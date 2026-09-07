@@ -1,0 +1,300 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef gc_GCInternals_h
+#define gc_GCInternals_h
+
+#include "mozilla/Maybe.h"
+#include "mozilla/Range.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/Vector.h"
+
+#include "gc/Cell.h"
+#include "gc/GC.h"
+#include "gc/GCContext.h"
+#include "gc/GCMarker.h"
+#include "vm/GeckoProfiler.h"
+#include "vm/HelperThreads.h"
+#include "vm/JSContext.h"
+
+namespace js {
+
+class GCMarker;
+
+namespace gc {
+
+
+struct MOZ_RAII AutoAssertNoNurseryAlloc {
+#ifdef DEBUG
+  AutoAssertNoNurseryAlloc();
+  ~AutoAssertNoNurseryAlloc();
+#else
+  AutoAssertNoNurseryAlloc() {}
+#endif
+};
+
+class MOZ_RAII AutoAssertEmptyNursery {
+ protected:
+  JSContext* cx;
+
+  mozilla::Maybe<AutoAssertNoNurseryAlloc> noAlloc;
+
+  void checkCondition(JSContext* cx);
+
+  AutoAssertEmptyNursery() : cx(nullptr) {}
+
+ public:
+  explicit AutoAssertEmptyNursery(JSContext* cx) : cx(nullptr) {
+    checkCondition(cx);
+  }
+
+  AutoAssertEmptyNursery(const AutoAssertEmptyNursery& other)
+      : AutoAssertEmptyNursery(other.cx) {}
+};
+
+class MOZ_RAII AutoEmptyNursery : public AutoAssertEmptyNursery {
+ public:
+  explicit AutoEmptyNursery(JSContext* cx);
+};
+
+class MOZ_RAII AutoGCSession : public AutoHeapSession {
+ public:
+  explicit AutoGCSession(GCRuntime* gc, JS::HeapState state)
+      : AutoHeapSession(gc, state) {}
+};
+
+class MOZ_RAII AutoMajorGCProfilerEntry : public AutoGeckoProfilerEntry {
+ public:
+  explicit AutoMajorGCProfilerEntry(GCRuntime* gc);
+};
+
+class MOZ_RAII AutoEmptyNurseryAndPrepareForTracing : private AutoFinishGC,
+                                                      public AutoEmptyNursery,
+                                                      public AutoTraceSession {
+ public:
+  explicit AutoEmptyNurseryAndPrepareForTracing(JSContext* cx)
+      : AutoFinishGC(cx, JS::GCReason::PREPARE_FOR_TRACING),
+        AutoEmptyNursery(cx),
+        AutoTraceSession(cx->runtime()) {}
+};
+
+class AutoUpdateLiveCompartments {
+  GCRuntime* gc;
+
+ public:
+  explicit AutoUpdateLiveCompartments(GCRuntime* gc);
+  ~AutoUpdateLiveCompartments();
+};
+
+class MOZ_RAII AutoRunParallelTask : public GCParallelTask {
+  using TaskFunc = JS_MEMBER_FN_PTR_TYPE(GCRuntime, void);
+
+  TaskFunc func_;
+  AutoLockHelperThreadState& lock_;
+
+ public:
+  AutoRunParallelTask(GCRuntime* gc, TaskFunc func, gcstats::PhaseKind phase,
+                      GCUse use, AutoLockHelperThreadState& lock)
+      : GCParallelTask(gc, phase, use), func_(func), lock_(lock) {
+    gc->startTask(*this, lock_);
+  }
+
+  ~AutoRunParallelTask() { gc->joinTask(*this, lock_); }
+
+  void run(AutoLockHelperThreadState& lock) override {
+    AutoUnlockHelperThreadState unlock(lock);
+
+    JS::AutoSuppressGCAnalysis nogc;
+
+    JS_CALL_MEMBER_FN_PTR(gc, func_);
+  }
+};
+
+#ifdef JS_GC_ZEAL
+
+class MOZ_RAII AutoStopVerifyingBarriers {
+  GCRuntime* gc;
+  bool restartPreVerifier;
+
+ public:
+  AutoStopVerifyingBarriers(JSRuntime* rt, bool isShutdown) : gc(&rt->gc) {
+    if (gc->isVerifyPreBarriersEnabled()) {
+      gc->endVerifyPreBarriers();
+      restartPreVerifier = !isShutdown;
+    } else {
+      restartPreVerifier = false;
+    }
+  }
+
+  ~AutoStopVerifyingBarriers() {
+    gcstats::PhaseKind outer = gc->stats().currentPhaseKind();
+    if (outer != gcstats::PhaseKind::NONE) {
+      gc->stats().endPhase(outer);
+    }
+    MOZ_ASSERT(gc->stats().currentPhaseKind() == gcstats::PhaseKind::NONE);
+
+    if (restartPreVerifier) {
+      gc->startVerifyPreBarriers();
+    }
+
+    if (outer != gcstats::PhaseKind::NONE) {
+      gc->stats().beginPhase(outer);
+    }
+  }
+};
+#else
+struct MOZ_RAII AutoStopVerifyingBarriers {
+  AutoStopVerifyingBarriers(JSRuntime*, bool) {}
+};
+#endif /* JS_GC_ZEAL */
+
+class MOZ_RAII AutoPoisonFreedJitCode {
+  JS::GCContext* const gcx;
+
+ public:
+  explicit AutoPoisonFreedJitCode(JS::GCContext* gcx) : gcx(gcx) {}
+  ~AutoPoisonFreedJitCode() { gcx->poisonJitCode(); }
+};
+
+
+class MOZ_RAII AutoSetThreadGCUse {
+ public:
+  AutoSetThreadGCUse(JS::GCContext* gcx, GCUse use)
+      : gcx(gcx), prevUse(gcx->gcUse_) {
+    gcx->gcUse_ = use;
+  }
+  explicit AutoSetThreadGCUse(GCUse use)
+      : AutoSetThreadGCUse(TlsGCContext.get(), use) {}
+
+  ~AutoSetThreadGCUse() { gcx->gcUse_ = prevUse; }
+
+ protected:
+  JS::GCContext* gcx;
+  GCUse prevUse;
+};
+
+template <GCUse Use>
+class AutoSetThreadGCUseT : public AutoSetThreadGCUse {
+ public:
+  explicit AutoSetThreadGCUseT(JS::GCContext* gcx)
+      : AutoSetThreadGCUse(gcx, Use) {}
+  AutoSetThreadGCUseT() : AutoSetThreadGCUseT(TlsGCContext.get()) {}
+};
+
+using AutoSetThreadIsPerformingGC = AutoSetThreadGCUseT<GCUse::Unspecified>;
+using AutoSetThreadIsMarking = AutoSetThreadGCUseT<GCUse::Marking>;
+using AutoSetThreadIsFinalizing = AutoSetThreadGCUseT<GCUse::Finalizing>;
+
+class AutoSetThreadIsSweeping : public AutoSetThreadGCUseT<GCUse::Sweeping> {
+ public:
+  explicit AutoSetThreadIsSweeping(JS::GCContext* gcx,
+                                   JS::Zone* sweepZone = nullptr)
+      : AutoSetThreadGCUseT(gcx) {
+#ifdef DEBUG
+    prevZone = gcx->gcSweepZone_;
+    gcx->gcSweepZone_ = sweepZone;
+#endif
+  }
+  explicit AutoSetThreadIsSweeping(JS::Zone* sweepZone = nullptr)
+      : AutoSetThreadIsSweeping(TlsGCContext.get(), sweepZone) {}
+
+  ~AutoSetThreadIsSweeping() {
+#ifdef DEBUG
+    MOZ_ASSERT_IF(prevUse == GCUse::None, !prevZone);
+    gcx->gcSweepZone_ = prevZone;
+#endif
+  }
+
+ private:
+#ifdef DEBUG
+  JS::Zone* prevZone;
+#endif
+};
+
+class MOZ_RAII AutoDisallowPreWriteBarrier {
+ public:
+  explicit AutoDisallowPreWriteBarrier(JS::GCContext* gcx) {
+#ifdef DEBUG
+    gcx_ = gcx;
+    MOZ_ASSERT(gcx->preWriteBarrierAllowed_);
+    gcx->preWriteBarrierAllowed_ = false;
+#endif
+  }
+  ~AutoDisallowPreWriteBarrier() {
+#ifdef DEBUG
+    MOZ_ASSERT(!gcx_->preWriteBarrierAllowed_);
+    gcx_->preWriteBarrierAllowed_ = true;
+#endif
+  }
+
+ private:
+#ifdef DEBUG
+  JS::GCContext* gcx_;
+#endif
+};
+
+#ifdef JSGC_HASH_TABLE_CHECKS
+void CheckHashTablesAfterMovingGC(JSRuntime* rt);
+void CheckHeapAfterGC(JSRuntime* rt);
+#endif
+
+struct MovingTracer final : public GenericTracerImpl<MovingTracer> {
+  explicit MovingTracer(JSRuntime* rt);
+
+ private:
+  template <typename T>
+  bool onEdge(T** thingp, const char* name);
+  friend class GenericTracerImpl<MovingTracer>;
+};
+
+struct MinorSweepingTracer final
+    : public GenericTracerImpl<MinorSweepingTracer> {
+  explicit MinorSweepingTracer(JSRuntime* rt);
+
+ private:
+  template <typename T>
+  bool onEdge(T** thingp, const char* name);
+  friend class GenericTracerImpl<MinorSweepingTracer>;
+};
+
+class MOZ_RAII AutoUpdateMarkStackRanges {
+  GCMarker& marker_;
+
+ public:
+  explicit AutoUpdateMarkStackRanges(GCMarker& marker) : marker_(marker) {
+    marker_.updateRangesAtStartOfSlice();
+  }
+  ~AutoUpdateMarkStackRanges() { marker_.updateRangesAtEndOfSlice(); }
+};
+
+extern void DelayCrossCompartmentGrayMarking(GCMarker* maybeMarker,
+                                             JSObject* src);
+
+inline bool IsOOMReason(JS::GCReason reason) {
+  return reason == JS::GCReason::LAST_DITCH ||
+         reason == JS::GCReason::MEM_PRESSURE;
+}
+
+void* AllocateTenuredCellInGC(JS::Zone* zone, AllocKind thingKind);
+
+void ReadProfileEnv(const char* envName, const char* helpText, bool* enableOut,
+                    bool* workersOut, mozilla::TimeDuration* thresholdOut);
+
+bool ShouldPrintProfile(JSRuntime* runtime, bool enable, bool workers,
+                        mozilla::TimeDuration threshold,
+                        mozilla::TimeDuration duration);
+
+using CharRange = mozilla::Range<const char>;
+using CharRangeVector = Vector<CharRange, 0, SystemAllocPolicy>;
+
+extern bool SplitStringBy(const char* string, char delimiter,
+                          CharRangeVector* resultOut);
+extern bool SplitStringBy(const CharRange& string, char delimiter,
+                          CharRangeVector* resultOut);
+
+} 
+} 
+
+#endif /* gc_GCInternals_h */

@@ -1,0 +1,762 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsTreeSelection.h"
+
+#include "XULTreeElement.h"
+#include "mozilla/AsyncEventDispatcher.h"
+#include "mozilla/dom/Element.h"
+#include "nsCOMPtr.h"
+#include "nsComponentManagerUtils.h"
+#include "nsGkAtoms.h"
+#include "nsIContent.h"
+#include "nsITreeView.h"
+#include "nsNameSpaceManager.h"
+#include "nsString.h"
+#include "nsTreeColumns.h"
+
+using namespace mozilla;
+using dom::XULTreeElement;
+
+struct nsTreeRange {
+  nsTreeSelection* mSelection;
+
+  nsTreeRange* mPrev;
+  nsTreeRange* mNext;
+
+  int32_t mMin;
+  int32_t mMax;
+
+  nsTreeRange(nsTreeSelection* aSel, int32_t aSingleVal)
+      : mSelection(aSel),
+        mPrev(nullptr),
+        mNext(nullptr),
+        mMin(aSingleVal),
+        mMax(aSingleVal) {}
+  nsTreeRange(nsTreeSelection* aSel, int32_t aMin, int32_t aMax)
+      : mSelection(aSel),
+        mPrev(nullptr),
+        mNext(nullptr),
+        mMin(aMin),
+        mMax(aMax) {}
+
+  ~nsTreeRange() { delete mNext; }
+
+  void Connect(nsTreeRange* aPrev = nullptr, nsTreeRange* aNext = nullptr) {
+    if (aPrev) {
+      aPrev->mNext = this;
+    } else {
+      mSelection->mFirstRange = this;
+    }
+
+    if (aNext) {
+      aNext->mPrev = this;
+    }
+
+    mPrev = aPrev;
+    mNext = aNext;
+  }
+
+  nsresult RemoveRange(int32_t aStart, int32_t aEnd) {
+    if (aEnd < mMin) {
+      return NS_OK;
+    }
+    if (aEnd < mMax) {
+      if (aStart <= mMin) {
+        mMin = aEnd + 1;
+      } else {
+        nsTreeRange* range = new nsTreeRange(mSelection, aEnd + 1, mMax);
+        if (!range) {
+          return NS_ERROR_OUT_OF_MEMORY;
+        }
+
+        mMax = aStart - 1;
+        range->Connect(this, mNext);
+      }
+      return NS_OK;
+    }
+    nsTreeRange* next = mNext;
+    if (aStart <= mMin) {
+      if (mPrev) {
+        mPrev->mNext = next;
+      } else {
+        mSelection->mFirstRange = next;
+      }
+
+      if (next) {
+        next->mPrev = mPrev;
+      }
+      mPrev = mNext = nullptr;
+      delete this;
+    } else if (aStart <= mMax) {
+      mMax = aStart - 1;
+    }
+    return next ? next->RemoveRange(aStart, aEnd) : NS_OK;
+  }
+
+  nsresult Remove(int32_t aIndex) {
+    if (aIndex >= mMin && aIndex <= mMax) {
+      if (mMin == mMax) {
+        if (mPrev) {
+          mPrev->mNext = mNext;
+        }
+        if (mNext) {
+          mNext->mPrev = mPrev;
+        }
+        nsTreeRange* first = mSelection->mFirstRange;
+        if (first == this) {
+          mSelection->mFirstRange = mNext;
+        }
+        mNext = mPrev = nullptr;
+        delete this;
+      } else if (aIndex == mMin) {
+        mMin++;
+      } else if (aIndex == mMax) {
+        mMax--;
+      } else {
+        nsTreeRange* newRange = new nsTreeRange(mSelection, aIndex + 1, mMax);
+        if (!newRange) {
+          return NS_ERROR_OUT_OF_MEMORY;
+        }
+
+        newRange->Connect(this, mNext);
+        mMax = aIndex - 1;
+      }
+    } else if (mNext) {
+      return mNext->Remove(aIndex);
+    }
+
+    return NS_OK;
+  }
+
+  nsresult Add(int32_t aIndex) {
+    if (aIndex < mMin) {
+      if (aIndex + 1 == mMin) {
+        mMin = aIndex;
+      } else if (mPrev && mPrev->mMax + 1 == aIndex) {
+        mPrev->mMax = aIndex;
+      } else {
+        nsTreeRange* newRange = new nsTreeRange(mSelection, aIndex);
+        if (!newRange) {
+          return NS_ERROR_OUT_OF_MEMORY;
+        }
+
+        newRange->Connect(mPrev, this);
+      }
+    } else if (mNext) {
+      mNext->Add(aIndex);
+    } else {
+      if (mMax + 1 == aIndex) {
+        mMax = aIndex;
+      } else {
+        nsTreeRange* newRange = new nsTreeRange(mSelection, aIndex);
+        if (!newRange) {
+          return NS_ERROR_OUT_OF_MEMORY;
+        }
+
+        newRange->Connect(this, nullptr);
+      }
+    }
+    return NS_OK;
+  }
+
+  bool Contains(int32_t aIndex) {
+    if (aIndex >= mMin && aIndex <= mMax) {
+      return true;
+    }
+
+    if (mNext) {
+      return mNext->Contains(aIndex);
+    }
+
+    return false;
+  }
+
+  int32_t Count() {
+    int32_t total = mMax - mMin + 1;
+    if (mNext) {
+      total += mNext->Count();
+    }
+    return total;
+  }
+
+  static void CollectRanges(nsTreeRange* aRange, nsTArray<int32_t>& aRanges) {
+    nsTreeRange* cur = aRange;
+    while (cur) {
+      aRanges.AppendElement(cur->mMin);
+      aRanges.AppendElement(cur->mMax);
+      cur = cur->mNext;
+    }
+  }
+
+  static void InvalidateRanges(XULTreeElement* aTree,
+                               nsTArray<int32_t>& aRanges) {
+    if (aTree) {
+      RefPtr<nsXULElement> tree = aTree;
+      for (uint32_t i = 0; i < aRanges.Length(); i += 2) {
+        aTree->InvalidateRange(aRanges[i], aRanges[i + 1]);
+      }
+    }
+  }
+
+  void Invalidate() {
+    nsTArray<int32_t> ranges;
+    CollectRanges(this, ranges);
+    InvalidateRanges(mSelection->mTree, ranges);
+  }
+
+  void RemoveAllBut(int32_t aIndex) {
+    if (aIndex >= mMin && aIndex <= mMax) {
+      nsTArray<int32_t> ranges;
+      CollectRanges(mSelection->mFirstRange, ranges);
+
+      mMin = aIndex;
+      mMax = aIndex;
+
+      nsTreeRange* first = mSelection->mFirstRange;
+      if (mPrev) {
+        mPrev->mNext = mNext;
+      }
+      if (mNext) {
+        mNext->mPrev = mPrev;
+      }
+      mNext = mPrev = nullptr;
+
+      if (first != this) {
+        delete mSelection->mFirstRange;
+        mSelection->mFirstRange = this;
+      }
+      InvalidateRanges(mSelection->mTree, ranges);
+    } else if (mNext) {
+      mNext->RemoveAllBut(aIndex);
+    }
+  }
+
+  void Insert(nsTreeRange* aRange) {
+    if (mMin >= aRange->mMax) {
+      aRange->Connect(mPrev, this);
+    } else if (mNext) {
+      mNext->Insert(aRange);
+    } else {
+      aRange->Connect(this, nullptr);
+    }
+  }
+};
+
+nsTreeSelection::nsTreeSelection(XULTreeElement* aTree)
+    : mTree(aTree),
+      mSuppressed(false),
+      mCurrentIndex(-1),
+      mShiftSelectPivot(-1),
+      mFirstRange(nullptr) {}
+
+nsTreeSelection::~nsTreeSelection() {
+  delete mFirstRange;
+  if (mSelectTimer) {
+    mSelectTimer->Cancel();
+  }
+}
+
+NS_IMPL_CYCLE_COLLECTION(nsTreeSelection, mTree)
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(nsTreeSelection)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(nsTreeSelection)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(nsTreeSelection)
+  NS_INTERFACE_MAP_ENTRY(nsITreeSelection)
+  NS_INTERFACE_MAP_ENTRY(nsINativeTreeSelection)
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+NS_IMETHODIMP nsTreeSelection::GetTree(XULTreeElement** aTree) {
+  NS_IF_ADDREF(*aTree = mTree);
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsTreeSelection::SetTree(XULTreeElement* aTree) {
+  if (mSelectTimer) {
+    mSelectTimer->Cancel();
+    mSelectTimer = nullptr;
+  }
+
+  mTree = aTree;
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsTreeSelection::GetSingle(bool* aSingle) {
+  if (!mTree) {
+    return NS_ERROR_NULL_POINTER;
+  }
+
+  *aSingle = mTree->AttrValueIs(kNameSpaceID_None, nsGkAtoms::seltype,
+                                u"single"_ns, eCaseMatters);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsTreeSelection::IsSelected(int32_t aIndex, bool* aResult) {
+  if (mFirstRange) {
+    *aResult = mFirstRange->Contains(aIndex);
+  } else {
+    *aResult = false;
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsTreeSelection::TimedSelect(int32_t aIndex, int32_t aMsec) {
+  bool suppressSelect = mSuppressed;
+
+  if (aMsec != -1) {
+    mSuppressed = true;
+  }
+
+  nsresult rv = Select(aIndex);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  if (aMsec != -1) {
+    mSuppressed = suppressSelect;
+    if (!mSuppressed) {
+      if (mSelectTimer) {
+        mSelectTimer->Cancel();
+      }
+
+      if (!mTree) {
+        return NS_ERROR_UNEXPECTED;
+      }
+      nsIEventTarget* target = GetMainThreadSerialEventTarget();
+      NS_NewTimerWithFuncCallback(getter_AddRefs(mSelectTimer), SelectCallback,
+                                  this, aMsec, nsITimer::TYPE_ONE_SHOT,
+                                  "nsTreeSelection::SelectCallback"_ns, target);
+    }
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsTreeSelection::Select(int32_t aIndex) {
+  mShiftSelectPivot = -1;
+
+  nsresult rv = SetCurrentIndex(aIndex);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  if (mFirstRange) {
+    bool alreadySelected = mFirstRange->Contains(aIndex);
+
+    if (alreadySelected) {
+      int32_t count = mFirstRange->Count();
+      if (count > 1) {
+        mFirstRange->RemoveAllBut(aIndex);
+        FireOnSelectHandler();
+      }
+      return NS_OK;
+    } else {
+      mFirstRange->Invalidate();
+      delete mFirstRange;
+    }
+  }
+
+  mFirstRange = new nsTreeRange(this, aIndex);
+  if (!mFirstRange) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+
+  mFirstRange->Invalidate();
+
+  FireOnSelectHandler();
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsTreeSelection::ToggleSelect(int32_t aIndex) {
+  mShiftSelectPivot = -1;
+  nsresult rv = SetCurrentIndex(aIndex);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  if (!mFirstRange) {
+    Select(aIndex);
+  } else {
+    if (!mFirstRange->Contains(aIndex)) {
+      bool single;
+      rv = GetSingle(&single);
+      if (NS_SUCCEEDED(rv) && !single) {
+        rv = mFirstRange->Add(aIndex);
+      }
+    } else {
+      rv = mFirstRange->Remove(aIndex);
+    }
+    if (NS_SUCCEEDED(rv)) {
+      if (mTree) {
+        mTree->InvalidateRow(aIndex);
+      }
+
+      FireOnSelectHandler();
+    }
+  }
+
+  return rv;
+}
+
+NS_IMETHODIMP nsTreeSelection::RangedSelect(int32_t aStartIndex,
+                                            int32_t aEndIndex, bool aAugment) {
+  bool single;
+  nsresult rv = GetSingle(&single);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  if ((mFirstRange || (aStartIndex != aEndIndex)) && single) {
+    return NS_OK;
+  }
+
+  if (!aAugment) {
+    if (mFirstRange) {
+      mFirstRange->Invalidate();
+      delete mFirstRange;
+      mFirstRange = nullptr;
+    }
+  }
+
+  if (aStartIndex == -1) {
+    if (mShiftSelectPivot != -1) {
+      aStartIndex = mShiftSelectPivot;
+    } else if (mCurrentIndex != -1) {
+      aStartIndex = mCurrentIndex;
+    } else {
+      aStartIndex = aEndIndex;
+    }
+  }
+
+  mShiftSelectPivot = aStartIndex;
+  rv = SetCurrentIndex(aEndIndex);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  int32_t start = aStartIndex < aEndIndex ? aStartIndex : aEndIndex;
+  int32_t end = aStartIndex < aEndIndex ? aEndIndex : aStartIndex;
+
+  if (aAugment && mFirstRange) {
+    nsresult rv = mFirstRange->RemoveRange(start, end);
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+  }
+
+  nsTreeRange* range = new nsTreeRange(this, start, end);
+  if (!range) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+
+  range->Invalidate();
+
+  if (aAugment && mFirstRange) {
+    mFirstRange->Insert(range);
+  } else {
+    mFirstRange = range;
+  }
+
+  FireOnSelectHandler();
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsTreeSelection::ClearRange(int32_t aStartIndex,
+                                          int32_t aEndIndex) {
+  nsresult rv = SetCurrentIndex(aEndIndex);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  if (mFirstRange) {
+    int32_t start = aStartIndex < aEndIndex ? aStartIndex : aEndIndex;
+    int32_t end = aStartIndex < aEndIndex ? aEndIndex : aStartIndex;
+
+    mFirstRange->RemoveRange(start, end);
+
+    if (mTree) {
+      mTree->InvalidateRange(start, end);
+    }
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsTreeSelection::ClearSelection() {
+  if (mFirstRange) {
+    mFirstRange->Invalidate();
+    delete mFirstRange;
+    mFirstRange = nullptr;
+  }
+  mShiftSelectPivot = -1;
+
+  FireOnSelectHandler();
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsTreeSelection::SelectAll() {
+  if (!mTree) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsITreeView> view = mTree->GetView();
+  if (!view) {
+    return NS_OK;
+  }
+
+  int32_t rowCount;
+  view->GetRowCount(&rowCount);
+  bool single;
+  nsresult rv = GetSingle(&single);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  if (rowCount == 0 || (rowCount > 1 && single)) {
+    return NS_OK;
+  }
+
+  mShiftSelectPivot = -1;
+
+  delete mFirstRange;
+
+  mFirstRange = new nsTreeRange(this, 0, rowCount - 1);
+  mFirstRange->Invalidate();
+
+  FireOnSelectHandler();
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsTreeSelection::GetRangeCount(int32_t* aResult) {
+  int32_t count = 0;
+  nsTreeRange* curr = mFirstRange;
+  while (curr) {
+    count++;
+    curr = curr->mNext;
+  }
+
+  *aResult = count;
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsTreeSelection::GetRangeAt(int32_t aIndex, int32_t* aMin,
+                                          int32_t* aMax) {
+  *aMin = *aMax = -1;
+  int32_t i = -1;
+  nsTreeRange* curr = mFirstRange;
+  while (curr) {
+    i++;
+    if (i == aIndex) {
+      *aMin = curr->mMin;
+      *aMax = curr->mMax;
+      break;
+    }
+    curr = curr->mNext;
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsTreeSelection::GetCount(int32_t* count) {
+  if (mFirstRange) {
+    *count = mFirstRange->Count();
+  } else {  
+    *count = 0;
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsTreeSelection::GetSelectEventsSuppressed(
+    bool* aSelectEventsSuppressed) {
+  *aSelectEventsSuppressed = mSuppressed;
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsTreeSelection::SetSelectEventsSuppressed(
+    bool aSelectEventsSuppressed) {
+  mSuppressed = aSelectEventsSuppressed;
+  if (!mSuppressed) {
+    FireOnSelectHandler();
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsTreeSelection::GetCurrentIndex(int32_t* aCurrentIndex) {
+  *aCurrentIndex = mCurrentIndex;
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsTreeSelection::SetCurrentIndex(int32_t aIndex) {
+  if (!mTree) {
+    return NS_ERROR_UNEXPECTED;
+  }
+  if (mCurrentIndex == aIndex) {
+    return NS_OK;
+  }
+  if (mCurrentIndex != -1 && mTree) {
+    mTree->InvalidateRow(mCurrentIndex);
+  }
+
+  mCurrentIndex = aIndex;
+  if (!mTree) {
+    return NS_OK;
+  }
+
+  if (aIndex != -1) {
+    mTree->InvalidateRow(aIndex);
+  }
+
+  NS_ENSURE_STATE(mTree);
+
+  constexpr auto DOMMenuItemActive = u"DOMMenuItemActive"_ns;
+  constexpr auto DOMMenuItemInactive = u"DOMMenuItemInactive"_ns;
+
+  auto asyncDispatcher = MakeRefPtr<AsyncEventDispatcher>(
+      mTree, (aIndex != -1 ? DOMMenuItemActive : DOMMenuItemInactive),
+      CanBubble::eYes, ChromeOnlyDispatch::eNo);
+  return asyncDispatcher->PostDOMEvent();
+}
+
+#define ADD_NEW_RANGE(macro_range, macro_selection, macro_start, macro_end) \
+  {                                                                         \
+    int32_t start = macro_start;                                            \
+    int32_t end = macro_end;                                                \
+    if (start > end) {                                                      \
+      end = start;                                                          \
+    }                                                                       \
+    nsTreeRange* macro_new_range =                                          \
+        new nsTreeRange(macro_selection, start, end);                       \
+    if (macro_range)                                                        \
+      macro_range->Insert(macro_new_range);                                 \
+    else                                                                    \
+      macro_range = macro_new_range;                                        \
+  }
+
+NS_IMETHODIMP
+nsTreeSelection::AdjustSelection(int32_t aIndex, int32_t aCount) {
+  NS_ASSERTION(aCount != 0, "adjusting by zero");
+  if (!aCount) {
+    return NS_OK;
+  }
+
+  if ((mShiftSelectPivot != 1) && (aIndex <= mShiftSelectPivot)) {
+    if (aCount < 0 && (mShiftSelectPivot <= (aIndex - aCount - 1))) {
+      mShiftSelectPivot = -1;
+    } else {
+      mShiftSelectPivot += aCount;
+    }
+  }
+
+  if ((mCurrentIndex != -1) && (aIndex <= mCurrentIndex)) {
+    if (aCount < 0 && (mCurrentIndex <= (aIndex - aCount - 1))) {
+      mCurrentIndex = -1;
+    } else {
+      mCurrentIndex += aCount;
+    }
+  }
+
+  if (!mFirstRange) {
+    return NS_OK;
+  }
+
+  bool selChanged = false;
+  nsTreeRange* oldFirstRange = mFirstRange;
+  nsTreeRange* curr = mFirstRange;
+  mFirstRange = nullptr;
+  while (curr) {
+    if (aCount > 0) {
+      if (aIndex > curr->mMax) {
+        ADD_NEW_RANGE(mFirstRange, this, curr->mMin, curr->mMax);
+      } else if (aIndex <= curr->mMin) {
+        ADD_NEW_RANGE(mFirstRange, this, curr->mMin + aCount,
+                      curr->mMax + aCount);
+        selChanged = true;
+      } else {
+        ADD_NEW_RANGE(mFirstRange, this, curr->mMin, aIndex - 1);
+        ADD_NEW_RANGE(mFirstRange, this, aIndex + aCount, curr->mMax + aCount);
+        selChanged = true;
+      }
+    } else {
+      if (aIndex > curr->mMax) {
+        ADD_NEW_RANGE(mFirstRange, this, curr->mMin, curr->mMax);
+      } else {
+        selChanged = true;
+        int32_t lastIndexOfAdjustment = aIndex - aCount - 1;
+        if (aIndex <= curr->mMin) {
+          if (lastIndexOfAdjustment < curr->mMin) {
+            ADD_NEW_RANGE(mFirstRange, this, curr->mMin + aCount,
+                          curr->mMax + aCount);
+          } else if (lastIndexOfAdjustment >= curr->mMax) {
+          } else {
+            ADD_NEW_RANGE(mFirstRange, this, aIndex, curr->mMax + aCount)
+          }
+        } else if (lastIndexOfAdjustment >= curr->mMax) {
+          ADD_NEW_RANGE(mFirstRange, this, curr->mMin, aIndex - 1)
+        } else {
+          ADD_NEW_RANGE(mFirstRange, this, curr->mMin, curr->mMax + aCount)
+        }
+      }
+    }
+    curr = curr->mNext;
+  }
+
+  delete oldFirstRange;
+
+  if (selChanged) {
+    FireOnSelectHandler();
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsTreeSelection::InvalidateSelection() {
+  if (mFirstRange) {
+    mFirstRange->Invalidate();
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsTreeSelection::GetShiftSelectPivot(int32_t* aIndex) {
+  *aIndex = mShiftSelectPivot;
+  return NS_OK;
+}
+
+nsresult nsTreeSelection::FireOnSelectHandler() {
+  if (mSuppressed || !mTree) {
+    return NS_OK;
+  }
+
+  AsyncEventDispatcher::RunDOMEventWhenSafe(
+      *mTree, u"select"_ns, CanBubble::eYes, ChromeOnlyDispatch::eNo);
+  return NS_OK;
+}
+
+void nsTreeSelection::SelectCallback(nsITimer* aTimer, void* aClosure) {
+  RefPtr<nsTreeSelection> self = static_cast<nsTreeSelection*>(aClosure);
+  if (self) {
+    self->FireOnSelectHandler();
+    aTimer->Cancel();
+    self->mSelectTimer = nullptr;
+  }
+}
+
+
+nsresult NS_NewTreeSelection(XULTreeElement* aTree,
+                             nsITreeSelection** aResult) {
+  *aResult = new nsTreeSelection(aTree);
+  if (!*aResult) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+  NS_ADDREF(*aResult);
+  return NS_OK;
+}

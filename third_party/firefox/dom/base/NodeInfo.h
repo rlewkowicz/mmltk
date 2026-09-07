@@ -1,0 +1,208 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_dom_NodeInfo_h_
+#define mozilla_dom_NodeInfo_h_
+
+#include "mozilla/Attributes.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/dom/NameSpaceConstants.h"
+#include "nsAtom.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsHTMLTags.h"
+#include "nsHashKeys.h"
+#include "nsString.h"
+
+class nsNodeInfoManager;
+
+namespace mozilla::dom {
+
+class Document;
+
+class NodeInfo final {
+ public:
+  NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(NodeInfo)
+  NS_DECL_CYCLE_COLLECTION_SKIPPABLE_NATIVE_CLASS_WITH_CUSTOM_DELETE(NodeInfo)
+
+  void GetName(nsAString& aName) const;
+
+  nsAtom* NameAtom() const { return mInner.mName; }
+
+  uint64_t NameBloomFilterHash() const { return mNameBloomHash; }
+
+  const nsString& QualifiedName() const { return mQualifiedName; }
+
+  const nsString& NodeName() const { return mNodeName; }
+
+  const nsString& LocalName() const { return mLocalName; }
+
+  const mozilla::Maybe<const nsHTMLTag>& HTMLTag() const;
+
+  void GetPrefix(nsAString& aPrefix) const;
+
+  nsAtom* GetPrefixAtom() const { return mInner.mPrefix; }
+
+  void GetNamespaceURI(nsAString& aNameSpaceURI) const;
+
+  int32_t NamespaceID() const { return mInner.mNamespaceID; }
+
+  uint16_t NodeType() const { return mInner.mNodeType; }
+
+  nsAtom* GetExtraName() const { return mInner.mExtraName; }
+
+  nsNodeInfoManager* NodeInfoManager() const { return mOwnerManager; }
+
+  inline bool Equals(NodeInfo* aNodeInfo) const;
+
+  bool NameAndNamespaceEquals(NodeInfo* aNodeInfo) const;
+
+  bool Equals(const nsAtom* aNameAtom) const {
+    return mInner.mName == aNameAtom;
+  }
+
+  bool Equals(const nsAtom* aNameAtom, const nsAtom* aPrefixAtom) const {
+    return (mInner.mName == aNameAtom) && (mInner.mPrefix == aPrefixAtom);
+  }
+
+  bool Equals(const nsAtom* aNameAtom, int32_t aNamespaceID) const {
+    return ((mInner.mName == aNameAtom) &&
+            (mInner.mNamespaceID == aNamespaceID));
+  }
+
+  bool Equals(const nsAtom* aNameAtom, const nsAtom* aPrefixAtom,
+              int32_t aNamespaceID) const {
+    return ((mInner.mName == aNameAtom) && (mInner.mPrefix == aPrefixAtom) &&
+            (mInner.mNamespaceID == aNamespaceID));
+  }
+
+  bool NamespaceEquals(int32_t aNamespaceID) const {
+    return mInner.mNamespaceID == aNamespaceID;
+  }
+
+  inline bool Equals(const nsAString& aName) const;
+
+  inline bool Equals(const nsAString& aName, const nsAString& aPrefix) const;
+
+  inline bool Equals(const nsAString& aName, int32_t aNamespaceID) const;
+
+  inline bool Equals(const nsAString& aName, const nsAString& aPrefix,
+                     int32_t aNamespaceID) const;
+
+  bool NamespaceEquals(const nsAString& aNamespaceURI) const;
+
+  inline bool QualifiedNameEquals(const nsAtom* aNameAtom) const;
+
+  bool QualifiedNameEquals(const nsAString& aQualifiedName) const {
+    return mQualifiedName == aQualifiedName;
+  }
+
+  Document* GetDocument() const { return mDocument; }
+
+ private:
+  NodeInfo() = delete;
+  NodeInfo(const NodeInfo& aOther) = delete;
+
+  NodeInfo(nsAtom* aName, nsAtom* aPrefix, int32_t aNamespaceID,
+           uint16_t aNodeType, nsAtom* aExtraName,
+           nsNodeInfoManager* aOwnerManager);
+
+  ~NodeInfo();
+
+ public:
+  bool CanSkip();
+
+  void DeleteCycleCollectable();
+
+ protected:
+
+  class NodeInfoInner {
+   public:
+    NodeInfoInner()
+        : mName(nullptr),
+          mPrefix(nullptr),
+          mNamespaceID(kNameSpaceID_Unknown),
+          mNodeType(0),
+          mNameString(nullptr),
+          mExtraName(nullptr),
+          mHash() {}
+    NodeInfoInner(nsAtom* aName, nsAtom* aPrefix, int32_t aNamespaceID,
+                  uint16_t aNodeType, nsAtom* aExtraName)
+        : mName(aName),
+          mPrefix(aPrefix),
+          mNamespaceID(aNamespaceID),
+          mNodeType(aNodeType),
+          mNameString(nullptr),
+          mExtraName(aExtraName),
+          mHash() {}
+    NodeInfoInner(const nsAString& aTmpName, nsAtom* aPrefix,
+                  int32_t aNamespaceID, uint16_t aNodeType)
+        : mName(nullptr),
+          mPrefix(aPrefix),
+          mNamespaceID(aNamespaceID),
+          mNodeType(aNodeType),
+          mNameString(&aTmpName),
+          mExtraName(nullptr),
+          mHash() {}
+
+    bool operator==(const NodeInfoInner& aOther) const {
+      if (mPrefix != aOther.mPrefix || mNamespaceID != aOther.mNamespaceID ||
+          mNodeType != aOther.mNodeType || mExtraName != aOther.mExtraName) {
+        return false;
+      }
+
+      if (mName) {
+        if (aOther.mName) {
+          return mName == aOther.mName;
+        }
+        return mName->Equals(*(aOther.mNameString));
+      }
+
+      if (aOther.mName) {
+        return aOther.mName->Equals(*(mNameString));
+      }
+
+      return mNameString->Equals(*(aOther.mNameString));
+    }
+
+    uint32_t Hash() const {
+      if (!mHash) {
+        uint32_t nameHash =
+            mName ? mName->hash() : mozilla::HashString(*mNameString);
+        mHash.emplace(mozilla::AddToHash(nameHash, mNamespaceID, mNodeType));
+      }
+      return mHash.value();
+    }
+
+    nsAtom* const MOZ_OWNING_REF mName;
+    nsAtom* MOZ_OWNING_REF mPrefix;
+    int32_t mNamespaceID;
+    uint16_t mNodeType;  
+    const nsAString* const mNameString;
+    nsAtom* MOZ_OWNING_REF mExtraName;  
+    mutable mozilla::Maybe<const uint32_t> mHash;
+  };
+
+  friend class ::nsNodeInfoManager;
+
+  Document* MOZ_NON_OWNING_REF mDocument;  
+
+  NodeInfoInner mInner;
+
+  RefPtr<nsNodeInfoManager> mOwnerManager;
+
+
+  nsString mQualifiedName;
+
+  nsString mNodeName;
+
+  nsString mLocalName;
+
+  uint64_t mNameBloomHash;
+  mutable Maybe<const nsHTMLTag> mHTMLTag;
+};
+
+}  
+
+#endif /* mozilla_dom_NodeInfo_h_ */

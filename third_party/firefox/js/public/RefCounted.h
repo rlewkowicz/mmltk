@@ -1,0 +1,85 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef js_RefCounted_h
+#define js_RefCounted_h
+
+#include "mozilla/Atomics.h"
+#include "mozilla/RefCountType.h"
+
+#include "js/Utility.h"
+
+
+namespace js {
+
+template <typename T>
+class RefCounted {
+  static const MozRefCountType DEAD = 0xffffdead;
+
+ protected:
+  RefCounted() : mRefCnt(0) {}
+  ~RefCounted() { MOZ_ASSERT(mRefCnt == DEAD); }
+
+ public:
+  void AddRef() const {
+    MOZ_ASSERT(int32_t(mRefCnt) >= 0);
+    ++mRefCnt;
+  }
+
+  void Release() const {
+    MOZ_ASSERT(int32_t(mRefCnt) > 0);
+    MozRefCountType cnt = --mRefCnt;
+    if (0 == cnt) {
+#ifdef DEBUG
+      mRefCnt = DEAD;
+#endif
+      js_delete(const_cast<T*>(static_cast<const T*>(this)));
+    }
+  }
+
+ private:
+  mutable MozRefCountType mRefCnt;
+};
+
+template <typename T>
+class AtomicRefCounted {
+
+  static_assert(sizeof(MozRefCountType) == sizeof(uintptr_t),
+                "You're at risk for ref count overflow.");
+
+  static const MozRefCountType DEAD = ~MozRefCountType(0xffff) | 0xdead;
+
+ protected:
+  AtomicRefCounted() = default;
+  ~AtomicRefCounted() { MOZ_ASSERT(mRefCnt == DEAD); }
+
+ public:
+  void AddRef() const {
+    ++mRefCnt;
+    MOZ_ASSERT(mRefCnt != DEAD);
+  }
+
+  void Release() const {
+    MOZ_ASSERT(mRefCnt != 0);
+    MozRefCountType cnt = --mRefCnt;
+    if (0 == cnt) {
+#ifdef DEBUG
+      mRefCnt = DEAD;
+#endif
+      js_delete(const_cast<T*>(static_cast<const T*>(this)));
+    }
+  }
+
+  bool hasOneRef() const {
+    MOZ_ASSERT(mRefCnt > 0);
+    return mRefCnt == 1;
+  }
+
+ private:
+  mutable mozilla::Atomic<MozRefCountType> mRefCnt{0};
+};
+
+}  
+
+#endif /* js_RefCounted_h */

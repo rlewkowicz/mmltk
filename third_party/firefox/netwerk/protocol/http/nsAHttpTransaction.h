@@ -1,0 +1,222 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsAHttpTransaction_h_
+#define nsAHttpTransaction_h_
+
+#include "nsTArray.h"
+#include "nsWeakReference.h"
+#include "nsIRequest.h"
+#include "nsITRRSkipReason.h"
+#include "nsILoadInfo.h"
+
+#ifdef Status
+typedef Status __StatusTmp;
+#  undef Status
+typedef __StatusTmp Status;
+#endif
+
+class nsIDNSHTTPSSVCRecord;
+class nsIInterfaceRequestor;
+class nsIRequestContext;
+class nsISVCBRecord;
+class nsITLSSocketControl;
+class nsITransport;
+
+namespace mozilla {
+namespace net {
+
+class nsAHttpConnection;
+class nsAHttpSegmentReader;
+class nsAHttpSegmentWriter;
+class nsHttpTransaction;
+class nsHttpRequestHead;
+class nsHttpResponseHead;
+class ProxyConnectResponseHead;
+class nsHttpConnectionInfo;
+class NullHttpTransaction;
+
+enum class ExtendedCONNECTSupport { UNSURE, NO_SUPPORT, SUPPORTED };
+
+
+#define NS_AHTTPTRANSACTION_IID \
+  {0x2af6d634, 0x13e3, 0x494c, {0x89, 0x03, 0xc9, 0xdc, 0xe5, 0xc2, 0x2f, 0xc0}}
+
+class nsAHttpTransaction : public nsSupportsWeakReference {
+ public:
+  NS_INLINE_DECL_STATIC_IID(NS_AHTTPTRANSACTION_IID)
+
+  virtual void SetConnection(nsAHttpConnection*) = 0;
+
+  virtual void OnActivated() {}
+
+  virtual nsAHttpConnection* Connection() = 0;
+
+  virtual void GetSecurityCallbacks(nsIInterfaceRequestor**) = 0;
+
+  virtual void OnTransportStatus(nsITransport* transport, nsresult status,
+                                 int64_t progress) = 0;
+
+  virtual bool IsDone() = 0;
+  virtual nsresult Status() = 0;
+  virtual uint32_t Caps() = 0;
+
+  [[nodiscard]] virtual nsresult ReadSegments(nsAHttpSegmentReader* reader,
+                                              uint32_t count,
+                                              uint32_t* countRead) = 0;
+
+  [[nodiscard]] virtual nsresult WriteSegments(nsAHttpSegmentWriter* writer,
+                                               uint32_t count,
+                                               uint32_t* countWritten) = 0;
+
+  [[nodiscard]] virtual nsresult ReadSegmentsAgain(nsAHttpSegmentReader* reader,
+                                                   uint32_t count,
+                                                   uint32_t* countRead,
+                                                   bool* again) {
+    return ReadSegments(reader, count, countRead);
+  }
+  [[nodiscard]] virtual nsresult WriteSegmentsAgain(
+      nsAHttpSegmentWriter* writer, uint32_t count, uint32_t* countWritten,
+      bool* again) {
+    return WriteSegments(writer, count, countWritten);
+  }
+
+  virtual void Close(nsresult reason) = 0;
+
+  virtual void Cancel(nsresult aReason) {}
+
+  virtual void SetProxyConnectFailed() = 0;
+
+  virtual const nsHttpRequestHead* RequestHead() = 0;
+
+  virtual uint32_t Http1xTransactionCount() = 0;
+
+  [[nodiscard]] virtual nsresult TakeSubTransactions(
+      nsTArray<RefPtr<nsAHttpTransaction> >& outTransactions) = 0;
+
+
+  virtual bool IsNullTransaction() { return false; }
+  virtual NullHttpTransaction* QueryNullTransaction() { return nullptr; }
+
+  virtual nsHttpTransaction* QueryHttpTransaction() { return nullptr; }
+
+  virtual nsIRequestContext* RequestContext() { return nullptr; }
+
+  virtual nsHttpConnectionInfo* ConnectionInfo() = 0;
+
+  virtual bool ResponseTimeoutEnabled() const;
+  virtual PRIntervalTime ResponseTimeout();
+
+  [[nodiscard]] virtual nsresult GetTransactionTLSSocketControl(
+      nsITLSSocketControl**) {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+
+  virtual void DisableSpdy() {}
+  virtual void DisableHttp2ForProxy() {}
+  virtual void DisableHttp3(bool aAllowRetryHTTPSRR) {}
+  virtual void MakeNonSticky() {}
+  virtual void MakeRestartable() {}
+  virtual void ReuseConnectionOnRestartOK(bool) {}
+  virtual void SetIsHttp2Websocket(bool) {}
+  virtual bool IsHttp2Websocket() { return false; }
+  virtual void SetTRRInfo(nsIRequest::TRRMode aMode,
+                          TRRSkippedReason aSkipReason) {};
+  virtual bool AllowedToConnectToIpAddressSpace(
+      nsILoadInfo::IPAddressSpace aTargetIpAddressSpace) {
+    return true;
+  };
+
+  virtual void DoNotRemoveAltSvc() {}
+
+  virtual void DoNotResetIPFamilyPreference() {}
+
+  [[nodiscard]] virtual bool Do0RTT(bool aCanSendEarlyData = true) {
+    return false;
+  }
+
+  virtual void OnPSKResumptionAccepted() {}
+  [[nodiscard]] virtual nsresult Finish0RTT(bool aRestart, bool aAlpnChanged) {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+
+  virtual uint64_t BrowserId() {
+    MOZ_ASSERT(false);
+    return 0;
+  }
+
+  virtual void OnProxyConnectComplete(ProxyConnectResponseHead* aResponseHead) {
+  }
+
+  virtual void OnClientAuthCertificateRequested() {}
+  virtual void OnClientAuthCertificateSelected() {}
+
+  virtual nsresult FetchHTTPSRR() { return NS_ERROR_NOT_IMPLEMENTED; }
+  virtual nsresult OnHTTPSRRAvailable(nsIDNSHTTPSSVCRecord* aHTTPSSVCRecord,
+                                      nsISVCBRecord* aHighestPriorityRecord,
+                                      const nsACString& aCname) {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+  virtual bool IsForWebTransport() { return false; }
+  virtual bool IsResettingForTunnelConn() { return false; }
+  virtual void SetResettingForTunnelConn(bool aValue) {}
+
+  virtual void InvokeCallback() {}
+  virtual bool IsForFallback() { return false; }
+};
+
+#define NS_DECL_NSAHTTPTRANSACTION                                             \
+  void SetConnection(nsAHttpConnection*) override;                             \
+  nsAHttpConnection* Connection() override;                                    \
+  void GetSecurityCallbacks(nsIInterfaceRequestor**) override;                 \
+  void OnTransportStatus(nsITransport* transport, nsresult status,             \
+                         int64_t progress) override;                           \
+  bool IsDone() override;                                                      \
+  nsresult Status() override;                                                  \
+  uint32_t Caps() override;                                                    \
+  [[nodiscard]] virtual nsresult ReadSegments(nsAHttpSegmentReader*, uint32_t, \
+                                              uint32_t*) override;             \
+  [[nodiscard]] virtual nsresult WriteSegments(nsAHttpSegmentWriter*,          \
+                                               uint32_t, uint32_t*) override;  \
+  virtual void Close(nsresult reason) override;                                \
+  nsHttpConnectionInfo* ConnectionInfo() override;                             \
+  void SetProxyConnectFailed() override;                                       \
+  virtual const nsHttpRequestHead* RequestHead() override;                     \
+  uint32_t Http1xTransactionCount() override;                                  \
+  [[nodiscard]] nsresult TakeSubTransactions(                                  \
+      nsTArray<RefPtr<nsAHttpTransaction> >& outTransactions) override;
+
+
+class nsAHttpSegmentReader {
+  NS_INLINE_DECL_PURE_VIRTUAL_REFCOUNTING
+
+ public:
+  [[nodiscard]] virtual nsresult OnReadSegment(const char* segment,
+                                               uint32_t count,
+                                               uint32_t* countRead) = 0;
+
+  [[nodiscard]] virtual nsresult CommitToSegmentSize(uint32_t size,
+                                                     bool forceCommitment) {
+    return NS_ERROR_FAILURE;
+  }
+};
+
+#define NS_DECL_NSAHTTPSEGMENTREADER                                     \
+  [[nodiscard]] nsresult OnReadSegment(const char*, uint32_t, uint32_t*) \
+      override;
+
+
+class nsAHttpSegmentWriter {
+ public:
+  [[nodiscard]] virtual nsresult OnWriteSegment(char* segment, uint32_t count,
+                                                uint32_t* countWritten) = 0;
+};
+
+#define NS_DECL_NSAHTTPSEGMENTWRITER \
+  [[nodiscard]] nsresult OnWriteSegment(char*, uint32_t, uint32_t*) override;
+
+}  
+}  
+
+#endif  // nsAHttpTransaction_h_

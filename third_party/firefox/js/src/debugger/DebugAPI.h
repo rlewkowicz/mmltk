@@ -1,0 +1,258 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef debugger_DebugAPI_h
+#define debugger_DebugAPI_h
+
+#include "js/Debug.h"
+#include "vm/GlobalObject.h"
+#include "vm/Interpreter.h"
+#include "vm/JSContext.h"
+#include "vm/Realm.h"
+
+namespace js {
+
+
+class AbstractGeneratorObject;
+class DebugScriptMap;
+class PromiseObject;
+
+namespace gc {
+class AutoSuppressGC;
+}  
+
+namespace wasm {
+class DebugFrame;
+class Instance;
+}  
+
+enum class NativeResumeMode {
+  Continue,
+
+  Override,
+
+  Abort,
+};
+
+class DebugScript;
+class DebuggerVector;
+
+class DebugAPI {
+ public:
+  friend class Debugger;
+
+
+  static void traceFramesWithLiveHooks(JSTracer* tracer);
+
+  static inline void traceGeneratorFrame(JSTracer* tracer,
+                                         AbstractGeneratorObject* generator);
+
+#ifdef ENABLE_WASM_JSPI
+  static void traceWasmContFrame(JSTracer* tracer, JSObject* src,
+                                 wasm::DebugFrame* debugFrame,
+                                 wasm::Instance* instance);
+#endif
+
+  static void traceCrossCompartmentEdges(JSTracer* tracer);
+
+  static void traceAllForMovingGC(JSTracer* trc);
+
+  static void traceDebugScriptMap(JSTracer* trc, DebugScriptMap* map);
+
+  static void traceFromRealm(JSTracer* trc, Realm* realm);
+
+  static void sweepAll(JS::GCContext* gcx);
+
+  [[nodiscard]] static bool findSweepGroupEdges(JSRuntime* rt);
+
+  static void removeDebugScript(JS::GCContext* gcx, JSScript* script);
+
+  static void deleteDebugScriptMap(DebugScriptMap* map);
+
+#ifdef JSGC_HASH_TABLE_CHECKS
+  static void checkDebugScriptAfterMovingGC(DebugScript* ds);
+#endif
+
+#ifdef DEBUG
+  static bool edgeIsInDebuggerWeakmap(JSRuntime* rt, JSObject* src,
+                                      JS::GCCellPtr dst);
+#endif
+
+
+  static inline bool stepModeEnabled(JSScript* script);
+  static inline bool hasBreakpointsAt(JSScript* script, jsbytecode* pc);
+  static inline bool hasAnyBreakpointsOrStepMode(JSScript* script);
+
+
+  static void handleBaselineOsr(JSContext* cx, InterpreterFrame* from,
+                                jit::BaselineFrame* to);
+
+  static void handleIonBailout(JSContext* cx, jit::RematerializedFrame* from,
+                               jit::BaselineFrame* to);
+
+  static void handleUnrecoverableIonBailoutError(
+      JSContext* cx, jit::RematerializedFrame* frame);
+
+  [[nodiscard]] static bool ensureExecutionObservabilityOfOsrFrame(
+      JSContext* cx, AbstractFramePtr osrSourceFrame);
+
+  class ExecutionObservableSet {
+   public:
+    virtual Zone* singleZone() const { return nullptr; }
+    virtual JSScript* singleScriptForZoneInvalidation() const {
+      return nullptr;
+    }
+    virtual const HashSet<Zone*>* zones() const { return nullptr; }
+
+    virtual bool shouldRecompileOrInvalidate(JSScript* script) const = 0;
+    virtual bool shouldMarkAsDebuggee(FrameIter& iter) const = 0;
+  };
+
+  enum IsObserving { NotObserving = 0, Observing = 1 };
+
+
+  static void onNewScript(JSContext* cx, HandleScript script);
+
+  static inline void onNewWasmInstance(
+      JSContext* cx, Handle<WasmInstanceObject*> wasmInstance);
+
+  [[nodiscard]] static inline bool onEnterFrame(JSContext* cx,
+                                                AbstractFramePtr frame);
+
+  [[nodiscard]] static inline bool onResumeFrame(JSContext* cx,
+                                                 AbstractFramePtr frame);
+
+  static void onLeaveWasmCont(JSContext* cx, wasm::ContStack* resumeBase);
+
+  static inline NativeResumeMode onNativeCall(JSContext* cx,
+                                              const CallArgs& args,
+                                              CallReason reason);
+
+  static inline bool shouldAvoidSideEffects(JSContext* cx);
+
+  [[nodiscard]] static inline bool onDebuggerStatement(JSContext* cx,
+                                                       AbstractFramePtr frame);
+
+  [[nodiscard]] static inline bool onExceptionUnwind(JSContext* cx,
+                                                     AbstractFramePtr frame);
+
+  [[nodiscard]] static inline bool onLeaveFrame(JSContext* cx,
+                                                AbstractFramePtr frame,
+                                                const jsbytecode* pc, bool ok);
+
+  [[nodiscard]] static bool onTrap(JSContext* cx);
+
+  [[nodiscard]] static bool onSingleStep(JSContext* cx);
+
+  static inline void onNewPromise(JSContext* cx,
+                                  Handle<PromiseObject*> promise);
+
+  static inline void onPromiseSettled(JSContext* cx,
+                                      Handle<PromiseObject*> promise);
+
+  static inline void onNewGlobalObject(JSContext* cx,
+                                       Handle<GlobalObject*> global);
+
+
+  static bool debuggerObservesAllExecution(GlobalObject* global);
+
+  static bool debuggerObservesCoverage(GlobalObject* global);
+
+  static bool debuggerObservesWasm(GlobalObject* global);
+
+  static bool debuggerObservesNativeCall(GlobalObject* global);
+
+  static bool isObservedByDebuggerTrackingAllocations(
+      const GlobalObject& debuggee);
+
+  static mozilla::Maybe<double> allocationSamplingProbability(
+      GlobalObject* global);
+
+  static bool hasExceptionUnwindHook(GlobalObject* global);
+
+  static bool hasDebuggerStatementHook(GlobalObject* global);
+
+
+  [[nodiscard]] static inline bool checkNoExecute(JSContext* cx,
+                                                  HandleScript script);
+
+  [[nodiscard]] static inline bool onNewGenerator(
+      JSContext* cx, AbstractFramePtr frame,
+      Handle<AbstractGeneratorObject*> genObj);
+
+  static inline void onGeneratorClosed(JSContext* cx,
+                                       AbstractGeneratorObject* genObj);
+
+  [[nodiscard]] static inline bool onLogAllocationSite(
+      JSContext* cx, JSObject* obj, Handle<SavedFrame*> frame,
+      mozilla::TimeStamp when);
+
+  static inline void notifyParticipatesInGC(GlobalObject* global,
+                                            uint64_t majorGCNumber);
+
+ private:
+  static bool stepModeEnabledSlow(JSScript* script);
+  static bool hasBreakpointsAtSlow(JSScript* script, jsbytecode* pc);
+  static void slowPathOnNewGlobalObject(JSContext* cx,
+                                        Handle<GlobalObject*> global);
+  static void slowPathNotifyParticipatesInGC(uint64_t majorGCNumber,
+                                             JS::Realm::DebuggerVector& dbgs,
+                                             const JS::AutoRequireNoGC& nogc);
+  [[nodiscard]] static bool slowPathOnLogAllocationSite(
+      JSContext* cx, HandleObject obj, Handle<SavedFrame*> frame,
+      mozilla::TimeStamp when, JS::Realm::DebuggerVector& dbgs,
+      const gc::AutoSuppressGC& nogc);
+  [[nodiscard]] static bool slowPathOnLeaveFrame(JSContext* cx,
+                                                 AbstractFramePtr frame,
+                                                 const jsbytecode* pc, bool ok);
+  [[nodiscard]] static bool slowPathOnNewGenerator(
+      JSContext* cx, AbstractFramePtr frame,
+      Handle<AbstractGeneratorObject*> genObj);
+  static void slowPathOnGeneratorClosed(JSContext* cx,
+                                        AbstractGeneratorObject* genObj);
+  [[nodiscard]] static bool slowPathCheckNoExecute(JSContext* cx,
+                                                   HandleScript script);
+  [[nodiscard]] static bool slowPathOnEnterFrame(JSContext* cx,
+                                                 AbstractFramePtr frame);
+  [[nodiscard]] static bool slowPathOnResumeFrame(JSContext* cx,
+                                                  AbstractFramePtr frame);
+  static NativeResumeMode slowPathOnNativeCall(JSContext* cx,
+                                               const CallArgs& args,
+                                               CallReason reason);
+  static bool slowPathShouldAvoidSideEffects(JSContext* cx);
+  [[nodiscard]] static bool slowPathOnDebuggerStatement(JSContext* cx,
+                                                        AbstractFramePtr frame);
+  [[nodiscard]] static bool slowPathOnExceptionUnwind(JSContext* cx,
+                                                      AbstractFramePtr frame);
+  static void slowPathOnNewWasmInstance(
+      JSContext* cx, Handle<WasmInstanceObject*> wasmInstance);
+  static void slowPathOnNewPromise(JSContext* cx,
+                                   Handle<PromiseObject*> promise);
+  static void slowPathOnPromiseSettled(JSContext* cx,
+                                       Handle<PromiseObject*> promise);
+  static bool inFrameMaps(AbstractFramePtr frame);
+  static void slowPathTraceGeneratorFrame(JSTracer* tracer,
+                                          AbstractGeneratorObject* generator);
+};
+
+class AutoSuppressDebuggeeNoExecuteChecks {
+  EnterDebuggeeNoExecute** stack_;
+  EnterDebuggeeNoExecute* prev_;
+
+ public:
+  explicit AutoSuppressDebuggeeNoExecuteChecks(JSContext* cx) {
+    stack_ = &cx->noExecuteDebuggerTop.ref();
+    prev_ = *stack_;
+    *stack_ = nullptr;
+  }
+
+  ~AutoSuppressDebuggeeNoExecuteChecks() {
+    MOZ_ASSERT(!*stack_);
+    *stack_ = prev_;
+  }
+};
+
+} 
+
+#endif /* debugger_DebugAPI_h */

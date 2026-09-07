@@ -1,0 +1,1016 @@
+/*
+ * Copyright 2016 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#ifndef wasm_code_h
+#define wasm_code_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/BinarySearch.h"
+#include "mozilla/DebugOnly.h"
+#include "mozilla/EnumeratedArray.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/UniquePtr.h"
+
+#include <stddef.h>
+#include <stdint.h>
+#include <utility>
+
+#include "jstypes.h"
+
+#include "gc/Memory.h"
+#include "jit/ProcessExecutableMemory.h"
+#include "js/AllocPolicy.h"
+#include "js/UniquePtr.h"
+#include "js/Utility.h"
+#include "js/Vector.h"
+#include "threading/ExclusiveData.h"
+#include "util/Memory.h"
+#include "vm/MutexIDs.h"
+#include "wasm/WasmBuiltinModule.h"
+#include "wasm/WasmBuiltins.h"
+#include "wasm/WasmCodegenConstants.h"
+#include "wasm/WasmCodegenTypes.h"
+#include "wasm/WasmCompileArgs.h"
+#include "wasm/WasmConstants.h"
+#include "wasm/WasmExprType.h"
+#include "wasm/WasmGC.h"
+#include "wasm/WasmLog.h"
+#include "wasm/WasmMetadata.h"
+#include "wasm/WasmModuleTypes.h"
+#include "wasm/WasmSerialize.h"
+#include "wasm/WasmShareable.h"
+#include "wasm/WasmTypeDecls.h"
+#include "wasm/WasmTypeDef.h"
+#include "wasm/WasmValType.h"
+
+struct JS_PUBLIC_API JSContext;
+class JSFunction;
+
+namespace js {
+
+namespace jit {
+class MacroAssembler;
+};
+
+namespace wasm {
+
+
+struct LinkDataCacheablePod {
+  uint32_t trapOffset = 0;
+
+  WASM_CHECK_CACHEABLE_POD(trapOffset);
+
+  LinkDataCacheablePod() = default;
+};
+
+WASM_DECLARE_CACHEABLE_POD(LinkDataCacheablePod);
+
+WASM_CHECK_CACHEABLE_POD_PADDING(LinkDataCacheablePod)
+
+struct LinkData : LinkDataCacheablePod {
+  LinkData() = default;
+
+  LinkDataCacheablePod& pod() { return *this; }
+  const LinkDataCacheablePod& pod() const { return *this; }
+
+  struct InternalLink {
+    uint32_t patchAtOffset;
+    uint32_t targetOffset;
+#ifdef JS_CODELABEL_LINKMODE
+    uint32_t mode;
+#endif
+
+    WASM_CHECK_CACHEABLE_POD(patchAtOffset, targetOffset);
+#ifdef JS_CODELABEL_LINKMODE
+    WASM_CHECK_CACHEABLE_POD(mode)
+#endif
+  };
+  using InternalLinkVector = Vector<InternalLink, 0, SystemAllocPolicy>;
+
+  struct SymbolicLinkArray
+      : mozilla::EnumeratedArray<SymbolicAddress, Uint32Vector,
+                                 size_t(SymbolicAddress::Limit)> {
+    bool isEmpty() const {
+      for (const Uint32Vector& symbolicLinks : *this) {
+        if (symbolicLinks.length() != 0) {
+          return false;
+        }
+      }
+      return true;
+    }
+    void clear() {
+      for (SymbolicAddress symbolicAddress :
+           mozilla::MakeEnumeratedRange(SymbolicAddress::Limit)) {
+        (*this)[symbolicAddress].clear();
+      }
+    }
+
+    size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+  };
+
+  InternalLinkVector internalLinks;
+  CallFarJumpVector callFarJumps;
+  SymbolicLinkArray symbolicLinks;
+
+  bool isEmpty() const {
+    return internalLinks.length() == 0 && callFarJumps.length() == 0 &&
+           symbolicLinks.isEmpty();
+  }
+  void clear() {
+    internalLinks.clear();
+    callFarJumps.clear();
+    symbolicLinks.clear();
+  }
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+};
+
+WASM_DECLARE_CACHEABLE_POD(LinkData::InternalLink);
+
+using UniqueLinkData = UniquePtr<LinkData>;
+using UniqueLinkDataVector = Vector<UniqueLinkData, 0, SystemAllocPolicy>;
+
+
+struct FreeCode {
+  uint32_t codeLength;
+  FreeCode() : codeLength(0) {}
+  explicit FreeCode(uint32_t codeLength) : codeLength(codeLength) {}
+  void operator()(uint8_t* codeBytes);
+};
+
+using UniqueCodeBytes = UniquePtr<uint8_t, FreeCode>;
+
+class Code;
+class CodeBlock;
+
+using UniqueCodeBlock = UniquePtr<CodeBlock>;
+using UniqueConstCodeBlock = UniquePtr<const CodeBlock>;
+using UniqueConstCodeBlockVector =
+    Vector<UniqueConstCodeBlock, 0, SystemAllocPolicy>;
+using RawCodeBlockVector = Vector<const CodeBlock*, 0, SystemAllocPolicy>;
+
+enum class CodeBlockKind {
+  SharedStubs,
+  BaselineTier,
+  OptimizedTier,
+  LazyStubs
+};
+
+class CodeSource {
+  jit::MacroAssembler* masm_ = nullptr;
+  const uint8_t* bytes_ = nullptr;
+
+  uint32_t length_ = 0;
+
+  const LinkData* linkData_;
+
+  const Code* code_;
+
+ public:
+  CodeSource(jit::MacroAssembler& masm, const LinkData* linkData,
+             const Code* code);
+
+  CodeSource(const uint8_t* bytes, uint32_t length, const LinkData& linkData,
+             const Code* code);
+
+  uint32_t lengthBytes() const { return length_; }
+
+  bool copyAndLink(jit::AutoMarkJitCodeWritableForThread& writable,
+                   uint8_t* codeStart) const;
+};
+
+class CodeSegment : public ShareableBase<CodeSegment> {
+ private:
+  const UniqueCodeBytes bytes_;
+  uint32_t lengthBytes_;
+  const uint32_t capacityBytes_;
+  const Code* code_;
+
+  static RefPtr<CodeSegment> create(
+      mozilla::Maybe<jit::AutoMarkJitCodeWritableForThread>& writable,
+      size_t capacityBytes, bool allowLastDitchGC = true);
+
+  static size_t AllocationAlignment();
+  static size_t AlignAllocationBytes(uintptr_t bytes);
+  static bool IsAligned(uintptr_t bytes);
+
+  bool hasSpace(size_t bytes) const;
+
+  void claimSpace(size_t bytes, uint8_t** claimedBase);
+
+ public:
+  CodeSegment(UniqueCodeBytes bytes, uint32_t lengthBytes,
+              uint32_t capacityBytes)
+      : bytes_(std::move(bytes)),
+        lengthBytes_(lengthBytes),
+        capacityBytes_(capacityBytes),
+        code_(nullptr) {}
+
+  static RefPtr<CodeSegment> allocate(
+      const CodeSource& codeSource,
+      Vector<RefPtr<CodeSegment>, 0, SystemAllocPolicy>* segmentPool,
+      bool allowLastDitchGC, uint8_t** codeStartOut,
+      uint32_t* allocationLengthOut);
+
+  void setCode(const Code& code) { code_ = &code; }
+
+  uint8_t* base() const { return bytes_.get(); }
+  uint32_t lengthBytes() const {
+    MOZ_ASSERT(lengthBytes_ != UINT32_MAX);
+    return lengthBytes_;
+  }
+  uint32_t capacityBytes() const {
+    MOZ_ASSERT(capacityBytes_ != UINT32_MAX);
+    return capacityBytes_;
+  }
+
+  const Code& code() const { return *code_; }
+
+  void addSizeOfMisc(mozilla::MallocSizeOf mallocSizeOf, size_t* code,
+                     size_t* data) const;
+  WASM_DECLARE_FRIEND_SERIALIZE(CodeSegment);
+};
+
+using SharedCodeSegment = RefPtr<CodeSegment>;
+using SharedCodeSegmentVector = Vector<SharedCodeSegment, 0, SystemAllocPolicy>;
+
+extern UniqueCodeBytes AllocateCodeBytes(
+    mozilla::Maybe<jit::AutoMarkJitCodeWritableForThread>& writable,
+    uint32_t codeLength, bool allowLastDitchGC);
+extern bool StaticallyLink(jit::AutoMarkJitCodeWritableForThread& writable,
+                           uint8_t* base, const LinkData& linkData,
+                           const Code* maybeCode);
+extern void StaticallyUnlink(uint8_t* base, const LinkData& linkData);
+
+enum class TierUpState : uint32_t {
+  NotRequested,
+  Requested,
+  Finished,
+};
+
+struct FuncState {
+  mozilla::Atomic<const CodeBlock*> bestTier;
+  mozilla::Atomic<TierUpState> tierUpState;
+};
+using FuncStatesPointer = mozilla::UniquePtr<FuncState[], JS::FreePolicy>;
+
+
+struct LazyFuncExport {
+  size_t funcIndex;
+  size_t lazyStubBlockIndex;
+  size_t funcCodeRangeIndex;
+  mozilla::DebugOnly<CodeBlockKind> funcKind;
+
+  LazyFuncExport(size_t funcIndex, size_t lazyStubBlockIndex,
+                 size_t funcCodeRangeIndex, CodeBlockKind funcKind)
+      : funcIndex(funcIndex),
+        lazyStubBlockIndex(lazyStubBlockIndex),
+        funcCodeRangeIndex(funcCodeRangeIndex),
+        funcKind(funcKind) {}
+};
+
+using LazyFuncExportVector = Vector<LazyFuncExport, 0, SystemAllocPolicy>;
+
+
+class FuncExport {
+  uint32_t funcIndex_;
+  uint32_t eagerInterpEntryOffset_;  
+
+  WASM_CHECK_CACHEABLE_POD(funcIndex_, eagerInterpEntryOffset_);
+
+  static constexpr uint32_t PENDING_EAGER_STUBS = UINT32_MAX - 1;
+
+  static constexpr uint32_t NO_EAGER_STUBS = UINT32_MAX;
+
+ public:
+  FuncExport() = default;
+  explicit FuncExport(uint32_t funcIndex, bool hasEagerStubs) {
+    funcIndex_ = funcIndex;
+    eagerInterpEntryOffset_ =
+        hasEagerStubs ? PENDING_EAGER_STUBS : NO_EAGER_STUBS;
+  }
+  void initEagerInterpEntryOffset(uint32_t entryOffset) {
+    MOZ_ASSERT(eagerInterpEntryOffset_ == PENDING_EAGER_STUBS);
+    MOZ_ASSERT(entryOffset != PENDING_EAGER_STUBS &&
+               entryOffset != NO_EAGER_STUBS);
+    MOZ_ASSERT(hasEagerStubs());
+    eagerInterpEntryOffset_ = entryOffset;
+  }
+
+  bool hasEagerStubs() const {
+    return eagerInterpEntryOffset_ != NO_EAGER_STUBS;
+  }
+  uint32_t funcIndex() const { return funcIndex_; }
+  uint32_t eagerInterpEntryOffset() const {
+    MOZ_ASSERT(eagerInterpEntryOffset_ != PENDING_EAGER_STUBS);
+    MOZ_ASSERT(hasEagerStubs());
+    return eagerInterpEntryOffset_;
+  }
+  void offsetBy(uint32_t delta) {
+    if (hasEagerStubs()) {
+      eagerInterpEntryOffset_ += delta;
+    }
+  }
+};
+
+WASM_DECLARE_CACHEABLE_POD(FuncExport);
+
+using FuncExportVector = Vector<FuncExport, 0, SystemAllocPolicy>;
+
+
+class FuncImport {
+ private:
+  uint32_t interpExitCodeOffset_;  
+  uint32_t jitExitCodeOffset_;     
+
+  WASM_CHECK_CACHEABLE_POD(interpExitCodeOffset_, jitExitCodeOffset_);
+
+ public:
+  FuncImport() : interpExitCodeOffset_(0), jitExitCodeOffset_(0) {}
+
+  void initInterpExitOffset(uint32_t off) {
+    MOZ_ASSERT(!interpExitCodeOffset_);
+    interpExitCodeOffset_ = off;
+  }
+  void initJitExitOffset(uint32_t off) {
+    MOZ_ASSERT(!jitExitCodeOffset_);
+    jitExitCodeOffset_ = off;
+  }
+
+  uint32_t interpExitCodeOffset() const { return interpExitCodeOffset_; }
+  uint32_t jitExitCodeOffset() const { return jitExitCodeOffset_; }
+};
+
+WASM_DECLARE_CACHEABLE_POD(FuncImport)
+
+using FuncImportVector = Vector<FuncImport, 0, SystemAllocPolicy>;
+
+static const uint32_t BAD_CODE_RANGE = UINT32_MAX;
+
+class FuncToCodeRangeMap {
+  uint32_t startFuncIndex_ = 0;
+  Uint32Vector funcToCodeRange_;
+
+  bool denseHasFuncIndex(uint32_t funcIndex) const {
+    return funcIndex >= startFuncIndex_ &&
+           funcIndex - startFuncIndex_ < funcToCodeRange_.length();
+  }
+
+  FuncToCodeRangeMap(uint32_t startFuncIndex, Uint32Vector&& funcToCodeRange)
+      : startFuncIndex_(startFuncIndex),
+        funcToCodeRange_(std::move(funcToCodeRange)) {}
+
+ public:
+  [[nodiscard]] static bool createDense(uint32_t startFuncIndex,
+                                        uint32_t numFuncs,
+                                        FuncToCodeRangeMap* result) {
+    Uint32Vector funcToCodeRange;
+    if (!funcToCodeRange.appendN(BAD_CODE_RANGE, numFuncs)) {
+      return false;
+    }
+    *result = FuncToCodeRangeMap(startFuncIndex, std::move(funcToCodeRange));
+    return true;
+  }
+
+  FuncToCodeRangeMap() = default;
+  FuncToCodeRangeMap(FuncToCodeRangeMap&& rhs) = default;
+  FuncToCodeRangeMap& operator=(FuncToCodeRangeMap&& rhs) = default;
+  FuncToCodeRangeMap(const FuncToCodeRangeMap& rhs) = delete;
+  FuncToCodeRangeMap& operator=(const FuncToCodeRangeMap& rhs) = delete;
+
+  uint32_t lookup(uint32_t funcIndex) const {
+    if (!denseHasFuncIndex(funcIndex)) {
+      return BAD_CODE_RANGE;
+    }
+    return funcToCodeRange_[funcIndex - startFuncIndex_];
+  }
+
+  uint32_t operator[](uint32_t funcIndex) const { return lookup(funcIndex); }
+
+  [[nodiscard]] bool insert(uint32_t funcIndex, uint32_t codeRangeIndex) {
+    if (!denseHasFuncIndex(funcIndex)) {
+      return false;
+    }
+    funcToCodeRange_[funcIndex - startFuncIndex_] = codeRangeIndex;
+    return true;
+  }
+  void insertInfallible(uint32_t funcIndex, uint32_t codeRangeIndex) {
+    bool result = insert(funcIndex, codeRangeIndex);
+    MOZ_RELEASE_ASSERT(result);
+  }
+
+  void shrinkStorageToFit() { funcToCodeRange_.shrinkStorageToFit(); }
+
+  void assertAllInitialized() {
+#ifdef DEBUG
+    for (uint32_t codeRangeIndex : funcToCodeRange_) {
+      MOZ_ASSERT(codeRangeIndex != BAD_CODE_RANGE);
+    }
+#endif
+  }
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+    return funcToCodeRange_.sizeOfExcludingThis(mallocSizeOf);
+  }
+
+  size_t numEntries() const { return funcToCodeRange_.length(); }
+
+  WASM_DECLARE_FRIEND_SERIALIZE(FuncToCodeRangeMap);
+};
+
+
+class CodeBlock {
+ public:
+  const Code* code;
+  size_t codeBlockIndex;
+
+  const CodeBlockKind kind;
+
+  SharedCodeSegment segment;
+
+  uint8_t* codeBase;
+  size_t codeLength;
+
+  FuncToCodeRangeMap funcToCodeRange;
+  CodeRangeVector codeRanges;
+  InliningContext inliningContext;
+  CallSites callSites;
+  TrapSites trapSites;
+  FuncExportVector funcExports;
+  StackMaps stackMaps;
+  TryNoteVector tryNotes;
+  CodeRangeUnwindInfoVector codeRangeUnwindInfos;
+
+  bool unregisterOnDestroy_;
+
+  static constexpr CodeBlockKind kindFromTier(Tier tier) {
+    if (tier == Tier::Optimized) {
+      return CodeBlockKind::OptimizedTier;
+    }
+    MOZ_ASSERT(tier == Tier::Baseline);
+    return CodeBlockKind::BaselineTier;
+  }
+
+  explicit CodeBlock(CodeBlockKind kind)
+      : code(nullptr),
+        codeBlockIndex((size_t)-1),
+        kind(kind),
+        codeBase(nullptr),
+        codeLength(0),
+        unregisterOnDestroy_(false) {}
+  ~CodeBlock();
+
+  bool initialized() const {
+    if (code) {
+      MOZ_ASSERT(codeBlockIndex != (size_t)-1);
+      return true;
+    }
+    return false;
+  }
+
+  bool initialize(const Code& code, size_t codeBlockIndex);
+  void sendToProfiler(const CodeMetadata& codeMeta,
+                      const CodeTailMetadata& codeTailMeta,
+                      FuncIonPerfSpewerSpan ionSpewers,
+                      FuncBaselinePerfSpewerSpan baselineSpewers) const;
+
+  Tier tier() const {
+    switch (kind) {
+      case CodeBlockKind::BaselineTier:
+        return Tier::Baseline;
+      case CodeBlockKind::OptimizedTier:
+        return Tier::Optimized;
+      default:
+        MOZ_CRASH();
+    }
+  }
+
+  bool isSerializable() const {
+    return kind == CodeBlockKind::SharedStubs ||
+           kind == CodeBlockKind::OptimizedTier;
+  }
+
+  uint8_t* base() const { return codeBase; }
+  uint32_t length() const { return codeLength; }
+  bool containsCodePC(const void* pc) const {
+    return pc >= base() && pc < (base() + length());
+  }
+
+  const CodeRange& codeRange(uint32_t funcIndex) const {
+    return codeRanges[funcToCodeRange[funcIndex]];
+  }
+  const CodeRange& codeRange(const FuncExport& funcExport) const {
+    return codeRanges[funcToCodeRange[funcExport.funcIndex()]];
+  }
+
+  const CodeRange* lookupRange(const void* pc) const;
+  bool lookupCallSite(void* pc, CallSite* callSite) const;
+  const StackMap* lookupStackMap(uint8_t* pc) const;
+  const TryNote* lookupTryNote(const void* pc) const;
+  bool lookupTrap(void* pc, Trap* kindOut, TrapSite* trapOut) const;
+  const CodeRangeUnwindInfo* lookupUnwindInfo(void* pc) const;
+  FuncExport& lookupFuncExport(uint32_t funcIndex,
+                               size_t* funcExportIndex = nullptr);
+  const FuncExport& lookupFuncExport(uint32_t funcIndex,
+                                     size_t* funcExportIndex = nullptr) const;
+
+  void disassemble(JSContext* cx, int kindSelection,
+                   PrintCallback printString) const;
+
+  void addSizeOfMisc(mozilla::MallocSizeOf mallocSizeOf, size_t* code,
+                     size_t* data) const;
+
+  WASM_DECLARE_FRIEND_SERIALIZE_ARGS(CodeBlock, const wasm::LinkData& data);
+};
+
+
+class ThreadSafeCodeBlockMap {
+
+  Mutex mutatorsMutex_ MOZ_UNANNOTATED;
+
+  RawCodeBlockVector segments1_;
+  RawCodeBlockVector segments2_;
+
+
+  RawCodeBlockVector* mutableCodeBlocks_;
+  mozilla::Atomic<const RawCodeBlockVector*> readonlyCodeBlocks_;
+  mozilla::Atomic<size_t> numActiveLookups_;
+
+  struct CodeBlockPC {
+    const void* pc;
+    explicit CodeBlockPC(const void* pc) : pc(pc) {}
+    int operator()(const CodeBlock* cb) const {
+      if (cb->containsCodePC(pc)) {
+        return 0;
+      }
+      if (pc < cb->base()) {
+        return -1;
+      }
+      return 1;
+    }
+  };
+
+  void swapAndWait() {
+
+
+    mutableCodeBlocks_ = const_cast<RawCodeBlockVector*>(
+        readonlyCodeBlocks_.exchange(mutableCodeBlocks_));
+
+
+
+    while (numActiveLookups_ > 0) {
+    }
+  }
+
+ public:
+  ThreadSafeCodeBlockMap()
+      : mutatorsMutex_(mutexid::WasmCodeBlockMap),
+        mutableCodeBlocks_(&segments1_),
+        readonlyCodeBlocks_(&segments2_),
+        numActiveLookups_(0) {}
+
+  ~ThreadSafeCodeBlockMap() {
+    MOZ_RELEASE_ASSERT(numActiveLookups_ == 0);
+    segments1_.clearAndFree();
+    segments2_.clearAndFree();
+  }
+
+  size_t numActiveLookups() const { return numActiveLookups_; }
+
+  bool insert(const CodeBlock* cs) {
+    LockGuard<Mutex> lock(mutatorsMutex_);
+
+    size_t index;
+    MOZ_ALWAYS_FALSE(BinarySearchIf(*mutableCodeBlocks_, 0,
+                                    mutableCodeBlocks_->length(),
+                                    CodeBlockPC(cs->base()), &index));
+
+    if (!mutableCodeBlocks_->insert(mutableCodeBlocks_->begin() + index, cs)) {
+      return false;
+    }
+
+    swapAndWait();
+
+#ifdef DEBUG
+    size_t otherIndex;
+    MOZ_ALWAYS_FALSE(BinarySearchIf(*mutableCodeBlocks_, 0,
+                                    mutableCodeBlocks_->length(),
+                                    CodeBlockPC(cs->base()), &otherIndex));
+    MOZ_ASSERT(index == otherIndex);
+#endif
+
+    AutoEnterOOMUnsafeRegion oom;
+    if (!mutableCodeBlocks_->insert(mutableCodeBlocks_->begin() + index, cs)) {
+      oom.crash("when inserting a CodeBlock in the process-wide map");
+    }
+
+    return true;
+  }
+
+  size_t remove(const CodeBlock* cs) {
+    LockGuard<Mutex> lock(mutatorsMutex_);
+
+    size_t index;
+    MOZ_ALWAYS_TRUE(BinarySearchIf(*mutableCodeBlocks_, 0,
+                                   mutableCodeBlocks_->length(),
+                                   CodeBlockPC(cs->base()), &index));
+
+    mutableCodeBlocks_->erase(mutableCodeBlocks_->begin() + index);
+    size_t newCodeBlockCount = mutableCodeBlocks_->length();
+
+    swapAndWait();
+
+#ifdef DEBUG
+    size_t otherIndex;
+    MOZ_ALWAYS_TRUE(BinarySearchIf(*mutableCodeBlocks_, 0,
+                                   mutableCodeBlocks_->length(),
+                                   CodeBlockPC(cs->base()), &otherIndex));
+    MOZ_ASSERT(index == otherIndex);
+#endif
+
+    mutableCodeBlocks_->erase(mutableCodeBlocks_->begin() + index);
+    return newCodeBlockCount;
+  }
+
+  const CodeBlock* lookup(const void* pc,
+                          const CodeRange** codeRange = nullptr) {
+    auto decObserver = mozilla::MakeScopeExit([&] {
+      MOZ_ASSERT(numActiveLookups_ > 0);
+      numActiveLookups_--;
+    });
+    numActiveLookups_++;
+
+    const RawCodeBlockVector* readonly = readonlyCodeBlocks_;
+
+    size_t index;
+    if (!BinarySearchIf(*readonly, 0, readonly->length(), CodeBlockPC(pc),
+                        &index)) {
+      if (codeRange) {
+        *codeRange = nullptr;
+      }
+      return nullptr;
+    }
+
+
+    const CodeBlock* result = (*readonly)[index];
+    if (codeRange) {
+      *codeRange = result->lookupRange(pc);
+    }
+    return result;
+  }
+};
+
+
+class JumpTables {
+  using TablePointer = mozilla::UniquePtr<void*[], JS::FreePolicy>;
+
+  CompileMode mode_ = CompileMode::Once;
+  TablePointer tiering_;
+  TablePointer jit_;
+  size_t numFuncs_ = 0;
+
+  static_assert(
+      JumpTableJitEntryOffset == 0,
+      "Each jit entry in table must have compatible layout with BaseScript and"
+      "SelfHostedLazyScript");
+
+ public:
+  bool initialize(CompileMode mode, const CodeMetadata& codeMeta,
+                  const CodeBlock& sharedStubs, const CodeBlock& tier1);
+
+  void setJitEntry(size_t i, void* target) const {
+    MOZ_ASSERT(i < numFuncs_);
+    __atomic_store_n(&jit_.get()[i], target, __ATOMIC_RELAXED);
+  }
+  void setJitEntryIfNull(size_t i, void* target) const {
+    MOZ_ASSERT(i < numFuncs_);
+    void* expected = nullptr;
+    (void)__atomic_compare_exchange_n(&jit_.get()[i], &expected, target,
+                                      false,
+                                      __ATOMIC_RELAXED,
+                                      __ATOMIC_RELAXED);
+  }
+  void** getAddressOfJitEntry(size_t i) const {
+    MOZ_ASSERT(i < numFuncs_);
+    MOZ_ASSERT(jit_.get()[i]);
+    return &jit_.get()[i];
+  }
+  uint32_t funcIndexFromJitEntry(void** target) const {
+    MOZ_ASSERT(target >= &jit_.get()[0]);
+    MOZ_ASSERT(target <= &(jit_.get()[numFuncs_ - 1]));
+    size_t index = (intptr_t*)target - (intptr_t*)&jit_.get()[0];
+    MOZ_ASSERT(index < wasm::MaxFuncs);
+    return (uint32_t)index;
+  }
+
+  void setTieringEntry(size_t i, void* target) const {
+    MOZ_ASSERT(i < numFuncs_);
+    if (mode_ != CompileMode::Once) {
+      tiering_.get()[i] = target;
+    }
+  }
+  void** tiering() const { return tiering_.get(); }
+
+  size_t sizeOfMiscExcludingThis() const {
+    return sizeof(void*) * (2 + (tiering_ ? 1 : 0)) * numFuncs_;
+  }
+};
+
+
+using SharedCode = RefPtr<const Code>;
+using MutableCode = RefPtr<Code>;
+using MetadataAnalysisHashMap =
+    HashMap<const char*, uint32_t, mozilla::CStringHasher, SystemAllocPolicy>;
+
+class Code : public ShareableBase<Code> {
+  struct ProtectedData {
+    UniqueConstCodeBlockVector blocks;
+    UniqueLinkDataVector blocksLinkData;
+
+    SharedCodeSegmentVector lazyStubSegments;
+    LazyFuncExportVector lazyExports;
+
+    SharedCodeSegmentVector lazyFuncSegments;
+
+    CompileAndLinkStats tier1Stats;
+    CompileAndLinkStats tier2Stats;
+  };
+  using ReadGuard = RWExclusiveData<ProtectedData>::ReadGuard;
+  using WriteGuard = RWExclusiveData<ProtectedData>::WriteGuard;
+
+  const CompileMode mode_;
+
+  RWExclusiveData<ProtectedData> data_;
+
+  mutable ThreadSafeCodeBlockMap blockMap_;
+
+  SharedCodeMetadata codeMeta_;
+  SharedCodeTailMetadata codeTailMeta_;
+
+  const CodeBlock* sharedStubs_;
+  const CodeBlock* completeTier1_;
+
+  mutable const CodeBlock* completeTier2_;
+  mutable mozilla::Atomic<bool> hasCompleteTier2_;
+
+  mutable FuncStatesPointer funcStates_;
+
+  FuncImportVector funcImports_;
+  ExclusiveData<CacheableCharsVector> profilingLabels_;
+  JumpTables jumpTables_;
+
+  uint8_t* trapCode_;
+
+  uint32_t debugStubOffset_;
+
+  uint32_t requestTierUpStubOffset_;
+
+  uint32_t updateCallRefMetricsStubOffset_;
+
+#ifdef ENABLE_WASM_JSPI
+  uint32_t contBaseFrameOffset_;
+#endif
+
+  Tiers completeTiers() const;
+
+  [[nodiscard]] bool addCodeBlock(const WriteGuard& guard,
+                                  UniqueCodeBlock block,
+                                  UniqueLinkData maybeLinkData) const;
+
+  [[nodiscard]] const LazyFuncExport* lookupLazyFuncExport(
+      const WriteGuard& guard, uint32_t funcIndex) const;
+
+  [[nodiscard]] void* lookupLazyInterpEntry(const WriteGuard& guard,
+                                            uint32_t funcIndex) const;
+
+  [[nodiscard]] bool createOneLazyEntryStub(const WriteGuard& guard,
+                                            uint32_t funcExportIndex,
+                                            const CodeBlock& tierCodeBlock,
+                                            void** interpEntry) const;
+  [[nodiscard]] bool createManyLazyEntryStubs(
+      const WriteGuard& guard, const Uint32Vector& funcExportIndices,
+      const CodeBlock& tierCodeBlock, size_t* stubBlockIndex) const;
+  [[nodiscard]] bool createTier2LazyEntryStubs(
+      const WriteGuard& guard, const CodeBlock& tier2Code,
+      mozilla::Maybe<size_t>* outStubBlockIndex) const;
+  [[nodiscard]] bool appendProfilingLabels(
+      const ExclusiveData<CacheableCharsVector>::Guard& labels,
+      const CodeBlock& codeBlock) const;
+
+  void printStats() const;
+
+ public:
+  Code(CompileMode mode, const CodeMetadata& codeMeta,
+       const CodeTailMetadata& codeTailMeta);
+  ~Code();
+
+  [[nodiscard]] bool initialize(FuncImportVector&& funcImports,
+                                UniqueCodeBlock sharedStubs,
+                                UniqueLinkData sharedStubsLinkData,
+                                UniqueCodeBlock tier1CodeBlock,
+                                UniqueLinkData tier1LinkData,
+                                const CompileAndLinkStats& tier1Stats);
+  [[nodiscard]] bool finishTier2(UniqueCodeBlock tier2CodeBlock,
+                                 UniqueLinkData tier2LinkData,
+                                 const CompileAndLinkStats& tier2Stats) const;
+
+  [[nodiscard]] bool getOrCreateInterpEntry(uint32_t funcIndex,
+                                            const FuncExport** funcExport,
+                                            void** interpEntry) const;
+
+  SharedCodeSegment createFuncCodeSegmentFromPool(
+      jit::MacroAssembler& masm, const LinkData& linkData,
+      bool allowLastDitchGC, uint8_t** codeStartOut,
+      uint32_t* codeLengthOut) const;
+
+  bool requestTierUp(uint32_t funcIndex) const;
+
+  bool tryClaimTierUp(uint32_t funcIndex) const {
+    MOZ_ASSERT(mode_ == CompileMode::LazyTiering);
+    FuncState& state = funcStates_[funcIndex - codeMeta_->numFuncImports];
+    return state.tierUpState.compareExchange(TierUpState::NotRequested,
+                                             TierUpState::Requested);
+  }
+
+  CompileMode mode() const { return mode_; }
+
+  void** tieringJumpTable() const { return jumpTables_.tiering(); }
+
+  void setJitEntryIfNull(size_t i, void* target) const {
+    jumpTables_.setJitEntryIfNull(i, target);
+  }
+  void** getAddressOfJitEntry(size_t i) const {
+    return jumpTables_.getAddressOfJitEntry(i);
+  }
+  uint32_t funcIndexFromJitEntry(void** jitEntry) const {
+    return jumpTables_.funcIndexFromJitEntry(jitEntry);
+  }
+
+  uint8_t* trapCode() const { return trapCode_; }
+
+  uint32_t debugStubOffset() const { return debugStubOffset_; }
+  void setDebugStubOffset(uint32_t offs) { debugStubOffset_ = offs; }
+
+  uint32_t requestTierUpStubOffset() const { return requestTierUpStubOffset_; }
+  void setRequestTierUpStubOffset(uint32_t offs) {
+    requestTierUpStubOffset_ = offs;
+  }
+
+  uint32_t updateCallRefMetricsStubOffset() const {
+    return updateCallRefMetricsStubOffset_;
+  }
+  void setUpdateCallRefMetricsStubOffset(uint32_t offs) {
+    updateCallRefMetricsStubOffset_ = offs;
+  }
+
+#ifdef ENABLE_WASM_JSPI
+  uint32_t contBaseFrameOffset() const { return contBaseFrameOffset_; }
+  void setContBaseFrameOffset(uint32_t offs) { contBaseFrameOffset_ = offs; }
+#endif
+
+  const FuncImport& funcImport(uint32_t funcIndex) const {
+    return funcImports_[funcIndex];
+  }
+  const FuncImportVector& funcImports() const { return funcImports_; }
+
+  bool hasCompleteTier(Tier tier) const;
+  Tier stableCompleteTier() const;
+  Tier bestCompleteTier() const;
+  bool hasSerializableCode() const { return hasCompleteTier(Tier::Serialized); }
+
+  const CodeMetadata& codeMeta() const { return *codeMeta_; }
+  const CodeTailMetadata& codeTailMeta() const { return *codeTailMeta_; }
+  bool debugEnabled() const { return codeTailMeta_->debugEnabled; }
+
+  const CodeBlock& sharedStubs() const { return *sharedStubs_; }
+  const CodeBlock& debugCodeBlock() const {
+    MOZ_ASSERT(debugEnabled());
+    MOZ_ASSERT(completeTier1_->tier() == Tier::Debug);
+    return *completeTier1_;
+  }
+  const CodeBlock& completeTierCodeBlock(Tier tier) const;
+  const CodeBlock& funcCodeBlock(uint32_t funcIndex) const {
+    if (funcIndex < funcImports_.length()) {
+      return *sharedStubs_;
+    }
+    if (mode_ == CompileMode::LazyTiering) {
+      return *funcStates_.get()[funcIndex - codeMeta_->numFuncImports].bestTier;
+    }
+    return completeTierCodeBlock(bestCompleteTier());
+  }
+  bool funcHasTier(uint32_t funcIndex, Tier tier) const {
+    if (funcIndex < funcImports_.length()) {
+      return false;
+    }
+    return funcCodeBlock(funcIndex).tier() == tier;
+  }
+  Tier funcTier(uint32_t funcIndex) const {
+    MOZ_ASSERT(funcIndex >= funcImports_.length());
+    return funcCodeBlock(funcIndex).tier();
+  }
+  void funcCodeRange(uint32_t funcIndex, const wasm::CodeRange** range,
+                     uint8_t** codeBase) const {
+    const CodeBlock& codeBlock = funcCodeBlock(funcIndex);
+    *range = &codeBlock.codeRanges[codeBlock.funcToCodeRange[funcIndex]];
+    *codeBase = codeBlock.base();
+  }
+
+  const LinkData* codeBlockLinkData(const CodeBlock& block) const;
+  void clearLinkData() const;
+
+  bool lookupCallSite(void* pc, CallSite* callSite) const {
+    const CodeBlock* block = blockMap_.lookup(pc);
+    if (!block) {
+      return false;
+    }
+    return block->lookupCallSite(pc, callSite);
+  }
+  const CodeRange* lookupFuncRange(void* pc) const {
+    const CodeBlock* block = blockMap_.lookup(pc);
+    if (!block) {
+      return nullptr;
+    }
+    const CodeRange* result = block->lookupRange(pc);
+    if (result && result->isFunction()) {
+      return result;
+    }
+    return nullptr;
+  }
+  const StackMap* lookupStackMap(uint8_t* pc) const {
+    const CodeBlock* block = blockMap_.lookup(pc);
+    if (!block) {
+      return nullptr;
+    }
+    return block->lookupStackMap(pc);
+  }
+  const wasm::TryNote* lookupTryNote(void* pc, const CodeBlock** block) const {
+    *block = blockMap_.lookup(pc);
+    if (!*block) {
+      return nullptr;
+    }
+    return (*block)->lookupTryNote(pc);
+  }
+  bool lookupTrap(void* pc, Trap* kindOut, TrapSite* trapOut) const {
+    const CodeBlock* block = blockMap_.lookup(pc);
+    if (!block) {
+      return false;
+    }
+    return block->lookupTrap(pc, kindOut, trapOut);
+  }
+  const CodeRangeUnwindInfo* lookupUnwindInfo(void* pc) const {
+    const CodeBlock* block = blockMap_.lookup(pc);
+    if (!block) {
+      return nullptr;
+    }
+    return block->lookupUnwindInfo(pc);
+  }
+
+
+  void ensureProfilingLabels(bool profilingEnabled) const;
+  const char* profilingLabel(uint32_t funcIndex) const;
+
+
+  void disassemble(JSContext* cx, Tier tier, int kindSelection,
+                   PrintCallback printString) const;
+
+  MetadataAnalysisHashMap metadataAnalysis(JSContext* cx) const;
+
+
+  void addSizeOfMiscIfNotSeen(mozilla::MallocSizeOf mallocSizeOf,
+                              CodeMetadata::SeenSet* seenCodeMeta,
+                              Code::SeenSet* seenCode, size_t* code,
+                              size_t* data) const;
+
+  size_t tier1CodeMemoryUsed() const {
+    return completeTier1_->segment->capacityBytes();
+  }
+
+  WASM_DECLARE_FRIEND_SERIALIZE_ARGS(SharedCode,
+                                     const wasm::LinkData& sharedStubsLinkData,
+                                     const wasm::LinkData& optimizedLinkData);
+};
+
+void PatchDebugSymbolicAccesses(uint8_t* codeBase, jit::MacroAssembler& masm);
+
+}  
+}  
+
+#endif  // wasm_code_h

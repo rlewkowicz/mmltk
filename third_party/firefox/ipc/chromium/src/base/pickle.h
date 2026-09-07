@@ -1,0 +1,230 @@
+// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(BASE_PICKLE_H_)
+#define BASE_PICKLE_H_
+
+#include <string>
+
+#include "base/basictypes.h"
+#include "base/logging.h"
+#include "base/string16.h"
+
+#include "mozilla/BufferList.h"
+#include "mozilla/mozalloc.h"
+#include "mozilla/TimeStamp.h"
+#if !0 && (!defined(RELEASE_OR_BETA) || defined(DEBUG))
+#  define MOZ_PICKLE_SENTINEL_CHECKING
+#endif
+class Pickle;
+class PickleIterator {
+ public:
+  explicit PickleIterator(const Pickle& pickle);
+
+ private:
+  friend class Pickle;
+
+  mozilla::BufferList<InfallibleAllocPolicy>::IterImpl iter_;
+
+  template <typename T>
+  void CopyInto(T* dest);
+};
+
+class Pickle {
+ public:
+  ~Pickle();
+
+  Pickle() = delete;
+
+  explicit Pickle(uint32_t header_size, size_t segment_capacity = 0);
+
+  Pickle(uint32_t header_size, const char* data, uint32_t length);
+
+  Pickle(const Pickle& other) = delete;
+
+  Pickle(Pickle&& other);
+
+  Pickle& operator=(const Pickle& other) = delete;
+
+  Pickle& operator=(Pickle&& other);
+
+  void CopyFrom(const Pickle& other);
+
+  uint32_t size() const { return header_size_ + header_->payload_size; }
+
+  typedef mozilla::BufferList<InfallibleAllocPolicy> BufferList;
+
+  const BufferList& Buffers() const { return buffers_; }
+
+  uint32_t CurrentSize() const { return buffers_.Size(); }
+
+  [[nodiscard]] bool ReadBool(PickleIterator* iter, bool* result) const;
+  [[nodiscard]] bool ReadInt16(PickleIterator* iter, int16_t* result) const;
+  [[nodiscard]] bool ReadUInt16(PickleIterator* iter, uint16_t* result) const;
+  [[nodiscard]] bool ReadShort(PickleIterator* iter, short* result) const;
+  [[nodiscard]] bool ReadInt(PickleIterator* iter, int* result) const;
+  [[nodiscard]] bool ReadLong(PickleIterator* iter, long* result) const;
+  [[nodiscard]] bool ReadULong(PickleIterator* iter,
+                               unsigned long* result) const;
+  [[nodiscard]] bool ReadInt32(PickleIterator* iter, int32_t* result) const;
+  [[nodiscard]] bool ReadUInt32(PickleIterator* iter, uint32_t* result) const;
+  [[nodiscard]] bool ReadInt64(PickleIterator* iter, int64_t* result) const;
+  [[nodiscard]] bool ReadUInt64(PickleIterator* iter, uint64_t* result) const;
+  [[nodiscard]] bool ReadDouble(PickleIterator* iter, double* result) const;
+  [[nodiscard]] bool ReadIntPtr(PickleIterator* iter, intptr_t* result) const;
+  [[nodiscard]] bool ReadUnsignedChar(PickleIterator* iter,
+                                      unsigned char* result) const;
+  [[nodiscard]] bool ReadString(PickleIterator* iter,
+                                std::string* result) const;
+  [[nodiscard]] bool ReadWString(PickleIterator* iter,
+                                 std::wstring* result) const;
+  [[nodiscard]] bool ReadBytesInto(PickleIterator* iter, void* data,
+                                   uint32_t length) const;
+
+  [[nodiscard]] bool ReadLength(PickleIterator* iter, int* result) const;
+
+  [[nodiscard]] bool IgnoreBytes(PickleIterator* iter, uint32_t length) const;
+
+  [[nodiscard]] bool ReadSentinel(PickleIterator* iter, uint32_t sentinel) const
+#if defined(MOZ_PICKLE_SENTINEL_CHECKING)
+      ;
+#else
+  {
+    return true;
+  }
+#endif
+
+  template <class T>
+  [[nodiscard]] bool ReadScalar(PickleIterator* iter, T* result) const {
+    static_assert(std::is_arithmetic_v<T>);
+    static_assert(!std::is_same_v<std::remove_cv_t<T>, bool>);
+
+    DCHECK(iter);
+
+    if (!IteratorHasRoomFor(*iter, sizeof(*result)))
+      return ReadBytesInto(iter, result, sizeof(*result));
+
+    iter->CopyInto(result);
+
+    UpdateIter(iter, sizeof(*result));
+    return true;
+  }
+
+  bool IgnoreSentinel(PickleIterator* iter) const
+#if defined(MOZ_PICKLE_SENTINEL_CHECKING)
+      ;
+#else
+  {
+    return true;
+  }
+#endif
+
+  void EndRead(PickleIterator& iter, uint32_t ipcMessageType = 0) const;
+
+  bool HasBytesAvailable(const PickleIterator* iter, uint32_t len) const;
+
+  void Truncate(PickleIterator* iter);
+
+  bool WriteBytes(const void* data, uint32_t data_len);
+
+  template <class T>
+  bool WriteScalar(const T& value) {
+    static_assert(std::is_arithmetic_v<T>);
+    static_assert(!std::is_same_v<std::remove_cv_t<T>, bool>);
+    return WriteBytes(&value, sizeof(value));
+  }
+
+  bool WriteBool(bool value);
+  bool WriteInt16(int16_t value);
+  bool WriteUInt16(uint16_t value);
+  bool WriteInt(int value);
+  bool WriteLong(long value);
+  bool WriteULong(unsigned long value);
+  bool WriteInt32(int32_t value);
+  bool WriteUInt32(uint32_t value);
+  bool WriteInt64(int64_t value);
+  bool WriteUInt64(uint64_t value);
+  bool WriteDouble(double value);
+  bool WriteIntPtr(intptr_t value);
+  bool WriteUnsignedChar(unsigned char value);
+  bool WriteString(const std::string& value);
+  bool WriteWString(const std::wstring& value);
+  bool WriteData(const char* data, uint32_t length);
+
+  bool WriteBytesZeroCopy(void* data, uint32_t data_len, uint32_t capacity);
+
+  bool WriteSentinel(uint32_t sentinel)
+#if defined(MOZ_PICKLE_SENTINEL_CHECKING)
+      ;
+#else
+  {
+    return true;
+  }
+#endif
+
+  int32_t* GetInt32PtrForTest(uint32_t offset);
+
+  void InputBytes(const char* data, uint32_t length);
+
+  struct Header {
+    uint32_t payload_size;  
+  };
+  static_assert(std::has_unique_object_representations_v<Header>,
+                "Header must not contain padding bytes");
+
+  template <class T>
+  T* headerT() {
+    DCHECK(sizeof(T) == header_size_);
+    return static_cast<T*>(header_);
+  }
+  template <class T>
+  const T* headerT() const {
+    DCHECK(sizeof(T) == header_size_);
+    return static_cast<const T*>(header_);
+  }
+
+  typedef uint32_t memberAlignmentType;
+
+ protected:
+  uint32_t payload_size() const { return header_->payload_size; }
+
+  void BeginWrite(uint32_t length);
+
+  void EndWrite(uint32_t length);
+
+  template <uint32_t alignment>
+  struct ConstantAligner {
+    static uint32_t align(int bytes) {
+      static_assert((alignment & (alignment - 1)) == 0,
+                    "alignment must be a power of two");
+      return (bytes + (alignment - 1)) & ~static_cast<uint32_t>(alignment - 1);
+    }
+  };
+
+  static uint32_t AlignInt(int bytes) {
+    return ConstantAligner<sizeof(memberAlignmentType)>::align(bytes);
+  }
+
+  static uint32_t AlignCapacity(int bytes) {
+    return ConstantAligner<kSegmentAlignment>::align(bytes);
+  }
+
+  bool IteratorHasRoomFor(const PickleIterator& iter, uint32_t len) const;
+
+  void UpdateIter(PickleIterator* iter, uint32_t bytes) const;
+
+  static uint32_t MessageSize(uint32_t header_size, const char* range_start,
+                              const char* range_end);
+
+  static const uint32_t kSegmentAlignment = 8;
+
+ private:
+  friend class PickleIterator;
+
+  BufferList buffers_;
+  Header* header_;
+  uint32_t header_size_;
+};
+
+#endif

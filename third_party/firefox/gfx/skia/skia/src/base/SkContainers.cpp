@@ -1,0 +1,74 @@
+// Copyright 2019 Google LLC
+// Use of this source code is governed by a BSD-style license that can be found in the LICENSE file.
+
+#include "include/private/base/SkContainers.h"
+
+#include "include/private/base/SkAlign.h"
+#include "include/private/base/SkAssert.h"
+#include "include/private/base/SkMalloc.h"
+#include "include/private/base/SkTo.h"
+
+#include <algorithm>
+#include <cstddef>
+
+namespace {
+constexpr size_t kMinBytes = alignof(max_align_t);
+
+SkSpan<std::byte> complete_size(void* ptr, size_t size) {
+    if (ptr == nullptr) {
+        return {};
+    }
+
+    return {static_cast<std::byte*>(ptr), sk_malloc_size(ptr, size)};
+}
+}  
+
+SkSpan<std::byte> SkContainerAllocator::allocate(int capacity, double growthFactor) {
+    SkASSERT(capacity >= 0);
+    SkASSERT(growthFactor >= 1.0);
+    SkASSERT_RELEASE(capacity <= fMaxCapacity);
+
+    if (growthFactor > 1.0 && capacity > 0) {
+        capacity = this->growthFactorCapacity(capacity, growthFactor);
+    }
+
+    return sk_allocate_throw(capacity * fSizeOfT);
+}
+
+size_t SkContainerAllocator::roundUpCapacity(int64_t capacity) const {
+    SkASSERT(capacity >= 0);
+
+    if (capacity < fMaxCapacity - kCapacityMultiple) {
+        return SkAlignTo(capacity, kCapacityMultiple);
+    }
+
+    return SkToSizeT(fMaxCapacity);
+}
+
+size_t SkContainerAllocator::growthFactorCapacity(int capacity, double growthFactor) const {
+    SkASSERT(capacity >= 0);
+    SkASSERT(growthFactor >= 1.0);
+    const int64_t capacityGrowth = static_cast<int64_t>(capacity * growthFactor);
+
+    return this->roundUpCapacity(capacityGrowth);
+}
+
+
+SkSpan<std::byte> sk_allocate_canfail(size_t size) {
+    const size_t adjustedSize = std::max(size, kMinBytes);
+    void* ptr = sk_malloc_canfail(adjustedSize);
+    return complete_size(ptr, adjustedSize);
+}
+
+SkSpan<std::byte> sk_allocate_throw(size_t size) {
+    if (size == 0) {
+        return {};
+    }
+    const size_t adjustedSize = std::max(size, kMinBytes);
+    void* ptr = sk_malloc_throw(adjustedSize);
+    return complete_size(ptr, adjustedSize);
+}
+
+void sk_report_container_overflow_and_die() {
+    SK_ABORT("Requested capacity is too large.");
+}

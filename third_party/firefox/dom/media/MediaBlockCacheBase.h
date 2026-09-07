@@ -1,0 +1,46 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MEDIA_BLOCK_CACHE_BASE_H_
+#define MEDIA_BLOCK_CACHE_BASE_H_
+
+#include "MediaCache.h"
+#include "mozilla/Span.h"
+
+namespace mozilla {
+
+class MediaBlockCacheBase {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(MediaBlockCacheBase)
+
+  static_assert(
+      MediaCacheStream::BLOCK_SIZE <
+          static_cast<
+              std::remove_const<decltype(MediaCacheStream::BLOCK_SIZE)>::type>(
+              INT32_MAX),
+      "MediaCacheStream::BLOCK_SIZE should fit in 31 bits");
+  static constexpr int32_t BLOCK_SIZE = MediaCacheStream::BLOCK_SIZE;
+
+ protected:
+  virtual ~MediaBlockCacheBase() = default;
+
+ public:
+  virtual nsresult Init() = 0;
+
+  virtual void Flush() = 0;
+
+  virtual size_t GetMaxBlocks(size_t aCacheSizeInKiB) const = 0;
+
+  virtual nsresult WriteBlock(uint32_t aBlockIndex, Span<const uint8_t> aData1,
+                              Span<const uint8_t> aData2) = 0;
+
+  virtual nsresult Read(int64_t aOffset, uint8_t* aData, int32_t aLength) = 0;
+
+  virtual nsresult MoveBlock(int32_t aSourceBlockIndex,
+                             int32_t aDestBlockIndex) = 0;
+};
+
+}  
+
+#endif /* MEDIA_BLOCK_CACHE_BASE_H_ */

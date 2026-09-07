@@ -1,0 +1,354 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include <errno.h>
+#include <fcntl.h>
+#include <mutex>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include "base/eintr_wrapper.h"
+#include "base/logging.h"
+#include "base/message_loop.h"
+#include "base/process_util.h"
+#include "mozilla/DataMutex.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/ipc/IOThread.h"
+#include "nsITimer.h"
+#include "nsTArray.h"
+#include "nsThreadUtils.h"
+#include "nsXULAppAPI.h"
+#include "prenv.h"
+
+#include "chrome/common/process_watcher.h"
+
+#if defined(MOZ_ENABLE_FORKSERVER)
+#  include "mozilla/ipc/ForkServiceChild.h"
+#endif
+
+
+#  define HAVE_PIPE2 1
+
+
+static constexpr int kMaxWaitMs = 2000;
+
+#if defined(MOZ_CODE_COVERAGE)
+static constexpr int kShutdownWaitMs = 80000;
+#elif defined(MOZ_ASAN) || defined(MOZ_TSAN)
+static constexpr int kShutdownWaitMs = 40000;
+#else
+static constexpr int kShutdownWaitMs = 8000;
+#endif
+
+namespace {
+
+using base::BlockingWait;
+
+struct PendingChild {
+  pid_t mPid;
+  nsCOMPtr<nsITimer> mForce;
+};
+
+static mozilla::StaticDataMutex<mozilla::StaticAutoPtr<nsTArray<PendingChild>>>
+    gPendingChildren("ProcessWatcher::gPendingChildren");
+static int gSignalPipe[2] = {-1, -1};
+static mozilla::Atomic<bool> gProcessWatcherShutdown;
+
+static bool IsProcessDead(pid_t pid, BlockingWait aBlock) {
+  int info = 0;
+
+  auto status = WaitForProcess(pid, aBlock, &info);
+  while (aBlock == BlockingWait::Yes &&
+         status == base::ProcessStatus::Running) {
+    sleep(1);
+    status = WaitForProcess(pid, aBlock, &info);
+  }
+
+  switch (status) {
+    case base::ProcessStatus::Running:
+      return false;
+
+    case base::ProcessStatus::Exited:
+      if (info != 0) {
+        CHROMIUM_LOG(WARNING)
+            << "process " << pid << " exited with status " << info;
+      }
+      return true;
+
+    case base::ProcessStatus::Killed:
+      CHROMIUM_LOG(WARNING)
+          << "process " << pid << " exited on signal " << info;
+      return true;
+
+    case base::ProcessStatus::Error:
+      CHROMIUM_LOG(ERROR) << "waiting for process " << pid
+                          << " failed with error " << info;
+      return true;
+
+    default:
+      DCHECK(false) << "can't happen";
+      return true;
+  }
+}
+
+already_AddRefed<nsITimer> DelayedKill(pid_t aPid) {
+  nsCOMPtr<nsITimer> timer;
+
+  nsresult rv = NS_NewTimerWithCallback(
+      getter_AddRefs(timer),
+      [aPid](nsITimer*) {
+        if (IsProcessDead(aPid, BlockingWait::No)) {
+          return;
+        }
+        if (kill(aPid, SIGKILL) != 0) {
+          const int err = errno;
+#if defined(MOZ_ENABLE_FORKSERVER)
+          const bool forkServed = mozilla::ipc::ForkServiceChild::WasUsed();
+#else
+          constexpr bool forkServed = false;
+#endif
+          if (err != ESRCH || !forkServed) {
+            CHROMIUM_LOG(ERROR) << "failed to send SIGKILL to process " << aPid
+                                << strerror(err);
+          }
+        }
+      },
+      kMaxWaitMs, nsITimer::TYPE_ONE_SHOT, "ProcessWatcher::DelayedKill"_ns,
+      XRE_GetAsyncIOEventTarget());
+
+  if (NS_FAILED(rv)) {
+    CHROMIUM_LOG(WARNING) << "failed to start kill timer for process " << aPid
+                          << "; killing immediately";
+    kill(aPid, SIGKILL);
+    return nullptr;
+  }
+
+  return timer.forget();
+}
+
+bool CrashProcessIfHanging(pid_t aPid) {
+  if (IsProcessDead(aPid, BlockingWait::No)) {
+    return false;
+  }
+
+  static int sWaitMs = kShutdownWaitMs;
+  if (sWaitMs > 0) {
+    CHROMIUM_LOG(WARNING) << "Process " << aPid
+                          << " may be hanging at shutdown; will wait for up to "
+                          << sWaitMs << "ms";
+  }
+  while (sWaitMs > 0) {
+    static constexpr int kWaitTickMs = 200;
+    struct timespec ts = {kWaitTickMs / 1000, (kWaitTickMs % 1000) * 1000000};
+    HANDLE_EINTR(nanosleep(&ts, &ts));
+    sWaitMs -= kWaitTickMs;
+
+    if (IsProcessDead(aPid, BlockingWait::No)) {
+      return false;
+    }
+  }
+
+  CHROMIUM_LOG(ERROR)
+      << "Process " << aPid
+      << " hanging at shutdown; attempting crash report (fatal error).";
+
+  kill(aPid, SIGABRT);
+  return true;
+}
+
+class ProcessCleaner final : public MessageLoopForIO::Watcher,
+                             public MessageLoop::DestructionObserver {
+ public:
+  void Register() {
+    MessageLoopForIO* loop = MessageLoopForIO::current();
+    loop->AddDestructionObserver(this);
+    loop->WatchFileDescriptor(gSignalPipe[0],  true,
+                              MessageLoopForIO::WATCH_READ, &mWatcher, this);
+  }
+
+  void OnFileCanReadWithoutBlocking(int fd) override {
+    DCHECK(fd == gSignalPipe[0]);
+    ssize_t rv;
+    do {
+      char msg[32];
+      rv = HANDLE_EINTR(read(gSignalPipe[0], msg, sizeof msg));
+      CHECK(rv != 0);
+      if (rv < 0) {
+        DCHECK(errno == EAGAIN || errno == EWOULDBLOCK);
+      } else {
+#if defined(DEBUG)
+        for (size_t i = 0; i < (size_t)rv; ++i) {
+          DCHECK(msg[i] == 0);
+        }
+#endif
+      }
+    } while (rv > 0);
+    PruneDeadProcesses();
+  }
+
+  void OnFileCanWriteWithoutBlocking(int fd) override {
+    CHROMIUM_LOG(FATAL) << "unreachable";
+  }
+
+  void WillDestroyCurrentMessageLoop() override {
+    gProcessWatcherShutdown = true;
+    mWatcher.StopWatchingFileDescriptor();
+    auto lock = gPendingChildren.Lock();
+    auto& children = lock.ref();
+    if (children) {
+      for (const auto& child : *children) {
+        if (child.mForce) {
+          if (kill(child.mPid, SIGKILL) != 0) {
+            CHROMIUM_LOG(ERROR)
+                << "failed to send SIGKILL to process " << child.mPid;
+            continue;
+          }
+        } else {
+          if (!PR_GetEnv("MOZ_TEST_CHILD_EXIT_HANG") &&
+              !CrashProcessIfHanging(child.mPid)) {
+            continue;
+          }
+        }
+        IsProcessDead(child.mPid, BlockingWait::Yes);
+      }
+      children = nullptr;
+    }
+#if defined(MOZ_ENABLE_FORKSERVER)
+    mozilla::ipc::ForkServiceChild::StopForkServer();
+#endif
+    delete this;
+  }
+
+ private:
+  MessageLoopForIO::FileDescriptorWatcher mWatcher;
+
+  static void PruneDeadProcesses() {
+    auto lock = gPendingChildren.Lock();
+    auto& children = lock.ref();
+    if (!children || children->IsEmpty()) {
+      return;
+    }
+    nsTArray<PendingChild> live;
+    for (const auto& child : *children) {
+      if (IsProcessDead(child.mPid, BlockingWait::No)) {
+        if (child.mForce) {
+          child.mForce->Cancel();
+        }
+      } else {
+        live.AppendElement(child);
+      }
+    }
+    *children = std::move(live);
+  }
+};
+
+static void HandleSigChld(int signum) {
+  DCHECK(signum == SIGCHLD);
+  char msg = 0;
+  HANDLE_EINTR(write(gSignalPipe[1], &msg, 1));
+}
+
+static void ProcessWatcherInit() {
+  int rv;
+
+#if defined(HAVE_PIPE2)
+  rv = pipe2(gSignalPipe, O_NONBLOCK | O_CLOEXEC);
+  CHECK(rv == 0)
+  << "pipe2() failed";
+#else
+  rv = pipe(gSignalPipe);
+  CHECK(rv == 0)
+  << "pipe() failed";
+  for (int fd : gSignalPipe) {
+    rv = fcntl(fd, F_SETFL, O_NONBLOCK);
+    CHECK(rv == 0)
+    << "O_NONBLOCK failed";
+    rv = fcntl(fd, F_SETFD, FD_CLOEXEC);
+    CHECK(rv == 0)
+    << "FD_CLOEXEC failed";
+  }
+#endif
+
+  auto oldHandler = signal(SIGCHLD, HandleSigChld);
+  CHECK(oldHandler != SIG_ERR);
+  DCHECK(oldHandler == SIG_DFL);
+
+  XRE_GetAsyncIOEventTarget()->Dispatch(
+      NS_NewRunnableFunction("ProcessCleaner::Register", [] {
+        ProcessCleaner* pc = new ProcessCleaner();
+        pc->Register();
+      }));
+}
+
+static void EnsureProcessWatcher() {
+  static std::once_flag sInited;
+  std::call_once(sInited, ProcessWatcherInit);
+}
+
+}  
+
+mozilla::UniqueFileHandle ProcessWatcher::GetSignalPipe() {
+  EnsureProcessWatcher();
+  int fd = gSignalPipe[1];
+  MOZ_ASSERT(fd >= 0);
+  auto rv = mozilla::DuplicateFileHandle(fd);
+  MOZ_ASSERT(rv);
+  return rv;
+}
+
+void ProcessWatcher::EnsureProcessTerminated(base::ProcessHandle process,
+                                             bool force) {
+  DCHECK(process != base::GetCurrentProcId());
+  DCHECK(process > 0);
+
+  if (gProcessWatcherShutdown) {
+    mozilla::ipc::AssertIOThread();
+    DCHECK(!MessageLoop::current()->IsAcceptingTasks());
+
+    if (!force) {
+      (void)IsProcessDead(process, BlockingWait::Yes);
+    }
+    return;
+  }
+
+  EnsureProcessWatcher();
+
+  auto lock = gPendingChildren.Lock();
+  auto& children = lock.ref();
+
+  if (IsProcessDead(process, BlockingWait::No)) {
+    return;
+  }
+
+  if (!children) {
+    children = new nsTArray<PendingChild>();
+  }
+  for (const auto& child : *children) {
+    if (child.mPid == process) {
+#if defined(MOZ_ENABLE_FORKSERVER)
+      if (mozilla::ipc::ForkServiceChild::WasUsed()) {
+
+        CHROMIUM_LOG(WARNING) << "EnsureProcessTerminated: duplicate process"
+                                 " ID "
+                              << process;
+
+        return;
+      }
+#endif
+      MOZ_ASSERT(false,
+                 "EnsureProcessTerminated must be called at most once for a "
+                 "given process");
+      return;
+    }
+  }
+
+  PendingChild child{};
+  child.mPid = process;
+  if (force) {
+    child.mForce = DelayedKill(process);
+  }
+  children->AppendElement(std::move(child));
+}

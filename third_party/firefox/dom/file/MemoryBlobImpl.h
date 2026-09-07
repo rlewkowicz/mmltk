@@ -1,0 +1,142 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_MemoryBlobImpl_h
+#define mozilla_dom_MemoryBlobImpl_h
+
+#include "mozilla/LinkedList.h"
+#include "mozilla/StaticMutex.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/StreamBufferSource.h"
+#include "mozilla/dom/BaseBlobImpl.h"
+#include "nsCOMPtr.h"
+#include "nsICloneableInputStream.h"
+#include "nsIIPCSerializableInputStream.h"
+#include "nsIInputStream.h"
+#include "nsISeekableStream.h"
+
+namespace mozilla::dom {
+
+class MemoryBlobImpl final : public BaseBlobImpl {
+ public:
+  NS_INLINE_DECL_REFCOUNTING_INHERITED(MemoryBlobImpl, BaseBlobImpl)
+
+  static already_AddRefed<MemoryBlobImpl> CreateWithLastModifiedNow(
+      void* aMemoryBuffer, uint64_t aLength, const nsAString& aName,
+      const nsAString& aContentType, RTPCallerType aRTPCallerType);
+
+  static already_AddRefed<MemoryBlobImpl> CreateWithCustomLastModified(
+      void* aMemoryBuffer, uint64_t aLength, const nsAString& aName,
+      const nsAString& aContentType, int64_t aLastModifiedDate);
+
+  MemoryBlobImpl(void* aMemoryBuffer, uint64_t aLength,
+                 const nsAString& aContentType)
+      : BaseBlobImpl(aContentType, aLength),
+        mDataOwner(new DataOwner(aMemoryBuffer, aLength)) {
+    MOZ_ASSERT(mDataOwner && mDataOwner->mData, "must have data");
+  }
+
+  void CreateInputStream(nsIInputStream** aStream,
+                         ErrorResult& aRv) const override;
+
+  already_AddRefed<BlobImpl> CreateSlice(uint64_t aStart, uint64_t aLength,
+                                         const nsAString& aContentType,
+                                         ErrorResult& aRv) const override;
+
+  bool IsMemoryFile() const override { return true; }
+
+  size_t GetAllocationSize() const override { return mLength; }
+
+  size_t GetAllocationSize(
+      FallibleTArray<BlobImpl*>& aVisitedBlobImpls) const override {
+    return GetAllocationSize();
+  }
+
+  void GetBlobImplType(nsAString& aBlobImplType) const override {
+    aBlobImplType = u"MemoryBlobImpl"_ns;
+  }
+
+  class DataOwner final : public mozilla::LinkedListElement<DataOwner> {
+   public:
+    NS_INLINE_DECL_THREADSAFE_REFCOUNTING(DataOwner)
+    DataOwner(void* aMemoryBuffer, uint64_t aLength)
+        : mData(aMemoryBuffer), mLength(aLength) {
+      mozilla::StaticMutexAutoLock lock(sDataOwnerMutex);
+
+      if (!sDataOwners) {
+        sDataOwners = new mozilla::LinkedList<DataOwner>();
+        EnsureMemoryReporterRegistered();
+      }
+      sDataOwners->insertBack(this);
+    }
+
+   private:
+    ~DataOwner() {
+      mozilla::StaticMutexAutoLock lock(sDataOwnerMutex);
+
+      remove();
+      if (sDataOwners->isEmpty()) {
+        sDataOwners = nullptr;
+      }
+
+      free(mData);
+    }
+
+   public:
+    static void EnsureMemoryReporterRegistered();
+
+    static mozilla::StaticMutex sDataOwnerMutex MOZ_UNANNOTATED;
+    static mozilla::StaticAutoPtr<mozilla::LinkedList<DataOwner> > sDataOwners;
+    static bool sMemoryReporterRegistered;
+
+    void* mData;
+    uint64_t mLength;
+  };
+
+  class DataOwnerAdapter final : public StreamBufferSource {
+    using DataOwner = MemoryBlobImpl::DataOwner;
+
+   public:
+    static nsresult Create(DataOwner* aDataOwner, size_t aStart, size_t aLength,
+                           nsIInputStream** _retval);
+
+    Span<const char> Data() override { return mData; }
+
+    bool Owning() override { return true; }
+
+    size_t SizeOfExcludingThisEvenIfShared(MallocSizeOf) override { return 0; }
+
+   private:
+    ~DataOwnerAdapter() override = default;
+
+    DataOwnerAdapter(DataOwner* aDataOwner, Span<const char> aData)
+        : mDataOwner(aDataOwner), mData(aData) {}
+
+    RefPtr<DataOwner> mDataOwner;
+    Span<const char> mData;
+  };
+
+ private:
+  MemoryBlobImpl(void* aMemoryBuffer, uint64_t aLength, const nsAString& aName,
+                 const nsAString& aContentType, int64_t aLastModifiedDate)
+      : BaseBlobImpl(aName, aContentType, aLength, aLastModifiedDate),
+        mDataOwner(new DataOwner(aMemoryBuffer, aLength)) {
+    MOZ_ASSERT(mDataOwner && mDataOwner->mData, "must have data");
+  }
+
+  MemoryBlobImpl(const MemoryBlobImpl* aOther, uint64_t aStart,
+                 uint64_t aLength, const nsAString& aContentType)
+      : BaseBlobImpl(aContentType, aOther->mStart + aStart, aLength),
+        mDataOwner(aOther->mDataOwner) {
+    MOZ_ASSERT(mDataOwner && mDataOwner->mData, "must have data");
+  }
+
+  ~MemoryBlobImpl() override = default;
+
+  RefPtr<DataOwner> mDataOwner;
+};
+
+}  
+
+#endif  // mozilla_dom_MemoryBlobImpl_h

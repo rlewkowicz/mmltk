@@ -1,0 +1,383 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef gc_Pretenuring_h
+#define gc_Pretenuring_h
+
+#include <algorithm>
+
+#include "gc/AllocKind.h"
+#include "js/TypeDecls.h"
+
+class JS_PUBLIC_API JSTracer;
+
+namespace JS {
+enum class GCReason;
+}  
+
+namespace js::gc {
+
+struct AllocSiteFilter;
+class GCRuntime;
+class PretenuringNursery;
+
+static constexpr size_t NurseryTraceKinds = 4;
+
+static constexpr size_t NormalSiteAttentionThreshold = 200;
+static constexpr size_t UnknownSiteAttentionThreshold = 30000;
+
+enum class CatchAllAllocSite { Unknown, Optimized };
+
+class AllocSite {
+ public:
+  enum class Kind : uint32_t {
+    Normal = 0,
+    Unknown = 1,
+    Optimized = 2,
+    Missing = 3,
+    Tenuring = 4,
+  };
+  enum class State : uint32_t { Unknown = 0, LongLived = 1, ShortLived = 2 };
+
+  static constexpr int32_t LONG_LIVED_BIT = 1;
+  static_assert((uint32_t(State::Unknown) & LONG_LIVED_BIT) ==
+                uint32_t(Heap::Default));
+  static_assert((uint32_t(State::LongLived) & LONG_LIVED_BIT) ==
+                uint32_t(Heap::Tenured));
+  static_assert((uint32_t(State::ShortLived) & LONG_LIVED_BIT) ==
+                uint32_t(Heap::Default));
+
+ private:
+  JS::Zone* zone_ = nullptr;
+
+  uintptr_t scriptAndState = uintptr_t(State::Unknown);
+  static constexpr uintptr_t STATE_MASK = BitMask(2);
+
+  AllocSite* nextNurseryAllocated = nullptr;
+
+  uint32_t pcOffset_ : 29;
+  static constexpr uint32_t InvalidPCOffset = Bit(29) - 1;
+
+  uint32_t kind_ : 3;
+
+  uint32_t nurseryAllocCount = 0;
+
+  uint32_t nurseryPromotedCount : 24;
+
+  uint32_t invalidationCount : 4;
+
+  uint32_t traceKind_ : 4;
+
+  static AllocSite* const EndSentinel;
+
+  static JSScript* const WasmScript;
+
+  friend class PretenuringZone;
+  friend class PretenuringNursery;
+
+  uintptr_t rawScript() const { return scriptAndState & ~STATE_MASK; }
+
+ public:
+  static constexpr uint32_t EnvSitePCOffset = InvalidPCOffset - 1;
+  static constexpr uint32_t MaxValidPCOffset = EnvSitePCOffset - 1;
+
+  AllocSite()
+      : pcOffset_(InvalidPCOffset),
+        kind_(uint32_t(Kind::Unknown)),
+        nurseryPromotedCount(0),
+        invalidationCount(0),
+        traceKind_(0) {}
+
+  AllocSite(JS::Zone* zone, JSScript* script, uint32_t pcOffset,
+            JS::TraceKind traceKind, Kind siteKind = Kind::Normal)
+      : zone_(zone),
+        pcOffset_(pcOffset),
+        kind_(uint32_t(siteKind)),
+        nurseryPromotedCount(0),
+        invalidationCount(0),
+        traceKind_(uint32_t(traceKind)) {
+    MOZ_ASSERT(pcOffset <= MaxValidPCOffset || pcOffset == EnvSitePCOffset);
+    MOZ_ASSERT(pcOffset_ == pcOffset);
+    setScript(script);
+  }
+
+  ~AllocSite() {
+    MOZ_ASSERT(!isInAllocatedList());
+    MOZ_ASSERT(nurseryAllocCount < NormalSiteAttentionThreshold);
+    MOZ_ASSERT(nurseryPromotedCount < NormalSiteAttentionThreshold);
+  }
+
+  void initUnknownSite(JS::Zone* zone, JS::TraceKind traceKind) {
+    assertUninitialized();
+    zone_ = zone;
+    traceKind_ = uint32_t(traceKind);
+    MOZ_ASSERT(traceKind_ < NurseryTraceKinds);
+  }
+
+  void initOptimizedSite(JS::Zone* zone) {
+    assertUninitialized();
+    zone_ = zone;
+    kind_ = uint32_t(Kind::Optimized);
+  }
+
+  void initTenuringSite(JS::Zone* zone) {
+    assertUninitialized();
+    zone_ = zone;
+    scriptAndState = uintptr_t(State::LongLived);
+    kind_ = uint32_t(Kind::Tenuring);
+  }
+
+  void initWasm(JS::Zone* zone) {
+    assertUninitialized();
+    zone_ = zone;
+    kind_ = uint32_t(Kind::Normal);
+    setScript(WasmScript);
+    traceKind_ = uint32_t(JS::TraceKind::Object);
+  }
+
+  void assertUninitialized() {
+#ifdef DEBUG
+    MOZ_ASSERT(!zone_);
+    MOZ_ASSERT(isUnknown());
+    MOZ_ASSERT(scriptAndState == uintptr_t(State::Unknown));
+    MOZ_ASSERT(nurseryPromotedCount == 0);
+    MOZ_ASSERT(invalidationCount == 0);
+#endif
+  }
+
+  static void staticAsserts();
+
+  JS::Zone* zone() const { return zone_; }
+
+  JS::TraceKind traceKind() const { return JS::TraceKind(traceKind_); }
+
+  State state() const { return State(scriptAndState & STATE_MASK); }
+
+  bool hasScript() const {
+    return rawScript() && rawScript() != uintptr_t(WasmScript);
+  }
+  JSScript* script() const {
+    MOZ_ASSERT(hasScript());
+    return reinterpret_cast<JSScript*>(rawScript());
+  }
+
+  uint32_t pcOffset() const {
+    MOZ_ASSERT(hasScript());
+    MOZ_ASSERT(pcOffset_ != InvalidPCOffset);
+    return pcOffset_;
+  }
+
+  bool isNormal() const { return kind() == Kind::Normal; }
+  bool isUnknown() const { return kind() == Kind::Unknown; }
+  bool isOptimized() const { return kind() == Kind::Optimized; }
+  bool isMissing() const { return kind() == Kind::Missing; }
+  bool isTenuring() const { return kind() == Kind::Tenuring; }
+
+  Kind kind() const {
+    MOZ_ASSERT((Kind(kind_) == Kind::Normal || Kind(kind_) == Kind::Missing) ==
+               (rawScript() != 0));
+    return Kind(kind_);
+  }
+
+  bool isInAllocatedList() const { return nextNurseryAllocated; }
+
+  Heap initialHeap() const {
+    Heap heap = Heap(uint32_t(state()) & LONG_LIVED_BIT);
+    MOZ_ASSERT_IF(isTenuring(), heap == Heap::Tenured);
+    return heap;
+  }
+
+  bool hasNurseryAllocations() const {
+    return nurseryAllocCount != 0 || nurseryPromotedCount != 0;
+  }
+  void resetNurseryAllocations() {
+    nurseryAllocCount = 0;
+    nurseryPromotedCount = 0;
+  }
+
+  uint32_t incAllocCount() { return ++nurseryAllocCount; }
+  uint32_t* nurseryAllocCountAddress() { return &nurseryAllocCount; }
+
+  void incPromotedCount() {
+    nurseryPromotedCount++;
+    MOZ_ASSERT(nurseryPromotedCount != 0);
+  }
+
+  size_t allocCount() const {
+    return std::max(nurseryAllocCount, nurseryPromotedCount);
+  }
+
+  enum SiteResult { NoChange, WasPretenured, WasPretenuredAndInvalidated };
+  SiteResult processSite(GCRuntime* gc, size_t attentionThreshold,
+                         const AllocSiteFilter& reportFilter);
+  void processMissingSite(const AllocSiteFilter& reportFilter);
+  void processCatchAllSite(const AllocSiteFilter& reportFilter);
+
+  void updateStateOnMinorGC(double promotionRate);
+
+  bool maybeResetState();
+
+  bool invalidationLimitReached() const;
+  bool invalidateScript(GCRuntime* gc);
+
+  void trace(JSTracer* trc);
+  bool traceWeak(JSTracer* trc);
+
+  static void printInfoHeader(GCRuntime* gc, JS::GCReason reason,
+                              double promotionRate);
+  static void printInfoFooter(size_t sitesCreated, size_t sitesActive,
+                              size_t sitesPretenured, size_t sitesInvalidated);
+  void printInfo(bool hasPromotionRate, double promotionRate,
+                 bool wasInvalidated) const;
+
+  static constexpr size_t offsetOfScriptAndState() {
+    return offsetof(AllocSite, scriptAndState);
+  }
+  static constexpr size_t offsetOfNurseryAllocCount() {
+    return offsetof(AllocSite, nurseryAllocCount);
+  }
+  static constexpr size_t offsetOfNextNurseryAllocated() {
+    return offsetof(AllocSite, nextNurseryAllocated);
+  }
+
+ private:
+  void setScript(JSScript* newScript) {
+    MOZ_ASSERT((uintptr_t(newScript) & STATE_MASK) == 0);
+    scriptAndState = uintptr_t(newScript) | uintptr_t(state());
+  }
+
+  void setState(State newState) {
+    MOZ_ASSERT((uintptr_t(newState) & ~STATE_MASK) == 0);
+    scriptAndState = rawScript() | uintptr_t(newState);
+  }
+
+  const char* stateName() const;
+};
+
+class PretenuringZone {
+ public:
+  AllocSite unknownAllocSites[NurseryTraceKinds];
+
+  AllocSite optimizedAllocSite;
+
+  AllocSite tenuringAllocSite;
+
+  AllocSite promotedAllocSites[NurseryTraceKinds];
+
+  uint32_t allocCountInNewlyCreatedArenas = 0;
+  uint32_t survivorCountInNewlyCreatedArenas = 0;
+
+  uint32_t lowYoungTenuredSurvivalCount = 0;
+
+  uint32_t highNurserySurvivalCount = 0;
+
+  uint32_t nurseryPromotedCounts[NurseryTraceKinds] = {0};
+
+  explicit PretenuringZone(JS::Zone* zone) {
+    for (uint32_t i = 0; i < NurseryTraceKinds; i++) {
+      unknownAllocSites[i].initUnknownSite(zone, JS::TraceKind(i));
+      promotedAllocSites[i].initUnknownSite(zone, JS::TraceKind(i));
+    }
+    optimizedAllocSite.initOptimizedSite(zone);
+    tenuringAllocSite.initTenuringSite(zone);
+  }
+
+  AllocSite& unknownAllocSite(JS::TraceKind kind) {
+    size_t i = size_t(kind);
+    MOZ_ASSERT(i < NurseryTraceKinds);
+    return unknownAllocSites[i];
+  }
+
+  AllocSite& promotedAllocSite(JS::TraceKind kind) {
+    size_t i = size_t(kind);
+    MOZ_ASSERT(i < NurseryTraceKinds);
+    return promotedAllocSites[i];
+  }
+
+  void clearCellCountsInNewlyCreatedArenas() {
+    allocCountInNewlyCreatedArenas = 0;
+    survivorCountInNewlyCreatedArenas = 0;
+  }
+  void updateCellCountsInNewlyCreatedArenas(uint32_t allocCount,
+                                            uint32_t survivorCount) {
+    allocCountInNewlyCreatedArenas += allocCount;
+    survivorCountInNewlyCreatedArenas += survivorCount;
+  }
+
+  bool calculateYoungTenuredSurvivalRate(double* rateOut);
+
+  void noteLowYoungTenuredSurvivalRate(bool lowYoungSurvivalRate);
+  void noteHighNurserySurvivalRate(bool highNurserySurvivalRate);
+
+  bool shouldResetNurseryAllocSites();
+  bool shouldResetPretenuredAllocSites();
+
+  uint32_t nurseryPromotedCount(JS::TraceKind kind) const {
+    size_t i = size_t(kind);
+    MOZ_ASSERT(i < std::size(nurseryPromotedCounts));
+    return nurseryPromotedCounts[i];
+  }
+};
+
+class PretenuringNursery {
+  AllocSite* allocatedSites;
+
+  size_t allocSitesCreated = 0;
+
+  uint32_t totalAllocCount_ = 0;
+
+ public:
+  PretenuringNursery() : allocatedSites(AllocSite::EndSentinel) {}
+
+  bool hasAllocatedSites() const {
+    return allocatedSites != AllocSite::EndSentinel;
+  }
+
+  bool canCreateAllocSite();
+  void noteAllocSiteCreated() { allocSitesCreated++; }
+
+  void insertIntoAllocatedList(AllocSite* site) {
+    MOZ_ASSERT(!site->isInAllocatedList());
+    site->nextNurseryAllocated = allocatedSites;
+    allocatedSites = site;
+  }
+
+  size_t doPretenuring(GCRuntime* gc, JS::GCReason reason,
+                       bool validPromotionRate, double promotionRate,
+                       const AllocSiteFilter& reportFilter);
+
+  void maybeStopPretenuring(GCRuntime* gc);
+
+  uint32_t totalAllocCount() const { return totalAllocCount_; }
+
+  void* addressOfAllocatedSites() { return &allocatedSites; }
+
+ private:
+  void updateTotalAllocCounts(AllocSite* site);
+};
+
+struct AllocSiteFilter {
+  size_t allocThreshold = 0;
+  uint8_t siteKindMask = 0;
+  uint8_t traceKindMask = 0;
+  uint8_t stateMask = 0;
+  bool enabled = false;
+
+  bool matches(const AllocSite& site) const;
+
+  static bool readFromString(const char* string, AllocSiteFilter* filter);
+};
+
+#ifdef JS_GC_ZEAL
+
+AllocSite* GetOrCreateMissingAllocSite(JSContext* cx, JSScript* script,
+                                       uint32_t pcOffset,
+                                       JS::TraceKind traceKind);
+
+#endif  // JS_GC_ZEAL
+
+}  
+
+#endif /* gc_Pretenuring_h */

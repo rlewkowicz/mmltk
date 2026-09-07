@@ -1,0 +1,83 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef _SECOID_H_
+#define _SECOID_H_
+
+#include "utilrename.h"
+
+
+#include "plarena.h"
+
+#include "seccomon.h"
+#include "secoidt.h"
+#include "secasn1t.h"
+
+SEC_BEGIN_PROTOS
+
+extern const SEC_ASN1Template SECOID_AlgorithmIDTemplate[];
+
+SEC_ASN1_CHOOSER_DECLARE(SECOID_AlgorithmIDTemplate)
+
+extern SECOidData *SECOID_FindOID(const SECItem *oid);
+extern SECOidTag SECOID_FindOIDTag(const SECItem *oid);
+extern SECOidData *SECOID_FindOIDByTag(SECOidTag tagnum);
+extern SECOidData *SECOID_FindOIDByMechanism(unsigned long mechanism);
+extern SECOidTag SECOID_FindOIDTagFromDescripton(const char *string,
+                                                 size_t len,
+                                                 PRBool isCipher);
+
+
+extern SECStatus SECOID_SetAlgorithmID(PLArenaPool *arena, SECAlgorithmID *aid,
+                                       SECOidTag tag, SECItem *params);
+
+extern SECStatus SECOID_CopyAlgorithmID(PLArenaPool *arena, SECAlgorithmID *dest,
+                                        const SECAlgorithmID *src);
+
+extern SECOidTag SECOID_GetAlgorithmTag(const SECAlgorithmID *aid);
+
+extern SECOidTag SECOID_GetTotalTags(void);
+
+extern void SECOID_DestroyAlgorithmID(SECAlgorithmID *aid, PRBool freeit);
+
+extern SECComparison SECOID_CompareAlgorithmID(SECAlgorithmID *a,
+                                               SECAlgorithmID *b);
+
+extern PRBool SECOID_KnownCertExtenOID(SECItem *extenOid);
+
+extern const char *SECOID_FindOIDTagDescription(SECOidTag tagnum);
+
+extern SECOidTag SECOID_AddEntry(const SECOidData *src);
+
+extern SECStatus SECOID_Init(void);
+
+extern SECStatus SECOID_Shutdown(void);
+
+extern SECStatus SEC_StringToOID(PLArenaPool *pool, SECItem *to,
+                                 const char *from, PRUint32 len);
+
+extern void UTIL_SetForkState(PRBool forked);
+
+
+extern SECStatus NSS_GetAlgorithmPolicy(SECOidTag tag, PRUint32 *pValue);
+
+extern SECStatus
+NSS_SetAlgorithmPolicy(SECOidTag tag, PRUint32 setBits, PRUint32 clearBits);
+
+extern SECStatus
+NSS_SetAlgorithmPolicyAll(PRUint32 setBits, PRUint32 clearBits);
+
+extern SECStatus
+NSS_GetAlgorithmPolicyAll(PRUint32 maskBits, PRUint32 valueBits,
+                          SECOidTag **outTags, int *outTagCount);
+
+void
+NSS_LockPolicy(void);
+
+PRBool
+NSS_IsPolicyLocked(void);
+
+SEC_END_PROTOS
+
+#endif /* _SECOID_H_ */

@@ -1,0 +1,32 @@
+
+[package]
+edition = "2015"
+rust-version = "1.56.0"
+name = "libloading"
+version = "0.8.6"
+authors = ["Simonas Kazlauskas <libloading@kazlauskas.me>"]
+description = "Bindings around the platform's dynamic library loading primitives with greatly improved memory safety."
+documentation = "https://docs.rs/libloading/"
+keywords = [
+    "dlopen",
+    "load",
+    "shared",
+    "dylib",
+]
+categories = ["api-bindings"]
+license = "ISC"
+repository = "https://github.com/nagisa/rust_libloading/"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = [
+    "--cfg",
+    "libloading_docs",
+]
+
+[target."cfg(unix)".dependencies.cfg-if]
+version = "1"
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+priority = 0

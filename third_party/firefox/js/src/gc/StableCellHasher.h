@@ -1,0 +1,30 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef gc_StableCellHasher_h
+#define gc_StableCellHasher_h
+
+#include "js/RootingAPI.h"
+#include "js/TypeDecls.h"
+
+
+namespace js::gc {
+
+class Cell;
+
+[[nodiscard]] bool MaybeGetUniqueId(Cell* cell, uint64_t* uidp);
+
+[[nodiscard]] bool GetOrCreateUniqueId(Cell* cell, uint64_t* uidp);
+
+uint64_t GetUniqueIdInfallible(Cell* cell);
+
+[[nodiscard]] bool HasUniqueId(Cell* cell);
+
+void TransferUniqueId(Cell* tgt, Cell* src);
+
+void RemoveUniqueId(Cell* cell);
+
+}  
+
+#endif  // gc_StableCellHasher_h

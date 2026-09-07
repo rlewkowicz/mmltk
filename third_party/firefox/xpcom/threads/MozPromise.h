@@ -1,0 +1,1616 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(XPCOM_THREADS_MOZPROMISE_H_)
+#define XPCOM_THREADS_MOZPROMISE_H_
+
+#include <type_traits>
+#include <utility>
+
+#include "mozilla/Attributes.h"
+#include "mozilla/ErrorNames.h"
+#include "mozilla/Logging.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/Monitor.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/StaticString.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/Variant.h"
+#include "nsIDirectTaskDispatcher.h"
+#include "nsISerialEventTarget.h"
+#include "nsTArray.h"
+#include "nsThreadUtils.h"
+
+
+#if MOZ_DIAGNOSTIC_ASSERT_ENABLED
+#  define PROMISE_DEBUG
+#endif
+
+#if defined(PROMISE_DEBUG)
+#  define PROMISE_ASSERT MOZ_RELEASE_ASSERT
+#else
+#  define PROMISE_ASSERT(...) \
+    do {                      \
+    } while (0)
+#endif
+
+#if DEBUG
+#  include "nsPrintfCString.h"
+#endif
+
+namespace mozilla {
+
+namespace dom {
+class Promise;
+}
+
+extern LazyLogModule gMozPromiseLog;
+
+#define PROMISE_LOG(x, ...) \
+  MOZ_LOG(gMozPromiseLog, mozilla::LogLevel::Debug, (x, ##__VA_ARGS__))
+
+namespace detail {
+template <typename F>
+struct MethodTraitsHelper : MethodTraitsHelper<decltype(&F::operator())> {};
+template <typename ThisType, typename Ret, typename... ArgTypes>
+struct MethodTraitsHelper<Ret (ThisType::*)(ArgTypes...)> {
+  using ReturnType = Ret;
+  static const size_t ArgSize = sizeof...(ArgTypes);
+};
+template <typename ThisType, typename Ret, typename... ArgTypes>
+struct MethodTraitsHelper<Ret (ThisType::*)(ArgTypes...) const> {
+  using ReturnType = Ret;
+  static const size_t ArgSize = sizeof...(ArgTypes);
+};
+template <typename ThisType, typename Ret, typename... ArgTypes>
+struct MethodTraitsHelper<Ret (ThisType::*)(ArgTypes...) volatile> {
+  using ReturnType = Ret;
+  static const size_t ArgSize = sizeof...(ArgTypes);
+};
+template <typename ThisType, typename Ret, typename... ArgTypes>
+struct MethodTraitsHelper<Ret (ThisType::*)(ArgTypes...) const volatile> {
+  using ReturnType = Ret;
+  static const size_t ArgSize = sizeof...(ArgTypes);
+};
+template <typename T>
+struct MethodTrait : MethodTraitsHelper<std::remove_reference_t<T>> {};
+
+}  
+
+template <typename T>
+using MethodReturnType = typename detail::MethodTrait<T>::ReturnType;
+
+template <typename MethodType>
+constexpr bool TakesAnyArguments =
+    detail::MethodTrait<MethodType>::ArgSize != 0;
+
+template <typename ResolveValueT, typename RejectValueT, bool IsExclusive>
+class MozPromise;
+
+template <typename T>
+constexpr bool IsMozPromise = false;
+
+template <typename ResolveValueT, typename RejectValueT, bool IsExclusive>
+constexpr bool
+    IsMozPromise<MozPromise<ResolveValueT, RejectValueT, IsExclusive>> = true;
+
+
+class MozPromiseRefcountable {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(MozPromiseRefcountable)
+ protected:
+  virtual ~MozPromiseRefcountable() = default;
+};
+
+class MozPromiseBase : public MozPromiseRefcountable {
+ public:
+  virtual void AssertIsDead() = 0;
+};
+
+template <typename T>
+class MozPromiseHolder;
+template <typename T>
+class MozPromiseRequestHolder;
+template <typename ResolveValueT, typename RejectValueT, bool IsExclusive>
+class MozPromise : public MozPromiseBase {
+  static const uint32_t sMagic = 0xcecace11;
+
+  template <typename T,
+            typename R = std::conditional_t<IsExclusive, T&&, const T&>>
+  static R MaybeMove(T& aX) {
+    return static_cast<R>(aX);
+  }
+
+ public:
+  using ResolveValueType = ResolveValueT;
+  using RejectValueType = RejectValueT;
+  class ResolveOrRejectValue {
+   public:
+    template <typename ResolveValueType_>
+    void SetResolve(ResolveValueType_&& aResolveValue) {
+      MOZ_ASSERT(IsNothing());
+      mValue = Storage(VariantIndex<ResolveIndex>{},
+                       std::forward<ResolveValueType_>(aResolveValue));
+    }
+
+    template <typename RejectValueType_>
+    void SetReject(RejectValueType_&& aRejectValue) {
+      MOZ_ASSERT(IsNothing());
+      mValue = Storage(VariantIndex<RejectIndex>{},
+                       std::forward<RejectValueType_>(aRejectValue));
+    }
+
+    template <typename ResolveValueType_>
+    static ResolveOrRejectValue MakeResolve(ResolveValueType_&& aResolveValue) {
+      ResolveOrRejectValue val;
+      val.SetResolve(std::forward<ResolveValueType_>(aResolveValue));
+      return val;
+    }
+
+    template <typename RejectValueType_>
+    static ResolveOrRejectValue MakeReject(RejectValueType_&& aRejectValue) {
+      ResolveOrRejectValue val;
+      val.SetReject(std::forward<RejectValueType_>(aRejectValue));
+      return val;
+    }
+
+    bool IsResolve() const { return mValue.template is<ResolveIndex>(); }
+    bool IsReject() const { return mValue.template is<RejectIndex>(); }
+    bool IsNothing() const { return mValue.template is<NothingIndex>(); }
+
+    const ResolveValueType& ResolveValue() const {
+      return mValue.template as<ResolveIndex>();
+    }
+    ResolveValueType& ResolveValue() {
+      return mValue.template as<ResolveIndex>();
+    }
+    const RejectValueType& RejectValue() const {
+      return mValue.template as<RejectIndex>();
+    }
+    RejectValueType& RejectValue() { return mValue.template as<RejectIndex>(); }
+
+   private:
+    enum { NothingIndex, ResolveIndex, RejectIndex };
+    using Storage = Variant<Nothing, ResolveValueType, RejectValueType>;
+    Storage mValue = Storage(VariantIndex<NothingIndex>{});
+  };
+
+ protected:
+  MozPromise(StaticString aCreationSite, bool aIsCompletionPromise)
+      : mCreationSite(aCreationSite),
+        mMutex("MozPromise Mutex"),
+        mHaveRequest(false),
+        mIsCompletionPromise(aIsCompletionPromise)
+#if defined(PROMISE_DEBUG)
+        ,
+        mMagic4(&mMutex)
+#endif
+  {
+    PROMISE_LOG("%s creating MozPromise (%p)", mCreationSite.get(), this);
+  }
+
+ public:
+  class Private;
+
+  template <typename ResolveValueType_>
+  [[nodiscard]] static RefPtr<MozPromise> CreateAndResolve(
+      ResolveValueType_&& aResolveValue, StaticString aResolveSite) {
+    static_assert(std::is_convertible_v<ResolveValueType_, ResolveValueT>,
+                  "Resolve() argument must be implicitly convertible to "
+                  "MozPromise's ResolveValueT");
+    RefPtr<typename MozPromise::Private> p =
+        new MozPromise::Private(aResolveSite);
+    p->Resolve(std::forward<ResolveValueType_>(aResolveValue), aResolveSite);
+    return p;
+  }
+
+  template <typename RejectValueType_>
+  [[nodiscard]] static RefPtr<MozPromise> CreateAndReject(
+      RejectValueType_&& aRejectValue, StaticString aRejectSite) {
+    static_assert(std::is_convertible_v<RejectValueType_, RejectValueT>,
+                  "Reject() argument must be implicitly convertible to "
+                  "MozPromise's RejectValueT");
+    RefPtr<typename MozPromise::Private> p =
+        new MozPromise::Private(aRejectSite);
+    p->Reject(std::forward<RejectValueType_>(aRejectValue), aRejectSite);
+    return p;
+  }
+
+  template <typename ResolveOrRejectValueType_>
+  [[nodiscard]] static RefPtr<MozPromise> CreateAndResolveOrReject(
+      ResolveOrRejectValueType_&& aValue, StaticString aSite) {
+    RefPtr<typename MozPromise::Private> p = new MozPromise::Private(aSite);
+    p->ResolveOrReject(std::forward<ResolveOrRejectValueType_>(aValue), aSite);
+    return p;
+  }
+
+  using AllPromiseType = MozPromise<CopyableTArray<ResolveValueType>,
+                                    RejectValueType, IsExclusive>;
+  using AllSettledPromiseType =
+      MozPromise<CopyableTArray<ResolveOrRejectValue>, bool, IsExclusive>;
+
+ private:
+  class AllPromiseHolder : public MozPromiseRefcountable {
+   public:
+    explicit AllPromiseHolder(size_t aDependentPromises)
+        : mPromise(new typename AllPromiseType::Private(__func__)),
+          mOutstandingPromises(aDependentPromises) {
+      MOZ_ASSERT(aDependentPromises > 0);
+      mResolveValues.SetLength(aDependentPromises);
+    }
+
+    template <typename ResolveValueType_>
+    void Resolve(size_t aIndex, ResolveValueType_&& aResolveValue) {
+      if (!mPromise) {
+        return;
+      }
+
+      mResolveValues[aIndex].emplace(
+          std::forward<ResolveValueType_>(aResolveValue));
+      if (--mOutstandingPromises == 0) {
+        nsTArray<ResolveValueType> resolveValues;
+        resolveValues.SetCapacity(mResolveValues.Length());
+        for (auto&& resolveValue : mResolveValues) {
+          resolveValues.AppendElement(std::move(resolveValue.ref()));
+        }
+
+        mPromise->Resolve(std::move(resolveValues), __func__);
+        mPromise = nullptr;
+        mResolveValues.Clear();
+      }
+    }
+
+    template <typename RejectValueType_>
+    void Reject(RejectValueType_&& aRejectValue) {
+      if (!mPromise) {
+        return;
+      }
+
+      mPromise->Reject(std::forward<RejectValueType_>(aRejectValue), __func__);
+      mPromise = nullptr;
+      mResolveValues.Clear();
+    }
+
+    AllPromiseType* Promise() { return mPromise; }
+
+   private:
+    nsTArray<Maybe<ResolveValueType>> mResolveValues;
+    RefPtr<typename AllPromiseType::Private> mPromise;
+    size_t mOutstandingPromises;
+  };
+
+  using ResolveOrRejectValueParam =
+      std::conditional_t<IsExclusive, ResolveOrRejectValue&&,
+                         const ResolveOrRejectValue&>;
+
+  using ResolveValueTypeParam =
+      std::conditional_t<IsExclusive, ResolveValueType&&,
+                         const ResolveValueType&>;
+
+  using RejectValueTypeParam =
+      std::conditional_t<IsExclusive, RejectValueType&&,
+                         const RejectValueType&>;
+
+  class AllSettledPromiseHolder : public MozPromiseRefcountable {
+   public:
+    explicit AllSettledPromiseHolder(size_t aDependentPromises)
+        : mPromise(new typename AllSettledPromiseType::Private(__func__)),
+          mOutstandingPromises(aDependentPromises) {
+      MOZ_ASSERT(aDependentPromises > 0);
+      mValues.SetLength(aDependentPromises);
+    }
+
+    void Settle(size_t aIndex, ResolveOrRejectValueParam aValue) {
+      if (!mPromise) {
+        return;
+      }
+
+      mValues[aIndex].emplace(MaybeMove(aValue));
+      if (--mOutstandingPromises == 0) {
+        nsTArray<ResolveOrRejectValue> values;
+        values.SetCapacity(mValues.Length());
+        for (auto&& value : mValues) {
+          values.AppendElement(std::move(value.ref()));
+        }
+
+        mPromise->Resolve(std::move(values), __func__);
+        mPromise = nullptr;
+        mValues.Clear();
+      }
+    }
+
+    AllSettledPromiseType* Promise() { return mPromise; }
+
+   private:
+    nsTArray<Maybe<ResolveOrRejectValue>> mValues;
+    RefPtr<typename AllSettledPromiseType::Private> mPromise;
+    size_t mOutstandingPromises;
+  };
+
+ public:
+  [[nodiscard]] static RefPtr<AllPromiseType> All(
+      nsISerialEventTarget* aProcessingTarget,
+      nsTArray<RefPtr<MozPromise>>& aPromises) {
+    if (aPromises.Length() == 0) {
+      return AllPromiseType::CreateAndResolve(
+          CopyableTArray<ResolveValueType>(), __func__);
+    }
+
+    RefPtr holder = MakeRefPtr<AllPromiseHolder>(aPromises.Length());
+    RefPtr<AllPromiseType> promise = holder->Promise();
+    for (size_t i = 0; i < aPromises.Length(); ++i) {
+      aPromises[i]->Then(
+          aProcessingTarget, __func__,
+          [holder, i](ResolveValueTypeParam aResolveValue) -> void {
+            holder->Resolve(i, MaybeMove(aResolveValue));
+          },
+          [holder](RejectValueTypeParam aRejectValue) -> void {
+            holder->Reject(MaybeMove(aRejectValue));
+          });
+    }
+    return promise;
+  }
+
+  [[nodiscard]] static RefPtr<AllSettledPromiseType> AllSettled(
+      nsISerialEventTarget* aProcessingTarget,
+      nsTArray<RefPtr<MozPromise>>& aPromises) {
+    if (aPromises.Length() == 0) {
+      return AllSettledPromiseType::CreateAndResolve(
+          CopyableTArray<ResolveOrRejectValue>(), __func__);
+    }
+
+    RefPtr holder = MakeRefPtr<AllSettledPromiseHolder>(aPromises.Length());
+    RefPtr<AllSettledPromiseType> promise = holder->Promise();
+    for (size_t i = 0; i < aPromises.Length(); ++i) {
+      aPromises[i]->Then(aProcessingTarget, __func__,
+                         [holder, i](ResolveOrRejectValueParam aValue) -> void {
+                           holder->Settle(i, MaybeMove(aValue));
+                         });
+    }
+    return promise;
+  }
+
+  class Request : public MozPromiseRefcountable {
+   public:
+    virtual void Disconnect() = 0;
+
+   protected:
+    Request() : mComplete(false), mDisconnected(false) {}
+    virtual ~Request() = default;
+
+    bool mComplete;
+    bool mDisconnected;
+  };
+
+ protected:
+  class ThenValueBase : public Request {
+    friend class MozPromise;
+    static const uint32_t sMagic = 0xfadece11;
+
+   public:
+    class ResolveOrRejectRunnable final
+        : public PrioritizableCancelableRunnable {
+     public:
+      ResolveOrRejectRunnable(ThenValueBase* aThenValue, MozPromise* aPromise)
+          : PrioritizableCancelableRunnable(
+                aPromise->mPriority,
+                "MozPromise::ThenValueBase::ResolveOrRejectRunnable"),
+            mThenValue(aThenValue),
+            mPromise(aPromise) {
+        MOZ_DIAGNOSTIC_ASSERT(!mPromise->IsPending());
+      }
+
+#if defined(MOZ_COLLECTING_RUNNABLE_TELEMETRY)
+      NS_IMETHOD GetName(nsACString& aName) override {
+        nsresult rv = PrioritizableCancelableRunnable::GetName(aName);
+        if (NS_FAILED(rv)) {
+          return rv;
+        }
+
+        if (mPromise) {
+          aName.Append(" ");
+          aName.Append(mPromise->mCreationSite);
+        };
+
+        return NS_OK;
+      }
+#endif
+
+      ~ResolveOrRejectRunnable() {
+        if (mThenValue) {
+          mThenValue->AssertIsDead();
+        }
+      }
+
+      NS_IMETHOD Run() override {
+        PROMISE_LOG("ResolveOrRejectRunnable::Run() [this=%p]", this);
+        mThenValue->DoResolveOrReject(mPromise->Value());
+        mThenValue = nullptr;
+        mPromise = nullptr;
+        return NS_OK;
+      }
+
+      nsresult Cancel() override { return Run(); }
+
+     private:
+      RefPtr<ThenValueBase> mThenValue;
+      RefPtr<MozPromise> mPromise;
+    };
+
+    ThenValueBase(nsISerialEventTarget* aResponseTarget, StaticString aCallSite)
+        : mResponseTarget(aResponseTarget), mCallSite(aCallSite) {
+      MOZ_ASSERT(aResponseTarget);
+    }
+
+#if defined(PROMISE_DEBUG)
+    ~ThenValueBase() {
+      mMagic1 = 0;
+      mMagic2 = 0;
+    }
+#endif
+
+    void AssertIsDead() {
+      PROMISE_ASSERT(mMagic1 == sMagic && mMagic2 == sMagic);
+      if (MozPromiseBase* p = CompletionPromise()) {
+        p->AssertIsDead();
+      } else {
+#if defined(MOZ_DIAGNOSTIC_ASSERT_ENABLED)
+        if (MOZ_UNLIKELY(!Request::mDisconnected)) {
+          MOZ_CRASH_UNSAFE_PRINTF(
+              "MozPromise::ThenValue created from '%s' destroyed without being "
+              "either disconnected, resolved, or rejected (dispatchRv: %s)",
+              mCallSite.get(),
+              mDispatchRv ? GetStaticErrorName(*mDispatchRv)
+                          : "not dispatched");
+        }
+#endif
+      }
+    }
+
+    void Dispatch(MozPromise* aPromise) {
+      PROMISE_ASSERT(mMagic1 == sMagic && mMagic2 == sMagic);
+      aPromise->mMutex.AssertCurrentThreadOwns();
+      MOZ_ASSERT(!aPromise->IsPending());
+
+      nsCOMPtr<nsIRunnable> r = new ResolveOrRejectRunnable(this, aPromise);
+      PROMISE_LOG(
+          "%s Then() call made from %s [Runnable=%p, Promise=%p, ThenValue=%p] "
+          "%s dispatch",
+          aPromise->mValue.IsResolve() ? "Resolving" : "Rejecting",
+          mCallSite.get(), r.get(), aPromise, this,
+          aPromise->mUseSynchronousTaskDispatch ? "synchronous"
+          : aPromise->mUseDirectTaskDispatch    ? "directtask"
+                                                : "normal");
+
+      if (aPromise->mUseSynchronousTaskDispatch &&
+          mResponseTarget->IsOnCurrentThread()) {
+        PROMISE_LOG("ThenValue::Dispatch running task synchronously [this=%p]",
+                    this);
+        r->Run();
+        return;
+      }
+
+      if (aPromise->mUseDirectTaskDispatch &&
+          mResponseTarget->IsOnCurrentThread()) {
+        PROMISE_LOG(
+            "ThenValue::Dispatch dispatch task via direct task queue [this=%p]",
+            this);
+        nsCOMPtr<nsIDirectTaskDispatcher> dispatcher =
+            do_QueryInterface(mResponseTarget);
+        if (dispatcher) {
+          SetDispatchRv(dispatcher->DispatchDirectTask(r.forget()));
+          return;
+        }
+        NS_WARNING(
+            nsPrintfCString(
+                "Direct Task dispatching not available for thread \"%s\"",
+                PR_GetThreadName(PR_GetCurrentThread()))
+                .get());
+        MOZ_DIAGNOSTIC_ASSERT(
+            false,
+            "mResponseTarget must implement nsIDirectTaskDispatcher for direct "
+            "task dispatching");
+      }
+
+      SetDispatchRv(mResponseTarget->Dispatch(r.forget()));
+    }
+
+    void Disconnect() override {
+      MOZ_DIAGNOSTIC_ASSERT(mResponseTarget->IsOnCurrentThread());
+      MOZ_DIAGNOSTIC_ASSERT(!Request::mComplete);
+      Request::mDisconnected = true;
+
+      MOZ_DIAGNOSTIC_ASSERT(!CompletionPromise());
+    }
+
+   protected:
+    virtual MozPromiseBase* CompletionPromise() const = 0;
+    virtual void DoResolveOrRejectInternal(ResolveOrRejectValue& aValue) = 0;
+
+    void DoResolveOrReject(ResolveOrRejectValue& aValue) {
+      PROMISE_ASSERT(mMagic1 == sMagic && mMagic2 == sMagic);
+      MOZ_DIAGNOSTIC_ASSERT(mResponseTarget->IsOnCurrentThread());
+      Request::mComplete = true;
+      if (Request::mDisconnected) {
+        PROMISE_LOG(
+            "ThenValue::DoResolveOrReject disconnected - bailing out [this=%p]",
+            this);
+        return;
+      }
+
+      DoResolveOrRejectInternal(aValue);
+    }
+
+    void SetDispatchRv(nsresult aRv) {
+#if defined(MOZ_DIAGNOSTIC_ASSERT_ENABLED)
+      mDispatchRv = Some(aRv);
+#endif
+    }
+
+    nsCOMPtr<nsISerialEventTarget>
+        mResponseTarget;  
+#if defined(PROMISE_DEBUG)
+    uint32_t mMagic1 = sMagic;
+#endif
+    StaticString mCallSite;
+#if defined(PROMISE_DEBUG)
+    uint32_t mMagic2 = sMagic;
+#endif
+#if defined(MOZ_DIAGNOSTIC_ASSERT_ENABLED)
+    Maybe<nsresult> mDispatchRv;
+#endif
+  };
+
+  template <typename ThisType, typename MethodType, typename ValueType>
+  static MethodReturnType<MethodType> InvokeMethod(ThisType* aThisVal,
+                                                   MethodType aMethod,
+                                                   ValueType&& aValue) {
+    if constexpr (TakesAnyArguments<MethodType>) {
+      return (aThisVal->*aMethod)(std::forward<ValueType>(aValue));
+    } else {
+      return (aThisVal->*aMethod)();
+    }
+  }
+
+  template <bool SupportChaining, typename PromiseType, typename ThisType,
+            typename MethodType, typename ValueType>
+  static RefPtr<PromiseType> InvokeCallbackMethod(ThisType* aThisVal,
+                                                  MethodType aMethod,
+                                                  ValueType&& aValue) {
+    if constexpr (SupportChaining) {
+      return InvokeMethod(aThisVal, aMethod, std::forward<ValueType>(aValue));
+    } else {
+      InvokeMethod(aThisVal, aMethod, std::forward<ValueType>(aValue));
+      return nullptr;
+    }
+  }
+
+  template <typename PromiseType>
+  static void MaybeChain(PromiseType* aFrom,
+                         RefPtr<typename PromiseType::Private>&& aTo) {
+    if (aTo) {
+      MOZ_DIAGNOSTIC_ASSERT(
+          aFrom,
+          "Can't do promise chaining for a non-promise-returning method.");
+      aFrom->ChainTo(aTo.forget(), "<chained completion promise>");
+    }
+  }
+
+  template <typename>
+  class ThenCommand;
+
+  template <typename...>
+  class ThenValue;
+
+  template <typename ThisType, typename ResolveMethodType,
+            typename RejectMethodType>
+  class ThenValue<ThisType*, ResolveMethodType, RejectMethodType>
+      : public ThenValueBase {
+    friend class ThenCommand<ThenValue>;
+
+    using R1 = RemoveSmartPointer<MethodReturnType<ResolveMethodType>>;
+    using R2 = RemoveSmartPointer<MethodReturnType<RejectMethodType>>;
+    constexpr static bool SupportChaining =
+        IsMozPromise<R1> && std::is_same_v<R1, R2>;
+
+    using PromiseType = std::conditional_t<SupportChaining, R1, MozPromise>;
+
+   public:
+    ThenValue(nsISerialEventTarget* aResponseTarget, ThisType* aThisVal,
+              ResolveMethodType aResolveMethod, RejectMethodType aRejectMethod,
+              StaticString aCallSite)
+        : ThenValueBase(aResponseTarget, aCallSite),
+          mThisVal(aThisVal),
+          mResolveMethod(aResolveMethod),
+          mRejectMethod(aRejectMethod) {}
+
+    void Disconnect() override {
+      ThenValueBase::Disconnect();
+
+      mThisVal = nullptr;
+    }
+
+   protected:
+    MozPromiseBase* CompletionPromise() const override {
+      return mCompletionPromise;
+    }
+
+    void DoResolveOrRejectInternal(ResolveOrRejectValue& aValue) override {
+      RefPtr<PromiseType> result =
+          aValue.IsResolve()
+              ? InvokeCallbackMethod<SupportChaining, PromiseType>(
+                    mThisVal.get(), mResolveMethod,
+                    MaybeMove(aValue.ResolveValue()))
+              : InvokeCallbackMethod<SupportChaining, PromiseType>(
+                    mThisVal.get(), mRejectMethod,
+                    MaybeMove(aValue.RejectValue()));
+
+      mThisVal = nullptr;
+
+      MaybeChain<PromiseType>(result, std::move(mCompletionPromise));
+    }
+
+   private:
+    RefPtr<ThisType>
+        mThisVal;  
+    ResolveMethodType mResolveMethod;
+    RejectMethodType mRejectMethod;
+    RefPtr<typename PromiseType::Private> mCompletionPromise;
+  };
+
+  template <typename ThisType, typename ResolveRejectMethodType>
+  class ThenValue<ThisType*, ResolveRejectMethodType> : public ThenValueBase {
+    friend class ThenCommand<ThenValue>;
+
+    using R1 = RemoveSmartPointer<MethodReturnType<ResolveRejectMethodType>>;
+    constexpr static bool SupportChaining = IsMozPromise<R1>;
+
+    using PromiseType = std::conditional_t<SupportChaining, R1, MozPromise>;
+
+   public:
+    ThenValue(nsISerialEventTarget* aResponseTarget, ThisType* aThisVal,
+              ResolveRejectMethodType aResolveRejectMethod,
+              StaticString aCallSite)
+        : ThenValueBase(aResponseTarget, aCallSite),
+          mThisVal(aThisVal),
+          mResolveRejectMethod(aResolveRejectMethod) {}
+
+    void Disconnect() override {
+      ThenValueBase::Disconnect();
+
+      mThisVal = nullptr;
+    }
+
+   protected:
+    MozPromiseBase* CompletionPromise() const override {
+      return mCompletionPromise;
+    }
+
+    void DoResolveOrRejectInternal(ResolveOrRejectValue& aValue) override {
+      RefPtr<PromiseType> result =
+          InvokeCallbackMethod<SupportChaining, PromiseType>(
+              mThisVal.get(), mResolveRejectMethod, MaybeMove(aValue));
+
+      mThisVal = nullptr;
+
+      MaybeChain<PromiseType>(result, std::move(mCompletionPromise));
+    }
+
+   private:
+    RefPtr<ThisType>
+        mThisVal;  
+    ResolveRejectMethodType mResolveRejectMethod;
+    RefPtr<typename PromiseType::Private> mCompletionPromise;
+  };
+
+  template <typename ResolveFunction, typename RejectFunction>
+  class ThenValue<ResolveFunction, RejectFunction> : public ThenValueBase {
+    friend class ThenCommand<ThenValue>;
+
+    using R1 = RemoveSmartPointer<MethodReturnType<ResolveFunction>>;
+    using R2 = RemoveSmartPointer<MethodReturnType<RejectFunction>>;
+    constexpr static bool SupportChaining =
+        IsMozPromise<R1> && std::is_same_v<R1, R2>;
+
+    using PromiseType = std::conditional_t<SupportChaining, R1, MozPromise>;
+
+   public:
+    ThenValue(nsISerialEventTarget* aResponseTarget,
+              ResolveFunction&& aResolveFunction,
+              RejectFunction&& aRejectFunction, StaticString aCallSite)
+        : ThenValueBase(aResponseTarget, aCallSite) {
+      mResolveFunction.emplace(std::move(aResolveFunction));
+      mRejectFunction.emplace(std::move(aRejectFunction));
+    }
+
+    void Disconnect() override {
+      ThenValueBase::Disconnect();
+
+      mResolveFunction.reset();
+      mRejectFunction.reset();
+    }
+
+   protected:
+    MozPromiseBase* CompletionPromise() const override {
+      return mCompletionPromise;
+    }
+
+    void DoResolveOrRejectInternal(ResolveOrRejectValue& aValue) override {
+      RefPtr<PromiseType> result =
+          aValue.IsResolve()
+              ? InvokeCallbackMethod<SupportChaining, PromiseType>(
+                    mResolveFunction.ptr(), &ResolveFunction::operator(),
+                    MaybeMove(aValue.ResolveValue()))
+              : InvokeCallbackMethod<SupportChaining, PromiseType>(
+                    mRejectFunction.ptr(), &RejectFunction::operator(),
+                    MaybeMove(aValue.RejectValue()));
+
+      mResolveFunction.reset();
+      mRejectFunction.reset();
+
+      MaybeChain<PromiseType>(result, std::move(mCompletionPromise));
+    }
+
+   private:
+    Maybe<ResolveFunction>
+        mResolveFunction;  
+    Maybe<RejectFunction>
+        mRejectFunction;  
+    RefPtr<typename PromiseType::Private> mCompletionPromise;
+  };
+
+  template <typename ResolveRejectFunction>
+  class ThenValue<ResolveRejectFunction> : public ThenValueBase {
+    friend class ThenCommand<ThenValue>;
+
+    using R1 = RemoveSmartPointer<MethodReturnType<ResolveRejectFunction>>;
+    constexpr static bool SupportChaining = IsMozPromise<R1>;
+
+    using PromiseType = std::conditional_t<SupportChaining, R1, MozPromise>;
+
+   public:
+    ThenValue(nsISerialEventTarget* aResponseTarget,
+              ResolveRejectFunction&& aResolveRejectFunction,
+              StaticString aCallSite)
+        : ThenValueBase(aResponseTarget, aCallSite) {
+      mResolveRejectFunction.emplace(std::move(aResolveRejectFunction));
+    }
+
+    void Disconnect() override {
+      ThenValueBase::Disconnect();
+
+      mResolveRejectFunction.reset();
+    }
+
+   protected:
+    MozPromiseBase* CompletionPromise() const override {
+      return mCompletionPromise;
+    }
+
+    void DoResolveOrRejectInternal(ResolveOrRejectValue& aValue) override {
+      RefPtr<PromiseType> result =
+          InvokeCallbackMethod<SupportChaining, PromiseType>(
+              mResolveRejectFunction.ptr(), &ResolveRejectFunction::operator(),
+              MaybeMove(aValue));
+
+      mResolveRejectFunction.reset();
+
+      MaybeChain<PromiseType>(result, std::move(mCompletionPromise));
+    }
+
+   private:
+    Maybe<ResolveRejectFunction>
+        mResolveRejectFunction;  
+    RefPtr<typename PromiseType::Private> mCompletionPromise;
+  };
+
+  template <typename ResolveFunction>
+  class MapValue final : public ThenValueBase {
+    friend class ThenCommand<MapValue>;
+    constexpr static const bool SupportChaining = true;
+    using ResolveValueT_ = std::invoke_result_t<ResolveFunction, ResolveValueT>;
+    using PromiseType = MozPromise<ResolveValueT_, RejectValueT, IsExclusive>;
+
+   public:
+    explicit MapValue(nsISerialEventTarget* aResponseTarget,
+                      ResolveFunction&& f, StaticString aCallSite)
+        : ThenValueBase(aResponseTarget, aCallSite),
+          mResolveFunction(Some(std::forward<ResolveFunction>(f))) {}
+
+   protected:
+    void Disconnect() override {
+      ThenValueBase::Disconnect();
+      mResolveFunction.reset();
+    }
+
+    MozPromiseBase* CompletionPromise() const override {
+      return mCompletionPromise;
+    }
+
+    void DoResolveOrRejectInternal(ResolveOrRejectValue& aValue) override {
+      auto value = MaybeMove(aValue);
+      typename PromiseType::ResolveOrRejectValue output;
+
+      if (value.IsResolve()) {
+        output.SetResolve((*mResolveFunction)(std::move(value.ResolveValue())));
+      } else {
+        output.SetReject(std::move(value.RejectValue()));
+      }
+
+      if (mCompletionPromise) {
+        mCompletionPromise->ResolveOrReject(std::move(output),
+                                            ThenValueBase::mCallSite);
+      }
+    }
+
+   private:
+    Maybe<ResolveFunction> mResolveFunction;
+    RefPtr<typename PromiseType::Private> mCompletionPromise;
+  };
+
+  template <typename RejectFunction>
+  class MapErrValue final : public ThenValueBase {
+    friend class ThenCommand<MapErrValue>;
+    constexpr static const bool SupportChaining = true;
+    using RejectValueT_ = std::invoke_result_t<RejectFunction, RejectValueT>;
+    using PromiseType = MozPromise<ResolveValueT, RejectValueT_, IsExclusive>;
+
+   public:
+    explicit MapErrValue(nsISerialEventTarget* aResponseTarget,
+                         RejectFunction&& f, StaticString aCallSite)
+        : ThenValueBase(aResponseTarget, aCallSite),
+          mRejectFunction(Some(std::forward<RejectFunction>(f))) {}
+
+   protected:
+    void Disconnect() override {
+      ThenValueBase::Disconnect();
+      mRejectFunction.reset();
+    }
+
+    MozPromiseBase* CompletionPromise() const override {
+      return mCompletionPromise;
+    }
+
+    void DoResolveOrRejectInternal(ResolveOrRejectValue& aValue) override {
+      auto value = MaybeMove(aValue);
+      typename PromiseType::ResolveOrRejectValue output;
+
+      if (value.IsResolve()) {
+        output.SetResolve(std::move(value.ResolveValue()));
+      } else {
+        output.SetReject((*mRejectFunction)(std::move(value.RejectValue())));
+      }
+
+      if (mCompletionPromise) {
+        mCompletionPromise->ResolveOrReject(std::move(output),
+                                            ThenValueBase::mCallSite);
+      }
+    }
+
+   private:
+    Maybe<RejectFunction> mRejectFunction;
+    RefPtr<typename PromiseType::Private> mCompletionPromise;
+  };
+
+ public:
+  void ThenInternal(already_AddRefed<ThenValueBase> aThenValue,
+                    StaticString aCallSite) {
+    PROMISE_ASSERT(mMagic1 == sMagic && mMagic2 == sMagic &&
+                   mMagic3 == sMagic && mMagic4 == &mMutex);
+    RefPtr<ThenValueBase> thenValue = aThenValue;
+    MutexAutoLock lock(mMutex);
+    MOZ_DIAGNOSTIC_ASSERT(
+        !IsExclusive || !mHaveRequest,
+        "Using an exclusive promise in a non-exclusive fashion");
+    mHaveRequest = true;
+    PROMISE_LOG("%s invoking Then() [this=%p, aThenValue=%p, isPending=%d]",
+                aCallSite.get(), this, thenValue.get(), (int)IsPending());
+    if (!IsPending()) {
+      thenValue->Dispatch(this);
+    } else {
+      mThenValues.AppendElement(thenValue.forget());
+    }
+  }
+
+ protected:
+  template <typename ThenValueType>
+  class MOZ_TEMPORARY_CLASS ThenCommand {
+    template <typename, typename, bool>
+    friend class MozPromise;
+
+    using PromiseType = typename ThenValueType::PromiseType;
+    using Private = typename PromiseType::Private;
+
+    ThenCommand(StaticString aCallSite,
+                already_AddRefed<ThenValueType> aThenValue,
+                MozPromise* aReceiver)
+        : mCallSite(aCallSite), mThenValue(aThenValue), mReceiver(aReceiver) {}
+
+    ThenCommand(ThenCommand&& aOther) noexcept = default;
+
+   public:
+    ~ThenCommand() {
+      if (mThenValue) {
+        mReceiver->ThenInternal(mThenValue.forget(), mCallSite);
+      }
+    }
+
+    operator RefPtr<PromiseType>() {
+      static_assert(
+          ThenValueType::SupportChaining,
+          "The resolve/reject callback needs to return a RefPtr<MozPromise> "
+          "in order to do promise chaining.");
+
+      RefPtr<Private> p =
+          new Private("<completion promise>", true );
+      mThenValue->mCompletionPromise = p;
+      mReceiver->ThenInternal(mThenValue.forget(), mCallSite);
+      return p;
+    }
+
+    template <typename... Ts>
+    auto Then(Ts&&... aArgs) -> decltype(std::declval<PromiseType>().Then(
+        std::forward<Ts>(aArgs)...)) {
+      return static_cast<RefPtr<PromiseType>>(*this)->Then(
+          std::forward<Ts>(aArgs)...);
+    }
+
+    template <typename... Ts>
+    auto Map(Ts&&... aArgs) -> decltype(std::declval<PromiseType>().Map(
+        std::forward<Ts>(aArgs)...)) {
+      return static_cast<RefPtr<PromiseType>>(*this)->Map(
+          std::forward<Ts>(aArgs)...);
+    }
+
+    template <typename... Ts>
+    auto MapErr(Ts&&... aArgs) -> decltype(std::declval<PromiseType>().MapErr(
+        std::forward<Ts>(aArgs)...)) {
+      return static_cast<RefPtr<PromiseType>>(*this)->MapErr(
+          std::forward<Ts>(aArgs)...);
+    }
+
+    void Track(MozPromiseRequestHolder<MozPromise>& aRequestHolder) {
+      aRequestHolder.Track(do_AddRef(mThenValue));
+      mReceiver->ThenInternal(mThenValue.forget(), mCallSite);
+    }
+
+    ThenCommand* operator->() { return this; }
+
+   private:
+    StaticString mCallSite;
+    RefPtr<ThenValueType> mThenValue;
+    RefPtr<MozPromise> mReceiver;
+  };
+
+ public:
+  template <typename ThisType, typename... Methods,
+            typename ThenValueType = ThenValue<ThisType*, Methods...>,
+            typename ReturnType = ThenCommand<ThenValueType>>
+  ReturnType Then(nsISerialEventTarget* aResponseTarget, StaticString aCallSite,
+                  ThisType* aThisVal, Methods... aMethods) {
+    RefPtr<ThenValueType> thenValue =
+        new ThenValueType(aResponseTarget, aThisVal, aMethods..., aCallSite);
+    return ReturnType(aCallSite, thenValue.forget(), this);
+  }
+
+  template <typename... Functions,
+            typename ThenValueType = ThenValue<Functions...>,
+            typename ReturnType = ThenCommand<ThenValueType>>
+  ReturnType Then(nsISerialEventTarget* aResponseTarget, StaticString aCallSite,
+                  Functions&&... aFunctions) {
+    RefPtr<ThenValueType> thenValue =
+        new ThenValueType(aResponseTarget, std::move(aFunctions)..., aCallSite);
+    return ReturnType(aCallSite, thenValue.forget(), this);
+  }
+
+  template <typename Function>
+  auto Map(nsISerialEventTarget* aResponseTarget, StaticString aCallSite,
+           Function&& function) {
+    RefPtr<MapValue<Function>> thenValue = new MapValue<Function>(
+        aResponseTarget, std::forward<Function>(function), aCallSite);
+    return ThenCommand<MapValue<Function>>(aCallSite, thenValue.forget(), this);
+  }
+
+  template <typename Function>
+  auto MapErr(nsISerialEventTarget* aResponseTarget, StaticString aCallSite,
+              Function&& function) {
+    RefPtr<MapErrValue<Function>> thenValue = new MapErrValue<Function>(
+        aResponseTarget, std::forward<Function>(function), aCallSite);
+    return ThenCommand<MapErrValue<Function>>(aCallSite, thenValue.forget(),
+                                              this);
+  }
+
+  void ChainTo(already_AddRefed<Private> aChainedPromise,
+               StaticString aCallSite) {
+    MutexAutoLock lock(mMutex);
+    MOZ_DIAGNOSTIC_ASSERT(
+        !IsExclusive || !mHaveRequest,
+        "Using an exclusive promise in a non-exclusive fashion");
+    mHaveRequest = true;
+    RefPtr<Private> chainedPromise = aChainedPromise;
+    PROMISE_LOG(
+        "%s invoking Chain() [this=%p, chainedPromise=%p, isPending=%d]",
+        aCallSite.get(), this, chainedPromise.get(), (int)IsPending());
+
+
+    if (mUseDirectTaskDispatch) {
+      chainedPromise->UseDirectTaskDispatch(aCallSite);
+    } else if constexpr (IsExclusive) {
+      if (mUseSynchronousTaskDispatch) {
+        chainedPromise->UseSynchronousTaskDispatch(aCallSite);
+      }
+    } else {
+      chainedPromise->SetTaskPriority(mPriority, aCallSite);
+    }
+
+    if (!IsPending()) {
+      ForwardTo(chainedPromise);
+    } else {
+      mChainedPromises.AppendElement(chainedPromise);
+    }
+  }
+
+
+  void AssertIsDead() override {
+    PROMISE_ASSERT(mMagic1 == sMagic && mMagic2 == sMagic &&
+                   mMagic3 == sMagic && mMagic4 == &mMutex);
+    MutexAutoLock lock(mMutex);
+    for (auto&& then : mThenValues) {
+      then->AssertIsDead();
+    }
+    for (auto&& chained : mChainedPromises) {
+      chained->AssertIsDead();
+    }
+  }
+
+ protected:
+  bool IsPending() const { return mValue.IsNothing(); }
+
+  ResolveOrRejectValue& Value() {
+    MOZ_DIAGNOSTIC_ASSERT(!IsPending());
+    return mValue;
+  }
+
+  void DispatchAll() {
+    mMutex.AssertCurrentThreadOwns();
+    for (auto&& thenValue : mThenValues) {
+      thenValue->Dispatch(this);
+    }
+    mThenValues.Clear();
+
+    for (auto&& chainedPromise : mChainedPromises) {
+      ForwardTo(chainedPromise);
+    }
+    mChainedPromises.Clear();
+  }
+
+  void ForwardTo(Private* aOther) {
+    MOZ_ASSERT(!IsPending());
+    if (mValue.IsResolve()) {
+      aOther->Resolve(MaybeMove(mValue.ResolveValue()), "<chained promise>");
+    } else {
+      aOther->Reject(MaybeMove(mValue.RejectValue()), "<chained promise>");
+    }
+  }
+
+  virtual ~MozPromise() {
+    PROMISE_LOG("MozPromise::~MozPromise [this=%p]", this);
+    AssertIsDead();
+    if (!mIsCompletionPromise) {
+      MOZ_ASSERT(!IsPending());
+      MOZ_ASSERT(mThenValues.IsEmpty());
+      MOZ_ASSERT(mChainedPromises.IsEmpty());
+    }
+#if defined(PROMISE_DEBUG)
+    mMagic1 = 0;
+    mMagic2 = 0;
+    mMagic3 = 0;
+    mMagic4 = nullptr;
+#endif
+  };
+
+  StaticString mCreationSite;  
+  Mutex mMutex MOZ_UNANNOTATED;
+  ResolveOrRejectValue mValue;
+  bool mUseSynchronousTaskDispatch = false;
+  bool mUseDirectTaskDispatch = false;
+  uint32_t mPriority = nsIRunnablePriority::PRIORITY_NORMAL;
+#if defined(PROMISE_DEBUG)
+  uint32_t mMagic1 = sMagic;
+#endif
+  AutoTArray<RefPtr<ThenValueBase>, IsExclusive ? 1 : 3> mThenValues;
+#if defined(PROMISE_DEBUG)
+  uint32_t mMagic2 = sMagic;
+#endif
+  nsTArray<RefPtr<Private>> mChainedPromises;
+#if defined(PROMISE_DEBUG)
+  uint32_t mMagic3 = sMagic;
+#endif
+  bool mHaveRequest;
+  const bool mIsCompletionPromise;
+#if defined(PROMISE_DEBUG)
+  void* mMagic4;
+#endif
+};
+
+template <typename ResolveValueT, typename RejectValueT, bool IsExclusive>
+class MozPromise<ResolveValueT, RejectValueT, IsExclusive>::Private
+    : public MozPromise<ResolveValueT, RejectValueT, IsExclusive> {
+ public:
+  explicit Private(StaticString aCreationSite,
+                   bool aIsCompletionPromise = false)
+      : MozPromise(aCreationSite, aIsCompletionPromise) {}
+
+  template <typename ResolveValueT_>
+  void Resolve(ResolveValueT_&& aResolveValue, StaticString aResolveSite) {
+    PROMISE_ASSERT(mMagic1 == sMagic && mMagic2 == sMagic &&
+                   mMagic3 == sMagic && mMagic4 == &mMutex);
+    MutexAutoLock lock(mMutex);
+    PROMISE_LOG("%s resolving MozPromise (%p created at %s)",
+                aResolveSite.get(), this, mCreationSite.get());
+    if (!IsPending()) {
+      PROMISE_LOG(
+          "%s ignored already resolved or rejected MozPromise (%p created at "
+          "%s)",
+          aResolveSite.get(), this, mCreationSite.get());
+      return;
+    }
+    mValue.SetResolve(std::forward<ResolveValueT_>(aResolveValue));
+    DispatchAll();
+  }
+
+  template <typename RejectValueT_>
+  void Reject(RejectValueT_&& aRejectValue, StaticString aRejectSite) {
+    PROMISE_ASSERT(mMagic1 == sMagic && mMagic2 == sMagic &&
+                   mMagic3 == sMagic && mMagic4 == &mMutex);
+    MutexAutoLock lock(mMutex);
+    PROMISE_LOG("%s rejecting MozPromise (%p created at %s)", aRejectSite.get(),
+                this, mCreationSite.get());
+    if (!IsPending()) {
+      PROMISE_LOG(
+          "%s ignored already resolved or rejected MozPromise (%p created at "
+          "%s)",
+          aRejectSite.get(), this, mCreationSite.get());
+      return;
+    }
+    mValue.SetReject(std::forward<RejectValueT_>(aRejectValue));
+    DispatchAll();
+  }
+
+  template <typename ResolveOrRejectValue_>
+  void ResolveOrReject(ResolveOrRejectValue_&& aValue, StaticString aSite) {
+    PROMISE_ASSERT(mMagic1 == sMagic && mMagic2 == sMagic &&
+                   mMagic3 == sMagic && mMagic4 == &mMutex);
+    MutexAutoLock lock(mMutex);
+    PROMISE_LOG("%s resolveOrRejecting MozPromise (%p created at %s)",
+                aSite.get(), this, mCreationSite.get());
+    if (!IsPending()) {
+      PROMISE_LOG(
+          "%s ignored already resolved or rejected MozPromise (%p created at "
+          "%s)",
+          aSite.get(), this, mCreationSite.get());
+      return;
+    }
+    mValue = std::forward<ResolveOrRejectValue_>(aValue);
+    DispatchAll();
+  }
+
+  void UseSynchronousTaskDispatch(const char* aSite) {
+    static_assert(
+        IsExclusive,
+        "Synchronous dispatch can only be used with exclusive promises");
+    PROMISE_ASSERT(mMagic1 == sMagic && mMagic2 == sMagic &&
+                   mMagic3 == sMagic && mMagic4 == &mMutex);
+    MutexAutoLock lock(mMutex);
+    PROMISE_LOG("%s UseSynchronousTaskDispatch MozPromise (%p created at %s)",
+                aSite, this, mCreationSite.get());
+    MOZ_ASSERT(IsPending(),
+               "A Promise must not have been already resolved or rejected to "
+               "set dispatch state");
+    mUseSynchronousTaskDispatch = true;
+  }
+
+  void UseDirectTaskDispatch(const char* aSite) {
+    PROMISE_ASSERT(mMagic1 == sMagic && mMagic2 == sMagic &&
+                   mMagic3 == sMagic && mMagic4 == &mMutex);
+    MutexAutoLock lock(mMutex);
+    PROMISE_LOG("%s UseDirectTaskDispatch MozPromise (%p created at %s)", aSite,
+                this, mCreationSite.get());
+    MOZ_ASSERT(IsPending(),
+               "A Promise must not have been already resolved or rejected to "
+               "set dispatch state");
+    MOZ_ASSERT(!mUseSynchronousTaskDispatch,
+               "Promise already set for synchronous dispatch");
+    mUseDirectTaskDispatch = true;
+  }
+
+  void SetTaskPriority(uint32_t aPriority, const char* aSite) {
+    PROMISE_ASSERT(mMagic1 == sMagic && mMagic2 == sMagic &&
+                   mMagic3 == sMagic && mMagic4 == &mMutex);
+    MutexAutoLock lock(mMutex);
+    PROMISE_LOG("%s TaskPriority MozPromise (%p created at %s)", aSite, this,
+                mCreationSite.get());
+    MOZ_ASSERT(IsPending(),
+               "A Promise must not have been already resolved or rejected to "
+               "set dispatch state");
+    MOZ_ASSERT(!mUseSynchronousTaskDispatch,
+               "Promise already set for synchronous dispatch");
+    MOZ_ASSERT(!mUseDirectTaskDispatch,
+               "Promise already set for direct dispatch");
+    mPriority = aPriority;
+  }
+};
+
+using GenericPromise = MozPromise<bool, nsresult,  true>;
+
+using GenericNonExclusivePromise =
+    MozPromise<bool, nsresult,  false>;
+
+template <typename PromiseType, typename ImplType>
+class MozPromiseHolderBase {
+ public:
+  MozPromiseHolderBase() = default;
+
+  MozPromiseHolderBase(MozPromiseHolderBase&& aOther) noexcept = default;
+  MozPromiseHolderBase& operator=(MozPromiseHolderBase&& aOther) noexcept =
+      default;
+
+  ~MozPromiseHolderBase() { MOZ_ASSERT(!mPromise); }
+
+  already_AddRefed<PromiseType> Ensure(StaticString aMethodName) {
+    static_cast<ImplType*>(this)->Check();
+    if (!mPromise) {
+      mPromise = new (typename PromiseType::Private)(aMethodName);
+    }
+    RefPtr<PromiseType> p = mPromise.get();
+    return p.forget();
+  }
+
+  bool IsEmpty() const {
+    static_cast<const ImplType*>(this)->Check();
+    return !mPromise;
+  }
+
+  already_AddRefed<typename PromiseType::Private> Steal() {
+    static_cast<ImplType*>(this)->Check();
+    return mPromise.forget();
+  }
+
+  template <typename ResolveValueType_>
+  void Resolve(ResolveValueType_&& aResolveValue, StaticString aMethodName) {
+    static_assert(std::is_convertible_v<ResolveValueType_,
+                                        typename PromiseType::ResolveValueType>,
+                  "Resolve() argument must be implicitly convertible to "
+                  "MozPromise's ResolveValueT");
+
+    static_cast<ImplType*>(this)->Check();
+    MOZ_ASSERT(mPromise);
+    mPromise->Resolve(std::forward<ResolveValueType_>(aResolveValue),
+                      aMethodName);
+    mPromise = nullptr;
+  }
+
+  template <typename ResolveValueType_>
+  void ResolveIfExists(ResolveValueType_&& aResolveValue,
+                       StaticString aMethodName) {
+    if (!IsEmpty()) {
+      Resolve(std::forward<ResolveValueType_>(aResolveValue), aMethodName);
+    }
+  }
+
+  template <typename RejectValueType_>
+  void Reject(RejectValueType_&& aRejectValue, StaticString aMethodName) {
+    static_assert(std::is_convertible_v<RejectValueType_,
+                                        typename PromiseType::RejectValueType>,
+                  "Reject() argument must be implicitly convertible to "
+                  "MozPromise's RejectValueT");
+
+    static_cast<ImplType*>(this)->Check();
+    MOZ_ASSERT(mPromise);
+    mPromise->Reject(std::forward<RejectValueType_>(aRejectValue), aMethodName);
+    mPromise = nullptr;
+  }
+
+  template <typename RejectValueType_>
+  void RejectIfExists(RejectValueType_&& aRejectValue,
+                      StaticString aMethodName) {
+    if (!IsEmpty()) {
+      Reject(std::forward<RejectValueType_>(aRejectValue), aMethodName);
+    }
+  }
+
+  template <typename ResolveOrRejectValueType_>
+  void ResolveOrReject(ResolveOrRejectValueType_&& aValue,
+                       StaticString aMethodName) {
+    static_cast<ImplType*>(this)->Check();
+    MOZ_ASSERT(mPromise);
+    mPromise->ResolveOrReject(std::forward<ResolveOrRejectValueType_>(aValue),
+                              aMethodName);
+    mPromise = nullptr;
+  }
+
+  template <typename ResolveOrRejectValueType_>
+  void ResolveOrRejectIfExists(ResolveOrRejectValueType_&& aValue,
+                               StaticString aMethodName) {
+    if (!IsEmpty()) {
+      ResolveOrReject(std::forward<ResolveOrRejectValueType_>(aValue),
+                      aMethodName);
+    }
+  }
+
+  void UseSynchronousTaskDispatch(const char* aSite) {
+    MOZ_ASSERT(mPromise);
+    mPromise->UseSynchronousTaskDispatch(aSite);
+  }
+
+  void UseDirectTaskDispatch(const char* aSite) {
+    MOZ_ASSERT(mPromise);
+    mPromise->UseDirectTaskDispatch(aSite);
+  }
+
+  void SetTaskPriority(uint32_t aPriority, const char* aSite) {
+    MOZ_ASSERT(mPromise);
+    mPromise->SetTaskPriority(aPriority, aSite);
+  }
+
+ private:
+  RefPtr<typename PromiseType::Private> mPromise;
+};
+
+template <typename PromiseType>
+class MozPromiseHolder
+    : public MozPromiseHolderBase<PromiseType, MozPromiseHolder<PromiseType>> {
+ public:
+  using MozPromiseHolderBase<
+      PromiseType, MozPromiseHolder<PromiseType>>::MozPromiseHolderBase;
+  static constexpr void Check() {};
+};
+
+template <typename PromiseType>
+class MozMonitoredPromiseHolder
+    : public MozPromiseHolderBase<PromiseType,
+                                  MozMonitoredPromiseHolder<PromiseType>> {
+ public:
+  explicit MozMonitoredPromiseHolder(Monitor* const aMonitor)
+      : mMonitor(aMonitor) {
+    MOZ_ASSERT(aMonitor);
+  }
+
+  MozMonitoredPromiseHolder(MozMonitoredPromiseHolder&& aOther) = delete;
+  MozMonitoredPromiseHolder& operator=(MozMonitoredPromiseHolder&& aOther) =
+      delete;
+
+  void Check() const { mMonitor->AssertCurrentThreadOwns(); }
+
+ private:
+  Monitor* const mMonitor;
+};
+
+template <typename PromiseType>
+class MozPromiseRequestHolder {
+ public:
+  MozPromiseRequestHolder() = default;
+  ~MozPromiseRequestHolder() { MOZ_ASSERT(!mRequest); }
+
+  void Track(already_AddRefed<typename PromiseType::Request> aRequest) {
+    MOZ_DIAGNOSTIC_ASSERT(!Exists());
+    mRequest = aRequest;
+  }
+
+  void Complete() {
+    MOZ_DIAGNOSTIC_ASSERT(Exists());
+    mRequest = nullptr;
+  }
+
+  void Disconnect() {
+    MOZ_ASSERT(Exists());
+    RefPtr request = std::move(mRequest);
+    request->Disconnect();
+  }
+
+  void DisconnectIfExists() {
+    if (Exists()) {
+      Disconnect();
+    }
+  }
+
+  bool Exists() const { return !!mRequest; }
+
+ private:
+  RefPtr<typename PromiseType::Request> mRequest;
+};
+
+
+namespace detail {
+
+class MethodCallBase {
+ public:
+  MOZ_COUNTED_DEFAULT_CTOR(MethodCallBase)
+  MOZ_COUNTED_DTOR_VIRTUAL(MethodCallBase)
+};
+
+template <typename PromiseType, typename MethodType, typename ThisType,
+          typename... Storages>
+class MethodCall : public MethodCallBase {
+ public:
+  template <typename... Args>
+  MethodCall(MethodType aMethod, ThisType* aThisVal, Args&&... aArgs)
+      : mMethod(aMethod),
+        mThisVal(aThisVal),
+        mArgs(std::forward<Args>(aArgs)...) {
+    static_assert(sizeof...(Storages) == sizeof...(Args),
+                  "Storages and Args should have equal sizes");
+  }
+
+  RefPtr<PromiseType> Invoke() { return mArgs.apply(mThisVal.get(), mMethod); }
+
+ private:
+  MethodType mMethod;
+  RefPtr<ThisType> mThisVal;
+  RunnableMethodArguments<Storages...> mArgs;
+};
+
+template <typename PromiseType, typename MethodType, typename ThisType,
+          typename... Storages>
+class ProxyRunnable : public CancelableRunnable {
+ public:
+  ProxyRunnable(
+      typename PromiseType::Private* aProxyPromise,
+      MethodCall<PromiseType, MethodType, ThisType, Storages...>* aMethodCall)
+      : CancelableRunnable("detail::ProxyRunnable"),
+        mProxyPromise(aProxyPromise),
+        mMethodCall(aMethodCall) {}
+
+  NS_IMETHOD Run() override {
+    RefPtr<PromiseType> p = mMethodCall->Invoke();
+    mMethodCall = nullptr;
+    p->ChainTo(mProxyPromise.forget(), "<Proxy Promise>");
+    return NS_OK;
+  }
+
+  nsresult Cancel() override { return Run(); }
+
+ private:
+  RefPtr<typename PromiseType::Private> mProxyPromise;
+  UniquePtr<MethodCall<PromiseType, MethodType, ThisType, Storages...>>
+      mMethodCall;
+};
+
+template <typename... Storages, typename PromiseType, typename ThisType,
+          typename... ArgTypes, typename... ActualArgTypes>
+static RefPtr<PromiseType> InvokeAsyncImpl(
+    nsISerialEventTarget* aTarget, ThisType* aThisVal, StaticString aCallerName,
+    RefPtr<PromiseType> (ThisType::*aMethod)(ArgTypes...),
+    ActualArgTypes&&... aArgs) {
+  MOZ_ASSERT(aTarget);
+
+  typedef RefPtr<PromiseType> (ThisType::*MethodType)(ArgTypes...);
+  typedef detail::MethodCall<PromiseType, MethodType, ThisType, Storages...>
+      MethodCallType;
+  typedef detail::ProxyRunnable<PromiseType, MethodType, ThisType, Storages...>
+      ProxyRunnableType;
+
+  MethodCallType* methodCall = new MethodCallType(
+      aMethod, aThisVal, std::forward<ActualArgTypes>(aArgs)...);
+  RefPtr<typename PromiseType::Private> p =
+      new (typename PromiseType::Private)(aCallerName);
+  RefPtr<ProxyRunnableType> r = new ProxyRunnableType(p, methodCall);
+  aTarget->Dispatch(r.forget());
+  return p;
+}
+
+constexpr bool Any() { return false; }
+
+template <typename T1>
+constexpr bool Any(T1 a) {
+  return static_cast<bool>(a);
+}
+
+template <typename T1, typename... Ts>
+constexpr bool Any(T1 a, Ts... aOthers) {
+  return a || Any(aOthers...);
+}
+
+}  
+
+template <typename... Storages, typename PromiseType, typename ThisType,
+          typename... ArgTypes, typename... ActualArgTypes,
+          std::enable_if_t<sizeof...(Storages) != 0, int> = 0>
+static RefPtr<PromiseType> InvokeAsync(
+    nsISerialEventTarget* aTarget, ThisType* aThisVal, StaticString aCallerName,
+    RefPtr<PromiseType> (ThisType::*aMethod)(ArgTypes...),
+    ActualArgTypes&&... aArgs) {
+  static_assert(
+      sizeof...(Storages) == sizeof...(ArgTypes),
+      "Provided Storages and method's ArgTypes should have equal sizes");
+  static_assert(sizeof...(Storages) == sizeof...(ActualArgTypes),
+                "Provided Storages and ActualArgTypes should have equal sizes");
+  return detail::InvokeAsyncImpl<Storages...>(
+      aTarget, aThisVal, aCallerName, aMethod,
+      std::forward<ActualArgTypes>(aArgs)...);
+}
+
+template <typename... Storages, typename PromiseType, typename ThisType,
+          typename... ArgTypes, typename... ActualArgTypes,
+          std::enable_if_t<sizeof...(Storages) == 0, int> = 0>
+static RefPtr<PromiseType> InvokeAsync(
+    nsISerialEventTarget* aTarget, ThisType* aThisVal, StaticString aCallerName,
+    RefPtr<PromiseType> (ThisType::*aMethod)(ArgTypes...),
+    ActualArgTypes&&... aArgs) {
+  static_assert(
+      !detail::Any(
+          std::is_pointer_v<std::remove_reference_t<ActualArgTypes>>...),
+      "Cannot pass pointer types through InvokeAsync, Storages must be "
+      "provided");
+  static_assert(sizeof...(ArgTypes) == sizeof...(ActualArgTypes),
+                "Method's ArgTypes and ActualArgTypes should have equal sizes");
+  return detail::InvokeAsyncImpl<
+      StoreCopyPassByRRef<std::decay_t<ActualArgTypes>>...>(
+      aTarget, aThisVal, aCallerName, aMethod,
+      std::forward<ActualArgTypes>(aArgs)...);
+}
+
+namespace detail {
+
+template <typename Function, typename PromiseType>
+class ProxyFunctionRunnable : public CancelableRunnable {
+  using FunctionStorage = std::decay_t<Function>;
+
+ public:
+  template <typename F>
+  ProxyFunctionRunnable(typename PromiseType::Private* aProxyPromise,
+                        F&& aFunction)
+      : CancelableRunnable("detail::ProxyFunctionRunnable"),
+        mProxyPromise(aProxyPromise),
+        mFunction(new FunctionStorage(std::forward<F>(aFunction))) {}
+
+  NS_IMETHOD Run() override {
+    RefPtr<PromiseType> p = (*mFunction)();
+    mFunction = nullptr;
+    p->ChainTo(mProxyPromise.forget(), "<Proxy Promise>");
+    return NS_OK;
+  }
+
+  nsresult Cancel() override { return Run(); }
+
+ private:
+  RefPtr<typename PromiseType::Private> mProxyPromise;
+  UniquePtr<FunctionStorage> mFunction;
+};
+
+template <typename T>
+constexpr static bool IsRefPtrMozPromise = false;
+template <typename T, typename U, bool B>
+constexpr static bool IsRefPtrMozPromise<RefPtr<MozPromise<T, U, B>>> = true;
+
+}  
+
+template <typename Function>
+static auto InvokeAsync(nsISerialEventTarget* aTarget, StaticString aCallerName,
+                        Function&& aFunction) -> decltype(aFunction()) {
+  static_assert(!std::is_lvalue_reference_v<Function>,
+                "Function object must not be passed by lvalue-ref (to avoid "
+                "unplanned copies); Consider move()ing the object.");
+
+  static_assert(detail::IsRefPtrMozPromise<decltype(aFunction())>,
+                "Function object must return RefPtr<MozPromise>");
+  MOZ_ASSERT(aTarget);
+  typedef RemoveSmartPointer<decltype(aFunction())> PromiseType;
+  typedef detail::ProxyFunctionRunnable<Function, PromiseType>
+      ProxyRunnableType;
+
+  auto p = MakeRefPtr<typename PromiseType::Private>(aCallerName);
+  auto r = MakeRefPtr<ProxyRunnableType>(p, std::forward<Function>(aFunction));
+  aTarget->Dispatch(r.forget());
+  return p;
+}
+
+#undef PROMISE_LOG
+#undef PROMISE_ASSERT
+#undef PROMISE_DEBUG
+
+}  
+
+#endif

@@ -1,0 +1,179 @@
+/*
+ * jdatasrc.c
+ *
+ * This file was part of the Independent JPEG Group's software:
+ * Copyright (C) 1994-1996, Thomas G. Lane.
+ * Modified 2009-2011 by Guido Vollbeding.
+ * libjpeg-turbo Modifications:
+ * Copyright (C) 2013, 2016, 2022, D. R. Commander.
+ * For conditions of distribution and use, see the accompanying README.ijg
+ * file.
+ *
+ * This file contains decompression data source routines for the case of
+ * reading JPEG data from memory or from a file (or any stdio stream).
+ * While these routines are sufficient for most applications,
+ * some will want to use a different source manager.
+ * IMPORTANT: we assume that fread() will correctly transcribe an array of
+ * JOCTETs from 8-bit-wide elements on external storage.  If char is wider
+ * than 8 bits on your machine, you may need to do some tweaking.
+ */
+
+#include "jinclude.h"
+#include "jpeglib.h"
+#include "jerror.h"
+
+
+
+typedef struct {
+  struct jpeg_source_mgr pub;   
+
+  FILE *infile;                 
+  JOCTET *buffer;               
+  boolean start_of_file;        
+} my_source_mgr;
+
+typedef my_source_mgr *my_src_ptr;
+
+#define INPUT_BUF_SIZE  4096    /* choose an efficiently fread'able size */
+
+
+
+METHODDEF(void)
+init_source(j_decompress_ptr cinfo)
+{
+  my_src_ptr src = (my_src_ptr)cinfo->src;
+
+  src->start_of_file = TRUE;
+}
+
+METHODDEF(void)
+init_mem_source(j_decompress_ptr cinfo)
+{
+}
+
+
+
+METHODDEF(boolean)
+fill_input_buffer(j_decompress_ptr cinfo)
+{
+  my_src_ptr src = (my_src_ptr)cinfo->src;
+  size_t nbytes;
+
+  nbytes = fread(src->buffer, 1, INPUT_BUF_SIZE, src->infile);
+
+  if (nbytes <= 0) {
+    if (src->start_of_file)     
+      ERREXIT(cinfo, JERR_INPUT_EMPTY);
+    WARNMS(cinfo, JWRN_JPEG_EOF);
+    src->buffer[0] = (JOCTET)0xFF;
+    src->buffer[1] = (JOCTET)JPEG_EOI;
+    nbytes = 2;
+  }
+
+  src->pub.next_input_byte = src->buffer;
+  src->pub.bytes_in_buffer = nbytes;
+  src->start_of_file = FALSE;
+
+  return TRUE;
+}
+
+METHODDEF(boolean)
+fill_mem_input_buffer(j_decompress_ptr cinfo)
+{
+  static const JOCTET mybuffer[4] = {
+    (JOCTET)0xFF, (JOCTET)JPEG_EOI, 0, 0
+  };
+
+  WARNMS(cinfo, JWRN_JPEG_EOF);
+
+
+  cinfo->src->next_input_byte = mybuffer;
+  cinfo->src->bytes_in_buffer = 2;
+
+  return TRUE;
+}
+
+
+
+METHODDEF(void)
+skip_input_data(j_decompress_ptr cinfo, long num_bytes)
+{
+  struct jpeg_source_mgr *src = cinfo->src;
+
+  if (num_bytes > 0) {
+    while (num_bytes > (long)src->bytes_in_buffer) {
+      num_bytes -= (long)src->bytes_in_buffer;
+      (void)(*src->fill_input_buffer) (cinfo);
+    }
+    src->next_input_byte += (size_t)num_bytes;
+    src->bytes_in_buffer -= (size_t)num_bytes;
+  }
+}
+
+
+
+
+
+METHODDEF(void)
+term_source(j_decompress_ptr cinfo)
+{
+}
+
+
+
+GLOBAL(void)
+jpeg_stdio_src(j_decompress_ptr cinfo, FILE *infile)
+{
+  my_src_ptr src;
+
+  if (cinfo->src == NULL) {     
+    cinfo->src = (struct jpeg_source_mgr *)
+      (*cinfo->mem->alloc_small) ((j_common_ptr)cinfo, JPOOL_PERMANENT,
+                                  sizeof(my_source_mgr));
+    src = (my_src_ptr)cinfo->src;
+    src->buffer = (JOCTET *)
+      (*cinfo->mem->alloc_small) ((j_common_ptr)cinfo, JPOOL_PERMANENT,
+                                  INPUT_BUF_SIZE * sizeof(JOCTET));
+  } else if (cinfo->src->init_source != init_source) {
+    ERREXIT(cinfo, JERR_BUFFER_SIZE);
+  }
+
+  src = (my_src_ptr)cinfo->src;
+  src->pub.init_source = init_source;
+  src->pub.fill_input_buffer = fill_input_buffer;
+  src->pub.skip_input_data = skip_input_data;
+  src->pub.resync_to_restart = jpeg_resync_to_restart; 
+  src->pub.term_source = term_source;
+  src->infile = infile;
+  src->pub.bytes_in_buffer = 0; 
+  src->pub.next_input_byte = NULL; 
+}
+
+
+
+GLOBAL(void)
+jpeg_mem_src(j_decompress_ptr cinfo, const unsigned char *inbuffer,
+             unsigned long insize)
+{
+  struct jpeg_source_mgr *src;
+
+  if (inbuffer == NULL || insize == 0)  
+    ERREXIT(cinfo, JERR_INPUT_EMPTY);
+
+  if (cinfo->src == NULL) {     
+    cinfo->src = (struct jpeg_source_mgr *)
+      (*cinfo->mem->alloc_small) ((j_common_ptr)cinfo, JPOOL_PERMANENT,
+                                  sizeof(struct jpeg_source_mgr));
+  } else if (cinfo->src->init_source != init_mem_source) {
+    ERREXIT(cinfo, JERR_BUFFER_SIZE);
+  }
+
+  src = cinfo->src;
+  src->init_source = init_mem_source;
+  src->fill_input_buffer = fill_mem_input_buffer;
+  src->skip_input_data = skip_input_data;
+  src->resync_to_restart = jpeg_resync_to_restart; 
+  src->term_source = term_source;
+  src->bytes_in_buffer = (size_t)insize;
+  src->next_input_byte = (const JOCTET *)inbuffer;
+}

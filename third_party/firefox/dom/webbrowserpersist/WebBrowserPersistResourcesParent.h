@@ -1,0 +1,51 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef WebBrowserPersistResourcesParent_h_
+#define WebBrowserPersistResourcesParent_h_
+
+#include "WebBrowserPersistDocumentParent.h"
+#include "mozilla/PWebBrowserPersistResourcesParent.h"
+#include "nsCOMPtr.h"
+#include "nsIWebBrowserPersistDocument.h"
+
+namespace mozilla {
+
+class WebBrowserPersistResourcesParent final
+    : public PWebBrowserPersistResourcesParent,
+      public nsIWebBrowserPersistDocumentReceiver {
+ public:
+  WebBrowserPersistResourcesParent(
+      nsIWebBrowserPersistDocument* aDocument,
+      nsIWebBrowserPersistResourceVisitor* aVisitor);
+
+  virtual mozilla::ipc::IPCResult RecvVisitResource(
+      const nsACString& aURI,
+      const nsContentPolicyType& aContentPolicyType) override;
+
+  virtual mozilla::ipc::IPCResult RecvVisitDocument(
+      NotNull<PWebBrowserPersistDocumentParent*> aSubDocument) override;
+
+  virtual mozilla::ipc::IPCResult RecvVisitBrowsingContext(
+      const dom::MaybeDiscarded<dom::BrowsingContext>& aContext) override;
+
+  virtual mozilla::ipc::IPCResult Recv__delete__(
+      const nsresult& aStatus) override;
+
+  virtual void ActorDestroy(ActorDestroyReason aWhy) override;
+
+  NS_DECL_NSIWEBBROWSERPERSISTDOCUMENTRECEIVER
+  NS_DECL_ISUPPORTS
+
+ private:
+  nsCOMPtr<nsIWebBrowserPersistDocument> mDocument;
+  nsCOMPtr<nsIWebBrowserPersistResourceVisitor> mVisitor;
+
+  virtual ~WebBrowserPersistResourcesParent();
+};
+
+}  
+
+#endif  // WebBrowserPersistResourcesParent_h_

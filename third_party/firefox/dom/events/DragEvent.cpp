@@ -1,0 +1,87 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "DragEvent.h"
+
+#include "mozilla/MouseEvents.h"
+#include "mozilla/dom/MouseEventBinding.h"
+#include "nsContentUtils.h"
+
+namespace mozilla::dom {
+
+DragEvent::DragEvent(EventTarget* aOwner, nsPresContext* aPresContext,
+                     WidgetDragEvent* aEvent)
+    : MouseEvent(
+          aOwner, aPresContext,
+          aEvent ? aEvent : new WidgetDragEvent(false, eVoidEvent, nullptr)) {
+  if (aEvent) {
+    mEventIsInternal = false;
+  } else {
+    mEventIsInternal = true;
+    mEvent->mRefPoint = LayoutDeviceIntPoint(0, 0);
+    mEvent->AsMouseEvent()->mInputSource =
+        MouseEvent_Binding::MOZ_SOURCE_UNKNOWN;
+  }
+}
+
+void DragEvent::InitDragEventInternal(
+    const nsAString& aType, bool aCanBubble, bool aCancelable,
+    nsGlobalWindowInner* aView, int32_t aDetail, double aScreenX,
+    double aScreenY, double aClientX, double aClientY, bool aCtrlKey,
+    bool aAltKey, bool aShiftKey, bool aMetaKey, uint16_t aButton,
+    EventTarget* aRelatedTarget, DataTransfer* aDataTransfer) {
+  NS_ENSURE_TRUE_VOID(!mEvent->mFlags.mIsBeingDispatched);
+
+  MouseEvent::InitMouseEventInternal(aType, aCanBubble, aCancelable, aView,
+                                     aDetail, aScreenX, aScreenY, aClientX,
+                                     aClientY, aCtrlKey, aAltKey, aShiftKey,
+                                     aMetaKey, aButton, aRelatedTarget);
+  if (mEventIsInternal) {
+    mEvent->AsDragEvent()->mDataTransfer = aDataTransfer;
+  }
+}
+
+DataTransfer* DragEvent::GetDataTransfer() {
+  if (!mEvent || mEvent->mClass != eDragEventClass) {
+    NS_WARNING("Tried to get dataTransfer from non-drag event!");
+    return nullptr;
+  }
+
+  WidgetDragEvent* dragEvent = mEvent->AsDragEvent();
+  if (!mEventIsInternal) {
+    nsresult rv = nsContentUtils::SetDataTransferInEvent(dragEvent);
+    NS_ENSURE_SUCCESS(rv, nullptr);
+  }
+
+  return dragEvent->mDataTransfer;
+}
+
+already_AddRefed<DragEvent> DragEvent::Constructor(
+    const GlobalObject& aGlobal, const nsAString& aType,
+    const DragEventInit& aParam) {
+  nsCOMPtr<EventTarget> t = do_QueryInterface(aGlobal.GetAsSupports());
+  RefPtr<DragEvent> e = new DragEvent(t, nullptr, nullptr);
+  bool trusted = e->Init(t);
+  e->InitDragEventInternal(
+      aType, aParam.mBubbles, aParam.mCancelable, aParam.mView, aParam.mDetail,
+      aParam.mScreenX, aParam.mScreenY, aParam.mClientX, aParam.mClientY,
+      aParam.mCtrlKey, aParam.mAltKey, aParam.mShiftKey, aParam.mMetaKey,
+      aParam.mButton, aParam.mRelatedTarget, aParam.mDataTransfer);
+  e->InitializeExtraMouseEventDictionaryMembers(aParam);
+  e->SetTrusted(trusted);
+  e->SetComposed(aParam.mComposed);
+  return e.forget();
+}
+
+}  
+
+using namespace mozilla;
+using namespace mozilla::dom;
+
+already_AddRefed<DragEvent> NS_NewDOMDragEvent(EventTarget* aOwner,
+                                               nsPresContext* aPresContext,
+                                               WidgetDragEvent* aEvent) {
+  RefPtr<DragEvent> event = new DragEvent(aOwner, aPresContext, aEvent);
+  return event.forget();
+}

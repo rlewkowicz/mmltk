@@ -1,0 +1,137 @@
+/*
+ * NSS utility functions
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef __nss_h_
+#define __nss_h_
+
+#if defined(NSS_ALLOW_UNSUPPORTED_CRITICAL)
+#define _NSS_CUSTOMIZED " (Customized build)"
+#else
+#define _NSS_CUSTOMIZED
+#endif
+
+#define NSS_VERSION "3.126" _NSS_CUSTOMIZED " Beta"
+#define NSS_VMAJOR 3
+#define NSS_VMINOR 126
+#define NSS_VPATCH 0
+#define NSS_VBUILD 0
+#define NSS_BETA PR_TRUE
+
+#ifndef RC_INVOKED
+
+#include "seccomon.h"
+
+typedef struct NSSInitParametersStr NSSInitParameters;
+
+struct NSSInitParametersStr {
+    unsigned int length; 
+    PRBool passwordRequired;
+    int minPWLen;
+    char *manufactureID;      
+    char *libraryDescription; 
+    char *cryptoTokenDescription;
+    char *dbTokenDescription;
+    char *FIPSTokenDescription;
+    char *cryptoSlotDescription;
+    char *dbSlotDescription;
+    char *FIPSSlotDescription;
+};
+
+SEC_BEGIN_PROTOS
+
+extern PRBool NSS_VersionCheck(const char *importedVersion);
+
+extern const char *NSS_GetVersion(void);
+
+extern SECStatus NSS_Init(const char *configdir);
+
+extern PRBool NSS_IsInitialized(void);
+
+extern SECStatus NSS_InitReadWrite(const char *configdir);
+
+#define NSS_INIT_READONLY 0x1
+#define NSS_INIT_NOCERTDB 0x2
+#define NSS_INIT_NOMODDB 0x4
+#define NSS_INIT_FORCEOPEN 0x8
+#define NSS_INIT_NOROOTINIT 0x10
+#define NSS_INIT_OPTIMIZESPACE 0x20
+#define NSS_INIT_PK11THREADSAFE 0x40
+#define NSS_INIT_PK11RELOAD 0x80
+#define NSS_INIT_NOPK11FINALIZE 0x100
+#define NSS_INIT_RESERVED 0x200
+
+#define NSS_INIT_COOPERATE NSS_INIT_PK11THREADSAFE |     \
+                               NSS_INIT_PK11RELOAD |     \
+                               NSS_INIT_NOPK11FINALIZE | \
+                               NSS_INIT_RESERVED
+
+#define SECMOD_DB "secmod.db"
+
+typedef struct NSSInitContextStr NSSInitContext;
+
+extern SECStatus NSS_Initialize(const char *configdir,
+                                const char *certPrefix, const char *keyPrefix,
+                                const char *secmodName, PRUint32 flags);
+
+extern NSSInitContext *NSS_InitContext(const char *configdir,
+                                       const char *certPrefix, const char *keyPrefix,
+                                       const char *secmodName, NSSInitParameters *initParams, PRUint32 flags);
+
+extern SECStatus NSS_ShutdownContext(NSSInitContext *);
+
+extern SECStatus NSS_InitWithMerge(const char *configdir,
+                                   const char *certPrefix, const char *keyPrefix, const char *secmodName,
+                                   const char *updatedir, const char *updCertPrefix,
+                                   const char *updKeyPrefix, const char *updateID,
+                                   const char *updateName, PRUint32 flags);
+SECStatus NSS_NoDB_Init(const char *configdir);
+
+typedef SECStatus (*NSS_ShutdownFunc)(void *appData, void *nssData);
+
+SECStatus NSS_RegisterShutdown(NSS_ShutdownFunc sFunc, void *appData);
+
+SECStatus NSS_UnregisterShutdown(NSS_ShutdownFunc sFunc, void *appData);
+
+#define NSS_RSA_MIN_KEY_SIZE 0x001
+#define NSS_DH_MIN_KEY_SIZE 0x002
+#define NSS_DSA_MIN_KEY_SIZE 0x004
+#define NSS_TLS_VERSION_MIN_POLICY 0x008
+#define NSS_TLS_VERSION_MAX_POLICY 0x009
+#define NSS_DTLS_VERSION_MIN_POLICY 0x00a
+#define NSS_DTLS_VERSION_MAX_POLICY 0x00b
+
+#define __NSS_PKCS12_DECODE_FORCE_UNICODE 0x00c
+#define NSS_DEFAULT_LOCKS 0x00d /* lock default values */
+#define NSS_DEFAULT_SSL_LOCK 1  /* lock the ssl default values */
+
+#define NSS_KEY_SIZE_POLICY_FLAGS 0x00e
+#define NSS_KEY_SIZE_POLICY_SET_FLAGS 0x00f
+#define NSS_KEY_SIZE_POLICY_CLEAR_FLAGS 0x010
+#define NSS_KEY_SIZE_POLICY_SSL_FLAG 1
+#define NSS_KEY_SIZE_POLICY_VERIFY_FLAG 2
+#define NSS_KEY_SIZE_POLICY_SIGN_FLAG 4
+#define NSS_KEY_SIZE_POLICY_SMIME_FLAG 8
+#define NSS_KEY_SIZE_POLICY_ALL_FLAGS 0x0f
+
+#define NSS_ECC_MIN_KEY_SIZE 0x011
+
+SECStatus NSS_OptionSet(PRInt32 which, PRInt32 value);
+SECStatus NSS_OptionGet(PRInt32 which, PRInt32 *value);
+
+extern SECStatus NSS_Shutdown(void);
+
+void PK11_ConfigurePKCS11(const char *man, const char *libdesc,
+                          const char *tokdesc, const char *ptokdesc, const char *slotdesc,
+                          const char *pslotdesc, const char *fslotdesc, const char *fpslotdesc,
+                          int minPwd, int pwRequired);
+
+void nss_DumpCertificateCacheInfo(void);
+
+SEC_END_PROTOS
+
+#endif /* RC_INVOKED */
+#endif /* __nss_h_ */

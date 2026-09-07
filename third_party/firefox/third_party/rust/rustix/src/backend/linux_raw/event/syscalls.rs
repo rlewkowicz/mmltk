@@ -1,0 +1,277 @@
+//! linux_raw syscalls supporting `rustix::event`.
+//!
+//! # Safety
+//!
+//! See the `rustix::backend` module documentation for details.
+#![allow(unsafe_code, clippy::undocumented_unsafe_blocks)]
+
+use crate::backend::conv::{
+    by_ref, c_int, c_uint, opt_mut, opt_ref, pass_usize, ret, ret_c_int, ret_error, ret_owned_fd,
+    ret_usize, size_of, slice_mut, zero,
+};
+use crate::event::{epoll, EventfdFlags, FdSetElement, PollFd, Timespec};
+use crate::fd::{BorrowedFd, OwnedFd};
+use crate::io;
+use core::ptr::null_mut;
+use linux_raw_sys::general::{kernel_sigset_t, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD};
+
+#[inline]
+pub(crate) fn poll(fds: &mut [PollFd<'_>], timeout: Option<&Timespec>) -> io::Result<usize> {
+    let (fds_addr_mut, fds_len) = slice_mut(fds);
+
+    #[cfg(target_pointer_width = "32")]
+    unsafe {
+        #[cfg(not(feature = "linux_5_1"))]
+        {
+            use linux_raw_sys::general::__kernel_old_timespec;
+
+            fn convert(timeout: &Timespec) -> Option<__kernel_old_timespec> {
+                Some(__kernel_old_timespec {
+                    tv_sec: timeout.tv_sec.try_into().ok()?,
+                    tv_nsec: timeout.tv_nsec.try_into().ok()?,
+                })
+            }
+            let old_timeout = if let Some(timeout) = timeout {
+                match convert(timeout) {
+                    None => None,
+                    Some(old_timeout) => Some(Some(old_timeout)),
+                }
+            } else {
+                Some(None)
+            };
+            if let Some(mut old_timeout) = old_timeout {
+                return ret_usize(syscall!(
+                    __NR_ppoll,
+                    fds_addr_mut,
+                    fds_len,
+                    opt_mut(old_timeout.as_mut()),
+                    zero(),
+                    size_of::<kernel_sigset_t, _>()
+                ));
+            }
+        }
+
+
+        ret_usize(syscall!(
+            __NR_ppoll_time64,
+            fds_addr_mut,
+            fds_len,
+            opt_mut(timeout.copied().as_mut()),
+            zero(),
+            size_of::<kernel_sigset_t, _>()
+        ))
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    unsafe {
+        ret_usize(syscall!(
+            __NR_ppoll,
+            fds_addr_mut,
+            fds_len,
+            opt_mut(timeout.copied().as_mut()),
+            zero(),
+            size_of::<kernel_sigset_t, _>()
+        ))
+    }
+}
+
+pub(crate) unsafe fn select(
+    nfds: i32,
+    readfds: Option<&mut [FdSetElement]>,
+    writefds: Option<&mut [FdSetElement]>,
+    exceptfds: Option<&mut [FdSetElement]>,
+    timeout: Option<&crate::timespec::Timespec>,
+) -> io::Result<i32> {
+    let len = crate::event::fd_set_num_elements_for_bitvector(nfds);
+
+    let readfds = match readfds {
+        Some(readfds) => {
+            assert!(readfds.len() >= len);
+            readfds.as_mut_ptr()
+        }
+        None => null_mut(),
+    };
+    let writefds = match writefds {
+        Some(writefds) => {
+            assert!(writefds.len() >= len);
+            writefds.as_mut_ptr()
+        }
+        None => null_mut(),
+    };
+    let exceptfds = match exceptfds {
+        Some(exceptfds) => {
+            assert!(exceptfds.len() >= len);
+            exceptfds.as_mut_ptr()
+        }
+        None => null_mut(),
+    };
+
+    #[cfg(target_pointer_width = "32")]
+    {
+        #[cfg(not(feature = "linux_5_1"))]
+        {
+            use linux_raw_sys::general::__kernel_old_timespec;
+
+            fn convert(timeout: &Timespec) -> Option<__kernel_old_timespec> {
+                Some(__kernel_old_timespec {
+                    tv_sec: timeout.tv_sec.try_into().ok()?,
+                    tv_nsec: timeout.tv_nsec.try_into().ok()?,
+                })
+            }
+            let old_timeout = if let Some(timeout) = timeout {
+                match convert(timeout) {
+                    None => None,
+                    Some(old_timeout) => Some(Some(old_timeout)),
+                }
+            } else {
+                Some(None)
+            };
+            if let Some(mut old_timeout) = old_timeout {
+                return ret_c_int(syscall!(
+                    __NR_pselect6,
+                    c_int(nfds),
+                    readfds,
+                    writefds,
+                    exceptfds,
+                    opt_mut(old_timeout.as_mut()),
+                    zero()
+                ));
+            }
+        }
+
+
+        ret_c_int(syscall!(
+            __NR_pselect6_time64,
+            c_int(nfds),
+            readfds,
+            writefds,
+            exceptfds,
+            opt_mut(timeout.copied().as_mut()),
+            zero()
+        ))
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    {
+        ret_c_int(syscall!(
+            __NR_pselect6,
+            c_int(nfds),
+            readfds,
+            writefds,
+            exceptfds,
+            opt_mut(timeout.copied().as_mut()),
+            zero()
+        ))
+    }
+}
+
+#[inline]
+pub(crate) fn epoll_create(flags: epoll::CreateFlags) -> io::Result<OwnedFd> {
+    unsafe { ret_owned_fd(syscall_readonly!(__NR_epoll_create1, flags)) }
+}
+
+#[inline]
+pub(crate) fn epoll_add(
+    epfd: BorrowedFd<'_>,
+    fd: BorrowedFd<'_>,
+    event: &epoll::Event,
+) -> io::Result<()> {
+    unsafe {
+        ret(syscall_readonly!(
+            __NR_epoll_ctl,
+            epfd,
+            c_uint(EPOLL_CTL_ADD),
+            fd,
+            by_ref(event)
+        ))
+    }
+}
+
+#[inline]
+pub(crate) fn epoll_mod(
+    epfd: BorrowedFd<'_>,
+    fd: BorrowedFd<'_>,
+    event: &epoll::Event,
+) -> io::Result<()> {
+    unsafe {
+        ret(syscall_readonly!(
+            __NR_epoll_ctl,
+            epfd,
+            c_uint(EPOLL_CTL_MOD),
+            fd,
+            by_ref(event)
+        ))
+    }
+}
+
+#[inline]
+pub(crate) fn epoll_del(epfd: BorrowedFd<'_>, fd: BorrowedFd<'_>) -> io::Result<()> {
+    unsafe {
+        ret(syscall_readonly!(
+            __NR_epoll_ctl,
+            epfd,
+            c_uint(EPOLL_CTL_DEL),
+            fd,
+            zero()
+        ))
+    }
+}
+
+#[inline]
+pub(crate) unsafe fn epoll_wait(
+    epfd: BorrowedFd<'_>,
+    events: (*mut crate::event::epoll::Event, usize),
+    timeout: Option<&Timespec>,
+) -> io::Result<usize> {
+    #[cfg(not(feature = "linux_5_11"))]
+    {
+        let old_timeout = if let Some(timeout) = timeout {
+            timeout.as_c_int_millis()
+        } else {
+            Some(-1)
+        };
+        if let Some(old_timeout) = old_timeout {
+            return ret_usize(syscall!(
+                __NR_epoll_pwait,
+                epfd,
+                events.0,
+                pass_usize(events.1),
+                c_int(old_timeout),
+                zero()
+            ));
+        }
+    }
+
+    ret_usize(syscall!(
+        __NR_epoll_pwait2,
+        epfd,
+        events.0,
+        pass_usize(events.1),
+        opt_ref(timeout),
+        zero()
+    ))
+}
+
+#[inline]
+pub(crate) fn eventfd(initval: u32, flags: EventfdFlags) -> io::Result<OwnedFd> {
+    unsafe { ret_owned_fd(syscall_readonly!(__NR_eventfd2, c_uint(initval), flags)) }
+}
+
+#[inline]
+pub(crate) fn pause() {
+    unsafe {
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        let error = ret_error(syscall_readonly!(
+            __NR_ppoll,
+            zero(),
+            zero(),
+            zero(),
+            zero()
+        ));
+
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
+        let error = ret_error(syscall_readonly!(__NR_pause));
+
+        debug_assert_eq!(error, io::Errno::INTR);
+    }
+}

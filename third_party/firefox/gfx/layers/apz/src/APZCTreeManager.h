@@ -1,0 +1,566 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_APZCTreeManager_h
+#define mozilla_layers_APZCTreeManager_h
+
+#include <unordered_map>  // for std::unordered_map
+
+#include "FocusState.h"          // for FocusState
+#include "HitTestingTreeNode.h"  // for HitTestingTreeNodeAutoLock
+#include "IAPZHitTester.h"       // for IAPZHitTester::HitTestResult
+#include "gfxPoint.h"            // for gfxPoint
+#include "mozilla/Assertions.h"  // for MOZ_ASSERT_HELPER2
+#include "mozilla/DataMutex.h"   // for DataMutex
+#include "mozilla/gfx/CompositorHitTestInfo.h"
+#include "mozilla/gfx/Logging.h"            // for gfx::TreeLog
+#include "mozilla/gfx/Matrix.h"             // for Matrix4x4
+#include "mozilla/layers/APZInputBridge.h"  // for APZInputBridge
+#include "mozilla/layers/APZUtils.h"        // for AsyncTransformComponents
+#include "mozilla/layers/CompositorScrollUpdate.h"  // for CompositorScrollUpdate
+#include "mozilla/layers/IAPZCTreeManager.h"        // for IAPZCTreeManager
+#include "mozilla/layers/PWebRenderBridgeParent.h"
+#include "mozilla/layers/ScrollbarData.h"
+#include "mozilla/layers/LayersTypes.h"
+#include "mozilla/layers/KeyboardMap.h"      // for KeyboardMap
+#include "mozilla/layers/TouchCounter.h"     // for TouchCounter
+#include "mozilla/layers/ZoomConstraints.h"  // for ZoomConstraints
+#include "mozilla/webrender/webrender_ffi.h"
+#include "mozilla/RecursiveMutex.h"  // for RecursiveMutex
+#include "mozilla/RefPtr.h"          // for RefPtr
+#include "mozilla/TimeStamp.h"       // for mozilla::TimeStamp
+#include "mozilla/UniquePtr.h"       // for UniquePtr
+#include "nsCOMPtr.h"                // for already_AddRefed
+#include "nsTArray.h"
+#include "VsyncSource.h"
+
+namespace mozilla {
+class MultiTouchInput;
+
+namespace dom {
+enum class InteractiveWidget : uint8_t;
+}  
+
+namespace wr {
+class TransactionWrapper;
+class WebRenderAPI;
+}  
+
+namespace layers {
+
+class Layer;
+class AsyncPanZoomController;
+class APZCTreeManagerParent;
+class APZSampler;
+class APZUpdater;
+class CompositorBridgeParent;
+class MatrixMessage;
+class OverscrollHandoffChain;
+struct OverscrollHandoffState;
+class FocusTarget;
+struct FlingHandoffState;
+class InputQueue;
+class GeckoContentController;
+class HitTestingTreeNode;
+class SampleTime;
+class WebRenderScrollDataWrapper;
+struct AncestorTransform;
+struct ScrollThumbData;
+struct ZoomTarget;
+
+
+class APZCTreeManager : public IAPZCTreeManager, public APZInputBridge {
+  typedef mozilla::layers::AllowedTouchBehavior AllowedTouchBehavior;
+  typedef mozilla::layers::AsyncDragMetrics AsyncDragMetrics;
+  using HitTestResult = IAPZHitTester::HitTestResult;
+
+  struct TargetApzcForNodeResult {
+    AsyncPanZoomController* mApzc;
+    bool mIsFixed;
+  };
+
+  struct TreeBuildingState;
+
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(APZCTreeManager, final);
+
+  static mozilla::LazyLogModule sLog;
+
+  static already_AddRefed<APZCTreeManager> Create(
+      LayersId aRootLayersId, UniquePtr<IAPZHitTester> aHitTester = nullptr);
+  void SetSampler(APZSampler* aSampler);
+  void SetUpdater(APZUpdater* aUpdater);
+
+  void NotifyLayerTreeAdopted(LayersId aLayersId,
+                              const RefPtr<APZCTreeManager>& aOldTreeManager);
+
+  void NotifyLayerTreeRemoved(LayersId aLayersId);
+
+  void UpdateFocusState(LayersId aRootLayerTreeId,
+                        LayersId aOriginatingLayersId,
+                        const FocusTarget& aFocusTarget);
+
+  std::vector<LayersId> UpdateHitTestingTree(
+      const WebRenderScrollDataWrapper& aRoot, LayersId aOriginatingLayersId,
+      uint32_t aPaintSequenceNumber);
+
+  void SampleForWebRender(const Maybe<VsyncId>& aVsyncId,
+                          wr::TransactionWrapper& aTxn,
+                          const SampleTime& aSampleTime);
+
+  APZEventResult ReceiveInputEvent(
+      InputData& aEvent,
+      InputBlockCallback&& aCallback = InputBlockCallback()) override;
+
+  void SetKeyboardMap(const KeyboardMap& aKeyboardMap) override;
+
+  void ZoomToRect(const ScrollableLayerGuid& aGuid,
+                  const ZoomTarget& aZoomTarget,
+                  const uint32_t aFlags = DEFAULT_BEHAVIOR) override;
+
+  void ContentReceivedInputBlock(uint64_t aInputBlockId,
+                                 bool aPreventDefault) override;
+
+  void SetTargetAPZC(uint64_t aInputBlockId,
+                     const nsTArray<ScrollableLayerGuid>& aTargets) override;
+
+  void UpdateZoomConstraints(
+      const ScrollableLayerGuid& aGuid,
+      const Maybe<ZoomConstraints>& aConstraints) override;
+
+  void ClearTree();
+
+  void SetDPI(float aDpiValue) override;
+
+  float GetDPI() const;
+
+  void FindScrollThumbNode(const AsyncDragMetrics& aDragMetrics,
+                           LayersId aLayersId,
+                           HitTestingTreeNodeAutoLock& aOutThumbNode);
+
+  void SetAllowedTouchBehavior(
+      uint64_t aInputBlockId,
+      const nsTArray<TouchBehaviorFlags>& aValues) override;
+
+  void SetBrowserGestureResponse(uint64_t aInputBlockId,
+                                 BrowserGestureResponse aResponse) override;
+
+  bool DispatchScroll(AsyncPanZoomController* aPrev,
+                      ParentLayerPoint& aStartPoint,
+                      ParentLayerPoint& aEndPoint,
+                      OverscrollHandoffState& aOverscrollHandoffState);
+
+  ParentLayerPoint DispatchFling(AsyncPanZoomController* aApzc,
+                                 const FlingHandoffState& aHandoffState);
+
+  void StartScrollbarDrag(const ScrollableLayerGuid& aGuid,
+                          const AsyncDragMetrics& aDragMetrics) override;
+
+  bool StartAutoscroll(const ScrollableLayerGuid& aGuid,
+                       const ScreenPoint& aAnchorLocation) override;
+
+  void StopAutoscroll(const ScrollableLayerGuid& aGuid) override;
+
+  RefPtr<const OverscrollHandoffChain> BuildOverscrollHandoffChain(
+      const RefPtr<AsyncPanZoomController>& aInitialTarget);
+
+  void SetLongTapEnabled(bool aTapGestureEnabled) override;
+
+  void NotifyApzAwareListenerAdded(const ScrollableLayerGuid& aGuid) override;
+
+  bool ChainHasFastPathApzAwareListener(const ScrollableLayerGuid& aHitGuid);
+
+  APZInputBridge* InputBridge() override { return this; }
+
+  void AddInputBlockCallback(uint64_t aInputBlockId,
+                             InputBlockCallback&& aCallback);
+
+
+  void ProcessUnhandledEvent(LayoutDeviceIntPoint* aRefPoint,
+                             ScrollableLayerGuid* aOutTargetGuid,
+                             uint64_t* aOutFocusSequenceNumber,
+                             LayersId* aOutLayersId) override;
+
+  void UpdateWheelTransaction(
+      LayoutDeviceIntPoint aRefPoint, EventMessage aEventMessage,
+      const Maybe<ScrollableLayerGuid>& aTargetGuid) override;
+
+  void MaybeOverrideLayersIdForWheelEvent(InputData& aEvent);
+
+
+  void SendSubtreeTransformsToChromeMainThread(
+      const AsyncPanZoomController* aAncestor);
+
+  void SetFixedLayerMargins(ScreenIntCoord aTop, ScreenIntCoord aBottom);
+
+  static LayerToParentLayerMatrix4x4 ComputeTransformForScrollThumb(
+      const LayerToParentLayerMatrix4x4& aCurrentTransform,
+      const gfx::Matrix4x4& aScrollableContentTransform,
+      AsyncPanZoomController* aApzc, const FrameMetrics& aMetrics,
+      const ScrollbarData& aScrollbarData, bool aScrollbarIsDescendant);
+
+  static void FlushApzRepaints(LayersId aLayersId);
+
+  void EndWheelTransaction(
+      PWebRenderBridgeParent::EndWheelTransactionResolver&& aResolver);
+
+  void MarkAsDetached(LayersId aLayersId);
+
+  void AssertOnSamplerThread();
+  void AssertOnUpdaterThread();
+
+  already_AddRefed<wr::WebRenderAPI> GetWebRenderAPI() const;
+
+ protected:
+  APZCTreeManager(LayersId aRootLayersId, UniquePtr<IAPZHitTester> aHitTester);
+
+  void Init();
+
+  virtual ~APZCTreeManager();
+
+  APZSampler* GetSampler() const;
+  APZUpdater* GetUpdater() const;
+
+  bool AdvanceAnimationsInternal(const MutexAutoLock& aProofOfMapLock,
+                                 const SampleTime& aSampleTime)
+      MOZ_REQUIRES(mMapLock);
+
+ private:
+  friend class APZUpdater;
+  void LockTree() MOZ_CAPABILITY_ACQUIRE(mTreeLock);
+  void UnlockTree() MOZ_CAPABILITY_RELEASE(mTreeLock);
+
+  virtual already_AddRefed<AsyncPanZoomController> NewAPZCInstance(
+      LayersId aLayersId, GeckoContentController* aController);
+
+  void SetFixedLayerMarginsOnRootContentApzcs(
+      const RecursiveMutexAutoLock& aProofOfTreeLock) MOZ_REQUIRES(mTreeLock);
+
+ public:
+  virtual SampleTime GetFrameTime();
+
+  void SetTestSampleTime(const Maybe<TimeStamp>& aTime);
+
+ private:
+  mutable DataMutex<Maybe<TimeStamp>> mTestSampleTime;
+  CopyableTArray<MatrixMessage> mLastMessages;
+
+ public:
+  RefPtr<HitTestingTreeNode> GetRootNode() const;
+  HitTestResult GetTargetAPZC(const ScreenPoint& aPoint);
+  already_AddRefed<AsyncPanZoomController> GetTargetAPZC(
+      const LayersId& aLayersId,
+      const ScrollableLayerGuid::ViewID& aScrollId) const;
+  already_AddRefed<AsyncPanZoomController> GetTargetAPZC(
+      const LayersId& aLayersId, const ScrollableLayerGuid::ViewID& aScrollId,
+      const MutexAutoLock& aProofOfMapLock) const;
+  ScreenToParentLayerMatrix4x4 GetScreenToApzcTransform(
+      const AsyncPanZoomController* aApzc) const;
+  ParentLayerToScreenMatrix4x4 GetApzcToGeckoTransformForHit(
+      HitTestResult& aHitResult) const;
+  ParentLayerToScreenMatrix4x4 GetApzcToGeckoTransform(
+      const AsyncPanZoomController* aApzc,
+      const AsyncTransformComponents& aComponents) const;
+
+  ParentLayerToParentLayerMatrix4x4 GetApzcToApzcTransform(
+      const AsyncPanZoomController* aStartApzc,
+      const AsyncPanZoomController* aStopApzc,
+      const AsyncTransformComponents& aComponents) const;
+
+  CSSToCSSMatrix4x4 GetOopifToRootContentTransform(
+      AsyncPanZoomController* aApzc) const;
+
+  CSSRect ConvertRectInApzcToRoot(AsyncPanZoomController* aApzc,
+                                  const CSSRect& aRect) const;
+
+  ScreenPoint GetCurrentMousePosition() const;
+  void SetCurrentMousePosition(const ScreenPoint& aNewPos);
+
+  Maybe<ScreenIntPoint> ConvertToGecko(const ScreenIntPoint& aPoint,
+                                       AsyncPanZoomController* aApzc);
+
+  already_AddRefed<AsyncPanZoomController> FindZoomableApzc(
+      AsyncPanZoomController* aStart) const;
+
+  AsyncPanZoomController* FindRootApzcFor(LayersId aLayersId) const;
+
+  ScreenMargin GetCompositorFixedLayerMargins() const;
+
+  void AdjustEventPointForDynamicToolbar(ScreenIntPoint& aEventPoint,
+                                         const HitTestResult& aHit);
+
+  APZScrollGeneration NewAPZScrollGeneration() {
+    MutexAutoLock lock(mScrollGenerationLock);
+    return mScrollGenerationCounter.NewAPZGeneration();
+  }
+
+  template <typename Callback>
+  void CallWithMapLock(Callback& aCallback) {
+    MutexAutoLock lock(mMapLock);
+    aCallback(lock);
+  }
+
+ private:
+  using GuidComparator = ScrollableLayerGuid::Comparator;
+  using ScrollNode = WebRenderScrollDataWrapper;
+
+
+  void AttachNodeToTree(HitTestingTreeNode* aNode, HitTestingTreeNode* aParent,
+                        HitTestingTreeNode* aNextSibling)
+      MOZ_REQUIRES(mTreeLock);
+  already_AddRefed<AsyncPanZoomController> GetTargetAPZC(
+      const ScrollableLayerGuid& aGuid);
+  already_AddRefed<HitTestingTreeNode> GetTargetNode(
+      const ScrollableLayerGuid& aGuid, GuidComparator aComparator) const;
+  HitTestingTreeNode* FindTargetNode(HitTestingTreeNode* aNode,
+                                     const ScrollableLayerGuid& aGuid,
+                                     GuidComparator aComparator);
+  TargetApzcForNodeResult GetTargetApzcForNode(const HitTestingTreeNode* aNode);
+  TargetApzcForNodeResult FindHandoffParent(
+      const AsyncPanZoomController* aApzc);
+
+  HitTestResult GetTargetAPZCForMouseInput(const MouseInput& aMouseInput);
+
+  HitTestingTreeNode* FindRootNodeForLayersId(LayersId aLayersId) const;
+  AsyncPanZoomController* FindRootContentApzcForLayersId(
+      LayersId aLayersId) const;
+  already_AddRefed<AsyncPanZoomController> GetZoomableTarget(
+      AsyncPanZoomController* aApzc1, AsyncPanZoomController* aApzc2) const;
+  already_AddRefed<AsyncPanZoomController> CommonAncestor(
+      AsyncPanZoomController* aApzc1, AsyncPanZoomController* aApzc2) const;
+
+  struct FixedPositionInfo;
+  struct StickyPositionInfo;
+
+  bool IsFixedToRootContent(const FixedPositionInfo& aFixedInfo,
+                            const MutexAutoLock& aProofOfMapLock) const
+      MOZ_REQUIRES(mMapLock);
+
+  SideBits SidesStuckToRootContent(const HitTestingTreeNode* aNode,
+                                   AsyncTransformConsumer aMode) const;
+  SideBits SidesStuckToRootContent(const StickyPositionInfo& aStickyInfo,
+                                   AsyncTransformConsumer aMode,
+                                   const MutexAutoLock& aProofOfMapLock) const
+      MOZ_REQUIRES(mMapLock);
+
+  HitTestResult GetTouchInputBlockAPZC(
+      const MultiTouchInput& aEvent,
+      nsTArray<TouchBehaviorFlags>* aOutTouchBehaviors);
+
+  struct InputHandlingState {
+    InputData& mEvent;
+
+    APZEventResult mResult;
+
+    HitTestResult mHit;
+
+    APZEventResult Finish(APZCTreeManager& aTreeManager,
+                          InputBlockCallback&& aCallback);
+  };
+
+  void ProcessTouchInput(InputHandlingState& aState, MultiTouchInput& aInput);
+  void SetupScrollbarDrag(MouseInput& aMouseInput,
+                          const HitTestingTreeNodeAutoLock& aScrollThumbNode,
+                          AsyncPanZoomController* aApzc);
+  APZEventResult ProcessTouchInputForScrollbarDrag(
+      MultiTouchInput& aInput,
+      const HitTestingTreeNodeAutoLock& aScrollThumbNode,
+      const gfx::CompositorHitTestInfo& aHitInfo);
+  void FlushRepaintsToClearScreenToGeckoTransform();
+
+  void SynthesizePinchGestureFromMouseWheel(
+      const ScrollWheelInput& aWheelInput,
+      const RefPtr<AsyncPanZoomController>& aTarget);
+
+  already_AddRefed<HitTestingTreeNode> RecycleOrCreateNode(
+      const RecursiveMutexAutoLock& aProofOfTreeLock, TreeBuildingState& aState,
+      AsyncPanZoomController* aApzc, LayersId aLayersId);
+  HitTestingTreeNode* PrepareNodeForLayer(
+      const RecursiveMutexAutoLock& aProofOfTreeLock, const ScrollNode& aLayer,
+      const FrameMetrics& aMetrics, LayersId aLayersId,
+      const Maybe<ZoomConstraints>& aZoomConstraints,
+      const AncestorTransform& aAncestorTransform, HitTestingTreeNode* aParent,
+      HitTestingTreeNode* aNextSibling, TreeBuildingState& aState);
+
+  void PrintLayerInfo(const ScrollNode& aLayer);
+
+  void NotifyScrollbarDragInitiated(uint64_t aDragBlockId,
+                                    const ScrollableLayerGuid& aGuid,
+                                    ScrollDirection aDirection) const;
+  void NotifyScrollbarDragRejected(const ScrollableLayerGuid& aGuid) const;
+  void NotifyAutoscrollRejected(const ScrollableLayerGuid& aGuid) const;
+
+  LayerToParentLayerMatrix4x4 ComputeTransformForScrollThumbNode(
+      const HitTestingTreeNode* aNode) const MOZ_REQUIRES(mTreeLock);
+
+  static already_AddRefed<GeckoContentController> GetContentController(
+      LayersId aLayersId);
+
+  using ClippedCompositionBoundsMap =
+      std::unordered_map<ScrollableLayerGuid, ParentLayerRect,
+                         ScrollableLayerGuid::HashIgnoringPresShellFn,
+                         ScrollableLayerGuid::EqualIgnoringPresShellFn>;
+  ParentLayerRect ComputeClippedCompositionBounds(
+      const MutexAutoLock& aProofOfMapLock,
+      ClippedCompositionBoundsMap& aDestMap, ScrollableLayerGuid aGuid)
+      MOZ_REQUIRES(mMapLock);
+
+  ScreenMargin GetCompositorFixedLayerMargins(
+      const MutexAutoLock& aProofOfMapLock) const MOZ_REQUIRES(mMapLock);
+
+  ScreenPoint ComputeFixedMarginsOffset(
+      const MutexAutoLock& aProofOfMapLock, SideBits aFixedSides,
+      const ScreenMargin& aGeckoFixedLayerMargins) const MOZ_REQUIRES(mMapLock);
+
+  bool IsSoftwareKeyboardVisible(const MutexAutoLock& aProofOfMapLock) const
+      MOZ_REQUIRES(mMapLock) {
+    return mIsSoftwareKeyboardVisible;
+  }
+  void SetIsSoftwareKeyboardVisible(bool aIsSoftwareKeyboardVisible,
+                                    const MutexAutoLock& aProofOfMapLock)
+      MOZ_REQUIRES(mMapLock) {
+    mIsSoftwareKeyboardVisible = aIsSoftwareKeyboardVisible;
+  }
+  dom::InteractiveWidget InteractiveWidgetMode(
+      const MutexAutoLock& aProofOfMapLock) const MOZ_REQUIRES(mMapLock) {
+    return mInteractiveWidget;
+  }
+  void SetInteractiveWidgetMode(dom::InteractiveWidget aInteractiveWidgetMode,
+                                const MutexAutoLock& aProofOfMapLock)
+      MOZ_REQUIRES(mMapLock) {
+    mInteractiveWidget = aInteractiveWidgetMode;
+  }
+
+ protected:
+  RefPtr<InputQueue> mInputQueue;
+
+  mutable mozilla::Mutex mMapLock;
+
+ private:
+  LayersId mRootLayersId;
+
+  APZSampler* MOZ_NON_OWNING_REF mSampler;
+  APZUpdater* MOZ_NON_OWNING_REF mUpdater;
+
+  mutable mozilla::RecursiveMutex mTreeLock;
+  RefPtr<HitTestingTreeNode> mRootNode MOZ_GUARDED_BY(mTreeLock);
+
+  std::unordered_set<LayersId, LayersId::HashFn> mDetachedLayersIds
+      MOZ_GUARDED_BY(mTreeLock);
+
+  struct ApzcMapData {
+    RefPtr<AsyncPanZoomController> apzc;
+    Maybe<ScrollableLayerGuid> parent;
+  };
+
+  std::unordered_map<ScrollableLayerGuid, ApzcMapData,
+                     ScrollableLayerGuid::HashIgnoringPresShellFn,
+                     ScrollableLayerGuid::EqualIgnoringPresShellFn>
+      mApzcMap MOZ_GUARDED_BY(mMapLock);
+
+  std::unordered_set<ScrollableLayerGuid,
+                     ScrollableLayerGuid::HashIgnoringPresShellFn,
+                     ScrollableLayerGuid::EqualIgnoringPresShellFn>
+      mFastPathApzAwareGuids MOZ_GUARDED_BY(mMapLock);
+  struct ScrollThumbInfo {
+    uint64_t mThumbAnimationId;
+    CSSTransformMatrix mThumbTransform;
+    ScrollbarData mThumbData;
+    ScrollableLayerGuid mTargetGuid;
+    CSSTransformMatrix mTargetTransform;
+    bool mTargetIsAncestor;
+
+    ScrollThumbInfo(const uint64_t& aThumbAnimationId,
+                    const CSSTransformMatrix& aThumbTransform,
+                    const ScrollbarData& aThumbData,
+                    const ScrollableLayerGuid& aTargetGuid,
+                    const CSSTransformMatrix& aTargetTransform,
+                    bool aTargetIsAncestor)
+        : mThumbAnimationId(aThumbAnimationId),
+          mThumbTransform(aThumbTransform),
+          mThumbData(aThumbData),
+          mTargetGuid(aTargetGuid),
+          mTargetTransform(aTargetTransform),
+          mTargetIsAncestor(aTargetIsAncestor) {
+      MOZ_ASSERT(mTargetGuid.mScrollId == mThumbData.mTargetViewId);
+    }
+  };
+  std::vector<ScrollThumbInfo> mScrollThumbInfo MOZ_GUARDED_BY(mMapLock);
+
+  struct RootScrollbarInfo {
+    uint64_t mScrollbarAnimationId;
+    ScrollDirection mScrollDirection;
+
+    RootScrollbarInfo(const uint64_t& aScrollbarAnimationId,
+                      const ScrollDirection aScrollDirection)
+        : mScrollbarAnimationId(aScrollbarAnimationId),
+          mScrollDirection(aScrollDirection) {}
+  };
+  std::vector<RootScrollbarInfo> mRootScrollbarInfo MOZ_GUARDED_BY(mMapLock);
+
+  struct FixedPositionInfo {
+    Maybe<uint64_t> mFixedPositionAnimationId;
+    SideBits mFixedPosSides;
+    ScrollableLayerGuid::ViewID mFixedPosTarget;
+    LayersId mLayersId;
+
+    explicit FixedPositionInfo(const HitTestingTreeNode* aNode);
+  };
+  std::vector<FixedPositionInfo> mFixedPositionInfo MOZ_GUARDED_BY(mMapLock);
+
+  struct StickyPositionInfo {
+    Maybe<uint64_t> mStickyPositionAnimationId;
+    SideBits mFixedPosSides;
+    ScrollableLayerGuid::ViewID mStickyPosTarget;
+    LayersId mLayersId;
+    LayerRectAbsolute mStickyScrollRangeInner;
+    LayerRectAbsolute mStickyScrollRangeOuter;
+
+    explicit StickyPositionInfo(const HitTestingTreeNode* aNode);
+  };
+  std::vector<StickyPositionInfo> mStickyPositionInfo MOZ_GUARDED_BY(mMapLock);
+
+  std::unordered_map<ScrollableLayerGuid, ZoomConstraints,
+                     ScrollableLayerGuid::HashIgnoringPresShellFn,
+                     ScrollableLayerGuid::EqualIgnoringPresShellFn>
+      mZoomConstraints;
+  KeyboardMap mKeyboardMap;
+  FocusState mFocusState;
+  HitTestResult mTouchBlockHitResult;
+  int32_t mRetainedTouchIdentifier;
+  bool mInScrollbarTouchDrag;
+  TouchCounter mTouchCounter;
+  HitTestResult mTapGestureHitResult;
+  HitTestResult mDragBlockHitResult;
+  mutable DataMutex<ScreenPoint> mCurrentMousePosition;
+  ScreenMargin mCompositorFixedLayerMargins MOZ_GUARDED_BY(mMapLock);
+  ScreenMargin mGeckoFixedLayerMargins MOZ_GUARDED_BY(mMapLock);
+  gfx::TreeLog<gfx::LOG_CRITICAL> mApzcTreeLog;
+
+  class CheckerboardFlushObserver;
+  friend class CheckerboardFlushObserver;
+  RefPtr<CheckerboardFlushObserver> mFlushObserver;
+
+
+  float mDPI;
+
+  friend class IAPZHitTester;
+  UniquePtr<IAPZHitTester> mHitTester;
+
+  nsTArray<AsyncPanZoomController*> mRootContentApzcs MOZ_GUARDED_BY(mTreeLock);
+
+  ScrollGenerationCounter mScrollGenerationCounter;
+  mozilla::Mutex mScrollGenerationLock;
+
+  dom::InteractiveWidget mInteractiveWidget MOZ_GUARDED_BY(mMapLock);
+
+  bool mIsSoftwareKeyboardVisible MOZ_GUARDED_BY(mMapLock);
+
+  bool mHaveOOPIframes;
+};
+
+}  
+}  
+
+#endif  // mozilla_layers_PanZoomController_h

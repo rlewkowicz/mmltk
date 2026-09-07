@@ -1,0 +1,86 @@
+/*
+ *  Copyright (c) 2017 The WebM project authors. All Rights Reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+#if !defined(VPX_VPX_UTIL_VPX_ATOMICS_H_)
+#define VPX_VPX_UTIL_VPX_ATOMICS_H_
+
+#include "./vpx_config.h"
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+#if CONFIG_OS_SUPPORT && CONFIG_MULTITHREAD
+
+#if !defined(__has_builtin)
+#define __has_builtin(x) 0  // Compatibility with non-clang compilers.
+#endif
+
+#if (__has_builtin(__atomic_load_n)) || \
+    (defined(__GNUC__) &&               \
+     (__GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 7)))
+#define VPX_USE_ATOMIC_BUILTINS
+#else
+#if defined(_MSC_VER)
+#define vpx_atomic_memory_barrier() \
+  do {                              \
+  } while (0)
+#else
+#if VPX_ARCH_X86 || VPX_ARCH_X86_64
+#define vpx_atomic_memory_barrier() __asm__ __volatile__("" ::: "memory")
+#elif VPX_ARCH_ARM
+#define vpx_atomic_memory_barrier() __asm__ __volatile__("dmb ish" ::: "memory")
+#elif VPX_ARCH_MIPS
+#define vpx_atomic_memory_barrier() __asm__ __volatile__("sync" ::: "memory")
+#else
+#error Unsupported architecture!
+#endif
+#endif
+#endif
+
+typedef struct vpx_atomic_int {
+  volatile int value;
+} vpx_atomic_int;
+
+#define VPX_ATOMIC_INIT(num) { num }
+
+static INLINE void vpx_atomic_init(vpx_atomic_int *atomic, int value) {
+  atomic->value = value;
+}
+
+static INLINE void vpx_atomic_store_release(vpx_atomic_int *atomic, int value) {
+#if defined(VPX_USE_ATOMIC_BUILTINS)
+  __atomic_store_n(&atomic->value, value, __ATOMIC_RELEASE);
+#else
+  vpx_atomic_memory_barrier();
+  atomic->value = value;
+#endif
+}
+
+static INLINE int vpx_atomic_load_acquire(const vpx_atomic_int *atomic) {
+#if defined(VPX_USE_ATOMIC_BUILTINS)
+  return __atomic_load_n(&atomic->value, __ATOMIC_ACQUIRE);
+#else
+  int v = atomic->value;
+  vpx_atomic_memory_barrier();
+  return v;
+#endif
+}
+
+#undef VPX_USE_ATOMIC_BUILTINS
+#undef vpx_atomic_memory_barrier
+
+#endif
+
+#if defined(__cplusplus)
+}  
+#endif
+
+#endif

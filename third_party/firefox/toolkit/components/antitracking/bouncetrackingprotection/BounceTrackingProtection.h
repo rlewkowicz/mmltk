@@ -1,0 +1,141 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef mozilla_BounceTrackingProtection_h_
+#define mozilla_BounceTrackingProtection_h_
+
+#include "BounceTrackingMapEntry.h"
+#include "BounceTrackingRecord.h"
+#include "mozilla/Logging.h"
+#include "mozilla/MozPromise.h"
+#include "nsIBounceTrackingProtection.h"
+#include "nsIBTPRemoteExceptionList.h"
+#include "mozilla/Maybe.h"
+#include "nsWeakReference.h"
+#include "nsTHashSet.h"
+
+inline const char* format_as(nsIBounceTrackingProtection::Modes aMode) {
+  switch (aMode) {
+    case nsIBounceTrackingProtection::MODE_DISABLED:
+      return "MODE_DISABLED";
+    case nsIBounceTrackingProtection::MODE_ENABLED:
+      return "MODE_ENABLED";
+    case nsIBounceTrackingProtection::MODE_ENABLED_STANDBY:
+      return "MODE_ENABLED_STANDBY";
+    case nsIBounceTrackingProtection::MODE_ENABLED_DRY_RUN:
+      return "MODE_ENABLED_DRY_RUN";
+  }
+  return "UNKNOWN";
+}
+
+class nsIPrincipal;
+class nsITimer;
+
+namespace mozilla {
+
+class BounceTrackingAllowList;
+class BounceTrackingState;
+class BounceTrackingStateGlobal;
+class BounceTrackingProtectionStorage;
+class ClearDataCallback;
+class OriginAttributes;
+
+namespace dom {
+class CanonicalBrowsingContext;
+class WindowContext;
+class WindowGlobalParent;
+}  
+
+using ClearDataMozPromise =
+    MozPromise<RefPtr<BounceTrackingPurgeEntry>, uint32_t, true>;
+
+extern LazyLogModule gBounceTrackingProtectionLog;
+
+class BounceTrackingProtection final : public nsIBounceTrackingProtection,
+                                       public nsSupportsWeakReference {
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIBOUNCETRACKINGPROTECTION
+
+ public:
+  static already_AddRefed<BounceTrackingProtection> GetSingleton();
+
+  [[nodiscard]] nsresult RecordStatefulBounces(
+      BounceTrackingState* aBounceTrackingState);
+
+  [[nodiscard]] static nsresult RecordUserActivation(
+      nsIPrincipal* aPrincipal, Maybe<PRTime> aActivationTime = Nothing(),
+      dom::CanonicalBrowsingContext* aTopBrowsingContext = nullptr);
+
+  [[nodiscard]] static nsresult RecordUserActivation(
+      dom::WindowContext* aWindowContext);
+
+  [[nodiscard]] nsresult ClearExpiredUserInteractions(
+      BounceTrackingStateGlobal* aStateGlobal = nullptr);
+
+  void MaybeLogPurgedWarningForSite(nsIPrincipal* aPrincipal,
+                                    BounceTrackingState* aBounceTrackingState);
+
+ private:
+  BounceTrackingProtection() = default;
+  ~BounceTrackingProtection() = default;
+
+  [[nodiscard]] nsresult Init();
+
+  static void OnPrefChange(const char* aPref, void* aData);
+
+  nsresult OnModeChange(bool aIsStartup);
+
+  nsresult UpdateBounceTrackingPurgeTimer(bool aShouldEnable);
+
+  nsCOMPtr<nsITimer> mBounceTrackingPurgeTimer;
+
+  RefPtr<BounceTrackingProtectionStorage> mStorage;
+
+  nsCOMPtr<nsIBTPRemoteExceptionList> mRemoteExceptionList;
+  RefPtr<GenericNonExclusivePromise> mRemoteExceptionListInitPromise;
+
+  nsTHashSet<nsCStringHashKey> mRemoteSiteHostExceptions;
+
+  RefPtr<GenericNonExclusivePromise> EnsureRemoteExceptionListService();
+
+  using PurgeBounceTrackersMozPromise =
+      MozPromise<nsTArray<RefPtr<BounceTrackingPurgeEntry>>, nsresult, true>;
+  RefPtr<PurgeBounceTrackersMozPromise> PurgeBounceTrackers();
+
+  [[nodiscard]] nsresult PurgeBounceTrackersForStateGlobal(
+      BounceTrackingStateGlobal* aStateGlobal,
+      BounceTrackingAllowList& aBounceTrackingAllowList,
+      nsTArray<RefPtr<ClearDataMozPromise>>& aClearPromises);
+
+  [[nodiscard]] nsresult PurgeStateForHostAndOriginAttributes(
+      const nsACString& aHost, PRTime bounceTime,
+      const OriginAttributes& aOriginAttributes,
+      BounceTrackingRecord* aChainRecord, ClearDataMozPromise** aClearPromise);
+
+  bool mPurgeInProgress = false;
+
+  [[nodiscard]] nsresult MaybeMigrateUserInteractionPermissions();
+
+  [[nodiscard]] static nsresult LogBounceTrackersClassifiedToWebConsole(
+      BounceTrackingState* aBounceTrackingState,
+      const nsTArray<nsCString>& aSiteHosts);
+
+  class PurgeEntryTimeComparator {
+   public:
+    bool Equals(const BounceTrackingPurgeEntry* a,
+                const BounceTrackingPurgeEntry* b) const {
+      MOZ_ASSERT(a && b);
+      return a->PurgeTimeRefConst() == b->PurgeTimeRefConst();
+    }
+
+    bool LessThan(const BounceTrackingPurgeEntry* a,
+                  const BounceTrackingPurgeEntry* b) const {
+      MOZ_ASSERT(a && b);
+      return a->PurgeTimeRefConst() < b->PurgeTimeRefConst();
+    }
+  };
+};
+
+}  
+
+#endif

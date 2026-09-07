@@ -1,0 +1,241 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_image_RasterImage_h
+#define mozilla_image_RasterImage_h
+
+#include "DecoderFactory.h"
+#include "FrameAnimator.h"
+#include "ISurfaceProvider.h"
+#include "Image.h"
+#include "ImageContainer.h"
+#include "ImageMetadata.h"
+#include "LookupResult.h"
+#include "Orientation.h"
+#include "PlaybackType.h"
+#include "imgIContainer.h"
+#include "mozilla/AtomicBitfields.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/NotNull.h"
+#include "mozilla/StaticPrefs_image.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/WeakPtr.h"
+#include "mozilla/image/Resolution.h"
+#include "nsCOMPtr.h"
+#include "nsTArray.h"
+#include "nsThreadUtils.h"
+#ifdef DEBUG
+#  include "imgIContainerDebug.h"
+#endif
+
+class nsIInputStream;
+class nsIRequest;
+
+#define NS_RASTERIMAGE_CID                    \
+  { \
+   0x376ff2c1,                                \
+   0x9bf6,                                    \
+   0x418a,                                    \
+   {0xb1, 0x43, 0x33, 0x40, 0xc0, 0x01, 0x12, 0xf7}}
+
+
+namespace mozilla {
+namespace layers {
+class ImageContainer;
+class Image;
+class LayersManager;
+}  
+
+namespace image {
+
+class Decoder;
+struct DecoderFinalStatus;
+class ImageMetadata;
+class SourceBuffer;
+
+class RasterImage final : public ImageResource,
+                          public SupportsWeakPtr
+#ifdef DEBUG
+    ,
+                          public imgIContainerDebug
+#endif
+{
+  virtual ~RasterImage();
+
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_IMGICONTAINER
+#ifdef DEBUG
+  NS_DECL_IMGICONTAINERDEBUG
+#endif
+
+  virtual nsresult StartAnimation() override;
+  virtual nsresult StopAnimation() override;
+
+  virtual void OnSurfaceDiscarded(const SurfaceKey& aSurfaceKey) override;
+
+  virtual size_t SizeOfSourceWithComputedFallback(
+      SizeOfState& aState) const override;
+
+  void Discard();
+
+
+  void NotifyProgress(Progress aProgress,
+                      const OrientedIntRect& aInvalidRect = OrientedIntRect(),
+                      const Maybe<uint32_t>& aFrameCount = Nothing(),
+                      DecoderFlags aDecoderFlags = DefaultDecoderFlags(),
+                      SurfaceFlags aSurfaceFlags = DefaultSurfaceFlags());
+
+  void NotifyDecodeComplete(
+      const DecoderFinalStatus& aStatus, const ImageMetadata& aMetadata,
+      Progress aProgress, const OrientedIntRect& aInvalidRect,
+      const Maybe<uint32_t>& aFrameCount, DecoderFlags aDecoderFlags,
+      SurfaceFlags aSurfaceFlags);
+
+  void ReportDecoderError();
+
+
+  virtual nsresult OnImageDataAvailable(nsIRequest* aRequest,
+                                        nsIInputStream* aInStr,
+                                        uint64_t aSourceOffset,
+                                        uint32_t aCount) override;
+  virtual nsresult OnImageDataComplete(nsIRequest* aRequest, nsresult aStatus,
+                                       bool aLastPart) override;
+
+  void NotifyForLoadEvent(Progress aProgress);
+
+  nsresult SetSourceSizeHint(uint32_t aSizeHint);
+
+  nsCString GetURIString() {
+    nsCString spec;
+    if (GetURI()) {
+      GetURI()->GetSpec(spec);
+    }
+    return spec;
+  }
+
+ private:
+  nsresult Init(const char* aMimeType, uint32_t aFlags);
+
+  LookupResult LookupFrame(const OrientedIntSize& aSize, uint32_t aFlags,
+                           PlaybackType aPlaybackType, bool aMarkUsed);
+
+  LookupResult LookupFrameInternal(const OrientedIntSize& aSize,
+                                   uint32_t aFlags, PlaybackType aPlaybackType,
+                                   bool aMarkUsed);
+
+  ImgDrawResult DrawInternal(DrawableSurface&& aFrameRef, gfxContext* aContext,
+                             const OrientedIntSize& aSize,
+                             const ImageRegion& aRegion,
+                             gfx::SamplingFilter aSamplingFilter,
+                             uint32_t aFlags, float aOpacity);
+
+
+  void Decode(const OrientedIntSize& aSize, uint32_t aFlags,
+              PlaybackType aPlaybackType, bool& aOutRanSync, bool& aOutFailed);
+
+  NS_IMETHOD DecodeMetadata(uint32_t aFlags);
+
+  bool SetMetadata(const ImageMetadata& aMetadata, bool aFromMetadataDecode);
+
+  void RecoverFromInvalidFrames(const OrientedIntSize& aSize, uint32_t aFlags);
+
+  void OnSurfaceDiscardedInternal(bool aAnimatedFramesDiscarded);
+
+ private:  
+  OrientedIntSize mSize;
+  nsTArray<OrientedIntSize> mNativeSizes;
+
+  Orientation mOrientation;
+
+  Resolution mResolution;
+
+  Maybe<Progress> mLoadProgress;
+
+  gfx::IntPoint mHotspot;
+
+  UniquePtr<FrameAnimator> mFrameAnimator;
+
+  Maybe<AnimationState> mAnimationState;
+
+  uint32_t mLockCount;
+
+  DecoderType mDecoderType;
+
+  int32_t mDecodeCount;
+
+  Atomic<bool> mIsBeingDestroyed{false};
+
+#ifdef DEBUG
+  uint32_t mFramesNotified;
+#endif
+
+  NotNull<RefPtr<SourceBuffer>> mSourceBuffer;
+
+  MOZ_ATOMIC_BITFIELDS(
+      mAtomicBitfields, 16,
+      ((bool, HasSize, 1),         
+       (bool, Transient, 1),       
+       (bool, SyncLoad, 1),        
+       (bool, Discardable, 1),     
+       (bool, SomeSourceData, 1),  
+       (bool, AllSourceData, 1),   
+       (bool, HasBeenDecoded, 1),  
+
+       (bool, PendingAnimation, 1),
+
+       (bool, AnimationFinished, 1),
+
+       (bool, WantFullDecode, 1)))
+
+
+
+  bool CanDownscaleDuringDecode(const OrientedIntSize& aSize, uint32_t aFlags);
+
+  void DoError();
+
+  class HandleErrorWorker : public Runnable {
+   public:
+    static void DispatchIfNeeded(RasterImage* aImage);
+
+    NS_IMETHOD Run() override;
+
+   private:
+    explicit HandleErrorWorker(RasterImage* aImage);
+
+    RefPtr<RasterImage> mImage;
+  };
+
+  bool CanDiscard();
+
+  bool IsOpaque();
+
+  LookupResult RequestDecodeForSizeInternal(const OrientedIntSize& aSize,
+                                            uint32_t aFlags,
+                                            uint32_t aWhichFrame);
+
+ protected:
+  explicit RasterImage(nsIURI* aURI = nullptr);
+
+  bool ShouldAnimate() override;
+
+  friend class ImageFactory;
+};
+
+inline NS_IMETHODIMP RasterImage::GetAnimationMode(uint16_t* aAnimationMode) {
+  return GetAnimationModeInternal(aAnimationMode);
+}
+
+}  
+}  
+
+inline nsISupports* ToSupports(mozilla::image::RasterImage* p) {
+  return NS_ISUPPORTS_CAST(mozilla::image::ImageResource*, p);
+}
+
+#endif /* mozilla_image_RasterImage_h */

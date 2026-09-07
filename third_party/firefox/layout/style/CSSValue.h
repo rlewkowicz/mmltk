@@ -1,0 +1,40 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_dom_CSSValue_h_
+#define mozilla_dom_CSSValue_h_
+
+#include "mozilla/RefCounted.h"
+#include "nsStringFwd.h"
+
+class nsROCSSPrimitiveValue;
+namespace mozilla {
+class ErrorResult;
+}  
+
+namespace mozilla::dom {
+
+class CSSValue : public RefCounted<CSSValue> {
+ public:
+  MOZ_DECLARE_REFCOUNTED_TYPENAME(CSSValue);
+  enum : uint16_t {
+    CSS_INHERIT,
+    CSS_PRIMITIVE_VALUE,
+    CSS_VALUE_LIST,
+    CSS_CUSTOM,
+  };
+
+  virtual void GetCssText(nsAString&) = 0;
+  virtual uint16_t CssValueType() const = 0;
+
+  virtual ~CSSValue() = default;
+
+
+  inline nsROCSSPrimitiveValue* AsPrimitiveValue();
+};
+
+}  
+
+#endif

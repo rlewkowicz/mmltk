@@ -1,0 +1,69 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_audio_channel_agent_h_
+#define mozilla_dom_audio_channel_agent_h_
+
+#include "nsCOMPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsIAudioChannelAgent.h"
+#include "nsIWeakReferenceUtils.h"
+
+class nsPIDOMWindowInner;
+class nsPIDOMWindowOuter;
+
+namespace mozilla::dom {
+
+class AudioPlaybackConfig;
+
+class AudioChannelAgent : public nsIAudioChannelAgent {
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_NSIAUDIOCHANNELAGENT
+
+  NS_DECL_CYCLE_COLLECTION_CLASS(AudioChannelAgent)
+
+  AudioChannelAgent();
+
+  void PullInitialUpdate();
+
+  uint64_t WindowID() const;
+
+  bool IsWindowAudioCapturingEnabled() const;
+  bool IsPlayingStarted() const;
+
+ private:
+  virtual ~AudioChannelAgent();
+
+  friend class AudioChannelService;
+  void WindowVolumeChanged(float aVolume, bool aMuted);
+  void WindowSuspendChanged(nsSuspendedTypes aSuspend);
+  void WindowAudioCaptureChanged(uint64_t aInnerWindowID, bool aCapture);
+
+  nsPIDOMWindowOuter* Window() const { return mWindow; }
+  uint64_t InnerWindowID() const;
+  AudioPlaybackConfig GetMediaConfig() const;
+
+  already_AddRefed<nsIAudioChannelAgentCallback> GetCallback();
+
+  nsresult InitInternal(nsPIDOMWindowInner* aWindow,
+                        nsIAudioChannelAgentCallback* aCallback,
+                        bool aUseWeakRef);
+
+  void Shutdown();
+
+  nsresult FindCorrectWindow(nsPIDOMWindowInner* aWindow);
+
+  nsCOMPtr<nsPIDOMWindowOuter> mWindow;
+  nsCOMPtr<nsIAudioChannelAgentCallback> mCallback;
+
+  nsWeakPtr mWeakCallback;
+
+  uint64_t mInnerWindowID;
+  bool mIsRegToService;
+};
+
+}  
+
+#endif

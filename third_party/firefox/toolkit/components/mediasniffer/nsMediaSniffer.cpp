@@ -1,0 +1,257 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ADTSDemuxer.h"
+#include "mozilla/Logging.h"
+#include "mozilla/ModuleUtils.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/StaticPrefs_media.h"
+#include "mp3sniff.h"
+#include "nestegg/nestegg.h"
+#include "nsHttpChannel.h"
+#include "nsIClassInfoImpl.h"
+#include "nsIChannel.h"
+#include "nsMediaSniffer.h"
+#include "nsMimeTypes.h"
+#include "nsQueryObject.h"
+#include "nsString.h"
+
+#include <algorithm>
+
+mozilla::LazyLogModule gMediaSnifferLog("MediaSniffer");
+
+#define LOG(msg, ...) \
+  MOZ_LOG(gMediaSnifferLog, mozilla::LogLevel::Debug, (msg, ##__VA_ARGS__))
+
+static const unsigned MP4_MIN_BYTES_COUNT = 12;
+static const uint32_t MAX_BYTES_SNIFFED = 512;
+static const uint32_t MAX_BYTES_SNIFFED_MP3 = 320 * 144 / 32 + 1 + 4;
+static const uint32_t MAX_BYTES_SNIFFED_ADTS = 8096;
+static const uint32_t MAX_BYTES_SNIFFED_MPEGTS = 188 * 5;
+
+NS_IMPL_ISUPPORTS(nsMediaSniffer, nsIContentSniffer)
+
+nsMediaSnifferEntry nsMediaSniffer::sSnifferEntries[] = {
+    PATTERN_ENTRY("\xFF\xFF\xFF\xFF\xFF", "OggS", APPLICATION_OGG),
+    PATTERN_ENTRY("\xFF\xFF\xFF\xFF"
+                  "\x00\x00\x00\x00"
+                  "\xFF\xFF\xFF\xFF"
+                  "\x00\x00\x00\x00"
+                  "\x00\x00\x00\x00"
+                  "\xFF\xFF",
+                  "RIFF"
+                  "\x00\x00\x00\x00"
+                  "WAVE"
+                  "\x00\x00\x00\x00"
+                  "\x00\x00\x00\x00"
+                  "\x55\x00",
+                  AUDIO_MP3),
+    PATTERN_ENTRY("\xFF\xFF\xFF\xFF\x00\x00\x00\x00\xFF\xFF\xFF\xFF",
+                  "RIFF\x00\x00\x00\x00WAVE", AUDIO_WAV),
+    PATTERN_ENTRY("\xFF\xFF\xFF", "ID3", AUDIO_MP3),
+    PATTERN_ENTRY("\xFF\xFF\xFF\xFF", "fLaC", AUDIO_FLAC),
+    PATTERN_ENTRY("\xFF\xFF\xFF\xFF\xFF\xFF\xFF", "#EXTM3U",
+                  APPLICATION_MPEGURL)};
+
+struct nsMediaSnifferFtypEntry : nsMediaSnifferEntry {
+  nsMediaSnifferFtypEntry(nsMediaSnifferEntry aBase, bool aIsIsoBrand = false)
+      : nsMediaSnifferEntry(aBase), mIsIsoBrand(aIsIsoBrand) {}
+  bool mIsIsoBrand;
+};
+
+MOZ_RUNINIT nsMediaSnifferFtypEntry sFtypEntries[] = {
+    {PATTERN_ENTRY("\xFF\xFF\xFF", "mp4", VIDEO_MP4)},  
+    {PATTERN_ENTRY("\xFF\xFF\xFF", "avc", VIDEO_MP4)},  
+    {PATTERN_ENTRY("\xFF\xFF\xFF\xFF", "3gp4", VIDEO_MP4)},
+    {PATTERN_ENTRY("\xFF\xFF\xFF", "3gp", VIDEO_3GPP)},  
+    {PATTERN_ENTRY("\xFF\xFF\xFF", "M4V", VIDEO_MP4)},
+    {PATTERN_ENTRY("\xFF\xFF\xFF", "M4A", AUDIO_MP4)},
+    {PATTERN_ENTRY("\xFF\xFF\xFF", "M4P", AUDIO_MP4)},
+    {PATTERN_ENTRY("\xFF\xFF", "qt", VIDEO_QUICKTIME)},
+    {PATTERN_ENTRY("\xFF\xFF\xFF", "crx", APPLICATION_OCTET_STREAM)},
+    {PATTERN_ENTRY("\xFF\xFF\xFF", "iso", VIDEO_MP4), true},
+    {PATTERN_ENTRY("\xFF\xFF\xFF\xFF", "mmp4", VIDEO_MP4)},
+    {PATTERN_ENTRY("\xFF\xFF\xFF\xFF", "avif", IMAGE_AVIF)},
+};
+
+static bool MatchesBrands(const uint8_t aData[4], nsACString& aSniffedType) {
+  for (const auto& currentEntry : sFtypEntries) {
+    bool matched = true;
+    MOZ_ASSERT(currentEntry.mLength <= 4,
+               "Pattern is too large to match brand strings.");
+    for (uint32_t j = 0; j < currentEntry.mLength; ++j) {
+      if ((currentEntry.mMask[j] & aData[j]) != currentEntry.mPattern[j]) {
+        matched = false;
+        break;
+      }
+    }
+    if (matched) {
+      if (!mozilla::StaticPrefs::media_mp4_sniff_iso_brand() &&
+          currentEntry.mIsIsoBrand) {
+        continue;
+      }
+
+      aSniffedType.AssignASCII(currentEntry.mContentType);
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool MatchesMP4(const uint8_t* aData, const uint32_t aLength,
+                nsACString& aSniffedType) {
+  if (aLength <= MP4_MIN_BYTES_COUNT) {
+    return false;
+  }
+  uint32_t boxSize =
+      (uint32_t)(aData[3] | aData[2] << 8 | aData[1] << 16 | aData[0] << 24);
+
+  if (boxSize % 4 || aLength < boxSize) {
+    return false;
+  }
+  if (aData[4] != 0x66 || aData[5] != 0x74 || aData[6] != 0x79 ||
+      aData[7] != 0x70) {
+    return false;
+  }
+  if (MatchesBrands(&aData[8], aSniffedType)) {
+    return true;
+  }
+  uint32_t bytesRead = 16;
+  while (bytesRead < boxSize) {
+    if (MatchesBrands(&aData[bytesRead], aSniffedType)) {
+      return true;
+    }
+    bytesRead += 4;
+  }
+
+  return false;
+}
+
+static bool MatchesWebM(const uint8_t* aData, const uint32_t aLength) {
+  return nestegg_sniff_webm((uint8_t*)aData, aLength);
+}
+
+static bool MatchesMatroska(const uint8_t* aData, const uint32_t aLength) {
+  return nestegg_sniff_mkv((uint8_t*)aData, aLength);
+}
+
+static bool MatchesMP3(const uint8_t* aData, const uint32_t aLength) {
+  return mp3_sniff(aData, (long)aLength);
+}
+
+static bool MatchesADTS(const uint8_t* aData, const uint32_t aLength) {
+  return mozilla::ADTSDemuxer::ADTSSniffer(aData, aLength);
+}
+
+static bool MatchesMPEGTS(const uint8_t* aData, const uint32_t aLength) {
+  static const uint8_t kSyncByte = 0x47;
+  static const uint32_t kPacketSize = 188;
+  static const uint32_t kPacketsToMatch = 5;
+  static const uint32_t kMinBytesToMatch =
+      kPacketSize * (kPacketsToMatch - 1) + 1;
+
+  if (aLength < kMinBytesToMatch) {
+    return false;
+  }
+
+  for (uint32_t i = 0; i < kPacketsToMatch; ++i) {
+    if (aData[i * kPacketSize] != kSyncByte) {
+      return false;
+    }
+  }
+  return true;
+}
+
+NS_IMETHODIMP
+nsMediaSniffer::GetMIMETypeFromContent(nsIRequest* aRequest,
+                                       const uint8_t* aData,
+                                       const uint32_t aLength,
+                                       nsACString& aSniffedType) {
+  const uint32_t clampedLength = std::min(aLength, MAX_BYTES_SNIFFED);
+
+  nsCOMPtr<nsIChannel> channel = do_QueryInterface(aRequest);
+
+  auto maybeUpdate = mozilla::MakeScopeExit([channel]() {
+    if (channel && XRE_IsParentProcess()) {
+      if (RefPtr<mozilla::net::nsHttpChannel> httpChannel =
+              do_QueryObject(channel)) {
+        httpChannel->DisableIsOpaqueResponseAllowedAfterSniffCheck(
+            mozilla::net::nsHttpChannel::SnifferType::Media);
+      }
+    };
+  });
+
+  if (channel && XRE_IsParentProcess()) {
+    nsCOMPtr<nsILoadInfo> loadInfo = channel->LoadInfo();
+    nsAutoCString mimeType;
+    channel->GetContentType(mimeType);
+    if (mimeType.EqualsLiteral(APPLICATION_OCTET_STREAM) &&
+        loadInfo->GetExternalContentPolicyType() ==
+            ExtContentPolicy::TYPE_DOCUMENT) {
+      aSniffedType.AssignLiteral(APPLICATION_OCTET_STREAM);
+      maybeUpdate.release();
+      return NS_ERROR_NOT_AVAILABLE;
+    }
+  }
+
+  for (const auto& currentEntry : sSnifferEntries) {
+    if (clampedLength < currentEntry.mLength || currentEntry.mLength == 0) {
+      continue;
+    }
+    bool matched = true;
+    for (uint32_t j = 0; j < currentEntry.mLength; ++j) {
+      if ((currentEntry.mMask[j] & aData[j]) != currentEntry.mPattern[j]) {
+        matched = false;
+        break;
+      }
+    }
+    if (matched) {
+      aSniffedType.AssignASCII(currentEntry.mContentType);
+      return NS_OK;
+    }
+  }
+
+  if (MatchesMP4(aData, clampedLength, aSniffedType)) {
+    LOG("Sniffed MP4 content");
+    return NS_OK;
+  }
+
+  if (MatchesWebM(aData, clampedLength)) {
+    LOG("Sniffed Webm content");
+    aSniffedType.AssignLiteral(VIDEO_WEBM);
+    return NS_OK;
+  }
+
+  if (MatchesMatroska(aData, clampedLength)) {
+    LOG("Sniffed Matroska content");
+    aSniffedType.AssignLiteral(VIDEO_MATROSKA);
+    return NS_OK;
+  }
+
+  if (MatchesMP3(aData, std::min(aLength, MAX_BYTES_SNIFFED_MP3))) {
+    aSniffedType.AssignLiteral(AUDIO_MP3);
+    LOG("Sniffed MP3 content");
+    return NS_OK;
+  }
+
+  if (MatchesADTS(aData, std::min(aLength, MAX_BYTES_SNIFFED_ADTS))) {
+    aSniffedType.AssignLiteral(AUDIO_AAC);
+    LOG("Sniffed ATDS content");
+    return NS_OK;
+  }
+
+  if (MatchesMPEGTS(aData, std::min(aLength, MAX_BYTES_SNIFFED_MPEGTS))) {
+    aSniffedType.AssignLiteral(VIDEO_MPEG_TS);
+    LOG("Sniffed MPEG-TS content");
+    return NS_OK;
+  }
+
+  maybeUpdate.release();
+
+  aSniffedType.AssignLiteral(APPLICATION_OCTET_STREAM);
+  return NS_ERROR_NOT_AVAILABLE;
+}
+
+#undef LOG

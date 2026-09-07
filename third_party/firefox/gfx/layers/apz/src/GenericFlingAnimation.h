@@ -1,0 +1,137 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_GenericFlingAnimation_h_
+#define mozilla_layers_GenericFlingAnimation_h_
+
+#include "APZUtils.h"
+#include "AsyncPanZoomAnimation.h"
+#include "AsyncPanZoomController.h"
+#include "FrameMetrics.h"
+#include "Units.h"
+#include "OverscrollHandoffState.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/Monitor.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/StaticPrefs_apz.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/ToString.h"
+#include "nsThreadUtils.h"
+
+static mozilla::LazyLogModule sApzFlgLog("apz.fling");
+#define FLING_LOG(...) MOZ_LOG(sApzFlgLog, LogLevel::Debug, (__VA_ARGS__))
+
+namespace mozilla {
+namespace layers {
+
+template <typename FlingPhysics>
+class GenericFlingAnimation : public AsyncPanZoomAnimation,
+                              public FlingPhysics {
+ public:
+  GenericFlingAnimation(AsyncPanZoomController& aApzc,
+                        const FlingHandoffState& aHandoffState, float aPLPPI)
+      : mApzc(aApzc),
+        mOverscrollHandoffChain(aHandoffState.mChain),
+        mScrolledApzc(aHandoffState.mScrolledApzc) {
+    MOZ_ASSERT(mOverscrollHandoffChain);
+
+    if (!mOverscrollHandoffChain->CanScrollInDirection(
+            &mApzc, ScrollDirection::eHorizontal)) {
+      RecursiveMutexAutoLock lock(mApzc.mRecursiveMutex);
+      mApzc.mX.SetVelocity(0);
+    }
+    if (!mOverscrollHandoffChain->CanScrollInDirection(
+            &mApzc, ScrollDirection::eVertical)) {
+      RecursiveMutexAutoLock lock(mApzc.mRecursiveMutex);
+      mApzc.mY.SetVelocity(0);
+    }
+
+    if (aHandoffState.mIsHandoff) {
+      mApzc.mFlingAccelerator.Reset();
+    }
+
+    ParentLayerPoint velocity =
+        mApzc.mFlingAccelerator.GetFlingStartingVelocity(
+            aApzc.GetFrameTime(), mApzc.GetVelocityVector(), aHandoffState);
+
+    mApzc.SetVelocityVector(velocity);
+
+    FlingPhysics::Init(mApzc.GetVelocityVector(), aPLPPI);
+  }
+
+  virtual bool DoSample(FrameMetrics& aFrameMetrics,
+                        const TimeDuration& aDelta) override {
+    CSSToParentLayerScale zoom(aFrameMetrics.GetZoom());
+    if (zoom == CSSToParentLayerScale(0)) {
+      return false;
+    }
+
+    ParentLayerPoint velocity;
+    ParentLayerPoint offset;
+    FlingPhysics::Sample(aDelta, &velocity, &offset);
+
+    mApzc.SetVelocityVector(velocity);
+
+    if (IsZero(velocity / zoom)) {
+      FLING_LOG("%p ending fling animation. overscrolled=%d\n", &mApzc,
+                mApzc.IsOverscrolled());
+      mDeferredTasks.AppendElement(NewRunnableMethod<AsyncPanZoomController*>(
+          "layers::OverscrollHandoffChain::SnapBackOverscrolledApzc",
+          mOverscrollHandoffChain.get(),
+          &OverscrollHandoffChain::SnapBackOverscrolledApzc, &mApzc));
+      return false;
+    }
+
+    ParentLayerPoint overscroll;
+    ParentLayerPoint adjustedOffset;
+    mApzc.mX.AdjustDisplacement(offset.x, adjustedOffset.x, overscroll.x);
+    mApzc.mY.AdjustDisplacement(offset.y, adjustedOffset.y, overscroll.y);
+    if (aFrameMetrics.GetZoom() != CSSToParentLayerScale(0)) {
+      mApzc.ScrollBy(adjustedOffset / aFrameMetrics.GetZoom());
+    }
+
+    if (!IsZero(overscroll / zoom)) {
+
+      if (mApzc.IsZero(overscroll.x)) {
+        velocity.x = 0;
+      } else if (mApzc.IsZero(overscroll.y)) {
+        velocity.y = 0;
+      }
+
+      FLING_LOG("%p fling went into overscroll, handing off with velocity %s\n",
+                &mApzc, ToString(velocity).c_str());
+      mDeferredTasks.AppendElement(
+          NewRunnableMethod<ParentLayerPoint, SideBits,
+                            RefPtr<const OverscrollHandoffChain>,
+                            RefPtr<const AsyncPanZoomController>>(
+              "layers::AsyncPanZoomController::HandleFlingOverscroll", &mApzc,
+              &AsyncPanZoomController::HandleFlingOverscroll, velocity,
+              apz::GetOverscrollSideBits(overscroll), mOverscrollHandoffChain,
+              mScrolledApzc));
+
+      return !IsZero(mApzc.GetVelocityVector() / zoom);
+    }
+
+    return true;
+  }
+
+  void Cancel(CancelAnimationFlags aFlags) override {
+    mApzc.mFlingAccelerator.ObserveFlingCanceled(mApzc.GetVelocityVector());
+  }
+
+  virtual bool HandleScrollOffsetUpdate(
+      const Maybe<CSSPoint>& aRelativeDelta) override {
+    return true;
+  }
+
+ private:
+  AsyncPanZoomController& mApzc;
+  RefPtr<const OverscrollHandoffChain> mOverscrollHandoffChain;
+  RefPtr<const AsyncPanZoomController> mScrolledApzc;
+};
+
+}  
+}  
+
+#endif  // mozilla_layers_GenericFlingAnimation_h_

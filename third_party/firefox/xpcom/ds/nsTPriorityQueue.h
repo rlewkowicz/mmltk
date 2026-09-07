@@ -1,0 +1,95 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef NS_TPRIORITY_QUEUE_H_
+#define NS_TPRIORITY_QUEUE_H_
+
+#include "mozilla/Assertions.h"
+#include "nsTArray.h"
+
+template <class T, class Compare = nsDefaultComparator<T, T>>
+class nsTPriorityQueue {
+ public:
+  typedef typename nsTArray<T>::size_type size_type;
+
+  nsTPriorityQueue() : mCompare(Compare()) {}
+
+  explicit nsTPriorityQueue(const Compare& aComp) : mCompare(aComp) {}
+
+  nsTPriorityQueue(nsTPriorityQueue&&) = default;
+  nsTPriorityQueue& operator=(nsTPriorityQueue&&) = default;
+
+  bool IsEmpty() const { return mElements.IsEmpty(); }
+
+  size_type Length() const { return mElements.Length(); }
+
+  const T& Top() const {
+    MOZ_ASSERT(!mElements.IsEmpty(), "Empty queue");
+    return mElements[0];
+  }
+
+  void Push(T&& aElement) {
+    mElements.AppendElement(std::move(aElement));
+
+    size_type i = mElements.Length() - 1;
+    while (i) {
+      size_type parent = (size_type)((i - 1) / 2);
+      if (mCompare.LessThan(mElements[parent], mElements[i])) {
+        break;
+      }
+      std::swap(mElements[i], mElements[parent]);
+      i = parent;
+    }
+  }
+
+  T Pop() {
+    MOZ_ASSERT(!mElements.IsEmpty(), "Empty queue");
+    T pop = std::move(mElements[0]);
+
+    const size_type newLength = mElements.Length() - 1;
+    if (newLength == 0) {
+      mElements.Clear();
+      return pop;
+    }
+
+    mElements[0] = mElements.PopLastElement();
+
+    size_type i = 0;
+    while (2 * i + 1 < newLength) {
+      size_type swap = i;
+      size_type l_child = 2 * i + 1;
+      if (mCompare.LessThan(mElements[l_child], mElements[i])) {
+        swap = l_child;
+      }
+      size_type r_child = l_child + 1;
+      if (r_child < newLength &&
+          mCompare.LessThan(mElements[r_child], mElements[swap])) {
+        swap = r_child;
+      }
+      if (swap == i) {
+        break;
+      }
+      std::swap(mElements[i], mElements[swap]);
+      i = swap;
+    }
+
+    return pop;
+  }
+
+  void Clear() { mElements.Clear(); }
+
+  const T* Elements() const { return mElements.Elements(); }
+
+  nsTPriorityQueue Clone() const {
+    auto res = nsTPriorityQueue{mCompare};
+    res.mElements = mElements.Clone();
+    return res;
+  }
+
+ protected:
+  nsTArray<T> mElements;
+  Compare mCompare;  
+};
+
+#endif  // NS_TPRIORITY_QUEUE_H_

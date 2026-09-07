@@ -1,0 +1,293 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+#ifndef __NUMBER_MODIFIERS_H__
+#define __NUMBER_MODIFIERS_H__
+
+#include <algorithm>
+#include <cstdint>
+#include "unicode/uniset.h"
+#include "unicode/simpleformatter.h"
+#include "standardplural.h"
+#include "formatted_string_builder.h"
+#include "number_types.h"
+
+U_NAMESPACE_BEGIN
+namespace number::impl {
+
+class U_I18N_API ConstantAffixModifier : public Modifier, public UObject {
+  public:
+    ConstantAffixModifier(const UnicodeString &prefix, const UnicodeString &suffix, Field field,
+                          bool strong)
+            : fPrefix(prefix), fSuffix(suffix), fField(field), fStrong(strong) {}
+
+    int32_t apply(FormattedStringBuilder &output, int32_t leftIndex, int32_t rightIndex,
+                  UErrorCode &status) const override;
+
+    int32_t getPrefixLength() const override;
+
+    int32_t getCodePointCount() const override;
+
+    bool isStrong() const override;
+
+    bool containsField(Field field) const override;
+
+    void getParameters(Parameters& output) const override;
+
+    bool strictEquals(const Modifier& other) const override;
+
+  private:
+    UnicodeString fPrefix;
+    UnicodeString fSuffix;
+    Field fField;
+    bool fStrong;
+};
+
+class U_I18N_API SimpleModifier : public Modifier, public UMemory {
+  public:
+    SimpleModifier(const SimpleFormatter &simpleFormatter, Field field, bool strong);
+
+    SimpleModifier(const SimpleFormatter &simpleFormatter, Field field, bool strong,
+                   const Modifier::Parameters parameters);
+
+    SimpleModifier();
+
+    int32_t apply(FormattedStringBuilder &output, int32_t leftIndex, int32_t rightIndex,
+                  UErrorCode &status) const override;
+
+    int32_t getPrefixLength() const override;
+
+    int32_t getCodePointCount() const override;
+
+    bool isStrong() const override;
+
+    bool containsField(Field field) const override;
+
+    void getParameters(Parameters& output) const override;
+
+    bool strictEquals(const Modifier& other) const override;
+
+    int32_t
+    formatAsPrefixSuffix(FormattedStringBuilder& result, int32_t startIndex, int32_t endIndex,
+                         UErrorCode& status) const;
+
+    static int32_t
+    formatTwoArgPattern(const SimpleFormatter& compiled, FormattedStringBuilder& result,
+                        int32_t index, int32_t* outPrefixLength, int32_t* outSuffixLength,
+                        Field field, UErrorCode& status);
+
+  private:
+    UnicodeString fCompiledPattern;
+    Field fField;
+    bool fStrong = false;
+    int32_t fPrefixLength = 0;
+    int32_t fSuffixOffset = -1;
+    int32_t fSuffixLength = 0;
+    Modifier::Parameters fParameters;
+};
+
+class U_I18N_API ConstantMultiFieldModifier : public Modifier, public UMemory {
+  public:
+    ConstantMultiFieldModifier(
+            const FormattedStringBuilder &prefix,
+            const FormattedStringBuilder &suffix,
+            bool overwrite,
+            bool strong,
+            const Modifier::Parameters parameters)
+      : fPrefix(prefix),
+        fSuffix(suffix),
+        fOverwrite(overwrite),
+        fStrong(strong),
+        fParameters(parameters) {}
+
+    ConstantMultiFieldModifier(
+            const FormattedStringBuilder &prefix,
+            const FormattedStringBuilder &suffix,
+            bool overwrite,
+            bool strong)
+      : fPrefix(prefix),
+        fSuffix(suffix),
+        fOverwrite(overwrite),
+        fStrong(strong) {}
+
+    int32_t apply(FormattedStringBuilder &output, int32_t leftIndex, int32_t rightIndex,
+                  UErrorCode &status) const override;
+
+    int32_t getPrefixLength() const override;
+
+    int32_t getCodePointCount() const override;
+
+    bool isStrong() const override;
+
+    bool containsField(Field field) const override;
+
+    void getParameters(Parameters& output) const override;
+
+    bool strictEquals(const Modifier& other) const override;
+
+  protected:
+    FormattedStringBuilder fPrefix;
+    FormattedStringBuilder fSuffix;
+    bool fOverwrite;
+    bool fStrong;
+    Modifier::Parameters fParameters;
+};
+
+class U_I18N_API CurrencySpacingEnabledModifier : public ConstantMultiFieldModifier {
+  public:
+    CurrencySpacingEnabledModifier(
+            const FormattedStringBuilder &prefix,
+            const FormattedStringBuilder &suffix,
+            bool overwrite,
+            bool strong,
+            const DecimalFormatSymbols &symbols,
+            UErrorCode &status);
+
+    int32_t apply(FormattedStringBuilder &output, int32_t leftIndex, int32_t rightIndex,
+                  UErrorCode &status) const override;
+
+    static int32_t
+    applyCurrencySpacing(FormattedStringBuilder &output, int32_t prefixStart, int32_t prefixLen,
+                         int32_t suffixStart, int32_t suffixLen, const DecimalFormatSymbols &symbols,
+                         UErrorCode &status);
+
+  private:
+    UnicodeSet fAfterPrefixUnicodeSet;
+    UnicodeString fAfterPrefixInsert;
+    UnicodeSet fBeforeSuffixUnicodeSet;
+    UnicodeString fBeforeSuffixInsert;
+
+    enum EAffix {
+        PREFIX, SUFFIX
+    };
+
+    enum EPosition {
+        IN_CURRENCY, IN_NUMBER
+    };
+
+    static int32_t applyCurrencySpacingAffix(FormattedStringBuilder &output, int32_t index, EAffix affix,
+                                             const DecimalFormatSymbols &symbols, UErrorCode &status);
+
+    static UnicodeSet
+    getUnicodeSet(const DecimalFormatSymbols &symbols, EPosition position, EAffix affix,
+                  UErrorCode &status);
+
+    static UnicodeString
+    getInsertString(const DecimalFormatSymbols &symbols, EAffix affix, UErrorCode &status);
+};
+
+class U_I18N_API EmptyModifier : public Modifier, public UMemory {
+  public:
+    explicit EmptyModifier(bool isStrong) : fStrong(isStrong) {}
+
+    int32_t apply(FormattedStringBuilder &output, int32_t leftIndex, int32_t rightIndex,
+                  UErrorCode &status) const override {
+        (void)output;
+        (void)leftIndex;
+        (void)rightIndex;
+        (void)status;
+        return 0;
+    }
+
+    int32_t getPrefixLength() const override {
+        return 0;
+    }
+
+    int32_t getCodePointCount() const override {
+        return 0;
+    }
+
+    bool isStrong() const override {
+        return fStrong;
+    }
+
+    bool containsField(Field field) const override {
+        (void)field;
+        return false;
+    }
+
+    void getParameters(Parameters& output) const override {
+        output.obj = nullptr;
+    }
+
+    bool strictEquals(const Modifier& other) const override {
+        return other.getCodePointCount() == 0;
+    }
+
+  private:
+    bool fStrong;
+};
+
+class U_I18N_API AdoptingSignumModifierStore : public UMemory {
+  public:
+    virtual ~AdoptingSignumModifierStore();
+
+    AdoptingSignumModifierStore() = default;
+
+    AdoptingSignumModifierStore(const AdoptingSignumModifierStore &other) = delete;
+    AdoptingSignumModifierStore& operator=(const AdoptingSignumModifierStore& other) = delete;
+
+    AdoptingSignumModifierStore(AdoptingSignumModifierStore &&other) noexcept {
+        *this = std::move(other);
+    }
+    AdoptingSignumModifierStore& operator=(AdoptingSignumModifierStore&& other) noexcept;
+
+    void adoptModifier(Signum signum, const Modifier* mod) {
+        U_ASSERT(mods[signum] == nullptr);
+        mods[signum] = mod;
+    }
+
+    inline const Modifier*& operator[](Signum signum) {
+        return mods[signum];
+    }
+    inline Modifier const* operator[](Signum signum) const {
+        return mods[signum];
+    }
+
+  private:
+    const Modifier* mods[SIGNUM_COUNT] = {};
+};
+
+class U_I18N_API AdoptingModifierStore : public ModifierStore, public UMemory {
+  public:
+    static constexpr StandardPlural::Form DEFAULT_STANDARD_PLURAL = StandardPlural::OTHER;
+
+    AdoptingModifierStore() = default;
+
+    AdoptingModifierStore(const AdoptingModifierStore &other) = delete;
+
+    AdoptingModifierStore(AdoptingModifierStore &&other) = default;
+
+    void adoptSignumModifierStore(StandardPlural::Form plural, AdoptingSignumModifierStore other) {
+        mods[plural] = std::move(other);
+    }
+
+    void adoptSignumModifierStoreNoPlural(AdoptingSignumModifierStore other) {
+        mods[DEFAULT_STANDARD_PLURAL] = std::move(other);
+    }
+
+    const Modifier *getModifier(Signum signum, StandardPlural::Form plural) const override {
+        const Modifier* modifier = mods[plural][signum];
+        if (modifier == nullptr && plural != DEFAULT_STANDARD_PLURAL) {
+            modifier = mods[DEFAULT_STANDARD_PLURAL][signum];
+        }
+        return modifier;
+    }
+
+    const Modifier *getModifierWithoutPlural(Signum signum) const {
+        return mods[DEFAULT_STANDARD_PLURAL][signum];
+    }
+
+  private:
+    AdoptingSignumModifierStore mods[StandardPlural::COUNT] = {};
+};
+
+} 
+U_NAMESPACE_END
+
+
+#endif //__NUMBER_MODIFIERS_H__
+
+#endif /* #if !UCONFIG_NO_FORMATTING */

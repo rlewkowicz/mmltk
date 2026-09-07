@@ -1,0 +1,469 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "frontend/NameOpEmitter.h"
+
+#include "frontend/AbstractScopePtr.h"
+#include "frontend/BytecodeEmitter.h"
+#include "frontend/ParserAtom.h"  // ParserAtom
+#include "frontend/SharedContext.h"
+#include "frontend/TDZCheckCache.h"
+#include "frontend/ValueUsage.h"
+#include "js/Value.h"
+#include "vm/Opcodes.h"
+
+using namespace js;
+using namespace js::frontend;
+
+NameOpEmitter::NameOpEmitter(BytecodeEmitter* bce, TaggedParserAtomIndex name,
+                             Kind kind)
+    : bce_(bce), kind_(kind), name_(name), loc_(bce_->lookupName(name_)) {}
+
+NameOpEmitter::NameOpEmitter(BytecodeEmitter* bce, TaggedParserAtomIndex name,
+                             const NameLocation& loc, Kind kind)
+    : bce_(bce), kind_(kind), name_(name), loc_(loc) {}
+
+bool NameOpEmitter::emitGet() {
+  MOZ_ASSERT(state_ == State::Start);
+
+  bool needsImplicitThis = false;
+  if (isCall()) {
+    switch (loc_.kind()) {
+      case NameLocation::Kind::Dynamic:
+        if (bce_->needsImplicitThis()) {
+          needsImplicitThis = true;
+          break;
+        }
+        [[fallthrough]];
+      case NameLocation::Kind::Global:
+        MOZ_ASSERT(bce_->outermostScope().hasNonSyntacticScopeOnChain() ==
+                   bce_->sc->hasNonSyntacticScope());
+        needsImplicitThis = bce_->sc->hasNonSyntacticScope();
+        break;
+      case NameLocation::Kind::Intrinsic:
+      case NameLocation::Kind::NamedLambdaCallee:
+      case NameLocation::Kind::Import:
+      case NameLocation::Kind::ArgumentSlot:
+      case NameLocation::Kind::FrameSlot:
+      case NameLocation::Kind::EnvironmentCoordinate:
+      case NameLocation::Kind::DebugEnvironmentCoordinate:
+      case NameLocation::Kind::DynamicAnnexBVar:
+        break;
+    }
+  }
+
+  switch (loc_.kind()) {
+    case NameLocation::Kind::Global:
+      MOZ_ASSERT(bce_->outermostScope().hasNonSyntacticScopeOnChain() ==
+                 bce_->sc->hasNonSyntacticScope());
+      if (!bce_->sc->hasNonSyntacticScope()) {
+        MOZ_ASSERT(!needsImplicitThis);
+
+        if (name_ == TaggedParserAtomIndex::WellKnown::undefined()) {
+          if (!bce_->emit1(JSOp::Undefined)) {
+            return false;
+          }
+        } else if (name_ == TaggedParserAtomIndex::WellKnown::NaN()) {
+          if (!bce_->emitDouble(JS::GenericNaN())) {
+            return false;
+          }
+        } else if (name_ == TaggedParserAtomIndex::WellKnown::Infinity()) {
+          if (!bce_->emitDouble(JS::Infinity())) {
+            return false;
+          }
+        } else {
+          if (!bce_->emitAtomOp(JSOp::GetGName, name_)) {
+            return false;
+          }
+        }
+        break;
+      }
+      [[fallthrough]];
+    case NameLocation::Kind::Dynamic:
+      if (needsImplicitThis) {
+        if (!bce_->emitAtomOp(JSOp::BindName, name_)) {
+          return false;
+        }
+        if (!bce_->emit1(JSOp::Dup)) {
+          return false;
+        }
+        if (!bce_->emitAtomOp(JSOp::GetBoundName, name_)) {
+          return false;
+        }
+      } else {
+        if (!bce_->emitAtomOp(JSOp::GetName, name_)) {
+          return false;
+        }
+      }
+      break;
+    case NameLocation::Kind::Intrinsic:
+      if (name_ == TaggedParserAtomIndex::WellKnown::undefined()) {
+        if (!bce_->emit1(JSOp::Undefined)) {
+          return false;
+        }
+      } else {
+        if (!bce_->emitAtomOp(JSOp::GetIntrinsic, name_)) {
+          return false;
+        }
+      }
+      break;
+    case NameLocation::Kind::NamedLambdaCallee:
+      if (!bce_->emit1(JSOp::Callee)) {
+        return false;
+      }
+      break;
+    case NameLocation::Kind::Import:
+      if (!bce_->emitAtomOp(JSOp::GetImport, name_)) {
+        return false;
+      }
+      break;
+    case NameLocation::Kind::ArgumentSlot:
+      if (!bce_->emitArgOp(JSOp::GetArg, loc_.argumentSlot())) {
+        return false;
+      }
+      break;
+    case NameLocation::Kind::FrameSlot:
+      if (!bce_->emitLocalOp(JSOp::GetLocal, loc_.frameSlot())) {
+        return false;
+      }
+      if (loc_.isLexical()) {
+        if (!bce_->emitTDZCheckIfNeeded(name_, loc_, ValueIsOnStack::Yes)) {
+          return false;
+        }
+      }
+      break;
+    case NameLocation::Kind::EnvironmentCoordinate:
+    case NameLocation::Kind::DebugEnvironmentCoordinate:
+      if (!bce_->emitEnvCoordOp(
+              loc_.kind() == NameLocation::Kind::EnvironmentCoordinate
+                  ? JSOp::GetAliasedVar
+                  : JSOp::GetAliasedDebugVar,
+              loc_.environmentCoordinate())) {
+        return false;
+      }
+      if (loc_.isLexical()) {
+        if (!bce_->emitTDZCheckIfNeeded(name_, loc_, ValueIsOnStack::Yes)) {
+          return false;
+        }
+      }
+      break;
+    case NameLocation::Kind::DynamicAnnexBVar:
+      MOZ_CRASH(
+          "Synthesized vars for Annex B.3.3 should only be used in "
+          "initialization");
+  }
+
+  if (isCall()) {
+    switch (loc_.kind()) {
+      case NameLocation::Kind::Dynamic:
+      case NameLocation::Kind::Global:
+        MOZ_ASSERT(bce_->emitterMode != BytecodeEmitter::SelfHosting);
+        if (needsImplicitThis) {
+          if (!bce_->emit1(JSOp::Swap)) {
+            return false;
+          }
+          if (!bce_->emit1(JSOp::ImplicitThis)) {
+            return false;
+          }
+        } else {
+          if (!bce_->emit1(JSOp::Undefined)) {
+            return false;
+          }
+        }
+        break;
+      case NameLocation::Kind::Intrinsic:
+      case NameLocation::Kind::NamedLambdaCallee:
+      case NameLocation::Kind::Import:
+      case NameLocation::Kind::ArgumentSlot:
+      case NameLocation::Kind::FrameSlot:
+      case NameLocation::Kind::EnvironmentCoordinate:
+        if (bce_->emitterMode == BytecodeEmitter::SelfHosting) {
+          if (!bce_->emitDebugCheckSelfHosted()) {
+            return false;
+          }
+        }
+        if (!bce_->emit1(JSOp::Undefined)) {
+          return false;
+        }
+        break;
+      case NameLocation::Kind::DebugEnvironmentCoordinate:
+        MOZ_CRASH(
+            "DebugEnvironmentCoordinate should only be used to get the private "
+            "brand, and so should never call.");
+        break;
+      case NameLocation::Kind::DynamicAnnexBVar:
+        MOZ_CRASH(
+            "Synthesized vars for Annex B.3.3 should only be used in "
+            "initialization");
+    }
+  }
+
+#if defined(DEBUG)
+  state_ = State::Get;
+#endif
+  return true;
+}
+
+bool NameOpEmitter::prepareForRhs() {
+  MOZ_ASSERT(state_ == State::Start);
+
+  switch (loc_.kind()) {
+    case NameLocation::Kind::Dynamic:
+    case NameLocation::Kind::Import:
+      if (!bce_->makeAtomIndex(name_, ParserAtom::Atomize::Yes, &atomIndex_)) {
+        return false;
+      }
+      if (!bce_->emitAtomOp(JSOp::BindUnqualifiedName, atomIndex_)) {
+        return false;
+      }
+      emittedBindOp_ = true;
+      break;
+    case NameLocation::Kind::DynamicAnnexBVar:
+      if (!bce_->emit1(JSOp::BindVar)) {
+        return false;
+      }
+      emittedBindOp_ = true;
+      break;
+    case NameLocation::Kind::Global:
+      if (!bce_->makeAtomIndex(name_, ParserAtom::Atomize::Yes, &atomIndex_)) {
+        return false;
+      }
+      MOZ_ASSERT(bce_->outermostScope().hasNonSyntacticScopeOnChain() ==
+                 bce_->sc->hasNonSyntacticScope());
+
+      if (loc_.isLexical() && isInitialize()) {
+        MOZ_ASSERT(bce_->innermostScope().is<GlobalScope>());
+      } else {
+        JSOp op;
+        if (bce_->sc->hasNonSyntacticScope()) {
+          op = JSOp::BindUnqualifiedName;
+        } else {
+          op = JSOp::BindUnqualifiedGName;
+        }
+        if (!bce_->emitAtomOp(op, atomIndex_)) {
+          return false;
+        }
+        emittedBindOp_ = true;
+      }
+      break;
+    case NameLocation::Kind::Intrinsic:
+    case NameLocation::Kind::NamedLambdaCallee:
+    case NameLocation::Kind::ArgumentSlot:
+    case NameLocation::Kind::FrameSlot:
+    case NameLocation::Kind::DebugEnvironmentCoordinate:
+    case NameLocation::Kind::EnvironmentCoordinate:
+      break;
+  }
+
+  if (isCompoundAssignment() || isIncDec()) {
+    if (loc_.kind() == NameLocation::Kind::Dynamic) {
+      if (!bce_->emit1(JSOp::Dup)) {
+        return false;
+      }
+      if (!bce_->emitAtomOp(JSOp::GetBoundName, atomIndex_)) {
+        return false;
+      }
+    } else {
+      if (!emitGet()) {
+        return false;
+      }
+    }
+  }
+
+#if defined(DEBUG)
+  state_ = State::Rhs;
+#endif
+  return true;
+}
+
+JSOp NameOpEmitter::strictifySetNameOp(JSOp op) const {
+  switch (op) {
+    case JSOp::SetName:
+      if (bce_->sc->strict()) {
+        op = JSOp::StrictSetName;
+      }
+      break;
+    case JSOp::SetGName:
+      if (bce_->sc->strict()) {
+        op = JSOp::StrictSetGName;
+      }
+      break;
+    default:
+      MOZ_CRASH("Invalid SetName op");
+  }
+  return op;
+}
+
+bool NameOpEmitter::emitAssignment() {
+  MOZ_ASSERT(state_ == State::Rhs);
+
+
+  switch (loc_.kind()) {
+    case NameLocation::Kind::Dynamic:
+    case NameLocation::Kind::Import:
+      MOZ_ASSERT(emittedBindOp_);
+      if (!bce_->emitAtomOp(strictifySetNameOp(JSOp::SetName), atomIndex_)) {
+        return false;
+      }
+      break;
+    case NameLocation::Kind::DynamicAnnexBVar:
+      MOZ_ASSERT(emittedBindOp_);
+      if (!bce_->emitAtomOp(strictifySetNameOp(JSOp::SetName), name_)) {
+        return false;
+      }
+      break;
+    case NameLocation::Kind::Global: {
+      JSOp op;
+      if (emittedBindOp_) {
+        MOZ_ASSERT(bce_->outermostScope().hasNonSyntacticScopeOnChain() ==
+                   bce_->sc->hasNonSyntacticScope());
+        if (bce_->sc->hasNonSyntacticScope()) {
+          op = strictifySetNameOp(JSOp::SetName);
+        } else {
+          op = strictifySetNameOp(JSOp::SetGName);
+        }
+      } else {
+        op = JSOp::InitGLexical;
+      }
+      if (!bce_->emitAtomOp(op, atomIndex_)) {
+        return false;
+      }
+      break;
+    }
+    case NameLocation::Kind::Intrinsic:
+      if (!bce_->emitAtomOp(JSOp::SetIntrinsic, name_)) {
+        return false;
+      }
+      break;
+    case NameLocation::Kind::NamedLambdaCallee:
+      if (bce_->sc->strict()) {
+        if (!bce_->emitAtomOp(JSOp::ThrowSetConst, name_)) {
+          return false;
+        }
+      }
+      break;
+    case NameLocation::Kind::ArgumentSlot:
+      if (!bce_->emitArgOp(JSOp::SetArg, loc_.argumentSlot())) {
+        return false;
+      }
+      break;
+    case NameLocation::Kind::FrameSlot: {
+      JSOp op = JSOp::SetLocal;
+      if (loc_.isLexical() || loc_.isPrivateMethod() || loc_.isSynthetic()) {
+        if (isInitialize()) {
+          op = JSOp::InitLexical;
+        } else {
+          if (loc_.isConst()) {
+            op = JSOp::ThrowSetConst;
+          }
+          if (!bce_->emitTDZCheckIfNeeded(name_, loc_, ValueIsOnStack::No)) {
+            return false;
+          }
+        }
+      }
+      if (op == JSOp::ThrowSetConst) {
+        if (!bce_->emitAtomOp(op, name_)) {
+          return false;
+        }
+      } else {
+        if (!bce_->emitLocalOp(op, loc_.frameSlot())) {
+          return false;
+        }
+      }
+      if (op == JSOp::InitLexical) {
+        if (!bce_->innermostTDZCheckCache->noteTDZCheck(bce_, name_,
+                                                        DontCheckTDZ)) {
+          return false;
+        }
+      }
+      break;
+    }
+    case NameLocation::Kind::EnvironmentCoordinate: {
+      JSOp op = JSOp::SetAliasedVar;
+      if (loc_.isLexical() || loc_.isPrivateMethod() || loc_.isSynthetic()) {
+        if (isInitialize()) {
+          op = JSOp::InitAliasedLexical;
+        } else {
+          if (loc_.isConst()) {
+            op = JSOp::ThrowSetConst;
+          }
+          if (!bce_->emitTDZCheckIfNeeded(name_, loc_, ValueIsOnStack::No)) {
+            return false;
+          }
+        }
+      } else if (loc_.bindingKind() == BindingKind::NamedLambdaCallee) {
+        if (!bce_->sc->strict()) {
+          break;
+        }
+        op = JSOp::ThrowSetConst;
+      }
+      if (op == JSOp::ThrowSetConst) {
+        if (!bce_->emitAtomOp(op, name_)) {
+          return false;
+        }
+      } else {
+        if (!bce_->emitEnvCoordOp(op, loc_.environmentCoordinate())) {
+          return false;
+        }
+      }
+      if (op == JSOp::InitAliasedLexical) {
+        if (!bce_->innermostTDZCheckCache->noteTDZCheck(bce_, name_,
+                                                        DontCheckTDZ)) {
+          return false;
+        }
+      }
+      break;
+    }
+    case NameLocation::Kind::DebugEnvironmentCoordinate:
+      MOZ_CRASH("Shouldn't be assigning to a private brand");
+      break;
+  }
+
+#if defined(DEBUG)
+  state_ = State::Assignment;
+#endif
+  return true;
+}
+
+bool NameOpEmitter::emitIncDec(ValueUsage valueUsage) {
+  MOZ_ASSERT(state_ == State::Start);
+
+  JSOp incOp = isInc() ? JSOp::Inc : JSOp::Dec;
+  if (!prepareForRhs()) {
+    return false;
+  }
+  if (!bce_->emit1(JSOp::ToNumeric)) {
+    return false;
+  }
+  if (isPostIncDec() && valueUsage == ValueUsage::WantValue) {
+    if (!bce_->emit1(JSOp::Dup)) {
+      return false;
+    }
+  }
+  if (!bce_->emit1(incOp)) {
+    return false;
+  }
+  if (isPostIncDec() && emittedBindOp() &&
+      valueUsage == ValueUsage::WantValue) {
+    if (!bce_->emit2(JSOp::Pick, 2)) {
+      return false;
+    }
+    if (!bce_->emit1(JSOp::Swap)) {
+      return false;
+    }
+  }
+  if (!emitAssignment()) {
+    return false;
+  }
+  if (isPostIncDec() && valueUsage == ValueUsage::WantValue) {
+    if (!bce_->emit1(JSOp::Pop)) {
+      return false;
+    }
+  }
+
+#if defined(DEBUG)
+  state_ = State::IncDec;
+#endif
+  return true;
+}

@@ -1,0 +1,3 @@
+#[cfg_attr(feature = "use-explicitly-provided-auxv", path = "init.rs")]
+#[cfg_attr(all(not(feature = "use-explicitly-provided-auxv"), feature = "use-libc-auxv"), path = "libc_auxv.rs")]
+pub(crate) mod auxv;

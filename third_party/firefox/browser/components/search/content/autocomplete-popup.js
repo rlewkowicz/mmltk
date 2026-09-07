@@ -1,0 +1,268 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+"use strict";
+
+{
+  const lazy = {};
+  ChromeUtils.defineESModuleGetters(lazy, {
+    BrowserSearchTelemetry:
+      "moz-src:///browser/components/search/BrowserSearchTelemetry.sys.mjs",
+    BrowserUtils: "resource://gre/modules/BrowserUtils.sys.mjs",
+    SearchOneOffs: "moz-src:///browser/components/search/SearchOneOffs.sys.mjs",
+    SearchService: "moz-src:///toolkit/components/search/SearchService.sys.mjs",
+  });
+
+
+  class MozSearchAutocompleteRichlistboxPopup
+    extends MozElements.MozAutocompleteRichlistboxPopup
+  {
+    constructor() {
+      super();
+
+      this.addEventListener("popupshowing", () => {
+        if (this.searchbar.hasAttribute("showonlysettings")) {
+          this.searchbar.removeAttribute("showonlysettings");
+          this.setAttribute("showonlysettings", "true");
+
+          this.richlistbox.collapsed = true;
+        } else {
+          this.removeAttribute("showonlysettings");
+          this.richlistbox.collapsed = this.matchCount == 0;
+        }
+
+        this.updateHeader().catch(console.error);
+
+        this._oneOffButtons.addEventListener(
+          "SelectedOneOffButtonChanged",
+          this
+        );
+      });
+
+      this.addEventListener("popuphiding", () => {
+        this._oneOffButtons.removeEventListener(
+          "SelectedOneOffButtonChanged",
+          this
+        );
+      });
+
+      this.addEventListener("click", event => {
+        if (event.button == 2) {
+          return;
+        }
+        let button = event.originalTarget;
+        let engine = button.parentNode.engine;
+        if (!engine) {
+          return;
+        }
+        if (this.searchbar.value) {
+          this.oneOffButtons.handleSearchCommand(event, engine);
+        } else if (event.shiftKey) {
+          this.openSearchForm(event, engine);
+        }
+      });
+
+      this._bundle = null;
+    }
+
+    static get inheritedAttributes() {
+      return {
+        ".search-panel-current-engine": "showonlysettings",
+        ".searchbar-engine-image": "src",
+      };
+    }
+
+    getElementForAttrInheritance(selector) {
+      return this.querySelector(selector);
+    }
+
+    initialize() {
+      super.initialize();
+      this.initializeAttributeInheritance();
+
+      this._searchOneOffsContainer = this.querySelector(".search-one-offs");
+      this._searchbarEngine = this.querySelector(".search-panel-header");
+      this._searchbarEngineName = this.querySelector(".searchbar-engine-name");
+      this._oneOffButtons = new lazy.SearchOneOffs(
+        this._searchOneOffsContainer
+      );
+      this._searchbar = document.getElementById("searchbar");
+    }
+
+    get oneOffButtons() {
+      if (!this._oneOffButtons) {
+        this.initialize();
+      }
+      return this._oneOffButtons;
+    }
+
+    static get markup() {
+      return `
+      <hbox class="search-panel-header search-panel-current-engine">
+        <image class="searchbar-engine-image"/>
+        <label class="searchbar-engine-name" flex="1" crop="end" role="presentation"/>
+      </hbox>
+      <menuseparator class="searchbar-separator"/>
+      <richlistbox class="autocomplete-richlistbox search-panel-tree"/>
+      <menuseparator class="searchbar-separator"/>
+      <hbox class="search-one-offs" is_searchbar="true"/>
+    `;
+    }
+
+    get searchOneOffsContainer() {
+      if (!this._searchOneOffsContainer) {
+        this.initialize();
+      }
+      return this._searchOneOffsContainer;
+    }
+
+    get searchbarEngine() {
+      if (!this._searchbarEngine) {
+        this.initialize();
+      }
+      return this._searchbarEngine;
+    }
+
+    get searchbarEngineName() {
+      if (!this._searchbarEngineName) {
+        this.initialize();
+      }
+      return this._searchbarEngineName;
+    }
+
+    get searchbar() {
+      if (!this._searchbar) {
+        this.initialize();
+      }
+      return this._searchbar;
+    }
+
+    get bundle() {
+      if (!this._bundle) {
+        const kBundleURI = "chrome://browser/locale/search.properties";
+        this._bundle = Services.strings.createBundle(kBundleURI);
+      }
+      return this._bundle;
+    }
+
+    openAutocompletePopup(aInput, aElement) {
+      aInput.popup.hidden = false;
+
+      this._openAutocompletePopup(aInput, aElement);
+    }
+
+    onPopupClick(aEvent) {
+      if (aEvent.button == 2) {
+        return;
+      }
+
+      this.searchbar.telemetrySelectedIndex = this.selectedIndex;
+
+      if (
+        aEvent.button == 0 &&
+        !aEvent.shiftKey &&
+        !aEvent.ctrlKey &&
+        !aEvent.altKey &&
+        !aEvent.metaKey
+      ) {
+        this.input.controller.handleEnter(true, aEvent);
+        return;
+      }
+
+
+      let search = this.input.controller.getValueAt(this.selectedIndex);
+
+      let where = lazy.BrowserUtils.whereToOpenLink(aEvent, false, true);
+      let params = {};
+
+      let modifier =
+        AppConstants.platform == "macosx" ? aEvent.metaKey : aEvent.ctrlKey;
+      if (
+        where == "tab" &&
+        MouseEvent.isInstance(aEvent) &&
+        (aEvent.button == 1 || modifier)
+      ) {
+        params.inBackground = true;
+      }
+
+      if (!(where == "tab" && params.inBackground)) {
+        this.closePopup();
+        this.input.controller.handleEscape();
+      }
+
+      this.searchbar.doSearch(search, where, null, params);
+      if (where == "tab" && params.inBackground) {
+        this.searchbar.focus();
+      } else {
+        this.searchbar.value = search;
+      }
+    }
+
+    #currentEngineName;
+
+    async updateHeader(engine) {
+      if (!engine) {
+        if (PrivateBrowsingUtils.isWindowPrivate(window)) {
+          engine = await lazy.SearchService.getDefaultPrivate();
+        } else {
+          engine = await lazy.SearchService.getDefault();
+        }
+      }
+      this.#currentEngineName = engine.name;
+
+      let uri = await engine.getIconURL();
+
+      if (engine.name != this.#currentEngineName) {
+        return;
+      }
+
+      if (uri) {
+        this.setAttribute("src", uri);
+      } else {
+        this.removeAttribute("src");
+      }
+
+      let headerText = this.bundle.formatStringFromName("searchHeader", [
+        engine.name,
+      ]);
+      this.searchbarEngineName.setAttribute("value", headerText);
+      this.searchbarEngine.engine = engine;
+    }
+
+    handleOneOffSearch(event, engine, where, params) {
+      this.searchbar.handleSearchCommandWhere(event, engine, where, params);
+    }
+
+    openSearchForm(event, engine, forceNewTab = false) {
+      let { where, params } = this.oneOffButtons._whereToOpen(
+        event,
+        forceNewTab
+      );
+      this.searchbar.openSearchFormWhere(event, engine, where, params);
+    }
+
+    handleEvent(event) {
+      let methodName = "_on_" + event.type;
+      if (methodName in this) {
+        this[methodName](event);
+      } else {
+        throw new Error("Unrecognized UrlbarView event: " + event.type);
+      }
+    }
+    _on_SelectedOneOffButtonChanged() {
+      let engine =
+        this.oneOffButtons.selectedButton &&
+        this.oneOffButtons.selectedButton.engine;
+      this.updateHeader(engine).catch(console.error);
+    }
+  }
+
+  customElements.define(
+    "search-autocomplete-richlistbox-popup",
+    MozSearchAutocompleteRichlistboxPopup,
+    {
+      extends: "panel",
+    }
+  );
+}

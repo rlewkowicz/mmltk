@@ -1,0 +1,226 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef StartupCache_h_
+#define StartupCache_h_
+
+#include <utility>
+
+#include "nsClassHashtable.h"
+#include "nsComponentManagerUtils.h"
+#include "nsTArray.h"
+#include "nsTHashSet.h"
+#include "nsTStringHasher.h"  // mozilla::DefaultHasher<nsCString>
+#include "nsZipArchive.h"
+#include "nsITimer.h"
+#include "nsIMemoryReporter.h"
+#include "nsIObserverService.h"
+#include "nsIObserver.h"
+#include "nsIObjectOutputStream.h"
+#include "nsIFile.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/AutoMemMap.h"
+#include "mozilla/Compression.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/Monitor.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/Result.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/UniquePtrExtensions.h"
+
+
+namespace mozilla {
+
+namespace scache {
+
+struct StartupCacheEntry {
+  UniqueFreePtr<char[]> mData;
+  uint32_t mOffset;
+  uint32_t mCompressedSize;
+  uint32_t mUncompressedSize;
+  int32_t mHeaderOffsetInFile;
+  int32_t mRequestedOrder;
+  bool mRequested;
+
+  MOZ_IMPLICIT StartupCacheEntry(uint32_t aOffset, uint32_t aCompressedSize,
+                                 uint32_t aUncompressedSize)
+      : mData(nullptr),
+        mOffset(aOffset),
+        mCompressedSize(aCompressedSize),
+        mUncompressedSize(aUncompressedSize),
+        mHeaderOffsetInFile(0),
+        mRequestedOrder(0),
+        mRequested(false) {}
+
+  StartupCacheEntry(UniqueFreePtr<char[]> aData, size_t aLength,
+                    int32_t aRequestedOrder)
+      : mData(std::move(aData)),
+        mOffset(0),
+        mCompressedSize(0),
+        mUncompressedSize(aLength),
+        mHeaderOffsetInFile(0),
+        mRequestedOrder(0),
+        mRequested(true) {}
+
+  struct KeyValuePair {
+    const nsCString* first;
+    StartupCacheEntry* second;
+    KeyValuePair(const nsCString* aKeyPtr, StartupCacheEntry* aValuePtr)
+        : first(aKeyPtr), second(aValuePtr) {}
+  };
+  static_assert(std::is_trivially_move_assignable<KeyValuePair>::value);
+  static_assert(std::is_trivially_move_constructible<KeyValuePair>::value);
+
+  struct Comparator {
+    using Value = KeyValuePair;
+
+    bool Equals(const Value& a, const Value& b) const {
+      return a.second->mRequestedOrder == b.second->mRequestedOrder;
+    }
+
+    bool LessThan(const Value& a, const Value& b) const {
+      return a.second->mRequestedOrder < b.second->mRequestedOrder;
+    }
+  };
+};
+
+class StartupCacheListener final : public nsIObserver {
+  ~StartupCacheListener() = default;
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+};
+
+class StartupCache : public nsIMemoryReporter {
+  friend class StartupCacheListener;
+
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIMEMORYREPORTER
+
+
+  bool HasEntry(const char* id);
+
+  nsresult GetBuffer(const char* id, const char** outbuf, uint32_t* length);
+
+  nsresult PutBuffer(const char* id, UniqueFreePtr<char[]>&& inbuf,
+                     uint32_t length);
+
+  void InvalidateCache(bool memoryOnly = false);
+
+  void CountAllowedInvalidation();
+
+  void MaybeKickOffInitialWrite();
+
+  void MaybeKickOffShutdownWrite();
+
+  void EnsureShutdownWriteComplete();
+
+  static void IgnoreDiskCache();
+
+  static bool GetIgnoreDiskCache();
+
+  nsresult GetDebugObjectOutputStream(nsIObjectOutputStream* aStream,
+                                      nsIObjectOutputStream** outStream);
+
+  static StartupCache* GetSingletonNoInit();
+  static StartupCache* GetSingleton();
+  static void DeleteSingleton();
+
+  size_t HeapSizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf) const
+      MOZ_REQUIRES(mTableLock);
+
+  bool ShouldCompactCache() MOZ_REQUIRES(mTableLock);
+  nsresult ResetStartupWriteTimerCheckingReadCount();
+  nsresult ResetStartupWriteTimerAndLock();
+  nsresult ResetStartupWriteTimer() MOZ_REQUIRES(mTableLock);
+  bool StartupWriteComplete();
+
+ private:
+  StartupCache();
+  virtual ~StartupCache();
+
+  friend class StartupCacheInfo;
+
+  enum class WriteType : uint8_t {
+    InitialWrite,
+    RegularWrite,
+  };
+
+  Result<Ok, nsresult> LoadArchive() MOZ_REQUIRES(mTableLock);
+  nsresult Init();
+
+  Result<nsCOMPtr<nsIFile>, nsresult> GetCacheFile(const nsAString& suffix);
+
+  Result<Ok, nsresult> OpenCache();
+
+  Result<Ok, nsresult> WriteToDisk(WriteType aWriteType)
+      MOZ_REQUIRES(mTableLock);
+
+  void WaitOnPrefetch();
+  void StartPrefetchMemory() MOZ_REQUIRES(mTableLock);
+
+  static nsresult InitSingleton();
+  static void WriteTimeout(nsITimer* aTimer, void* aClosure);
+  void MaybeWriteOffMainThread(WriteType aWriteType,
+                               bool aUseLowPriorityIO = true);
+  void ThreadedPrefetch(uint8_t* aStart, size_t aSize);
+
+  Monitor mPrefetchComplete{"StartupCachePrefetch"};
+  bool mPrefetchInProgress MOZ_GUARDED_BY(mPrefetchComplete){false};
+
+  HashMap<nsCString, StartupCacheEntry> mTable MOZ_GUARDED_BY(mTableLock);
+  nsTArray<decltype(mTable)> mOldTables MOZ_GUARDED_BY(mTableLock);
+  size_t mAllowedInvalidationsCount = 0;
+  nsCOMPtr<nsIFile> mFile;
+  mozilla::loader::AutoMemMap mCacheData MOZ_GUARDED_BY(mTableLock);
+  Mutex mTableLock;
+
+  nsCOMPtr<nsIObserverService> mObserverService;
+  RefPtr<StartupCacheListener> mListener;
+  nsCOMPtr<nsITimer> mTimer;
+
+  bool mDirty MOZ_GUARDED_BY(mTableLock);
+  bool mRegularWriteDone MOZ_GUARDED_BY(mTableLock);
+  bool mCurTableReferenced MOZ_GUARDED_BY(mTableLock);
+
+  uint32_t mRequestedCount;
+  size_t mCacheEntriesBaseOffset;
+
+  static StaticRefPtr<StartupCache> gStartupCache;
+  static bool gShutdownInitiated;
+  static bool gIgnoreDiskCache;
+  static bool gFoundDiskCacheOnInit;
+  static bool gWantInitialWrite;
+
+  UniquePtr<Compression::LZ4FrameDecompressionContext> mDecompressionContext;
+#ifdef DEBUG
+  nsTHashSet<nsCOMPtr<nsISupports>> mWriteObjectMap;
+#endif
+};
+
+#ifdef DEBUG
+class StartupCacheDebugOutputStream final : public nsIObjectOutputStream {
+  ~StartupCacheDebugOutputStream() = default;
+
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIOBJECTOUTPUTSTREAM
+
+  StartupCacheDebugOutputStream(nsIObjectOutputStream* binaryStream,
+                                nsTHashSet<nsCOMPtr<nsISupports>>* objectMap)
+      : mBinaryStream(binaryStream), mObjectMap(objectMap) {}
+
+  NS_FORWARD_SAFE_NSIBINARYOUTPUTSTREAM(mBinaryStream)
+  NS_FORWARD_SAFE_NSIOUTPUTSTREAM(mBinaryStream)
+
+  bool CheckReferences(nsISupports* aObject);
+
+  nsCOMPtr<nsIObjectOutputStream> mBinaryStream;
+  nsTHashSet<nsCOMPtr<nsISupports>>* mObjectMap;
+};
+#endif  // DEBUG
+
+}  
+}  
+
+#endif  // StartupCache_h_

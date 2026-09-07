@@ -1,0 +1,2308 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "jit/IonAnalysis.h"
+
+#include "mozilla/CheckedArithmetic.h"
+#include "mozilla/HashFunctions.h"
+
+#include <algorithm>
+
+#include "jit/AliasAnalysis.h"
+#include "jit/CompileInfo.h"
+#include "jit/DominatorTree.h"
+#include "jit/MIRGenerator.h"
+#include "jit/MIRGraph.h"
+#include "js/HashTable.h"
+
+#include "vm/BytecodeUtil-inl.h"
+
+using namespace js;
+using namespace js::jit;
+
+using mozilla::DebugOnly;
+
+bool jit::SplitCriticalEdgesForBlock(MIRGraph& graph, MBasicBlock* block) {
+  if (block->numSuccessors() < 2) {
+    return true;
+  }
+  for (size_t i = 0; i < block->numSuccessors(); i++) {
+    MBasicBlock* target = block->getSuccessor(i);
+    if (target->numPredecessors() < 2) {
+      continue;
+    }
+
+    MBasicBlock* split = MBasicBlock::NewSplitEdge(graph, block, i, target);
+    if (!split) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool jit::SplitCriticalEdges(MIRGraph& graph) {
+  for (MBasicBlockIterator iter(graph.begin()); iter != graph.end(); iter++) {
+    MBasicBlock* block = *iter;
+    if (!SplitCriticalEdgesForBlock(graph, block)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool jit::IsUint32Type(const MDefinition* def) {
+  if (def->isBeta()) {
+    def = def->getOperand(0);
+  }
+
+  if (def->type() != MIRType::Int32) {
+    return false;
+  }
+
+  return def->isUrsh() && def->getOperand(1)->isConstant() &&
+         def->getOperand(1)->toConstant()->type() == MIRType::Int32 &&
+         def->getOperand(1)->toConstant()->toInt32() == 0;
+}
+
+bool jit::FoldEmptyBlocks(MIRGraph& graph, bool* changed) {
+  *changed = false;
+
+  for (MBasicBlockIterator iter(graph.begin()); iter != graph.end();) {
+    MBasicBlock* block = *iter;
+    iter++;
+
+    if (block->numPredecessors() != 1 || block->numSuccessors() != 1) {
+      continue;
+    }
+
+    if (!block->phisEmpty()) {
+      continue;
+    }
+
+    if (block->outerResumePoint()) {
+      continue;
+    }
+
+    if (*block->begin() != *block->rbegin()) {
+      continue;
+    }
+
+    MBasicBlock* succ = block->getSuccessor(0);
+    MBasicBlock* pred = block->getPredecessor(0);
+
+    if (succ->numPredecessors() != 1) {
+      continue;
+    }
+
+    size_t pos = pred->getSuccessorIndex(block);
+    pred->lastIns()->replaceSuccessor(pos, succ);
+
+    graph.removeBlock(block);
+
+    if (!succ->addPredecessorSameInputsAs(pred, block)) {
+      return false;
+    }
+    succ->removePredecessor(block);
+
+    *changed = true;
+  }
+  return true;
+}
+
+static void EliminateTriviallyDeadResumePointOperands(MIRGraph& graph,
+                                                      MResumePoint* rp) {
+  if (rp->mode() != ResumeMode::ResumeAt) {
+    return;
+  }
+
+  jsbytecode* pc = rp->pc();
+  if (JSOp(*pc) == JSOp::JumpTarget) {
+    pc += JSOpLength_JumpTarget;
+  }
+  if (JSOp(*pc) != JSOp::Pop) {
+    return;
+  }
+
+  size_t top = rp->stackDepth() - 1;
+  MOZ_ASSERT(!rp->isObservableOperand(top));
+
+  MDefinition* def = rp->getOperand(top);
+  if (def->isConstant()) {
+    return;
+  }
+
+  MConstant* constant = rp->block()->optimizedOutConstant(graph.alloc());
+  rp->replaceOperand(top, constant);
+}
+
+bool jit::EliminateTriviallyDeadResumePointOperands(const MIRGenerator* mir,
+                                                    MIRGraph& graph) {
+  for (auto* block : graph) {
+    if (MResumePoint* rp = block->entryResumePoint()) {
+      if (!graph.alloc().ensureBallast()) {
+        return false;
+      }
+      ::EliminateTriviallyDeadResumePointOperands(graph, rp);
+    }
+  }
+  return true;
+}
+
+bool jit::EliminateDeadResumePointOperands(const MIRGenerator* mir,
+                                           MIRGraph& graph) {
+  if (graph.hasTryBlock()) {
+    return true;
+  }
+
+  for (PostorderIterator block = graph.poBegin(); block != graph.poEnd();
+       block++) {
+    if (mir->shouldCancel("Eliminate Dead Resume Point Operands (main loop)")) {
+      return false;
+    }
+
+    if (MResumePoint* rp = block->entryResumePoint()) {
+      if (!graph.alloc().ensureBallast()) {
+        return false;
+      }
+      ::EliminateTriviallyDeadResumePointOperands(graph, rp);
+    }
+
+    if (block->isLoopHeader() && block->backedge() == *block) {
+      continue;
+    }
+
+    for (MInstructionIterator ins = block->begin(); ins != block->end();
+         ins++) {
+      if (MResumePoint* rp = ins->resumePoint()) {
+        if (!graph.alloc().ensureBallast()) {
+          return false;
+        }
+        ::EliminateTriviallyDeadResumePointOperands(graph, rp);
+      }
+
+      if (ins->isConstant()) {
+        continue;
+      }
+
+      if (ins->isUnbox() || ins->isParameter() || ins->isBoxNonStrictThis()) {
+        continue;
+      }
+
+      if (ins->isRecoveredOnBailout()) {
+        MOZ_ASSERT(ins->canRecoverOnBailout());
+        continue;
+      }
+
+      if (ins->isImplicitlyUsed()) {
+        continue;
+      }
+
+      uint32_t maxDefinition = 0;
+      for (MUseIterator uses(ins->usesBegin()); uses != ins->usesEnd();
+           uses++) {
+        MNode* consumer = uses->consumer();
+        if (consumer->isResumePoint()) {
+          MResumePoint* resume = consumer->toResumePoint();
+          if (resume->isObservableOperand(*uses)) {
+            maxDefinition = UINT32_MAX;
+            break;
+          }
+          continue;
+        }
+
+        MDefinition* def = consumer->toDefinition();
+        if (def->block() != *block || def->isBox() || def->isPhi()) {
+          maxDefinition = UINT32_MAX;
+          break;
+        }
+        maxDefinition = std::max(maxDefinition, def->id());
+      }
+      if (maxDefinition == UINT32_MAX) {
+        continue;
+      }
+
+      for (MUseIterator uses(ins->usesBegin()); uses != ins->usesEnd();) {
+        MUse* use = *uses++;
+        if (use->consumer()->isDefinition()) {
+          continue;
+        }
+        MResumePoint* mrp = use->consumer()->toResumePoint();
+        if (mrp->block() != *block || !mrp->instruction() ||
+            mrp->instruction() == *ins ||
+            mrp->instruction()->id() <= maxDefinition) {
+          continue;
+        }
+
+        if (!graph.alloc().ensureBallast()) {
+          return false;
+        }
+
+        MConstant* constant =
+            MConstant::NewMagic(graph.alloc(), JS_OPTIMIZED_OUT);
+        block->insertBefore(*(block->begin()), constant);
+        use->replaceProducer(constant);
+      }
+    }
+  }
+
+  return true;
+}
+
+bool js::jit::DeadIfUnused(const MDefinition* def) {
+  if (def->isEffectful()) {
+    return false;
+  }
+
+  if (def->isGuard()) {
+    return false;
+  }
+
+  if (def->isGuardRangeBailouts()) {
+    return false;
+  }
+
+  if (def->isControlInstruction()) {
+    return false;
+  }
+
+  if (def->isInstruction() && def->toInstruction()->resumePoint()) {
+    return false;
+  }
+
+  return true;
+}
+
+bool js::jit::DeadIfUnusedAllowEffectful(const MDefinition* def) {
+  if (def->isGuard()) {
+    return false;
+  }
+
+  if (def->isGuardRangeBailouts()) {
+    return false;
+  }
+
+  if (def->isControlInstruction()) {
+    return false;
+  }
+
+  if (def->isInstruction() && def->toInstruction()->resumePoint()) {
+    if (!def->isEffectful()) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool js::jit::IsDiscardable(const MDefinition* def) {
+  return !def->hasUses() && (DeadIfUnused(def) || def->block()->isMarked());
+}
+
+bool js::jit::IsDiscardableAllowEffectful(const MDefinition* def) {
+  return !def->hasUses() &&
+         (DeadIfUnusedAllowEffectful(def) || def->block()->isMarked());
+}
+
+bool jit::EliminateDeadCode(const MIRGenerator* mir, MIRGraph& graph) {
+  for (PostorderIterator block = graph.poBegin(); block != graph.poEnd();
+       block++) {
+    if (mir->shouldCancel("Eliminate Dead Code (main loop)")) {
+      return false;
+    }
+
+    for (MInstructionReverseIterator iter = block->rbegin();
+         iter != block->rend();) {
+      MInstruction* inst = *iter++;
+      if (js::jit::IsDiscardable(inst)) {
+        block->discard(inst);
+      }
+    }
+  }
+
+  return true;
+}
+
+static inline bool IsPhiObservable(MPhi* phi, Observability observe) {
+  if (phi->isImplicitlyUsed()) {
+    return true;
+  }
+
+  for (MUseIterator iter(phi->usesBegin()); iter != phi->usesEnd(); iter++) {
+    MNode* consumer = iter->consumer();
+    if (consumer->isResumePoint()) {
+      MResumePoint* resume = consumer->toResumePoint();
+      if (observe == ConservativeObservability) {
+        return true;
+      }
+      if (resume->isObservableOperand(*iter)) {
+        return true;
+      }
+    } else {
+      MDefinition* def = consumer->toDefinition();
+      if (!def->isPhi()) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+static inline MDefinition* IsPhiRedundant(MPhi* phi) {
+  MDefinition* first = phi->operandIfRedundant();
+  if (first == nullptr) {
+    return nullptr;
+  }
+
+  if (phi->isImplicitlyUsed()) {
+    first->setImplicitlyUsedUnchecked();
+  }
+
+  return first;
+}
+
+bool jit::EliminatePhis(const MIRGenerator* mir, MIRGraph& graph,
+                        Observability observe) {
+
+  Vector<MPhi*, 16, SystemAllocPolicy> worklist;
+
+  for (PostorderIterator block = graph.poBegin(); block != graph.poEnd();
+       block++) {
+    MPhiIterator iter = block->phisBegin();
+    while (iter != block->phisEnd()) {
+      MPhi* phi = *iter++;
+
+      if (mir->shouldCancel("Eliminate Phis (populate loop)")) {
+        return false;
+      }
+
+      phi->setUnused();
+
+      if (MDefinition* redundant = IsPhiRedundant(phi)) {
+        phi->justReplaceAllUsesWith(redundant);
+        block->discardPhi(phi);
+        continue;
+      }
+
+      if (IsPhiObservable(phi, observe)) {
+        phi->setInWorklist();
+        if (!worklist.append(phi)) {
+          return false;
+        }
+      }
+    }
+  }
+
+  while (!worklist.empty()) {
+    if (mir->shouldCancel("Eliminate Phis (worklist)")) {
+      return false;
+    }
+
+    MPhi* phi = worklist.popCopy();
+    MOZ_ASSERT(phi->isUnused());
+    phi->setNotInWorklist();
+
+    if (MDefinition* redundant = IsPhiRedundant(phi)) {
+      for (MUseDefIterator it(phi); it; it++) {
+        if (it.def()->isPhi()) {
+          MPhi* use = it.def()->toPhi();
+          if (!use->isUnused()) {
+            use->setUnusedUnchecked();
+            use->setInWorklist();
+            if (!worklist.append(use)) {
+              return false;
+            }
+          }
+        }
+      }
+      phi->justReplaceAllUsesWith(redundant);
+    } else {
+      phi->setNotUnused();
+    }
+
+    for (size_t i = 0, e = phi->numOperands(); i < e; i++) {
+      MDefinition* in = phi->getOperand(i);
+      if (!in->isPhi() || !in->isUnused() || in->isInWorklist()) {
+        continue;
+      }
+      in->setInWorklist();
+      if (!worklist.append(in->toPhi())) {
+        return false;
+      }
+    }
+  }
+
+  for (PostorderIterator block = graph.poBegin(); block != graph.poEnd();
+       block++) {
+    if (mir->shouldCancel("Eliminate Phis (sweep dead phis)")) {
+      return false;
+    }
+
+    MPhiIterator iter = block->phisBegin();
+    while (iter != block->phisEnd()) {
+      MPhi* phi = *iter++;
+      if (phi->isUnused()) {
+        if (!phi->optimizeOutAllUses(graph.alloc())) {
+          return false;
+        }
+        block->discardPhi(phi);
+      }
+    }
+  }
+
+  return true;
+}
+
+void jit::RenumberBlocks(MIRGraph& graph) {
+  size_t id = 0;
+  for (ReversePostorderIterator block(graph.rpoBegin());
+       block != graph.rpoEnd(); block++) {
+    block->setId(id++);
+  }
+}
+
+bool jit::AccountForCFGChanges(const MIRGenerator* mir, MIRGraph& graph,
+                               bool updateAliasAnalysis,
+                               bool underValueNumberer) {
+  size_t id = 0;
+  for (ReversePostorderIterator i(graph.rpoBegin()), e(graph.rpoEnd()); i != e;
+       ++i) {
+    i->clearDominatorInfo();
+    i->setId(id++);
+  }
+
+  if (!BuildDominatorTree(mir, graph)) {
+    return false;
+  }
+
+  if (updateAliasAnalysis) {
+    if (!AliasAnalysis(mir, graph).analyze()) {
+      return false;
+    }
+  }
+
+  AssertExtendedGraphCoherency(graph, underValueNumberer);
+  return true;
+}
+
+bool jit::BuildPhiReverseMapping(MIRGraph& graph) {
+  for (MBasicBlockIterator block(graph.begin()); block != graph.end();
+       block++) {
+    if (block->phisEmpty()) {
+      continue;
+    }
+
+    for (size_t j = 0; j < block->numPredecessors(); j++) {
+      MBasicBlock* pred = block->getPredecessor(j);
+
+#ifdef DEBUG
+      size_t numSuccessorsWithPhis = 0;
+      for (size_t k = 0; k < pred->numSuccessors(); k++) {
+        MBasicBlock* successor = pred->getSuccessor(k);
+        if (!successor->phisEmpty()) {
+          numSuccessorsWithPhis++;
+        }
+      }
+      MOZ_ASSERT(numSuccessorsWithPhis <= 1);
+#endif
+
+      pred->setSuccessorWithPhis(*block, j);
+    }
+  }
+
+  return true;
+}
+
+struct BoundsCheckInfo {
+  MBoundsCheck* check;
+  uint32_t validEnd;
+};
+
+using BoundsCheckMap =
+    HashMap<uint32_t, BoundsCheckInfo, DefaultHasher<uint32_t>, JitAllocPolicy>;
+
+static HashNumber BoundsCheckHashIgnoreOffset(MBoundsCheck* check) {
+  SimpleLinearSum indexSum = ExtractLinearSum(check->index());
+  uintptr_t index = indexSum.term ? uintptr_t(indexSum.term) : 0;
+  uintptr_t length = uintptr_t(check->length());
+  return index ^ length;
+}
+
+static MBoundsCheck* FindDominatingBoundsCheck(BoundsCheckMap& checks,
+                                               MBoundsCheck* check,
+                                               size_t index) {
+  HashNumber hash = BoundsCheckHashIgnoreOffset(check);
+  BoundsCheckMap::Ptr p = checks.lookup(hash);
+  if (!p || index >= p->value().validEnd) {
+    BoundsCheckInfo info;
+    info.check = check;
+    info.validEnd = index + check->block()->numDominated();
+
+    if (!checks.put(hash, info)) return nullptr;
+
+    return check;
+  }
+
+  return p->value().check;
+}
+
+static MathSpace ExtractMathSpace(MDefinition* ins) {
+  MOZ_ASSERT(ins->isAdd() || ins->isSub());
+  MBinaryArithInstruction* arith = nullptr;
+  if (ins->isAdd()) {
+    arith = ins->toAdd();
+  } else {
+    arith = ins->toSub();
+  }
+  switch (arith->truncateKind()) {
+    case TruncateKind::NoTruncate:
+    case TruncateKind::TruncateAfterBailouts:
+      return MathSpace::Infinite;
+    case TruncateKind::IndirectTruncate:
+    case TruncateKind::Truncate:
+      return MathSpace::Modulo;
+  }
+  MOZ_CRASH("Unknown TruncateKind");
+}
+
+static bool MonotoneAdd(int32_t lhs, int32_t rhs) {
+  return (lhs >= 0 && rhs >= 0) || (lhs <= 0 && rhs <= 0);
+}
+
+static bool MonotoneSub(int32_t lhs, int32_t rhs) {
+  return (lhs >= 0 && rhs <= 0) || (lhs <= 0 && rhs >= 0);
+}
+
+SimpleLinearSum jit::ExtractLinearSum(MDefinition* ins, MathSpace space,
+                                      int32_t recursionDepth) {
+  const int32_t SAFE_RECURSION_LIMIT = 100;
+  if (recursionDepth > SAFE_RECURSION_LIMIT) {
+    return SimpleLinearSum(ins, 0);
+  }
+
+  if (ins->isInt32ToIntPtr()) {
+    ins = ins->toInt32ToIntPtr()->input();
+  }
+
+  if (ins->isBeta()) {
+    ins = ins->getOperand(0);
+  }
+
+  MOZ_ASSERT(!ins->isInt32ToIntPtr());
+
+  if (ins->type() != MIRType::Int32) {
+    return SimpleLinearSum(ins, 0);
+  }
+
+  if (ins->isConstant()) {
+    return SimpleLinearSum(nullptr, ins->toConstant()->toInt32());
+  }
+
+  if (!ins->isAdd() && !ins->isSub()) {
+    return SimpleLinearSum(ins, 0);
+  }
+
+  MathSpace insSpace = ExtractMathSpace(ins);
+  if (space == MathSpace::Unknown) {
+    space = insSpace;
+  } else if (space != insSpace) {
+    return SimpleLinearSum(ins, 0);
+  }
+  MOZ_ASSERT(space == MathSpace::Modulo || space == MathSpace::Infinite);
+
+  if (space == MathSpace::Modulo) {
+    return SimpleLinearSum(ins, 0);
+  }
+
+  MDefinition* lhs = ins->getOperand(0);
+  MDefinition* rhs = ins->getOperand(1);
+  if (lhs->type() != MIRType::Int32 || rhs->type() != MIRType::Int32) {
+    return SimpleLinearSum(ins, 0);
+  }
+
+  SimpleLinearSum lsum = ExtractLinearSum(lhs, space, recursionDepth + 1);
+  SimpleLinearSum rsum = ExtractLinearSum(rhs, space, recursionDepth + 1);
+
+  if (lsum.term && rsum.term) {
+    return SimpleLinearSum(ins, 0);
+  }
+
+  if (ins->isAdd()) {
+    int32_t constant;
+    if (space == MathSpace::Modulo) {
+      constant = uint32_t(lsum.constant) + uint32_t(rsum.constant);
+    } else if (!mozilla::SafeAdd(lsum.constant, rsum.constant, &constant) ||
+               !MonotoneAdd(lsum.constant, rsum.constant)) {
+      return SimpleLinearSum(ins, 0);
+    }
+    return SimpleLinearSum(lsum.term ? lsum.term : rsum.term, constant);
+  }
+
+  MOZ_ASSERT(ins->isSub());
+  if (lsum.term) {
+    int32_t constant;
+    if (space == MathSpace::Modulo) {
+      constant = uint32_t(lsum.constant) - uint32_t(rsum.constant);
+    } else if (!mozilla::SafeSub(lsum.constant, rsum.constant, &constant) ||
+               !MonotoneSub(lsum.constant, rsum.constant)) {
+      return SimpleLinearSum(ins, 0);
+    }
+    return SimpleLinearSum(lsum.term, constant);
+  }
+
+  return SimpleLinearSum(ins, 0);
+}
+
+bool jit::ExtractLinearInequality(const MTest* test, BranchDirection direction,
+                                  SimpleLinearSum* plhs, MDefinition** prhs,
+                                  bool* plessEqual) {
+  if (!test->getOperand(0)->isCompare()) {
+    return false;
+  }
+
+  MCompare* compare = test->getOperand(0)->toCompare();
+
+  MDefinition* lhs = compare->getOperand(0);
+  MDefinition* rhs = compare->getOperand(1);
+
+  if (!compare->isInt32Comparison()) {
+    return false;
+  }
+
+  MOZ_ASSERT(lhs->type() == MIRType::Int32);
+  MOZ_ASSERT(rhs->type() == MIRType::Int32);
+
+  JSOp jsop = compare->jsop();
+  if (direction == FALSE_BRANCH) {
+    jsop = NegateCompareOp(jsop);
+  }
+
+  SimpleLinearSum lsum = ExtractLinearSum(lhs);
+  SimpleLinearSum rsum = ExtractLinearSum(rhs);
+
+  if (!mozilla::SafeSub(lsum.constant, rsum.constant, &lsum.constant)) {
+    return false;
+  }
+
+  switch (jsop) {
+    case JSOp::Le:
+      *plessEqual = true;
+      break;
+    case JSOp::Lt:
+      if (!mozilla::SafeAdd(lsum.constant, 1, &lsum.constant)) {
+        return false;
+      }
+      *plessEqual = true;
+      break;
+    case JSOp::Ge:
+      *plessEqual = false;
+      break;
+    case JSOp::Gt:
+      if (!mozilla::SafeSub(lsum.constant, 1, &lsum.constant)) {
+        return false;
+      }
+      *plessEqual = false;
+      break;
+    default:
+      return false;
+  }
+
+  *plhs = lsum;
+  *prhs = rsum.term;
+
+  return true;
+}
+
+static bool TryEliminateBoundsCheck(BoundsCheckMap& checks, size_t blockIndex,
+                                    MBoundsCheck* dominated, bool* eliminated) {
+  MOZ_ASSERT(!*eliminated);
+
+  dominated->replaceAllUsesWith(dominated->index());
+
+  if (!dominated->isMovable()) {
+    return true;
+  }
+
+  if (!dominated->fallible()) {
+    return true;
+  }
+
+  MBoundsCheck* dominating =
+      FindDominatingBoundsCheck(checks, dominated, blockIndex);
+  if (!dominating) {
+    return false;
+  }
+
+  if (dominating == dominated) {
+    return true;
+  }
+
+  if (dominating->length() != dominated->length()) {
+    return true;
+  }
+
+  SimpleLinearSum sumA = ExtractLinearSum(dominating->index());
+  SimpleLinearSum sumB = ExtractLinearSum(dominated->index());
+
+  if (sumA.term != sumB.term) {
+    return true;
+  }
+
+  *eliminated = true;
+
+  int32_t minimumA, maximumA, minimumB, maximumB;
+  if (!mozilla::SafeAdd(sumA.constant, dominating->minimum(), &minimumA) ||
+      !mozilla::SafeAdd(sumA.constant, dominating->maximum(), &maximumA) ||
+      !mozilla::SafeAdd(sumB.constant, dominated->minimum(), &minimumB) ||
+      !mozilla::SafeAdd(sumB.constant, dominated->maximum(), &maximumB)) {
+    return false;
+  }
+
+  int32_t newMinimum, newMaximum;
+  if (!mozilla::SafeSub(std::min(minimumA, minimumB), sumA.constant,
+                        &newMinimum) ||
+      !mozilla::SafeSub(std::max(maximumA, maximumB), sumA.constant,
+                        &newMaximum)) {
+    return false;
+  }
+
+  dominating->setMinimum(newMinimum);
+  dominating->setMaximum(newMaximum);
+  dominating->setBailoutKind(BailoutKind::HoistBoundsCheck);
+
+  return true;
+}
+
+bool jit::EliminateRedundantChecks(MIRGraph& graph) {
+  BoundsCheckMap checks(graph.alloc());
+
+  Vector<MBasicBlock*, 1, JitAllocPolicy> worklist(graph.alloc());
+
+  size_t index = 0;
+
+  for (MBasicBlockIterator i(graph.begin()); i != graph.end(); i++) {
+    MBasicBlock* block = *i;
+    if (block->immediateDominator() == block) {
+      if (!worklist.append(block)) {
+        return false;
+      }
+    }
+  }
+
+  while (!worklist.empty()) {
+    MBasicBlock* block = worklist.popCopy();
+
+    if (!worklist.append(block->immediatelyDominatedBlocksBegin(),
+                         block->immediatelyDominatedBlocksEnd())) {
+      return false;
+    }
+
+    for (MDefinitionIterator iter(block); iter;) {
+      MDefinition* def = *iter++;
+
+      if (!def->isBoundsCheck()) {
+        continue;
+      }
+      auto* boundsCheck = def->toBoundsCheck();
+
+      bool eliminated = false;
+      if (!TryEliminateBoundsCheck(checks, index, boundsCheck, &eliminated)) {
+        return false;
+      }
+
+      if (eliminated) {
+        block->discard(boundsCheck);
+      }
+    }
+    index++;
+  }
+
+  MOZ_ASSERT(index == graph.numBlocks());
+
+  return true;
+}
+
+static bool ShapeGuardIsRedundant(MGuardShape* guard,
+                                  const MDefinition* storeObject,
+                                  const Shape* storeShape) {
+  const MDefinition* guardObject = guard->object()->skipObjectGuards();
+  if (guardObject != storeObject) {
+    JitSpew(JitSpew_RedundantShapeGuards, "SKIP: different objects (%d vs %d)",
+            guardObject->id(), storeObject->id());
+    return false;
+  }
+
+  const Shape* guardShape = guard->shape();
+  if (guardShape != storeShape) {
+    JitSpew(JitSpew_RedundantShapeGuards, "SKIP: different shapes");
+    return false;
+  }
+
+  return true;
+}
+
+bool jit::EliminateRedundantShapeGuards(MIRGraph& graph) {
+  JitSpew(JitSpew_RedundantShapeGuards, "Begin");
+
+  for (ReversePostorderIterator block = graph.rpoBegin();
+       block != graph.rpoEnd(); block++) {
+    for (MInstructionIterator insIter(block->begin());
+         insIter != block->end();) {
+      MInstruction* ins = *insIter;
+      insIter++;
+
+      if (!ins->isGuardShape()) {
+        continue;
+      }
+      MGuardShape* guard = ins->toGuardShape();
+      MDefinition* lastStore = guard->dependency();
+
+      JitSpew(JitSpew_RedundantShapeGuards, "Visit shape guard %d",
+              guard->id());
+      JitSpewIndent spewIndent(JitSpew_RedundantShapeGuards);
+
+      if (lastStore->isDiscarded() || lastStore->block()->isDead() ||
+          !lastStore->block()->dominates(guard->block())) {
+        JitSpew(JitSpew_RedundantShapeGuards,
+                "SKIP: ins %d does not dominate block %d", lastStore->id(),
+                guard->block()->id());
+        continue;
+      }
+
+      if (lastStore->isAddAndStoreSlot()) {
+        auto* add = lastStore->toAddAndStoreSlot();
+        auto* addObject = add->object()->skipObjectGuards();
+        if (!ShapeGuardIsRedundant(guard, addObject, add->shape())) {
+          continue;
+        }
+      } else if (lastStore->isAllocateAndStoreSlot()) {
+        auto* allocate = lastStore->toAllocateAndStoreSlot();
+        auto* allocateObject = allocate->object()->skipObjectGuards();
+        if (!ShapeGuardIsRedundant(guard, allocateObject, allocate->shape())) {
+          continue;
+        }
+      } else if (lastStore->isStart()) {
+        auto* obj = guard->object()->skipObjectGuards();
+
+        const Shape* initialShape = nullptr;
+        if (obj->isNewObject()) {
+          auto* templateObject = obj->toNewObject()->templateObject();
+          if (!templateObject) {
+            JitSpew(JitSpew_RedundantShapeGuards, "SKIP: no template");
+            continue;
+          }
+          initialShape = templateObject->shape();
+        } else if (obj->isNewPlainObject()) {
+          initialShape = obj->toNewPlainObject()->shape();
+        } else {
+          JitSpew(JitSpew_RedundantShapeGuards,
+                  "SKIP: not NewObject or NewPlainObject (%d)", obj->id());
+          continue;
+        }
+        if (initialShape != guard->shape()) {
+          JitSpew(JitSpew_RedundantShapeGuards, "SKIP: shapes don't match");
+          continue;
+        }
+      } else {
+        JitSpew(JitSpew_RedundantShapeGuards,
+                "SKIP: Last store not supported (%d)", lastStore->id());
+        continue;
+      }
+
+#ifdef DEBUG
+      if (!graph.alloc().ensureBallast()) {
+        return false;
+      }
+      auto* assert = MAssertShape::New(graph.alloc(), guard->object(),
+                                       const_cast<Shape*>(guard->shape()));
+      guard->block()->insertBefore(guard, assert);
+#endif
+
+      JitSpew(JitSpew_RedundantShapeGuards, "SUCCESS: Removing shape guard %d",
+              guard->id());
+      guard->replaceAllUsesWith(guard->input());
+      guard->block()->discard(guard);
+    }
+  }
+
+  return true;
+}
+
+[[nodiscard]] static bool TryEliminateGCBarriersForAllocation(
+    TempAllocator& alloc, MInstruction* allocation) {
+  MOZ_ASSERT(allocation->type() == MIRType::Object);
+
+  JitSpew(JitSpew_RedundantGCBarriers, "Analyzing allocation %s",
+          allocation->opName());
+
+  MBasicBlock* block = allocation->block();
+  MInstructionIterator insIter(block->begin(allocation));
+
+  MOZ_ASSERT(*insIter == allocation);
+  insIter++;
+
+  while (insIter != block->end()) {
+    MInstruction* ins = *insIter;
+    insIter++;
+    switch (ins->op()) {
+      case MDefinition::Opcode::Constant:
+      case MDefinition::Opcode::Box:
+      case MDefinition::Opcode::Unbox:
+      case MDefinition::Opcode::AssertCanElidePostWriteBarrier:
+        break;
+      case MDefinition::Opcode::StoreFixedSlot: {
+        auto* store = ins->toStoreFixedSlot();
+        if (store->object() != allocation) {
+          JitSpew(JitSpew_RedundantGCBarriers,
+                  "Stopped at StoreFixedSlot for other object");
+          return true;
+        }
+        store->setNeedsBarrier(false);
+        JitSpew(JitSpew_RedundantGCBarriers, "Elided StoreFixedSlot barrier");
+        break;
+      }
+      case MDefinition::Opcode::PostWriteBarrier: {
+        auto* barrier = ins->toPostWriteBarrier();
+        if (barrier->object() != allocation) {
+          JitSpew(JitSpew_RedundantGCBarriers,
+                  "Stopped at PostWriteBarrier for other object");
+          return true;
+        }
+#ifdef DEBUG
+        if (!alloc.ensureBallast()) {
+          return false;
+        }
+        MDefinition* value = barrier->value();
+        if (value->type() != MIRType::Value) {
+          value = MBox::New(alloc, value);
+          block->insertBefore(barrier, value->toInstruction());
+        }
+        auto* assert =
+            MAssertCanElidePostWriteBarrier::New(alloc, allocation, value);
+        block->insertBefore(barrier, assert);
+#endif
+        block->discard(barrier);
+        JitSpew(JitSpew_RedundantGCBarriers, "Elided PostWriteBarrier");
+        break;
+      }
+      default:
+        JitSpew(JitSpew_RedundantGCBarriers,
+                "Stopped at unsupported instruction %s", ins->opName());
+        return true;
+    }
+  }
+
+  return true;
+}
+
+bool jit::EliminateRedundantGCBarriers(MIRGraph& graph) {
+
+  JitSpew(JitSpew_RedundantGCBarriers, "Begin");
+
+  for (ReversePostorderIterator block = graph.rpoBegin();
+       block != graph.rpoEnd(); block++) {
+    for (MInstructionIterator insIter(block->begin()); insIter != block->end();
+         insIter++) {
+      MInstruction* ins = *insIter;
+      if (ins->isNewCallObject()) {
+        MNewCallObject* allocation = ins->toNewCallObject();
+        if (allocation->initialHeap() == gc::Heap::Default) {
+          if (!TryEliminateGCBarriersForAllocation(graph.alloc(), allocation)) {
+            return false;
+          }
+        }
+      }
+    }
+  }
+
+  return true;
+}
+
+bool jit::MarkLoadsUsedAsPropertyKeys(MIRGraph& graph) {
+  JitSpew(JitSpew_MarkLoadsUsedAsPropertyKeys, "Begin");
+
+  for (ReversePostorderIterator block = graph.rpoBegin();
+       block != graph.rpoEnd(); block++) {
+    for (MInstructionIterator insIter(block->begin());
+         insIter != block->end();) {
+      MInstruction* ins = *insIter;
+      insIter++;
+
+      MDefinition* idVal = nullptr;
+      if (ins->isGetPropertyCache()) {
+        idVal = ins->toGetPropertyCache()->idval();
+      } else if (ins->isHasOwnCache()) {
+        idVal = ins->toHasOwnCache()->idval();
+      } else if (ins->isSetPropertyCache()) {
+        idVal = ins->toSetPropertyCache()->idval();
+      } else if (ins->isGetPropSuperCache()) {
+        idVal = ins->toGetPropSuperCache()->idval();
+      } else if (ins->isMegamorphicLoadSlotByValue()) {
+        idVal = ins->toMegamorphicLoadSlotByValue()->idVal();
+      } else if (ins->isMegamorphicLoadSlotByValuePermissive()) {
+        idVal = ins->toMegamorphicLoadSlotByValuePermissive()->idVal();
+      } else if (ins->isMegamorphicHasProp()) {
+        idVal = ins->toMegamorphicHasProp()->idVal();
+      } else if (ins->isMegamorphicSetElement()) {
+        idVal = ins->toMegamorphicSetElement()->index();
+      } else if (ins->isProxyGetByValue()) {
+        idVal = ins->toProxyGetByValue()->idVal();
+      } else if (ins->isProxyHasProp()) {
+        idVal = ins->toProxyHasProp()->idVal();
+      } else if (ins->isProxySetByValue()) {
+        idVal = ins->toProxySetByValue()->idVal();
+      } else if (ins->isIdToStringOrSymbol()) {
+        idVal = ins->toIdToStringOrSymbol()->idVal();
+      } else if (ins->isGuardSpecificAtom()) {
+        idVal = ins->toGuardSpecificAtom()->input();
+      } else if (ins->isToHashableString()) {
+        idVal = ins->toToHashableString()->input();
+      } else if (ins->isToHashableValue()) {
+        idVal = ins->toToHashableValue()->input();
+      } else if (ins->isMapObjectHasValueVMCall()) {
+        idVal = ins->toMapObjectHasValueVMCall()->value();
+      } else if (ins->isMapObjectGetValueVMCall()) {
+        idVal = ins->toMapObjectGetValueVMCall()->value();
+      } else if (ins->isSetObjectHasValueVMCall()) {
+        idVal = ins->toSetObjectHasValueVMCall()->value();
+      } else {
+        continue;
+      }
+      JitSpew(JitSpew_MarkLoadsUsedAsPropertyKeys,
+              "Analyzing property access %s%d with idVal %s%d", ins->opName(),
+              ins->id(), idVal->opName(), idVal->id());
+
+      do {
+        if (idVal->isLexicalCheck()) {
+          idVal = idVal->toLexicalCheck()->input();
+          JitSpew(JitSpew_MarkLoadsUsedAsPropertyKeys,
+                  "- Skipping lexical check. idVal is now %s%d",
+                  idVal->opName(), idVal->id());
+          continue;
+        }
+        if (idVal->isUnbox() && idVal->type() == MIRType::String) {
+          idVal = idVal->toUnbox()->input();
+          JitSpew(JitSpew_MarkLoadsUsedAsPropertyKeys,
+                  "- Skipping unbox. idVal is now %s%d", idVal->opName(),
+                  idVal->id());
+          continue;
+        }
+        break;
+      } while (true);
+
+      if (idVal->isLoadFixedSlot()) {
+        JitSpew(JitSpew_MarkLoadsUsedAsPropertyKeys,
+                "- SUCCESS: Marking fixed slot");
+        idVal->toLoadFixedSlot()->setUsedAsPropertyKey();
+      } else if (idVal->isLoadDynamicSlot()) {
+        JitSpew(JitSpew_MarkLoadsUsedAsPropertyKeys,
+                "- SUCCESS: Marking dynamic slot");
+        idVal->toLoadDynamicSlot()->setUsedAsPropertyKey();
+      } else {
+        JitSpew(JitSpew_MarkLoadsUsedAsPropertyKeys, "- SKIP: %s not supported",
+                idVal->opName());
+      }
+    }
+  }
+
+  return true;
+}
+
+enum class CanonicalizeNaN {
+  Yes,
+
+  No,
+
+  Propagate,
+};
+
+static auto NeedToCanonicalizeNaN(const MDefinition* def) {
+  switch (def->op()) {
+    case MDefinition::Opcode::Phi:
+    case MDefinition::Opcode::Add:
+    case MDefinition::Opcode::Sub:
+    case MDefinition::Opcode::Mul:
+    case MDefinition::Opcode::Div:
+    case MDefinition::Opcode::Mod:
+    case MDefinition::Opcode::Abs:
+    case MDefinition::Opcode::Atan2:
+    case MDefinition::Opcode::CopySign:
+    case MDefinition::Opcode::Hypot:
+    case MDefinition::Opcode::MathFunction:
+    case MDefinition::Opcode::MinMax:
+    case MDefinition::Opcode::Pow:
+    case MDefinition::Opcode::PowHalf:
+    case MDefinition::Opcode::Sqrt:
+    case MDefinition::Opcode::NearbyInt:
+    case MDefinition::Opcode::RoundToDouble:
+    case MDefinition::Opcode::ToDouble:
+    case MDefinition::Opcode::ToFloat32:
+    case MDefinition::Opcode::ToFloat16:
+      MOZ_ASSERT(IsFloatingPointType(def->type()));
+      return CanonicalizeNaN::Propagate;
+
+    case MDefinition::Opcode::StoreUnboxedScalar:
+    case MDefinition::Opcode::StoreDataViewElement:
+    case MDefinition::Opcode::StoreTypedArrayElementHole:
+    case MDefinition::Opcode::TypedArrayFill:
+      MOZ_ASSERT(def->type() == MIRType::None);
+      return CanonicalizeNaN::No;
+
+    case MDefinition::Opcode::PostWriteBarrier:
+    case MDefinition::Opcode::PostWriteElementBarrier:
+      MOZ_ASSERT(def->type() == MIRType::None);
+      return CanonicalizeNaN::No;
+
+    case MDefinition::Opcode::Ceil:
+    case MDefinition::Opcode::Floor:
+    case MDefinition::Opcode::Round:
+    case MDefinition::Opcode::Trunc:
+    case MDefinition::Opcode::ClampToUint8:
+    case MDefinition::Opcode::ToNumberInt32:
+    case MDefinition::Opcode::TruncateToInt32:
+    case MDefinition::Opcode::DoubleParseInt:
+      MOZ_ASSERT(def->type() == MIRType::Int32);
+      return CanonicalizeNaN::No;
+
+    case MDefinition::Opcode::GuardNumberToIntPtrIndex:
+      MOZ_ASSERT(def->type() == MIRType::IntPtr);
+      return CanonicalizeNaN::No;
+
+    case MDefinition::Opcode::ToString:
+      MOZ_ASSERT(def->type() == MIRType::String);
+      return CanonicalizeNaN::No;
+
+    case MDefinition::Opcode::Not:
+    case MDefinition::Opcode::Compare:
+    case MDefinition::Opcode::SameValueDouble:
+      MOZ_ASSERT(def->type() == MIRType::Boolean);
+      return CanonicalizeNaN::No;
+
+    case MDefinition::Opcode::Test:
+      MOZ_ASSERT(def->type() == MIRType::None);
+      return CanonicalizeNaN::No;
+
+    case MDefinition::Opcode::TableSwitch:
+      MOZ_ASSERT(def->type() == MIRType::None);
+      return CanonicalizeNaN::No;
+
+    case MDefinition::Opcode::CanonicalizeNaN:
+    case MDefinition::Opcode::TimeClip:
+    case MDefinition::Opcode::NaNToZero:
+      MOZ_ASSERT(IsFloatingPointType(def->type()));
+      return CanonicalizeNaN::No;
+
+    case MDefinition::Opcode::Sign:
+      return IsFloatingPointType(def->type()) ? CanonicalizeNaN::Propagate
+                                              : CanonicalizeNaN::No;
+
+    default:
+      return CanonicalizeNaN::Yes;
+  }
+}
+
+using PhiList = Vector<MPhi*, 8, SystemAllocPolicy>;
+
+static bool CanonicalizeNaNFor(MIRGraph& graph, PhiList& philist,
+                               MInstruction* load) {
+  Vector<MDefinition*, 16, SystemAllocPolicy> worklist;
+  Vector<MUse*, 8, SystemAllocPolicy> useslist;
+
+  if (!worklist.append(load)) {
+    return false;
+  }
+  load->setInWorklist();
+
+  while (!worklist.empty()) {
+    auto* def = worklist.popCopy();
+
+    JitSpewDef(JitSpew_CanonicalizeNaN, "Check worklist item\n", def);
+    JitSpewIndent spewIndent(JitSpew_CanonicalizeNaN);
+
+    MOZ_ASSERT(useslist.empty());
+
+    for (MUseIterator uses(def->usesBegin()); uses != def->usesEnd();) {
+      MUse* use = *uses++;
+
+      if (!use->consumer()->isDefinition()) {
+        continue;
+      }
+
+      MDefinition* consumer = use->consumer()->toDefinition();
+
+      if (consumer->isRecoveredOnBailout()) {
+        continue;
+      }
+
+      switch (NeedToCanonicalizeNaN(consumer)) {
+        case CanonicalizeNaN::Propagate:
+          if (consumer->isInWorklist()) {
+            continue;
+          }
+
+          JitSpewDef(JitSpew_CanonicalizeNaN, "Add consumer\n", consumer);
+          if (!worklist.append(consumer)) {
+            return false;
+          }
+          consumer->setInWorklist();
+          break;
+        case CanonicalizeNaN::No:
+          JitSpewDef(JitSpew_CanonicalizeNaN, "Skip canonicalize for\n",
+                     consumer);
+          break;
+        case CanonicalizeNaN::Yes: {
+          JitSpewDef(JitSpew_CanonicalizeNaN, "Canonicalize for\n", consumer);
+          MOZ_ASSERT(!consumer->isPhi(),
+                     "useslist is expected to contain no phis");
+
+          if (!useslist.append(use)) {
+            return false;
+          }
+          break;
+        }
+      }
+    }
+
+    if (useslist.empty()) {
+      continue;
+    }
+
+    bool singleUseBlock = true;
+    auto* firstUseBlock = useslist[0]->consumer()->block();
+    for (size_t i = 1; i < useslist.length(); i++) {
+      auto* useBlock = useslist[i]->consumer()->block();
+      if (useBlock != firstUseBlock) {
+        singleUseBlock = false;
+        break;
+      }
+    }
+
+    if (singleUseBlock) {
+      if (!graph.alloc().ensureBallast()) {
+        return false;
+      }
+      auto* canonical = MCanonicalizeNaN::New(graph.alloc(), def);
+
+      if (useslist.length() == 1) {
+        auto* consumer = useslist[0]->consumer()->toDefinition();
+        firstUseBlock->insertBefore(consumer->toInstruction(), canonical);
+      } else if (firstUseBlock == def->block() && def->isInstruction()) {
+        firstUseBlock->insertAfter(def->toInstruction(), canonical);
+      } else {
+        firstUseBlock->insertBefore(*firstUseBlock->begin(), canonical);
+      }
+
+      while (!useslist.empty()) {
+        auto* use = useslist.popCopy();
+        use->replaceProducer(canonical);
+      }
+      continue;
+    }
+
+    if (def->isInstruction()) {
+      if (!graph.alloc().ensureBallast()) {
+        return false;
+      }
+      auto* canonical = MCanonicalizeNaN::New(graph.alloc(), def);
+      def->block()->insertAfter(def->toInstruction(), canonical);
+
+      while (!useslist.empty()) {
+        auto* use = useslist.popCopy();
+        use->replaceProducer(canonical);
+      }
+      continue;
+    }
+
+    if (!philist.append(def->toPhi())) {
+      return false;
+    }
+    useslist.clear();
+  }
+  return true;
+}
+
+static bool CanonicalizeNaNPhis(MIRGraph& graph, PhiList& philist) {
+  while (!philist.empty()) {
+    auto* phi = philist.popCopy();
+
+    JitSpewDef(JitSpew_CanonicalizeNaN, "Process phi\n", phi);
+    JitSpewIndent spewIndent(JitSpew_CanonicalizeNaN);
+
+    for (size_t i = 0, e = phi->numOperands(); i < e; i++) {
+      MDefinition* def = phi->getOperand(i);
+
+      if (!def->isInWorklist()) {
+        JitSpewDef(JitSpew_CanonicalizeNaN, "Skip phi operand\n", def);
+        continue;
+      }
+
+      JitSpewDef(JitSpew_CanonicalizeNaN, "Handle phi operand\n", def);
+
+      if (!graph.alloc().ensureBallast()) {
+        return false;
+      }
+      auto* canonical = MCanonicalizeNaN::New(graph.alloc(), def);
+
+      auto* pred = phi->block()->getPredecessor(i);
+      if (def->block() == pred && def->isInstruction()) {
+        pred->insertAfter(def->toInstruction(), canonical);
+      } else {
+        pred->insertAtEnd(canonical);
+      }
+      phi->replaceOperand(i, canonical);
+    }
+  }
+  return true;
+}
+
+bool jit::CanonicalizeNaNAtUses(const MIRGenerator* mir, MIRGraph& graph) {
+
+  JitSpew(JitSpew_CanonicalizeNaN, "Begin");
+
+  PhiList philist;
+  bool hasSeenFloatingPointLoads = false;
+
+  for (MBasicBlock* block : graph) {
+    if (mir->shouldCancel("CanonicalizeNaN")) {
+      return false;
+    }
+
+    for (MInstruction* ins : *block) {
+      Scalar::Type storageType;
+      if (ins->isLoadUnboxedScalar()) {
+        storageType = ins->toLoadUnboxedScalar()->storageType();
+      } else if (ins->isLoadDataViewElement()) {
+        storageType = ins->toLoadDataViewElement()->storageType();
+      } else {
+        continue;
+      }
+      if (!Scalar::isFloatingType(storageType)) {
+        continue;
+      }
+
+      hasSeenFloatingPointLoads = true;
+
+      if (!CanonicalizeNaNFor(graph, philist, ins)) {
+        return false;
+      }
+    }
+  }
+
+  if (!CanonicalizeNaNPhis(graph, philist)) {
+    return false;
+  }
+
+  if (hasSeenFloatingPointLoads) {
+    for (MBasicBlock* block : graph) {
+      if (mir->shouldCancel("CanonicalizeNaN (unmark)")) {
+        return false;
+      }
+      for (MPhiIterator phi(block->phisBegin()); phi != block->phisEnd();
+           phi++) {
+        phi->setNotInWorklistUnchecked();
+      }
+      for (MInstruction* ins : *block) {
+        ins->setNotInWorklistUnchecked();
+      }
+    }
+  }
+
+  return true;
+}
+
+static bool NeedsKeepAlive(MInstruction* slotsOrElements, MInstruction* use) {
+  MOZ_ASSERT(slotsOrElements->type() == MIRType::Elements ||
+             slotsOrElements->type() == MIRType::Slots);
+
+  if (slotsOrElements->block() != use->block()) {
+    return true;
+  }
+
+  MBasicBlock* block = use->block();
+  MInstructionIterator iter(block->begin(slotsOrElements));
+  MOZ_ASSERT(*iter == slotsOrElements);
+  ++iter;
+
+  while (true) {
+    MInstruction* ins = *iter;
+    switch (ins->op()) {
+      case MDefinition::Opcode::Nop:
+      case MDefinition::Opcode::Constant:
+      case MDefinition::Opcode::KeepAliveObject:
+      case MDefinition::Opcode::Unbox:
+      case MDefinition::Opcode::LoadDynamicSlot:
+      case MDefinition::Opcode::LoadDynamicSlotAndUnbox:
+      case MDefinition::Opcode::StoreDynamicSlot:
+      case MDefinition::Opcode::LoadFixedSlot:
+      case MDefinition::Opcode::LoadFixedSlotAndUnbox:
+      case MDefinition::Opcode::StoreFixedSlot:
+      case MDefinition::Opcode::LoadElement:
+      case MDefinition::Opcode::LoadElementAndUnbox:
+      case MDefinition::Opcode::LoadElementHole:
+      case MDefinition::Opcode::StoreElement:
+      case MDefinition::Opcode::StoreHoleValueElement:
+      case MDefinition::Opcode::LoadUnboxedScalar:
+      case MDefinition::Opcode::StoreUnboxedScalar:
+      case MDefinition::Opcode::StoreTypedArrayElementHole:
+      case MDefinition::Opcode::LoadDataViewElement:
+      case MDefinition::Opcode::StoreDataViewElement:
+      case MDefinition::Opcode::AtomicTypedArrayElementBinop:
+      case MDefinition::Opcode::AtomicExchangeTypedArrayElement:
+      case MDefinition::Opcode::CompareExchangeTypedArrayElement:
+      case MDefinition::Opcode::InitializedLength:
+      case MDefinition::Opcode::SetInitializedLength:
+      case MDefinition::Opcode::ArrayLength:
+      case MDefinition::Opcode::BoundsCheck:
+      case MDefinition::Opcode::GuardElementNotHole:
+      case MDefinition::Opcode::GuardElementsArePacked:
+      case MDefinition::Opcode::InArray:
+      case MDefinition::Opcode::SpectreMaskIndex:
+      case MDefinition::Opcode::Add:
+      case MDefinition::Opcode::DebugEnterGCUnsafeRegion:
+      case MDefinition::Opcode::DebugLeaveGCUnsafeRegion:
+        break;
+      case MDefinition::Opcode::LoadTypedArrayElementHole: {
+        auto* loadIns = ins->toLoadTypedArrayElementHole();
+        if (Scalar::isBigIntType(loadIns->arrayType())) {
+          return true;
+        }
+        break;
+      }
+      default:
+        return true;
+    }
+
+    if (ins == use) {
+      return false;
+    }
+    iter++;
+  }
+
+  MOZ_CRASH("Unreachable");
+}
+
+bool jit::AddKeepAliveInstructions(MIRGraph& graph) {
+  for (MBasicBlockIterator i(graph.begin()); i != graph.end(); i++) {
+    MBasicBlock* block = *i;
+
+    for (MInstructionIterator insIter(block->begin()); insIter != block->end();
+         insIter++) {
+      MInstruction* ins = *insIter;
+      if (ins->type() != MIRType::Elements && ins->type() != MIRType::Slots) {
+        continue;
+      }
+
+      MDefinition* ownerObject;
+      switch (ins->op()) {
+        case MDefinition::Opcode::Elements:
+        case MDefinition::Opcode::ArrayBufferViewElements:
+          MOZ_ASSERT(ins->numOperands() == 1);
+          ownerObject = ins->getOperand(0);
+          break;
+        case MDefinition::Opcode::Slots:
+          ownerObject = ins->toSlots()->object();
+          break;
+        default:
+          MOZ_CRASH("Unexpected op");
+      }
+
+      MOZ_ASSERT(ownerObject->type() == MIRType::Object);
+
+      const MDefinition* unwrapped = ownerObject->skipObjectGuards();
+      if (unwrapped->isConstant() || unwrapped->isNurseryObject()) {
+        continue;
+      }
+
+      for (MUseDefIterator uses(ins); uses; uses++) {
+        MInstruction* use = uses.def()->toInstruction();
+
+        if (use->isStoreElementHole()) {
+          MOZ_ASSERT_IF(!use->toStoreElementHole()->object()->isUnbox() &&
+                            !ownerObject->isUnbox(),
+                        use->toStoreElementHole()->object() == ownerObject);
+          continue;
+        }
+
+        if (!NeedsKeepAlive(ins, use)) {
+#ifdef DEBUG
+          if (!graph.alloc().ensureBallast()) {
+            return false;
+          }
+
+          auto* enter = MDebugEnterGCUnsafeRegion::New(graph.alloc());
+          use->block()->insertAfter(ins, enter);
+
+          auto* leave = MDebugLeaveGCUnsafeRegion::New(graph.alloc());
+          use->block()->insertAfter(use, leave);
+#endif
+          continue;
+        }
+
+        if (!graph.alloc().ensureBallast()) {
+          return false;
+        }
+        MKeepAliveObject* keepAlive =
+            MKeepAliveObject::New(graph.alloc(), ownerObject);
+        use->block()->insertAfter(use, keepAlive);
+      }
+    }
+  }
+
+  return true;
+}
+
+bool LinearSum::multiply(int32_t scale) {
+  for (size_t i = 0; i < terms_.length(); i++) {
+    if (!mozilla::SafeMul(scale, terms_[i].scale, &terms_[i].scale)) {
+      return false;
+    }
+  }
+  return mozilla::SafeMul(scale, constant_, &constant_);
+}
+
+bool LinearSum::add(const LinearSum& other, int32_t scale ) {
+  for (size_t i = 0; i < other.terms_.length(); i++) {
+    int32_t newScale = scale;
+    if (!mozilla::SafeMul(scale, other.terms_[i].scale, &newScale)) {
+      return false;
+    }
+    if (!add(other.terms_[i].term, newScale)) {
+      return false;
+    }
+  }
+  int32_t newConstant = scale;
+  if (!mozilla::SafeMul(scale, other.constant_, &newConstant)) {
+    return false;
+  }
+  return add(newConstant);
+}
+
+bool LinearSum::add(MDefinition* term, int32_t scale) {
+  MOZ_ASSERT(term);
+
+  if (scale == 0) {
+    return true;
+  }
+
+  if (MConstant* termConst = term->maybeConstantValue()) {
+    int32_t constant = termConst->toInt32();
+    if (!mozilla::SafeMul(constant, scale, &constant)) {
+      return false;
+    }
+    return add(constant);
+  }
+
+  for (size_t i = 0; i < terms_.length(); i++) {
+    if (term == terms_[i].term) {
+      if (!mozilla::SafeAdd(scale, terms_[i].scale, &terms_[i].scale)) {
+        return false;
+      }
+      if (terms_[i].scale == 0) {
+        terms_[i] = terms_.back();
+        terms_.popBack();
+      }
+      return true;
+    }
+  }
+
+  AutoEnterOOMUnsafeRegion oomUnsafe;
+  if (!terms_.append(LinearTerm(term, scale))) {
+    oomUnsafe.crash("LinearSum::add");
+  }
+
+  return true;
+}
+
+bool LinearSum::add(int32_t constant) {
+  return mozilla::SafeAdd(constant, constant_, &constant_);
+}
+
+void LinearSum::dump(GenericPrinter& out) const {
+  for (size_t i = 0; i < terms_.length(); i++) {
+    int32_t scale = terms_[i].scale;
+    int32_t id = terms_[i].term->id();
+    MOZ_ASSERT(scale);
+    if (scale > 0) {
+      if (i) {
+        out.printf("+");
+      }
+      if (scale == 1) {
+        out.printf("#%d", id);
+      } else {
+        out.printf("%d*#%d", scale, id);
+      }
+    } else if (scale == -1) {
+      out.printf("-#%d", id);
+    } else {
+      out.printf("%d*#%d", scale, id);
+    }
+  }
+  if (constant_ > 0) {
+    out.printf("+%d", constant_);
+  } else if (constant_ < 0) {
+    out.printf("%d", constant_);
+  }
+}
+
+void LinearSum::dump() const {
+  Fprinter out(stderr);
+  dump(out);
+  out.finish();
+}
+
+MDefinition* jit::ConvertLinearSum(TempAllocator& alloc, MBasicBlock* block,
+                                   const LinearSum& sum,
+                                   BailoutKind bailoutKind) {
+  MDefinition* def = nullptr;
+
+  for (size_t i = 0; i < sum.numTerms(); i++) {
+    LinearTerm term = sum.term(i);
+    MOZ_ASSERT(!term.term->isConstant());
+    if (term.scale == 1) {
+      if (def) {
+        def = MAdd::New(alloc, def, term.term, MIRType::Int32);
+        def->setBailoutKind(bailoutKind);
+        block->insertAtEnd(def->toInstruction());
+        def->computeRange(alloc);
+      } else {
+        def = term.term;
+      }
+    } else if (term.scale == -1) {
+      if (!def) {
+        def = MConstant::NewInt32(alloc, 0);
+        block->insertAtEnd(def->toInstruction());
+        def->computeRange(alloc);
+      }
+      def = MSub::New(alloc, def, term.term, MIRType::Int32);
+      def->setBailoutKind(bailoutKind);
+      block->insertAtEnd(def->toInstruction());
+      def->computeRange(alloc);
+    } else {
+      MOZ_ASSERT(term.scale != 0);
+      MConstant* factor = MConstant::NewInt32(alloc, term.scale);
+      block->insertAtEnd(factor);
+      MMul* mul = MMul::New(alloc, term.term, factor, MIRType::Int32);
+      mul->setBailoutKind(bailoutKind);
+      block->insertAtEnd(mul);
+      mul->computeRange(alloc);
+      if (def) {
+        def = MAdd::New(alloc, def, mul, MIRType::Int32);
+        def->setBailoutKind(bailoutKind);
+        block->insertAtEnd(def->toInstruction());
+        def->computeRange(alloc);
+      } else {
+        def = mul;
+      }
+    }
+  }
+
+  if (!def) {
+    def = MConstant::NewInt32(alloc, 0);
+    block->insertAtEnd(def->toInstruction());
+    def->computeRange(alloc);
+  }
+
+  return def;
+}
+
+size_t jit::MarkLoopBlocks(MIRGraph& graph, const MBasicBlock* header,
+                           bool* canOsr) {
+#ifdef DEBUG
+  for (ReversePostorderIterator i = graph.rpoBegin(), e = graph.rpoEnd();
+       i != e; ++i) {
+    MOZ_ASSERT(!i->isMarked(), "Some blocks already marked");
+  }
+#endif
+
+  MBasicBlock* osrBlock = graph.osrBlock();
+  *canOsr = false;
+
+  MBasicBlock* backedge = header->backedge();
+  backedge->mark();
+  size_t numMarked = 1;
+  for (PostorderIterator i = graph.poBegin(backedge);; ++i) {
+    MOZ_ASSERT(
+        i != graph.poEnd(),
+        "Reached the end of the graph while searching for the loop header");
+    MBasicBlock* block = *i;
+    if (block == header) {
+      break;
+    }
+    if (!block->isMarked()) {
+      continue;
+    }
+
+    for (size_t p = 0, e = block->numPredecessors(); p != e; ++p) {
+      MBasicBlock* pred = block->getPredecessor(p);
+      if (pred->isMarked()) {
+        continue;
+      }
+
+      if (osrBlock && pred != header && osrBlock->dominates(pred) &&
+          !osrBlock->dominates(header)) {
+        *canOsr = true;
+        continue;
+      }
+
+      MOZ_ASSERT(pred->id() >= header->id() && pred->id() <= backedge->id(),
+                 "Loop block not between loop header and loop backedge");
+
+      pred->mark();
+      ++numMarked;
+
+      if (pred->isLoopHeader()) {
+        MBasicBlock* innerBackedge = pred->backedge();
+        if (!innerBackedge->isMarked()) {
+          innerBackedge->mark();
+          ++numMarked;
+
+          if (innerBackedge->id() > block->id()) {
+            i = graph.poBegin(innerBackedge);
+            --i;
+          }
+        }
+      }
+    }
+  }
+
+  if (!header->isMarked()) {
+    jit::UnmarkLoopBlocks(graph, header);
+    return 0;
+  }
+
+  return numMarked;
+}
+
+void jit::UnmarkLoopBlocks(MIRGraph& graph, const MBasicBlock* header) {
+  MBasicBlock* backedge = header->backedge();
+  for (ReversePostorderIterator i = graph.rpoBegin(header);; ++i) {
+    MOZ_ASSERT(i != graph.rpoEnd(),
+               "Reached the end of the graph while searching for the backedge");
+    MBasicBlock* block = *i;
+    if (block->isMarked()) {
+      block->unmark();
+      if (block == backedge) {
+        break;
+      }
+    }
+  }
+
+#ifdef DEBUG
+  for (ReversePostorderIterator i = graph.rpoBegin(), e = graph.rpoEnd();
+       i != e; ++i) {
+    MOZ_ASSERT(!i->isMarked(), "Not all blocks got unmarked");
+  }
+#endif
+}
+
+bool jit::FoldLoadsWithUnbox(const MIRGenerator* mir, MIRGraph& graph) {
+
+  Vector<MInstruction*, 16, SystemAllocPolicy> optimizedElements;
+  for (MBasicBlockIterator block(graph.begin()); block != graph.end();
+       block++) {
+    if (mir->shouldCancel("FoldLoadsWithUnbox")) {
+      return false;
+    }
+
+    for (MInstructionIterator insIter(block->begin());
+         insIter != block->end();) {
+      MInstruction* ins = *insIter;
+      insIter++;
+
+      if (!ins->isLoadFixedSlot() && !ins->isLoadDynamicSlot() &&
+          !ins->isLoadElement() && !ins->isSuperFunction()) {
+        continue;
+      }
+      if (ins->type() != MIRType::Value) {
+        continue;
+      }
+
+      MInstruction* load = ins;
+
+      MDefinition* defUse = load->maybeSingleDefUse();
+      if (!defUse) {
+        continue;
+      }
+      MLexicalCheck* lexicalCheck = nullptr;
+      if (defUse->isLexicalCheck()) {
+        lexicalCheck = defUse->toLexicalCheck();
+        defUse = lexicalCheck->maybeSingleDefUse();
+        if (!defUse) {
+          continue;
+        }
+      }
+      if (!defUse->isUnbox()) {
+        continue;
+      }
+
+      MUnbox* unbox = defUse->toUnbox();
+      if (unbox->block() != *block) {
+        continue;
+      }
+      MOZ_ASSERT_IF(lexicalCheck, lexicalCheck->block() == *block);
+
+      MOZ_ASSERT(!IsMagicType(unbox->type()));
+
+      if ((load->isLoadElement() || lexicalCheck) && !unbox->fallible()) {
+        continue;
+      }
+
+      if (load->isSuperFunction() &&
+          !(unbox->type() == MIRType::Object && unbox->fallible())) {
+        continue;
+      }
+
+      if (!graph.alloc().ensureBallast()) {
+        return false;
+      }
+
+      MIRType type = unbox->type();
+      MUnbox::Mode mode = unbox->mode();
+
+      MInstruction* replacement;
+      switch (load->op()) {
+        case MDefinition::Opcode::LoadFixedSlot: {
+          auto* loadIns = load->toLoadFixedSlot();
+          replacement = MLoadFixedSlotAndUnbox::New(
+              graph.alloc(), loadIns->object(), loadIns->slot(), mode, type,
+              loadIns->usedAsPropertyKey());
+          break;
+        }
+        case MDefinition::Opcode::LoadDynamicSlot: {
+          auto* loadIns = load->toLoadDynamicSlot();
+          replacement = MLoadDynamicSlotAndUnbox::New(
+              graph.alloc(), loadIns->slots(), loadIns->slot(), mode, type,
+              loadIns->usedAsPropertyKey());
+          break;
+        }
+        case MDefinition::Opcode::LoadElement: {
+          auto* loadIns = load->toLoadElement();
+          MOZ_ASSERT(unbox->fallible());
+          replacement = MLoadElementAndUnbox::New(
+              graph.alloc(), loadIns->elements(), loadIns->index(), mode, type);
+          MOZ_ASSERT(!IsMagicType(type));
+          if ((optimizedElements.empty() ||
+               optimizedElements.back() != loadIns) &&
+              !optimizedElements.append(loadIns->elements()->toInstruction())) {
+            return false;
+          }
+          break;
+        }
+        case MDefinition::Opcode::SuperFunction: {
+          auto* loadIns = load->toSuperFunction();
+          MOZ_ASSERT(unbox->fallible());
+          MOZ_ASSERT(unbox->type() == MIRType::Object);
+          replacement =
+              MSuperFunctionAndUnbox::New(graph.alloc(), loadIns->callee());
+          break;
+        }
+        default:
+          MOZ_CRASH("Unexpected instruction");
+      }
+      replacement->setBailoutKind(BailoutKind::UnboxFolding);
+
+      block->insertBefore(load, replacement);
+      unbox->replaceAllUsesWith(replacement);
+      if (lexicalCheck) {
+        lexicalCheck->replaceAllUsesWith(replacement);
+      }
+      load->replaceAllUsesWith(replacement);
+
+      if (lexicalCheck && *insIter == lexicalCheck) {
+        insIter++;
+      }
+      if (*insIter == unbox) {
+        insIter++;
+      }
+      block->discard(unbox);
+      if (lexicalCheck) {
+        block->discard(lexicalCheck);
+      }
+      block->discard(load);
+    }
+  }
+
+  for (auto* elements : optimizedElements) {
+    bool canRemovePackedChecks = true;
+    Vector<MInstruction*, 4, SystemAllocPolicy> guards;
+    for (MUseDefIterator uses(elements); uses; uses++) {
+      MInstruction* use = uses.def()->toInstruction();
+      if (use->isGuardElementsArePacked()) {
+        if (!guards.append(use)) {
+          return false;
+        }
+      } else if (use->isLoadElement()) {
+        if (!use->toLoadElement()->needsHoleCheck()) {
+          canRemovePackedChecks = false;
+          break;
+        }
+      } else if (use->isStoreElement()) {
+        if (!use->toStoreElement()->needsHoleCheck()) {
+          canRemovePackedChecks = false;
+          break;
+        }
+      } else if (use->isLoadElementAndUnbox() || use->isInitializedLength() ||
+                 use->isArrayLength()) {
+        continue;
+      } else {
+        canRemovePackedChecks = false;
+        break;
+      }
+    }
+    if (!canRemovePackedChecks) {
+      continue;
+    }
+    for (auto* guard : guards) {
+      guard->block()->discard(guard);
+    }
+  }
+
+  return true;
+}
+
+static void MakeLoopContiguous(MIRGraph& graph, MBasicBlock* header,
+                               size_t numMarked) {
+  MBasicBlock* backedge = header->backedge();
+
+  MOZ_ASSERT(header->isMarked(), "Loop header is not part of loop");
+  MOZ_ASSERT(backedge->isMarked(), "Loop backedge is not part of loop");
+
+  ReversePostorderIterator insertIter = graph.rpoBegin(backedge);
+  insertIter++;
+  MBasicBlock* insertPt = *insertIter;
+
+  size_t headerId = header->id();
+  size_t inLoopId = headerId;
+  size_t notInLoopId = inLoopId + numMarked;
+  ReversePostorderIterator i = graph.rpoBegin(header);
+  for (;;) {
+    MBasicBlock* block = *i++;
+    MOZ_ASSERT(block->id() >= header->id() && block->id() <= backedge->id(),
+               "Loop backedge should be last block in loop");
+
+    if (block->isMarked()) {
+      block->unmark();
+      block->setId(inLoopId++);
+      if (block == backedge) {
+        break;
+      }
+    } else {
+      graph.moveBlockBefore(insertPt, block);
+      block->setId(notInLoopId++);
+    }
+  }
+  MOZ_ASSERT(header->id() == headerId, "Loop header id changed");
+  MOZ_ASSERT(inLoopId == headerId + numMarked,
+             "Wrong number of blocks kept in loop");
+  MOZ_ASSERT(notInLoopId == (insertIter != graph.rpoEnd() ? insertPt->id()
+                                                          : graph.numBlocks()),
+             "Wrong number of blocks moved out of loop");
+}
+
+bool jit::MakeLoopsContiguous(MIRGraph& graph) {
+  for (MBasicBlockIterator i(graph.begin()); i != graph.end(); i++) {
+    MBasicBlock* header = *i;
+    if (!header->isLoopHeader()) {
+      continue;
+    }
+
+    bool canOsr;
+    size_t numMarked = MarkLoopBlocks(graph, header, &canOsr);
+
+    if (numMarked == 0) {
+      continue;
+    }
+
+    if (canOsr) {
+      UnmarkLoopBlocks(graph, header);
+      continue;
+    }
+
+    MakeLoopContiguous(graph, header, numMarked);
+  }
+
+  return true;
+}
+
+static MDefinition* SkipIterObjectUnbox(MDefinition* ins) {
+  if (ins->isGuardIsNotProxy()) {
+    ins = ins->toGuardIsNotProxy()->input();
+  }
+  if (ins->isUnbox()) {
+    ins = ins->toUnbox()->input();
+  }
+  return ins;
+}
+
+static MDefinition* SkipBox(MDefinition* ins) {
+  if (ins->isBox()) {
+    return ins->toBox()->input();
+  }
+  return ins;
+}
+
+static MObjectToIterator* FindObjectToIteratorUse(MDefinition* ins) {
+  for (MUseIterator use(ins->usesBegin()); use != ins->usesEnd(); use++) {
+    if (!(*use)->consumer()->isDefinition()) {
+      continue;
+    }
+    MDefinition* def = (*use)->consumer()->toDefinition();
+    if (def->isGuardIsNotProxy()) {
+      MObjectToIterator* recursed = FindObjectToIteratorUse(def);
+      if (recursed) {
+        return recursed;
+      }
+    } else if (def->isUnbox()) {
+      MObjectToIterator* recursed = FindObjectToIteratorUse(def);
+      if (recursed) {
+        return recursed;
+      }
+    } else if (def->isObjectToIterator()) {
+      return def->toObjectToIterator();
+    }
+  }
+
+  return nullptr;
+}
+
+using IteratorMoreSet =
+    InlineSet<MIteratorMore*, 8, DefaultHasher<MIteratorMore*>,
+              BackgroundSystemAllocPolicy>;
+
+static bool FindSafeIteratorMoreInstructions(MIRGraph& graph,
+                                             IteratorMoreSet& safeIterMores) {
+
+  using InstructionVector =
+      Vector<MInstruction*, 8, BackgroundSystemAllocPolicy>;
+
+  auto hasDominatingIteratorEnd = [](const InstructionVector& iteratorEnds,
+                                     MInstruction* access) {
+    for (MInstruction* iteratorEnd : iteratorEnds) {
+      if (iteratorEnd->dominates(access)) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  for (MBasicBlockIterator block(graph.begin()); block != graph.end();
+       block++) {
+    for (MInstructionIterator ins(block->begin()); ins != block->end(); ins++) {
+      if (!ins->isObjectToIterator()) {
+        continue;
+      }
+
+      InstructionVector iteratorMores;
+      InstructionVector iteratorEnds;
+      bool hasPhiUse = false;
+
+      for (MUseDefIterator uses(*ins); uses; uses++) {
+        MDefinition* def = uses.def();
+        if (def->isIteratorMore()) {
+          if (!iteratorMores.append(def->toInstruction())) {
+            return false;
+          }
+        } else if (def->isIteratorEnd()) {
+          if (!iteratorEnds.append(def->toInstruction())) {
+            return false;
+          }
+        } else if (def->isLoadIteratorElement() ||
+                   def->isObjectKeysFromIterator() || def->isIteratorLength() ||
+                   def->isPostWriteBarrier() || def->isStoreElement()) {
+          continue;
+        } else if (def->isPhi()) {
+          hasPhiUse = true;
+          break;
+        } else {
+          MOZ_CRASH("Unexpected ObjectToIterator use");
+        }
+      }
+      if (hasPhiUse) {
+        continue;
+      }
+
+      for (MInstruction* iterMore : iteratorMores) {
+        bool hasUnsafeUse = false;
+        for (MUseDefIterator iterMoreUses(iterMore); iterMoreUses;
+             iterMoreUses++) {
+          MDefinition* def = iterMoreUses.def();
+          if (def->isInstruction() &&
+              hasDominatingIteratorEnd(iteratorEnds, def->toInstruction())) {
+            hasUnsafeUse = true;
+            break;
+          }
+        }
+        if (!hasUnsafeUse && !safeIterMores.put(iterMore->toIteratorMore())) {
+          return false;
+        }
+      }
+    }
+  }
+
+  return true;
+}
+
+bool jit::OptimizeIteratorIndices(const MIRGenerator* mir, MIRGraph& graph) {
+  bool changed = false;
+
+  uint32_t numInitialBlocks = graph.numBlockIds();
+  auto hasNoDominatorInfo = [&](MBasicBlock* block) {
+    return block->id() >= numInitialBlocks;
+  };
+
+  IteratorMoreSet safeIteratorMores;
+  if (!FindSafeIteratorMoreInstructions(graph, safeIteratorMores)) {
+    return false;
+  }
+
+  for (ReversePostorderIterator blockIter = graph.rpoBegin();
+       blockIter != graph.rpoEnd();) {
+    MBasicBlock* block = *blockIter++;
+    for (MInstructionIterator insIter(block->begin());
+         insIter != block->end();) {
+      MInstruction* ins = *insIter;
+      insIter++;
+      if (!graph.alloc().ensureBallast()) {
+        return false;
+      }
+
+      MDefinition* receiver = nullptr;
+      MDefinition* idVal = nullptr;
+      MDefinition* setValue = nullptr;
+      if (ins->isMegamorphicHasProp() &&
+          ins->toMegamorphicHasProp()->hasOwn()) {
+        receiver = ins->toMegamorphicHasProp()->object();
+        idVal = ins->toMegamorphicHasProp()->idVal();
+      } else if (ins->isHasOwnCache()) {
+        receiver = ins->toHasOwnCache()->value();
+        idVal = ins->toHasOwnCache()->idval();
+      } else if (ins->isMegamorphicLoadSlotByValue()) {
+        receiver = ins->toMegamorphicLoadSlotByValue()->object();
+        idVal = ins->toMegamorphicLoadSlotByValue()->idVal();
+      } else if (ins->isMegamorphicLoadSlotByValuePermissive()) {
+        receiver = ins->toMegamorphicLoadSlotByValuePermissive()->object();
+        idVal = ins->toMegamorphicLoadSlotByValuePermissive()->idVal();
+      } else if (ins->isGetPropertyCache()) {
+        receiver = ins->toGetPropertyCache()->value();
+        idVal = ins->toGetPropertyCache()->idval();
+      } else if (ins->isMegamorphicSetElement()) {
+        receiver = ins->toMegamorphicSetElement()->object();
+        idVal = ins->toMegamorphicSetElement()->index();
+        setValue = ins->toMegamorphicSetElement()->value();
+      } else if (ins->isSetPropertyCache()) {
+        receiver = ins->toSetPropertyCache()->object();
+        idVal = ins->toSetPropertyCache()->idval();
+        setValue = ins->toSetPropertyCache()->value();
+      }
+
+      if (!receiver) {
+        continue;
+      }
+
+#ifdef JS_CODEGEN_X86
+      bool supportObjectKeys = false;
+#else
+      bool supportObjectKeys = true;
+#endif
+
+      MObjectToIterator* iter = nullptr;
+      MObjectToIterator* otherIter = nullptr;
+      MDefinition* iterElementIndex = nullptr;
+      if (idVal->isIteratorMore()) {
+        auto* iterNext = idVal->toIteratorMore();
+
+        if (!iterNext->iterator()->isObjectToIterator()) {
+          continue;
+        }
+
+        iter = iterNext->iterator()->toObjectToIterator();
+        if (SkipIterObjectUnbox(iter->object()) !=
+            SkipIterObjectUnbox(receiver)) {
+          continue;
+        }
+        if (!safeIteratorMores.has(iterNext)) {
+          continue;
+        }
+      } else if (supportObjectKeys && SkipBox(idVal)->isLoadIteratorElement()) {
+        auto* iterLoad = SkipBox(idVal)->toLoadIteratorElement();
+
+        if (!iterLoad->iter()->isObjectToIterator()) {
+          continue;
+        }
+
+        iter = iterLoad->iter()->toObjectToIterator();
+        if (SkipIterObjectUnbox(iter->object()) !=
+            SkipIterObjectUnbox(receiver)) {
+          if (!setValue) {
+            otherIter = FindObjectToIteratorUse(SkipIterObjectUnbox(receiver));
+          }
+
+          if (!otherIter || hasNoDominatorInfo(block) ||
+              hasNoDominatorInfo(otherIter->block()) ||
+              !otherIter->dominates(ins)) {
+            continue;
+          }
+        }
+        iterElementIndex = iterLoad->index();
+      } else {
+        continue;
+      }
+
+      MOZ_ASSERT_IF(iterElementIndex, supportObjectKeys);
+      MOZ_ASSERT_IF(otherIter, supportObjectKeys);
+
+      MInstruction* indicesCheck = nullptr;
+      if (otherIter) {
+        indicesCheck = MIteratorsMatchAndHaveIndices::New(
+            graph.alloc(), otherIter->object(), iter, otherIter);
+      } else {
+        indicesCheck =
+            MIteratorHasIndices::New(graph.alloc(), iter->object(), iter);
+      }
+
+      MInstruction* replacement;
+      if (ins->isHasOwnCache() || ins->isMegamorphicHasProp()) {
+        MOZ_ASSERT(!setValue);
+        replacement = MConstant::NewBoolean(graph.alloc(), true);
+      } else if (ins->isMegamorphicLoadSlotByValue() ||
+                 ins->isMegamorphicLoadSlotByValuePermissive() ||
+                 ins->isGetPropertyCache()) {
+        MOZ_ASSERT(!setValue);
+        if (iterElementIndex) {
+          replacement = MLoadSlotByIteratorIndexIndexed::New(
+              graph.alloc(), receiver, iter, iterElementIndex);
+        } else {
+          replacement =
+              MLoadSlotByIteratorIndex::New(graph.alloc(), receiver, iter);
+        }
+      } else {
+        MOZ_ASSERT(ins->isMegamorphicSetElement() || ins->isSetPropertyCache());
+        MOZ_ASSERT(setValue);
+        if (iterElementIndex) {
+          replacement = MStoreSlotByIteratorIndexIndexed::New(
+              graph.alloc(), receiver, iter, iterElementIndex, setValue);
+        } else {
+          replacement = MStoreSlotByIteratorIndex::New(graph.alloc(), receiver,
+                                                       iter, setValue);
+        }
+      }
+
+      if (!block->wrapInstructionInFastpath(ins, replacement, indicesCheck)) {
+        return false;
+      }
+
+      iter->setWantsIndices(true);
+      changed = true;
+
+      blockIter = graph.rpoBegin(block->getSuccessor(0)->getSuccessor(0));
+      break;
+    }
+  }
+  if (changed && !AccountForCFGChanges(mir, graph,
+                                       false)) {
+    return false;
+  }
+
+  return true;
+}

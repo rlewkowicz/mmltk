@@ -1,0 +1,64 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SMIL_SMILPARSERUTILS_H_
+#define DOM_SMIL_SMILPARSERUTILS_H_
+
+#include "SMILTimeValue.h"
+#include "nsStringFwd.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+
+class SMILAttr;
+class SMILKeySpline;
+class SMILRepeatCount;
+class SMILTimeValueSpecParams;
+class SMILValue;
+
+namespace dom {
+class SVGAnimationElement;
+}  
+
+class SMILParserUtils {
+ public:
+  class MOZ_STACK_CLASS GenericValueParser {
+   public:
+    virtual bool Parse(const nsAString& aValueStr) = 0;
+  };
+
+  static const nsDependentSubstring TrimWhitespace(const nsAString& aString);
+
+  static bool ParseKeySplines(const nsAString& aSpec,
+                              FallibleTArray<SMILKeySpline>& aKeySplines);
+
+  static bool ParseSemicolonDelimitedProgressList(
+      const nsAString& aSpec, bool aNonDecreasing,
+      FallibleTArray<double>& aArray);
+
+  static bool ParseValues(const nsAString& aSpec,
+                          const mozilla::dom::SVGAnimationElement* aSrcElement,
+                          const SMILAttr& aAttribute,
+                          FallibleTArray<SMILValue>& aValuesArray,
+                          bool& aPreventCachingOfSandwich);
+
+  static bool ParseValuesGeneric(const nsAString& aSpec,
+                                 GenericValueParser& aParser);
+
+  static bool ParseRepeatCount(const nsAString& aSpec,
+                               SMILRepeatCount& aResult);
+
+  static bool ParseTimeValueSpecParams(const nsAString& aSpec,
+                                       SMILTimeValueSpecParams& aResult);
+
+  static bool ParseClockValue(const nsAString& aSpec,
+                              SMILTimeValue::Rounding aRounding,
+                              SMILTimeValue* aResult);
+
+  static int32_t CheckForNegativeNumber(const nsAString& aStr);
+};
+
+}  
+
+#endif  // DOM_SMIL_SMILPARSERUTILS_H_

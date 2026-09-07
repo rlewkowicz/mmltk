@@ -1,0 +1,115 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "SVGPolyElement.h"
+
+#include "DOMSVGPointList.h"
+#include "SVGContentUtils.h"
+#include "mozilla/dom/SVGAnimatedLength.h"
+#include "mozilla/gfx/2D.h"
+
+using namespace mozilla::gfx;
+
+namespace mozilla::dom {
+
+
+SVGPolyElement::SVGPolyElement(
+    already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo)
+    : SVGPolyElementBase(std::move(aNodeInfo)) {}
+
+already_AddRefed<DOMSVGPointList> SVGPolyElement::Points() {
+  return DOMSVGPointList::GetDOMWrapper(mPoints.GetBaseValKey(), this);
+}
+
+already_AddRefed<DOMSVGPointList> SVGPolyElement::AnimatedPoints() {
+  return DOMSVGPointList::GetDOMWrapper(mPoints.GetAnimValKey(), this);
+}
+
+
+bool SVGPolyElement::HasValidDimensions() const {
+  return !mPoints.GetAnimValue().IsEmpty();
+}
+
+
+bool SVGPolyElement::AttributeDefinesGeometry(const nsAtom* aName) {
+  return aName == nsGkAtoms::points || aName == nsGkAtoms::pathLength;
+}
+
+void SVGPolyElement::GetMarkPoints(nsTArray<SVGMark>* aMarks) {
+  const SVGPointList& points = mPoints.GetAnimValue();
+
+  if (points.IsEmpty()) {
+    return;
+  }
+
+  float zoom = UserSpaceMetrics::GetZoom(this);
+
+  Point prevPos = points[0] * zoom;
+  float prevAngle = 0.0f;
+  if (!prevPos.IsFinite()) {
+    return;
+  }
+
+  aMarks->AppendElement(SVGMark(prevPos, 0, SVGMark::Type::Start));
+
+  for (uint32_t i = 1; i < points.Length(); ++i) {
+    gfx::Point pos = points[i] * zoom;
+    if (!pos.IsFinite()) {
+      aMarks->Clear();
+      return;
+    }
+    float angle = std::atan2(pos.y - prevPos.y, pos.x - prevPos.x);
+
+    if (i == 1) {
+      aMarks->ElementAt(0).angle = angle;
+    } else {
+      aMarks->LastElement().angle =
+          SVGContentUtils::AngleBisect(prevAngle, angle);
+    }
+
+    aMarks->AppendElement(SVGMark(pos, 0, SVGMark::Type::Mid));
+
+    prevAngle = angle;
+    prevPos = pos;
+  }
+
+  aMarks->LastElement().angle = prevAngle;
+  aMarks->LastElement().type = SVGMark::Type::End;
+}
+
+bool SVGPolyElement::GetGeometryBounds(Rect* aBounds,
+                                       const StrokeOptions& aStrokeOptions,
+                                       const Matrix& aToBoundsSpace,
+                                       const Matrix* aToNonScalingStrokeSpace) {
+  const SVGPointList& points = mPoints.GetAnimValue();
+
+  if (points.IsEmpty()) {
+    aBounds->SetEmpty();
+    return true;
+  }
+
+  if (aStrokeOptions.mLineWidth > 0 || aToNonScalingStrokeSpace) {
+    return false;
+  }
+
+  float zoom = UserSpaceMetrics::GetZoom(this);
+
+  if (aToBoundsSpace.IsRectilinear()) {
+
+    Rect bounds(Point(points[0]) * zoom, Size());
+    for (uint32_t i = 1; i < points.Length(); ++i) {
+      bounds.ExpandToEnclose(Point(points[i]) * zoom);
+    }
+    *aBounds = aToBoundsSpace.TransformBounds(bounds);
+  } else {
+    *aBounds =
+        Rect(aToBoundsSpace.TransformPoint(Point(points[0]) * zoom), Size());
+    for (uint32_t i = 1; i < points.Length(); ++i) {
+      aBounds->ExpandToEnclose(
+          aToBoundsSpace.TransformPoint(Point(points[i]) * zoom));
+    }
+  }
+  return aBounds->IsFinite();
+}
+}  

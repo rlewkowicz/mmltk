@@ -1,0 +1,307 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_NotNull_h
+#define mozilla_NotNull_h
+
+
+#include <cstddef>
+#include <type_traits>
+#include <utility>
+
+#include "mozilla/Assertions.h"
+
+namespace mozilla {
+
+namespace detail {
+template <typename T>
+struct CopyablePtr {
+  T mPtr;
+
+  template <typename U>
+  explicit CopyablePtr(U&& aPtr) : mPtr{std::forward<U>(aPtr)} {}
+
+  template <typename U>
+  explicit CopyablePtr(CopyablePtr<U> aPtr) : mPtr{std::move(aPtr.mPtr)} {}
+};
+}  
+
+template <typename T>
+class MovingNotNull;
+
+template <typename T>
+class NotNull {
+  template <typename U>
+  friend constexpr NotNull<U> WrapNotNull(U aBasePtr);
+  template <typename U>
+  friend constexpr NotNull<U> WrapNotNullUnchecked(U aBasePtr);
+  template <typename U, typename... Args>
+  friend constexpr NotNull<U> MakeNotNull(Args&&... aArgs);
+  template <typename U>
+  friend class NotNull;
+
+  detail::CopyablePtr<T> mBasePtr;
+
+  template <typename U>
+  constexpr explicit NotNull(U aBasePtr) : mBasePtr(T{std::move(aBasePtr)}) {
+    static_assert(sizeof(T) == sizeof(NotNull<T>),
+                  "NotNull must have zero space overhead.");
+    static_assert(offsetof(NotNull<T>, mBasePtr) == 0,
+                  "mBasePtr must have zero offset.");
+  }
+
+ public:
+  NotNull() = delete;
+
+  template <typename U,
+            typename = std::enable_if_t<std::is_convertible_v<const U&, T>>>
+  constexpr MOZ_IMPLICIT NotNull(const NotNull<U>& aOther)
+      : mBasePtr(aOther.mBasePtr) {}
+
+  template <typename U,
+            typename = std::enable_if_t<std::is_convertible_v<U&&, T>>>
+  constexpr MOZ_IMPLICIT NotNull(MovingNotNull<U>&& aOther)
+      : mBasePtr(std::move(aOther).unwrapBasePtr()) {}
+
+  explicit operator bool() const = delete;
+
+  constexpr const T& get() const { return mBasePtr.mPtr; }
+
+  constexpr operator const T&() const { return get(); }
+
+  template <typename U,
+            std::enable_if_t<!std::is_pointer_v<T> &&
+                                 std::is_convertible_v<const T&, U*>,
+                             int> = 0>
+  constexpr operator U*() const& {
+    return get();
+  }
+
+  template <typename U,
+            std::enable_if_t<!std::is_pointer_v<T> &&
+                                 std::is_convertible_v<const T&, U*> &&
+                                 !std::is_convertible_v<const T&&, U*>,
+                             int> = 0>
+  constexpr operator U*() const&& = delete;
+
+  constexpr auto* operator->() const MOZ_NONNULL_RETURN {
+    return mBasePtr.mPtr.operator->();
+  }
+  constexpr decltype(*mBasePtr.mPtr) operator*() const {
+    return *mBasePtr.mPtr;
+  }
+
+  NotNull(const NotNull&) = default;
+  NotNull& operator=(const NotNull&) = default;
+};
+
+template <typename T>
+class NotNull<T*> {
+  template <typename U>
+  friend constexpr NotNull<U> WrapNotNull(U aBasePtr);
+  template <typename U>
+  friend constexpr NotNull<U*> WrapNotNullUnchecked(U* aBasePtr);
+  template <typename U, typename... Args>
+  friend constexpr NotNull<U> MakeNotNull(Args&&... aArgs);
+  template <typename U>
+  friend class NotNull;
+
+  T* mBasePtr;
+
+  template <typename U>
+  constexpr explicit NotNull(U* aBasePtr) : mBasePtr(aBasePtr) {}
+
+ public:
+  NotNull() = delete;
+
+  template <typename U,
+            typename = std::enable_if_t<std::is_convertible_v<const U&, T*>>>
+  constexpr MOZ_IMPLICIT NotNull(const NotNull<U>& aOther)
+      : mBasePtr(aOther.get()) {
+    static_assert(sizeof(T*) == sizeof(NotNull<T*>),
+                  "NotNull must have zero space overhead.");
+    static_assert(offsetof(NotNull<T*>, mBasePtr) == 0,
+                  "mBasePtr must have zero offset.");
+  }
+
+  template <typename U,
+            typename = std::enable_if_t<std::is_convertible_v<U&&, T*>>>
+  constexpr MOZ_IMPLICIT NotNull(MovingNotNull<U>&& aOther)
+      : mBasePtr(NotNull{std::move(aOther)}) {}
+
+  explicit operator bool() const = delete;
+
+  constexpr T* get() const MOZ_NONNULL_RETURN { return mBasePtr; }
+
+  constexpr operator T*() const MOZ_NONNULL_RETURN { return get(); }
+
+  constexpr T* operator->() const MOZ_NONNULL_RETURN { return get(); }
+  constexpr T& operator*() const { return *mBasePtr; }
+};
+
+template <typename T>
+constexpr NotNull<T> WrapNotNull(T aBasePtr) {
+  MOZ_RELEASE_ASSERT(aBasePtr);
+  return NotNull<T>{std::move(aBasePtr)};
+}
+
+template <typename T>
+constexpr NotNull<T> WrapNotNullUnchecked(T aBasePtr) {
+  return NotNull<T>{std::move(aBasePtr)};
+}
+
+template <typename T>
+MOZ_NONNULL(1)
+constexpr NotNull<T*> WrapNotNullUnchecked(T* const aBasePtr) {
+#if defined(__clang__)
+#  pragma clang diagnostic push
+#  pragma clang diagnostic ignored "-Wpointer-bool-conversion"
+#elif defined(__GNUC__)
+#  pragma GCC diagnostic push
+#  pragma GCC diagnostic ignored "-Wnonnull-compare"
+#endif
+  MOZ_ASSERT(aBasePtr);
+#if defined(__clang__)
+#  pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#  pragma GCC diagnostic pop
+#endif
+  return NotNull<T*>{aBasePtr};
+}
+
+template <typename T>
+class MOZ_NON_AUTOABLE MovingNotNull {
+  template <typename U>
+  friend constexpr MovingNotNull<U> WrapMovingNotNullUnchecked(U aBasePtr);
+
+  T mBasePtr;
+#ifdef DEBUG
+  bool mConsumed = false;
+#endif
+
+  template <typename U>
+  constexpr explicit MovingNotNull(U aBasePtr) : mBasePtr{std::move(aBasePtr)} {
+#ifndef DEBUG
+    static_assert(sizeof(T) == sizeof(MovingNotNull<T>),
+                  "NotNull must have zero space overhead.");
+#endif
+    static_assert(offsetof(MovingNotNull<T>, mBasePtr) == 0,
+                  "mBasePtr must have zero offset.");
+  }
+
+ public:
+  MovingNotNull() = delete;
+
+  MOZ_IMPLICIT MovingNotNull(const NotNull<T>& aSrc) : mBasePtr(aSrc.get()) {}
+
+  template <typename U,
+            typename = std::enable_if_t<std::is_convertible_v<U, T>>>
+  MOZ_IMPLICIT MovingNotNull(const NotNull<U>& aSrc) : mBasePtr(aSrc.get()) {}
+
+  template <typename U,
+            typename = std::enable_if_t<std::is_convertible_v<U, T>>>
+  MOZ_IMPLICIT MovingNotNull(MovingNotNull<U>&& aSrc)
+      : mBasePtr(std::move(aSrc).unwrapBasePtr()) {}
+
+  MOZ_IMPLICIT operator T() && { return std::move(*this).unwrapBasePtr(); }
+
+  MOZ_IMPLICIT operator NotNull<T>() && { return std::move(*this).unwrap(); }
+
+  NotNull<T> unwrap() && {
+    return WrapNotNullUnchecked(std::move(*this).unwrapBasePtr());
+  }
+
+  T unwrapBasePtr() && {
+#ifdef DEBUG
+    MOZ_ASSERT(!mConsumed);
+    mConsumed = true;
+#endif
+    return std::move(mBasePtr);
+  }
+
+  MovingNotNull(MovingNotNull&&) = default;
+  MovingNotNull& operator=(MovingNotNull&&) = default;
+};
+
+template <typename T>
+constexpr MovingNotNull<T> WrapMovingNotNullUnchecked(T aBasePtr) {
+  return MovingNotNull<T>{std::move(aBasePtr)};
+}
+
+template <typename T>
+constexpr MovingNotNull<T> WrapMovingNotNull(T aBasePtr) {
+  MOZ_RELEASE_ASSERT(aBasePtr);
+  return WrapMovingNotNullUnchecked(std::move(aBasePtr));
+}
+
+namespace detail {
+
+template <typename Pointer>
+struct PointedTo {
+  using Type = std::remove_reference_t<decltype(*std::declval<Pointer>())>;
+  using NonConstType = std::remove_const_t<Type>;
+};
+
+template <typename T>
+struct PointedTo<T*> {
+  using Type = T;
+  using NonConstType = T;
+};
+
+template <typename T>
+struct PointedTo<const T*> {
+  using Type = const T;
+  using NonConstType = T;
+};
+
+}  
+
+template <typename T, typename... Args>
+constexpr NotNull<T> MakeNotNull(Args&&... aArgs) {
+  using Pointee = typename detail::PointedTo<T>::NonConstType;
+  static_assert(!std::is_array_v<Pointee>,
+                "MakeNotNull cannot construct an array");
+  return NotNull<T>(new Pointee(std::forward<Args>(aArgs)...));
+}
+
+template <typename T, typename U>
+constexpr bool operator==(const NotNull<T>& aLhs, const NotNull<U>& aRhs) {
+  return aLhs.get() == aRhs.get();
+}
+template <typename T, typename U>
+constexpr bool operator!=(const NotNull<T>& aLhs, const NotNull<U>& aRhs) {
+  return aLhs.get() != aRhs.get();
+}
+
+template <typename T, typename U>
+constexpr bool operator==(const NotNull<T>& aLhs, const U& aRhs) {
+  return aLhs.get() == aRhs;
+}
+template <typename T, typename U>
+constexpr bool operator!=(const NotNull<T>& aLhs, const U& aRhs) {
+  return aLhs.get() != aRhs;
+}
+
+template <typename T, typename U>
+constexpr bool operator==(const T& aLhs, const NotNull<U>& aRhs) {
+  return aLhs == aRhs.get();
+}
+template <typename T, typename U>
+constexpr bool operator!=(const T& aLhs, const NotNull<U>& aRhs) {
+  return aLhs != aRhs.get();
+}
+
+template <typename T>
+bool operator==(const NotNull<T>&, std::nullptr_t) = delete;
+template <typename T>
+bool operator!=(const NotNull<T>&, std::nullptr_t) = delete;
+
+template <typename T>
+bool operator==(std::nullptr_t, const NotNull<T>&) = delete;
+template <typename T>
+bool operator!=(std::nullptr_t, const NotNull<T>&) = delete;
+
+}  
+
+#endif /* mozilla_NotNull_h */

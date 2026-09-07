@@ -1,0 +1,109 @@
+/*
+ * Copyright 2008 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+
+#if !defined(SkPtrSet_DEFINED)
+#define SkPtrSet_DEFINED
+
+#include "include/core/SkFlattenable.h"
+#include "include/core/SkRefCnt.h"
+#include "include/private/base/SkTDArray.h"
+
+#include <cstdint>
+
+class SkPtrSet : public SkRefCnt {
+public:
+
+
+    uint32_t find(void*) const;
+
+    uint32_t add(void*);
+
+    int count() const { return fList.size(); }
+
+    void copyToArray(void* array[]) const;
+
+    void reset();
+
+    class Iter {
+    public:
+        Iter(const SkPtrSet& set)
+            : fSet(set)
+            , fIndex(0) {}
+
+        void* next() {
+            return fIndex < fSet.fList.size() ? fSet.fList[fIndex++].fPtr : nullptr;
+        }
+
+    private:
+        const SkPtrSet& fSet;
+        int             fIndex;
+    };
+
+protected:
+    virtual void incPtr(void*) {}
+    virtual void decPtr(void*) {}
+
+private:
+    struct Pair {
+        void*       fPtr;   
+        uint32_t    fIndex; 
+    };
+
+    SkTDArray<Pair>  fList;
+
+    static bool Less(const Pair& a, const Pair& b);
+
+    using INHERITED = SkRefCnt;
+};
+
+template <typename T> class SkTPtrSet : public SkPtrSet {
+public:
+    uint32_t find(T ptr) {
+        return this->INHERITED::find((void*)ptr);
+    }
+    uint32_t add(T ptr) {
+        return this->INHERITED::add((void*)ptr);
+    }
+
+    void copyToArray(T* array) const {
+        this->INHERITED::copyToArray((void**)array);
+    }
+
+private:
+    using INHERITED = SkPtrSet;
+};
+
+class SkRefCntSet : public SkTPtrSet<SkRefCnt*> {
+public:
+    ~SkRefCntSet() override;
+
+protected:
+    void incPtr(void*) override;
+    void decPtr(void*) override;
+};
+
+class SkFactorySet : public SkTPtrSet<SkFlattenable::Factory> {};
+
+class SkNamedFactorySet : public SkRefCnt {
+public:
+
+
+    SkNamedFactorySet();
+
+    uint32_t find(SkFlattenable::Factory);
+
+    const char* getNextAddedFactoryName();
+private:
+    int                    fNextAddedFactory;
+    SkFactorySet           fFactorySet;
+    SkTDArray<const char*> fNames;
+
+    using INHERITED = SkRefCnt;
+};
+
+#endif

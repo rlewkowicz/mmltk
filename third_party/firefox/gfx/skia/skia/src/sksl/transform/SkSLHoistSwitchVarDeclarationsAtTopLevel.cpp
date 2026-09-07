@@ -1,0 +1,120 @@
+/*
+ * Copyright 2023 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "include/private/base/SkAssert.h"
+#include "include/private/base/SkTArray.h"
+#include "src/sksl/SkSLAnalysis.h"
+#include "src/sksl/SkSLDefines.h"
+#include "src/sksl/SkSLPosition.h"
+#include "src/sksl/ir/SkSLBlock.h"
+#include "src/sksl/ir/SkSLExpression.h"
+#include "src/sksl/ir/SkSLIRHelpers.h"
+#include "src/sksl/ir/SkSLIRNode.h"
+#include "src/sksl/ir/SkSLModifierFlags.h"
+#include "src/sksl/ir/SkSLNop.h"
+#include "src/sksl/ir/SkSLStatement.h"
+#include "src/sksl/ir/SkSLSymbolTable.h"
+#include "src/sksl/ir/SkSLVarDeclarations.h"
+#include "src/sksl/ir/SkSLVariable.h"
+#include "src/sksl/transform/SkSLProgramWriter.h"
+#include "src/sksl/transform/SkSLTransform.h"
+
+#include <memory>
+#include <utility>
+
+using namespace skia_private;
+
+namespace SkSL {
+
+class Context;
+
+std::unique_ptr<Block> Transform::HoistSwitchVarDeclarationsAtTopLevel(const Context& context,
+                                                                       StatementArray& cases,
+                                                                       SymbolTable& switchSymbols,
+                                                                       Position pos) {
+    struct HoistSwitchVarDeclsVisitor : public ProgramWriter {
+        HoistSwitchVarDeclsVisitor(const Context& c) : fContext(c) {}
+
+        bool visitExpressionPtr(std::unique_ptr<Expression>& expr) override {
+            return false;
+        }
+
+        bool visitStatementPtr(std::unique_ptr<Statement>& stmt) override {
+            switch (stmt->kind()) {
+                case StatementKind::kSwitchCase:
+                    return INHERITED::visitStatementPtr(stmt);
+
+                case StatementKind::kBlock:
+                    if (!stmt->as<Block>().isScope()) {
+                        return INHERITED::visitStatementPtr(stmt);
+                    }
+                    break;
+
+                case StatementKind::kVarDeclaration:
+                    fVarDeclarations.push_back(&stmt);
+                    break;
+
+                default:
+                    break;
+            }
+
+            return false;
+        }
+
+        const Context& fContext;
+        TArray<std::unique_ptr<Statement>*> fVarDeclarations;
+
+        using INHERITED = ProgramWriter;
+    };
+
+    HoistSwitchVarDeclsVisitor visitor(context);
+    for (std::unique_ptr<Statement>& sc : cases) {
+        visitor.visitStatementPtr(sc);
+    }
+
+    if (visitor.fVarDeclarations.empty()) {
+        return nullptr;
+    }
+
+    std::unique_ptr<SymbolTable> blockSymbols = switchSymbols.insertNewParent();
+
+    StatementArray blockStmts;
+    blockStmts.reserve_exact(visitor.fVarDeclarations.size() + 1);
+    for (std::unique_ptr<Statement>* innerDeclaration : visitor.fVarDeclarations) {
+        VarDeclaration& decl = (*innerDeclaration)->as<VarDeclaration>();
+        Variable* var = decl.var();
+        bool isConst = var->modifierFlags().isConst();
+
+        std::unique_ptr<Statement> replacementStmt;
+        if (decl.value() && !isConst) {
+            struct AssignmentHelper : public IRHelpers {
+                using IRHelpers::IRHelpers;
+
+                std::unique_ptr<Statement> makeAssignmentStmt(VarDeclaration& decl) const {
+                    return Assign(Ref(decl.var()), std::move(decl.value()));
+                }
+            };
+
+            AssignmentHelper helper(context);
+            replacementStmt = helper.makeAssignmentStmt(decl);
+        } else {
+            SkASSERT(!isConst || Analysis::IsConstantExpression(*decl.value()));
+
+            replacementStmt = Nop::Make();
+        }
+
+        blockStmts.push_back(std::move(*innerDeclaration));
+        *innerDeclaration = std::move(replacementStmt);
+
+        switchSymbols.moveSymbolTo(blockSymbols.get(), var, context);
+    }
+
+    return Block::MakeBlock(pos, std::move(blockStmts), Block::Kind::kBracedScope,
+                            std::move(blockSymbols));
+}
+
+}  

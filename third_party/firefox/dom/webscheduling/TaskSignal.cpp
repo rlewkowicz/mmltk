@@ -1,0 +1,70 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "TaskSignal.h"
+
+#include "WebTaskScheduler.h"
+
+namespace mozilla::dom {
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED(TaskSignal, AbortSignal,
+                                   mDependentTaskSignals)
+
+NS_IMPL_ISUPPORTS_CYCLE_COLLECTION_INHERITED_0(TaskSignal, AbortSignal)
+
+already_AddRefed<TaskSignal> TaskSignal::Create(nsIGlobalObject* aGlobalObject,
+                                                TaskPriority aPriority) {
+  return do_AddRef(new TaskSignal(aGlobalObject, aPriority));
+}
+
+void TaskSignal::RunPriorityChangeAlgorithms() {
+  for (const WeakPtr<WebTaskScheduler>& scheduler : mSchedulers) {
+    if (scheduler) {
+      scheduler->RunTaskSignalPriorityChange(this);
+    }
+  }
+}
+void TaskSignal::SetWebTaskScheduler(WebTaskScheduler* aScheduler) {
+  mSchedulers.AppendElement(aScheduler);
+}
+
+already_AddRefed<TaskSignal> TaskSignal::Any(
+    GlobalObject& aGlobal, const Sequence<OwningNonNull<AbortSignal>>& aSignals,
+    const TaskSignalAnyInit& aInit) {
+  nsCOMPtr<nsIGlobalObject> global = do_QueryInterface(aGlobal.GetAsSupports());
+  RefPtr<AbortSignal> abortSignal =
+      AbortSignal::Any(global, aSignals, [](nsIGlobalObject* aGlobal) {
+        RefPtr<TaskSignal> signal =
+            new TaskSignal(aGlobal, TaskPriority::User_visible);
+        return signal.forget();
+      });
+
+  if (!abortSignal) {
+    return nullptr;
+  }
+
+  RefPtr<TaskSignal> resultSignal = static_cast<TaskSignal*>(abortSignal.get());
+
+  resultSignal->mDependent = true;
+
+  if (aInit.mPriority.IsTaskPriority()) {
+    resultSignal->SetPriority(aInit.mPriority.GetAsTaskPriority());
+    return resultSignal.forget();
+  }
+
+  OwningNonNull<TaskSignal> sourceSignal = aInit.mPriority.GetAsTaskSignal();
+
+  resultSignal->SetPriority(sourceSignal->Priority());
+
+  if (!sourceSignal->HasFixedPriority()) {
+    if (sourceSignal->mDependent) {
+      sourceSignal = sourceSignal->mSourceTaskSignal;
+    }
+    MOZ_ASSERT(!sourceSignal->mDependent);
+    resultSignal->mSourceTaskSignal = sourceSignal;
+    sourceSignal->mDependentTaskSignals.AppendElement(resultSignal);
+  }
+  return resultSignal.forget();
+}
+}  

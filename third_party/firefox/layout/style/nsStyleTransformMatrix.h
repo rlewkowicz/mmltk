@@ -1,0 +1,124 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsStyleTransformMatrix_h_
+#define nsStyleTransformMatrix_h_
+
+#include "Units.h"  // for CSSPoint
+#include "mozilla/ServoStyleConsts.h"
+#include "mozilla/gfx/Matrix.h"
+
+class nsIFrame;
+class nsPresContext;
+struct gfxQuaternion;
+struct nsRect;
+
+namespace mozilla {
+struct ResolvedMotionPathData;
+}  
+
+namespace nsStyleTransformMatrix {
+enum class MatrixTransformOperator : uint8_t { Interpolate, Accumulate };
+
+class MOZ_STACK_CLASS TransformReferenceBox final {
+ public:
+  typedef nscoord (TransformReferenceBox::*DimensionGetter)();
+
+  TransformReferenceBox() = default;
+
+  explicit TransformReferenceBox(const nsIFrame* aFrame) : mFrame(aFrame) {
+    MOZ_ASSERT(mFrame);
+  }
+
+  TransformReferenceBox(const nsIFrame* aFrame,
+                        const nsRect& aFallbackDimensions) {
+    mFrame = aFrame;
+    if (!mFrame) {
+      Init(aFallbackDimensions);
+    }
+  }
+
+  TransformReferenceBox(const TransformReferenceBox&) = delete;
+
+  void Init(const nsIFrame* aFrame) {
+    MOZ_ASSERT(!mFrame && !mIsCached);
+    mFrame = aFrame;
+  }
+
+  void Init(const nsRect& aDimensions) {
+    MOZ_ASSERT(!mFrame && !mIsCached);
+    mBox = aDimensions;
+    mIsCached = true;
+  }
+
+  nscoord X() {
+    EnsureDimensionsAreCached();
+    return mBox.X();
+  }
+  nscoord Y() {
+    EnsureDimensionsAreCached();
+    return mBox.Y();
+  }
+
+  nscoord Width() {
+    EnsureDimensionsAreCached();
+    return mBox.Width();
+  }
+  nscoord Height() {
+    EnsureDimensionsAreCached();
+    return mBox.Height();
+  }
+
+  bool IsEmpty() { return !mFrame; }
+
+ private:
+  void EnsureDimensionsAreCached();
+
+  const nsIFrame* mFrame = nullptr;
+  nsRect mBox;
+  bool mIsCached = false;
+};
+
+float ProcessTranslatePart(
+    const mozilla::LengthPercentage& aValue, TransformReferenceBox* aRefBox,
+    TransformReferenceBox::DimensionGetter aDimensionGetter = nullptr);
+
+void ProcessInterpolateMatrix(mozilla::gfx::Matrix4x4& aMatrix,
+                              const mozilla::StyleTransformOperation& aOp,
+                              TransformReferenceBox& aBounds,
+                              mozilla::StyleZoom aEffectiveZoom);
+
+void ProcessAccumulateMatrix(mozilla::gfx::Matrix4x4& aMatrix,
+                             const mozilla::StyleTransformOperation& aOp,
+                             TransformReferenceBox& aBounds,
+                             mozilla::StyleZoom aEffectiveZoom);
+
+mozilla::gfx::Matrix4x4 ReadTransforms(const mozilla::StyleTransform& aList,
+                                       TransformReferenceBox& aBounds,
+                                       float aAppUnitsPerMatrixUnit,
+                                       mozilla::StyleZoom aEffectiveZoom);
+
+mozilla::gfx::Matrix4x4 ReadTransforms(
+    const mozilla::StyleTranslate&, const mozilla::StyleRotate&,
+    const mozilla::StyleScale&, const mozilla::ResolvedMotionPathData* aMotion,
+    const mozilla::StyleTransform&, TransformReferenceBox& aRefBox,
+    float aAppUnitsPerMatrixUnit, mozilla::StyleZoom aEffectiveZoom);
+
+mozilla::CSSPoint Convert2DPosition(const mozilla::LengthPercentage& aX,
+                                    const mozilla::LengthPercentage& aY,
+                                    const mozilla::CSSSize& aSize);
+
+mozilla::CSSPoint Convert2DPosition(const mozilla::LengthPercentage& aX,
+                                    const mozilla::LengthPercentage& aY,
+                                    TransformReferenceBox& aRefBox);
+
+mozilla::gfx::Point Convert2DPosition(const mozilla::LengthPercentage& aX,
+                                      const mozilla::LengthPercentage& aY,
+                                      TransformReferenceBox& aRefBox,
+                                      int32_t aAppUnitsPerDevPixel);
+
+}  
+
+#endif

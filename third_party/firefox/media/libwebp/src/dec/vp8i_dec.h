@@ -1,0 +1,231 @@
+// Copyright 2010 Google Inc. All Rights Reserved.
+// Use of this source code is governed by a BSD-style license
+
+#if !defined(WEBP_DEC_VP8I_DEC_H_)
+#define WEBP_DEC_VP8I_DEC_H_
+
+#include <string.h>     // for memcpy()
+
+#include "src/dec/common_dec.h"
+#include "src/dec/vp8_dec.h"
+#include "src/dec/vp8li_dec.h"
+#include "src/dec/webpi_dec.h"
+#include "src/dsp/dsp.h"
+#include "src/utils/bit_reader_utils.h"
+#include "src/utils/random_utils.h"
+#include "src/utils/thread_utils.h"
+#include "src/webp/decode.h"
+#include "src/webp/types.h"
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+
+#define DEC_MAJ_VERSION 1
+#define DEC_MIN_VERSION 6
+#define DEC_REV_VERSION 0
+
+#define YUV_SIZE (BPS * 17 + BPS * 9)
+#define Y_OFF    (BPS * 1 + 8)
+#define U_OFF    (Y_OFF + BPS * 16 + BPS)
+#define V_OFF    (U_OFF + 16)
+
+#define MIN_WIDTH_FOR_THREADS 512
+
+
+typedef struct {
+  uint8_t key_frame;
+  uint8_t profile;
+  uint8_t show;
+  uint32_t partition_length;
+} VP8FrameHeader;
+
+typedef struct {
+  uint16_t width;
+  uint16_t height;
+  uint8_t xscale;
+  uint8_t yscale;
+  uint8_t colorspace;   
+  uint8_t clamp_type;
+} VP8PictureHeader;
+
+typedef struct {
+  int use_segment;
+  int update_map;        
+  int absolute_delta;    
+  int8_t quantizer[NUM_MB_SEGMENTS];        
+  int8_t filter_strength[NUM_MB_SEGMENTS];  
+} VP8SegmentHeader;
+
+typedef uint8_t VP8ProbaArray[NUM_PROBAS];
+
+typedef struct {   
+  VP8ProbaArray probas[NUM_CTX];
+} VP8BandProbas;
+
+typedef struct {
+  uint8_t segments[MB_FEATURE_TREE_PROBS];
+  VP8BandProbas bands[NUM_TYPES][NUM_BANDS];
+  const VP8BandProbas* bands_ptr[NUM_TYPES][16 + 1];
+} VP8Proba;
+
+typedef struct {
+  int simple;                  
+  int level;                   
+  int sharpness;               
+  int use_lf_delta;
+  int ref_lf_delta[NUM_REF_LF_DELTAS];
+  int mode_lf_delta[NUM_MODE_LF_DELTAS];
+} VP8FilterHeader;
+
+
+typedef struct {  
+  uint8_t f_limit;      
+  uint8_t f_ilevel;     
+  uint8_t f_inner;      
+  uint8_t hev_thresh;   
+} VP8FInfo;
+
+typedef struct {  
+  uint8_t nz;        
+  uint8_t nz_dc;     
+} VP8MB;
+
+typedef int quant_t[2];      
+typedef struct {
+  quant_t y1_mat, y2_mat, uv_mat;
+
+  int uv_quant;   
+  int dither;     
+} VP8QuantMatrix;
+
+typedef struct {
+  int16_t coeffs[384];   
+  uint8_t is_i4x4;       
+  uint8_t imodes[16];    
+  uint8_t uvmode;        
+  uint32_t non_zero_y;
+  uint32_t non_zero_uv;
+  uint8_t dither;      
+  uint8_t skip;
+  uint8_t segment;
+} VP8MBData;
+
+typedef struct {
+  int id;              
+  int mb_y;            
+  int filter_row;      
+  VP8FInfo* f_info;    
+  VP8MBData* mb_data;  
+  VP8Io io;            
+} VP8ThreadContext;
+
+typedef struct {
+  uint8_t y[16], u[8], v[8];
+} VP8TopSamples;
+
+
+struct VP8Decoder {
+  VP8StatusCode status;
+  int ready;     
+  const char* error_msg;  
+
+  VP8BitReader br;
+  int incremental;  
+
+  VP8FrameHeader   frm_hdr;
+  VP8PictureHeader pic_hdr;
+  VP8FilterHeader  filter_hdr;
+  VP8SegmentHeader segment_hdr;
+
+  WebPWorker worker;
+  int mt_method;      
+  int cache_id;       
+  int num_caches;     
+  VP8ThreadContext thread_ctx;  
+
+  int mb_w, mb_h;
+
+  int tl_mb_x, tl_mb_y;  
+  int br_mb_x, br_mb_y;  
+
+  uint32_t num_parts_minus_one;
+  VP8BitReader parts[MAX_NUM_PARTITIONS];
+
+  int dither;                
+  VP8Random dithering_rg;    
+
+  VP8QuantMatrix dqm[NUM_MB_SEGMENTS];
+
+  VP8Proba proba;
+  int use_skip_proba;
+  uint8_t skip_p;
+
+  uint8_t* intra_t;      
+  uint8_t  intra_l[4];   
+
+  VP8TopSamples* yuv_t;  
+
+  VP8MB* mb_info;        
+  VP8FInfo* f_info;      
+  uint8_t* yuv_b;        
+
+  uint8_t* cache_y;      
+  uint8_t* cache_u;
+  uint8_t* cache_v;
+  int cache_y_stride;
+  int cache_uv_stride;
+
+  void* mem;
+  size_t mem_size;
+
+  int mb_x, mb_y;        
+  VP8MBData* mb_data;    
+
+  int filter_type;                          
+  VP8FInfo fstrengths[NUM_MB_SEGMENTS][2];  
+
+  struct ALPHDecoder* alph_dec;  
+  const uint8_t* alpha_data;     
+  size_t alpha_data_size;
+  int is_alpha_decoded;      
+  uint8_t* alpha_plane_mem;  
+  uint8_t* alpha_plane;      
+  const uint8_t* alpha_prev_line;  
+  int alpha_dithering;       
+};
+
+
+int VP8SetError(VP8Decoder* const dec,
+                VP8StatusCode error, const char* const msg);
+
+void VP8ResetProba(VP8Proba* const proba);
+void VP8ParseProba(VP8BitReader* const br, VP8Decoder* const dec);
+int VP8ParseIntraModeRow(VP8BitReader* const br, VP8Decoder* const dec);
+
+void VP8ParseQuant(VP8Decoder* const dec);
+
+WEBP_NODISCARD int VP8InitFrame(VP8Decoder* const dec, VP8Io* const io);
+VP8StatusCode VP8EnterCritical(VP8Decoder* const dec, VP8Io* const io);
+WEBP_NODISCARD int VP8ExitCritical(VP8Decoder* const dec, VP8Io* const io);
+int VP8GetThreadMethod(const WebPDecoderOptions* const options,
+                       const WebPHeaderStructure* const headers,
+                       int width, int height);
+void VP8InitDithering(const WebPDecoderOptions* const options,
+                      VP8Decoder* const dec);
+WEBP_NODISCARD int VP8ProcessRow(VP8Decoder* const dec, VP8Io* const io);
+void VP8InitScanline(VP8Decoder* const dec);
+WEBP_NODISCARD int VP8DecodeMB(VP8Decoder* const dec,
+                               VP8BitReader* const token_br);
+
+const uint8_t* VP8DecompressAlphaRows(VP8Decoder* const dec,
+                                      const VP8Io* const io,
+                                      int row, int num_rows);
+
+
+#if defined(__cplusplus)
+}    
+#endif
+
+#endif

@@ -1,0 +1,961 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_quota_quotamanager_h_
+#define mozilla_dom_quota_quotamanager_h_
+
+#include <cstdint>
+#include <utility>
+
+#include "Client.h"
+#include "ErrorList.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/InitializedOnce.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/Result.h"
+#include "mozilla/ThreadBound.h"
+#include "mozilla/dom/Nullable.h"
+#include "mozilla/dom/ipc/IdType.h"
+#include "mozilla/dom/quota/Assertions.h"
+#include "mozilla/dom/quota/BackgroundThreadObject.h"
+#include "mozilla/dom/quota/CommonMetadata.h"
+#include "mozilla/dom/quota/DirectoryLockCategory.h"
+#include "mozilla/dom/quota/ForwardDecls.h"
+#include "mozilla/dom/quota/HashKeys.h"
+#include "mozilla/dom/quota/InitializationTypes.h"
+#include "mozilla/dom/quota/NotifyUtils.h"
+#include "mozilla/dom/quota/OpenClientDirectoryInfo.h"
+#include "mozilla/dom/quota/OriginOperationCallbacks.h"
+#include "mozilla/dom/quota/PersistenceType.h"
+#include "nsCOMPtr.h"
+#include "nsClassHashtable.h"
+#include "nsDebug.h"
+#include "nsHashKeys.h"
+#include "nsISupports.h"
+#include "nsStringFwd.h"
+#include "nsTArray.h"
+#include "nsTHashMap.h"
+#include "nsTStringRepr.h"
+#include "nscore.h"
+#include "prenv.h"
+
+class mozIStorageConnection;
+class nsIEventTarget;
+class nsIFile;
+class nsIRunnable;
+class nsIThread;
+class nsITimer;
+
+namespace mozilla {
+
+class OriginAttributes;
+class OriginAttributesPattern;
+
+namespace ipc {
+
+class PrincipalInfo;
+
+}  
+
+}  
+
+namespace mozilla::dom::quota {
+
+class CanonicalQuotaObject;
+class ClearDataOp;
+class ClearRequestBase;
+class ClientStorageScope;
+class ClientUsageArray;
+class ClientDirectoryLock;
+class ClientDirectoryLockHandle;
+class DirectoryLockImpl;
+class GroupInfo;
+class GroupInfoPair;
+class NormalOriginOperationBase;
+class OriginDirectoryLock;
+class OriginInfo;
+class OriginScope;
+class QuotaObject;
+class SaveOriginAccessTimeOp;
+class UniversalDirectoryLock;
+
+class QuotaManager final : public BackgroundThreadObject {
+  friend class CanonicalQuotaObject;
+  friend class ClearDataOp;
+  friend class ClearRequestBase;
+  friend class ClearStorageOp;
+  friend class ClientDirectoryLockHandle;
+  friend class DirectoryLockImpl;
+  friend class FinalizeOriginEvictionOp;
+  friend class GroupInfo;
+  friend class InitOp;
+  friend class InitializePersistentOriginOp;
+  friend class InitializePersistentStorageOp;
+  friend class InitializeTemporaryGroupOp;
+  friend class InitializeTemporaryOriginOp;
+  friend class InitTemporaryStorageOp;
+  friend class ListCachedOriginsOp;
+  friend class OriginInfo;
+  friend class PersistOp;
+  friend class SaveOriginAccessTimeOp;
+  friend class ShutdownStorageOp;
+  friend class UniversalDirectoryLock;
+
+  friend Result<PrincipalMetadata, nsresult> GetInfoFromValidatedPrincipalInfo(
+      QuotaManager& aQuotaManager,
+      const mozilla::ipc::PrincipalInfo& aPrincipalInfo);
+
+  using PrincipalInfo = mozilla::ipc::PrincipalInfo;
+
+  class Observer;
+
+ public:
+  using ClientDirectoryLockHandlePromise =
+      MozPromise<ClientDirectoryLockHandle, nsresult, true>;
+
+  QuotaManager(const nsAString& aBasePath, const nsAString& aStorageName);
+
+  NS_INLINE_DECL_REFCOUNTING(QuotaManager)
+
+  static nsresult Initialize();
+
+  static const char kReplaceChars[];
+  static const char16_t kReplaceChars16[];
+
+  static Result<MovingNotNull<RefPtr<QuotaManager>>, nsresult> GetOrCreate();
+
+  static Result<Ok, nsresult> EnsureCreated();
+
+  static QuotaManager* Get();
+
+  static bool IsShuttingDown();
+
+  static void ShutdownInstance();
+
+  static bool IsOSMetadata(const nsAString& aFileName);
+
+  static bool IsDotFile(const nsAString& aFileName);
+
+  void RegisterNormalOriginOp(NormalOriginOperationBase& aNormalOriginOp);
+
+  void UnregisterNormalOriginOp(NormalOriginOperationBase& aNormalOriginOp);
+
+  bool IsPersistentOriginInitializedInternal(const nsACString& aOrigin) const {
+    AssertIsOnIOThread();
+
+    return mInitializedOriginsInternal.Contains(aOrigin);
+  }
+
+  bool IsTemporaryStorageInitializedInternal() const {
+    AssertIsOnIOThread();
+
+    return mTemporaryStorageInitializedInternal;
+  }
+
+  void InitQuotaForOrigin(const FullOriginMetadata& aFullOriginMetadata,
+                          bool aDirectoryExists = true);
+
+  void DecreaseUsageForClient(const ClientMetadata& aClientMetadata,
+                              int64_t aSize);
+
+  void ResetUsageForClient(const ClientMetadata& aClientMetadata);
+
+  UsageInfo GetUsageForClient(PersistenceType aPersistenceType,
+                              const OriginMetadata& aOriginMetadata,
+                              Client::Type aClientType);
+
+  void UpdateOriginAccessTime(const OriginMetadata& aOriginMetadata,
+                              int64_t aTimestamp);
+
+  void UpdateOriginMaintenanceDate(const OriginMetadata& aOriginMetadata,
+                                   int32_t aMaintenanceDate);
+
+  void UpdateOriginAccessed(const OriginMetadata& aOriginMetadata);
+
+  void RemoveQuota();
+
+  void RemoveQuotaForRepository(PersistenceType aPersistenceType) {
+    MutexAutoLock lock(mQuotaMutex);
+    LockedRemoveQuotaForRepository(aPersistenceType);
+  }
+
+  void RemoveQuotaForOrigin(PersistenceType aPersistenceType,
+                            const OriginMetadata& aOriginMetadata) {
+    MutexAutoLock lock(mQuotaMutex);
+    LockedRemoveQuotaForOrigin(aOriginMetadata);
+  }
+
+  nsresult LoadQuota();
+
+  void UnloadQuota();
+
+  void RemoveOriginFromCache(const OriginMetadata& aOriginMetadata);
+
+  already_AddRefed<QuotaObject> GetQuotaObject(
+      PersistenceType aPersistenceType, const OriginMetadata& aOriginMetadata,
+      Client::Type aClientType, nsIFile* aFile, int64_t aFileSize = -1,
+      int64_t* aFileSizeOut = nullptr);
+
+  already_AddRefed<QuotaObject> GetQuotaObject(
+      PersistenceType aPersistenceType, const OriginMetadata& aOriginMetadata,
+      Client::Type aClientType, const nsAString& aPath, int64_t aFileSize = -1,
+      int64_t* aFileSizeOut = nullptr);
+
+  already_AddRefed<QuotaObject> GetQuotaObject(const int64_t aDirectoryLockId,
+                                               const nsAString& aPath);
+
+  Nullable<bool> OriginPersisted(const OriginMetadata& aOriginMetadata);
+
+  void PersistOrigin(const OriginMetadata& aOriginMetadata);
+
+  template <typename F>
+  auto WithOriginInfo(const OriginMetadata& aOriginMetadata, F aFunction)
+      -> std::invoke_result_t<F, const RefPtr<OriginInfo>&>;
+
+  using DirectoryLockIdTableArray =
+      AutoTArray<Client::DirectoryLockIdTable, Client::TYPE_MAX>;
+  void AbortOperationsForLocks(const DirectoryLockIdTableArray& aLockIds);
+
+  void AbortOperationsForProcess(ContentParentId aContentParentId);
+
+  Result<nsCOMPtr<nsIFile>, nsresult> GetOriginDirectory(
+      const OriginMetadata& aOriginMetadata) const;
+
+  Result<bool, nsresult> DoesOriginDirectoryExist(
+      const OriginMetadata& aOriginMetadata) const;
+
+  Result<nsCOMPtr<nsIFile>, nsresult> GetOrCreateTemporaryOriginDirectory(
+      const OriginMetadata& aOriginMetadata);
+
+  Result<Ok, nsresult> EnsureTemporaryOriginDirectoryCreated(
+      const OriginMetadata& aOriginMetadata);
+
+  nsresult CreateDirectoryMetadata2(
+      nsIFile& aDirectory, const FullOriginMetadata& aFullOriginMetadata);
+
+  nsresult RestoreDirectoryMetadata2(nsIFile* aDirectory);
+
+  Result<FullOriginMetadata, nsresult> LoadFullOriginMetadata(
+      nsIFile* aDirectory, PersistenceType aPersistenceType);
+
+  Result<FullOriginMetadata, nsresult> LoadFullOriginMetadataWithRestore(
+      nsIFile* aDirectory);
+
+  Result<std::pair<FullOriginMetadata, bool >, nsresult>
+  LoadFullOriginMetadataWithRestoreAndStatus(nsIFile* aDirectory);
+
+  Result<OriginMetadata, nsresult> GetOriginMetadata(nsIFile* aDirectory);
+
+  Result<Ok, nsresult> RemoveOriginDirectory(nsIFile& aDirectory);
+
+  Result<bool, nsresult> DoesClientDirectoryExist(
+      const ClientMetadata& aClientMetadata) const;
+
+  RefPtr<UniversalDirectoryLockPromise> OpenStorageDirectory(
+      const PersistenceScope& aPersistenceScope,
+      const OriginScope& aOriginScope,
+      const ClientStorageScope& aClientStorageScope, bool aExclusive,
+      bool aInitializeOrigins = false,
+      DirectoryLockCategory aCategory = DirectoryLockCategory::None,
+      Maybe<RefPtr<UniversalDirectoryLock>&> aPendingDirectoryLockOut =
+          Nothing());
+
+  RefPtr<ClientDirectoryLockHandlePromise> OpenClientDirectory(
+      const ClientMetadata& aClientMetadata, bool aInitializeOrigins = true,
+      bool aCreateIfNonExistent = true,
+      Maybe<RefPtr<ClientDirectoryLock>&> aPendingDirectoryLockOut = Nothing());
+
+  RefPtr<ClientDirectoryLockHandlePromise> OpenClientDirectoryImpl(
+      const ClientMetadata& aClientMetadata, bool aInitializeOrigins,
+      bool aCreateIfNonExistent,
+      Maybe<RefPtr<ClientDirectoryLock>&> aPendingDirectoryLockOut);
+
+  RefPtr<ClientDirectoryLock> CreateDirectoryLock(
+      const ClientMetadata& aClientMetadata, bool aExclusive);
+
+  RefPtr<UniversalDirectoryLock> CreateDirectoryLockInternal(
+      const PersistenceScope& aPersistenceScope,
+      const OriginScope& aOriginScope,
+      const ClientStorageScope& aClientStorageScope, bool aExclusive,
+      DirectoryLockCategory aCategory = DirectoryLockCategory::None);
+
+  uint64_t CollectOriginsForEviction(
+      uint64_t aMinSizeToBeFreed,
+      nsTArray<RefPtr<OriginDirectoryLock>>& aLocks);
+
+  template <typename P>
+  void CollectPendingOriginsForListing(P aPredicate);
+
+  bool IsPendingOrigin(const OriginMetadata& aOriginMetadata) const;
+
+  RefPtr<BoolPromise> InitializeStorage();
+
+  RefPtr<BoolPromise> InitializeStorage(
+      RefPtr<UniversalDirectoryLock> aDirectoryLock);
+
+  bool IsStorageInitialized() const {
+    AssertIsOnOwningThread();
+
+    return mStorageInitialized;
+  }
+
+  bool IsStorageInitializedInternal() const {
+    AssertIsOnIOThread();
+    return static_cast<bool>(mStorageConnection);
+  }
+
+  void AssertStorageIsInitializedInternal() const
+#ifdef DEBUG
+      ;
+#else
+  {
+  }
+#endif
+
+ private:
+  nsresult EnsureStorageIsInitializedInternal();
+
+ public:
+  RefPtr<BoolPromise> InitializePersistentStorage();
+
+  RefPtr<BoolPromise> InitializePersistentStorage(
+      RefPtr<UniversalDirectoryLock> aDirectoryLock);
+
+  bool IsPersistentStorageInitialized() const {
+    AssertIsOnOwningThread();
+
+    return mPersistentStorageInitialized;
+  }
+
+  bool IsPersistentStorageInitializedInternal() const {
+    AssertIsOnIOThread();
+
+    return mPersistentStorageInitializedInternal;
+  }
+
+ private:
+  nsresult EnsurePersistentStorageIsInitializedInternal();
+
+ public:
+  RefPtr<BoolPromise> InitializeTemporaryGroup(
+      const PrincipalMetadata& aPrincipalMetadata);
+
+  RefPtr<BoolPromise> InitializeTemporaryGroup(
+      const PrincipalMetadata& aPrincipalMetadata,
+      RefPtr<UniversalDirectoryLock> aDirectoryLock);
+
+  bool IsTemporaryGroupInitialized(const PrincipalMetadata& aPrincipalMetadata);
+
+  bool IsTemporaryGroupInitializedInternal(
+      const PrincipalMetadata& aPrincipalMetadata) const;
+
+ private:
+  Result<Ok, nsresult> EnsureTemporaryGroupIsInitializedInternal(
+      const PrincipalMetadata& aPrincipalMetadata);
+
+ public:
+  RefPtr<BoolPromise> InitializePersistentOrigin(
+      const OriginMetadata& aOriginMetadata);
+
+  RefPtr<BoolPromise> InitializePersistentOrigin(
+      const OriginMetadata& aOriginMetadata,
+      RefPtr<UniversalDirectoryLock> aDirectoryLock);
+
+  bool IsPersistentOriginInitialized(const OriginMetadata& aOriginMetadata);
+
+  bool IsPersistentOriginInitializedInternal(
+      const OriginMetadata& aOriginMetadata) const;
+
+ private:
+  Result<std::pair<nsCOMPtr<nsIFile>, bool>, nsresult>
+  EnsurePersistentOriginIsInitializedInternal(
+      const OriginMetadata& aOriginMetadata);
+
+ public:
+  RefPtr<BoolPromise> InitializeTemporaryOrigin(
+      const OriginMetadata& aOriginMetadata, bool aCreateIfNonExistent);
+
+  RefPtr<BoolPromise> InitializeTemporaryOrigin(
+      const OriginMetadata& aOriginMetadata, bool aCreateIfNonExistent,
+      RefPtr<UniversalDirectoryLock> aDirectoryLock);
+
+  bool IsTemporaryOriginInitialized(const OriginMetadata& aOriginMetadata);
+
+  bool IsTemporaryOriginInitializedInternal(
+      const OriginMetadata& aOriginMetadata) const;
+
+ private:
+  Result<std::pair<nsCOMPtr<nsIFile>, bool>, nsresult>
+  EnsureTemporaryOriginIsInitializedInternal(
+      const OriginMetadata& aOriginMetadata, bool aCreateIfNonExistent);
+
+ public:
+  RefPtr<BoolPromise> InitializePersistentClient(
+      const ClientMetadata& aClientMetadata);
+
+  RefPtr<BoolPromise> InitializePersistentClient(
+      const ClientMetadata& aClientMetadata,
+      RefPtr<UniversalDirectoryLock> aDirectoryLock);
+
+  bool IsPersistentClientInitialized(const ClientMetadata& aClientMetadata);
+
+  Result<std::pair<nsCOMPtr<nsIFile>, bool>, nsresult>
+  EnsurePersistentClientIsInitialized(const ClientMetadata& aClientMetadata);
+
+  RefPtr<BoolPromise> InitializeTemporaryClient(
+      const ClientMetadata& aClientMetadata, bool aCreateIfNonExistent);
+
+  RefPtr<BoolPromise> InitializeTemporaryClient(
+      const ClientMetadata& aClientMetadata, bool aCreateIfNonExistent,
+      RefPtr<UniversalDirectoryLock> aDirectoryLock);
+
+  bool IsTemporaryClientInitialized(const ClientMetadata& aClientMetadata);
+
+  Result<std::pair<nsCOMPtr<nsIFile>, bool>, nsresult>
+  EnsureTemporaryClientIsInitialized(const ClientMetadata& aClientMetadata,
+                                     bool aCreateIfNonExistent);
+
+  RefPtr<BoolPromise> InitializeTemporaryStorage();
+
+  RefPtr<BoolPromise> InitializeTemporaryStorage(
+      RefPtr<UniversalDirectoryLock> aDirectoryLock);
+
+  bool IsTemporaryStorageInitialized() const {
+    AssertIsOnOwningThread();
+
+    return mTemporaryStorageInitialized;
+  }
+
+ private:
+  nsresult InitializeTemporaryStorageInternal();
+
+  nsresult EnsureTemporaryStorageIsInitializedInternal();
+
+ public:
+  RefPtr<BoolPromise> InitializeAllTemporaryOrigins();
+
+  RefPtr<BoolPromise> SaveOriginAccessTime(
+      const OriginMetadata& aOriginMetadata);
+
+  RefPtr<BoolPromise> SaveOriginAccessTime(
+      const OriginMetadata& aOriginMetadata,
+      RefPtr<UniversalDirectoryLock> aDirectoryLock);
+
+  RefPtr<OriginUsageMetadataArrayPromise> GetUsage(
+      bool aGetAll, RefPtr<BoolPromise> aOnCancelPromise = nullptr);
+
+  RefPtr<UsageInfoPromise> GetOriginUsage(
+      const PrincipalInfo& aPrincipalInfo,
+      RefPtr<BoolPromise> aOnCancelPromise = nullptr);
+
+  RefPtr<UInt64Promise> GetCachedOriginUsage(
+      const PrincipalInfo& aPrincipalInfo);
+
+  RefPtr<CStringArrayPromise> ListOrigins();
+
+  RefPtr<CStringArrayPromise> ListCachedOrigins();
+
+  RefPtr<BoolPromise> ClearStoragesForOrigin(
+      const Maybe<PersistenceType>& aPersistenceType,
+      const PrincipalInfo& aPrincipalInfo);
+
+  RefPtr<BoolPromise> ClearStoragesForClient(
+      Maybe<PersistenceType> aPersistenceType,
+      const PrincipalInfo& aPrincipalInfo, Client::Type aClientType);
+
+  RefPtr<BoolPromise> ClearStoragesForOriginPrefix(
+      const Maybe<PersistenceType>& aPersistenceType,
+      const PrincipalInfo& aPrincipalInfo);
+
+  RefPtr<BoolPromise> ClearStoragesForOriginAttributesPattern(
+      const OriginAttributesPattern& aPattern);
+
+  RefPtr<BoolPromise> ClearPrivateRepository();
+
+  RefPtr<BoolPromise> ClearStorage();
+
+  RefPtr<BoolPromise> ShutdownStoragesForOrigin(
+      Maybe<PersistenceType> aPersistenceType,
+      const PrincipalInfo& aPrincipalInfo);
+
+  RefPtr<BoolPromise> ShutdownStoragesForClient(
+      Maybe<PersistenceType> aPersistenceType,
+      const PrincipalInfo& aPrincipalInfo, Client::Type aClientType);
+
+  RefPtr<BoolPromise> ShutdownStorage(
+      Maybe<OriginOperationCallbackOptions> aCallbackOptions = Nothing(),
+      Maybe<OriginOperationCallbacks&> aCallbacks = Nothing());
+
+  void ShutdownStorageInternal();
+
+  Result<bool, nsresult> EnsureOriginDirectory(nsIFile& aDirectory);
+
+  nsresult AboutToClearOrigins(const PersistenceScope& aPersistenceScope,
+                               const OriginScope& aOriginScope,
+                               const ClientStorageScope& aClientStorageScope);
+
+  void OriginClearCompleted(const OriginMetadata& aOriginMetadata,
+                            const ClientStorageScope& aClientStorageScope);
+
+  void RepositoryClearCompleted(PersistenceType aPersistenceType);
+
+  void StartIdleMaintenance() {
+    AssertIsOnOwningThread();
+
+    for (const auto& client : *mClients) {
+      client->StartIdleMaintenance();
+    }
+  }
+
+  void StopIdleMaintenance() {
+    AssertIsOnOwningThread();
+
+    for (const auto& client : *mClients) {
+      client->StopIdleMaintenance();
+    }
+  }
+
+  void AssertCurrentThreadOwnsQuotaMutex() {
+    mQuotaMutex.AssertCurrentThreadOwns();
+  }
+
+  void AssertNotCurrentThreadOwnsQuotaMutex() {
+    mQuotaMutex.AssertNotCurrentThreadOwns();
+  }
+
+  nsIThread* IOThread() { return mIOThread->get(); }
+
+  Client* GetClient(Client::Type aClientType);
+
+  const AutoTArray<Client::Type, Client::TYPE_MAX>& AllClientTypes();
+
+  const nsString& GetBasePath() const { return mBasePath; }
+
+  const nsString& GetStorageName() const { return mStorageName; }
+
+  const nsString& GetStoragePath() const { return *mStoragePath; }
+
+  const nsString& GetStoragePath(PersistenceType aPersistenceType) const {
+    if (aPersistenceType == PERSISTENCE_TYPE_PERSISTENT) {
+      return *mPermanentStoragePath;
+    }
+
+    if (aPersistenceType == PERSISTENCE_TYPE_TEMPORARY) {
+      return *mTemporaryStoragePath;
+    }
+
+    if (aPersistenceType == PERSISTENCE_TYPE_DEFAULT) {
+      return *mDefaultStoragePath;
+    }
+
+    MOZ_ASSERT(aPersistenceType == PERSISTENCE_TYPE_PRIVATE);
+
+    return *mPrivateStoragePath;
+  }
+
+  bool IsThumbnailPrivateIdentityIdKnown() const;
+
+  uint32_t GetThumbnailPrivateIdentityId() const;
+
+  void SetThumbnailPrivateIdentityId(uint32_t aThumbnailPrivateIdentityId);
+
+  uint64_t GetGroupLimit() const;
+  static uint64_t GetGroupLimitForLimit(uint64_t aLimit);
+
+  Maybe<OriginStateMetadata> GetOriginStateMetadata(
+      const OriginMetadata& aOriginMetadata);
+
+  std::pair<uint64_t, uint64_t> GetUsageAndLimitForEstimate(
+      const OriginMetadata& aOriginMetadata);
+
+  uint64_t GetOriginUsage(const PrincipalMetadata& aPrincipalMetadata);
+
+  Maybe<FullOriginMetadata> GetFullOriginMetadata(
+      const OriginMetadata& aOriginMetadata);
+
+  uint64_t TotalDirectoryIterations() const;
+
+  uint64_t SaveOriginAccessTimeCount() const;
+
+  uint64_t SaveOriginAccessTimeCountInternal() const;
+
+  static void MaybeRecordQuotaClientShutdownStep(
+      const Client::Type aClientType, const nsACString& aStepDescription);
+
+  static void SafeMaybeRecordQuotaClientShutdownStep(
+      Client::Type aClientType, const nsACString& aStepDescription);
+
+  void RecordQuotaManagerShutdownStep(const nsACString& aStepDescription);
+
+  void MaybeRecordQuotaManagerShutdownStep(const nsACString& aStepDescription);
+
+  template <typename F>
+  void MaybeRecordQuotaManagerShutdownStepWith(F&& aFunc);
+
+  static void GetStorageId(PersistenceType aPersistenceType,
+                           const nsACString& aOrigin, Client::Type aClientType,
+                           nsACString& aDatabaseId);
+
+  static bool IsOriginInternal(const nsACString& aOrigin);
+
+  static bool AreOriginsEqualOnDisk(const nsACString& aOrigin1,
+                                    const nsACString& aOrigin2);
+
+  static Result<PrincipalInfo, nsresult> ParseOrigin(const nsACString& aOrigin);
+
+  static void InvalidateQuotaCache();
+
+  OriginMetadataArray GetTemporaryOrigins(
+      PersistenceType aPersistenceType) const;
+
+ private:
+  virtual ~QuotaManager();
+
+  nsresult Init();
+
+  void Shutdown();
+
+  void RegisterDirectoryLock(DirectoryLockImpl& aLock);
+
+  void UnregisterDirectoryLock(DirectoryLockImpl& aLock);
+
+  void AddPendingDirectoryLock(DirectoryLockImpl& aLock);
+
+  void RemovePendingDirectoryLock(DirectoryLockImpl& aLock);
+
+  uint64_t LockedCollectOriginsForEviction(
+      uint64_t aMinSizeToBeFreed,
+      nsTArray<RefPtr<OriginDirectoryLock>>& aLocks);
+
+  void LockedRemoveQuotaForRepository(PersistenceType aPersistenceType);
+
+  void LockedRemoveQuotaForOrigin(const OriginMetadata& aOriginMetadata);
+
+  bool LockedHasGroupInfoPair(const nsACString& aGroup) const;
+
+  already_AddRefed<GroupInfo> LockedGetOrCreateGroupInfo(
+      PersistenceType aPersistenceType, const nsACString& aSuffix,
+      const nsACString& aGroup);
+
+  already_AddRefed<OriginInfo> LockedGetOriginInfo(
+      PersistenceType aPersistenceType,
+      const OriginMetadata& aOriginMetadata) const;
+
+  nsresult UpgradeFromIndexedDBDirectoryToPersistentStorageDirectory(
+      nsIFile* aIndexedDBDir);
+
+  nsresult UpgradeFromPersistentStorageDirectoryToDefaultStorageDirectory(
+      nsIFile* aPersistentStorageDir);
+
+  nsresult MaybeUpgradeToDefaultStorageDirectory(nsIFile& aStorageFile);
+
+  template <typename Helper>
+  nsresult UpgradeStorage(const int32_t aOldVersion, const int32_t aNewVersion,
+                          mozIStorageConnection* aConnection);
+
+  nsresult UpgradeStorageFrom0_0To1_0(mozIStorageConnection* aConnection);
+
+  nsresult UpgradeStorageFrom1_0To2_0(mozIStorageConnection* aConnection);
+
+  nsresult UpgradeStorageFrom2_0To2_1(mozIStorageConnection* aConnection);
+
+  nsresult UpgradeStorageFrom2_1To2_2(mozIStorageConnection* aConnection);
+
+  nsresult UpgradeStorageFrom2_2To2_3(mozIStorageConnection* aConnection);
+
+  nsresult MaybeCreateOrUpgradeStorage(mozIStorageConnection& aConnection);
+
+  OkOrErr MaybeRemoveLocalStorageArchiveTmpFile();
+
+  nsresult MaybeRemoveLocalStorageDataAndArchive(nsIFile& aLsArchiveFile);
+
+  nsresult MaybeRemoveLocalStorageDirectories();
+
+  Result<Ok, nsresult> CopyLocalStorageArchiveFromWebAppsStore(
+      nsIFile& aLsArchiveFile) const;
+
+  Result<nsCOMPtr<mozIStorageConnection>, nsresult>
+  CreateLocalStorageArchiveConnection(nsIFile& aLsArchiveFile) const;
+
+  Result<nsCOMPtr<mozIStorageConnection>, nsresult>
+  RecopyLocalStorageArchiveFromWebAppsStore(nsIFile& aLsArchiveFile);
+
+  Result<nsCOMPtr<mozIStorageConnection>, nsresult>
+  DowngradeLocalStorageArchive(nsIFile& aLsArchiveFile);
+
+  Result<nsCOMPtr<mozIStorageConnection>, nsresult>
+  UpgradeLocalStorageArchiveFromLessThan4To4(nsIFile& aLsArchiveFile);
+
+
+  Result<Ok, nsresult> MaybeCreateOrUpgradeLocalStorageArchive(
+      nsIFile& aLsArchiveFile);
+
+  Result<Ok, nsresult> CreateEmptyLocalStorageArchive(
+      nsIFile& aLsArchiveFile) const;
+
+  template <typename OriginFunc>
+  Result<Ok, nsresult> InitializeOriginDirectory(
+      const nsCOMPtr<nsIFile>& aChildDirectory, const nsAutoString& aLeafName,
+      PersistenceType aPersistenceType,
+      nsTArray<struct RenameAndInitInfo>& aRenameAndInitInfos,
+      OriginFunc&& aOriginFunc);
+
+  template <typename OriginFunc>
+  Result<Ok, nsresult> ResolveRepositoryEntry(
+      const nsCOMPtr<nsIFile>& aChildDirectory,
+      PersistenceType aPersistenceType,
+      nsTArray<RenameAndInitInfo>& aRenameAndInitInfos,
+      OriginFunc&& aOriginFunc);
+
+  template <typename OriginFunc>
+  nsresult InitializeRepository(PersistenceType aPersistenceType,
+                                OriginFunc&& aOriginFunc);
+
+  nsresult InitializeOrigin(nsIFile* aDirectory,
+                            const FullOriginMetadata& aFullOriginMetadata,
+                            bool aForGroup = false);
+
+  using OriginInfosFlatTraversable =
+      nsTArray<NotNull<RefPtr<const OriginInfo>>>;
+
+  using OriginInfosNestedTraversable =
+      nsTArray<nsTArray<NotNull<RefPtr<const OriginInfo>>>>;
+
+  OriginInfosNestedTraversable GetOriginInfosExceedingGroupLimit() const;
+
+  OriginInfosNestedTraversable GetOriginInfosExceedingGlobalLimit() const;
+
+  OriginInfosNestedTraversable GetOriginInfosWithZeroUsage(
+      const Maybe<int64_t>& aCutoffAccessTime = Nothing()) const;
+
+  template <typename Checker>
+  void ClearOrigins(const OriginInfosNestedTraversable& aDoomedOriginInfos,
+                    Checker&& aChecker,
+                    const Maybe<size_t>& aMaxOriginsToClear = Nothing());
+
+  void CleanupTemporaryStorage();
+
+
+  void DeleteOriginDirectory(const OriginMetadata& aOriginMetadata);
+
+  void FinalizeOriginEviction(nsTArray<RefPtr<OriginDirectoryLock>>&& aLocks);
+
+  Result<Ok, nsresult> ArchiveOrigins(
+      const nsTArray<FullOriginMetadata>& aFullOriginMetadatas);
+
+  void ReleaseIOThreadObjects() {
+    AssertIsOnIOThread();
+
+    for (Client::Type type : AllClientTypes()) {
+      (*mClients)[type]->ReleaseIOThreadObjects();
+    }
+  }
+
+  void AddTemporaryOrigin(const FullOriginMetadata& aFullOriginMetadata);
+
+  void RemoveTemporaryOrigin(const OriginMetadata& aOriginMetadata);
+
+  void RemoveTemporaryOrigins(PersistenceType aPersistenceType);
+
+  void RemoveTemporaryOrigins();
+
+  uint32_t ThumbnailPrivateIdentityTemporaryOriginCount() const;
+
+  PrincipalMetadataArray GetAllTemporaryGroups() const;
+
+  OriginMetadataArray GetAllTemporaryOrigins() const;
+
+  void NoteInitializedOrigin(PersistenceType aPersistenceType,
+                             const nsACString& aOrigin);
+
+  void NoteUninitializedOrigins(
+      const OriginMetadataArray& aOriginMetadataArray);
+
+  void NoteUninitializedRepository(PersistenceType aPersistenceType);
+
+  bool IsOriginInitialized(PersistenceType aPersistenceType,
+                           const nsACString& aOrigin) const;
+
+  void NoteInitializedClient(PersistenceType aPersistenceType,
+                             const nsACString& aOrigin,
+                             Client::Type aClientType);
+
+  void NoteUninitializedClients(
+      const ClientMetadataArray& aClientMetadataArray);
+
+  void NoteUninitializedClients(
+      const OriginMetadataArray& aOriginMetadataArray);
+
+  void NoteUninitializedClients(PersistenceType aPersistenceType);
+
+  bool IsClientInitialized(PersistenceType aPersistenceType,
+                           const nsACString& aOrigin,
+                           Client::Type aClientType) const;
+
+  bool IsSanitizedOriginValid(const nsACString& aSanitizedOrigin);
+
+  Result<nsCString, nsresult> EnsureStorageOriginFromOrigin(
+      const nsACString& aOrigin);
+
+  Result<nsCString, nsresult> GetOriginFromStorageOrigin(
+      const nsACString& aStorageOrigin);
+
+  int64_t GenerateDirectoryLockId();
+
+  template <typename UpdateCallback>
+  void RegisterClientDirectoryLockHandle(const OriginMetadata& aOriginMetadata,
+                                         UpdateCallback&& aUpdateCallback);
+
+  template <typename Callback>
+  auto WithOpenClientDirectoryInfo(const OriginMetadata& aOriginMetadata,
+                                   Callback&& aCallback)
+      -> std::invoke_result_t<Callback, OpenClientDirectoryInfo&>;
+
+  template <typename UpdateCallback>
+  void UnregisterClientDirectoryLockHandle(
+      const OriginMetadata& aOriginMetadata, UpdateCallback&& aUpdateCallback);
+
+  void ClientDirectoryLockHandleDestroy(ClientDirectoryLockHandle& aHandle);
+
+  bool ShutdownStarted() const;
+
+  void RecordShutdownStep(Maybe<Client::Type> aClientType,
+                          const nsACString& aStepDescription);
+
+  template <typename Func>
+  auto ExecuteInitialization(Initialization aInitialization, Func&& aFunc)
+      -> std::invoke_result_t<Func, const FirstInitializationAttempt<
+                                        Initialization, StringGenerator>&>;
+
+  template <typename Func>
+  auto ExecuteInitialization(Initialization aInitialization,
+                             const nsACString& aContext, Func&& aFunc)
+      -> std::invoke_result_t<Func, const FirstInitializationAttempt<
+                                        Initialization, StringGenerator>&>;
+
+  template <typename Func>
+  auto ExecuteGroupInitialization(const nsACString& aGroup,
+                                  const GroupInitialization aInitialization,
+                                  const nsACString& aContext, Func&& aFunc)
+      -> std::invoke_result_t<Func, const FirstInitializationAttempt<
+                                        Initialization, StringGenerator>&>;
+
+  template <typename Func>
+  auto ExecuteOriginInitialization(const nsACString& aOrigin,
+                                   const OriginInitialization aInitialization,
+                                   const nsACString& aContext, Func&& aFunc)
+      -> std::invoke_result_t<Func, const FirstInitializationAttempt<
+                                        Initialization, StringGenerator>&>;
+
+  void IncreaseTotalDirectoryIterations();
+
+  void IncreaseSaveOriginAccessTimeCount();
+
+  void IncreaseSaveOriginAccessTimeCountInternal();
+
+  template <typename Collect, typename Pred>
+  static OriginInfosFlatTraversable CollectLRUOriginInfosUntil(
+      Collect&& aCollect, Pred&& aPred);
+
+  LazyInitializedOnceNotNull<const nsCOMPtr<nsIThread>> mIOThread;
+
+  nsCOMPtr<mozIStorageConnection> mStorageConnection;
+
+  EnumeratedArray<Client::Type, nsCString, size_t(Client::TYPE_MAX)>
+      mShutdownSteps;
+  LazyInitializedOnce<const TimeStamp> mShutdownStartedAt;
+
+  nsCString mQuotaManagerShutdownSteps;
+
+  mutable mozilla::Mutex mQuotaMutex MOZ_UNANNOTATED;
+
+  nsClassHashtable<nsCStringHashKey, GroupInfoPair> mGroupInfoPairs;
+
+  nsTArray<RefPtr<DirectoryLockImpl>> mPendingDirectoryLocks;
+
+  nsTArray<NotNull<DirectoryLockImpl*>> mDirectoryLocks;
+
+  nsTArray<NotNull<DirectoryLockImpl*>> mExclusiveDirectoryLocks;
+
+  nsTHashMap<nsUint64HashKey, NotNull<DirectoryLockImpl*>>
+      mDirectoryLockIdTable;
+
+  struct BackgroundThreadAccessible {
+    PrincipalMetadataArray mUninitializedGroups;
+    nsTHashSet<nsCString> mInitializedGroups;
+
+    nsTHashMap<nsCStringHashKey, OpenClientDirectoryInfo>
+        mOpenClientDirectoryInfos;
+
+    uint64_t mSaveOriginAccessTimeCount = 0;
+  };
+  ThreadBound<BackgroundThreadAccessible> mBackgroundThreadAccessible;
+
+  using BoolArray = AutoTArray<bool, PERSISTENCE_TYPE_INVALID>;
+  nsTHashMap<nsCStringHashKeyWithDisabledMemmove, BoolArray>
+      mInitializedOrigins;
+
+  using BitSetArray =
+      AutoTArray<BitSet<Client::TYPE_MAX>, PERSISTENCE_TYPE_INVALID>;
+  nsTHashMap<nsCStringHashKeyWithDisabledMemmove, BitSetArray>
+      mInitializedClients;
+
+  struct IOThreadAccessible {
+    nsTHashMap<nsCStringHashKey, nsTArray<FullOriginMetadata>>
+        mAllTemporaryOrigins;
+    Maybe<uint32_t> mThumbnailPrivateIdentityId;
+    uint64_t mTotalDirectoryIterations = 0;
+    uint64_t mSaveOriginAccessTimeCount = 0;
+    uint32_t mThumbnailPrivateIdentityTemporaryOriginCount = 0;
+  };
+  ThreadBound<IOThreadAccessible> mIOThreadAccessible;
+
+  nsTArray<nsCString> mInitializedOriginsInternal;
+
+  nsTHashMap<nsCStringHashKey, bool> mValidOrigins;
+
+  nsTHashMap<nsCStringHashKey, nsCString> mOriginToStorageOriginMap;
+  nsTHashMap<nsCStringHashKey, nsCString> mStorageOriginToOriginMap;
+
+  LazyInitializedOnce<const AutoTArray<RefPtr<Client>, Client::TYPE_MAX>>
+      mClients;
+
+  using ClientTypesArray = AutoTArray<Client::Type, Client::TYPE_MAX>;
+  LazyInitializedOnce<const ClientTypesArray> mAllClientTypes;
+  LazyInitializedOnce<const ClientTypesArray> mAllClientTypesExceptLS;
+
+  InitializationInfo mInitializationInfo;
+
+  const nsString mBasePath;
+  const nsString mStorageName;
+  LazyInitializedOnce<const nsString> mIndexedDBPath;
+  LazyInitializedOnce<const nsString> mStoragePath;
+  LazyInitializedOnce<const nsString> mStorageArchivesPath;
+  LazyInitializedOnce<const nsString> mPermanentStoragePath;
+  LazyInitializedOnce<const nsString> mTemporaryStoragePath;
+  LazyInitializedOnce<const nsString> mDefaultStoragePath;
+  LazyInitializedOnce<const nsString> mPrivateStoragePath;
+  LazyInitializedOnce<const nsString> mToBeRemovedStoragePath;
+
+  MozPromiseHolder<BoolPromise> mInitializeAllTemporaryOriginsPromiseHolder;
+
+  uint64_t mTemporaryStorageLimit;
+  uint64_t mTemporaryStorageUsage;
+  int64_t mNextDirectoryLockId;
+  bool mStorageInitialized;
+  bool mPersistentStorageInitialized;
+  bool mPersistentStorageInitializedInternal;
+  bool mTemporaryStorageInitialized;
+  bool mTemporaryStorageInitializedInternal;
+  bool mInitializingAllTemporaryOrigins;
+  bool mAllTemporaryOriginsInitialized;
+  bool mCacheUsable;
+};
+
+}  
+
+#endif /* mozilla_dom_quota_quotamanager_h_ */

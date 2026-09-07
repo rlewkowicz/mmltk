@@ -1,0 +1,23 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_MIDI_MIDIUTILS_H_
+#define DOM_MIDI_MIDIUTILS_H_
+
+#include "mozilla/TimeStamp.h"
+#include "nsTArray.h"
+
+namespace mozilla::dom {
+class MIDIMessage;
+
+namespace MIDIUtils {
+
+bool ParseMessages(const nsTArray<uint8_t>& aByteBuffer,
+                   const TimeStamp& aTimestamp,
+                   nsTArray<MIDIMessage>& aMsgArray);
+bool IsSysexMessage(const MIDIMessage& a);
+}  
+}  
+
+#endif  // DOM_MIDI_MIDIUTILS_H_

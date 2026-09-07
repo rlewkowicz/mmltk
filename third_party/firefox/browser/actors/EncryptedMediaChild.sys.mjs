@@ -1,0 +1,83 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+class GlobalCaptureListener {
+  constructor() {
+    Services.cpmm.sharedData.addEventListener("change", this);
+    this._isScreenCaptured = true;
+    this._isAnyWindowCaptured = true;
+  }
+
+  requestUpdateAndNotify() {
+    this._updateCaptureState({ forceNotify: true });
+  }
+
+  handleEvent(event) {
+    if (
+      event.changedKeys.includes("webrtcUI:isSharingScreen") ||
+      event.changedKeys.includes("webrtcUI:sharedTopInnerWindowIds")
+    ) {
+      this._updateCaptureState();
+    }
+  }
+
+  _updateCaptureState({ forceNotify = false } = {}) {
+    const previousCaptureState =
+      this._isScreenCaptured || this._isAnyWindowCaptured;
+
+    this._isScreenCaptured = Boolean(
+      Services.cpmm.sharedData.get("webrtcUI:isSharingScreen")
+    );
+
+    const capturedTopInnerWindowIds = Services.cpmm.sharedData.get(
+      "webrtcUI:sharedTopInnerWindowIds"
+    );
+    if (capturedTopInnerWindowIds && capturedTopInnerWindowIds.size > 0) {
+      this._isAnyWindowCaptured = true;
+    } else {
+      this._isAnyWindowCaptured = false;
+    }
+    const newCaptureState = this._isScreenCaptured || this._isAnyWindowCaptured;
+
+    const captureStateChanged = previousCaptureState != newCaptureState;
+
+    if (forceNotify || captureStateChanged) {
+      this._notifyCaptureState();
+    }
+  }
+
+  _notifyCaptureState() {
+    const isCapturePossible =
+      this._isScreenCaptured || this._isAnyWindowCaptured;
+    const isCapturePossibleString = isCapturePossible
+      ? "capture-possible"
+      : "capture-not-possible";
+    Services.obs.notifyObservers(
+      null,
+      "mediakeys-response",
+      isCapturePossibleString
+    );
+  }
+}
+
+const gGlobalCaptureListener = new GlobalCaptureListener();
+
+export class EncryptedMediaChild extends JSWindowActorChild {
+  observe(aSubject, aTopic, aData) {
+    let parsedData;
+    try {
+      parsedData = JSON.parse(aData);
+    } catch (ex) {
+      console.error("Malformed EME video message with data: ", aData);
+      return;
+    }
+    const { status } = parsedData;
+    if (status == "is-capture-possible") {
+      gGlobalCaptureListener.requestUpdateAndNotify();
+      return;
+    }
+
+    this.sendAsyncMessage("EMEVideo:ContentMediaKeysRequest", aData);
+  }
+}

@@ -1,0 +1,17 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+JAR_MANIFESTS += ["jar.mn"]
+
+if CONFIG["MOZ_UPDATER"]:
+    LOCALIZED_GENERATED_FILES += ["updater.ini"]
+    updater = LOCALIZED_GENERATED_FILES["updater.ini"]
+    updater.script = "generate_ini.py"
+    updater.inputs = [
+        "en-US/updater/updater.ini",
+    ]
+    # Yes, this is weird, but what can you do? This file doesn't want to be in the DIST_SUBDIR,
+    # but we can't really move it to a different directory until we change how locale repacks
+    # work.
+    LOCALIZED_FILES[".."] += ["!updater.ini"]

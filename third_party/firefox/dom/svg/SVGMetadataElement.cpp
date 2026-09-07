@@ -1,0 +1,28 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/SVGMetadataElement.h"
+
+#include "mozilla/dom/SVGMetadataElementBinding.h"
+
+NS_IMPL_NS_NEW_SVG_ELEMENT(Metadata)
+
+namespace mozilla::dom {
+
+JSObject* SVGMetadataElement::WrapNode(JSContext* aCx,
+                                       JS::Handle<JSObject*> aGivenProto) {
+  return SVGMetadataElement_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+
+SVGMetadataElement::SVGMetadataElement(
+    already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo)
+    : SVGMetadataElementBase(std::move(aNodeInfo)) {}
+
+nsresult SVGMetadataElement::Init() { return NS_OK; }
+
+
+NS_IMPL_ELEMENT_CLONE_WITH_INIT(SVGMetadataElement)
+
+}  

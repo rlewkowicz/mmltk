@@ -1,0 +1,85 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef NS_IPARSER_
+#define NS_IPARSER_
+
+
+#include "nsISupports.h"
+#include "nsIStreamListener.h"
+#include "nsString.h"
+#include "nsTArray.h"
+#include "nsAtom.h"
+#include "nsParserBase.h"
+#include "mozilla/NotNull.h"
+
+#define NS_IPARSER_IID \
+  {0x2c4ad90a, 0x740e, 0x4212, {0xba, 0x3f, 0xfe, 0xac, 0xda, 0x4b, 0x92, 0x9e}}
+
+class nsIContentSink;
+class nsIRequestObserver;
+class nsIURI;
+class nsIChannel;
+namespace mozilla {
+class Encoding;
+}
+
+enum eParserCommands { eViewNormal, eViewSource, eViewFragment, eViewErrors };
+
+enum eParserDocType { eUnknown = 0, eXML, eHTML_Quirks, eHTML_Strict };
+
+enum eStreamState { eNone, eOnStart, eOnDataAvail, eOnStop };
+
+class nsIParser : public nsParserBase {
+ protected:
+  using Encoding = mozilla::Encoding;
+  template <typename T>
+  using NotNull = mozilla::NotNull<T>;
+
+ public:
+  NS_INLINE_DECL_STATIC_IID(NS_IPARSER_IID)
+
+  NS_IMETHOD_(void) SetContentSink(nsIContentSink* aSink) = 0;
+
+  NS_IMETHOD_(nsIContentSink*) GetContentSink(void) = 0;
+
+  NS_IMETHOD_(void) GetCommand(nsCString& aCommand) = 0;
+  NS_IMETHOD_(void) SetCommand(const char* aCommand) = 0;
+  NS_IMETHOD_(void) SetCommand(eParserCommands aParserCommand) = 0;
+
+  virtual void SetDocumentCharset(NotNull<const Encoding*> aCharset,
+                                  int32_t aSource,
+                                  bool aForceAutoDetection = false) = 0;
+
+  virtual nsIStreamListener* GetStreamListener() = 0;
+
+
+  NS_IMETHOD ContinueInterruptedParsing() = 0;
+
+  NS_IMETHOD_(void) BlockParser() = 0;
+
+  NS_IMETHOD_(void) UnblockParser() = 0;
+
+  NS_IMETHOD_(void) ContinueInterruptedParsingAsync() = 0;
+
+  NS_IMETHOD_(bool) IsParserEnabled() override = 0;
+  NS_IMETHOD_(bool) IsComplete() = 0;
+
+  NS_IMETHOD Parse(nsIURI* aURL) = 0;
+
+  NS_IMETHOD Terminate(void) = 0;
+
+  virtual bool IsInsertionPointDefined() = 0;
+
+  virtual void IncrementScriptNestingLevel() = 0;
+
+  virtual void DecrementScriptNestingLevel() = 0;
+
+  virtual bool HasNonzeroScriptNestingLevel() const = 0;
+
+  virtual bool IsScriptCreated() = 0;
+
+  virtual bool IsAboutBlankMode() = 0;
+};
+
+#endif

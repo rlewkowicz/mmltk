@@ -1,0 +1,35 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+MOZ_SRC_FILES += [
+    "UrlbarMuxerStandard.sys.mjs",
+    "UrlbarParentController.sys.mjs",
+    "UrlbarPrefs.sys.mjs",
+    "UrlbarProviderAboutPages.sys.mjs",
+    "UrlbarProviderActionsSearchMode.sys.mjs",
+    "UrlbarProviderAliasEngines.sys.mjs",
+    "UrlbarProviderHeuristicFallback.sys.mjs",
+    "UrlbarProviderOpenTabs.sys.mjs",
+    "UrlbarProviderPrivateSearch.sys.mjs",
+    "UrlbarProviderRestrictKeywords.sys.mjs",
+    "UrlbarProviderRestrictKeywordsAutofill.sys.mjs",
+    "UrlbarProvidersManager.sys.mjs",
+    "UrlbarProviderTokenAliasEngines.sys.mjs",
+    "UrlbarSearchOneOffs.sys.mjs",
+    "UrlbarSearchTermsPersistence.sys.mjs",
+    "UrlbarSearchUtils.sys.mjs",
+    "UrlbarTokenizer.sys.mjs",
+    "UrlbarUtils.sys.mjs",
+    "UrlbarValueFormatter.sys.mjs",
+]
+
+if CONFIG["MOZ_PLACES"]:
+    MOZ_SRC_FILES += [
+        "UrlbarProviderAutofill.sys.mjs",
+        "UrlbarProviderBookmarkKeywords.sys.mjs",
+        "UrlbarProviderHistoryUrlHeuristic.sys.mjs",
+        "UrlbarProviderPlaces.sys.mjs",
+    ]
+
+JAR_MANIFESTS += ["jar.mn"]

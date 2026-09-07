@@ -1,0 +1,251 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsHtml5TokenizerLoopPoliciesALU_h
+#define nsHtml5TokenizerLoopPoliciesALU_h
+
+#include "mozilla/Utf16.h"
+
+struct nsHtml5FastestPolicyALU {
+  static const bool reportErrors = false;
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static int32_t transition(
+      nsHtml5Highlighter* aHighlighter, int32_t aState, bool aReconsume,
+      int32_t aPos) {
+    return aState;
+  }
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static void completedNamedCharacterReference(
+      nsHtml5Highlighter* aHighlighter) {}
+
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static int32_t accelerateAdvancementData(
+      nsHtml5Tokenizer* aTokenizer, char16_t* buf, int32_t pos,
+      int32_t endPos) {
+    return 0;
+  }
+
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static int32_t accelerateAdvancementRawtext(
+      nsHtml5Tokenizer* aTokenizer, char16_t* buf, int32_t pos,
+      int32_t endPos) {
+    return 0;
+  }
+
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static int32_t
+  accelerateAdvancementScriptDataEscaped(nsHtml5Tokenizer* aTokenizer,
+                                         char16_t* buf, int32_t pos,
+                                         int32_t endPos) {
+    return 0;
+  }
+
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static int32_t accelerateAdvancementComment(
+      nsHtml5Tokenizer* aTokenizer, char16_t* buf, int32_t pos,
+      int32_t endPos) {
+    return 0;
+  }
+
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static int32_t
+  accelerateAdvancementAttributeValueSingleQuoted(nsHtml5Tokenizer* aTokenizer,
+                                                  char16_t* buf, int32_t pos,
+                                                  int32_t endPos) {
+    return 0;
+  }
+
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static int32_t
+  accelerateAdvancementAttributeValueDoubleQuoted(nsHtml5Tokenizer* aTokenizer,
+                                                  char16_t* buf, int32_t pos,
+                                                  int32_t endPos) {
+    return 0;
+  }
+
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static int32_t accelerateAdvancementCdataSection(
+      nsHtml5Tokenizer* aTokenizer, char16_t* buf, int32_t pos,
+      int32_t endPos) {
+    return 0;
+  }
+
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static int32_t accelerateAdvancementPlaintext(
+      nsHtml5Tokenizer* aTokenizer, char16_t* buf, int32_t pos,
+      int32_t endPos) {
+    return 0;
+  }
+
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static char16_t checkChar(
+      nsHtml5Tokenizer* aTokenizer, char16_t* buf, int32_t pos) {
+    return buf[pos];
+  }
+
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static void silentCarriageReturn(
+      nsHtml5Tokenizer* aTokenizer) {
+    aTokenizer->lastCR = true;
+  }
+
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static void silentLineFeed(
+      nsHtml5Tokenizer* aTokenizer) {}
+};
+
+struct nsHtml5LineColPolicyALU {
+  static const bool reportErrors = false;
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static int32_t transition(
+      nsHtml5Highlighter* aHighlighter, int32_t aState, bool aReconsume,
+      int32_t aPos) {
+    return aState;
+  }
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static void completedNamedCharacterReference(
+      nsHtml5Highlighter* aHighlighter) {}
+
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static int32_t accelerateAdvancementData(
+      nsHtml5Tokenizer* aTokenizer, char16_t* buf, int32_t pos,
+      int32_t endPos) {
+    return 0;
+  }
+
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static int32_t accelerateAdvancementRawtext(
+      nsHtml5Tokenizer* aTokenizer, char16_t* buf, int32_t pos,
+      int32_t endPos) {
+    return 0;
+  }
+
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static int32_t
+  accelerateAdvancementScriptDataEscaped(nsHtml5Tokenizer* aTokenizer,
+                                         char16_t* buf, int32_t pos,
+                                         int32_t endPos) {
+    return 0;
+  }
+
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static int32_t accelerateAdvancementComment(
+      nsHtml5Tokenizer* aTokenizer, char16_t* buf, int32_t pos,
+      int32_t endPos) {
+    return 0;
+  }
+
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static int32_t
+  accelerateAdvancementAttributeValueSingleQuoted(nsHtml5Tokenizer* aTokenizer,
+                                                  char16_t* buf, int32_t pos,
+                                                  int32_t endPos) {
+    return 0;
+  }
+
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static int32_t
+  accelerateAdvancementAttributeValueDoubleQuoted(nsHtml5Tokenizer* aTokenizer,
+                                                  char16_t* buf, int32_t pos,
+                                                  int32_t endPos) {
+    return 0;
+  }
+
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static int32_t accelerateAdvancementCdataSection(
+      nsHtml5Tokenizer* aTokenizer, char16_t* buf, int32_t pos,
+      int32_t endPos) {
+    return 0;
+  }
+
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static int32_t accelerateAdvancementPlaintext(
+      nsHtml5Tokenizer* aTokenizer, char16_t* buf, int32_t pos,
+      int32_t endPos) {
+    return 0;
+  }
+
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static char16_t checkChar(
+      nsHtml5Tokenizer* aTokenizer, char16_t* buf, int32_t pos) {
+    char16_t c = buf[pos];
+    if (MOZ_UNLIKELY(aTokenizer->nextCharOnNewLine)) {
+      aTokenizer->line++;
+      aTokenizer->col = 1;
+      aTokenizer->nextCharOnNewLine = false;
+    } else if (MOZ_LIKELY(!mozilla::IsLowSurrogate(c))) {
+      aTokenizer->col++;
+    }
+    return c;
+  }
+
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static void silentCarriageReturn(
+      nsHtml5Tokenizer* aTokenizer) {
+    aTokenizer->nextCharOnNewLine = true;
+    aTokenizer->lastCR = true;
+  }
+
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static void silentLineFeed(
+      nsHtml5Tokenizer* aTokenizer) {
+    aTokenizer->nextCharOnNewLine = true;
+  }
+};
+
+struct nsHtml5ViewSourcePolicyALU {
+  static const bool reportErrors = true;
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static int32_t transition(
+      nsHtml5Highlighter* aHighlighter, int32_t aState, bool aReconsume,
+      int32_t aPos) {
+    return aHighlighter->Transition(aState, aReconsume, aPos);
+  }
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static void completedNamedCharacterReference(
+      nsHtml5Highlighter* aHighlighter) {
+    aHighlighter->CompletedNamedCharacterReference();
+  }
+
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static int32_t accelerateAdvancementData(
+      nsHtml5Tokenizer* aTokenizer, char16_t* buf, int32_t pos,
+      int32_t endPos) {
+    return 0;
+  }
+
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static int32_t accelerateAdvancementRawtext(
+      nsHtml5Tokenizer* aTokenizer, char16_t* buf, int32_t pos,
+      int32_t endPos) {
+    return 0;
+  }
+
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static int32_t
+  accelerateAdvancementScriptDataEscaped(nsHtml5Tokenizer* aTokenizer,
+                                         char16_t* buf, int32_t pos,
+                                         int32_t endPos) {
+    return 0;
+  }
+
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static int32_t accelerateAdvancementComment(
+      nsHtml5Tokenizer* aTokenizer, char16_t* buf, int32_t pos,
+      int32_t endPos) {
+    return 0;
+  }
+
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static int32_t
+  accelerateAdvancementAttributeValueSingleQuoted(nsHtml5Tokenizer* aTokenizer,
+                                                  char16_t* buf, int32_t pos,
+                                                  int32_t endPos) {
+    return 0;
+  }
+
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static int32_t
+  accelerateAdvancementAttributeValueDoubleQuoted(nsHtml5Tokenizer* aTokenizer,
+                                                  char16_t* buf, int32_t pos,
+                                                  int32_t endPos) {
+    return 0;
+  }
+
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static int32_t accelerateAdvancementCdataSection(
+      nsHtml5Tokenizer* aTokenizer, char16_t* buf, int32_t pos,
+      int32_t endPos) {
+    return 0;
+  }
+
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static int32_t accelerateAdvancementPlaintext(
+      nsHtml5Tokenizer* aTokenizer, char16_t* buf, int32_t pos,
+      int32_t endPos) {
+    return 0;
+  }
+
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static char16_t checkChar(
+      nsHtml5Tokenizer* aTokenizer, char16_t* buf, int32_t pos) {
+    return buf[pos];
+  }
+
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static void silentCarriageReturn(
+      nsHtml5Tokenizer* aTokenizer) {
+    aTokenizer->line++;
+    aTokenizer->lastCR = true;
+  }
+
+  MOZ_ALWAYS_INLINE_EVEN_DEBUG static void silentLineFeed(
+      nsHtml5Tokenizer* aTokenizer) {
+    aTokenizer->line++;
+  }
+};
+
+#endif  // nsHtml5TokenizerLoopPoliciesALU_h

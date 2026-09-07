@@ -1,0 +1,283 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef nsTableRowFrame_h_
+#define nsTableRowFrame_h_
+
+#include "mozilla/WritingModes.h"
+#include "nsContainerFrame.h"
+#include "nsTableRowGroupFrame.h"
+#include "nscore.h"
+
+class nsTableCellFrame;
+namespace mozilla {
+class PresShell;
+struct TableCellReflowInput;
+
+enum class ForceAlignTopForTableCell : uint8_t { No, Yes };
+}  
+
+class nsTableRowFrame : public nsContainerFrame {
+  using TableCellReflowInput = mozilla::TableCellReflowInput;
+
+ public:
+  NS_DECL_QUERYFRAME
+  NS_DECL_FRAMEARENA_HELPERS(nsTableRowFrame)
+
+  virtual ~nsTableRowFrame();
+
+  void Init(nsIContent* aContent, nsContainerFrame* aParent,
+            nsIFrame* aPrevInFlow) override;
+
+  void Destroy(DestroyContext&) override;
+
+  void DidSetComputedStyle(ComputedStyle* aOldComputedStyle) override;
+
+  void AppendFrames(ChildListID aListID, nsFrameList&& aFrameList) override;
+  void InsertFrames(ChildListID aListID, nsIFrame* aPrevFrame,
+                    const nsLineList::iterator* aPrevFrameLine,
+                    nsFrameList&& aFrameList) override;
+  void RemoveFrame(DestroyContext&, ChildListID, nsIFrame*) override;
+
+  friend nsTableRowFrame* NS_NewTableRowFrame(mozilla::PresShell* aPresShell,
+                                              ComputedStyle* aStyle);
+
+  nsTableRowGroupFrame* GetTableRowGroupFrame() const {
+    nsIFrame* parent = GetParent();
+    MOZ_ASSERT(parent && parent->IsTableRowGroupFrame());
+    return static_cast<nsTableRowGroupFrame*>(parent);
+  }
+
+  nsTableFrame* GetTableFrame() const {
+    return GetTableRowGroupFrame()->GetTableFrame();
+  }
+
+  nsMargin GetUsedMargin() const override;
+  nsMargin GetUsedBorder() const override;
+  nsMargin GetUsedPadding() const override;
+
+  void BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                        const nsDisplayListSet& aLists) override;
+
+  void PaintCellBackgroundsForFrame(nsIFrame* aFrame,
+                                    nsDisplayListBuilder* aBuilder,
+                                    const nsDisplayListSet& aLists,
+                                    const nsPoint& aOffset = nsPoint());
+
+  inline nsTableCellFrame* GetFirstCell() const;
+
+  void Reflow(nsPresContext* aPresContext, ReflowOutput& aDesiredSize,
+              const ReflowInput& aReflowInput,
+              nsReflowStatus& aStatus) override;
+
+  void DidResize(mozilla::ForceAlignTopForTableCell aForceAlignTop =
+                     mozilla::ForceAlignTopForTableCell::No);
+
+#ifdef DEBUG_FRAME_DUMP
+  nsresult GetFrameName(nsAString& aResult) const override;
+#endif
+
+  void UpdateBSize(nscoord aBSize, nsTableFrame* aTableFrame,
+                   nsTableCellFrame* aCellFrame);
+
+  void ResetBSize();
+
+  nscoord CalcBSize(const ReflowInput& aReflowInput);
+
+
+  nscoord GetMaxCellAscent() const;
+
+  Maybe<nscoord> GetRowBaseline(mozilla::WritingMode aWM);
+
+  virtual int32_t GetRowIndex() const;
+
+  void SetRowIndex(int aRowIndex);
+
+  int32_t GetAdjustmentForStoredIndex(int32_t aStoredIndex) const;
+
+  void AddDeletedRowIndex();
+
+  nscoord ReflowCellFrame(nsPresContext* aPresContext,
+                          const ReflowInput& aReflowInput, bool aIsTopOfPage,
+                          nsTableCellFrame* aCellFrame, nscoord aAvailableBSize,
+                          nsReflowStatus& aStatus);
+  nscoord CollapseRowIfNecessary(nscoord aRowOffset, nscoord aISize,
+                                 bool aCollapseGroup, bool& aDidCollapse);
+
+  void InsertCellFrame(nsTableCellFrame* aFrame, int32_t aColIndex);
+
+  nscoord CalcCellActualBSize(nsTableCellFrame* aCellFrame,
+                              const nscoord& aDesiredBSize,
+                              mozilla::WritingMode aWM);
+
+  bool IsFirstInserted() const;
+  void SetFirstInserted(bool aValue);
+
+  nscoord GetContentBSize() const;
+  void SetContentBSize(nscoord aTwipValue);
+
+  bool HasStyleBSize() const;
+
+  bool HasFixedBSize() const;
+  void SetHasFixedBSize(bool aValue);
+
+  bool HasPctBSize() const;
+  void SetHasPctBSize(bool aValue);
+
+  nscoord GetFixedBSize() const;
+  void SetFixedBSize(nscoord aValue);
+
+  float GetPctBSize() const;
+  void SetPctBSize(float aPctValue, bool aForce = false);
+
+  nscoord GetInitialBSize(nscoord aBasis = 0) const;
+
+  nsTableRowFrame* GetPrevRow() const;
+  nsTableRowFrame* GetNextRow() const;
+
+  bool HasUnpaginatedBSize() const {
+    return HasAnyStateBits(NS_TABLE_ROW_HAS_UNPAGINATED_BSIZE);
+  }
+  nscoord GetUnpaginatedBSize() const;
+  void SetUnpaginatedBSize(nscoord aValue);
+
+  nscoord GetBStartBCBorderWidth() const { return mBStartBorderWidth; }
+  nscoord GetBEndBCBorderWidth() const { return mBEndBorderWidth; }
+  void SetBStartBCBorderWidth(nscoord aWidth) { mBStartBorderWidth = aWidth; }
+  void SetBEndBCBorderWidth(nscoord aWidth) { mBEndBorderWidth = aWidth; }
+  mozilla::LogicalMargin GetBCBorderWidth(mozilla::WritingMode aWM);
+
+  void InvalidateFrame(uint32_t aDisplayItemKey = 0,
+                       bool aRebuildDisplayItems = true) override;
+  void InvalidateFrameWithRect(const nsRect& aRect,
+                               uint32_t aDisplayItemKey = 0,
+                               bool aRebuildDisplayItems = true) override;
+  void InvalidateFrameForRemoval() override { InvalidateFrameSubtree(); }
+
+#ifdef ACCESSIBILITY
+  mozilla::a11y::AccType AccessibleType() override;
+#endif
+
+ protected:
+  explicit nsTableRowFrame(ComputedStyle* aStyle, nsPresContext* aPresContext,
+                           ClassID aID = kClassID);
+
+  void InitChildReflowInput(nsPresContext& aPresContext,
+                            const mozilla::LogicalSize& aAvailSize,
+                            bool aBorderCollapse,
+                            TableCellReflowInput& aReflowInput);
+
+  LogicalSides GetLogicalSkipSides() const override;
+
+
+  nscoord ComputeCellXOffset(const ReflowInput& aState, nsIFrame* aKidFrame,
+                             const nsMargin& aKidMargin) const;
+  void ReflowChildren(nsPresContext* aPresContext, ReflowOutput& aDesiredSize,
+                      const ReflowInput& aReflowInput,
+                      nsTableFrame& aTableFrame, nsReflowStatus& aStatus);
+
+ private:
+  struct RowBits {
+    unsigned mRowIndex : 29;
+    unsigned mHasFixedBSize : 1;  
+    unsigned mHasPctBSize : 1;  
+    unsigned mFirstInserted : 1;  
+  } mBits;
+
+  nscoord mContentBSize = 0;
+  nscoord mStylePctBSize = 0;
+  nscoord mStyleFixedBSize = 0;
+
+  nscoord mMaxCellAscent = 0;   
+  nscoord mMaxCellDescent = 0;  
+
+  nscoord mBStartBorderWidth = 0;
+  nscoord mBEndBorderWidth = 0;
+  nscoord mIEndContBorderWidth = 0;
+  nscoord mBStartContBorderWidth = 0;
+  nscoord mIStartContBorderWidth = 0;
+
+  void InitHasCellWithStyleBSize(nsTableFrame* aTableFrame);
+};
+
+inline int32_t nsTableRowFrame::GetAdjustmentForStoredIndex(
+    int32_t aStoredIndex) const {
+  nsTableRowGroupFrame* parentFrame = GetTableRowGroupFrame();
+  return parentFrame->GetAdjustmentForStoredIndex(aStoredIndex);
+}
+
+inline void nsTableRowFrame::AddDeletedRowIndex() {
+  nsTableRowGroupFrame* parentFrame = GetTableRowGroupFrame();
+  parentFrame->AddDeletedRowIndex(int32_t(mBits.mRowIndex));
+}
+
+inline int32_t nsTableRowFrame::GetRowIndex() const {
+  int32_t storedRowIndex = int32_t(mBits.mRowIndex);
+  int32_t rowIndexAdjustment = GetAdjustmentForStoredIndex(storedRowIndex);
+  return (storedRowIndex - rowIndexAdjustment);
+}
+
+inline void nsTableRowFrame::SetRowIndex(int aRowIndex) {
+  MOZ_ASSERT(
+      GetTableRowGroupFrame()->GetTableFrame()->IsDeletedRowIndexRangesEmpty(),
+      "mDeletedRowIndexRanges should be empty here!");
+  mBits.mRowIndex = aRowIndex;
+}
+
+inline bool nsTableRowFrame::IsFirstInserted() const {
+  return bool(mBits.mFirstInserted);
+}
+
+inline void nsTableRowFrame::SetFirstInserted(bool aValue) {
+  mBits.mFirstInserted = aValue;
+}
+
+inline bool nsTableRowFrame::HasStyleBSize() const {
+  return (bool)mBits.mHasFixedBSize || (bool)mBits.mHasPctBSize;
+}
+
+inline bool nsTableRowFrame::HasFixedBSize() const {
+  return (bool)mBits.mHasFixedBSize;
+}
+
+inline void nsTableRowFrame::SetHasFixedBSize(bool aValue) {
+  mBits.mHasFixedBSize = aValue;
+}
+
+inline bool nsTableRowFrame::HasPctBSize() const {
+  return (bool)mBits.mHasPctBSize;
+}
+
+inline void nsTableRowFrame::SetHasPctBSize(bool aValue) {
+  mBits.mHasPctBSize = aValue;
+}
+
+inline nscoord nsTableRowFrame::GetContentBSize() const {
+  return mContentBSize;
+}
+
+inline void nsTableRowFrame::SetContentBSize(nscoord aValue) {
+  mContentBSize = aValue;
+}
+
+inline nscoord nsTableRowFrame::GetFixedBSize() const {
+  if (mBits.mHasFixedBSize) {
+    return mStyleFixedBSize;
+  }
+  return 0;
+}
+
+inline float nsTableRowFrame::GetPctBSize() const {
+  if (mBits.mHasPctBSize) {
+    return (float)mStylePctBSize / 100.0f;
+  }
+  return 0.0f;
+}
+
+inline mozilla::LogicalMargin nsTableRowFrame::GetBCBorderWidth(
+    mozilla::WritingMode aWM) {
+  return mozilla::LogicalMargin(aWM, mBStartBorderWidth, 0, mBEndBorderWidth,
+                                0);
+}
+
+#endif

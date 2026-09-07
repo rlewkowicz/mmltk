@@ -1,0 +1,38 @@
+[package]
+name = "sharded-slab"
+version = "0.1.7"
+authors = ["Eliza Weisman <eliza@buoyant.io>"]
+edition = "2018"
+documentation = "https://docs.rs/sharded-slab/"
+homepage = "https://github.com/hawkw/sharded-slab"
+repository = "https://github.com/hawkw/sharded-slab"
+rust-version = "1.42.0"
+license = "MIT"
+keywords = ["slab", "allocator", "lock-free", "atomic"]
+categories = ["memory-management", "data-structures", "concurrency"]
+description = """
+A lock-free concurrent slab.
+"""
+ignore = [
+    "flake.nix",
+    "flake.lock",
+    ".envrc",
+    ".clog.toml",
+    ".cargo",
+    ".github",
+    ".direnv",
+    "bin",
+]
+
+[badges]
+maintenance = { status = "experimental" }
+
+[dependencies]
+lazy_static = "1"
+
+[target.'cfg(loom)'.dependencies]
+loom = { version = "0.5", features = ["checkpoint"], optional = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

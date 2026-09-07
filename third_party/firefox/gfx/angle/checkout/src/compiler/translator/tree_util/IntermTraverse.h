@@ -1,0 +1,288 @@
+// Copyright 2017 The ANGLE Project Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(COMPILER_TRANSLATOR_TREEUTIL_INTERMTRAVERSE_H_)
+#define COMPILER_TRANSLATOR_TREEUTIL_INTERMTRAVERSE_H_
+
+#include "compiler/translator/IntermNode.h"
+#include "compiler/translator/tree_util/Visit.h"
+
+namespace sh
+{
+
+class TCompiler;
+class TSymbolTable;
+class TSymbolUniqueId;
+
+class TIntermTraverser : angle::NonCopyable
+{
+  public:
+    POOL_ALLOCATOR_NEW_DELETE
+    TIntermTraverser(bool preVisitIn,
+                     bool inVisitIn,
+                     bool postVisitIn,
+                     TSymbolTable *symbolTable = nullptr);
+    virtual ~TIntermTraverser();
+
+    virtual void visitSymbol(TIntermSymbol *node) {}
+    virtual void visitConstantUnion(TIntermConstantUnion *node) {}
+    virtual bool visitSwizzle(Visit visit, TIntermSwizzle *node) { return true; }
+    virtual bool visitBinary(Visit visit, TIntermBinary *node) { return true; }
+    virtual bool visitUnary(Visit visit, TIntermUnary *node) { return true; }
+    virtual bool visitTernary(Visit visit, TIntermTernary *node) { return true; }
+    virtual bool visitIfElse(Visit visit, TIntermIfElse *node) { return true; }
+    virtual bool visitSwitch(Visit visit, TIntermSwitch *node) { return true; }
+    virtual bool visitCase(Visit visit, TIntermCase *node) { return true; }
+    virtual void visitFunctionPrototype(TIntermFunctionPrototype *node) {}
+    virtual bool visitFunctionDefinition(Visit visit, TIntermFunctionDefinition *node)
+    {
+        return true;
+    }
+    virtual bool visitAggregate(Visit visit, TIntermAggregate *node) { return true; }
+    virtual bool visitBlock(Visit visit, TIntermBlock *node) { return true; }
+    virtual bool visitGlobalQualifierDeclaration(Visit visit,
+                                                 TIntermGlobalQualifierDeclaration *node)
+    {
+        return true;
+    }
+    virtual bool visitDeclaration(Visit visit, TIntermDeclaration *node) { return true; }
+    virtual bool visitLoop(Visit visit, TIntermLoop *node) { return true; }
+    virtual bool visitBranch(Visit visit, TIntermBranch *node) { return true; }
+    virtual void visitPreprocessorDirective(TIntermPreprocessorDirective *node) {}
+
+
+    template <typename T>
+    void traverse(T *node);
+
+    virtual void traverseBinary(TIntermBinary *node);
+    virtual void traverseUnary(TIntermUnary *node);
+    virtual void traverseFunctionDefinition(TIntermFunctionDefinition *node);
+    virtual void traverseAggregate(TIntermAggregate *node);
+    virtual void traverseBlock(TIntermBlock *node);
+    virtual void traverseLoop(TIntermLoop *node);
+
+    int getMaxDepth() const { return mMaxDepth; }
+
+    [[nodiscard]] bool updateTree(TCompiler *compiler, TIntermNode *node);
+
+  protected:
+    void setMaxAllowedDepth(int depth);
+
+    bool incrementDepth(TIntermNode *current)
+    {
+        mMaxDepth = std::max(mMaxDepth, static_cast<int>(mPath.size()));
+        mPath.push_back(current);
+        return mMaxDepth < mMaxAllowedDepth;
+    }
+
+    void decrementDepth() { mPath.pop_back(); }
+
+    int getCurrentTraversalDepth() const { return static_cast<int>(mPath.size()) - 1; }
+    int getCurrentBlockDepth() const { return static_cast<int>(mParentBlockStack.size()) - 1; }
+
+    class [[nodiscard]] ScopedNodeInTraversalPath
+    {
+      public:
+        ScopedNodeInTraversalPath(TIntermTraverser *traverser, TIntermNode *current)
+            : mTraverser(traverser)
+        {
+            mWithinDepthLimit = mTraverser->incrementDepth(current);
+        }
+        ~ScopedNodeInTraversalPath() { mTraverser->decrementDepth(); }
+
+        bool isWithinDepthLimit() { return mWithinDepthLimit; }
+
+      private:
+        TIntermTraverser *mTraverser;
+        bool mWithinDepthLimit;
+    };
+    friend void TIntermSymbol::traverse(TIntermTraverser *);
+    friend void TIntermConstantUnion::traverse(TIntermTraverser *);
+    friend void TIntermFunctionPrototype::traverse(TIntermTraverser *);
+
+    TIntermNode *getParentNode() const
+    {
+        return mPath.size() <= 1 ? nullptr : mPath[mPath.size() - 2u];
+    }
+
+    TIntermNode *getAncestorNode(unsigned int n) const
+    {
+        if (mPath.size() > n + 1u)
+        {
+            return mPath[mPath.size() - n - 2u];
+        }
+        return nullptr;
+    }
+
+    size_t getParentChildIndex(Visit visit) const
+    {
+        ASSERT(visit == PreVisit);
+        return mCurrentChildIndex;
+    }
+    size_t getLastTraversedChildIndex(Visit visit) const
+    {
+        ASSERT(visit != PreVisit);
+        return mCurrentChildIndex;
+    }
+
+    const TIntermBlock *getParentBlock() const;
+
+    TIntermNode *getRootNode() const
+    {
+        ASSERT(!mPath.empty());
+        return mPath.front();
+    }
+
+    void pushParentBlock(TIntermBlock *node);
+    void incrementParentBlockPos();
+    void popParentBlock();
+
+    struct NodeReplaceWithMultipleEntry
+    {
+        NodeReplaceWithMultipleEntry(TIntermAggregateBase *parentIn,
+                                     TIntermNode *originalIn,
+                                     TIntermSequence &&replacementsIn)
+            : parent(parentIn), original(originalIn), replacements(std::move(replacementsIn))
+        {}
+
+        TIntermAggregateBase *parent;
+        TIntermNode *original;
+        TIntermSequence replacements;
+    };
+
+    void insertStatementsInParentBlock(const TIntermSequence &insertions);
+
+    void insertStatementsInParentBlock(const TIntermSequence &insertionsBefore,
+                                       const TIntermSequence &insertionsAfter);
+
+    void insertStatementInParentBlock(TIntermNode *statement);
+
+    void insertStatementsInBlockAtPosition(TIntermBlock *parent,
+                                           size_t position,
+                                           const TIntermSequence &insertionsBefore,
+                                           const TIntermSequence &insertionsAfter);
+
+    enum class OriginalNode
+    {
+        BECOMES_CHILD,
+        IS_DROPPED
+    };
+
+    void clearReplacementQueue();
+
+    void queueReplacement(TIntermNode *replacement, OriginalNode originalStatus);
+    void queueReplacementWithParent(TIntermNode *parent,
+                                    TIntermNode *original,
+                                    TIntermNode *replacement,
+                                    OriginalNode originalStatus);
+    void queueAccessChainReplacement(TIntermTyped *replacement);
+
+    const bool preVisit;
+    const bool inVisit;
+    const bool postVisit;
+
+    int mMaxDepth;
+    int mMaxAllowedDepth;
+
+    bool mInGlobalScope;
+
+    std::vector<NodeReplaceWithMultipleEntry> mMultiReplacements;
+
+    TSymbolTable *mSymbolTable;
+
+  private:
+    struct NodeInsertMultipleEntry
+    {
+        NodeInsertMultipleEntry(TIntermBlock *_parent,
+                                TIntermSequence::size_type _position,
+                                TIntermSequence _insertionsBefore,
+                                TIntermSequence _insertionsAfter)
+            : parent(_parent),
+              position(_position),
+              insertionsBefore(_insertionsBefore),
+              insertionsAfter(_insertionsAfter)
+        {}
+
+        TIntermBlock *parent;
+        TIntermSequence::size_type position;
+        TIntermSequence insertionsBefore;
+        TIntermSequence insertionsAfter;
+    };
+
+    static bool CompareInsertion(const NodeInsertMultipleEntry &a,
+                                 const NodeInsertMultipleEntry &b);
+
+    struct NodeUpdateEntry
+    {
+        NodeUpdateEntry(TIntermNode *_parent,
+                        TIntermNode *_original,
+                        TIntermNode *_replacement,
+                        bool _originalBecomesChildOfReplacement)
+            : parent(_parent),
+              original(_original),
+              replacement(_replacement),
+              originalBecomesChildOfReplacement(_originalBecomesChildOfReplacement)
+        {}
+
+        TIntermNode *parent;
+        TIntermNode *original;
+        TIntermNode *replacement;
+        bool originalBecomesChildOfReplacement;
+    };
+
+    struct ParentBlock
+    {
+        ParentBlock(TIntermBlock *nodeIn, TIntermSequence::size_type posIn)
+            : node(nodeIn), pos(posIn)
+        {}
+
+        TIntermBlock *node;
+        TIntermSequence::size_type pos;
+    };
+
+    std::vector<NodeInsertMultipleEntry> mInsertions;
+    std::vector<NodeUpdateEntry> mReplacements;
+
+    TVector<TIntermNode *> mPath;
+    size_t mCurrentChildIndex;
+
+    std::vector<ParentBlock> mParentBlockStack;
+};
+
+class TLValueTrackingTraverser : public TIntermTraverser
+{
+  public:
+    TLValueTrackingTraverser(bool preVisit,
+                             bool inVisit,
+                             bool postVisit,
+                             TSymbolTable *symbolTable);
+    ~TLValueTrackingTraverser() override {}
+
+    void traverseBinary(TIntermBinary *node) final;
+    void traverseUnary(TIntermUnary *node) final;
+    void traverseAggregate(TIntermAggregate *node) final;
+
+  protected:
+    bool isLValueRequiredHere() const
+    {
+        return mOperatorRequiresLValue || mInFunctionCallOutParameter;
+    }
+
+  private:
+    void setOperatorRequiresLValue(bool lValueRequired)
+    {
+        mOperatorRequiresLValue = lValueRequired;
+    }
+    bool operatorRequiresLValue() const { return mOperatorRequiresLValue; }
+
+    void setInFunctionCallOutParameter(bool inOutParameter);
+    bool isInFunctionCallOutParameter() const;
+
+    bool mOperatorRequiresLValue;
+    bool mInFunctionCallOutParameter;
+};
+
+}  
+
+#endif

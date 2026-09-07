@@ -1,0 +1,227 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SVG_SVGSVGELEMENT_H_
+#define DOM_SVG_SVGSVGELEMENT_H_
+
+#include "SVGAnimatedEnumeration.h"
+#include "SVGViewportElement.h"
+#include "mozilla/SVGImageContext.h"
+#include "nsString.h"
+
+nsresult NS_NewSVGSVGElement(nsIContent** aResult,
+                             already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo,
+                             mozilla::dom::FromParser aFromParser);
+
+#define MOZILLA_SVGSVGELEMENT_IID \
+  {0x4b83982c, 0xe5e9, 0x4ca1, {0xab, 0xd4, 0x14, 0xd2, 0x7e, 0x8b, 0x35, 0x31}}
+
+namespace mozilla {
+class AutoFragmentHandler;
+class SMILTimeContainer;
+class EventChainPreVisitor;
+
+namespace dom {
+struct DOMMatrix2DInit;
+class DOMSVGAngle;
+class DOMSVGLength;
+class DOMSVGNumber;
+class DOMSVGPoint;
+class SVGMatrix;
+class SVGRect;
+class SVGSVGElement;
+
+class SVGView {
+ public:
+  SVGView();
+
+  SVGAnimatedViewBox mViewBox;
+  std::unique_ptr<SVGAnimatedTransformList> mTransforms;
+  SVGAnimatedPreserveAspectRatio mPreserveAspectRatio;
+  SVGAnimatedEnumeration mZoomAndPan;
+};
+
+using SVGSVGElementBase = SVGViewportElement;
+
+class SVGSVGElement final : public SVGSVGElementBase {
+  friend class mozilla::SVGOuterSVGFrame;
+  friend class mozilla::AutoPreserveAspectRatioOverride;
+  friend class mozilla::AutoFragmentHandler;
+  friend class mozilla::dom::SVGView;
+
+ protected:
+  SVGSVGElement(already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo,
+                FromParser aFromParser);
+  JSObject* WrapNode(JSContext* aCx,
+                     JS::Handle<JSObject*> aGivenProto) override;
+
+  friend nsresult(::NS_NewSVGSVGElement(
+      nsIContent** aResult, already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo,
+      mozilla::dom::FromParser aFromParser));
+
+  ~SVGSVGElement() = default;
+
+ public:
+  NS_IMPL_FROMNODE_WITH_TAG(SVGSVGElement, kNameSpaceID_SVG, svg)
+
+  NS_INLINE_DECL_STATIC_IID(MOZILLA_SVGSVGELEMENT_IID)
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(SVGSVGElement, SVGSVGElementBase)
+
+  MOZ_CAN_RUN_SCRIPT
+  void DidChangeTranslate();
+
+  void GetEventTargetParent(EventChainPreVisitor& aVisitor) override;
+  bool IsEventAttributeNameInternal(nsAtom* aName) override;
+
+  nsresult Clone(dom::NodeInfo*, nsINode** aResult) const override;
+
+  already_AddRefed<DOMSVGAnimatedLength> X();
+  already_AddRefed<DOMSVGAnimatedLength> Y();
+  already_AddRefed<DOMSVGAnimatedLength> Width();
+  already_AddRefed<DOMSVGAnimatedLength> Height();
+  bool UseCurrentView() const;
+  float CurrentScale() const;
+  void SetCurrentScale(float aCurrentScale);
+  already_AddRefed<DOMSVGPoint> CurrentTranslate();
+  uint32_t SuspendRedraw(uint32_t max_wait_milliseconds);
+  void UnsuspendRedraw(uint32_t suspend_handle_id);
+  void UnsuspendRedrawAll();
+  void ForceRedraw();
+  void PauseAnimations();
+  void PauseAnimationsAt(float seconds);
+  void UnpauseAnimations();
+  bool AnimationsPaused();
+  float GetCurrentTimeAsFloat();
+  void SetCurrentTime(float seconds);
+  MOZ_CAN_RUN_SCRIPT void DeselectAll();
+  already_AddRefed<DOMSVGNumber> CreateSVGNumber();
+  already_AddRefed<DOMSVGLength> CreateSVGLength();
+  already_AddRefed<DOMSVGAngle> CreateSVGAngle();
+  already_AddRefed<DOMSVGPoint> CreateSVGPoint();
+  already_AddRefed<SVGMatrix> CreateSVGMatrix();
+  already_AddRefed<SVGRect> CreateSVGRect();
+  already_AddRefed<DOMSVGTransform> CreateSVGTransform();
+  already_AddRefed<DOMSVGTransform> CreateSVGTransformFromMatrix(
+      const DOMMatrix2DInit& matrix, ErrorResult& rv);
+  using nsINode::GetElementById;  
+  uint16_t ZoomAndPan() const;
+  void SetZoomAndPan(uint16_t aZoomAndPan, ErrorResult& rv);
+
+
+  nsresult BindToTree(BindContext&, nsINode& aParent) override;
+  void UnbindFromTree(UnbindContext&) override;
+
+
+  bool IsOverriddenBy(const nsAString& aViewID) const {
+    return !mCurrentViewID.IsVoid() && mCurrentViewID.Equals(aViewID);
+  }
+
+  SVGAnimatedTransformList* GetViewTransformList() const;
+
+  SMILTimeContainer* GetTimedDocumentRoot();
+
+
+  const gfx::Point& GetCurrentTranslate() const { return mCurrentTranslate; }
+  bool IsScaledOrTranslated() const {
+    return mCurrentTranslate != gfx::Point() || mCurrentScale != 1.0f;
+  }
+
+  LengthPercentage GetIntrinsicWidth();
+  LengthPercentage GetIntrinsicHeight();
+  AspectRatio GetIntrinsicRatio();
+  gfx::Size GetIntrinsicSizeWithFallback();
+
+  virtual void FlushImageTransformInvalidation();
+
+  void SetCurrentView(const nsAString& aCurrentViewID);
+  void SetViewSpec(std::unique_ptr<SVGView> aSVGView);
+
+ private:
+
+  virtual SVGViewElement* GetCurrentViewElement() const;
+  SVGPreserveAspectRatio GetPreserveAspectRatioWithOverride() const override;
+
+
+  bool WillBeOutermostSVG(nsINode& aParent) const;
+
+  LengthPercentage GetIntrinsicWidthOrHeight(int aAttr);
+
+  void InvalidateTransformNotifyFrame();
+
+  void SetImageOverridePreserveAspectRatio(const SVGPreserveAspectRatio& aPAR);
+  void ClearImageOverridePreserveAspectRatio();
+
+  bool SetPreserveAspectRatioProperty(const SVGPreserveAspectRatio& aPAR);
+  const SVGPreserveAspectRatio* GetPreserveAspectRatioProperty() const;
+  bool ClearPreserveAspectRatioProperty();
+
+  const SVGAnimatedViewBox& GetViewBoxInternal() const override;
+
+  EnumAttributesInfo GetEnumInfo() override;
+
+  std::unique_ptr<SMILTimeContainer> mTimedDocumentRoot;
+
+  nsString mCurrentViewID = VoidString();
+  std::unique_ptr<SVGView> mSVGView;
+
+  gfx::Point mCurrentTranslate;
+  float mCurrentScale = 1.0f;
+
+  enum { ZOOMANDPAN };
+  SVGAnimatedEnumeration mEnumAttributes[1];
+  static SVGEnumMapping sZoomAndPanMap[];
+  static EnumInfo sEnumInfo[1];
+
+  bool mStartAnimationOnBindToTree : 1;
+
+  bool mImageNeedsTransformInvalidation : 1 = false;
+};
+
+}  
+
+class MOZ_RAII AutoSVGTimeSetRestore {
+ public:
+  AutoSVGTimeSetRestore(dom::SVGSVGElement* aRootElem, float aFrameTime)
+      : mRootElem(aRootElem),
+        mOriginalTime(mRootElem->GetCurrentTimeAsFloat()) {
+    mRootElem->SetCurrentTime(
+        aFrameTime);  
+  }
+
+  ~AutoSVGTimeSetRestore() { mRootElem->SetCurrentTime(mOriginalTime); }
+
+ private:
+  const RefPtr<dom::SVGSVGElement> mRootElem;
+  const float mOriginalTime;
+};
+
+class MOZ_RAII AutoPreserveAspectRatioOverride {
+ public:
+  AutoPreserveAspectRatioOverride(const SVGImageContext& aSVGContext,
+                                  dom::SVGSVGElement* aRootElem)
+      : mRootElem(aRootElem), mDidOverride(false) {
+    MOZ_ASSERT(mRootElem, "No SVG/Symbol node to manage?");
+
+    if (aSVGContext.GetPreserveAspectRatio().isSome()) {
+      mRootElem->SetImageOverridePreserveAspectRatio(
+          *aSVGContext.GetPreserveAspectRatio());
+      mDidOverride = true;
+    }
+  }
+
+  ~AutoPreserveAspectRatioOverride() {
+    if (mDidOverride) {
+      mRootElem->ClearImageOverridePreserveAspectRatio();
+    }
+  }
+
+ private:
+  const RefPtr<dom::SVGSVGElement> mRootElem;
+  bool mDidOverride;
+};
+
+}  
+
+#endif  // DOM_SVG_SVGSVGELEMENT_H_

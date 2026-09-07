@@ -1,0 +1,123 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "CacheStreamControlChild.h"
+
+#include "mozilla/dom/cache/ActorUtils.h"
+#include "mozilla/dom/cache/CacheTypes.h"
+#include "mozilla/dom/cache/CacheWorkerRef.h"
+#include "mozilla/ipc/IPCStreamUtils.h"
+#include "mozilla/ipc/PBackgroundChild.h"
+#include "nsISupportsImpl.h"
+
+namespace mozilla::dom::cache {
+
+using mozilla::ipc::FileDescriptor;
+
+already_AddRefed<PCacheStreamControlChild> AllocPCacheStreamControlChild(
+    ActorChild* aParentActor) {
+  return MakeAndAddRef<CacheStreamControlChild>(aParentActor);
+}
+
+CacheStreamControlChild::CacheStreamControlChild(ActorChild* aParentActor)
+    : mParentActor(aParentActor),
+      mDestroyStarted(false),
+      mDestroyDelayed(false) {
+  MOZ_COUNT_CTOR(cache::CacheStreamControlChild);
+}
+
+CacheStreamControlChild::~CacheStreamControlChild() {
+  NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
+  MOZ_COUNT_DTOR(cache::CacheStreamControlChild);
+}
+
+void CacheStreamControlChild::StartDestroy() {
+  NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
+  if (mDestroyStarted) {
+    return;
+  }
+  mDestroyStarted = true;
+
+  if (HasEverBeenRead()) {
+    mDestroyDelayed = true;
+    return;
+  }
+
+
+  RecvCloseAll();
+}
+
+void CacheStreamControlChild::SerializeControl(
+    CacheReadStream* aReadStreamOut) {
+  NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
+  MOZ_DIAGNOSTIC_ASSERT(aReadStreamOut);
+  aReadStreamOut->control() = this;
+}
+
+void CacheStreamControlChild::SerializeStream(CacheReadStream* aReadStreamOut,
+                                              nsIInputStream* aStream) {
+  NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
+  MOZ_DIAGNOSTIC_ASSERT(aReadStreamOut);
+  MOZ_ALWAYS_TRUE(mozilla::ipc::SerializeIPCStream(
+      do_AddRef(aStream), aReadStreamOut->stream(),  false));
+}
+
+void CacheStreamControlChild::OpenStream(const nsID& aId,
+                                         InputStreamResolver&& aResolver) {
+  NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
+
+  if (mDestroyStarted) {
+    aResolver(nullptr);
+    return;
+  }
+
+  const SafeRefPtr<CacheWorkerRef> holder = GetWorkerRefPtr().clonePtr();
+
+  SendOpenStream(aId)->Then(
+      GetCurrentSerialEventTarget(), __func__,
+      [aResolver,
+       holder = holder.clonePtr()](const Maybe<IPCStream>& aOptionalStream) {
+        nsCOMPtr<nsIInputStream> stream = DeserializeIPCStream(aOptionalStream);
+        aResolver(std::move(stream));
+      },
+      [aResolver, holder = holder.clonePtr()](ResponseRejectReason&& aReason) {
+        aResolver(nullptr);
+      });
+}
+
+void CacheStreamControlChild::NoteClosedAfterForget(const nsID& aId) {
+  NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
+
+  QM_WARNONLY_TRY(OkIf(SendNoteClosed(aId)));
+
+  if (mDestroyDelayed && !HasEverBeenRead()) {
+    mDestroyDelayed = false;
+    RecvCloseAll();
+  }
+}
+
+#ifdef DEBUG
+void CacheStreamControlChild::AssertOwningThread() {
+  NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
+}
+#endif
+
+void CacheStreamControlChild::ActorDestroy(ActorDestroyReason aReason) {
+  NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
+  CloseAllReadStreamsWithoutReporting();
+
+  if (mParentActor) {
+    mParentActor->NoteDeletedActor();
+  }
+
+  RemoveWorkerRef();
+}
+
+mozilla::ipc::IPCResult CacheStreamControlChild::RecvCloseAll() {
+  NS_ASSERT_OWNINGTHREAD(CacheStreamControlChild);
+  CloseAllReadStreams();
+  return IPC_OK();
+}
+
+}  

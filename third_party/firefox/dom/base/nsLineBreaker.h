@@ -1,0 +1,139 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef NSLINEBREAKER_H_
+#define NSLINEBREAKER_H_
+
+#include "mozilla/intl/LineBreaker.h"
+#include "mozilla/intl/Segmenter.h"
+#include "nsString.h"
+#include "nsTArray.h"
+
+class nsAtom;
+
+class nsILineBreakSink {
+ public:
+  virtual void SetBreaks(uint32_t aStart, uint32_t aLength,
+                         uint8_t* aBreakBefore) = 0;
+
+  virtual void SetCapitalization(uint32_t aStart, uint32_t aLength,
+                                 bool* aCapitalize) = 0;
+};
+
+class nsLineBreaker {
+ public:
+  nsLineBreaker() = default;
+  ~nsLineBreaker();
+
+  static inline bool IsSpace(char16_t u) {
+    return mozilla::intl::NS_IsSpace(u);
+  }
+
+  static bool ShouldCapitalize(uint32_t aChar, bool& aCapitalizeNext);
+
+
+  enum {
+    BREAK_SUPPRESS_INITIAL = 0x01,
+    BREAK_SUPPRESS_INSIDE = 0x02,
+    BREAK_SKIP_SETTING_NO_BREAKS = 0x04,
+    BREAK_NEED_CAPITALIZATION = 0x08,
+    BREAK_USE_AUTO_HYPHENATION = 0x10
+  };
+
+  nsresult AppendInvisibleWhitespace(uint32_t aFlags);
+
+  nsresult AppendText(nsAtom* aHyphenationLanguage, const char16_t* aText,
+                      uint32_t aLength, uint32_t aFlags,
+                      nsILineBreakSink* aSink);
+  nsresult AppendText(nsAtom* aHyphenationLanguage, const uint8_t* aText,
+                      uint32_t aLength, uint32_t aFlags,
+                      nsILineBreakSink* aSink);
+  nsresult Reset(bool* aTrailingBreak);
+
+  void SetWordBreak(mozilla::intl::WordBreakRule aMode) {
+    if (aMode != mWordBreak && !mCurrentWord.IsEmpty()) {
+      nsresult rv = FlushCurrentWord();
+      if (NS_FAILED(rv)) {
+        NS_WARNING("FlushCurrentWord failed, line-breaks may be wrong");
+      }
+      if (mWordBreak == mozilla::intl::WordBreakRule::BreakAll) {
+        mBreakHere = true;
+      }
+    }
+    mWordBreak = aMode;
+  }
+
+  void SetStrictness(mozilla::intl::LineBreakRule aMode) {
+    if (aMode != mLineBreak && !mCurrentWord.IsEmpty()) {
+      nsresult rv = FlushCurrentWord();
+      if (NS_FAILED(rv)) {
+        NS_WARNING("FlushCurrentWord failed, line-breaks may be wrong");
+      }
+      if (mLineBreak == mozilla::intl::LineBreakRule::Anywhere) {
+        mBreakHere = true;
+      }
+    }
+    mLineBreak = aMode;
+  }
+
+  bool InWord() const { return !mCurrentWord.IsEmpty(); }
+
+  void SetWordContinuation(bool aContinuation) {
+    mWordContinuation = aContinuation;
+  }
+
+  void SetHyphenateLimitChars(uint32_t aWordLength, uint32_t aStartLength,
+                              uint32_t aEndLength) {
+    mHyphenateLimitWord = std::min(255u, aWordLength);
+    mHyphenateLimitStart = std::min(255u, aStartLength);
+    mHyphenateLimitEnd = std::min(255u, aEndLength);
+  }
+
+ private:
+  struct TextItem {
+    TextItem(nsILineBreakSink* aSink, uint32_t aSinkOffset, uint32_t aLength,
+             uint32_t aFlags)
+        : mSink(aSink),
+          mSinkOffset(aSinkOffset),
+          mLength(aLength),
+          mFlags(aFlags) {}
+
+    nsILineBreakSink* mSink;
+    uint32_t mSinkOffset;
+    uint32_t mLength;
+    uint32_t mFlags;
+  };
+
+
+  nsresult FlushCurrentWord();
+
+  void UpdateCurrentWordLanguage(nsAtom* aHyphenationLanguage);
+
+  inline constexpr bool IsSegmentSpace(char16_t u) const {
+    return u == 0x0020 ||  
+           u == 0x0009 ||  
+           u == 0x000D;    
+  }
+
+  AutoTArray<char16_t, 100> mCurrentWord;
+  AutoTArray<TextItem, 2> mTextItems;
+  nsAtom* mCurrentWordLanguage = nullptr;
+
+  uint8_t mHyphenateLimitWord = 0;   
+  uint8_t mHyphenateLimitStart = 0;  
+  uint8_t mHyphenateLimitEnd = 0;    
+
+  bool mCurrentWordContainsMixedLang = false;
+  bool mCurrentWordMightBeBreakable = false;
+  bool mScriptIsChineseOrJapanese = false;
+
+  bool mAfterBreakableSpace = false;
+  bool mBreakHere = false;
+  mozilla::intl::WordBreakRule mWordBreak =
+      mozilla::intl::WordBreakRule::Normal;
+  mozilla::intl::LineBreakRule mLineBreak = mozilla::intl::LineBreakRule::Auto;
+  bool mWordContinuation = false;
+};
+
+#endif /*NSLINEBREAKER_H_*/

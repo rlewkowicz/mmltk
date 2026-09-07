@@ -1,0 +1,173 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_ICState_h
+#define jit_ICState_h
+
+#include "jit/JitOptions.h"
+
+namespace js {
+namespace jit {
+
+enum class TrialInliningState : uint8_t {
+  Initial = 0,
+  Candidate,
+  Inlined,
+  MonomorphicInlined,
+  Failure,
+};
+
+class ICState {
+ public:
+  enum class Mode : uint8_t { Specialized = 0, Megamorphic, Generic };
+
+ private:
+  uint8_t mode_ : 2;
+
+  uint8_t trialInliningState_ : 3;
+
+  bool usedByTranspiler_ : 1;
+
+  bool mayHaveFoldedStub_ : 1;
+
+  uint8_t numOptimizedStubs_;
+
+  uint8_t numFailures_;
+
+  static const size_t MaxOptimizedStubs = 6;
+
+  void setMode(Mode mode) {
+    mode_ = uint32_t(mode);
+    MOZ_ASSERT(Mode(mode_) == mode, "mode must fit in bitfield");
+  }
+
+  void transition(Mode mode) {
+    MOZ_ASSERT(mode > this->mode());
+    setMode(mode);
+    numFailures_ = 0;
+  }
+
+  MOZ_ALWAYS_INLINE size_t maxFailures() const {
+    static_assert(MaxOptimizedStubs == 6,
+                  "numFailures_/maxFailures should fit in uint8_t");
+    size_t res = 5 + size_t(40) * numOptimizedStubs_;
+    MOZ_ASSERT(res <= UINT8_MAX, "numFailures_ should not overflow");
+    return res;
+  }
+
+ public:
+  ICState() { reset(); }
+
+  Mode mode() const { return Mode(mode_); }
+  size_t numOptimizedStubs() const { return numOptimizedStubs_; }
+  bool hasFailures() const { return (numFailures_ != 0); }
+  bool newStubIsFirstStub() const {
+    return (mode() == Mode::Specialized && numOptimizedStubs() == 0);
+  }
+
+  MOZ_ALWAYS_INLINE bool canAttachStub() const {
+    if (mode() == Mode::Generic || JitOptions.disableCacheIR) {
+      return false;
+    }
+    return true;
+  }
+
+  [[nodiscard]] MOZ_ALWAYS_INLINE bool shouldTransition() {
+    if (mode() == Mode::Generic) {
+      return false;
+    }
+    if (numOptimizedStubs_ < MaxOptimizedStubs &&
+        numFailures_ < maxFailures()) {
+      return false;
+    }
+    return true;
+  }
+
+  [[nodiscard]] MOZ_ALWAYS_INLINE bool maybeTransition() {
+    if (!shouldTransition()) {
+      return false;
+    }
+    forceTransition();
+    return true;
+  }
+
+  MOZ_ALWAYS_INLINE void forceTransition() {
+    if (numFailures_ >= maxFailures() || mode() == Mode::Megamorphic) {
+      transition(Mode::Generic);
+    } else {
+      MOZ_ASSERT(mode() == Mode::Specialized);
+      transition(Mode::Megamorphic);
+    }
+  }
+
+  void reset() {
+    setMode(Mode::Specialized);
+#ifdef DEBUG
+    if (JitOptions.forceMegamorphicICs) {
+      setMode(Mode::Megamorphic);
+    }
+#endif
+    trialInliningState_ = uint32_t(TrialInliningState::Initial);
+    usedByTranspiler_ = false;
+    mayHaveFoldedStub_ = false;
+    numOptimizedStubs_ = 0;
+    numFailures_ = 0;
+  }
+  void trackAttached() {
+    MOZ_ASSERT(numOptimizedStubs_ < 16);
+    numOptimizedStubs_++;
+    numFailures_ = std::min(numFailures_, static_cast<uint8_t>(1));
+  }
+  void trackNotAttached() {
+    numFailures_++;
+    MOZ_ASSERT(numFailures_ > 0, "numFailures_ should not overflow");
+  }
+  void trackUnlinkedStub() {
+    MOZ_ASSERT(numOptimizedStubs_ > 0);
+    numOptimizedStubs_--;
+  }
+  void trackUnlinkedAllStubs() { numOptimizedStubs_ = 0; }
+
+  void clearUsedByTranspiler() { usedByTranspiler_ = false; }
+  void setUsedByTranspiler() { usedByTranspiler_ = true; }
+  bool usedByTranspiler() const { return usedByTranspiler_; }
+
+  void clearMayHaveFoldedStub() { mayHaveFoldedStub_ = false; }
+  void setMayHaveFoldedStub() { mayHaveFoldedStub_ = true; }
+  bool mayHaveFoldedStub() const { return mayHaveFoldedStub_; }
+
+  TrialInliningState trialInliningState() const {
+    return TrialInliningState(trialInliningState_);
+  }
+  void setTrialInliningState(TrialInliningState state) {
+#ifdef DEBUG
+    if (state != TrialInliningState::Failure) {
+      switch (trialInliningState()) {
+        case TrialInliningState::Initial:
+          MOZ_ASSERT(state == TrialInliningState::Candidate);
+          break;
+        case TrialInliningState::Candidate:
+          MOZ_ASSERT(state == TrialInliningState::Candidate ||
+                     state == TrialInliningState::Inlined ||
+                     state == TrialInliningState::MonomorphicInlined);
+          break;
+        case TrialInliningState::Inlined:
+        case TrialInliningState::MonomorphicInlined:
+        case TrialInliningState::Failure:
+          MOZ_CRASH("Inlined and Failure can only change to Failure");
+          break;
+      }
+    }
+#endif
+
+    trialInliningState_ = uint32_t(state);
+    MOZ_ASSERT(trialInliningState() == state,
+               "TrialInliningState must fit in bitfield");
+  }
+};
+
+}  
+}  
+
+#endif /* jit_ICState_h */

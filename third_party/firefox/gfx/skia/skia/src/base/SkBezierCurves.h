@@ -1,0 +1,49 @@
+/*
+ * Copyright 2023 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+#if !defined(SkBezierCurves_DEFINED)
+#define SkBezierCurves_DEFINED
+
+#include "include/private/base/SkSpan_impl.h"
+
+#include <array>
+
+struct SkPoint;
+
+class SkBezierCubic {
+public:
+
+    static std::array<double, 2> EvalAt(const double curve[8], double t);
+
+    static void Subdivide(const double curve[8], double t,
+                          double twoCurves[14]);
+
+    static std::array<double, 4> ConvertToPolynomial(const double curve[8], bool yValues);
+
+    static SkSpan<const float> IntersectWithHorizontalLine(
+            SkSpan<const SkPoint> controlPoints, float yIntercept,
+            float intersectionStorage[3]);
+
+    static SkSpan<const float> Intersect(
+            double AX, double BX, double CX, double DX,
+            double AY, double BY, double CY, double DY,
+            float toIntersect, float intersectionsStorage[3]);
+};
+
+class SkBezierQuad {
+public:
+    static SkSpan<const float> IntersectWithHorizontalLine(
+            SkSpan<const SkPoint> controlPoints, float yIntercept,
+            float intersectionStorage[2]);
+
+    static SkSpan<const float> Intersect(
+            double AX, double BX, double CX,
+            double AY, double BY, double CY,
+            double yIntercept,
+            float intersectionStorage[2]);
+};
+
+#endif

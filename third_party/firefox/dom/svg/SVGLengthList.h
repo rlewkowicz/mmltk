@@ -1,0 +1,207 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SVG_SVGLENGTHLIST_H_
+#define DOM_SVG_SVGLENGTHLIST_H_
+
+#include "SVGElement.h"
+#include "SVGLength.h"
+#include "nsCOMPtr.h"
+#include "nsDebug.h"
+#include "nsIContent.h"
+#include "nsINode.h"
+#include "nsIWeakReferenceUtils.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+
+namespace dom {
+class DOMSVGLength;
+class DOMSVGLengthList;
+}  
+
+class SVGLengthList {
+  friend class dom::DOMSVGLength;
+  friend class dom::DOMSVGLengthList;
+  friend class SVGAnimatedLengthList;
+
+ public:
+  SVGLengthList() = default;
+  ~SVGLengthList() = default;
+
+  SVGLengthList& operator=(const SVGLengthList& aOther) {
+    mLengths.ClearAndRetainStorage();
+    (void)mLengths.AppendElements(aOther.mLengths, fallible);
+    return *this;
+  }
+
+  SVGLengthList(const SVGLengthList& aOther) { *this = aOther; }
+
+
+  void GetValueAsString(nsAString& aValue) const;
+
+  bool IsEmpty() const { return mLengths.IsEmpty(); }
+
+  uint32_t Length() const { return mLengths.Length(); }
+
+  const SVGLength& operator[](uint32_t aIndex) const {
+    return mLengths[aIndex];
+  }
+
+  bool operator==(const SVGLengthList& rhs) const;
+
+  bool SetCapacity(uint32_t size) {
+    return mLengths.SetCapacity(size, fallible);
+  }
+
+  void Compact() { mLengths.Compact(); }
+
+
+ protected:
+  nsresult CopyFrom(const SVGLengthList&);
+  void SwapWith(SVGLengthList& aOther) {
+    mLengths.SwapElements(aOther.mLengths);
+  }
+
+  SVGLength& operator[](uint32_t aIndex) { return mLengths[aIndex]; }
+
+  bool SetLength(uint32_t aNumberOfItems) {
+    return mLengths.SetLength(aNumberOfItems, fallible);
+  }
+
+ private:
+
+  nsresult SetValueFromString(const nsAString& aValue);
+
+  void Clear() { mLengths.Clear(); }
+
+  bool InsertItem(uint32_t aIndex, const SVGLength& aLength) {
+    if (aIndex >= mLengths.Length()) aIndex = mLengths.Length();
+    return !!mLengths.InsertElementAt(aIndex, aLength, fallible);
+  }
+
+  void ReplaceItem(uint32_t aIndex, const SVGLength& aLength) {
+    MOZ_ASSERT(aIndex < mLengths.Length(),
+               "DOM wrapper caller should have raised INDEX_SIZE_ERR");
+    mLengths[aIndex] = aLength;
+  }
+
+  void RemoveItem(uint32_t aIndex) {
+    MOZ_ASSERT(aIndex < mLengths.Length(),
+               "DOM wrapper caller should have raised INDEX_SIZE_ERR");
+    mLengths.RemoveElementAt(aIndex);
+  }
+
+  bool AppendItem(SVGLength aLength) {
+    return !!mLengths.AppendElement(aLength, fallible);
+  }
+
+ protected:
+  FallibleTArray<SVGLength> mLengths;
+};
+
+class SVGLengthListAndInfo : public SVGLengthList {
+ public:
+  SVGLengthListAndInfo()
+      : mElement(nullptr), mAxis(SVGLength::Axis::XY), mCanZeroPadList(true) {}
+
+  SVGLengthListAndInfo(dom::SVGElement* aElement, SVGLength::Axis aAxis,
+                       bool aCanZeroPadList)
+      : mElement(do_GetWeakReference(static_cast<nsINode*>(aElement))),
+        mAxis(aAxis),
+        mCanZeroPadList(aCanZeroPadList) {}
+
+  void SetInfo(dom::SVGElement* aElement, SVGLength::Axis aAxis,
+               bool aCanZeroPadList) {
+    mElement = do_GetWeakReference(static_cast<nsINode*>(aElement));
+    mAxis = aAxis;
+    mCanZeroPadList = aCanZeroPadList;
+  }
+
+  dom::SVGElement* Element() const {
+    nsCOMPtr<nsIContent> e = do_QueryReferent(mElement);
+    return static_cast<dom::SVGElement*>(e.get());
+  }
+
+  bool IsIdentity() const {
+    if (!mElement) {
+      MOZ_ASSERT(IsEmpty(), "target element propagation failure");
+      return true;
+    }
+    return false;
+  }
+
+  SVGLength::Axis Axis() const {
+    MOZ_ASSERT(mElement, "Axis() isn't valid");
+    return mAxis;
+  }
+
+  bool CanZeroPadList() const {
+    return mCanZeroPadList;
+  }
+
+  void SetCanZeroPadList(bool aCanZeroPadList) {
+    mCanZeroPadList = aCanZeroPadList;
+  }
+
+  nsresult CopyFrom(const SVGLengthListAndInfo& rhs) {
+    mElement = rhs.mElement;
+    mAxis = rhs.mAxis;
+    mCanZeroPadList = rhs.mCanZeroPadList;
+    return SVGLengthList::CopyFrom(rhs);
+  }
+
+
+  nsresult CopyFrom(const SVGLengthList& rhs) {
+    return SVGLengthList::CopyFrom(rhs);
+  }
+  const SVGLength& operator[](uint32_t aIndex) const {
+    return SVGLengthList::operator[](aIndex);
+  }
+  SVGLength& operator[](uint32_t aIndex) {
+    return SVGLengthList::operator[](aIndex);
+  }
+  bool SetLength(uint32_t aNumberOfItems) {
+    return SVGLengthList::SetLength(aNumberOfItems);
+  }
+
+ private:
+  nsWeakPtr mElement;
+  SVGLength::Axis mAxis;
+  bool mCanZeroPadList;
+};
+
+class MOZ_STACK_CLASS SVGUserUnitList {
+ public:
+  SVGUserUnitList()
+      : mList(nullptr), mElement(nullptr), mAxis(SVGLength::Axis::XY) {}
+
+  void Init(const SVGLengthList* aList, const dom::SVGElement* aElement,
+            SVGLength::Axis aAxis) {
+    mList = aList;
+    mElement = aElement;
+    mAxis = aAxis;
+  }
+
+  bool IsEmpty() const { return mList->IsEmpty(); }
+
+  uint32_t Length() const { return mList->Length(); }
+
+  float operator[](uint32_t aIndex) const {
+    return (*mList)[aIndex].GetValueInPixelsWithZoom(mElement, mAxis);
+  }
+
+  bool HasPercentageValueAt(uint32_t aIndex) const {
+    return (*mList)[aIndex].IsPercentage();
+  }
+
+ private:
+  const SVGLengthList* mList;
+  const dom::SVGElement* mElement;
+  SVGLength::Axis mAxis;
+};
+
+}  
+
+#endif  // DOM_SVG_SVGLENGTHLIST_H_

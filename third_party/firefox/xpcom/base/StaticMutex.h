@@ -1,0 +1,62 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_StaticMutex_h
+#define mozilla_StaticMutex_h
+
+#include "mozilla/Atomics.h"
+#include "mozilla/Mutex.h"
+
+namespace mozilla {
+
+class MOZ_ONLY_USED_TO_AVOID_STATIC_CONSTRUCTORS MOZ_CAPABILITY("mutex")
+    StaticMutex {
+ public:
+  void Lock() MOZ_CAPABILITY_ACQUIRE() { Mutex()->Lock(); }
+
+  [[nodiscard]] bool TryLock() MOZ_TRY_ACQUIRE(true) {
+    return Mutex()->TryLock();
+  }
+
+  void Unlock() MOZ_CAPABILITY_RELEASE() { Mutex()->Unlock(); }
+
+  void AssertCurrentThreadOwns() MOZ_ASSERT_CAPABILITY(this) {
+#ifdef DEBUG
+    Mutex()->AssertCurrentThreadOwns();
+#endif
+  }
+
+  StaticMutex() = default;
+
+#ifdef DEBUG
+  StaticMutex(StaticMutex& aOther) = delete;
+#endif
+
+ private:
+  OffTheBooksMutex* Mutex() {
+    if (mMutex) {
+      return mMutex;
+    }
+
+    OffTheBooksMutex* mutex = new OffTheBooksMutex("StaticMutex");
+    if (!mMutex.compareExchange(nullptr, mutex)) {
+      delete mutex;
+    }
+
+    return mMutex;
+  }
+
+  Atomic<OffTheBooksMutex*, SequentiallyConsistent> mMutex{nullptr};
+
+  StaticMutex& operator=(StaticMutex* aRhs);
+  static void* operator new(size_t) noexcept(true);
+  static void operator delete(void*);
+};
+
+typedef detail::BaseAutoLock<StaticMutex&> StaticMutexAutoLock;
+typedef detail::BaseAutoUnlock<StaticMutex&> StaticMutexAutoUnlock;
+
+}  
+
+#endif

@@ -1,0 +1,44 @@
+/*
+ * Copyright 2016 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SKSL_CONTEXT)
+#define SKSL_CONTEXT
+
+#include "include/private/base/SkAssert.h"
+
+namespace SkSL {
+
+class BuiltinTypes;
+class ErrorReporter;
+struct Module;
+struct ProgramConfig;
+class SymbolTable;
+
+class Context {
+public:
+    Context(const BuiltinTypes& types, ErrorReporter& errors);
+    ~Context();
+
+    const BuiltinTypes& fTypes;
+
+    ProgramConfig* fConfig = nullptr;
+
+    ErrorReporter* fErrors;
+
+    void setErrorReporter(ErrorReporter* e) {
+        SkASSERT(e);
+        fErrors = e;
+    }
+
+    const Module* fModule = nullptr;
+
+    SymbolTable* fSymbolTable = nullptr;
+};
+
+}  
+
+#endif

@@ -1,0 +1,42 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/SVGSymbolElement.h"
+
+#include "mozilla/dom/SVGSymbolElementBinding.h"
+
+NS_IMPL_NS_NEW_SVG_ELEMENT(Symbol)
+
+namespace mozilla::dom {
+
+JSObject* SVGSymbolElement::WrapNode(JSContext* aCx,
+                                     JS::Handle<JSObject*> aGivenProto) {
+  return SVGSymbolElement_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+
+NS_IMPL_ISUPPORTS_INHERITED(SVGSymbolElement, SVGSymbolElementBase,
+                            mozilla::dom::SVGTests)
+
+
+SVGSymbolElement::SVGSymbolElement(
+    already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo)
+    : SVGSymbolElementBase(std::move(aNodeInfo)) {}
+
+Focusable SVGSymbolElement::IsFocusableWithoutStyle(IsFocusableFlags aFlags) {
+  if (!CouldBeRendered()) {
+    return {};
+  }
+  return SVGSymbolElementBase::IsFocusableWithoutStyle(aFlags);
+}
+
+bool SVGSymbolElement::CouldBeRendered() const {
+  auto* shadowRoot = ShadowRoot::FromNodeOrNull(GetParentNode());
+  return shadowRoot && shadowRoot->Host()->IsSVGElement(nsGkAtoms::use);
+}
+
+
+NS_IMPL_ELEMENT_CLONE_WITH_INIT(SVGSymbolElement)
+
+}  

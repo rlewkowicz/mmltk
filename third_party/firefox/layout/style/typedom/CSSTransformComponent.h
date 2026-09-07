@@ -1,0 +1,134 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef LAYOUT_STYLE_TYPEDOM_CSSTRANSFORMCOMPONENT_H_
+#define LAYOUT_STYLE_TYPEDOM_CSSTRANSFORMCOMPONENT_H_
+
+#include "js/TypeDecls.h"
+#include "mozilla/dom/DOMMatrixBindingFwd.h"
+#include "nsCOMPtr.h"
+#include "nsISupports.h"
+#include "nsISupportsImpl.h"
+#include "nsStringFwd.h"
+#include "nsWrapperCache.h"
+
+template <class T>
+struct already_AddRefed;
+
+namespace mozilla {
+
+struct CSSPropertyId;
+class ErrorResult;
+
+namespace dom {
+
+class CSSTranslate;
+class CSSRotate;
+class CSSScale;
+class CSSSkew;
+class CSSSkewX;
+class CSSSkewY;
+class CSSPerspective;
+class CSSMatrixComponent;
+
+class CSSTransformComponent : public nsISupports, public nsWrapperCache {
+ public:
+  enum class TransformComponentType {
+    Translate,
+    Rotate,
+    Scale,
+    Skew,
+    SkewX,
+    SkewY,
+    Perspective,
+    MatrixComponent
+  };
+
+  CSSTransformComponent(nsCOMPtr<nsISupports> aParent, bool aIs2D,
+                        TransformComponentType aTransformComponentType);
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(CSSTransformComponent)
+
+  nsISupports* GetParentObject() const;
+
+  JSObject* WrapObject(JSContext*, JS::Handle<JSObject*> aGivenProto) override;
+
+
+  bool Is2D() const;
+
+  void SetIs2D(bool aArg);
+
+  already_AddRefed<DOMMatrix> ToMatrix(ErrorResult& aRv);
+
+  void Stringify(nsACString&);
+
+
+  TransformComponentType GetTransformComponentType() const {
+    return mTransformComponentType;
+  }
+
+  bool IsCSSTranslate() const;
+
+  const CSSTranslate& GetAsCSSTranslate() const;
+
+  CSSTranslate& GetAsCSSTranslate();
+
+  bool IsCSSRotate() const;
+
+  const CSSRotate& GetAsCSSRotate() const;
+
+  CSSRotate& GetAsCSSRotate();
+
+  bool IsCSSScale() const;
+
+  const CSSScale& GetAsCSSScale() const;
+
+  CSSScale& GetAsCSSScale();
+
+  bool IsCSSSkew() const;
+
+  const CSSSkew& GetAsCSSSkew() const;
+
+  CSSSkew& GetAsCSSSkew();
+
+  bool IsCSSSkewX() const;
+
+  const CSSSkewX& GetAsCSSSkewX() const;
+
+  CSSSkewX& GetAsCSSSkewX();
+
+  bool IsCSSSkewY() const;
+
+  const CSSSkewY& GetAsCSSSkewY() const;
+
+  CSSSkewY& GetAsCSSSkewY();
+
+  bool IsCSSPerspective() const;
+
+  const CSSPerspective& GetAsCSSPerspective() const;
+
+  CSSPerspective& GetAsCSSPerspective();
+
+  bool IsCSSMatrixComponent() const;
+
+  const CSSMatrixComponent& GetAsCSSMatrixComponent() const;
+
+  CSSMatrixComponent& GetAsCSSMatrixComponent();
+
+  void ToCssTextWithProperty(const CSSPropertyId& aPropertyId,
+                             nsACString& aDest) const;
+
+ protected:
+  virtual ~CSSTransformComponent() = default;
+
+  nsCOMPtr<nsISupports> mParent;
+  bool mIs2D;
+  const TransformComponentType mTransformComponentType;
+};
+
+}  
+}  
+
+#endif  // LAYOUT_STYLE_TYPEDOM_CSSTRANSFORMCOMPONENT_H_

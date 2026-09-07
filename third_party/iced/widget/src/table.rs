@@ -1,0 +1,644 @@
+use crate::core;
+use crate::core::alignment;
+use crate::core::layout;
+use crate::core::mouse;
+use crate::core::overlay;
+use crate::core::renderer;
+use crate::core::widget;
+use crate::core::{
+    Alignment, Background, Element, Layout, Length, Pixels, Rectangle, Size, Widget,
+};
+
+pub fn table<'a, 'b, T, Message, Theme, Renderer>(
+    columns: impl IntoIterator<Item = Column<'a, 'b, T, Message, Theme, Renderer>>,
+    rows: impl IntoIterator<Item = T>,
+) -> Table<'a, Message, Theme, Renderer>
+where
+    T: Clone,
+    Theme: Catalog,
+    Renderer: core::Renderer,
+{
+    Table::new(columns, rows)
+}
+
+pub fn column<'a, 'b, T, E, Message, Theme, Renderer>(
+    header: impl Into<Element<'a, Message, Theme, Renderer>>,
+    view: impl Fn(T) -> E + 'b,
+) -> Column<'a, 'b, T, Message, Theme, Renderer>
+where
+    T: 'a,
+    E: Into<Element<'a, Message, Theme, Renderer>>,
+{
+    Column {
+        header: header.into(),
+        view: Box::new(move |data| view(data).into()),
+        width: Length::Shrink,
+        align_x: alignment::Horizontal::Left,
+        align_y: alignment::Vertical::Top,
+    }
+}
+
+pub struct Table<'a, Message, Theme = crate::Theme, Renderer = crate::Renderer>
+where
+    Theme: Catalog,
+{
+    columns: Vec<Column_>,
+    cells: Vec<Element<'a, Message, Theme, Renderer>>,
+    width: Length,
+    height: Length,
+    padding_x: f32,
+    padding_y: f32,
+    separator_x: f32,
+    separator_y: f32,
+    class: Theme::Class<'a>,
+}
+
+struct Column_ {
+    width: Length,
+    align_x: alignment::Horizontal,
+    align_y: alignment::Vertical,
+}
+
+impl<'a, Message, Theme, Renderer> Table<'a, Message, Theme, Renderer>
+where
+    Theme: Catalog,
+    Renderer: core::Renderer,
+{
+                    pub fn new<'b, T>(
+        columns: impl IntoIterator<Item = Column<'a, 'b, T, Message, Theme, Renderer>>,
+        rows: impl IntoIterator<Item = T>,
+    ) -> Self
+    where
+        T: Clone,
+    {
+        let columns = columns.into_iter();
+        let rows = rows.into_iter();
+
+        let mut width = Length::Fit;
+        let mut cells = Vec::with_capacity(columns.size_hint().0 * (1 + rows.size_hint().0));
+
+        let (mut columns, views): (Vec<_>, Vec<_>) = columns
+            .map(|column| {
+                width = width.stack(column.width);
+
+                cells.push(column.header);
+
+                (
+                    Column_ {
+                        width: column.width,
+                        align_x: column.align_x,
+                        align_y: column.align_y,
+                    },
+                    column.view,
+                )
+            })
+            .collect();
+
+        if width == Length::Shrink
+            && let Some(first) = columns.first_mut()
+        {
+            first.width = Length::Fill;
+        }
+
+        for row in rows {
+            for view in &views {
+                let cell = view(row.clone());
+                cells.push(cell);
+            }
+        }
+
+        Self {
+            columns,
+            cells,
+            width,
+            height: Length::Fit,
+            padding_x: 10.0,
+            padding_y: 5.0,
+            separator_x: 1.0,
+            separator_y: 1.0,
+            class: Theme::default(),
+        }
+    }
+
+        pub fn width(mut self, width: impl Into<Length>) -> Self {
+        self.width = width.into();
+        self
+    }
+
+        pub fn padding(self, padding: impl Into<Pixels>) -> Self {
+        let padding = padding.into();
+
+        self.padding_x(padding).padding_y(padding)
+    }
+
+        pub fn padding_x(mut self, padding: impl Into<Pixels>) -> Self {
+        self.padding_x = padding.into().0;
+        self
+    }
+
+        pub fn padding_y(mut self, padding: impl Into<Pixels>) -> Self {
+        self.padding_y = padding.into().0;
+        self
+    }
+
+        pub fn separator(self, separator: impl Into<Pixels>) -> Self {
+        let separator = separator.into();
+
+        self.separator_x(separator).separator_y(separator)
+    }
+
+        pub fn separator_x(mut self, separator: impl Into<Pixels>) -> Self {
+        self.separator_x = separator.into().0;
+        self
+    }
+
+        pub fn separator_y(mut self, separator: impl Into<Pixels>) -> Self {
+        self.separator_y = separator.into().0;
+        self
+    }
+}
+
+struct Metrics {
+    columns: Vec<f32>,
+    rows: Vec<f32>,
+}
+
+impl<'a, Message, Theme, Renderer> Widget<Message, Theme, Renderer>
+    for Table<'a, Message, Theme, Renderer>
+where
+    Theme: Catalog,
+    Renderer: core::Renderer,
+{
+    fn size(&self) -> Size<Length> {
+        Size {
+            width: self.width,
+            height: self.height,
+        }
+    }
+
+    fn tag(&self) -> widget::tree::Tag {
+        widget::tree::Tag::of::<Metrics>()
+    }
+
+    fn state(&self) -> widget::tree::State {
+        widget::tree::State::new(Metrics {
+            columns: Vec::new(),
+            rows: Vec::new(),
+        })
+    }
+
+    fn diff(&mut self, tree: &mut widget::Tree) {
+        tree.diff_children(&mut self.cells);
+
+        for cell in &self.cells {
+            let size = cell.as_widget().size();
+
+            self.height = self.height.stack(size.height);
+        }
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut widget::Tree,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        let metrics = tree.state.downcast_mut::<Metrics>();
+        let columns = self.columns.len();
+        let rows = self.cells.len() / columns;
+
+        let limits = limits.width(self.width).height(self.height);
+        let available = limits.max();
+        let table_fluid = if self.width.fill_factor() == 0 {
+            Length::Shrink
+        } else {
+            Length::Fill
+        };
+
+        let mut cells = Vec::with_capacity(self.cells.len());
+        cells.resize(self.cells.len(), layout::Node::default());
+
+        metrics.columns = vec![0.0; self.columns.len()];
+        metrics.rows = vec![0.0; rows];
+
+        let mut column_factors = vec![0; self.columns.len()];
+        let mut total_row_factors = 0;
+        let mut total_fluid_height = 0.0;
+        let mut row_factor = 0;
+
+        let spacing_x = self.padding_x * 2.0 + self.separator_x;
+        let spacing_y = self.padding_y * 2.0 + self.separator_y;
+
+        let mut x = self.padding_x;
+        let mut y = self.padding_y;
+
+        for (i, (cell, state)) in self.cells.iter_mut().zip(&mut tree.children).enumerate() {
+            let row = i / columns;
+            let column = i % columns;
+
+            let width = self.columns[column].width;
+            let size = cell.as_widget().size();
+
+            if column == 0 {
+                x = self.padding_x;
+
+                if row > 0 {
+                    y += metrics.rows[row - 1] + spacing_y;
+
+                    if row_factor != 0 {
+                        total_fluid_height += metrics.rows[row - 1];
+                        total_row_factors += row_factor;
+
+                        row_factor = 0;
+                    }
+                }
+            }
+
+            let width_factor = width.fill_factor();
+            let height_factor = size.height.fill_factor();
+
+            if width_factor != 0 || height_factor != 0 || size.width.is_fill() {
+                column_factors[column] = column_factors[column].max(width_factor);
+
+                row_factor = row_factor.max(height_factor);
+
+                continue;
+            }
+
+            let limits = layout::Limits::new(
+                Size::ZERO,
+                Size::new(available.width - x, available.height - y),
+            )
+            .width(width);
+
+            let layout = cell.as_widget_mut().layout(state, renderer, &limits);
+            let size = limits.resolve(width, Length::Shrink, layout.size());
+
+            metrics.columns[column] = metrics.columns[column].max(size.width);
+            metrics.rows[row] = metrics.rows[row].max(size.height);
+            cells[i] = layout;
+
+            x += size.width + spacing_x;
+        }
+
+        let left = Size::new(
+            available.width
+                - metrics
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| column_factors[*i] == 0)
+                    .map(|(_, width)| width)
+                    .sum::<f32>(),
+            available.height - total_fluid_height,
+        );
+
+        let width_unit = (left.width
+            - spacing_x * self.columns.len().saturating_sub(1) as f32
+            - self.padding_x * 2.0)
+            / column_factors.iter().sum::<u16>() as f32;
+
+        let height_unit =
+            (left.height - spacing_y * rows.saturating_sub(1) as f32 - self.padding_y * 2.0)
+                / total_row_factors as f32;
+
+        let mut x = self.padding_x;
+        let mut y = self.padding_y;
+
+        for (i, (cell, state)) in self.cells.iter_mut().zip(&mut tree.children).enumerate() {
+            let row = i / columns;
+            let column = i % columns;
+
+            let size = cell.as_widget().size();
+
+            let width = self.columns[column].width;
+            let width_factor = width.fill_factor();
+            let height_factor = size.height.fill_factor();
+
+            if column == 0 {
+                x = self.padding_x;
+
+                if row > 0 {
+                    y += metrics.rows[row - 1] + spacing_y;
+                }
+            }
+
+            if width_factor == 0 && size.width.fill_factor() == 0 && size.height.fill_factor() == 0
+            {
+                continue;
+            }
+
+            let max_width = if width_factor == 0 {
+                if size.width.is_fill() {
+                    metrics.columns[column]
+                } else {
+                    (available.width - x).max(0.0)
+                }
+            } else {
+                width_unit * width_factor as f32
+            };
+
+            let max_height = if height_factor == 0 {
+                if size.height.is_fill() {
+                    metrics.rows[row]
+                } else {
+                    (available.height - y).max(0.0)
+                }
+            } else {
+                height_unit * height_factor as f32
+            };
+
+            let limits =
+                layout::Limits::new(Size::ZERO, Size::new(max_width, max_height)).width(width);
+
+            let layout = cell.as_widget_mut().layout(state, renderer, &limits);
+            let size = limits.resolve(
+                if let Length::Fixed(_) = width {
+                    width
+                } else {
+                    table_fluid
+                },
+                Length::Shrink,
+                layout.size(),
+            );
+
+            metrics.columns[column] = metrics.columns[column].max(size.width);
+            metrics.rows[row] = metrics.rows[row].max(size.height);
+            cells[i] = layout;
+
+            x += size.width + spacing_x;
+        }
+
+        let mut x = self.padding_x;
+        let mut y = self.padding_y;
+
+        for (i, cell) in cells.iter_mut().enumerate() {
+            let row = i / columns;
+            let column = i % columns;
+
+            if column == 0 {
+                x = self.padding_x;
+
+                if row > 0 {
+                    y += metrics.rows[row - 1] + spacing_y;
+                }
+            }
+
+            let Column_ {
+                align_x, align_y, ..
+            } = &self.columns[column];
+
+            cell.move_to_mut((x, y));
+            cell.align_mut(
+                Alignment::from(*align_x),
+                Alignment::from(*align_y),
+                Size::new(metrics.columns[column], metrics.rows[row]),
+            );
+
+            x += metrics.columns[column] + spacing_x;
+        }
+
+        let intrinsic = limits.resolve(
+            self.width,
+            self.height,
+            Size::new(
+                x - spacing_x + self.padding_x,
+                y + metrics
+                    .rows
+                    .last()
+                    .copied()
+                    .map(|height| height + self.padding_y)
+                    .unwrap_or_default(),
+            ),
+        );
+
+        layout::Node::with_children(intrinsic, cells)
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut widget::Tree,
+        event: &core::Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+        shell: &mut core::Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        for ((cell, tree), layout) in self
+            .cells
+            .iter_mut()
+            .zip(&mut tree.children)
+            .zip(layout.children())
+        {
+            cell.as_widget_mut()
+                .update(tree, event, layout, cursor, renderer, shell, viewport);
+        }
+    }
+
+    fn draw(
+        &self,
+        tree: &widget::Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        for ((cell, state), layout) in self.cells.iter().zip(&tree.children).zip(layout.children())
+        {
+            cell.as_widget()
+                .draw(state, renderer, theme, style, layout, cursor, viewport);
+        }
+
+        let bounds = layout.bounds();
+        let metrics = tree.state.downcast_ref::<Metrics>();
+        let style = theme.style(&self.class);
+
+        if self.separator_x > 0.0 {
+            let mut x = self.padding_x;
+
+            for width in &metrics.columns[..metrics.columns.len().saturating_sub(1)] {
+                x += width + self.padding_x;
+
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds: Rectangle {
+                            x: bounds.x + x,
+                            y: bounds.y,
+                            width: self.separator_x,
+                            height: bounds.height,
+                        },
+                        snap: true,
+                        ..renderer::Quad::default()
+                    },
+                    style.separator_x,
+                );
+
+                x += self.separator_x + self.padding_x;
+            }
+        }
+
+        if self.separator_y > 0.0 {
+            let mut y = self.padding_y;
+
+            for height in &metrics.rows[..metrics.rows.len().saturating_sub(1)] {
+                y += height + self.padding_y;
+
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds: Rectangle {
+                            x: bounds.x,
+                            y: bounds.y + y,
+                            width: bounds.width,
+                            height: self.separator_y,
+                        },
+                        snap: true,
+                        ..renderer::Quad::default()
+                    },
+                    style.separator_y,
+                );
+
+                y += self.separator_y + self.padding_y;
+            }
+        }
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &widget::Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &Renderer,
+    ) -> mouse::Interaction {
+        self.cells
+            .iter()
+            .zip(&tree.children)
+            .zip(layout.children())
+            .map(|((cell, tree), layout)| {
+                cell.as_widget()
+                    .mouse_interaction(tree, layout, cursor, viewport, renderer)
+            })
+            .max()
+            .unwrap_or_default()
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut widget::Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn widget::Operation,
+    ) {
+        for ((cell, state), layout) in self
+            .cells
+            .iter_mut()
+            .zip(&mut tree.children)
+            .zip(layout.children())
+        {
+            cell.as_widget_mut()
+                .operate(state, layout, renderer, operation);
+        }
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut widget::Tree,
+        layout: Layout<'b>,
+        renderer: &Renderer,
+        viewport: &Rectangle,
+        translation: core::Vector,
+    ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
+        overlay::from_children(
+            &mut self.cells,
+            tree,
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+}
+
+impl<'a, Message, Theme, Renderer> From<Table<'a, Message, Theme, Renderer>>
+    for Element<'a, Message, Theme, Renderer>
+where
+    Message: 'a,
+    Theme: Catalog + 'a,
+    Renderer: core::Renderer + 'a,
+{
+    fn from(table: Table<'a, Message, Theme, Renderer>) -> Self {
+        Element::new(table)
+    }
+}
+
+pub struct Column<'a, 'b, T, Message, Theme = crate::Theme, Renderer = crate::Renderer> {
+    header: Element<'a, Message, Theme, Renderer>,
+    view: Box<dyn Fn(T) -> Element<'a, Message, Theme, Renderer> + 'b>,
+    width: Length,
+    align_x: alignment::Horizontal,
+    align_y: alignment::Vertical,
+}
+
+impl<'a, 'b, T, Message, Theme, Renderer> Column<'a, 'b, T, Message, Theme, Renderer> {
+        pub fn width(mut self, width: impl Into<Length>) -> Self {
+        self.width = width.into();
+        self
+    }
+
+        pub fn align_x(mut self, alignment: impl Into<alignment::Horizontal>) -> Self {
+        self.align_x = alignment.into();
+        self
+    }
+
+        pub fn align_y(mut self, alignment: impl Into<alignment::Vertical>) -> Self {
+        self.align_y = alignment.into();
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Style {
+        pub separator_x: Background,
+        pub separator_y: Background,
+}
+
+pub trait Catalog {
+        type Class<'a>;
+
+        fn default<'a>() -> Self::Class<'a>;
+
+        fn style(&self, class: &Self::Class<'_>) -> Style;
+}
+
+pub type StyleFn<'a, Theme> = Box<dyn Fn(&Theme) -> Style + 'a>;
+
+impl<Theme> From<Style> for StyleFn<'_, Theme> {
+    fn from(style: Style) -> Self {
+        Box::new(move |_theme| style)
+    }
+}
+
+impl Catalog for crate::Theme {
+    type Class<'a> = StyleFn<'a, Self>;
+
+    fn default<'a>() -> Self::Class<'a> {
+        Box::new(default)
+    }
+
+    fn style(&self, class: &Self::Class<'_>) -> Style {
+        class(self)
+    }
+}
+
+pub fn default(theme: &crate::Theme) -> Style {
+    let palette = theme.palette();
+    let separator = palette.background.strong.color.into();
+
+    Style {
+        separator_x: separator,
+        separator_y: separator,
+    }
+}

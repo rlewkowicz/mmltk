@@ -1,0 +1,62 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_InputEventOptions_h
+#define mozilla_InputEventOptions_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/TextEvents.h"
+#include "mozilla/dom/DataTransfer.h"
+#include "mozilla/dom/StaticRange.h"
+#include "nsString.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+
+struct MOZ_STACK_CLASS InputEventOptions final {
+  enum class NeverCancelable {
+    No,
+    Yes,
+  };
+  InputEventOptions() : mDataTransfer(nullptr), mNeverCancelable(false) {}
+  explicit InputEventOptions(const InputEventOptions& aOther) = delete;
+  InputEventOptions(InputEventOptions&& aOther) = default;
+  explicit InputEventOptions(const nsAString& aData,
+                             NeverCancelable aNeverCancelable)
+      : mData(aData),
+        mDataTransfer(nullptr),
+        mNeverCancelable(aNeverCancelable == NeverCancelable::Yes) {}
+  explicit InputEventOptions(dom::DataTransfer* aDataTransfer,
+                             NeverCancelable aNeverCancelable)
+      : mDataTransfer(aDataTransfer),
+        mNeverCancelable(aNeverCancelable == NeverCancelable::Yes) {
+    MOZ_ASSERT(mDataTransfer);
+    MOZ_ASSERT(mDataTransfer->IsReadOnly());
+  }
+  InputEventOptions(const nsAString& aData,
+                    OwningNonNullStaticRangeArray&& aTargetRanges,
+                    NeverCancelable aNeverCancelable)
+      : mData(aData),
+        mDataTransfer(nullptr),
+        mTargetRanges(std::move(aTargetRanges)),
+        mNeverCancelable(aNeverCancelable == NeverCancelable::Yes) {}
+  InputEventOptions(dom::DataTransfer* aDataTransfer,
+                    OwningNonNullStaticRangeArray&& aTargetRanges,
+                    NeverCancelable aNeverCancelable)
+      : mDataTransfer(aDataTransfer),
+        mTargetRanges(std::move(aTargetRanges)),
+        mNeverCancelable(aNeverCancelable == NeverCancelable::Yes) {
+    MOZ_ASSERT(mDataTransfer);
+    MOZ_ASSERT(mDataTransfer->IsReadOnly());
+  }
+
+  nsString mData;
+  dom::DataTransfer* mDataTransfer;
+  OwningNonNullStaticRangeArray mTargetRanges;
+  bool mNeverCancelable;
+};
+
+}  
+
+#endif  // #ifndef mozilla_InputEventOptions_h

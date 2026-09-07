@@ -1,0 +1,1392 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "builtin/AtomicsObject.h"
+
+#include "mozilla/Atomics.h"
+#include "mozilla/DebugOnly.h"
+#include "mozilla/FloatingPoint.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/ScopeExit.h"
+
+#include "builtin/Number.h"
+#include "builtin/Promise.h"
+#include "jit/AtomicOperations.h"
+#include "jit/InlinableNatives.h"
+#include "js/Class.h"
+#include "js/friend/ErrorMessages.h"  // js::GetErrorMessage, JSMSG_*
+#include "js/PropertySpec.h"
+#include "js/Result.h"
+#include "js/WaitCallbacks.h"
+#include "vm/GlobalObject.h"
+#include "vm/HelperThreads.h"                 // AutoLockHelperThreadState
+#include "vm/OffThreadPromiseRuntimeState.h"  // OffthreadPromiseTask
+#include "vm/TypedArrayObject.h"
+
+#include "vm/Compartment-inl.h"
+#include "vm/JSObject-inl.h"
+#include "vm/Realm-inl.h"
+
+using namespace js;
+
+static bool ReportBadArrayType(JSContext* cx) {
+  JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                            JSMSG_ATOMICS_BAD_ARRAY);
+  return false;
+}
+
+static bool ReportDetachedArrayBuffer(JSContext* cx) {
+  JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                            JSMSG_TYPED_ARRAY_DETACHED);
+  return false;
+}
+
+static bool ReportImmutableBuffer(JSContext* cx) {
+  JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                            JSMSG_ARRAYBUFFER_IMMUTABLE);
+  return false;
+}
+
+static bool ReportResizedArrayBuffer(JSContext* cx) {
+  JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                            JSMSG_TYPED_ARRAY_RESIZED_BOUNDS);
+  return false;
+}
+
+static bool ReportOutOfRange(JSContext* cx) {
+  JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr, JSMSG_BAD_INDEX);
+  return false;
+}
+
+enum class AccessMode { Read, Write };
+
+static bool ValidateIntegerTypedArray(
+    JSContext* cx, HandleValue typedArray, bool waitable, AccessMode accessMode,
+    MutableHandle<TypedArrayObject*> unwrappedTypedArray) {
+  auto* unwrapped = UnwrapAndTypeCheckValue<TypedArrayObject>(
+      cx, typedArray, [cx]() { ReportBadArrayType(cx); });
+  if (!unwrapped) {
+    return false;
+  }
+
+  if (unwrapped->hasDetachedBuffer()) {
+    return ReportDetachedArrayBuffer(cx);
+  }
+
+  if (accessMode == AccessMode::Write &&
+      unwrapped->is<ImmutableTypedArrayObject>()) {
+    return ReportImmutableBuffer(cx);
+  }
+
+  if (waitable) {
+    switch (unwrapped->type()) {
+      case Scalar::Int32:
+      case Scalar::BigInt64:
+        break;
+      default:
+        return ReportBadArrayType(cx);
+    }
+  } else {
+    switch (unwrapped->type()) {
+      case Scalar::Int8:
+      case Scalar::Uint8:
+      case Scalar::Int16:
+      case Scalar::Uint16:
+      case Scalar::Int32:
+      case Scalar::Uint32:
+      case Scalar::BigInt64:
+      case Scalar::BigUint64:
+        break;
+      default:
+        return ReportBadArrayType(cx);
+    }
+  }
+
+  unwrappedTypedArray.set(unwrapped);
+  return true;
+}
+
+static bool ValidateAtomicAccess(JSContext* cx,
+                                 Handle<TypedArrayObject*> typedArray,
+                                 HandleValue requestIndex, size_t* index) {
+  MOZ_ASSERT(!typedArray->hasDetachedBuffer());
+
+  mozilla::Maybe<size_t> length = typedArray->length();
+  if (!length) {
+    return ReportResizedArrayBuffer(cx);
+  }
+
+  uint64_t accessIndex;
+  if (!ToIndex(cx, requestIndex, &accessIndex)) {
+    return false;
+  }
+
+  if (accessIndex >= *length) {
+    return ReportOutOfRange(cx);
+  }
+
+  *index = size_t(accessIndex);
+  return true;
+}
+
+template <typename T>
+struct ArrayOps {
+  using Type = T;
+
+  static JS::Result<T> convertValue(JSContext* cx, HandleValue v) {
+    int32_t n;
+    if (!ToInt32(cx, v, &n)) {
+      return cx->alreadyReportedError();
+    }
+    return static_cast<T>(n);
+  }
+
+  static JS::Result<T> convertValue(JSContext* cx, HandleValue v,
+                                    MutableHandleValue result) {
+    double d;
+    if (!ToInteger(cx, v, &d)) {
+      return cx->alreadyReportedError();
+    }
+    result.setNumber(d);
+    return static_cast<T>(JS::ToInt32(d));
+  }
+
+  static JS::Result<> storeResult(JSContext* cx, T v,
+                                  MutableHandleValue result) {
+    result.setInt32(v);
+    return Ok();
+  }
+};
+
+template <>
+JS::Result<> ArrayOps<uint32_t>::storeResult(JSContext* cx, uint32_t v,
+                                             MutableHandleValue result) {
+  result.setDouble(v);
+  return Ok();
+}
+
+template <>
+struct ArrayOps<int64_t> {
+  using Type = int64_t;
+
+  static JS::Result<int64_t> convertValue(JSContext* cx, HandleValue v) {
+    BigInt* bi = ToBigInt(cx, v);
+    if (!bi) {
+      return cx->alreadyReportedError();
+    }
+    return BigInt::toInt64(bi);
+  }
+
+  static JS::Result<int64_t> convertValue(JSContext* cx, HandleValue v,
+                                          MutableHandleValue result) {
+    BigInt* bi = ToBigInt(cx, v);
+    if (!bi) {
+      return cx->alreadyReportedError();
+    }
+    result.setBigInt(bi);
+    return BigInt::toInt64(bi);
+  }
+
+  static JS::Result<> storeResult(JSContext* cx, int64_t v,
+                                  MutableHandleValue result) {
+    BigInt* bi = BigInt::createFromInt64(cx, v);
+    if (!bi) {
+      return cx->alreadyReportedError();
+    }
+    result.setBigInt(bi);
+    return Ok();
+  }
+};
+
+template <>
+struct ArrayOps<uint64_t> {
+  using Type = uint64_t;
+
+  static JS::Result<uint64_t> convertValue(JSContext* cx, HandleValue v) {
+    BigInt* bi = ToBigInt(cx, v);
+    if (!bi) {
+      return cx->alreadyReportedError();
+    }
+    return BigInt::toUint64(bi);
+  }
+
+  static JS::Result<uint64_t> convertValue(JSContext* cx, HandleValue v,
+                                           MutableHandleValue result) {
+    BigInt* bi = ToBigInt(cx, v);
+    if (!bi) {
+      return cx->alreadyReportedError();
+    }
+    result.setBigInt(bi);
+    return BigInt::toUint64(bi);
+  }
+
+  static JS::Result<> storeResult(JSContext* cx, uint64_t v,
+                                  MutableHandleValue result) {
+    BigInt* bi = BigInt::createFromUint64(cx, v);
+    if (!bi) {
+      return cx->alreadyReportedError();
+    }
+    result.setBigInt(bi);
+    return Ok();
+  }
+};
+
+template <typename Op>
+static bool AtomicAccess(JSContext* cx, HandleValue obj, HandleValue index,
+                         AccessMode accessMode, Op op) {
+  Rooted<TypedArrayObject*> unwrappedTypedArray(cx);
+  if (!ValidateIntegerTypedArray(cx, obj, false, accessMode,
+                                 &unwrappedTypedArray)) {
+    return false;
+  }
+
+  size_t intIndex;
+  if (!ValidateAtomicAccess(cx, unwrappedTypedArray, index, &intIndex)) {
+    return false;
+  }
+
+  switch (unwrappedTypedArray->type()) {
+    case Scalar::Int8:
+      return op(ArrayOps<int8_t>{}, unwrappedTypedArray, intIndex);
+    case Scalar::Uint8:
+      return op(ArrayOps<uint8_t>{}, unwrappedTypedArray, intIndex);
+    case Scalar::Int16:
+      return op(ArrayOps<int16_t>{}, unwrappedTypedArray, intIndex);
+    case Scalar::Uint16:
+      return op(ArrayOps<uint16_t>{}, unwrappedTypedArray, intIndex);
+    case Scalar::Int32:
+      return op(ArrayOps<int32_t>{}, unwrappedTypedArray, intIndex);
+    case Scalar::Uint32:
+      return op(ArrayOps<uint32_t>{}, unwrappedTypedArray, intIndex);
+    case Scalar::BigInt64:
+      return op(ArrayOps<int64_t>{}, unwrappedTypedArray, intIndex);
+    case Scalar::BigUint64:
+      return op(ArrayOps<uint64_t>{}, unwrappedTypedArray, intIndex);
+    case Scalar::Float16:
+    case Scalar::Float32:
+    case Scalar::Float64:
+    case Scalar::Uint8Clamped:
+    case Scalar::MaxTypedArrayViewType:
+    case Scalar::Int64:
+    case Scalar::Simd128:
+      break;
+  }
+  MOZ_CRASH("Unsupported TypedArray type");
+}
+
+template <typename T>
+static SharedMem<T*> TypedArrayData(JSContext* cx, TypedArrayObject* typedArray,
+                                    size_t index) {
+  mozilla::Maybe<size_t> length = typedArray->length();
+
+  if (!length) {
+    ReportDetachedArrayBuffer(cx);
+    return {};
+  }
+
+  if (index >= *length) {
+    ReportOutOfRange(cx);
+    return {};
+  }
+
+  SharedMem<void*> typedArrayData = typedArray->dataPointerEither();
+  return typedArrayData.cast<T*>() + index;
+}
+
+static bool atomics_compareExchange(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  HandleValue typedArray = args.get(0);
+  HandleValue index = args.get(1);
+
+  return AtomicAccess(
+      cx, typedArray, index, AccessMode::Write,
+      [cx, &args](auto ops, Handle<TypedArrayObject*> unwrappedTypedArray,
+                  size_t index) {
+        using T = typename decltype(ops)::Type;
+
+        HandleValue expectedValue = args.get(2);
+        HandleValue replacementValue = args.get(3);
+
+        T oldval;
+        JS_TRY_VAR_OR_RETURN_FALSE(cx, oldval,
+                                   ops.convertValue(cx, expectedValue));
+
+        T newval;
+        JS_TRY_VAR_OR_RETURN_FALSE(cx, newval,
+                                   ops.convertValue(cx, replacementValue));
+
+        SharedMem<T*> addr = TypedArrayData<T>(cx, unwrappedTypedArray, index);
+        if (!addr) {
+          return false;
+        }
+
+        oldval =
+            jit::AtomicOperations::compareExchangeSeqCst(addr, oldval, newval);
+
+        JS_TRY_OR_RETURN_FALSE(cx, ops.storeResult(cx, oldval, args.rval()));
+        return true;
+      });
+}
+
+static bool atomics_load(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  HandleValue typedArray = args.get(0);
+  HandleValue index = args.get(1);
+
+  return AtomicAccess(
+      cx, typedArray, index, AccessMode::Read,
+      [cx, &args](auto ops, Handle<TypedArrayObject*> unwrappedTypedArray,
+                  size_t index) {
+        using T = typename decltype(ops)::Type;
+
+        SharedMem<T*> addr = TypedArrayData<T>(cx, unwrappedTypedArray, index);
+        if (!addr) {
+          return false;
+        }
+
+        T v = jit::AtomicOperations::loadSeqCst(addr);
+
+        JS_TRY_OR_RETURN_FALSE(cx, ops.storeResult(cx, v, args.rval()));
+        return true;
+      });
+}
+
+static bool atomics_store(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  HandleValue typedArray = args.get(0);
+  HandleValue index = args.get(1);
+
+  return AtomicAccess(
+      cx, typedArray, index, AccessMode::Write,
+      [cx, &args](auto ops, Handle<TypedArrayObject*> unwrappedTypedArray,
+                  size_t index) {
+        using T = typename decltype(ops)::Type;
+
+        HandleValue value = args.get(2);
+
+        T v;
+        JS_TRY_VAR_OR_RETURN_FALSE(cx, v,
+                                   ops.convertValue(cx, value, args.rval()));
+
+        SharedMem<T*> addr = TypedArrayData<T>(cx, unwrappedTypedArray, index);
+        if (!addr) {
+          return false;
+        }
+
+        jit::AtomicOperations::storeSeqCst(addr, v);
+        return true;
+      });
+}
+
+template <typename AtomicOp>
+static bool AtomicReadModifyWrite(JSContext* cx, const CallArgs& args,
+                                  AtomicOp op) {
+  HandleValue typedArray = args.get(0);
+  HandleValue index = args.get(1);
+
+  return AtomicAccess(
+      cx, typedArray, index, AccessMode::Write,
+      [cx, &args, op](auto ops, Handle<TypedArrayObject*> unwrappedTypedArray,
+                      size_t index) {
+        using T = typename decltype(ops)::Type;
+
+        HandleValue value = args.get(2);
+
+        T v;
+        JS_TRY_VAR_OR_RETURN_FALSE(cx, v, ops.convertValue(cx, value));
+
+        SharedMem<T*> addr = TypedArrayData<T>(cx, unwrappedTypedArray, index);
+        if (!addr) {
+          return false;
+        }
+
+        v = op(addr, v);
+
+        JS_TRY_OR_RETURN_FALSE(cx, ops.storeResult(cx, v, args.rval()));
+        return true;
+      });
+}
+
+static bool atomics_exchange(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  return AtomicReadModifyWrite(cx, args, [](auto addr, auto val) {
+    return jit::AtomicOperations::exchangeSeqCst(addr, val);
+  });
+}
+
+static bool atomics_add(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  return AtomicReadModifyWrite(cx, args, [](auto addr, auto val) {
+    return jit::AtomicOperations::fetchAddSeqCst(addr, val);
+  });
+}
+
+static bool atomics_sub(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  return AtomicReadModifyWrite(cx, args, [](auto addr, auto val) {
+    return jit::AtomicOperations::fetchSubSeqCst(addr, val);
+  });
+}
+
+static bool atomics_and(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  return AtomicReadModifyWrite(cx, args, [](auto addr, auto val) {
+    return jit::AtomicOperations::fetchAndSeqCst(addr, val);
+  });
+}
+
+static bool atomics_or(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  return AtomicReadModifyWrite(cx, args, [](auto addr, auto val) {
+    return jit::AtomicOperations::fetchOrSeqCst(addr, val);
+  });
+}
+
+static bool atomics_xor(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  return AtomicReadModifyWrite(cx, args, [](auto addr, auto val) {
+    return jit::AtomicOperations::fetchXorSeqCst(addr, val);
+  });
+}
+
+static bool atomics_isLockFree(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  HandleValue v = args.get(0);
+
+  int32_t size;
+  if (v.isInt32()) {
+    size = v.toInt32();
+  } else {
+    double dsize;
+    if (!ToInteger(cx, v, &dsize)) {
+      return false;
+    }
+
+    if (!mozilla::NumberEqualsInt32(dsize, &size)) {
+      args.rval().setBoolean(false);
+      return true;
+    }
+  }
+
+  args.rval().setBoolean(jit::AtomicOperations::isLockfreeJS(size));
+  return true;
+}
+
+namespace js {
+
+
+class WaitAsyncNotifyTask;
+class WaitAsyncTimeoutTask;
+
+class AutoLockFutexAPI {
+  mozilla::Maybe<js::UniqueLock<js::Mutex>> unique_;
+
+ public:
+  AutoLockFutexAPI() {
+    js::Mutex* lock = FutexThread::lock_;
+    unique_.emplace(*lock);
+  }
+
+  ~AutoLockFutexAPI() { unique_.reset(); }
+
+  js::UniqueLock<js::Mutex>& unique() { return *unique_; }
+};
+
+class FutexWaiter : public FutexWaiterListNode {
+ protected:
+  FutexWaiter(JSContext* cx, size_t offset, FutexWaiterKind kind)
+      : FutexWaiterListNode(kind), offset_(offset), cx_(cx) {}
+
+  size_t offset_;  
+  JSContext* cx_;  
+
+ public:
+  bool isSync() const { return kind_ == FutexWaiterKind::Sync; }
+  SyncFutexWaiter* asSync() {
+    MOZ_ASSERT(isSync());
+    return reinterpret_cast<SyncFutexWaiter*>(this);
+  }
+
+  bool isAsync() const { return kind_ == FutexWaiterKind::Async; }
+  AsyncFutexWaiter* asAsync() {
+    MOZ_ASSERT(isAsync());
+    return reinterpret_cast<AsyncFutexWaiter*>(this);
+  }
+  size_t offset() const { return offset_; }
+  JSContext* cx() { return cx_; }
+};
+
+class MOZ_STACK_CLASS SyncFutexWaiter : public FutexWaiter {
+ public:
+  SyncFutexWaiter(JSContext* cx, size_t offset)
+      : FutexWaiter(cx, offset, FutexWaiterKind::Sync) {}
+};
+
+class AsyncFutexWaiter : public FutexWaiter {
+ public:
+  AsyncFutexWaiter(JSContext* cx, size_t offset)
+      : FutexWaiter(cx, offset, FutexWaiterKind::Async) {}
+
+  ~AsyncFutexWaiter();
+
+  WaitAsyncNotifyTask* notifyTask() { return notifyTask_; }
+
+  void setNotifyTask(WaitAsyncNotifyTask* task) {
+    MOZ_ASSERT(!notifyTask_);
+    notifyTask_ = task;
+  }
+
+  void resetNotifyTask() { notifyTask_ = nullptr; }
+
+  void setTimeoutTask(WaitAsyncTimeoutTask* task) {
+    MOZ_ASSERT(!timeoutTask_);
+    timeoutTask_ = task;
+  }
+
+  void resetTimeoutTask() { timeoutTask_ = nullptr; }
+
+  bool hasTimeout() const { return !!timeoutTask_; }
+  WaitAsyncTimeoutTask* timeoutTask() const { return timeoutTask_; }
+
+  void maybeClearTimeout(AutoLockFutexAPI& lock);
+
+ private:
+  WaitAsyncNotifyTask* notifyTask_ = nullptr;
+
+  WaitAsyncTimeoutTask* timeoutTask_ = nullptr;
+};
+
+class WaitAsyncNotifyTask : public OffThreadPromiseTask {
+ public:
+  enum class Result { Ok, TimedOut, Dead };
+
+ private:
+  Result result_ = Result::Ok;
+
+  AsyncFutexWaiter* waiter_ = nullptr;
+
+ public:
+  WaitAsyncNotifyTask(JSContext* cx, Handle<PromiseObject*> promise)
+      : OffThreadPromiseTask(cx, promise) {}
+
+  ~WaitAsyncNotifyTask() override {
+    if (waiter_) {
+      waiter_->resetNotifyTask();
+    }
+  }
+
+  void setWaiter(AsyncFutexWaiter* waiter) {
+    MOZ_ASSERT(!waiter_);
+    waiter_ = waiter;
+  }
+  void resetWaiter() { waiter_ = nullptr; }
+
+  void setResult(Result result, AutoLockFutexAPI& lock) { result_ = result; }
+
+  bool resolve(JSContext* cx, Handle<PromiseObject*> promise) override {
+    RootedValue resultMsg(cx);
+    switch (result_) {
+      case Result::Ok:
+        resultMsg = StringValue(cx->names().ok);
+        break;
+      case Result::TimedOut:
+        resultMsg = StringValue(cx->names().timed_out_);
+        break;
+      case Result::Dead:
+        return true;
+    }
+    return PromiseObject::resolve(cx, promise, resultMsg);
+  }
+
+  void prepareForCancel() override;
+};
+
+class WaitAsyncTimeoutTask : public JS::Dispatchable {
+  AsyncFutexWaiter* waiter_;
+
+ public:
+  explicit WaitAsyncTimeoutTask(AsyncFutexWaiter* waiter) : waiter_(waiter) {
+    MOZ_ASSERT(waiter_);
+  }
+  ~WaitAsyncTimeoutTask() {
+    if (waiter_) {
+      waiter_->resetTimeoutTask();
+    }
+  }
+
+  void resetWaiter() { waiter_ = nullptr; }
+
+  void clear(AutoLockFutexAPI&) {
+    if (waiter_) {
+      waiter_->resetTimeoutTask();
+    }
+    waiter_ = nullptr;
+  }
+  bool cleared(AutoLockFutexAPI&) { return !waiter_; }
+
+  void run(JSContext*, MaybeShuttingDown maybeshuttingdown) final;
+  void transferToRuntime() final;
+};
+
+AsyncFutexWaiter::~AsyncFutexWaiter() {
+  if (notifyTask_) {
+    notifyTask_->resetWaiter();
+  }
+  if (timeoutTask_) {
+    timeoutTask_->resetWaiter();
+  }
+}
+
+}  
+
+static void AddWaiter(SharedArrayRawBuffer* sarb, FutexWaiter* node,
+                      AutoLockFutexAPI&) {
+  FutexWaiterListNode* listHead = sarb->waiters();
+
+  node->setNext(listHead);
+  node->setPrev(listHead->prev());
+  listHead->prev()->setNext(node);
+  listHead->setPrev(node);
+}
+
+static void RemoveWaiterImpl(FutexWaiterListNode* node, AutoLockFutexAPI&) {
+  if (!node->prev()) {
+    MOZ_ASSERT(!node->next());
+    return;
+  }
+
+  node->prev()->setNext(node->next());
+  node->next()->setPrev(node->prev());
+
+  node->setNext(nullptr);
+  node->setPrev(nullptr);
+}
+
+static void RemoveSyncWaiter(SyncFutexWaiter* waiter, AutoLockFutexAPI& lock) {
+  RemoveWaiterImpl(waiter, lock);
+}
+
+[[nodiscard]] AsyncFutexWaiter* RemoveAsyncWaiter(AsyncFutexWaiter* waiter,
+                                                  AutoLockFutexAPI& lock) {
+  RemoveWaiterImpl(waiter, lock);
+  return waiter;
+}
+
+FutexWaiterListHead::~FutexWaiterListHead() {
+  AutoLockHelperThreadState helperLock;
+  AutoLockFutexAPI lock;
+
+  FutexWaiterListNode* iter = next();
+  while (iter && iter != this) {
+
+    FutexWaiterListNode* next = iter->next();
+    AsyncFutexWaiter* removedWaiter =
+        RemoveAsyncWaiter(iter->toWaiter()->asAsync(), lock);
+    iter = next;
+
+    if (removedWaiter->hasTimeout() &&
+        !removedWaiter->timeoutTask()->cleared(lock)) {
+      continue;
+    }
+    UniquePtr<AsyncFutexWaiter> ownedWaiter(removedWaiter);
+    WaitAsyncNotifyTask* task = ownedWaiter->notifyTask();
+    task->setResult(WaitAsyncNotifyTask::Result::Dead, lock);
+    task->removeFromCancellableListAndDispatch(helperLock);
+  }
+
+  RemoveWaiterImpl(this, lock);
+}
+
+static PlainObject* CreateAsyncResultObject(JSContext* cx, bool async,
+                                            HandleValue promiseOrString) {
+  Rooted<PlainObject*> resultObject(cx, NewPlainObject(cx));
+  if (!resultObject) {
+    return nullptr;
+  }
+
+  RootedValue isAsync(cx, BooleanValue(async));
+  if (!NativeDefineDataProperty(cx, resultObject, cx->names().async, isAsync,
+                                JSPROP_ENUMERATE)) {
+    return nullptr;
+  }
+
+  MOZ_ASSERT_IF(!async, promiseOrString.isString());
+  MOZ_ASSERT_IF(async, promiseOrString.isObject() &&
+                           promiseOrString.toObject().is<PromiseObject>());
+  if (!NativeDefineDataProperty(cx, resultObject, cx->names().value,
+                                promiseOrString, JSPROP_ENUMERATE)) {
+    return nullptr;
+  }
+
+  return resultObject;
+}
+
+void WaitAsyncNotifyTask::prepareForCancel() {
+  AutoLockFutexAPI lock;
+  UniquePtr<AsyncFutexWaiter> waiter(RemoveAsyncWaiter(waiter_, lock));
+  waiter->maybeClearTimeout(lock);
+}
+
+void WaitAsyncTimeoutTask::run(JSContext* cx,
+                               MaybeShuttingDown maybeShuttingDown) {
+  AutoLockHelperThreadState helperLock;
+  AutoLockFutexAPI lock;
+
+  if (cleared(lock)) {
+    js_delete(this);
+    return;
+  }
+
+  UniquePtr<AsyncFutexWaiter> asyncWaiter(RemoveAsyncWaiter(waiter_, lock));
+  asyncWaiter->resetTimeoutTask();
+
+  WaitAsyncNotifyTask* task = asyncWaiter->notifyTask();
+  task->setResult(WaitAsyncNotifyTask::Result::TimedOut, lock);
+  task->removeFromCancellableListAndDispatch(helperLock);
+  js_delete(this);
+}
+
+void WaitAsyncTimeoutTask::transferToRuntime() {
+  {
+    AutoLockFutexAPI lock;
+    clear(lock);
+  }
+  js_delete(this);
+}
+
+void AsyncFutexWaiter::maybeClearTimeout(AutoLockFutexAPI& lock) {
+  if (timeoutTask_) {
+    timeoutTask_->clear(lock);
+    timeoutTask_ = nullptr;
+  }
+}
+
+template <typename T>
+static FutexThread::WaitResult AtomicsWaitAsyncCriticalSection(
+    JSContext* cx, SharedArrayRawBuffer* sarb, size_t byteOffset, T value,
+    const mozilla::Maybe<mozilla::TimeDuration>& timeout,
+    Handle<PromiseObject*> promise) {
+  AutoLockHelperThreadState helperThreadLock;
+
+  UniquePtr<WaitAsyncTimeoutTask> timeoutTask;
+  {
+    AutoLockFutexAPI futexLock;
+
+    SharedMem<T*> addr =
+        sarb->dataPointerShared().cast<T*>() + (byteOffset / sizeof(T));
+    if (jit::AtomicOperations::loadSafeWhenRacy(addr) != value) {
+      return FutexThread::WaitResult::NotEqual;
+    }
+
+    bool hasTimeout = timeout.isSome();
+    if (hasTimeout && timeout.value().IsZero()) {
+      return FutexThread::WaitResult::TimedOut;
+    }
+
+
+    auto notifyTask = js::MakeUnique<WaitAsyncNotifyTask>(cx, promise);
+    if (!notifyTask) {
+      JS_ReportOutOfMemory(cx);
+      return FutexThread::WaitResult::Error;
+    }
+    auto waiter = js::MakeUnique<AsyncFutexWaiter>(cx, byteOffset);
+    if (!waiter) {
+      JS_ReportOutOfMemory(cx);
+      return FutexThread::WaitResult::Error;
+    }
+
+    notifyTask->setWaiter(waiter.get());
+    waiter->setNotifyTask(notifyTask.get());
+
+    if (hasTimeout) {
+      timeoutTask = js::MakeUnique<WaitAsyncTimeoutTask>(waiter.get());
+      if (!timeoutTask) {
+        JS_ReportOutOfMemory(cx);
+        return FutexThread::WaitResult::Error;
+      }
+      waiter->setTimeoutTask(timeoutTask.get());
+    }
+
+    if (!js::OffThreadPromiseTask::InitCancellable(cx, helperThreadLock,
+                                                   std::move(notifyTask))) {
+      return FutexThread::WaitResult::Error;
+    }
+
+    AddWaiter(sarb, waiter.release(), futexLock);
+  }  
+
+  if (timeoutTask) {
+    OffThreadPromiseRuntimeState& state =
+        cx->runtime()->offThreadPromiseState.ref();
+    (void)state.delayedDispatchToEventLoop(std::move(timeoutTask),
+                                           timeout.value().ToMilliseconds());
+  }
+
+  return FutexThread::WaitResult::OK;
+}
+
+template <typename T>
+static PlainObject* AtomicsWaitAsync(
+    JSContext* cx, SharedArrayRawBuffer* sarb, size_t byteOffset, T value,
+    const mozilla::Maybe<mozilla::TimeDuration>& timeout) {
+  Rooted<PromiseObject*> promiseObject(
+      cx, CreatePromiseObjectWithoutResolutionFunctions(cx));
+  if (!promiseObject) {
+    return nullptr;
+  }
+
+  switch (AtomicsWaitAsyncCriticalSection(cx, sarb, byteOffset, value, timeout,
+                                          promiseObject)) {
+    case FutexThread::WaitResult::NotEqual: {
+      RootedValue msg(cx, StringValue(cx->names().not_equal_));
+      return CreateAsyncResultObject(cx, false, msg);
+    }
+    case FutexThread::WaitResult::TimedOut: {
+      RootedValue msg(cx, StringValue(cx->names().timed_out_));
+      return CreateAsyncResultObject(cx, false, msg);
+    }
+    case FutexThread::WaitResult::Error:
+      return nullptr;
+    case FutexThread::WaitResult::OK:
+      break;
+  }
+
+  RootedValue objectValue(cx, ObjectValue(*promiseObject));
+  return CreateAsyncResultObject(cx, true, objectValue);
+}
+
+template <typename T>
+static FutexThread::WaitResult AtomicsWait(
+    JSContext* cx, SharedArrayRawBuffer* sarb, size_t byteOffset, T value,
+    const mozilla::Maybe<mozilla::TimeDuration>& timeout) {
+  MOZ_ASSERT(sarb, "wait is only applicable to shared memory");
+
+  SharedMem<T*> addr =
+      sarb->dataPointerShared().cast<T*>() + (byteOffset / sizeof(T));
+
+  AutoLockFutexAPI lock;
+
+  if (jit::AtomicOperations::loadSafeWhenRacy(addr) != value) {
+    return FutexThread::WaitResult::NotEqual;
+  }
+
+  SyncFutexWaiter w(cx, byteOffset);
+
+  AddWaiter(sarb, &w, lock);
+  FutexThread::WaitResult retval = cx->fx.wait(cx, lock.unique(), timeout);
+  RemoveSyncWaiter(&w, lock);
+
+  return retval;
+}
+
+FutexThread::WaitResult js::atomics_wait_impl(
+    JSContext* cx, SharedArrayRawBuffer* sarb, size_t byteOffset, int32_t value,
+    const mozilla::Maybe<mozilla::TimeDuration>& timeout) {
+  return AtomicsWait(cx, sarb, byteOffset, value, timeout);
+}
+
+FutexThread::WaitResult js::atomics_wait_impl(
+    JSContext* cx, SharedArrayRawBuffer* sarb, size_t byteOffset, int64_t value,
+    const mozilla::Maybe<mozilla::TimeDuration>& timeout) {
+  return AtomicsWait(cx, sarb, byteOffset, value, timeout);
+}
+
+PlainObject* js::atomics_wait_async_impl(
+    JSContext* cx, SharedArrayRawBuffer* sarb, size_t byteOffset, int32_t value,
+    const mozilla::Maybe<mozilla::TimeDuration>& timeout) {
+  return AtomicsWaitAsync(cx, sarb, byteOffset, value, timeout);
+}
+
+PlainObject* js::atomics_wait_async_impl(
+    JSContext* cx, SharedArrayRawBuffer* sarb, size_t byteOffset, int64_t value,
+    const mozilla::Maybe<mozilla::TimeDuration>& timeout) {
+  return AtomicsWaitAsync(cx, sarb, byteOffset, value, timeout);
+}
+
+template <typename T>
+static bool DoAtomicsWait(JSContext* cx, bool isAsync,
+                          Handle<TypedArrayObject*> unwrappedTypedArray,
+                          size_t index, T value, HandleValue timeoutv,
+                          MutableHandleValue r) {
+  mozilla::Maybe<mozilla::TimeDuration> timeout;
+  if (!timeoutv.isUndefined()) {
+    double timeout_ms;
+    if (!ToNumber(cx, timeoutv, &timeout_ms)) {
+      return false;
+    }
+
+    if (!std::isnan(timeout_ms)) {
+      if (timeout_ms < 0) {
+        timeout = mozilla::Some(mozilla::TimeDuration::FromSeconds(0.0));
+      } else if (!std::isinf(timeout_ms)) {
+        timeout =
+            mozilla::Some(mozilla::TimeDuration::FromMilliseconds(timeout_ms));
+      }
+    }
+  }
+
+  if (!isAsync && !cx->fx.canWait()) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_ATOMICS_WAIT_NOT_ALLOWED);
+    return false;
+  }
+
+  Rooted<SharedArrayBufferObject*> unwrappedSab(
+      cx, unwrappedTypedArray->bufferShared());
+
+  mozilla::Maybe<size_t> offset = unwrappedTypedArray->byteOffset();
+  MOZ_ASSERT(
+      offset,
+      "offset can't become invalid because shared buffers can only grow");
+
+  size_t byteIndexInBuffer = index * sizeof(T) + *offset;
+
+  if (isAsync) {
+    PlainObject* resultObject = atomics_wait_async_impl(
+        cx, unwrappedSab->rawBufferObject(), byteIndexInBuffer, value, timeout);
+    if (!resultObject) {
+      return false;
+    }
+    r.setObject(*resultObject);
+    return true;
+  }
+
+  switch (atomics_wait_impl(cx, unwrappedSab->rawBufferObject(),
+                            byteIndexInBuffer, value, timeout)) {
+    case FutexThread::WaitResult::NotEqual:
+      r.setString(cx->names().not_equal_);
+      return true;
+    case FutexThread::WaitResult::OK:
+      r.setString(cx->names().ok);
+      return true;
+    case FutexThread::WaitResult::TimedOut:
+      r.setString(cx->names().timed_out_);
+      return true;
+    case FutexThread::WaitResult::Error:
+      return false;
+    default:
+      MOZ_CRASH("Should not happen");
+  }
+}
+
+static bool DoWait(JSContext* cx, bool isAsync, HandleValue objv,
+                   HandleValue index, HandleValue valv, HandleValue timeoutv,
+                   MutableHandleValue r) {
+  Rooted<TypedArrayObject*> unwrappedTypedArray(cx);
+  if (!ValidateIntegerTypedArray(cx, objv, true, AccessMode::Read,
+                                 &unwrappedTypedArray)) {
+    return false;
+  }
+  MOZ_ASSERT(unwrappedTypedArray->type() == Scalar::Int32 ||
+             unwrappedTypedArray->type() == Scalar::BigInt64);
+
+  if (!unwrappedTypedArray->isSharedMemory()) {
+    return ReportBadArrayType(cx);
+  }
+
+  size_t intIndex;
+  if (!ValidateAtomicAccess(cx, unwrappedTypedArray, index, &intIndex)) {
+    return false;
+  }
+
+  if (unwrappedTypedArray->type() == Scalar::Int32) {
+    int32_t value;
+    if (!ToInt32(cx, valv, &value)) {
+      return false;
+    }
+
+    return DoAtomicsWait(cx, isAsync, unwrappedTypedArray, intIndex, value,
+                         timeoutv, r);
+  }
+
+  MOZ_ASSERT(unwrappedTypedArray->type() == Scalar::BigInt64);
+
+  RootedBigInt value(cx, ToBigInt(cx, valv));
+  if (!value) {
+    return false;
+  }
+
+  return DoAtomicsWait(cx, isAsync, unwrappedTypedArray, intIndex,
+                       BigInt::toInt64(value), timeoutv, r);
+}
+
+static bool atomics_wait(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  HandleValue objv = args.get(0);
+  HandleValue index = args.get(1);
+  HandleValue valv = args.get(2);
+  HandleValue timeoutv = args.get(3);
+  MutableHandleValue r = args.rval();
+
+  return DoWait(cx,  false, objv, index, valv, timeoutv, r);
+}
+
+static bool atomics_wait_async(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  HandleValue objv = args.get(0);
+  HandleValue index = args.get(1);
+  HandleValue valv = args.get(2);
+  HandleValue timeoutv = args.get(3);
+  MutableHandleValue r = args.rval();
+
+  return DoWait(cx,  true, objv, index, valv, timeoutv, r);
+}
+
+bool js::atomics_notify_impl(JSContext* cx, SharedArrayRawBuffer* sarb,
+                             size_t byteOffset, int64_t count, int64_t* woken) {
+  MOZ_ASSERT(woken);
+
+  MOZ_ASSERT(sarb, "notify is only applicable to shared memory");
+
+  *woken = 0;
+
+  Rooted<GCVector<PromiseObject*>> promisesToResolve(
+      cx, GCVector<PromiseObject*>(cx));
+  {
+    AutoLockHelperThreadState helperLock;
+    AutoLockFutexAPI lock;
+    FutexWaiterListNode* waiterListHead = sarb->waiters();
+    FutexWaiterListNode* iter = waiterListHead->next();
+    while (count && iter != waiterListHead) {
+      FutexWaiter* waiter = iter->toWaiter();
+      iter = iter->next();
+      if (byteOffset != waiter->offset()) {
+        continue;
+      }
+      if (waiter->isSync()) {
+        if (!waiter->cx()->fx.isWaiting()) {
+          continue;
+        }
+        waiter->cx()->fx.notify(FutexThread::NotifyExplicit);
+      } else {
+
+        UniquePtr<AsyncFutexWaiter> asyncWaiter(
+            RemoveAsyncWaiter(waiter->asAsync(), lock));
+        asyncWaiter->maybeClearTimeout(lock);
+        OffThreadPromiseTask* task = asyncWaiter->notifyTask();
+        if (waiter->cx() == cx) {
+          PromiseObject* promise =
+              OffThreadPromiseTask::ExtractAndForget(task, helperLock);
+          if (!promisesToResolve.append(promise)) {
+            return false;
+          }
+        } else {
+          task->removeFromCancellableListAndDispatch(helperLock);
+        }
+      }
+      MOZ_RELEASE_ASSERT(*woken < INT64_MAX);
+      (*woken)++;
+      if (count > 0) {
+        --count;
+      }
+    }
+  }
+
+  RootedValue resultMsg(cx, StringValue(cx->names().ok));
+  for (uint32_t i = 0; i < promisesToResolve.length(); i++) {
+    AutoRealm ar(cx, promisesToResolve[i]);
+    if (!PromiseObject::resolve(cx, promisesToResolve[i], resultMsg)) {
+      MOZ_ASSERT(cx->isThrowingOutOfMemory() || cx->isThrowingOverRecursed());
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static bool atomics_notify(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  HandleValue objv = args.get(0);
+  HandleValue index = args.get(1);
+  HandleValue countv = args.get(2);
+  MutableHandleValue r = args.rval();
+
+  Rooted<TypedArrayObject*> unwrappedTypedArray(cx);
+  if (!ValidateIntegerTypedArray(cx, objv, true, AccessMode::Read,
+                                 &unwrappedTypedArray)) {
+    return false;
+  }
+  MOZ_ASSERT(unwrappedTypedArray->type() == Scalar::Int32 ||
+             unwrappedTypedArray->type() == Scalar::BigInt64);
+
+  size_t intIndex;
+  if (!ValidateAtomicAccess(cx, unwrappedTypedArray, index, &intIndex)) {
+    return false;
+  }
+
+  int64_t count;
+  if (countv.isUndefined()) {
+    count = -1;
+  } else {
+    double dcount;
+    if (!ToInteger(cx, countv, &dcount)) {
+      return false;
+    }
+    if (dcount < 0.0) {
+      dcount = 0.0;
+    }
+    count = dcount < double(1ULL << 63) ? int64_t(dcount) : -1;
+  }
+
+  if (!unwrappedTypedArray->isSharedMemory()) {
+    r.setInt32(0);
+    return true;
+  }
+
+  Rooted<SharedArrayBufferObject*> unwrappedSab(
+      cx, unwrappedTypedArray->bufferShared());
+
+  mozilla::Maybe<size_t> offset = unwrappedTypedArray->byteOffset();
+  MOZ_ASSERT(
+      offset,
+      "offset can't become invalid because shared buffers can only grow");
+
+  size_t elementSize = Scalar::byteSize(unwrappedTypedArray->type());
+  size_t indexedPosition = intIndex * elementSize + *offset;
+
+
+  int64_t woken = 0;
+  if (!atomics_notify_impl(cx, unwrappedSab->rawBufferObject(), indexedPosition,
+                           count, &woken)) {
+    return false;
+  }
+
+  r.setNumber(double(woken));
+
+  return true;
+}
+
+static bool atomics_pause(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  if (args.hasDefined(0)) {
+    if (!args[0].isNumber() || !IsInteger(args[0].toNumber())) {
+      JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                                JSMSG_ATOMICS_PAUSE_BAD_COUNT);
+      return false;
+    }
+  }
+
+  jit::AtomicOperations::pause();
+
+  args.rval().setUndefined();
+  return true;
+}
+
+bool js::FutexThread::initialize() {
+  MOZ_ASSERT(!lock_);
+  lock_ = js_new<js::Mutex>(mutexid::FutexThread);
+  return lock_ != nullptr;
+}
+
+void js::FutexThread::destroy() {
+  if (lock_) {
+    js::Mutex* lock = lock_;
+    js_delete(lock);
+    lock_ = nullptr;
+  }
+}
+
+void js::FutexThread::lock() {
+  js::Mutex* lock = lock_;
+
+  lock->lock();
+}
+
+ mozilla::Atomic<js::Mutex*, mozilla::SequentiallyConsistent>
+    FutexThread::lock_;
+
+void js::FutexThread::unlock() {
+  js::Mutex* lock = lock_;
+
+  lock->unlock();
+}
+
+js::FutexThread::FutexThread()
+    : cond_(nullptr), state_(Idle), canWait_(false) {}
+
+bool js::FutexThread::initInstance() {
+  MOZ_ASSERT(lock_);
+  cond_ = js_new<js::ConditionVariable>();
+  return cond_ != nullptr;
+}
+
+void js::FutexThread::destroyInstance() {
+  if (cond_) {
+    js_delete(cond_);
+  }
+}
+
+bool js::FutexThread::isWaiting() {
+  return state_ == Waiting || state_ == WaitingInterrupted ||
+         state_ == WaitingNotifiedForInterrupt;
+}
+
+FutexThread::WaitResult js::FutexThread::wait(
+    JSContext* cx, js::UniqueLock<js::Mutex>& locked,
+    const mozilla::Maybe<mozilla::TimeDuration>& timeout) {
+  MOZ_ASSERT(&cx->fx == this);
+  MOZ_ASSERT(cx->fx.canWait());
+  MOZ_ASSERT(state_ == Idle || state_ == WaitingInterrupted);
+
+
+  if (state_ == WaitingInterrupted) {
+    UnlockGuard unlock(locked);
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_ATOMICS_WAIT_NOT_ALLOWED);
+    return WaitResult::Error;
+  }
+
+  auto onFinish = mozilla::MakeScopeExit([&] { state_ = Idle; });
+
+  const bool isTimed = timeout.isSome();
+
+  auto finalEnd = timeout.map([](const mozilla::TimeDuration& timeout) {
+    return mozilla::TimeStamp::Now() + timeout;
+  });
+
+  auto maxSlice = mozilla::TimeDuration::FromSeconds(4000.0);
+
+  for (;;) {
+    auto sliceEnd = finalEnd.map([&](mozilla::TimeStamp& finalEnd) {
+      auto sliceEnd = mozilla::TimeStamp::Now() + maxSlice;
+      if (finalEnd < sliceEnd) {
+        sliceEnd = finalEnd;
+      }
+      return sliceEnd;
+    });
+
+    state_ = Waiting;
+
+    MOZ_ASSERT((cx->runtime()->beforeWaitCallback == nullptr) ==
+               (cx->runtime()->afterWaitCallback == nullptr));
+    mozilla::DebugOnly<bool> callbacksPresent =
+        cx->runtime()->beforeWaitCallback != nullptr;
+
+    void* cookie = nullptr;
+    uint8_t clientMemory[JS::WAIT_CALLBACK_CLIENT_MAXMEM];
+    if (cx->runtime()->beforeWaitCallback) {
+      cookie = (*cx->runtime()->beforeWaitCallback)(clientMemory);
+    }
+
+    if (isTimed) {
+      (void)cond_->wait_until(locked, *sliceEnd);
+    } else {
+      cond_->wait(locked);
+    }
+
+    MOZ_ASSERT((cx->runtime()->afterWaitCallback != nullptr) ==
+               callbacksPresent);
+    if (cx->runtime()->afterWaitCallback) {
+      (*cx->runtime()->afterWaitCallback)(cookie);
+    }
+
+    switch (state_) {
+      case FutexThread::Waiting:
+        if (isTimed) {
+          auto now = mozilla::TimeStamp::Now();
+          if (now >= *finalEnd) {
+            return WaitResult::TimedOut;
+          }
+        }
+        break;
+
+      case FutexThread::Woken:
+        return WaitResult::OK;
+
+      case FutexThread::WaitingNotifiedForInterrupt:
+
+        state_ = WaitingInterrupted;
+        {
+          UnlockGuard unlock(locked);
+          if (!cx->handleInterrupt()) {
+            return WaitResult::Error;
+          }
+        }
+        if (state_ == Woken) {
+          return WaitResult::OK;
+        }
+        break;
+
+      default:
+        MOZ_CRASH("Bad FutexState in wait()");
+    }
+  }
+}
+
+void js::FutexThread::notify(NotifyReason reason) {
+  MOZ_ASSERT(isWaiting());
+
+  if ((state_ == WaitingInterrupted || state_ == WaitingNotifiedForInterrupt) &&
+      reason == NotifyExplicit) {
+    state_ = Woken;
+    return;
+  }
+  switch (reason) {
+    case NotifyExplicit:
+      state_ = Woken;
+      break;
+    case NotifyForJSInterrupt:
+      if (state_ == WaitingNotifiedForInterrupt) {
+        return;
+      }
+      state_ = WaitingNotifiedForInterrupt;
+      break;
+    default:
+      MOZ_CRASH("bad NotifyReason in FutexThread::notify()");
+  }
+  cond_->notify_all();
+}
+
+const JSFunctionSpec AtomicsMethods[] = {
+    JS_INLINABLE_FN("compareExchange", atomics_compareExchange, 4, 0,
+                    AtomicsCompareExchange),
+    JS_INLINABLE_FN("load", atomics_load, 2, 0, AtomicsLoad),
+    JS_INLINABLE_FN("store", atomics_store, 3, 0, AtomicsStore),
+    JS_INLINABLE_FN("exchange", atomics_exchange, 3, 0, AtomicsExchange),
+    JS_INLINABLE_FN("add", atomics_add, 3, 0, AtomicsAdd),
+    JS_INLINABLE_FN("sub", atomics_sub, 3, 0, AtomicsSub),
+    JS_INLINABLE_FN("and", atomics_and, 3, 0, AtomicsAnd),
+    JS_INLINABLE_FN("or", atomics_or, 3, 0, AtomicsOr),
+    JS_INLINABLE_FN("xor", atomics_xor, 3, 0, AtomicsXor),
+    JS_INLINABLE_FN("isLockFree", atomics_isLockFree, 1, 0, AtomicsIsLockFree),
+    JS_FN("wait", atomics_wait, 4, 0),
+    JS_FN("waitAsync", atomics_wait_async, 4, 0),
+    JS_FN("notify", atomics_notify, 3, 0),
+    JS_FN("wake", atomics_notify, 3, 0),  
+    JS_INLINABLE_FN("pause", atomics_pause, 0, 0, AtomicsPause),
+    JS_FS_END,
+};
+
+static const JSPropertySpec AtomicsProperties[] = {
+    JS_STRING_SYM_PS(toStringTag, "Atomics", JSPROP_READONLY),
+    JS_PS_END,
+};
+
+static JSObject* CreateAtomicsObject(JSContext* cx, JSProtoKey key) {
+  RootedObject proto(cx, &cx->global()->getObjectPrototype());
+  return NewObjectWithGivenProto(cx, &AtomicsObject::class_, proto,
+                                 {.newKind = TenuredObject});
+}
+
+static const ClassSpec AtomicsClassSpec = {
+    CreateAtomicsObject,
+    nullptr,
+    AtomicsMethods,
+    AtomicsProperties,
+};
+
+const JSClass AtomicsObject::class_ = {
+    "Atomics",
+    JSCLASS_HAS_CACHED_PROTO(JSProto_Atomics),
+    JS_NULL_CLASS_OPS,
+    &AtomicsClassSpec,
+};

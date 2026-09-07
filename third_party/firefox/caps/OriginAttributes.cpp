@@ -1,0 +1,459 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/OriginAttributes.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/dom/BlobURLProtocolHandler.h"
+#include "mozilla/dom/quota/QuotaManager.h"
+#include "nsIEffectiveTLDService.h"
+#include "nsIURI.h"
+#include "nsNetCID.h"
+#include "nsNetUtil.h"
+#include "nsString.h"
+#include "nsURLHelper.h"
+
+static const char kSourceChar = ':';
+static const char kSanitizedChar = '+';
+
+namespace mozilla {
+
+static void MakeTopLevelInfo(const nsACString& aScheme, const nsACString& aHost,
+                             bool aForeignByAncestorContext, bool aUseSite,
+                             nsAString& aTopLevelInfo) {
+  if (!aUseSite) {
+    aTopLevelInfo.Assign(NS_ConvertUTF8toUTF16(aHost));
+    return;
+  }
+
+
+  nsAutoCString site;
+  site.AssignLiteral("(");
+  site.Append(aScheme);
+  site.Append(",");
+  site.Append(aHost);
+  if (aForeignByAncestorContext) {
+    site.Append(",f");
+  }
+  site.AppendLiteral(")");
+
+  aTopLevelInfo.Assign(NS_ConvertUTF8toUTF16(site));
+}
+
+static void PopulateTopLevelInfoFromURI(const bool aIsTopLevelDocument,
+                                        nsIURI* aURI,
+                                        bool aForeignByAncestorContext,
+                                        bool aIsFirstPartyEnabled, bool aForced,
+                                        bool aUseSite,
+                                        nsString OriginAttributes::* aTarget,
+                                        OriginAttributes& aOriginAttributes) {
+  nsresult rv;
+
+  if (!aURI) {
+    return;
+  }
+
+  if ((!aIsFirstPartyEnabled || !aIsTopLevelDocument) && !aForced) {
+    return;
+  }
+
+  nsAString& topLevelInfo = aOriginAttributes.*aTarget;
+
+  nsAutoCString scheme;
+  nsCOMPtr<nsIURI> uri = aURI;
+  nsCOMPtr<nsINestedURI> nestedURI;
+  do {
+    NS_ENSURE_SUCCESS_VOID(uri->GetScheme(scheme));
+    nestedURI = do_QueryInterface(uri);
+  } while (nestedURI && !scheme.EqualsLiteral("about") &&
+           NS_SUCCEEDED(nestedURI->GetInnerURI(getter_AddRefs(uri))));
+
+  if (scheme.EqualsLiteral("blob")) {
+    nsCOMPtr<nsIPrincipal> blobPrincipal;
+    NS_ENSURE_TRUE_VOID(dom::BlobURLProtocolHandler::GetBlobURLPrincipal(
+        uri, aOriginAttributes, getter_AddRefs(blobPrincipal)));
+    uri = blobPrincipal->GetURI();
+    NS_ENSURE_TRUE_VOID(uri);
+    NS_ENSURE_SUCCESS_VOID(uri->GetScheme(scheme));
+  }
+
+  if (scheme.EqualsLiteral("about")) {
+    MakeTopLevelInfo(scheme, nsLiteralCString(ABOUT_URI_FIRST_PARTY_DOMAIN),
+                     aForeignByAncestorContext, aUseSite, topLevelInfo);
+    return;
+  }
+
+  if (scheme.EqualsLiteral("moz-nullprincipal")) {
+    nsAutoCString filePath;
+    rv = uri->GetFilePath(filePath);
+    MOZ_ASSERT(NS_SUCCEEDED(rv));
+    filePath.Mid(filePath, 1, filePath.Length() - 2);
+    filePath.AppendLiteral(".mozilla");
+    topLevelInfo = NS_ConvertUTF8toUTF16(filePath);
+    return;
+  }
+
+  nsCOMPtr<nsIEffectiveTLDService> tldService =
+      do_GetService(NS_EFFECTIVETLDSERVICE_CONTRACTID);
+  MOZ_ASSERT(tldService);
+  NS_ENSURE_TRUE_VOID(tldService);
+
+  nsAutoCString baseDomain;
+  rv = tldService->GetBaseDomain(uri, 0, baseDomain);
+  if (NS_SUCCEEDED(rv)) {
+    MakeTopLevelInfo(scheme, baseDomain, aForeignByAncestorContext, aUseSite,
+                     topLevelInfo);
+    return;
+  }
+
+  bool isIpAddress = (rv == NS_ERROR_HOST_IS_IP_ADDRESS);
+  bool isInsufficientDomainLevels = (rv == NS_ERROR_INSUFFICIENT_DOMAIN_LEVELS);
+
+  nsAutoCString host;
+  rv = uri->GetHost(host);
+  NS_ENSURE_SUCCESS_VOID(rv);
+
+  if (isIpAddress) {
+    nsAutoCString ipAddr;
+
+    if (net_IsValidIPv6Addr(host)) {
+      ipAddr.AssignLiteral("[");
+      ipAddr.Append(host);
+      ipAddr.AppendLiteral("]");
+    } else {
+      ipAddr = host;
+    }
+    MakeTopLevelInfo(scheme, ipAddr, aForeignByAncestorContext, aUseSite,
+                     topLevelInfo);
+    return;
+  }
+
+  if (aUseSite) {
+    MakeTopLevelInfo(scheme, host, aForeignByAncestorContext, aUseSite,
+                     topLevelInfo);
+    return;
+  }
+
+  if (isInsufficientDomainLevels) {
+    nsAutoCString publicSuffix;
+    rv = tldService->GetPublicSuffix(uri, publicSuffix);
+    if (NS_SUCCEEDED(rv)) {
+      MakeTopLevelInfo(scheme, publicSuffix, aForeignByAncestorContext,
+                       aUseSite, topLevelInfo);
+      return;
+    }
+  }
+}
+
+void OriginAttributes::SetFirstPartyDomain(const bool aIsTopLevelDocument,
+                                           nsIURI* aURI, bool aForced) {
+  PopulateTopLevelInfoFromURI(
+      aIsTopLevelDocument, aURI, false, IsFirstPartyEnabled(), aForced,
+      StaticPrefs::privacy_firstparty_isolate_use_site(),
+      &OriginAttributes::mFirstPartyDomain, *this);
+}
+
+void OriginAttributes::SetFirstPartyDomain(const bool aIsTopLevelDocument,
+                                           const nsACString& aDomain) {
+  SetFirstPartyDomain(aIsTopLevelDocument, NS_ConvertUTF8toUTF16(aDomain));
+}
+
+void OriginAttributes::SetFirstPartyDomain(const bool aIsTopLevelDocument,
+                                           const nsAString& aDomain,
+                                           bool aForced) {
+  if ((!IsFirstPartyEnabled() || !aIsTopLevelDocument) && !aForced) {
+    return;
+  }
+
+  mFirstPartyDomain = aDomain;
+}
+
+void OriginAttributes::SetPartitionKey(nsIURI* aURI,
+                                       bool aForeignByAncestorContext) {
+  PopulateTopLevelInfoFromURI(
+      false , aURI, aForeignByAncestorContext,
+      IsFirstPartyEnabled(), true ,
+      StaticPrefs::privacy_dynamic_firstparty_use_site(),
+      &OriginAttributes::mPartitionKey, *this);
+}
+
+void OriginAttributes::SetPartitionKey(const nsACString& aOther) {
+  SetPartitionKey(NS_ConvertUTF8toUTF16(aOther));
+}
+
+void OriginAttributes::SetPartitionKey(const nsAString& aOther) {
+  mPartitionKey = aOther;
+}
+
+void OriginAttributes::CreateSuffix(nsACString& aStr) const {
+  URLParams params;
+  nsAutoCString value;
+
+
+  if (mUserContextId != nsIScriptSecurityManager::DEFAULT_USER_CONTEXT_ID) {
+    value.Truncate();
+    value.AppendInt(mUserContextId);
+    params.Set("userContextId"_ns, value);
+  }
+
+  if (mPrivateBrowsingId) {
+    value.Truncate();
+    value.AppendInt(mPrivateBrowsingId);
+    params.Set("privateBrowsingId"_ns, value);
+  }
+
+  if (!mFirstPartyDomain.IsEmpty()) {
+    nsAutoString sanitizedFirstPartyDomain(mFirstPartyDomain);
+    sanitizedFirstPartyDomain.ReplaceChar(kSourceChar, kSanitizedChar);
+    params.Set("firstPartyDomain"_ns,
+               NS_ConvertUTF16toUTF8(sanitizedFirstPartyDomain));
+  }
+
+  if (!mGeckoViewSessionContextId.IsEmpty()) {
+    nsAutoString sanitizedGeckoViewUserContextId(mGeckoViewSessionContextId);
+    sanitizedGeckoViewUserContextId.ReplaceChar(
+        dom::quota::QuotaManager::kReplaceChars16, kSanitizedChar);
+    params.Set("geckoViewUserContextId"_ns,
+               NS_ConvertUTF16toUTF8(sanitizedGeckoViewUserContextId));
+  }
+
+  if (!mPartitionKey.IsEmpty()) {
+    nsAutoString sanitizedPartitionKey(mPartitionKey);
+    sanitizedPartitionKey.ReplaceChar(kSourceChar, kSanitizedChar);
+    params.Set("partitionKey"_ns, NS_ConvertUTF16toUTF8(sanitizedPartitionKey));
+  }
+
+  aStr.Truncate();
+
+  params.Serialize(value, true);
+  value.ReplaceSubstring("*"_ns, "%2A"_ns);
+
+  if (!value.IsEmpty()) {
+    aStr.AppendLiteral("^");
+    aStr.Append(value);
+  }
+
+#ifdef DEBUG
+  nsAutoCString str;
+  str.Assign(aStr);
+  MOZ_ASSERT(str.FindCharInSet(dom::quota::QuotaManager::kReplaceChars) ==
+             kNotFound);
+#endif
+}
+
+already_AddRefed<nsAtom> OriginAttributes::CreateSuffixAtom() const {
+  nsAutoCString suffix;
+  CreateSuffix(suffix);
+  return NS_Atomize(suffix);
+}
+
+void OriginAttributes::CreateAnonymizedSuffix(nsACString& aStr) const {
+  OriginAttributes attrs = *this;
+
+  if (!attrs.mFirstPartyDomain.IsEmpty()) {
+    attrs.mFirstPartyDomain.AssignLiteral("_anonymizedFirstPartyDomain_");
+  }
+
+  if (!attrs.mPartitionKey.IsEmpty()) {
+    attrs.mPartitionKey.AssignLiteral("_anonymizedPartitionKey_");
+  }
+
+  attrs.CreateSuffix(aStr);
+}
+
+bool OriginAttributes::PopulateFromSuffix(const nsACString& aStr) {
+  if (aStr.IsEmpty()) {
+    return true;
+  }
+
+  if (aStr[0] != '^') {
+    return false;
+  }
+
+  mPrivateBrowsingId = nsIScriptSecurityManager::DEFAULT_PRIVATE_BROWSING_ID;
+
+
+  MOZ_RELEASE_ASSERT(mUserContextId == 0);
+  MOZ_RELEASE_ASSERT(mPrivateBrowsingId == 0);
+  MOZ_RELEASE_ASSERT(mFirstPartyDomain.IsEmpty());
+  MOZ_RELEASE_ASSERT(mGeckoViewSessionContextId.IsEmpty());
+  MOZ_RELEASE_ASSERT(mPartitionKey.IsEmpty());
+
+  return URLParams::Parse(
+      Substring(aStr, 1, aStr.Length() - 1), true,
+      [this](const nsACString& aName, const nsACString& aValue) {
+        if (aName.EqualsLiteral("disableJit")) {
+          return true;
+        }
+
+        if (aName.EqualsLiteral("inBrowser")) {
+          if (!aValue.EqualsLiteral("1")) {
+            return false;
+          }
+
+          return true;
+        }
+
+        if (aName.EqualsLiteral("addonId") || aName.EqualsLiteral("appId")) {
+          return true;
+        }
+
+        if (aName.EqualsLiteral("userContextId")) {
+          nsresult rv;
+          int64_t val = aValue.ToInteger64(&rv);
+          NS_ENSURE_SUCCESS(rv, false);
+          NS_ENSURE_TRUE(val <= UINT32_MAX, false);
+          mUserContextId = static_cast<uint32_t>(val);
+
+          return true;
+        }
+
+        if (aName.EqualsLiteral("privateBrowsingId")) {
+          nsresult rv;
+          int64_t val = aValue.ToInteger64(&rv);
+          NS_ENSURE_SUCCESS(rv, false);
+          NS_ENSURE_TRUE(val >= 0 && val <= UINT32_MAX, false);
+          mPrivateBrowsingId = static_cast<uint32_t>(val);
+
+          return true;
+        }
+
+        if (aName.EqualsLiteral("firstPartyDomain")) {
+          nsAutoCString firstPartyDomain(aValue);
+          firstPartyDomain.ReplaceChar(kSanitizedChar, kSourceChar);
+          mFirstPartyDomain.Assign(NS_ConvertUTF8toUTF16(firstPartyDomain));
+          return true;
+        }
+
+        if (aName.EqualsLiteral("geckoViewUserContextId")) {
+          mGeckoViewSessionContextId.Assign(NS_ConvertUTF8toUTF16(aValue));
+          return true;
+        }
+
+        if (aName.EqualsLiteral("partitionKey")) {
+          nsAutoCString partitionKey(aValue);
+          partitionKey.ReplaceChar(kSanitizedChar, kSourceChar);
+          mPartitionKey.Assign(NS_ConvertUTF8toUTF16(partitionKey));
+          return true;
+        }
+
+        return false;
+      });
+}
+
+bool OriginAttributes::PopulateFromOrigin(const nsACString& aOrigin,
+                                          nsACString& aOriginNoSuffix) {
+  nsCString origin(aOrigin);
+  int32_t pos = origin.RFindChar('^');
+
+  if (pos == kNotFound) {
+    aOriginNoSuffix = std::move(origin);
+    return true;
+  }
+
+  aOriginNoSuffix = Substring(origin, 0, pos);
+  return PopulateFromSuffix(Substring(origin, pos));
+}
+
+void OriginAttributes::SyncAttributesWithPrivateBrowsing(
+    bool aInPrivateBrowsing) {
+  mPrivateBrowsingId = aInPrivateBrowsing ? 1 : 0;
+}
+
+bool OriginAttributes::IsPrivateBrowsing(const nsACString& aOrigin) {
+  nsAutoCString dummy;
+  OriginAttributes attrs;
+  if (NS_WARN_IF(!attrs.PopulateFromOrigin(aOrigin, dummy))) {
+    return false;
+  }
+
+  return attrs.IsPrivateBrowsing();
+}
+
+bool OriginAttributes::ParsePartitionKey(const nsAString& aPartitionKey,
+                                         nsAString& outScheme,
+                                         nsAString& outBaseDomain,
+                                         int32_t& outPort,
+                                         bool& outForeignByAncestorContext) {
+  outScheme.Truncate();
+  outBaseDomain.Truncate();
+  outPort = -1;
+  outForeignByAncestorContext = false;
+
+
+  if (aPartitionKey.IsEmpty()) {
+    return true;
+  }
+
+  if (!StaticPrefs::privacy_dynamic_firstparty_use_site()) {
+    outBaseDomain = aPartitionKey;
+    return true;
+  }
+
+  if (NS_WARN_IF(aPartitionKey.Length() < 5)) {
+    return false;
+  }
+
+  if (NS_WARN_IF(aPartitionKey.First() != '(' || aPartitionKey.Last() != ')')) {
+    return false;
+  }
+
+  nsAutoString str(Substring(aPartitionKey, 1, aPartitionKey.Length() - 2));
+
+  uint32_t fieldIndex = 0;
+  for (const nsAString& field : str.Split(',')) {
+    if (NS_WARN_IF(field.IsEmpty())) {
+      return false;
+    }
+
+    if (fieldIndex == 0) {
+      outScheme.Assign(field);
+    } else if (fieldIndex == 1) {
+      outBaseDomain.Assign(field);
+    } else if (fieldIndex == 2) {
+      if (field.EqualsLiteral("f")) {
+        outForeignByAncestorContext = true;
+      } else {
+        long port = strtol(NS_ConvertUTF16toUTF8(field).get(), nullptr, 10);
+        if (NS_WARN_IF(port == 0)) {
+          return false;
+        }
+        outPort = static_cast<int32_t>(port);
+      }
+    } else if (fieldIndex == 3) {
+      if (!field.EqualsLiteral("f") || outPort != -1) {
+        NS_WARNING("Invalid partitionKey. Invalid token.");
+        return false;
+      }
+      outForeignByAncestorContext = true;
+    } else {
+      NS_WARNING("Invalid partitionKey. Too many tokens");
+      return false;
+    }
+
+    fieldIndex++;
+  }
+
+  return fieldIndex > 1;
+}
+
+bool OriginAttributes::ExtractSiteFromPartitionKey(
+    const nsAString& aPartitionKey, nsAString& aOutSite) {
+  nsAutoString scheme, host;
+  int32_t port;
+  bool unused;
+  if (!ParsePartitionKey(aPartitionKey, scheme, host, port, unused)) {
+    return false;
+  }
+
+  if (port == -1) {
+    aOutSite.Assign(scheme + u"://"_ns + host);
+  } else {
+    aOutSite.Assign(scheme + u"://"_ns + host + u":"_ns);
+    aOutSite.AppendInt(port);
+  }
+  return true;
+}
+
+}  

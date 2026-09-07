@@ -1,0 +1,230 @@
+/*
+ * Copyright 2020 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkRuntimeEffectPriv_DEFINED)
+#define SkRuntimeEffectPriv_DEFINED
+
+#include "include/core/SkColor.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkString.h"
+#include "include/effects/SkRuntimeEffect.h"
+#include "include/private/SkSLSampleUsage.h"
+#include "include/private/base/SkAssert.h"
+#include "include/private/base/SkDebug.h"
+#include "include/private/base/SkSpan_impl.h"
+#include "include/private/base/SkTArray.h"
+#include "src/core/SkEffectPriv.h"
+#include "src/core/SkKnownRuntimeEffects.h"
+#include "src/sksl/codegen/SkSLRasterPipelineBuilder.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <vector>
+
+#include "include/sksl/SkSLVersion.h"
+
+class SkArenaAlloc;
+class SkCapabilities;
+class SkColorSpace;
+class SkData;
+class SkMatrix;
+class SkReadBuffer;
+class SkShader;
+class SkWriteBuffer;
+struct SkColorSpaceXformSteps;
+
+namespace SkShaders {
+class MatrixRec;
+}
+
+namespace SkSL {
+class Context;
+class Variable;
+struct Program;
+}
+
+class SkRuntimeEffectPriv {
+public:
+    struct UniformsCallbackContext {
+        const SkColorSpace* fDstColorSpace;
+    };
+
+    using UniformsCallback = std::function<sk_sp<const SkData>(const UniformsCallbackContext&)>;
+    static sk_sp<SkShader> MakeDeferredShader(const SkRuntimeEffect* effect,
+                                              UniformsCallback uniformsCallback,
+                                              SkSpan<const SkRuntimeEffect::ChildPtr> children,
+                                              const SkMatrix* localMatrix = nullptr);
+
+    static bool SupportsConstantOutputForConstantInput(const SkRuntimeEffect* effect) {
+        if (!effect->allowColorFilter() || !effect->children().empty()) {
+            return false;
+        }
+        return true;
+    }
+
+    static uint32_t Hash(const SkRuntimeEffect& effect) {
+        return effect.hash();
+    }
+
+    static bool HasName(const SkRuntimeEffect& effect) {
+        return !effect.fName.isEmpty();
+    }
+
+    static const char* GetName(const SkRuntimeEffect& effect) {
+        return effect.fName.c_str();
+    }
+
+    static uint32_t StableKey(const SkRuntimeEffect& effect) {
+        return effect.fStableKey;
+    }
+
+    static void SetStableKey(SkRuntimeEffect* effect, uint32_t stableKey) {
+        SkASSERT(!effect->fStableKey);
+        SkASSERT(SkKnownRuntimeEffects::IsViableUserDefinedKnownRuntimeEffect(stableKey));
+        effect->fStableKey = stableKey;
+    }
+
+    static void SetStableKeyOnOptions(SkRuntimeEffect::Options* options, uint32_t stableKey) {
+        SkASSERT(!options->fStableKey);
+        SkASSERT(SkKnownRuntimeEffects::IsSkiaKnownRuntimeEffect(stableKey));
+        options->fStableKey = stableKey;
+    }
+
+    static void ResetStableKey(SkRuntimeEffect* effect) {
+        effect->fStableKey = 0;
+    }
+
+    static const SkSL::Program& Program(const SkRuntimeEffect& effect) {
+        return *effect.fBaseProgram;
+    }
+
+    static SkRuntimeEffect::Options ES3Options() {
+        SkRuntimeEffect::Options options;
+        options.maxVersionAllowed = SkSL::Version::k300;
+        return options;
+    }
+
+    static void AllowPrivateAccess(SkRuntimeEffect::Options* options) {
+        options->allowPrivateAccess = true;
+    }
+
+    static SkRuntimeEffect::Uniform VarAsUniform(const SkSL::Variable&,
+                                                 const SkSL::Context&,
+                                                 size_t* offset);
+
+    static SkRuntimeEffect::Child VarAsChild(const SkSL::Variable& var,
+                                             int index);
+
+    static const char* ChildTypeToStr(SkRuntimeEffect::ChildType type);
+
+    static sk_sp<const SkData> TransformUniforms(SkSpan<const SkRuntimeEffect::Uniform> uniforms,
+                                                 sk_sp<const SkData> originalData,
+                                                 const SkColorSpaceXformSteps&);
+    static sk_sp<const SkData> TransformUniforms(SkSpan<const SkRuntimeEffect::Uniform> uniforms,
+                                                 sk_sp<const SkData> originalData,
+                                                 const SkColorSpace* dstCS);
+    static SkSpan<const float> UniformsAsSpan(
+        SkSpan<const SkRuntimeEffect::Uniform> uniforms,
+        sk_sp<const SkData> originalData,
+        bool alwaysCopyIntoAlloc,
+        const SkColorSpace* destColorSpace,
+        SkArenaAlloc* alloc);
+
+    static bool CanDraw(const SkCapabilities*, const SkSL::Program*);
+    static bool CanDraw(const SkCapabilities*, const SkRuntimeEffect*);
+
+    static bool ReadChildEffects(SkReadBuffer& buffer,
+                                 const SkRuntimeEffect* effect,
+                                 skia_private::TArray<SkRuntimeEffect::ChildPtr>* children);
+    static void WriteChildEffects(SkWriteBuffer& buffer,
+                                  SkSpan<const SkRuntimeEffect::ChildPtr> children);
+
+    static bool UsesSampleCoords(const SkRuntimeEffect* effect) {
+        return effect->usesSampleCoords();
+    }
+    static bool SamplesOutsideMain(const SkRuntimeEffect* effect) {
+        return effect->samplesOutsideMain();
+    }
+    static bool UsesColorTransform(const SkRuntimeEffect* effect) {
+        return effect->usesColorTransform();
+    }
+    static bool AlwaysOpaque(const SkRuntimeEffect* effect) {
+        return effect->alwaysOpaque();
+    }
+    static bool IsAlphaUnchanged(const SkRuntimeEffect* effect) {
+        return effect->isAlphaUnchanged();
+    }
+    static SkSL::SampleUsage ChildSampleUsage(const SkRuntimeEffect* effect, int child) {
+        return effect->fSampleUsages[child];
+    }
+};
+
+
+sk_sp<SkRuntimeEffect> SkMakeCachedRuntimeEffect(
+        SkRuntimeEffect::Result (*make)(SkString sksl, const SkRuntimeEffect::Options&),
+        SkString sksl);
+
+inline sk_sp<SkRuntimeEffect> SkMakeCachedRuntimeEffect(
+        SkRuntimeEffect::Result (*make)(SkString, const SkRuntimeEffect::Options&),
+        const char* sksl) {
+    return SkMakeCachedRuntimeEffect(make, SkString{sksl});
+}
+
+inline SkRuntimeEffect* SkMakeRuntimeEffect(
+        SkRuntimeEffect::Result (*make)(SkString, const SkRuntimeEffect::Options&),
+        const char* sksl,
+        SkRuntimeEffect::Options options = SkRuntimeEffect::Options{}) {
+#if defined(SK_DEBUG)
+    if (SkStrContains(sksl, "//") || SkStrContains(sksl, "    ")) {
+        SkDEBUGFAILF("Found SkSL snippet that can be minified: \n %s\n", sksl);
+    }
+#endif
+    SkRuntimeEffectPriv::AllowPrivateAccess(&options);
+    auto result = make(SkString{sksl}, options);
+    if (!result.effect) {
+        SK_ABORT("%s", result.errorText.c_str());
+    }
+    return result.effect.release();
+}
+
+class RuntimeEffectRPCallbacks : public SkSL::RP::Callbacks {
+public:
+    RuntimeEffectRPCallbacks(const SkStageRec& s,
+                             const SkShaders::MatrixRec& m,
+                             SkSpan<const SkRuntimeEffect::ChildPtr> c,
+                             SkSpan<const SkSL::SampleUsage> u)
+            : fStage{s.fPipeline,
+                     s.fAlloc,
+                     s.fDstColorType,
+                     s.fDstCS,
+                     SkColors::kTransparent,
+                     s.fSurfaceProps,
+                     s.fDstBounds}
+            , fMatrix(m)
+            , fChildren(c)
+            , fSampleUsages(u) {}
+
+    bool appendShader(int index) override;
+    bool appendColorFilter(int index) override;
+    bool appendBlender(int index) override;
+
+    void toLinearSrgb(const void* color) override;
+
+    void fromLinearSrgb(const void* color) override;
+
+private:
+    void applyColorSpaceXform(const SkColorSpaceXformSteps& tempXform, const void* color);
+
+    const SkStageRec fStage;
+    const SkShaders::MatrixRec& fMatrix;
+    SkSpan<const SkRuntimeEffect::ChildPtr> fChildren;
+    SkSpan<const SkSL::SampleUsage> fSampleUsages;
+};
+
+#endif

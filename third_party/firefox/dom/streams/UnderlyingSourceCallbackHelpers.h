@@ -1,0 +1,269 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_UnderlyingSourceCallbackHelpers_h
+#define mozilla_dom_UnderlyingSourceCallbackHelpers_h
+
+#include "mozilla/DOMEventTargetHelper.h"
+#include "mozilla/HoldDropJSObjects.h"
+#include "mozilla/WeakPtr.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/UnderlyingSourceBinding.h"
+#include "nsIAsyncInputStream.h"
+#include "nsISupports.h"
+#include "nsISupportsImpl.h"
+
+enum class nsresult : uint32_t;
+
+namespace mozilla::dom {
+
+class StrongWorkerRef;
+class BodyStreamHolder;
+class ReadableStreamControllerBase;
+class ReadableStream;
+
+class UnderlyingSourceAlgorithmsBase : public nsISupports {
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_CLASS(UnderlyingSourceAlgorithmsBase)
+
+  MOZ_CAN_RUN_SCRIPT virtual void StartCallback(
+      JSContext* aCx, ReadableStreamControllerBase& aController,
+      JS::MutableHandle<JS::Value> aRetVal, ErrorResult& aRv) = 0;
+
+  MOZ_CAN_RUN_SCRIPT virtual already_AddRefed<Promise> PullCallback(
+      JSContext* aCx, ReadableStreamControllerBase& aController,
+      ErrorResult& aRv) = 0;
+
+  MOZ_CAN_RUN_SCRIPT virtual already_AddRefed<Promise> CancelCallback(
+      JSContext* aCx, const Optional<JS::Handle<JS::Value>>& aReason,
+      ErrorResult& aRv) = 0;
+
+  virtual void ReleaseObjects() {}
+
+  virtual nsIInputStream* MaybeGetInputStreamIfUnread() { return nullptr; }
+
+  virtual void SetInputStreamIfUnread(nsIInputStream* aInput) {}
+
+  virtual bool IsNative() { return true; }
+
+ protected:
+  virtual ~UnderlyingSourceAlgorithmsBase() = default;
+};
+
+class UnderlyingSourceAlgorithms final : public UnderlyingSourceAlgorithmsBase {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_CLASS_INHERITED(
+      UnderlyingSourceAlgorithms, UnderlyingSourceAlgorithmsBase)
+
+  UnderlyingSourceAlgorithms(nsIGlobalObject* aGlobal,
+                             JS::Handle<JSObject*> aUnderlyingSource,
+                             UnderlyingSource& aUnderlyingSourceDict)
+      : mGlobal(aGlobal), mUnderlyingSource(aUnderlyingSource) {
+    if (aUnderlyingSourceDict.mStart.WasPassed()) {
+      mStartCallback = aUnderlyingSourceDict.mStart.Value();
+    }
+
+    if (aUnderlyingSourceDict.mPull.WasPassed()) {
+      mPullCallback = aUnderlyingSourceDict.mPull.Value();
+    }
+
+    if (aUnderlyingSourceDict.mCancel.WasPassed()) {
+      mCancelCallback = aUnderlyingSourceDict.mCancel.Value();
+    }
+
+    mozilla::HoldJSObjects(this);
+  };
+
+  MOZ_CAN_RUN_SCRIPT void StartCallback(
+      JSContext* aCx, ReadableStreamControllerBase& aController,
+      JS::MutableHandle<JS::Value> aRetVal, ErrorResult& aRv) override;
+
+  MOZ_CAN_RUN_SCRIPT already_AddRefed<Promise> PullCallback(
+      JSContext* aCx, ReadableStreamControllerBase& aController,
+      ErrorResult& aRv) override;
+
+  MOZ_CAN_RUN_SCRIPT already_AddRefed<Promise> CancelCallback(
+      JSContext* aCx, const Optional<JS::Handle<JS::Value>>& aReason,
+      ErrorResult& aRv) override;
+
+  bool IsNative() override { return false; }
+
+ protected:
+  ~UnderlyingSourceAlgorithms() override { mozilla::DropJSObjects(this); };
+
+ private:
+  nsCOMPtr<nsIGlobalObject> mGlobal;
+  JS::Heap<JSObject*> mUnderlyingSource;
+  MOZ_KNOWN_LIVE RefPtr<UnderlyingSourceStartCallback> mStartCallback;
+  MOZ_KNOWN_LIVE RefPtr<UnderlyingSourcePullCallback> mPullCallback;
+  MOZ_KNOWN_LIVE RefPtr<UnderlyingSourceCancelCallback> mCancelCallback;
+};
+
+class UnderlyingSourceAlgorithmsWrapper
+    : public UnderlyingSourceAlgorithmsBase {
+  void StartCallback(JSContext*, ReadableStreamControllerBase&,
+                     JS::MutableHandle<JS::Value> aRetVal, ErrorResult&) final;
+
+  MOZ_CAN_RUN_SCRIPT already_AddRefed<Promise> PullCallback(
+      JSContext* aCx, ReadableStreamControllerBase& aController,
+      ErrorResult& aRv) final;
+
+  MOZ_CAN_RUN_SCRIPT already_AddRefed<Promise> CancelCallback(
+      JSContext* aCx, const Optional<JS::Handle<JS::Value>>& aReason,
+      ErrorResult& aRv) final;
+
+  MOZ_CAN_RUN_SCRIPT virtual already_AddRefed<Promise> PullCallbackImpl(
+      JSContext* aCx, ReadableStreamControllerBase& aController,
+      ErrorResult& aRv) {
+    return nullptr;
+  }
+
+  MOZ_CAN_RUN_SCRIPT virtual already_AddRefed<Promise> CancelCallbackImpl(
+      JSContext* aCx, const Optional<JS::Handle<JS::Value>>& aReason,
+      ErrorResult& aRv) {
+    return nullptr;
+  }
+};
+
+class InputToReadableStreamAlgorithms;
+
+class InputStreamHolder final : public nsIInputStreamCallback,
+                                public GlobalTeardownObserver {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIINPUTSTREAMCALLBACK
+
+  InputStreamHolder(nsIGlobalObject* aGlobal,
+                    InputToReadableStreamAlgorithms* aCallback,
+                    nsIAsyncInputStream* aInput);
+
+  void Init(JSContext* aCx);
+
+  void DisconnectFromOwner() override;
+
+  void Shutdown();
+
+  nsresult AsyncWait(uint32_t aFlags, uint32_t aRequestedCount,
+                     nsIEventTarget* aEventTarget);
+  nsresult Available(uint64_t* aSize) { return mInput->Available(aSize); }
+  nsresult Read(char* aBuffer, uint32_t aLength, uint32_t* aWritten) {
+    return mInput->Read(aBuffer, aLength, aWritten);
+  }
+  nsresult CloseWithStatus(nsresult aStatus) {
+    return mInput->CloseWithStatus(aStatus);
+  }
+
+  nsIAsyncInputStream* GetInputStream() { return mInput; }
+
+ private:
+  ~InputStreamHolder();
+
+  WeakPtr<InputToReadableStreamAlgorithms> mCallback;
+  RefPtr<StrongWorkerRef> mAsyncWaitWorkerRef;
+  RefPtr<StrongWorkerRef> mWorkerRef;
+  nsCOMPtr<nsIAsyncInputStream> mInput;
+
+  RefPtr<InputToReadableStreamAlgorithms> mAsyncWaitAlgorithms;
+};
+
+class InputToReadableStreamAlgorithms
+    : public UnderlyingSourceAlgorithmsWrapper,
+      public nsIInputStreamCallback,
+      public SupportsWeakPtr {
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_NSIINPUTSTREAMCALLBACK
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(InputToReadableStreamAlgorithms,
+                                           UnderlyingSourceAlgorithmsWrapper)
+
+  InputToReadableStreamAlgorithms(JSContext* aCx, nsIAsyncInputStream* aInput,
+                                  ReadableStream* aStream);
+
+
+  already_AddRefed<Promise> PullCallbackImpl(
+      JSContext* aCx, ReadableStreamControllerBase& aController,
+      ErrorResult& aRv) override;
+
+  void ReleaseObjects() override;
+
+  nsIInputStream* MaybeGetInputStreamIfUnread() override;
+
+ protected:
+  ~InputToReadableStreamAlgorithms();
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void CloseAndReleaseObjects(
+      JSContext* aCx, ReadableStream* aStream);
+
+  void WriteIntoReadRequestBuffer(JSContext* aCx, ReadableStream* aStream,
+                                  JS::Handle<JSObject*> aBuffer,
+                                  uint32_t aLength, uint32_t* aByteWritten,
+                                  ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT void PullFromInputStream(JSContext* aCx,
+                                              uint64_t aAvailable,
+                                              ErrorResult& aRv);
+
+  void ErrorPropagation(JSContext* aCx, ReadableStream* aStream,
+                        nsresult aError);
+
+
+  bool IsClosed() { return !mInput; }
+
+  nsCOMPtr<nsIEventTarget> mOwningEventTarget;
+
+  RefPtr<Promise> mPullPromise;
+
+  RefPtr<InputStreamHolder> mInput;
+
+  MOZ_KNOWN_LIVE RefPtr<ReadableStream> mStream;
+};
+
+class NonAsyncInputToReadableStreamAlgorithms
+    : public UnderlyingSourceAlgorithmsWrapper {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(
+      NonAsyncInputToReadableStreamAlgorithms,
+      UnderlyingSourceAlgorithmsWrapper)
+
+  explicit NonAsyncInputToReadableStreamAlgorithms(nsIInputStream& aInput)
+      : mInput(&aInput) {}
+
+  already_AddRefed<Promise> PullCallbackImpl(
+      JSContext* aCx, ReadableStreamControllerBase& aController,
+      ErrorResult& aRv) override;
+
+  void ReleaseObjects() override {
+    if (RefPtr<InputToReadableStreamAlgorithms> algorithms =
+            mAsyncAlgorithms.forget()) {
+      algorithms->ReleaseObjects();
+    }
+    if (nsCOMPtr<nsIInputStream> input = mInput.forget()) {
+      input->Close();
+    }
+  }
+
+  nsIInputStream* MaybeGetInputStreamIfUnread() override {
+    MOZ_ASSERT(mInput, "Should be only called on non-disturbed streams");
+    return mInput;
+  }
+
+  void SetInputStreamIfUnread(nsIInputStream* aInput) override {
+    MOZ_ASSERT(mInput, "Should be only called on non-disturbed streams");
+    MOZ_ASSERT(!mAsyncAlgorithms,
+               "Should be only called before the stream is read");
+    mInput = aInput;
+  }
+
+ private:
+  ~NonAsyncInputToReadableStreamAlgorithms() = default;
+
+  nsCOMPtr<nsIInputStream> mInput;
+  RefPtr<InputToReadableStreamAlgorithms> mAsyncAlgorithms;
+};
+
+}  
+
+#endif

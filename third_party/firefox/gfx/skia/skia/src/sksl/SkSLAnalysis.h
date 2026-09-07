@@ -1,0 +1,148 @@
+/*
+ * Copyright 2020 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkSLAnalysis_DEFINED)
+#define SkSLAnalysis_DEFINED
+
+#include "include/private/SkSLSampleUsage.h"
+#include "include/private/base/SkTArray.h"
+
+#include <cstdint>
+#include <memory>
+#include <vector>
+
+namespace SkSL {
+
+class Context;
+class ErrorReporter;
+class Expression;
+class FunctionDeclaration;
+class FunctionDefinition;
+class Position;
+class ProgramElement;
+class ProgramUsage;
+class Statement;
+class SymbolTable;
+class Variable;
+class VariableReference;
+enum class VariableRefKind : int8_t;
+struct ForLoopPositions;
+struct LoopUnrollInfo;
+struct Module;
+struct Program;
+
+namespace Analysis {
+
+SampleUsage GetSampleUsage(const Program& program,
+                           const Variable& child,
+                           bool writesToSampleCoords = true,
+                           int* elidedSampleCoordCount = nullptr);
+
+bool ReferencesBuiltin(const Program& program, int builtin);
+
+bool ReferencesSampleCoords(const Program& program);
+bool ReferencesFragCoords(const Program& program);
+
+bool CallsSampleOutsideMain(const Program& program);
+
+bool CallsColorTransformIntrinsics(const Program& program);
+
+bool ReturnsOpaqueColor(const FunctionDefinition& function);
+
+bool ReturnsInputAlpha(const FunctionDefinition& function, const ProgramUsage& usage);
+
+bool CheckProgramStructure(const Program& program);
+
+bool ContainsRTAdjust(const Expression& expr);
+
+bool ContainsVariable(const Expression& expr, const Variable& var);
+
+bool HasSideEffects(const Expression& expr);
+
+bool IsCompileTimeConstant(const Expression& expr);
+
+bool IsDynamicallyUniformExpression(const Expression& expr);
+
+bool DetectVarDeclarationWithoutScope(const Statement& stmt, ErrorReporter* errors = nullptr);
+
+int NodeCountUpToLimit(const FunctionDefinition& function, int limit);
+
+bool SwitchCaseContainsUnconditionalExit(const Statement& stmt);
+
+bool SwitchCaseContainsConditionalExit(const Statement& stmt);
+
+std::unique_ptr<ProgramUsage> GetUsage(const Program& program);
+std::unique_ptr<ProgramUsage> GetUsage(const Module& module);
+
+bool StatementWritesToVariable(const Statement& stmt, const Variable& var);
+
+struct LoopControlFlowInfo {
+    bool fHasContinue = false;
+    bool fHasBreak = false;
+    bool fHasReturn = false;
+};
+LoopControlFlowInfo GetLoopControlFlowInfo(const Statement& stmt);
+
+struct AssignmentInfo {
+    VariableReference* fAssignedVar = nullptr;
+};
+bool IsAssignable(Expression& expr, AssignmentInfo* info = nullptr,
+                  ErrorReporter* errors = nullptr);
+
+bool UpdateVariableRefKind(Expression* expr, VariableRefKind kind, ErrorReporter* errors = nullptr);
+
+bool IsTrivialExpression(const Expression& expr);
+
+bool IsSameExpressionTree(const Expression& left, const Expression& right);
+
+bool IsConstantExpression(const Expression& expr);
+
+void ValidateIndexingForES2(const ProgramElement& pe, ErrorReporter& errors);
+
+void CheckSymbolTableCorrectness(const Program& program);
+
+std::unique_ptr<LoopUnrollInfo> GetLoopUnrollInfo(const Context& context,
+                                                  Position pos,
+                                                  const ForLoopPositions& positions,
+                                                  const Statement* loopInitializer,
+                                                  std::unique_ptr<Expression>* loopTestPtr,
+                                                  const Expression* loopNext,
+                                                  const Statement* loopStatement,
+                                                  ErrorReporter* errors);
+
+bool CanExitWithoutReturningValue(const FunctionDeclaration& funcDecl, const Statement& body);
+
+enum class ReturnComplexity {
+    kSingleSafeReturn,
+    kScopedReturns,
+    kEarlyReturns,
+};
+ReturnComplexity GetReturnComplexity(const FunctionDefinition& funcDef);
+
+void DoFinalizationChecks(const Program& program);
+
+skia_private::TArray<const SkSL::Variable*> GetComputeShaderMainParams(const Context& context,
+                                                                       const Program& program);
+
+class SymbolTableStackBuilder {
+public:
+    SymbolTableStackBuilder(const Statement* stmt, std::vector<SymbolTable*>* stack);
+
+    ~SymbolTableStackBuilder();
+
+    bool foundSymbolTable() {
+        return fStackToPop != nullptr;
+    }
+
+private:
+    std::vector<SymbolTable*>* fStackToPop = nullptr;
+};
+
+}  
+}  
+
+#endif

@@ -1,0 +1,31 @@
+/*
+ * Copyright 2017 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkGaussFilter_DEFINED)
+#define SkGaussFilter_DEFINED
+
+#include <cstddef>
+
+class SkGaussFilter {
+public:
+    inline static constexpr int kGaussArrayMax = 6;
+
+    explicit SkGaussFilter(double sigma);
+
+    size_t size()   const { return fN; }
+    int radius() const { return fN - 1; }
+    int width()  const { return 2 * this->radius() + 1; }
+
+    const double* begin() const { return &fBasis[0];  }
+    const double* end()   const { return &fBasis[fN]; }
+
+private:
+    double fBasis[kGaussArrayMax];
+    int    fN;
+};
+
+#endif

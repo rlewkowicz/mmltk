@@ -1,0 +1,224 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef vm_PropMap_inl_h
+#define vm_PropMap_inl_h
+
+#include "vm/PropMap.h"
+
+#include "gc/Cell.h"
+#include "gc/Zone.h"
+#include "vm/JSContext.h"
+
+#include "gc/GCContext-inl.h"
+
+namespace js {
+
+inline AutoKeepPropMapTables::AutoKeepPropMapTables(JSContext* cx)
+    : cx_(cx), prev_(cx->zone()->keepPropMapTables()) {
+  cx->zone()->setKeepPropMapTables(true);
+}
+
+inline AutoKeepPropMapTables::~AutoKeepPropMapTables() {
+  cx_->zone()->setKeepPropMapTables(prev_);
+}
+
+MOZ_ALWAYS_INLINE PropMap* PropMap::lookupLinear(uint32_t mapLength,
+                                                 PropertyKey key,
+                                                 uint32_t* index) {
+  MOZ_ASSERT(mapLength > 0);
+  MOZ_ASSERT(mapLength <= Capacity);
+
+
+  static_assert(PropMap::Capacity == 8,
+                "Code below needs to change when capacity changes");
+
+#define LOOKUP_KEY(idx)                        \
+  if (mapLength > idx && getKey(idx) == key) { \
+    *index = idx;                              \
+    return this;                               \
+  }
+  LOOKUP_KEY(0);
+  LOOKUP_KEY(1);
+  LOOKUP_KEY(2);
+  LOOKUP_KEY(3);
+  LOOKUP_KEY(4);
+  LOOKUP_KEY(5);
+  LOOKUP_KEY(6);
+  LOOKUP_KEY(7);
+#undef LOOKUP_KEY
+
+  PropMap* map = this;
+  while (map->hasPrevious()) {
+    map = map->asLinked()->previous();
+#define LOOKUP_KEY(idx)          \
+  if (map->getKey(idx) == key) { \
+    *index = idx;                \
+    return map;                  \
+  }
+    LOOKUP_KEY(0);
+    LOOKUP_KEY(1);
+    LOOKUP_KEY(2);
+    LOOKUP_KEY(3);
+    LOOKUP_KEY(4);
+    LOOKUP_KEY(5);
+    LOOKUP_KEY(6);
+    LOOKUP_KEY(7);
+#undef LOOKUP_KEY
+  }
+
+  return nullptr;
+}
+
+MOZ_ALWAYS_INLINE PropMap* PropMapTable::lookup(PropMap* map,
+                                                uint32_t mapLength,
+                                                PropertyKey key,
+                                                uint32_t* index) {
+  JS::AutoCheckCannotGC nogc;
+  MOZ_ASSERT(map->asLinked()->maybeTable(nogc) == this);
+
+  PropMapAndIndex entry;
+  if (lookupInCache(key, &entry)) {
+    if (entry.isNone()) {
+      return nullptr;
+    }
+  } else {
+    auto p = lookupRaw(key);
+    addToCache(key, p);
+    if (!p) {
+      return nullptr;
+    }
+    entry = *p;
+  }
+
+  if (entry.map() == map && entry.index() >= mapLength) {
+    return nullptr;
+  }
+
+  *index = entry.index();
+  return entry.map();
+}
+
+MOZ_ALWAYS_INLINE PropMap* PropMap::lookupPure(uint32_t mapLength,
+                                               PropertyKey key,
+                                               uint32_t* index) {
+  if (canHaveTable()) {
+    JS::AutoCheckCannotGC nogc;
+    if (PropMapTable* table = asLinked()->maybeTable(nogc)) {
+      return table->lookup(this, mapLength, key, index);
+    }
+  }
+
+  return lookupLinear(mapLength, key, index);
+}
+
+MOZ_ALWAYS_INLINE PropMap* PropMap::lookup(JSContext* cx, uint32_t mapLength,
+                                           PropertyKey key, uint32_t* index) {
+  if (canHaveTable()) {
+    JS::AutoCheckCannotGC nogc;
+    if (PropMapTable* table = asLinked()->ensureTable(cx, nogc);
+        MOZ_LIKELY(table)) {
+      return table->lookup(this, mapLength, key, index);
+    }
+    cx->recoverFromOutOfMemory();
+  }
+
+  return lookupLinear(mapLength, key, index);
+}
+
+inline void SharedPropMap::getPrevious(MutableHandle<SharedPropMap*> map,
+                                       uint32_t* mapLength) {
+
+  MOZ_ASSERT(map);
+  MOZ_ASSERT(*mapLength > 0);
+
+  if (*mapLength > 1) {
+    *mapLength -= 1;
+    return;
+  }
+
+  if (map->hasPrevious()) {
+    map.set(map->asNormal()->previous());
+    *mapLength = PropMap::Capacity;
+    return;
+  }
+
+  map.set(nullptr);
+  *mapLength = 0;
+}
+
+inline bool PropMap::lookupForRemove(JSContext* cx, PropMap* map,
+                                     uint32_t mapLength, PropertyKey key,
+                                     const AutoKeepPropMapTables& keep,
+                                     PropMap** propMap, uint32_t* propIndex,
+                                     PropMapTable** table,
+                                     PropMapTable::Ptr* ptr) {
+  if (map->isDictionary()) {
+    *table = map->asLinked()->ensureTable(cx, keep);
+    if (!*table) {
+      return false;
+    }
+    *ptr = (*table)->lookupRaw(key);
+    *propMap = *ptr ? (*ptr)->map() : nullptr;
+    *propIndex = *ptr ? (*ptr)->index() : 0;
+    return true;
+  }
+
+  *table = nullptr;
+  *propMap = map->lookup(cx, mapLength, key, propIndex);
+  return true;
+}
+
+MOZ_ALWAYS_INLINE bool SharedPropMap::shouldConvertToDictionaryForAdd() const {
+  if (MOZ_LIKELY(numPreviousMaps() < NumPrevMapsConsiderDictionary)) {
+    return false;
+  }
+  if (numPreviousMaps() >= NumPrevMapsAlwaysDictionary) {
+    return true;
+  }
+
+  const SharedPropMap* curMap = this;
+  for (size_t i = 0; i < 2; i++) {
+    if (curMap->hadDictionaryConversion()) {
+      return true;
+    }
+    if (curMap->treeDataRef().parent.map() != curMap->asNormal()->previous()) {
+      return true;
+    }
+    curMap = curMap->asNormal()->previous();
+  }
+  return false;
+}
+
+inline void SharedPropMap::sweep(JS::GCContext* gcx) {
+
+  MOZ_ASSERT(zone()->isGCSweeping());
+  MOZ_ASSERT_IF(hasPrevious(), asLinked()->previous()->zone() == zone());
+
+  SharedPropMapAndIndex parent = treeDataRef().parent;
+  if (!parent.isNone() && TenuredThingIsMarkedAny(parent.map())) {
+    parent.map()->removeChild(gcx, this);
+  }
+}
+
+inline void SharedPropMap::finalize(JS::GCContext* gcx) {
+  if (canHaveTable() && asLinked()->hasTable()) {
+    asLinked()->purgeTable(gcx);
+  }
+  if (hasChildrenSet()) {
+    SharedChildrenPtr& childrenRef = treeDataRef().children;
+    gcx->delete_(this, childrenRef.toChildrenSet(), MemoryUse::PropMapChildren);
+    childrenRef.setNone();
+  }
+}
+
+inline void DictionaryPropMap::finalize(JS::GCContext* gcx) {
+  if (asLinked()->hasTable()) {
+    asLinked()->purgeTable(gcx);
+  }
+}
+
+}  
+
+#endif /* vm_PropMap_inl_h */

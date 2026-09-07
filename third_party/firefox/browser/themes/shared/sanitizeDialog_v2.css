@@ -1,0 +1,130 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#sanitizeEverythingWarning,
+#sanitizeEverythingUndoWarning {
+  white-space: pre-wrap;
+}
+
+#sanitizeDurationSuffixLabel {
+  margin-inline-start: var(--space-small);
+}
+
+#sanitizeDurationSuffixLabel[value=""] {
+  display: none;
+}
+
+#sanitizeDurationLabel[value=""] + #sanitizeDurationChoice {
+  margin-inline-start: 0;
+}
+
+#sanitizeEverythingWarningBox {
+  background-color: var(--background-color-box);
+  border: 1px solid var(--border-color, ThreeDDarkShadow);
+  border-radius: var(--border-radius-small);
+  padding: 16px;
+  margin-block: 6px;
+}
+
+#sanitizeEverythingWarningIcon {
+  padding: 0;
+  margin: 0;
+  @media not (-moz-platform: linux) {
+    list-style-image: url("chrome://global/skin/icons/warning-large.png");
+  }
+  @media (-moz-platform: linux) {
+    list-style-image: image-set("moz-icon://stock/dialog-warning?size=48" 1x, "moz-icon://stock/dialog-warning?size=48&scale=2" 2x);
+  }
+}
+
+#sanitizeEverythingWarningDescBox {
+  padding: 0 16px;
+  margin: 0;
+}
+
+#titleText {
+  margin-block-start: 0;
+  margin-inline: 4px;
+}
+
+.checkboxWithDescription {
+  padding: 8px 0;
+}
+
+.sanitizeCheckboxDescription {
+  padding: 0 24px;
+  line-height: normal;
+}
+
+#sanitizeDurationChoice {
+  margin-inline-end: 0;
+}
+
+dialog:not([inClearOnShutdown]) #SanitizeOnShutdownDescription {
+  display: none;
+}
+
+dialog[inClearOnShutdown] #SanitizeDurationBox {
+  display: none;
+}
+
+dialog[inClearOnShutdown] #SanitizeOnShutdownDescription {
+  display: block;
+}
+
+dialog:not([inbrowserwindow]) #titleText {
+  display: none;
+}
+
+dialog[inbrowserwindow] {
+  --grid-padding: 16px;
+  padding: var(--grid-padding) calc(var(--grid-padding) - 4px);
+}
+
+dialog[inbrowserwindow] groupbox,
+dialog[inbrowserwindow] #sanitizeEverythingWarningBox,
+dialog[inbrowserwindow] #SanitizeDurationBox {
+  margin-inline: 4px;
+}
+
+dialog[inbrowserwindow] #sanitizeDurationLabel {
+  margin-inline-start: 0;
+}
+
+dialog[inbrowserwindow] #sanitizeDurationSuffixLabel {
+  margin-inline-end: 0;
+}
+
+dialog[inbrowserwindow] groupbox:last-child {
+  margin-block-end: 16px;
+}
+
+.data-size-loading {
+  margin-inline-start: 8px;
+  gap: 4px;
+}
+
+.data-size-spinner {
+  width: var(--icon-size);
+  height: var(--icon-size);
+  -moz-context-properties: fill;
+  fill: currentColor;
+  opacity: 0.6;
+  animation: spin 1s linear infinite;
+}
+
+.data-size-label {
+  font-size: var(--font-size-small);
+  opacity: 0.7;
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}

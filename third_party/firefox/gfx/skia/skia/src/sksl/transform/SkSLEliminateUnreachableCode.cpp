@@ -1,0 +1,177 @@
+/*
+ * Copyright 2021 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "include/core/SkSpan.h"
+#include "include/core/SkTypes.h"
+#include "include/private/base/SkTArray.h"
+#include "src/sksl/SkSLDefines.h"
+#include "src/sksl/SkSLModule.h"
+#include "src/sksl/analysis/SkSLProgramUsage.h"
+#include "src/sksl/ir/SkSLFunctionDefinition.h"
+#include "src/sksl/ir/SkSLIRNode.h"
+#include "src/sksl/ir/SkSLIfStatement.h"
+#include "src/sksl/ir/SkSLNop.h"
+#include "src/sksl/ir/SkSLProgram.h"
+#include "src/sksl/ir/SkSLProgramElement.h"
+#include "src/sksl/ir/SkSLStatement.h"
+#include "src/sksl/ir/SkSLSwitchCase.h"
+#include "src/sksl/ir/SkSLSwitchStatement.h"
+#include "src/sksl/transform/SkSLProgramWriter.h"
+#include "src/sksl/transform/SkSLTransform.h"
+
+#include <memory>
+#include <vector>
+
+using namespace skia_private;
+
+namespace SkSL {
+
+class Expression;
+
+static void eliminate_unreachable_code(SkSpan<std::unique_ptr<ProgramElement>> elements,
+                                       ProgramUsage* usage) {
+    class UnreachableCodeEliminator : public ProgramWriter {
+    public:
+        UnreachableCodeEliminator(ProgramUsage* usage) : fUsage(usage) {
+            fFoundFunctionExit.push_back(false);
+            fFoundBlockExit.push_back(false);
+        }
+
+        bool visitExpressionPtr(std::unique_ptr<Expression>& expr) override {
+            return false;
+        }
+
+        bool visitStatementPtr(std::unique_ptr<Statement>& stmt) override {
+            if (fFoundFunctionExit.back() || fFoundBlockExit.back()) {
+                if (!stmt->is<Nop>()) {
+                    fUsage->remove(stmt.get());
+                    stmt = Nop::Make();
+                }
+                return false;
+            }
+
+            switch (stmt->kind()) {
+                case Statement::Kind::kReturn:
+                case Statement::Kind::kDiscard:
+                    fFoundFunctionExit.back() = true;
+                    break;
+
+                case Statement::Kind::kBreak:
+                case Statement::Kind::kContinue:
+                    fFoundBlockExit.back() = true;
+                    break;
+
+                case Statement::Kind::kExpression:
+                case Statement::Kind::kNop:
+                case Statement::Kind::kVarDeclaration:
+                    break;
+
+                case Statement::Kind::kBlock:
+                    return INHERITED::visitStatementPtr(stmt);
+
+                case Statement::Kind::kDo: {
+                    fFoundBlockExit.push_back(false);
+                    bool result = INHERITED::visitStatementPtr(stmt);
+                    fFoundBlockExit.pop_back();
+                    return result;
+                }
+                case Statement::Kind::kFor: {
+                    fFoundFunctionExit.push_back(false);
+                    fFoundBlockExit.push_back(false);
+                    bool result = INHERITED::visitStatementPtr(stmt);
+                    fFoundBlockExit.pop_back();
+                    fFoundFunctionExit.pop_back();
+                    return result;
+                }
+                case Statement::Kind::kIf: {
+                    IfStatement& ifStmt = stmt->as<IfStatement>();
+
+                    fFoundFunctionExit.push_back(false);
+                    fFoundBlockExit.push_back(false);
+                    bool result = (ifStmt.ifTrue() && this->visitStatementPtr(ifStmt.ifTrue()));
+                    bool foundFunctionExitOnTrue = fFoundFunctionExit.back();
+                    bool foundLoopExitOnTrue = fFoundBlockExit.back();
+                    fFoundFunctionExit.pop_back();
+                    fFoundBlockExit.pop_back();
+
+                    fFoundFunctionExit.push_back(false);
+                    fFoundBlockExit.push_back(false);
+                    result |= (ifStmt.ifFalse() && this->visitStatementPtr(ifStmt.ifFalse()));
+                    bool foundFunctionExitOnFalse = fFoundFunctionExit.back();
+                    bool foundLoopExitOnFalse = fFoundBlockExit.back();
+                    fFoundFunctionExit.pop_back();
+                    fFoundBlockExit.pop_back();
+
+                    fFoundFunctionExit.back() |= foundFunctionExitOnTrue &&
+                                                 foundFunctionExitOnFalse;
+                    fFoundBlockExit.back() |= foundLoopExitOnTrue &&
+                                              foundLoopExitOnFalse;
+                    return result;
+                }
+                case Statement::Kind::kSwitch: {
+                    SwitchStatement& sw = stmt->as<SwitchStatement>();
+                    bool result = false;
+
+                    // statement (potentially via fallthrough).
+                    bool foundCaseWithoutReturn = false;
+                    bool hasDefault = false;
+                    for (std::unique_ptr<Statement>& c : sw.cases()) {
+                        fFoundFunctionExit.push_back(false);
+                        fFoundBlockExit.push_back(false);
+
+                        SwitchCase& sc = c->as<SwitchCase>();
+                        result |= this->visitStatementPtr(sc.statement());
+
+                        //        it is the last possible label reachable via fallthrough. Thus if
+                        //        we defer the decision to the fallthrough case. We won't propagate
+                        if (sc.isDefault()) {
+                            foundCaseWithoutReturn |= !fFoundFunctionExit.back();
+                            hasDefault = true;
+                        } else {
+                            // doesn't fallthrough.
+                            foundCaseWithoutReturn |=
+                                    (!fFoundFunctionExit.back() && fFoundBlockExit.back());
+                        }
+
+                        fFoundFunctionExit.pop_back();
+                        fFoundBlockExit.pop_back();
+                    }
+
+                    fFoundFunctionExit.back() |= !foundCaseWithoutReturn && hasDefault;
+                    return result;
+                }
+                case Statement::Kind::kSwitchCase:
+                    SkUNREACHABLE;
+            }
+
+            return false;
+        }
+
+        ProgramUsage* fUsage;
+        STArray<32, bool> fFoundFunctionExit;
+        STArray<32, bool> fFoundBlockExit;
+
+        using INHERITED = ProgramWriter;
+    };
+
+    for (std::unique_ptr<ProgramElement>& pe : elements) {
+        if (pe->is<FunctionDefinition>()) {
+            UnreachableCodeEliminator visitor{usage};
+            visitor.visitStatementPtr(pe->as<FunctionDefinition>().body());
+        }
+    }
+}
+
+void Transform::EliminateUnreachableCode(Module& module, ProgramUsage* usage) {
+    return eliminate_unreachable_code(SkSpan(module.fElements), usage);
+}
+
+void Transform::EliminateUnreachableCode(Program& program) {
+    return eliminate_unreachable_code(SkSpan(program.fOwnedElements), program.fUsage.get());
+}
+
+}  

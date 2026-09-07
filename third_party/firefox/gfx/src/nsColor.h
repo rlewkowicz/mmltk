@@ -1,0 +1,61 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsColor_h_
+#define nsColor_h_
+
+#include <stdint.h>   // for uint8_t, uint32_t
+#include "nsCoord.h"  // for NSToIntRound
+#include "nsStringFwd.h"
+
+typedef uint32_t nscolor;
+
+#define NS_RGB(_r, _g, _b) \
+  ((nscolor)((255 << 24) | ((_b) << 16) | ((_g) << 8) | (_r)))
+
+#define NS_RGBA(_r, _g, _b, _a) \
+  ((nscolor)(((_a) << 24) | ((_b) << 16) | ((_g) << 8) | (_r)))
+
+#define NS_GET_R(_rgba) ((uint8_t)((_rgba) & 0xff))
+#define NS_GET_G(_rgba) ((uint8_t)(((_rgba) >> 8) & 0xff))
+#define NS_GET_B(_rgba) ((uint8_t)(((_rgba) >> 16) & 0xff))
+#define NS_GET_A(_rgba) ((uint8_t)(((_rgba) >> 24) & 0xff))
+
+namespace mozilla {
+
+template <typename T>
+inline uint8_t ClampColor(T aColor) {
+  if (aColor >= 255) {
+    return 255;
+  }
+  if (aColor <= 0) {
+    return 0;
+  }
+  return NSToIntRound(aColor);
+}
+
+}  
+
+enum class nsHexColorType : uint8_t {
+  NoAlpha,     
+  AllowAlpha,  
+};
+
+bool NS_HexToRGBA(const nsAString& aBuf, nsHexColorType aType,
+                  nscolor* aResult);
+
+nscolor NS_ComposeColors(nscolor aBG, nscolor aFG);
+
+namespace mozilla {
+
+inline uint32_t RoundingDivideBy255(uint32_t n) {
+  return (n + 127) / 255;
+}
+
+}  
+
+bool NS_LooseHexToRGB(const nsString& aBuf, nscolor* aResult);
+
+
+#endif /* nsColor_h_ */

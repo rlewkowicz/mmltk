@@ -1,0 +1,343 @@
+/*
+ * Copyright 2011 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkClipStack_DEFINED)
+#define SkClipStack_DEFINED
+
+#include "include/core/SkClipOp.h"
+#include "include/core/SkMatrix.h"
+#include "include/core/SkPath.h"
+#include "include/core/SkRRect.h"
+#include "include/core/SkRect.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkShader.h"
+#include "include/private/base/SkAssert.h"
+#include "include/private/base/SkDebug.h"
+#include "include/private/base/SkDeque.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <utility>
+
+class SkClipStack {
+public:
+    enum BoundsType {
+        kNormal_BoundsType,
+        kInsideOut_BoundsType
+    };
+
+    class Element {
+    public:
+        enum class DeviceSpaceType {
+            kEmpty,
+            kRect,
+            kRRect,
+            kPath,
+            kShader,
+
+            kLastType = kShader
+        };
+        static const int kTypeCnt = (int)DeviceSpaceType::kLastType + 1;
+
+        Element() {
+            this->initCommon(0, SkClipOp::kIntersect, false);
+            this->setEmpty();
+        }
+
+        Element(const Element&);
+
+        Element(const SkRect& rect, const SkMatrix& m, SkClipOp op, bool doAA) {
+            this->initRect(0, rect, m, op, doAA);
+        }
+
+        Element(const SkRRect& rrect, const SkMatrix& m, SkClipOp op, bool doAA) {
+            this->initRRect(0, rrect, m, op, doAA);
+        }
+
+        Element(const SkPath& path, const SkMatrix& m, SkClipOp op, bool doAA) {
+            this->initPath(0, path, m, op, doAA);
+        }
+
+        explicit Element(sk_sp<SkShader> shader) { this->initShader(0, std::move(shader)); }
+
+        Element(const SkRect& rect, bool doAA) {
+            this->initReplaceRect(0, rect, doAA);
+        }
+
+        ~Element();
+
+        bool operator== (const Element& element) const;
+        bool operator!= (const Element& element) const { return !(*this == element); }
+
+        DeviceSpaceType getDeviceSpaceType() const { return fDeviceSpaceType; }
+
+        int getSaveCount() const { return fSaveCount; }
+
+        const SkPath& getDeviceSpacePath() const {
+            SkASSERT(DeviceSpaceType::kPath == fDeviceSpaceType);
+            return *fDeviceSpacePath;
+        }
+
+        const SkRRect& getDeviceSpaceRRect() const {
+            SkASSERT(DeviceSpaceType::kRRect == fDeviceSpaceType);
+            return fDeviceSpaceRRect;
+        }
+
+        const SkRect& getDeviceSpaceRect() const {
+            SkASSERT(DeviceSpaceType::kRect == fDeviceSpaceType &&
+                     (fDeviceSpaceRRect.isRect() || fDeviceSpaceRRect.isEmpty()));
+            return fDeviceSpaceRRect.getBounds();
+        }
+
+        sk_sp<SkShader> refShader() const {
+            return fShader;
+        }
+        const SkShader* getShader() const {
+            return fShader.get();
+        }
+
+        SkClipOp getOp() const { return fOp; }
+        bool isReplaceOp() const { return fIsReplace; }
+
+        SkPath asDeviceSpacePath() const;
+
+        const SkRRect& asDeviceSpaceRRect() const {
+            SkASSERT(DeviceSpaceType::kPath != fDeviceSpaceType);
+            return fDeviceSpaceRRect;
+        }
+
+        bool isAA() const { return fDoAA; }
+
+        uint32_t getGenID() const { SkASSERT(kInvalidGenID != fGenID); return fGenID; }
+
+        const SkRect& getBounds() const;
+
+        bool contains(const SkRect& rect) const;
+        bool contains(const SkRRect& rrect) const;
+
+        bool isInverseFilled() const {
+            return DeviceSpaceType::kPath == fDeviceSpaceType &&
+                   fDeviceSpacePath->isInverseFillType();
+        }
+
+#if defined(SK_DEBUG)
+        void dump() const;
+#endif
+
+    private:
+        friend class SkClipStack;
+
+        std::optional<SkPath> fDeviceSpacePath;
+        SkRRect fDeviceSpaceRRect;
+        sk_sp<SkShader> fShader;
+        int fSaveCount;  
+        SkClipOp fOp;
+        DeviceSpaceType fDeviceSpaceType;
+        bool fDoAA;
+        bool fIsReplace;
+
+        SkClipStack::BoundsType fFiniteBoundType;
+        SkRect fFiniteBound;
+
+        bool fIsIntersectionOfRects;
+
+        uint32_t fGenID;
+        explicit Element(int saveCount) {
+            this->initCommon(saveCount, SkClipOp::kIntersect, false);
+            this->setEmpty();
+        }
+
+        Element(int saveCount, const SkRRect& rrect, const SkMatrix& m, SkClipOp op, bool doAA) {
+            this->initRRect(saveCount, rrect, m, op, doAA);
+        }
+
+        Element(int saveCount, const SkRect& rect, const SkMatrix& m, SkClipOp op, bool doAA) {
+            this->initRect(saveCount, rect, m, op, doAA);
+        }
+
+        Element(int saveCount, const SkPath& path, const SkMatrix& m, SkClipOp op, bool doAA) {
+            this->initPath(saveCount, path, m, op, doAA);
+        }
+
+        Element(int saveCount, sk_sp<SkShader> shader) {
+            this->initShader(saveCount, std::move(shader));
+        }
+
+        Element(int saveCount, const SkRect& rect, bool doAA) {
+            this->initReplaceRect(saveCount, rect, doAA);
+        }
+
+        void initCommon(int saveCount, SkClipOp op, bool doAA);
+        void initRect(int saveCount, const SkRect&, const SkMatrix&, SkClipOp, bool doAA);
+        void initRRect(int saveCount, const SkRRect&, const SkMatrix&, SkClipOp, bool doAA);
+        void initPath(int saveCount, const SkPath&, const SkMatrix&, SkClipOp, bool doAA);
+        void initAsPath(int saveCount, const SkPath&, const SkMatrix&, SkClipOp, bool doAA);
+        void initShader(int saveCount, sk_sp<SkShader>);
+        void initReplaceRect(int saveCount, const SkRect&, bool doAA);
+
+        void setEmpty();
+
+        inline void checkEmpty() const;
+        inline bool canBeIntersectedInPlace(int saveCount, SkClipOp op) const;
+        bool rectRectIntersectAllowed(const SkRect& newR, bool newAA) const;
+        void updateBoundAndGenID(const Element* prior);
+        enum FillCombo {
+            kPrev_Cur_FillCombo,
+            kPrev_InvCur_FillCombo,
+            kInvPrev_Cur_FillCombo,
+            kInvPrev_InvCur_FillCombo
+        };
+        inline void combineBoundsDiff(FillCombo combination, const SkRect& prevFinite);
+        inline void combineBoundsIntersection(int combination, const SkRect& prevFinite);
+    };
+
+    SkClipStack();
+    SkClipStack(void* storage, size_t size);
+    SkClipStack(const SkClipStack& b);
+    ~SkClipStack();
+
+    SkClipStack& operator=(const SkClipStack& b);
+    bool operator==(const SkClipStack& b) const;
+    bool operator!=(const SkClipStack& b) const { return !(*this == b); }
+
+    void reset();
+
+    int getSaveCount() const { return fSaveCount; }
+    void save();
+    void restore();
+
+    class AutoRestore {
+    public:
+        AutoRestore(SkClipStack* cs, bool doSave)
+            : fCS(cs), fSaveCount(cs->getSaveCount())
+        {
+            if (doSave) {
+                fCS->save();
+            }
+        }
+        ~AutoRestore() {
+            SkASSERT(fCS->getSaveCount() >= fSaveCount);  
+            while (fCS->getSaveCount() > fSaveCount) {
+                fCS->restore();
+            }
+        }
+
+    private:
+        SkClipStack* fCS;
+        const int    fSaveCount;
+    };
+
+    void getBounds(SkRect* canvFiniteBound,
+                   BoundsType* boundType,
+                   bool* isIntersectionOfRects = nullptr) const;
+
+    SkRect bounds(const SkIRect& deviceBounds) const;
+    bool isEmpty(const SkIRect& deviceBounds) const;
+
+    bool quickContains(const SkRect& devRect) const {
+        return this->isWideOpen() || this->internalQuickContains(devRect);
+    }
+
+    bool quickContains(const SkRRect& devRRect) const {
+        return this->isWideOpen() || this->internalQuickContains(devRRect);
+    }
+
+    void clipDevRect(const SkIRect& ir, SkClipOp op) {
+        SkRect r;
+        r.set(ir);
+        this->clipRect(r, SkMatrix::I(), op, false);
+    }
+    void clipRect(const SkRect&, const SkMatrix& matrix, SkClipOp, bool doAA);
+    void clipRRect(const SkRRect&, const SkMatrix& matrix, SkClipOp, bool doAA);
+    void clipPath(const SkPath&, const SkMatrix& matrix, SkClipOp, bool doAA);
+    void clipShader(sk_sp<SkShader>);
+    void clipEmpty();
+
+    void replaceClip(const SkRect& devRect, bool doAA);
+
+    bool isWideOpen() const { return this->getTopmostGenID() == kWideOpenGenID; }
+
+    bool isRRect(const SkRect& bounds, SkRRect* rrect, bool* aa) const;
+
+    static const uint32_t kInvalidGenID  = 0;    
+    static const uint32_t kEmptyGenID    = 1;    
+    static const uint32_t kWideOpenGenID = 2;    
+
+    uint32_t getTopmostGenID() const;
+
+#if defined(SK_DEBUG)
+    void dump() const;
+#endif
+
+public:
+    class Iter {
+    public:
+        enum IterStart {
+            kBottom_IterStart = SkDeque::Iter::kFront_IterStart,
+            kTop_IterStart = SkDeque::Iter::kBack_IterStart
+        };
+
+        Iter();
+
+        Iter(const SkClipStack& stack, IterStart startLoc);
+
+        const Element* next();
+        const Element* prev();
+
+        const Element* skipToTopmost(SkClipOp op);
+
+        void reset(const SkClipStack& stack, IterStart startLoc);
+
+    private:
+        const SkClipStack* fStack;
+        SkDeque::Iter      fIter;
+    };
+
+    class B2TIter : private Iter {
+    public:
+        B2TIter() {}
+
+        B2TIter(const SkClipStack& stack)
+        : INHERITED(stack, kBottom_IterStart) {
+        }
+
+        using Iter::next;
+
+        void reset(const SkClipStack& stack) {
+            this->INHERITED::reset(stack, kBottom_IterStart);
+        }
+
+    private:
+
+        using INHERITED = Iter;
+    };
+
+    void getConservativeBounds(int offsetX,
+                               int offsetY,
+                               int maxWidth,
+                               int maxHeight,
+                               SkRect* devBounds,
+                               bool* isIntersectionOfRects = nullptr) const;
+
+private:
+    friend class Iter;
+
+    SkDeque fDeque;
+    int     fSaveCount;
+
+    bool internalQuickContains(const SkRect& devRect) const;
+    bool internalQuickContains(const SkRRect& devRRect) const;
+
+    void pushElement(const Element& element);
+
+    void restoreTo(int saveCount);
+
+    static uint32_t GetNextGenID();
+};
+
+#endif

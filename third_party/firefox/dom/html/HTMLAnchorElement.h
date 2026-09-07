@@ -1,0 +1,170 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_HTMLAnchorElement_h
+#define mozilla_dom_HTMLAnchorElement_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/dom/HTMLDNSPrefetch.h"
+#include "mozilla/dom/Link.h"
+#include "nsDOMTokenList.h"
+#include "nsGenericHTMLElement.h"
+
+namespace mozilla {
+class EventChainPostVisitor;
+class EventChainPreVisitor;
+namespace dom {
+
+class HTMLAnchorElement final : public nsGenericHTMLElement,
+                                public Link,
+                                public SupportsDNSPrefetch {
+ public:
+  using Element::GetCharacterDataBuffer;
+
+  explicit HTMLAnchorElement(already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo)
+      : nsGenericHTMLElement(std::move(aNodeInfo)), Link(this) {}
+
+  NS_DECL_ISUPPORTS_INHERITED
+
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(HTMLAnchorElement,
+                                           nsGenericHTMLElement)
+
+  NS_IMPL_FROMNODE_HTML_WITH_TAG(HTMLAnchorElement, a);
+
+  int32_t TabIndexDefault() override;
+  bool Draggable() const override;
+
+  bool IsInteractiveHTMLContent() const override;
+
+  NS_DECL_ADDSIZEOFEXCLUDINGTHIS
+
+  nsresult BindToTree(BindContext&, nsINode& aParent) override;
+  void UnbindFromTree(UnbindContext&) override;
+  bool IsHTMLFocusable(IsFocusableFlags, bool* aIsFocusable,
+                       int32_t* aTabIndex) override;
+
+  void GetEventTargetParent(EventChainPreVisitor& aVisitor) override;
+  MOZ_CAN_RUN_SCRIPT
+  nsresult PostHandleEvent(EventChainPostVisitor& aVisitor) override;
+
+  void GetLinkTargetImpl(nsAString& aTarget) override;
+  already_AddRefed<nsIURI> GetHrefURI() const override;
+
+  void BeforeSetAttr(int32_t aNamespaceID, nsAtom* aName,
+                     const nsAttrValue* aValue, bool aNotify) override;
+  void AfterSetAttr(int32_t aNamespaceID, nsAtom* aName,
+                    const nsAttrValue* aValue, const nsAttrValue* aOldValue,
+                    nsIPrincipal* aSubjectPrincipal, bool aNotify) override;
+
+  nsresult Clone(dom::NodeInfo*, nsINode** aResult) const override;
+
+
+  void GetHref(nsACString& aValue) const {
+    GetURIAttr(nsGkAtoms::href, nullptr, aValue);
+  }
+  void SetHref(const nsACString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::href, NS_ConvertUTF8toUTF16(aValue), aRv);
+  }
+  void GetTarget(nsAString& aValue) const;
+  void SetTarget(const nsAString& aValue, mozilla::ErrorResult& rv) {
+    SetHTMLAttr(nsGkAtoms::target, aValue, rv);
+  }
+  void GetDownload(DOMString& aValue) const {
+    GetHTMLAttr(nsGkAtoms::download, aValue);
+  }
+  void SetDownload(const nsAString& aValue, mozilla::ErrorResult& rv) {
+    SetHTMLAttr(nsGkAtoms::download, aValue, rv);
+  }
+  void GetPing(DOMString& aValue) const {
+    GetHTMLAttr(nsGkAtoms::ping, aValue);
+  }
+  void SetPing(const nsAString& aValue, mozilla::ErrorResult& rv) {
+    SetHTMLAttr(nsGkAtoms::ping, aValue, rv);
+  }
+  void GetRel(DOMString& aValue) const { GetHTMLAttr(nsGkAtoms::rel, aValue); }
+  void SetRel(const nsAString& aValue, mozilla::ErrorResult& rv) {
+    SetHTMLAttr(nsGkAtoms::rel, aValue, rv);
+  }
+  void SetReferrerPolicy(const nsAString& aValue, mozilla::ErrorResult& rv) {
+    SetHTMLAttr(nsGkAtoms::referrerpolicy, aValue, rv);
+  }
+  void GetReferrerPolicy(DOMString& aPolicy) const {
+    GetEnumAttr(nsGkAtoms::referrerpolicy, "", aPolicy);
+  }
+  nsDOMTokenList* RelList();
+  void GetHreflang(DOMString& aValue) const {
+    GetHTMLAttr(nsGkAtoms::hreflang, aValue);
+  }
+  void SetHreflang(const nsAString& aValue, mozilla::ErrorResult& rv) {
+    SetHTMLAttr(nsGkAtoms::hreflang, aValue, rv);
+  }
+  void GetType(DOMString& aValue) const {
+    GetHTMLAttr(nsGkAtoms::type, aValue);
+  }
+  void SetType(const nsAString& aValue, mozilla::ErrorResult& rv) {
+    SetHTMLAttr(nsGkAtoms::type, aValue, rv);
+  }
+  void GetText(nsAString& aText, mozilla::ErrorResult& aRv) const;
+  void SetText(const nsAString& aText, mozilla::ErrorResult& aRv);
+
+
+
+
+
+
+
+
+
+
+
+  void GetCoords(DOMString& aValue) const {
+    GetHTMLAttr(nsGkAtoms::coords, aValue);
+  }
+  void SetCoords(const nsAString& aValue, mozilla::ErrorResult& rv) {
+    SetHTMLAttr(nsGkAtoms::coords, aValue, rv);
+  }
+  void GetCharset(DOMString& aValue) const {
+    GetHTMLAttr(nsGkAtoms::charset, aValue);
+  }
+  void SetCharset(const nsAString& aValue, mozilla::ErrorResult& rv) {
+    SetHTMLAttr(nsGkAtoms::charset, aValue, rv);
+  }
+  void GetName(DOMString& aValue) const {
+    GetHTMLAttr(nsGkAtoms::name, aValue);
+  }
+  void GetName(nsAString& aValue) const {
+    GetHTMLAttr(nsGkAtoms::name, aValue);
+  }
+  void SetName(const nsAString& aValue, mozilla::ErrorResult& rv) {
+    SetHTMLAttr(nsGkAtoms::name, aValue, rv);
+  }
+  void GetRev(DOMString& aValue) const { GetHTMLAttr(nsGkAtoms::rev, aValue); }
+  void SetRev(const nsAString& aValue, mozilla::ErrorResult& rv) {
+    SetHTMLAttr(nsGkAtoms::rev, aValue, rv);
+  }
+  void GetShape(DOMString& aValue) const {
+    GetHTMLAttr(nsGkAtoms::shape, aValue);
+  }
+  void SetShape(const nsAString& aValue, mozilla::ErrorResult& rv) {
+    SetHTMLAttr(nsGkAtoms::shape, aValue, rv);
+  }
+
+  void NodeInfoChanged(Document* aOldDoc) final {
+    ClearHasPendingLinkUpdate();
+    nsGenericHTMLElement::NodeInfoChanged(aOldDoc);
+  }
+
+ protected:
+  virtual ~HTMLAnchorElement();
+
+  void MaybeTryDNSPrefetch();
+
+  JSObject* WrapNode(JSContext*, JS::Handle<JSObject*> aGivenProto) override;
+  RefPtr<nsDOMTokenList> mRelList;
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_HTMLAnchorElement_h

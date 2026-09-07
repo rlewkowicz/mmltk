@@ -1,0 +1,1748 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_dom_Element_h_
+#define mozilla_dom_Element_h_
+
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <utility>
+
+#include "AttrArray.h"
+#include "ErrorList.h"
+#include "Units.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/BasicEvents.h"
+#include "mozilla/CORSMode.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/FlushType.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/PseudoStyleType.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/Result.h"
+#include "mozilla/RustCell.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/dom/AtomAttributes.h"
+#include "mozilla/dom/BorrowedAttrInfo.h"
+#include "mozilla/dom/DOMString.h"
+#include "mozilla/dom/DOMTokenListSupportedTokens.h"
+#include "mozilla/dom/DirectionalityUtils.h"
+#include "mozilla/dom/FragmentOrElement.h"
+#include "mozilla/dom/NameSpaceConstants.h"
+#include "mozilla/dom/NodeInfo.h"
+#include "mozilla/dom/RustTypes.h"
+#include "mozilla/dom/ShadowRootBindingFwd.h"
+#include "nsAtom.h"
+#include "nsAttrValue.h"
+#include "nsAttrValueInlines.h"
+#include "nsCaseTreatment.h"
+#include "nsChangeHint.h"
+#include "nsDebug.h"
+#include "nsError.h"
+#include "nsGkAtoms.h"
+#include "nsHashKeys.h"
+#include "nsHtml5String.h"
+#include "nsLiteralString.h"
+#include "nsRect.h"
+#include "nsTHashMap.h"
+#include "nsTLiteralString.h"
+#include "nscore.h"
+
+class JSObject;
+class mozAutoDocUpdate;
+class nsAttrName;
+class nsAttrValueOrString;
+class nsDOMAttributeMap;
+class nsDOMCSSAttributeDeclaration;
+class nsDOMStringMap;
+class nsDOMTokenList;
+class nsFocusManager;
+class nsGenericHTMLElement;
+class nsGenericHTMLFormControlElementWithState;
+class nsGlobalWindowInner;
+class nsGlobalWindowOuter;
+class nsImageLoadingContent;
+class nsIAutoCompletePopup;
+class nsIBrowser;
+class nsIDOMXULButtonElement;
+class nsIDOMXULContainerElement;
+class nsIDOMXULContainerItemElement;
+class nsIDOMXULControlElement;
+class nsIDOMXULMenuListElement;
+class nsIDOMXULMultiSelectControlElement;
+class nsIDOMXULRadioGroupElement;
+class nsIDOMXULRelatedElement;
+class nsIDOMXULSelectControlElement;
+class nsIDOMXULSelectControlItemElement;
+class nsIFrame;
+class nsIPrincipal;
+class nsIScreen;
+class nsIURI;
+class nsObjectLoadingContent;
+class nsPresContext;
+class nsWindowSizes;
+struct JSContext;
+struct ServoNodeData;
+template <class E>
+class nsTArray;
+template <class T>
+class nsGetterAddRefs;
+
+namespace mozilla {
+class DeclarationBlock;
+class MappedDeclarationsBuilder;
+class EditorBase;
+class ErrorResult;
+class OOMReporter;
+class ScrollContainerFrame;
+class SMILAttr;
+struct MutationClosureData;
+class TextEditor;
+namespace css {
+struct URLValue;
+}  
+namespace dom {
+struct CheckVisibilityOptions;
+struct CustomElementData;
+struct SetHTMLUnsafeOptions;
+struct SetHTMLOptions;
+struct GetHTMLOptions;
+struct GetAnimationsOptions;
+struct ScrollIntoViewOptions;
+struct ScrollToOptions;
+struct FocusOptions;
+struct ShadowRootInit;
+struct ScrollOptions;
+struct FullscreenOptions;
+struct PointerLockOptions;
+class Attr;
+class BooleanOrScrollIntoViewOptions;
+class ContentList;
+class Document;
+class HTMLFormElement;
+class DOMIntersectionObserver;
+class DOMMatrixReadOnly;
+class Element;
+class ElementOrCSSPseudoElement;
+class PopoverData;
+class Promise;
+class Sanitizer;
+class ShadowRoot;
+class StylePropertyMapReadOnly;
+class TrustedHTMLOrString;
+class UnrestrictedDoubleOrKeyframeAnimationOptions;
+template <typename T>
+class Optional;
+enum class CallerType : uint32_t;
+enum class ReferrerPolicy : uint8_t;
+enum class FetchPriority : uint8_t;
+enum class PopoverAttributeState : uint8_t;
+enum class ShadowRootMode : uint8_t;
+}  
+}  
+
+using nsMapRuleToAttributesFunc = void (*)(mozilla::MappedDeclarationsBuilder&);
+
+extern "C" bool Servo_Element_IsDisplayContents(const mozilla::dom::Element*);
+
+already_AddRefed<mozilla::dom::ContentList> NS_GetContentList(
+    nsINode* aRootNode, int32_t aMatchNameSpaceId, const nsAString& aTagname);
+
+#define ELEMENT_FLAG_BIT(n_) \
+  NODE_FLAG_BIT(NODE_TYPE_SPECIFIC_BITS_OFFSET + (n_))
+
+enum : uint32_t {
+  ELEMENT_HAS_DIRTY_DESCENDANTS_FOR_SERVO = ELEMENT_FLAG_BIT(0),
+  ELEMENT_HAS_ANIMATION_ONLY_DIRTY_DESCENDANTS_FOR_SERVO = ELEMENT_FLAG_BIT(1),
+
+  ELEMENT_HAS_SNAPSHOT = ELEMENT_FLAG_BIT(2),
+
+  ELEMENT_HANDLED_SNAPSHOT = ELEMENT_FLAG_BIT(3),
+
+  ELEMENT_IS_DATALIST_OR_HAS_DATALIST_ANCESTOR = ELEMENT_FLAG_BIT(4),
+
+  ELEMENT_PROCESSED_BY_LCP_FOR_TEXT = ELEMENT_FLAG_BIT(5),
+
+  ELEMENT_PARSER_HAD_DUPLICATE_ATTR_ERROR = ELEMENT_FLAG_BIT(6),
+
+  ELEMENT_IN_CONTENT_IDENTIFIER_FOR_LCP = ELEMENT_FLAG_BIT(7),
+
+  ELEMENT_CUSTOM_ELEMENT_REGISTRY_LOW_BIT = ELEMENT_FLAG_BIT(8),
+  ELEMENT_CUSTOM_ELEMENT_REGISTRY_MASK =
+      ELEMENT_FLAG_BIT(8) | ELEMENT_FLAG_BIT(9),
+
+  ELEMENT_HAS_EDIT_CONTEXT = ELEMENT_FLAG_BIT(10),
+
+  ELEMENT_TYPE_SPECIFIC_BITS_OFFSET = NODE_TYPE_SPECIFIC_BITS_OFFSET + 11
+};
+
+#undef ELEMENT_FLAG_BIT
+
+ASSERT_NODE_FLAGS_SPACE(ELEMENT_TYPE_SPECIFIC_BITS_OFFSET);
+
+enum class CustomElementRegistryState : uint8_t {
+  Global = 0,
+  Null = 1,
+  Scoped = 2,
+};
+
+namespace mozilla {
+enum class PseudoStyleType : uint8_t;
+struct PseudoStyleRequest;
+class EventChainPostVisitor;
+class EventChainPreVisitor;
+class EventChainVisitor;
+class EventListenerManager;
+class EventStateManager;
+
+enum class ContentEditableState {
+  Inherit,
+  False,
+  True,
+  PlainTextOnly,
+};
+
+namespace dom {
+
+struct CustomElementDefinition;
+class Animation;
+class CustomElementRegistry;
+class Link;
+class DOMRect;
+class DOMRectList;
+class OwningTrustedHTMLOrNullIsEmptyString;
+class TrustedHTML;
+class TrustedHTMLOrNullIsEmptyString;
+class TrustedHTMLOrTrustedScriptOrTrustedScriptURLOrString;
+
+#define NS_ELEMENT_IID \
+  {0xc67ed254, 0xfd3b, 0x4b10, {0x96, 0xa2, 0xc5, 0x8b, 0x7b, 0x64, 0x97, 0xd1}}
+
+#define REFLECT_NULLABLE_DOMSTRING_ATTR(method, attr)            \
+  void Get##method(nsAString& aValue) const {                    \
+    const nsAttrValue* val = mAttrs.GetAttr(nsGkAtoms::attr);    \
+    if (!val) {                                                  \
+      SetDOMStringToNull(aValue);                                \
+      return;                                                    \
+    }                                                            \
+    val->ToString(aValue);                                       \
+  }                                                              \
+  void Set##method(const nsAString& aValue, ErrorResult& aRv) {  \
+    SetOrRemoveNullableStringAttr(nsGkAtoms::attr, aValue, aRv); \
+  }
+
+#define REFLECT_NULLABLE_ELEMENT_ATTR(method, attr)              \
+  Element* Get##method() const {                                 \
+    return GetAttrAssociatedElementForBindings(nsGkAtoms::attr); \
+  }                                                              \
+                                                                 \
+  void Set##method(Element* aElement) {                          \
+    ExplicitlySetAttrElement(nsGkAtoms::attr, aElement);         \
+  }
+
+#define REFLECT_NULLABLE_ELEMENTS_ATTR(method, attr)                       \
+  void Get##method(bool* aUseCachedValue,                                  \
+                   Nullable<nsTArray<RefPtr<Element>>>& aElements) {       \
+    GetAttrAssociatedElementsForBindings(nsGkAtoms::attr, aUseCachedValue, \
+                                         aElements);                       \
+  }                                                                        \
+                                                                           \
+  void Set##method(                                                        \
+      const Nullable<Sequence<OwningNonNull<Element>>>& aElements) {       \
+    ExplicitlySetAttrElements(nsGkAtoms::attr, aElements);                 \
+  }
+
+class Element : public FragmentOrElement {
+ public:
+  explicit Element(already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo)
+      : FragmentOrElement(std::move(aNodeInfo)),
+        mState(ElementState::READONLY | ElementState::DEFINED |
+               ElementState::LTR) {
+    MOZ_ASSERT(mNodeInfo->NodeType() == ELEMENT_NODE,
+               "Bad NodeType in aNodeInfo");
+    mAttrs.UpdateSubtreeBloomFilter(NodeInfo()->NameBloomFilterHash());
+    SetIsElement();
+  }
+
+  ~Element() {
+    NS_ASSERTION(!HasServoData(), "expected ServoData to be cleared earlier");
+    UnlinkCustomElementRegistry(this);
+  }
+
+  NS_INLINE_DECL_STATIC_IID(NS_ELEMENT_IID)
+
+  NS_DECL_ADDSIZEOFEXCLUDINGTHIS
+
+  NS_IMPL_FROMNODE_HELPER(Element, IsElement())
+
+  NS_IMETHOD QueryInterface(REFNSIID aIID, void** aInstancePtr) override;
+
+  ElementState State() const { return mState; }
+
+  bool IsDisabled() const { return State().HasState(ElementState::DISABLED); }
+  bool IsReadOnly() const { return State().HasState(ElementState::READONLY); }
+  bool IsDisabledOrReadOnly() const {
+    return State().HasAtLeastOneOfStates(ElementState::DISABLED |
+                                         ElementState::READONLY);
+  }
+
+  [[nodiscard]] inline bool IsContentEditablePlainTextOnly() const;
+
+  virtual int32_t TabIndexDefault() { return -1; }
+
+  int32_t TabIndex();
+
+  Maybe<int32_t> GetTabIndexAttrValue();
+
+  void SetTabIndex(int32_t aTabIndex, mozilla::ErrorResult& aError);
+
+  void SetShadowRoot(ShadowRoot* aShadowRoot);
+
+  void SetLastRememberedBSize(float aBSize);
+  void SetLastRememberedISize(float aISize);
+  void RemoveLastRememberedBSize();
+  void RemoveLastRememberedISize();
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY virtual void Focus(const FocusOptions& aOptions,
+                                                 const CallerType aCallerType,
+                                                 ErrorResult& aError);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY virtual void Blur(mozilla::ErrorResult& aError);
+
+  ElementState StyleState() const {
+    if (!HasLockedStyleStates()) {
+      return mState;
+    }
+    return StyleStateFromLocks();
+  }
+
+  struct StyleStateLocks {
+    ElementState mLocks;
+    ElementState mValues;
+  };
+
+  StyleStateLocks LockedStyleStates() const;
+
+  void LockStyleStates(ElementState aStates, bool aEnabled);
+
+  void UnlockStyleStates(ElementState aStates);
+
+  void ClearStyleStateLocks();
+
+  bool HasDirAuto() const {
+    return State().HasState(ElementState::HAS_DIR_ATTR_LIKE_AUTO);
+  }
+
+  bool HasFixedDir() const {
+    return State().HasAtLeastOneOfStates(ElementState::HAS_DIR_ATTR_LTR |
+                                         ElementState::HAS_DIR_ATTR_RTL);
+  }
+
+  StyleLockedDeclarationBlock* GetInlineStyleDeclaration() const;
+
+  StyleLockedDeclarationBlock* GetMappedAttributeStyle() const {
+    return mAttrs.GetMappedDeclarationBlock();
+  }
+
+  bool IsPendingMappedAttributeEvaluation() const {
+    return mAttrs.IsPendingMappedAttributeEvaluation();
+  }
+
+  void SetMappedDeclarationBlock(already_AddRefed<StyleLockedDeclarationBlock>);
+
+  virtual void InlineStyleDeclarationWillChange(MutationClosureData& aData);
+
+  virtual nsresult SetInlineStyleDeclaration(StyleLockedDeclarationBlock&,
+                                             MutationClosureData& aData);
+
+  StyleLockedDeclarationBlock* GetSMILOverrideStyleDeclaration();
+
+  void SetSMILOverrideStyleDeclaration(StyleLockedDeclarationBlock&);
+
+  virtual UniquePtr<SMILAttr> GetAnimatedAttr(int32_t aNamespaceID,
+                                              nsAtom* aName);
+
+  nsDOMCSSAttributeDeclaration* SMILOverrideStyle();
+
+  virtual bool IsLabelable() const;
+
+  virtual bool IsInteractiveHTMLContent() const;
+
+  NS_IMETHOD_(bool) IsAttributeMapped(const nsAtom* aAttribute) const;
+
+  nsresult BindToTree(BindContext&, nsINode& aParent) override;
+  void UnbindFromTree(UnbindContext&) override;
+  using nsIContent::UnbindFromTree;
+
+  virtual nsMapRuleToAttributesFunc GetAttributeMappingFunction() const;
+  static void MapNoAttributesInto(mozilla::MappedDeclarationsBuilder&);
+
+  virtual nsChangeHint GetAttributeChangeHint(const nsAtom* aAttribute,
+                                              AttrModType aModType) const;
+
+  inline Directionality GetDirectionality() const {
+    ElementState state = State();
+    if (state.HasState(ElementState::RTL)) {
+      return Directionality::Rtl;
+    }
+    if (state.HasState(ElementState::LTR)) {
+      return Directionality::Ltr;
+    }
+    return Directionality::Unset;
+  }
+
+  inline void SetDirectionality(Directionality aDir, bool aNotify) {
+    AutoStateChangeNotifier notifier(*this, aNotify);
+    RemoveStatesSilently(ElementState::DIR_STATES);
+    switch (aDir) {
+      case Directionality::Rtl:
+        AddStatesSilently(ElementState::RTL);
+        break;
+      case Directionality::Ltr:
+        AddStatesSilently(ElementState::LTR);
+        break;
+      case Directionality::Unset:
+      case Directionality::Auto:
+        MOZ_ASSERT_UNREACHABLE("Setting unresolved directionality?");
+        break;
+    }
+  }
+
+  Directionality GetComputedDirectionality() const;
+
+  static const uint32_t kAllServoDescendantBits =
+      ELEMENT_HAS_DIRTY_DESCENDANTS_FOR_SERVO |
+      ELEMENT_HAS_ANIMATION_ONLY_DIRTY_DESCENDANTS_FOR_SERVO |
+      NODE_DESCENDANTS_NEED_FRAMES;
+
+  void NoteDirtySubtreeForServo();
+
+  void NoteDirtyForServo();
+  void NoteAnimationOnlyDirtyForServo();
+  void NoteDescendantsNeedFramesForServo();
+
+  bool HasDirtyDescendantsForServo() const {
+    return HasFlag(ELEMENT_HAS_DIRTY_DESCENDANTS_FOR_SERVO);
+  }
+
+  void SetHasDirtyDescendantsForServo() {
+    SetFlags(ELEMENT_HAS_DIRTY_DESCENDANTS_FOR_SERVO);
+  }
+
+  void UnsetHasDirtyDescendantsForServo() {
+    UnsetFlags(ELEMENT_HAS_DIRTY_DESCENDANTS_FOR_SERVO);
+  }
+
+  bool HasAnimationOnlyDirtyDescendantsForServo() const {
+    return HasFlag(ELEMENT_HAS_ANIMATION_ONLY_DIRTY_DESCENDANTS_FOR_SERVO);
+  }
+
+  void SetHasAnimationOnlyDirtyDescendantsForServo() {
+    SetFlags(ELEMENT_HAS_ANIMATION_ONLY_DIRTY_DESCENDANTS_FOR_SERVO);
+  }
+
+  void UnsetHasAnimationOnlyDirtyDescendantsForServo() {
+    UnsetFlags(ELEMENT_HAS_ANIMATION_ONLY_DIRTY_DESCENDANTS_FOR_SERVO);
+  }
+
+  bool HasServoData() const { return !!mServoData.Get(); }
+
+  void ClearServoData() { ClearServoData(GetComposedDoc()); }
+  void ClearServoData(Document* aDocument);
+
+  PopoverData* GetPopoverData() const {
+    const nsExtendedDOMSlots* slots = GetExistingExtendedDOMSlots();
+    return slots ? slots->mPopoverData.get() : nullptr;
+  }
+
+  PopoverData& EnsurePopoverData() {
+    if (auto* popoverData = GetPopoverData()) {
+      return *popoverData;
+    }
+    return CreatePopoverData();
+  }
+
+  bool IsPopoverOpenedInMode(PopoverAttributeState aMode) const;
+  bool IsPopoverOpen() const;
+
+  void SetAssociatedPopover(nsGenericHTMLElement& aPopover);
+  nsGenericHTMLElement* GetAssociatedPopover() const;
+
+  Element* GetTopmostPopoverAncestor(const Element* aInvoker,
+                                     bool isPopover) const;
+
+  ElementAnimationData* GetAnimationData() const {
+    if (!MayHaveAnimations()) {
+      return nullptr;
+    }
+    const nsExtendedDOMSlots* slots = GetExistingExtendedDOMSlots();
+    return slots ? slots->mAnimations.get() : nullptr;
+  }
+
+  ElementAnimationData& EnsureAnimationData() {
+    if (auto* anim = GetAnimationData()) {
+      return *anim;
+    }
+    return CreateAnimationData();
+  }
+
+ private:
+  ElementAnimationData& CreateAnimationData();
+  PopoverData& CreatePopoverData();
+
+ public:
+  void ClearPopoverData();
+
+  CustomElementData* GetCustomElementData() const {
+    if (!HasCustomElementData()) {
+      return nullptr;
+    }
+
+    const nsExtendedDOMSlots* slots = GetExistingExtendedDOMSlots();
+    return slots ? slots->mCustomElementData.get() : nullptr;
+  }
+
+  void SetCustomElementData(UniquePtr<CustomElementData> aData);
+
+  void ClearCustomElementData();
+
+  nsTArray<RefPtr<nsAtom>>& EnsureCustomStates();
+
+  CustomElementDefinition* GetCustomElementDefinition() const;
+
+  virtual void SetCustomElementDefinition(CustomElementDefinition* aDefinition);
+
+  const AttrArray& GetAttrs() const { return mAttrs; }
+
+  void SetDefined(bool aSet) { SetStates(ElementState::DEFINED, aSet); }
+
+  REFLECT_NULLABLE_DOMSTRING_ATTR(Role, role)
+
+  REFLECT_NULLABLE_ELEMENT_ATTR(AriaActiveDescendantElement,
+                                aria_activedescendant)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaAtomic, aria_atomic)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaAutoComplete, aria_autocomplete)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaBrailleLabel, aria_braillelabel)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaBrailleRoleDescription,
+                                  aria_brailleroledescription)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaBusy, aria_busy)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaChecked, aria_checked)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaColCount, aria_colcount)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaColIndex, aria_colindex)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaColIndexText, aria_colindextext)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaColSpan, aria_colspan)
+  REFLECT_NULLABLE_ELEMENTS_ATTR(AriaControlsElements, aria_controls)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaCurrent, aria_current)
+  REFLECT_NULLABLE_ELEMENTS_ATTR(AriaDescribedByElements, aria_describedby)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaDescription, aria_description)
+  REFLECT_NULLABLE_ELEMENTS_ATTR(AriaDetailsElements, aria_details)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaDisabled, aria_disabled)
+  REFLECT_NULLABLE_ELEMENTS_ATTR(AriaErrorMessageElements, aria_errormessage)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaExpanded, aria_expanded)
+  REFLECT_NULLABLE_ELEMENTS_ATTR(AriaFlowToElements, aria_flowto)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaHasPopup, aria_haspopup)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaHidden, aria_hidden)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaInvalid, aria_invalid)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaKeyShortcuts, aria_keyshortcuts)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaLabel, aria_label)
+  REFLECT_NULLABLE_ELEMENTS_ATTR(AriaLabelledByElements, aria_labelledby)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaLevel, aria_level)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaLive, aria_live)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaModal, aria_modal)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaMultiLine, aria_multiline)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaMultiSelectable, aria_multiselectable)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaOrientation, aria_orientation)
+  REFLECT_NULLABLE_ELEMENTS_ATTR(AriaOwnsElements, aria_owns)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaPlaceholder, aria_placeholder)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaPosInSet, aria_posinset)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaPressed, aria_pressed)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaReadOnly, aria_readonly)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaRelevant, aria_relevant)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaRequired, aria_required)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaRoleDescription, aria_roledescription)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaRowCount, aria_rowcount)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaRowIndex, aria_rowindex)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaRowIndexText, aria_rowindextext)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaRowSpan, aria_rowspan)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaSelected, aria_selected)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaSetSize, aria_setsize)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaSort, aria_sort)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaValueMax, aria_valuemax)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaValueMin, aria_valuemin)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaValueNow, aria_valuenow)
+  REFLECT_NULLABLE_DOMSTRING_ATTR(AriaValueText, aria_valuetext)
+
+ protected:
+  already_AddRefed<ShadowRoot> AttachShadowInternal(ShadowRootMode,
+                                                    ErrorResult& aError);
+
+ public:
+  MOZ_CAN_RUN_SCRIPT
+  ScrollContainerFrame* GetScrollContainerFrame(
+      nsIFrame** aFrame = nullptr, FlushType aFlushType = FlushType::Layout);
+
+ private:
+  ElementState StyleStateFromLocks() const;
+
+  void NotifyStateChange(ElementState aStates);
+  void NotifyStyleStateChange(ElementState aStates);
+
+ public:
+  struct AutoStateChangeNotifier {
+    AutoStateChangeNotifier(Element& aElement, bool aNotify)
+        : mElement(aElement), mOldState(aElement.State()), mNotify(aNotify) {}
+    ~AutoStateChangeNotifier() {
+      if (!mNotify) {
+        return;
+      }
+      ElementState newState = mElement.State();
+      if (mOldState != newState) {
+        mElement.NotifyStateChange(mOldState ^ newState);
+      }
+    }
+
+   private:
+    Element& mElement;
+    const ElementState mOldState;
+    const bool mNotify;
+  };
+
+  void AddStatesSilently(ElementState aStates) { mState |= aStates; }
+  void RemoveStatesSilently(ElementState aStates) { mState &= ~aStates; }
+  void AddStates(ElementState aStates, bool aNotify = true) {
+    ElementState old = mState;
+    AddStatesSilently(aStates);
+    if (aNotify && old != mState) {
+      NotifyStateChange(old ^ mState);
+    }
+  }
+  void RemoveStates(ElementState aStates, bool aNotify = true) {
+    ElementState old = mState;
+    RemoveStatesSilently(aStates);
+    if (aNotify && old != mState) {
+      NotifyStateChange(old ^ mState);
+    }
+  }
+  void SetStates(ElementState aStates, bool aSet, bool aNotify = true) {
+    if (aSet) {
+      AddStates(aStates, aNotify);
+    } else {
+      RemoveStates(aStates, aNotify);
+    }
+  }
+  void ToggleStates(ElementState aStates, bool aNotify) {
+    mState ^= aStates;
+    if (aNotify) {
+      NotifyStateChange(aStates);
+    }
+  }
+
+  void UpdateEditableState(bool aNotify) override;
+  void UpdateReadOnlyState(bool aNotify);
+  virtual bool IsReadOnlyInternal() const;
+
+  already_AddRefed<mozilla::dom::NodeInfo> GetExistingAttrNameFromQName(
+      const nsAString& aStr) const;
+
+  bool MaybeCheckSameAttrVal(int32_t aNamespaceID, const nsAtom* aName,
+                             const nsAtom* aPrefix,
+                             const nsAttrValueOrString& aValue, bool aNotify,
+                             nsAttrValue& aOldValue, AttrModType* aModType,
+                             bool* aOldValueSet);
+
+  bool OnlyNotifySameValueSet(int32_t aNamespaceID, nsAtom* aName,
+                              nsAtom* aPrefix,
+                              const nsAttrValueOrString& aValue, bool aNotify,
+                              nsAttrValue& aOldValue, AttrModType* aModType,
+                              bool* aOldValueSet);
+
+  nsresult SetClassAttrFromParser(nsAtom* aValue);
+
+  nsresult SetParsedAttr(int32_t aNameSpaceID, nsAtom* aName, nsAtom* aPrefix,
+                         nsAttrValue& aParsedValue, bool aNotify,
+                         IsKnownNewAttr aIsKnownNew);
+
+  nsresult SetNoNameSpaceAttrOnNewlyCreatedElement(
+      already_AddRefed<nsAtom> aName, nsHtml5String& aValue,
+      bool& aIsPendingMappedAttributeEvaluation);
+
+  bool GetAttr(int32_t aNameSpaceID, const nsAtom* aName,
+               nsAString& aResult) const;
+  bool GetAttr(const nsAtom* aName, nsAString& aResult) const;
+
+  inline bool HasAttr(int32_t aNameSpaceID, const nsAtom* aName) const {
+    return mAttrs.HasAttr(aNameSpaceID, aName);
+  }
+
+  bool HasAttr(const nsAtom* aAttr) const { return mAttrs.HasAttr(aAttr); }
+
+  inline bool HasNonEmptyAttr(int32_t aNameSpaceID, const nsAtom* aName) const;
+
+  bool HasNonEmptyAttr(const nsAtom* aAttr) const {
+    return HasNonEmptyAttr(kNameSpaceID_None, aAttr);
+  }
+
+  inline bool AttrValueIs(int32_t aNameSpaceID, const nsAtom* aName,
+                          const nsAString& aValue,
+                          nsCaseTreatment aCaseSensitive) const;
+
+  bool AttrValueIs(int32_t aNameSpaceID, const nsAtom* aName,
+                   const nsAtom* aValue, nsCaseTreatment aCaseSensitive) const;
+
+  using AttrValuesArray = AttrArray::AttrValuesArray;
+  int32_t FindAttrValueIn(int32_t aNameSpaceID, const nsAtom* aName,
+                          AttrArray::AttrValuesArray* aValues,
+                          nsCaseTreatment aCaseSensitive) const;
+
+  nsresult SetAttr(int32_t aNameSpaceID, nsAtom* aName, const nsAString& aValue,
+                   bool aNotify) {
+    return SetAttr(aNameSpaceID, aName, nullptr, aValue, nullptr, aNotify,
+                   IsKnownNewAttr::No);
+  }
+  nsresult SetAttr(int32_t aNameSpaceID, nsAtom* aName, nsAtom* aPrefix,
+                   const nsAString& aValue, bool aNotify) {
+    return SetAttr(aNameSpaceID, aName, aPrefix, aValue, nullptr, aNotify,
+                   IsKnownNewAttr::No);
+  }
+  nsresult SetAttr(int32_t aNameSpaceID, nsAtom* aName, const nsAString& aValue,
+                   nsIPrincipal* aTriggeringPrincipal, bool aNotify) {
+    return SetAttr(aNameSpaceID, aName, nullptr, aValue, aTriggeringPrincipal,
+                   aNotify, IsKnownNewAttr::No);
+  }
+
+  nsresult SetAttr(int32_t aNameSpaceID, nsAtom* aName, nsAtom* aPrefix,
+                   const nsAString& aValue,
+                   nsIPrincipal* aMaybeScriptedPrincipal, bool aNotify,
+                   IsKnownNewAttr aIsKnownNew);
+
+  nsresult SetAttr(int32_t aNameSpaceID, nsAtom* aName, nsAtom* aPrefix,
+                   nsAtom* aValue, nsIPrincipal* aMaybeScriptedPrincipal,
+                   bool aNotify);
+
+  nsresult UnsetAttr(int32_t aNameSpaceID, nsAtom* aName, bool aNotify);
+
+  nsresult SetAndSwapAttr(nsAtom* aLocalName, nsAttrValue& aValue,
+                          bool* aHadValue, IsKnownNewAttr aIsKnownNew);
+
+  nsresult SetAndSwapAttr(mozilla::dom::NodeInfo* aName, nsAttrValue& aValue,
+                          bool* aHadValue, IsKnownNewAttr aIsKnownNew);
+
+  const nsAttrName* GetAttrNameAt(uint32_t aIndex) const {
+    return mAttrs.GetSafeAttrNameAt(aIndex);
+  }
+
+  const nsAttrName* GetUnsafeAttrNameAt(uint32_t aIndex) const {
+    return mAttrs.AttrNameAt(aIndex);
+  }
+
+  [[nodiscard]] bool GetAttrNameAt(uint32_t aIndex,
+                                   const nsAttrName** aResult) const {
+    return mAttrs.GetSafeAttrNameAt(aIndex, aResult);
+  }
+
+  BorrowedAttrInfo GetAttrInfoAt(uint32_t aIndex) const {
+    if (aIndex >= mAttrs.AttrCount()) {
+      return BorrowedAttrInfo(nullptr, nullptr);
+    }
+
+    return mAttrs.AttrInfoAt(aIndex);
+  }
+
+  uint32_t GetAttrCount() const { return mAttrs.AttrCount(); }
+
+  const nsAttrValue* GetClasses() const {
+    if (!MayHaveClass()) {
+      return nullptr;
+    }
+
+    if (IsSVGElement()) {
+      if (const nsAttrValue* value = GetSVGAnimatedClass()) {
+        return value;
+      }
+    }
+
+    return GetParsedAttr(nsGkAtoms::_class);
+  }
+
+#ifdef MOZ_DOM_LIST
+  virtual void List(FILE* out = stdout, int32_t aIndent = 0) const override {
+    List(out, aIndent, ""_ns);
+  }
+  virtual void DumpContent(FILE* out, int32_t aIndent,
+                           bool aDumpAll) const override;
+  void List(FILE* out, int32_t aIndent, const nsCString& aPrefix) const;
+  void ListAttributes(FILE* out) const;
+#endif
+
+  enum class DescriptionKind { IdOnly, IdAndClass, AllAttributes };
+  void Describe(nsAString& aOutDescription,
+                DescriptionKind aKind = DescriptionKind::AllAttributes) const;
+
+  struct MappedAttributeEntry {
+    const nsStaticAtom* const attribute;
+  };
+
+  template <size_t N>
+  static bool FindAttributeDependence(
+      const nsAtom* aAttribute, const MappedAttributeEntry* const (&aMaps)[N]) {
+    return FindAttributeDependence(aAttribute, aMaps, N);
+  }
+
+  enum class Command : uint8_t {
+    Invalid,
+    Custom,
+    TogglePopover,
+    ShowPopover,
+    HidePopover,
+    ShowModal,
+    RequestClose,
+    Toggle,
+    Close,
+    Open,
+  };
+
+  virtual bool IsValidCommandAction(Command aCommand) const { return false; }
+
+  MOZ_CAN_RUN_SCRIPT virtual bool HandleCommandInternal(Element* aSource,
+                                                        Command aCommand,
+                                                        ErrorResult& aRv) {
+    return false;
+  }
+
+ private:
+  void DescribeAttribute(uint32_t index, nsAString& aOutDescription) const;
+
+  static bool FindAttributeDependence(const nsAtom* aAttribute,
+                                      const MappedAttributeEntry* const aMaps[],
+                                      uint32_t aMapCount);
+
+  bool HasSharedRoot(const Element* aElement) const;
+
+  Element* GetElementByIdInDocOrSubtree(nsAtom* aID) const;
+
+ protected:
+  inline bool GetAttr(const nsAtom* aName, DOMString& aResult) const {
+    MOZ_ASSERT(aResult.IsEmpty(), "Should have empty string coming in");
+    const nsAttrValue* val = mAttrs.GetAttr(aName);
+    if (!val) {
+      return false;  
+    }
+    val->ToString(aResult);
+    return true;
+  }
+
+  inline bool GetAttr(int32_t aNameSpaceID, const nsAtom* aName,
+                      DOMString& aResult) const {
+    MOZ_ASSERT(aResult.IsEmpty(), "Should have empty string coming in");
+    const nsAttrValue* val = mAttrs.GetAttr(aName, aNameSpaceID);
+    if (!val) {
+      return false;  
+    }
+    val->ToString(aResult);
+    return true;
+  }
+
+ public:
+  bool HasAttrs() const { return mAttrs.HasAttrs(); }
+
+  inline bool GetAttr(const nsAString& aName, DOMString& aResult) const {
+    MOZ_ASSERT(aResult.IsEmpty(), "Should have empty string coming in");
+    const nsAttrValue* val = mAttrs.GetAttr(aName);
+    if (val) {
+      val->ToString(aResult);
+      return true;
+    }
+    return false;
+  }
+
+  void ClearAttributes() { mAttrs.Clear(); }
+
+  void GetTagName(nsAString& aTagName) const { aTagName = NodeName(); }
+  void GetId(nsAString& aId) const { GetAttr(nsGkAtoms::id, aId); }
+  void GetId(DOMString& aId) const { GetAttr(nsGkAtoms::id, aId); }
+  void SetId(const nsAString& aId) {
+    SetAttr(kNameSpaceID_None, nsGkAtoms::id, aId, true);
+  }
+  void GetClassName(nsAString& aClassName) {
+    GetAttr(nsGkAtoms::_class, aClassName);
+  }
+  void GetClassName(DOMString& aClassName) {
+    GetAttr(nsGkAtoms::_class, aClassName);
+  }
+  void SetClassName(const nsAString& aClassName) {
+    SetAttr(kNameSpaceID_None, nsGkAtoms::_class, aClassName, true);
+  }
+
+  nsDOMTokenList* ClassList();
+  nsDOMTokenList* Part();
+
+  nsDOMAttributeMap* Attributes();
+
+  void GetAttributeNames(nsTArray<nsString>& aResult);
+
+  void GetAttribute(const nsAString& aName, nsAString& aReturn) {
+    DOMString str;
+    GetAttribute(aName, str);
+    aReturn.Assign(std::move(str));
+  }
+
+  void GetAttribute(const nsAString& aName, DOMString& aReturn);
+  void GetAttributeNS(const nsAString& aNamespaceURI,
+                      const nsAString& aLocalName, nsAString& aReturn);
+  bool ToggleAttribute(const nsAString& aName, const Optional<bool>& aForce,
+                       nsIPrincipal* aTriggeringPrincipal, ErrorResult& aError);
+  void SetAttribute(const nsAString& aName, const nsAString& aValue,
+                    nsIPrincipal* aTriggeringPrincipal, ErrorResult& aError);
+  void SetAttributeNS(const nsAString& aNamespaceURI,
+                      const nsAString& aLocalName, const nsAString& aValue,
+                      nsIPrincipal* aTriggeringPrincipal, ErrorResult& aError);
+  void SetAttribute(const nsAString& aName, const nsAString& aValue,
+                    ErrorResult& aError) {
+    SetAttribute(aName, aValue, nullptr, aError);
+  }
+
+  MOZ_CAN_RUN_SCRIPT void SetAttribute(
+      const nsAString& aName,
+      const TrustedHTMLOrTrustedScriptOrTrustedScriptURLOrString& aValue,
+      nsIPrincipal* aTriggeringPrincipal, ErrorResult& aError);
+  MOZ_CAN_RUN_SCRIPT void SetAttributeNS(
+      const nsAString& aNamespaceURI, const nsAString& aLocalName,
+      const TrustedHTMLOrTrustedScriptOrTrustedScriptURLOrString& aValue,
+      nsIPrincipal* aTriggeringPrincipal, ErrorResult& aError);
+  MOZ_CAN_RUN_SCRIPT void SetAttribute(
+      const nsAString& aName,
+      const TrustedHTMLOrTrustedScriptOrTrustedScriptURLOrString& aValue,
+      ErrorResult& aError) {
+    SetAttribute(aName, aValue, nullptr, aError);
+  }
+
+  void RemoveAttribute(const nsAString& aName, ErrorResult& aError);
+  void RemoveAttributeNS(const nsAString& aNamespaceURI,
+                         const nsAString& aLocalName, ErrorResult& aError);
+  bool HasAttribute(const nsAString& aName) const {
+    return InternalGetAttrNameFromQName(aName) != nullptr;
+  }
+  bool HasAttributeNS(const nsAString& aNamespaceURI,
+                      const nsAString& aLocalName) const;
+  bool HasAttributes() const { return HasAttrs(); }
+  Element* Closest(const nsACString& aSelector, ErrorResult& aResult);
+  bool Matches(const nsACString& aSelector, ErrorResult& aError);
+  already_AddRefed<HTMLCollection> GetElementsByTagName(
+      const nsAString& aQualifiedName);
+  already_AddRefed<HTMLCollection> GetElementsByTagNameNS(
+      const nsAString& aNamespaceURI, const nsAString& aLocalName,
+      ErrorResult& aError);
+  already_AddRefed<HTMLCollection> GetElementsByClassName(
+      const nsAString& aClassNames);
+
+  Element* GetAttrAssociatedElementInternal(nsAtom* aAttr,
+                                            bool aForBindings = false) const;
+  Element* GetAttrAssociatedElementForBindings(nsAtom* aAttr) const;
+
+  Maybe<nsTArray<RefPtr<Element>>> GetAttrAssociatedElementsInternal(
+      nsAtom* aAttr, bool aForBindings = false);
+  void GetAttrAssociatedElementsForBindings(
+      nsAtom* aAttr, bool* aUseCachedValue,
+      Nullable<nsTArray<RefPtr<Element>>>& aElements);
+
+  typedef bool (*AttrTargetObserver)(Element* aOldElement, Element* aNewElement,
+                                     Element* thisElement);
+  Element* AddAttrAssociatedElementObserver(nsAtom* aAttr,
+                                            AttrTargetObserver aObserver);
+  void RemoveAttrAssociatedElementObserver(nsAtom* aAttr,
+                                           AttrTargetObserver aObserver);
+  bool AttrAssociatedElementUpdated(nsAtom* aAttr);
+
+ protected:
+  void IDREFAttributeValueChanged(nsAtom* aAttr, const nsAttrValue* aValue);
+
+ private:
+  FragmentOrElement::nsExtendedDOMSlots::AttrElementObserverData*
+  GetAttrElementObserverData(nsAtom* aAttr);
+  void DeleteAttrAssociatedElementObserverData(nsAtom* aAttr);
+  void AddDocOrShadowObserversForAttrAssociatedElement(
+      DocumentOrShadowRoot& aContainingDocOrShadow, nsAtom* aAttr);
+  void RemoveDocOrShadowObserversForAttrAssociatedElement(
+      DocumentOrShadowRoot& aContainingDocOrShadow, nsAtom* aAttr);
+  void BindAttrAssociatedElementObservers(
+      DocumentOrShadowRoot& aContainingDocOrShadow);
+  void UnbindAttrAssociatedElementObservers(
+      DocumentOrShadowRoot& aContainingDocOrShadow);
+
+ public:
+  void ExplicitlySetAttrElement(nsAtom* aAttr, Element* aElement);
+  void ExplicitlySetAttrElements(
+      nsAtom* aAttr,
+      const Nullable<Sequence<OwningNonNull<Element>>>& aElements);
+
+  void ClearExplicitlySetAttrElement(nsAtom*);
+  void ClearExplicitlySetAttrElements(nsAtom*);
+
+  Element* GetExplicitlySetAttrElement(nsAtom* aAttr) const;
+
+  Maybe<nsTArray<RefPtr<dom::Element>>> GetExplicitlySetAttrElements(
+      nsAtom* aAttr) const;
+
+  typedef bool (*ReferenceTargetChangeObserver)(void* aData);
+
+  void AddReferenceTargetChangeObserver(ReferenceTargetChangeObserver aObserver,
+                                        void* aData);
+  void RemoveReferenceTargetChangeObserver(
+      ReferenceTargetChangeObserver aObserver, void* aData);
+  void NotifyReferenceTargetChanged();
+
+  PseudoStyleType GetPseudoElementType() const {
+    nsresult rv = NS_OK;
+    auto raw = GetProperty(nsGkAtoms::pseudoProperty, &rv);
+    if (rv == NS_PROPTABLE_PROP_NOT_THERE) {
+      return PseudoStyleType::NotPseudo;
+    }
+    return PseudoStyleType(reinterpret_cast<uintptr_t>(raw));
+  }
+
+  void SetPseudoElementType(PseudoStyleType aPseudo) {
+    static_assert(sizeof(PseudoStyleType) <= sizeof(uintptr_t),
+                  "Need to be able to store this in a void*");
+    MOZ_ASSERT(PseudoStyle::IsPseudoElement(aPseudo));
+    SetProperty(nsGkAtoms::pseudoProperty, reinterpret_cast<void*>(aPseudo),
+                 nullptr,  true);
+  }
+
+  MOZ_CAN_RUN_SCRIPT bool HasVisibleScrollbars();
+
+  EditorBase* GetExtantEditor() const;
+
+ private:
+  nsINode* InsertAdjacent(const nsAString& aWhere, nsINode* aNode,
+                          ErrorResult& aError);
+
+ public:
+  Element* InsertAdjacentElement(const nsAString& aWhere, Element& aElement,
+                                 ErrorResult& aError);
+
+  void InsertAdjacentText(const nsAString& aWhere, const nsAString& aData,
+                          ErrorResult& aError);
+
+  void SetPointerCapture(int32_t aPointerId, ErrorResult& aError);
+  void ReleasePointerCapture(int32_t aPointerId, ErrorResult& aError);
+  bool HasPointerCapture(long aPointerId);
+  void SetCapture(bool aRetargetToElement);
+
+  void SetCaptureAlways(bool aRetargetToElement);
+
+  void ReleaseCapture();
+
+  already_AddRefed<Promise> RequestFullscreen(const FullscreenOptions&,
+                                              CallerType, ErrorResult&);
+  already_AddRefed<Promise> RequestPointerLock(
+      const PointerLockOptions& aOptions, CallerType aCallerType,
+      ErrorResult& aRv);
+  Attr* GetAttributeNode(const nsAString& aName);
+  MOZ_CAN_RUN_SCRIPT already_AddRefed<Attr> SetAttributeNode(
+      Attr& aNewAttr, nsIPrincipal* aSubjectPrincipal, ErrorResult& aError);
+  already_AddRefed<Attr> RemoveAttributeNode(Attr& aOldAttr,
+                                             ErrorResult& aError);
+  Attr* GetAttributeNodeNS(const nsAString& aNamespaceURI,
+                           const nsAString& aLocalName);
+  MOZ_CAN_RUN_SCRIPT already_AddRefed<Attr> SetAttributeNodeNS(
+      Attr& aNewAttr, nsIPrincipal* aSubjectPrincipal, ErrorResult& aError);
+
+  MOZ_CAN_RUN_SCRIPT already_AddRefed<DOMRectList> GetClientRects();
+  MOZ_CAN_RUN_SCRIPT already_AddRefed<DOMRect> GetBoundingClientRect();
+
+  enum class Loading : uint8_t {
+    Eager,
+    Lazy,
+  };
+
+  Loading LoadingState() const;
+  void GetLoading(nsAString& aValue) const;
+  bool ParseLoadingAttribute(const nsAString& aValue, nsAttrValue& aResult);
+
+ protected:
+  [[nodiscard]] bool MaybeStartLazyLoading();
+  void StopLazyLoading();
+  void LazyLoadingElementBindToTree(BindContext&);
+  void LazyLoadingElementUnbindFromTree(UnbindContext&);
+
+ public:
+  virtual bool IsPotentiallyRenderBlocking() { return false; }
+  bool BlockingContainsRender() const;
+
+  enum class ShadowRootDeclarative : bool { No, Yes };
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  already_AddRefed<ShadowRoot> AttachShadow(const ShadowRootInit&,
+                                            ErrorResult&);
+  bool CanAttachShadowDOM() const;
+  virtual void GetSlotNameFor(const ShadowRoot&, const nsIContent& aContent,
+                              nsAString& aName) const {
+    if (const Element* element = Element::FromNode(aContent)) {
+      element->GetAttr(nsGkAtoms::slot, aName);
+    }
+  }
+  virtual void OnChildBeforeSlotted(ShadowRoot&, nsIContent&) {}
+  virtual void OnChildUnslotted(ShadowRoot&, nsIContent&) {}
+
+  enum class DelegatesFocus : bool { No, Yes };
+  enum class ShadowRootClonable : bool { No, Yes };
+  enum class ShadowRootSerializable : bool { No, Yes };
+  enum class CustomSlotDispatch : bool { No, Yes };
+
+  already_AddRefed<ShadowRoot> AttachShadowWithoutNameChecks(
+      const ShadowRootInit&,
+      const Maybe<RefPtr<CustomElementRegistry>>& aRegistry,
+      CustomSlotDispatch = CustomSlotDispatch::No, bool aNotify = true);
+
+  enum class NotifyUAWidget : bool { No, Yes };
+  void AttachAndSetUAShadowRoot(NotifyUAWidget = NotifyUAWidget::Yes,
+                                DelegatesFocus = DelegatesFocus::No,
+                                CustomSlotDispatch = CustomSlotDispatch::No,
+                                bool aNotify = true);
+
+  void NotifyUAWidgetSetupOrChange();
+
+  enum class UnattachShadowRoot : bool { No, Yes };
+  void TeardownUAShadowRoot(NotifyUAWidget = NotifyUAWidget::Yes,
+                            UnattachShadowRoot = UnattachShadowRoot::Yes);
+
+  void UnattachShadow();
+
+  void SetSlot(const nsAString& aName, ErrorResult& aError);
+  void GetSlot(nsAString& aName);
+
+  ShadowRoot* GetShadowRootForBindings() const;
+  ShadowRoot* GetOpenOrClosedShadowRoot(nsIPrincipal& aSubject) const;
+  [[nodiscard]] ShadowRoot* GetShadowRoot() const {
+    const nsExtendedDOMSlots* slots = GetExistingExtendedDOMSlots();
+    return slots ? slots->mShadowRoot.get() : nullptr;
+  }
+
+  template <TreeKind aKind>
+  [[nodiscard]] ShadowRoot* GetShadowRoot() const {
+    if constexpr (aKind == TreeKind::DOM) {
+      return nullptr;
+    } else if constexpr (aKind == TreeKind::ShadowIncludingDOM ||
+                         aKind == TreeKind::FlatForSelection) {
+      MOZ_ASSERT(ShouldIgnoreNonContentShadow<aKind>());
+      return nsINode::GetShadowRootForSelection();
+    } else if constexpr (aKind == TreeKind::Flat) {
+      MOZ_ASSERT(!ShouldIgnoreNonContentShadow<aKind>());
+      return GetShadowRoot();
+    } else {
+      MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE("Handle the new TreeKind value");
+    }
+  }
+
+  Element* ResolveReferenceTarget() const;
+  Element* RetargetReferenceTargetForBindings(Element* aElement) const;
+
+  CustomElementRegistryState GetCustomElementRegistryState() const {
+    return static_cast<CustomElementRegistryState>(
+        (GetFlags() & ELEMENT_CUSTOM_ELEMENT_REGISTRY_MASK) /
+        ELEMENT_CUSTOM_ELEMENT_REGISTRY_LOW_BIT);
+  }
+
+  void SetCustomElementRegistryState(CustomElementRegistryState aState) {
+    UnsetFlags(ELEMENT_CUSTOM_ELEMENT_REGISTRY_MASK);
+    SetFlags(static_cast<uint32_t>(aState) *
+             ELEMENT_CUSTOM_ELEMENT_REGISTRY_LOW_BIT);
+  }
+
+  bool HasCustomElementRegistry() const {
+    return GetCustomElementRegistryState() !=
+           CustomElementRegistryState::Global;
+  }
+
+  CustomElementRegistry* GetCustomElementRegistry();
+  void SetCustomElementRegistry(CustomElementRegistry* aCustomElementRegistry);
+  void SetKeepCustomElementRegistryNull();
+  static void TraverseCustomElementRegistry(
+      Element* aElement, nsCycleCollectionTraversalCallback& aCb);
+  static void UnlinkCustomElementRegistry(Element* aElement);
+
+  Maybe<float> GetLastRememberedBSize() const {
+    const nsExtendedDOMSlots* slots = GetExistingExtendedDOMSlots();
+    return slots ? slots->mLastRememberedBSize : Nothing();
+  }
+  Maybe<float> GetLastRememberedISize() const {
+    const nsExtendedDOMSlots* slots = GetExistingExtendedDOMSlots();
+    return slots ? slots->mLastRememberedISize : Nothing();
+  }
+  bool HasLastRememberedBSize() const {
+    return GetLastRememberedBSize().isSome();
+  }
+  bool HasLastRememberedISize() const {
+    return GetLastRememberedISize().isSome();
+  }
+
+  Maybe<ContentRelevancy> GetContentRelevancy() const {
+    const auto* slots = GetExistingExtendedDOMSlots();
+    return slots ? slots->mContentRelevancy : Nothing();
+  }
+  void SetContentRelevancy(ContentRelevancy relevancy) {
+    ExtendedDOMSlots()->mContentRelevancy = Some(relevancy);
+  }
+
+  Maybe<bool> GetVisibleForContentVisibility() const {
+    const auto* slots = GetExistingExtendedDOMSlots();
+    return slots ? slots->mVisibleForContentVisibility : Nothing();
+  }
+  void SetVisibleForContentVisibility(bool visible) {
+    ExtendedDOMSlots()->mVisibleForContentVisibility = Some(visible);
+  }
+
+  void ClearContentRelevancy() {
+    if (auto* slots = GetExistingExtendedDOMSlots()) {
+      slots->mContentRelevancy.reset();
+      slots->mVisibleForContentVisibility.reset();
+      slots->mTemporarilyVisibleForScrolledIntoViewDescendant = false;
+    }
+  }
+
+  bool TemporarilyVisibleForScrolledIntoViewDescendant() const {
+    const auto* slots = GetExistingExtendedDOMSlots();
+    return slots && slots->mTemporarilyVisibleForScrolledIntoViewDescendant;
+  }
+
+  void SetTemporarilyVisibleForScrolledIntoViewDescendant(bool aVisible) {
+    ExtendedDOMSlots()->mTemporarilyVisibleForScrolledIntoViewDescendant =
+        aVisible;
+  }
+
+  MOZ_CAN_RUN_SCRIPT bool CheckVisibility(const CheckVisibilityOptions&);
+
+ private:
+  MOZ_CAN_RUN_SCRIPT void ScrollIntoView(const ScrollIntoViewOptions& aOptions);
+
+ public:
+  MOZ_CAN_RUN_SCRIPT
+  void ScrollIntoView(const BooleanOrScrollIntoViewOptions& aObject);
+  MOZ_CAN_RUN_SCRIPT void ScrollTo(double aXScroll, double aYScroll);
+  MOZ_CAN_RUN_SCRIPT void ScrollTo(const ScrollToOptions& aOptions);
+  MOZ_CAN_RUN_SCRIPT void ScrollBy(double aXScrollDif, double aYScrollDif);
+  MOZ_CAN_RUN_SCRIPT void ScrollBy(const ScrollToOptions& aOptions);
+  MOZ_CAN_RUN_SCRIPT double ScrollTop();
+  MOZ_CAN_RUN_SCRIPT void SetScrollTop(double aScrollTop);
+  MOZ_CAN_RUN_SCRIPT double ScrollLeft();
+  MOZ_CAN_RUN_SCRIPT void SetScrollLeft(double aScrollLeft);
+  MOZ_CAN_RUN_SCRIPT int32_t ScrollWidth();
+  MOZ_CAN_RUN_SCRIPT int32_t ScrollHeight();
+  MOZ_CAN_RUN_SCRIPT void MozScrollSnap();
+  MOZ_CAN_RUN_SCRIPT int32_t ClientTop() {
+    return CSSPixel::FromAppUnits(GetClientAreaRect().y).Rounded();
+  }
+  MOZ_CAN_RUN_SCRIPT int32_t ClientLeft() {
+    return CSSPixel::FromAppUnits(GetClientAreaRect().x).Rounded();
+  }
+  MOZ_CAN_RUN_SCRIPT int32_t ClientWidth() {
+    return CSSPixel::FromAppUnits(GetClientAreaRect().Width()).Rounded();
+  }
+  MOZ_CAN_RUN_SCRIPT int32_t ClientHeight() {
+    return CSSPixel::FromAppUnits(GetClientAreaRect().Height()).Rounded();
+  }
+
+  MOZ_CAN_RUN_SCRIPT int32_t ScreenX();
+  MOZ_CAN_RUN_SCRIPT int32_t ScreenY();
+  MOZ_CAN_RUN_SCRIPT already_AddRefed<nsIScreen> GetScreen();
+
+  MOZ_CAN_RUN_SCRIPT double ScrollTopMin();
+  MOZ_CAN_RUN_SCRIPT double ScrollTopMax();
+  MOZ_CAN_RUN_SCRIPT double ScrollLeftMin();
+  MOZ_CAN_RUN_SCRIPT double ScrollLeftMax();
+
+  MOZ_CAN_RUN_SCRIPT double ClientHeightDouble() {
+    return CSSPixel::FromAppUnits(GetClientAreaRect().Height());
+  }
+
+  MOZ_CAN_RUN_SCRIPT double ClientWidthDouble() {
+    return CSSPixel::FromAppUnits(GetClientAreaRect().Width());
+  }
+
+  MOZ_CAN_RUN_SCRIPT double CurrentCSSZoom();
+
+  Element* GetOffsetParent() {
+    CSSIntRect rcFrame;
+    return GetOffsetRect(rcFrame);
+  }
+  int32_t OffsetTop() {
+    CSSIntRect rcFrame;
+    GetOffsetRect(rcFrame);
+    return rcFrame.y;
+  }
+  int32_t OffsetLeft() {
+    CSSIntRect rcFrame;
+    GetOffsetRect(rcFrame);
+    return rcFrame.x;
+  }
+  int32_t OffsetWidth() {
+    CSSIntRect rcFrame;
+    GetOffsetRect(rcFrame);
+    return rcFrame.Width();
+  }
+  int32_t OffsetHeight() {
+    CSSIntRect rcFrame;
+    GetOffsetRect(rcFrame);
+    return rcFrame.Height();
+  }
+  Element* GetOffsetRect(CSSIntRect& aRect);
+
+  double FirstLineBoxBSize() const;
+
+  already_AddRefed<DOMMatrixReadOnly> GetTransformToAncestor(
+      Element& aAncestor);
+  already_AddRefed<DOMMatrixReadOnly> GetTransformToParent();
+  already_AddRefed<DOMMatrixReadOnly> GetTransformToViewport();
+
+  already_AddRefed<Animation> Animate(
+      JSContext* aContext, JS::Handle<JSObject*> aKeyframes,
+      const UnrestrictedDoubleOrKeyframeAnimationOptions& aOptions,
+      ErrorResult& aError);
+
+  MOZ_CAN_RUN_SCRIPT
+  void GetAnimations(const GetAnimationsOptions& aOptions,
+                     nsTArray<RefPtr<Animation>>& aAnimations,
+                     ErrorResult& aError);
+
+  void GetAnimationsWithoutFlush(const GetAnimationsOptions& aOptions,
+                                 nsTArray<RefPtr<Animation>>& aAnimations,
+                                 ErrorResult& aError);
+
+  void CloneAnimationsFrom(const Element& aOther);
+
+  virtual void GetInnerHTML(nsAString& aInnerHTML, OOMReporter& aError);
+
+  void GetInnerHTML(OwningTrustedHTMLOrNullIsEmptyString& aInnerHTML,
+                    OOMReporter& aError);
+
+  MOZ_CAN_RUN_SCRIPT void SetInnerHTML(
+      const TrustedHTMLOrNullIsEmptyString& aInnerHTML,
+      nsIPrincipal* aSubjectPrincipal, ErrorResult& aError);
+
+  virtual void SetInnerHTMLTrusted(const nsAString& aInnerHTML,
+                                   nsIPrincipal* aSubjectPrincipal,
+                                   ErrorResult& aError);
+
+  void GetOuterHTML(OwningTrustedHTMLOrNullIsEmptyString& aOuterHTML);
+
+  MOZ_CAN_RUN_SCRIPT void SetOuterHTML(
+      const TrustedHTMLOrNullIsEmptyString& aOuterHTML,
+      nsIPrincipal* aSubjectPrincipal, ErrorResult& aError);
+
+  MOZ_CAN_RUN_SCRIPT void InsertAdjacentHTML(
+      const nsAString& aPosition,
+      const TrustedHTMLOrString& aTrustedHTMLOrString,
+      nsIPrincipal* aSubjectPrincipal, ErrorResult& aError);
+
+  virtual void SetHTML(const nsAString& aInnerHTML,
+                       const SetHTMLOptions& aOptions, ErrorResult& aError);
+
+  MOZ_CAN_RUN_SCRIPT
+  virtual void SetHTMLUnsafe(const TrustedHTMLOrString& aHTML,
+                             const SetHTMLUnsafeOptions& aOptions,
+                             nsIPrincipal* aSubjectPrincipal,
+                             ErrorResult& aError);
+
+  void GetHTML(const GetHTMLOptions& aOptions, nsAString& aResult);
+
+  StylePropertyMapReadOnly* ComputedStyleMap();
+
+
+  void SetEventHandler(nsAtom* aEventName, const nsAString& aValue,
+                       bool aDefer = true);
+
+  nsresult LeaveLink(nsPresContext* aPresContext);
+
+  static bool ShouldBlur(nsIContent* aContent);
+
+  MOZ_CAN_RUN_SCRIPT
+  static nsresult DispatchClickEvent(nsPresContext* aPresContext,
+                                     WidgetInputEvent* aSourceEvent,
+                                     nsIContent* aTarget, bool aFullDispatch,
+                                     const EventFlags* aFlags,
+                                     nsEventStatus* aStatus);
+
+  using nsIContent::DispatchEvent;
+  MOZ_CAN_RUN_SCRIPT
+  static nsresult DispatchEvent(nsPresContext* aPresContext,
+                                WidgetEvent* aEvent, nsIContent* aTarget,
+                                bool aFullDispatch, nsEventStatus* aStatus);
+
+  bool IsDisplayContents() const {
+    return HasServoData() && Servo_Element_IsDisplayContents(this);
+  }
+
+  bool IsRendered() const { return GetPrimaryFrame() || IsDisplayContents(); }
+
+  const nsAttrValue* GetParsedAttr(const nsAtom* aAttr) const {
+    return mAttrs.GetAttr(aAttr);
+  }
+
+  const nsAttrValue* GetParsedAttr(const nsAtom* aAttr,
+                                   int32_t aNameSpaceID) const {
+    return mAttrs.GetAttr(aAttr, aNameSpaceID);
+  }
+
+  nsDOMAttributeMap* GetAttributeMap() {
+    nsDOMSlots* slots = GetExistingDOMSlots();
+
+    return slots ? slots->mAttributeMap.get() : nullptr;
+  }
+
+  void RecompileScriptEventListeners();
+
+  BorrowedAttrInfo GetAttrInfo(int32_t aNamespaceID,
+                               const nsAtom* aName) const {
+    NS_ASSERTION(aName, "must have attribute name");
+    NS_ASSERTION(aNamespaceID != kNameSpaceID_Unknown,
+                 "must have a real namespace ID!");
+
+    int32_t index = mAttrs.IndexOfAttr(aName, aNamespaceID);
+    if (index < 0) {
+      return BorrowedAttrInfo(nullptr, nullptr);
+    }
+
+    return mAttrs.AttrInfoAt(index);
+  }
+
+  static void ParseCORSValue(const nsAString& aValue, nsAttrValue& aResult);
+
+  static CORSMode StringToCORSMode(const nsAString& aValue);
+
+  static CORSMode AttrValueToCORSMode(const nsAttrValue* aValue);
+
+  nsINode* GetScopeChainParent() const override;
+
+  JSObject* WrapNode(JSContext*, JS::Handle<JSObject*> aGivenProto) override;
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY mozilla::TextEditor* GetTextEditorInternal();
+
+  void ClearEditContext();
+
+  bool GetBoolAttr(nsAtom* aAttr) const { return HasAttr(aAttr); }
+
+  nsresult SetBoolAttr(nsAtom* aAttr, bool aValue);
+
+  void GetEnumAttr(nsAtom* aAttr, const char* aDefault,
+                   nsAString& aResult) const;
+
+  void GetEnumAttr(nsAtom* aAttr, const char* aDefaultMissing,
+                   const char* aDefaultInvalid, nsAString& aResult) const;
+
+  void UnsetAttr(nsAtom* aAttr, ErrorResult& aError) {
+    aError = UnsetAttr(kNameSpaceID_None, aAttr, true);
+  }
+
+  void SetAttr(nsAtom* aAttr, const nsAString& aValue, ErrorResult& aError) {
+    aError = SetAttr(kNameSpaceID_None, aAttr, aValue, true);
+  }
+
+  void SetAttr(nsAtom* aAttr, const nsAString& aValue,
+               nsIPrincipal* aTriggeringPrincipal, ErrorResult& aError) {
+    aError =
+        SetAttr(kNameSpaceID_None, aAttr, aValue, aTriggeringPrincipal, true);
+  }
+
+  void ReserveAttributeCount(uint32_t aAttributeCount);
+
+  void SetParserHadDuplicateAttributeError() {
+    SetFlags(ELEMENT_PARSER_HAD_DUPLICATE_ATTR_ERROR);
+  }
+
+  void SetOrRemoveNullableStringAttr(nsAtom* aName, const nsAString& aValue,
+                                     ErrorResult& aError);
+
+  float FontSizeInflation();
+
+  void GetImplementedPseudoElement(nsAString&) const;
+
+  Element* GetPseudoElement(const PseudoStyleRequest&) const;
+
+  ReferrerPolicy GetReferrerPolicyAsEnum() const;
+  ReferrerPolicy ReferrerPolicyFromAttr(const nsAttrValue* aValue) const;
+
+  already_AddRefed<nsDOMStringMap> Dataset();
+  void ClearDataset();
+
+  already_AddRefed<nsIDOMXULButtonElement> AsXULButton();
+  already_AddRefed<nsIDOMXULContainerElement> AsXULContainer();
+  already_AddRefed<nsIDOMXULContainerItemElement> AsXULContainerItem();
+  already_AddRefed<nsIDOMXULControlElement> AsXULControl();
+  already_AddRefed<nsIDOMXULMenuListElement> AsXULMenuList();
+  already_AddRefed<nsIDOMXULMultiSelectControlElement>
+  AsXULMultiSelectControl();
+  already_AddRefed<nsIDOMXULRadioGroupElement> AsXULRadioGroup();
+  already_AddRefed<nsIDOMXULRelatedElement> AsXULRelated();
+  already_AddRefed<nsIDOMXULSelectControlElement> AsXULSelectControl();
+  already_AddRefed<nsIDOMXULSelectControlItemElement> AsXULSelectControlItem();
+  already_AddRefed<nsIBrowser> AsBrowser();
+  already_AddRefed<nsIAutoCompletePopup> AsAutoCompletePopup();
+
+  enum PresContextFor { eForComposedDoc, eForUncomposedDoc };
+  nsPresContext* GetPresContext(PresContextFor aFor) const;
+
+  MOZ_CAN_RUN_SCRIPT
+  virtual Result<bool, nsresult> PerformAccesskey(bool aKeyCausesActivation,
+                                                  bool aIsTrustedEvent) {
+    return Err(NS_ERROR_NOT_IMPLEMENTED);
+  }
+
+ protected:
+  static const DOMTokenListSupportedToken sAnchorAndFormRelValues[];
+
+  static const bool kNotifyDocumentObservers = true;
+  static const bool kDontNotifyDocumentObservers = false;
+  static const bool kCallAfterSetAttr = true;
+  static const bool kDontCallAfterSetAttr = false;
+
+  static const DOMTokenListSupportedToken sSupportedBlockingValues[];
+
+  template <typename ParseFunc>
+  nsresult SetAttrInternal(int32_t aNamespaceID, nsAtom* aName, nsAtom* aPrefix,
+                           const nsAttrValueOrString& aValueForComparison,
+                           nsIPrincipal* aSubjectPrincipal, bool aNotify,
+                           ParseFunc&& aParseFn, IsKnownNewAttr aIsKnownNew);
+
+  nsresult SetAttrAndNotify(int32_t aNamespaceID, nsAtom* aName,
+                            nsAtom* aPrefix, const nsAttrValue* aOldValue,
+                            nsAttrValue& aParsedValue,
+                            nsIPrincipal* aSubjectPrincipal,
+                            AttrModType aModType, bool aNotify,
+                            bool aCallAfterSetAttr, Document* aComposedDocument,
+                            const mozAutoDocUpdate& aGuard,
+                            IsKnownNewAttr aIsKnownNew);
+
+  virtual bool ParseAttribute(int32_t aNamespaceID, nsAtom* aAttribute,
+                              const nsAString& aValue,
+                              nsIPrincipal* aMaybeScriptedPrincipal,
+                              nsAttrValue& aResult);
+
+  virtual void BeforeSetAttr(int32_t aNamespaceID, nsAtom* aName,
+                             const nsAttrValue* aValue, bool aNotify);
+
+  virtual void AfterSetAttr(int32_t aNamespaceID, nsAtom* aName,
+                            const nsAttrValue* aValue,
+                            const nsAttrValue* aOldValue,
+                            nsIPrincipal* aMaybeScriptedPrincipal,
+                            bool aNotify);
+
+  void PreIdMaybeChange(const nsAttrValue* aValue);
+  void PostIdMaybeChange(const nsAttrValue* aValue);
+  virtual void OnAttrSetButNotChanged(int32_t aNamespaceID, nsAtom* aName,
+                                      const nsAttrValueOrString& aValue,
+                                      bool aNotify);
+
+  virtual EventListenerManager* GetEventListenerManagerForAttr(
+      nsAtom* aAttrName, bool* aDefer);
+
+  const nsAttrName* InternalGetAttrNameFromQName(
+      const nsAString& aStr, nsAutoString* aNameToUse = nullptr,
+      RefPtr<nsAtom>* aOutAtom = nullptr) const;
+
+  virtual Element* GetNameSpaceElement() override { return this; }
+
+  Attr* GetAttributeNodeNSInternal(const nsAString& aNamespaceURI,
+                                   const nsAString& aLocalName);
+
+  inline void RegisterActivityObserver();
+  inline void UnregisterActivityObserver();
+
+  void AddToIdTable(nsAtom* aId);
+  void RemoveFromIdTable();
+
+
+  bool CheckHandleEventForLinksPrecondition(EventChainVisitor& aVisitor) const;
+
+  void GetEventTargetParentForLinks(EventChainPreVisitor& aVisitor);
+
+  void DispatchChromeOnlyLinkClickEvent(EventChainPostVisitor& aVisitor);
+
+  MOZ_CAN_RUN_SCRIPT
+  nsresult PostHandleEventForLinks(EventChainPostVisitor& aVisitor);
+
+  mozilla::dom::FetchPriority GetFetchPriority() const;
+
+  static void ParseFetchPriority(const nsAString& aValue, nsAttrValue& aResult);
+
+ public:
+  bool IsLink() const {
+    return mState.HasAtLeastOneOfStates(ElementState::VISITED |
+                                        ElementState::UNVISITED);
+  }
+
+  virtual already_AddRefed<nsIURI> GetHrefURI() const { return nullptr; }
+
+  static void SanitizeLinkOrFormTarget(nsAString& aTarget);
+
+  void GetLinkTarget(nsAString& aTarget);
+
+  virtual void GetLinkTargetImpl(nsAString& aTarget);
+
+  virtual bool Translate() const;
+
+  MOZ_CAN_RUN_SCRIPT
+  void FireBeforematchEvent(ErrorResult& aRv);
+
+  void PropagateBloomFilterToParents();
+  void UpdateSubtreeBloomFilterForClass(const nsAttrValue* aClassValue);
+  void UpdateSubtreeBloomFilterForAttribute(nsAtom* aAttribute);
+  uint64_t GetSubtreeBloomFilter() const {
+    return mAttrs.GetSubtreeBloomFilter();
+  }
+#ifdef DEBUG
+  void VerifySubtreeBloomFilter() const;
+#endif
+
+ protected:
+  nsresult CopyInnerTo(Element* aDest);
+
+  virtual nsAtom* GetEventNameForAttr(nsAtom* aAttr);
+
+  virtual void RegUnRegAccessKey(bool aDoReg);
+
+  void IsElement() = delete;
+  void AsElement() = delete;
+
+ private:
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+  void AssertInvariantsOnNodeInfoChange();
+#endif
+
+  const nsAttrValue* GetSVGAnimatedClass() const;
+
+  MOZ_CAN_RUN_SCRIPT nsRect GetClientAreaRect();
+
+  MOZ_CAN_RUN_SCRIPT nsSize GetScrollSize();
+  MOZ_CAN_RUN_SCRIPT nsPoint GetScrollOrigin();
+  MOZ_CAN_RUN_SCRIPT nsRect GetScrollRange();
+
+  template <class T>
+  void GetCustomInterface(nsGetterAddRefs<T> aResult);
+
+  ElementState mState;
+  mozilla::RustCell<ServoNodeData*> mServoData;
+
+ protected:
+  AttrArray mAttrs;
+};
+
+inline bool Element::HasNonEmptyAttr(int32_t aNameSpaceID,
+                                     const nsAtom* aName) const {
+  MOZ_ASSERT(aNameSpaceID > kNameSpaceID_Unknown, "Must have namespace");
+  MOZ_ASSERT(aName, "Must have attribute name");
+
+  const nsAttrValue* val = mAttrs.GetAttr(aName, aNameSpaceID);
+  return val && !val->IsEmptyString();
+}
+
+inline bool Element::AttrValueIs(int32_t aNameSpaceID, const nsAtom* aName,
+                                 const nsAString& aValue,
+                                 nsCaseTreatment aCaseSensitive) const {
+  return mAttrs.AttrValueIs(aNameSpaceID, aName, aValue, aCaseSensitive);
+}
+
+inline bool Element::AttrValueIs(int32_t aNameSpaceID, const nsAtom* aName,
+                                 const nsAtom* aValue,
+                                 nsCaseTreatment aCaseSensitive) const {
+  return mAttrs.AttrValueIs(aNameSpaceID, aName, aValue, aCaseSensitive);
+}
+
+}  
+}  
+
+NON_VIRTUAL_ADDREF_RELEASE(mozilla::dom::Element)
+
+inline mozilla::dom::Element* nsINode::AsElement() {
+  MOZ_ASSERT(IsElement());
+  return static_cast<mozilla::dom::Element*>(this);
+}
+
+inline const mozilla::dom::Element* nsINode::AsElement() const {
+  MOZ_ASSERT(IsElement());
+  return static_cast<const mozilla::dom::Element*>(this);
+}
+
+inline mozilla::dom::Element* nsINode::GetParentElement() const {
+  return mozilla::dom::Element::FromNodeOrNull(mParent);
+}
+
+inline mozilla::dom::Element* nsINode::GetPreviousElementSibling() const {
+  auto* parent = GetParentNode();
+  if (!parent || !parent->HasFlag(NODE_MAY_HAVE_ELEMENT_CHILDREN)) {
+    return nullptr;
+  }
+  nsIContent* previousSibling = GetPreviousSibling();
+  while (previousSibling) {
+    if (previousSibling->IsElement()) {
+      return previousSibling->AsElement();
+    }
+    previousSibling = previousSibling->GetPreviousSibling();
+  }
+
+  return nullptr;
+}
+
+inline mozilla::dom::ShadowRoot* nsINode::GetShadowRoot() const {
+  return IsElement() ? AsElement()->GetShadowRoot() : nullptr;
+}
+
+inline mozilla::dom::Element* nsINode::GetAsElementOrParentElement() const {
+  return IsElement() ? const_cast<mozilla::dom::Element*>(AsElement())
+                     : GetParentElement();
+}
+
+inline mozilla::dom::Element* nsINode::GetNextElementSibling() const {
+  auto* parent = GetParentNode();
+  if (!parent || !parent->HasFlag(NODE_MAY_HAVE_ELEMENT_CHILDREN)) {
+    return nullptr;
+  }
+  nsIContent* nextSibling = GetNextSibling();
+  while (nextSibling) {
+    if (nextSibling->IsElement()) {
+      return nextSibling->AsElement();
+    }
+    nextSibling = nextSibling->GetNextSibling();
+  }
+
+  return nullptr;
+}
+
+#define NS_IMPL_ELEMENT_CLONE(_elementName, ...)                    \
+  nsresult _elementName::Clone(mozilla::dom::NodeInfo* aNodeInfo,   \
+                               nsINode** aResult) const {           \
+    *aResult = nullptr;                                             \
+    RefPtr<_elementName> it = new (aNodeInfo->NodeInfoManager())    \
+        _elementName(do_AddRef(aNodeInfo), ##__VA_ARGS__);          \
+    nsresult rv = const_cast<_elementName*>(this)->CopyInnerTo(it); \
+    if (NS_SUCCEEDED(rv)) {                                         \
+      it.forget(aResult);                                           \
+    }                                                               \
+    return rv;                                                      \
+  }
+
+#define NS_IMPL_ELEMENT_CLONE_WITH_INIT(_elementName, ...)           \
+  nsresult _elementName::Clone(mozilla::dom::NodeInfo* aNodeInfo,    \
+                               nsINode** aResult) const {            \
+    *aResult = nullptr;                                              \
+    RefPtr<_elementName> it = new (aNodeInfo->NodeInfoManager())     \
+        _elementName(do_AddRef(aNodeInfo), ##__VA_ARGS__);           \
+    nsresult rv = it->Init();                                        \
+    nsresult rv2 = const_cast<_elementName*>(this)->CopyInnerTo(it); \
+    if (NS_FAILED(rv2)) {                                            \
+      rv = rv2;                                                      \
+    }                                                                \
+    if (NS_SUCCEEDED(rv)) {                                          \
+      it.forget(aResult);                                            \
+    }                                                                \
+    return rv;                                                       \
+  }
+
+#define NS_IMPL_ELEMENT_CLONE_WITH_INIT_AND_PARSER(_elementName) \
+  NS_IMPL_ELEMENT_CLONE_WITH_INIT(_elementName, NOT_FROM_PARSER)
+
+#endif  // mozilla_dom_Element_h_

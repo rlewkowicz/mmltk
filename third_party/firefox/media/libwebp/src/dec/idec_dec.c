@@ -1,0 +1,840 @@
+// Copyright 2011 Google Inc. All Rights Reserved.
+// Use of this source code is governed by a BSD-style license
+
+#include <assert.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "src/dec/alphai_dec.h"
+#include "src/dec/vp8_dec.h"
+#include "src/dec/vp8i_dec.h"
+#include "src/dec/vp8li_dec.h"
+#include "src/dec/webpi_dec.h"
+#include "src/utils/bit_reader_utils.h"
+#include "src/utils/thread_utils.h"
+#include "src/utils/utils.h"
+#include "src/webp/decode.h"
+#include "src/webp/format_constants.h"
+#include "src/webp/types.h"
+
+#define CHUNK_SIZE 4096
+#define MAX_MB_SIZE 4096
+
+
+typedef enum {
+  STATE_WEBP_HEADER,  
+  STATE_VP8_HEADER,   
+  STATE_VP8_PARTS0,
+  STATE_VP8_DATA,
+  STATE_VP8L_HEADER,
+  STATE_VP8L_DATA,
+  STATE_DONE,
+  STATE_ERROR
+} DecState;
+
+typedef enum {
+  MEM_MODE_NONE = 0,
+  MEM_MODE_APPEND,
+  MEM_MODE_MAP
+} MemBufferMode;
+
+typedef struct {
+  MemBufferMode mode;  
+  size_t start;        
+  size_t end;          
+  size_t buf_size;     
+  uint8_t* buf;        
+
+  size_t part0_size;         
+  const uint8_t* part0_buf;  
+} MemBuffer;
+
+struct WebPIDecoder {
+  DecState state;         
+  WebPDecParams params;   
+  int is_lossless;        
+  void* dec;              
+  VP8Io io;
+
+  MemBuffer mem;          
+  WebPDecBuffer output;   
+  WebPDecBuffer* final_output;  
+  size_t chunk_size;      
+
+  int last_mb_y;          
+};
+
+typedef struct {
+  VP8MB left;
+  VP8MB info;
+  VP8BitReader token_br;
+} MBContext;
+
+
+static WEBP_INLINE size_t MemDataSize(const MemBuffer* mem) {
+  return (mem->end - mem->start);
+}
+
+static int NeedCompressedAlpha(const WebPIDecoder* const idec) {
+  if (idec->state == STATE_WEBP_HEADER) {
+    return 0;
+  }
+  if (idec->is_lossless) {
+    return 0;  
+  } else {
+    const VP8Decoder* const dec = (VP8Decoder*)idec->dec;
+    assert(dec != NULL);  
+    return (dec->alpha_data != NULL) && !dec->is_alpha_decoded;
+  }
+}
+
+static void DoRemap(WebPIDecoder* const idec, ptrdiff_t offset) {
+  MemBuffer* const mem = &idec->mem;
+  const uint8_t* const new_base = mem->buf + mem->start;
+  idec->io.data = new_base;
+  idec->io.data_size = MemDataSize(mem);
+
+  if (idec->dec != NULL) {
+    if (!idec->is_lossless) {
+      VP8Decoder* const dec = (VP8Decoder*)idec->dec;
+      const uint32_t last_part = dec->num_parts_minus_one;
+      if (offset != 0) {
+        uint32_t p;
+        for (p = 0; p <= last_part; ++p) {
+          VP8RemapBitReader(dec->parts + p, offset);
+        }
+        if (mem->mode == MEM_MODE_MAP) {
+          VP8RemapBitReader(&dec->br, offset);
+        }
+      }
+      {
+        const uint8_t* const last_start = dec->parts[last_part].buf;
+        if (last_start != NULL) {
+          VP8BitReaderSetBuffer(&dec->parts[last_part], last_start,
+                                mem->buf + mem->end - last_start);
+        }
+      }
+      if (NeedCompressedAlpha(idec)) {
+        ALPHDecoder* const alph_dec = dec->alph_dec;
+        dec->alpha_data += offset;
+        if (alph_dec != NULL && alph_dec->vp8l_dec != NULL) {
+          if (alph_dec->method == ALPHA_LOSSLESS_COMPRESSION) {
+            VP8LDecoder* const alph_vp8l_dec = alph_dec->vp8l_dec;
+            assert(dec->alpha_data_size >= ALPHA_HEADER_LEN);
+            VP8LBitReaderSetBuffer(&alph_vp8l_dec->br,
+                                   dec->alpha_data + ALPHA_HEADER_LEN,
+                                   dec->alpha_data_size - ALPHA_HEADER_LEN);
+          } else {  
+          }
+        }
+      }
+    } else {    
+      VP8LDecoder* const dec = (VP8LDecoder*)idec->dec;
+      VP8LBitReaderSetBuffer(&dec->br, new_base, MemDataSize(mem));
+    }
+  }
+}
+
+WEBP_NODISCARD static int AppendToMemBuffer(WebPIDecoder* const idec,
+                                            const uint8_t* const data,
+                                            size_t data_size) {
+  VP8Decoder* const dec = (VP8Decoder*)idec->dec;
+  MemBuffer* const mem = &idec->mem;
+  const int need_compressed_alpha = NeedCompressedAlpha(idec);
+  const uint8_t* const old_start =
+      (mem->buf == NULL) ? NULL : mem->buf + mem->start;
+  const uint8_t* const old_base =
+      need_compressed_alpha ? dec->alpha_data : old_start;
+  assert(mem->buf != NULL || mem->start == 0);
+  assert(mem->mode == MEM_MODE_APPEND);
+  if (data_size > MAX_CHUNK_PAYLOAD) {
+    return 0;
+  }
+
+  if (mem->end + data_size > mem->buf_size) {  
+    const size_t new_mem_start = old_start - old_base;
+    const size_t current_size = MemDataSize(mem) + new_mem_start;
+    const uint64_t new_size = (uint64_t)current_size + data_size;
+    const uint64_t extra_size = (new_size + CHUNK_SIZE - 1) & ~(CHUNK_SIZE - 1);
+    uint8_t* const new_buf =
+        (uint8_t*)WebPSafeMalloc(extra_size, sizeof(*new_buf));
+    if (new_buf == NULL) return 0;
+    if (old_base != NULL) memcpy(new_buf, old_base, current_size);
+    WebPSafeFree(mem->buf);
+    mem->buf = new_buf;
+    mem->buf_size = (size_t)extra_size;
+    mem->start = new_mem_start;
+    mem->end = current_size;
+  }
+
+  assert(mem->buf != NULL);
+  memcpy(mem->buf + mem->end, data, data_size);
+  mem->end += data_size;
+  assert(mem->end <= mem->buf_size);
+
+  DoRemap(idec, mem->buf + mem->start - old_start);
+  return 1;
+}
+
+WEBP_NODISCARD static int RemapMemBuffer(WebPIDecoder* const idec,
+                                         const uint8_t* const data,
+                                         size_t data_size) {
+  MemBuffer* const mem = &idec->mem;
+  const uint8_t* const old_buf = mem->buf;
+  const uint8_t* const old_start =
+      (old_buf == NULL) ? NULL : old_buf + mem->start;
+  assert(old_buf != NULL || mem->start == 0);
+  assert(mem->mode == MEM_MODE_MAP);
+
+  if (data_size < mem->buf_size) return 0;  
+
+  mem->buf = (uint8_t*)data;
+  mem->end = mem->buf_size = data_size;
+
+  DoRemap(idec, mem->buf + mem->start - old_start);
+  return 1;
+}
+
+static void InitMemBuffer(MemBuffer* const mem) {
+  mem->mode       = MEM_MODE_NONE;
+  mem->buf        = NULL;
+  mem->buf_size   = 0;
+  mem->part0_buf  = NULL;
+  mem->part0_size = 0;
+}
+
+static void ClearMemBuffer(MemBuffer* const mem) {
+  assert(mem);
+  if (mem->mode == MEM_MODE_APPEND) {
+    WebPSafeFree(mem->buf);
+    WebPSafeFree((void*)mem->part0_buf);
+  }
+}
+
+WEBP_NODISCARD static int CheckMemBufferMode(MemBuffer* const mem,
+                                             MemBufferMode expected) {
+  if (mem->mode == MEM_MODE_NONE) {
+    mem->mode = expected;    
+  } else if (mem->mode != expected) {
+    return 0;         
+  }
+  assert(mem->mode == expected);   
+  return 1;
+}
+
+WEBP_NODISCARD static VP8StatusCode FinishDecoding(WebPIDecoder* const idec) {
+  const WebPDecoderOptions* const options = idec->params.options;
+  WebPDecBuffer* const output = idec->params.output;
+
+  idec->state = STATE_DONE;
+  if (options != NULL && options->flip) {
+    const VP8StatusCode status = WebPFlipBuffer(output);
+    if (status != VP8_STATUS_OK) return status;
+  }
+  if (idec->final_output != NULL) {
+    const VP8StatusCode status = WebPCopyDecBufferPixels(
+        output, idec->final_output);  
+    WebPFreeDecBuffer(&idec->output);
+    if (status != VP8_STATUS_OK) return status;
+    *output = *idec->final_output;
+    idec->final_output = NULL;
+  }
+  return VP8_STATUS_OK;
+}
+
+
+static void SaveContext(const VP8Decoder* dec, const VP8BitReader* token_br,
+                        MBContext* const context) {
+  context->left = dec->mb_info[-1];
+  context->info = dec->mb_info[dec->mb_x];
+  context->token_br = *token_br;
+}
+
+static void RestoreContext(const MBContext* context, VP8Decoder* const dec,
+                           VP8BitReader* const token_br) {
+  dec->mb_info[-1] = context->left;
+  dec->mb_info[dec->mb_x] = context->info;
+  *token_br = context->token_br;
+}
+
+
+static VP8StatusCode IDecError(WebPIDecoder* const idec, VP8StatusCode error) {
+  if (idec->state == STATE_VP8_DATA) {
+    (void)VP8ExitCritical((VP8Decoder*)idec->dec, &idec->io);
+  }
+  idec->state = STATE_ERROR;
+  return error;
+}
+
+static void ChangeState(WebPIDecoder* const idec, DecState new_state,
+                        size_t consumed_bytes) {
+  MemBuffer* const mem = &idec->mem;
+  idec->state = new_state;
+  mem->start += consumed_bytes;
+  assert(mem->start <= mem->end);
+  idec->io.data = mem->buf + mem->start;
+  idec->io.data_size = MemDataSize(mem);
+}
+
+static VP8StatusCode DecodeWebPHeaders(WebPIDecoder* const idec) {
+  MemBuffer* const mem = &idec->mem;
+  const uint8_t* data = mem->buf + mem->start;
+  size_t curr_size = MemDataSize(mem);
+  VP8StatusCode status;
+  WebPHeaderStructure headers;
+
+  headers.data = data;
+  headers.data_size = curr_size;
+  headers.have_all_data = 0;
+  status = WebPParseHeaders(&headers);
+  if (status == VP8_STATUS_NOT_ENOUGH_DATA) {
+    return VP8_STATUS_SUSPENDED;  
+  } else if (status != VP8_STATUS_OK) {
+    return IDecError(idec, status);
+  }
+
+  idec->chunk_size = headers.compressed_size;
+  idec->is_lossless = headers.is_lossless;
+  if (!idec->is_lossless) {
+    VP8Decoder* const dec = VP8New();
+    if (dec == NULL) {
+      return VP8_STATUS_OUT_OF_MEMORY;
+    }
+    dec->incremental = 1;
+    idec->dec = dec;
+    dec->alpha_data = headers.alpha_data;
+    dec->alpha_data_size = headers.alpha_data_size;
+    ChangeState(idec, STATE_VP8_HEADER, headers.offset);
+  } else {
+    VP8LDecoder* const dec = VP8LNew();
+    if (dec == NULL) {
+      return VP8_STATUS_OUT_OF_MEMORY;
+    }
+    idec->dec = dec;
+    ChangeState(idec, STATE_VP8L_HEADER, headers.offset);
+  }
+  return VP8_STATUS_OK;
+}
+
+static VP8StatusCode DecodeVP8FrameHeader(WebPIDecoder* const idec) {
+  const uint8_t* data = idec->mem.buf + idec->mem.start;
+  const size_t curr_size = MemDataSize(&idec->mem);
+  int width, height;
+  uint32_t bits;
+
+  if (curr_size < VP8_FRAME_HEADER_SIZE) {
+    return VP8_STATUS_SUSPENDED;
+  }
+  if (!VP8GetInfo(data, curr_size, idec->chunk_size, &width, &height)) {
+    return IDecError(idec, VP8_STATUS_BITSTREAM_ERROR);
+  }
+
+  bits = data[0] | (data[1] << 8) | (data[2] << 16);
+  idec->mem.part0_size = (bits >> 5) + VP8_FRAME_HEADER_SIZE;
+
+  idec->io.data = data;
+  idec->io.data_size = curr_size;
+  idec->state = STATE_VP8_PARTS0;
+  return VP8_STATUS_OK;
+}
+
+static VP8StatusCode CopyParts0Data(WebPIDecoder* const idec) {
+  VP8Decoder* const dec = (VP8Decoder*)idec->dec;
+  VP8BitReader* const br = &dec->br;
+  const size_t part_size = br->buf_end - br->buf;
+  MemBuffer* const mem = &idec->mem;
+  assert(!idec->is_lossless);
+  assert(mem->part0_buf == NULL);
+  assert(part_size <= mem->part0_size);
+  if (part_size == 0) {   
+    return VP8_STATUS_BITSTREAM_ERROR;
+  }
+  if (mem->mode == MEM_MODE_APPEND) {
+    uint8_t* const part0_buf = (uint8_t*)WebPSafeMalloc(1ULL, part_size);
+    if (part0_buf == NULL) {
+      return VP8_STATUS_OUT_OF_MEMORY;
+    }
+    memcpy(part0_buf, br->buf, part_size);
+    mem->part0_buf = part0_buf;
+    VP8BitReaderSetBuffer(br, part0_buf, part_size);
+  } else {
+  }
+  mem->start += part_size;
+  return VP8_STATUS_OK;
+}
+
+static VP8StatusCode DecodePartition0(WebPIDecoder* const idec) {
+  VP8Decoder* const dec = (VP8Decoder*)idec->dec;
+  VP8Io* const io = &idec->io;
+  const WebPDecParams* const params = &idec->params;
+  WebPDecBuffer* const output = params->output;
+
+  if (MemDataSize(&idec->mem) < idec->mem.part0_size) {
+    return VP8_STATUS_SUSPENDED;
+  }
+
+  if (!VP8GetHeaders(dec, io)) {
+    const VP8StatusCode status = dec->status;
+    if (status == VP8_STATUS_SUSPENDED ||
+        status == VP8_STATUS_NOT_ENOUGH_DATA) {
+      return VP8_STATUS_SUSPENDED;
+    }
+    return IDecError(idec, status);
+  }
+
+  dec->status = WebPAllocateDecBuffer(io->width, io->height, params->options,
+                                      output);
+  if (dec->status != VP8_STATUS_OK) {
+    return IDecError(idec, dec->status);
+  }
+  dec->mt_method = VP8GetThreadMethod(params->options, NULL,
+                                      io->width, io->height);
+  VP8InitDithering(params->options, dec);
+
+  dec->status = CopyParts0Data(idec);
+  if (dec->status != VP8_STATUS_OK) {
+    return IDecError(idec, dec->status);
+  }
+
+  if (VP8EnterCritical(dec, io) != VP8_STATUS_OK) {
+    return IDecError(idec, dec->status);
+  }
+
+  idec->state = STATE_VP8_DATA;
+  if (!VP8InitFrame(dec, io)) {
+    return IDecError(idec, dec->status);
+  }
+  return VP8_STATUS_OK;
+}
+
+static VP8StatusCode DecodeRemaining(WebPIDecoder* const idec) {
+  VP8Decoder* const dec = (VP8Decoder*)idec->dec;
+  VP8Io* const io = &idec->io;
+
+  if (!dec->ready) {
+    return IDecError(idec, VP8_STATUS_BITSTREAM_ERROR);
+  }
+  for (; dec->mb_y < dec->mb_h; ++dec->mb_y) {
+    if (idec->last_mb_y != dec->mb_y) {
+      if (!VP8ParseIntraModeRow(&dec->br, dec)) {
+        return IDecError(idec, VP8_STATUS_BITSTREAM_ERROR);
+      }
+      idec->last_mb_y = dec->mb_y;
+    }
+    for (; dec->mb_x < dec->mb_w; ++dec->mb_x) {
+      VP8BitReader* const token_br =
+          &dec->parts[dec->mb_y & dec->num_parts_minus_one];
+      MBContext context;
+      SaveContext(dec, token_br, &context);
+      if (!VP8DecodeMB(dec, token_br)) {
+        if (dec->num_parts_minus_one == 0 &&
+            MemDataSize(&idec->mem) > MAX_MB_SIZE) {
+          return IDecError(idec, VP8_STATUS_BITSTREAM_ERROR);
+        }
+        if (dec->mt_method > 0) {
+          if (!WebPGetWorkerInterface()->Sync(&dec->worker)) {
+            return IDecError(idec, VP8_STATUS_BITSTREAM_ERROR);
+          }
+        }
+        RestoreContext(&context, dec, token_br);
+        return VP8_STATUS_SUSPENDED;
+      }
+      if (dec->num_parts_minus_one == 0) {
+        idec->mem.start = token_br->buf - idec->mem.buf;
+        assert(idec->mem.start <= idec->mem.end);
+      }
+    }
+    VP8InitScanline(dec);   
+
+    if (!VP8ProcessRow(dec, io)) {
+      return IDecError(idec, VP8_STATUS_USER_ABORT);
+    }
+  }
+  if (!VP8ExitCritical(dec, io)) {
+    idec->state = STATE_ERROR;  
+    return IDecError(idec, VP8_STATUS_USER_ABORT);
+  }
+  dec->ready = 0;
+  return FinishDecoding(idec);
+}
+
+static VP8StatusCode ErrorStatusLossless(WebPIDecoder* const idec,
+                                         VP8StatusCode status) {
+  if (status == VP8_STATUS_SUSPENDED || status == VP8_STATUS_NOT_ENOUGH_DATA) {
+    return VP8_STATUS_SUSPENDED;
+  }
+  return IDecError(idec, status);
+}
+
+static VP8StatusCode DecodeVP8LHeader(WebPIDecoder* const idec) {
+  VP8Io* const io = &idec->io;
+  VP8LDecoder* const dec = (VP8LDecoder*)idec->dec;
+  const WebPDecParams* const params = &idec->params;
+  WebPDecBuffer* const output = params->output;
+  size_t curr_size = MemDataSize(&idec->mem);
+  assert(idec->is_lossless);
+
+  if (curr_size < (idec->chunk_size >> 3)) {
+    dec->status = VP8_STATUS_SUSPENDED;
+    return ErrorStatusLossless(idec, dec->status);
+  }
+
+  if (!VP8LDecodeHeader(dec, io)) {
+    if (dec->status == VP8_STATUS_BITSTREAM_ERROR &&
+        curr_size < idec->chunk_size) {
+      dec->status = VP8_STATUS_SUSPENDED;
+    }
+    return ErrorStatusLossless(idec, dec->status);
+  }
+  dec->status = WebPAllocateDecBuffer(io->width, io->height, params->options,
+                                      output);
+  if (dec->status != VP8_STATUS_OK) {
+    return IDecError(idec, dec->status);
+  }
+
+  idec->state = STATE_VP8L_DATA;
+  return VP8_STATUS_OK;
+}
+
+static VP8StatusCode DecodeVP8LData(WebPIDecoder* const idec) {
+  VP8LDecoder* const dec = (VP8LDecoder*)idec->dec;
+  const size_t curr_size = MemDataSize(&idec->mem);
+  assert(idec->is_lossless);
+
+  dec->incremental = (curr_size < idec->chunk_size);
+
+  if (!VP8LDecodeImage(dec)) {
+    return ErrorStatusLossless(idec, dec->status);
+  }
+  assert(dec->status == VP8_STATUS_OK || dec->status == VP8_STATUS_SUSPENDED);
+  return (dec->status == VP8_STATUS_SUSPENDED) ? dec->status
+                                               : FinishDecoding(idec);
+}
+
+static VP8StatusCode IDecode(WebPIDecoder* idec) {
+  VP8StatusCode status = VP8_STATUS_SUSPENDED;
+
+  if (idec->state == STATE_WEBP_HEADER) {
+    status = DecodeWebPHeaders(idec);
+  } else {
+    if (idec->dec == NULL) {
+      return VP8_STATUS_SUSPENDED;    
+    }
+  }
+  if (idec->state == STATE_VP8_HEADER) {
+    status = DecodeVP8FrameHeader(idec);
+  }
+  if (idec->state == STATE_VP8_PARTS0) {
+    status = DecodePartition0(idec);
+  }
+  if (idec->state == STATE_VP8_DATA) {
+    const VP8Decoder* const dec = (VP8Decoder*)idec->dec;
+    if (dec == NULL) {
+      return VP8_STATUS_SUSPENDED;  
+    }
+    status = DecodeRemaining(idec);
+  }
+  if (idec->state == STATE_VP8L_HEADER) {
+    status = DecodeVP8LHeader(idec);
+  }
+  if (idec->state == STATE_VP8L_DATA) {
+    status = DecodeVP8LData(idec);
+  }
+  return status;
+}
+
+
+WEBP_NODISCARD static WebPIDecoder* NewDecoder(
+    WebPDecBuffer* const output_buffer,
+    const WebPBitstreamFeatures* const features) {
+  WebPIDecoder* idec = (WebPIDecoder*)WebPSafeCalloc(1ULL, sizeof(*idec));
+  if (idec == NULL) {
+    return NULL;
+  }
+
+  idec->state = STATE_WEBP_HEADER;
+  idec->chunk_size = 0;
+
+  idec->last_mb_y = -1;
+
+  InitMemBuffer(&idec->mem);
+  if (!WebPInitDecBuffer(&idec->output) || !VP8InitIo(&idec->io)) {
+    WebPSafeFree(idec);
+    return NULL;
+  }
+
+  WebPResetDecParams(&idec->params);
+  if (output_buffer == NULL || WebPAvoidSlowMemory(output_buffer, features)) {
+    idec->params.output = &idec->output;
+    idec->final_output = output_buffer;
+    if (output_buffer != NULL) {
+      idec->params.output->colorspace = output_buffer->colorspace;
+    }
+  } else {
+    idec->params.output = output_buffer;
+    idec->final_output = NULL;
+  }
+  WebPInitCustomIo(&idec->params, &idec->io);  
+
+  return idec;
+}
+
+
+WebPIDecoder* WebPINewDecoder(WebPDecBuffer* output_buffer) {
+  return NewDecoder(output_buffer, NULL);
+}
+
+WebPIDecoder* WebPIDecode(const uint8_t* data, size_t data_size,
+                          WebPDecoderConfig* config) {
+  WebPIDecoder* idec;
+  WebPBitstreamFeatures tmp_features;
+  WebPBitstreamFeatures* const features =
+      (config == NULL) ? &tmp_features : &config->input;
+  memset(&tmp_features, 0, sizeof(tmp_features));
+
+  if (data != NULL && data_size > 0) {
+    if (WebPGetFeatures(data, data_size, features) != VP8_STATUS_OK) {
+      return NULL;
+    }
+  }
+
+  idec = (config != NULL) ? NewDecoder(&config->output, features)
+                          : NewDecoder(NULL, features);
+  if (idec == NULL) {
+    return NULL;
+  }
+  if (config != NULL) {
+    idec->params.options = &config->options;
+  }
+  return idec;
+}
+
+void WebPIDelete(WebPIDecoder* idec) {
+  if (idec == NULL) return;
+  if (idec->dec != NULL) {
+    if (!idec->is_lossless) {
+      if (idec->state == STATE_VP8_DATA) {
+        (void)VP8ExitCritical((VP8Decoder*)idec->dec, &idec->io);
+      }
+      VP8Delete((VP8Decoder*)idec->dec);
+    } else {
+      VP8LDelete((VP8LDecoder*)idec->dec);
+    }
+  }
+  ClearMemBuffer(&idec->mem);
+  WebPFreeDecBuffer(&idec->output);
+  WebPSafeFree(idec);
+}
+
+
+WebPIDecoder* WebPINewRGB(WEBP_CSP_MODE csp, uint8_t* output_buffer,
+                          size_t output_buffer_size, int output_stride) {
+  const int is_external_memory = (output_buffer != NULL) ? 1 : 0;
+  WebPIDecoder* idec;
+
+  if (csp >= MODE_YUV) return NULL;
+  if (is_external_memory == 0) {    
+    output_buffer_size = 0;
+    output_stride = 0;
+  } else {  
+    if (output_stride == 0 || output_buffer_size == 0) {
+      return NULL;   
+    }
+  }
+  idec = WebPINewDecoder(NULL);
+  if (idec == NULL) return NULL;
+  idec->output.colorspace = csp;
+  idec->output.is_external_memory = is_external_memory;
+  idec->output.u.RGBA.rgba = output_buffer;
+  idec->output.u.RGBA.stride = output_stride;
+  idec->output.u.RGBA.size = output_buffer_size;
+  return idec;
+}
+
+WebPIDecoder* WebPINewYUVA(uint8_t* luma, size_t luma_size, int luma_stride,
+                           uint8_t* u, size_t u_size, int u_stride,
+                           uint8_t* v, size_t v_size, int v_stride,
+                           uint8_t* a, size_t a_size, int a_stride) {
+  const int is_external_memory = (luma != NULL) ? 1 : 0;
+  WebPIDecoder* idec;
+  WEBP_CSP_MODE colorspace;
+
+  if (is_external_memory == 0) {    
+    luma_size = u_size = v_size = a_size = 0;
+    luma_stride = u_stride = v_stride = a_stride = 0;
+    u = v = a = NULL;
+    colorspace = MODE_YUVA;
+  } else {  
+    if (u == NULL || v == NULL) return NULL;
+    if (luma_size == 0 || u_size == 0 || v_size == 0) return NULL;
+    if (luma_stride == 0 || u_stride == 0 || v_stride == 0) return NULL;
+    if (a != NULL) {
+      if (a_size == 0 || a_stride == 0) return NULL;
+    }
+    colorspace = (a == NULL) ? MODE_YUV : MODE_YUVA;
+  }
+
+  idec = WebPINewDecoder(NULL);
+  if (idec == NULL) return NULL;
+
+  idec->output.colorspace = colorspace;
+  idec->output.is_external_memory = is_external_memory;
+  idec->output.u.YUVA.y = luma;
+  idec->output.u.YUVA.y_stride = luma_stride;
+  idec->output.u.YUVA.y_size = luma_size;
+  idec->output.u.YUVA.u = u;
+  idec->output.u.YUVA.u_stride = u_stride;
+  idec->output.u.YUVA.u_size = u_size;
+  idec->output.u.YUVA.v = v;
+  idec->output.u.YUVA.v_stride = v_stride;
+  idec->output.u.YUVA.v_size = v_size;
+  idec->output.u.YUVA.a = a;
+  idec->output.u.YUVA.a_stride = a_stride;
+  idec->output.u.YUVA.a_size = a_size;
+  return idec;
+}
+
+WebPIDecoder* WebPINewYUV(uint8_t* luma, size_t luma_size, int luma_stride,
+                          uint8_t* u, size_t u_size, int u_stride,
+                          uint8_t* v, size_t v_size, int v_stride) {
+  return WebPINewYUVA(luma, luma_size, luma_stride,
+                      u, u_size, u_stride,
+                      v, v_size, v_stride,
+                      NULL, 0, 0);
+}
+
+
+static VP8StatusCode IDecCheckStatus(const WebPIDecoder* const idec) {
+  assert(idec);
+  if (idec->state == STATE_ERROR) {
+    return VP8_STATUS_BITSTREAM_ERROR;
+  }
+  if (idec->state == STATE_DONE) {
+    return VP8_STATUS_OK;
+  }
+  return VP8_STATUS_SUSPENDED;
+}
+
+VP8StatusCode WebPIAppend(WebPIDecoder* idec,
+                          const uint8_t* data, size_t data_size) {
+  VP8StatusCode status;
+  if (idec == NULL || data == NULL) {
+    return VP8_STATUS_INVALID_PARAM;
+  }
+  status = IDecCheckStatus(idec);
+  if (status != VP8_STATUS_SUSPENDED) {
+    return status;
+  }
+  if (!CheckMemBufferMode(&idec->mem, MEM_MODE_APPEND)) {
+    return VP8_STATUS_INVALID_PARAM;
+  }
+  if (!AppendToMemBuffer(idec, data, data_size)) {
+    return VP8_STATUS_OUT_OF_MEMORY;
+  }
+  return IDecode(idec);
+}
+
+VP8StatusCode WebPIUpdate(WebPIDecoder* idec,
+                          const uint8_t* data, size_t data_size) {
+  VP8StatusCode status;
+  if (idec == NULL || data == NULL) {
+    return VP8_STATUS_INVALID_PARAM;
+  }
+  status = IDecCheckStatus(idec);
+  if (status != VP8_STATUS_SUSPENDED) {
+    return status;
+  }
+  if (!CheckMemBufferMode(&idec->mem, MEM_MODE_MAP)) {
+    return VP8_STATUS_INVALID_PARAM;
+  }
+  if (!RemapMemBuffer(idec, data, data_size)) {
+    return VP8_STATUS_INVALID_PARAM;
+  }
+  return IDecode(idec);
+}
+
+
+static const WebPDecBuffer* GetOutputBuffer(const WebPIDecoder* const idec) {
+  if (idec == NULL || idec->dec == NULL) {
+    return NULL;
+  }
+  if (idec->state <= STATE_VP8_PARTS0) {
+    return NULL;
+  }
+  if (idec->final_output != NULL) {
+    return NULL;   
+  }
+  return idec->params.output;
+}
+
+const WebPDecBuffer* WebPIDecodedArea(const WebPIDecoder* idec,
+                                      int* left, int* top,
+                                      int* width, int* height) {
+  const WebPDecBuffer* const src = GetOutputBuffer(idec);
+  if (left != NULL) *left = 0;
+  if (top != NULL) *top = 0;
+  if (src != NULL) {
+    if (width != NULL) *width = src->width;
+    if (height != NULL) *height = idec->params.last_y;
+  } else {
+    if (width != NULL) *width = 0;
+    if (height != NULL) *height = 0;
+  }
+  return src;
+}
+
+WEBP_NODISCARD uint8_t* WebPIDecGetRGB(const WebPIDecoder* idec, int* last_y,
+                                       int* width, int* height, int* stride) {
+  const WebPDecBuffer* const src = GetOutputBuffer(idec);
+  if (src == NULL) return NULL;
+  if (src->colorspace >= MODE_YUV) {
+    return NULL;
+  }
+
+  if (last_y != NULL) *last_y = idec->params.last_y;
+  if (width != NULL) *width = src->width;
+  if (height != NULL) *height = src->height;
+  if (stride != NULL) *stride = src->u.RGBA.stride;
+
+  return src->u.RGBA.rgba;
+}
+
+WEBP_NODISCARD uint8_t* WebPIDecGetYUVA(const WebPIDecoder* idec, int* last_y,
+                                        uint8_t** u, uint8_t** v, uint8_t** a,
+                                        int* width, int* height, int* stride,
+                                        int* uv_stride, int* a_stride) {
+  const WebPDecBuffer* const src = GetOutputBuffer(idec);
+  if (src == NULL) return NULL;
+  if (src->colorspace < MODE_YUV) {
+    return NULL;
+  }
+
+  if (last_y != NULL) *last_y = idec->params.last_y;
+  if (u != NULL) *u = src->u.YUVA.u;
+  if (v != NULL) *v = src->u.YUVA.v;
+  if (a != NULL) *a = src->u.YUVA.a;
+  if (width != NULL) *width = src->width;
+  if (height != NULL) *height = src->height;
+  if (stride != NULL) *stride = src->u.YUVA.y_stride;
+  if (uv_stride != NULL) *uv_stride = src->u.YUVA.u_stride;
+  if (a_stride != NULL) *a_stride = src->u.YUVA.a_stride;
+
+  return src->u.YUVA.y;
+}
+
+int WebPISetIOHooks(WebPIDecoder* const idec,
+                    VP8IoPutHook put,
+                    VP8IoSetupHook setup,
+                    VP8IoTeardownHook teardown,
+                    void* user_data) {
+  if (idec == NULL || idec->state > STATE_WEBP_HEADER) {
+    return 0;
+  }
+
+  idec->io.put = put;
+  idec->io.setup = setup;
+  idec->io.teardown = teardown;
+  idec->io.opaque = user_data;
+
+  return 1;
+}

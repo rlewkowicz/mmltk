@@ -1,0 +1,251 @@
+/*
+ * Copyright 2013 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+#include "src/core/SkMipmap.h"
+
+#include "include/core/SkBitmap.h"
+#include "include/core/SkColorSpace.h"
+#include "include/core/SkColorType.h"
+#include "include/core/SkTypes.h"
+#include "include/private/base/SkTo.h"
+#include "src/base/SkMathPriv.h"
+#include "src/core/SkImageInfoPriv.h"
+#include "src/core/SkMipmapBuilder.h"
+
+#include <new>
+
+
+
+SkMipmap::SkMipmap(void* malloc, size_t size) : SkCachedData(malloc, size) {}
+SkMipmap::SkMipmap(size_t size, SkDiscardableMemory* dm) : SkCachedData(size, dm) {}
+
+SkMipmap::~SkMipmap() = default;
+
+size_t SkMipmap::AllocLevelsSize(int levelCount, size_t pixelSize) {
+    if (levelCount < 0) {
+        return 0;
+    }
+    int64_t size = sk_64_mul(levelCount + 1, sizeof(Level)) + pixelSize;
+    if (!SkTFitsIn<int32_t>(size)) {
+        return 0;
+    }
+    return SkTo<int32_t>(size);
+}
+
+SkMipmap* SkMipmap::Build(const SkPixmap& src, SkDiscardableFactoryProc fact,
+                          bool computeContents) {
+    if (src.width() <= 1 && src.height() <= 1) {
+        return nullptr;
+    }
+
+    const SkColorType ct = src.colorType();
+    const SkAlphaType at = src.alphaType();
+
+    size_t size = 0;
+    int countLevels = ComputeLevelCount(src.width(), src.height());
+    for (int currentMipLevel = countLevels; currentMipLevel >= 0; currentMipLevel--) {
+        SkISize mipSize = ComputeLevelSize(src.width(), src.height(), currentMipLevel);
+        size += SkColorTypeMinRowBytes(ct, mipSize.fWidth) * mipSize.fHeight;
+    }
+
+    size_t storageSize = SkMipmap::AllocLevelsSize(countLevels, size);
+    if (0 == storageSize) {
+        return nullptr;
+    }
+
+    SkMipmap* mipmap;
+    if (fact) {
+        SkDiscardableMemory* dm = fact(storageSize);
+        if (nullptr == dm) {
+            return nullptr;
+        }
+        mipmap = new SkMipmap(storageSize, dm);
+    } else {
+        void* tmp = sk_malloc_canfail(storageSize);
+        if (!tmp) {
+            return nullptr;
+        }
+
+        mipmap = new SkMipmap(tmp, storageSize);
+    }
+
+    mipmap->fCS = sk_ref_sp(src.info().colorSpace());
+    mipmap->fCount = countLevels;
+    mipmap->fLevels = (Level*)mipmap->writable_data();
+    SkASSERT(mipmap->fLevels);
+
+    Level* levels = mipmap->fLevels;
+    uint8_t*    baseAddr = (uint8_t*)&levels[countLevels];
+    uint8_t*    addr = baseAddr;
+    int         width = src.width();
+    int         height = src.height();
+    uint32_t    rowBytes;
+    SkPixmap    srcPM(src);
+
+    SkASSERT(SkIsAlign8((uintptr_t)addr));
+
+    std::unique_ptr<SkMipmapDownSampler> downsampler;
+    if (computeContents) {
+        downsampler = MakeDownSampler(src);
+        if (!downsampler) {
+            delete mipmap;
+            return nullptr;
+        }
+    }
+
+    for (int i = 0; i < countLevels; ++i) {
+        width = std::max(1, width >> 1);
+        height = std::max(1, height >> 1);
+        rowBytes = SkToU32(SkColorTypeMinRowBytes(ct, width));
+
+        new (&levels[i].fPixmap) SkPixmap(SkImageInfo::Make(width, height, ct, at), addr, rowBytes);
+        levels[i].fScale  = SkSize::Make(SkIntToScalar(width)  / src.width(),
+                                         SkIntToScalar(height) / src.height());
+
+        const SkPixmap& dstPM = levels[i].fPixmap;
+        if (downsampler) {
+            downsampler->buildLevel(dstPM, srcPM);
+        }
+        srcPM = dstPM;
+        addr += height * rowBytes;
+    }
+    SkASSERT(addr == baseAddr + size);
+
+    SkASSERT(mipmap->fLevels);
+    return mipmap;
+}
+
+int SkMipmap::ComputeLevelCount(int baseWidth, int baseHeight) {
+    if (baseWidth < 1 || baseHeight < 1) {
+        return 0;
+    }
+
+
+    const int largestAxis = std::max(baseWidth, baseHeight);
+    if (largestAxis < 2) {
+        return 0;
+    }
+    const int leadingZeros = SkCLZ(static_cast<uint32_t>(largestAxis));
+    const int significantBits = (sizeof(uint32_t) * 8) - leadingZeros;
+    int mipLevelCount = significantBits;
+
+    if (mipLevelCount > 0) {
+        --mipLevelCount;
+    }
+
+    return mipLevelCount;
+}
+
+SkISize SkMipmap::ComputeLevelSize(int baseWidth, int baseHeight, int level) {
+    if (baseWidth < 1 || baseHeight < 1) {
+        return SkISize::Make(0, 0);
+    }
+
+    int maxLevelCount = ComputeLevelCount(baseWidth, baseHeight);
+    if (level >= maxLevelCount || level < 0) {
+        return SkISize::Make(0, 0);
+    }
+
+    int width = std::max(1, baseWidth >> (level + 1));
+    int height = std::max(1, baseHeight >> (level + 1));
+
+    return SkISize::Make(width, height);
+}
+
+
+float SkMipmap::ComputeLevel(SkSize scaleSize) {
+    SkASSERT(scaleSize.width() >= 0 && scaleSize.height() >= 0);
+
+#if !defined(SK_SUPPORT_LEGACY_ANISOTROPIC_MIPMAP_SCALE)
+    const float scale = std::min(scaleSize.width(), scaleSize.height());
+#else
+    const float scale = std::sqrt(scaleSize.width() * scaleSize.height());
+#endif
+
+    if (scale >= SK_Scalar1 || scale <= 0 || !SkIsFinite(scale)) {
+        return -1;
+    }
+
+    float L = std::max(-SkScalarLog2(scale) - 0.5f, 0.f);
+    if (!SkIsFinite(L)) {
+        return -1;
+    }
+    return L;
+}
+
+bool SkMipmap::extractLevel(SkSize scaleSize, Level* levelPtr) const {
+    if (nullptr == fLevels) {
+        return false;
+    }
+
+    float L = ComputeLevel(scaleSize);
+    int level = sk_float_round2int(L);
+    if (level <= 0) {
+        return false;
+    }
+
+    if (level > fCount) {
+        level = fCount;
+    }
+    if (levelPtr) {
+        *levelPtr = fLevels[level - 1];
+        levelPtr->fPixmap.setColorSpace(fCS);
+    }
+    return true;
+}
+
+bool SkMipmap::validForRootLevel(const SkImageInfo& root) const {
+    if (nullptr == fLevels) {
+        return false;
+    }
+
+    const SkISize dimension = root.dimensions();
+    if (dimension.width() <= 1 && dimension.height() <= 1) {
+        return false;
+    }
+
+    if (fLevels[0].fPixmap. width() != std::max(1, dimension. width() >> 1) ||
+        fLevels[0].fPixmap.height() != std::max(1, dimension.height() >> 1)) {
+        return false;
+    }
+
+    for (int i = 0; i < this->countLevels(); ++i) {
+        if (fLevels[i].fPixmap.colorType() != root.colorType() ||
+            fLevels[i].fPixmap.alphaType() != root.alphaType()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+SkMipmap* SkMipmap::Build(const SkBitmap& src, SkDiscardableFactoryProc fact) {
+    SkPixmap srcPixmap;
+    if (!src.peekPixels(&srcPixmap)) {
+        return nullptr;
+    }
+    return Build(srcPixmap, fact);
+}
+
+int SkMipmap::countLevels() const {
+    return fCount;
+}
+
+bool SkMipmap::getLevel(int index, Level* levelPtr) const {
+    if (nullptr == fLevels) {
+        return false;
+    }
+    if (index < 0) {
+        return false;
+    }
+    if (index > fCount - 1) {
+        return false;
+    }
+    if (levelPtr) {
+        *levelPtr = fLevels[index];
+        levelPtr->fPixmap.setColorSpace(fCS);
+    }
+    return true;
+}

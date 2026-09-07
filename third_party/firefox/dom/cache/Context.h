@@ -1,0 +1,164 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_cache_Context_h
+#define mozilla_dom_cache_Context_h
+
+#include "CacheCipherKeyManager.h"
+#include "mozilla/dom/SafeRefPtr.h"
+#include "mozilla/dom/cache/Types.h"
+#include "mozilla/dom/quota/ClientDirectoryLockHandle.h"
+#include "mozilla/dom/quota/StringifyUtils.h"
+#include "nsCOMPtr.h"
+#include "nsISupportsImpl.h"
+#include "nsProxyRelease.h"
+#include "nsString.h"
+#include "nsTArray.h"
+#include "nsTObserverArray.h"
+
+class nsIEventTarget;
+class nsIThread;
+
+namespace mozilla::dom {
+
+namespace quota {
+
+class ClientDirectoryLock;
+
+}  
+
+namespace cache {
+
+class Action;
+class Manager;
+
+class Context final : public SafeRefCounted<Context>, public Stringifyable {
+  using ClientDirectoryLock = mozilla::dom::quota::ClientDirectoryLock;
+  using ClientDirectoryLockHandle =
+      mozilla::dom::quota::ClientDirectoryLockHandle;
+
+ public:
+  class ThreadsafeHandle final : public AtomicSafeRefCounted<ThreadsafeHandle> {
+    friend class Context;
+
+   public:
+    explicit ThreadsafeHandle(SafeRefPtr<Context> aContext);
+    ~ThreadsafeHandle();
+
+    MOZ_DECLARE_REFCOUNTED_TYPENAME(cache::Context::ThreadsafeHandle)
+
+    void AllowToClose();
+    void InvalidateAndAllowToClose();
+
+   private:
+    void AllowToCloseOnOwningThread();
+    void InvalidateAndAllowToCloseOnOwningThread();
+
+    void ContextDestroyed(Context& aContext);
+
+    SafeRefPtr<Context> mStrongRef;
+
+    Context* mWeakRef;
+
+    nsCOMPtr<nsISerialEventTarget> mOwningEventTarget;
+  };
+
+  class Activity : public Stringifyable {
+   public:
+    virtual void Cancel() = 0;
+    virtual bool MatchesCacheId(CacheId aCacheId) const = 0;
+  };
+
+  static SafeRefPtr<Context> Create(SafeRefPtr<Manager> aManager,
+                                    nsISerialEventTarget* aTarget,
+                                    SafeRefPtr<Action> aInitAction,
+                                    Maybe<Context&> aOldContext);
+
+  void Dispatch(SafeRefPtr<Action> aAction);
+
+  Maybe<ClientDirectoryLock&> MaybeDirectoryLockRef() const;
+
+  CipherKeyManager& MutableCipherKeyManagerRef();
+
+  const Maybe<CacheDirectoryMetadata>& MaybeCacheDirectoryMetadataRef() const;
+
+  void CancelAll();
+
+  bool IsCanceled() const;
+
+  void Invalidate();
+
+  void AllowToClose();
+
+  void CancelForCacheId(CacheId aCacheId);
+
+  void AddActivity(Activity& aActivity);
+  void RemoveActivity(Activity& aActivity);
+
+  void NoteOrphanedData();
+
+ private:
+  class Data;
+  class QuotaInitRunnable;
+  class ActionRunnable;
+
+  enum State {
+    STATE_CONTEXT_PREINIT,
+    STATE_CONTEXT_INIT,
+    STATE_CONTEXT_READY,
+    STATE_CONTEXT_CANCELED
+  };
+
+  struct PendingAction {
+    nsCOMPtr<nsIEventTarget> mTarget;
+    SafeRefPtr<Action> mAction;
+  };
+
+  void Init(Maybe<Context&> aOldContext);
+  void Start();
+  void DispatchAction(SafeRefPtr<Action> aAction, bool aDoomData = false);
+  void OnQuotaInit(nsresult aRv,
+                   const Maybe<CacheDirectoryMetadata>& aDirectoryMetadata,
+                   ClientDirectoryLockHandle aDirectoryLockHandle,
+                   RefPtr<CipherKeyManager> aCipherKeyManager);
+
+  SafeRefPtr<ThreadsafeHandle> CreateThreadsafeHandle();
+
+  void SetNextContext(SafeRefPtr<Context> aNextContext);
+
+  void DoomTargetData();
+
+  void DoStringify(nsACString& aData) override;
+
+  SafeRefPtr<Manager> mManager;
+  nsCOMPtr<nsISerialEventTarget> mTarget;
+  RefPtr<Data> mData;
+  State mState;
+  bool mOrphanedData;
+  Maybe<CacheDirectoryMetadata> mDirectoryMetadata;
+  RefPtr<QuotaInitRunnable> mInitRunnable;
+  SafeRefPtr<Action> mInitAction;
+  nsTArray<PendingAction> mPendingActions;
+
+  nsTObserverArray<NotNull<Activity*>> mActivityList;
+
+  SafeRefPtr<ThreadsafeHandle> mThreadsafeHandle;
+
+  ClientDirectoryLockHandle mDirectoryLockHandle;
+  RefPtr<CipherKeyManager> mCipherKeyManager;
+  SafeRefPtr<Context> mNextContext;
+
+ public:
+  Context(SafeRefPtr<Manager> aManager, nsISerialEventTarget* aTarget,
+          SafeRefPtr<Action> aInitAction);
+  ~Context();
+
+  NS_DECL_OWNINGTHREAD
+  MOZ_DECLARE_REFCOUNTED_TYPENAME(cache::Context)
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_cache_Context_h

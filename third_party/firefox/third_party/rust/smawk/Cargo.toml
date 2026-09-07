@@ -1,0 +1,30 @@
+
+[package]
+edition = "2021"
+name = "smawk"
+version = "0.3.2"
+authors = ["Martin Geisler <martin@geisler.net>"]
+exclude = [
+    ".github/",
+    ".gitignore",
+    "benches/",
+    "examples/",
+]
+description = "Functions for finding row-minima in a totally monotone matrix."
+keywords = [
+    "smawk",
+    "matrix",
+    "optimization",
+    "dynamic-programming",
+]
+categories = [
+    "algorithms",
+    "mathematics",
+    "science",
+]
+license = "MIT"
+repository = "https://github.com/mgeisler/smawk"
+
+[dependencies.ndarray]
+version = "0.15.4"
+optional = true

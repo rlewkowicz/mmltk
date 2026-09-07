@@ -1,0 +1,4241 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+import { XPCOMUtils } from "resource://gre/modules/XPCOMUtils.sys.mjs";
+
+const lazy = {};
+
+ChromeUtils.defineESModuleGetters(lazy, {
+  CustomizableWidgets:
+    "moz-src:///browser/components/customizableui/CustomizableWidgets.sys.mjs",
+  PanelMultiView:
+    "moz-src:///browser/components/customizableui/PanelMultiView.sys.mjs",
+  PrivateBrowsingUtils: "resource://gre/modules/PrivateBrowsingUtils.sys.mjs",
+  ShortcutUtils: "resource://gre/modules/ShortcutUtils.sys.mjs",
+});
+
+ChromeUtils.defineLazyGetter(lazy, "gWidgetsBundle", function () {
+  const kUrl =
+    "chrome://browser/locale/customizableui/customizableWidgets.properties";
+  return Services.strings.createBundle(kUrl);
+});
+
+const kSpecialWidgetPfx = "customizableui-special-";
+
+const kPrefCustomizationState = "browser.uiCustomization.state";
+const kPrefCustomizationAutoAdd = "browser.uiCustomization.autoAdd";
+const kPrefCustomizationDebug = "browser.uiCustomization.debug";
+const kPrefDrawInTitlebar = "browser.tabs.inTitlebar";
+const kPrefUIDensity = "browser.uidensity";
+const kPrefAutoTouchMode = "browser.touchmode.auto";
+const kPrefAutoHideDownloadsButton = "browser.download.autohideButton";
+
+const kExpectedWindowURL = "chrome://browser/content/browser.xhtml";
+
+const kSubviewEvents = ["ViewShowing", "ViewHiding"];
+
+var kVersion = 25;
+
+var gPalette = new Map();
+
+var gAreas = new Map();
+
+var gPlacements = new Map();
+
+var gFuturePlacements = new Map();
+
+var gSupportedWidgetTypes = new Set([
+  "button",
+
+  "view",
+
+  "button-and-view",
+
+  "custom",
+]);
+
+var gPanelsForWindow = new WeakMap();
+
+var gSeenWidgets = new Set();
+
+var gDirtyAreaCache = new Set();
+
+var gPendingBuildAreas = new Map();
+
+var gSavedState = null;
+var gRestoring = false;
+var gDirty = false;
+var gInBatchStack = 0;
+var gResetting = false;
+var gUndoResetting = false;
+
+var gBuildAreas = new Map();
+
+var gBuildWindows = new Map();
+
+var gNewElementCount = 0;
+var gGroupWrapperCache = new Map();
+var gSingleWrapperCache = new WeakMap();
+var gListeners = new Set();
+
+var gUIStateBeforeReset = {
+  uiCustomizationState: null,
+  drawInTitlebar: null,
+  currentTheme: null,
+  uiDensity: null,
+  uiDensityHadUserValue: null,
+  autoTouchMode: null,
+};
+
+XPCOMUtils.defineLazyPreferenceGetter(
+  lazy,
+  "gDebuggingEnabled",
+  kPrefCustomizationDebug,
+  false,
+  (pref, oldVal, newVal) => {
+    if (typeof lazy.log != "undefined") {
+      lazy.log.maxLogLevel = newVal ? "all" : "log";
+    }
+  }
+);
+
+XPCOMUtils.defineLazyPreferenceGetter(
+  lazy,
+  "resetPBMToolbarButtonEnabled",
+  "browser.privatebrowsing.resetPBM.enabled",
+  false
+);
+
+ChromeUtils.defineLazyGetter(lazy, "log", () => {
+  let { ConsoleAPI } = ChromeUtils.importESModule(
+    "resource://gre/modules/Console.sys.mjs"
+  );
+  let consoleOptions = {
+    maxLogLevel: lazy.gDebuggingEnabled ? "all" : "log",
+    prefix: "CustomizableUI",
+  };
+  return new ConsoleAPI(consoleOptions);
+});
+
+var CustomizableUIInternal = {
+  initialize() {
+    lazy.log.debug("Initializing");
+
+    this.addListener(this);
+    this.defineBuiltInWidgets();
+    this.loadSavedState();
+    this.registerArea(
+      CustomizableUI.AREA_FIXED_OVERFLOW_PANEL,
+      {
+        type: CustomizableUI.TYPE_PANEL,
+        defaultPlacements: [],
+        anchor: "nav-bar-overflow-button",
+      },
+      true
+    );
+
+    let navbarPlacements = [
+      "back-button",
+      "forward-button",
+      "stop-reload-button",
+      "home-button",
+      "spring",
+      "urlbar-container",
+      "spring",
+      "downloads-button",
+      lazy.resetPBMToolbarButtonEnabled ? "reset-pbm-toolbar-button" : null,
+    ].filter(name => name);
+
+    this.registerArea(
+      CustomizableUI.AREA_NAVBAR,
+      {
+        type: CustomizableUI.TYPE_TOOLBAR,
+        overflowable: true,
+        defaultPlacements: navbarPlacements,
+        defaultCollapsed: false,
+      },
+      true
+    );
+
+    if (!Services.appinfo.nativeMenubar) {
+      this.registerArea(
+        CustomizableUI.AREA_MENUBAR,
+        {
+          type: CustomizableUI.TYPE_TOOLBAR,
+          defaultPlacements: ["menubar-items"],
+          defaultCollapsed: true,
+        },
+        true
+      );
+    }
+
+    this.registerArea(
+      CustomizableUI.AREA_TABSTRIP,
+      {
+        type: CustomizableUI.TYPE_TOOLBAR,
+        defaultPlacements: [
+          "tabbrowser-tabs",
+          "new-tab-button",
+          "alltabs-button",
+        ],
+        defaultCollapsed: null,
+      },
+      true
+    );
+
+    this.registerArea(
+      CustomizableUI.AREA_BOOKMARKS,
+      {
+        type: CustomizableUI.TYPE_TOOLBAR,
+        defaultPlacements: ["personal-bookmarks"],
+        defaultCollapsed: "newtab",
+      },
+      true
+    );
+    lazy.log.debug(`All the areas registered: ${[...gAreas.keys()]}`);
+
+    Services.obs.addObserver(this, "browser-set-toolbar-visibility");
+  },
+
+  get builtinAreas() {
+    return new Set([
+      ...this.builtinToolbars,
+      CustomizableUI.AREA_FIXED_OVERFLOW_PANEL,
+    ]);
+  },
+
+  get builtinToolbars() {
+    let toolbars = new Set([
+      CustomizableUI.AREA_NAVBAR,
+      CustomizableUI.AREA_BOOKMARKS,
+      CustomizableUI.AREA_TABSTRIP,
+    ]);
+    toolbars.add(CustomizableUI.AREA_MENUBAR);
+    return toolbars;
+  },
+
+  defineBuiltInWidgets() {
+    for (let widgetDefinition of lazy.CustomizableWidgets) {
+      this.createBuiltinWidget(widgetDefinition);
+    }
+  },
+
+  placeNewDefaultWidgetsInArea(aArea) {
+    let futurePlacedWidgets = gFuturePlacements.get(aArea);
+    let savedPlacements =
+      gSavedState && gSavedState.placements && gSavedState.placements[aArea];
+    let defaultPlacements = gAreas.get(aArea).get("defaultPlacements");
+    if (
+      !savedPlacements ||
+      !savedPlacements.length ||
+      !futurePlacedWidgets ||
+      !defaultPlacements ||
+      !defaultPlacements.length
+    ) {
+      return;
+    }
+    let defaultWidgetIndex = -1;
+
+    for (let widgetId of futurePlacedWidgets) {
+      let widget = gPalette.get(widgetId);
+      if (
+        !widget ||
+        widget.source !== CustomizableUI.SOURCE_BUILTIN ||
+        !widget.defaultArea ||
+        !(widget._introducedInVersion || widget._introducedByPref) ||
+        savedPlacements.includes(widget.id)
+      ) {
+        continue;
+      }
+      defaultWidgetIndex = defaultPlacements.indexOf(widget.id);
+      if (defaultWidgetIndex === -1) {
+        continue;
+      }
+      for (let i = defaultWidgetIndex; i >= 0; i--) {
+        if (i === 0 && i === defaultWidgetIndex) {
+          savedPlacements.splice(0, 0, widget.id);
+          futurePlacedWidgets.delete(widget.id);
+          gDirty = true;
+          break;
+        }
+        if (i) {
+          let previousWidget = defaultPlacements[i - 1];
+          let previousWidgetIndex = savedPlacements.indexOf(previousWidget);
+          if (previousWidgetIndex != -1) {
+            savedPlacements.splice(previousWidgetIndex + 1, 0, widget.id);
+            futurePlacedWidgets.delete(widget.id);
+            gDirty = true;
+            break;
+          }
+        }
+      }
+    }
+    this.saveState();
+  },
+
+  getCustomizationTarget(aElement) {
+    if (!aElement) {
+      return null;
+    }
+
+    if (
+      !aElement._customizationTarget &&
+      aElement.hasAttribute("customizable")
+    ) {
+      let id = aElement.getAttribute("customizationtarget");
+      if (id) {
+        aElement._customizationTarget =
+          aElement.ownerDocument.getElementById(id);
+      }
+
+      if (!aElement._customizationTarget) {
+        aElement._customizationTarget = aElement;
+      }
+    }
+
+    return aElement._customizationTarget;
+  },
+
+  wrapWidget(aWidgetId) {
+    if (gGroupWrapperCache.has(aWidgetId)) {
+      return gGroupWrapperCache.get(aWidgetId);
+    }
+
+    let provider = this.getWidgetProvider(aWidgetId);
+    if (!provider) {
+      return null;
+    }
+
+    if (provider == CustomizableUI.PROVIDER_API) {
+      let widget = gPalette.get(aWidgetId);
+      if (!widget.wrapper) {
+        widget.wrapper = new WidgetGroupWrapper(widget);
+        gGroupWrapperCache.set(aWidgetId, widget.wrapper);
+      }
+      return widget.wrapper;
+    }
+
+    let wrapper = new XULWidgetGroupWrapper(aWidgetId);
+    gGroupWrapperCache.set(aWidgetId, wrapper);
+    return wrapper;
+  },
+
+  registerArea(aName, aProperties, aInternalCaller) {
+    if (typeof aName != "string" || !/^[a-z0-9-_]{1,}$/i.test(aName)) {
+      throw new Error("Invalid area name");
+    }
+
+    let areaIsKnown = gAreas.has(aName);
+    let props = areaIsKnown ? gAreas.get(aName) : new Map();
+    const kImmutableProperties = new Set(["type", "overflowable"]);
+    for (let key in aProperties) {
+      if (
+        areaIsKnown &&
+        kImmutableProperties.has(key) &&
+        props.get(key) != aProperties[key]
+      ) {
+        throw new Error("An area cannot change the property for '" + key + "'");
+      }
+      props.set(key, aProperties[key]);
+    }
+    if (!props.has("type")) {
+      props.set("type", CustomizableUI.TYPE_TOOLBAR);
+    }
+    if (props.get("type") == CustomizableUI.TYPE_TOOLBAR) {
+      if (!aInternalCaller && aProperties.defaultCollapsed) {
+        throw new Error(
+          "defaultCollapsed is only allowed for default toolbars."
+        );
+      }
+      if (!props.has("defaultCollapsed")) {
+        props.set("defaultCollapsed", true);
+      }
+    } else if (props.has("defaultCollapsed")) {
+      throw new Error("defaultCollapsed only applies for TYPE_TOOLBAR areas.");
+    }
+    let allTypes = [CustomizableUI.TYPE_TOOLBAR, CustomizableUI.TYPE_PANEL];
+    if (!allTypes.includes(props.get("type"))) {
+      throw new Error("Invalid area type " + props.get("type"));
+    }
+
+    if (!props.has("defaultPlacements")) {
+      props.set("defaultPlacements", []);
+    }
+    if (!Array.isArray(props.get("defaultPlacements"))) {
+      throw new Error("Should provide an array of default placements");
+    }
+
+    if (!areaIsKnown) {
+      gAreas.set(aName, props);
+
+      this.placeNewDefaultWidgetsInArea(aName);
+
+      if (
+        props.get("type") == CustomizableUI.TYPE_TOOLBAR &&
+        !gPlacements.has(aName)
+      ) {
+        lazy.log.debug(
+          `registerArea ${aName}, no gPlacements yet, nothing to restore`
+        );
+        if (!gFuturePlacements.has(aName)) {
+          gFuturePlacements.set(aName, new Set());
+        }
+      } else {
+        this.restoreStateForArea(aName);
+      }
+
+      if (gPendingBuildAreas.has(aName)) {
+        let pendingNodes = gPendingBuildAreas.get(aName);
+        for (let pendingNode of pendingNodes) {
+          this.registerToolbarNode(pendingNode);
+        }
+        gPendingBuildAreas.delete(aName);
+      }
+    }
+  },
+
+  unregisterArea(aName, aDestroyPlacements) {
+    if (typeof aName != "string" || !/^[a-z0-9-_]{1,}$/i.test(aName)) {
+      throw new Error("Invalid area name");
+    }
+    if (!gAreas.has(aName) && !gPlacements.has(aName)) {
+      throw new Error("Area not registered");
+    }
+
+    this.beginBatchUpdate();
+    try {
+      let placements = gPlacements.get(aName);
+      if (placements) {
+        placements = [...placements];
+        placements.forEach(this.removeWidgetFromArea, this);
+      }
+
+      gAreas.delete(aName);
+      if (aDestroyPlacements) {
+        gPlacements.delete(aName);
+      } else {
+        gPlacements.set(aName, placements);
+      }
+      gFuturePlacements.delete(aName);
+      let existingAreaNodes = gBuildAreas.get(aName);
+      if (existingAreaNodes) {
+        for (let areaNode of existingAreaNodes) {
+          this.notifyListeners(
+            "onAreaNodeUnregistered",
+            aName,
+            this.getCustomizationTarget(areaNode),
+            CustomizableUI.REASON_AREA_UNREGISTERED
+          );
+        }
+      }
+      gBuildAreas.delete(aName);
+    } finally {
+      this.endBatchUpdate(true);
+    }
+  },
+
+  registerToolbarNode(aToolbar) {
+    let area = aToolbar.id;
+    if (gBuildAreas.has(area) && gBuildAreas.get(area).has(aToolbar)) {
+      return;
+    }
+    let areaProperties = gAreas.get(area);
+
+    if (!areaProperties) {
+      if (!gPendingBuildAreas.has(area)) {
+        gPendingBuildAreas.set(area, []);
+      }
+      gPendingBuildAreas.get(area).push(aToolbar);
+      return;
+    }
+
+    this.beginBatchUpdate();
+    try {
+      let placements = gPlacements.get(area);
+      if (
+        !placements &&
+        areaProperties.get("type") == CustomizableUI.TYPE_TOOLBAR
+      ) {
+        this.restoreStateForArea(area);
+        placements = gPlacements.get(area);
+      }
+
+      let defaultPlacements = areaProperties.get("defaultPlacements");
+      if (
+        !this.builtinToolbars.has(area) ||
+        placements.length != defaultPlacements.length ||
+        !placements.every((id, i) => id == defaultPlacements[i])
+      ) {
+        gDirtyAreaCache.add(area);
+      }
+
+      if (areaProperties.get("overflowable")) {
+        aToolbar.overflowable = new OverflowableToolbar(aToolbar);
+      }
+
+      this.registerBuildArea(area, aToolbar);
+
+      if (
+        gDirtyAreaCache.has(area) ||
+        placements.some(id => gPalette.has(id))
+      ) {
+        this.buildArea(area, placements, aToolbar);
+      } else {
+        let specials = placements.filter(p => this.isSpecialWidget(p));
+        if (specials.length) {
+          this.updateSpecialsForBuiltinToolbar(aToolbar, specials);
+        }
+      }
+      this.notifyListeners(
+        "onAreaNodeRegistered",
+        area,
+        this.getCustomizationTarget(aToolbar)
+      );
+    } finally {
+      lazy.log.debug(
+        `registerToolbarNode for ${area}, tabstripAreasReady? ${this.tabstripAreasReady}`
+      );
+      this.endBatchUpdate();
+    }
+  },
+
+  updateSpecialsForBuiltinToolbar(aToolbar, aSpecialIDs) {
+    let { children } = this.getCustomizationTarget(aToolbar);
+    for (let kid of children) {
+      if (
+        this.matchingSpecials(aSpecialIDs[0], kid) &&
+        kid.getAttribute("skipintoolbarset") != "true"
+      ) {
+        kid.id = aSpecialIDs.shift();
+      }
+      if (!aSpecialIDs.length) {
+        return;
+      }
+    }
+  },
+
+  buildArea(aAreaId, aPlacements, aAreaNode) {
+    let document = aAreaNode.ownerDocument;
+    let window = document.defaultView;
+    let inPrivateWindow = lazy.PrivateBrowsingUtils.isWindowPrivate(window);
+    let container = this.getCustomizationTarget(aAreaNode);
+    let areaIsPanel =
+      gAreas.get(aAreaId).get("type") == CustomizableUI.TYPE_PANEL;
+
+    if (!container) {
+      throw new Error(
+        "Expected area " + aAreaId + " to have a customizationTarget attribute."
+      );
+    }
+
+    if (aAreaId == CustomizableUI.AREA_NAVBAR) {
+      aAreaNode.collapsed = false;
+    }
+
+    this.beginBatchUpdate();
+
+    try {
+      let currentNode = container.firstElementChild;
+      let placementsToRemove = new Set();
+      for (let id of aPlacements) {
+        while (
+          currentNode &&
+          currentNode.getAttribute("skipintoolbarset") == "true"
+        ) {
+          currentNode = currentNode.nextElementSibling;
+        }
+
+        if (
+          currentNode &&
+          (!currentNode.id || CustomizableUI.isSpecialWidget(currentNode)) &&
+          this.matchingSpecials(id, currentNode)
+        ) {
+          currentNode.id = id;
+        }
+        if (currentNode && currentNode.id == id) {
+          currentNode = currentNode.nextElementSibling;
+          continue;
+        }
+
+        if (this.isSpecialWidget(id) && areaIsPanel) {
+          placementsToRemove.add(id);
+          continue;
+        }
+
+        let [provider, node] = this.getWidgetNode(id, window);
+        if (!node) {
+          lazy.log.debug("Unknown widget: " + id);
+          continue;
+        }
+
+        let widget = null;
+        if (provider == CustomizableUI.PROVIDER_API) {
+          widget = gPalette.get(id);
+          if (!widget.removable && aAreaId != widget.defaultArea) {
+            placementsToRemove.add(id);
+            continue;
+          }
+        } else if (
+          provider == CustomizableUI.PROVIDER_XUL &&
+          !this.isWidgetRemovable(node) &&
+          node.parentNode != container &&
+          !aAreaNode.overflowable?.isInOverflowList(node)
+        ) {
+          placementsToRemove.add(id);
+          continue;
+        } 
+
+        if (inPrivateWindow && widget && !widget.showInPrivateBrowsing) {
+          continue;
+        }
+
+        if (!inPrivateWindow && widget?.hideInNonPrivateBrowsing) {
+          continue;
+        }
+
+        this.ensureButtonContextMenu(node, aAreaNode);
+
+        if (widget) {
+          widget.currentArea = aAreaId;
+        }
+        this.insertWidgetBefore(node, currentNode, container, aAreaId);
+        if (gResetting) {
+          this.notifyListeners("onWidgetReset", node, container);
+        } else if (gUndoResetting) {
+          this.notifyListeners("onWidgetUndoMove", node, container);
+        }
+      }
+
+      if (currentNode) {
+        let palette = window.gNavToolbox ? window.gNavToolbox.palette : null;
+        let limit = currentNode.previousElementSibling;
+        let node = container.lastElementChild;
+        while (node && node != limit) {
+          let previousSibling = node.previousElementSibling;
+          if (
+            (node.id || this.isSpecialWidget(node)) &&
+            node.getAttribute("skipintoolbarset") != "true"
+          ) {
+            if (this.isWidgetRemovable(node)) {
+              if (node.id && (gResetting || gUndoResetting)) {
+                let widget = gPalette.get(node.id);
+                if (widget) {
+                  widget.currentArea = null;
+                }
+              }
+              this.notifyDOMChange(node, null, container, true, () => {
+                if (palette && !this.isSpecialWidget(node.id)) {
+                  palette.appendChild(node);
+                  this.removeLocationAttributes(node);
+                } else {
+                  container.removeChild(node);
+                }
+              });
+            } else {
+              node.setAttribute("removable", false);
+              lazy.log.debug(
+                "Adding non-removable widget to placements of " +
+                  aAreaId +
+                  ": " +
+                  node.id
+              );
+              gPlacements.get(aAreaId).push(node.id);
+              gDirty = true;
+            }
+          }
+          node = previousSibling;
+        }
+      }
+
+      if (placementsToRemove.size) {
+        let placementAry = gPlacements.get(aAreaId);
+        for (let id of placementsToRemove) {
+          let index = placementAry.indexOf(id);
+          placementAry.splice(index, 1);
+        }
+      }
+
+      if (gResetting) {
+        this.notifyListeners("onAreaReset", aAreaId, container);
+      }
+    } finally {
+      this.endBatchUpdate();
+    }
+  },
+
+  addPanelCloseListeners(aPanel) {
+    aPanel.addEventListener("click", this, { mozSystemGroup: true });
+    aPanel.addEventListener("keypress", this, { mozSystemGroup: true });
+    let win = aPanel.documentGlobal;
+    if (!gPanelsForWindow.has(win)) {
+      gPanelsForWindow.set(win, new Set());
+    }
+    gPanelsForWindow.get(win).add(this._getPanelForNode(aPanel));
+  },
+
+  removePanelCloseListeners(aPanel) {
+    aPanel.removeEventListener("click", this, { mozSystemGroup: true });
+    aPanel.removeEventListener("keypress", this, { mozSystemGroup: true });
+    let win = aPanel.documentGlobal;
+    let panels = gPanelsForWindow.get(win);
+    if (panels) {
+      panels.delete(this._getPanelForNode(aPanel));
+    }
+  },
+
+  ensureButtonContextMenu(aNode, aAreaNode, forcePanel) {
+    const kPanelItemContextMenu = "customizationPanelItemContextMenu";
+
+    let currentContextMenu =
+      aNode.getAttribute("context") || aNode.getAttribute("contextmenu");
+    let contextMenuForPlace =
+      forcePanel || "panel" == CustomizableUI.getPlaceForItem(aAreaNode)
+        ? kPanelItemContextMenu
+        : null;
+    if (contextMenuForPlace && !currentContextMenu) {
+      aNode.setAttribute("context", contextMenuForPlace);
+    } else if (
+      currentContextMenu == kPanelItemContextMenu &&
+      contextMenuForPlace != kPanelItemContextMenu
+    ) {
+      aNode.removeAttribute("context");
+      aNode.removeAttribute("contextmenu");
+    }
+  },
+
+  getWidgetProvider(aWidgetId) {
+    if (this.isSpecialWidget(aWidgetId)) {
+      return CustomizableUI.PROVIDER_SPECIAL;
+    }
+    if (gPalette.has(aWidgetId)) {
+      return CustomizableUI.PROVIDER_API;
+    }
+    if (gSeenWidgets.has(aWidgetId)) {
+      return null;
+    }
+
+    return CustomizableUI.PROVIDER_XUL;
+  },
+
+
+  getWidgetNode(aWidgetId, aWindow) {
+    let document = aWindow.document;
+
+    if (this.isSpecialWidget(aWidgetId)) {
+      let widgetNode =
+        document.getElementById(aWidgetId) ||
+        this.createSpecialWidget(aWidgetId, document);
+      return [CustomizableUI.PROVIDER_SPECIAL, widgetNode];
+    }
+
+    let widget = gPalette.get(aWidgetId);
+    if (widget) {
+      if (widget.instances.has(document)) {
+        lazy.log.debug(
+          "An instance of widget " +
+            aWidgetId +
+            " already exists in this " +
+            "document. Reusing."
+        );
+        return [CustomizableUI.PROVIDER_API, widget.instances.get(document)];
+      }
+
+      return [
+        CustomizableUI.PROVIDER_API,
+        this.buildWidgetNode(document, widget),
+      ];
+    }
+
+    lazy.log.debug("Searching for " + aWidgetId + " in toolbox.");
+    let node = this.findXULWidgetInWindow(aWidgetId, aWindow);
+    if (node) {
+      return [CustomizableUI.PROVIDER_XUL, node];
+    }
+
+    lazy.log.debug("No node for " + aWidgetId + " found.");
+    return [null, null];
+  },
+
+  registerPanelNode(aNode, aAreaId) {
+    if (gBuildAreas.has(aAreaId) && gBuildAreas.get(aAreaId).has(aNode)) {
+      return;
+    }
+
+    aNode._customizationTarget = aNode;
+    this.addPanelCloseListeners(this._getPanelForNode(aNode));
+
+    let placements = gPlacements.get(aAreaId);
+    this.buildArea(aAreaId, placements, aNode);
+    this.notifyListeners("onAreaNodeRegistered", aAreaId, aNode);
+
+    for (let child of aNode.children) {
+      if (child.localName != "toolbarbutton") {
+        if (child.localName == "toolbaritem") {
+          this.ensureButtonContextMenu(child, aNode, true);
+        }
+        continue;
+      }
+      this.ensureButtonContextMenu(child, aNode, true);
+    }
+
+    this.registerBuildArea(aAreaId, aNode);
+  },
+
+  onWidgetAdded(aWidgetId, aArea, _aPosition) {
+    this.insertNode(aWidgetId, aArea, true);
+
+    if (!gResetting) {
+      this._clearPreviousUIState();
+    }
+  },
+
+  onWidgetRemoved(aWidgetId, aArea) {
+    let areaNodes = gBuildAreas.get(aArea);
+    if (!areaNodes) {
+      return;
+    }
+
+    let area = gAreas.get(aArea);
+    let isToolbar = area.get("type") == CustomizableUI.TYPE_TOOLBAR;
+    let isOverflowable = isToolbar && area.get("overflowable");
+    let showInPrivateBrowsing = gPalette.has(aWidgetId)
+      ? gPalette.get(aWidgetId).showInPrivateBrowsing
+      : true;
+    let hideInNonPrivateBrowsing =
+      gPalette.get(aWidgetId)?.hideInNonPrivateBrowsing ?? false;
+
+    for (let areaNode of areaNodes) {
+      let window = areaNode.documentGlobal;
+      if (
+        !showInPrivateBrowsing &&
+        lazy.PrivateBrowsingUtils.isWindowPrivate(window)
+      ) {
+        continue;
+      }
+
+      if (
+        hideInNonPrivateBrowsing &&
+        !lazy.PrivateBrowsingUtils.isWindowPrivate(window)
+      ) {
+        continue;
+      }
+
+      let container = this.getCustomizationTarget(areaNode);
+      let widgetNode = window.document.getElementById(aWidgetId);
+      if (widgetNode && isOverflowable) {
+        container = areaNode.overflowable.getContainerFor(widgetNode);
+      }
+
+      if (!widgetNode || !container.contains(widgetNode)) {
+        lazy.log.info(
+          "Widget " + aWidgetId + " not found, unable to remove from " + aArea
+        );
+        continue;
+      }
+
+      this.notifyDOMChange(widgetNode, null, container, true, () => {
+        this.removeLocationAttributes(widgetNode);
+        this.ensureButtonContextMenu(widgetNode);
+        if (gPalette.has(aWidgetId) || this.isSpecialWidget(aWidgetId)) {
+          container.removeChild(widgetNode);
+        } else {
+          window.gNavToolbox.palette.appendChild(widgetNode);
+        }
+      });
+
+      let windowCache = gSingleWrapperCache.get(window);
+      if (windowCache) {
+        windowCache.delete(aWidgetId);
+      }
+    }
+    if (!gResetting) {
+      this._clearPreviousUIState();
+    }
+  },
+
+  onWidgetMoved(aWidgetId, aArea, _aOldPosition, _aNewPosition) {
+    this.insertNode(aWidgetId, aArea);
+    if (!gResetting) {
+      this._clearPreviousUIState();
+    }
+  },
+
+  onCustomizeEnd() {
+    this._clearPreviousUIState();
+  },
+
+  registerBuildArea(aAreaId, aAreaNode) {
+    let window = aAreaNode.documentGlobal;
+    if (window.closed) {
+      return;
+    }
+    this.registerBuildWindow(window);
+
+    if (window.gNavToolbox) {
+      gBuildWindows.get(window).add(window.gNavToolbox);
+    }
+
+    if (!gBuildAreas.has(aAreaId)) {
+      gBuildAreas.set(aAreaId, new Set());
+    }
+
+    gBuildAreas.get(aAreaId).add(aAreaNode);
+
+    let customizableNode = this.getCustomizeTargetForArea(aAreaId, window);
+    customizableNode.classList.add("customization-target");
+  },
+
+  registerBuildWindow(aWindow) {
+    if (!gBuildWindows.has(aWindow)) {
+      gBuildWindows.set(aWindow, new Set());
+
+      aWindow.addEventListener("unload", this);
+      aWindow.addEventListener("command", this, true);
+
+      this.notifyListeners("onWindowOpened", aWindow);
+    }
+  },
+
+  unregisterBuildWindow(aWindow) {
+    aWindow.removeEventListener("unload", this);
+    aWindow.removeEventListener("command", this, true);
+    gPanelsForWindow.delete(aWindow);
+    gBuildWindows.delete(aWindow);
+    gSingleWrapperCache.delete(aWindow);
+    let document = aWindow.document;
+
+    for (let [areaId, areaNodes] of gBuildAreas) {
+      let areaProperties = gAreas.get(areaId);
+      for (let node of areaNodes) {
+        if (node.ownerDocument == document) {
+          this.notifyListeners(
+            "onAreaNodeUnregistered",
+            areaId,
+            this.getCustomizationTarget(node),
+            CustomizableUI.REASON_WINDOW_CLOSED
+          );
+          if (areaProperties.get("overflowable")) {
+            node.overflowable.uninit();
+            node.overflowable = null;
+          }
+          areaNodes.delete(node);
+        }
+      }
+    }
+
+    for (let [, widget] of gPalette) {
+      widget.instances.delete(document);
+      this.notifyListeners("onWidgetInstanceRemoved", widget.id, document);
+    }
+
+    for (let [, pendingNodes] of gPendingBuildAreas) {
+      for (let i = pendingNodes.length - 1; i >= 0; i--) {
+        if (pendingNodes[i].ownerDocument == document) {
+          pendingNodes.splice(i, 1);
+        }
+      }
+    }
+
+    this.notifyListeners("onWindowClosed", aWindow);
+  },
+
+  handleNewBrowserWindow(aWindow) {
+    let { gNavToolbox, document } = aWindow;
+    gNavToolbox.palette = document.getElementById(
+      "BrowserToolbarPalette"
+    ).content;
+
+    for (let area of CustomizableUI.areas) {
+      if (CustomizableUI.getAreaType(area) == CustomizableUI.TYPE_TOOLBAR) {
+        this.registerToolbarNode(document.getElementById(area));
+      }
+    }
+  },
+
+  setLocationAttributes(aNode, aAreaId) {
+    let props = gAreas.get(aAreaId);
+    if (!props) {
+      throw new Error(
+        "Expected area " +
+          aAreaId +
+          " to have a properties Map " +
+          "associated with it."
+      );
+    }
+
+    aNode.setAttribute("cui-areatype", props.get("type") || "");
+    let anchor = props.get("anchor");
+    if (anchor) {
+      aNode.setAttribute("cui-anchorid", anchor);
+    } else {
+      aNode.removeAttribute("cui-anchorid");
+    }
+  },
+
+  removeLocationAttributes(aNode) {
+    aNode.removeAttribute("cui-areatype");
+    aNode.removeAttribute("cui-anchorid");
+  },
+
+  insertNode(aWidgetId, aAreaId, isNew) {
+    let areaNodes = gBuildAreas.get(aAreaId);
+    if (!areaNodes) {
+      return;
+    }
+
+    let placements = gPlacements.get(aAreaId);
+    if (!placements) {
+      lazy.log.error(
+        "Could not find any placements for " +
+          aAreaId +
+          " when moving a widget."
+      );
+      return;
+    }
+
+    for (let areaNode of areaNodes) {
+      this.insertNodeInWindow(aWidgetId, areaNode, isNew);
+    }
+  },
+
+  insertNodeInWindow(aWidgetId, aAreaNode, isNew) {
+    let window = aAreaNode.documentGlobal;
+    let showInPrivateBrowsing = gPalette.has(aWidgetId)
+      ? gPalette.get(aWidgetId).showInPrivateBrowsing
+      : true;
+    let hideInNonPrivateBrowsing =
+      gPalette.get(aWidgetId)?.hideInNonPrivateBrowsing ?? false;
+
+    if (
+      !showInPrivateBrowsing &&
+      lazy.PrivateBrowsingUtils.isWindowPrivate(window)
+    ) {
+      return;
+    }
+
+    if (
+      hideInNonPrivateBrowsing &&
+      !lazy.PrivateBrowsingUtils.isWindowPrivate(window)
+    ) {
+      return;
+    }
+
+    let [, widgetNode] = this.getWidgetNode(aWidgetId, window);
+    if (!widgetNode) {
+      lazy.log.error("Widget '" + aWidgetId + "' not found, unable to move");
+      return;
+    }
+
+    let areaId = aAreaNode.id;
+    if (isNew) {
+      this.ensureButtonContextMenu(widgetNode, aAreaNode);
+    }
+
+    let [insertionContainer, nextNode] = this.findInsertionPoints(
+      widgetNode,
+      aAreaNode
+    );
+    this.insertWidgetBefore(widgetNode, nextNode, insertionContainer, areaId);
+  },
+
+
+  findInsertionPoints(aNode, aAreaNode) {
+    let areaId = aAreaNode.id;
+    let props = gAreas.get(areaId);
+
+    if (
+      props.get("type") == CustomizableUI.TYPE_TOOLBAR &&
+      props.get("overflowable")
+    ) {
+      return aAreaNode.overflowable.findOverflowedInsertionPoints(aNode);
+    }
+
+    let container = this.getCustomizationTarget(aAreaNode);
+    let placements = gPlacements.get(areaId);
+    let nodeIndex = placements.indexOf(aNode.id);
+
+    while (++nodeIndex < placements.length) {
+      let nextNodeId = placements[nodeIndex];
+      let nextNode = aAreaNode.ownerDocument.getElementById(nextNodeId);
+      if (
+        nextNode &&
+        (nextNode.parentNode == container ||
+          (nextNode.parentNode.localName == "toolbarpaletteitem" &&
+            nextNode.parentNode.parentNode == container))
+      ) {
+        return [container, nextNode];
+      }
+    }
+
+    return [container, null];
+  },
+
+  insertWidgetBefore(aNode, aNextNode, aContainer, aAreaId) {
+    this.notifyDOMChange(aNode, aNextNode, aContainer, false, () => {
+      this.setLocationAttributes(aNode, aAreaId);
+      aContainer.insertBefore(aNode, aNextNode);
+    });
+  },
+
+  notifyDOMChange(aNode, aNextNode, aContainer, aIsRemove, aCallback) {
+    this.notifyListeners(
+      "onWidgetBeforeDOMChange",
+      aNode,
+      aNextNode,
+      aContainer,
+      aIsRemove
+    );
+    aCallback();
+    this.notifyListeners(
+      "onWidgetAfterDOMChange",
+      aNode,
+      aNextNode,
+      aContainer,
+      aIsRemove
+    );
+  },
+
+  handleEvent(aEvent) {
+    switch (aEvent.type) {
+      case "command":
+        if (!this._originalEventInPanel(aEvent)) {
+          break;
+        }
+        aEvent = aEvent.sourceEvent;
+      case "click":
+      case "keypress":
+        this.maybeAutoHidePanel(aEvent);
+        break;
+      case "unload":
+        this.unregisterBuildWindow(aEvent.currentTarget);
+        break;
+    }
+  },
+
+  _originalEventInPanel(aEvent) {
+    let e = aEvent.sourceEvent;
+    if (!e) {
+      return false;
+    }
+    let node = this._getPanelForNode(e.target);
+    if (!node) {
+      return false;
+    }
+    let win = e.view;
+    let panels = gPanelsForWindow.get(win);
+    return !!panels && panels.has(node);
+  },
+
+  _getSpecialIdForNode(aStringOrNode) {
+    if (typeof aStringOrNode == "object" && aStringOrNode.localName) {
+      if (aStringOrNode.id) {
+        return aStringOrNode.id;
+      }
+      if (aStringOrNode.localName.startsWith("toolbar")) {
+        return aStringOrNode.localName.substring(7);
+      }
+      return "";
+    }
+    return aStringOrNode;
+  },
+
+  isSpecialWidget(aStringOrNode) {
+    if (aStringOrNode === null) {
+      lazy.log.debug("isSpecialWidget was passed null");
+      return false;
+    }
+    aStringOrNode = this._getSpecialIdForNode(aStringOrNode);
+    return (
+      aStringOrNode.startsWith(kSpecialWidgetPfx) ||
+      aStringOrNode.startsWith("separator") ||
+      aStringOrNode.startsWith("spring") ||
+      aStringOrNode.startsWith("spacer")
+    );
+  },
+
+  matchingSpecials(aId1, aId2) {
+    aId1 = this._getSpecialIdForNode(aId1);
+    aId2 = this._getSpecialIdForNode(aId2);
+
+    return (
+      this.isSpecialWidget(aId1) &&
+      this.isSpecialWidget(aId2) &&
+      aId1.match(/spring|spacer|separator/)[0] ==
+        aId2.match(/spring|spacer|separator/)[0]
+    );
+  },
+
+  ensureSpecialWidgetId(aId) {
+    let nodeType = aId.match(/spring|spacer|separator/)[0];
+    if (nodeType == aId) {
+      return kSpecialWidgetPfx + aId + ++gNewElementCount;
+    }
+    return aId;
+  },
+
+  createSpecialWidget(aId, aDocument) {
+    let nodeName = "toolbar" + aId.match(/spring|spacer|separator/)[0];
+    let node = aDocument.createXULElement(nodeName);
+    node.className = "chromeclass-toolbar-additional";
+    node.id = this.ensureSpecialWidgetId(aId);
+    return node;
+  },
+
+  findXULWidgetInWindow(aId, aWindow) {
+    if (!gBuildWindows.has(aWindow)) {
+      throw new Error("Build window not registered");
+    }
+
+    if (!aId) {
+      lazy.log.error("findWidgetInWindow was passed an empty string.");
+      return null;
+    }
+
+    let document = aWindow.document;
+
+    let node = document.getElementById(aId);
+    if (node) {
+      let parent = node.parentNode;
+      while (
+        parent &&
+        !(
+          this.getCustomizationTarget(parent) ||
+          parent == aWindow.gNavToolbox.palette
+        )
+      ) {
+        parent = parent.parentNode;
+      }
+
+      if (parent) {
+        let nodeInArea =
+          node.parentNode.localName == "toolbarpaletteitem"
+            ? node.parentNode
+            : node;
+        if (
+          (this.getCustomizationTarget(parent) == nodeInArea.parentNode &&
+            gBuildWindows.get(aWindow).has(aWindow.gNavToolbox)) ||
+          aWindow.gNavToolbox.palette == nodeInArea.parentNode
+        ) {
+          if (!node.hasAttribute("removable")) {
+            node.setAttribute(
+              "removable",
+              !this.getCustomizationTarget(parent)
+            );
+          }
+          return node;
+        }
+      }
+    }
+
+    let toolboxes = gBuildWindows.get(aWindow);
+    for (let toolbox of toolboxes) {
+      if (toolbox.palette) {
+        let element = toolbox.palette.getElementsByAttribute("id", aId)[0];
+        if (element) {
+          if (!element.hasAttribute("removable")) {
+            element.setAttribute("removable", true);
+          }
+          return element;
+        }
+      }
+    }
+    return null;
+  },
+
+  buildWidgetNode(aDocument, aWidget) {
+    if (aDocument.documentURI != kExpectedWindowURL) {
+      throw new Error("buildWidget was called for a non-browser window!");
+    }
+    if (typeof aWidget == "string") {
+      aWidget = gPalette.get(aWidget);
+    }
+    if (!aWidget) {
+      throw new Error("buildWidget was passed a non-widget to build.");
+    }
+    if (
+      !aWidget.showInPrivateBrowsing &&
+      lazy.PrivateBrowsingUtils.isWindowPrivate(aDocument.defaultView)
+    ) {
+      return null;
+    }
+    if (
+      aWidget.hideInNonPrivateBrowsing &&
+      !lazy.PrivateBrowsingUtils.isWindowPrivate(aDocument.defaultView)
+    ) {
+      return null;
+    }
+
+    lazy.log.debug("Building " + aWidget.id + " of type " + aWidget.type);
+
+    let node;
+    let button;
+    if (aWidget.type == "custom") {
+      if (aWidget.onBuild) {
+        node = aWidget.onBuild(aDocument);
+      }
+      if (
+        !node ||
+        !aDocument.defaultView.XULElement.isInstance(node) ||
+        (aWidget.viewId && !node.viewButton)
+      ) {
+        lazy.log.error(
+          "Custom widget with id " +
+            aWidget.id +
+            " does not return a valid node"
+        );
+      }
+      if (aWidget.viewId) {
+        button = node.viewButton;
+      }
+    }
+    if (button || aWidget.type != "custom") {
+      if (
+        aWidget.onBeforeCreated &&
+        aWidget.onBeforeCreated(aDocument) === false
+      ) {
+        return null;
+      }
+
+      if (!button) {
+        button = aDocument.createXULElement("toolbarbutton");
+        node = button;
+      }
+      button.classList.add("toolbarbutton-1");
+      button.setAttribute("delegatesanchor", "true");
+
+      let viewbutton = null;
+      if (aWidget.type == "button-and-view") {
+        button.setAttribute("id", aWidget.id + "-button");
+        let dropmarker = aDocument.createXULElement("toolbarbutton");
+        dropmarker.setAttribute("id", aWidget.id + "-dropmarker");
+        dropmarker.setAttribute("delegatesanchor", "true");
+        dropmarker.classList.add(
+          "toolbarbutton-1",
+          "toolbarbutton-combined-buttons-dropmarker"
+        );
+        node = aDocument.createXULElement("toolbaritem");
+        node.classList.add("toolbaritem-combined-buttons");
+        node.append(button, dropmarker);
+        viewbutton = dropmarker;
+      } else if (aWidget.viewId) {
+        viewbutton = button;
+      }
+
+      node.setAttribute("id", aWidget.id);
+      node.setAttribute("widget-id", aWidget.id);
+      node.setAttribute("widget-type", aWidget.type);
+      node.toggleAttribute("disabled", !!aWidget.disabled);
+      node.setAttribute("removable", aWidget.removable);
+      node.setAttribute("overflows", aWidget.overflows);
+      if (aWidget.tabSpecific) {
+        node.setAttribute("tabspecific", aWidget.tabSpecific);
+      }
+      if (aWidget.locationSpecific) {
+        node.setAttribute("locationspecific", aWidget.locationSpecific);
+      }
+      if (aWidget.keepBroadcastAttributesWhenCustomizing) {
+        node.setAttribute(
+          "keepbroadcastattributeswhencustomizing",
+          aWidget.keepBroadcastAttributesWhenCustomizing
+        );
+      }
+
+      let shortcut;
+      if (aWidget.shortcutId) {
+        let keyEl = aDocument.getElementById(aWidget.shortcutId);
+        if (keyEl) {
+          shortcut = lazy.ShortcutUtils.prettifyShortcut(keyEl);
+        } else {
+          lazy.log.error(
+            "Key element with id '" +
+              aWidget.shortcutId +
+              "' for widget '" +
+              aWidget.id +
+              "' not found!"
+          );
+        }
+      }
+
+      if (aWidget.l10nId) {
+        aDocument.l10n.setAttributes(node, aWidget.l10nId);
+        if (button != node) {
+          aDocument.l10n.setAttributes(button, aWidget.l10nId);
+        }
+
+        if (shortcut) {
+          node.setAttribute("data-l10n-args", JSON.stringify({ shortcut }));
+          if (button != node) {
+            button.setAttribute("data-l10n-args", JSON.stringify({ shortcut }));
+          }
+        }
+      } else {
+        node.setAttribute("label", this.getLocalizedProperty(aWidget, "label"));
+        if (button != node) {
+          button.setAttribute("label", node.getAttribute("label"));
+        }
+
+        let tooltip = this.getLocalizedProperty(
+          aWidget,
+          "tooltiptext",
+          shortcut ? [shortcut] : []
+        );
+        if (tooltip) {
+          node.setAttribute("tooltiptext", tooltip);
+          if (button != node) {
+            button.setAttribute("tooltiptext", tooltip);
+          }
+        }
+      }
+
+      let commandHandler = this.handleWidgetCommand.bind(this, aWidget, node);
+      node.addEventListener("command", commandHandler);
+      let clickHandler = this.handleWidgetClick.bind(this, aWidget, node);
+      node.addEventListener("click", clickHandler);
+
+      node.classList.add("chromeclass-toolbar-additional");
+
+      if (viewbutton) {
+        lazy.log.debug(
+          "Widget " +
+            aWidget.id +
+            " has a view. Auto-registering event handlers."
+        );
+
+        if (aWidget.source == CustomizableUI.SOURCE_BUILTIN) {
+          node.classList.add("subviewbutton-nav");
+        }
+      }
+
+      if (aWidget.onCreated) {
+        aWidget.onCreated(node);
+      }
+    }
+
+    aWidget.instances.set(aDocument, node);
+    return node;
+  },
+
+  ensureSubviewListeners(viewNode) {
+    if (viewNode._addedEventListeners) {
+      return;
+    }
+    let viewId = viewNode.id;
+    let widget = [...gPalette.values()].find(w => w.viewId == viewId);
+    if (!widget) {
+      return;
+    }
+    for (let eventName of kSubviewEvents) {
+      let handler = "on" + eventName;
+      if (typeof widget[handler] == "function") {
+        viewNode.addEventListener(eventName, widget[handler]);
+      }
+    }
+    viewNode._addedEventListeners = true;
+    lazy.log.debug(
+      "Widget " + widget.id + " showing and hiding event handlers set."
+    );
+  },
+
+  getLocalizedProperty(aWidget, aProp, aFormatArgs, aDef) {
+    const kReqStringProps = ["label"];
+
+    if (typeof aWidget == "string") {
+      aWidget = gPalette.get(aWidget);
+    }
+    if (!aWidget) {
+      throw new Error(
+        "getLocalizedProperty was passed a non-widget to work with."
+      );
+    }
+    let def, name;
+    if (aWidget[aProp] != null) {
+      name = aWidget[aProp];
+      def = aDef || name;
+    } else {
+      name = aWidget.id + "." + aProp;
+      def = aDef || "";
+    }
+    if (aWidget.localized === false) {
+      return def;
+    }
+    try {
+      if (Array.isArray(aFormatArgs) && aFormatArgs.length) {
+        return (
+          lazy.gWidgetsBundle.formatStringFromName(name, aFormatArgs) || def
+        );
+      }
+      return lazy.gWidgetsBundle.GetStringFromName(name) || def;
+    } catch (ex) {
+      if (!def && (name != "" || kReqStringProps.includes(aProp))) {
+        lazy.log.error("Could not localize property '" + name + "'.");
+      }
+    }
+    return def;
+  },
+
+  addShortcut(aShortcutNode, aTargetNode = aShortcutNode) {
+    if (aTargetNode.hasAttribute("shortcut")) {
+      return;
+    }
+
+    let { document } = aShortcutNode.documentGlobal;
+    let shortcutId = aShortcutNode.getAttribute("key");
+    let shortcut;
+    if (shortcutId) {
+      shortcut = document.getElementById(shortcutId);
+    } else {
+      let commandId = aShortcutNode.getAttribute("command");
+      if (commandId) {
+        shortcut = lazy.ShortcutUtils.findShortcut(
+          document.getElementById(commandId)
+        );
+      }
+    }
+    if (!shortcut) {
+      return;
+    }
+
+    aTargetNode.setAttribute(
+      "shortcut",
+      lazy.ShortcutUtils.prettifyShortcut(shortcut)
+    );
+  },
+
+  doWidgetCommand(aWidget, aNode, aEvent) {
+    if (aWidget.onCommand) {
+      try {
+        aWidget.onCommand.call(null, aEvent);
+      } catch (e) {
+        lazy.log.error(e);
+      }
+    } else {
+      Services.obs.notifyObservers(
+        aNode,
+        "customizedui-widget-command",
+        aWidget.id
+      );
+    }
+  },
+
+  showWidgetView(aWidget, aNode, aEvent) {
+    let ownerWindow = aNode.documentGlobal;
+    let area = this.getPlacementOfWidget(aNode.id).area;
+    let areaType = CustomizableUI.getAreaType(area);
+    let anchor = aNode;
+
+    if (
+      aWidget.disallowSubView &&
+      (areaType == CustomizableUI.TYPE_PANEL ||
+        aNode.hasAttribute("overflowedItem"))
+    ) {
+      let wrapper = this.wrapWidget(aWidget.id).forWindow(ownerWindow);
+      if (wrapper?.anchor) {
+        this.hidePanelForNode(aNode);
+        anchor = wrapper.anchor;
+      }
+    } else if (areaType != CustomizableUI.TYPE_PANEL) {
+      let wrapper = this.wrapWidget(aWidget.id).forWindow(ownerWindow);
+
+      let hasMultiView = !!aNode.closest("panelmultiview");
+      if (!hasMultiView && wrapper?.anchor) {
+        this.hidePanelForNode(aNode);
+        anchor = wrapper.anchor;
+      }
+    }
+    ownerWindow.PanelUI.showSubView(aWidget.viewId, anchor, aEvent);
+  },
+
+  handleWidgetCommand(aWidget, aNode, aEvent) {
+    lazy.log.debug("handleWidgetCommand");
+
+    let action;
+    if (aWidget.onBeforeCommand) {
+      try {
+        action = aWidget.onBeforeCommand.call(null, aEvent, aNode);
+      } catch (e) {
+        lazy.log.error(e);
+      }
+    }
+
+    if (aWidget.type == "button" || action == "command") {
+      this.doWidgetCommand(aWidget, aNode, aEvent);
+    } else if (aWidget.type == "view" || action == "view") {
+      this.showWidgetView(aWidget, aNode, aEvent);
+    } else if (aWidget.type == "button-and-view") {
+      let button = aNode.firstElementChild;
+      let area = this.getPlacementOfWidget(aNode.id).area;
+      let areaType = CustomizableUI.getAreaType(area);
+      if (
+        areaType == CustomizableUI.TYPE_TOOLBAR &&
+        button.contains(aEvent.target) &&
+        !aNode.hasAttribute("overflowedItem")
+      ) {
+        this.doWidgetCommand(aWidget, aNode, aEvent);
+      } else {
+        this.showWidgetView(aWidget, aNode, aEvent);
+      }
+    }
+  },
+
+  handleWidgetClick(aWidget, aNode, aEvent) {
+    lazy.log.debug("handleWidgetClick");
+    if (aWidget.onClick) {
+      try {
+        aWidget.onClick.call(null, aEvent);
+      } catch (e) {
+        console.error(e);
+      }
+    } else {
+      Services.obs.notifyObservers(
+        aNode,
+        "customizedui-widget-click",
+        aWidget.id
+      );
+    }
+  },
+
+  _getPanelForNode(aNode) {
+    return aNode.closest("panel");
+  },
+
+  _isOnInteractiveElement(aEvent) {
+    let panel = this._getPanelForNode(aEvent.currentTarget);
+    if (!panel) {
+      return true;
+    }
+
+    function getNextTarget(target) {
+      if (target.nodeType == target.DOCUMENT_NODE) {
+        if (!target.defaultView) {
+          return null;
+        }
+        return target.defaultView.docShell.chromeEventHandler;
+      }
+      return target.parentNode?.host || target.parentNode;
+    }
+
+    for (
+      let target = aEvent.originalTarget;
+      target && target != panel;
+      target = getNextTarget(target)
+    ) {
+      if (target.nodeType == target.DOCUMENT_NODE) {
+        continue;
+      }
+
+      if (
+        target.nodeType == target.DOCUMENT_FRAGMENT_NODE &&
+        target.containingShadowRoot == target
+      ) {
+        continue;
+      }
+
+      if (target.hasAttribute("disabled")) {
+        return true;
+      }
+
+      let tagName = target.localName;
+      if (tagName == "input" || target.closest("#search-container")) {
+        return true;
+      }
+      if (tagName == "toolbaritem" || tagName == "toolbarbutton") {
+        return target.getAttribute("type") == "menu";
+      }
+      if (tagName == "menuitem") {
+        return true;
+      }
+      if (tagName == "moz-button") {
+        return false;
+      }
+    }
+
+    return true;
+  },
+
+  hidePanelForNode(aNode) {
+    let panel = this._getPanelForNode(aNode);
+    if (panel) {
+      lazy.PanelMultiView.hidePopup(panel);
+    }
+  },
+
+  maybeAutoHidePanel(aEvent) {
+    let eventType = aEvent.type;
+    if (eventType == "keypress" && aEvent.keyCode != aEvent.DOM_VK_RETURN) {
+      return;
+    }
+
+    if (eventType == "click" && aEvent.button != 0) {
+      return;
+    }
+
+    if (eventType != "command" && this._isOnInteractiveElement(aEvent)) {
+      return;
+    }
+
+    let target = aEvent.originalTarget;
+
+    if (!target.isConnected) {
+      return;
+    }
+
+    while (target.parentNode && target.localName != "panel") {
+      if (
+        target.getAttribute("closemenu") == "none" ||
+        target.getAttribute("widget-type") == "view" ||
+        target.getAttribute("widget-type") == "button-and-view" ||
+        target.hasAttribute("view-button-id")
+      ) {
+        return;
+      }
+
+      target = target.parentNode;
+
+      if (ShadowRoot.isInstance(target)) {
+        target = target.host;
+      }
+    }
+
+    this.hidePanelForNode(aEvent.target);
+  },
+
+  getUnusedWidgets(aWindowPalette) {
+    let window = aWindowPalette.documentGlobal;
+    let isWindowPrivate = lazy.PrivateBrowsingUtils.isWindowPrivate(window);
+    let widgets = new Set();
+
+    for (let [id, widget] of gPalette) {
+      if (!widget.currentArea) {
+        if (
+          (isWindowPrivate && widget.showInPrivateBrowsing) ||
+          (!isWindowPrivate && !widget.hideInNonPrivateBrowsing)
+        ) {
+          widgets.add(id);
+        }
+      }
+    }
+
+    lazy.log.debug("Iterating the actual nodes of the window palette");
+    for (let node of aWindowPalette.children) {
+      lazy.log.debug("In palette children: " + node.id);
+      if (node.id && !this.getPlacementOfWidget(node.id)) {
+        widgets.add(node.id);
+      }
+    }
+
+    return [...widgets];
+  },
+
+  getPlacementOfWidget(aWidgetId, aOnlyRegistered, aDeadAreas) {
+    if (aOnlyRegistered && !this.widgetExists(aWidgetId)) {
+      return null;
+    }
+
+    for (let [area, placements] of gPlacements) {
+      if (!gAreas.has(area) && !aDeadAreas) {
+        continue;
+      }
+      let index = placements.indexOf(aWidgetId);
+      if (index != -1) {
+        return { area, position: index };
+      }
+    }
+
+    return null;
+  },
+
+  widgetExists(aWidgetId) {
+    if (gPalette.has(aWidgetId) || this.isSpecialWidget(aWidgetId)) {
+      return true;
+    }
+
+    if (gSeenWidgets.has(aWidgetId)) {
+      return false;
+    }
+
+    return true;
+  },
+
+  addWidgetToArea(aWidgetId, aArea, aPosition, aInitialAdd = false) {
+    if (aArea == CustomizableUI.AREA_NO_AREA) {
+      throw new Error(
+        "AREA_NO_AREA is only used as an argument for " +
+          "canWidgetMoveToArea. Use removeWidgetFromArea instead."
+      );
+    }
+    if (!gAreas.has(aArea)) {
+      throw new Error("Unknown customization area: " + aArea);
+    }
+
+    if (
+      gAreas.get(aArea).get("type") == CustomizableUI.TYPE_PANEL &&
+      this.isSpecialWidget(aWidgetId)
+    ) {
+      return;
+    }
+
+    if (this.isAreaLazy(aArea)) {
+      gFuturePlacements.get(aArea).add(aWidgetId);
+      return;
+    }
+
+    if (this.isSpecialWidget(aWidgetId)) {
+      aWidgetId = this.ensureSpecialWidgetId(aWidgetId);
+    }
+
+    let oldPlacement = this.getPlacementOfWidget(aWidgetId, false, true);
+    if (oldPlacement && oldPlacement.area == aArea) {
+      this.moveWidgetWithinArea(aWidgetId, aPosition);
+      return;
+    }
+
+    if (!this.canWidgetMoveToArea(aWidgetId, aArea)) {
+      return;
+    }
+
+    if (oldPlacement) {
+      this.removeWidgetFromArea(aWidgetId);
+    }
+
+    if (!gPlacements.has(aArea)) {
+      gPlacements.set(aArea, [aWidgetId]);
+      aPosition = 0;
+    } else {
+      let placements = gPlacements.get(aArea);
+      if (typeof aPosition != "number") {
+        aPosition = placements.length;
+      }
+      if (aPosition < 0) {
+        aPosition = 0;
+      }
+      placements.splice(aPosition, 0, aWidgetId);
+    }
+
+    let widget = gPalette.get(aWidgetId);
+    if (widget) {
+      widget.currentArea = aArea;
+      widget.currentPosition = aPosition;
+    }
+
+    if (!aInitialAdd) {
+      gDirtyAreaCache.add(aArea);
+    }
+
+    gDirty = true;
+    this.saveState();
+
+    this.notifyListeners("onWidgetAdded", aWidgetId, aArea, aPosition);
+  },
+
+  loadSavedState() {
+    let state = Services.prefs.getCharPref(kPrefCustomizationState, "");
+    if (!state) {
+      lazy.log.debug("No saved state found");
+      return;
+    }
+    try {
+      gSavedState = JSON.parse(state);
+      if (typeof gSavedState != "object" || gSavedState === null) {
+        throw new Error("Invalid saved state");
+      }
+    } catch (e) {
+      Services.prefs.clearUserPref(kPrefCustomizationState);
+      gSavedState = {};
+      lazy.log.debug(
+        "Error loading saved UI customization state, falling back to defaults."
+      );
+    }
+
+    if (!("placements" in gSavedState)) {
+      gSavedState.placements = {};
+    }
+
+    if (!("currentVersion" in gSavedState)) {
+      gSavedState.currentVersion = 0;
+    }
+
+    gSeenWidgets = new Set(gSavedState.seen || []);
+    gDirtyAreaCache = new Set(gSavedState.dirtyAreaCache || []);
+    gNewElementCount = gSavedState.newElementCount || 0;
+  },
+
+  restoreStateForArea(aAreaId) {
+    let placementsPreexisted = gPlacements.has(aAreaId);
+
+    this.beginBatchUpdate();
+    try {
+      gRestoring = true;
+
+      let restored = false;
+      if (placementsPreexisted) {
+        lazy.log.debug(
+          "Restoring " + aAreaId + " from pre-existing placements"
+        );
+        for (let [position, id] of gPlacements.get(aAreaId).entries()) {
+          this.moveWidgetWithinArea(id, position);
+        }
+        gDirty = false;
+        restored = true;
+      } else {
+        gPlacements.set(aAreaId, []);
+      }
+
+      if (!restored && gSavedState && aAreaId in gSavedState.placements) {
+        lazy.log.debug("Restoring " + aAreaId + " from saved state");
+        let placements = gSavedState.placements[aAreaId];
+        for (let id of placements) {
+          this.addWidgetToArea(id, aAreaId);
+        }
+        gDirty = false;
+        restored = true;
+      }
+
+      if (!restored) {
+        lazy.log.debug("Restoring " + aAreaId + " from default state");
+        let defaults = gAreas.get(aAreaId).get("defaultPlacements");
+
+        if (defaults) {
+          for (let id of defaults) {
+            this.addWidgetToArea(id, aAreaId, null, true);
+          }
+        }
+        gDirty = false;
+      }
+
+      if (gFuturePlacements.has(aAreaId)) {
+        let areaPlacements = gPlacements.get(aAreaId);
+        for (let id of gFuturePlacements.get(aAreaId)) {
+          if (areaPlacements.includes(id)) {
+            continue;
+          }
+          this.addWidgetToArea(id, aAreaId);
+        }
+        gFuturePlacements.delete(aAreaId);
+      }
+
+      lazy.log.debug(
+        "Placements for " +
+          aAreaId +
+          ":\n\t" +
+          gPlacements.get(aAreaId).join("\n\t")
+      );
+
+      gRestoring = false;
+    } finally {
+      this.endBatchUpdate();
+    }
+  },
+
+  getAreaPlacementsForSaving(aAreaId) {
+    let placements;
+    if (this.isAreaLazy(aAreaId) && gFuturePlacements.get(aAreaId)?.size) {
+      placements = [...gFuturePlacements.get(aAreaId)];
+    } else if (gPlacements.has(aAreaId)) {
+      placements = gPlacements.get(aAreaId);
+    }
+
+    if (!placements && gSavedState && gSavedState.placements?.[aAreaId]) {
+      placements = gSavedState.placements[aAreaId];
+    }
+    lazy.log.debug(
+      `getAreaPlacementsForSaving for area: ${aAreaId}, gPlacements for area: ${gPlacements.get(
+        aAreaId
+      )}, returning: ${placements}`
+    );
+    return placements;
+  },
+
+  saveState() {
+    if (gInBatchStack || !gDirty) {
+      return;
+    }
+    let placements = new Map();
+    let allAreaIds = new Set([...gPlacements.keys()]);
+    if (gSavedState?.placements) {
+      for (let area of Object.keys(gSavedState.placements)) {
+        allAreaIds.add(area);
+      }
+    }
+    for (let area of allAreaIds) {
+      placements.set(area, this.getAreaPlacementsForSaving(area));
+    }
+    let state = {
+      placements,
+      seen: gSeenWidgets,
+      dirtyAreaCache: gDirtyAreaCache,
+      currentVersion: kVersion,
+      newElementCount: gNewElementCount,
+    };
+
+    lazy.log.debug("Saving state.");
+    let serialized = JSON.stringify(state, this.serializerHelper);
+    lazy.log.debug("State saved as: " + serialized);
+    Services.prefs.setCharPref(kPrefCustomizationState, serialized);
+    gDirty = false;
+  },
+
+  serializerHelper(_aKey, aValue) {
+    if (typeof aValue == "object" && aValue.constructor.name == "Map") {
+      let result = {};
+      for (let [mapKey, mapValue] of aValue) {
+        result[mapKey] = mapValue;
+      }
+      return result;
+    }
+
+    if (typeof aValue == "object" && aValue.constructor.name == "Set") {
+      return [...aValue];
+    }
+
+    return aValue;
+  },
+
+  beginBatchUpdate() {
+    gInBatchStack++;
+  },
+
+  endBatchUpdate(aForceDirty) {
+    gInBatchStack--;
+    if (aForceDirty === true) {
+      gDirty = true;
+    }
+    if (gInBatchStack == 0) {
+      this.saveState();
+    } else if (gInBatchStack < 0) {
+      throw new Error(
+        "The batch editing stack should never reach a negative number."
+      );
+    }
+  },
+
+  addListener(aListener) {
+    gListeners.add(aListener);
+  },
+
+  removeListener(aListener) {
+    if (aListener == this) {
+      return;
+    }
+
+    gListeners.delete(aListener);
+  },
+
+  notifyListeners(aListenerName, ...aArgs) {
+    if (gRestoring) {
+      return;
+    }
+
+    for (let listener of gListeners) {
+      try {
+        if (typeof listener[aListenerName] == "function") {
+          listener[aListenerName].apply(listener, aArgs);
+        }
+      } catch (e) {
+        lazy.log.error(e + " -- " + e.fileName + ":" + e.lineNumber);
+      }
+    }
+  },
+
+  _dispatchToolboxEventToWindow(aEventType, aDetails, aWindow) {
+    let evt = new aWindow.CustomEvent(aEventType, {
+      bubbles: true,
+      cancelable: true,
+      detail: aDetails,
+    });
+    aWindow.gNavToolbox.dispatchEvent(evt);
+  },
+
+  dispatchToolboxEvent(aEventType, aDetails = {}, aWindow = null) {
+    if (aWindow) {
+      this._dispatchToolboxEventToWindow(aEventType, aDetails, aWindow);
+      return;
+    }
+    for (let [win] of gBuildWindows) {
+      this._dispatchToolboxEventToWindow(aEventType, aDetails, win);
+    }
+  },
+
+  createWidget(aProperties) {
+    let widget = this.normalizeWidget(
+      aProperties,
+      CustomizableUI.SOURCE_EXTERNAL
+    );
+    if (!widget) {
+      lazy.log.error("unable to normalize widget");
+      return undefined;
+    }
+
+    gPalette.set(widget.id, widget);
+
+    gGroupWrapperCache.delete(widget.id);
+    for (let [win] of gBuildWindows) {
+      let cache = gSingleWrapperCache.get(win);
+      if (cache) {
+        cache.delete(widget.id);
+      }
+    }
+
+    this.notifyListeners("onWidgetCreated", widget.id);
+
+    if (widget.defaultArea) {
+      let addToDefaultPlacements = false;
+      let area = gAreas.get(widget.defaultArea);
+      if (
+        !CustomizableUI.isBuiltinToolbar(widget.defaultArea) &&
+        widget.defaultArea != CustomizableUI.AREA_FIXED_OVERFLOW_PANEL
+      ) {
+        addToDefaultPlacements = true;
+      }
+
+      if (addToDefaultPlacements) {
+        if (area.has("defaultPlacements")) {
+          area.get("defaultPlacements").push(widget.id);
+        } else {
+          area.set("defaultPlacements", [widget.id]);
+        }
+      }
+    }
+
+    let seenAreas = new Set();
+    let widgetMightNeedAutoAdding = true;
+    for (let [area] of gPlacements) {
+      seenAreas.add(area);
+      let areaIsRegistered = gAreas.has(area);
+      let index = gPlacements.get(area).indexOf(widget.id);
+      if (index != -1) {
+        widgetMightNeedAutoAdding = false;
+        if (areaIsRegistered) {
+          widget.currentArea = area;
+          widget.currentPosition = index;
+        }
+        break;
+      }
+    }
+
+    if (widgetMightNeedAutoAdding && gSavedState) {
+      for (let area of Object.keys(gSavedState.placements)) {
+        if (seenAreas.has(area)) {
+          continue;
+        }
+
+        let areaIsRegistered = gAreas.has(area);
+        let index = gSavedState.placements[area].indexOf(widget.id);
+        if (index != -1) {
+          widgetMightNeedAutoAdding = false;
+          if (areaIsRegistered) {
+            widget.currentArea = area;
+            widget.currentPosition = index;
+          }
+          break;
+        }
+      }
+    }
+
+    this.beginBatchUpdate();
+    try {
+      if (widget.currentArea) {
+        this.notifyListeners(
+          "onWidgetAdded",
+          widget.id,
+          widget.currentArea,
+          widget.currentPosition
+        );
+      } else if (widgetMightNeedAutoAdding) {
+        let autoAdd = Services.prefs.getBoolPref(
+          kPrefCustomizationAutoAdd,
+          true
+        );
+
+        let canBeAutoAdded = autoAdd && !gSeenWidgets.has(widget.id);
+        if (!widget.currentArea && (!widget.removable || canBeAutoAdded)) {
+          if (widget.defaultArea) {
+            if (this.isAreaLazy(widget.defaultArea)) {
+              gFuturePlacements.get(widget.defaultArea).add(widget.id);
+            } else {
+              this.addWidgetToArea(widget.id, widget.defaultArea);
+            }
+          }
+        }
+
+      }
+    } finally {
+      gSeenWidgets.add(widget.id);
+      this.endBatchUpdate(true);
+    }
+
+    this.notifyListeners(
+      "onWidgetAfterCreation",
+      widget.id,
+      widget.currentArea
+    );
+    return widget.id;
+  },
+
+  createBuiltinWidget(aData) {
+
+    let conditionalDestroyPromise = aData.conditionalDestroyPromise || null;
+    delete aData.conditionalDestroyPromise;
+
+    let widget = this.normalizeWidget(aData, CustomizableUI.SOURCE_BUILTIN);
+    if (!widget) {
+      lazy.log.error("Error creating builtin widget: " + aData.id);
+      return;
+    }
+
+    lazy.log.debug("Creating built-in widget with id: " + widget.id);
+    gPalette.set(widget.id, widget);
+
+    if (conditionalDestroyPromise) {
+      conditionalDestroyPromise.then(
+        shouldDestroy => {
+          if (shouldDestroy) {
+            this.destroyWidget(widget.id);
+            this.removeWidgetFromArea(widget.id);
+          }
+        },
+        err => {
+          console.error(err);
+        }
+      );
+    }
+  },
+
+  isAreaLazy(aAreaId) {
+    if (gPlacements.has(aAreaId) || !gAreas.has(aAreaId)) {
+      return false;
+    }
+    return gAreas.get(aAreaId).get("type") == CustomizableUI.TYPE_TOOLBAR;
+  },
+
+  normalizeWidget(aData, aSource) {
+    let widget = {
+      implementation: aData,
+      source: aSource || CustomizableUI.SOURCE_EXTERNAL,
+      instances: new Map(),
+      currentArea: null,
+      localized: true,
+      removable: true,
+      overflows: true,
+      defaultArea: null,
+      shortcutId: null,
+      tabSpecific: false,
+      locationSpecific: false,
+      tooltiptext: null,
+      l10nId: null,
+      showInPrivateBrowsing: true,
+      hideInNonPrivateBrowsing: false,
+      _introducedInVersion: -1,
+      _introducedByPref: null,
+      keepBroadcastAttributesWhenCustomizing: false,
+      disallowSubView: false,
+    };
+
+    if (typeof aData.id != "string" || !/^[a-z0-9-_]{1,}$/i.test(aData.id)) {
+      lazy.log.error("Given an illegal id in normalizeWidget: " + aData.id);
+      return null;
+    }
+
+    delete widget.implementation.currentArea;
+    widget.implementation.__defineGetter__(
+      "currentArea",
+      () => widget.currentArea
+    );
+
+    const kReqStringProps = ["id"];
+    for (let prop of kReqStringProps) {
+      if (typeof aData[prop] != "string") {
+        lazy.log.error(
+          "Missing required property '" +
+            prop +
+            "' in normalizeWidget: " +
+            aData.id
+        );
+        return null;
+      }
+      widget[prop] = aData[prop];
+    }
+
+    const kOptStringProps = ["l10nId", "label", "tooltiptext", "shortcutId"];
+    for (let prop of kOptStringProps) {
+      if (typeof aData[prop] == "string") {
+        widget[prop] = aData[prop];
+      }
+    }
+
+    const kOptBoolProps = [
+      "removable",
+      "showInPrivateBrowsing",
+      "hideInNonPrivateBrowsing",
+      "overflows",
+      "tabSpecific",
+      "locationSpecific",
+      "localized",
+      "keepBroadcastAttributesWhenCustomizing",
+      "disallowSubView",
+    ];
+    for (let prop of kOptBoolProps) {
+      if (typeof aData[prop] == "boolean") {
+        widget[prop] = aData[prop];
+      }
+    }
+
+    if (
+      aData.defaultArea &&
+      (aSource == CustomizableUI.SOURCE_BUILTIN ||
+        gAreas.has(aData.defaultArea))
+    ) {
+      widget.defaultArea = aData.defaultArea;
+    } else if (!widget.removable) {
+      lazy.log.error(
+        "Widget '" +
+          widget.id +
+          "' is not removable but does not specify " +
+          "a valid defaultArea. That's not possible; it must specify a " +
+          "valid defaultArea as well."
+      );
+      return null;
+    }
+
+    if ("type" in aData && gSupportedWidgetTypes.has(aData.type)) {
+      widget.type = aData.type;
+    } else {
+      widget.type = "button";
+    }
+
+    widget.disabled = aData.disabled === true;
+
+    if (aSource == CustomizableUI.SOURCE_BUILTIN) {
+      widget._introducedInVersion = aData.introducedInVersion || 0;
+
+      if (aData._introducedByPref) {
+        widget._introducedByPref = aData._introducedByPref;
+      }
+    }
+
+    this.wrapWidgetEventHandler("onBeforeCreated", widget);
+    this.wrapWidgetEventHandler("onClick", widget);
+    this.wrapWidgetEventHandler("onCreated", widget);
+    this.wrapWidgetEventHandler("onDestroyed", widget);
+
+    if (typeof aData.onBeforeCommand == "function") {
+      widget.onBeforeCommand = aData.onBeforeCommand;
+    }
+
+    if (typeof aData.onCommand == "function") {
+      widget.onCommand = aData.onCommand;
+    }
+    if (
+      widget.type == "view" ||
+      widget.type == "button-and-view" ||
+      aData.viewId
+    ) {
+      if (typeof aData.viewId != "string") {
+        lazy.log.error(
+          "Expected a string for widget " +
+            widget.id +
+            " viewId, but got " +
+            aData.viewId
+        );
+        return null;
+      }
+      widget.viewId = aData.viewId;
+
+      this.wrapWidgetEventHandler("onViewShowing", widget);
+      this.wrapWidgetEventHandler("onViewHiding", widget);
+    }
+    if (widget.type == "custom") {
+      this.wrapWidgetEventHandler("onBuild", widget);
+    }
+
+    if (gPalette.has(widget.id)) {
+      return null;
+    }
+
+    return widget;
+  },
+
+  wrapWidgetEventHandler(aEventName, aWidget) {
+    if (typeof aWidget.implementation[aEventName] != "function") {
+      aWidget[aEventName] = null;
+      return;
+    }
+    aWidget[aEventName] = function (...aArgs) {
+      try {
+        return aWidget.implementation[aEventName].apply(
+          aWidget.implementation,
+          aArgs
+        );
+      } catch (e) {
+        console.error(e);
+        return undefined;
+      }
+    };
+  },
+
+  destroyWidget(aWidgetId) {
+    let widget = gPalette.get(aWidgetId);
+    if (!widget) {
+      gGroupWrapperCache.delete(aWidgetId);
+      for (let [window] of gBuildWindows) {
+        let windowCache = gSingleWrapperCache.get(window);
+        if (windowCache) {
+          windowCache.delete(aWidgetId);
+        }
+      }
+      return;
+    }
+
+    if (widget.defaultArea) {
+      let area = gAreas.get(widget.defaultArea);
+      if (area) {
+        let defaultPlacements = area.get("defaultPlacements");
+        let widgetIndex = defaultPlacements.indexOf(aWidgetId);
+        if (widgetIndex != -1) {
+          defaultPlacements.splice(widgetIndex, 1);
+        }
+      }
+    }
+
+    for (let [window] of gBuildWindows) {
+      let windowCache = gSingleWrapperCache.get(window);
+      if (windowCache) {
+        windowCache.delete(aWidgetId);
+      }
+      let widgetNode =
+        window.document.getElementById(aWidgetId) ||
+        window.gNavToolbox.palette.getElementsByAttribute("id", aWidgetId)[0];
+      if (widgetNode) {
+        let container = widgetNode.parentNode;
+        this.notifyListeners(
+          "onWidgetBeforeDOMChange",
+          widgetNode,
+          null,
+          container,
+          true
+        );
+        widgetNode.remove();
+        this.notifyListeners(
+          "onWidgetAfterDOMChange",
+          widgetNode,
+          null,
+          container,
+          true
+        );
+      }
+      if (
+        widget.type == "view" ||
+        widget.type == "button-and-view" ||
+        widget.viewId
+      ) {
+        let viewNode = window.document.getElementById(widget.viewId);
+        if (viewNode) {
+          for (let eventName of kSubviewEvents) {
+            let handler = "on" + eventName;
+            if (typeof widget[handler] == "function") {
+              viewNode.removeEventListener(eventName, widget[handler]);
+            }
+          }
+          viewNode._addedEventListeners = false;
+        }
+      }
+      if (widgetNode && widget.onDestroyed) {
+        widget.onDestroyed(window.document);
+      }
+    }
+
+    gPalette.delete(aWidgetId);
+    gGroupWrapperCache.delete(aWidgetId);
+
+    this.notifyListeners("onWidgetDestroyed", aWidgetId);
+  },
+
+  getCustomizeTargetForArea(aArea, aWindow) {
+    let buildAreaNodes = gBuildAreas.get(aArea);
+    if (!buildAreaNodes) {
+      return null;
+    }
+
+    for (let node of buildAreaNodes) {
+      if (node.documentGlobal == aWindow) {
+        return this.getCustomizationTarget(node) || node;
+      }
+    }
+
+    return null;
+  },
+
+  reset() {
+    gResetting = true;
+    Services.prefs.setBoolPref("sidebar.verticalTabs", false);
+    this._resetUIState();
+
+    this._rebuildRegisteredAreas();
+
+    for (let [widgetId, widget] of gPalette) {
+      if (widget.source == CustomizableUI.SOURCE_EXTERNAL) {
+        gSeenWidgets.add(widgetId);
+      }
+    }
+    if (gSeenWidgets.size || gNewElementCount) {
+      gDirty = true;
+      this.saveState();
+    }
+
+    gResetting = false;
+  },
+
+  _resetUIState() {
+    try {
+      gUIStateBeforeReset.drawInTitlebar =
+        Services.prefs.getIntPref(kPrefDrawInTitlebar);
+      gUIStateBeforeReset.uiCustomizationState = Services.prefs.getCharPref(
+        kPrefCustomizationState
+      );
+      gUIStateBeforeReset.uiDensity = Services.prefs.getIntPref(kPrefUIDensity);
+      gUIStateBeforeReset.uiDensityHadUserValue =
+        Services.prefs.prefHasUserValue(kPrefUIDensity);
+      gUIStateBeforeReset.autoTouchMode =
+        Services.prefs.getBoolPref(kPrefAutoTouchMode);
+      gUIStateBeforeReset.autoHideDownloadsButton = Services.prefs.getBoolPref(
+        kPrefAutoHideDownloadsButton
+      );
+      gUIStateBeforeReset.newElementCount = gNewElementCount;
+    } catch (e) {}
+
+    Services.prefs.clearUserPref(kPrefCustomizationState);
+    Services.prefs.clearUserPref(kPrefDrawInTitlebar);
+    Services.prefs.clearUserPref(kPrefUIDensity);
+    Services.prefs.clearUserPref(kPrefAutoTouchMode);
+    Services.prefs.clearUserPref(kPrefAutoHideDownloadsButton);
+    gNewElementCount = 0;
+    lazy.log.debug("State reset");
+
+    gPlacements = new Map();
+    gDirtyAreaCache = new Set();
+    gSeenWidgets = new Set();
+    gSavedState = null;
+    for (let [areaId] of gAreas) {
+      this.restoreStateForArea(areaId);
+    }
+  },
+
+  _rebuildRegisteredAreas() {
+    for (let [areaId, areaNodes] of gBuildAreas) {
+      let placements = gPlacements.get(areaId);
+      let isFirstChangedToolbar = true;
+      for (let areaNode of areaNodes) {
+        this.buildArea(areaId, placements, areaNode);
+
+        let area = gAreas.get(areaId);
+        if (area.get("type") == CustomizableUI.TYPE_TOOLBAR) {
+          let defaultCollapsed = area.get("defaultCollapsed");
+          let win = areaNode.documentGlobal;
+          if (defaultCollapsed !== null) {
+            win.setToolbarVisibility(
+              areaNode,
+              typeof defaultCollapsed == "string"
+                ? defaultCollapsed
+                : !defaultCollapsed,
+              isFirstChangedToolbar
+            );
+          }
+        }
+        isFirstChangedToolbar = false;
+      }
+    }
+  },
+
+  undoReset() {
+    if (
+      gUIStateBeforeReset.uiCustomizationState == null ||
+      gUIStateBeforeReset.drawInTitlebar == null
+    ) {
+      return;
+    }
+    gUndoResetting = true;
+
+    const {
+      uiCustomizationState,
+      drawInTitlebar,
+      uiDensity,
+      uiDensityHadUserValue,
+      autoTouchMode,
+      autoHideDownloadsButton,
+    } = gUIStateBeforeReset;
+    gNewElementCount = gUIStateBeforeReset.newElementCount;
+
+    this._clearPreviousUIState();
+
+    Services.prefs.setCharPref(kPrefCustomizationState, uiCustomizationState);
+    Services.prefs.setIntPref(kPrefDrawInTitlebar, drawInTitlebar);
+    if (uiDensityHadUserValue) {
+      Services.prefs.setIntPref(kPrefUIDensity, uiDensity);
+    } else {
+      Services.prefs.clearUserPref(kPrefUIDensity);
+    }
+    Services.prefs.setBoolPref(kPrefAutoTouchMode, autoTouchMode);
+    Services.prefs.setBoolPref(
+      kPrefAutoHideDownloadsButton,
+      autoHideDownloadsButton
+    );
+    this.loadSavedState();
+    if (gSavedState) {
+      for (let areaId of Object.keys(gSavedState.placements)) {
+        let placements = gSavedState.placements[areaId];
+        gPlacements.set(areaId, placements);
+      }
+      this._rebuildRegisteredAreas();
+    }
+
+    gUndoResetting = false;
+  },
+
+  _clearPreviousUIState() {
+    Object.getOwnPropertyNames(gUIStateBeforeReset).forEach(prop => {
+      gUIStateBeforeReset[prop] = null;
+    });
+  },
+
+  isWidgetRemovable(aWidget) {
+    let widgetId;
+    let widgetNode;
+    if (typeof aWidget == "string") {
+      widgetId = aWidget;
+    } else {
+      if (!aWidget.id && aWidget.getAttribute("skipintoolbarset") == "true") {
+        return false;
+      }
+      if (
+        !aWidget.id &&
+        !["toolbarspring", "toolbarspacer", "toolbarseparator"].includes(
+          aWidget.nodeName
+        )
+      ) {
+        throw new Error(
+          "No nodes without ids that aren't special widgets should ever come into contact with CUI"
+        );
+      }
+      widgetId =
+        aWidget.id || aWidget.nodeName.substring(7 );
+      widgetNode = aWidget;
+    }
+    let provider = this.getWidgetProvider(widgetId);
+
+    if (provider == CustomizableUI.PROVIDER_API) {
+      return gPalette.get(widgetId).removable;
+    }
+
+    if (provider == CustomizableUI.PROVIDER_XUL) {
+      if (gBuildWindows.size == 0) {
+        return true;
+      }
+
+      if (!widgetNode) {
+        let [window] = [...gBuildWindows][0];
+        [, widgetNode] = this.getWidgetNode(widgetId, window);
+      }
+      if (!widgetNode) {
+        return true;
+      }
+      return widgetNode.getAttribute("removable") == "true";
+    }
+
+    return true;
+  },
+
+  canWidgetMoveToArea(aWidgetId, aArea) {
+    if (
+      this.isSpecialWidget(aWidgetId) &&
+      gAreas.has(aArea) &&
+      gAreas.get(aArea).get("type") == CustomizableUI.TYPE_PANEL
+    ) {
+      return false;
+    }
+
+    let placement = this.getPlacementOfWidget(aWidgetId);
+    if (!placement || placement.area == aArea) {
+      return true;
+    }
+    return this.isWidgetRemovable(aWidgetId);
+  },
+
+  ensureWidgetPlacedInWindow(aWidgetId, aWindow) {
+    let placement = this.getPlacementOfWidget(aWidgetId);
+    if (!placement) {
+      return false;
+    }
+    let areaNodes = gBuildAreas.get(placement.area);
+    if (!areaNodes) {
+      return false;
+    }
+    let container = [...areaNodes].filter(n => n.documentGlobal == aWindow);
+    if (!container.length) {
+      return false;
+    }
+    let existingNode = container[0].getElementsByAttribute("id", aWidgetId)[0];
+    if (existingNode) {
+      return true;
+    }
+
+    this.insertNodeInWindow(aWidgetId, container[0], true);
+    return true;
+  },
+
+  _getCurrentWidgetsInContainer(container) {
+    let currentWidgets = new Set();
+    function addUnskippedChildren(parent) {
+      for (let node of parent.children) {
+        let realNode =
+          node.localName == "toolbarpaletteitem"
+            ? node.firstElementChild
+            : node;
+        if (realNode.getAttribute("skipintoolbarset") != "true") {
+          currentWidgets.add(realNode.id);
+        }
+      }
+    }
+    addUnskippedChildren(this.getCustomizationTarget(container));
+    if (container.getAttribute("overflowing") == "true") {
+      let overflowTarget = container.getAttribute("default-overflowtarget");
+      addUnskippedChildren(
+        container.ownerDocument.getElementById(overflowTarget)
+      );
+    }
+    let orderedPlacements = CustomizableUI.getWidgetIdsInArea(container.id);
+    return orderedPlacements.filter(w => {
+      return (
+        currentWidgets.has(w) ||
+        this.getWidgetProvider(w) == CustomizableUI.PROVIDER_API
+      );
+    });
+  },
+
+  get inDefaultState() {
+    for (let [areaId, props] of gAreas) {
+      let defaultPlacements = props
+        .get("defaultPlacements")
+        .filter(item => this.widgetExists(item));
+      let currentPlacements = gPlacements.get(areaId);
+      let buildAreaNodes = gBuildAreas.get(areaId);
+      if (buildAreaNodes && buildAreaNodes.size) {
+        let container = [...buildAreaNodes][0];
+        let removableOrDefault = itemNodeOrItem => {
+          let item = (itemNodeOrItem && itemNodeOrItem.id) || itemNodeOrItem;
+          let isRemovable = this.isWidgetRemovable(itemNodeOrItem);
+          let isInDefault = defaultPlacements.includes(item);
+          return isRemovable || isInDefault;
+        };
+        if (props.get("type") == CustomizableUI.TYPE_TOOLBAR) {
+          currentPlacements =
+            this._getCurrentWidgetsInContainer(container).filter(
+              removableOrDefault
+            );
+        } else {
+          currentPlacements = currentPlacements.filter(item => {
+            let itemNode = container.getElementsByAttribute("id", item)[0];
+            return itemNode && removableOrDefault(itemNode || item);
+          });
+        }
+
+        if (props.get("type") == CustomizableUI.TYPE_TOOLBAR) {
+          let collapsed = null;
+          let defaultCollapsed = props.get("defaultCollapsed");
+          let nondefaultState = false;
+          if (areaId == CustomizableUI.AREA_BOOKMARKS) {
+            collapsed = Services.prefs.getCharPref(
+              "browser.toolbars.bookmarks.visibility"
+            );
+            nondefaultState = Services.prefs.prefHasUserValue(
+              "browser.toolbars.bookmarks.visibility"
+            );
+          } else {
+            let attribute =
+              container.getAttribute("type") == "menubar"
+                ? "autohide"
+                : "collapsed";
+            collapsed = container.hasAttribute(attribute);
+            nondefaultState = collapsed != defaultCollapsed;
+          }
+          if (defaultCollapsed !== null && nondefaultState) {
+            lazy.log.debug(
+              "Found " +
+                areaId +
+                " had non-default toolbar visibility" +
+                "(expected " +
+                defaultCollapsed +
+                ", was " +
+                collapsed +
+                ")"
+            );
+            return false;
+          }
+        }
+      }
+      lazy.log.debug(
+        "Checking default state for " +
+          areaId +
+          ":\n" +
+          currentPlacements.join(",") +
+          "\nvs.\n" +
+          defaultPlacements.join(",")
+      );
+
+      if (currentPlacements.length != defaultPlacements.length) {
+        return false;
+      }
+
+      for (let i = 0; i < currentPlacements.length; ++i) {
+        if (
+          currentPlacements[i] != defaultPlacements[i] &&
+          !this.matchingSpecials(currentPlacements[i], defaultPlacements[i])
+        ) {
+          lazy.log.debug(
+            "Found " +
+              currentPlacements[i] +
+              " in " +
+              areaId +
+              " where " +
+              defaultPlacements[i] +
+              " was expected!"
+          );
+          return false;
+        }
+      }
+    }
+
+    if (Services.prefs.prefHasUserValue(kPrefUIDensity)) {
+      lazy.log.debug(kPrefUIDensity + " pref is non-default");
+      return false;
+    }
+
+    if (Services.prefs.prefHasUserValue(kPrefAutoTouchMode)) {
+      lazy.log.debug(kPrefAutoTouchMode + " pref is non-default");
+      return false;
+    }
+
+    if (Services.prefs.prefHasUserValue(kPrefDrawInTitlebar)) {
+      lazy.log.debug(kPrefDrawInTitlebar + " pref is non-default");
+      return false;
+    }
+
+    return true;
+  },
+
+  getCollapsedToolbarIds(window) {
+    let collapsedToolbars = new Set();
+    for (let toolbarId of CustomizableUIInternal.builtinToolbars) {
+      let toolbar = window.document.getElementById(toolbarId);
+
+      let hidingAttribute =
+        toolbar.getAttribute("type") == "menubar" ? "autohide" : "collapsed";
+
+      if (toolbar.hasAttribute(hidingAttribute)) {
+        collapsedToolbars.add(toolbarId);
+      }
+    }
+
+    return collapsedToolbars;
+  },
+
+  setToolbarVisibility(aToolbarId, aIsVisible) {
+    let isFirstChangedToolbar = true;
+    for (let window of CustomizableUI.windows) {
+      let toolbar = window.document.getElementById(aToolbarId);
+      if (toolbar) {
+        window.setToolbarVisibility(toolbar, aIsVisible, isFirstChangedToolbar);
+        isFirstChangedToolbar = false;
+      }
+    }
+  },
+
+  widgetIsLikelyVisible(aWidgetId, window) {
+    let placement = this.getPlacementOfWidget(aWidgetId);
+
+    if (!placement) {
+      return false;
+    }
+
+    switch (placement.area) {
+      case CustomizableUI.AREA_NAVBAR:
+        return true;
+      case CustomizableUI.AREA_MENUBAR:
+        return !this.getCollapsedToolbarIds(window).has(
+          CustomizableUI.AREA_MENUBAR
+        );
+      case CustomizableUI.AREA_TABSTRIP:
+        return true;
+      case CustomizableUI.AREA_BOOKMARKS:
+        return (
+          Services.prefs.getCharPref(
+            "browser.toolbars.bookmarks.visibility"
+          ) === "always"
+        );
+      default:
+        return false;
+    }
+  },
+
+  observe(aSubject, aTopic, aData) {
+    if (aTopic == "browser-set-toolbar-visibility") {
+      let [toolbar, visibility] = JSON.parse(aData);
+      CustomizableUI.setToolbarVisibility(toolbar, visibility == "true");
+    }
+
+  },
+
+};
+Object.freeze(CustomizableUIInternal);
+
+export var CustomizableUI = {
+  AREA_NAVBAR: "nav-bar",
+  AREA_MENUBAR: "toolbar-menubar",
+  AREA_TABSTRIP: "TabsToolbar",
+
+  AREA_BOOKMARKS: "PersonalToolbar",
+  AREA_FIXED_OVERFLOW_PANEL: "widget-overflow-fixed-list",
+  AREA_NO_AREA: "customization-palette",
+  TYPE_PANEL: "panel",
+  TYPE_TOOLBAR: "toolbar",
+
+  PROVIDER_XUL: "xul",
+  PROVIDER_API: "api",
+  PROVIDER_SPECIAL: "special",
+
+  SOURCE_BUILTIN: "builtin",
+  SOURCE_EXTERNAL: "external",
+
+  REASON_WINDOW_CLOSED: "window-closed",
+  REASON_AREA_UNREGISTERED: "area-unregistered",
+
+  windows: {
+    *[Symbol.iterator]() {
+      for (let [window] of gBuildWindows) {
+        yield window;
+      }
+    },
+  },
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  addListener(aListener) {
+    CustomizableUIInternal.addListener(aListener);
+  },
+
+  removeListener(aListener) {
+    CustomizableUIInternal.removeListener(aListener);
+  },
+
+  registerArea(aName, aProperties) {
+    CustomizableUIInternal.registerArea(aName, aProperties);
+  },
+  registerToolbarNode(aToolbar) {
+    CustomizableUIInternal.registerToolbarNode(aToolbar);
+  },
+  registerPanelNode(aNode, aArea) {
+    CustomizableUIInternal.registerPanelNode(aNode, aArea);
+  },
+  unregisterArea(aName, aDestroyPlacements) {
+    CustomizableUIInternal.unregisterArea(aName, aDestroyPlacements);
+  },
+  addWidgetToArea(aWidgetId, aArea, aPosition) {
+    CustomizableUIInternal.addWidgetToArea(aWidgetId, aArea, aPosition);
+  },
+  removeWidgetFromArea(aWidgetId) {
+    CustomizableUIInternal.removeWidgetFromArea(aWidgetId);
+  },
+  moveWidgetWithinArea(aWidgetId, aPosition) {
+    CustomizableUIInternal.moveWidgetWithinArea(aWidgetId, aPosition);
+  },
+  ensureWidgetPlacedInWindow(aWidgetId, aWindow) {
+    return CustomizableUIInternal.ensureWidgetPlacedInWindow(
+      aWidgetId,
+      aWindow
+    );
+  },
+  beginBatchUpdate() {
+    CustomizableUIInternal.beginBatchUpdate();
+  },
+  endBatchUpdate(aForceDirty = false) {
+    CustomizableUIInternal.endBatchUpdate(aForceDirty);
+  },
+
+
+
+
+
+
+
+
+
+
+
+  createWidget(aProperties) {
+    return CustomizableUIInternal.wrapWidget(
+      CustomizableUIInternal.createWidget(aProperties)
+    );
+  },
+  destroyWidget(aWidgetId) {
+    CustomizableUIInternal.destroyWidget(aWidgetId);
+  },
+  getWidget(aWidgetId) {
+    return CustomizableUIInternal.wrapWidget(aWidgetId);
+  },
+  getUnusedWidgets(aWindowPalette) {
+    return CustomizableUIInternal.getUnusedWidgets(aWindowPalette).map(
+      CustomizableUIInternal.wrapWidget,
+      CustomizableUIInternal
+    );
+  },
+  getWidgetIdsInArea(aArea) {
+    if (!gAreas.has(aArea)) {
+      throw new Error("Unknown customization area: " + aArea);
+    }
+    if (!gPlacements.has(aArea)) {
+      throw new Error(`Area ${aArea} not yet restored`);
+    }
+
+    return [...gPlacements.get(aArea)];
+  },
+  getDefaultPlacementsForArea(aArea) {
+    return [...gAreas.get(aArea).get("defaultPlacements")];
+  },
+  getWidgetsInArea(aArea) {
+    return this.getWidgetIdsInArea(aArea).map(
+      CustomizableUIInternal.wrapWidget,
+      CustomizableUIInternal
+    );
+  },
+
+  ensureSubviewListeners(aViewNode) {
+    return CustomizableUIInternal.ensureSubviewListeners(aViewNode);
+  },
+  get areas() {
+    return [...gAreas.keys()];
+  },
+  getAreaType(aArea) {
+    let area = gAreas.get(aArea);
+    return area ? area.get("type") : null;
+  },
+  isToolbarDefaultCollapsed(aArea) {
+    let area = gAreas.get(aArea);
+    return area ? area.get("defaultCollapsed") : null;
+  },
+  getCustomizeTargetForArea(aArea, aWindow) {
+    return CustomizableUIInternal.getCustomizeTargetForArea(aArea, aWindow);
+  },
+  reset() {
+    CustomizableUIInternal.reset();
+  },
+
+  undoReset() {
+    CustomizableUIInternal.undoReset();
+  },
+
+  /**
+   * Remove a custom toolbar added in a previous version of Firefox or using
+   * an add-on. NB: only works on the customizable toolbars generated by
+   * the toolbox itself. Intended for use from CustomizeMode, not by
+   * other consumers.
+   *
+   * @param {string} aToolbarId
+   *   The ID of the toolbar to remove.
+   */
+  removeExtraToolbar(aToolbarId) {
+    CustomizableUIInternal.removeExtraToolbar(aToolbarId);
+  },
+
+  get canUndoReset() {
+    return (
+      gUIStateBeforeReset.uiCustomizationState != null ||
+      gUIStateBeforeReset.drawInTitlebar != null ||
+      gUIStateBeforeReset.currentTheme != null ||
+      gUIStateBeforeReset.autoTouchMode != null ||
+      gUIStateBeforeReset.uiDensity != null
+    );
+  },
+
+
+  getPlacementOfWidget(aWidgetId, aOnlyRegistered = true, aDeadAreas = false) {
+    return CustomizableUIInternal.getPlacementOfWidget(
+      aWidgetId,
+      aOnlyRegistered,
+      aDeadAreas
+    );
+  },
+  isWidgetRemovable(aWidgetId) {
+    return CustomizableUIInternal.isWidgetRemovable(aWidgetId);
+  },
+  canWidgetMoveToArea(aWidgetId, aArea) {
+    return CustomizableUIInternal.canWidgetMoveToArea(aWidgetId, aArea);
+  },
+  get inDefaultState() {
+    return CustomizableUIInternal.inDefaultState;
+  },
+
+  setToolbarVisibility(aToolbarId, aIsVisible) {
+    CustomizableUIInternal.setToolbarVisibility(aToolbarId, aIsVisible);
+  },
+
+  getCollapsedToolbarIds(window) {
+    return CustomizableUIInternal.getCollapsedToolbarIds(window);
+  },
+
+  widgetIsLikelyVisible(aWidgetId, window) {
+    return CustomizableUIInternal.widgetIsLikelyVisible(aWidgetId, window);
+  },
+
+  getLocalizedProperty(aWidget, aProp, aFormatArgs, aDef) {
+    return CustomizableUIInternal.getLocalizedProperty(
+      aWidget,
+      aProp,
+      aFormatArgs,
+      aDef
+    );
+  },
+  addShortcut(aShortcutNode, aTargetNode) {
+    return CustomizableUIInternal.addShortcut(aShortcutNode, aTargetNode);
+  },
+  hidePanelForNode(aNode) {
+    CustomizableUIInternal.hidePanelForNode(aNode);
+  },
+  isSpecialWidget(aWidgetId) {
+    return CustomizableUIInternal.isSpecialWidget(aWidgetId);
+  },
+  addPanelCloseListeners(aPanel) {
+    CustomizableUIInternal.addPanelCloseListeners(aPanel);
+  },
+  removePanelCloseListeners(aPanel) {
+    CustomizableUIInternal.removePanelCloseListeners(aPanel);
+  },
+  onWidgetDrag(aWidgetId, aArea) {
+    CustomizableUIInternal.notifyListeners("onWidgetDrag", aWidgetId, aArea);
+  },
+  notifyStartCustomizing(aWindow) {
+    CustomizableUIInternal.notifyListeners("onCustomizeStart", aWindow);
+  },
+  notifyEndCustomizing(aWindow) {
+    CustomizableUIInternal.notifyListeners("onCustomizeEnd", aWindow);
+  },
+
+  dispatchToolboxEvent(aEvent, aDetails = {}, aWindow = null) {
+    CustomizableUIInternal.dispatchToolboxEvent(aEvent, aDetails, aWindow);
+  },
+
+  isAreaOverflowable(aAreaId) {
+    let area = gAreas.get(aAreaId);
+    return area
+      ? area.get("type") == this.TYPE_TOOLBAR && area.get("overflowable")
+      : false;
+  },
+  getPlaceForItem(aElement) {
+    let place;
+    let node = aElement;
+    while (node && !place) {
+      if (node.localName == "toolbar") {
+        place = "toolbar";
+      } else if (node.id == CustomizableUI.AREA_FIXED_OVERFLOW_PANEL) {
+        place = "panel";
+      } else if (node.id == "customization-palette") {
+        place = "palette";
+      }
+
+      node = node.parentNode;
+    }
+    return place;
+  },
+
+  isBuiltinToolbar(aToolbarId) {
+    return CustomizableUIInternal.builtinToolbars.has(aToolbarId);
+  },
+
+  createSpecialWidget(aId, aDocument) {
+    return CustomizableUIInternal.createSpecialWidget(aId, aDocument);
+  },
+
+  fillSubviewFromMenuItems(aMenuItems, aSubview) {
+    let attrs = [
+      "oncommand",
+      "onclick",
+      "label",
+      "key",
+      "disabled",
+      "command",
+      "observes",
+      "hidden",
+      "class",
+      "origin",
+      "image",
+      "checked",
+      "style",
+    ];
+
+    let doc = aSubview.documentGlobal.document;
+    let fragment = doc.createDocumentFragment();
+    for (let menuChild of aMenuItems) {
+      if (menuChild.hidden) {
+        continue;
+      }
+
+      let subviewItem;
+      if (menuChild.localName == "menuseparator") {
+        if (
+          !fragment.lastElementChild ||
+          fragment.lastElementChild.localName == "toolbarseparator"
+        ) {
+          continue;
+        }
+        subviewItem = doc.createXULElement("toolbarseparator");
+      } else if (menuChild.localName == "menuitem") {
+        subviewItem = doc.createXULElement("toolbarbutton");
+        CustomizableUI.addShortcut(menuChild, subviewItem);
+
+        let item = menuChild;
+        if (!item.hasAttribute("onclick")) {
+          subviewItem.addEventListener("click", event => {
+            let newEvent = new doc.documentGlobal.PointerEvent("click", event);
+
+            item.dispatchEvent(newEvent);
+          });
+        }
+
+        if (!item.hasAttribute("oncommand")) {
+          subviewItem.addEventListener("command", event => {
+            let newEvent = doc.createEvent("XULCommandEvent");
+            newEvent.initCommandEvent(
+              event.type,
+              event.bubbles,
+              event.cancelable,
+              event.view,
+              event.detail,
+              event.ctrlKey,
+              event.altKey,
+              event.shiftKey,
+              event.metaKey,
+              0,
+              event.sourceEvent,
+              0
+            );
+
+            item.dispatchEvent(newEvent);
+          });
+        }
+      } else {
+        continue;
+      }
+      for (let attr of attrs) {
+        let attrVal = menuChild.getAttribute(attr);
+        if (attrVal !== null) {
+          subviewItem.setAttribute(attr, attrVal);
+        }
+      }
+      if (menuChild.localName == "menuitem") {
+        subviewItem.classList.add("subviewbutton");
+      }
+
+      let l10nId = menuChild.getAttribute("appmenu-data-l10n-id");
+      if (l10nId) {
+        doc.l10n.setAttributes(subviewItem, l10nId);
+      }
+
+      fragment.appendChild(subviewItem);
+    }
+    aSubview.appendChild(fragment);
+  },
+
+  clearSubview(aSubview) {
+    let parent = aSubview.parentNode;
+    parent.removeChild(aSubview);
+
+    while (aSubview.firstChild) {
+      aSubview.firstChild.remove();
+    }
+
+    parent.appendChild(aSubview);
+  },
+
+  handleNewBrowserWindow(aWindow) {
+    return CustomizableUIInternal.handleNewBrowserWindow(aWindow);
+  },
+
+  getCustomizationTarget(aElement) {
+    return CustomizableUIInternal.getCustomizationTarget(aElement);
+  },
+
+  getTestOnlyInternalProp(aProp) {
+    if (!false) {
+      return null;
+    }
+    switch (aProp) {
+      case "CustomizableUIInternal":
+        return CustomizableUIInternal;
+      case "gAreas":
+        return gAreas;
+      case "gFuturePlacements":
+        return gFuturePlacements;
+      case "gPalette":
+        return gPalette;
+      case "gPlacements":
+        return gPlacements;
+      case "gSavedState":
+        return gSavedState;
+      case "gSeenWidgets":
+        return gSeenWidgets;
+      case "kVersion":
+        return kVersion;
+    }
+    return null;
+  },
+
+  setTestOnlyInternalProp(aProp, aValue) {
+    if (!false) {
+      return;
+    }
+    switch (aProp) {
+      case "gSavedState":
+        gSavedState = aValue;
+        break;
+      case "kVersion":
+        kVersion = aValue;
+        break;
+      case "gDirty":
+        gDirty = aValue;
+        break;
+    }
+  },
+};
+
+Object.freeze(CustomizableUI);
+Object.freeze(CustomizableUI.windows);
+
+
+function WidgetGroupWrapper(aWidget) {
+  this.isGroup = true;
+
+  const kBareProps = [
+    "id",
+    "source",
+    "type",
+    "disabled",
+    "label",
+    "tooltiptext",
+    "showInPrivateBrowsing",
+    "hideInNonPrivateBrowsing",
+    "viewId",
+    "disallowSubView",
+  ];
+  for (let prop of kBareProps) {
+    let propertyName = prop;
+    this.__defineGetter__(propertyName, () => aWidget[propertyName]);
+  }
+
+  this.__defineGetter__("provider", () => CustomizableUI.PROVIDER_API);
+
+  this.__defineSetter__("disabled", function (aValue) {
+    aValue = !!aValue;
+    aWidget.disabled = aValue;
+    for (let [, instance] of aWidget.instances) {
+      instance.disabled = aValue;
+    }
+  });
+
+  this.forWindow = function WidgetGroupWrapper_forWindow(aWindow) {
+    let wrapperMap;
+    if (!gSingleWrapperCache.has(aWindow)) {
+      wrapperMap = new Map();
+      gSingleWrapperCache.set(aWindow, wrapperMap);
+    } else {
+      wrapperMap = gSingleWrapperCache.get(aWindow);
+    }
+    if (wrapperMap.has(aWidget.id)) {
+      return wrapperMap.get(aWidget.id);
+    }
+
+    let instance = aWidget.instances.get(aWindow.document);
+    if (!instance) {
+      instance = CustomizableUIInternal.buildWidgetNode(
+        aWindow.document,
+        aWidget
+      );
+    }
+
+    let wrapper = new WidgetSingleWrapper(aWidget, instance);
+    wrapperMap.set(aWidget.id, wrapper);
+    return wrapper;
+  };
+
+  this.__defineGetter__("instances", function () {
+    let placement = CustomizableUIInternal.getPlacementOfWidget(aWidget.id);
+    if (!placement) {
+      return [];
+    }
+    let area = placement.area;
+    let buildAreas = gBuildAreas.get(area);
+    if (!buildAreas) {
+      return [];
+    }
+    return Array.from(buildAreas, node => this.forWindow(node.documentGlobal));
+  });
+
+  this.__defineGetter__("areaType", function () {
+    let { currentArea } = aWidget;
+    if (!currentArea) {
+      return null;
+    }
+    let areaProps = gAreas.get(currentArea);
+    return areaProps && areaProps.get("type");
+  });
+
+  Object.freeze(this);
+}
+
+function WidgetSingleWrapper(aWidget, aNode) {
+  this.isGroup = false;
+
+  this.node = aNode;
+  this.provider = CustomizableUI.PROVIDER_API;
+
+  const kGlobalProps = ["id", "type"];
+  for (let prop of kGlobalProps) {
+    this[prop] = aWidget[prop];
+  }
+
+  const kNodeProps = ["label", "tooltiptext"];
+  for (let prop of kNodeProps) {
+    let propertyName = prop;
+    this.__defineGetter__(propertyName, () => aNode.getAttribute(propertyName));
+  }
+
+  this.__defineGetter__("disabled", () => aNode.disabled);
+  this.__defineSetter__("disabled", function (aValue) {
+    aNode.disabled = !!aValue;
+  });
+
+  this.__defineGetter__("anchor", function () {
+    let anchorId;
+    let placement = CustomizableUIInternal.getPlacementOfWidget(aWidget.id);
+    if (placement) {
+      anchorId = gAreas.get(placement.area).get("anchor");
+    }
+    if (!anchorId) {
+      anchorId = aNode.getAttribute("cui-anchorid");
+    }
+    if (!anchorId) {
+      anchorId = aNode.getAttribute("view-button-id");
+    }
+    if (anchorId) {
+      return aNode.ownerDocument.getElementById(anchorId);
+    }
+    if (aWidget.type == "button-and-view") {
+      return aNode.lastElementChild;
+    }
+    return aNode;
+  });
+
+  this.__defineGetter__("overflowed", function () {
+    return aNode.getAttribute("overflowedItem") == "true";
+  });
+
+  Object.freeze(this);
+}
+
+function XULWidgetGroupWrapper(aWidgetId) {
+  this.isGroup = true;
+  this.id = aWidgetId;
+  this.type = "custom";
+  this.provider = CustomizableUI.PROVIDER_XUL;
+
+  this.forWindow = function XULWidgetGroupWrapper_forWindow(aWindow) {
+    let wrapperMap;
+    if (!gSingleWrapperCache.has(aWindow)) {
+      wrapperMap = new Map();
+      gSingleWrapperCache.set(aWindow, wrapperMap);
+    } else {
+      wrapperMap = gSingleWrapperCache.get(aWindow);
+    }
+    if (wrapperMap.has(aWidgetId)) {
+      return wrapperMap.get(aWidgetId);
+    }
+
+    let instance = aWindow.document.getElementById(aWidgetId);
+    if (!instance) {
+      instance = aWindow.gNavToolbox.palette.getElementsByAttribute(
+        "id",
+        aWidgetId
+      )[0];
+    }
+
+    let wrapper = new XULWidgetSingleWrapper(
+      aWidgetId,
+      instance,
+      aWindow.document
+    );
+    wrapperMap.set(aWidgetId, wrapper);
+    return wrapper;
+  };
+
+  this.__defineGetter__("areaType", function () {
+    let placement = CustomizableUIInternal.getPlacementOfWidget(aWidgetId);
+    if (!placement) {
+      return null;
+    }
+
+    let areaProps = gAreas.get(placement.area);
+    return areaProps && areaProps.get("type");
+  });
+
+  this.__defineGetter__("instances", function () {
+    return Array.from(gBuildWindows, wins => this.forWindow(wins[0]));
+  });
+
+  Object.freeze(this);
+}
+
+function XULWidgetSingleWrapper(aWidgetId, aNode, aDocument) {
+  this.isGroup = false;
+
+  this.id = aWidgetId;
+  this.type = "custom";
+  this.provider = CustomizableUI.PROVIDER_XUL;
+
+  let weakDoc = Cu.getWeakReference(aDocument);
+  aDocument = null;
+
+  this.__defineGetter__("node", function () {
+    if (!weakDoc) {
+      return null;
+    }
+    if (aNode) {
+      if (aNode.isConnected) {
+        return aNode;
+      }
+      let toolbox = aNode.documentGlobal.gNavToolbox;
+      if (toolbox && toolbox.palette && aNode.parentNode == toolbox.palette) {
+        return aNode;
+      }
+      // If it isn't, clear the cached value and fall through to the "slow" case:
+      aNode = null;
+    }
+
+    let doc = weakDoc.get();
+    if (doc) {
+      aNode = CustomizableUIInternal.findXULWidgetInWindow(
+        aWidgetId,
+        doc.defaultView
+      );
+      return aNode;
+    }
+    weakDoc = null;
+    return null;
+  });
+
+  this.__defineGetter__("anchor", function () {
+    let anchorId;
+    let placement = CustomizableUIInternal.getPlacementOfWidget(aWidgetId);
+    if (placement) {
+      anchorId = gAreas.get(placement.area).get("anchor");
+    }
+
+    let node = this.node;
+    if (!anchorId && node) {
+      anchorId = node.getAttribute("cui-anchorid");
+    }
+
+    return anchorId && node
+      ? node.ownerDocument.getElementById(anchorId)
+      : node;
+  });
+
+  this.__defineGetter__("overflowed", function () {
+    let node = this.node;
+    if (!node) {
+      return false;
+    }
+    return node.getAttribute("overflowedItem") == "true";
+  });
+
+  Object.freeze(this);
+}
+
+class OverflowableToolbar {
+  #initialized = false;
+
+  #toolbar = null;
+
+  #target = null;
+
+  #overflowedInfo = new Map();
+
+  #hiddenOverflowedNodes = new WeakSet();
+
+  #enabled = true;
+
+  #defaultList = null;
+
+  #defaultListButton = null;
+
+  #defaultListPanel = null;
+
+  #checkOverflowHandle = null;
+
+  #hideTimeoutId = null;
+
+
+  constructor(aToolbarNode) {
+    this.#toolbar = aToolbarNode;
+    this.#target = CustomizableUI.getCustomizationTarget(this.#toolbar);
+    if (this.#target.parentNode != this.#toolbar) {
+      throw new Error(
+        "Customization target must be a direct child of an overflowable toolbar."
+      );
+    }
+
+    this.#toolbar.setAttribute("overflowable", "true");
+    let doc = this.#toolbar.ownerDocument;
+    this.#defaultList = doc.getElementById(
+      this.#toolbar.getAttribute("default-overflowtarget")
+    );
+    this.#defaultList._customizationTarget = this.#defaultList;
+
+    let window = this.#toolbar.documentGlobal;
+
+    if (window.gBrowserInit.delayedStartupFinished) {
+      this.init();
+    } else {
+      Services.obs.addObserver(this, "browser-delayed-startup-finished");
+    }
+  }
+
+  init() {
+    let doc = this.#toolbar.ownerDocument;
+    let window = doc.defaultView;
+    window.addEventListener("resize", this);
+    window.gNavToolbox.addEventListener("customizationstarting", this);
+    window.gNavToolbox.addEventListener("aftercustomization", this);
+
+    let defaultListButton = this.#toolbar.getAttribute(
+      "default-overflowbutton"
+    );
+    this.#defaultListButton = doc.getElementById(defaultListButton);
+    this.#defaultListButton.addEventListener("mousedown", this);
+    this.#defaultListButton.addEventListener("keypress", this);
+    this.#defaultListButton.addEventListener("dragover", this);
+    this.#defaultListButton.addEventListener("dragend", this);
+
+    let panelId = this.#toolbar.getAttribute("default-overflowpanel");
+    this.#defaultListPanel = doc.getElementById(panelId);
+    this.#defaultListPanel.addEventListener("popuphiding", this);
+    CustomizableUIInternal.addPanelCloseListeners(this.#defaultListPanel);
+
+    CustomizableUI.addListener(this);
+
+    this.#checkOverflow();
+
+    this.#initialized = true;
+  }
+
+  uninit() {
+    this.#toolbar.removeAttribute("overflowable");
+
+    if (!this.#initialized) {
+      Services.obs.removeObserver(this, "browser-delayed-startup-finished");
+      return;
+    }
+
+    this.#disable();
+
+    let window = this.#toolbar.documentGlobal;
+    window.removeEventListener("resize", this);
+    window.gNavToolbox.removeEventListener("customizationstarting", this);
+    window.gNavToolbox.removeEventListener("aftercustomization", this);
+    this.#defaultListButton.removeEventListener("mousedown", this);
+    this.#defaultListButton.removeEventListener("keypress", this);
+    this.#defaultListButton.removeEventListener("dragover", this);
+    this.#defaultListButton.removeEventListener("dragend", this);
+    this.#defaultListPanel.removeEventListener("popuphiding", this);
+
+    CustomizableUI.removeListener(this);
+    CustomizableUIInternal.removePanelCloseListeners(this.#defaultListPanel);
+  }
+
+  show(aEvent) {
+    if (this.#defaultListPanel.state == "open") {
+      return Promise.resolve();
+    }
+    return new Promise(resolve => {
+      let doc = this.#defaultListPanel.ownerDocument;
+      this.#defaultListPanel.hidden = false;
+      let multiview = this.#defaultListPanel.querySelector("panelmultiview");
+      let mainViewId = multiview.getAttribute("mainViewId");
+      let mainView = doc.getElementById(mainViewId);
+      let contextMenu = doc.getElementById(mainView.getAttribute("context"));
+      contextMenu.addEventListener("command", this, {
+        capture: true,
+        mozSystemGroup: true,
+      });
+      let anchor = this.#defaultListButton.icon;
+
+      let popupshown = false;
+      this.#defaultListPanel.addEventListener(
+        "popupshown",
+        () => {
+          popupshown = true;
+          this.#defaultListPanel.addEventListener("dragover", this);
+          this.#defaultListPanel.addEventListener("dragend", this);
+          Services.tm.dispatchToMainThread(resolve);
+        },
+        { once: true }
+      );
+
+      let openPanel = () => {
+        this.#defaultListPanel.addEventListener(
+          "popupshowing",
+          () => {
+            doc.defaultView.updateEditUIVisibility();
+          },
+          { once: true }
+        );
+
+        this.#defaultListPanel.addEventListener(
+          "popuphidden",
+          () => {
+            if (!popupshown) {
+              openPanel();
+            }
+          },
+          { once: true }
+        );
+
+        lazy.PanelMultiView.openPopup(
+          this.#defaultListPanel,
+          anchor || this.#defaultListButton,
+          {
+            triggerEvent: aEvent,
+          }
+        );
+        this.#defaultListButton.open = true;
+      };
+
+      openPanel();
+    });
+  }
+
+  isHandlingOverflow() {
+    return !!this.#checkOverflowHandle;
+  }
+
+  findOverflowedInsertionPoints(aNode) {
+    let newNodeCanOverflow = aNode.getAttribute("overflows") != "false";
+    let areaId = this.#toolbar.id;
+    let placements = gPlacements.get(areaId);
+    let nodeIndex = placements.indexOf(aNode.id);
+    let nodeBeforeNewNodeIsOverflown = false;
+
+    let loopIndex = -1;
+    while (++loopIndex < placements.length) {
+      let nextNodeId = placements[loopIndex];
+      if (loopIndex > nodeIndex) {
+        let nextNode = this.#toolbar.ownerDocument.getElementById(nextNodeId);
+        if (
+          newNodeCanOverflow &&
+          this.#overflowedInfo.has(nextNodeId) &&
+          nextNode &&
+          nextNode.parentNode == this.#defaultList
+        ) {
+          return [this.#defaultList, nextNode];
+        }
+        if (
+          (!nodeBeforeNewNodeIsOverflown || !newNodeCanOverflow) &&
+          nextNode &&
+          (nextNode.parentNode == this.#target ||
+            (nextNode.parentNode.localName == "toolbarpaletteitem" &&
+              nextNode.parentNode.parentNode == this.#target))
+        ) {
+          return [this.#target, nextNode];
+        }
+      } else if (
+        loopIndex < nodeIndex &&
+        this.#overflowedInfo.has(nextNodeId)
+      ) {
+        nodeBeforeNewNodeIsOverflown = true;
+      }
+    }
+
+    let containerForAppending =
+      this.#overflowedInfo.size && newNodeCanOverflow
+        ? this.#defaultList
+        : this.#target;
+    return [containerForAppending, null];
+  }
+
+  getContainerFor(aNode) {
+    if (aNode.getAttribute("overflowedItem") == "true") {
+      return this.#defaultList;
+    }
+    return this.#target;
+  }
+
+
+  async #onOverflow() {
+    if (!this.#enabled) {
+      return;
+    }
+
+    let win = this.#target.documentGlobal;
+    let checkOverflowHandle = this.#checkOverflowHandle;
+    let { isOverflowing, targetContentWidth } = await this.#getOverflowInfo();
+
+    if (win.closed || this.#checkOverflowHandle != checkOverflowHandle) {
+      lazy.log.debug("Window closed or another overflow handler started.");
+      return;
+    }
+
+    let child = this.#target.lastElementChild;
+    while (child && isOverflowing) {
+      let prevChild = child.previousElementSibling;
+
+      if (child.getAttribute("overflows") != "false") {
+        this.#overflowedInfo.set(child.id, targetContentWidth);
+        let { width: childWidth } =
+          win.windowUtils.getBoundsWithoutFlushing(child);
+        if (!childWidth) {
+          this.#hiddenOverflowedNodes.add(child);
+        }
+
+        child.setAttribute("overflowedItem", true);
+        CustomizableUIInternal.ensureButtonContextMenu(
+          child,
+          this.#toolbar,
+          true
+        );
+        CustomizableUIInternal.notifyListeners(
+          "onWidgetOverflow",
+          child,
+          this.#target
+        );
+
+        child.setAttribute("cui-anchorid", this.#defaultListButton.id);
+        this.#defaultList.insertBefore(
+          child,
+          this.#defaultList.firstElementChild
+        );
+        if (!CustomizableUI.isSpecialWidget(child.id) && childWidth) {
+          this.#toolbar.setAttribute("overflowing", "true");
+        }
+      }
+      child = prevChild;
+      ({ isOverflowing, targetContentWidth } = await this.#getOverflowInfo());
+      if (win.closed || this.#checkOverflowHandle != checkOverflowHandle) {
+        lazy.log.debug("Window closed or another overflow handler started.");
+        return;
+      }
+    }
+
+    win.UpdateUrlbarSearchSplitterState();
+  }
+
+
+  async #getOverflowInfo() {
+    function getInlineSize(aElement) {
+      return aElement.getBoundingClientRect().width;
+    }
+
+    function sumChildrenInlineSize(aParent, aExceptChild = null) {
+      let sum = 0;
+      for (let child of aParent.children) {
+        let style = win.getComputedStyle(child);
+        if (
+          style.display == "none" ||
+          win.XULPopupElement.isInstance(child) ||
+          (style.position != "static" && style.position != "relative")
+        ) {
+          continue;
+        }
+        sum += parseFloat(style.marginLeft) + parseFloat(style.marginRight);
+        if (child != aExceptChild) {
+          sum += getInlineSize(child);
+        }
+      }
+      return sum;
+    }
+
+    let win = this.#target.documentGlobal;
+    let totalAvailWidth;
+    let targetWidth;
+    let targetChildrenWidth;
+
+    await win.promiseDocumentFlushed(() => {
+      let style = win.getComputedStyle(this.#toolbar);
+      let toolbarChildrenWidth = sumChildrenInlineSize(
+        this.#toolbar,
+        this.#target
+      );
+      totalAvailWidth =
+        getInlineSize(this.#toolbar) -
+        parseFloat(style.paddingLeft) -
+        parseFloat(style.paddingRight) -
+        toolbarChildrenWidth;
+      targetWidth = getInlineSize(this.#target);
+      targetChildrenWidth =
+        this.#target == this.#toolbar
+          ? toolbarChildrenWidth
+          : sumChildrenInlineSize(this.#target);
+    });
+
+    lazy.log.debug(
+      `Getting overflow info: target width: ${targetWidth} (${targetChildrenWidth}); avail: ${totalAvailWidth}`
+    );
+
+    let targetContentWidth = Math.floor(
+      Math.max(targetWidth, targetChildrenWidth)
+    );
+    totalAvailWidth = Math.ceil(totalAvailWidth);
+    let isOverflowing = targetContentWidth > totalAvailWidth;
+    return { isOverflowing, targetContentWidth, totalAvailWidth };
+  }
+
+  async #moveItemsBackToTheirOrigin(shouldMoveAllItems, totalAvailWidth) {
+    lazy.log.debug(
+      `Attempting to move ${shouldMoveAllItems ? "all" : "some"} items back`
+    );
+    let placements = gPlacements.get(this.#toolbar.id);
+    let win = this.#target.documentGlobal;
+    let doc = this.#target.ownerDocument;
+    let checkOverflowHandle = this.#checkOverflowHandle;
+
+    let overflowedItemStack = Array.from(this.#overflowedInfo.entries());
+
+    for (let i = overflowedItemStack.length - 1; i >= 0; --i) {
+      let [childID, minSize] = overflowedItemStack[i];
+
+      let child = lazy.PanelMultiView.getViewNode(doc, childID);
+
+      if (!child) {
+        this.#overflowedInfo.delete(childID);
+        continue;
+      }
+
+      lazy.log.debug(
+        `Considering moving ${child.id} back, minSize: ${minSize}`
+      );
+
+      if (!shouldMoveAllItems && minSize) {
+        if (!totalAvailWidth) {
+          ({ totalAvailWidth } = await this.#getOverflowInfo());
+
+          if (win.closed || this.#checkOverflowHandle != checkOverflowHandle) {
+            lazy.log.debug("Window closed or #checkOverflow called again.");
+            return;
+          }
+        }
+        if (totalAvailWidth <= minSize) {
+          lazy.log.debug(
+            `Need ${minSize} but width is ${totalAvailWidth} so bailing`
+          );
+          break;
+        }
+      }
+
+      lazy.log.debug(`Moving ${child.id} back`);
+      this.#overflowedInfo.delete(child.id);
+      let beforeNodeIndex = placements.indexOf(child.id) + 1;
+      if (beforeNodeIndex == 0) {
+        beforeNodeIndex = placements.length;
+      }
+      let inserted = false;
+      for (; beforeNodeIndex < placements.length; beforeNodeIndex++) {
+        let beforeNode = this.#target.getElementsByAttribute(
+          "id",
+          placements[beforeNodeIndex]
+        )[0];
+        if (beforeNode && this.#target == beforeNode.parentElement) {
+          this.#target.insertBefore(child, beforeNode);
+          inserted = true;
+          break;
+        }
+      }
+      if (!inserted) {
+        this.#target.appendChild(child);
+      }
+      child.removeAttribute("cui-anchorid");
+      child.removeAttribute("overflowedItem");
+      CustomizableUIInternal.ensureButtonContextMenu(child, this.#target);
+      CustomizableUIInternal.notifyListeners(
+        "onWidgetUnderflow",
+        child,
+        this.#target
+      );
+    }
+
+    win.UpdateUrlbarSearchSplitterState();
+
+    let defaultListItems = Array.from(this.#defaultList.children);
+    if (
+      defaultListItems.every(
+        item =>
+          CustomizableUI.isSpecialWidget(item.id) ||
+          this.#hiddenOverflowedNodes.has(item)
+      )
+    ) {
+      this.#toolbar.removeAttribute("overflowing");
+    }
+  }
+
+  async #checkOverflow() {
+    if (!this.#enabled) {
+      return;
+    }
+
+    let win = this.#target.documentGlobal;
+    if (win.document.documentElement.hasAttribute("inDOMFullscreen")) {
+      return;
+    }
+
+    let checkOverflowHandle = (this.#checkOverflowHandle = {});
+
+    lazy.log.debug("Checking overflow");
+    let { isOverflowing, totalAvailWidth } = await this.#getOverflowInfo();
+    if (win.closed || this.#checkOverflowHandle != checkOverflowHandle) {
+      return;
+    }
+
+    if (isOverflowing) {
+      await this.#onOverflow();
+    } else {
+      await this.#moveItemsBackToTheirOrigin(false, totalAvailWidth);
+    }
+
+    if (checkOverflowHandle == this.#checkOverflowHandle) {
+      this.#checkOverflowHandle = null;
+    }
+  }
+
+  #disable() {
+    this.#checkOverflowHandle = {};
+    this.#moveItemsBackToTheirOrigin(true);
+    this.#enabled = false;
+  }
+
+  #enable() {
+    this.#enabled = true;
+    this.#checkOverflow();
+  }
+
+  #showWithTimeout() {
+    const OVERFLOW_PANEL_HIDE_DELAY_MS = 500;
+
+    this.show().then(() => {
+      let window = this.#toolbar.documentGlobal;
+      if (this.#hideTimeoutId) {
+        window.clearTimeout(this.#hideTimeoutId);
+      }
+      this.#hideTimeoutId = window.setTimeout(() => {
+        if (!this.#defaultListPanel.firstElementChild.matches(":hover")) {
+          lazy.PanelMultiView.hidePopup(this.#defaultListPanel);
+        }
+      }, OVERFLOW_PANEL_HIDE_DELAY_MS);
+    });
+  }
+
+  #isOverflowList(aNode) {
+    return aNode == this.#defaultList;
+  }
+
+
+  #onClickDefaultListButton(aEvent) {
+    if (this.#defaultListButton.open) {
+      this.#defaultListButton.open = false;
+      lazy.PanelMultiView.hidePopup(this.#defaultListPanel);
+    } else if (
+      this.#defaultListPanel.state != "hiding" &&
+      !this.#defaultListButton.disabled
+    ) {
+      this.show(aEvent);
+    }
+  }
+
+  #onPanelHiding(aEvent) {
+    if (aEvent.target != this.#defaultListPanel) {
+      return;
+    }
+    this.#defaultListButton.open = false;
+    this.#defaultListPanel.removeEventListener("dragover", this);
+    this.#defaultListPanel.removeEventListener("dragend", this);
+    let doc = aEvent.target.ownerDocument;
+    doc.defaultView.updateEditUIVisibility();
+    let contextMenuId = this.#defaultListPanel.getAttribute("context");
+    if (contextMenuId) {
+      let contextMenu = doc.getElementById(contextMenuId);
+      contextMenu.removeEventListener("command", this, {
+        capture: true,
+        mozSystemGroup: true,
+      });
+    }
+  }
+
+  #onResize(aEvent) {
+    if (aEvent.target != aEvent.currentTarget) {
+      return;
+    }
+    this.#checkOverflow();
+  }
+
+
+  onWidgetBeforeDOMChange(aNode, aNextNode, aContainer) {
+    if (!this.#enabled || !this.#isOverflowList(aContainer)) {
+      return;
+    }
+    let updatedMinSize;
+    if (aNode.previousElementSibling) {
+      updatedMinSize = this.#overflowedInfo.get(
+        aNode.previousElementSibling.id
+      );
+    } else {
+      updatedMinSize = 1;
+    }
+    let nextItem = aNode.nextElementSibling;
+    while (nextItem) {
+      this.#overflowedInfo.set(nextItem.id, updatedMinSize);
+      nextItem = nextItem.nextElementSibling;
+    }
+  }
+
+  onWidgetAfterDOMChange(aNode, aNextNode, aContainer) {
+    if (
+      !this.#enabled ||
+      (aContainer != this.#target && !this.#isOverflowList(aContainer))
+    ) {
+      return;
+    }
+
+    let nowOverflowed = this.#isOverflowList(aNode.parentNode);
+    let wasOverflowed = this.#overflowedInfo.has(aNode.id);
+
+    if (!wasOverflowed) {
+      if (nowOverflowed) {
+        let sourceOfMinSize = aNode.previousElementSibling;
+        let minSize = sourceOfMinSize
+          ? this.#overflowedInfo.get(sourceOfMinSize.id)
+          : 1;
+        this.#overflowedInfo.set(aNode.id, minSize);
+        aNode.setAttribute("cui-anchorid", this.#defaultListButton.id);
+        aNode.setAttribute("overflowedItem", true);
+        CustomizableUIInternal.ensureButtonContextMenu(aNode, aContainer, true);
+        CustomizableUIInternal.notifyListeners(
+          "onWidgetOverflow",
+          aNode,
+          this.#target
+        );
+      }
+    } else if (!nowOverflowed) {
+      this.#overflowedInfo.delete(aNode.id);
+      aNode.removeAttribute("cui-anchorid");
+      aNode.removeAttribute("overflowedItem");
+      CustomizableUIInternal.ensureButtonContextMenu(aNode, aContainer);
+      CustomizableUIInternal.notifyListeners(
+        "onWidgetUnderflow",
+        aNode,
+        this.#target
+      );
+
+      let collapsedWidgetIds = Array.from(this.#overflowedInfo.keys());
+      if (collapsedWidgetIds.every(w => CustomizableUI.isSpecialWidget(w))) {
+        this.#toolbar.removeAttribute("overflowing");
+      }
+    } else if (aNode.previousElementSibling) {
+      let prevId = aNode.previousElementSibling.id;
+      let minSize = this.#overflowedInfo.get(prevId);
+      this.#overflowedInfo.set(aNode.id, minSize);
+    }
+
+    this.#checkOverflow();
+  }
+
+  isInOverflowList(node) {
+    return node.parentNode == this.#defaultList;
+  }
+
+
+  observe(aSubject, aTopic) {
+    if (
+      aTopic == "browser-delayed-startup-finished" &&
+      aSubject == this.#toolbar.documentGlobal
+    ) {
+      Services.obs.removeObserver(this, "browser-delayed-startup-finished");
+      this.init();
+    }
+  }
+
+
+  handleEvent(aEvent) {
+    switch (aEvent.type) {
+      case "aftercustomization": {
+        this.#enable();
+        break;
+      }
+      case "mousedown": {
+        if (aEvent.button != 0) {
+          break;
+        }
+        if (aEvent.target == this.#defaultListButton) {
+          this.#onClickDefaultListButton(aEvent);
+        } else {
+          lazy.PanelMultiView.hidePopup(this.#defaultListPanel);
+        }
+        break;
+      }
+      case "keypress": {
+        if (
+          aEvent.target == this.#defaultListButton &&
+          (aEvent.key == " " || aEvent.key == "Enter")
+        ) {
+          this.#onClickDefaultListButton(aEvent);
+        }
+        break;
+      }
+      case "customizationstarting": {
+        this.#disable();
+        break;
+      }
+      case "dragover": {
+        if (this.#enabled) {
+          this.#showWithTimeout();
+        }
+        break;
+      }
+      case "dragend": {
+        lazy.PanelMultiView.hidePopup(this.#defaultListPanel);
+        break;
+      }
+      case "popuphiding": {
+        this.#onPanelHiding(aEvent);
+        break;
+      }
+      case "resize": {
+        this.#onResize(aEvent);
+        break;
+      }
+    }
+  }
+}
+
+CustomizableUIInternal.initialize();

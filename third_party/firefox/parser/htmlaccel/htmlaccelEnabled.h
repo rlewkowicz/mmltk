@@ -1,0 +1,37 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_htmlaccel_htmlaccelEnabled_h
+#define mozilla_htmlaccel_htmlaccelEnabled_h
+
+#include "mozilla/Assertions.h"
+#if defined(__x86_64__)
+#  include "mozilla/SSE.h"
+#endif
+
+namespace mozilla::htmlaccel {
+
+
+inline bool htmlaccelEnabled() {
+#if !defined(__clang__) && defined(__GNUC__) && __GNUC__ < 12
+  return false;
+#elif defined(__aarch64__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#  define MOZ_MAY_HAVE_HTMLACCEL 1
+  return true;
+#elif defined(__x86_64__)
+#  define MOZ_MAY_HAVE_HTMLACCEL 1
+  bool ret = mozilla::supports_bmi();
+  if (ret) {
+    MOZ_ASSERT(mozilla::supports_avx(),
+               "supports_bmi is supposed to imply supports_avx");
+  }
+  return ret;
+#else
+  return false;
+#endif
+}
+
+}  
+
+#endif  // mozilla_htmlaccel_htmlaccelEnabled_h

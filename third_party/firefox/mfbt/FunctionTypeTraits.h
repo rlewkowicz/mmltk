@@ -1,0 +1,78 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_FunctionTypeTraits_h
+#define mozilla_FunctionTypeTraits_h
+
+#include <cstddef> /* for size_t */
+
+namespace mozilla {
+
+template <typename T>
+struct FunctionTypeTraits;
+
+template <typename T>
+struct FunctionTypeTraits<T&> : FunctionTypeTraits<T> {};
+template <typename T>
+struct FunctionTypeTraits<T&&> : FunctionTypeTraits<T> {};
+template <typename T>
+struct FunctionTypeTraits<T*> : FunctionTypeTraits<T> {};
+
+template <typename T>
+struct FunctionTypeTraits : FunctionTypeTraits<decltype(&T::operator())> {};
+
+namespace detail {
+template <size_t N, typename... As>
+struct SafePackElement;
+
+template <size_t N>
+struct SafePackElement<N> {
+  using type = void;
+};
+
+template <typename A, typename... As>
+struct SafePackElement<0, A, As...> {
+  using type = A;
+};
+
+template <size_t N, typename A, typename... As>
+struct SafePackElement<N, A, As...> : SafePackElement<N - 1, As...> {};
+
+template <size_t N, typename... As>
+using SafePackElementType = typename SafePackElement<N, As...>::type;
+
+}  
+
+template <typename R, typename... As>
+struct FunctionTypeTraits<R(As...)> {
+  using ReturnType = R;
+  static constexpr size_t arity = sizeof...(As);
+  template <size_t N>
+  using ParameterType = detail::SafePackElementType<N, As...>;
+};
+
+template <typename C, typename R, typename... As>
+struct FunctionTypeTraits<R (C::*)(As...)> : FunctionTypeTraits<R(As...)> {};
+
+template <typename C, typename R, typename... As>
+struct FunctionTypeTraits<R (C::*)(As...) const>
+    : FunctionTypeTraits<R(As...)> {};
+
+#ifdef NS_HAVE_STDCALL
+template <typename R, typename... As>
+struct FunctionTypeTraits<R NS_STDCALL(As...)> : FunctionTypeTraits<R(As...)> {
+};
+
+template <typename C, typename R, typename... As>
+struct FunctionTypeTraits<R (NS_STDCALL C::*)(As...)>
+    : FunctionTypeTraits<R(As...)> {};
+
+template <typename C, typename R, typename... As>
+struct FunctionTypeTraits<R (NS_STDCALL C::*)(As...) const>
+    : FunctionTypeTraits<R(As...)> {};
+#endif  // NS_HAVE_STDCALL
+
+}  
+
+#endif  // mozilla_FunctionTypeTraits_h

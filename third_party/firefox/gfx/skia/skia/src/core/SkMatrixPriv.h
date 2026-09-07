@@ -1,0 +1,155 @@
+/*
+ * Copyright 2016 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkMatrixPriv_DEFINE)
+#define SkMatrixPriv_DEFINE
+
+#include "include/core/SkM44.h"
+#include "include/core/SkMatrix.h"
+#include "include/core/SkPoint.h"
+#include "include/core/SkRect.h"
+#include "include/core/SkScalar.h"
+#include "include/core/SkTypes.h"
+#include "src/base/SkVx.h"
+
+#include <cstdint>
+#include <cstring>
+struct SkPoint3;
+
+class SkMatrixPriv {
+public:
+    enum {
+        kMaxFlattenSize = 9 * sizeof(SkScalar) + sizeof(uint32_t),
+    };
+
+    static size_t WriteToMemory(const SkMatrix& matrix, void* buffer) {
+        return matrix.writeToMemory(buffer);
+    }
+
+    static size_t ReadFromMemory(SkMatrix* matrix, const void* buffer, size_t length) {
+        return matrix->readFromMemory(buffer, length);
+    }
+
+    typedef SkMatrix::MapPtsProc MapPtsProc;
+
+
+    static MapPtsProc GetMapPtsProc(const SkMatrix& matrix) {
+        return SkMatrix::GetMapPtsProc(matrix.getType());
+    }
+
+    [[nodiscard]] static bool InverseMapRect(const SkMatrix& mx, SkRect* dst, const SkRect& src) {
+        if (mx.isScaleTranslate()) {
+            if (mx.getScaleX() == 0.f || mx.getScaleY() == 0.f) {
+                return false;
+            }
+
+            const SkScalar tx = mx.getTranslateX();
+            const SkScalar ty = mx.getTranslateY();
+            auto inverted = skvx::float4::Load(&src.fLeft);
+            inverted -= skvx::float4(tx, ty, tx, ty);
+
+            if (mx.getType() > SkMatrix::kTranslate_Mask) {
+                const SkScalar sx = 1.f / mx.getScaleX();
+                const SkScalar sy = 1.f / mx.getScaleY();
+                inverted *= skvx::float4(sx, sy, sx, sy);
+                if (sx < 0.f && sy < 0.f) {
+                    inverted = skvx::shuffle<2, 3, 0, 1>(inverted); 
+                } else if (sx < 0.f) {
+                    inverted = skvx::shuffle<2, 1, 0, 3>(inverted); 
+                } else if (sy < 0.f) {
+                    inverted = skvx::shuffle<0, 3, 2, 1>(inverted); 
+                }
+            }
+            inverted.store(&dst->fLeft);
+            return true;
+        }
+
+        if (auto inverse = mx.invert()) {
+            inverse->mapRect(dst, src);
+            return true;
+        }
+        return false;
+    }
+
+    static void MapPointsWithStride(const SkMatrix& mx, SkPoint pts[], size_t stride, int count) {
+        SkASSERT(stride >= sizeof(SkPoint));
+        SkASSERT(0 == stride % sizeof(SkScalar));
+
+        SkMatrix::TypeMask tm = mx.getType();
+
+        if (SkMatrix::kIdentity_Mask == tm) {
+            return;
+        }
+        if (SkMatrix::kTranslate_Mask == tm) {
+            const SkScalar tx = mx.getTranslateX();
+            const SkScalar ty = mx.getTranslateY();
+            skvx::float2 trans(tx, ty);
+            for (int i = 0; i < count; ++i) {
+                (skvx::float2::Load(&pts->fX) + trans).store(&pts->fX);
+                pts = (SkPoint*)((intptr_t)pts + stride);
+            }
+            return;
+        }
+
+        if (mx.hasPerspective()) {
+            for (int i = 0; i < count; ++i) {
+                *pts = mx.mapPointPerspective(*pts);
+                pts = (SkPoint*)((intptr_t)pts + stride);
+            }
+        } else {
+            for (int i = 0; i < count; ++i) {
+                *pts = mx.mapPointAffine(*pts);
+                pts = (SkPoint*)((intptr_t)pts + stride);
+            }
+        }
+    }
+
+    static void MapPointsWithStride(const SkMatrix& mx, SkPoint dst[], size_t dstStride,
+                                    const SkPoint src[], size_t srcStride, int count) {
+        SkASSERT(srcStride >= sizeof(SkPoint));
+        SkASSERT(dstStride >= sizeof(SkPoint));
+        SkASSERT(0 == srcStride % sizeof(SkScalar));
+        SkASSERT(0 == dstStride % sizeof(SkScalar));
+        for (int i = 0; i < count; ++i) {
+            *dst = mx.mapPoint(*src);
+            src = (SkPoint*)((intptr_t)src + srcStride);
+            dst = (SkPoint*)((intptr_t)dst + dstStride);
+        }
+    }
+
+    static void MapHomogeneousPointsWithStride(const SkMatrix& mx, SkPoint3 dst[], size_t dstStride,
+                                               const SkPoint3 src[], size_t srcStride, int count);
+
+    static bool PostIDiv(SkMatrix* matrix, int divx, int divy) {
+        return matrix->postIDiv(divx, divy);
+    }
+
+    static bool CheapEqual(const SkMatrix& a, const SkMatrix& b) {
+        return &a == &b || 0 == memcmp(a.fMat, b.fMat, sizeof(a.fMat));
+    }
+
+    static const SkScalar* M44ColMajor(const SkM44& m) { return m.fMat; }
+
+    static bool IsScaleTranslateAsM33(const SkM44& m) {
+        return m.rc(1,0) == 0 && m.rc(3,0) == 0 &&
+               m.rc(0,1) == 0 && m.rc(3,1) == 0 &&
+               m.rc(3,3) == 1;
+
+    }
+
+    static SkRect MapRect(const SkM44& m, const SkRect& r);
+
+    static SkScalar DifferentialAreaScale(const SkMatrix& m, const SkPoint& p);
+
+    static bool NearlyAffine(const SkMatrix& m,
+                             const SkRect& bounds,
+                             SkScalar tolerance = SK_ScalarNearlyZero);
+
+    static SkScalar ComputeResScaleForStroking(const SkMatrix& matrix);
+};
+
+#endif

@@ -1,0 +1,97 @@
+/*
+ * Copyright 2016 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SKSL_BINARYEXPRESSION)
+#define SKSL_BINARYEXPRESSION
+
+#include "include/core/SkTypes.h"
+#include "src/sksl/SkSLOperator.h"
+#include "src/sksl/SkSLPosition.h"
+#include "src/sksl/ir/SkSLExpression.h"
+#include "src/sksl/ir/SkSLIRNode.h"
+
+#include <memory>
+#include <string>
+#include <utility>
+
+namespace SkSL {
+
+class Context;
+class Type;
+class VariableReference;
+
+class BinaryExpression final : public Expression {
+public:
+    inline static constexpr Kind kIRNodeKind = Kind::kBinary;
+
+    BinaryExpression(Position pos, std::unique_ptr<Expression> left, Operator op,
+                     std::unique_ptr<Expression> right, const Type* type)
+        : INHERITED(pos, kIRNodeKind, type)
+        , fLeft(std::move(left))
+        , fOperator(op)
+        , fRight(std::move(right)) {
+        SkASSERT(!op.isAssignment() || CheckRef(*this->left()));
+    }
+
+    static std::unique_ptr<Expression> Convert(const Context& context,
+                                               Position pos,
+                                               std::unique_ptr<Expression> left,
+                                               Operator op,
+                                               std::unique_ptr<Expression> right);
+
+    static std::unique_ptr<Expression> Make(const Context& context,
+                                            Position pos,
+                                            std::unique_ptr<Expression> left,
+                                            Operator op,
+                                            std::unique_ptr<Expression> right);
+
+    static std::unique_ptr<Expression> Make(const Context& context,
+                                            Position pos,
+                                            std::unique_ptr<Expression> left,
+                                            Operator op,
+                                            std::unique_ptr<Expression> right,
+                                            const Type* resultType);
+
+    std::unique_ptr<Expression>& left() {
+        return fLeft;
+    }
+
+    const std::unique_ptr<Expression>& left() const {
+        return fLeft;
+    }
+
+    std::unique_ptr<Expression>& right() {
+        return fRight;
+    }
+
+    const std::unique_ptr<Expression>& right() const {
+        return fRight;
+    }
+
+    Operator getOperator() const {
+        return fOperator;
+    }
+
+    std::unique_ptr<Expression> clone(Position pos) const override;
+
+    std::string description(OperatorPrecedence parentPrecedence) const override;
+
+    VariableReference* isAssignmentIntoVariable();
+
+private:
+    static bool CheckRef(const Expression& expr);
+
+    std::unique_ptr<Expression> fLeft;
+    Operator fOperator;
+    std::unique_ptr<Expression> fRight;
+
+    using INHERITED = Expression;
+};
+
+}  
+
+#endif

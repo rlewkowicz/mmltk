@@ -1,0 +1,128 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef js_Principals_h
+#define js_Principals_h
+
+#include "mozilla/Atomics.h"
+
+#include <stdint.h>
+
+#include "jstypes.h"
+
+#include "js/TypeDecls.h"
+
+struct JSStructuredCloneReader;
+struct JSStructuredCloneWriter;
+
+struct JSPrincipals {
+  mozilla::Atomic<int32_t, mozilla::SequentiallyConsistent> refcount{0};
+
+#ifdef JS_DEBUG
+  uint32_t debugToken = 0;
+#endif
+
+  JSPrincipals() = default;
+
+  struct RefCount {
+    const int32_t value;
+    constexpr explicit RefCount(int32_t value) : value(value) {}
+    RefCount(const RefCount&) = delete;
+  };
+  explicit constexpr JSPrincipals(RefCount c) : refcount{c.value} {}
+
+  void setDebugToken(int32_t token) {
+#ifdef JS_DEBUG
+    debugToken = token;
+#endif
+  }
+
+  virtual bool write(JSContext* cx, JSStructuredCloneWriter* writer) = 0;
+
+  virtual bool isSystemPrincipal() = 0;
+
+  JS_PUBLIC_API void dump();
+};
+
+extern JS_PUBLIC_API void JS_HoldPrincipals(JSPrincipals* principals);
+
+extern JS_PUBLIC_API void JS_DropPrincipals(JSContext* cx,
+                                            JSPrincipals* principals);
+
+typedef bool (*JSSubsumesOp)(JSPrincipals* first, JSPrincipals* second);
+
+namespace JS {
+enum class RuntimeCode { JS, WASM };
+enum class CompilationType { DirectEval, IndirectEval, Function, Undefined };
+}  
+
+typedef bool (*JSCSPEvalChecker)(
+    JSContext* cx, JS::RuntimeCode kind, JS::Handle<JSString*> codeString,
+    JS::CompilationType compilationType,
+    JS::Handle<JS::StackGCVector<JSString*>> parameterStrings,
+    JS::Handle<JSString*> bodyString,
+    JS::Handle<JS::StackGCVector<JS::Value>> parameterArgs,
+    JS::Handle<JS::Value> bodyArg, bool* outCanCompileStrings);
+
+typedef bool (*JSCodeForEvalOp)(JSContext* cx, JS::HandleObject code,
+                                JS::MutableHandle<JSString*> outCode);
+
+struct JSSecurityCallbacks {
+  JSCSPEvalChecker contentSecurityPolicyAllows;
+  JSCodeForEvalOp codeForEvalGets;
+  JSSubsumesOp subsumes;
+};
+
+extern JS_PUBLIC_API void JS_SetSecurityCallbacks(
+    JSContext* cx, const JSSecurityCallbacks* callbacks);
+
+extern JS_PUBLIC_API const JSSecurityCallbacks* JS_GetSecurityCallbacks(
+    JSContext* cx);
+
+extern JS_PUBLIC_API void JS_SetTrustedPrincipals(JSContext* cx,
+                                                  JSPrincipals* prin);
+
+typedef void (*JSDestroyPrincipalsOp)(JSPrincipals* principals);
+
+extern JS_PUBLIC_API void JS_InitDestroyPrincipalsCallback(
+    JSContext* cx, JSDestroyPrincipalsOp destroyPrincipals);
+
+using JSReadPrincipalsOp = bool (*)(JSContext* cx,
+                                    JSStructuredCloneReader* reader,
+                                    JSPrincipals** outPrincipals);
+
+extern JS_PUBLIC_API void JS_InitReadPrincipalsCallback(
+    JSContext* cx, JSReadPrincipalsOp read);
+
+namespace JS {
+
+class MOZ_RAII AutoHoldPrincipals {
+  JSContext* cx_;
+  JSPrincipals* principals_ = nullptr;
+
+ public:
+  explicit AutoHoldPrincipals(JSContext* cx, JSPrincipals* principals = nullptr)
+      : cx_(cx) {
+    reset(principals);
+  }
+
+  ~AutoHoldPrincipals() { reset(nullptr); }
+
+  void reset(JSPrincipals* principals) {
+    if (principals) {
+      JS_HoldPrincipals(principals);
+    }
+    if (principals_) {
+      JS_DropPrincipals(cx_, principals_);
+    }
+    principals_ = principals;
+  }
+
+  JSPrincipals* get() const { return principals_; }
+};
+
+}  
+
+#endif /* js_Principals_h */

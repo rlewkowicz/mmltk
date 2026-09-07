@@ -1,0 +1,1356 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+ChromeUtils.defineESModuleGetters(this, {
+  PlacesTransactions: "resource://gre/modules/PlacesTransactions.sys.mjs",
+  PlacesUIUtils: "moz-src:///browser/components/places/PlacesUIUtils.sys.mjs",
+  PlacesUtils: "resource://gre/modules/PlacesUtils.sys.mjs",
+});
+
+
+function PlacesInsertionPoint({
+  parentGuid,
+  index = PlacesUtils.bookmarks.DEFAULT_INDEX,
+  orientation = Ci.nsITreeView.DROP_ON,
+  tagName = null,
+  dropNearNode = null,
+}) {
+  this.guid = parentGuid;
+  this._index = index;
+  this.orientation = orientation;
+  this.tagName = tagName;
+  this.dropNearNode = dropNearNode;
+}
+
+PlacesInsertionPoint.prototype = {
+  set index(val) {
+    this._index = val;
+  },
+
+  async getIndex() {
+    if (this.dropNearNode) {
+      let index = (
+        await PlacesUtils.bookmarks.fetch(this.dropNearNode.bookmarkGuid)
+      ).index;
+      return this.orientation == Ci.nsITreeView.DROP_BEFORE ? index : index + 1;
+    }
+    return this._index;
+  },
+
+  get isTag() {
+    return typeof this.tagName == "string";
+  },
+};
+
+
+function PlacesController(aView) {
+  this._view = aView;
+  ChromeUtils.defineLazyGetter(this, "profileName", function () {
+    return Services.dirsvc.get("ProfD", Ci.nsIFile).leafName;
+  });
+
+  ChromeUtils.defineESModuleGetters(this, {
+    ForgetAboutSite: "resource://gre/modules/ForgetAboutSite.sys.mjs",
+  });
+}
+
+PlacesController.prototype = {
+  _view: null,
+
+  disableUserActions: false,
+
+  QueryInterface: ChromeUtils.generateQI(["nsIClipboardOwner"]),
+
+  LosingOwnership: function PC_LosingOwnership() {
+    this.cutNodes = [];
+  },
+
+  terminate: function PC_terminate() {
+    this._releaseClipboardOwnership();
+  },
+
+  supportsCommand: function PC_supportsCommand(aCommand) {
+    if (this.disableUserActions) {
+      return false;
+    }
+    switch (aCommand) {
+      case "cmd_undo":
+      case "cmd_redo":
+      case "cmd_cut":
+      case "cmd_copy":
+      case "cmd_paste":
+      case "cmd_delete":
+      case "cmd_selectAll":
+        return true;
+    }
+
+    const CMD_PREFIX = "placesCmd_";
+    return aCommand.substr(0, CMD_PREFIX.length) == CMD_PREFIX;
+  },
+
+  isCommandEnabled: function PC_isCommandEnabled(aCommand) {
+    let ip = this._view.insertionPoint;
+    let canInsert = ip && (aCommand.endsWith("_paste") || !ip.isTag);
+
+    switch (aCommand) {
+      case "cmd_undo":
+        return PlacesTransactions.topUndoEntry != null;
+      case "cmd_redo":
+        return PlacesTransactions.topRedoEntry != null;
+      case "cmd_cut":
+      case "placesCmd_cut":
+        for (let node of this._view.selectedNodes) {
+          if (
+            node.itemId == -1 ||
+            (node.parent && PlacesUtils.nodeIsTagQuery(node.parent))
+          ) {
+            return false;
+          }
+        }
+      // Otherwise fall through the cmd_delete check.
+      case "cmd_delete":
+      case "placesCmd_delete":
+      case "placesCmd_deleteDataHost":
+        return this._hasRemovableSelection();
+      case "cmd_copy":
+      case "placesCmd_copy":
+      case "placesCmd_showInFolder":
+        return this._view.hasSelection;
+      case "cmd_paste":
+      case "placesCmd_paste":
+        return (
+          canInsert &&
+          Services.clipboard.hasDataMatchingFlavors(
+            [
+              ...PlacesUIUtils.PLACES_FLAVORS,
+              PlacesUtils.TYPE_X_MOZ_URL,
+              PlacesUtils.TYPE_PLAINTEXT,
+            ],
+            Ci.nsIClipboard.kGlobalClipboard
+          )
+        );
+      case "cmd_selectAll":
+        if (this._view.selType != "single") {
+          let rootNode = this._view.result.root;
+          if (rootNode.containerOpen && rootNode.childCount > 0) {
+            return true;
+          }
+        }
+        return false;
+      case "placesCmd_open":
+      case "placesCmd_open:window":
+      case "placesCmd_open:privatewindow":
+      case "placesCmd_open:tab": {
+        let selectedNode = this._view.selectedNode;
+        return selectedNode && PlacesUtils.nodeIsURI(selectedNode);
+      }
+      case "placesCmd_new:folder":
+        return canInsert;
+      case "placesCmd_new:bookmark":
+        return canInsert;
+      case "placesCmd_new:separator":
+        return (
+          canInsert &&
+          !PlacesUtils.asQuery(this._view.result.root).queryOptions
+            .excludeItems &&
+          this._view.result.sortingMode ==
+            Ci.nsINavHistoryQueryOptions.SORT_BY_NONE
+        );
+      case "placesCmd_show:info": {
+        let selectedNode = this._view.selectedNode;
+        return (
+          selectedNode &&
+          !PlacesUtils.isRootItem(
+            PlacesUtils.getConcreteItemGuid(selectedNode)
+          ) &&
+          (PlacesUtils.nodeIsTagQuery(selectedNode) ||
+            PlacesUtils.nodeIsBookmark(selectedNode) ||
+            (PlacesUtils.nodeIsFolderOrShortcut(selectedNode) &&
+              !PlacesUtils.nodeIsQueryGeneratedFolder(selectedNode)))
+        );
+      }
+      case "placesCmd_sortBy:name": {
+        let selectedNode = this._view.selectedNode;
+        return (
+          selectedNode &&
+          PlacesUtils.nodeIsFolderOrShortcut(selectedNode) &&
+          !PlacesUIUtils.isFolderReadOnly(selectedNode) &&
+          this._view.result.sortingMode ==
+            Ci.nsINavHistoryQueryOptions.SORT_BY_NONE
+        );
+      }
+      case "placesCmd_createBookmark": {
+        return !this._view.selectedNodes.some(
+          node => !PlacesUtils.nodeIsURI(node) || node.itemId != -1
+        );
+      }
+      default:
+        return false;
+    }
+  },
+
+  doCommand: function PC_doCommand(aCommand) {
+    if (aCommand != "cmd_delete" && aCommand != "placesCmd_delete") {
+      this._lastRemoveOperationFingerprint = null;
+    }
+    switch (aCommand) {
+      case "cmd_undo":
+        PlacesTransactions.undo().catch(console.error);
+        break;
+      case "cmd_redo":
+        PlacesTransactions.redo().catch(console.error);
+        break;
+      case "cmd_cut":
+      case "placesCmd_cut":
+        this.cut();
+        break;
+      case "cmd_copy":
+      case "placesCmd_copy":
+        this.copy();
+        break;
+      case "cmd_paste":
+      case "placesCmd_paste":
+        this.paste().catch(console.error);
+        break;
+      case "cmd_delete":
+      case "placesCmd_delete":
+        this.remove("Remove Selection").catch(console.error);
+        break;
+      case "placesCmd_deleteDataHost":
+        this.forgetAboutThisSite().catch(console.error);
+        break;
+      case "cmd_selectAll":
+        this.selectAll();
+        break;
+      case "placesCmd_open":
+        PlacesUIUtils.openNodeIn(
+          this._view.selectedNode,
+          "current",
+          this._view
+        );
+        break;
+      case "placesCmd_open:window":
+        PlacesUIUtils.openNodeIn(this._view.selectedNode, "window", this._view);
+        break;
+      case "placesCmd_open:privatewindow":
+        PlacesUIUtils.openNodeIn(
+          this._view.selectedNode,
+          "window",
+          this._view,
+          true
+        );
+        break;
+      case "placesCmd_open:tab":
+        PlacesUIUtils.openNodeIn(this._view.selectedNode, "tab", this._view);
+        break;
+      case "placesCmd_new:folder":
+        this.newItem("folder").catch(console.error);
+        break;
+      case "placesCmd_new:bookmark":
+        this.newItem("bookmark").catch(console.error);
+        break;
+      case "placesCmd_new:separator":
+        this.newSeparator().catch(console.error);
+        break;
+      case "placesCmd_show:info":
+        this.showBookmarkPropertiesForSelection();
+        break;
+      case "placesCmd_sortBy:name":
+        this.sortFolderByName().catch(console.error);
+        break;
+      case "placesCmd_createBookmark": {
+        const nodes = this._view.selectedNodes.map(node => {
+          return {
+            uri: Services.io.newURI(node.uri),
+            title: node.title,
+          };
+        });
+        PlacesUIUtils.showBookmarkPagesDialog(
+          nodes,
+          ["keyword", "location"],
+          window.top
+        );
+        break;
+      }
+      case "placesCmd_showInFolder":
+        this.showInFolder(this._view.selectedNode.bookmarkGuid);
+        break;
+    }
+  },
+
+  onEvent: function PC_onEvent() {},
+
+  _hasRemovableSelection() {
+    var ranges = this._view.removableSelectionRanges;
+    if (!ranges.length) {
+      return false;
+    }
+
+    var root = this._view.result.root;
+
+    for (var j = 0; j < ranges.length; j++) {
+      var nodes = ranges[j];
+      for (var i = 0; i < nodes.length; ++i) {
+        if (nodes[i] == root) {
+          return false;
+        }
+
+        if (!PlacesUIUtils.canUserRemove(nodes[i])) {
+          return false;
+        }
+      }
+    }
+
+    return true;
+  },
+
+  _isRepeatedRemoveOperation() {
+    let lastRemoveOperationFingerprint = this._lastRemoveOperationFingerprint;
+    this._lastRemoveOperationFingerprint = PlacesUtils.sha256(
+      this._view.selectedNodes
+        .map(n => n.bookmarkGuid || (n.pageGuid || n.uri) + n.time)
+        .join()
+    );
+    return (
+      lastRemoveOperationFingerprint == this._lastRemoveOperationFingerprint
+    );
+  },
+
+  _buildSelectionMetadata() {
+    return this._view.selectedNodes.map(n => this._selectionMetadataForNode(n));
+  },
+
+  _selectionMetadataForNode(node) {
+    let nodeData = {};
+    switch (node.type) {
+      case Ci.nsINavHistoryResultNode.RESULT_TYPE_QUERY:
+        nodeData.query = true;
+        if (node.parent) {
+          switch (PlacesUtils.asQuery(node.parent).queryOptions.resultType) {
+            case Ci.nsINavHistoryQueryOptions.RESULTS_AS_SITE_QUERY:
+              nodeData.query_host = true;
+              break;
+            case Ci.nsINavHistoryQueryOptions.RESULTS_AS_DATE_SITE_QUERY:
+            case Ci.nsINavHistoryQueryOptions.RESULTS_AS_DATE_QUERY:
+              nodeData.query_day = true;
+              break;
+            case Ci.nsINavHistoryQueryOptions.RESULTS_AS_TAGS_ROOT:
+              nodeData.query_tag = true;
+          }
+        }
+        break;
+      case Ci.nsINavHistoryResultNode.RESULT_TYPE_FOLDER:
+      case Ci.nsINavHistoryResultNode.RESULT_TYPE_FOLDER_SHORTCUT:
+        nodeData.folder = true;
+        break;
+      case Ci.nsINavHistoryResultNode.RESULT_TYPE_SEPARATOR:
+        nodeData.separator = true;
+        break;
+      case Ci.nsINavHistoryResultNode.RESULT_TYPE_URI:
+        nodeData.link = true;
+        if (PlacesUtils.nodeIsBookmark(node)) {
+          nodeData.link_bookmark = true;
+          var parentNode = node.parent;
+          if (parentNode && PlacesUtils.nodeIsTagQuery(parentNode)) {
+            nodeData.link_bookmark_tag = true;
+          }
+        }
+        break;
+    }
+    return nodeData;
+  },
+
+  _shouldShowMenuItem(aMenuItem, aMetaData) {
+    if (PlacesUIUtils.shouldHideOpenMenuItem(aMenuItem)) {
+      return false;
+    }
+
+    let selectiontype =
+      aMenuItem.getAttribute("selection-type") || "single|multiple";
+
+    var selectionTypes = selectiontype.split("|");
+    if (selectionTypes.includes("any")) {
+      return true;
+    }
+    var count = aMetaData.length;
+    if (count > 1 && !selectionTypes.includes("multiple")) {
+      return false;
+    }
+    if (count == 1 && !selectionTypes.includes("single")) {
+      return false;
+    }
+    if (count == 0) {
+      if (!selectionTypes.includes("none")) {
+        return false;
+      }
+      aMetaData = [this._selectionMetadataForNode(this._view.result.root)];
+    }
+
+    let attr = aMenuItem.getAttribute("hide-if-node-type");
+    if (attr) {
+      let rules = attr.split("|");
+      if (aMetaData.some(d => rules.some(r => r in d))) {
+        return false;
+      }
+    }
+
+    attr = aMenuItem.getAttribute("hide-if-node-type-is-only");
+    if (attr) {
+      let rules = attr.split("|");
+      if (rules.some(r => aMetaData.every(d => r in d))) {
+        return false;
+      }
+    }
+
+    attr = aMenuItem.getAttribute("node-type");
+    if (!attr) {
+      return true;
+    }
+
+    let anyMatched = false;
+    let rules = attr.split("|");
+    for (let metaData of aMetaData) {
+      if (rules.some(r => r in metaData)) {
+        anyMatched = true;
+      } else {
+        return false;
+      }
+    }
+    return anyMatched;
+  },
+
+  buildContextMenu(aPopup) {
+    var metadata = this._buildSelectionMetadata();
+    var ip = this._view.insertionPoint;
+    var noIp = !ip || ip.isTag;
+
+    var separator = null;
+    var visibleItemsBeforeSep = false;
+    var usableItemCount = 0;
+    for (var i = 0; i < aPopup.children.length; ++i) {
+      var item = aPopup.children[i];
+      if (item.getAttribute("ignore-item") == "true") {
+        continue;
+      }
+      if (item.localName != "menuseparator") {
+        let hideIfNoIP =
+          item.getAttribute("hide-if-no-insertion-point") == "true" &&
+          noIp &&
+          !(ip && ip.isTag && item.id == "placesContext_paste");
+        let hideIfSingleClickOpens =
+          item.getAttribute("hide-if-single-click-opens") == "true" &&
+          !PlacesUIUtils.loadBookmarksInBackground &&
+          !PlacesUIUtils.loadBookmarksInTabs &&
+          this._view.singleClickOpens;
+        let hideIfNotSearch =
+          item.getAttribute("hide-if-not-search") == "true" &&
+          (!this._view.selectedNode ||
+            !this._view.selectedNode.parent ||
+            !PlacesUtils.nodeIsQuery(this._view.selectedNode.parent));
+
+        let shouldHideItem =
+          hideIfNoIP ||
+          hideIfSingleClickOpens ||
+          hideIfNotSearch ||
+          !this._shouldShowMenuItem(item, metadata);
+        item.hidden = shouldHideItem;
+        item.disabled =
+          shouldHideItem || item.getAttribute("start-disabled") == "true";
+
+        if (!item.hidden) {
+          visibleItemsBeforeSep = true;
+          usableItemCount++;
+
+          if (separator) {
+            separator.hidden = false;
+            separator = null;
+          }
+        }
+      } else {
+        item.hidden = true;
+
+        if (visibleItemsBeforeSep) {
+          separator = item;
+        }
+
+        visibleItemsBeforeSep = false;
+      }
+
+      if (item.id === "placesContext_deleteBookmark") {
+        document.l10n.setAttributes(item, "places-delete-bookmark", {
+          count: metadata.length,
+        });
+      }
+      if (item.id === "placesContext_deleteFolder") {
+        document.l10n.setAttributes(item, "places-delete-folder", {
+          count: metadata.length,
+        });
+      }
+    }
+
+    if (usableItemCount > 0) {
+      let openContainerInTabsItem = document.getElementById(
+        "placesContext_openContainer:tabs"
+      );
+      let openBookmarksItem = document.getElementById(
+        "placesContext_openBookmarkContainer:tabs"
+      );
+      for (let menuItem of [openContainerInTabsItem, openBookmarksItem]) {
+        if (!menuItem.hidden) {
+          var containerToUse =
+            this._view.selectedNode || this._view.result.root;
+          if (PlacesUtils.nodeIsContainer(containerToUse)) {
+            if (!PlacesUtils.hasChildURIs(containerToUse)) {
+              menuItem.disabled = true;
+              usableItemCount--;
+            }
+          }
+        }
+      }
+    }
+
+    const deleteHistoryItem = document.getElementById(
+      "placesContext_delete_history"
+    );
+    document.l10n.setAttributes(deleteHistoryItem, "places-delete-page", {
+      count: metadata.length,
+    });
+
+    const createBookmarkItem = document.getElementById(
+      "placesContext_createBookmark"
+    );
+    document.l10n.setAttributes(createBookmarkItem, "places-create-bookmark", {
+      count: metadata.length,
+    });
+
+    return usableItemCount > 0;
+  },
+
+  selectAll: function PC_selectAll() {
+    this._view.selectAll();
+  },
+
+  showBookmarkPropertiesForSelection() {
+    let node = this._view.selectedNode;
+    if (!node) {
+      return;
+    }
+
+    PlacesUIUtils.showBookmarkDialog(
+      { action: "edit", node, hiddenRows: ["folderPicker"] },
+      window.top
+    );
+  },
+
+  openSelectionInTabs: function PC_openLinksInTabs(aEvent) {
+    var node = this._view.selectedNode;
+    var nodes = this._view.selectedNodes;
+    if (!node && !nodes.length) {
+      node = this._view.result.root;
+    }
+    PlacesUIUtils.openMultipleLinksInTabs(
+      node ? node : nodes,
+      aEvent,
+      this._view
+    );
+  },
+
+  async newItem(aType) {
+    let ip = this._view.insertionPoint;
+    if (!ip) {
+      throw Components.Exception("", Cr.NS_ERROR_NOT_AVAILABLE);
+    }
+
+    let bookmarkGuid = await PlacesUIUtils.showBookmarkDialog(
+      {
+        action: "add",
+        type: aType,
+        defaultInsertionPoint: ip,
+        hiddenRows: ["folderPicker"],
+      },
+      window.top
+    );
+    if (bookmarkGuid) {
+      this._view.selectItems([bookmarkGuid], false);
+    }
+  },
+
+  async newSeparator() {
+    var ip = this._view.insertionPoint;
+    if (!ip) {
+      throw Components.Exception("", Cr.NS_ERROR_NOT_AVAILABLE);
+    }
+
+    let index = await ip.getIndex();
+    let txn = PlacesTransactions.NewSeparator({ parentGuid: ip.guid, index });
+    let guid = await txn.transact();
+    this._view.selectItems([guid], false);
+  },
+
+  async sortFolderByName() {
+    let guid = PlacesUtils.getConcreteItemGuid(this._view.selectedNode);
+    await PlacesTransactions.SortByName(guid).transact();
+  },
+
+  _shouldSkipNode: function PC_shouldSkipNode(node, pastFolders) {
+    function isNodeContainedBy(parent) {
+      var cursor = node.parent;
+      while (cursor) {
+        if (cursor == parent) {
+          return true;
+        }
+        cursor = cursor.parent;
+      }
+      return false;
+    }
+
+    for (var j = 0; j < pastFolders.length; ++j) {
+      if (isNodeContainedBy(pastFolders[j])) {
+        return true;
+      }
+    }
+    return false;
+  },
+
+  async _removeRange(range, transactions, removedFolders) {
+    if (!(transactions instanceof Array)) {
+      throw new Error("Must pass a transactions array");
+    }
+    if (!removedFolders) {
+      removedFolders = [];
+    }
+
+    let bmGuidsToRemove = [];
+    let totalItems = 0;
+
+    for (var i = 0; i < range.length; ++i) {
+      var node = range[i];
+      if (this._shouldSkipNode(node, removedFolders)) {
+        continue;
+      }
+
+      totalItems++;
+
+      if (PlacesUtils.nodeIsTagQuery(node.parent)) {
+        let tag = node.parent.title || "";
+        if (!tag) {
+          tag = node.parent.query.tags[0];
+        }
+        transactions.push(PlacesTransactions.Untag({ urls: [node.uri], tag }));
+      } else if (
+        PlacesUtils.nodeIsTagQuery(node) &&
+        node.parent &&
+        PlacesUtils.nodeIsQuery(node.parent) &&
+        PlacesUtils.asQuery(node.parent).queryOptions.resultType ==
+          Ci.nsINavHistoryQueryOptions.RESULTS_AS_TAGS_ROOT
+      ) {
+        let tag = node.title;
+        let urls = new Set();
+        await PlacesUtils.bookmarks.fetch({ tags: [tag] }, b =>
+          urls.add(b.url)
+        );
+        transactions.push(
+          PlacesTransactions.Untag({ tag, urls: Array.from(urls) })
+        );
+      } else if (
+        PlacesUtils.nodeIsURI(node) &&
+        PlacesUtils.nodeIsQuery(node.parent) &&
+        PlacesUtils.asQuery(node.parent).queryOptions.queryType ==
+          Ci.nsINavHistoryQueryOptions.QUERY_TYPE_HISTORY
+      ) {
+        await PlacesUtils.history.remove(node.uri).catch(console.error);
+      } else if (
+        node.itemId == -1 &&
+        PlacesUtils.nodeIsQuery(node) &&
+        PlacesUtils.asQuery(node).queryOptions.queryType ==
+          Ci.nsINavHistoryQueryOptions.QUERY_TYPE_HISTORY
+      ) {
+        await this._removeHistoryContainer(node).catch(console.error);
+      } else {
+        if (PlacesUtils.nodeIsFolderOrShortcut(node)) {
+          removedFolders.push(node);
+        }
+        bmGuidsToRemove.push(node.bookmarkGuid);
+      }
+    }
+    if (bmGuidsToRemove.length) {
+      transactions.push(PlacesTransactions.Remove({ guids: bmGuidsToRemove }));
+    }
+    return totalItems;
+  },
+
+  async _removeRowsFromBookmarks() {
+    let ranges = this._view.removableSelectionRanges;
+    let transactions = [];
+    let removedFolders = [];
+    let totalItems = 0;
+
+    for (let range of ranges) {
+      totalItems += await this._removeRange(
+        range,
+        transactions,
+        removedFolders
+      );
+    }
+
+    if (transactions.length) {
+      await PlacesUIUtils.batchUpdatesForNode(
+        this._view.result,
+        totalItems,
+        async () => {
+          await PlacesTransactions.batch(
+            transactions,
+            "PlacesController::removeRowsFromBookmarks"
+          );
+        }
+      );
+    }
+  },
+
+  async _removeRowsFromHistory() {
+    let nodes = this._view.selectedNodes;
+    let URIs = new Set();
+    for (let i = 0; i < nodes.length; ++i) {
+      let node = nodes[i];
+      if (PlacesUtils.nodeIsURI(node)) {
+        URIs.add(node.uri);
+      } else if (
+        PlacesUtils.nodeIsQuery(node) &&
+        PlacesUtils.asQuery(node).queryOptions.queryType ==
+          Ci.nsINavHistoryQueryOptions.QUERY_TYPE_HISTORY
+      ) {
+        await this._removeHistoryContainer(node).catch(console.error);
+      }
+    }
+
+    if (URIs.size) {
+      await PlacesUIUtils.batchUpdatesForNode(
+        this._view.result,
+        URIs.size,
+        async () => {
+          await PlacesUtils.history.remove([...URIs]);
+        }
+      );
+    }
+  },
+
+  async _removeHistoryContainer(aContainerNode) {
+    if (PlacesUtils.nodeIsHost(aContainerNode)) {
+      let host =
+        "." +
+        (aContainerNode.title == PlacesUtils.getString("localhost")
+          ? ""
+          : aContainerNode.title);
+      aContainerNode.containerOpen = false;
+      await PlacesUtils.history.removeByFilter({ host });
+    } else if (PlacesUtils.nodeIsDay(aContainerNode)) {
+      let query = aContainerNode.query;
+      let beginTime = query.beginTime;
+      let endTime = query.endTime;
+      if (!query || !beginTime || !endTime) {
+        throw new Error("A valid date container query should exist!");
+      }
+      aContainerNode.containerOpen = false;
+      await PlacesUtils.history.removeByFilter({
+        beginDate: PlacesUtils.toDate(beginTime + 1000),
+        endDate: PlacesUtils.toDate(endTime),
+      });
+    }
+  },
+
+  async remove() {
+    if (!this._hasRemovableSelection()) {
+      return;
+    }
+
+    if (this._isRepeatedRemoveOperation()) {
+      return;
+    }
+
+    var root = this._view.result.root;
+
+    if (PlacesUtils.nodeIsFolderOrShortcut(root)) {
+      await this._removeRowsFromBookmarks();
+    } else if (PlacesUtils.nodeIsQuery(root)) {
+      var queryType = PlacesUtils.asQuery(root).queryOptions.queryType;
+      if (queryType == Ci.nsINavHistoryQueryOptions.QUERY_TYPE_BOOKMARKS) {
+        await this._removeRowsFromBookmarks();
+      } else if (queryType == Ci.nsINavHistoryQueryOptions.QUERY_TYPE_HISTORY) {
+        await this._removeRowsFromHistory();
+      } else {
+        throw new Error("Unknown query type");
+      }
+    } else {
+      throw new Error("unexpected root");
+    }
+  },
+
+  setDataTransfer: function PC_setDataTransfer(aEvent) {
+    let dt = aEvent.dataTransfer;
+
+    let result = this._view.result;
+    let didSuppressNotifications = result.suppressNotifications;
+    if (!didSuppressNotifications) {
+      result.suppressNotifications = true;
+    }
+
+    function addData(type, index) {
+      let wrapNode = PlacesUtils.wrapNode(node, type);
+      dt.mozSetDataAt(type, wrapNode, index);
+    }
+
+    function addURIData(index) {
+      addData(PlacesUtils.TYPE_X_MOZ_URL, index);
+      addData(PlacesUtils.TYPE_PLAINTEXT, index);
+      addData(PlacesUtils.TYPE_HTML, index);
+    }
+
+    try {
+      let nodes = this._view.draggableSelection;
+      for (let i = 0; i < nodes.length; ++i) {
+        var node = nodes[i];
+
+        addData(PlacesUtils.TYPE_X_MOZ_PLACE, i);
+        if (node.uri) {
+          addURIData(i);
+        }
+      }
+    } finally {
+      if (!didSuppressNotifications) {
+        result.suppressNotifications = false;
+      }
+    }
+  },
+
+  get clipboardAction() {
+    let action = {};
+    let actionOwner;
+    try {
+      let xferable = Cc["@mozilla.org/widget/transferable;1"].createInstance(
+        Ci.nsITransferable
+      );
+      xferable.init(null);
+      xferable.addDataFlavor(PlacesUtils.TYPE_X_MOZ_PLACE_ACTION);
+      Services.clipboard.getData(xferable, Ci.nsIClipboard.kGlobalClipboard);
+      xferable.getTransferData(PlacesUtils.TYPE_X_MOZ_PLACE_ACTION, action);
+      [action, actionOwner] = action.value
+        .QueryInterface(Ci.nsISupportsString)
+        .data.split(",");
+    } catch (ex) {
+      return "copy";
+    }
+    if (action == "cut" && actionOwner != this.profileName) {
+      action = "copy";
+    }
+
+    return action;
+  },
+
+  _releaseClipboardOwnership: function PC__releaseClipboardOwnership() {
+    if (this.cutNodes.length) {
+      Services.clipboard.emptyClipboard(Ci.nsIClipboard.kGlobalClipboard);
+    }
+  },
+
+  _clearClipboard: function PC__clearClipboard() {
+    let xferable = Cc["@mozilla.org/widget/transferable;1"].createInstance(
+      Ci.nsITransferable
+    );
+    xferable.init(null);
+    const TYPE = "text/x-moz-place-empty";
+    xferable.addDataFlavor(TYPE);
+    xferable.setTransferData(TYPE, PlacesUtils.toISupportsString(""));
+    Services.clipboard.setData(
+      xferable,
+      null,
+      Ci.nsIClipboard.kGlobalClipboard
+    );
+  },
+
+  _populateClipboard: function PC__populateClipboard(aNodes, aAction) {
+    let contents = [
+      { type: PlacesUtils.TYPE_X_MOZ_PLACE, entries: [] },
+      { type: PlacesUtils.TYPE_X_MOZ_URL, entries: [] },
+      { type: PlacesUtils.TYPE_HTML, entries: [] },
+      { type: PlacesUtils.TYPE_PLAINTEXT, entries: [] },
+    ];
+
+    let copiedFolders = [];
+    aNodes.forEach(function (node) {
+      if (this._shouldSkipNode(node, copiedFolders)) {
+        return;
+      }
+      if (PlacesUtils.nodeIsFolderOrShortcut(node)) {
+        copiedFolders.push(node);
+      }
+
+      contents.forEach(function (content) {
+        content.entries.push(PlacesUtils.wrapNode(node, content.type));
+      });
+    }, this);
+
+    function addData(type, data) {
+      xferable.addDataFlavor(type);
+      xferable.setTransferData(type, PlacesUtils.toISupportsString(data));
+    }
+
+    let xferable = Cc["@mozilla.org/widget/transferable;1"].createInstance(
+      Ci.nsITransferable
+    );
+    xferable.init(null);
+    let hasData = false;
+    contents.forEach(function (content) {
+      if (content.entries.length) {
+        hasData = true;
+        let glue =
+          content.type == PlacesUtils.TYPE_X_MOZ_PLACE ? "," : PlacesUtils.endl;
+        addData(content.type, content.entries.join(glue));
+      }
+    });
+
+    addData(
+      PlacesUtils.TYPE_X_MOZ_PLACE_ACTION,
+      aAction + "," + this.profileName
+    );
+
+    if (hasData) {
+      Services.clipboard.setData(
+        xferable,
+        aAction == "cut" ? this : null,
+        Ci.nsIClipboard.kGlobalClipboard
+      );
+    }
+  },
+
+  _cutNodes: [],
+  get cutNodes() {
+    return this._cutNodes;
+  },
+  set cutNodes(aNodes) {
+    let self = this;
+    function updateCutNodes(aValue) {
+      self._cutNodes.forEach(function (aNode) {
+        self._view.toggleCutNode(aNode, aValue);
+      });
+    }
+
+    updateCutNodes(false);
+    this._cutNodes = aNodes;
+    updateCutNodes(true);
+  },
+
+  copy: function PC_copy() {
+    let result = this._view.result;
+    let didSuppressNotifications = result.suppressNotifications;
+    if (!didSuppressNotifications) {
+      result.suppressNotifications = true;
+    }
+    try {
+      this._populateClipboard(this._view.selectedNodes, "copy");
+    } finally {
+      if (!didSuppressNotifications) {
+        result.suppressNotifications = false;
+      }
+    }
+  },
+
+  cut: function PC_cut() {
+    let result = this._view.result;
+    let didSuppressNotifications = result.suppressNotifications;
+    if (!didSuppressNotifications) {
+      result.suppressNotifications = true;
+    }
+    try {
+      this._populateClipboard(this._view.selectedNodes, "cut");
+      this.cutNodes = this._view.selectedNodes;
+    } finally {
+      if (!didSuppressNotifications) {
+        result.suppressNotifications = false;
+      }
+    }
+  },
+
+  async paste() {
+    let ip = this._view.insertionPoint;
+    if (!ip) {
+      throw Components.Exception("", Cr.NS_ERROR_NOT_AVAILABLE);
+    }
+
+    let action = this.clipboardAction;
+
+    let xferable = Cc["@mozilla.org/widget/transferable;1"].createInstance(
+      Ci.nsITransferable
+    );
+    xferable.init(null);
+    [
+      PlacesUtils.TYPE_X_MOZ_PLACE,
+      PlacesUtils.TYPE_X_MOZ_URL,
+      PlacesUtils.TYPE_PLAINTEXT,
+    ].forEach(type => xferable.addDataFlavor(type));
+
+    Services.clipboard.getData(xferable, Ci.nsIClipboard.kGlobalClipboard);
+
+    let validNodes, invalidNodes;
+
+    try {
+      let data = {},
+        type = {};
+      xferable.getAnyTransferData(type, data);
+      ({ validNodes, invalidNodes } = PlacesUtils.unwrapNodes(
+        data.value.QueryInterface(Ci.nsISupportsString).data,
+        type.value
+      ));
+    } catch (ex) {
+      return;
+    }
+
+    let doCopy = action == "copy";
+    let itemsToSelect = await PlacesUIUtils.handleTransferItems(
+      validNodes,
+      ip,
+      doCopy,
+      this._view
+    );
+
+    if (action == "cut") {
+      this._clearClipboard();
+    }
+
+    if (itemsToSelect.length) {
+      this._view.selectItems(itemsToSelect, false);
+    }
+
+    if (invalidNodes.length) {
+      let [title, body] = PlacesUIUtils.promptLocalization.formatValuesSync([
+        "places-bookmarks-paste-error-title",
+        "places-bookmarks-paste-error-message-header",
+      ]);
+
+      const MAX_URI_LENGTH = 100;
+      const MAX_URI_COUNT = 20;
+
+      let invalidUrlList = invalidNodes
+        .slice(0, MAX_URI_COUNT)
+        .map(item => {
+          let encodedUri = encodeURI(item.uri);
+          if (encodedUri.length > MAX_URI_LENGTH) {
+            encodedUri = encodedUri.slice(0, MAX_URI_LENGTH) + "…";
+          }
+          return "\n  • " + encodedUri;
+        })
+        .join("");
+
+      if (invalidNodes.length > MAX_URI_COUNT) {
+        invalidUrlList += "\n  • …";
+      }
+
+      body = `${body}${invalidUrlList}`;
+      Services.prompt.alert(window, title, body);
+    }
+  },
+
+  disallowInsertion(container) {
+    if (!container) {
+      throw new Error("empty container");
+    }
+    return (
+      !PlacesUtils.nodeIsTagQuery(container) &&
+      (!PlacesUtils.nodeIsFolderOrShortcut(container) ||
+        PlacesUIUtils.isFolderReadOnly(container))
+    );
+  },
+
+  canMoveNode(node) {
+    if (node.itemId == -1) {
+      return false;
+    }
+
+    let parentNode = node.parent;
+    if (!parentNode) {
+      return false;
+    }
+
+    if (PlacesUtils.nodeIsTagQuery(parentNode)) {
+      return false;
+    }
+
+    return (
+      (PlacesUtils.nodeIsFolderOrShortcut(parentNode) &&
+        !PlacesUIUtils.isFolderReadOnly(parentNode)) ||
+      PlacesUtils.nodeIsQuery(parentNode)
+    );
+  },
+  async forgetAboutThisSite() {
+    let host;
+    if (PlacesUtils.nodeIsHost(this._view.selectedNode)) {
+      host = this._view.selectedNode.query.domain;
+    } else {
+      host = Services.io.newURI(this._view.selectedNode.uri).host;
+    }
+    let baseDomain;
+    try {
+      baseDomain = Services.eTLD.getBaseDomainFromHost(host);
+    } catch (e) {
+    }
+    let params = { host, hostOrBaseDomain: baseDomain ?? host };
+    if (window.gDialogBox) {
+      await window.gDialogBox.open(
+        "chrome://browser/content/places/clearDataForSite.xhtml",
+        params
+      );
+    } else {
+      await window.openDialog(
+        "chrome://browser/content/places/clearDataForSite.xhtml",
+        null,
+        "modal,centerscreen",
+        params
+      );
+    }
+  },
+
+  showInFolder(aBookmarkGuid) {
+    let documentUrl = document.documentURI.toLowerCase();
+    if (documentUrl.endsWith("browser.xhtml")) {
+      window.SidebarController._show("viewBookmarksSidebar").then(() => {
+        let sidebar = document.getElementById("sidebar");
+        let updatedPanel =
+          sidebar.contentDocument.querySelector("sidebar-bookmarks");
+        if (updatedPanel) {
+          updatedPanel.showInFolder(aBookmarkGuid).catch(console.error);
+        } else {
+          sidebar.contentDocument
+            .getElementById("bookmarks-view")
+            .selectItems([aBookmarkGuid]);
+        }
+      }, console.error);
+    } else if (documentUrl.includes("sidebar")) {
+      let searchBox = document.getElementById("search-box");
+      searchBox.clear();
+
+      this._view.selectItems([aBookmarkGuid], true);
+    } else {
+      PlacesUtils.bookmarks
+        .fetch(aBookmarkGuid, null, { includePath: true })
+        .then(b => {
+          let containers = b.path.map(obj => {
+            return obj.guid;
+          });
+          containers.splice(0, 0, "AllBookmarks");
+          PlacesOrganizer.selectLeftPaneContainerByHierarchy(containers);
+          this._view.selectItems([aBookmarkGuid], false);
+        })
+        .catch(e => console.error("showInFolder failed:", e));
+    }
+  },
+};
+
+var PlacesControllerDragHelper = {
+  currentDropTarget: null,
+
+  draggingOverChildNode: function PCDH_draggingOverChildNode(node) {
+    let currentNode = this.currentDropTarget;
+    while (currentNode) {
+      if (currentNode == node) {
+        return true;
+      }
+      currentNode = currentNode.parentNode;
+    }
+    return false;
+  },
+
+  getSession: function PCDH__getSession() {
+    return this.dragService.getCurrentSession(window);
+  },
+
+  getMostRelevantFlavor(flavors) {
+    flavors = Array.from(flavors);
+    return PlacesUIUtils.SUPPORTED_FLAVORS.find(f => flavors.includes(f));
+  },
+
+  canDrop: function PCDH_canDrop(ip, dt) {
+    let dropCount = dt.mozItemCount;
+
+    for (let i = 0; i < dropCount; i++) {
+      let flavor = this.getMostRelevantFlavor(dt.mozTypesAt(i));
+      if (!flavor) {
+        return false;
+      }
+
+      if (flavor == TAB_DROP_TYPE) {
+        continue;
+      }
+
+      let data = dt.mozGetDataAt(flavor, i);
+      let validNodes;
+      try {
+        ({ validNodes } = PlacesUtils.unwrapNodes(data, flavor));
+      } catch (e) {
+        return false;
+      }
+
+      for (let dragged of validNodes) {
+        if (
+          ip.isTag &&
+          dragged.type != PlacesUtils.TYPE_X_MOZ_URL &&
+          (dragged.type != PlacesUtils.TYPE_X_MOZ_PLACE ||
+            (dragged.uri && dragged.uri.startsWith("place:")))
+        ) {
+          return false;
+        }
+
+        if (
+          dragged.type == PlacesUtils.TYPE_X_MOZ_PLACE_CONTAINER ||
+          (dragged.uri && dragged.uri.startsWith("place:"))
+        ) {
+          let dragOverPlacesNode = this.currentDropTarget;
+          if (!(dragOverPlacesNode instanceof Ci.nsINavHistoryResultNode)) {
+            dragOverPlacesNode =
+              dragOverPlacesNode._placesNode ??
+              dragOverPlacesNode.parentNode?._placesNode;
+          }
+
+          if (dragOverPlacesNode) {
+            let guid = dragged.concreteGuid ?? dragged.itemGuid;
+            if (PlacesUtils.getConcreteItemGuid(dragOverPlacesNode) == guid) {
+              return false;
+            }
+            for (let ancestor of PlacesUtils.nodeAncestors(
+              dragOverPlacesNode
+            )) {
+              if (PlacesUtils.getConcreteItemGuid(ancestor) == guid) {
+                return false;
+              }
+            }
+          }
+        }
+
+        if (
+          !flavor.startsWith("text/x-moz-place") &&
+          (validNodes.length > 1 || dropCount > 1) &&
+          validNodes.some(n => n.uri?.startsWith("javascript:"))
+        ) {
+          return false;
+        }
+      }
+    }
+    return true;
+  },
+
+  async onDrop(insertionPoint, dt, view) {
+    let doCopy = ["copy", "link"].includes(dt.dropEffect);
+
+    let dropCount = dt.mozItemCount;
+
+    let duplicable = new Map();
+    duplicable.set(PlacesUtils.TYPE_PLAINTEXT, new Set());
+    duplicable.set(PlacesUtils.TYPE_X_MOZ_URL, new Set());
+
+    let nodes = [];
+    let externalDrag = false;
+    for (let i = 0; i < dropCount; ++i) {
+      let flavor = this.getMostRelevantFlavor(dt.mozTypesAt(i));
+      if (!flavor) {
+        return;
+      }
+
+      let data = dt.mozGetDataAt(flavor, i);
+      if (duplicable.has(flavor)) {
+        let handled = duplicable.get(flavor);
+        if (handled.has(data)) {
+          continue;
+        }
+        handled.add(data);
+      }
+
+      if (i == 0 && !flavor.startsWith("text/x-moz-place")) {
+        externalDrag = true;
+      }
+
+      if (flavor != TAB_DROP_TYPE) {
+        nodes = [...nodes, ...PlacesUtils.unwrapNodes(data, flavor).validNodes];
+      } else if (
+        XULElement.isInstance(data) &&
+        data.localName == "tab" &&
+        data.documentGlobal.isChromeWindow
+      ) {
+        let uri = data.linkedBrowser.currentURI;
+        let spec = uri ? uri.spec : "about:blank";
+        nodes.push({
+          uri: spec,
+          title: data.label,
+          type: PlacesUtils.TYPE_X_MOZ_URL,
+        });
+      } else if (
+        XULElement.isInstance(data) &&
+        data.localName == "tab-split-view-wrapper" &&
+        data.documentGlobal.isChromeWindow
+      ) {
+        data.tabs.forEach(tab => {
+          let uri = tab.linkedBrowser.currentURI?.spec ?? "about:blank";
+          nodes.push({
+            uri,
+            title: tab.label,
+            type: PlacesUtils.TYPE_X_MOZ_URL,
+          });
+        });
+      } else {
+        throw new Error("bogus data was passed as a tab");
+      }
+    }
+
+    if (
+      externalDrag &&
+      (nodes.length > 1 || dropCount > 1) &&
+      nodes.some(n => n.uri?.startsWith("javascript:"))
+    ) {
+      throw new Error("Javascript bookmarklet passed with uris");
+    }
+
+    if (
+      nodes.length == 1 &&
+      externalDrag &&
+      nodes[0].uri?.startsWith("javascript")
+    ) {
+      let uri;
+      try {
+        uri = Services.io.newURI(nodes[0].uri);
+      } catch (ex) {
+      }
+
+      if (uri) {
+        let bookmarkGuid = await PlacesUIUtils.showBookmarkDialog(
+          {
+            action: "add",
+            type: "bookmark",
+            defaultInsertionPoint: insertionPoint,
+            hiddenRows: ["folderPicker"],
+            title: nodes[0].title,
+            uri,
+          },
+          BrowserWindowTracker.getTopWindow() 
+        );
+
+        if (bookmarkGuid && view) {
+          view.selectItems([bookmarkGuid], false);
+        }
+
+        return;
+      }
+    }
+
+    await PlacesUIUtils.handleTransferItems(
+      nodes,
+      insertionPoint,
+      doCopy,
+      view
+    );
+  },
+};
+
+XPCOMUtils.defineLazyServiceGetter(
+  PlacesControllerDragHelper,
+  "dragService",
+  "@mozilla.org/widget/dragservice;1",
+  Ci.nsIDragService
+);

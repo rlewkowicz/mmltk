@@ -1,0 +1,112 @@
+/*
+ * Copyright 2011 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkData_DEFINED)
+#define SkData_DEFINED
+
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkSpan.h"
+#include "include/private/base/SkAPI.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+
+class SkStream;
+
+class SK_API SkData final : public SkNVRefCnt<SkData> {
+public:
+    bool operator==(const SkData& rhs) const;
+    bool operator!=(const SkData& rhs) const { return !(*this == rhs); }
+
+    bool equals(const SkData* other) const {
+        return (other != nullptr) && *this == *other;
+    }
+
+    static bool Equals(const SkData* a, const SkData* b) {
+        return (a == nullptr) ? (b == nullptr) : a->equals(b);
+    }
+
+    size_t size() const { return fSpan.size(); }
+
+    const void* data() const { return fSpan.data(); }
+
+    bool empty() const { return fSpan.empty(); }
+
+    const uint8_t* bytes() const { return reinterpret_cast<const uint8_t*>(this->data()); }
+
+    SkSpan<const uint8_t> byteSpan() const { return {this->bytes(), this->size()}; }
+
+    void* writable_data() {
+        return fSpan.data();
+    }
+
+    sk_sp<SkData> copySubset(size_t offset, size_t length) const;
+
+    sk_sp<SkData> shareSubset(size_t offset, size_t length);
+    sk_sp<const SkData> shareSubset(size_t offset, size_t length) const;
+
+    size_t copyRange(size_t offset, size_t length, void* buffer) const;
+
+    typedef void (*ReleaseProc)(const void* ptr, void* context);
+
+    static sk_sp<SkData> MakeWithCopy(const void* data, size_t length);
+
+
+    static sk_sp<SkData> MakeUninitialized(size_t length);
+
+    static sk_sp<SkData> MakeZeroInitialized(size_t length);
+
+    static sk_sp<SkData> MakeWithCString(const char cstr[]);
+
+    static sk_sp<SkData> MakeWithProc(const void* ptr, size_t length, ReleaseProc proc, void* ctx);
+
+    static sk_sp<SkData> MakeWithoutCopy(const void* data, size_t length) {
+        return MakeWithProc(data, length, NoopReleaseProc, nullptr);
+    }
+
+    static sk_sp<SkData> MakeFromMalloc(const void* data, size_t length);
+
+    static sk_sp<SkData> MakeFromFileName(const char path[]);
+
+    static sk_sp<SkData> MakeFromFILE(FILE* f);
+
+    static sk_sp<SkData> MakeFromFD(int fd);
+
+    static sk_sp<SkData> MakeFromStream(SkStream*, size_t size);
+
+    static sk_sp<SkData> MakeSubset(const SkData* src, size_t offset, size_t length) {
+        if (sk_sp<SkData> dst = const_cast<SkData*>(src)->shareSubset(offset, length)) {
+            return dst;
+        }
+        return SkData::MakeEmpty();
+    }
+
+    static sk_sp<SkData> MakeEmpty();
+
+    bool isEmpty() const { return fSpan.empty(); }
+
+private:
+    friend class SkNVRefCnt<SkData>;
+    ReleaseProc         fReleaseProc;
+    void*               fReleaseProcContext;
+    SkSpan<std::byte>   fSpan;
+
+    SkData(SkSpan<std::byte>, ReleaseProc, void* context);
+    explicit SkData(size_t size);   
+    ~SkData();
+
+    void operator delete(void* p);
+
+    static sk_sp<SkData> PrivateNewWithCopy(const void* srcOrNull, size_t length);
+
+    static void NoopReleaseProc(const void*, void*); 
+
+    using INHERITED = SkRefCnt;
+};
+
+#endif

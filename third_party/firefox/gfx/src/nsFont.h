@@ -1,0 +1,97 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsFont_h_
+#define nsFont_h_
+
+#include <cstdint>
+#include "gfxFontConstants.h"  // for NS_FONT_KERNING_AUTO, etc
+#include "gfxFontVariations.h"
+#include "mozilla/ServoStyleConsts.h"
+#include "mozilla/StyleColorInlines.h"  // for StyleAbsoluteColor
+#include "nsTArray.h"                   // for nsTArray
+
+struct gfxFontStyle;
+
+struct nsFont final {
+  typedef mozilla::FontStretch FontStretch;
+  typedef mozilla::FontSlantStyle FontSlantStyle;
+  typedef mozilla::FontWeight FontWeight;
+
+  mozilla::StyleFontFamily family;
+
+  CopyableTArray<gfxFontFeature> fontFeatureSettings;
+
+  CopyableTArray<gfxFontVariation> fontVariationSettings;
+
+  mozilla::NonNegativeLength size{0};
+
+  mozilla::StyleFontSizeAdjust sizeAdjust =
+      mozilla::StyleFontSizeAdjust::None();
+
+  mozilla::StyleFontLanguageOverride languageOverride{0};
+
+  FontSlantStyle style = FontSlantStyle::NORMAL;
+  FontWeight weight = FontWeight::NORMAL;
+  FontStretch stretch = FontStretch::NORMAL;
+
+  mozilla::StyleFontVariantAlternates variantAlternates;
+
+  mozilla::StyleFontVariantLigatures variantLigatures =
+      mozilla::StyleFontVariantLigatures::NORMAL;
+  mozilla::StyleFontVariantEastAsian variantEastAsian =
+      mozilla::StyleFontVariantEastAsian::NORMAL;
+
+  uint8_t variantCaps = NS_FONT_VARIANT_CAPS_NORMAL;
+  mozilla::StyleFontVariantNumeric variantNumeric =
+      mozilla::StyleFontVariantNumeric::NORMAL;
+  uint8_t variantPosition = NS_FONT_VARIANT_POSITION_NORMAL;
+  uint8_t variantWidth = NS_FONT_VARIANT_WIDTH_NORMAL;
+  StyleFontVariantEmoji variantEmoji = StyleFontVariantEmoji::Normal;
+
+  uint8_t smoothing = NS_FONT_SMOOTHING_AUTO;
+
+  uint8_t kerning = NS_FONT_KERNING_AUTO;
+
+  uint8_t opticalSizing = NS_FONT_OPTICAL_SIZING_AUTO;
+
+  mozilla::StyleFontSynthesis synthesisWeight =
+      mozilla::StyleFontSynthesis::Auto;
+  mozilla::StyleFontSynthesisStyle synthesisStyle =
+      mozilla::StyleFontSynthesisStyle::Auto;
+  mozilla::StyleFontSynthesis synthesisSmallCaps =
+      mozilla::StyleFontSynthesis::Auto;
+  mozilla::StyleFontSynthesis synthesisPosition =
+      mozilla::StyleFontSynthesis::Auto;
+
+  nsFont(const mozilla::StyleFontFamily&, mozilla::Length aSize);
+
+  nsFont(mozilla::StyleGenericFontFamily, mozilla::Length aSize);
+
+  nsFont(const nsFont& aFont);
+
+  nsFont() = default;
+  ~nsFont();
+
+  bool operator==(const nsFont& aOther) const { return Equals(aOther); }
+
+  bool operator!=(const nsFont& aOther) const { return !Equals(aOther); }
+
+  bool Equals(const nsFont& aOther) const;
+
+  nsFont& operator=(const nsFont& aOther);
+
+  enum class MaxDifference : uint8_t { eNone, eVisual, eLayoutAffecting };
+
+  MaxDifference CalcDifference(const nsFont& aOther) const;
+
+  void AddFontFeaturesToStyle(gfxFontStyle* aStyle, bool aVertical) const;
+
+  void AddFontVariationsToStyle(gfxFontStyle* aStyle) const;
+};
+
+#define NS_FONT_VARIANT_NORMAL 0
+#define NS_FONT_VARIANT_SMALL_CAPS 1
+
+#endif /* nsFont_h_ */

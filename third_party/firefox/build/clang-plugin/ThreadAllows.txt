@@ -1,0 +1,80 @@
+# This file is ingested by `ThreadAllows.py` to produce a list of thread names
+# which our clang plugin will allow to be used with `NS_NewNamedThread`.
+#
+# Permitted thread names are a maximum of 15 characters in length, and must be
+# string literals at their point-of-use in the code -- i.e., in the invocation
+# of `NS_NewNamedThread`.
+#
+# Within this file, each permitted thread name is on a separate line. Comments
+# begin with `#`, as seen here. Leading and trailing whitespace, trailing
+# comments, and blank lines are ignored, and may be used freely.
+#
+# Please explain the addition of any new thread names in comments, preferably
+# with a pointer to a relevant bug.
+
+######
+# Gecko/Firefox thread names
+# (See also "Unsorted thread names", below.)
+
+# Used by `nsUpdateProcessor` to check for updates. May also be used for polling
+# the update process.
+UpdateProcessor
+######
+# Unsorted thread names
+#
+# Thread names below this point are grandfathered in. Please do not add new
+# thread names to this list -- and please remove any that you can, whether by
+# documenting and moving them or by confirming that they are no longer required.
+#
+BGReadURLs
+BHMgr Monitor
+BHMgr Processor
+Cache I/O
+CanvasRenderer
+Compositor
+Cookie
+DDMediaLogs
+DOMCacheThread
+DataStorage
+File Dialog
+FileWatcher IO
+Font Loader
+FontEnumThread
+GMPThread
+GraphRunner
+HTML5 Parser
+ICS parser
+IPC Launch
+IPDL Background
+IdentityCrypto
+ImageBridgeChld
+LS Thread
+MDCDMThread
+MediaCache
+MediaTrackGrph
+MemoryPoller
+Netlink Monitor
+OSKeyStore
+OutputDrain
+PaintThread
+Permission
+PlayEventSound
+ProcessHangMon
+ProxyResolution
+RemoteLzyStream
+Renderer
+ResetCleanup
+SaveScripts
+Socket Thread
+SpeechWorker
+SuicideManager
+System Proxy
+Timer
+TRR Background
+VsyncIOThread
+Wifi Monitor
+Worker Launcher
+speechd init
+thread
+thread shutdown
+wifi tickler

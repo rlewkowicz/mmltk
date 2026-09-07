@@ -1,0 +1,180 @@
+/*
+ * Copyright 2012 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkImage_Base_DEFINED)
+#define SkImage_Base_DEFINED
+
+#include "include/core/SkData.h"
+#include "include/core/SkImage.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkTypes.h"
+#include "src/core/SkMipmap.h"
+
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+
+class GrDirectContext;
+class GrImageContext;
+class SkBitmap;
+class SkColorSpace;
+class SkPixmap;
+class SkRecorder;
+class SkSurface;
+enum SkYUVColorSpace : int;
+struct SkIRect;
+struct SkISize;
+struct SkImageInfo;
+
+enum {
+    kNeedNewImageUniqueID = 0
+};
+
+class SkImage_Base : public SkImage {
+public:
+    ~SkImage_Base() override;
+
+    sk_sp<SkImage> makeColorSpace(SkRecorder*,
+                                  sk_sp<SkColorSpace>,
+                                  RequiredProperties) const override;
+
+    sk_sp<SkImage> makeSubset(SkRecorder*, const SkIRect&, RequiredProperties) const override;
+    size_t textureSize() const override { return 0; }
+
+    virtual bool onPeekPixels(SkPixmap*) const { return false; }
+
+    virtual const SkBitmap* onPeekBitmap() const { return nullptr; }
+
+    virtual bool onReadPixels(GrDirectContext*,
+                              const SkImageInfo& dstInfo,
+                              void* dstPixels,
+                              size_t dstRowBytes,
+                              int srcX,
+                              int srcY,
+                              CachingHint) const = 0;
+
+    virtual bool readPixelsGraphite(SkRecorder*, const SkPixmap& dst, int srcX, int srcY) const {
+        return false;
+    }
+
+    virtual bool onHasMipmaps() const = 0;
+    virtual bool onIsProtected() const = 0;
+
+    virtual SkMipmap* onPeekMips() const { return nullptr; }
+
+    sk_sp<SkMipmap> refMips() const {
+        return sk_ref_sp(this->onPeekMips());
+    }
+
+    virtual void onAsyncRescaleAndReadPixels(const SkImageInfo&,
+                                             SkIRect srcRect,
+                                             RescaleGamma,
+                                             RescaleMode,
+                                             ReadPixelsCallback,
+                                             ReadPixelsContext) const;
+    virtual void onAsyncRescaleAndReadPixelsYUV420(SkYUVColorSpace,
+                                                   bool readAlpha,
+                                                   sk_sp<SkColorSpace> dstColorSpace,
+                                                   SkIRect srcRect,
+                                                   SkISize dstSize,
+                                                   RescaleGamma,
+                                                   RescaleMode,
+                                                   ReadPixelsCallback,
+                                                   ReadPixelsContext) const;
+
+    virtual GrImageContext* context() const { return nullptr; }
+
+    virtual GrDirectContext* directContext() const { return nullptr; }
+
+    virtual void generatingSurfaceIsDeleted() {}
+
+    virtual bool getROPixels(GrDirectContext*, SkBitmap*,
+                             CachingHint = kAllow_CachingHint) const = 0;
+
+    virtual sk_sp<SkImage> onMakeSubset(SkRecorder*, const SkIRect&, RequiredProperties) const = 0;
+
+    virtual sk_sp<const SkData> onRefEncoded() const { return nullptr; }
+
+    virtual bool onAsLegacyBitmap(GrDirectContext*, SkBitmap*) const;
+
+    virtual sk_sp<SkSurface> onMakeSurface(SkRecorder*, const SkImageInfo&) const = 0;
+
+    enum class Type {
+        kRaster,
+        kRasterPinnable,
+        kLazy,
+        kLazyPicture,
+        kLazyTexture,
+        kGanesh,
+        kGaneshYUVA,
+        kGraphite,
+        kGraphiteYUVA,
+    };
+
+    virtual Type type() const = 0;
+
+    bool isLazyGenerated() const override {
+        return this->type() == Type::kLazy || this->type() == Type::kLazyPicture ||
+               this->type() == Type::kLazyTexture;
+    }
+
+    bool isRasterBacked() const {
+        return this->type() == Type::kRaster || this->type() == Type::kRasterPinnable;
+    }
+
+    bool isGaneshBacked() const {
+        return this->type() == Type::kGanesh || this->type() == Type::kGaneshYUVA;
+    }
+
+    bool isGraphiteBacked() const {
+        return this->type() == Type::kGraphite || this->type() == Type::kGraphiteYUVA;
+    }
+
+    bool isYUVA() const {
+        return this->type() == Type::kGaneshYUVA || this->type() == Type::kGraphiteYUVA;
+    }
+
+    bool isTextureBacked() const override {
+        return this->isGaneshBacked() || this->isGraphiteBacked();
+    }
+
+    virtual void notifyAddedToRasterCache() const {
+        fAddedToRasterCache.store(true);
+    }
+
+    virtual sk_sp<SkImage> onReinterpretColorSpace(sk_sp<SkColorSpace>) const = 0;
+
+    // NOLINTNEXTLINE(performance-unnecessary-value-param)
+    virtual sk_sp<SkImage> onMakeWithMipmaps(sk_sp<SkMipmap>) const {
+        return nullptr;
+    }
+
+protected:
+    SkImage_Base(const SkImageInfo& info, uint32_t uniqueID);
+
+private:
+
+    mutable std::atomic<bool> fAddedToRasterCache;
+};
+
+static inline SkImage_Base* as_IB(SkImage* image) {
+    return static_cast<SkImage_Base*>(image);
+}
+
+static inline SkImage_Base* as_IB(const sk_sp<SkImage>& image) {
+    return static_cast<SkImage_Base*>(image.get());
+}
+
+static inline const SkImage_Base* as_IB(const SkImage* image) {
+    return static_cast<const SkImage_Base*>(image);
+}
+
+static inline const SkImage_Base* as_IB(const sk_sp<const SkImage>& image) {
+    return static_cast<const SkImage_Base*>(image.get());
+}
+
+#endif

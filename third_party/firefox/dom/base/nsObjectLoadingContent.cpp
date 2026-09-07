@@ -1,0 +1,1498 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "imgLoader.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/dom/BindContext.h"
+#include "mozilla/dom/Document.h"
+#include "nsError.h"
+#include "nsIAppShell.h"
+#include "nsIAsyncVerifyRedirectCallback.h"
+#include "nsIClassOfService.h"
+#include "nsIConsoleService.h"
+#include "nsIDocShell.h"
+#include "nsIExternalProtocolHandler.h"
+#include "nsIHttpChannel.h"
+#include "nsINestedURI.h"
+#include "nsIPermissionManager.h"
+#include "nsIScriptChannel.h"
+#include "nsIScriptError.h"
+#include "nsIURILoader.h"
+#include "nsScriptSecurityManager.h"
+#include "nsSubDocumentFrame.h"
+
+#include "mozilla/Logging.h"
+#include "mozilla/Preferences.h"
+#include "nsContentPolicyUtils.h"
+#include "nsContentUtils.h"
+#include "nsDocShellLoadState.h"
+#include "nsGkAtoms.h"
+#include "nsMimeTypes.h"
+#include "nsNetUtil.h"
+#include "nsQueryObject.h"
+#include "nsStyleUtil.h"
+#include "nsThreadUtils.h"
+
+#include "ReferrerInfo.h"
+#include "mozilla/AsyncEventDispatcher.h"
+#include "mozilla/BasicEvents.h"
+#include "mozilla/Components.h"
+#include "mozilla/EventDispatcher.h"
+#include "mozilla/IMEStateManager.h"
+#include "mozilla/LoadInfo.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/StaticPrefs_browser.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/dom/BindingUtils.h"
+#include "mozilla/dom/ContentChild.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/Event.h"
+#include "mozilla/dom/HTMLEmbedElement.h"
+#include "mozilla/dom/HTMLObjectElement.h"
+#include "mozilla/dom/HTMLObjectElementBinding.h"
+#include "mozilla/dom/PolicyContainer.h"
+#include "mozilla/dom/ScriptSettings.h"
+#include "mozilla/dom/UserActivation.h"
+#include "mozilla/dom/nsCSPContext.h"
+#include "mozilla/net/DocumentChannel.h"
+#include "mozilla/widget/IMEData.h"
+#include "nsFocusManager.h"
+#include "nsFrameLoader.h"
+#include "nsIEffectiveTLDService.h"
+#include "nsObjectLoadingContent.h"
+#include "nsWidgetsCID.h"
+
+
+static const char kPrefYoutubeRewrite[] = "plugins.rewrite_youtube_embeds";
+
+using namespace mozilla;
+using namespace mozilla::dom;
+using namespace mozilla::net;
+
+static LogModule* GetObjectLog() {
+  static LazyLogModule sLog("objlc");
+  return sLog;
+}
+
+#define LOG(args) MOZ_LOG(GetObjectLog(), mozilla::LogLevel::Debug, args)
+#define LOG_ENABLED() MOZ_LOG_TEST(GetObjectLog(), mozilla::LogLevel::Debug)
+
+static bool IsFlashMIME(const nsACString& aMIMEType) {
+  return aMIMEType.LowerCaseEqualsASCII("application/x-shockwave-flash") ||
+         aMIMEType.LowerCaseEqualsASCII("application/futuresplash") ||
+         aMIMEType.LowerCaseEqualsASCII("application/x-shockwave-flash-test");
+}
+
+static bool IsPluginMIME(const nsACString& aMIMEType) {
+  return IsFlashMIME(aMIMEType) ||
+         aMIMEType.LowerCaseEqualsASCII("application/x-test");
+}
+
+
+class AutoSetLoadingToFalse {
+ public:
+  explicit AutoSetLoadingToFalse(nsObjectLoadingContent* aContent)
+      : mContent(aContent) {}
+  ~AutoSetLoadingToFalse() { mContent->mIsLoading = false; }
+
+ private:
+  nsObjectLoadingContent* mContent;
+};
+
+
+bool nsObjectLoadingContent::IsSuccessfulRequest(nsIRequest* aRequest,
+                                                 nsresult* aStatus) {
+  nsresult rv = aRequest->GetStatus(aStatus);
+  if (NS_FAILED(rv) || NS_FAILED(*aStatus)) {
+    return false;
+  }
+
+  nsCOMPtr<nsIHttpChannel> httpChan(do_QueryInterface(aRequest));
+  if (httpChan) {
+    bool success;
+    rv = httpChan->GetRequestSucceeded(&success);
+    if (NS_FAILED(rv) || !success) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static bool CanHandleURI(nsIURI* aURI) {
+  nsAutoCString scheme;
+  if (NS_FAILED(aURI->GetScheme(scheme))) {
+    return false;
+  }
+
+  nsCOMPtr<nsIIOService> ios = mozilla::components::IO::Service();
+  if (!ios) {
+    return false;
+  }
+
+  nsCOMPtr<nsIProtocolHandler> handler;
+  ios->GetProtocolHandler(scheme.get(), getter_AddRefs(handler));
+  if (!handler) {
+    return false;
+  }
+
+  nsCOMPtr<nsIExternalProtocolHandler> extHandler = do_QueryInterface(handler);
+  return extHandler == nullptr;
+}
+
+static bool inline URIEquals(nsIURI* a, nsIURI* b) {
+  bool equal;
+  return (!a && !b) || (a && b && NS_SUCCEEDED(a->Equals(b, &equal)) && equal);
+}
+
+
+void nsObjectLoadingContent::SetupFrameLoader() {
+  mFrameLoader = nsFrameLoader::Create(AsElement(), mNetworkCreated);
+  MOZ_ASSERT(mFrameLoader, "nsFrameLoader::Create failed");
+}
+
+already_AddRefed<nsIDocShell> nsObjectLoadingContent::SetupDocShell(
+    nsIURI* aRecursionCheckURI) {
+  SetupFrameLoader();
+  if (!mFrameLoader) {
+    return nullptr;
+  }
+
+  nsCOMPtr<nsIDocShell> docShell;
+
+  if (aRecursionCheckURI) {
+    nsresult rv = mFrameLoader->CheckForRecursiveLoad(aRecursionCheckURI);
+    if (NS_SUCCEEDED(rv)) {
+      IgnoredErrorResult result;
+      docShell = mFrameLoader->GetDocShell(result);
+      if (result.Failed()) {
+        MOZ_ASSERT_UNREACHABLE("Could not get DocShell from mFrameLoader?");
+      }
+    } else {
+      LOG(("OBJLC [%p]: Aborting recursive load", this));
+    }
+  }
+
+  if (!docShell) {
+    RefPtr<nsFrameLoader> loader = std::move(mFrameLoader);
+    loader->Destroy();
+    return nullptr;
+  }
+
+  return docShell.forget();
+}
+
+void nsObjectLoadingContent::UnbindFromTree() {
+  UnloadObject();
+}
+
+nsObjectLoadingContent::nsObjectLoadingContent()
+    : mType(ObjectType::Loading),
+      mChannelLoaded(false),
+      mNetworkCreated(true),
+      mIsStopping(false),
+      mIsLoading(false),
+      mScriptRequested(false),
+      mRewrittenYoutubeEmbed(false) {}
+
+nsObjectLoadingContent::~nsObjectLoadingContent() {
+  if (mFrameLoader) {
+    MOZ_ASSERT_UNREACHABLE(
+        "Should not be tearing down frame loaders at this point");
+    mFrameLoader->Destroy();
+  }
+}
+
+NS_IMETHODIMP
+nsObjectLoadingContent::OnStartRequest(nsIRequest* aRequest) {
+
+  LOG(("OBJLC [%p]: Channel OnStartRequest", this));
+
+  if (aRequest != mChannel || !aRequest) {
+    return NS_BINDING_ABORTED;
+  }
+
+  nsCOMPtr<nsIChannel> chan(do_QueryInterface(aRequest));
+  NS_ASSERTION(chan, "Why is our request not a channel?");
+
+  nsresult status = NS_OK;
+  bool success = IsSuccessfulRequest(aRequest, &status);
+
+  if (mType == ObjectType::Document) {
+    if (!mFinalListener) {
+      MOZ_ASSERT_UNREACHABLE(
+          "Already is Document, but don't have final listener yet?");
+      return NS_BINDING_ABORTED;
+    }
+
+    if (success) {
+      LOG(("OBJLC [%p]: OnStartRequest: DocumentChannel request succeeded\n",
+           this));
+      nsCString channelType;
+      MOZ_ALWAYS_SUCCEEDS(mChannel->GetContentType(channelType));
+
+      if (GetTypeOfContent(channelType) != ObjectType::Document) {
+        MOZ_CRASH("DocumentChannel request with non-document MIME");
+      }
+      mContentType = channelType;
+
+      MOZ_ALWAYS_SUCCEEDS(
+          NS_GetFinalChannelURI(mChannel, getter_AddRefs(mURI)));
+    }
+
+    nsCOMPtr<nsIStreamListener> listener = mFinalListener;
+    return listener->OnStartRequest(aRequest);
+  }
+
+  if (mType != ObjectType::Loading) {
+    MOZ_ASSERT_UNREACHABLE("Should be type loading at this point");
+    return NS_BINDING_ABORTED;
+  }
+  NS_ASSERTION(!mChannelLoaded, "mChannelLoaded set already?");
+  NS_ASSERTION(!mFinalListener, "mFinalListener exists already?");
+
+  mChannelLoaded = true;
+
+  if (!success) {
+    LOG(("OBJLC [%p]: OnStartRequest: Request failed\n", this));
+    mChannel = nullptr;
+    LoadObject(true, false);
+    return NS_ERROR_FAILURE;
+  }
+
+  return LoadObject(true, false, aRequest);
+}
+
+NS_IMETHODIMP
+nsObjectLoadingContent::OnStopRequest(nsIRequest* aRequest,
+                                      nsresult aStatusCode) {
+
+  if (aRequest != mChannel) {
+    return NS_BINDING_ABORTED;
+  }
+
+  mChannel = nullptr;
+
+  if (mFinalListener) {
+    nsCOMPtr<nsIStreamListener> listenerGrip(mFinalListener);
+    mFinalListener = nullptr;
+    listenerGrip->OnStopRequest(aRequest, aStatusCode);
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsObjectLoadingContent::OnDataAvailable(nsIRequest* aRequest,
+                                        nsIInputStream* aInputStream,
+                                        uint64_t aOffset, uint32_t aCount) {
+  if (aRequest != mChannel) {
+    return NS_BINDING_ABORTED;
+  }
+
+  if (mFinalListener) {
+    nsCOMPtr<nsIStreamListener> listenerGrip(mFinalListener);
+    return listenerGrip->OnDataAvailable(aRequest, aInputStream, aOffset,
+                                         aCount);
+  }
+
+  MOZ_ASSERT_UNREACHABLE(
+      "Got data for channel with no connected final "
+      "listener");
+  mChannel = nullptr;
+
+  return NS_ERROR_UNEXPECTED;
+}
+
+NS_IMETHODIMP
+nsObjectLoadingContent::GetActualType(nsACString& aType) {
+  aType = mContentType;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsObjectLoadingContent::GetDisplayedType(uint32_t* aType) {
+  *aType = DisplayedType();
+  return NS_OK;
+}
+
+class ObjectInterfaceRequestorShim final : public nsIInterfaceRequestor,
+                                           public nsIChannelEventSink,
+                                           public nsIStreamListener {
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(ObjectInterfaceRequestorShim,
+                                           nsIInterfaceRequestor)
+  NS_DECL_NSIINTERFACEREQUESTOR
+  NS_FORWARD_NSICHANNELEVENTSINK(
+      static_cast<nsObjectLoadingContent*>(mContent.get())->)
+  NS_FORWARD_NSISTREAMLISTENER(
+      static_cast<nsObjectLoadingContent*>(mContent.get())->)
+  NS_FORWARD_NSIREQUESTOBSERVER(
+      static_cast<nsObjectLoadingContent*>(mContent.get())->)
+
+  explicit ObjectInterfaceRequestorShim(nsIObjectLoadingContent* aContent)
+      : mContent(aContent) {}
+
+ protected:
+  ~ObjectInterfaceRequestorShim() = default;
+  nsCOMPtr<nsIObjectLoadingContent> mContent;
+};
+
+NS_IMPL_CYCLE_COLLECTION(ObjectInterfaceRequestorShim, mContent)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(ObjectInterfaceRequestorShim)
+  NS_INTERFACE_MAP_ENTRY(nsIInterfaceRequestor)
+  NS_INTERFACE_MAP_ENTRY(nsIChannelEventSink)
+  NS_INTERFACE_MAP_ENTRY(nsIStreamListener)
+  NS_INTERFACE_MAP_ENTRY(nsIRequestObserver)
+  NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIInterfaceRequestor)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(ObjectInterfaceRequestorShim)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(ObjectInterfaceRequestorShim)
+
+NS_IMETHODIMP
+ObjectInterfaceRequestorShim::GetInterface(const nsIID& aIID, void** aResult) {
+  if (aIID.Equals(NS_GET_IID(nsIChannelEventSink))) {
+    nsIChannelEventSink* sink = this;
+    *aResult = sink;
+    NS_ADDREF(sink);
+    return NS_OK;
+  }
+  if (aIID.Equals(NS_GET_IID(nsIObjectLoadingContent))) {
+    nsIObjectLoadingContent* olc = mContent;
+    *aResult = olc;
+    NS_ADDREF(olc);
+    return NS_OK;
+  }
+  return NS_NOINTERFACE;
+}
+
+NS_IMETHODIMP
+nsObjectLoadingContent::AsyncOnChannelRedirect(
+    nsIChannel* aOldChannel, nsIChannel* aNewChannel, uint32_t aFlags,
+    nsIAsyncVerifyRedirectCallback* cb) {
+  if (!mChannel || aOldChannel != mChannel) {
+    return NS_BINDING_ABORTED;
+  }
+
+  mChannel = aNewChannel;
+
+  if (mFinalListener) {
+    nsCOMPtr<nsIChannelEventSink> sink(do_QueryInterface(mFinalListener));
+    MOZ_RELEASE_ASSERT(sink, "mFinalListener isn't nsIChannelEventSink?");
+    if (mType != ObjectType::Document) {
+      MOZ_ASSERT_UNREACHABLE(
+          "Not a DocumentChannel load, but we're getting a "
+          "AsyncOnChannelRedirect with a mFinalListener?");
+      return NS_BINDING_ABORTED;
+    }
+
+    return sink->AsyncOnChannelRedirect(aOldChannel, aNewChannel, aFlags, cb);
+  }
+
+  cb->OnRedirectVerifyCallback(NS_OK);
+  return NS_OK;
+}
+
+void nsObjectLoadingContent::MaybeRewriteYoutubeEmbed(nsIURI* aURI,
+                                                      nsIURI* aBaseURI,
+                                                      nsIURI** aRewrittenURI) {
+  nsCOMPtr<nsIEffectiveTLDService> tldService =
+      do_GetService(NS_EFFECTIVETLDSERVICE_CONTRACTID);
+  if (!tldService) {
+    NS_WARNING("Could not get TLD service!");
+    return;
+  }
+
+  nsAutoCString currentBaseDomain;
+  bool ok = NS_SUCCEEDED(tldService->GetBaseDomain(aURI, 0, currentBaseDomain));
+  if (!ok) {
+    return;
+  }
+
+  if (!currentBaseDomain.EqualsLiteral("youtube.com") &&
+      !currentBaseDomain.EqualsLiteral("youtube-nocookie.com")) {
+    return;
+  }
+
+  nsAutoCString path;
+  aURI->GetPathQueryRef(path);
+  if (!StringBeginsWith(path, "/v/"_ns)) {
+    return;
+  }
+
+  nsAutoCString prePath;
+  nsresult rv = aURI->GetPrePath(prePath);
+  if (NS_FAILED(rv)) {
+    return;
+  }
+
+  int32_t ampIndex = path.FindChar('&', 0);
+  bool replaceQuery = false;
+  if (ampIndex != -1) {
+    int32_t qmIndex = path.FindChar('?', 0);
+    if (qmIndex == -1 || qmIndex > ampIndex) {
+      replaceQuery = true;
+    }
+  }
+
+  if (!Preferences::GetBool(kPrefYoutubeRewrite)) {
+    return;
+  }
+
+  Document* const doc = AsElement()->OwnerDoc();
+  NS_ConvertUTF8toUTF16 utf16OldURI(prePath);
+  AppendUTF8toUTF16(path, utf16OldURI);
+  if (replaceQuery) {
+    path.ReplaceChar('?', '&');
+    path.SetCharAt('?', ampIndex);
+  }
+  path.ReplaceSubstring("/v/"_ns, "/embed/"_ns);
+  NS_ConvertUTF8toUTF16 utf16URI(prePath);
+  AppendUTF8toUTF16(path, utf16URI);
+  rv = nsContentUtils::NewURIWithDocumentCharset(aRewrittenURI, utf16URI, doc,
+                                                 aBaseURI);
+  if (NS_FAILED(rv)) {
+    return;
+  }
+  AutoTArray<nsString, 2> params = {std::move(utf16OldURI),
+                                    std::move(utf16URI)};
+  const char* msgName;
+  if (!replaceQuery) {
+    msgName = "RewriteYouTubeEmbed";
+  } else {
+    msgName = "RewriteYouTubeEmbedPathParams";
+  }
+  nsContentUtils::ReportToConsole(nsIScriptError::warningFlag, "Plugins"_ns,
+                                  doc, PropertiesFile::DOM_PROPERTIES, msgName,
+                                  params);
+}
+
+bool nsObjectLoadingContent::CheckLoadPolicy(int16_t* aContentPolicy) {
+  if (!aContentPolicy || !mURI) {
+    MOZ_ASSERT_UNREACHABLE("Doing it wrong");
+    return false;
+  }
+
+  Element* el = AsElement();
+  Document* doc = el->OwnerDoc();
+
+  nsContentPolicyType contentPolicyType = GetContentPolicyType();
+
+  Result<RefPtr<LoadInfo>, nsresult> maybeLoadInfo =
+      LoadInfo::Create(doc->NodePrincipal(),  
+                       doc->NodePrincipal(),  
+                       el, nsILoadInfo::SEC_ONLY_FOR_EXPLICIT_CONTENTSEC_CHECK,
+                       contentPolicyType);
+  if (NS_WARN_IF(maybeLoadInfo.isErr())) {
+    return false;
+  }
+  RefPtr<LoadInfo> secCheckLoadInfo = maybeLoadInfo.unwrap();
+
+  *aContentPolicy = nsIContentPolicy::ACCEPT;
+  nsresult rv =
+      NS_CheckContentLoadPolicy(mURI, secCheckLoadInfo, aContentPolicy,
+                                nsContentUtils::GetContentPolicy());
+  NS_ENSURE_SUCCESS(rv, false);
+  if (NS_CP_REJECTED(*aContentPolicy)) {
+    LOG(("OBJLC [%p]: Content policy denied load of %s", this,
+         mURI->GetSpecOrDefault().get()));
+    return false;
+  }
+
+  return true;
+}
+
+bool nsObjectLoadingContent::CheckProcessPolicy(int16_t* aContentPolicy) {
+  if (!aContentPolicy) {
+    MOZ_ASSERT_UNREACHABLE("Null out variable");
+    return false;
+  }
+
+  Element* el = AsElement();
+  Document* doc = el->OwnerDoc();
+
+  nsContentPolicyType objectType;
+  switch (mType) {
+    case ObjectType::Document:
+      objectType = nsIContentPolicy::TYPE_DOCUMENT;
+      break;
+    default:
+      MOZ_ASSERT_UNREACHABLE(
+          "Calling checkProcessPolicy with an unexpected type");
+      return false;
+  }
+
+  Result<RefPtr<LoadInfo>, nsresult> maybeLoadInfo = LoadInfo::Create(
+      doc->NodePrincipal(),  
+      doc->NodePrincipal(),  
+      el, nsILoadInfo::SEC_ONLY_FOR_EXPLICIT_CONTENTSEC_CHECK, objectType);
+  if (NS_WARN_IF(maybeLoadInfo.isErr())) {
+    return false;
+  }
+  RefPtr<LoadInfo> secCheckLoadInfo = maybeLoadInfo.unwrap();
+
+  *aContentPolicy = nsIContentPolicy::ACCEPT;
+  nsresult rv = NS_CheckContentProcessPolicy(
+      mURI ? mURI : mBaseURI, secCheckLoadInfo, aContentPolicy,
+      nsContentUtils::GetContentPolicy());
+  NS_ENSURE_SUCCESS(rv, false);
+
+  if (NS_CP_REJECTED(*aContentPolicy)) {
+    LOG(("OBJLC [%p]: CheckContentProcessPolicy rejected load", this));
+    return false;
+  }
+
+  return true;
+}
+
+bool nsObjectLoadingContent::IsSyntheticImageDocument() const {
+  if (mType != ObjectType::Document || !mFrameLoader) {
+    return false;
+  }
+
+  BrowsingContext* browsingContext = mFrameLoader->GetExtantBrowsingContext();
+  return browsingContext && browsingContext->GetIsSyntheticDocumentContainer();
+}
+
+nsObjectLoadingContent::ParameterUpdateFlags
+nsObjectLoadingContent::UpdateObjectParameters() {
+  Element* el = AsElement();
+
+  uint32_t caps = GetCapabilities();
+  LOG(("OBJLC [%p]: Updating object parameters", this));
+
+  nsresult rv;
+  nsAutoCString newMime;
+  nsCOMPtr<nsIURI> newURI;
+  nsCOMPtr<nsIURI> newBaseURI;
+  ObjectType newType;
+  bool stateInvalid = false;
+  ParameterUpdateFlags retval = eParamNoChange;
+
+
+  if (caps & eFallbackIfClassIDPresent &&
+      el->HasNonEmptyAttr(nsGkAtoms::classid)) {
+    stateInvalid = true;
+  }
+
+
+  nsIURI* docBaseURI = el->GetBaseURI();
+
+  nsAutoString codebaseStr;
+  el->GetAttr(nsGkAtoms::codebase, codebaseStr);
+  if (StaticPrefs::dom_object_embed_codebase_enabled() &&
+      !codebaseStr.IsEmpty()) {
+    rv = nsContentUtils::NewURIWithDocumentCharset(
+        getter_AddRefs(newBaseURI), codebaseStr, el->OwnerDoc(), docBaseURI);
+    if (NS_FAILED(rv)) {
+      LOG(
+          ("OBJLC [%p]: Could not parse plugin's codebase as a URI, "
+           "will use document baseURI instead",
+           this));
+    }
+  }
+
+  if (!newBaseURI) {
+    newBaseURI = docBaseURI;
+  }
+
+
+  nsAutoString uriStr;
+  if (el->NodeInfo()->Equals(nsGkAtoms::object)) {
+    el->GetAttr(nsGkAtoms::data, uriStr);
+  } else if (el->NodeInfo()->Equals(nsGkAtoms::embed)) {
+    el->GetAttr(nsGkAtoms::src, uriStr);
+  } else {
+    MOZ_ASSERT_UNREACHABLE("Unrecognized plugin-loading tag");
+  }
+
+  mRewrittenYoutubeEmbed = false;
+
+  if (!uriStr.IsEmpty()) {
+    rv = nsContentUtils::NewURIWithDocumentCharset(
+        getter_AddRefs(newURI), uriStr, el->OwnerDoc(), newBaseURI);
+    nsCOMPtr<nsIURI> rewrittenURI;
+    MaybeRewriteYoutubeEmbed(newURI, newBaseURI, getter_AddRefs(rewrittenURI));
+    if (rewrittenURI) {
+      newURI = rewrittenURI;
+      mRewrittenYoutubeEmbed = true;
+      newMime = "text/html"_ns;
+    }
+
+    if (NS_FAILED(rv)) {
+      stateInvalid = true;
+    }
+  }
+
+  nsAutoString rawTypeAttr;
+  el->GetAttr(nsGkAtoms::type, rawTypeAttr);
+  if (!mRewrittenYoutubeEmbed && !rawTypeAttr.IsEmpty()) {
+    nsAutoString params;
+    nsAutoString mime;
+    nsContentUtils::SplitMimeType(rawTypeAttr, mime, params);
+
+    if (!StaticPrefs::dom_object_embed_type_hint_enabled()) {
+      NS_ConvertUTF16toUTF8 mimeUTF8(mime);
+      if (imgLoader::SupportImageWithMimeType(mimeUTF8)) {
+        newMime = mimeUTF8;
+      } else if (GetTypeOfContent(mimeUTF8) != ObjectType::Document) {
+        LOG(
+            ("OBJLC [%p]: MIME '%s' from type attribute is not supported, "
+             "forcing fallback.",
+             this, mimeUTF8.get()));
+        stateInvalid = true;
+      }
+
+    } else {
+      CopyUTF16toUTF8(mime, newMime);
+    }
+  }
+
+
+  if ((mOriginalContentType != newMime) || !URIEquals(mOriginalURI, newURI)) {
+    retval = (ParameterUpdateFlags)(retval | eParamChannelChanged);
+    LOG(("OBJLC [%p]: Channel parameters changed", this));
+  }
+  mOriginalContentType = newMime;
+  mOriginalURI = newURI;
+
+
+  bool useChannel = mChannelLoaded && !(retval & eParamChannelChanged);
+  bool newChannel = useChannel && mType == ObjectType::Loading;
+
+  RefPtr<DocumentChannel> documentChannel = do_QueryObject(mChannel);
+  if (newChannel && documentChannel) {
+    newMime = TEXT_HTML;
+
+    MOZ_DIAGNOSTIC_ASSERT(GetTypeOfContent(newMime) == ObjectType::Document,
+                          "How is text/html not ObjectType::Document?");
+  } else if (newChannel && mChannel) {
+    nsCString channelType;
+    rv = mChannel->GetContentType(channelType);
+    if (NS_FAILED(rv)) {
+      MOZ_ASSERT_UNREACHABLE("GetContentType failed");
+      stateInvalid = true;
+      channelType.Truncate();
+    }
+
+    LOG(("OBJLC [%p]: Channel has a content type of %s", this,
+         channelType.get()));
+
+    bool binaryChannelType = false;
+    if (channelType.EqualsASCII(APPLICATION_GUESS_FROM_EXT)) {
+      channelType = APPLICATION_OCTET_STREAM;
+      mChannel->SetContentType(channelType);
+      binaryChannelType = true;
+    } else if (channelType.EqualsASCII(APPLICATION_OCTET_STREAM) ||
+               channelType.EqualsASCII(BINARY_OCTET_STREAM)) {
+      binaryChannelType = true;
+    }
+
+    rv = NS_GetFinalChannelURI(mChannel, getter_AddRefs(newURI));
+    if (NS_FAILED(rv)) {
+      MOZ_ASSERT_UNREACHABLE("NS_GetFinalChannelURI failure");
+      stateInvalid = true;
+    }
+
+    ObjectType typeHint =
+        newMime.IsEmpty() ? ObjectType::Fallback : GetTypeOfContent(newMime);
+
+
+    bool overrideChannelType = false;
+    if (IsPluginMIME(newMime)) {
+      LOG(("OBJLC [%p]: Using plugin type hint in favor of any channel type",
+           this));
+      overrideChannelType = true;
+    } else if (binaryChannelType && typeHint != ObjectType::Fallback) {
+      if (typeHint == ObjectType::Document) {
+        if (imgLoader::SupportImageWithMimeType(newMime)) {
+          LOG(
+              ("OBJLC [%p]: Using type hint in favor of binary channel type "
+               "(Image Document)",
+               this));
+          overrideChannelType = true;
+        }
+      } else {
+        LOG(
+            ("OBJLC [%p]: Using type hint in favor of binary channel type "
+             "(Non-Image Document)",
+             this));
+        overrideChannelType = true;
+      }
+    }
+
+    if (overrideChannelType) {
+      nsAutoCString parsedMime, dummy;
+      NS_ParseResponseContentType(newMime, parsedMime, dummy);
+      if (!parsedMime.IsEmpty()) {
+        mChannel->SetContentType(parsedMime);
+      }
+    } else {
+      newMime = channelType;
+    }
+  } else if (newChannel) {
+    LOG(("OBJLC [%p]: We failed to open a channel, marking invalid", this));
+    stateInvalid = true;
+  }
+
+
+  ObjectType newMime_Type = GetTypeOfContent(newMime);
+
+  if (stateInvalid) {
+    newType = ObjectType::Fallback;
+    LOG(("OBJLC [%p]: NewType #0: %s - %u", this, newMime.get(),
+         uint32_t(newType)));
+    newMime.Truncate();
+  } else if (newChannel) {
+    newType = newMime_Type;
+    LOG(("OBJLC [%p]: NewType #1: %s - %u", this, newMime.get(),
+         uint32_t(newType)));
+    LOG(("OBJLC [%p]: Using channel type", this));
+  } else if (((caps & eAllowPluginSkipChannel) || !newURI) &&
+             IsPluginMIME(newMime)) {
+    newType = newMime_Type;
+    LOG(("OBJLC [%p]: NewType #2: %s - %u", this, newMime.get(),
+         uint32_t(newType)));
+    LOG(("OBJLC [%p]: Plugin type with no URI, skipping channel load", this));
+  } else if (newURI && (mOriginalContentType.IsEmpty() ||
+                        newMime_Type != ObjectType::Fallback)) {
+    newType = ObjectType::Loading;
+    LOG(("OBJLC [%p]: NewType #3: %u", this, uint32_t(newType)));
+  } else {
+    newType = ObjectType::Fallback;
+    LOG(("OBJLC [%p]: NewType #4: %u", this, uint32_t(newType)));
+  }
+
+
+  if (useChannel && newType == ObjectType::Loading) {
+    newType = mType;
+    LOG(("OBJLC [%p]: NewType #5: %u", this, uint32_t(newType)));
+    newMime = mContentType;
+    newURI = mURI;
+  } else if (useChannel && !newChannel) {
+    retval = (ParameterUpdateFlags)(retval | eParamChannelChanged);
+    useChannel = false;
+  }
+
+
+  if (newType != mType) {
+    retval = (ParameterUpdateFlags)(retval | eParamStateChanged);
+    LOG(("OBJLC [%p]: Type changed from %u -> %u", this, uint32_t(mType),
+         uint32_t(newType)));
+    mType = newType;
+  }
+
+  if (!URIEquals(mBaseURI, newBaseURI)) {
+    LOG(("OBJLC [%p]: Object effective baseURI changed", this));
+    mBaseURI = newBaseURI;
+  }
+
+  if (!URIEquals(newURI, mURI)) {
+    retval = (ParameterUpdateFlags)(retval | eParamStateChanged);
+    LOG(("OBJLC [%p]: Object effective URI changed", this));
+    mURI = newURI;
+  }
+
+  if (mType != ObjectType::Loading && mContentType != newMime) {
+    retval = (ParameterUpdateFlags)(retval | eParamStateChanged);
+    retval = (ParameterUpdateFlags)(retval | eParamContentTypeChanged);
+    LOG(("OBJLC [%p]: Object effective mime type changed (%s -> %s)", this,
+         mContentType.get(), newMime.get()));
+    mContentType = newMime;
+  }
+
+  if (useChannel && !newChannel && (retval & eParamStateChanged)) {
+    mType = ObjectType::Loading;
+    retval = (ParameterUpdateFlags)(retval | eParamChannelChanged);
+  }
+
+  return retval;
+}
+
+nsresult nsObjectLoadingContent::LoadObject(bool aNotify, bool aForceLoad) {
+  return LoadObject(aNotify, aForceLoad, nullptr);
+}
+
+nsresult nsObjectLoadingContent::LoadObject(bool aNotify, bool aForceLoad,
+                                            nsIRequest* aLoadingChannel) {
+  Element* el = AsElement();
+  Document* doc = el->OwnerDoc();
+  nsresult rv = NS_OK;
+
+  if (!doc->IsCurrentActiveDocument()) {
+    UnloadObject();
+    ObjectType oldType = mType;
+    mType = ObjectType::Fallback;
+    TriggerInnerFallbackLoads();
+    NotifyStateChanged(oldType, true);
+    return NS_OK;
+  }
+
+  if (doc->IsBeingUsedAsImage()) {
+    return NS_OK;
+  }
+
+  if (doc->IsLoadedAsData() || doc->IsStaticDocument()) {
+    return NS_OK;
+  }
+
+  LOG(("OBJLC [%p]: LoadObject called, notify %u, forceload %u, channel %p",
+       this, aNotify, aForceLoad, aLoadingChannel));
+
+  if (aForceLoad && mChannelLoaded) {
+    CloseChannel();
+    mChannelLoaded = false;
+  }
+
+  ObjectType oldType = mType;
+
+  ParameterUpdateFlags stateChange = UpdateObjectParameters();
+
+  if (!stateChange && !aForceLoad) {
+    return NS_OK;
+  }
+
+  LOG(("OBJLC [%p]: LoadObject - plugin state changed (%u)", this,
+       stateChange));
+
+  if (mIsLoading) {
+    LOG(("OBJLC [%p]: Re-entering into LoadObject", this));
+  }
+  mIsLoading = true;
+  AutoSetLoadingToFalse reentryCheck(this);
+
+  UnloadObject(false);  
+  if (!mIsLoading) {
+    LOG(("OBJLC [%p]: Re-entered into LoadObject, aborting outer load", this));
+    return NS_OK;
+  }
+
+  if (stateChange & eParamChannelChanged) {
+    CloseChannel();
+    mChannelLoaded = false;
+  } else if (mType == ObjectType::Fallback && mChannel) {
+    CloseChannel();
+  } else if (mType == ObjectType::Loading && mChannel) {
+    return NS_OK;
+  } else if (mChannelLoaded && mChannel != aLoadingChannel) {
+    MOZ_ASSERT_UNREACHABLE(
+        "Loading with a channel, but state doesn't make sense");
+    return NS_OK;
+  }
+
+
+  if (mType != ObjectType::Fallback) {
+    bool allowLoad = true;
+    int16_t contentPolicy = nsIContentPolicy::ACCEPT;
+    if (allowLoad && mURI && !mChannelLoaded && mType != ObjectType::Loading) {
+      allowLoad = CheckLoadPolicy(&contentPolicy);
+    }
+    if (allowLoad && mType != ObjectType::Loading) {
+      allowLoad = CheckProcessPolicy(&contentPolicy);
+    }
+
+    if (!mIsLoading) {
+      LOG(("OBJLC [%p]: We re-entered in content policy, leaving original load",
+           this));
+      return NS_OK;
+    }
+
+    if (!allowLoad) {
+      LOG(("OBJLC [%p]: Load denied by policy", this));
+      mType = ObjectType::Fallback;
+    }
+  }
+
+  if (mType != ObjectType::Fallback && mURI) {
+    ObjectType type = ObjectType::Fallback;
+    for (const auto& candidate :
+         {"about", "blob", "chrome", "data", "file", "http", "https"}) {
+      if (mURI->SchemeIs(candidate)) {
+        type = mType;
+        break;
+      }
+    }
+    mType = type;
+  }
+
+  if (mFrameLoader || mFinalListener) {
+    MOZ_ASSERT_UNREACHABLE("Trying to load new plugin with existing content");
+    return NS_OK;
+  }
+
+  if (mType != ObjectType::Fallback && !!mChannel != mChannelLoaded) {
+    MOZ_ASSERT_UNREACHABLE("Trying to load with bad channel state");
+    return NS_OK;
+  }
+
+
+  nsCOMPtr<nsIStreamListener> finalListener;
+  switch (mType) {
+    case ObjectType::Document: {
+      if (!mChannel) {
+        MOZ_ASSERT_UNREACHABLE(
+            "Attempting to load a document without a "
+            "channel");
+        rv = NS_ERROR_FAILURE;
+        break;
+      }
+
+      nsCOMPtr<nsIDocShell> docShell = SetupDocShell(mURI);
+      if (!docShell) {
+        rv = NS_ERROR_FAILURE;
+        break;
+      }
+
+      nsLoadFlags flags = 0;
+      mChannel->GetLoadFlags(&flags);
+      flags |= nsIChannel::LOAD_DOCUMENT_URI;
+      mChannel->SetLoadFlags(flags);
+
+      nsCOMPtr<nsIInterfaceRequestor> req(do_QueryInterface(docShell));
+      NS_ASSERTION(req, "Docshell must be an ifreq");
+
+      nsCOMPtr<nsIURILoader> uriLoader(components::URILoader::Service());
+      if (NS_WARN_IF(!uriLoader)) {
+        MOZ_ASSERT_UNREACHABLE("Failed to get uriLoader service");
+        RefPtr<nsFrameLoader> loader = std::move(mFrameLoader);
+        loader->Destroy();
+        break;
+      }
+
+      uint32_t uriLoaderFlags = nsDocShell::ComputeURILoaderFlags(
+          docShell->GetBrowsingContext(), LOAD_NORMAL,
+           false);
+
+      rv = uriLoader->OpenChannel(mChannel, uriLoaderFlags, req,
+                                  getter_AddRefs(finalListener));
+    } break;
+    case ObjectType::Loading:
+      rv = OpenChannel();
+      if (NS_FAILED(rv)) {
+        LOG(("OBJLC [%p]: OpenChannel returned failure (%" PRIu32 ")", this,
+             static_cast<uint32_t>(rv)));
+      }
+      break;
+    case ObjectType::Fallback:
+      break;
+  }
+
+  if (NS_FAILED(rv)) {
+    LOG(("OBJLC [%p]: Loading failed, switching to fallback", this));
+    mType = ObjectType::Fallback;
+  }
+
+  if (mType == ObjectType::Fallback) {
+    LOG(("OBJLC [%p]: Switching to fallback state", this));
+    MOZ_ASSERT(!mFrameLoader, "switched to fallback but also loaded something");
+
+    MaybeFireErrorEvent();
+
+    if (mChannel) {
+      CloseChannel();
+    }
+
+    finalListener = nullptr;
+
+    TriggerInnerFallbackLoads();
+  }
+
+  NotifyStateChanged(oldType, aNotify);
+  NS_ENSURE_TRUE(mIsLoading, NS_OK);
+
+
+  rv = NS_OK;
+  if (finalListener) {
+    NS_ASSERTION(mType != ObjectType::Fallback && mType != ObjectType::Loading,
+                 "We should not have a final listener with a non-loaded type");
+    mFinalListener = finalListener;
+
+    RefPtr<DocumentChannel> documentChannel = do_QueryObject(mChannel);
+    if (documentChannel) {
+      MOZ_ASSERT(
+          mType == ObjectType::Document,
+          "We have a DocumentChannel here but aren't loading a document?");
+    } else {
+      rv = finalListener->OnStartRequest(mChannel);
+    }
+  }
+
+  if ((NS_FAILED(rv) && rv != NS_ERROR_PARSED_DATA_CACHED) && mIsLoading) {
+    oldType = mType;
+    mType = ObjectType::Fallback;
+    UnloadObject(false);
+    NS_ENSURE_TRUE(mIsLoading, NS_OK);
+    CloseChannel();
+    TriggerInnerFallbackLoads();
+    NotifyStateChanged(oldType, true);
+  }
+
+  return NS_OK;
+}
+
+nsresult nsObjectLoadingContent::CloseChannel() {
+  if (mChannel) {
+    LOG(("OBJLC [%p]: Closing channel\n", this));
+    nsCOMPtr<nsIChannel> channelGrip(mChannel);
+    nsCOMPtr<nsIStreamListener> listenerGrip(mFinalListener);
+    mChannel = nullptr;
+    mFinalListener = nullptr;
+    channelGrip->CancelWithReason(NS_BINDING_ABORTED,
+                                  "nsObjectLoadingContent::CloseChannel"_ns);
+    if (listenerGrip) {
+      listenerGrip->OnStopRequest(channelGrip, NS_BINDING_ABORTED);
+    }
+  }
+  return NS_OK;
+}
+
+bool nsObjectLoadingContent::IsAboutBlankLoadOntoInitialAboutBlank(
+    nsIURI* aURI, bool aInheritPrincipal, nsIPrincipal* aPrincipalToInherit) {
+  if (!NS_IsAboutBlankAllowQueryAndFragment(aURI) || !aInheritPrincipal) {
+    return false;
+  }
+
+  if (!mFrameLoader || !mFrameLoader->GetExistingDocShell()) {
+    return false;
+  }
+
+  RefPtr<nsDocShellLoadState> dummyLoadState = new nsDocShellLoadState(mURI);
+  return mFrameLoader->GetExistingDocShell()->ShouldDoInitialAboutBlankSyncLoad(
+      aURI, dummyLoadState, aPrincipalToInherit);
+}
+
+nsresult nsObjectLoadingContent::OpenChannel() {
+  Element* el = AsElement();
+  Document* doc = el->OwnerDoc();
+  NS_ASSERTION(doc, "No owner document?");
+
+  nsresult rv;
+  mChannel = nullptr;
+
+  if (!mURI || !CanHandleURI(mURI)) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  nsCOMPtr<nsILoadGroup> group = doc->GetDocumentLoadGroup();
+  nsCOMPtr<nsIChannel> chan;
+  RefPtr<ObjectInterfaceRequestorShim> shim =
+      new ObjectInterfaceRequestorShim(this);
+
+  bool inheritAttrs = nsContentUtils::ChannelShouldInheritPrincipal(
+      el->NodePrincipal(),  
+      mURI,                 
+      true,                 
+      false);               
+
+  bool inheritPrincipal = inheritAttrs && !mURI->SchemeIs("data");
+
+  nsSecurityFlags securityFlags =
+      nsILoadInfo::SEC_ALLOW_CROSS_ORIGIN_SEC_CONTEXT_IS_NULL;
+  if (inheritPrincipal) {
+    securityFlags |= nsILoadInfo::SEC_FORCE_INHERIT_PRINCIPAL;
+  }
+
+  nsContentPolicyType contentPolicyType = GetContentPolicyType();
+  nsLoadFlags loadFlags = nsIChannel::LOAD_CALL_CONTENT_SNIFFERS |
+                          nsIChannel::LOAD_BYPASS_SERVICE_WORKER |
+                          nsIRequest::LOAD_HTML_OBJECT_DATA;
+  uint32_t sandboxFlags = doc->GetSandboxFlags();
+
+  RefPtr<PolicyContainer> policyContainerToInherit;
+  if (nsCOMPtr<nsIPolicyContainer> policyContainer =
+          doc->GetPolicyContainer()) {
+    policyContainerToInherit = new PolicyContainer();
+    policyContainerToInherit->InitFromOther(
+        PolicyContainer::Cast(policyContainer.get()));
+  }
+
+  RefPtr<LoadInfo> loadInfo = MOZ_TRY(LoadInfo::Create(
+       nullptr,
+       nullptr,
+       el,
+       securityFlags,
+       contentPolicyType,
+       Nothing(),
+       Nothing(),
+       sandboxFlags));
+
+  if (inheritAttrs) {
+    loadInfo->SetPrincipalToInherit(el->NodePrincipal());
+  }
+
+  if (policyContainerToInherit) {
+    loadInfo->SetPolicyContainerToInherit(policyContainerToInherit);
+  }
+
+  if (DocumentChannel::CanUseDocumentChannel(mURI) &&
+      !IsAboutBlankLoadOntoInitialAboutBlank(mURI, inheritPrincipal,
+                                             el->NodePrincipal())) {
+    RefPtr<nsDocShellLoadState> loadState = new nsDocShellLoadState(mURI);
+    loadState->SetPrincipalToInherit(el->NodePrincipal());
+    loadState->SetTriggeringPrincipal(loadInfo->TriggeringPrincipal());
+    if (policyContainerToInherit) {
+      loadState->SetPolicyContainer(policyContainerToInherit);
+    }
+    loadState->SetTriggeringSandboxFlags(sandboxFlags);
+
+    auto referrerInfo = MakeRefPtr<ReferrerInfo>(*doc);
+    loadState->SetReferrerInfo(referrerInfo);
+
+    loadState->SetShouldCheckForRecursion(true);
+
+    if (!mOriginalContentType.IsEmpty()) {
+      nsAutoCString parsedMime, dummy;
+      NS_ParseResponseContentType(mOriginalContentType, parsedMime, dummy);
+      if (!parsedMime.IsEmpty()) {
+        loadState->SetTypeHint(parsedMime);
+      }
+    }
+
+    chan =
+        DocumentChannel::CreateForObject(loadState, loadInfo, loadFlags, shim);
+    MOZ_ASSERT(chan);
+    chan->SetLoadGroup(group);
+  } else {
+    rv = NS_NewChannelInternal(getter_AddRefs(chan),  
+                               mURI,                  
+                               loadInfo,              
+                               nullptr,               
+                               group,                 
+                               shim,                  
+                               loadFlags,             
+                               nullptr);              
+    NS_ENSURE_SUCCESS(rv, rv);
+  };
+
+  if (nsCOMPtr<nsIHttpChannel> httpChan = do_QueryInterface(chan)) {
+    auto referrerInfo = MakeRefPtr<ReferrerInfo>(*doc);
+
+    rv = httpChan->SetReferrerInfoWithoutClone(referrerInfo);
+    MOZ_ASSERT(NS_SUCCEEDED(rv));
+
+    if (nsCOMPtr<nsITimedChannel> timedChannel = do_QueryInterface(httpChan)) {
+      timedChannel->SetInitiatorType(el->LocalName());
+    }
+
+    nsCOMPtr<nsIClassOfService> cos(do_QueryInterface(httpChan));
+    if (cos && UserActivation::IsHandlingUserInput()) {
+      cos->AddClassFlags(nsIClassOfService::UrgentStart);
+    }
+  }
+
+  rv = chan->AsyncOpen(shim);
+  NS_ENSURE_SUCCESS(rv, rv);
+  LOG(("OBJLC [%p]: Channel opened", this));
+  mChannel = std::move(chan);
+  return NS_OK;
+}
+
+uint32_t nsObjectLoadingContent::GetCapabilities() const {
+  return eSupportImages | eSupportDocuments;
+}
+
+void nsObjectLoadingContent::Destroy() {
+  UnloadObject();
+}
+
+void nsObjectLoadingContent::Traverse(nsObjectLoadingContent* tmp,
+                                      nsCycleCollectionTraversalCallback& cb) {
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mFrameLoader);
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mFeaturePolicy);
+}
+
+void nsObjectLoadingContent::Unlink(nsObjectLoadingContent* tmp) {
+  if (tmp->mFrameLoader) {
+    tmp->mFrameLoader->Destroy();
+  }
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mFrameLoader);
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mFeaturePolicy);
+}
+
+void nsObjectLoadingContent::UnloadObject(bool aResetState) {
+  if (mFrameLoader) {
+    RefPtr<nsFrameLoader> loader = std::move(mFrameLoader);
+    loader->Destroy();
+  }
+
+  if (aResetState) {
+    CloseChannel();
+    mChannelLoaded = false;
+    mType = ObjectType::Loading;
+    mURI = mOriginalURI = mBaseURI = nullptr;
+    mContentType.Truncate();
+    mOriginalContentType.Truncate();
+  }
+
+  mScriptRequested = false;
+
+  mIsStopping = false;
+
+  mSubdocumentIntrinsicSize.reset();
+  mSubdocumentIntrinsicRatio.reset();
+}
+
+void nsObjectLoadingContent::NotifyStateChanged(ObjectType aOldType,
+                                                bool aNotify) {
+  LOG(("OBJLC [%p]: NotifyStateChanged: (%u) -> (%u) (notify %i)", this,
+       uint32_t(aOldType), uint32_t(mType), aNotify));
+
+  dom::Element* thisEl = AsElement();
+  thisEl->RemoveStates(ElementState::BROKEN, aNotify);
+
+  if (mType == aOldType) {
+    return;
+  }
+
+  Document* doc = thisEl->GetComposedDoc();
+  if (!doc) {
+    return;  
+  }
+
+  PresShell* presShell = doc->GetPresShell();
+  if (!presShell || !presShell->DidInitialize()) {
+    return;
+  }
+  presShell->PostRecreateFramesFor(thisEl);
+}
+
+nsObjectLoadingContent::ObjectType nsObjectLoadingContent::GetTypeOfContent(
+    const nsCString& aMIMEType) {
+  Element* el = AsElement();
+  NS_ASSERTION(el, "must be a content");
+
+  Document* doc = el->OwnerDoc();
+
+  MOZ_ASSERT((GetCapabilities() & (eSupportImages | eSupportDocuments)) ==
+             (eSupportImages | eSupportDocuments));
+
+  LOG(
+      ("OBJLC [%p]: calling HtmlObjectContentTypeForMIMEType: aMIMEType: %s - "
+       "el: %p\n",
+       this, aMIMEType.get(), el));
+  auto ret =
+      static_cast<ObjectType>(nsContentUtils::HtmlObjectContentTypeForMIMEType(
+          aMIMEType, doc->GetSandboxFlags()));
+  LOG(("OBJLC [%p]: called HtmlObjectContentTypeForMIMEType\n", this));
+  return ret;
+}
+
+NS_IMETHODIMP
+nsObjectLoadingContent::GetSrcURI(nsIURI** aURI) {
+  NS_IF_ADDREF(*aURI = GetSrcURI());
+  return NS_OK;
+}
+
+void nsObjectLoadingContent::TriggerInnerFallbackLoads() {
+  MOZ_ASSERT(!mFrameLoader && !mChannel,
+             "ConfigureFallback called with loaded content");
+  MOZ_ASSERT(mType == ObjectType::Fallback);
+
+  Element* el = AsElement();
+  if (!el->IsHTMLElement(nsGkAtoms::object)) {
+    return;
+  }
+  AutoTArray<RefPtr<nsIContent>, 4> targets;
+  for (nsIContent* child = el->GetFirstChild(); child;) {
+    if (child->IsAnyOfHTMLElements(nsGkAtoms::embed, nsGkAtoms::object)) {
+      targets.AppendElement(child);
+      child = child->GetNextNonChildNode(el);
+    } else {
+      child = child->GetNextNode(el);
+    }
+  }
+
+  for (RefPtr<nsIContent>& target : targets) {
+    if (!target->IsInclusiveDescendantOf(el)) {
+      continue;
+    }
+    if (auto* embed = HTMLEmbedElement::FromNode(target)) {
+      embed->StartObjectLoad(true, true);
+    } else if (auto* object = HTMLObjectElement::FromNode(target)) {
+      object->StartObjectLoad(true, true);
+    }
+  }
+}
+
+NS_IMETHODIMP
+nsObjectLoadingContent::UpgradeLoadToDocument(
+    nsIChannel* aRequest, BrowsingContext** aBrowsingContext) {
+
+  LOG(("OBJLC [%p]: UpgradeLoadToDocument", this));
+
+  if (aRequest != mChannel || !aRequest) {
+    return NS_BINDING_ABORTED;
+  }
+
+  if (mType != ObjectType::Loading) {
+    MOZ_ASSERT_UNREACHABLE("Should be type loading at this point");
+    return NS_BINDING_ABORTED;
+  }
+  MOZ_ASSERT(!mChannelLoaded, "mChannelLoaded set already?");
+  MOZ_ASSERT(!mFinalListener, "mFinalListener exists already?");
+
+  mChannelLoaded = true;
+
+
+  nsresult rv = LoadObject(true, false, aRequest);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  RefPtr<BrowsingContext> bc = GetBrowsingContext();
+  if (!bc) {
+    return NS_ERROR_FAILURE;
+  }
+
+  RefreshFeaturePolicy();
+
+  bc.forget(aBrowsingContext);
+  return NS_OK;
+}
+
+Document* nsObjectLoadingContent::GetContentDocument(
+    nsIPrincipal& aSubjectPrincipal) {
+  Element* el = AsElement();
+  if (!el->IsInComposedDoc()) {
+    return nullptr;
+  }
+
+  Document* sub_doc = el->OwnerDoc()->GetSubDocumentFor(el);
+  if (!sub_doc) {
+    return nullptr;
+  }
+
+  if (!aSubjectPrincipal.SubsumesConsideringDomain(sub_doc->NodePrincipal())) {
+    return nullptr;
+  }
+
+  return sub_doc;
+}
+
+void nsObjectLoadingContent::MaybeFireErrorEvent() {
+  Element* el = AsElement();
+  if (el->IsHTMLElement(nsGkAtoms::object)) {
+    RefPtr<AsyncEventDispatcher> loadBlockingAsyncDispatcher =
+        new LoadBlockingAsyncEventDispatcher(el, u"error"_ns, CanBubble::eNo,
+                                             ChromeOnlyDispatch::eNo);
+    loadBlockingAsyncDispatcher->PostDOMEvent();
+  }
+}
+
+bool nsObjectLoadingContent::BlockEmbedOrObjectContentLoading() {
+  Element* el = AsElement();
+
+  for (nsIContent* parent = el->GetParent(); parent;
+       parent = parent->GetParent()) {
+    if (parent->IsAnyOfHTMLElements(nsGkAtoms::video, nsGkAtoms::audio)) {
+      return true;
+    }
+    if (auto* object = HTMLObjectElement::FromNode(parent)) {
+      if (object->Type() != ObjectType::Fallback) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+void nsObjectLoadingContent::SubdocumentIntrinsicSizeOrRatioChanged(
+    const Maybe<IntrinsicSize>& aIntrinsicSize,
+    const Maybe<AspectRatio>& aIntrinsicRatio) {
+  if (aIntrinsicSize == mSubdocumentIntrinsicSize &&
+      aIntrinsicRatio == mSubdocumentIntrinsicRatio) {
+    return;
+  }
+
+  mSubdocumentIntrinsicSize = aIntrinsicSize;
+  mSubdocumentIntrinsicRatio = aIntrinsicRatio;
+
+  if (nsSubDocumentFrame* sdf = do_QueryFrame(AsElement()->GetPrimaryFrame())) {
+    sdf->SubdocumentIntrinsicSizeOrRatioChanged();
+  }
+}
+
+void nsObjectLoadingContent::SubdocumentImageLoadComplete(nsresult aResult) {
+  ObjectType oldType = mType;
+  if (NS_FAILED(aResult)) {
+    UnloadObject();
+    mType = ObjectType::Fallback;
+    TriggerInnerFallbackLoads();
+    NotifyStateChanged(oldType, true);
+    return;
+  }
+
+  MOZ_DIAGNOSTIC_ASSERT_IF(mChannelLoaded && mChannel,
+                           mType == ObjectType::Document);
+  NotifyStateChanged(oldType, true);
+}
+
+void nsObjectLoadingContent::MaybeStoreCrossOriginFeaturePolicy() {
+  MOZ_DIAGNOSTIC_ASSERT(mFrameLoader);
+  if (!mFrameLoader) {
+    return;
+  }
+
+  if (!mFrameLoader->IsRemoteFrame() && !mFrameLoader->GetExistingDocShell()) {
+    return;
+  }
+
+  RefPtr<BrowsingContext> browsingContext = mFrameLoader->GetBrowsingContext();
+
+  if (!browsingContext || !browsingContext->IsContentSubframe()) {
+    return;
+  }
+
+  auto* el = nsGenericHTMLElement::FromNode(AsElement());
+  if (!el->IsInComposedDoc()) {
+    return;
+  }
+
+  if (ContentChild* cc = ContentChild::GetSingleton()) {
+    (void)cc->SendSetContainerFeaturePolicy(
+        browsingContext, Some(mFeaturePolicy->ToFeaturePolicyInfo()));
+  }
+}
+
+ already_AddRefed<nsIPrincipal>
+nsObjectLoadingContent::GetFeaturePolicyDefaultOrigin(nsINode* aNode) {
+  auto* el = nsGenericHTMLElement::FromNode(aNode);
+  nsCOMPtr<nsIURI> nodeURI;
+  if (el->NodeInfo()->Equals(nsGkAtoms::object)) {
+    el->GetURIAttr(nsGkAtoms::data, nullptr, getter_AddRefs(nodeURI));
+  } else if (el->NodeInfo()->Equals(nsGkAtoms::embed)) {
+    el->GetURIAttr(nsGkAtoms::src, nullptr, getter_AddRefs(nodeURI));
+  }
+
+  nsCOMPtr<nsIPrincipal> principal;
+  if (nodeURI) {
+    principal = BasePrincipal::CreateContentPrincipal(
+        nodeURI,
+        BasePrincipal::Cast(el->NodePrincipal())->OriginAttributesRef());
+  } else {
+    principal = el->NodePrincipal();
+  }
+
+  return principal.forget();
+}
+
+void nsObjectLoadingContent::RefreshFeaturePolicy() {
+  if (mType != ObjectType::Document) {
+    return;
+  }
+
+  if (!mFeaturePolicy) {
+    mFeaturePolicy = MakeAndAddRef<FeaturePolicy>(AsElement());
+  }
+
+  nsCOMPtr<nsIPrincipal> origin = GetFeaturePolicyDefaultOrigin(AsElement());
+  MOZ_ASSERT(origin);
+  mFeaturePolicy->SetDefaultOrigin(origin);
+
+  mFeaturePolicy->InheritPolicy(AsElement()->OwnerDoc()->FeaturePolicy());
+  MaybeStoreCrossOriginFeaturePolicy();
+}

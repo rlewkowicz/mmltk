@@ -1,0 +1,112 @@
+/*
+ * Copyright 2013 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkFontMgr_DEFINED)
+#define SkFontMgr_DEFINED
+
+#include "include/core/SkFontArguments.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkSpan.h"
+#include "include/core/SkTypes.h"
+
+#include <memory>
+
+class SkData;
+class SkFontStyle;
+class SkStreamAsset;
+class SkString;
+class SkTypeface;
+
+class SK_API SkFontStyleSet : public SkRefCnt {
+public:
+    virtual int count() = 0;
+    virtual void getStyle(int index, SkFontStyle*, SkString* style) = 0;
+    virtual sk_sp<SkTypeface> createTypeface(int index) = 0;
+    virtual sk_sp<SkTypeface> matchStyle(const SkFontStyle& pattern) = 0;
+
+    static sk_sp<SkFontStyleSet> CreateEmpty();
+
+protected:
+    sk_sp<SkTypeface> matchStyleCSS3(const SkFontStyle& pattern);
+};
+
+class SK_API SkFontMgr : public SkRefCnt {
+public:
+    int countFamilies() const;
+    void getFamilyName(int index, SkString* familyName) const;
+    sk_sp<SkFontStyleSet> createStyleSet(int index) const;
+
+    sk_sp<SkFontStyleSet> matchFamily(const char familyName[]) const;
+
+    sk_sp<SkTypeface> matchFamilyStyle(const char familyName[], const SkFontStyle&) const;
+
+    sk_sp<SkTypeface> matchFamilyStyleCharacter(const char familyName[], const SkFontStyle&,
+                                                const char* bcp47[], int bcp47Count,
+                                                SkUnichar character) const;
+
+    struct Request {
+        struct CMapEntry {
+            SkUnichar character;
+            SkUnichar variation;  
+        };
+        SkSpan<const CMapEntry> cmapEntries;
+
+        SkSpan<const char*> bcp47;
+
+        const char* familyName;
+
+        SkSpan<const SkFontArguments::VariationPosition::Coordinate> model;
+        SkFontStyle fontStyleFromModel() const;
+        static void SetModel(SkFontStyle s, SkFontArguments::VariationPosition::Coordinate(&m)[4]);
+
+        std::optional<bool> syntheticBold;
+        std::optional<bool> syntheticOblique;
+    };
+
+    sk_sp<SkTypeface> match(const Request&) const;
+
+    sk_sp<SkTypeface> fallback(const Request&) const;
+
+    sk_sp<SkTypeface> makeFromData(sk_sp<SkData>, int ttcIndex = 0) const;
+
+    sk_sp<SkTypeface> makeFromStream(std::unique_ptr<SkStreamAsset>, int ttcIndex = 0) const;
+
+    sk_sp<SkTypeface> makeFromStream(std::unique_ptr<SkStreamAsset>, const SkFontArguments&) const;
+
+    sk_sp<SkTypeface> makeFromFile(const char path[], int ttcIndex = 0) const;
+
+    sk_sp<SkTypeface> legacyMakeTypeface(const char familyName[], SkFontStyle style) const;
+
+    static sk_sp<SkFontMgr> RefEmpty();
+
+protected:
+    virtual int onCountFamilies() const = 0;
+    virtual void onGetFamilyName(int index, SkString* familyName) const = 0;
+    virtual sk_sp<SkFontStyleSet> onCreateStyleSet(int index)const  = 0;
+
+    virtual sk_sp<SkFontStyleSet> onMatchFamily(const char familyName[]) const = 0;
+
+    virtual sk_sp<SkTypeface> onMatchFamilyStyle(const char familyName[],
+                                                 const SkFontStyle&) const = 0;
+    virtual sk_sp<SkTypeface> onMatchFamilyStyleCharacter(const char familyName[],
+                                                          const SkFontStyle&,
+                                                          const char* bcp47[], int bcp47Count,
+                                                          SkUnichar character) const = 0;
+    virtual sk_sp<SkTypeface> onMatch(const Request&) const; 
+    virtual sk_sp<SkTypeface> onFallback(const Request&) const; 
+
+    virtual sk_sp<SkTypeface> onMakeFromData(sk_sp<SkData>, int ttcIndex) const = 0;
+    virtual sk_sp<SkTypeface> onMakeFromStreamIndex(std::unique_ptr<SkStreamAsset>,
+                                                    int ttcIndex) const = 0;
+    virtual sk_sp<SkTypeface> onMakeFromStreamArgs(std::unique_ptr<SkStreamAsset>,
+                                                   const SkFontArguments&) const = 0;
+    virtual sk_sp<SkTypeface> onMakeFromFile(const char path[], int ttcIndex) const = 0;
+
+    virtual sk_sp<SkTypeface> onLegacyMakeTypeface(const char familyName[], SkFontStyle) const = 0;
+};
+
+#endif

@@ -1,0 +1,225 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+const { EnableDelayHelper } = ChromeUtils.importESModule(
+  "resource://gre/modules/PromptUtils.sys.mjs"
+);
+const { XPCOMUtils } = ChromeUtils.importESModule(
+  "resource://gre/modules/XPCOMUtils.sys.mjs"
+);
+
+const lazy = {};
+XPCOMUtils.defineLazyPreferenceGetter(
+  lazy,
+  "walletSchemes",
+  "privacy.wallet_schemes"
+);
+
+let dialog = {
+  initialize() {
+    let args = window.arguments[0].wrappedJSObject || window.arguments[0];
+    let {
+      handler,
+      principal,
+      outArgs,
+      canPersistPermission,
+      preferredHandlerName,
+      browsingContext,
+    } = args;
+
+    this._handlerInfo = handler.QueryInterface(Ci.nsIHandlerInfo);
+    this._principal = principal?.QueryInterface(Ci.nsIPrincipal);
+    this._browsingContext = browsingContext;
+    this._outArgs = outArgs.QueryInterface(Ci.nsIWritablePropertyBag);
+    this._preferredHandlerName = preferredHandlerName;
+
+    this._dialog = document.querySelector("dialog");
+    this._checkRemember = document.getElementById("remember");
+    this._checkRememberContainer = document.getElementById("rememberContainer");
+
+    if (!canPersistPermission) {
+      this._checkRememberContainer.hidden = true;
+    }
+
+    let changeAppLink = document.getElementById("change-app");
+
+    if (this._preferredHandlerName && !this._principal?.isSystemPrincipal) {
+      changeAppLink.hidden = false;
+
+      changeAppLink.addEventListener("click", () => this.onChangeApp());
+    }
+    document.addEventListener("dialogaccept", () => this.onAccept());
+    this.initL10n();
+
+    this._delayHelper = new EnableDelayHelper({
+      disableDialog: () => {
+        this._dialog.setAttribute("buttondisabledaccept", true);
+      },
+      enableDialog: () => {
+        this._dialog.removeAttribute("buttondisabledaccept");
+      },
+      focusTarget: window,
+    });
+  },
+
+  shouldShowPrincipal() {
+    if (!this._principal) {
+      return false;
+    }
+
+    let topContentPrincipal =
+      this._browsingContext?.top.embedderElement?.contentPrincipal;
+
+    let shownScheme = this._browsingContext.currentURI.scheme;
+    return (
+      !topContentPrincipal ||
+      !topContentPrincipal.equals(this._principal) ||
+      !["http", "https", "file"].includes(shownScheme)
+    );
+  },
+
+  get l10nDescriptionId() {
+    if (this._principal?.schemeIs("file") && !this.shouldShowPrincipal()) {
+      if (this._preferredHandlerName) {
+        return "permission-dialog-description-file-app";
+      }
+      return "permission-dialog-description-file";
+    }
+
+    if (this._principal?.isSystemPrincipal && this._preferredHandlerName) {
+      return "permission-dialog-description-system-app";
+    }
+
+    if (this._principal?.isSystemPrincipal && !this._preferredHandlerName) {
+      return "permission-dialog-description-system-noapp";
+    }
+
+    if (this.shouldShowPrincipal() && this.userReadablePrincipal) {
+      if (this._preferredHandlerName) {
+        return "permission-dialog-description-host-app";
+      }
+      return "permission-dialog-description-host";
+    }
+
+    if (this._preferredHandlerName) {
+      return "permission-dialog-description-app";
+    }
+
+    return "permission-dialog-description";
+  },
+
+  get l10nCheckboxId() {
+    if (!this._principal) {
+      return null;
+    }
+
+    if (this._principal.schemeIs("file")) {
+      return "permission-dialog-remember-file";
+    }
+    return "permission-dialog-remember";
+  },
+
+  get walletWarningL10nId() {
+    if (this.shouldShowPrincipal() && this.userReadablePrincipal) {
+      if (this._preferredHandlerName) {
+        return "wallet-custom-scheme-warning-host-app";
+      }
+      return "wallet-custom-scheme-warning-host";
+    }
+
+    if (this._preferredHandlerName) {
+      return "wallet-custom-scheme-warning-app";
+    }
+
+    return "wallet-custom-scheme-warning";
+  },
+
+  get userReadablePrincipal() {
+    if (!this._principal) {
+      return null;
+    }
+
+    let p = this._principal.isNullPrincipal
+      ? this._principal.precursorPrincipal
+      : this._principal;
+    if (p?.schemeIs("file")) {
+      try {
+        let { file } = p.URI.QueryInterface(Ci.nsIFileURL);
+        return file.path;
+      } catch (_ex) {
+        return p.spec;
+      }
+    }
+    return p?.exposablePrePath;
+  },
+
+  initL10n() {
+
+    let idAcceptButton;
+    let acceptButton = this._dialog.getButton("accept");
+
+    if (this._preferredHandlerName) {
+      idAcceptButton = "permission-dialog-btn-open-link";
+    } else {
+      idAcceptButton = "permission-dialog-btn-choose-app";
+
+      let descriptionExtra = document.getElementById("description-extra");
+      descriptionExtra.hidden = false;
+      acceptButton.addEventListener("click", () => this.onChangeApp());
+    }
+    document.l10n.setAttributes(acceptButton, idAcceptButton);
+
+    let description = document.getElementById("description");
+
+    let host = this.userReadablePrincipal;
+    let scheme = this._handlerInfo.type;
+
+    document.l10n.setAttributes(description, this.l10nDescriptionId, {
+      host,
+      scheme,
+      appName: this._preferredHandlerName,
+    });
+
+    if (!this._checkRememberContainer.hidden) {
+      let checkboxLabel = document.getElementById("remember-label");
+      document.l10n.setAttributes(checkboxLabel, this.l10nCheckboxId, {
+        host,
+        scheme,
+      });
+    }
+
+    let walletSchemeList = lazy.walletSchemes.split(",");
+    if (walletSchemeList.includes(scheme)) {
+      let warning = document.getElementById("warning-bar");
+      document.l10n.setAttributes(
+        warning,
+        "wallet-custom-scheme-warning-heading"
+      );
+      warning.messageL10nId = this.walletWarningL10nId;
+      warning.messageL10nArgs = {
+        host,
+        scheme,
+        appName: this._preferredHandlerName,
+      };
+      warning.hidden = false;
+      description.hidden = true;
+    }
+  },
+
+  onAccept() {
+    this._outArgs.setProperty("remember", this._checkRemember.checked);
+    this._outArgs.setProperty("granted", true);
+  },
+
+  onChangeApp() {
+    this._outArgs.setProperty("resetHandlerChoice", true);
+
+    this.onAccept();
+    window.close();
+  },
+};
+
+window.addEventListener("DOMContentLoaded", () => dialog.initialize(), {
+  once: true,
+});

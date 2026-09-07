@@ -1,0 +1,153 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef ComputedStyleInlines_h
+#define ComputedStyleInlines_h
+
+#include "MainThreadUtils.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/CachedInheritingStyles.h"
+#include "mozilla/ComputedStyle.h"
+#include "mozilla/PseudoStyleType.h"
+#include "nsStyleStructInlines.h"
+#include "nsStyleStructList.h"
+
+namespace mozilla {
+
+namespace detail {
+
+template <typename T, typename Enable = void>
+struct HasTriggerImageLoads : public std::false_type {};
+
+template <typename T>
+struct HasTriggerImageLoads<T, decltype(std::declval<T&>().TriggerImageLoads(
+                                   std::declval<dom::Document&>(), nullptr))>
+    : public std::true_type {};
+
+template <typename T, const T* (ComputedStyle::*Method)() const>
+void TriggerImageLoads(dom::Document& aDocument, const ComputedStyle* aOldStyle,
+                       ComputedStyle* aStyle) {
+  if constexpr (HasTriggerImageLoads<T>::value) {
+    auto* old = aOldStyle ? (aOldStyle->*Method)() : nullptr;
+    auto* current = const_cast<T*>((aStyle->*Method)());
+    current->TriggerImageLoads(aDocument, old);
+  } else {
+    (void)aOldStyle;
+    (void)aStyle;
+  }
+}
+
+}  
+
+void ComputedStyle::StartImageLoads(dom::Document& aDocument,
+                                    const ComputedStyle* aOldStyle) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+#define TRIGGER_IMAGE_LOADS(name_)                                         \
+  detail::TriggerImageLoads<nsStyle##name_, &ComputedStyle::Style##name_>( \
+      aDocument, aOldStyle, this);
+  FOR_EACH_STYLE_STRUCT(TRIGGER_IMAGE_LOADS, TRIGGER_IMAGE_LOADS)
+#undef TRIGGER_IMAGE_LOADS
+}
+
+StylePointerEvents ComputedStyle::PointerEvents() const {
+  if (IsRootElementStyle()) {
+    return StylePointerEvents::Auto;
+  }
+  const auto& ui = *StyleUI();
+  if (ui.IsInert()) {
+    return StylePointerEvents::None;
+  }
+  return ui.ComputedPointerEvents();
+}
+
+StyleUserSelect ComputedStyle::UserSelect() const {
+  return StyleUI()->IsInert() ? StyleUserSelect::None
+                              : StyleUIReset()->ComputedUserSelect();
+}
+
+bool ComputedStyle::IsFixedPosContainingBlockForNonSVGTextFrames() const {
+  if (IsRootElementStyle()) {
+    return false;
+  }
+
+  const auto& disp = *StyleDisplay();
+  if (disp.mWillChange.bits & mozilla::StyleWillChangeBits::FIXPOS_CB_NON_SVG) {
+    return true;
+  }
+
+  const auto& effects = *StyleEffects();
+  return effects.HasFilters() || effects.HasBackdropFilters();
+}
+
+bool ComputedStyle::IsFixedPosContainingBlock(
+    const nsIFrame* aContextFrame) const {
+  if (aContextFrame->IsInSVGTextSubtree()) {
+    return false;
+  }
+  if (IsFixedPosContainingBlockForNonSVGTextFrames()) {
+    return true;
+  }
+  const auto& disp = *StyleDisplay();
+  if (disp.IsFixedPosContainingBlockForContainLayoutAndPaintSupportingFrames() &&
+      aContextFrame->SupportsContainLayoutAndPaint()) {
+    return true;
+  }
+  if (disp.IsFixedPosContainingBlockForTransformSupportingFrames() &&
+      aContextFrame->SupportsCSSTransforms()) {
+    return true;
+  }
+  return false;
+}
+
+bool ComputedStyle::IsAbsPosContainingBlock(
+    const nsIFrame* aContextFrame) const {
+  if (IsFixedPosContainingBlock(aContextFrame)) {
+    return true;
+  }
+  return StyleDisplay()->IsPositionedStyle() &&
+         !aContextFrame->IsInSVGTextSubtree();
+}
+
+template <typename Func>
+void CachedInheritingStyles::ForEachLazyPseudoEntry(Func&& aFunc) const {
+  if (IsEmpty()) {
+    return;
+  }
+  if (IsNullDirect()) {
+    aFunc(nullptr, nullptr, NullDirectType());
+    return;
+  }
+  if (!IsIndirect()) {
+    ComputedStyle* direct = AsDirect();
+    if (direct->IsLazilyCascadedPseudoElement()) {
+      aFunc(direct, nullptr, direct->GetPseudoType());
+    }
+    return;
+  }
+  for (const auto& entry : *AsIndirect()) {
+    if (!entry.mStyle) {
+      if (PseudoStyle::IsPseudoElement(entry.mPseudoType) &&
+          !PseudoStyle::IsEagerlyCascadedInServo(entry.mPseudoType)) {
+        aFunc(nullptr, entry.mFunctionalPseudoParameter.get(),
+              entry.mPseudoType);
+      }
+      continue;
+    }
+    if (entry.mStyle->IsLazilyCascadedPseudoElement()) {
+      aFunc(entry.mStyle.get(), entry.mFunctionalPseudoParameter.get(),
+            entry.mPseudoType);
+    }
+  }
+}
+
+template <typename Func>
+void ComputedStyle::ForEachCachedLazyPseudoEntry(Func&& aFunc) const {
+  mCachedInheritingStyles.ForEachLazyPseudoEntry(aFunc);
+}
+
+}  
+
+#endif  // ComputedStyleInlines_h

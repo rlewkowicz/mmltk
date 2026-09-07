@@ -1,0 +1,92 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "mozilla/AttributeStyles.h"
+
+#include "mozilla/DeclarationBlock.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/RestyleManager.h"
+#include "mozilla/ServoBindings.h"
+#include "mozilla/ServoStyleSet.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/DocumentInlines.h"
+#include "mozilla/dom/Element.h"
+#include "nsError.h"
+#include "nsHashKeys.h"
+#include "nsPresContext.h"
+#include "nsStyleConsts.h"
+
+using namespace mozilla::dom;
+
+namespace mozilla {
+
+
+AttributeStyles::AttributeStyles(Document* aDocument) : mDocument(aDocument) {
+  MOZ_ASSERT(aDocument);
+}
+
+void AttributeStyles::SetOwningDocument(Document* aDocument) {
+  mDocument = aDocument;  
+}
+
+void AttributeStyles::Reset() {
+  mServoUnvisitedLinkDecl = nullptr;
+  mServoVisitedLinkDecl = nullptr;
+  mServoActiveLinkDecl = nullptr;
+}
+
+nsresult AttributeStyles::ImplLinkColorSetter(
+    RefPtr<StyleLockedDeclarationBlock>& aDecl, nscolor aColor) {
+  if (!mDocument || !mDocument->GetPresShell()) {
+    return NS_OK;
+  }
+
+  MOZ_ASSERT(!ServoStyleSet::IsInServoTraversal());
+  aDecl = Servo_DeclarationBlock_CreateEmpty().Consume();
+  Servo_DeclarationBlock_SetColorValue(aDecl.get(), eCSSProperty_color, aColor);
+
+  if (Element* root = mDocument->GetRootElement()) {
+    RestyleManager* rm = mDocument->GetPresContext()->RestyleManager();
+    rm->PostRestyleEvent(root, RestyleHint::RestyleSubtree(), nsChangeHint(0));
+  }
+  return NS_OK;
+}
+
+nsresult AttributeStyles::SetLinkColor(nscolor aColor) {
+  return ImplLinkColorSetter(mServoUnvisitedLinkDecl, aColor);
+}
+
+nsresult AttributeStyles::SetActiveLinkColor(nscolor aColor) {
+  return ImplLinkColorSetter(mServoActiveLinkDecl, aColor);
+}
+
+nsresult AttributeStyles::SetVisitedLinkColor(nscolor aColor) {
+  return ImplLinkColorSetter(mServoVisitedLinkDecl, aColor);
+}
+
+size_t AttributeStyles::DOMSizeOfIncludingThis(
+    MallocSizeOf aMallocSizeOf) const {
+  size_t n = aMallocSizeOf(this);
+  return n;
+}
+
+AttributeStyles::~AttributeStyles() {
+  for (auto iter = mCachedStyleAttrs.Iter(); !iter.Done(); iter.Next()) {
+    MiscContainer*& value = iter.Data();
+
+    if (value->mType == nsAttrValue::eCSSDeclaration) {
+      DeclarationBlock* declaration = value->mValue.mCSSDeclaration;
+      declaration->SetAttributeStyles(nullptr);
+    } else {
+      MOZ_ASSERT_UNREACHABLE("unexpected cached nsAttrValue type");
+    }
+
+    value->mValue.mCached = 0;
+    iter.Remove();
+  }
+}
+
+}  

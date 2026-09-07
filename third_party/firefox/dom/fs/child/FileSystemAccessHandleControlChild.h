@@ -1,0 +1,40 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_FS_CHILD_FILESYSTEMACCESSHANDLECONTROLCHILD_H_
+#define DOM_FS_CHILD_FILESYSTEMACCESSHANDLECONTROLCHILD_H_
+
+#include "mozilla/dom/PFileSystemAccessHandleControlChild.h"
+#include "nsISupportsImpl.h"
+
+namespace mozilla::dom {
+
+class FileSystemSyncAccessHandle;
+
+class FileSystemAccessHandleControlChild
+    : public PFileSystemAccessHandleControlChild {
+ public:
+  NS_INLINE_DECL_REFCOUNTING_WITH_DESTROY(FileSystemAccessHandleControlChild,
+                                          Destroy(), override)
+
+  void SetAccessHandle(FileSystemSyncAccessHandle* aAccessHandle);
+
+  void Shutdown();
+
+  void ActorDestroy(ActorDestroyReason aWhy) override;
+
+ protected:
+  virtual ~FileSystemAccessHandleControlChild() = default;
+
+  virtual void Destroy() {
+    Shutdown();
+    delete this;
+  }
+
+  FileSystemSyncAccessHandle* MOZ_NON_OWNING_REF mAccessHandle;
+};
+
+}  
+
+#endif  // DOM_FS_CHILD_FILESYSTEMACCESSHANDLECONTROLCHILD_H_

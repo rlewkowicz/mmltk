@@ -1,0 +1,53 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_dom_UnbindContext_h_
+#define mozilla_dom_UnbindContext_h_
+
+#include "mozilla/Attributes.h"
+#include "nsINode.h"
+
+namespace mozilla::dom {
+
+struct MOZ_STACK_CLASS UnbindContext final {
+  nsINode& Root() const { return mRoot; }
+  bool IsUnbindRoot(const nsINode* aNode) const { return &mRoot == aNode; }
+  nsINode* GetOriginalSubtreeParent() const { return mOriginalParent; }
+
+  Document& OwnerDoc() const { return mDoc; }
+
+  bool WasInComposedDoc() const { return mWasInComposedDoc; }
+
+  bool WasInUncomposedDoc() const { return mWasInUncomposedDoc; }
+
+  explicit UnbindContext(nsINode& aRoot, const BatchRemovalState* aBatchState)
+      : mRoot(aRoot),
+        mOriginalParent(aRoot.GetParentNode()),
+        mDoc(*aRoot.OwnerDoc()),
+        mBatchState(aBatchState),
+        mWasInComposedDoc(aRoot.IsInComposedDoc()),
+        mWasInUncomposedDoc(aRoot.IsInUncomposedDoc()) {}
+
+  void SetIsMove(bool aIsMove) { mIsMove = aIsMove; }
+
+  bool IsMove() const { return mIsMove; }
+
+  const BatchRemovalState* GetBatchRemovalState() const { return mBatchState; }
+
+ private:
+  nsINode& mRoot;
+  nsINode* const mOriginalParent;
+  Document& mDoc;
+  const BatchRemovalState* const mBatchState = nullptr;
+
+  const bool mWasInComposedDoc;
+  const bool mWasInUncomposedDoc;
+
+  bool mIsMove = false;
+};
+
+}  
+
+#endif

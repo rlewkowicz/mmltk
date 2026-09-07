@@ -1,0 +1,273 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef vm_DateTime_h
+#define vm_DateTime_h
+
+#include "mozilla/Atomics.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/UniquePtr.h"
+
+#include <stdint.h>
+
+#include "js/AllocPolicy.h"
+#include "js/RealmOptions.h"
+#include "js/Utility.h"
+#include "js/Vector.h"
+#include "threading/ExclusiveData.h"
+#include "util/LanguageId.h"
+
+#if JS_HAS_INTL_API
+#  include "mozilla/intl/ICUError.h"
+#  include "mozilla/intl/TimeZone.h"
+#endif
+
+namespace JS {
+class Realm;
+}
+
+namespace js {
+
+constexpr int32_t HoursPerDay = 24;
+constexpr int32_t MinutesPerHour = 60;
+constexpr int32_t SecondsPerMinute = 60;
+constexpr int32_t msPerSecond = 1000;
+constexpr int32_t msPerMinute = msPerSecond * SecondsPerMinute;
+constexpr int32_t msPerHour = msPerMinute * MinutesPerHour;
+constexpr int32_t msPerDay = msPerHour * HoursPerDay;
+
+constexpr int32_t SecondsPerHour = 60 * 60;
+constexpr int32_t SecondsPerDay = SecondsPerHour * 24;
+
+constexpr double StartOfTime = -8.64e15;
+constexpr double EndOfTime = 8.64e15;
+
+extern bool InitDateTimeState();
+
+extern void FinishDateTimeState();
+
+enum class ResetTimeZoneMode : bool {
+  DontResetIfOffsetUnchanged,
+  ResetEvenIfOffsetUnchanged,
+};
+
+extern void ResetTimeZoneInternal(ResetTimeZoneMode mode);
+
+using TimeZoneDisplayNameVector = Vector<char16_t, 100, SystemAllocPolicy>;
+
+#if JS_HAS_INTL_API
+using TimeZoneIdentifierVector =
+    Vector<char, mozilla::intl::TimeZone::TimeZoneIdentifierLength,
+           SystemAllocPolicy>;
+#endif
+
+class DateTimeInfo {
+  static ExclusiveData<DateTimeInfo>* instance;
+
+  static constexpr int32_t InvalidOffset = INT32_MIN;
+
+  static inline mozilla::Atomic<int32_t, mozilla::Relaxed>
+      utcToLocalOffsetSeconds{InvalidOffset};
+
+  friend class ExclusiveData<DateTimeInfo>;
+
+  friend bool InitDateTimeState();
+  friend void FinishDateTimeState();
+
+  DateTimeInfo();
+
+  static auto acquireLockWithValidTimeZone() {
+    auto guard = instance->lock();
+    if (guard->timeZoneStatus_ != TimeZoneStatus::Valid) {
+      guard->updateTimeZone();
+    }
+    return guard;
+  }
+
+ public:
+#if JS_HAS_INTL_API
+  explicit DateTimeInfo(RefPtr<JS::TimeZoneString> timeZone);
+#endif
+  ~DateTimeInfo();
+
+
+  static int32_t getDSTOffsetMilliseconds(DateTimeInfo* dtInfo,
+                                          int64_t utcMilliseconds) {
+    if (MOZ_UNLIKELY(dtInfo)) {
+      return dtInfo->internalGetDSTOffsetMilliseconds(utcMilliseconds);
+    }
+    auto guard = acquireLockWithValidTimeZone();
+    return guard->internalGetDSTOffsetMilliseconds(utcMilliseconds);
+  }
+
+  static int32_t utcToLocalStandardOffsetSeconds() {
+    int32_t offset = utcToLocalOffsetSeconds;
+    if (offset != InvalidOffset) {
+      return offset;
+    }
+
+    auto guard = acquireLockWithValidTimeZone();
+    offset = guard->utcToLocalStandardOffsetSeconds_;
+    utcToLocalOffsetSeconds = offset;
+    return offset;
+  }
+
+  static int32_t timeZoneCacheKey(DateTimeInfo* dtInfo) {
+    if (MOZ_UNLIKELY(dtInfo)) {
+      return dtInfo->utcToLocalStandardOffsetSeconds_;
+    }
+
+    return utcToLocalStandardOffsetSeconds();
+  }
+
+  enum class TimeZoneOffset { UTC, Local };
+
+#if JS_HAS_INTL_API
+  static int32_t getOffsetMilliseconds(DateTimeInfo* dtInfo,
+                                       int64_t milliseconds,
+                                       TimeZoneOffset offset) {
+    if (MOZ_UNLIKELY(dtInfo)) {
+      return dtInfo->internalGetOffsetMilliseconds(milliseconds, offset);
+    }
+    auto guard = acquireLockWithValidTimeZone();
+    return guard->internalGetOffsetMilliseconds(milliseconds, offset);
+  }
+
+  static bool timeZoneDisplayName(DateTimeInfo* dtInfo,
+                                  TimeZoneDisplayNameVector& result,
+                                  int64_t utcMilliseconds, LanguageId locale) {
+    if (MOZ_UNLIKELY(dtInfo)) {
+      return dtInfo->internalTimeZoneDisplayName(result, utcMilliseconds,
+                                                 locale);
+    }
+    auto guard = acquireLockWithValidTimeZone();
+    return guard->internalTimeZoneDisplayName(result, utcMilliseconds, locale);
+  }
+
+  static bool timeZoneId(DateTimeInfo* dtInfo,
+                         TimeZoneIdentifierVector& result) {
+    if (MOZ_UNLIKELY(dtInfo)) {
+      return dtInfo->internalTimeZoneId(result);
+    }
+    auto guard = acquireLockWithValidTimeZone();
+    return guard->internalTimeZoneId(result);
+  }
+
+  static mozilla::Result<int32_t, mozilla::intl::ICUError> getRawOffsetMs(
+      DateTimeInfo* dtInfo) {
+    if (MOZ_UNLIKELY(dtInfo)) {
+      return dtInfo->timeZone()->GetRawOffsetMs();
+    }
+    auto guard = acquireLockWithValidTimeZone();
+    return guard->timeZone()->GetRawOffsetMs();
+  }
+#else
+  static int32_t localTZA() {
+    return utcToLocalStandardOffsetSeconds() * msPerSecond;
+  }
+#endif /* JS_HAS_INTL_API */
+
+  static const void* addressOfUTCToLocalOffsetSeconds() {
+    static_assert(sizeof(decltype(utcToLocalOffsetSeconds)) == sizeof(int32_t));
+    return &DateTimeInfo::utcToLocalOffsetSeconds;
+  }
+
+#if JS_HAS_INTL_API
+  void updateTimeZoneOverride(RefPtr<JS::TimeZoneString> timeZone);
+#endif
+
+ private:
+  friend void js::ResetTimeZoneInternal(ResetTimeZoneMode);
+
+  static void resetTimeZone(ResetTimeZoneMode mode) {
+    auto guard = instance->lock();
+    guard->internalResetTimeZone(mode);
+
+    utcToLocalOffsetSeconds = InvalidOffset;
+  }
+
+  struct RangeCache {
+    int64_t startSeconds, endSeconds;
+    int64_t oldStartSeconds, oldEndSeconds;
+
+    int32_t offsetMilliseconds;
+    int32_t oldOffsetMilliseconds;
+
+    void reset();
+
+    void sanityCheck();
+  };
+
+  enum class TimeZoneStatus : uint8_t { Valid, NeedsUpdate, UpdateIfChanged };
+
+  TimeZoneStatus timeZoneStatus_ = TimeZoneStatus::NeedsUpdate;
+
+  int32_t utcToLocalStandardOffsetSeconds_ = 0;
+
+  RangeCache dstRange_;  
+
+#if JS_HAS_INTL_API
+  static constexpr int64_t MinTimeT =
+      static_cast<int64_t>(StartOfTime / msPerSecond);
+  static constexpr int64_t MaxTimeT =
+      static_cast<int64_t>(EndOfTime / msPerSecond);
+
+  RangeCache utcRange_;    
+  RangeCache localRange_;  
+
+  RefPtr<JS::TimeZoneString> timeZoneOverride_;
+
+  mozilla::UniquePtr<mozilla::intl::TimeZone> timeZone_;
+
+  JS::UniqueChars timeZoneId_;
+
+  LanguageId locale_ = LanguageId::und();
+  JS::UniqueTwoByteChars standardName_;
+  JS::UniqueTwoByteChars daylightSavingsName_;
+#else
+  static constexpr int64_t MinTimeT = 0;          
+  static constexpr int64_t MaxTimeT = 2145830400; 
+#endif /* JS_HAS_INTL_API */
+
+  static constexpr int64_t RangeExpansionAmount = 30 * SecondsPerDay;
+
+  void internalResetTimeZone(ResetTimeZoneMode mode);
+
+  void resetState();
+
+  void updateTimeZone();
+
+  void internalResyncICUDefaultTimeZone();
+
+  static int64_t toClampedSeconds(int64_t milliseconds);
+
+  using ComputeFn = int32_t (DateTimeInfo::*)(int64_t);
+
+  int32_t getOrComputeValue(RangeCache& range, int64_t seconds,
+                            ComputeFn compute);
+
+  int32_t computeDSTOffsetMilliseconds(int64_t utcSeconds);
+
+  int32_t internalGetDSTOffsetMilliseconds(int64_t utcMilliseconds);
+
+#if JS_HAS_INTL_API
+  int32_t computeUTCOffsetMilliseconds(int64_t localSeconds);
+
+  int32_t computeLocalOffsetMilliseconds(int64_t utcSeconds);
+
+  int32_t internalGetOffsetMilliseconds(int64_t milliseconds,
+                                        TimeZoneOffset offset);
+
+  bool internalTimeZoneDisplayName(TimeZoneDisplayNameVector& result,
+                                   int64_t utcMilliseconds, LanguageId locale);
+
+  bool internalTimeZoneId(TimeZoneIdentifierVector& result);
+
+  mozilla::intl::TimeZone* timeZone();
+#endif /* JS_HAS_INTL_API */
+};
+
+} 
+
+#endif /* vm_DateTime_h */

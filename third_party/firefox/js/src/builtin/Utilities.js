@@ -1,0 +1,169 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "SelfHostingDefines.h"
+
+#ifdef DEBUG
+#define assert(b, info) \
+  do { \
+    if (!(b)) { \
+      AssertionFailed(__FILE__ + ":" + __LINE__ + ": " + info) \
+    } \
+  } while (false)
+#define dbg(msg) \
+  do { \
+    DumpMessage(callFunction(std_Array_pop, \
+                             StringSplitString(__FILE__, '/')) + \
+                '#' + __LINE__ + ': ' + msg) \
+  } while (false)
+#else
+#define assert(b, info) ; 
+#define dbg(msg) ; 
+#endif
+
+
+
+function GetMethod(V, P) {
+  assert(IsPropertyKey(P), "Invalid property key");
+
+  var func = V[P];
+
+  if (IsNullOrUndefined(func)) {
+    return undefined;
+  }
+
+  if (!IsCallable(func)) {
+    ThrowTypeError(JSMSG_NOT_FUNCTION, typeof func);
+  }
+
+  return func;
+}
+
+function IsPropertyKey(argument) {
+  var type = typeof argument;
+  return type === "string" || type === "symbol";
+}
+
+#define TO_PROPERTY_KEY(name) \
+(typeof name !== "string" && typeof name !== "number" && typeof name !== "symbol" ? ToPropertyKey(name) : name)
+
+function SpeciesConstructor(obj, defaultConstructor) {
+  assert(IsObject(obj), "not passed an object");
+
+  var ctor = obj.constructor;
+
+  if (ctor === undefined) {
+    return defaultConstructor;
+  }
+
+  if (!IsObject(ctor)) {
+    ThrowTypeError(JSMSG_OBJECT_REQUIRED, "object's 'constructor' property");
+  }
+
+  var s = ctor[GetBuiltinSymbol("species")];
+
+  if (IsNullOrUndefined(s)) {
+    return defaultConstructor;
+  }
+
+  if (IsConstructor(s)) {
+    return s;
+  }
+
+  ThrowTypeError(
+    JSMSG_NOT_CONSTRUCTOR,
+    "@@species property of object's constructor"
+  );
+}
+
+function GetTypeError(...args) {
+  try {
+    FUN_APPLY(ThrowTypeError, undefined, args);
+  } catch (e) {
+    return e;
+  }
+  assert(false, "the catch block should've returned from this function.");
+}
+
+function GetAggregateError(...args) {
+  try {
+    FUN_APPLY(ThrowAggregateError, undefined, args);
+  } catch (e) {
+    return e;
+  }
+  assert(false, "the catch block should've returned from this function.");
+}
+
+function GetInternalError(...args) {
+  try {
+    FUN_APPLY(ThrowInternalError, undefined, args);
+  } catch (e) {
+    return e;
+  }
+  assert(false, "the catch block should've returned from this function.");
+}
+
+function NullFunction() {}
+
+function CopyDataProperties(target, source, excludedItems) {
+  assert(IsObject(target), "target is an object");
+
+  assert(IsObject(excludedItems), "excludedItems is an object");
+
+  if (IsNullOrUndefined(source)) {
+    return;
+  }
+
+  var from = ToObject(source);
+
+  var keys = CopyDataPropertiesOrGetOwnKeys(target, from, excludedItems);
+
+  if (keys === null) {
+    return;
+  }
+
+  for (var index = 0; index < keys.length; index++) {
+    var key = keys[index];
+
+    if (
+      !hasOwn(key, excludedItems) &&
+      callFunction(std_Object_propertyIsEnumerable, from, key)
+    ) {
+      DefineDataProperty(target, key, from[key]);
+    }
+  }
+
+}
+
+function CopyDataPropertiesUnfiltered(target, source) {
+  assert(IsObject(target), "target is an object");
+
+
+  if (IsNullOrUndefined(source)) {
+    return;
+  }
+
+  var from = ToObject(source);
+
+  var keys = CopyDataPropertiesOrGetOwnKeys(target, from, null);
+
+  if (keys === null) {
+    return;
+  }
+
+  for (var index = 0; index < keys.length; index++) {
+    var key = keys[index];
+
+    if (callFunction(std_Object_propertyIsEnumerable, from, key)) {
+      DefineDataProperty(target, key, from[key]);
+    }
+  }
+
+}
+
+function outer() {
+  return function inner() {
+    return "foo";
+  };
+}

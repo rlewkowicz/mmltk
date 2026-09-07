@@ -1,0 +1,255 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_Axis_h
+#define mozilla_layers_Axis_h
+
+#include <sys/types.h>  // for int32_t
+
+#include "APZUtils.h"
+#include "AxisPhysicsMSDModel.h"
+#include "mozilla/DataMutex.h"  // for DataMutex
+#include "mozilla/gfx/Types.h"  // for Side
+#include "mozilla/TimeStamp.h"  // for TimeDuration
+#include "nsTArray.h"           // for nsTArray
+#include "Units.h"
+
+namespace mozilla {
+namespace layers {
+
+const float EPSILON = 0.0001f;
+
+bool FuzzyEqualsCoordinate(CSSCoord aValue1, CSSCoord aValue2);
+
+bool FuzzyEqualsPoint(const CSSPoint& aValue1, const CSSPoint& aValue2);
+
+struct FrameMetrics;
+class AsyncPanZoomController;
+
+class VelocityTracker {
+ public:
+  virtual ~VelocityTracker() = default;
+
+  virtual void StartTracking(ParentLayerCoord aPos, TimeStamp aTimestamp) = 0;
+  virtual Maybe<float> AddPosition(ParentLayerCoord aPos,
+                                   TimeStamp aTimestamp) = 0;
+  virtual Maybe<float> ComputeVelocity(TimeStamp aTimestamp) = 0;
+  virtual void Clear() = 0;
+};
+
+class Axis {
+ public:
+  explicit Axis(AsyncPanZoomController* aAsyncPanZoomController);
+
+  void UpdateWithTouchAtDevicePoint(ParentLayerCoord aPos,
+                                    TimeStamp aTimestamp);
+
+ public:
+  void StartTouch(ParentLayerCoord aPos, TimeStamp aTimestamp);
+
+  enum class ClearAxisLock { Yes, No };
+
+  void EndTouch(TimeStamp aTimestamp, ClearAxisLock aClearAxisLock);
+
+  void CancelGesture();
+
+  bool AdjustDisplacement(ParentLayerCoord aDisplacement,
+                          ParentLayerCoord& aDisplacementOut,
+                          ParentLayerCoord& aOverscrollAmountOut,
+                          bool aForceOverscroll = false);
+
+  void OverscrollBy(ParentLayerCoord aOverscroll);
+
+  ParentLayerCoord GetOverscroll() const;
+
+  void RestoreOverscroll(ParentLayerCoord aOverscroll);
+
+  void StartOverscrollAnimation(float aVelocity);
+
+  bool SampleOverscrollAnimation(const TimeDuration& aDelta,
+                                 SideBits aOverscrollSideBits);
+
+  void EndOverscrollAnimation();
+
+  bool IsOverscrolled() const;
+
+  bool IsInInvalidOverscroll() const;
+
+  void ClearOverscroll();
+
+  bool IsOverscrollAnimationAlive() const;
+
+  bool IsOverscrollAnimationRunning() const;
+
+  ParentLayerCoord PanStart() const;
+
+  ParentLayerCoord PanDistance() const;
+
+  ParentLayerCoord PanDistance(ParentLayerCoord aPos) const;
+
+  bool CanScroll() const;
+
+  bool CanScroll(CSSCoord aDelta) const;
+  bool CanScroll(ParentLayerCoord aDelta) const;
+
+  bool CanScrollNow() const;
+
+  CSSCoord ClampOriginToScrollableRect(CSSCoord aOrigin) const;
+
+  float GetVelocity() const;
+
+  void SetVelocity(float aVelocity);
+
+  ParentLayerCoord DisplacementWillOverscrollAmount(
+      ParentLayerCoord aDisplacement) const;
+
+  CSSCoord ScaleWillOverscrollAmount(float aScale, CSSCoord aFocus) const;
+
+  bool ScaleWillOverscrollBothSides(float aScale) const;
+
+  bool IsAxisLocked() const;
+
+  void SetAxisLocked(bool aAxisLocked);
+
+  ParentLayerCoord GetOrigin() const;
+  ParentLayerCoord GetCompositionLength() const;
+  ParentLayerCoord GetPageStart() const;
+  ParentLayerCoord GetPageLength() const;
+  ParentLayerCoord GetCompositionEnd() const;
+  ParentLayerCoord GetPageEnd() const;
+  ParentLayerCoord GetScrollRangeEnd() const;
+
+  bool IsScrolledToStart() const;
+  bool IsScrolledToEnd() const;
+
+  ParentLayerCoord GetPos() const { return mPos; }
+
+  bool OverscrollBehaviorAllowsHandoff() const;
+  bool OverscrollBehaviorAllowsOverscrollEffect() const;
+
+  virtual CSSToParentLayerScale GetAxisScale(
+      const CSSToParentLayerScale2D& aScale) const = 0;
+  virtual CSSCoord GetPointOffset(const CSSPoint& aPoint) const = 0;
+  virtual OuterCSSCoord GetPointOffset(const OuterCSSPoint& aPoint) const = 0;
+  virtual ParentLayerCoord GetPointOffset(
+      const ParentLayerPoint& aPoint) const = 0;
+  virtual ParentLayerCoord GetRectLength(
+      const ParentLayerRect& aRect) const = 0;
+  virtual CSSCoord GetRectLength(const CSSRect& aRect) const = 0;
+  virtual ParentLayerCoord GetRectOffset(
+      const ParentLayerRect& aRect) const = 0;
+  virtual CSSCoord GetRectOffset(const CSSRect& aRect) const = 0;
+  virtual float GetTransformScale(
+      const AsyncTransformComponentMatrix& aMatrix) const = 0;
+  virtual ParentLayerCoord GetTransformTranslation(
+      const AsyncTransformComponentMatrix& aMatrix) const = 0;
+  virtual void PostScale(AsyncTransformComponentMatrix& aMatrix,
+                         float aScale) const = 0;
+  virtual void PostTranslate(AsyncTransformComponentMatrix& aMatrix,
+                             ParentLayerCoord aTranslation) const = 0;
+
+  virtual ScreenPoint MakePoint(ScreenCoord aCoord) const = 0;
+
+  const void* OpaqueApzcPointer() const { return mAsyncPanZoomController; }
+
+  virtual const char* Name() const = 0;
+
+  float ToLocalVelocity(float aVelocityInchesPerMs) const;
+
+ protected:
+  ParentLayerCoord mPos;
+
+  ParentLayerCoord mStartPos;
+  mutable DataMutex<float> mVelocity;
+  mutable DataMutex<bool> mAxisLocked;
+  AsyncPanZoomController* mAsyncPanZoomController;
+
+  ParentLayerCoord mOverscroll;
+
+  AxisPhysicsMSDModel mMSDModel;
+
+  UniquePtr<VelocityTracker> mVelocityTracker;
+
+  float DoGetVelocity() const;
+  void DoSetVelocity(float aVelocity);
+
+  const FrameMetrics& GetFrameMetrics() const;
+  const ScrollMetadata& GetScrollMetadata() const;
+
+  virtual OverscrollBehavior GetOverscrollBehavior() const = 0;
+
+  ParentLayerCoord ApplyResistance(ParentLayerCoord aOverscroll) const;
+
+  void StepOverscrollAnimation(double aStepDurationMilliseconds);
+};
+
+class AxisX : public Axis {
+ public:
+  explicit AxisX(AsyncPanZoomController* mAsyncPanZoomController);
+  CSSToParentLayerScale GetAxisScale(
+      const CSSToParentLayerScale2D& aScale) const override;
+  CSSCoord GetPointOffset(const CSSPoint& aPoint) const override;
+  OuterCSSCoord GetPointOffset(const OuterCSSPoint& aPoint) const override;
+  ParentLayerCoord GetPointOffset(
+      const ParentLayerPoint& aPoint) const override;
+  ParentLayerCoord GetRectLength(const ParentLayerRect& aRect) const override;
+  CSSCoord GetRectLength(const CSSRect& aRect) const override;
+  ParentLayerCoord GetRectOffset(const ParentLayerRect& aRect) const override;
+  CSSCoord GetRectOffset(const CSSRect& aRect) const override;
+  float GetTransformScale(
+      const AsyncTransformComponentMatrix& aMatrix) const override;
+  ParentLayerCoord GetTransformTranslation(
+      const AsyncTransformComponentMatrix& aMatrix) const override;
+  void PostScale(AsyncTransformComponentMatrix& aMatrix,
+                 float aScale) const override;
+  void PostTranslate(AsyncTransformComponentMatrix& aMatrix,
+                     ParentLayerCoord aTranslation) const override;
+  ScreenPoint MakePoint(ScreenCoord aCoord) const override;
+  const char* Name() const override;
+  bool CanScrollTo(Side aSide) const;
+  SideBits ScrollableDirections() const;
+
+ private:
+  OverscrollBehavior GetOverscrollBehavior() const override;
+};
+
+class AxisY : public Axis {
+ public:
+  explicit AxisY(AsyncPanZoomController* mAsyncPanZoomController);
+  CSSCoord GetPointOffset(const CSSPoint& aPoint) const override;
+  OuterCSSCoord GetPointOffset(const OuterCSSPoint& aPoint) const override;
+  ParentLayerCoord GetPointOffset(
+      const ParentLayerPoint& aPoint) const override;
+  CSSToParentLayerScale GetAxisScale(
+      const CSSToParentLayerScale2D& aScale) const override;
+  ParentLayerCoord GetRectLength(const ParentLayerRect& aRect) const override;
+  CSSCoord GetRectLength(const CSSRect& aRect) const override;
+  ParentLayerCoord GetRectOffset(const ParentLayerRect& aRect) const override;
+  CSSCoord GetRectOffset(const CSSRect& aRect) const override;
+  float GetTransformScale(
+      const AsyncTransformComponentMatrix& aMatrix) const override;
+  ParentLayerCoord GetTransformTranslation(
+      const AsyncTransformComponentMatrix& aMatrix) const override;
+  void PostScale(AsyncTransformComponentMatrix& aMatrix,
+                 float aScale) const override;
+  void PostTranslate(AsyncTransformComponentMatrix& aMatrix,
+                     ParentLayerCoord aTranslation) const override;
+  ScreenPoint MakePoint(ScreenCoord aCoord) const override;
+  const char* Name() const override;
+  bool CanScrollTo(Side aSide) const;
+  bool CanVerticalScrollWithDynamicToolbar() const;
+  SideBits ScrollableDirections() const;
+  SideBits ScrollableDirectionsWithDynamicToolbar(
+      const ScreenMargin& aFixedLayerMargins) const;
+
+ private:
+  OverscrollBehavior GetOverscrollBehavior() const override;
+  ParentLayerCoord GetCompositionLengthWithoutDynamicToolbar() const;
+  bool HasDynamicToolbar() const;
+};
+
+}  
+}  
+
+#endif

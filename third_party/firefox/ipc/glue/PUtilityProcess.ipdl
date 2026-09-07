@@ -1,0 +1,65 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+include MemoryReportTypes;
+include PrefsTypes;
+
+include protocol PUtilityMediaService;
+include protocol PJSOracle;
+
+
+#if defined(NIGHTLY_BUILD) && !defined(MOZ_NO_SMART_CARDS)
+include protocol PPKCS11Module;
+#endif
+
+
+include "mozilla/ipc/ByteBufUtils.h";
+
+include GraphicsMessages;
+
+
+
+namespace mozilla {
+
+namespace ipc {
+
+// This protocol allows the UI process to talk to the Utility process. There is
+// one instance of this protocol, with the UtilityProcessParent living on the main thread
+// of the main process and the UtilityProcessChild living on the main thread of the Utility
+// process.
+[NeedsOtherPid, ChildProc=Utility]
+protocol PUtilityProcess
+{
+parent:
+  async AddMemoryReport(MemoryReport aReport);
+
+
+  async InitCompleted();
+
+child:
+  async Init(FileDescriptor? sandboxBroker);
+
+
+  async RequestMemoryReport(uint32_t generation,
+                            bool anonymize,
+                            bool minimizeMemoryUsage,
+                            FileDescriptor? DMDFile)
+      returns (uint32_t aGeneration);
+
+  async PreferenceUpdate(Pref pref);
+
+  async StartUtilityMediaService(Endpoint<PUtilityMediaServiceParent> aEndpoint, GfxVarUpdate[] updates);
+
+  async StartJSOracleService(Endpoint<PJSOracleChild> aEndpoint);
+
+#if defined(NIGHTLY_BUILD) && !defined(MOZ_NO_SMART_CARDS)
+  async StartPKCS11ModuleService(Endpoint<PPKCS11ModuleChild> aEndpoint, nsCString aProfilePath);
+#endif
+
+
+};
+
+} // namespace ipc
+
+} // namespace mozilla

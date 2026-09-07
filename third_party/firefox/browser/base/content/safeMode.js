@@ -1,0 +1,65 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+const appStartup = Services.startup;
+
+const { ResetProfile } = ChromeUtils.importESModule(
+  "resource://gre/modules/ResetProfile.sys.mjs"
+);
+
+var defaultToReset = false;
+
+function showResetDialog() {
+  let retVals = {
+    reset: false,
+  };
+  window.openDialog(
+    "chrome://global/content/resetProfile.xhtml",
+    null,
+    "chrome,modal,centerscreen,titlebar,dialog=yes",
+    retVals
+  );
+  if (!retVals.reset) {
+    return;
+  }
+
+  ResetProfile.doReset();
+}
+
+function onDefaultButton(event) {
+  if (defaultToReset) {
+    event.preventDefault();
+    ResetProfile.doReset();
+  }
+}
+
+function onCancel() {
+  appStartup.quit(appStartup.eForceQuit);
+}
+
+function onExtra1() {
+  if (defaultToReset) {
+    window.close();
+  }
+  showResetDialog();
+}
+
+window.addEventListener("load", () => {
+  const dialog = document.getElementById("safeModeDialog");
+  if (appStartup.automaticSafeModeNecessary) {
+    document.getElementById("autoSafeMode").hidden = false;
+    document.getElementById("safeMode").hidden = true;
+    if (ResetProfile.resetSupported()) {
+      document.getElementById("resetProfile").hidden = false;
+    } else {
+      dialog.getButton("extra1").hidden = true;
+    }
+  } else if (!ResetProfile.resetSupported()) {
+    dialog.getButton("extra1").hidden = true;
+    document.getElementById("resetProfileInstead").hidden = true;
+  }
+  document.addEventListener("dialogaccept", onDefaultButton);
+  document.addEventListener("dialogcancel", onCancel);
+  document.addEventListener("dialogextra1", onExtra1);
+});

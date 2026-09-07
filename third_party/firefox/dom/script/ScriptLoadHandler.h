@@ -1,0 +1,110 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_dom_ScriptLoadHandler_h
+#define mozilla_dom_ScriptLoadHandler_h
+
+#include "mozilla/Encoding.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/UniquePtr.h"
+#include "nsIChannelEventSink.h"
+#include "nsIIncrementalStreamLoader.h"
+#include "nsIInterfaceRequestor.h"
+#include "nsISupports.h"
+
+namespace JS::loader {
+class ScriptLoadRequest;
+}
+
+namespace mozilla {
+
+class Decoder;
+
+namespace dom {
+
+#ifdef NIGHTLY_BUILD
+class ResourceHasher;
+#endif
+class ScriptLoader;
+class SRICheckDataVerifier;
+
+class ScriptDecoder {
+ public:
+  enum BOMHandling { Ignore, Remove };
+
+  ScriptDecoder(const Encoding* aEncoding,
+                ScriptDecoder::BOMHandling handleBOM);
+
+  ~ScriptDecoder() = default;
+
+  nsresult DecodeRawData(JS::loader::ScriptLoadRequest* aRequest,
+                         const uint8_t* aData, uint32_t aDataLength,
+                         bool aEndOfStream);
+
+ private:
+  template <typename Unit>
+  nsresult DecodeRawDataHelper(JS::loader::ScriptLoadRequest* aRequest,
+                               const uint8_t* aData, uint32_t aDataLength,
+                               bool aEndOfStream);
+
+  mozilla::UniquePtr<mozilla::Decoder> mDecoder;
+};
+
+class ScriptLoadHandler final : public nsIIncrementalStreamLoaderObserver,
+                                public nsIChannelEventSink,
+                                public nsIInterfaceRequestor {
+ public:
+  explicit ScriptLoadHandler(
+      ScriptLoader* aScriptLoader, JS::loader::ScriptLoadRequest* aRequest,
+      UniquePtr<SRICheckDataVerifier>&& aSRIDataVerifier);
+
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIINCREMENTALSTREAMLOADEROBSERVER
+  NS_DECL_NSICHANNELEVENTSINK
+  NS_DECL_NSIINTERFACEREQUESTOR
+
+ private:
+  virtual ~ScriptLoadHandler();
+
+  nsresult DoOnStreamComplete(nsIChannel* aChannel, nsresult aStatus,
+                              uint32_t aDataLength, const uint8_t* aData);
+
+  bool EnsureDecoder(nsIChannel* aChannel, const uint8_t* aData,
+                     uint32_t aDataLength, bool aEndOfStream) {
+    if (mDecoder) {
+      return true;
+    }
+
+    return TrySetDecoder(aChannel, aData, aDataLength, aEndOfStream);
+  }
+
+  bool TrySetDecoder(nsIChannel* aChannel, const uint8_t* aData,
+                     uint32_t aDataLength, bool aEndOfStream);
+
+  nsresult MaybeDecodeSRI(uint32_t* sriLength);
+
+  nsresult EnsureKnownDataType(nsIChannel* aChannel);
+
+  RefPtr<ScriptLoader> mScriptLoader;
+
+  RefPtr<JS::loader::ScriptLoadRequest> mRequest;
+
+  UniquePtr<SRICheckDataVerifier> mSRIDataVerifier;
+
+  nsresult mSRIStatus;
+
+  UniquePtr<ScriptDecoder> mDecoder;
+
+  bool mPreloadStartNotified = false;
+
+#ifdef NIGHTLY_BUILD
+  RefPtr<mozilla::dom::ResourceHasher> mResourceHasher;
+#endif
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_ScriptLoadHandler_h

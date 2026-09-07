@@ -1,0 +1,297 @@
+// Copyright 2008 Google Inc.  All rights reserved.
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
+
+
+#define _POSIX_C_SOURCE 202405L
+
+#if !defined(_MSC_VER)
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+#endif
+#include <errno.h>
+
+#include <algorithm>
+#include <istream>
+#include <ostream>
+
+#include "absl/log/absl_check.h"
+#include "absl/log/absl_log.h"
+#include "google/protobuf/io/zero_copy_stream_impl.h"
+
+
+namespace google {
+namespace protobuf {
+namespace io {
+
+
+namespace {
+
+int robust_close(int fd) {
+#if defined(POSIX_CLOSE_RESTART)
+  return posix_close(fd, 0);
+#else
+  return close(fd);
+#endif
+}
+
+}  
+
+
+FileInputStream::FileInputStream(int file_descriptor, int block_size)
+    : copying_input_(file_descriptor), impl_(&copying_input_, block_size) {}
+
+bool FileInputStream::Close() { return copying_input_.Close(); }
+
+bool FileInputStream::Next(const void** data, int* size) {
+  return impl_.Next(data, size);
+}
+
+void FileInputStream::BackUp(int count) { impl_.BackUp(count); }
+
+bool FileInputStream::Skip(int count) { return impl_.Skip(count); }
+
+int64_t FileInputStream::ByteCount() const { return impl_.ByteCount(); }
+
+FileInputStream::CopyingFileInputStream::CopyingFileInputStream(
+    int file_descriptor)
+    : file_(file_descriptor),
+      close_on_delete_(false),
+      is_closed_(false),
+      errno_(0),
+      previous_seek_failed_(false) {
+  int flags = fcntl(file_, F_GETFL);
+  flags &= ~O_NONBLOCK;
+  fcntl(file_, F_SETFL, flags);
+}
+
+FileInputStream::CopyingFileInputStream::~CopyingFileInputStream() {
+  if (close_on_delete_) {
+    if (!Close()) {
+      ABSL_LOG(ERROR) << "close() failed: " << strerror(errno_);
+    }
+  }
+}
+
+bool FileInputStream::CopyingFileInputStream::Close() {
+  ABSL_CHECK(!is_closed_);
+
+  is_closed_ = true;
+  if (robust_close(file_) != 0) {
+    errno_ = errno;
+    return false;
+  }
+
+  return true;
+}
+
+int FileInputStream::CopyingFileInputStream::Read(void* buffer, int size) {
+  ABSL_CHECK(!is_closed_);
+
+  int result;
+  do {
+    result = read(file_, buffer, size);
+  } while (result < 0 && errno == EINTR);
+
+  if (result < 0) {
+    errno_ = errno;
+  }
+
+  return result;
+}
+
+int FileInputStream::CopyingFileInputStream::Skip(int count) {
+  ABSL_CHECK(!is_closed_);
+
+  if (!previous_seek_failed_ && lseek(file_, count, SEEK_CUR) != (off_t)-1) {
+    return count;
+  } else {
+
+    previous_seek_failed_ = true;
+
+    return CopyingInputStream::Skip(count);
+  }
+}
+
+
+FileOutputStream::FileOutputStream(int file_descriptor, int block_size)
+    : CopyingOutputStreamAdaptor(&copying_output_, block_size),
+      copying_output_(file_descriptor) {}
+
+bool FileOutputStream::Close() {
+  bool flush_succeeded = Flush();
+  return copying_output_.Close() && flush_succeeded;
+}
+
+FileOutputStream::CopyingFileOutputStream::CopyingFileOutputStream(
+    int file_descriptor)
+    : file_(file_descriptor),
+      close_on_delete_(false),
+      is_closed_(false),
+      errno_(0) {}
+
+FileOutputStream::~FileOutputStream() { (void)Flush(); }
+
+FileOutputStream::CopyingFileOutputStream::~CopyingFileOutputStream() {
+  if (close_on_delete_) {
+    if (!Close()) {
+      ABSL_LOG(ERROR) << "close() failed: " << strerror(errno_);
+    }
+  }
+}
+
+bool FileOutputStream::CopyingFileOutputStream::Close() {
+  ABSL_CHECK(!is_closed_);
+
+  is_closed_ = true;
+  if (robust_close(file_) != 0) {
+    errno_ = errno;
+    return false;
+  }
+
+  return true;
+}
+
+bool FileOutputStream::CopyingFileOutputStream::Write(const void* buffer,
+                                                      int size) {
+  ABSL_CHECK(!is_closed_);
+  int total_written = 0;
+
+  const uint8_t* buffer_base = reinterpret_cast<const uint8_t*>(buffer);
+
+  while (total_written < size) {
+    int bytes;
+    do {
+      bytes = write(file_, buffer_base + total_written, size - total_written);
+    } while (bytes < 0 && errno == EINTR);
+
+    if (bytes <= 0) {
+
+
+      if (bytes < 0) {
+        errno_ = errno;
+      }
+      return false;
+    }
+    total_written += bytes;
+  }
+
+  return true;
+}
+
+
+IstreamInputStream::IstreamInputStream(std::istream* input, int block_size)
+    : copying_input_(input), impl_(&copying_input_, block_size) {}
+
+bool IstreamInputStream::Next(const void** data, int* size) {
+  return impl_.Next(data, size);
+}
+
+void IstreamInputStream::BackUp(int count) { impl_.BackUp(count); }
+
+bool IstreamInputStream::Skip(int count) { return impl_.Skip(count); }
+
+int64_t IstreamInputStream::ByteCount() const { return impl_.ByteCount(); }
+
+IstreamInputStream::CopyingIstreamInputStream::CopyingIstreamInputStream(
+    std::istream* input)
+    : input_(input) {}
+
+IstreamInputStream::CopyingIstreamInputStream::~CopyingIstreamInputStream() =
+    default;
+
+int IstreamInputStream::CopyingIstreamInputStream::Read(void* buffer,
+                                                        int size) {
+  input_->read(reinterpret_cast<char*>(buffer), size);
+  int result = input_->gcount();
+  if (result == 0 && input_->fail() && !input_->eof()) {
+    return -1;
+  }
+  return result;
+}
+
+
+OstreamOutputStream::OstreamOutputStream(std::ostream* output, int block_size)
+    : copying_output_(output), impl_(&copying_output_, block_size) {}
+
+OstreamOutputStream::~OstreamOutputStream() { (void)impl_.Flush(); }
+
+bool OstreamOutputStream::Next(void** data, int* size) {
+  return impl_.Next(data, size);
+}
+
+void OstreamOutputStream::BackUp(int count) { impl_.BackUp(count); }
+
+int64_t OstreamOutputStream::ByteCount() const { return impl_.ByteCount(); }
+
+OstreamOutputStream::CopyingOstreamOutputStream::CopyingOstreamOutputStream(
+    std::ostream* output)
+    : output_(output) {}
+
+OstreamOutputStream::CopyingOstreamOutputStream::~CopyingOstreamOutputStream() =
+    default;
+
+bool OstreamOutputStream::CopyingOstreamOutputStream::Write(const void* buffer,
+                                                            int size) {
+  output_->write(reinterpret_cast<const char*>(buffer), size);
+  return output_->good();
+}
+
+
+ConcatenatingInputStream::ConcatenatingInputStream(
+    ZeroCopyInputStream* const streams[], int count)
+    : streams_(streams), stream_count_(count), bytes_retired_(0) {
+}
+
+bool ConcatenatingInputStream::Next(const void** data, int* size) {
+  while (stream_count_ > 0) {
+    if (streams_[0]->Next(data, size)) return true;
+
+    bytes_retired_ += streams_[0]->ByteCount();
+    ++streams_;
+    --stream_count_;
+  }
+
+  return false;
+}
+
+void ConcatenatingInputStream::BackUp(int count) {
+  if (stream_count_ > 0) {
+    streams_[0]->BackUp(count);
+  } else {
+    ABSL_DLOG(FATAL) << "Can't BackUp() after failed Next().";
+  }
+}
+
+bool ConcatenatingInputStream::Skip(int count) {
+  while (stream_count_ > 0) {
+    int64_t target_byte_count = streams_[0]->ByteCount() + count;
+    if (streams_[0]->Skip(count)) return true;
+
+    int64_t final_byte_count = streams_[0]->ByteCount();
+    ABSL_DCHECK_LT(final_byte_count, target_byte_count);
+    count = target_byte_count - final_byte_count;
+
+    bytes_retired_ += final_byte_count;
+    ++streams_;
+    --stream_count_;
+  }
+
+  return false;
+}
+
+int64_t ConcatenatingInputStream::ByteCount() const {
+  if (stream_count_ == 0) {
+    return bytes_retired_;
+  } else {
+    return bytes_retired_ + streams_[0]->ByteCount();
+  }
+}
+
+
+
+}  
+}  
+}  

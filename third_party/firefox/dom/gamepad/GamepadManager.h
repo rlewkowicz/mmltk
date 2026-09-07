@@ -1,0 +1,120 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_GamepadManager_h_
+#define mozilla_dom_GamepadManager_h_
+
+#include "nsIObserver.h"
+#include "nsRefPtrHashtable.h"
+
+#include "mozilla/dom/GamepadBinding.h"
+#include "mozilla/dom/GamepadHandle.h"
+
+class nsGlobalWindowInner;
+class nsIGlobalObject;
+
+namespace mozilla {
+namespace gfx {
+class VRManagerChild;
+}  
+namespace dom {
+
+class EventTarget;
+class Gamepad;
+class GamepadChangeEvent;
+class GamepadEventChannelChild;
+
+class GamepadManager final : public nsIObserver {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+
+  static bool IsServiceRunning();
+  static already_AddRefed<GamepadManager> GetService();
+
+  void BeginShutdown();
+  void StopMonitoring();
+
+  void AddListener(nsGlobalWindowInner* aWindow);
+  void RemoveListener(nsGlobalWindowInner* aWindow);
+
+  void AddGamepad(GamepadHandle aHandle, const nsAString& aID,
+                  GamepadMappingType aMapping, GamepadHand aHand,
+                  uint32_t aNumButtons, uint32_t aNumAxes, uint32_t aNumHaptics,
+                  uint32_t aNumLightIndicator, uint32_t aNumTouchEvents);
+
+  void RemoveGamepad(GamepadHandle aHandle);
+
+  void SyncGamepadState(GamepadHandle aHandle, nsGlobalWindowInner* aWindow,
+                        Gamepad* aGamepad);
+
+  already_AddRefed<Gamepad> GetGamepad(GamepadHandle aHandle) const;
+
+  void Update(const GamepadChangeEvent& aGamepadEvent);
+
+  already_AddRefed<Promise> VibrateHaptic(GamepadHandle aHandle,
+                                          uint32_t aHapticIndex,
+                                          double aIntensity, double aDuration,
+                                          nsIGlobalObject* aGlobal,
+                                          ErrorResult& aRv);
+  void StopHaptics();
+
+  already_AddRefed<Promise> SetLightIndicatorColor(GamepadHandle aHandle,
+                                                   uint32_t aLightColorIndex,
+                                                   uint8_t aRed, uint8_t aGreen,
+                                                   uint8_t aBlue,
+                                                   nsIGlobalObject* aGlobal,
+                                                   ErrorResult& aRv);
+
+  already_AddRefed<Promise> RequestAllGamepads(nsIGlobalObject* aGlobal,
+                                               ErrorResult& aRv);
+
+ protected:
+  GamepadManager();
+  ~GamepadManager() = default;
+
+  void NewConnectionEvent(GamepadHandle aHandle, bool aConnected);
+
+  void FireAxisMoveEvent(EventTarget* aTarget, Gamepad* aGamepad, uint32_t axis,
+                         double value);
+
+  void FireButtonEvent(EventTarget* aTarget, Gamepad* aGamepad,
+                       uint32_t aButton, double aValue);
+
+  void FireConnectionEvent(EventTarget* aTarget, Gamepad* aGamepad,
+                           bool aConnected);
+
+  bool mEnabled;
+  bool mNonstandardEventsEnabled;
+  bool mShuttingDown;
+
+  RefPtr<GamepadEventChannelChild> mChannelChild;
+
+ private:
+  nsresult Init();
+
+  void MaybeConvertToNonstandardGamepadEvent(const GamepadChangeEvent& aEvent,
+                                             nsGlobalWindowInner* aWindow);
+
+  bool SetGamepadByEvent(const GamepadChangeEvent& aEvent,
+                         nsGlobalWindowInner* aWindow = nullptr);
+  bool AxisMoveIsFirstIntent(nsGlobalWindowInner* aWindow,
+                             GamepadHandle aHandle,
+                             const GamepadChangeEvent& aEvent);
+  bool MaybeWindowHasSeenGamepad(nsGlobalWindowInner* aWindow,
+                                 GamepadHandle aHandle);
+  bool WindowHasSeenGamepad(nsGlobalWindowInner* aWindow,
+                            GamepadHandle aHandle) const;
+  void SetWindowHasSeenGamepad(nsGlobalWindowInner* aWindow,
+                               GamepadHandle aHandle, bool aHasSeen = true);
+
+  nsRefPtrHashtable<nsGenericHashKey<GamepadHandle>, Gamepad> mGamepads;
+  nsTArray<RefPtr<nsGlobalWindowInner>> mListeners;
+  uint32_t mPromiseID;
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_GamepadManager_h_

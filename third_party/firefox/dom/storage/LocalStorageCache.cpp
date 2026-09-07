@@ -1,0 +1,548 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "LocalStorageCache.h"
+
+#include "LocalStorageManager.h"
+#include "Storage.h"
+#include "StorageDBThread.h"
+#include "StorageIPC.h"
+#include "StorageUtils.h"
+#include "nsDOMString.h"
+#include "nsProxyRelease.h"
+#include "nsThreadUtils.h"
+#include "nsXULAppAPI.h"
+
+namespace mozilla::dom {
+
+#define DOM_STORAGE_CACHE_KEEP_ALIVE_TIME_MS 20000
+
+namespace {
+
+const uint32_t kDefaultSet = 0;
+const uint32_t kSessionSet = 1;
+
+inline uint32_t GetDataSetIndex(bool aPrivateBrowsing,
+                                bool aSessionScopedOrLess) {
+  if (!aPrivateBrowsing && aSessionScopedOrLess) {
+    return kSessionSet;
+  }
+
+  return kDefaultSet;
+}
+
+inline uint32_t GetDataSetIndex(const LocalStorage* aStorage) {
+  return GetDataSetIndex(aStorage->IsPrivateBrowsing(),
+                         aStorage->IsPrivateBrowsingOrLess());
+}
+
+}  
+
+
+NS_IMPL_ADDREF(LocalStorageCacheBridge)
+
+NS_IMETHODIMP_(void) LocalStorageCacheBridge::Release(void) {
+  MOZ_ASSERT(int32_t(mRefCnt) > 0, "dup release");
+  nsrefcnt count = --mRefCnt;
+  NS_LOG_RELEASE(this, count, "LocalStorageCacheBridge");
+  if (0 == count) {
+    mRefCnt = 1; 
+    delete (this);
+  }
+}
+
+
+LocalStorageCache::LocalStorageCache(const nsACString* aOriginNoSuffix)
+    : mActor(nullptr),
+      mOriginNoSuffix(*aOriginNoSuffix),
+      mMonitor("LocalStorageCache"),
+      mLoaded(false),
+      mLoadResult(NS_OK),
+      mInitialized(false),
+      mPersistent(false),
+      mPreloadTelemetryRecorded(false) {
+  MOZ_COUNT_CTOR(LocalStorageCache);
+}
+
+LocalStorageCache::~LocalStorageCache() {
+  if (mActor) {
+    mActor->SendDeleteMeInternal();
+    MOZ_ASSERT(!mActor, "SendDeleteMeInternal should have cleared!");
+  }
+
+  if (mManager) {
+    mManager->DropCache(this);
+  }
+
+  MOZ_COUNT_DTOR(LocalStorageCache);
+}
+
+void LocalStorageCache::SetActor(LocalStorageCacheChild* aActor) {
+  AssertIsOnOwningThread();
+  MOZ_ASSERT(aActor);
+  MOZ_ASSERT(!mActor);
+
+  mActor = aActor;
+}
+
+NS_IMETHODIMP_(void)
+LocalStorageCache::Release(void) {
+  if (NS_IsMainThread()) {
+    LocalStorageCacheBridge::Release();
+    return;
+  }
+
+  RefPtr<nsRunnableMethod<LocalStorageCacheBridge, void, false>> event =
+      NewNonOwningRunnableMethod("dom::LocalStorageCacheBridge::Release",
+                                 static_cast<LocalStorageCacheBridge*>(this),
+                                 &LocalStorageCacheBridge::Release);
+
+  nsresult rv = NS_DispatchToMainThread(event);
+  if (NS_FAILED(rv)) {
+    NS_WARNING("LocalStorageCache::Release() on a non-main thread");
+    LocalStorageCacheBridge::Release();
+  }
+}
+
+void LocalStorageCache::Init(LocalStorageManager* aManager, bool aPersistent,
+                             nsIPrincipal* aPrincipal,
+                             const nsACString& aQuotaOriginScope) {
+  MOZ_ASSERT(!aQuotaOriginScope.IsEmpty());
+
+  if (mInitialized) {
+    return;
+  }
+
+  mInitialized = true;
+  aPrincipal->OriginAttributesRef().CreateSuffix(mOriginSuffix);
+  mPrivateBrowsingId = aPrincipal->GetPrivateBrowsingId();
+  mPersistent = aPersistent;
+  mQuotaOriginScope = aQuotaOriginScope;
+
+  if (mPersistent) {
+    mManager = aManager;
+    Preload();
+  }
+
+  MOZ_ASSERT(StringBeginsWith(mQuotaOriginScope, mOriginSuffix));
+  MOZ_ASSERT(mOriginSuffix.IsEmpty() !=
+             StringBeginsWith(mQuotaOriginScope, "^"_ns));
+
+  mUsage = aManager->GetOriginUsage(mQuotaOriginScope, mPrivateBrowsingId);
+}
+
+void LocalStorageCache::NotifyObservers(const LocalStorage* aStorage,
+                                        const nsAString& aKey,
+                                        const nsAString& aOldValue,
+                                        const nsAString& aNewValue) {
+  AssertIsOnOwningThread();
+  MOZ_ASSERT(aStorage);
+
+  if (!mActor) {
+    return;
+  }
+
+
+  (void)mActor->SendNotify(aStorage->DocumentURI(), aKey, aOldValue, aNewValue);
+}
+
+inline bool LocalStorageCache::Persist(const LocalStorage* aStorage) const {
+  return mPersistent && (aStorage->IsPrivateBrowsing() ||
+                         !aStorage->IsPrivateBrowsingOrLess());
+}
+
+nsCString LocalStorageCache::Origin() const {
+  return LocalStorageManager::CreateOrigin(mOriginSuffix, mOriginNoSuffix);
+}
+
+LocalStorageCache::Data& LocalStorageCache::DataSet(
+    const LocalStorage* aStorage) {
+  return mData[GetDataSetIndex(aStorage)];
+}
+
+bool LocalStorageCache::ProcessUsageDelta(const LocalStorage* aStorage,
+                                          int64_t aDelta,
+                                          const MutationSource aSource) {
+  return ProcessUsageDelta(GetDataSetIndex(aStorage), aDelta, aSource);
+}
+
+bool LocalStorageCache::ProcessUsageDelta(uint32_t aGetDataSetIndex,
+                                          const int64_t aDelta,
+                                          const MutationSource aSource) {
+  Data& data = mData[aGetDataSetIndex];
+  uint64_t newOriginUsage = data.mOriginQuotaUsage + aDelta;
+  if (aSource == ContentMutation && aDelta > 0 &&
+      newOriginUsage > LocalStorageManager::GetOriginQuota()) {
+    return false;
+  }
+
+  if (mUsage &&
+      !mUsage->CheckAndSetETLD1UsageDelta(aGetDataSetIndex, aDelta, aSource)) {
+    return false;
+  }
+
+  data.mOriginQuotaUsage = newOriginUsage;
+  return true;
+}
+
+void LocalStorageCache::Preload() {
+  if (mLoaded || !mPersistent) {
+    return;
+  }
+
+  StorageDBChild* storageChild =
+      StorageDBChild::GetOrCreate(mPrivateBrowsingId);
+  if (!storageChild) {
+    mLoaded = true;
+    mLoadResult = NS_ERROR_FAILURE;
+    return;
+  }
+
+  storageChild->AsyncPreload(this);
+}
+
+void LocalStorageCache::WaitForPreload() {
+  if (!mPersistent) {
+    return;
+  }
+
+  bool loaded = mLoaded;
+
+  if (!mPreloadTelemetryRecorded) {
+    mPreloadTelemetryRecorded = true;
+  }
+
+  if (loaded) {
+    return;
+  }
+
+
+
+  StorageDBChild::Get(mPrivateBrowsingId)->SyncPreload(this);
+}
+
+nsresult LocalStorageCache::GetLength(const LocalStorage* aStorage,
+                                      uint32_t* aRetval) {
+  if (Persist(aStorage)) {
+    WaitForPreload();
+    if (NS_FAILED(mLoadResult)) {
+      return mLoadResult;
+    }
+  }
+
+  *aRetval = DataSet(aStorage).mKeys.Count();
+  return NS_OK;
+}
+
+nsresult LocalStorageCache::GetKey(const LocalStorage* aStorage,
+                                   uint32_t aIndex, nsAString& aRetval) {
+  if (Persist(aStorage)) {
+    WaitForPreload();
+    if (NS_FAILED(mLoadResult)) {
+      return mLoadResult;
+    }
+  }
+
+  aRetval.SetIsVoid(true);
+  for (auto iter = DataSet(aStorage).mKeys.Iter(); !iter.Done(); iter.Next()) {
+    if (aIndex == 0) {
+      aRetval = iter.Key();
+      break;
+    }
+    aIndex--;
+  }
+
+  return NS_OK;
+}
+
+void LocalStorageCache::GetKeys(const LocalStorage* aStorage,
+                                nsTArray<nsString>& aKeys) {
+  if (Persist(aStorage)) {
+    WaitForPreload();
+  }
+
+  if (NS_FAILED(mLoadResult)) {
+    return;
+  }
+
+  AppendToArray(aKeys, DataSet(aStorage).mKeys.Keys());
+}
+
+nsresult LocalStorageCache::GetItem(const LocalStorage* aStorage,
+                                    const nsAString& aKey, nsAString& aRetval) {
+  if (Persist(aStorage)) {
+    WaitForPreload();
+    if (NS_FAILED(mLoadResult)) {
+      return mLoadResult;
+    }
+  }
+
+  nsString value;
+  if (!DataSet(aStorage).mKeys.Get(aKey, &value)) {
+    SetDOMStringToNull(value);
+  }
+
+  aRetval = value;
+
+  return NS_OK;
+}
+
+nsresult LocalStorageCache::SetItem(const LocalStorage* aStorage,
+                                    const nsAString& aKey,
+                                    const nsAString& aValue, nsString& aOld,
+                                    const MutationSource aSource) {
+  int64_t delta = 0;
+
+  if (Persist(aStorage)) {
+    WaitForPreload();
+    if (NS_FAILED(mLoadResult)) {
+      return mLoadResult;
+    }
+  }
+
+  Data& data = DataSet(aStorage);
+  if (!data.mKeys.Get(aKey, &aOld)) {
+    SetDOMStringToNull(aOld);
+
+    delta += static_cast<int64_t>(aKey.Length());
+  }
+
+  delta += static_cast<int64_t>(aValue.Length()) -
+           static_cast<int64_t>(aOld.Length());
+
+  if (!ProcessUsageDelta(aStorage, delta, aSource)) {
+    return NS_ERROR_DOM_QUOTA_EXCEEDED_ERR;
+  }
+
+  if (aValue == aOld && DOMStringIsNull(aValue) == DOMStringIsNull(aOld)) {
+    return NS_SUCCESS_DOM_NO_OPERATION;
+  }
+
+  data.mKeys.InsertOrUpdate(aKey, aValue);
+
+  if (aSource != ContentMutation) {
+    return NS_OK;
+  }
+
+  NotifyObservers(aStorage, aKey, aOld, aValue);
+
+  if (Persist(aStorage)) {
+    StorageDBChild* storageChild = StorageDBChild::Get(mPrivateBrowsingId);
+    if (!storageChild) {
+      NS_ERROR(
+          "Writing to localStorage after the database has been shut down"
+          ", data lose!");
+      return NS_ERROR_NOT_INITIALIZED;
+    }
+
+    if (DOMStringIsNull(aOld)) {
+      return storageChild->AsyncAddItem(this, aKey, aValue);
+    }
+
+    return storageChild->AsyncUpdateItem(this, aKey, aValue);
+  }
+
+  return NS_OK;
+}
+
+nsresult LocalStorageCache::RemoveItem(const LocalStorage* aStorage,
+                                       const nsAString& aKey, nsString& aOld,
+                                       const MutationSource aSource) {
+  if (Persist(aStorage)) {
+    WaitForPreload();
+    if (NS_FAILED(mLoadResult)) {
+      return mLoadResult;
+    }
+  }
+
+  Data& data = DataSet(aStorage);
+  if (!data.mKeys.Get(aKey, &aOld)) {
+    SetDOMStringToNull(aOld);
+    return NS_SUCCESS_DOM_NO_OPERATION;
+  }
+
+  const int64_t delta = -(static_cast<int64_t>(aOld.Length()) +
+                          static_cast<int64_t>(aKey.Length()));
+  (void)ProcessUsageDelta(aStorage, delta, aSource);
+  data.mKeys.Remove(aKey);
+
+  if (aSource != ContentMutation) {
+    return NS_OK;
+  }
+
+  NotifyObservers(aStorage, aKey, aOld, VoidString());
+
+  if (Persist(aStorage)) {
+    StorageDBChild* storageChild = StorageDBChild::Get(mPrivateBrowsingId);
+    if (!storageChild) {
+      NS_ERROR(
+          "Writing to localStorage after the database has been shut down"
+          ", data lose!");
+      return NS_ERROR_NOT_INITIALIZED;
+    }
+
+    return storageChild->AsyncRemoveItem(this, aKey);
+  }
+
+  return NS_OK;
+}
+
+nsresult LocalStorageCache::Clear(const LocalStorage* aStorage,
+                                  const MutationSource aSource) {
+  bool refresh = false;
+  if (Persist(aStorage)) {
+    WaitForPreload();
+    if (NS_FAILED(mLoadResult)) {
+      refresh = true;
+      mLoadResult = NS_OK;
+    }
+  }
+
+  Data& data = DataSet(aStorage);
+  bool hadData = !!data.mKeys.Count();
+
+  if (hadData) {
+    (void)ProcessUsageDelta(aStorage, -data.mOriginQuotaUsage, aSource);
+    data.mKeys.Clear();
+  }
+
+  if (aSource != ContentMutation) {
+    return hadData ? NS_OK : NS_SUCCESS_DOM_NO_OPERATION;
+  }
+
+  if (hadData) {
+    NotifyObservers(aStorage, VoidString(), VoidString(), VoidString());
+  }
+
+  if (Persist(aStorage) && (refresh || hadData)) {
+    StorageDBChild* storageChild = StorageDBChild::Get(mPrivateBrowsingId);
+    if (!storageChild) {
+      NS_ERROR(
+          "Writing to localStorage after the database has been shut down"
+          ", data lose!");
+      return NS_ERROR_NOT_INITIALIZED;
+    }
+
+    return storageChild->AsyncClear(this);
+  }
+
+  return hadData ? NS_OK : NS_SUCCESS_DOM_NO_OPERATION;
+}
+
+int64_t LocalStorageCache::GetOriginQuotaUsage(
+    const LocalStorage* aStorage) const {
+  return mData[GetDataSetIndex(aStorage)].mOriginQuotaUsage;
+}
+
+void LocalStorageCache::UnloadItems(uint32_t aUnloadFlags) {
+  if (aUnloadFlags & kUnloadDefault) {
+    WaitForPreload();
+
+    mData[kDefaultSet].mKeys.Clear();
+    ProcessUsageDelta(kDefaultSet, -mData[kDefaultSet].mOriginQuotaUsage);
+  }
+
+  if (aUnloadFlags & kUnloadSession) {
+    mData[kSessionSet].mKeys.Clear();
+    ProcessUsageDelta(kSessionSet, -mData[kSessionSet].mOriginQuotaUsage);
+  }
+
+#if defined(DOM_STORAGE_TESTS)
+  if (aUnloadFlags & kTestReload) {
+    WaitForPreload();
+
+    mData[kDefaultSet].mKeys.Clear();
+    mLoaded = false;  
+    Preload();
+  }
+#endif
+}
+
+
+uint32_t LocalStorageCache::LoadedCount() {
+  MonitorAutoLock monitor(mMonitor);
+  Data& data = mData[kDefaultSet];
+  return data.mKeys.Count();
+}
+
+bool LocalStorageCache::LoadItem(const nsAString& aKey,
+                                 const nsAString& aValue) {
+  MonitorAutoLock monitor(mMonitor);
+  if (mLoaded) {
+    return false;
+  }
+
+  Data& data = mData[kDefaultSet];
+  data.mKeys.LookupOrInsertWith(aKey, [&] {
+    data.mOriginQuotaUsage += aKey.Length() + aValue.Length();
+    return nsString(aValue);
+  });
+  return true;
+}
+
+void LocalStorageCache::LoadDone(nsresult aRv) {
+  MonitorAutoLock monitor(mMonitor);
+  mLoadResult = aRv;
+  mLoaded = true;
+  monitor.Notify();
+}
+
+void LocalStorageCache::LoadWait() {
+  MonitorAutoLock monitor(mMonitor);
+  while (!mLoaded) {
+    monitor.Wait();
+  }
+}
+
+
+StorageUsage::StorageUsage(const nsACString& aOriginScope)
+    : mOriginScope(aOriginScope) {
+  mUsage[kDefaultSet] = mUsage[kSessionSet] = 0LL;
+}
+
+namespace {
+
+class LoadUsageRunnable : public Runnable {
+ public:
+  LoadUsageRunnable(int64_t* aUsage, const int64_t aDelta)
+      : Runnable("dom::LoadUsageRunnable"), mTarget(aUsage), mDelta(aDelta) {}
+
+ private:
+  int64_t* mTarget;
+  int64_t mDelta;
+
+  NS_IMETHOD Run() override {
+    *mTarget = mDelta;
+    return NS_OK;
+  }
+};
+
+}  
+
+void StorageUsage::LoadUsage(const int64_t aUsage) {
+  if (!NS_IsMainThread()) {
+    RefPtr<LoadUsageRunnable> r =
+        new LoadUsageRunnable(mUsage + kDefaultSet, aUsage);
+    NS_DispatchToMainThread(r);
+  } else {
+    mUsage[kDefaultSet] += aUsage;
+  }
+}
+
+bool StorageUsage::CheckAndSetETLD1UsageDelta(
+    uint32_t aDataSetIndex, const int64_t aDelta,
+    const LocalStorageCache::MutationSource aSource) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  int64_t newUsage = mUsage[aDataSetIndex] + aDelta;
+  if (aSource == LocalStorageCache::ContentMutation && aDelta > 0 &&
+      newUsage > LocalStorageManager::GetSiteQuota()) {
+    return false;
+  }
+
+  mUsage[aDataSetIndex] = newUsage;
+  return true;
+}
+
+}  

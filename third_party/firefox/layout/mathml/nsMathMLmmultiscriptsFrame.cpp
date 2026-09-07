@@ -1,0 +1,590 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsMathMLmmultiscriptsFrame.h"
+
+#include <algorithm>
+
+#include "gfxContext.h"
+#include "gfxMathTable.h"
+#include "gfxTextRun.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/StaticPrefs_mathml.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/Element.h"
+#include "nsLayoutUtils.h"
+#include "nsPresContext.h"
+
+using namespace mozilla;
+
+
+nsIFrame* NS_NewMathMLmmultiscriptsFrame(PresShell* aPresShell,
+                                         ComputedStyle* aStyle) {
+  return new (aPresShell)
+      nsMathMLmmultiscriptsFrame(aStyle, aPresShell->GetPresContext());
+}
+
+NS_IMPL_FRAMEARENA_HELPERS(nsMathMLmmultiscriptsFrame)
+
+nsMathMLmmultiscriptsFrame::~nsMathMLmmultiscriptsFrame() = default;
+
+uint8_t nsMathMLmmultiscriptsFrame::ScriptIncrement(nsIFrame* aFrame) {
+  if (!aFrame) {
+    return 0;
+  }
+  if (mFrames.ContainsFrame(aFrame)) {
+    if (mFrames.FirstChild() == aFrame ||
+        aFrame->GetContent()->IsMathMLElement(nsGkAtoms::mprescripts)) {
+      return 0;  
+    }
+    return 1;
+  }
+  return 0;  
+}
+
+NS_IMETHODIMP
+nsMathMLmmultiscriptsFrame::TransmitAutomaticData() {
+  mPresentationData.baseFrame = mFrames.FirstChild();
+  GetEmbellishDataFrom(mPresentationData.baseFrame, mEmbellishData);
+
+  int32_t count = 0;
+  bool isSubScript = !mContent->IsMathMLElement(nsGkAtoms::msup);
+
+  nsIFrame* childFrame = mFrames.FirstChild();
+  while (childFrame) {
+    if (childFrame->GetContent()->IsMathMLElement(nsGkAtoms::mprescripts)) {
+    } else if (0 == count) {
+    } else {
+      PropagateFrameFlagFor(childFrame, NS_FRAME_MATHML_SCRIPT_DESCENDANT);
+      isSubScript = !isSubScript;
+    }
+    count++;
+    childFrame = childFrame->GetNextSibling();
+  }
+
+  return NS_OK;
+}
+
+void nsMathMLmmultiscriptsFrame::Place(DrawTarget* aDrawTarget,
+                                       const PlaceFlags& aFlags,
+                                       ReflowOutput& aDesiredSize) {
+  nscoord subScriptShift = 0;
+  nscoord supScriptShift = 0;
+  float fontSizeInflation = nsLayoutUtils::FontSizeInflationFor(this);
+
+  return PlaceMultiScript(PresContext(), aDrawTarget, aFlags, aDesiredSize,
+                          this, subScriptShift, supScriptShift,
+                          fontSizeInflation);
+}
+
+void nsMathMLmmultiscriptsFrame::PlaceMultiScript(
+    nsPresContext* aPresContext, DrawTarget* aDrawTarget,
+    const PlaceFlags& aFlags, ReflowOutput& aDesiredSize,
+    nsMathMLContainerFrame* aFrame, nscoord aUserSubScriptShift,
+    nscoord aUserSupScriptShift, float aFontSizeInflation) {
+  nsAtom* tag = aFrame->GetContent()->NodeInfo()->NameAtom();
+
+  if (aFrame->GetContent()->IsMathMLElement(nsGkAtoms::mover)) {
+    tag = nsGkAtoms::msup;
+  } else if (aFrame->GetContent()->IsMathMLElement(nsGkAtoms::munder)) {
+    tag = nsGkAtoms::msub;
+  } else if (aFrame->GetContent()->IsMathMLElement(nsGkAtoms::munderover)) {
+    tag = nsGkAtoms::msubsup;
+  }
+
+  nsBoundingMetrics bmFrame;
+
+  nscoord minShiftFromXHeight, subDrop, supDrop;
+
+
+  nsIFrame* baseFrame = aFrame->PrincipalChildList().FirstChild();
+
+  if (!baseFrame) {
+    if (tag == nsGkAtoms::mmultiscripts) {
+      aFrame->ReportErrorToConsole("NoBase");
+    } else {
+      aFrame->ReportChildCountError();
+    }
+    return aFrame->PlaceAsMrow(aDrawTarget, aFlags, aDesiredSize);
+  }
+
+  const nsStyleFont* font = aFrame->StyleFont();
+  RefPtr<nsFontMetrics> fm =
+      nsLayoutUtils::GetFontMetricsForFrame(baseFrame, aFontSizeInflation);
+
+  nscoord xHeight = fm->XHeight();
+
+  nscoord oneDevPixel = fm->AppUnitsPerDevPixel();
+  RefPtr<gfxFont> mathFont = fm->GetThebesFontGroup()->GetFirstMathFont();
+  nscoord scriptSpace;
+  if (mathFont) {
+    scriptSpace = mathFont->MathTable()->Constant(
+        gfxMathTable::SpaceAfterScript, oneDevPixel);
+  } else {
+    scriptSpace = nsPresContext::CSSPointsToAppUnits(0.5f);
+  }
+
+  if (mathFont) {
+    subDrop = mathFont->MathTable()->Constant(
+        gfxMathTable::SubscriptBaselineDropMin, oneDevPixel);
+    supDrop = mathFont->MathTable()->Constant(
+        gfxMathTable::SuperscriptBaselineDropMax, oneDevPixel);
+  }
+
+  nscoord onePixel = nsPresContext::CSSPixelsToAppUnits(1);
+  scriptSpace = std::max(onePixel, scriptSpace);
+
+
+  nscoord subScriptShift;
+  if (mathFont) {
+    subScriptShift = mathFont->MathTable()->Constant(
+        gfxMathTable::SubscriptShiftDown, oneDevPixel);
+  } else {
+    nscoord subScriptShift1, subScriptShift2;
+    GetSubScriptShifts(fm, subScriptShift1, subScriptShift2);
+    if (tag == nsGkAtoms::msub) {
+      subScriptShift = subScriptShift1;
+    } else {
+      subScriptShift = std::max(subScriptShift1, subScriptShift2);
+    }
+  }
+
+  if (0 < aUserSubScriptShift) {
+    subScriptShift = std::max(subScriptShift, aUserSubScriptShift);
+  }
+
+
+  nscoord supScriptShift;
+  nsPresentationData presentationData;
+  aFrame->GetPresentationData(presentationData);
+  bool compressed = font->mMathShift == StyleMathShift::Compact;
+  if (mathFont) {
+    supScriptShift = mathFont->MathTable()->Constant(
+        compressed ? gfxMathTable::SuperscriptShiftUpCramped
+                   : gfxMathTable::SuperscriptShiftUp,
+        oneDevPixel);
+  } else {
+    nscoord supScriptShift1, supScriptShift2, supScriptShift3;
+    GetSupScriptShifts(fm, supScriptShift1, supScriptShift2, supScriptShift3);
+
+    if (font->mMathDepth == 0 && font->mMathStyle == StyleMathStyle::Normal &&
+        !compressed) {
+      supScriptShift = supScriptShift1;
+    } else if (compressed) {
+      supScriptShift = supScriptShift3;
+    } else {
+      supScriptShift = supScriptShift2;
+    }
+  }
+
+  if (0 < aUserSupScriptShift) {
+    supScriptShift = std::max(supScriptShift, aUserSupScriptShift);
+  }
+
+
+  const WritingMode wm(aDesiredSize.GetWritingMode());
+  nscoord width = 0, prescriptsWidth = 0, rightBearing = 0;
+  nscoord minSubScriptShift = 0, minSupScriptShift = 0;
+  nscoord trySubScriptShift = subScriptShift;
+  nscoord trySupScriptShift = supScriptShift;
+  nscoord maxSubScriptShift = subScriptShift;
+  nscoord maxSupScriptShift = supScriptShift;
+  ReflowOutput baseSize(wm);
+  ReflowOutput subScriptSize(wm);
+  ReflowOutput supScriptSize(wm);
+  ReflowOutput multiSubSize(wm), multiSupSize(wm);
+  baseFrame = nullptr;
+  nsIFrame* subScriptFrame = nullptr;
+  nsIFrame* supScriptFrame = nullptr;
+  nsIFrame* prescriptsFrame = nullptr;  
+
+  bool firstPrescriptsPair = false;
+  nsBoundingMetrics bmBase, bmSubScript, bmSupScript, bmMultiSub, bmMultiSup;
+  nsMargin baseMargin, subScriptMargin, supScriptMargin;
+  multiSubSize.SetBlockStartAscent(-0x7FFFFFFF);
+  multiSupSize.SetBlockStartAscent(-0x7FFFFFFF);
+  bmMultiSub.ascent = bmMultiSup.ascent = -0x7FFFFFFF;
+  bmMultiSub.descent = bmMultiSup.descent = -0x7FFFFFFF;
+  nscoord italicCorrection = 0;
+  nscoord largeOpItalicCorrection = 0;
+
+  nsBoundingMetrics boundingMetrics;
+  boundingMetrics.width = 0;
+  boundingMetrics.ascent = boundingMetrics.descent = -0x7FFFFFFF;
+  aDesiredSize.Width() = aDesiredSize.Height() = 0;
+
+  int32_t count = 0;
+
+  bool isSubScript = (tag != nsGkAtoms::msup);
+
+  nsIFrame* childFrame = aFrame->PrincipalChildList().FirstChild();
+  while (childFrame) {
+    if (childFrame->GetContent()->IsMathMLElement(nsGkAtoms::mprescripts)) {
+      if (tag != nsGkAtoms::mmultiscripts) {
+        if (!aFlags.contains(PlaceFlag::MeasureOnly)) {
+          aFrame->ReportInvalidChildError(nsGkAtoms::mprescripts);
+        }
+        return aFrame->PlaceAsMrow(aDrawTarget, aFlags, aDesiredSize);
+      }
+      if (prescriptsFrame) {
+        if (!aFlags.contains(PlaceFlag::MeasureOnly)) {
+          aFrame->ReportErrorToConsole("DuplicateMprescripts");
+        }
+        return aFrame->PlaceAsMrow(aDrawTarget, aFlags, aDesiredSize);
+      }
+      if (!isSubScript) {
+        if (!aFlags.contains(PlaceFlag::MeasureOnly)) {
+          aFrame->ReportErrorToConsole("SubSupMismatch");
+        }
+        return aFrame->PlaceAsMrow(aDrawTarget, aFlags, aDesiredSize);
+      }
+
+      prescriptsFrame = childFrame;
+      firstPrescriptsPair = true;
+    } else if (0 == count) {
+      baseFrame = childFrame;
+      GetReflowAndBoundingMetricsFor(baseFrame, baseSize, bmBase);
+      baseMargin = GetMarginForPlace(aFlags, baseFrame);
+
+      if (tag != nsGkAtoms::msub) {
+        GetItalicCorrection(bmBase, italicCorrection);
+        italicCorrection += onePixel;
+      }
+
+      if (tag != nsGkAtoms::msup) {
+        if (nsIMathMLFrame* mathMLFrame = do_QueryFrame(baseFrame)) {
+          nsEmbellishData baseFrameEmbellishData;
+          mathMLFrame->GetEmbellishData(baseFrameEmbellishData);
+          if (baseFrameEmbellishData.flags.contains(
+                  MathMLEmbellishFlag::LargeOp)) {
+            largeOpItalicCorrection = mathMLFrame->ItalicCorrection();
+          }
+        }
+      }
+
+      boundingMetrics.width = bmBase.width + baseMargin.LeftRight();
+      boundingMetrics.rightBearing =
+          bmBase.rightBearing + baseMargin.LeftRight();
+      boundingMetrics.leftBearing = bmBase.leftBearing;  
+    } else {
+      if (isSubScript) {
+        subScriptFrame = childFrame;
+        GetReflowAndBoundingMetricsFor(subScriptFrame, subScriptSize,
+                                       bmSubScript);
+        subScriptMargin = GetMarginForPlace(aFlags, subScriptFrame);
+
+        if (!mathFont) {
+          GetSubDropFromChild(subScriptFrame, subDrop, aFontSizeInflation);
+        }
+
+        minSubScriptShift = bmBase.descent + baseMargin.bottom + subDrop;
+        trySubScriptShift = std::max(minSubScriptShift, subScriptShift);
+        multiSubSize.SetBlockStartAscent(
+            std::max(multiSubSize.BlockStartAscent(),
+                     subScriptSize.BlockStartAscent() + subScriptMargin.top));
+        bmMultiSub.ascent = std::max(bmMultiSub.ascent,
+                                     bmSubScript.ascent + subScriptMargin.top);
+        bmMultiSub.descent = std::max(
+            bmMultiSub.descent, bmSubScript.descent + subScriptMargin.bottom);
+        multiSubSize.Height() =
+            std::max(multiSubSize.Height(),
+                     subScriptSize.Height() - subScriptSize.BlockStartAscent() +
+                         subScriptMargin.bottom);
+        if (bmSubScript.width) {
+          width = bmSubScript.width + subScriptMargin.LeftRight() + scriptSpace;
+        }
+        rightBearing = bmSubScript.rightBearing + subScriptMargin.LeftRight();
+
+        if (tag == nsGkAtoms::msub) {
+          boundingMetrics.rightBearing = boundingMetrics.width + rightBearing;
+          boundingMetrics.width += width;
+
+          nscoord subscriptTopMax;
+          if (mathFont) {
+            subscriptTopMax = mathFont->MathTable()->Constant(
+                gfxMathTable::SubscriptTopMax, oneDevPixel);
+          } else {
+            subscriptTopMax = NSToCoordRound((4.0f / 5.0f) * xHeight);
+          }
+          nscoord minShiftFromXHeight =
+              bmSubScript.ascent + subScriptMargin.top - subscriptTopMax;
+          maxSubScriptShift = std::max(trySubScriptShift, minShiftFromXHeight);
+
+          maxSubScriptShift = std::max(maxSubScriptShift, trySubScriptShift);
+          trySubScriptShift = subScriptShift;
+        }
+      } else {
+        supScriptFrame = childFrame;
+        GetReflowAndBoundingMetricsFor(supScriptFrame, supScriptSize,
+                                       bmSupScript);
+        supScriptMargin = GetMarginForPlace(aFlags, supScriptFrame);
+        if (!mathFont) {
+          GetSupDropFromChild(supScriptFrame, supDrop, aFontSizeInflation);
+        }
+        minSupScriptShift = bmBase.ascent + baseMargin.top - supDrop;
+        nscoord superscriptBottomMin;
+        if (mathFont) {
+          superscriptBottomMin = mathFont->MathTable()->Constant(
+              gfxMathTable::SuperscriptBottomMin, oneDevPixel);
+        } else {
+          superscriptBottomMin = NSToCoordRound((1.0f / 4.0f) * xHeight);
+        }
+        minShiftFromXHeight =
+            bmSupScript.descent + supScriptMargin.bottom + superscriptBottomMin;
+        trySupScriptShift = std::max(
+            minSupScriptShift, std::max(minShiftFromXHeight, supScriptShift));
+        multiSupSize.SetBlockStartAscent(
+            std::max(multiSupSize.BlockStartAscent(),
+                     supScriptSize.BlockStartAscent() + supScriptMargin.top));
+        bmMultiSup.ascent = std::max(bmMultiSup.ascent,
+                                     bmSupScript.ascent + supScriptMargin.top);
+        bmMultiSup.descent = std::max(
+            bmMultiSup.descent, bmSupScript.descent + supScriptMargin.bottom);
+        multiSupSize.Height() =
+            std::max(multiSupSize.Height(),
+                     supScriptSize.Height() - supScriptSize.BlockStartAscent() +
+                         supScriptMargin.bottom);
+
+        if (bmSupScript.width) {
+          width =
+              std::max(width, bmSupScript.width + supScriptMargin.LeftRight() +
+                                  scriptSpace);
+        }
+
+        if (!prescriptsFrame) {  
+          rightBearing = std::max(rightBearing,
+                                  italicCorrection + bmSupScript.rightBearing +
+                                      supScriptMargin.LeftRight());
+          boundingMetrics.rightBearing = boundingMetrics.width + rightBearing;
+          boundingMetrics.width += width;
+        } else {
+          prescriptsWidth += width;
+          if (firstPrescriptsPair) {
+            firstPrescriptsPair = false;
+            boundingMetrics.leftBearing =
+                std::min(bmSubScript.leftBearing, bmSupScript.leftBearing);
+          }
+        }
+        width = rightBearing = 0;
+
+        if (tag == nsGkAtoms::mmultiscripts || tag == nsGkAtoms::msubsup) {
+          nscoord subSuperscriptGapMin;
+          if (mathFont) {
+            subSuperscriptGapMin = mathFont->MathTable()->Constant(
+                gfxMathTable::SubSuperscriptGapMin, oneDevPixel);
+          } else {
+            nscoord ruleSize;
+            GetRuleThickness(aDrawTarget, fm, ruleSize);
+            subSuperscriptGapMin = 4 * ruleSize;
+          }
+          nscoord gap =
+              (trySupScriptShift - bmSupScript.descent -
+               supScriptMargin.bottom) -
+              (subScriptMargin.top + bmSubScript.ascent - trySubScriptShift);
+          if (gap < subSuperscriptGapMin) {
+            trySubScriptShift += subSuperscriptGapMin - gap;
+          }
+
+          nscoord superscriptBottomMaxWithSubscript;
+          if (mathFont) {
+            superscriptBottomMaxWithSubscript = mathFont->MathTable()->Constant(
+                gfxMathTable::SuperscriptBottomMaxWithSubscript, oneDevPixel);
+          } else {
+            superscriptBottomMaxWithSubscript =
+                NSToCoordRound((4.0f / 5.0f) * xHeight);
+          }
+          gap = superscriptBottomMaxWithSubscript -
+                (trySupScriptShift - bmSupScript.descent -
+                 supScriptMargin.bottom);
+          if (gap > 0) {
+            trySupScriptShift += gap;
+            trySubScriptShift -= gap;
+          }
+        }
+
+        maxSubScriptShift = std::max(maxSubScriptShift, trySubScriptShift);
+        maxSupScriptShift = std::max(maxSupScriptShift, trySupScriptShift);
+
+        trySubScriptShift = subScriptShift;
+        trySupScriptShift = supScriptShift;
+      }
+
+      isSubScript = !isSubScript;
+    }
+    count++;
+    childFrame = childFrame->GetNextSibling();
+  }
+
+  if ((count != 2 && (tag == nsGkAtoms::msup || tag == nsGkAtoms::msub)) ||
+      (count != 3 && tag == nsGkAtoms::msubsup) || !baseFrame ||
+      (!isSubScript && tag == nsGkAtoms::mmultiscripts)) {
+    if (!aFlags.contains(PlaceFlag::MeasureOnly)) {
+      if ((count != 2 && (tag == nsGkAtoms::msup || tag == nsGkAtoms::msub)) ||
+          (count != 3 && tag == nsGkAtoms::msubsup)) {
+        aFrame->ReportChildCountError();
+      } else if (!baseFrame) {
+        aFrame->ReportErrorToConsole("NoBase");
+      } else {
+        aFrame->ReportErrorToConsole("SubSupMismatch");
+      }
+    }
+    return aFrame->PlaceAsMrow(aDrawTarget, aFlags, aDesiredSize);
+  }
+
+  boundingMetrics.rightBearing += prescriptsWidth;
+  boundingMetrics.width += prescriptsWidth;
+
+  if (!subScriptFrame) {
+    maxSubScriptShift = 0;
+  }
+  if (!supScriptFrame) {
+    maxSupScriptShift = 0;
+  }
+
+  if (tag == nsGkAtoms::msub) {
+    boundingMetrics.ascent = std::max(bmBase.ascent + baseMargin.top,
+                                      bmMultiSub.ascent - maxSubScriptShift);
+  } else {
+    boundingMetrics.ascent = std::max(bmBase.ascent + baseMargin.top,
+                                      (bmMultiSup.ascent + maxSupScriptShift));
+  }
+  if (tag == nsGkAtoms::msup) {
+    boundingMetrics.descent = std::max(bmBase.descent + baseMargin.bottom,
+                                       bmMultiSup.descent - maxSupScriptShift);
+  } else {
+    boundingMetrics.descent =
+        std::max(bmBase.descent + baseMargin.bottom,
+                 (bmMultiSub.descent + maxSubScriptShift));
+  }
+
+  aDesiredSize.SetBlockStartAscent(
+      std::max(baseSize.BlockStartAscent() + baseMargin.top,
+               std::max(multiSubSize.BlockStartAscent() - maxSubScriptShift,
+                        multiSupSize.BlockStartAscent() + maxSupScriptShift)));
+  aDesiredSize.Height() =
+      aDesiredSize.BlockStartAscent() +
+      std::max(
+          baseSize.Height() - baseSize.BlockStartAscent() + baseMargin.bottom,
+          std::max(multiSubSize.Height() + maxSubScriptShift,
+                   multiSupSize.Height() - maxSupScriptShift));
+  aDesiredSize.Width() = boundingMetrics.width;
+  aDesiredSize.mBoundingMetrics = boundingMetrics;
+
+  auto sizes = aFrame->GetWidthAndHeightForPlaceAdjustment(aFlags);
+  aFrame->ApplyAdjustmentForWidthAndHeight(aFlags, sizes, aDesiredSize,
+                                           boundingMetrics);
+
+  auto borderPadding = aFrame->GetBorderPaddingForPlace(aFlags);
+  InflateReflowAndBoundingMetrics(borderPadding, aDesiredSize, boundingMetrics);
+
+  aFrame->SetBoundingMetrics(boundingMetrics);
+  aFrame->SetReference(nsPoint(0, aDesiredSize.BlockStartAscent()));
+
+
+
+  if (!aFlags.contains(PlaceFlag::MeasureOnly)) {
+    const bool isRTL = aFrame->GetWritingMode().IsBidiRTL();
+    nscoord dx = isRTL ? borderPadding.right : borderPadding.left;
+    nscoord dy = 0;
+
+    if (tag == nsGkAtoms::msub || tag == nsGkAtoms::msup) {
+      count = 1;
+    } else {
+      count = 0;
+    }
+    childFrame = prescriptsFrame;
+    bool isPreScript = true;
+    do {
+      if (!childFrame) {  
+        isPreScript = false;
+        childFrame = baseFrame;
+        dy = aDesiredSize.BlockStartAscent() - baseSize.BlockStartAscent();
+        baseMargin = GetMarginForPlace(aFlags, baseFrame);
+        nscoord dx_base = dx + (isRTL ? baseMargin.right : baseMargin.left);
+        FinishReflowChild(baseFrame, aPresContext, baseSize, nullptr,
+                          aFrame->MirrorIfRTL(aDesiredSize.Width(),
+                                              baseSize.Width(), dx_base),
+                          dy, ReflowChildFlags::Default);
+        if (prescriptsFrame) {
+          ReflowOutput prescriptsSize(wm);
+          nsBoundingMetrics unusedBm;
+          GetReflowAndBoundingMetricsFor(prescriptsFrame, prescriptsSize,
+                                         unusedBm);
+          nsMargin prescriptsMargin =
+              GetMarginForPlace(aFlags, prescriptsFrame);
+          nscoord dx_prescripts =
+              dx + (isRTL ? prescriptsMargin.right : prescriptsMargin.left);
+          dy = aDesiredSize.BlockStartAscent() -
+               prescriptsSize.BlockStartAscent();
+          FinishReflowChild(
+              prescriptsFrame, aPresContext, prescriptsSize, nullptr,
+              aFrame->MirrorIfRTL(aDesiredSize.Width(), prescriptsSize.Width(),
+                                  dx_prescripts),
+              dy, ReflowChildFlags::Default);
+        }
+        dx += bmBase.width + baseMargin.LeftRight();
+      } else if (childFrame != prescriptsFrame) {
+        if (0 == count) {
+          subScriptFrame = childFrame;
+          count = 1;
+        } else if (1 == count) {
+          if (tag != nsGkAtoms::msub) {
+            supScriptFrame = childFrame;
+          }
+          count = 0;
+
+          if (subScriptFrame) {
+            GetReflowAndBoundingMetricsFor(subScriptFrame, subScriptSize,
+                                           bmSubScript);
+            subScriptMargin = GetMarginForPlace(aFlags, subScriptFrame);
+          }
+          if (supScriptFrame) {
+            GetReflowAndBoundingMetricsFor(supScriptFrame, supScriptSize,
+                                           bmSupScript);
+            supScriptMargin = GetMarginForPlace(aFlags, supScriptFrame);
+          }
+
+          width = std::max(subScriptSize.Width() + subScriptMargin.LeftRight(),
+                           supScriptSize.Width() + supScriptMargin.LeftRight());
+
+          if (subScriptFrame) {
+            nscoord x =
+                dx + (isRTL ? subScriptMargin.right : subScriptMargin.left);
+            if (isPreScript) {
+              x += width - subScriptSize.Width() - subScriptMargin.LeftRight();
+            } else {
+              x -= largeOpItalicCorrection;
+            }
+            dy = aDesiredSize.BlockStartAscent() -
+                 subScriptSize.BlockStartAscent() + maxSubScriptShift;
+            FinishReflowChild(subScriptFrame, aPresContext, subScriptSize,
+                              nullptr,
+                              aFrame->MirrorIfRTL(aDesiredSize.Width(),
+                                                  subScriptSize.Width(), x),
+                              dy, ReflowChildFlags::Default);
+          }
+
+          if (supScriptFrame) {
+            nscoord x =
+                dx + (isRTL ? supScriptMargin.right : supScriptMargin.left);
+            if (isPreScript) {
+              x += width - supScriptSize.Width() - supScriptMargin.LeftRight();
+            } else {
+              x += italicCorrection;
+            }
+            dy = aDesiredSize.BlockStartAscent() -
+                 supScriptSize.BlockStartAscent() - maxSupScriptShift;
+            FinishReflowChild(supScriptFrame, aPresContext, supScriptSize,
+                              nullptr,
+                              aFrame->MirrorIfRTL(aDesiredSize.Width(),
+                                                  supScriptSize.Width(), x),
+                              dy, ReflowChildFlags::Default);
+          }
+          dx += width + scriptSpace;
+        }
+      }
+      childFrame = childFrame->GetNextSibling();
+    } while (prescriptsFrame != childFrame);
+  }
+}

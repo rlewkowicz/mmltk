@@ -1,0 +1,41 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef frontend_TDZCheckCache_h
+#define frontend_TDZCheckCache_h
+
+#include "mozilla/Maybe.h"
+
+#include "ds/Nestable.h"
+#include "frontend/NameCollections.h"
+
+namespace js {
+namespace frontend {
+
+struct BytecodeEmitter;
+class TaggedParserAtomIndex;
+
+enum MaybeCheckTDZ { CheckTDZ = true, DontCheckTDZ = false };
+
+using CheckTDZMap = RecyclableNameMap<MaybeCheckTDZ>;
+
+class MOZ_STACK_CLASS TDZCheckCache : public Nestable<TDZCheckCache> {
+  PooledMapPtr<CheckTDZMap> cache_;
+
+  [[nodiscard]] bool ensureCache(BytecodeEmitter* bce);
+
+ public:
+  explicit TDZCheckCache(BytecodeEmitter* bce);
+
+  mozilla::Maybe<MaybeCheckTDZ> needsTDZCheck(BytecodeEmitter* bce,
+                                              TaggedParserAtomIndex name);
+  [[nodiscard]] bool noteTDZCheck(BytecodeEmitter* bce,
+                                  TaggedParserAtomIndex name,
+                                  MaybeCheckTDZ check);
+};
+
+} 
+} 
+
+#endif /* frontend_TDZCheckCache_h */

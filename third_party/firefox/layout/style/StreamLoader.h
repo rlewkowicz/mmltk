@@ -1,0 +1,64 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_css_StreamLoader_h
+#define mozilla_css_StreamLoader_h
+
+#include "mozilla/css/SheetLoadData.h"
+#include "nsIChannelEventSink.h"
+#include "nsIInterfaceRequestor.h"
+#include "nsIStreamListener.h"
+#include "nsIThreadRetargetableStreamListener.h"
+#include "nsIURI.h"
+#include "nsString.h"
+
+class nsIInputStream;
+
+namespace mozilla::css {
+
+class StreamLoader : public nsIThreadRetargetableStreamListener,
+                     public nsIChannelEventSink,
+                     public nsIInterfaceRequestor {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIREQUESTOBSERVER
+  NS_DECL_NSISTREAMLISTENER
+  NS_DECL_NSICHANNELEVENTSINK
+  NS_DECL_NSIINTERFACEREQUESTOR
+  NS_DECL_NSITHREADRETARGETABLESTREAMLISTENER
+
+  explicit StreamLoader(SheetLoadData&);
+
+  void ChannelOpenFailed(nsresult rv) {
+#ifdef NIGHTLY_BUILD
+    mChannelOpenFailed = true;
+#endif
+  }
+
+ private:
+  virtual ~StreamLoader();
+
+  static nsresult WriteSegmentFun(nsIInputStream*, void*, const char*, uint32_t,
+                                  uint32_t, uint32_t*);
+
+  void HandleBOM();
+
+  RefPtr<SheetLoadData> mSheetLoadData;
+  nsresult mStatus;
+  Maybe<const Encoding*> mEncodingFromBOM;
+
+  nsCString mBytes;
+  nsAutoCStringN<3> mBOMBytes;
+  nsCOMPtr<nsIRequest> mRequest;
+  bool mOnStopProcessingDone{false};
+  RefPtr<SheetLoadDataHolder> mMainThreadSheetLoadData;
+
+#ifdef NIGHTLY_BUILD
+  bool mChannelOpenFailed = false;
+#endif
+};
+
+}  
+
+#endif  // mozilla_css_StreamLoader_h

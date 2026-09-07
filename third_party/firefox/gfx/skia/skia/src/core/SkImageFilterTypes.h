@@ -1,0 +1,888 @@
+/*
+ * Copyright 2019 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkImageFilterTypes_DEFINED)
+#define SkImageFilterTypes_DEFINED
+
+#include "include/core/SkColorFilter.h"
+#include "include/core/SkColorSpace.h"
+#include "include/core/SkM44.h"
+#include "include/core/SkMatrix.h"
+#include "include/core/SkPoint.h"
+#include "include/core/SkRect.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkSamplingOptions.h"
+#include "include/core/SkScalar.h"
+#include "include/core/SkSize.h"
+#include "include/core/SkSpan.h"
+#include "include/core/SkSurfaceProps.h"
+#include "include/core/SkTileMode.h"
+#include "include/core/SkTypes.h"
+#include "include/private/base/SkFloatingPoint.h"
+#include "include/private/base/SkTArray.h"
+#include "include/private/base/SkTPin.h"
+#include "include/private/base/SkTo.h"
+#include "src/base/SkEnumBitMask.h"
+#include "src/core/SkSpecialImage.h"
+
+#include <cstdint>
+#include <optional>
+#include <utility>
+
+class FilterResultTestAccess;  
+class SkBitmap;
+class SkBlender;
+class SkBlurEngine;
+class SkDevice;
+class SkImage;
+class SkImageFilter;
+class SkImageFilterCache;
+class SkPicture;
+class SkShader;
+enum SkColorType : int;
+
+namespace skif {
+
+SkIRect RoundOut(SkRect);
+SkIRect RoundIn(SkRect);
+
+struct IVector {
+    int32_t fX;
+    int32_t fY;
+
+    IVector() = default;
+    IVector(int32_t x, int32_t y) : fX(x), fY(y) {}
+    explicit IVector(const SkIVector& v) : fX(v.fX), fY(v.fY) {}
+};
+
+struct Vector {
+    SkScalar fX;
+    SkScalar fY;
+
+    Vector() = default;
+    Vector(SkScalar x, SkScalar y) : fX(x), fY(y) {}
+    explicit Vector(const SkVector& v) : fX(v.fX), fY(v.fY) {}
+
+    bool isFinite() const { return SkIsFinite(fX, fY); }
+};
+
+
+template<typename T>
+class ParameterSpace {
+public:
+    ParameterSpace() = default;
+    explicit ParameterSpace(const T& data) : fData(data) {}
+    explicit ParameterSpace(T&& data) : fData(std::move(data)) {}
+
+    explicit operator const T&() const { return fData; }
+
+private:
+    T fData;
+};
+
+template<typename T>
+class DeviceSpace {
+public:
+    DeviceSpace() = default;
+    explicit DeviceSpace(const T& data) : fData(data) {}
+    explicit DeviceSpace(T&& data) : fData(std::move(data)) {}
+
+    explicit operator const T&() const { return fData; }
+
+private:
+    T fData;
+};
+
+template<typename T>
+class LayerSpace {};
+
+template<>
+class LayerSpace<IVector> {
+public:
+    LayerSpace() = default;
+    explicit LayerSpace(const IVector& geometry) : fData(geometry) {}
+    explicit LayerSpace(IVector&& geometry) : fData(std::move(geometry)) {}
+    explicit operator const IVector&() const { return fData; }
+
+    explicit operator SkIVector() const { return SkIVector::Make(fData.fX, fData.fY); }
+
+    int32_t x() const { return fData.fX; }
+    int32_t y() const { return fData.fY; }
+
+    LayerSpace<IVector> operator-() const { return LayerSpace<IVector>({-fData.fX, -fData.fY}); }
+
+    LayerSpace<IVector> operator+(const LayerSpace<IVector>& v) const {
+        LayerSpace<IVector> sum = *this;
+        sum += v;
+        return sum;
+    }
+    LayerSpace<IVector> operator-(const LayerSpace<IVector>& v) const {
+        LayerSpace<IVector> diff = *this;
+        diff -= v;
+        return diff;
+    }
+
+    void operator+=(const LayerSpace<IVector>& v) {
+        fData.fX += v.fData.fX;
+        fData.fY += v.fData.fY;
+    }
+    void operator-=(const LayerSpace<IVector>& v) {
+        fData.fX -= v.fData.fX;
+        fData.fY -= v.fData.fY;
+    }
+
+private:
+    IVector fData;
+};
+
+template<>
+class LayerSpace<Vector> {
+public:
+    LayerSpace() = default;
+    explicit LayerSpace(const Vector& geometry) : fData(geometry) {}
+    explicit LayerSpace(Vector&& geometry) : fData(std::move(geometry)) {}
+    explicit operator const Vector&() const { return fData; }
+
+    explicit operator SkVector() const { return SkVector::Make(fData.fX, fData.fY); }
+
+    SkScalar x() const { return fData.fX; }
+    SkScalar y() const { return fData.fY; }
+
+    SkScalar length() const { return SkVector::Length(fData.fX, fData.fY); }
+
+    LayerSpace<Vector> operator-() const { return LayerSpace<Vector>({-fData.fX, -fData.fY}); }
+
+    LayerSpace<Vector> operator*(SkScalar s) const {
+        LayerSpace<Vector> scaled = *this;
+        scaled *= s;
+        return scaled;
+    }
+
+    LayerSpace<Vector> operator+(const LayerSpace<Vector>& v) const {
+        LayerSpace<Vector> sum = *this;
+        sum += v;
+        return sum;
+    }
+    LayerSpace<Vector> operator-(const LayerSpace<Vector>& v) const {
+        LayerSpace<Vector> diff = *this;
+        diff -= v;
+        return diff;
+    }
+
+    void operator*=(SkScalar s) {
+        fData.fX *= s;
+        fData.fY *= s;
+    }
+    void operator+=(const LayerSpace<Vector>& v) {
+        fData.fX += v.fData.fX;
+        fData.fY += v.fData.fY;
+    }
+    void operator-=(const LayerSpace<Vector>& v) {
+        fData.fX -= v.fData.fX;
+        fData.fY -= v.fData.fY;
+    }
+
+    friend LayerSpace<Vector> operator*(SkScalar s, const LayerSpace<Vector>& b) {
+        return b * s;
+    }
+
+private:
+    Vector fData;
+};
+
+template<>
+class LayerSpace<SkIPoint> {
+public:
+    LayerSpace() = default;
+    explicit LayerSpace(const SkIPoint& geometry)  : fData(geometry) {}
+    explicit LayerSpace(SkIPoint&& geometry) : fData(std::move(geometry)) {}
+    explicit operator const SkIPoint&() const { return fData; }
+
+    int32_t x() const { return fData.fX; }
+    int32_t y() const { return fData.fY; }
+
+    LayerSpace<SkIPoint> operator+(const LayerSpace<IVector>& v) {
+        return LayerSpace<SkIPoint>(fData + SkIVector(v));
+    }
+    LayerSpace<SkIPoint> operator-(const LayerSpace<IVector>& v) {
+        return LayerSpace<SkIPoint>(fData - SkIVector(v));
+    }
+
+    void operator+=(const LayerSpace<IVector>& v) {
+        fData += SkIVector(v);
+    }
+    void operator-=(const LayerSpace<IVector>& v) {
+        fData -= SkIVector(v);
+    }
+
+    LayerSpace<IVector> operator-(const LayerSpace<SkIPoint>& p) {
+        return LayerSpace<IVector>(IVector(fData - p.fData));
+    }
+
+    LayerSpace<IVector> operator-() const { return LayerSpace<IVector>({-fData.fX, -fData.fY}); }
+
+private:
+    SkIPoint fData;
+};
+
+template<>
+class LayerSpace<SkPoint> {
+public:
+    LayerSpace() = default;
+    explicit LayerSpace(const SkPoint& geometry) : fData(geometry) {}
+    explicit LayerSpace(SkPoint&& geometry) : fData(std::move(geometry)) {}
+    explicit operator const SkPoint&() const { return fData; }
+
+    SkScalar x() const { return fData.fX; }
+    SkScalar y() const { return fData.fY; }
+
+    SkScalar distanceToOrigin() const { return fData.distanceToOrigin(); }
+
+    LayerSpace<SkPoint> operator+(const LayerSpace<Vector>& v) {
+        return LayerSpace<SkPoint>(fData + SkVector(v));
+    }
+    LayerSpace<SkPoint> operator-(const LayerSpace<Vector>& v) {
+        return LayerSpace<SkPoint>(fData - SkVector(v));
+    }
+
+    void operator+=(const LayerSpace<Vector>& v) {
+        fData += SkVector(v);
+    }
+    void operator-=(const LayerSpace<Vector>& v) {
+        fData -= SkVector(v);
+    }
+
+    LayerSpace<Vector> operator-(const LayerSpace<SkPoint>& p) {
+        return LayerSpace<Vector>(Vector(fData - p.fData));
+    }
+
+    LayerSpace<Vector> operator-() const { return LayerSpace<Vector>({-fData.fX, -fData.fY}); }
+
+private:
+    SkPoint fData;
+};
+
+template<>
+class LayerSpace<SkISize> {
+public:
+    LayerSpace() = default;
+    explicit LayerSpace(const SkISize& geometry) : fData(geometry) {}
+    explicit LayerSpace(SkISize&& geometry) : fData(std::move(geometry)) {}
+    explicit operator const SkISize&() const { return fData; }
+
+    int32_t width() const { return fData.width(); }
+    int32_t height() const { return fData.height(); }
+
+    bool isEmpty() const { return fData.isEmpty(); }
+
+private:
+    SkISize fData;
+};
+
+template<>
+class LayerSpace<SkSize> {
+public:
+    LayerSpace() = default;
+    explicit LayerSpace(const SkSize& geometry) : fData(geometry) {}
+    explicit LayerSpace(SkSize&& geometry) : fData(std::move(geometry)) {}
+    explicit operator const SkSize&() const { return fData; }
+
+    SkScalar width() const { return fData.width(); }
+    SkScalar height() const { return fData.height(); }
+
+    bool isEmpty() const { return fData.isEmpty(); }
+    bool isZero() const { return fData.isZero(); }
+
+    LayerSpace<SkISize> round() const;
+    LayerSpace<SkISize> ceil() const;
+    LayerSpace<SkISize> floor() const;
+
+private:
+    SkSize fData;
+};
+
+template<>
+class LayerSpace<SkIRect> {
+public:
+    LayerSpace() = default;
+    explicit LayerSpace(const SkIRect& geometry) : fData(geometry) {}
+    explicit LayerSpace(SkIRect&& geometry) : fData(std::move(geometry)) {}
+    explicit LayerSpace(const SkISize& size) : fData(SkIRect::MakeSize(size)) {}
+    explicit operator const SkIRect&() const { return fData; }
+
+    static LayerSpace<SkIRect> Empty() { return LayerSpace<SkIRect>(SkIRect::MakeEmpty()); }
+
+    static constexpr std::optional<LayerSpace<SkIRect>> Unbounded() { return {}; }
+
+    template<typename BoundsFn>
+    static LayerSpace<SkIRect> Union(int boundsCount, BoundsFn boundsFn) {
+        if (boundsCount <= 0) {
+            return LayerSpace<SkIRect>::Empty();
+        }
+        LayerSpace<SkIRect> output = boundsFn(0);
+        for (int i = 1; i < boundsCount; ++i) {
+            output.join(boundsFn(i));
+        }
+        return output;
+    }
+
+    LayerSpace<SkIRect> relevantSubset(const LayerSpace<SkIRect> dstRect, SkTileMode) const;
+
+    bool isEmpty() const { return fData.isEmpty64(); }
+    bool contains(const LayerSpace<SkIRect>& r) const { return fData.contains(r.fData); }
+
+    int32_t left() const { return fData.fLeft; }
+    int32_t top() const { return fData.fTop; }
+    int32_t right() const { return fData.fRight; }
+    int32_t bottom() const { return fData.fBottom; }
+
+    int32_t width() const { return fData.width(); }
+    int32_t height() const { return fData.height(); }
+
+    LayerSpace<SkIPoint> topLeft() const { return LayerSpace<SkIPoint>(fData.topLeft()); }
+    LayerSpace<SkISize> size() const { return LayerSpace<SkISize>(fData.size()); }
+
+    static bool Intersects(const LayerSpace<SkIRect>& a, const LayerSpace<SkIRect>& b) {
+        return SkIRect::Intersects(a.fData, b.fData);
+    }
+
+    bool intersect(const LayerSpace<SkIRect>& r) { return fData.intersect(r.fData); }
+    void join(const LayerSpace<SkIRect>& r) { fData.join(r.fData); }
+    void offset(const LayerSpace<IVector>& v) { fData.offset(SkIVector(v)); }
+    void outset(const LayerSpace<SkISize>& delta) { fData.outset(delta.width(), delta.height()); }
+    void inset(const LayerSpace<SkISize>& delta) { fData.inset(delta.width(), delta.height()); }
+
+private:
+    SkIRect fData;
+};
+
+template<>
+class LayerSpace<SkRect> {
+public:
+    LayerSpace() = default;
+    explicit LayerSpace(const SkRect& geometry) : fData(geometry) {}
+    explicit LayerSpace(SkRect&& geometry) : fData(std::move(geometry)) {}
+    explicit LayerSpace(const LayerSpace<SkIRect>& rect) : fData(SkRect::Make(SkIRect(rect))) {}
+    explicit operator const SkRect&() const { return fData; }
+
+    static LayerSpace<SkRect> Empty() { return LayerSpace<SkRect>(SkRect::MakeEmpty()); }
+
+    bool isEmpty() const { return fData.isEmpty(); }
+    bool contains(const LayerSpace<SkRect>& r) const { return fData.contains(r.fData); }
+
+    SkScalar left() const { return fData.fLeft; }
+    SkScalar top() const { return fData.fTop; }
+    SkScalar right() const { return fData.fRight; }
+    SkScalar bottom() const { return fData.fBottom; }
+
+    SkScalar width() const { return fData.width(); }
+    SkScalar height() const { return fData.height(); }
+
+    LayerSpace<SkPoint> topLeft() const {
+        return LayerSpace<SkPoint>(SkPoint::Make(fData.fLeft, fData.fTop));
+    }
+    LayerSpace<SkPoint> center() const {
+        return LayerSpace<SkPoint>(fData.center());
+    }
+    LayerSpace<SkSize> size() const {
+        return LayerSpace<SkSize>(SkSize::Make(fData.width(), fData.height()));
+    }
+
+    LayerSpace<SkIRect> round() const { return LayerSpace<SkIRect>(fData.round()); }
+    LayerSpace<SkIRect> roundIn() const { return LayerSpace<SkIRect>(RoundIn(fData)); }
+    LayerSpace<SkIRect> roundOut() const { return LayerSpace<SkIRect>(RoundOut(fData)); }
+
+    bool intersect(const LayerSpace<SkRect>& r) { return fData.intersect(r.fData); }
+    void join(const LayerSpace<SkRect>& r) { fData.join(r.fData); }
+    void offset(const LayerSpace<Vector>& v) { fData.offset(SkVector(v)); }
+    void outset(const LayerSpace<SkSize>& delta) { fData.outset(delta.width(), delta.height()); }
+    void inset(const LayerSpace<SkSize>& delta) { fData.inset(delta.width(), delta.height()); }
+
+    LayerSpace<SkPoint> clamp(LayerSpace<SkPoint> pt) const {
+        return LayerSpace<SkPoint>(SkPoint::Make(SkTPin(pt.x(), fData.fLeft, fData.fRight),
+                                                 SkTPin(pt.y(), fData.fTop, fData.fBottom)));
+    }
+
+private:
+    SkRect fData;
+};
+
+template<>
+class LayerSpace<SkMatrix> {
+public:
+    LayerSpace() = default;
+    explicit LayerSpace(const SkMatrix& m) : fData(m) {}
+    explicit LayerSpace(SkMatrix&& m) : fData(std::move(m)) {}
+    explicit operator const SkMatrix&() const { return fData; }
+
+    static LayerSpace<SkMatrix> RectToRect(const LayerSpace<SkRect>& from,
+                                           const LayerSpace<SkRect>& to) {
+        return LayerSpace<SkMatrix>(SkMatrix::RectToRectOrIdentity(SkRect(from), SkRect(to)));
+    }
+
+    LayerSpace<SkRect> mapRect(const LayerSpace<SkRect>& r) const;
+
+    LayerSpace<SkIRect> mapRect(const LayerSpace<SkIRect>& r) const;
+
+    LayerSpace<SkPoint> mapPoint(const LayerSpace<SkPoint>& p) const;
+
+    LayerSpace<Vector> mapVector(const LayerSpace<Vector>& v) const;
+
+    LayerSpace<SkSize> mapSize(const LayerSpace<SkSize>& s) const;
+
+    LayerSpace<SkMatrix>& preConcat(const LayerSpace<SkMatrix>& m) {
+        fData = SkMatrix::Concat(fData, m.fData);
+        return *this;
+    }
+
+    LayerSpace<SkMatrix>& postConcat(const LayerSpace<SkMatrix>& m) {
+        fData = SkMatrix::Concat(m.fData, fData);
+        return *this;
+    }
+
+    bool invert(LayerSpace<SkMatrix>* inverse) const {
+        if (auto inv = fData.invert()) {
+            if (inverse) {
+                inverse->fData = *inv;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    bool inverseMapRect(const LayerSpace<SkRect>& r, LayerSpace<SkRect>* out) const;
+    bool inverseMapRect(const LayerSpace<SkIRect>& r, LayerSpace<SkIRect>* out) const;
+
+    float rc(int row, int col) const { return fData.rc(row, col); }
+    float get(int i) const { return fData.get(i); }
+
+private:
+    SkMatrix fData;
+};
+
+enum class MatrixCapability {
+    kTranslate,
+    kScaleTranslate,
+    kComplex,
+};
+
+class Mapping {
+public:
+    Mapping() = default;
+
+    explicit Mapping(const SkM44& paramToLayer)
+            : fLayerToDevMatrix(SkM44())
+            , fParamToLayerMatrix(paramToLayer)
+            , fDevToLayerMatrix(SkM44()) {}
+
+    Mapping(const SkM44& layerToDev, const SkM44& devToLayer, const SkM44& paramToLayer)
+            : fLayerToDevMatrix(layerToDev)
+            , fParamToLayerMatrix(paramToLayer)
+            , fDevToLayerMatrix(devToLayer) {}
+
+    [[nodiscard]] bool decomposeCTM(const SkM44& ctm,
+                                    const SkImageFilter* filter,
+                                    const skif::ParameterSpace<SkPoint>& representativePt);
+    [[nodiscard]] bool decomposeCTM(const SkM44& ctm,
+                                    MatrixCapability,
+                                    const skif::ParameterSpace<SkPoint>& representativePt);
+
+    void concatLocal(const SkMatrix& local) { fParamToLayerMatrix.preConcat(local); }
+
+    bool adjustLayerSpace(const SkM44& layer);
+
+    void applyOrigin(const LayerSpace<SkIPoint>& origin) {
+        SkAssertResult(this->adjustLayerSpace(SkM44::Translate(-origin.x(), -origin.y())));
+    }
+
+    const SkM44& layerToDevice() const { return fLayerToDevMatrix; }
+    const SkM44& deviceToLayer() const { return fDevToLayerMatrix; }
+    const SkM44& layerMatrix() const { return fParamToLayerMatrix; }
+    SkM44 totalMatrix() const {
+        return fLayerToDevMatrix * fParamToLayerMatrix;
+    }
+
+    template<typename T>
+    LayerSpace<T> paramToLayer(const ParameterSpace<T>& paramGeometry) const {
+        return LayerSpace<T>(map(static_cast<const T&>(paramGeometry),
+                                 fParamToLayerMatrix.asM33()));
+    }
+
+    template<typename T>
+    LayerSpace<T> deviceToLayer(const DeviceSpace<T>& devGeometry) const {
+        if (auto devToLayer33 = fLayerToDevMatrix.asM33().invert()) {
+            return LayerSpace<T>(map(static_cast<const T&>(devGeometry), *devToLayer33));
+        }
+        return LayerSpace<T>::Empty();
+    }
+
+    template<typename T>
+    DeviceSpace<T> layerToDevice(const LayerSpace<T>& layerGeometry) const {
+        return DeviceSpace<T>(map(static_cast<const T&>(layerGeometry), fLayerToDevMatrix.asM33()));
+    }
+
+private:
+    friend class LayerSpace<SkMatrix>; 
+    friend class FilterResult;         
+
+    SkM44 fLayerToDevMatrix;
+    SkM44 fParamToLayerMatrix;
+
+    SkM44 fDevToLayerMatrix;
+
+    template<typename T>
+    static T map(const T& geom, const SkMatrix& matrix);
+};
+
+class Context; 
+
+class FilterResult {
+public:
+    FilterResult() : FilterResult(nullptr) {}
+
+    explicit FilterResult(sk_sp<SkSpecialImage> image)
+            : FilterResult(std::move(image), LayerSpace<SkIPoint>({0, 0})) {}
+
+    FilterResult(sk_sp<SkSpecialImage> image, const LayerSpace<SkIPoint>& origin)
+            : FilterResult(std::move(image), origin, PixelBoundary::kUnknown) {}
+
+    static FilterResult MakeFromPicture(const Context& ctx,
+                                        sk_sp<SkPicture> pic,
+                                        ParameterSpace<SkRect> cullRect);
+
+    static FilterResult MakeFromShader(const Context& ctx,
+                                       sk_sp<SkShader> shader,
+                                       bool dither);
+
+    static FilterResult MakeFromImage(const Context& ctx,
+                                      sk_sp<SkImage> image,
+                                      SkRect srcRect,
+                                      ParameterSpace<SkRect> dstRect,
+                                      const SkSamplingOptions& sampling);
+
+    static constexpr SkSamplingOptions kDefaultSampling{SkFilterMode::kLinear};
+
+    explicit operator bool() const { return SkToBool(fImage); }
+
+    const SkSpecialImage* image() const { return fImage.get(); }
+    sk_sp<SkSpecialImage> refImage() const { return fImage; }
+
+    LayerSpace<SkIRect> layerBounds() const { return fLayerBounds; }
+    SkTileMode tileMode() const { return fTileMode; }
+    SkSamplingOptions sampling() const { return fSamplingOptions; }
+
+    const SkColorFilter* colorFilter() const { return fColorFilter.get(); }
+
+    FilterResult applyCrop(const Context& ctx,
+                           const LayerSpace<SkIRect>& crop,
+                           SkTileMode tileMode=SkTileMode::kDecal) const;
+
+    FilterResult applyTransform(const Context& ctx,
+                                const LayerSpace<SkMatrix>& transform,
+                                const SkSamplingOptions& sampling) const;
+
+    FilterResult applyColorFilter(const Context& ctx,
+                                  sk_sp<SkColorFilter> colorFilter) const;
+
+    sk_sp<SkSpecialImage> imageAndOffset(const Context& ctx, SkIPoint* offset) const;
+    std::pair<sk_sp<SkSpecialImage>, LayerSpace<SkIPoint>> imageAndOffset(const Context& ctx) const;
+
+    void draw(const Context& ctx, SkDevice* target, const SkBlender* blender) const;
+
+    FilterResult insetForSaveLayer() const;
+
+    class Builder;
+
+    enum class ShaderFlags : int {
+        kNone = 0,
+        kSampledRepeatedly = 1 << 0,
+        kNonTrivialSampling = 1 << 1,
+    };
+    SK_DECL_BITMASK_OPS_FRIENDS(ShaderFlags)
+
+private:
+    friend class ::FilterResultTestAccess; 
+
+    class AutoSurface;
+
+    enum class PixelBoundary : int {
+        kUnknown,     
+        kTransparent, 
+        kInitialized, 
+    };
+
+    FilterResult(sk_sp<SkSpecialImage> image,
+                 const LayerSpace<SkIPoint>& origin,
+                 PixelBoundary boundary)
+            : fImage(std::move(image))
+            , fBoundary(boundary)
+            , fSamplingOptions(kDefaultSampling)
+            , fTileMode(SkTileMode::kDecal)
+            , fTransform(SkMatrix::Translate(origin.x(), origin.y()))
+            , fColorFilter(nullptr)
+            , fLayerBounds(
+                    fTransform.mapRect(LayerSpace<SkIRect>(fImage ? fImage->dimensions()
+                                                                  : SkISize{0, 0}))) {}
+
+    FilterResult resolve(const Context& ctx, LayerSpace<SkIRect> dstBounds,
+                         bool preserveDstBounds=false) const;
+    FilterResult subset(const LayerSpace<SkIPoint>& knownOrigin,
+                        const LayerSpace<SkIRect>& subsetBounds,
+                        bool clampSrcIfDisjoint=false) const;
+    FilterResult insetByPixel() const;
+
+    enum class BoundsAnalysis : int {
+        kSimple = 0,
+        kDstBoundsNotCovered = 1 << 0,
+        kHasLayerFillingEffect = 1 << 1,
+        kRequiresLayerCrop = 1 << 2,
+        kRequiresShaderTiling = 1 << 3,
+        kRequiresDecalInLayerSpace = 1 << 4,
+    };
+    SK_DECL_BITMASK_OPS_FRIENDS(BoundsAnalysis)
+
+    enum class BoundsScope : int {
+        kDeferred,        
+        kCanDrawDirectly, 
+        kShaderOnly,      
+        kRescale          
+    };
+
+    SkEnumBitMask<BoundsAnalysis> analyzeBounds(const SkMatrix& xtraTransform,
+                                                const SkIRect& dstBounds,
+                                                BoundsScope scope = BoundsScope::kDeferred) const;
+    SkEnumBitMask<BoundsAnalysis> analyzeBounds(const LayerSpace<SkIRect>& dstBounds,
+                                                BoundsScope scope = BoundsScope::kDeferred) const {
+        return this->analyzeBounds(SkMatrix::I(), SkIRect(dstBounds), scope);
+    }
+
+    bool canClampToTransparentBoundary(SkEnumBitMask<BoundsAnalysis> analysis) const {
+        return fTileMode == SkTileMode::kDecal &&
+               fBoundary == PixelBoundary::kTransparent &&
+               !(analysis & BoundsAnalysis::kRequiresDecalInLayerSpace);
+    }
+
+    FilterResult rescale(const Context& ctx,
+                         const LayerSpace<SkSize>& scale,
+                         bool enforceDecal,
+                         bool allowOverscaling) const;
+    void draw(const Context& ctx,
+              SkDevice* device,
+              bool preserveDeviceState,
+              const SkBlender* blender=nullptr) const;
+
+    sk_sp<SkShader> asShader(const Context& ctx,
+                             const SkSamplingOptions& xtraSampling,
+                             SkEnumBitMask<ShaderFlags> flags,
+                             const LayerSpace<SkIRect>& sampleBounds) const;
+
+    sk_sp<SkShader> getAnalyzedShaderView(const Context& ctx,
+                                          const SkSamplingOptions& finalSampling,
+                                          SkEnumBitMask<BoundsAnalysis> analysis) const;
+
+    void updateTileMode(const Context& ctx, SkTileMode tileMode);
+
+    sk_sp<SkSpecialImage> fImage;
+    PixelBoundary         fBoundary;
+
+    SkSamplingOptions     fSamplingOptions;
+    SkTileMode            fTileMode;
+    LayerSpace<SkMatrix>  fTransform;
+
+    sk_sp<SkColorFilter>  fColorFilter;
+
+    LayerSpace<SkIRect>   fLayerBounds;
+};
+SK_MAKE_BITMASK_OPS(FilterResult::ShaderFlags)
+SK_MAKE_BITMASK_OPS(FilterResult::BoundsAnalysis)
+
+class FilterResult::Builder {
+public:
+    Builder(const Context& context);
+    ~Builder();
+
+    Builder& add(const FilterResult& input,
+                 std::optional<LayerSpace<SkIRect>> sampleBounds = {},
+                 SkEnumBitMask<ShaderFlags> inputFlags = ShaderFlags::kNone,
+                 const SkSamplingOptions& inputSampling = kDefaultSampling) {
+        fInputs.push_back({input, sampleBounds, inputFlags, inputSampling});
+        return *this;
+    }
+
+    FilterResult merge();
+
+    FilterResult blur(const LayerSpace<SkSize>& sigma);
+
+    template <typename ShaderFn>
+    FilterResult eval(ShaderFn shaderFn,
+                      std::optional<LayerSpace<SkIRect>> explicitOutput = {},
+                      bool evaluateInParameterSpace=false) {
+        auto outputBounds = this->outputBounds(explicitOutput);
+        if (outputBounds.isEmpty()) {
+            return {};
+        }
+
+        auto inputShaders = this->createInputShaders(outputBounds, evaluateInParameterSpace);
+        return this->drawShader(shaderFn(inputShaders), outputBounds, evaluateInParameterSpace);
+    }
+
+private:
+    struct SampledFilterResult {
+        FilterResult fImage;
+        std::optional<LayerSpace<SkIRect>> fSampleBounds;
+        SkEnumBitMask<ShaderFlags> fFlags;
+        SkSamplingOptions fSampling;
+    };
+
+    SkSpan<sk_sp<SkShader>> createInputShaders(const LayerSpace<SkIRect>& outputBounds,
+                                               bool evaluateInParameterSpace);
+
+    LayerSpace<SkIRect> outputBounds(std::optional<LayerSpace<SkIRect>> explicitOutput) const;
+
+    FilterResult drawShader(sk_sp<SkShader> shader,
+                            const LayerSpace<SkIRect>& outputBounds,
+                            bool evaluateInParameterSpace) const;
+
+    const Context& fContext; 
+    skia_private::STArray<1, SampledFilterResult> fInputs;
+    skia_private::STArray<1, sk_sp<SkShader>> fInputShaders;
+};
+
+class Backend : public SkRefCnt {
+public:
+    ~Backend() override;
+
+    virtual sk_sp<SkDevice> makeDevice(SkISize size,
+                                       sk_sp<SkColorSpace>,
+                                       const SkSurfaceProps* props=nullptr) const = 0;
+
+    virtual sk_sp<SkSpecialImage> makeImage(const SkIRect& subset, sk_sp<SkImage> image) const = 0;
+
+    virtual sk_sp<SkImage> getCachedBitmap(const SkBitmap& data) const = 0;
+
+    virtual const SkBlurEngine* getBlurEngine() const = 0;
+
+    const SkSurfaceProps& surfaceProps() const { return fSurfaceProps; }
+    SkColorType colorType() const { return fColorType; }
+
+    SkImageFilterCache* cache() const { return fCache.get(); }
+
+protected:
+    Backend(sk_sp<SkImageFilterCache> cache,
+            const SkSurfaceProps& surfaceProps,
+            const SkColorType colorType);
+
+private:
+    sk_sp<SkImageFilterCache> fCache;
+    SkSurfaceProps fSurfaceProps;
+    SkColorType fColorType;
+};
+
+sk_sp<Backend> MakeRasterBackend(const SkSurfaceProps& surfaceProps, SkColorType colorType);
+
+struct Stats {
+    int fNumVisitedImageFilters = 0; 
+    int fNumCacheHits = 0; 
+    int fNumOffscreenSurfaces = 0; 
+    int fNumShaderClampedDraws = 0; 
+    int fNumShaderBasedTilingDraws = 0; 
+
+    void dumpStats() const;   
+    void reportStats() const; 
+};
+
+class Context {
+public:
+    Context(sk_sp<Backend> backend,
+            const Mapping& mapping,
+            const LayerSpace<SkIRect>& desiredOutput,
+            const FilterResult& source,
+            const SkColorSpace* colorSpace,
+            Stats* stats)
+        : fBackend(std::move(backend))
+        , fMapping(mapping)
+        , fDesiredOutput(desiredOutput)
+        , fSource(source)
+        , fColorSpace(sk_ref_sp(colorSpace))
+        , fStats(stats) {}
+
+    const Backend* backend() const { return fBackend.get(); }
+
+    const Mapping& mapping() const { return fMapping; }
+
+    const LayerSpace<SkIRect>& desiredOutput() const { return fDesiredOutput; }
+
+    SkColorSpace* colorSpace() const { return fColorSpace.get(); }
+    sk_sp<SkColorSpace> refColorSpace() const { return fColorSpace; }
+
+    const FilterResult& source() const { return fSource; }
+
+
+    Context withNewMapping(const Mapping& mapping) const {
+        Context c = *this;
+        c.fMapping = mapping;
+        return c;
+    }
+    Context withNewDesiredOutput(const LayerSpace<SkIRect>& desiredOutput) const {
+        Context c = *this;
+        c.fDesiredOutput = desiredOutput;
+        return c;
+    }
+    Context withNewColorSpace(SkColorSpace* cs) const {
+        Context c = *this;
+        c.fColorSpace = sk_ref_sp(cs);
+        return c;
+    }
+
+    Context withNewSource(const FilterResult& source) const {
+        Context c = *this;
+        c.fSource = source;
+        return c;
+    }
+
+
+    void markVisitedImageFilter() const {
+        if (fStats) {
+            fStats->fNumVisitedImageFilters++;
+        }
+    }
+    void markCacheHit() const {
+        if (fStats) {
+            fStats->fNumCacheHits++;
+        }
+    }
+    void markNewSurface() const {
+        if (fStats) {
+            fStats->fNumOffscreenSurfaces++;
+        }
+    }
+    void markShaderBasedTilingRequired(SkTileMode tileMode) const {
+        if (fStats) {
+            if (tileMode == SkTileMode::kClamp) {
+                fStats->fNumShaderClampedDraws++;
+            } else {
+                fStats->fNumShaderBasedTilingDraws++;
+            }
+        }
+    }
+
+private:
+    friend class ::FilterResultTestAccess; 
+
+    sk_sp<Backend> fBackend;
+
+    Mapping             fMapping;
+    LayerSpace<SkIRect> fDesiredOutput;
+    FilterResult        fSource;
+    sk_sp<SkColorSpace> fColorSpace;
+
+    Stats* fStats;
+};
+
+} 
+
+#endif

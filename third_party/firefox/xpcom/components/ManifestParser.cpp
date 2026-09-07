@@ -1,0 +1,552 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/Printf.h"
+
+#include "ManifestParser.h"
+
+#include <string.h>
+
+#include "prio.h"
+#if defined(MOZ_WIDGET_GTK)
+#  include <gtk/gtk.h>
+#endif
+
+
+#if defined(MOZ_BACKGROUNDTASKS)
+#  include "mozilla/BackgroundTasks.h"
+#endif
+
+#include "mozilla/Services.h"
+
+#include "nsCRT.h"
+#include "nsConsoleMessage.h"
+#include "nsTextFormatter.h"
+#include "nsVersionComparator.h"
+#include "nsXPCOMCIDInternal.h"
+
+#include "nsIConsoleService.h"
+#include "nsIScriptError.h"
+#include "nsIXULAppInfo.h"
+#include "nsIXULRuntime.h"
+
+using namespace mozilla;
+
+struct ManifestDirective {
+  const char* directive;
+  int argc;
+
+  bool ischrome;
+
+  bool contentflags;
+
+  void (nsComponentManagerImpl::*mgrfunc)(
+      nsComponentManagerImpl::ManifestProcessingContext& aCx, int aLineNo,
+      char* const* aArgv);
+  void (nsChromeRegistry::*regfunc)(
+      nsChromeRegistry::ManifestProcessingContext& aCx, int aLineNo,
+      char* const* aArgv, int aFlags);
+};
+static const ManifestDirective kParsingTable[] = {
+    // clang-format off
+  {
+    "manifest",         1, true, false,
+    &nsComponentManagerImpl::ManifestManifest, nullptr,
+  },
+  {
+    "category",         3, false, false,
+    &nsComponentManagerImpl::ManifestCategory, nullptr,
+  },
+  {
+    "content",          2, true,  true,
+    nullptr, &nsChromeRegistry::ManifestContent,
+  },
+  {
+    "locale",           3, true, false,
+    nullptr, &nsChromeRegistry::ManifestLocale,
+  },
+  {
+    "skin",             3, true, false,
+    nullptr, &nsChromeRegistry::ManifestSkin,
+  },
+  {
+    "override",         2, true, false,
+    nullptr, &nsChromeRegistry::ManifestOverride,
+  },
+  {
+    "resource",         2, false, true,
+    nullptr, &nsChromeRegistry::ManifestResource,
+  }
+    // clang-format on
+};
+
+static const char kWhitespace[] = "\t ";
+
+static bool IsNewline(char aChar) { return aChar == '\n' || aChar == '\r'; }
+
+void LogMessage(const char* aMsg, ...) {
+  MOZ_ASSERT(nsComponentManagerImpl::gComponentManager);
+
+  nsCOMPtr<nsIConsoleService> console =
+      do_GetService(NS_CONSOLESERVICE_CONTRACTID);
+  if (!console) {
+    return;
+  }
+
+  va_list args;
+  va_start(args, aMsg);
+  SmprintfPointer formatted(mozilla::Vsmprintf(aMsg, args));
+  va_end(args);
+
+  nsCOMPtr<nsIConsoleMessage> error =
+      new nsConsoleMessage(NS_ConvertUTF8toUTF16(formatted.get()));
+  console->LogMessage(error);
+}
+
+void LogMessageWithContext(FileLocation& aFile, uint32_t aLineNumber,
+                           const char* aMsg, ...) {
+  va_list args;
+  va_start(args, aMsg);
+  SmprintfPointer formatted(mozilla::Vsmprintf(aMsg, args));
+  va_end(args);
+  if (!formatted) {
+    return;
+  }
+
+  MOZ_ASSERT(nsComponentManagerImpl::gComponentManager);
+
+  nsCString file;
+  aFile.GetURIString(file);
+
+  nsCOMPtr<nsIScriptError> error = do_CreateInstance(NS_SCRIPTERROR_CONTRACTID);
+  if (!error) {
+    LogMessage("Warning: in '%s', line %i: %s", file.get(), aLineNumber,
+               formatted.get());
+    return;
+  }
+
+  nsCOMPtr<nsIConsoleService> console =
+      do_GetService(NS_CONSOLESERVICE_CONTRACTID);
+  if (!console) {
+    return;
+  }
+
+  nsresult rv = error->Init(
+      NS_ConvertUTF8toUTF16(formatted.get()), file, aLineNumber, 0,
+      nsIScriptError::warningFlag, "chrome registration"_ns,
+      false , true );
+  if (NS_FAILED(rv)) {
+    return;
+  }
+
+  console->LogMessage(error);
+}
+
+static bool CheckFlag(const nsAString& aFlag, const nsAString& aData,
+                      bool& aResult) {
+  if (!StringBeginsWith(aData, aFlag)) {
+    return false;
+  }
+
+  if (aFlag.Length() == aData.Length()) {
+    aResult = true;
+    return true;
+  }
+
+  if (aData.CharAt(aFlag.Length()) != '=') {
+    return false;
+  }
+
+  if (aData.Length() == aFlag.Length() + 1) {
+    aResult = false;
+    return true;
+  }
+
+  switch (aData.CharAt(aFlag.Length() + 1)) {
+    case '1':
+    case 't':  
+    case 'y':  
+      aResult = true;
+      return true;
+
+    case '0':
+    case 'f':  
+    case 'n':  
+      aResult = false;
+      return true;
+  }
+
+  return false;
+}
+
+enum TriState { eUnspecified, eBad, eOK };
+
+static bool CheckStringFlag(const nsAString& aFlag, const nsAString& aData,
+                            const nsAString& aValue, TriState& aResult) {
+  if (aData.Length() < aFlag.Length() + 1) {
+    return false;
+  }
+
+  if (!StringBeginsWith(aData, aFlag)) {
+    return false;
+  }
+
+  bool comparison = true;
+  if (aData[aFlag.Length()] != '=') {
+    if (aData[aFlag.Length()] == '!' && aData.Length() >= aFlag.Length() + 2 &&
+        aData[aFlag.Length() + 1] == '=') {
+      comparison = false;
+    } else {
+      return false;
+    }
+  }
+
+  if (aResult != eOK) {
+    nsDependentSubstring testdata =
+        Substring(aData, aFlag.Length() + (comparison ? 1 : 2));
+    if (testdata.Equals(aValue)) {
+      aResult = comparison ? eOK : eBad;
+    } else {
+      aResult = comparison ? eBad : eOK;
+    }
+  }
+
+  return true;
+}
+
+static bool CheckOsFlag(const nsAString& aFlag, const nsAString& aData,
+                        const nsAString& aValue, TriState& aResult) {
+  bool result = CheckStringFlag(aFlag, aData, aValue, aResult);
+#if defined(XP_UNIX) && !0 && !0
+  if (result && aResult == eBad) {
+    result = CheckStringFlag(aFlag, aData, u"likeunix"_ns, aResult);
+  }
+#endif
+  return result;
+}
+
+
+#define COMPARE_EQ 1 << 0
+#define COMPARE_LT 1 << 1
+#define COMPARE_GT 1 << 2
+
+static bool CheckVersionFlag(const nsString& aFlag, const nsString& aData,
+                             const nsString& aValue, TriState& aResult) {
+  if (aData.Length() < aFlag.Length() + 2) {
+    return false;
+  }
+
+  if (!StringBeginsWith(aData, aFlag)) {
+    return false;
+  }
+
+  if (aValue.Length() == 0) {
+    if (aResult != eOK) {
+      aResult = eBad;
+    }
+    return true;
+  }
+
+  uint32_t comparison;
+  nsAutoString testdata;
+
+  switch (aData[aFlag.Length()]) {
+    case '=':
+      comparison = COMPARE_EQ;
+      testdata = Substring(aData, aFlag.Length() + 1);
+      break;
+
+    case '<':
+      if (aData[aFlag.Length() + 1] == '=') {
+        comparison = COMPARE_EQ | COMPARE_LT;
+        testdata = Substring(aData, aFlag.Length() + 2);
+      } else {
+        comparison = COMPARE_LT;
+        testdata = Substring(aData, aFlag.Length() + 1);
+      }
+      break;
+
+    case '>':
+      if (aData[aFlag.Length() + 1] == '=') {
+        comparison = COMPARE_EQ | COMPARE_GT;
+        testdata = Substring(aData, aFlag.Length() + 2);
+      } else {
+        comparison = COMPARE_GT;
+        testdata = Substring(aData, aFlag.Length() + 1);
+      }
+      break;
+
+    default:
+      return false;
+  }
+
+  if (testdata.Length() == 0) {
+    return false;
+  }
+
+  if (aResult != eOK) {
+    int32_t c = mozilla::CompareVersions(NS_ConvertUTF16toUTF8(aValue).get(),
+                                         NS_ConvertUTF16toUTF8(testdata).get());
+    if ((c == 0 && comparison & COMPARE_EQ) ||
+        (c < 0 && comparison & COMPARE_LT) ||
+        (c > 0 && comparison & COMPARE_GT)) {
+      aResult = eOK;
+    } else {
+      aResult = eBad;
+    }
+  }
+
+  return true;
+}
+
+static void ToLowerCase(char* aToken) {
+  for (; *aToken; ++aToken) {
+    *aToken = NS_ToLower(*aToken);
+  }
+}
+
+namespace {
+
+struct CachedDirective {
+  int lineno;
+  char* argv[4];
+};
+
+}  
+
+void ParseManifest(NSLocationType aType, FileLocation& aFile, char* aBuf,
+                   bool aChromeOnly) {
+  nsComponentManagerImpl::ManifestProcessingContext mgrcx(aType, aFile,
+                                                          aChromeOnly);
+  nsChromeRegistry::ManifestProcessingContext chromecx(aType, aFile);
+  nsresult rv;
+
+  constexpr auto kContentAccessible = u"contentaccessible"_ns;
+  constexpr auto kApplication = u"application"_ns;
+  constexpr auto kAppVersion = u"appversion"_ns;
+  constexpr auto kGeckoVersion = u"platformversion"_ns;
+  constexpr auto kOs = u"os"_ns;
+  constexpr auto kOsVersion = u"osversion"_ns;
+  constexpr auto kABI = u"abi"_ns;
+  constexpr auto kProcess = u"process"_ns;
+  constexpr auto kBackgroundTask = u"backgroundtask"_ns;
+
+  constexpr auto kMain = u"main"_ns;
+  constexpr auto kContent = u"content"_ns;
+
+  constexpr auto kXPCNativeWrappers = u"xpcnativewrappers"_ns;
+
+  nsAutoString appID;
+  nsAutoString appVersion;
+  nsAutoString geckoVersion;
+  nsAutoString osTarget;
+  nsAutoString abi;
+  nsAutoString process;
+
+  nsCOMPtr<nsIXULAppInfo> xapp(do_GetService(XULAPPINFO_SERVICE_CONTRACTID));
+  if (xapp) {
+    nsAutoCString s;
+    rv = xapp->GetID(s);
+    if (NS_SUCCEEDED(rv)) {
+      CopyUTF8toUTF16(s, appID);
+    }
+
+    rv = xapp->GetVersion(s);
+    if (NS_SUCCEEDED(rv)) {
+      CopyUTF8toUTF16(s, appVersion);
+    }
+
+    rv = xapp->GetPlatformVersion(s);
+    if (NS_SUCCEEDED(rv)) {
+      CopyUTF8toUTF16(s, geckoVersion);
+    }
+
+    nsCOMPtr<nsIXULRuntime> xruntime(do_QueryInterface(xapp));
+    if (xruntime) {
+      rv = xruntime->GetOS(s);
+      if (NS_SUCCEEDED(rv)) {
+        ToLowerCase(s);
+        CopyUTF8toUTF16(s, osTarget);
+      }
+
+      rv = xruntime->GetXPCOMABI(s);
+      if (NS_SUCCEEDED(rv) && osTarget.Length()) {
+        ToLowerCase(s);
+        CopyUTF8toUTF16(s, abi);
+        abi.Insert(char16_t('_'), 0);
+        abi.Insert(osTarget, 0);
+      }
+    }
+  }
+
+  nsAutoString osVersion;
+#if defined(MOZ_WIDGET_GTK)
+  nsTextFormatter::ssprintf(osVersion, u"%ld.%ld", gtk_major_version,
+                            gtk_minor_version);
+#endif
+
+  if (XRE_IsContentProcess()) {
+    process = kContent;
+  } else {
+    process = kMain;
+  }
+
+  char* token;
+  char* newline = aBuf;
+  uint32_t line = 0;
+
+  while (*newline) {
+    while (*newline && IsNewline(*newline)) {
+      ++newline;
+      ++line;
+    }
+    if (!*newline) {
+      break;
+    }
+
+    token = newline;
+    while (*newline && !IsNewline(*newline)) {
+      ++newline;
+    }
+
+    if (*newline) {
+      *newline = '\0';
+      ++newline;
+    }
+    ++line;
+
+    if (*token == '#') {  
+      continue;
+    }
+
+    char* whitespace = token;
+    token = nsCRT::strtok(whitespace, kWhitespace, &whitespace);
+    if (!token) {
+      continue;
+    }
+
+    const ManifestDirective* directive = nullptr;
+    for (const ManifestDirective* d = kParsingTable;
+         d < std::end(kParsingTable); ++d) {
+      if (!strcmp(d->directive, token)) {
+        directive = d;
+        break;
+      }
+    }
+
+    if (!directive) {
+      LogMessageWithContext(
+          aFile, line, "Ignoring unrecognized chrome manifest directive '%s'.",
+          token);
+      continue;
+    }
+
+    NS_ASSERTION(directive->argc < 4, "Need to reset argv array length");
+    char* argv[4];
+    for (int i = 0; i < directive->argc; ++i) {
+      argv[i] = nsCRT::strtok(whitespace, kWhitespace, &whitespace);
+    }
+
+    if (!argv[directive->argc - 1]) {
+      LogMessageWithContext(aFile, line,
+                            "Not enough arguments for chrome manifest "
+                            "directive '%s', expected %i.",
+                            token, directive->argc);
+      continue;
+    }
+
+    bool ok = true;
+    TriState stAppVersion = eUnspecified;
+    TriState stGeckoVersion = eUnspecified;
+    TriState stApp = eUnspecified;
+    TriState stOsVersion = eUnspecified;
+    TriState stOs = eUnspecified;
+    TriState stABI = eUnspecified;
+    TriState stProcess = eUnspecified;
+#if defined(MOZ_BACKGROUNDTASKS)
+    TriState stBackgroundTask = (BackgroundTasks::IsBackgroundTaskMode() &&
+                                 strcmp("category", directive->directive) == 0)
+                                    ? eBad
+                                    : eUnspecified;
+#endif
+    int flags = 0;
+
+    while ((token = nsCRT::strtok(whitespace, kWhitespace, &whitespace)) &&
+           ok) {
+      ToLowerCase(token);
+      NS_ConvertASCIItoUTF16 wtoken(token);
+
+      if (CheckStringFlag(kApplication, wtoken, appID, stApp) ||
+          CheckOsFlag(kOs, wtoken, osTarget, stOs) ||
+          CheckStringFlag(kABI, wtoken, abi, stABI) ||
+          CheckStringFlag(kProcess, wtoken, process, stProcess) ||
+          CheckVersionFlag(kOsVersion, wtoken, osVersion, stOsVersion) ||
+          CheckVersionFlag(kAppVersion, wtoken, appVersion, stAppVersion) ||
+          CheckVersionFlag(kGeckoVersion, wtoken, geckoVersion,
+                           stGeckoVersion)) {
+        continue;
+      }
+
+
+      bool flag;
+      if (CheckFlag(kBackgroundTask, wtoken, flag)) {
+#if defined(MOZ_BACKGROUNDTASKS)
+        stBackgroundTask =
+            (flag == BackgroundTasks::IsBackgroundTaskMode()) ? eOK : eBad;
+#endif
+        continue;
+      }
+
+      if (directive->contentflags) {
+        bool flag;
+        if (CheckFlag(kContentAccessible, wtoken, flag)) {
+          if (flag) flags |= nsChromeRegistry::CONTENT_ACCESSIBLE;
+          continue;
+        }
+      }
+
+      bool xpcNativeWrappers = true;  
+      if (CheckFlag(kXPCNativeWrappers, wtoken, xpcNativeWrappers)) {
+        LogMessageWithContext(
+            aFile, line, "Ignoring obsolete chrome registration modifier '%s'.",
+            token);
+        continue;
+      }
+
+      LogMessageWithContext(
+          aFile, line, "Unrecognized chrome manifest modifier '%s'.", token);
+      ok = false;
+    }
+
+    if (!ok || stApp == eBad || stAppVersion == eBad ||
+        stGeckoVersion == eBad || stOs == eBad || stOsVersion == eBad ||
+#if defined(MOZ_BACKGROUNDTASKS)
+        stBackgroundTask == eBad ||
+#endif
+        stABI == eBad || stProcess == eBad) {
+      continue;
+    }
+
+    if (directive->regfunc) {
+      if (GeckoProcessType_Default != XRE_GetProcessType()) {
+        continue;
+      }
+
+      if (!nsChromeRegistry::gChromeRegistry) {
+        nsCOMPtr<nsIChromeRegistry> cr = mozilla::services::GetChromeRegistry();
+        if (!nsChromeRegistry::gChromeRegistry) {
+          LogMessageWithContext(aFile, line,
+                                "Chrome registry isn't available yet.");
+          continue;
+        }
+      }
+
+      (nsChromeRegistry::gChromeRegistry->*(directive->regfunc))(chromecx, line,
+                                                                 argv, flags);
+    } else if (directive->ischrome || !aChromeOnly) {
+      (nsComponentManagerImpl::gComponentManager->*(directive->mgrfunc))(
+          mgrcx, line, argv);
+    }
+  }
+}

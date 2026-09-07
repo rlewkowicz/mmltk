@@ -1,0 +1,97 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "FormatZstd.h"
+
+#include "BaseAlgorithms.h"
+#include "mozilla/dom/TransformStreamDefaultController.h"
+#include "zstd/zstd.h"
+
+namespace mozilla::dom::compression {
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED(ZstdDecompressionStreamAlgorithms,
+                                   TransformerAlgorithmsBase)
+NS_IMPL_ADDREF_INHERITED(ZstdDecompressionStreamAlgorithms,
+                         TransformerAlgorithmsBase)
+NS_IMPL_RELEASE_INHERITED(ZstdDecompressionStreamAlgorithms,
+                          TransformerAlgorithmsBase)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(ZstdDecompressionStreamAlgorithms)
+NS_INTERFACE_MAP_END_INHERITING(TransformerAlgorithmsBase)
+
+Result<already_AddRefed<ZstdDecompressionStreamAlgorithms>, nsresult>
+ZstdDecompressionStreamAlgorithms::Create() {
+  RefPtr<ZstdDecompressionStreamAlgorithms> alg =
+      new ZstdDecompressionStreamAlgorithms();
+  MOZ_TRY(alg->Init());
+  return alg.forget();
+}
+
+[[nodiscard]] nsresult ZstdDecompressionStreamAlgorithms::Init() {
+  mDStream = ZSTD_createDStream();
+  if (!mDStream) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+
+  static const uint8_t WINDOW_LOG_MAX = 23;
+  ZSTD_DCtx_setParameter(mDStream, ZSTD_d_windowLogMax, WINDOW_LOG_MAX);
+
+  return NS_OK;
+}
+
+bool ZstdDecompressionStreamAlgorithms::Decompress(
+    JSContext* aCx, Span<const uint8_t> aInput,
+    JS::MutableHandleVector<JSObject*> aOutput, Flush aFlush,
+    ErrorResult& aRv) {
+  ZSTD_inBuffer inBuffer = { const_cast<uint8_t*>(aInput.Elements()),
+                             aInput.Length(),
+                             0};
+
+  while (inBuffer.pos < inBuffer.size && !mObservedStreamEnd) {
+    UniquePtr<uint8_t[], JS::FreePolicy> buffer(
+        static_cast<uint8_t*>(JS_malloc(aCx, kBufferSize)));
+    if (!buffer) {
+      aRv.ThrowTypeError("Out of memory");
+      return false;
+    }
+
+    ZSTD_outBuffer outBuffer = { buffer.get(),
+                                 kBufferSize,
+                                 0};
+
+    size_t rv = ZSTD_decompressStream(mDStream, &outBuffer, &inBuffer);
+    if (ZSTD_isError(rv)) {
+      aRv.ThrowTypeError("zstd decompression error: "_ns +
+                         nsDependentCString(ZSTD_getErrorName(rv)));
+      return false;
+    }
+
+    if (rv == 0) {
+      mObservedStreamEnd = true;
+    }
+
+
+
+    size_t written = outBuffer.pos;
+    if (written > 0) {
+      JS::Rooted<JSObject*> view(aCx, nsJSUtils::MoveBufferAsUint8Array(
+                                          aCx, written, std::move(buffer)));
+      if (!view || !aOutput.append(view)) {
+        JS_ClearPendingException(aCx);
+        aRv.ThrowTypeError("Out of memory");
+        return false;
+      }
+    }
+  }
+
+  return inBuffer.pos == inBuffer.size;
+}
+
+ZstdDecompressionStreamAlgorithms::~ZstdDecompressionStreamAlgorithms() {
+  if (mDStream) {
+    ZSTD_freeDStream(mDStream);
+    mDStream = nullptr;
+  }
+}
+
+}  

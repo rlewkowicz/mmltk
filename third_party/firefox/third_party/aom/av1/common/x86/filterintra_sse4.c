@@ -1,0 +1,274 @@
+/*
+ * Copyright (c) 2018, Alliance for Open Media. All rights reserved.
+ *
+ * This source code is subject to the terms of the BSD 2 Clause License and
+ * the Alliance for Open Media Patent License 1.0. If the BSD 2 Clause License
+ * was not distributed with this source code in the LICENSE file, you can
+ * obtain it at www.aomedia.org/license/software. If the Alliance for Open
+ * Media Patent License 1.0 was not distributed with this source code in the
+ * PATENTS file, you can obtain it at www.aomedia.org/license/patent.
+ */
+
+#include <assert.h>
+#include <smmintrin.h>
+#include <string.h>
+
+#include "config/av1_rtcd.h"
+
+#include "aom_dsp/x86/synonyms.h"
+#include "av1/common/enums.h"
+#include "av1/common/reconintra.h"
+
+
+#define DUPLICATE_FIRST_HALF 0x44
+
+static inline void filter_4x2_sse4_1(uint8_t *dst, const ptrdiff_t stride,
+                                     const __m128i *pixels,
+                                     const __m128i *taps_0_1,
+                                     const __m128i *taps_2_3,
+                                     const __m128i *taps_4_5,
+                                     const __m128i *taps_6_7) {
+  const __m128i mul_0_01 = _mm_maddubs_epi16(*pixels, *taps_0_1);
+  const __m128i mul_0_23 = _mm_maddubs_epi16(*pixels, *taps_2_3);
+  __m128i output_half = _mm_hadd_epi16(mul_0_01, mul_0_23);
+  __m128i output = _mm_hadd_epi16(output_half, output_half);
+  const __m128i output_row0 =
+      _mm_packus_epi16(xx_roundn_epi16_unsigned(output, 4),
+                        output);
+  xx_storel_32(dst, output_row0);
+  const __m128i mul_1_01 = _mm_maddubs_epi16(*pixels, *taps_4_5);
+  const __m128i mul_1_23 = _mm_maddubs_epi16(*pixels, *taps_6_7);
+  output_half = _mm_hadd_epi16(mul_1_01, mul_1_23);
+  output = _mm_hadd_epi16(output_half, output_half);
+  const __m128i output_row1 =
+      _mm_packus_epi16(xx_roundn_epi16_unsigned(output, 4),
+                        output);
+  xx_storel_32(dst + stride, output_row1);
+}
+
+static inline void filter_4xh(uint8_t *dest, ptrdiff_t stride,
+                              const uint8_t *const top_ptr,
+                              const uint8_t *const left_ptr, int mode,
+                              const int height) {
+  const __m128i taps_0_1 = xx_load_128(av1_filter_intra_taps[mode][0]);
+  const __m128i taps_2_3 = xx_load_128(av1_filter_intra_taps[mode][2]);
+  const __m128i taps_4_5 = xx_load_128(av1_filter_intra_taps[mode][4]);
+  const __m128i taps_6_7 = xx_load_128(av1_filter_intra_taps[mode][6]);
+  __m128i top = xx_loadl_32(top_ptr - 1);
+  __m128i pixels = _mm_insert_epi8(top, (int8_t)top_ptr[3], 4);
+  __m128i left = (height == 4 ? xx_loadl_32(left_ptr) : xx_loadl_64(left_ptr));
+  left = _mm_slli_si128(left, 5);
+
+  pixels = _mm_or_si128(left, pixels);
+
+  pixels = _mm_shuffle_epi32(pixels, DUPLICATE_FIRST_HALF);
+  filter_4x2_sse4_1(dest, stride, &pixels, &taps_0_1, &taps_2_3, &taps_4_5,
+                    &taps_6_7);
+  dest += stride;  
+  pixels = xx_loadl_32(dest);
+
+  pixels = _mm_or_si128(left, pixels);
+
+  const int64_t kInsertTopLeftFirstMask = 0x0F08070302010006;
+
+  const __m128i pixel_order1 = _mm_set1_epi64x(kInsertTopLeftFirstMask);
+  pixels = _mm_shuffle_epi8(pixels, pixel_order1);
+  dest += stride;  
+  filter_4x2_sse4_1(dest, stride, &pixels, &taps_0_1, &taps_2_3, &taps_4_5,
+                    &taps_6_7);
+  dest += stride;  
+
+  if (height == 16) {
+    left = _mm_slli_si128(left, 1);
+    pixels = xx_loadl_32(dest);
+
+    pixels = _mm_or_si128(left, pixels);
+
+    const int64_t kInsertTopLeftSecondMask = 0x0F0B0A0302010009;
+
+    const __m128i pixel_order2 = _mm_set1_epi64x(kInsertTopLeftSecondMask);
+    pixels = _mm_shuffle_epi8(pixels, pixel_order2);
+    dest += stride;  
+
+    filter_4x2_sse4_1(dest, stride, &pixels, &taps_0_1, &taps_2_3, &taps_4_5,
+                      &taps_6_7);
+
+    __m128i keep_top_left = _mm_srli_si128(left, 13);
+    dest += stride;  
+    pixels = xx_loadl_32(dest);
+    left = _mm_srli_si128(left, 2);
+
+    pixels = _mm_or_si128(left, pixels);
+    left = xx_loadl_64(left_ptr + 8);
+
+    pixels = _mm_shuffle_epi8(pixels, pixel_order2);
+    dest += stride;  
+
+    filter_4x2_sse4_1(dest, stride, &pixels, &taps_0_1, &taps_2_3, &taps_4_5,
+                      &taps_6_7);
+
+    keep_top_left = _mm_slli_si128(keep_top_left, 6);
+    dest += stride;  
+    pixels = xx_loadl_32(dest);
+    left = _mm_slli_si128(left, 7);
+    left = _mm_or_si128(left, keep_top_left);
+
+    pixels = _mm_or_si128(left, pixels);
+    pixels = _mm_shuffle_epi8(pixels, pixel_order1);
+    dest += stride;  
+
+    filter_4x2_sse4_1(dest, stride, &pixels, &taps_0_1, &taps_2_3, &taps_4_5,
+                      &taps_6_7);
+    dest += stride;  
+
+    pixels = xx_loadl_32(dest);
+    left = _mm_srli_si128(left, 2);
+
+    pixels = _mm_or_si128(left, pixels);
+    pixels = _mm_shuffle_epi8(pixels, pixel_order1);
+    dest += stride;  
+
+    filter_4x2_sse4_1(dest, stride, &pixels, &taps_0_1, &taps_2_3, &taps_4_5,
+                      &taps_6_7);
+    dest += stride;  
+  }
+
+  if (height > 4) {
+    left = _mm_srli_si128(left, 8);
+    left = _mm_slli_si128(left, 6);
+    pixels = xx_loadl_32(dest);
+
+    pixels = _mm_or_si128(left, pixels);
+    pixels = _mm_shuffle_epi8(pixels, pixel_order1);
+    dest += stride;  
+
+    filter_4x2_sse4_1(dest, stride, &pixels, &taps_0_1, &taps_2_3, &taps_4_5,
+                      &taps_6_7);
+    dest += stride;  
+    pixels = xx_loadl_32(dest);
+    left = _mm_srli_si128(left, 2);
+
+    pixels = _mm_or_si128(left, pixels);
+    pixels = _mm_shuffle_epi8(pixels, pixel_order1);
+    dest += stride;  
+
+    filter_4x2_sse4_1(dest, stride, &pixels, &taps_0_1, &taps_2_3, &taps_4_5,
+                      &taps_6_7);
+  }
+}
+
+static inline void filter_intra_predictor_sse4_1(void *const dest,
+                                                 ptrdiff_t stride,
+                                                 const void *const top_row,
+                                                 const void *const left_column,
+                                                 int mode, const int width,
+                                                 const int height) {
+  const uint8_t *const top_ptr = (const uint8_t *)top_row;
+  const uint8_t *const left_ptr = (const uint8_t *)left_column;
+  uint8_t *dst = (uint8_t *)dest;
+  if (width == 4) {
+    filter_4xh(dst, stride, top_ptr, left_ptr, mode, height);
+    return;
+  }
+
+  const __m128i taps_0_1 = xx_load_128(av1_filter_intra_taps[mode][0]);
+  const __m128i taps_2_3 = xx_load_128(av1_filter_intra_taps[mode][2]);
+  const __m128i taps_4_5 = xx_load_128(av1_filter_intra_taps[mode][4]);
+  const __m128i taps_6_7 = xx_load_128(av1_filter_intra_taps[mode][6]);
+
+  const int64_t kCondenseLeftMask = 0x0F09080403020100;
+
+  const __m128i pixel_order1 = _mm_set1_epi64x(kCondenseLeftMask);
+
+  const int64_t kInsertTopLeftMask = 0x0F0A090302010008;
+
+  const __m128i pixel_order2 = _mm_set1_epi64x(kInsertTopLeftMask);
+
+  __m128i pixels = xx_loadl_64(top_ptr - 1);
+  __m128i left = _mm_slli_si128(xx_loadl_32(left_column), 8);
+  pixels = _mm_or_si128(pixels, left);
+
+  pixels = _mm_shuffle_epi8(pixels, pixel_order1);
+  filter_4x2_sse4_1(dst, stride, &pixels, &taps_0_1, &taps_2_3, &taps_4_5,
+                    &taps_6_7);
+  left = _mm_srli_si128(left, 1);
+
+  pixels = xx_loadl_32(dst + stride);
+
+  pixels = _mm_or_si128(pixels, left);
+  pixels = _mm_shuffle_epi8(pixels, pixel_order2);
+  const ptrdiff_t stride2 = stride << 1;
+  const ptrdiff_t stride4 = stride << 2;
+  filter_4x2_sse4_1(dst + stride2, stride, &pixels, &taps_0_1, &taps_2_3,
+                    &taps_4_5, &taps_6_7);
+  dst += 4;
+  for (int x = 3; x < width - 4; x += 4) {
+    pixels = xx_loadl_32(top_ptr + x);
+    pixels = _mm_insert_epi8(pixels, (int8_t)top_ptr[x + 4], 4);
+    pixels = _mm_insert_epi8(pixels, (int8_t)dst[-1], 5);
+    pixels = _mm_insert_epi8(pixels, (int8_t)dst[stride - 1], 6);
+
+    pixels = _mm_shuffle_epi32(pixels, DUPLICATE_FIRST_HALF);
+    filter_4x2_sse4_1(dst, stride, &pixels, &taps_0_1, &taps_2_3, &taps_4_5,
+                      &taps_6_7);
+    pixels = xx_loadl_32(dst + stride - 1);
+    pixels = _mm_insert_epi8(pixels, (int8_t)dst[stride + 3], 4);
+    pixels = _mm_insert_epi8(pixels, (int8_t)dst[stride2 - 1], 5);
+    pixels = _mm_insert_epi8(pixels, (int8_t)dst[stride + stride2 - 1], 6);
+
+    pixels = _mm_shuffle_epi32(pixels, DUPLICATE_FIRST_HALF);
+    filter_4x2_sse4_1(dst + stride2, stride, &pixels, &taps_0_1, &taps_2_3,
+                      &taps_4_5, &taps_6_7);
+    dst += 4;
+  }
+
+  for (int y = 4; y < height; y += 4) {
+    dst -= width;
+    dst += stride4;
+
+    pixels = xx_loadl_32(dst - stride);
+    left = _mm_slli_si128(xx_loadl_32(left_ptr + y - 1), 8);
+    left = _mm_insert_epi8(left, (int8_t)left_ptr[y + 3], 12);
+    pixels = _mm_or_si128(pixels, left);
+    pixels = _mm_shuffle_epi8(pixels, pixel_order2);
+    filter_4x2_sse4_1(dst, stride, &pixels, &taps_0_1, &taps_2_3, &taps_4_5,
+                      &taps_6_7);
+
+    left = _mm_srli_si128(left, 2);
+    pixels = xx_loadl_32(dst + stride);
+    pixels = _mm_or_si128(pixels, left);
+    pixels = _mm_shuffle_epi8(pixels, pixel_order2);
+    filter_4x2_sse4_1(dst + stride2, stride, &pixels, &taps_0_1, &taps_2_3,
+                      &taps_4_5, &taps_6_7);
+
+    dst += 4;
+
+    for (int x = 4; x < width; x += 4) {
+      pixels = xx_loadl_32(dst - stride - 1);
+      pixels = _mm_insert_epi8(pixels, (int8_t)dst[-stride + 3], 4);
+      pixels = _mm_insert_epi8(pixels, (int8_t)dst[-1], 5);
+      pixels = _mm_insert_epi8(pixels, (int8_t)dst[stride - 1], 6);
+
+      pixels = _mm_shuffle_epi32(pixels, DUPLICATE_FIRST_HALF);
+      filter_4x2_sse4_1(dst, stride, &pixels, &taps_0_1, &taps_2_3, &taps_4_5,
+                        &taps_6_7);
+      pixels = xx_loadl_32(dst + stride - 1);
+      pixels = _mm_insert_epi8(pixels, (int8_t)dst[stride + 3], 4);
+      pixels = _mm_insert_epi8(pixels, (int8_t)dst[stride2 - 1], 5);
+      pixels = _mm_insert_epi8(pixels, (int8_t)dst[stride2 + stride - 1], 6);
+
+      pixels = _mm_shuffle_epi32(pixels, DUPLICATE_FIRST_HALF);
+      filter_4x2_sse4_1(dst + stride2, stride, &pixels, &taps_0_1, &taps_2_3,
+                        &taps_4_5, &taps_6_7);
+      dst += 4;
+    }
+  }
+}
+
+void av1_filter_intra_predictor_sse4_1(uint8_t *dst, ptrdiff_t stride,
+                                       TX_SIZE tx_size, const uint8_t *above,
+                                       const uint8_t *left, int mode) {
+  const int bw = tx_size_wide[tx_size];
+  const int bh = tx_size_high[tx_size];
+  filter_intra_predictor_sse4_1(dst, stride, above, left, mode, bw, bh);
+}

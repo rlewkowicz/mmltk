@@ -1,0 +1,94 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_AnimationEffect_h
+#define mozilla_dom_AnimationEffect_h
+
+#include "mozilla/ComputedTiming.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/TimingParams.h"
+#include "mozilla/dom/Animation.h"
+#include "mozilla/dom/Nullable.h"
+#include "mozilla/dom/ScrollTimeline.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsWrapperCache.h"
+
+namespace mozilla {
+class ErrorResult;
+
+namespace dom {
+
+class KeyframeEffect;
+struct ComputedEffectTiming;
+struct EffectTiming;
+struct OptionalEffectTiming;
+class Document;
+
+class AnimationEffect : public nsISupports, public nsWrapperCache {
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(AnimationEffect)
+
+  AnimationEffect(Document* aDocument, TimingParams&& aTiming);
+
+  virtual KeyframeEffect* AsKeyframeEffect() { return nullptr; }
+
+  nsISupports* GetParentObject() const;
+
+  bool IsCurrent() const;
+  bool IsInEffect() const;
+  bool HasFiniteActiveDuration() const {
+    return NormalizedTiming().ActiveDuration() != TimeDuration::Forever();
+  }
+
+  virtual void GetTiming(EffectTiming& aRetVal) const;
+  virtual void GetComputedTimingAsDict(ComputedEffectTiming& aRetVal) const;
+  virtual void UpdateTiming(const OptionalEffectTiming& aTiming,
+                            ErrorResult& aRv);
+
+  const TimingParams& SpecifiedTiming() const { return mTiming; }
+  void SetSpecifiedTiming(TimingParams&& aTiming);
+
+  const TimingParams& NormalizedTiming() const {
+    MOZ_ASSERT((mAnimation && mAnimation->UsingScrollTimeline() &&
+                mNormalizedTiming) ||
+                   !mNormalizedTiming,
+               "We do normalization only for progress-based timeline");
+    return mNormalizedTiming ? *mNormalizedTiming : mTiming;
+  }
+
+  void UpdateNormalizedTiming();
+
+  static ComputedTiming GetComputedTimingAt(
+      const Nullable<TimeDuration>& aLocalTime, const TimingParams& aTiming,
+      double aPlaybackRate,
+      Animation::ProgressTimelinePosition aProgressTimelinePosition,
+      EndpointBehavior aEndpointBehavior = EndpointBehavior::Exclusive);
+  ComputedTiming GetComputedTiming(
+      const TimingParams* aTiming = nullptr,
+      EndpointBehavior aEndpointBehavior = EndpointBehavior::Exclusive) const;
+
+  virtual void SetAnimation(Animation* aAnimation) = 0;
+  Animation* GetAnimation() const { return mAnimation; };
+
+  virtual bool AffectsGeometry() const = 0;
+
+ protected:
+  virtual ~AnimationEffect();
+
+  Nullable<TimeDuration> GetLocalTime() const;
+
+ protected:
+  RefPtr<Document> mDocument;
+  RefPtr<Animation> mAnimation;
+  TimingParams mTiming;
+  Maybe<TimingParams> mNormalizedTiming;
+
+  enum RTPCallerType mRTPCallerType;
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_AnimationEffect_h

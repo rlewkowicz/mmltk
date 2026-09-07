@@ -1,0 +1,68 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_mediaplaybackdelaypolicy_h_
+#define mozilla_dom_mediaplaybackdelaypolicy_h_
+
+#include "AudioChannelAgent.h"
+#include "AudioChannelService.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/RefPtr.h"
+#include "nsISupportsImpl.h"
+
+typedef uint32_t SuspendTypes;
+
+namespace mozilla::dom {
+
+class HTMLMediaElement;
+class ResumeDelayedPlaybackAgent {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(ResumeDelayedPlaybackAgent);
+  ResumeDelayedPlaybackAgent() = default;
+
+  using ResumePromise = MozPromise<bool, bool, true >;
+  RefPtr<ResumePromise> GetResumePromise();
+  void UpdateAudibleState(const HTMLMediaElement* aElement, bool aIsAudible);
+
+ private:
+  friend class MediaPlaybackDelayPolicy;
+
+  ~ResumeDelayedPlaybackAgent();
+  bool InitDelegate(const HTMLMediaElement* aElement, bool aIsAudible);
+
+  class ResumePlayDelegate final : public nsIAudioChannelAgentCallback {
+   public:
+    NS_DECL_ISUPPORTS
+
+    ResumePlayDelegate() = default;
+
+    bool Init(const HTMLMediaElement* aElement, bool aIsAudible);
+    void UpdateAudibleState(const HTMLMediaElement* aElement, bool aIsAudible);
+    RefPtr<ResumePromise> GetResumePromise();
+    void Clear();
+
+    NS_IMETHODIMP WindowVolumeChanged(float aVolume, bool aMuted) override;
+    NS_IMETHODIMP WindowAudioCaptureChanged(bool aCapture) override;
+    NS_IMETHODIMP WindowSuspendChanged(SuspendTypes aSuspend) override;
+
+   private:
+    virtual ~ResumePlayDelegate();
+
+    MozPromiseHolder<ResumePromise> mPromise;
+    RefPtr<AudioChannelAgent> mAudioChannelAgent;
+  };
+
+  RefPtr<ResumePlayDelegate> mDelegate;
+};
+
+class MediaPlaybackDelayPolicy {
+ public:
+  static bool ShouldDelayPlayback(const HTMLMediaElement* aElement);
+  static RefPtr<ResumeDelayedPlaybackAgent> CreateResumeDelayedPlaybackAgent(
+      const HTMLMediaElement* aElement, bool aIsAudible);
+};
+
+}  
+
+#endif

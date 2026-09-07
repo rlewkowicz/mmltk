@@ -1,0 +1,607 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsError.h"
+#include "nsIAsyncShutdown.h"
+#include "nsUserIdleService.h"
+#include "nsString.h"
+#include "nsIObserverService.h"
+#include "nsDebug.h"
+#include "nsCOMArray.h"
+#include "nsXULAppAPI.h"
+#include "prinrval.h"
+#include "mozilla/Logging.h"
+#include "prtime.h"
+#include "mozilla/AppShutdown.h"
+#include "mozilla/dom/ContentChild.h"
+#include "mozilla/Services.h"
+#include "mozilla/Preferences.h"
+#include <algorithm>
+
+
+using namespace mozilla;
+
+#define DAILY_SIGNIFICANT_IDLE_SERVICE_SEC (3 * 60)
+
+#define DAILY_SHORTENED_IDLE_SERVICE_SEC 60
+
+#define PREF_LAST_DAILY "idle.lastDailyNotification"
+
+#define SECONDS_PER_DAY 86400
+
+static LazyLogModule sLog("idleService");
+
+#define LOG_TAG "GeckoIdleService"
+#define LOG_LEVEL ANDROID_LOG_DEBUG
+
+class IdleListenerComparator {
+ public:
+  bool Equals(IdleListener a, IdleListener b) const {
+    return (a.observer == b.observer) && (a.reqIdleTime == b.reqIdleTime);
+  }
+};
+
+
+NS_IMPL_ISUPPORTS(nsUserIdleServiceDaily, nsIObserver, nsISupportsWeakReference)
+
+NS_IMETHODIMP
+nsUserIdleServiceDaily::Observe(nsISupports*, const char* aTopic,
+                                const char16_t*) {
+  auto shutdownInProgress =
+      AppShutdown::IsInOrBeyond(ShutdownPhase::AppShutdownConfirmed);
+  MOZ_LOG(sLog, LogLevel::Debug,
+          ("nsUserIdleServiceDaily: Observe '%s' (%d)", aTopic,
+           shutdownInProgress));
+
+  if (shutdownInProgress || strcmp(aTopic, OBSERVER_TOPIC_ACTIVE) == 0) {
+    return NS_OK;
+  }
+  MOZ_ASSERT(strcmp(aTopic, OBSERVER_TOPIC_IDLE) == 0);
+
+  MOZ_LOG(sLog, LogLevel::Debug,
+          ("nsUserIdleServiceDaily: Notifying idle-daily observers"));
+
+  nsCOMPtr<nsIObserverService> observerService =
+      mozilla::services::GetObserverService();
+  NS_ENSURE_STATE(observerService);
+  (void)observerService->NotifyObservers(nullptr, OBSERVER_TOPIC_IDLE_DAILY,
+                                         nullptr);
+
+  nsCOMArray<nsIObserver> entries;
+  mCategoryObservers.GetEntries(entries);
+  for (int32_t i = 0; i < entries.Count(); ++i) {
+    (void)entries[i]->Observe(nullptr, OBSERVER_TOPIC_IDLE_DAILY, nullptr);
+  }
+
+  (void)mIdleService->RemoveIdleObserver(this, mIdleDailyTriggerWait);
+
+  int32_t nowSec = static_cast<int32_t>(PR_Now() / PR_USEC_PER_SEC);
+  Preferences::SetInt(PREF_LAST_DAILY, nowSec);
+
+  nsIPrefService* prefs = Preferences::GetService();
+  if (prefs) {
+    prefs->SavePrefFile(nullptr);
+  }
+
+  MOZ_LOG(
+      sLog, LogLevel::Debug,
+      ("nsUserIdleServiceDaily: Storing last idle time as %d sec.", nowSec));
+
+  mExpectedTriggerTime =
+      PR_Now() + ((PRTime)SECONDS_PER_DAY * (PRTime)PR_USEC_PER_SEC);
+
+  MOZ_LOG(sLog, LogLevel::Debug,
+          ("nsUserIdleServiceDaily: Restarting daily timer"));
+
+  (void)mTimer->InitWithNamedFuncCallback(
+      DailyCallback, this, SECONDS_PER_DAY * PR_MSEC_PER_SEC,
+      nsITimer::TYPE_ONE_SHOT, "nsUserIdleServiceDaily::Observe"_ns);
+
+  return NS_OK;
+}
+
+nsUserIdleServiceDaily::nsUserIdleServiceDaily(nsIUserIdleService* aIdleService)
+    : mIdleService(aIdleService),
+      mTimer(NS_NewTimer()),
+      mCategoryObservers(OBSERVER_TOPIC_IDLE_DAILY),
+      mExpectedTriggerTime(0),
+      mIdleDailyTriggerWait(DAILY_SIGNIFICANT_IDLE_SERVICE_SEC) {}
+
+void nsUserIdleServiceDaily::Init() {
+
+  int32_t lastDaily = Preferences::GetInt(PREF_LAST_DAILY, 0);
+  if (lastDaily == -1) {
+    MOZ_LOG(sLog, LogLevel::Debug,
+            ("nsUserIdleServiceDaily: Init: disabled idle-daily"));
+    return;
+  }
+
+  int32_t nowSec = static_cast<int32_t>(PR_Now() / PR_USEC_PER_SEC);
+  if (lastDaily < 0 || lastDaily > nowSec) {
+    lastDaily = 0;
+  }
+  int32_t secondsSinceLastDaily = nowSec - lastDaily;
+
+  MOZ_LOG(sLog, LogLevel::Debug,
+          ("nsUserIdleServiceDaily: Init: seconds since last daily: %d",
+           secondsSinceLastDaily));
+
+  if (secondsSinceLastDaily > SECONDS_PER_DAY) {
+    bool hasBeenLongWait =
+        (lastDaily && (secondsSinceLastDaily > (SECONDS_PER_DAY * 2)));
+
+    MOZ_LOG(
+        sLog, LogLevel::Debug,
+        ("nsUserIdleServiceDaily: has been long wait? %d", hasBeenLongWait));
+
+    StageIdleDaily(hasBeenLongWait);
+  } else {
+    MOZ_LOG(sLog, LogLevel::Debug,
+            ("nsUserIdleServiceDaily: Setting timer a day from now"));
+
+    int32_t milliSecLeftUntilDaily =
+        (SECONDS_PER_DAY - secondsSinceLastDaily) * PR_MSEC_PER_SEC;
+
+    MOZ_LOG(sLog, LogLevel::Debug,
+            ("nsUserIdleServiceDaily: Seconds till next timeout: %d",
+             (SECONDS_PER_DAY - secondsSinceLastDaily)));
+
+    mExpectedTriggerTime =
+        PR_Now() + (milliSecLeftUntilDaily * PR_USEC_PER_MSEC);
+
+    (void)mTimer->InitWithNamedFuncCallback(
+        DailyCallback, this, milliSecLeftUntilDaily, nsITimer::TYPE_ONE_SHOT,
+        "nsUserIdleServiceDaily::Init"_ns);
+  }
+}
+
+nsUserIdleServiceDaily::~nsUserIdleServiceDaily() {
+  if (mTimer) {
+    mTimer->Cancel();
+    mTimer = nullptr;
+  }
+}
+
+void nsUserIdleServiceDaily::StageIdleDaily(bool aHasBeenLongWait) {
+  NS_ASSERTION(mIdleService, "No idle service available?");
+  MOZ_LOG(sLog, LogLevel::Debug,
+          ("nsUserIdleServiceDaily: Registering Idle observer callback "
+           "(short wait requested? %d)",
+           aHasBeenLongWait));
+  mIdleDailyTriggerWait =
+      (aHasBeenLongWait ? DAILY_SHORTENED_IDLE_SERVICE_SEC
+                        : DAILY_SIGNIFICANT_IDLE_SERVICE_SEC);
+  (void)mIdleService->AddIdleObserver(this, mIdleDailyTriggerWait);
+}
+
+void nsUserIdleServiceDaily::DailyCallback(nsITimer* aTimer, void* aClosure) {
+  MOZ_LOG(sLog, LogLevel::Debug,
+          ("nsUserIdleServiceDaily: DailyCallback running"));
+
+  nsUserIdleServiceDaily* self = static_cast<nsUserIdleServiceDaily*>(aClosure);
+
+  PRTime now = PR_Now();
+  if (self->mExpectedTriggerTime && now < self->mExpectedTriggerTime) {
+    PRTime delayTime = self->mExpectedTriggerTime - now;
+
+    delayTime += 10 * PR_USEC_PER_MSEC;
+
+    MOZ_LOG(sLog, LogLevel::Debug,
+            ("nsUserIdleServiceDaily: DailyCallback resetting timer to %" PRId64
+             " msec",
+             delayTime / PR_USEC_PER_MSEC));
+
+    (void)self->mTimer->InitWithNamedFuncCallback(
+        DailyCallback, self, delayTime / PR_USEC_PER_MSEC,
+        nsITimer::TYPE_ONE_SHOT, "nsUserIdleServiceDaily::DailyCallback"_ns);
+    return;
+  }
+
+  self->StageIdleDaily(false);
+}
+
+
+
+namespace {
+nsUserIdleService* gIdleService;
+}  
+
+already_AddRefed<nsUserIdleService> nsUserIdleService::GetInstance() {
+  RefPtr<nsUserIdleService> instance(gIdleService);
+  return instance.forget();
+}
+
+class UserIdleBlocker final : public nsIAsyncShutdownBlocker {
+  ~UserIdleBlocker() = default;
+
+ public:
+  explicit UserIdleBlocker() = default;
+
+  NS_IMETHOD
+  GetName(nsAString& aNameOut) override {
+    aNameOut = nsLiteralString(u"UserIdleBlocker");
+    return NS_OK;
+  }
+
+  NS_IMETHOD
+  BlockShutdown(nsIAsyncShutdownClient* aClient) override {
+    if (gIdleService) {
+      gIdleService->SetDisabledForShutdown();
+    }
+    aClient->RemoveBlocker(this);
+    return NS_OK;
+  }
+
+  NS_IMETHOD
+  GetState(nsIPropertyBag**) override { return NS_OK; }
+
+  NS_DECL_ISUPPORTS
+};
+
+NS_IMPL_ISUPPORTS(UserIdleBlocker, nsIAsyncShutdownBlocker)
+
+nsUserIdleService::nsUserIdleService()
+    : mIdleObserverCount(0),
+      mDeltaToNextIdleSwitchInS(UINT32_MAX),
+      mLastUserInteraction(TimeStamp::Now()) {
+  MOZ_ASSERT(!gIdleService);
+  gIdleService = this;
+  if (XRE_IsParentProcess()) {
+    mDailyIdle = new nsUserIdleServiceDaily(this);
+    mDailyIdle->Init();
+  }
+  nsCOMPtr<nsIAsyncShutdownService> svc = services::GetAsyncShutdownService();
+  MOZ_ASSERT(svc);
+  nsCOMPtr<nsIAsyncShutdownClient> client;
+  auto rv = svc->GetAppShutdownConfirmed(getter_AddRefs(client));
+  if (NS_FAILED(rv)) {
+    rv = svc->GetXpcomWillShutdown(getter_AddRefs(client));
+  }
+  MOZ_ASSERT(NS_SUCCEEDED(rv));
+  client->AddBlocker(new UserIdleBlocker(),
+                     NS_LITERAL_STRING_FROM_CSTRING(__FILE__), __LINE__,
+                     u""_ns);
+}
+
+nsUserIdleService::~nsUserIdleService() {
+  if (mTimer) {
+    mTimer->Cancel();
+  }
+
+  MOZ_ASSERT(gIdleService == this);
+  gIdleService = nullptr;
+}
+
+NS_IMPL_ISUPPORTS(nsUserIdleService, nsIUserIdleService,
+                  nsIUserIdleServiceInternal)
+
+void nsUserIdleService::SetDisabledForShutdown() {
+  SetDisabled(true);
+  if (mTimer) {
+    mTimer->Cancel();
+    mTimer = nullptr;
+  }
+}
+
+NS_IMETHODIMP
+nsUserIdleService::AddIdleObserver(nsIObserver* aObserver,
+                                   uint32_t aIdleTimeInS) {
+  NS_ENSURE_ARG_POINTER(aObserver);
+  NS_ENSURE_ARG_RANGE(aIdleTimeInS, 1, (UINT32_MAX / 10) - 1);
+
+  if (XRE_IsContentProcess()) {
+    dom::ContentChild* cpc = dom::ContentChild::GetSingleton();
+    cpc->AddIdleObserver(aObserver, aIdleTimeInS);
+    return NS_OK;
+  }
+
+  MOZ_LOG(sLog, LogLevel::Debug,
+          ("idleService: Register idle observer %p for %d seconds", aObserver,
+           aIdleTimeInS));
+
+  IdleListener listener(aObserver, aIdleTimeInS);
+
+  mArrayListeners.AppendElement(listener);
+
+  if (!mTimer) {
+    mTimer = NS_NewTimer();
+    NS_ENSURE_TRUE(mTimer, NS_ERROR_OUT_OF_MEMORY);
+  }
+
+  if (mDeltaToNextIdleSwitchInS > aIdleTimeInS) {
+    MOZ_LOG(
+        sLog, LogLevel::Debug,
+        ("idleService: Register: adjusting next switch from %d to %d seconds",
+         mDeltaToNextIdleSwitchInS, aIdleTimeInS));
+
+    mDeltaToNextIdleSwitchInS = aIdleTimeInS;
+    ReconfigureTimer();
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsUserIdleService::RemoveIdleObserver(nsIObserver* aObserver,
+                                      uint32_t aTimeInS) {
+  NS_ENSURE_ARG_POINTER(aObserver);
+  NS_ENSURE_ARG(aTimeInS);
+
+  if (XRE_IsContentProcess()) {
+    dom::ContentChild* cpc = dom::ContentChild::GetSingleton();
+    cpc->RemoveIdleObserver(aObserver, aTimeInS);
+    return NS_OK;
+  }
+
+  IdleListener listener(aObserver, aTimeInS);
+
+  IdleListenerComparator c;
+  nsTArray<IdleListener>::index_type listenerIndex =
+      mArrayListeners.IndexOf(listener, 0, c);
+  if (listenerIndex != mArrayListeners.NoIndex) {
+    if (mArrayListeners.ElementAt(listenerIndex).isIdle) mIdleObserverCount--;
+    mArrayListeners.RemoveElementAt(listenerIndex);
+    MOZ_LOG(sLog, LogLevel::Debug,
+            ("idleService: Remove observer %p (%d seconds), %d remain idle",
+             aObserver, aTimeInS, mIdleObserverCount));
+    return NS_OK;
+  }
+
+  MOZ_LOG(sLog, LogLevel::Warning,
+          ("idleService: Failed to remove idle observer %p (%d seconds)",
+           aObserver, aTimeInS));
+  return NS_ERROR_FAILURE;
+}
+
+NS_IMETHODIMP
+nsUserIdleService::ResetIdleTimeOut(uint32_t idleDeltaInMS) {
+  MOZ_LOG(sLog, LogLevel::Debug,
+          ("idleService: Reset idle timeout (last interaction %u msec)",
+           idleDeltaInMS));
+
+  mLastUserInteraction =
+      TimeStamp::Now() - TimeDuration::FromMilliseconds(idleDeltaInMS);
+
+  if (mIdleObserverCount == 0) {
+    MOZ_LOG(sLog, LogLevel::Debug,
+            ("idleService: Reset idle timeout: no idle observers"));
+    return NS_OK;
+  }
+
+  nsCOMArray<nsIObserver> notifyList;
+  mDeltaToNextIdleSwitchInS = UINT32_MAX;
+
+  for (uint32_t i = 0; i < mArrayListeners.Length(); i++) {
+    IdleListener& curListener = mArrayListeners.ElementAt(i);
+
+    if (curListener.isIdle) {
+      notifyList.AppendObject(curListener.observer);
+      curListener.isIdle = false;
+    }
+
+    mDeltaToNextIdleSwitchInS =
+        std::min(mDeltaToNextIdleSwitchInS, curListener.reqIdleTime);
+  }
+
+  mIdleObserverCount = 0;
+
+  ReconfigureTimer();
+
+  int32_t numberOfPendingNotifications = notifyList.Count();
+
+  if (!numberOfPendingNotifications) {
+    return NS_OK;
+  }
+
+
+  nsAutoString timeStr;
+
+  timeStr.AppendInt((int32_t)(idleDeltaInMS / PR_MSEC_PER_SEC));
+
+  while (numberOfPendingNotifications--) {
+    MOZ_LOG(sLog, LogLevel::Debug,
+            ("idleService: Reset idle timeout: tell observer %p user is back",
+             notifyList[numberOfPendingNotifications]));
+    notifyList[numberOfPendingNotifications]->Observe(
+        this, OBSERVER_TOPIC_ACTIVE, timeStr.get());
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsUserIdleService::GetIdleTime(uint32_t* idleTime) {
+  if (!idleTime) {
+    return NS_ERROR_NULL_POINTER;
+  }
+
+  uint32_t polledIdleTimeMS;
+
+  bool polledIdleTimeIsValid = PollIdleTime(&polledIdleTimeMS);
+
+  MOZ_LOG(sLog, LogLevel::Debug,
+          ("idleService: Get idle time: polled %u msec, valid = %d",
+           polledIdleTimeMS, polledIdleTimeIsValid));
+
+  TimeDuration timeSinceReset = TimeStamp::Now() - mLastUserInteraction;
+  uint32_t timeSinceResetInMS = timeSinceReset.ToMilliseconds();
+
+  MOZ_LOG(sLog, LogLevel::Debug,
+          ("idleService: Get idle time: time since reset %u msec",
+           timeSinceResetInMS));
+
+  if (!polledIdleTimeIsValid) {
+    *idleTime = timeSinceResetInMS;
+    return NS_OK;
+  }
+
+  *idleTime = std::min(timeSinceResetInMS, polledIdleTimeMS);
+
+  return NS_OK;
+}
+
+bool nsUserIdleService::PollIdleTime(uint32_t* ) {
+  return false;
+}
+
+nsresult nsUserIdleService::GetDisabled(bool* aResult) {
+  *aResult = mDisabled;
+  return NS_OK;
+}
+
+nsresult nsUserIdleService::SetDisabled(bool aDisabled) {
+  mDisabled = aDisabled;
+  return NS_OK;
+}
+
+void nsUserIdleService::StaticIdleTimerCallback(nsITimer* aTimer,
+                                                void* aClosure) {
+  static_cast<nsUserIdleService*>(aClosure)->IdleTimerCallback();
+}
+
+void nsUserIdleService::IdleTimerCallback(void) {
+  mCurrentlySetToTimeoutAt = TimeStamp();
+
+  uint32_t lastIdleTimeInMS = static_cast<uint32_t>(
+      (TimeStamp::Now() - mLastUserInteraction).ToMilliseconds());
+  uint32_t currentIdleTimeInMS;
+
+  if (NS_FAILED(GetIdleTime(&currentIdleTimeInMS))) {
+    MOZ_LOG(sLog, LogLevel::Info,
+            ("idleService: Idle timer callback: failed to get idle time"));
+    return;
+  }
+
+  MOZ_LOG(sLog, LogLevel::Debug,
+          ("idleService: Idle timer callback: current idle time %u msec",
+           currentIdleTimeInMS));
+
+  if (lastIdleTimeInMS > currentIdleTimeInMS) {
+    ResetIdleTimeOut(currentIdleTimeInMS);
+
+  }
+
+  uint32_t currentIdleTimeInS = currentIdleTimeInMS / PR_MSEC_PER_SEC;
+
+  if (mDeltaToNextIdleSwitchInS > currentIdleTimeInS) {
+    ReconfigureTimer();
+    return;
+  }
+
+  if (mDisabled) {
+    MOZ_LOG(sLog, LogLevel::Info,
+            ("idleService: Skipping idle callback while disabled"));
+
+    ReconfigureTimer();
+    return;
+  }
+
+
+
+  mDeltaToNextIdleSwitchInS = UINT32_MAX;
+
+  nsCOMArray<nsIObserver> notifyList;
+
+  for (uint32_t i = 0; i < mArrayListeners.Length(); i++) {
+    IdleListener& curListener = mArrayListeners.ElementAt(i);
+
+    if (!curListener.isIdle) {
+      if (curListener.reqIdleTime <= currentIdleTimeInS) {
+        notifyList.AppendObject(curListener.observer);
+        curListener.isIdle = true;
+        mIdleObserverCount++;
+      } else {
+        mDeltaToNextIdleSwitchInS =
+            std::min(mDeltaToNextIdleSwitchInS, curListener.reqIdleTime);
+      }
+    }
+  }
+
+  ReconfigureTimer();
+
+  int32_t numberOfPendingNotifications = notifyList.Count();
+
+  if (!numberOfPendingNotifications) {
+    MOZ_LOG(
+        sLog, LogLevel::Debug,
+        ("idleService: **** Idle timer callback: no observers to message."));
+    return;
+  }
+
+  nsAutoString timeStr;
+  timeStr.AppendInt(currentIdleTimeInS);
+
+  while (numberOfPendingNotifications--) {
+    MOZ_LOG(
+        sLog, LogLevel::Debug,
+        ("idleService: **** Idle timer callback: tell observer %p user is idle",
+         notifyList[numberOfPendingNotifications]));
+    nsAutoCString timeCStr;
+    timeCStr.AppendInt(currentIdleTimeInS);
+    notifyList[numberOfPendingNotifications]->Observe(this, OBSERVER_TOPIC_IDLE,
+                                                      timeStr.get());
+  }
+}
+
+void nsUserIdleService::SetTimerExpiryIfBefore(TimeStamp aNextTimeout) {
+  TimeDuration nextTimeoutDuration = aNextTimeout - TimeStamp::Now();
+
+  MOZ_LOG(
+      sLog, LogLevel::Debug,
+      ("idleService: SetTimerExpiryIfBefore: next timeout %0.f msec from now",
+       nextTimeoutDuration.ToMilliseconds()));
+
+
+  if (!mTimer) {
+    return;
+  }
+
+  if (mCurrentlySetToTimeoutAt.IsNull() ||
+      mCurrentlySetToTimeoutAt > aNextTimeout) {
+    mCurrentlySetToTimeoutAt = aNextTimeout;
+
+    mTimer->Cancel();
+
+    TimeStamp currentTime = TimeStamp::Now();
+    if (currentTime > mCurrentlySetToTimeoutAt) {
+      mCurrentlySetToTimeoutAt = currentTime;
+    }
+
+    mCurrentlySetToTimeoutAt += TimeDuration::FromMilliseconds(10);
+
+    TimeDuration deltaTime = mCurrentlySetToTimeoutAt - currentTime;
+    MOZ_LOG(
+        sLog, LogLevel::Debug,
+        ("idleService: IdleService reset timer expiry to %0.f msec from now",
+         deltaTime.ToMilliseconds()));
+
+    mTimer->InitWithNamedFuncCallback(
+        StaticIdleTimerCallback, this, deltaTime.ToMilliseconds(),
+        nsITimer::TYPE_ONE_SHOT,
+        "nsUserIdleService::SetTimerExpiryIfBefore"_ns);
+  }
+}
+
+void nsUserIdleService::ReconfigureTimer(void) {
+  if ((mIdleObserverCount == 0) && UINT32_MAX == mDeltaToNextIdleSwitchInS) {
+    MOZ_LOG(sLog, LogLevel::Debug,
+            ("idleService: ReconfigureTimer: no idle or waiting observers"));
+    return;
+  }
+
+
+  TimeStamp curTime = TimeStamp::Now();
+
+  TimeStamp nextTimeoutAt =
+      mLastUserInteraction +
+      TimeDuration::FromSeconds(mDeltaToNextIdleSwitchInS);
+
+  TimeDuration nextTimeoutDuration = nextTimeoutAt - curTime;
+
+  MOZ_LOG(sLog, LogLevel::Debug,
+          ("idleService: next timeout %0.f msec from now",
+           nextTimeoutDuration.ToMilliseconds()));
+
+
+  SetTimerExpiryIfBefore(nextTimeoutAt);
+}

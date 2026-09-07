@@ -1,0 +1,78 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsIConsoleReportCollector_h
+#define nsIConsoleReportCollector_h
+
+#include "mozilla/ErrorResult.h"
+#include "nsISupports.h"
+#include "nsStringFwd.h"
+#include "nsTArrayForwardDeclare.h"
+
+#define NS_NSICONSOLEREPORTCOLLECTOR_IID \
+  {0xdd98a481, 0xd2c4, 0x4203, {0x8d, 0xfa, 0x85, 0xbf, 0xd7, 0xdc, 0xd7, 0x05}}
+
+class nsILoadGroup;
+enum class PropertiesFile : uint8_t;
+
+namespace mozilla {
+namespace net {
+class ConsoleReportCollected;
+}
+namespace dom {
+class Document;
+}
+}  
+
+class NS_NO_VTABLE nsIConsoleReportCollector : public nsISupports {
+ public:
+  NS_INLINE_DECL_STATIC_IID(NS_NSICONSOLEREPORTCOLLECTOR_IID)
+
+  virtual void AddConsoleReport(uint32_t aErrorFlags,
+                                const nsACString& aCategory,
+                                PropertiesFile aPropertiesFile,
+                                const nsACString& aSourceFileURI,
+                                uint32_t aLineNumber, uint32_t aColumnNumber,
+                                const nsACString& aMessageName,
+                                const nsTArray<nsString>& aStringParams) = 0;
+
+  template <typename... Params>
+  void AddConsoleReport(uint32_t aErrorFlags, const nsACString& aCategory,
+                        PropertiesFile aPropertiesFile,
+                        const nsACString& aSourceFileURI, uint32_t aLineNumber,
+                        uint32_t aColumnNumber, const nsACString& aMessageName,
+                        Params&&... aParams) {
+    nsTArray<nsString> params;
+    mozilla::dom::StringArrayAppender::Append(params, sizeof...(Params),
+                                              std::forward<Params>(aParams)...);
+    AddConsoleReport(aErrorFlags, aCategory, aPropertiesFile, aSourceFileURI,
+                     aLineNumber, aColumnNumber, aMessageName, params);
+  }
+
+  enum class ReportAction { Forget, Save };
+
+  virtual void FlushReportsToConsole(
+      uint64_t aInnerWindowID, ReportAction aAction = ReportAction::Forget) = 0;
+
+  virtual void FlushReportsToConsoleForServiceWorkerScope(
+      const nsACString& aScope,
+      ReportAction aAction = ReportAction::Forget) = 0;
+
+  virtual void FlushConsoleReports(
+      mozilla::dom::Document* aDocument,
+      ReportAction aAction = ReportAction::Forget) = 0;
+
+  virtual void FlushConsoleReports(
+      nsILoadGroup* aLoadGroup,
+      ReportAction aAction = ReportAction::Forget) = 0;
+
+  virtual void FlushConsoleReports(nsIConsoleReportCollector* aCollector) = 0;
+
+  virtual void StealConsoleReports(
+      nsTArray<mozilla::net::ConsoleReportCollected>& aReports) = 0;
+
+  virtual void ClearConsoleReports() = 0;
+};
+
+#endif  // nsIConsoleReportCollector_h

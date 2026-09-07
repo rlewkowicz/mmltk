@@ -1,0 +1,100 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "DOMSVGAnimatedTransformList.h"
+
+#include "DOMSVGTransformList.h"
+#include "SVGAnimatedTransformList.h"
+#include "SVGAttrTearoffTable.h"
+#include "mozilla/dom/SVGAnimatedTransformListBinding.h"
+
+namespace mozilla::dom {
+
+constinit static SVGAttrTearoffTable<SVGAnimatedTransformList,
+                                     DOMSVGAnimatedTransformList>
+    sSVGAnimatedTransformListTearoffTable;
+
+NS_SVG_VAL_IMPL_CYCLE_COLLECTION_WRAPPERCACHED(DOMSVGAnimatedTransformList,
+                                               mElement)
+
+JSObject* DOMSVGAnimatedTransformList::WrapObject(
+    JSContext* aCx, JS::Handle<JSObject*> aGivenProto) {
+  return SVGAnimatedTransformList_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+already_AddRefed<DOMSVGTransformList> DOMSVGAnimatedTransformList::BaseVal() {
+  if (!mBaseVal) {
+    mBaseVal = new DOMSVGTransformList(this, InternalAList().GetBaseValue());
+  }
+  RefPtr<DOMSVGTransformList> baseVal = mBaseVal;
+  return baseVal.forget();
+}
+
+already_AddRefed<DOMSVGTransformList> DOMSVGAnimatedTransformList::AnimVal() {
+  if (!mAnimVal) {
+    mAnimVal = new DOMSVGTransformList(this, InternalAList().GetAnimValue());
+  }
+  RefPtr<DOMSVGTransformList> animVal = mAnimVal;
+  return animVal.forget();
+}
+
+already_AddRefed<DOMSVGAnimatedTransformList>
+DOMSVGAnimatedTransformList::GetDOMWrapper(SVGAnimatedTransformList* aList,
+                                           SVGElement* aElement) {
+  RefPtr<DOMSVGAnimatedTransformList> wrapper =
+      sSVGAnimatedTransformListTearoffTable.GetTearoff(aList);
+  if (!wrapper) {
+    wrapper = new DOMSVGAnimatedTransformList(aElement);
+    sSVGAnimatedTransformListTearoffTable.AddTearoff(aList, wrapper);
+  }
+  return wrapper.forget();
+}
+
+DOMSVGAnimatedTransformList* DOMSVGAnimatedTransformList::GetDOMWrapperIfExists(
+    SVGAnimatedTransformList* aList) {
+  return sSVGAnimatedTransformListTearoffTable.GetTearoff(aList);
+}
+
+DOMSVGAnimatedTransformList::~DOMSVGAnimatedTransformList() {
+  sSVGAnimatedTransformListTearoffTable.RemoveTearoff(&InternalAList());
+}
+
+void DOMSVGAnimatedTransformList::InternalBaseValListWillChangeLengthTo(
+    uint32_t aNewLength) {
+
+  RefPtr<DOMSVGAnimatedTransformList> kungFuDeathGrip;
+  if (mBaseVal) {
+    if (aNewLength < mBaseVal->LengthNoFlush()) {
+      kungFuDeathGrip = this;
+    }
+    mBaseVal->InternalListLengthWillChange(aNewLength);
+  }
+
+
+  if (!IsAnimating()) {
+    InternalAnimValListWillChangeLengthTo(aNewLength);
+  }
+}
+
+void DOMSVGAnimatedTransformList::InternalAnimValListWillChangeLengthTo(
+    uint32_t aNewLength) {
+  if (mAnimVal) {
+    mAnimVal->InternalListLengthWillChange(aNewLength);
+  }
+}
+
+bool DOMSVGAnimatedTransformList::IsAnimating() const {
+  return InternalAList().IsAnimating();
+}
+
+SVGAnimatedTransformList& DOMSVGAnimatedTransformList::InternalAList() {
+  return *mElement->GetExistingAnimatedTransformList();
+}
+
+const SVGAnimatedTransformList& DOMSVGAnimatedTransformList::InternalAList()
+    const {
+  return *mElement->GetExistingAnimatedTransformList();
+}
+
+}  

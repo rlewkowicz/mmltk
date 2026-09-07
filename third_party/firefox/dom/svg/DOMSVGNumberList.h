@@ -1,0 +1,136 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SVG_DOMSVGNUMBERLIST_H_
+#define DOM_SVG_DOMSVGNUMBERLIST_H_
+
+#include "DOMSVGAnimatedNumberList.h"
+#include "SVGNumberList.h"
+#include "mozAutoDocUpdate.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/RefPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsDebug.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+class ErrorResult;
+
+namespace dom {
+class DOMSVGNumber;
+class SVGElement;
+
+template <class T>
+class MOZ_RAII AutoChangeNumberListNotifier : public mozAutoDocUpdate {
+ public:
+  explicit AutoChangeNumberListNotifier(T* aValue)
+      : mozAutoDocUpdate(aValue->Element()->GetComposedDoc(), true),
+        mValue(aValue) {
+    MOZ_ASSERT(mValue, "Expecting non-null value");
+    mValue->Element()->WillChangeNumberList(mValue->AttrEnum(), *this);
+  }
+
+  ~AutoChangeNumberListNotifier() {
+    mValue->Element()->DidChangeNumberList(mValue->AttrEnum(), *this);
+    if (mValue->IsAnimating()) {
+      mValue->Element()->AnimationNeedsResample();
+    }
+  }
+
+ private:
+  T* const mValue;
+};
+
+class DOMSVGNumberList final : public nsISupports, public nsWrapperCache {
+  template <class T>
+  friend class AutoChangeNumberListNotifier;
+  friend class DOMSVGNumber;
+
+  ~DOMSVGNumberList() {
+    if (mAList) {
+      (IsAnimValList() ? mAList->mAnimVal : mAList->mBaseVal) = nullptr;
+    }
+  }
+
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_CLASS(DOMSVGNumberList)
+
+  DOMSVGNumberList(DOMSVGAnimatedNumberList* aAList,
+                   const SVGNumberList& aInternalList)
+      : mAList(aAList) {
+
+    InternalListLengthWillChange(aInternalList.Length());  
+  }
+
+  JSObject* WrapObject(JSContext* cx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  nsISupports* GetParentObject() { return static_cast<nsIContent*>(Element()); }
+
+  uint32_t LengthNoFlush() const {
+    MOZ_ASSERT(
+        mItems.Length() == 0 || mItems.Length() == InternalList().Length(),
+        "DOM wrapper's list length is out of sync");
+    return mItems.Length();
+  }
+
+  void InternalListLengthWillChange(uint32_t aNewLength);
+
+  bool IsAnimating() const { return mAList->IsAnimating(); }
+  bool AnimListMirrorsBaseList() const {
+    return mAList->mAnimVal && !mAList->IsAnimating();
+  }
+
+  uint32_t NumberOfItems() const {
+    if (IsAnimValList()) {
+      Element()->FlushAnimations();
+    }
+    return LengthNoFlush();
+  }
+  void Clear(ErrorResult& aRv);
+  already_AddRefed<DOMSVGNumber> Initialize(DOMSVGNumber& aItem,
+                                            ErrorResult& aRv);
+  already_AddRefed<DOMSVGNumber> GetItem(uint32_t index, ErrorResult& aRv);
+  already_AddRefed<DOMSVGNumber> IndexedGetter(uint32_t index, bool& found,
+                                               ErrorResult& aRv);
+  already_AddRefed<DOMSVGNumber> InsertItemBefore(DOMSVGNumber& aItem,
+                                                  uint32_t index,
+                                                  ErrorResult& aRv);
+  already_AddRefed<DOMSVGNumber> ReplaceItem(DOMSVGNumber& aItem,
+                                             uint32_t index, ErrorResult& aRv);
+  already_AddRefed<DOMSVGNumber> RemoveItem(uint32_t index, ErrorResult& aRv);
+  already_AddRefed<DOMSVGNumber> AppendItem(DOMSVGNumber& newItem,
+                                            ErrorResult& aRv) {
+    return InsertItemBefore(newItem, LengthNoFlush(), aRv);
+  }
+  uint32_t Length() const { return NumberOfItems(); }
+
+ private:
+  dom::SVGElement* Element() const { return mAList->mElement; }
+
+  uint8_t AttrEnum() const { return mAList->mAttrEnum; }
+
+  bool IsAnimValList() const {
+    MOZ_ASSERT(this == mAList->mBaseVal || this == mAList->mAnimVal,
+               "Calling IsAnimValList() too early?!");
+    return this == mAList->mAnimVal;
+  }
+
+  SVGNumberList& InternalList() const;
+
+  already_AddRefed<DOMSVGNumber> GetItemAt(uint32_t aIndex);
+
+  void MaybeInsertNullInAnimValListAt(uint32_t aIndex);
+  void MaybeRemoveItemFromAnimValListAt(uint32_t aIndex);
+
+  FallibleTArray<DOMSVGNumber*> mItems;
+
+  RefPtr<DOMSVGAnimatedNumberList> mAList;
+};
+
+}  
+}  
+
+#endif  // DOM_SVG_DOMSVGNUMBERLIST_H_

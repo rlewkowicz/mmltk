@@ -1,0 +1,421 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "WritableStreamDefaultControllerAbstract.h"
+#include "js/Exception.h"
+#include "js/TypeDecls.h"
+#include "js/Value.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/dom/AbortSignal.h"
+#include "mozilla/dom/Promise-inl.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/UnderlyingSinkBinding.h"
+#include "mozilla/dom/WritableStream.h"
+#include "mozilla/dom/WritableStreamDefaultControllerBinding.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsDebug.h"
+#include "nsISupports.h"
+
+namespace mozilla::dom {
+
+using namespace streams_abstract;
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(WritableStreamDefaultController)
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(WritableStreamDefaultController)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mGlobal, mSignal, mStrategySizeAlgorithm,
+                                  mAlgorithms, mStream)
+  tmp->mQueue.clear();
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_PRESERVED_WRAPPER
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(WritableStreamDefaultController)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mGlobal, mSignal, mStrategySizeAlgorithm,
+                                    mAlgorithms, mStream)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTION_TRACE_BEGIN(WritableStreamDefaultController)
+  NS_IMPL_CYCLE_COLLECTION_TRACE_PRESERVED_WRAPPER
+  for (const auto& queueEntry : tmp->mQueue) {
+    aCallbacks.Trace(&queueEntry->mValue, "mQueue.mValue", aClosure);
+  }
+NS_IMPL_CYCLE_COLLECTION_TRACE_END
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(WritableStreamDefaultController)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(WritableStreamDefaultController)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(WritableStreamDefaultController)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+WritableStreamDefaultController::WritableStreamDefaultController(
+    nsISupports* aGlobal, WritableStream& aStream)
+    : mGlobal(do_QueryInterface(aGlobal)), mStream(&aStream) {
+  mozilla::HoldJSObjects(this);
+}
+
+WritableStreamDefaultController::~WritableStreamDefaultController() {
+  mQueue.clear();
+  mozilla::DropJSObjects(this);
+}
+
+JSObject* WritableStreamDefaultController::WrapObject(
+    JSContext* aCx, JS::Handle<JSObject*> aGivenProto) {
+  return WritableStreamDefaultController_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+void WritableStreamDefaultController::Error(JSContext* aCx,
+                                            JS::Handle<JS::Value> aError,
+                                            ErrorResult& aRv) {
+  if (mStream->State() != WritableStream::WriterState::Writable) {
+    return;
+  }
+  RefPtr<WritableStreamDefaultController> thisRefPtr = this;
+  WritableStreamDefaultControllerError(aCx, thisRefPtr, aError, aRv);
+}
+
+already_AddRefed<Promise> WritableStreamDefaultController::AbortSteps(
+    JSContext* aCx, JS::Handle<JS::Value> aReason, ErrorResult& aRv) {
+  RefPtr<UnderlyingSinkAlgorithmsBase> algorithms = mAlgorithms;
+  Optional<JS::Handle<JS::Value>> optionalReason(aCx, aReason);
+  RefPtr<Promise> abortPromise =
+      algorithms->AbortCallback(aCx, optionalReason, aRv);
+  if (aRv.Failed()) {
+    return nullptr;
+  }
+
+  ClearAlgorithms();
+
+  return abortPromise.forget();
+}
+
+void WritableStreamDefaultController::ErrorSteps() {
+  ResetQueue(this);
+}
+
+void WritableStreamDefaultController::SetSignal(AbortSignal* aSignal) {
+  MOZ_ASSERT(aSignal);
+  mSignal = aSignal;
+}
+
+namespace streams_abstract {
+
+MOZ_CAN_RUN_SCRIPT static void
+WritableStreamDefaultControllerAdvanceQueueIfNeeded(
+    JSContext* aCx, WritableStreamDefaultController* aController,
+    ErrorResult& aRv);
+
+void SetUpWritableStreamDefaultController(
+    JSContext* aCx, WritableStream* aStream,
+    WritableStreamDefaultController* aController,
+    UnderlyingSinkAlgorithmsBase* aAlgorithms, double aHighWaterMark,
+    QueuingStrategySize* aSizeAlgorithm, ErrorResult& aRv) {
+  MOZ_ASSERT(!aStream->Controller());
+
+  MOZ_ASSERT(aController->Stream() == aStream);
+
+  aStream->SetController(*aController);
+
+  ResetQueue(aController);
+
+  RefPtr<AbortSignal> signal =
+      AbortSignal::Create(aController->GetParentObject(), SignalAborted::No,
+                          JS::UndefinedHandleValue);
+
+  aController->SetSignal(signal);
+
+  aController->SetStarted(false);
+
+  aController->SetStrategySizeAlgorithm(aSizeAlgorithm);
+
+  aController->SetStrategyHWM(aHighWaterMark);
+
+  aController->SetAlgorithms(*aAlgorithms);
+
+  bool backpressure = aController->GetBackpressure();
+
+  aStream->UpdateBackpressure(backpressure);
+
+  JS::Rooted<JS::Value> startResult(aCx, JS::UndefinedValue());
+  RefPtr<WritableStreamDefaultController> controller(aController);
+  aAlgorithms->StartCallback(aCx, *controller, &startResult, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  RefPtr<Promise> startPromise =
+      Promise::CreateInfallible(aStream->GetParentObject());
+  startPromise->MaybeResolve(startResult);
+
+  startPromise->AddCallbacksWithCycleCollectedArgs(
+      [](JSContext* aCx, JS::Handle<JS::Value> aValue, ErrorResult& aRv,
+         WritableStreamDefaultController* aController)
+          MOZ_CAN_RUN_SCRIPT_BOUNDARY {
+            MOZ_ASSERT(aController->Stream()->State() ==
+                           WritableStream::WriterState::Writable ||
+                       aController->Stream()->State() ==
+                           WritableStream::WriterState::Erroring);
+            aController->SetStarted(true);
+            WritableStreamDefaultControllerAdvanceQueueIfNeeded(
+                aCx, MOZ_KnownLive(aController), aRv);
+          },
+      [](JSContext* aCx, JS::Handle<JS::Value> aValue, ErrorResult& aRv,
+         WritableStreamDefaultController* aController)
+          MOZ_CAN_RUN_SCRIPT_BOUNDARY {
+            RefPtr<WritableStream> stream = aController->Stream();
+            MOZ_ASSERT(
+                stream->State() == WritableStream::WriterState::Writable ||
+                stream->State() == WritableStream::WriterState::Erroring);
+            aController->SetStarted(true);
+            stream->DealWithRejection(aCx, aValue, aRv);
+          },
+      RefPtr(aController));
+}
+
+void SetUpWritableStreamDefaultControllerFromUnderlyingSink(
+    JSContext* aCx, WritableStream* aStream,
+    JS::Handle<JSObject*> aUnderlyingSink, UnderlyingSink& aUnderlyingSinkDict,
+    double aHighWaterMark, QueuingStrategySize* aSizeAlgorithm,
+    ErrorResult& aRv) {
+  RefPtr<WritableStreamDefaultController> controller =
+      new WritableStreamDefaultController(aStream->GetParentObject(), *aStream);
+
+  auto algorithms = MakeRefPtr<UnderlyingSinkAlgorithms>(
+      aStream->GetParentObject(), aUnderlyingSink, aUnderlyingSinkDict);
+
+  SetUpWritableStreamDefaultController(aCx, aStream, controller, algorithms,
+                                       aHighWaterMark, aSizeAlgorithm, aRv);
+}
+
+MOZ_CAN_RUN_SCRIPT static void WritableStreamDefaultControllerProcessClose(
+    JSContext* aCx, WritableStreamDefaultController* aController,
+    ErrorResult& aRv) {
+  RefPtr<WritableStream> stream = aController->Stream();
+
+  stream->MarkCloseRequestInFlight();
+
+  JS::Rooted<JS::Value> value(aCx);
+  DequeueValue(aCx, aController, &value, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  MOZ_ASSERT(aController->Queue().isEmpty());
+
+  RefPtr<UnderlyingSinkAlgorithmsBase> algorithms =
+      aController->GetAlgorithms();
+  RefPtr<Promise> sinkClosePromise = algorithms->CloseCallback(aCx, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  aController->ClearAlgorithms();
+
+  sinkClosePromise->AddCallbacksWithCycleCollectedArgs(
+      [](JSContext* aCx, JS::Handle<JS::Value> aValue, ErrorResult& aRv,
+         WritableStreamDefaultController* aController) {
+        RefPtr<WritableStream> stream = aController->Stream();
+        stream->FinishInFlightClose();
+      },
+      [](JSContext* aCx, JS::Handle<JS::Value> aValue, ErrorResult& aRv,
+         WritableStreamDefaultController* aController)
+          MOZ_CAN_RUN_SCRIPT_BOUNDARY {
+            RefPtr<WritableStream> stream = aController->Stream();
+            stream->FinishInFlightCloseWithError(aCx, aValue, aRv);
+          },
+      RefPtr(aController));
+}
+
+MOZ_CAN_RUN_SCRIPT static void WritableStreamDefaultControllerProcessWrite(
+    JSContext* aCx, WritableStreamDefaultController* aController,
+    JS::Handle<JS::Value> aChunk, ErrorResult& aRv) {
+  RefPtr<WritableStream> stream = aController->Stream();
+
+  stream->MarkFirstWriteRequestInFlight();
+
+  RefPtr<UnderlyingSinkAlgorithmsBase> algorithms =
+      aController->GetAlgorithms();
+  RefPtr<Promise> sinkWritePromise =
+      algorithms->WriteCallback(aCx, aChunk, *aController, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  sinkWritePromise->AddCallbacksWithCycleCollectedArgs(
+      [](JSContext* aCx, JS::Handle<JS::Value> aValue, ErrorResult& aRv,
+         WritableStreamDefaultController* aController)
+          MOZ_CAN_RUN_SCRIPT_BOUNDARY {
+            RefPtr<WritableStream> stream = aController->Stream();
+
+            stream->FinishInFlightWrite();
+
+            WritableStream::WriterState state = stream->State();
+
+            MOZ_ASSERT(state == WritableStream::WriterState::Writable ||
+                       state == WritableStream::WriterState::Erroring);
+
+            JS::Rooted<JS::Value> value(aCx);
+            DequeueValue(aCx, aController, &value, aRv);
+            if (aRv.Failed()) {
+              return;
+            }
+
+            if (!stream->CloseQueuedOrInFlight() &&
+                state == WritableStream::WriterState::Writable) {
+              bool backpressure = aController->GetBackpressure();
+              stream->UpdateBackpressure(backpressure);
+            }
+
+            WritableStreamDefaultControllerAdvanceQueueIfNeeded(
+                aCx, MOZ_KnownLive(aController), aRv);
+          },
+      [](JSContext* aCx, JS::Handle<JS::Value> aValue, ErrorResult& aRv,
+         WritableStreamDefaultController* aController)
+          MOZ_CAN_RUN_SCRIPT_BOUNDARY {
+            RefPtr<WritableStream> stream = aController->Stream();
+
+            if (stream->State() == WritableStream::WriterState::Writable) {
+              aController->ClearAlgorithms();
+            }
+
+            stream->FinishInFlightWriteWithError(aCx, aValue, aRv);
+          },
+      RefPtr(aController));
+}
+
+constexpr JSWhyMagic CLOSE_SENTINEL = JS_GENERIC_MAGIC;
+
+static void WritableStreamDefaultControllerAdvanceQueueIfNeeded(
+    JSContext* aCx, WritableStreamDefaultController* aController,
+    ErrorResult& aRv) {
+  RefPtr<WritableStream> stream = aController->Stream();
+
+  if (!aController->Started()) {
+    return;
+  }
+
+  if (stream->GetInFlightWriteRequest()) {
+    return;
+  }
+
+  WritableStream::WriterState state = stream->State();
+
+  MOZ_ASSERT(state != WritableStream::WriterState::Closed &&
+             state != WritableStream::WriterState::Errored);
+
+  if (state == WritableStream::WriterState::Erroring) {
+    stream->FinishErroring(aCx, aRv);
+
+    return;
+  }
+
+  if (aController->Queue().isEmpty()) {
+    return;
+  }
+
+  JS::Rooted<JS::Value> value(aCx);
+  PeekQueueValue(aCx, aController, &value, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  if (value.isMagic(CLOSE_SENTINEL)) {
+    WritableStreamDefaultControllerProcessClose(aCx, aController, aRv);
+    return;
+  }
+
+  WritableStreamDefaultControllerProcessWrite(aCx, aController, value, aRv);
+}
+
+void WritableStreamDefaultControllerClose(
+    JSContext* aCx, WritableStreamDefaultController* aController,
+    ErrorResult& aRv) {
+  JS::Rooted<JS::Value> aCloseSentinel(aCx, JS::MagicValue(CLOSE_SENTINEL));
+  EnqueueValueWithSize(aController, aCloseSentinel, 0, aRv);
+  MOZ_ASSERT(!aRv.Failed());
+
+  WritableStreamDefaultControllerAdvanceQueueIfNeeded(aCx, aController, aRv);
+}
+
+void WritableStreamDefaultControllerWrite(
+    JSContext* aCx, WritableStreamDefaultController* aController,
+    JS::Handle<JS::Value> aChunk, double chunkSize, ErrorResult& aRv) {
+  IgnoredErrorResult rv;
+  EnqueueValueWithSize(aController, aChunk, chunkSize, rv);
+
+  if (rv.MaybeSetPendingException(aCx,
+                                  "WritableStreamDefaultController.write")) {
+    JS::Rooted<JS::Value> error(aCx);
+    JS_GetPendingException(aCx, &error);
+    JS_ClearPendingException(aCx);
+
+    WritableStreamDefaultControllerErrorIfNeeded(aCx, aController, error, aRv);
+
+    return;
+  }
+
+  RefPtr<WritableStream> stream = aController->Stream();
+
+  if (!stream->CloseQueuedOrInFlight() &&
+      stream->State() == WritableStream::WriterState::Writable) {
+    bool backpressure = aController->GetBackpressure();
+
+    stream->UpdateBackpressure(backpressure);
+  }
+
+  WritableStreamDefaultControllerAdvanceQueueIfNeeded(aCx, aController, aRv);
+}
+
+void WritableStreamDefaultControllerError(
+    JSContext* aCx, WritableStreamDefaultController* aController,
+    JS::Handle<JS::Value> aError, ErrorResult& aRv) {
+  RefPtr<WritableStream> stream = aController->Stream();
+
+  MOZ_ASSERT(stream->State() == WritableStream::WriterState::Writable);
+
+  aController->ClearAlgorithms();
+
+  stream->StartErroring(aCx, aError, aRv);
+}
+
+void WritableStreamDefaultControllerErrorIfNeeded(
+    JSContext* aCx, WritableStreamDefaultController* aController,
+    JS::Handle<JS::Value> aError, ErrorResult& aRv) {
+  if (aController->Stream()->State() == WritableStream::WriterState::Writable) {
+    WritableStreamDefaultControllerError(aCx, aController, aError, aRv);
+  }
+}
+
+double WritableStreamDefaultControllerGetChunkSize(
+    JSContext* aCx, WritableStreamDefaultController* aController,
+    JS::Handle<JS::Value> aChunk, ErrorResult& aRv) {
+  RefPtr<QueuingStrategySize> sizeAlgorithm(
+      aController->StrategySizeAlgorithm());
+
+  Optional<JS::Handle<JS::Value>> optionalChunk(aCx, aChunk);
+
+  double chunkSize =
+      sizeAlgorithm
+          ? sizeAlgorithm->Call(
+                optionalChunk, aRv,
+                "WritableStreamDefaultController.[[strategySizeAlgorithm]]",
+                CallbackObject::eRethrowExceptions)
+          : 1.0;
+
+  if (aRv.MaybeSetPendingException(
+          aCx, "WritableStreamDefaultController.[[strategySizeAlgorithm]]")) {
+    JS::Rooted<JS::Value> error(aCx);
+    JS_GetPendingException(aCx, &error);
+    JS_ClearPendingException(aCx);
+
+    WritableStreamDefaultControllerErrorIfNeeded(aCx, aController, error, aRv);
+
+    return 1.0;
+  }
+
+  return chunkSize;
+}
+
+}  
+
+}  

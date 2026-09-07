@@ -1,0 +1,41 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_ScrollingMetrics_h
+#define mozilla_dom_ScrollingMetrics_h
+
+#include "Units.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/StaticPtr.h"
+
+namespace mozilla {
+
+class ScrollingMetrics {
+ public:
+  using ScrollingMetricsPromise =
+      MozPromise<std::tuple<uint32_t, uint32_t>, bool, true>;
+
+  static RefPtr<ScrollingMetricsPromise> CollectScrollingMetrics() {
+    return GetSingleton()->CollectScrollingMetricsInternal();
+  }
+
+  static std::tuple<uint32_t, uint32_t> CollectLocalScrollingMetrics() {
+    return GetSingleton()->CollectLocalScrollingMetricsInternal();
+  }
+
+  static void OnScrollingInteraction(CSSCoord distanceScrolled);
+
+  static void OnScrollingInteractionEnded();
+
+ private:
+  static ScrollingMetrics* GetSingleton();
+  static StaticAutoPtr<ScrollingMetrics> sSingleton;
+  RefPtr<ScrollingMetricsPromise> CollectScrollingMetricsInternal();
+  std::tuple<uint32_t, uint32_t> CollectLocalScrollingMetricsInternal();
+};
+
+}  
+
+#endif /* mozilla_dom_ScrollingMetrics_h */

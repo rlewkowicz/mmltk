@@ -1,0 +1,244 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsFont.h"
+#include "gfxFont.h"          // for gfxFontStyle
+#include "gfxFontFeatures.h"  // for gfxFontFeature, etc
+#include "gfxFontUtils.h"     // for TRUETYPE_TAG
+#include "mozilla/ServoStyleConstsInlines.h"
+#include "nsCRT.h"    // for nsCRT
+#include "nsDebug.h"  // for NS_ASSERTION
+#include "nsISupports.h"
+#include "nsUnicharUtils.h"
+#include "nscore.h"  // for char16_t
+#include "mozilla/gfx/2D.h"
+
+using namespace mozilla;
+
+nsFont::nsFont(const StyleFontFamily& aFamily, mozilla::Length aSize)
+    : family(aFamily), size(aSize) {}
+
+nsFont::nsFont(StyleGenericFontFamily aGenericType, mozilla::Length aSize)
+    : family(*Servo_FontFamily_Generic(aGenericType)), size(aSize) {}
+
+nsFont::nsFont(const nsFont& aOther) = default;
+
+nsFont::~nsFont() = default;
+
+nsFont& nsFont::operator=(const nsFont&) = default;
+
+bool nsFont::Equals(const nsFont& aOther) const {
+  return CalcDifference(aOther) == MaxDifference::eNone;
+}
+
+nsFont::MaxDifference nsFont::CalcDifference(const nsFont& aOther) const {
+  if ((style != aOther.style) || (weight != aOther.weight) ||
+      (stretch != aOther.stretch) || (size != aOther.size) ||
+      (sizeAdjust != aOther.sizeAdjust) || (family != aOther.family) ||
+      (kerning != aOther.kerning) || (opticalSizing != aOther.opticalSizing) ||
+      (synthesisWeight != aOther.synthesisWeight) ||
+      (synthesisStyle != aOther.synthesisStyle) ||
+      (synthesisSmallCaps != aOther.synthesisSmallCaps) ||
+      (synthesisPosition != aOther.synthesisPosition) ||
+      (fontFeatureSettings != aOther.fontFeatureSettings) ||
+      (fontVariationSettings != aOther.fontVariationSettings) ||
+      (languageOverride != aOther.languageOverride) ||
+      (variantAlternates != aOther.variantAlternates) ||
+      (variantCaps != aOther.variantCaps) ||
+      (variantEastAsian != aOther.variantEastAsian) ||
+      (variantLigatures != aOther.variantLigatures) ||
+      (variantNumeric != aOther.variantNumeric) ||
+      (variantPosition != aOther.variantPosition) ||
+      (variantWidth != aOther.variantWidth) ||
+      (variantEmoji != aOther.variantEmoji)) {
+    return MaxDifference::eLayoutAffecting;
+  }
+
+  if (smoothing != aOther.smoothing) {
+    return MaxDifference::eVisual;
+  }
+
+  return MaxDifference::eNone;
+}
+
+
+const gfxFontFeature eastAsianDefaults[] = {
+    {TRUETYPE_TAG('j', 'p', '7', '8'), 1},
+    {TRUETYPE_TAG('j', 'p', '8', '3'), 1},
+    {TRUETYPE_TAG('j', 'p', '9', '0'), 1},
+    {TRUETYPE_TAG('j', 'p', '0', '4'), 1},
+    {TRUETYPE_TAG('s', 'm', 'p', 'l'), 1},
+    {TRUETYPE_TAG('t', 'r', 'a', 'd'), 1},
+    {TRUETYPE_TAG('f', 'w', 'i', 'd'), 1},
+    {TRUETYPE_TAG('p', 'w', 'i', 'd'), 1},
+    {TRUETYPE_TAG('r', 'u', 'b', 'y'), 1}};
+
+static_assert(std::size(eastAsianDefaults) == StyleFontVariantEastAsian::COUNT,
+              "eastAsianDefaults[] should be correct");
+
+const gfxFontFeature ligDefaults[] = {
+    {TRUETYPE_TAG('l', 'i', 'g', 'a'), 0},  
+    {TRUETYPE_TAG('l', 'i', 'g', 'a'), 1},
+    {TRUETYPE_TAG('l', 'i', 'g', 'a'), 0},
+    {TRUETYPE_TAG('d', 'l', 'i', 'g'), 1},
+    {TRUETYPE_TAG('d', 'l', 'i', 'g'), 0},
+    {TRUETYPE_TAG('h', 'l', 'i', 'g'), 1},
+    {TRUETYPE_TAG('h', 'l', 'i', 'g'), 0},
+    {TRUETYPE_TAG('c', 'a', 'l', 't'), 1},
+    {TRUETYPE_TAG('c', 'a', 'l', 't'), 0}};
+
+static_assert(std::size(ligDefaults) == StyleFontVariantLigatures::COUNT,
+              "ligDefaults[] should be correct");
+
+const gfxFontFeature numericDefaults[] = {
+    {TRUETYPE_TAG('l', 'n', 'u', 'm'), 1},
+    {TRUETYPE_TAG('o', 'n', 'u', 'm'), 1},
+    {TRUETYPE_TAG('p', 'n', 'u', 'm'), 1},
+    {TRUETYPE_TAG('t', 'n', 'u', 'm'), 1},
+    {TRUETYPE_TAG('f', 'r', 'a', 'c'), 1},
+    {TRUETYPE_TAG('a', 'f', 'r', 'c'), 1},
+    {TRUETYPE_TAG('z', 'e', 'r', 'o'), 1},
+    {TRUETYPE_TAG('o', 'r', 'd', 'n'), 1}};
+
+static_assert(std::size(numericDefaults) == StyleFontVariantNumeric::COUNT,
+              "numericDefaults[] should be correct");
+
+template <typename T>
+static void AddFontFeaturesBitmask(T aValue, T aMin, T aMax,
+                                   Span<const gfxFontFeature> aFeatureDefaults,
+                                   nsTArray<gfxFontFeature>& aFeaturesOut)
+
+{
+  for (uint32_t i = 0, m = aMin._0; m <= aMax._0; i++, m <<= 1) {
+    if (m & aValue._0) {
+      const gfxFontFeature& feature = aFeatureDefaults[i];
+      aFeaturesOut.AppendElement(feature);
+    }
+  }
+}
+
+static uint32_t FontFeatureTagForVariantWidth(uint32_t aVariantWidth) {
+  switch (aVariantWidth) {
+    case NS_FONT_VARIANT_WIDTH_FULL:
+      return TRUETYPE_TAG('f', 'w', 'i', 'd');
+    case NS_FONT_VARIANT_WIDTH_HALF:
+      return TRUETYPE_TAG('h', 'w', 'i', 'd');
+    case NS_FONT_VARIANT_WIDTH_THIRD:
+      return TRUETYPE_TAG('t', 'w', 'i', 'd');
+    case NS_FONT_VARIANT_WIDTH_QUARTER:
+      return TRUETYPE_TAG('q', 'w', 'i', 'd');
+    default:
+      return 0;
+  }
+}
+
+void nsFont::AddFontFeaturesToStyle(gfxFontStyle* aStyle,
+                                    bool aVertical) const {
+  gfxFontFeature setting;
+
+  setting.mTag = aVertical ? TRUETYPE_TAG('v', 'k', 'r', 'n')
+                           : TRUETYPE_TAG('k', 'e', 'r', 'n');
+  switch (kerning) {
+    case NS_FONT_KERNING_NONE:
+      setting.mValue = 0;
+      aStyle->featureSettings.AppendElement(setting);
+      break;
+    case NS_FONT_KERNING_NORMAL:
+      setting.mValue = 1;
+      aStyle->featureSettings.AppendElement(setting);
+      break;
+    default:
+      break;
+  }
+
+  for (auto& alternate : variantAlternates.AsSpan()) {
+    if (alternate.IsHistoricalForms()) {
+      setting.mValue = 1;
+      setting.mTag = TRUETYPE_TAG('h', 'i', 's', 't');
+      aStyle->featureSettings.AppendElement(setting);
+      break;
+    }
+  }
+
+  aStyle->variantAlternates = variantAlternates;
+
+  aStyle->variantCaps = variantCaps;
+
+  if (variantEastAsian) {
+    AddFontFeaturesBitmask(variantEastAsian, StyleFontVariantEastAsian::JIS78,
+                           StyleFontVariantEastAsian::RUBY, eastAsianDefaults,
+                           aStyle->featureSettings);
+  }
+
+  if (variantLigatures) {
+    AddFontFeaturesBitmask(variantLigatures, StyleFontVariantLigatures::NONE,
+                           StyleFontVariantLigatures::NO_CONTEXTUAL,
+                           ligDefaults, aStyle->featureSettings);
+
+    if (variantLigatures & StyleFontVariantLigatures::COMMON_LIGATURES) {
+      setting.mTag = TRUETYPE_TAG('c', 'l', 'i', 'g');
+      setting.mValue = 1;
+      aStyle->featureSettings.AppendElement(setting);
+    } else if (variantLigatures &
+               StyleFontVariantLigatures::NO_COMMON_LIGATURES) {
+      setting.mTag = TRUETYPE_TAG('c', 'l', 'i', 'g');
+      setting.mValue = 0;
+      aStyle->featureSettings.AppendElement(setting);
+    } else if (variantLigatures & StyleFontVariantLigatures::NONE) {
+      setting.mValue = 0;
+      setting.mTag = TRUETYPE_TAG('d', 'l', 'i', 'g');
+      aStyle->featureSettings.AppendElement(setting);
+      setting.mTag = TRUETYPE_TAG('h', 'l', 'i', 'g');
+      aStyle->featureSettings.AppendElement(setting);
+      setting.mTag = TRUETYPE_TAG('c', 'a', 'l', 't');
+      aStyle->featureSettings.AppendElement(setting);
+      setting.mTag = TRUETYPE_TAG('c', 'l', 'i', 'g');
+      aStyle->featureSettings.AppendElement(setting);
+    }
+  }
+
+  if (variantNumeric) {
+    AddFontFeaturesBitmask(variantNumeric, StyleFontVariantNumeric::LINING_NUMS,
+                           StyleFontVariantNumeric::ORDINAL, numericDefaults,
+                           aStyle->featureSettings);
+  }
+
+  aStyle->variantSubSuper = variantPosition;
+
+  setting.mTag = FontFeatureTagForVariantWidth(variantWidth);
+  if (setting.mTag) {
+    setting.mValue = 1;
+    aStyle->featureSettings.AppendElement(setting);
+  }
+
+  aStyle->noFallbackVariantFeatures =
+      (aStyle->variantCaps == NS_FONT_VARIANT_CAPS_NORMAL) &&
+      (variantPosition == NS_FONT_VARIANT_POSITION_NORMAL);
+
+  if (!aStyle->featureSettings.IsEmpty() || !fontFeatureSettings.IsEmpty()) {
+    aStyle->featureSettings.AppendElement(gfxFontFeature{0, 0});
+  }
+
+  aStyle->featureSettings.AppendElements(fontFeatureSettings);
+
+  if (smoothing == NS_FONT_SMOOTHING_GRAYSCALE) {
+    aStyle->useGrayscaleAntialiasing = true;
+  }
+}
+
+void nsFont::AddFontVariationsToStyle(gfxFontStyle* aStyle) const {
+  class VariationTagComparator {
+   public:
+    bool Equals(const gfxFontVariation& aVariation, uint32_t aTag) const {
+      return aVariation.mTag == aTag;
+    }
+  };
+  const uint32_t kTagOpsz = TRUETYPE_TAG('o', 'p', 's', 'z');
+  if (opticalSizing == NS_FONT_OPTICAL_SIZING_AUTO &&
+      !fontVariationSettings.Contains(kTagOpsz, VariationTagComparator())) {
+    aStyle->autoOpticalSize = size.ToCSSPixels();
+  }
+
+  aStyle->variationSettings.AppendElements(fontVariationSettings);
+}

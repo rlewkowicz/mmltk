@@ -1,0 +1,37 @@
+[package]
+name = "fluent-bundle"
+description = """
+A low-level implementation of a collection of localization messages for a single locale for Project Fluent,
+a localization system designed to unleash the entire expressive power of natural language translations.
+"""
+version = "0.16.0"
+edition.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+authors.workspace = true
+categories.workspace = true
+keywords.workspace = true
+include = [
+  "src/**/*",
+  "benches/*.rs",
+  "Cargo.toml",
+  "README.md",
+  "LICENSE-APACHE",
+  "LICENSE-MIT",
+]
+
+[dependencies]
+fluent-langneg.workspace = true
+fluent-syntax.workspace = true
+intl_pluralrules.workspace = true
+rustc-hash.workspace = true
+unic-langid.workspace = true
+intl-memoizer.workspace = true
+self_cell = "1.2"
+smallvec = "1.13"
+
+[features]
+default = []
+all-benchmarks = []

@@ -1,0 +1,134 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef nsTableColGroupFrame_h_
+#define nsTableColGroupFrame_h_
+
+#include "mozilla/WritingModes.h"
+#include "nsContainerFrame.h"
+#include "nsTableFrame.h"
+#include "nscore.h"
+
+class nsTableColFrame;
+
+namespace mozilla {
+class PresShell;
+}  
+
+class nsTableColGroupFrame final : public nsContainerFrame {
+ public:
+  NS_DECL_FRAMEARENA_HELPERS(nsTableColGroupFrame)
+  NS_DECL_QUERYFRAME
+
+  friend nsTableColGroupFrame* NS_NewTableColGroupFrame(
+      mozilla::PresShell* aPresShell, ComputedStyle* aStyle);
+
+  void Init(nsIContent* aContent, nsContainerFrame* aParent,
+            nsIFrame* aPrevInFlow) override {
+    nsContainerFrame::Init(aContent, aParent, aPrevInFlow);
+    if (!aPrevInFlow) {
+      mWritingMode = GetTableFrame()->GetWritingMode();
+    }
+  }
+
+  nsTableFrame* GetTableFrame() const {
+    nsIFrame* parent = GetParent();
+    MOZ_ASSERT(parent && parent->IsTableFrame());
+    MOZ_ASSERT(!parent->GetPrevInFlow(),
+               "Col group should always be in a first-in-flow table frame");
+    return static_cast<nsTableFrame*>(parent);
+  }
+
+  nsTableColGroupFrame* GetSyntheticColGroup() const;
+
+  void BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                        const nsDisplayListSet& aLists) override;
+
+  bool IsSynthetic() const;
+  void SetIsSynthetic();
+
+  static nsTableColGroupFrame* GetLastRealColGroup(nsTableFrame* aTableFrame);
+
+  void DidSetComputedStyle(ComputedStyle* aOldComputedStyle) override;
+
+  void SetInitialChildList(ChildListID aListID,
+                           nsFrameList&& aChildList) override;
+  void AppendFrames(ChildListID aListID, nsFrameList&& aFrameList) override;
+  void InsertFrames(ChildListID aListID, nsIFrame* aPrevFrame,
+                    const nsLineList::iterator* aPrevFrameLine,
+                    nsFrameList&& aFrameList) override;
+  void RemoveFrame(DestroyContext&, ChildListID, nsIFrame*) override;
+
+  void RemoveChild(DestroyContext& aContext, nsTableColFrame& aChild,
+                   bool aResetSubsequentColIndices);
+
+  void Reflow(nsPresContext* aPresContext, ReflowOutput& aDesiredSize,
+              const ReflowInput& aReflowInput,
+              nsReflowStatus& aStatus) override;
+
+  nsresult AddColsToTable(int32_t aFirstColIndex,
+                          bool aResetSubsequentColIndices,
+                          const nsFrameList::Slice& aCols);
+
+#ifdef DEBUG_FRAME_DUMP
+  nsresult GetFrameName(nsAString& aResult) const override;
+  void Dump(int32_t aIndent);
+#endif
+
+  int32_t GetColCount() const;
+
+  nsTableColFrame* GetFirstColumn();
+  nsTableColFrame* GetNextColumn(nsIFrame* aChildFrame);
+
+  int32_t GetStartColumnIndex();
+
+  void SetStartColumnIndex(int32_t aIndex);
+
+  int32_t GetSpan();
+
+  nsFrameList& GetWritableChildList();
+
+  static void ResetColIndices(nsIFrame* aFirstFrame,
+                              nsTableColGroupFrame* aSyntheticColGroup,
+                              int32_t aFirstColIndex,
+                              nsIFrame* aStartColFrame = nullptr);
+
+  void InvalidateFrame(uint32_t aDisplayItemKey = 0,
+                       bool aRebuildDisplayItems = true) override;
+  void InvalidateFrameWithRect(const nsRect& aRect,
+                               uint32_t aDisplayItemKey = 0,
+                               bool aRebuildDisplayItems = true) override;
+  void InvalidateFrameForRemoval() override { InvalidateFrameSubtree(); }
+
+ protected:
+  nsTableColGroupFrame(ComputedStyle* aStyle, nsPresContext* aPresContext);
+
+  void InsertColsReflow(int32_t aColIndex, const nsFrameList::Slice& aCols);
+
+  LogicalSides GetLogicalSkipSides() const override;
+
+  int32_t mColCount;
+  int32_t mStartColIndex;
+};
+
+inline nsTableColGroupFrame::nsTableColGroupFrame(ComputedStyle* aStyle,
+                                                  nsPresContext* aPresContext)
+    : nsContainerFrame(aStyle, aPresContext, kClassID),
+      mColCount(0),
+      mStartColIndex(0) {}
+
+inline int32_t nsTableColGroupFrame::GetStartColumnIndex() {
+  return mStartColIndex;
+}
+
+inline void nsTableColGroupFrame::SetStartColumnIndex(int32_t aIndex) {
+  mStartColIndex = aIndex;
+}
+
+inline int32_t nsTableColGroupFrame::GetColCount() const { return mColCount; }
+
+inline nsFrameList& nsTableColGroupFrame::GetWritableChildList() {
+  return mFrames;
+}
+
+#endif

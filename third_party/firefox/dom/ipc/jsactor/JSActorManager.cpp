@@ -1,0 +1,226 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/JSActorManager.h"
+
+#include "js/CallAndConstruct.h"    // JS::Construct
+#include "js/PropertyAndElement.h"  // JS_GetProperty
+#include "jsapi.h"
+#include "mozJSModuleLoader.h"
+#include "mozilla/AppShutdown.h"
+#include "mozilla/CycleCollectedJSRuntime.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/dom/AutoEntryScript.h"
+#include "mozilla/dom/JSActorService.h"
+#include "mozilla/dom/JSIPCValue.h"
+#include "mozilla/dom/JSIPCValueUtils.h"
+#include "mozilla/dom/JSProcessActorProtocol.h"
+#include "mozilla/dom/JSWindowActorProtocol.h"
+#include "mozilla/dom/MessagePort.h"
+#include "mozilla/dom/PWindowGlobal.h"
+#include "mozilla/ipc/ProtocolUtils.h"
+#include "nsContentUtils.h"
+
+namespace mozilla::dom {
+
+already_AddRefed<JSActor> JSActorManager::GetActor(JSContext* aCx,
+                                                   const nsACString& aName,
+                                                   ErrorResult& aRv) {
+  MOZ_ASSERT(nsContentUtils::IsSafeToRunScript());
+
+  mozilla::ipc::IProtocol* nativeActor = AsNativeActor();
+  if (!nativeActor->CanSend()) {
+    aRv.ThrowInvalidStateError(nsPrintfCString(
+        "Cannot get actor '%s'. Native '%s' actor is destroyed.",
+        PromiseFlatCString(aName).get(), nativeActor->GetProtocolName()));
+    return nullptr;
+  }
+
+  if (RefPtr<JSActor> actor = mJSActors.Get(aName)) {
+    return actor.forget();
+  }
+
+  RefPtr<JSActorService> actorSvc = JSActorService::GetSingleton();
+  if (!actorSvc) {
+    aRv.ThrowInvalidStateError("JSActorService hasn't been initialized");
+    return nullptr;
+  }
+
+  RefPtr<JSActorProtocol> protocol =
+      MatchingJSActorProtocol(actorSvc, aName, aRv);
+  if (!protocol) {
+    return nullptr;
+  }
+
+  auto& side = nativeActor->GetSide() == mozilla::ipc::ParentSide
+                   ? protocol->Parent()
+                   : protocol->Child();
+
+  RefPtr loader = protocol->mLoadInDevToolsLoader
+                      ? mozJSModuleLoader::GetOrCreateDevToolsLoader(aCx)
+                      : mozJSModuleLoader::Get();
+  MOZ_ASSERT(loader);
+
+  JSAutoRealm ar(aCx, loader->GetSharedGlobal());
+
+  JS::Rooted<JSObject*> actorObj(aCx);
+  if (side.mESModuleURI) {
+    JS::Rooted<JSObject*> exports(aCx);
+    aRv = loader->ImportESModule(aCx, side.mESModuleURI.ref(), &exports);
+    if (aRv.Failed()) {
+      return nullptr;
+    }
+    MOZ_ASSERT(exports, "null exports!");
+
+    JS::Rooted<JS::Value> ctor(aCx);
+    nsAutoCString ctorName(aName);
+    ctorName.Append(StringFromIPCSide(nativeActor->GetSide()));
+    if (!JS_GetProperty(aCx, exports, ctorName.get(), &ctor)) {
+      aRv.NoteJSContextException(aCx);
+      return nullptr;
+    }
+
+    if (NS_WARN_IF(!ctor.isObject())) {
+      aRv.ThrowNotFoundError(nsPrintfCString(
+          "Could not find actor constructor '%s'", ctorName.get()));
+      return nullptr;
+    }
+
+    if (!JS::Construct(aCx, ctor, JS::HandleValueArray::empty(), &actorObj)) {
+      aRv.NoteJSContextException(aCx);
+      return nullptr;
+    }
+  }
+
+  RefPtr<JSActor> actor = InitJSActor(actorObj, aName, aRv);
+  if (aRv.Failed()) {
+    return nullptr;
+  }
+  mJSActors.InsertOrUpdate(aName, RefPtr{actor});
+  return actor.forget();
+}
+
+already_AddRefed<JSActor> JSActorManager::GetExistingActor(
+    const nsACString& aName) {
+  if (!AsNativeActor()->CanSend()) {
+    return nullptr;
+  }
+  return mJSActors.Get(aName);
+}
+
+#define CHILD_DIAGNOSTIC_ASSERT(test, msg) \
+  do {                                     \
+    if (XRE_IsParentProcess()) {           \
+      MOZ_ASSERT(test, msg);               \
+    } else {                               \
+      MOZ_DIAGNOSTIC_ASSERT(test, msg);    \
+    }                                      \
+  } while (0)
+
+void JSActorManager::ReceiveRawMessage(const JSActorMessageMeta& aMetadata,
+                                       JSIPCValue&& aData,
+                                       ipc::StructuredCloneData* aStack) {
+  MOZ_ASSERT(nsContentUtils::IsSafeToRunScript());
+
+  AutoEntryScript aes(xpc::PrivilegedJunkScope(), "JSActor message handler");
+  JSContext* cx = aes.cx();
+
+  ErrorResult error;
+  auto autoSetException =
+      MakeScopeExit([&] { (void)error.MaybeSetPendingException(cx); });
+
+  JS::Rooted<JSObject*> stack(cx);
+  Maybe<JS::AutoSetAsyncStackForNewCalls> stackSetter;
+  {
+    JS::Rooted<JS::Value> stackVal(cx);
+    if (aStack) {
+      aStack->Read(cx, &stackVal, error);
+      if (error.Failed()) {
+        error.SuppressException();
+        stackVal.setUndefined();
+      }
+    }
+
+    if (stackVal.isObject()) {
+      stack = &stackVal.toObject();
+      if (!js::IsSavedFrame(stack)) {
+        CHILD_DIAGNOSTIC_ASSERT(false, "Stack must be a SavedFrame object");
+        error.ThrowDataError("Actor async stack must be a SavedFrame object");
+        return;
+      }
+      stackSetter.emplace(cx, stack, "JSActor query");
+    }
+  }
+
+  RefPtr<JSActor> actor = GetActor(cx, aMetadata.actorName(), error);
+  if (error.Failed()) {
+    return;
+  }
+
+#ifdef DEBUG
+  {
+    RefPtr<JSActorService> actorSvc = JSActorService::GetSingleton();
+    RefPtr windowProtocol(
+        actorSvc->GetJSWindowActorProtocol(aMetadata.actorName()));
+    RefPtr processProtocol(
+        actorSvc->GetJSProcessActorProtocol(aMetadata.actorName()));
+    MOZ_ASSERT(windowProtocol || processProtocol,
+               "The protocol of this actor should exist");
+  }
+#endif  // DEBUG
+
+  JS::Rooted<JS::Value> data(cx);
+  JSIPCValueUtils::ToJSVal(cx, std::move(aData), &data, error);
+  if (error.Failed()) {
+    CHILD_DIAGNOSTIC_ASSERT(CycleCollectedJSRuntime::Get()->OOMReported(),
+                            "Should not receive non-decodable data");
+    return;
+  }
+
+  switch (aMetadata.kind()) {
+    case JSActorMessageKind::QueryResolve:
+    case JSActorMessageKind::QueryReject:
+      actor->ReceiveQueryReply(cx, aMetadata, data, error);
+      break;
+
+    case JSActorMessageKind::Message:
+      actor->ReceiveMessage(cx, aMetadata, data, error);
+      break;
+
+    case JSActorMessageKind::Query:
+      actor->ReceiveQuery(cx, aMetadata, data, error);
+      break;
+
+    default:
+      MOZ_ASSERT_UNREACHABLE();
+  }
+}
+
+void JSActorManager::JSActorWillDestroy() {
+  for (const auto& entry : mJSActors.Values()) {
+    entry->StartDestroy();
+  }
+}
+
+void JSActorManager::JSActorDidDestroy() {
+  MOZ_ASSERT(nsContentUtils::IsSafeToRunScript());
+  const nsRefPtrHashtable<nsCStringHashKey, JSActor> actors =
+      std::move(mJSActors);
+  for (const auto& entry : actors.Values()) {
+    if (!AppShutdown::IsInOrBeyond(ShutdownPhase::XPCOMShutdownFinal)) {
+      entry->AfterDestroy();
+    }
+  }
+}
+
+void JSActorManager::JSActorUnregister(const nsACString& aName) {
+  MOZ_ASSERT(nsContentUtils::IsSafeToRunScript());
+
+  RefPtr<JSActor> actor;
+  if (mJSActors.Remove(aName, getter_AddRefs(actor))) {
+    actor->AfterDestroy();
+  }
+}
+
+}  

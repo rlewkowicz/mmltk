@@ -1,0 +1,159 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_localstorage_LSObject_h
+#define mozilla_dom_localstorage_LSObject_h
+
+#include <cstdint>
+
+#include "ErrorList.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/dom/Storage.h"
+#include "mozilla/ipc/PBackgroundSharedTypes.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsID.h"
+#include "nsISupports.h"
+#include "nsStringFwd.h"
+#include "nsTArrayForwardDeclare.h"
+
+class nsGlobalWindowInner;
+class nsIEventTarget;
+class nsIPrincipal;
+class nsISerialEventTarget;
+class nsPIDOMWindowInner;
+
+namespace mozilla {
+
+class ErrorResult;
+
+namespace dom {
+
+class LSDatabase;
+class LSObjectChild;
+class LSObserver;
+class LSRequestChild;
+class LSRequestChildCallback;
+class LSRequestParams;
+class LSRequestResponse;
+
+class LSObject final : public Storage {
+  using PrincipalInfo = mozilla::ipc::PrincipalInfo;
+
+  friend nsGlobalWindowInner;
+
+  UniquePtr<PrincipalInfo> mPrincipalInfo;
+  UniquePtr<PrincipalInfo> mStoragePrincipalInfo;
+
+  RefPtr<LSDatabase> mDatabase;
+  RefPtr<LSObserver> mObserver;
+
+  uint32_t mPrivateBrowsingId;
+  Maybe<nsID> mClientId;
+  Maybe<PrincipalInfo> mClientPrincipalInfo;
+  nsCString mOrigin;
+  nsCString mOriginKey;
+  nsString mDocumentURI;
+
+  bool mInExplicitSnapshot;
+
+ public:
+  static nsresult CreateForWindow(nsPIDOMWindowInner* aWindow,
+                                  Storage** aStorage);
+
+  static nsresult CreateForPrincipal(nsPIDOMWindowInner* aWindow,
+                                     nsIPrincipal* aPrincipal,
+                                     nsIPrincipal* aStoragePrincipal,
+                                     const nsAString& aDocumentURI,
+                                     bool aPrivate, LSObject** aObject);
+
+  void AssertIsOnOwningThread() const { NS_ASSERT_OWNINGTHREAD(LSObject); }
+
+  const RefPtr<LSDatabase>& DatabaseStrongRef() const { return mDatabase; }
+
+  const nsString& DocumentURI() const { return mDocumentURI; }
+
+  bool InExplicitSnapshot() const { return mInExplicitSnapshot; }
+
+  LSRequestChild* StartRequest(const LSRequestParams& aParams,
+                               LSRequestChildCallback* aCallback);
+
+  StorageType Type() const override;
+
+  bool IsForkOf(const Storage* aStorage) const override;
+
+  int64_t GetOriginQuotaUsage() const override;
+
+  void Disconnect() override;
+
+  uint32_t GetLength(nsIPrincipal& aSubjectPrincipal,
+                     ErrorResult& aError) override;
+
+  void Key(uint32_t aIndex, nsAString& aResult, nsIPrincipal& aSubjectPrincipal,
+           ErrorResult& aError) override;
+
+  void GetItem(const nsAString& aKey, nsAString& aResult,
+               nsIPrincipal& aSubjectPrincipal, ErrorResult& aError) override;
+
+  void GetSupportedNames(nsTArray<nsString>& aNames) override;
+
+  void SetItem(const nsAString& aKey, const nsAString& aValue,
+               nsIPrincipal& aSubjectPrincipal, ErrorResult& aError) override;
+
+  void RemoveItem(const nsAString& aKey, nsIPrincipal& aSubjectPrincipal,
+                  ErrorResult& aError) override;
+
+  void Clear(nsIPrincipal& aSubjectPrincipal, ErrorResult& aError) override;
+
+  void Open(nsIPrincipal& aSubjectPrincipal, ErrorResult& aError) override;
+
+  void Close(nsIPrincipal& aSubjectPrincipal, ErrorResult& aError) override;
+
+  void BeginExplicitSnapshot(nsIPrincipal& aSubjectPrincipal,
+                             ErrorResult& aError) override;
+
+  void CheckpointExplicitSnapshot(nsIPrincipal& aSubjectPrincipal,
+                                  ErrorResult& aError) override;
+
+  void EndExplicitSnapshot(nsIPrincipal& aSubjectPrincipal,
+                           ErrorResult& aError) override;
+
+  bool GetHasSnapshot(nsIPrincipal& aSubjectPrincipal,
+                      ErrorResult& aError) override;
+
+  int64_t GetSnapshotUsage(nsIPrincipal& aSubjectPrincipal,
+                           ErrorResult& aError) override;
+
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(LSObject, Storage)
+
+ private:
+  LSObject(nsPIDOMWindowInner* aWindow, nsIPrincipal* aPrincipal,
+           nsIPrincipal* aStoragePrincipal);
+
+  ~LSObject();
+
+  nsresult DoRequestSynchronously(const LSRequestParams& aParams,
+                                  LSRequestResponse& aResponse);
+
+  nsresult EnsureDatabase();
+
+  void DropDatabase();
+
+  nsresult EnsureObserver();
+
+  void DropObserver();
+
+  void OnChange(const nsAString& aKey, const nsAString& aOldValue,
+                const nsAString& aNewValue);
+
+  void LastRelease() override;
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_localstorage_LSObject_h

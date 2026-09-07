@@ -1,0 +1,68 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_cache_BoundStorageKeyChild_h
+#define mozilla_dom_cache_BoundStorageKeyChild_h
+
+#include "mozilla/dom/cache/ActorChild.h"
+#include "mozilla/dom/cache/ActorUtils.h"
+#include "mozilla/dom/cache/PBoundStorageKeyChild.h"
+#include "mozilla/dom/cache/TypeUtils.h"
+#include "mozilla/dom/cache/Types.h"
+#include "mozilla/ipc/ProtocolUtils.h"
+
+class nsIGlobalObject;
+
+namespace mozilla::dom::cache {
+class CacheWorkerRef;
+
+class PCacheChild;
+class PCacheStreamControlChild;
+class CacheOpArgs;
+class PCacheChild;
+class PCacheOpChild;
+
+using ActorDestroyReason = ::mozilla::ipc::IProtocol::ActorDestroyReason;
+class BoundStorageKeyChild final : public PBoundStorageKeyChild,
+                                   public ActorChild {
+  friend class PBoundStorageKeyChild;
+
+ public:
+  explicit BoundStorageKeyChild(BoundStorageKeyChildListener* aListener);
+
+  void ClearListener();
+
+  void StartDestroyFromListener();
+
+  NS_INLINE_DECL_REFCOUNTING(BoundStorageKeyChild, override)
+  void NoteDeletedActor() override;
+
+  already_AddRefed<PCacheChild> AllocPCacheChild() {
+    return dom::cache::AllocPCacheChild(this);
+  }
+
+  already_AddRefed<PCacheStreamControlChild> AllocPCacheStreamControlChild() {
+    return dom::cache::AllocPCacheStreamControlChild(this);
+  }
+
+ private:
+  ~BoundStorageKeyChild();
+  void DestroyInternal();
+
+  virtual void StartDestroy() override;
+
+  virtual void ActorDestroy(ActorDestroyReason aReason) override;
+
+  inline uint32_t NumChildActors() {
+    return ManagedPCacheStorageChild().Count() + ManagedPCacheChild().Count() +
+           ManagedPCacheStreamControlChild().Count();
+  }
+
+  BoundStorageKeyChildListener* MOZ_NON_OWNING_REF mListener;
+  bool mDelayedDestroy;
+};
+
+}  
+
+#endif  // mozilla_dom_cache_BoundStorageKeyChild_h

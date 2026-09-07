@@ -1,0 +1,236 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DISPLAYLISTCLIPSTATE_H_
+#define DISPLAYLISTCLIPSTATE_H_
+
+#include "DisplayItemClip.h"
+#include "DisplayItemClipChain.h"
+
+class nsIFrame;
+
+namespace mozilla {
+
+class nsDisplayListBuilder;
+
+class DisplayListClipState {
+ public:
+  DisplayListClipState()
+      : mClipChainContentDescendants(nullptr),
+        mClipChainContainingBlockDescendants(nullptr),
+        mCurrentCombinedClipChain(nullptr),
+        mCurrentCombinedClipChainIsValid(false) {}
+
+  const DisplayItemClipChain* GetCurrentCombinedClipChain(
+      nsDisplayListBuilder* aBuilder);
+
+  const DisplayItemClipChain* GetClipChainForContainingBlockDescendants()
+      const {
+    return mClipChainContainingBlockDescendants;
+  }
+  const DisplayItemClipChain* GetClipChainForContentDescendants() const {
+    return mClipChainContentDescendants;
+  }
+
+  const ActiveScrolledRoot* GetContentClipASR() const {
+    return mClipChainContentDescendants ? mClipChainContentDescendants->mASR
+                                        : nullptr;
+  }
+
+  class AutoSaveRestore;
+
+  class AutoClipContainingBlockDescendantsToContentBox;
+
+  class AutoClipMultiple;
+
+  enum { ASSUME_DRAWING_RESTRICTED_TO_CONTENT_RECT = 0x01 };
+
+ private:
+  void Clear() {
+    mClipChainContentDescendants = nullptr;
+    mClipChainContainingBlockDescendants = nullptr;
+    mCurrentCombinedClipChain = nullptr;
+    mCurrentCombinedClipChainIsValid = false;
+  }
+
+  void SetClipChainForContainingBlockDescendants(
+      const DisplayItemClipChain* aClipChain) {
+    mClipChainContainingBlockDescendants = aClipChain;
+    InvalidateCurrentCombinedClipChain(aClipChain ? aClipChain->mASR : nullptr);
+  }
+
+  void ClipContainingBlockDescendants(nsDisplayListBuilder* aBuilder,
+                                      const nsRect& aRect,
+                                      const nsRectCornerRadii* aRadii,
+                                      DisplayItemClipChain& aClipChainOnStack);
+
+  void ClipToDisplayPort(nsDisplayListBuilder* aBuilder, const nsRect& aRect,
+                         DisplayItemClipChain& aClipChainOnStack);
+
+  void ClipContentDescendants(nsDisplayListBuilder* aBuilder,
+                              const nsRect& aRect,
+                              const nsRectCornerRadii* aRadii,
+                              DisplayItemClipChain& aClipChainOnStack);
+  void ClipContentDescendants(nsDisplayListBuilder* aBuilder,
+                              const nsRect& aRect, const nsRect& aRoundedRect,
+                              const nsRectCornerRadii* aRadii,
+                              DisplayItemClipChain& aClipChainOnStack);
+
+  void InvalidateCurrentCombinedClipChain(
+      const ActiveScrolledRoot* aInvalidateUpTo);
+
+  void ClipContainingBlockDescendantsToContentBox(
+      nsDisplayListBuilder* aBuilder, nsIFrame* aFrame,
+      DisplayItemClipChain& aClipChainOnStack, uint32_t aFlags);
+
+  const DisplayItemClipChain* mClipChainContentDescendants;
+  const DisplayItemClipChain* mClipChainContainingBlockDescendants;
+  const DisplayItemClipChain* mCurrentCombinedClipChain;
+  bool mCurrentCombinedClipChainIsValid;
+};
+
+class DisplayListClipState::AutoSaveRestore {
+ public:
+  explicit AutoSaveRestore(nsDisplayListBuilder* aBuilder);
+  void Restore() {
+    mState = mSavedState;
+#ifdef DEBUG
+    mRestored = true;
+#endif
+  }
+  ~AutoSaveRestore() { Restore(); }
+
+  void Clear() {
+    NS_ASSERTION(!mRestored, "Already restored!");
+    mState.Clear();
+#ifdef DEBUG
+    mClipUsed = false;
+#endif
+  }
+
+  void SetClipChainForContainingBlockDescendants(
+      const DisplayItemClipChain* aClipChain) {
+    mState.SetClipChainForContainingBlockDescendants(aClipChain);
+  }
+
+  void ClipContainingBlockDescendants(
+      const nsRect& aRect, const nsRectCornerRadii* aRadii = nullptr) {
+    NS_ASSERTION(!mRestored, "Already restored!");
+    NS_ASSERTION(!mClipUsed, "mClip already used");
+#ifdef DEBUG
+    mClipUsed = true;
+#endif
+    mState.ClipContainingBlockDescendants(mBuilder, aRect, aRadii, mClipChain);
+  }
+
+  void ClipToDisplayPort(const nsRect& aRect) {
+    NS_ASSERTION(!mRestored, "Already restored!");
+    NS_ASSERTION(!mClipUsed, "mClip already used");
+#ifdef DEBUG
+    mClipUsed = true;
+#endif
+    mState.ClipToDisplayPort(mBuilder, aRect, mClipChain);
+  }
+
+  void ClipContentDescendants(const nsRect& aRect,
+                              const nsRectCornerRadii* aRadii = nullptr) {
+    NS_ASSERTION(!mRestored, "Already restored!");
+    NS_ASSERTION(!mClipUsed, "mClip already used");
+#ifdef DEBUG
+    mClipUsed = true;
+#endif
+    mState.ClipContentDescendants(mBuilder, aRect, aRadii, mClipChain);
+  }
+
+  void ClipContentDescendants(const nsRect& aRect, const nsRect& aRoundedRect,
+                              const nsRectCornerRadii* aRadii = nullptr) {
+    NS_ASSERTION(!mRestored, "Already restored!");
+    NS_ASSERTION(!mClipUsed, "mClip already used");
+#ifdef DEBUG
+    mClipUsed = true;
+#endif
+    mState.ClipContentDescendants(mBuilder, aRect, aRoundedRect, aRadii,
+                                  mClipChain);
+  }
+
+  void ClipContainingBlockDescendantsToContentBox(
+      nsDisplayListBuilder* aBuilder, nsIFrame* aFrame, uint32_t aFlags = 0) {
+    NS_ASSERTION(!mRestored, "Already restored!");
+    NS_ASSERTION(!mClipUsed, "mClip already used");
+#ifdef DEBUG
+    mClipUsed = true;
+#endif
+    mState.ClipContainingBlockDescendantsToContentBox(aBuilder, aFrame,
+                                                      mClipChain, aFlags);
+  }
+
+  void MaybeRemoveDisplayportClip() {
+    if (!mState.mClipChainContainingBlockDescendants) return;
+
+    if (mState.mClipChainContainingBlockDescendants->IsDisplayportClip()) {
+      auto* displayportClipItem = mState.mClipChainContainingBlockDescendants;
+      mState.mClipChainContainingBlockDescendants =
+          mState.mClipChainContainingBlockDescendants->mParent;
+      mState.InvalidateCurrentCombinedClipChain(displayportClipItem->mASR);
+    }
+  }
+
+ protected:
+  nsDisplayListBuilder* mBuilder;
+  DisplayListClipState& mState;
+  DisplayListClipState mSavedState;
+  DisplayItemClipChain mClipChain;
+#ifdef DEBUG
+  bool mClipUsed;
+  bool mRestored;
+#endif
+};
+
+class DisplayListClipState::AutoClipContainingBlockDescendantsToContentBox
+    : public AutoSaveRestore {
+ public:
+  AutoClipContainingBlockDescendantsToContentBox(nsDisplayListBuilder* aBuilder,
+                                                 nsIFrame* aFrame,
+                                                 uint32_t aFlags = 0)
+      : AutoSaveRestore(aBuilder) {
+#ifdef DEBUG
+    mClipUsed = true;
+#endif
+    mState.ClipContainingBlockDescendantsToContentBox(aBuilder, aFrame,
+                                                      mClipChain, aFlags);
+  }
+};
+
+class DisplayListClipState::AutoClipMultiple : public AutoSaveRestore {
+ public:
+  explicit AutoClipMultiple(nsDisplayListBuilder* aBuilder)
+      : AutoSaveRestore(aBuilder)
+#ifdef DEBUG
+        ,
+        mExtraClipUsed(false)
+#endif
+  {
+  }
+
+  void ClipContainingBlockDescendantsExtra(const nsRect& aRect,
+                                           const nsRectCornerRadii* aRadii) {
+    NS_ASSERTION(!mRestored, "Already restored!");
+    NS_ASSERTION(!mExtraClipUsed, "mExtraClip already used");
+#ifdef DEBUG
+    mExtraClipUsed = true;
+#endif
+    mState.ClipContainingBlockDescendants(mBuilder, aRect, aRadii,
+                                          mExtraClipChain);
+  }
+
+ protected:
+  DisplayItemClipChain mExtraClipChain;
+#ifdef DEBUG
+  bool mExtraClipUsed;
+#endif
+};
+
+}  
+
+#endif /* DISPLAYLISTCLIPSTATE_H_ */

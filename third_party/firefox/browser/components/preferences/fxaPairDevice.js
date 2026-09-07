@@ -1,0 +1,127 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+const { XPCOMUtils } = ChromeUtils.importESModule(
+  "resource://gre/modules/XPCOMUtils.sys.mjs"
+);
+const { FxAccounts } = ChromeUtils.importESModule(
+  "resource://gre/modules/FxAccounts.sys.mjs"
+);
+const { Weave } = ChromeUtils.importESModule(
+  "resource://services-sync/main.sys.mjs"
+);
+
+ChromeUtils.defineESModuleGetters(this, {
+  EventEmitter: "resource://gre/modules/EventEmitter.sys.mjs",
+  FxAccountsPairingFlow: "resource://gre/modules/FxAccountsPairing.sys.mjs",
+  QR: "moz-src:///toolkit/components/qrcode/encoder.mjs",
+});
+
+const MIN_PAIRING_LOADING_TIME_MS = 1000;
+
+var gFxaPairDeviceDialog = {
+  init() {
+    window.addEventListener("unload", () => this.uninit());
+    document
+      .getElementById("qrError")
+      .addEventListener("click", () => this.startPairingFlow());
+
+    this._resetBackgroundQR();
+    Services.tm.dispatchToMainThread(() => this.startPairingFlow());
+  },
+
+  uninit() {
+    const browser = window.docShell.chromeEventHandler;
+    browser.loadURI(Services.io.newURI("about:preferences#sync"), {
+      triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal(),
+    });
+
+    this.teardownListeners();
+    this._emitter.emit("view:Closed");
+  },
+
+  async startPairingFlow() {
+    this._resetBackgroundQR();
+    document
+      .getElementById("qrWrapper")
+      .setAttribute("pairing-status", "loading");
+    this._emitter = new EventEmitter();
+    this.setupListeners();
+    try {
+      if (!Weave.Utils.ensureMPUnlocked()) {
+        throw new Error("Master-password locked.");
+      }
+      this._styleParentDialog();
+
+      const [, uri] = await Promise.all([
+        new Promise(res => setTimeout(res, MIN_PAIRING_LOADING_TIME_MS)),
+        FxAccountsPairingFlow.start({ emitter: this._emitter }),
+      ]);
+      const imgData = QR.encodeToDataURI(uri, "L");
+      document.getElementById("qrContainer").style.backgroundImage =
+        `url("${imgData.src}")`;
+      document
+        .getElementById("qrWrapper")
+        .setAttribute("pairing-status", "ready");
+    } catch (e) {
+      this.onError(e);
+    }
+  },
+
+  _styleParentDialog() {
+    let dialogParent = window.parent.document;
+
+    let dialogBox = dialogParent.querySelector(".dialogBox");
+    dialogBox.style.overflow = "visible";
+    dialogBox.style.borderRadius = "12px";
+
+    let dialogTitle = dialogParent.querySelector(".dialogTitleBar");
+    dialogTitle.style.borderBottom = "none";
+    dialogTitle.classList.add("fxaPairDeviceIcon");
+  },
+
+  _resetBackgroundQR() {
+    const imgData = QR.encodeToDataURI(
+      "https://accounts.firefox.com/pair",
+      "L"
+    );
+    document.getElementById("qrContainer").style.backgroundImage =
+      `url("${imgData.src}")`;
+  },
+
+  onError(err) {
+    console.error(err);
+    this.teardownListeners();
+    document
+      .getElementById("qrWrapper")
+      .setAttribute("pairing-status", "error");
+  },
+
+  _switchToUrl(url) {
+    const browser = window.docShell.chromeEventHandler;
+    browser.fixupAndLoadURIString(url, {
+      triggeringPrincipal: Services.scriptSecurityManager.createNullPrincipal(
+        {}
+      ),
+    });
+  },
+
+  setupListeners() {
+    this._switchToWebContent = (_, url) => this._switchToUrl(url);
+    this._onError = (_, error) => this.onError(error);
+    this._emitter.once("view:SwitchToWebContent", this._switchToWebContent);
+    this._emitter.on("view:Error", this._onError);
+  },
+
+  teardownListeners() {
+    try {
+      this._emitter.off("view:SwitchToWebContent", this._switchToWebContent);
+      this._emitter.off("view:Error", this._onError);
+    } catch (e) {
+      console.warn("Error while tearing down listeners.", e);
+    }
+  },
+};
+
+window.addEventListener("load", () => gFxaPairDeviceDialog.init());

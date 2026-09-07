@@ -1,0 +1,117 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/cache/CacheChild.h"
+
+#include "CacheWorkerRef.h"
+#include "mozilla/dom/cache/ActorUtils.h"
+#include "mozilla/dom/cache/Cache.h"
+#include "mozilla/dom/cache/CacheOpChild.h"
+
+namespace mozilla::dom::cache {
+
+already_AddRefed<PCacheChild> AllocPCacheChild(ActorChild* aParentActor) {
+  return MakeAndAddRef<CacheChild>(aParentActor);
+}
+
+void DeallocPCacheChild(PCacheChild* aActor) { delete aActor; }
+
+CacheChild::CacheChild(ActorChild* aParentActor)
+    : mParentActor(aParentActor),
+      mListener(nullptr),
+      mLocked(false),
+      mDelayedDestroy(false) {
+  MOZ_COUNT_CTOR(cache::CacheChild);
+}
+
+CacheChild::~CacheChild() {
+  MOZ_COUNT_DTOR(cache::CacheChild);
+  NS_ASSERT_OWNINGTHREAD(CacheChild);
+  MOZ_DIAGNOSTIC_ASSERT(!mListener);
+  MOZ_DIAGNOSTIC_ASSERT(!mLocked);
+}
+
+void CacheChild::SetListener(CacheChildListener* aListener) {
+  NS_ASSERT_OWNINGTHREAD(CacheChild);
+  MOZ_DIAGNOSTIC_ASSERT(!mListener);
+  mListener = aListener;
+  MOZ_DIAGNOSTIC_ASSERT(mListener);
+}
+
+void CacheChild::ClearListener() {
+  NS_ASSERT_OWNINGTHREAD(CacheChild);
+  MOZ_DIAGNOSTIC_ASSERT(mListener);
+  mListener = nullptr;
+}
+
+void CacheChild::StartDestroyFromListener() {
+  NS_ASSERT_OWNINGTHREAD(CacheChild);
+
+  MOZ_DIAGNOSTIC_ASSERT(NumChildActors() == 0);
+  StartDestroy();
+}
+
+void CacheChild::DestroyInternal() {
+  CacheChildListener* listener = mListener;
+
+  if (!listener) {
+    return;
+  }
+
+  listener->OnActorDestroy(this);
+
+  MOZ_DIAGNOSTIC_ASSERT(!mListener);
+
+  QM_WARNONLY_TRY(OkIf(SendTeardown()));
+}
+
+void CacheChild::StartDestroy() {
+  NS_ASSERT_OWNINGTHREAD(CacheChild);
+
+  if (NumChildActors() != 0 || mLocked) {
+    mDelayedDestroy = true;
+    return;
+  }
+
+  DestroyInternal();
+}
+
+void CacheChild::ActorDestroy(ActorDestroyReason aReason) {
+  NS_ASSERT_OWNINGTHREAD(CacheChild);
+  CacheChildListener* listener = mListener;
+  if (listener) {
+    listener->OnActorDestroy(this);
+    MOZ_DIAGNOSTIC_ASSERT(!mListener);
+  }
+
+  if (mParentActor) {
+    mParentActor->NoteDeletedActor();
+  }
+
+  RemoveWorkerRef();
+}
+
+void CacheChild::NoteDeletedActor() {
+  if (NumChildActors() == 0 && mDelayedDestroy && !mLocked) DestroyInternal();
+}
+
+already_AddRefed<PCacheOpChild> CacheChild::AllocPCacheOpChild(
+    const CacheOpArgs& aOpArgs) {
+  MOZ_CRASH("CacheOpChild should be manually constructed.");
+  return nullptr;
+}
+
+void CacheChild::Lock() {
+  NS_ASSERT_OWNINGTHREAD(CacheChild);
+  MOZ_DIAGNOSTIC_ASSERT(!mLocked);
+  mLocked = true;
+}
+
+void CacheChild::Unlock() {
+  NS_ASSERT_OWNINGTHREAD(CacheChild);
+  MOZ_DIAGNOSTIC_ASSERT(mLocked);
+  mLocked = false;
+}
+
+}  

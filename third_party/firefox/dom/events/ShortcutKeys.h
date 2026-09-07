@@ -1,0 +1,64 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_ShortcutKeys_h
+#define mozilla_ShortcutKeys_h
+
+#include "nsIObserver.h"
+
+class nsAtom;
+
+namespace mozilla {
+class KeyEventHandler;
+class WidgetKeyboardEvent;
+
+struct ShortcutKeyData {
+  const char16_t* event;
+  const char16_t* keycode;
+  const char16_t* key;
+  const char16_t* modifiers;
+  const char16_t* command;
+};
+
+enum class HandlerType {
+  eInput,
+  eTextArea,
+  eBrowser,
+  eEditor,
+};
+
+class ShortcutKeys : public nsIObserver {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+
+  static KeyEventHandler* GetHandlers(HandlerType aType);
+
+  static nsAtom* ConvertEventToDOMEventType(
+      const WidgetKeyboardEvent* aWidgetKeyboardEvent);
+
+  static void Shutdown();
+
+ protected:
+  ShortcutKeys();
+  virtual ~ShortcutKeys();
+
+  KeyEventHandler* EnsureHandlers(HandlerType aType);
+
+  static StaticRefPtr<ShortcutKeys> sInstance;
+
+  static ShortcutKeyData sBrowserHandlers[];
+  static ShortcutKeyData sEditorHandlers[];
+  static ShortcutKeyData sInputHandlers[];
+  static ShortcutKeyData sTextAreaHandlers[];
+
+  KeyEventHandler* mBrowserHandlers;
+  KeyEventHandler* mEditorHandlers;
+  KeyEventHandler* mInputHandlers;
+  KeyEventHandler* mTextAreaHandlers;
+};
+
+}  
+
+#endif  // #ifndef mozilla_ShortcutKeys_h

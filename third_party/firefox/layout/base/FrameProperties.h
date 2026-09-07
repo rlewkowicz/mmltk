@@ -1,0 +1,314 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef FRAMEPROPERTIES_H_
+#define FRAMEPROPERTIES_H_
+
+#include "mozilla/MemoryReporting.h"
+#include "nsTArray.h"
+#include "nsThreadUtils.h"
+
+class nsIFrame;
+
+namespace mozilla {
+
+struct FramePropertyDescriptorUntyped {
+  typedef void UntypedDestructor(void* aPropertyValue);
+  UntypedDestructor* mDestructor;
+  typedef void UntypedDestructorWithFrame(const nsIFrame* aFrame,
+                                          void* aPropertyValue);
+  UntypedDestructorWithFrame* mDestructorWithFrame;
+
+ protected:
+  constexpr FramePropertyDescriptorUntyped(
+      UntypedDestructor* aDtor, UntypedDestructorWithFrame* aDtorWithFrame)
+      : mDestructor(aDtor), mDestructorWithFrame(aDtorWithFrame) {}
+};
+
+template <typename T>
+struct FramePropertyDescriptor : public FramePropertyDescriptorUntyped {
+  typedef void Destructor(T* aPropertyValue);
+  typedef void DestructorWithFrame(const nsIFrame* aFrame, T* aPropertyValue);
+
+  template <Destructor Dtor>
+  static constexpr const FramePropertyDescriptor<T> NewWithDestructor() {
+    return {Destruct<Dtor>, nullptr};
+  }
+
+  template <DestructorWithFrame Dtor>
+  static constexpr const FramePropertyDescriptor<T>
+  NewWithDestructorWithFrame() {
+    return {nullptr, DestructWithFrame<Dtor>};
+  }
+
+  static constexpr const FramePropertyDescriptor<T> NewWithoutDestructor() {
+    return {nullptr, nullptr};
+  }
+
+ private:
+  constexpr FramePropertyDescriptor(UntypedDestructor* aDtor,
+                                    UntypedDestructorWithFrame* aDtorWithFrame)
+      : FramePropertyDescriptorUntyped(aDtor, aDtorWithFrame) {}
+
+  template <Destructor Dtor>
+  static void Destruct(void* aPropertyValue) {
+    Dtor(static_cast<T*>(aPropertyValue));
+  }
+
+  template <DestructorWithFrame Dtor>
+  static void DestructWithFrame(const nsIFrame* aFrame, void* aPropertyValue) {
+    Dtor(aFrame, static_cast<T*>(aPropertyValue));
+  }
+};
+
+template <typename T>
+class SmallValueHolder;
+
+namespace detail {
+
+template <typename T>
+struct FramePropertyTypeHelper {
+  typedef T* Type;
+};
+template <typename T>
+struct FramePropertyTypeHelper<SmallValueHolder<T>> {
+  typedef T Type;
+};
+
+}  
+
+class FrameProperties {
+ public:
+  template <typename T>
+  using Descriptor = const FramePropertyDescriptor<T>*;
+  using UntypedDescriptor = const FramePropertyDescriptorUntyped*;
+
+  template <typename T>
+  using PropertyType = typename detail::FramePropertyTypeHelper<T>::Type;
+
+  explicit FrameProperties() = default;
+
+  ~FrameProperties() {
+    MOZ_ASSERT(mProperties.Length() == 0, "forgot to delete properties");
+  }
+
+  bool IsEmpty() const { return mProperties.IsEmpty(); }
+
+  template <typename T>
+  void Set(Descriptor<T> aProperty, PropertyType<T> aValue,
+           const nsIFrame* aFrame) {
+    uint64_t v = ReinterpretHelper<T>::ToInternalValue(aValue);
+    SetInternal(aProperty, v, aFrame);
+  }
+
+  template <typename T>
+  void Add(Descriptor<T> aProperty, PropertyType<T> aValue) {
+    MOZ_ASSERT(!Has(aProperty), "duplicate frame property");
+    uint64_t v = ReinterpretHelper<T>::ToInternalValue(aValue);
+    AddInternal(aProperty, v);
+  }
+
+  template <typename T>
+  bool Has(Descriptor<T> aProperty) const {
+    return mProperties.Contains(aProperty, PropertyComparator());
+  }
+
+  template <typename T>
+  PropertyType<T> Get(Descriptor<T> aProperty,
+                      bool* aFoundResult = nullptr) const {
+    uint64_t v = GetInternal(aProperty, aFoundResult);
+    return ReinterpretHelper<T>::FromInternalValue(v);
+  }
+
+  template <typename T>
+  PropertyType<T> Take(Descriptor<T> aProperty, bool* aFoundResult = nullptr) {
+    uint64_t v = TakeInternal(aProperty, aFoundResult);
+    return ReinterpretHelper<T>::FromInternalValue(v);
+  }
+
+  template <typename T>
+  bool Remove(Descriptor<T> aProperty, const nsIFrame* aFrame) {
+    return RemoveInternal(aProperty, aFrame);
+  }
+
+  template <class F>
+  void ForEach(F aFunction) const {
+#ifdef DEBUG
+    size_t len = mProperties.Length();
+#endif
+    for (const auto& prop : mProperties) {
+      bool shouldContinue = aFunction(prop.mProperty, prop.mValue);
+      MOZ_ASSERT(len == mProperties.Length(),
+                 "frame property list was modified by ForEach callback!");
+      if (!shouldContinue) {
+        return;
+      }
+    }
+  }
+
+  void RemoveAll(const nsIFrame* aFrame) {
+    nsTArray<PropertyValue> toDelete = std::move(mProperties);
+    for (auto& prop : toDelete) {
+      prop.DestroyValueFor(aFrame);
+    }
+    MOZ_ASSERT(mProperties.IsEmpty(), "a property dtor added new properties");
+  }
+
+  size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) const {
+    return mProperties.ShallowSizeOfExcludingThis(aMallocSizeOf);
+  }
+
+ private:
+  FrameProperties(const FrameProperties&) = delete;
+  FrameProperties& operator=(const FrameProperties&) = delete;
+
+  inline void SetInternal(UntypedDescriptor aProperty, uint64_t aValue,
+                          const nsIFrame* aFrame);
+
+  inline void AddInternal(UntypedDescriptor aProperty, uint64_t aValue);
+
+  inline uint64_t GetInternal(UntypedDescriptor aProperty,
+                              bool* aFoundResult) const;
+
+  inline uint64_t TakeInternal(UntypedDescriptor aProperty, bool* aFoundResult);
+
+  inline bool RemoveInternal(UntypedDescriptor aProperty,
+                             const nsIFrame* aFrame);
+
+  template <typename T>
+  struct ReinterpretHelper {
+    static_assert(sizeof(PropertyType<T>) <= sizeof(uint64_t),
+                  "size of the value must never be larger than 64 bits");
+
+    static uint64_t ToInternalValue(PropertyType<T> aValue) {
+      uint64_t v = 0;
+      memcpy(&v, &aValue, sizeof(aValue));
+      return v;
+    }
+
+    static PropertyType<T> FromInternalValue(uint64_t aInternalValue) {
+      PropertyType<T> value;
+      memcpy(&value, &aInternalValue, sizeof(value));
+      return value;
+    }
+  };
+
+  struct PropertyValue {
+    PropertyValue() : mProperty(nullptr), mValue(0) {}
+    PropertyValue(UntypedDescriptor aProperty, uint64_t aValue)
+        : mProperty(aProperty), mValue(aValue) {}
+
+    void DestroyValueFor(const nsIFrame* aFrame) {
+      if (mProperty->mDestructor) {
+        mProperty->mDestructor(
+            ReinterpretHelper<void*>::FromInternalValue(mValue));
+      } else if (mProperty->mDestructorWithFrame) {
+        mProperty->mDestructorWithFrame(
+            aFrame, ReinterpretHelper<void*>::FromInternalValue(mValue));
+      }
+    }
+
+    UntypedDescriptor mProperty;
+    uint64_t mValue;
+  };
+
+  class PropertyComparator {
+   public:
+    bool Equals(const PropertyValue& a, const PropertyValue& b) const {
+      return a.mProperty == b.mProperty;
+    }
+    bool Equals(UntypedDescriptor a, const PropertyValue& b) const {
+      return a == b.mProperty;
+    }
+    bool Equals(const PropertyValue& a, UntypedDescriptor b) const {
+      return a.mProperty == b;
+    }
+  };
+
+  nsTArray<PropertyValue> mProperties;
+};
+
+inline uint64_t FrameProperties::GetInternal(UntypedDescriptor aProperty,
+                                             bool* aFoundResult) const {
+  MOZ_ASSERT(aProperty, "Null property?");
+
+  return mProperties.ApplyIf(
+      aProperty, 0, PropertyComparator(),
+      [&aFoundResult](const PropertyValue& aPV) -> uint64_t {
+        if (aFoundResult) {
+          *aFoundResult = true;
+        }
+        return aPV.mValue;
+      },
+      [&aFoundResult]() -> uint64_t {
+        if (aFoundResult) {
+          *aFoundResult = false;
+        }
+        return 0;
+      });
+}
+
+inline void FrameProperties::SetInternal(UntypedDescriptor aProperty,
+                                         uint64_t aValue,
+                                         const nsIFrame* aFrame) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aProperty, "Null property?");
+
+  mProperties.ApplyIf(
+      aProperty, 0, PropertyComparator(),
+      [&](PropertyValue& aPV) {
+        aPV.DestroyValueFor(aFrame);
+        aPV.mValue = aValue;
+      },
+      [&]() { mProperties.AppendElement(PropertyValue(aProperty, aValue)); });
+}
+
+inline void FrameProperties::AddInternal(UntypedDescriptor aProperty,
+                                         uint64_t aValue) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aProperty, "Null property?");
+
+  mProperties.AppendElement(PropertyValue(aProperty, aValue));
+}
+
+inline uint64_t FrameProperties::TakeInternal(UntypedDescriptor aProperty,
+                                              bool* aFoundResult) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aProperty, "Null property?");
+
+  auto index = mProperties.IndexOf(aProperty, 0, PropertyComparator());
+  if (index == nsTArray<PropertyValue>::NoIndex) {
+    if (aFoundResult) {
+      *aFoundResult = false;
+    }
+    return 0;
+  }
+
+  if (aFoundResult) {
+    *aFoundResult = true;
+  }
+
+  uint64_t result = mProperties.Elements()[index].mValue;
+  mProperties.RemoveElementAtUnsafe(index);
+
+  return result;
+}
+
+inline bool FrameProperties::RemoveInternal(UntypedDescriptor aProperty,
+                                            const nsIFrame* aFrame) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aProperty, "Null property?");
+
+  auto index = mProperties.IndexOf(aProperty, 0, PropertyComparator());
+  if (index == nsTArray<PropertyValue>::NoIndex) {
+    return false;
+  }
+  mProperties.Elements()[index].DestroyValueFor(aFrame);
+  mProperties.RemoveElementAtUnsafe(index);
+  return true;
+}
+
+}  
+
+#endif /* FRAMEPROPERTIES_H_ */

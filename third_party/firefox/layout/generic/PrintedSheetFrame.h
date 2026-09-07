@@ -1,0 +1,79 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+
+#ifndef LAYOUT_GENERIC_PRINTEDSHEETFRAME_H_
+#define LAYOUT_GENERIC_PRINTEDSHEETFRAME_H_
+
+#include "mozilla/gfx/Point.h"
+#include "nsContainerFrame.h"
+#include "nsHTMLParts.h"
+
+class nsSharedPageData;
+
+namespace mozilla {
+
+class PrintedSheetFrame final : public nsContainerFrame {
+ public:
+  using IntSize = mozilla::gfx::IntSize;
+
+  NS_DECL_QUERYFRAME
+  NS_DECL_FRAMEARENA_HELPERS(PrintedSheetFrame)
+
+  friend PrintedSheetFrame* ::NS_NewPrintedSheetFrame(
+      mozilla::PresShell* aPresShell, ComputedStyle* aStyle);
+
+  void SetSharedPageData(nsSharedPageData* aPD) { mPD = aPD; }
+
+  void ClaimPageFrameFromPrevInFlow();
+
+  void Reflow(nsPresContext* aPresContext, ReflowOutput& aReflowOutput,
+              const ReflowInput& aReflowInput,
+              nsReflowStatus& aStatus) override;
+
+  void BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                        const nsDisplayListSet& aLists) override;
+
+#ifdef DEBUG_FRAME_DUMP
+  nsresult GetFrameName(nsAString& aResult) const override;
+#endif
+
+  uint32_t GetNumPages() const { return mNumPages; }
+
+  uint32_t GetGridNumCols() const { return mGridNumCols; }
+  nsPoint GetGridOrigin() const { return mGridOrigin; }
+  nscoord GetGridCellWidth() const { return mGridCellWidth; }
+  nscoord GetGridCellHeight() const { return mGridCellHeight; }
+
+  nsSize ComputeSheetSize(const nsPresContext* aPresContext);
+
+  nsSize GetSizeForChildren() const { return mSizeForChildren; }
+
+  IntSize GetPrintTargetSizeInPoints(
+      const int32_t aAppUnitsPerPhysicalInch) const;
+
+ private:
+  PrintedSheetFrame(ComputedStyle* aStyle, nsPresContext* aPresContext)
+      : nsContainerFrame(aStyle, aPresContext, kClassID) {}
+  ~PrintedSheetFrame() = default;
+
+  void ComputePagesPerSheetGridMetrics(const nsSize& aSheetSize);
+
+  nsSize mSizeForChildren;
+
+  nsSharedPageData* mPD = nullptr;
+
+  uint32_t mNumPages = 0;
+
+  uint32_t mGridNumCols = 1;
+
+  nsPoint mGridOrigin;
+
+  nscoord mGridCellWidth = 1;
+  nscoord mGridCellHeight = 1;
+};
+
+}  
+
+#endif /* LAYOUT_GENERIC_PRINTEDSHEETFRAME_H_ */

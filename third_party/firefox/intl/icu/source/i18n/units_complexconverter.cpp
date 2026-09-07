@@ -1,0 +1,228 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#include <cmath>
+
+#include "cmemory.h"
+#include "number_decimalquantity.h"
+#include "number_roundingutils.h"
+#include "putilimp.h"
+#include "uarrsort.h"
+#include "uassert.h"
+#include "unicode/fmtable.h"
+#include "unicode/localpointer.h"
+#include "unicode/measunit.h"
+#include "unicode/measure.h"
+#include "units_complexconverter.h"
+#include "units_converter.h"
+
+U_NAMESPACE_BEGIN
+namespace units {
+ComplexUnitsConverter::ComplexUnitsConverter(const MeasureUnitImpl &targetUnit,
+                                             const ConversionRates &ratesInfo, UErrorCode &status)
+    : units_(targetUnit.extractIndividualUnitsWithIndices(status)) {
+    if (U_FAILURE(status)) {
+        return;
+    }
+    U_ASSERT(units_.length() != 0);
+
+    MeasureUnitImpl *biggestUnit = &units_[0]->unitImpl;
+    for (int32_t i = 1; i < units_.length(); i++) {
+        if (UnitsConverter::compareTwoUnits(units_[i]->unitImpl, *biggestUnit, ratesInfo, status) > 0 &&
+            U_SUCCESS(status)) {
+            biggestUnit = &units_[i]->unitImpl;
+        }
+
+        if (U_FAILURE(status)) {
+            return;
+        }
+    }
+
+    this->init(*biggestUnit, ratesInfo, status);
+}
+
+ComplexUnitsConverter::ComplexUnitsConverter(StringPiece inputUnitIdentifier,
+                                             StringPiece outputUnitsIdentifier, UErrorCode &status) {
+    if (U_FAILURE(status)) {
+        return;
+    }
+    MeasureUnitImpl inputUnit = MeasureUnitImpl::forIdentifier(inputUnitIdentifier, status);
+    MeasureUnitImpl outputUnits = MeasureUnitImpl::forIdentifier(outputUnitsIdentifier, status);
+
+    this->units_ = outputUnits.extractIndividualUnitsWithIndices(status);
+    U_ASSERT(units_.length() != 0);
+
+    this->init(inputUnit, ConversionRates(status), status);
+}
+
+ComplexUnitsConverter::ComplexUnitsConverter(const MeasureUnitImpl &inputUnit,
+                                             const MeasureUnitImpl &outputUnits,
+                                             const ConversionRates &ratesInfo, UErrorCode &status)
+    : units_(outputUnits.extractIndividualUnitsWithIndices(status)) {
+    if (U_FAILURE(status)) {
+        return;
+    }
+
+    U_ASSERT(units_.length() != 0);
+
+    this->init(inputUnit, ratesInfo, status);
+}
+
+void ComplexUnitsConverter::init(const MeasureUnitImpl &inputUnit,
+                                 const ConversionRates &ratesInfo,
+                                 UErrorCode &status) {
+    auto descendingCompareUnits = [](const void *context, const void *left, const void *right) {
+        UErrorCode status = U_ZERO_ERROR;
+
+        const auto *leftPointer = static_cast<const MeasureUnitImplWithIndex *const *>(left);
+        const auto *rightPointer = static_cast<const MeasureUnitImplWithIndex *const *>(right);
+
+        return (-1) * UnitsConverter::compareTwoUnits((**leftPointer).unitImpl,                       
+                                                      (**rightPointer).unitImpl,                      
+                                                      *static_cast<const ConversionRates *>(context), 
+                                                      status);
+    };
+
+    uprv_sortArray(units_.getAlias(),                                                                  
+                   units_.length(),                                                                    
+                   sizeof units_[0],  
+                   descendingCompareUnits,                                                             
+                   &ratesInfo,                                                                         
+                   false,                                                                              
+                   &status                                                                             
+    );
+
+    for (int i = 0, n = units_.length(); i < n; i++) {
+        if (i == 0) { 
+            unitsConverters_.emplaceBackAndCheckErrorCode(status, inputUnit, units_[i]->unitImpl,
+                                                          ratesInfo, status);
+        } else {
+            unitsConverters_.emplaceBackAndCheckErrorCode(status, units_[i - 1]->unitImpl,
+                                                          units_[i]->unitImpl, ratesInfo, status);
+        }
+
+        if (U_FAILURE(status)) {
+            return;
+        }
+    }
+}
+
+UBool ComplexUnitsConverter::greaterThanOrEqual(double quantity, double limit) const {
+    U_ASSERT(unitsConverters_.length() > 0);
+
+    double newQuantity = unitsConverters_[0]->convert(quantity);
+    return newQuantity >= limit;
+}
+
+MaybeStackVector<Measure> ComplexUnitsConverter::convert(double quantity,
+                                                         icu::number::impl::RoundingImpl *rounder,
+                                                         UErrorCode &status) const {
+    MaybeStackVector<Measure> result;
+    int sign = 1;
+    if (quantity < 0 && unitsConverters_.length() > 1) {
+        quantity *= -1;
+        sign = -1;
+    }
+
+    MaybeStackArray<int64_t, 5> intValues(unitsConverters_.length() - 1, status);
+    if (U_FAILURE(status)) {
+        return result;
+    }
+    uprv_memset(intValues.getAlias(), 0, (unitsConverters_.length() - 1) * sizeof(int64_t));
+
+    for (int i = 0, n = unitsConverters_.length(); i < n; ++i) {
+        quantity = (*unitsConverters_[i]).convert(quantity);
+        if (i < n - 1) {
+            int64_t flooredQuantity;
+            if (uprv_isNaN(quantity)) {
+                flooredQuantity = 0;
+            } else {
+                flooredQuantity = static_cast<int64_t>(floor(quantity * (1 + DBL_EPSILON)));
+            }
+            intValues[i] = flooredQuantity;
+
+            double remainder = quantity - flooredQuantity;
+            if (remainder < 0) {
+                quantity = 0;
+            } else {
+                quantity = remainder;
+            }
+        }
+    }
+
+    applyRounder(intValues, quantity, rounder, status);
+
+    MaybeStackArray<Measure *, 4> tmpResult(unitsConverters_.length(), status);
+    if (U_FAILURE(status)) {
+        return result;
+    }
+
+    for (int i = 0, n = unitsConverters_.length(); i < n; ++i) {
+        if (i < n - 1) {
+            Formattable formattableQuantity(intValues[i] * sign);
+            MeasureUnit *type = new MeasureUnit(units_[i]->unitImpl.copy(status).build(status));
+            tmpResult[units_[i]->index] = new Measure(formattableQuantity, type, status);
+        } else { 
+            Formattable formattableQuantity(quantity * sign);
+            MeasureUnit *type = new MeasureUnit(units_[i]->unitImpl.copy(status).build(status));
+            tmpResult[units_[i]->index] = new Measure(formattableQuantity, type, status);
+        }
+    }
+
+    for(int32_t i = 0, n = unitsConverters_.length(); i < n; ++i) {
+        U_ASSERT(tmpResult[i] != nullptr);
+        result.emplaceBackAndCheckErrorCode(status, *tmpResult[i]);
+        delete tmpResult[i];
+    }
+
+    return result;
+}
+
+void ComplexUnitsConverter::applyRounder(MaybeStackArray<int64_t, 5> &intValues, double &quantity,
+                                         icu::number::impl::RoundingImpl *rounder,
+                                         UErrorCode &status) const {
+    if (uprv_isInfinite(quantity) || uprv_isNaN(quantity)) {
+        return;
+    }
+
+    if (rounder == nullptr) {
+        return;
+    }
+
+    number::impl::DecimalQuantity decimalQuantity;
+    decimalQuantity.setToDouble(quantity);
+    rounder->apply(decimalQuantity, status);
+    if (U_FAILURE(status)) {
+        return;
+    }
+    quantity = decimalQuantity.toDouble();
+
+    int32_t lastIndex = unitsConverters_.length() - 1;
+    if (lastIndex == 0) {
+        return;
+    }
+
+    int64_t carry = static_cast<int64_t>(floor(unitsConverters_[lastIndex]->convertInverse(quantity) * (1 + DBL_EPSILON)));
+    if (carry <= 0) {
+        return;
+    }
+    quantity -= unitsConverters_[lastIndex]->convert(static_cast<double>(carry));
+    intValues[lastIndex - 1] += carry;
+
+    for (int32_t j = lastIndex - 1; j > 0; j--) {
+        carry = static_cast<int64_t>(floor(unitsConverters_[j]->convertInverse(static_cast<double>(intValues[j])) * (1 + DBL_EPSILON)));
+        if (carry <= 0) {
+            return;
+        }
+        intValues[j] -= static_cast<int64_t>(round(unitsConverters_[j]->convert(static_cast<double>(carry))));
+        intValues[j - 1] += carry;
+    }
+}
+
+} 
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_FORMATTING */

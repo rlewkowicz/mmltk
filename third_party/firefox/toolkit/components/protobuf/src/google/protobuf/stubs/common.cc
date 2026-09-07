@@ -1,0 +1,94 @@
+// Copyright 2008 Google Inc.  All rights reserved.
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
+
+
+#include "google/protobuf/stubs/common.h"
+
+#include <errno.h>
+#include <stdio.h>
+
+#include <atomic>
+#include <sstream>
+#include <vector>
+
+
+#include "absl/log/absl_log.h"
+#include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
+#include "google/protobuf/stubs/callback.h"
+
+#include "google/protobuf/port_def.inc"  // NOLINT
+
+namespace google {
+namespace protobuf {
+
+namespace internal {
+
+void VerifyVersion(int protobufVersionCompiledWith, const char* filename) {
+  if (GOOGLE_PROTOBUF_VERSION != protobufVersionCompiledWith) {
+    ABSL_LOG(FATAL)
+        << "This program was compiled with Protobuf C++ version "
+        << VersionString(protobufVersionCompiledWith)
+        << ", but the linked version is "
+        << VersionString(GOOGLE_PROTOBUF_VERSION)
+        << ".  Please update your library.  If you compiled the program "
+           "yourself, make sure that"
+           "your headers are from the same version of Protocol Buffers as your "
+           "link-time library.  (Version verification failed in \""
+        << filename << "\".)";
+  }
+}
+
+std::string VersionString(int version) {
+  int major = version / 1000000;
+  int minor = (version / 1000) % 1000;
+  int micro = version % 1000;
+
+  char buffer[128];
+  snprintf(buffer, sizeof(buffer), "%d.%d.%d", major, minor, micro);
+
+  buffer[sizeof(buffer)-1] = '\0';
+
+  return buffer;
+}
+
+std::string ProtocVersionString(int version) {
+  int minor = (version / 1000) % 1000;
+  int micro = version % 1000;
+
+  char buffer[128];
+  snprintf(buffer, sizeof(buffer), "%d.%d", minor, micro);
+
+  buffer[sizeof(buffer) - 1] = '\0';
+
+  return buffer;
+}
+
+}  
+
+
+
+Closure::~Closure() {}
+
+namespace internal { FunctionClosure0::~FunctionClosure0() {} }
+
+void DoNothing() {}
+
+uint32_t ghtonl(uint32_t x) {
+  union {
+    uint32_t result;
+    uint8_t result_array[4];
+  };
+  result_array[0] = static_cast<uint8_t>(x >> 24);
+  result_array[1] = static_cast<uint8_t>((x >> 16) & 0xFF);
+  result_array[2] = static_cast<uint8_t>((x >> 8) & 0xFF);
+  result_array[3] = static_cast<uint8_t>(x & 0xFF);
+  return result;
+}
+
+}  
+}  
+
+#include "google/protobuf/port_undef.inc"  // NOLINT

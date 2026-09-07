@@ -1,0 +1,336 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+
+#ifndef mozilla_EndianUtils_h
+#define mozilla_EndianUtils_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/DebugOnly.h"
+
+#include <bit>
+#include <stdint.h>
+#include <string.h>
+
+namespace mozilla {
+
+template <typename T>
+constexpr T byteswap(T n) {
+  if constexpr (sizeof(T) == 2) {
+    return __builtin_bswap16(n);
+  } else if constexpr (sizeof(T) == 4) {
+    return __builtin_bswap32(n);
+  } else if constexpr (sizeof(T) == 8) {
+    return __builtin_bswap64(n);
+  }
+}
+
+namespace detail {
+
+class EndianUtils {
+  static void assertNoOverlap(const void* aDest, const void* aSrc,
+                              size_t aCount) {
+    DebugOnly<const uint8_t*> byteDestPtr = static_cast<const uint8_t*>(aDest);
+    DebugOnly<const uint8_t*> byteSrcPtr = static_cast<const uint8_t*>(aSrc);
+    MOZ_ASSERT(
+        (byteDestPtr <= byteSrcPtr && byteDestPtr + aCount <= byteSrcPtr) ||
+        (byteSrcPtr <= byteDestPtr && byteSrcPtr + aCount <= byteDestPtr));
+  }
+
+  template <typename T>
+  static void assertAligned(T* aPtr) {
+    MOZ_ASSERT((uintptr_t(aPtr) % sizeof(T)) == 0, "Unaligned pointer!");
+  }
+
+ protected:
+  template <std::endian SourceEndian, std::endian DestEndian, typename T>
+  static constexpr T maybeSwap(T aValue) {
+    if constexpr (SourceEndian == DestEndian) {
+      return aValue;
+    }
+    return byteswap(aValue);
+  }
+
+  template <std::endian SourceEndian, std::endian DestEndian, typename T>
+  static inline void maybeSwapInPlace(T* aPtr, size_t aCount) {
+    assertAligned(aPtr);
+
+    if constexpr (SourceEndian == DestEndian) {
+      return;
+    }
+    for (size_t i = 0; i < aCount; i++) {
+      aPtr[i] = byteswap(aPtr[i]);
+    }
+  }
+
+  template <std::endian SourceEndian, std::endian DestEndian, typename T>
+  static void copyAndSwapTo(void* aDest, const T* aSrc, size_t aCount) {
+    assertNoOverlap(aDest, aSrc, aCount * sizeof(T));
+    assertAligned(aSrc);
+
+    if constexpr (SourceEndian == DestEndian) {
+      memcpy(aDest, aSrc, aCount * sizeof(T));
+      return;
+    }
+
+    uint8_t* byteDestPtr = static_cast<uint8_t*>(aDest);
+    for (size_t i = 0; i < aCount; ++i) {
+      const T Val = maybeSwap<SourceEndian, DestEndian>(aSrc[i]);
+      memcpy(byteDestPtr, static_cast<const void*>(&Val), sizeof(T));
+      byteDestPtr += sizeof(T);
+    }
+  }
+
+  template <std::endian SourceEndian, std::endian DestEndian, typename T>
+  static void copyAndSwapFrom(T* aDest, const void* aSrc, size_t aCount) {
+    assertNoOverlap(aDest, aSrc, aCount * sizeof(T));
+    assertAligned(aDest);
+
+    if constexpr (SourceEndian == DestEndian) {
+      memcpy(aDest, aSrc, aCount * sizeof(T));
+      return;
+    }
+
+    const uint8_t* byteSrcPtr = static_cast<const uint8_t*>(aSrc);
+    for (size_t i = 0; i < aCount; ++i) {
+      T Val;
+      memcpy(static_cast<void*>(&Val), byteSrcPtr, sizeof(T));
+      aDest[i] = maybeSwap<SourceEndian, DestEndian>(Val);
+      byteSrcPtr += sizeof(T);
+    }
+  }
+};
+
+template <std::endian ThisEndian>
+class Endian : private EndianUtils {
+ protected:
+  [[nodiscard]] static uint16_t readUint16(const void* aPtr) {
+    return read<uint16_t>(aPtr);
+  }
+
+  [[nodiscard]] static uint32_t readUint32(const void* aPtr) {
+    return read<uint32_t>(aPtr);
+  }
+
+  [[nodiscard]] static uint64_t readUint64(const void* aPtr) {
+    return read<uint64_t>(aPtr);
+  }
+
+  [[nodiscard]] static uintptr_t readUintptr(const void* aPtr) {
+    return read<uintptr_t>(aPtr);
+  }
+
+  [[nodiscard]] static int16_t readInt16(const void* aPtr) {
+    return read<int16_t>(aPtr);
+  }
+
+  [[nodiscard]] static int32_t readInt32(const void* aPtr) {
+    return read<uint32_t>(aPtr);
+  }
+
+  [[nodiscard]] static int64_t readInt64(const void* aPtr) {
+    return read<int64_t>(aPtr);
+  }
+
+  [[nodiscard]] static intptr_t readIntptr(const void* aPtr) {
+    return read<intptr_t>(aPtr);
+  }
+
+  static void writeUint16(void* aPtr, uint16_t aValue) { write(aPtr, aValue); }
+
+  static void writeUint32(void* aPtr, uint32_t aValue) { write(aPtr, aValue); }
+
+  static void writeUint64(void* aPtr, uint64_t aValue) { write(aPtr, aValue); }
+
+  static void writeUintptr(void* aPtr, uintptr_t aValue) {
+    write(aPtr, aValue);
+  }
+
+  static void writeInt16(void* aPtr, int16_t aValue) { write(aPtr, aValue); }
+
+  static void writeInt32(void* aPtr, int32_t aValue) { write(aPtr, aValue); }
+
+  static void writeInt64(void* aPtr, int64_t aValue) { write(aPtr, aValue); }
+
+  static void writeIntptr(void* aPtr, intptr_t aValue) { write(aPtr, aValue); }
+
+  template <typename T>
+  [[nodiscard]] static constexpr T swapToLittleEndian(T aValue) {
+    return maybeSwap<ThisEndian, std::endian::little>(aValue);
+  }
+
+  template <typename T>
+  static void copyAndSwapToLittleEndian(void* aDest, const T* aSrc,
+                                        size_t aCount) {
+    copyAndSwapTo<ThisEndian, std::endian::little>(aDest, aSrc, aCount);
+  }
+
+  template <typename T>
+  static void swapToLittleEndianInPlace(T* aPtr, size_t aCount) {
+    maybeSwapInPlace<ThisEndian, std::endian::little>(aPtr, aCount);
+  }
+
+  template <typename T>
+  [[nodiscard]] static constexpr T swapToBigEndian(T aValue) {
+    return maybeSwap<ThisEndian, std::endian::big>(aValue);
+  }
+
+  template <typename T>
+  static void copyAndSwapToBigEndian(void* aDest, const T* aSrc,
+                                     size_t aCount) {
+    copyAndSwapTo<ThisEndian, std::endian::big>(aDest, aSrc, aCount);
+  }
+
+  template <typename T>
+  static void swapToBigEndianInPlace(T* aPtr, size_t aCount) {
+    maybeSwapInPlace<ThisEndian, std::endian::big>(aPtr, aCount);
+  }
+
+
+  template <typename T>
+  [[nodiscard]] static constexpr T swapToNetworkOrder(T aValue) {
+    return swapToBigEndian(aValue);
+  }
+
+  template <typename T>
+  static void copyAndSwapToNetworkOrder(void* aDest, const T* aSrc,
+                                        size_t aCount) {
+    copyAndSwapToBigEndian(aDest, aSrc, aCount);
+  }
+
+  template <typename T>
+  static void swapToNetworkOrderInPlace(T* aPtr, size_t aCount) {
+    swapToBigEndianInPlace(aPtr, aCount);
+  }
+
+  template <typename T>
+  [[nodiscard]] static constexpr T swapFromLittleEndian(T aValue) {
+    return maybeSwap<std::endian::little, ThisEndian>(aValue);
+  }
+
+  template <typename T>
+  static void copyAndSwapFromLittleEndian(T* aDest, const void* aSrc,
+                                          size_t aCount) {
+    copyAndSwapFrom<std::endian::little, ThisEndian>(aDest, aSrc, aCount);
+  }
+
+  template <typename T>
+  static void swapFromLittleEndianInPlace(T* aPtr, size_t aCount) {
+    maybeSwapInPlace<std::endian::little, ThisEndian>(aPtr, aCount);
+  }
+
+  template <typename T>
+  [[nodiscard]] static constexpr T swapFromBigEndian(T aValue) {
+    return maybeSwap<std::endian::big, ThisEndian>(aValue);
+  }
+
+  template <typename T>
+  static void copyAndSwapFromBigEndian(T* aDest, const void* aSrc,
+                                       size_t aCount) {
+    copyAndSwapFrom<std::endian::big, ThisEndian>(aDest, aSrc, aCount);
+  }
+
+  template <typename T>
+  static void swapFromBigEndianInPlace(T* aPtr, size_t aCount) {
+    maybeSwapInPlace<std::endian::big, ThisEndian>(aPtr, aCount);
+  }
+
+  template <typename T>
+  [[nodiscard]] static constexpr T swapFromNetworkOrder(T aValue) {
+    return swapFromBigEndian(aValue);
+  }
+
+  template <typename T>
+  static void copyAndSwapFromNetworkOrder(T* aDest, const void* aSrc,
+                                          size_t aCount) {
+    copyAndSwapFromBigEndian(aDest, aSrc, aCount);
+  }
+
+  template <typename T>
+  static void swapFromNetworkOrderInPlace(T* aPtr, size_t aCount) {
+    swapFromBigEndianInPlace(aPtr, aCount);
+  }
+
+ private:
+  template <typename T>
+  static T read(const void* aPtr) {
+    T Val;
+    memcpy(static_cast<void*>(&Val), aPtr, sizeof(T));
+    return maybeSwap<ThisEndian, std::endian::native>(Val);
+  }
+
+  template <typename T>
+  static void write(void* aPtr, T aValue) {
+    T tmp = maybeSwap<std::endian::native, ThisEndian>(aValue);
+    memcpy(aPtr, &tmp, sizeof(T));
+  }
+
+  Endian() = delete;
+  Endian(const Endian& aTther) = delete;
+  void operator=(const Endian& aOther) = delete;
+};
+
+template <std::endian ThisEndian>
+class EndianReadWrite : public Endian<ThisEndian> {
+ private:
+  typedef Endian<ThisEndian> super;
+
+ public:
+  using super::readInt16;
+  using super::readInt32;
+  using super::readInt64;
+  using super::readIntptr;
+  using super::readUint16;
+  using super::readUint32;
+  using super::readUint64;
+  using super::readUintptr;
+  using super::writeInt16;
+  using super::writeInt32;
+  using super::writeInt64;
+  using super::writeIntptr;
+  using super::writeUint16;
+  using super::writeUint32;
+  using super::writeUint64;
+  using super::writeUintptr;
+};
+
+} 
+
+class LittleEndian final : public detail::EndianReadWrite<std::endian::little> {
+};
+
+class BigEndian final : public detail::EndianReadWrite<std::endian::big> {};
+
+typedef BigEndian NetworkEndian;
+
+class NativeEndian final : public detail::Endian<std::endian::native> {
+ private:
+  typedef detail::Endian<std::endian::native> super;
+
+ public:
+  using super::copyAndSwapToBigEndian;
+  using super::copyAndSwapToLittleEndian;
+  using super::copyAndSwapToNetworkOrder;
+  using super::swapToBigEndian;
+  using super::swapToBigEndianInPlace;
+  using super::swapToLittleEndian;
+  using super::swapToLittleEndianInPlace;
+  using super::swapToNetworkOrder;
+  using super::swapToNetworkOrderInPlace;
+
+  using super::copyAndSwapFromBigEndian;
+  using super::copyAndSwapFromLittleEndian;
+  using super::copyAndSwapFromNetworkOrder;
+  using super::swapFromBigEndian;
+  using super::swapFromBigEndianInPlace;
+  using super::swapFromLittleEndian;
+  using super::swapFromLittleEndianInPlace;
+  using super::swapFromNetworkOrder;
+  using super::swapFromNetworkOrderInPlace;
+};
+
+} 
+
+#endif /* mozilla_EndianUtils_h */

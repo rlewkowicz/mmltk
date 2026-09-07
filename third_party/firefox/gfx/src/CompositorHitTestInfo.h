@@ -1,0 +1,72 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_GFX_COMPOSITORHITTESTINFO_H_
+#define MOZILLA_GFX_COMPOSITORHITTESTINFO_H_
+
+#include "mozilla/EnumSet.h"
+#include "mozilla/EnumTypeTraits.h"
+
+namespace mozilla {
+namespace gfx {
+
+enum class CompositorHitTestFlags : uint8_t {
+  eVisibleToHitTest = 0,  
+
+  eIrregularArea,  
+  eApzAwareListeners,  
+  eInactiveScrollframe,  
+
+  eTouchActionPanXDisabled,           
+  eTouchActionPanYDisabled,           
+  eTouchActionPinchZoomDisabled,      
+  eTouchActionAnimatingZoomDisabled,  
+
+  eScrollbar,  
+  eScrollbarThumb,  
+  eScrollbarVertical,  
+
+  eRequiresTargetConfirmation,  
+
+
+};
+
+using CompositorHitTestInfo = EnumSet<CompositorHitTestFlags, uint32_t>;
+
+constexpr CompositorHitTestInfo CompositorHitTestInvisibleToHit;
+
+constexpr CompositorHitTestInfo CompositorHitTestTouchActionMask(
+    CompositorHitTestFlags::eTouchActionPanXDisabled,
+    CompositorHitTestFlags::eTouchActionPanYDisabled,
+    CompositorHitTestFlags::eTouchActionPinchZoomDisabled,
+    CompositorHitTestFlags::eTouchActionAnimatingZoomDisabled);
+
+constexpr CompositorHitTestInfo CompositorHitTestDispatchToContent(
+    CompositorHitTestFlags::eIrregularArea,
+    CompositorHitTestFlags::eApzAwareListeners,
+    CompositorHitTestFlags::eInactiveScrollframe);
+
+}  
+
+template <>
+struct MaxEnumValue<::mozilla::gfx::CompositorHitTestFlags> {
+  static constexpr unsigned int value = static_cast<unsigned int>(
+      gfx::CompositorHitTestFlags::eRequiresTargetConfirmation);
+};
+
+namespace gfx {
+
+template <int N>
+static constexpr bool DoesCompositorHitTestInfoFitIntoBits() {
+  if (MaxEnumValue<CompositorHitTestInfo::valueType>::value < N) {
+    return true;
+  }
+
+  return false;
+}
+}  
+
+}  
+
+#endif /* MOZILLA_GFX_COMPOSITORHITTESTINFO_H_ */

@@ -1,0 +1,59 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef _SECITEM_H_
+#define _SECITEM_H_
+
+#include "utilrename.h"
+
+
+#include "plarena.h"
+#include "plhash.h"
+#include "seccomon.h"
+
+SEC_BEGIN_PROTOS
+
+extern SECItem *SECITEM_AllocItem(PLArenaPool *arena, SECItem *item,
+                                  unsigned int len);
+
+extern SECStatus SECITEM_MakeItem(PLArenaPool *arena, SECItem *dest,
+                                  const unsigned char *data, unsigned int len);
+
+extern SECStatus SECITEM_ReallocItem(
+                                     PLArenaPool *arena, SECItem *item,
+                                     unsigned int oldlen, unsigned int newlen);
+
+extern SECStatus SECITEM_ReallocItemV2(PLArenaPool *arena, SECItem *item,
+                                       unsigned int newlen);
+
+extern SECComparison SECITEM_CompareItem(const SECItem *a, const SECItem *b);
+
+extern PRBool SECITEM_ItemsAreEqual(const SECItem *a, const SECItem *b);
+
+extern SECStatus SECITEM_CopyItem(PLArenaPool *arena, SECItem *to,
+                                  const SECItem *from);
+
+extern SECItem *SECITEM_DupItem(const SECItem *from);
+
+extern SECItem *SECITEM_ArenaDupItem(PLArenaPool *arena, const SECItem *from);
+
+extern void SECITEM_FreeItem(SECItem *zap, PRBool freeit);
+
+extern void SECITEM_ZfreeItem(SECItem *zap, PRBool freeit);
+
+PLHashNumber PR_CALLBACK SECITEM_Hash(const void *key);
+
+PRIntn PR_CALLBACK SECITEM_HashCompare(const void *k1, const void *k2);
+
+extern SECItemArray *SECITEM_AllocArray(PLArenaPool *arena,
+                                        SECItemArray *array,
+                                        unsigned int len);
+extern SECItemArray *SECITEM_DupArray(PLArenaPool *arena,
+                                      const SECItemArray *from);
+extern void SECITEM_FreeArray(SECItemArray *array, PRBool freeit);
+extern void SECITEM_ZfreeArray(SECItemArray *array, PRBool freeit);
+
+SEC_END_PROTOS
+
+#endif /* _SECITEM_H_ */

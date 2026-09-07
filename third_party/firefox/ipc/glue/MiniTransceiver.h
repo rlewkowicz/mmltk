@@ -1,0 +1,66 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef MINITRANSCEIVER_H_
+#define MINITRANSCEIVER_H_
+
+#include "chrome/common/ipc_message.h"
+
+struct msghdr;
+
+namespace mozilla {
+namespace ipc {
+
+enum class DataBufferClear { None, AfterReceiving };
+
+class MiniTransceiver {
+ public:
+  explicit MiniTransceiver(
+      int aFd, DataBufferClear aDataBufClear = DataBufferClear::None);
+
+  bool Send(IPC::Message& aMsg);
+  inline bool SendInfallible(IPC::Message& aMsg, const char* aCrashMessage) {
+    bool Ok = Send(aMsg);
+    if (!Ok) {
+      MOZ_CRASH_UNSAFE(aCrashMessage);
+    }
+    return Ok;
+  }
+
+  bool Recv(UniquePtr<IPC::Message>& aMsg);
+  inline bool RecvInfallible(UniquePtr<IPC::Message>& aMsg,
+                             const char* aCrashMessage) {
+    bool Ok = Recv(aMsg);
+    if (!Ok) {
+      MOZ_CRASH_UNSAFE(aCrashMessage);
+    }
+    return Ok;
+  }
+
+  int GetFD() { return mFd; }
+
+ private:
+  void PrepareFDs(msghdr* aHdr, IPC::Message& aMsg);
+  size_t PrepareBuffers(msghdr* aHdr, IPC::Message& aMsg);
+  unsigned RecvFDs(msghdr* aHdr, int* aAllFds, unsigned aMaxFds);
+  bool RecvData(char* aDataBuf, size_t aBufSize, uint32_t* aMsgSize,
+                int* aFdsBuf, unsigned aMaxFds, unsigned* aNumFds);
+
+  int mFd;  
+
+#ifdef DEBUG
+  enum State {
+    STATE_NONE,
+    STATE_SENDING,
+    STATE_RECEIVING,
+  };
+  State mState;
+#endif
+
+  DataBufferClear mDataBufClear;
+};
+
+}  
+}  
+
+#endif  // MINITRANSCEIVER_H_

@@ -1,0 +1,105 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+#ifndef DriftCompensation_h_
+#define DriftCompensation_h_
+
+#include "MediaSegment.h"
+#include "VideoUtils.h"
+#include "mozilla/Atomics.h"
+
+namespace mozilla {
+
+static LazyLogModule gDriftCompensatorLog("DriftCompensator");
+#define LOG(type, ...) MOZ_LOG_FMT(gDriftCompensatorLog, type, __VA_ARGS__)
+
+class DriftCompensator {
+  const RefPtr<nsIEventTarget> mVideoThread;
+  const TrackRate mAudioRate;
+
+  Atomic<TrackTime> mAudioSamples{0};
+
+  TimeStamp mAudioStartTime;
+
+  void SetAudioStartTime(TimeStamp aTime) {
+    MOZ_ASSERT(mVideoThread->IsOnCurrentThread());
+    MOZ_ASSERT(mAudioStartTime.IsNull());
+    mAudioStartTime = aTime;
+  }
+
+ protected:
+  virtual ~DriftCompensator() = default;
+
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(DriftCompensator)
+
+  DriftCompensator(RefPtr<nsIEventTarget> aVideoThread, TrackRate aAudioRate)
+      : mVideoThread(std::move(aVideoThread)), mAudioRate(aAudioRate) {
+    MOZ_ASSERT(mAudioRate > 0);
+  }
+
+  void NotifyAudioStart(TimeStamp aStart) {
+    MOZ_ASSERT(mAudioSamples == 0);
+    LOG(LogLevel::Info, "DriftCompensator {} at rate {} started",
+        fmt::ptr(this), mAudioRate);
+    nsresult rv = mVideoThread->Dispatch(NewRunnableMethod<TimeStamp>(
+        "DriftCompensator::SetAudioStartTime", this,
+        &DriftCompensator::SetAudioStartTime, aStart));
+    MOZ_DIAGNOSTIC_ASSERT(NS_SUCCEEDED(rv));
+    (void)rv;
+  }
+
+  void NotifyAudio(TrackTime aSamples) {
+    MOZ_ASSERT(aSamples > 0);
+    mAudioSamples += aSamples;
+
+    LOG(LogLevel::Verbose,
+        "DriftCompensator {} Processed another {} samples; now {:.3f}s audio",
+        fmt::ptr(this), aSamples,
+        static_cast<double>(mAudioSamples) / mAudioRate);
+  }
+
+  virtual TimeStamp GetVideoTime(TimeStamp aNow, TimeStamp aTime) {
+    MOZ_ASSERT(mVideoThread->IsOnCurrentThread());
+    TrackTime samples = mAudioSamples;
+
+    if (samples / mAudioRate < 10) {
+      LOG(LogLevel::Debug, "DriftCompensator {} {}ms so far; ignoring",
+          fmt::ptr(this), samples * 1000 / mAudioRate);
+      return aTime;
+    }
+
+    if (aNow == mAudioStartTime) {
+      LOG(LogLevel::Warning,
+          "DriftCompensator {} video scale 0, assuming no drift",
+          fmt::ptr(this));
+      return aTime;
+    }
+
+    double videoScaleUs = (aNow - mAudioStartTime).ToMicroseconds();
+    double audioScaleUs = FramesToUsecs(samples, mAudioRate).value();
+    double videoDurationUs = (aTime - mAudioStartTime).ToMicroseconds();
+
+    TimeStamp reclocked =
+        mAudioStartTime + TimeDuration::FromMicroseconds(
+                              videoDurationUs * audioScaleUs / videoScaleUs);
+
+    LOG(LogLevel::Debug,
+        "DriftCompensator {} GetVideoTime, v-now: {:.3f}s, a-now: {:.3f}s; "
+        "{:.3f}s -> {:.3f}s (d {:.3f}ms)",
+        fmt::ptr(this), (aNow - mAudioStartTime).ToSeconds(),
+        TimeDuration::FromMicroseconds(audioScaleUs).ToSeconds(),
+        (aTime - mAudioStartTime).ToSeconds(),
+        (reclocked - mAudioStartTime).ToSeconds(),
+        (reclocked - aTime).ToMilliseconds());
+
+    return reclocked;
+  }
+};
+
+#undef LOG
+
+}  
+
+#endif /* DriftCompensation_h_ */

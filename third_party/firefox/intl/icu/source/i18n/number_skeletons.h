@@ -1,0 +1,295 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+#ifndef __SOURCE_NUMBER_SKELETONS_H__
+#define __SOURCE_NUMBER_SKELETONS_H__
+
+#include "number_types.h"
+#include "numparse_types.h"
+#include "unicode/ucharstrie.h"
+#include "string_segment.h"
+
+U_NAMESPACE_BEGIN
+namespace number::impl {
+
+struct SeenMacroProps;
+
+namespace skeleton {
+
+
+enum ParseState {
+
+
+    STATE_NULL,
+
+
+    STATE_SCIENTIFIC,
+    STATE_FRACTION_PRECISION,
+    STATE_PRECISION,
+
+
+    STATE_INCREMENT_PRECISION,
+    STATE_MEASURE_UNIT,
+    STATE_PER_MEASURE_UNIT,
+    STATE_IDENTIFIER_UNIT,
+    STATE_UNIT_USAGE,
+    STATE_CURRENCY_UNIT,
+    STATE_INTEGER_WIDTH,
+    STATE_NUMBERING_SYSTEM,
+    STATE_SCALE,
+};
+
+enum StemEnum {
+
+
+    STEM_COMPACT_SHORT,
+    STEM_COMPACT_LONG,
+    STEM_SCIENTIFIC,
+    STEM_ENGINEERING,
+    STEM_NOTATION_SIMPLE,
+    STEM_BASE_UNIT,
+    STEM_PERCENT,
+    STEM_PERMILLE,
+    STEM_PERCENT_100, 
+    STEM_PRECISION_INTEGER,
+    STEM_PRECISION_UNLIMITED,
+    STEM_PRECISION_CURRENCY_STANDARD,
+    STEM_PRECISION_CURRENCY_CASH,
+    STEM_ROUNDING_MODE_CEILING,
+    STEM_ROUNDING_MODE_FLOOR,
+    STEM_ROUNDING_MODE_DOWN,
+    STEM_ROUNDING_MODE_UP,
+    STEM_ROUNDING_MODE_HALF_EVEN,
+    STEM_ROUNDING_MODE_HALF_ODD,
+    STEM_ROUNDING_MODE_HALF_CEILING,
+    STEM_ROUNDING_MODE_HALF_FLOOR,
+    STEM_ROUNDING_MODE_HALF_DOWN,
+    STEM_ROUNDING_MODE_HALF_UP,
+    STEM_ROUNDING_MODE_UNNECESSARY,
+    STEM_INTEGER_WIDTH_TRUNC,
+    STEM_GROUP_OFF,
+    STEM_GROUP_MIN2,
+    STEM_GROUP_AUTO,
+    STEM_GROUP_ON_ALIGNED,
+    STEM_GROUP_THOUSANDS,
+    STEM_LATIN,
+    STEM_UNIT_WIDTH_NARROW,
+    STEM_UNIT_WIDTH_SHORT,
+    STEM_UNIT_WIDTH_FULL_NAME,
+    STEM_UNIT_WIDTH_ISO_CODE,
+    STEM_UNIT_WIDTH_FORMAL,
+    STEM_UNIT_WIDTH_VARIANT,
+    STEM_UNIT_WIDTH_HIDDEN,
+    STEM_SIGN_AUTO,
+    STEM_SIGN_ALWAYS,
+    STEM_SIGN_NEVER,
+    STEM_SIGN_ACCOUNTING,
+    STEM_SIGN_ACCOUNTING_ALWAYS,
+    STEM_SIGN_EXCEPT_ZERO,
+    STEM_SIGN_ACCOUNTING_EXCEPT_ZERO,
+    STEM_SIGN_NEGATIVE,
+    STEM_SIGN_ACCOUNTING_NEGATIVE,
+    STEM_DECIMAL_AUTO,
+    STEM_DECIMAL_ALWAYS,
+
+
+    STEM_PRECISION_INCREMENT,
+    STEM_MEASURE_UNIT,
+    STEM_PER_MEASURE_UNIT,
+    STEM_UNIT,
+    STEM_UNIT_USAGE,
+    STEM_CURRENCY,
+    STEM_INTEGER_WIDTH,
+    STEM_NUMBERING_SYSTEM,
+    STEM_SCALE,
+};
+
+constexpr char16_t kWildcardChar = u'*';
+
+constexpr char16_t kAltWildcardChar = u'+';
+
+inline bool isWildcardChar(char16_t c) {
+    return c == kWildcardChar || c == kAltWildcardChar;
+}
+
+UnlocalizedNumberFormatter create(
+    const UnicodeString& skeletonString, UParseError* perror, UErrorCode& status);
+
+UnicodeString generate(const MacroProps& macros, UErrorCode& status);
+
+MacroProps parseSkeleton(const UnicodeString& skeletonString, int32_t& errOffset, UErrorCode& status);
+
+ParseState parseStem(const StringSegment& segment, const UCharsTrie& stemTrie, SeenMacroProps& seen,
+                     MacroProps& macros, UErrorCode& status);
+
+ParseState
+parseOption(ParseState stem, const StringSegment& segment, MacroProps& macros, UErrorCode& status);
+
+} 
+
+
+namespace stem_to_object {
+
+Notation notation(skeleton::StemEnum stem);
+
+MeasureUnit unit(skeleton::StemEnum stem);
+
+Precision precision(skeleton::StemEnum stem);
+
+UNumberFormatRoundingMode roundingMode(skeleton::StemEnum stem);
+
+UNumberGroupingStrategy groupingStrategy(skeleton::StemEnum stem);
+
+UNumberUnitWidth unitWidth(skeleton::StemEnum stem);
+
+UNumberSignDisplay signDisplay(skeleton::StemEnum stem);
+
+UNumberDecimalSeparatorDisplay decimalSeparatorDisplay(skeleton::StemEnum stem);
+
+} 
+
+namespace enum_to_stem_string {
+
+void roundingMode(UNumberFormatRoundingMode value, UnicodeString& sb);
+
+void groupingStrategy(UNumberGroupingStrategy value, UnicodeString& sb);
+
+void unitWidth(UNumberUnitWidth value, UnicodeString& sb);
+
+void signDisplay(UNumberSignDisplay value, UnicodeString& sb);
+
+void decimalSeparatorDisplay(UNumberDecimalSeparatorDisplay value, UnicodeString& sb);
+
+} 
+
+namespace blueprint_helpers {
+
+bool parseExponentWidthOption(const StringSegment& segment, MacroProps& macros, UErrorCode& status);
+
+void generateExponentWidthOption(int32_t minExponentDigits, UnicodeString& sb, UErrorCode& status);
+
+bool parseExponentSignOption(const StringSegment& segment, MacroProps& macros, UErrorCode& status);
+
+void parseCurrencyOption(const StringSegment& segment, MacroProps& macros, UErrorCode& status);
+
+void generateCurrencyOption(const CurrencyUnit& currency, UnicodeString& sb, UErrorCode& status);
+
+void parseMeasureUnitOption(const StringSegment& segment, MacroProps& macros, UErrorCode& status);
+
+void parseMeasurePerUnitOption(const StringSegment& segment, MacroProps& macros, UErrorCode& status);
+
+void parseIdentifierUnitOption(const StringSegment& segment, MacroProps& macros, UErrorCode& status);
+
+void parseUnitUsageOption(const StringSegment& segment, MacroProps& macros, UErrorCode& status);
+
+void parseFractionStem(const StringSegment& segment, MacroProps& macros, UErrorCode& status);
+
+void generateFractionStem(int32_t minFrac, int32_t maxFrac, UnicodeString& sb, UErrorCode& status);
+
+void parseDigitsStem(const StringSegment& segment, MacroProps& macros, UErrorCode& status);
+
+void generateDigitsStem(int32_t minSig, int32_t maxSig, UnicodeString& sb, UErrorCode& status);
+
+void parseScientificStem(const StringSegment& segment, MacroProps& macros, UErrorCode& status);
+
+
+void parseIntegerStem(const StringSegment& segment, MacroProps& macros, UErrorCode& status);
+
+
+bool parseFracSigOption(const StringSegment& segment, MacroProps& macros, UErrorCode& status);
+
+bool parseTrailingZeroOption(const StringSegment& segment, MacroProps& macros, UErrorCode& status);
+
+void parseIncrementOption(const StringSegment& segment, MacroProps& macros, UErrorCode& status);
+
+void
+generateIncrementOption(uint32_t increment, digits_t incrementMagnitude, int32_t minFrac, UnicodeString& sb, UErrorCode& status);
+
+void parseIntegerWidthOption(const StringSegment& segment, MacroProps& macros, UErrorCode& status);
+
+void generateIntegerWidthOption(int32_t minInt, int32_t maxInt, UnicodeString& sb, UErrorCode& status);
+
+void parseNumberingSystemOption(const StringSegment& segment, MacroProps& macros, UErrorCode& status);
+
+void generateNumberingSystemOption(const NumberingSystem& ns, UnicodeString& sb, UErrorCode& status);
+
+void parseScaleOption(const StringSegment& segment, MacroProps& macros, UErrorCode& status);
+
+void generateScaleOption(int32_t magnitude, const DecNum* arbitrary, UnicodeString& sb,
+                              UErrorCode& status);
+
+} 
+
+class GeneratorHelpers {
+  public:
+    static void generateSkeleton(const MacroProps& macros, UnicodeString& sb, UErrorCode& status);
+
+  private:
+    static bool notation(const MacroProps& macros, UnicodeString& sb, UErrorCode& status);
+
+    static bool unit(const MacroProps& macros, UnicodeString& sb, UErrorCode& status);
+
+    static bool usage(const MacroProps& macros, UnicodeString& sb, UErrorCode& status);
+
+    static bool precision(const MacroProps& macros, UnicodeString& sb, UErrorCode& status);
+
+    static bool roundingMode(const MacroProps& macros, UnicodeString& sb, UErrorCode& status);
+
+    static bool grouping(const MacroProps& macros, UnicodeString& sb, UErrorCode& status);
+
+    static bool integerWidth(const MacroProps& macros, UnicodeString& sb, UErrorCode& status);
+
+    static bool symbols(const MacroProps& macros, UnicodeString& sb, UErrorCode& status);
+
+    static bool unitWidth(const MacroProps& macros, UnicodeString& sb, UErrorCode& status);
+
+    static bool sign(const MacroProps& macros, UnicodeString& sb, UErrorCode& status);
+
+    static bool decimal(const MacroProps& macros, UnicodeString& sb, UErrorCode& status);
+
+    static bool scale(const MacroProps& macros, UnicodeString& sb, UErrorCode& status);
+
+};
+
+struct SeenMacroProps {
+    bool notation = false;
+    bool unit = false;
+    bool perUnit = false;
+    bool usage = false;
+    bool precision = false;
+    bool roundingMode = false;
+    bool grouper = false;
+    bool padder = false;
+    bool integerWidth = false;
+    bool symbols = false;
+    bool unitWidth = false;
+    bool sign = false;
+    bool decimal = false;
+    bool scale = false;
+};
+
+namespace {
+
+#define SKELETON_UCHAR_TO_CHAR(dest, src, start, end, status) (void)(dest); \
+UPRV_BLOCK_MACRO_BEGIN { \
+    UErrorCode conversionStatus = U_ZERO_ERROR; \
+    (dest).appendInvariantChars({false, (src).getBuffer() + (start), (end) - (start)}, conversionStatus); \
+    if (conversionStatus == U_INVARIANT_CONVERSION_ERROR) { \
+         \
+        (status) = U_NUMBER_SKELETON_SYNTAX_ERROR; \
+        return; \
+    } else if (U_FAILURE(conversionStatus)) { \
+        (status) = conversionStatus; \
+        return; \
+    } \
+} UPRV_BLOCK_MACRO_END
+
+} 
+
+} 
+U_NAMESPACE_END
+
+#endif //__SOURCE_NUMBER_SKELETONS_H__
+#endif /* #if !UCONFIG_NO_FORMATTING */

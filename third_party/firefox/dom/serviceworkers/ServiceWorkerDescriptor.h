@@ -1,0 +1,91 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef _mozilla_dom_ServiceWorkerDescriptor_h
+#define _mozilla_dom_ServiceWorkerDescriptor_h
+
+#include "mozilla/UniquePtr.h"
+#include "nsCOMPtr.h"
+#include "nsString.h"
+
+class nsIPrincipal;
+
+namespace mozilla {
+
+namespace ipc {
+class PrincipalInfo;
+}  
+
+namespace dom {
+
+class IPCServiceWorkerDescriptor;
+enum class WorkerType : uint8_t;
+enum class ServiceWorkerState : uint8_t;
+
+class ServiceWorkerDescriptor final {
+  UniquePtr<IPCServiceWorkerDescriptor> mData;
+
+ public:
+  ServiceWorkerDescriptor(uint64_t aId, uint64_t aRegistrationId,
+                          uint64_t aRegistrationVersion,
+                          nsIPrincipal* aPrincipal, const nsACString& aScope,
+                          WorkerType aType, const nsACString& aScriptURL,
+                          ServiceWorkerState aState);
+
+  ServiceWorkerDescriptor(uint64_t aId, uint64_t aRegistrationId,
+                          uint64_t aRegistrationVersion,
+                          const mozilla::ipc::PrincipalInfo& aPrincipalInfo,
+                          const nsACString& aScope, WorkerType aType,
+                          const nsACString& aScriptURL,
+                          ServiceWorkerState aState);
+
+  explicit ServiceWorkerDescriptor(
+      const IPCServiceWorkerDescriptor& aDescriptor);
+
+  ServiceWorkerDescriptor(const ServiceWorkerDescriptor& aRight);
+
+  ServiceWorkerDescriptor& operator=(const ServiceWorkerDescriptor& aRight);
+
+  ServiceWorkerDescriptor(ServiceWorkerDescriptor&& aRight);
+
+  ServiceWorkerDescriptor& operator=(ServiceWorkerDescriptor&& aRight);
+
+  ~ServiceWorkerDescriptor();
+
+  bool operator==(const ServiceWorkerDescriptor& aRight) const;
+
+  uint64_t Id() const;
+
+  uint64_t RegistrationId() const;
+
+  uint64_t RegistrationVersion() const;
+
+  const mozilla::ipc::PrincipalInfo& PrincipalInfo() const;
+
+  Result<nsCOMPtr<nsIPrincipal>, nsresult> GetPrincipal() const;
+
+  const nsCString& Scope() const;
+
+  WorkerType Type() const;
+
+  const nsCString& ScriptURL() const;
+
+  ServiceWorkerState State() const;
+
+  void SetState(ServiceWorkerState aState);
+
+  void SetRegistrationVersion(uint64_t aVersion);
+
+  bool HandlesFetch() const;
+
+  void SetHandlesFetch(bool aHandlesFetch);
+
+  bool Matches(const ServiceWorkerDescriptor& aDescriptor) const;
+
+  const IPCServiceWorkerDescriptor& ToIPC() const;
+};
+
+}  
+}  
+
+#endif  // _mozilla_dom_ServiceWorkerDescriptor_h

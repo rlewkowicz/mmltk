@@ -1,0 +1,66 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_x64_SharedICHelpers_x64_inl_h
+#define jit_x64_SharedICHelpers_x64_inl_h
+
+#include "jit/BaselineFrame.h"
+#include "jit/SharedICHelpers.h"
+
+#include "jit/MacroAssembler-inl.h"
+
+namespace js {
+namespace jit {
+
+inline void EmitBaselineTailCallVM(TrampolinePtr target, MacroAssembler& masm,
+                                   uint32_t argSize) {
+#ifdef DEBUG
+  ScratchRegisterScope scratch(masm);
+
+  masm.movq(FramePointer, scratch);
+  masm.subq(StackPointer, scratch);
+  masm.subq(Imm32(argSize), scratch);
+  Address frameSizeAddr(FramePointer,
+                        BaselineFrame::reverseOffsetOfDebugFrameSize());
+  masm.store32(scratch, frameSizeAddr);
+#endif
+
+  masm.push(FrameDescriptor(FrameType::BaselineJS));
+  masm.push(ICTailCallReg);
+  masm.jump(target);
+}
+
+inline void EmitBaselineCallVM(TrampolinePtr target, MacroAssembler& masm) {
+  masm.push(FrameDescriptor(FrameType::BaselineStub));
+  masm.call(target);
+}
+
+inline void EmitBaselineEnterStubFrame(MacroAssembler& masm, Register) {
+#ifdef DEBUG
+
+  ScratchRegisterScope scratch(masm);
+  masm.movq(FramePointer, scratch);
+  masm.subq(StackPointer, scratch);
+  masm.subq(Imm32(sizeof(void*)), scratch);  
+
+  Address frameSizeAddr(FramePointer,
+                        BaselineFrame::reverseOffsetOfDebugFrameSize());
+  masm.store32(scratch, frameSizeAddr);
+#endif
+
+  masm.Push(Operand(StackPointer, 0));
+
+  masm.storePtr(ImmWord(MakeFrameDescriptor(FrameType::BaselineJS)),
+                Address(StackPointer, sizeof(uintptr_t)));
+
+  masm.Push(FramePointer);
+  masm.mov(StackPointer, FramePointer);
+
+  masm.Push(ICStubReg);
+}
+
+}  
+}  
+
+#endif /* jit_x64_SharedICHelpers_x64_inl_h */

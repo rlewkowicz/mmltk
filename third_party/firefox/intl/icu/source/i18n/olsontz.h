@@ -1,0 +1,202 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+**********************************************************************
+* Copyright (c) 2003-2013, International Business Machines
+* Corporation and others.  All Rights Reserved.
+**********************************************************************
+* Author: Alan Liu
+* Created: July 21 2003
+* Since: ICU 2.8
+**********************************************************************
+*/
+#ifndef OLSONTZ_H
+#define OLSONTZ_H
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/basictz.h"
+#include "umutex.h"
+
+struct UResourceBundle;
+
+U_NAMESPACE_BEGIN
+
+class SimpleTimeZone;
+
+class U_I18N_API_CLASS OlsonTimeZone : public BasicTimeZone {
+ public:
+    OlsonTimeZone(const UResourceBundle* top,
+                  const UResourceBundle* res,
+                  const UnicodeString& tzid,
+                  UErrorCode& ec);
+
+    OlsonTimeZone(const OlsonTimeZone& other);
+
+    virtual ~OlsonTimeZone();
+
+    U_I18N_API OlsonTimeZone& operator=(const OlsonTimeZone& other);
+
+    virtual bool operator==(const TimeZone& other) const override;
+
+    virtual OlsonTimeZone* clone() const override;
+
+    U_I18N_API static UClassID U_EXPORT2 getStaticClassID();
+
+    virtual UClassID getDynamicClassID() const override;
+    
+    virtual int32_t getOffset(uint8_t era, int32_t year, int32_t month,
+                              int32_t day, uint8_t dayOfWeek,
+                              int32_t millis, UErrorCode& ec) const override;
+
+    virtual int32_t getOffset(uint8_t era, int32_t year, int32_t month,
+                              int32_t day, uint8_t dayOfWeek,
+                              int32_t millis, int32_t monthLength,
+                              UErrorCode& ec) const override;
+
+    virtual void getOffset(UDate date, UBool local, int32_t& rawOffset,
+                   int32_t& dstOffset, UErrorCode& ec) const override;
+
+    virtual void getOffsetFromLocal(
+        UDate date, UTimeZoneLocalOption nonExistingTimeOpt,
+        UTimeZoneLocalOption duplicatedTimeOpt,
+        int32_t& rawOffset, int32_t& dstOffset, UErrorCode& status) const override;
+
+    virtual void setRawOffset(int32_t offsetMillis) override;
+
+    virtual int32_t getRawOffset() const override;
+
+    virtual UBool useDaylightTime() const override;
+
+    virtual UBool inDaylightTime(UDate date, UErrorCode& ec) const override;
+
+    virtual int32_t getDSTSavings() const override;
+
+    virtual UBool hasSameRules(const TimeZone& other) const override;
+
+    virtual UBool getNextTransition(UDate base, UBool inclusive, TimeZoneTransition& result) const override;
+
+    virtual UBool getPreviousTransition(UDate base, UBool inclusive, TimeZoneTransition& result) const override;
+
+    virtual int32_t countTransitionRules(UErrorCode& status) const override;
+
+    virtual void getTimeZoneRules(const InitialTimeZoneRule*& initial,
+        const TimeZoneRule* trsrules[], int32_t& trscount, UErrorCode& status) const override;
+
+    const char16_t *getCanonicalID() const;
+
+private:
+    OlsonTimeZone();
+
+private:
+
+    void constructEmpty();
+
+    void getHistoricalOffset(UDate date, UBool local,
+        int32_t NonExistingTimeOpt, int32_t DuplicatedTimeOpt,
+        int32_t& rawoff, int32_t& dstoff) const;
+
+    int16_t transitionCount() const;
+
+    int64_t transitionTimeInSeconds(int16_t transIdx) const;
+    double transitionTime(int16_t transIdx) const;
+
+    int32_t zoneOffsetAt(int16_t transIdx) const;
+    int32_t rawOffsetAt(int16_t transIdx) const;
+    int32_t dstOffsetAt(int16_t transIdx) const;
+
+    int32_t initialRawOffset() const;
+    int32_t initialDstOffset() const;
+
+    int16_t transitionCountPre32;
+    int16_t transitionCount32;
+    int16_t transitionCountPost32;
+
+    const int32_t *transitionTimesPre32; 
+
+    const int32_t *transitionTimes32; 
+
+    const int32_t *transitionTimesPost32; 
+
+    int16_t typeCount;
+
+    const int32_t *typeOffsets; 
+
+    const uint8_t *typeMapData; 
+
+    SimpleTimeZone *finalZone; 
+
+    double finalStartMillis;
+
+    int32_t finalStartYear;
+
+    const char16_t *canonicalID;
+
+    void clearTransitionRules();
+    void deleteTransitionRules();
+    void checkTransitionRules(UErrorCode& status) const;
+
+  public:    
+    void initTransitionRules(UErrorCode& status);
+  private:
+
+    InitialTimeZoneRule *initialRule;
+    TimeZoneTransition  *firstTZTransition;
+    int16_t             firstTZTransitionIdx;
+    TimeZoneTransition  *firstFinalTZTransition;
+    TimeArrayTimeZoneRule   **historicRules;
+    int16_t             historicRuleCount;
+    SimpleTimeZone      *finalZoneWithStartYear; 
+    UInitOnce           transitionRulesInitOnce {};
+};
+
+inline int16_t
+OlsonTimeZone::transitionCount() const {
+    return transitionCountPre32 + transitionCount32 + transitionCountPost32;
+}
+
+inline double
+OlsonTimeZone::transitionTime(int16_t transIdx) const {
+    return static_cast<double>(transitionTimeInSeconds(transIdx)) * U_MILLIS_PER_SECOND;
+}
+
+inline int32_t
+OlsonTimeZone::zoneOffsetAt(int16_t transIdx) const {
+    int16_t typeIdx = (transIdx >= 0 ? typeMapData[transIdx] : 0) << 1;
+    return typeOffsets[typeIdx] + typeOffsets[typeIdx + 1];
+}
+
+inline int32_t
+OlsonTimeZone::rawOffsetAt(int16_t transIdx) const {
+    int16_t typeIdx = (transIdx >= 0 ? typeMapData[transIdx] : 0) << 1;
+    return typeOffsets[typeIdx];
+}
+
+inline int32_t
+OlsonTimeZone::dstOffsetAt(int16_t transIdx) const {
+    int16_t typeIdx = (transIdx >= 0 ? typeMapData[transIdx] : 0) << 1;
+    return typeOffsets[typeIdx + 1];
+}
+
+inline int32_t
+OlsonTimeZone::initialRawOffset() const {
+    return typeOffsets[0];
+}
+
+inline int32_t
+OlsonTimeZone::initialDstOffset() const {
+    return typeOffsets[1];
+}
+
+inline const char16_t*
+OlsonTimeZone::getCanonicalID() const {
+    return canonicalID;
+}
+
+
+U_NAMESPACE_END
+
+#endif // !UCONFIG_NO_FORMATTING
+#endif // OLSONTZ_H
+

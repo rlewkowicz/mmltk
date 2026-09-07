@@ -1,0 +1,59 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_ImportScanner_h
+#define mozilla_ImportScanner_h
+
+
+#include "nsString.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+
+struct ImportScanner final {
+  ImportScanner() = default;
+
+  void Start();
+
+  nsTArray<nsString> Stop();
+
+  bool ShouldScan() const {
+    return mState != State::OutsideOfStyleElement && mState != State::Done;
+  }
+
+  nsTArray<nsString> Scan(Span<const char16_t> aFragment);
+
+ private:
+  enum class State {
+    OutsideOfStyleElement,
+    Idle,
+    MaybeAtCommentStart,
+    AtComment,
+    MaybeAtCommentEnd,
+    AtRuleName,
+    AtRuleValue,
+    AtRuleValueDelimited,
+    AfterRuleValue,
+    Done,
+  };
+
+  void ResetState();
+  void EmitUrl();
+  [[nodiscard]] State Scan(char16_t aChar);
+
+  static constexpr const uint32_t kMaxRuleNameLength = 7;  
+
+  State mState = State::OutsideOfStyleElement;
+  nsAutoStringN<kMaxRuleNameLength> mRuleName;
+  nsAutoStringN<128> mRuleValue;
+  nsAutoStringN<128> mAfterRuleValue;
+  nsTArray<nsString> mUrlsFound;
+
+  bool mInImportRule = false;
+  char16_t mUrlValueDelimiterClosingChar = 0;
+};
+
+}  
+
+#endif

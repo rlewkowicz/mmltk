@@ -1,0 +1,473 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_shared_CodeGenerator_shared_h
+#define jit_shared_CodeGenerator_shared_h
+
+#include "mozilla/Alignment.h"
+
+#include <utility>
+
+#include "jit/InlineList.h"
+#include "jit/InlineScriptTree.h"
+#include "jit/JitcodeMap.h"
+#include "jit/LIR.h"
+#include "jit/MacroAssembler.h"
+#include "jit/MIRGenerator.h"
+#include "jit/MIRGraph.h"
+#include "jit/SafepointIndex.h"
+#include "jit/Safepoints.h"
+#include "jit/Snapshots.h"
+
+namespace js {
+namespace jit {
+
+class OutOfLineCode;
+class CodeGenerator;
+class MacroAssembler;
+class IonIC;
+
+class OutOfLineTruncateSlow;
+
+class CodeGeneratorShared : public LElementVisitor {
+  AppendOnlyList<OutOfLineCode> outOfLineCode_;
+
+  MacroAssembler& ensureMasm(MacroAssembler* masm, TempAllocator& alloc,
+                             CompileRealm* realm);
+  mozilla::Maybe<OffThreadMacroAssembler> maybeMasm_;
+
+ public:
+  MacroAssembler& masm;
+
+ protected:
+  MIRGenerator* gen;
+  LIRGraph& graph;
+  const wasm::CodeMetadata* wasmCodeMeta_;
+  LBlock* current;
+  SnapshotWriter snapshots_;
+  RecoverWriter recovers_;
+#ifdef DEBUG
+  uint32_t pushedArgs_;
+#endif
+  uint32_t lastOsiPointOffset_;
+  SafepointWriter safepoints_;
+  Label invalidate_;
+  CodeOffset invalidateEpilogueData_;
+
+  NonAssertingLabel returnLabel_;
+
+  uint32_t inboundStackArgBytes_;
+
+  js::Vector<CodegenSafepointIndex, 0, JitAllocPolicy> safepointIndices_;
+  js::Vector<OsiIndex, 0, BackgroundSystemAllocPolicy> osiIndices_;
+
+  js::Vector<uint8_t, 0, BackgroundSystemAllocPolicy> runtimeData_;
+
+  js::Vector<uint32_t, 0, BackgroundSystemAllocPolicy> icList_;
+
+  struct CompileTimeICInfo {
+    CodeOffset icOffsetForJump;
+    CodeOffset icOffsetForPush;
+  };
+  js::Vector<CompileTimeICInfo, 0, BackgroundSystemAllocPolicy> icInfo_;
+
+ protected:
+  js::Vector<NativeToBytecode, 0, BackgroundSystemAllocPolicy>
+      nativeToBytecodeList_;
+  UniquePtr<uint8_t> nativeToBytecodeMap_;
+  uint32_t nativeToBytecodeMapSize_;
+  uint32_t nativeToBytecodeTableOffset_;
+
+  bool isProfilerInstrumentationEnabled() {
+    return gen->isProfilerInstrumentationEnabled();
+  }
+
+  gc::Heap initialStringHeap() const { return gen->initialStringHeap(); }
+  gc::Heap initialBigIntHeap() const { return gen->initialBigIntHeap(); }
+
+ protected:
+  mozilla::Maybe<size_t> osrEntryOffset_ = {};
+
+  TempAllocator& alloc() const { return graph.mir().alloc(); }
+
+  void setOsrEntryOffset(size_t offset) { osrEntryOffset_.emplace(offset); }
+
+  size_t getOsrEntryOffset() const {
+    MOZ_RELEASE_ASSERT(osrEntryOffset_.isSome());
+    return *osrEntryOffset_;
+  }
+
+  using SafepointIndices =
+      js::Vector<CodegenSafepointIndex, 8, SystemAllocPolicy>;
+
+ protected:
+#ifdef CHECK_OSIPOINT_REGISTERS
+  bool checkOsiPointRegisters;
+#endif
+
+  uint32_t frameDepth_;
+
+  uint32_t offsetOfArgsFromFP_ = 0;
+
+  uint32_t offsetOfPassedArgSlots_ = 0;
+
+  inline Address AddressOfPassedArg(uint32_t slot) const;
+  inline uint32_t UnusedStackBytesForCall(uint32_t numArgSlots) const;
+
+  template <BaseRegForAddress Base = BaseRegForAddress::Default>
+  inline Address ToAddress(const LAllocation& a) const;
+
+  template <BaseRegForAddress Base = BaseRegForAddress::Default>
+  inline Address ToAddress(const LAllocation* a) const;
+
+  template <BaseRegForAddress Base = BaseRegForAddress::Default>
+  inline Address ToAddress(const LInt64Allocation& a) const;
+
+  static inline Address ToAddress(Register elements, const LAllocation* index,
+                                  Scalar::Type type);
+
+  uint32_t frameSize() const { return frameDepth_; }
+
+ protected:
+  bool addNativeToBytecodeEntry(const BytecodeSite* site);
+  void dumpNativeToBytecodeEntries();
+  void dumpNativeToBytecodeEntry(uint32_t idx);
+
+ public:
+  MIRGenerator& mirGen() const { return *gen; }
+  const wasm::CodeMetadata* wasmCodeMeta() const { return wasmCodeMeta_; }
+  IonPerfSpewer& perfSpewer() const { return mirGen().perfSpewer(); }
+
+  friend class DataPtr;
+  template <typename T>
+  class DataPtr {
+    CodeGeneratorShared* cg_;
+    size_t index_;
+
+    T* lookup() { return reinterpret_cast<T*>(&cg_->runtimeData_[index_]); }
+
+   public:
+    DataPtr(CodeGeneratorShared* cg, size_t index) : cg_(cg), index_(index) {}
+
+    T* operator->() { return lookup(); }
+    T* operator*() { return lookup(); }
+  };
+
+ protected:
+  [[nodiscard]] bool allocateData(size_t size, size_t* offset) {
+    MOZ_ASSERT(size % sizeof(void*) == 0);
+    *offset = runtimeData_.length();
+    masm.propagateOOM(runtimeData_.appendN(0, size));
+    return !masm.oom();
+  }
+
+  template <typename T>
+  inline size_t allocateIC(const T& cache) {
+    static_assert(std::is_base_of_v<IonIC, T>, "T must inherit from IonIC");
+    size_t index;
+    masm.propagateOOM(
+        allocateData(sizeof(mozilla::AlignedStorage2<T>), &index));
+    masm.propagateOOM(icList_.append(index));
+    masm.propagateOOM(icInfo_.append(CompileTimeICInfo()));
+    if (masm.oom()) {
+      return SIZE_MAX;
+    }
+    MOZ_ASSERT(index == icList_.back());
+    new (&runtimeData_[index]) T(cache);
+    return index;
+  }
+
+ protected:
+  void encode(LRecoverInfo* recover);
+  void encode(LSnapshot* snapshot);
+  void encodeAllocation(LSnapshot* snapshot, MDefinition* def,
+                        uint32_t* startIndex, bool hasSideEffects);
+
+  bool encodeSafepoints();
+
+  bool createNativeToBytecodeScriptList(JSContext* cx,
+                                        IonEntry::ScriptList& scripts);
+  bool generateCompactNativeToBytecodeMap(JSContext* cx, JitCode* code,
+                                          IonEntry::ScriptList& scripts);
+  void verifyCompactNativeToBytecodeMap(JitCode* code,
+                                        const IonEntry::ScriptList& scripts,
+                                        uint32_t numRegions);
+
+  void markSafepoint(LInstruction* ins);
+  void markSafepointAt(uint32_t offset, LInstruction* ins);
+
+  uint32_t markOsiPoint(LOsiPoint* ins);
+
+  void ensureOsiSpace();
+
+  OutOfLineCode* oolTruncateDouble(
+      FloatRegister src, Register dest, MInstruction* mir,
+      wasm::BytecodeOffset callOffset = wasm::BytecodeOffset());
+  void emitTruncateDouble(FloatRegister src, Register dest, MInstruction* mir);
+  void emitTruncateFloat32(FloatRegister src, Register dest, MInstruction* mir);
+
+  void emitPreBarrier(Address address);
+  void emitPreBarrier(BaseObjectElementIndex address);
+
+  MBasicBlock* skipTrivialBlocks(MBasicBlock* block) {
+    while (block->lir()->isTrivial()) {
+      LGoto* ins = block->lir()->rbegin()->toGoto();
+      MOZ_ASSERT(ins->numSuccessors() == 1);
+      block = ins->getSuccessor(0);
+    }
+    return block;
+  }
+
+  // Test whether the given block can be reached via fallthrough from the
+  inline bool isNextBlock(LBlock* block) {
+    uint32_t targetId = skipTrivialBlocks(block->mir())->id();
+
+    if (targetId < current->mir()->id() + 1) {
+      return false;
+    }
+
+    if (current->isOutOfLine() != graph.getBlock(targetId)->isOutOfLine()) {
+      return false;
+    }
+
+    // Scan through blocks until the target to see if we can fallthrough them.
+    for (uint32_t nextId = current->mir()->id() + 1; nextId != targetId;
+         ++nextId) {
+      LBlock* nextBlock = graph.getBlock(nextId);
+
+      // one, then we don't need to consider it for fallthrough.
+      if (nextBlock->isOutOfLine() != graph.getBlock(targetId)->isOutOfLine()) {
+        continue;
+      }
+
+      // need to consider it for fallthrough.
+      if (nextBlock->isTrivial()) {
+        continue;
+      }
+
+      // Otherwise this is a real block that will prevent fallthrough.
+      return false;
+    }
+
+    return true;
+  }
+
+ protected:
+  void saveVolatile(Register output) {
+    LiveRegisterSet regs(RegisterSet::Volatile());
+    regs.takeUnchecked(output);
+    masm.PushRegsInMask(regs);
+  }
+  void restoreVolatile(Register output) {
+    LiveRegisterSet regs(RegisterSet::Volatile());
+    regs.takeUnchecked(output);
+    masm.PopRegsInMask(regs);
+  }
+  void saveVolatile(FloatRegister output) {
+    LiveRegisterSet regs(RegisterSet::Volatile());
+    regs.takeUnchecked(output);
+    masm.PushRegsInMask(regs);
+  }
+  void restoreVolatile(FloatRegister output) {
+    LiveRegisterSet regs(RegisterSet::Volatile());
+    regs.takeUnchecked(output);
+    masm.PopRegsInMask(regs);
+  }
+  void saveVolatile(LiveRegisterSet temps) {
+    masm.PushRegsInMask(LiveRegisterSet(RegisterSet::VolatileNot(temps.set())));
+  }
+  void restoreVolatile(LiveRegisterSet temps) {
+    masm.PopRegsInMask(LiveRegisterSet(RegisterSet::VolatileNot(temps.set())));
+  }
+  void saveVolatile() {
+    masm.PushRegsInMask(LiveRegisterSet(RegisterSet::Volatile()));
+  }
+  void restoreVolatile() {
+    masm.PopRegsInMask(LiveRegisterSet(RegisterSet::Volatile()));
+  }
+
+  inline void saveLive(LInstruction* ins);
+  inline void restoreLive(LInstruction* ins);
+  inline void restoreLiveIgnore(LInstruction* ins, LiveRegisterSet reg);
+
+  inline LiveRegisterSet liveVolatileRegs(LInstruction* ins);
+  inline void saveLiveVolatile(LInstruction* ins);
+  inline void restoreLiveVolatile(LInstruction* ins);
+
+ public:
+  template <typename T>
+  void pushArg(const T& t) {
+    masm.Push(t);
+#ifdef DEBUG
+    pushedArgs_++;
+#endif
+  }
+
+  void pushArg(jsid id, Register temp) {
+    masm.Push(id, temp);
+#ifdef DEBUG
+    pushedArgs_++;
+#endif
+  }
+
+  template <typename T>
+  CodeOffset pushArgWithPatch(const T& t) {
+#ifdef DEBUG
+    pushedArgs_++;
+#endif
+    return masm.PushWithPatch(t);
+  }
+
+  void storePointerResultTo(Register reg) { masm.storeCallPointerResult(reg); }
+
+  void storeFloatResultTo(FloatRegister reg) { masm.storeCallFloatResult(reg); }
+
+  template <typename T>
+  void storeResultValueTo(const T& t) {
+    masm.storeCallResultValue(t);
+  }
+
+ protected:
+  void addIC(LInstruction* lir, size_t cacheIndex);
+
+ protected:
+  bool generatePrologue();
+  bool generateEpilogue();
+
+  void addOutOfLineCode(OutOfLineCode* code, const MInstruction* mir);
+  void addOutOfLineCode(OutOfLineCode* code, const BytecodeSite* site);
+  bool generateOutOfLineCode();
+
+  Label* getJumpLabelForBranch(MBasicBlock* block);
+
+  void jumpToBlock(MBasicBlock* mir);
+
+#if !defined(JS_CODEGEN_MIPS64)
+  void jumpToBlock(MBasicBlock* mir, Assembler::Condition cond);
+#endif
+
+ private:
+  void generateInvalidateEpilogue();
+
+ public:
+  CodeGeneratorShared(MIRGenerator* gen, LIRGraph* graph, MacroAssembler* masm,
+                      const wasm::CodeMetadata* wasmCodeMeta);
+
+ public:
+  void visitOutOfLineTruncateSlow(OutOfLineTruncateSlow* ool);
+
+  bool omitOverRecursedStackCheck() const;
+  bool omitOverRecursedInterruptCheck() const;
+
+ public:
+  bool isGlobalObject(JSObject* object);
+};
+
+class OutOfLineCode : public TempObject,
+                      public AppendOnlyListNode<OutOfLineCode> {
+  Label entry_;
+  Label rejoin_;
+  uint32_t framePushed_;
+  const BytecodeSite* site_;
+
+ public:
+  OutOfLineCode() : framePushed_(0), site_() {}
+
+  virtual void generate(CodeGeneratorShared* codegen) = 0;
+
+  Label* entry() { return &entry_; }
+  virtual void bind(MacroAssembler* masm) { masm->bind(entry()); }
+  Label* rejoin() { return &rejoin_; }
+  void setFramePushed(uint32_t framePushed) { framePushed_ = framePushed; }
+  uint32_t framePushed() const { return framePushed_; }
+  void setBytecodeSite(const BytecodeSite* site) { site_ = site; }
+  const BytecodeSite* bytecodeSite() const { return site_; }
+};
+
+template <typename Func>
+class LambdaOutOfLineCode : public OutOfLineCode {
+  static_assert(std::is_void_v<std::invoke_result_t<Func, OutOfLineCode&>>,
+                "LambdaOutOfLineCode lambda must return void; use "
+                "masm.setOOM() to report failure");
+
+  Func generateFunc_;
+
+ public:
+  explicit LambdaOutOfLineCode(Func generateFunc)
+      : generateFunc_(std::move(generateFunc)) {}
+
+  void generate(CodeGeneratorShared*) override { generateFunc_(*this); }
+};
+
+template <typename T>
+class OutOfLineCodeBase : public OutOfLineCode {
+ public:
+  virtual void generate(CodeGeneratorShared* codegen) override {
+    accept(static_cast<T*>(codegen));
+  }
+
+ public:
+  virtual void accept(T* codegen) = 0;
+};
+
+template <class CodeGen>
+class OutOfLineWasmTruncateCheckBase : public OutOfLineCodeBase<CodeGen> {
+  MIRType fromType_;
+  MIRType toType_;
+  FloatRegister input_;
+  Register output_;
+  Register64 output64_;
+  TruncFlags flags_;
+  wasm::TrapSiteDesc trapSiteDesc_;
+
+ public:
+  OutOfLineWasmTruncateCheckBase(MWasmTruncateToInt32* mir, FloatRegister input,
+                                 Register output)
+      : fromType_(mir->input()->type()),
+        toType_(MIRType::Int32),
+        input_(input),
+        output_(output),
+        output64_(Register64::Invalid()),
+        flags_(mir->flags()),
+        trapSiteDesc_(mir->trapSiteDesc()) {}
+
+  OutOfLineWasmTruncateCheckBase(MWasmBuiltinTruncateToInt64* mir,
+                                 FloatRegister input, Register64 output)
+      : fromType_(mir->input()->type()),
+        toType_(MIRType::Int64),
+        input_(input),
+        output_(Register::Invalid()),
+        output64_(output),
+        flags_(mir->flags()),
+        trapSiteDesc_(mir->trapSiteDesc()) {}
+
+  OutOfLineWasmTruncateCheckBase(MWasmTruncateToInt64* mir, FloatRegister input,
+                                 Register64 output)
+      : fromType_(mir->input()->type()),
+        toType_(MIRType::Int64),
+        input_(input),
+        output_(Register::Invalid()),
+        output64_(output),
+        flags_(mir->flags()),
+        trapSiteDesc_(mir->trapSiteDesc()) {}
+
+  void accept(CodeGen* codegen) override {
+    codegen->visitOutOfLineWasmTruncateCheck(this);
+  }
+
+  FloatRegister input() const { return input_; }
+  Register output() const { return output_; }
+  Register64 output64() const { return output64_; }
+  MIRType toType() const { return toType_; }
+  MIRType fromType() const { return fromType_; }
+  bool isUnsigned() const { return flags_ & TRUNC_UNSIGNED; }
+  bool isSaturating() const { return flags_ & TRUNC_SATURATING; }
+  TruncFlags flags() const { return flags_; }
+  wasm::TrapSiteDesc trapSiteDesc() const { return trapSiteDesc_; }
+};
+
+}  
+}  
+
+#endif /* jit_shared_CodeGenerator_shared_h */

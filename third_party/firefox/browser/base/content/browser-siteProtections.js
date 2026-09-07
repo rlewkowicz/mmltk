@@ -1,0 +1,2104 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+ChromeUtils.defineESModuleGetters(this, {
+  ContentBlockingAllowList:
+    "resource://gre/modules/ContentBlockingAllowList.sys.mjs",
+});
+
+XPCOMUtils.defineLazyServiceGetter(
+  this,
+  "TrackingDBService",
+  "@mozilla.org/tracking-db-service;1",
+  Ci.nsITrackingDBService
+);
+
+class ProtectionCategory {
+  constructor(
+    id,
+    { prefEnabled },
+    {
+      load,
+      block,
+    }
+  ) {
+    this._id = id;
+    this.prefEnabled = prefEnabled;
+
+    this._flags = { load, block };
+
+    if (
+      Services.prefs.getPrefType(this.prefEnabled) == Services.prefs.PREF_BOOL
+    ) {
+      XPCOMUtils.defineLazyPreferenceGetter(
+        this,
+        "_enabled",
+        this.prefEnabled,
+        false,
+        this.updateCategoryItem.bind(this)
+      );
+    }
+
+    MozXULElement.insertFTLIfNeeded("browser/siteProtections.ftl");
+
+    ChromeUtils.defineLazyGetter(this, "subView", () =>
+      document.getElementById(`protections-popup-${this._id}View`)
+    );
+
+    ChromeUtils.defineLazyGetter(this, "subViewHeading", () =>
+      document.getElementById(`protections-popup-${this._id}View-heading`)
+    );
+
+    ChromeUtils.defineLazyGetter(this, "subViewList", () =>
+      document.getElementById(`protections-popup-${this._id}View-list`)
+    );
+
+    ChromeUtils.defineLazyGetter(this, "isWindowPrivate", () =>
+      PrivateBrowsingUtils.isWindowPrivate(window)
+    );
+  }
+
+  init() {}
+  uninit() {}
+
+  get enabled() {
+    return this._enabled;
+  }
+
+  get categoryItem() {
+    return (
+      this._categoryItem ||
+      (this._categoryItem = document.getElementById(
+        `protections-popup-category-${this._id}`
+      ))
+    );
+  }
+
+  get blockingEnabled() {
+    return this.enabled;
+  }
+
+  updateCategoryItem() {
+    if (!gProtectionsHandler._protectionsPopup) {
+      return false;
+    }
+    this.categoryItem.classList.toggle("blocked", this.enabled);
+    this.categoryItem.classList.toggle("subviewbutton-nav", this.enabled);
+    return true;
+  }
+
+  async updateSubView() {
+    let { items } = await this._generateSubViewListItems();
+
+    this.subViewList.textContent = "";
+    this.subViewList.append(items);
+    const isBlocking =
+      this.blockingEnabled && !gProtectionsHandler.hasException;
+    let l10nId;
+    switch (this._id) {
+      case "cryptominers":
+        l10nId = isBlocking
+          ? "protections-blocking-cryptominers"
+          : "protections-not-blocking-cryptominers";
+        break;
+      case "fingerprinters":
+        l10nId = isBlocking
+          ? "protections-blocking-fingerprinters"
+          : "protections-not-blocking-fingerprinters";
+        break;
+      case "socialblock":
+        l10nId = isBlocking
+          ? "protections-blocking-social-media-trackers"
+          : "protections-not-blocking-social-media-trackers";
+        break;
+    }
+    if (l10nId) {
+      document.l10n.setAttributes(this.subView, l10nId);
+    }
+  }
+
+  async _generateSubViewListItems() {
+    let contentBlockingLog = gBrowser.selectedBrowser.getContentBlockingLog();
+    contentBlockingLog = JSON.parse(contentBlockingLog);
+    let fragment = document.createDocumentFragment();
+    for (let [origin, actions] of Object.entries(contentBlockingLog)) {
+      let { item } = await this._createListItem(origin, actions);
+      if (!item) {
+        continue;
+      }
+      fragment.appendChild(item);
+    }
+
+    return {
+      items: fragment,
+    };
+  }
+
+  async getBlockerCount() {
+    let { items } = await this._generateSubViewListItems();
+    return items?.childElementCount ?? 0;
+  }
+
+  _createListItem(origin, actions) {
+    let isAllowed = actions.some(([state]) => this.isAllowing(state));
+    let isDetected =
+      isAllowed || actions.some(([state]) => this.isBlocking(state));
+
+    if (!isDetected) {
+      return {};
+    }
+
+    let listItem = document.createElementNS(
+      "http://www.w3.org/1999/xhtml",
+      "div"
+    );
+    listItem.className = "protections-popup-list-item";
+    listItem.classList.toggle("allowed", isAllowed);
+
+    let label = document.createXULElement("label");
+    label.tooltipText = origin;
+    label.value = origin;
+    label.className = "protections-popup-list-host-label";
+    label.setAttribute("crop", "end");
+    listItem.append(label);
+
+    return { item: listItem };
+  }
+
+  isBlocking(state) {
+    return (state & this._flags.block) != 0;
+  }
+
+  isAllowing(state) {
+    return (state & this._flags.load) != 0;
+  }
+
+  isDetected(state) {
+    return this.isBlocking(state) || this.isAllowing(state);
+  }
+
+}
+
+let Fingerprinting =
+  new (class FingerprintingProtection extends ProtectionCategory {
+    iconSrc = "chrome://browser/skin/fingerprint.svg";
+    l10nKeys = {
+      content: "fingerprinters",
+      general: "fingerprinter",
+      title: {
+        blocking: "protections-blocking-fingerprinters",
+        "not-blocking": "protections-not-blocking-fingerprinters",
+      },
+    };
+    #isInitialized = false;
+
+    constructor() {
+      super(
+        "fingerprinters",
+        {
+          prefEnabled: "privacy.trackingprotection.fingerprinting.enabled",
+        },
+        {
+          load: Ci.nsIWebProgressListener.STATE_LOADED_FINGERPRINTING_CONTENT,
+          block: Ci.nsIWebProgressListener.STATE_BLOCKED_FINGERPRINTING_CONTENT,
+        }
+      );
+
+      this.prefFPPEnabled = "privacy.fingerprintingProtection";
+      this.prefFPPEnabledInPrivateWindows =
+        "privacy.fingerprintingProtection.pbmode";
+
+      this.enabledFPB = false;
+      this.enabledFPPGlobally = false;
+      this.enabledFPPInPrivateWindows = false;
+    }
+
+    init() {
+      this.updateEnabled();
+
+      if (!this.#isInitialized) {
+        Services.prefs.addObserver(this.prefEnabled, this);
+        Services.prefs.addObserver(this.prefFPPEnabled, this);
+        Services.prefs.addObserver(this.prefFPPEnabledInPrivateWindows, this);
+        this.#isInitialized = true;
+      }
+    }
+
+    uninit() {
+      if (this.#isInitialized) {
+        Services.prefs.removeObserver(this.prefEnabled, this);
+        Services.prefs.removeObserver(this.prefFPPEnabled, this);
+        Services.prefs.removeObserver(
+          this.prefFPPEnabledInPrivateWindows,
+          this
+        );
+        this.#isInitialized = false;
+      }
+    }
+
+    updateEnabled() {
+      this.enabledFPB = Services.prefs.getBoolPref(this.prefEnabled);
+      this.enabledFPPGlobally = Services.prefs.getBoolPref(this.prefFPPEnabled);
+      this.enabledFPPInPrivateWindows = Services.prefs.getBoolPref(
+        this.prefFPPEnabledInPrivateWindows
+      );
+    }
+
+    observe() {
+      this.updateEnabled();
+      this.updateCategoryItem();
+    }
+
+    get enabled() {
+      return (
+        this.enabledFPB ||
+        this.enabledFPPGlobally ||
+        (this.isWindowPrivate && this.enabledFPPInPrivateWindows)
+      );
+    }
+
+    isBlocking(state) {
+      let blockFlag = this._flags.block;
+
+      if (
+        this.enabledFPPGlobally ||
+        (this.isWindowPrivate && this.enabledFPPInPrivateWindows)
+      ) {
+        blockFlag |=
+          Ci.nsIWebProgressListener.STATE_BLOCKED_SUSPICIOUS_FINGERPRINTING;
+      }
+
+      return (state & blockFlag) != 0;
+    }
+  })();
+
+let Cryptomining = new ProtectionCategory(
+  "cryptominers",
+  {
+    prefEnabled: "privacy.trackingprotection.cryptomining.enabled",
+  },
+  {
+    load: Ci.nsIWebProgressListener.STATE_LOADED_CRYPTOMINING_CONTENT,
+    block: Ci.nsIWebProgressListener.STATE_BLOCKED_CRYPTOMINING_CONTENT,
+  }
+);
+
+Cryptomining.l10nId = "trustpanel-cryptomining";
+Cryptomining.iconSrc = "chrome://browser/skin/controlcenter/cryptominers.svg";
+Cryptomining.l10nKeys = {
+  content: "cryptominers",
+  general: "cryptominer",
+  title: {
+    blocking: "protections-blocking-cryptominers",
+    "not-blocking": "protections-not-blocking-cryptominers",
+  },
+};
+
+let TrackingProtection =
+  new (class TrackingProtection extends ProtectionCategory {
+    iconSrc = "chrome://browser/skin/canvas.svg";
+    l10nKeys = {
+      content: "tracking-content",
+      general: "tracking-content",
+      title: {
+        blocking: "protections-blocking-tracking-content",
+        "not-blocking": "protections-not-blocking-tracking-content",
+      },
+    };
+    #isInitialized = false;
+
+    constructor() {
+      super(
+        "trackers",
+        {
+          prefEnabled: "privacy.trackingprotection.enabled",
+        },
+        {
+          load: null,
+          block:
+            Ci.nsIWebProgressListener.STATE_BLOCKED_TRACKING_CONTENT |
+            Ci.nsIWebProgressListener.STATE_BLOCKED_EMAILTRACKING_CONTENT,
+        }
+      );
+
+      this.prefEnabledInPrivateWindows =
+        "privacy.trackingprotection.pbmode.enabled";
+      this.prefTrackingTable = "urlclassifier.trackingTable";
+      this.prefTrackingAnnotationTable =
+        "urlclassifier.trackingAnnotationTable";
+      this.prefAnnotationsLevel2Enabled =
+        "privacy.annotate_channels.strict_list.enabled";
+      this.prefEmailTrackingProtectionEnabled =
+        "privacy.trackingprotection.emailtracking.enabled";
+      this.prefEmailTrackingProtectionEnabledInPrivateWindows =
+        "privacy.trackingprotection.emailtracking.pbmode.enabled";
+
+      this.enabledGlobally = false;
+      this.emailTrackingProtectionEnabledGlobally = false;
+
+      this.enabledInPrivateWindows = false;
+      this.emailTrackingProtectionEnabledInPrivateWindows = false;
+
+      XPCOMUtils.defineLazyPreferenceGetter(
+        this,
+        "trackingTable",
+        this.prefTrackingTable,
+        ""
+      );
+      XPCOMUtils.defineLazyPreferenceGetter(
+        this,
+        "trackingAnnotationTable",
+        this.prefTrackingAnnotationTable,
+        ""
+      );
+      XPCOMUtils.defineLazyPreferenceGetter(
+        this,
+        "annotationsLevel2Enabled",
+        this.prefAnnotationsLevel2Enabled,
+        false
+      );
+    }
+
+    init() {
+      this.updateEnabled();
+
+      if (!this.#isInitialized) {
+        Services.prefs.addObserver(this.prefEnabled, this);
+        Services.prefs.addObserver(this.prefEnabledInPrivateWindows, this);
+        Services.prefs.addObserver(
+          this.prefEmailTrackingProtectionEnabled,
+          this
+        );
+        Services.prefs.addObserver(
+          this.prefEmailTrackingProtectionEnabledInPrivateWindows,
+          this
+        );
+        this.#isInitialized = true;
+      }
+    }
+
+    uninit() {
+      if (this.#isInitialized) {
+        Services.prefs.removeObserver(this.prefEnabled, this);
+        Services.prefs.removeObserver(this.prefEnabledInPrivateWindows, this);
+        Services.prefs.removeObserver(
+          this.prefEmailTrackingProtectionEnabled,
+          this
+        );
+        Services.prefs.removeObserver(
+          this.prefEmailTrackingProtectionEnabledInPrivateWindows,
+          this
+        );
+        this.#isInitialized = false;
+      }
+    }
+
+    observe() {
+      this.updateEnabled();
+      this.updateCategoryItem();
+    }
+
+    get trackingProtectionLevel2Enabled() {
+      const CONTENT_TABLE = "content-track-digest256";
+      return this.trackingTable.includes(CONTENT_TABLE);
+    }
+
+    get enabled() {
+      return (
+        this.enabledGlobally ||
+        this.emailTrackingProtectionEnabledGlobally ||
+        (this.isWindowPrivate &&
+          (this.enabledInPrivateWindows ||
+            this.emailTrackingProtectionEnabledInPrivateWindows))
+      );
+    }
+
+    updateEnabled() {
+      this.enabledGlobally = Services.prefs.getBoolPref(this.prefEnabled);
+      this.enabledInPrivateWindows = Services.prefs.getBoolPref(
+        this.prefEnabledInPrivateWindows
+      );
+      this.emailTrackingProtectionEnabledGlobally = Services.prefs.getBoolPref(
+        this.prefEmailTrackingProtectionEnabled
+      );
+      this.emailTrackingProtectionEnabledInPrivateWindows =
+        Services.prefs.getBoolPref(
+          this.prefEmailTrackingProtectionEnabledInPrivateWindows
+        );
+    }
+
+    isAllowingLevel1(state) {
+      return (
+        (state &
+          Ci.nsIWebProgressListener.STATE_LOADED_LEVEL_1_TRACKING_CONTENT) !=
+        0
+      );
+    }
+
+    isAllowingLevel2(state) {
+      return (
+        (state &
+          Ci.nsIWebProgressListener.STATE_LOADED_LEVEL_2_TRACKING_CONTENT) !=
+        0
+      );
+    }
+
+    isAllowing(state) {
+      return this.isAllowingLevel1(state) || this.isAllowingLevel2(state);
+    }
+
+    async updateSubView() {
+      let previousURI = gBrowser.currentURI.spec;
+      let previousWindow = gBrowser.selectedBrowser.innerWindowID;
+
+      let { items } = await this._generateSubViewListItems();
+
+      if (!items.childNodes.length) {
+        let emptyImage = document.createXULElement("image");
+        emptyImage.classList.add("protections-popup-trackersView-empty-image");
+        emptyImage.classList.add("trackers-icon");
+
+        let emptyLabel = document.createXULElement("label");
+        emptyLabel.classList.add("protections-popup-empty-label");
+        document.l10n.setAttributes(
+          emptyLabel,
+          "content-blocking-trackers-view-empty"
+        );
+
+        items.appendChild(emptyImage);
+        items.appendChild(emptyLabel);
+
+        this.subViewList.classList.add("empty");
+      } else {
+        this.subViewList.classList.remove("empty");
+      }
+
+      if (
+        previousURI == gBrowser.currentURI.spec &&
+        previousWindow == gBrowser.selectedBrowser.innerWindowID
+      ) {
+        this.subViewList.textContent = "";
+        this.subViewList.append(items);
+        const l10nId =
+          this.enabled && !gProtectionsHandler.hasException
+            ? "protections-blocking-tracking-content"
+            : "protections-not-blocking-tracking-content";
+        document.l10n.setAttributes(this.subView, l10nId);
+      }
+    }
+
+    async _createListItem(origin, actions) {
+      let isAllowed = actions.some(([state]) => this.isAllowing(state));
+      let isDetected =
+        isAllowed || actions.some(([state]) => this.isBlocking(state));
+
+      if (!isDetected) {
+        return {};
+      }
+
+      if (
+        this.annotationsLevel2Enabled &&
+        !this.trackingProtectionLevel2Enabled &&
+        actions.some(
+          ([state]) =>
+            (state &
+              Ci.nsIWebProgressListener
+                .STATE_LOADED_LEVEL_2_TRACKING_CONTENT) !=
+            0
+        )
+      ) {
+        return {};
+      }
+
+      let listItem = document.createElementNS(
+        "http://www.w3.org/1999/xhtml",
+        "div"
+      );
+      listItem.className = "protections-popup-list-item";
+      listItem.classList.toggle("allowed", isAllowed);
+
+      let label = document.createXULElement("label");
+      label.tooltipText = origin;
+      label.value = origin;
+      label.className = "protections-popup-list-host-label";
+      label.setAttribute("crop", "end");
+      listItem.append(label);
+
+      return { item: listItem };
+    }
+  })();
+
+let ThirdPartyCookies =
+  new (class ThirdPartyCookies extends ProtectionCategory {
+    iconSrc = "chrome://browser/skin/controlcenter/3rdpartycookies.svg";
+    l10nKeys = {
+      content: "cross-site-tracking-cookies",
+      general: "tracking-cookies",
+      title: {
+        blocking: "protections-blocking-cookies-third-party",
+        "not-blocking": "protections-not-blocking-cookies-third-party",
+      },
+    };
+
+    constructor() {
+      super(
+        "cookies",
+        {
+          prefEnabled: "network.cookie.cookieBehavior",
+        },
+        {
+          load: null,
+          block: null,
+        }
+      );
+
+      ChromeUtils.defineLazyGetter(this, "categoryLabel", () =>
+        document.getElementById("protections-popup-cookies-category-label")
+      );
+
+      this.prefEnabledValues = [
+        Ci.nsICookieService.BEHAVIOR_REJECT_FOREIGN, 
+        Ci.nsICookieService.BEHAVIOR_REJECT_TRACKER, 
+        Ci.nsICookieService.BEHAVIOR_PARTITION_FOREIGN, 
+        Ci.nsICookieService.BEHAVIOR_REJECT, 
+      ];
+
+      XPCOMUtils.defineLazyPreferenceGetter(
+        this,
+        "behaviorPref",
+        this.prefEnabled,
+        Ci.nsICookieService.BEHAVIOR_ACCEPT,
+        this.updateCategoryItem.bind(this)
+      );
+    }
+
+    isBlocking(state) {
+      return (
+        (state & Ci.nsIWebProgressListener.STATE_COOKIES_BLOCKED_TRACKER) !=
+          0 ||
+        (state &
+          Ci.nsIWebProgressListener.STATE_COOKIES_BLOCKED_SOCIALTRACKER) !=
+          0 ||
+        (state & Ci.nsIWebProgressListener.STATE_COOKIES_BLOCKED_ALL) != 0 ||
+        (state &
+          Ci.nsIWebProgressListener.STATE_COOKIES_BLOCKED_BY_PERMISSION) !=
+          0 ||
+        (state & Ci.nsIWebProgressListener.STATE_COOKIES_BLOCKED_FOREIGN) !=
+          0 ||
+        (state & Ci.nsIWebProgressListener.STATE_COOKIES_PARTITIONED_TRACKER) !=
+          0
+      );
+    }
+
+    isDetected(state) {
+      if (this.isBlocking(state)) {
+        return true;
+      }
+
+      if (
+        [
+          Ci.nsICookieService.BEHAVIOR_PARTITION_FOREIGN,
+          Ci.nsICookieService.BEHAVIOR_REJECT_TRACKER,
+          Ci.nsICookieService.BEHAVIOR_ACCEPT,
+        ].includes(this.behaviorPref)
+      ) {
+        return (
+          (state & Ci.nsIWebProgressListener.STATE_COOKIES_LOADED_TRACKER) !=
+            0 ||
+          (SocialTracking.enabled &&
+            (state &
+              Ci.nsIWebProgressListener.STATE_COOKIES_LOADED_SOCIALTRACKER) !=
+              0)
+        );
+      }
+
+      return (state & Ci.nsIWebProgressListener.STATE_COOKIES_LOADED) != 0;
+    }
+
+    updateCategoryItem() {
+      if (!super.updateCategoryItem()) {
+        return;
+      }
+
+      let l10nId;
+      if (!this.enabled) {
+        l10nId = "content-blocking-cookies-blocking-trackers-label";
+      } else {
+        switch (this.behaviorPref) {
+          case Ci.nsICookieService.BEHAVIOR_REJECT_FOREIGN:
+            l10nId = "content-blocking-cookies-blocking-third-party-label";
+            break;
+          case Ci.nsICookieService.BEHAVIOR_REJECT:
+            l10nId = "content-blocking-cookies-blocking-all-label";
+            break;
+          case Ci.nsICookieService.BEHAVIOR_LIMIT_FOREIGN:
+            l10nId = "content-blocking-cookies-blocking-unvisited-label";
+            break;
+          case Ci.nsICookieService.BEHAVIOR_REJECT_TRACKER:
+          case Ci.nsICookieService.BEHAVIOR_PARTITION_FOREIGN:
+            l10nId = "content-blocking-cookies-blocking-trackers-label";
+            break;
+          default:
+            console.error(
+              `Error: Unknown cookieBehavior pref observed: ${this.behaviorPref}`
+            );
+            this.categoryLabel.removeAttribute("data-l10n-id");
+            this.categoryLabel.textContent = "";
+            return;
+        }
+      }
+      document.l10n.setAttributes(this.categoryLabel, l10nId);
+    }
+
+    get enabled() {
+      return this.prefEnabledValues.includes(this.behaviorPref);
+    }
+
+    _generateSubViewListItems() {
+      let fragment = document.createDocumentFragment();
+      let contentBlockingLog = gBrowser.selectedBrowser.getContentBlockingLog();
+      contentBlockingLog = JSON.parse(contentBlockingLog);
+      let categories = this._processContentBlockingLog(contentBlockingLog);
+
+      let categoryNames = ["trackers"];
+      switch (this.behaviorPref) {
+        case Ci.nsICookieService.BEHAVIOR_REJECT:
+          categoryNames.push("firstParty");
+        // eslint-disable-next-line no-fallthrough
+        case Ci.nsICookieService.BEHAVIOR_REJECT_FOREIGN:
+          categoryNames.push("thirdParty");
+      }
+
+      for (let category of categoryNames) {
+        let itemsToShow = categories[category];
+
+        if (!itemsToShow.length) {
+          continue;
+        }
+        for (let info of itemsToShow) {
+          fragment.appendChild(this._createListItem(info));
+        }
+      }
+      return { items: fragment };
+    }
+
+    updateSubView() {
+      let contentBlockingLog = gBrowser.selectedBrowser.getContentBlockingLog();
+      contentBlockingLog = JSON.parse(contentBlockingLog);
+
+      let categories = this._processContentBlockingLog(contentBlockingLog);
+
+      this.subViewList.textContent = "";
+
+      let categoryNames = ["trackers"];
+      switch (this.behaviorPref) {
+        case Ci.nsICookieService.BEHAVIOR_REJECT:
+          categoryNames.push("firstParty");
+        // eslint-disable-next-line no-fallthrough
+        case Ci.nsICookieService.BEHAVIOR_REJECT_FOREIGN:
+          categoryNames.push("thirdParty");
+      }
+
+      for (let category of categoryNames) {
+        let itemsToShow = categories[category];
+
+        if (!itemsToShow.length) {
+          continue;
+        }
+
+        let box = document.createXULElement("vbox");
+        box.className = "protections-popup-cookiesView-list-section";
+        let label = document.createXULElement("label");
+        label.className = "protections-popup-cookiesView-list-header";
+        let l10nId;
+        switch (category) {
+          case "trackers":
+            l10nId = "content-blocking-cookies-view-trackers-label";
+            break;
+          case "firstParty":
+            l10nId = "content-blocking-cookies-view-first-party-label";
+            break;
+          case "thirdParty":
+            l10nId = "content-blocking-cookies-view-third-party-label";
+            break;
+        }
+        if (l10nId) {
+          document.l10n.setAttributes(label, l10nId);
+        }
+        box.appendChild(label);
+
+        for (let info of itemsToShow) {
+          box.appendChild(this._createListItem(info));
+        }
+
+        this.subViewList.appendChild(box);
+      }
+
+      this.subViewHeading.hidden = false;
+      if (!this.enabled) {
+        document.l10n.setAttributes(
+          this.subView,
+          "protections-not-blocking-cross-site-tracking-cookies"
+        );
+        return;
+      }
+
+      let l10nId;
+      let siteException = gProtectionsHandler.hasException;
+      switch (this.behaviorPref) {
+        case Ci.nsICookieService.BEHAVIOR_REJECT_FOREIGN:
+          l10nId = siteException
+            ? "protections-not-blocking-cookies-third-party"
+            : "protections-blocking-cookies-third-party";
+          this.subViewHeading.hidden = true;
+          if (this.subViewHeading.nextSibling.nodeName == "toolbarseparator") {
+            this.subViewHeading.nextSibling.hidden = true;
+          }
+          break;
+        case Ci.nsICookieService.BEHAVIOR_REJECT:
+          l10nId = siteException
+            ? "protections-not-blocking-cookies-all"
+            : "protections-blocking-cookies-all";
+          this.subViewHeading.hidden = true;
+          if (this.subViewHeading.nextSibling.nodeName == "toolbarseparator") {
+            this.subViewHeading.nextSibling.hidden = true;
+          }
+          break;
+        case Ci.nsICookieService.BEHAVIOR_LIMIT_FOREIGN:
+          l10nId = "protections-blocking-cookies-unvisited";
+          this.subViewHeading.hidden = true;
+          if (this.subViewHeading.nextSibling.nodeName == "toolbarseparator") {
+            this.subViewHeading.nextSibling.hidden = true;
+          }
+          break;
+        case Ci.nsICookieService.BEHAVIOR_REJECT_TRACKER:
+        case Ci.nsICookieService.BEHAVIOR_PARTITION_FOREIGN:
+          l10nId = siteException
+            ? "protections-not-blocking-cross-site-tracking-cookies"
+            : "protections-blocking-cookies-trackers";
+          break;
+        default:
+          console.error(
+            `Error: Unknown cookieBehavior pref when updating subview: ${this.behaviorPref}`
+          );
+          return;
+      }
+
+      document.l10n.setAttributes(this.subView, l10nId);
+    }
+
+    _getExceptionState(origin) {
+      let thirdPartyStorage = Services.perms.testPermissionFromPrincipal(
+        gBrowser.contentPrincipal,
+        "3rdPartyStorage^" + origin
+      );
+
+      if (thirdPartyStorage != Services.perms.UNKNOWN_ACTION) {
+        return thirdPartyStorage;
+      }
+
+      let principal =
+        Services.scriptSecurityManager.createContentPrincipalFromOrigin(origin);
+      return Services.perms.testPermissionFromPrincipal(principal, "cookie");
+    }
+
+    _clearException(origin) {
+      for (let perm of Services.perms.getAllForPrincipal(
+        gBrowser.contentPrincipal
+      )) {
+        if (perm.type == "3rdPartyStorage^" + origin) {
+          Services.perms.removePermission(perm);
+        }
+      }
+
+      let host = Services.io.newURI(origin).host;
+
+      for (let perm of Services.perms.all) {
+        if (
+          perm.type == "cookie" &&
+          Services.eTLD.hasRootDomain(host, perm.principal.host)
+        ) {
+          Services.perms.removePermission(perm);
+        }
+      }
+    }
+
+    _processContentBlockingLog(log) {
+      let newLog = {
+        firstParty: [],
+        trackers: [],
+        thirdParty: [],
+      };
+
+      let firstPartyDomain = null;
+      try {
+        firstPartyDomain = Services.eTLD.getBaseDomain(gBrowser.currentURI);
+      } catch (e) {
+        if (
+          e.result != Cr.NS_ERROR_HOST_IS_IP_ADDRESS &&
+          e.result != Cr.NS_ERROR_INSUFFICIENT_DOMAIN_LEVELS
+        ) {
+          throw e;
+        }
+      }
+
+      for (let [origin, actions] of Object.entries(log)) {
+        if (!origin.startsWith("http")) {
+          continue;
+        }
+
+        let info = {
+          origin,
+          isAllowed: true,
+          exceptionState: this._getExceptionState(origin),
+        };
+        let hasCookie = false;
+        let isTracker = false;
+
+        for (let [state, blocked] of actions) {
+          if (this.isDetected(state)) {
+            hasCookie = true;
+          }
+          if (TrackingProtection.isAllowing(state)) {
+            isTracker = true;
+          }
+          if (this.isBlocking(state)) {
+            info.isAllowed = !blocked;
+          }
+        }
+
+        if (!hasCookie) {
+          continue;
+        }
+
+        let isFirstParty = false;
+        try {
+          let uri = Services.io.newURI(origin);
+          isFirstParty = Services.eTLD.getBaseDomain(uri) == firstPartyDomain;
+        } catch (e) {
+          if (
+            e.result != Cr.NS_ERROR_HOST_IS_IP_ADDRESS &&
+            e.result != Cr.NS_ERROR_INSUFFICIENT_DOMAIN_LEVELS
+          ) {
+            throw e;
+          }
+        }
+
+        if (isFirstParty) {
+          newLog.firstParty.push(info);
+        } else if (isTracker) {
+          newLog.trackers.push(info);
+        } else {
+          newLog.thirdParty.push(info);
+        }
+      }
+
+      return newLog;
+    }
+
+    _createListItem({ origin, isAllowed, exceptionState }) {
+      let listItem = document.createElementNS(
+        "http://www.w3.org/1999/xhtml",
+        "div"
+      );
+      listItem.className = "protections-popup-list-item";
+      listItem.tooltipText = origin;
+
+      let label = document.createXULElement("label");
+      label.value = origin;
+      label.className = "protections-popup-list-host-label";
+      label.setAttribute("crop", "end");
+      listItem.append(label);
+
+      if (
+        (isAllowed && exceptionState == Services.perms.ALLOW_ACTION) ||
+        (!isAllowed && exceptionState == Services.perms.DENY_ACTION)
+      ) {
+        listItem.classList.add("protections-popup-list-item-with-state");
+
+        let stateLabel = document.createXULElement("label");
+        stateLabel.className = "protections-popup-list-state-label";
+        let l10nId;
+        if (isAllowed) {
+          l10nId = "content-blocking-cookies-view-allowed-label";
+          listItem.classList.toggle("allowed", true);
+        } else {
+          l10nId = "content-blocking-cookies-view-blocked-label";
+        }
+        document.l10n.setAttributes(stateLabel, l10nId);
+
+        let removeException = document.createXULElement("button");
+        removeException.className = "permission-popup-permission-remove-button";
+        document.l10n.setAttributes(
+          removeException,
+          "content-blocking-cookies-view-remove-button",
+          { domain: origin }
+        );
+        removeException.appendChild(stateLabel);
+
+        removeException.addEventListener(
+          "click",
+          () => {
+            this._clearException(origin);
+            removeException.remove();
+            listItem.classList.toggle("allowed", !isAllowed);
+          },
+          { once: true }
+        );
+        listItem.append(removeException);
+      }
+
+      return listItem;
+    }
+  })();
+
+let SocialTracking =
+  new (class SocialTrackingProtection extends ProtectionCategory {
+    iconSrc = "chrome://browser/skin/thumb-down.svg";
+    l10nKeys = {
+      content: "social-media-trackers",
+      general: "social-tracking",
+      title: {
+        blocking: "protections-blocking-social-media-trackers",
+        "not-blocking": "protections-not-blocking-social-media-trackers",
+      },
+    };
+
+    constructor() {
+      super(
+        "socialblock",
+        {
+          prefEnabled: "privacy.socialtracking.block_cookies.enabled",
+        },
+        {
+          load: Ci.nsIWebProgressListener.STATE_LOADED_SOCIALTRACKING_CONTENT,
+          block: Ci.nsIWebProgressListener.STATE_BLOCKED_SOCIALTRACKING_CONTENT,
+        }
+      );
+
+      this.prefStpTpEnabled =
+        "privacy.trackingprotection.socialtracking.enabled";
+      this.prefSTPCookieEnabled = this.prefEnabled;
+      this.prefCookieBehavior = "network.cookie.cookieBehavior";
+
+      XPCOMUtils.defineLazyPreferenceGetter(
+        this,
+        "socialTrackingProtectionEnabled",
+        this.prefStpTpEnabled,
+        false,
+        this.updateCategoryItem.bind(this)
+      );
+      XPCOMUtils.defineLazyPreferenceGetter(
+        this,
+        "rejectTrackingCookies",
+        this.prefCookieBehavior,
+        null,
+        this.updateCategoryItem.bind(this),
+        val =>
+          [
+            Ci.nsICookieService.BEHAVIOR_REJECT_TRACKER,
+            Ci.nsICookieService.BEHAVIOR_PARTITION_FOREIGN,
+          ].includes(val)
+      );
+    }
+
+    get blockingEnabled() {
+      return (
+        (this.socialTrackingProtectionEnabled || this.rejectTrackingCookies) &&
+        this.enabled
+      );
+    }
+
+    isBlockingCookies(state) {
+      return (
+        (state &
+          Ci.nsIWebProgressListener.STATE_COOKIES_BLOCKED_SOCIALTRACKER) !=
+        0
+      );
+    }
+
+    isBlocking(state) {
+      return super.isBlocking(state) || this.isBlockingCookies(state);
+    }
+
+    isAllowing(state) {
+      if (this.socialTrackingProtectionEnabled) {
+        return super.isAllowing(state);
+      }
+
+      return (
+        (state &
+          Ci.nsIWebProgressListener.STATE_COOKIES_LOADED_SOCIALTRACKER) !=
+        0
+      );
+    }
+
+    updateCategoryItem() {
+      if (!gProtectionsHandler._protectionsPopup) {
+        return;
+      }
+      if (this.enabled) {
+        this.categoryItem.removeAttribute("uidisabled");
+      } else {
+        this.categoryItem.setAttribute("uidisabled", true);
+      }
+      this.categoryItem.classList.toggle("blocked", this.blockingEnabled);
+    }
+  })();
+
+var gProtectionsHandler = {
+  PREF_CB_CATEGORY: "browser.contentblocking.category",
+
+  _protectionsPopup: null,
+  _initializePopup() {
+    if (!this._protectionsPopup) {
+      let wrapper = document.getElementById("template-protections-popup");
+      this._protectionsPopup = wrapper.content.firstElementChild;
+      this._protectionsPopup.addEventListener("popupshown", this);
+      this._protectionsPopup.addEventListener("popuphidden", this);
+      wrapper.replaceWith(wrapper.content);
+
+      this.maybeSetMilestoneCounterText();
+
+      for (let blocker of Object.values(this.blockers)) {
+        blocker.updateCategoryItem();
+      }
+
+      this._protectionsPopup.addEventListener("command", this);
+      this._protectionsPopup.addEventListener("popupshown", this);
+      this._protectionsPopup.addEventListener("popuphidden", this);
+
+      function openTooltip(event) {
+        document.getElementById(event.target.tooltip).openPopup(event.target);
+      }
+      function closeTooltip(event) {
+        document.getElementById(event.target.tooltip).hidePopup();
+      }
+      let notBlockingWhy = document.getElementById(
+        "protections-popup-not-blocking-section-why"
+      );
+      notBlockingWhy.addEventListener("mouseover", openTooltip);
+      notBlockingWhy.addEventListener("focus", openTooltip);
+      notBlockingWhy.addEventListener("mouseout", closeTooltip);
+      notBlockingWhy.addEventListener("blur", closeTooltip);
+
+      document
+        .getElementById(
+          "protections-popup-trackers-blocked-counter-description"
+        )
+        .addEventListener("click", () =>
+          gProtectionsHandler.openProtections(true)
+        );
+    }
+  },
+
+  _hidePopup() {
+    if (this._protectionsPopup) {
+      PanelMultiView.hidePopup(this._protectionsPopup);
+    }
+  },
+
+  get iconBox() {
+    delete this.iconBox;
+    return (this.iconBox = document.getElementById(
+      "tracking-protection-icon-box"
+    ));
+  },
+  get _protectionsPopupMultiView() {
+    delete this._protectionsPopupMultiView;
+    return (this._protectionsPopupMultiView = document.getElementById(
+      "protections-popup-multiView"
+    ));
+  },
+  get _protectionsPopupMainView() {
+    delete this._protectionsPopupMainView;
+    return (this._protectionsPopupMainView = document.getElementById(
+      "protections-popup-mainView"
+    ));
+  },
+  get _protectionsPopupMainViewHeaderLabel() {
+    delete this._protectionsPopupMainViewHeaderLabel;
+    return (this._protectionsPopupMainViewHeaderLabel = document.getElementById(
+      "protections-popup-mainView-panel-header-span"
+    ));
+  },
+  get _protectionsPopupTPSwitch() {
+    delete this._protectionsPopupTPSwitch;
+    return (this._protectionsPopupTPSwitch = document.getElementById(
+      "protections-popup-tp-switch"
+    ));
+  },
+  get _protectionsPopupCategoryList() {
+    delete this._protectionsPopupCategoryList;
+    return (this._protectionsPopupCategoryList = document.getElementById(
+      "protections-popup-category-list"
+    ));
+  },
+  get _protectionsPopupBlockingHeader() {
+    delete this._protectionsPopupBlockingHeader;
+    return (this._protectionsPopupBlockingHeader = document.getElementById(
+      "protections-popup-blocking-section-header"
+    ));
+  },
+  get _protectionsPopupNotBlockingHeader() {
+    delete this._protectionsPopupNotBlockingHeader;
+    return (this._protectionsPopupNotBlockingHeader = document.getElementById(
+      "protections-popup-not-blocking-section-header"
+    ));
+  },
+  get _protectionsPopupNotFoundHeader() {
+    delete this._protectionsPopupNotFoundHeader;
+    return (this._protectionsPopupNotFoundHeader = document.getElementById(
+      "protections-popup-not-found-section-header"
+    ));
+  },
+  get _protectionsPopupSettingsButton() {
+    delete this._protectionsPopupSettingsButton;
+    return (this._protectionsPopupSettingsButton = document.getElementById(
+      "protections-popup-settings-button"
+    ));
+  },
+  get _protectionsPopupFooter() {
+    delete this._protectionsPopupFooter;
+    return (this._protectionsPopupFooter = document.getElementById(
+      "protections-popup-footer"
+    ));
+  },
+  get _protectionsPopupTrackersCounterBox() {
+    delete this._protectionsPopupTrackersCounterBox;
+    return (this._protectionsPopupTrackersCounterBox = document.getElementById(
+      "protections-popup-trackers-blocked-counter-box"
+    ));
+  },
+  get _protectionsPopupTrackersCounterDescription() {
+    delete this._protectionsPopupTrackersCounterDescription;
+    return (this._protectionsPopupTrackersCounterDescription =
+      document.getElementById(
+        "protections-popup-trackers-blocked-counter-description"
+      ));
+  },
+  get _protectionsPopupFooterProtectionTypeLabel() {
+    delete this._protectionsPopupFooterProtectionTypeLabel;
+    return (this._protectionsPopupFooterProtectionTypeLabel =
+      document.getElementById(
+        "protections-popup-footer-protection-type-label"
+      ));
+  },
+  get _trackingProtectionIconTooltipLabel() {
+    delete this._trackingProtectionIconTooltipLabel;
+    return (this._trackingProtectionIconTooltipLabel = document.getElementById(
+      "tracking-protection-icon-tooltip-label"
+    ));
+  },
+  get _trackingProtectionIconContainer() {
+    delete this._trackingProtectionIconContainer;
+    return (this._trackingProtectionIconContainer = document.getElementById(
+      "tracking-protection-icon-container"
+    ));
+  },
+
+  get noTrackersDetectedDescription() {
+    delete this.noTrackersDetectedDescription;
+    return (this.noTrackersDetectedDescription = document.getElementById(
+      "protections-popup-no-trackers-found-description"
+    ));
+  },
+
+  get _protectionsPopupMilestonesText() {
+    delete this._protectionsPopupMilestonesText;
+    return (this._protectionsPopupMilestonesText = document.getElementById(
+      "protections-popup-milestones-text"
+    ));
+  },
+
+  get _notBlockingWhyLink() {
+    delete this._notBlockingWhyLink;
+    return (this._notBlockingWhyLink = document.getElementById(
+      "protections-popup-not-blocking-section-why"
+    ));
+  },
+
+  blockers: {
+    SocialTracking,
+    ThirdPartyCookies,
+    TrackingProtection,
+    Fingerprinting,
+    Cryptomining,
+  },
+
+  init() {
+    XPCOMUtils.defineLazyPreferenceGetter(
+      this,
+      "_protectionsPopupToastTimeout",
+      "browser.protections_panel.toast.timeout",
+      3000
+    );
+
+    XPCOMUtils.defineLazyPreferenceGetter(
+      this,
+      "milestoneListPref",
+      "browser.contentblocking.cfr-milestone.milestones",
+      "[]",
+      () => this.maybeSetMilestoneCounterText(),
+      val => JSON.parse(val)
+    );
+
+    XPCOMUtils.defineLazyPreferenceGetter(
+      this,
+      "milestonePref",
+      "browser.contentblocking.cfr-milestone.milestone-achieved",
+      0,
+      () => this.maybeSetMilestoneCounterText()
+    );
+
+    XPCOMUtils.defineLazyPreferenceGetter(
+      this,
+      "milestoneTimestampPref",
+      "browser.contentblocking.cfr-milestone.milestone-shown-time",
+      "0",
+      null,
+      val => parseInt(val)
+    );
+
+    XPCOMUtils.defineLazyPreferenceGetter(
+      this,
+      "milestonesEnabledPref",
+      "browser.contentblocking.cfr-milestone.enabled",
+      false,
+      () => this.maybeSetMilestoneCounterText()
+    );
+
+    XPCOMUtils.defineLazyPreferenceGetter(
+      this,
+      "protectionsPanelMessageSeen",
+      "browser.protections_panel.infoMessage.seen",
+      false
+    );
+
+    XPCOMUtils.defineLazyPreferenceGetter(
+      this,
+      "trustPanelEnabledPref",
+      "browser.urlbar.trustPanel.featureGate",
+      false
+    );
+
+    for (let blocker of Object.values(this.blockers)) {
+      if (blocker.init) {
+        blocker.init();
+      }
+    }
+
+    Services.obs.addObserver(this, "browser:purge-session-history");
+  },
+
+  uninit() {
+    for (let blocker of Object.values(this.blockers)) {
+      if (blocker.uninit) {
+        blocker.uninit();
+      }
+    }
+
+    Services.obs.removeObserver(this, "browser:purge-session-history");
+  },
+
+  getTrackingProtectionLabel() {
+    const value = Services.prefs.getStringPref(this.PREF_CB_CATEGORY);
+
+    switch (value) {
+      case "strict":
+        return "protections-popup-footer-protection-label-strict";
+      case "custom":
+        return "protections-popup-footer-protection-label-custom";
+      case "standard":
+      /* fall through */
+      default:
+        return "protections-popup-footer-protection-label-standard";
+    }
+  },
+
+  openPreferences(origin) {
+    openPreferences("privacy-trackingprotection", { origin });
+  },
+
+  openProtections(relatedToCurrent = false) {
+    switchToTabHavingURI("about:protections", true, {
+      replaceQueryString: true,
+      relatedToCurrent,
+      triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal(),
+    });
+
+    Services.prefs.clearUserPref(
+      "browser.contentblocking.cfr-milestone.milestone-shown-time"
+    );
+  },
+
+  async showTrackersSubview() {
+    await TrackingProtection.updateSubView();
+    this._protectionsPopupMultiView.showSubView(
+      "protections-popup-trackersView"
+    );
+  },
+
+  async showSocialblockerSubview() {
+    await SocialTracking.updateSubView();
+    this._protectionsPopupMultiView.showSubView(
+      "protections-popup-socialblockView"
+    );
+  },
+
+  async showCookiesSubview() {
+    await ThirdPartyCookies.updateSubView();
+    this._protectionsPopupMultiView.showSubView(
+      "protections-popup-cookiesView"
+    );
+  },
+
+  async showFingerprintersSubview() {
+    await Fingerprinting.updateSubView();
+    this._protectionsPopupMultiView.showSubView(
+      "protections-popup-fingerprintersView"
+    );
+  },
+
+  async showCryptominersSubview() {
+    await Cryptomining.updateSubView();
+    this._protectionsPopupMultiView.showSubView(
+      "protections-popup-cryptominersView"
+    );
+  },
+
+
+
+
+  handleProtectionsButtonEvent(event) {
+    event.stopPropagation();
+    if (
+      (event.type == "click" && event.button != 0) ||
+      (event.type == "keypress" &&
+        event.charCode != KeyEvent.DOM_VK_SPACE &&
+        event.keyCode != KeyEvent.DOM_VK_RETURN)
+    ) {
+      return; 
+    }
+
+    this.showProtectionsPopup({ event });
+  },
+
+  onPopupShown(event) {
+    if (event.target == this._protectionsPopup) {
+      PopupNotifications.suppressWhileOpen(this._protectionsPopup);
+
+      window.addEventListener("focus", this, true);
+      this._protectionsPopupTPSwitch.addEventListener("toggle", this);
+
+      this._insertProtectionsPanelInfoMessage(event);
+
+
+      this._trackingProtectionIconContainer.setAttribute("open", "true");
+    }
+  },
+
+  onPopupHidden(event) {
+    if (event.target == this._protectionsPopup) {
+      window.removeEventListener("focus", this, true);
+      this._protectionsPopupTPSwitch.removeEventListener("toggle", this);
+
+    }
+  },
+
+  async onTrackingProtectionIconHoveredOrFocused() {
+    if (this._updatingFooter) {
+      return;
+    }
+    this._updatingFooter = true;
+
+    this._initializePopup();
+
+    const trackerCount = await TrackingDBService.sumAllEvents();
+    this.setTrackersBlockedCounter(trackerCount);
+
+    const l10nId = this.getTrackingProtectionLabel();
+    const elem = this._protectionsPopupFooterProtectionTypeLabel;
+    document.l10n.setAttributes(elem, l10nId);
+
+    await this.maybeUpdateEarliestRecordedDateTooltip(trackerCount);
+
+    this._updatingFooter = false;
+  },
+
+  onLocationChange() {
+    if (this._showToastAfterRefresh) {
+      this._showToastAfterRefresh = false;
+
+      if (
+        this._previousURI == gBrowser.currentURI.spec &&
+        this._previousOuterWindowID == gBrowser.selectedBrowser.outerWindowID
+      ) {
+        this.showProtectionsPopup({
+          toast: true,
+        });
+      }
+    }
+
+    this.hadShieldState = false;
+
+    if (!ContentBlockingAllowList.canHandle(gBrowser.selectedBrowser)) {
+      this._trackingProtectionIconContainer.hidden = true;
+      return;
+    }
+    this._trackingProtectionIconContainer.hidden = false;
+
+    this.hasException = ContentBlockingAllowList.includes(
+      gBrowser.selectedBrowser
+    );
+
+    if (this._protectionsPopup) {
+      this._protectionsPopup.toggleAttribute("hasException", this.hasException);
+    }
+    this.iconBox.toggleAttribute("hasException", this.hasException);
+
+  },
+
+  notifyContentBlockingEvent(event) {
+    if (!this._isStoppedState || !this.anyDetected) {
+      return;
+    }
+
+    let uri = gBrowser.currentURI;
+    let uriHost = uri.asciiHost ? uri.host : uri.spec;
+    Services.obs.notifyObservers(
+      {
+        wrappedJSObject: {
+          browser: gBrowser.selectedBrowser,
+          host: uriHost,
+          event,
+        },
+      },
+      "SiteProtection:ContentBlockingEvent"
+    );
+  },
+
+  onStateChange(aWebProgress, stateFlags) {
+    if (!aWebProgress.isTopLevel) {
+      return;
+    }
+
+    this._isStoppedState = !!(
+      stateFlags & Ci.nsIWebProgressListener.STATE_STOP
+    );
+    this.notifyContentBlockingEvent(
+      gBrowser.selectedBrowser.getContentBlockingEvents()
+    );
+  },
+
+  updatePanelForBlockingEvent(event) {
+    for (let blocker of Object.values(this.blockers)) {
+      if (blocker.categoryItem.hasAttribute("uidisabled")) {
+        continue;
+      }
+      blocker.categoryItem.classList.toggle(
+        "notFound",
+        !blocker.isDetected(event)
+      );
+      blocker.categoryItem.classList.toggle(
+        "subviewbutton-nav",
+        blocker.isDetected(event)
+      );
+    }
+
+    this._protectionsPopup.toggleAttribute("detected", this.anyDetected);
+    this._protectionsPopup.toggleAttribute("blocking", this.anyBlocking);
+    this._protectionsPopup.toggleAttribute("hasException", this.hasException);
+
+    this.noTrackersDetectedDescription.hidden = this.anyDetected;
+
+    if (this.anyDetected) {
+      this.reorderCategoryItems();
+    }
+  },
+
+
+  onContentBlockingEvent(event, webProgress, isSimulated, previousState) {
+    if (!ContentBlockingAllowList.canHandle(gBrowser.selectedBrowser)) {
+      this.iconBox.removeAttribute("active");
+      this.iconBox.removeAttribute("hasException");
+      return;
+    }
+
+    this.anyDetected = false;
+    this.anyBlocking = false;
+    this._lastEvent = event;
+
+    this.hasException = ContentBlockingAllowList.includes(
+      gBrowser.selectedBrowser
+    );
+
+    for (let blocker of Object.values(this.blockers)) {
+      if (blocker.categoryItem?.hasAttribute("uidisabled")) {
+        continue;
+      }
+      blocker.activated = blocker.isBlocking(event);
+      this.anyDetected = this.anyDetected || blocker.isDetected(event);
+      this.anyBlocking = this.anyBlocking || blocker.activated;
+    }
+
+    this._categoryItemOrderInvalidated = true;
+
+
+    this.iconBox.toggleAttribute("active", this.anyBlocking);
+    this.iconBox.toggleAttribute("hasException", this.hasException);
+
+    if (this.hasException) {
+      this.showDisabledTooltipForTPIcon();
+    } else if (this.anyBlocking) {
+      this.showActiveTooltipForTPIcon();
+    } else {
+      this.showNoTrackerTooltipForTPIcon();
+    }
+
+    let isPanelOpen = ["showing", "open"].includes(
+      this._protectionsPopup?.state
+    );
+    if (isPanelOpen) {
+      this.updatePanelForBlockingEvent(event);
+    }
+
+    if (!isSimulated) {
+      this.notifyContentBlockingEvent(event);
+    }
+
+  },
+
+  onCommand(event) {
+    switch (event.target.id) {
+      case "protections-popup-category-trackers":
+        gProtectionsHandler.showTrackersSubview(event);
+        break;
+      case "protections-popup-category-socialblock":
+        gProtectionsHandler.showSocialblockerSubview(event);
+        break;
+      case "protections-popup-category-cookies":
+        gProtectionsHandler.showCookiesSubview(event);
+        break;
+      case "protections-popup-category-cryptominers":
+        gProtectionsHandler.showCryptominersSubview(event);
+        return;
+      case "protections-popup-category-fingerprinters":
+        gProtectionsHandler.showFingerprintersSubview(event);
+        break;
+      case "protections-popup-settings-button":
+        gProtectionsHandler.openPreferences();
+        break;
+      case "protections-popup-show-report-button":
+        gProtectionsHandler.openProtections(true);
+        break;
+      case "protections-popup-milestones-content":
+        gProtectionsHandler.openProtections(true);
+        break;
+      case "protections-popup-trackersView-settings-button":
+        gProtectionsHandler.openPreferences();
+        break;
+      case "protections-popup-socialblockView-settings-button":
+        gProtectionsHandler.openPreferences();
+        break;
+      case "protections-popup-cookiesView-settings-button":
+        gProtectionsHandler.openPreferences();
+        break;
+      case "protections-popup-fingerprintersView-settings-button":
+        gProtectionsHandler.openPreferences();
+        break;
+      case "protections-popup-cryptominersView-settings-button":
+        gProtectionsHandler.openPreferences();
+        break;
+      case "protections-popup-toast-panel-tp-on-desc":
+      case "protections-popup-toast-panel-tp-off-desc":
+        PanelMultiView.hidePopup(this._protectionsPopup);
+
+        this.showProtectionsPopup({ event });
+        break;
+    }
+  },
+
+  handleEvent(event) {
+    switch (event.type) {
+      case "command":
+        this.onCommand(event);
+        break;
+      case "focus": {
+        let elem = document.activeElement;
+        let position = elem.compareDocumentPosition(this._protectionsPopup);
+
+        if (
+          !(
+            position &
+            (Node.DOCUMENT_POSITION_CONTAINS |
+              Node.DOCUMENT_POSITION_CONTAINED_BY)
+          ) &&
+          !this._protectionsPopup.hasAttribute("noautohide")
+        ) {
+          PanelMultiView.hidePopup(this._protectionsPopup);
+        }
+        break;
+      }
+      case "popupshown":
+        this.onPopupShown(event);
+        break;
+      case "popuphidden":
+        this.onPopupHidden(event);
+        break;
+      case "toggle": {
+        this.onTPSwitchCommand(event);
+        break;
+      }
+    }
+  },
+
+  observe(subject, topic) {
+    switch (topic) {
+      case "browser:purge-session-history":
+        this._earliestRecordedDate = 0;
+        this.maybeUpdateEarliestRecordedDateTooltip();
+        break;
+    }
+  },
+
+  refreshProtectionsPopup() {
+    let host = gIdentityHandler.getHostForDisplay();
+    document.l10n.setAttributes(
+      this._protectionsPopupMainViewHeaderLabel,
+      "protections-header",
+      { host }
+    );
+
+    let currentlyEnabled = !this.hasException;
+
+    this.updateProtectionsToggle(currentlyEnabled);
+
+    this._notBlockingWhyLink.setAttribute(
+      "tooltip",
+      currentlyEnabled
+        ? "protections-popup-not-blocking-why-etp-on-tooltip"
+        : "protections-popup-not-blocking-why-etp-off-tooltip"
+    );
+
+    this.maybeUpdateEarliestRecordedDateTooltip();
+
+    let today = Date.now();
+    let threeDaysMillis = 72 * 60 * 60 * 1000;
+    let expired = today - this.milestoneTimestampPref > threeDaysMillis;
+
+    if (this._milestoneTextSet && !expired) {
+      this._protectionsPopup.setAttribute("milestone", this.milestonePref);
+    } else {
+      this._protectionsPopup.removeAttribute("milestone");
+    }
+
+    this._protectionsPopup.toggleAttribute("detected", this.anyDetected);
+    this._protectionsPopup.toggleAttribute("blocking", this.anyBlocking);
+    this._protectionsPopup.toggleAttribute("hasException", this.hasException);
+  },
+
+  updateProtectionsToggle(isPressed) {
+    let host = gIdentityHandler.getHostForDisplay();
+    let toggle = this._protectionsPopupTPSwitch;
+    toggle.toggleAttribute("pressed", isPressed);
+    toggle.toggleAttribute("disabled", !!this._TPSwitchCommanding);
+    document.l10n.setAttributes(
+      toggle,
+      isPressed
+        ? "protections-panel-etp-toggle-on"
+        : "protections-panel-etp-toggle-off",
+      { host }
+    );
+  },
+
+  reorderCategoryItems() {
+    if (!this._categoryItemOrderInvalidated) {
+      return;
+    }
+
+    delete this._categoryItemOrderInvalidated;
+
+    this._protectionsPopupBlockingHeader.hidden = true;
+    this._protectionsPopupNotBlockingHeader.hidden = true;
+    this._protectionsPopupNotFoundHeader.hidden = true;
+
+    for (let { categoryItem } of Object.values(this.blockers)) {
+      if (
+        categoryItem.classList.contains("notFound") ||
+        categoryItem.hasAttribute("uidisabled")
+      ) {
+        this._protectionsPopupCategoryList.insertAdjacentElement(
+          "beforeend",
+          categoryItem
+        );
+        categoryItem.setAttribute("disabled", true);
+        this._protectionsPopupNotFoundHeader.hidden = false;
+        continue;
+      }
+
+      categoryItem.removeAttribute("disabled");
+
+      if (categoryItem.classList.contains("blocked") && !this.hasException) {
+        categoryItem.parentNode.insertBefore(
+          categoryItem,
+          this._protectionsPopupNotBlockingHeader
+        );
+        this._protectionsPopupBlockingHeader.hidden = false;
+        continue;
+      }
+
+      categoryItem.parentNode.insertBefore(
+        categoryItem,
+        this._protectionsPopupNotFoundHeader
+      );
+      this._protectionsPopupNotBlockingHeader.hidden = false;
+    }
+  },
+
+  disableForCurrentPage(shouldReload = true) {
+    ContentBlockingAllowList.add(gBrowser.selectedBrowser);
+    if (shouldReload) {
+      this._hidePopup();
+      BrowserCommands.reload();
+    }
+  },
+
+  enableForCurrentPage(shouldReload = true) {
+    ContentBlockingAllowList.remove(gBrowser.selectedBrowser);
+    if (shouldReload) {
+      this._hidePopup();
+      BrowserCommands.reload();
+    }
+  },
+
+  async onTPSwitchCommand() {
+    if (this._TPSwitchCommanding) {
+      return;
+    }
+
+    this._TPSwitchCommanding = true;
+
+    let newExceptionState =
+      this._protectionsPopup.toggleAttribute("hasException");
+
+    this.updateProtectionsToggle(!newExceptionState);
+
+    if (newExceptionState) {
+      this.showDisabledTooltipForTPIcon();
+    } else {
+      this.showNoTrackerTooltipForTPIcon();
+    }
+
+    this.iconBox.toggleAttribute("hasException", newExceptionState);
+
+    this._showToastAfterRefresh = true;
+    this._previousURI = gBrowser.currentURI.spec;
+    this._previousOuterWindowID = gBrowser.selectedBrowser.outerWindowID;
+
+    if (newExceptionState) {
+      this.disableForCurrentPage(false);
+    } else {
+      this.enableForCurrentPage(false);
+    }
+
+    let targetTab = gBrowser.selectedTab;
+    let onTabSelectHandler;
+    let tabSelectPromise = new Promise(resolve => {
+      onTabSelectHandler = () => resolve();
+      gBrowser.tabContainer.addEventListener("TabSelect", onTabSelectHandler);
+    });
+    let timeoutPromise = new Promise(resolve => setTimeout(resolve, 500));
+
+    await Promise.race([tabSelectPromise, timeoutPromise]);
+    gBrowser.tabContainer.removeEventListener("TabSelect", onTabSelectHandler);
+    PanelMultiView.hidePopup(this._protectionsPopup);
+    gBrowser.reloadTab(targetTab);
+
+    delete this._TPSwitchCommanding;
+  },
+
+  setTrackersBlockedCounter(trackerCount) {
+    if (this._earliestRecordedDate) {
+      document.l10n.setAttributes(
+        this._protectionsPopupTrackersCounterDescription,
+        "protections-footer-blocked-tracker-counter",
+        { trackerCount, date: this._earliestRecordedDate }
+      );
+    } else {
+      document.l10n.setAttributes(
+        this._protectionsPopupTrackersCounterDescription,
+        "protections-footer-blocked-tracker-counter-no-tooltip",
+        { trackerCount }
+      );
+      this._protectionsPopupTrackersCounterDescription.removeAttribute(
+        "tooltiptext"
+      );
+    }
+
+    this._protectionsPopupTrackersCounterBox.toggleAttribute(
+      "showing",
+      trackerCount != 0
+    );
+  },
+
+  _milestoneTextSet: false,
+  async maybeSetMilestoneCounterText() {
+    if (!this._protectionsPopup) {
+      return;
+    }
+    let trackerCount = this.milestonePref;
+    if (
+      !this.milestonesEnabledPref ||
+      !trackerCount ||
+      !this.milestoneListPref.includes(trackerCount)
+    ) {
+      this._milestoneTextSet = false;
+      return;
+    }
+
+    let date = await TrackingDBService.getEarliestRecordedDate();
+    document.l10n.setAttributes(
+      this._protectionsPopupMilestonesText,
+      "protections-milestone",
+      { date: date ?? 0, trackerCount }
+    );
+    this._milestoneTextSet = true;
+  },
+
+  showDisabledTooltipForTPIcon() {
+    document.l10n.setAttributes(
+      this._trackingProtectionIconTooltipLabel,
+      "tracking-protection-icon-disabled"
+    );
+    document.l10n.setAttributes(
+      this._trackingProtectionIconContainer,
+      "tracking-protection-icon-disabled-container"
+    );
+  },
+
+  showActiveTooltipForTPIcon() {
+    document.l10n.setAttributes(
+      this._trackingProtectionIconTooltipLabel,
+      "tracking-protection-icon-active"
+    );
+    document.l10n.setAttributes(
+      this._trackingProtectionIconContainer,
+      "tracking-protection-icon-active-container"
+    );
+  },
+
+  showNoTrackerTooltipForTPIcon() {
+    document.l10n.setAttributes(
+      this._trackingProtectionIconTooltipLabel,
+      "tracking-protection-icon-no-trackers-detected"
+    );
+    document.l10n.setAttributes(
+      this._trackingProtectionIconContainer,
+      "tracking-protection-icon-no-trackers-detected-container"
+    );
+  },
+
+  showProtectionsPopup(options = {}) {
+    if (this.trustPanelEnabledPref) {
+      return;
+    }
+    const { event, toast } = options;
+
+    this._initializePopup();
+
+    if (this.hasOwnProperty("_lastEvent")) {
+      this.updatePanelForBlockingEvent(this._lastEvent);
+      delete this._lastEvent;
+    }
+
+    if (this._toastPanelTimer) {
+      clearTimeout(this._toastPanelTimer);
+      delete this._toastPanelTimer;
+    }
+
+    this._protectionsPopup.toggleAttribute("toast", !!toast);
+    if (!toast) {
+      this.refreshProtectionsPopup();
+    }
+
+    if (toast) {
+      this._protectionsPopup.addEventListener(
+        "popupshown",
+        () => {
+          this._toastPanelTimer = setTimeout(() => {
+            PanelMultiView.hidePopup(this._protectionsPopup, true);
+            delete this._toastPanelTimer;
+          }, this._protectionsPopupToastTimeout);
+        },
+        { once: true }
+      );
+    }
+
+    let openPanels = Array.from(document.querySelectorAll("panel[openpanel]"));
+    for (let panel of openPanels) {
+      PanelMultiView.hidePopup(panel);
+    }
+
+    PanelMultiView.openPopup(
+      this._protectionsPopup,
+      this._trackingProtectionIconContainer,
+      {
+        position: "bottomleft topleft",
+        triggerEvent: event,
+      }
+    ).catch(console.error);
+  },
+
+  async maybeUpdateEarliestRecordedDateTooltip(trackerCount) {
+    if (this._earliestRecordedDate || !this._protectionsPopup) {
+      return;
+    }
+
+    let date = await TrackingDBService.getEarliestRecordedDate();
+
+    if (date) {
+      if (typeof trackerCount !== "number") {
+        trackerCount = await TrackingDBService.sumAllEvents();
+      }
+      document.l10n.setAttributes(
+        this._protectionsPopupTrackersCounterDescription,
+        "protections-footer-blocked-tracker-counter",
+        { trackerCount, date }
+      );
+      this._earliestRecordedDate = date;
+    }
+  },
+
+  _dispatchUserAction(message) {
+    let url;
+    try {
+      url = Services.urlFormatter.formatURL(message.content.cta_url);
+    } catch (e) {
+      console.error(e);
+      url = message.content.cta_url;
+    }
+    openTrustedLinkIn(url, message.content.cta_where || "tabshifted");
+  },
+
+  _attachCommandListener(element, message) {
+    element.addEventListener("mouseup", () => {
+      this._dispatchUserAction(message);
+    });
+    element.addEventListener("keyup", e => {
+      if (e.key === "Enter" || e.key === " ") {
+        this._dispatchUserAction(message);
+      }
+    });
+  },
+
+  _insertProtectionsPanelInfoMessage(event) {
+    const message = {
+      id: "PROTECTIONS_PANEL_1",
+      content: {
+        title: { string_id: "cfr-protections-panel-header" },
+        body: { string_id: "cfr-protections-panel-body" },
+        link_text: { string_id: "cfr-protections-panel-link-text" },
+        cta_url: `${Services.urlFormatter.formatURLPref(
+          "app.support.baseURL"
+        )}etp-promotions?as=u&utm_source=inproduct`,
+        cta_type: "OPEN_URL",
+      },
+    };
+
+    const doc = event.target.ownerDocument;
+    const container = doc.getElementById("info-message-container");
+    const infoButton = doc.getElementById("protections-popup-info-button");
+    const panelContainer = doc.getElementById("protections-popup");
+    const toggleMessage = () => {
+      const learnMoreLink = doc.querySelector(
+        "#info-message-container .text-link"
+      );
+      if (learnMoreLink) {
+        container.toggleAttribute("disabled");
+        infoButton.toggleAttribute("checked");
+        panelContainer.toggleAttribute("infoMessageShowing");
+        learnMoreLink.disabled = !learnMoreLink.disabled;
+      }
+    };
+    if (!container.childElementCount) {
+      const messageEl = this._createHeroElement(doc, message);
+      container.appendChild(messageEl);
+      infoButton.addEventListener("click", toggleMessage);
+    }
+    if (
+      !this.protectionsPanelMessageSeen &&
+      container.hasAttribute("disabled")
+    ) {
+      toggleMessage(message);
+    }
+    if (!this.protectionsPanelMessageSeen) {
+      Services.prefs.setBoolPref(
+        "browser.protections_panel.infoMessage.seen",
+        true
+      );
+    }
+    panelContainer.addEventListener(
+      "popuphidden",
+      () => {
+        if (
+          this.protectionsPanelMessageSeen &&
+          !container.hasAttribute("disabled")
+        ) {
+          toggleMessage(message);
+        }
+      },
+      {
+        once: true,
+      }
+    );
+  },
+
+  _createElement(doc, elem, options = {}) {
+    const node = doc.createElementNS("http://www.w3.org/1999/xhtml", elem);
+    if (options.classList) {
+      node.classList.add(options.classList);
+    }
+    if (options.content) {
+      doc.l10n.setAttributes(node, options.content.string_id);
+    }
+    return node;
+  },
+
+  _createHeroElement(doc, message) {
+    const messageEl = this._createElement(doc, "div");
+    messageEl.setAttribute("id", "protections-popup-message");
+    messageEl.classList.add("protections-hero-message");
+    const wrapperEl = this._createElement(doc, "div");
+    wrapperEl.classList.add("protections-popup-message-body");
+    messageEl.appendChild(wrapperEl);
+
+    wrapperEl.appendChild(
+      this._createElement(doc, "h2", {
+        classList: "protections-popup-message-title",
+        content: message.content.title,
+      })
+    );
+
+    wrapperEl.appendChild(
+      this._createElement(doc, "p", { content: message.content.body })
+    );
+
+    if (message.content.link_text) {
+      let linkEl = this._createElement(doc, "a", {
+        classList: "text-link",
+        content: message.content.link_text,
+      });
+
+      linkEl.disabled = true;
+      wrapperEl.appendChild(linkEl);
+      this._attachCommandListener(linkEl, message);
+    } else {
+      this._attachCommandListener(wrapperEl, message);
+    }
+
+    return messageEl;
+  },
+
+};

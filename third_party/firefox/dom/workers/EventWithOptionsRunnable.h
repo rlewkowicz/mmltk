@@ -1,0 +1,46 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_DOM_WORKERS_EVENTWITHOPTIONSRUNNABLE_H_
+#define MOZILLA_DOM_WORKERS_EVENTWITHOPTIONSRUNNABLE_H_
+
+#include "WorkerCommon.h"
+#include "WorkerRunnable.h"
+#include "mozilla/dom/StructuredCloneHolder.h"
+
+namespace mozilla {
+class DOMEventTargetHelper;
+
+namespace dom {
+class Event;
+class EventTarget;
+class Worker;
+class WorkerPrivate;
+
+class EventWithOptionsRunnable : public WorkerDebuggeeRunnable,
+                                 public StructuredCloneHolder {
+ public:
+  explicit EventWithOptionsRunnable(
+      Worker& aWorker, const char* aName = "EventWithOptionsRunnable");
+  void InitOptions(JSContext* aCx, JS::Handle<JS::Value> aOptions,
+                   const Sequence<JSObject*>& aTransferable, ErrorResult& aRv);
+
+  virtual already_AddRefed<Event> BuildEvent(
+      JSContext* aCx, nsIGlobalObject* aGlobal, EventTarget* aTarget,
+      JS::Handle<JS::Value> aOptions) = 0;
+
+  virtual void OptionsDeserializeFailed(ErrorResult& aRv) {}
+
+ protected:
+  virtual ~EventWithOptionsRunnable();
+
+ private:
+  bool WorkerRun(JSContext* aCx, WorkerPrivate* aWorkerPrivate) override;
+  bool BuildAndFireEvent(JSContext* aCx, WorkerPrivate* aWorkerPrivate,
+                         DOMEventTargetHelper* aTarget);
+};
+}  
+}  
+
+#endif  // MOZILLA_DOM_WORKERS_EVENTWITHOPTIONSRUNNABLE_H_

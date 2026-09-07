@@ -1,0 +1,405 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_InputBlockState_h
+#define mozilla_layers_InputBlockState_h
+
+#include "InputData.h"  // for MultiTouchInput
+#include "Units.h"
+#include "mozilla/RefCounted.h"  // for RefCounted
+#include "mozilla/RefPtr.h"      // for RefPtr
+#include "mozilla/StaticPrefs_apz.h"
+#include "mozilla/gfx/Matrix.h"  // for Matrix4x4
+#include "mozilla/layers/APZUtils.h"
+#include "mozilla/layers/LayersTypes.h"  // for TouchBehaviorFlags
+#include "mozilla/layers/AsyncDragMetrics.h"
+#include "mozilla/layers/TouchCounter.h"
+#include "mozilla/TimeStamp.h"  // for TimeStamp
+#include "nsTArray.h"           // for nsTArray
+
+namespace mozilla {
+namespace layers {
+
+class AsyncPanZoomController;
+class OverscrollHandoffChain;
+class CancelableBlockState;
+class TouchBlockState;
+class WheelBlockState;
+class DragBlockState;
+class PanGestureBlockState;
+class PinchGestureBlockState;
+class KeyboardBlockState;
+class InputQueueIterator;
+enum class BrowserGestureResponse : bool;
+
+class InputBlockState : public RefCounted<InputBlockState> {
+ public:
+  MOZ_DECLARE_REFCOUNTED_TYPENAME(InputBlockState)
+
+  static const uint64_t NO_BLOCK_ID = 0;
+
+  enum class TargetConfirmationState : uint8_t {
+    eUnconfirmed,
+    eTimedOut,
+    eConfirmed
+  };
+
+  InputBlockState(const RefPtr<AsyncPanZoomController>& aTargetApzc,
+                  TargetConfirmationFlags aFlags);
+  virtual ~InputBlockState() = default;
+
+  virtual CancelableBlockState* AsCancelableBlock() { return nullptr; }
+  virtual TouchBlockState* AsTouchBlock() { return nullptr; }
+  virtual const TouchBlockState* AsTouchBlock() const { return nullptr; }
+  virtual WheelBlockState* AsWheelBlock() { return nullptr; }
+  virtual DragBlockState* AsDragBlock() { return nullptr; }
+  virtual PanGestureBlockState* AsPanGestureBlock() { return nullptr; }
+  virtual PinchGestureBlockState* AsPinchGestureBlock() { return nullptr; }
+  virtual KeyboardBlockState* AsKeyboardBlock() { return nullptr; }
+  virtual Maybe<LayersId> WheelTransactionLayersId() const { return Nothing(); }
+
+  virtual bool SetConfirmedTargetApzc(
+      const RefPtr<AsyncPanZoomController>& aTargetApzc,
+      TargetConfirmationState aState, InputQueueIterator aFirstInput,
+      bool aForScrollbarDrag);
+  const RefPtr<AsyncPanZoomController>& GetTargetApzc() const;
+  const RefPtr<const OverscrollHandoffChain>& GetOverscrollHandoffChain() const;
+  uint64_t GetBlockId() const;
+
+  bool IsTargetConfirmed() const;
+
+  virtual bool ShouldDropEvents() const;
+
+  void SetScrolledApzc(AsyncPanZoomController* aApzc);
+  AsyncPanZoomController* GetScrolledApzc() const;
+  bool IsDownchainOfScrolledApzc(AsyncPanZoomController* aApzc) const;
+
+  virtual void DispatchEvent(const InputData& aEvent) const;
+
+  virtual bool MustStayActive() = 0;
+
+  const ScreenToParentLayerMatrix4x4& GetTransformToApzc() const {
+    return mTransformToApzc;
+  }
+
+ protected:
+  virtual void UpdateTargetApzc(
+      const RefPtr<AsyncPanZoomController>& aTargetApzc);
+
+  const AsyncPanZoomController* TargetApzc() const { return mTargetApzc.get(); }
+
+ private:
+  bool IsDownchainOf(AsyncPanZoomController* aA,
+                     AsyncPanZoomController* aB) const;
+
+ private:
+  RefPtr<AsyncPanZoomController> mTargetApzc;
+  bool mRequiresTargetConfirmation;
+  const uint64_t mBlockId;
+
+  RefPtr<AsyncPanZoomController> mScrolledApzc;
+
+ protected:
+  TargetConfirmationState mTargetConfirmed;
+  RefPtr<const OverscrollHandoffChain> mOverscrollHandoffChain;
+
+  ScreenToParentLayerMatrix4x4 mTransformToApzc;
+};
+
+class CancelableBlockState : public InputBlockState {
+ public:
+  CancelableBlockState(const RefPtr<AsyncPanZoomController>& aTargetApzc,
+                       TargetConfirmationFlags aFlags);
+
+  CancelableBlockState* AsCancelableBlock() override { return this; }
+
+  virtual bool SetContentResponse(bool aPreventDefault);
+
+  virtual bool TimeoutContentResponse();
+
+  bool IsContentResponseTimerExpired() const;
+
+  bool HasContentResponded() const { return mContentResponded; }
+
+  bool IsDefaultPrevented() const;
+
+  virtual bool IsReadyForHandling() const;
+
+  virtual const char* Type() = 0;
+
+  bool ShouldDropEvents() const override;
+
+  bool HasStateBeenReset() const { return mHasStateBeenReset; };
+  void ResetState() { mHasStateBeenReset = true; }
+
+  void ResetContentResponseTimerExpired() {
+    mContentResponseTimerExpired = false;
+    mContentResponded = false;
+  }
+
+ private:
+  bool mPreventDefault;
+  bool mContentResponded;
+  bool mContentResponseTimerExpired;
+  bool mHasStateBeenReset;
+};
+
+class WheelBlockState : public CancelableBlockState {
+ public:
+  WheelBlockState(const RefPtr<AsyncPanZoomController>& aTargetApzc,
+                  TargetConfirmationFlags aFlags,
+                  const ScrollWheelInput& aEvent);
+
+  bool SetContentResponse(bool aPreventDefault) override;
+  bool MustStayActive() override;
+  const char* Type() override;
+  bool SetConfirmedTargetApzc(const RefPtr<AsyncPanZoomController>& aTargetApzc,
+                              TargetConfirmationState aState,
+                              InputQueueIterator aFirstInput,
+                              bool aForScrollbarDrag) override;
+
+  WheelBlockState* AsWheelBlock() override { return this; }
+
+  bool ShouldAcceptNewEvent() const;
+
+  bool MaybeTimeout(const ScrollWheelInput& aEvent);
+
+  void OnMouseMove(const ScreenIntPoint& aPoint,
+                   const Maybe<ScrollableLayerGuid>& aTargetGuid);
+
+  bool InTransaction() const;
+
+  void EndTransaction();
+
+  bool AllowScrollHandoff() const;
+
+  bool MaybeTimeout(const TimeStamp& aTimeStamp);
+
+  void Update(ScrollWheelInput& aEvent);
+
+  ScrollDirections GetAllowedScrollDirections() const {
+    return mAllowedScrollDirections;
+  }
+
+  Maybe<LayersId> WheelTransactionLayersId() const override;
+
+ protected:
+  void UpdateTargetApzc(
+      const RefPtr<AsyncPanZoomController>& aTargetApzc) override;
+
+ private:
+  TimeStamp mLastEventTime;
+  TimeStamp mLastMouseMove;
+  uint32_t mScrollSeriesCounter;
+  bool mTransactionEnded;
+  bool mIsScrollable = true;
+  ScrollDirections mAllowedScrollDirections;
+};
+
+class DragBlockState : public CancelableBlockState {
+ public:
+  DragBlockState(const RefPtr<AsyncPanZoomController>& aTargetApzc,
+                 TargetConfirmationFlags aFlags, const MouseInput& aEvent);
+
+  bool MustStayActive() override;
+  const char* Type() override;
+
+  bool HasReceivedMouseUp();
+  void MarkMouseUpReceived();
+
+  DragBlockState* AsDragBlock() override { return this; }
+
+  void SetInitialThumbPos(OuterCSSCoord aThumbPos);
+  void SetDragMetrics(const AsyncDragMetrics& aDragMetrics,
+                      const CSSRect& aScrollableRect);
+
+  void DispatchEvent(const InputData& aEvent) const override;
+
+ private:
+  AsyncDragMetrics mDragMetrics;
+  OuterCSSCoord mInitialThumbPos;
+  CSSRect mInitialScrollableRect;
+  bool mReceivedMouseUp;
+};
+
+class PanGestureBlockState : public CancelableBlockState {
+ public:
+  PanGestureBlockState(const RefPtr<AsyncPanZoomController>& aTargetApzc,
+                       TargetConfirmationFlags aFlags,
+                       const PanGestureInput& aEvent);
+
+  bool SetContentResponse(bool aPreventDefault) override;
+  bool IsReadyForHandling() const override;
+  bool MustStayActive() override;
+  const char* Type() override;
+  bool SetConfirmedTargetApzc(const RefPtr<AsyncPanZoomController>& aTargetApzc,
+                              TargetConfirmationState aState,
+                              InputQueueIterator aFirstInput,
+                              bool aForScrollbarDrag) override;
+
+  PanGestureBlockState* AsPanGestureBlock() override { return this; }
+
+  bool ShouldDropEvents() const override;
+
+  bool TimeoutContentResponse() override;
+
+  bool AllowScrollHandoff() const;
+
+  bool WasInterrupted() const { return mInterrupted; }
+
+  void SetNeedsToWaitForContentResponse(bool aWaitForContentResponse);
+  void SetNeedsToWaitForBrowserGestureResponse(
+      bool aWaitForBrowserGestureResponse);
+  void SetBrowserGestureResponse(BrowserGestureResponse aResponse);
+
+  ScrollDirections GetAllowedScrollDirections() const {
+    return mAllowedScrollDirections;
+  }
+
+  bool IsWaitingForBrowserGestureResponse() const {
+    return mWaitingForBrowserGestureResponse;
+  }
+  bool IsWaitingForContentResponse() const {
+    return mWaitingForContentResponse;
+  }
+  Maybe<LayersId> WheelTransactionLayersId() const override;
+
+  void ConfirmForHoldGesture() {
+    mTargetConfirmed = InputBlockState::TargetConfirmationState::eConfirmed;
+  }
+
+ private:
+  bool mInterrupted;
+  bool mWaitingForContentResponse;
+  bool mWaitingForBrowserGestureResponse;
+  bool mStartedBrowserGesture;
+  ScrollDirections mAllowedScrollDirections;
+};
+
+class PinchGestureBlockState : public CancelableBlockState {
+ public:
+  PinchGestureBlockState(const RefPtr<AsyncPanZoomController>& aTargetApzc,
+                         TargetConfirmationFlags aFlags);
+
+  bool SetContentResponse(bool aPreventDefault) override;
+  bool IsReadyForHandling() const override;
+  bool MustStayActive() override;
+  const char* Type() override;
+
+  PinchGestureBlockState* AsPinchGestureBlock() override { return this; }
+
+  bool WasInterrupted() const { return mInterrupted; }
+
+  void SetNeedsToWaitForContentResponse(bool aWaitForContentResponse);
+
+  bool IsWaitingForContentResponse() const {
+    return mWaitingForContentResponse;
+  }
+
+ private:
+  bool mInterrupted;
+  bool mWaitingForContentResponse;
+};
+
+class TouchBlockState : public CancelableBlockState {
+ public:
+  explicit TouchBlockState(const RefPtr<AsyncPanZoomController>& aTargetApzc,
+                           TargetConfirmationFlags aFlags,
+                           TouchCounter& aTouchCounter);
+
+  TouchBlockState* AsTouchBlock() override { return this; }
+  const TouchBlockState* AsTouchBlock() const override { return this; }
+
+  bool SetAllowedTouchBehaviors(const nsTArray<TouchBehaviorFlags>& aBehaviors);
+  bool GetAllowedTouchBehaviors(
+      nsTArray<TouchBehaviorFlags>& aOutBehaviors) const;
+
+  bool HasAllowedTouchBehaviors() const;
+
+  void CopyPropertiesFrom(const TouchBlockState& aOther);
+
+  bool IsReadyForHandling() const override;
+
+  void SetDuringFastFling();
+  bool IsDuringFastFling() const;
+  void SetSingleTapState(apz::SingleTapState aState);
+  apz::SingleTapState SingleTapState() const { return mSingleTapState; }
+
+  bool TouchActionAllowsPinchZoom() const;
+  bool TouchActionAllowsDoubleTapZoom() const;
+  bool TouchActionAllowsPanningX() const;
+  bool TouchActionAllowsPanningY() const;
+  bool TouchActionAllowsPanningXY() const;
+
+  bool UpdateSlopState(const MultiTouchInput& aInput,
+                       bool aApzcCanConsumeEvents);
+  enum class InSlop : bool { No, Yes };
+  InSlop IsInSlop() const;
+  bool ForLongTap() const { return mForLongTap; }
+  void SetForLongTap() { mForLongTap = true; }
+  bool WasLongTapProcessed() const { return mLongTapWasProcessed; }
+  void SetLongTapProcessed() {
+    MOZ_ASSERT(!mForLongTap);
+    mLongTapWasProcessed = true;
+    mIsWaitingLongTapResult = false;
+  }
+
+  void SetWaitingLongTapResult(bool aResult) {
+    MOZ_ASSERT(!mForLongTap);
+    mIsWaitingLongTapResult = aResult;
+  }
+  bool IsWaitingLongTapResult() const { return mIsWaitingLongTapResult; }
+
+  void SetNeedsToWaitTouchMove(bool aNeedsWaitTouchMove) {
+    mNeedsWaitTouchMove = aNeedsWaitTouchMove;
+  }
+  bool IsReadyForCallback() const { return !mNeedsWaitTouchMove; };
+
+  Maybe<ScrollDirection> GetBestGuessPanDirection(
+      const MultiTouchInput& aInput) const;
+
+  uint32_t GetActiveTouchCount() const;
+
+  void DispatchEvent(const InputData& aEvent) const override;
+  bool MustStayActive() override;
+  const char* Type() override;
+  TimeDuration GetTimeSinceBlockStart() const;
+  bool IsTargetOriginallyConfirmed() const;
+
+  bool NeedsContentResponseAfterLongTap(const MultiTouchInput& aEvent,
+                                        InSlop aWasInSlop) const;
+
+ private:
+  nsTArray<TouchBehaviorFlags> mAllowedTouchBehaviors;
+  bool mAllowedTouchBehaviorSet;
+  bool mDuringFastFling;
+  bool mInSlop;
+  bool mForLongTap;
+  bool mLongTapWasProcessed;
+
+  bool mIsWaitingLongTapResult;
+  bool mNeedsWaitTouchMove;
+  apz::SingleTapState mSingleTapState;
+  ScreenIntPoint mSlopOrigin;
+  TouchCounter& mTouchCounter;
+  TimeStamp mStartTime;
+  TargetConfirmationState mOriginalTargetConfirmedState;
+};
+
+class KeyboardBlockState : public InputBlockState {
+ public:
+  explicit KeyboardBlockState(
+      const RefPtr<AsyncPanZoomController>& aTargetApzc);
+
+  KeyboardBlockState* AsKeyboardBlock() override { return this; }
+
+  bool MustStayActive() override { return false; }
+
+  bool AllowScrollHandoff() const { return false; }
+};
+
+}  
+}  
+
+#endif  // mozilla_layers_InputBlockState_h

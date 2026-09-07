@@ -1,0 +1,48 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_ReentrancyGuard_h
+#define mozilla_ReentrancyGuard_h
+
+#include "mozilla/Attributes.h"
+#ifdef DEBUG
+#  include "mozilla/Assertions.h"
+#endif
+
+namespace mozilla {
+
+class MOZ_RAII ReentrancyGuard {
+#ifdef DEBUG
+  bool& mEntered;
+#endif
+
+ public:
+  template <class T>
+#ifdef DEBUG
+  explicit ReentrancyGuard(T& aObj)
+      : mEntered(aObj.mEntered)
+#else
+  explicit ReentrancyGuard(T&)
+#endif
+  {
+#ifdef DEBUG
+    MOZ_ASSERT(!mEntered);
+    mEntered = true;
+#endif
+  }
+  ~ReentrancyGuard() {
+#ifdef DEBUG
+    mEntered = false;
+#endif
+  }
+
+ private:
+  ReentrancyGuard(const ReentrancyGuard&) = delete;
+  void operator=(const ReentrancyGuard&) = delete;
+};
+
+}  
+
+#endif /* mozilla_ReentrancyGuard_h */

@@ -1,0 +1,149 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(mozilla_mozalloc_h)
+#define mozilla_mozalloc_h
+
+
+#if defined(__cplusplus)
+#  include <new>
+#  include <cstdlib>
+#else
+#  include <stdlib.h>
+#endif
+
+#if defined(MOZ_MEMORY) && defined(IMPL_MFBT)
+#  define MOZ_MEMORY_IMPL
+#  include "mozmemory_wrap.h"
+#  define MALLOC_FUNCS MALLOC_FUNCS_MALLOC
+#  define NOTHROW_MALLOC_DECL(name, return_type, ...) \
+    MOZ_MEMORY_API return_type name##_impl(__VA_ARGS__) noexcept(true);
+#  define MALLOC_DECL(name, return_type, ...) \
+    MOZ_MEMORY_API return_type name##_impl(__VA_ARGS__);
+#  include "malloc_decls.h"
+#endif
+
+#if defined(__cplusplus)
+#  include "mozilla/mozalloc_abort.h"
+#  include "mozilla/CheckedArithmetic.h"
+#  include "mozilla/Likely.h"
+#endif
+#include "mozilla/Attributes.h"
+#include "mozilla/Types.h"
+
+MOZ_BEGIN_EXTERN_C
+
+#if !defined(free_impl)
+#  define free_impl free
+#  define free_impl_
+#endif
+#if !defined(malloc_impl)
+#  define malloc_impl malloc
+#  define malloc_impl_
+#endif
+
+
+MFBT_API void* moz_xmalloc(size_t size) MOZ_INFALLIBLE_ALLOCATOR;
+
+MFBT_API void* moz_xcalloc(size_t nmemb, size_t size) MOZ_INFALLIBLE_ALLOCATOR;
+
+MFBT_API void* moz_xrealloc(void* ptr, size_t size) MOZ_INFALLIBLE_ALLOCATOR;
+
+MFBT_API char* moz_xstrdup(const char* str) MOZ_INFALLIBLE_ALLOCATOR;
+
+#if defined(HAVE_STRNDUP)
+MFBT_API char* moz_xstrndup(const char* str,
+                            size_t strsize) MOZ_INFALLIBLE_ALLOCATOR;
+#endif
+
+MFBT_API void* moz_xmemdup(const void* ptr,
+                           size_t size) MOZ_INFALLIBLE_ALLOCATOR;
+
+MFBT_API void* moz_xmemalign(size_t boundary,
+                             size_t size) MOZ_INFALLIBLE_ALLOCATOR;
+
+MFBT_API size_t moz_malloc_usable_size(void* ptr);
+
+MFBT_API size_t moz_malloc_size_of(const void* ptr);
+
+MFBT_API size_t moz_malloc_enclosing_size_of(const void* ptr);
+
+MOZ_END_EXTERN_C
+
+#if defined(__cplusplus)
+
+#if defined(__clang__)
+#    pragma clang diagnostic push
+#    pragma clang diagnostic ignored "-Winline-new-delete"
+#endif
+
+#    define MOZALLOC_EXPORT_NEW MOZ_ALWAYS_INLINE_EVEN_DEBUG
+
+#  include "mozilla/cxxalloc.h"
+#if defined(__clang__)
+#    pragma clang diagnostic pop
+#endif
+
+class InfallibleAllocPolicy {
+ public:
+  template <typename T>
+  T* maybe_pod_malloc(size_t aNumElems) {
+    return pod_malloc<T>(aNumElems);
+  }
+
+  template <typename T>
+  T* maybe_pod_calloc(size_t aNumElems) {
+    return pod_calloc<T>(aNumElems);
+  }
+
+  template <typename T>
+  T* maybe_pod_realloc(T* aPtr, size_t aOldSize, size_t aNewSize) {
+    return pod_realloc<T>(aPtr, aOldSize, aNewSize);
+  }
+
+  template <typename T>
+  T* pod_malloc(size_t aNumElems) {
+    size_t size;
+    if (MOZ_UNLIKELY(!mozilla::SafeMul(aNumElems, sizeof(T), &size))) {
+      reportAllocOverflow();
+    }
+    return static_cast<T*>(moz_xmalloc(size));
+  }
+
+  template <typename T>
+  T* pod_calloc(size_t aNumElems) {
+    return static_cast<T*>(moz_xcalloc(aNumElems, sizeof(T)));
+  }
+
+  template <typename T>
+  T* pod_realloc(T* aPtr, size_t aOldSize, size_t aNewSize) {
+    size_t size;
+    if (MOZ_UNLIKELY(!mozilla::SafeMul(aNewSize, sizeof(T), &size))) {
+      reportAllocOverflow();
+    }
+    return static_cast<T*>(moz_xrealloc(aPtr, size));
+  }
+
+  template <typename T>
+  void free_(T* aPtr, size_t aNumElems = 0) {
+    free_impl(aPtr);
+  }
+
+  void reportAllocOverflow() const { mozalloc_abort("alloc overflow"); }
+
+  bool checkSimulatedOOM() const { return true; }
+};
+
+#endif
+
+#if defined(malloc_impl_)
+#  undef malloc_impl_
+#  undef malloc_impl
+#endif
+#if defined(free_impl_)
+#  undef free_impl_
+#  undef free_impl
+#endif
+
+#endif

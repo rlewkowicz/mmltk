@@ -1,0 +1,576 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(mozilla_dom_CanonicalBrowsingContext_h)
+#define mozilla_dom_CanonicalBrowsingContext_h
+
+#include "mozilla/dom/BrowsingContext.h"
+#include "mozilla/dom/MediaControlKeySource.h"
+#include "mozilla/dom/BrowsingContextWebProgress.h"
+#include "mozilla/dom/FeaturePolicy.h"
+#include "mozilla/dom/ProcessIsolation.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/SessionHistoryEntry.h"
+#include "mozilla/dom/SessionStoreRestoreData.h"
+#include "mozilla/dom/SessionStoreUtils.h"
+#include "mozilla/dom/UniqueContentParentKeepAlive.h"
+#include "mozilla/dom/ipc/IdType.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/MozPromise.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsWrapperCache.h"
+#include "nsTArray.h"
+#include "nsTHashtable.h"
+#include "nsHashKeys.h"
+#include "nsISecureBrowserUI.h"
+
+class nsIBrowserDOMWindow;
+class nsISHistory;
+class nsIWidget;
+class nsSHistory;
+class nsBrowserStatusFilter;
+class nsSecureBrowserUI;
+class CallerWillNotifyHistoryIndexAndLengthChanges;
+class nsITimer;
+class nsIScopedPrefs;
+
+namespace mozilla {
+enum class CallState;
+class BounceTrackingState;
+
+namespace net {
+class DocumentLoadListener;
+}
+
+namespace dom {
+
+class BrowserParent;
+class BrowserBridgeParent;
+class FeaturePolicy;
+struct LoadURIOptions;
+class MediaController;
+enum class AudioFocusInterruptAction : uint8_t;
+struct LoadingSessionHistoryInfo;
+class SSCacheCopy;
+class WindowGlobalParent;
+class SessionStoreFormData;
+class SessionStoreScrollData;
+
+class CanonicalBrowsingContext final : public BrowsingContext {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_CLASS_INHERITED(
+      CanonicalBrowsingContext, BrowsingContext)
+
+  static already_AddRefed<CanonicalBrowsingContext> Get(uint64_t aId);
+  static CanonicalBrowsingContext* Cast(BrowsingContext* aContext);
+  static const CanonicalBrowsingContext* Cast(const BrowsingContext* aContext);
+  static already_AddRefed<CanonicalBrowsingContext> Cast(
+      already_AddRefed<BrowsingContext> aContext);
+
+  bool IsOwnedByProcess(uint64_t aProcessId) const {
+    return mProcessId == aProcessId;
+  }
+  bool IsEmbeddedInProcess(uint64_t aProcessId) const {
+    return mEmbedderProcessId == aProcessId;
+  }
+  uint64_t OwnerProcessId() const { return mProcessId; }
+  uint64_t EmbedderProcessId() const { return mEmbedderProcessId; }
+  ContentParent* GetContentParent() const;
+
+  void GetCurrentRemoteType(nsACString& aRemoteType, ErrorResult& aRv) const;
+
+  void SetOwnerProcessId(uint64_t aProcessId);
+
+  uint64_t GetCrossGroupOpenerId() const { return mCrossGroupOpenerId; }
+  already_AddRefed<CanonicalBrowsingContext> GetCrossGroupOpener() const;
+  void SetCrossGroupOpenerId(uint64_t aOpenerId);
+  void SetCrossGroupOpener(CanonicalBrowsingContext* aCrossGroupOpener,
+                           ErrorResult& aRv);
+
+  void GetWindowGlobals(nsTArray<RefPtr<WindowGlobalParent>>& aWindows);
+
+  WindowGlobalParent* GetCurrentWindowGlobal() const;
+
+  CanonicalBrowsingContext* GetParent() {
+    return Cast(BrowsingContext::GetParent());
+  }
+  CanonicalBrowsingContext* Top() { return Cast(BrowsingContext::Top()); }
+  WindowGlobalParent* GetParentWindowContext();
+  WindowGlobalParent* GetTopWindowContext();
+
+  already_AddRefed<nsIWidget> GetParentProcessWidgetContaining();
+  already_AddRefed<nsIBrowserDOMWindow> GetBrowserDOMWindow();
+
+  already_AddRefed<WindowGlobalParent> GetEmbedderWindowGlobal() const;
+
+  CanonicalBrowsingContext* GetParentCrossChromeBoundary();
+  CanonicalBrowsingContext* TopCrossChromeBoundary();
+  Nullable<WindowProxyHolder> GetTopChromeWindow();
+
+  nsISHistory* GetSessionHistory();
+  SessionHistoryEntry* GetActiveSessionHistoryEntry();
+  void SetActiveSessionHistoryEntryFromBFCache(SessionHistoryEntry* aEntry);
+
+  bool ManuallyManagesActiveness() const;
+
+  UniquePtr<LoadingSessionHistoryInfo> CreateLoadingSessionHistoryEntryForLoad(
+      nsDocShellLoadState* aLoadState, SessionHistoryEntry* aExistingEntry,
+      nsIChannel* aChannel);
+
+  UniquePtr<LoadingSessionHistoryInfo> ReplaceLoadingSessionHistoryEntryForLoad(
+      LoadingSessionHistoryInfo* aInfo, nsIChannel* aNewChannel);
+
+  enum class TopDescendantKind {
+    All,
+    NonNested,
+    ChildrenOnly,
+  };
+  void CallOnTopDescendants(
+      const FunctionRef<CallState(CanonicalBrowsingContext*)>& aCallback,
+      TopDescendantKind aKind);
+
+  void SessionHistoryCommit(uint64_t aLoadId, const nsID& aChangeID,
+                            uint32_t aLoadType, bool aCloneEntryChildren,
+                            bool aChannelExpired, uint32_t aCacheKey);
+
+  void NotifyOnHistoryReload(
+      bool aForceReload, bool& aCanReload,
+      Maybe<NotNull<RefPtr<nsDocShellLoadState>>>& aLoadState,
+      Maybe<bool>& aReloadActiveEntry);
+
+  void SetActiveSessionHistoryEntry(const Maybe<nsPoint>& aPreviousScrollPos,
+                                    SessionHistoryInfo* aInfo,
+                                    uint32_t aLoadType,
+                                    uint32_t aUpdatedCacheKey,
+                                    const nsID& aChangeID);
+
+  void ReplaceActiveSessionHistoryEntry(SessionHistoryInfo* aInfo);
+
+  void RemoveDynEntriesFromActiveSessionHistoryEntry();
+
+  void RemoveFromSessionHistory(const nsID& aChangeID);
+
+  MOZ_CAN_RUN_SCRIPT Maybe<int32_t> HistoryGo(
+      int32_t aOffset, uint64_t aHistoryEpoch, bool aRequireUserInteraction,
+      bool aUserActivation, bool aCheckForCancelation,
+      Maybe<ContentParentId> aContentId,
+      std::function<void(nsresult)>&& aResolver = [](nsresult) {});
+
+  MOZ_CAN_RUN_SCRIPT void NavigationTraverse(
+      const nsID& aKey, uint64_t aHistoryEpoch, bool aUserActivation,
+      bool aCheckForCancelation, Maybe<ContentParentId> aContentId,
+      std::function<void(nsresult)>&& aResolver);
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  void DispatchWheelZoomChange(bool aIncrease);
+
+  void NotifyStartDelayedAutoplayMedia();
+
+  static uint32_t CountSiteOrigins(
+      GlobalObject& aGlobal,
+      const Sequence<mozilla::OwningNonNull<BrowsingContext>>& aRoots);
+
+  static bool IsPrivateBrowsingActive();
+
+  void UpdateMediaControlAction(const MediaControlAction& aAction);
+
+  void UpdateMediaSessionInterrupt(AudioFocusInterruptAction aAction);
+
+  using BrowsingContext::LoadURI;
+  void FixupAndLoadURIString(const nsAString& aURI,
+                             const LoadURIOptions& aOptions,
+                             ErrorResult& aError);
+  void LoadURI(nsIURI* aURI, const LoadURIOptions& aOptions,
+               ErrorResult& aError);
+
+  MOZ_CAN_RUN_SCRIPT
+  void GoBack(const Optional<int32_t>& aCancelContentJSEpoch,
+              bool aRequireUserInteraction, bool aUserActivation);
+  MOZ_CAN_RUN_SCRIPT
+  void GoForward(const Optional<int32_t>& aCancelContentJSEpoch,
+                 bool aRequireUserInteraction, bool aUserActivation);
+  MOZ_CAN_RUN_SCRIPT
+  void GoToIndex(int32_t aIndex, const Optional<int32_t>& aCancelContentJSEpoch,
+                 bool aUserActivation);
+  MOZ_CAN_RUN_SCRIPT
+  void Reload(uint32_t aReloadFlags);
+  void Stop(uint32_t aStopFlags);
+
+  already_AddRefed<nsIURI> GetCurrentURI() const;
+  void SetCurrentRemoteURI(nsIURI* aCurrentRemoteURI);
+
+  BrowserParent* GetBrowserParent() const;
+  void SetCurrentBrowserParent(BrowserParent* aBrowserParent);
+
+  using RemotenessPromise = MozPromise<
+      std::pair<RefPtr<BrowserParent>, RefPtr<CanonicalBrowsingContext>>,
+      nsresult, false>;
+  MOZ_CAN_RUN_SCRIPT
+  RefPtr<RemotenessPromise> ChangeRemoteness(
+      const NavigationIsolationOptions& aOptions, uint64_t aPendingSwitchId);
+
+  MediaController* GetMediaController();
+  bool HasCreatedMediaController() const;
+
+  bool AttemptSpeculativeLoadInParent(nsDocShellLoadState* aLoadState);
+
+  nsISecureBrowserUI* GetSecureBrowserUI();
+
+  BrowsingContextWebProgress* GetWebProgress() { return mWebProgress; }
+
+  void UpdateSecurityState();
+
+  void ReplacedBy(CanonicalBrowsingContext* aNewContext,
+                  const NavigationIsolationOptions& aRemotenessOptions);
+
+  bool HasHistoryEntry(SessionHistoryEntry* aEntry);
+  bool HasLoadingHistoryEntry(SessionHistoryEntry* aEntry) {
+    for (const LoadingSessionHistoryEntry& loading : mLoadingEntries) {
+      if (loading.mEntry == aEntry) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void SwapHistoryEntries(SessionHistoryEntry* aOldEntry,
+                          SessionHistoryEntry* aNewEntry);
+
+  void AddLoadingSessionHistoryEntry(uint64_t aLoadId,
+                                     SessionHistoryEntry* aEntry);
+
+  void GetLoadingSessionHistoryInfoFromParent(
+      Maybe<LoadingSessionHistoryInfo>& aLoadingInfo);
+
+  MOZ_CAN_RUN_SCRIPT
+  void HistoryCommitIndexAndLength();
+
+  void DeactivateDocuments();
+
+  MOZ_CAN_RUN_SCRIPT
+  void ReactivateDocuments(SessionHistoryEntry* aEntry,
+                           SessionHistoryEntry* aPreviousEntryForActivation);
+
+  void SynchronizeLayoutHistoryState();
+
+  void SynchronizeNavigationAPIState(nsIStructuredCloneContainer* aState);
+
+  void ResetScalingZoom();
+
+  void SetContainerFeaturePolicy(
+      Maybe<FeaturePolicyInfo>&& aContainerFeaturePolicyInfo);
+  const Maybe<FeaturePolicyInfo>& GetContainerFeaturePolicy() const {
+    return mContainerFeaturePolicyInfo;
+  }
+
+  void SetRestoreData(SessionStoreRestoreData* aData, ErrorResult& aError);
+  void ClearRestoreState();
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void RequestRestoreTabContent(
+      WindowGlobalParent* aWindow);
+  already_AddRefed<Promise> GetRestorePromise();
+
+  nsresult WriteSessionStorageToSessionStore(
+      const nsTArray<SSCacheCopy>& aSesssionStorage, uint32_t aEpoch);
+
+  void UpdateSessionStoreSessionStorage(const std::function<void()>& aDone);
+
+  static void UpdateSessionStoreForStorage(uint64_t aBrowsingContextId);
+
+  void BrowserParentDestroyed(BrowserParent* aBrowserParent,
+                              bool aAbnormalShutdown);
+
+  void StartUnloadingHost(uint64_t aChildID);
+  void ClearUnloadingHost(uint64_t aChildID);
+
+  bool AllowedInBFCache(const Maybe<uint64_t>& aChannelId, nsIURI* aNewURI);
+
+ private:
+  static nsresult ContainsSameOriginBfcacheEntry(
+      SessionHistoryEntry* aEntry, mozilla::dom::BrowsingContext* aBC,
+      int32_t aChildIndex, void* aData);
+
+ public:
+  static nsresult ClearBfcacheByPrincipal(nsIPrincipal* aPrincipal);
+
+  bool IsPriorityActive() const {
+    MOZ_RELEASE_ASSERT(IsTop());
+    return mPriorityActive;
+  }
+  void SetPriorityActive(bool aIsActive) {
+    MOZ_RELEASE_ASSERT(IsTop());
+    mPriorityActive = aIsActive;
+  }
+
+  void GetDownloadFolderOverride(nsString& aOut) const {
+    if (IsTop()) {
+      aOut = mDownloadFolderOverride;
+    }
+  }
+  void SetDownloadFolderOverride(const nsAString& aValue, ErrorResult& aRv) {
+    if (!IsTop()) {
+      aRv.ThrowInvalidStateError(
+          "downloadFolderOverride can only be set on the top "
+          "BrowsingContext");
+      return;
+    }
+    mDownloadFolderOverride = aValue;
+  }
+
+  void SetIsActive(bool aIsActive, ErrorResult& aRv);
+
+  void SetIsActiveInternal(bool aIsActive, ErrorResult& aRv) {
+    ExplicitActiveStatus newValue = aIsActive ? ExplicitActiveStatus::Active
+                                              : ExplicitActiveStatus::Inactive;
+    SetExplicitActive(newValue, aRv);
+  }
+
+  void SetTouchEventsOverride(dom::TouchEventsOverride, ErrorResult& aRv);
+  void SetTargetTopLevelLinkClicksToBlank(bool aTargetTopLevelLinkClicksToBlank,
+                                          ErrorResult& aRv);
+
+  bool IsReplaced() const { return mIsReplaced; }
+
+
+  const JS::Heap<JS::Value>& PermanentKey() { return mPermanentKey; }
+  void ClearPermanentKey() { mPermanentKey.setNull(); }
+  void MaybeSetPermanentKey(Element* aEmbedder);
+
+  void AddPageAwakeRequest();
+  void RemovePageAwakeRequest();
+
+  bool StartApzAutoscroll(float aAnchorX, float aAnchorY, nsViewID aScrollId,
+                          uint32_t aPresShellId);
+  void StopApzAutoscroll(nsViewID aScrollId, uint32_t aPresShellId);
+
+  void AddFinalDiscardListener(std::function<void(uint64_t)>&& aListener);
+
+  bool ForceAppWindowActive() const { return mForceAppWindowActive; }
+  void SetForceAppWindowActive(bool, ErrorResult&);
+  void RecomputeAppWindowVisibility();
+
+  already_AddRefed<nsISHEntry> GetMostRecentLoadingSessionHistoryEntry();
+
+  already_AddRefed<BounceTrackingState> GetBounceTrackingState();
+  already_AddRefed<nsIScopedPrefs> GetScopedPrefs();
+
+  bool CanOpenModalPicker();
+
+  already_AddRefed<net::DocumentLoadListener> GetCurrentLoad();
+
+  void CreateRedactedAncestorOriginsList(
+      nsIPrincipal* aThisDocumentPrincipal,
+      ReferrerPolicy aFrameReferrerPolicyAttribute);
+
+  Span<const nsCOMPtr<nsIPrincipal>> GetPossiblyRedactedAncestorOriginsList()
+      const;
+  void SetPossiblyRedactedAncestorOriginsList(
+      nsTArray<nsCOMPtr<nsIPrincipal>> aAncestorOriginsList);
+
+  void SetEmbedderFrameReferrerPolicy(ReferrerPolicy aPolicy);
+
+  ReferrerPolicy GetEmbedderFrameReferrerPolicy() const {
+    return mEmbedderFrameReferrerPolicy;
+  }
+
+ protected:
+  void CanonicalDiscard();
+
+  void CanonicalAttach();
+
+  void AdjustPrivateBrowsingCount(bool aPrivateBrowsing);
+
+  using Type = BrowsingContext::Type;
+  CanonicalBrowsingContext(WindowContext* aParentWindow,
+                           BrowsingContextGroup* aGroup,
+                           uint64_t aBrowsingContextId,
+                           uint64_t aOwnerProcessId,
+                           uint64_t aEmbedderProcessId, Type aType,
+                           FieldValues&& aInit);
+
+ private:
+  friend class BrowsingContext;
+
+  virtual ~CanonicalBrowsingContext();
+
+  class PendingRemotenessChange {
+   public:
+    NS_INLINE_DECL_REFCOUNTING(PendingRemotenessChange)
+
+    PendingRemotenessChange(CanonicalBrowsingContext* aTarget,
+                            RemotenessPromise::Private* aPromise,
+                            uint64_t aPendingSwitchId,
+                            const NavigationIsolationOptions& aOptions);
+
+    void Cancel(nsresult aRv);
+
+   private:
+    friend class CanonicalBrowsingContext;
+
+    ~PendingRemotenessChange();
+    MOZ_CAN_RUN_SCRIPT
+    void ProcessLaunched();
+    MOZ_CAN_RUN_SCRIPT
+    void ProcessReady();
+    MOZ_CAN_RUN_SCRIPT
+    void MaybeFinish();
+    void Clear();
+
+    MOZ_CAN_RUN_SCRIPT
+    nsresult FinishTopContent();
+    nsresult FinishSubframe();
+
+    RefPtr<CanonicalBrowsingContext> mTarget;
+    RefPtr<RemotenessPromise::Private> mPromise;
+    UniqueContentParentKeepAlive mContentParentKeepAlive;
+    RefPtr<BrowsingContextGroup> mSpecificGroup;
+
+    bool mProcessReady = false;
+    bool mWaitingForPrepareToChange = false;
+
+    uint64_t mPendingSwitchId;
+    NavigationIsolationOptions mOptions;
+  };
+
+  struct RestoreState {
+    NS_INLINE_DECL_REFCOUNTING(RestoreState)
+
+    void ClearData() { mData = nullptr; }
+    void Resolve();
+
+    RefPtr<SessionStoreRestoreData> mData;
+    RefPtr<Promise> mPromise;
+    uint32_t mRequests = 0;
+    uint32_t mResolves = 0;
+
+   private:
+    ~RestoreState() = default;
+  };
+
+  friend class net::DocumentLoadListener;
+  bool StartDocumentLoad(net::DocumentLoadListener* aLoad);
+  void EndDocumentLoad(bool aContinueNavigating);
+
+  bool SupportsLoadingInParent(nsDocShellLoadState* aLoadState,
+                               uint64_t* aOuterWindowId);
+
+  void HistoryCommitIndexAndLength(
+      const nsID& aChangeID,
+      const CallerWillNotifyHistoryIndexAndLengthChanges& aProofOfCaller);
+
+  struct UnloadingHost {
+    uint64_t mChildID;
+    nsTArray<std::function<void()>> mCallbacks;
+  };
+  nsTArray<UnloadingHost>::iterator FindUnloadingHost(uint64_t aChildID);
+
+  void ShowSubframeCrashedUI(BrowserBridgeParent* aBridge);
+
+  void MaybeScheduleSessionStoreUpdate();
+
+  void CancelSessionStoreUpdate();
+
+  void AddPendingDiscard();
+
+  void RemovePendingDiscard();
+
+  bool ShouldAddEntryForRefresh(const SessionHistoryEntry* aEntry) {
+    return ShouldAddEntryForRefresh(aEntry->Info().GetURI(),
+                                    aEntry->Info().HasPostData());
+  }
+  bool ShouldAddEntryForRefresh(nsIURI* aNewURI, bool aHasPostData) {
+    nsCOMPtr<nsIURI> currentURI = GetCurrentURI();
+    return BrowsingContext::ShouldAddEntryForRefresh(currentURI, aNewURI,
+                                                     aHasPostData);
+  }
+
+  already_AddRefed<nsDocShellLoadState> CreateLoadInfo(
+      SessionHistoryEntry* aEntry, NavigationType aNavigationType);
+
+  void GetContiguousEntriesForLoad(LoadingSessionHistoryInfo& aLoadingInfo,
+                                   const RefPtr<SessionHistoryEntry>& aEntry);
+
+  void MaybeReuseNavigationKeyFromActiveEntry(SessionHistoryEntry* aEntry);
+
+  uint64_t mProcessId;
+
+  uint64_t mEmbedderProcessId;
+
+  uint64_t mCrossGroupOpenerId = 0;
+
+  void ResetSHEntryHasUserInteractionCache();
+
+  RefPtr<BrowserParent> mCurrentBrowserParent;
+
+  nsTArray<UnloadingHost> mUnloadingHosts;
+
+  nsCOMPtr<nsIURI> mCurrentRemoteURI;
+
+  RefPtr<PendingRemotenessChange> mPendingRemotenessChange;
+
+  RefPtr<nsSHistory> mSessionHistory;
+
+  RefPtr<MediaController> mTabMediaController;
+
+  RefPtr<net::DocumentLoadListener> mCurrentLoad;
+
+  struct LoadingSessionHistoryEntry {
+    uint64_t mLoadId = 0;
+    RefPtr<SessionHistoryEntry> mEntry;
+  };
+  nsTArray<LoadingSessionHistoryEntry> mLoadingEntries;
+  RefPtr<SessionHistoryEntry> mActiveEntry;
+
+  RefPtr<nsSecureBrowserUI> mSecureBrowserUI;
+  RefPtr<BrowsingContextWebProgress> mWebProgress;
+
+  nsCOMPtr<nsIScopedPrefs> mScopedPrefs;
+
+  nsCOMPtr<nsIWebProgressListener> mDocShellProgressBridge;
+  RefPtr<nsBrowserStatusFilter> mStatusFilter;
+
+  Maybe<FeaturePolicyInfo> mContainerFeaturePolicyInfo;
+
+  friend class BrowserSessionStore;
+  WeakPtr<SessionStoreFormData>& GetSessionStoreFormDataRef() {
+    return mFormdata;
+  }
+  WeakPtr<SessionStoreScrollData>& GetSessionStoreScrollDataRef() {
+    return mScroll;
+  }
+
+  WeakPtr<SessionStoreFormData> mFormdata;
+  WeakPtr<SessionStoreScrollData> mScroll;
+
+  RefPtr<RestoreState> mRestoreState;
+
+  nsCOMPtr<nsITimer> mSessionStoreSessionStorageUpdateTimer;
+
+  bool mPriorityActive = false;
+
+  nsString mDownloadFolderOverride;
+
+  bool mForceAppWindowActive = false;
+
+  bool mIsReplaced = false;
+
+
+  JS::Heap<JS::Value> mPermanentKey;
+
+  uint32_t mPendingDiscards = 0;
+
+  bool mFullyDiscarded = false;
+  ReferrerPolicy mEmbedderFrameReferrerPolicy = ReferrerPolicy::_empty;
+
+  nsTArray<std::function<void(uint64_t)>> mFullyDiscardedListeners;
+
+  nsTArray<nsCOMPtr<nsIPrincipal>> mPossiblyRedactedAncestorOriginsList;
+};
+
+}  
+}  
+
+#endif

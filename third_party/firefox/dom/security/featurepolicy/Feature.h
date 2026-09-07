@@ -1,0 +1,60 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_Feature_h
+#define mozilla_dom_Feature_h
+
+#include "nsCOMPtr.h"
+#include "nsString.h"
+#include "nsTArray.h"
+
+class nsIPrincipal;
+
+namespace mozilla::dom {
+
+class Feature final {
+ public:
+  explicit Feature(const nsAString& aFeatureName);
+
+  ~Feature();
+
+  const nsAString& Name() const;
+
+  void SetAllowsNone();
+
+  bool AllowsNone() const;
+
+  void SetAllowsAll();
+
+  bool AllowsAll() const;
+
+  void AppendToAllowList(nsIPrincipal* aPrincipal);
+
+  void GetAllowList(nsTArray<nsCOMPtr<nsIPrincipal>>& aList) const;
+
+  bool AllowListContains(nsIPrincipal* aPrincipal) const;
+
+  bool HasAllowList() const;
+
+  bool Allows(nsIPrincipal* aPrincipal) const;
+
+ private:
+  nsString mFeatureName;
+
+  enum Policy {
+    eNone,
+
+    eAll,
+
+    eAllowList,
+  };
+
+  Policy mPolicy;
+
+  CopyableTArray<nsCOMPtr<nsIPrincipal>> mAllowList;
+};
+
+}  
+
+#endif  // mozilla_dom_Feature_h

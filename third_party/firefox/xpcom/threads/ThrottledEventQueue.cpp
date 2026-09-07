@@ -1,0 +1,349 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ThrottledEventQueue.h"
+
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/CondVar.h"
+#include "mozilla/EventQueue.h"
+#include "mozilla/MaybeLeakRefPtr.h"
+#include "mozilla/Mutex.h"
+#include "nsThreadUtils.h"
+
+namespace mozilla {
+
+namespace {}  
+
+class ThrottledEventQueue::Inner final : public nsISupports {
+  class Executor final : public Runnable, public nsIRunnablePriority {
+    RefPtr<Inner> mInner;
+
+    ~Executor() = default;
+
+   public:
+    explicit Executor(Inner* aInner)
+        : Runnable("ThrottledEventQueue::Inner::Executor"), mInner(aInner) {}
+
+    NS_DECL_ISUPPORTS_INHERITED
+
+    NS_IMETHODIMP
+    Run() override {
+      mInner->ExecuteRunnable();
+      return NS_OK;
+    }
+
+    NS_IMETHODIMP
+    GetPriority(uint32_t* aPriority) override {
+      *aPriority = mInner->mPriority;
+      return NS_OK;
+    }
+
+#ifdef MOZ_COLLECTING_RUNNABLE_TELEMETRY
+    NS_IMETHODIMP
+    GetName(nsACString& aName) override { return mInner->CurrentName(aName); }
+#endif
+  };
+
+  mutable Mutex mMutex;
+  mutable CondVar mIdleCondVar MOZ_GUARDED_BY(mMutex);
+
+  EventQueueSized<64> mEventQueue MOZ_GUARDED_BY(mMutex);
+
+  const nsCOMPtr<nsISerialEventTarget> mBaseTarget;
+
+  nsCOMPtr<nsIRunnable> mExecutor MOZ_GUARDED_BY(mMutex);
+
+  const char* const mName;
+
+  const uint32_t mPriority;
+
+  bool mIsPaused MOZ_GUARDED_BY(mMutex);
+
+  explicit Inner(nsISerialEventTarget* aBaseTarget, const char* aName,
+                 uint32_t aPriority)
+      : mMutex("ThrottledEventQueue"),
+        mIdleCondVar(mMutex, "ThrottledEventQueue:Idle"),
+        mBaseTarget(aBaseTarget),
+        mName(aName),
+        mPriority(aPriority),
+        mIsPaused(false) {
+    MOZ_ASSERT(mName, "Must pass a valid name!");
+  }
+
+  ~Inner() {
+#ifdef DEBUG
+    MutexAutoLock lock(mMutex);
+
+    MOZ_ASSERT(!mExecutor);
+
+    MOZ_ASSERT(mEventQueue.IsEmpty(lock) || IsPaused(lock));
+
+    MOZ_ASSERT_IF(!mEventQueue.IsEmpty(lock), IsOnCurrentThread());
+#endif
+  }
+
+  nsresult EnsureExecutor(MutexAutoLock& lock) MOZ_REQUIRES(mMutex) {
+    if (mExecutor) return NS_OK;
+
+    mExecutor = new Executor(this);
+    nsresult rv = mBaseTarget->Dispatch(mExecutor, NS_DISPATCH_NORMAL);
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      mExecutor = nullptr;
+      return rv;
+    }
+
+    return NS_OK;
+  }
+
+  nsresult CurrentName(nsACString& aName) {
+    nsCOMPtr<nsIRunnable> event;
+
+#ifdef DEBUG
+    bool currentThread = false;
+    mBaseTarget->IsOnCurrentThread(&currentThread);
+    MOZ_ASSERT(currentThread);
+#endif
+
+    {
+      MutexAutoLock lock(mMutex);
+      event = mEventQueue.PeekEvent(lock);
+      if (!event) {
+        aName.AssignLiteral("no runnables left in the ThrottledEventQueue");
+        return NS_OK;
+      }
+    }
+
+    if (nsCOMPtr<nsINamed> named = do_QueryInterface(event)) {
+      nsresult rv = named->GetName(aName);
+      return rv;
+    }
+
+    aName.AssignASCII(mName);
+    return NS_OK;
+  }
+
+  void ExecuteRunnable() {
+    nsCOMPtr<nsIRunnable> event;
+
+#ifdef DEBUG
+    bool currentThread = false;
+    mBaseTarget->IsOnCurrentThread(&currentThread);
+    MOZ_ASSERT(currentThread);
+#endif
+
+    {
+      MutexAutoLock lock(mMutex);
+
+      if (IsPaused(lock)) {
+        mExecutor = nullptr;
+        return;
+      }
+
+      event = mEventQueue.GetEvent(lock);
+      MOZ_ASSERT(event);
+
+      if (mEventQueue.HasReadyEvent(lock)) {
+        MOZ_ALWAYS_SUCCEEDS(
+            mBaseTarget->Dispatch(mExecutor, NS_DISPATCH_NORMAL));
+      }
+
+      else {
+        mExecutor = nullptr;
+        mIdleCondVar.NotifyAll();
+      }
+    }
+
+    LogRunnable::Run log(event);
+    (void)event->Run();
+
+    event = nullptr;
+  }
+
+ public:
+  static already_AddRefed<Inner> Create(nsISerialEventTarget* aBaseTarget,
+                                        const char* aName, uint32_t aPriority) {
+
+    RefPtr<Inner> ref = new Inner(aBaseTarget, aName, aPriority);
+    return ref.forget();
+  }
+
+  bool IsEmpty() const {
+    return Length() == 0;
+  }
+
+  uint32_t Length() const {
+    MutexAutoLock lock(mMutex);
+    return mEventQueue.Count(lock);
+  }
+
+  already_AddRefed<nsIRunnable> GetEvent() {
+    MutexAutoLock lock(mMutex);
+    return mEventQueue.GetEvent(lock);
+  }
+
+  void AwaitIdle() const {
+    MOZ_ASSERT(!NS_IsMainThread());
+#ifdef DEBUG
+    bool onBaseTarget = false;
+    (void)mBaseTarget->IsOnCurrentThread(&onBaseTarget);
+    MOZ_ASSERT(!onBaseTarget);
+#endif
+
+    MutexAutoLock lock(mMutex);
+    while (mExecutor || IsPaused(lock)) {
+      mIdleCondVar.Wait();
+    }
+  }
+
+  bool IsPaused() const {
+    MutexAutoLock lock(mMutex);
+    return IsPaused(lock);
+  }
+
+  bool IsPaused(const MutexAutoLock& aProofOfLock) const MOZ_REQUIRES(mMutex) {
+    return mIsPaused;
+  }
+
+  nsresult SetIsPaused(bool aIsPaused) {
+    MutexAutoLock lock(mMutex);
+
+    if (!aIsPaused && !mEventQueue.IsEmpty(lock)) {
+      nsresult rv = EnsureExecutor(lock);
+      if (NS_FAILED(rv)) {
+        return rv;
+      }
+    }
+
+    mIsPaused = aIsPaused;
+    return NS_OK;
+  }
+
+  nsresult DispatchFromScript(nsIRunnable* aEvent, DispatchFlags aFlags) {
+    return Dispatch(do_AddRef(aEvent), aFlags);
+  }
+
+  nsresult Dispatch(already_AddRefed<nsIRunnable> aEvent,
+                    DispatchFlags aFlags) {
+    MaybeLeakRefPtr<nsIRunnable> event(std::move(aEvent),
+                                       aFlags & NS_DISPATCH_FALLIBLE);
+
+    MutexAutoLock lock(mMutex);
+
+    if (!IsPaused(lock)) {
+      nsresult rv = EnsureExecutor(lock);
+      if (NS_FAILED(rv)) {
+        return rv;
+      }
+    }
+
+    LogRunnable::LogDispatch(event);
+    mEventQueue.PutEvent(event.forget(), EventQueuePriority::Normal, lock);
+    return NS_OK;
+  }
+
+  nsresult DelayedDispatch(already_AddRefed<nsIRunnable> aEvent,
+                           uint32_t aDelay) {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+
+  nsresult RegisterShutdownTask(nsITargetShutdownTask* aTask) {
+    return mBaseTarget->RegisterShutdownTask(aTask);
+  }
+
+  nsresult UnregisterShutdownTask(nsITargetShutdownTask* aTask) {
+    return mBaseTarget->UnregisterShutdownTask(aTask);
+  }
+
+  nsIEventTarget::FeatureFlags GetFeatures() {
+    return mBaseTarget->GetFeatures();
+  }
+
+  bool IsOnCurrentThread() { return mBaseTarget->IsOnCurrentThread(); }
+
+  NS_DECL_THREADSAFE_ISUPPORTS
+};
+
+NS_IMPL_ISUPPORTS(ThrottledEventQueue::Inner, nsISupports);
+
+NS_IMPL_ISUPPORTS_INHERITED(ThrottledEventQueue::Inner::Executor, Runnable,
+                            nsIRunnablePriority)
+
+NS_IMPL_ISUPPORTS(ThrottledEventQueue, ThrottledEventQueue, nsIEventTarget,
+                  nsISerialEventTarget);
+
+ThrottledEventQueue::ThrottledEventQueue(already_AddRefed<Inner> aInner)
+    : mInner(aInner) {
+  MOZ_ASSERT(mInner);
+}
+
+already_AddRefed<ThrottledEventQueue> ThrottledEventQueue::Create(
+    nsISerialEventTarget* aBaseTarget, const char* aName, uint32_t aPriority) {
+  MOZ_ASSERT(aBaseTarget);
+
+  RefPtr<Inner> inner = Inner::Create(aBaseTarget, aName, aPriority);
+
+  RefPtr<ThrottledEventQueue> ref = new ThrottledEventQueue(inner.forget());
+  return ref.forget();
+}
+
+bool ThrottledEventQueue::IsEmpty() const { return mInner->IsEmpty(); }
+
+uint32_t ThrottledEventQueue::Length() const { return mInner->Length(); }
+
+already_AddRefed<nsIRunnable> ThrottledEventQueue::GetEvent() {
+  return mInner->GetEvent();
+}
+
+void ThrottledEventQueue::AwaitIdle() const { return mInner->AwaitIdle(); }
+
+nsresult ThrottledEventQueue::SetIsPaused(bool aIsPaused) {
+  return mInner->SetIsPaused(aIsPaused);
+}
+
+bool ThrottledEventQueue::IsPaused() const { return mInner->IsPaused(); }
+
+NS_IMETHODIMP
+ThrottledEventQueue::DispatchFromScript(nsIRunnable* aEvent,
+                                        DispatchFlags aFlags) {
+  return mInner->DispatchFromScript(aEvent, aFlags);
+}
+
+NS_IMETHODIMP
+ThrottledEventQueue::Dispatch(already_AddRefed<nsIRunnable> aEvent,
+                              DispatchFlags aFlags) {
+  return mInner->Dispatch(std::move(aEvent), aFlags);
+}
+
+NS_IMETHODIMP
+ThrottledEventQueue::DelayedDispatch(already_AddRefed<nsIRunnable> aEvent,
+                                     uint32_t aFlags) {
+  return mInner->DelayedDispatch(std::move(aEvent), aFlags);
+}
+
+NS_IMETHODIMP
+ThrottledEventQueue::RegisterShutdownTask(nsITargetShutdownTask* aTask) {
+  return mInner->RegisterShutdownTask(aTask);
+}
+
+NS_IMETHODIMP
+ThrottledEventQueue::UnregisterShutdownTask(nsITargetShutdownTask* aTask) {
+  return mInner->UnregisterShutdownTask(aTask);
+}
+
+nsIEventTarget::FeatureFlags ThrottledEventQueue::GetFeatures() {
+  return mInner->GetFeatures();
+}
+
+NS_IMETHODIMP
+ThrottledEventQueue::IsOnCurrentThread(bool* aResult) {
+  *aResult = mInner->IsOnCurrentThread();
+  return NS_OK;
+}
+
+NS_IMETHODIMP_(bool)
+ThrottledEventQueue::IsOnCurrentThreadInfallible() {
+  return mInner->IsOnCurrentThread();
+}
+
+}  

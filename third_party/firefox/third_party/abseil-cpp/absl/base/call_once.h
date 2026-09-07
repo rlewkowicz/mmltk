@@ -1,0 +1,162 @@
+// Copyright 2017 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef ABSL_BASE_CALL_ONCE_H_
+#define ABSL_BASE_CALL_ONCE_H_
+
+#include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <functional>
+#include <type_traits>
+#include <utility>
+
+#include "absl/base/attributes.h"
+#include "absl/base/config.h"
+#include "absl/base/internal/low_level_scheduling.h"
+#include "absl/base/internal/raw_logging.h"
+#include "absl/base/internal/scheduling_mode.h"
+#include "absl/base/internal/spinlock_wait.h"
+#include "absl/base/macros.h"
+#include "absl/base/nullability.h"
+#include "absl/base/optimization.h"
+#include "absl/base/port.h"
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+
+class once_flag;
+
+namespace base_internal {
+std::atomic<uint32_t>* absl_nonnull ControlWord(
+    absl::once_flag* absl_nonnull flag);
+}  
+
+template <typename Callable, typename... Args>
+void call_once(absl::once_flag& flag, Callable&& fn, Args&&... args);
+
+class once_flag {
+ public:
+  constexpr once_flag() : control_(0) {}
+  once_flag(const once_flag&) = delete;
+  once_flag& operator=(const once_flag&) = delete;
+
+ private:
+  friend std::atomic<uint32_t>* absl_nonnull base_internal::ControlWord(
+      once_flag* absl_nonnull flag);
+  std::atomic<uint32_t> control_;
+};
+
+
+namespace base_internal {
+
+template <typename Callable, typename... Args>
+void LowLevelCallOnce(absl::once_flag* absl_nonnull flag, Callable&& fn,
+                      Args&&... args);
+
+class SchedulingHelper {
+ public:
+  explicit SchedulingHelper(base_internal::SchedulingMode mode) : mode_(mode) {
+    if (mode_ == base_internal::SCHEDULE_KERNEL_ONLY) {
+      guard_result_ = base_internal::SchedulingGuard::DisableRescheduling();
+    }
+  }
+
+  ~SchedulingHelper() {
+    if (mode_ == base_internal::SCHEDULE_KERNEL_ONLY) {
+      base_internal::SchedulingGuard::EnableRescheduling(guard_result_);
+    }
+  }
+
+ private:
+  base_internal::SchedulingMode mode_;
+  bool guard_result_ = false;
+};
+
+enum {
+  kOnceInit = 0,
+  kOnceRunning = 0x65C2937B,
+  kOnceWaiter = 0x05A308D2,
+  kOnceDone = 221,    
+};
+
+template <typename Callable, typename... Args>
+    void
+    CallOnceImpl(std::atomic<uint32_t>* absl_nonnull control,
+                 base_internal::SchedulingMode scheduling_mode, Callable&& fn,
+                 Args&&... args) {
+#ifndef NDEBUG
+  {
+    uint32_t old_control = control->load(std::memory_order_relaxed);
+    if (old_control != kOnceInit &&
+        old_control != kOnceRunning &&
+        old_control != kOnceWaiter &&
+        old_control != kOnceDone) {
+      ABSL_RAW_LOG(FATAL, "Unexpected value for control word: 0x%lx",
+                   static_cast<unsigned long>(old_control));  // NOLINT
+    }
+  }
+#endif  // NDEBUG
+  static const base_internal::SpinLockWaitTransition trans[] = {
+      {kOnceInit, kOnceRunning, true},
+      {kOnceRunning, kOnceWaiter, false},
+      {kOnceDone, kOnceDone, true}};
+
+  base_internal::SchedulingHelper maybe_disable_scheduling(scheduling_mode);
+  uint32_t old_control = kOnceInit;
+  if (control->compare_exchange_strong(old_control, kOnceRunning,
+                                       std::memory_order_relaxed) ||
+      base_internal::SpinLockWait(control, ABSL_ARRAYSIZE(trans), trans,
+                                  scheduling_mode) == kOnceInit) {
+    std::invoke(std::forward<Callable>(fn), std::forward<Args>(args)...);
+    old_control =
+        control->exchange(base_internal::kOnceDone, std::memory_order_release);
+    if (old_control == base_internal::kOnceWaiter) {
+      base_internal::SpinLockWake(control, true);
+    }
+  }  
+}
+
+inline std::atomic<uint32_t>* absl_nonnull ControlWord(
+    once_flag* absl_nonnull flag) {
+  return &flag->control_;
+}
+
+template <typename Callable, typename... Args>
+void LowLevelCallOnce(absl::once_flag* absl_nonnull flag, Callable&& fn,
+                      Args&&... args) {
+  std::atomic<uint32_t>* once = base_internal::ControlWord(flag);
+  uint32_t s = once->load(std::memory_order_acquire);
+  if (ABSL_PREDICT_FALSE(s != base_internal::kOnceDone)) {
+    base_internal::CallOnceImpl(once, base_internal::SCHEDULE_KERNEL_ONLY,
+                                std::forward<Callable>(fn),
+                                std::forward<Args>(args)...);
+  }
+}
+
+}  
+
+template <typename Callable, typename... Args>
+    void
+    call_once(absl::once_flag& flag, Callable&& fn, Args&&... args) {
+  std::atomic<uint32_t>* once = base_internal::ControlWord(&flag);
+  uint32_t s = once->load(std::memory_order_acquire);
+  if (ABSL_PREDICT_FALSE(s != base_internal::kOnceDone)) {
+    base_internal::CallOnceImpl(
+        once, base_internal::SCHEDULE_COOPERATIVE_AND_KERNEL,
+        std::forward<Callable>(fn), std::forward<Args>(args)...);
+  }
+}
+
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_BASE_CALL_ONCE_H_

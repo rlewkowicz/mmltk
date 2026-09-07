@@ -1,0 +1,294 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_GFX_DRAWEVENTRECORDER_H_
+#define MOZILLA_GFX_DRAWEVENTRECORDER_H_
+
+#include "2D.h"
+#include "DrawEventRecorderTypes.h"
+#include "RecordedEvent.h"
+#include "RecordingTypes.h"
+
+#include <deque>
+#include <functional>
+#include <vector>
+
+#include "ImageContainer.h"
+#include "mozilla/DataMutex.h"
+#include "mozilla/ThreadSafeWeakPtr.h"
+#include "nsTHashMap.h"
+#include "nsTHashSet.h"
+#include "nsISupportsImpl.h"
+
+namespace mozilla {
+namespace layers {
+class CanvasChild;
+}  
+
+namespace gfx {
+
+class DrawTargetRecording;
+class PathRecording;
+class RecordedEvent;
+
+class DrawEventRecorderPrivate : public DrawEventRecorder {
+ public:
+  MOZ_DECLARE_REFCOUNTED_VIRTUAL_TYPENAME(DrawEventRecorderPrivate, override)
+
+  DrawEventRecorderPrivate();
+  virtual ~DrawEventRecorderPrivate();
+  RecorderType GetRecorderType() const override {
+    return RecorderType::PRIVATE;
+  }
+  bool Finish() override {
+    ClearResources();
+    return true;
+  }
+  virtual void FlushItem(IntRect) {}
+  virtual void DetachResources() {
+    NS_ASSERT_OWNINGTHREAD(DrawEventRecorderPrivate);
+
+    nsTHashSet<ScaledFont*> fonts = std::move(mStoredFonts);
+    for (const auto& font : fonts) {
+      font->RemoveUserData(reinterpret_cast<UserDataKey*>(this));
+    }
+
+    nsTHashMap<void*, ThreadSafeWeakPtr<SourceSurface>> surfaces =
+        std::move(mStoredSurfaces);
+    for (const auto& entry : surfaces) {
+      RefPtr<SourceSurface> strongRef(entry.GetData());
+      if (strongRef) {
+        strongRef->RemoveUserData(reinterpret_cast<UserDataKey*>(this));
+      }
+    }
+
+    ProcessPendingDeletions();
+  }
+
+  void ClearResources() {
+    NS_ASSERT_OWNINGTHREAD(DrawEventRecorderPrivate);
+    mStoredObjects.Clear();
+    mStoredFontData.Clear();
+    mScaledFonts.clear();
+    mCurrentDT = nullptr;
+  }
+
+  template <class S>
+  void WriteHeader(S& aStream) {
+    NS_ASSERT_OWNINGTHREAD(DrawEventRecorderPrivate);
+    WriteElement(aStream, kMagicInt);
+    WriteElement(aStream, kMajorRevision);
+    WriteElement(aStream, kMinorRevision);
+  }
+
+  virtual void RecordEvent(const RecordedEvent& aEvent) = 0;
+
+  void RecordEvent(const DrawTargetRecording* aDT,
+                   const RecordedEvent& aEvent) {
+    ReferencePtr dt = aDT;
+    if (mCurrentDT != dt) {
+      SetDrawTarget(dt);
+    }
+    RecordEvent(aEvent);
+  }
+
+  void SetDrawTarget(ReferencePtr aDT);
+
+  void ClearDrawTarget(const DrawTargetRecording* aDT) {
+    ReferencePtr dt = aDT;
+    if (mCurrentDT == dt) {
+      mCurrentDT = nullptr;
+    }
+  }
+
+  void AddStoredObject(const ReferencePtr aObject) {
+    ProcessPendingDeletions();
+    mStoredObjects.Insert(aObject);
+  }
+
+  bool TryAddStoredObject(const ReferencePtr aObject) {
+    ProcessPendingDeletions();
+    return mStoredObjects.EnsureInserted(aObject);
+  }
+
+  virtual void AddPendingDeletion(std::function<void()>&& aPendingDeletion) {
+    auto lockedPendingDeletions = mPendingDeletions.Lock();
+    lockedPendingDeletions->emplace_back(std::move(aPendingDeletion));
+  }
+
+  void RemoveStoredObject(const ReferencePtr aObject) {
+    NS_ASSERT_OWNINGTHREAD(DrawEventRecorderPrivate);
+    mStoredObjects.Remove(aObject);
+  }
+
+  int32_t IncrementUnscaledFontRefCount(const ReferencePtr aUnscaledFont) {
+    NS_ASSERT_OWNINGTHREAD(DrawEventRecorderPrivate);
+    int32_t& count = mUnscaledFontRefs.LookupOrInsert(aUnscaledFont, 0);
+    return count++;
+  }
+
+  void DecrementUnscaledFontRefCount(const ReferencePtr aUnscaledFont);
+
+  void AddScaledFont(ScaledFont* aFont) {
+    NS_ASSERT_OWNINGTHREAD(DrawEventRecorderPrivate);
+    if (mStoredFonts.EnsureInserted(aFont) && WantsExternalFonts()) {
+      mScaledFonts.push_back(aFont);
+    }
+  }
+
+  void RemoveScaledFont(ScaledFont* aFont) { mStoredFonts.Remove(aFont); }
+
+  void AddSourceSurface(SourceSurface* aSurface) {
+    NS_ASSERT_OWNINGTHREAD(DrawEventRecorderPrivate);
+    mStoredSurfaces.InsertOrUpdate(aSurface, aSurface);
+  }
+
+  void RemoveSourceSurface(SourceSurface* aSurface) {
+    NS_ASSERT_OWNINGTHREAD(DrawEventRecorderPrivate);
+    mStoredSurfaces.Remove(aSurface);
+  }
+
+#if defined(DEBUG)
+  bool HasStoredObject(const ReferencePtr aObject) {
+    ProcessPendingDeletions();
+    return mStoredObjects.Contains(aObject);
+  }
+#endif
+
+  void AddStoredFontData(const uint64_t aFontDataKey) {
+    NS_ASSERT_OWNINGTHREAD(DrawEventRecorderPrivate);
+    mStoredFontData.Insert(aFontDataKey);
+  }
+
+  bool HasStoredFontData(const uint64_t aFontDataKey) {
+    NS_ASSERT_OWNINGTHREAD(DrawEventRecorderPrivate);
+    return mStoredFontData.Contains(aFontDataKey);
+  }
+
+  bool WantsExternalFonts() const { return mExternalFonts; }
+
+  virtual void StoreSourceSurfaceRecording(SourceSurface* aSurface,
+                                           const char* aReason);
+
+  virtual void StoreImageRecording(
+      const RefPtr<layers::Image>& aImageOfSurfaceDescriptor,
+      const char* aReasony) {
+    MOZ_ASSERT_UNREACHABLE("unexpected to be called");
+  }
+
+  void RecordSourceSurfaceDestruction(void* aSurface);
+
+  virtual void AddDependentSurface(uint64_t aDependencyId) {
+    MOZ_CRASH("GFX: AddDependentSurface");
+  }
+
+  struct ExternalSurfaceEntry {
+    RefPtr<SourceSurface> mSurface;
+    int64_t mEventCount = -1;
+  };
+
+  using ExternalSurfacesHolder =
+      DrawEventRecorderPrivate_ExternalSurfacesHolder;
+
+  void TakeExternalSurfaces(ExternalSurfacesHolder& aSurfaces) {
+    NS_ASSERT_OWNINGTHREAD(DrawEventRecorderPrivate);
+    aSurfaces = std::move(mExternalSurfaces);
+  }
+
+  struct ExternalImageEntry {
+    RefPtr<layers::Image> mImage;
+    int64_t mEventCount = -1;
+  };
+
+  using ExternalImagesHolder = std::deque<ExternalImageEntry>;
+
+  virtual already_AddRefed<layers::CanvasChild> GetCanvasChild() const {
+    return nullptr;
+  }
+
+ protected:
+  NS_DECL_OWNINGTHREAD
+
+  void StoreExternalSurfaceRecording(SourceSurface* aSurface, uint64_t aKey);
+
+  void StoreExternalImageRecording(
+      const RefPtr<layers::Image>& aImageOfSurfaceDescriptor);
+
+  void ProcessPendingDeletions() {
+    NS_ASSERT_OWNINGTHREAD(DrawEventRecorderPrivate);
+
+    PendingDeletionsVector pendingDeletions;
+    {
+      auto lockedPendingDeletions = mPendingDeletions.Lock();
+      pendingDeletions.swap(*lockedPendingDeletions);
+    }
+    for (const auto& pendingDeletion : pendingDeletions) {
+      pendingDeletion();
+    }
+  }
+
+  virtual void Flush() = 0;
+
+  nsTHashSet<const void*> mStoredObjects;
+
+  using PendingDeletionsVector = std::vector<std::function<void()>>;
+  DataMutex<PendingDeletionsVector> mPendingDeletions{
+      "DrawEventRecorderPrivate::mPendingDeletions"};
+
+  nsTHashMap<const void*, int32_t> mUnscaledFontRefs;
+
+  nsTHashSet<uint64_t> mStoredFontData;
+  nsTHashSet<ScaledFont*> mStoredFonts;
+  std::vector<RefPtr<ScaledFont>> mScaledFonts;
+
+  nsTHashMap<void*, ThreadSafeWeakPtr<SourceSurface>> mStoredSurfaces;
+
+  ReferencePtr mCurrentDT;
+  ExternalSurfacesHolder mExternalSurfaces;
+  ExternalImagesHolder mExternalImages;
+  bool mExternalFonts;
+};
+
+typedef std::function<void(MemStream& aStream,
+                           std::vector<RefPtr<ScaledFont>>& aScaledFonts)>
+    SerializeResourcesFn;
+
+class DrawEventRecorderMemory : public DrawEventRecorderPrivate {
+ public:
+  MOZ_DECLARE_REFCOUNTED_VIRTUAL_TYPENAME(DrawEventRecorderMemory, override)
+
+  DrawEventRecorderMemory();
+  explicit DrawEventRecorderMemory(const SerializeResourcesFn& aSerialize);
+
+  RecorderType GetRecorderType() const override { return RecorderType::MEMORY; }
+
+  void RecordEvent(const RecordedEvent& aEvent) override;
+
+  void AddDependentSurface(uint64_t aDependencyId) override;
+
+  nsTHashSet<uint64_t>&& TakeDependentSurfaces();
+
+  size_t RecordingSize();
+
+  void WipeRecording();
+  bool Finish() override;
+  void FlushItem(IntRect) override;
+
+  MemStream mOutputStream;
+  MemStream mIndex;
+
+ protected:
+  virtual ~DrawEventRecorderMemory() = default;
+
+ private:
+  SerializeResourcesFn mSerializeCallback;
+  nsTHashSet<uint64_t> mDependentSurfaces;
+
+  void Flush() override;
+};
+
+}  
+}  
+
+#endif /* MOZILLA_GFX_DRAWEVENTRECORDER_H_ */

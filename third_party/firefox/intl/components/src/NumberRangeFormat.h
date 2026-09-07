@@ -1,0 +1,149 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef intl_components_NumberRangeFormat_h_
+#define intl_components_NumberRangeFormat_h_
+
+#include "mozilla/FloatingPoint.h"
+#include "mozilla/intl/ICUError.h"
+#include "mozilla/intl/NumberFormat.h"
+#include "mozilla/Result.h"
+#include "mozilla/UniquePtr.h"
+
+#include <stdint.h>
+#include <string_view>
+
+#include "unicode/utypes.h"
+
+struct UFormattedNumberRange;
+struct UNumberRangeFormatter;
+struct UPluralRules;
+
+namespace mozilla::intl {
+
+struct MOZ_STACK_CLASS NumberRangeFormatOptions : public NumberFormatOptions {
+  enum class RangeCollapse {
+    Auto,
+
+    None,
+
+    Unit,
+
+    All,
+  } mRangeCollapse = RangeCollapse::Auto;
+
+  enum class RangeIdentityFallback {
+    SingleValue,
+
+    ApproximatelyOrSingleValue,
+
+    Approximately,
+
+    Range,
+  } mRangeIdentityFallback = RangeIdentityFallback::SingleValue;
+};
+
+class NumberRangeFormat final {
+ public:
+  static Result<UniquePtr<NumberRangeFormat>, ICUError> TryCreate(
+      std::string_view aLocale, const NumberRangeFormatOptions& aOptions);
+
+  NumberRangeFormat() = default;
+  NumberRangeFormat(const NumberRangeFormat&) = delete;
+  NumberRangeFormat& operator=(const NumberRangeFormat&) = delete;
+
+  ~NumberRangeFormat();
+
+  Result<std::u16string_view, ICUError> format(double start, double end) const {
+    if (!formatInternal(start, end)) {
+      return Err(ICUError::InternalError);
+    }
+
+    return formatResult();
+  }
+
+  Result<std::u16string_view, ICUError> formatToParts(
+      double start, double end, NumberPartVector& parts) const {
+    if (!formatInternal(start, end)) {
+      return Err(ICUError::InternalError);
+    }
+
+    bool isNegativeStart = !std::isnan(start) && IsNegative(start);
+    bool isNegativeEnd = !std::isnan(end) && IsNegative(end);
+
+    return formatResultToParts(Some(start), isNegativeStart, Some(end),
+                               isNegativeEnd, parts);
+  }
+
+  Result<std::u16string_view, ICUError> format(std::string_view start,
+                                               std::string_view end) const {
+    if (!formatInternal(start, end)) {
+      return Err(ICUError::InternalError);
+    }
+
+    return formatResult();
+  }
+
+  Result<std::u16string_view, ICUError> formatToParts(
+      std::string_view start, std::string_view end,
+      NumberPartVector& parts) const {
+    if (!formatInternal(start, end)) {
+      return Err(ICUError::InternalError);
+    }
+
+    Maybe<double> numStart = Nothing();
+    if (start == "Infinity" || start == "+Infinity") {
+      numStart.emplace(PositiveInfinity<double>());
+    } else if (start == "-Infinity") {
+      numStart.emplace(NegativeInfinity<double>());
+    } else {
+      MOZ_ASSERT(start != "NaN");
+    }
+
+    Maybe<double> numEnd = Nothing();
+    if (end == "Infinity" || end == "+Infinity") {
+      numEnd.emplace(PositiveInfinity<double>());
+    } else if (end == "-Infinity") {
+      numEnd.emplace(NegativeInfinity<double>());
+    } else {
+      MOZ_ASSERT(end != "NaN");
+    }
+
+    bool isNegativeStart = !start.empty() && start[0] == '-';
+    bool isNegativeEnd = !end.empty() && end[0] == '-';
+
+    return formatResultToParts(numStart, isNegativeStart, numEnd, isNegativeEnd,
+                               parts);
+  }
+
+  Result<int32_t, ICUError> selectForRange(
+      double start, double end, char16_t* keyword, int32_t keywordSize,
+      const UPluralRules* pluralRules) const;
+
+  Result<int32_t, ICUError> selectForRange(
+      std::string_view start, std::string_view end, char16_t* keyword,
+      int32_t keywordSize, const UPluralRules* pluralRules) const;
+
+ private:
+  UNumberRangeFormatter* mNumberRangeFormatter = nullptr;
+  UFormattedNumberRange* mFormattedNumberRange = nullptr;
+  bool mFormatForUnit = false;
+
+  Result<Ok, ICUError> initialize(std::string_view aLocale,
+                                  const NumberRangeFormatOptions& aOptions);
+
+  [[nodiscard]] bool formatInternal(double start, double end) const;
+
+  [[nodiscard]] bool formatInternal(std::string_view start,
+                                    std::string_view end) const;
+
+  Result<std::u16string_view, ICUError> formatResult() const;
+
+  Result<std::u16string_view, ICUError> formatResultToParts(
+      Maybe<double> start, bool startIsNegative, Maybe<double> end,
+      bool endIsNegative, NumberPartVector& parts) const;
+};
+
+}  
+
+#endif

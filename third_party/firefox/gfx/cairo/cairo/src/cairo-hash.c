@@ -1,0 +1,385 @@
+/* cairo - a vector graphics library with display and print output
+ *
+ * Copyright © 2004 Red Hat, Inc.
+ * Copyright © 2005 Red Hat, Inc.
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it either under the terms of the GNU Lesser General Public
+ * License version 2.1 as published by the Free Software Foundation
+ * (the "LGPL") or, at your option, under the terms of the Mozilla
+ * Public License Version 1.1 (the "MPL"). If you do not alter this
+ * notice, a recipient may use your version of this file under either
+ * the MPL or the LGPL.
+ *
+ * You should have received a copy of the LGPL along with this library
+ * in the file COPYING-LGPL-2.1; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Suite 500, Boston, MA 02110-1335, USA
+ * You should have received a copy of the MPL along with this library
+ * in the file COPYING-MPL-1.1
+ *
+ * The contents of this file are subject to the Mozilla Public License
+ * Version 1.1 (the "License"); you may not use this file except in
+ * compliance with the License. You may obtain a copy of the License at
+ * http://www.mozilla.org/MPL/
+ *
+ * This software is distributed on an "AS IS" basis, WITHOUT WARRANTY
+ * OF ANY KIND, either express or implied. See the LGPL or the MPL for
+ * the specific language governing rights and limitations.
+ *
+ * The Original Code is the cairo graphics library.
+ *
+ * The Initial Developer of the Original Code is Red Hat, Inc.
+ *
+ * Contributor(s):
+ *      Keith Packard <keithp@keithp.com>
+ *	Graydon Hoare <graydon@redhat.com>
+ *	Carl Worth <cworth@cworth.org>
+ */
+
+#include "cairoint.h"
+#include "cairo-error-private.h"
+
+
+#define DEAD_ENTRY ((cairo_hash_entry_t *) 0x1)
+
+#define ENTRY_IS_FREE(entry) ((entry) == NULL)
+#define ENTRY_IS_DEAD(entry) ((entry) == DEAD_ENTRY)
+#define ENTRY_IS_LIVE(entry) ((entry) >  DEAD_ENTRY)
+
+
+static const unsigned long hash_table_sizes[] = {
+    43,
+    73,
+    151,
+    283,
+    571,
+    1153,
+    2269,
+    4519,
+    9013,
+    18043,
+    36109,
+    72091,
+    144409,
+    288361,
+    576883,
+    1153459,
+    2307163,
+    4613893,
+    9227641,
+    18455029,
+    36911011,
+    73819861,
+    147639589,
+    295279081,
+    590559793
+};
+
+struct _cairo_hash_table {
+    cairo_hash_keys_equal_func_t keys_equal;
+
+    cairo_hash_entry_t *cache[32];
+
+    const unsigned long *table_size;
+    cairo_hash_entry_t **entries;
+
+    unsigned long live_entries;
+    unsigned long free_entries;
+    unsigned long iterating;   
+};
+
+static cairo_bool_t
+_cairo_hash_table_uid_keys_equal (const void *key_a, const void *key_b)
+{
+    return TRUE;
+}
+
+cairo_hash_table_t *
+_cairo_hash_table_create (cairo_hash_keys_equal_func_t keys_equal)
+{
+    cairo_hash_table_t *hash_table;
+
+    hash_table = _cairo_calloc (sizeof (cairo_hash_table_t));
+    if (unlikely (hash_table == NULL)) {
+	_cairo_error_throw (CAIRO_STATUS_NO_MEMORY);
+	return NULL;
+    }
+
+    if (keys_equal == NULL)
+	hash_table->keys_equal = _cairo_hash_table_uid_keys_equal;
+    else
+	hash_table->keys_equal = keys_equal;
+
+    memset (&hash_table->cache, 0, sizeof (hash_table->cache));
+    hash_table->table_size = &hash_table_sizes[0];
+
+    hash_table->entries = _cairo_calloc_ab (*hash_table->table_size,
+				  sizeof (cairo_hash_entry_t *));
+    if (unlikely (hash_table->entries == NULL)) {
+	_cairo_error_throw (CAIRO_STATUS_NO_MEMORY);
+	free (hash_table);
+	return NULL;
+    }
+
+    hash_table->live_entries = 0;
+    hash_table->free_entries = *hash_table->table_size;
+    hash_table->iterating = 0;
+
+    return hash_table;
+}
+
+void
+_cairo_hash_table_destroy (cairo_hash_table_t *hash_table)
+{
+    assert (hash_table->live_entries == 0);
+    assert (hash_table->iterating == 0);
+
+    free (hash_table->entries);
+    free (hash_table);
+}
+
+static cairo_hash_entry_t **
+_cairo_hash_table_lookup_unique_key (cairo_hash_table_t *hash_table,
+				     cairo_hash_entry_t *key)
+{
+    unsigned long table_size, i, idx, step;
+    cairo_hash_entry_t **entry;
+
+    table_size = *hash_table->table_size;
+    idx = key->hash % table_size;
+
+    entry = &hash_table->entries[idx];
+    if (! ENTRY_IS_LIVE (*entry))
+	return entry;
+
+    i = 1;
+    step = 1 + key->hash % (table_size - 2);
+    do {
+	idx += step;
+	if (idx >= table_size)
+	    idx -= table_size;
+
+	entry = &hash_table->entries[idx];
+	if (! ENTRY_IS_LIVE (*entry))
+	    return entry;
+    } while (++i < table_size);
+
+    ASSERT_NOT_REACHED;
+    return NULL;
+}
+
+static cairo_status_t
+_cairo_hash_table_manage (cairo_hash_table_t *hash_table)
+{
+    cairo_hash_table_t tmp;
+    unsigned long new_size, i;
+
+    unsigned long live_high = *hash_table->table_size >> 1;
+    unsigned long live_low = live_high >> 2;
+    unsigned long free_low = live_high >> 1;
+
+    tmp = *hash_table;
+
+    if (hash_table->live_entries > live_high)
+    {
+	tmp.table_size = hash_table->table_size + 1;
+	assert (tmp.table_size - hash_table_sizes <
+		ARRAY_LENGTH (hash_table_sizes));
+    }
+    else if (hash_table->live_entries < live_low)
+    {
+	if (hash_table->table_size == &hash_table_sizes[0])
+	    tmp.table_size = hash_table->table_size;
+	else
+	    tmp.table_size = hash_table->table_size - 1;
+    }
+
+    if (tmp.table_size == hash_table->table_size &&
+	hash_table->free_entries > free_low)
+    {
+	return CAIRO_STATUS_SUCCESS;
+    }
+
+    new_size = *tmp.table_size;
+    tmp.entries = _cairo_calloc_ab (new_size, sizeof (cairo_hash_entry_t*));
+    if (unlikely (tmp.entries == NULL))
+	return _cairo_error (CAIRO_STATUS_NO_MEMORY);
+
+    for (i = 0; i < *hash_table->table_size; ++i) {
+	if (ENTRY_IS_LIVE (hash_table->entries[i])) {
+	    *_cairo_hash_table_lookup_unique_key (&tmp, hash_table->entries[i])
+		= hash_table->entries[i];
+	}
+    }
+
+    free (hash_table->entries);
+    hash_table->entries = tmp.entries;
+    hash_table->table_size = tmp.table_size;
+    hash_table->free_entries = new_size - hash_table->live_entries;
+
+    return CAIRO_STATUS_SUCCESS;
+}
+
+void *
+_cairo_hash_table_lookup (cairo_hash_table_t *hash_table,
+			  cairo_hash_entry_t *key)
+{
+    cairo_hash_entry_t *entry;
+    unsigned long table_size, i, idx, step;
+    uintptr_t hash = key->hash;
+
+    entry = hash_table->cache[hash & 31];
+    if (entry && entry->hash == hash && hash_table->keys_equal (key, entry))
+	return entry;
+
+    table_size = *hash_table->table_size;
+    idx = hash % table_size;
+
+    entry = hash_table->entries[idx];
+    if (ENTRY_IS_LIVE (entry)) {
+	if (entry->hash == hash && hash_table->keys_equal (key, entry))
+		goto insert_cache;
+    } else if (ENTRY_IS_FREE (entry))
+	return NULL;
+
+    i = 1;
+    step = 1 + hash % (table_size - 2);
+    do {
+	idx += step;
+	if (idx >= table_size)
+	    idx -= table_size;
+
+	entry = hash_table->entries[idx];
+	if (ENTRY_IS_LIVE (entry)) {
+	    if (entry->hash == hash && hash_table->keys_equal (key, entry))
+		    goto insert_cache;
+	} else if (ENTRY_IS_FREE (entry))
+	    return NULL;
+    } while (++i < table_size);
+
+    ASSERT_NOT_REACHED;
+    return NULL;
+
+insert_cache:
+    hash_table->cache[hash & 31] = entry;
+    return entry;
+}
+
+void *
+_cairo_hash_table_random_entry (cairo_hash_table_t	   *hash_table,
+				cairo_hash_predicate_func_t predicate)
+{
+    cairo_hash_entry_t *entry;
+    unsigned long hash;
+    unsigned long table_size, i, idx, step;
+
+    assert (predicate != NULL);
+
+    table_size = *hash_table->table_size;
+    hash = rand ();
+    idx = hash % table_size;
+
+    entry = hash_table->entries[idx];
+    if (ENTRY_IS_LIVE (entry) && predicate (entry))
+	return entry;
+
+    i = 1;
+    step = 1 + hash % (table_size - 2);
+    do {
+	idx += step;
+	if (idx >= table_size)
+	    idx -= table_size;
+
+	entry = hash_table->entries[idx];
+	if (ENTRY_IS_LIVE (entry) && predicate (entry))
+	    return entry;
+    } while (++i < table_size);
+
+    return NULL;
+}
+
+cairo_status_t
+_cairo_hash_table_insert (cairo_hash_table_t *hash_table,
+			  cairo_hash_entry_t *key_and_value)
+{
+    cairo_hash_entry_t **entry;
+    cairo_status_t status;
+
+    assert (hash_table->iterating == 0);
+
+    status = _cairo_hash_table_manage (hash_table);
+    if (unlikely (status))
+	return status;
+
+    entry = _cairo_hash_table_lookup_unique_key (hash_table, key_and_value);
+
+    if (ENTRY_IS_FREE (*entry))
+	hash_table->free_entries--;
+
+    *entry = key_and_value;
+    hash_table->cache[key_and_value->hash & 31] = key_and_value;
+    hash_table->live_entries++;
+
+    return CAIRO_STATUS_SUCCESS;
+}
+
+static cairo_hash_entry_t **
+_cairo_hash_table_lookup_exact_key (cairo_hash_table_t *hash_table,
+				    cairo_hash_entry_t *key)
+{
+    unsigned long table_size, i, idx, step;
+    cairo_hash_entry_t **entry;
+
+    table_size = *hash_table->table_size;
+    idx = key->hash % table_size;
+
+    entry = &hash_table->entries[idx];
+    if (*entry == key)
+	return entry;
+
+    i = 1;
+    step = 1 + key->hash % (table_size - 2);
+    do {
+	idx += step;
+	if (idx >= table_size)
+	    idx -= table_size;
+
+	entry = &hash_table->entries[idx];
+	if (*entry == key)
+	    return entry;
+    } while (++i < table_size);
+
+    ASSERT_NOT_REACHED;
+    return NULL;
+}
+void
+_cairo_hash_table_remove (cairo_hash_table_t *hash_table,
+			  cairo_hash_entry_t *key)
+{
+    *_cairo_hash_table_lookup_exact_key (hash_table, key) = DEAD_ENTRY;
+    hash_table->live_entries--;
+    hash_table->cache[key->hash & 31] = NULL;
+
+    if (hash_table->iterating == 0) {
+	_cairo_hash_table_manage (hash_table);
+    }
+}
+
+void
+_cairo_hash_table_foreach (cairo_hash_table_t	      *hash_table,
+			   cairo_hash_callback_func_t  hash_callback,
+			   void			      *closure)
+{
+    unsigned long i;
+    cairo_hash_entry_t *entry;
+
+    ++hash_table->iterating;
+    for (i = 0; i < *hash_table->table_size; i++) {
+	entry = hash_table->entries[i];
+	if (ENTRY_IS_LIVE(entry))
+	    hash_callback (entry, closure);
+    }
+    if (--hash_table->iterating == 0) {
+	_cairo_hash_table_manage (hash_table);
+    }
+}

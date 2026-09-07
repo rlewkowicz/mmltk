@@ -1,0 +1,89 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "mozilla/ReflowOutput.h"
+
+#include "mozilla/ReflowInput.h"
+#include "mozilla/WritingModes.h"
+
+namespace mozilla {
+
+static bool IsValidOverflowRect(const nsRect& aRect) {
+  return aRect.Size() != nsSize{0, 0} && aRect.Width() >= 0 &&
+         aRect.Height() >= 0;
+}
+
+nsRect OverflowAreas::GetOverflowClipRect(const nsRect& aRectToClip,
+                                          const nsRect& aBounds,
+                                          PhysicalAxes aClipAxes,
+                                          const nsMargin& aOverflowMargin) {
+  auto inflatedBounds = aBounds;
+  inflatedBounds.Inflate(aOverflowMargin);
+  auto clip = aRectToClip;
+  if (aClipAxes.contains(PhysicalAxis::Vertical)) {
+    clip.y = inflatedBounds.y;
+    clip.height = inflatedBounds.height;
+  }
+  if (aClipAxes.contains(PhysicalAxis::Horizontal)) {
+    clip.x = inflatedBounds.x;
+    clip.width = inflatedBounds.width;
+  }
+  return clip;
+}
+
+void OverflowAreas::ApplyOverflowClippingOnRect(
+    nsRect& aOverflowRect, const nsRect& aBounds, PhysicalAxes aClipAxes,
+    const nsMargin& aOverflowMargin) {
+  aOverflowRect = aOverflowRect.Intersect(
+      GetOverflowClipRect(aOverflowRect, aBounds, aClipAxes, aOverflowMargin));
+}
+
+void OverflowAreas::UnionWith(const OverflowAreas& aOther) {
+  if (IsValidOverflowRect(aOther.InkOverflow())) {
+    InkOverflow().UnionRect(InkOverflow(), aOther.InkOverflow());
+  }
+  if (IsValidOverflowRect(aOther.ScrollableOverflow())) {
+    ScrollableOverflow().UnionRect(ScrollableOverflow(),
+                                   aOther.ScrollableOverflow());
+  }
+}
+
+void OverflowAreas::UnionWithAbsoluteOverflowAreas(
+    const OverflowAreas& aOther) {
+  for (const auto t : AllOverflowTypes()) {
+    const auto& kidOverflow = aOther.Overflow(t);
+    if (kidOverflow.IsEmpty()) {
+      continue;
+    }
+    auto& overflow = Overflow(t);
+    overflow.UnionRect(overflow, kidOverflow);
+  }
+}
+
+void OverflowAreas::UnionAllWith(const nsRect& aRect) {
+  if (!IsValidOverflowRect(aRect)) {
+    return;
+  }
+  InkOverflow().UnionRect(InkOverflow(), aRect);
+  ScrollableOverflow().UnionRect(ScrollableOverflow(), aRect);
+}
+
+void OverflowAreas::SetAllTo(const nsRect& aRect) {
+  InkOverflow() = aRect;
+  ScrollableOverflow() = aRect;
+}
+
+ReflowOutput::ReflowOutput(const ReflowInput& aReflowInput)
+    : ReflowOutput(aReflowInput.GetWritingMode()) {}
+
+void ReflowOutput::SetOverflowAreasToDesiredBounds() {
+  mOverflowAreas.SetAllTo(nsRect(0, 0, Width(), Height()));
+}
+
+void ReflowOutput::UnionOverflowAreasWithDesiredBounds() {
+  mOverflowAreas.UnionAllWith(nsRect(0, 0, Width(), Height()));
+}
+
+}  

@@ -1,0 +1,130 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_Blob_h
+#define mozilla_dom_Blob_h
+
+#include "mozilla/dom/BodyConsumer.h"
+#include "nsCOMPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsWrapperCache.h"
+
+class nsIGlobalObject;
+class nsIInputStream;
+
+namespace mozilla {
+class ErrorResult;
+
+namespace dom {
+
+struct BlobPropertyBag;
+class BlobImpl;
+class File;
+class GlobalObject;
+class OwningArrayBufferViewOrArrayBufferOrBlobOrUTF8String;
+class Promise;
+
+class ReadableStream;
+
+#define NS_DOM_BLOB_IID \
+  {0x648c2a83, 0xbdb1, 0x4a7d, {0xb5, 0x0a, 0xca, 0xcd, 0x92, 0x87, 0x45, 0xc2}}
+
+class Blob : public nsISupports, public nsWrapperCache {
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_CLASS(Blob)
+  NS_INLINE_DECL_STATIC_IID(NS_DOM_BLOB_IID)
+
+  using BlobPart = OwningArrayBufferViewOrArrayBufferOrBlobOrUTF8String;
+
+  static already_AddRefed<Blob> Create(nsIGlobalObject* aGlobal,
+                                       BlobImpl* aImpl);
+
+  static already_AddRefed<Blob> CreateStringBlob(nsIGlobalObject* aGlobal,
+                                                 const nsACString& aData,
+                                                 const nsAString& aContentType);
+
+  static already_AddRefed<Blob> CreateMemoryBlob(nsIGlobalObject* aGlobal,
+                                                 void* aMemoryBuffer,
+                                                 uint64_t aLength,
+                                                 const nsAString& aContentType);
+
+  already_AddRefed<Blob> Clone() const;
+
+  bool HasExpandos() const;
+
+  BlobImpl* Impl() const { return mImpl; }
+
+  bool IsFile() const;
+
+  const nsTArray<RefPtr<BlobImpl>>* GetSubBlobImpls() const;
+
+  already_AddRefed<File> ToFile();
+
+  already_AddRefed<File> ToFile(const nsAString& aName, ErrorResult& aRv) const;
+
+  already_AddRefed<Blob> CreateSlice(uint64_t aStart, uint64_t aLength,
+                                     const nsAString& aContentType,
+                                     ErrorResult& aRv) const;
+
+  void CreateInputStream(nsIInputStream** aStream, ErrorResult& aRv) const;
+
+  int64_t GetFileId() const;
+
+  static void MakeValidBlobType(nsAString& aType);
+
+  nsIGlobalObject* GetParentObject() const { return mGlobal; }
+
+  bool IsMemoryFile() const;
+
+  static already_AddRefed<Blob> Constructor(
+      const GlobalObject& aGlobal, const Optional<Sequence<BlobPart>>& aData,
+      const BlobPropertyBag& aBag, ErrorResult& aRv);
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  uint64_t GetSize(ErrorResult& aRv);
+
+  void GetType(nsAString& aType);
+
+  void GetBlobImplType(nsAString& aBlobImplType);
+
+  already_AddRefed<Blob> Slice(const Optional<int64_t>& aStart,
+                               const Optional<int64_t>& aEnd,
+                               const Optional<nsAString>& aContentType,
+                               ErrorResult& aRv);
+
+  size_t GetAllocationSize() const;
+
+  nsresult GetSendInfo(nsIInputStream** aBody, uint64_t* aContentLength,
+                       nsACString& aContentType, nsACString& aCharset) const;
+
+  already_AddRefed<ReadableStream> Stream(JSContext* aCx,
+                                          ErrorResult& aRv) const;
+  already_AddRefed<Promise> Text(ErrorResult& aRv) const;
+  already_AddRefed<Promise> ArrayBuffer(ErrorResult& aRv) const;
+  already_AddRefed<Promise> Bytes(ErrorResult& aRv) const;
+
+ protected:
+  Blob(nsIGlobalObject* aGlobal, BlobImpl* aImpl);
+  virtual ~Blob();
+
+  virtual bool HasFileInterface() const { return false; }
+
+  already_AddRefed<Promise> ConsumeBody(BodyConsumer::ConsumeType aConsumeType,
+                                        ErrorResult& aRv) const;
+
+  RefPtr<BlobImpl> mImpl;
+
+ private:
+  nsCOMPtr<nsIGlobalObject> mGlobal;
+};
+
+size_t BindingJSObjectMallocBytes(Blob* aBlob);
+
+}  
+}  
+
+#endif  // mozilla_dom_Blob_h

@@ -1,0 +1,356 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef LookAndFeel_h_
+#define LookAndFeel_h_
+
+#ifndef MOZILLA_INTERNAL_API
+#  error "This header is only usable from within libxul (MOZILLA_INTERNAL_API)."
+#endif
+
+#include "nsDebug.h"
+#include "nsColor.h"
+#include "nsString.h"
+#include "nsTArray.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/widget/ThemeChangeKind.h"
+#include "mozilla/ColorScheme.h"
+
+struct gfxFontStyle;
+
+class nsIFrame;
+
+namespace mozilla {
+
+using Modifiers = uint16_t;
+struct StyleColorSchemeFlags;
+
+namespace dom {
+class Document;
+}
+
+namespace widget {
+class FullLookAndFeel;
+class LookAndFeelFont;
+}  
+
+enum class StyleSystemColor : uint8_t;
+enum class StyleSystemColorScheme : uint8_t;
+enum class StyleSystemFont : uint8_t;
+
+class LookAndFeel {
+ public:
+  using ColorID = StyleSystemColor;
+  using ColorScheme = mozilla::ColorScheme;
+
+  enum class IntID {
+    CaretBlinkTime,
+    CaretBlinkCount,
+    CaretWidth,
+    SelectTextfieldsOnKeyFocus,
+    SubmenuDelay,
+    MenusCanOverlapOSBar,
+    UseOverlayScrollbars,
+    AllowOverlayScrollbarsOverlap,
+    SkipNavigatingDisabledMenuItem,
+    DragThresholdX,
+    DragThresholdY,
+    UseAccessibilityTheme,
+
+    ScrollArrowStyle,
+
+    ScrollButtonLeftMouseButtonAction,
+    ScrollButtonMiddleMouseButtonAction,
+    ScrollButtonRightMouseButtonAction,
+
+    TreeOpenDelay,
+    TreeCloseDelay,
+    TreeLazyScrollDelay,
+    TreeScrollDelay,
+    TreeScrollLinesMax,
+    ChosenMenuItemsShouldBlink,
+
+    WindowsAccentColorInTitlebar,
+
+    WindowsMica,
+
+    WindowsMicaPopups,
+
+    MacBigSurTheme,
+
+    MacTahoeTheme,
+
+    AlertNotificationOrigin,
+
+    ScrollToClick,
+
+    IMERawInputUnderlineStyle,
+    IMESelectedRawTextUnderlineStyle,
+    IMEConvertedTextUnderlineStyle,
+    IMESelectedConvertedTextUnderline,
+    TextErrorUnderlineStyle,
+
+    MenuBarDrag,
+    ScrollbarButtonAutoRepeatBehavior,
+    SwipeAnimationEnabled,
+
+    ScrollbarDisplayOnMouseMove,
+
+    ScrollbarFadeBeginDelay,
+    ScrollbarFadeDuration,
+
+    ContextMenuOffsetVertical,
+    ContextMenuOffsetHorizontal,
+    TooltipOffsetVertical,
+
+    GTKCSDAvailable,
+
+    GTKCSDTransparencyAvailable,
+
+    GTKCSDMinimizeButton,
+
+    GTKCSDMaximizeButton,
+
+    GTKCSDCloseButton,
+
+    GTKCSDMinimizeButtonPosition,
+
+    GTKCSDMaximizeButtonPosition,
+
+    GTKCSDCloseButtonPosition,
+
+    GTKCSDReversedPlacement,
+
+    SystemUsesDarkTheme,
+
+    PrefersReducedMotion,
+
+    PrefersReducedTransparency,
+
+    InvertedColors,
+
+    PrimaryPointerCapabilities,
+    AllPointerCapabilities,
+
+    SystemScrollbarSize,
+
+    TouchDeviceSupportPresent,
+
+    TitlebarRadius,
+
+    TooltipRadius,
+
+    DynamicRange,
+
+    PanelAnimations,
+
+    HideCursorWhileTyping,
+
+    GTKThemeFamily,
+
+    FullKeyboardAccess,
+
+    PointingDeviceKinds,
+
+    NativeMenubar,
+
+    HourCycle,
+
+    End,
+  };
+
+  static bool UseOverlayScrollbars() {
+    return GetInt(IntID::UseOverlayScrollbars);
+  }
+
+  static constexpr int32_t kDefaultTooltipOffset = 21;
+  static int32_t TooltipOffsetVertical() {
+    return GetInt(IntID::TooltipOffsetVertical, kDefaultTooltipOffset);
+  }
+
+  static uint32_t GetMenuAccessKey();
+  static Modifiers GetMenuAccessKeyModifiers();
+
+  enum {
+    eScrollArrow_None = 0,
+    eScrollArrow_StartBackward = 0x1000,
+    eScrollArrow_StartForward = 0x0100,
+    eScrollArrow_EndBackward = 0x0010,
+    eScrollArrow_EndForward = 0x0001
+  };
+
+  enum {
+    eScrollArrowStyle_Single =
+        eScrollArrow_StartBackward | eScrollArrow_EndForward,
+    eScrollArrowStyle_BothAtBottom =
+        eScrollArrow_EndBackward | eScrollArrow_EndForward,
+    eScrollArrowStyle_BothAtEachEnd =
+        eScrollArrow_EndBackward | eScrollArrow_EndForward |
+        eScrollArrow_StartBackward | eScrollArrow_StartForward,
+    eScrollArrowStyle_BothAtTop =
+        eScrollArrow_StartBackward | eScrollArrow_StartForward
+  };
+
+  enum class FloatID {
+    IMEUnderlineRelativeSize,
+    TextErrorUnderlineRelativeSize,
+
+    CaretAspectRatio,
+
+    TextScaleFactor,
+
+    CursorScale,
+
+    End,
+  };
+
+  using FontID = mozilla::StyleSystemFont;
+
+  enum class PointingDeviceKinds : uint8_t {
+    None = 0,
+    Mouse = 1 << 0,
+    Touch = 1 << 1,
+    Pen = 1 << 2,
+  };
+
+  static ColorScheme SystemColorScheme() {
+    return GetInt(IntID::SystemUsesDarkTheme) ? ColorScheme::Dark
+                                              : ColorScheme::Light;
+  }
+
+  static bool IsDarkColor(nscolor);
+
+  static ColorScheme ColorSchemeForStyle(
+      const dom::Document&, const StyleColorSchemeFlags&,
+      ColorSchemeMode = ColorSchemeMode::Used);
+  static ColorScheme ColorSchemeForFrame(
+      const nsIFrame*, ColorSchemeMode = ColorSchemeMode::Used);
+
+  enum class UseStandins : bool { No, Yes };
+  static UseStandins ShouldUseStandins(const dom::Document&, ColorID);
+
+  static Maybe<nscolor> GetColor(ColorID, ColorScheme, UseStandins);
+
+  static Maybe<nscolor> GetColor(ColorID, const nsIFrame*);
+
+  static nscolor Color(ColorID aId, ColorScheme aScheme,
+                       UseStandins aUseStandins,
+                       nscolor aDefault = NS_RGB(0, 0, 0)) {
+    return GetColor(aId, aScheme, aUseStandins).valueOr(aDefault);
+  }
+
+  static nscolor Color(ColorID aId, nsIFrame* aFrame,
+                       nscolor aDefault = NS_RGB(0, 0, 0)) {
+    return GetColor(aId, aFrame).valueOr(aDefault);
+  }
+
+  static float GetTextScaleFactor() {
+    float f = GetFloat(FloatID::TextScaleFactor, 1.0f);
+    if (MOZ_UNLIKELY(f <= 0.0f)) {
+      return 1.0f;
+    }
+    return f;
+  }
+
+  struct ZoomSettings {
+    float mFullZoom = 1.0f;
+    float mTextZoom = 1.0f;
+  };
+
+  static ZoomSettings SystemZoomSettings();
+
+  static nsresult GetInt(IntID, int32_t* aResult);
+  static nsresult GetFloat(FloatID aID, float* aResult);
+
+  static int32_t GetInt(IntID aID, int32_t aDefault = 0) {
+    int32_t result;
+    if (NS_FAILED(GetInt(aID, &result))) {
+      return aDefault;
+    }
+    return result;
+  }
+
+  static float GetFloat(FloatID aID, float aDefault = 0.0f) {
+    float result;
+    if (NS_FAILED(GetFloat(aID, &result))) {
+      return aDefault;
+    }
+    return result;
+  }
+
+  static bool GetFont(FontID aID, nsString& aName, gfxFontStyle& aStyle);
+  static void GetFont(FontID, widget::LookAndFeelFont&);
+
+  static char16_t GetPasswordCharacter();
+
+  static bool GetEchoPassword();
+
+  static bool DrawInTitlebar();
+
+  static int32_t CaretBlinkCount() {
+    return GetInt(IntID::CaretBlinkCount, -1);
+  }
+
+  static int32_t CaretBlinkTime() { return GetInt(IntID::CaretBlinkTime, 500); }
+
+  enum class TitlebarAction {
+    None,
+    WindowLower,
+    WindowMenu,
+    WindowMinimize,
+    WindowMaximize,
+    WindowMaximizeToggle,
+  };
+
+  enum class TitlebarEvent {
+    Double_Click,
+    Middle_Click,
+  };
+
+  static TitlebarAction GetTitlebarAction(TitlebarEvent aEvent);
+
+  static uint32_t GetPasswordMaskDelay();
+
+  static void GetThemeInfo(nsACString&);
+
+  static void Refresh();
+
+  static void EnsureInit();
+
+  static void SetData(widget::FullLookAndFeel&& aTables);
+  static void NotifyChangedAllWindows(widget::ThemeChangeKind);
+  static bool HasPendingGlobalThemeChange() { return sGlobalThemeChanged; }
+  static void HandleGlobalThemeChange() {
+    if (MOZ_UNLIKELY(HasPendingGlobalThemeChange())) {
+      DoHandleGlobalThemeChange();
+    }
+  }
+
+  static nsresult GetKeyboardLayout(nsACString& aLayout);
+
+ protected:
+  static void DoHandleGlobalThemeChange();
+  static bool sGlobalThemeChanged;
+};
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(LookAndFeel::PointingDeviceKinds);
+
+}  
+
+
+constexpr nscolor NS_TRANSPARENT = NS_RGBA(0x01, 0x00, 0x00, 0x00);
+constexpr nscolor NS_SAME_AS_FOREGROUND_COLOR = NS_RGBA(0x02, 0x00, 0x00, 0x00);
+constexpr nscolor NS_40PERCENT_FOREGROUND_COLOR =
+    NS_RGBA(0x03, 0x00, 0x00, 0x00);
+
+#define NS_IS_SELECTION_SPECIAL_COLOR(c)                          \
+  ((c) == NS_TRANSPARENT || (c) == NS_SAME_AS_FOREGROUND_COLOR || \
+   (c) == NS_40PERCENT_FOREGROUND_COLOR)
+
+
+#define NS_ALERT_HORIZONTAL 1
+#define NS_ALERT_LEFT 2
+#define NS_ALERT_TOP 4
+
+#endif /* LookAndFeel_h_ */

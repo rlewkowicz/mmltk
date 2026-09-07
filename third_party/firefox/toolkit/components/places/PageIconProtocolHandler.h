@@ -1,0 +1,65 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_places_PageIconProtocolHandler_h
+#define mozilla_places_PageIconProtocolHandler_h
+
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/net/RemoteStreamGetter.h"
+#include "mozilla/places/nsFaviconService.h"
+#include "nsIProtocolHandler.h"
+#include "nsThreadUtils.h"
+#include "nsWeakReference.h"
+
+namespace mozilla::places {
+
+struct FaviconMetadata;
+
+using net::RemoteStreamPromise;
+
+class PageIconProtocolHandler final : public nsIProtocolHandler,
+                                      public nsSupportsWeakReference {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIPROTOCOLHANDLER
+
+  static already_AddRefed<PageIconProtocolHandler> GetSingleton() {
+    MOZ_ASSERT(NS_IsMainThread());
+    if (MOZ_UNLIKELY(!sSingleton)) {
+      sSingleton = new PageIconProtocolHandler();
+      ClearOnShutdown(&sSingleton);
+    }
+    return do_AddRef(sSingleton);
+  }
+
+  RefPtr<RemoteStreamPromise> NewStream(nsIURI* aChildURI,
+                                        nsILoadInfo* aLoadInfo,
+                                        bool* aTerminateSender);
+
+ private:
+  ~PageIconProtocolHandler() = default;
+
+  Result<Ok, nsresult> SubstituteRemoteChannel(nsIURI* aURI,
+                                               nsILoadInfo* aLoadInfo,
+                                               nsIChannel** aRetVal);
+
+  RefPtr<FaviconPromise> GetFaviconData(nsIURI* aPageIconURI);
+
+  nsresult NewChannelInternal(nsIURI*, nsILoadInfo*, nsIChannel**);
+
+  void GetStreams(nsIAsyncInputStream** inStream,
+                  nsIAsyncOutputStream** outStream);
+
+  static void NewSimpleChannel(nsIURI* aURI, nsILoadInfo* aLoadinfo,
+                               mozilla::net::RemoteStreamGetter* aStreamGetter,
+                               nsIChannel** aRetVal);
+  static StaticRefPtr<PageIconProtocolHandler> sSingleton;
+};
+
+}  
+
+#endif

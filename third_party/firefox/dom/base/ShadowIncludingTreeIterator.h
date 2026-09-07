@@ -1,0 +1,86 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_dom_ShadowIncludingTreeIterator_h
+#define mozilla_dom_ShadowIncludingTreeIterator_h
+
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/ShadowRoot.h"
+#include "nsINode.h"
+#include "nsTArray.h"
+
+namespace mozilla::dom {
+
+class ShadowIncludingTreeIterator {
+ public:
+  explicit ShadowIncludingTreeIterator(nsINode& aRoot) : mCurrent(&aRoot) {
+    mRoots.AppendElement(&aRoot);
+  }
+
+#ifdef DEBUG
+  ~ShadowIncludingTreeIterator() {
+    MOZ_ASSERT(
+        !mMutationGuard.Mutated(0),
+        "Don't mutate the DOM while using a ShadowIncludingTreeIterator");
+  }
+#endif  // DEBUG
+
+  ShadowIncludingTreeIterator& begin() { return *this; }
+
+  std::nullptr_t end() const { return nullptr; }
+
+  bool operator!=(std::nullptr_t) const { return !!mCurrent; }
+
+  explicit operator bool() const { return !!mCurrent; }
+
+  void operator++() { Next(); }
+
+  void SkipChildren() {
+    MOZ_ASSERT(mCurrent, "Shouldn't be at end");
+    mCurrent = mCurrent->GetNextNonChildNode(mRoots.LastElement());
+    WalkOutOfShadowRootsIfNeeded();
+  }
+
+  nsINode* operator*() { return mCurrent; }
+
+ private:
+  void Next() {
+    MOZ_ASSERT(mCurrent, "Don't call Next() after we have no current node");
+
+    if (Element* element = Element::FromNode(mCurrent)) {
+      if (ShadowRoot* shadowRoot = element->GetShadowRoot()) {
+        mCurrent = shadowRoot;
+        mRoots.AppendElement(shadowRoot);
+        return;
+      }
+    }
+
+    mCurrent = mCurrent->GetNextNode(mRoots.LastElement());
+    WalkOutOfShadowRootsIfNeeded();
+  }
+
+  void WalkOutOfShadowRootsIfNeeded() {
+    while (!mCurrent) {
+      nsINode* root = mRoots.PopLastElement();
+      if (mRoots.IsEmpty()) {
+        return;
+      }
+      mCurrent =
+          ShadowRoot::FromNode(root)->Host()->GetNextNode(mRoots.LastElement());
+    }
+  }
+
+  nsINode* mCurrent;
+
+  CopyableAutoTArray<nsINode*, 4> mRoots;
+
+#ifdef DEBUG
+  nsMutationGuard mMutationGuard;
+#endif  // DEBUG
+};
+
+}  
+
+#endif  // mozilla_dom_ShadowIncludingTreeIterator_h

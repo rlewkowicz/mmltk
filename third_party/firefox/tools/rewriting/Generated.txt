@@ -1,0 +1,10 @@
+browser/locales/l10n-changesets.json
+browser/locales/l10n-onchange-changesets.json
+dom/base/use_counter_metrics.yaml
+intl/components/src/UnicodeScriptCodes.h
+intl/unicharutil/util/nsSpecialCasingData.cpp
+intl/unicharutil/util/nsUnicodePropertyData.cpp
+services/settings/dumps/
+toolkit/components/pdfjs/PdfJsDefaultPrefs.js
+toolkit/components/pdfjs/PdfJsOverridePrefs.js
+toolkit/components/uniffi-js/GeneratedScaffolding.cpp

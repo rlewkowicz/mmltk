@@ -1,0 +1,64 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef _nsFrameManager_h_
+#define _nsFrameManager_h_
+
+#include "mozilla/Attributes.h"
+#include "nsDebug.h"
+#include "nsFrameList.h"
+
+class nsContainerFrame;
+class nsIFrame;
+class nsILayoutHistoryState;
+class nsPlaceholderFrame;
+class nsWindowSizes;
+
+namespace mozilla {
+struct FrameDestroyContext;
+class PresShell;
+class ViewportFrame;
+}  
+
+class nsFrameManager {
+ public:
+  using DestroyContext = mozilla::FrameDestroyContext;
+
+  explicit nsFrameManager(mozilla::PresShell* aPresShell)
+      : mPresShell(aPresShell) {
+    MOZ_ASSERT(mPresShell, "need a pres shell");
+  }
+  ~nsFrameManager();
+
+  nsIFrame* GetRootFrame() const { return mRootFrame; }
+  void SetRootFrame(mozilla::ViewportFrame* aRootFrame);
+
+  void Destroy();
+
+  void AppendFrames(nsContainerFrame* aParentFrame,
+                    mozilla::FrameChildListID aListID,
+                    nsFrameList&& aFrameList);
+
+  void InsertFrames(nsContainerFrame* aParentFrame,
+                    mozilla::FrameChildListID aListID, nsIFrame* aPrevFrame,
+                    nsFrameList&& aFrameList);
+
+  void RemoveFrame(DestroyContext&, mozilla::FrameChildListID, nsIFrame*);
+
+  void CaptureFrameState(nsIFrame* aFrame, nsILayoutHistoryState* aState);
+
+  void CaptureFrameStateFor(nsIFrame* aFrame, nsILayoutHistoryState* aState);
+
+  void RestoreFrameStateFor(nsIFrame* aFrame, nsILayoutHistoryState* aState);
+
+  void AddSizeOfIncludingThis(nsWindowSizes& aSizes) const;
+
+ protected:
+  mozilla::PresShell* MOZ_NON_OWNING_REF mPresShell;
+
+  nsIFrame* mRootFrame = nullptr;
+};
+
+#endif

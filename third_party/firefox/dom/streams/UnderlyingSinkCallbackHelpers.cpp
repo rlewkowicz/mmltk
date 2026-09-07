@@ -1,0 +1,240 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/UnderlyingSinkCallbackHelpers.h"
+
+#include "StreamUtils.h"
+#include "mozilla/dom/BufferSourceBinding.h"
+#include "mozilla/dom/BufferSourceBindingFwd.h"
+#include "mozilla/dom/UnionTypes.h"
+#include "mozilla/dom/WebTransportError.h"
+#include "nsHttp.h"
+
+using namespace mozilla::dom;
+
+NS_IMPL_CYCLE_COLLECTION(UnderlyingSinkAlgorithmsBase)
+NS_IMPL_CYCLE_COLLECTING_ADDREF(UnderlyingSinkAlgorithmsBase)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(UnderlyingSinkAlgorithmsBase)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(UnderlyingSinkAlgorithmsBase)
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED_WITH_JS_MEMBERS(
+    UnderlyingSinkAlgorithms, UnderlyingSinkAlgorithmsBase,
+    (mGlobal, mStartCallback, mWriteCallback, mCloseCallback, mAbortCallback),
+    (mUnderlyingSink))
+NS_IMPL_ADDREF_INHERITED(UnderlyingSinkAlgorithms, UnderlyingSinkAlgorithmsBase)
+NS_IMPL_RELEASE_INHERITED(UnderlyingSinkAlgorithms,
+                          UnderlyingSinkAlgorithmsBase)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(UnderlyingSinkAlgorithms)
+NS_INTERFACE_MAP_END_INHERITING(UnderlyingSinkAlgorithmsBase)
+
+void UnderlyingSinkAlgorithms::StartCallback(
+    JSContext* aCx, WritableStreamDefaultController& aController,
+    JS::MutableHandle<JS::Value> aRetVal, ErrorResult& aRv) {
+  if (!mStartCallback) {
+    aRetVal.setUndefined();
+    return;
+  }
+
+  JS::Rooted<JSObject*> thisObj(aCx, mUnderlyingSink);
+  return mStartCallback->Call(thisObj, aController, aRetVal, aRv,
+                              "UnderlyingSink.start",
+                              CallbackFunction::eRethrowExceptions);
+}
+
+already_AddRefed<Promise> UnderlyingSinkAlgorithms::WriteCallback(
+    JSContext* aCx, JS::Handle<JS::Value> aChunk,
+    WritableStreamDefaultController& aController, ErrorResult& aRv) {
+  if (!mWriteCallback) {
+    return Promise::CreateResolvedWithUndefined(mGlobal, aRv);
+  }
+
+  JS::Rooted<JSObject*> thisObj(aCx, mUnderlyingSink);
+  RefPtr<Promise> promise = mWriteCallback->Call(
+      thisObj, aChunk, aController, aRv, "UnderlyingSink.write",
+      CallbackFunction::eRethrowExceptions);
+  return promise.forget();
+}
+
+already_AddRefed<Promise> UnderlyingSinkAlgorithms::CloseCallback(
+    JSContext* aCx, ErrorResult& aRv) {
+  if (!mCloseCallback) {
+    return Promise::CreateResolvedWithUndefined(mGlobal, aRv);
+  }
+
+  JS::Rooted<JSObject*> thisObj(aCx, mUnderlyingSink);
+  RefPtr<Promise> promise =
+      mCloseCallback->Call(thisObj, aRv, "UnderlyingSink.close",
+                           CallbackFunction::eRethrowExceptions);
+  return promise.forget();
+}
+
+already_AddRefed<Promise> UnderlyingSinkAlgorithms::AbortCallback(
+    JSContext* aCx, const Optional<JS::Handle<JS::Value>>& aReason,
+    ErrorResult& aRv) {
+  if (!mAbortCallback) {
+    return Promise::CreateResolvedWithUndefined(mGlobal, aRv);
+  }
+
+  JS::Rooted<JSObject*> thisObj(aCx, mUnderlyingSink);
+  RefPtr<Promise> promise =
+      mAbortCallback->Call(thisObj, aReason, aRv, "UnderlyingSink.abort",
+                           CallbackFunction::eRethrowExceptions);
+
+  return promise.forget();
+}
+
+already_AddRefed<Promise> UnderlyingSinkAlgorithmsWrapper::WriteCallback(
+    JSContext* aCx, JS::Handle<JS::Value> aChunk,
+    WritableStreamDefaultController& aController, ErrorResult& aRv) {
+  nsCOMPtr<nsIGlobalObject> global = xpc::CurrentNativeGlobal(aCx);
+  return PromisifyAlgorithm(
+      global,
+      [&](ErrorResult& aRv) {
+        return WriteCallbackImpl(aCx, aChunk, aController, aRv);
+      },
+      aRv);
+}
+
+already_AddRefed<Promise> UnderlyingSinkAlgorithmsWrapper::CloseCallback(
+    JSContext* aCx, ErrorResult& aRv) {
+  nsCOMPtr<nsIGlobalObject> global = xpc::CurrentNativeGlobal(aCx);
+  return PromisifyAlgorithm(
+      global, [&](ErrorResult& aRv) { return CloseCallbackImpl(aCx, aRv); },
+      aRv);
+}
+
+already_AddRefed<Promise> UnderlyingSinkAlgorithmsWrapper::AbortCallback(
+    JSContext* aCx, const Optional<JS::Handle<JS::Value>>& aReason,
+    ErrorResult& aRv) {
+  nsCOMPtr<nsIGlobalObject> global = xpc::CurrentNativeGlobal(aCx);
+  return PromisifyAlgorithm(
+      global,
+      [&](ErrorResult& aRv) { return AbortCallbackImpl(aCx, aReason, aRv); },
+      aRv);
+}
+
+NS_IMPL_ISUPPORTS_CYCLE_COLLECTION_INHERITED(WritableStreamToOutputAlgorithms,
+                                             UnderlyingSinkAlgorithmsBase,
+                                             nsIOutputStreamCallback)
+NS_IMPL_CYCLE_COLLECTION_INHERITED(WritableStreamToOutputAlgorithms,
+                                   UnderlyingSinkAlgorithmsBase, mParent,
+                                   mOutput, mPromise)
+
+NS_IMETHODIMP
+WritableStreamToOutputAlgorithms::OnOutputStreamReady(
+    nsIAsyncOutputStream* aStream) {
+  if (!mData) {
+    return NS_OK;
+  }
+  MOZ_ASSERT(mPromise);
+  uint32_t written = 0;
+  nsresult rv = mOutput->Write(
+      reinterpret_cast<const char*>(mData->Elements() + mWritten),
+      mData->Length() - mWritten, &written);
+  if (NS_FAILED(rv) && rv != NS_BASE_STREAM_WOULD_BLOCK) {
+    mPromise->MaybeRejectWithAbortError("Error writing to stream"_ns);
+    ClearData();
+    return rv;
+  }
+  if (NS_SUCCEEDED(rv)) {
+    mWritten += written;
+    MOZ_ASSERT(mWritten <= mData->Length());
+    if (mWritten >= mData->Length()) {
+      mPromise->MaybeResolveWithUndefined();
+      ClearData();
+      return NS_OK;
+    }
+  }
+  nsCOMPtr<nsIEventTarget> target = mozilla::GetCurrentSerialEventTarget();
+  rv = mOutput->AsyncWait(this, 0, 0, target);
+  if (NS_FAILED(rv)) {
+    mPromise->MaybeRejectWithUnknownError("error waiting to write data"_ns);
+    ClearData();
+    return rv;
+  }
+  return NS_OK;
+}
+
+already_AddRefed<Promise> WritableStreamToOutputAlgorithms::WriteCallbackImpl(
+    JSContext* aCx, JS::Handle<JS::Value> aChunk,
+    WritableStreamDefaultController& aController, ErrorResult& aRv) {
+  BufferSource data;
+  if (!data.Init(aCx, aChunk)) {
+    aRv.MightThrowJSException();
+    aRv.StealExceptionFromJSContext(aCx);
+    return nullptr;
+  }
+  MOZ_ASSERT(data.IsArrayBuffer() || data.IsArrayBufferView());
+
+  RefPtr<Promise> promise = Promise::Create(mParent, aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+
+  MOZ_ASSERT(!mPromise);
+  MOZ_ASSERT(mWritten == 0);
+  uint32_t written = 0;
+  ProcessTypedArraysFixed(data, [&](const Span<uint8_t>& aData) {
+    Span<uint8_t> dataSpan = aData;
+    nsresult rv = mOutput->Write(mozilla::AsChars(dataSpan).Elements(),
+                                 dataSpan.Length(), &written);
+    if (NS_FAILED(rv) && rv != NS_BASE_STREAM_WOULD_BLOCK) {
+      promise->MaybeRejectWithAbortError("error writing data"_ns);
+      return;
+    }
+    if (NS_SUCCEEDED(rv)) {
+      if (written == dataSpan.Length()) {
+        promise->MaybeResolveWithUndefined();
+        return;
+      }
+      dataSpan = dataSpan.From(written);
+    }
+
+    auto buffer = Buffer<uint8_t>::CopyFrom(dataSpan);
+    if (buffer.isNothing()) {
+      promise->MaybeReject(NS_ERROR_OUT_OF_MEMORY);
+      return;
+    }
+    mData = std::move(buffer);
+  });
+
+  if (promise->State() != Promise::PromiseState::Pending) {
+    return promise.forget();
+  }
+
+  mPromise = promise;
+
+  nsCOMPtr<nsIEventTarget> target = mozilla::GetCurrentSerialEventTarget();
+  nsresult rv = mOutput->AsyncWait(this, 0, 0, target);
+  if (NS_FAILED(rv)) {
+    ClearData();
+    promise->MaybeRejectWithUnknownError("error waiting to write data"_ns);
+  }
+  return promise.forget();
+}
+
+already_AddRefed<Promise> WritableStreamToOutputAlgorithms::AbortCallbackImpl(
+    JSContext* aCx, const Optional<JS::Handle<JS::Value>>& aReason,
+    ErrorResult& aRv) {
+
+  if (aReason.WasPassed() && aReason.Value().isObject()) {
+    JS::Rooted<JSObject*> obj(aCx, &aReason.Value().toObject());
+    RefPtr<WebTransportError> error;
+    UnwrapObject<prototypes::id::WebTransportError, WebTransportError>(
+        obj, error, nullptr);
+    if (error) {
+      mOutput->CloseWithStatus(net::GetNSResultFromWebTransportError(
+          error->GetStreamErrorCode().Value()));
+      return nullptr;
+    }
+  }
+
+  mOutput->CloseWithStatus(NS_ERROR_WEBTRANSPORT_CODE_BASE);
+
+  return nullptr;
+}
+
+void WritableStreamToOutputAlgorithms::ReleaseObjects() { mOutput->Close(); }

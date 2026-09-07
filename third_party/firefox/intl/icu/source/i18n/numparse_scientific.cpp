@@ -1,0 +1,139 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#define UNISTR_FROM_STRING_EXPLICIT
+
+#include "numparse_types.h"
+#include "numparse_scientific.h"
+#include "static_unicode_sets.h"
+#include "string_segment.h"
+
+using namespace icu;
+using namespace icu::numparse;
+using namespace icu::numparse::impl;
+
+
+namespace {
+
+inline const UnicodeSet& minusSignSet() {
+    return *unisets::get(unisets::MINUS_SIGN);
+}
+
+inline const UnicodeSet& plusSignSet() {
+    return *unisets::get(unisets::PLUS_SIGN);
+}
+
+} 
+
+
+ScientificMatcher::ScientificMatcher(const DecimalFormatSymbols& dfs, const Grouper& grouper)
+        : fExponentSeparatorString(dfs.getConstSymbol(DecimalFormatSymbols::kExponentialSymbol)),
+          fExponentMatcher(dfs, grouper, PARSE_FLAG_INTEGER_ONLY | PARSE_FLAG_GROUPING_DISABLED),
+          fIgnorablesMatcher(PARSE_FLAG_STRICT_IGNORABLES) {
+
+    const UnicodeString& minusSign = dfs.getConstSymbol(DecimalFormatSymbols::kMinusSignSymbol);
+    if (minusSignSet().contains(minusSign)) {
+        fCustomMinusSign.setToBogus();
+    } else {
+        fCustomMinusSign = minusSign;
+    }
+
+    const UnicodeString& plusSign = dfs.getConstSymbol(DecimalFormatSymbols::kPlusSignSymbol);
+    if (plusSignSet().contains(plusSign)) {
+        fCustomPlusSign.setToBogus();
+    } else {
+        fCustomPlusSign = plusSign;
+    }
+}
+
+bool ScientificMatcher::match(StringSegment& segment, ParsedNumber& result, UErrorCode& status) const {
+    if (!result.seenNumber()) {
+        return false;
+    }
+
+    if (0 != (result.flags & FLAG_HAS_EXPONENT)) {
+        return false;
+    }
+
+    int32_t initialOffset = segment.getOffset();
+    int32_t overlap = segment.getCommonPrefixLength(fExponentSeparatorString);
+    if (overlap == fExponentSeparatorString.length()) {
+
+        if (segment.length() == overlap) {
+            return true;
+        }
+        segment.adjustOffset(overlap);
+
+        fIgnorablesMatcher.match(segment, result, status);
+        if (segment.length() == 0) {
+            segment.setOffset(initialOffset);
+            return true;
+        }
+
+        int8_t exponentSign = 1;
+        if (segment.startsWith(minusSignSet())) {
+            exponentSign = -1;
+            segment.adjustOffsetByCodePoint();
+        } else if (segment.startsWith(plusSignSet())) {
+            segment.adjustOffsetByCodePoint();
+        } else if (segment.startsWith(fCustomMinusSign)) {
+            overlap = segment.getCommonPrefixLength(fCustomMinusSign);
+            if (overlap != fCustomMinusSign.length()) {
+                segment.setOffset(initialOffset);
+                return true;
+            }
+            exponentSign = -1;
+            segment.adjustOffset(overlap);
+        } else if (segment.startsWith(fCustomPlusSign)) {
+            overlap = segment.getCommonPrefixLength(fCustomPlusSign);
+            if (overlap != fCustomPlusSign.length()) {
+                segment.setOffset(initialOffset);
+                return true;
+            }
+            segment.adjustOffset(overlap);
+        }
+
+        if (segment.length() == 0) {
+            segment.setOffset(initialOffset);
+            return true;
+        }
+
+        fIgnorablesMatcher.match(segment, result, status);
+        if (segment.length() == 0) {
+            segment.setOffset(initialOffset);
+            return true;
+        }
+
+        bool wasBogus = result.quantity.bogus;
+        result.quantity.bogus = false;
+        int digitsOffset = segment.getOffset();
+        bool digitsReturnValue = fExponentMatcher.match(segment, result, exponentSign, status);
+        result.quantity.bogus = wasBogus;
+
+        if (segment.getOffset() != digitsOffset) {
+            result.flags |= FLAG_HAS_EXPONENT;
+        } else {
+            segment.setOffset(initialOffset);
+        }
+        return digitsReturnValue;
+
+    } else if (overlap == segment.length()) {
+        return true;
+    }
+
+    return false;
+}
+
+bool ScientificMatcher::smokeTest(const StringSegment& segment) const {
+    return segment.startsWith(fExponentSeparatorString);
+}
+
+UnicodeString ScientificMatcher::toString() const {
+    return u"<Scientific>";
+}
+
+
+#endif /* #if !UCONFIG_NO_FORMATTING */

@@ -1,0 +1,131 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+**********************************************************************
+* Copyright (c) 2002-2016, International Business Machines
+* Corporation and others.  All Rights Reserved.
+**********************************************************************
+*/
+#ifndef _UCURR_H_
+#define _UCURR_H_
+
+#include "unicode/utypes.h"
+#include "unicode/uenum.h"
+
+
+#if !UCONFIG_NO_FORMATTING
+
+enum UCurrencyUsage {
+    UCURR_USAGE_STANDARD=0,
+    UCURR_USAGE_CASH=1,
+#ifndef U_HIDE_DEPRECATED_API
+    UCURR_USAGE_COUNT=2
+#endif  // U_HIDE_DEPRECATED_API
+};
+typedef enum UCurrencyUsage UCurrencyUsage; 
+
+U_CAPI int32_t U_EXPORT2
+ucurr_forLocale(const char* locale,
+                UChar* buff,
+                int32_t buffCapacity,
+                UErrorCode* ec);
+
+typedef enum UCurrNameStyle {
+    UCURR_SYMBOL_NAME,
+
+    UCURR_LONG_NAME,
+
+    UCURR_NARROW_SYMBOL_NAME,
+
+    UCURR_FORMAL_SYMBOL_NAME,
+
+    UCURR_VARIANT_SYMBOL_NAME
+    
+} UCurrNameStyle;
+
+#if !UCONFIG_NO_SERVICE
+typedef const void* UCurrRegistryKey;
+
+U_CAPI UCurrRegistryKey U_EXPORT2
+ucurr_register(const UChar* isoCode, 
+                   const char* locale,  
+                   UErrorCode* status);
+U_CAPI UBool U_EXPORT2
+ucurr_unregister(UCurrRegistryKey key, UErrorCode* status);
+#endif /* UCONFIG_NO_SERVICE */
+
+U_CAPI const UChar* U_EXPORT2
+ucurr_getName(const UChar* currency,
+              const char* locale,
+              UCurrNameStyle nameStyle,
+              UBool* isChoiceFormat,
+              int32_t* len,
+              UErrorCode* ec);
+
+U_CAPI const UChar* U_EXPORT2
+ucurr_getPluralName(const UChar* currency,
+                    const char* locale,
+                    UBool* isChoiceFormat,
+                    const char* pluralCount,
+                    int32_t* len,
+                    UErrorCode* ec);
+
+U_CAPI int32_t U_EXPORT2
+ucurr_getDefaultFractionDigits(const UChar* currency,
+                               UErrorCode* ec);
+
+U_CAPI int32_t U_EXPORT2
+ucurr_getDefaultFractionDigitsForUsage(const UChar* currency, 
+                                       const UCurrencyUsage usage,
+                                       UErrorCode* ec);
+
+U_CAPI double U_EXPORT2
+ucurr_getRoundingIncrement(const UChar* currency,
+                           UErrorCode* ec);
+
+U_CAPI double U_EXPORT2
+ucurr_getRoundingIncrementForUsage(const UChar* currency,
+                                   const UCurrencyUsage usage,
+                                   UErrorCode* ec);
+
+typedef enum UCurrCurrencyType {
+    UCURR_ALL = INT32_MAX,
+    UCURR_COMMON = 1,
+    UCURR_UNCOMMON = 2,
+    UCURR_DEPRECATED = 4,
+    UCURR_NON_DEPRECATED = 8
+} UCurrCurrencyType;
+
+U_CAPI UEnumeration * U_EXPORT2
+ucurr_openISOCurrencies(uint32_t currType, UErrorCode *pErrorCode);
+
+U_CAPI UBool U_EXPORT2
+ucurr_isAvailable(const UChar* isoCode, 
+             UDate from, 
+             UDate to, 
+             UErrorCode* errorCode);
+
+U_CAPI int32_t U_EXPORT2
+ucurr_countCurrencies(const char* locale, 
+                 UDate date, 
+                 UErrorCode* ec); 
+
+U_CAPI int32_t U_EXPORT2 
+ucurr_forLocaleAndDate(const char* locale, 
+                UDate date, 
+                int32_t index,
+                UChar* buff, 
+                int32_t buffCapacity, 
+                UErrorCode* ec); 
+
+U_CAPI UEnumeration* U_EXPORT2
+ucurr_getKeywordValuesForLocale(const char* key,
+                                const char* locale,
+                                UBool commonlyUsed,
+                                UErrorCode* status);
+
+U_CAPI int32_t U_EXPORT2
+ucurr_getNumericCode(const UChar* currency);
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+
+#endif

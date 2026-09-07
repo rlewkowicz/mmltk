@@ -1,0 +1,66 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_worklet_WorkletThread_h
+#define mozilla_dom_worklet_WorkletThread_h
+
+#include "mozilla/CondVar.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/WorkletImpl.h"
+#include "nsIObserver.h"
+#include "nsThread.h"
+
+class nsIRunnable;
+
+namespace JS {
+class ContextOptions;
+};  
+
+namespace mozilla::dom {
+
+class WorkletThread final : public nsThread, public nsIObserver {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_NSIOBSERVER
+
+  static already_AddRefed<WorkletThread> Create(WorkletImpl* aWorkletImpl);
+
+  static void EnsureCycleCollectedJSContext(JSRuntime* aParentRuntime,
+                                            const JS::ContextOptions& aOptions);
+  static void DeleteCycleCollectedJSContext();
+
+  static bool IsOnWorkletThread();
+
+  static void AssertIsOnWorkletThread();
+
+  nsresult DispatchRunnable(already_AddRefed<nsIRunnable> aRunnable);
+
+  void Terminate();
+
+  static uint32_t StackSize();
+
+ private:
+  explicit WorkletThread(WorkletImpl* aWorkletImpl);
+  ~WorkletThread();
+
+  void RunEventLoop();
+  class PrimaryRunnable;
+
+  void TerminateInternal();
+  class TerminateRunnable;
+
+  using nsThread::DelayedDispatch;
+  using nsThread::Dispatch;
+  using nsThread::DispatchFromScript;
+
+  const RefPtr<WorkletImpl> mWorkletImpl;
+
+  bool mExitLoop;  
+
+  bool mIsTerminating;  
+};
+
+}  
+
+#endif  // mozilla_dom_worklet_WorkletThread_h

@@ -1,0 +1,303 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef vm_Activation_h
+#define vm_Activation_h
+
+#include "mozilla/Assertions.h"  // MOZ_ASSERT
+#include "mozilla/Attributes.h"  // MOZ_RAII
+
+#include <stddef.h>  // size_t
+#include <stdint.h>  // uint8_t, uint32_t
+
+#include "jstypes.h"  // JS_PUBLIC_API
+
+#include "jit/CalleeToken.h"  // js::jit::CalleeToken
+#include "js/RootingAPI.h"    // JS::Handle, JS::Rooted
+#include "js/TypeDecls.h"     // jsbytecode
+#include "js/Value.h"         // JS::Value
+#include "vm/SavedFrame.h"    // js::SavedFrame
+#include "vm/Stack.h"         // js::InterpreterRegs
+
+struct JS_PUBLIC_API JSContext;
+
+class JSFunction;
+class JSObject;
+class JSScript;
+
+namespace JS {
+
+class CallArgs;
+class JS_PUBLIC_API Compartment;
+
+}  
+
+namespace js {
+
+class InterpreterActivation;
+
+namespace jit {
+class JitActivation;
+}  
+
+class LiveSavedFrameCache {
+ public:
+  class FramePtr {
+    using Ptr = mozilla::Variant<InterpreterFrame*, jit::CommonFrameLayout*,
+                                 jit::RematerializedFrame*, wasm::DebugFrame*>;
+
+    Ptr ptr;
+
+    template <typename Frame>
+    explicit FramePtr(Frame ptr) : ptr(ptr) {}
+
+    struct HasCachedMatcher;
+    struct SetHasCachedMatcher;
+    struct ClearHasCachedMatcher;
+
+   public:
+    static inline mozilla::Maybe<FramePtr> create(JSContext* cx,
+                                                  const FrameIter& iter);
+
+    inline bool hasCachedSavedFrame() const;
+    inline void setHasCachedSavedFrame();
+    inline void clearHasCachedSavedFrame();
+
+    inline bool isInterpreterFrame() const {
+      return ptr.is<InterpreterFrame*>();
+    }
+
+    inline InterpreterFrame& asInterpreterFrame() const {
+      return *ptr.as<InterpreterFrame*>();
+    }
+
+    inline bool isRematerializedFrame() const {
+      return ptr.is<jit::RematerializedFrame*>();
+    }
+
+    bool operator==(const FramePtr& rhs) const { return rhs.ptr == this->ptr; }
+    bool operator!=(const FramePtr& rhs) const { return !(rhs == *this); }
+  };
+
+ private:
+  class Key {
+    FramePtr framePtr;
+
+   public:
+    MOZ_IMPLICIT Key(const FramePtr& framePtr) : framePtr(framePtr) {}
+
+    bool operator==(const Key& rhs) const {
+      return rhs.framePtr == this->framePtr;
+    }
+    bool operator!=(const Key& rhs) const { return !(rhs == *this); }
+  };
+
+  struct Entry {
+    const Key key;
+    const jsbytecode* pc;
+    HeapPtr<SavedFrame*> savedFrame;
+
+    Entry(const Key& key, const jsbytecode* pc, SavedFrame* savedFrame)
+        : key(key), pc(pc), savedFrame(savedFrame) {}
+  };
+
+  using EntryVector = Vector<Entry, 0, SystemAllocPolicy>;
+  EntryVector* frames;
+
+ public:
+  explicit LiveSavedFrameCache() : frames(nullptr) {}
+
+  LiveSavedFrameCache(LiveSavedFrameCache&& rhs) : frames(rhs.frames) {
+    MOZ_ASSERT(this != &rhs, "self-move disallowed");
+    rhs.frames = nullptr;
+  }
+
+  ~LiveSavedFrameCache() {
+    if (frames) {
+      js_delete(frames);
+      frames = nullptr;
+    }
+  }
+
+  LiveSavedFrameCache(const LiveSavedFrameCache&) = delete;
+  LiveSavedFrameCache& operator=(const LiveSavedFrameCache&) = delete;
+
+  bool initialized() const { return !!frames; }
+  bool init(JSContext* cx) {
+    frames = js_new<EntryVector>();
+    if (!frames) {
+      JS_ReportOutOfMemory(cx);
+      return false;
+    }
+    return true;
+  }
+
+  void trace(JSTracer* trc);
+
+  void find(JSContext* cx, FramePtr& framePtr, const jsbytecode* pc,
+            MutableHandle<SavedFrame*> frame) const;
+
+  void findWithoutInvalidation(const FramePtr& framePtr,
+                               MutableHandle<SavedFrame*> frame) const;
+
+  bool insert(JSContext* cx, FramePtr&& framePtr, const jsbytecode* pc,
+              Handle<SavedFrame*> savedFrame);
+
+  void clear() {
+    if (frames) frames->clear();
+  }
+};
+
+static_assert(
+    sizeof(LiveSavedFrameCache) == sizeof(uintptr_t),
+    "Every js::Activation has a LiveSavedFrameCache, so we need to be pretty "
+    "careful "
+    "about avoiding bloat. If you're adding members to LiveSavedFrameCache, "
+    "maybe you "
+    "should consider figuring out a way to make js::Activation have a "
+    "LiveSavedFrameCache* instead of a Rooted<LiveSavedFrameCache>.");
+
+class MOZ_STACK_CLASS Activation {
+ protected:
+  JSContext* cx_;
+  JS::Compartment* compartment_;
+  Activation* prev_;
+  Activation* prevProfiling_;
+
+  size_t hideScriptedCallerCount_;
+
+  LiveSavedFrameCache frameCache_;
+
+  SavedFrame* asyncStack_;
+
+  const char* asyncCause_;
+
+  bool asyncCallIsExplicit_;
+
+  enum Kind : bool { Interpreter, Jit };
+  Kind kind_;
+
+  inline Activation(JSContext* cx, Kind kind);
+  inline ~Activation();
+
+  void traceCommon(JSTracer* trc);
+
+ public:
+  JSContext* cx() const { return cx_; }
+  JS::Compartment* compartment() const { return compartment_; }
+  Activation* prev() const { return prev_; }
+  Activation* prevProfiling() const { return prevProfiling_; }
+  inline Activation* mostRecentProfiling();
+
+  bool isInterpreter() const { return kind_ == Interpreter; }
+  bool isJit() const { return kind_ == Jit; }
+  inline bool hasWasmExitFP() const;
+
+  inline bool isProfiling() const;
+  void registerProfiling();
+  void unregisterProfiling();
+
+  InterpreterActivation* asInterpreter() const {
+    MOZ_ASSERT(isInterpreter());
+    return (InterpreterActivation*)this;
+  }
+  jit::JitActivation* asJit() const {
+    MOZ_ASSERT(isJit());
+    return (jit::JitActivation*)this;
+  }
+
+  void hideScriptedCaller() { hideScriptedCallerCount_++; }
+  void unhideScriptedCaller() {
+    MOZ_ASSERT(hideScriptedCallerCount_ > 0);
+    hideScriptedCallerCount_--;
+  }
+  bool scriptedCallerIsHidden() const { return hideScriptedCallerCount_ > 0; }
+
+  SavedFrame* asyncStack() { return asyncStack_; }
+
+  const char* asyncCause() const { return asyncCause_; }
+
+  bool asyncCallIsExplicit() const { return asyncCallIsExplicit_; }
+
+  inline LiveSavedFrameCache* getLiveSavedFrameCache(JSContext* cx);
+  void clearLiveSavedFrameCache() { frameCache_.clear(); }
+
+  void trace(JSTracer* trc);
+
+  Activation(const Activation& other) = delete;
+  void operator=(const Activation& other) = delete;
+} JS_HAZ_ROOTED;
+
+constexpr jsbytecode EnableInterruptsPseudoOpcode = -1;
+
+static_assert(EnableInterruptsPseudoOpcode >= JSOP_LIMIT,
+              "EnableInterruptsPseudoOpcode must be greater than any opcode");
+static_assert(
+    EnableInterruptsPseudoOpcode == jsbytecode(-1),
+    "EnableInterruptsPseudoOpcode must be the maximum jsbytecode value");
+
+class InterpreterFrameIterator;
+class RunState;
+
+class InterpreterActivation : public Activation {
+  friend class js::InterpreterFrameIterator;
+
+  InterpreterRegs regs_;
+  InterpreterFrame* entryFrame_;
+  size_t opMask_;  
+
+#ifdef DEBUG
+  size_t oldFrameCount_;
+#endif
+
+ public:
+  inline InterpreterActivation(RunState& state, JSContext* cx,
+                               InterpreterFrame* entryFrame);
+  inline ~InterpreterActivation();
+
+  inline bool pushInlineFrame(const JS::CallArgs& args,
+                              JS::Handle<JSScript*> script,
+                              MaybeConstruct constructing);
+  inline void popInlineFrame(InterpreterFrame* frame);
+
+  inline bool resumeGeneratorFrame(JS::Handle<JSFunction*> callee,
+                                   JS::Handle<JSObject*> envChain);
+
+  InterpreterFrame* current() const { return regs_.fp(); }
+  InterpreterRegs& regs() { return regs_; }
+  InterpreterFrame* entryFrame() const { return entryFrame_; }
+  size_t opMask() const { return opMask_; }
+
+  bool isProfiling() const { return false; }
+
+  void enableInterruptsIfRunning(JSScript* script) {
+    if (regs_.fp()->script() == script) {
+      enableInterruptsUnconditionally();
+    }
+  }
+  void enableInterruptsUnconditionally() {
+    opMask_ = EnableInterruptsPseudoOpcode;
+  }
+  void clearInterruptsMask() { opMask_ = 0; }
+
+  void trace(JSTracer* trc);
+};
+
+class ActivationIterator {
+ protected:
+  Activation* activation_;
+
+ public:
+  explicit ActivationIterator(JSContext* cx);
+
+  ActivationIterator& operator++();
+
+  Activation* operator->() const { return activation_; }
+  Activation* activation() const { return activation_; }
+  bool done() const { return activation_ == nullptr; }
+};
+
+}  
+
+#endif  // vm_Activation_h

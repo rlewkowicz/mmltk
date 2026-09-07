@@ -1,0 +1,296 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+
+#ifndef __CHAR16PTR_H__
+#define __CHAR16PTR_H__
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API || U_SHOW_CPLUSPLUS_HEADER_API
+
+#include <cstddef>
+#include <string_view>
+#include <type_traits>
+
+#endif
+
+
+#ifdef U_ALIASING_BARRIER
+#elif (defined(__clang__) || defined(__GNUC__)) && U_PLATFORM != U_PF_BROWSER_NATIVE_CLIENT
+#   define U_ALIASING_BARRIER(ptr) asm volatile("" : : "rm"(ptr) : "memory")
+#elif defined(U_IN_DOXYGEN)
+#   define U_ALIASING_BARRIER(ptr)
+#endif
+
+#if U_SHOW_CPLUSPLUS_API
+
+U_NAMESPACE_BEGIN
+
+class U_COMMON_API Char16Ptr final {
+public:
+    inline Char16Ptr(char16_t *p);
+#if !U_CHAR16_IS_TYPEDEF
+    inline Char16Ptr(uint16_t *p);
+#endif
+#if U_SIZEOF_WCHAR_T==2 || defined(U_IN_DOXYGEN)
+    inline Char16Ptr(wchar_t *p);
+#endif
+    inline Char16Ptr(std::nullptr_t p);
+    inline ~Char16Ptr();
+
+    inline char16_t *get() const;
+    inline operator char16_t *() const { return get(); }
+
+private:
+    Char16Ptr() = delete;
+
+#ifdef U_ALIASING_BARRIER
+    template<typename T> static char16_t *cast(T *t) {
+        U_ALIASING_BARRIER(t);
+        return reinterpret_cast<char16_t *>(t);
+    }
+
+    char16_t *p_;
+#else
+    union {
+        char16_t *cp;
+        uint16_t *up;
+        wchar_t *wp;
+    } u_;
+#endif
+};
+
+#ifdef U_ALIASING_BARRIER
+
+Char16Ptr::Char16Ptr(char16_t *p) : p_(p) {}
+#if !U_CHAR16_IS_TYPEDEF
+Char16Ptr::Char16Ptr(uint16_t *p) : p_(cast(p)) {}
+#endif
+#if U_SIZEOF_WCHAR_T==2
+Char16Ptr::Char16Ptr(wchar_t *p) : p_(cast(p)) {}
+#endif
+Char16Ptr::Char16Ptr(std::nullptr_t p) : p_(p) {}
+Char16Ptr::~Char16Ptr() {
+    U_ALIASING_BARRIER(p_);
+}
+
+char16_t *Char16Ptr::get() const { return p_; }
+
+#else
+
+Char16Ptr::Char16Ptr(char16_t *p) { u_.cp = p; }
+#if !U_CHAR16_IS_TYPEDEF
+Char16Ptr::Char16Ptr(uint16_t *p) { u_.up = p; }
+#endif
+#if U_SIZEOF_WCHAR_T==2
+Char16Ptr::Char16Ptr(wchar_t *p) { u_.wp = p; }
+#endif
+Char16Ptr::Char16Ptr(std::nullptr_t p) { u_.cp = p; }
+Char16Ptr::~Char16Ptr() {}
+
+char16_t *Char16Ptr::get() const { return u_.cp; }
+
+#endif
+
+class U_COMMON_API ConstChar16Ptr final {
+public:
+    inline ConstChar16Ptr(const char16_t *p);
+#if !U_CHAR16_IS_TYPEDEF
+    inline ConstChar16Ptr(const uint16_t *p);
+#endif
+#if U_SIZEOF_WCHAR_T==2 || defined(U_IN_DOXYGEN)
+    inline ConstChar16Ptr(const wchar_t *p);
+#endif
+    inline ConstChar16Ptr(const std::nullptr_t p);
+
+    inline ~ConstChar16Ptr();
+
+    inline const char16_t *get() const;
+    inline operator const char16_t *() const { return get(); }
+
+private:
+    ConstChar16Ptr() = delete;
+
+#ifdef U_ALIASING_BARRIER
+    template<typename T> static const char16_t *cast(const T *t) {
+        U_ALIASING_BARRIER(t);
+        return reinterpret_cast<const char16_t *>(t);
+    }
+
+    const char16_t *p_;
+#else
+    union {
+        const char16_t *cp;
+        const uint16_t *up;
+        const wchar_t *wp;
+    } u_;
+#endif
+};
+
+#ifdef U_ALIASING_BARRIER
+
+ConstChar16Ptr::ConstChar16Ptr(const char16_t *p) : p_(p) {}
+#if !U_CHAR16_IS_TYPEDEF
+ConstChar16Ptr::ConstChar16Ptr(const uint16_t *p) : p_(cast(p)) {}
+#endif
+#if U_SIZEOF_WCHAR_T==2
+ConstChar16Ptr::ConstChar16Ptr(const wchar_t *p) : p_(cast(p)) {}
+#endif
+ConstChar16Ptr::ConstChar16Ptr(const std::nullptr_t p) : p_(p) {}
+ConstChar16Ptr::~ConstChar16Ptr() {
+    U_ALIASING_BARRIER(p_);
+}
+
+const char16_t *ConstChar16Ptr::get() const { return p_; }
+
+#else
+
+ConstChar16Ptr::ConstChar16Ptr(const char16_t *p) { u_.cp = p; }
+#if !U_CHAR16_IS_TYPEDEF
+ConstChar16Ptr::ConstChar16Ptr(const uint16_t *p) { u_.up = p; }
+#endif
+#if U_SIZEOF_WCHAR_T==2
+ConstChar16Ptr::ConstChar16Ptr(const wchar_t *p) { u_.wp = p; }
+#endif
+ConstChar16Ptr::ConstChar16Ptr(const std::nullptr_t p) { u_.cp = p; }
+ConstChar16Ptr::~ConstChar16Ptr() {}
+
+const char16_t *ConstChar16Ptr::get() const { return u_.cp; }
+
+#endif
+
+U_NAMESPACE_END
+
+#endif  // U_SHOW_CPLUSPLUS_API
+
+#if U_SHOW_CPLUSPLUS_API || U_SHOW_CPLUSPLUS_HEADER_API
+
+namespace U_ICU_NAMESPACE_OR_INTERNAL {
+
+#ifndef U_FORCE_HIDE_INTERNAL_API
+template<typename T, typename = std::enable_if_t<std::is_same_v<T, UChar>>>
+inline const char16_t *uprv_char16PtrFromUChar(const T *p) {
+    if constexpr (std::is_same_v<UChar, char16_t>) {
+        return p;
+    } else {
+#if U_SHOW_CPLUSPLUS_API
+        return ConstChar16Ptr(p).get();
+#else
+#ifdef U_ALIASING_BARRIER
+        U_ALIASING_BARRIER(p);
+#endif
+        return reinterpret_cast<const char16_t *>(p);
+#endif
+    }
+}
+#if !U_CHAR16_IS_TYPEDEF && (!defined(_LIBCPP_VERSION) || _LIBCPP_VERSION < 180000)
+inline const char16_t *uprv_char16PtrFromUint16(const uint16_t *p) {
+#if U_SHOW_CPLUSPLUS_API
+    return ConstChar16Ptr(p).get();
+#else
+#ifdef U_ALIASING_BARRIER
+    U_ALIASING_BARRIER(p);
+#endif
+    return reinterpret_cast<const char16_t *>(p);
+#endif
+}
+#endif
+#if U_SIZEOF_WCHAR_T==2
+inline const char16_t *uprv_char16PtrFromWchar(const wchar_t *p) {
+#if U_SHOW_CPLUSPLUS_API
+    return ConstChar16Ptr(p).get();
+#else
+#ifdef U_ALIASING_BARRIER
+    U_ALIASING_BARRIER(p);
+#endif
+    return reinterpret_cast<const char16_t *>(p);
+#endif
+}
+#endif
+#endif
+
+inline const UChar *toUCharPtr(const char16_t *p) {
+#ifdef U_ALIASING_BARRIER
+    U_ALIASING_BARRIER(p);
+#endif
+    return reinterpret_cast<const UChar *>(p);
+}
+
+inline UChar *toUCharPtr(char16_t *p) {
+#ifdef U_ALIASING_BARRIER
+    U_ALIASING_BARRIER(p);
+#endif
+    return reinterpret_cast<UChar *>(p);
+}
+
+inline const OldUChar *toOldUCharPtr(const char16_t *p) {
+#ifdef U_ALIASING_BARRIER
+    U_ALIASING_BARRIER(p);
+#endif
+    return reinterpret_cast<const OldUChar *>(p);
+}
+
+inline OldUChar *toOldUCharPtr(char16_t *p) {
+#ifdef U_ALIASING_BARRIER
+    U_ALIASING_BARRIER(p);
+#endif
+    return reinterpret_cast<OldUChar *>(p);
+}
+
+}  
+
+#endif  // U_SHOW_CPLUSPLUS_API || U_SHOW_CPLUSPLUS_HEADER_API
+
+#if U_SHOW_CPLUSPLUS_API
+
+U_NAMESPACE_BEGIN
+
+#ifndef U_FORCE_HIDE_INTERNAL_API
+template<typename T>
+constexpr bool ConvertibleToU16StringView =
+    std::is_convertible_v<T, std::u16string_view>
+#if !U_CHAR16_IS_TYPEDEF && (!defined(_LIBCPP_VERSION) || _LIBCPP_VERSION < 180000)
+    || std::is_convertible_v<T, std::basic_string_view<uint16_t>>
+#endif
+#if U_SIZEOF_WCHAR_T==2
+    || std::is_convertible_v<T, std::wstring_view>
+#endif
+    ;
+
+namespace internal {
+inline std::u16string_view toU16StringView(std::u16string_view sv) { return sv; }
+
+#if !U_CHAR16_IS_TYPEDEF && (!defined(_LIBCPP_VERSION) || _LIBCPP_VERSION < 180000)
+inline std::u16string_view toU16StringView(std::basic_string_view<uint16_t> sv) {
+    return { ConstChar16Ptr(sv.data()), sv.length() };
+}
+#endif
+
+#if U_SIZEOF_WCHAR_T==2
+inline std::u16string_view toU16StringView(std::wstring_view sv) {
+    return { ConstChar16Ptr(sv.data()), sv.length() };
+}
+#endif
+
+template <typename T,
+          typename = typename std::enable_if_t<!std::is_pointer_v<std::remove_reference_t<T>>>>
+inline std::u16string_view toU16StringViewNullable(const T& text) {
+    return toU16StringView(text);
+}
+
+template <typename T,
+          typename = typename std::enable_if_t<std::is_pointer_v<std::remove_reference_t<T>>>,
+          typename = void>
+inline std::u16string_view toU16StringViewNullable(const T& text) {
+    if (text == nullptr) return {};  
+    return toU16StringView(text);
+}
+
+}  
+#endif  // U_FORCE_HIDE_INTERNAL_API
+
+U_NAMESPACE_END
+
+#endif  // U_SHOW_CPLUSPLUS_API
+
+#endif  // __CHAR16PTR_H__

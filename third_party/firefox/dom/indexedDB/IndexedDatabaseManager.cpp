@@ -1,0 +1,774 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "IndexedDatabaseManager.h"
+
+#include "ActorsChild.h"
+#include "DatabaseFileManager.h"
+#include "IDBEvents.h"
+#include "IDBFactory.h"
+#include "IDBKeyRange.h"
+#include "IDBRequest.h"
+#include "IndexedDBCommon.h"
+#include "LoggingHelpers.h"
+#include "ScriptErrorHelper.h"
+#include "chrome/common/ipc_channel.h"  // for IPC::Channel::kMaximumMessageSize
+#include "js/Object.h"                  // JS::GetClass
+#include "js/PropertyAndElement.h"      // JS_DefineProperty
+#include "jsapi.h"
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/ContentEvents.h"
+#include "mozilla/EventDispatcher.h"
+#include "mozilla/Logging.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/dom/DOMException.h"
+#include "mozilla/dom/ErrorEvent.h"
+#include "mozilla/dom/ErrorEventBinding.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/RootedDictionary.h"
+#include "mozilla/dom/WorkerScope.h"
+#include "mozilla/dom/quota/Assertions.h"
+#include "mozilla/dom/quota/PromiseUtils.h"
+#include "mozilla/dom/quota/ResultExtensions.h"
+#include "mozilla/intl/LocaleCanonicalizer.h"
+#include "mozilla/intl/LocaleService.h"
+#include "mozilla/ipc/BackgroundChild.h"
+#include "mozilla/ipc/PBackgroundChild.h"
+#include "nsCharSeparatedTokenizer.h"
+#include "nsContentUtils.h"
+#include "nsIScriptError.h"
+#include "nsIScriptGlobalObject.h"
+
+#include "mozilla/dom/IDBCursorBinding.h"
+#include "mozilla/dom/IDBDatabaseBinding.h"
+#include "mozilla/dom/IDBFactoryBinding.h"
+#include "mozilla/dom/IDBIndexBinding.h"
+#include "mozilla/dom/IDBKeyRangeBinding.h"
+#include "mozilla/dom/IDBObjectStoreBinding.h"
+#include "mozilla/dom/IDBOpenDBRequestBinding.h"
+#include "mozilla/dom/IDBRequestBinding.h"
+#include "mozilla/dom/IDBTransactionBinding.h"
+#include "mozilla/dom/IDBVersionChangeEventBinding.h"
+
+#define IDB_STR "indexedDB"
+
+namespace mozilla::dom {
+namespace indexedDB {
+
+using namespace mozilla::dom::quota;
+using namespace mozilla::ipc;
+
+class FileManagerInfo {
+ public:
+  [[nodiscard]] SafeRefPtr<DatabaseFileManager> GetFileManager(
+      PersistenceType aPersistenceType, const nsAString& aName) const;
+
+  [[nodiscard]] SafeRefPtr<DatabaseFileManager>
+  GetFileManagerByDatabaseFilePath(PersistenceType aPersistenceType,
+                                   const nsAString& aDatabaseFilePath) const;
+
+  const nsTArray<SafeRefPtr<DatabaseFileManager>>& GetFileManagers(
+      PersistenceType aPersistenceType) const;
+
+  void AddFileManager(SafeRefPtr<DatabaseFileManager> aFileManager);
+
+  bool HasFileManagers() const {
+    AssertIsOnIOThread();
+
+    return !mPersistentStorageFileManagers.IsEmpty() ||
+           !mTemporaryStorageFileManagers.IsEmpty() ||
+           !mDefaultStorageFileManagers.IsEmpty() ||
+           !mPrivateStorageFileManagers.IsEmpty();
+  }
+
+  void InvalidateAllFileManagers() const;
+
+  void InvalidateAndRemoveFileManagers(PersistenceType aPersistenceType);
+
+  void InvalidateAndRemoveFileManager(PersistenceType aPersistenceType,
+                                      const nsAString& aName);
+
+ private:
+  nsTArray<SafeRefPtr<DatabaseFileManager>>& GetArray(
+      PersistenceType aPersistenceType);
+
+  const nsTArray<SafeRefPtr<DatabaseFileManager>>& GetImmutableArray(
+      PersistenceType aPersistenceType) const {
+    return const_cast<FileManagerInfo*>(this)->GetArray(aPersistenceType);
+  }
+
+  nsTArray<SafeRefPtr<DatabaseFileManager>> mPersistentStorageFileManagers;
+  nsTArray<SafeRefPtr<DatabaseFileManager>> mTemporaryStorageFileManagers;
+  nsTArray<SafeRefPtr<DatabaseFileManager>> mDefaultStorageFileManagers;
+  nsTArray<SafeRefPtr<DatabaseFileManager>> mPrivateStorageFileManagers;
+};
+
+}  
+
+using namespace mozilla::dom::indexedDB;
+
+namespace {
+
+const int32_t kDefaultDataThresholdBytes = 1024 * 1024;  
+
+const int32_t kDefaultMaxStructuredCloneSize = 1042 * 1024 * 1024;  
+
+const int32_t kDefaultMaxSerializedMsgSize = IPC::Channel::kMaximumMessageSize;
+
+const int32_t kDefaultMaxPreloadExtraRecords = 64;
+
+#define IDB_PREF_BRANCH_ROOT "dom.indexedDB."
+
+const char kDataThresholdPref[] = IDB_PREF_BRANCH_ROOT "dataThreshold";
+const char kPrefMaxStructuredCloneSize[] =
+    IDB_PREF_BRANCH_ROOT "maxStructuredCloneSize";
+const char kPrefMaxSerilizedMsgSize[] =
+    IDB_PREF_BRANCH_ROOT "maxSerializedMsgSize";
+const char kPrefMaxPreloadExtraRecords[] =
+    IDB_PREF_BRANCH_ROOT "maxPreloadExtraRecords";
+
+#define IDB_PREF_LOGGING_BRANCH_ROOT IDB_PREF_BRANCH_ROOT "logging."
+
+const char kPrefLoggingEnabled[] = IDB_PREF_LOGGING_BRANCH_ROOT "enabled";
+const char kPrefLoggingDetails[] = IDB_PREF_LOGGING_BRANCH_ROOT "details";
+
+#undef IDB_PREF_LOGGING_BRANCH_ROOT
+#undef IDB_PREF_BRANCH_ROOT
+
+StaticMutex gDBManagerMutex;
+StaticRefPtr<IndexedDatabaseManager> gDBManager MOZ_GUARDED_BY(gDBManagerMutex);
+bool gInitialized MOZ_GUARDED_BY(gDBManagerMutex) = false;
+bool gClosed MOZ_GUARDED_BY(gDBManagerMutex) = false;
+
+Atomic<int32_t> gDataThresholdBytes(0);
+Atomic<int32_t> gMaxStructuredCloneSize(0);
+Atomic<int32_t> gMaxSerializedMsgSize(0);
+Atomic<int32_t> gMaxPreloadExtraRecords(0);
+
+void DataThresholdPrefChangedCallback(const char* aPrefName, void* aClosure) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(!strcmp(aPrefName, kDataThresholdPref));
+  MOZ_ASSERT(!aClosure);
+
+  int32_t dataThresholdBytes =
+      Preferences::GetInt(aPrefName, kDefaultDataThresholdBytes);
+
+  if (dataThresholdBytes == -1) {
+    dataThresholdBytes = INT32_MAX;
+  }
+
+  gDataThresholdBytes = dataThresholdBytes;
+}
+
+void MaxStructuredCloneSizePrefChangeCallback(const char* aPrefName,
+                                              void* aClosure) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(!strcmp(aPrefName, kPrefMaxStructuredCloneSize));
+  MOZ_ASSERT(!aClosure);
+
+  gMaxStructuredCloneSize =
+      Preferences::GetInt(aPrefName, kDefaultMaxStructuredCloneSize);
+  MOZ_ASSERT(gMaxStructuredCloneSize > 0);
+}
+
+void MaxSerializedMsgSizePrefChangeCallback(const char* aPrefName,
+                                            void* aClosure) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(!strcmp(aPrefName, kPrefMaxSerilizedMsgSize));
+  MOZ_ASSERT(!aClosure);
+
+  gMaxSerializedMsgSize =
+      Preferences::GetInt(aPrefName, kDefaultMaxSerializedMsgSize);
+  MOZ_ASSERT(gMaxSerializedMsgSize > 0);
+}
+
+void MaxPreloadExtraRecordsPrefChangeCallback(const char* aPrefName,
+                                              void* aClosure) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(!strcmp(aPrefName, kPrefMaxPreloadExtraRecords));
+  MOZ_ASSERT(!aClosure);
+
+  gMaxPreloadExtraRecords =
+      Preferences::GetInt(aPrefName, kDefaultMaxPreloadExtraRecords);
+  MOZ_ASSERT(gMaxPreloadExtraRecords >= 0);
+
+}
+
+auto DatabaseNameMatchPredicate(const nsAString* const aName) {
+  MOZ_ASSERT(aName);
+  return [aName](const auto& fileManager) {
+    return fileManager->DatabaseName() == *aName;
+  };
+}
+
+auto DatabaseFilePathMatchPredicate(const nsAString* const aDatabaseFilePath) {
+  MOZ_ASSERT(aDatabaseFilePath);
+  return [aDatabaseFilePath](const auto& fileManager) {
+    return fileManager->DatabaseFilePath() == *aDatabaseFilePath;
+  };
+}
+
+}  
+
+IndexedDatabaseManager::IndexedDatabaseManager()
+    : mLocaleInitialized(false), mBackgroundActor(nullptr) {
+  NS_ASSERTION(NS_IsMainThread(), "Wrong thread!");
+}
+
+IndexedDatabaseManager::~IndexedDatabaseManager() {
+  NS_ASSERTION(NS_IsMainThread(), "Wrong thread!");
+
+  if (mBackgroundActor) {
+    mBackgroundActor->SendDeleteMeInternal();
+    MOZ_ASSERT(!mBackgroundActor, "SendDeleteMeInternal should have cleared!");
+  }
+}
+
+bool IndexedDatabaseManager::sIsMainProcess = false;
+bool IndexedDatabaseManager::sFullSynchronousMode = false;
+
+mozilla::LazyLogModule IndexedDatabaseManager::sLoggingModule("IndexedDB");
+
+Atomic<IndexedDatabaseManager::LoggingMode>
+    IndexedDatabaseManager::sLoggingMode(
+        IndexedDatabaseManager::Logging_Disabled);
+
+IndexedDatabaseManager* IndexedDatabaseManager::GetOrCreate() {
+  NS_ASSERTION(NS_IsMainThread(), "Wrong thread!");
+
+  StaticMutexAutoLock lock(gDBManagerMutex);
+
+  if (gClosed) {
+    NS_ERROR("Calling GetOrCreate() after shutdown!");
+    return nullptr;
+  }
+
+  if (!gDBManager) {
+    sIsMainProcess = XRE_IsParentProcess();
+
+    if (gInitialized) {
+      NS_ERROR("Initialized more than once?!");
+    }
+
+    RefPtr<IndexedDatabaseManager> instance(new IndexedDatabaseManager());
+
+    {
+      StaticMutexAutoUnlock unlock(gDBManagerMutex);
+
+      QM_TRY(MOZ_TO_RESULT(instance->Init()), nullptr);
+    }
+
+    gDBManager = instance;
+
+    ClearOnShutdown(&gDBManager);
+
+    gInitialized = true;
+  }
+
+  return gDBManager;
+}
+
+IndexedDatabaseManager* IndexedDatabaseManager::Get() {
+  StaticMutexAutoLock lock(gDBManagerMutex);
+
+  return gDBManager;
+}
+
+already_AddRefed<IndexedDatabaseManager>
+IndexedDatabaseManager::FactoryCreate() {
+  RefPtr<IndexedDatabaseManager> indexedDatabaseManager = GetOrCreate();
+  return indexedDatabaseManager.forget();
+}
+
+nsresult IndexedDatabaseManager::Init() {
+  NS_ASSERTION(NS_IsMainThread(), "Wrong thread!");
+
+  sFullSynchronousMode = Preferences::GetBool("dom.indexedDB.fullSynchronous");
+
+  Preferences::RegisterCallback(LoggingModePrefChangedCallback,
+                                kPrefLoggingDetails);
+
+  Preferences::RegisterCallbackAndCall(LoggingModePrefChangedCallback,
+                                       kPrefLoggingEnabled);
+
+  Preferences::RegisterCallbackAndCall(DataThresholdPrefChangedCallback,
+                                       kDataThresholdPref);
+
+  Preferences::RegisterCallbackAndCall(MaxStructuredCloneSizePrefChangeCallback,
+                                       kPrefMaxStructuredCloneSize);
+
+  Preferences::RegisterCallbackAndCall(MaxSerializedMsgSizePrefChangeCallback,
+                                       kPrefMaxSerilizedMsgSize);
+
+  Preferences::RegisterCallbackAndCall(MaxPreloadExtraRecordsPrefChangeCallback,
+                                       kPrefMaxPreloadExtraRecords);
+
+  return NS_OK;
+}
+
+void IndexedDatabaseManager::Destroy() {
+  {
+    StaticMutexAutoLock lock(gDBManagerMutex);
+
+    if (gInitialized && gClosed) {
+      NS_ERROR("Shutdown more than once?!");
+    }
+
+    gClosed = true;
+  }
+
+  Preferences::UnregisterCallback(LoggingModePrefChangedCallback,
+                                  kPrefLoggingDetails);
+
+  Preferences::UnregisterCallback(LoggingModePrefChangedCallback,
+                                  kPrefLoggingEnabled);
+
+  Preferences::UnregisterCallback(DataThresholdPrefChangedCallback,
+                                  kDataThresholdPref);
+
+  Preferences::UnregisterCallback(MaxStructuredCloneSizePrefChangeCallback,
+                                  kPrefMaxStructuredCloneSize);
+
+  Preferences::UnregisterCallback(MaxSerializedMsgSizePrefChangeCallback,
+                                  kPrefMaxSerilizedMsgSize);
+
+  delete this;
+}
+
+nsresult IndexedDatabaseManager::EnsureBackgroundActor() {
+  if (mBackgroundActor) {
+    return NS_OK;
+  }
+
+  PBackgroundChild* bgActor = BackgroundChild::GetForCurrentThread();
+  if (NS_WARN_IF(!bgActor)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  {
+    BackgroundUtilsChild* actor = new BackgroundUtilsChild(this);
+
+    mBackgroundActor = static_cast<BackgroundUtilsChild*>(
+        bgActor->SendPBackgroundIndexedDBUtilsConstructor(actor));
+
+    if (NS_WARN_IF(!mBackgroundActor)) {
+      return NS_ERROR_FAILURE;
+    }
+  }
+
+  return NS_OK;
+}
+
+bool IndexedDatabaseManager::ResolveSandboxBinding(JSContext* aCx) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(
+      JS::GetClass(JS::CurrentGlobalOrNull(aCx))->flags & JSCLASS_DOM_GLOBAL,
+      "Passed object is not a global object!");
+
+  if (NS_WARN_IF(!GetOrCreate())) {
+    return false;
+  }
+
+  if (!IDBCursor_Binding::CreateAndDefineOnGlobal(aCx) ||
+      !IDBCursorWithValue_Binding::CreateAndDefineOnGlobal(aCx) ||
+      !IDBDatabase_Binding::CreateAndDefineOnGlobal(aCx) ||
+      !IDBFactory_Binding::CreateAndDefineOnGlobal(aCx) ||
+      !IDBIndex_Binding::CreateAndDefineOnGlobal(aCx) ||
+      !IDBKeyRange_Binding::CreateAndDefineOnGlobal(aCx) ||
+      !IDBObjectStore_Binding::CreateAndDefineOnGlobal(aCx) ||
+      !IDBOpenDBRequest_Binding::CreateAndDefineOnGlobal(aCx) ||
+      !IDBRequest_Binding::CreateAndDefineOnGlobal(aCx) ||
+      !IDBTransaction_Binding::CreateAndDefineOnGlobal(aCx) ||
+      !IDBVersionChangeEvent_Binding::CreateAndDefineOnGlobal(aCx)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool IndexedDatabaseManager::DefineIndexedDB(JSContext* aCx,
+                                             JS::Handle<JSObject*> aGlobal) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(JS::GetClass(aGlobal)->flags & JSCLASS_DOM_GLOBAL,
+             "Passed object is not a global object!");
+
+  nsIGlobalObject* global = xpc::CurrentNativeGlobal(aCx);
+  if (NS_WARN_IF(!global)) {
+    return false;
+  }
+
+  QM_TRY_UNWRAP(auto factory, IDBFactory::CreateForMainThreadJS(global), false);
+
+  MOZ_ASSERT(factory, "This should never fail for chrome!");
+
+  JS::Rooted<JS::Value> indexedDB(aCx);
+  js::AssertSameCompartment(aCx, aGlobal);
+  if (!GetOrCreateDOMReflector(aCx, factory, &indexedDB)) {
+    return false;
+  }
+
+  return JS_DefineProperty(aCx, aGlobal, IDB_STR, indexedDB, JSPROP_ENUMERATE);
+}
+
+bool IndexedDatabaseManager::IsClosed() {
+  StaticMutexAutoLock lock(gDBManagerMutex);
+
+  return gClosed;
+}
+
+#ifdef DEBUG
+bool IndexedDatabaseManager::IsMainProcess() {
+  NS_ASSERTION(Get(),
+               "IsMainProcess() called before indexedDB has been initialized!");
+  NS_ASSERTION((XRE_IsParentProcess()) == sIsMainProcess,
+               "XRE_GetProcessType changed its tune!");
+  return sIsMainProcess;
+}
+
+IndexedDatabaseManager::LoggingMode IndexedDatabaseManager::GetLoggingMode() {
+  MOZ_ASSERT(Get(),
+             "GetLoggingMode called before IndexedDatabaseManager has been "
+             "initialized!");
+
+  return sLoggingMode;
+}
+
+mozilla::LogModule* IndexedDatabaseManager::GetLoggingModule() {
+  MOZ_ASSERT(Get(),
+             "GetLoggingModule called before IndexedDatabaseManager has been "
+             "initialized!");
+
+  return sLoggingModule;
+}
+
+#endif  // DEBUG
+
+bool IndexedDatabaseManager::FullSynchronous() {
+  MOZ_ASSERT(Get(),
+             "FullSynchronous() called before indexedDB has been initialized!");
+
+  return sFullSynchronousMode;
+}
+
+uint32_t IndexedDatabaseManager::DataThreshold() {
+  MOZ_ASSERT(Get(),
+             "DataThreshold() called before indexedDB has been initialized!");
+
+  return gDataThresholdBytes;
+}
+
+uint32_t IndexedDatabaseManager::MaxStructuredCloneSize() {
+  MOZ_ASSERT(
+      Get(),
+      "MaxStructuredCloneSize() called before indexedDB has been initialized!");
+  MOZ_ASSERT(gMaxStructuredCloneSize > 0);
+
+  return gMaxStructuredCloneSize;
+}
+
+uint32_t IndexedDatabaseManager::MaxSerializedMsgSize() {
+  MOZ_ASSERT(
+      Get(),
+      "MaxSerializedMsgSize() called before indexedDB has been initialized!");
+  MOZ_ASSERT(gMaxSerializedMsgSize > 0);
+
+  return gMaxSerializedMsgSize;
+}
+
+int32_t IndexedDatabaseManager::MaxPreloadExtraRecords() {
+  MOZ_ASSERT(Get(),
+             "MaxPreloadExtraRecords() called before indexedDB has been "
+             "initialized!");
+
+  return gMaxPreloadExtraRecords;
+}
+
+void IndexedDatabaseManager::ClearBackgroundActor() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  mBackgroundActor = nullptr;
+}
+
+SafeRefPtr<DatabaseFileManager> IndexedDatabaseManager::GetFileManager(
+    PersistenceType aPersistenceType, const nsACString& aOrigin,
+    const nsAString& aDatabaseName) {
+  AssertIsOnIOThread();
+
+  FileManagerInfo* info;
+  if (!mFileManagerInfos.Get(aOrigin, &info)) {
+    return nullptr;
+  }
+
+  return info->GetFileManager(aPersistenceType, aDatabaseName);
+}
+
+SafeRefPtr<DatabaseFileManager>
+IndexedDatabaseManager::GetFileManagerByDatabaseFilePath(
+    PersistenceType aPersistenceType, const nsACString& aOrigin,
+    const nsAString& aDatabaseFilePath) {
+  AssertIsOnIOThread();
+
+  FileManagerInfo* info;
+  if (!mFileManagerInfos.Get(aOrigin, &info)) {
+    return nullptr;
+  }
+
+  return info->GetFileManagerByDatabaseFilePath(aPersistenceType,
+                                                aDatabaseFilePath);
+}
+
+const nsTArray<SafeRefPtr<DatabaseFileManager>>&
+IndexedDatabaseManager::GetFileManagers(PersistenceType aPersistenceType,
+                                        const nsACString& aOrigin) {
+  AssertIsOnIOThread();
+
+  FileManagerInfo* info;
+  if (!mFileManagerInfos.Get(aOrigin, &info)) {
+    static nsTArray<SafeRefPtr<DatabaseFileManager>> emptyArray;
+    return emptyArray;
+  }
+
+  return info->GetFileManagers(aPersistenceType);
+}
+
+void IndexedDatabaseManager::AddFileManager(
+    SafeRefPtr<DatabaseFileManager> aFileManager) {
+  AssertIsOnIOThread();
+  MOZ_ASSERT(aFileManager);
+
+  const auto& origin = aFileManager->Origin();
+  mFileManagerInfos.GetOrInsertNew(origin)->AddFileManager(
+      std::move(aFileManager));
+}
+
+void IndexedDatabaseManager::InvalidateAllFileManagers() {
+  AssertIsOnIOThread();
+
+  for (const auto& fileManagerInfo : mFileManagerInfos.Values()) {
+    fileManagerInfo->InvalidateAllFileManagers();
+  }
+
+  mFileManagerInfos.Clear();
+}
+
+void IndexedDatabaseManager::InvalidateFileManagers(
+    PersistenceType aPersistenceType) {
+  AssertIsOnIOThread();
+
+  for (auto iter = mFileManagerInfos.Iter(); !iter.Done(); iter.Next()) {
+    iter.Data()->InvalidateAndRemoveFileManagers(aPersistenceType);
+
+    if (!iter.Data()->HasFileManagers()) {
+      iter.Remove();
+    }
+  }
+}
+
+void IndexedDatabaseManager::InvalidateFileManagers(
+    PersistenceType aPersistenceType, const nsACString& aOrigin) {
+  AssertIsOnIOThread();
+  MOZ_ASSERT(!aOrigin.IsEmpty());
+
+  FileManagerInfo* info;
+  if (!mFileManagerInfos.Get(aOrigin, &info)) {
+    return;
+  }
+
+  info->InvalidateAndRemoveFileManagers(aPersistenceType);
+
+  if (!info->HasFileManagers()) {
+    mFileManagerInfos.Remove(aOrigin);
+  }
+}
+
+void IndexedDatabaseManager::InvalidateFileManager(
+    PersistenceType aPersistenceType, const nsACString& aOrigin,
+    const nsAString& aDatabaseName) {
+  AssertIsOnIOThread();
+
+  FileManagerInfo* info;
+  if (!mFileManagerInfos.Get(aOrigin, &info)) {
+    return;
+  }
+
+  info->InvalidateAndRemoveFileManager(aPersistenceType, aDatabaseName);
+
+  if (!info->HasFileManagers()) {
+    mFileManagerInfos.Remove(aOrigin);
+  }
+}
+
+NS_IMPL_ADDREF(IndexedDatabaseManager)
+NS_IMPL_RELEASE_WITH_DESTROY(IndexedDatabaseManager, Destroy())
+NS_IMPL_QUERY_INTERFACE(IndexedDatabaseManager, nsIIndexedDatabaseManager)
+
+void IndexedDatabaseManager::LoggingModePrefChangedCallback(
+    const char* , void* ) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (!Preferences::GetBool(kPrefLoggingEnabled)) {
+    sLoggingMode = Logging_Disabled;
+    return;
+  }
+
+  const bool logDetails = Preferences::GetBool(kPrefLoggingDetails);
+  sLoggingMode = logDetails ? Logging_Detailed : Logging_Concise;
+}
+
+nsresult IndexedDatabaseManager::EnsureLocale() {
+  AssertIsOnMainThread();
+
+  if (mLocaleInitialized) {
+    return NS_OK;
+  }
+
+  nsAutoCString acceptLang;
+  intl::LocaleService::GetInstance()->GetAcceptLanguages(acceptLang);
+
+  for (const auto& lang :
+       nsCCharSeparatedTokenizer(acceptLang, ',').ToRange()) {
+    mozilla::intl::LocaleCanonicalizer::Vector asciiString{};
+    auto result = mozilla::intl::LocaleCanonicalizer::CanonicalizeICULevel1(
+        PromiseFlatCString(lang).get(), asciiString);
+    if (result.isOk()) {
+      mLocale.AssignASCII(asciiString);
+      break;
+    }
+  }
+
+  if (mLocale.IsEmpty()) {
+    mLocale.AssignLiteral("en_US");
+  }
+
+  mLocaleInitialized = true;
+
+  return NS_OK;
+}
+
+const nsCString& IndexedDatabaseManager::GetLocale() {
+  IndexedDatabaseManager* idbManager = Get();
+  MOZ_ASSERT(idbManager, "IDBManager is not ready!");
+
+  MOZ_ASSERT(!idbManager->mLocale.IsEmpty());
+  return idbManager->mLocale;
+}
+
+SafeRefPtr<DatabaseFileManager> FileManagerInfo::GetFileManager(
+    PersistenceType aPersistenceType, const nsAString& aName) const {
+  AssertIsOnIOThread();
+
+  const auto& managers = GetImmutableArray(aPersistenceType);
+
+  const auto end = managers.cend();
+  const auto foundIt =
+      std::find_if(managers.cbegin(), end, DatabaseNameMatchPredicate(&aName));
+
+  return foundIt != end ? foundIt->clonePtr() : nullptr;
+}
+
+SafeRefPtr<DatabaseFileManager>
+FileManagerInfo::GetFileManagerByDatabaseFilePath(
+    PersistenceType aPersistenceType,
+    const nsAString& aDatabaseFilePath) const {
+  AssertIsOnIOThread();
+
+  const auto& managers = GetImmutableArray(aPersistenceType);
+
+  const auto end = managers.cend();
+  const auto foundIt =
+      std::find_if(managers.cbegin(), end,
+                   DatabaseFilePathMatchPredicate(&aDatabaseFilePath));
+
+  return foundIt != end ? foundIt->clonePtr() : nullptr;
+}
+
+const nsTArray<SafeRefPtr<DatabaseFileManager>>&
+FileManagerInfo::GetFileManagers(PersistenceType aPersistenceType) const {
+  AssertIsOnIOThread();
+
+  return GetImmutableArray(aPersistenceType);
+}
+
+void FileManagerInfo::AddFileManager(
+    SafeRefPtr<DatabaseFileManager> aFileManager) {
+  AssertIsOnIOThread();
+
+  nsTArray<SafeRefPtr<DatabaseFileManager>>& managers =
+      GetArray(aFileManager->Type());
+
+  NS_ASSERTION(!managers.Contains(aFileManager), "Adding more than once?!");
+
+  managers.AppendElement(std::move(aFileManager));
+}
+
+void FileManagerInfo::InvalidateAllFileManagers() const {
+  AssertIsOnIOThread();
+
+  uint32_t i;
+
+  for (i = 0; i < mPersistentStorageFileManagers.Length(); i++) {
+    mPersistentStorageFileManagers[i]->Invalidate();
+  }
+
+  for (i = 0; i < mTemporaryStorageFileManagers.Length(); i++) {
+    mTemporaryStorageFileManagers[i]->Invalidate();
+  }
+
+  for (i = 0; i < mDefaultStorageFileManagers.Length(); i++) {
+    mDefaultStorageFileManagers[i]->Invalidate();
+  }
+
+  for (i = 0; i < mPrivateStorageFileManagers.Length(); i++) {
+    mPrivateStorageFileManagers[i]->Invalidate();
+  }
+}
+
+void FileManagerInfo::InvalidateAndRemoveFileManagers(
+    PersistenceType aPersistenceType) {
+  AssertIsOnIOThread();
+
+  nsTArray<SafeRefPtr<DatabaseFileManager>>& managers =
+      GetArray(aPersistenceType);
+
+  for (uint32_t i = 0; i < managers.Length(); i++) {
+    managers[i]->Invalidate();
+  }
+
+  managers.Clear();
+}
+
+void FileManagerInfo::InvalidateAndRemoveFileManager(
+    PersistenceType aPersistenceType, const nsAString& aName) {
+  AssertIsOnIOThread();
+
+  auto& managers = GetArray(aPersistenceType);
+  const auto end = managers.cend();
+  const auto foundIt =
+      std::find_if(managers.cbegin(), end, DatabaseNameMatchPredicate(&aName));
+
+  if (foundIt != end) {
+    (*foundIt)->Invalidate();
+    managers.RemoveElementAt(foundIt.GetIndex());
+  }
+}
+
+nsTArray<SafeRefPtr<DatabaseFileManager>>& FileManagerInfo::GetArray(
+    PersistenceType aPersistenceType) {
+  switch (aPersistenceType) {
+    case PERSISTENCE_TYPE_PERSISTENT:
+      return mPersistentStorageFileManagers;
+    case PERSISTENCE_TYPE_TEMPORARY:
+      return mTemporaryStorageFileManagers;
+    case PERSISTENCE_TYPE_DEFAULT:
+      return mDefaultStorageFileManagers;
+    case PERSISTENCE_TYPE_PRIVATE:
+      return mPrivateStorageFileManagers;
+
+    case PERSISTENCE_TYPE_INVALID:
+    default:
+      MOZ_CRASH("Bad storage type value!");
+  }
+}
+
+}  

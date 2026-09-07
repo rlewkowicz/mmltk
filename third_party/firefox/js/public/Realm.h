@@ -1,0 +1,118 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef js_Realm_h
+#define js_Realm_h
+
+#include "js/shadow/Realm.h"  // JS::shadow::Realm
+
+#include "js/GCPolicyAPI.h"
+#include "js/TypeDecls.h"  // forward-declaration of JS::Realm
+
+
+
+namespace js {
+namespace gc {
+JS_PUBLIC_API void TraceRealmRoot(JSTracer* trc, JS::Realm* realm,
+                                  const char* name);
+}  
+}  
+
+namespace JS {
+class JS_PUBLIC_API AutoRequireNoGC;
+
+template <>
+struct GCPolicy<Realm*> : public NonGCPointerPolicy<Realm*> {
+  static void trace(JSTracer* trc, Realm** vp, const char* name) {
+    if (*vp) {
+      ::js::gc::TraceRealmRoot(trc, *vp, name);
+    }
+  }
+};
+
+extern JS_PUBLIC_API Realm* GetCurrentRealmOrNull(JSContext* cx);
+
+inline JS::Compartment* GetCompartmentForRealm(Realm* realm) {
+  return shadow::Realm::get(realm)->compartment();
+}
+
+extern JS_PUBLIC_API Realm* GetObjectRealmOrNull(JSObject* obj);
+
+extern JS_PUBLIC_API bool HasRealmInitializedGlobal(Realm* realm);
+
+extern JS_PUBLIC_API void* GetRealmPrivate(Realm* realm);
+
+extern JS_PUBLIC_API void SetRealmPrivate(Realm* realm, void* data);
+
+typedef void (*DestroyRealmCallback)(JS::GCContext* gcx, Realm* realm);
+
+extern JS_PUBLIC_API void SetDestroyRealmCallback(
+    JSContext* cx, DestroyRealmCallback callback);
+
+using RealmNameCallback = void (*)(JSContext* cx, Realm* realm, char* buf,
+                                   size_t bufsize,
+                                   const JS::AutoRequireNoGC& nogc);
+
+extern JS_PUBLIC_API void SetRealmNameCallback(JSContext* cx,
+                                               RealmNameCallback callback);
+
+extern JS_PUBLIC_API JSObject* GetRealmGlobalOrNull(Realm* realm);
+
+extern JS_PUBLIC_API bool InitRealmStandardClasses(JSContext* cx);
+
+extern JS_PUBLIC_API bool MaybeFreezeCtorAndPrototype(JSContext* cx,
+                                                      HandleObject ctor,
+                                                      HandleObject maybeProto);
+
+
+extern JS_PUBLIC_API JSObject* GetRealmObjectPrototype(JSContext* cx);
+extern JS_PUBLIC_API JS::Handle<JSObject*> GetRealmObjectPrototypeHandle(
+    JSContext* cx);
+
+extern JS_PUBLIC_API JSObject* GetRealmFunctionPrototype(JSContext* cx);
+extern JS_PUBLIC_API JS::Handle<JSObject*> GetRealmFunctionPrototypeHandle(
+    JSContext* cx);
+
+extern JS_PUBLIC_API JSObject* GetRealmArrayPrototype(JSContext* cx);
+
+extern JS_PUBLIC_API JSObject* GetRealmErrorPrototype(JSContext* cx);
+
+extern JS_PUBLIC_API JSObject* GetRealmIteratorPrototype(JSContext* cx);
+
+extern JS_PUBLIC_API JSObject* GetRealmAsyncIteratorPrototype(JSContext* cx);
+
+extern JS_PUBLIC_API JSObject* GetRealmKeyObject(JSContext* cx);
+
+extern JS_PUBLIC_API Realm* GetFunctionRealm(JSContext* cx,
+                                             HandleObject objArg);
+
+extern JS_PUBLIC_API JS::Realm* EnterRealm(JSContext* cx, JSObject* target);
+
+extern JS_PUBLIC_API void LeaveRealm(JSContext* cx, JS::Realm* oldRealm);
+
+extern JS_PUBLIC_API void ResetRealmMathRandomSeed(JSContext* cx);
+
+}  
+
+
+class MOZ_RAII JS_PUBLIC_API JSAutoRealm {
+  JSContext* cx_;
+  JS::Realm* oldRealm_;
+
+ public:
+  JSAutoRealm(JSContext* cx, JSObject* target);
+  JSAutoRealm(JSContext* cx, JSScript* target);
+  ~JSAutoRealm();
+};
+
+class MOZ_RAII JS_PUBLIC_API JSAutoNullableRealm {
+  JSContext* cx_;
+  JS::Realm* oldRealm_;
+
+ public:
+  explicit JSAutoNullableRealm(JSContext* cx, JSObject* targetOrNull);
+  ~JSAutoNullableRealm();
+};
+
+#endif  // js_Realm_h

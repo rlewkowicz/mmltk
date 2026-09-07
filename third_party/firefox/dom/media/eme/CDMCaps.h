@@ -1,0 +1,70 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef CDMCaps_h_
+#define CDMCaps_h_
+
+#include "SamplesWaitingForKey.h"
+#include "mozilla/Monitor.h"
+#include "mozilla/dom/BindingDeclarations.h"       // For Optional
+#include "mozilla/dom/MediaKeyStatusMapBinding.h"  // For MediaKeyStatus
+#include "nsString.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+
+class CDMCaps {
+ public:
+  CDMCaps();
+  ~CDMCaps();
+
+  struct KeyStatus {
+    KeyStatus(const CencKeyId& aId, const nsString& aSessionId,
+              dom::MediaKeyStatus aStatus)
+        : mId(aId.Clone()), mSessionId(aSessionId), mStatus(aStatus) {}
+    KeyStatus(const KeyStatus& aOther)
+        : mId(aOther.mId.Clone()),
+          mSessionId(aOther.mSessionId),
+          mStatus(aOther.mStatus) {}
+    bool operator==(const KeyStatus& aOther) const {
+      return mId == aOther.mId && mSessionId == aOther.mSessionId;
+    };
+
+    CencKeyId mId;
+    nsString mSessionId;
+    dom::MediaKeyStatus mStatus;
+  };
+
+  bool IsKeyUsable(const CencKeyId& aKeyId);
+
+  bool SetKeyStatus(const CencKeyId& aKeyId, const nsString& aSessionId,
+                    const dom::Optional<dom::MediaKeyStatus>& aStatus);
+
+  void GetKeyStatusesForSession(const nsAString& aSessionId,
+                                nsTArray<KeyStatus>& aOutKeyStatuses);
+
+  bool RemoveKeysForSession(const nsString& aSessionId);
+
+  void NotifyWhenKeyIdUsable(const CencKeyId& aKey,
+                             SamplesWaitingForKey* aSamplesWaiting);
+
+ private:
+  struct WaitForKeys {
+    WaitForKeys(const CencKeyId& aKeyId, SamplesWaitingForKey* aListener)
+        : mKeyId(aKeyId.Clone()), mListener(aListener) {}
+    CencKeyId mKeyId;
+    RefPtr<SamplesWaitingForKey> mListener;
+  };
+
+  nsTArray<KeyStatus> mKeyStatuses;
+
+  nsTArray<WaitForKeys> mWaitForKeys;
+
+  CDMCaps(const CDMCaps&) = delete;
+  CDMCaps& operator=(const CDMCaps&) = delete;
+};
+
+}  
+
+#endif

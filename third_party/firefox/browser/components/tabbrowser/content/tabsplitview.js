@@ -1,0 +1,360 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+"use strict";
+
+{
+  ChromeUtils.defineESModuleGetters(this, {
+    DeferredTask: "resource://gre/modules/DeferredTask.sys.mjs",
+  });
+
+  const updateUrlbarButton = new DeferredTask(() => {
+    const { activeSplitView, selectedTab } = gBrowser;
+    const button = document.getElementById("split-view-button");
+    if (activeSplitView) {
+      const activeIndex = activeSplitView.tabs.indexOf(selectedTab);
+      button.hidden = false;
+      button.setAttribute("data-active-index", activeIndex);
+    } else {
+      button.hidden = true;
+      button.removeAttribute("data-active-index");
+    }
+  }, 0);
+
+  class MozTabSplitViewWrapper extends MozXULElement {
+    #tabChangeObserver;
+
+    #tabs = [];
+
+    #isClosing = false;
+
+    #isUnsplitting = false;
+
+    #shouldMoveAllTabsAtOnce = true;
+
+    #storedPanelWidths = new WeakMap();
+
+    get hasActiveTab() {
+      return this.hasAttribute("hasactivetab");
+    }
+
+    get shouldMoveAllTabsAtOnce() {
+      return this.#shouldMoveAllTabsAtOnce;
+    }
+
+    get group() {
+      return gBrowser.isTabGroup(this.parentElement)
+        ? this.parentElement
+        : null;
+    }
+
+    get state() {
+      return {
+        id: this.splitViewId,
+        numberOfTabs: this.tabs.length,
+      };
+    }
+
+    set hasActiveTab(val) {
+      this.toggleAttribute("hasactivetab", val);
+    }
+
+    get multiselected() {
+      return this.hasAttribute("multiselected");
+    }
+
+    constructor() {
+      super();
+      XPCOMUtils.defineLazyPreferenceGetter(
+        this,
+        "_hasUsedSplitView",
+        "browser.tabs.splitview.hasUsed",
+        false
+      );
+    }
+
+    connectedCallback() {
+      this.documentGlobal.addEventListener("TabSelect", this);
+
+      this.#observeTabChanges();
+      this.#restorePanelWidths();
+
+      if (this.hasActiveTab) {
+        this.#activate();
+      }
+
+      if (this._initialized) {
+        return;
+      }
+
+      if (!this._hasUsedSplitView) {
+        Services.prefs.setBoolPref("browser.tabs.splitview.hasUsed", true);
+      }
+
+      this._initialized = true;
+
+      this.textContent = "";
+
+      this.container = gBrowser.tabContainer;
+    }
+
+    disconnectedCallback() {
+      this.#tabChangeObserver?.disconnect();
+      this.documentGlobal.removeEventListener("TabSelect", this);
+      this.#deactivate();
+      this.#resetPanelWidths();
+      this.container.dispatchEvent(
+        new CustomEvent("SplitViewRemoved", {
+          bubbles: true,
+          composed: true,
+        })
+      );
+    }
+
+    #observeTabChanges() {
+      if (!this.#tabChangeObserver) {
+        this.#tabChangeObserver = new window.MutationObserver(mutations => {
+          if (this.tabs.length) {
+            this.hasActiveTab = this.tabs.some(tab => tab.selected);
+            this.tabs.forEach((tab, index) => {
+              tab.setAttribute("aria-posinset", index + 1);
+              tab.setAttribute("aria-setsize", this.tabs.length);
+              tab.updateSplitViewAriaLabel(index);
+            });
+            this.dispatchEvent(
+              new CustomEvent("SplitViewTabChange", {
+                bubbles: true,
+              })
+            );
+          } else {
+            this.remove();
+          }
+
+          if (
+            this.tabs.length == 1 &&
+            mutations.length &&
+            mutations[0].removedNodes.length == 1
+          ) {
+            this.unsplitTabs("tab_close");
+          }
+        });
+      }
+      this.#tabChangeObserver.observe(this, {
+        childList: true,
+      });
+    }
+
+    get splitViewId() {
+      return parseInt(this.getAttribute("splitViewId"));
+    }
+
+    set splitViewId(val) {
+      this.setAttribute("splitViewId", val);
+    }
+
+    get tabs() {
+      return Array.from(this.children).filter(node => node.matches("tab"));
+    }
+
+    get visible() {
+      return this.tabs.every(tab => tab.visible);
+    }
+
+    get pinned() {
+      return false;
+    }
+
+    get panels() {
+      const panels = [];
+      for (const { linkedPanel } of this.#tabs) {
+        const el = document.getElementById(linkedPanel);
+        if (el) {
+          panels.push(el);
+        }
+      }
+      return panels;
+    }
+
+    #activate() {
+      updateUrlbarButton.arm();
+      gBrowser.showSplitViewPanels(this.#tabs);
+      this.container.dispatchEvent(
+        new CustomEvent("TabSplitViewActivate", {
+          detail: { tabs: this.#tabs, splitview: this },
+          bubbles: true,
+        })
+      );
+    }
+
+    #deactivate() {
+      gBrowser.tabpanels.removeTabsFromSplitview(
+        this.#tabs.filter(tab => !tab.splitview || tab.splitview === this)
+      );
+      updateUrlbarButton.arm();
+      this.container.dispatchEvent(
+        new CustomEvent("TabSplitViewDeactivate", {
+          detail: { tabs: this.#tabs, splitview: this },
+          bubbles: true,
+        })
+      );
+    }
+
+    #suspend() {
+      gBrowser.tabpanels.suspendSplitViewPanels(
+        this.#tabs.filter(tab => !tab.splitview || tab.splitview === this)
+      );
+      updateUrlbarButton.arm();
+      this.container.dispatchEvent(
+        new CustomEvent("TabSplitViewDeactivate", {
+          detail: { tabs: this.#tabs, splitview: this },
+          bubbles: true,
+        })
+      );
+    }
+
+    #resetPanelWidths() {
+      for (const panel of this.panels) {
+        const width = panel.getAttribute("width");
+        if (width) {
+          this.#storedPanelWidths.set(panel, width);
+          panel.removeAttribute("width");
+          panel.style.removeProperty("width");
+        }
+      }
+    }
+
+    #restorePanelWidths() {
+      for (const panel of this.panels) {
+        const width = this.#storedPanelWidths.get(panel);
+        if (width) {
+          panel.setAttribute("width", width);
+          panel.style.setProperty("width", width + "px");
+        }
+      }
+    }
+
+    resetRightPanelWidth() {
+      const panel = this.panels[1];
+      this.#storedPanelWidths.delete(panel);
+      panel.removeAttribute("width");
+      panel.style.removeProperty("width");
+    }
+
+    addTabs(tabs, { isSessionRestore = false, indexOfReplacedTab = -1 } = {}) {
+      for (let tab of tabs) {
+        if (tab.pinned) {
+          return;
+        }
+        let tabToMove =
+          this.documentGlobal === tab.documentGlobal
+            ? tab
+            : gBrowser.adoptTab(tab, {
+                tabIndex: gBrowser.tabs.at(-1)._tPos + 1,
+                selectTab: tab.selected,
+              });
+        if (indexOfReplacedTab > -1 && indexOfReplacedTab < this.#tabs.length) {
+          this.#tabs[indexOfReplacedTab] = tabToMove;
+        } else {
+          this.#tabs.push(tabToMove);
+        }
+        isSessionRestore
+          ? this.appendChild(tab)
+          : gBrowser.moveTabToSplitView(tabToMove, this, indexOfReplacedTab);
+        if (tab === gBrowser.selectedTab) {
+          this.hasActiveTab = true;
+        }
+      }
+
+      if (this.hasActiveTab) {
+        this.#activate();
+      }
+      for (let tab of this.tabs) {
+        let tabURI = tab.linkedBrowser.currentURI.spec;
+        if (!isBlankPageURL(tabURI) && tabURI !== "about:opentabs") {
+          const index = tabs.indexOf(tab);
+          const label = String(index + 1); 
+        }
+      }
+    }
+
+    unsplitTabs(trigger = null) {
+      if (this.#isUnsplitting) {
+        return;
+      }
+      this.#isUnsplitting = true;
+      let telemetryTrigger = this.#isClosing ? null : trigger;
+      if (telemetryTrigger) {
+        const tab_layout = gBrowser.tabContainer.verticalMode
+          ? "vertical"
+          : "horizontal";
+
+      }
+
+      let aboutOpenTabs = this.#tabs.filter(
+        tab => tab?.linkedBrowser?.currentURI?.spec === "about:opentabs"
+      );
+      aboutOpenTabs.forEach(aboutOpenTab => {
+        gBrowser.removeTab(aboutOpenTab);
+      });
+
+      for (let i = this.tabs.length - 1; i >= 0; i--) {
+        gBrowser.handleTabMove(this.tabs[i], () =>
+          gBrowser.tabContainer.insertBefore(
+            this.tabs[i],
+            this.nextElementSibling
+          )
+        );
+      }
+    }
+
+    replaceTab(tabToReplace, newTab) {
+      let indexOfReplacedTab = this.tabs.indexOf(tabToReplace);
+
+      if (tabToReplace.selected) {
+        gBrowser.selectedTab = newTab;
+      }
+      gBrowser.removeTab(tabToReplace);
+      this.addTabs([newTab], { isSessionRestore: false, indexOfReplacedTab });
+
+      this.#activate();
+    }
+
+    reverseTabs(trigger = null) {
+      const [firstTab, secondTab] = this.#tabs;
+      this.#shouldMoveAllTabsAtOnce = false;
+      gBrowser.moveTabBefore(secondTab, firstTab);
+      this.#shouldMoveAllTabsAtOnce = true;
+      this.#tabs = [secondTab, firstTab];
+      if (this.hasActiveTab) {
+        gBrowser.showSplitViewPanels(this.#tabs);
+        updateUrlbarButton.arm();
+      }
+
+      if (trigger) {
+      }
+    }
+
+    close(trigger = null) {
+      if (trigger) {
+        const tab_layout = gBrowser.tabContainer.verticalMode
+          ? "vertical"
+          : "horizontal";
+      }
+      this.#isClosing = true;
+      gBrowser.removeTabs(this.#tabs);
+    }
+
+    on_TabSelect(event) {
+      const wasActive = this.hasActiveTab;
+      this.hasActiveTab = event.target.splitview === this;
+      if (this.hasActiveTab) {
+        this.#activate();
+      } else if (wasActive && !event.detail.previousTab?.removedByAdoption) {
+        this.#suspend();
+      }
+    }
+  }
+
+  customElements.define("tab-split-view-wrapper", MozTabSplitViewWrapper);
+}

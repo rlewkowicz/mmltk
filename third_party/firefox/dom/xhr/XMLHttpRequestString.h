@@ -1,0 +1,112 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_XMLHttpRequestString_h
+#define mozilla_dom_XMLHttpRequestString_h
+
+#include "mozilla/Mutex.h"
+#include "nsString.h"
+
+struct JSContext;
+class JSString;
+
+namespace mozilla::dom {
+
+class ArrayBufferBuilder;
+class BlobImpl;
+class DOMString;
+class XMLHttpRequestStringBuffer;
+class XMLHttpRequestStringSnapshot;
+class XMLHttpRequestStringWriterHelper;
+
+class XMLHttpRequestString final {
+  friend class XMLHttpRequestStringWriterHelper;
+
+ public:
+  XMLHttpRequestString();
+  ~XMLHttpRequestString();
+
+  void Truncate();
+
+  uint32_t Length() const;
+
+  void Append(const nsAString& aString);
+
+  [[nodiscard]] bool GetAsString(nsAString& aString) const;
+
+  size_t SizeOfThis(MallocSizeOf aMallocSizeOf) const;
+
+  const char16_t* Data() const;
+
+  bool IsEmpty() const;
+
+  void CreateSnapshot(XMLHttpRequestStringSnapshot& aSnapshot);
+
+  XMLHttpRequestString(const XMLHttpRequestString&) = delete;
+  XMLHttpRequestString& operator=(const XMLHttpRequestString&) = delete;
+  XMLHttpRequestString& operator=(const XMLHttpRequestString&&) = delete;
+
+ private:
+  RefPtr<XMLHttpRequestStringBuffer> mBuffer;
+};
+
+class MOZ_STACK_CLASS XMLHttpRequestStringWriterHelper final {
+ public:
+  explicit XMLHttpRequestStringWriterHelper(XMLHttpRequestString& aString);
+  ~XMLHttpRequestStringWriterHelper();
+
+  XMLHttpRequestStringWriterHelper(const XMLHttpRequestStringWriterHelper&) =
+      delete;
+  XMLHttpRequestStringWriterHelper& operator=(
+      const XMLHttpRequestStringWriterHelper&) = delete;
+  XMLHttpRequestStringWriterHelper& operator=(
+      const XMLHttpRequestStringWriterHelper&&) = delete;
+
+  uint32_t Length() const;
+
+  mozilla::Result<mozilla::BulkWriteHandle<char16_t>, nsresult> BulkWrite(
+      uint32_t aCapacity);
+
+ private:
+  RefPtr<XMLHttpRequestStringBuffer> mBuffer;
+  MutexAutoLock mLock;
+};
+
+class XMLHttpRequestStringSnapshot final {
+  friend class XMLHttpRequestStringBuffer;
+
+ public:
+  XMLHttpRequestStringSnapshot();
+  ~XMLHttpRequestStringSnapshot();
+
+  XMLHttpRequestStringSnapshot& operator=(const XMLHttpRequestStringSnapshot&) =
+      delete;
+  XMLHttpRequestStringSnapshot(const XMLHttpRequestStringSnapshot&) = delete;
+  XMLHttpRequestStringSnapshot& operator=(
+      const XMLHttpRequestStringSnapshot&&) = delete;
+
+  void Reset() { ResetInternal(false ); }
+
+  void SetVoid() { ResetInternal(true ); }
+
+  bool IsVoid() const { return mVoid; }
+
+  bool IsEmpty() const { return !mBuffer; }
+
+  [[nodiscard]] bool GetAsString(DOMString& aString) const;
+
+  JSString* GetAsJSStringCopy(JSContext* aCx) const;
+
+ private:
+  void Set(XMLHttpRequestStringBuffer* aBuffer);
+
+  void ResetInternal(bool aIsVoid);
+
+  RefPtr<XMLHttpRequestStringBuffer> mBuffer;
+  bool mVoid;
+};
+
+}  
+
+#endif  // mozilla_dom_XMLHttpRequestString_h

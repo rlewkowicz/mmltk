@@ -1,0 +1,54 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsWebNavigationInfo.h"
+
+#include "nsServiceManagerUtils.h"
+#include "nsIDocumentLoaderFactory.h"
+#include "nsContentUtils.h"
+#include "imgLoader.h"
+
+NS_IMPL_ISUPPORTS(nsWebNavigationInfo, nsIWebNavigationInfo)
+
+NS_IMETHODIMP
+nsWebNavigationInfo::IsTypeSupported(const nsACString& aType,
+                                     uint32_t* aIsTypeSupported) {
+  MOZ_ASSERT(aIsTypeSupported, "null out param?");
+
+  *aIsTypeSupported = IsTypeSupported(aType);
+  return NS_OK;
+}
+
+uint32_t nsWebNavigationInfo::IsTypeSupported(const nsACString& aType) {
+  if (aType.LowerCaseEqualsLiteral("application/pdf") &&
+      nsContentUtils::IsPDFJSEnabled()) {
+    return nsIWebNavigationInfo::UNSUPPORTED;
+  }
+
+  const nsCString& flatType = PromiseFlatCString(aType);
+  return IsTypeSupportedInternal(flatType);
+}
+
+uint32_t nsWebNavigationInfo::IsTypeSupportedInternal(const nsCString& aType) {
+  nsContentUtils::DocumentViewerType vtype = nsContentUtils::TYPE_UNSUPPORTED;
+
+  nsCOMPtr<nsIDocumentLoaderFactory> docLoaderFactory =
+      nsContentUtils::FindInternalDocumentViewer(aType, &vtype);
+
+  switch (vtype) {
+    case nsContentUtils::TYPE_UNSUPPORTED:
+      return nsIWebNavigationInfo::UNSUPPORTED;
+
+    case nsContentUtils::TYPE_UNKNOWN:
+      return nsIWebNavigationInfo::OTHER;
+
+    case nsContentUtils::TYPE_CONTENT:
+      if (imgLoader::SupportImageWithMimeType(aType)) {
+        return nsIWebNavigationInfo::IMAGE;
+      }
+      return nsIWebNavigationInfo::OTHER;
+  }
+
+  return nsIWebNavigationInfo::UNSUPPORTED;
+}

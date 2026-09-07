@@ -1,0 +1,540 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "AudioNodeTrack.h"
+
+#include "AlignmentUtils.h"
+#include "AudioChannelFormat.h"
+#include "AudioContext.h"
+#include "AudioNodeEngine.h"
+#include "AudioParamTimeline.h"
+#include "MediaTrackGraph.h"
+#include "MediaTrackListener.h"
+#include "ThreeDPoint.h"
+#include "blink/Reverb.h"
+#include "nsMathUtils.h"
+
+using namespace mozilla::dom;
+
+namespace mozilla {
+
+
+AudioNodeTrack::AudioNodeTrack(AudioNodeEngine* aEngine, Flags aFlags,
+                               TrackRate aSampleRate)
+    : ProcessedMediaTrack(
+          aSampleRate, MediaSegment::AUDIO,
+          (aFlags & EXTERNAL_OUTPUT) ? new AudioSegment() : nullptr),
+      mEngine(aEngine),
+      mFlags(aFlags),
+      mNumberOfInputChannels(2),
+      mIsActive(aEngine->IsActive()),
+      mMarkAsEndedAfterThisBlock(false),
+      mAudioParamTrack(false),
+      mPassThrough(false) {
+  MOZ_ASSERT(NS_IsMainThread());
+  mSuspendedCount = !(mIsActive || mFlags & EXTERNAL_OUTPUT);
+  mChannelCountMode = ChannelCountMode::Max;
+  mChannelInterpretation = ChannelInterpretation::Speakers;
+  mLastChunks.SetLength(std::max(uint16_t(1), mEngine->OutputCount()));
+  MOZ_COUNT_CTOR(AudioNodeTrack);
+}
+
+AudioNodeTrack::~AudioNodeTrack() {
+  MOZ_ASSERT(mActiveInputCount == 0);
+  MOZ_COUNT_DTOR(AudioNodeTrack);
+}
+
+void AudioNodeTrack::OnGraphThreadDone() { mEngine->OnGraphThreadDone(); }
+
+void AudioNodeTrack::DestroyImpl() {
+  mInputChunks.Clear();
+  mLastChunks.Clear();
+
+  ProcessedMediaTrack::DestroyImpl();
+}
+
+already_AddRefed<AudioNodeTrack> AudioNodeTrack::Create(
+    AudioContext* aCtx, AudioNodeEngine* aEngine, Flags aFlags,
+    MediaTrackGraph* aGraph) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_RELEASE_ASSERT(aGraph);
+
+  AudioNode* node = aEngine->NodeMainThread();
+
+  RefPtr<AudioNodeTrack> track =
+      new AudioNodeTrack(aEngine, aFlags, aGraph->GraphRate());
+  if (node) {
+    track->SetChannelMixingParametersImpl(node->ChannelCount(),
+                                          node->ChannelCountModeValue(),
+                                          node->ChannelInterpretationValue());
+  }
+  bool isRealtime = !aCtx->IsOffline();
+  track->mSuspendedCount += isRealtime;
+  aGraph->AddTrack(track);
+  if (isRealtime && !aCtx->ShouldSuspendNewTrack()) {
+    nsTArray<RefPtr<mozilla::MediaTrack>> tracks;
+    tracks.AppendElement(track);
+    aGraph->ApplyAudioContextOperation(aCtx->DestinationTrack(),
+                                       std::move(tracks),
+                                       AudioContextOperation::Resume);
+  }
+  return track.forget();
+}
+
+size_t AudioNodeTrack::SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const {
+  size_t amount = 0;
+
+
+  amount += ProcessedMediaTrack::SizeOfExcludingThis(aMallocSizeOf);
+  amount += mLastChunks.ShallowSizeOfExcludingThis(aMallocSizeOf);
+  for (size_t i = 0; i < mLastChunks.Length(); i++) {
+    amount += mLastChunks[i].SizeOfExcludingThisIfUnshared(aMallocSizeOf);
+  }
+
+  return amount;
+}
+
+size_t AudioNodeTrack::SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const {
+  return aMallocSizeOf(this) + SizeOfExcludingThis(aMallocSizeOf);
+}
+
+void AudioNodeTrack::SizeOfAudioNodesIncludingThis(
+    MallocSizeOf aMallocSizeOf, AudioNodeSizes& aUsage) const {
+  aUsage.mTrack = SizeOfIncludingThis(aMallocSizeOf);
+
+  if (mEngine) {
+    mEngine->SizeOfIncludingThis(aMallocSizeOf, aUsage);
+  }
+}
+
+void AudioNodeTrack::SetTrackTimeParameter(uint32_t aIndex,
+                                           AudioContext* aContext,
+                                           double aTrackTime) {
+  QueueControlMessageWithNoShutdown(
+      [self = RefPtr{this}, this, aIndex,
+       relativeToTrack = RefPtr{aContext->DestinationTrack()}, aTrackTime] {
+        SetTrackTimeParameterImpl(aIndex, relativeToTrack, aTrackTime);
+      });
+}
+
+void AudioNodeTrack::SetTrackTimeParameterImpl(uint32_t aIndex,
+                                               MediaTrack* aRelativeToTrack,
+                                               double aTrackTime) {
+  TrackTime ticks = aRelativeToTrack->SecondsToNearestTrackTime(aTrackTime);
+  mEngine->SetTrackTimeParameter(aIndex, ticks);
+}
+
+void AudioNodeTrack::SetDoubleParameter(uint32_t aIndex, double aValue) {
+  QueueControlMessageWithNoShutdown(
+      [self = RefPtr{this}, this, aIndex, aValue] {
+        Engine()->SetDoubleParameter(aIndex, aValue);
+      });
+}
+
+void AudioNodeTrack::SetInt32Parameter(uint32_t aIndex, int32_t aValue) {
+  QueueControlMessageWithNoShutdown(
+      [self = RefPtr{this}, this, aIndex, aValue] {
+        Engine()->SetInt32Parameter(aIndex, aValue);
+      });
+}
+
+void AudioNodeTrack::SendTimelineEvent(uint32_t aIndex,
+                                       const AudioParamEvent& aEvent) {
+  QueueControlMessageWithNoShutdown(
+      [self = RefPtr{this}, this, aIndex, event = aEvent]() mutable {
+        Engine()->RecvTimelineEvent(aIndex, event);
+      });
+}
+
+void AudioNodeTrack::SetBuffer(AudioChunk&& aBuffer) {
+  QueueControlMessageWithNoShutdown(
+      [self = RefPtr{this}, this, buffer = std::move(aBuffer)]() mutable {
+        Engine()->SetBuffer(std::move(buffer));
+      });
+}
+
+void AudioNodeTrack::SetReverb(WebCore::Reverb* aReverb,
+                               uint32_t aImpulseChannelCount) {
+  QueueControlMessageWithNoShutdown([self = RefPtr{this}, this,
+                                     reverb = WrapUnique(aReverb),
+                                     aImpulseChannelCount]() mutable {
+    Engine()->SetReverb(reverb.release(), aImpulseChannelCount);
+  });
+}
+
+void AudioNodeTrack::SetRawArrayData(nsTArray<float>&& aData) {
+  QueueControlMessageWithNoShutdown(
+      [self = RefPtr{this}, this, data = std::move(aData)]() mutable {
+        Engine()->SetRawArrayData(std::move(data));
+      });
+}
+
+void AudioNodeTrack::SetChannelMixingParameters(
+    uint32_t aNumberOfChannels, ChannelCountMode aChannelCountMode,
+    ChannelInterpretation aChannelInterpretation) {
+  QueueControlMessageWithNoShutdown([self = RefPtr{this}, this,
+                                     aNumberOfChannels, aChannelCountMode,
+                                     aChannelInterpretation] {
+    SetChannelMixingParametersImpl(aNumberOfChannels, aChannelCountMode,
+                                   aChannelInterpretation);
+  });
+}
+
+void AudioNodeTrack::SetPassThrough(bool aPassThrough) {
+  QueueControlMessageWithNoShutdown([self = RefPtr{this}, this, aPassThrough] {
+    mPassThrough = aPassThrough;
+  });
+}
+
+void AudioNodeTrack::SendRunnable(already_AddRefed<nsIRunnable> aRunnable) {
+  QueueControlMessageWithNoShutdown([runnable = nsCOMPtr{aRunnable}] {
+    runnable->Run();
+  });
+}
+
+void AudioNodeTrack::SetChannelMixingParametersImpl(
+    uint32_t aNumberOfChannels, ChannelCountMode aChannelCountMode,
+    ChannelInterpretation aChannelInterpretation) {
+  mNumberOfInputChannels = aNumberOfChannels;
+  mChannelCountMode = aChannelCountMode;
+  mChannelInterpretation = aChannelInterpretation;
+}
+
+uint32_t AudioNodeTrack::ComputedNumberOfChannels(uint32_t aInputChannelCount) {
+  switch (mChannelCountMode) {
+    case ChannelCountMode::Explicit:
+      return mNumberOfInputChannels;
+    case ChannelCountMode::Clamped_max:
+      return std::min(aInputChannelCount, mNumberOfInputChannels);
+    default:
+    case ChannelCountMode::Max:
+      return aInputChannelCount;
+  }
+}
+
+uint32_t AudioNodeTrack::NumberOfChannels() const {
+  AssertOnGraphThread();
+
+  return mNumberOfInputChannels;
+}
+
+void AudioNodeTrack::AdvanceAndResume(TrackTime aAdvance) {
+  mMainThreadCurrentTime += aAdvance;
+  QueueControlMessageWithNoShutdown([self = RefPtr{this}, this, aAdvance] {
+    mStartTime -= aAdvance;
+    mSegment->AppendNullData(aAdvance);
+    DecrementSuspendCount();
+  });
+}
+
+void AudioNodeTrack::ObtainInputBlock(AudioBlock& aTmpChunk,
+                                      uint32_t aPortIndex) {
+  uint32_t inputCount = mInputs.Length();
+  uint32_t outputChannelCount = 1;
+  AutoTArray<const AudioBlock*, 250> inputChunks;
+  for (uint32_t i = 0; i < inputCount; ++i) {
+    if (aPortIndex != mInputs[i]->InputNumber()) {
+      continue;
+    }
+    MediaTrack* t = mInputs[i]->GetSource();
+    AudioNodeTrack* a = static_cast<AudioNodeTrack*>(t);
+    MOZ_ASSERT(a == t->AsAudioNodeTrack());
+    if (a->IsAudioParamTrack()) {
+      continue;
+    }
+
+    const AudioBlock* chunk = &a->mLastChunks[mInputs[i]->OutputNumber()];
+    MOZ_ASSERT(chunk);
+    if (chunk->IsNull() || chunk->mChannelData.IsEmpty()) {
+      continue;
+    }
+
+    inputChunks.AppendElement(chunk);
+    outputChannelCount =
+        GetAudioChannelsSuperset(outputChannelCount, chunk->ChannelCount());
+  }
+
+  outputChannelCount = ComputedNumberOfChannels(outputChannelCount);
+
+  uint32_t inputChunkCount = inputChunks.Length();
+  if (inputChunkCount == 0 ||
+      (inputChunkCount == 1 && inputChunks[0]->ChannelCount() == 0)) {
+    aTmpChunk.SetNull(WEBAUDIO_BLOCK_SIZE);
+    return;
+  }
+
+  if (inputChunkCount == 1 &&
+      inputChunks[0]->ChannelCount() == outputChannelCount) {
+    aTmpChunk = *inputChunks[0];
+    return;
+  }
+
+  if (outputChannelCount == 0) {
+    aTmpChunk.SetNull(WEBAUDIO_BLOCK_SIZE);
+    return;
+  }
+
+  aTmpChunk.AllocateChannels(outputChannelCount);
+  DownmixBufferType downmixBuffer;
+  ASSERT_ALIGNED16(downmixBuffer.Elements());
+
+  for (uint32_t i = 0; i < inputChunkCount; ++i) {
+    AccumulateInputChunk(i, *inputChunks[i], &aTmpChunk, &downmixBuffer);
+  }
+}
+
+void AudioNodeTrack::AccumulateInputChunk(uint32_t aInputIndex,
+                                          const AudioBlock& aChunk,
+                                          AudioBlock* aBlock,
+                                          DownmixBufferType* aDownmixBuffer) {
+  AutoTArray<const float*, GUESS_AUDIO_CHANNELS> channels;
+  UpMixDownMixChunk(&aChunk, aBlock->ChannelCount(), channels, *aDownmixBuffer);
+
+  for (uint32_t c = 0; c < channels.Length(); ++c) {
+    const float* inputData = static_cast<const float*>(channels[c]);
+    float* outputData = aBlock->ChannelFloatsForWrite(c);
+    if (inputData) {
+      if (aInputIndex == 0) {
+        AudioBlockCopyChannelWithScale(inputData, aChunk.mVolume, outputData);
+      } else {
+        AudioBlockAddChannelWithScale(inputData, aChunk.mVolume, outputData);
+      }
+    } else {
+      if (aInputIndex == 0) {
+        PodZero(outputData, WEBAUDIO_BLOCK_SIZE);
+      }
+    }
+  }
+}
+
+void AudioNodeTrack::UpMixDownMixChunk(const AudioBlock* aChunk,
+                                       uint32_t aOutputChannelCount,
+                                       nsTArray<const float*>& aOutputChannels,
+                                       DownmixBufferType& aDownmixBuffer) {
+  for (uint32_t i = 0; i < aChunk->ChannelCount(); i++) {
+    aOutputChannels.AppendElement(
+        static_cast<const float*>(aChunk->mChannelData[i]));
+  }
+  if (aOutputChannels.Length() < aOutputChannelCount) {
+    if (mChannelInterpretation == ChannelInterpretation::Speakers) {
+      AudioChannelsUpMix<float>(&aOutputChannels, aOutputChannelCount, nullptr);
+      NS_ASSERTION(aOutputChannelCount == aOutputChannels.Length(),
+                   "We called GetAudioChannelsSuperset to avoid this");
+    } else {
+      for (uint32_t j = aOutputChannels.Length(); j < aOutputChannelCount;
+           ++j) {
+        aOutputChannels.AppendElement(nullptr);
+      }
+    }
+  } else if (aOutputChannels.Length() > aOutputChannelCount) {
+    if (mChannelInterpretation == ChannelInterpretation::Speakers) {
+      AutoTArray<float*, GUESS_AUDIO_CHANNELS> outputChannels;
+      outputChannels.SetLength(aOutputChannelCount);
+      aDownmixBuffer.SetLength(aOutputChannelCount * WEBAUDIO_BLOCK_SIZE);
+      for (uint32_t j = 0; j < aOutputChannelCount; ++j) {
+        outputChannels[j] = &aDownmixBuffer[j * WEBAUDIO_BLOCK_SIZE];
+      }
+
+      AudioChannelsDownMix<float, float>(aOutputChannels, outputChannels,
+                                         WEBAUDIO_BLOCK_SIZE);
+
+      aOutputChannels.SetLength(aOutputChannelCount);
+      for (uint32_t j = 0; j < aOutputChannels.Length(); ++j) {
+        aOutputChannels[j] = outputChannels[j];
+      }
+    } else {
+      aOutputChannels.RemoveLastElements(aOutputChannels.Length() -
+                                         aOutputChannelCount);
+    }
+  }
+}
+
+void AudioNodeTrack::ProcessInput(GraphTime aFrom, GraphTime aTo,
+                                  uint32_t aFlags) {
+  MOZ_ASSERT(aTo - aFrom == WEBAUDIO_BLOCK_SIZE);
+  uint16_t outputCount = mLastChunks.Length();
+  MOZ_ASSERT(outputCount == std::max(uint16_t(1), mEngine->OutputCount()));
+
+  if (!mIsActive) {
+#ifdef DEBUG
+    for (const auto& chunk : mLastChunks) {
+      MOZ_ASSERT(chunk.IsNull());
+    }
+#endif
+  } else if (InMutedCycle()) {
+    mInputChunks.Clear();
+    for (uint16_t i = 0; i < outputCount; ++i) {
+      mLastChunks[i].SetNull(WEBAUDIO_BLOCK_SIZE);
+    }
+  } else {
+    uint16_t maxInputs = std::max(uint16_t(1), mEngine->InputCount());
+    mInputChunks.SetLength(maxInputs);
+    for (uint16_t i = 0; i < maxInputs; ++i) {
+      ObtainInputBlock(mInputChunks[i], i);
+    }
+    bool finished = false;
+    if (mPassThrough) {
+      MOZ_ASSERT(outputCount == 1,
+                 "For now, we only support nodes that have one output port");
+      mLastChunks[0] = mInputChunks[0];
+    } else {
+      if (maxInputs <= 1 && outputCount <= 1) {
+        mEngine->ProcessBlock(this, aFrom, mInputChunks[0], &mLastChunks[0],
+                              &finished);
+      } else {
+        mEngine->ProcessBlocksOnPorts(
+            this, aFrom, Span(mInputChunks.Elements(), mEngine->InputCount()),
+            Span(mLastChunks.Elements(), mEngine->OutputCount()), &finished);
+      }
+    }
+    for (uint16_t i = 0; i < outputCount; ++i) {
+      NS_ASSERTION(mLastChunks[i].GetDuration() == WEBAUDIO_BLOCK_SIZE,
+                   "Invalid WebAudio chunk size");
+    }
+    if (finished && !mMarkAsEndedAfterThisBlock) {
+      mMarkAsEndedAfterThisBlock = true;
+      if (mIsActive) {
+        ScheduleCheckForInactive();
+      }
+    }
+
+    if (mDisabledMode != DisabledTrackMode::ENABLED) {
+      for (uint32_t i = 0; i < outputCount; ++i) {
+        mLastChunks[i].SetNull(WEBAUDIO_BLOCK_SIZE);
+      }
+    }
+  }
+
+  if (!mEnded) {
+    if (mFlags & EXTERNAL_OUTPUT) {
+      AdvanceOutputSegment();
+    }
+    if (mMarkAsEndedAfterThisBlock && (aFlags & ALLOW_END)) {
+      mEnded = true;
+    }
+  }
+}
+
+void AudioNodeTrack::ProduceOutputBeforeInput(GraphTime aFrom) {
+  MOZ_ASSERT(mEngine->AsDelayNodeEngine());
+  MOZ_ASSERT(mEngine->OutputCount() == 1,
+             "DelayNodeEngine output count should be 1");
+  MOZ_ASSERT(!InMutedCycle(), "DelayNodes should break cycles");
+  MOZ_ASSERT(mLastChunks.Length() == 1);
+
+  if (!mIsActive) {
+    mLastChunks[0].SetNull(WEBAUDIO_BLOCK_SIZE);
+  } else {
+    mEngine->ProduceBlockBeforeInput(this, aFrom, &mLastChunks[0]);
+    NS_ASSERTION(mLastChunks[0].GetDuration() == WEBAUDIO_BLOCK_SIZE,
+                 "Invalid WebAudio chunk size");
+    if (mDisabledMode != DisabledTrackMode::ENABLED) {
+      mLastChunks[0].SetNull(WEBAUDIO_BLOCK_SIZE);
+    }
+  }
+}
+
+void AudioNodeTrack::AdvanceOutputSegment() {
+  AudioSegment* segment = GetData<AudioSegment>();
+
+  AudioChunk copyChunk = *mLastChunks[0].AsMutableChunk();
+  AudioSegment tmpSegment;
+  tmpSegment.AppendAndConsumeChunk(std::move(copyChunk));
+
+  for (const auto& l : mTrackListeners) {
+    l->NotifyQueuedChanges(Graph(), segment->GetDuration(), tmpSegment);
+  }
+
+  if (mLastChunks[0].IsNull()) {
+    segment->AppendNullData(tmpSegment.GetDuration());
+  } else {
+    segment->AppendFrom(&tmpSegment);
+  }
+}
+
+void AudioNodeTrack::AddInput(MediaInputPort* aPort) {
+  ProcessedMediaTrack::AddInput(aPort);
+  AudioNodeTrack* ns = aPort->GetSource()->AsAudioNodeTrack();
+  if (!ns || (ns->mIsActive && !ns->IsAudioParamTrack())) {
+    IncrementActiveInputCount();
+  }
+}
+void AudioNodeTrack::RemoveInput(MediaInputPort* aPort) {
+  ProcessedMediaTrack::RemoveInput(aPort);
+  AudioNodeTrack* ns = aPort->GetSource()->AsAudioNodeTrack();
+  if (!ns || (ns->mIsActive && !ns->IsAudioParamTrack())) {
+    DecrementActiveInputCount();
+  }
+}
+
+void AudioNodeTrack::SetActive() {
+  if (mIsActive || mMarkAsEndedAfterThisBlock) {
+    return;
+  }
+
+  mIsActive = true;
+  if (!(mFlags & EXTERNAL_OUTPUT)) {
+    DecrementSuspendCount();
+  }
+  if (IsAudioParamTrack()) {
+    return;
+  }
+
+  for (const auto& consumer : mConsumers) {
+    AudioNodeTrack* ns = consumer->GetDestination()->AsAudioNodeTrack();
+    if (ns) {
+      ns->IncrementActiveInputCount();
+    }
+  }
+}
+
+void AudioNodeTrack::ScheduleCheckForInactive() {
+  if (mActiveInputCount > 0 && !mMarkAsEndedAfterThisBlock) {
+    return;
+  }
+
+  RunAfterProcessing([self = RefPtr{this}, this] {
+    CheckForInactive();
+  });
+}
+
+void AudioNodeTrack::CheckForInactive() {
+  if (((mActiveInputCount > 0 || mEngine->IsActive()) &&
+       !mMarkAsEndedAfterThisBlock) ||
+      !mIsActive) {
+    return;
+  }
+
+  mIsActive = false;
+  mInputChunks.Clear();  
+  for (auto& chunk : mLastChunks) {
+    chunk.SetNull(WEBAUDIO_BLOCK_SIZE);
+  }
+  if (!(mFlags & EXTERNAL_OUTPUT)) {
+    IncrementSuspendCount();
+  }
+  if (IsAudioParamTrack()) {
+    return;
+  }
+
+  for (const auto& consumer : mConsumers) {
+    AudioNodeTrack* ns = consumer->GetDestination()->AsAudioNodeTrack();
+    if (ns) {
+      ns->DecrementActiveInputCount();
+    }
+  }
+}
+
+void AudioNodeTrack::IncrementActiveInputCount() {
+  ++mActiveInputCount;
+  SetActive();
+}
+
+void AudioNodeTrack::DecrementActiveInputCount() {
+  MOZ_ASSERT(mActiveInputCount > 0);
+  --mActiveInputCount;
+  CheckForInactive();
+}
+
+}  

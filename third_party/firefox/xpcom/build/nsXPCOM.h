@@ -1,0 +1,167 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsXPCOM_h_
+#define nsXPCOM_h_
+
+#include "nscore.h"
+#include "nsXPCOMCID.h"
+#include "mozilla/Attributes.h"
+
+#ifdef __cplusplus
+#  define DECL_CLASS(c) class c
+#  define DECL_STRUCT(c) struct c
+#else
+#  define DECL_CLASS(c) typedef struct c c
+#  define DECL_STRUCT(c) typedef struct c c
+#endif
+
+DECL_CLASS(nsISupports);
+DECL_CLASS(nsIComponentManager);
+DECL_CLASS(nsIComponentRegistrar);
+DECL_CLASS(nsIServiceManager);
+DECL_CLASS(nsIFile);
+DECL_CLASS(nsIDirectoryServiceProvider);
+DECL_CLASS(nsIMemory);
+DECL_CLASS(nsIDebug2);
+
+#ifdef __cplusplus
+extern bool gXPCOMShuttingDown;
+extern bool gXPCOMMainThreadEventsAreDoomed;
+#endif
+
+#ifdef __cplusplus
+#  include "nsStringFwd.h"
+#endif
+
+XPCOM_API(nsresult)
+NS_InitXPCOM(nsIServiceManager** aResult, nsIFile* aBinDirectory,
+             nsIDirectoryServiceProvider* aAppFileLocationProvider,
+             bool aInitJSContext = true);
+
+XPCOM_API(nsresult)
+NS_InitMinimalXPCOM();
+
+XPCOM_API(MOZ_CAN_RUN_SCRIPT_BOUNDARY nsresult)
+NS_ShutdownXPCOM(nsIServiceManager* aServMgr);
+
+XPCOM_API(nsresult) NS_GetServiceManager(nsIServiceManager** aResult);
+
+XPCOM_API(nsresult) NS_GetComponentManager(nsIComponentManager** aResult);
+
+XPCOM_API(nsresult) NS_GetComponentRegistrar(nsIComponentRegistrar** aResult);
+
+#ifdef __cplusplus
+
+XPCOM_API([[nodiscard]] nsresult)
+NS_NewLocalFile(const nsAString& aPath, nsIFile** aResult);
+
+XPCOM_API([[nodiscard]] nsresult)
+NS_NewNativeLocalFile(const nsACString& aPath, nsIFile** aResult);
+
+class NS_ConvertUTF16toUTF8;
+nsresult NS_NewNativeLocalFile(const NS_ConvertUTF16toUTF8& aPath,
+                               nsIFile** aResult) = delete;
+
+XPCOM_API([[nodiscard]] nsresult)
+NS_NewUTF8LocalFile(const nsACString& aPath, nsIFile** aResult);
+
+XPCOM_API([[nodiscard]] nsresult)
+NS_NewLocalFileWithFile(nsIFile* aFile, nsIFile** aResult);
+
+XPCOM_API([[nodiscard]] nsresult)
+NS_NewLocalFileWithRelativeDescriptor(nsIFile* aFromFile,
+                                      const nsACString& aRelativeDesc,
+                                      nsIFile** aResult);
+
+XPCOM_API([[nodiscard]] nsresult)
+NS_NewLocalFileWithPersistentDescriptor(const nsACString& aPersistentDescriptor,
+                                        nsIFile** aResult);
+
+#endif
+
+
+enum {
+  NS_DEBUG_WARNING = 0,
+  NS_DEBUG_ASSERTION = 1,
+  NS_DEBUG_BREAK = 2,
+  NS_DEBUG_ABORT = 3
+};
+
+XPCOM_API(void)
+NS_DebugBreak(uint32_t aSeverity, const char* aStr, const char* aExpr,
+              const char* aFile, int32_t aLine);
+
+
+XPCOM_API(void) NS_LogInit();
+
+XPCOM_API(void) NS_LogTerm();
+
+#ifdef __cplusplus
+
+class ScopedLogging {
+ public:
+  ScopedLogging() { NS_LogInit(); }
+
+  ~ScopedLogging() { NS_LogTerm(); }
+};
+#endif
+
+
+XPCOM_API(void)
+NS_LogCtor(void* aPtr, const char* aTypeName, uint32_t aInstanceSize);
+
+XPCOM_API(void)
+NS_LogDtor(void* aPtr, const char* aTypeName, uint32_t aInstanceSize);
+
+XPCOM_API(void)
+NS_LogAddRef(void* aPtr, nsrefcnt aNewRefCnt, const char* aTypeName,
+             uint32_t aInstanceSize);
+
+XPCOM_API(void)
+NS_LogRelease(void* aPtr, nsrefcnt aNewRefCnt, const char* aTypeName);
+
+
+XPCOM_API(void) NS_LogCOMPtrAddRef(void* aCOMPtr, nsISupports* aObject);
+
+XPCOM_API(void) NS_LogCOMPtrRelease(void* aCOMPtr, nsISupports* aObject);
+
+
+#ifdef __cplusplus
+
+class nsCycleCollectionParticipant;
+class nsCycleCollectingAutoRefCnt;
+
+XPCOM_API(void)
+NS_CycleCollectorSuspect3(void* aPtr, nsCycleCollectionParticipant* aCp,
+                          nsCycleCollectingAutoRefCnt* aRefCnt,
+                          bool* aShouldDelete);
+
+XPCOM_API(void)
+NS_CycleCollectableHasRefCntZero();
+
+#endif
+
+
+#define XPCOM_DIRECTORY_PROVIDER_CATEGORY "xpcom-directory-providers"
+
+#define NS_XPCOM_STARTUP_CATEGORY "xpcom-startup"
+
+
+#define NS_XPCOM_STARTUP_OBSERVER_ID "xpcom-startup"
+
+#define NS_XPCOM_WILL_SHUTDOWN_OBSERVER_ID "xpcom-will-shutdown"
+
+#define NS_XPCOM_SHUTDOWN_OBSERVER_ID "xpcom-shutdown"
+
+#define NS_XPCOM_CATEGORY_ENTRY_ADDED_OBSERVER_ID "xpcom-category-entry-added"
+
+#define NS_XPCOM_CATEGORY_ENTRY_REMOVED_OBSERVER_ID \
+  "xpcom-category-entry-removed"
+
+#define NS_XPCOM_CATEGORY_CLEARED_OBSERVER_ID "xpcom-category-cleared"
+
+XPCOM_API(nsresult) NS_GetDebug(nsIDebug2** aResult);
+
+#endif

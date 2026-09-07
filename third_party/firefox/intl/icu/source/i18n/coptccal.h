@@ -1,0 +1,92 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*******************************************************************************
+* Copyright (C) 2003 - 2013, International Business Machines Corporation and  *
+* others. All Rights Reserved.                                                *
+*******************************************************************************
+*/
+
+#ifndef COPTCCAL_H
+#define COPTCCAL_H
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/calendar.h"
+#include "cecal.h"
+
+U_NAMESPACE_BEGIN
+
+class CopticCalendar : public CECalendar {
+  
+public:
+    enum EMonths {
+        TOUT,
+        
+        BABA,
+
+        HATOR,
+
+        KIAHK,
+
+        TOBA,
+
+        AMSHIR,
+
+        BARAMHAT,
+
+        BARAMOUDA,
+
+        BASHANS,
+
+        PAONA,
+
+        EPEP,
+
+        MESRA,
+
+        NASIE
+    };
+
+    enum EEras {
+        BCE,    
+        CE      
+    };
+
+    CopticCalendar(const Locale& aLocale, UErrorCode& success);
+
+    CopticCalendar (const CopticCalendar& other);
+
+    virtual ~CopticCalendar();
+
+    virtual CopticCalendar* clone() const override;
+
+    const char * getType() const override;
+
+protected:
+
+    int32_t getRelatedYearDifference() const override;
+
+    virtual int32_t handleGetExtendedYear(UErrorCode& status) override;
+
+    virtual int32_t handleGetLimit(UCalendarDateFields field, ELimitType limitType) const override;
+
+    DECLARE_OVERRIDE_SYSTEM_DEFAULT_CENTURY
+
+    int32_t getJDEpochOffset() const override;
+
+    int32_t extendedYearToEra(int32_t extendedYear) const override;
+
+    int32_t extendedYearToYear(int32_t extendedYear) const override;
+public:
+    virtual UClassID getDynamicClassID() const override;
+
+    U_I18N_API static UClassID U_EXPORT2 getStaticClassID();  
+
+};
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+#endif /* COPTCCAL_H */

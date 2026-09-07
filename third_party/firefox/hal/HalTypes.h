@@ -1,0 +1,76 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_hal_Types_h
+#define mozilla_hal_Types_h
+
+#include "ipc/EnumSerializer.h"
+#include "mozilla/BitSet.h"
+#include "mozilla/Observer.h"
+#include "mozilla/TimeStamp.h"
+
+namespace mozilla {
+namespace hal {
+
+const uint64_t CONTENT_PROCESS_ID_UNKNOWN = uint64_t(-1);
+const uint64_t CONTENT_PROCESS_ID_MAIN = 0;
+
+enum ProcessPriority {
+  PROCESS_PRIORITY_UNKNOWN = -1,
+  PROCESS_PRIORITY_BACKGROUND,
+  PROCESS_PRIORITY_BACKGROUND_PERCEIVABLE,
+  PROCESS_PRIORITY_FOREGROUND_KEYBOARD,
+  PROCESS_PRIORITY_PREALLOC,
+  PROCESS_PRIORITY_FOREGROUND,
+  PROCESS_PRIORITY_FOREGROUND_HIGH,
+  PROCESS_PRIORITY_PARENT_PROCESS,
+  NUM_PROCESS_PRIORITY
+};
+
+const char* ProcessPriorityToString(ProcessPriority aPriority);
+
+enum WakeLockControl {
+  WAKE_LOCK_REMOVE_ONE = -1,
+  WAKE_LOCK_NO_CHANGE = 0,
+  WAKE_LOCK_ADD_ONE = 1,
+  NUM_WAKE_LOCK
+};
+
+class PerformanceHintSession {
+ public:
+  virtual ~PerformanceHintSession() = default;
+
+  virtual void UpdateTargetWorkDuration(TimeDuration aDuration) = 0;
+
+  virtual void ReportActualWorkDuration(TimeDuration aDuration) = 0;
+};
+
+struct HeterogeneousCpuInfo {
+  static const size_t MAX_CPUS = 32;
+  size_t mTotalNumCpus;
+  mozilla::BitSet<MAX_CPUS> mLittleCpus;
+  mozilla::BitSet<MAX_CPUS> mMediumCpus;
+  mozilla::BitSet<MAX_CPUS> mBigCpus;
+};
+
+}  
+}  
+
+namespace IPC {
+
+template <>
+struct ParamTraits<mozilla::hal::WakeLockControl>
+    : public ContiguousEnumSerializer<mozilla::hal::WakeLockControl,
+                                      mozilla::hal::WAKE_LOCK_REMOVE_ONE,
+                                      mozilla::hal::NUM_WAKE_LOCK> {};
+
+template <>
+struct ParamTraits<mozilla::hal::ProcessPriority>
+    : public ContiguousEnumSerializer<mozilla::hal::ProcessPriority,
+                                      mozilla::hal::PROCESS_PRIORITY_UNKNOWN,
+                                      mozilla::hal::NUM_PROCESS_PRIORITY> {};
+
+}  
+
+#endif  // mozilla_hal_Types_h

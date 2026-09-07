@@ -1,0 +1,269 @@
+/*
+ * Copyright 2014 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkTextBlob_DEFINED)
+#define SkTextBlob_DEFINED
+
+#include "include/core/SkFont.h"
+#include "include/core/SkFontTypes.h"
+#include "include/core/SkPoint.h"
+#include "include/core/SkRSXform.h"
+#include "include/core/SkRect.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkScalar.h"
+#include "include/core/SkSpan.h"
+#include "include/core/SkTypes.h"
+#include "include/private/base/SkDebug.h"
+#include "include/private/base/SkTemplates.h"
+
+#include <atomic>
+#include <cstdint>
+#include <cstring>
+
+class SkData;
+class SkPaint;
+class SkTypeface;
+struct SkDeserialProcs;
+struct SkSerialProcs;
+
+namespace sktext {
+class GlyphRunList;
+}
+
+class SK_API SkTextBlob final : public SkNVRefCnt<SkTextBlob> {
+private:
+    class RunRecord;
+
+public:
+
+    const SkRect& bounds() const { return fBounds; }
+
+    uint32_t uniqueID() const { return fUniqueID; }
+
+    int getIntercepts(const SkScalar bounds[2], SkScalar intervals[],
+                      const SkPaint* paint = nullptr) const;
+
+    /** Creates SkTextBlob with a single run.
+
+        font contains attributes used to define the run text.
+
+        When encoding is SkTextEncoding::kUTF8, SkTextEncoding::kUTF16, or
+        SkTextEncoding::kUTF32, this function uses the default
+        character-to-glyph mapping from the SkTypeface in font.  It does not
+        perform typeface fallback for characters not found in the SkTypeface.
+        It does not perform kerning or other complex shaping; glyphs are
+        positioned based on their default advances.
+
+        @param text        character code points or glyphs drawn
+        @param byteLength  byte length of text array
+        @param font        text size, typeface, text scale, and so on, used to draw
+        @param encoding    text encoding used in the text array
+        @return            SkTextBlob constructed from one run
+    */
+    static sk_sp<SkTextBlob> MakeFromText(const void* text, size_t byteLength, const SkFont& font,
+                                          SkTextEncoding encoding = SkTextEncoding::kUTF8);
+
+    /** Creates SkTextBlob with a single run. string meaning depends on SkTextEncoding;
+        by default, string is encoded as UTF-8.
+
+        font contains attributes used to define the run text.
+
+        When encoding is SkTextEncoding::kUTF8, SkTextEncoding::kUTF16, or
+        SkTextEncoding::kUTF32, this function uses the default
+        character-to-glyph mapping from the SkTypeface in font.  It does not
+        perform typeface fallback for characters not found in the SkTypeface.
+        It does not perform kerning or other complex shaping; glyphs are
+        positioned based on their default advances.
+
+        @param string   character code points or glyphs drawn
+        @param font     text size, typeface, text scale, and so on, used to draw
+        @param encoding text encoding used in the text array
+        @return         SkTextBlob constructed from one run
+    */
+    static sk_sp<SkTextBlob> MakeFromString(const char* string, const SkFont& font,
+                                            SkTextEncoding encoding = SkTextEncoding::kUTF8) {
+        if (!string) {
+            return nullptr;
+        }
+        return MakeFromText(string, strlen(string), font, encoding);
+    }
+
+    static sk_sp<SkTextBlob> MakeFromPosTextH(const void* text, size_t byteLength,
+                                              SkSpan<const SkScalar> xpos, SkScalar constY,
+                                              const SkFont& font,
+                                              SkTextEncoding encoding = SkTextEncoding::kUTF8);
+
+    static sk_sp<SkTextBlob> MakeFromPosText(const void* text, size_t byteLength,
+                                             SkSpan<const SkPoint> pos, const SkFont& font,
+                                             SkTextEncoding encoding = SkTextEncoding::kUTF8);
+
+    static sk_sp<SkTextBlob> MakeFromRSXform(const void* text, size_t byteLength,
+                                             SkSpan<const SkRSXform> xform, const SkFont& font,
+                                             SkTextEncoding encoding = SkTextEncoding::kUTF8);
+
+
+    static sk_sp<SkTextBlob> MakeFromPosHGlyphs(SkSpan<const SkGlyphID> glyphs,
+                                                SkSpan<const SkScalar> xpos, SkScalar constY,
+                                                const SkFont& font) {
+        return MakeFromPosTextH(glyphs.data(), glyphs.size() * sizeof(SkGlyphID), xpos, constY,
+                                font, SkTextEncoding::kGlyphID);
+    }
+    static sk_sp<SkTextBlob> MakeFromPosGlyphs(SkSpan<const SkGlyphID> glyphs,
+                                               SkSpan<const SkPoint> pos, const SkFont& font) {
+        return MakeFromPosText(glyphs.data(), glyphs.size() * sizeof(SkGlyphID), pos, font,
+                               SkTextEncoding::kGlyphID);
+    }
+    static sk_sp<SkTextBlob> MakeFromRSXformGlyphs(SkSpan<const SkGlyphID> glyphs,
+                                                   SkSpan<const SkRSXform> xform,
+                                                   const SkFont& font) {
+        return MakeFromRSXform(glyphs.data(), glyphs.size() * sizeof(SkGlyphID), xform, font,
+                               SkTextEncoding::kGlyphID);
+    }
+
+    size_t serialize(const SkSerialProcs& procs, void* memory, size_t memory_size) const;
+
+    sk_sp<SkData> serialize(const SkSerialProcs& procs) const;
+
+    static sk_sp<SkTextBlob> Deserialize(const void* data, size_t size,
+                                         const SkDeserialProcs& procs);
+
+    class SK_API Iter {
+    public:
+        struct Run {
+            SkTypeface* fTypeface;
+            int fGlyphCount;
+            const SkGlyphID* fGlyphIndices;
+#if defined(SK_UNTIL_CRBUG_1187654_IS_FIXED)
+            const uint32_t* fClusterIndex_forTest;
+            int fUtf8Size_forTest;
+            const char* fUtf8_forTest;
+#endif
+        };
+
+        Iter(const SkTextBlob&);
+
+        bool next(Run*);
+
+        struct ExperimentalRun {
+            SkFont font;
+            int count;
+            const SkGlyphID* glyphs;
+            const SkPoint* positions;
+        };
+        bool experimentalNext(ExperimentalRun*);
+
+    private:
+        const RunRecord* fRunRecord;
+    };
+
+private:
+    friend class SkNVRefCnt<SkTextBlob>;
+
+    enum GlyphPositioning : uint8_t;
+
+    explicit SkTextBlob(const SkRect& bounds);
+
+    ~SkTextBlob();
+
+    void operator delete(void* p);
+    void* operator new(size_t);
+    void* operator new(size_t, void* p);
+
+    static unsigned ScalarsPerGlyph(GlyphPositioning pos);
+
+    using PurgeDelegate = void (*)(uint32_t blobID, uint32_t cacheID);
+
+    void notifyAddedToCache(uint32_t cacheID, PurgeDelegate purgeDelegate) const {
+        fCacheID.store(cacheID);
+        fPurgeDelegate.store(purgeDelegate);
+    }
+
+    friend class sktext::GlyphRunList;
+    friend class SkTextBlobBuilder;
+    friend class SkTextBlobPriv;
+    friend class SkTextBlobRunIterator;
+
+    const SkRect                  fBounds;
+    const uint32_t                fUniqueID;
+    mutable std::atomic<uint32_t> fCacheID;
+    mutable std::atomic<PurgeDelegate> fPurgeDelegate;
+
+    SkDEBUGCODE(size_t fStorageSize;)
+
+
+    using INHERITED = SkRefCnt;
+};
+
+class SK_API SkTextBlobBuilder {
+public:
+
+    SkTextBlobBuilder();
+
+    ~SkTextBlobBuilder();
+
+    sk_sp<SkTextBlob> make();
+
+    struct RunBuffer {
+        SkGlyphID* glyphs;   
+        SkScalar*  pos;      
+        char*      utf8text; 
+        uint32_t*  clusters; 
+
+        SkPoint*    points() const { return reinterpret_cast<SkPoint*>(pos); }
+        SkRSXform*  xforms() const { return reinterpret_cast<SkRSXform*>(pos); }
+    };
+
+    const RunBuffer& allocRun(const SkFont& font, int count, SkScalar x, SkScalar y,
+                              const SkRect* bounds = nullptr);
+
+    const RunBuffer& allocRunPosH(const SkFont& font, int count, SkScalar y,
+                                  const SkRect* bounds = nullptr);
+
+    const RunBuffer& allocRunPos(const SkFont& font, int count,
+                                 const SkRect* bounds = nullptr);
+
+    const RunBuffer& allocRunRSXform(const SkFont& font, int count);
+
+    const RunBuffer& allocRunText(const SkFont& font, int count, SkScalar x, SkScalar y,
+                                  int textByteCount, const SkRect* bounds = nullptr);
+
+    const RunBuffer& allocRunTextPosH(const SkFont& font, int count, SkScalar y, int textByteCount,
+                                      const SkRect* bounds = nullptr);
+
+    const RunBuffer& allocRunTextPos(const SkFont& font, int count, int textByteCount,
+                                     const SkRect* bounds = nullptr);
+
+    const RunBuffer& allocRunTextRSXform(const SkFont& font, int count, int textByteCount,
+                                         const SkRect* bounds = nullptr);
+
+private:
+    void reserve(size_t size);
+    void allocInternal(const SkFont& font, SkTextBlob::GlyphPositioning positioning,
+                       int count, int textBytes, SkPoint offset, const SkRect* bounds);
+    bool mergeRun(const SkFont& font, SkTextBlob::GlyphPositioning positioning,
+                  uint32_t count, SkPoint offset);
+    void updateDeferredBounds();
+
+    static SkRect ConservativeRunBounds(const SkTextBlob::RunRecord&);
+    static SkRect TightRunBounds(const SkTextBlob::RunRecord&);
+
+    friend class SkTextBlobPriv;
+    friend class SkTextBlobBuilderPriv;
+
+    skia_private::AutoTMalloc<uint8_t> fStorage;
+    size_t                 fStorageSize;
+    size_t                 fStorageUsed;
+
+    SkRect                 fBounds;
+    int                    fRunCount;
+    bool                   fDeferredBounds;
+    size_t                 fLastRun; 
+
+    RunBuffer              fCurrentRunBuffer;
+};
+
+#endif

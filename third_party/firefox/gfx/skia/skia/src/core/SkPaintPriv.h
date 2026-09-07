@@ -1,0 +1,41 @@
+/*
+ * Copyright 2013 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkPaintPriv_DEFINED)
+#define SkPaintPriv_DEFINED
+
+#include "include/core/SkColor.h"
+#include "include/core/SkPaint.h"
+
+class SkColorSpace;
+class SkReadBuffer;
+class SkWriteBuffer;
+enum SkColorType : int;
+
+class SkPaintPriv {
+public:
+    enum ShaderOverrideOpacity {
+        kNone_ShaderOverrideOpacity,        
+        kOpaque_ShaderOverrideOpacity,      
+        kNotOpaque_ShaderOverrideOpacity,   
+    };
+
+    static bool Overwrites(const SkPaint* paint, ShaderOverrideOpacity);
+
+    static bool ShouldDither(const SkPaint&, SkColorType);
+
+    static SkColor ComputeLuminanceColor(const SkPaint&);
+
+    static void Flatten(const SkPaint& paint, SkWriteBuffer& buffer);
+
+    static SkPaint Unflatten(SkReadBuffer& buffer);
+
+    static void RemoveColorFilter(SkPaint*, SkColorSpace* dstCS);
+
+};
+
+#endif

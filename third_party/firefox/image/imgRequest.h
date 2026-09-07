@@ -1,0 +1,243 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_image_imgRequest_h
+#define mozilla_image_imgRequest_h
+
+#include "ImageCacheKey.h"
+#include "mozilla/Mutex.h"
+#include "nsCOMPtr.h"
+#include "nsError.h"
+#include "nsIAsyncVerifyRedirectCallback.h"
+#include "nsIChannelEventSink.h"
+#include "nsIInterfaceRequestor.h"
+#include "nsIPrincipal.h"
+#include "nsIStreamListener.h"
+#include "nsIThreadRetargetableStreamListener.h"
+#include "nsProxyRelease.h"
+#include "nsString.h"
+
+class imgCacheValidator;
+class imgLoader;
+class imgRequestProxy;
+class imgCacheEntry;
+class nsIProperties;
+class nsIRequest;
+class nsITimedChannel;
+class nsIURI;
+class nsIReferrerInfo;
+
+namespace mozilla {
+enum CORSMode : uint8_t;
+namespace image {
+class Image;
+class ProgressTracker;
+}  
+}  
+
+struct NewPartResult;
+
+class imgRequest final : public nsIThreadRetargetableStreamListener,
+                         public nsIChannelEventSink,
+                         public nsIInterfaceRequestor,
+                         public nsIAsyncVerifyRedirectCallback {
+  typedef mozilla::image::Image Image;
+  typedef mozilla::image::ImageCacheKey ImageCacheKey;
+  typedef mozilla::image::ProgressTracker ProgressTracker;
+  typedef mozilla::dom::ReferrerPolicy ReferrerPolicy;
+
+ public:
+  imgRequest(imgLoader* aLoader, const ImageCacheKey& aCacheKey);
+
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSISTREAMLISTENER
+  NS_DECL_NSITHREADRETARGETABLESTREAMLISTENER
+  NS_DECL_NSIREQUESTOBSERVER
+  NS_DECL_NSICHANNELEVENTSINK
+  NS_DECL_NSIINTERFACEREQUESTOR
+  NS_DECL_NSIASYNCVERIFYREDIRECTCALLBACK
+
+  [[nodiscard]] nsresult Init(nsIURI* aURI, nsIURI* aFinalURI,
+                              bool aHadInsecureRedirect, nsIRequest* aRequest,
+                              nsIChannel* aChannel, imgCacheEntry* aCacheEntry,
+                              mozilla::dom::Document* aLoadingDocument,
+                              nsIPrincipal* aTriggeringPrincipal,
+                              mozilla::CORSMode aCORSMode,
+                              nsIReferrerInfo* aReferrerInfo);
+
+  void ClearLoader();
+
+  void AddProxy(imgRequestProxy* proxy);
+
+  bool CanReuseWithoutValidation(mozilla::dom::Document*) const;
+
+  nsresult RemoveProxy(imgRequestProxy* proxy, nsresult aStatus);
+
+  void CancelAndAbort(nsresult aStatus);
+
+  void ContinueCancel(nsresult aStatus);
+
+  void ContinueEvict();
+
+  void StartDecoding();
+
+  uint64_t InnerWindowID() const;
+  void SetInnerWindowID(uint64_t aInnerWindowId);
+
+  static void SetCacheValidation(imgCacheEntry* aEntry, nsIRequest* aRequest,
+                                 bool aForceTouch = false);
+
+  bool GetMultipart() const;
+
+  bool HadInsecureRedirect() const;
+
+  mozilla::CORSMode GetCORSMode() const { return mCORSMode; }
+
+  nsIReferrerInfo* GetReferrerInfo() const { return mReferrerInfo; }
+
+  already_AddRefed<nsIPrincipal> GetTriggeringPrincipal() const;
+
+  already_AddRefed<ProgressTracker> GetProgressTracker() const;
+
+  already_AddRefed<Image> GetImage() const;
+
+  inline nsIPrincipal* GetPrincipal() const { return mPrincipal.get(); }
+
+  const ImageCacheKey& CacheKey() const { return mCacheKey; }
+
+  void ResetCacheEntry();
+
+  nsresult GetURI(nsIURI** aURI);
+  nsresult GetFinalURI(nsIURI** aURI);
+  bool IsChrome() const;
+  bool IsData() const;
+
+  nsresult GetImageErrorCode(void);
+
+  const char* GetMimeType() const { return mContentType.get(); }
+
+  int64_t GetContentLength() const { return mContentLength; }
+
+  void GetFileName(nsACString& aFileName);
+
+  int32_t Priority() const;
+
+  void AdjustPriority(imgRequestProxy* aProxy, int32_t aDelta);
+
+  void BoostPriority(uint32_t aCategory);
+
+  nsIRequest* GetRequest() const { return mRequest; }
+
+  nsITimedChannel* GetTimedChannel() const { return mTimedChannel; }
+
+  bool HadCrossOriginRedirects() const;
+
+  imgCacheValidator* GetValidator() const { return mValidator; }
+  void SetValidator(imgCacheValidator* aValidator) { mValidator = aValidator; }
+
+  void* LoadId() const { return mLoadId; }
+  void SetLoadId(void* aLoadId) { mLoadId = aLoadId; }
+
+  void SetCacheEntry(imgCacheEntry* aEntry);
+
+  bool HasCacheEntry() const;
+
+  void SetIsInCache(bool aCacheable);
+
+  void EvictFromCache();
+  void RemoveFromCache();
+
+  void SetProperties(const nsACString& aContentType,
+                     const nsACString& aContentDisposition);
+
+  nsIProperties* Properties() const { return mProperties; }
+
+  bool HasConsumers() const;
+
+  bool ImageAvailable() const;
+
+  bool IsDeniedCrossSiteCORSRequest() const {
+    return mIsDeniedCrossSiteCORSRequest;
+  }
+
+  bool IsCrossSiteNoCORSRequest() const { return mIsCrossSiteNoCORSRequest; }
+
+  bool ShouldReportRenderTimeForLCP() const {
+    return mShouldReportRenderTimeForLCP;
+  }
+
+ private:
+  friend class FinishPreparingForNewPartRunnable;
+
+  virtual ~imgRequest();
+
+  void FinishPreparingForNewPart(const NewPartResult& aResult);
+
+  void UpdateShouldReportRenderTimeForLCP();
+
+  void Cancel(nsresult aStatus);
+
+  void UpdateCacheEntrySize();
+
+  bool IsDecodeRequested() const;
+
+  void AdjustPriorityInternal(int32_t aDelta);
+
+  imgLoader* mLoader;
+  nsCOMPtr<nsIRequest> mRequest;
+  nsCOMPtr<nsIURI> mURI;
+  nsCOMPtr<nsIURI> mFinalURI;
+  nsCOMPtr<nsIPrincipal> mTriggeringPrincipal;
+  nsCOMPtr<nsIPrincipal> mPrincipal;
+  nsCOMPtr<nsIProperties> mProperties;
+  nsCOMPtr<nsIChannel> mChannel;
+  nsCOMPtr<nsIInterfaceRequestor> mPrevChannelSink;
+
+  nsCOMPtr<nsITimedChannel> mTimedChannel;
+
+  nsCString mContentType;
+  int64_t mContentLength = 0;
+
+  RefPtr<imgCacheEntry> mCacheEntry;
+
+  ImageCacheKey mCacheKey;
+
+  void* mLoadId;
+
+  void* mFirstProxy;
+
+  imgCacheValidator* mValidator;
+  nsCOMPtr<nsIAsyncVerifyRedirectCallback> mRedirectCallback;
+  nsCOMPtr<nsIChannel> mNewRedirectChannel;
+
+  nsCOMPtr<nsIReferrerInfo> mReferrerInfo;
+
+  nsresult mImageErrorCode;
+
+  uint32_t mBoostCategoriesRequested = 0;
+
+  mozilla::CORSMode mCORSMode;
+
+  bool mImageAvailable;
+  bool mIsDeniedCrossSiteCORSRequest;
+  bool mIsCrossSiteNoCORSRequest;
+
+  bool mShouldReportRenderTimeForLCP;
+  bool mHadCrossOriginRedirects = false;
+  bool mOffMainThreadData = false;
+
+  mutable mozilla::Mutex mMutex;
+
+  RefPtr<ProgressTracker> mProgressTracker MOZ_GUARDED_BY(mMutex);
+  RefPtr<Image> mImage MOZ_GUARDED_BY(mMutex);
+  bool mIsMultiPartChannel : 1 MOZ_GUARDED_BY(mMutex);
+  bool mIsInCache : 1 MOZ_GUARDED_BY(mMutex);
+  bool mDecodeRequested : 1 MOZ_GUARDED_BY(mMutex);
+  bool mNewPartPending : 1 MOZ_GUARDED_BY(mMutex);
+  bool mHadInsecureRedirect : 1 MOZ_GUARDED_BY(mMutex);
+  uint64_t mInnerWindowId MOZ_GUARDED_BY(mMutex);
+};
+
+#endif  // mozilla_image_imgRequest_h

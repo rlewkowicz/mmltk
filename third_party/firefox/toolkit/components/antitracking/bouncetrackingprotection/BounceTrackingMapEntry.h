@@ -1,0 +1,79 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_BounceTrackingMapEntry_h
+#define mozilla_BounceTrackingMapEntry_h
+
+#include "BounceTrackingRecord.h"
+#include "mozilla/OriginAttributes.h"
+#include "nsIBounceTrackingMapEntry.h"
+#include "nsString.h"
+
+namespace mozilla {
+
+class BTPMapEntry {
+ public:
+  OriginAttributes& OriginAttributesRef() { return mOriginAttributes; }
+
+  nsACString& SiteHostRef() { return mSiteHost; }
+
+  PRTime& TimeStampRef() { return mTimeStamp; }
+
+ protected:
+  BTPMapEntry(const OriginAttributes& aOriginAttributes,
+              const nsACString& aSiteHost, PRTime aTimeStamp)
+      : mOriginAttributes(aOriginAttributes),
+        mSiteHost(aSiteHost),
+        mTimeStamp(aTimeStamp) {}
+
+  OriginAttributes mOriginAttributes;
+  nsAutoCString mSiteHost;
+  PRTime mTimeStamp;
+};
+
+class BounceTrackingMapEntry final : public BTPMapEntry,
+                                     public nsIBounceTrackingMapEntry {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIBOUNCETRACKINGMAPENTRY
+
+  BounceTrackingMapEntry(const OriginAttributes& aOriginAttributes,
+                         const nsACString& aSiteHost, PRTime aTimeStamp)
+      : BTPMapEntry(aOriginAttributes, aSiteHost, aTimeStamp) {}
+
+ private:
+  ~BounceTrackingMapEntry() = default;
+};
+
+class BounceTrackingPurgeEntry final : public BTPMapEntry,
+                                       public nsIBounceTrackingPurgeEntry {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIBOUNCETRACKINGMAPENTRY
+  NS_DECL_NSIBOUNCETRACKINGPURGEENTRY
+  BounceTrackingPurgeEntry(const OriginAttributes& aOriginAttributes,
+                           const nsACString& aSiteHost, PRTime aBounceTime,
+                           PRTime aPurgeTime)
+      : BTPMapEntry(aOriginAttributes, aSiteHost, aBounceTime),
+        mPurgeTime(aPurgeTime) {}
+
+  PRTime& BounceTimeRef() { return mTimeStamp; }
+
+  PRTime& PurgeTimeRef() { return mPurgeTime; }
+
+  const PRTime& PurgeTimeRefConst() const { return mPurgeTime; }
+
+  void SetBounceChainRecord(BounceTrackingRecord* aRecord) {
+    mChainRecord = aRecord;
+  }
+
+ private:
+  ~BounceTrackingPurgeEntry() = default;
+  PRTime mPurgeTime;
+  RefPtr<BounceTrackingRecord> mChainRecord;
+};
+
+}  
+
+#endif

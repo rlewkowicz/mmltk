@@ -1,0 +1,18 @@
+
+[package]
+name = "num_cpus"
+version = "1.16.0"
+authors = ["Sean McArthur <sean@seanmonstar.com>"]
+description = "Get the number of CPUs on a machine."
+documentation = "https://docs.rs/num_cpus"
+keywords = [
+    "cpu",
+    "cpus",
+    "cores",
+]
+categories = ["hardware-support"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/seanmonstar/num_cpus"
+
+[target."cfg(target_os = \"linux\")".dependencies.libc]
+version = "0.2.26"

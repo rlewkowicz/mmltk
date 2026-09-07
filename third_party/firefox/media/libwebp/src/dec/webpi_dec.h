@@ -1,0 +1,91 @@
+// Copyright 2011 Google Inc. All Rights Reserved.
+// Use of this source code is governed by a BSD-style license
+
+#if !defined(WEBP_DEC_WEBPI_DEC_H_)
+#define WEBP_DEC_WEBPI_DEC_H_
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+#include <stddef.h>
+
+#include "src/dec/vp8_dec.h"
+#include "src/utils/rescaler_utils.h"
+#include "src/webp/decode.h"
+#include "src/webp/types.h"
+
+
+typedef struct WebPDecParams WebPDecParams;
+typedef int (*OutputFunc)(const VP8Io* const io, WebPDecParams* const p);
+typedef int (*OutputAlphaFunc)(const VP8Io* const io, WebPDecParams* const p,
+                               int expected_num_out_lines);
+typedef int (*OutputRowFunc)(WebPDecParams* const p, int y_pos,
+                             int max_out_lines);
+
+struct WebPDecParams {
+  WebPDecBuffer* output;             
+  uint8_t* tmp_y, *tmp_u, *tmp_v;    
+
+  int last_y;                 
+  const WebPDecoderOptions* options;  
+
+  WebPRescaler* scaler_y, *scaler_u, *scaler_v, *scaler_a;  
+  void* memory;                  
+
+  OutputFunc emit;               
+  OutputAlphaFunc emit_alpha;    
+  OutputRowFunc emit_alpha_row;  
+};
+
+void WebPResetDecParams(WebPDecParams* const params);
+
+
+typedef struct {
+  const uint8_t* data;         
+  size_t data_size;            
+  int have_all_data;           
+  size_t offset;               
+  const uint8_t* alpha_data;   
+  size_t alpha_data_size;      
+  size_t compressed_size;      
+  size_t riff_size;            
+  int is_lossless;             
+} WebPHeaderStructure;
+
+VP8StatusCode WebPParseHeaders(WebPHeaderStructure* const headers);
+
+
+int WebPCheckCropDimensions(int image_width, int image_height,
+                            int x, int y, int w, int h);
+
+void WebPInitCustomIo(WebPDecParams* const params, VP8Io* const io);
+
+WEBP_NODISCARD int WebPIoInitFromOptions(
+    const WebPDecoderOptions* const options, VP8Io* const io,
+    WEBP_CSP_MODE src_colorspace);
+
+
+VP8StatusCode WebPAllocateDecBuffer(int width, int height,
+                                    const WebPDecoderOptions* const options,
+                                    WebPDecBuffer* const buffer);
+
+VP8StatusCode WebPFlipBuffer(WebPDecBuffer* const buffer);
+
+void WebPCopyDecBuffer(const WebPDecBuffer* const src,
+                       WebPDecBuffer* const dst);
+
+void WebPGrabDecBuffer(WebPDecBuffer* const src, WebPDecBuffer* const dst);
+
+VP8StatusCode WebPCopyDecBufferPixels(const WebPDecBuffer* const src,
+                                      WebPDecBuffer* const dst);
+
+int WebPAvoidSlowMemory(const WebPDecBuffer* const output,
+                        const WebPBitstreamFeatures* const features);
+
+
+#if defined(__cplusplus)
+}    
+#endif
+
+#endif

@@ -1,0 +1,81 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/ByteLengthQueuingStrategy.h"
+
+#include "js/PropertyAndElement.h"
+#include "js/TypeDecls.h"
+#include "mozilla/dom/FunctionBinding.h"
+#include "mozilla/dom/QueuingStrategyBinding.h"
+#include "nsCOMPtr.h"
+#include "nsISupports.h"
+
+namespace mozilla::dom {
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE_INHERITED(ByteLengthQueuingStrategy,
+                                                BaseQueuingStrategy)
+NS_IMPL_ADDREF_INHERITED(ByteLengthQueuingStrategy, BaseQueuingStrategy)
+NS_IMPL_RELEASE_INHERITED(ByteLengthQueuingStrategy, BaseQueuingStrategy)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(ByteLengthQueuingStrategy)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+NS_INTERFACE_MAP_END_INHERITING(BaseQueuingStrategy)
+
+already_AddRefed<ByteLengthQueuingStrategy>
+ByteLengthQueuingStrategy::Constructor(const GlobalObject& aGlobal,
+                                       const QueuingStrategyInit& aInit) {
+  RefPtr<ByteLengthQueuingStrategy> strategy = new ByteLengthQueuingStrategy(
+      aGlobal.GetAsSupports(), aInit.mHighWaterMark);
+  return strategy.forget();
+}
+
+JSObject* ByteLengthQueuingStrategy::WrapObject(
+    JSContext* aCx, JS::Handle<JSObject*> aGivenProto) {
+  return ByteLengthQueuingStrategy_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+static bool ByteLengthQueuingStrategySize(JSContext* cx, unsigned argc,
+                                          JS::Value* vp) {
+  JS::CallArgs args = CallArgsFromVp(argc, vp);
+
+  JS::Rooted<JSObject*> chunkObj(cx, JS::ToObject(cx, args.get(0)));
+  if (!chunkObj) {
+    return false;
+  }
+
+  return JS_GetProperty(cx, chunkObj, "byteLength", args.rval());
+}
+
+already_AddRefed<Function> ByteLengthQueuingStrategy::GetSize(
+    ErrorResult& aRv) {
+  if (RefPtr<Function> fun =
+          mGlobal->GetByteLengthQueuingStrategySizeFunction()) {
+    return fun.forget();
+  }
+
+
+  AutoJSAPI jsapi;
+  if (!jsapi.Init(mGlobal)) {
+    aRv.ThrowUnknownError("Internal error");
+    return nullptr;
+  }
+  JSContext* cx = jsapi.cx();
+
+
+  JS::Rooted<JSFunction*> sizeFunction(
+      cx, JS_NewFunction(cx, ByteLengthQueuingStrategySize, 1, 0, "size"));
+  if (!sizeFunction) {
+    aRv.StealExceptionFromJSContext(cx);
+    return nullptr;
+  }
+
+  JS::Rooted<JSObject*> funObj(cx, JS_GetFunctionObject(sizeFunction));
+  JS::Rooted<JSObject*> global(cx, mGlobal->GetGlobalJSObject());
+  RefPtr<Function> function = new Function(cx, funObj, global, mGlobal);
+  mGlobal->SetByteLengthQueuingStrategySizeFunction(function);
+
+  return function.forget();
+}
+
+}  

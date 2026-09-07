@@ -1,0 +1,417 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef frontend_SourceNotes_h
+#define frontend_SourceNotes_h
+
+#include "mozilla/Assertions.h"  // MOZ_ASSERT
+
+#include <algorithm>  // std::min
+#include <stddef.h>   // ptrdiff_t, size_t
+#include <stdint.h>   // int8_t, uint8_t, uint32_t
+
+#include "jstypes.h"  // js::{Bit, BitMask}
+#include "js/ColumnNumber.h"  // JS::ColumnNumberOffset, JS::LimitedColumnNumberOneOrigin
+
+namespace js {
+
+
+#define FOR_EACH_SRC_NOTE_TYPE(M)                                  \
+  M(ColSpan, "colspan", int8_t(SrcNote::ColSpan::Operands::Count)) \
+                           \
+  M(NewLine, "newline", 0)                                         \
+  M(NewLineColumn, "newlinecolumn",                                \
+    int8_t(SrcNote::NewLineColumn::Operands::Count))               \
+  M(SetLine, "setline", int8_t(SrcNote::SetLine::Operands::Count)) \
+  M(SetLineColumn, "setlinecolumn",                                \
+    int8_t(SrcNote::SetLineColumn::Operands::Count))               \
+                        \
+  M(Breakpoint, "breakpoint", 0)                                   \
+     \
+                                          \
+  M(BreakpointStepSep, "breakpoint-step-sep", 0)                   \
+  M(Unused7, "unused", 0)                                          \
+                  \
+  M(XDelta, "xdelta", 0)
+
+
+enum class SrcNoteType : uint8_t {
+#define DEFINE_SRC_NOTE_TYPE(sym, name, arity) sym,
+  FOR_EACH_SRC_NOTE_TYPE(DEFINE_SRC_NOTE_TYPE)
+#undef DEFINE_SRC_NOTE_TYPE
+
+      Last,
+};
+
+static_assert(uint8_t(SrcNoteType::XDelta) == 8, "XDelta should be 8");
+
+class SrcNote {
+  struct Spec {
+    const char* name_;
+    int8_t arity_;
+  };
+
+  static const Spec specs_[];
+
+  static constexpr unsigned TypeBits = 4;
+  static constexpr unsigned DeltaBits = 4;
+  static constexpr unsigned XDeltaBits = 7;
+
+  static constexpr uint8_t TypeMask = js::BitMask(TypeBits) << DeltaBits;
+  static constexpr ptrdiff_t DeltaMask = js::BitMask(DeltaBits);
+  static constexpr ptrdiff_t XDeltaMask = js::BitMask(XDeltaBits);
+
+  static constexpr ptrdiff_t DeltaLimit = js::Bit(DeltaBits);
+  static constexpr ptrdiff_t XDeltaLimit = js::Bit(XDeltaBits);
+
+  static constexpr inline uint8_t toShiftedTypeBits(SrcNoteType type) {
+    return (uint8_t(type) << DeltaBits);
+  }
+
+  static inline uint8_t noteValue(SrcNoteType type, ptrdiff_t delta) {
+    MOZ_ASSERT((delta & DeltaMask) == delta);
+    return noteValueUnchecked(type, delta);
+  }
+
+  static constexpr inline uint8_t noteValueUnchecked(SrcNoteType type,
+                                                     ptrdiff_t delta) {
+    return toShiftedTypeBits(type) | (delta & DeltaMask);
+  }
+
+  static inline uint8_t xDeltaValue(ptrdiff_t delta) {
+    return toShiftedTypeBits(SrcNoteType::XDelta) | (delta & XDeltaMask);
+  }
+
+  uint8_t value_;
+
+  constexpr explicit SrcNote(uint8_t value) : value_(value) {}
+
+ public:
+  constexpr SrcNote() : value_(noteValueUnchecked(SrcNoteType::XDelta, 0)) {}
+
+  SrcNote(const SrcNote& other) = default;
+  SrcNote& operator=(const SrcNote& other) = default;
+
+  SrcNote(SrcNote&& other) = default;
+  SrcNote& operator=(SrcNote&& other) = default;
+
+  static constexpr SrcNote padding() { return SrcNote(); }
+
+ private:
+  inline uint8_t typeBits() const { return (value_ >> DeltaBits); }
+
+  inline bool isXDelta() const {
+    return typeBits() >= uint8_t(SrcNoteType::XDelta);
+  }
+
+  inline bool isFourBytesOperand() const {
+    return value_ & FourBytesOperandFlag;
+  }
+
+  inline unsigned arity() const {
+    MOZ_ASSERT(uint8_t(type()) < uint8_t(SrcNoteType::Last));
+    return specs_[uint8_t(type())].arity_;
+  }
+
+ public:
+  inline SrcNoteType type() const {
+    if (isXDelta()) {
+      return SrcNoteType::XDelta;
+    }
+    return SrcNoteType(typeBits());
+  }
+
+  const char* name() const {
+    MOZ_ASSERT(uint8_t(type()) < uint8_t(SrcNoteType::Last));
+    return specs_[uint8_t(type())].name_;
+  }
+
+  inline bool isTerminator() const {
+    return value_ == noteValueUnchecked(SrcNoteType::XDelta, 0);
+  }
+
+  inline ptrdiff_t delta() const {
+    if (isXDelta()) {
+      return value_ & XDeltaMask;
+    }
+    return value_ & DeltaMask;
+  }
+
+ private:
+  static constexpr unsigned FourBytesOperandFlag = 0x80;
+  static constexpr unsigned FourBytesOperandMask = 0x7f;
+
+  static constexpr unsigned OperandBits = 31;
+
+ public:
+  static constexpr size_t MaxOperand = (size_t(1) << OperandBits) - 1;
+
+  static inline bool isRepresentableOperand(ptrdiff_t operand) {
+    return 0 <= operand && size_t(operand) <= MaxOperand;
+  }
+
+  class ColSpan {
+   public:
+    enum class Operands {
+      Span,
+      Count
+    };
+
+   private:
+    static constexpr ptrdiff_t ColSpanSignBit = 1 << (OperandBits - 1);
+
+    static inline JS::ColumnNumberOffset fromOperand(ptrdiff_t operand) {
+      MOZ_ASSERT(!(operand & ~((1U << OperandBits) - 1)));
+
+      return JS::ColumnNumberOffset((operand ^ ColSpanSignBit) -
+                                    ColSpanSignBit);
+    }
+
+   public:
+    static constexpr ptrdiff_t MinColSpan = -ColSpanSignBit;
+    static constexpr ptrdiff_t MaxColSpan = ColSpanSignBit - 1;
+
+    static inline ptrdiff_t toOperand(JS::ColumnNumberOffset colspan) {
+      ptrdiff_t operand = colspan.value() & ((1U << OperandBits) - 1);
+
+      MOZ_ASSERT(fromOperand(operand) == colspan);
+      return operand;
+    }
+
+    static inline JS::ColumnNumberOffset getSpan(const SrcNote* sn);
+  };
+
+  class NewLineColumn {
+   public:
+    enum class Operands { Column, Count };
+
+   private:
+    static inline JS::LimitedColumnNumberOneOrigin fromOperand(
+        ptrdiff_t operand) {
+      return JS::LimitedColumnNumberOneOrigin(operand);
+    }
+
+   public:
+    static inline ptrdiff_t toOperand(JS::LimitedColumnNumberOneOrigin column) {
+      return column.oneOriginValue();
+    }
+
+    static inline JS::LimitedColumnNumberOneOrigin getColumn(const SrcNote* sn);
+  };
+
+  class SetLine {
+   public:
+    enum class Operands {
+      Line,
+      Count
+    };
+
+   private:
+    static inline size_t fromOperand(ptrdiff_t operand) {
+      return size_t(operand);
+    }
+
+   public:
+    static inline unsigned lengthFor(unsigned line, size_t initialLine) {
+      unsigned operandSize = toOperand(line, initialLine) >
+                                     ptrdiff_t(SrcNote::FourBytesOperandMask)
+                                 ? 4
+                                 : 1;
+      return 1  + operandSize;
+    }
+
+    static inline ptrdiff_t toOperand(size_t line, size_t initialLine) {
+      MOZ_ASSERT(line >= initialLine);
+      return ptrdiff_t(line - initialLine);
+    }
+
+    static inline size_t getLine(const SrcNote* sn, size_t initialLine);
+  };
+
+  class SetLineColumn {
+   public:
+    enum class Operands { Line, Column, Count };
+
+   private:
+    static inline size_t lineFromOperand(ptrdiff_t operand) {
+      return size_t(operand);
+    }
+
+    static inline JS::LimitedColumnNumberOneOrigin columnFromOperand(
+        ptrdiff_t operand) {
+      return JS::LimitedColumnNumberOneOrigin(operand);
+    }
+
+   public:
+    static inline ptrdiff_t columnToOperand(
+        JS::LimitedColumnNumberOneOrigin column) {
+      return column.oneOriginValue();
+    }
+
+    static inline size_t getLine(const SrcNote* sn, size_t initialLine);
+    static inline JS::LimitedColumnNumberOneOrigin getColumn(const SrcNote* sn);
+  };
+
+  friend class SrcNoteWriter;
+  friend class SrcNoteReader;
+  friend class SrcNoteIterator;
+};
+
+class SrcNoteWriter {
+ public:
+  template <typename T>
+  static bool writeNote(SrcNoteType type, ptrdiff_t delta, T allocator) {
+    while (delta >= SrcNote::DeltaLimit) {
+      ptrdiff_t xdelta = std::min(delta, SrcNote::XDeltaMask);
+      SrcNote* sn = allocator(1);
+      if (!sn) {
+        return false;
+      }
+      sn->value_ = SrcNote::xDeltaValue(xdelta);
+      delta -= xdelta;
+    }
+
+    SrcNote* sn = allocator(1);
+    if (!sn) {
+      return false;
+    }
+    sn->value_ = SrcNote::noteValue(type, delta);
+    return true;
+  }
+
+  static void convertNote(SrcNote* sn, SrcNoteType newType) {
+    ptrdiff_t delta = sn->delta();
+    sn->value_ = SrcNote::noteValue(newType, delta);
+  }
+
+  template <typename T>
+  static bool writeOperand(ptrdiff_t operand, T allocator) {
+    if (operand > ptrdiff_t(SrcNote::FourBytesOperandMask)) {
+      SrcNote* sn = allocator(4);
+      if (!sn) {
+        return false;
+      }
+
+      sn[0].value_ = (SrcNote::FourBytesOperandFlag | (operand >> 24));
+      sn[1].value_ = operand >> 16;
+      sn[2].value_ = operand >> 8;
+      sn[3].value_ = operand;
+    } else {
+      SrcNote* sn = allocator(1);
+      if (!sn) {
+        return false;
+      }
+
+      sn[0].value_ = operand;
+    }
+
+    return true;
+  }
+};
+
+class SrcNoteReader {
+  template <typename T>
+  static T getOperandHead(T sn, unsigned which) {
+    MOZ_ASSERT(sn->type() != SrcNoteType::XDelta);
+    MOZ_ASSERT(uint8_t(which) < sn->arity());
+
+    T curr = sn + 1;
+    for (; which; which--) {
+      if (curr->isFourBytesOperand()) {
+        curr += 4;
+      } else {
+        curr++;
+      }
+    }
+    return curr;
+  }
+
+ public:
+  static ptrdiff_t getOperand(const SrcNote* sn, unsigned which) {
+    const SrcNote* head = getOperandHead(sn, which);
+
+    if (head->isFourBytesOperand()) {
+      return ptrdiff_t(
+          (uint32_t(head[0].value_ & SrcNote::FourBytesOperandMask) << 24) |
+          (uint32_t(head[1].value_) << 16) | (uint32_t(head[2].value_) << 8) |
+          uint32_t(head[3].value_));
+    }
+
+    return ptrdiff_t(head[0].value_);
+  }
+};
+
+inline JS::ColumnNumberOffset SrcNote::ColSpan::getSpan(const SrcNote* sn) {
+  return fromOperand(SrcNoteReader::getOperand(sn, unsigned(Operands::Span)));
+}
+
+inline JS::LimitedColumnNumberOneOrigin SrcNote::NewLineColumn::getColumn(
+    const SrcNote* sn) {
+  return fromOperand(SrcNoteReader::getOperand(sn, unsigned(Operands::Column)));
+}
+
+inline size_t SrcNote::SetLine::getLine(const SrcNote* sn, size_t initialLine) {
+  return initialLine +
+         fromOperand(SrcNoteReader::getOperand(sn, unsigned(Operands::Line)));
+}
+
+inline size_t SrcNote::SetLineColumn::getLine(const SrcNote* sn,
+                                              size_t initialLine) {
+  return initialLine + lineFromOperand(SrcNoteReader::getOperand(
+                           sn, unsigned(Operands::Line)));
+}
+
+inline JS::LimitedColumnNumberOneOrigin SrcNote::SetLineColumn::getColumn(
+    const SrcNote* sn) {
+  return columnFromOperand(
+      SrcNoteReader::getOperand(sn, unsigned(Operands::Column)));
+}
+
+class SrcNoteIterator {
+  const SrcNote* current_;
+  const SrcNote* end_;
+
+  void next() {
+    unsigned arity = current_->arity();
+    current_++;
+
+    for (; arity; arity--) {
+      if (current_->isFourBytesOperand()) {
+        current_ += 4;
+      } else {
+        current_++;
+      }
+    }
+  }
+
+ public:
+  SrcNoteIterator() = delete;
+
+  SrcNoteIterator(const SrcNoteIterator& other) = delete;
+  SrcNoteIterator& operator=(const SrcNoteIterator& other) = delete;
+
+  SrcNoteIterator(SrcNoteIterator&& other) = default;
+  SrcNoteIterator& operator=(SrcNoteIterator&& other) = default;
+
+  SrcNoteIterator(const SrcNote* sn, const SrcNote* end)
+      : current_(sn), end_(end) {}
+
+  bool atEnd() const {
+    MOZ_ASSERT(current_ <= end_);
+    return current_ == end_ || current_->isTerminator();
+  }
+
+  const SrcNote* operator*() const { return current_; }
+
+  SrcNoteIterator& operator++() {
+    next();
+    return *this;
+  }
+
+  SrcNoteIterator operator++(int) = delete;
+};
+
+}  
+
+#endif /* frontend_SourceNotes_h */

@@ -1,0 +1,104 @@
+// Copyright 2022 The Abseil Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//     https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef ABSL_CRC_INTERNAL_CRC_CORD_STATE_H_
+#define ABSL_CRC_INTERNAL_CRC_CORD_STATE_H_
+
+#include <atomic>
+#include <cstddef>
+#include <deque>
+
+#include "absl/base/config.h"
+#include "absl/crc/crc32c.h"
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace crc_internal {
+
+class CrcCordState {
+ public:
+  CrcCordState();
+  CrcCordState(const CrcCordState&);
+  CrcCordState(CrcCordState&&);
+
+  ~CrcCordState();
+
+  CrcCordState& operator=(const CrcCordState&);
+  CrcCordState& operator=(CrcCordState&&);
+
+  struct PrefixCrc {
+    PrefixCrc() = default;
+    PrefixCrc(size_t length_arg, absl::crc32c_t crc_arg)
+        : length(length_arg), crc(crc_arg) {}
+
+    size_t length = 0;
+
+    absl::crc32c_t crc = absl::crc32c_t{0};
+  };
+
+  struct Rep {
+    PrefixCrc removed_prefix;
+
+    std::deque<PrefixCrc> prefix_crc;
+  };
+
+  const Rep& rep() const { return refcounted_rep_->rep; }
+
+  Rep* mutable_rep() {
+    if (refcounted_rep_->count.load(std::memory_order_acquire) != 1) {
+      RefcountedRep* copy = new RefcountedRep;
+      copy->rep = refcounted_rep_->rep;
+      Unref(refcounted_rep_);
+      refcounted_rep_ = copy;
+    }
+    return &refcounted_rep_->rep;
+  }
+
+  absl::crc32c_t Checksum() const;
+
+  bool IsNormalized() const { return rep().removed_prefix.length == 0; }
+
+  void Normalize();
+
+  size_t NumChunks() const { return rep().prefix_crc.size(); }
+
+  PrefixCrc NormalizedPrefixCrcAtNthChunk(size_t n) const;
+
+  void Poison();
+
+ private:
+  struct RefcountedRep {
+    std::atomic<int32_t> count{1};
+    Rep rep;
+  };
+
+  static RefcountedRep* RefSharedEmptyRep();
+
+  static void Ref(RefcountedRep* r) {
+    assert(r != nullptr);
+    r->count.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  static void Unref(RefcountedRep* r) {
+    assert(r != nullptr);
+    if (r->count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+      delete r;
+    }
+  }
+
+  RefcountedRep* refcounted_rep_;
+};
+
+}  
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_CRC_INTERNAL_CRC_CORD_STATE_H_

@@ -1,0 +1,142 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsHttpRequestHead_h_
+#define nsHttpRequestHead_h_
+
+#include "nsHttp.h"
+#include "nsHttpHeaderArray.h"
+#include "nsString.h"
+#include "mozilla/RecursiveMutex.h"
+
+class nsIHttpHeaderVisitor;
+
+namespace IPC {
+template <typename>
+struct ParamTraits;
+}  
+
+namespace mozilla {
+namespace net {
+
+class DictionaryCacheEntry;
+
+
+class nsHttpRequestHead {
+ public:
+  nsHttpRequestHead();
+  explicit nsHttpRequestHead(const nsHttpRequestHead& aRequestHead);
+  nsHttpRequestHead(nsHttpRequestHead&& aRequestHead);
+  ~nsHttpRequestHead();
+
+  nsHttpRequestHead& operator=(const nsHttpRequestHead& aRequestHead);
+
+  const nsHttpHeaderArray& Headers() const MOZ_REQUIRES(mRecursiveMutex);
+  void Enter() const MOZ_CAPABILITY_ACQUIRE(mRecursiveMutex) {
+    mRecursiveMutex.Lock();
+  }
+  void Exit() const MOZ_CAPABILITY_RELEASE(mRecursiveMutex) {
+    mRecursiveMutex.Unlock();
+  }
+
+  void SetHeaders(const nsHttpHeaderArray& aHeaders);
+
+  void SetMethod(const nsACString& method);
+  void SetVersion(HttpVersion version);
+  void SetRequestURI(const nsACString& s);
+  void SetPath(const nsACString& s);
+  void SetDictionary(DictionaryCacheEntry* aDict);
+  uint32_t HeaderCount();
+
+  [[nodiscard]] nsresult VisitHeaders(
+      nsIHttpHeaderVisitor* visitor,
+      nsHttpHeaderArray::VisitorFilter filter = nsHttpHeaderArray::eFilterAll);
+  void Method(nsACString& aMethod) const;
+  HttpVersion Version() const;
+  void RequestURI(nsACString& RequestURI) const;
+  void Path(nsACString& aPath) const;
+  void SetHTTPS(bool val);
+  bool IsHTTPS() const;
+
+  void SetOrigin(const nsACString& scheme, const nsACString& host,
+                 int32_t port);
+  void Origin(nsACString& aOrigin) const;
+
+  [[nodiscard]] nsresult SetHeader(const nsACString& h, const nsACString& v,
+                                   bool m = false);
+  [[nodiscard]] nsresult SetHeader(const nsACString& h, const nsACString& v,
+                                   bool m,
+                                   nsHttpHeaderArray::HeaderVariety variety);
+  [[nodiscard]] nsresult SetHeader(const nsHttpAtom& h, const nsACString& v,
+                                   bool m = false);
+  [[nodiscard]] nsresult SetHeader(const nsHttpAtom& h, const nsACString& v,
+                                   bool m,
+                                   nsHttpHeaderArray::HeaderVariety variety);
+  [[nodiscard]] nsresult SetEmptyHeader(const nsACString& h);
+  [[nodiscard]] nsresult GetHeader(const nsHttpAtom& h, nsACString& v) const;
+
+  [[nodiscard]] nsresult ClearHeader(const nsHttpAtom& h);
+  void ClearHeaders();
+
+  bool HasHeaderValue(const nsHttpAtom& h, const char* v) const;
+  bool HasHeader(const nsHttpAtom& h) const;
+  void Flatten(nsACString&, bool pruneProxyHeaders = false) const;
+
+  [[nodiscard]] nsresult SetHeaderOnce(const nsHttpAtom& h, const char* v,
+                                       bool merge = false);
+
+  bool IsSafeMethod() const;
+
+  enum ParsedMethodType {
+    kMethod_Custom,
+    kMethod_Get,
+    kMethod_Post,
+    kMethod_Patch,
+    kMethod_Options,
+    kMethod_Connect,
+    kMethod_Head,
+    kMethod_Put,
+    kMethod_Trace
+  };
+
+  static void ParseMethod(const nsCString& aRawMethod,
+                          ParsedMethodType& aParsedMethod);
+
+  ParsedMethodType ParsedMethod() const;
+  bool EqualsMethod(ParsedMethodType aType) const;
+  bool IsGet() const { return EqualsMethod(kMethod_Get); }
+  bool IsPost() const { return EqualsMethod(kMethod_Post); }
+  bool IsPatch() const { return EqualsMethod(kMethod_Patch); }
+  bool IsOptions() const { return EqualsMethod(kMethod_Options); }
+  bool IsConnect() const { return EqualsMethod(kMethod_Connect); }
+  bool IsHead() const { return EqualsMethod(kMethod_Head); }
+  bool IsPut() const { return EqualsMethod(kMethod_Put); }
+  bool IsTrace() const { return EqualsMethod(kMethod_Trace); }
+  void ParseHeaderSet(const char* buffer);
+
+ private:
+  nsHttpHeaderArray mHeaders MOZ_GUARDED_BY(mRecursiveMutex);
+  nsCString mMethod MOZ_GUARDED_BY(mRecursiveMutex){"GET"_ns};
+  HttpVersion mVersion MOZ_GUARDED_BY(mRecursiveMutex){HttpVersion::v1_1};
+
+  nsCString mRequestURI MOZ_GUARDED_BY(mRecursiveMutex);
+  nsCString mPath MOZ_GUARDED_BY(mRecursiveMutex);
+
+  RefPtr<DictionaryCacheEntry> mDict MOZ_GUARDED_BY(mRecursiveMutex);
+
+  nsCString mOrigin MOZ_GUARDED_BY(mRecursiveMutex);
+  ParsedMethodType mParsedMethod MOZ_GUARDED_BY(mRecursiveMutex){kMethod_Get};
+  bool mHTTPS MOZ_GUARDED_BY(mRecursiveMutex){false};
+
+  mutable RecursiveMutex mRecursiveMutex{"nsHttpRequestHead.mRecursiveMutex"};
+
+  uint32_t mInVisitHeaders MOZ_GUARDED_BY(mRecursiveMutex){0};
+
+  friend struct IPC::ParamTraits<nsHttpRequestHead>;
+};
+
+}  
+}  
+
+#endif  // nsHttpRequestHead_h_

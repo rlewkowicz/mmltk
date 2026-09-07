@@ -1,0 +1,85 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_intl_LocaleService_h_
+#define mozilla_intl_LocaleService_h_
+
+#include "nsIObserver.h"
+#include "nsString.h"
+#include "nsTArray.h"
+#include "nsWeakReference.h"
+#include "MozLocaleBindings.h"
+#include "mozilla/intl/ICU4CGlue.h"
+#include "mozILocaleService.h"
+
+namespace mozilla {
+namespace intl {
+
+class LocaleService final : public mozILocaleService,
+                            public nsIObserver,
+                            public nsSupportsWeakReference {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+  NS_DECL_MOZILOCALESERVICE
+
+  static const int32_t kLangNegStrategyFiltering = 0;
+  static const int32_t kLangNegStrategyMatching = 1;
+  static const int32_t kLangNegStrategyLookup = 2;
+
+  explicit LocaleService(bool aIsServer);
+
+  static LocaleService* GetInstance();
+
+  static already_AddRefed<LocaleService> GetInstanceAddRefed() {
+    return RefPtr<LocaleService>(GetInstance()).forget();
+  }
+
+  static bool CanonicalizeLanguageId(nsACString& aLocale) {
+    return ffi::unic_langid_canonicalize(&aLocale);
+  }
+  void AssignAppLocales(const nsTArray<nsCString>& aAppLocales);
+  void AssignRequestedLocales(const nsTArray<nsCString>& aRequestedLocales);
+
+  void RequestedLocalesChanged();
+  void LocalesChanged();
+
+  void WebExposedLocalesChanged();
+
+  static bool IsLocaleRTL(const nsACString& aLocale);
+
+  bool IsAppLocaleRTL();
+
+  bool AlwaysAppendAccesskeys();
+
+  bool InsertSeparatorBeforeAccesskeys();
+
+  static bool LanguagesMatch(const nsACString& aRequested,
+                             const nsACString& aAvailable);
+
+  bool IsServer();
+
+ private:
+  void NegotiateAppLocales(nsTArray<nsCString>& aRetVal);
+
+  void InitPackagedLocales();
+
+  void RemoveObservers();
+
+  virtual ~LocaleService() = default;
+
+  nsAutoCStringN<16> mDefaultLocale;
+  nsTArray<nsCString> mAppLocales;
+  nsTArray<nsCString> mRequestedLocales;
+  nsTArray<nsCString> mAvailableLocales;
+  nsTArray<nsCString> mPackagedLocales;
+  nsTArray<nsCString> mWebExposedLocales;
+  const bool mIsServer;
+
+  static StaticRefPtr<LocaleService> sInstance;
+};
+}  
+}  
+
+#endif /* mozilla_intl_LocaleService_h_ */

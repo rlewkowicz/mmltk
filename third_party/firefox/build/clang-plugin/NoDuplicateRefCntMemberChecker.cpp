@@ -1,0 +1,57 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "NoDuplicateRefCntMemberChecker.h"
+#include "CustomMatchers.h"
+
+void NoDuplicateRefCntMemberChecker::registerMatchers(MatchFinder *AstMatcher) {
+  AstMatcher->addMatcher(
+      cxxRecordDecl(hasDefinition(), hasAnyBase(hasType(cxxRecordDecl(
+                                         has(fieldDecl(hasName("mRefCnt")))))))
+          .bind("decl"),
+      this);
+}
+
+void NoDuplicateRefCntMemberChecker::check(
+    const MatchFinder::MatchResult &Result) {
+  const CXXRecordDecl *D = Result.Nodes.getNodeAs<CXXRecordDecl>("decl");
+  const FieldDecl *RefCntMember = getClassRefCntMember(D);
+  const FieldDecl *FoundRefCntBase = nullptr;
+
+  if (!RefCntMember && D->getNumBases() < 2) {
+    return;
+  }
+
+  for (auto &Base : D->bases()) {
+    const FieldDecl *BaseRefCntMember = getBaseRefCntMember(Base.getType());
+
+    if (BaseRefCntMember) {
+      if (RefCntMember) {
+        const char *Error = "Refcounted record %0 has multiple mRefCnt members";
+        const char *Note1 = "Superclass %0 also has an mRefCnt member";
+        const char *Note2 =
+            "Consider using the _INHERITED macros for AddRef and Release here";
+
+        diag(D->getBeginLoc(), Error, DiagnosticIDs::Error) << D;
+        diag(BaseRefCntMember->getBeginLoc(), Note1, DiagnosticIDs::Note)
+            << BaseRefCntMember->getParent();
+        diag(RefCntMember->getBeginLoc(), Note2, DiagnosticIDs::Note);
+      }
+
+      if (FoundRefCntBase) {
+        const char *Error = "Refcounted record %0 has multiple superclasses "
+                            "with mRefCnt members";
+        const char *Note = "Superclass %0 has an mRefCnt member";
+
+        diag(D->getBeginLoc(), Error, DiagnosticIDs::Error) << D;
+        diag(BaseRefCntMember->getBeginLoc(), Note, DiagnosticIDs::Note)
+            << BaseRefCntMember->getParent();
+        diag(FoundRefCntBase->getBeginLoc(), Note, DiagnosticIDs::Note)
+            << FoundRefCntBase->getParent();
+      }
+
+      FoundRefCntBase = BaseRefCntMember;
+    }
+  }
+}

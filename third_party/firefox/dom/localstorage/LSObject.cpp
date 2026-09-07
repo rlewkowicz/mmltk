@@ -1,0 +1,1020 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "LSObject.h"
+
+#include "ActorsChild.h"
+#include "LSDatabase.h"
+#include "LSObserver.h"
+
+#include <utility>
+
+#include "MainThreadUtils.h"
+#include "mozilla/AppShutdown.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/Monitor.h"
+#include "mozilla/OriginAttributes.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/RemoteLazyInputStreamThread.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/SpinEventLoopUntil.h"
+#include "mozilla/StaticMutex.h"
+#include "mozilla/StorageAccess.h"
+#include "mozilla/dom/ClientInfo.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/LocalStorageCommon.h"
+#include "mozilla/dom/PBackgroundLSRequest.h"
+#include "mozilla/dom/PBackgroundLSSharedTypes.h"
+#include "mozilla/dom/quota/PrincipalUtils.h"
+#include "mozilla/ipc/BackgroundChild.h"
+#include "mozilla/ipc/BackgroundUtils.h"
+#include "mozilla/ipc/PBackgroundChild.h"
+#include "nsCOMPtr.h"
+#include "nsContentUtils.h"
+#include "nsDebug.h"
+#include "nsError.h"
+#include "nsIEventTarget.h"
+#include "nsIPrincipal.h"
+#include "nsIRunnable.h"
+#include "nsIScriptObjectPrincipal.h"
+#include "nsISerialEventTarget.h"
+#include "nsITimer.h"
+#include "nsPIDOMWindow.h"
+#include "nsString.h"
+#include "nsTArray.h"
+#include "nsTStringRepr.h"
+#include "nsThread.h"
+#include "nsThreadUtils.h"
+#include "nsXULAppAPI.h"
+#include "nscore.h"
+
+#define FAILSAFE_CANCEL_SYNC_OP_MS 50000
+
+#define SYNC_OP_WAKE_INTERVAL_MS 500
+
+namespace mozilla::dom {
+
+namespace {
+
+class RequestHelper;
+
+class RequestHelper final : public Runnable, public LSRequestChildCallback {
+  enum class State {
+    Initial,
+    ResponsePending,
+    Canceling,
+    Complete
+  };
+
+  RefPtr<LSObject> mObject;
+  nsCOMPtr<nsIEventTarget> mOwningEventTarget;
+  LSRequestChild* mActor;
+  const LSRequestParams mParams;
+  Monitor mMonitor;
+  LSRequestResponse mResponse MOZ_GUARDED_BY(mMonitor);
+  nsresult mResultCode MOZ_GUARDED_BY(mMonitor);
+  State mState MOZ_GUARDED_BY(mMonitor);
+
+ public:
+  RequestHelper(LSObject* aObject, const LSRequestParams& aParams)
+      : Runnable("dom::RequestHelper"),
+        mObject(aObject),
+        mOwningEventTarget(GetCurrentSerialEventTarget()),
+        mActor(nullptr),
+        mParams(aParams),
+        mMonitor("dom::RequestHelper::mMonitor"),
+        mResultCode(NS_OK),
+        mState(State::Initial) {}
+
+  bool IsOnOwningThread() const {
+    MOZ_ASSERT(mOwningEventTarget);
+
+    bool current;
+    return NS_SUCCEEDED(mOwningEventTarget->IsOnCurrentThread(&current)) &&
+           current;
+  }
+
+  void AssertIsOnOwningThread() const {
+    MOZ_ASSERT(NS_IsMainThread());
+    MOZ_ASSERT(IsOnOwningThread());
+  }
+
+  nsresult StartAndReturnResponse(LSRequestResponse& aResponse);
+
+ private:
+  ~RequestHelper() = default;
+
+  NS_DECL_ISUPPORTS_INHERITED
+
+  NS_DECL_NSIRUNNABLE
+
+  void OnResponse(LSRequestResponse&& aResponse) override;
+};
+
+void AssertExplicitSnapshotInvariants(const LSObject& aObject) {
+  MOZ_ASSERT(aObject.InExplicitSnapshot());
+
+  MOZ_ASSERT(aObject.DatabaseStrongRef());
+
+  MOZ_ASSERT(!aObject.DatabaseStrongRef()->IsAllowedToClose());
+}
+
+}  
+
+LSObject::LSObject(nsPIDOMWindowInner* aWindow, nsIPrincipal* aPrincipal,
+                   nsIPrincipal* aStoragePrincipal)
+    : Storage(aWindow, aPrincipal, aStoragePrincipal),
+      mPrivateBrowsingId(0),
+      mInExplicitSnapshot(false) {
+  AssertIsOnOwningThread();
+  MOZ_ASSERT(NextGenLocalStorageEnabled());
+}
+
+LSObject::~LSObject() {
+  AssertIsOnOwningThread();
+
+  DropObserver();
+}
+
+nsresult LSObject::CreateForWindow(nsPIDOMWindowInner* aWindow,
+                                   Storage** aStorage) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aWindow);
+  MOZ_ASSERT(aStorage);
+  MOZ_ASSERT(NextGenLocalStorageEnabled());
+  MOZ_ASSERT(StorageAllowedForWindow(aWindow) != StorageAccess::eDeny);
+
+  nsCOMPtr<nsIScriptObjectPrincipal> sop = do_QueryInterface(aWindow);
+  MOZ_ASSERT(sop);
+
+  nsCOMPtr<nsIPrincipal> principal = sop->GetPrincipal();
+  if (NS_WARN_IF(!principal)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsCOMPtr<nsIPrincipal> storagePrincipal = sop->GetEffectiveStoragePrincipal();
+  if (NS_WARN_IF(!storagePrincipal)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (principal->IsSystemPrincipal()) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  nsCString originAttrSuffix;
+  nsCString originKey;
+  nsresult rv = storagePrincipal->GetStorageOriginKey(originKey);
+  storagePrincipal->OriginAttributesRef().CreateSuffix(originAttrSuffix);
+
+  if (NS_FAILED(rv)) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  auto principalInfo = MakeUnique<PrincipalInfo>();
+  rv = PrincipalToPrincipalInfo(principal, principalInfo.get());
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  MOZ_ASSERT(principalInfo->type() == PrincipalInfo::TContentPrincipalInfo);
+
+  auto storagePrincipalInfo = MakeUnique<PrincipalInfo>();
+  rv = PrincipalToPrincipalInfo(storagePrincipal, storagePrincipalInfo.get());
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  MOZ_ASSERT(storagePrincipalInfo->type() ==
+             PrincipalInfo::TContentPrincipalInfo);
+
+  if (NS_WARN_IF(!quota::IsPrincipalInfoValid(*storagePrincipalInfo))) {
+    return NS_ERROR_FAILURE;
+  }
+
+#ifdef DEBUG
+  QM_TRY_INSPECT(const auto& principalMetadata,
+                 quota::GetInfoFromPrincipal(storagePrincipal.get()));
+
+  MOZ_ASSERT(originAttrSuffix == principalMetadata.mSuffix);
+
+  const auto& origin = principalMetadata.mOrigin;
+#else
+  QM_TRY_INSPECT(const auto& origin,
+                 quota::GetOriginFromPrincipal(storagePrincipal.get()));
+#endif
+
+  uint32_t privateBrowsingId;
+  rv = storagePrincipal->GetPrivateBrowsingId(&privateBrowsingId);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  Maybe<ClientInfo> clientInfo = aWindow->GetClientInfo();
+  if (clientInfo.isNothing()) {
+    return NS_ERROR_FAILURE;
+  }
+
+  Maybe<nsID> clientId = Some(clientInfo.ref().Id());
+
+  Maybe<PrincipalInfo> clientPrincipalInfo =
+      Some(clientInfo.ref().PrincipalInfo());
+
+  nsString documentURI;
+  if (nsCOMPtr<Document> doc = aWindow->GetExtantDoc()) {
+    rv = doc->GetDocumentURI(documentURI);
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      return rv;
+    }
+  }
+
+  RefPtr<LSObject> object = new LSObject(aWindow, principal, storagePrincipal);
+  object->mPrincipalInfo = std::move(principalInfo);
+  object->mStoragePrincipalInfo = std::move(storagePrincipalInfo);
+  object->mPrivateBrowsingId = privateBrowsingId;
+  object->mClientId = std::move(clientId);
+  object->mClientPrincipalInfo = std::move(clientPrincipalInfo);
+  object->mOrigin = origin;
+  object->mOriginKey = originKey;
+  object->mDocumentURI = documentURI;
+
+  object.forget(aStorage);
+  return NS_OK;
+}
+
+nsresult LSObject::CreateForPrincipal(nsPIDOMWindowInner* aWindow,
+                                      nsIPrincipal* aPrincipal,
+                                      nsIPrincipal* aStoragePrincipal,
+                                      const nsAString& aDocumentURI,
+                                      bool aPrivate, LSObject** aObject) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aPrincipal);
+  MOZ_ASSERT(aStoragePrincipal);
+  MOZ_ASSERT(aObject);
+
+  nsCString originAttrSuffix;
+  nsCString originKey;
+  nsresult rv = aStoragePrincipal->GetStorageOriginKey(originKey);
+  aStoragePrincipal->OriginAttributesRef().CreateSuffix(originAttrSuffix);
+  if (NS_FAILED(rv)) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  auto principalInfo = MakeUnique<PrincipalInfo>();
+  rv = PrincipalToPrincipalInfo(aPrincipal, principalInfo.get());
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  MOZ_ASSERT(principalInfo->type() == PrincipalInfo::TContentPrincipalInfo ||
+             principalInfo->type() == PrincipalInfo::TSystemPrincipalInfo);
+
+  auto storagePrincipalInfo = MakeUnique<PrincipalInfo>();
+  rv = PrincipalToPrincipalInfo(aStoragePrincipal, storagePrincipalInfo.get());
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  MOZ_ASSERT(
+      storagePrincipalInfo->type() == PrincipalInfo::TContentPrincipalInfo ||
+      storagePrincipalInfo->type() == PrincipalInfo::TSystemPrincipalInfo);
+
+  if (NS_WARN_IF(!quota::IsPrincipalInfoValid(*storagePrincipalInfo))) {
+    return NS_ERROR_FAILURE;
+  }
+
+#ifdef DEBUG
+  QM_TRY_INSPECT(
+      const auto& principalMetadata,
+      ([&storagePrincipalInfo,
+        &aPrincipal]() -> Result<quota::PrincipalMetadata, nsresult> {
+        if (storagePrincipalInfo->type() ==
+            PrincipalInfo::TSystemPrincipalInfo) {
+          return quota::GetInfoForChrome();
+        }
+
+        QM_TRY_RETURN(quota::GetInfoFromPrincipal(aPrincipal));
+      }()));
+
+  MOZ_ASSERT(originAttrSuffix == principalMetadata.mSuffix);
+
+  const auto& origin = principalMetadata.mOrigin;
+#else
+  QM_TRY_INSPECT(const auto& origin,
+                 ([&storagePrincipalInfo,
+                   &aPrincipal]() -> Result<nsAutoCString, nsresult> {
+                   if (storagePrincipalInfo->type() ==
+                       PrincipalInfo::TSystemPrincipalInfo) {
+                     return nsAutoCString{quota::GetOriginForChrome()};
+                   }
+
+                   QM_TRY_RETURN(quota::GetOriginFromPrincipal(aPrincipal));
+                 }()));
+#endif
+
+  Maybe<nsID> clientId;
+  if (aWindow) {
+    Maybe<ClientInfo> clientInfo = aWindow->GetClientInfo();
+    if (clientInfo.isNothing()) {
+      return NS_ERROR_FAILURE;
+    }
+
+    clientId = Some(clientInfo.ref().Id());
+  } else if (Preferences::GetBool("dom.storage.client_validation")) {
+    return NS_ERROR_FAILURE;
+  }
+
+  RefPtr<LSObject> object =
+      new LSObject(aWindow, aPrincipal, aStoragePrincipal);
+  object->mPrincipalInfo = std::move(principalInfo);
+  object->mStoragePrincipalInfo = std::move(storagePrincipalInfo);
+  object->mPrivateBrowsingId = aPrivate ? 1 : 0;
+  object->mClientId = std::move(clientId);
+  object->mOrigin = origin;
+  object->mOriginKey = originKey;
+  object->mDocumentURI = aDocumentURI;
+
+  object.forget(aObject);
+  return NS_OK;
+}  
+
+LSRequestChild* LSObject::StartRequest(const LSRequestParams& aParams,
+                                       LSRequestChildCallback* aCallback) {
+  AssertIsOnDOMFileThread();
+
+  mozilla::ipc::PBackgroundChild* backgroundActor =
+      mozilla::ipc::BackgroundChild::GetOrCreateForCurrentThread();
+  if (NS_WARN_IF(!backgroundActor)) {
+    return nullptr;
+  }
+
+  LSRequestChild* actor = new LSRequestChild();
+
+  if (!backgroundActor->SendPBackgroundLSRequestConstructor(actor, aParams)) {
+    return nullptr;
+  }
+
+  actor->SetCallback(aCallback);
+
+  return actor;
+}
+
+Storage::StorageType LSObject::Type() const {
+  AssertIsOnOwningThread();
+
+  return eLocalStorage;
+}
+
+bool LSObject::IsForkOf(const Storage* aStorage) const {
+  AssertIsOnOwningThread();
+  MOZ_ASSERT(aStorage);
+
+  if (aStorage->Type() != eLocalStorage) {
+    return false;
+  }
+
+  return static_cast<const LSObject*>(aStorage)->mOrigin == mOrigin;
+}
+
+int64_t LSObject::GetOriginQuotaUsage() const {
+  AssertIsOnOwningThread();
+
+  return 0;
+}
+
+void LSObject::Disconnect() {
+  if (mInExplicitSnapshot) {
+    AssertExplicitSnapshotInvariants(*this);
+
+    nsresult rv = mDatabase->EndExplicitSnapshot();
+    (void)NS_WARN_IF(NS_FAILED(rv));
+
+    mInExplicitSnapshot = false;
+  }
+}
+
+uint32_t LSObject::GetLength(nsIPrincipal& aSubjectPrincipal,
+                             ErrorResult& aError) {
+  AssertIsOnOwningThread();
+
+  if (!CanUseStorage(aSubjectPrincipal)) {
+    aError.Throw(NS_ERROR_DOM_SECURITY_ERR);
+    return 0;
+  }
+
+  nsresult rv = EnsureDatabase();
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    aError.Throw(rv);
+    return 0;
+  }
+
+  uint32_t result;
+  rv = mDatabase->GetLength(this, &result);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    aError.Throw(rv);
+    return 0;
+  }
+
+  return result;
+}
+
+void LSObject::Key(uint32_t aIndex, nsAString& aResult,
+                   nsIPrincipal& aSubjectPrincipal, ErrorResult& aError) {
+  AssertIsOnOwningThread();
+
+  if (!CanUseStorage(aSubjectPrincipal)) {
+    aError.Throw(NS_ERROR_DOM_SECURITY_ERR);
+    return;
+  }
+
+  nsresult rv = EnsureDatabase();
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    aError.Throw(rv);
+    return;
+  }
+
+  nsString result;
+  rv = mDatabase->GetKey(this, aIndex, result);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    aError.Throw(rv);
+    return;
+  }
+
+  aResult = result;
+}
+
+void LSObject::GetItem(const nsAString& aKey, nsAString& aResult,
+                       nsIPrincipal& aSubjectPrincipal, ErrorResult& aError) {
+  AssertIsOnOwningThread();
+
+  if (!CanUseStorage(aSubjectPrincipal)) {
+    aError.Throw(NS_ERROR_DOM_SECURITY_ERR);
+    return;
+  }
+
+  nsresult rv = EnsureDatabase();
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    aError.Throw(rv);
+    return;
+  }
+
+  nsString result;
+  rv = mDatabase->GetItem(this, aKey, result);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    aError.Throw(rv);
+    return;
+  }
+
+  aResult = result;
+}
+
+void LSObject::GetSupportedNames(nsTArray<nsString>& aNames) {
+  AssertIsOnOwningThread();
+
+  if (!CanUseStorage(*nsContentUtils::SubjectPrincipal())) {
+    aNames.Clear();
+    return;
+  }
+
+  nsresult rv = EnsureDatabase();
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return;
+  }
+
+  rv = mDatabase->GetKeys(this, aNames);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return;
+  }
+}
+
+void LSObject::SetItem(const nsAString& aKey, const nsAString& aValue,
+                       nsIPrincipal& aSubjectPrincipal, ErrorResult& aError) {
+  AssertIsOnOwningThread();
+
+  if (!CanUseStorage(aSubjectPrincipal)) {
+    aError.Throw(NS_ERROR_DOM_SECURITY_ERR);
+    return;
+  }
+
+  nsresult rv = EnsureDatabase();
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    aError.Throw(rv);
+    return;
+  }
+
+  LSNotifyInfo info;
+  rv = mDatabase->SetItem(this, aKey, aValue, info);
+  if (rv == NS_ERROR_FILE_NO_DEVICE_SPACE) {
+    rv = NS_ERROR_DOM_QUOTA_EXCEEDED_ERR;
+  }
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    aError.Throw(rv);
+    return;
+  }
+
+  if (info.changed()) {
+    OnChange(aKey, info.oldValue(), aValue);
+  }
+}
+
+void LSObject::RemoveItem(const nsAString& aKey,
+                          nsIPrincipal& aSubjectPrincipal,
+                          ErrorResult& aError) {
+  AssertIsOnOwningThread();
+
+  if (!CanUseStorage(aSubjectPrincipal)) {
+    aError.Throw(NS_ERROR_DOM_SECURITY_ERR);
+    return;
+  }
+
+  nsresult rv = EnsureDatabase();
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    aError.Throw(rv);
+    return;
+  }
+
+  LSNotifyInfo info;
+  rv = mDatabase->RemoveItem(this, aKey, info);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    aError.Throw(rv);
+    return;
+  }
+
+  if (info.changed()) {
+    OnChange(aKey, info.oldValue(), VoidString());
+  }
+}
+
+void LSObject::Clear(nsIPrincipal& aSubjectPrincipal, ErrorResult& aError) {
+  AssertIsOnOwningThread();
+
+  if (!CanUseStorage(aSubjectPrincipal)) {
+    aError.Throw(NS_ERROR_DOM_SECURITY_ERR);
+    return;
+  }
+
+  nsresult rv = EnsureDatabase();
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    aError.Throw(rv);
+    return;
+  }
+
+  LSNotifyInfo info;
+  rv = mDatabase->Clear(this, info);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    aError.Throw(rv);
+    return;
+  }
+
+  if (info.changed()) {
+    OnChange(VoidString(), VoidString(), VoidString());
+  }
+}
+
+void LSObject::Open(nsIPrincipal& aSubjectPrincipal, ErrorResult& aError) {
+  AssertIsOnOwningThread();
+
+  if (!CanUseStorage(aSubjectPrincipal)) {
+    aError.Throw(NS_ERROR_DOM_SECURITY_ERR);
+    return;
+  }
+
+  nsresult rv = EnsureDatabase();
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    aError.Throw(rv);
+    return;
+  }
+}
+
+void LSObject::Close(nsIPrincipal& aSubjectPrincipal, ErrorResult& aError) {
+  AssertIsOnOwningThread();
+
+  if (!CanUseStorage(aSubjectPrincipal)) {
+    aError.Throw(NS_ERROR_DOM_SECURITY_ERR);
+    return;
+  }
+
+  DropDatabase();
+}
+
+void LSObject::BeginExplicitSnapshot(nsIPrincipal& aSubjectPrincipal,
+                                     ErrorResult& aError) {
+  AssertIsOnOwningThread();
+
+  if (!CanUseStorage(aSubjectPrincipal)) {
+    aError.Throw(NS_ERROR_DOM_SECURITY_ERR);
+    return;
+  }
+
+  if (mInExplicitSnapshot) {
+    aError.Throw(NS_ERROR_ALREADY_INITIALIZED);
+    return;
+  }
+
+  nsresult rv = EnsureDatabase();
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    aError.Throw(rv);
+    return;
+  }
+
+  rv = mDatabase->BeginExplicitSnapshot(this);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    aError.Throw(rv);
+    return;
+  }
+
+  mInExplicitSnapshot = true;
+}
+
+void LSObject::CheckpointExplicitSnapshot(nsIPrincipal& aSubjectPrincipal,
+                                          ErrorResult& aError) {
+  AssertIsOnOwningThread();
+
+  if (!CanUseStorage(aSubjectPrincipal)) {
+    aError.Throw(NS_ERROR_DOM_SECURITY_ERR);
+    return;
+  }
+
+  if (!mInExplicitSnapshot) {
+    aError.Throw(NS_ERROR_NOT_INITIALIZED);
+    return;
+  }
+
+  AssertExplicitSnapshotInvariants(*this);
+
+  nsresult rv = mDatabase->CheckpointExplicitSnapshot();
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    aError.Throw(rv);
+    return;
+  }
+}
+
+void LSObject::EndExplicitSnapshot(nsIPrincipal& aSubjectPrincipal,
+                                   ErrorResult& aError) {
+  AssertIsOnOwningThread();
+
+  if (!CanUseStorage(aSubjectPrincipal)) {
+    aError.Throw(NS_ERROR_DOM_SECURITY_ERR);
+    return;
+  }
+
+  if (!mInExplicitSnapshot) {
+    aError.Throw(NS_ERROR_NOT_INITIALIZED);
+    return;
+  }
+
+  AssertExplicitSnapshotInvariants(*this);
+
+  nsresult rv = mDatabase->EndExplicitSnapshot();
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    aError.Throw(rv);
+    return;
+  }
+
+  mInExplicitSnapshot = false;
+}
+
+bool LSObject::GetHasSnapshot(nsIPrincipal& aSubjectPrincipal,
+                              ErrorResult& aError) {
+  AssertIsOnOwningThread();
+
+  if (!CanUseStorage(aSubjectPrincipal)) {
+    aError.Throw(NS_ERROR_DOM_SECURITY_ERR);
+    return false;
+  }
+
+  if (!mDatabase || mDatabase->IsAllowedToClose()) {
+    return false;
+  }
+
+  return mDatabase->HasSnapshot();
+}
+
+int64_t LSObject::GetSnapshotUsage(nsIPrincipal& aSubjectPrincipal,
+                                   ErrorResult& aError) {
+  AssertIsOnOwningThread();
+
+  if (!CanUseStorage(aSubjectPrincipal)) {
+    aError.Throw(NS_ERROR_DOM_SECURITY_ERR);
+    return 0;
+  }
+
+  if (!mDatabase || mDatabase->IsAllowedToClose()) {
+    aError.Throw(NS_ERROR_NOT_AVAILABLE);
+    return 0;
+  }
+
+  if (!mDatabase->HasSnapshot()) {
+    aError.Throw(NS_ERROR_NOT_AVAILABLE);
+    return 0;
+  }
+
+  return mDatabase->GetSnapshotUsage();
+}
+
+NS_IMPL_ADDREF_INHERITED(LSObject, Storage)
+NS_IMPL_RELEASE_INHERITED(LSObject, Storage)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(LSObject)
+NS_INTERFACE_MAP_END_INHERITING(Storage)
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(LSObject)
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(LSObject, Storage)
+  tmp->AssertIsOnOwningThread();
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_INHERITED(LSObject, Storage)
+  tmp->AssertIsOnOwningThread();
+  tmp->DropDatabase();
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+nsresult LSObject::DoRequestSynchronously(const LSRequestParams& aParams,
+                                          LSRequestResponse& aResponse) {
+  mozilla::ipc::PBackgroundChild* backgroundActor =
+      mozilla::ipc::BackgroundChild::GetOrCreateForCurrentThread();
+  if (NS_WARN_IF(!backgroundActor)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  RefPtr<RequestHelper> helper = new RequestHelper(this, aParams);
+
+  nsresult rv = helper->StartAndReturnResponse(aResponse);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  if (aResponse.type() == LSRequestResponse::Tnsresult) {
+    nsresult errorCode = aResponse.get_nsresult();
+
+    if (errorCode == NS_ERROR_FILE_NO_DEVICE_SPACE) {
+      errorCode = NS_ERROR_DOM_QUOTA_EXCEEDED_ERR;
+    }
+
+    return errorCode;
+  }
+
+  return NS_OK;
+}
+
+nsresult LSObject::EnsureDatabase() {
+  AssertIsOnOwningThread();
+
+  if (mDatabase && !mDatabase->IsAllowedToClose()) {
+    return NS_OK;
+  }
+
+  mDatabase = LSDatabase::Get(mOrigin);
+
+
+
+
+
+  mozilla::ipc::PBackgroundChild* backgroundActor =
+      mozilla::ipc::BackgroundChild::GetOrCreateForCurrentThread();
+  if (NS_WARN_IF(!backgroundActor)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  LSRequestCommonParams commonParams;
+  commonParams.principalInfo() = *mPrincipalInfo;
+  commonParams.storagePrincipalInfo() = *mStoragePrincipalInfo;
+  commonParams.originKey() = mOriginKey;
+
+  LSRequestPrepareDatastoreParams params;
+  params.commonParams() = commonParams;
+  params.clientId() = mClientId;
+  params.clientPrincipalInfo() = mClientPrincipalInfo;
+
+  LSRequestResponse response;
+
+  nsresult rv = DoRequestSynchronously(params, response);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  MOZ_ASSERT(response.type() ==
+             LSRequestResponse::TLSRequestPrepareDatastoreResponse);
+
+  LSRequestPrepareDatastoreResponse prepareDatastoreResponse =
+      std::move(response.get_LSRequestPrepareDatastoreResponse());
+
+  auto childEndpoint =
+      std::move(prepareDatastoreResponse.databaseChildEndpoint());
+
+
+  RefPtr<LSDatabase> database = new LSDatabase(mOrigin);
+
+  RefPtr<LSDatabaseChild> actor = new LSDatabaseChild(database);
+
+  MOZ_ALWAYS_TRUE(childEndpoint.Bind(actor));
+
+  database->SetActor(actor);
+
+  if (prepareDatastoreResponse.invalidated()) {
+    database->RequestAllowToClose();
+    return NS_ERROR_ABORT;
+  }
+
+  mDatabase = std::move(database);
+
+  return NS_OK;
+}
+
+void LSObject::DropDatabase() {
+  AssertIsOnOwningThread();
+
+  mDatabase = nullptr;
+}
+
+nsresult LSObject::EnsureObserver() {
+  AssertIsOnOwningThread();
+
+  if (mObserver) {
+    return NS_OK;
+  }
+
+  mObserver = LSObserver::Get(mOrigin);
+
+  if (mObserver) {
+    return NS_OK;
+  }
+
+  LSRequestPrepareObserverParams params;
+  params.principalInfo() = *mPrincipalInfo;
+  params.storagePrincipalInfo() = *mStoragePrincipalInfo;
+  params.clientId() = mClientId;
+  params.clientPrincipalInfo() = mClientPrincipalInfo;
+
+  LSRequestResponse response;
+
+  nsresult rv = DoRequestSynchronously(params, response);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  MOZ_ASSERT(response.type() ==
+             LSRequestResponse::TLSRequestPrepareObserverResponse);
+
+  const LSRequestPrepareObserverResponse& prepareObserverResponse =
+      response.get_LSRequestPrepareObserverResponse();
+
+  uint64_t observerId = prepareObserverResponse.observerId();
+
+
+  mozilla::ipc::PBackgroundChild* backgroundActor =
+      mozilla::ipc::BackgroundChild::GetForCurrentThread();
+  MOZ_ASSERT(backgroundActor);
+
+  RefPtr<LSObserver> observer = new LSObserver(mOrigin);
+
+  LSObserverChild* actor = new LSObserverChild(observer);
+
+  MOZ_ALWAYS_TRUE(
+      backgroundActor->SendPBackgroundLSObserverConstructor(actor, observerId));
+
+  observer->SetActor(actor);
+
+  mObserver = std::move(observer);
+
+  return NS_OK;
+}
+
+void LSObject::DropObserver() {
+  AssertIsOnOwningThread();
+
+  if (mObserver) {
+    mObserver = nullptr;
+  }
+}
+
+void LSObject::OnChange(const nsAString& aKey, const nsAString& aOldValue,
+                        const nsAString& aNewValue) {
+  AssertIsOnOwningThread();
+
+  NotifyChange( this, StoragePrincipal(), aKey, aOldValue,
+               aNewValue,  kLocalStorageType, mDocumentURI,
+                !!mPrivateBrowsingId,
+                false);
+}
+
+void LSObject::LastRelease() {
+  AssertIsOnOwningThread();
+
+  DropDatabase();
+}
+
+nsresult RequestHelper::StartAndReturnResponse(LSRequestResponse& aResponse) {
+  AssertIsOnOwningThread();
+
+  nsCOMPtr<nsIEventTarget> domFileThread =
+      RemoteLazyInputStreamThread::GetOrCreate();
+  if (NS_WARN_IF(!domFileThread)) {
+    return NS_ERROR_ILLEGAL_DURING_SHUTDOWN;
+  }
+
+  nsresult rv = domFileThread->Dispatch(this, NS_DISPATCH_NORMAL);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  TimeStamp deadline = TimeStamp::Now() + TimeDuration::FromMilliseconds(
+                                              FAILSAFE_CANCEL_SYNC_OP_MS);
+
+  MonitorAutoLock lock(mMonitor);
+  while (mState != State::Complete) {
+    TimeStamp now = TimeStamp::Now();
+    if (AppShutdown::IsShutdownImpending() || now >= deadline) {
+      switch (mState) {
+        case State::Initial:
+          mResultCode = NS_ERROR_FAILURE;
+          mState = State::Complete;
+          continue;
+        case State::ResponsePending:
+          mState = State::Canceling;
+          MOZ_ALWAYS_SUCCEEDS(
+              domFileThread->Dispatch(this, NS_DISPATCH_NORMAL));
+          [[fallthrough]];
+        case State::Canceling:
+          lock.Wait();
+          continue;
+        default:
+          MOZ_ASSERT_UNREACHABLE("unexpected state");
+      }
+    }
+
+    lock.Wait(TimeDuration::Min(
+        TimeDuration::FromMilliseconds(SYNC_OP_WAKE_INTERVAL_MS),
+        deadline - now));
+  }
+
+  mObject = nullptr;
+
+  if (NS_WARN_IF(NS_FAILED(mResultCode))) {
+    return mResultCode;
+  }
+
+  aResponse = std::move(mResponse);
+  return NS_OK;
+}
+
+NS_IMPL_ISUPPORTS_INHERITED0(RequestHelper, Runnable)
+
+NS_IMETHODIMP
+RequestHelper::Run() {
+  AssertIsOnDOMFileThread();
+
+  MonitorAutoLock lock(mMonitor);
+
+  switch (mState) {
+    case State::Initial: {
+      mState = State::ResponsePending;
+      {
+        MonitorAutoUnlock unlock(mMonitor);
+        mActor = mObject->StartRequest(mParams, this);
+      }
+      if (NS_WARN_IF(!mActor) && mState != State::Complete) {
+        mResultCode = NS_ERROR_FAILURE;
+        mState = State::Complete;
+        lock.Notify();
+      }
+      return NS_OK;
+    }
+
+    case State::Canceling: {
+      if (mActor && !mActor->Finishing()) {
+        if (mActor->SendCancel()) {
+
+        }
+      }
+
+      return NS_OK;
+    }
+
+    case State::Complete: {
+      return NS_OK;
+    }
+
+    default:
+      MOZ_CRASH("Bad state!");
+  }
+}
+
+void RequestHelper::OnResponse(LSRequestResponse&& aResponse) {
+  AssertIsOnDOMFileThread();
+
+  MonitorAutoLock lock(mMonitor);
+
+  MOZ_ASSERT(mState == State::ResponsePending || mState == State::Canceling);
+
+  mActor = nullptr;
+
+  mResponse = std::move(aResponse);
+
+  mState = State::Complete;
+
+  lock.Notify();
+}
+
+}  

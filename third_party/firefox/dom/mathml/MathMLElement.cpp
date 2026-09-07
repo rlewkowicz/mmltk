@@ -1,0 +1,668 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/MathMLElement.h"
+
+#include "mozilla/EventListenerManager.h"
+#include "mozilla/FocusModel.h"
+#include "mozilla/StaticPrefs_mathml.h"
+#include "mozilla/TextUtils.h"
+#include "mozilla/dom/BindContext.h"
+#include "mozilla/dom/Document.h"
+#include "nsAttrValueOrString.h"
+#include "nsCSSValue.h"
+#include "nsContentUtils.h"
+#include "nsGkAtoms.h"
+#include "nsIContentInlines.h"
+#include "nsIScriptError.h"
+#include "nsITableCellLayout.h"  // for MAX_COLSPAN / MAX_ROWSPAN
+#include "nsIURI.h"
+#include "nsPresContext.h"
+#include "nsStyleConsts.h"
+
+#include "mozilla/EventDispatcher.h"
+#include "mozilla/MappedDeclarationsBuilder.h"
+#include "mozilla/dom/MathMLElementBinding.h"
+#include "mozilla/dom/SVGLength.h"
+
+using namespace mozilla;
+using namespace mozilla::dom;
+
+
+NS_IMPL_ISUPPORTS_INHERITED(MathMLElement, MathMLElementBase, Link)
+
+static nsresult ReportLengthParseError(const nsString& aValue,
+                                       Document* aDocument) {
+  AutoTArray<nsString, 1> arg = {aValue};
+  return nsContentUtils::ReportToConsole(
+      nsIScriptError::errorFlag, "MathML"_ns, aDocument,
+      PropertiesFile::MATHML_PROPERTIES, "LengthParsingError", arg);
+}
+
+static nsresult ReportParseErrorNoTag(const nsString& aValue, nsAtom* aAtom,
+                                      Document& aDocument) {
+  AutoTArray<nsString, 2> argv = {aValue, nsDependentAtomString(aAtom)};
+  return nsContentUtils::ReportToConsole(
+      nsIScriptError::errorFlag, "MathML"_ns, &aDocument,
+      PropertiesFile::MATHML_PROPERTIES, "AttributeParsingErrorNoTag", argv);
+}
+
+MathMLElement::MathMLElement(
+    already_AddRefed<mozilla::dom::NodeInfo>& aNodeInfo)
+    : MathMLElementBase(std::move(aNodeInfo)), Link(this) {}
+
+MathMLElement::MathMLElement(already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo)
+    : MathMLElementBase(std::move(aNodeInfo)), Link(this) {}
+
+nsresult MathMLElement::BindToTree(BindContext& aContext, nsINode& aParent) {
+  nsresult rv = MathMLElementBase::BindToTree(aContext, aParent);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  Link::BindToTree(aContext);
+
+  if (!aContext.IsMove() && HasFlag(NODE_HAS_NONCE_AND_HEADER_CSP) &&
+      IsInComposedDoc() && OwnerDoc()->GetBrowsingContext()) {
+    nsContentUtils::AddScriptRunner(NS_NewRunnableFunction(
+        "MathMLElement::ResetNonce::Runnable",
+        [self = RefPtr<MathMLElement>(this)]() {
+          nsAutoString nonce;
+          self->GetNonce(nonce);
+          self->SetAttr(kNameSpaceID_None, nsGkAtoms::nonce, u""_ns, true);
+          self->SetNonce(nonce);
+        }));
+  }
+
+  return rv;
+}
+
+void MathMLElement::UnbindFromTree(UnbindContext& aContext) {
+  MathMLElementBase::UnbindFromTree(aContext);
+  Link::UnbindFromTree();
+}
+
+bool MathMLElement::ParseAttribute(int32_t aNamespaceID, nsAtom* aAttribute,
+                                   const nsAString& aValue,
+                                   nsIPrincipal* aMaybeScriptedPrincipal,
+                                   nsAttrValue& aResult) {
+  MOZ_ASSERT(IsMathMLElement());
+
+  if (aNamespaceID == kNameSpaceID_None) {
+    if (aAttribute == nsGkAtoms::mathcolor ||
+        aAttribute == nsGkAtoms::mathbackground) {
+      return aResult.ParseColor(aValue);
+    }
+    if (aAttribute == nsGkAtoms::tabindex) {
+      return aResult.ParseIntValue(aValue);
+    }
+    if (mNodeInfo->Equals(nsGkAtoms::mtd)) {
+      if (aAttribute == nsGkAtoms::columnspan) {
+        aResult.ParseClampedNonNegativeInt(aValue, 1, 1, MAX_COLSPAN);
+        return true;
+      }
+      if (aAttribute == nsGkAtoms::rowspan) {
+        aResult.ParseClampedNonNegativeInt(aValue, 1, 0, MAX_ROWSPAN);
+        return true;
+      }
+    }
+    if (!StaticPrefs::mathml_href_link_on_non_anchor_element_disabled() &&
+        aAttribute == nsGkAtoms::href && !mNodeInfo->Equals(nsGkAtoms::a)) {
+      AutoTArray<nsString, 1> params;
+      params.AppendElement(mNodeInfo->NodeName());
+      OwnerDoc()->WarnOnceAndReportAbout(
+          dom::DeprecatedOperations::
+              eMathML_DeprecatedHrefLinkOnNonAnchorElement,
+           false, params);
+    }
+  }
+
+  return MathMLElementBase::ParseAttribute(aNamespaceID, aAttribute, aValue,
+                                           aMaybeScriptedPrincipal, aResult);
+}
+
+static Element::MappedAttributeEntry sGlobalAttributes[] = {
+    {nsGkAtoms::dir},
+    {nsGkAtoms::mathbackground},
+    {nsGkAtoms::mathcolor},
+    {nsGkAtoms::mathsize},
+    {nsGkAtoms::scriptlevel},
+    {nsGkAtoms::displaystyle},
+    {nullptr}};
+
+bool MathMLElement::IsAttributeMapped(const nsAtom* aAttribute) const {
+  MOZ_ASSERT(IsMathMLElement());
+
+  static const MappedAttributeEntry* const globalMap[] = {sGlobalAttributes};
+
+  return FindAttributeDependence(aAttribute, globalMap) ||
+         ((!StaticPrefs::mathml_legacy_mathvariant_attribute_disabled() ||
+           mNodeInfo->Equals(nsGkAtoms::mi)) &&
+          aAttribute == nsGkAtoms::mathvariant) ||
+         (mNodeInfo->Equals(nsGkAtoms::mtable) &&
+          aAttribute == nsGkAtoms::width);
+}
+
+nsMapRuleToAttributesFunc MathMLElement::GetAttributeMappingFunction() const {
+  if (mNodeInfo->Equals(nsGkAtoms::mtable)) {
+    return &MapMTableAttributesInto;
+  }
+  if (StaticPrefs::mathml_legacy_mathvariant_attribute_disabled() &&
+      mNodeInfo->Equals(nsGkAtoms::mi)) {
+    return &MapMiAttributesInto;
+  }
+  return &MapGlobalMathMLAttributesInto;
+}
+
+bool MathMLElement::ParseNamedSpaceValue(const nsString& aString,
+                                         nsCSSValue& aCSSValue,
+                                         const Document& aDocument,
+                                         ParseFlags aFlags) {
+  if (StaticPrefs::mathml_mathspace_names_disabled()) {
+    return false;
+  }
+  int32_t i = 0;
+  if (aString.EqualsLiteral("veryverythinmathspace")) {
+    i = 1;
+  } else if (aString.EqualsLiteral("verythinmathspace")) {
+    i = 2;
+  } else if (aString.EqualsLiteral("thinmathspace")) {
+    i = 3;
+  } else if (aString.EqualsLiteral("mediummathspace")) {
+    i = 4;
+  } else if (aString.EqualsLiteral("thickmathspace")) {
+    i = 5;
+  } else if (aString.EqualsLiteral("verythickmathspace")) {
+    i = 6;
+  } else if (aString.EqualsLiteral("veryverythickmathspace")) {
+    i = 7;
+  } else if (aFlags.contains(ParseFlag::AllowNegative)) {
+    if (aString.EqualsLiteral("negativeveryverythinmathspace")) {
+      i = -1;
+    } else if (aString.EqualsLiteral("negativeverythinmathspace")) {
+      i = -2;
+    } else if (aString.EqualsLiteral("negativethinmathspace")) {
+      i = -3;
+    } else if (aString.EqualsLiteral("negativemediummathspace")) {
+      i = -4;
+    } else if (aString.EqualsLiteral("negativethickmathspace")) {
+      i = -5;
+    } else if (aString.EqualsLiteral("negativeverythickmathspace")) {
+      i = -6;
+    } else if (aString.EqualsLiteral("negativeveryverythickmathspace")) {
+      i = -7;
+    }
+  }
+  if (0 != i) {
+    AutoTArray<nsString, 1> params;
+    params.AppendElement(aString);
+    aDocument.WarnOnceAndReportAbout(
+        dom::DeprecatedOperations::eMathML_DeprecatedMathSpaceValue2, false,
+        params);
+    aCSSValue.SetFloatValue(float(i) / float(18), eCSSUnit_EM);
+    return true;
+  }
+
+  return false;
+}
+
+bool MathMLElement::ParseNumericValue(const nsString& aString,
+                                      nsCSSValue& aCSSValue,
+                                      Document* aDocument, ParseFlags aFlags) {
+  nsAutoString str(aString);
+  str.CompressWhitespace();  
+
+  int32_t stringLength = str.Length();
+  if (!stringLength) {
+    if (!aFlags.contains(ParseFlag::SuppressWarnings)) {
+      ReportLengthParseError(aString, aDocument);
+    }
+    return false;
+  }
+
+  if (aDocument && ParseNamedSpaceValue(str, aCSSValue, *aDocument, aFlags)) {
+    return true;
+  }
+
+  nsAutoString number, unit;
+
+  int32_t i = 0;
+  char16_t c = str[0];
+  if (c == '-') {
+    number.Append(c);
+    i++;
+  }
+
+  bool gotDot = false;
+  for (; i < stringLength; i++) {
+    c = str[i];
+    if (gotDot && c == '.') {
+      if (!aFlags.contains(ParseFlag::SuppressWarnings)) {
+        ReportLengthParseError(aString, aDocument);
+      }
+      return false;  
+    } else if (c == '.')
+      gotDot = true;
+    else if (!IsAsciiDigit(c)) {
+      str.Right(unit, stringLength - i);
+      break;
+    }
+    number.Append(c);
+  }
+  if (gotDot && str[i - 1] == '.') {
+    if (!aFlags.contains(ParseFlag::SuppressWarnings)) {
+      ReportLengthParseError(aString, aDocument);
+    }
+    return false;  
+  }
+
+  nsresult errorCode;
+  float floatValue = number.ToFloat(&errorCode);
+  if (NS_FAILED(errorCode)) {
+    if (!aFlags.contains(ParseFlag::SuppressWarnings)) {
+      ReportLengthParseError(aString, aDocument);
+    }
+    return false;
+  }
+  if (floatValue < 0 && !aFlags.contains(ParseFlag::AllowNegative)) {
+    if (!aFlags.contains(ParseFlag::SuppressWarnings)) {
+      ReportLengthParseError(aString, aDocument);
+    }
+    return false;
+  }
+
+  nsCSSUnit cssUnit;
+  if (unit.IsEmpty()) {
+    if (floatValue != 0.0) {
+      if (!aFlags.contains(ParseFlag::SuppressWarnings)) {
+        ReportLengthParseError(aString, aDocument);
+      }
+      return false;
+    }
+    cssUnit = eCSSUnit_Pixel;
+  } else if (unit.EqualsLiteral("%")) {
+    aCSSValue.SetPercentValue(floatValue / 100.0f);
+    return true;
+  } else {
+    uint8_t unitType = SVGLength::GetUnitTypeForString(unit);
+    if (unitType ==
+        SVGLength_Binding::SVG_LENGTHTYPE_UNKNOWN) {  
+      if (!aFlags.contains(ParseFlag::SuppressWarnings)) {
+        ReportLengthParseError(aString, aDocument);
+      }
+      return false;
+    }
+    cssUnit = SVGLength::SpecifiedUnitTypeToCSSUnit(unitType);
+  }
+
+  aCSSValue.SetFloatValue(floatValue, cssUnit);
+  return true;
+}
+
+void MathMLElement::MapMTableAttributesInto(
+    MappedDeclarationsBuilder& aBuilder) {
+  if (!aBuilder.PropertyIsSet(eCSSProperty_width)) {
+    const nsAttrValue* value = aBuilder.GetAttr(nsGkAtoms::width);
+    nsCSSValue width;
+    if (value && (value->Type() == nsAttrValue::eString ||
+                  value->Type() == nsAttrValue::eAtom)) {
+      nsString str(nsAttrValueOrString(value).String());
+      ParseNumericValue(str, width, &aBuilder.Document());
+      if (width.GetUnit() == eCSSUnit_Percent) {
+        aBuilder.SetPercentValue(eCSSProperty_width, width.GetPercentValue());
+      } else if (width.GetUnit() != eCSSUnit_Null) {
+        aBuilder.SetLengthValue(eCSSProperty_width, width);
+      }
+    }
+  }
+  MapGlobalMathMLAttributesInto(aBuilder);
+}
+
+void MathMLElement::MapMiAttributesInto(MappedDeclarationsBuilder& aBuilder) {
+  if (!aBuilder.PropertyIsSet(eCSSProperty_text_transform)) {
+    const nsAttrValue* value = aBuilder.GetAttr(nsGkAtoms::mathvariant);
+    if (value && (value->Type() == nsAttrValue::eString ||
+                  value->Type() == nsAttrValue::eAtom)) {
+      nsString str(nsAttrValueOrString(value).String());
+      str.CompressWhitespace();
+      if (str.LowerCaseEqualsASCII("normal")) {
+        aBuilder.SetKeywordValue(eCSSProperty_text_transform,
+                                 StyleTextTransform::NONE._0);
+      }
+    }
+  }
+  MapGlobalMathMLAttributesInto(aBuilder);
+}
+
+template <uint8_t N, uint8_t M>
+static constexpr uint8_t cmemmemi(const char (&needle)[N],
+                                  const char (&haystack)[M]) {
+  static_assert(M > N, "needle larger than haystack");
+  for (uint8_t i = 0; i < M - N; ++i) {
+    for (uint8_t j = 0; j < N; ++j) {
+      if (needle[j] != haystack[i + j]) {
+        break;
+      }
+      if (needle[j] == '\0') {
+        return i;
+      }
+    }
+  }
+  return std::numeric_limits<uint8_t>::max();
+}
+
+void MathMLElement::MapGlobalMathMLAttributesInto(
+    MappedDeclarationsBuilder& aBuilder) {
+  const nsAttrValue* value = aBuilder.GetAttr(nsGkAtoms::scriptlevel);
+  if (value &&
+      (value->Type() == nsAttrValue::eString ||
+       value->Type() == nsAttrValue::eAtom) &&
+      !aBuilder.PropertyIsSet(eCSSProperty_math_depth)) {
+    nsString str(nsAttrValueOrString(value).String());
+    str.CompressWhitespace();
+    if (str.Length() > 0) {
+      nsresult errorCode;
+      int32_t intValue = str.ToInteger(&errorCode);
+      bool reportParseError = true;
+      if (NS_SUCCEEDED(errorCode)) {
+        char16_t ch = str.CharAt(0);
+        bool isRelativeScriptLevel = (ch == '+' || ch == '-');
+        reportParseError = false;
+        for (uint32_t i = isRelativeScriptLevel ? 1 : 0; i < str.Length();
+             i++) {
+          if (!IsAsciiDigit(str.CharAt(i))) {
+            reportParseError = true;
+            break;
+          }
+        }
+        if (!reportParseError) {
+          aBuilder.SetMathDepthValue(intValue, isRelativeScriptLevel);
+        }
+      }
+      if (reportParseError) {
+        ReportParseErrorNoTag(str, nsGkAtoms::scriptlevel, aBuilder.Document());
+      }
+    }
+  }
+
+  value = aBuilder.GetAttr(nsGkAtoms::mathsize);
+  if (value &&
+      (value->Type() == nsAttrValue::eString ||
+       value->Type() == nsAttrValue::eAtom) &&
+      !aBuilder.PropertyIsSet(eCSSProperty_font_size)) {
+    nsString str(nsAttrValueOrString(value).String());
+    nsCSSValue fontSize;
+    ParseNumericValue(str, fontSize, nullptr);
+    if (fontSize.GetUnit() == eCSSUnit_Percent) {
+      aBuilder.SetPercentValue(eCSSProperty_font_size,
+                               fontSize.GetPercentValue());
+    } else if (fontSize.GetUnit() != eCSSUnit_Null) {
+      aBuilder.SetLengthValue(eCSSProperty_font_size, fontSize);
+    }
+  }
+
+  if (!StaticPrefs::mathml_legacy_mathvariant_attribute_disabled()) {
+    value = aBuilder.GetAttr(nsGkAtoms::mathvariant);
+    if (value &&
+        (value->Type() == nsAttrValue::eString ||
+         value->Type() == nsAttrValue::eAtom) &&
+        !aBuilder.PropertyIsSet(eCSSProperty__moz_math_variant)) {
+      nsString str(nsAttrValueOrString(value).String());
+      str.CompressWhitespace();
+
+
+      static constexpr const char compressed_sizes[] =
+          "normal\0"
+          "bold\0"
+          "bold-script\0"
+          "double-struck\0"
+          "bold-fraktur\0"
+          "bold-sans-serif\0"
+          "sans-serif-italic\0"
+          "sans-serif-bold-italic\0"
+          "monospace\0"
+          "initial\0"
+          "tailed\0"
+          "looped\0"
+          "stretched\0";
+
+      static constexpr uint8_t value_indices[] = {
+          cmemmemi("normal", compressed_sizes),
+          cmemmemi("bold", compressed_sizes),
+          cmemmemi("italic", compressed_sizes),
+          cmemmemi("bold-italic", compressed_sizes),
+          cmemmemi("script", compressed_sizes),
+          cmemmemi("bold-script", compressed_sizes),
+          cmemmemi("fraktur", compressed_sizes),
+          cmemmemi("double-struck", compressed_sizes),
+          cmemmemi("bold-fraktur", compressed_sizes),
+          cmemmemi("sans-serif", compressed_sizes),
+          cmemmemi("bold-sans-serif", compressed_sizes),
+          cmemmemi("sans-serif-italic", compressed_sizes),
+          cmemmemi("sans-serif-bold-italic", compressed_sizes),
+          cmemmemi("monospace", compressed_sizes),
+          cmemmemi("initial", compressed_sizes),
+          cmemmemi("tailed", compressed_sizes),
+          cmemmemi("looped", compressed_sizes),
+          cmemmemi("stretched", compressed_sizes),
+      };
+
+      for (size_t i = 0; i < std::size(value_indices); ++i) {
+        if (str.LowerCaseEqualsASCII(&compressed_sizes[value_indices[i]])) {
+          StyleMathVariant value = (StyleMathVariant)(i + 1);
+          if (value != StyleMathVariant::Normal) {
+            AutoTArray<nsString, 1> params;
+            params.AppendElement(str);
+            aBuilder.Document().WarnOnceAndReportAbout(
+                dom::DeprecatedOperations::eMathML_DeprecatedMathVariant, false,
+                params);
+          }
+          aBuilder.SetKeywordValue(eCSSProperty__moz_math_variant, value);
+          break;
+        }
+      }
+    }
+  }
+
+  value = aBuilder.GetAttr(nsGkAtoms::mathbackground);
+  if (value) {
+    nscolor color;
+    if (value->GetColorValue(color)) {
+      aBuilder.SetColorValueIfUnset(eCSSProperty_background_color, color);
+    }
+  }
+
+  value = aBuilder.GetAttr(nsGkAtoms::mathcolor);
+  nscolor color;
+  if (value && value->GetColorValue(color)) {
+    aBuilder.SetColorValueIfUnset(eCSSProperty_color, color);
+  }
+
+  value = aBuilder.GetAttr(nsGkAtoms::dir);
+  if (value &&
+      (value->Type() == nsAttrValue::eString ||
+       value->Type() == nsAttrValue::eAtom) &&
+      !aBuilder.PropertyIsSet(eCSSProperty_direction)) {
+    nsString str(nsAttrValueOrString(value).String());
+    static const char dirs[][4] = {"ltr", "rtl"};
+    static const StyleDirection dirValues[std::size(dirs)] = {
+        StyleDirection::Ltr, StyleDirection::Rtl};
+    for (uint32_t i = 0; i < std::size(dirs); ++i) {
+      if (str.LowerCaseEqualsASCII(dirs[i])) {
+        aBuilder.SetKeywordValue(eCSSProperty_direction, dirValues[i]);
+        break;
+      }
+    }
+  }
+
+  value = aBuilder.GetAttr(nsGkAtoms::displaystyle);
+  if (value &&
+      (value->Type() == nsAttrValue::eString ||
+       value->Type() == nsAttrValue::eAtom) &&
+      !aBuilder.PropertyIsSet(eCSSProperty_math_style)) {
+    nsString str(nsAttrValueOrString(value).String());
+    static const char displaystyles[][6] = {"false", "true"};
+    static const StyleMathStyle mathStyle[std::size(displaystyles)] = {
+        StyleMathStyle::Compact, StyleMathStyle::Normal};
+    for (uint32_t i = 0; i < std::size(displaystyles); ++i) {
+      if (str.LowerCaseEqualsASCII(displaystyles[i])) {
+        aBuilder.SetKeywordValue(eCSSProperty_math_style, mathStyle[i]);
+        break;
+      }
+    }
+  }
+}
+
+void MathMLElement::GetEventTargetParent(EventChainPreVisitor& aVisitor) {
+  Element::GetEventTargetParent(aVisitor);
+
+  GetEventTargetParentForLinks(aVisitor);
+}
+
+nsresult MathMLElement::PostHandleEvent(EventChainPostVisitor& aVisitor) {
+  return PostHandleEventForLinks(aVisitor);
+}
+
+NS_IMPL_ELEMENT_CLONE(MathMLElement)
+
+nsresult MathMLElement::CopyInnerTo(mozilla::dom::Element* aDest) {
+  nsresult rv = Element::CopyInnerTo(aDest);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  auto* dest = static_cast<MathMLElement*>(aDest);
+
+  if (auto* nonce = static_cast<nsString*>(GetProperty(nsGkAtoms::nonce))) {
+    dest->SetNonce(*nonce);
+  }
+
+  return NS_OK;
+}
+
+void MathMLElement::SetIncrementScriptLevel(bool aIncrementScriptLevel,
+                                            bool aNotify) {
+  NS_ASSERTION(aNotify, "We always notify!");
+  if (aIncrementScriptLevel) {
+    AddStates(ElementState::INCREMENT_SCRIPT_LEVEL);
+  } else {
+    RemoveStates(ElementState::INCREMENT_SCRIPT_LEVEL);
+  }
+}
+
+int32_t MathMLElement::TabIndexDefault() {
+  if (!StaticPrefs::mathml_href_link_on_non_anchor_element_disabled() &&
+      IsLink()) {
+    return 0;
+  }
+  return mNodeInfo->Equals(nsGkAtoms::a) ? 0 : -1;
+}
+
+Focusable MathMLElement::IsFocusableWithoutStyle(IsFocusableFlags) {
+  if (!IsInComposedDoc() || IsInDesignMode()) {
+    return {};
+  }
+
+  int32_t tabIndex = TabIndex();
+  if (!IsLink()) {
+    if (GetTabIndexAttrValue().isSome()) {
+      return {true, tabIndex};
+    }
+    return {};
+  }
+
+  if (!OwnerDoc()->LinkHandlingEnabled()) {
+    return {};
+  }
+
+  if (nsContentUtils::IsNodeInEditableRegion(this)) {
+    return {};
+  }
+
+  if (!FocusModel::IsTabFocusable(TabFocusableType::Links)) {
+    tabIndex = -1;
+  }
+
+  return {true, tabIndex};
+}
+
+already_AddRefed<nsIURI> MathMLElement::GetHrefURI() const {
+  if (!SupportsHrefAttribute()) {
+    return nullptr;
+  }
+
+  const nsAttrValue* href = mAttrs.GetAttr(nsGkAtoms::href, kNameSpaceID_None);
+  if (!href) {
+    return nullptr;
+  }
+
+  nsAutoString hrefStr;
+  href->ToString(hrefStr);
+  nsCOMPtr<nsIURI> hrefURI;
+  nsContentUtils::NewURIWithDocumentCharset(getter_AddRefs(hrefURI), hrefStr,
+                                            OwnerDoc(), GetBaseURI());
+  return hrefURI.forget();
+}
+
+bool MathMLElement::IsEventAttributeNameInternal(nsAtom* aName) {
+  return nsContentUtils::IsEventAttributeName(aName, EventNameType_HTML);
+}
+
+void MathMLElement::BeforeSetAttr(int32_t aNamespaceID, nsAtom* aName,
+                                  const nsAttrValue* aValue, bool aNotify) {
+  if (aNamespaceID == kNameSpaceID_None) {
+    if (!aValue && IsEventAttributeName(aName)) {
+      if (EventListenerManager* manager = GetExistingListenerManager()) {
+        manager->RemoveEventHandler(GetEventNameForAttr(aName));
+      }
+    }
+  }
+
+  return MathMLElementBase::BeforeSetAttr(aNamespaceID, aName, aValue, aNotify);
+}
+
+void MathMLElement::AfterSetAttr(int32_t aNameSpaceID, nsAtom* aName,
+                                 const nsAttrValue* aValue,
+                                 const nsAttrValue* aOldValue,
+                                 nsIPrincipal* aSubjectPrincipal,
+                                 bool aNotify) {
+  if (aName == nsGkAtoms::href && aNameSpaceID == kNameSpaceID_None) {
+    if (SupportsHrefAttribute()) {
+      Link::ResetLinkState(aNotify, aValue);
+    }
+  }
+
+  if (aNameSpaceID == kNameSpaceID_None) {
+    if (IsEventAttributeName(aName) && aValue) {
+      MOZ_ASSERT(aValue->Type() == nsAttrValue::eString ||
+                     aValue->Type() == nsAttrValue::eAtom,
+                 "Expected string or atom value for script body");
+      SetEventHandler(GetEventNameForAttr(aName),
+                      nsAttrValueOrString(aValue).String());
+    }
+  }
+
+  if (nsGkAtoms::nonce == aName && kNameSpaceID_None == aNameSpaceID) {
+    if (aValue) {
+      SetNonce(nsAttrValueOrString(aValue).String());
+      if (OwnerDoc()->GetHasCSPDeliveredThroughHeader()) {
+        SetFlags(NODE_HAS_NONCE_AND_HEADER_CSP);
+      }
+    } else {
+      RemoveNonce();
+    }
+  }
+
+  return MathMLElementBase::AfterSetAttr(aNameSpaceID, aName, aValue, aOldValue,
+                                         aSubjectPrincipal, aNotify);
+}
+
+JSObject* MathMLElement::WrapNode(JSContext* aCx,
+                                  JS::Handle<JSObject*> aGivenProto) {
+  return MathMLElement_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+bool MathMLElement::SupportsHrefAttribute() const {
+  if (StaticPrefs::mathml_href_link_on_non_anchor_element_disabled()) {
+    return mNodeInfo->Equals(nsGkAtoms::a);
+  }
+
+  return true;
+}

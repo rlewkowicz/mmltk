@@ -1,0 +1,468 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_LAYERS_RENDERTHREAD_H
+#define MOZILLA_LAYERS_RENDERTHREAD_H
+
+#include "base/basictypes.h"       // for DISALLOW_EVIL_CONSTRUCTORS
+#include "base/platform_thread.h"  // for PlatformThreadId
+#include "base/thread.h"           // for Thread
+#include "base/message_loop.h"
+#include "GLTypes.h"  // for GLenum
+#include "nsISupportsImpl.h"
+#include "mozilla/gfx/Point.h"
+#include "mozilla/Hal.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/DataMutex.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/webrender/webrender_ffi.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/webrender/WebRenderTypes.h"
+#include "mozilla/layers/CompositionRecorder.h"
+#include "mozilla/layers/SynchronousTask.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/VsyncDispatcher.h"
+
+#include <list>
+#include <queue>
+#include <unordered_map>
+
+namespace mozilla {
+namespace gl {
+class GLContext;
+}  
+namespace layers {
+class CompositorBridgeParent;
+class Fence;
+class ShaderProgramOGLsHolder;
+class SurfacePool;
+}  
+namespace wr {
+
+typedef MozPromise<MemoryReport, bool, true> MemoryReportPromise;
+
+class RendererOGL;
+class RenderTextureHost;
+class RenderTextureHostUsageInfo;
+class RenderThread;
+
+class WebRenderThreadPool {
+ public:
+  explicit WebRenderThreadPool(bool low_priority);
+
+  ~WebRenderThreadPool();
+
+  wr::WrThreadPool* Raw() {
+    MOZ_RELEASE_ASSERT(mThreadPool);
+    return mThreadPool;
+  }
+
+  void Destroy(bool aJoinWorkers);
+
+ protected:
+  wr::WrThreadPool* mThreadPool;
+};
+
+class MaybeWebRenderGlyphRasterThread {
+ public:
+  explicit MaybeWebRenderGlyphRasterThread(bool aEnabled);
+
+  ~MaybeWebRenderGlyphRasterThread();
+
+  bool IsEnabled() const { return mThread != nullptr; }
+
+  const wr::WrGlyphRasterThread* Raw() { return mThread; }
+
+ protected:
+  wr::WrGlyphRasterThread* mThread;
+};
+
+class WebRenderProgramCache final {
+ public:
+  explicit WebRenderProgramCache(wr::WrThreadPool* aThreadPool);
+
+  ~WebRenderProgramCache();
+
+  wr::WrProgramCache* Raw() { return mProgramCache; }
+
+ protected:
+  wr::WrProgramCache* mProgramCache;
+};
+
+class WebRenderShaders final {
+ public:
+  WebRenderShaders(gl::GLContext* gl, WebRenderProgramCache* programCache);
+  ~WebRenderShaders();
+
+  bool ResumeWarmup();
+
+  wr::WrShaders* RawShaders() { return mShaders; }
+
+ protected:
+  RefPtr<gl::GLContext> mGL;
+  wr::WrShaders* mShaders;
+};
+
+class WebRenderPipelineInfo final {
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(WebRenderPipelineInfo);
+
+  const wr::WrPipelineInfo& Raw() const { return mPipelineInfo; }
+  wr::WrPipelineInfo& Raw() { return mPipelineInfo; }
+
+ protected:
+  ~WebRenderPipelineInfo() = default;
+  wr::WrPipelineInfo mPipelineInfo;
+};
+
+class RendererEvent {
+ public:
+  RendererEvent() : mCreationTimeStamp(TimeStamp::Now()) {}
+  virtual ~RendererEvent() = default;
+  virtual void Run(RenderThread& aRenderThread, wr::WindowId aWindow) = 0;
+  virtual const char* Name() = 0;
+
+  const TimeStamp mCreationTimeStamp;
+};
+
+class RenderThread final {
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING_WITH_DELETE_ON_MAIN_THREAD(RenderThread)
+
+ public:
+  static RenderThread* Get();
+
+  static void Start(uint32_t aNamespace);
+
+  static void ShutDown();
+
+  bool HasShutdown() const { return mHasShutdown; }
+
+  static bool IsInRenderThread();
+
+  static already_AddRefed<nsIThread> GetRenderThread();
+
+  static RefPtr<MemoryReportPromise> AccumulateMemoryReport(
+      MemoryReport aInitial);
+
+  static void PostHandleDeviceReset(gfx::DeviceResetDetectPlace aPlace,
+                                    gfx::DeviceResetReason aReason);
+
+  void AddRenderer(wr::WindowId aWindowId, UniquePtr<RendererOGL> aRenderer);
+
+  void RemoveRenderer(wr::WindowId aWindowId);
+
+  RendererOGL* GetRenderer(wr::WindowId aWindowId);
+
+  void SetClearColor(wr::WindowId aWindowId, wr::ColorF aColor);
+
+  void PipelineSizeChanged(wr::WindowId aWindowId, uint64_t aPipelineId,
+                           float aWidth, float aHeight);
+
+  void PostEvent(wr::WindowId aWindowId, UniquePtr<RendererEvent> aEvent);
+
+  void SetFramePublishId(wr::WindowId aWindowId, FramePublishId aPublishId);
+
+  void UpdateAndRender(wr::WindowId aWindowId, const VsyncId& aStartId,
+                       const TimeStamp& aStartTime,
+                       const wr::FrameReadyParams& aParams,
+                       const Maybe<gfx::IntSize>& aReadbackSize,
+                       const Maybe<wr::ImageFormat>& aReadbackFormat,
+                       const Maybe<Range<uint8_t>>& aReadbackBuffer,
+                       RendererStats* aStats, bool* aNeedsYFlip = nullptr);
+
+  void Pause(wr::WindowId aWindowId);
+  bool Resume(wr::WindowId aWindowId);
+  void NotifyIdle();
+
+  void RegisterExternalImage(const wr::ExternalImageId& aExternalImageId,
+                             already_AddRefed<RenderTextureHost> aTexture);
+
+  void UnregisterExternalImage(const wr::ExternalImageId& aExternalImageId);
+
+  void DestroyExternalImagesSyncWait(
+      const std::vector<wr::ExternalImageId>&& aIds);
+
+  void PrepareForUse(const wr::ExternalImageId& aExternalImageId);
+
+  void NotifyNotUsed(const wr::ExternalImageId& aExternalImageId);
+
+  void NotifyForUse(const wr::ExternalImageId& aExternalImageId);
+
+  void HandleRenderTextureOps();
+
+  RefPtr<RenderTextureHostUsageInfo> GetOrMergeUsageInfo(
+      const wr::ExternalImageId& aExternalImageId,
+      RefPtr<RenderTextureHostUsageInfo> aUsageInfo);
+
+  void UnregisterExternalImageDuringShutdown(
+      const wr::ExternalImageId& aExternalImageId);
+
+  RenderTextureHost* GetRenderTexture(
+      const wr::ExternalImageId& aExternalImageId);
+
+  std::tuple<RenderTextureHost*, RefPtr<RenderTextureHostUsageInfo>>
+  GetRenderTextureAndUsageInfo(const wr::ExternalImageId& aExternalImageId);
+
+  bool IsDestroyed(wr::WindowId aWindowId);
+  void SetDestroyed(wr::WindowId aWindowId);
+  bool TooManyPendingFrames(wr::WindowId aWindowId);
+  void IncPendingFrameCount(wr::WindowId aWindowId, const VsyncId& aStartId,
+                            const TimeStamp& aStartTime);
+  void DecPendingFrameBuildCount(wr::WindowId aWindowId);
+  void DecPendingFrameCount(wr::WindowId aWindowId);
+
+  void WrNotifierEvent_WakeUp(WrWindowId aWindowId, bool aCompositeNeeded);
+  void WrNotifierEvent_NewFrameReady(WrWindowId aWindowId,
+                                     wr::FramePublishId aPublishId,
+                                     const wr::FrameReadyParams* aParams);
+  void WrNotifierEvent_ExternalEvent(WrWindowId aWindowId, size_t aRawEvent);
+
+  WebRenderThreadPool& ThreadPool() { return mThreadPool; }
+
+  WebRenderThreadPool& ThreadPoolLP() { return mThreadPoolLP; }
+
+  WrChunkPool* MemoryChunkPool() { return mChunkPool; }
+
+  MaybeWebRenderGlyphRasterThread& GlyphRasterThread() {
+    return mGlyphRasterThread;
+  }
+
+  WebRenderProgramCache* GetProgramCache() {
+    MOZ_ASSERT(IsInRenderThread());
+    return mProgramCache.get();
+  }
+
+  WebRenderShaders* GetShaders() {
+    MOZ_ASSERT(IsInRenderThread());
+    return mShaders.get();
+  }
+
+  gl::GLContext* SingletonGL(nsACString& aError);
+  gl::GLContext* SingletonGL();
+  void ClearSingletonGL();
+  RefPtr<layers::SurfacePool> SharedSurfacePool();
+  void ClearSharedSurfacePool();
+
+  void HandleDeviceReset(gfx::DeviceResetDetectPlace aPlace,
+                         gfx::DeviceResetReason aReason);
+  bool IsHandlingDeviceReset();
+  void SimulateDeviceReset();
+
+  void NotifyWebRenderError(WebRenderError aError);
+
+  void HandleWebRenderError(WebRenderError aError);
+  bool IsHandlingWebRenderError();
+
+  bool SyncObjectNeeded();
+
+  size_t RendererCount() const;
+  size_t ActiveRendererCount() const { return sActiveRendererCount; };
+  void UpdateActiveRendererCount();
+
+  void BeginRecordingForWindow(wr::WindowId aWindowId,
+                               const TimeStamp& aRecordingStart,
+                               wr::PipelineId aRootPipelineId);
+
+  Maybe<layers::FrameRecording> EndRecordingForWindow(wr::WindowId aWindowId);
+
+  static void MaybeEnableGLDebugMessage(gl::GLContext* aGLContext);
+
+  void SetBatteryInfo(const hal::BatteryInformation& aBatteryInfo);
+  bool GetPowerIsCharging();
+
+  void BeginShaderWarmupIfNeeded();
+
+ private:
+  static size_t sRendererCount;
+  static size_t sActiveRendererCount;
+
+  enum class RenderTextureOp {
+    PrepareForUse,
+    NotifyForUse,
+    NotifyNotUsed,
+  };
+  class WrNotifierEvent {
+   public:
+    enum class Tag {
+      WakeUp,
+      NewFrameReady,
+      ExternalEvent,
+    };
+    const Tag mTag;
+
+   private:
+    WrNotifierEvent(const Tag aTag, wr::FramePublishId aPublishId,
+                    wr::FrameReadyParams aParams)
+        : mTag(aTag), mPublishId(aPublishId), mParams(aParams) {
+      MOZ_ASSERT(mTag == Tag::NewFrameReady);
+    }
+    WrNotifierEvent(const Tag aTag, wr::FrameReadyParams aParams)
+        : mTag(aTag), mParams(aParams) {
+      MOZ_ASSERT(mTag == Tag::WakeUp);
+    }
+    WrNotifierEvent(const Tag aTag, UniquePtr<RendererEvent>&& aRendererEvent)
+        : mTag(aTag), mRendererEvent(std::move(aRendererEvent)) {
+      MOZ_ASSERT(mTag == Tag::ExternalEvent);
+    }
+
+    const wr::FramePublishId mPublishId = wr::FramePublishId::INVALID;
+    const wr::FrameReadyParams mParams = {
+        .present = false,
+        .render = false,
+        .scrolled = false,
+        .tracked = false,
+    };
+    UniquePtr<RendererEvent> mRendererEvent;
+
+   public:
+    static WrNotifierEvent WakeUp(const bool aCompositeNeeded) {
+      wr::FrameReadyParams params = {
+          .present = aCompositeNeeded,
+          .render = aCompositeNeeded,
+          .scrolled = false,
+          .tracked = false,
+      };
+      return WrNotifierEvent(Tag::WakeUp, params);
+    }
+
+    static WrNotifierEvent NewFrameReady(FramePublishId aPublishId,
+                                         const wr::FrameReadyParams* aParams) {
+      return WrNotifierEvent(Tag::NewFrameReady, aPublishId, *aParams);
+    }
+
+    static WrNotifierEvent ExternalEvent(
+        UniquePtr<RendererEvent>&& aRendererEvent) {
+      return WrNotifierEvent(Tag::ExternalEvent, std::move(aRendererEvent));
+    }
+
+    const wr::FrameReadyParams& FrameReadyParams() const {
+      MOZ_ASSERT(mTag == Tag::NewFrameReady || mTag == Tag::WakeUp,
+                 "Unexpected NotiferEvent tag");
+      return mParams;
+    }
+    FramePublishId PublishId() {
+      if (mTag == Tag::NewFrameReady) {
+        return mPublishId;
+      }
+      MOZ_ASSERT_UNREACHABLE("Unexpected NotiferEvent tag");
+      return FramePublishId::INVALID;
+    }
+    UniquePtr<RendererEvent> ExternalEvent() {
+      if (mTag == Tag::ExternalEvent) {
+        MOZ_ASSERT(mRendererEvent);
+        return std::move(mRendererEvent);
+      }
+      MOZ_ASSERT_UNREACHABLE("Unexpected NotiferEvent tag");
+      return nullptr;
+    }
+  };
+
+  explicit RenderThread(RefPtr<nsIThread> aThread);
+
+  void HandleFrameOneDocInner(wr::WindowId aWindowId,
+                              const wr::FrameReadyParams& aParams,
+                              Maybe<FramePublishId> aPublishId);
+
+  void DeferredRenderTextureHostDestroy();
+  void ShutDownTask();
+  void InitDeviceTask();
+  void PostResumeShaderWarmupRunnable();
+  void ResumeShaderWarmup();
+  void HandleFrameOneDoc(wr::WindowId aWindowId, const wr::FrameReadyParams&,
+                         Maybe<FramePublishId> aPublishId);
+  void RunEvent(wr::WindowId aWindowId, UniquePtr<RendererEvent> aEvent,
+                bool aViaWebRender);
+  void PostRunnable(already_AddRefed<nsIRunnable> aRunnable);
+
+  void DoAccumulateMemoryReport(MemoryReport,
+                                const RefPtr<MemoryReportPromise::Private>&);
+
+  void AddRenderTextureOp(RenderTextureOp aOp,
+                          const wr::ExternalImageId& aExternalImageId);
+
+  void CreateSingletonGL(nsACString& aError);
+
+  void DestroyExternalImages(const std::vector<wr::ExternalImageId>&& aIds);
+
+  struct WindowInfo;
+
+  void PostWrNotifierEvents(WrWindowId aWindowId);
+  void PostWrNotifierEvents(WrWindowId aWindowId, WindowInfo* aInfo);
+  void HandleWrNotifierEvents(WrWindowId aWindowId);
+  void WrNotifierEvent_HandleWakeUp(wr::WindowId aWindowId,
+                                    const wr::FrameReadyParams& aParams);
+  void WrNotifierEvent_HandleNewFrameReady(wr::WindowId aWindowId,
+                                           wr::FramePublishId aPublishId,
+                                           const wr::FrameReadyParams& aParams);
+  void WrNotifierEvent_HandleExternalEvent(
+      wr::WindowId aWindowId, UniquePtr<RendererEvent> aRendererEvent);
+
+  ~RenderThread();
+
+  RefPtr<nsIThread> const mThread;
+
+  WebRenderThreadPool mThreadPool;
+  WebRenderThreadPool mThreadPoolLP;
+  WrChunkPool* mChunkPool;
+  MaybeWebRenderGlyphRasterThread mGlyphRasterThread;
+
+  UniquePtr<WebRenderProgramCache> mProgramCache;
+  UniquePtr<WebRenderShaders> mShaders;
+  RefPtr<gl::GLContext> mSingletonGL;
+  RefPtr<layers::SurfacePool> mSurfacePool;
+
+  std::map<wr::WindowId, UniquePtr<RendererOGL>> mRenderers;
+
+  DataMutex<Maybe<hal::BatteryInformation>> mBatteryInfo;
+
+  struct PendingFrameInfo {
+    TimeStamp mStartTime;
+    VsyncId mStartId;
+  };
+
+  struct WindowInfo {
+    int64_t PendingCount() { return mPendingFrames.size(); }
+    std::queue<PendingFrameInfo> mPendingFrames;
+    uint8_t mPendingFrameBuild = 0;
+    bool mIsDestroyed = false;
+    RefPtr<nsIRunnable> mWrNotifierEventsRunnable;
+    std::queue<WrNotifierEvent> mPendingWrNotifierEvents;
+  };
+
+  DataMutex<std::unordered_map<uint64_t, UniquePtr<WindowInfo>>> mWindowInfos;
+
+  std::unordered_map<uint64_t, UniquePtr<std::queue<WrNotifierEvent>>>
+      mWrNotifierEventsQueues;
+
+  struct ExternalImageIdHashFn {
+    std::size_t operator()(const wr::ExternalImageId& aId) const {
+      return HashGeneric(wr::AsUint64(aId));
+    }
+  };
+
+  Mutex mRenderTextureMapLock;
+  std::unordered_map<wr::ExternalImageId, RefPtr<RenderTextureHost>,
+                     ExternalImageIdHashFn>
+      mRenderTextures MOZ_GUARDED_BY(mRenderTextureMapLock);
+  std::unordered_map<wr::ExternalImageId, RefPtr<RenderTextureHost>,
+                     ExternalImageIdHashFn>
+      mSyncObjectNeededRenderTextures MOZ_GUARDED_BY(mRenderTextureMapLock);
+  std::list<std::pair<RenderTextureOp, RefPtr<RenderTextureHost>>>
+      mRenderTextureOps MOZ_GUARDED_BY(mRenderTextureMapLock);
+
+  std::list<RefPtr<RenderTextureHost>> mRenderTexturesDeferred
+      MOZ_GUARDED_BY(mRenderTextureMapLock);
+
+  RefPtr<nsIRunnable> mRenderTextureOpsRunnable
+      MOZ_GUARDED_BY(mRenderTextureMapLock);
+
+  bool mHasShutdown;
+
+  bool mHandlingDeviceReset;
+  bool mHandlingWebRenderError;
+};
+
+}  
+}  
+
+#endif

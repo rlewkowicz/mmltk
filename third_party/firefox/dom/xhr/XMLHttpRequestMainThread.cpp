@@ -1,0 +1,3885 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "XMLHttpRequestMainThread.h"
+
+#include <algorithm>
+#  include <unistd.h>
+#include "MultipartBlobImpl.h"
+#include "XMLHttpRequestUpload.h"
+#include "js/ArrayBuffer.h"  // JS::{Create,Release}MappedArrayBufferContents,New{,Mapped}ArrayBufferWithContents
+#include "js/JSON.h"         // JS_ParseJSON
+#include "js/MemoryFunctions.h"
+#include "js/RootingAPI.h"  // JS::{{,Mutable}Handle,Rooted}
+#include "js/Value.h"       // JS::{,Undefined}Value
+#include "jsapi.h"          // JS_ClearPendingException
+#include "mozilla/AppShutdown.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/CheckedInt.h"
+#include "mozilla/Components.h"
+#include "mozilla/Encoding.h"
+#include "mozilla/EventDispatcher.h"
+#include "mozilla/EventListenerManager.h"
+#include "mozilla/HoldDropJSObjects.h"
+#include "mozilla/LoadContext.h"
+#include "mozilla/LoadInfo.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/PreloaderBase.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/SpinEventLoopUntil.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/StaticPrefs_network.h"
+#include "mozilla/StaticPrefs_privacy.h"
+#include "mozilla/dom/AutoSuppressEventHandlingAndSuspend.h"
+#include "mozilla/dom/BlobBinding.h"
+#include "mozilla/dom/BlobURLChannel.h"
+#include "mozilla/dom/BlobURLProtocolHandler.h"
+#include "mozilla/dom/DOMString.h"
+#include "mozilla/dom/DocGroup.h"
+#include "mozilla/dom/FetchUtil.h"
+#include "mozilla/dom/File.h"
+#include "mozilla/dom/FileBinding.h"
+#include "mozilla/dom/FileCreatorHelper.h"
+#include "mozilla/dom/FormData.h"
+#include "mozilla/dom/MutableBlobStorage.h"
+#include "mozilla/dom/ProgressEvent.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/PromiseNativeHandler.h"
+#include "mozilla/dom/ReferrerInfo.h"
+#include "mozilla/dom/URLSearchParams.h"
+#include "mozilla/dom/UserActivation.h"
+#include "mozilla/dom/WorkerError.h"
+#include "mozilla/dom/XMLDocument.h"
+#include "mozilla/dom/XMLHttpRequestBinding.h"
+#include "mozilla/dom/quota/QuotaCommon.h"
+#include "mozilla/net/ContentRange.h"
+#include "nsAsyncRedirectVerifyHelper.h"
+#include "nsCharSeparatedTokenizer.h"
+#include "nsContentUtils.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsDataChannel.h"
+#include "nsError.h"
+#include "nsGlobalWindowInner.h"
+#include "nsIAuthPrompt.h"
+#include "nsIAuthPrompt2.h"
+#include "nsIBaseChannel.h"
+#include "nsICachingChannel.h"
+#include "nsIClassOfService.h"
+#include "nsIClassifiedChannel.h"
+#include "nsIContentPolicy.h"
+#include "nsICookieJarSettings.h"
+#include "nsIDOMEventListener.h"
+#include "nsIFileChannel.h"
+#include "nsIHttpChannel.h"
+#include "nsIHttpChannelInternal.h"
+#include "nsIInterfaceRequestorUtils.h"
+#include "nsIJARChannel.h"
+#include "nsIJARURI.h"
+#include "nsILoadGroup.h"
+#include "nsIPermissionManager.h"
+#include "nsIPromptFactory.h"
+#include "nsIScriptError.h"
+#include "nsISupportsPriority.h"
+#include "nsITimedChannel.h"
+#include "nsIURI.h"
+#include "nsIURIMutator.h"
+#include "nsIUploadChannel.h"
+#include "nsIUploadChannel2.h"
+#include "nsIWindowWatcher.h"
+#include "nsMimeTypes.h"
+#include "nsNetUtil.h"
+#include "nsPIDOMWindowInlines.h"
+#include "nsQueryObject.h"
+#include "nsReadableUtils.h"
+#include "nsSandboxFlags.h"
+#include "nsStreamListenerWrapper.h"
+#include "nsStreamUtils.h"
+#include "nsStringStream.h"
+#include "nsThreadUtils.h"
+#include "nsVariant.h"
+#include "nsWrapperCacheInlines.h"
+#include "nsXPCOM.h"
+#include "nsZipArchive.h"
+#include "private/pprio.h"
+
+#if defined(CreateFile)
+#  undef CreateFile
+#endif
+
+extern mozilla::LazyLogModule gXMLHttpRequestLog;
+
+using namespace mozilla::net;
+
+namespace mozilla::dom {
+
+using EventType = XMLHttpRequest::EventType;
+using Events = XMLHttpRequest::Events;
+
+const uint32_t XML_HTTP_REQUEST_ARRAYBUFFER_MAX_GROWTH = 32 * 1024 * 1024;
+const uint32_t XML_HTTP_REQUEST_ARRAYBUFFER_MIN_SIZE = 32 * 1024;
+const int32_t XML_HTTP_REQUEST_MAX_CONTENT_LENGTH_PREALLOCATE =
+    1 * 1024 * 1024 * 1024LL;
+
+constexpr nsLiteralString kLiteralString_readystatechange =
+    u"readystatechange"_ns;
+constexpr nsLiteralString kLiteralString_DOMContentLoaded =
+    u"DOMContentLoaded"_ns;
+constexpr nsLiteralCString kLiteralString_charset = "charset"_ns;
+constexpr nsLiteralCString kLiteralString_UTF_8 = "UTF-8"_ns;
+
+#define NS_PROGRESS_EVENT_INTERVAL 50
+#define MAX_SYNC_TIMEOUT_WHEN_UNLOADING 10000 /* 10 secs */
+
+NS_IMPL_ISUPPORTS(nsXHRParseEndListener, nsIDOMEventListener)
+
+class nsResumeTimeoutsEvent : public Runnable {
+ public:
+  explicit nsResumeTimeoutsEvent(nsPIDOMWindowInner* aWindow)
+      : Runnable("dom::nsResumeTimeoutsEvent"), mWindow(aWindow) {}
+
+  NS_IMETHOD Run() override {
+    mWindow->Resume();
+    return NS_OK;
+  }
+
+ private:
+  nsCOMPtr<nsPIDOMWindowInner> mWindow;
+};
+
+static void AddLoadFlags(nsIRequest* request, nsLoadFlags newFlags) {
+  nsLoadFlags flags;
+  request->GetLoadFlags(&flags);
+  flags |= newFlags;
+  request->SetLoadFlags(flags);
+}
+
+#define NOT_CALLABLE_IN_SYNC_SEND_RV                               \
+  if (mFlagSyncLooping || mEventDispatchingSuspended) {            \
+    aRv.Throw(NS_ERROR_DOM_INVALID_STATE_XHR_HAS_INVALID_CONTEXT); \
+    return;                                                        \
+  }
+
+
+#if defined(DEBUG)
+
+namespace {
+struct DebugWorkerRefs {
+  Mutex& mMutex;
+  RefPtr<ThreadSafeWorkerRef> mTSWorkerRef;
+  nsCString mPrev;
+
+  DebugWorkerRefs(XMLHttpRequestMainThread& aXHR, const std::string& aStatus)
+      : mMutex(aXHR.mTSWorkerRefMutex) {
+    MutexAutoLock lock(mMutex);
+
+    mTSWorkerRef = aXHR.mTSWorkerRef;
+
+    if (!mTSWorkerRef) {
+      return;
+    }
+
+    MOZ_ASSERT(mTSWorkerRef->Private());
+
+    nsCString status(aStatus.c_str());
+    mPrev = GET_WORKERREF_DEBUG_STATUS(mTSWorkerRef->Ref());
+    SET_WORKERREF_DEBUG_STATUS(mTSWorkerRef->Ref(), status);
+  }
+
+  ~DebugWorkerRefs() {
+    MutexAutoLock lock(mMutex);
+
+    if (!mTSWorkerRef) {
+      return;
+    }
+
+    MOZ_ASSERT(mTSWorkerRef->Private());
+
+    SET_WORKERREF_DEBUG_STATUS(mTSWorkerRef->Ref(), mPrev);
+
+    mTSWorkerRef = nullptr;
+  }
+};
+}  
+
+#  define STREAM_STRING(stuff)                                    \
+    (((const std::ostringstream&)(std::ostringstream() << stuff)) \
+         .str())  // NOLINT
+
+#if 1  // Disabling because bug 1855699
+#    define DEBUG_WORKERREFS void()
+#    define DEBUG_WORKERREFS1(x) void()
+#else
+
+#    define DEBUG_WORKERREFS \
+      DebugWorkerRefs MOZ_UNIQUE_VAR(debugWR__)(*this, __func__)
+
+#    define DEBUG_WORKERREFS1(x)                 \
+      DebugWorkerRefs MOZ_UNIQUE_VAR(debugWR__)( \
+          *this, STREAM_STRING(__func__ << ": " << x))  // NOLINT
+
+#endif
+
+#else
+#  define DEBUG_WORKERREFS void()
+#  define DEBUG_WORKERREFS1(x) void()
+#endif
+
+bool XMLHttpRequestMainThread::sDontWarnAboutSyncXHR = false;
+
+XMLHttpRequestMainThread::XMLHttpRequestMainThread(
+    nsIGlobalObject* aGlobalObject)
+    : XMLHttpRequest(aGlobalObject),
+#if defined(DEBUG)
+      mTSWorkerRefMutex("Debug WorkerRefs"),
+#endif
+      mResponseBodyDecodedPos(0),
+      mResponseType(XMLHttpRequestResponseType::_empty),
+      mState(XMLHttpRequest_Binding::UNSENT),
+      mFlagSynchronous(false),
+      mFlagAborted(false),
+      mFlagParseBody(false),
+      mFlagSyncLooping(false),
+      mFlagBackgroundRequest(false),
+      mFlagHadUploadListenersOnSend(false),
+      mFlagACwithCredentials(false),
+      mFlagTimedOut(false),
+      mFlagDeleted(false),
+      mFlagSend(false),
+      mUploadTransferred(0),
+      mUploadTotal(0),
+      mUploadComplete(true),
+      mProgressSinceLastProgressEvent(false),
+      mRequestSentTime(0),
+      mTimeoutMilliseconds(0),
+      mErrorLoad(ErrorType::eOK),
+      mErrorLoadDetail(NS_OK),
+      mErrorParsingXML(false),
+      mWaitingForOnStopRequest(false),
+      mProgressTimerIsActive(false),
+      mIsHtml(false),
+      mWarnAboutSyncHtml(false),
+      mLoadTotal(-1),
+      mLoadTransferred(0),
+      mIsSystem(false),
+      mIsAnon(false),
+      mAlreadyGotStopRequest(false),
+      mResultJSON(JS::UndefinedValue()),
+      mArrayBufferBuilder(new ArrayBufferBuilder()),
+      mResultArrayBuffer(nullptr),
+      mIsMappedArrayBuffer(false),
+      mXPCOMifier(nullptr),
+      mEventDispatchingSuspended(false),
+      mEofDecoded(false),
+      mDelayedDoneNotifier(nullptr) {
+  DEBUG_WORKERREFS;
+  mozilla::HoldJSObjects(this);
+}
+
+XMLHttpRequestMainThread::~XMLHttpRequestMainThread() {
+  DEBUG_WORKERREFS;
+  MOZ_ASSERT(
+      !mDelayedDoneNotifier,
+      "How can we have mDelayedDoneNotifier, which owns us, in destructor?");
+
+  mFlagDeleted = true;
+
+  if ((mState == XMLHttpRequest_Binding::OPENED && mFlagSend) ||
+      mState == XMLHttpRequest_Binding::LOADING) {
+    Abort();
+  }
+
+  mParseEndListener = nullptr;
+
+  MOZ_ASSERT(!mFlagSyncLooping, "we rather crash than hang");
+  mFlagSyncLooping = false;
+
+  mozilla::DropJSObjects(this);
+}
+
+void XMLHttpRequestMainThread::Construct(
+    nsIPrincipal* aPrincipal, nsICookieJarSettings* aCookieJarSettings,
+    bool aForWorker, nsIURI* aBaseURI ,
+    nsILoadGroup* aLoadGroup ,
+    PerformanceStorage* aPerformanceStorage ,
+    nsICSPEventListener* aCSPEventListener ) {
+  DEBUG_WORKERREFS;
+  MOZ_ASSERT(aPrincipal);
+  mPrincipal = aPrincipal;
+  mBaseURI = aBaseURI;
+  mLoadGroup = aLoadGroup;
+  mCookieJarSettings = aCookieJarSettings;
+  mForWorker = aForWorker;
+  mPerformanceStorage = aPerformanceStorage;
+  mCSPEventListener = aCSPEventListener;
+}
+
+void XMLHttpRequestMainThread::InitParameters(bool aAnon, bool aSystem) {
+  DEBUG_WORKERREFS;
+  if (!aAnon && !aSystem) {
+    return;
+  }
+
+  if (!IsSystemXHR() && aSystem) {
+    nsIGlobalObject* global = GetRelevantGlobal();
+    if (NS_WARN_IF(!global)) {
+      SetParameters(aAnon, false);
+      return;
+    }
+
+    nsIPrincipal* principal = global->PrincipalOrNull();
+    if (NS_WARN_IF(!principal)) {
+      SetParameters(aAnon, false);
+      return;
+    }
+
+    nsCOMPtr<nsIPermissionManager> permMgr =
+        components::PermissionManager::Service();
+    if (NS_WARN_IF(!permMgr)) {
+      SetParameters(aAnon, false);
+      return;
+    }
+
+    uint32_t permission;
+    nsresult rv = permMgr->TestPermissionFromPrincipal(
+        principal, "systemXHR"_ns, &permission);
+    if (NS_FAILED(rv) || permission != nsIPermissionManager::ALLOW_ACTION) {
+      SetParameters(aAnon, false);
+      return;
+    }
+  }
+
+  SetParameters(aAnon, aSystem);
+}
+
+void XMLHttpRequestMainThread::SetClientInfoAndController(
+    const ClientInfo& aClientInfo,
+    const Maybe<ServiceWorkerDescriptor>& aController) {
+  mClientInfo.emplace(aClientInfo);
+  mController = aController;
+}
+
+void XMLHttpRequestMainThread::SetAssociatedBrowsingContextID(uint64_t aId) {
+  mAssociatedBrowsingContextID = aId;
+}
+
+void XMLHttpRequestMainThread::ResetResponse() {
+  mResponseXML = nullptr;
+  mResponseBody.Truncate();
+  TruncateResponseText();
+  mResponseBlobImpl = nullptr;
+  mResponseBlob = nullptr;
+  mBlobStorage = nullptr;
+  mResultArrayBuffer = nullptr;
+  mArrayBufferBuilder = new ArrayBufferBuilder();
+  mResultJSON.setUndefined();
+  mLoadTransferred = 0;
+  mResponseBodyDecodedPos = 0;
+  mEofDecoded = false;
+}
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(XMLHttpRequestMainThread)
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(XMLHttpRequestMainThread,
+                                                  XMLHttpRequestEventTarget)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mChannel)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mResponseXML)
+
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mXMLParserStreamListener)
+
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mResponseBlob)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mNotificationCallbacks)
+
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mChannelEventSink)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mProgressEventSink)
+
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mUpload)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_INHERITED(XMLHttpRequestMainThread,
+                                                XMLHttpRequestEventTarget)
+  tmp->mResultArrayBuffer = nullptr;
+  tmp->mArrayBufferBuilder = nullptr;
+  tmp->mResultJSON.setUndefined();
+  tmp->mResponseBlobImpl = nullptr;
+
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mChannel)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mResponseXML)
+
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mXMLParserStreamListener)
+
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mResponseBlob)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mNotificationCallbacks)
+
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mChannelEventSink)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mProgressEventSink)
+
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mUpload)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_WEAK_PTR
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_CYCLE_COLLECTION_TRACE_BEGIN_INHERITED(XMLHttpRequestMainThread,
+                                               XMLHttpRequestEventTarget)
+  NS_IMPL_CYCLE_COLLECTION_TRACE_JS_MEMBER_CALLBACK(mResultArrayBuffer)
+  NS_IMPL_CYCLE_COLLECTION_TRACE_JS_MEMBER_CALLBACK(mResultJSON)
+NS_IMPL_CYCLE_COLLECTION_TRACE_END
+
+bool XMLHttpRequestMainThread::IsCertainlyAliveForCC() const {
+  return mWaitingForOnStopRequest;
+}
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(XMLHttpRequestMainThread)
+  NS_INTERFACE_MAP_ENTRY(nsIRequestObserver)
+  NS_INTERFACE_MAP_ENTRY(nsIStreamListener)
+  NS_INTERFACE_MAP_ENTRY(nsIChannelEventSink)
+  NS_INTERFACE_MAP_ENTRY(nsIProgressEventSink)
+  NS_INTERFACE_MAP_ENTRY(nsIInterfaceRequestor)
+  NS_INTERFACE_MAP_ENTRY(nsITimerCallback)
+  NS_INTERFACE_MAP_ENTRY(nsINamed)
+  NS_INTERFACE_MAP_ENTRY(nsISizeOfEventTarget)
+NS_INTERFACE_MAP_END_INHERITING(XMLHttpRequestEventTarget)
+
+NS_IMPL_ADDREF_INHERITED(XMLHttpRequestMainThread, XMLHttpRequestEventTarget)
+NS_IMPL_RELEASE_INHERITED(XMLHttpRequestMainThread, XMLHttpRequestEventTarget)
+
+void XMLHttpRequestMainThread::DisconnectFromOwner() {
+  XMLHttpRequestEventTarget::DisconnectFromOwner();
+  if (!mForWorker) {
+    Abort();
+  }
+}
+
+size_t XMLHttpRequestMainThread::SizeOfEventTargetIncludingThis(
+    MallocSizeOf aMallocSizeOf) const {
+  size_t n = aMallocSizeOf(this);
+  n += mResponseBody.SizeOfExcludingThisIfUnshared(aMallocSizeOf);
+
+  n += mResponseText.SizeOfThis(aMallocSizeOf);
+
+  return n;
+
+}
+
+static void LogMessage(
+    const char* aWarning, nsPIDOMWindowInner* aWindow,
+    const nsTArray<nsString>& aParams = nsTArray<nsString>()) {
+  nsCOMPtr<Document> doc;
+  if (aWindow) {
+    doc = aWindow->GetExtantDoc();
+  }
+  nsContentUtils::ReportToConsole(nsIScriptError::warningFlag, "DOM"_ns, doc,
+                                  PropertiesFile::DOM_PROPERTIES, aWarning,
+                                  aParams);
+}
+
+Document* XMLHttpRequestMainThread::GetResponseXML(ErrorResult& aRv) {
+  if (mResponseType != XMLHttpRequestResponseType::_empty &&
+      mResponseType != XMLHttpRequestResponseType::Document) {
+    aRv.ThrowInvalidStateError(
+        "responseXML is only available if responseType is '' or 'document'.");
+    return nullptr;
+  }
+  if (mWarnAboutSyncHtml) {
+    mWarnAboutSyncHtml = false;
+    LogMessage("HTMLSyncXHRWarning", GetOwnerWindow());
+  }
+  if (mState != XMLHttpRequest_Binding::DONE) {
+    return nullptr;
+  }
+  return mResponseXML;
+}
+
+nsresult XMLHttpRequestMainThread::DetectCharset() {
+  DEBUG_WORKERREFS;
+  mDecoder = nullptr;
+
+  if (mResponseType != XMLHttpRequestResponseType::_empty &&
+      mResponseType != XMLHttpRequestResponseType::Text &&
+      mResponseType != XMLHttpRequestResponseType::Json) {
+    return NS_OK;
+  }
+
+  nsAutoCString charsetVal;
+  const Encoding* encoding;
+  bool ok = mChannel && NS_SUCCEEDED(mChannel->GetContentCharset(charsetVal)) &&
+            (encoding = Encoding::ForLabel(charsetVal));
+  if (!ok) {
+    encoding = UTF_8_ENCODING;
+  }
+
+  if (mResponseType == XMLHttpRequestResponseType::Json &&
+      encoding != UTF_8_ENCODING) {
+    LogMessage("JSONCharsetWarning", GetOwnerWindow());
+    encoding = UTF_8_ENCODING;
+  }
+
+  if (mResponseType == XMLHttpRequestResponseType::Json) {
+    mDecoder = encoding->NewDecoderWithBOMRemoval();
+  } else {
+    mDecoder = encoding->NewDecoder();
+  }
+
+  return NS_OK;
+}
+
+nsresult XMLHttpRequestMainThread::AppendToResponseText(
+    Span<const uint8_t> aBuffer, bool aLast) {
+
+  NS_ENSURE_STATE(mDecoder);
+
+  CheckedInt<size_t> destBufferLen =
+      mDecoder->MaxUTF16BufferLength(aBuffer.Length());
+
+  {  
+    XMLHttpRequestStringWriterHelper helper(mResponseText);
+
+    uint32_t len = helper.Length();
+
+    destBufferLen += len;
+    if (!destBufferLen.isValid() || destBufferLen.value() > UINT32_MAX) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+
+    auto handleOrErr = helper.BulkWrite(destBufferLen.value());
+    if (handleOrErr.isErr()) {
+      return handleOrErr.unwrapErr();
+    }
+
+    auto handle = handleOrErr.unwrap();
+
+    uint32_t result;
+    size_t read;
+    size_t written;
+    std::tie(result, read, written, std::ignore) =
+        mDecoder->DecodeToUTF16(aBuffer, handle.AsSpan().From(len), aLast);
+    MOZ_ASSERT(result == kInputEmpty);
+    MOZ_ASSERT(read == aBuffer.Length());
+    len += written;
+    MOZ_ASSERT(len <= destBufferLen.value());
+    handle.Finish(len, false);
+  }  
+
+  if (aLast) {
+    mDecoder = nullptr;
+    mEofDecoded = true;
+  }
+  return NS_OK;
+}
+
+void XMLHttpRequestMainThread::GetResponseText(DOMString& aResponseText,
+                                               ErrorResult& aRv) {
+  MOZ_DIAGNOSTIC_ASSERT(!mForWorker);
+
+  XMLHttpRequestStringSnapshot snapshot;
+  GetResponseText(snapshot, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  if (!snapshot.GetAsString(aResponseText)) {
+    aRv.Throw(NS_ERROR_OUT_OF_MEMORY);
+    return;
+  }
+}
+
+void XMLHttpRequestMainThread::GetResponseText(
+    XMLHttpRequestStringSnapshot& aSnapshot, ErrorResult& aRv) {
+  aSnapshot.Reset();
+
+  if (mResponseType != XMLHttpRequestResponseType::_empty &&
+      mResponseType != XMLHttpRequestResponseType::Text) {
+    aRv.ThrowInvalidStateError(
+        "responseText is only available if responseType is '' or 'text'.");
+    return;
+  }
+
+  if (mState != XMLHttpRequest_Binding::LOADING &&
+      mState != XMLHttpRequest_Binding::DONE) {
+    return;
+  }
+
+  if (mRequestMethod.EqualsLiteral("HEAD") ||
+      mRequestMethod.EqualsLiteral("CONNECT")) {
+    return;
+  }
+
+  if ((!mResponseXML && !mErrorParsingXML) ||
+      (mResponseBodyDecodedPos == mResponseBody.Length() &&
+       (mState != XMLHttpRequest_Binding::DONE || mEofDecoded))) {
+    mResponseText.CreateSnapshot(aSnapshot);
+    return;
+  }
+
+  MatchCharsetAndDecoderToResponseDocument();
+
+  MOZ_ASSERT(mResponseBodyDecodedPos < mResponseBody.Length() ||
+                 mState == XMLHttpRequest_Binding::DONE,
+             "Unexpected mResponseBodyDecodedPos");
+  Span<const uint8_t> span = mResponseBody;
+  aRv = AppendToResponseText(span.From(mResponseBodyDecodedPos),
+                             mState == XMLHttpRequest_Binding::DONE);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  mResponseBodyDecodedPos = mResponseBody.Length();
+
+  if (mEofDecoded) {
+    mResponseBody.Truncate();
+    mResponseBodyDecodedPos = 0;
+  }
+
+  mResponseText.CreateSnapshot(aSnapshot);
+}
+
+nsresult XMLHttpRequestMainThread::CreateResponseParsedJSON(JSContext* aCx) {
+  if (!aCx) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsAutoString string;
+  nsresult rv = GetResponseTextForJSON(string);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  JS::Rooted<JS::Value> value(aCx);
+  if (!JS_ParseJSON(aCx, string.BeginReading(), string.Length(), &value)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  mResultJSON = value;
+  return NS_OK;
+}
+
+void XMLHttpRequestMainThread::SetResponseType(
+    XMLHttpRequestResponseType aResponseType, ErrorResult& aRv) {
+  NOT_CALLABLE_IN_SYNC_SEND_RV
+
+  if (mState == XMLHttpRequest_Binding::LOADING ||
+      mState == XMLHttpRequest_Binding::DONE) {
+    aRv.ThrowInvalidStateError(
+        "Cannot set 'responseType' property on XMLHttpRequest after 'send()' "
+        "(when its state is LOADING or DONE).");
+    return;
+  }
+
+  if (HasOrHasHadOwnerWindow() && mState != XMLHttpRequest_Binding::UNSENT &&
+      mFlagSynchronous) {
+    LogMessage("ResponseTypeSyncXHRWarning", GetOwnerWindow());
+    aRv.ThrowInvalidAccessError(
+        "synchronous XMLHttpRequests do not support timeout and responseType");
+    return;
+  }
+
+  SetResponseTypeRaw(aResponseType);
+}
+
+void XMLHttpRequestMainThread::GetResponse(
+    JSContext* aCx, JS::MutableHandle<JS::Value> aResponse, ErrorResult& aRv) {
+  MOZ_DIAGNOSTIC_ASSERT(!mForWorker);
+
+  switch (mResponseType) {
+    case XMLHttpRequestResponseType::_empty:
+    case XMLHttpRequestResponseType::Text: {
+      DOMString str;
+      GetResponseText(str, aRv);
+      if (aRv.Failed()) {
+        return;
+      }
+      if (!xpc::StringToJsval(aCx, str, aResponse)) {
+        aRv.Throw(NS_ERROR_OUT_OF_MEMORY);
+      }
+      return;
+    }
+
+    case XMLHttpRequestResponseType::Arraybuffer: {
+      if (mState != XMLHttpRequest_Binding::DONE) {
+        aResponse.setNull();
+        return;
+      }
+
+      if (!mResultArrayBuffer) {
+        mResultArrayBuffer = mArrayBufferBuilder->TakeArrayBuffer(aCx);
+        if (!mResultArrayBuffer) {
+          aRv.Throw(NS_ERROR_OUT_OF_MEMORY);
+          return;
+        }
+      }
+      aResponse.setObject(*mResultArrayBuffer);
+      return;
+    }
+    case XMLHttpRequestResponseType::Blob: {
+      if (mState != XMLHttpRequest_Binding::DONE) {
+        aResponse.setNull();
+        return;
+      }
+
+      if (!mResponseBlobImpl) {
+        aResponse.setNull();
+        return;
+      }
+
+      if (!mResponseBlob) {
+        mResponseBlob = Blob::Create(GetRelevantGlobal(), mResponseBlobImpl);
+      }
+
+      if (!GetOrCreateDOMReflector(aCx, mResponseBlob, aResponse)) {
+        aResponse.setNull();
+      }
+
+      return;
+    }
+    case XMLHttpRequestResponseType::Document: {
+      if (!mResponseXML || mState != XMLHttpRequest_Binding::DONE) {
+        aResponse.setNull();
+        return;
+      }
+
+      aRv =
+          nsContentUtils::WrapNative(aCx, ToSupports(mResponseXML), aResponse);
+      return;
+    }
+    case XMLHttpRequestResponseType::Json: {
+      if (mState != XMLHttpRequest_Binding::DONE) {
+        aResponse.setNull();
+        return;
+      }
+
+      if (mResultJSON.isUndefined()) {
+        aRv = CreateResponseParsedJSON(aCx);
+        TruncateResponseText();
+        if (aRv.Failed()) {
+          aRv = NS_OK;
+          JS_ClearPendingException(aCx);
+          mResultJSON.setNull();
+        }
+      }
+      aResponse.set(mResultJSON);
+      return;
+    }
+    default:
+      NS_ERROR("Should not happen");
+  }
+
+  aResponse.setNull();
+}
+
+already_AddRefed<BlobImpl> XMLHttpRequestMainThread::GetResponseBlobImpl() {
+  MOZ_DIAGNOSTIC_ASSERT(mForWorker);
+  MOZ_DIAGNOSTIC_ASSERT(mResponseType == XMLHttpRequestResponseType::Blob);
+
+  if (mState != XMLHttpRequest_Binding::DONE) {
+    return nullptr;
+  }
+
+  RefPtr<BlobImpl> blobImpl = mResponseBlobImpl;
+  return blobImpl.forget();
+}
+
+already_AddRefed<ArrayBufferBuilder>
+XMLHttpRequestMainThread::GetResponseArrayBufferBuilder() {
+  MOZ_DIAGNOSTIC_ASSERT(mForWorker);
+  MOZ_DIAGNOSTIC_ASSERT(mResponseType ==
+                        XMLHttpRequestResponseType::Arraybuffer);
+
+  if (mState != XMLHttpRequest_Binding::DONE) {
+    return nullptr;
+  }
+
+  RefPtr<ArrayBufferBuilder> builder = mArrayBufferBuilder;
+  return builder.forget();
+}
+
+nsresult XMLHttpRequestMainThread::GetResponseTextForJSON(nsAString& aString) {
+  if (mState != XMLHttpRequest_Binding::DONE) {
+    aString.SetIsVoid(true);
+    return NS_OK;
+  }
+
+  if (!mResponseText.GetAsString(aString)) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+
+  return NS_OK;
+}
+
+bool XMLHttpRequestMainThread::IsCrossSiteCORSRequest() const {
+  if (!mChannel) {
+    return false;
+  }
+
+  nsCOMPtr<nsILoadInfo> loadInfo = mChannel->LoadInfo();
+  return loadInfo->GetTainting() == LoadTainting::CORS;
+}
+
+bool XMLHttpRequestMainThread::IsDeniedCrossSiteCORSRequest() {
+  if (IsCrossSiteCORSRequest()) {
+    nsresult rv;
+    mChannel->GetStatus(&rv);
+    if (NS_FAILED(rv)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool XMLHttpRequestMainThread::BadContentRangeRequested() {
+  if (!mChannel) {
+    return false;
+  }
+  RefPtr<BlobURLChannel> blobChan = do_QueryObject(mChannel);
+  if (!blobChan) {
+    return false;
+  }
+  return !blobChan->GetResponseContentRange() &&
+         mAuthorRequestHeaders.Has("range");
+}
+
+RefPtr<mozilla::net::ContentRange>
+XMLHttpRequestMainThread::GetRequestedContentRange() const {
+  MOZ_ASSERT(mChannel);
+  RefPtr<BlobURLChannel> blobChan = do_QueryObject(mChannel);
+  if (!blobChan) {
+    return nullptr;
+  }
+  return blobChan->GetResponseContentRange();
+}
+
+void XMLHttpRequestMainThread::GetContentRangeHeader(nsACString& out) const {
+  if (!IsBlobURI(mRequestURL)) {
+    out.SetIsVoid(true);
+    return;
+  }
+  RefPtr<mozilla::net::ContentRange> range = GetRequestedContentRange();
+  if (range) {
+    range->AsHeader(out);
+  } else {
+    out.SetIsVoid(true);
+  }
+}
+
+void XMLHttpRequestMainThread::GetResponseURL(nsACString& aUrl) {
+  aUrl.Truncate();
+
+  if ((mState == XMLHttpRequest_Binding::UNSENT ||
+       mState == XMLHttpRequest_Binding::OPENED) ||
+      !mChannel) {
+    return;
+  }
+
+  if (IsDeniedCrossSiteCORSRequest()) {
+    return;
+  }
+
+  nsCOMPtr<nsIURI> responseUrl;
+  if (NS_FAILED(NS_GetFinalChannelURI(mChannel, getter_AddRefs(responseUrl)))) {
+    return;
+  }
+
+  responseUrl->GetSpecIgnoringRef(aUrl);
+}
+
+uint32_t XMLHttpRequestMainThread::GetStatus(ErrorResult& aRv) {
+  if (IsDeniedCrossSiteCORSRequest()) {
+    return 0;
+  }
+
+  if (mState == XMLHttpRequest_Binding::UNSENT ||
+      mState == XMLHttpRequest_Binding::OPENED) {
+    return 0;
+  }
+
+  if (mErrorLoad != ErrorType::eOK) {
+    nsCOMPtr<nsIJARChannel> jarChannel = GetCurrentJARChannel();
+    if (jarChannel) {
+      nsresult status;
+      mChannel->GetStatus(&status);
+
+      if (status == NS_ERROR_FILE_NOT_FOUND) {
+        return 404;  
+      } else {
+        return 500;  
+      }
+    }
+
+    return 0;
+  }
+
+  nsCOMPtr<nsIHttpChannel> httpChannel = GetCurrentHttpChannel();
+  if (!httpChannel) {
+    return GetRequestedContentRange() ? 206 : 200;
+  }
+
+  uint32_t status;
+  nsresult rv = httpChannel->GetResponseStatus(&status);
+  if (NS_FAILED(rv)) {
+    status = 0;
+  }
+
+  return status;
+}
+
+void XMLHttpRequestMainThread::GetStatusText(nsACString& aStatusText,
+                                             ErrorResult& aRv) {
+  aStatusText.Truncate();
+
+  if (IsDeniedCrossSiteCORSRequest()) {
+    return;
+  }
+
+  if (mState == XMLHttpRequest_Binding::UNSENT ||
+      mState == XMLHttpRequest_Binding::OPENED) {
+    return;
+  }
+
+  if (mErrorLoad != ErrorType::eOK) {
+    return;
+  }
+
+  nsCOMPtr<nsIHttpChannel> httpChannel = GetCurrentHttpChannel();
+  if (httpChannel) {
+    (void)httpChannel->GetResponseStatusText(aStatusText);
+  } else {
+    aStatusText.AssignLiteral("OK");
+  }
+}
+
+void XMLHttpRequestMainThread::TerminateOngoingFetch(nsresult detail) {
+  DEBUG_WORKERREFS;
+  if ((mState == XMLHttpRequest_Binding::OPENED && mFlagSend) ||
+      mState == XMLHttpRequest_Binding::HEADERS_RECEIVED ||
+      mState == XMLHttpRequest_Binding::LOADING) {
+    MOZ_LOG(gXMLHttpRequestLog, LogLevel::Info,
+            ("%p TerminateOngoingFetch(0x%" PRIx32 ")", this,
+             static_cast<uint32_t>(detail)));
+    CloseRequest(detail);
+  }
+}
+
+void XMLHttpRequestMainThread::CloseRequest(nsresult detail) {
+  DEBUG_WORKERREFS;
+  mWaitingForOnStopRequest = false;
+  mErrorLoad = ErrorType::eTerminated;
+  mErrorLoadDetail = detail;
+  if (mChannel) {
+    mChannel->CancelWithReason(NS_BINDING_ABORTED,
+                               "XMLHttpRequestMainThread::CloseRequest"_ns);
+  }
+  CancelTimeoutTimer();
+}
+
+void XMLHttpRequestMainThread::CloseRequestWithError(
+    const ErrorProgressEventType& aType) {
+  DEBUG_WORKERREFS;
+  MOZ_LOG(gXMLHttpRequestLog, LogLevel::Debug,
+          ("%p CloseRequestWithError(%s)", this, aType.cStr));
+
+  CloseRequest(aType.errorCode);
+
+  ResetResponse();
+
+  if (mFlagDeleted) {
+    mFlagSyncLooping = false;
+    return;
+  }
+
+  if (mState != XMLHttpRequest_Binding::UNSENT &&
+      !(mState == XMLHttpRequest_Binding::OPENED && !mFlagSend) &&
+      mState != XMLHttpRequest_Binding::DONE) {
+    ChangeState(XMLHttpRequest_Binding::DONE, true);
+
+    if (!mFlagSyncLooping) {
+      if (mUpload && !mUploadComplete) {
+        mUploadComplete = true;
+        DispatchProgressEvent(mUpload, aType, 0, -1);
+      }
+      DispatchProgressEvent(this, aType, 0, -1);
+    }
+  }
+
+  if (mFlagAborted) {
+    ChangeState(XMLHttpRequest_Binding::UNSENT, false);  
+  }
+
+  mFlagSyncLooping = false;
+}
+
+void XMLHttpRequestMainThread::RequestErrorSteps(
+    const ProgressEventType aEventType, const nsresult aOptionalException,
+    ErrorResult& aRv) {
+  MOZ_LOG(gXMLHttpRequestLog, LogLevel::Debug,
+          ("%p RequestErrorSteps(%s,0x%" PRIx32 ")", this, aEventType.cStr,
+           static_cast<uint32_t>(aOptionalException)));
+
+  CancelTimeoutTimer();
+  CancelSyncTimeoutTimer();
+  StopProgressEventTimer();
+
+  mState = XMLHttpRequest_Binding::DONE;
+
+  mFlagSend = false;
+
+  ResetResponse();
+
+  if (mFlagDeleted) {
+    mFlagSyncLooping = false;
+    return;
+  }
+
+  if (mFlagSynchronous && NS_FAILED(aOptionalException)) {
+    aRv.Throw(aOptionalException);
+    return;
+  }
+
+  FireReadystatechangeEvent();
+
+  if (mUpload && !mUploadComplete) {
+    mUploadComplete = true;
+
+    if (mFlagHadUploadListenersOnSend) {
+      DispatchProgressEvent(mUpload, aEventType, 0, -1);
+    }
+  }
+
+  DispatchProgressEvent(this, aEventType, 0, -1);
+}
+
+void XMLHttpRequestMainThread::Abort(ErrorResult& aRv) {
+  NOT_CALLABLE_IN_SYNC_SEND_RV
+  MOZ_LOG(gXMLHttpRequestLog, LogLevel::Debug, ("%p Abort()", this));
+  AbortInternal(aRv);
+}
+
+void XMLHttpRequestMainThread::AbortInternal(ErrorResult& aRv) {
+  MOZ_LOG(gXMLHttpRequestLog, LogLevel::Debug, ("%p AbortInternal()", this));
+  mFlagAborted = true;
+  DisconnectDoneNotifier();
+
+  TerminateOngoingFetch(NS_ERROR_DOM_ABORT_ERR);
+
+  if ((mState == XMLHttpRequest_Binding::OPENED && mFlagSend) ||
+      mState == XMLHttpRequest_Binding::HEADERS_RECEIVED ||
+      mState == XMLHttpRequest_Binding::LOADING) {
+    RequestErrorSteps(Events::abort, NS_ERROR_DOM_ABORT_ERR, aRv);
+  }
+
+  if (mState == XMLHttpRequest_Binding::DONE) {
+    ChangeState(XMLHttpRequest_Binding::UNSENT,
+                false);  
+  }
+
+  mFlagSyncLooping = false;
+}
+
+bool XMLHttpRequestMainThread::IsSafeHeader(
+    const nsACString& aHeader, NotNull<nsIHttpChannel*> aHttpChannel) const {
+  if (!IsSystemXHR() && nsContentUtils::IsForbiddenResponseHeader(aHeader)) {
+    NS_WARNING("blocked access to response header");
+    return false;
+  }
+  if (!IsCrossSiteCORSRequest()) {
+    return true;
+  }
+  if (mChannel) {
+    nsresult status;
+    mChannel->GetStatus(&status);
+    if (NS_FAILED(status)) {
+      return false;
+    }
+  }
+  const char* kCrossOriginSafeHeaders[] = {
+      "cache-control", "content-language", "content-type", "content-length",
+      "expires",       "last-modified",    "pragma"};
+  for (auto& kCrossOriginSafeHeader : kCrossOriginSafeHeaders) {
+    if (aHeader.LowerCaseEqualsASCII(kCrossOriginSafeHeader)) {
+      return true;
+    }
+  }
+  nsAutoCString headerVal;
+  (void)aHttpChannel->GetResponseHeader("Access-Control-Expose-Headers"_ns,
+                                        headerVal);
+  bool isSafe = false;
+  for (const nsACString& token :
+       nsCCharSeparatedTokenizer(headerVal, ',').ToRange()) {
+    if (token.IsEmpty()) {
+      continue;
+    }
+    if (!NS_IsValidHTTPToken(token)) {
+      return false;
+    }
+
+    if (token.EqualsLiteral("*") && !mFlagACwithCredentials) {
+      isSafe = true;
+    } else if (aHeader.Equals(token, nsCaseInsensitiveCStringComparator)) {
+      isSafe = true;
+    }
+  }
+
+  return isSafe;
+}
+
+bool XMLHttpRequestMainThread::GetContentType(nsACString& aValue) const {
+  MOZ_ASSERT(mChannel);
+  nsCOMPtr<nsIBaseChannel> baseChan = do_QueryInterface(mChannel);
+  if (baseChan) {
+    RefPtr<CMimeType> fullMimeType(baseChan->FullMimeType());
+    if (fullMimeType) {
+      fullMimeType->Serialize(aValue);
+      return true;
+    }
+  }
+  if (NS_SUCCEEDED(mChannel->GetContentType(aValue))) {
+    nsCString value;
+    if (NS_SUCCEEDED(mChannel->GetContentCharset(value)) && !value.IsEmpty()) {
+      aValue.AppendLiteral(";charset=");
+      aValue.Append(value);
+    }
+    return true;
+  }
+  return false;
+}
+void XMLHttpRequestMainThread::GetAllResponseHeaders(
+    nsACString& aResponseHeaders, ErrorResult& aRv) {
+  NOT_CALLABLE_IN_SYNC_SEND_RV
+
+  aResponseHeaders.Truncate();
+
+  if (mState == XMLHttpRequest_Binding::UNSENT ||
+      mState == XMLHttpRequest_Binding::OPENED) {
+    return;
+  }
+
+  if (mErrorLoad != ErrorType::eOK) {
+    return;
+  }
+
+  if (nsCOMPtr<nsIHttpChannel> httpChannel = GetCurrentHttpChannel()) {
+    RefPtr<nsHeaderVisitor> visitor =
+        new nsHeaderVisitor(*this, WrapNotNull(httpChannel));
+    if (NS_SUCCEEDED(httpChannel->VisitResponseHeaders(visitor))) {
+      aResponseHeaders = visitor->Headers();
+    }
+    return;
+  }
+
+  if (!mChannel) {
+    return;
+  }
+
+  nsAutoCString value;
+  if (GetContentType(value)) {
+    aResponseHeaders.AppendLiteral("Content-Type: ");
+    aResponseHeaders.Append(value);
+    aResponseHeaders.AppendLiteral("\r\n");
+  }
+
+  nsCOMPtr<nsIURI> uri;
+  if (NS_FAILED(mChannel->GetURI(getter_AddRefs(uri))) ||
+      !uri->SchemeIs("data")) {
+    int64_t length;
+    if (NS_SUCCEEDED(mChannel->GetContentLength(&length))) {
+      aResponseHeaders.AppendLiteral("Content-Length: ");
+      aResponseHeaders.AppendInt(length);
+      aResponseHeaders.AppendLiteral("\r\n");
+    }
+  }
+
+  GetContentRangeHeader(value);
+  if (!value.IsVoid()) {
+    aResponseHeaders.AppendLiteral("Content-Range: ");
+    aResponseHeaders.Append(value);
+    aResponseHeaders.AppendLiteral("\r\n");
+  }
+}
+
+void XMLHttpRequestMainThread::GetResponseHeader(const nsACString& header,
+                                                 nsACString& _retval,
+                                                 ErrorResult& aRv) {
+  NOT_CALLABLE_IN_SYNC_SEND_RV
+
+  _retval.SetIsVoid(true);
+
+  nsCOMPtr<nsIHttpChannel> httpChannel = GetCurrentHttpChannel();
+
+  if (!httpChannel) {
+    if (mState == XMLHttpRequest_Binding::UNSENT ||
+        mState == XMLHttpRequest_Binding::OPENED) {
+      return;
+    }
+
+    nsresult status;
+    if (!mChannel || NS_FAILED(mChannel->GetStatus(&status)) ||
+        (NS_FAILED(status) && status != NS_ERROR_FILE_ALREADY_EXISTS)) {
+      return;
+    }
+
+    if (header.LowerCaseEqualsASCII("content-type")) {
+      if (!GetContentType(_retval)) {
+        _retval.SetIsVoid(true);
+        return;
+      }
+    }
+
+    else if (header.LowerCaseEqualsASCII("content-length")) {
+      int64_t length;
+      if (NS_SUCCEEDED(mChannel->GetContentLength(&length))) {
+        _retval.AppendInt(length);
+      }
+    }
+
+    else if (header.LowerCaseEqualsASCII("content-range")) {
+      GetContentRangeHeader(_retval);
+    }
+
+    return;
+  }
+
+  if (!IsSafeHeader(header, WrapNotNull(httpChannel))) {
+    return;
+  }
+
+  aRv = httpChannel->GetResponseHeader(header, _retval);
+  if (aRv.ErrorCodeIs(NS_ERROR_NOT_AVAILABLE)) {
+    _retval.SetIsVoid(true);
+    aRv.SuppressException();
+  }
+}
+
+already_AddRefed<nsILoadGroup> XMLHttpRequestMainThread::GetLoadGroup() const {
+  if (mFlagBackgroundRequest) {
+    return nullptr;
+  }
+
+  if (mLoadGroup) {
+    nsCOMPtr<nsILoadGroup> ref = mLoadGroup;
+    return ref.forget();
+  }
+
+  Document* doc = GetDocumentIfCurrent();
+  if (doc) {
+    return doc->GetDocumentLoadGroup();
+  }
+
+  return nullptr;
+}
+
+nsresult XMLHttpRequestMainThread::FireReadystatechangeEvent() {
+  MOZ_ASSERT(mState != XMLHttpRequest_Binding::UNSENT);
+  RefPtr<Event> event = NS_NewDOMEvent(this, nullptr, nullptr);
+  event->InitEvent(kLiteralString_readystatechange, false, false);
+  event->SetTrusted(true);
+  DispatchOrStoreEvent(this, event);
+  return NS_OK;
+}
+
+void XMLHttpRequestMainThread::DispatchProgressEvent(
+    DOMEventTargetHelper* aTarget, const ProgressEventType& aType,
+    int64_t aLoaded, int64_t aTotal) {
+  DEBUG_WORKERREFS;
+  NS_ASSERTION(aTarget, "null target");
+
+  if (NS_FAILED(CheckCurrentGlobalCorrectness()) ||
+      (!AllowUploadProgress() && aTarget == mUpload)) {
+    return;
+  }
+
+  if (IsDeniedCrossSiteCORSRequest()) {
+    if (aType == Events::progress || aType == Events::load) {
+      return;
+    }
+    aLoaded = 0;
+    aTotal = -1;
+  }
+
+  ProgressEventInit init;
+  init.mBubbles = false;
+  init.mCancelable = false;
+  init.mLengthComputable = aTotal != -1;  
+  init.mLoaded = aLoaded;
+  init.mTotal = (aTotal == -1) ? 0 : aTotal;
+
+  RefPtr<ProgressEvent> event =
+      ProgressEvent::Constructor(aTarget, aType, init);
+  event->SetTrusted(true);
+
+  MOZ_LOG(
+      gXMLHttpRequestLog, LogLevel::Debug,
+      ("firing %s event (%u,%u,%" PRIu64 ",%" PRIu64 ")", aType.cStr,
+       aTarget == mUpload, aTotal != -1, aLoaded, (aTotal == -1) ? 0 : aTotal));
+
+  DispatchOrStoreEvent(aTarget, event);
+
+  if (aType == Events::load || aType == Events::error ||
+      aType == Events::timeout || aType == Events::abort) {
+    DispatchProgressEvent(aTarget, Events::loadend, aLoaded, aTotal);
+  }
+}
+
+void XMLHttpRequestMainThread::DispatchOrStoreEvent(
+    DOMEventTargetHelper* aTarget, Event* aEvent) {
+  DEBUG_WORKERREFS;
+  MOZ_ASSERT(aTarget);
+  MOZ_ASSERT(aEvent);
+
+  if (NS_FAILED(CheckCurrentGlobalCorrectness())) {
+    return;
+  }
+
+  if (mEventDispatchingSuspended) {
+    PendingEvent* event = mPendingEvents.AppendElement();
+    event->mTarget = aTarget;
+    event->mEvent = aEvent;
+    return;
+  }
+
+  aTarget->DispatchEvent(*aEvent);
+}
+
+void XMLHttpRequestMainThread::SuspendEventDispatching() {
+  MOZ_ASSERT(!mEventDispatchingSuspended);
+  mEventDispatchingSuspended = true;
+}
+
+void XMLHttpRequestMainThread::ResumeEventDispatching() {
+  MOZ_ASSERT(mEventDispatchingSuspended);
+  mEventDispatchingSuspended = false;
+
+  nsTArray<PendingEvent> pendingEvents = std::move(mPendingEvents);
+
+  if (NS_FAILED(CheckCurrentGlobalCorrectness())) {
+    return;
+  }
+
+  for (uint32_t i = 0; i < pendingEvents.Length(); ++i) {
+    pendingEvents[i].mTarget->DispatchEvent(*pendingEvents[i].mEvent);
+  }
+}
+
+already_AddRefed<nsIHttpChannel>
+XMLHttpRequestMainThread::GetCurrentHttpChannel() {
+  nsCOMPtr<nsIHttpChannel> httpChannel = do_QueryInterface(mChannel);
+  return httpChannel.forget();
+}
+
+already_AddRefed<nsIJARChannel>
+XMLHttpRequestMainThread::GetCurrentJARChannel() {
+  nsCOMPtr<nsIJARChannel> appChannel = do_QueryInterface(mChannel);
+  return appChannel.forget();
+}
+
+bool XMLHttpRequestMainThread::IsSystemXHR() const {
+  return mIsSystem || mPrincipal->IsSystemPrincipal();
+}
+
+bool XMLHttpRequestMainThread::InUploadPhase() const {
+  return mState == XMLHttpRequest_Binding::OPENED;
+}
+
+void XMLHttpRequestMainThread::Open(const nsACString& aMethod,
+                                    const nsACString& aUrl, ErrorResult& aRv) {
+  Open(aMethod, aUrl, true, VoidCString(), VoidCString(), aRv);
+}
+
+void XMLHttpRequestMainThread::Open(const nsACString& aMethod,
+                                    const nsACString& aUrl, bool aAsync,
+                                    const nsACString& aUsername,
+                                    const nsACString& aPassword,
+                                    ErrorResult& aRv) {
+  DEBUG_WORKERREFS1(aMethod << " " << aUrl);
+  NOT_CALLABLE_IN_SYNC_SEND_RV
+
+  if (!aAsync && !DontWarnAboutSyncXHR() && GetOwnerWindow() &&
+      GetOwnerWindow()->GetExtantDoc()) {
+    GetOwnerWindow()->GetExtantDoc()->WarnOnceAndReportAbout(
+        DeprecatedOperations::eSyncXMLHttpRequestDeprecated);
+  }
+
+
+
+  nsCOMPtr<Document> responsibleDocument = GetDocumentIfCurrent();
+  if (!responsibleDocument) {
+    if (NS_WARN_IF(NS_FAILED(CheckCurrentGlobalCorrectness()))) {
+      aRv.Throw(NS_ERROR_DOM_INVALID_STATE_XHR_HAS_INVALID_CONTEXT);
+      return;
+    }
+  }
+  if (!mPrincipal) {
+    aRv.Throw(NS_ERROR_NOT_INITIALIZED);
+    return;
+  }
+
+  if (AppShutdown::IsInOrBeyond(ShutdownPhase::AppShutdownConfirmed)) {
+    aRv.Throw(NS_ERROR_ILLEGAL_DURING_SHUTDOWN);
+    return;
+  }
+
+  if (!aAsync && responsibleDocument && GetOwnerWindow()) {
+    nsCOMPtr<nsIDocShell> shell = responsibleDocument->GetDocShell();
+    if (shell) {
+      bool inUnload = false;
+      shell->GetIsInUnload(&inUnload);
+      if (inUnload) {
+        LogMessage("UseSendBeaconDuringUnloadAndPagehideWarning",
+                   GetOwnerWindow());
+      }
+    }
+  }
+
+  nsAutoCString method;
+  aRv = FetchUtil::GetValidRequestMethod(aMethod, method);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return;
+  }
+
+  nsIURI* baseURI = nullptr;
+  if (mBaseURI) {
+    baseURI = mBaseURI;
+  } else if (responsibleDocument) {
+    baseURI = responsibleDocument->GetBaseURI();
+  }
+
+  NotNull<const Encoding*> originCharset = UTF_8_ENCODING;
+  if (responsibleDocument &&
+      responsibleDocument->NodePrincipal() == mPrincipal) {
+    originCharset = responsibleDocument->GetDocumentCharacterSet();
+  }
+
+  nsCOMPtr<nsIURI> parsedURL;
+  nsresult rv =
+      NS_NewURI(getter_AddRefs(parsedURL), aUrl, originCharset, baseURI);
+  if (NS_FAILED(rv)) {
+    aRv.ThrowSyntaxError("'"_ns + aUrl + "' is not a valid URL."_ns);
+    return;
+  }
+  if (NS_WARN_IF(NS_FAILED(CheckCurrentGlobalCorrectness()))) {
+    aRv.Throw(NS_ERROR_DOM_INVALID_STATE_XHR_HAS_INVALID_CONTEXT);
+    return;
+  }
+
+
+  nsAutoCString host;
+  parsedURL->GetHost(host);
+  if (!host.IsEmpty() && (!aUsername.IsVoid() || !aPassword.IsVoid())) {
+    auto mutator = NS_MutateURI(parsedURL);
+    if (!aUsername.IsVoid()) {
+      mutator.SetUsername(aUsername);
+    }
+    if (!aPassword.IsVoid()) {
+      mutator.SetPassword(aPassword);
+    }
+    (void)mutator.Finalize(parsedURL);
+  }
+
+  if (!aAsync && HasOrHasHadOwnerWindow() &&
+      (mTimeoutMilliseconds ||
+       mResponseType != XMLHttpRequestResponseType::_empty)) {
+    if (mTimeoutMilliseconds) {
+      LogMessage("TimeoutSyncXHRWarning", GetOwnerWindow());
+    }
+    if (mResponseType != XMLHttpRequestResponseType::_empty) {
+      LogMessage("ResponseTypeSyncXHRWarning", GetOwnerWindow());
+    }
+    aRv.ThrowInvalidAccessError(
+        "synchronous XMLHttpRequests do not support timeout and responseType");
+    return;
+  }
+
+  TerminateOngoingFetch(NS_OK);
+
+  DisconnectDoneNotifier();
+  mFlagSend = false;
+  mRequestMethod.Assign(method);
+  mRequestURL = std::move(parsedURL);
+  mFlagSynchronous = !aAsync;
+  mAuthorRequestHeaders.Clear();
+  ResetResponse();
+
+  mFlagHadUploadListenersOnSend = false;
+  mFlagAborted = false;
+  mFlagTimedOut = false;
+  mDecoder = nullptr;
+
+  CreateChannel();
+
+  if (mState != XMLHttpRequest_Binding::OPENED) {
+    mState = XMLHttpRequest_Binding::OPENED;
+    FireReadystatechangeEvent();
+  }
+}
+
+void XMLHttpRequestMainThread::SetOriginAttributes(
+    const OriginAttributesDictionary& aAttrs) {
+  MOZ_ASSERT((mState == XMLHttpRequest_Binding::OPENED) && !mFlagSend);
+
+  OriginAttributes attrs(aAttrs);
+
+  nsCOMPtr<nsILoadInfo> loadInfo = mChannel->LoadInfo();
+  loadInfo->SetOriginAttributes(attrs);
+}
+
+nsresult XMLHttpRequestMainThread::StreamReaderFunc(
+    nsIInputStream* in, void* closure, const char* fromRawSegment,
+    uint32_t toOffset, uint32_t count, uint32_t* writeCount) {
+  XMLHttpRequestMainThread* xmlHttpRequest =
+      static_cast<XMLHttpRequestMainThread*>(closure);
+  if (!xmlHttpRequest || !writeCount) {
+    NS_WARNING(
+        "XMLHttpRequest cannot read from stream: no closure or writeCount");
+    return NS_ERROR_FAILURE;
+  }
+
+  nsresult rv = NS_OK;
+
+  if (xmlHttpRequest->mResponseType == XMLHttpRequestResponseType::Blob) {
+    xmlHttpRequest->MaybeCreateBlobStorage();
+    rv = xmlHttpRequest->mBlobStorage->Append(fromRawSegment, count);
+  } else if (xmlHttpRequest->mResponseType ==
+                 XMLHttpRequestResponseType::Arraybuffer &&
+             !xmlHttpRequest->mIsMappedArrayBuffer) {
+    if (xmlHttpRequest->mArrayBufferBuilder->Capacity() == 0)
+      xmlHttpRequest->mArrayBufferBuilder->SetCapacity(
+          std::max(count, XML_HTTP_REQUEST_ARRAYBUFFER_MIN_SIZE));
+
+    if (NS_WARN_IF(!xmlHttpRequest->mArrayBufferBuilder->Append(
+            reinterpret_cast<const uint8_t*>(fromRawSegment), count,
+            XML_HTTP_REQUEST_ARRAYBUFFER_MAX_GROWTH))) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+
+  } else if (xmlHttpRequest->mResponseType ==
+                 XMLHttpRequestResponseType::_empty &&
+             xmlHttpRequest->mResponseXML) {
+    if (!xmlHttpRequest->mResponseBody.Append(fromRawSegment, count,
+                                              fallible)) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+  } else if (xmlHttpRequest->mResponseType ==
+                 XMLHttpRequestResponseType::_empty ||
+             xmlHttpRequest->mResponseType ==
+                 XMLHttpRequestResponseType::Text ||
+             xmlHttpRequest->mResponseType ==
+                 XMLHttpRequestResponseType::Json) {
+    MOZ_ASSERT(!xmlHttpRequest->mResponseXML,
+               "We shouldn't be parsing a doc here");
+    rv = xmlHttpRequest->AppendToResponseText(
+        AsBytes(Span(fromRawSegment, count)));
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      return rv;
+    }
+  }
+
+  if (xmlHttpRequest->mFlagParseBody) {
+
+    nsCOMPtr<nsIInputStream> copyStream;
+    rv = NS_NewByteInputStream(getter_AddRefs(copyStream),
+                               Span(fromRawSegment, count),
+                               NS_ASSIGNMENT_DEPEND);
+
+    if (NS_SUCCEEDED(rv) && xmlHttpRequest->mXMLParserStreamListener) {
+      NS_ASSERTION(copyStream, "NS_NewByteInputStream lied");
+      nsCOMPtr<nsIStreamListener> listener =
+          xmlHttpRequest->mXMLParserStreamListener;
+      nsresult parsingResult = listener->OnDataAvailable(
+          xmlHttpRequest->mChannel, copyStream, toOffset, count);
+
+      if (NS_FAILED(parsingResult)) {
+        xmlHttpRequest->mFlagParseBody = false;
+      }
+    }
+  }
+
+  if (NS_SUCCEEDED(rv)) {
+    *writeCount = count;
+  } else {
+    *writeCount = 0;
+  }
+
+  return rv;
+}
+
+namespace {
+
+nsresult GetLocalFileFromChannel(nsIRequest* aRequest, nsIFile** aFile) {
+  MOZ_ASSERT(aRequest);
+  MOZ_ASSERT(aFile);
+
+  *aFile = nullptr;
+
+  nsCOMPtr<nsIFileChannel> fc = do_QueryInterface(aRequest);
+  if (!fc) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIFile> file;
+  nsresult rv = fc->GetFile(getter_AddRefs(file));
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  file.forget(aFile);
+  return NS_OK;
+}
+
+nsresult DummyStreamReaderFunc(nsIInputStream* aInputStream, void* aClosure,
+                               const char* aFromRawSegment, uint32_t aToOffset,
+                               uint32_t aCount, uint32_t* aWriteCount) {
+  *aWriteCount = aCount;
+  return NS_OK;
+}
+
+class FileCreationHandler final : public PromiseNativeHandler {
+ public:
+  NS_DECL_ISUPPORTS
+
+  static void Create(Promise* aPromise, XMLHttpRequestMainThread* aXHR) {
+    MOZ_ASSERT(aPromise);
+
+    RefPtr<FileCreationHandler> handler = new FileCreationHandler(aXHR);
+    aPromise->AppendNativeHandler(handler);
+  }
+
+  void ResolvedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue,
+                        ErrorResult& aRv) override {
+    if (NS_WARN_IF(!aValue.isObject())) {
+      mXHR->LocalFileToBlobCompleted(nullptr);
+      return;
+    }
+
+    RefPtr<Blob> blob;
+    if (NS_WARN_IF(NS_FAILED(UNWRAP_OBJECT(Blob, &aValue.toObject(), blob)))) {
+      mXHR->LocalFileToBlobCompleted(nullptr);
+      return;
+    }
+
+    mXHR->LocalFileToBlobCompleted(blob->Impl());
+  }
+
+  void RejectedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue,
+                        ErrorResult& aRv) override {
+    mXHR->LocalFileToBlobCompleted(nullptr);
+  }
+
+ private:
+  explicit FileCreationHandler(XMLHttpRequestMainThread* aXHR) : mXHR(aXHR) {
+    MOZ_ASSERT(aXHR);
+  }
+
+  ~FileCreationHandler() = default;
+
+  RefPtr<XMLHttpRequestMainThread> mXHR;
+};
+
+NS_IMPL_ISUPPORTS0(FileCreationHandler)
+
+}  
+
+void XMLHttpRequestMainThread::LocalFileToBlobCompleted(BlobImpl* aBlobImpl) {
+  MOZ_ASSERT(mState != XMLHttpRequest_Binding::DONE);
+
+  mResponseBlobImpl = aBlobImpl;
+  mBlobStorage = nullptr;
+  NS_ASSERTION(mResponseBody.IsEmpty(), "mResponseBody should be empty");
+
+  ChangeStateToDone(mFlagSyncLooping);
+}
+
+NS_IMETHODIMP
+XMLHttpRequestMainThread::OnDataAvailable(nsIRequest* request,
+                                          nsIInputStream* inStr,
+                                          uint64_t sourceOffset,
+                                          uint32_t count) {
+  DEBUG_WORKERREFS;
+  NS_ENSURE_ARG_POINTER(inStr);
+
+  mProgressSinceLastProgressEvent = true;
+  XMLHttpRequest_Binding::ClearCachedResponseTextValue(this);
+
+  nsresult rv;
+
+  if (mResponseType == XMLHttpRequestResponseType::Blob) {
+    nsCOMPtr<nsIFile> localFile;
+    if (RefPtr<BlobURLChannel> blobChan = do_QueryObject(request)) {
+      RefPtr<BlobImpl> blobImpl;
+      rv = blobChan->GetBackingBlob(getter_AddRefs(blobImpl));
+      if (NS_SUCCEEDED(rv)) {
+        mResponseBlobImpl = blobImpl;
+      }
+    } else {
+      rv = GetLocalFileFromChannel(request, getter_AddRefs(localFile));
+    }
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      return rv;
+    }
+
+    if (mResponseBlobImpl || localFile) {
+      mBlobStorage = nullptr;
+      NS_ASSERTION(mResponseBody.IsEmpty(), "mResponseBody should be empty");
+
+      uint32_t totalRead;
+      rv = inStr->ReadSegments(DummyStreamReaderFunc, nullptr, count,
+                               &totalRead);
+      NS_ENSURE_SUCCESS(rv, rv);
+
+      ChangeState(XMLHttpRequest_Binding::LOADING);
+
+      return request->Cancel(NS_ERROR_FILE_ALREADY_EXISTS);
+    }
+  }
+
+  uint32_t totalRead;
+  rv = inStr->ReadSegments(XMLHttpRequestMainThread::StreamReaderFunc,
+                           (void*)this, count, &totalRead);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (mState == XMLHttpRequest_Binding::HEADERS_RECEIVED) {
+    ChangeState(XMLHttpRequest_Binding::LOADING);
+    if (!mFlagSynchronous) {
+      DispatchProgressEvent(this, Events::progress, mLoadTransferred,
+                            mLoadTotal);
+    }
+    mProgressSinceLastProgressEvent = false;
+  }
+
+  if (!mFlagSynchronous && !mProgressTimerIsActive) {
+    StartProgressEventTimer();
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+XMLHttpRequestMainThread::OnStartRequest(nsIRequest* request) {
+  DEBUG_WORKERREFS;
+
+  nsresult rv = NS_OK;
+
+  if (request != mChannel) {
+    return NS_OK;
+  }
+
+  if (mState == XMLHttpRequest_Binding::UNSENT) {
+    return NS_OK;
+  }
+
+  if (mFlagAborted) {
+    return NS_BINDING_ABORTED;
+  }
+
+  if (mFlagTimedOut) {
+    return NS_OK;
+  }
+
+  if (BadContentRangeRequested()) {
+    return NS_ERROR_NET_PARTIAL_TRANSFER;
+  }
+
+  nsCOMPtr<nsIChannel> channel(do_QueryInterface(request));
+  NS_ENSURE_TRUE(channel, NS_ERROR_UNEXPECTED);
+
+  nsresult status;
+  request->GetStatus(&status);
+  if (mErrorLoad == ErrorType::eOK && NS_FAILED(status)) {
+    mErrorLoad = ErrorType::eRequest;
+    mErrorLoadDetail = status;
+  }
+
+  if (mUpload && !mUploadComplete && mErrorLoad == ErrorType::eOK &&
+      !mFlagSynchronous) {
+    StopProgressEventTimer();
+
+    mUploadTransferred = mUploadTotal;
+
+    if (mProgressSinceLastProgressEvent) {
+      DispatchProgressEvent(mUpload, Events::progress, mUploadTransferred,
+                            mUploadTotal);
+      mProgressSinceLastProgressEvent = false;
+    }
+
+    mUploadComplete = true;
+    DispatchProgressEvent(mUpload, Events::load, mUploadTotal, mUploadTotal);
+  }
+
+  mFlagParseBody = true;
+  if (mErrorLoad == ErrorType::eOK) {
+    ChangeState(XMLHttpRequest_Binding::HEADERS_RECEIVED);
+  }
+
+  ResetResponse();
+
+  if (!mOverrideMimeType.IsEmpty()) {
+    channel->SetContentType(NS_ConvertUTF16toUTF8(mOverrideMimeType));
+  }
+
+  if (!IsBlobURI(mRequestURL)) {
+    nsAutoCString type;
+    channel->GetContentType(type);
+    if (type.IsEmpty() || type.EqualsLiteral(UNKNOWN_CONTENT_TYPE)) {
+      channel->SetContentType(nsLiteralCString(APPLICATION_OCTET_STREAM));
+    }
+  }
+
+  DetectCharset();
+
+  if (mResponseType == XMLHttpRequestResponseType::Arraybuffer &&
+      NS_SUCCEEDED(status)) {
+    if (mIsMappedArrayBuffer) {
+      nsCOMPtr<nsIJARChannel> jarChannel = do_QueryInterface(channel);
+      if (jarChannel) {
+        nsCOMPtr<nsIURI> uri;
+        rv = channel->GetURI(getter_AddRefs(uri));
+        if (NS_SUCCEEDED(rv)) {
+          nsAutoCString file;
+          nsAutoCString scheme;
+          uri->GetScheme(scheme);
+          if (scheme.LowerCaseEqualsLiteral("jar")) {
+            nsCOMPtr<nsIJARURI> jarURI = do_QueryInterface(uri);
+            if (jarURI) {
+              jarURI->GetJAREntry(file);
+            }
+          }
+          nsCOMPtr<nsIFile> jarFile;
+          jarChannel->GetJarFile(getter_AddRefs(jarFile));
+          if (!jarFile) {
+            mIsMappedArrayBuffer = false;
+          } else {
+            rv = mArrayBufferBuilder->MapToFileInPackage(file, jarFile);
+            if (NS_FAILED(rv)) {
+              mIsMappedArrayBuffer = false;
+            } else {
+              channel->SetContentType("application/mem-mapped"_ns);
+            }
+          }
+        }
+      }
+    }
+    if (!mIsMappedArrayBuffer) {
+      int64_t contentLength;
+      rv = channel->GetContentLength(&contentLength);
+      if (NS_SUCCEEDED(rv) && contentLength > 0 &&
+          contentLength < XML_HTTP_REQUEST_MAX_CONTENT_LENGTH_PREALLOCATE) {
+        mArrayBufferBuilder->SetCapacity(static_cast<int32_t>(contentLength));
+      }
+    }
+  }
+
+  bool parseBody = (mResponseType == XMLHttpRequestResponseType::_empty ||
+                    mResponseType == XMLHttpRequestResponseType::Document) &&
+                   !(mRequestMethod.EqualsLiteral("HEAD") ||
+                     mRequestMethod.EqualsLiteral("CONNECT"));
+
+  if (parseBody) {
+    int64_t contentLength;
+    if (NS_SUCCEEDED(mChannel->GetContentLength(&contentLength)) &&
+        contentLength == 0) {
+      parseBody = false;
+    }
+  }
+
+  mIsHtml = false;
+  mWarnAboutSyncHtml = false;
+  if (parseBody && NS_SUCCEEDED(status)) {
+    nsAutoCString type;
+    channel->GetContentType(type);
+
+    if ((mResponseType == XMLHttpRequestResponseType::Document) &&
+        type.EqualsLiteral("text/html")) {
+      if (mFlagSynchronous) {
+        mWarnAboutSyncHtml = true;
+        mFlagParseBody = false;
+      } else {
+        mIsHtml = true;
+      }
+    } else if (!type.IsEmpty() && (!(type.EqualsLiteral("text/xml") ||
+                                     type.EqualsLiteral("application/xml") ||
+                                     StringEndsWith(type, "+xml"_ns)))) {
+      mFlagParseBody = false;
+    }
+  } else {
+    mFlagParseBody = false;
+  }
+
+  if (mFlagParseBody) {
+    nsCOMPtr<nsIURI> baseURI, docURI;
+    rv = mChannel->GetURI(getter_AddRefs(docURI));
+    NS_ENSURE_SUCCESS(rv, rv);
+    baseURI = docURI;
+
+    nsCOMPtr<Document> doc = GetDocumentIfCurrent();
+    nsCOMPtr<nsIURI> chromeXHRDocURI, chromeXHRDocBaseURI;
+    if (doc) {
+      chromeXHRDocURI = doc->GetDocumentURI();
+      chromeXHRDocBaseURI = doc->GetBaseURI();
+    } else {
+      if (NS_WARN_IF(NS_FAILED(CheckCurrentGlobalCorrectness()))) {
+        return NS_ERROR_DOM_INVALID_STATE_XHR_HAS_INVALID_CONTEXT;
+      }
+    }
+
+    const auto& emptyStr = u""_ns;
+    nsIGlobalObject* global = DOMEventTargetHelper::GetParentObject();
+
+    nsCOMPtr<nsIPrincipal> requestingPrincipal;
+    rv = nsContentUtils::GetSecurityManager()->GetChannelResultPrincipal(
+        channel, getter_AddRefs(requestingPrincipal));
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    rv = NS_NewDOMDocument(
+        getter_AddRefs(mResponseXML), emptyStr, emptyStr, nullptr, docURI,
+        baseURI, requestingPrincipal, LoadedAsData::AsData, global,
+        mIsHtml ? DocumentFlavor::HTML : DocumentFlavor::LegacyGuess);
+    NS_ENSURE_SUCCESS(rv, rv);
+    mResponseXML->SetChromeXHRDocURI(chromeXHRDocURI);
+    mResponseXML->SetChromeXHRDocBaseURI(chromeXHRDocBaseURI);
+
+    IgnoredErrorResult rv2;
+    uint32_t responseStatus = GetStatus(rv2);
+    if (!rv2.Failed() && (responseStatus == 201 || responseStatus == 202 ||
+                          responseStatus == 204 || responseStatus == 205 ||
+                          responseStatus == 304)) {
+      mResponseXML->SetSuppressParserErrorConsoleMessages(true);
+    }
+
+    nsCOMPtr<nsILoadInfo> loadInfo = mChannel->LoadInfo();
+    bool isCrossSite = false;
+    isCrossSite = loadInfo->GetTainting() != LoadTainting::Basic;
+
+    if (isCrossSite) {
+      mResponseXML->DisableCookieAccess();
+    }
+
+    nsCOMPtr<nsIStreamListener> listener;
+    nsCOMPtr<nsILoadGroup> loadGroup;
+    channel->GetLoadGroup(getter_AddRefs(loadGroup));
+
+    if (!IsSystemXHR()) {
+      mResponseXML->SetSuppressParserErrorElement(true);
+    }
+
+    rv = mResponseXML->StartDocumentLoad(kLoadAsData, channel, loadGroup,
+                                         nullptr, getter_AddRefs(listener),
+                                         !isCrossSite);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    nsCOMPtr<nsIReferrerInfo> referrerInfo =
+        new ReferrerInfo(nullptr, mResponseXML->ReferrerPolicy());
+    mResponseXML->SetReferrerInfo(referrerInfo);
+
+    mXMLParserStreamListener = listener;
+    nsCOMPtr<nsIStreamListener> parserListener = mXMLParserStreamListener;
+    rv = parserListener->OnStartRequest(request);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  if (NS_SUCCEEDED(rv) && HasListenersFor(nsGkAtoms::onprogress)) {
+    StartProgressEventTimer();
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+XMLHttpRequestMainThread::OnStopRequest(nsIRequest* request, nsresult status) {
+  DEBUG_WORKERREFS;
+
+  if (request != mChannel) {
+    return NS_OK;
+  }
+
+  if (mAlreadyGotStopRequest) {
+    return NS_OK;
+  }
+  mAlreadyGotStopRequest = true;
+
+  if (mDecoder && ((mResponseType == XMLHttpRequestResponseType::Text) ||
+                   (mResponseType == XMLHttpRequestResponseType::Json) ||
+                   (mResponseType == XMLHttpRequestResponseType::_empty &&
+                    !mResponseXML))) {
+    AppendToResponseText(Span<const uint8_t>(), true);
+  }
+
+  mWaitingForOnStopRequest = false;
+
+  if (mState == XMLHttpRequest_Binding::UNSENT || mFlagTimedOut) {
+    if (mXMLParserStreamListener) {
+      nsCOMPtr<nsIStreamListener> parserListener = mXMLParserStreamListener;
+      (void)parserListener->OnStopRequest(request, status);
+    }
+    return NS_OK;
+  }
+
+  if (mXMLParserStreamListener && mFlagParseBody) {
+    nsCOMPtr<nsIStreamListener> parserListener = mXMLParserStreamListener;
+    parserListener->OnStopRequest(request, status);
+  }
+
+  mXMLParserStreamListener = nullptr;
+
+  if (status == NS_BINDING_ABORTED) {
+    mFlagParseBody = false;
+
+    nsAutoCString cancelReason;
+    if (mChannel) {
+      mChannel->GetCanceledReason(cancelReason);
+    }
+
+    if (cancelReason.EqualsLiteral("navigation")) {
+      CancelTimeoutTimer();
+      CancelSyncTimeoutTimer();
+      StopProgressEventTimer();
+
+      mState = XMLHttpRequest_Binding::DONE;
+      mFlagSend = false;
+      ResetResponse();
+
+      if (!mFlagDeleted) {
+        FireReadystatechangeEvent();
+        if (mUpload && !mUploadComplete) {
+          mUploadComplete = true;
+          if (mFlagHadUploadListenersOnSend) {
+            DispatchProgressEvent(mUpload, Events::loadend, 0, -1);
+          }
+        }
+        DispatchProgressEvent(this, Events::loadend, 0, -1);
+      }
+    } else {
+      IgnoredErrorResult rv;
+      RequestErrorSteps(Events::abort, NS_ERROR_DOM_ABORT_ERR, rv);
+    }
+
+    ChangeState(XMLHttpRequest_Binding::UNSENT, false);
+    return NS_OK;
+  }
+
+  if (status == NS_ERROR_FILE_ALREADY_EXISTS && mResponseBlobImpl) {
+    ChangeStateToDone(mFlagSyncLooping);
+    return NS_OK;
+  }
+
+  bool waitingForBlobCreation = false;
+
+  if (!mResponseBlobImpl && status == NS_ERROR_FILE_ALREADY_EXISTS &&
+      mResponseType == XMLHttpRequestResponseType::Blob) {
+    nsCOMPtr<nsIFile> file;
+    nsresult rv = GetLocalFileFromChannel(request, getter_AddRefs(file));
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      return rv;
+    }
+
+    if (file) {
+      nsAutoCString contentType;
+      rv = mChannel->GetContentType(contentType);
+      if (NS_WARN_IF(NS_FAILED(rv))) {
+        return rv;
+      }
+
+      ChromeFilePropertyBag bag;
+      CopyUTF8toUTF16(contentType, bag.mType);
+
+      nsCOMPtr<nsIGlobalObject> global = GetRelevantGlobal();
+
+      ErrorResult error;
+      RefPtr<Promise> promise =
+          FileCreatorHelper::CreateFile(global, file, bag, true, error);
+      if (NS_WARN_IF(error.Failed())) {
+        return error.StealNSResult();
+      }
+
+      FileCreationHandler::Create(promise, this);
+      waitingForBlobCreation = true;
+      status = NS_OK;
+
+      NS_ASSERTION(mResponseBody.IsEmpty(), "mResponseBody should be empty");
+      NS_ASSERTION(mResponseText.IsEmpty(), "mResponseText should be empty");
+    }
+  }
+
+  if (NS_SUCCEEDED(status) &&
+      mResponseType == XMLHttpRequestResponseType::Blob &&
+      !waitingForBlobCreation) {
+    nsAutoCString contentType;
+    if (!mOverrideMimeType.IsEmpty()) {
+      contentType.Assign(NS_ConvertUTF16toUTF8(mOverrideMimeType));
+    } else {
+      mChannel->GetContentType(contentType);
+    }
+
+    MaybeCreateBlobStorage();
+    mBlobStorage->GetBlobImplWhenReady(contentType, this);
+    waitingForBlobCreation = true;
+
+    NS_ASSERTION(mResponseBody.IsEmpty(), "mResponseBody should be empty");
+    NS_ASSERTION(mResponseText.IsEmpty(), "mResponseText should be empty");
+  } else if (NS_SUCCEEDED(status) && !mIsMappedArrayBuffer &&
+             mResponseType == XMLHttpRequestResponseType::Arraybuffer) {
+    if (!mArrayBufferBuilder->SetCapacity(mArrayBufferBuilder->Length())) {
+      status = NS_ERROR_UNEXPECTED;
+    }
+  }
+
+  nsCOMPtr<nsIChannel> channel(do_QueryInterface(request));
+  NS_ENSURE_TRUE(channel, NS_ERROR_UNEXPECTED);
+
+  channel->SetNotificationCallbacks(nullptr);
+  mNotificationCallbacks = nullptr;
+  mChannelEventSink = nullptr;
+  mProgressEventSink = nullptr;
+
+  bool wasSync = mFlagSyncLooping;
+  mFlagSyncLooping = false;
+  mRequestSentTime = 0;
+
+  MatchCharsetAndDecoderToResponseDocument();
+
+  if (NS_FAILED(status)) {
+
+    mErrorLoad = ErrorType::eUnreachable;
+    mErrorLoadDetail = status;
+    mResponseXML = nullptr;
+
+    if (NS_ERROR_GET_MODULE(status) == NS_ERROR_MODULE_NETWORK) {
+      MOZ_LOG(gXMLHttpRequestLog, LogLevel::Debug,
+              ("%p detected networking error 0x%" PRIx32 "\n", this,
+               static_cast<uint32_t>(status)));
+      IgnoredErrorResult rv;
+      mFlagParseBody = false;
+      RequestErrorSteps(Events::error, NS_ERROR_DOM_NETWORK_ERR, rv);
+      if (mFlagSynchronous) {
+        ChangeStateToDone(wasSync);
+      }
+      return NS_OK;
+    }
+
+    MOZ_LOG(gXMLHttpRequestLog, LogLevel::Debug,
+            ("%p detected unreachable error 0x%" PRIx32 "\n", this,
+             static_cast<uint32_t>(status)));
+  }
+
+  if (mState == XMLHttpRequest_Binding::UNSENT ||
+      mState == XMLHttpRequest_Binding::DONE) {
+    return NS_OK;
+  }
+
+  if (!mResponseXML) {
+    mFlagParseBody = false;
+
+    if (!waitingForBlobCreation) {
+      ChangeStateToDone(wasSync);
+    }
+
+    return NS_OK;
+  }
+
+  if (mIsHtml) {
+    NS_ASSERTION(!mFlagSyncLooping,
+                 "We weren't supposed to support HTML parsing with XHR!");
+    mParseEndListener = new nsXHRParseEndListener(this);
+    RefPtr<EventTarget> eventTarget = mResponseXML;
+    EventListenerManager* manager = eventTarget->GetOrCreateListenerManager();
+    manager->AddEventListenerByType(mParseEndListener,
+                                    kLiteralString_DOMContentLoaded,
+                                    TrustedEventsAtSystemGroupBubble());
+    return NS_OK;
+  } else {
+    mFlagParseBody = false;
+  }
+
+  if (!mResponseXML->GetRootElement()) {
+    mErrorParsingXML = true;
+    mResponseXML = nullptr;
+  }
+  ChangeStateToDone(wasSync);
+  return NS_OK;
+}
+
+void XMLHttpRequestMainThread::OnBodyParseEnd() {
+  mFlagParseBody = false;
+  mParseEndListener = nullptr;
+  ChangeStateToDone(mFlagSyncLooping);
+}
+
+void XMLHttpRequestMainThread::MatchCharsetAndDecoderToResponseDocument() {
+  if (mResponseXML &&
+      (!mDecoder ||
+       mDecoder->Encoding() != mResponseXML->GetDocumentCharacterSet())) {
+    TruncateResponseText();
+    mResponseBodyDecodedPos = 0;
+    mEofDecoded = false;
+    mDecoder = mResponseXML->GetDocumentCharacterSet()->NewDecoder();
+  }
+}
+
+void XMLHttpRequestMainThread::DisconnectDoneNotifier() {
+  if (mDelayedDoneNotifier) {
+    RefPtr<XMLHttpRequestMainThread> kungfuDeathGrip = this;
+    mDelayedDoneNotifier->Disconnect();
+    mDelayedDoneNotifier = nullptr;
+  }
+}
+
+void XMLHttpRequestMainThread::ChangeStateToDone(bool aWasSync) {
+  DEBUG_WORKERREFS;
+  DisconnectDoneNotifier();
+
+  if (!mForWorker && !aWasSync && mChannel) {
+    nsLoadFlags loadFlags = 0;
+    mChannel->GetLoadFlags(&loadFlags);
+    MOZ_DIAGNOSTIC_ASSERT(loadFlags & nsIRequest::LOAD_BACKGROUND);
+    nsPIDOMWindowInner* owner = GetOwnerWindow();
+    BrowsingContext* bc = owner ? owner->GetBrowsingContext() : nullptr;
+    bc = bc ? bc->Top() : nullptr;
+    if (bc && bc->IsLoading()) {
+      MOZ_ASSERT(!mDelayedDoneNotifier);
+      RefPtr<XMLHttpRequestDoneNotifier> notifier =
+          new XMLHttpRequestDoneNotifier(this);
+      mDelayedDoneNotifier = notifier;
+      bc->AddDeprioritizedLoadRunner(notifier);
+      return;
+    }
+  }
+
+  ChangeStateToDoneInternal();
+}
+
+void XMLHttpRequestMainThread::ChangeStateToDoneInternal() {
+  DEBUG_WORKERREFS;
+  RefPtr<XMLHttpRequestMainThread> kungfuDeathGrip(this);
+  DisconnectDoneNotifier();
+  StopProgressEventTimer();
+
+  MOZ_ASSERT(!mFlagParseBody,
+             "ChangeStateToDone() called before async HTML parsing is done.");
+
+  mFlagSend = false;
+
+  CancelTimeoutTimer();
+
+  if (!mFlagSynchronous &&
+      (!mLoadTransferred || mProgressSinceLastProgressEvent)) {
+    DispatchProgressEvent(this, Events::progress, mLoadTransferred, mLoadTotal);
+    mProgressSinceLastProgressEvent = false;
+  }
+
+  if (mErrorLoad == ErrorType::eOK) {
+    Document* doc = GetDocumentIfCurrent();
+    if (doc) {
+      doc->NotifyFetchOrXHRSuccess();
+    }
+  }
+
+  ChangeState(XMLHttpRequest_Binding::DONE, true);
+
+  if (!mFlagSynchronous && mUpload && !mUploadComplete) {
+    DispatchProgressEvent(mUpload, Events::error, 0, -1);
+  }
+
+  if (mErrorLoad != ErrorType::eOK) {
+    DispatchProgressEvent(this, Events::error, 0, -1);
+  } else {
+    DispatchProgressEvent(this, Events::load, mLoadTransferred, mLoadTotal);
+  }
+
+  if (mErrorLoad != ErrorType::eOK) {
+    mChannel = nullptr;
+  }
+}
+
+nsresult XMLHttpRequestMainThread::CreateChannel() {
+  DEBUG_WORKERREFS;
+  nsCOMPtr<nsILoadGroup> loadGroup = GetLoadGroup();
+
+  nsSecurityFlags secFlags;
+  nsLoadFlags loadFlags = nsIRequest::LOAD_BACKGROUND;
+  uint32_t sandboxFlags = 0;
+  if (mPrincipal->IsSystemPrincipal()) {
+    secFlags = nsILoadInfo::SEC_ALLOW_CROSS_ORIGIN_SEC_CONTEXT_IS_NULL;
+    sandboxFlags = SANDBOXED_ORIGIN;
+  } else if (IsSystemXHR()) {
+    secFlags = nsILoadInfo::SEC_ALLOW_CROSS_ORIGIN_INHERITS_SEC_CONTEXT |
+               nsILoadInfo::SEC_FORCE_INHERIT_PRINCIPAL;
+    loadFlags |= nsIChannel::LOAD_BYPASS_SERVICE_WORKER;
+  } else {
+    secFlags = nsILoadInfo::SEC_REQUIRE_CORS_INHERITS_SEC_CONTEXT |
+               nsILoadInfo::SEC_FORCE_INHERIT_PRINCIPAL;
+  }
+
+  if (mIsAnon) {
+    secFlags |= nsILoadInfo::SEC_COOKIES_OMIT;
+  }
+
+  nsresult rv;
+  nsCOMPtr<Document> responsibleDocument = GetDocumentIfCurrent();
+  auto contentPolicyType =
+      mFlagSynchronous ? nsIContentPolicy::TYPE_INTERNAL_XMLHTTPREQUEST_SYNC
+                       : nsIContentPolicy::TYPE_INTERNAL_XMLHTTPREQUEST_ASYNC;
+  if (responsibleDocument &&
+      responsibleDocument->NodePrincipal() == mPrincipal) {
+    rv = NS_NewChannel(getter_AddRefs(mChannel), mRequestURL,
+                       responsibleDocument, secFlags, contentPolicyType,
+                       nullptr,  
+                       loadGroup,
+                       nullptr,  
+                       loadFlags, nullptr, sandboxFlags);
+  } else if (mClientInfo.isSome()) {
+    rv = NS_NewChannel(getter_AddRefs(mChannel), mRequestURL, mPrincipal,
+                       mClientInfo.ref(), mController, secFlags,
+                       contentPolicyType, mCookieJarSettings,
+                       mPerformanceStorage,  
+                       loadGroup,
+                       nullptr,  
+                       loadFlags, nullptr, sandboxFlags);
+  } else {
+    rv = NS_NewChannel(getter_AddRefs(mChannel), mRequestURL, mPrincipal,
+                       secFlags, contentPolicyType, mCookieJarSettings,
+                       mPerformanceStorage,  
+                       loadGroup,
+                       nullptr,  
+                       loadFlags, nullptr, sandboxFlags);
+  }
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (mAssociatedBrowsingContextID) {
+    nsCOMPtr<nsILoadInfo> loadInfo = mChannel->LoadInfo();
+    rv = loadInfo->SetAssociatedBrowsingContextID(mAssociatedBrowsingContextID);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  mAlreadyGotStopRequest = false;
+
+  if (mCSPEventListener) {
+    nsCOMPtr<nsILoadInfo> loadInfo = mChannel->LoadInfo();
+    rv = loadInfo->SetCspEventListener(mCSPEventListener);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  if (nsCOMPtr<Document> doc = GetDocumentIfCurrent()) {
+    net::ClassificationFlags flags = doc->GetScriptTrackingFlags();
+    nsCOMPtr<nsILoadInfo> loadInfo = mChannel->LoadInfo();
+
+    loadInfo->SetTriggeringFirstPartyClassificationFlags(flags.firstPartyFlags);
+    loadInfo->SetTriggeringThirdPartyClassificationFlags(flags.thirdPartyFlags);
+  }
+
+  nsCOMPtr<nsIHttpChannel> httpChannel(do_QueryInterface(mChannel));
+  if (httpChannel) {
+    rv = httpChannel->SetRequestMethod(mRequestMethod);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    nsCOMPtr<nsITimedChannel> timedChannel(do_QueryInterface(httpChannel));
+    if (timedChannel) {
+      timedChannel->SetInitiatorType(u"xmlhttprequest"_ns);
+    }
+  }
+
+  return NS_OK;
+}
+
+void XMLHttpRequestMainThread::MaybeLowerChannelPriority() {
+  nsCOMPtr<Document> doc = GetDocumentIfCurrent();
+  if (!doc) {
+    return;
+  }
+
+  AutoJSAPI jsapi;
+  if (!jsapi.Init(GetRelevantGlobal())) {
+    return;
+  }
+
+  JSContext* cx = jsapi.cx();
+
+  if (!doc->IsScriptTracking(cx)) {
+    return;
+  }
+
+  if (StaticPrefs::network_http_tailing_enabled()) {
+    nsCOMPtr<nsIClassOfService> cos = do_QueryInterface(mChannel);
+    if (cos) {
+      cos->AddClassFlags(nsIClassOfService::Throttleable |
+                         nsIClassOfService::Tail |
+                         nsIClassOfService::TailAllowed);
+    }
+  }
+
+  nsCOMPtr<nsISupportsPriority> p = do_QueryInterface(mChannel);
+  if (p) {
+    p->SetPriority(nsISupportsPriority::PRIORITY_LOWEST);
+  }
+}
+
+nsresult XMLHttpRequestMainThread::InitiateFetch(
+    already_AddRefed<nsIInputStream> aUploadStream, int64_t aUploadLength,
+    nsACString& aUploadContentType) {
+  DEBUG_WORKERREFS;
+  nsresult rv;
+  nsCOMPtr<nsIInputStream> uploadStream = std::move(aUploadStream);
+
+  if (IsSystemXHR() && mFlagSynchronous &&
+      StaticPrefs::network_xhr_block_sync_system_requests()) {
+    mState = XMLHttpRequest_Binding::DONE;
+    return NS_ERROR_DOM_NETWORK_ERR;
+  }
+
+  if (!uploadStream) {
+    RefPtr<PreloaderBase> preload = FindPreload();
+    if (preload) {
+      nsCOMPtr<nsIStreamListener> listener =
+          new net::nsStreamListenerWrapper(this);
+      rv = preload->AsyncConsume(listener);
+      if (NS_SUCCEEDED(rv)) {
+        mFromPreload = true;
+
+        mChannel = preload->Channel();
+        MOZ_ASSERT(mChannel);
+        EnsureChannelContentType();
+        return NS_OK;
+      }
+
+      preload = nullptr;
+    }
+  }
+
+  nsCOMPtr<nsIHttpChannel> httpChannel(do_QueryInterface(mChannel));
+  if (httpChannel) {
+    if (!mAuthorRequestHeaders.Has("accept")) {
+      mAuthorRequestHeaders.Set("accept", "*/*"_ns);
+    }
+
+    mAuthorRequestHeaders.ApplyToChannel(httpChannel, false, false);
+
+    if (!IsSystemXHR()) {
+      nsCOMPtr<nsPIDOMWindowInner> owner = GetOwnerWindow();
+      nsCOMPtr<Document> doc = owner ? owner->GetExtantDoc() : nullptr;
+      nsCOMPtr<nsIReferrerInfo> referrerInfo =
+          ReferrerInfo::CreateForFetch(mPrincipal, doc);
+      (void)httpChannel->SetReferrerInfoWithoutClone(referrerInfo);
+    }
+
+    if (uploadStream) {
+      if (!NS_InputStreamIsBuffered(uploadStream)) {
+        nsCOMPtr<nsIInputStream> bufferedStream;
+        rv = NS_NewBufferedInputStream(getter_AddRefs(bufferedStream),
+                                       uploadStream.forget(), 4096);
+        NS_ENSURE_SUCCESS(rv, rv);
+
+        uploadStream = bufferedStream;
+      }
+
+      nsCOMPtr<nsIUploadChannel2> uploadChannel(do_QueryInterface(httpChannel));
+      NS_ASSERTION(uploadChannel, "http must support nsIUploadChannel");
+      rv = uploadChannel->ExplicitSetUploadStream(
+          uploadStream, aUploadContentType, mUploadTotal, mRequestMethod);
+    }
+  }
+
+  RefPtr<BlobURLChannel> blobChan = do_QueryObject(mChannel);
+  if (blobChan) {
+    nsAutoCString range;
+    mAuthorRequestHeaders.Get("range", range);
+    if (!range.IsVoid()) {
+      rv = blobChan->SetRequestContentRangeHeader(range);
+      if (mFlagSynchronous && NS_FAILED(rv)) {
+        mState = XMLHttpRequest_Binding::DONE;
+        return NS_ERROR_DOM_NETWORK_ERR;
+      }
+    }
+  }
+
+  if (!IsSystemXHR() && !mIsAnon && mFlagACwithCredentials) {
+    nsCOMPtr<nsILoadInfo> loadInfo = mChannel->LoadInfo();
+    static_cast<net::LoadInfo*>(loadInfo.get())->SetIncludeCookiesSecFlag();
+  }
+
+  nsCOMPtr<nsIClassOfService> cos(do_QueryInterface(mChannel));
+  if (cos) {
+    cos->AddClassFlags(nsIClassOfService::Unblocked);
+
+    if (UserActivation::IsHandlingUserInput()) {
+      cos->AddClassFlags(nsIClassOfService::UrgentStart);
+    }
+  }
+
+  nsCOMPtr<nsIHttpChannelInternal> internalHttpChannel(
+      do_QueryInterface(mChannel));
+  if (internalHttpChannel) {
+    rv = internalHttpChannel->SetResponseTimeoutEnabled(false);
+    MOZ_ASSERT(NS_SUCCEEDED(rv));
+  }
+
+  if (!mIsAnon) {
+    AddLoadFlags(mChannel, nsIChannel::LOAD_EXPLICIT_CREDENTIALS);
+  }
+
+  if (mRequestMethod.EqualsLiteral("POST")) {
+    AddLoadFlags(mChannel, nsICachingChannel::LOAD_BYPASS_LOCAL_CACHE |
+                               nsIRequest::INHIBIT_CACHING);
+  } else {
+    AddLoadFlags(mChannel, nsICachingChannel::LOAD_BYPASS_LOCAL_CACHE_IF_BUSY);
+  }
+
+  EnsureChannelContentType();
+
+  if (!IsSystemXHR()) {
+    nsTArray<nsCString> CORSUnsafeHeaders;
+    mAuthorRequestHeaders.GetCORSUnsafeHeaders(CORSUnsafeHeaders);
+    nsCOMPtr<nsILoadInfo> loadInfo = mChannel->LoadInfo();
+    loadInfo->SetCorsPreflightInfo(CORSUnsafeHeaders,
+                                   mFlagHadUploadListenersOnSend);
+  }
+
+  mChannel->GetNotificationCallbacks(getter_AddRefs(mNotificationCallbacks));
+  mChannel->SetNotificationCallbacks(this);
+
+  if (internalHttpChannel) {
+    internalHttpChannel->SetBlockAuthPrompt(ShouldBlockAuthPrompt());
+  }
+
+  nsCOMPtr<nsIStreamListener> listener = new net::nsStreamListenerWrapper(this);
+
+  if (StaticPrefs::privacy_trackingprotection_lower_network_priority()) {
+    MaybeLowerChannelPriority();
+  }
+
+  NotifyNetworkMonitorAlternateStack(mChannel, std::move(mOriginStack));
+
+  rv = mChannel->AsyncOpen(listener);
+  listener = nullptr;
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    mChannel->SetNotificationCallbacks(mNotificationCallbacks);
+    mChannel = nullptr;
+
+    mErrorLoad = ErrorType::eChannelOpen;
+    mErrorLoadDetail = rv;
+
+    if (mFlagSynchronous) {
+      mState = XMLHttpRequest_Binding::DONE;
+      return NS_ERROR_DOM_NETWORK_ERR;
+    }
+  }
+
+  return NS_OK;
+}
+
+already_AddRefed<PreloaderBase> XMLHttpRequestMainThread::FindPreload() {
+  Document* doc = GetDocumentIfCurrent();
+  if (!doc) {
+    return nullptr;
+  }
+  if (mPrincipal->IsSystemPrincipal() || IsSystemXHR()) {
+    return nullptr;
+  }
+  if (!mRequestMethod.EqualsLiteral("GET")) {
+    return nullptr;
+  }
+  if (!mAuthorRequestHeaders.IsEmpty()) {
+    return nullptr;
+  }
+
+  CORSMode cors = (mIsAnon || !mFlagACwithCredentials)
+                      ? CORSMode::CORS_ANONYMOUS
+                      : CORSMode::CORS_USE_CREDENTIALS;
+  nsCOMPtr<nsIReferrerInfo> referrerInfo =
+      ReferrerInfo::CreateForFetch(mPrincipal, doc);
+  auto key = PreloadHashKey::CreateAsFetch(mRequestURL, cors);
+  RefPtr<PreloaderBase> preload = doc->Preloads().LookupPreload(key);
+  if (!preload) {
+    return nullptr;
+  }
+
+  preload->RemoveSelf(doc);
+  preload->NotifyUsage(doc, PreloaderBase::LoadBackground::Keep);
+
+  return preload.forget();
+}
+
+void XMLHttpRequestMainThread::EnsureChannelContentType() {
+  MOZ_ASSERT(mChannel);
+
+  if (IsBlobURI(mRequestURL)) {
+    return;
+  }
+
+  nsAutoCString contentType;
+  if (NS_FAILED(mChannel->GetContentType(contentType)) ||
+      contentType.IsEmpty() ||
+      contentType.EqualsLiteral(UNKNOWN_CONTENT_TYPE)) {
+    mChannel->SetContentType("text/xml"_ns);
+  }
+}
+
+void XMLHttpRequestMainThread::ResumeTimeout() {
+  DEBUG_WORKERREFS;
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(mFlagSynchronous);
+
+  if (mResumeTimeoutRunnable) {
+    DispatchToMainThread(mResumeTimeoutRunnable.forget());
+    mResumeTimeoutRunnable = nullptr;
+  }
+}
+
+void XMLHttpRequestMainThread::Send(
+    const Nullable<
+        DocumentOrBlobOrArrayBufferViewOrArrayBufferOrFormDataOrURLSearchParamsOrUSVString>&
+        aData,
+    ErrorResult& aRv) {
+  DEBUG_WORKERREFS1(mRequestURL);
+  NOT_CALLABLE_IN_SYNC_SEND_RV
+
+  if (!CanSend(aRv)) {
+    return;
+  }
+
+  if (aData.IsNull()) {
+    SendInternal(nullptr, false, aRv);
+    return;
+  }
+
+  if (aData.Value().IsDocument()) {
+    BodyExtractor<Document> body(&aData.Value().GetAsDocument());
+    SendInternal(&body, true, aRv);
+    return;
+  }
+
+  if (aData.Value().IsBlob()) {
+    BodyExtractor<const Blob> body(&aData.Value().GetAsBlob());
+    SendInternal(&body, false, aRv);
+    return;
+  }
+
+  if (aData.Value().IsArrayBuffer()) {
+    BodyExtractor<const ArrayBuffer> body(&aData.Value().GetAsArrayBuffer());
+    SendInternal(&body, false, aRv);
+    return;
+  }
+
+  if (aData.Value().IsArrayBufferView()) {
+    BodyExtractor<const ArrayBufferView> body(
+        &aData.Value().GetAsArrayBufferView());
+    SendInternal(&body, false, aRv);
+    return;
+  }
+
+  if (aData.Value().IsFormData()) {
+    BodyExtractor<const FormData> body(&aData.Value().GetAsFormData());
+    SendInternal(&body, false, aRv);
+    return;
+  }
+
+  if (aData.Value().IsURLSearchParams()) {
+    BodyExtractor<const URLSearchParams> body(
+        &aData.Value().GetAsURLSearchParams());
+    SendInternal(&body, false, aRv);
+    return;
+  }
+
+  if (aData.Value().IsUSVString()) {
+    BodyExtractor<const nsAString> body(&aData.Value().GetAsUSVString());
+    SendInternal(&body, true, aRv);
+    return;
+  }
+}
+
+nsresult XMLHttpRequestMainThread::MaybeSilentSendFailure(nsresult aRv) {
+  if (mFlagSynchronous) {
+    mState = XMLHttpRequest_Binding::DONE;
+    return NS_ERROR_DOM_NETWORK_ERR;
+  }
+
+  (void)NS_WARN_IF(
+      NS_FAILED(DispatchToMainThread(NewRunnableMethod<ErrorProgressEventType>(
+          "dom::XMLHttpRequestMainThread::CloseRequestWithError", this,
+          &XMLHttpRequestMainThread::CloseRequestWithError, Events::error))));
+  return NS_OK;
+}
+
+bool XMLHttpRequestMainThread::CanSend(ErrorResult& aRv) {
+  if (!mPrincipal) {
+    aRv.Throw(NS_ERROR_NOT_INITIALIZED);
+    return false;
+  }
+
+  if (mState != XMLHttpRequest_Binding::OPENED) {
+    aRv.ThrowInvalidStateError("XMLHttpRequest state must be OPENED.");
+    return false;
+  }
+
+  if (mFlagSend) {
+    aRv.ThrowInvalidStateError("XMLHttpRequest must not be sending.");
+    return false;
+  }
+
+  if (NS_FAILED(CheckCurrentGlobalCorrectness())) {
+    aRv.Throw(NS_ERROR_DOM_INVALID_STATE_XHR_HAS_INVALID_CONTEXT);
+    return false;
+  }
+
+  if (AppShutdown::IsInOrBeyond(ShutdownPhase::XPCOMShutdownThreads)) {
+    aRv.Throw(NS_ERROR_ILLEGAL_DURING_SHUTDOWN);
+    return false;
+  }
+
+  return true;
+}
+
+void XMLHttpRequestMainThread::SendInternal(const BodyExtractorBase* aBody,
+                                            bool aBodyIsDocumentOrString,
+                                            ErrorResult& aRv) {
+  DEBUG_WORKERREFS;
+  MOZ_ASSERT(NS_IsMainThread());
+
+
+  if (!mChannel) {
+    mErrorLoad = ErrorType::eChannelOpen;
+    mErrorLoadDetail = NS_ERROR_DOM_NETWORK_ERR;
+    mFlagSend = true;  
+    aRv = MaybeSilentSendFailure(mErrorLoadDetail);
+    return;
+  }
+
+  if (IsBlobURI(mRequestURL) && !mRequestMethod.EqualsLiteral("GET")) {
+    mErrorLoad = ErrorType::eChannelOpen;
+    mErrorLoadDetail = NS_ERROR_DOM_NETWORK_ERR;
+    mFlagSend = true;  
+    aRv = MaybeSilentSendFailure(mErrorLoadDetail);
+    return;
+  }
+
+  if (mResponseType != XMLHttpRequestResponseType::Document) {
+    nsCOMPtr<nsILoadInfo> loadInfo = mChannel->LoadInfo();
+    loadInfo->SetSkipContentSniffing(true);
+  }
+
+
+  mUploadTransferred = 0;
+  mUploadTotal = 0;
+  mUploadComplete = true;
+  mErrorLoad = ErrorType::eOK;
+  mErrorLoadDetail = NS_OK;
+  mLoadTotal = -1;
+  nsCOMPtr<nsIInputStream> uploadStream;
+  nsAutoCString uploadContentType;
+  nsCOMPtr<nsIHttpChannel> httpChannel(do_QueryInterface(mChannel));
+  if (aBody && httpChannel && !mRequestMethod.EqualsLiteral("GET") &&
+      !mRequestMethod.EqualsLiteral("HEAD")) {
+    nsAutoCString charset;
+    nsAutoCString defaultContentType;
+    uint64_t size_u64;
+    aRv = aBody->GetAsStream(getter_AddRefs(uploadStream), &size_u64,
+                             defaultContentType, charset);
+    if (aRv.Failed()) {
+      return;
+    }
+
+    mUploadTotal =
+        net::InScriptableRange(size_u64) ? static_cast<int64_t>(size_u64) : -1;
+
+    if (uploadStream) {
+      mAuthorRequestHeaders.Get("content-type", uploadContentType);
+      if (uploadContentType.IsVoid()) {
+        uploadContentType = defaultContentType;
+      } else if (aBodyIsDocumentOrString) {
+        RefPtr<CMimeType> contentTypeRecord =
+            CMimeType::Parse(uploadContentType);
+        nsAutoCString charset;
+        if (contentTypeRecord &&
+            contentTypeRecord->GetParameterValue(kLiteralString_charset,
+                                                 charset) &&
+            !charset.EqualsIgnoreCase("utf-8")) {
+          contentTypeRecord->SetParameterValue(kLiteralString_charset,
+                                               kLiteralString_UTF_8);
+          contentTypeRecord->Serialize(uploadContentType);
+        }
+      } else if (!charset.IsEmpty()) {
+        RequestHeaders::CharsetIterator iter(uploadContentType);
+        while (iter.Next()) {
+          if (!iter.Equals(charset, nsCaseInsensitiveCStringComparator)) {
+            iter.Replace(charset);
+          }
+        }
+      }
+
+      mUploadComplete = false;
+    }
+  }
+
+  ResetResponse();
+
+  if (mUpload && mUpload->HasListeners()) {
+    mFlagHadUploadListenersOnSend = true;
+  }
+
+  mIsMappedArrayBuffer = false;
+  if (mResponseType == XMLHttpRequestResponseType::Arraybuffer &&
+      StaticPrefs::dom_mapped_arraybuffer_enabled()) {
+    nsCOMPtr<nsIURI> uri;
+    nsAutoCString scheme;
+
+    aRv = mChannel->GetURI(getter_AddRefs(uri));
+    if (!aRv.Failed()) {
+      uri->GetScheme(scheme);
+      if (scheme.LowerCaseEqualsLiteral("jar")) {
+        mIsMappedArrayBuffer = true;
+      }
+    }
+  }
+
+  aRv = InitiateFetch(uploadStream.forget(), mUploadTotal, uploadContentType);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  mRequestSentTime = PR_Now();
+  StartTimeoutTimer();
+
+  mWaitingForOnStopRequest = true;
+
+  mFlagSend = true;
+
+  RefPtr<Document> suspendedDoc;
+  if (mFlagSynchronous) {
+    auto scopeExit = MakeScopeExit([&] {
+      CancelSyncTimeoutTimer();
+      ResumeTimeout();
+      ResumeEventDispatching();
+    });
+    Maybe<AutoSuppressEventHandling> autoSuppress;
+
+    mFlagSyncLooping = true;
+
+    if (GetOwnerWindow()) {
+      if (nsCOMPtr<nsPIDOMWindowOuter> topWindow =
+              GetOwnerWindow()->GetOuterWindow()->GetInProcessTop()) {
+        if (nsCOMPtr<nsPIDOMWindowInner> topInner =
+                topWindow->GetCurrentInnerWindow()) {
+          suspendedDoc = topWindow->GetExtantDoc();
+          autoSuppress.emplace(topWindow->GetBrowsingContext());
+          topInner->Suspend();
+          mResumeTimeoutRunnable = new nsResumeTimeoutsEvent(topInner);
+        }
+      }
+    }
+
+    SuspendEventDispatching();
+    StopProgressEventTimer();
+
+    SyncTimeoutType syncTimeoutType = MaybeStartSyncTimeoutTimer();
+    if (syncTimeoutType == eErrorOrExpired) {
+      Abort();
+      aRv.Throw(NS_ERROR_DOM_NETWORK_ERR);
+      return;
+    }
+
+    nsresult channelStatus = NS_OK;
+    nsAutoSyncOperation sync(suspendedDoc,
+                             SyncOperationBehavior::eSuspendInput);
+    if (!SpinEventLoopUntil("XMLHttpRequestMainThread::SendInternal"_ns, [&]() {
+          if (mFlagSyncLooping && mChannel) {
+            mChannel->GetStatus(&channelStatus);
+          }
+          return !mFlagSyncLooping || NS_FAILED(channelStatus);
+        })) {
+      aRv.Throw(NS_ERROR_UNEXPECTED);
+      return;
+    }
+    if (NS_FAILED(channelStatus)) {
+      MOZ_ASSERT(mFlagSyncLooping);
+      OnStopRequest(mChannel, channelStatus);
+    }
+
+    if (syncTimeoutType == eTimerStarted && !mSyncTimeoutTimer) {
+      aRv.Throw(NS_ERROR_DOM_NETWORK_ERR);
+      return;
+    }
+  } else {
+    StopProgressEventTimer();
+
+    if (mUpload && mUpload->HasListenersFor(nsGkAtoms::onprogress)) {
+      StartProgressEventTimer();
+    }
+    DispatchProgressEvent(this, Events::loadstart, 0, -1);
+    if (mUpload && !mUploadComplete) {
+      DispatchProgressEvent(mUpload, Events::loadstart, 0, mUploadTotal);
+    }
+  }
+
+  if (!mChannel) {
+    aRv = MaybeSilentSendFailure(NS_ERROR_DOM_NETWORK_ERR);
+  }
+}
+
+void XMLHttpRequestMainThread::SetRequestHeader(const nsACString& aName,
+                                                const nsACString& aValue,
+                                                ErrorResult& aRv) {
+  NOT_CALLABLE_IN_SYNC_SEND_RV
+
+  if (mState != XMLHttpRequest_Binding::OPENED) {
+    aRv.ThrowInvalidStateError("XMLHttpRequest state must be OPENED.");
+    return;
+  }
+
+  if (mFlagSend) {
+    aRv.ThrowInvalidStateError("XMLHttpRequest must not be sending.");
+    return;
+  }
+
+  nsAutoCString value;
+  NS_TrimHTTPWhitespace(aValue, value);
+
+  if (!NS_IsValidHTTPToken(aName) || !NS_IsReasonableHTTPHeaderValue(value)) {
+    aRv.Throw(NS_ERROR_DOM_INVALID_HEADER_NAME);
+    return;
+  }
+
+  bool isPrivilegedCaller = IsSystemXHR();
+  bool isForbiddenHeader =
+      nsContentUtils::IsForbiddenRequestHeader(aName, aValue);
+  if (!isPrivilegedCaller && isForbiddenHeader) {
+    AutoTArray<nsString, 1> params;
+    CopyUTF8toUTF16(aName, *params.AppendElement());
+    LogMessage("ForbiddenHeaderWarning", GetOwnerWindow(), params);
+    return;
+  }
+
+
+  if (isPrivilegedCaller && isForbiddenHeader) {
+    mAuthorRequestHeaders.Set(aName, value);
+  } else {
+    mAuthorRequestHeaders.MergeOrSet(aName, value);
+  }
+}
+
+void XMLHttpRequestMainThread::SetTimeout(uint32_t aTimeout, ErrorResult& aRv) {
+  NOT_CALLABLE_IN_SYNC_SEND_RV
+
+  if (mFlagSynchronous && mState != XMLHttpRequest_Binding::UNSENT &&
+      HasOrHasHadOwnerWindow()) {
+    LogMessage("TimeoutSyncXHRWarning", GetOwnerWindow());
+    aRv.ThrowInvalidAccessError(
+        "synchronous XMLHttpRequests do not support timeout and responseType");
+    return;
+  }
+
+  mTimeoutMilliseconds = aTimeout;
+  if (mRequestSentTime) {
+    StartTimeoutTimer();
+  }
+}
+
+nsIEventTarget* XMLHttpRequestMainThread::GetTimerEventTarget() {
+  if (nsIGlobalObject* global = GetRelevantGlobal()) {
+    return global->SerialEventTarget();
+  }
+  return nullptr;
+}
+
+nsresult XMLHttpRequestMainThread::DispatchToMainThread(
+    already_AddRefed<nsIRunnable> aRunnable) {
+  DEBUG_WORKERREFS;
+  if (nsIGlobalObject* global = GetRelevantGlobal()) {
+    return global->Dispatch(std::move(aRunnable));
+  }
+  return NS_DispatchToMainThread(std::move(aRunnable));
+}
+
+void XMLHttpRequestMainThread::StartTimeoutTimer() {
+  DEBUG_WORKERREFS;
+  MOZ_ASSERT(
+      mRequestSentTime,
+      "StartTimeoutTimer mustn't be called before the request was sent!");
+  if (mState == XMLHttpRequest_Binding::DONE) {
+    return;
+  }
+
+  CancelTimeoutTimer();
+
+  if (!mTimeoutMilliseconds) {
+    return;
+  }
+
+  if (!mTimeoutTimer) {
+    mTimeoutTimer = NS_NewTimer(GetTimerEventTarget());
+  }
+  uint32_t elapsed =
+      (uint32_t)((PR_Now() - mRequestSentTime) / PR_USEC_PER_MSEC);
+  mTimeoutTimer->InitWithCallback(
+      this, mTimeoutMilliseconds > elapsed ? mTimeoutMilliseconds - elapsed : 0,
+      nsITimer::TYPE_ONE_SHOT);
+}
+
+uint16_t XMLHttpRequestMainThread::ReadyState() const { return mState; }
+
+void XMLHttpRequestMainThread::OverrideMimeType(const nsAString& aMimeType,
+                                                ErrorResult& aRv) {
+  NOT_CALLABLE_IN_SYNC_SEND_RV
+
+  if (mState == XMLHttpRequest_Binding::LOADING ||
+      mState == XMLHttpRequest_Binding::DONE) {
+    aRv.ThrowInvalidStateError(
+        "Cannot call 'overrideMimeType()' on XMLHttpRequest after 'send()' "
+        "(when its state is LOADING or DONE).");
+    return;
+  }
+
+  RefPtr<MimeType> parsed = MimeType::Parse(aMimeType);
+  if (parsed) {
+    parsed->Serialize(mOverrideMimeType);
+  } else {
+    mOverrideMimeType.AssignLiteral(APPLICATION_OCTET_STREAM);
+  }
+}
+
+bool XMLHttpRequestMainThread::MozBackgroundRequest() const {
+  return mFlagBackgroundRequest;
+}
+
+void XMLHttpRequestMainThread::SetMozBackgroundRequestExternal(
+    bool aMozBackgroundRequest, ErrorResult& aRv) {
+  if (!IsSystemXHR()) {
+    aRv.Throw(NS_ERROR_DOM_SECURITY_ERR);
+    return;
+  }
+
+  if (mState != XMLHttpRequest_Binding::UNSENT) {
+    aRv.ThrowInvalidStateError("XMLHttpRequest must not be sending.");
+    return;
+  }
+
+  mFlagBackgroundRequest = aMozBackgroundRequest;
+}
+
+void XMLHttpRequestMainThread::SetMozBackgroundRequest(
+    bool aMozBackgroundRequest, ErrorResult& aRv) {
+  SetMozBackgroundRequestExternal(aMozBackgroundRequest, IgnoreErrors());
+}
+
+void XMLHttpRequestMainThread::SetOriginStack(
+    UniquePtr<SerializedStackHolder> aOriginStack) {
+  mOriginStack = std::move(aOriginStack);
+}
+
+bool XMLHttpRequestMainThread::WithCredentials() const {
+  return mFlagACwithCredentials;
+}
+
+void XMLHttpRequestMainThread::SetWithCredentials(bool aWithCredentials,
+                                                  ErrorResult& aRv) {
+  NOT_CALLABLE_IN_SYNC_SEND_RV
+
+
+  if ((mState != XMLHttpRequest_Binding::UNSENT &&
+       mState != XMLHttpRequest_Binding::OPENED) ||
+      mFlagSend || mIsAnon) {
+    aRv.ThrowInvalidStateError("XMLHttpRequest must not be sending.");
+    return;
+  }
+
+  mFlagACwithCredentials = aWithCredentials;
+}
+
+nsresult XMLHttpRequestMainThread::ChangeState(uint16_t aState,
+                                               bool aBroadcast) {
+  mState = aState;
+  nsresult rv = NS_OK;
+
+  if (aState != XMLHttpRequest_Binding::HEADERS_RECEIVED &&
+      aState != XMLHttpRequest_Binding::LOADING) {
+    StopProgressEventTimer();
+  }
+
+  if (aBroadcast &&
+      (!mFlagSynchronous || aState == XMLHttpRequest_Binding::OPENED ||
+       aState == XMLHttpRequest_Binding::DONE)) {
+    rv = FireReadystatechangeEvent();
+  }
+
+  return rv;
+}
+
+NS_IMETHODIMP
+XMLHttpRequestMainThread::AsyncOnChannelRedirect(
+    nsIChannel* aOldChannel, nsIChannel* aNewChannel, uint32_t aFlags,
+    nsIAsyncVerifyRedirectCallback* callback) {
+  DEBUG_WORKERREFS;
+  MOZ_ASSERT(aNewChannel, "Redirect without a channel?");
+
+  mRedirectCallback = callback;
+  mNewRedirectChannel = aNewChannel;
+
+  if (mChannelEventSink) {
+    nsCOMPtr<nsIAsyncVerifyRedirectCallback> fwd = EnsureXPCOMifier();
+
+    nsresult rv = mChannelEventSink->AsyncOnChannelRedirect(
+        aOldChannel, aNewChannel, aFlags, fwd);
+    if (NS_FAILED(rv)) {
+      mRedirectCallback = nullptr;
+      mNewRedirectChannel = nullptr;
+    }
+    return rv;
+  }
+
+  bool stripAuth =
+      NS_ShouldRemoveAuthHeaderOnRedirect(aOldChannel, aNewChannel, aFlags);
+
+  OnRedirectVerifyCallback(NS_OK, stripAuth);
+
+  return NS_OK;
+}
+
+nsresult XMLHttpRequestMainThread::OnRedirectVerifyCallback(nsresult result,
+                                                            bool aStripAuth) {
+  DEBUG_WORKERREFS;
+  NS_ASSERTION(mRedirectCallback, "mRedirectCallback not set in callback");
+  NS_ASSERTION(mNewRedirectChannel, "mNewRedirectChannel not set in callback");
+
+  if (NS_SUCCEEDED(result)) {
+    bool rewriteToGET = false;
+    nsCOMPtr<nsIHttpChannel> oldHttpChannel = GetCurrentHttpChannel();
+    (void)oldHttpChannel->ShouldStripRequestBodyHeader(mRequestMethod,
+                                                       &rewriteToGET);
+
+    mChannel = mNewRedirectChannel;
+
+    nsCOMPtr<nsIHttpChannel> newHttpChannel(do_QueryInterface(mChannel));
+    if (newHttpChannel) {
+      mAuthorRequestHeaders.ApplyToChannel(newHttpChannel, rewriteToGET,
+                                           aStripAuth);
+    }
+  } else {
+    mErrorLoad = ErrorType::eRedirect;
+    mErrorLoadDetail = result;
+  }
+
+  mNewRedirectChannel = nullptr;
+
+  mRedirectCallback->OnRedirectVerifyCallback(result);
+  mRedirectCallback = nullptr;
+
+  return NS_OK;
+}
+
+
+NS_IMETHODIMP
+XMLHttpRequestMainThread::OnProgress(nsIRequest* aRequest, int64_t aProgress,
+                                     int64_t aProgressMax) {
+  DEBUG_WORKERREFS;
+  bool lengthComputable = (aProgressMax != -1);
+  if (InUploadPhase()) {
+    int64_t loaded = aProgress;
+    if (lengthComputable) {
+      int64_t headerSize = aProgressMax - mUploadTotal;
+      loaded -= headerSize;
+    }
+    mUploadTransferred = loaded;
+    mProgressSinceLastProgressEvent = true;
+
+    if (!mFlagSynchronous && !mProgressTimerIsActive) {
+      StartProgressEventTimer();
+    }
+  } else {
+    mLoadTotal = aProgressMax;
+    mLoadTransferred = aProgress;
+  }
+
+  if (mProgressEventSink) {
+    mProgressEventSink->OnProgress(aRequest, aProgress, aProgressMax);
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+XMLHttpRequestMainThread::OnStatus(nsIRequest* aRequest, nsresult aStatus,
+                                   const char16_t* aStatusArg) {
+  DEBUG_WORKERREFS;
+  if (mProgressEventSink) {
+    mProgressEventSink->OnStatus(aRequest, aStatus, aStatusArg);
+  }
+
+  return NS_OK;
+}
+
+bool XMLHttpRequestMainThread::AllowUploadProgress() {
+  return !IsCrossSiteCORSRequest() || mFlagHadUploadListenersOnSend;
+}
+
+NS_IMETHODIMP
+XMLHttpRequestMainThread::GetInterface(const nsIID& aIID, void** aResult) {
+  nsresult rv;
+
+  if (aIID.Equals(NS_GET_IID(nsIChannelEventSink))) {
+    mChannelEventSink = do_GetInterface(mNotificationCallbacks);
+    *aResult = static_cast<nsIChannelEventSink*>(EnsureXPCOMifier().take());
+    return NS_OK;
+  } else if (aIID.Equals(NS_GET_IID(nsIProgressEventSink))) {
+    mProgressEventSink = do_GetInterface(mNotificationCallbacks);
+    *aResult = static_cast<nsIProgressEventSink*>(EnsureXPCOMifier().take());
+    return NS_OK;
+  }
+
+  if (mNotificationCallbacks) {
+    rv = mNotificationCallbacks->GetInterface(aIID, aResult);
+    if (NS_SUCCEEDED(rv)) {
+      NS_ASSERTION(*aResult, "Lying nsIInterfaceRequestor implementation!");
+      return rv;
+    }
+  }
+
+  if (!mFlagBackgroundRequest && (aIID.Equals(NS_GET_IID(nsIAuthPrompt)) ||
+                                  aIID.Equals(NS_GET_IID(nsIAuthPrompt2)))) {
+    nsCOMPtr<nsIPromptFactory> wwatch =
+        do_GetService(NS_WINDOWWATCHER_CONTRACTID, &rv);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    nsCOMPtr<nsPIDOMWindowOuter> window;
+    if (nsGlobalWindowInner* inner = GetOwnerWindow()) {
+      window = inner->GetOuterWindow();
+    }
+    return wwatch->GetPrompt(window, aIID, reinterpret_cast<void**>(aResult));
+  }
+
+  if (aIID.Equals(NS_GET_IID(nsIStreamListener))) {
+    *aResult = static_cast<nsIStreamListener*>(EnsureXPCOMifier().take());
+    return NS_OK;
+  }
+  if (aIID.Equals(NS_GET_IID(nsIRequestObserver))) {
+    *aResult = static_cast<nsIRequestObserver*>(EnsureXPCOMifier().take());
+    return NS_OK;
+  }
+  if (aIID.Equals(NS_GET_IID(nsITimerCallback))) {
+    *aResult = static_cast<nsITimerCallback*>(EnsureXPCOMifier().take());
+    return NS_OK;
+  }
+
+  return QueryInterface(aIID, aResult);
+}
+
+void XMLHttpRequestMainThread::GetInterface(
+    JSContext* aCx, JS::Handle<JS::Value> aIID,
+    JS::MutableHandle<JS::Value> aRetval, ErrorResult& aRv) {
+  dom::GetInterface(aCx, this, aIID, aRetval, aRv);
+}
+
+XMLHttpRequestUpload* XMLHttpRequestMainThread::GetUpload(ErrorResult& aRv) {
+  if (!mUpload) {
+    mUpload = new XMLHttpRequestUpload(this);
+  }
+  return mUpload;
+}
+
+bool XMLHttpRequestMainThread::MozAnon() const { return mIsAnon; }
+
+bool XMLHttpRequestMainThread::MozSystem() const { return IsSystemXHR(); }
+
+void XMLHttpRequestMainThread::HandleTimeoutCallback() {
+  DEBUG_WORKERREFS;
+  if (mState == XMLHttpRequest_Binding::DONE) {
+    MOZ_ASSERT_UNREACHABLE(
+        "XMLHttpRequestMainThread::HandleTimeoutCallback "
+        "with completed request");
+    return;
+  }
+
+  mFlagTimedOut = true;
+  CloseRequestWithError(Events::timeout);
+}
+
+void XMLHttpRequestMainThread::CancelTimeoutTimer() {
+  DEBUG_WORKERREFS;
+  if (mTimeoutTimer) {
+    mTimeoutTimer->Cancel();
+    mTimeoutTimer = nullptr;
+  }
+}
+
+NS_IMETHODIMP
+XMLHttpRequestMainThread::Notify(nsITimer* aTimer) {
+  DEBUG_WORKERREFS;
+  if (mProgressNotifier == aTimer) {
+    HandleProgressTimerCallback();
+    return NS_OK;
+  }
+
+  if (mTimeoutTimer == aTimer) {
+    HandleTimeoutCallback();
+    return NS_OK;
+  }
+
+  if (mSyncTimeoutTimer == aTimer) {
+    HandleSyncTimeoutTimer();
+    return NS_OK;
+  }
+
+  NS_WARNING("Unexpected timer!");
+  return NS_ERROR_INVALID_POINTER;
+}
+
+void XMLHttpRequestMainThread::HandleProgressTimerCallback() {
+  DEBUG_WORKERREFS;
+  if (!mLoadTotal && mLoadTransferred) {
+    return;
+  }
+
+  mProgressTimerIsActive = false;
+
+  if (!mProgressSinceLastProgressEvent || mErrorLoad != ErrorType::eOK) {
+    return;
+  }
+
+  if (InUploadPhase()) {
+    if (mUpload && !mUploadComplete && mFlagHadUploadListenersOnSend) {
+      DispatchProgressEvent(mUpload, Events::progress, mUploadTransferred,
+                            mUploadTotal);
+    }
+  } else {
+    if (mState != XMLHttpRequest_Binding::UNSENT) {
+      FireReadystatechangeEvent();
+      DispatchProgressEvent(this, Events::progress, mLoadTransferred,
+                            mLoadTotal);
+    }
+  }
+
+  mProgressSinceLastProgressEvent = false;
+
+  if (mState != XMLHttpRequest_Binding::UNSENT) {
+    StartProgressEventTimer();
+  }
+}
+
+void XMLHttpRequestMainThread::StopProgressEventTimer() {
+  if (mProgressNotifier) {
+    mProgressTimerIsActive = false;
+    mProgressNotifier->Cancel();
+  }
+}
+
+void XMLHttpRequestMainThread::StartProgressEventTimer() {
+  if (!mProgressNotifier) {
+    mProgressNotifier = NS_NewTimer(GetTimerEventTarget());
+  }
+  if (mProgressNotifier) {
+    mProgressTimerIsActive = true;
+    mProgressNotifier->Cancel();
+    mProgressNotifier->InitWithCallback(this, NS_PROGRESS_EVENT_INTERVAL,
+                                        nsITimer::TYPE_ONE_SHOT);
+  }
+}
+
+XMLHttpRequestMainThread::SyncTimeoutType
+XMLHttpRequestMainThread::MaybeStartSyncTimeoutTimer() {
+  MOZ_ASSERT(mFlagSynchronous);
+
+  Document* doc = GetDocumentIfCurrent();
+  if (!doc || !doc->GetPageUnloadingEventTimeStamp()) {
+    return eNoTimerNeeded;
+  }
+
+  TimeDuration diff =
+      (TimeStamp::NowLoRes() - doc->GetPageUnloadingEventTimeStamp());
+  if (diff.ToMilliseconds() > MAX_SYNC_TIMEOUT_WHEN_UNLOADING) {
+    return eErrorOrExpired;
+  }
+
+  mSyncTimeoutTimer = NS_NewTimer(GetTimerEventTarget());
+  if (!mSyncTimeoutTimer) {
+    return eErrorOrExpired;
+  }
+
+  uint32_t timeout = MAX_SYNC_TIMEOUT_WHEN_UNLOADING - diff.ToMilliseconds();
+  nsresult rv = mSyncTimeoutTimer->InitWithCallback(this, timeout,
+                                                    nsITimer::TYPE_ONE_SHOT);
+  return NS_FAILED(rv) ? eErrorOrExpired : eTimerStarted;
+}
+
+void XMLHttpRequestMainThread::HandleSyncTimeoutTimer() {
+  MOZ_ASSERT(mSyncTimeoutTimer);
+  MOZ_ASSERT(mFlagSyncLooping);
+
+  CancelSyncTimeoutTimer();
+  Abort();
+  mErrorLoadDetail = NS_ERROR_DOM_TIMEOUT_ERR;
+}
+
+void XMLHttpRequestMainThread::CancelSyncTimeoutTimer() {
+  if (mSyncTimeoutTimer) {
+    mSyncTimeoutTimer->Cancel();
+    mSyncTimeoutTimer = nullptr;
+  }
+}
+
+already_AddRefed<nsXMLHttpRequestXPCOMifier>
+XMLHttpRequestMainThread::EnsureXPCOMifier() {
+  if (!mXPCOMifier) {
+    mXPCOMifier = new nsXMLHttpRequestXPCOMifier(this);
+  }
+  RefPtr<nsXMLHttpRequestXPCOMifier> newRef(mXPCOMifier);
+  return newRef.forget();
+}
+
+bool XMLHttpRequestMainThread::ShouldBlockAuthPrompt() {
+
+  if (mAuthorRequestHeaders.Has("authorization")) {
+    return true;
+  }
+
+  nsCOMPtr<nsIURI> uri;
+  nsresult rv = mChannel->GetURI(getter_AddRefs(uri));
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return false;
+  }
+
+  bool hasUserPass;
+  return NS_SUCCEEDED(uri->GetHasUserPass(&hasUserPass)) && hasUserPass;
+}
+
+void XMLHttpRequestMainThread::TruncateResponseText() {
+  mResponseText.Truncate();
+  XMLHttpRequest_Binding::ClearCachedResponseTextValue(this);
+}
+
+NS_IMPL_ISUPPORTS(XMLHttpRequestMainThread::nsHeaderVisitor,
+                  nsIHttpHeaderVisitor)
+
+NS_IMETHODIMP XMLHttpRequestMainThread::nsHeaderVisitor::VisitHeader(
+    const nsACString& header, const nsACString& value) {
+  if (mXHR.IsSafeHeader(header, mHttpChannel)) {
+    nsAutoCString lowerHeader(header);
+    ToLowerCase(lowerHeader);
+    if (!mHeaderList.InsertElementSorted(HeaderEntry(lowerHeader, value),
+                                         fallible)) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+  }
+  return NS_OK;
+}
+
+XMLHttpRequestMainThread::nsHeaderVisitor::nsHeaderVisitor(
+    const XMLHttpRequestMainThread& aXMLHttpRequest,
+    NotNull<nsIHttpChannel*> aHttpChannel)
+    : mXHR(aXMLHttpRequest), mHttpChannel(aHttpChannel) {}
+
+XMLHttpRequestMainThread::nsHeaderVisitor::~nsHeaderVisitor() = default;
+
+void XMLHttpRequestMainThread::MaybeCreateBlobStorage() {
+  DEBUG_WORKERREFS;
+  MOZ_ASSERT(mResponseType == XMLHttpRequestResponseType::Blob);
+
+  if (mBlobStorage) {
+    return;
+  }
+
+  MutableBlobStorage::MutableBlobStorageType storageType =
+      BasePrincipal::Cast(mPrincipal)->PrivateBrowsingId() == 0
+          ? MutableBlobStorage::eCouldBeInTemporaryFile
+          : MutableBlobStorage::eOnlyInMemory;
+
+  nsCOMPtr<nsIEventTarget> eventTarget;
+  if (nsIGlobalObject* global = GetRelevantGlobal()) {
+    eventTarget = global->SerialEventTarget();
+  }
+
+  mBlobStorage = new MutableBlobStorage(storageType, eventTarget);
+}
+
+void XMLHttpRequestMainThread::BlobStoreCompleted(
+    MutableBlobStorage* aBlobStorage, BlobImpl* aBlobImpl, nsresult aRv) {
+  DEBUG_WORKERREFS;
+  if (mBlobStorage != aBlobStorage || NS_FAILED(aRv)) {
+    return;
+  }
+
+  MOZ_ASSERT(mState != XMLHttpRequest_Binding::DONE);
+
+  mResponseBlobImpl = aBlobImpl;
+  mBlobStorage = nullptr;
+
+  ChangeStateToDone(mFlagSyncLooping);
+}
+
+NS_IMETHODIMP
+XMLHttpRequestMainThread::GetName(nsACString& aName) {
+  aName.AssignLiteral("XMLHttpRequest");
+  return NS_OK;
+}
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(nsXMLHttpRequestXPCOMifier)
+  NS_INTERFACE_MAP_ENTRY(nsIStreamListener)
+  NS_INTERFACE_MAP_ENTRY(nsIRequestObserver)
+  NS_INTERFACE_MAP_ENTRY(nsIChannelEventSink)
+  NS_INTERFACE_MAP_ENTRY(nsIAsyncVerifyRedirectCallback)
+  NS_INTERFACE_MAP_ENTRY(nsIProgressEventSink)
+  NS_INTERFACE_MAP_ENTRY(nsIInterfaceRequestor)
+  NS_INTERFACE_MAP_ENTRY(nsITimerCallback)
+  NS_INTERFACE_MAP_ENTRY(nsINamed)
+  NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIStreamListener)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(nsXMLHttpRequestXPCOMifier)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(nsXMLHttpRequestXPCOMifier)
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(nsXMLHttpRequestXPCOMifier)
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(nsXMLHttpRequestXPCOMifier)
+  if (tmp->mXHR) {
+    tmp->mXHR->mXPCOMifier = nullptr;
+  }
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mXHR)
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsXMLHttpRequestXPCOMifier)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mXHR)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMETHODIMP
+nsXMLHttpRequestXPCOMifier::GetInterface(const nsIID& aIID, void** aResult) {
+  if (!aIID.Equals(NS_GET_IID(nsIInterfaceRequestor))) {
+    nsresult rv = QueryInterface(aIID, aResult);
+    if (NS_SUCCEEDED(rv)) {
+      return rv;
+    }
+  }
+
+  return mXHR->GetInterface(aIID, aResult);
+}
+
+ArrayBufferBuilder::ArrayBufferBuilder()
+    : mMutex("ArrayBufferBuilder"),
+      mDataPtr(nullptr),
+      mCapacity(0),
+      mLength(0),
+      mMapPtr(nullptr),
+      mNeutered(false) {}
+
+ArrayBufferBuilder::~ArrayBufferBuilder() {
+  if (mDataPtr) {
+    JS_free(nullptr, mDataPtr);
+  }
+
+  if (mMapPtr) {
+    JS::ReleaseMappedArrayBufferContents(mMapPtr, mLength);
+    mMapPtr = nullptr;
+  }
+
+  mDataPtr = nullptr;
+  mCapacity = mLength = 0;
+}
+
+bool ArrayBufferBuilder::SetCapacity(uint32_t aNewCap) {
+  MutexAutoLock lock(mMutex);
+  return SetCapacityInternal(aNewCap, lock);
+}
+
+bool ArrayBufferBuilder::SetCapacityInternal(
+    uint32_t aNewCap, const MutexAutoLock& aProofOfLock) {
+  MOZ_ASSERT(!mMapPtr);
+  MOZ_ASSERT(!mNeutered);
+
+  uint8_t* newdata = (uint8_t*)js_realloc(mDataPtr, aNewCap ? aNewCap : 1);
+
+  if (!newdata) {
+    return false;
+  }
+
+  if (aNewCap > mCapacity) {
+    memset(newdata + mCapacity, 0, aNewCap - mCapacity);
+  }
+
+  mDataPtr = newdata;
+  mCapacity = aNewCap;
+  if (mLength > aNewCap) {
+    mLength = aNewCap;
+  }
+
+  return true;
+}
+
+bool ArrayBufferBuilder::Append(const uint8_t* aNewData, uint32_t aDataLen,
+                                uint32_t aMaxGrowth) {
+  MutexAutoLock lock(mMutex);
+  MOZ_ASSERT(!mMapPtr);
+  MOZ_ASSERT(!mNeutered);
+
+  CheckedUint32 neededCapacity = mLength;
+  neededCapacity += aDataLen;
+  if (!neededCapacity.isValid()) {
+    return false;
+  }
+  if (mLength + aDataLen > mCapacity) {
+    CheckedUint32 newcap = mCapacity;
+    if (!aMaxGrowth || mCapacity < aMaxGrowth) {
+      newcap *= 2;
+    } else {
+      newcap += aMaxGrowth;
+    }
+
+    if (!newcap.isValid()) {
+      return false;
+    }
+
+    if (newcap.value() < neededCapacity.value()) {
+      newcap = neededCapacity;
+    }
+
+    if (!SetCapacityInternal(newcap.value(), lock)) {
+      return false;
+    }
+  }
+
+  MOZ_ASSERT(
+      !AreOverlappingRegions(aNewData, aDataLen, mDataPtr + mLength, aDataLen));
+
+  memcpy(mDataPtr + mLength, aNewData, aDataLen);
+  mLength += aDataLen;
+
+  return true;
+}
+
+uint32_t ArrayBufferBuilder::Length() {
+  MutexAutoLock lock(mMutex);
+  MOZ_ASSERT(!mNeutered);
+  return mLength;
+}
+
+uint32_t ArrayBufferBuilder::Capacity() {
+  MutexAutoLock lock(mMutex);
+  MOZ_ASSERT(!mNeutered);
+  return mCapacity;
+}
+
+JSObject* ArrayBufferBuilder::TakeArrayBuffer(JSContext* aCx) {
+  MutexAutoLock lock(mMutex);
+  MOZ_DIAGNOSTIC_ASSERT(!mNeutered);
+
+  if (mMapPtr) {
+    JSObject* obj = JS::NewMappedArrayBufferWithContents(aCx, mLength, mMapPtr);
+    if (!obj) {
+      JS::ReleaseMappedArrayBufferContents(mMapPtr, mLength);
+    }
+
+    mMapPtr = nullptr;
+    mNeutered = true;
+
+    return obj;
+  }
+
+  if (mCapacity > mLength || mLength == 0) {
+    if (!SetCapacityInternal(mLength, lock)) {
+      return nullptr;
+    }
+  }
+
+  JSObject* obj = JS::NewArrayBufferWithContents(
+      aCx, mLength, mDataPtr,
+      JS::NewArrayBufferOutOfMemory::CallerMustFreeMemory);
+  if (!obj) {
+    return nullptr;
+  }
+
+  mDataPtr = nullptr;
+  mCapacity = mLength = 0;
+
+  mNeutered = true;
+  return obj;
+}
+
+nsresult ArrayBufferBuilder::MapToFileInPackage(const nsCString& aFile,
+                                                nsIFile* aJarFile) {
+  MutexAutoLock lock(mMutex);
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(!mNeutered);
+
+  nsresult rv;
+
+  RefPtr<nsZipArchive> zip = nsZipArchive::OpenArchive(aJarFile);
+  if (!zip) {
+    return NS_ERROR_FAILURE;
+  }
+  nsZipItem* zipItem = zip->GetItem(aFile);
+  if (!zipItem) {
+    return NS_ERROR_FILE_NOT_FOUND;
+  }
+
+  if (!zipItem->Compression()) {
+    uint32_t offset = zip->GetDataOffset(zipItem);
+    uint32_t size = zipItem->RealSize();
+    mozilla::AutoFDClose pr_fd;
+    rv = aJarFile->OpenNSPRFileDesc(PR_RDONLY, 0, getter_Transfers(pr_fd));
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+    mMapPtr = JS::CreateMappedArrayBufferContents(
+        PR_FileDesc2NativeHandle(pr_fd.get()), offset, size);
+    if (mMapPtr) {
+      mLength = size;
+      return NS_OK;
+    }
+  }
+  return NS_ERROR_FAILURE;
+}
+
+bool ArrayBufferBuilder::AreOverlappingRegions(const uint8_t* aStart1,
+                                               uint32_t aLength1,
+                                               const uint8_t* aStart2,
+                                               uint32_t aLength2) {
+  const uint8_t* end1 = aStart1 + aLength1;
+  const uint8_t* end2 = aStart2 + aLength2;
+
+  const uint8_t* max_start = aStart1 > aStart2 ? aStart1 : aStart2;
+  const uint8_t* min_end = end1 < end2 ? end1 : end2;
+
+  return max_start < min_end;
+}
+
+RequestHeaders::RequestHeader* RequestHeaders::Find(const nsACString& aName) {
+  for (RequestHeaders::RequestHeader& header : mHeaders) {
+    if (header.mName.Equals(aName, nsCaseInsensitiveCStringComparator)) {
+      return &header;
+    }
+  }
+  return nullptr;
+}
+
+bool RequestHeaders::IsEmpty() const { return mHeaders.IsEmpty(); }
+
+bool RequestHeaders::Has(const char* aName) {
+  return Has(nsDependentCString(aName));
+}
+
+bool RequestHeaders::Has(const nsACString& aName) { return !!Find(aName); }
+
+void RequestHeaders::Get(const char* aName, nsACString& aValue) {
+  Get(nsDependentCString(aName), aValue);
+}
+
+void RequestHeaders::Get(const nsACString& aName, nsACString& aValue) {
+  RequestHeader* header = Find(aName);
+  if (header) {
+    aValue = header->mValue;
+  } else {
+    aValue.SetIsVoid(true);
+  }
+}
+
+void RequestHeaders::Set(const char* aName, const nsACString& aValue) {
+  Set(nsDependentCString(aName), aValue);
+}
+
+void RequestHeaders::Set(const nsACString& aName, const nsACString& aValue) {
+  RequestHeader* header = Find(aName);
+  if (header) {
+    header->mValue.Assign(aValue);
+  } else {
+    RequestHeader newHeader = {nsCString(aName), nsCString(aValue)};
+    mHeaders.AppendElement(newHeader);
+  }
+}
+
+void RequestHeaders::MergeOrSet(const char* aName, const nsACString& aValue) {
+  MergeOrSet(nsDependentCString(aName), aValue);
+}
+
+void RequestHeaders::MergeOrSet(const nsACString& aName,
+                                const nsACString& aValue) {
+  RequestHeader* header = Find(aName);
+  if (header) {
+    header->mValue.AppendLiteral(", ");
+    header->mValue.Append(aValue);
+  } else {
+    RequestHeader newHeader = {nsCString(aName), nsCString(aValue)};
+    mHeaders.AppendElement(newHeader);
+  }
+}
+
+void RequestHeaders::Clear() { mHeaders.Clear(); }
+
+void RequestHeaders::ApplyToChannel(nsIHttpChannel* aChannel,
+                                    bool aStripRequestBodyHeader,
+                                    bool aStripAuthHeader) const {
+  for (const RequestHeader& header : mHeaders) {
+    if (aStripRequestBodyHeader &&
+        (header.mName.LowerCaseEqualsASCII("content-type") ||
+         header.mName.LowerCaseEqualsASCII("content-encoding") ||
+         header.mName.LowerCaseEqualsASCII("content-language") ||
+         header.mName.LowerCaseEqualsASCII("content-location"))) {
+      continue;
+    }
+
+    if (aStripAuthHeader &&
+        header.mName.LowerCaseEqualsASCII("authorization")) {
+      continue;
+    }
+
+    if (header.mName.LowerCaseEqualsASCII("referer")) {
+      DebugOnly<nsresult> rv = aChannel->SetNewReferrerInfo(
+          header.mValue, nsIReferrerInfo::ReferrerPolicyIDL::UNSAFE_URL, true);
+      MOZ_ASSERT(NS_SUCCEEDED(rv));
+    }
+    if (header.mValue.IsEmpty()) {
+      DebugOnly<nsresult> rv = aChannel->SetEmptyRequestHeader(header.mName);
+      MOZ_ASSERT(NS_SUCCEEDED(rv));
+    } else {
+      DebugOnly<nsresult> rv =
+          aChannel->SetRequestHeader(header.mName, header.mValue, false);
+      MOZ_ASSERT(NS_SUCCEEDED(rv));
+    }
+  }
+}
+
+void RequestHeaders::GetCORSUnsafeHeaders(nsTArray<nsCString>& aArray) const {
+  for (const RequestHeader& header : mHeaders) {
+    if (!nsContentUtils::IsCORSSafelistedRequestHeader(header.mName,
+                                                       header.mValue)) {
+      aArray.AppendElement(header.mName);
+    }
+  }
+}
+
+RequestHeaders::CharsetIterator::CharsetIterator(nsACString& aSource)
+    : mValid(false),
+      mCurPos(-1),
+      mCurLen(-1),
+      mCutoff(aSource.Length()),
+      mSource(aSource) {}
+
+bool RequestHeaders::CharsetIterator::Equals(
+    const nsACString& aOther, const nsCStringComparator& aCmp) const {
+  if (mValid) {
+    return Substring(mSource, mCurPos, mCurLen).Equals(aOther, aCmp);
+  } else {
+    return false;
+  }
+}
+
+void RequestHeaders::CharsetIterator::Replace(const nsACString& aReplacement) {
+  if (mValid) {
+    mSource.Replace(mCurPos, mCurLen, aReplacement);
+    mCurLen = aReplacement.Length();
+  }
+}
+
+bool RequestHeaders::CharsetIterator::Next() {
+  int32_t start, end;
+  nsAutoCString charset;
+
+  NS_ExtractCharsetFromContentType(Substring(mSource, 0, mCutoff), charset,
+                                   &mValid, &start, &end);
+
+  if (!mValid) {
+    return false;
+  }
+
+  mCurPos = mSource.FindChar('=', start) + 1;
+  mCurLen = end - mCurPos;
+
+  if (charset.Length() >= 2 && charset.First() == '\'' &&
+      charset.Last() == '\'') {
+    ++mCurPos;
+    mCurLen -= 2;
+  }
+
+  mCutoff = start;
+
+  return true;
+}
+
+}  

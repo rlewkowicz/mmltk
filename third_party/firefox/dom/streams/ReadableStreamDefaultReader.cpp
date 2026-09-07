@@ -1,0 +1,355 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ReadableStreamAbstract.h"
+#include "ReadableStreamDefaultReaderAbstract.h"
+#include "ReadableStreamGenericReaderAbstract.h"
+#include "js/PropertyAndElement.h"
+#include "js/TypeDecls.h"
+#include "js/Value.h"
+#include "jsapi.h"
+#include "mozilla/dom/AutoEntryScript.h"
+#include "mozilla/dom/ReadableStreamDefaultReaderBinding.h"
+#include "mozilla/dom/RootedDictionary.h"
+#include "mozilla/dom/UnderlyingSourceBinding.h"
+#include "nsCOMPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsISupports.h"
+#include "nsWrapperCache.h"
+
+namespace mozilla::dom {
+
+using namespace streams_abstract;
+
+NS_IMPL_CYCLE_COLLECTION(ReadableStreamGenericReader, mClosedPromise, mStream,
+                         mGlobal)
+NS_IMPL_CYCLE_COLLECTING_ADDREF(ReadableStreamGenericReader)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(ReadableStreamGenericReader)
+NS_IMPL_CYCLE_COLLECTION_TRACE_BEGIN(ReadableStreamGenericReader)
+NS_IMPL_CYCLE_COLLECTION_TRACE_END
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(ReadableStreamGenericReader)
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE_INHERITED(ReadableStreamDefaultReader,
+                                                ReadableStreamGenericReader,
+                                                mReadRequests)
+NS_IMPL_ADDREF_INHERITED(ReadableStreamDefaultReader,
+                         ReadableStreamGenericReader)
+NS_IMPL_RELEASE_INHERITED(ReadableStreamDefaultReader,
+                          ReadableStreamGenericReader)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(ReadableStreamDefaultReader)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+NS_INTERFACE_MAP_END_INHERITING(ReadableStreamGenericReader)
+
+ReadableStreamDefaultReader::ReadableStreamDefaultReader(nsISupports* aGlobal)
+    : ReadableStreamGenericReader(do_QueryInterface(aGlobal)) {}
+
+ReadableStreamDefaultReader::~ReadableStreamDefaultReader() {
+  mReadRequests.clear();
+}
+
+JSObject* ReadableStreamDefaultReader::WrapObject(
+    JSContext* aCx, JS::Handle<JSObject*> aGivenProto) {
+  return ReadableStreamDefaultReader_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+namespace streams_abstract {
+bool ReadableStreamReaderGenericInitialize(ReadableStreamGenericReader* aReader,
+                                           ReadableStream* aStream) {
+  aReader->SetStream(aStream);
+
+  aStream->SetReader(aReader);
+
+  aReader->SetClosedPromise(
+      Promise::CreateInfallible(aReader->GetParentObject()));
+
+  switch (aStream->State()) {
+    case ReadableStream::ReaderState::Readable:
+      return true;
+    case ReadableStream::ReaderState::Closed:
+      aReader->ClosedPromise()->MaybeResolve(JS::UndefinedHandleValue);
+
+      return true;
+    case ReadableStream::ReaderState::Errored: {
+      JS::RootingContext* rcx = RootingCx();
+      JS::Rooted<JS::Value> rootedError(rcx, aStream->UnsafeStoredError());
+      aReader->ClosedPromise()->MaybeReject(rootedError);
+
+      aReader->ClosedPromise()->SetSettledPromiseIsHandled();
+      return true;
+    }
+    default:
+      MOZ_ASSERT_UNREACHABLE("Unknown ReaderState");
+      return false;
+  }
+}
+}  
+
+already_AddRefed<ReadableStreamDefaultReader>
+ReadableStreamDefaultReader::Constructor(const GlobalObject& aGlobal,
+                                         ReadableStream& aStream,
+                                         ErrorResult& aRv) {
+  RefPtr<ReadableStreamDefaultReader> reader =
+      new ReadableStreamDefaultReader(aGlobal.GetAsSupports());
+
+  if (aStream.Locked()) {
+    aRv.ThrowTypeError(
+        "Cannot create a new reader for a readable stream already locked by "
+        "another reader.");
+    return nullptr;
+  }
+
+  RefPtr<ReadableStream> streamPtr = &aStream;
+  if (!ReadableStreamReaderGenericInitialize(reader, streamPtr)) {
+    return nullptr;
+  }
+
+  reader->mReadRequests.clear();
+
+  return reader.forget();
+}
+
+void Read_ReadRequest::ChunkSteps(JSContext* aCx, JS::Handle<JS::Value> aChunk,
+                                  ErrorResult& aRv) {
+
+  JS::Rooted<JS::Value> chunk(aCx, aChunk);
+  if (!JS_WrapValue(aCx, &chunk)) {
+    aRv.StealExceptionFromJSContext(aCx);
+    return;
+  }
+
+  RootedDictionary<ReadableStreamReadResult> result(aCx);
+  result.mValue = chunk;
+  result.mDone.Construct(false);
+
+  JS::Rooted<JS::Value> value(aCx);
+  if (!ToJSValue(aCx, std::move(result), &value)) {
+    aRv.StealExceptionFromJSContext(aCx);
+    return;
+  }
+
+  mPromise->MaybeResolve(value);
+}
+
+void Read_ReadRequest::CloseSteps(JSContext* aCx, ErrorResult& aRv) {
+  RootedDictionary<ReadableStreamReadResult> result(aCx);
+  result.mValue.setUndefined();
+  result.mDone.Construct(true);
+
+  JS::Rooted<JS::Value> value(aCx);
+  if (!ToJSValue(aCx, std::move(result), &value)) {
+    aRv.StealExceptionFromJSContext(aCx);
+    return;
+  }
+
+  mPromise->MaybeResolve(value);
+}
+
+void Read_ReadRequest::ErrorSteps(JSContext* aCx, JS::Handle<JS::Value> e,
+                                  ErrorResult& aRv) {
+  mPromise->MaybeReject(e);
+}
+
+NS_IMPL_CYCLE_COLLECTION(ReadRequest)
+NS_IMPL_CYCLE_COLLECTION_INHERITED(Read_ReadRequest, ReadRequest, mPromise)
+NS_IMPL_CYCLE_COLLECTING_ADDREF(ReadRequest)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(ReadRequest)
+
+NS_IMPL_ADDREF_INHERITED(Read_ReadRequest, ReadRequest)
+NS_IMPL_RELEASE_INHERITED(Read_ReadRequest, ReadRequest)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(ReadRequest)
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(Read_ReadRequest)
+NS_INTERFACE_MAP_END_INHERITING(ReadRequest)
+
+namespace streams_abstract {
+void ReadableStreamDefaultReaderRead(JSContext* aCx,
+                                     ReadableStreamGenericReader* aReader,
+                                     ReadRequest* aRequest, ErrorResult& aRv) {
+  ReadableStream* stream = aReader->GetStream();
+
+  MOZ_ASSERT(stream);
+
+  stream->SetDisturbed(true);
+
+  switch (stream->State()) {
+    case ReadableStream::ReaderState::Closed: {
+      aRequest->CloseSteps(aCx, aRv);
+      return;
+    }
+
+    case ReadableStream::ReaderState::Errored: {
+      JS::Rooted<JS::Value> storedError(aCx);
+      stream->GetStoredError(aCx, &storedError, aRv);
+      if (aRv.Failed()) {
+        return;
+      }
+      aRequest->ErrorSteps(aCx, storedError, aRv);
+      return;
+    }
+
+    case ReadableStream::ReaderState::Readable: {
+      RefPtr<ReadableStreamControllerBase> controller(stream->Controller());
+      MOZ_ASSERT(controller);
+      controller->PullSteps(aCx, aRequest, aRv);
+      return;
+    }
+  }
+}
+}  
+
+already_AddRefed<Promise> ReadableStreamDefaultReader::Read(ErrorResult& aRv) {
+  if (!mStream) {
+    aRv.ThrowTypeError("Reading is not possible after calling releaseLock.");
+    return nullptr;
+  }
+
+  RefPtr<Promise> promise = Promise::CreateInfallible(GetParentObject());
+
+  RefPtr<ReadRequest> request = new Read_ReadRequest(promise);
+
+  AutoEntryScript aes(mGlobal, "ReadableStreamDefaultReader::Read");
+  JSContext* cx = aes.cx();
+
+  ReadableStreamDefaultReaderRead(cx, this, request, aRv);
+  if (aRv.Failed()) {
+    return nullptr;
+  }
+
+  return promise.forget();
+}
+
+namespace streams_abstract {
+
+void ReadableStreamReaderGenericRelease(ReadableStreamGenericReader* aReader,
+                                        ErrorResult& aRv) {
+  RefPtr<ReadableStream> stream = aReader->GetStream();
+
+  MOZ_ASSERT(stream);
+
+  MOZ_ASSERT(stream->GetReader() == aReader);
+
+  if (stream->State() == ReadableStream::ReaderState::Readable) {
+    aReader->ClosedPromise()->MaybeRejectWithTypeError(
+        "Releasing lock on readable stream");
+  } else {
+    RefPtr<Promise> promise = Promise::CreateRejectedWithTypeError(
+        aReader->GetParentObject(), "Lock Released"_ns, aRv);
+    aReader->SetClosedPromise(promise.forget());
+  }
+
+  aReader->ClosedPromise()->SetSettledPromiseIsHandled();
+
+  stream->Controller()->ReleaseSteps();
+
+  stream->SetReader(nullptr);
+
+  aReader->SetStream(nullptr);
+}
+
+void ReadableStreamDefaultReaderErrorReadRequests(
+    JSContext* aCx, ReadableStreamDefaultReader* aReader,
+    JS::Handle<JS::Value> aError, ErrorResult& aRv) {
+  LinkedList<RefPtr<ReadRequest>> readRequests =
+      std::move(aReader->ReadRequests());
+
+  aReader->ReadRequests().clear();
+
+  while (RefPtr<ReadRequest> readRequest = readRequests.popFirst()) {
+    readRequest->ErrorSteps(aCx, aError, aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+  }
+}
+
+void ReadableStreamDefaultReaderRelease(JSContext* aCx,
+                                        ReadableStreamDefaultReader* aReader,
+                                        ErrorResult& aRv) {
+  ReadableStreamReaderGenericRelease(aReader, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  ErrorResult rv;
+  rv.ThrowTypeError("Releasing lock");
+  JS::Rooted<JS::Value> error(aCx);
+  MOZ_ALWAYS_TRUE(ToJSValue(aCx, std::move(rv), &error));
+
+  ReadableStreamDefaultReaderErrorReadRequests(aCx, aReader, error, aRv);
+}
+
+}  
+
+void ReadableStreamDefaultReader::ReleaseLock(ErrorResult& aRv) {
+  if (!mStream) {
+    return;
+  }
+
+  AutoJSAPI jsapi;
+  if (!jsapi.Init(mGlobal)) {
+    return aRv.ThrowUnknownError("Internal error");
+  }
+  JSContext* cx = jsapi.cx();
+
+  RefPtr<ReadableStreamDefaultReader> thisRefPtr = this;
+  ReadableStreamDefaultReaderRelease(cx, thisRefPtr, aRv);
+}
+
+already_AddRefed<Promise> ReadableStreamGenericReader::Closed() const {
+  return do_AddRef(mClosedPromise);
+}
+
+MOZ_CAN_RUN_SCRIPT
+static already_AddRefed<Promise> ReadableStreamGenericReaderCancel(
+    JSContext* aCx, ReadableStreamGenericReader* aReader,
+    JS::Handle<JS::Value> aReason, ErrorResult& aRv) {
+  RefPtr<ReadableStream> stream = aReader->GetStream();
+
+  MOZ_ASSERT(stream);
+
+  return ReadableStreamCancel(aCx, stream, aReason, aRv);
+}
+
+already_AddRefed<Promise> ReadableStreamGenericReader::Cancel(
+    JSContext* aCx, JS::Handle<JS::Value> aReason, ErrorResult& aRv) {
+  if (!mStream) {
+    aRv.ThrowTypeError("Canceling is not possible after calling releaseLock.");
+    return nullptr;
+  }
+
+  return ReadableStreamGenericReaderCancel(aCx, this, aReason, aRv);
+}
+
+namespace streams_abstract {
+void SetUpReadableStreamDefaultReader(ReadableStreamDefaultReader* aReader,
+                                      ReadableStream* aStream,
+                                      ErrorResult& aRv) {
+  if (IsReadableStreamLocked(aStream)) {
+    return aRv.ThrowTypeError(
+        "Cannot get a new reader for a readable stream already locked by "
+        "another reader.");
+  }
+
+  if (!ReadableStreamReaderGenericInitialize(aReader, aStream)) {
+    return;
+  }
+
+  aReader->ReadRequests().clear();
+}
+}  
+
+void ReadableStreamDefaultReader::ReadChunk(JSContext* aCx,
+                                            ReadRequest& aRequest,
+                                            ErrorResult& aRv) {
+  ReadableStreamDefaultReaderRead(aCx, this, &aRequest, aRv);
+}
+
+}  

@@ -1,0 +1,251 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "base/message_loop.h"
+
+#include "js/Initialization.h"
+#include "nsBaseAppShell.h"
+#include "nsJSUtils.h"
+#include "nsThreadUtils.h"
+#include "nsIAppShell.h"
+#include "nsIObserverService.h"
+#include "nsServiceManagerUtils.h"
+#include "mozilla/Services.h"
+#include "nsXULAppAPI.h"
+
+#define THREAD_EVENT_STARVATION_LIMIT PR_MillisecondsToInterval(10)
+
+NS_IMPL_ISUPPORTS(nsBaseAppShell, nsIAppShell, nsIThreadObserver, nsIObserver)
+
+nsBaseAppShell::nsBaseAppShell()
+    : mSuspendNativeCount(0),
+      mEventloopNestingLevel(0),
+      mBlockedWait(nullptr),
+      mNativeEventPending(false),
+      mGeckoTaskBurstStartTime(0),
+      mLastNativeEventTime(0),
+      mEventloopNestingState(eEventloopNone),
+      mRunning(false),
+      mExiting(false),
+      mBlockNativeEvent(false),
+      mProcessedGeckoEvents(false) {}
+
+nsBaseAppShell::~nsBaseAppShell() = default;
+
+nsresult nsBaseAppShell::Init() {
+
+  if (XRE_UseNativeEventProcessing()) {
+    nsCOMPtr<nsIThreadInternal> threadInt =
+        do_QueryInterface(NS_GetCurrentThread());
+    NS_ENSURE_STATE(threadInt);
+
+    threadInt->SetObserver(this);
+  }
+
+  nsCOMPtr<nsIObserverService> obsSvc = mozilla::services::GetObserverService();
+  if (obsSvc) obsSvc->AddObserver(this, NS_XPCOM_SHUTDOWN_OBSERVER_ID, false);
+  return NS_OK;
+}
+
+void nsBaseAppShell::NativeEventCallback() {
+  if (!mNativeEventPending.exchange(false)) return;
+
+  if (mEventloopNestingState == eEventloopXPCOM) {
+    mEventloopNestingState = eEventloopOther;
+    return;
+  }
+
+
+  nsIThread* thread = NS_GetCurrentThread();
+  bool prevBlockNativeEvent = mBlockNativeEvent;
+  if (mEventloopNestingState == eEventloopOther) {
+    if (!NS_HasPendingEvents(thread)) return;
+    mBlockNativeEvent = true;
+  }
+
+  IncrementEventloopNestingLevel();
+  EventloopNestingState prevVal = mEventloopNestingState;
+  NS_ProcessPendingEvents(thread, THREAD_EVENT_STARVATION_LIMIT);
+  mProcessedGeckoEvents = true;
+  mEventloopNestingState = prevVal;
+  mBlockNativeEvent = prevBlockNativeEvent;
+
+  if (NS_HasPendingEvents(thread)) DoProcessMoreGeckoEvents();
+
+  DecrementEventloopNestingLevel();
+}
+
+void nsBaseAppShell::OnSystemTimezoneChange() {
+  if (JS_IsInitialized()) {
+    nsJSUtils::ResetTimeZone();
+  }
+
+  nsCOMPtr<nsIObserverService> obsSvc = mozilla::services::GetObserverService();
+  if (obsSvc) {
+    obsSvc->NotifyObservers(nullptr, DEFAULT_TIMEZONE_CHANGED_OBSERVER_TOPIC,
+                            nullptr);
+  }
+}
+
+void nsBaseAppShell::DoProcessMoreGeckoEvents() { OnDispatchedEvent(); }
+
+bool nsBaseAppShell::DoProcessNextNativeEvent(bool mayWait) {
+  EventloopNestingState prevVal = mEventloopNestingState;
+  mEventloopNestingState = eEventloopXPCOM;
+
+  IncrementEventloopNestingLevel();
+  bool result = ProcessNextNativeEvent(mayWait);
+  DecrementEventloopNestingLevel();
+
+  mEventloopNestingState = prevVal;
+  return result;
+}
+
+
+NS_IMETHODIMP
+nsBaseAppShell::Run(void) {
+  NS_ENSURE_STATE(!mRunning);  
+  mRunning = true;
+
+  nsIThread* thread = NS_GetCurrentThread();
+
+  MessageLoop::current()->Run();
+
+  NS_ProcessPendingEvents(thread);
+
+  mRunning = false;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseAppShell::Exit(void) {
+  if (mRunning && !mExiting) {
+    MessageLoop::current()->Quit();
+  }
+  mExiting = true;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseAppShell::GeckoTaskBurst() {
+  if (mGeckoTaskBurstStartTime == 0) {
+    mGeckoTaskBurstStartTime = PR_IntervalNow();
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseAppShell::SuspendNative() {
+  ++mSuspendNativeCount;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseAppShell::ResumeNative() {
+  --mSuspendNativeCount;
+  NS_ASSERTION(mSuspendNativeCount >= 0,
+               "Unbalanced call to nsBaseAppShell::ResumeNative!");
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseAppShell::GetEventloopNestingLevel(uint32_t* aNestingLevelResult) {
+  NS_ENSURE_ARG_POINTER(aNestingLevelResult);
+
+  *aNestingLevelResult = mEventloopNestingLevel;
+
+  return NS_OK;
+}
+
+
+NS_IMETHODIMP
+nsBaseAppShell::OnDispatchedEvent() {
+  if (mBlockNativeEvent) return NS_OK;
+
+  if (mNativeEventPending.exchange(true)) return NS_OK;
+
+  ScheduleNativeEventCallback();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseAppShell::OnProcessNextEvent(nsIThreadInternal* thr, bool mayWait) {
+  if (mBlockNativeEvent) {
+    if (!mayWait) return NS_OK;
+    mBlockNativeEvent = false;
+    if (NS_HasPendingEvents(thr))
+      OnDispatchedEvent();  
+  }
+
+  PRIntervalTime start = PR_IntervalNow();
+  PRIntervalTime limit = THREAD_EVENT_STARVATION_LIMIT;
+
+  if (mBlockedWait) *mBlockedWait = false;
+
+  bool* oldBlockedWait = mBlockedWait;
+  mBlockedWait = &mayWait;
+
+  bool needEvent = mayWait;
+  mProcessedGeckoEvents = false;
+
+  if (!XRE_IsContentProcess() && (start > (mGeckoTaskBurstStartTime + limit))) {
+    mGeckoTaskBurstStartTime = 0;
+    PRIntervalTime now = start;
+    bool keepGoing;
+    do {
+      mLastNativeEventTime = now;
+      keepGoing = DoProcessNextNativeEvent(false);
+    } while (keepGoing && ((now = PR_IntervalNow()) - start) < limit);
+  } else {
+    if (start - mLastNativeEventTime > limit) {
+      mLastNativeEventTime = start;
+      DoProcessNextNativeEvent(false);
+    }
+  }
+
+  while (!NS_HasPendingEvents(thr) && !mProcessedGeckoEvents) {
+    if (mExiting) mayWait = false;
+
+    mLastNativeEventTime = PR_IntervalNow();
+    if (!DoProcessNextNativeEvent(mayWait) || !mayWait) break;
+  }
+
+  mBlockedWait = oldBlockedWait;
+
+  if (needEvent && !mExiting && !NS_HasPendingEvents(thr)) {
+    DispatchDummyEvent(thr);
+  }
+
+  return NS_OK;
+}
+
+bool nsBaseAppShell::DispatchDummyEvent(nsIThread* aTarget) {
+  NS_ASSERTION(NS_IsMainThread(), "Wrong thread!");
+
+  if (!mDummyEvent) mDummyEvent = new mozilla::Runnable("DummyEvent");
+
+  return NS_SUCCEEDED(aTarget->Dispatch(mDummyEvent, NS_DISPATCH_NORMAL));
+}
+
+void nsBaseAppShell::IncrementEventloopNestingLevel() {
+  ++mEventloopNestingLevel;
+}
+
+void nsBaseAppShell::DecrementEventloopNestingLevel() {
+  --mEventloopNestingLevel;
+}
+
+NS_IMETHODIMP
+nsBaseAppShell::AfterProcessNextEvent(nsIThreadInternal* thr,
+                                      bool eventWasProcessed) {
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsBaseAppShell::Observe(nsISupports* subject, const char* topic,
+                        const char16_t* data) {
+  NS_ASSERTION(!strcmp(topic, NS_XPCOM_SHUTDOWN_OBSERVER_ID), "oops");
+  Exit();
+  return NS_OK;
+}

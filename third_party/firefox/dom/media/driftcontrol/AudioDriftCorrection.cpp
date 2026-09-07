@@ -1,0 +1,159 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "AudioDriftCorrection.h"
+
+#include "AudioResampler.h"
+#include "DriftController.h"
+
+namespace mozilla {
+
+extern LazyLogModule gMediaTrackGraphLog;
+
+#define LOG_CONTROLLER(level, controller, format, ...)    \
+  MOZ_LOG_FMT(gMediaTrackGraphLog, level,                 \
+              "DriftController {}: (plot-id {}) " format, \
+              fmt::ptr(controller), (controller)->mPlotId, ##__VA_ARGS__)
+
+static media::TimeUnit DesiredBuffering(media::TimeUnit aSourceLatency) {
+  constexpr media::TimeUnit kMinBuffer(10, MSECS_PER_S);
+  constexpr media::TimeUnit kMaxBuffer(2500, MSECS_PER_S);
+
+  const auto clamped = std::clamp(aSourceLatency, kMinBuffer, kMaxBuffer);
+
+  return clamped.ToBase(aSourceLatency);
+}
+
+AudioDriftCorrection::AudioDriftCorrection(
+    uint32_t aSourceRate, uint32_t aTargetRate,
+    const PrincipalHandle& aPrincipalHandle)
+    : mTargetRate(aTargetRate),
+      mDriftController(MakeUnique<DriftController>(aSourceRate, aTargetRate,
+                                                   mDesiredBuffering)),
+      mResampler(MakeUnique<AudioResampler>(aSourceRate, aTargetRate, 0,
+                                            aPrincipalHandle)) {}
+
+AudioDriftCorrection::~AudioDriftCorrection() = default;
+
+AudioSegment AudioDriftCorrection::RequestFrames(const AudioSegment& aInput,
+                                                 uint32_t aOutputFrames) {
+  const media::TimeUnit inputDuration(aInput.GetDuration(),
+                                      mDriftController->mSourceRate);
+  const media::TimeUnit outputDuration(aOutputFrames, mTargetRate);
+
+  if (inputDuration.IsPositive()) {
+    if (mDesiredBuffering.IsZero()) {
+      const media::TimeUnit desiredBuffering = DesiredBuffering(std::max(
+          inputDuration * 11 / 10, media::TimeUnit::FromSeconds(0.05)));
+      LOG_CONTROLLER(LogLevel::Info, mDriftController.get(),
+                     "Initial desired buffering {:.2f}ms",
+                     desiredBuffering.ToSeconds() * 1000.0);
+      SetDesiredBuffering(desiredBuffering);
+    } else if (inputDuration > mDesiredBuffering) {
+      if (inputDuration > mSourceLatency) {
+        const media::TimeUnit desiredBuffering =
+            DesiredBuffering(inputDuration * 11 / 10);
+        LOG_CONTROLLER(LogLevel::Info, mDriftController.get(),
+                       "High observed input latency {:.2f}ms ({} frames). "
+                       "Increasing desired buffering {:.2f}ms->{:.2f}ms frames",
+                       inputDuration.ToSeconds() * 1000.0, aInput.GetDuration(),
+                       mDesiredBuffering.ToSeconds() * 1000.0,
+                       desiredBuffering.ToSeconds() * 1000.0);
+        SetDesiredBuffering(desiredBuffering);
+      } else {
+        const media::TimeUnit desiredBuffering =
+            DesiredBuffering(mSourceLatency * 11 / 10);
+        LOG_CONTROLLER(LogLevel::Info, mDriftController.get(),
+                       "Increasing desired buffering {:.2f}ms->{:.2f}ms, "
+                       "based on reported input-latency {:.2f}ms.",
+                       mDesiredBuffering.ToSeconds() * 1000.0,
+                       desiredBuffering.ToSeconds() * 1000.0,
+                       mSourceLatency.ToSeconds() * 1000.0);
+        SetDesiredBuffering(desiredBuffering);
+      }
+    }
+
+    mIsHandlingUnderrun = false;
+    mResampler->AppendInput(aInput);
+  }
+  bool hasUnderrun = false;
+  AudioSegment output = mResampler->Resample(aOutputFrames, &hasUnderrun);
+  mDriftController->UpdateClock(inputDuration, outputDuration,
+                                CurrentBuffering(), BufferSize());
+  mResampler->UpdateInRate(mDriftController->GetCorrectedSourceRate());
+  if (hasUnderrun) {
+    if (!mIsHandlingUnderrun) {
+      NS_WARNING("Drift-correction: Underrun");
+      LOG_CONTROLLER(
+          LogLevel::Info, mDriftController.get(),
+          "Underrun. Doubling the desired buffering {:.2f}ms->{:.2f}ms",
+          mDesiredBuffering.ToSeconds() * 1000.0,
+          (mDesiredBuffering * 2).ToSeconds() * 1000.0);
+      mIsHandlingUnderrun = true;
+      ++mNumUnderruns;
+      SetDesiredBuffering(DesiredBuffering(mDesiredBuffering * 2));
+      mDriftController->ResetAfterUnderrun();
+    }
+  }
+
+  if (mDriftController->DurationNearDesired() > mLatencyReductionTimeLimit &&
+      mDriftController->DurationSinceDesiredBufferingChange() >
+          mLatencyReductionTimeLimit) {
+    const media::TimeUnit sourceLatency =
+        mDriftController->MeasuredSourceLatency();
+    const media::TimeUnit targetDesiredBuffering =
+        DesiredBuffering(sourceLatency * 13 / 10);
+    if (targetDesiredBuffering < mDesiredBuffering) {
+      const media::TimeUnit diff =
+          (mDesiredBuffering - targetDesiredBuffering) / 10;
+      const media::TimeUnit target = std::max(
+          targetDesiredBuffering, (mDesiredBuffering - diff).ToBase(500));
+      if (target < mDesiredBuffering) {
+        LOG_CONTROLLER(
+            LogLevel::Info, mDriftController.get(),
+            "Reducing desired buffering because the buffering level is stable. "
+            "{:.2f}ms->{:.2f}ms. Measured source latency is {:.2f}ms, ideal "
+            "target "
+            "is {:.2f}ms.",
+            mDesiredBuffering.ToSeconds() * 1000.0, target.ToSeconds() * 1000.0,
+            sourceLatency.ToSeconds() * 1000.0,
+            targetDesiredBuffering.ToSeconds() * 1000.0);
+        SetDesiredBuffering(target);
+      }
+    }
+  }
+  return output;
+}
+
+uint32_t AudioDriftCorrection::CurrentBuffering() const {
+  return mResampler->InputReadableFrames();
+}
+
+uint32_t AudioDriftCorrection::BufferSize() const {
+  return mResampler->InputCapacityFrames();
+}
+
+uint32_t AudioDriftCorrection::NumCorrectionChanges() const {
+  return mDriftController->NumCorrectionChanges();
+}
+
+void AudioDriftCorrection::SetSourceLatency(media::TimeUnit aSourceLatency) {
+  LOG_CONTROLLER(LogLevel::Info, mDriftController.get(),
+                 "SetSourceLatency {:.2f}ms->{:.2f}ms",
+                 mSourceLatency.ToSeconds() * 1000.0,
+                 aSourceLatency.ToSeconds() * 1000.0);
+
+  mSourceLatency = aSourceLatency;
+}
+
+void AudioDriftCorrection::SetDesiredBuffering(
+    media::TimeUnit aDesiredBuffering) {
+  mDesiredBuffering = aDesiredBuffering;
+  mDriftController->SetDesiredBuffering(mDesiredBuffering);
+  mResampler->SetInputPreBufferFrameCount(
+      mDesiredBuffering.ToTicksAtRate(mDriftController->mSourceRate));
+}
+}  
+
+#undef LOG_CONTROLLER

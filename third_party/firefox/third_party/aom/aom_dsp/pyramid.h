@@ -1,0 +1,71 @@
+/*
+ * Copyright (c) 2022, Alliance for Open Media. All rights reserved.
+ *
+ * This source code is subject to the terms of the BSD 2 Clause License and
+ * the Alliance for Open Media Patent License 1.0. If the BSD 2 Clause License
+ * was not distributed with this source code in the LICENSE file, you can
+ * obtain it at www.aomedia.org/license/software. If the Alliance for Open
+ * Media Patent License 1.0 was not distributed with this source code in the
+ * PATENTS file, you can obtain it at www.aomedia.org/license/patent.
+ */
+
+#if !defined(AOM_AOM_DSP_PYRAMID_H_)
+#define AOM_AOM_DSP_PYRAMID_H_
+
+#include <stddef.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+#include "config/aom_config.h"
+
+#include "aom_scale/yv12config.h"
+#include "aom_util/aom_pthread.h"
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+#define MIN_PYRAMID_SIZE_LOG2 3
+#define MIN_PYRAMID_SIZE (1 << MIN_PYRAMID_SIZE_LOG2)
+
+#define PYRAMID_PADDING 16
+
+#define PYRAMID_ALIGNMENT 32
+
+typedef struct {
+  uint8_t *buffer;
+  int width;
+  int height;
+  int stride;
+} PyramidLayer;
+
+typedef struct image_pyramid {
+#if CONFIG_MULTITHREAD
+  pthread_mutex_t mutex;
+#endif
+  int max_levels;
+  int filled_levels;
+  uint8_t *buffer_alloc;
+  PyramidLayer *layers;
+} ImagePyramid;
+
+size_t aom_get_pyramid_alloc_size(int width, int height, bool image_is_16bit);
+
+ImagePyramid *aom_alloc_pyramid(int width, int height, bool image_is_16bit);
+
+int aom_compute_pyramid(const YV12_BUFFER_CONFIG *frame, int bit_depth,
+                        int n_levels, ImagePyramid *pyr);
+
+#if !defined(NDEBUG)
+bool aom_is_pyramid_valid(ImagePyramid *pyr, int n_levels);
+#endif
+
+void aom_invalidate_pyramid(ImagePyramid *pyr);
+
+void aom_free_pyramid(ImagePyramid *pyr);
+
+#if defined(__cplusplus)
+}
+#endif
+
+#endif

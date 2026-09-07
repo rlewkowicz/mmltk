@@ -1,0 +1,25 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+:root {
+  --identity-box-margin-inline: 4px;
+
+  --urlbar-inner-border-radius: calc(var(--urlbarview-border-radius) - var(--urlbarView-padding));
+  --urlbar-input-gap: 0.45em;
+  --urlbar-min-height: max(32px, 1.4em);
+
+  /* stylelint-disable-next-line media-query-no-invalid */
+  @media not -moz-pref("browser.nova.enabled") {
+    --urlbar-inner-border-radius: calc(var(--urlbar-border-radius) - 1px);
+  }
+
+  &[uidensity="compact"] {
+    --urlbar-min-height: max(26px, 1.4em);
+  }
+
+  &[uidensity="touch"] {
+    --urlbar-min-height: max(34px, 1.4em);
+  }
+}

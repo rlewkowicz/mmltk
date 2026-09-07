@@ -1,0 +1,631 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef frontend_ObjLiteral_h
+#define frontend_ObjLiteral_h
+
+#include "mozilla/BloomFilter.h"  // mozilla::BitBloomFilter
+#include "mozilla/Span.h"
+
+#include "frontend/ParserAtom.h"  // ParserAtomsTable, TaggedParserAtomIndex, ParserAtom
+#include "js/AllocPolicy.h"
+#include "js/Value.h"
+#include "js/Vector.h"
+#include "util/EnumFlags.h"
+#include "vm/BytecodeUtil.h"
+#include "vm/Opcodes.h"
+
+
+namespace js {
+
+class FrontendContext;
+class JSONPrinter;
+class LifoAlloc;
+
+namespace frontend {
+struct CompilationAtomCache;
+struct CompilationStencil;
+class StencilXDR;
+}  
+
+enum class ObjLiteralOpcode : uint8_t {
+  INVALID = 0,
+
+  ConstValue = 1,  
+  ConstString = 2,
+  Null = 3,
+  Undefined = 4,
+  True = 5,
+  False = 6,
+
+  MAX = False,
+};
+
+enum class ObjLiteralKind : uint8_t {
+  Array,
+
+  CallSiteObj,
+
+  Object,
+
+  Shape,
+
+  Invalid
+};
+
+enum class ObjLiteralFlag : uint8_t {
+  HasIndexOrDuplicatePropName = 1 << 0,
+
+};
+
+using ObjLiteralFlags = EnumFlags<ObjLiteralFlag>;
+
+class ObjLiteralKindAndFlags {
+  uint8_t bits_ = 0;
+
+  static constexpr size_t KindBits = 3;
+  static constexpr size_t KindMask = BitMask(KindBits);
+
+  static_assert(size_t(ObjLiteralKind::Invalid) <= KindMask,
+                "ObjLiteralKind needs more bits");
+
+ public:
+  ObjLiteralKindAndFlags() = default;
+
+  ObjLiteralKindAndFlags(ObjLiteralKind kind, ObjLiteralFlags flags)
+      : bits_(size_t(kind) | (flags.toRaw() << KindBits)) {
+    MOZ_ASSERT(this->kind() == kind);
+    MOZ_ASSERT(this->flags() == flags);
+  }
+
+  ObjLiteralKind kind() const { return ObjLiteralKind(bits_ & KindMask); }
+  ObjLiteralFlags flags() const {
+    ObjLiteralFlags res;
+    res.setRaw(bits_ >> KindBits);
+    return res;
+  }
+
+  uint8_t toRaw() const { return bits_; }
+  void setRaw(uint8_t bits) { bits_ = bits; }
+};
+
+inline bool ObjLiteralOpcodeHasValueArg(ObjLiteralOpcode op) {
+  return op == ObjLiteralOpcode::ConstValue;
+}
+
+inline bool ObjLiteralOpcodeHasAtomArg(ObjLiteralOpcode op) {
+  return op == ObjLiteralOpcode::ConstString;
+}
+
+struct ObjLiteralReaderBase;
+
+struct ObjLiteralKey {
+ private:
+  uint32_t value_;
+
+  enum ObjLiteralKeyType {
+    None,
+    AtomIndex,
+    ArrayIndex,
+  };
+
+  ObjLiteralKeyType type_;
+
+  ObjLiteralKey(uint32_t value, ObjLiteralKeyType ty)
+      : value_(value), type_(ty) {}
+
+ public:
+  ObjLiteralKey() : ObjLiteralKey(0, None) {}
+  ObjLiteralKey(uint32_t value, bool isArrayIndex)
+      : ObjLiteralKey(value, isArrayIndex ? ArrayIndex : AtomIndex) {}
+  ObjLiteralKey(const ObjLiteralKey& other) = default;
+
+  static ObjLiteralKey fromPropName(frontend::TaggedParserAtomIndex atomIndex) {
+    return ObjLiteralKey(atomIndex.rawData(), false);
+  }
+  static ObjLiteralKey fromArrayIndex(uint32_t index) {
+    return ObjLiteralKey(index, true);
+  }
+  static ObjLiteralKey none() { return ObjLiteralKey(); }
+
+  bool isNone() const { return type_ == None; }
+  bool isAtomIndex() const { return type_ == AtomIndex; }
+  bool isArrayIndex() const { return type_ == ArrayIndex; }
+
+  frontend::TaggedParserAtomIndex getAtomIndex() const {
+    MOZ_ASSERT(isAtomIndex());
+    return frontend::TaggedParserAtomIndex::fromRaw(value_);
+  }
+  uint32_t getArrayIndex() const {
+    MOZ_ASSERT(isArrayIndex());
+    return value_;
+  }
+
+  uint32_t rawIndex() const { return value_; }
+};
+
+struct ObjLiteralWriterBase {
+ protected:
+  friend struct ObjLiteralReaderBase;  
+  static const uint32_t ATOM_INDEX_MASK = 0x7fffffff;
+  static const uint32_t INDEXED_PROP = 0x80000000;
+
+ public:
+  using CodeVector = Vector<uint8_t, 64, js::SystemAllocPolicy>;
+
+ protected:
+  CodeVector code_;
+
+ public:
+  ObjLiteralWriterBase() = default;
+
+  uint32_t curOffset() const { return code_.length(); }
+
+ private:
+  [[nodiscard]] bool pushByte(FrontendContext* fc, uint8_t data) {
+    if (!code_.append(data)) {
+      js::ReportOutOfMemory(fc);
+      return false;
+    }
+    return true;
+  }
+
+  [[nodiscard]] bool prepareBytes(FrontendContext* fc, size_t len,
+                                  uint8_t** p) {
+    size_t offset = code_.length();
+    if (!code_.growByUninitialized(len)) {
+      js::ReportOutOfMemory(fc);
+      return false;
+    }
+    *p = &code_[offset];
+    return true;
+  }
+
+  template <typename T>
+  [[nodiscard]] bool pushRawData(FrontendContext* fc, T data) {
+    uint8_t* p = nullptr;
+    if (!prepareBytes(fc, sizeof(T), &p)) {
+      return false;
+    }
+    memcpy(p, &data, sizeof(T));
+    return true;
+  }
+
+ protected:
+  [[nodiscard]] bool pushOpAndName(FrontendContext* fc, ObjLiteralOpcode op,
+                                   ObjLiteralKey key) {
+    uint8_t opdata = static_cast<uint8_t>(op);
+    uint32_t data = key.rawIndex() | (key.isArrayIndex() ? INDEXED_PROP : 0);
+    return pushByte(fc, opdata) && pushRawData(fc, data);
+  }
+
+  [[nodiscard]] bool pushValueArg(FrontendContext* fc, const JS::Value& value) {
+    MOZ_ASSERT(value.isNumber() || value.isNullOrUndefined() ||
+               value.isBoolean());
+    uint64_t data = value.asRawBits();
+    return pushRawData(fc, data);
+  }
+
+  [[nodiscard]] bool pushAtomArg(FrontendContext* fc,
+                                 frontend::TaggedParserAtomIndex atomIndex) {
+    return pushRawData(fc, atomIndex.rawData());
+  }
+};
+
+struct ObjLiteralWriter : private ObjLiteralWriterBase {
+ public:
+  ObjLiteralWriter() = default;
+
+  void clear() { code_.clear(); }
+
+  using CodeVector = typename ObjLiteralWriterBase::CodeVector;
+
+  bool checkForDuplicatedNames(FrontendContext* fc);
+  mozilla::Span<const uint8_t> getCode() const { return code_; }
+  ObjLiteralKind getKind() const { return kind_; }
+  ObjLiteralFlags getFlags() const { return flags_; }
+  uint32_t getPropertyCount() const { return propertyCount_; }
+
+  void beginArray(JSOp op) {
+    MOZ_ASSERT(JOF_OPTYPE(op) == JOF_OBJECT);
+    MOZ_ASSERT(op == JSOp::Object);
+    kind_ = ObjLiteralKind::Array;
+  }
+  void beginCallSiteObj(JSOp op) {
+    MOZ_ASSERT(JOF_OPTYPE(op) == JOF_OBJECT);
+    MOZ_ASSERT(op == JSOp::CallSiteObj);
+    kind_ = ObjLiteralKind::CallSiteObj;
+  }
+  void beginObject(JSOp op) {
+    MOZ_ASSERT(JOF_OPTYPE(op) == JOF_OBJECT);
+    MOZ_ASSERT(op == JSOp::Object);
+    kind_ = ObjLiteralKind::Object;
+  }
+  void beginShape(JSOp op) {
+    MOZ_ASSERT(JOF_OPTYPE(op) == JOF_SHAPE);
+    MOZ_ASSERT(op == JSOp::NewObject);
+    kind_ = ObjLiteralKind::Shape;
+  }
+
+  bool setPropName(frontend::ParserAtomsTable& parserAtoms,
+                   const frontend::TaggedParserAtomIndex propName) {
+    setPropNameNoDuplicateCheck(parserAtoms, propName);
+
+    if (flags_.hasFlag(ObjLiteralFlag::HasIndexOrDuplicatePropName)) {
+      return true;
+    }
+
+    if (mightContainDuplicatePropertyNames_) {
+      return true;
+    }
+
+    if (propNamesFilter_.mightContain(propName.rawData())) {
+      mightContainDuplicatePropertyNames_ = true;
+    } else {
+      propNamesFilter_.add(propName.rawData());
+    }
+    return true;
+  }
+  void setPropNameNoDuplicateCheck(
+      frontend::ParserAtomsTable& parserAtoms,
+      const frontend::TaggedParserAtomIndex propName) {
+    MOZ_ASSERT(kind_ == ObjLiteralKind::Object ||
+               kind_ == ObjLiteralKind::Shape);
+    parserAtoms.markUsedByStencil(propName, frontend::ParserAtom::Atomize::Yes);
+    nextKey_ = ObjLiteralKey::fromPropName(propName);
+  }
+  void setPropIndex(uint32_t propIndex) {
+    MOZ_ASSERT(kind_ == ObjLiteralKind::Object);
+    MOZ_ASSERT(propIndex <= ATOM_INDEX_MASK);
+    nextKey_ = ObjLiteralKey::fromArrayIndex(propIndex);
+    flags_.setFlag(ObjLiteralFlag::HasIndexOrDuplicatePropName);
+  }
+  void beginDenseArrayElements() {
+    MOZ_ASSERT(kind_ == ObjLiteralKind::Array ||
+               kind_ == ObjLiteralKind::CallSiteObj);
+    nextKey_ = ObjLiteralKey::none();
+  }
+
+  [[nodiscard]] bool propWithConstNumericValue(FrontendContext* fc,
+                                               const JS::Value& value) {
+    MOZ_ASSERT(kind_ != ObjLiteralKind::Shape);
+    propertyCount_++;
+    MOZ_ASSERT(value.isNumber());
+    return pushOpAndName(fc, ObjLiteralOpcode::ConstValue, nextKey_) &&
+           pushValueArg(fc, value);
+  }
+  [[nodiscard]] bool propWithAtomValue(
+      FrontendContext* fc, frontend::ParserAtomsTable& parserAtoms,
+      const frontend::TaggedParserAtomIndex value) {
+    MOZ_ASSERT(kind_ != ObjLiteralKind::Shape);
+    propertyCount_++;
+    parserAtoms.markUsedByStencil(value, frontend::ParserAtom::Atomize::No);
+    return pushOpAndName(fc, ObjLiteralOpcode::ConstString, nextKey_) &&
+           pushAtomArg(fc, value);
+  }
+  [[nodiscard]] bool propWithNullValue(FrontendContext* fc) {
+    MOZ_ASSERT(kind_ != ObjLiteralKind::Shape);
+    propertyCount_++;
+    return pushOpAndName(fc, ObjLiteralOpcode::Null, nextKey_);
+  }
+  [[nodiscard]] bool propWithUndefinedValue(FrontendContext* fc) {
+    propertyCount_++;
+    return pushOpAndName(fc, ObjLiteralOpcode::Undefined, nextKey_);
+  }
+  [[nodiscard]] bool propWithTrueValue(FrontendContext* fc) {
+    MOZ_ASSERT(kind_ != ObjLiteralKind::Shape);
+    propertyCount_++;
+    return pushOpAndName(fc, ObjLiteralOpcode::True, nextKey_);
+  }
+  [[nodiscard]] bool propWithFalseValue(FrontendContext* fc) {
+    MOZ_ASSERT(kind_ != ObjLiteralKind::Shape);
+    propertyCount_++;
+    return pushOpAndName(fc, ObjLiteralOpcode::False, nextKey_);
+  }
+
+  static bool arrayIndexInRange(int32_t i) {
+    return i >= 0 && static_cast<uint32_t>(i) <= ATOM_INDEX_MASK;
+  }
+
+#if defined(DEBUG) || defined(JS_JITSPEW)
+  void dump() const;
+  void dump(JSONPrinter& json,
+            const frontend::CompilationStencil* stencil) const;
+  void dumpFields(JSONPrinter& json,
+                  const frontend::CompilationStencil* stencil) const;
+#endif
+
+ private:
+  bool mightContainDuplicatePropertyNames_ = false;
+
+  ObjLiteralKind kind_ = ObjLiteralKind::Invalid;
+  ObjLiteralFlags flags_;
+  ObjLiteralKey nextKey_;
+  uint32_t propertyCount_ = 0;
+
+  mozilla::BitBloomFilter<12, frontend::TaggedParserAtomIndex> propNamesFilter_;
+};
+
+struct ObjLiteralReaderBase {
+ private:
+  mozilla::Span<const uint8_t> data_;
+  size_t cursor_;
+
+  [[nodiscard]] bool readByte(uint8_t* b) {
+    if (cursor_ + 1 > data_.Length()) {
+      return false;
+    }
+    *b = *data_.From(cursor_).data();
+    cursor_ += 1;
+    return true;
+  }
+
+  [[nodiscard]] bool readBytes(size_t size, const uint8_t** p) {
+    if (cursor_ + size > data_.Length()) {
+      return false;
+    }
+    *p = data_.From(cursor_).data();
+    cursor_ += size;
+    return true;
+  }
+
+  template <typename T>
+  [[nodiscard]] bool readRawData(T* data) {
+    const uint8_t* p = nullptr;
+    if (!readBytes(sizeof(T), &p)) {
+      return false;
+    }
+    memcpy(data, p, sizeof(T));
+    return true;
+  }
+
+ public:
+  explicit ObjLiteralReaderBase(mozilla::Span<const uint8_t> data)
+      : data_(data), cursor_(0) {}
+
+  [[nodiscard]] bool readOpAndKey(ObjLiteralOpcode* op, ObjLiteralKey* key) {
+    uint8_t opbyte;
+    if (!readByte(&opbyte)) {
+      return false;
+    }
+    if (MOZ_UNLIKELY(opbyte > static_cast<uint8_t>(ObjLiteralOpcode::MAX))) {
+      return false;
+    }
+    *op = static_cast<ObjLiteralOpcode>(opbyte);
+
+    uint32_t data;
+    if (!readRawData(&data)) {
+      return false;
+    }
+    bool isArray = data & ObjLiteralWriterBase::INDEXED_PROP;
+    uint32_t rawIndex = data & ~ObjLiteralWriterBase::INDEXED_PROP;
+    *key = ObjLiteralKey(rawIndex, isArray);
+    return true;
+  }
+
+  [[nodiscard]] bool readValueArg(JS::Value* value) {
+    uint64_t data;
+    if (!readRawData(&data)) {
+      return false;
+    }
+    *value = JS::Value::fromRawBits(data);
+    return true;
+  }
+
+  [[nodiscard]] bool readAtomArg(frontend::TaggedParserAtomIndex* atomIndex) {
+    return readRawData(atomIndex->rawDataRef());
+  }
+
+  size_t cursor() const { return cursor_; }
+};
+
+struct ObjLiteralInsn {
+ private:
+  ObjLiteralOpcode op_;
+  ObjLiteralKey key_;
+  union Arg {
+    explicit Arg(uint64_t raw_) : raw(raw_) {}
+
+    JS::Value constValue;
+    frontend::TaggedParserAtomIndex atomIndex;
+    uint64_t raw;
+  } arg_;
+
+ public:
+  ObjLiteralInsn() : op_(ObjLiteralOpcode::INVALID), arg_(0) {}
+  ObjLiteralInsn(ObjLiteralOpcode op, ObjLiteralKey key)
+      : op_(op), key_(key), arg_(0) {
+    MOZ_ASSERT(!hasConstValue());
+    MOZ_ASSERT(!hasAtomIndex());
+  }
+  ObjLiteralInsn(ObjLiteralOpcode op, ObjLiteralKey key, const JS::Value& value)
+      : op_(op), key_(key), arg_(0) {
+    MOZ_ASSERT(hasConstValue());
+    MOZ_ASSERT(!hasAtomIndex());
+    arg_.constValue = value;
+  }
+  ObjLiteralInsn(ObjLiteralOpcode op, ObjLiteralKey key,
+                 frontend::TaggedParserAtomIndex atomIndex)
+      : op_(op), key_(key), arg_(0) {
+    MOZ_ASSERT(!hasConstValue());
+    MOZ_ASSERT(hasAtomIndex());
+    arg_.atomIndex = atomIndex;
+  }
+  ObjLiteralInsn(const ObjLiteralInsn& other) : ObjLiteralInsn() {
+    *this = other;
+  }
+  ObjLiteralInsn& operator=(const ObjLiteralInsn& other) {
+    op_ = other.op_;
+    key_ = other.key_;
+    arg_.raw = other.arg_.raw;
+    return *this;
+  }
+
+  bool isValid() const {
+    return op_ > ObjLiteralOpcode::INVALID && op_ <= ObjLiteralOpcode::MAX;
+  }
+
+  ObjLiteralOpcode getOp() const {
+    MOZ_ASSERT(isValid());
+    return op_;
+  }
+  const ObjLiteralKey& getKey() const {
+    MOZ_ASSERT(isValid());
+    return key_;
+  }
+
+  bool hasConstValue() const {
+    MOZ_ASSERT(isValid());
+    return ObjLiteralOpcodeHasValueArg(op_);
+  }
+  bool hasAtomIndex() const {
+    MOZ_ASSERT(isValid());
+    return ObjLiteralOpcodeHasAtomArg(op_);
+  }
+
+  JS::Value getConstValue() const {
+    MOZ_ASSERT(isValid());
+    MOZ_ASSERT(hasConstValue());
+    return arg_.constValue;
+  }
+  frontend::TaggedParserAtomIndex getAtomIndex() const {
+    MOZ_ASSERT(isValid());
+    MOZ_ASSERT(hasAtomIndex());
+    return arg_.atomIndex;
+  };
+};
+
+struct ObjLiteralReader : private ObjLiteralReaderBase {
+ public:
+  explicit ObjLiteralReader(mozilla::Span<const uint8_t> data)
+      : ObjLiteralReaderBase(data) {}
+
+  [[nodiscard]] bool readInsn(ObjLiteralInsn* insn) {
+    ObjLiteralOpcode op;
+    ObjLiteralKey key;
+    if (!readOpAndKey(&op, &key)) {
+      return false;
+    }
+    if (ObjLiteralOpcodeHasValueArg(op)) {
+      JS::Value value;
+      if (!readValueArg(&value)) {
+        return false;
+      }
+      *insn = ObjLiteralInsn(op, key, value);
+      return true;
+    }
+    if (ObjLiteralOpcodeHasAtomArg(op)) {
+      frontend::TaggedParserAtomIndex atomIndex;
+      if (!readAtomArg(&atomIndex)) {
+        return false;
+      }
+      *insn = ObjLiteralInsn(op, key, atomIndex);
+      return true;
+    }
+    *insn = ObjLiteralInsn(op, key);
+    return true;
+  }
+};
+
+struct ObjLiteralModifier : private ObjLiteralReaderBase {
+  mozilla::Span<uint8_t> mutableData_;
+
+ public:
+  explicit ObjLiteralModifier(mozilla::Span<uint8_t> data)
+      : ObjLiteralReaderBase(data), mutableData_(data) {}
+
+ private:
+  template <typename MapT>
+  void mapOneAtom(MapT map, frontend::TaggedParserAtomIndex atom,
+                  size_t atomCursor) {
+    auto atomIndex = map(atom);
+    memcpy(mutableData_.data() + atomCursor, atomIndex.rawDataRef(),
+           sizeof(frontend::TaggedParserAtomIndex));
+  }
+
+  template <typename MapT>
+  bool mapInsnAtom(MapT map) {
+    ObjLiteralOpcode op;
+    ObjLiteralKey key;
+
+    size_t opCursor = cursor();
+    if (!readOpAndKey(&op, &key)) {
+      return false;
+    }
+    if (key.isAtomIndex()) {
+      static constexpr size_t OpLength = 1;
+      size_t atomCursor = opCursor + OpLength;
+      mapOneAtom(map, key.getAtomIndex(), atomCursor);
+    }
+
+    if (ObjLiteralOpcodeHasValueArg(op)) {
+      JS::Value value;
+      if (!readValueArg(&value)) {
+        return false;
+      }
+    } else if (ObjLiteralOpcodeHasAtomArg(op)) {
+      size_t atomCursor = cursor();
+
+      frontend::TaggedParserAtomIndex atomIndex;
+      if (!readAtomArg(&atomIndex)) {
+        return false;
+      }
+
+      mapOneAtom(map, atomIndex, atomCursor);
+    }
+
+    return true;
+  }
+
+ public:
+  template <typename MapT>
+  void mapAtom(MapT map) {
+    while (mapInsnAtom(map)) {
+    }
+  }
+};
+
+class ObjLiteralStencil {
+  friend class frontend::StencilXDR;
+
+  friend struct frontend::CompilationStencil;
+
+  mozilla::Span<uint8_t> code_;
+  ObjLiteralKindAndFlags kindAndFlags_;
+  uint32_t propertyCount_ = 0;
+
+ public:
+  ObjLiteralStencil() = default;
+
+  ObjLiteralStencil(uint8_t* code, size_t length, ObjLiteralKind kind,
+                    const ObjLiteralFlags& flags, uint32_t propertyCount)
+      : code_(mozilla::Span(code, length)),
+        kindAndFlags_(kind, flags),
+        propertyCount_(propertyCount) {}
+
+  JS::GCCellPtr create(JSContext* cx,
+                       const frontend::CompilationAtomCache& atomCache) const;
+
+  mozilla::Span<const uint8_t> code() const { return code_; }
+  ObjLiteralKind kind() const { return kindAndFlags_.kind(); }
+  ObjLiteralFlags flags() const { return kindAndFlags_.flags(); }
+  uint32_t propertyCount() const { return propertyCount_; }
+
+#ifdef DEBUG
+  bool isContainedIn(const LifoAlloc& alloc) const;
+#endif
+
+#if defined(DEBUG) || defined(JS_JITSPEW)
+  void dump() const;
+  void dump(JSONPrinter& json,
+            const frontend::CompilationStencil* stencil) const;
+  void dumpFields(JSONPrinter& json,
+                  const frontend::CompilationStencil* stencil) const;
+
+#endif
+};
+
+}  
+#endif  // frontend_ObjLiteral_h

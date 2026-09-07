@@ -1,0 +1,89 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_SerialPortParent_h
+#define mozilla_dom_SerialPortParent_h
+
+#include "mozilla/dom/PSerialPortParent.h"
+#include "mozilla/dom/SerialPlatformService.h"
+#include "mozilla/ipc/DataPipe.h"
+#include "nsIAsyncInputStream.h"
+#include "nsISupports.h"
+
+namespace mozilla::dom {
+
+class SerialDeviceChangeProxy;
+
+namespace webserial {
+class SerialPortWritePump;
+}  
+
+class SerialPortParent final : public PSerialPortParent {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(SerialPortParent, override)
+
+  mozilla::ipc::IPCResult RecvOpen(const IPCSerialOptions& aOptions,
+                                   OpenResolver&& aResolver);
+  mozilla::ipc::IPCResult RecvClose(CloseResolver&& aResolver);
+  mozilla::ipc::IPCResult RecvSetSignals(const IPCSerialOutputSignals& aSignals,
+                                         SetSignalsResolver&& aResolver);
+  mozilla::ipc::IPCResult RecvGetSignals(GetSignalsResolver&& aResolver);
+  mozilla::ipc::IPCResult RecvDrain(DrainResolver&& aResolver);
+  mozilla::ipc::IPCResult RecvFlush(bool aReceive, FlushResolver&& aResolver);
+  mozilla::ipc::IPCResult RecvAttachReadPipe(
+      const RefPtr<mozilla::ipc::DataPipeSender>& aReadPipeSender);
+  mozilla::ipc::IPCResult RecvAttachWritePipe(
+      const RefPtr<mozilla::ipc::DataPipeReceiver>& aWritePipeReceiver);
+  mozilla::ipc::IPCResult RecvUpdateSharingState(bool aConnected);
+  mozilla::ipc::IPCResult RecvClone(
+      mozilla::ipc::Endpoint<PSerialPortParent>&& aEndpoint);
+
+  void ActorDestroy(ActorDestroyReason aWhy) override;
+
+  bool PortIdMatches(const nsAString& aPortId) const {
+    return mPortId == aPortId;
+  }
+
+  void NotifyConnected();
+  void NotifyDisconnected();
+
+  SerialPortParent(const nsString& aPortId, uint64_t aBrowserId,
+                   SerialDeviceChangeProxy* aProxy = nullptr);
+
+ private:
+  ~SerialPortParent();
+
+  void StopPumpsBeforeClose();
+
+  void StopReadPump();
+  void DestroyPlatformReader();
+  void StopWritePump();
+  void NotifySharingStateChanged(bool aConnected);
+  void StartReadPump(
+      already_AddRefed<mozilla::ipc::DataPipeSender> aReadPipeSender);
+  void StartWritePump(
+      already_AddRefed<mozilla::ipc::DataPipeReceiver> aWritePipeReceiver);
+
+  const nsString mPortId;
+  const uint64_t mBrowserId;
+  bool mIsOpen = false;
+  bool mSharingConnected = false;
+  uint32_t mPipeCapacity = 0;
+
+  RefPtr<mozilla::ipc::DataPipeSender> mReadPipeSender;
+  RefPtr<mozilla::ipc::DataPipeReceiver> mWritePipeReceiver;
+
+  nsCOMPtr<nsIAsyncInputStream> mPlatformInputStream;
+  nsCOMPtr<nsISupports> mReadCopierCtx;
+
+  RefPtr<webserial::SerialPortWritePump> mWritePump;
+
+  RefPtr<SerialDeviceChangeProxy> mDeviceChangeProxy;
+
+  nsTArray<RefPtr<SerialPortParent>> mClones;
+};
+
+}  
+
+#endif  // mozilla_dom_SerialPortParent_h

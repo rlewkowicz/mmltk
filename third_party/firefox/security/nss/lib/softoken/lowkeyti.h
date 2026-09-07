@@ -1,0 +1,114 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef _LOWKEYTI_H_
+#define _LOWKEYTI_H_ 1
+
+#include "blapit.h"
+#include "prtypes.h"
+#include "plarena.h"
+#include "secitem.h"
+#include "secasn1t.h"
+#include "secoidt.h"
+#include "kyber.h"
+
+extern const SEC_ASN1Template nsslowkey_PQGParamsTemplate[];
+extern const SEC_ASN1Template nsslowkey_RSAPrivateKeyTemplate[];
+extern const SEC_ASN1Template nsslowkey_DSAPrivateKeyTemplate[];
+extern const SEC_ASN1Template nsslowkey_DSAPrivateKeyExportTemplate[];
+extern const SEC_ASN1Template nsslowkey_DHPrivateKeyTemplate[];
+extern const SEC_ASN1Template nsslowkey_DHPrivateKeyExportTemplate[];
+#define NSSLOWKEY_EC_PRIVATE_KEY_VERSION 1 /* as per SECG 1 C.4 */
+extern const SEC_ASN1Template nsslowkey_ECPrivateKeyTemplate[];
+extern const SEC_ASN1Template nsslowkey_PQBothSeedAndPrivateKeyTemplate[];
+extern const SEC_ASN1Template nsslowkey_PQSeedTemplate[];
+extern const SEC_ASN1Template nsslowkey_PQPrivateKeyTemplate[];
+
+extern const SEC_ASN1Template nsslowkey_PrivateKeyInfoTemplate[];
+extern const SEC_ASN1Template nsslowkey_EncryptedPrivateKeyInfoTemplate[];
+extern const SEC_ASN1Template nsslowkey_SubjectPublicKeyInfoTemplate[];
+extern const SEC_ASN1Template nsslowkey_RSAPublicKeyTemplate[];
+
+struct NSSLOWKEYAttributeStr {
+    SECItem attrType;
+    SECItem *attrValue;
+};
+typedef struct NSSLOWKEYAttributeStr NSSLOWKEYAttribute;
+
+struct NSSLOWKEYPrivateKeyInfoStr {
+    PLArenaPool *arena;
+    SECItem version;
+    SECAlgorithmID algorithm;
+    SECItem privateKey;
+    NSSLOWKEYAttribute **attributes;
+};
+typedef struct NSSLOWKEYPrivateKeyInfoStr NSSLOWKEYPrivateKeyInfo;
+#define NSSLOWKEY_PRIVATE_KEY_INFO_VERSION 0 /* what we *create* */
+
+struct NSSLOWKEYSubjectPublicKeyInfoStr {
+    PLArenaPool *arena;
+    SECAlgorithmID algorithm;
+    SECItem subjectPublicKey;
+};
+typedef struct NSSLOWKEYSubjectPublicKeyInfoStr NSSLOWKEYSubjectPublicKeyInfo;
+
+typedef enum {
+    NSSLOWKEYNullKey = 0,
+    NSSLOWKEYRSAKey = 1,
+    NSSLOWKEYDSAKey = 2,
+    NSSLOWKEYDHKey = 4,
+    NSSLOWKEYECKey = 5,
+    NSSLOWKEYMLDSAKey = 6,
+    NSSLOWKEYMLKEMKey = 7,
+} NSSLOWKEYType;
+
+typedef struct MLKEMPrivateKeyStr MLKEMPrivateKey;
+typedef struct MLKEMPublicKeyStr MLKEMPublicKey;
+
+struct MLKEMPrivateKeyStr {
+    KyberParams mlkemParams;
+    SECItem key;
+    SECItem seed;
+};
+
+struct MLKEMPublicKeyStr {
+    KyberParams mlkemParams;
+    SECItem key;
+};
+
+struct NSSLOWKEYPublicKeyStr {
+    PLArenaPool *arena;
+    NSSLOWKEYType keyType;
+    union {
+        RSAPublicKey rsa;
+        DSAPublicKey dsa;
+        DHPublicKey dh;
+        ECPublicKey ec;
+        MLDSAPublicKey mldsa;
+        MLKEMPublicKey mlkem;
+    } u;
+};
+typedef struct NSSLOWKEYPublicKeyStr NSSLOWKEYPublicKey;
+
+typedef struct GenPostQuantumPrivateKeyStr GenPostQuantumPrivateKey;
+struct GenPostQuantumPrivateKeyStr {
+    SECItem seedItem;
+    SECItem keyItem;
+};
+
+struct NSSLOWKEYPrivateKeyStr {
+    PLArenaPool *arena;
+    NSSLOWKEYType keyType;
+    union {
+        RSAPrivateKey rsa;
+        DSAPrivateKey dsa;
+        DHPrivateKey dh;
+        ECPrivateKey ec;
+        GenPostQuantumPrivateKey genpq; 
+        MLDSAPrivateKey mldsa;
+        MLKEMPrivateKey mlkem;
+    } u;
+};
+typedef struct NSSLOWKEYPrivateKeyStr NSSLOWKEYPrivateKey;
+
+#endif /* _LOWKEYTI_H_ */

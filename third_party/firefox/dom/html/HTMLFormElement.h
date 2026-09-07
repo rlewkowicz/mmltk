@@ -1,0 +1,318 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_HTMLFormElement_h
+#define mozilla_dom_HTMLFormElement_h
+
+#include "js/friend/DOMProxy.h"  // JS::ExpandoAndGeneration
+#include "mozilla/AsyncEventDispatcher.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/dom/BrowsingContext.h"
+#include "mozilla/dom/PopupBlocker.h"
+#include "mozilla/dom/RadioGroupContainer.h"
+#include "nsGenericHTMLElement.h"
+#include "nsIFormControl.h"
+#include "nsInterfaceHashtable.h"
+#include "nsThreadUtils.h"
+
+class nsIMutableArray;
+class nsIURI;
+
+namespace mozilla {
+class EventChainPostVisitor;
+class EventChainPreVisitor;
+namespace dom {
+class DialogFormSubmission;
+class HTMLFormControlsCollection;
+class HTMLFormSubmission;
+class HTMLImageElement;
+class FormData;
+
+class HTMLFormElement final : public nsGenericHTMLElement {
+  friend class HTMLFormControlsCollection;
+
+ public:
+  NS_IMPL_FROMNODE_HTML_WITH_TAG(HTMLFormElement, form)
+
+  explicit HTMLFormElement(already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo);
+
+  enum { FORM_CONTROL_LIST_HASHTABLE_LENGTH = 8 };
+
+  NS_DECL_ISUPPORTS_INHERITED
+
+  int32_t IndexOfContent(nsIContent* aContent);
+  nsGenericHTMLFormElement* GetDefaultSubmitElement() const;
+  bool IsDefaultSubmitElement(nsGenericHTMLFormElement* aElement) const {
+    return aElement == mDefaultSubmitElement;
+  }
+
+  bool ParseAttribute(int32_t aNamespaceID, nsAtom* aAttribute,
+                      const nsAString& aValue,
+                      nsIPrincipal* aMaybeScriptedPrincipal,
+                      nsAttrValue& aResult) override;
+  void GetEventTargetParent(EventChainPreVisitor& aVisitor) override;
+  void WillHandleEvent(EventChainPostVisitor& aVisitor) override;
+  MOZ_CAN_RUN_SCRIPT nsresult
+  PostHandleEvent(EventChainPostVisitor& aVisitor) override;
+
+  nsresult BindToTree(BindContext&, nsINode& aParent) override;
+  void UnbindFromTree(UnbindContext&) override;
+  void BeforeSetAttr(int32_t aNamespaceID, nsAtom* aName,
+                     const nsAttrValue* aValue, bool aNotify) override;
+
+  void ForgetCurrentSubmission();
+
+  nsresult Clone(dom::NodeInfo*, nsINode** aResult) const override;
+
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(HTMLFormElement,
+                                           nsGenericHTMLElement)
+
+  nsresult RemoveElement(nsGenericHTMLFormElement* aElement,
+                         bool aUpdateValidity);
+
+  nsresult RemoveElementFromTable(nsGenericHTMLFormElement* aElement,
+                                  const nsAString& aName);
+
+  nsresult AddElement(nsGenericHTMLFormElement* aElement, bool aUpdateValidity,
+                      bool aNotify);
+
+  nsresult AddElementToTable(nsGenericHTMLFormElement* aChild,
+                             const nsAString& aName);
+
+  nsresult RemoveImageElement(HTMLImageElement* aElement);
+
+  nsresult RemoveImageElementFromTable(HTMLImageElement* aElement,
+                                       const nsAString& aName);
+  nsresult AddImageElement(HTMLImageElement* aElement);
+
+  nsresult AddImageElementToTable(HTMLImageElement* aChild,
+                                  const nsAString& aName);
+
+  bool ImplicitSubmissionIsDisabled() const;
+
+  bool IsLastActiveElement(const nsGenericHTMLFormElement* aElement) const;
+
+  void OnSubmitClickBegin();
+  void OnSubmitClickEnd();
+
+  void UpdateValidity(bool aElementValidityState);
+
+  MOZ_CAN_RUN_SCRIPT
+  bool CheckValidFormSubmission();
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY nsresult ConstructEntryList(FormData*);
+
+
+  void GetAcceptCharset(DOMString& aValue) {
+    GetHTMLAttr(nsGkAtoms::acceptcharset, aValue);
+  }
+
+  void SetAcceptCharset(const nsAString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::acceptcharset, aValue, aRv);
+  }
+
+  void GetAction(nsString& aValue);
+  void SetAction(const nsAString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::action, aValue, aRv);
+  }
+
+  void GetAutocomplete(nsAString& aValue);
+  void SetAutocomplete(const nsAString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::autocomplete, aValue, aRv);
+  }
+
+  void GetEnctype(nsAString& aValue);
+  void SetEnctype(const nsAString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::enctype, aValue, aRv);
+  }
+
+  void GetEncoding(nsAString& aValue) { GetEnctype(aValue); }
+  void SetEncoding(const nsAString& aValue, ErrorResult& aRv) {
+    SetEnctype(aValue, aRv);
+  }
+
+  void GetMethod(nsAString& aValue);
+  void SetMethod(const nsAString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::method, aValue, aRv);
+  }
+
+  void GetName(DOMString& aValue) { GetHTMLAttr(nsGkAtoms::name, aValue); }
+
+  void SetName(const nsAString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::name, aValue, aRv);
+  }
+
+  bool NoValidate() const { return GetBoolAttr(nsGkAtoms::novalidate); }
+
+  void SetNoValidate(bool aValue, ErrorResult& aRv) {
+    SetHTMLBoolAttr(nsGkAtoms::novalidate, aValue, aRv);
+  }
+
+  void GetTarget(DOMString& aValue) { GetHTMLAttr(nsGkAtoms::target, aValue); }
+
+  void SetTarget(const nsAString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::target, aValue, aRv);
+  }
+
+  void GetRel(DOMString& aValue) { GetHTMLAttr(nsGkAtoms::rel, aValue); }
+  void SetRel(const nsAString& aRel, ErrorResult& aError) {
+    SetHTMLAttr(nsGkAtoms::rel, aRel, aError);
+  }
+  nsDOMTokenList* RelList();
+
+  HTMLFormControlsCollection* Elements();
+
+  int32_t Length();
+
+  MOZ_CAN_RUN_SCRIPT void MaybeSubmit(Element* aSubmitter);
+  MOZ_CAN_RUN_SCRIPT void MaybeReset(Element* aSubmitter);
+  void Submit(ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT void RequestSubmit(nsGenericHTMLElement* aSubmitter,
+                                        ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT void Reset();
+
+  bool CheckValidity() { return CheckFormValidity(nullptr); }
+
+  MOZ_CAN_RUN_SCRIPT
+  bool ReportValidity() { return CheckValidFormSubmission(); }
+
+  Element* IndexedGetter(uint32_t aIndex, bool& aFound);
+
+  already_AddRefed<nsISupports> ResolveName(const nsAString&);
+  already_AddRefed<nsISupports> NamedGetter(const nsAString& aName,
+                                            bool& aFound);
+
+  void GetSupportedNames(nsTArray<nsString>& aRetval);
+
+  JS::ExpandoAndGeneration mExpandoAndGeneration;
+
+ protected:
+  JSObject* WrapNode(JSContext*, JS::Handle<JSObject*> aGivenProto) override;
+
+  class RemoveElementRunnable;
+  friend class RemoveElementRunnable;
+
+  class RemoveElementRunnable : public Runnable {
+   public:
+    explicit RemoveElementRunnable(HTMLFormElement* aForm)
+        : Runnable("dom::HTMLFormElement::RemoveElementRunnable"),
+          mForm(aForm) {}
+
+    NS_IMETHOD Run() override {
+      mForm->HandleDefaultSubmitRemoval();
+      return NS_OK;
+    }
+
+   private:
+    RefPtr<HTMLFormElement> mForm;
+  };
+
+  MOZ_CAN_RUN_SCRIPT nsresult DoReset();
+
+  void HandleDefaultSubmitRemoval();
+
+  nsresult DoSubmit(Event* aEvent = nullptr);
+
+  nsresult BuildSubmission(HTMLFormSubmission** aFormSubmission, Event* aEvent);
+  nsresult SubmitSubmission(HTMLFormSubmission* aFormSubmission);
+
+  nsresult SubmitDialog(DialogFormSubmission* aFormSubmission);
+
+  nsresult DispatchBeforeSubmitChromeOnlyEvent(bool* aCancelSubmit);
+
+  nsresult DoSecureToInsecureSubmitCheck(nsIURI* aActionURL,
+                                         bool* aCancelSubmit);
+
+  bool CheckFormValidity(nsTArray<RefPtr<Element>>* aInvalidElements) const;
+
+  void Clear();
+
+  void AddToPastNamesMap(const nsAString& aName, nsISupports* aChild);
+
+  void RemoveElementFromPastNamesMap(Element* aElement);
+
+  nsresult AddElementToTableInternal(
+      nsInterfaceHashtable<nsStringHashKey, nsISupports>& aTable,
+      nsIContent* aChild, const nsAString& aName);
+
+  nsresult RemoveElementFromTableInternal(
+      nsInterfaceHashtable<nsStringHashKey, nsISupports>& aTable,
+      nsIContent* aChild, const nsAString& aName);
+
+ public:
+  void FlushPendingSubmission();
+
+  nsresult GetActionURL(nsIURI** aActionURL, Element* aOriginatingElement);
+
+  void GetSubmissionTarget(nsGenericHTMLElement* aSubmitter,
+                           nsAString& aTarget);
+
+  int32_t GetFormNumberForStateKey();
+
+  void NodeInfoChanged(Document* aOldDoc) override;
+
+ protected:
+  RefPtr<HTMLFormControlsCollection> mControls;
+
+  UniquePtr<HTMLFormSubmission> mPendingSubmission;
+
+  RefPtr<BrowsingContext> mTargetContext;
+  Maybe<uint64_t> mCurrentLoadId;
+
+  nsGenericHTMLFormElement* mDefaultSubmitElement;
+
+  nsGenericHTMLFormElement* mFirstSubmitInElements;
+
+  nsGenericHTMLFormElement* mFirstSubmitNotInElements;
+
+
+  TreeOrderedArray<HTMLImageElement*> mImageElements;
+
+
+  nsInterfaceHashtable<nsStringHashKey, nsISupports> mImageNameLookupTable;
+
+
+  nsInterfaceHashtable<nsStringHashKey, nsISupports> mPastNameLookupTable;
+
+  PopupBlocker::PopupControlState mSubmitPopupState;
+
+  RefPtr<nsDOMTokenList> mRelList;
+
+  int32_t mInvalidElementsCount;
+
+  int32_t mFormNumber;
+
+  bool mGeneratingSubmit;
+  bool mGeneratingReset;
+  bool mDeferSubmission;
+  bool mNotifiedObservers;
+  bool mNotifiedObserversResult;
+  bool mEverTriedInvalidSubmit;
+  bool mIsConstructingEntryList;
+  bool mIsFiringSubmissionEvents;
+
+ private:
+  bool IsSubmitting() const;
+
+  void SetDefaultSubmitElement(nsGenericHTMLFormElement*);
+
+  NotNull<const Encoding*> GetSubmitEncoding();
+
+  void MaybeFireFormRemoved();
+
+  MOZ_CAN_RUN_SCRIPT
+  void ReportInvalidUnfocusableElements(
+      const nsTArray<RefPtr<Element>>&& aInvalidElements);
+
+  ~HTMLFormElement();
+};
+
+}  
+
+}  
+
+#endif  // mozilla_dom_HTMLFormElement_h

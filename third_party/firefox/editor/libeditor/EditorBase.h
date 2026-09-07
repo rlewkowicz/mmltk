@@ -1,0 +1,1804 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_EditorBase_h
+#define mozilla_EditorBase_h
+
+#include "mozilla/intl/BidiEmbeddingLevel.h"
+#include "mozilla/Assertions.h"      // for MOZ_ASSERT, etc.
+#include "mozilla/EditAction.h"      // for EditAction and EditSubAction
+#include "mozilla/EditorDOMPoint.h"  // for EditorDOMPoint
+#include "mozilla/EditorForwards.h"
+#include "mozilla/EventForwards.h"       // for InputEventTargetRanges
+#include "mozilla/Likely.h"              // for MOZ_UNLIKELY, MOZ_LIKELY
+#include "mozilla/Maybe.h"               // for Maybe
+#include "mozilla/OwningNonNull.h"       // for OwningNonNull
+#include "mozilla/PendingStyles.h"       // for PendingStyle, PendingStyleCache
+#include "mozilla/RangeBoundary.h"       // for RawRangeBoundary, RangeBoundary
+#include "mozilla/SelectionState.h"      // for RangeUpdater, etc.
+#include "mozilla/TransactionManager.h"  // for TransactionManager
+#include "mozilla/WeakPtr.h"             // for WeakPtr
+#include "mozilla/dom/DataTransfer.h"    // for dom::DataTransfer
+#include "mozilla/dom/HTMLBRElement.h"   // for dom::HTMLBRElement
+#include "mozilla/dom/Selection.h"
+#include "mozilla/dom/Text.h"
+#include "nsAtom.h"    // for nsAtom, nsStaticAtom
+#include "nsCOMPtr.h"  // for already_AddRefed, nsCOMPtr
+#include "nsCycleCollectionParticipant.h"
+#include "nsGkAtoms.h"
+#include "nsIClipboard.h"            // for nsIClipboard::ClipboardType
+#include "nsIContentInlines.h"       // for nsINode::IsEditable()
+#include "nsIEditor.h"               // for nsIEditor, etc.
+#include "nsISelectionController.h"  // for nsISelectionController constants
+#include "nsISelectionListener.h"    // for nsISelectionListener
+#include "nsISupportsImpl.h"         // for EditorBase::Release, etc.
+#include "nsIWeakReferenceUtils.h"   // for nsWeakPtr
+#include "nsLiteralString.h"         // for NS_LITERAL_STRING
+#include "nsPIDOMWindow.h"           // for nsPIDOMWindowInner, etc.
+#include "nsString.h"                // for nsCString
+#include "nsTArray.h"                // for nsTArray and AutoTArray
+#include "nsWeakReference.h"         // for nsSupportsWeakReference
+#include "nscore.h"                  // for nsresult, nsAString, etc.
+
+#include <tuple>  // for std::tuple
+
+class nsAtom;
+class nsCaret;
+class nsIContent;
+class nsIDocumentEncoder;
+class nsIDocumentStateListener;
+class nsIEditActionListener;
+class nsINode;
+class nsIPrincipal;
+class nsISupports;
+class nsITransferable;
+class nsITransaction;
+class nsIWidget;
+class nsRange;
+
+namespace mozilla {
+class AlignStateAtSelection;
+class AutoTransactionsConserveSelection;
+class AutoUpdateViewBatch;
+class ErrorResult;
+class IMEContentObserver;
+class ListElementSelectionState;
+class ListItemElementSelectionState;
+class ParagraphStateAtSelection;
+class PresShell;
+class TextComposition;
+class TextInputListener;
+struct LimitersAndCaretData;
+namespace dom {
+class AbstractRange;
+class DataTransfer;
+class Document;
+class DragEvent;
+class Element;
+class EventTarget;
+class HTMLBRElement;
+}  
+
+namespace widget {
+struct IMEState;
+}  
+
+class EditorBase : public nsIEditor,
+                   public nsISelectionListener,
+                   public nsSupportsWeakReference {
+ public:
+
+  using DataTransfer = dom::DataTransfer;
+  using Document = dom::Document;
+  using Element = dom::Element;
+  using InterlinePosition = dom::Selection::InterlinePosition;
+  using Selection = dom::Selection;
+  using Text = dom::Text;
+
+  enum class EditorType { Text, HTML };
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(EditorBase, nsIEditor)
+
+  NS_DECL_NSIEDITOR
+
+  NS_DECL_NSISELECTIONLISTENER
+
+  explicit EditorBase(EditorType aEditorType);
+
+  [[nodiscard]] bool IsInitialized() const {
+    return mDocument && mDidPostCreate;
+  }
+  [[nodiscard]] bool IsBeingInitialized() const {
+    return mDocument && !mDidPostCreate;
+  }
+  [[nodiscard]] bool Destroyed() const { return mDidPreDestroy; }
+
+  Document* GetDocument() const { return mDocument; }
+  nsPIDOMWindowOuter* GetWindow() const;
+  nsPIDOMWindowInner* GetInnerWindow() const;
+
+  [[nodiscard]] bool MaybeNodeRemovalsObservedByDevTools() const;
+
+  bool MayHaveBeforeInputEventListenersForTelemetry() const {
+    if (const nsPIDOMWindowInner* window = GetInnerWindow()) {
+      return window->HasBeforeInputEventListenersForTelemetry();
+    }
+    return false;
+  }
+
+  bool MutationObserverHasObservedNodeForTelemetry() const {
+    if (const nsPIDOMWindowInner* window = GetInnerWindow()) {
+      return window->MutationObserverHasObservedNodeForTelemetry();
+    }
+    return false;
+  }
+
+  [[nodiscard]] static bool TreatAsUserInput(nsIPrincipal* aPrincipal);
+
+  PresShell* GetPresShell() const;
+  nsPresContext* GetPresContext() const;
+  already_AddRefed<nsCaret> GetCaretForSelection() const;
+
+  already_AddRefed<nsIWidget> GetWidget() const;
+
+  nsISelectionController* GetSelectionController() const;
+
+  nsresult GetSelection(SelectionType aSelectionType,
+                        Selection** aSelection) const;
+
+  Selection* GetSelection(
+      SelectionType aSelectionType = SelectionType::eNormal) const {
+    if (aSelectionType == SelectionType::eNormal &&
+        IsEditActionDataAvailable()) {
+      return &SelectionRef();
+    }
+    nsISelectionController* sc = GetSelectionController();
+    if (!sc) {
+      return nullptr;
+    }
+    Selection* selection = sc->GetSelection(ToRawSelectionType(aSelectionType));
+    return selection;
+  }
+
+  [[nodiscard]] nsIContent* GetSelectionAncestorLimiter() const {
+    Selection* selection = GetSelection(SelectionType::eNormal);
+    return selection ? selection->GetAncestorLimiter() : nullptr;
+  }
+
+  already_AddRefed<DataTransfer> CreateDataTransferForPaste(
+      EventMessage aEventMessage,
+      nsIClipboard::ClipboardType aClipboardType) const;
+
+  Element* GetRoot() const { return mRootElement; }
+
+  Element* GetExposedRoot() const;
+
+  virtual dom::EditContext* ComputeEditContext() const { return nullptr; }
+
+  void SetTextInputListener(TextInputListener* aTextInputListener);
+
+  void SetIMEContentObserver(IMEContentObserver* aIMEContentObserver);
+
+  TextComposition* GetComposition() const;
+
+  [[nodiscard]] virtual Result<widget::IMEState, nsresult>
+  GetPreferredIMEState() const = 0;
+
+  bool IsIMEComposing() const;
+
+  nsresult CommitComposition();
+
+  MOZ_CAN_RUN_SCRIPT nsresult
+  ToggleTextDirectionAsAction(nsIPrincipal* aPrincipal = nullptr);
+
+  enum class TextDirection {
+    eLTR,
+    eRTL,
+  };
+  MOZ_CAN_RUN_SCRIPT void SwitchTextDirectionTo(TextDirection aTextDirection);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY nsresult FinalizeSelection();
+
+  bool IsSelectionEditable();
+
+  size_t NumberOfUndoItems() const {
+    return mTransactionManager ? mTransactionManager->NumberOfUndoItems() : 0;
+  }
+  size_t NumberOfRedoItems() const {
+    return mTransactionManager ? mTransactionManager->NumberOfRedoItems() : 0;
+  }
+
+  int32_t NumberOfMaximumTransactions() const {
+    return mTransactionManager
+               ? mTransactionManager->NumberOfMaximumTransactions()
+               : 0;
+  }
+
+  bool IsUndoRedoEnabled() const {
+    return mTransactionManager &&
+           mTransactionManager->NumberOfMaximumTransactions();
+  }
+
+  bool CanUndo() const {
+    return IsUndoRedoEnabled() && NumberOfUndoItems() > 0;
+  }
+  bool CanRedo() const {
+    return IsUndoRedoEnabled() && NumberOfRedoItems() > 0;
+  }
+
+  bool EnableUndoRedo(int32_t aMaxTransactionCount = -1) {
+    if (!mTransactionManager) {
+      mTransactionManager = new TransactionManager();
+    }
+    return mTransactionManager->EnableUndoRedo(aMaxTransactionCount);
+  }
+  bool DisableUndoRedo() {
+    if (!mTransactionManager) {
+      return true;
+    }
+    return mTransactionManager->DisableUndoRedo();
+  }
+  bool ClearUndoRedo() {
+    if (!mTransactionManager) {
+      return true;
+    }
+    return mTransactionManager->ClearUndoRedo();
+  }
+
+  bool AreClipboardCommandsUnconditionallyEnabled() const;
+
+  MOZ_CAN_RUN_SCRIPT bool IsCutCommandEnabled() const;
+
+  MOZ_CAN_RUN_SCRIPT bool IsCopyCommandEnabled() const;
+
+  bool IsCopyToClipboardAllowed() const {
+    AutoEditActionDataSetter editActionData(*this, EditAction::eNotEditing);
+    if (NS_WARN_IF(!editActionData.CanHandle())) {
+      return false;
+    }
+    return IsCopyToClipboardAllowedInternal();
+  }
+
+  MOZ_CAN_RUN_SCRIPT bool WillHandleMouseButtonEvent(
+      WidgetMouseEvent& aMouseEvent);
+
+  MOZ_CAN_RUN_SCRIPT nsresult HandleDropEvent(dom::DragEvent* aDropEvent);
+
+  MOZ_CAN_RUN_SCRIPT virtual nsresult HandleKeyPressEvent(
+      WidgetKeyboardEvent* aKeyboardEvent);
+
+  virtual dom::EventTarget* GetDOMEventTarget() const = 0;
+
+  nsresult OnCompositionStart(WidgetCompositionEvent& aCompositionStartEvent);
+
+  MOZ_CAN_RUN_SCRIPT nsresult
+  OnCompositionChange(WidgetCompositionEvent& aCompositionChangeEvent);
+
+  MOZ_CAN_RUN_SCRIPT void OnCompositionEnd(
+      WidgetCompositionEvent& aCompositionEndEvent);
+
+  uint32_t Flags() const { return mFlags; }
+
+  MOZ_CAN_RUN_SCRIPT nsresult AddFlags(uint32_t aFlags) {
+    const uint32_t kOldFlags = Flags();
+    const uint32_t kNewFlags = (kOldFlags | aFlags);
+    if (kNewFlags == kOldFlags) {
+      return NS_OK;
+    }
+    return SetFlags(kNewFlags);  
+  }
+  MOZ_CAN_RUN_SCRIPT nsresult RemoveFlags(uint32_t aFlags) {
+    const uint32_t kOldFlags = Flags();
+    const uint32_t kNewFlags = (kOldFlags & ~aFlags);
+    if (kNewFlags == kOldFlags) {
+      return NS_OK;
+    }
+    return SetFlags(kNewFlags);  
+  }
+  MOZ_CAN_RUN_SCRIPT nsresult AddAndRemoveFlags(uint32_t aAddingFlags,
+                                                uint32_t aRemovingFlags) {
+    MOZ_ASSERT(!(aAddingFlags & aRemovingFlags),
+               "Same flags are specified both adding and removing");
+    const uint32_t kOldFlags = Flags();
+    const uint32_t kNewFlags = ((kOldFlags | aAddingFlags) & ~aRemovingFlags);
+    if (kNewFlags == kOldFlags) {
+      return NS_OK;
+    }
+    return SetFlags(kNewFlags);  
+  }
+
+  bool IsSingleLineEditor() const {
+    const bool isSingleLineEditor =
+        (mFlags & nsIEditor::eEditorSingleLineMask) != 0;
+    MOZ_ASSERT_IF(isSingleLineEditor, IsTextEditor());
+    return isSingleLineEditor;
+  }
+
+  bool IsPasswordEditor() const {
+    const bool isPasswordEditor =
+        (mFlags & nsIEditor::eEditorPasswordMask) != 0;
+    MOZ_ASSERT_IF(isPasswordEditor, IsTextEditor());
+    return isPasswordEditor;
+  }
+
+  bool IsRightToLeft() const {
+    return (mFlags & nsIEditor::eEditorRightToLeft) != 0;
+  }
+  bool IsLeftToRight() const {
+    return (mFlags & nsIEditor::eEditorLeftToRight) != 0;
+  }
+
+  bool IsReadonly() const {
+    return (mFlags & nsIEditor::eEditorReadonlyMask) != 0;
+  }
+
+  bool IsMailEditor() const {
+    return (mFlags & nsIEditor::eEditorMailMask) != 0;
+  }
+
+  bool IsInteractionAllowed() const {
+    const bool isInteractionAllowed =
+        (mFlags & nsIEditor::eEditorAllowInteraction) != 0;
+    MOZ_ASSERT_IF(isInteractionAllowed, IsHTMLEditor());
+    return isInteractionAllowed;
+  }
+
+  bool HasIndependentSelection() const {
+    MOZ_ASSERT_IF(mSelectionController, IsTextEditor());
+    return !!mSelectionController;
+  }
+
+  bool IsModifiable() const { return !IsReadonly(); }
+
+  bool IsInEditSubAction() const { return mIsInEditSubAction; }
+
+  virtual bool IsEmpty() const = 0;
+
+  void SuppressDispatchingInputEvent(bool aSuppress) {
+    mDispatchInputEvent = !aSuppress;
+  }
+
+  bool IsSuppressingDispatchingInputEvent() const {
+    return !mDispatchInputEvent;
+  }
+
+  bool OutputsMozDirty() const {
+    return !IsInteractionAllowed() || IsMailEditor();
+  }
+
+  virtual Element* GetFocusedElement() const;
+
+  virtual bool IsAcceptableInputEvent(WidgetGUIEvent* aGUIEvent) const;
+
+  [[nodiscard]] virtual Element* FindSelectionRoot(const nsINode& aNode) const;
+
+  MOZ_CAN_RUN_SCRIPT virtual nsresult OnFocus(
+      const nsINode& aOriginalEventTargetNode);
+
+  MOZ_CAN_RUN_SCRIPT virtual void PostHandleFocusEvent(
+      const nsINode& aFocusEventTargetNode);
+
+  MOZ_CAN_RUN_SCRIPT virtual nsresult OnBlur(
+      const dom::EventTarget* aEventTarget) = 0;
+
+  MOZ_CAN_RUN_SCRIPT nsresult CutAsAction(nsIPrincipal* aPrincipal = nullptr);
+
+  virtual bool CanPaste(nsIClipboard::ClipboardType aClipboardType) const = 0;
+
+  MOZ_CAN_RUN_SCRIPT nsresult UndoAsAction(uint32_t aCount,
+                                           nsIPrincipal* aPrincipal = nullptr);
+  MOZ_CAN_RUN_SCRIPT nsresult RedoAsAction(uint32_t aCount,
+                                           nsIPrincipal* aPrincipal = nullptr);
+
+  MOZ_CAN_RUN_SCRIPT nsresult InsertTextAsAction(
+      const nsAString& aStringToInsert, nsIPrincipal* aPrincipal = nullptr);
+
+  MOZ_CAN_RUN_SCRIPT virtual nsresult InsertLineBreakAsAction(
+      nsIPrincipal* aPrincipal = nullptr) = 0;
+
+  bool CanDeleteSelection() const {
+    AutoEditActionDataSetter editActionData(*this, EditAction::eNotEditing);
+    if (NS_WARN_IF(!editActionData.CanHandle())) {
+      return false;
+    }
+    return IsModifiable() && !SelectionRef().IsCollapsed();
+  }
+
+  MOZ_CAN_RUN_SCRIPT nsresult
+  DeleteSelectionAsAction(nsIEditor::EDirection aDirectionAndAmount,
+                          nsIEditor::EStripWrappers aStripWrappers,
+                          nsIPrincipal* aPrincipal = nullptr);
+
+  enum class AllowBeforeInputEventCancelable {
+    No,
+    Yes,
+  };
+
+  enum class PreventSetSelection {
+    No,
+    Yes,
+  };
+
+  MOZ_CAN_RUN_SCRIPT nsresult ReplaceTextAsAction(
+      const nsAString& aString, nsRange* aReplaceRange,
+      AllowBeforeInputEventCancelable aAllowBeforeInputEventCancelable,
+      PreventSetSelection aPreventSetSelection = PreventSetSelection::No,
+      nsIPrincipal* aPrincipal = nullptr);
+
+  virtual bool CanPasteTransferable(nsITransferable* aTransferable) = 0;
+
+  enum class DispatchPasteEvent { No, Yes };
+  MOZ_CAN_RUN_SCRIPT nsresult
+  PasteAsAction(nsIClipboard::ClipboardType aClipboardType,
+                DispatchPasteEvent aDispatchPasteEvent,
+                DataTransfer* aDataTransfer = nullptr,
+                nsIPrincipal* aPrincipal = nullptr);
+
+  MOZ_CAN_RUN_SCRIPT nsresult PasteTransferableAsAction(
+      nsITransferable* aTransferable, DispatchPasteEvent aDispatchPasteEvent,
+      nsIPrincipal* aPrincipal = nullptr);
+
+  MOZ_CAN_RUN_SCRIPT nsresult
+  PasteAsQuotationAsAction(nsIClipboard::ClipboardType aClipboardType,
+                           DispatchPasteEvent aDispatchPasteEvent,
+                           DataTransfer* aDataTransfer = nullptr,
+                           nsIPrincipal* aPrincipal = nullptr);
+
+  [[nodiscard]] bool IsDispatchingInputEvent() const {
+    return mEditActionData && mEditActionData->IsDispatchingInputEvent();
+  }
+
+ protected:  
+  class AutoEditActionDataSetter;
+
+  struct MOZ_STACK_CLASS TopLevelEditSubActionData final {
+    friend class AutoEditActionDataSetter;
+
+    TopLevelEditSubActionData(const TopLevelEditSubActionData& aOther) = delete;
+
+    RefPtr<RangeItem> mSelectedRange;
+
+    RefPtr<nsRange> mChangedRange;
+
+    Maybe<AutoPendingStyleCacheArray> mCachedPendingStyles;
+
+    bool mDidDeleteSelection;
+
+    bool mDidExplicitlySetInterLine;
+
+    bool mDidDeleteNonCollapsedRange;
+
+    bool mDidDeleteEmptyParentBlocks;
+
+    bool mRestoreContentEditableCount;
+
+    bool mDidNormalizeWhitespaces;
+
+    bool mNeedsToCleanUpEmptyElements;
+
+    void DidCreateElement(EditorBase& aEditorBase, Element& aNewElement);
+    void DidInsertContent(EditorBase& aEditorBase, nsIContent& aNewContent);
+    void WillDeleteContent(EditorBase& aEditorBase,
+                           nsIContent& aRemovingContent);
+    void DidSplitContent(EditorBase& aEditorBase, nsIContent& aSplitContent,
+                         nsIContent& aNewContent);
+    void DidJoinContents(EditorBase& aEditorBase,
+                         const EditorRawDOMPoint& aJoinedPoint);
+    void DidInsertText(EditorBase& aEditorBase,
+                       const EditorRawDOMPoint& aInsertionBegin,
+                       const EditorRawDOMPoint& aInsertionEnd);
+    void DidDeleteText(EditorBase& aEditorBase,
+                       const EditorRawDOMPoint& aStartInTextNode);
+    void WillDeleteRange(EditorBase& aEditorBase,
+                         const EditorRawDOMPoint& aStart,
+                         const EditorRawDOMPoint& aEnd);
+
+   private:
+    void Clear() {
+      mDidExplicitlySetInterLine = false;
+      if (!mSelectedRange) {
+        return;
+      }
+      mSelectedRange->Clear();
+      mChangedRange->Reset();
+      if (mCachedPendingStyles.isSome()) {
+        mCachedPendingStyles->Clear();
+      }
+      mDidDeleteSelection = false;
+      mDidDeleteNonCollapsedRange = false;
+      mDidDeleteEmptyParentBlocks = false;
+      mRestoreContentEditableCount = false;
+      mDidNormalizeWhitespaces = false;
+      mNeedsToCleanUpEmptyElements = true;
+    }
+
+    nsresult AddNodeToChangedRange(const HTMLEditor& aHTMLEditor,
+                                   nsINode& aNode);
+
+    nsresult AddPointToChangedRange(const HTMLEditor& aHTMLEditor,
+                                    const EditorRawDOMPoint& aPoint);
+
+    nsresult AddRangeToChangedRange(const HTMLEditor& aHTMLEditor,
+                                    const EditorRawDOMPoint& aStart,
+                                    const EditorRawDOMPoint& aEnd);
+
+    TopLevelEditSubActionData() = default;
+  };
+
+  struct MOZ_STACK_CLASS EditSubActionData final {
+    bool mAdjustChangedRangeFromListener;
+
+   private:
+    void Clear() { mAdjustChangedRangeFromListener = true; }
+
+    friend EditorBase;
+  };
+
+ protected:  
+  enum class SettingDataTransfer {
+    eWithFormat,
+    eWithoutFormat,
+  };
+
+  class MOZ_STACK_CLASS AutoEditActionDataSetter final {
+   public:
+    AutoEditActionDataSetter(const EditorBase& aEditorBase,
+                             EditAction aEditAction,
+                             nsIPrincipal* aPrincipal = nullptr);
+    AutoEditActionDataSetter() = delete;
+    AutoEditActionDataSetter(const AutoEditActionDataSetter& aOther) = delete;
+    ~AutoEditActionDataSetter();
+
+    void SetSelectionCreatedByDoubleclick(bool aSelectionCreatedByDoubleclick) {
+      mSelectionCreatedByDoubleclick = aSelectionCreatedByDoubleclick;
+    }
+
+    [[nodiscard]] bool SelectionCreatedByDoubleclick() const {
+      return mSelectionCreatedByDoubleclick;
+    }
+
+    void UpdateEditAction(EditAction aEditAction) {
+      MOZ_ASSERT(!mHasTriedToDispatchBeforeInputEvent,
+                 "It's too late to update EditAction since this may have "
+                 "already dispatched a beforeinput event");
+      mEditAction = aEditAction;
+    }
+
+    [[nodiscard]] bool CanHandle() const {
+#ifdef DEBUG
+      mHasCanHandleChecked = true;
+#endif  // #ifdef DEBUG
+      if (mEditAction != EditAction::eInitializing &&
+          HasEditorDestroyedDuringHandlingEditActionAndNotYetReinitialized()) {
+        NS_WARNING("Editor was destroyed during an edit action being handled");
+        return false;
+      }
+      return IsDataAvailable();
+    }
+    [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult
+    CanHandleAndMaybeDispatchBeforeInputEvent() {
+      if (MOZ_UNLIKELY(NS_WARN_IF(!CanHandle()))) {
+        return NS_ERROR_NOT_INITIALIZED;
+      }
+      nsresult rv = MaybeFlushPendingNotifications();
+      if (MOZ_UNLIKELY(NS_FAILED(rv))) {
+        return rv;
+      }
+      return MaybeDispatchBeforeInputEvent();
+    }
+    [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult
+    CanHandleAndFlushPendingNotifications() {
+      if (MOZ_UNLIKELY(NS_WARN_IF(!CanHandle()))) {
+        return NS_ERROR_NOT_INITIALIZED;
+      }
+      MOZ_ASSERT(MayEditActionRequireLayout(mRawEditAction));
+      return MaybeFlushPendingNotifications();
+    }
+
+    [[nodiscard]] bool IsDataAvailable() const {
+      return mSelection && mEditorBase.mDocument;
+    }
+
+    [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult MaybeDispatchBeforeInputEvent(
+        nsIEditor::EDirection aDeleteDirectionAndAmount = nsIEditor::eNone);
+
+    void MarkAsBeforeInputHasBeenDispatched() {
+      MOZ_ASSERT(!HasTriedToDispatchBeforeInputEvent());
+      MOZ_ASSERT(mEditAction == EditAction::ePaste ||
+                 mEditAction == EditAction::ePasteAsQuotation ||
+                 mEditAction == EditAction::eDrop);
+      mHasTriedToDispatchBeforeInputEvent = true;
+    }
+
+    void MarkAsHandled() {
+      MOZ_ASSERT(!mHandled);
+      mHandled = true;
+    }
+
+    bool ShouldAlreadyHaveHandledBeforeInputEventDispatching() const {
+      return !HasTriedToDispatchBeforeInputEvent() &&
+             NeedsBeforeInputEventHandling(mEditAction) &&
+             IsBeforeInputEventEnabled() 
+          ;
+    }
+
+    bool HasTriedToDispatchBeforeInputEvent() const {
+      return mHasTriedToDispatchBeforeInputEvent;
+    }
+
+    bool IsCanceled() const { return mBeforeInputEventCanceled; }
+
+    MOZ_KNOWN_LIVE Selection& SelectionRef() const {
+      MOZ_ASSERT(!mSelection ||
+                 (mSelection->GetType() == SelectionType::eNormal));
+      return *mSelection;
+    }
+
+    LimitersAndCaretData SelectionLimitersAndCaretData() const;
+
+    Text* GetCachedTextNode() const {
+      MOZ_ASSERT(mEditorBase.IsTextEditor());
+      return mTextNode;
+    }
+
+    nsIPrincipal* GetPrincipal() const { return mPrincipal; }
+    EditAction GetEditAction() const { return mEditAction; }
+
+    dom::EditContext* GetEditContext() const { return mEditContext; }
+    bool EditContextHasBeenChanged() const {
+      return mEditContext != mEditorBase.ComputeEditContext();
+    }
+
+    void SetData(const nsAString& aData) {
+      MOZ_ASSERT(!mHasTriedToDispatchBeforeInputEvent,
+                 "It's too late to set data since this may have already "
+                 "dispatched a beforeinput event");
+      mData = aData;
+    }
+    const nsString& GetData() const { return mData; }
+
+    void SetColorData(const nsAString& aData);
+
+    void InitializeDataTransfer(DataTransfer* aDataTransfer);
+    void InitializeDataTransfer(nsITransferable* aTransferable);
+    void InitializeDataTransfer(const nsAString& aString);
+    void InitializeDataTransferWithClipboard(
+        SettingDataTransfer aSettingDataTransfer, DataTransfer* aDataTransfer,
+        nsIClipboard::ClipboardType aClipboardType);
+    DataTransfer* GetDataTransfer() const { return mDataTransfer; }
+
+    void AppendTargetRange(dom::StaticRange& aTargetRange);
+    void AppendTargetRange(RefPtr<dom::StaticRange>&& aTargetRange);
+
+    void MakeBeforeInputEventNonCancelable() {
+      mMakeBeforeInputEventNonCancelable = true;
+    }
+
+    void NotifyOfDispatchingClipboardEvent() {
+      MOZ_ASSERT(NeedsToDispatchClipboardEvent());
+      MOZ_ASSERT(!mHasTriedToDispatchClipboardEvent);
+      mHasTriedToDispatchClipboardEvent = true;
+    }
+
+    void Abort() { mAborted = true; }
+    bool IsAborted() const { return mAborted; }
+
+    void OnEditorDestroy() {
+      if (!mHandled && mHasTriedToDispatchBeforeInputEvent) {
+        mEditorWasDestroyedDuringHandlingEditAction = true;
+        mEditorWasReinitialized = false;
+      }
+      if (mParentData) {
+        mParentData->OnEditorDestroy();
+      }
+    }
+    void OnEditorInitialized();
+    [[nodiscard]] bool HasEditorDestroyedDuringHandlingEditAction() const {
+      return mEditorWasDestroyedDuringHandlingEditAction;
+    }
+    [[nodiscard]] bool
+    HasEditorDestroyedDuringHandlingEditActionAndNotYetReinitialized() const {
+      return mEditorWasDestroyedDuringHandlingEditAction &&
+             !mEditorWasReinitialized;
+    }
+
+    void SetTopLevelEditSubAction(EditSubAction aEditSubAction,
+                                  EDirection aDirection = eNone) {
+      mTopLevelEditSubAction = aEditSubAction;
+      TopLevelEditSubActionDataRef().Clear();
+      switch (mTopLevelEditSubAction) {
+        case EditSubAction::eInsertNode:
+        case EditSubAction::eMoveNode:
+        case EditSubAction::eCreateNode:
+        case EditSubAction::eSplitNode:
+        case EditSubAction::eInsertText:
+        case EditSubAction::eInsertTextComingFromIME:
+        case EditSubAction::eSetTextProperty:
+        case EditSubAction::eRemoveTextProperty:
+        case EditSubAction::eRemoveAllTextProperties:
+        case EditSubAction::eSetText:
+        case EditSubAction::eInsertLineBreak:
+        case EditSubAction::eInsertParagraphSeparator:
+        case EditSubAction::eCreateOrChangeList:
+        case EditSubAction::eIndent:
+        case EditSubAction::eOutdent:
+        case EditSubAction::eSetOrClearAlignment:
+        case EditSubAction::eCreateOrRemoveBlock:
+        case EditSubAction::eFormatBlockForHTMLCommand:
+        case EditSubAction::eMergeBlockContents:
+        case EditSubAction::eRemoveList:
+        case EditSubAction::eCreateOrChangeDefinitionListItem:
+        case EditSubAction::eInsertElement:
+        case EditSubAction::eInsertQuotation:
+        case EditSubAction::eInsertQuotedText:
+        case EditSubAction::ePasteHTMLContent:
+        case EditSubAction::eInsertHTMLSource:
+        case EditSubAction::eSetPositionToAbsolute:
+        case EditSubAction::eSetPositionToStatic:
+        case EditSubAction::eDecreaseZIndex:
+        case EditSubAction::eIncreaseZIndex:
+          MOZ_ASSERT(aDirection == eNext);
+          mDirectionOfTopLevelEditSubAction = eNext;
+          break;
+        case EditSubAction::eJoinNodes:
+        case EditSubAction::eDeleteText:
+          MOZ_ASSERT(aDirection == ePrevious);
+          mDirectionOfTopLevelEditSubAction = ePrevious;
+          break;
+        case EditSubAction::eUndo:
+        case EditSubAction::eRedo:
+        case EditSubAction::eComputeTextToOutput:
+        case EditSubAction::eCreatePaddingBRElementForEmptyEditor:
+        case EditSubAction::eMaintainWhiteSpaceVisibility:
+        case EditSubAction::eNone:
+          MOZ_ASSERT(aDirection == eNone);
+          mDirectionOfTopLevelEditSubAction = eNone;
+          break;
+        case EditSubAction::eDeleteNode:
+        case EditSubAction::eDeleteSelectedContent:
+          mDirectionOfTopLevelEditSubAction = aDirection;
+          break;
+      }
+    }
+    EditSubAction GetTopLevelEditSubAction() const {
+      MOZ_ASSERT(IsDataAvailable());
+      return mTopLevelEditSubAction;
+    }
+    EDirection GetDirectionOfTopLevelEditSubAction() const {
+      return mDirectionOfTopLevelEditSubAction;
+    }
+
+    const TopLevelEditSubActionData& TopLevelEditSubActionDataRef() const {
+      return mParentData ? mParentData->TopLevelEditSubActionDataRef()
+                         : mTopLevelEditSubActionData;
+    }
+    TopLevelEditSubActionData& TopLevelEditSubActionDataRef() {
+      return mParentData ? mParentData->TopLevelEditSubActionDataRef()
+                         : mTopLevelEditSubActionData;
+    }
+
+    const EditSubActionData& EditSubActionDataRef() const {
+      return mEditSubActionData;
+    }
+    EditSubActionData& EditSubActionDataRef() { return mEditSubActionData; }
+
+    SelectionState& SavedSelectionRef() {
+      return mParentData ? mParentData->SavedSelectionRef() : mSavedSelection;
+    }
+    const SelectionState& SavedSelectionRef() const {
+      return mParentData ? mParentData->SavedSelectionRef() : mSavedSelection;
+    }
+
+    RangeUpdater& RangeUpdaterRef() {
+      return mParentData ? mParentData->RangeUpdaterRef() : mRangeUpdater;
+    }
+    const RangeUpdater& RangeUpdaterRef() const {
+      return mParentData ? mParentData->RangeUpdaterRef() : mRangeUpdater;
+    }
+
+    MOZ_CAN_RUN_SCRIPT void UpdateSelectionCache(Selection& aSelection);
+
+    bool IsDispatchingInputEvent() const {
+      return mDispatchingInputEvent ||
+             (mParentData && mParentData->IsDispatchingInputEvent());
+    }
+    void WillDispatchInputEvent() {
+      MOZ_ASSERT(!mDispatchingInputEvent);
+      mDispatchingInputEvent = true;
+    }
+    void DidDispatchInputEvent() {
+      MOZ_ASSERT(mDispatchingInputEvent);
+      mDispatchingInputEvent = false;
+    }
+
+   private:
+    bool IsBeforeInputEventEnabled() const;
+
+    [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult
+    MaybeFlushPendingNotifications() const;
+
+    static bool NeedsBeforeInputEventHandling(EditAction aEditAction) {
+      MOZ_ASSERT(aEditAction != EditAction::eNone);
+      switch (aEditAction) {
+        case EditAction::eNone:
+        case EditAction::eNotEditing:
+        case EditAction::eInitializing:
+        case NS_EDIT_ACTION_CASES_ACCESSING_TABLE_DATA_WITHOUT_EDITING:
+        case EditAction::eUnknown:
+        case EditAction::eHidePassword:
+        case EditAction::eStartComposition:
+        case EditAction::eEnableOrDisableCSS:
+        case EditAction::eEnableOrDisableAbsolutePositionEditor:
+        case EditAction::eEnableOrDisableResizer:
+        case EditAction::eEnableOrDisableInlineTableEditingUI:
+        case EditAction::eSetWrapWidth:
+        case EditAction::eResizingElement:
+        case EditAction::eMovingElement:
+        case EditAction::eCreatePaddingBRElementForEmptyEditor:
+          return false;
+        default:
+          return true;
+      }
+    }
+
+    bool NeedsToDispatchClipboardEvent() const {
+      if (mHasTriedToDispatchClipboardEvent) {
+        return false;
+      }
+      switch (mEditAction) {
+        case EditAction::ePaste:
+        case EditAction::ePasteAsQuotation:
+        case EditAction::eCut:
+        case EditAction::eCopy:
+          return true;
+        default:
+          return false;
+      }
+    }
+
+    void MarkEditActionCanceled();
+
+    EditorBase& mEditorBase;
+    RefPtr<Selection> mSelection;
+    nsTArray<OwningNonNull<Selection>> mRetiredSelections;
+
+    RefPtr<Text> mTextNode;
+
+    bool mSelectionCreatedByDoubleclick{false};
+
+    nsCOMPtr<nsIPrincipal> mPrincipal;
+    AutoEditActionDataSetter* mParentData;
+
+    SelectionState mSavedSelection;
+
+    RangeUpdater mRangeUpdater;
+
+    nsString mData;
+
+    RefPtr<DataTransfer> mDataTransfer;
+
+    OwningNonNullStaticRangeArray mTargetRanges;
+
+    RefPtr<dom::EditContext> mEditContext;
+
+    TopLevelEditSubActionData mTopLevelEditSubActionData;
+
+    EditSubActionData mEditSubActionData;
+
+    EditAction mEditAction;
+    EditAction mRawEditAction;
+
+    EditSubAction mTopLevelEditSubAction = EditSubAction::eNone;
+
+    EDirection mDirectionOfTopLevelEditSubAction = nsIEditor::eNone;
+
+    bool mAborted = false;
+
+    bool mHasTriedToDispatchBeforeInputEvent = false;
+    bool mBeforeInputEventCanceled = false;
+    bool mMakeBeforeInputEventNonCancelable = false;
+    bool mHasTriedToDispatchClipboardEvent = false;
+    bool mEditorWasDestroyedDuringHandlingEditAction;
+    bool mEditorWasReinitialized;
+    bool mHandled = false;
+    bool mDispatchingInputEvent = false;
+
+#ifdef DEBUG
+    mutable bool mHasCanHandleChecked = false;
+#endif  // #ifdef DEBUG
+  };
+
+  void UpdateEditActionData(const nsAString& aData) {
+    mEditActionData->SetData(aData);
+  }
+
+  void NotifyOfDispatchingClipboardEvent() {
+    MOZ_ASSERT(mEditActionData);
+    mEditActionData->NotifyOfDispatchingClipboardEvent();
+  }
+
+ protected:  
+
+  bool IsEditActionCanceled() const {
+    MOZ_ASSERT(mEditActionData);
+    return mEditActionData->IsCanceled();
+  }
+
+  bool ShouldAlreadyHaveHandledBeforeInputEventDispatching() const {
+    MOZ_ASSERT(mEditActionData);
+    return mEditActionData
+        ->ShouldAlreadyHaveHandledBeforeInputEventDispatching();
+  }
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult MaybeDispatchBeforeInputEvent() {
+    MOZ_ASSERT(mEditActionData);
+    return mEditActionData->MaybeDispatchBeforeInputEvent();
+  }
+
+  void MarkAsBeforeInputHasBeenDispatched() {
+    MOZ_ASSERT(mEditActionData);
+    return mEditActionData->MarkAsBeforeInputHasBeenDispatched();
+  }
+
+  bool HasTriedToDispatchBeforeInputEvent() const {
+    return mEditActionData &&
+           mEditActionData->HasTriedToDispatchBeforeInputEvent();
+  }
+
+  bool IsEditActionDataAvailable() const {
+    return mEditActionData && mEditActionData->IsDataAvailable();
+  }
+
+  bool IsTopLevelEditSubActionDataAvailable() const {
+    return mEditActionData && !!GetTopLevelEditSubAction();
+  }
+
+  bool IsEditActionAborted() const {
+    MOZ_ASSERT(mEditActionData);
+    return mEditActionData->IsAborted();
+  }
+
+  nsresult GetDataFromDataTransferOrClipboard(
+      DataTransfer* aDataTransfer, nsITransferable* aTransferable,
+      nsIClipboard::ClipboardType aClipboardType) const;
+
+  MOZ_KNOWN_LIVE Selection& SelectionRef() const {
+    MOZ_ASSERT(mEditActionData);
+    MOZ_ASSERT(mEditActionData->SelectionRef().GetType() ==
+               SelectionType::eNormal);
+    return mEditActionData->SelectionRef();
+  }
+  LimitersAndCaretData SelectionLimitersAndCaretData() const;
+
+  Text* GetCachedTextNode() {
+    MOZ_ASSERT(IsTextEditor());
+    return mEditActionData ? mEditActionData->GetCachedTextNode() : nullptr;
+  }
+
+  const Text* GetCachedTextNode() const {
+    MOZ_ASSERT(IsTextEditor());
+    return const_cast<EditorBase*>(this)->GetCachedTextNode();
+  }
+
+  nsIPrincipal* GetEditActionPrincipal() const {
+    MOZ_ASSERT(mEditActionData);
+    return mEditActionData->GetPrincipal();
+  }
+
+  dom::EditContext* GetEditActionEditContext() const {
+    MOZ_ASSERT(mEditActionData);
+    return mEditActionData->GetEditContext();
+  }
+
+  bool EditContextChangedSinceStartOfEditAction() const {
+    MOZ_ASSERT(mEditActionData);
+    return mEditActionData->EditContextHasBeenChanged();
+  }
+
+  EditAction GetEditAction() const {
+    return mEditActionData ? mEditActionData->GetEditAction()
+                           : EditAction::eNone;
+  }
+
+  const nsString& GetInputEventData() const {
+    return mEditActionData ? mEditActionData->GetData() : VoidString();
+  }
+
+  DataTransfer* GetInputEventDataTransfer() const {
+    return mEditActionData ? mEditActionData->GetDataTransfer() : nullptr;
+  }
+
+  EditSubAction GetTopLevelEditSubAction() const {
+    return mEditActionData ? mEditActionData->GetTopLevelEditSubAction()
+                           : EditSubAction::eNone;
+  }
+
+  EDirection GetDirectionOfTopLevelEditSubAction() const {
+    return mEditActionData
+               ? mEditActionData->GetDirectionOfTopLevelEditSubAction()
+               : eNone;
+  }
+
+  SelectionState& SavedSelectionRef() {
+    MOZ_ASSERT(IsEditActionDataAvailable());
+    return mEditActionData->SavedSelectionRef();
+  }
+  const SelectionState& SavedSelectionRef() const {
+    MOZ_ASSERT(IsEditActionDataAvailable());
+    return mEditActionData->SavedSelectionRef();
+  }
+
+  RangeUpdater& RangeUpdaterRef() {
+    MOZ_ASSERT(IsEditActionDataAvailable());
+    return mEditActionData->RangeUpdaterRef();
+  }
+  const RangeUpdater& RangeUpdaterRef() const {
+    MOZ_ASSERT(IsEditActionDataAvailable());
+    return mEditActionData->RangeUpdaterRef();
+  }
+
+  const TopLevelEditSubActionData& TopLevelEditSubActionDataRef() const {
+    MOZ_ASSERT(IsEditActionDataAvailable());
+    return mEditActionData->TopLevelEditSubActionDataRef();
+  }
+  TopLevelEditSubActionData& TopLevelEditSubActionDataRef() {
+    MOZ_ASSERT(IsEditActionDataAvailable());
+    return mEditActionData->TopLevelEditSubActionDataRef();
+  }
+
+  const EditSubActionData& EditSubActionDataRef() const {
+    MOZ_ASSERT(IsEditActionDataAvailable());
+    return mEditActionData->EditSubActionDataRef();
+  }
+  EditSubActionData& EditSubActionDataRef() {
+    MOZ_ASSERT(IsEditActionDataAvailable());
+    return mEditActionData->EditSubActionDataRef();
+  }
+
+  template <typename EditorDOMPointType>
+  EditorDOMPointType GetFirstIMESelectionStartPoint() const;
+  template <typename EditorDOMPointType>
+  EditorDOMPointType GetLastIMESelectionEndPoint() const;
+
+  bool IsSelectionRangeContainerNotContent() const;
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult
+  OnInputText(const nsAString& aStringToInsert);
+
+  enum class InsertTextFor {
+    NormalText,
+    CompositionStart,
+    CompositionUpdate,
+    CompositionEnd,
+    CompositionStartAndEnd,
+  };
+  friend inline std::ostream& operator<<(std::ostream& aStream,
+                                         const InsertTextFor& aPurpose) {
+    switch (aPurpose) {
+      case InsertTextFor::NormalText:
+        return aStream << "InsertTextFor::NormalText";
+      case InsertTextFor::CompositionStart:
+        return aStream << "InsertTextFor::CompositionStart";
+      case InsertTextFor::CompositionUpdate:
+        return aStream << "InsertTextFor::CompositionUpdate";
+      case InsertTextFor::CompositionEnd:
+        return aStream << "InsertTextFor::CompositionEnd";
+      case InsertTextFor::CompositionStartAndEnd:
+        return aStream << "InsertTextFor::CompositionStartAndEnd";
+    }
+    return aStream << "<illegal value>";
+  }
+  [[nodiscard]] static bool InsertingTextForComposition(
+      InsertTextFor aPurpose) {
+    return aPurpose != InsertTextFor::NormalText;
+  }
+  [[nodiscard]] static bool InsertingTextForExtantComposition(
+      InsertTextFor aPurpose) {
+    return aPurpose == InsertTextFor::CompositionUpdate ||
+           aPurpose == InsertTextFor::CompositionEnd;
+  }
+  [[nodiscard]] static bool InsertingTextForStartingComposition(
+      InsertTextFor aPurpose) {
+    return aPurpose == InsertTextFor::CompositionStart ||
+           aPurpose == InsertTextFor::CompositionStartAndEnd;
+  }
+  [[nodiscard]] static bool InsertingTextForCommittingComposition(
+      InsertTextFor aPurpose) {
+    return aPurpose == InsertTextFor::CompositionEnd ||
+           aPurpose == InsertTextFor::CompositionStartAndEnd;
+  }
+  [[nodiscard]] static bool NothingToDoIfInsertingEmptyText(
+      InsertTextFor aPurpose) {
+    return aPurpose == InsertTextFor::NormalText ||
+           aPurpose == InsertTextFor::CompositionStartAndEnd;
+  }
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult InsertTextAsSubAction(
+      const nsAString& aStringToInsert, InsertTextFor aPurpose);
+
+  enum class InsertTextTo {
+    SpecifiedPoint,
+    ExistingTextNodeIfAvailable,
+    ExistingTextNodeIfAvailableAndNotStart,
+    AlwaysCreateNewTextNode
+  };
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT virtual Result<InsertTextResult, nsresult>
+  InsertTextWithTransaction(const nsAString& aStringToInsert,
+                            const EditorDOMPoint& aPointToInsert,
+                            InsertTextTo aInsertTextTo);
+
+  [[nodiscard]] EditorDOMPoint ComputePointToInsertText(
+      const EditorDOMPoint& aPoint, InsertTextTo aInsertTextTo) const;
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT Result<InsertTextResult, nsresult>
+  InsertTextIntoTextNodeWithTransaction(
+      const nsAString& aStringToInsert,
+      const EditorDOMPointInText& aPointToInsert);
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult
+  SetTextNodeWithoutTransaction(const nsAString& aString, Text& aTextNode);
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult
+  DeleteNodeWithTransaction(nsIContent& aContent);
+
+  template <typename ContentNodeType>
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT
+      Result<CreateNodeResultBase<ContentNodeType>, nsresult>
+      InsertNodeWithTransaction(ContentNodeType& aContentToInsert,
+                                const EditorDOMPoint& aPointToInsert);
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT Result<CreateElementResult, nsresult>
+  InsertPaddingBRElementForEmptyLastLineWithTransaction(
+      const EditorDOMPoint& aPointToInsert);
+
+  enum class BRElementType {
+    Normal,
+    PaddingForEmptyEditor,
+    PaddingForEmptyLastLine
+  };
+  friend inline auto format_as(const BRElementType& aType) {
+    constexpr const char* sNames[] = {"Normal", "PaddingForEmptyEditor",
+                                      "PaddingForEmptyLastLine"};
+    return std::string(sNames[static_cast<size_t>(aType)]);
+  }
+  friend inline std::ostream& operator<<(std::ostream& aStream,
+                                         const BRElementType& aType) {
+    return aStream << format_as(aType);
+  }
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult
+  UpdateBRElementType(dom::HTMLBRElement& aBRElement, BRElementType aNewType);
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT Result<CreateElementResult, nsresult>
+  InsertBRElement(WithTransaction aWithTransaction,
+                  BRElementType aBRElementType,
+                  const EditorDOMPoint& aPointToInsert);
+
+  MOZ_CAN_RUN_SCRIPT void CloneAttributesWithTransaction(
+      Element& aDestElement, Element& aSourceElement);
+
+  MOZ_CAN_RUN_SCRIPT nsresult CloneAttributeWithTransaction(
+      nsAtom& aAttribute, Element& aDestElement, Element& aSourceElement);
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult
+  RemoveAttributeWithTransaction(Element& aElement, nsAtom& aAttribute);
+
+  MOZ_CAN_RUN_SCRIPT virtual nsresult RemoveAttributeOrEquivalent(
+      Element* aElement, nsAtom* aAttribute, bool aSuppressTransaction) = 0;
+
+  MOZ_CAN_RUN_SCRIPT nsresult SetAttributeWithTransaction(
+      Element& aElement, nsAtom& aAttribute, const nsAString& aValue);
+
+  MOZ_CAN_RUN_SCRIPT virtual nsresult SetAttributeOrEquivalent(
+      Element* aElement, nsAtom* aAttribute, const nsAString& aValue,
+      bool aSuppressTransaction) = 0;
+
+  already_AddRefed<Element> CreateHTMLContent(const nsAtom* aTag) const;
+
+  already_AddRefed<nsTextNode> CreateTextNode(const nsAString& aData) const;
+
+  MOZ_CAN_RUN_SCRIPT void DoInsertText(dom::Text& aText, uint32_t aOffset,
+                                       const nsAString& aStringToInsert,
+                                       ErrorResult& aRv);
+  MOZ_CAN_RUN_SCRIPT void DoDeleteText(dom::Text& aText, uint32_t aOffset,
+                                       uint32_t aCount, ErrorResult& aRv);
+  MOZ_CAN_RUN_SCRIPT void DoReplaceText(dom::Text& aText, uint32_t aOffset,
+                                        uint32_t aCount,
+                                        const nsAString& aStringToInsert,
+                                        ErrorResult& aRv);
+  MOZ_CAN_RUN_SCRIPT void DoSetText(dom::Text& aText,
+                                    const nsAString& aStringToSet,
+                                    ErrorResult& aRv);
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT Result<CaretPoint, nsresult>
+  DeleteTextWithTransaction(dom::Text& aTextNode, uint32_t aOffset,
+                            uint32_t aLength);
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult MarkElementDirty(Element& aElement);
+
+  MOZ_CAN_RUN_SCRIPT nsresult
+  DoTransactionInternal(nsITransaction* aTransaction);
+
+  bool IsRoot(const nsINode* inNode) const;
+
+  bool IsDescendantOfRoot(const nsINode* inNode) const;
+
+  bool ShouldHandleIMEComposition() const;
+
+  template <typename EditorDOMPointType>
+  EditorDOMPointType GetFirstSelectionStartPoint() const;
+  template <typename EditorDOMPointType>
+  EditorDOMPointType GetFirstSelectionEndPoint() const;
+
+  static nsresult GetEndChildNode(const Selection& aSelection,
+                                  nsIContent** aEndNode);
+
+  template <typename PT, typename CT>
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult
+  CollapseSelectionTo(const EditorDOMPointBase<PT, CT>& aPoint) const {
+    IgnoredErrorResult error;
+    CollapseSelectionTo(aPoint, error);
+    return error.StealNSResult();
+  }
+
+  template <typename PT, typename CT>
+  MOZ_CAN_RUN_SCRIPT void CollapseSelectionTo(
+      const EditorDOMPointBase<PT, CT>& aPoint, ErrorResult& aRv) const {
+    MOZ_ASSERT(IsEditActionDataAvailable());
+    MOZ_ASSERT(!aRv.Failed());
+
+    if (aPoint.GetInterlinePosition() != InterlinePosition::Undefined) {
+      if (MOZ_UNLIKELY(NS_FAILED(SelectionRef().SetInterlinePosition(
+              aPoint.GetInterlinePosition())))) {
+        NS_WARNING("Selection::SetInterlinePosition() failed");
+        aRv.Throw(NS_ERROR_FAILURE);
+        return;
+      }
+    }
+
+    SelectionRef().CollapseInLimiter(aPoint, aRv);
+    if (MOZ_UNLIKELY(Destroyed())) {
+      NS_WARNING("Selection::CollapseInLimiter() caused destroying the editor");
+      aRv.Throw(NS_ERROR_EDITOR_DESTROYED);
+      return;
+    }
+    NS_WARNING_ASSERTION(!aRv.Failed(),
+                         "Selection::CollapseInLimiter() failed");
+  }
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult
+  CollapseSelectionToStartOf(nsINode& aNode) const {
+    return CollapseSelectionTo(EditorRawDOMPoint(&aNode, 0u));
+  }
+
+  MOZ_CAN_RUN_SCRIPT void CollapseSelectionToStartOf(nsINode& aNode,
+                                                     ErrorResult& aRv) const {
+    CollapseSelectionTo(EditorRawDOMPoint(&aNode, 0u), aRv);
+  }
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult
+  CollapseSelectionToEndOf(nsINode& aNode) const {
+    return CollapseSelectionTo(EditorRawDOMPoint::AtEndOf(aNode));
+  }
+
+  MOZ_CAN_RUN_SCRIPT void CollapseSelectionToEndOf(nsINode& aNode,
+                                                   ErrorResult& aRv) const {
+    CollapseSelectionTo(EditorRawDOMPoint::AtEndOf(aNode), aRv);
+  }
+
+  inline bool AllowsTransactionsToChangeSelection() const {
+    return mAllowsTransactionsToChangeSelection;
+  }
+
+  inline void MakeThisAllowTransactionsToChangeSelection(bool aAllow) {
+    mAllowsTransactionsToChangeSelection = aAllow;
+  }
+
+  virtual bool IsActiveInDOMWindow() const;
+
+  void HideCaret(bool aHide);
+
+ protected:  
+  class MOZ_RAII AutoCaretBidiLevelManager final {
+   public:
+    template <typename PT, typename CT>
+    AutoCaretBidiLevelManager(const EditorBase& aEditorBase,
+                              nsIEditor::EDirection aDirectionAndAmount,
+                              const EditorDOMPointBase<PT, CT>& aPointAtCaret);
+    AutoCaretBidiLevelManager(const EditorBase& aEditorBase,
+                              nsIEditor::EDirection aDirectionAndAmount,
+                              const dom::EditContext& aEditContext) {
+      InitForEditContext(aEditorBase, aDirectionAndAmount, aEditContext);
+    }
+
+    bool Failed() const { return mFailed; }
+
+    bool Canceled() const { return mCanceled; }
+
+    void MaybeUpdateCaretBidiLevel(const EditorBase& aEditorBase) const;
+
+   private:
+    template <typename PT, typename CT>
+    void Init(const EditorBase& aEditorBase,
+              nsIEditor::EDirection aDirectionAndAmount,
+              const EditorDOMPointBase<PT, CT>& aPointAtCaret);
+    void InitForEditContext(const EditorBase& aEditorBase,
+                            nsIEditor::EDirection aDirectionAndAmount,
+                            const dom::EditContext&);
+    Maybe<mozilla::intl::BidiEmbeddingLevel> mNewCaretBidiLevel;
+    bool mFailed = false;
+    bool mCanceled = false;
+  };
+
+  void UndefineCaretBidiLevel() const;
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT bool
+  FlushPendingNotificationsIfToHandleDeletionWithFrameSelection(
+      nsIEditor::EDirection aDirectionAndAmount) const;
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult
+  DeleteSelectionAsSubAction(nsIEditor::EDirection aDirectionAndAmount,
+                             nsIEditor::EStripWrappers aStripWrappers);
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT virtual Result<EditActionResult, nsresult>
+  HandleDeleteSelection(nsIEditor::EDirection aDirectionAndAmount,
+                        nsIEditor::EStripWrappers aStripWrappers) = 0;
+
+  MOZ_CAN_RUN_SCRIPT nsresult
+  ReplaceSelectionAsSubAction(const nsAString& aString);
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT virtual Result<EditActionResult, nsresult>
+  HandleInsertText(const nsAString& aInsertionString,
+                   InsertTextFor aPurpose) = 0;
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT virtual nsresult
+  InsertWithQuotationsAsSubAction(const nsAString& aQuotedText) = 0;
+
+  enum class DeleteSelectedContent : bool {
+    No,   
+    Yes,  
+  };
+  MOZ_CAN_RUN_SCRIPT nsresult
+  PrepareToInsertContent(const EditorDOMPoint& aPointToInsert,
+                         DeleteSelectedContent aDeleteSelectedContent);
+
+  MOZ_CAN_RUN_SCRIPT nsresult InsertTextAt(
+      const nsAString& aStringToInsert, const EditorDOMPoint& aPointToInsert,
+      DeleteSelectedContent aDeleteSelectedContent);
+
+  enum class SafeToInsertData : bool { No, Yes };
+  SafeToInsertData IsSafeToInsertData(nsIPrincipal* aSourcePrincipal) const;
+
+  bool ArePreservingSelection() const;
+  void PreserveSelectionAcrossActions();
+  MOZ_CAN_RUN_SCRIPT nsresult RestorePreservedSelection();
+  void StopPreservingSelection();
+
+ protected:  
+  MOZ_CAN_RUN_SCRIPT virtual void OnStartToHandleTopLevelEditSubAction(
+      EditSubAction aTopLevelEditSubAction,
+      nsIEditor::EDirection aDirectionOfTopLevelEditSubAction,
+      ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT virtual nsresult OnEndHandlingTopLevelEditSubAction();
+
+  void OnStartToHandleEditSubAction() { EditSubActionDataRef().Clear(); }
+  void OnEndHandlingEditSubAction() { EditSubActionDataRef().Clear(); }
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void BeginPlaceholderTransaction(
+      nsStaticAtom& aTransactionName, const char* aRequesterFuncName);
+  enum class ScrollSelectionIntoView { No, Yes };
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void EndPlaceholderTransaction(
+      ScrollSelectionIntoView aScrollSelectionIntoView,
+      const char* aRequesterFuncName);
+
+  void BeginUpdateViewBatch(const char* aRequesterFuncName);
+  MOZ_CAN_RUN_SCRIPT void EndUpdateViewBatch(const char* aRequesterFuncName);
+
+  MOZ_CAN_RUN_SCRIPT void BeginTransactionInternal(
+      const char* aRequesterFuncName);
+  MOZ_CAN_RUN_SCRIPT void EndTransactionInternal(
+      const char* aRequesterFuncName);
+
+ protected:  
+  virtual ~EditorBase();
+
+  MOZ_CAN_RUN_SCRIPT nsresult
+  InitInternal(Document& aDocument, Element* aRootElement,
+               nsISelectionController& aSelectionController, uint32_t aFlags);
+
+  MOZ_CAN_RUN_SCRIPT nsresult PostCreateInternal();
+
+  MOZ_CAN_RUN_SCRIPT virtual void PreDestroyInternal();
+
+  MOZ_ALWAYS_INLINE EditorType GetEditorType() const {
+    return mIsHTMLEditorClass ? EditorType::HTML : EditorType::Text;
+  }
+
+  [[nodiscard]] bool CanKeepHandlingFocusEvent(
+      const nsINode& aOriginalEventTargetNode) const;
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult EnsureEmptyTextFirstChild();
+
+  int32_t WrapWidth() const { return mWrapColumn; }
+
+  static inline nsresult ToGenericNSResult(nsresult aRv) {
+    switch (aRv) {
+      case NS_ERROR_EDITOR_DESTROYED:
+        return NS_OK;
+      case NS_ERROR_EDITOR_UNEXPECTED_DOM_TREE:
+        return NS_OK;
+      case NS_ERROR_EDITOR_ACTION_CANCELED:
+        return NS_SUCCESS_DOM_NO_OPERATION;
+      case NS_ERROR_EDITOR_NO_EDITABLE_RANGE:
+        return NS_SUCCESS_DOM_NO_OPERATION;
+      case NS_SUCCESS_EDITOR_BUT_IGNORED_TRIVIAL_ERROR:
+        return NS_OK;
+      default:
+        return aRv;
+    }
+  }
+
+  nsresult GetDocumentCharsetInternal(nsACString& aCharset) const;
+
+  nsresult ComputeValueInternal(const nsAString& aFormatType,
+                                uint32_t aDocumentEncoderFlags,
+                                nsAString& aOutputString) const;
+
+  already_AddRefed<nsIDocumentEncoder> GetAndInitDocEncoder(
+      const nsAString& aFormatType, uint32_t aDocumentEncoderFlags,
+      const nsACString& aCharset) const;
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult
+  EnsurePaddingBRElementInMultilineEditor();
+
+  MOZ_CAN_RUN_SCRIPT virtual nsresult SelectAllInternal();
+
+  nsresult DetermineCurrentDirection();
+
+  MOZ_CAN_RUN_SCRIPT void DispatchInputEvent();
+
+  [[nodiscard]] bool CanDispatchInputEventBeforeCompositionEnd() const;
+
+  [[nodiscard]] bool CanDispatchInputEventAfterCompositionEnd() const;
+
+  MOZ_CAN_RUN_SCRIPT void DoAfterDoTransaction(nsITransaction* aTransaction);
+
+
+  MOZ_CAN_RUN_SCRIPT void DoAfterUndoTransaction();
+
+  MOZ_CAN_RUN_SCRIPT void DoAfterRedoTransaction();
+
+  enum TDocumentListenerNotification {
+    eDocumentCreated,
+    eDocumentToBeDestroyed,
+    eDocumentStateChanged
+  };
+  MOZ_CAN_RUN_SCRIPT nsresult
+  NotifyDocumentListeners(TDocumentListenerNotification aNotificationType);
+
+  MOZ_CAN_RUN_SCRIPT virtual nsresult SelectEntireDocument() = 0;
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult
+  ScrollSelectionFocusIntoView() const;
+
+  virtual nsresult InstallEventListeners();
+  virtual void CreateEventListeners();
+  void RemoveEventListeners();
+  [[nodiscard]] bool IsListeningToEvents() const;
+
+  void HandleKeyPressEventInReadOnlyMode(
+      WidgetKeyboardEvent& aKeyboardEvent) const;
+
+  virtual already_AddRefed<Element> GetInputEventTargetElement() const = 0;
+
+  MOZ_CAN_RUN_SCRIPT virtual void InitializeSelectionAncestorLimit(
+      Element& aAncestorLimit) const;
+
+  MOZ_CAN_RUN_SCRIPT nsresult
+  InitializeSelection(const nsINode& aOriginalEventTargetNode);
+
+  enum NotificationForEditorObservers {
+    eNotifyEditorObserversOfEnd,
+    eNotifyEditorObserversOfBefore,
+    eNotifyEditorObserversOfCancel
+  };
+  MOZ_CAN_RUN_SCRIPT void NotifyEditorObservers(
+      NotificationForEditorObservers aNotification);
+
+  enum class HowToHandleCollapsedRange {
+    Ignore,
+    ExtendBackward,
+    ExtendForward,
+  };
+
+  static HowToHandleCollapsedRange HowToHandleCollapsedRangeFor(
+      nsIEditor::EDirection aDirectionAndAmount) {
+    switch (aDirectionAndAmount) {
+      case nsIEditor::eNone:
+        return HowToHandleCollapsedRange::Ignore;
+      case nsIEditor::ePrevious:
+        return HowToHandleCollapsedRange::ExtendBackward;
+      case nsIEditor::eNext:
+        return HowToHandleCollapsedRange::ExtendForward;
+      case nsIEditor::ePreviousWord:
+      case nsIEditor::eNextWord:
+      case nsIEditor::eToBeginningOfLine:
+      case nsIEditor::eToEndOfLine:
+        return HowToHandleCollapsedRange::Ignore;
+    }
+    MOZ_ASSERT_UNREACHABLE("Invalid nsIEditor::EDirection value");
+    return HowToHandleCollapsedRange::Ignore;
+  }
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT virtual nsresult
+  InsertDroppedDataTransferAsAction(AutoEditActionDataSetter& aEditActionData,
+                                    DataTransfer& aDataTransfer,
+                                    const EditorDOMPoint& aDroppedAt,
+                                    nsIPrincipal* aSourcePrincipal) = 0;
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult
+  DeleteSelectionByDragAsAction(bool aDispatchInputEvent);
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT Result<CaretPoint, nsresult>
+  DeleteRangeWithTransaction(nsIEditor::EDirection aDirectionAndAmount,
+                             nsIEditor::EStripWrappers aStripWrappers,
+                             nsRange& aRangeToDelete);
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT virtual Result<CaretPoint, nsresult>
+  DeleteRangesWithTransaction(nsIEditor::EDirection aDirectionAndAmount,
+                              nsIEditor::EStripWrappers aStripWrappers,
+                              AutoClonedRangeArray& aRangesToDelete);
+
+  already_AddRefed<DeleteMultipleRangesTransaction>
+  CreateTransactionForDeleteSelection(
+      HowToHandleCollapsedRange aHowToHandleCollapsedRange,
+      const AutoClonedRangeArray& aRangesToDelete);
+
+  already_AddRefed<DeleteContentTransactionBase>
+  CreateTransactionForCollapsedRange(
+      const nsRange& aCollapsedRange,
+      HowToHandleCollapsedRange aHowToHandleCollapsedRange);
+
+  std::tuple<EditorDOMPointInText, EditorDOMPointInText> ComputeInsertedRange(
+      const EditorDOMPointInText& aInsertedPoint,
+      const nsAString& aInsertedString) const;
+
+  bool EnsureComposition(WidgetCompositionEvent& aCompositionEvent);
+
+  virtual bool IsCopyToClipboardAllowedInternal() const {
+    MOZ_ASSERT(IsEditActionDataAvailable());
+    return !SelectionRef().IsCollapsed();
+  }
+
+  MOZ_CAN_RUN_SCRIPT bool CheckForClipboardCommandListener(
+      nsAtom* aCommand, EventMessage aEventMessage) const;
+
+  enum class ClipboardEventResult {
+    IgnoredOrError,
+    DefaultPreventedOfPaste,
+    CopyOrCutHandled,
+    DoDefault,
+  };
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT Result<ClipboardEventResult, nsresult>
+  DispatchClipboardEventAndUpdateClipboard(
+      EventMessage aEventMessage,
+      mozilla::Maybe<nsIClipboard::ClipboardType> aClipboardType,
+      DataTransfer* aDataTransfer = nullptr);
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT virtual nsresult HandlePaste(
+      AutoEditActionDataSetter& aEditActionData,
+      nsIClipboard::ClipboardType aClipboardType,
+      DataTransfer* aDataTransfer) = 0;
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT virtual nsresult HandlePasteAsQuotation(
+      AutoEditActionDataSetter& aEditActionData,
+      nsIClipboard::ClipboardType aClipboardType,
+      DataTransfer* aDataTransfer) = 0;
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT virtual nsresult HandlePasteTransferable(
+      AutoEditActionDataSetter& aEditActionData,
+      nsITransferable& aTransferable) = 0;
+
+ private:
+  nsCOMPtr<nsISelectionController> mSelectionController;
+  RefPtr<Document> mDocument;
+
+  AutoEditActionDataSetter* mEditActionData;
+
+  MOZ_CAN_RUN_SCRIPT nsresult SetTextDirectionTo(TextDirection aTextDirection);
+
+ protected:  
+  class MOZ_RAII AutoPlaceholderBatch final {
+   public:
+    AutoPlaceholderBatch(EditorBase& aEditorBase,
+                         ScrollSelectionIntoView aScrollSelectionIntoView,
+                         const char* aRequesterFuncName)
+        : mEditorBase(aEditorBase),
+          mScrollSelectionIntoView(aScrollSelectionIntoView),
+          mRequesterFuncName(aRequesterFuncName) {
+      mEditorBase->BeginPlaceholderTransaction(*nsGkAtoms::_empty,
+                                               mRequesterFuncName);
+    }
+
+    AutoPlaceholderBatch(EditorBase& aEditorBase,
+                         nsStaticAtom& aTransactionName,
+                         ScrollSelectionIntoView aScrollSelectionIntoView,
+                         const char* aRequesterFuncName)
+        : mEditorBase(aEditorBase),
+          mScrollSelectionIntoView(aScrollSelectionIntoView),
+          mRequesterFuncName(aRequesterFuncName) {
+      mEditorBase->BeginPlaceholderTransaction(aTransactionName,
+                                               mRequesterFuncName);
+    }
+
+    ~AutoPlaceholderBatch() {
+      mEditorBase->EndPlaceholderTransaction(mScrollSelectionIntoView,
+                                             mRequesterFuncName);
+    }
+
+   protected:
+    const OwningNonNull<EditorBase> mEditorBase;
+    const ScrollSelectionIntoView mScrollSelectionIntoView;
+    const char* const mRequesterFuncName;
+  };
+
+  class MOZ_RAII AutoEditSubActionNotifier final {
+   public:
+    MOZ_CAN_RUN_SCRIPT AutoEditSubActionNotifier(
+        EditorBase& aEditorBase, EditSubAction aEditSubAction,
+        nsIEditor::EDirection aDirection, ErrorResult& aRv)
+        : mEditorBase(aEditorBase), mIsTopLevel(true) {
+      if (!mEditorBase.GetTopLevelEditSubAction()) {
+        MOZ_KnownLive(mEditorBase)
+            .OnStartToHandleTopLevelEditSubAction(aEditSubAction, aDirection,
+                                                  aRv);
+      } else {
+        mIsTopLevel = false;
+      }
+      mEditorBase.OnStartToHandleEditSubAction();
+    }
+
+    MOZ_CAN_RUN_SCRIPT ~AutoEditSubActionNotifier() {
+      mEditorBase.OnEndHandlingEditSubAction();
+      if (mIsTopLevel) {
+        MOZ_KnownLive(mEditorBase).OnEndHandlingTopLevelEditSubAction();
+      }
+    }
+
+   protected:
+    EditorBase& mEditorBase;
+    bool mIsTopLevel;
+  };
+
+  class MOZ_RAII AutoTransactionsConserveSelection final {
+   public:
+    explicit AutoTransactionsConserveSelection(EditorBase& aEditorBase)
+        : mEditorBase(aEditorBase),
+          mAllowedTransactionsToChangeSelection(
+              aEditorBase.AllowsTransactionsToChangeSelection()) {
+      mEditorBase.MakeThisAllowTransactionsToChangeSelection(false);
+    }
+
+    ~AutoTransactionsConserveSelection() {
+      mEditorBase.MakeThisAllowTransactionsToChangeSelection(
+          mAllowedTransactionsToChangeSelection);
+    }
+
+   protected:
+    EditorBase& mEditorBase;
+    bool mAllowedTransactionsToChangeSelection;
+  };
+
+  class MOZ_RAII AutoUpdateViewBatch final {
+   public:
+    MOZ_CAN_RUN_SCRIPT explicit AutoUpdateViewBatch(
+        EditorBase& aEditorBase, const char* aRequesterFuncName)
+        : mEditorBase(aEditorBase), mRequesterFuncName(aRequesterFuncName) {
+      mEditorBase.BeginUpdateViewBatch(mRequesterFuncName);
+    }
+
+    MOZ_CAN_RUN_SCRIPT ~AutoUpdateViewBatch() {
+      MOZ_KnownLive(mEditorBase).EndUpdateViewBatch(mRequesterFuncName);
+    }
+
+   protected:
+    EditorBase& mEditorBase;
+    const char* const mRequesterFuncName;
+  };
+
+ protected:
+  enum Tristate { eTriUnset, eTriFalse, eTriTrue };
+
+  nsString mContentMIMEType;
+
+  RefPtr<TransactionManager> mTransactionManager;
+  RefPtr<Element> mRootElement;
+
+  nsCOMPtr<dom::EventTarget> mEventTarget;
+  RefPtr<EditorEventListener> mEventListener;
+  RefPtr<PlaceholderTransaction> mPlaceholderTransaction;
+  nsStaticAtom* mPlaceholderName;
+  mozilla::Maybe<SelectionState> mSelState;
+  RefPtr<TextComposition> mComposition;
+
+  RefPtr<TextInputListener> mTextInputListener;
+
+  RefPtr<IMEContentObserver> mIMEContentObserver;
+
+  mutable nsCOMPtr<nsIDocumentEncoder> mCachedDocumentEncoder;
+  mutable nsString mCachedDocumentEncoderType;
+
+  using AutoActionListenerArray =
+      AutoTArray<OwningNonNull<nsIEditActionListener>, 2>;
+  AutoActionListenerArray mActionListeners;
+  using AutoDocumentStateListenerArray =
+      AutoTArray<OwningNonNull<nsIDocumentStateListener>, 1>;
+  AutoDocumentStateListenerArray mDocStateListeners;
+
+  uint32_t mModCount;
+  uint32_t mFlags;
+
+  int32_t mUpdateCount;
+
+  int32_t mPlaceholderBatch;
+
+  int32_t mWrapColumn = 0;
+  int32_t mNewlineHandling;
+  int32_t mCaretStyle;
+
+  int8_t mDocDirtyState;
+  bool mInitSucceeded;
+  bool mAllowsTransactionsToChangeSelection;
+  bool mDidPreDestroy;
+  bool mDidPostCreate;
+  bool mDispatchInputEvent;
+  bool mIsInEditSubAction;
+  bool mHidingCaret;
+  bool mIsHTMLEditorClass;
+
+  friend class AlignStateAtSelection;          
+  friend class AutoClonedRangeArray;           
+  friend class AutoClonedSelectionRangeArray;  
+  friend class AutoSelectionRestorer;   
+  friend class CaretPoint;              
+  friend class CompositionTransaction;  
+  friend class DeleteNodeTransaction;   
+  friend class DeleteRangeTransaction;  
+  friend class DeleteTextTransaction;   
+  friend class InsertNodeTransaction;   
+  friend class InsertTextTransaction;   
+  friend class ListElementSelectionState;      
+  friend class ListItemElementSelectionState;  
+  friend class MoveNodeTransaction;      
+  friend class MoveSiblingsTransaction;  
+  friend class ParagraphStateAtSelection;  
+  friend class PendingStyles;              
+  friend class ReplaceTextTransaction;  
+  friend class SplitNodeTransaction;    
+  friend class
+      WhiteSpaceVisibilityKeeper;  
+  friend class nsIEditor;          
+};
+
+}  
+
+bool nsIEditor::IsTextEditor() const {
+  return !AsEditorBase()->mIsHTMLEditorClass;
+}
+
+bool nsIEditor::IsHTMLEditor() const {
+  return AsEditorBase()->mIsHTMLEditorClass;
+}
+
+mozilla::EditorBase* nsIEditor::AsEditorBase() {
+  return static_cast<mozilla::EditorBase*>(this);
+}
+
+const mozilla::EditorBase* nsIEditor::AsEditorBase() const {
+  return static_cast<const mozilla::EditorBase*>(this);
+}
+
+#endif  // #ifndef mozilla_EditorBase_h

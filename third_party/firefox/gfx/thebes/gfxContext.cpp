@@ -1,0 +1,515 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include <math.h>
+
+#include "cairo.h"
+
+#include "gfxContext.h"
+
+#include "gfxMatrix.h"
+#include "gfxUtils.h"
+#include "gfxPattern.h"
+#include "gfxPlatform.h"
+
+#include "gfx2DGlue.h"
+#include "mozilla/gfx/PathHelpers.h"
+#include <algorithm>
+#include "TextDrawTarget.h"
+
+
+using namespace mozilla;
+using namespace mozilla::gfx;
+
+#if defined(DEBUG)
+#  define CURRENTSTATE_CHANGED() mAzureState.mContentChanged = true;
+#else
+#  define CURRENTSTATE_CHANGED()
+#endif
+
+PatternFromState::operator Pattern&() {
+  const gfxContext::AzureState& state = mContext->mAzureState;
+
+  if (state.pattern) {
+    return *state.pattern->GetPattern(
+        mContext->mDT,
+        state.patternTransformChanged ? &state.patternTransform : nullptr);
+  }
+
+  mPattern = new (mColorPattern.addr()) ColorPattern(state.color);
+  return *mPattern;
+}
+
+UniquePtr<gfxContext> gfxContext::CreateOrNull(DrawTarget* aTarget) {
+  if (!aTarget || !aTarget->IsValid()) {
+    gfxCriticalNote << "Invalid target in gfxContext::CreateOrNull "
+                    << hexa(aTarget);
+    return nullptr;
+  }
+
+  return MakeUnique<gfxContext>(aTarget);
+}
+
+gfxContext::~gfxContext() {
+  while (!mSavedStates.IsEmpty()) {
+    Restore();
+  }
+  for (unsigned int c = 0; c < mAzureState.pushedClips.Length(); c++) {
+    mDT->PopClip();
+  }
+}
+
+mozilla::layout::TextDrawTarget* gfxContext::GetTextDrawer() const {
+  if (mDT->GetBackendType() == BackendType::WEBRENDER_TEXT) {
+    return static_cast<mozilla::layout::TextDrawTarget*>(&*mDT);
+  }
+  return nullptr;
+}
+
+void gfxContext::Save() {
+  mSavedStates.AppendElement(mAzureState);
+  mAzureState.pushedClips.Clear();
+#if defined(DEBUG)
+  mAzureState.mContentChanged = false;
+#endif
+}
+
+void gfxContext::Restore() {
+#if defined(DEBUG)
+  NS_ASSERTION(
+      mAzureState.mContentChanged || mAzureState.pushedClips.Length() > 0,
+      "The context of the current AzureState is not altered after "
+      "Save() been called. you may consider to remove this pair of "
+      "gfxContext::Save/Restore.");
+#endif
+
+  for (unsigned int c = 0; c < mAzureState.pushedClips.Length(); c++) {
+    mDT->PopClip();
+  }
+
+  mAzureState = mSavedStates.PopLastElement();
+
+  ChangeTransform(mAzureState.transform, false);
+}
+
+
+void gfxContext::Fill(const Pattern& aPattern) {
+
+  CompositionOp op = GetOp();
+
+  if (mPathIsRect) {
+    MOZ_ASSERT(!mTransformChanged);
+
+    if (op == CompositionOp::OP_SOURCE) {
+      mDT->ClearRect(mRect);
+      mDT->FillRect(mRect, aPattern, DrawOptions(1.0f));
+    } else {
+      mDT->FillRect(mRect, aPattern, DrawOptions(1.0f, op, mAzureState.aaMode));
+    }
+  } else {
+    EnsurePath();
+    mDT->Fill(mPath, aPattern, DrawOptions(1.0f, op, mAzureState.aaMode));
+  }
+}
+
+void gfxContext::Rectangle(const gfxRect& rect, bool snapToPixels) {
+  Rect rec = ToRect(rect);
+
+  if (snapToPixels) {
+    gfxRect newRect(rect);
+    if (UserToDevicePixelSnapped(newRect, SnapOption::IgnoreScale)) {
+      gfxMatrix mat = CurrentMatrixDouble();
+      if (mat.Invert()) {
+        rec = ToRect(mat.TransformBounds(newRect));
+      } else {
+        rec = Rect();
+      }
+    }
+  }
+
+  if (!mPathBuilder && !mPathIsRect) {
+    mPathIsRect = true;
+    mRect = rec;
+    return;
+  }
+
+  EnsurePathBuilder();
+
+  mPathBuilder->MoveTo(rec.TopLeft());
+  mPathBuilder->LineTo(rec.TopRight());
+  mPathBuilder->LineTo(rec.BottomRight());
+  mPathBuilder->LineTo(rec.BottomLeft());
+  mPathBuilder->Close();
+}
+
+void gfxContext::SnappedClip(const gfxRect& rect) {
+  Rect rec = ToRect(rect);
+
+  gfxRect newRect(rect);
+  if (UserToDevicePixelSnapped(newRect, SnapOption::IgnoreScale)) {
+    gfxMatrix mat = CurrentMatrixDouble();
+    if (mat.Invert()) {
+      rec = ToRect(mat.TransformBounds(newRect));
+    } else {
+      rec = Rect();
+    }
+  }
+
+  Clip(rec);
+}
+
+bool gfxContext::UserToDevicePixelSnapped(gfxRect& rect,
+                                          SnapOptions aOptions) const {
+  if (mDT->GetUserData(&sDisablePixelSnapping)) {
+    return false;
+  }
+
+  const gfxFloat epsilon = 0.0000001;
+#define WITHIN_E(a, b) (fabs((a) - (b)) < epsilon)
+  Matrix mat = mAzureState.transform;
+  if (!aOptions.contains(SnapOption::IgnoreScale) &&
+      (!WITHIN_E(mat._11, 1.0) || !WITHIN_E(mat._22, 1.0) ||
+       !WITHIN_E(mat._12, 0.0) || !WITHIN_E(mat._21, 0.0))) {
+    return false;
+  }
+#undef WITHIN_E
+
+  gfxPoint p1 = UserToDevice(rect.TopLeft());
+  gfxPoint p2 = UserToDevice(rect.TopRight());
+  gfxPoint p3 = UserToDevice(rect.BottomRight());
+
+  if (!(p2 == gfxPoint(p1.x, p3.y) || p2 == gfxPoint(p3.x, p1.y))) {
+    return false;
+  }
+
+  if (aOptions.contains(SnapOption::PrioritizeSize)) {
+
+    rect.SizeTo(std::floor(rect.width + 0.5), std::floor(rect.height + 0.5));
+
+    gfxPoint center = (p1 + p3) / 2;
+    gfxPoint topLeft = center - gfxPoint(rect.width / 2.0, rect.height / 2.0);
+    topLeft.Round();
+    rect.MoveTo(topLeft);
+  } else {
+    p1.Round();
+    p3.Round();
+    rect.MoveTo(gfxPoint(std::min(p1.x, p3.x), std::min(p1.y, p3.y)));
+    rect.SizeTo(gfxSize(std::max(p1.x, p3.x) - rect.X(),
+                        std::max(p1.y, p3.y) - rect.Y()));
+  }
+
+  return true;
+}
+
+bool gfxContext::UserToDevicePixelSnapped(gfxPoint& pt,
+                                          bool ignoreScale) const {
+  if (mDT->GetUserData(&sDisablePixelSnapping)) {
+    return false;
+  }
+
+  const gfxFloat epsilon = 0.0000001;
+#define WITHIN_E(a, b) (fabs((a) - (b)) < epsilon)
+  Matrix mat = mAzureState.transform;
+  if (!ignoreScale && (!WITHIN_E(mat._11, 1.0) || !WITHIN_E(mat._22, 1.0) ||
+                       !WITHIN_E(mat._12, 0.0) || !WITHIN_E(mat._21, 0.0))) {
+    return false;
+  }
+#undef WITHIN_E
+
+  pt = UserToDevice(pt);
+  pt.Round();
+  return true;
+}
+
+void gfxContext::SetDash(const Float* dashes, int ndash, Float offset,
+                         Float devPxScale) {
+  CURRENTSTATE_CHANGED()
+
+  mAzureState.dashPattern.SetLength(ndash);
+  for (int i = 0; i < ndash; i++) {
+    mAzureState.dashPattern[i] = dashes[i] * devPxScale;
+  }
+  mAzureState.strokeOptions.mDashLength = ndash;
+  mAzureState.strokeOptions.mDashOffset = offset * devPxScale;
+  mAzureState.strokeOptions.mDashPattern =
+      ndash ? mAzureState.dashPattern.Elements() : nullptr;
+}
+
+bool gfxContext::CurrentDash(FallibleTArray<Float>& dashes,
+                             Float* offset) const {
+  if (mAzureState.strokeOptions.mDashLength == 0 ||
+      !dashes.Assign(mAzureState.dashPattern, fallible)) {
+    return false;
+  }
+
+  *offset = mAzureState.strokeOptions.mDashOffset;
+
+  return true;
+}
+
+void gfxContext::Clip(const Rect& rect) {
+  AzureState::PushedClip clip = {nullptr, rect, mAzureState.transform};
+  mAzureState.pushedClips.AppendElement(clip);
+  mDT->PushClipRect(rect);
+  NewPath();
+}
+
+void gfxContext::Clip(Path* aPath) {
+  mDT->PushClip(aPath);
+  AzureState::PushedClip clip = {aPath, Rect(), mAzureState.transform};
+  mAzureState.pushedClips.AppendElement(clip);
+}
+
+void gfxContext::Clip() {
+  if (mPathIsRect) {
+    MOZ_ASSERT(!mTransformChanged);
+
+    AzureState::PushedClip clip = {nullptr, mRect, mAzureState.transform};
+    mAzureState.pushedClips.AppendElement(clip);
+    mDT->PushClipRect(mRect);
+  } else {
+    EnsurePath();
+    mDT->PushClip(mPath);
+    AzureState::PushedClip clip = {mPath, Rect(), mAzureState.transform};
+    mAzureState.pushedClips.AppendElement(clip);
+  }
+}
+
+gfxRect gfxContext::GetClipExtents(ClipExtentsSpace aSpace) const {
+  Rect rect = GetAzureDeviceSpaceClipBounds();
+
+  if (rect.IsZeroArea()) {
+    return gfxRect(0, 0, 0, 0);
+  }
+
+  if (aSpace == eUserSpace) {
+    Matrix mat = mAzureState.transform;
+    mat.Invert();
+    rect = mat.TransformBounds(rect);
+  }
+
+  return ThebesRect(rect);
+}
+
+bool gfxContext::ExportClip(ClipExporter& aExporter) const {
+  ForAllClips([&](const AzureState::PushedClip& aClip) -> void {
+    gfx::Matrix transform = aClip.transform;
+    transform.PostTranslate(-GetDeviceOffset());
+
+    aExporter.BeginClip(transform);
+    if (aClip.path) {
+      aClip.path->StreamToSink(&aExporter);
+    } else {
+      aExporter.MoveTo(aClip.rect.TopLeft());
+      aExporter.LineTo(aClip.rect.TopRight());
+      aExporter.LineTo(aClip.rect.BottomRight());
+      aExporter.LineTo(aClip.rect.BottomLeft());
+      aExporter.Close();
+    }
+    aExporter.EndClip();
+  });
+
+  return true;
+}
+
+
+bool gfxContext::GetDeviceColor(DeviceColor& aColorOut) const {
+  if (mAzureState.pattern) {
+    return mAzureState.pattern->GetSolidColor(aColorOut);
+  }
+
+  aColorOut = mAzureState.color;
+  return true;
+}
+
+already_AddRefed<gfxPattern> gfxContext::GetPattern() const {
+  RefPtr<gfxPattern> pat;
+
+  if (mAzureState.pattern) {
+    pat = mAzureState.pattern;
+  } else {
+    pat = new gfxPattern(mAzureState.color);
+  }
+  return pat.forget();
+}
+
+void gfxContext::Paint(Float alpha) const {
+
+  Matrix mat = mDT->GetTransform();
+  mat.Invert();
+  Rect paintRect = mat.TransformBounds(Rect(Point(0, 0), Size(mDT->GetSize())));
+
+  mDT->FillRect(paintRect, PatternFromState(this), DrawOptions(alpha, GetOp()));
+}
+
+#if defined(MOZ_DUMP_PAINTING)
+void gfxContext::WriteAsPNG(const char* aFile) {
+  gfxUtils::WriteAsPNG(mDT, aFile);
+}
+
+void gfxContext::DumpAsDataURI() { gfxUtils::DumpAsDataURI(mDT); }
+
+void gfxContext::CopyAsDataURI() { gfxUtils::CopyAsDataURI(mDT); }
+#endif
+
+void gfxContext::EnsurePath() {
+  if (mPathBuilder) {
+    mPath = mPathBuilder->Finish();
+    mPathBuilder = nullptr;
+  }
+
+  if (mPath) {
+    if (mTransformChanged) {
+      Matrix mat = mAzureState.transform;
+      mat.Invert();
+      mat = mPathTransform * mat;
+      Path::Transform(mPath, mat);
+
+      mTransformChanged = false;
+    }
+    return;
+  }
+
+  EnsurePathBuilder();
+  mPath = mPathBuilder->Finish();
+  mPathBuilder = nullptr;
+}
+
+void gfxContext::EnsurePathBuilder() {
+  if (mPathBuilder && !mTransformChanged) {
+    return;
+  }
+
+  if (mPath) {
+    if (!mTransformChanged) {
+      mPathBuilder = Path::ToBuilder(mPath.forget());
+    } else {
+      Matrix invTransform = mAzureState.transform;
+      invTransform.Invert();
+      Matrix toNewUS = mPathTransform * invTransform;
+      mPathBuilder = Path::ToBuilder(mPath.forget(), toNewUS);
+    }
+    return;
+  }
+
+  DebugOnly<PathBuilder*> oldPath = mPathBuilder.get();
+
+  if (!mPathBuilder) {
+    mPathBuilder = mDT->CreatePathBuilder(FillRule::FILL_WINDING);
+
+    if (mPathIsRect) {
+      mPathBuilder->MoveTo(mRect.TopLeft());
+      mPathBuilder->LineTo(mRect.TopRight());
+      mPathBuilder->LineTo(mRect.BottomRight());
+      mPathBuilder->LineTo(mRect.BottomLeft());
+      mPathBuilder->Close();
+    }
+  }
+
+  if (mTransformChanged) {
+    MOZ_ASSERT(oldPath);
+    MOZ_ASSERT(!mPathIsRect);
+
+    Matrix invTransform = mAzureState.transform;
+    invTransform.Invert();
+    Matrix toNewUS = mPathTransform * invTransform;
+
+    RefPtr<Path> path = mPathBuilder->Finish();
+    if (!path) {
+      gfxCriticalError()
+          << "gfxContext::EnsurePathBuilder failed in PathBuilder::Finish";
+    }
+    mPathBuilder = Path::ToBuilder(path.forget(), toNewUS);
+  }
+
+  mPathIsRect = false;
+}
+
+CompositionOp gfxContext::GetOp() const {
+  if (mAzureState.op != CompositionOp::OP_SOURCE) {
+    return mAzureState.op;
+  }
+
+  if (mAzureState.pattern) {
+    if (mAzureState.pattern->IsOpaque()) {
+      return CompositionOp::OP_OVER;
+    } else {
+      return CompositionOp::OP_SOURCE;
+    }
+  } else {
+    if (mAzureState.color.a > 0.999) {
+      return CompositionOp::OP_OVER;
+    } else {
+      return CompositionOp::OP_SOURCE;
+    }
+  }
+}
+
+void gfxContext::ChangeTransform(const Matrix& aNewMatrix,
+                                 bool aUpdatePatternTransform) {
+  if (aUpdatePatternTransform && (mAzureState.pattern) &&
+      !mAzureState.patternTransformChanged) {
+    mAzureState.patternTransform = GetDTTransform();
+    mAzureState.patternTransformChanged = true;
+  }
+
+  if (mPathIsRect) {
+    Matrix invMatrix = aNewMatrix;
+
+    invMatrix.Invert();
+
+    Matrix toNewUS = mAzureState.transform * invMatrix;
+
+    if (toNewUS.IsRectilinear()) {
+      mRect = toNewUS.TransformBounds(mRect);
+      mRect.NudgeToIntegers();
+    } else {
+      mPathBuilder = mDT->CreatePathBuilder(FillRule::FILL_WINDING);
+
+      mPathBuilder->MoveTo(toNewUS.TransformPoint(mRect.TopLeft()));
+      mPathBuilder->LineTo(toNewUS.TransformPoint(mRect.TopRight()));
+      mPathBuilder->LineTo(toNewUS.TransformPoint(mRect.BottomRight()));
+      mPathBuilder->LineTo(toNewUS.TransformPoint(mRect.BottomLeft()));
+      mPathBuilder->Close();
+
+      mPathIsRect = false;
+    }
+
+    mTransformChanged = false;
+  } else if ((mPath || mPathBuilder) && !mTransformChanged) {
+    mTransformChanged = true;
+    mPathTransform = mAzureState.transform;
+  }
+
+  mAzureState.transform = aNewMatrix;
+
+  mDT->SetTransform(GetDTTransform());
+}
+
+Rect gfxContext::GetAzureDeviceSpaceClipBounds() const {
+  Rect rect(mAzureState.deviceOffset.x + Float(mDT->GetRect().x),
+            mAzureState.deviceOffset.y + Float(mDT->GetRect().y),
+            Float(mDT->GetSize().width), Float(mDT->GetSize().height));
+  ForAllClips([&](const AzureState::PushedClip& aClip) -> void {
+    if (aClip.path) {
+      rect.IntersectRect(rect, aClip.path->GetBounds(aClip.transform));
+    } else {
+      rect.IntersectRect(rect, aClip.transform.TransformBounds(aClip.rect));
+    }
+  });
+
+  return rect;
+}
+
+template <typename F>
+void gfxContext::ForAllClips(F&& aLambda) const {
+  for (const auto& state : mSavedStates) {
+    for (const auto& clip : state.pushedClips) {
+      aLambda(clip);
+    }
+  }
+  for (const auto& clip : mAzureState.pushedClips) {
+    aLambda(clip);
+  }
+}

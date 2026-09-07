@@ -1,0 +1,64 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+"use strict";
+
+
+
+var ArrayBuffer_transfer = function (buffer, size = buffer.byteLength) {
+  let u8out = new Uint8Array(size);
+  let u8buffer = new Uint8Array(buffer, 0, Math.min(size, buffer.byteLength));
+  u8out.set(u8buffer);
+  return u8out.buffer;
+};
+
+var libraries = {};
+
+var Library = class Library {
+  constructor(name, names, definitions) {
+    if (name in libraries) {
+      return libraries[name];
+    }
+
+    for (let name of names) {
+      try {
+        if (!this.library) {
+          this.library = ctypes.open(name);
+        }
+      } catch (e) {
+      }
+    }
+    if (!this.library) {
+      throw new Error("Could not load libc");
+    }
+
+    libraries[name] = this;
+
+    for (let symbol of Object.keys(definitions)) {
+      this.declare(symbol, ...definitions[symbol]);
+    }
+  }
+
+  declare(name, ...args) {
+    Object.defineProperty(this, name, {
+      configurable: true,
+      get() {
+        Object.defineProperty(this, name, {
+          configurable: true,
+          value: this.library.declare(name, ...args),
+        });
+
+        return this[name];
+      },
+    });
+  }
+};
+
+var SubprocessConstants = {
+  ERROR_END_OF_FILE: 0xff7a0001,
+  ERROR_INVALID_JSON: 0xff7a0002,
+  ERROR_BAD_EXECUTABLE: 0xff7a0003,
+  ERROR_INVALID_OPTION: 0xff7a0004,
+};
+
+Object.freeze(SubprocessConstants);

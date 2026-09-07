@@ -1,0 +1,49 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/SVGAnimateTransformElement.h"
+
+#include "mozilla/dom/SVGAnimateTransformElementBinding.h"
+
+NS_IMPL_NS_NEW_SVG_ELEMENT(AnimateTransform)
+
+namespace mozilla::dom {
+
+JSObject* SVGAnimateTransformElement::WrapNode(
+    JSContext* aCx, JS::Handle<JSObject*> aGivenProto) {
+  return SVGAnimateTransformElement_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+
+SVGAnimateTransformElement::SVGAnimateTransformElement(
+    already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo)
+    : SVGAnimationElement(std::move(aNodeInfo)) {}
+
+bool SVGAnimateTransformElement::ParseAttribute(
+    int32_t aNamespaceID, nsAtom* aAttribute, const nsAString& aValue,
+    nsIPrincipal* aMaybeScriptedPrincipal, nsAttrValue& aResult) {
+  if (aNamespaceID == kNameSpaceID_None && aAttribute == nsGkAtoms::type) {
+    aResult.ParseAtom(aValue);
+    nsAtom* atom = aResult.GetAtomValue();
+    if (atom != nsGkAtoms::translate && atom != nsGkAtoms::scale &&
+        atom != nsGkAtoms::rotate && atom != nsGkAtoms::skewX &&
+        atom != nsGkAtoms::skewY) {
+      ReportAttributeParseFailure(OwnerDoc(), aAttribute, aValue);
+    }
+    return true;
+  }
+
+  return SVGAnimationElement::ParseAttribute(aNamespaceID, aAttribute, aValue,
+                                             aMaybeScriptedPrincipal, aResult);
+}
+
+
+NS_IMPL_ELEMENT_CLONE_WITH_INIT(SVGAnimateTransformElement)
+
+
+SMILAnimationFunction& SVGAnimateTransformElement::AnimationFunction() {
+  return mAnimationFunction;
+}
+
+}  

@@ -1,0 +1,145 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_BounceTrackingStateGlobal_h
+#define mozilla_BounceTrackingStateGlobal_h
+
+#include "BounceTrackingMapEntry.h"
+#include "BounceTrackingProtectionStorage.h"
+#include "BounceTrackingRecord.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/WeakPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsTHashMap.h"
+#include "nsTArray.h"
+#include "nsISupports.h"
+#include "fmt/format.h"
+
+namespace mozilla {
+
+struct BounceTrackerCandidate {
+  PRTime mBounceTime;
+  RefPtr<BounceTrackingRecord> mRecord;
+};
+
+class BounceTrackingStateGlobal final {
+ public:
+  NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(BounceTrackingStateGlobal);
+  NS_DECL_CYCLE_COLLECTION_NATIVE_CLASS(BounceTrackingStateGlobal);
+
+  BounceTrackingStateGlobal(BounceTrackingProtectionStorage* aStorage,
+                            const OriginAttributes& aAttrs);
+
+  bool IsPrivateBrowsing() const {
+    return mOriginAttributes.IsPrivateBrowsing();
+  }
+
+  bool ShouldPersistToDisk() const { return !IsPrivateBrowsing(); }
+
+  const OriginAttributes& OriginAttributesRef() const {
+    return mOriginAttributes;
+  };
+
+  bool HasUserActivation(const nsACString& aSiteHost) const;
+
+  [[nodiscard]] nsresult RecordUserActivation(const nsACString& aSiteHost,
+                                              PRTime aTime,
+                                              bool aSkipStorage = false);
+
+  [[nodiscard]] nsresult TestRemoveUserActivation(const nsACString& aSiteHost);
+
+  [[nodiscard]] nsresult ClearUserActivationBefore(PRTime aTime);
+
+  bool HasBounceTracker(const nsACString& aSiteHost) const;
+
+  [[nodiscard]] nsresult RecordBounceTracker(
+      const nsACString& aSiteHost, PRTime aTime, bool aSkipStorage = false,
+      BounceTrackingRecord* aRecord = nullptr);
+
+  [[nodiscard]] nsresult RecordPurgedTracker(
+      const RefPtr<BounceTrackingPurgeEntry>& aEntry);
+
+  [[nodiscard]] nsresult RemoveBounceTrackers(
+      const nsTArray<nsCString>& aSiteHosts);
+
+  [[nodiscard]] nsresult ClearByType(
+      BounceTrackingProtectionStorage::EntryType aType, bool aSkipStorage);
+
+  [[nodiscard]] nsresult ClearSiteHost(const nsACString& aSiteHost,
+                                       bool aSkipStorage = false);
+
+  [[nodiscard]] nsresult ClearByTimeRange(
+      PRTime aFrom, Maybe<PRTime> aTo = Nothing(),
+      Maybe<BounceTrackingProtectionStorage::EntryType> aEntryType = Nothing(),
+      bool aSkipStorage = false);
+
+  const nsTHashMap<nsCStringHashKey, PRTime>& UserActivationMapRef() {
+    return mUserActivation;
+  }
+
+  const nsTHashMap<nsCStringHashKey, BounceTrackerCandidate>&
+  BounceTrackersMapRef() {
+    return mBounceTrackers;
+  }
+
+  const nsTHashMap<nsCStringHashKey,
+                   nsTArray<RefPtr<BounceTrackingPurgeEntry>>>&
+  RecentPurgesMapRef() {
+    return mRecentPurges;
+  }
+
+ private:
+  ~BounceTrackingStateGlobal() = default;
+
+  WeakPtr<BounceTrackingProtectionStorage> mStorage;
+
+  OriginAttributes mOriginAttributes;
+
+  nsTHashMap<nsCStringHashKey, PRTime> mUserActivation;
+
+  nsTHashMap<nsCStringHashKey, BounceTrackerCandidate> mBounceTrackers;
+
+  nsTHashMap<nsCStringHashKey, nsTArray<RefPtr<BounceTrackingPurgeEntry>>>
+      mRecentPurges;
+
+  friend struct fmt::formatter<BounceTrackingStateGlobal>;
+};
+
+}  
+
+template <>
+struct fmt::formatter<mozilla::BounceTrackingStateGlobal>
+    : fmt::formatter<std::string_view> {
+  auto format(const mozilla::BounceTrackingStateGlobal& aGlobal,
+              fmt::format_context& aCtx) const {
+    nsAutoCString originAttributeSuffix;
+    aGlobal.mOriginAttributes.CreateSuffix(originAttributeSuffix);
+
+    auto out = aCtx.out();
+    out = fmt::format_to(out, "{{ mOriginAttributes: {}, mUserActivation: {{",
+                         originAttributeSuffix);
+    bool first = true;
+    for (auto iter = aGlobal.mUserActivation.ConstIter(); !iter.Done();
+         iter.Next()) {
+      if (!first) {
+        out = fmt::format_to(out, ", ");
+      }
+      out = fmt::format_to(out, "{}: {}", iter.Key(), iter.Data());
+      first = false;
+    }
+    out = fmt::format_to(out, "}}, mBounceTrackers: {{");
+    first = true;
+    for (auto iter = aGlobal.mBounceTrackers.ConstIter(); !iter.Done();
+         iter.Next()) {
+      if (!first) {
+        out = fmt::format_to(out, ", ");
+      }
+      out = fmt::format_to(out, "{}: {}", iter.Key(), iter.Data().mBounceTime);
+      first = false;
+    }
+    return fmt::format_to(out, "}} }}");
+  }
+};
+
+#endif

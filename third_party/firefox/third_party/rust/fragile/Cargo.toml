@@ -1,0 +1,31 @@
+
+[package]
+edition = "2018"
+name = "fragile"
+version = "2.0.1"
+authors = ["Armin Ronacher <armin.ronacher@active-4.com>"]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Provides wrapper types for sending non-send values to other threads."
+homepage = "https://github.com/mitsuhiko/fragile"
+keywords = [
+    "send",
+    "cell",
+    "non-send",
+    "send-wrapper",
+    "failure",
+]
+license = "Apache-2.0"
+repository = "https://github.com/mitsuhiko/fragile"
+
+[lib]
+name = "fragile"
+path = "src/lib.rs"
+
+[dependencies.slab]
+version = "0.4.5"
+optional = true

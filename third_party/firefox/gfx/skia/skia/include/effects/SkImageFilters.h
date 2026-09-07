@@ -1,0 +1,266 @@
+/*
+ * Copyright 2019 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkImageFilters_DEFINED)
+#define SkImageFilters_DEFINED
+
+#include "include/core/SkColor.h"
+#include "include/core/SkColorSpace.h"
+#include "include/core/SkImage.h"
+#include "include/core/SkImageFilter.h"
+#include "include/core/SkPicture.h"
+#include "include/core/SkRect.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkScalar.h"
+#include "include/core/SkShader.h"
+#include "include/core/SkTileMode.h"
+#include "include/core/SkTypes.h"
+
+#include <cstddef>
+#include <optional>
+#include <string_view>
+#include <utility>
+
+class SkBlender;
+class SkColorFilter;
+class SkMatrix;
+class SkRuntimeEffectBuilder;
+enum class SkBlendMode;
+struct SkIPoint;
+struct SkISize;
+struct SkPoint3;
+struct SkSamplingOptions;
+
+class SK_API SkImageFilters {
+public:
+    struct CropRect : public std::optional<SkRect> {
+        CropRect() {}
+        CropRect(const SkIRect& crop) : std::optional<SkRect>(SkRect::Make(crop)) {}
+        CropRect(const SkRect& crop) : std::optional<SkRect>(crop) {}
+        CropRect(const std::optional<SkRect>& crop) : std::optional<SkRect>(crop) {}
+        CropRect(const std::nullopt_t&) : std::optional<SkRect>() {}
+
+        CropRect(std::nullptr_t) {}
+        CropRect(const SkIRect* optionalCrop) {
+            if (optionalCrop) {
+                *this = SkRect::Make(*optionalCrop);
+            }
+        }
+        CropRect(const SkRect* optionalCrop) {
+            if (optionalCrop) {
+                *this = *optionalCrop;
+            }
+        }
+
+        bool operator==(const CropRect& o) const {
+            return this->has_value() == o.has_value() &&
+                   (!this->has_value() || this->value() == *o);
+        }
+    };
+
+    static sk_sp<SkImageFilter> Arithmetic(SkScalar k1, SkScalar k2, SkScalar k3, SkScalar k4,
+                                           bool enforcePMColor, sk_sp<SkImageFilter> background,
+                                           sk_sp<SkImageFilter> foreground,
+                                           const CropRect& cropRect = {});
+
+    static sk_sp<SkImageFilter> Blend(SkBlendMode mode, sk_sp<SkImageFilter> background,
+                                      sk_sp<SkImageFilter> foreground = nullptr,
+                                      const CropRect& cropRect = {});
+
+    static sk_sp<SkImageFilter> Blend(sk_sp<SkBlender> blender, sk_sp<SkImageFilter> background,
+                                      sk_sp<SkImageFilter> foreground = nullptr,
+                                      const CropRect& cropRect = {});
+
+    static sk_sp<SkImageFilter> Blur(SkScalar sigmaX, SkScalar sigmaY, SkTileMode tileMode,
+                                     sk_sp<SkImageFilter> input, const CropRect& cropRect = {});
+    static sk_sp<SkImageFilter> Blur(SkScalar sigmaX, SkScalar sigmaY, sk_sp<SkImageFilter> input,
+                                     const CropRect& cropRect = {}) {
+        return Blur(sigmaX, sigmaY, SkTileMode::kDecal, std::move(input), cropRect);
+    }
+
+    static sk_sp<SkImageFilter> ColorFilter(sk_sp<SkColorFilter> cf, sk_sp<SkImageFilter> input,
+                                            const CropRect& cropRect = {});
+
+    static sk_sp<SkImageFilter> Compose(sk_sp<SkImageFilter> outer, sk_sp<SkImageFilter> inner);
+
+    static sk_sp<SkImageFilter> Crop(const SkRect& rect,
+                                     SkTileMode tileMode,
+                                     sk_sp<SkImageFilter> input);
+    static sk_sp<SkImageFilter> Crop(const SkRect& rect, sk_sp<SkImageFilter> input) {
+        return Crop(rect, SkTileMode::kDecal, std::move(input));
+    }
+
+    static sk_sp<SkImageFilter> DisplacementMap(SkColorChannel xChannelSelector,
+                                                SkColorChannel yChannelSelector,
+                                                SkScalar scale, sk_sp<SkImageFilter> displacement,
+                                                sk_sp<SkImageFilter> color,
+                                                const CropRect& cropRect = {});
+
+    static sk_sp<SkImageFilter> DropShadow(SkScalar dx, SkScalar dy,
+                                           SkScalar sigmaX, SkScalar sigmaY,
+                                           SkColor4f color, sk_sp<SkColorSpace> colorSpace,
+                                           sk_sp<SkImageFilter> input,
+                                           const CropRect& cropRect = {});
+    static sk_sp<SkImageFilter> DropShadow(SkScalar dx, SkScalar dy,
+                                           SkScalar sigmaX, SkScalar sigmaY,
+                                           SkColor color, sk_sp<SkImageFilter> input,
+                                           const CropRect& cropRect = {}) {
+        return DropShadow(dx, dy,
+                          sigmaX, sigmaY,
+                          SkColor4f::FromColor(color), nullptr,
+                          std::move(input),
+                          cropRect);
+    }
+
+    static sk_sp<SkImageFilter> DropShadowOnly(SkScalar dx, SkScalar dy,
+                                               SkScalar sigmaX, SkScalar sigmaY,
+                                               SkColor4f color, sk_sp<SkColorSpace>,
+                                               sk_sp<SkImageFilter> input,
+                                               const CropRect& cropRect = {});
+    static sk_sp<SkImageFilter> DropShadowOnly(SkScalar dx, SkScalar dy,
+                                               SkScalar sigmaX, SkScalar sigmaY,
+                                               SkColor color, sk_sp<SkImageFilter> input,
+                                               const CropRect& cropRect = {}) {
+        return DropShadowOnly(dx, dy,
+                              sigmaX, sigmaY,
+                              SkColor4f::FromColor(color), nullptr,
+                              std::move(input),
+                              cropRect);
+    }
+
+    static sk_sp<SkImageFilter> Empty();
+
+    static sk_sp<SkImageFilter> Image(sk_sp<SkImage> image, const SkRect& srcRect,
+                                      const SkRect& dstRect, const SkSamplingOptions& sampling);
+
+    static sk_sp<SkImageFilter> Image(sk_sp<SkImage> image, const SkSamplingOptions& sampling) {
+        if (image) {
+            SkRect r = SkRect::Make(image->bounds());
+            return Image(std::move(image), r, r, sampling);
+        } else {
+            return nullptr;
+        }
+    }
+
+    static sk_sp<SkImageFilter> Magnifier(const SkRect& lensBounds,
+                                          SkScalar zoomAmount,
+                                          SkScalar inset,
+                                          const SkSamplingOptions& sampling,
+                                          sk_sp<SkImageFilter> input,
+                                          const CropRect& cropRect = {});
+
+    static sk_sp<SkImageFilter> MatrixConvolution(const SkISize& kernelSize,
+                                                  const SkScalar kernel[], SkScalar gain,
+                                                  SkScalar bias, const SkIPoint& kernelOffset,
+                                                  SkTileMode tileMode, bool convolveAlpha,
+                                                  sk_sp<SkImageFilter> input,
+                                                  const CropRect& cropRect = {});
+
+    static sk_sp<SkImageFilter> MatrixTransform(const SkMatrix& matrix,
+                                                const SkSamplingOptions& sampling,
+                                                sk_sp<SkImageFilter> input);
+
+    static sk_sp<SkImageFilter> Merge(sk_sp<SkImageFilter>* const filters, int count,
+                                      const CropRect& cropRect = {});
+    static sk_sp<SkImageFilter> Merge(sk_sp<SkImageFilter> first, sk_sp<SkImageFilter> second,
+                                      const CropRect& cropRect = {}) {
+        sk_sp<SkImageFilter> array[] = { std::move(first), std::move(second) };
+        return Merge(array, 2, cropRect);
+    }
+
+    static sk_sp<SkImageFilter> Offset(SkScalar dx, SkScalar dy, sk_sp<SkImageFilter> input,
+                                       const CropRect& cropRect = {});
+
+    static sk_sp<SkImageFilter> Picture(sk_sp<SkPicture> pic, const SkRect& targetRect);
+    static sk_sp<SkImageFilter> Picture(sk_sp<SkPicture> pic) {
+        SkRect target = pic ? pic->cullRect() : SkRect::MakeEmpty();
+        return Picture(std::move(pic), target);
+    }
+
+    static sk_sp<SkImageFilter> RuntimeShader(const SkRuntimeEffectBuilder& builder,
+                                              std::string_view childShaderName,
+                                              sk_sp<SkImageFilter> input) {
+        return RuntimeShader(builder, 0.f, childShaderName, std::move(input));
+    }
+
+    static sk_sp<SkImageFilter> RuntimeShader(const SkRuntimeEffectBuilder& builder,
+                                              SkScalar sampleRadius,
+                                              std::string_view childShaderName,
+                                              sk_sp<SkImageFilter> input);
+
+    static sk_sp<SkImageFilter> RuntimeShader(const SkRuntimeEffectBuilder& builder,
+                                              std::string_view childShaderNames[],
+                                              const sk_sp<SkImageFilter> inputs[],
+                                              int inputCount) {
+        return RuntimeShader(builder, 0.f, childShaderNames,
+                             inputs, inputCount);
+    }
+
+    static sk_sp<SkImageFilter> RuntimeShader(const SkRuntimeEffectBuilder& builder,
+                                              SkScalar maxSampleRadius,
+                                              std::string_view childShaderNames[],
+                                              const sk_sp<SkImageFilter> inputs[],
+                                              int inputCount);
+
+    enum class Dither : bool {
+        kNo = false,
+        kYes = true
+    };
+
+    static sk_sp<SkImageFilter> Shader(sk_sp<SkShader> shader, const CropRect& cropRect = {}) {
+        return Shader(std::move(shader), Dither::kNo, cropRect);
+    }
+    static sk_sp<SkImageFilter> Shader(sk_sp<SkShader> shader, Dither dither,
+                                       const CropRect& cropRect = {});
+
+    static sk_sp<SkImageFilter> Tile(const SkRect& src, const SkRect& dst,
+                                     sk_sp<SkImageFilter> input);
+
+
+    static sk_sp<SkImageFilter> Dilate(SkScalar radiusX, SkScalar radiusY,
+                                       sk_sp<SkImageFilter> input,
+                                       const CropRect& cropRect = {});
+
+    static sk_sp<SkImageFilter> Erode(SkScalar radiusX, SkScalar radiusY,
+                                      sk_sp<SkImageFilter> input,
+                                      const CropRect& cropRect = {});
+
+
+    static sk_sp<SkImageFilter> DistantLitDiffuse(const SkPoint3& direction, SkColor lightColor,
+                                                  SkScalar surfaceScale, SkScalar kd,
+                                                  sk_sp<SkImageFilter> input,
+                                                  const CropRect& cropRect = {});
+    static sk_sp<SkImageFilter> PointLitDiffuse(const SkPoint3& location, SkColor lightColor,
+                                                SkScalar surfaceScale, SkScalar kd,
+                                                sk_sp<SkImageFilter> input,
+                                                const CropRect& cropRect = {});
+    static sk_sp<SkImageFilter> SpotLitDiffuse(const SkPoint3& location, const SkPoint3& target,
+                                               SkScalar falloffExponent, SkScalar cutoffAngle,
+                                               SkColor lightColor, SkScalar surfaceScale,
+                                               SkScalar kd, sk_sp<SkImageFilter> input,
+                                               const CropRect& cropRect = {});
+
+    static sk_sp<SkImageFilter> DistantLitSpecular(const SkPoint3& direction, SkColor lightColor,
+                                                   SkScalar surfaceScale, SkScalar ks,
+                                                   SkScalar shininess, sk_sp<SkImageFilter> input,
+                                                   const CropRect& cropRect = {});
+    static sk_sp<SkImageFilter> PointLitSpecular(const SkPoint3& location, SkColor lightColor,
+                                                 SkScalar surfaceScale, SkScalar ks,
+                                                 SkScalar shininess, sk_sp<SkImageFilter> input,
+                                                 const CropRect& cropRect = {});
+    static sk_sp<SkImageFilter> SpotLitSpecular(const SkPoint3& location, const SkPoint3& target,
+                                                SkScalar falloffExponent, SkScalar cutoffAngle,
+                                                SkColor lightColor, SkScalar surfaceScale,
+                                                SkScalar ks, SkScalar shininess,
+                                                sk_sp<SkImageFilter> input,
+                                                const CropRect& cropRect = {});
+
+private:
+    SkImageFilters() = delete;
+};
+
+#endif

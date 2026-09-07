@@ -1,0 +1,222 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#define NS_HTML5_TREE_BUILDER_HANDLE_ARRAY_LENGTH 512
+private:
+using Encoding = mozilla::Encoding;
+template <typename T>
+using NotNull = mozilla::NotNull<T>;
+
+nsHtml5OplessBuilder* mBuilder;
+nsHtml5Highlighter* mViewSource;
+mozilla::ImportScanner mImportScanner;
+nsTArray<nsHtml5TreeOperation> mOpQueue;
+nsTArray<nsHtml5SpeculativeLoad> mSpeculativeLoadQueue;
+nsAHtml5TreeOpSink* mOpSink;
+mozilla::UniquePtr<nsIContent*[]> mHandles;
+int32_t mHandlesUsed;
+nsTArray<mozilla::UniquePtr<nsIContent*[]>> mOldHandles;
+nsHtml5TreeOpStage* mSpeculativeLoadStage;
+nsresult mBroken;
+bool mCurrentHtmlScriptCannotDocumentWriteOrBlock;
+bool mPreventScriptExecution;
+bool mGenerateSpeculativeLoads;
+
+bool mHasSeenImportMap;
+#ifdef DEBUG
+bool mActive;
+#endif
+
+void documentMode(nsHtml5DocumentMode m);
+
+nsIContentHandle* getDocumentFragmentForTemplate(nsIContentHandle* aTemplate);
+void setDocumentFragmentForTemplate(nsIContentHandle* aTemplate,
+                                    nsIContentHandle* aFragment);
+
+nsIContentHandle* getShadowRootFromHost(
+    nsIContentHandle* aHost, nsIContentHandle* aTemplateNode,
+    nsHtml5String aShadowRootMode, bool aShadowRootIsClonable,
+    bool aShadowRootIsSerializable, bool aShadowRootDelegatesFocus,
+    bool aShadowRootCustomElementRegistry,
+    nsHtml5String aShadowRootSlotAssignment,
+    nsHtml5String aShadowRootReferenceTarget);
+
+nsIContentHandle* getFormPointerForContext(nsIContentHandle* aContext);
+
+nsIContentHandle* AllocateContentHandle();
+
+void accumulateCharactersForced(const char16_t* aBuf, int32_t aStart,
+                                int32_t aLength) {
+  accumulateCharacters(aBuf, aStart, aLength);
+}
+
+void MarkAsBrokenAndRequestSuspensionWithBuilder(nsresult aRv) {
+  mBuilder->MarkAsBroken(aRv);
+  requestSuspension();
+}
+
+void MarkAsBrokenAndRequestSuspensionWithoutBuilder(nsresult aRv) {
+  MarkAsBroken(aRv);
+  requestSuspension();
+}
+
+void MarkAsBrokenFromPortability(nsresult aRv);
+
+public:
+explicit nsHtml5TreeBuilder(nsHtml5OplessBuilder* aBuilder);
+
+nsHtml5TreeBuilder(nsAHtml5TreeOpSink* aOpSink, nsHtml5TreeOpStage* aStage,
+                   bool aGenerateSpeculativeLoads);
+
+~nsHtml5TreeBuilder();
+
+bool WantsLineAndColumn() {
+  return !(mBuilder && mPreventScriptExecution);
+}
+
+void StartPlainTextViewSource(const nsAutoString& aTitle);
+
+void StartPlainText();
+
+void StartPlainTextBody();
+
+bool HasScriptThatMayDocumentWriteOrBlock();
+
+void SetOpSink(nsAHtml5TreeOpSink* aOpSink) { mOpSink = aOpSink; }
+
+void ClearOps() { mOpQueue.Clear(); }
+
+mozilla::Result<bool, nsresult> Flush(bool aDiscretionary = false);
+
+void FlushLoads();
+
+void SetDocumentCharset(NotNull<const Encoding*> aEncoding,
+                        nsCharsetSource aCharsetSource,
+                        bool aCommitEncodingSpeculation);
+
+void UpdateCharsetSource(nsCharsetSource aCharsetSource);
+
+void StreamEnded();
+
+void NeedsCharsetSwitchTo(NotNull<const Encoding*> aEncoding, int32_t aSource,
+                          int32_t aLineNumber);
+
+void MaybeComplainAboutCharset(const char* aMsgId, bool aError,
+                               int32_t aLineNumber);
+
+void TryToEnableEncodingMenu();
+
+void AddSnapshotToScript(nsAHtml5TreeBuilderState* aSnapshot, int32_t aLine);
+
+void DropHandles();
+
+void SetPreventScriptExecution(bool aPrevent) {
+  mPreventScriptExecution = aPrevent;
+}
+
+bool HasBuilder() { return mBuilder; }
+
+bool EnsureBufferSpace(int32_t aLength);
+
+void EnableViewSource(nsHtml5Highlighter* aHighlighter);
+
+void errDeepTree();
+
+void errStrayStartTag(nsAtom* aName);
+
+void errStrayEndTag(nsAtom* aName);
+
+void errUnclosedElements(int32_t aIndex, nsAtom* aName);
+
+void errUnclosedElementsImplied(int32_t aIndex, nsAtom* aName);
+
+void errUnclosedElementsCell(int32_t aIndex);
+
+void errStrayDoctype();
+
+void errAlmostStandardsDoctype();
+
+void errQuirkyDoctype();
+
+void errNonSpaceInTrailer();
+
+void errNonSpaceAfterFrameset();
+
+void errNonSpaceInFrameset();
+
+void errNonSpaceAfterBody();
+
+void errNonSpaceInColgroupInFragment();
+
+void errNonSpaceInNoscriptInHead();
+
+void errFooBetweenHeadAndBody(nsAtom* aName);
+
+void errStartTagWithoutDoctype();
+
+void errNoSelectInTableScope();
+
+void errStartSelectWhereEndSelectExpected();
+
+void errStartTagWithSelectOpen(nsAtom* aName);
+
+void errBadStartTagInNoscriptInHead(nsAtom* aName);
+
+void errImage();
+
+void errIsindex();
+
+void errFooSeenWhenFooOpen(nsAtom* aName);
+
+void errHeadingWhenHeadingOpen();
+
+void errFramesetStart();
+
+void errNoCellToClose();
+
+void errStartTagInTable(nsAtom* aName);
+
+void errFormWhenFormOpen();
+
+void errTableSeenWhileTableOpen();
+
+void errStartTagInTableBody(nsAtom* aName);
+
+void errEndTagSeenWithoutDoctype();
+
+void errEndTagAfterBody();
+
+void errEndTagSeenWithSelectOpen(nsAtom* aName);
+
+void errGarbageInColgroup();
+
+void errEndTagBr();
+
+void errNoElementToCloseButEndTagSeen(nsAtom* aName);
+
+void errHtmlStartTagInForeignContext(nsAtom* aName);
+
+void errNoTableRowToClose();
+
+void errNonSpaceInTable();
+
+void errUnclosedChildrenInRuby();
+
+void errStartTagSeenWithoutRuby(nsAtom* aName);
+
+void errSelfClosing();
+
+void errNoCheckUnclosedElementsOnStack();
+
+void errEndTagDidNotMatchCurrentOpenElement(nsAtom* aName, nsAtom* aOther);
+
+void errEndTagViolatesNestingRules(nsAtom* aName);
+
+void errEndWithUnclosedElements(nsAtom* aName);
+
+void errListUnclosedStartTags(int32_t aIgnored);
+
+void MarkAsBroken(nsresult aRv);
+
+nsresult IsBroken() { return mBroken; }

@@ -1,0 +1,278 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsProxyRelease_h_
+#define nsProxyRelease_h_
+
+#include <utility>
+
+#include "MainThreadUtils.h"
+#include "mozilla/Likely.h"
+#include "nsCOMPtr.h"
+#include "nsIEventTarget.h"
+#include "nsISerialEventTarget.h"
+#include "nsIThread.h"
+#include "nsPrintfCString.h"
+#include "nsThreadUtils.h"
+
+#ifdef XPCOM_GLUE_AVOID_NSPR
+#  error NS_ProxyRelease implementation depends on NSPR.
+#endif
+
+class nsIRunnable;
+
+namespace detail {
+
+template <typename T>
+class ProxyReleaseEvent : public mozilla::CancelableRunnable {
+ public:
+  ProxyReleaseEvent(const char* aName, already_AddRefed<T> aDoomed)
+      : CancelableRunnable(aName), mDoomed(aDoomed.take()) {}
+
+  NS_IMETHOD Run() override {
+    NS_IF_RELEASE(mDoomed);
+    return NS_OK;
+  }
+
+  nsresult Cancel() override { return Run(); }
+
+#ifdef MOZ_COLLECTING_RUNNABLE_TELEMETRY
+  NS_IMETHOD GetName(nsACString& aName) override {
+    if (mName) {
+      aName.Append(nsPrintfCString("ProxyReleaseEvent for %s", mName));
+    } else {
+      aName.AssignLiteral("ProxyReleaseEvent");
+    }
+    return NS_OK;
+  }
+#endif
+
+ private:
+  T* MOZ_OWNING_REF mDoomed;
+};
+
+template <typename T>
+nsresult ProxyRelease(const char* aName, nsIEventTarget* aTarget,
+                      already_AddRefed<T> aDoomed, bool aAlwaysProxy) {
+  RefPtr<T> doomed = aDoomed;
+  nsresult rv;
+
+  if (!doomed || !aTarget) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  if (!aAlwaysProxy) {
+    bool onCurrentThread = false;
+    rv = aTarget->IsOnCurrentThread(&onCurrentThread);
+    if (NS_SUCCEEDED(rv) && onCurrentThread) {
+      return NS_OK;
+    }
+  }
+
+  nsCOMPtr<nsIRunnable> ev = new ProxyReleaseEvent<T>(aName, doomed.forget());
+
+  rv = aTarget->Dispatch(ev, NS_DISPATCH_NORMAL);
+  if (NS_FAILED(rv)) {
+    NS_WARNING(
+        nsPrintfCString("failed to post proxy release event for %s, leaking!",
+                        aName ? aName : "pointer")
+            .get());
+  }
+  return rv;
+}
+
+template <bool nsISupportsBased>
+struct ProxyReleaseChooser {
+  template <typename T>
+  static nsresult ProxyRelease(const char* aName, nsIEventTarget* aTarget,
+                               already_AddRefed<T> aDoomed, bool aAlwaysProxy) {
+    return ::detail::ProxyRelease(aName, aTarget, std::move(aDoomed),
+                                  aAlwaysProxy);
+  }
+};
+
+template <>
+struct ProxyReleaseChooser<true> {
+  template <typename T>
+  static nsresult ProxyRelease(const char* aName, nsIEventTarget* aTarget,
+                               already_AddRefed<T> aDoomed, bool aAlwaysProxy) {
+    return ProxyReleaseISupports(aName, aTarget, ToSupports(aDoomed.take()),
+                                 aAlwaysProxy);
+  }
+
+  static nsresult ProxyReleaseISupports(const char* aName,
+                                        nsIEventTarget* aTarget,
+                                        nsISupports* aDoomed,
+                                        bool aAlwaysProxy);
+};
+
+}  
+
+template <class T>
+inline NS_HIDDEN_(nsresult)
+    NS_ProxyRelease(const char* aName, nsIEventTarget* aTarget,
+                    already_AddRefed<T> aDoomed, bool aAlwaysProxy = false) {
+  return ::detail::ProxyReleaseChooser<
+      std::is_base_of_v<nsISupports, T>>::ProxyRelease(aName, aTarget,
+                                                       std::move(aDoomed),
+                                                       aAlwaysProxy);
+}
+
+template <class T>
+inline NS_HIDDEN_(void)
+    NS_ReleaseOnMainThread(const char* aName, already_AddRefed<T> aDoomed,
+                           bool aAlwaysProxy = false) {
+  RefPtr<T> doomed = aDoomed;
+  if (!doomed) {
+    return;  
+  }
+
+  nsCOMPtr<nsIEventTarget> target;
+  if (!NS_IsMainThread() || aAlwaysProxy) {
+    target = mozilla::GetMainThreadSerialEventTarget();
+
+    if (!target) {
+      MOZ_ASSERT_UNREACHABLE("Could not get main thread; leaking an object!");
+      doomed.forget().leak();
+      return;
+    }
+  }
+
+  NS_ProxyRelease(aName, target, doomed.forget(), aAlwaysProxy);
+}
+
+template <class T>
+class MOZ_IS_SMARTPTR_TO_REFCOUNTED nsMainThreadPtrHolder final {
+ public:
+  nsMainThreadPtrHolder(const char* aName, T* aPtr, bool aStrict = true)
+      : mRawPtr(aPtr),
+        mStrict(aStrict)
+#ifndef RELEASE_OR_BETA
+        ,
+        mName(aName)
+#endif
+  {
+    MOZ_ASSERT(!mStrict || NS_IsMainThread());
+    NS_IF_ADDREF(mRawPtr);
+  }
+  nsMainThreadPtrHolder(const char* aName, already_AddRefed<T> aPtr,
+                        bool aStrict = true)
+      : mRawPtr(aPtr.take()),
+        mStrict(aStrict)
+#ifndef RELEASE_OR_BETA
+        ,
+        mName(aName)
+#endif
+  {
+  }
+
+  T& operator=(nsMainThreadPtrHolder& aOther) = delete;
+  nsMainThreadPtrHolder(const nsMainThreadPtrHolder& aOther) = delete;
+
+ private:
+  ~nsMainThreadPtrHolder() {
+    if (NS_IsMainThread()) {
+      NS_IF_RELEASE(mRawPtr);
+    } else if (mRawPtr) {
+      NS_ReleaseOnMainThread(
+#ifdef RELEASE_OR_BETA
+          nullptr,
+#else
+          mName,
+#endif
+          dont_AddRef(mRawPtr));
+    }
+  }
+
+ public:
+  T* get() const {
+    if (mStrict && MOZ_UNLIKELY(!NS_IsMainThread())) {
+      NS_ERROR("Can't dereference nsMainThreadPtrHolder off main thread");
+      MOZ_CRASH();
+    }
+    return mRawPtr;
+  }
+
+  bool operator==(const nsMainThreadPtrHolder<T>& aOther) const {
+    return mRawPtr == aOther.mRawPtr;
+  }
+  bool operator!() const { return !mRawPtr; }
+
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(nsMainThreadPtrHolder<T>)
+
+ private:
+  T* mRawPtr = nullptr;
+
+  bool mStrict = true;
+
+#ifndef RELEASE_OR_BETA
+  const char* mName = nullptr;
+#endif
+};
+
+template <class T>
+class MOZ_IS_SMARTPTR_TO_REFCOUNTED nsMainThreadPtrHandle {
+ public:
+  nsMainThreadPtrHandle() : mPtr(nullptr) {}
+  MOZ_IMPLICIT nsMainThreadPtrHandle(decltype(nullptr)) : mPtr(nullptr) {}
+  explicit nsMainThreadPtrHandle(nsMainThreadPtrHolder<T>* aHolder)
+      : mPtr(aHolder) {}
+  explicit nsMainThreadPtrHandle(
+      already_AddRefed<nsMainThreadPtrHolder<T>> aHolder)
+      : mPtr(aHolder) {}
+  nsMainThreadPtrHandle(const nsMainThreadPtrHandle& aOther) = default;
+  nsMainThreadPtrHandle(nsMainThreadPtrHandle&& aOther) = default;
+  nsMainThreadPtrHandle& operator=(const nsMainThreadPtrHandle& aOther) =
+      default;
+  nsMainThreadPtrHandle& operator=(nsMainThreadPtrHandle&& aOther) = default;
+  nsMainThreadPtrHandle& operator=(nsMainThreadPtrHolder<T>* aHolder) {
+    mPtr = aHolder;
+    return *this;
+  }
+
+  T* get() const {
+    if (mPtr) {
+      return mPtr.get()->get();
+    }
+    return nullptr;
+  }
+
+  operator T*() const { return get(); }
+  T* operator->() const MOZ_NO_ADDREF_RELEASE_ON_RETURN { return get(); }
+
+  bool operator==(const nsMainThreadPtrHandle<T>& aOther) const {
+    if (!mPtr || !aOther.mPtr) {
+      return mPtr == aOther.mPtr;
+    }
+    return *mPtr == *aOther.mPtr;
+  }
+  bool operator!=(const nsMainThreadPtrHandle<T>& aOther) const {
+    return !operator==(aOther);
+  }
+  bool operator==(decltype(nullptr)) const { return mPtr == nullptr; }
+  bool operator!=(decltype(nullptr)) const { return mPtr != nullptr; }
+  bool operator!() const { return !mPtr || !*mPtr; }
+
+ private:
+  RefPtr<nsMainThreadPtrHolder<T>> mPtr;
+};
+
+class nsCycleCollectionTraversalCallback;
+template <typename T>
+void CycleCollectionNoteChild(nsCycleCollectionTraversalCallback& aCallback,
+                              T* aChild, const char* aName, uint32_t aFlags);
+
+template <typename T>
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback,
+    nsMainThreadPtrHandle<T>& aField, const char* aName, uint32_t aFlags = 0) {
+  CycleCollectionNoteChild(aCallback, aField.get(), aName, aFlags);
+}
+
+template <typename T>
+inline void ImplCycleCollectionUnlink(nsMainThreadPtrHandle<T>& aField) {
+  aField = nullptr;
+}
+
+#endif

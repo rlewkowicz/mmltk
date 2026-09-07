@@ -1,0 +1,307 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "nsSplittableFrame.h"
+
+#include "mozilla/ReflowInput.h"
+#include "nsContainerFrame.h"
+#include "nsFieldSetFrame.h"
+#include "nsIFrameInlines.h"
+
+using namespace mozilla;
+
+NS_QUERYFRAME_HEAD(nsSplittableFrame)
+  NS_QUERYFRAME_ENTRY(nsSplittableFrame)
+NS_QUERYFRAME_TAIL_INHERITING(nsIFrame)
+
+void nsSplittableFrame::Init(nsIContent* aContent, nsContainerFrame* aParent,
+                             nsIFrame* aPrevInFlow) {
+  if (aPrevInFlow) {
+    SetPrevInFlow(aPrevInFlow);
+    aPrevInFlow->SetNextInFlow(this);
+  }
+  nsIFrame::Init(aContent, aParent, aPrevInFlow);
+}
+
+void nsSplittableFrame::Destroy(DestroyContext& aContext) {
+  if (mPrevContinuation || mNextContinuation) {
+    RemoveFromFlow(this);
+  }
+
+  nsIFrame::Destroy(aContext);
+}
+
+nsIFrame* nsSplittableFrame::GetPrevContinuation() const {
+  return mPrevContinuation;
+}
+
+void nsSplittableFrame::SetPrevContinuation(nsIFrame* aFrame) {
+  NS_ASSERTION(!aFrame || Type() == aFrame->Type(),
+               "setting a prev continuation with incorrect type!");
+  NS_ASSERTION(!IsInPrevContinuationChain(aFrame, this),
+               "creating a loop in continuation chain!");
+  mPrevContinuation = aFrame;
+  RemoveStateBits(NS_FRAME_IS_FLUID_CONTINUATION);
+  UpdateFirstContinuationAndFirstInFlowCache();
+}
+
+nsIFrame* nsSplittableFrame::GetNextContinuation() const {
+  return mNextContinuation;
+}
+
+void nsSplittableFrame::SetNextContinuation(nsIFrame* aFrame) {
+  NS_ASSERTION(!aFrame || Type() == aFrame->Type(),
+               "setting a next continuation with incorrect type!");
+  NS_ASSERTION(!IsInNextContinuationChain(aFrame, this),
+               "creating a loop in continuation chain!");
+  mNextContinuation = aFrame;
+  if (mNextContinuation) {
+    mNextContinuation->RemoveStateBits(NS_FRAME_IS_FLUID_CONTINUATION);
+  }
+}
+
+nsIFrame* nsSplittableFrame::FirstContinuation() const {
+  if (mFirstContinuation) {
+    return mFirstContinuation;
+  }
+
+  auto* firstContinuation = const_cast<nsSplittableFrame*>(this);
+  while (nsIFrame* prev = firstContinuation->GetPrevContinuation()) {
+    firstContinuation = static_cast<nsSplittableFrame*>(prev);
+  }
+  MOZ_ASSERT(firstContinuation);
+  return firstContinuation;
+}
+
+nsIFrame* nsSplittableFrame::LastContinuation() const {
+  nsSplittableFrame* lastContinuation = const_cast<nsSplittableFrame*>(this);
+  while (lastContinuation->mNextContinuation) {
+    lastContinuation =
+        static_cast<nsSplittableFrame*>(lastContinuation->mNextContinuation);
+  }
+  MOZ_ASSERT(lastContinuation, "post-condition failed");
+  return lastContinuation;
+}
+
+#ifdef DEBUG
+bool nsSplittableFrame::IsInPrevContinuationChain(nsIFrame* aFrame1,
+                                                  nsIFrame* aFrame2) {
+  int32_t iterations = 0;
+  while (aFrame1 && iterations < 10) {
+    if (aFrame1 == aFrame2) return true;
+    aFrame1 = aFrame1->GetPrevContinuation();
+    ++iterations;
+  }
+  return false;
+}
+
+bool nsSplittableFrame::IsInNextContinuationChain(nsIFrame* aFrame1,
+                                                  nsIFrame* aFrame2) {
+  int32_t iterations = 0;
+  while (aFrame1 && iterations < 10) {
+    if (aFrame1 == aFrame2) return true;
+    aFrame1 = aFrame1->GetNextContinuation();
+    ++iterations;
+  }
+  return false;
+}
+#endif
+
+nsIFrame* nsSplittableFrame::GetPrevInFlow() const {
+  return HasAnyStateBits(NS_FRAME_IS_FLUID_CONTINUATION) ? mPrevContinuation
+                                                         : nullptr;
+}
+
+void nsSplittableFrame::SetPrevInFlow(nsIFrame* aFrame) {
+  NS_ASSERTION(!aFrame || Type() == aFrame->Type(),
+               "setting a prev in flow with incorrect type!");
+  NS_ASSERTION(!IsInPrevContinuationChain(aFrame, this),
+               "creating a loop in continuation chain!");
+  mPrevContinuation = aFrame;
+  AddStateBits(NS_FRAME_IS_FLUID_CONTINUATION);
+  UpdateFirstContinuationAndFirstInFlowCache();
+}
+
+nsIFrame* nsSplittableFrame::GetNextInFlow() const {
+  return mNextContinuation && mNextContinuation->HasAnyStateBits(
+                                  NS_FRAME_IS_FLUID_CONTINUATION)
+             ? mNextContinuation
+             : nullptr;
+}
+
+void nsSplittableFrame::SetNextInFlow(nsIFrame* aFrame) {
+  NS_ASSERTION(!aFrame || Type() == aFrame->Type(),
+               "setting a next in flow with incorrect type!");
+  NS_ASSERTION(!IsInNextContinuationChain(aFrame, this),
+               "creating a loop in continuation chain!");
+  mNextContinuation = aFrame;
+  if (mNextContinuation) {
+    mNextContinuation->AddStateBits(NS_FRAME_IS_FLUID_CONTINUATION);
+  }
+}
+
+nsIFrame* nsSplittableFrame::FirstInFlow() const {
+  if (mFirstInFlow) {
+    return mFirstInFlow;
+  }
+
+  auto* firstInFlow = const_cast<nsSplittableFrame*>(this);
+  while (nsIFrame* prev = firstInFlow->GetPrevInFlow()) {
+    firstInFlow = static_cast<nsSplittableFrame*>(prev);
+  }
+  MOZ_ASSERT(firstInFlow);
+  return firstInFlow;
+}
+
+nsIFrame* nsSplittableFrame::LastInFlow() const {
+  nsSplittableFrame* lastInFlow = const_cast<nsSplittableFrame*>(this);
+  while (nsIFrame* next = lastInFlow->GetNextInFlow()) {
+    lastInFlow = static_cast<nsSplittableFrame*>(next);
+  }
+  MOZ_ASSERT(lastInFlow, "post-condition failed");
+  return lastInFlow;
+}
+
+void nsSplittableFrame::RemoveFromFlow(nsIFrame* aFrame) {
+  nsIFrame* prevContinuation = aFrame->GetPrevContinuation();
+  nsIFrame* nextContinuation = aFrame->GetNextContinuation();
+
+  if (aFrame->GetPrevInFlow() && aFrame->GetNextInFlow()) {
+    if (prevContinuation) {
+      prevContinuation->SetNextInFlow(nextContinuation);
+    }
+    if (nextContinuation) {
+      nextContinuation->SetPrevInFlow(prevContinuation);
+    }
+  } else {
+    if (prevContinuation) {
+      prevContinuation->SetNextContinuation(nextContinuation);
+    }
+    if (nextContinuation) {
+      nextContinuation->SetPrevContinuation(prevContinuation);
+    }
+  }
+
+  aFrame->SetNextInFlow(nullptr);
+  aFrame->SetPrevInFlow(nullptr);
+}
+
+void nsSplittableFrame::UpdateFirstContinuationAndFirstInFlowCache() {
+  nsIFrame* oldCachedFirstContinuation = mFirstContinuation;
+  if (nsIFrame* prevContinuation = GetPrevContinuation()) {
+    nsIFrame* newFirstContinuation = prevContinuation->FirstContinuation();
+    if (oldCachedFirstContinuation != newFirstContinuation) {
+      for (nsSplittableFrame* f = this; f;
+           f = reinterpret_cast<nsSplittableFrame*>(f->GetNextContinuation())) {
+        f->mFirstContinuation = newFirstContinuation;
+      }
+    }
+  } else {
+    if (oldCachedFirstContinuation) {
+      for (nsSplittableFrame* f = this; f;
+           f = reinterpret_cast<nsSplittableFrame*>(f->GetNextContinuation())) {
+        f->mFirstContinuation = nullptr;
+      }
+    }
+  }
+
+  nsIFrame* oldCachedFirstInFlow = mFirstInFlow;
+  if (nsIFrame* prevInFlow = GetPrevInFlow()) {
+    nsIFrame* newFirstInFlow = prevInFlow->FirstInFlow();
+    if (oldCachedFirstInFlow != newFirstInFlow) {
+      for (nsSplittableFrame* f = this; f;
+           f = reinterpret_cast<nsSplittableFrame*>(f->GetNextInFlow())) {
+        f->mFirstInFlow = newFirstInFlow;
+      }
+    }
+  } else {
+    if (oldCachedFirstInFlow) {
+      for (nsSplittableFrame* f = this; f;
+           f = reinterpret_cast<nsSplittableFrame*>(f->GetNextInFlow())) {
+        f->mFirstInFlow = nullptr;
+      }
+    }
+  }
+}
+
+NS_DECLARE_FRAME_PROPERTY_SMALL_VALUE(ConsumedBSizeProperty, nscoord);
+
+nscoord nsSplittableFrame::CalcAndCacheConsumedBSize() {
+  nsIFrame* prev = GetPrevContinuation();
+  if (!prev) {
+    return 0;
+  }
+  const auto wm = GetWritingMode();
+  nscoord bSize = 0;
+  for (; prev; prev = prev->GetPrevContinuation()) {
+    if (prev->IsTrueOverflowContainer()) {
+      continue;
+    }
+
+    bSize += prev->ContentBSize(wm);
+    bool found = false;
+    nscoord consumed = prev->GetProperty(ConsumedBSizeProperty(), &found);
+    if (found) {
+      bSize += consumed;
+      break;
+    }
+    MOZ_ASSERT(!prev->GetPrevContinuation(),
+               "Property should always be set on prev continuation if not "
+               "the first continuation");
+  }
+  SetProperty(ConsumedBSizeProperty(), bSize);
+  return bSize;
+}
+
+nscoord nsSplittableFrame::GetEffectiveComputedBSize(
+    const ReflowInput& aReflowInput, nscoord aConsumedBSize) const {
+  nscoord bSize = aReflowInput.ComputedBSize();
+  if (bSize == NS_UNCONSTRAINEDSIZE) {
+    return NS_UNCONSTRAINEDSIZE;
+  }
+
+  bSize -= aConsumedBSize;
+
+  if (IsTrueOverflowContainer() &&
+      Style()->GetPseudoType() == PseudoStyleType::MozFieldsetContent) {
+    for (nsFieldSetFrame* fieldset = do_QueryFrame(GetParent()); fieldset;
+         fieldset = static_cast<nsFieldSetFrame*>(fieldset->GetPrevInFlow())) {
+      bSize -= fieldset->LegendSpace();
+    }
+  }
+
+  return std::max(0, bSize);
+}
+
+LogicalSides nsSplittableFrame::GetBlockLevelLogicalSkipSides(
+    bool aAfterReflow) const {
+  LogicalSides skip(mWritingMode);
+  if (MOZ_UNLIKELY(IsTrueOverflowContainer())) {
+    skip += LogicalSides(mWritingMode, LogicalSides::BBoth);
+    return skip;
+  }
+
+  if (MOZ_UNLIKELY(StyleBorder()->mBoxDecorationBreak ==
+                   StyleBoxDecorationBreak::Clone)) {
+    return skip;
+  }
+
+  if (GetPrevContinuation()) {
+    skip += LogicalSide::BStart;
+  }
+
+  if (HasColumnSpanSiblings()) {
+    skip += LogicalSide::BEnd;
+  }
+
+  if (aAfterReflow) {
+    nsIFrame* nif = GetNextContinuation();
+    if (nif && !nif->IsTrueOverflowContainer()) {
+      skip += LogicalSide::BEnd;
+    }
+  }
+
+  return skip;
+}

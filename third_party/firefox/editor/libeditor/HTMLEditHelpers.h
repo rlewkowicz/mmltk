@@ -1,0 +1,1148 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef HTMLEditHelpers_h
+#define HTMLEditHelpers_h
+
+
+#include "EditorDOMPoint.h"
+#include "EditorForwards.h"
+#include "EditorUtils.h"  // for CaretPoint
+
+#include "mozilla/Attributes.h"
+#include "mozilla/ContentIterator.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/RangeBoundary.h"
+#include "mozilla/Result.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/StaticRange.h"
+
+#include "nsCOMPtr.h"
+#include "nsDebug.h"
+#include "nsError.h"
+#include "nsGkAtoms.h"
+#include "nsIContent.h"
+#include "nsRange.h"
+#include "nsString.h"
+
+class nsISimpleEnumerator;
+
+namespace mozilla {
+
+enum class BlockInlineCheck : uint8_t {
+  Unused,
+  UseHTMLDefaultStyle,
+  UseComputedDisplayOutsideStyle,
+  UseComputedDisplayStyle,
+  Auto,
+};
+
+[[nodiscard]] inline BlockInlineCheck PreferDisplayOutsideIfUsingDisplay(
+    BlockInlineCheck aBlockInlineCheck) {
+  return aBlockInlineCheck == BlockInlineCheck::UseComputedDisplayStyle
+             ? BlockInlineCheck::UseComputedDisplayOutsideStyle
+             : aBlockInlineCheck;
+}
+
+[[nodiscard]] inline BlockInlineCheck PreferDisplayIfUsingDisplayOutside(
+    BlockInlineCheck aBlockInlineCheck) {
+  return aBlockInlineCheck == BlockInlineCheck::UseComputedDisplayOutsideStyle
+             ? BlockInlineCheck::UseComputedDisplayStyle
+             : aBlockInlineCheck;
+}
+
+[[nodiscard]] inline BlockInlineCheck UseComputedDisplayStyleIfAuto(
+    BlockInlineCheck aBlockInlineCheck) {
+  return aBlockInlineCheck == BlockInlineCheck::Auto
+             ? BlockInlineCheck::UseComputedDisplayStyle
+             : aBlockInlineCheck;
+}
+
+[[nodiscard]] inline BlockInlineCheck UseComputedDisplayOutsideStyleIfAuto(
+    BlockInlineCheck aBlockInlineCheck) {
+  return aBlockInlineCheck == BlockInlineCheck::Auto
+             ? BlockInlineCheck::UseComputedDisplayOutsideStyle
+             : aBlockInlineCheck;
+}
+
+enum class WithTransaction { No, Yes };
+inline std::ostream& operator<<(std::ostream& aStream,
+                                WithTransaction aWithTransaction) {
+  aStream << "WithTransaction::"
+          << (aWithTransaction == WithTransaction::Yes ? "Yes" : "No");
+  return aStream;
+}
+
+class MOZ_STACK_CLASS MoveNodeResult final : public CaretPoint,
+                                             public EditActionResult {
+ public:
+  constexpr const EditorDOMPoint& NextInsertionPointRef() const {
+    return mNextInsertionPoint;
+  }
+  constexpr EditorDOMPoint&& UnwrapNextInsertionPoint() {
+    return std::move(mNextInsertionPoint);
+  }
+  constexpr const EditorDOMRange& MovedContentRangeRef() const {
+    return mMovedContentRange;
+  }
+  constexpr EditorDOMRange&& UnwrapMovedContentRange() {
+    return std::move(mMovedContentRange);
+  }
+  template <typename EditorDOMPointType>
+  EditorDOMPointType NextInsertionPoint() const {
+    return mNextInsertionPoint.To<EditorDOMPointType>();
+  }
+
+  MoveNodeResult(const MoveNodeResult& aOther) = delete;
+  MoveNodeResult& operator=(const MoveNodeResult& aOther) = delete;
+  MoveNodeResult(MoveNodeResult&& aOther) = default;
+  MoveNodeResult& operator=(MoveNodeResult&& aOther) = default;
+
+  MoveNodeResult& operator|=(const MoveNodeResult& aOther) {
+    MOZ_ASSERT(this != &aOther);
+    aOther.IgnoreCaretPointSuggestion();
+    UnmarkAsHandledCaretPoint();
+
+    if (aOther.Canceled()) {
+      MOZ_ASSERT_UNREACHABLE("How was aOther canceled?");
+      MarkAsCanceled();
+    } else if (aOther.Handled()) {
+      MarkAsHandled();
+      UnmarkAsCanceled();
+      if (!mMovedContentRange.IsPositioned() && mNextInsertionPoint.IsSet()) {
+        MOZ_ASSERT(mNextInsertionPoint.IsSetAndValid());
+        mMovedContentRange.SetStartAndEnd(mNextInsertionPoint,
+                                          mNextInsertionPoint);
+      }
+      if (aOther.mMovedContentRange.IsPositioned()) {
+        mMovedContentRange.MergeWith(aOther.mMovedContentRange);
+      } else if (aOther.mNextInsertionPoint.IsSet()) {
+        MOZ_ASSERT(aOther.mNextInsertionPoint.IsSetAndValid());
+        mMovedContentRange.MergeWith(aOther.mNextInsertionPoint);
+      }
+    }
+
+    mNextInsertionPoint = aOther.mNextInsertionPoint;
+
+    if (aOther.HasCaretPointSuggestion()) {
+      SetCaretPoint(aOther.CaretPointRef());
+    }
+    return *this;
+  }
+
+  void ForceToMarkAsHandled() {
+    if (Handled()) {
+      return;
+    }
+    MarkAsHandled();
+    if (!mMovedContentRange.IsPositioned()) {
+      MOZ_ASSERT(mNextInsertionPoint.IsSetAndValidInComposedDoc());
+      mMovedContentRange.SetStartAndEnd(mNextInsertionPoint,
+                                        mNextInsertionPoint);
+    }
+  }
+
+#ifdef DEBUG
+  ~MoveNodeResult() {
+    MOZ_ASSERT_IF(Handled(), !HasCaretPointSuggestion() || CaretPointHandled());
+  }
+#endif
+
+  static MoveNodeResult IgnoredResult(
+      const EditorDOMPoint& aNextInsertionPoint) {
+    return MoveNodeResult(aNextInsertionPoint, false);
+  }
+  static MoveNodeResult IgnoredResult(EditorDOMPoint&& aNextInsertionPoint) {
+    return MoveNodeResult(std::forward<EditorDOMPoint>(aNextInsertionPoint),
+                          false);
+  }
+
+  static MoveNodeResult HandledResult(
+      const EditorDOMPoint& aNextInsertionPoint) {
+    return MoveNodeResult(aNextInsertionPoint, true);
+  }
+
+  static MoveNodeResult HandledResult(EditorDOMPoint&& aNextInsertionPoint) {
+    return MoveNodeResult(std::forward<EditorDOMPoint>(aNextInsertionPoint),
+                          true);
+  }
+
+  static MoveNodeResult HandledResult(const EditorDOMPoint& aNextInsertionPoint,
+                                      const EditorDOMPoint& aPointToPutCaret) {
+    return MoveNodeResult(aNextInsertionPoint, aPointToPutCaret);
+  }
+
+  static MoveNodeResult HandledResult(EditorDOMPoint&& aNextInsertionPoint,
+                                      const EditorDOMPoint& aPointToPutCaret) {
+    return MoveNodeResult(std::forward<EditorDOMPoint>(aNextInsertionPoint),
+                          aPointToPutCaret);
+  }
+
+  static MoveNodeResult HandledResult(const EditorDOMPoint& aNextInsertionPoint,
+                                      EditorDOMPoint&& aPointToPutCaret) {
+    return MoveNodeResult(aNextInsertionPoint,
+                          std::forward<EditorDOMPoint>(aPointToPutCaret));
+  }
+
+  static MoveNodeResult HandledResult(EditorDOMPoint&& aNextInsertionPoint,
+                                      EditorDOMPoint&& aPointToPutCaret) {
+    return MoveNodeResult(std::forward<EditorDOMPoint>(aNextInsertionPoint),
+                          std::forward<EditorDOMPoint>(aPointToPutCaret));
+  }
+  static MoveNodeResult HandledResult(const nsIContent& aFirstMovedContent,
+                                      EditorDOMPoint&& aNextInsertionPoint) {
+    return MoveNodeResult(aFirstMovedContent,
+                          std::forward<EditorDOMPoint>(aNextInsertionPoint));
+  }
+  static MoveNodeResult HandledResult(const nsIContent& aFirstMovedContent,
+                                      EditorDOMPoint&& aNextInsertionPoint,
+                                      EditorDOMPoint&& aPointToPutCaret) {
+    return MoveNodeResult(aFirstMovedContent,
+                          std::forward<EditorDOMPoint>(aNextInsertionPoint),
+                          std::forward<EditorDOMPoint>(aPointToPutCaret));
+  }
+
+ private:
+  explicit MoveNodeResult(const EditorDOMPoint& aNextInsertionPoint,
+                          bool aHandled)
+      : EditActionResult(false, aHandled && aNextInsertionPoint.IsSet()),
+        mNextInsertionPoint(aNextInsertionPoint) {
+    if (Handled()) {
+      mMovedContentRange = EditorDOMRange(mNextInsertionPoint);
+    }
+  }
+  explicit MoveNodeResult(EditorDOMPoint&& aNextInsertionPoint, bool aHandled)
+      : EditActionResult(false, aHandled && aNextInsertionPoint.IsSet()),
+        mNextInsertionPoint(std::move(aNextInsertionPoint)) {
+    if (Handled()) {
+      mMovedContentRange = EditorDOMRange(mNextInsertionPoint);
+    }
+  }
+  explicit MoveNodeResult(const EditorDOMPoint& aNextInsertionPoint,
+                          const EditorDOMPoint& aPointToPutCaret)
+      : CaretPoint(aPointToPutCaret),
+        EditActionResult(false, aNextInsertionPoint.IsSet()),
+        mNextInsertionPoint(aNextInsertionPoint) {
+    if (Handled()) {
+      mMovedContentRange = EditorDOMRange(mNextInsertionPoint);
+    }
+  }
+  explicit MoveNodeResult(EditorDOMPoint&& aNextInsertionPoint,
+                          const EditorDOMPoint& aPointToPutCaret)
+      : CaretPoint(aPointToPutCaret),
+        EditActionResult(false, aNextInsertionPoint.IsSet()),
+        mNextInsertionPoint(std::move(aNextInsertionPoint)) {
+    if (Handled()) {
+      mMovedContentRange = EditorDOMRange(mNextInsertionPoint);
+    }
+  }
+  explicit MoveNodeResult(const EditorDOMPoint& aNextInsertionPoint,
+                          EditorDOMPoint&& aPointToPutCaret)
+      : CaretPoint(std::forward<EditorDOMPoint>(aPointToPutCaret)),
+        EditActionResult(false, aNextInsertionPoint.IsSet()),
+        mNextInsertionPoint(aNextInsertionPoint) {
+    if (Handled()) {
+      mMovedContentRange = EditorDOMRange(mNextInsertionPoint);
+    }
+  }
+  explicit MoveNodeResult(EditorDOMPoint&& aNextInsertionPoint,
+                          EditorDOMPoint&& aPointToPutCaret)
+      : CaretPoint(std::forward<EditorDOMPoint>(aPointToPutCaret)),
+        EditActionResult(false, aNextInsertionPoint.IsSet()),
+        mNextInsertionPoint(std::forward<EditorDOMPoint>(aNextInsertionPoint)) {
+    if (Handled()) {
+      mMovedContentRange = EditorDOMRange(mNextInsertionPoint);
+    }
+  }
+  explicit MoveNodeResult(const nsIContent& aFirstMovedContent,
+                          EditorDOMPoint&& aNextInsertionPoint)
+      : EditActionResult(false, aNextInsertionPoint.IsSet()),
+        mNextInsertionPoint(std::forward<EditorDOMPoint>(aNextInsertionPoint)) {
+    if (Handled()) {
+      EditorDOMPoint pointAfterFirstMovedContent =
+          EditorDOMPoint::After(aFirstMovedContent);
+      if (MOZ_LIKELY(pointAfterFirstMovedContent.EqualsOrIsBefore(
+              mNextInsertionPoint))) {
+        mMovedContentRange = EditorDOMRange(
+            std::move(pointAfterFirstMovedContent), mNextInsertionPoint);
+      } else {
+        mMovedContentRange = EditorDOMRange(
+            mNextInsertionPoint, std::move(pointAfterFirstMovedContent));
+      }
+    }
+  }
+  explicit MoveNodeResult(const nsIContent& aFirstMovedContent,
+                          EditorDOMPoint&& aNextInsertionPoint,
+                          EditorDOMPoint&& aPointToPutCaret)
+      : CaretPoint(std::forward<EditorDOMPoint>(aPointToPutCaret)),
+        EditActionResult(false, aNextInsertionPoint.IsSet()),
+        mNextInsertionPoint(std::forward<EditorDOMPoint>(aNextInsertionPoint)) {
+    if (Handled()) {
+      EditorDOMPoint pointAfterFirstMovedContent =
+          EditorDOMPoint::After(aFirstMovedContent);
+      if (MOZ_LIKELY(pointAfterFirstMovedContent.EqualsOrIsBefore(
+              mNextInsertionPoint))) {
+        mMovedContentRange = EditorDOMRange(
+            std::move(pointAfterFirstMovedContent), mNextInsertionPoint);
+      } else {
+        mMovedContentRange = EditorDOMRange(
+            mNextInsertionPoint, std::move(pointAfterFirstMovedContent));
+      }
+    }
+  }
+
+  using EditActionResult::CanceledResult;
+  using EditActionResult::MarkAsCanceled;
+  using EditActionResult::MarkAsHandled;
+
+  EditorDOMPoint mNextInsertionPoint;
+  EditorDOMRange mMovedContentRange;
+
+  friend class AutoTrackDOMMoveNodeResult;
+};
+
+class MOZ_STACK_CLASS DeleteRangeResult final : public CaretPoint,
+                                                public EditActionResult {
+ public:
+  DeleteRangeResult() : CaretPoint(EditorDOMPoint()) {};
+  DeleteRangeResult(const EditorDOMPoint& aDeletePoint,
+                    const EditorDOMPoint& aCaretPoint)
+      : CaretPoint(aCaretPoint),
+        EditActionResult(false, true),
+        mDeleteRange(aDeletePoint) {
+    MOZ_ASSERT(aDeletePoint.IsSetAndValidInComposedDoc());
+    MOZ_ASSERT_IF(aCaretPoint.IsSet(),
+                  aCaretPoint.IsSetAndValidInComposedDoc());
+  }
+  DeleteRangeResult(const EditorDOMPoint& aDeletePoint,
+                    EditorDOMPoint&& aCaretPoint)
+      : CaretPoint(std::move(aCaretPoint)),
+        EditActionResult(false, true),
+        mDeleteRange(aDeletePoint) {
+    MOZ_ASSERT(aDeletePoint.IsSetAndValidInComposedDoc());
+    MOZ_ASSERT_IF(HasCaretPointSuggestion(),
+                  CaretPointRef().IsSetAndValidInComposedDoc());
+  }
+  DeleteRangeResult(const EditorDOMRange& aDeleteRange,
+                    const EditorDOMPoint& aCaretPoint)
+      : CaretPoint(aCaretPoint),
+        EditActionResult(false, true),
+        mDeleteRange(aDeleteRange) {
+    MOZ_ASSERT(aDeleteRange.IsPositionedAndValid());
+    MOZ_ASSERT_IF(aCaretPoint.IsSet(),
+                  aCaretPoint.IsSetAndValidInComposedDoc());
+  }
+  DeleteRangeResult(EditorDOMRange&& aDeleteRange,
+                    const EditorDOMPoint& aCaretPoint)
+      : CaretPoint(aCaretPoint),
+        EditActionResult(false, true),
+        mDeleteRange(std::move(aDeleteRange)) {
+    MOZ_ASSERT(mDeleteRange.IsPositionedAndValid());
+    MOZ_ASSERT_IF(aCaretPoint.IsSet(),
+                  aCaretPoint.IsSetAndValidInComposedDoc());
+  }
+  DeleteRangeResult(const EditorDOMRange& aDeleteRange,
+                    EditorDOMPoint&& aCaretPoint)
+      : CaretPoint(std::move(aCaretPoint)),
+        EditActionResult(false, true),
+        mDeleteRange(aDeleteRange) {
+    MOZ_ASSERT(aDeleteRange.IsPositionedAndValidInComposedDoc());
+    MOZ_ASSERT_IF(HasCaretPointSuggestion(),
+                  CaretPointRef().IsSetAndValidInComposedDoc());
+  }
+  DeleteRangeResult(EditorDOMRange&& aDeleteRange, EditorDOMPoint&& aCaretPoint)
+      : CaretPoint(std::move(aCaretPoint)),
+        EditActionResult(false, true),
+        mDeleteRange(std::move(aDeleteRange)) {
+    MOZ_ASSERT(mDeleteRange.IsPositionedAndValid());
+    MOZ_ASSERT_IF(HasCaretPointSuggestion(),
+                  CaretPointRef().IsSetAndValidInComposedDoc());
+  }
+
+  [[nodiscard]] static DeleteRangeResult IgnoredResult() {
+    return DeleteRangeResult(EditActionResult::IgnoredResult());
+  }
+  [[nodiscard]] static DeleteRangeResult CanceledResult() {
+    return DeleteRangeResult(EditActionResult::CanceledResult());
+  }
+
+  [[nodiscard]] EditorDOMRange&& UnwrapDeleteRange() {
+    return std::move(mDeleteRange);
+  }
+  [[nodiscard]] const EditorDOMRange& DeleteRangeRef() const {
+    return mDeleteRange;
+  }
+
+  template <typename EditorDOMPointType>
+  void SetDeleteRangeStart(const EditorDOMPointType& aPoint) {
+    MOZ_ASSERT(aPoint.IsSetAndValidInComposedDoc());
+    if (mDeleteRange.IsPositioned()) {
+      mDeleteRange.SetStart(aPoint);
+    } else {
+      mDeleteRange.SetStartAndEnd(aPoint, aPoint);
+    }
+  }
+
+  template <typename EditorDOMPointType>
+  void SetDeleteRangeEnd(const EditorDOMPointType& aPoint) {
+    MOZ_ASSERT(aPoint.IsSetAndValidInComposedDoc());
+    if (mDeleteRange.IsPositioned()) {
+      mDeleteRange.SetEnd(aPoint);
+    } else {
+      mDeleteRange.SetStartAndEnd(aPoint, aPoint);
+    }
+  }
+
+  DeleteRangeResult& operator|=(const DeleteRangeResult& aOtherResult) {
+    if (aOtherResult.Ignored() || aOtherResult.Canceled()) {
+      return *this;
+    }
+    MarkAsHandled();
+    UnmarkAsCanceled();
+    if (aOtherResult.mDeleteRange.IsPositioned()) {
+      mDeleteRange.MergeWith(aOtherResult.mDeleteRange);
+    }
+    return operator|=(static_cast<const CaretPoint&>(aOtherResult));
+  }
+
+  DeleteRangeResult& operator|=(const CaretPoint& aCaretPoint) {
+    if (MOZ_UNLIKELY(!aCaretPoint.HasCaretPointSuggestion())) {
+      return *this;
+    }
+    SetCaretPoint(aCaretPoint.CaretPointRef());
+    aCaretPoint.IgnoreCaretPointSuggestion();
+    return *this;
+  }
+
+ private:
+  explicit DeleteRangeResult(EditActionResult&& aEditActionResult)
+      : CaretPoint(EditorDOMPoint()),
+        EditActionResult(std::move(aEditActionResult)) {}
+
+  using EditActionResult::MarkAsCanceled;
+  using EditActionResult::MarkAsHandled;
+
+  EditorDOMRange mDeleteRange;
+
+  friend class AutoTrackDOMDeleteRangeResult;
+};
+
+class MOZ_STACK_CLASS SplitNodeResult final : public CaretPoint {
+ public:
+  bool Handled() const { return mPreviousNode || mNextNode; }
+
+  bool DidSplit() const { return mPreviousNode && mNextNode; }
+
+  MOZ_KNOWN_LIVE nsIContent* GetPreviousContent() const {
+    if (mGivenSplitPoint.IsSet()) {
+      return mGivenSplitPoint.IsEndOfContainer() ? mGivenSplitPoint.GetChild()
+                                                 : nullptr;
+    }
+    return mPreviousNode;
+  }
+  template <typename NodeType>
+  MOZ_KNOWN_LIVE NodeType* GetPreviousContentAs() const {
+    return NodeType::FromNodeOrNull(GetPreviousContent());
+  }
+  template <typename EditorDOMPointType>
+  EditorDOMPointType AtPreviousContent() const {
+    if (nsIContent* previousContent = GetPreviousContent()) {
+      return EditorDOMPointType(previousContent);
+    }
+    return EditorDOMPointType();
+  }
+
+  MOZ_KNOWN_LIVE nsIContent* GetNextContent() const {
+    if (mGivenSplitPoint.IsSet()) {
+      return !mGivenSplitPoint.IsEndOfContainer() ? mGivenSplitPoint.GetChild()
+                                                  : nullptr;
+    }
+    return mNextNode;
+  }
+  template <typename NodeType>
+  MOZ_KNOWN_LIVE NodeType* GetNextContentAs() const {
+    return NodeType::FromNodeOrNull(GetNextContent());
+  }
+  template <typename EditorDOMPointType>
+  EditorDOMPointType AtNextContent() const {
+    if (nsIContent* nextContent = GetNextContent()) {
+      return EditorDOMPointType(nextContent);
+    }
+    return EditorDOMPointType();
+  }
+
+  MOZ_KNOWN_LIVE nsIContent* GetNewContent() const {
+    if (!DidSplit()) {
+      return nullptr;
+    }
+    return mNextNode;
+  }
+  template <typename NodeType>
+  MOZ_KNOWN_LIVE NodeType* GetNewContentAs() const {
+    return NodeType::FromNodeOrNull(GetNewContent());
+  }
+  template <typename EditorDOMPointType>
+  EditorDOMPointType AtNewContent() const {
+    if (nsIContent* newContent = GetNewContent()) {
+      return EditorDOMPointType(newContent);
+    }
+    return EditorDOMPointType();
+  }
+
+  MOZ_KNOWN_LIVE nsIContent* GetOriginalContent() const {
+    if (mGivenSplitPoint.IsSet()) {
+      return mGivenSplitPoint.GetContainerAs<nsIContent>();
+    }
+    return mPreviousNode ? mPreviousNode : mNextNode;
+  }
+  template <typename NodeType>
+  MOZ_KNOWN_LIVE NodeType* GetOriginalContentAs() const {
+    return NodeType::FromNodeOrNull(GetOriginalContent());
+  }
+  template <typename EditorDOMPointType>
+  EditorDOMPointType AtOriginalContent() const {
+    if (nsIContent* originalContent = GetOriginalContent()) {
+      return EditorDOMPointType(originalContent);
+    }
+    return EditorDOMPointType();
+  }
+
+  template <typename EditorDOMPointType>
+  EditorDOMPointType AtSplitPoint() const {
+    if (mGivenSplitPoint.IsSet()) {
+      return mGivenSplitPoint.To<EditorDOMPointType>();
+    }
+    if (!mPreviousNode) {
+      return EditorDOMPointType(mNextNode);
+    }
+    return EditorDOMPointType::After(mPreviousNode);
+  }
+
+  SplitNodeResult(const SplitNodeResult&) = delete;
+  SplitNodeResult& operator=(const SplitNodeResult&) = delete;
+  SplitNodeResult(SplitNodeResult&&) = default;
+  SplitNodeResult& operator=(SplitNodeResult&&) = default;
+
+  SplitNodeResult(SplitNodeResult&& aSplitResult,
+                  const EditorDOMPoint& aNewCaretPoint)
+      : SplitNodeResult(std::move(aSplitResult)) {
+    SetCaretPoint(aNewCaretPoint);
+  }
+  SplitNodeResult(SplitNodeResult&& aSplitResult,
+                  EditorDOMPoint&& aNewCaretPoint)
+      : SplitNodeResult(std::move(aSplitResult)) {
+    SetCaretPoint(std::move(aNewCaretPoint));
+  }
+
+  SplitNodeResult(nsIContent& aNewNode, nsIContent& aSplitNode,
+                  const Maybe<EditorDOMPoint>& aNewCaretPoint = Nothing())
+      : CaretPoint(aNewCaretPoint.isSome()
+                       ? aNewCaretPoint.ref()
+                       : EditorDOMPoint::AtEndOf(aSplitNode)),
+        mPreviousNode(&aSplitNode),
+        mNextNode(&aNewNode) {}
+
+  SplitNodeResult ToHandledResult() const {
+    CaretPointHandled();
+    SplitNodeResult result;
+    result.mPreviousNode = GetPreviousContent();
+    result.mNextNode = GetNextContent();
+    MOZ_DIAGNOSTIC_ASSERT(result.Handled());
+    result.SetCaretPoint(CaretPointRef());
+    return result;
+  }
+
+  static inline SplitNodeResult HandledButDidNotSplitDueToEndOfContainer(
+      nsIContent& aNotSplitNode,
+      const SplitNodeResult* aDeeperSplitNodeResult = nullptr) {
+    SplitNodeResult result;
+    result.mPreviousNode = &aNotSplitNode;
+    if (aDeeperSplitNodeResult) {
+      result.SetCaretPoint(aDeeperSplitNodeResult->CaretPointRef());
+      aDeeperSplitNodeResult->IgnoreCaretPointSuggestion();
+    }
+    return result;
+  }
+
+  static inline SplitNodeResult HandledButDidNotSplitDueToStartOfContainer(
+      nsIContent& aNotSplitNode,
+      const SplitNodeResult* aDeeperSplitNodeResult = nullptr) {
+    SplitNodeResult result;
+    result.mNextNode = &aNotSplitNode;
+    if (aDeeperSplitNodeResult) {
+      result.SetCaretPoint(aDeeperSplitNodeResult->CaretPointRef());
+      aDeeperSplitNodeResult->IgnoreCaretPointSuggestion();
+    }
+    return result;
+  }
+
+  template <typename PT, typename CT>
+  static inline SplitNodeResult NotHandled(
+      const EditorDOMPointBase<PT, CT>& aGivenSplitPoint,
+      const SplitNodeResult* aDeeperSplitNodeResult = nullptr) {
+    SplitNodeResult result;
+    result.mGivenSplitPoint = aGivenSplitPoint;
+    if (aDeeperSplitNodeResult) {
+      result.SetCaretPoint(aDeeperSplitNodeResult->CaretPointRef());
+      aDeeperSplitNodeResult->IgnoreCaretPointSuggestion();
+    }
+    return result;
+  }
+
+  static inline SplitNodeResult MergeWithDeeperSplitNodeResult(
+      SplitNodeResult&& aSplitNodeResult,
+      const SplitNodeResult& aDeeperSplitNodeResult) {
+    aSplitNodeResult.UnmarkAsHandledCaretPoint();
+    aDeeperSplitNodeResult.IgnoreCaretPointSuggestion();
+    if (aSplitNodeResult.DidSplit() ||
+        !aDeeperSplitNodeResult.HasCaretPointSuggestion()) {
+      return std::move(aSplitNodeResult);
+    }
+    SplitNodeResult result(std::move(aSplitNodeResult));
+    result.SetCaretPoint(aDeeperSplitNodeResult.CaretPointRef());
+    return result;
+  }
+
+#ifdef DEBUG
+  ~SplitNodeResult() {
+    MOZ_ASSERT(!HasCaretPointSuggestion() || CaretPointHandled());
+  }
+#endif
+
+ private:
+  SplitNodeResult() = default;
+
+  nsCOMPtr<nsIContent> mPreviousNode;
+  nsCOMPtr<nsIContent> mNextNode;
+
+  EditorDOMPoint mGivenSplitPoint;
+};
+
+class MOZ_STACK_CLASS JoinNodesResult final {
+ public:
+  MOZ_KNOWN_LIVE nsIContent* ExistingContent() const {
+    return mJoinedPoint.ContainerAs<nsIContent>();
+  }
+  template <typename EditorDOMPointType>
+  EditorDOMPointType AtExistingContent() const {
+    return EditorDOMPointType(mJoinedPoint.ContainerAs<nsIContent>());
+  }
+
+  MOZ_KNOWN_LIVE nsIContent* RemovedContent() const { return mRemovedContent; }
+  template <typename EditorDOMPointType>
+  EditorDOMPointType AtRemovedContent() const {
+    if (mRemovedContent) {
+      return EditorDOMPointType(mRemovedContent);
+    }
+    return EditorDOMPointType();
+  }
+
+  template <typename EditorDOMPointType>
+  EditorDOMPointType AtJoinedPoint() const {
+    return mJoinedPoint.To<EditorDOMPointType>();
+  }
+
+  JoinNodesResult() = delete;
+
+  JoinNodesResult(const EditorDOMPoint& aJoinedPoint,
+                  nsIContent& aRemovedContent)
+      : mJoinedPoint(aJoinedPoint), mRemovedContent(&aRemovedContent) {
+    MOZ_DIAGNOSTIC_ASSERT(aJoinedPoint.IsInContentNode());
+  }
+
+  JoinNodesResult(const JoinNodesResult& aOther) = delete;
+  JoinNodesResult& operator=(const JoinNodesResult& aOther) = delete;
+  JoinNodesResult(JoinNodesResult&& aOther) = default;
+  JoinNodesResult& operator=(JoinNodesResult&& aOther) = default;
+
+ private:
+  EditorDOMPoint mJoinedPoint;
+  MOZ_KNOWN_LIVE nsCOMPtr<nsIContent> mRemovedContent;
+};
+
+class MOZ_STACK_CLASS SplitRangeOffFromNodeResult final : public CaretPoint {
+ public:
+  MOZ_KNOWN_LIVE nsIContent* GetLeftContent() const { return mLeftContent; }
+  template <typename ContentNodeType>
+  MOZ_KNOWN_LIVE ContentNodeType* GetLeftContentAs() const {
+    return ContentNodeType::FromNodeOrNull(GetLeftContent());
+  }
+  constexpr nsCOMPtr<nsIContent>&& UnwrapLeftContent() {
+    mMovedContent = true;
+    return std::move(mLeftContent);
+  }
+
+  MOZ_KNOWN_LIVE nsIContent* GetMiddleContent() const { return mMiddleContent; }
+  template <typename ContentNodeType>
+  MOZ_KNOWN_LIVE ContentNodeType* GetMiddleContentAs() const {
+    return ContentNodeType::FromNodeOrNull(GetMiddleContent());
+  }
+  constexpr nsCOMPtr<nsIContent>&& UnwrapMiddleContent() {
+    mMovedContent = true;
+    return std::move(mMiddleContent);
+  }
+
+  MOZ_KNOWN_LIVE nsIContent* GetRightContent() const { return mRightContent; }
+  template <typename ContentNodeType>
+  MOZ_KNOWN_LIVE ContentNodeType* GetRightContentAs() const {
+    return ContentNodeType::FromNodeOrNull(GetRightContent());
+  }
+  constexpr nsCOMPtr<nsIContent>&& UnwrapRightContent() {
+    mMovedContent = true;
+    return std::move(mRightContent);
+  }
+
+  MOZ_KNOWN_LIVE nsIContent* GetLeftmostContent() const {
+    MOZ_ASSERT(!mMovedContent);
+    return mLeftContent ? mLeftContent
+                        : (mMiddleContent ? mMiddleContent : mRightContent);
+  }
+  template <typename ContentNodeType>
+  MOZ_KNOWN_LIVE ContentNodeType* GetLeftmostContentAs() const {
+    return ContentNodeType::FromNodeOrNull(GetLeftmostContent());
+  }
+
+  MOZ_KNOWN_LIVE nsIContent* GetRightmostContent() const {
+    MOZ_ASSERT(!mMovedContent);
+    return mRightContent ? mRightContent
+                         : (mMiddleContent ? mMiddleContent : mLeftContent);
+  }
+  template <typename ContentNodeType>
+  MOZ_KNOWN_LIVE ContentNodeType* GetRightmostContentAs() const {
+    return ContentNodeType::FromNodeOrNull(GetRightmostContent());
+  }
+
+  [[nodiscard]] bool DidSplit() const { return mLeftContent || mRightContent; }
+
+  SplitRangeOffFromNodeResult() = delete;
+
+  SplitRangeOffFromNodeResult(nsIContent* aLeftContent,
+                              nsIContent* aMiddleContent,
+                              nsIContent* aRightContent)
+      : mLeftContent(aLeftContent),
+        mMiddleContent(aMiddleContent),
+        mRightContent(aRightContent) {}
+
+  SplitRangeOffFromNodeResult(nsIContent* aLeftContent,
+                              nsIContent* aMiddleContent,
+                              nsIContent* aRightContent,
+                              EditorDOMPoint&& aPointToPutCaret)
+      : CaretPoint(std::move(aPointToPutCaret)),
+        mLeftContent(aLeftContent),
+        mMiddleContent(aMiddleContent),
+        mRightContent(aRightContent) {}
+
+  SplitRangeOffFromNodeResult(const SplitRangeOffFromNodeResult& aOther) =
+      delete;
+  SplitRangeOffFromNodeResult& operator=(
+      const SplitRangeOffFromNodeResult& aOther) = delete;
+  SplitRangeOffFromNodeResult(SplitRangeOffFromNodeResult&& aOther) noexcept
+      : CaretPoint(aOther.UnwrapCaretPoint()),
+        mLeftContent(std::move(aOther.mLeftContent)),
+        mMiddleContent(std::move(aOther.mMiddleContent)),
+        mRightContent(std::move(aOther.mRightContent)) {
+    MOZ_ASSERT(!aOther.mMovedContent);
+  }
+  SplitRangeOffFromNodeResult& operator=(SplitRangeOffFromNodeResult&& aOther) =
+      delete;  
+
+#ifdef DEBUG
+  ~SplitRangeOffFromNodeResult() {
+    MOZ_ASSERT(!HasCaretPointSuggestion() || CaretPointHandled());
+  }
+#endif
+
+ private:
+  MOZ_KNOWN_LIVE nsCOMPtr<nsIContent> mLeftContent;
+  MOZ_KNOWN_LIVE nsCOMPtr<nsIContent> mMiddleContent;
+  MOZ_KNOWN_LIVE nsCOMPtr<nsIContent> mRightContent;
+
+  bool mutable mMovedContent = false;
+};
+
+class MOZ_STACK_CLASS SplitRangeOffResult final : public CaretPoint {
+ public:
+  constexpr bool Handled() const { return mHandled; }
+
+  constexpr const EditorDOMRange& RangeRef() const { return mRange; }
+
+  SplitRangeOffResult() = delete;
+
+  SplitRangeOffResult(EditorDOMRange&& aTrackedRange,
+                      SplitNodeResult&& aSplitNodeResultAtStart,
+                      SplitNodeResult&& aSplitNodeResultAtEnd)
+      : mRange(std::move(aTrackedRange)),
+        mHandled(aSplitNodeResultAtStart.Handled() ||
+                 aSplitNodeResultAtEnd.Handled()) {
+    MOZ_ASSERT(mRange.StartRef().IsSet());
+    MOZ_ASSERT(mRange.EndRef().IsSet());
+    EditorDOMPoint pointToPutCaret;
+    SplitNodeResult splitNodeResultAtStart(std::move(aSplitNodeResultAtStart));
+    SplitNodeResult splitNodeResultAtEnd(std::move(aSplitNodeResultAtEnd));
+    splitNodeResultAtStart.MoveCaretPointTo(
+        pointToPutCaret, {SuggestCaret::OnlyIfHasSuggestion});
+    splitNodeResultAtEnd.MoveCaretPointTo(pointToPutCaret,
+                                          {SuggestCaret::OnlyIfHasSuggestion});
+    SetCaretPoint(std::move(pointToPutCaret));
+  }
+
+  SplitRangeOffResult(const SplitRangeOffResult& aOther) = delete;
+  SplitRangeOffResult& operator=(const SplitRangeOffResult& aOther) = delete;
+  SplitRangeOffResult(SplitRangeOffResult&& aOther) = default;
+  SplitRangeOffResult& operator=(SplitRangeOffResult&& aOther) = default;
+
+ private:
+  EditorDOMRange mRange;
+
+
+  bool mHandled;
+};
+
+
+class MOZ_RAII DOMIterator {
+ public:
+  explicit DOMIterator();
+  explicit DOMIterator(nsINode& aNode);
+  virtual ~DOMIterator() = default;
+
+  nsresult Init(nsRange& aRange);
+  nsresult Init(const RawRangeBoundary& aStartRef,
+                const RawRangeBoundary& aEndRef);
+
+  template <class NodeClass>
+  void AppendAllNodesToArray(
+      nsTArray<OwningNonNull<NodeClass>>& aArrayOfNodes) const;
+
+  using BoolFunctor = bool (*)(nsINode& aNode, void* aClosure);
+  template <class NodeClass>
+  void AppendNodesToArray(BoolFunctor aFunctor,
+                          nsTArray<OwningNonNull<NodeClass>>& aArrayOfNodes,
+                          void* aClosure = nullptr) const;
+
+ protected:
+  SafeContentIteratorBase* mIter;
+  PostContentIterator mPostOrderIter;
+};
+
+class MOZ_RAII DOMSubtreeIterator final : public DOMIterator {
+ public:
+  explicit DOMSubtreeIterator();
+  virtual ~DOMSubtreeIterator() = default;
+  explicit DOMSubtreeIterator(nsINode& aNode) = delete;
+
+  nsresult Init(nsRange& aRange);
+
+ private:
+  ContentSubtreeIterator mSubtreeIter;
+};
+
+
+template <typename EditorDOMPointType>
+class MOZ_STACK_CLASS ReplaceRangeDataBase final {
+ public:
+  ReplaceRangeDataBase() = default;
+  template <typename OtherEditorDOMRangeType>
+  ReplaceRangeDataBase(const OtherEditorDOMRangeType& aRange,
+                       const nsAString& aReplaceString)
+      : mRange(aRange), mReplaceString(aReplaceString) {}
+  template <typename StartPointType, typename EndPointType>
+  ReplaceRangeDataBase(const StartPointType& aStart, const EndPointType& aEnd,
+                       const nsAString& aReplaceString)
+      : mRange(aStart, aEnd), mReplaceString(aReplaceString) {}
+
+  bool IsSet() const { return mRange.IsPositioned(); }
+  bool IsSetAndValid() const { return mRange.IsPositionedAndValid(); }
+  bool Collapsed() const { return mRange.Collapsed(); }
+  bool HasReplaceString() const { return !mReplaceString.IsEmpty(); }
+  const EditorDOMPointType& StartRef() const { return mRange.StartRef(); }
+  const EditorDOMPointType& EndRef() const { return mRange.EndRef(); }
+  const EditorDOMRangeBase<EditorDOMPointType>& RangeRef() const {
+    return mRange;
+  }
+  const nsString& ReplaceStringRef() const { return mReplaceString; }
+
+  template <typename PointType>
+  MOZ_NEVER_INLINE_DEBUG void SetStart(const PointType& aStart) {
+    mRange.SetStart(aStart);
+  }
+  template <typename PointType>
+  MOZ_NEVER_INLINE_DEBUG void SetEnd(const PointType& aEnd) {
+    mRange.SetEnd(aEnd);
+  }
+  template <typename StartPointType, typename EndPointType>
+  MOZ_NEVER_INLINE_DEBUG void SetStartAndEnd(const StartPointType& aStart,
+                                             const EndPointType& aEnd) {
+    mRange.SetRange(aStart, aEnd);
+  }
+  template <typename OtherEditorDOMRangeType>
+  MOZ_NEVER_INLINE_DEBUG void SetRange(const OtherEditorDOMRangeType& aRange) {
+    mRange = aRange;
+  }
+  void SetReplaceString(const nsAString& aReplaceString) {
+    mReplaceString = aReplaceString;
+  }
+  template <typename StartPointType, typename EndPointType>
+  MOZ_NEVER_INLINE_DEBUG void SetStartAndEnd(const StartPointType& aStart,
+                                             const EndPointType& aEnd,
+                                             const nsAString& aReplaceString) {
+    SetStartAndEnd(aStart, aEnd);
+    SetReplaceString(aReplaceString);
+  }
+  template <typename OtherEditorDOMRangeType>
+  MOZ_NEVER_INLINE_DEBUG void Set(const OtherEditorDOMRangeType& aRange,
+                                  const nsAString& aReplaceString) {
+    SetRange(aRange);
+    SetReplaceString(aReplaceString);
+  }
+
+ private:
+  EditorDOMRangeBase<EditorDOMPointType> mRange;
+  nsString mReplaceString;
+};
+
+
+class MOZ_STACK_CLASS EditorElementStyle {
+ public:
+#define DEFINE_FACTORY(aName, aAttr)            \
+  constexpr static EditorElementStyle aName() { \
+    return EditorElementStyle(*(aAttr));        \
+  }
+
+  DEFINE_FACTORY(Align, nsGkAtoms::align)
+  DEFINE_FACTORY(BGColor, nsGkAtoms::bgcolor)
+  DEFINE_FACTORY(Background, nsGkAtoms::background)
+  DEFINE_FACTORY(Border, nsGkAtoms::border)
+  DEFINE_FACTORY(Height, nsGkAtoms::height)
+  DEFINE_FACTORY(Text, nsGkAtoms::text)
+  DEFINE_FACTORY(Type, nsGkAtoms::type)
+  DEFINE_FACTORY(VAlign, nsGkAtoms::valign)
+  DEFINE_FACTORY(Width, nsGkAtoms::width)
+
+  static EditorElementStyle Create(const nsAtom& aAttribute) {
+    MOZ_DIAGNOSTIC_ASSERT(IsHTMLStyle(&aAttribute));
+    return EditorElementStyle(*aAttribute.AsStatic());
+  }
+
+  [[nodiscard]] static bool IsHTMLStyle(const nsAtom* aAttribute) {
+    return aAttribute == nsGkAtoms::align || aAttribute == nsGkAtoms::bgcolor ||
+           aAttribute == nsGkAtoms::background ||
+           aAttribute == nsGkAtoms::border || aAttribute == nsGkAtoms::height ||
+           aAttribute == nsGkAtoms::text || aAttribute == nsGkAtoms::type ||
+           aAttribute == nsGkAtoms::valign || aAttribute == nsGkAtoms::width;
+  }
+
+  [[nodiscard]] bool IsCSSSettable(const nsStaticAtom& aTagName) const;
+  [[nodiscard]] bool IsCSSSettable(const dom::Element& aElement) const;
+
+  [[nodiscard]] bool IsCSSRemovable(const nsStaticAtom& aTagName) const;
+  [[nodiscard]] bool IsCSSRemovable(const dom::Element& aElement) const;
+
+  nsStaticAtom* Style() const { return mStyle; }
+
+  [[nodiscard]] bool IsInlineStyle() const { return !mStyle; }
+  inline EditorInlineStyle& AsInlineStyle();
+  inline const EditorInlineStyle& AsInlineStyle() const;
+
+ protected:
+  MOZ_KNOWN_LIVE nsStaticAtom* mStyle = nullptr;
+  EditorElementStyle() = default;
+
+ private:
+  constexpr explicit EditorElementStyle(const nsStaticAtom& aStyle)
+      : mStyle(const_cast<nsStaticAtom*>(&aStyle)) {}
+};
+
+
+struct MOZ_STACK_CLASS EditorInlineStyle : public EditorElementStyle {
+  MOZ_KNOWN_LIVE nsStaticAtom* const mHTMLProperty = nullptr;
+  MOZ_KNOWN_LIVE const RefPtr<nsAtom> mAttribute;
+
+  [[nodiscard]] bool IsStyleToClearAllInlineStyles() const {
+    return !mHTMLProperty;
+  }
+
+  [[nodiscard]] bool IsStyleOfAnchorElement() const {
+    return mHTMLProperty == nsGkAtoms::a || mHTMLProperty == nsGkAtoms::href ||
+           mHTMLProperty == nsGkAtoms::name;
+  }
+
+  [[nodiscard]] bool IsInvertibleWithCSS() const {
+    return mHTMLProperty == nsGkAtoms::b;
+  }
+
+  enum class IgnoreSElement { No, Yes };
+  [[nodiscard]] bool IsStyleOfTextDecoration(
+      IgnoreSElement aIgnoreSElement) const {
+    return mHTMLProperty == nsGkAtoms::u ||
+           mHTMLProperty == nsGkAtoms::strike ||
+           (aIgnoreSElement == IgnoreSElement::No &&
+            mHTMLProperty == nsGkAtoms::s);
+  }
+
+  [[nodiscard]] bool IsStyleOfFontElement() const {
+    MOZ_ASSERT_IF(
+        mHTMLProperty == nsGkAtoms::font,
+        mAttribute == nsGkAtoms::bgcolor || mAttribute == nsGkAtoms::color ||
+            mAttribute == nsGkAtoms::face || mAttribute == nsGkAtoms::size);
+    return mHTMLProperty == nsGkAtoms::font && mAttribute != nsGkAtoms::bgcolor;
+  }
+
+  [[nodiscard]] bool IsStyleOfFontSize() const {
+    return mHTMLProperty == nsGkAtoms::font && mAttribute == nsGkAtoms::size;
+  }
+
+  [[nodiscard]] bool IsStyleConflictingWithVerticalAlign() const {
+    return mHTMLProperty == nsGkAtoms::sup || mHTMLProperty == nsGkAtoms::sub;
+  }
+
+  [[nodiscard]] nsStaticAtom* GetSimilarElementNameAtom() const {
+    if (mHTMLProperty == nsGkAtoms::b) {
+      return nsGkAtoms::strong;
+    }
+    if (mHTMLProperty == nsGkAtoms::i) {
+      return nsGkAtoms::em;
+    }
+    if (mHTMLProperty == nsGkAtoms::strike) {
+      return nsGkAtoms::s;
+    }
+    return nullptr;
+  }
+
+  [[nodiscard]] bool IsRepresentedBy(const nsIContent& aContent) const;
+
+  [[nodiscard]] Result<bool, nsresult> IsSpecifiedBy(
+      const HTMLEditor& aHTMLEditor, dom::Element& aElement) const;
+
+  explicit EditorInlineStyle(const nsStaticAtom& aHTMLProperty,
+                             nsAtom* aAttribute = nullptr)
+      : EditorInlineStyle(aHTMLProperty, aAttribute, HasValue::No) {}
+  EditorInlineStyle(const nsStaticAtom& aHTMLProperty,
+                    RefPtr<nsAtom>&& aAttribute)
+      : EditorInlineStyle(aHTMLProperty, aAttribute, HasValue::No) {}
+
+  static EditorInlineStyle RemoveAllStyles() { return EditorInlineStyle(); }
+
+  PendingStyleCache ToPendingStyleCache(nsAString&& aValue) const;
+
+  bool operator==(const EditorInlineStyle& aOther) const {
+    return mHTMLProperty == aOther.mHTMLProperty &&
+           mAttribute == aOther.mAttribute;
+  }
+
+  bool MaybeHasValue() const { return mMaybeHasValue; }
+  inline EditorInlineStyleAndValue& AsInlineStyleAndValue();
+  inline const EditorInlineStyleAndValue& AsInlineStyleAndValue() const;
+
+ protected:
+  const bool mMaybeHasValue = false;
+
+  enum class HasValue { No, Yes };
+  EditorInlineStyle(const nsStaticAtom& aHTMLProperty, nsAtom* aAttribute,
+                    HasValue aHasValue)
+      : mHTMLProperty(const_cast<nsStaticAtom*>(&aHTMLProperty)),
+        mAttribute(aAttribute),
+        mMaybeHasValue(aHasValue == HasValue::Yes) {}
+  EditorInlineStyle(const nsStaticAtom& aHTMLProperty,
+                    RefPtr<nsAtom>&& aAttribute, HasValue aHasValue)
+      : mHTMLProperty(const_cast<nsStaticAtom*>(&aHTMLProperty)),
+        mAttribute(std::move(aAttribute)),
+        mMaybeHasValue(aHasValue == HasValue::Yes) {}
+  EditorInlineStyle(const EditorInlineStyle& aStyle, HasValue aHasValue)
+      : mHTMLProperty(aStyle.mHTMLProperty),
+        mAttribute(aStyle.mAttribute),
+        mMaybeHasValue(aHasValue == HasValue::Yes) {}
+
+ private:
+  EditorInlineStyle() = default;
+
+  using EditorElementStyle::AsInlineStyle;
+  using EditorElementStyle::IsInlineStyle;
+  using EditorElementStyle::Style;
+};
+
+inline EditorInlineStyle& EditorElementStyle::AsInlineStyle() {
+  return reinterpret_cast<EditorInlineStyle&>(*this);
+}
+
+inline const EditorInlineStyle& EditorElementStyle::AsInlineStyle() const {
+  return reinterpret_cast<const EditorInlineStyle&>(*this);
+}
+
+
+struct MOZ_STACK_CLASS EditorInlineStyleAndValue : public EditorInlineStyle {
+  nsString const mAttributeValue;
+
+  bool IsStyleToClearAllInlineStyles() const = delete;
+  EditorInlineStyleAndValue() = delete;
+
+  explicit EditorInlineStyleAndValue(nsStaticAtom& aHTMLProperty)
+      : EditorInlineStyle(aHTMLProperty, nullptr, HasValue::No) {}
+  EditorInlineStyleAndValue(nsStaticAtom& aHTMLProperty, nsAtom& aAttribute,
+                            const nsAString& aValue)
+      : EditorInlineStyle(aHTMLProperty, &aAttribute, HasValue::Yes),
+        mAttributeValue(aValue) {}
+  EditorInlineStyleAndValue(nsStaticAtom& aHTMLProperty,
+                            RefPtr<nsAtom>&& aAttribute,
+                            const nsAString& aValue)
+      : EditorInlineStyle(aHTMLProperty, std::move(aAttribute), HasValue::Yes),
+        mAttributeValue(aValue) {
+    MOZ_ASSERT(mAttribute);
+  }
+  EditorInlineStyleAndValue(nsStaticAtom& aHTMLProperty, nsAtom& aAttribute,
+                            nsString&& aValue)
+      : EditorInlineStyle(aHTMLProperty, &aAttribute, HasValue::Yes),
+        mAttributeValue(std::move(aValue)) {}
+  EditorInlineStyleAndValue(nsStaticAtom& aHTMLProperty,
+                            RefPtr<nsAtom>&& aAttribute, nsString&& aValue)
+      : EditorInlineStyle(aHTMLProperty, std::move(aAttribute), HasValue::Yes),
+        mAttributeValue(std::move(aValue)) {}
+
+  [[nodiscard]] static EditorInlineStyleAndValue ToInvert(
+      const EditorInlineStyle& aStyle) {
+    MOZ_ASSERT(aStyle.IsInvertibleWithCSS());
+    return EditorInlineStyleAndValue(aStyle, u"-moz-editor-invert-value"_ns);
+  }
+
+  MOZ_KNOWN_LIVE nsStaticAtom& HTMLPropertyRef() const {
+    MOZ_DIAGNOSTIC_ASSERT(mHTMLProperty);
+    return *mHTMLProperty;
+  }
+
+  [[nodiscard]] bool IsStyleToInvert() const {
+    return mAttributeValue.EqualsLiteral(u"-moz-editor-invert-value");
+  }
+
+  [[nodiscard]] bool IsRepresentableWithHTML() const {
+    if (mAttribute == nsGkAtoms::bgcolor) {
+      return false;
+    }
+    if (IsStyleToInvert()) {
+      return false;
+    }
+    return true;
+  }
+
+ private:
+  using EditorInlineStyle::mHTMLProperty;
+
+  EditorInlineStyleAndValue(const EditorInlineStyle& aStyle,
+                            const nsAString& aValue)
+      : EditorInlineStyle(aStyle, HasValue::Yes), mAttributeValue(aValue) {}
+
+  using EditorInlineStyle::AsInlineStyleAndValue;
+  using EditorInlineStyle::HasValue;
+};
+
+inline EditorInlineStyleAndValue& EditorInlineStyle::AsInlineStyleAndValue() {
+  return reinterpret_cast<EditorInlineStyleAndValue&>(*this);
+}
+
+inline const EditorInlineStyleAndValue&
+EditorInlineStyle::AsInlineStyleAndValue() const {
+  return reinterpret_cast<const EditorInlineStyleAndValue&>(*this);
+}
+
+}  
+
+#endif  // #ifndef HTMLEditHelpers_h

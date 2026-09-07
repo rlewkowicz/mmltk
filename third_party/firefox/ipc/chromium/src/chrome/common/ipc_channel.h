@@ -1,0 +1,108 @@
+// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(CHROME_COMMON_IPC_CHANNEL_H_)
+#define CHROME_COMMON_IPC_CHANNEL_H_
+
+#include <cstdint>
+#include <variant>
+#include "base/basictypes.h"
+#include "base/process.h"
+#include "mozilla/EventTargetAndLockCapability.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/UniquePtrExtensions.h"
+#include "chrome/common/ipc_message.h"
+
+#include "nsISerialEventTarget.h"
+
+
+namespace IPC {
+
+class Message;
+class MessageReader;
+class MessageWriter;
+
+
+class Channel {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING_WITH_DELETE_ON_EVENT_TARGET(
+      Channel, IOThread().GetEventTarget());
+
+  using ChannelHandle =
+      std::variant<std::monostate, mozilla::UniqueFileHandle
+                   >;
+
+  class Listener {
+   public:
+    virtual ~Listener() = default;
+
+    virtual void OnMessageReceived(mozilla::UniquePtr<Message> message) = 0;
+
+    virtual void OnChannelConnected(base::ProcessId peer_pid) {}
+
+    virtual void OnChannelError() {}
+  };
+
+  enum Mode { MODE_BROKER_SERVER, MODE_BROKER_CLIENT, MODE_PEER };
+
+  enum {
+
+    kMaximumMessageSize = 256 * 1024 * 1024,
+
+    kReadBufferSize = 4 * 1024,
+  };
+
+  struct ChannelKind {
+    bool (*create_raw_pipe)(ChannelHandle* server, ChannelHandle* client);
+
+    uint32_t (*num_relayed_attachments)(const IPC::Message& message);
+
+    bool (*is_valid_handle)(const ChannelHandle& handle);
+  };
+
+  static already_AddRefed<Channel> Create(ChannelHandle pipe, Mode mode,
+                                          base::ProcessId other_pid);
+
+  Channel(const Channel&) = delete;
+  Channel& operator=(const Channel&) = delete;
+
+  virtual bool Connect(Listener* listener) MOZ_EXCLUDES(SendMutex()) = 0;
+
+  virtual void Close() MOZ_EXCLUDES(SendMutex()) = 0;
+
+  virtual bool Send(mozilla::UniquePtr<Message> message)
+      MOZ_EXCLUDES(SendMutex()) = 0;
+
+  virtual void SetOtherPid(base::ProcessId other_pid)
+      MOZ_EXCLUDES(SendMutex()) = 0;
+
+
+  virtual const ChannelKind* GetKind() const = 0;
+
+ protected:
+  Channel();
+  virtual ~Channel();
+
+  const mozilla::EventTargetCapability<nsISerialEventTarget>& IOThread() const
+      MOZ_RETURN_CAPABILITY(chan_cap_.Target()) {
+    return chan_cap_.Target();
+  }
+
+  mozilla::Mutex& SendMutex() MOZ_RETURN_CAPABILITY(chan_cap_.Lock()) {
+    return chan_cap_.Lock();
+  }
+
+  mozilla::EventTargetAndLockCapability<nsISerialEventTarget, mozilla::Mutex>
+      chan_cap_;
+
+  enum {
+
+    HELLO_MESSAGE_TYPE = kuint16max  
+  };
+};
+
+}  
+
+#endif

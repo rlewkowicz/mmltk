@@ -1,0 +1,103 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_MruCache_h
+#define mozilla_MruCache_h
+
+#include <cstddef>
+#include <type_traits>
+#include <utility>
+
+#include "mozilla/Attributes.h"
+#include "mozilla/Assertions.h"
+
+namespace mozilla {
+
+namespace detail {
+
+template <typename Value>
+constexpr bool IsNotEmpty(const Value& aVal) {
+  if constexpr (!std::is_pointer_v<Value>) {
+    return true;
+  } else {
+    return aVal != nullptr;
+  }
+}
+
+}  
+
+template <class Key, class Value, class Cache, size_t Size = 31>
+class MruCache {
+  static_assert(Size % 2 != 0, "Use a prime number");
+
+
+ public:
+  using KeyType = Key;
+  using ValueType = Value;
+
+  MruCache() = default;
+  MruCache(const MruCache&) = delete;
+  MruCache(const MruCache&&) = delete;
+
+  template <typename U>
+  void Put(const KeyType& aKey, U&& aVal) {
+    *RawEntry(aKey) = std::forward<U>(aVal);
+  }
+
+  void Remove(const KeyType& aKey) { Lookup(aKey).Remove(); }
+
+  void Clear() {
+    for (ValueType& val : mCache) {
+      val = ValueType{};
+    }
+  }
+
+  class Entry {
+   public:
+    Entry(ValueType* aEntry, bool aMatch) : mEntry(aEntry), mMatch(aMatch) {
+      MOZ_ASSERT(mEntry);
+    }
+
+    explicit operator bool() const { return mMatch; }
+
+    ValueType& Data() const {
+      MOZ_ASSERT(mMatch);
+      return *mEntry;
+    }
+
+    template <typename U>
+    void Set(U&& aValue) {
+      mMatch = true;
+      Data() = std::forward<U>(aValue);
+    }
+
+    void Remove() {
+      if (mMatch) {
+        Data() = ValueType{};
+        mMatch = false;
+      }
+    }
+
+   private:
+    ValueType* mEntry;  
+    bool mMatch;        
+  };
+
+  Entry Lookup(const KeyType& aKey) {
+    auto entry = RawEntry(aKey);
+    bool match = detail::IsNotEmpty(*entry) && Cache::Match(aKey, *entry);
+    return Entry(entry, match);
+  }
+
+ private:
+  MOZ_ALWAYS_INLINE ValueType* RawEntry(const KeyType& aKey) {
+    return &mCache[Cache::Hash(aKey) % Size];
+  }
+
+  ValueType mCache[Size] = {};
+};
+
+}  
+
+#endif  // mozilla_mrucache_h

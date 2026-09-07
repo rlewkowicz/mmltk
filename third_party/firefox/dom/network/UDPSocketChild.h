@@ -1,0 +1,72 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_UDPSocketChild_h_
+#define mozilla_dom_UDPSocketChild_h_
+
+#include "mozilla/net/PUDPSocketChild.h"
+#include "nsCOMPtr.h"
+
+class nsIInputStream;
+class nsIPrincipal;
+class nsIUDPSocketInternal;
+
+namespace mozilla::dom {
+
+class UDPSocketChild : public mozilla::net::PUDPSocketChild {
+ public:
+  UDPSocketChild();
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(UDPSocketChild, override);
+
+  uint16_t LocalPort() const { return mLocalPort; }
+  const nsACString& LocalAddress() const { return mLocalAddress; }
+
+  nsresult SetFilterName(const nsACString& aFilterName);
+
+  nsresult Bind(nsIUDPSocketInternal* aSocket, nsIPrincipal* aPrincipal,
+                const nsACString& aHost, uint16_t aPort, bool aAddressReuse,
+                bool aLoopback, uint32_t recvBufferSize,
+                uint32_t sendBufferSize);
+
+  void Connect(nsIUDPSocketInternal* aSocket, const nsACString& aHost,
+               uint16_t aPort);
+
+  nsresult SendWithAddress(const NetAddr* aAddr, const uint8_t* aData,
+                           uint32_t aByteLength);
+
+  nsresult SendBinaryStream(const nsACString& aHost, uint16_t aPort,
+                            nsIInputStream* aStream);
+
+  void Close();
+
+  void JoinMulticast(const nsACString& aMulticastAddress,
+                     const nsACString& aInterface);
+  void LeaveMulticast(const nsACString& aMulticastAddress,
+                      const nsACString& aInterface);
+
+  mozilla::ipc::IPCResult RecvCallbackOpened(
+      const UDPAddressInfo& aAddressInfo) override;
+  mozilla::ipc::IPCResult RecvCallbackConnected(
+      const UDPAddressInfo& aAddressInfo) override;
+  mozilla::ipc::IPCResult RecvCallbackClosed() override;
+  mozilla::ipc::IPCResult RecvCallbackReceivedData(
+      const UDPAddressInfo& aAddressInfo, nsTArray<uint8_t>&& aData) override;
+  mozilla::ipc::IPCResult RecvCallbackError(
+      const nsACString& aMessage, const nsACString& aFilename,
+      const uint32_t& aLineNumber) override;
+
+ private:
+  virtual ~UDPSocketChild();
+  nsresult SendDataInternal(const UDPSocketAddr& aAddr, const uint8_t* aData,
+                            const uint32_t aByteLength);
+
+  nsCOMPtr<nsIUDPSocketInternal> mSocket;
+  uint16_t mLocalPort;
+  nsCString mLocalAddress;
+  nsCString mFilterName;
+};
+
+}  
+
+#endif  // !defined(mozilla_dom_UDPSocketChild_h_)

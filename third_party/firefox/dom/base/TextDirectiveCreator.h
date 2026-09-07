@@ -1,0 +1,151 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_TEXTDIRECTIVECREATOR_H_
+#define DOM_TEXTDIRECTIVECREATOR_H_
+
+#include <tuple>
+
+#include "RangeBoundary.h"
+#include "TextDirectiveUtil.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/Result.h"
+#include "mozilla/dom/fragmentdirectives_ffi_generated.h"
+#include "nsStringFwd.h"
+
+class nsRange;
+
+namespace mozilla {
+class ErrorResult;
+}
+
+namespace mozilla::dom {
+class Document;
+class TextDirectiveCreator {
+ public:
+  static Result<nsCString, ErrorResult> CreateTextDirectiveFromRange(
+      Document* aDocument, AbstractRange* aInputRange,
+      const TimeoutWatchdog* aWatchdog);
+
+  virtual ~TextDirectiveCreator();
+
+ protected:
+  TextDirectiveCreator(Document* aDocument, AbstractRange* aRange,
+                       const TimeoutWatchdog* aWatchdog);
+
+  static Result<RefPtr<AbstractRange>, ErrorResult> ExtendRangeToWordBoundaries(
+      AbstractRange* aRange);
+
+  static Result<bool, ErrorResult> MustUseRangeBasedMatching(
+      AbstractRange* aRange);
+
+  static Result<UniquePtr<TextDirectiveCreator>, ErrorResult> CreateInstance(
+      Document* aDocument, AbstractRange* aRange,
+      const TimeoutWatchdog* aWatchdog);
+
+  virtual Result<bool, ErrorResult> CollectContextTerms() = 0;
+
+  Result<Ok, ErrorResult> CollectPrefixContextTerm();
+
+  Result<Ok, ErrorResult> CollectSuffixContextTerm();
+
+  virtual void CollectContextTermWordBoundaryDistances() = 0;
+
+  virtual Result<Ok, ErrorResult> FindAllMatchingCandidates() = 0;
+
+  Result<nsTArray<RefPtr<AbstractRange>>, ErrorResult> FindAllMatchingRanges(
+      const nsString& aSearchQuery, const RangeBoundary& aSearchStart,
+      const RangeBoundary& aSearchEnd);
+
+  Result<nsCString, ErrorResult> CreateTextDirective();
+
+  static std::tuple<nsTArray<uint32_t>, nsTArray<uint32_t>>
+  ExtendSubstringLengthsToWordBoundaries(
+      const nsTArray<std::tuple<uint32_t, uint32_t>>& aExactSubstringLengths,
+      const Span<const uint32_t>& aFirstWordPositions,
+      const Span<const uint32_t>& aSecondWordPositions);
+
+  virtual Maybe<TextDirective> FindShortestCombination() const = 0;
+
+  static Maybe<std::tuple<uint32_t, uint32_t>> CheckAllCombinations(
+      const nsTArray<std::tuple<uint32_t, uint32_t>>& aExactWordLengths,
+      const nsTArray<uint32_t>& aFirstExtendedToWordBoundaries,
+      const nsTArray<uint32_t>& aSecondExtendedToWordBoundaries);
+
+  static constexpr uint32_t kMaxContextTermLength = 1024;
+
+  nsString mPrefixContent;
+  nsString mPrefixFoldCaseContent;
+  nsTArray<uint32_t> mPrefixWordBeginDistances;
+
+  nsString mStartContent;
+
+  nsString mSuffixContent;
+  nsString mSuffixFoldCaseContent;
+  nsTArray<uint32_t> mSuffixWordEndDistances;
+
+  NotNull<RefPtr<Document>> mDocument;
+  NotNull<RefPtr<AbstractRange>> mRange;
+
+  NotNull<RefPtr<nsFind>> mFinder;
+
+  RefPtr<const TimeoutWatchdog> mWatchdog;
+
+  nsContentUtils::NodeIndexCache mNodeIndexCache;
+};
+
+class RangeBasedTextDirectiveCreator : public TextDirectiveCreator {
+ private:
+  using TextDirectiveCreator::TextDirectiveCreator;
+
+  Result<bool, ErrorResult> CollectContextTerms() override;
+
+  void CollectContextTermWordBoundaryDistances() override;
+
+  Result<Ok, ErrorResult> FindAllMatchingCandidates() override;
+
+  void FindStartMatchCommonSubstringLengths(
+      const nsTArray<RefPtr<AbstractRange>>& aMatchRanges);
+
+  void FindEndMatchCommonSubstringLengths(
+      const nsTArray<RefPtr<AbstractRange>>& aMatchRanges);
+
+  Maybe<TextDirective> FindShortestCombination() const override;
+
+  nsString mEndContent;
+  nsString mStartFoldCaseContent;
+  nsString mEndFoldCaseContent;
+
+  nsString mFirstWordOfStartContent;
+  nsString mLastWordOfEndContent;
+
+  uint32_t mStartFirstWordLengthIncludingWhitespace = 0;
+  uint32_t mEndLastWordLengthIncludingWhitespace = 0;
+
+  nsTArray<uint32_t> mStartWordEndDistances;
+  nsTArray<uint32_t> mEndWordBeginDistances;
+
+  nsTArray<std::tuple<uint32_t, uint32_t>> mStartMatchCommonSubstringLengths;
+  nsTArray<std::tuple<uint32_t, uint32_t>> mEndMatchCommonSubstringLengths;
+};
+
+class ExactMatchTextDirectiveCreator : public TextDirectiveCreator {
+ private:
+  using TextDirectiveCreator::TextDirectiveCreator;
+
+  Result<bool, ErrorResult> CollectContextTerms() override;
+
+  void CollectContextTermWordBoundaryDistances() override;
+
+  Result<Ok, ErrorResult> FindAllMatchingCandidates() override;
+
+  void FindCommonSubstringLengths(
+      const nsTArray<RefPtr<AbstractRange>>& aMatchRanges);
+
+  Maybe<TextDirective> FindShortestCombination() const override;
+
+  nsTArray<std::tuple<uint32_t, uint32_t>> mCommonSubstringLengths;
+};
+}  
+#endif

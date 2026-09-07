@@ -1,0 +1,73 @@
+/*
+ * Copyright 2006 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkScanPriv_DEFINED)
+#define SkScanPriv_DEFINED
+
+#include "include/core/SkPath.h"
+#include "src/core/SkBlitter.h"
+#include "src/core/SkScan.h"
+
+#define SK_SUPERSAMPLE_SHIFT    2
+
+class SkScanClipper {
+public:
+    SkScanClipper(SkBlitter* blitter, const SkRegion* clip, const SkIRect& bounds,
+                  bool skipRejectTest = false, bool boundsPreClipped = false);
+
+    SkBlitter*      getBlitter() const { return fBlitter; }
+    const SkIRect*  getClipRect() const { return fClipRect; }
+
+private:
+    SkRectClipBlitter   fRectBlitter;
+    SkRgnClipBlitter    fRgnBlitter;
+#if defined(SK_DEBUG)
+    SkRectClipCheckBlitter fRectClipCheckBlitter;
+#endif
+    SkBlitter*          fBlitter;
+    const SkIRect*      fClipRect;
+};
+
+void sk_blit_above(SkBlitter*, const SkIRect& avoid, const SkRegion& clip);
+void sk_blit_below(SkBlitter*, const SkIRect& avoid, const SkRegion& clip);
+
+template<class EdgeType>
+static inline void remove_edge(EdgeType* edge) {
+    edge->fPrev->fNext = edge->fNext;
+    edge->fNext->fPrev = edge->fPrev;
+}
+
+template<class EdgeType>
+static inline void insert_edge_after(EdgeType* edge, EdgeType* afterMe) {
+    edge->fPrev = afterMe;
+    edge->fNext = afterMe->fNext;
+    afterMe->fNext->fPrev = edge;
+    afterMe->fNext = edge;
+}
+
+template<class EdgeType>
+void backward_insert_edge_based_on_x(EdgeType* edge) {
+    SkFixed x = edge->fX;
+    EdgeType* prev = edge->fPrev;
+    while (prev->fPrev && prev->fX > x) {
+        prev = prev->fPrev;
+    }
+    if (prev->fNext != edge) {
+        remove_edge(edge);
+        insert_edge_after(edge, prev);
+    }
+}
+
+template<class EdgeType>
+EdgeType* backward_insert_start(EdgeType* prev, SkFixed x) {
+    while (prev->fPrev && prev->fX > x) {
+        prev = prev->fPrev;
+    }
+    return prev;
+}
+
+#endif

@@ -1,0 +1,115 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+#ifndef __NUMBER_FORMATIMPL_H__
+#define __NUMBER_FORMATIMPL_H__
+
+#include "number_types.h"
+#include "formatted_string_builder.h"
+#include "number_patternstring.h"
+#include "number_usageprefs.h"
+#include "number_utils.h"
+#include "number_patternmodifier.h"
+#include "number_longnames.h"
+#include "number_compact.h"
+#include "number_microprops.h"
+#include "number_utypes.h"
+
+U_NAMESPACE_BEGIN
+namespace number::impl {
+
+class NumberFormatterImpl : public UMemory {
+  public:
+    NumberFormatterImpl(const MacroProps &macros, UErrorCode &status);
+
+    NumberFormatterImpl(UErrorCode &) {}
+
+    static int32_t formatStatic(const MacroProps &macros, UFormattedNumberData *results,
+                                UErrorCode &status);
+
+    static int32_t getPrefixSuffixStatic(const MacroProps& macros, Signum signum,
+                                         StandardPlural::Form plural, FormattedStringBuilder& outString,
+                                         UErrorCode& status);
+
+    int32_t format(UFormattedNumberData *results, UErrorCode &status) const;
+
+    void preProcess(DecimalQuantity& inValue, MicroProps& microsOut, UErrorCode& status) const;
+
+    int32_t getPrefixSuffix(Signum signum, StandardPlural::Form plural, FormattedStringBuilder& outString,
+                            UErrorCode& status) const;
+
+    const MicroProps& getRawMicroProps() const {
+        return fMicros;
+    }
+
+    static int32_t writeNumber(
+        const SimpleMicroProps& micros,
+        DecimalQuantity& quantity,
+        FormattedStringBuilder& string,
+        int32_t index,
+        UErrorCode& status);
+
+    static int32_t writeAffixes(
+        const MicroProps& micros,
+        FormattedStringBuilder& string,
+        int32_t start,
+        int32_t end,
+        UErrorCode& status);
+
+  private:
+    const MicroPropsGenerator *fMicroPropsGenerator = nullptr;
+
+    MicroProps fMicros;
+
+    LocalPointer<const UsagePrefsHandler> fUsagePrefsHandler;
+    LocalPointer<const UnitConversionHandler> fUnitConversionHandler;
+    LocalPointer<const DecimalFormatSymbols> fSymbols;
+    LocalPointer<const PluralRules> fRules;
+    LocalPointer<const ParsedPatternInfo> fPatternInfo;
+    LocalPointer<const ScientificHandler> fScientificHandler;
+    LocalPointer<MutablePatternModifier> fPatternModifier;
+    LocalPointer<ImmutablePatternModifier> fImmutablePatternModifier;
+    LocalPointer<LongNameHandler> fLongNameHandler;
+    LocalPointer<MixedUnitLongNameHandler> fMixedUnitLongNameHandler;
+    LocalPointer<const LongNameMultiplexer> fLongNameMultiplexer;
+    LocalPointer<const CompactHandler> fCompactHandler;
+
+    NumberFormatterImpl(const MacroProps &macros, bool safe, UErrorCode &status);
+
+    MicroProps& preProcessUnsafe(DecimalQuantity &inValue, UErrorCode &status);
+
+    int32_t getPrefixSuffixUnsafe(Signum signum, StandardPlural::Form plural,
+                                  FormattedStringBuilder& outString, UErrorCode& status);
+
+    const PluralRules *
+    resolvePluralRules(const PluralRules *rulesPtr, const Locale &locale, UErrorCode &status);
+
+    const MicroPropsGenerator *
+    macrosToMicroGenerator(const MacroProps &macros, bool safe, UErrorCode &status);
+
+    static int32_t
+    writeIntegerDigits(
+        const SimpleMicroProps& micros,
+        DecimalQuantity &quantity,
+        FormattedStringBuilder &string,
+        int32_t index,
+        UErrorCode &status);
+
+    static int32_t
+    writeFractionDigits(
+        const SimpleMicroProps& micros,
+        DecimalQuantity &quantity,
+        FormattedStringBuilder &string,
+        int32_t index,
+        UErrorCode &status);
+};
+
+} 
+U_NAMESPACE_END
+
+
+#endif //__NUMBER_FORMATIMPL_H__
+
+#endif /* #if !UCONFIG_NO_FORMATTING */

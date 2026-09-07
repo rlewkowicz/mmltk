@@ -1,0 +1,81 @@
+/*
+ * Copyright 2018 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkPicturePriv_DEFINED)
+#define SkPicturePriv_DEFINED
+
+#include "include/core/SkFourByteTag.h"
+#include "include/core/SkPicture.h"
+#include "include/core/SkRefCnt.h"
+
+#include <atomic>
+#include <cstdint>
+
+class SkBigPicture;
+class SkReadBuffer;
+class SkStream;
+class SkWriteBuffer;
+struct SkPictInfo;
+
+class SkPicturePriv {
+public:
+    static sk_sp<SkPicture> MakeFromBuffer(SkReadBuffer& buffer);
+
+    static void Flatten(const sk_sp<const SkPicture> , SkWriteBuffer& buffer);
+
+    static const SkBigPicture* AsSkBigPicture(const sk_sp<const SkPicture>& picture) {
+        return picture->asSkBigPicture();
+    }
+
+    static uint64_t MakeSharedID(uint32_t pictureID) {
+        uint64_t sharedID = SkSetFourByteTag('p', 'i', 'c', 't');
+        return (sharedID << 32) | pictureID;
+    }
+
+    static void AddedToCache(const SkPicture* pic) {
+        pic->fAddedToCache.store(true);
+    }
+
+
+    enum Version {
+        kPictureShaderFilterParam_Version   = 82,
+        kMatrixImageFilterSampling_Version  = 83,
+        kImageFilterImageSampling_Version   = 84,
+        kNoFilterQualityShaders_Version     = 85,
+        kVerticesRemoveCustomData_Version   = 86,
+        kSkBlenderInSkPaint                 = 87,
+        kBlenderInEffects                   = 88,
+        kNoExpandingClipOps                 = 89,
+        kBackdropScaleFactor                = 90,
+        kRawImageShaders                    = 91,
+        kAnisotropicFilter                  = 92,
+        kBlend4fColorFilter                 = 93,
+        kNoShaderLocalMatrix                = 94,
+        kShaderImageFilterSerializeShader   = 95,
+        kRevampMagnifierFilter              = 96,
+        kRuntimeImageFilterSampleRadius     = 97,
+        kCombineBlendArithmeticFilters      = 98,
+        kRemoveLegacyMagnifierFilter        = 99,
+        kDropShadowImageFilterComposition   = 100,
+        kCropImageFilterSupportsTiling      = 101,
+        kConvolutionImageFilterTilingUpdate = 102,
+        kRemoveDeprecatedCropRect           = 103,
+        kMultipleFiltersOnSaveLayer         = 104,
+        kUnclampedMatrixColorFilter         = 105,
+        kSaveLayerBackdropTileMode          = 106,
+        kCombineColorShaders                = 107,
+        kSerializeStableKeys                = 108,
+        kWorkingColorSpaceOutput            = 109,
+
+        kMin_Version     = kPictureShaderFilterParam_Version,
+        kCurrent_Version = kWorkingColorSpaceOutput
+    };
+};
+
+bool SkPicture_StreamIsSKP(SkStream*, SkPictInfo*);
+
+#endif

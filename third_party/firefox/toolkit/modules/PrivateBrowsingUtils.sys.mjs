@@ -1,0 +1,59 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+const kAutoStartPref = "browser.privatebrowsing.autostart";
+
+var gTemporaryAutoStartMode = false;
+
+export var PrivateBrowsingUtils = {
+  get enabled() {
+    return true;
+  },
+
+  isWindowPrivate: function pbu_isWindowPrivate(aWindow) {
+    if (!aWindow.isChromeWindow) {
+      dump(
+        "WARNING: content window passed to PrivateBrowsingUtils.isWindowPrivate. " +
+          "Use isContentWindowPrivate instead (but only for frame scripts).\n" +
+          new Error().stack
+      );
+    }
+
+    return this.privacyContextFromWindow(aWindow).usePrivateBrowsing;
+  },
+
+  isContentWindowPrivate: function pbu_isWindowPrivate(aWindow) {
+    return this.privacyContextFromWindow(aWindow).usePrivateBrowsing;
+  },
+
+  isBrowserPrivate(aBrowser) {
+    let chromeWin = aBrowser.documentGlobal;
+    if (chromeWin.gMultiProcessBrowser || !aBrowser.contentWindow) {
+      return this.isWindowPrivate(chromeWin);
+    }
+    return this.privacyContextFromWindow(aBrowser.contentWindow)
+      .usePrivateBrowsing;
+  },
+
+  privacyContextFromWindow: function pbu_privacyContextFromWindow(aWindow) {
+    return aWindow.docShell.QueryInterface(Ci.nsILoadContext);
+  },
+
+  get permanentPrivateBrowsing() {
+    try {
+      return (
+        gTemporaryAutoStartMode || Services.prefs.getBoolPref(kAutoStartPref)
+      );
+    } catch (e) {
+      return false;
+    }
+  },
+
+  enterTemporaryAutoStartMode: function pbu_enterTemporaryAutoStartMode() {
+    gTemporaryAutoStartMode = true;
+  },
+  get isInTemporaryAutoStartMode() {
+    return gTemporaryAutoStartMode;
+  },
+};

@@ -1,0 +1,42 @@
+/* SPDX-FileCopyrightText: Copyright © 2018 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
+
+#ifndef SPA_PARAM_BUFFERS_H
+#define SPA_PARAM_BUFFERS_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
+#include <spa/param/param.h>
+
+enum spa_param_buffers {
+	SPA_PARAM_BUFFERS_START,
+	SPA_PARAM_BUFFERS_buffers,	
+	SPA_PARAM_BUFFERS_blocks,	
+	SPA_PARAM_BUFFERS_size,		
+	SPA_PARAM_BUFFERS_stride,	
+	SPA_PARAM_BUFFERS_align,	
+	SPA_PARAM_BUFFERS_dataType,	
+	SPA_PARAM_BUFFERS_metaType,	
+};
+
+enum spa_param_meta {
+	SPA_PARAM_META_START,
+	SPA_PARAM_META_type,		
+	SPA_PARAM_META_size,		
+};
+
+enum spa_param_io {
+	SPA_PARAM_IO_START,
+	SPA_PARAM_IO_id,	
+	SPA_PARAM_IO_size,	
+};
+
+
+#ifdef __cplusplus
+}  
+#endif
+
+#endif /* SPA_PARAM_BUFFERS_H */

@@ -1,0 +1,3 @@
+pub fn fmaxf(x: f32, y: f32) -> f32 {
+    (if x.is_nan() || x < y { y } else { x }) * 1.0
+}

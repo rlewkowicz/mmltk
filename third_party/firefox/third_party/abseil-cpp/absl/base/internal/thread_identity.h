@@ -1,0 +1,180 @@
+// Copyright 2017 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#if !defined(ABSL_BASE_INTERNAL_THREAD_IDENTITY_H_)
+#define ABSL_BASE_INTERNAL_THREAD_IDENTITY_H_
+
+#include <pthread.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <cstdint>
+
+#include "absl/base/config.h"
+#include "absl/base/internal/per_thread_tls.h"
+#include "absl/base/optimization.h"
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+
+struct SynchLocksHeld;
+struct SynchWaitParams;
+
+namespace base_internal {
+
+class SpinLock;
+struct ThreadIdentity;
+
+struct PerThreadSynch {
+  static constexpr int kLowZeroBits = 8;
+  static constexpr int kAlignment = 1 << kLowZeroBits;
+
+  ThreadIdentity* thread_identity() {
+    return reinterpret_cast<ThreadIdentity*>(this);
+  }
+
+  PerThreadSynch* next;  
+  PerThreadSynch* skip;  
+  bool may_skip;         
+  bool wake;             
+  bool cond_waiter;
+  bool maybe_unlocking;  
+  bool suppress_fatal_errors;  
+  int priority;                
+
+  enum State { kAvailable, kQueued };
+  std::atomic<State> state;
+
+  SynchWaitParams* waitp;
+
+  intptr_t readers;  
+
+  int64_t next_priority_read_cycles;
+
+  SynchLocksHeld* all_locks;
+};
+
+struct ThreadIdentity {
+  PerThreadSynch per_thread_synch;
+
+  struct SchedulerState {
+    std::atomic<void*> bound_schedulable{nullptr};
+    uint32_t association_lock_word;
+    std::atomic<int> scheduling_disabled_depth;
+    int potentially_blocking_depth;
+    uint32_t schedule_next_state;
+
+    bool waking_designated_waker;
+
+    inline SpinLock* association_lock() {
+      return reinterpret_cast<SpinLock*>(&association_lock_word);
+    }
+  } scheduler_state;  
+
+  enum class WaitState : uint8_t {
+    kActive = 0,
+    kWaitingForWork = 1,
+  };
+  std::atomic<WaitState> wait_state;
+  static_assert(std::atomic<WaitState>::is_always_lock_free);
+
+  static constexpr size_t kToBePaddedSize =
+      sizeof(SchedulerState) + sizeof(std::atomic<WaitState>);
+  static_assert(ABSL_CACHELINE_SIZE >= kToBePaddedSize);
+  char padding[ABSL_CACHELINE_SIZE - kToBePaddedSize];
+
+  struct WaiterState {
+    alignas(void*) char data[256];
+  } waiter_state;
+
+  std::atomic<int>* blocked_count_ptr;
+
+  std::atomic<int> ticker;      
+  std::atomic<int> wait_start;  
+  std::atomic<bool> is_idle;    
+
+  int static_initialization_depth;
+
+  ThreadIdentity* next;
+};
+
+ThreadIdentity* CurrentThreadIdentityIfPresent();
+
+using ThreadIdentityReclaimerFunction = void (*)(void*);
+
+void SetCurrentThreadIdentity(ThreadIdentity* identity,
+                              ThreadIdentityReclaimerFunction reclaimer);
+
+void ClearCurrentThreadIdentity();
+
+#if defined(ABSL_THREAD_IDENTITY_MODE_USE_POSIX_SETSPECIFIC)
+#error ABSL_THREAD_IDENTITY_MODE_USE_POSIX_SETSPECIFIC cannot be directly set
+#else
+#define ABSL_THREAD_IDENTITY_MODE_USE_POSIX_SETSPECIFIC 0
+#endif
+
+#if defined(ABSL_THREAD_IDENTITY_MODE_USE_TLS)
+#error ABSL_THREAD_IDENTITY_MODE_USE_TLS cannot be directly set
+#else
+#define ABSL_THREAD_IDENTITY_MODE_USE_TLS 1
+#endif
+
+#if defined(ABSL_THREAD_IDENTITY_MODE_USE_CPP11)
+#error ABSL_THREAD_IDENTITY_MODE_USE_CPP11 cannot be directly set
+#else
+#define ABSL_THREAD_IDENTITY_MODE_USE_CPP11 2
+#endif
+
+#if defined(ABSL_THREAD_IDENTITY_MODE)
+#error ABSL_THREAD_IDENTITY_MODE cannot be directly set
+#elif defined(ABSL_FORCE_THREAD_IDENTITY_MODE)
+#define ABSL_THREAD_IDENTITY_MODE ABSL_FORCE_THREAD_IDENTITY_MODE
+#elif ABSL_PER_THREAD_TLS && defined(__GOOGLE_GRTE_VERSION__) && \
+    (__GOOGLE_GRTE_VERSION__ >= 20140228L)
+#define ABSL_THREAD_IDENTITY_MODE ABSL_THREAD_IDENTITY_MODE_USE_TLS
+#else
+#define ABSL_THREAD_IDENTITY_MODE \
+  ABSL_THREAD_IDENTITY_MODE_USE_POSIX_SETSPECIFIC
+#endif
+
+#if ABSL_THREAD_IDENTITY_MODE == ABSL_THREAD_IDENTITY_MODE_USE_TLS || \
+    ABSL_THREAD_IDENTITY_MODE == ABSL_THREAD_IDENTITY_MODE_USE_CPP11
+
+#if ABSL_PER_THREAD_TLS
+ABSL_CONST_INIT extern ABSL_PER_THREAD_TLS_KEYWORD ThreadIdentity*
+    thread_identity_ptr;
+#elif defined(ABSL_HAVE_THREAD_LOCAL)
+ABSL_CONST_INIT extern thread_local ThreadIdentity* thread_identity_ptr;
+#else
+#error Thread-local storage not detected on this platform
+#endif
+
+#if !0 && !defined(ABSL_BUILD_DLL) && \
+    !defined(ABSL_CONSUME_DLL)
+#define ABSL_INTERNAL_INLINE_CURRENT_THREAD_IDENTITY_IF_PRESENT 1
+#endif
+
+#if defined(ABSL_INTERNAL_INLINE_CURRENT_THREAD_IDENTITY_IF_PRESENT)
+inline ThreadIdentity* CurrentThreadIdentityIfPresent() {
+  return thread_identity_ptr;
+}
+#endif
+
+#elif ABSL_THREAD_IDENTITY_MODE != \
+    ABSL_THREAD_IDENTITY_MODE_USE_POSIX_SETSPECIFIC
+#error Unknown ABSL_THREAD_IDENTITY_MODE
+#endif
+
+}  
+ABSL_NAMESPACE_END
+}  
+
+#endif

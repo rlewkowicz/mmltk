@@ -1,0 +1,139 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_DOMEventTargetHelper_h_
+#define mozilla_DOMEventTargetHelper_h_
+
+#include "mozilla/Attributes.h"
+#include "mozilla/GlobalTeardownObserver.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/EventTarget.h"
+#include "nsAtom.h"
+#include "nsCOMPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsDebug.h"
+#include "nsGkAtoms.h"
+#include "nsID.h"
+#include "nsIGlobalObject.h"
+#include "nsISupports.h"
+#include "nsPIDOMWindow.h"
+#include "nsStringFwd.h"
+#include "nsTArray.h"
+
+class nsCycleCollectionTraversalCallback;
+
+namespace mozilla {
+
+class ErrorResult;
+class EventChainPostVisitor;
+class EventChainPreVisitor;
+class EventListenerManager;
+
+namespace dom {
+class Document;
+class Event;
+enum class CallerType : uint32_t;
+}  
+
+#define NS_DOMEVENTTARGETHELPER_IID \
+  {0xa28385c6, 0x9451, 0x4d7e, {0xa3, 0xdd, 0xf4, 0xb6, 0x87, 0x2f, 0xa4, 0x76}}
+
+class DOMEventTargetHelper : public dom::EventTarget,
+                             public GlobalTeardownObserver {
+ public:
+  DOMEventTargetHelper();
+  explicit DOMEventTargetHelper(nsPIDOMWindowInner* aWindow);
+  explicit DOMEventTargetHelper(nsIGlobalObject* aGlobalObject);
+  explicit DOMEventTargetHelper(DOMEventTargetHelper* aOther);
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_IMETHOD_(void) DeleteCycleCollectable() override;
+  NS_DECL_CYCLE_COLLECTION_SKIPPABLE_WRAPPERCACHE_CLASS_AMBIGUOUS(
+      DOMEventTargetHelper, dom::EventTarget)
+
+  EventListenerManager* GetExistingListenerManager() const override;
+  EventListenerManager* GetOrCreateListenerManager() override;
+
+  bool ComputeDefaultWantsUntrusted(ErrorResult& aRv) override;
+
+  using EventTarget::DispatchEvent;
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY bool DispatchEvent(dom::Event& aEvent,
+                                                 dom::CallerType aCallerType,
+                                                 ErrorResult& aRv) override;
+
+  void GetEventTargetParent(EventChainPreVisitor& aVisitor) override;
+
+  nsresult PostHandleEvent(EventChainPostVisitor& aVisitor) override;
+
+  NS_INLINE_DECL_STATIC_IID(NS_DOMEVENTTARGETHELPER_IID)
+
+  nsIGlobalObject* GetRelevantGlobal() const override {
+    return GlobalTeardownObserver::GetRelevantGlobal();
+  }
+
+  static DOMEventTargetHelper* FromSupports(nsISupports* aSupports) {
+    dom::EventTarget* target = static_cast<dom::EventTarget*>(aSupports);
+#ifdef DEBUG
+    {
+      nsCOMPtr<dom::EventTarget> target_qi = do_QueryInterface(aSupports);
+
+      NS_ASSERTION(target_qi == target, "Uh, fix QI!");
+    }
+#endif
+
+    return static_cast<DOMEventTargetHelper*>(target);
+  }
+
+  bool HasListenersFor(const nsAString& aType) const;
+
+  bool HasListenersFor(nsAtom* aTypeWithOn) const;
+
+  nsPIDOMWindowInner* GetWindowIfCurrent() const;
+  mozilla::dom::Document* GetDocumentIfCurrent() const;
+
+  void DisconnectFromOwner() override;
+  using EventTarget::GetParentObject;
+
+  void EventListenerAdded(nsAtom* aType) override;
+
+  void EventListenerRemoved(nsAtom* aType) override;
+
+  nsresult DispatchTrustedEvent(const nsAString& aEventName);
+
+ protected:
+  virtual ~DOMEventTargetHelper();
+
+  nsresult WantsUntrusted(bool* aRetVal);
+
+  void MaybeUpdateKeepAlive();
+  void MaybeDontKeepAlive();
+
+  virtual bool IsCertainlyAliveForCC() const { return mIsKeptAlive; }
+
+  RefPtr<EventListenerManager> mListenerManager;
+  nsresult DispatchTrustedEvent(dom::Event* aEvent);
+
+  virtual void LastRelease() {}
+
+  void KeepAliveIfHasListenersFor(nsAtom* aType);
+
+  void IgnoreKeepAliveIfHasListenersFor(nsAtom* aType);
+
+ private:
+  nsTArray<RefPtr<nsAtom>> mKeepingAliveTypes;
+
+  bool mIsKeptAlive = false;
+};
+
+}  
+
+#define IMPL_EVENT_HANDLER(_event)                                          \
+  inline mozilla::dom::EventHandlerNonNull* GetOn##_event() {               \
+    return GetEventHandler(nsGkAtoms::on##_event);                          \
+  }                                                                         \
+  inline void SetOn##_event(mozilla::dom::EventHandlerNonNull* aCallback) { \
+    SetEventHandler(nsGkAtoms::on##_event, aCallback);                      \
+  }
+
+#endif  // mozilla_DOMEventTargetHelper_h_

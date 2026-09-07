@@ -1,0 +1,121 @@
+// Copyright 2008 Google Inc.  All rights reserved.
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
+
+#if !defined(GOOGLE_PROTOBUF_ANY_H__)
+#define GOOGLE_PROTOBUF_ANY_H__
+
+#include <string>
+
+#include "absl/strings/string_view.h"
+#include "google/protobuf/port.h"
+#include "google/protobuf/message_lite.h"
+
+#include "google/protobuf/port_def.inc"
+
+namespace google {
+namespace protobuf {
+
+class FieldDescriptor;
+class Message;
+
+namespace internal {
+
+PROTOBUF_EXPORT extern const char kAnyFullTypeName[];
+PROTOBUF_EXPORT extern const char kTypeGoogleApisComPrefix[];
+PROTOBUF_EXPORT extern const char kTypeGoogleProdComPrefix[];
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+std::string GetTypeUrl(absl::string_view message_name,
+                       absl::string_view type_url_prefix);
+
+template <typename T>
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD absl::string_view GetAnyMessageName() {
+  return T::FullMessageName();
+}
+
+#define URL_TYPE std::string
+#define VALUE_TYPE std::string
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+PROTOBUF_EXPORT bool InternalPackFromLite(
+    const MessageLite& message, absl::string_view type_url_prefix,
+    absl::string_view type_name, URL_TYPE* PROTOBUF_NONNULL dst_url,
+    VALUE_TYPE* PROTOBUF_NONNULL dst_value);
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+PROTOBUF_EXPORT bool InternalUnpackToLite(
+    absl::string_view type_name, absl::string_view type_url,
+    const VALUE_TYPE& value, MessageLite* PROTOBUF_NONNULL dst_message);
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+PROTOBUF_EXPORT bool InternalIsLite(absl::string_view type_name,
+                                    absl::string_view type_url);
+
+template <typename T>
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool InternalPackFrom(
+    const T& message, URL_TYPE* PROTOBUF_NONNULL dst_url,
+    VALUE_TYPE* PROTOBUF_NONNULL dst_value) {
+  return InternalPackFromLite(message, kTypeGoogleApisComPrefix,
+                              GetAnyMessageName<T>(), dst_url, dst_value);
+}
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+PROTOBUF_EXPORT bool InternalPackFrom(const Message& message,
+                                      URL_TYPE* PROTOBUF_NONNULL dst_url,
+                                      VALUE_TYPE* PROTOBUF_NONNULL dst_value);
+
+template <typename T>
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool InternalPackFrom(
+    const T& message, absl::string_view type_url_prefix,
+    URL_TYPE* PROTOBUF_NONNULL dst_url,
+    VALUE_TYPE* PROTOBUF_NONNULL dst_value) {
+  return InternalPackFromLite(message, type_url_prefix, GetAnyMessageName<T>(),
+                              dst_url, dst_value);
+}
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+PROTOBUF_EXPORT bool InternalPackFrom(const Message& message,
+                                      absl::string_view type_url_prefix,
+                                      URL_TYPE* PROTOBUF_NONNULL dst_url,
+                                      VALUE_TYPE* PROTOBUF_NONNULL dst_value);
+
+template <typename T>
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool InternalUnpackTo(
+    absl::string_view type_url, const VALUE_TYPE& value,
+    T* PROTOBUF_NONNULL message) {
+  return InternalUnpackToLite(GetAnyMessageName<T>(), type_url, value, message);
+}
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+PROTOBUF_EXPORT bool InternalUnpackTo(absl::string_view type_url,
+                                      const VALUE_TYPE& value,
+                                      Message* PROTOBUF_NONNULL message);
+
+template <typename T>
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool InternalIs(
+    absl::string_view type_url) {
+  return InternalIsLite(GetAnyMessageName<T>(), type_url);
+}
+
+#undef URL_TYPE
+#undef VALUE_TYPE
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+bool ParseAnyTypeUrl(absl::string_view type_url,
+                     std::string* PROTOBUF_NONNULL full_type_name);
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+bool ParseAnyTypeUrl(absl::string_view type_url,
+                     std::string* PROTOBUF_NULLABLE url_prefix,
+                     std::string* PROTOBUF_NONNULL full_type_name);
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+bool GetAnyFieldDescriptors(const Message& message,
+                            const FieldDescriptor * PROTOBUF_NULLABLE *
+                                PROTOBUF_NONNULL type_url_field,
+                            const FieldDescriptor * PROTOBUF_NULLABLE *
+                                PROTOBUF_NONNULL value_field);
+
+}  
+}  
+}  
+
+#include "google/protobuf/port_undef.inc"
+
+#endif

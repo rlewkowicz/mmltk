@@ -1,0 +1,38 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+SOURCES += [
+    'sharpyuv.c',
+    'sharpyuv_csp.c',
+    'sharpyuv_dsp.c',
+    'sharpyuv_gamma.c',
+]
+
+LOCAL_INCLUDES += [
+    '/media/libwebp',
+]
+
+include('/media/libwebp/libwebp-config.mozbuild')
+
+# Note the defines in this file for cpu instruction sets are mostly overridden
+# and enabled by what src/dsp/cpu.h does. So just removing the defines here may do
+# nothing.
+
+if CONFIG['INTEL_ARCHITECTURE']:
+    SOURCES += [
+        'sharpyuv_sse2.c',
+    ]
+    DEFINES['WEBP_HAVE_SSE2'] = 1;
+    for f in SOURCES:
+      if f.endswith('sse2.c'):
+        SOURCES[f].flags += CONFIG['SSE2_FLAGS']
+
+CFLAGS += ['-Wno-unreachable-code']
+
+# Add libFuzzer configuration directives
+
+FINAL_LIBRARY = 'xul'
+
+# We allow warnings for third-party code that can be updated from upstream.
+AllowCompilerWarnings()

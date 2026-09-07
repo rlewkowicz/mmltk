@@ -1,0 +1,191 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef _nsClipboard_h_
+#define _nsClipboard_h_
+
+#include "mozilla/Maybe.h"
+#include "mozilla/Span.h"
+#include "mozilla/widget/WebCustomFormatUtils.h"
+#include "nsBaseClipboard.h"
+#include "nsIClipboard.h"
+#include "nsIObserver.h"
+#include "nsCOMPtr.h"
+#include "GUniquePtr.h"
+#include <gtk/gtk.h>
+
+namespace mozilla {
+
+class ClipboardTargets {
+  friend class ClipboardData;
+  nsTArray<GdkAtom> mTargets;
+
+ public:
+  ClipboardTargets() = default;
+  ClipboardTargets(GUniquePtr<GdkAtom> aTargets, int aTargetsNum);
+  explicit ClipboardTargets(nsTArray<GdkAtom> aTargets)
+      : mTargets(std::move(aTargets)) {}
+  explicit ClipboardTargets(GList* aTargets);
+
+  bool Contains(GdkAtom aTarget) const;
+  void Set(ClipboardTargets);
+  ClipboardTargets Clone() const;
+  void Clear() { mTargets.Clear(); };
+
+  mozilla::Span<GdkAtom> AsSpan() { return mTargets; }
+  explicit operator bool() const { return !mTargets.IsEmpty(); }
+};
+
+class ClipboardData {
+  GUniquePtr<char> mData;
+  uint32_t mLength = 0;
+
+ public:
+  ClipboardData() = default;
+
+  void SetData(Span<const uint8_t>);
+  void SetText(Span<const char>);
+  void SetTargets(GUniquePtr<GdkAtom> aTarget, int aTargetsNum);
+
+  ClipboardTargets ExtractTargets();
+  GUniquePtr<char> ExtractText() {
+    mLength = 0;
+    return std::move(mData);
+  }
+
+  Span<char> AsSpan() const { return {mData.get(), mLength}; }
+  explicit operator bool() const { return bool(mData); }
+};
+
+enum class ClipboardDataType { Data, Text, Targets };
+
+class RetrievalContext {
+ public:
+  NS_INLINE_DECL_REFCOUNTING(RetrievalContext)
+
+  virtual ClipboardData GetClipboardData(const char* aMimeType,
+                                         int32_t aWhichClipboard) = 0;
+  virtual GUniquePtr<char> GetClipboardText(int32_t aWhichClipboard) = 0;
+
+  virtual ClipboardTargets GetTargets(int32_t aWhichClipboard) = 0;
+
+  virtual void ClearCachedTargets(int32_t aWhichClipboard) {}
+
+  RetrievalContext() = default;
+
+ protected:
+  virtual ~RetrievalContext() = default;
+};
+
+class nsClipboard final : public nsBaseClipboard, public nsIObserver {
+ public:
+  nsClipboard();
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_NSIOBSERVER
+
+  nsresult Init(void);
+
+  void SelectionGetEvent(GtkClipboard* aGtkClipboard,
+                         GtkSelectionData* aSelectionData);
+  void SelectionClearEvent(GtkClipboard* aGtkClipboard);
+
+  void OwnerChangedEvent(GtkClipboard* aGtkClipboard,
+                         GdkEventOwnerChange* aEvent);
+
+  Result<int32_t, nsresult> GetNativeClipboardSequenceNumber(
+      ClipboardType aWhichClipboard) override;
+
+ protected:
+  NS_IMETHOD SetNativeClipboardData(nsITransferable* aTransferable,
+                                    ClipboardType aWhichClipboard) override;
+  Result<nsCOMPtr<nsISupports>, nsresult> GetNativeClipboardData(
+      const nsACString& aFlavor, ClipboardType aWhichClipboard,
+      uint64_t aThreshold = 0) override;
+  void AsyncGetNativeClipboardData(const nsACString& aFlavor,
+                                   ClipboardType aWhichClipboard,
+                                   GetNativeDataCallback&& aCallback) override;
+  nsresult EmptyNativeClipboardData(ClipboardType aWhichClipboard) override;
+  Result<bool, nsresult> HasNativeClipboardDataMatchingFlavors(
+      const nsTArray<nsCString>& aFlavorList,
+      ClipboardType aWhichClipboard) override;
+  void AsyncHasNativeClipboardDataMatchingFlavors(
+      const nsTArray<nsCString>& aFlavorList, ClipboardType aWhichClipboard,
+      HasMatchingFlavorsCallback&& aCallback) override;
+
+ public:
+  using HasMatchingFlavorsCallbackWithMap = mozilla::MoveOnlyFunction<void(
+      mozilla::Result<nsTArray<nsCString>, nsresult>,
+      mozilla::Maybe<mozilla::widget::WebCustomFormatMap>)>;
+
+ private:
+  virtual ~nsClipboard();
+
+  void AsyncHasNativeClipboardDataMatchingFlavorsWithMap(
+      const nsTArray<nsCString>& aFlavorList, ClipboardType aWhichClipboard,
+      HasMatchingFlavorsCallbackWithMap&& aCallback);
+
+  nsITransferable* GetTransferable(int32_t aWhichClipboard);
+
+  void ClearTransferable(int32_t aWhichClipboard);
+  void ClearCachedTargets(int32_t aWhichClipboard);
+
+  bool HasSuitableData(int32_t aWhichClipboard, const nsACString& aFlavor);
+
+  mozilla::widget::WebCustomFormatMap GetWebCustomFormatMapFromClipboard(
+      int32_t aWhichClipboard);
+
+  nsCOMPtr<nsITransferable> mSelectionTransferable;
+  nsCOMPtr<nsITransferable> mGlobalTransferable;
+  RefPtr<RetrievalContext> mContext;
+
+  mozilla::widget::WebCustomFormatMap mSelectionWebCustomFormatMap;
+  mozilla::widget::WebCustomFormatMap mGlobalWebCustomFormatMap;
+  mozilla::widget::WebCustomFormatMap& WebCustomFormatMapFor(
+      int32_t aWhichClipboard) {
+    return aWhichClipboard == kSelectionClipboard ? mSelectionWebCustomFormatMap
+                                                  : mGlobalWebCustomFormatMap;
+  }
+
+  void IncrementSequenceNumber(int32_t aWhichClipboard) {
+    if (aWhichClipboard == kSelectionClipboard) {
+      mSelectionSequenceNumber++;
+    } else {
+      mGlobalSequenceNumber++;
+    }
+  }
+  int32_t GetSequenceNumber(int32_t aWhichClipboard) {
+    return (aWhichClipboard == kSelectionClipboard) ? mSelectionSequenceNumber
+                                                    : mGlobalSequenceNumber;
+  }
+
+  int32_t mSelectionSequenceNumber = 0;
+  int32_t mGlobalSequenceNumber = 0;
+
+  void MarkNextOwnerClipboardChange(int32_t aWhichClipboard, bool aOurChange) {
+    if (aWhichClipboard == kSelectionClipboard) {
+      mWeSetSelectionData = aOurChange;
+    } else {
+      mWeSetGlobalData = aOurChange;
+    }
+  }
+  bool IsOurOwnerClipboardChange(int32_t aWhichClipboard) {
+    return (aWhichClipboard == kSelectionClipboard) ? mWeSetSelectionData
+                                                    : mWeSetGlobalData;
+  }
+
+  bool mWeSetSelectionData = false;
+  bool mWeSetGlobalData = false;
+};
+
+extern const int kClipboardTimeout;
+extern const int kClipboardFastIterationNum;
+
+GdkAtom GetSelectionAtom(int32_t aWhichClipboard);
+Maybe<nsIClipboard::ClipboardType> GetGeckoClipboardType(
+    GtkClipboard* aGtkClipboard);
+
+};  
+
+#endif /* _nsClipboard_h_ */

@@ -1,0 +1,636 @@
+// Copyright 2017 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#if !defined(ABSL_SYNCHRONIZATION_MUTEX_H_)
+#define ABSL_SYNCHRONIZATION_MUTEX_H_
+
+#include <atomic>
+#include <cstdint>
+#include <cstring>
+#include <type_traits>
+
+#include "absl/base/attributes.h"
+#include "absl/base/config.h"
+#include "absl/base/const_init.h"
+#include "absl/base/internal/thread_identity.h"
+#include "absl/base/internal/tsan_mutex_interface.h"
+#include "absl/base/macros.h"
+#include "absl/base/nullability.h"
+#include "absl/base/thread_annotations.h"
+#include "absl/meta/type_traits.h"
+#include "absl/synchronization/internal/kernel_timeout.h"
+#include "absl/synchronization/internal/per_thread_sem.h"
+#include "absl/time/time.h"
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+
+class Condition;
+struct SynchWaitParams;
+
+namespace synchronization_internal {
+
+template <typename T, typename = void>
+struct HasConstMemberCallOperator : std::false_type {};
+
+template <typename T>
+struct HasConstMemberCallOperator<
+    T, std::void_t<decltype(static_cast<bool (T::*)() const>(&T::operator()))>>
+    : std::true_type {};
+
+}  
+
+
+class ABSL_LOCKABLE ABSL_ATTRIBUTE_WARN_UNUSED Mutex {
+ public:
+  Mutex();
+
+  explicit constexpr Mutex(absl::ConstInitType);
+
+  ~Mutex();
+
+  void lock() ABSL_EXCLUSIVE_LOCK_FUNCTION();
+
+  ABSL_DEPRECATE_AND_INLINE()
+  inline void Lock() ABSL_EXCLUSIVE_LOCK_FUNCTION() { lock(); }
+
+  void unlock() ABSL_UNLOCK_FUNCTION();
+
+  ABSL_DEPRECATE_AND_INLINE()
+  inline void Unlock() ABSL_UNLOCK_FUNCTION() { unlock(); }
+
+  [[nodiscard]] bool try_lock() ABSL_EXCLUSIVE_TRYLOCK_FUNCTION(true);
+
+  ABSL_DEPRECATE_AND_INLINE()
+  [[nodiscard]] bool TryLock() ABSL_EXCLUSIVE_TRYLOCK_FUNCTION(true) {
+    return try_lock();
+  }
+
+  void AssertHeld() const ABSL_ASSERT_EXCLUSIVE_LOCK();
+
+
+
+  void lock_shared() ABSL_SHARED_LOCK_FUNCTION();
+
+  ABSL_DEPRECATE_AND_INLINE()
+  void ReaderLock() ABSL_SHARED_LOCK_FUNCTION() { lock_shared(); }
+
+  void unlock_shared() ABSL_UNLOCK_FUNCTION();
+
+  ABSL_DEPRECATE_AND_INLINE()
+  void ReaderUnlock() ABSL_UNLOCK_FUNCTION() { unlock_shared(); }
+
+  [[nodiscard]] bool try_lock_shared() ABSL_SHARED_TRYLOCK_FUNCTION(true);
+
+  ABSL_DEPRECATE_AND_INLINE()
+  [[nodiscard]] bool ReaderTryLock() ABSL_SHARED_TRYLOCK_FUNCTION(true) {
+    return try_lock_shared();
+  }
+
+  void AssertReaderHeld() const ABSL_ASSERT_SHARED_LOCK();
+
+  ABSL_DEPRECATE_AND_INLINE()
+  void WriterLock() ABSL_EXCLUSIVE_LOCK_FUNCTION() { lock(); }
+
+  ABSL_DEPRECATE_AND_INLINE()
+  void WriterUnlock() ABSL_UNLOCK_FUNCTION() { unlock(); }
+
+  ABSL_DEPRECATE_AND_INLINE()
+  [[nodiscard]] bool WriterTryLock() ABSL_EXCLUSIVE_TRYLOCK_FUNCTION(true) {
+    return try_lock();
+  }
+
+
+
+  void Await(const Condition& cond) {
+    AwaitCommon(cond, synchronization_internal::KernelTimeout::Never());
+  }
+
+  void LockWhen(const Condition& cond) ABSL_EXCLUSIVE_LOCK_FUNCTION() {
+    LockWhenCommon(cond, synchronization_internal::KernelTimeout::Never(),
+                   true);
+  }
+
+  void ReaderLockWhen(const Condition& cond) ABSL_SHARED_LOCK_FUNCTION() {
+    LockWhenCommon(cond, synchronization_internal::KernelTimeout::Never(),
+                   false);
+  }
+
+  void WriterLockWhen(const Condition& cond) ABSL_EXCLUSIVE_LOCK_FUNCTION() {
+    this->LockWhen(cond);
+  }
+
+
+  bool AwaitWithTimeout(const Condition& cond, absl::Duration timeout) {
+    return AwaitCommon(cond, synchronization_internal::KernelTimeout{timeout});
+  }
+
+  bool AwaitWithDeadline(const Condition& cond, absl::Time deadline) {
+    return AwaitCommon(cond, synchronization_internal::KernelTimeout{deadline});
+  }
+
+  bool LockWhenWithTimeout(const Condition& cond, absl::Duration timeout)
+      ABSL_EXCLUSIVE_LOCK_FUNCTION() {
+    return LockWhenCommon(
+        cond, synchronization_internal::KernelTimeout{timeout}, true);
+  }
+  bool ReaderLockWhenWithTimeout(const Condition& cond, absl::Duration timeout)
+      ABSL_SHARED_LOCK_FUNCTION() {
+    return LockWhenCommon(
+        cond, synchronization_internal::KernelTimeout{timeout}, false);
+  }
+  bool WriterLockWhenWithTimeout(const Condition& cond, absl::Duration timeout)
+      ABSL_EXCLUSIVE_LOCK_FUNCTION() {
+    return this->LockWhenWithTimeout(cond, timeout);
+  }
+
+  bool LockWhenWithDeadline(const Condition& cond, absl::Time deadline)
+      ABSL_EXCLUSIVE_LOCK_FUNCTION() {
+    return LockWhenCommon(
+        cond, synchronization_internal::KernelTimeout{deadline}, true);
+  }
+  bool ReaderLockWhenWithDeadline(const Condition& cond, absl::Time deadline)
+      ABSL_SHARED_LOCK_FUNCTION() {
+    return LockWhenCommon(
+        cond, synchronization_internal::KernelTimeout{deadline}, false);
+  }
+  bool WriterLockWhenWithDeadline(const Condition& cond, absl::Time deadline)
+      ABSL_EXCLUSIVE_LOCK_FUNCTION() {
+    return this->LockWhenWithDeadline(cond, deadline);
+  }
+
+
+  void EnableInvariantDebugging(
+      void (*absl_nullable invariant)(void* absl_nullability_unknown),
+      void* absl_nullability_unknown arg);
+
+  void EnableDebugLog(const char* absl_nullable name);
+
+
+  void ForgetDeadlockInfo();
+
+  void AssertNotHeld() const;
+
+
+  typedef const struct MuHowS* MuHow;
+
+  static void InternalAttemptToUseMutexInFatalSignalHandler();
+
+ private:
+  std::atomic<intptr_t> mu_;  
+
+  static void IncrementSynchSem(Mutex* absl_nonnull mu,
+                                base_internal::PerThreadSynch* absl_nonnull w);
+  static bool DecrementSynchSem(Mutex* absl_nonnull mu,
+                                base_internal::PerThreadSynch* absl_nonnull w,
+                                synchronization_internal::KernelTimeout t);
+
+  void LockSlowLoop(SynchWaitParams* absl_nonnull waitp, int flags);
+  bool LockSlowWithDeadline(MuHow absl_nonnull how,
+                            const Condition* absl_nullable cond,
+                            synchronization_internal::KernelTimeout t,
+                            int flags);
+  void LockSlow(MuHow absl_nonnull how, const Condition* absl_nullable cond,
+                int flags) ABSL_ATTRIBUTE_COLD;
+  void UnlockSlow(SynchWaitParams* absl_nullable waitp) ABSL_ATTRIBUTE_COLD;
+  bool TryLockSlow();
+  bool ReaderTryLockSlow();
+  bool AwaitCommon(const Condition& cond,
+                   synchronization_internal::KernelTimeout t);
+  bool LockWhenCommon(const Condition& cond,
+                      synchronization_internal::KernelTimeout t, bool write);
+  void TryRemove(base_internal::PerThreadSynch* absl_nonnull s);
+  void Block(base_internal::PerThreadSynch* absl_nonnull s);
+  base_internal::PerThreadSynch* absl_nullable Wakeup(
+      base_internal::PerThreadSynch* absl_nonnull w);
+  void Dtor();
+
+  friend class CondVar;                
+  void Trans(MuHow absl_nonnull how);  
+  void Fer(base_internal::PerThreadSynch* absl_nonnull
+               w);  
+
+  explicit Mutex(const volatile Mutex* absl_nullable ) {}
+
+  Mutex(const Mutex&) = delete;
+  Mutex& operator=(const Mutex&) = delete;
+};
+
+
+class ABSL_SCOPED_LOCKABLE MutexLock {
+ public:
+
+  explicit MutexLock(Mutex& mu ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(this))
+      ABSL_EXCLUSIVE_LOCK_FUNCTION(mu)
+      : mu_(mu) {
+    this->mu_.lock();
+  }
+
+  ABSL_REFACTOR_INLINE
+  explicit MutexLock(Mutex* absl_nonnull mu) ABSL_EXCLUSIVE_LOCK_FUNCTION(mu)
+      : MutexLock(*mu) {}
+
+  explicit MutexLock(Mutex& mu ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(this),
+                     const Condition& cond) ABSL_EXCLUSIVE_LOCK_FUNCTION(mu)
+      : mu_(mu) {
+    this->mu_.LockWhen(cond);
+  }
+
+  [[deprecated("Use the constructor that takes a reference instead")]]
+  ABSL_REFACTOR_INLINE
+  explicit MutexLock(Mutex* absl_nonnull mu, const Condition& cond)
+      ABSL_EXCLUSIVE_LOCK_FUNCTION(mu)
+      : MutexLock(*mu, cond) {}
+
+  MutexLock(const MutexLock&) = delete;  // NOLINT(runtime/mutex)
+  MutexLock(MutexLock&&) = delete;       // NOLINT(runtime/mutex)
+  MutexLock& operator=(const MutexLock&) = delete;
+  MutexLock& operator=(MutexLock&&) = delete;
+
+  ~MutexLock() ABSL_UNLOCK_FUNCTION() { this->mu_.unlock(); }
+
+ private:
+  Mutex& mu_;
+};
+
+class ABSL_SCOPED_LOCKABLE ReaderMutexLock {
+ public:
+  explicit ReaderMutexLock(Mutex& mu ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(this))
+      ABSL_SHARED_LOCK_FUNCTION(mu)
+      : mu_(mu) {
+    mu.lock_shared();
+  }
+
+  ABSL_REFACTOR_INLINE
+  explicit ReaderMutexLock(Mutex* absl_nonnull mu) ABSL_SHARED_LOCK_FUNCTION(mu)
+      : ReaderMutexLock(*mu) {}
+
+  explicit ReaderMutexLock(Mutex& mu ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(this),
+                           const Condition& cond) ABSL_SHARED_LOCK_FUNCTION(mu)
+      : mu_(mu) {
+    mu.ReaderLockWhen(cond);
+  }
+
+  [[deprecated("Use the constructor that takes a reference instead")]]
+  ABSL_REFACTOR_INLINE
+  explicit ReaderMutexLock(Mutex* absl_nonnull mu, const Condition& cond)
+      ABSL_SHARED_LOCK_FUNCTION(mu)
+      : ReaderMutexLock(*mu, cond) {}
+
+  ReaderMutexLock(const ReaderMutexLock&) = delete;
+  ReaderMutexLock(ReaderMutexLock&&) = delete;
+  ReaderMutexLock& operator=(const ReaderMutexLock&) = delete;
+  ReaderMutexLock& operator=(ReaderMutexLock&&) = delete;
+
+  ~ReaderMutexLock() ABSL_UNLOCK_FUNCTION() { this->mu_.unlock_shared(); }
+
+ private:
+  Mutex& mu_;
+};
+
+class ABSL_SCOPED_LOCKABLE WriterMutexLock {
+ public:
+  explicit WriterMutexLock(Mutex& mu ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(this))
+      ABSL_EXCLUSIVE_LOCK_FUNCTION(mu)
+      : mu_(mu) {
+    mu.lock();
+  }
+
+  ABSL_REFACTOR_INLINE
+  explicit WriterMutexLock(Mutex* absl_nonnull mu)
+      ABSL_EXCLUSIVE_LOCK_FUNCTION(mu)
+      : WriterMutexLock(*mu) {}
+
+  explicit WriterMutexLock(Mutex& mu ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(this),
+                           const Condition& cond)
+      ABSL_EXCLUSIVE_LOCK_FUNCTION(mu)
+      : mu_(mu) {
+    mu.WriterLockWhen(cond);
+  }
+
+  [[deprecated("Use the constructor that takes a reference instead")]]
+  ABSL_REFACTOR_INLINE
+  explicit WriterMutexLock(Mutex* absl_nonnull mu, const Condition& cond)
+      ABSL_EXCLUSIVE_LOCK_FUNCTION(mu)
+      : WriterMutexLock(*mu, cond) {}
+
+  WriterMutexLock(const WriterMutexLock&) = delete;
+  WriterMutexLock(WriterMutexLock&&) = delete;
+  WriterMutexLock& operator=(const WriterMutexLock&) = delete;
+  WriterMutexLock& operator=(WriterMutexLock&&) = delete;
+
+  ~WriterMutexLock() ABSL_UNLOCK_FUNCTION() { this->mu_.unlock(); }
+
+ private:
+  Mutex& mu_;
+};
+
+class Condition {
+ public:
+  Condition(bool (*absl_nonnull func)(void* absl_nullability_unknown),
+            void* absl_nullability_unknown arg);
+
+  template <typename T>
+  Condition(bool (*absl_nonnull func)(T* absl_nullability_unknown),
+            T* absl_nullability_unknown arg);
+
+  template <typename T, typename = void>
+  Condition(
+      bool (*absl_nonnull func)(T* absl_nullability_unknown),
+      typename absl::type_identity<T>::type* absl_nullability_unknown
+          arg);
+
+  template <typename T>
+  Condition(
+      T* absl_nonnull object,
+      bool (absl::type_identity<T>::type::* absl_nonnull method)());
+
+  template <typename T>
+  Condition(
+      const T* absl_nonnull object,
+      bool (absl::type_identity<T>::type::* absl_nonnull method)()
+          const);
+
+  explicit Condition(const bool* absl_nonnull cond);
+
+
+
+  template <typename T,
+            std::enable_if_t<
+                synchronization_internal::HasConstMemberCallOperator<T>::value,
+                int> = 0>
+  explicit Condition(const T* absl_nonnull obj)
+      : Condition(obj, static_cast<bool (T::*)() const>(&T::operator())) {}
+
+  template <
+      typename T,
+      typename = std::enable_if_t<
+          !synchronization_internal::HasConstMemberCallOperator<T>::value &&
+          sizeof(static_cast<bool (*)(const T&)>(&T::operator())) != 0>>
+  explicit Condition(const T* absl_nonnull obj)
+      : Condition(&CallByRef<T>, obj) {}
+
+  ABSL_CONST_INIT static const Condition kTrue;
+
+  bool Eval() const;
+
+  static bool GuaranteedEqual(const Condition* absl_nullable a,
+                              const Condition* absl_nullable b);
+
+ private:
+
+#if !defined(_MSC_VER)
+  using MethodPtr = bool (Condition::*)();
+  char callback_[sizeof(MethodPtr)] = {0};
+#else
+  char callback_[24] = {0};
+#endif
+
+  bool (*absl_nullable eval_)(const Condition* absl_nonnull) = nullptr;
+
+  void* absl_nullable arg_ = nullptr;
+
+  static bool CallVoidPtrFunction(const Condition* absl_nonnull c);
+  template <typename T>
+  static bool CastAndCallFunction(const Condition* absl_nonnull c);
+  template <typename T, typename ConditionMethodPtr>
+  static bool CastAndCallMethod(const Condition* absl_nonnull c);
+
+  template <typename T>
+  static bool CallByRef(const T* absl_nonnull self) {
+    return (*self)();
+  }
+
+  template <typename T>
+  inline void StoreCallback(T callback) {
+    static_assert(
+        sizeof(callback) <= sizeof(callback_),
+        "An overlarge pointer was passed as a callback to Condition.");
+    std::memcpy(callback_, &callback, sizeof(callback));
+  }
+
+  template <typename T>
+  inline void ReadCallback(T* absl_nonnull callback) const {
+    std::memcpy(callback, callback_, sizeof(*callback));
+  }
+
+  static bool AlwaysTrue(const Condition* absl_nullable) { return true; }
+
+  constexpr Condition() : eval_(AlwaysTrue), arg_(nullptr) {}
+};
+
+class CondVar {
+ public:
+  CondVar();
+
+  void Wait(Mutex* absl_nonnull mu) {
+    WaitCommon(mu, synchronization_internal::KernelTimeout::Never());
+  }
+
+  bool WaitWithTimeout(Mutex* absl_nonnull mu, absl::Duration timeout) {
+    return WaitCommon(mu, synchronization_internal::KernelTimeout(timeout));
+  }
+
+  bool WaitWithDeadline(Mutex* absl_nonnull mu, absl::Time deadline) {
+    return WaitCommon(mu, synchronization_internal::KernelTimeout(deadline));
+  }
+
+  void Signal();
+
+  void SignalAll();
+
+  void EnableDebugLog(const char* absl_nullable name);
+
+ private:
+  bool WaitCommon(Mutex* absl_nonnull mutex,
+                  synchronization_internal::KernelTimeout t);
+  void Remove(base_internal::PerThreadSynch* absl_nonnull s);
+  std::atomic<intptr_t> cv_;  
+  CondVar(const CondVar&) = delete;
+  CondVar& operator=(const CondVar&) = delete;
+};
+
+
+class ABSL_SCOPED_LOCKABLE MutexLockMaybe {
+ public:
+  explicit MutexLockMaybe(Mutex* absl_nullable mu)
+      ABSL_EXCLUSIVE_LOCK_FUNCTION(mu)
+      : mu_(mu) {
+    if (this->mu_ != nullptr) {
+      this->mu_->lock();
+    }
+  }
+
+  explicit MutexLockMaybe(Mutex* absl_nullable mu, const Condition& cond)
+      ABSL_EXCLUSIVE_LOCK_FUNCTION(mu)
+      : mu_(mu) {
+    if (this->mu_ != nullptr) {
+      this->mu_->LockWhen(cond);
+    }
+  }
+
+  ~MutexLockMaybe() ABSL_UNLOCK_FUNCTION() {
+    if (this->mu_ != nullptr) {
+      this->mu_->unlock();
+    }
+  }
+
+ private:
+  Mutex* absl_nullable const mu_;
+  MutexLockMaybe(const MutexLockMaybe&) = delete;
+  MutexLockMaybe(MutexLockMaybe&&) = delete;
+  MutexLockMaybe& operator=(const MutexLockMaybe&) = delete;
+  MutexLockMaybe& operator=(MutexLockMaybe&&) = delete;
+};
+
+class ABSL_SCOPED_LOCKABLE ReleasableMutexLock {
+ public:
+  explicit ReleasableMutexLock(Mutex& mu ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(
+      this)) ABSL_EXCLUSIVE_LOCK_FUNCTION(mu)
+      : mu_(&mu) {
+    this->mu_->lock();
+  }
+
+  ABSL_REFACTOR_INLINE
+  explicit ReleasableMutexLock(Mutex* absl_nonnull mu)
+      ABSL_EXCLUSIVE_LOCK_FUNCTION(mu)
+      : ReleasableMutexLock(*mu) {}
+
+  explicit ReleasableMutexLock(
+      Mutex& mu ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(this),
+      const Condition& cond) ABSL_EXCLUSIVE_LOCK_FUNCTION(mu)
+      : mu_(&mu) {
+    this->mu_->LockWhen(cond);
+  }
+
+  [[deprecated("Use the constructor that takes a reference instead")]]
+  ABSL_REFACTOR_INLINE
+  explicit ReleasableMutexLock(Mutex* absl_nonnull mu, const Condition& cond)
+      ABSL_EXCLUSIVE_LOCK_FUNCTION(mu)
+      : ReleasableMutexLock(*mu, cond) {}
+
+  ~ReleasableMutexLock() ABSL_UNLOCK_FUNCTION() {
+    if (this->mu_ != nullptr) {
+      this->mu_->unlock();
+    }
+  }
+
+  void Release() ABSL_UNLOCK_FUNCTION();
+
+ private:
+  Mutex* absl_nullable mu_;
+  ReleasableMutexLock(const ReleasableMutexLock&) = delete;
+  ReleasableMutexLock(ReleasableMutexLock&&) = delete;
+  ReleasableMutexLock& operator=(const ReleasableMutexLock&) = delete;
+  ReleasableMutexLock& operator=(ReleasableMutexLock&&) = delete;
+};
+
+inline Mutex::Mutex() : mu_(0) {
+  ABSL_TSAN_MUTEX_CREATE(this, __tsan_mutex_not_static);
+}
+
+inline constexpr Mutex::Mutex(absl::ConstInitType) : mu_(0) {}
+
+#if !0 && !defined(ABSL_BUILD_DLL)
+ABSL_ATTRIBUTE_ALWAYS_INLINE
+inline Mutex::~Mutex() { Dtor(); }
+#endif
+
+#if defined(NDEBUG) && !defined(ABSL_HAVE_THREAD_SANITIZER) && \
+    !defined(ABSL_BUILD_DLL)
+ABSL_ATTRIBUTE_ALWAYS_INLINE
+inline void Mutex::Dtor() {}
+#endif
+
+inline CondVar::CondVar() : cv_(0) {}
+
+template <typename T, typename ConditionMethodPtr>
+bool Condition::CastAndCallMethod(const Condition* absl_nonnull c) {
+  T* object = static_cast<T*>(c->arg_);
+  ConditionMethodPtr condition_method_pointer;
+  c->ReadCallback(&condition_method_pointer);
+  return (object->*condition_method_pointer)();
+}
+
+template <typename T>
+bool Condition::CastAndCallFunction(const Condition* absl_nonnull c) {
+  bool (*function)(T*);
+  c->ReadCallback(&function);
+  T* argument = static_cast<T*>(c->arg_);
+  return (*function)(argument);
+}
+
+template <typename T>
+inline Condition::Condition(
+    bool (*absl_nonnull func)(T* absl_nullability_unknown),
+    T* absl_nullability_unknown arg)
+    : eval_(&CastAndCallFunction<T>),
+      arg_(const_cast<void*>(static_cast<const void*>(arg))) {
+  static_assert(sizeof(&func) <= sizeof(callback_),
+                "An overlarge function pointer was passed to Condition.");
+  StoreCallback(func);
+}
+
+template <typename T, typename>
+inline Condition::Condition(
+    bool (*absl_nonnull func)(T* absl_nullability_unknown),
+    typename absl::type_identity<T>::type* absl_nullability_unknown
+        arg)
+    : Condition(func, arg) {}
+
+template <typename T>
+inline Condition::Condition(
+    T* absl_nonnull object,
+    bool (absl::type_identity<T>::type::* absl_nonnull method)())
+    : eval_(&CastAndCallMethod<T, decltype(method)>), arg_(object) {
+  static_assert(sizeof(&method) <= sizeof(callback_),
+                "An overlarge method pointer was passed to Condition.");
+  StoreCallback(method);
+}
+
+template <typename T>
+inline Condition::Condition(
+    const T* absl_nonnull object,
+    bool (absl::type_identity<T>::type::* absl_nonnull method)()
+        const)
+    : eval_(&CastAndCallMethod<const T, decltype(method)>),
+      arg_(reinterpret_cast<void*>(const_cast<T*>(object))) {
+  StoreCallback(method);
+}
+
+void RegisterMutexProfiler(void (*absl_nonnull fn)(int64_t wait_cycles));
+
+void RegisterMutexTracer(void (*absl_nonnull fn)(const char* absl_nonnull msg,
+                                                 const void* absl_nonnull obj,
+                                                 int64_t wait_cycles));
+
+void RegisterCondVarTracer(void (*absl_nonnull fn)(
+    const char* absl_nonnull msg, const void* absl_nonnull cv));
+
+void EnableMutexInvariantDebugging(bool enabled);
+
+
+enum class OnDeadlockCycle {
+  kIgnore,  
+  kReport,  
+  kAbort,   
+};
+
+void SetMutexDeadlockDetectionMode(OnDeadlockCycle mode);
+
+ABSL_NAMESPACE_END
+}  
+
+extern "C" {
+void ABSL_INTERNAL_C_SYMBOL(AbslInternalMutexYield)();
+}  
+
+#endif

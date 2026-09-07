@@ -1,0 +1,223 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MP3_FRAME_PARSER_H_
+#define MP3_FRAME_PARSER_H_
+
+#include <vector>
+
+#include "BufferReader.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/Result.h"
+
+namespace mozilla {
+
+class ID3Parser {
+ public:
+  class ID3Header {
+   public:
+    static const int SIZE = 10;
+    static const int ID3v1_SIZE = 128;
+
+    ID3Header();
+
+    void Reset();
+
+    uint8_t MajorVersion() const;
+    uint8_t MinorVersion() const;
+
+    uint8_t Flags() const;
+
+    uint32_t Size() const;
+
+    bool HasSizeBeenSet() const;
+
+    uint8_t FooterSize() const;
+
+    uint32_t TotalTagSize() const;
+
+    bool IsValid(int aPos) const;
+
+    bool IsValid() const;
+
+    bool ParseNext(uint8_t c);
+
+   private:
+    bool Update(uint8_t c);
+
+    uint8_t mRaw[SIZE] = {};
+
+    Maybe<uint32_t> mSize;
+
+    int mPos = 0;
+  };
+
+  static bool IsBufferStartingWithID3Tag(BufferReader* aReader);
+  static bool IsBufferStartingWithID3v1Tag(BufferReader* aReader);
+
+  const ID3Header& Header() const;
+
+  uint32_t TotalHeadersSize() const;
+
+  uint32_t Parse(BufferReader* aReader);
+
+  void Reset();
+
+ private:
+  uint32_t ParseInternal(BufferReader* aReader);
+
+  ID3Header mHeader;
+  uint32_t mFormerID3Size = 0;
+};
+
+//   T          - Copyright (0->disabled, 1->enabled)
+class FrameParser {
+ public:
+  class FrameHeader {
+   public:
+    static const int SIZE = 4;
+
+    FrameHeader();
+
+    uint8_t Sync1() const;
+    uint8_t Sync2() const;
+    uint8_t RawVersion() const;
+    uint8_t RawLayer() const;
+    uint8_t RawProtection() const;
+    uint8_t RawBitrate() const;
+    uint8_t RawSampleRate() const;
+    uint8_t Padding() const;
+    uint8_t Private() const;
+    uint8_t RawChannelMode() const;
+
+    uint32_t SampleRate() const;
+
+    uint32_t Channels() const;
+
+    uint32_t SamplesPerFrame() const;
+
+    uint32_t SlotSize() const;
+
+    uint32_t Bitrate() const;
+
+    uint32_t Layer() const;
+
+    bool IsValid(const int aPos) const;
+
+    bool IsValid() const;
+
+    void Reset();
+
+    bool ParseNext(const uint8_t c);
+
+   private:
+    bool Update(const uint8_t c);
+
+    uint8_t mRaw[SIZE] = {};
+
+    int mPos = 0;
+  };
+
+  class VBRHeader {
+   public:
+    enum VBRHeaderType { NONE = 0, XING, VBRI };
+
+    VBRHeader();
+
+    VBRHeaderType Type() const;
+
+    const Maybe<uint32_t>& NumAudioFrames() const;
+
+    const Maybe<uint32_t>& NumBytes() const;
+
+    const Maybe<uint32_t>& Scale() const;
+
+    bool IsTOCPresent() const;
+
+    bool IsValid() const;
+
+    bool IsComplete() const;
+
+    int64_t Offset(media::TimeUnit aTime, media::TimeUnit aDuration) const;
+
+    bool Parse(BufferReader* aReader, size_t aFrameSize);
+
+    uint32_t EncoderDelay() const { return mEncoderDelay; }
+    uint32_t EncoderPadding() const { return mEncoderPadding; }
+
+   private:
+    Result<bool, nsresult> ParseXing(BufferReader* aReader, size_t aFrameSize);
+
+    Result<bool, nsresult> ParseVBRI(BufferReader* aReader);
+
+    Maybe<uint32_t> mNumAudioFrames;
+
+    Maybe<uint32_t> mNumBytes;
+
+    Maybe<uint32_t> mScale;
+
+    std::vector<int64_t> mTOC;
+
+    VBRHeaderType mType;
+
+    uint16_t mVBRISeekOffsetsFramesPerEntry = 0;
+
+    uint16_t mEncoderDelay = 0;
+    uint16_t mEncoderPadding = 0;
+  };
+
+  class Frame {
+   public:
+    uint32_t Length() const;
+
+    const FrameHeader& Header() const;
+
+    void Reset();
+
+    bool ParseNext(uint8_t c);
+
+   private:
+    FrameHeader mHeader;
+  };
+
+  FrameParser();
+
+  const Frame& CurrentFrame() const;
+
+  const Frame& PrevFrame() const;
+
+  const Frame& FirstFrame() const;
+
+  const ID3Parser::ID3Header& ID3Header() const;
+
+  bool ID3v1MetadataFound() const;
+
+  uint32_t TotalID3HeaderSize() const;
+
+  const VBRHeader& VBRInfo() const;
+
+  void Reset();
+
+  void ResetFrameData();
+
+  void EndFrameSession();
+
+  Result<bool, nsresult> Parse(BufferReader* aReader, uint32_t* aBytesToSkip);
+
+  bool ParseVBRHeader(BufferReader* aReader);
+
+ private:
+  ID3Parser mID3Parser;
+
+  VBRHeader mVBRHeader;
+
+  Frame mFirstFrame;
+  Frame mFrame;
+  Frame mPrevFrame;
+  bool mID3v1MetadataFound = false;
+};
+
+}  
+
+#endif

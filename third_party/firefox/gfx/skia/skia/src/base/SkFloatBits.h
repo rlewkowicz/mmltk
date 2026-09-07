@@ -1,0 +1,54 @@
+/*
+ * Copyright 2008 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkFloatBits_DEFINED)
+#define SkFloatBits_DEFINED
+
+#include "include/private/base/SkMath.h"
+
+#include <cstdint>
+#include <cstring>
+
+static inline int32_t SkSignBitTo2sCompliment(int32_t x) {
+    if (x < 0) {
+        x &= 0x7FFFFFFF;
+        x = -x;
+    }
+    return x;
+}
+
+static inline int32_t Sk2sComplimentToSignBit(int32_t x) {
+    int sign = x >> 31;
+    x = (x ^ sign) - sign;
+    x |= SkLeftShift(sign, 31);
+    return x;
+}
+
+static inline uint32_t SkFloat2Bits(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(uint32_t));
+    return bits;
+}
+
+static inline float SkBits2Float(uint32_t bits) {
+    float value;
+    memcpy(&value, &bits, sizeof(float));
+    return value;
+}
+
+static inline int32_t SkFloatAs2sCompliment(float x) {
+    return SkSignBitTo2sCompliment((int32_t)SkFloat2Bits(x));
+}
+
+static inline float Sk2sComplimentAsFloat(int32_t x) {
+    return SkBits2Float((uint32_t)Sk2sComplimentToSignBit(x));
+}
+
+
+#define SkScalarAs2sCompliment(x)    SkFloatAs2sCompliment(x)
+
+#endif

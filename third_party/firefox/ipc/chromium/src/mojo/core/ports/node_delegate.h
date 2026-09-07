@@ -1,0 +1,33 @@
+// Copyright 2016 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(MOJO_CORE_PORTS_NODE_DELEGATE_H_)
+#define MOJO_CORE_PORTS_NODE_DELEGATE_H_
+
+#include "mojo/core/ports/event.h"
+#include "mojo/core/ports/name.h"
+#include "mojo/core/ports/port_ref.h"
+
+namespace mojo {
+namespace core {
+namespace ports {
+
+class NodeDelegate {
+ public:
+  virtual ~NodeDelegate() = default;
+
+  virtual void ForwardEvent(const NodeName& node, ScopedEvent event) = 0;
+
+  virtual void BroadcastEvent(ScopedEvent event) = 0;
+
+  virtual void PortStatusChanged(const PortRef& port_ref) = 0;
+
+  virtual void ObserveRemoteNode(const NodeName& node) = 0;
+};
+
+}  
+}  
+}  
+
+#endif

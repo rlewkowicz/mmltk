@@ -1,0 +1,274 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_EncoderTemplate_h
+#define mozilla_dom_EncoderTemplate_h
+
+#include <queue>
+
+#include "EncoderAgent.h"
+#include "MediaData.h"
+#include "SimpleMap.h"
+#include "WebCodecsUtils.h"
+#include "mozilla/DOMEventTargetHelper.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/Result.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/dom/AudioEncoderBinding.h"
+#include "mozilla/dom/VideoEncoderBinding.h"
+#include "mozilla/dom/WorkerRef.h"
+#include "mozilla/media/MediaUtils.h"
+#include "nsStringFwd.h"
+
+namespace mozilla::dom {
+
+class WebCodecsErrorCallback;
+class Promise;
+enum class CodecState : uint8_t;
+
+using Id = size_t;
+
+template <typename EncoderType>
+class EncoderTemplate : public DOMEventTargetHelper {
+  using Self = EncoderTemplate<EncoderType>;
+  using ConfigType = typename EncoderType::ConfigType;
+  using ConfigTypeInternal = typename EncoderType::ConfigTypeInternal;
+  using OutputConfigType = typename EncoderType::OutputConfigType;
+  using InputType = typename EncoderType::InputType;
+  using InputTypeInternal = typename EncoderType::InputTypeInternal;
+  using OutputType = typename EncoderType::OutputType;
+  using OutputCallbackType = typename EncoderType::OutputCallbackType;
+
+ protected:
+  class ConfigureMessage;
+  class EncodeMessage;
+  class FlushMessage;
+
+  class ControlMessage {
+   public:
+    NS_INLINE_DECL_THREADSAFE_REFCOUNTING(ControlMessage)
+    explicit ControlMessage(Id aConfigureId);
+    virtual void Cancel() = 0;
+    virtual bool IsProcessing() = 0;
+
+    virtual nsCString ToString() const = 0;
+    virtual RefPtr<ConfigureMessage> AsConfigureMessage() { return nullptr; }
+    virtual RefPtr<EncodeMessage> AsEncodeMessage() { return nullptr; }
+    virtual RefPtr<FlushMessage> AsFlushMessage() { return nullptr; }
+
+    const WebCodecsId mConfigureId;
+    const WebCodecsId mMessageId;
+
+   protected:
+    virtual ~ControlMessage() = default;
+  };
+
+  class ConfigureMessage final
+      : public ControlMessage,
+        public MessageRequestHolder<EncoderAgent::ConfigurePromise> {
+   public:
+    ConfigureMessage(Id aConfigureId,
+                     const RefPtr<ConfigTypeInternal>& aConfig);
+    virtual void Cancel() override { Disconnect(); }
+    virtual bool IsProcessing() override { return Exists(); };
+    virtual RefPtr<ConfigureMessage> AsConfigureMessage() override {
+      return this;
+    }
+    RefPtr<ConfigTypeInternal> Config() { return mConfig; }
+    nsCString ToString() const override {
+      nsCString rv;
+      rv.AppendPrintf("ConfigureMessage(#%zu): %s", this->mMessageId,
+                      mConfig ? mConfig->ToString().get() : "null cfg");
+      return rv;
+    }
+
+   private:
+    const RefPtr<ConfigTypeInternal> mConfig;
+  };
+
+  class EncodeMessage final
+      : public ControlMessage,
+        public MessageRequestHolder<EncoderAgent::EncodePromise> {
+   public:
+    EncodeMessage(WebCodecsId aConfigureId,
+                  already_AddRefed<InputTypeInternal> aData,
+                  Maybe<VideoEncoderEncodeOptions>&& aOptions = Nothing());
+    nsCString ToString() const override {
+      nsCString rv;
+      rv.AppendPrintf(
+          "EncodeMessage(#%zu, #%zu): %zu frames (%zu kfs, %zu held)",
+          this->mConfigureId, this->mMessageId, mFrames, mKeyFrames,
+          mData.Length());
+      return rv;
+    }
+    bool IsValid() const { return !mHasEmptyData && !mData.IsEmpty(); }
+    size_t BatchSize() const { return mData.Length(); }
+    void PushData(already_AddRefed<InputTypeInternal> aData,
+                  Maybe<VideoEncoderEncodeOptions>&& aOptions = Nothing()) {
+      mFrames += 1;
+      RefPtr<InputTypeInternal> data = aData;
+      if (!data) {
+        mHasEmptyData = true;
+      }
+      MOZ_ASSERT_IF(aOptions.isSome() && aOptions->mKeyFrame, data->mKeyframe);
+      mKeyFrames += data->mKeyframe ? 1 : 0;
+      mData.AppendElement(data.forget());
+    }
+    nsTArray<RefPtr<MediaData>>&& TakeData() { return std::move(mData); }
+    virtual void Cancel() override { Disconnect(); }
+    virtual bool IsProcessing() override { return Exists(); };
+    virtual RefPtr<EncodeMessage> AsEncodeMessage() override { return this; }
+
+   private:
+    nsTArray<RefPtr<MediaData>> mData;
+    size_t mFrames = 0;
+    size_t mKeyFrames = 0;
+    bool mHasEmptyData = false;
+  };
+
+  class FlushMessage final
+      : public ControlMessage,
+        public MessageRequestHolder<EncoderAgent::EncodePromise> {
+   public:
+    explicit FlushMessage(WebCodecsId aConfigureId);
+    virtual void Cancel() override { Disconnect(); }
+    virtual bool IsProcessing() override { return Exists(); };
+    virtual RefPtr<FlushMessage> AsFlushMessage() override { return this; }
+
+    nsCString ToString() const override {
+      nsCString rv;
+      rv.AppendPrintf("FlushMessage(#%zu, #%zu)", this->mConfigureId,
+                      this->mMessageId);
+      return rv;
+    }
+  };
+
+ protected:
+  EncoderTemplate(nsIGlobalObject* aGlobalObject,
+                  RefPtr<WebCodecsErrorCallback>&& aErrorCallback,
+                  RefPtr<OutputCallbackType>&& aOutputCallback);
+
+  virtual ~EncoderTemplate() = default;
+
+ public:
+  IMPL_EVENT_HANDLER(dequeue)
+
+  void StartBlockingMessageQueue();
+  void StopBlockingMessageQueue();
+
+  MOZ_CAN_RUN_SCRIPT
+  void OutputEncodedData(const nsTArray<RefPtr<MediaRawData>>&& aData);
+
+  CodecState State() const { return mState; };
+
+  uint32_t EncodeQueueSize() const { return mEncodeQueueSize; };
+
+  MOZ_CAN_RUN_SCRIPT
+  void Configure(const ConfigType& aConfig, ErrorResult& aRv);
+
+  void EncodeAudioData(InputType& aInput, ErrorResult& aRv);
+  void EncodeVideoFrame(InputType& aInput,
+                        const VideoEncoderEncodeOptions& aOptions,
+                        ErrorResult& aRv);
+
+  already_AddRefed<Promise> Flush(ErrorResult& aRv);
+
+  void Reset(ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT
+  void Close(ErrorResult& aRv);
+
+ protected:
+  virtual RefPtr<OutputType> EncodedDataToOutputType(
+      nsIGlobalObject* aGlobalObject, const RefPtr<MediaRawData>& aData) = 0;
+  virtual void EncoderConfigToDecoderConfig(
+      JSContext* aCx, const RefPtr<MediaRawData>& aData,
+      const ConfigTypeInternal& aSrcConfig,
+      OutputConfigType& aDestConfig) const = 0;
+
+ protected:
+  void AssertIsOnOwningThread() const {
+    NS_ASSERT_OWNINGTHREAD(EncoderTemplate);
+  }
+
+  Result<Ok, nsresult> ResetInternal(const nsresult& aResult);
+  MOZ_CAN_RUN_SCRIPT
+  Result<Ok, nsresult> CloseInternalWithAbort();
+  MOZ_CAN_RUN_SCRIPT
+  void CloseInternal(const nsresult& aResult);
+
+  MOZ_CAN_RUN_SCRIPT void ReportError(const nsresult& aResult);
+
+  MOZ_CAN_RUN_SCRIPT void OutputEncodedVideoData(
+      const nsTArray<RefPtr<MediaRawData>>&& aData);
+  MOZ_CAN_RUN_SCRIPT void OutputEncodedAudioData(
+      const nsTArray<RefPtr<MediaRawData>>&& aData);
+
+  void ScheduleDequeueEvent();
+  nsresult FireEvent(nsAtom* aTypeWithOn, const nsAString& aEventType);
+
+  void SchedulePromiseResolveOrReject(already_AddRefed<Promise> aPromise,
+                                      const nsresult& aResult);
+
+  void ProcessControlMessageQueue();
+  void CancelPendingControlMessagesAndFlushPromises(const nsresult& aResult);
+
+  template <typename Func>
+  void QueueATask(const char* aName, Func&& aSteps);
+
+  MessageProcessedResult ProcessConfigureMessage(
+      RefPtr<ConfigureMessage> aMessage);
+
+  MessageProcessedResult ProcessEncodeMessage(RefPtr<EncodeMessage> aMessage);
+
+  MessageProcessedResult ProcessFlushMessage(RefPtr<FlushMessage> aMessage);
+
+  void Configure(RefPtr<ConfigureMessage> aMessage);
+  void Reconfigure(RefPtr<ConfigureMessage> aMessage);
+  void DrainAndReconfigure(RefPtr<ConfigureMessage> aMessage);
+
+  bool CreateEncoderAgent(WebCodecsId aId, RefPtr<ConfigTypeInternal> aConfig);
+  void DestroyEncoderAgentIfAny();
+
+  void PushEncodeRequest(
+      WebCodecsId aConfigureId, RefPtr<InputTypeInternal>&& aData,
+      Maybe<VideoEncoderEncodeOptions>&& aOptions = Nothing());
+
+  RefPtr<WebCodecsErrorCallback> mErrorCallback;
+  RefPtr<OutputCallbackType> mOutputCallback;
+
+  CodecState mState;
+
+  bool mMessageQueueBlocked;
+  std::queue<RefPtr<ControlMessage>> mControlMessageQueue;
+  RefPtr<ControlMessage> mProcessingMessage;
+
+  SimpleMap<int64_t, RefPtr<Promise>> mPendingFlushPromises;
+
+  uint32_t mEncodeQueueSize;
+  bool mDequeueEventScheduled;
+
+  uint32_t mLatestConfigureId;
+  size_t mEncodeCounter;
+  size_t mFlushCounter;
+
+  RefPtr<EncoderAgent> mAgent;
+  MozPromiseRequestHolder<EncoderAgent::ReconfigurationPromise>
+      mReconfigureRequest;
+  MozPromiseRequestHolder<EncoderAgent::EncodePromise>
+      mDrainAfterReconfigureRequest;
+  RefPtr<ConfigTypeInternal> mActiveConfig;
+  bool mOutputNewDecoderConfig = false;
+
+  UniquePtr<media::ShutdownBlockingTicket> mShutdownBlocker;
+
+  RefPtr<ThreadSafeWorkerRef> mWorkerRef;
+  uint64_t mPacketsOutput = 0;
+
+};
+
+}  
+
+#endif  // mozilla_dom_EncoderTemplate_h

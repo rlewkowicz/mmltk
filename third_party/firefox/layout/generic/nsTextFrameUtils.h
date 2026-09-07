@@ -1,0 +1,140 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef NSTEXTFRAMEUTILS_H_
+#define NSTEXTFRAMEUTILS_H_
+
+#include "gfxSkipChars.h"
+#include "nsBidiUtils.h"
+
+class nsAtom;
+class nsIContent;
+struct nsStyleText;
+
+namespace mozilla {
+namespace dom {
+class Text;
+}
+}  
+
+#define BIG_TEXT_NODE_SIZE 4096
+
+#define CH_NBSP 160
+#define CH_SHY 173
+#define CH_CJKSP 12288  // U+3000 IDEOGRAPHIC SPACE (CJK Full-Width Space)
+
+class nsTextFrameUtils {
+ public:
+  enum class Flags : uint16_t {
+
+    HasTab = 0x01,
+    HasShy = 0x02,
+    HasNewline = 0x04,
+
+    DontSkipDrawingForPendingUserFonts = 0x08,
+
+
+    IsSimpleFlow = 0x10,
+    IncomingWhitespace = 0x20,
+    TrailingWhitespace = 0x40,
+    CompressedLeadingWhitespace = 0x80,
+    NoBreaks = 0x100,
+    IsTransformed = 0x200,
+    HasTrailingBreak = 0x400,
+
+    IsSingleCharMi = 0x800,
+
+    MightHaveGlyphChanges = 0x1000,
+
+    RunSizeAccounted = 0x2000,
+
+  };
+
+  enum { INCOMING_NONE = 0, INCOMING_WHITESPACE = 1, INCOMING_ARABICCHAR = 2 };
+
+  static bool IsSpaceCombiningSequenceTail(const char16_t* aChars,
+                                           int32_t aLength);
+  static bool IsSpaceCombiningSequenceTail(const uint8_t* aChars,
+                                           int32_t aLength) {
+    return false;
+  }
+
+  enum CompressionMode {
+    COMPRESS_NONE,
+    COMPRESS_WHITESPACE,
+    COMPRESS_WHITESPACE_NEWLINE,
+    COMPRESS_NONE_TRANSFORM_TO_SPACE
+  };
+
+  template <class CharT>
+  static CharT* TransformText(const CharT* aText, uint32_t aLength,
+                              CharT* aOutput, CompressionMode aCompression,
+                              uint8_t* aIncomingFlags, gfxSkipChars* aSkipChars,
+                              nsTextFrameUtils::Flags* aAnalysisFlags,
+                              const nsAtom* aLanguage);
+
+  template <class CharT>
+  static bool IsSkippableCharacterForTransformText(CharT aChar);
+
+  static void AppendLineBreakOffset(nsTArray<uint32_t>* aArray,
+                                    uint32_t aOffset) {
+    if (aArray->Length() > 0 && (*aArray)[aArray->Length() - 1] == aOffset) {
+      return;
+    }
+    aArray->AppendElement(aOffset);
+  }
+
+  static uint32_t ComputeApproximateLengthWithWhitespaceCompression(
+      mozilla::dom::Text*, const nsStyleText*);
+  static uint32_t ComputeApproximateLengthWithWhitespaceCompression(
+      const nsAString&, const nsStyleText*);
+};
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(nsTextFrameUtils::Flags)
+
+class nsSkipCharsRunIterator {
+ public:
+  enum LengthMode {
+    LENGTH_UNSKIPPED_ONLY = false,
+    LENGTH_INCLUDES_SKIPPED = true
+  };
+  nsSkipCharsRunIterator(const gfxSkipCharsIterator& aStart,
+                         LengthMode aLengthIncludesSkipped,
+                         uint32_t aRemainingLength)
+      : mIterator(aStart),
+        mRemainingLength(aRemainingLength),
+        mRunLength(0),
+        mSkipped(false),
+        mVisitSkipped(false),
+        mLengthIncludesSkipped(aLengthIncludesSkipped) {}
+
+  void SetVisitSkipped() { mVisitSkipped = true; }
+
+  void SetOriginalOffset(int32_t aOffset) {
+    mIterator.SetOriginalOffset(aOffset);
+  }
+  void SetSkippedOffset(uint32_t aOffset) {
+    mIterator.SetSkippedOffset(aOffset);
+  }
+
+  bool NextRun();
+
+  bool IsSkipped() const { return mSkipped; }
+
+  int32_t GetRunLength() const { return mRunLength; }
+
+  const gfxSkipCharsIterator& GetPos() const { return mIterator; }
+  int32_t GetOriginalOffset() const { return mIterator.GetOriginalOffset(); }
+  uint32_t GetSkippedOffset() const { return mIterator.GetSkippedOffset(); }
+
+ private:
+  gfxSkipCharsIterator mIterator;
+  int32_t mRemainingLength;
+  int32_t mRunLength;
+  bool mSkipped;
+  bool mVisitSkipped;
+  bool mLengthIncludesSkipped;
+};
+
+#endif /*NSTEXTFRAMEUTILS_H_*/

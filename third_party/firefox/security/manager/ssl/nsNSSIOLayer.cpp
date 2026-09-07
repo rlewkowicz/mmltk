@@ -1,0 +1,1633 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsNSSIOLayer.h"
+
+#include <algorithm>
+#include <utility>
+#include <vector>
+
+#include "NSSCertDBTrustDomain.h"
+#include "NSSErrorsService.h"
+#include "NSSSocketControl.h"
+#include "SSLServerCertVerification.h"
+#include "ScopedNSSTypes.h"
+#include "TLSClientAuthCertSelection.h"
+#include "keyhi.h"
+#include "mozilla/Base64.h"
+#include "mozilla/Logging.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/RandomNum.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/StaticPrefs_security.h"
+#include "mozilla/net/SSLTokensCache.h"
+#include "mozilla/net/SocketProcessChild.h"
+#include "mozilla/psm/IPCClientCertsChild.h"
+#include "mozilla/psm/mozilla_abridged_certs_generated.h"
+#include "mozilla/psm/PIPCClientCertsChild.h"
+#include "mozilla/psm/EnabledSignatureSchemes.h"
+#include "mozpkix/pkixnss.h"
+#include "mozpkix/pkixtypes.h"
+#include "mozpkix/pkixutil.h"
+#include "nsArray.h"
+#include "nsArrayUtils.h"
+#include "nsCRT.h"
+#include "nsCharSeparatedTokenizer.h"
+#include "nsClientAuthRemember.h"
+#include "nsContentUtils.h"
+#include "nsISocketProvider.h"
+#include "nsIWebProgressListener.h"
+#include "nsNSSComponent.h"
+#include "nsPrintfCString.h"
+#include "nsServiceManagerUtils.h"
+#include "prmem.h"
+#include "prnetdb.h"
+#include "secder.h"
+#include "secerr.h"
+#include "ssl.h"
+#include "sslerr.h"
+#include "sslexp.h"
+#include "sslproto.h"
+#include "zlib.h"
+#include "brotli/decode.h"
+#include "zstd/zstd.h"
+
+#if defined(__arm__)
+#  include "mozilla/arm.h"
+#endif
+
+
+using namespace mozilla;
+using namespace mozilla::psm;
+using namespace mozilla::ipc;
+
+
+
+namespace {
+
+
+enum {
+  kTLSProviderFlagMaxVersion10 = 0x01,
+  kTLSProviderFlagMaxVersion11 = 0x02,
+  kTLSProviderFlagMaxVersion12 = 0x03,
+  kTLSProviderFlagMaxVersion13 = 0x04,
+};
+
+static uint32_t getTLSProviderFlagMaxVersion(uint32_t flags) {
+  return (flags & 0x07);
+}
+
+static uint32_t getTLSProviderFlagFallbackLimit(uint32_t flags) {
+  return (flags & 0x38) >> 3;
+}
+
+void getSiteKey(const nsACString& hostName, uint16_t port,
+                 nsACString& key) {
+  key = hostName;
+  key.AppendLiteral(":");
+  key.AppendInt(port);
+}
+
+}  
+
+extern LazyLogModule gPIPNSSLog;
+
+namespace {
+
+enum Operation { reading, writing, not_reading_or_writing };
+
+int32_t checkHandshake(int32_t bytesTransfered, bool wasReading,
+                       PRFileDesc* ssl_layer_fd, NSSSocketControl* socketInfo);
+
+NSSSocketControl* getSocketInfoIfRunning(PRFileDesc* fd, Operation op) {
+  if (!fd || !fd->lower || !fd->secret ||
+      fd->identity != nsSSLIOLayerHelpers::nsSSLIOLayerIdentity) {
+    NS_ERROR("bad file descriptor passed to getSocketInfoIfRunning");
+    PR_SetError(PR_BAD_DESCRIPTOR_ERROR, 0);
+    return nullptr;
+  }
+
+  NSSSocketControl* socketInfo = (NSSSocketControl*)fd->secret;
+
+  if (socketInfo->IsCanceled()) {
+    PRErrorCode err = socketInfo->GetErrorCode();
+    PR_SetError(err, 0);
+    if (op == reading || op == writing) {
+      (void)checkHandshake(-1, op == reading, fd, socketInfo);
+    }
+
+    return nullptr;
+  }
+
+  return socketInfo;
+}
+
+}  
+
+static PRStatus nsSSLIOLayerConnect(PRFileDesc* fd, const PRNetAddr* addr,
+                                    PRIntervalTime timeout) {
+  MOZ_LOG(gPIPNSSLog, LogLevel::Debug,
+          ("[%p] connecting SSL socket\n", (void*)fd));
+  if (!getSocketInfoIfRunning(fd, not_reading_or_writing)) return PR_FAILURE;
+
+  PRStatus status = fd->lower->methods->connect(fd->lower, addr, timeout);
+  if (status != PR_SUCCESS) {
+    MOZ_LOG(gPIPNSSLog, LogLevel::Error,
+            ("[%p] Lower layer connect error: %d\n", (void*)fd, PR_GetError()));
+    return status;
+  }
+
+  MOZ_LOG(gPIPNSSLog, LogLevel::Debug, ("[%p] Connect\n", (void*)fd));
+  return status;
+}
+
+void nsSSLIOLayerHelpers::rememberTolerantAtVersion(const nsACString& hostName,
+                                                    uint16_t port,
+                                                    uint16_t tolerant) {
+  nsCString key;
+  getSiteKey(hostName, port, key);
+
+  MutexAutoLock lock(mutex);
+
+  IntoleranceEntry entry;
+  if (mTLSIntoleranceInfo.Get(key, &entry)) {
+    entry.AssertInvariant();
+    entry.tolerant = std::max(entry.tolerant, tolerant);
+    if (entry.intolerant != 0 && entry.intolerant <= entry.tolerant) {
+      entry.intolerant = entry.tolerant + 1;
+      entry.intoleranceReason = 0;  
+    }
+  } else {
+    entry.tolerant = tolerant;
+    entry.intolerant = 0;
+    entry.intoleranceReason = 0;
+  }
+
+  entry.AssertInvariant();
+
+  mTLSIntoleranceInfo.InsertOrUpdate(key, entry);
+}
+
+void nsSSLIOLayerHelpers::forgetIntolerance(const nsACString& hostName,
+                                            uint16_t port) {
+  nsCString key;
+  getSiteKey(hostName, port, key);
+
+  MutexAutoLock lock(mutex);
+
+  IntoleranceEntry entry;
+  if (mTLSIntoleranceInfo.Get(key, &entry)) {
+    entry.AssertInvariant();
+
+    entry.intolerant = 0;
+    entry.intoleranceReason = 0;
+
+    entry.AssertInvariant();
+    mTLSIntoleranceInfo.InsertOrUpdate(key, entry);
+  }
+}
+
+bool nsSSLIOLayerHelpers::fallbackLimitReached(const nsACString& hostName,
+                                               uint16_t intolerant) {
+  if (isInsecureFallbackSite(hostName)) {
+    return intolerant <= SSL_LIBRARY_VERSION_TLS_1_0;
+  }
+  return intolerant <= mVersionFallbackLimit;
+}
+
+bool nsSSLIOLayerHelpers::rememberIntolerantAtVersion(
+    const nsACString& hostName, uint16_t port, uint16_t minVersion,
+    uint16_t intolerant, PRErrorCode intoleranceReason) {
+  if (intolerant <= minVersion || fallbackLimitReached(hostName, intolerant)) {
+    forgetIntolerance(hostName, port);
+    return false;
+  }
+
+  nsCString key;
+  getSiteKey(hostName, port, key);
+
+  MutexAutoLock lock(mutex);
+
+  IntoleranceEntry entry;
+  if (mTLSIntoleranceInfo.Get(key, &entry)) {
+    entry.AssertInvariant();
+    if (intolerant <= entry.tolerant) {
+      return false;
+    }
+    if ((entry.intolerant != 0 && intolerant >= entry.intolerant)) {
+      return true;
+    }
+  } else {
+    entry.tolerant = 0;
+  }
+
+  entry.intolerant = intolerant;
+  entry.intoleranceReason = intoleranceReason;
+  entry.AssertInvariant();
+  mTLSIntoleranceInfo.InsertOrUpdate(key, entry);
+
+  return true;
+}
+
+void nsSSLIOLayerHelpers::adjustForTLSIntolerance(
+    const nsACString& hostName, uint16_t port,
+     SSLVersionRange& range) {
+  IntoleranceEntry entry;
+
+  {
+    nsCString key;
+    getSiteKey(hostName, port, key);
+
+    MutexAutoLock lock(mutex);
+    if (!mTLSIntoleranceInfo.Get(key, &entry)) {
+      return;
+    }
+  }
+
+  entry.AssertInvariant();
+
+  if (entry.intolerant != 0) {
+    if (range.min < entry.intolerant) {
+      range.max = entry.intolerant - 1;
+    }
+  }
+}
+
+PRErrorCode nsSSLIOLayerHelpers::getIntoleranceReason(
+    const nsACString& hostName, uint16_t port) {
+  IntoleranceEntry entry;
+
+  {
+    nsCString key;
+    getSiteKey(hostName, port, key);
+
+    MutexAutoLock lock(mutex);
+    if (!mTLSIntoleranceInfo.Get(key, &entry)) {
+      return 0;
+    }
+  }
+
+  entry.AssertInvariant();
+  return entry.intoleranceReason;
+}
+
+bool nsSSLIOLayerHelpers::nsSSLIOLayerInitialized = false;
+PRDescIdentity nsSSLIOLayerHelpers::nsSSLIOLayerIdentity;
+PRDescIdentity nsSSLIOLayerHelpers::nsSSLPlaintextLayerIdentity;
+PRIOMethods nsSSLIOLayerHelpers::nsSSLIOLayerMethods;
+PRIOMethods nsSSLIOLayerHelpers::nsSSLPlaintextLayerMethods;
+
+static PRStatus nsSSLIOLayerClose(PRFileDesc* fd) {
+  if (!fd) {
+    return PR_FAILURE;
+  }
+
+  MOZ_LOG(gPIPNSSLog, LogLevel::Debug, ("[%p] Shutting down socket", fd));
+
+  RefPtr<NSSSocketControl> socketInfo(
+      already_AddRefed((NSSSocketControl*)fd->secret));
+  fd->secret = nullptr;
+  if (!socketInfo) {
+    return PR_FAILURE;
+  }
+
+  return socketInfo->CloseSocketAndDestroy();
+}
+
+#if defined(DEBUG_SSL_VERBOSE) && defined(DUMP_BUFFER)
+#  define DUMPBUF_LINESIZE 24
+static void nsDumpBuffer(unsigned char* buf, int len) {
+  char hexbuf[DUMPBUF_LINESIZE * 3 + 1];
+  char chrbuf[DUMPBUF_LINESIZE + 1];
+  static const char* hex = "0123456789abcdef";
+  int i = 0;
+  int l = 0;
+  char ch;
+  char* c;
+  char* h;
+  if (len == 0) return;
+  hexbuf[DUMPBUF_LINESIZE * 3] = '\0';
+  chrbuf[DUMPBUF_LINESIZE] = '\0';
+  (void)memset(hexbuf, 0x20, DUMPBUF_LINESIZE * 3);
+  (void)memset(chrbuf, 0x20, DUMPBUF_LINESIZE);
+  h = hexbuf;
+  c = chrbuf;
+
+  while (i < len) {
+    ch = buf[i];
+
+    if (l == DUMPBUF_LINESIZE) {
+      MOZ_LOG(gPIPNSSLog, LogLevel::Debug, ("%s%s\n", hexbuf, chrbuf));
+      (void)memset(hexbuf, 0x20, DUMPBUF_LINESIZE * 3);
+      (void)memset(chrbuf, 0x20, DUMPBUF_LINESIZE);
+      h = hexbuf;
+      c = chrbuf;
+      l = 0;
+    }
+
+    *h++ = hex[(ch >> 4) & 0xf];
+    *h++ = hex[ch & 0xf];
+    h++;
+
+    if ((ch >= 0x20) && (ch <= 0x7e)) {
+      *c++ = ch;
+    } else {
+      *c++ = '.';
+    }
+    i++;
+    l++;
+  }
+  MOZ_LOG(gPIPNSSLog, LogLevel::Debug, ("%s%s\n", hexbuf, chrbuf));
+}
+
+#  define DEBUG_DUMP_BUFFER(buf, len) nsDumpBuffer(buf, len)
+#else
+#  define DEBUG_DUMP_BUFFER(buf, len)
+#endif
+
+namespace {
+
+uint32_t tlsIntoleranceTelemetryBucket(PRErrorCode err) {
+  switch (err) {
+    case SSL_ERROR_BAD_MAC_ALERT:
+      return 1;
+    case SSL_ERROR_BAD_MAC_READ:
+      return 2;
+    case SSL_ERROR_HANDSHAKE_FAILURE_ALERT:
+      return 3;
+    case SSL_ERROR_HANDSHAKE_UNEXPECTED_ALERT:
+      return 4;
+    case SSL_ERROR_ILLEGAL_PARAMETER_ALERT:
+      return 6;
+    case SSL_ERROR_NO_CYPHER_OVERLAP:
+      return 7;
+    case SSL_ERROR_UNSUPPORTED_VERSION:
+      return 10;
+    case SSL_ERROR_PROTOCOL_VERSION_ALERT:
+      return 11;
+    case SSL_ERROR_BAD_HANDSHAKE_HASH_VALUE:
+      return 13;
+    case SSL_ERROR_DECODE_ERROR_ALERT:
+      return 14;
+    case PR_CONNECT_RESET_ERROR:
+      return 16;
+    case PR_END_OF_FILE_ERROR:
+      return 17;
+    case SSL_ERROR_INTERNAL_ERROR_ALERT:
+      return 18;
+    default:
+      return 0;
+  }
+}
+
+bool retryDueToTLSIntolerance(PRErrorCode err, NSSSocketControl* socketInfo) {
+
+  if (StaticPrefs::security_tls_ech_disable_grease_on_fallback() &&
+      socketInfo->GetEchExtensionStatus() == EchExtensionStatus::kGREASE) {
+    return true;
+  }
+
+  SSLVersionRange range = socketInfo->GetTLSVersionRange();
+
+  if (err == SSL_ERROR_UNSUPPORTED_VERSION &&
+      range.min == SSL_LIBRARY_VERSION_TLS_1_0) {
+    socketInfo->SetSecurityState(nsIWebProgressListener::STATE_IS_INSECURE |
+                                 nsIWebProgressListener::STATE_USES_SSL_3);
+  }
+
+  if (err == SSL_ERROR_INAPPROPRIATE_FALLBACK_ALERT ||
+      err == SSL_ERROR_RX_MALFORMED_SERVER_HELLO) {
+
+    socketInfo->ForgetTLSIntolerance();
+
+    return false;
+  }
+
+
+  if ((err == PR_CONNECT_RESET_ERROR || err == PR_END_OF_FILE_ERROR) &&
+      socketInfo->GetForSTARTTLS()) {
+    return false;
+  }
+
+  uint32_t reason = tlsIntoleranceTelemetryBucket(err);
+  if (reason == 0) {
+    return false;
+  }
+
+  if (!socketInfo->RememberTLSIntolerant(err)) {
+    return false;
+  }
+
+  return true;
+}
+
+int32_t checkHandshake(int32_t bytesTransferred, bool wasReading,
+                       PRFileDesc* ssl_layer_fd, NSSSocketControl* socketInfo) {
+  const PRErrorCode originalError = PR_GetError();
+
+  if (bytesTransferred < 0 && originalError == PR_WOULD_BLOCK_ERROR) {
+    PR_SetError(PR_WOULD_BLOCK_ERROR, 0);
+    return bytesTransferred;
+  }
+
+  bool handleHandshakeResultNow = socketInfo->IsHandshakePending();
+  if (!handleHandshakeResultNow) {
+    if (bytesTransferred < 0) {
+      if (!socketInfo->IsCanceled()) {
+        socketInfo->SetCanceled(originalError);
+      }
+      PR_SetError(originalError, 0);
+    }
+    return bytesTransferred;
+  }
+
+  socketInfo->SetHandshakeNotPending();
+  if (bytesTransferred > 0) {
+    return bytesTransferred;
+  }
+
+  PRErrorCode errorToUse = originalError;
+  if (bytesTransferred == 0) {
+    if (wasReading) {
+      errorToUse = PR_END_OF_FILE_ERROR;
+    } else {
+      errorToUse = SEC_ERROR_LIBRARY_FAILURE;
+    }
+    bytesTransferred = -1;
+  }
+  bool wantRetry = retryDueToTLSIntolerance(errorToUse, socketInfo);
+  if (!socketInfo->IsCanceled()) {
+    socketInfo->SetCanceled(errorToUse);
+  }
+
+  if (wantRetry) {
+    MOZ_LOG(gPIPNSSLog, LogLevel::Debug,
+            ("[%p] checkHandshake: will retry with lower max TLS version",
+             ssl_layer_fd));
+    PR_SetError(PR_CONNECT_RESET_ERROR, 0);
+  } else {
+    PR_SetError(originalError, 0);
+  }
+
+  return bytesTransferred;
+}
+
+}  
+
+static int16_t nsSSLIOLayerPoll(PRFileDesc* fd, int16_t in_flags,
+                                int16_t* out_flags) {
+  if (!out_flags) {
+    NS_WARNING("nsSSLIOLayerPoll called with null out_flags");
+    return 0;
+  }
+
+  *out_flags = 0;
+
+  NSSSocketControl* socketInfo =
+      getSocketInfoIfRunning(fd, not_reading_or_writing);
+
+  if (!socketInfo) {
+    MOZ_LOG(
+        gPIPNSSLog, LogLevel::Debug,
+        ("[%p] polling SSL socket right after certificate verification failed "
+         "or NSS shutdown or SDR logout %d\n",
+         fd, (int)in_flags));
+
+    MOZ_ASSERT(in_flags & PR_POLL_EXCEPT,
+               "Caller did not poll for EXCEPT (canceled)");
+    *out_flags = in_flags | PR_POLL_EXCEPT;  
+    return in_flags;
+  }
+
+  MOZ_LOG(gPIPNSSLog, LogLevel::Verbose,
+          (socketInfo->IsWaitingForCertVerification()
+               ? "[%p] polling SSL socket during certificate verification "
+                 "using lower %d\n"
+               : "[%p] poll SSL socket using lower %d\n",
+           fd, (int)in_flags));
+
+  socketInfo->MaybeSelectClientAuthCertificate();
+
+  int16_t result = fd->lower->methods->poll(fd->lower, in_flags, out_flags);
+  MOZ_LOG(gPIPNSSLog, LogLevel::Verbose,
+          ("[%p] poll SSL socket returned %d\n", (void*)fd, (int)result));
+  return result;
+}
+
+nsSSLIOLayerHelpers::nsSSLIOLayerHelpers(PublicOrPrivate aPublicOrPrivate,
+                                         uint32_t aTlsFlags)
+    : mVersionFallbackLimit(SSL_LIBRARY_VERSION_TLS_1_0),
+      mPublicOrPrivate(aPublicOrPrivate),
+      mutex("nsSSLIOLayerHelpers.mutex"),
+      mTlsFlags(aTlsFlags) {}
+
+static int32_t PSMAvailable(PRFileDesc*) {
+  PR_SetError(PR_NOT_IMPLEMENTED_ERROR, 0);
+  return -1;
+}
+
+static int64_t PSMAvailable64(PRFileDesc*) {
+  PR_SetError(PR_NOT_IMPLEMENTED_ERROR, 0);
+  return -1;
+}
+
+static PRStatus PSMGetsockname(PRFileDesc* fd, PRNetAddr* addr) {
+  if (!getSocketInfoIfRunning(fd, not_reading_or_writing)) return PR_FAILURE;
+
+  return fd->lower->methods->getsockname(fd->lower, addr);
+}
+
+static PRStatus PSMGetpeername(PRFileDesc* fd, PRNetAddr* addr) {
+  if (!getSocketInfoIfRunning(fd, not_reading_or_writing)) return PR_FAILURE;
+
+  return fd->lower->methods->getpeername(fd->lower, addr);
+}
+
+static PRStatus PSMGetsocketoption(PRFileDesc* fd, PRSocketOptionData* data) {
+  if (!getSocketInfoIfRunning(fd, not_reading_or_writing)) return PR_FAILURE;
+
+  return fd->lower->methods->getsocketoption(fd, data);
+}
+
+static PRStatus PSMSetsocketoption(PRFileDesc* fd,
+                                   const PRSocketOptionData* data) {
+  if (!getSocketInfoIfRunning(fd, not_reading_or_writing)) return PR_FAILURE;
+
+  return fd->lower->methods->setsocketoption(fd, data);
+}
+
+static int32_t PSMRecv(PRFileDesc* fd, void* buf, int32_t amount, int flags,
+                       PRIntervalTime timeout) {
+  NSSSocketControl* socketInfo = getSocketInfoIfRunning(fd, reading);
+  if (!socketInfo) return -1;
+
+  if (flags != PR_MSG_PEEK && flags != 0) {
+    PR_SetError(PR_INVALID_ARGUMENT_ERROR, 0);
+    return -1;
+  }
+
+  int32_t bytesRead =
+      fd->lower->methods->recv(fd->lower, buf, amount, flags, timeout);
+
+  MOZ_LOG(gPIPNSSLog, LogLevel::Verbose,
+          ("[%p] read %d bytes\n", (void*)fd, bytesRead));
+
+#if defined(DEBUG_SSL_VERBOSE)
+  DEBUG_DUMP_BUFFER((unsigned char*)buf, bytesRead);
+#endif
+
+  return checkHandshake(bytesRead, true, fd, socketInfo);
+}
+
+static int32_t PSMSend(PRFileDesc* fd, const void* buf, int32_t amount,
+                       int flags, PRIntervalTime timeout) {
+  NSSSocketControl* socketInfo = getSocketInfoIfRunning(fd, writing);
+  if (!socketInfo) return -1;
+
+  if (flags != 0) {
+    PR_SetError(PR_INVALID_ARGUMENT_ERROR, 0);
+    return -1;
+  }
+
+#if defined(DEBUG_SSL_VERBOSE)
+  DEBUG_DUMP_BUFFER((unsigned char*)buf, amount);
+#endif
+
+  if (socketInfo->IsShortWritePending() && amount > 0) {
+#if defined(DEBUG)
+    socketInfo->CheckShortWrittenBuffer(static_cast<const unsigned char*>(buf),
+                                        amount);
+#endif
+
+    buf = socketInfo->GetShortWritePendingByteRef();
+    amount = 1;
+
+    MOZ_LOG(gPIPNSSLog, LogLevel::Verbose,
+            ("[%p] pushing 1 byte after SSL short write", fd));
+  }
+
+  int32_t bytesWritten =
+      fd->lower->methods->send(fd->lower, buf, amount, flags, timeout);
+
+
+  static const int32_t kShortWrite16k = 16383;
+
+  if ((amount > 1 && bytesWritten == (amount - 1)) ||
+      (amount > kShortWrite16k && bytesWritten == kShortWrite16k)) {
+    socketInfo->SetShortWritePending(
+        bytesWritten + 1,  
+        *(static_cast<const unsigned char*>(buf) + bytesWritten));
+
+    MOZ_LOG(
+        gPIPNSSLog, LogLevel::Verbose,
+        ("[%p] indicated SSL short write for %d bytes (written just %d bytes)",
+         fd, amount, bytesWritten));
+
+    bytesWritten = -1;
+    PR_SetError(PR_WOULD_BLOCK_ERROR, 0);
+
+#if defined(DEBUG)
+    socketInfo->RememberShortWrittenBuffer(
+        static_cast<const unsigned char*>(buf));
+#endif
+
+  } else if (socketInfo->IsShortWritePending() && bytesWritten == 1) {
+    MOZ_LOG(gPIPNSSLog, LogLevel::Verbose,
+            ("[%p] finished SSL short write", fd));
+
+    bytesWritten = socketInfo->ResetShortWritePending();
+  }
+
+  MOZ_LOG(gPIPNSSLog, LogLevel::Verbose,
+          ("[%p] wrote %d bytes\n", fd, bytesWritten));
+
+  return checkHandshake(bytesWritten, false, fd, socketInfo);
+}
+
+static PRStatus PSMBind(PRFileDesc* fd, const PRNetAddr* addr) {
+  if (!getSocketInfoIfRunning(fd, not_reading_or_writing)) return PR_FAILURE;
+
+  return fd->lower->methods->bind(fd->lower, addr);
+}
+
+static int32_t nsSSLIOLayerRead(PRFileDesc* fd, void* buf, int32_t amount) {
+  return PSMRecv(fd, buf, amount, 0, PR_INTERVAL_NO_TIMEOUT);
+}
+
+static int32_t nsSSLIOLayerWrite(PRFileDesc* fd, const void* buf,
+                                 int32_t amount) {
+  return PSMSend(fd, buf, amount, 0, PR_INTERVAL_NO_TIMEOUT);
+}
+
+static PRStatus PSMConnectcontinue(PRFileDesc* fd, int16_t out_flags) {
+  if (!getSocketInfoIfRunning(fd, not_reading_or_writing)) {
+    return PR_FAILURE;
+  }
+
+  return fd->lower->methods->connectcontinue(fd, out_flags);
+}
+
+NS_IMPL_ISUPPORTS(nsSSLIOLayerHelpers, nsIObserver)
+
+NS_IMETHODIMP
+nsSSLIOLayerHelpers::Observe(nsISupports* aSubject, const char* aTopic,
+                             const char16_t* someData) {
+  if (nsCRT::strcmp(aTopic, NS_PREFBRANCH_PREFCHANGE_TOPIC_ID) == 0) {
+    NS_ConvertUTF16toUTF8 prefName(someData);
+
+    if (prefName.EqualsLiteral("security.tls.version.fallback-limit")) {
+      loadVersionFallbackLimit();
+    } else if (prefName.EqualsLiteral("security.tls.insecure_fallback_hosts")) {
+      initInsecureFallbackSites();
+    }
+  } else if (nsCRT::strcmp(aTopic, "last-pb-context-exited") == 0) {
+    clearStoredData();
+  }
+  return NS_OK;
+}
+
+void nsSSLIOLayerHelpers::GlobalInit() {
+  MOZ_ASSERT(NS_IsMainThread(), "Not on main thread");
+  gPublicSSLIOLayerHelpers = new nsSSLIOLayerHelpers(PublicOrPrivate::Public);
+  gPublicSSLIOLayerHelpers->Init();
+  gPrivateSSLIOLayerHelpers = new nsSSLIOLayerHelpers(PublicOrPrivate::Private);
+  gPrivateSSLIOLayerHelpers->Init();
+}
+
+void nsSSLIOLayerHelpers::GlobalCleanup() {
+  MOZ_ASSERT(NS_IsMainThread(), "Not on main thread");
+
+  if (gPrivateSSLIOLayerHelpers) {
+    Preferences::RemoveObserver(gPrivateSSLIOLayerHelpers,
+                                "security.tls.version.fallback-limit");
+#if defined(DEBUG)
+    gPrivateSSLIOLayerHelpers->mRegisteredPrefObservers = false;
+#endif
+    gPrivateSSLIOLayerHelpers = nullptr;
+  }
+
+  if (gPublicSSLIOLayerHelpers) {
+    Preferences::RemoveObserver(gPublicSSLIOLayerHelpers,
+                                "security.tls.version.fallback-limit");
+    Preferences::RemoveObserver(gPublicSSLIOLayerHelpers,
+                                "security.tls.insecure_fallback_hosts");
+#if defined(DEBUG)
+    gPublicSSLIOLayerHelpers->mRegisteredPrefObservers = false;
+#endif
+    gPublicSSLIOLayerHelpers = nullptr;
+  }
+}
+
+already_AddRefed<nsSSLIOLayerHelpers> PublicSSLIOLayerHelpers() {
+  return do_AddRef(gPublicSSLIOLayerHelpers);
+}
+
+already_AddRefed<nsSSLIOLayerHelpers> PrivateSSLIOLayerHelpers() {
+  return do_AddRef(gPrivateSSLIOLayerHelpers);
+}
+
+static int32_t PlaintextRecv(PRFileDesc* fd, void* buf, int32_t amount,
+                             int flags, PRIntervalTime timeout) {
+  NSSSocketControl* socketInfo = nullptr;
+
+  int32_t bytesRead =
+      fd->lower->methods->recv(fd->lower, buf, amount, flags, timeout);
+  if (fd->identity == nsSSLIOLayerHelpers::nsSSLPlaintextLayerIdentity) {
+    socketInfo = (NSSSocketControl*)fd->secret;
+  }
+
+  if ((bytesRead > 0) && socketInfo) {
+    socketInfo->AddPlaintextBytesRead(bytesRead);
+  }
+  return bytesRead;
+}
+
+nsSSLIOLayerHelpers::~nsSSLIOLayerHelpers() {
+  MOZ_ASSERT(!mRegisteredPrefObservers,
+             "Pref observers should have been removed before destruction");
+}
+
+template <typename R, R return_value, typename... Args>
+static R InvalidPRIOMethod(Args...) {
+  MOZ_ASSERT_UNREACHABLE("I/O method is invalid");
+  PR_SetError(PR_NOT_IMPLEMENTED_ERROR, 0);
+  return return_value;
+}
+
+nsresult nsSSLIOLayerHelpers::Init() {
+  if (!nsSSLIOLayerInitialized) {
+    MOZ_ASSERT(NS_IsMainThread());
+    nsSSLIOLayerInitialized = true;
+    nsSSLIOLayerIdentity = PR_GetUniqueIdentity("NSS layer");
+    nsSSLIOLayerMethods = *PR_GetDefaultIOMethods();
+
+    nsSSLIOLayerMethods.fsync =
+        InvalidPRIOMethod<PRStatus, PR_FAILURE, PRFileDesc*>;
+    nsSSLIOLayerMethods.seek =
+        InvalidPRIOMethod<int32_t, -1, PRFileDesc*, int32_t, PRSeekWhence>;
+    nsSSLIOLayerMethods.seek64 =
+        InvalidPRIOMethod<int64_t, -1, PRFileDesc*, int64_t, PRSeekWhence>;
+    nsSSLIOLayerMethods.fileInfo =
+        InvalidPRIOMethod<PRStatus, PR_FAILURE, PRFileDesc*, PRFileInfo*>;
+    nsSSLIOLayerMethods.fileInfo64 =
+        InvalidPRIOMethod<PRStatus, PR_FAILURE, PRFileDesc*, PRFileInfo64*>;
+    nsSSLIOLayerMethods.writev =
+        InvalidPRIOMethod<int32_t, -1, PRFileDesc*, const PRIOVec*, int32_t,
+                          PRIntervalTime>;
+    nsSSLIOLayerMethods.accept =
+        InvalidPRIOMethod<PRFileDesc*, nullptr, PRFileDesc*, PRNetAddr*,
+                          PRIntervalTime>;
+    nsSSLIOLayerMethods.listen =
+        InvalidPRIOMethod<PRStatus, PR_FAILURE, PRFileDesc*, int>;
+    nsSSLIOLayerMethods.shutdown =
+        InvalidPRIOMethod<PRStatus, PR_FAILURE, PRFileDesc*, int>;
+    nsSSLIOLayerMethods.recvfrom =
+        InvalidPRIOMethod<int32_t, -1, PRFileDesc*, void*, int32_t, int,
+                          PRNetAddr*, PRIntervalTime>;
+    nsSSLIOLayerMethods.sendto =
+        InvalidPRIOMethod<int32_t, -1, PRFileDesc*, const void*, int32_t, int,
+                          const PRNetAddr*, PRIntervalTime>;
+    nsSSLIOLayerMethods.acceptread =
+        InvalidPRIOMethod<int32_t, -1, PRFileDesc*, PRFileDesc**, PRNetAddr**,
+                          void*, int32_t, PRIntervalTime>;
+    nsSSLIOLayerMethods.transmitfile =
+        InvalidPRIOMethod<int32_t, -1, PRFileDesc*, PRFileDesc*, const void*,
+                          int32_t, PRTransmitFileFlags, PRIntervalTime>;
+    nsSSLIOLayerMethods.sendfile =
+        InvalidPRIOMethod<int32_t, -1, PRFileDesc*, PRSendFileData*,
+                          PRTransmitFileFlags, PRIntervalTime>;
+
+    nsSSLIOLayerMethods.available = PSMAvailable;
+    nsSSLIOLayerMethods.available64 = PSMAvailable64;
+    nsSSLIOLayerMethods.getsockname = PSMGetsockname;
+    nsSSLIOLayerMethods.getpeername = PSMGetpeername;
+    nsSSLIOLayerMethods.getsocketoption = PSMGetsocketoption;
+    nsSSLIOLayerMethods.setsocketoption = PSMSetsocketoption;
+    nsSSLIOLayerMethods.recv = PSMRecv;
+    nsSSLIOLayerMethods.send = PSMSend;
+    nsSSLIOLayerMethods.connectcontinue = PSMConnectcontinue;
+    nsSSLIOLayerMethods.bind = PSMBind;
+
+    nsSSLIOLayerMethods.connect = nsSSLIOLayerConnect;
+    nsSSLIOLayerMethods.close = nsSSLIOLayerClose;
+    nsSSLIOLayerMethods.write = nsSSLIOLayerWrite;
+    nsSSLIOLayerMethods.read = nsSSLIOLayerRead;
+    nsSSLIOLayerMethods.poll = nsSSLIOLayerPoll;
+
+    nsSSLPlaintextLayerIdentity = PR_GetUniqueIdentity("Plaintxext PSM layer");
+    nsSSLPlaintextLayerMethods = *PR_GetDefaultIOMethods();
+    nsSSLPlaintextLayerMethods.recv = PlaintextRecv;
+  }
+
+  loadVersionFallbackLimit();
+
+  if (NS_IsMainThread()) {
+    initInsecureFallbackSites();
+
+#if defined(DEBUG)
+    mRegisteredPrefObservers = true;
+#endif
+    Preferences::AddStrongObserver(this, "security.tls.version.fallback-limit");
+    if (isPublic()) {
+      Preferences::AddStrongObserver(this,
+                                     "security.tls.insecure_fallback_hosts");
+    } else {
+      nsCOMPtr<nsIObserverService> obsSvc =
+          mozilla::services::GetObserverService();
+      if (obsSvc) {
+        obsSvc->AddObserver(this, "last-pb-context-exited", false);
+      }
+    }
+  } else {
+    MOZ_ASSERT(mTlsFlags, "Only per socket version can ignore prefs");
+  }
+
+  return NS_OK;
+}
+
+void nsSSLIOLayerHelpers::loadVersionFallbackLimit() {
+  uint32_t limit = StaticPrefs::security_tls_version_fallback_limit();
+
+  uint32_t tlsFlagsFallbackLimit = getTLSProviderFlagFallbackLimit(mTlsFlags);
+
+  if (tlsFlagsFallbackLimit) {
+    limit = tlsFlagsFallbackLimit;
+    MOZ_LOG(gPIPNSSLog, LogLevel::Debug,
+            ("loadVersionFallbackLimit overriden by tlsFlags %d\n", limit));
+  }
+
+  SSLVersionRange defaults = {SSL_LIBRARY_VERSION_TLS_1_2,
+                              SSL_LIBRARY_VERSION_TLS_1_2};
+  SSLVersionRange filledInRange;
+  nsNSSComponent::FillTLSVersionRange(filledInRange, limit, limit, defaults);
+  if (filledInRange.max < SSL_LIBRARY_VERSION_TLS_1_2) {
+    filledInRange.max = SSL_LIBRARY_VERSION_TLS_1_2;
+  }
+
+  mVersionFallbackLimit = filledInRange.max;
+}
+
+void nsSSLIOLayerHelpers::clearStoredData() {
+  MOZ_ASSERT(NS_IsMainThread());
+  initInsecureFallbackSites();
+
+  MutexAutoLock lock(mutex);
+  mTLSIntoleranceInfo.Clear();
+}
+
+void nsSSLIOLayerHelpers::setInsecureFallbackSites(const nsCString& str) {
+  MutexAutoLock lock(mutex);
+
+  mInsecureFallbackSites.Clear();
+
+  for (const nsACString& host : nsCCharSeparatedTokenizer(str, ',').ToRange()) {
+    if (!host.IsEmpty()) {
+      mInsecureFallbackSites.PutEntry(host);
+    }
+  }
+}
+
+void nsSSLIOLayerHelpers::initInsecureFallbackSites() {
+  MOZ_ASSERT(NS_IsMainThread());
+  nsAutoCString insecureFallbackHosts;
+  Preferences::GetCString("security.tls.insecure_fallback_hosts",
+                          insecureFallbackHosts);
+  setInsecureFallbackSites(insecureFallbackHosts);
+}
+
+bool nsSSLIOLayerHelpers::isPublic() const {
+  return mPublicOrPrivate == PublicOrPrivate::Public;
+}
+
+class FallbackPrefRemover final : public Runnable {
+ public:
+  explicit FallbackPrefRemover(const nsACString& aHost)
+      : mozilla::Runnable("FallbackPrefRemover"), mHost(aHost) {}
+  NS_IMETHOD Run() override;
+
+ private:
+  nsCString mHost;
+};
+
+NS_IMETHODIMP
+FallbackPrefRemover::Run() {
+  MOZ_ASSERT(NS_IsMainThread());
+  nsAutoCString oldValue;
+  Preferences::GetCString("security.tls.insecure_fallback_hosts", oldValue);
+  nsCString newValue;
+  for (const nsACString& host :
+       nsCCharSeparatedTokenizer(oldValue, ',').ToRange()) {
+    if (host.Equals(mHost)) {
+      continue;
+    }
+    if (!newValue.IsEmpty()) {
+      newValue.Append(',');
+    }
+    newValue.Append(host);
+  }
+  Preferences::SetCString("security.tls.insecure_fallback_hosts", newValue);
+  return NS_OK;
+}
+
+void nsSSLIOLayerHelpers::removeInsecureFallbackSite(const nsACString& hostname,
+                                                     uint16_t port) {
+  forgetIntolerance(hostname, port);
+  {
+    MutexAutoLock lock(mutex);
+    if (!mInsecureFallbackSites.Contains(hostname)) {
+      return;
+    }
+    mInsecureFallbackSites.RemoveEntry(hostname);
+  }
+  if (!isPublic()) {
+    return;
+  }
+  RefPtr runnable = MakeRefPtr<FallbackPrefRemover>(hostname);
+  if (NS_IsMainThread()) {
+    runnable->Run();
+  } else {
+    NS_DispatchToMainThread(runnable);
+  }
+}
+
+bool nsSSLIOLayerHelpers::isInsecureFallbackSite(const nsACString& hostname) {
+  MutexAutoLock lock(mutex);
+  return mInsecureFallbackSites.Contains(hostname);
+}
+
+nsresult nsSSLIOLayerNewSocket(int32_t family, const char* host, int32_t port,
+                               nsIProxyInfo* proxy,
+                               const OriginAttributes& originAttributes,
+                               PRFileDesc** fd,
+                               nsITLSSocketControl** tlsSocketControl,
+                               bool forSTARTTLS, uint32_t flags,
+                               uint32_t tlsFlags) {
+  PRFileDesc* sock = PR_OpenTCPSocket(family);
+  if (!sock) return NS_ERROR_OUT_OF_MEMORY;
+
+  nsresult rv =
+      nsSSLIOLayerAddToSocket(family, host, port, proxy, originAttributes, sock,
+                              tlsSocketControl, forSTARTTLS, flags, tlsFlags);
+  if (NS_FAILED(rv)) {
+    PR_Close(sock);
+    return rv;
+  }
+
+  *fd = sock;
+  return NS_OK;
+}
+
+static PRFileDesc* nsSSLIOLayerImportFD(PRFileDesc* fd,
+                                        NSSSocketControl* infoObject,
+                                        const char* host, bool haveHTTPSProxy) {
+  PRFileDesc* sslSock = SSL_ImportFD(nullptr, fd);
+  if (!sslSock) {
+    return nullptr;
+  }
+  if (SSL_HandshakeCallback(sslSock, HandshakeCallback, infoObject) !=
+      SECSuccess) {
+    return nullptr;
+  }
+  if (SSL_SetCanFalseStartCallback(sslSock, CanFalseStartCallback,
+                                   infoObject) != SECSuccess) {
+    return nullptr;
+  }
+
+  uint32_t flags = infoObject->GetProviderFlags();
+  SSLGetClientAuthData clientAuthDataHook = SSLGetClientAuthDataHook;
+  if (flags & nsISocketProvider::ANONYMOUS_CONNECT && !haveHTTPSProxy &&
+      !(flags & nsISocketProvider::ANONYMOUS_CONNECT_ALLOW_CLIENT_CERT)) {
+    clientAuthDataHook = nullptr;
+  }
+  if (SSL_GetClientAuthDataHook(sslSock, clientAuthDataHook, infoObject) !=
+      SECSuccess) {
+    return nullptr;
+  }
+
+  if (SSL_AuthCertificateHook(sslSock, AuthCertificateHook, infoObject) !=
+      SECSuccess) {
+    return nullptr;
+  }
+  if (SSL_SetURL(sslSock, host) != SECSuccess) {
+    return nullptr;
+  }
+
+  return sslSock;
+}
+
+static const SSLSignatureScheme sEnabledSignatureSchemes[] = {
+#define SCHEME(NAME, _) NAME,
+
+    FOR_EACH_ENABLED_SIGNATURE_SCHEME(SCHEME)
+
+#undef SCHEME
+};
+
+enum CertificateCompressionAlgorithms {
+  zlib = 0x01,
+  brotli = 0x02,
+  zstd = 0x03
+};
+
+void GatherCertificateCompressionTelemetry(SECStatus rv,
+                                           CertificateCompressionAlgorithms alg,
+                                           PRUint64 actualCertLen,
+                                           PRUint64 encodedCertLen) {
+  nsAutoCString decoder;
+
+  switch (alg) {
+    case zlib:
+      decoder.AssignLiteral("zlib");
+      break;
+    case brotli:
+      decoder.AssignLiteral("brotli");
+      break;
+    case zstd:
+      decoder.AssignLiteral("zstd");
+      break;
+  }
+
+  if (rv != SECSuccess) {
+
+    return;
+  }
+
+}
+
+SECStatus abridgedCertificatePass1Decode(const SECItem* input,
+                                         unsigned char* output,
+                                         size_t outputLen, size_t* usedLen) {
+  if (!input || !input->data || input->len == 0 || !output || outputLen == 0) {
+    PR_SetError(SEC_ERROR_INVALID_ARGS, 0);
+    return SECFailure;
+  }
+  if (NS_FAILED(mozilla::psm::abridged_certs::decompress(
+          input->data, input->len, output, outputLen, usedLen))) {
+    PR_SetError(SEC_ERROR_BAD_DATA, 0);
+    return SECFailure;
+  }
+  return SECSuccess;
+}
+
+SECStatus abridgedCertificateDecode(const SECItem* input, unsigned char* output,
+                                    size_t outputLen, size_t* usedLen) {
+  if (!input || !input->data || input->len == 0 || !output || outputLen == 0) {
+    MOZ_LOG(gPIPNSSLog, LogLevel::Error,
+            ("AbridgedCerts: Invalid arguments passed to "
+             "abridgedCertificateDecode"));
+    PR_SetError(SEC_ERROR_INVALID_ARGS, 0);
+    return SECFailure;
+  }
+  UniqueSECItem tempBuffer(::SECITEM_AllocItem(nullptr, nullptr, outputLen));
+  if (!tempBuffer) {
+    PR_SetError(SEC_ERROR_NO_MEMORY, 0);
+    return SECFailure;
+  }
+  size_t tempUsed;
+  SECStatus rv = brotliCertificateDecode(input, tempBuffer->data,
+                                         (size_t)tempBuffer->len, &tempUsed);
+  if (rv != SECSuccess) {
+    MOZ_LOG(gPIPNSSLog, LogLevel::Error,
+            ("AbridgedCerts: Brotli Decoder failed"));
+    return rv;
+  }
+  tempBuffer->len = tempUsed;
+  return abridgedCertificatePass1Decode(tempBuffer.get(), output, outputLen,
+                                        usedLen);
+}
+
+SECStatus zlibCertificateDecode(const SECItem* input, unsigned char* output,
+                                size_t outputLen, size_t* usedLen) {
+  SECStatus rv = SECFailure;
+  if (!input || !input->data || input->len == 0 || !output || outputLen == 0) {
+    PR_SetError(SEC_ERROR_INVALID_ARGS, 0);
+    return rv;
+  }
+
+  z_stream strm = {};
+
+  if (inflateInit(&strm) != Z_OK) {
+    PR_SetError(SEC_ERROR_LIBRARY_FAILURE, 0);
+    return rv;
+  }
+
+  auto cleanup = MakeScopeExit([&] {
+    GatherCertificateCompressionTelemetry(rv, zlib, *usedLen, input->len);
+    (void)inflateEnd(&strm);
+  });
+
+  strm.avail_in = input->len;
+  strm.next_in = input->data;
+
+  strm.avail_out = outputLen;
+  strm.next_out = output;
+
+  int ret = inflate(&strm, Z_FINISH);
+  bool ok = ret == Z_STREAM_END && strm.avail_in == 0 && strm.avail_out == 0;
+  if (!ok) {
+    PR_SetError(SEC_ERROR_BAD_DATA, 0);
+    return rv;
+  }
+
+  *usedLen = strm.total_out;
+  rv = SECSuccess;
+  return rv;
+}
+
+SECStatus brotliCertificateDecode(const SECItem* input, unsigned char* output,
+                                  size_t outputLen, size_t* usedLen) {
+  SECStatus rv = SECFailure;
+
+  if (!input || !input->data || input->len == 0 || !output || outputLen == 0) {
+    PR_SetError(SEC_ERROR_INVALID_ARGS, 0);
+    return rv;
+  }
+
+  auto cleanup = MakeScopeExit([&] {
+    GatherCertificateCompressionTelemetry(rv, brotli, *usedLen, input->len);
+  });
+
+  size_t uncompressedSize = outputLen;
+  BrotliDecoderResult result = BrotliDecoderDecompress(
+      input->len, input->data, &uncompressedSize, output);
+
+  if (result != BROTLI_DECODER_RESULT_SUCCESS) {
+    PR_SetError(SEC_ERROR_BAD_DATA, 0);
+    return rv;
+  }
+
+  *usedLen = uncompressedSize;
+  rv = SECSuccess;
+  return rv;
+}
+
+SECStatus zstdCertificateDecode(const SECItem* input, unsigned char* output,
+                                size_t outputLen, size_t* usedLen) {
+  SECStatus rv = SECFailure;
+
+  if (!input || !input->data || input->len == 0 || !output || outputLen == 0) {
+    PR_SetError(SEC_ERROR_INVALID_ARGS, 0);
+    return rv;
+  }
+
+  auto cleanup = MakeScopeExit([&] {
+    GatherCertificateCompressionTelemetry(rv, zstd, *usedLen, input->len);
+  });
+
+  size_t result = ZSTD_decompress(output, outputLen, input->data, input->len);
+
+  if (ZSTD_isError(result)) {
+    PR_SetError(SEC_ERROR_BAD_DATA, 0);
+    return rv;
+  }
+
+  *usedLen = result;
+  rv = SECSuccess;
+  return rv;
+}
+
+static nsresult nsSSLIOLayerSetOptions(PRFileDesc* fd, bool forSTARTTLS,
+                                       bool haveProxy, const char* host,
+                                       int32_t port,
+                                       NSSSocketControl* infoObject) {
+  if (forSTARTTLS || haveProxy) {
+    if (SECSuccess != SSL_OptionSet(fd, SSL_SECURITY, false)) {
+      return NS_ERROR_FAILURE;
+    }
+  }
+
+  SSLVersionRange range;
+  if (SSL_VersionRangeGet(fd, &range) != SECSuccess) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (SECSuccess != SSL_OptionSet(fd, SSL_ENABLE_TLS13_COMPAT_MODE, PR_TRUE)) {
+    MOZ_LOG(gPIPNSSLog, LogLevel::Error,
+            ("[%p] nsSSLIOLayerSetOptions: Setting compat mode failed\n", fd));
+  }
+
+  uint32_t versionFlags =
+      getTLSProviderFlagMaxVersion(infoObject->GetProviderTlsFlags());
+  if (versionFlags) {
+    MOZ_LOG(
+        gPIPNSSLog, LogLevel::Debug,
+        ("[%p] nsSSLIOLayerSetOptions: version flags %d\n", fd, versionFlags));
+    if (versionFlags == kTLSProviderFlagMaxVersion10) {
+      range.max = SSL_LIBRARY_VERSION_TLS_1_0;
+    } else if (versionFlags == kTLSProviderFlagMaxVersion11) {
+      range.max = SSL_LIBRARY_VERSION_TLS_1_1;
+    } else if (versionFlags == kTLSProviderFlagMaxVersion12) {
+      range.max = SSL_LIBRARY_VERSION_TLS_1_2;
+    } else if (versionFlags == kTLSProviderFlagMaxVersion13) {
+      range.max = SSL_LIBRARY_VERSION_TLS_1_3;
+    } else {
+      MOZ_LOG(gPIPNSSLog, LogLevel::Error,
+              ("[%p] nsSSLIOLayerSetOptions: unknown version flags %d\n", fd,
+               versionFlags));
+    }
+  }
+
+  if ((infoObject->GetProviderFlags() & nsISocketProvider::BE_CONSERVATIVE) &&
+      (range.max > SSL_LIBRARY_VERSION_TLS_1_2)) {
+    MOZ_LOG(gPIPNSSLog, LogLevel::Debug,
+            ("[%p] nsSSLIOLayerSetOptions: range.max limited to 1.2 due to "
+             "BE_CONSERVATIVE flag\n",
+             fd));
+    range.max = SSL_LIBRARY_VERSION_TLS_1_2;
+  }
+
+  uint16_t maxEnabledVersion = range.max;
+  infoObject->AdjustForTLSIntolerance(range);
+  MOZ_LOG(
+      gPIPNSSLog, LogLevel::Debug,
+      ("[%p] nsSSLIOLayerSetOptions: using TLS version range (0x%04x,0x%04x)\n",
+       fd, static_cast<unsigned int>(range.min),
+       static_cast<unsigned int>(range.max)));
+
+  if (range.min > range.max) {
+    range.min = range.max;
+  }
+
+  if (SSL_VersionRangeSet(fd, &range) != SECSuccess) {
+    return NS_ERROR_FAILURE;
+  }
+  infoObject->SetTLSVersionRange(range);
+
+  if (range.max < maxEnabledVersion) {
+    MOZ_LOG(gPIPNSSLog, LogLevel::Debug,
+            ("[%p] nsSSLIOLayerSetOptions: enabling TLS_FALLBACK_SCSV\n", fd));
+    if (range.max < SSL_LIBRARY_VERSION_TLS_1_2) {
+      if (SECSuccess != SSL_OptionSet(fd, SSL_ENABLE_FALLBACK_SCSV, true)) {
+        return NS_ERROR_FAILURE;
+      }
+    }
+    if (SECSuccess != SSL_SetDowngradeCheckVersion(fd, maxEnabledVersion)) {
+      return NS_ERROR_FAILURE;
+    }
+  }
+
+  if (range.max >= SSL_LIBRARY_VERSION_TLS_1_3 &&
+      !(infoObject->GetProviderFlags() & (nsISocketProvider::BE_CONSERVATIVE |
+                                          nsISocketProvider::DONT_TRY_ECH)) &&
+      StaticPrefs::security_tls_ech_grease_probability()) {
+    if ((RandomUint64().valueOr(0) % 100) >=
+        100 - StaticPrefs::security_tls_ech_grease_probability()) {
+      MOZ_LOG(gPIPNSSLog, LogLevel::Debug,
+              ("[%p] nsSSLIOLayerSetOptions: enabling TLS ECH Grease\n", fd));
+      if (SECSuccess != SSL_EnableTls13GreaseEch(fd, PR_TRUE)) {
+        return NS_ERROR_FAILURE;
+      }
+      if (SECSuccess !=
+          SSL_SetTls13GreaseEchSize(
+              fd, std::clamp(StaticPrefs::security_tls_ech_grease_size(), 1U,
+                             255U))) {
+        return NS_ERROR_FAILURE;
+      }
+      infoObject->UpdateEchExtensionStatus(EchExtensionStatus::kGREASE);
+    }
+  }
+
+  unsigned int additional_shares =
+      StaticPrefs::security_tls_client_hello_send_p256_keyshare();
+  if (StaticPrefs::security_tls_enable_kyber() &&
+      range.max >= SSL_LIBRARY_VERSION_TLS_1_3) {
+    const SSLNamedGroup namedGroups[] = {
+        ssl_grp_kem_mlkem768x25519, ssl_grp_ec_curve25519, ssl_grp_ec_secp256r1,
+        ssl_grp_ec_secp384r1,       ssl_grp_ec_secp521r1,  ssl_grp_ffdhe_2048,
+        ssl_grp_ffdhe_3072};
+    if (SECSuccess !=
+        SSL_NamedGroupConfig(fd, namedGroups, std::size(namedGroups))) {
+      return NS_ERROR_FAILURE;
+    }
+    additional_shares += 1;
+  } else {
+    const SSLNamedGroup namedGroups[] = {
+        ssl_grp_ec_curve25519, ssl_grp_ec_secp256r1, ssl_grp_ec_secp384r1,
+        ssl_grp_ec_secp521r1,  ssl_grp_ffdhe_2048,   ssl_grp_ffdhe_3072};
+    if (SECSuccess !=
+        SSL_NamedGroupConfig(fd, namedGroups, std::size(namedGroups))) {
+      return NS_ERROR_FAILURE;
+    }
+  }
+
+  if (SECSuccess != SSL_SendAdditionalKeyShares(fd, additional_shares)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (range.max >= SSL_LIBRARY_VERSION_TLS_1_3 &&
+      !(infoObject->GetProviderFlags() &
+        (nsISocketProvider::BE_CONSERVATIVE | nsISocketProvider::IS_RETRY))) {
+    SSLCertificateCompressionAlgorithm zlibAlg = {1, "zlib", nullptr,
+                                                  zlibCertificateDecode};
+
+    SSLCertificateCompressionAlgorithm brotliAlg = {2, "brotli", nullptr,
+                                                    brotliCertificateDecode};
+
+    SSLCertificateCompressionAlgorithm zstdAlg = {3, "zstd", nullptr,
+                                                  zstdCertificateDecode};
+
+    SSLCertificateCompressionAlgorithm abridgedAlg = {
+        0xab00, "abridged-00", nullptr, abridgedCertificateDecode};
+
+    if (StaticPrefs::security_tls_enable_certificate_compression_zlib() &&
+        SSL_SetCertificateCompressionAlgorithm(fd, zlibAlg) != SECSuccess) {
+      return NS_ERROR_FAILURE;
+    }
+
+    if (StaticPrefs::security_tls_enable_certificate_compression_brotli() &&
+        SSL_SetCertificateCompressionAlgorithm(fd, brotliAlg) != SECSuccess) {
+      return NS_ERROR_FAILURE;
+    }
+
+    if (StaticPrefs::security_tls_enable_certificate_compression_zstd() &&
+        SSL_SetCertificateCompressionAlgorithm(fd, zstdAlg) != SECSuccess) {
+      return NS_ERROR_FAILURE;
+    }
+
+    if (StaticPrefs::security_tls_enable_certificate_compression_abridged() &&
+        mozilla::psm::abridged_certs::certs_are_available() &&
+        SSL_SetCertificateCompressionAlgorithm(fd, abridgedAlg) != SECSuccess) {
+      return NS_ERROR_FAILURE;
+    }
+  }
+
+  if (SECSuccess !=
+      SSL_SignatureSchemePrefSet(fd, sEnabledSignatureSchemes,
+                                 std::size(sEnabledSignatureSchemes))) {
+    return NS_ERROR_FAILURE;
+  }
+
+  bool enabled = StaticPrefs::security_ssl_enable_ocsp_stapling();
+  if (SECSuccess != SSL_OptionSet(fd, SSL_ENABLE_OCSP_STAPLING, enabled)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  bool sctsEnabled = GetCertificateTransparencyMode() !=
+                     CertVerifier::CertificateTransparencyMode::Disabled;
+  if (SECSuccess !=
+      SSL_OptionSet(fd, SSL_ENABLE_SIGNED_CERT_TIMESTAMPS, sctsEnabled)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (SECSuccess != SSL_OptionSet(fd, SSL_HANDSHAKE_AS_CLIENT, true)) {
+    return NS_ERROR_FAILURE;
+  }
+
+#if defined(__arm__)
+  if (!mozilla::supports_arm_aes()) {
+    unsigned int enabledCiphers = 0;
+    std::vector<uint16_t> ciphers(SSL_GetNumImplementedCiphers());
+
+    if (SSL_CipherSuiteOrderGet(fd, ciphers.data(), &enabledCiphers) !=
+        SECSuccess) {
+      return NS_ERROR_FAILURE;
+    }
+
+    if (enabledCiphers > 1) {
+      if (ciphers[0] != TLS_CHACHA20_POLY1305_SHA256 &&
+          ciphers[1] == TLS_CHACHA20_POLY1305_SHA256) {
+        std::swap(ciphers[0], ciphers[1]);
+
+        if (SSL_CipherSuiteOrderSet(fd, ciphers.data(), enabledCiphers) !=
+            SECSuccess) {
+          return NS_ERROR_FAILURE;
+        }
+      }
+    }
+  }
+#endif
+
+  nsAutoCString peerId;
+  infoObject->GetPeerId(peerId);
+  if (SECSuccess != SSL_SetSockPeerID(fd, peerId.get())) {
+    return NS_ERROR_FAILURE;
+  }
+
+  uint32_t flags = infoObject->GetProviderFlags();
+  if (flags & nsISocketProvider::NO_PERMANENT_STORAGE) {
+    if (SECSuccess != SSL_OptionSet(fd, SSL_ENABLE_SESSION_TICKETS, false) ||
+        SECSuccess != SSL_OptionSet(fd, SSL_NO_CACHE, true)) {
+      return NS_ERROR_FAILURE;
+    }
+  }
+
+  return NS_OK;
+}
+
+SECStatus StoreResumptionToken(PRFileDesc* fd, const PRUint8* resumptionToken,
+                               unsigned int len, void* ctx) {
+  PRIntn val;
+  if (SSL_OptionGet(fd, SSL_ENABLE_SESSION_TICKETS, &val) != SECSuccess ||
+      val == 0) {
+    return SECFailure;
+  }
+
+  NSSSocketControl* infoObject = (NSSSocketControl*)ctx;
+  if (!infoObject) {
+    return SECFailure;
+  }
+
+  nsAutoCString peerId;
+  infoObject->GetPeerId(peerId);
+  if (NS_FAILED(
+          net::SSLTokensCache::Put(peerId, resumptionToken, len, infoObject))) {
+    return SECFailure;
+  }
+
+  return SECSuccess;
+}
+
+nsresult nsSSLIOLayerAddToSocket(int32_t family, const char* host, int32_t port,
+                                 nsIProxyInfo* proxy,
+                                 const OriginAttributes& originAttributes,
+                                 PRFileDesc* fd,
+                                 nsITLSSocketControl** tlsSocketControl,
+                                 bool forSTARTTLS, uint32_t providerFlags,
+                                 uint32_t providerTlsFlags) {
+  RefPtr<nsSSLIOLayerHelpers> sslIOLayerHelpers;
+  if (providerTlsFlags) {
+    sslIOLayerHelpers =
+        new nsSSLIOLayerHelpers(PublicOrPrivate::Public, providerTlsFlags);
+    sslIOLayerHelpers->Init();
+  } else {
+    bool isPrivate = providerFlags & nsISocketProvider::NO_PERMANENT_STORAGE ||
+                     originAttributes.IsPrivateBrowsing();
+    sslIOLayerHelpers =
+        isPrivate ? PrivateSSLIOLayerHelpers() : PublicSSLIOLayerHelpers();
+  }
+
+  RefPtr<NSSSocketControl> infoObject(new NSSSocketControl(
+      nsDependentCString(host), port, sslIOLayerHelpers.forget(), providerFlags,
+      providerTlsFlags));
+  if (!infoObject) {
+    return NS_ERROR_FAILURE;
+  }
+
+  infoObject->SetForSTARTTLS(forSTARTTLS);
+  infoObject->SetOriginAttributes(originAttributes);
+
+  bool haveProxy = false;
+  bool haveHTTPSProxy = false;
+  if (proxy) {
+    nsAutoCString proxyHost;
+    nsresult rv = proxy->GetHost(proxyHost);
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+    haveProxy = !proxyHost.IsEmpty();
+    nsAutoCString type;
+    haveHTTPSProxy = haveProxy && NS_SUCCEEDED(proxy->GetType(type)) &&
+                     type.EqualsLiteral("https");
+  }
+
+  PRFileDesc* plaintextLayer =
+      PR_CreateIOLayerStub(nsSSLIOLayerHelpers::nsSSLPlaintextLayerIdentity,
+                           &nsSSLIOLayerHelpers::nsSSLPlaintextLayerMethods);
+  if (!plaintextLayer) {
+    return NS_ERROR_FAILURE;
+  }
+  plaintextLayer->secret = (PRFilePrivate*)infoObject.get();
+  if (PR_PushIOLayer(fd, PR_TOP_IO_LAYER, plaintextLayer) != PR_SUCCESS) {
+    plaintextLayer->dtor(plaintextLayer);
+    return NS_ERROR_FAILURE;
+  }
+  auto plaintextLayerCleanup = MakeScopeExit([&fd] {
+    PRFileDesc* plaintextLayer =
+        PR_PopIOLayer(fd, nsSSLIOLayerHelpers::nsSSLPlaintextLayerIdentity);
+    if (plaintextLayer) {
+      plaintextLayer->dtor(plaintextLayer);
+    }
+  });
+
+  PRFileDesc* sslSock =
+      nsSSLIOLayerImportFD(fd, infoObject, host, haveHTTPSProxy);
+  if (!sslSock) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsresult rv = nsSSLIOLayerSetOptions(sslSock, forSTARTTLS, haveProxy, host,
+                                       port, infoObject);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  PRFileDesc* layer =
+      PR_CreateIOLayerStub(nsSSLIOLayerHelpers::nsSSLIOLayerIdentity,
+                           &nsSSLIOLayerHelpers::nsSSLIOLayerMethods);
+  if (!layer) {
+    return NS_ERROR_FAILURE;
+  }
+  layer->secret = (PRFilePrivate*)do_AddRef(infoObject).take();
+
+  if (PR_PushIOLayer(sslSock, PR_GetLayersIdentity(sslSock), layer) !=
+      PR_SUCCESS) {
+    layer->dtor(layer);
+    return NS_ERROR_FAILURE;
+  }
+  auto layerCleanup = MakeScopeExit([&fd] {
+    PRFileDesc* layer =
+        PR_PopIOLayer(fd, nsSSLIOLayerHelpers::nsSSLIOLayerIdentity);
+    if (layer) {
+      layer->dtor(layer);
+    }
+  });
+
+  if (forSTARTTLS || haveProxy) {
+    infoObject->SetHandshakeNotPending();
+  }
+
+  rv = infoObject->SetResumptionTokenFromExternalCache(sslSock);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+  if (SSL_SetResumptionTokenCallback(sslSock, &StoreResumptionToken,
+                                     infoObject) != SECSuccess) {
+    return NS_ERROR_FAILURE;
+  }
+
+  MOZ_LOG(gPIPNSSLog, LogLevel::Debug, ("[%p] Socket set up", (void*)sslSock));
+
+  (void)infoObject->SetFileDescPtr(sslSock);
+  layerCleanup.release();
+  plaintextLayerCleanup.release();
+  *tlsSocketControl = infoObject.forget().take();
+  return NS_OK;
+}
+
+extern "C" {
+
+const uint8_t kIPCClientCertsObjectTypeCert = 1;
+const uint8_t kIPCClientCertsObjectTypeRSAKey = 2;
+const uint8_t kIPCClientCertsObjectTypeECKey = 3;
+
+void DoFindObjects(FindObjectsCallback cb, void* ctx) {
+  net::SocketProcessChild* socketChild =
+      net::SocketProcessChild::GetSingleton();
+  if (!socketChild) {
+    return;
+  }
+
+  RefPtr<IPCClientCertsChild> ipcClientCertsActor(
+      socketChild->GetIPCClientCertsActor());
+  if (!ipcClientCertsActor) {
+    return;
+  }
+  nsTArray<IPCClientCertObject> objects;
+  if (!ipcClientCertsActor->SendFindObjects(&objects)) {
+    return;
+  }
+  for (const auto& object : objects) {
+    switch (object.type()) {
+      case IPCClientCertObject::TECKey:
+        cb(kIPCClientCertsObjectTypeECKey, object.get_ECKey().params().Length(),
+           object.get_ECKey().params().Elements(),
+           object.get_ECKey().cert().Length(),
+           object.get_ECKey().cert().Elements(), ctx);
+        break;
+      case IPCClientCertObject::TRSAKey:
+        cb(kIPCClientCertsObjectTypeRSAKey,
+           object.get_RSAKey().modulus().Length(),
+           object.get_RSAKey().modulus().Elements(),
+           object.get_RSAKey().cert().Length(),
+           object.get_RSAKey().cert().Elements(), ctx);
+        break;
+      case IPCClientCertObject::TCertificate:
+        cb(kIPCClientCertsObjectTypeCert,
+           object.get_Certificate().der().Length(),
+           object.get_Certificate().der().Elements(), 0, nullptr, ctx);
+        break;
+      default:
+        MOZ_ASSERT_UNREACHABLE("unhandled IPCClientCertObject type");
+        break;
+    }
+  }
+}
+
+void DoSign(size_t cert_len, const uint8_t* cert, size_t data_len,
+            const uint8_t* data, size_t params_len, const uint8_t* params,
+            SignCallback cb, void* ctx) {
+  net::SocketProcessChild* socketChild =
+      net::SocketProcessChild::GetSingleton();
+  if (!socketChild) {
+    return;
+  }
+
+  RefPtr<IPCClientCertsChild> ipcClientCertsActor(
+      socketChild->GetIPCClientCertsActor());
+  if (!ipcClientCertsActor) {
+    return;
+  }
+  ByteArray certBytes(nsTArray<uint8_t>(cert, cert_len));
+  ByteArray dataBytes(nsTArray<uint8_t>(data, data_len));
+  ByteArray paramsBytes(nsTArray<uint8_t>(params, params_len));
+  ByteArray signature;
+  if (!ipcClientCertsActor->SendSign(certBytes, dataBytes, paramsBytes,
+                                     &signature)) {
+    return;
+  }
+  cb(signature.data().Length(), signature.data().Elements(), ctx);
+}
+
+}  

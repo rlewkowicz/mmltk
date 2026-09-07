@@ -1,0 +1,119 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_BodyConsumer_h
+#define mozilla_dom_BodyConsumer_h
+
+#include "mozilla/GlobalFreezeObserver.h"
+#include "mozilla/GlobalTeardownObserver.h"
+#include "mozilla/dom/AbortFollower.h"
+#include "mozilla/dom/MutableBlobStorage.h"
+#include "nsIInputStreamPump.h"
+
+class nsIThread;
+
+namespace mozilla::dom {
+
+class Promise;
+class ThreadSafeWorkerRef;
+
+class BodyConsumer final : public AbortFollower,
+                           public GlobalTeardownObserver,
+                           public GlobalFreezeObserver {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+
+  enum class ConsumeType {
+    ArrayBuffer,
+    Blob,
+    Bytes,
+    FormData,
+    JSON,
+    Text,
+  };
+
+  static already_AddRefed<Promise> Create(
+      nsIGlobalObject* aGlobal, nsISerialEventTarget* aMainThreadEventTarget,
+      nsIInputStream* aBodyStream, AbortSignalImpl* aSignalImpl,
+      ConsumeType aType, BlobImpl* aBodyBlobImpl,
+      const nsAString& aBodyLocalPath, const nsACString& aBodyMimeType,
+      const nsACString& aMixedCaseMimeType,
+      MutableBlobStorage::MutableBlobStorageType aBlobStorageType,
+      ErrorResult& aRv);
+
+  void ReleaseObject();
+
+  void BeginConsumeBodyMainThread(ThreadSafeWorkerRef* aWorkerRef);
+
+  void OnBlobResult(BlobImpl* aBlobImpl,
+                    ThreadSafeWorkerRef* aWorkerRef = nullptr);
+
+  void ContinueConsumeBody(nsresult aStatus, uint32_t aResultLength,
+                           uint8_t* aResult, bool aShuttingDown = false);
+
+  void ContinueConsumeBlobBody(BlobImpl* aBlobImpl, bool aShuttingDown = false);
+
+  void DispatchContinueConsumeBlobBody(BlobImpl* aBlobImpl,
+                                       ThreadSafeWorkerRef* aWorkerRef);
+
+  void ShutDownMainThreadConsuming();
+
+  void NullifyConsumeBodyPump() {
+    mShuttingDown = true;
+    mConsumeBodyPump = nullptr;
+  }
+
+  void RunAbortAlgorithm() override;
+
+ private:
+  BodyConsumer(nsISerialEventTarget* aMainThreadEventTarget,
+               nsIGlobalObject* aGlobalObject, nsIInputStream* aBodyStream,
+               Promise* aPromise, ConsumeType aType, BlobImpl* aBodyBlobImpl,
+               const nsAString& aBodyLocalPath, const nsACString& aBodyMimeType,
+               const nsACString& aMixedCaseMimeType,
+               MutableBlobStorage::MutableBlobStorageType aBlobStorageType);
+
+  ~BodyConsumer();
+
+  nsresult GetBodyLocalFile(nsIFile** aFile) const;
+
+  void AssertIsOnTargetThread() const;
+
+  void MaybeAbortConsumption();
+
+  void DisconnectFromOwner() override {
+    MaybeAbortConsumption();
+    GlobalTeardownObserver::DisconnectFromOwner();
+  }
+  void FrozenCallback(nsIGlobalObject* aGlobal) override {
+    MaybeAbortConsumption();
+  }
+
+  nsCOMPtr<nsIThread> mTargetThread;
+  nsCOMPtr<nsISerialEventTarget> mMainThreadEventTarget;
+
+  nsCOMPtr<nsIInputStream> mBodyStream;
+
+  MutableBlobStorage::MutableBlobStorageType mBlobStorageType;
+  nsCString mBodyMimeType;
+  nsCString mMixedCaseMimeType;
+
+  RefPtr<BlobImpl> mBodyBlobImpl;
+  nsString mBodyLocalPath;
+
+  nsCOMPtr<nsIGlobalObject> mGlobal;
+
+  nsCOMPtr<nsIInputStreamPump> mConsumeBodyPump;
+
+  ConsumeType mConsumeType;
+  RefPtr<Promise> mConsumePromise;
+
+  bool mBodyConsumed;
+
+  bool mShuttingDown;
+};
+
+}  
+
+#endif  // mozilla_dom_BodyConsumer_h

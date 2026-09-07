@@ -1,0 +1,104 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_APZSampler_h
+#define mozilla_layers_APZSampler_h
+
+#include <unordered_map>
+
+#include "apz/src/APZCTreeManager.h"
+#include "base/platform_thread.h"  // for PlatformThreadId
+#include "mozilla/layers/APZUtils.h"
+#include "mozilla/layers/SampleTime.h"
+#include "mozilla/StaticMutex.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/webrender/WebRenderTypes.h"
+#include "Units.h"
+#include "VsyncSource.h"
+
+namespace mozilla {
+
+class TimeStamp;
+
+namespace wr {
+struct Transaction;
+class TransactionWrapper;
+struct WrWindowId;
+}  
+
+namespace layers {
+
+struct ScrollbarData;
+
+class APZSampler {
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(APZSampler)
+
+ public:
+  APZSampler(const RefPtr<APZCTreeManager>& aApz, bool aIsUsingWebRender);
+
+  void Destroy();
+
+  void SetWebRenderWindowId(const wr::WindowId& aWindowId);
+
+  static void SetSamplerThread(const wr::WrWindowId& aWindowId);
+  static void SampleForWebRender(const wr::WrWindowId& aWindowId,
+                                 const uint64_t* aGeneratedFrameId,
+                                 wr::Transaction* aTransaction);
+
+  void SetSampleTime(const SampleTime& aSampleTime);
+  void SampleForWebRender(const Maybe<VsyncId>& aGeneratedFrameId,
+                          wr::TransactionWrapper& aTxn);
+
+  AsyncTransform GetCurrentAsyncTransform(
+      const LayersId& aLayersId, const ScrollableLayerGuid::ViewID& aScrollId,
+      AsyncTransformComponents aComponents,
+      const MutexAutoLock& aProofOfMapLock) const;
+
+  ParentLayerRect GetCompositionBounds(
+      const LayersId& aLayersId, const ScrollableLayerGuid::ViewID& aScrollId,
+      const MutexAutoLock& aProofOfMapLock) const;
+
+  struct ScrollOffsetAndRange {
+    CSSPoint mOffset;
+    CSSRect mRange;
+  };
+  Maybe<ScrollOffsetAndRange> GetCurrentScrollOffsetAndRange(
+      const LayersId& aLayersId, const ScrollableLayerGuid::ViewID& aScrollId,
+      const MutexAutoLock& aProofOfMapLock) const;
+
+  void AssertOnSamplerThread() const;
+
+  bool IsSamplerThread() const;
+
+  template <typename Callback>
+  void CallWithMapLock(Callback& aCallback) {
+    mApz->CallWithMapLock(aCallback);
+  }
+
+ protected:
+  virtual ~APZSampler();
+
+  static already_AddRefed<APZSampler> GetSampler(
+      const wr::WrWindowId& aWindowId);
+
+ private:
+  RefPtr<APZCTreeManager> mApz;
+  bool mIsUsingWebRender;
+
+  static StaticMutex sWindowIdLock MOZ_UNANNOTATED;
+  static StaticAutoPtr<std::unordered_map<uint64_t, RefPtr<APZSampler>>>
+      sWindowIdMap;
+  Maybe<wr::WrWindowId> mWindowId;
+
+  mutable Mutex mThreadIdLock MOZ_UNANNOTATED;
+  Maybe<PlatformThreadId> mSamplerThreadId;
+
+  Mutex mSampleTimeLock MOZ_UNANNOTATED;
+  SampleTime mSampleTime;
+};
+
+}  
+}  
+
+#endif  // mozilla_layers_APZSampler_h

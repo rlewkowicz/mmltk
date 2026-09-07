@@ -1,0 +1,1138 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+ChromeUtils.defineESModuleGetters(this, {
+  BrowserUtils: "resource://gre/modules/BrowserUtils.sys.mjs",
+  ContentBlockingAllowList:
+    "resource://gre/modules/ContentBlockingAllowList.sys.mjs",
+  E10SUtils: "resource://gre/modules/E10SUtils.sys.mjs",
+  PanelMultiView:
+    "moz-src:///browser/components/customizableui/PanelMultiView.sys.mjs",
+  PlacesUtils: "resource://gre/modules/PlacesUtils.sys.mjs",
+  QWACs: "resource://gre/modules/psm/QWACs.sys.mjs",
+  SiteDataManager: "resource:///modules/SiteDataManager.sys.mjs",
+  UrlbarPrefs: "moz-src:///browser/components/urlbar/UrlbarPrefs.sys.mjs",
+});
+
+XPCOMUtils.defineLazyPreferenceGetter(
+  this,
+  "insecureConnectionTextEnabled",
+  "security.insecure_connection_text.enabled"
+);
+XPCOMUtils.defineLazyPreferenceGetter(
+  this,
+  "insecureConnectionTextPBModeEnabled",
+  "security.insecure_connection_text.pbmode.enabled"
+);
+XPCOMUtils.defineLazyPreferenceGetter(
+  this,
+  "httpsOnlyModeEnabled",
+  "dom.security.https_only_mode"
+);
+XPCOMUtils.defineLazyPreferenceGetter(
+  this,
+  "httpsFirstModeEnabled",
+  "dom.security.https_first"
+);
+XPCOMUtils.defineLazyPreferenceGetter(
+  this,
+  "schemelessHttpsFirstModeEnabled",
+  "dom.security.https_first_schemeless"
+);
+XPCOMUtils.defineLazyPreferenceGetter(
+  this,
+  "httpsFirstModeEnabledPBM",
+  "dom.security.https_first_pbm"
+);
+XPCOMUtils.defineLazyPreferenceGetter(
+  this,
+  "httpsOnlyModeEnabledPBM",
+  "dom.security.https_only_mode_pbm"
+);
+XPCOMUtils.defineLazyPreferenceGetter(
+  this,
+  "popupClickjackDelay",
+  "security.notification_enable_delay",
+  500
+);
+const ETP_ENABLED_ASSETS = {
+  label: "trustpanel-etp-label-enabled",
+  description: "trustpanel-etp-description-enabled",
+  header: "trustpanel-header-enabled",
+  innerDescription: "trustpanel-description-enabled2",
+};
+
+const ETP_DISABLED_ASSETS = {
+  label: "trustpanel-etp-label-disabled",
+  description: "trustpanel-etp-description-disabled",
+  header: "trustpanel-header-disabled",
+  innerDescription: "trustpanel-description-disabled",
+};
+
+class TrustPanel {
+  #state = null;
+  #secInfo = null;
+  #qwac = null;
+
+  #qwacStatusPromise = null;
+
+  #uri = null;
+  #uriHasHost = null;
+  #lastEvent = null;
+
+  #blockerViewUpdateId = 0;
+
+  #popupToggleDelayTimer = null;
+  #openingReason = null;
+
+  #blockers = {
+    SocialTracking,
+    ThirdPartyCookies,
+    TrackingProtection,
+    Fingerprinting,
+    Cryptomining,
+  };
+
+  init() {
+    for (let blocker of Object.values(this.#blockers)) {
+      if (blocker.init) {
+        blocker.init();
+      }
+    }
+
+  }
+
+  uninit() {
+    for (let blocker of Object.values(this.#blockers)) {
+      if (blocker.uninit) {
+        blocker.uninit();
+      }
+    }
+
+  }
+
+  get #popup() {
+    return document.getElementById("trustpanel-popup");
+  }
+
+  get #enabled() {
+    return UrlbarPrefs.get("trustPanel.featureGate");
+  }
+
+  handleProtectionsButtonEvent(event) {
+    event.stopPropagation();
+    if (
+      (event.type == "click" && event.button != 0) ||
+      (event.type == "keypress" &&
+        event.charCode != KeyEvent.DOM_VK_SPACE &&
+        event.keyCode != KeyEvent.DOM_VK_RETURN)
+    ) {
+      return; 
+    }
+
+    this.showPopup({ event, openingReason: "shieldButtonClicked" });
+  }
+
+  async onContentBlockingEvent(
+    event,
+    _webProgress,
+    _isSimulated,
+    _previousState
+  ) {
+    if (!this.#enabled || !this.#uri) {
+      return;
+    }
+
+    this.anyDetected = false;
+    this.#lastEvent = event;
+
+    this.hasException =
+      ContentBlockingAllowList.canHandle(window.gBrowser.selectedBrowser) &&
+      ContentBlockingAllowList.includes(window.gBrowser.selectedBrowser);
+
+    for (let blocker of Object.values(this.#blockers)) {
+      blocker.activated = blocker.isBlocking(event);
+      this.anyDetected = this.anyDetected || blocker.isDetected(event);
+    }
+
+    if (this.#popup) {
+      await this.#updatePopup();
+    }
+  }
+
+  #initializePopup() {
+    if (!this.#popup) {
+      let wrapper = document.getElementById("template-trustpanel-popup");
+      wrapper.replaceWith(wrapper.content);
+
+      document
+        .getElementById("trustpanel-popup-connection")
+        .addEventListener("click", event =>
+          this.#openSecurityInformationSubview(event)
+        );
+      document
+        .getElementById("trustpanel-blocker-see-all")
+        .addEventListener("click", event => this.#openBlockerSubview(event));
+      document
+        .getElementById("trustpanel-privacy-link")
+        .addEventListener("click", () => {
+          this.#hidePopup();
+          window.openTrustedLinkIn("about:preferences#privacy", "tab");
+        });
+      document
+        .getElementById("trustpanel-clear-cookies-button")
+        .addEventListener("command", event =>
+          this.#showClearCookiesSubview(event)
+        );
+      document
+        .getElementById("trustpanel-siteinformation-morelink")
+        .addEventListener("click", () => this.#showSecurityPopup());
+      document
+        .getElementById("trustpanel-clear-cookie-cancel")
+        .addEventListener("click", () => this.#hidePopup());
+      document
+        .getElementById("trustpanel-clear-cookie-clear")
+        .addEventListener("click", () => this.#clearSiteData());
+      document
+        .getElementById("trustpanel-toggle")
+        .addEventListener("click", () => this.#toggleTrackingProtection());
+      document
+        .getElementById("identity-popup-remove-cert-exception")
+        .addEventListener("click", () => this.#removeCertException());
+      document
+        .getElementById("trustpanel-popup-security-httpsonlymode-menulist")
+        .addEventListener("command", () => this.#changeHttpsOnlyPermission());
+
+      this.#popup.addEventListener("popupshown", this);
+      this.#popup.addEventListener("popuphidden", this);
+    }
+  }
+
+  async showPopup(opts = {}) {
+    this.#initializePopup();
+
+    if (this.#isSecureContext && !this.#qwacStatusPromise) {
+      let qwacStatusPromise = QWACs.determineQWACStatus(
+        this.#secInfo,
+        this.#uri,
+        gBrowser.selectedBrowser.browsingContext
+      ).then(result => {
+        if (qwacStatusPromise == this.#qwacStatusPromise && result) {
+          this.#qwac = result;
+          this.#updateSecurityInformationSubview();
+        }
+      });
+      this.#qwacStatusPromise = qwacStatusPromise;
+    }
+
+    await this.#updatePopup();
+
+    this.#openingReason = opts.reason;
+
+    PanelMultiView.openPopup(this.#popup, this.#anchor(), {
+      position: "bottomleft topleft",
+      triggerEvent: opts.event,
+    });
+
+  }
+
+  async #hidePopup() {
+    let hidden = new Promise(c => {
+      this.#popup.addEventListener("popuphidden", c, { once: true });
+    });
+    PanelMultiView.hidePopup(this.#popup);
+    await hidden;
+  }
+
+  updateIdentity(state, uri) {
+    if (!this.#enabled) {
+      return;
+    }
+    try {
+      this.#uriHasHost = !!uri.host;
+    } catch (ex) {
+      this.#uriHasHost = false;
+    }
+    this.#state = state;
+    this.#uri = uri;
+
+    this.#secInfo = gBrowser.securityUI.secInfo;
+    this.#qwac = null;
+    this.#qwacStatusPromise = null;
+
+  }
+
+  #anchor() {
+    let anchors = [
+      document.getElementById("trust-icon-container"),
+      document.getElementById("identity-icon-box"),
+    ];
+    return anchors.find(element => element.checkVisibility());
+  }
+
+  #updateUrlbarIcon() {
+    let icon = document.getElementById("trust-icon-container");
+    let targetClasses = new Set();
+    targetClasses.add(this.#isSecurePage() ? "secure" : "insecure");
+
+    if (!this.#trackingProtectionEnabled) {
+      targetClasses.add("inactive");
+    }
+    if (this.#isAboutNetErrorPage || this.#isCertUserOverridden) {
+      targetClasses.add("warning");
+    }
+
+    icon.className = "";
+
+    icon.classList.add(...targetClasses);
+    icon.setAttribute("tooltiptext", this.#tooltipText());
+    icon.classList.toggle("chickletShown", this.#isInternalSecurePage);
+  }
+
+  async #updatePopup() {
+    this.#popup.setAttribute("connection", this.#connectionState());
+    this.#popup.toggleAttribute("customroot", this.#hasCustomRoot());
+    this.#popup.setAttribute(
+      "tracking-protection",
+      this.#trackingProtectionStatus()
+    );
+
+    await this.#updateMainView();
+  }
+
+  async #updateMainView() {
+    let assets = this.#trackingProtectionEnabled
+      ? ETP_ENABLED_ASSETS
+      : ETP_DISABLED_ASSETS;
+
+    const graphicSection = document.getElementById(
+      "trustpanel-graphic-section"
+    );
+    graphicSection.hidden = false;
+
+    if (AppConstants.MOZ_PLACES && this.#uri) {
+      let favicon = await PlacesUtils.favicons.getFaviconForPage(this.#uri);
+      document.getElementById("trustpanel-popup-icon").src =
+        favicon?.uri.spec ?? "";
+    }
+
+    let toggle = document.getElementById("trustpanel-toggle");
+    toggle.toggleAttribute("pressed", this.#trackingProtectionEnabled);
+    document.l10n.setAttributes(
+      toggle,
+      this.#trackingProtectionEnabled
+        ? "trustpanel-etp-toggle-on"
+        : "trustpanel-etp-toggle-off",
+      { host: this.#host }
+    );
+
+    let hostElement = document.getElementById("trustpanel-popup-host");
+    hostElement.setAttribute("value", this.#host);
+    hostElement.setAttribute("tooltiptext", this.#host);
+
+    document.l10n.setAttributes(
+      document.getElementById("trustpanel-etp-label"),
+      assets.label
+    );
+    document.l10n.setAttributes(
+      document.getElementById("trustpanel-etp-description"),
+      assets.description
+    );
+    document.l10n.setAttributes(
+      document.getElementById("trustpanel-header"),
+      assets.header
+    );
+    document.l10n.setAttributes(
+      document.getElementById("trustpanel-description"),
+      assets.innerDescription
+    );
+    document.l10n.setAttributes(
+      document.getElementById("trustpanel-connection-label"),
+      this.#connectionLabel()
+    );
+
+    this.#updateAttribute(
+      document.getElementById("trustpanel-toggle-section"),
+      "disabled",
+      !ContentBlockingAllowList.canHandle(window.gBrowser.selectedBrowser)
+    );
+
+    const isPrivate = PrivateBrowsingUtils.isWindowPrivate(window);
+    this.#updateAttribute(
+      document.getElementById("trustpanel-clear-cookies-footer"),
+      "hidden",
+      isPrivate
+    );
+    if (!isPrivate) {
+      try {
+        let baseDomain = SiteDataManager.getBaseDomainFromHost(this.#uri.host);
+        SiteDataManager.hasSiteData(baseDomain).then(hasSiteData => {
+          this.#updateAttribute(
+            document.getElementById("trustpanel-clear-cookies-button"),
+            "disabled",
+            !hasSiteData
+          );
+        });
+      } catch (e) {}
+    }
+
+    this.#updateAttribute(
+      document.getElementById("trustpanel-toggle"),
+      "disabled",
+      !ContentBlockingAllowList.canHandle(window.gBrowser.selectedBrowser)
+    );
+
+    await this.#updateBlockerView();
+  }
+
+  async #updateBlockerView() {
+    const event = this.#lastEvent;
+    const updateId = ++this.#blockerViewUpdateId;
+
+    let count = 0;
+    let blocked = [];
+    let detected = [];
+
+    for (let blocker of Object.values(this.#blockers)) {
+      if (blocker.isBlocking(event)) {
+        blocked.push(blocker);
+        count += await blocker.getBlockerCount();
+      } else if (blocker.isDetected(event)) {
+        detected.push(blocker);
+      }
+    }
+
+    if (updateId !== this.#blockerViewUpdateId) {
+      return;
+    }
+
+    this.#addButtons("trustpanel-blocked", blocked, true);
+    this.#addButtons("trustpanel-detected", detected, false);
+
+
+    this.#updateAttribute(
+      document.getElementById("trustpanel-blocker-section"),
+      "hidden",
+      count === 0
+    );
+
+    document.l10n.setArgs(
+      document.getElementById("trustpanel-blocker-section-header"),
+      { count }
+    );
+  }
+
+  async #showSecurityPopup() {
+    await this.#hidePopup();
+    window.BrowserCommands.pageInfo(null, "securityTab");
+  }
+
+  #removeCertException() {
+    let overrideService = Cc["@mozilla.org/security/certoverride;1"].getService(
+      Ci.nsICertOverrideService
+    );
+    overrideService.clearValidityOverride(
+      this.#uri.host,
+      this.#uri.port > 0 ? this.#uri.port : 443,
+      gBrowser.contentPrincipal.originAttributes
+    );
+    BrowserCommands.reloadSkipCache();
+    PanelMultiView.hidePopup(this.#popup);
+  }
+
+  #trackingProtectionStatus() {
+    if (!this.#isSecurePage()) {
+      return "warning";
+    }
+    return this.#trackingProtectionEnabled ? "enabled" : "disabled";
+  }
+
+  #updateSecurityInformationSubview() {
+    document.l10n.setAttributes(
+      document.getElementById("trustpanel-securityInformationView"),
+      "trustpanel-site-information-header",
+      { host: this.#host }
+    );
+
+    let connection = this.#connectionState();
+    let mixedcontent = this.#mixedContentState();
+    let ciphers = this.#ciphersState();
+    let httpsOnlyStatus = this.#httpsOnlyState();
+
+    let elementIDs = [
+      "trustpanel-popup",
+      "identity-popup-securityView-extended-info",
+    ];
+
+    for (let id of elementIDs) {
+      let element = document.getElementById(id);
+      this.#updateAttribute(element, "connection", connection);
+      this.#updateAttribute(element, "ciphers", ciphers);
+      this.#updateAttribute(element, "mixedcontent", mixedcontent);
+      this.#updateAttribute(element, "isbroken", this.#isBrokenConnection);
+      element.toggleAttribute("customroot", this.#hasCustomRoot());
+      this.#updateAttribute(element, "httpsonlystatus", httpsOnlyStatus);
+    }
+
+    let { supplemental, owner, verifier } = this.#supplementalText();
+    document.getElementById("identity-popup-content-supplemental").textContent =
+      supplemental;
+    document.getElementById("identity-popup-content-verifier").textContent =
+      verifier;
+    document.getElementById("identity-popup-content-owner").textContent = owner;
+  }
+
+  #openSecurityInformationSubview(event) {
+    this.#updateSecurityInformationSubview();
+    document
+      .getElementById("trustpanel-popup-multiView")
+      .showSubView("trustpanel-securityInformationView", event.target);
+  }
+
+  async #openBlockerSubview(event) {
+    document.l10n.setAttributes(
+      document.getElementById("trustpanel-blockerView"),
+      "trustpanel-blocker-header",
+      { host: this.#host }
+    );
+    await this.#updateBlockerView();
+    document
+      .getElementById("trustpanel-popup-multiView")
+      .showSubView("trustpanel-blockerView", event.target);
+  }
+
+  async #openBlockerDetailsSubview(event, blocker, blocking) {
+    let count = await blocker.getBlockerCount();
+    let blockingKey = blocking ? "blocking" : "not-blocking";
+    document.l10n.setAttributes(
+      document.getElementById("trustpanel-blockerDetailsView"),
+      blocker.l10nKeys.title[blockingKey]
+    );
+    document.l10n.setAttributes(
+      document.getElementById("trustpanel-blocker-details-header"),
+      `trustpanel-${blocker.l10nKeys.general}-${blockingKey}-tab-header`,
+      { count }
+    );
+    document.l10n.setAttributes(
+      document.getElementById("trustpanel-blocker-details-content"),
+      `protections-panel-${blocker.l10nKeys.content}`
+    );
+
+    let listHeaderId;
+    if (blocker.l10nKeys.general == "fingerprinter") {
+      listHeaderId = "trustpanel-fingerprinter-list-header";
+    } else if (blocker.l10nKeys.general == "cryptominer") {
+      listHeaderId = "trustpanel-cryptominer-tab-list-header";
+    } else {
+      listHeaderId = "trustpanel-tracking-content-tab-list-header";
+    }
+
+    document.l10n.setAttributes(
+      document.getElementById("trustpanel-blocker-details-list-header"),
+      listHeaderId
+    );
+
+    let { items } = await blocker._generateSubViewListItems();
+    document.getElementById("trustpanel-blocker-items").replaceChildren(items);
+    document
+      .getElementById("trustpanel-popup-multiView")
+      .showSubView("trustpanel-blockerDetailsView", event.target);
+  }
+
+  async #showClearCookiesSubview(event) {
+    document.l10n.setAttributes(
+      document.getElementById("trustpanel-clearcookiesView"),
+      "trustpanel-clear-cookies-header",
+      { host: this.#host }
+    );
+    document
+      .getElementById("trustpanel-popup-multiView")
+      .showSubView("trustpanel-clearcookiesView", event.target);
+  }
+
+  async #addButtons(section, blockers, blocking) {
+    let sectionElement = document.getElementById(section);
+
+    if (!blockers.length) {
+      sectionElement.hidden = true;
+      return;
+    }
+
+    let children = blockers.map(async blocker => {
+      let button = document.createElement("moz-button");
+      button.classList.add("moz-button-subviewbutton-nav");
+      button.setAttribute("iconsrc", blocker.iconSrc);
+      button.setAttribute("type", "ghost icon");
+      document.l10n.setAttributes(
+        button,
+        `trustpanel-list-label-${blocker.l10nKeys.general}`,
+        { count: await blocker.getBlockerCount() }
+      );
+      button.addEventListener("click", event =>
+        this.#openBlockerDetailsSubview(event, blocker, blocking)
+      );
+      return button;
+    });
+
+    sectionElement.hidden = false;
+    sectionElement
+      .querySelector(".trustpanel-blocker-buttons")
+      .replaceChildren(...(await Promise.all(children)));
+  }
+
+  get #trackingProtectionEnabled() {
+    return (
+      !ContentBlockingAllowList.canHandle(window.gBrowser.selectedBrowser) ||
+      !ContentBlockingAllowList.includes(window.gBrowser.selectedBrowser)
+    );
+  }
+
+  #isSecurePage() {
+    if (this.#isInternalSecurePage) {
+      return true;
+    }
+    if (this.#isCertErrorPage || this.#isCertUserOverridden) {
+      return false;
+    }
+    if (this.#isSecureConnection) {
+      return true;
+    }
+    if (this.#isBrokenConnection) {
+      return false;
+    }
+    if (this.#isPotentiallyTrustworthy) {
+      return true;
+    }
+    return false;
+  }
+
+  get #isInternalSecurePage() {
+    if (this.#uri?.schemeIs("about")) {
+      let module = E10SUtils.getAboutModule(this.#uri);
+      if (module) {
+        let flags = module.getURIFlags(this.#uri);
+        if (flags & Ci.nsIAboutModule.IS_SECURE_CHROME_UI) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  #clearSiteData() {
+    let baseDomain = SiteDataManager.getBaseDomainFromHost(this.#uri.host);
+    SiteDataManager.remove(baseDomain);
+    this.#hidePopup();
+  }
+
+  #toggleTrackingProtection() {
+    if (this.#trackingProtectionEnabled) {
+      ContentBlockingAllowList.add(window.gBrowser.selectedBrowser);
+    } else {
+      ContentBlockingAllowList.remove(window.gBrowser.selectedBrowser);
+    }
+
+    PanelMultiView.hidePopup(this.#popup);
+    window.BrowserCommands.reload();
+  }
+
+  #isHttpsOnlyModeActive(isWindowPrivate) {
+    return httpsOnlyModeEnabled || (isWindowPrivate && httpsOnlyModeEnabledPBM);
+  }
+
+  #isHttpsFirstModeActive(isWindowPrivate) {
+    return (
+      !this.#isHttpsOnlyModeActive(isWindowPrivate) &&
+      (httpsFirstModeEnabled || (isWindowPrivate && httpsFirstModeEnabledPBM))
+    );
+  }
+  #isSchemelessHttpsFirstModeActive(isWindowPrivate) {
+    return (
+      !this.#isHttpsOnlyModeActive(isWindowPrivate) &&
+      !this.#isHttpsFirstModeActive(isWindowPrivate) &&
+      schemelessHttpsFirstModeEnabled
+    );
+  }
+  #getIdentityData(cert = this.#secInfo.serverCert) {
+    var result = {};
+
+    result.subjectOrg = cert.organization;
+
+    if (cert.subjectName) {
+      result.subjectNameFields = {};
+      cert.subjectName.split(",").forEach(function (v) {
+        var field = v.split("=");
+        this[field[0]] = field[1];
+      }, result.subjectNameFields);
+
+      result.city = result.subjectNameFields.L;
+      result.state = result.subjectNameFields.ST;
+      result.country = result.subjectNameFields.C;
+    }
+
+    result.caOrg = cert.issuerOrganization || cert.issuerCommonName;
+    result.cert = cert;
+
+    return result;
+  }
+
+  get #isSecureContext() {
+    return gBrowser.securityUI.isSecureContext;
+  }
+
+  #hasCustomRoot() {
+    return (
+      this.#isSecureConnection &&
+      !this.#isCertUserOverridden &&
+      this.#secInfo &&
+      !this.#secInfo.isBuiltCertChainRootBuiltInRoot
+    );
+  }
+
+  get #isBrokenConnection() {
+    return this.#state & Ci.nsIWebProgressListener.STATE_IS_BROKEN;
+  }
+
+  get #isSecureConnection() {
+    return (
+      !this.#isURILoadedFromFile &&
+      this.#state & Ci.nsIWebProgressListener.STATE_IS_SECURE
+    );
+  }
+
+  get #host() {
+    if (!this.#uri) {
+      return null;
+    }
+    return BrowserUtils.formatURIForDisplay(this.#uri, {
+      onlyBaseDomain: true,
+    });
+  }
+
+  get #isEV() {
+    return (
+      !this.#isURILoadedFromFile &&
+      this.#state & Ci.nsIWebProgressListener.STATE_IDENTITY_EV_TOPLEVEL
+    );
+  }
+
+  get #isAssociatedIdentity() {
+    return this.#state & Ci.nsIWebProgressListener.STATE_IDENTITY_ASSOCIATED;
+  }
+
+  get #isMixedActiveContentLoaded() {
+    return (
+      this.#state & Ci.nsIWebProgressListener.STATE_LOADED_MIXED_ACTIVE_CONTENT
+    );
+  }
+
+  get #isMixedActiveContentBlocked() {
+    return (
+      this.#state & Ci.nsIWebProgressListener.STATE_BLOCKED_MIXED_ACTIVE_CONTENT
+    );
+  }
+
+  get #isMixedPassiveContentLoaded() {
+    return (
+      this.#state & Ci.nsIWebProgressListener.STATE_LOADED_MIXED_DISPLAY_CONTENT
+    );
+  }
+
+  get #isContentHttpsOnlyModeUpgraded() {
+    return (
+      this.#state & Ci.nsIWebProgressListener.STATE_HTTPS_ONLY_MODE_UPGRADED
+    );
+  }
+
+  get #isContentHttpsOnlyModeUpgradeFailed() {
+    return (
+      this.#state &
+      Ci.nsIWebProgressListener.STATE_HTTPS_ONLY_MODE_UPGRADE_FAILED
+    );
+  }
+
+  get #isContentHttpsFirstModeUpgraded() {
+    return (
+      this.#state &
+      Ci.nsIWebProgressListener.STATE_HTTPS_ONLY_MODE_UPGRADED_FIRST
+    );
+  }
+
+  get #isCertUserOverridden() {
+    return this.#state & Ci.nsIWebProgressListener.STATE_CERT_USER_OVERRIDDEN;
+  }
+
+  get #isCertErrorPage() {
+    let { documentURI } = gBrowser.selectedBrowser;
+    if (documentURI?.scheme != "about") {
+      return false;
+    }
+
+    return (
+      documentURI.filePath == "certerror" ||
+      (documentURI.filePath == "neterror" &&
+        new URLSearchParams(documentURI.query).get("e") == "nssFailure2")
+    );
+  }
+
+  get #isSecurelyConnectedAboutNetErrorPage() {
+    let { documentURI } = gBrowser.selectedBrowser;
+    if (documentURI?.scheme != "about" || documentURI.filePath != "neterror") {
+      return false;
+    }
+
+    let error = new URLSearchParams(documentURI.query).get("e");
+
+    return error === "httpErrorPage" || error === "serverError";
+  }
+
+  get #isAboutNetErrorPage() {
+    let { documentURI } = gBrowser.selectedBrowser;
+    return documentURI?.scheme == "about" && documentURI.filePath == "neterror";
+  }
+
+  get #isAboutHttpsOnlyErrorPage() {
+    let { documentURI } = gBrowser.selectedBrowser;
+    return (
+      documentURI?.scheme == "about" && documentURI.filePath == "httpsonlyerror"
+    );
+  }
+
+  get #isPotentiallyTrustworthy() {
+    return (
+      !this.#isBrokenConnection &&
+      (this.#isSecureContext ||
+        gBrowser.selectedBrowser.documentURI?.scheme == "chrome")
+    );
+  }
+
+  get #isAboutBlockedPage() {
+    let { documentURI } = gBrowser.selectedBrowser;
+    return documentURI?.scheme == "about" && documentURI.filePath == "blocked";
+  }
+
+  get #isURILoadedFromFile() {
+    return this.#uri.schemeIs("file");
+  }
+
+  get qwacStatusPromise() {
+    return this.#qwacStatusPromise;
+  }
+
+  #supplementalText() {
+    let supplemental = "";
+    let verifier = "";
+    let owner = "";
+
+    if (this.#isSecureConnection) {
+      verifier = this.#getIdentityData().caOrg;
+    }
+
+    if (this.#isEV || this.#qwac) {
+      let identityData = this.#getIdentityData(
+        this.#qwac || this.#secInfo.serverCert
+      );
+      owner = identityData.subjectOrg;
+      verifier = identityData.caOrg;
+
+      if (identityData.city) {
+        supplemental += identityData.city + "\n";
+      }
+      if (identityData.state && identityData.country) {
+        supplemental += gNavigatorBundle.getFormattedString(
+          "identity.identified.state_and_country",
+          [identityData.state, identityData.country]
+        );
+      } else if (identityData.state) {
+        supplemental += identityData.state;
+      } else if (identityData.country) {
+        supplemental += identityData.country;
+      }
+    }
+    return { supplemental, verifier, owner };
+  }
+
+  #tooltipText() {
+    let tooltip = "";
+    let warnTextOnInsecure =
+      insecureConnectionTextEnabled ||
+      (insecureConnectionTextPBModeEnabled &&
+        PrivateBrowsingUtils.isWindowPrivate(window));
+
+    if (this.#uriHasHost && this.#isSecureConnection) {
+      if (!this.#isCertUserOverridden) {
+        tooltip = gNavigatorBundle.getFormattedString(
+          "identity.identified.verifier",
+          [this.#getIdentityData().caOrg]
+        );
+      }
+    } else if (this.#isBrokenConnection) {
+      if (this.#isMixedActiveContentLoaded) {
+        if (
+          UrlbarPrefs.get("trimHttps") &&
+          warnTextOnInsecure
+        ) {
+          tooltip = gNavigatorBundle.getString("identity.notSecure.tooltip");
+        }
+      }
+    } else if (!this.#isPotentiallyTrustworthy) {
+      tooltip = gNavigatorBundle.getString("identity.notSecure.tooltip");
+    }
+
+    if (this.#isCertUserOverridden) {
+      tooltip = gNavigatorBundle.getString(
+        "identity.identified.verified_by_you"
+      );
+    }
+    return tooltip;
+  }
+
+  #connectionState() {
+    let connection = "not-secure";
+    if (this.#isInternalSecurePage) {
+      connection = "chrome";
+    } else if (this.#isURILoadedFromFile) {
+      connection = "file";
+    } else if (this.#qwac) {
+      connection = "secure-etsi";
+    } else if (this.#isEV) {
+      connection = "secure-ev";
+    } else if (this.#isCertUserOverridden) {
+      connection = "secure-cert-user-overridden";
+    } else if (this.#isSecureConnection) {
+      connection = "secure";
+    } else if (this.#isCertErrorPage) {
+      connection = "cert-error-page";
+    } else if (this.#isAboutHttpsOnlyErrorPage) {
+      connection = "https-only-error-page";
+    } else if (this.#isAboutBlockedPage) {
+      connection = "not-secure";
+    } else if (this.#isSecurelyConnectedAboutNetErrorPage) {
+      connection = "secure";
+    } else if (this.#isAboutNetErrorPage) {
+      connection = "net-error-page";
+    } else if (this.#isAssociatedIdentity) {
+      connection = "associated";
+    } else if (this.#isPotentiallyTrustworthy) {
+      connection = "file";
+    }
+    return connection;
+  }
+
+  #connectionLabel() {
+    if (this.#isAboutNetErrorPage) {
+      return "identity-connection-failure";
+    }
+    if (this.#isSecurePage()) {
+      return "trustpanel-connection-label-secure";
+    }
+    return "trustpanel-connection-label-insecure";
+  }
+
+  #mixedContentState() {
+    let mixedcontent = [];
+    if (this.#isMixedPassiveContentLoaded) {
+      mixedcontent.push("passive-loaded");
+    }
+    if (this.#isMixedActiveContentLoaded) {
+      mixedcontent.push("active-loaded");
+    } else if (this.#isMixedActiveContentBlocked) {
+      mixedcontent.push("active-blocked");
+    }
+    return mixedcontent;
+  }
+
+  #ciphersState() {
+    if (
+      this.#isBrokenConnection &&
+      !this.#isMixedActiveContentLoaded &&
+      !this.#isMixedPassiveContentLoaded
+    ) {
+      return "weak";
+    }
+    return "";
+  }
+
+  #httpsOnlyState() {
+    const privateBrowsingWindow = PrivateBrowsingUtils.isWindowPrivate(window);
+    const isHttpsOnlyModeActive = this.#isHttpsOnlyModeActive(
+      privateBrowsingWindow
+    );
+    const isHttpsFirstModeActive = this.#isHttpsFirstModeActive(
+      privateBrowsingWindow
+    );
+    const isSchemelessHttpsFirstModeActive =
+      this.#isSchemelessHttpsFirstModeActive(privateBrowsingWindow);
+
+    let httpsOnlyStatus = "";
+
+    if (
+      isHttpsFirstModeActive ||
+      isHttpsOnlyModeActive ||
+      isSchemelessHttpsFirstModeActive
+    ) {
+      let value = this.#getHttpsOnlyPermission();
+
+      document.getElementById(
+        "trustpanel-popup-security-httpsonlymode"
+      ).hidden = isSchemelessHttpsFirstModeActive;
+
+      document.getElementById(
+        "trustpanel-popup-security-menulist-off-item"
+      ).hidden = privateBrowsingWindow && value != 1;
+      document.getElementById(
+        "trustpanel-popup-security-httpsonlymode-menulist"
+      ).value = value;
+
+      if (value > 0) {
+        httpsOnlyStatus = "exception";
+      } else if (
+        this.#isAboutHttpsOnlyErrorPage ||
+        (isHttpsFirstModeActive && this.#isContentHttpsOnlyModeUpgradeFailed)
+      ) {
+        httpsOnlyStatus = "failed-top";
+      } else if (this.#isContentHttpsOnlyModeUpgradeFailed) {
+        httpsOnlyStatus = "failed-sub";
+      } else if (
+        this.#isContentHttpsOnlyModeUpgraded ||
+        this.#isContentHttpsFirstModeUpgraded
+      ) {
+        httpsOnlyStatus = "upgraded";
+      }
+    }
+    return httpsOnlyStatus;
+  }
+
+  #getHttpsOnlyPermission() {
+    let uri = gBrowser.currentURI;
+    if (uri instanceof Ci.nsINestedURI) {
+      uri = uri.QueryInterface(Ci.nsINestedURI).innermostURI;
+    }
+    if (!uri.schemeIs("http") && !uri.schemeIs("https")) {
+      return -1;
+    }
+    uri = uri.mutate().setScheme("http").finalize();
+    const principal = Services.scriptSecurityManager.createContentPrincipal(
+      uri,
+      gBrowser.contentPrincipal.originAttributes
+    );
+    const { state } = SitePermissions.getForPrincipal(
+      principal,
+      "https-only-load-insecure"
+    );
+    switch (state) {
+      case Ci.nsIHttpsOnlyModePermission.LOAD_INSECURE_ALLOW_SESSION:
+        return 2; 
+      case Ci.nsIHttpsOnlyModePermission.LOAD_INSECURE_ALLOW:
+        return 1; 
+      default:
+        return 0; 
+    }
+  }
+
+  #changeHttpsOnlyPermission() {
+    const oldValue = this.#getHttpsOnlyPermission();
+    if (oldValue < 0) {
+      console.error(
+        "Did not update HTTPS-Only permission since scheme is incompatible"
+      );
+      return;
+    }
+
+    let menulist = document.getElementById(
+      "trustpanel-popup-security-httpsonlymode-menulist"
+    );
+    let newValue = parseInt(menulist.selectedItem.value, 10);
+
+    if (newValue === oldValue) {
+      return;
+    }
+
+    let newURI = gBrowser.currentURI;
+    if (newURI instanceof Ci.nsINestedURI) {
+      newURI = newURI.QueryInterface(Ci.nsINestedURI).innermostURI;
+    }
+    newURI = newURI.mutate().setScheme("http").finalize();
+    const principal = Services.scriptSecurityManager.createContentPrincipal(
+      newURI,
+      gBrowser.contentPrincipal.originAttributes
+    );
+
+    if (newValue === 0) {
+      SitePermissions.removeFromPrincipal(
+        principal,
+        "https-only-load-insecure"
+      );
+    } else if (newValue === 1) {
+      SitePermissions.setForPrincipal(
+        principal,
+        "https-only-load-insecure",
+        Ci.nsIHttpsOnlyModePermission.LOAD_INSECURE_ALLOW,
+        SitePermissions.SCOPE_PERSISTENT
+      );
+    } else {
+      SitePermissions.setForPrincipal(
+        principal,
+        "https-only-load-insecure",
+        Ci.nsIHttpsOnlyModePermission.LOAD_INSECURE_ALLOW_SESSION,
+        SitePermissions.SCOPE_SESSION
+      );
+    }
+
+    if (this.#isAboutHttpsOnlyErrorPage) {
+      gBrowser.loadURI(newURI, {
+        triggeringPrincipal:
+          Services.scriptSecurityManager.getSystemPrincipal(),
+        loadFlags: Ci.nsIWebNavigation.LOAD_FLAGS_REPLACE_HISTORY,
+      });
+      PanelMultiView.hidePopup(this.#popup);
+      return;
+    }
+    if (newValue + oldValue !== 3) {
+      BrowserCommands.reloadSkipCache();
+      PanelMultiView.hidePopup(this.#popup);
+      gBrowser.selectedBrowser.focus();
+    }
+  }
+
+  #resetToggleSecDelay() {
+    clearTimeout(this.#popupToggleDelayTimer);
+    this.#popupToggleDelayTimer = setTimeout(() => {
+      this.#enablePopupToggles();
+    }, popupClickjackDelay);
+  }
+
+  #disablePopupToggles() {
+    this.#popup.querySelectorAll("moz-toggle").forEach(toggle => {
+      toggle.setAttribute("disabled", true);
+      toggle.addEventListener("pointerdown", this.#resetToggleReference);
+    });
+  }
+
+  #resetToggleReference = this.#resetToggleSecDelay.bind(this);
+  #enablePopupToggles() {
+    this.#popup.querySelectorAll("moz-toggle").forEach(toggle => {
+      if (
+        toggle.id != "trustpanel-toggle" ||
+        ContentBlockingAllowList.canHandle(window.gBrowser.selectedBrowser)
+      ) {
+        toggle.removeAttribute("disabled");
+      }
+      toggle.removeEventListener("pointerdown", this.#resetToggleReference);
+    });
+  }
+
+  #updateAttribute(elem, attr, value) {
+    if (value) {
+      elem.setAttribute(attr, value);
+    } else {
+      elem.removeAttribute(attr);
+    }
+  }
+
+
+}
+
+var gTrustPanelHandler = new TrustPanel();

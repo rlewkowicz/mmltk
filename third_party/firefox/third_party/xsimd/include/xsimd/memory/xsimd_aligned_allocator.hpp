@@ -1,0 +1,240 @@
+/***************************************************************************
+ * Copyright (c) Johan Mabille, Sylvain Corlay, Wolf Vollprecht and         *
+ * Martin Renou                                                             *
+ * Copyright (c) QuantStack                                                 *
+ * Copyright (c) Serge Guelton                                              *
+ *                                                                          *
+ * Distributed under the terms of the BSD 3-Clause License.                 *
+ *                                                                          *
+ * The full license is in the file LICENSE, distributed with this software. *
+ ****************************************************************************/
+
+#if !defined(XSIMD_ALIGNED_ALLOCATOR_HPP)
+#define XSIMD_ALIGNED_ALLOCATOR_HPP
+
+#include <algorithm>
+#include <cstddef>
+#include <utility>
+#include <cstdlib>
+
+#include "../config/xsimd_arch.hpp"
+
+#include <cassert>
+#include <memory>
+
+namespace xsimd
+{
+
+    template <class T, size_t Align = std::conditional<std::is_same<unsupported, default_arch>::value, common, default_arch>::type::alignment()>
+    class aligned_allocator
+    {
+    public:
+        using value_type = T;
+        using pointer = T*;
+        using const_pointer = const T*;
+        using reference = T&;
+        using const_reference = const T&;
+        using size_type = size_t;
+        using difference_type = ptrdiff_t;
+
+        static constexpr size_t alignment = Align;
+
+        template <class U>
+        struct rebind
+        {
+            using other = aligned_allocator<U, Align>;
+        };
+
+        XSIMD_INLINE aligned_allocator() noexcept;
+        XSIMD_INLINE aligned_allocator(const aligned_allocator& rhs) noexcept;
+
+        template <class U>
+        XSIMD_INLINE aligned_allocator(const aligned_allocator<U, Align>& rhs) noexcept;
+
+        XSIMD_INLINE ~aligned_allocator();
+
+        XSIMD_INLINE pointer address(reference) noexcept;
+        XSIMD_INLINE const_pointer address(const_reference) const noexcept;
+
+        XSIMD_INLINE pointer allocate(size_type n, const void* hint = 0);
+        XSIMD_INLINE void deallocate(pointer p, size_type n);
+
+        XSIMD_INLINE size_type max_size() const noexcept;
+        XSIMD_INLINE size_type size_max() const noexcept;
+
+        template <class U, class... Args>
+        XSIMD_INLINE void construct(U* p, Args&&... args);
+
+        template <class U>
+        XSIMD_INLINE void destroy(U* p);
+    };
+
+    template <class T1, size_t Align1, class T2, size_t Align2>
+    XSIMD_INLINE bool operator==(const aligned_allocator<T1, Align1>& lhs,
+                                 const aligned_allocator<T2, Align2>& rhs) noexcept;
+
+    template <class T1, size_t Align1, class T2, size_t Align2>
+    XSIMD_INLINE bool operator!=(const aligned_allocator<T1, Align1>& lhs,
+                                 const aligned_allocator<T2, Align2>& rhs) noexcept;
+
+    XSIMD_INLINE void* aligned_malloc(size_t size, size_t alignment);
+    XSIMD_INLINE void aligned_free(void* ptr);
+
+    template <class T>
+    XSIMD_INLINE size_t get_alignment_offset(const T* p, size_t size, size_t block_size);
+
+
+    template <class T, size_t A>
+    XSIMD_INLINE aligned_allocator<T, A>::aligned_allocator() noexcept
+    {
+    }
+
+    template <class T, size_t A>
+    XSIMD_INLINE aligned_allocator<T, A>::aligned_allocator(const aligned_allocator&) noexcept
+    {
+    }
+
+    template <class T, size_t A>
+    template <class U>
+    XSIMD_INLINE aligned_allocator<T, A>::aligned_allocator(const aligned_allocator<U, A>&) noexcept
+    {
+    }
+
+    template <class T, size_t A>
+    XSIMD_INLINE aligned_allocator<T, A>::~aligned_allocator()
+    {
+    }
+
+    template <class T, size_t A>
+    XSIMD_INLINE auto
+    aligned_allocator<T, A>::address(reference r) noexcept -> pointer
+    {
+        return &r;
+    }
+
+    template <class T, size_t A>
+    XSIMD_INLINE auto
+    aligned_allocator<T, A>::address(const_reference r) const noexcept -> const_pointer
+    {
+        return &r;
+    }
+
+    template <class T, size_t A>
+    XSIMD_INLINE auto
+    aligned_allocator<T, A>::allocate(size_type n, const void*) -> pointer
+    {
+        pointer res = reinterpret_cast<pointer>(aligned_malloc(sizeof(T) * n, A));
+#if defined(_CPPUNWIND) || defined(__cpp_exceptions)
+        if (res == nullptr)
+            throw std::bad_alloc();
+#endif
+        return res;
+    }
+
+    template <class T, size_t A>
+    XSIMD_INLINE void aligned_allocator<T, A>::deallocate(pointer p, size_type)
+    {
+        aligned_free(p);
+    }
+
+    template <class T, size_t A>
+    XSIMD_INLINE auto
+    aligned_allocator<T, A>::max_size() const noexcept -> size_type
+    {
+        return size_type(-1) / sizeof(T);
+    }
+
+    template <class T, size_t A>
+    XSIMD_INLINE auto
+    aligned_allocator<T, A>::size_max() const noexcept -> size_type
+    {
+        return size_type(-1) / sizeof(T);
+    }
+
+    template <class T, size_t A>
+    template <class U, class... Args>
+    XSIMD_INLINE void aligned_allocator<T, A>::construct(U* p, Args&&... args)
+    {
+        new ((void*)p) U(std::forward<Args>(args)...);
+    }
+
+    template <class T, size_t A>
+    template <class U>
+    XSIMD_INLINE void aligned_allocator<T, A>::destroy(U* p)
+    {
+        p->~U();
+    }
+
+
+    template <class T1, size_t A1, class T2, size_t A2>
+    XSIMD_INLINE bool operator==(const aligned_allocator<T1, A1>& lhs,
+                                 const aligned_allocator<T2, A2>& rhs) noexcept
+    {
+        return lhs.alignment == rhs.alignment;
+    }
+
+    template <class T1, size_t A1, class T2, size_t A2>
+    XSIMD_INLINE bool operator!=(const aligned_allocator<T1, A1>& lhs,
+                                 const aligned_allocator<T2, A2>& rhs) noexcept
+    {
+        return !(lhs == rhs);
+    }
+
+
+    namespace detail
+    {
+        XSIMD_INLINE void* xaligned_malloc(size_t size, size_t alignment)
+        {
+            assert(((alignment & (alignment - 1)) == 0) && "alignment must be a power of two");
+            assert((alignment >= sizeof(void*)) && "alignment must be at least the size of a pointer");
+            void* res = nullptr;
+            if (posix_memalign(&res, alignment, size) != 0)
+            {
+                res = nullptr;
+            }
+            return res;
+        }
+
+        XSIMD_INLINE void xaligned_free(void* ptr)
+        {
+            free(ptr);
+        }
+    }
+
+    XSIMD_INLINE void* aligned_malloc(size_t size, size_t alignment)
+    {
+        return detail::xaligned_malloc(size, alignment);
+    }
+
+    XSIMD_INLINE void aligned_free(void* ptr)
+    {
+        detail::xaligned_free(ptr);
+    }
+
+    template <class T>
+    XSIMD_INLINE size_t get_alignment_offset(const T* p, size_t size, size_t block_size)
+    {
+        if (block_size == 1)
+        {
+            return 0;
+        }
+        else if (size_t(p) & (sizeof(T) - 1))
+        {
+            return size;
+        }
+        else
+        {
+            size_t block_mask = block_size - 1;
+            return std::min<size_t>(
+                (block_size - ((size_t(p) / sizeof(T)) & block_mask)) & block_mask,
+                size);
+        }
+    }
+
+    template <class T, class A = default_arch>
+    using default_allocator = std::conditional_t<A::requires_alignment(),
+                                                 aligned_allocator<T, A::alignment()>,
+                                                 std::allocator<T>>;
+}
+
+#endif

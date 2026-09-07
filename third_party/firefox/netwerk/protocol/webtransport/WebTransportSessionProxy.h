@@ -1,0 +1,104 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_net_WebTransportProxy_h
+#define mozilla_net_WebTransportProxy_h
+
+#include <functional>
+#include "nsIChannelEventSink.h"
+#include "nsIInterfaceRequestor.h"
+#include "nsIRedirectResultListener.h"
+#include "nsIStreamListener.h"
+#include "nsIWebTransport.h"
+
+
+namespace mozilla::net {
+
+class WebTransportEventService;
+
+class WebTransportStreamCallbackWrapper;
+
+class WebTransportSessionProxy final
+    : public nsIWebTransport,
+      public WebTransportSessionEventListener,
+      public WebTransportSessionEventListenerInternal,
+      public WebTransportConnectionSettings,
+      public nsIStreamListener,
+      public nsIChannelEventSink,
+      public nsIRedirectResultListener,
+      public nsIInterfaceRequestor {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIWEBTRANSPORT
+  NS_DECL_WEBTRANSPORTSESSIONEVENTLISTENER
+  NS_DECL_WEBTRANSPORTSESSIONEVENTLISTENERINTERNAL
+  NS_DECL_WEBTRANSPORTCONNECTIONSETTINGS
+  NS_DECL_NSIREQUESTOBSERVER
+  NS_DECL_NSISTREAMLISTENER
+  NS_DECL_NSICHANNELEVENTSINK
+  NS_DECL_NSIREDIRECTRESULTLISTENER
+  NS_DECL_NSIINTERFACEREQUESTOR
+
+  WebTransportSessionProxy();
+
+ private:
+  ~WebTransportSessionProxy();
+
+  void CloseSessionInternal();
+  void CloseSessionInternalLocked();
+  void CallOnSessionClosed();
+  void CallOnSessionClosedLocked();
+
+  enum WebTransportSessionProxyState {
+    INIT,
+    NEGOTIATING,
+    NEGOTIATING_SUCCEEDED,
+    ACTIVE,
+    CLOSE_CALLBACK_PENDING,
+    SESSION_CLOSE_PENDING,
+    DONE,
+  };
+  mozilla::Mutex mMutex;
+  WebTransportSessionProxyState mState MOZ_GUARDED_BY(mMutex) =
+      WebTransportSessionProxyState::INIT;
+  void ChangeState(WebTransportSessionProxyState newState);
+  void CreateStreamInternal(nsIWebTransportStreamCallback* callback,
+                            bool aBidi);
+  void DoCreateStream(WebTransportStreamCallbackWrapper* aCallback,
+                      WebTransportSessionBase* aSession, bool aBidi);
+  void SendDatagramInternal(const RefPtr<WebTransportSessionBase>& aSession,
+                            nsTArray<uint8_t>&& aData, uint64_t aTrackingId);
+  void NotifyDatagramReceived(nsTArray<uint8_t>&& aData);
+  void GetMaxDatagramSizeInternal(
+      const RefPtr<WebTransportSessionBase>& aSession);
+  void OnMaxDatagramSizeInternal(uint64_t aSize);
+  void OnOutgoingDatagramOutComeInternal(
+      uint64_t aId, WebTransportSessionEventListener::DatagramOutcome aOutCome);
+  void OnStopSendingInternal(uint64_t aStreamId, nsresult aError);
+  void OnResetReceivedInternal(uint64_t aStreamId, nsresult aError);
+
+  nsCOMPtr<nsIChannel> mChannel;
+  uint64_t mHttpChannelID = 0;
+  nsCOMPtr<nsIChannel> mRedirectChannel;
+  RefPtr<WebTransportEventService> mService;
+  nsCOMPtr<WebTransportSessionEventListener> mListener MOZ_GUARDED_BY(mMutex);
+  RefPtr<WebTransportSessionBase> mWebTransportSession MOZ_GUARDED_BY(mMutex);
+  uint64_t mSessionId MOZ_GUARDED_BY(mMutex) = UINT64_MAX;
+  uint32_t mCloseStatus MOZ_GUARDED_BY(mMutex) = 0;
+  nsCString mReason MOZ_GUARDED_BY(mMutex);
+  bool mCleanly MOZ_GUARDED_BY(mMutex) = false;
+  bool mStopRequestCalled MOZ_GUARDED_BY(mMutex) = false;
+  nsTArray<std::function<void()>> mPendingEvents MOZ_GUARDED_BY(mMutex);
+  nsTArray<std::function<void(nsresult)>> mPendingCreateStreamEvents
+      MOZ_GUARDED_BY(mMutex);
+  nsCOMPtr<nsIEventTarget> mTarget MOZ_GUARDED_BY(mMutex);
+  nsTArray<RefPtr<nsIWebTransportHash>> mServerCertHashes
+      MOZ_GUARDED_BY(mMutex);
+  bool mDedicatedConnection = false;  
+  nsIWebTransport::HTTPVersion mHTTPVersion = nsIWebTransport::HTTPVersion::h3;
+};
+
+}  
+
+#endif  // mozilla_net_WebTransportProxy_h

@@ -1,0 +1,557 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+
+#ifndef xptinfo_h
+#define xptinfo_h
+
+#include <stdint.h>
+#include "nsID.h"
+#include "mozilla/Assertions.h"
+#include "jsapi.h"
+#include "js/Symbol.h"
+#include "js/Value.h"
+#include "nsString.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+namespace dom {
+struct NativePropertyHooks;
+}  
+}  
+
+struct nsXPTInterfaceInfo;
+struct nsXPTType;
+struct nsXPTParamInfo;
+struct nsXPTMethodInfo;
+struct nsXPTConstantInfo;
+struct nsXPTDOMObjectInfo;
+
+enum class nsXPTInterface : uint16_t;
+
+namespace xpt {
+namespace detail {
+
+inline const nsXPTInterfaceInfo* GetInterface(uint16_t aIndex);
+inline const nsXPTType& GetType(uint16_t aIndex);
+inline const nsXPTParamInfo& GetParam(uint16_t aIndex);
+inline const nsXPTMethodInfo& GetMethod(uint16_t aIndex);
+inline const nsXPTConstantInfo& GetConstant(uint16_t aIndex);
+inline const nsXPTDOMObjectInfo& GetDOMObjectInfo(uint16_t aIndex);
+inline const char* GetString(uint32_t aIndex);
+
+const nsXPTInterfaceInfo* InterfaceByIID(const nsIID& aIID);
+const nsXPTInterfaceInfo* InterfaceByName(const char* aName);
+
+extern const uint16_t sInterfacesSize;
+
+}  
+}  
+
+struct nsXPTInterfaceInfo {
+  static const nsXPTInterfaceInfo* ByIID(const nsIID& aIID) {
+    return xpt::detail::InterfaceByIID(aIID);
+  }
+  static const nsXPTInterfaceInfo* ByName(const char* aName) {
+    return xpt::detail::InterfaceByName(aName);
+  }
+
+  static const nsXPTInterfaceInfo* Get(nsXPTInterface aID) {
+    return ByIndex(uint16_t(aID));
+  }
+
+  static const nsXPTInterfaceInfo* ByIndex(uint16_t aIndex) {
+    return xpt::detail::GetInterface(aIndex + 1);
+  }
+  static uint16_t InterfaceCount() { return xpt::detail::sInterfacesSize; }
+
+  bool IsFunction() const { return mFunction; }
+  bool IsBuiltinClass() const { return mBuiltinClass; }
+  bool IsMainProcessScriptableOnly() const {
+    return mMainProcessScriptableOnly;
+  }
+
+  const char* Name() const { return xpt::detail::GetString(mName); }
+  const nsIID& IID() const { return mIID; }
+
+  const nsXPTInterfaceInfo* GetParent() const {
+    return xpt::detail::GetInterface(mParent);
+  }
+
+  bool HasAncestor(const nsIID& aIID) const;
+
+  uint16_t ConstantCount() const { return mNumConsts; }
+  const nsXPTConstantInfo& Constant(uint16_t aIndex) const;
+  uint16_t MethodCount() const { return mNumMethods; }
+  const nsXPTMethodInfo& Method(uint16_t aIndex) const;
+
+  nsresult GetMethodInfo(uint16_t aIndex, const nsXPTMethodInfo** aInfo) const;
+  nsresult GetConstant(uint16_t aIndex, JS::MutableHandle<JS::Value> constant,
+                       char** aName) const;
+
+
+  nsID mIID;
+  uint32_t mName;  
+
+  uint16_t mParent : 14;
+  uint16_t mBuiltinClass : 1;
+  uint16_t mMainProcessScriptableOnly : 1;
+
+  uint16_t mMethods;  
+
+  uint16_t mConsts : 14;  
+  uint16_t mFunction : 1;
+
+  uint8_t mNumMethods;  
+  uint8_t mNumConsts;   
+};
+
+static_assert(sizeof(nsXPTInterfaceInfo) == 28, "wrong size?");
+
+enum nsXPTTypeTag : uint8_t {
+  TD_INT8 = 0,
+  TD_INT16 = 1,
+  TD_INT32 = 2,
+  TD_INT64 = 3,
+  TD_UINT8 = 4,
+  TD_UINT16 = 5,
+  TD_UINT32 = 6,
+  TD_UINT64 = 7,
+  TD_FLOAT = 8,
+  TD_DOUBLE = 9,
+  TD_BOOL = 10,
+  TD_CHAR = 11,
+  TD_WCHAR = 12,
+  _TD_LAST_ARITHMETIC = TD_WCHAR,
+
+  TD_VOID = 13,
+  TD_NSIDPTR = 14,
+  TD_PSTRING = 15,
+  TD_PWSTRING = 16,
+  TD_INTERFACE_TYPE = 17,
+  TD_INTERFACE_IS_TYPE = 18,
+  TD_LEGACY_ARRAY = 19,
+  TD_PSTRING_SIZE_IS = 20,
+  TD_PWSTRING_SIZE_IS = 21,
+  TD_DOMOBJECT = 22,
+  TD_PROMISE = 23,
+  _TD_LAST_POINTER = TD_PROMISE,
+
+  TD_UTF8STRING = 24,
+  TD_CSTRING = 25,
+  TD_ASTRING = 26,
+  TD_NSID = 27,
+  TD_JSVAL = 28,
+  TD_ARRAY = 29,
+  _TD_LAST_COMPLEX = TD_ARRAY
+};
+
+static_assert(_TD_LAST_COMPLEX < 32, "nsXPTTypeTag must fit in 5 bits");
+
+struct nsXPTType {
+  nsXPTTypeTag Tag() const { return static_cast<nsXPTTypeTag>(mTag); }
+
+  uint8_t ArgNum() const {
+    MOZ_ASSERT(Tag() == TD_INTERFACE_IS_TYPE || Tag() == TD_PSTRING_SIZE_IS ||
+               Tag() == TD_PWSTRING_SIZE_IS || Tag() == TD_LEGACY_ARRAY);
+    return mData1;
+  }
+
+ private:
+  uint16_t Data16() const {
+    return static_cast<uint16_t>(mData1 << 8) | mData2;
+  }
+
+ public:
+  const nsXPTType& ArrayElementType() const {
+    if (Tag() == TD_LEGACY_ARRAY) {
+      return xpt::detail::GetType(mData2);
+    }
+    MOZ_ASSERT(Tag() == TD_ARRAY);
+    return xpt::detail::GetType(Data16());
+  }
+
+  const nsXPTInterfaceInfo* GetInterface() const {
+    MOZ_ASSERT(Tag() == TD_INTERFACE_TYPE);
+    return xpt::detail::GetInterface(Data16());
+  }
+
+  const nsXPTDOMObjectInfo& GetDOMObjectInfo() const {
+    MOZ_ASSERT(Tag() == TD_DOMOBJECT);
+    return xpt::detail::GetDOMObjectInfo(Data16());
+  }
+
+  bool IsArithmetic() const { return Tag() <= _TD_LAST_ARITHMETIC; }
+  bool IsPointer() const {
+    return !IsArithmetic() && Tag() <= _TD_LAST_POINTER;
+  }
+  bool IsComplex() const { return Tag() > _TD_LAST_POINTER; }
+
+  bool IsInterfacePointer() const {
+    return Tag() == TD_INTERFACE_TYPE || Tag() == TD_INTERFACE_IS_TYPE;
+  }
+
+  bool IsDependent() const {
+    return (Tag() == TD_ARRAY && InnermostType().IsDependent()) ||
+           Tag() == TD_INTERFACE_IS_TYPE || Tag() == TD_LEGACY_ARRAY ||
+           Tag() == TD_PSTRING_SIZE_IS || Tag() == TD_PWSTRING_SIZE_IS;
+  }
+
+  const nsXPTType& InnermostType() const {
+    if (Tag() == TD_LEGACY_ARRAY || Tag() == TD_ARRAY) {
+      return ArrayElementType().InnermostType();
+    }
+    return *this;
+  }
+
+  inline size_t Stride() const;
+
+  void* ElementPtr(const void* aBase, uint32_t aIndex) const {
+    return (char*)aBase + (aIndex * Stride());
+  }
+
+  void ZeroValue(void* aValue) const {
+    MOZ_RELEASE_ASSERT(!IsComplex(), "Cannot zero a complex value");
+    memset(aValue, 0, Stride());
+  }
+
+  enum class Idx : uint8_t {
+    INT8 = 0,
+    UINT8,
+    INT16,
+    UINT16,
+    INT32,
+    UINT32,
+    INT64,
+    UINT64,
+    FLOAT,
+    DOUBLE,
+    BOOL,
+    CHAR,
+    WCHAR,
+    NSIDPTR,
+    PSTRING,
+    PWSTRING,
+    INTERFACE_IS_TYPE
+  };
+
+  static nsXPTType MkArrayType(Idx aInner) {
+    MOZ_ASSERT(aInner <= Idx::INTERFACE_IS_TYPE);
+    return {TD_LEGACY_ARRAY, false, false, false, 0, (uint8_t)aInner};
+  }
+  static const nsXPTType& Get(Idx aInner) {
+    MOZ_ASSERT(aInner <= Idx::INTERFACE_IS_TYPE);
+    return xpt::detail::GetType((uint8_t)aInner);
+  }
+
+
+  nsXPTType& operator=(nsXPTTypeTag aPrefix) {
+    mTag = aPrefix;
+    return *this;
+  }
+  operator nsXPTTypeTag() const { return Tag(); }
+
+#define TD_ALIAS_(name_, value_) static constexpr nsXPTTypeTag name_ = value_
+  TD_ALIAS_(T_I8, TD_INT8);
+  TD_ALIAS_(T_I16, TD_INT16);
+  TD_ALIAS_(T_I32, TD_INT32);
+  TD_ALIAS_(T_I64, TD_INT64);
+  TD_ALIAS_(T_U8, TD_UINT8);
+  TD_ALIAS_(T_U16, TD_UINT16);
+  TD_ALIAS_(T_U32, TD_UINT32);
+  TD_ALIAS_(T_U64, TD_UINT64);
+  TD_ALIAS_(T_FLOAT, TD_FLOAT);
+  TD_ALIAS_(T_DOUBLE, TD_DOUBLE);
+  TD_ALIAS_(T_BOOL, TD_BOOL);
+  TD_ALIAS_(T_CHAR, TD_CHAR);
+  TD_ALIAS_(T_WCHAR, TD_WCHAR);
+  TD_ALIAS_(T_VOID, TD_VOID);
+  TD_ALIAS_(T_NSIDPTR, TD_NSIDPTR);
+  TD_ALIAS_(T_CHAR_STR, TD_PSTRING);
+  TD_ALIAS_(T_WCHAR_STR, TD_PWSTRING);
+  TD_ALIAS_(T_INTERFACE, TD_INTERFACE_TYPE);
+  TD_ALIAS_(T_INTERFACE_IS, TD_INTERFACE_IS_TYPE);
+  TD_ALIAS_(T_LEGACY_ARRAY, TD_LEGACY_ARRAY);
+  TD_ALIAS_(T_PSTRING_SIZE_IS, TD_PSTRING_SIZE_IS);
+  TD_ALIAS_(T_PWSTRING_SIZE_IS, TD_PWSTRING_SIZE_IS);
+  TD_ALIAS_(T_UTF8STRING, TD_UTF8STRING);
+  TD_ALIAS_(T_CSTRING, TD_CSTRING);
+  TD_ALIAS_(T_ASTRING, TD_ASTRING);
+  TD_ALIAS_(T_NSID, TD_NSID);
+  TD_ALIAS_(T_JSVAL, TD_JSVAL);
+  TD_ALIAS_(T_DOMOBJECT, TD_DOMOBJECT);
+  TD_ALIAS_(T_PROMISE, TD_PROMISE);
+  TD_ALIAS_(T_ARRAY, TD_ARRAY);
+#undef TD_ALIAS_
+
+
+  uint8_t mTag : 5;
+
+  uint8_t mInParam : 1;
+  uint8_t mOutParam : 1;
+  uint8_t mOptionalParam : 1;
+
+  uint8_t mData1;
+  uint8_t mData2;
+};
+
+static_assert(sizeof(nsXPTType) == 3, "wrong size");
+
+struct nsXPTParamInfo {
+  bool IsIn() const { return mType.mInParam; }
+  bool IsOut() const { return mType.mOutParam; }
+  bool IsOptional() const { return mType.mOptionalParam; }
+  bool IsShared() const { return false; }  
+
+  const nsXPTType& Type() const { return mType; }
+  const nsXPTType& GetType() const {
+    return Type();
+  }  
+
+  bool IsIndirect() const { return IsOut() || Type().IsComplex(); }
+
+
+  nsXPTType mType;
+};
+
+static_assert(sizeof(nsXPTParamInfo) == 3, "wrong size");
+
+struct nsXPTMethodInfo {
+  bool IsGetter() const { return mGetter; }
+  bool IsSetter() const { return mSetter; }
+  bool IsReflectable() const { return mReflectable; }
+  bool IsSymbol() const { return mIsSymbol; }
+  bool WantsOptArgc() const { return mOptArgc; }
+  bool WantsContext() const { return mContext; }
+  uint8_t ParamCount() const { return mNumParams; }
+
+  const char* Name() const {
+    MOZ_ASSERT(!IsSymbol());
+    return xpt::detail::GetString(mName);
+  }
+  const nsXPTParamInfo& Param(uint8_t aIndex) const {
+    MOZ_ASSERT(aIndex < mNumParams);
+    return xpt::detail::GetParam(mParams + aIndex);
+  }
+
+  bool HasRetval() const { return mHasRetval; }
+  const nsXPTParamInfo* GetRetval() const {
+    return mHasRetval ? &Param(mNumParams - 1) : nullptr;
+  }
+
+  uint8_t IndexOfJSContext() const {
+    if (!WantsContext()) {
+      return UINT8_MAX;
+    }
+    if (IsGetter() || IsSetter()) {
+      return 0;
+    }
+    MOZ_ASSERT_IF(HasRetval(), ParamCount() > 0);
+    return ParamCount() - uint8_t(HasRetval());
+  }
+
+  JS::SymbolCode GetSymbolCode() const {
+    MOZ_ASSERT(IsSymbol());
+    return JS::SymbolCode(mName);
+  }
+
+  JS::Symbol* GetSymbol(JSContext* aCx) const {
+    return JS::GetWellKnownSymbol(aCx, GetSymbolCode());
+  }
+
+  const char* SymbolDescription() const;
+
+  const char* NameOrDescription() const {
+    if (IsSymbol()) {
+      return SymbolDescription();
+    }
+    return Name();
+  }
+
+  bool GetId(JSContext* aCx, jsid& aId) const;
+
+
+  uint32_t mName;    
+  uint16_t mParams;  
+  uint8_t mNumParams;
+
+  uint8_t mGetter : 1;
+  uint8_t mSetter : 1;
+  uint8_t mReflectable : 1;
+  uint8_t mOptArgc : 1;
+  uint8_t mContext : 1;
+  uint8_t mHasRetval : 1;
+  uint8_t mIsSymbol : 1;
+};
+
+static_assert(sizeof(nsXPTMethodInfo) == 8, "wrong size");
+
+#if defined(MOZ_THUNDERBIRD) || defined(MOZ_SUITE)
+#  define PARAM_BUFFER_COUNT 18
+#else
+#  define PARAM_BUFFER_COUNT 14
+#endif
+
+struct nsXPTConstantInfo {
+  const char* Name() const { return xpt::detail::GetString(mName); }
+
+  JS::Value JSValue() const {
+    if (mSigned) {
+      return JS::Int32Value(int32_t(mValue));
+    }
+    return JS::NumberValue(mValue);
+  }
+
+
+  uint32_t mName : 31;  
+
+  uint32_t mSigned : 1;
+  uint32_t mValue;  
+};
+
+static_assert(sizeof(nsXPTConstantInfo) == 8, "wrong size");
+
+struct nsXPTDOMObjectInfo {
+  nsresult Unwrap(JS::Handle<JS::Value> aHandle, void** aObj,
+                  JSContext* aCx) const {
+    return mUnwrap(aHandle, aObj, aCx);
+  }
+
+  bool Wrap(JSContext* aCx, void* aObj,
+            JS::MutableHandle<JS::Value> aHandle) const {
+    return mWrap(aCx, aObj, aHandle);
+  }
+
+  void Cleanup(void* aObj) const { return mCleanup(aObj); }
+
+
+  nsresult (*mUnwrap)(JS::Handle<JS::Value> aHandle, void** aObj,
+                      JSContext* aCx);
+  bool (*mWrap)(JSContext* aCx, void* aObj,
+                JS::MutableHandle<JS::Value> aHandle);
+  void (*mCleanup)(void* aObj);
+};
+
+namespace xpt {
+namespace detail {
+
+class UntypedTArray : public nsTArray_base<nsTArray_RelocateUsingMemutils> {
+ public:
+  void* Elements() const { return static_cast<void*>(Hdr() + 1); }
+
+  bool SetLength(const nsXPTType& aEltTy, uint32_t aTo) {
+    if (!EnsureCapacity<nsTArrayFallibleAllocator>(aTo, aEltTy.Stride())) {
+      return false;
+    }
+
+    if (mHdr != EmptyHdr()) {
+      mHdr->mLength = aTo;
+    }
+
+    return true;
+  }
+
+  void Clear() {
+    if (mHdr != EmptyHdr() && !UsesAutoArrayBuffer()) {
+      nsTArrayFallibleAllocator::Free(mHdr);
+    }
+    mHdr = EmptyHdr();
+  }
+};
+
+
+extern const nsXPTInterfaceInfo sInterfaces[];
+extern const nsXPTType sTypes[];
+extern const nsXPTParamInfo sParams[];
+extern const nsXPTMethodInfo sMethods[];
+extern const nsXPTConstantInfo sConsts[];
+extern const nsXPTDOMObjectInfo sDOMObjects[];
+
+extern const char sStrings[];
+
+
+inline const nsXPTInterfaceInfo* GetInterface(uint16_t aIndex) {
+  if (aIndex > 0 && aIndex <= sInterfacesSize) {
+    return &sInterfaces[aIndex - 1];  
+  }
+  return nullptr;
+}
+
+inline const nsXPTType& GetType(uint16_t aIndex) { return sTypes[aIndex]; }
+
+inline const nsXPTParamInfo& GetParam(uint16_t aIndex) {
+  return sParams[aIndex];
+}
+
+inline const nsXPTMethodInfo& GetMethod(uint16_t aIndex) {
+  return sMethods[aIndex];
+}
+
+inline const nsXPTConstantInfo& GetConstant(uint16_t aIndex) {
+  return sConsts[aIndex];
+}
+
+inline const nsXPTDOMObjectInfo& GetDOMObjectInfo(uint16_t aIndex) {
+  return sDOMObjects[aIndex];
+}
+
+inline const char* GetString(uint32_t aIndex) { return &sStrings[aIndex]; }
+
+}  
+}  
+
+#define XPT_FOR_EACH_ARITHMETIC_TYPE(MACRO) \
+  MACRO(TD_INT8, int8_t)                    \
+  MACRO(TD_INT16, int16_t)                  \
+  MACRO(TD_INT32, int32_t)                  \
+  MACRO(TD_INT64, int64_t)                  \
+  MACRO(TD_UINT8, uint8_t)                  \
+  MACRO(TD_UINT16, uint16_t)                \
+  MACRO(TD_UINT32, uint32_t)                \
+  MACRO(TD_UINT64, uint64_t)                \
+  MACRO(TD_FLOAT, float)                    \
+  MACRO(TD_DOUBLE, double)                  \
+  MACRO(TD_BOOL, bool)                      \
+  MACRO(TD_CHAR, char)                      \
+  MACRO(TD_WCHAR, char16_t)
+
+#define XPT_FOR_EACH_POINTER_TYPE(MACRO)    \
+  MACRO(TD_VOID, void*)                     \
+  MACRO(TD_NSIDPTR, nsID*)                  \
+  MACRO(TD_PSTRING, char*)                  \
+  MACRO(TD_PWSTRING, wchar_t*)              \
+  MACRO(TD_INTERFACE_TYPE, nsISupports*)    \
+  MACRO(TD_INTERFACE_IS_TYPE, nsISupports*) \
+  MACRO(TD_LEGACY_ARRAY, void*)             \
+  MACRO(TD_PSTRING_SIZE_IS, char*)          \
+  MACRO(TD_PWSTRING_SIZE_IS, wchar_t*)      \
+  MACRO(TD_DOMOBJECT, void*)                \
+  MACRO(TD_PROMISE, mozilla::dom::Promise*)
+
+#define XPT_FOR_EACH_COMPLEX_TYPE(MACRO) \
+  MACRO(TD_UTF8STRING, nsCString)        \
+  MACRO(TD_CSTRING, nsCString)           \
+  MACRO(TD_ASTRING, nsString)            \
+  MACRO(TD_NSID, nsID)                   \
+  MACRO(TD_JSVAL, JS::Value)             \
+  MACRO(TD_ARRAY, xpt::detail::UntypedTArray)
+
+#define XPT_FOR_EACH_TYPE(MACRO)      \
+  XPT_FOR_EACH_ARITHMETIC_TYPE(MACRO) \
+  XPT_FOR_EACH_POINTER_TYPE(MACRO)    \
+  XPT_FOR_EACH_COMPLEX_TYPE(MACRO)
+
+inline size_t nsXPTType::Stride() const {
+  switch (Tag()) {
+#define XPT_TYPE_STRIDE(tag, type) \
+  case tag:                        \
+    return sizeof(type);
+    XPT_FOR_EACH_TYPE(XPT_TYPE_STRIDE)
+#undef XPT_TYPE_STRIDE
+  }
+
+  MOZ_CRASH("Unknown type");
+}
+
+#endif /* xptinfo_h */

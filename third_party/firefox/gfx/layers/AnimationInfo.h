@@ -1,0 +1,134 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef GFX_ANIMATIONINFO_H
+#define GFX_ANIMATIONINFO_H
+
+#include "nsCSSPropertyIDSet.h"
+#include "nsDisplayItemTypes.h"
+#include "mozilla/Array.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/FunctionRef.h"
+#include "mozilla/layers/AnimationStorageData.h"
+#include "mozilla/layers/LayersMessages.h"  // for TransformData
+
+struct RawServoAnimationValue;
+class nsIContent;
+class nsIFrame;
+
+namespace mozilla {
+
+class nsDisplayItem;
+class nsDisplayListBuilder;
+class EffectSet;
+struct AnimationProperty;
+
+namespace dom {
+class Animation;
+}  
+
+namespace gfx {
+class Path;
+}  
+
+namespace layers {
+
+class Animation;
+class CompositorAnimations;
+class Layer;
+class WebRenderLayerManager;
+struct CompositorAnimationData;
+struct PropertyAnimationGroup;
+
+class AnimationInfo final {
+  typedef nsTArray<Animation> AnimationArray;
+
+ public:
+  AnimationInfo();
+  ~AnimationInfo();
+
+  void EnsureAnimationsId();
+
+  Animation* AddAnimation();
+
+  Animation* AddAnimationForNextTransaction();
+
+  void SetAnimationGeneration(uint64_t aCount) {
+    mAnimationGeneration = Some(aCount);
+  }
+  Maybe<uint64_t> GetAnimationGeneration() const {
+    return mAnimationGeneration;
+  }
+
+  void ClearAnimations();
+  void ClearAnimationsForNextTransaction();
+  uint64_t GetCompositorAnimationsId() { return mCompositorAnimationsId; }
+  AnimationArray& GetAnimations() { return mAnimations; }
+  nsTArray<PropertyAnimationGroup>& GetPropertyAnimationGroups() {
+    return mStorageData.mAnimation;
+  }
+  const Maybe<TransformData>& GetTransformData() const {
+    return mStorageData.mTransformData;
+  }
+  const LayersId& GetLayersId() const { return mStorageData.mLayersId; }
+  bool ApplyPendingUpdatesForThisTransaction();
+  bool HasTransformAnimation() const;
+
+  gfx::Path* CachedMotionPath() { return mStorageData.mCachedMotionPath; }
+
+  static Maybe<uint64_t> GetGenerationFromFrame(
+      nsIFrame* aFrame, DisplayItemType aDisplayItemKey);
+
+  using CompositorAnimatableDisplayItemTypes =
+      Array<DisplayItemType,
+            nsCSSPropertyIDSet::CompositorAnimatableDisplayItemCount()>;
+  using AnimationGenerationCallback = FunctionRef<bool(
+      const Maybe<uint64_t>& aGeneration, DisplayItemType aDisplayItemType)>;
+  static void EnumerateGenerationOnFrame(
+      const nsIFrame* aFrame, const nsIContent* aContent,
+      const CompositorAnimatableDisplayItemTypes& aDisplayItemTypes,
+      AnimationGenerationCallback);
+
+  void AddAnimationsForDisplayItem(
+      nsIFrame* aFrame, nsDisplayListBuilder* aBuilder, nsDisplayItem* aItem,
+      DisplayItemType aType, WebRenderLayerManager* aLayerManager,
+      const Maybe<LayoutDevicePoint>& aPosition = Nothing());
+
+ private:
+  enum class Send {
+    NextTransaction,
+    Immediate,
+  };
+  void AddAnimationForProperty(nsIFrame* aFrame,
+                               const AnimationProperty& aProperty,
+                               dom::Animation* aAnimation,
+                               const Maybe<TransformData>& aTransformData,
+                               Send aSendFlag);
+
+  bool AddAnimationsForProperty(
+      nsIFrame* aFrame, const EffectSet* aEffects,
+      const nsTArray<RefPtr<dom::Animation>>& aCompositorAnimations,
+      const Maybe<TransformData>& aTransformData,
+      NonCustomCSSPropertyId aProperty, Send aSendFlag,
+      WebRenderLayerManager* aLayerManager);
+
+  void AddNonAnimatingTransformLikePropertiesStyles(
+      const nsCSSPropertyIDSet& aNonAnimatingProperties, nsIFrame* aFrame,
+      Send aSendFlag);
+
+  void MaybeStartPendingAnimation(Animation&, const TimeStamp& aReadyTime);
+
+  AnimationArray mAnimations;
+  UniquePtr<AnimationArray> mPendingAnimations;
+
+  uint64_t mCompositorAnimationsId;
+  AnimationStorageData mStorageData;
+  Maybe<uint64_t> mAnimationGeneration;
+  bool mMutated;
+};
+
+}  
+}  
+
+#endif  // GFX_ANIMATIONINFO_H

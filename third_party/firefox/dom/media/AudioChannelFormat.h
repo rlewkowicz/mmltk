@@ -1,0 +1,185 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef MOZILLA_AUDIOCHANNELFORMAT_H_
+#define MOZILLA_AUDIOCHANNELFORMAT_H_
+
+#include <stdint.h>
+
+#include "AudioSampleFormat.h"
+#include "nsTArray.h"
+#include "nsTArrayForwardDeclare.h"
+
+namespace mozilla {
+
+
+enum {
+  SURROUND_L,
+  SURROUND_R,
+  SURROUND_C,
+  SURROUND_LFE,
+  SURROUND_SL,
+  SURROUND_SR
+};
+
+const uint32_t CUSTOM_CHANNEL_LAYOUTS = 6;
+
+#undef IGNORE
+
+const int IGNORE = CUSTOM_CHANNEL_LAYOUTS;
+const float IGNORE_F = 0.0f;
+
+const int gMixingMatrixIndexByChannels[CUSTOM_CHANNEL_LAYOUTS - 1] = {0, 5, 9,
+                                                                      12, 14};
+
+uint32_t GetAudioChannelsSuperset(uint32_t aChannels1, uint32_t aChannels2);
+
+const float SQRT_ONE_HALF = 0.7071067811865476f;
+
+struct DownMixMatrix {
+  uint8_t mInputDestination[CUSTOM_CHANNEL_LAYOUTS];
+  uint8_t mCExtraDestination;
+  float mInputCoefficient[CUSTOM_CHANNEL_LAYOUTS];
+};
+
+static const DownMixMatrix gDownMixMatrices[CUSTOM_CHANNEL_LAYOUTS *
+                                            (CUSTOM_CHANNEL_LAYOUTS - 1) /
+                                            2] = {
+    {{0, 0}, IGNORE, {0.5f, 0.5f}},
+    {{0, IGNORE, IGNORE}, IGNORE, {1.0f, IGNORE_F, IGNORE_F}},
+    {{0, 0, 0, 0}, IGNORE, {0.25f, 0.25f, 0.25f, 0.25f}},
+    {{0, IGNORE, IGNORE, IGNORE, IGNORE},
+     IGNORE,
+     {1.0f, IGNORE_F, IGNORE_F, IGNORE_F, IGNORE_F}},
+    {{0, 0, 0, IGNORE, 0, 0},
+     IGNORE,
+     {SQRT_ONE_HALF, SQRT_ONE_HALF, 1.0f, IGNORE_F, 0.5f, 0.5f}},
+    {{0, 1, IGNORE}, IGNORE, {1.0f, 1.0f, IGNORE_F}},
+    {{0, 1, 0, 1}, IGNORE, {0.5f, 0.5f, 0.5f, 0.5f}},
+    {{0, 1, IGNORE, IGNORE, IGNORE},
+     IGNORE,
+     {1.0f, 1.0f, IGNORE_F, IGNORE_F, IGNORE_F}},
+    {{0, 1, 0, IGNORE, 0, 1},
+     1,
+     {1.0f, 1.0f, SQRT_ONE_HALF, IGNORE_F, SQRT_ONE_HALF, SQRT_ONE_HALF}},
+    {{0, 1, 2, IGNORE}, IGNORE, {1.0f, 1.0f, 1.0f, IGNORE_F}},
+    {{0, 1, 2, IGNORE, IGNORE}, IGNORE, {1.0f, 1.0f, 1.0f, IGNORE_F, IGNORE_F}},
+    {{0, 1, 2, IGNORE, IGNORE, IGNORE},
+     IGNORE,
+     {1.0f, 1.0f, 1.0f, IGNORE_F, IGNORE_F, IGNORE_F}},
+    {{0, 1, 2, 3, IGNORE}, IGNORE, {1.0f, 1.0f, 1.0f, 1.0f, IGNORE_F}},
+    {{0, 1, 0, IGNORE, 2, 3},
+     1,
+     {1.0f, 1.0f, SQRT_ONE_HALF, IGNORE_F, 1.0f, 1.0f}},
+    {{0, 1, 2, 3, 4, IGNORE},
+     IGNORE,
+     {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, IGNORE_F}}};
+
+template <typename SrcT, typename DstT>
+void AudioChannelsDownMix(Span<const SrcT* const> aInputChannels,
+                          Span<DstT* const> aOutputChannels,
+                          uint32_t aDuration) {
+  uint32_t inputChannelCount = aInputChannels.Length();
+  uint32_t outputChannelCount = aOutputChannels.Length();
+  NS_ASSERTION(inputChannelCount > outputChannelCount, "Nothing to do");
+
+  if (inputChannelCount > 6) {
+    for (uint32_t o = 0; o < outputChannelCount; ++o) {
+      if (aInputChannels[o]) {
+        ConvertAudioSamples(aInputChannels[o], aOutputChannels[o], aDuration);
+      } else {
+        std::fill_n(aOutputChannels[o], aDuration, static_cast<DstT>(0));
+      }
+    }
+    return;
+  }
+
+  inputChannelCount = std::min<uint32_t>(6, inputChannelCount);
+
+  const DownMixMatrix& m =
+      gDownMixMatrices[gMixingMatrixIndexByChannels[outputChannelCount - 1] +
+                       inputChannelCount - outputChannelCount - 1];
+
+  for (DstT* outChannel : aOutputChannels) {
+    std::fill_n(outChannel, aDuration, static_cast<DstT>(0));
+  }
+  for (uint32_t c = 0; c < inputChannelCount; ++c) {
+    uint32_t dstIndex = m.mInputDestination[c];
+    if (dstIndex == IGNORE || !aInputChannels[c]) {
+      continue;
+    }
+    AddAudioSamplesWithScale(aInputChannels[c], aOutputChannels[dstIndex],
+                             aDuration, m.mInputCoefficient[c]);
+  }
+  uint32_t dstIndex = m.mCExtraDestination;
+  if (dstIndex != IGNORE && aInputChannels[SURROUND_C]) {
+    AddAudioSamplesWithScale(aInputChannels[SURROUND_C],
+                             aOutputChannels[dstIndex], aDuration,
+                             m.mInputCoefficient[SURROUND_C]);
+  }
+}
+
+struct UpMixMatrix {
+  uint8_t mInputDestination[CUSTOM_CHANNEL_LAYOUTS];
+};
+
+static const UpMixMatrix gUpMixMatrices[CUSTOM_CHANNEL_LAYOUTS *
+                                        (CUSTOM_CHANNEL_LAYOUTS - 1) / 2] = {
+    {{0, 0}},
+    {{0, IGNORE, IGNORE}},
+    {{0, 0, IGNORE, IGNORE}},
+    {{0, IGNORE, IGNORE, IGNORE, IGNORE}},
+    {{IGNORE, IGNORE, 0, IGNORE, IGNORE, IGNORE}},
+    {{0, 1, IGNORE}},
+    {{0, 1, IGNORE, IGNORE}},
+    {{0, 1, IGNORE, IGNORE, IGNORE}},
+    {{0, 1, IGNORE, IGNORE, IGNORE, IGNORE}},
+    {{0, 1, 2, IGNORE}},
+    {{0, 1, 2, IGNORE, IGNORE}},
+    {{0, 1, 2, IGNORE, IGNORE, IGNORE}},
+    {{0, 1, 2, 3, IGNORE}},
+    {{0, 1, IGNORE, IGNORE, 2, 3}},
+    {{0, 1, 2, 3, 4, IGNORE}}};
+
+template <typename T>
+void AudioChannelsUpMix(nsTArray<const T*>* aChannelArray,
+                        uint32_t aOutputChannelCount, const T* aZeroChannel) {
+  uint32_t inputChannelCount = aChannelArray->Length();
+  uint32_t outputChannelCount =
+      GetAudioChannelsSuperset(aOutputChannelCount, inputChannelCount);
+  NS_ASSERTION(outputChannelCount > inputChannelCount, "No up-mix needed");
+  MOZ_ASSERT(inputChannelCount > 0, "Bad number of channels");
+  MOZ_ASSERT(outputChannelCount > 0, "Bad number of channels");
+
+  aChannelArray->SetLength(outputChannelCount);
+
+  if (inputChannelCount < CUSTOM_CHANNEL_LAYOUTS &&
+      outputChannelCount <= CUSTOM_CHANNEL_LAYOUTS) {
+    const UpMixMatrix& m =
+        gUpMixMatrices[gMixingMatrixIndexByChannels[inputChannelCount - 1] +
+                       outputChannelCount - inputChannelCount - 1];
+
+    const T* outputChannels[CUSTOM_CHANNEL_LAYOUTS];
+
+    for (uint32_t i = 0; i < outputChannelCount; ++i) {
+      uint8_t channelIndex = m.mInputDestination[i];
+      if (channelIndex == IGNORE) {
+        outputChannels[i] = aZeroChannel;
+      } else {
+        outputChannels[i] = aChannelArray->ElementAt(channelIndex);
+      }
+    }
+    for (uint32_t i = 0; i < outputChannelCount; ++i) {
+      aChannelArray->ElementAt(i) = outputChannels[i];
+    }
+    return;
+  }
+
+  for (uint32_t i = inputChannelCount; i < outputChannelCount; ++i) {
+    aChannelArray->ElementAt(i) = aZeroChannel;
+  }
+}
+
+}  
+
+#endif /* MOZILLA_AUDIOCHANNELFORMAT_H_ */

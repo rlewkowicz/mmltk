@@ -1,0 +1,423 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "AccessCheck.h"
+#include "xpcprivate.h"
+#include "XPCWrapper.h"
+#include "nsContentUtils.h"
+#include "nsCycleCollectionNoteRootCallback.h"
+#include "ExpandedPrincipal.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/Preferences.h"
+#include "XPCMaps.h"
+#include "js/Object.h"              // JS::GetCompartment
+#include "js/PropertyAndElement.h"  // JS_DefineProperty, JS_DefinePropertyById
+#include "js/RealmIterators.h"
+#include "mozJSModuleLoader.h"
+
+#include "mozilla/dom/BindingUtils.h"
+
+using namespace mozilla;
+using namespace xpc;
+using namespace JS;
+
+
+static XPCWrappedNativeScopeList& AllScopes() {
+  return XPCJSRuntime::Get()->GetWrappedNativeScopes();
+}
+
+static bool RemoteXULForbidsXBLScopeForPrincipal(nsIPrincipal* aPrincipal) {
+  MOZ_ASSERT(nsContentUtils::IsInitialized());
+  if (aPrincipal->IsSystemPrincipal()) {
+    return false;
+  }
+
+  if (!nsContentUtils::AllowXULXBLForPrincipal(aPrincipal)) {
+    return false;
+  }
+
+  return !Preferences::GetBool("dom.use_xbl_scopes_for_remote_xul", false);
+}
+
+static bool RemoteXULForbidsXBLScope(HandleObject aFirstGlobal) {
+  MOZ_ASSERT(aFirstGlobal);
+
+  if (IsSandbox(aFirstGlobal)) {
+    return false;
+  }
+
+  nsIPrincipal* principal = xpc::GetObjectPrincipal(aFirstGlobal);
+  return RemoteXULForbidsXBLScopeForPrincipal(principal);
+}
+
+XPCWrappedNativeScope::XPCWrappedNativeScope(JS::Compartment* aCompartment,
+                                             JS::HandleObject aFirstGlobal)
+    : mWrappedNativeMap(mozilla::MakeUnique<Native2WrappedNativeMap>()),
+      mWrappedNativeProtoMap(
+          mozilla::MakeUnique<ClassInfo2WrappedNativeProtoMap>()),
+      mComponents(nullptr),
+      mCompartment(aCompartment) {
+#ifdef DEBUG
+  for (XPCWrappedNativeScope* cur : AllScopes()) {
+    MOZ_ASSERT(aCompartment != cur->Compartment(), "dup object");
+  }
+#endif
+
+  AllScopes().insertBack(this);
+
+  MOZ_COUNT_CTOR(XPCWrappedNativeScope);
+
+  mAllowContentXBLScope = !RemoteXULForbidsXBLScope(aFirstGlobal);
+}
+
+bool XPCWrappedNativeScope::GetComponentsJSObject(JSContext* cx,
+                                                  JS::MutableHandleObject obj) {
+  if (!mComponents) {
+    bool system = AccessCheck::isChrome(mCompartment);
+    MOZ_RELEASE_ASSERT(system, "How did we get a non-system Components?");
+    mComponents = new nsXPCComponents(this);
+  }
+
+  RootedValue val(cx);
+  xpcObjectHelper helper(mComponents);
+  bool ok = XPCConvert::NativeInterface2JSObject(cx, &val, helper, nullptr,
+                                                 false, nullptr);
+  if (NS_WARN_IF(!ok)) {
+    return false;
+  }
+
+  if (NS_WARN_IF(!val.isObject())) {
+    return false;
+  }
+
+  obj.set(&val.toObject());
+  return true;
+}
+
+static bool DefineSubcomponentProperty(JSContext* aCx, HandleObject aGlobal,
+                                       nsISupports* aSubcomponent,
+                                       const nsID* aIID,
+                                       unsigned int aStringIndex) {
+  RootedValue subcompVal(aCx);
+  xpcObjectHelper helper(aSubcomponent);
+  if (!XPCConvert::NativeInterface2JSObject(aCx, &subcompVal, helper, aIID,
+                                            false, nullptr))
+    return false;
+  if (NS_WARN_IF(!subcompVal.isObject())) {
+    return false;
+  }
+  RootedId id(aCx, XPCJSContext::Get()->GetStringID(aStringIndex));
+  return JS_DefinePropertyById(aCx, aGlobal, id, subcompVal, 0);
+}
+
+bool XPCWrappedNativeScope::AttachComponentsObject(JSContext* aCx) {
+  RootedObject components(aCx);
+  if (!GetComponentsJSObject(aCx, &components)) {
+    return false;
+  }
+
+  RootedObject global(aCx, CurrentGlobalOrNull(aCx));
+
+  const unsigned attrs = JSPROP_READONLY | JSPROP_RESOLVING | JSPROP_PERMANENT;
+
+  RootedId id(aCx,
+              XPCJSContext::Get()->GetStringID(XPCJSContext::IDX_COMPONENTS));
+  if (!JS_DefinePropertyById(aCx, global, id, components, attrs)) {
+    return false;
+  }
+
+#define DEFINE_SUBCOMPONENT_PROPERTY(_comp, _type, _iid, _id)                 \
+  nsCOMPtr<nsIXPCComponents_##_type> obj##_type;                              \
+  if (NS_FAILED(_comp->Get##_type(getter_AddRefs(obj##_type)))) return false; \
+  if (!DefineSubcomponentProperty(aCx, global, obj##_type, _iid,              \
+                                  XPCJSContext::IDX_##_id))                   \
+    return false;
+
+  DEFINE_SUBCOMPONENT_PROPERTY(mComponents, Interfaces, nullptr, CI)
+  DEFINE_SUBCOMPONENT_PROPERTY(mComponents, Results, nullptr, CR)
+
+  DEFINE_SUBCOMPONENT_PROPERTY(mComponents, Classes, nullptr, CC)
+  DEFINE_SUBCOMPONENT_PROPERTY(mComponents, Utils,
+                               &NS_GET_IID(nsIXPCComponents_Utils), CU)
+
+#undef DEFINE_SUBCOMPONENT_PROPERTY
+
+  return true;
+}
+
+bool XPCWrappedNativeScope::AttachJSServices(JSContext* aCx) {
+  RootedObject global(aCx, CurrentGlobalOrNull(aCx));
+  return mozJSModuleLoader::Get()->DefineJSServices(aCx, global);
+}
+
+bool XPCWrappedNativeScope::XBLScopeStateMatches(nsIPrincipal* aPrincipal) {
+  return mAllowContentXBLScope ==
+         !RemoteXULForbidsXBLScopeForPrincipal(aPrincipal);
+}
+
+bool XPCWrappedNativeScope::AllowContentXBLScope(Realm* aRealm) {
+  MOZ_ASSERT_IF(!mAllowContentXBLScope, nsContentUtils::AllowXULXBLForPrincipal(
+                                            xpc::GetRealmPrincipal(aRealm)));
+  return mAllowContentXBLScope;
+}
+
+namespace xpc {
+JSObject* GetUAWidgetScope(JSContext* cx, JSObject* contentScopeArg) {
+  JS::RootedObject contentScope(cx, contentScopeArg);
+  JSAutoRealm ar(cx, contentScope);
+  nsIPrincipal* principal = GetObjectPrincipal(contentScope);
+
+  if (principal->IsSystemPrincipal()) {
+    return JS::GetNonCCWObjectGlobal(contentScope);
+  }
+
+  return GetUAWidgetScope(cx, principal);
+}
+
+JSObject* GetUAWidgetScope(JSContext* cx, nsIPrincipal* principal) {
+  RootedObject scope(cx, XPCJSRuntime::Get()->GetUAWidgetScope(cx, principal));
+  NS_ENSURE_TRUE(scope, nullptr);  
+
+  scope = js::UncheckedUnwrap(scope);
+  JS::ExposeObjectToActiveJS(scope);
+  return scope;
+}
+
+bool AllowContentXBLScope(JS::Realm* realm) {
+  JS::Compartment* comp = GetCompartmentForRealm(realm);
+  XPCWrappedNativeScope* scope = CompartmentPrivate::Get(comp)->GetScope();
+  MOZ_ASSERT(scope);
+  return scope->AllowContentXBLScope(realm);
+}
+
+} 
+
+XPCWrappedNativeScope::~XPCWrappedNativeScope() {
+  MOZ_COUNT_DTOR(XPCWrappedNativeScope);
+
+
+  MOZ_ASSERT(0 == mWrappedNativeMap->Count(), "scope has non-empty map");
+
+  MOZ_ASSERT(0 == mWrappedNativeProtoMap->Count(), "scope has non-empty map");
+
+  if (mComponents) {
+    mComponents->mScope = nullptr;
+  }
+
+  mComponents = nullptr;
+
+  MOZ_RELEASE_ASSERT(!mXrayExpandos.initialized());
+
+  mCompartment = nullptr;
+}
+
+void XPCWrappedNativeScope::TraceWrappedNativesInAllScopes(XPCJSRuntime* xpcrt,
+                                                           JSTracer* trc) {
+
+  for (XPCWrappedNativeScope* cur : xpcrt->GetWrappedNativeScopes()) {
+    for (auto i = cur->mWrappedNativeMap->Iter(); !i.done(); i.next()) {
+      XPCWrappedNative* wrapper = i.get().value();
+      if (wrapper->HasExternalReference() && !wrapper->IsWrapperExpired()) {
+        wrapper->TraceSelf(trc);
+      }
+    }
+  }
+}
+
+void XPCWrappedNativeScope::SuspectAllWrappers(
+    nsCycleCollectionNoteRootCallback& cb) {
+  for (XPCWrappedNativeScope* cur : AllScopes()) {
+    for (auto i = cur->mWrappedNativeMap->Iter(); !i.done(); i.next()) {
+      i.get().value()->Suspect(cb);
+    }
+  }
+}
+
+void XPCWrappedNativeScope::UpdateWeakPointersAfterGC(JSTracer* trc) {
+  if (mWaiverWrapperMap) {
+    mWaiverWrapperMap->UpdateWeakPointers(trc);
+  }
+
+  if (!js::IsCompartmentZoneSweepingOrCompacting(mCompartment)) {
+    return;
+  }
+
+  if (!js::CompartmentHasLiveGlobal(mCompartment)) {
+    GetWrappedNativeMap()->Clear();
+    mWrappedNativeProtoMap->Clear();
+
+    if (mXrayExpandos.initialized()) {
+      mXrayExpandos.destroy();
+    }
+    mIDProto = nullptr;
+    mIIDProto = nullptr;
+    mCIDProto = nullptr;
+    return;
+  }
+
+  for (auto iter = GetWrappedNativeMap()->ModIter(); !iter.done();
+       iter.next()) {
+    XPCWrappedNative* wrapper = iter.get().value();
+    JSObject* obj = wrapper->GetFlatJSObjectPreserveColor();
+    if (JS_UpdateWeakPointerAfterGCUnbarriered(trc, &obj)) {
+      MOZ_ASSERT(obj == wrapper->GetFlatJSObjectPreserveColor());
+      MOZ_ASSERT(JS::GetCompartment(obj) == mCompartment);
+    } else {
+      iter.remove();
+    }
+  }
+
+  for (auto i = mWrappedNativeProtoMap->ModIter(); !i.done(); i.next()) {
+    XPCWrappedNativeProto* proto = i.get().value();
+    JSObject* obj = proto->GetJSProtoObjectPreserveColor();
+    if (JS_UpdateWeakPointerAfterGCUnbarriered(trc, &obj)) {
+      MOZ_ASSERT(JS::GetCompartment(obj) == mCompartment);
+      MOZ_ASSERT(obj == proto->GetJSProtoObjectPreserveColor());
+    } else {
+      i.remove();
+    }
+  }
+}
+
+void XPCWrappedNativeScope::SweepAllWrappedNativeTearOffs() {
+  for (XPCWrappedNativeScope* cur : AllScopes()) {
+    for (auto i = cur->mWrappedNativeMap->Iter(); !i.done(); i.next()) {
+      i.get().value()->SweepTearOffs();
+    }
+  }
+}
+
+void XPCWrappedNativeScope::SystemIsBeingShutDown() {
+
+  for (XPCWrappedNativeScope* cur : AllScopes()) {
+    if (cur->mComponents) {
+      cur->mComponents->SystemIsBeingShutDown();
+    }
+
+    cur->mIDProto = nullptr;
+    cur->mIIDProto = nullptr;
+    cur->mCIDProto = nullptr;
+
+    if (cur->mXrayExpandos.initialized()) {
+      cur->mXrayExpandos.destroy();
+    }
+
+    for (auto i = cur->mWrappedNativeProtoMap->ModIter(); !i.done(); i.next()) {
+      i.get().value()->SystemIsBeingShutDown();
+      i.remove();
+    }
+    for (auto i = cur->mWrappedNativeMap->ModIter(); !i.done(); i.next()) {
+      i.get().value()->SystemIsBeingShutDown();
+      i.remove();
+    }
+
+    CompartmentPrivate* priv = CompartmentPrivate::Get(cur->Compartment());
+    priv->SystemIsBeingShutDown();
+  }
+}
+
+
+JSObject* XPCWrappedNativeScope::GetExpandoChain(HandleObject target) {
+  MOZ_ASSERT(ObjectScope(target) == this);
+  if (!mXrayExpandos.initialized()) {
+    return nullptr;
+  }
+  return mXrayExpandos.lookup(target);
+}
+
+bool XPCWrappedNativeScope::SetExpandoChain(JSContext* cx, HandleObject target,
+                                            HandleObject chain) {
+  MOZ_ASSERT(ObjectScope(target) == this);
+  MOZ_ASSERT(js::IsObjectInContextCompartment(target, cx));
+  MOZ_ASSERT_IF(chain, ObjectScope(chain) == this);
+  if (!mXrayExpandos.initialized() && !mXrayExpandos.init(cx)) {
+    return false;
+  }
+  return mXrayExpandos.put(cx, target, chain);
+}
+
+
+void XPCWrappedNativeScope::DebugDumpAllScopes(int16_t depth) {
+#ifdef DEBUG
+  depth--;
+
+  int count = 0;
+  for (XPCWrappedNativeScope* cur : AllScopes()) {
+    (void)cur;
+    count++;
+  }
+
+  XPC_LOG_ALWAYS(("chain of %d XPCWrappedNativeScope(s)", count));
+  XPC_LOG_INDENT();
+  if (depth) {
+    for (XPCWrappedNativeScope* cur : AllScopes()) {
+      cur->DebugDump(depth);
+    }
+  }
+  XPC_LOG_OUTDENT();
+#endif
+}
+
+void XPCWrappedNativeScope::DebugDump(int16_t depth) {
+#ifdef DEBUG
+  depth--;
+  XPC_LOG_ALWAYS(("XPCWrappedNativeScope @ %p", this));
+  XPC_LOG_INDENT();
+  XPC_LOG_ALWAYS(("next @ %p", getNext()));
+  XPC_LOG_ALWAYS(("mComponents @ %p", mComponents.get()));
+  XPC_LOG_ALWAYS(("mCompartment @ %p", mCompartment));
+
+  XPC_LOG_ALWAYS(("mWrappedNativeMap @ %p with %d wrappers(s)",
+                  mWrappedNativeMap.get(), mWrappedNativeMap->Count()));
+  if (depth && mWrappedNativeMap->Count()) {
+    XPC_LOG_INDENT();
+    for (auto i = mWrappedNativeMap->Iter(); !i.done(); i.next()) {
+      i.get().value()->DebugDump(depth);
+    }
+    XPC_LOG_OUTDENT();
+  }
+
+  XPC_LOG_ALWAYS(("mWrappedNativeProtoMap @ %p with %d protos(s)",
+                  mWrappedNativeProtoMap.get(),
+                  mWrappedNativeProtoMap->Count()));
+  if (depth && mWrappedNativeProtoMap->Count()) {
+    XPC_LOG_INDENT();
+    for (auto i = mWrappedNativeProtoMap->Iter(); !i.done(); i.next()) {
+      i.get().value()->DebugDump(depth);
+    }
+    XPC_LOG_OUTDENT();
+  }
+  XPC_LOG_OUTDENT();
+#endif
+}
+
+void XPCWrappedNativeScope::AddSizeOfAllScopesIncludingThis(
+    JSContext* cx, ScopeSizeInfo* scopeSizeInfo) {
+  for (XPCWrappedNativeScope* cur : AllScopes()) {
+    cur->AddSizeOfIncludingThis(cx, scopeSizeInfo);
+  }
+}
+
+void XPCWrappedNativeScope::AddSizeOfIncludingThis(
+    JSContext* cx, ScopeSizeInfo* scopeSizeInfo) {
+  scopeSizeInfo->mScopeAndMapSize += scopeSizeInfo->mMallocSizeOf(this);
+  scopeSizeInfo->mScopeAndMapSize +=
+      mWrappedNativeMap->SizeOfIncludingThis(scopeSizeInfo->mMallocSizeOf);
+  scopeSizeInfo->mScopeAndMapSize +=
+      mWrappedNativeProtoMap->SizeOfIncludingThis(scopeSizeInfo->mMallocSizeOf);
+
+  auto realmCb = [](JSContext*, void* aData, JS::Realm* aRealm,
+                    const JS::AutoRequireNoGC& nogc) {
+    auto* scopeSizeInfo = static_cast<ScopeSizeInfo*>(aData);
+    JSObject* global = GetRealmGlobalOrNull(aRealm);
+    if (global && dom::HasProtoAndIfaceCache(global)) {
+      dom::ProtoAndIfaceCache* cache = dom::GetProtoAndIfaceCache(global);
+      scopeSizeInfo->mProtoAndIfaceCacheSize +=
+          cache->SizeOfIncludingThis(scopeSizeInfo->mMallocSizeOf);
+    }
+  };
+  IterateRealmsInCompartment(cx, Compartment(), scopeSizeInfo, realmCb);
+
+}

@@ -1,0 +1,43 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_TreeOrderedArray_h
+#define mozilla_dom_TreeOrderedArray_h
+
+#include "FastFrontRemovableArray.h"
+#include "nsContentUtils.h"
+
+class nsINode;
+template <typename T>
+class RefPtr;
+
+namespace mozilla::dom {
+
+template <typename NodePointer, TreeKind K = TreeKind::DOM>
+class TreeOrderedArray : public FastFrontRemovableArray<NodePointer, 1> {
+  using Base = FastFrontRemovableArray<NodePointer, 1>;
+
+  template <typename T>
+  struct RawTypeExtractor {};
+
+  template <typename T>
+  struct RawTypeExtractor<T*> {
+    using type = T;
+  };
+
+  template <typename T>
+  struct RawTypeExtractor<RefPtr<T>> {
+    using type = T;
+  };
+
+  using Node = typename RawTypeExtractor<NodePointer>::type;
+
+ public:
+  inline size_t Insert(Node&, nsINode* aCommonAncestor = nullptr);
+  bool RemoveElement(Node& aNode) { return Base::RemoveElement(&aNode); }
+};
+
+}  
+
+#endif

@@ -1,0 +1,161 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#if !defined(VPXDecoder_h_)
+#  define VPXDecoder_h_
+
+#  include <stdint.h>
+#  include <vpx/vp8dx.h>
+#  include <vpx/vpx_codec.h>
+#  include <vpx/vpx_decoder.h>
+
+#  include "PlatformDecoderModule.h"
+#  include "mozilla/Span.h"
+#  include "mozilla/gfx/Types.h"
+
+namespace mozilla {
+
+DDLoggedTypeDeclNameAndBase(VPXDecoder, MediaDataDecoder);
+
+class VPXDecoder final : public MediaDataDecoder,
+                         public DecoderDoctorLifeLogger<VPXDecoder> {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(VPXDecoder, final);
+
+  explicit VPXDecoder(const CreateDecoderParams& aParams);
+
+  RefPtr<InitPromise> Init() override;
+  RefPtr<DecodePromise> Decode(MediaRawData* aSample) override;
+  RefPtr<DecodePromise> Drain() override;
+  RefPtr<FlushPromise> Flush() override;
+  RefPtr<ShutdownPromise> Shutdown() override;
+  nsCString GetDescriptionName() const override {
+    return "libvpx video decoder"_ns;
+  }
+  nsCString GetCodecName() const override;
+
+  enum Codec : uint8_t {
+    VP8 = 1 << 0,
+    VP9 = 1 << 1,
+    Unknown = 1 << 7,
+  };
+
+  static bool IsVPX(const nsACString& aMimeType,
+                    uint8_t aCodecMask = VP8 | VP9);
+  static bool IsVP8(const nsACString& aMimeType);
+  static bool IsVP9(const nsACString& aMimeType);
+
+  static bool IsKeyframe(Span<const uint8_t> aBuffer, Codec aCodec);
+
+  static gfx::IntSize GetFrameSize(Span<const uint8_t> aBuffer, Codec aCodec);
+  static gfx::IntSize GetDisplaySize(Span<const uint8_t> aBuffer, Codec aCodec);
+
+  static int GetVP9Profile(Span<const uint8_t> aBuffer);
+
+  struct VPXStreamInfo {
+    gfx::IntSize mImage;
+    bool mDisplayAndImageDifferent = false;
+    gfx::IntSize mDisplay;
+    bool mKeyFrame = false;
+
+    uint8_t mProfile = 0;
+    uint8_t mBitDepth = 8;
+    int mColorSpace = 1;  
+
+    gfx::YUVColorSpace ColorSpace() const {
+      switch (mColorSpace) {
+        case 1:
+        case 3:
+        case 4:
+          return gfx::YUVColorSpace::BT601;
+        case 2:
+          return gfx::YUVColorSpace::BT709;
+        case 5:
+          return gfx::YUVColorSpace::BT2020;
+        default:
+          return gfx::YUVColorSpace::Default;
+      }
+    }
+
+    uint8_t mColorPrimaries = gfx::CICP::ColourPrimaries::CP_UNSPECIFIED;
+    gfx::ColorSpace2 ColorPrimaries() const {
+      switch (mColorPrimaries) {
+        case gfx::CICP::ColourPrimaries::CP_BT709:
+          return gfx::ColorSpace2::BT709;
+        case gfx::CICP::ColourPrimaries::CP_UNSPECIFIED:
+          return gfx::ColorSpace2::BT709;
+        case gfx::CICP::ColourPrimaries::CP_BT2020:
+          return gfx::ColorSpace2::BT2020;
+        default:
+          return gfx::ColorSpace2::BT709;
+      }
+    }
+
+    uint8_t mTransferFunction =
+        gfx::CICP::TransferCharacteristics::TC_UNSPECIFIED;
+    gfx::TransferFunction TransferFunction() const {
+      switch (mTransferFunction) {
+        case gfx::CICP::TransferCharacteristics::TC_BT709:
+          return gfx::TransferFunction::BT709;
+        case gfx::CICP::TransferCharacteristics::TC_SRGB:
+          return gfx::TransferFunction::SRGB;
+        case gfx::CICP::TransferCharacteristics::TC_SMPTE2084:
+          return gfx::TransferFunction::PQ;
+        case gfx::CICP::TransferCharacteristics::TC_HLG:
+          return gfx::TransferFunction::HLG;
+        default:
+          return gfx::TransferFunction::BT709;
+      }
+    }
+
+    bool mFullRange = false;
+
+    gfx::ColorRange ColorRange() const {
+      return mFullRange ? gfx::ColorRange::FULL : gfx::ColorRange::LIMITED;
+    }
+
+    bool mSubSampling_x = true;
+    bool mSubSampling_y = true;
+
+    bool IsCompatible(const VPXStreamInfo& aOther) const {
+      return mImage == aOther.mImage && mProfile == aOther.mProfile &&
+             mBitDepth == aOther.mBitDepth &&
+             mSubSampling_x == aOther.mSubSampling_x &&
+             mSubSampling_y == aOther.mSubSampling_y &&
+             mColorSpace == aOther.mColorSpace &&
+             mFullRange == aOther.mFullRange;
+    }
+  };
+
+  static bool GetStreamInfo(Span<const uint8_t> aBuffer, VPXStreamInfo& aInfo,
+                            Codec aCodec);
+
+  static void GetVPCCBox(MediaByteBuffer* aDestBox, const VPXStreamInfo& aInfo);
+  static bool SetVideoInfo(VideoInfo* aDestInfo, const nsAString& aCodec);
+
+  static void SetChroma(VPXStreamInfo& aDestInfo, uint8_t chroma);
+  static void ReadVPCCBox(VPXStreamInfo& aDestInfo, MediaByteBuffer* aBox);
+
+ private:
+  ~VPXDecoder();
+  RefPtr<DecodePromise> ProcessDecode(MediaRawData* aSample);
+  MediaResult DecodeAlpha(vpx_image_t** aImgAlpha, const MediaRawData* aSample);
+
+  const RefPtr<layers::ImageContainer> mImageContainer;
+  RefPtr<layers::KnowsCompositor> mImageAllocator;
+  const RefPtr<TaskQueue> mTaskQueue;
+
+  vpx_codec_ctx_t mVPX;
+
+  vpx_codec_ctx_t mVPXAlpha;
+
+  const VideoInfo mInfo;
+
+  const Codec mCodec;
+  const bool mLowLatency;
+  const Maybe<TrackingId> mTrackingId;
+};
+
+}  
+
+#endif

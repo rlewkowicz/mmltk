@@ -1,0 +1,120 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_WritableStreamDefaultController_h
+#define mozilla_dom_WritableStreamDefaultController_h
+
+#include "js/TypeDecls.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/Nullable.h"
+#include "mozilla/dom/QueueWithSizes.h"
+#include "mozilla/dom/QueuingStrategyBinding.h"
+#include "mozilla/dom/ReadRequest.h"
+#include "mozilla/dom/UnderlyingSinkCallbackHelpers.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsISupports.h"
+#include "nsTArray.h"
+#include "nsWrapperCache.h"
+
+namespace mozilla::dom {
+
+class AbortSignal;
+class WritableStream;
+struct UnderlyingSink;
+
+class WritableStreamDefaultController final : public nsISupports,
+                                              public nsWrapperCache {
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_CLASS(WritableStreamDefaultController)
+
+  explicit WritableStreamDefaultController(nsISupports* aGlobal,
+                                           WritableStream& aStream);
+
+ protected:
+  ~WritableStreamDefaultController();
+
+ public:
+  nsIGlobalObject* GetParentObject() const { return mGlobal; }
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+
+  AbortSignal* Signal() { return mSignal; }
+
+  MOZ_CAN_RUN_SCRIPT void Error(JSContext* aCx, JS::Handle<JS::Value> aError,
+                                ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT virtual already_AddRefed<Promise> AbortSteps(
+      JSContext* aCx, JS::Handle<JS::Value> aReason, ErrorResult& aRv);
+
+  virtual void ErrorSteps();
+
+
+  QueueWithSizes& Queue() { return mQueue; }
+
+  double QueueTotalSize() const { return mQueueTotalSize; }
+  void SetQueueTotalSize(double aQueueTotalSize) {
+    mQueueTotalSize = aQueueTotalSize;
+  }
+
+  void SetSignal(AbortSignal* aSignal);
+
+  bool Started() const { return mStarted; }
+  void SetStarted(bool aStarted) { mStarted = aStarted; }
+
+  double StrategyHWM() const { return mStrategyHWM; }
+  void SetStrategyHWM(double aStrategyHWM) { mStrategyHWM = aStrategyHWM; }
+
+  QueuingStrategySize* StrategySizeAlgorithm() const {
+    return mStrategySizeAlgorithm;
+  }
+  void SetStrategySizeAlgorithm(QueuingStrategySize* aStrategySizeAlgorithm) {
+    mStrategySizeAlgorithm = aStrategySizeAlgorithm;
+  }
+
+  UnderlyingSinkAlgorithmsBase* GetAlgorithms() { return mAlgorithms; }
+  void SetAlgorithms(UnderlyingSinkAlgorithmsBase& aAlgorithms) {
+    mAlgorithms = &aAlgorithms;
+  }
+
+  WritableStream* Stream() { return mStream; }
+
+  bool GetBackpressure() const {
+    double desiredSize = GetDesiredSize();
+    return desiredSize <= 0;
+  }
+
+  double GetDesiredSize() const { return mStrategyHWM - mQueueTotalSize; }
+
+  void ClearAlgorithms() {
+    if (RefPtr<UnderlyingSinkAlgorithmsBase> algorithms =
+            mAlgorithms.forget()) {
+      algorithms->ReleaseObjects();
+    }
+
+    mStrategySizeAlgorithm = nullptr;
+  }
+
+ private:
+  nsCOMPtr<nsIGlobalObject> mGlobal;
+
+  QueueWithSizes mQueue = {};
+  double mQueueTotalSize = 0.0;
+  RefPtr<AbortSignal> mSignal;
+  bool mStarted = false;
+  double mStrategyHWM = 0.0;
+
+  RefPtr<QueuingStrategySize> mStrategySizeAlgorithm;
+  RefPtr<UnderlyingSinkAlgorithmsBase> mAlgorithms;
+  RefPtr<WritableStream> mStream;
+};
+
+}  
+
+#endif  // mozilla_dom_WritableStreamDefaultController_h

@@ -1,0 +1,205 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+
+#ifndef __UCASEMAP_IMP_H__
+#define __UCASEMAP_IMP_H__
+
+#include "unicode/utypes.h"
+#include "unicode/ucasemap.h"
+#include "unicode/uchar.h"
+#include "ucase.h"
+
+#define U_TITLECASE_ITERATOR_MASK 0xe0
+
+#define U_TITLECASE_ADJUSTMENT_MASK 0x600
+
+U_CFUNC int32_t
+u_strcmpFold(const UChar *s1, int32_t length1,
+             const UChar *s2, int32_t length2,
+             uint32_t options,
+             UErrorCode *pErrorCode);
+
+U_CAPI void
+u_caseInsensitivePrefixMatch(const UChar *s1, int32_t length1,
+                             const UChar *s2, int32_t length2,
+                             uint32_t options,
+                             int32_t *matchLen1, int32_t *matchLen2,
+                             UErrorCode *pErrorCode);
+
+#ifdef __cplusplus
+
+U_NAMESPACE_BEGIN
+
+class BreakIterator;        
+class ByteSink;
+class Locale;               
+
+inline UBool ustrcase_checkTitleAdjustmentOptions(uint32_t options, UErrorCode &errorCode) {
+    if (U_FAILURE(errorCode)) { return false; }
+    if ((options & U_TITLECASE_ADJUSTMENT_MASK) == U_TITLECASE_ADJUSTMENT_MASK) {
+        errorCode = U_ILLEGAL_ARGUMENT_ERROR;
+        return false;
+    }
+    return true;
+}
+
+inline UBool ustrcase_isLNS(UChar32 c) {
+    const uint32_t LNS = (U_GC_L_MASK|U_GC_N_MASK|U_GC_S_MASK|U_GC_CO_MASK) & ~U_GC_LM_MASK;
+    int gc = u_charType(c);
+    return (U_MASK(gc) & LNS) != 0 || (gc == U_MODIFIER_LETTER && ucase_getType(c) != UCASE_NONE);
+}
+
+#if !UCONFIG_NO_BREAK_ITERATION
+
+U_CFUNC
+BreakIterator *ustrcase_getTitleBreakIterator(
+        const Locale *locale, const char *locID, uint32_t options, BreakIterator *iter,
+        LocalPointer<BreakIterator> &ownedIter, UErrorCode &errorCode);
+
+#endif
+
+U_NAMESPACE_END
+
+#include "unicode/unistr.h"  // for UStringCaseMapper
+
+
+struct UCaseMap : public icu::UMemory {
+    UCaseMap(const char *localeID, uint32_t opts, UErrorCode *pErrorCode);
+    ~UCaseMap();
+
+#if !UCONFIG_NO_BREAK_ITERATION
+    icu::BreakIterator *iter;  
+#endif
+    char locale[32];
+    int32_t caseLocale;
+    uint32_t options;
+};
+
+#if UCONFIG_NO_BREAK_ITERATION
+#   define UCASEMAP_BREAK_ITERATOR_PARAM
+#   define UCASEMAP_BREAK_ITERATOR_UNUSED
+#   define UCASEMAP_BREAK_ITERATOR
+#   define UCASEMAP_BREAK_ITERATOR_NULL
+#else
+#   define UCASEMAP_BREAK_ITERATOR_PARAM icu::BreakIterator *iter,
+#   define UCASEMAP_BREAK_ITERATOR_UNUSED icu::BreakIterator *,
+#   define UCASEMAP_BREAK_ITERATOR iter,
+#   define UCASEMAP_BREAK_ITERATOR_NULL NULL,
+#endif
+
+U_CFUNC int32_t
+ustrcase_getCaseLocale(const char *locale);
+
+U_CFUNC int32_t U_CALLCONV
+ustrcase_internalToLower(int32_t caseLocale, uint32_t options, UCASEMAP_BREAK_ITERATOR_PARAM
+                         char16_t *dest, int32_t destCapacity,
+                         const char16_t *src, int32_t srcLength,
+                         icu::Edits *edits,
+                         UErrorCode &errorCode);
+
+U_CFUNC int32_t U_CALLCONV
+ustrcase_internalToUpper(int32_t caseLocale, uint32_t options, UCASEMAP_BREAK_ITERATOR_PARAM
+                         char16_t *dest, int32_t destCapacity,
+                         const char16_t *src, int32_t srcLength,
+                         icu::Edits *edits,
+                         UErrorCode &errorCode);
+
+#if !UCONFIG_NO_BREAK_ITERATION
+
+U_CFUNC int32_t U_CALLCONV
+ustrcase_internalToTitle(int32_t caseLocale, uint32_t options,
+                         icu::BreakIterator *iter,
+                         char16_t *dest, int32_t destCapacity,
+                         const char16_t *src, int32_t srcLength,
+                         icu::Edits *edits,
+                         UErrorCode &errorCode);
+
+#endif
+
+U_CFUNC int32_t U_CALLCONV
+ustrcase_internalFold(int32_t caseLocale, uint32_t options, UCASEMAP_BREAK_ITERATOR_PARAM
+                      char16_t *dest, int32_t destCapacity,
+                      const char16_t *src, int32_t srcLength,
+                      icu::Edits *edits,
+                      UErrorCode &errorCode);
+
+U_CFUNC int32_t
+ustrcase_map(int32_t caseLocale, uint32_t options, UCASEMAP_BREAK_ITERATOR_PARAM
+             char16_t *dest, int32_t destCapacity,
+             const char16_t *src, int32_t srcLength,
+             UStringCaseMapper *stringCaseMapper,
+             icu::Edits *edits,
+             UErrorCode &errorCode);
+
+U_CFUNC int32_t
+ustrcase_mapWithOverlap(int32_t caseLocale, uint32_t options, UCASEMAP_BREAK_ITERATOR_PARAM
+                        char16_t *dest, int32_t destCapacity,
+                        const char16_t *src, int32_t srcLength,
+                        UStringCaseMapper *stringCaseMapper,
+                        UErrorCode &errorCode);
+
+typedef void U_CALLCONV
+UTF8CaseMapper(int32_t caseLocale, uint32_t options,
+#if !UCONFIG_NO_BREAK_ITERATION
+               icu::BreakIterator *iter,
+#endif
+               const uint8_t *src, int32_t srcLength,
+               icu::ByteSink &sink, icu::Edits *edits,
+               UErrorCode &errorCode);
+
+#if !UCONFIG_NO_BREAK_ITERATION
+
+U_CFUNC void U_CALLCONV
+ucasemap_internalUTF8ToTitle(int32_t caseLocale, uint32_t options,
+        icu::BreakIterator *iter,
+        const uint8_t *src, int32_t srcLength,
+        icu::ByteSink &sink, icu::Edits *edits,
+        UErrorCode &errorCode);
+
+#endif
+
+void
+ucasemap_mapUTF8(int32_t caseLocale, uint32_t options, UCASEMAP_BREAK_ITERATOR_PARAM
+                 const char *src, int32_t srcLength,
+                 UTF8CaseMapper *stringCaseMapper,
+                 icu::ByteSink &sink, icu::Edits *edits,
+                 UErrorCode &errorCode);
+
+int32_t
+ucasemap_mapUTF8(int32_t caseLocale, uint32_t options, UCASEMAP_BREAK_ITERATOR_PARAM
+                 char *dest, int32_t destCapacity,
+                 const char *src, int32_t srcLength,
+                 UTF8CaseMapper *stringCaseMapper,
+                 icu::Edits *edits,
+                 UErrorCode &errorCode);
+
+U_NAMESPACE_BEGIN
+namespace GreekUpper {
+
+static const uint32_t UPPER_MASK = 0x3ff;
+static const uint32_t HAS_VOWEL = 0x1000;
+static const uint32_t HAS_YPOGEGRAMMENI = 0x2000;
+static const uint32_t HAS_ACCENT = 0x4000;
+static const uint32_t HAS_DIALYTIKA = 0x8000;
+static const uint32_t HAS_COMBINING_DIALYTIKA = 0x10000;
+static const uint32_t HAS_OTHER_GREEK_DIACRITIC = 0x20000;
+
+static const uint32_t HAS_VOWEL_AND_ACCENT = HAS_VOWEL | HAS_ACCENT;
+static const uint32_t HAS_VOWEL_AND_ACCENT_AND_DIALYTIKA =
+        HAS_VOWEL_AND_ACCENT | HAS_DIALYTIKA;
+static const uint32_t HAS_EITHER_DIALYTIKA = HAS_DIALYTIKA | HAS_COMBINING_DIALYTIKA;
+
+static const uint32_t AFTER_CASED = 1;
+static const uint32_t AFTER_VOWEL_WITH_COMBINING_ACCENT = 2;
+static const uint32_t AFTER_VOWEL_WITH_PRECOMPOSED_ACCENT = 4;
+
+uint32_t getLetterData(UChar32 c);
+
+uint32_t getDiacriticData(UChar32 c);
+
+}  
+U_NAMESPACE_END
+
+#endif  // __cplusplus
+
+#endif  // __UCASEMAP_IMP_H__

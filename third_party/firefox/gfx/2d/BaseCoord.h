@@ -1,0 +1,88 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_GFX_BASECOORD_H_
+#define MOZILLA_GFX_BASECOORD_H_
+
+#include <ostream>
+#include <tuple>
+
+#include "mozilla/MathAlgorithms.h"
+
+namespace mozilla::gfx {
+
+template <class T, class Sub>
+struct BaseCoord {
+  T value;
+
+  constexpr BaseCoord() : value(0) {}
+  explicit constexpr BaseCoord(T aValue) : value(aValue) {}
+
+
+  friend constexpr Sub Abs(BaseCoord aCoord) { return Abs(aCoord.value); }
+
+  constexpr operator T() const { return value; }
+
+  friend constexpr bool operator==(Sub aA, Sub aB) {
+    return aA.value == aB.value;
+  }
+  friend constexpr bool operator!=(Sub aA, Sub aB) {
+    return aA.value != aB.value;
+  }
+
+  friend constexpr Sub operator+(Sub aA, Sub aB) {
+    return Sub(aA.value + aB.value);
+  }
+  friend constexpr Sub operator-(Sub aA, Sub aB) {
+    return Sub(aA.value - aB.value);
+  }
+  friend constexpr Sub operator*(Sub aCoord, T aScale) {
+    return Sub(aCoord.value * aScale);
+  }
+  friend constexpr Sub operator*(T aScale, Sub aCoord) {
+    return Sub(aScale * aCoord.value);
+  }
+  friend constexpr Sub operator/(Sub aCoord, T aScale) {
+    return Sub(aCoord.value / aScale);
+  }
+
+  constexpr Sub& operator+=(Sub aCoord) {
+    value += aCoord.value;
+    return *static_cast<Sub*>(this);
+  }
+  constexpr Sub& operator-=(Sub aCoord) {
+    value -= aCoord.value;
+    return *static_cast<Sub*>(this);
+  }
+  constexpr Sub& operator*=(T aScale) {
+    value *= aScale;
+    return *static_cast<Sub*>(this);
+  }
+  constexpr Sub& operator/=(T aScale) {
+    value /= aScale;
+    return *static_cast<Sub*>(this);
+  }
+
+  friend constexpr bool operator==(Sub aA, T aB) { return aA.value == aB; }
+  friend constexpr bool operator==(T aA, Sub aB) { return aA == aB.value; }
+  friend constexpr bool operator!=(Sub aA, T aB) { return aA.value != aB; }
+  friend constexpr bool operator!=(T aA, Sub aB) { return aA != aB.value; }
+  friend constexpr T operator+(Sub aA, T aB) { return aA.value + aB; }
+  friend constexpr T operator+(T aA, Sub aB) { return aA + aB.value; }
+  friend constexpr T operator-(Sub aA, T aB) { return aA.value - aB; }
+  friend constexpr T operator-(T aA, Sub aB) { return aA - aB.value; }
+
+  auto MutTiedFields() { return std::tie(value); }
+
+  constexpr Sub operator-() const { return Sub(-value); }
+
+  friend std::ostream& operator<<(std::ostream& aStream,
+                                  const BaseCoord<T, Sub>& aCoord) {
+    return aStream << aCoord.value;
+  }
+};
+
+}  
+
+#endif /* MOZILLA_GFX_BASECOORD_H_ */

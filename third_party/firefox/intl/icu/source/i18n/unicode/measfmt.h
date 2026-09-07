@@ -1,0 +1,179 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+**********************************************************************
+* Copyright (c) 2004-2016, International Business Machines
+* Corporation and others.  All Rights Reserved.
+**********************************************************************
+* Author: Alan Liu
+* Created: April 20, 2004
+* Since: ICU 3.0
+**********************************************************************
+*/
+#ifndef MEASUREFORMAT_H
+#define MEASUREFORMAT_H
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/format.h"
+#include "unicode/udat.h"
+
+
+enum UMeasureFormatWidth {
+
+    UMEASFMT_WIDTH_WIDE,
+ 
+    UMEASFMT_WIDTH_SHORT,
+
+    UMEASFMT_WIDTH_NARROW,
+
+    UMEASFMT_WIDTH_NUMERIC,
+
+#ifndef U_HIDE_DEPRECATED_API
+    UMEASFMT_WIDTH_COUNT = 4
+#endif  // U_HIDE_DEPRECATED_API
+};
+typedef enum UMeasureFormatWidth UMeasureFormatWidth; 
+
+U_NAMESPACE_BEGIN
+
+class Measure;
+class MeasureUnit;
+class NumberFormat;
+class PluralRules;
+class MeasureFormatCacheData;
+class SharedNumberFormat;
+class SharedPluralRules;
+class QuantityFormatter;
+class SimpleFormatter;
+class ListFormatter;
+class DateFormat;
+
+class U_I18N_API MeasureFormat : public Format {
+ public:
+    using Format::parseObject;
+    using Format::format;
+
+    MeasureFormat(
+            const Locale &locale, UMeasureFormatWidth width, UErrorCode &status);
+
+    MeasureFormat(
+            const Locale &locale,
+            UMeasureFormatWidth width,
+            NumberFormat *nfToAdopt,
+            UErrorCode &status);
+
+    MeasureFormat(const MeasureFormat &other);
+
+    MeasureFormat &operator=(const MeasureFormat &rhs);
+
+    virtual ~MeasureFormat();
+
+    virtual bool operator==(const Format &other) const override;
+
+    virtual MeasureFormat *clone() const override;
+
+    virtual UnicodeString &format(
+            const Formattable &obj,
+            UnicodeString &appendTo,
+            FieldPosition &pos,
+            UErrorCode &status) const override;
+
+#ifndef U_FORCE_HIDE_DRAFT_API
+    virtual void parseObject(
+            const UnicodeString &source,
+            Formattable &reslt,
+            ParsePosition &pos) const override;
+#endif  // U_FORCE_HIDE_DRAFT_API
+
+    UnicodeString &formatMeasures(
+            const Measure *measures,
+            int32_t measureCount,
+            UnicodeString &appendTo,
+            FieldPosition &pos,
+            UErrorCode &status) const;
+
+    UnicodeString &formatMeasurePerUnit(
+            const Measure &measure,
+            const MeasureUnit &perUnit,
+            UnicodeString &appendTo,
+            FieldPosition &pos,
+            UErrorCode &status) const;
+
+    UnicodeString getUnitDisplayName(const MeasureUnit& unit, UErrorCode &status) const;
+
+
+    static MeasureFormat* U_EXPORT2 createCurrencyFormat(const Locale& locale,
+                                               UErrorCode& ec);
+
+    static MeasureFormat* U_EXPORT2 createCurrencyFormat(UErrorCode& ec);
+
+    static UClassID U_EXPORT2 getStaticClassID();
+
+    virtual UClassID getDynamicClassID() const override;
+
+ protected:
+    MeasureFormat();
+
+#ifndef U_HIDE_INTERNAL_API 
+
+    void initMeasureFormat(
+            const Locale &locale,
+            UMeasureFormatWidth width,
+            NumberFormat *nfToAdopt,
+            UErrorCode &status);
+    UBool setMeasureFormatLocale(const Locale &locale, UErrorCode &status);
+
+    void adoptNumberFormat(NumberFormat *nfToAdopt, UErrorCode &status);
+
+    const NumberFormat &getNumberFormatInternal() const;
+
+    const NumberFormat& getCurrencyFormatInternal() const;
+
+    const PluralRules &getPluralRules() const;
+
+    Locale getLocale(UErrorCode &status) const;
+
+    const char *getLocaleID(UErrorCode &status) const;
+
+#endif /* U_HIDE_INTERNAL_API */
+
+ private:
+    const MeasureFormatCacheData *cache;
+    const SharedNumberFormat *numberFormat;
+    const SharedPluralRules *pluralRules;
+    UMeasureFormatWidth fWidth;    
+
+    ListFormatter *listFormatter;
+
+    UnicodeString &formatMeasure(
+        const Measure &measure,
+        const NumberFormat &nf,
+        UnicodeString &appendTo,
+        FieldPosition &pos,
+        UErrorCode &status) const;
+
+    UnicodeString &formatMeasuresSlowTrack(
+        const Measure *measures,
+        int32_t measureCount,
+        UnicodeString& appendTo,
+        FieldPosition& pos,
+        UErrorCode& status) const;
+
+    UnicodeString &formatNumeric(
+        const Formattable *hms,  
+        int32_t bitMap,   
+        UnicodeString &appendTo,
+        UErrorCode &status) const;
+};
+
+U_NAMESPACE_END
+
+#endif // #if !UCONFIG_NO_FORMATTING
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif // #ifndef MEASUREFORMAT_H

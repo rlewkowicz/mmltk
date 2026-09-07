@@ -1,0 +1,34 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "jit/BranchHinting.h"
+
+#include "jit/IonAnalysis.h"
+#include "jit/JitSpewer.h"
+#include "jit/MIRGenerator.h"
+#include "jit/MIRGraph.h"
+
+using namespace js;
+using namespace js::jit;
+
+
+bool jit::BranchHinting(const MIRGenerator* mir, MIRGraph& graph) {
+  JitSpew(JitSpew_BranchHint, "Beginning BranchHinting pass");
+
+  for (ReversePostorderIterator block(graph.rpoBegin());
+       block != graph.rpoEnd(); block++) {
+    if (block->isUnknownFrequency()) {
+      continue;
+    }
+
+    for (MBasicBlock** it = block->immediatelyDominatedBlocksBegin();
+         it != block->immediatelyDominatedBlocksEnd(); it++) {
+      if ((*it)->isUnknownFrequency()) {
+        (*it)->setFrequency(block->getFrequency());
+      }
+    }
+  }
+
+  return true;
+}

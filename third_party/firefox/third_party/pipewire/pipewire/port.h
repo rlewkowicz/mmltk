@@ -1,0 +1,124 @@
+/* SPDX-FileCopyrightText: Copyright © 2018 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
+
+#ifndef PIPEWIRE_PORT_H
+#define PIPEWIRE_PORT_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <stdarg.h>
+#include <errno.h>
+
+#include <spa/utils/defs.h>
+#include <spa/utils/hook.h>
+#include <spa/param/param.h>
+
+#include <pipewire/proxy.h>
+
+
+
+#define PW_TYPE_INTERFACE_Port	PW_TYPE_INFO_INTERFACE_BASE "Port"
+
+#define PW_PORT_PERM_MASK	PW_PERM_R|PW_PERM_X|PW_PERM_M
+
+#define PW_VERSION_PORT		3
+struct pw_port;
+
+#ifndef PW_API_PORT_IMPL
+#define PW_API_PORT_IMPL static inline
+#endif
+
+#define pw_direction spa_direction
+#define PW_DIRECTION_INPUT SPA_DIRECTION_INPUT
+#define PW_DIRECTION_OUTPUT SPA_DIRECTION_OUTPUT
+
+const char * pw_direction_as_string(enum pw_direction direction);
+
+struct pw_port_info {
+	uint32_t id;				
+	enum pw_direction direction;		
+#define PW_PORT_CHANGE_MASK_PROPS		(1 << 0)
+#define PW_PORT_CHANGE_MASK_PARAMS		(1 << 1)
+#define PW_PORT_CHANGE_MASK_ALL			((1 << 2)-1)
+	uint64_t change_mask;			
+	struct spa_dict *props;			
+	struct spa_param_info *params;		
+	uint32_t n_params;			
+};
+
+struct pw_port_info *
+pw_port_info_update(struct pw_port_info *info,
+		const struct pw_port_info *update);
+
+struct pw_port_info *
+pw_port_info_merge(struct pw_port_info *info,
+		const struct pw_port_info *update, bool reset);
+
+void
+pw_port_info_free(struct pw_port_info *info);
+
+#define PW_PORT_EVENT_INFO	0
+#define PW_PORT_EVENT_PARAM	1
+#define PW_PORT_EVENT_NUM	2
+
+struct pw_port_events {
+#define PW_VERSION_PORT_EVENTS	0
+	uint32_t version;
+	void (*info) (void *data, const struct pw_port_info *info);
+	void (*param) (void *data, int seq,
+		       uint32_t id, uint32_t index, uint32_t next,
+		       const struct spa_pod *param);
+};
+
+#define PW_PORT_METHOD_ADD_LISTENER	0
+#define PW_PORT_METHOD_SUBSCRIBE_PARAMS	1
+#define PW_PORT_METHOD_ENUM_PARAMS	2
+#define PW_PORT_METHOD_NUM		3
+
+struct pw_port_methods {
+#define PW_VERSION_PORT_METHODS		0
+	uint32_t version;
+
+	int (*add_listener) (void *object,
+			struct spa_hook *listener,
+			const struct pw_port_events *events,
+			void *data);
+	int (*subscribe_params) (void *object, uint32_t *ids, uint32_t n_ids);
+
+	int (*enum_params) (void *object, int seq,
+			uint32_t id, uint32_t start, uint32_t num,
+			const struct spa_pod *filter);
+};
+
+PW_API_PORT_IMPL int pw_port_add_listener(struct pw_port *object,
+			struct spa_hook *listener,
+			const struct pw_port_events *events,
+			void *data)
+{
+	return spa_api_method_r(int, -ENOTSUP,
+			pw_port, (struct spa_interface*)object, add_listener, 0,
+			listener, events, data);
+}
+PW_API_PORT_IMPL int pw_port_subscribe_params(struct pw_port *object, uint32_t *ids, uint32_t n_ids)
+{
+	return spa_api_method_r(int, -ENOTSUP,
+			pw_port, (struct spa_interface*)object, subscribe_params, 0,
+			ids, n_ids);
+}
+PW_API_PORT_IMPL int pw_port_enum_params(struct pw_port *object,
+		int seq, uint32_t id, uint32_t start, uint32_t num,
+			    const struct spa_pod *filter)
+{
+	return spa_api_method_r(int, -ENOTSUP,
+			pw_port, (struct spa_interface*)object, enum_params, 0,
+			seq, id, start, num, filter);
+}
+
+
+#ifdef __cplusplus
+}  
+#endif
+
+#endif /* PIPEWIRE_PORT_H */

@@ -1,0 +1,94 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsFieldSetFrame_h_
+#define nsFieldSetFrame_h_
+
+#include "ImgDrawResult.h"
+#include "nsContainerFrame.h"
+
+namespace mozilla {
+class ScrollContainerFrame;
+}  
+
+class nsFieldSetFrame final : public nsContainerFrame {
+  typedef mozilla::image::ImgDrawResult ImgDrawResult;
+
+ public:
+  NS_DECL_FRAMEARENA_HELPERS(nsFieldSetFrame)
+  NS_DECL_QUERYFRAME
+
+  explicit nsFieldSetFrame(ComputedStyle* aStyle, nsPresContext* aPresContext);
+
+  nscoord IntrinsicISize(const mozilla::IntrinsicSizeInput& aInput,
+                         mozilla::IntrinsicISizeType aType) override;
+
+  nsRect VisualBorderRectRelativeToSelf() const override;
+
+  void Reflow(nsPresContext* aPresContext, ReflowOutput& aDesiredSize,
+              const ReflowInput& aReflowInput,
+              nsReflowStatus& aStatus) override;
+
+  nscoord SynthesizeFallbackBaseline(
+      mozilla::WritingMode aWM,
+      BaselineSharingGroup aBaselineGroup) const override;
+  BaselineSharingGroup GetDefaultBaselineSharingGroup() const override;
+  Maybe<nscoord> GetNaturalBaselineBOffset(
+      mozilla::WritingMode aWM, BaselineSharingGroup aBaselineGroup,
+      BaselineExportContext aExportContext) const override;
+
+  void BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                        const nsDisplayListSet& aLists) override;
+
+  ImgDrawResult PaintBorder(nsDisplayListBuilder* aBuilder,
+                            gfxContext& aRenderingContext, nsPoint aPt,
+                            const nsRect& aDirtyRect);
+
+  void SetInitialChildList(ChildListID aListID,
+                           nsFrameList&& aChildList) override;
+  void AppendFrames(ChildListID aListID, nsFrameList&& aFrameList) override;
+  void InsertFrames(ChildListID aListID, nsIFrame* aPrevFrame,
+                    const nsLineList::iterator* aPrevFrameLine,
+                    nsFrameList&& aFrameList) override;
+#ifdef DEBUG
+  void RemoveFrame(DestroyContext&, ChildListID aListID,
+                   nsIFrame* aOldFrame) override;
+#endif
+
+  mozilla::ScrollContainerFrame* GetScrollTargetFrame() const override;
+
+  void AppendDirectlyOwnedAnonBoxes(nsTArray<OwnedAnonBox>& aResult) override;
+
+#ifdef ACCESSIBILITY
+  virtual mozilla::a11y::AccType AccessibleType() override;
+#endif
+
+#ifdef DEBUG_FRAME_DUMP
+  virtual nsresult GetFrameName(nsAString& aResult) const override {
+    return MakeFrameName(u"FieldSet"_ns, aResult);
+  }
+#endif
+
+  nsContainerFrame* GetInner() const;
+
+  nsContainerFrame* GetContentInsertionFrame() override {
+    if (auto* inner = GetInner()) {
+      return inner->GetContentInsertionFrame();
+    }
+    return this;
+  }
+
+  nsIFrame* GetLegend() const;
+
+  nscoord LegendSpace() const { return mLegendSpace; }
+
+ protected:
+  void EnsureChildContinuation(nsIFrame* aChild, const nsReflowStatus& aStatus);
+
+  mozilla::LogicalRect mLegendRect;
+
+  nscoord mLegendSpace;
+};
+
+#endif  // nsFieldSetFrame_h_

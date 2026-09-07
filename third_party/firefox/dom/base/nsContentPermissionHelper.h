@@ -1,0 +1,209 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsContentPermissionHelper_h
+#define nsContentPermissionHelper_h
+
+#include "mozilla/PermissionDelegateHandler.h"
+#include "mozilla/dom/PContentPermissionRequestChild.h"
+#include "mozilla/dom/ipc/IdType.h"
+#include "nsIContentPermissionPrompt.h"
+#include "nsIMutableArray.h"
+#include "nsTArray.h"
+
+#undef LoadImage
+
+class nsPIDOMWindowInner;
+class nsContentPermissionRequestProxy;
+
+namespace mozilla::dom {
+
+class Element;
+class PermissionRequest;
+class ContentPermissionRequestParent;
+class PContentPermissionRequestParent;
+
+class ContentPermissionType : public nsIContentPermissionType {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSICONTENTPERMISSIONTYPE
+
+  ContentPermissionType(const nsACString& aType,
+                        const nsTArray<nsString>& aOptions);
+
+ protected:
+  virtual ~ContentPermissionType();
+
+  nsCString mType;
+  nsTArray<nsString> mOptions;
+};
+
+class nsContentPermissionUtils {
+ public:
+  static uint32_t ConvertPermissionRequestToArray(
+      nsTArray<PermissionRequest>& aSrcArray, nsIMutableArray* aDesArray);
+
+  static void ConvertArrayToPermissionRequest(
+      nsIArray* aSrcArray, nsTArray<PermissionRequest>& aDesArray);
+
+  static nsresult CreatePermissionArray(const nsACString& aType,
+                                        const nsTArray<nsString>& aOptions,
+                                        nsIArray** aTypesArray);
+
+  static PContentPermissionRequestParent* CreateContentPermissionRequestParent(
+      Element* aElement, nsIPrincipal* aPrincipal,
+      nsIPrincipal* aTopLevelPrincipal,
+      const bool aHasValidTransientUserGestureActivation,
+      const bool aIsRequestDelegatedToUnsafeThirdParty, const TabId& aTabId,
+      const bool aIgnoreAllowSitePermission);
+
+  static void InitContentPermissionRequestParent(
+      PContentPermissionRequestParent* aActor,
+      nsTArray<PermissionRequest>&& aRequests);
+
+  static nsresult AskPermission(nsIContentPermissionRequest* aRequest,
+                                nsPIDOMWindowInner* aWindow);
+
+  static nsTArray<PContentPermissionRequestParent*>
+  GetContentPermissionRequestParentById(const TabId& aTabId);
+
+  static void NotifyRemoveContentPermissionRequestParent(
+      PContentPermissionRequestParent* aParent);
+
+  static nsTArray<PContentPermissionRequestChild*>
+  GetContentPermissionRequestChildById(const TabId& aTabId);
+
+  static void NotifyRemoveContentPermissionRequestChild(
+      PContentPermissionRequestChild* aChild);
+};
+
+nsresult TranslateChoices(
+    JS::Handle<JS::Value> aChoices,
+    const nsTArray<PermissionRequest>& aPermissionRequests,
+    nsTArray<PermissionChoice>& aTranslatedChoices);
+
+class ContentPermissionRequestBase : public nsIContentPermissionRequest {
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_CLASS(ContentPermissionRequestBase)
+
+  NS_IMETHOD GetTypes(nsIArray** aTypes) override;
+  NS_IMETHOD GetPrincipal(nsIPrincipal** aPrincipal) override;
+  NS_IMETHOD GetDelegatePrincipal(const nsACString& aType,
+                                  nsIPrincipal** aPrincipal) override;
+  NS_IMETHOD GetTopLevelPrincipal(nsIPrincipal** aTopLevelPrincipal) override;
+  NS_IMETHOD GetWindow(mozIDOMWindow** aWindow) override;
+  NS_IMETHOD GetElement(mozilla::dom::Element** aElement) override;
+  NS_IMETHOD GetHasValidTransientUserGestureActivation(
+      bool* aHasValidTransientUserGestureActivation) override;
+  NS_IMETHOD GetIsRequestDelegatedToUnsafeThirdParty(
+      bool* aIsRequestDelegatedToUnsafeThirdParty) override;
+  NS_IMETHOD GetIgnoreAllowSitePermission(
+      bool* aIgnoreAllowSitePermission) override;
+
+  NS_IMETHOD NotifyShown(void) override;
+
+  enum class PromptResult {
+    Granted,
+    Denied,
+    Pending,
+  };
+  nsresult ShowPrompt(PromptResult& aResult);
+
+  PromptResult CheckPromptPrefs() const;
+
+  bool CheckPermissionDelegate() const;
+
+  enum class DelayedTaskType {
+    Allow,
+    Deny,
+    Request,
+  };
+  void RequestDelayedTask(nsIEventTarget* aTarget, DelayedTaskType aType);
+
+ protected:
+  ContentPermissionRequestBase(nsIPrincipal* aPrincipal,
+                               nsPIDOMWindowInner* aWindow,
+                               const nsACString& aPrefName,
+                               const nsACString& aType);
+  virtual ~ContentPermissionRequestBase() = default;
+
+  nsCOMPtr<nsIPrincipal> mPrincipal;
+  nsCOMPtr<nsIPrincipal> mTopLevelPrincipal;
+  nsCOMPtr<nsPIDOMWindowInner> mWindow;
+  RefPtr<PermissionDelegateHandler> mPermissionHandler;
+
+  const nsCString mPrefName;
+
+  const nsCString mType;
+
+  bool mHasValidTransientUserGestureActivation;
+
+  bool mIsRequestDelegatedToUnsafeThirdParty;
+};
+
+}  
+
+using mozilla::dom::ContentPermissionRequestParent;
+
+class nsContentPermissionRequestProxy : public nsIContentPermissionRequest {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSICONTENTPERMISSIONREQUEST
+
+  explicit nsContentPermissionRequestProxy(
+      ContentPermissionRequestParent* parent);
+
+  nsresult Init(const nsTArray<mozilla::dom::PermissionRequest>& requests);
+
+  void OnParentDestroyed();
+
+ private:
+  virtual ~nsContentPermissionRequestProxy();
+
+  ContentPermissionRequestParent* mParent;
+  nsTArray<mozilla::dom::PermissionRequest> mPermissionRequests;
+};
+
+class RemotePermissionRequest final
+    : public mozilla::dom::PContentPermissionRequestChild {
+ public:
+  NS_INLINE_DECL_REFCOUNTING(RemotePermissionRequest)
+
+  RemotePermissionRequest(nsIContentPermissionRequest* aRequest,
+                          nsPIDOMWindowInner* aWindow);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  mozilla::ipc::IPCResult RecvNotifyResult(
+      const bool& aAllow, nsTArray<PermissionChoice>&& aChoices);
+
+  void IPDLAddRef() {
+    mIPCOpen = true;
+    AddRef();
+  }
+
+  void IPDLRelease() {
+    mIPCOpen = false;
+    Release();
+  }
+
+  void Destroy();
+
+  bool IPCOpen() const { return mIPCOpen && !mDestroyed; }
+
+ private:
+  virtual ~RemotePermissionRequest();
+
+  MOZ_CAN_RUN_SCRIPT
+  void DoAllow(JS::Handle<JS::Value> aChoices);
+  MOZ_CAN_RUN_SCRIPT
+  void DoCancel();
+
+  nsCOMPtr<nsIContentPermissionRequest> mRequest;
+  nsCOMPtr<nsPIDOMWindowInner> mWindow;
+  bool mIPCOpen;
+  bool mDestroyed;
+};
+
+#endif  // nsContentPermissionHelper_h

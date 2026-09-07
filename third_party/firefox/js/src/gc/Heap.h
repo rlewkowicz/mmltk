@@ -1,0 +1,542 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef gc_Heap_h
+#define gc_Heap_h
+
+#include "mozilla/DebugOnly.h"
+
+#include "gc/AllocKind.h"
+#include "gc/Memory.h"
+#include "gc/Pretenuring.h"
+#include "js/HeapAPI.h"
+#include "js/TypeDecls.h"
+#include "util/Poison.h"
+
+namespace js {
+
+class AutoLockGC;
+class AutoLockGCBgAlloc;
+class Nursery;
+
+namespace gc {
+
+class Arena;
+class ArenaCellSet;
+class ArenaList;
+class GCRuntime;
+class MarkingValidator;
+class SortedArenaList;
+class TenuredCell;
+
+const uintptr_t LargestTaggedNullCellPointer = (1 << CellAlignShift) - 1;
+
+static_assert(ArenaSize % CellAlignBytes == 0,
+              "Arena size must be a multiple of cell alignment");
+
+class FreeSpan {
+  friend class Arena;
+  friend class ArenaCellIter;
+  friend class ArenaFreeCellIter;
+
+  uint16_t first;
+  uint16_t last;
+
+ public:
+  void initBounds(uintptr_t firstArg, uintptr_t lastArg, const Arena* arena) {
+    checkRange(firstArg, lastArg, arena);
+    first = firstArg;
+    last = lastArg;
+  }
+
+  void initAsEmpty() {
+    first = 0;
+    last = 0;
+  }
+
+  void initFinal(uintptr_t firstArg, uintptr_t lastArg, const Arena* arena) {
+    initBounds(firstArg, lastArg, arena);
+    FreeSpan* last = nextSpanUnchecked(arena);
+    last->initAsEmpty();
+    checkSpan(arena);
+  }
+
+  bool isEmpty() const { return !first; }
+
+  Arena* getArenaUnchecked() { return reinterpret_cast<Arena*>(this); }
+  inline Arena* getArena();
+
+  static size_t offsetOfFirst() { return offsetof(FreeSpan, first); }
+
+  static size_t offsetOfLast() { return offsetof(FreeSpan, last); }
+
+  FreeSpan* nextSpanUnchecked(const Arena* arena) const {
+    MOZ_ASSERT(arena && !isEmpty());
+    return reinterpret_cast<FreeSpan*>(uintptr_t(arena) + last);
+  }
+
+  const FreeSpan* nextSpan(const Arena* arena) const {
+    checkSpan(arena);
+    return nextSpanUnchecked(arena);
+  }
+
+  MOZ_ALWAYS_INLINE TenuredCell* allocate(size_t thingSize) {
+    Arena* arena = getArenaUnchecked();
+    checkSpan(arena);
+    uintptr_t thing = uintptr_t(arena) + first;
+    if (first < last) {
+      first += thingSize;
+    } else if (MOZ_LIKELY(first)) {
+      const FreeSpan* next = nextSpan(arena);
+      first = next->first;
+      last = next->last;
+    } else {
+      return nullptr;  
+    }
+    checkSpan(arena);
+    DebugOnlyPoison(reinterpret_cast<void*>(thing),
+                    JS_ALLOCATED_TENURED_PATTERN, thingSize,
+                    MemCheckKind::MakeUndefined);
+    return reinterpret_cast<TenuredCell*>(thing);
+  }
+
+  inline void checkSpan(const Arena* arena) const;
+  inline void checkRange(uintptr_t first, uintptr_t last,
+                         const Arena* arena) const;
+};
+
+class alignas(ArenaSize) Arena {
+  static JS_PUBLIC_DATA const uint8_t ThingSizes[];
+  static JS_PUBLIC_DATA const uint8_t FirstThingOffsets[];
+  static JS_PUBLIC_DATA const uint8_t ThingsPerArena[];
+  FreeSpan firstFreeSpan;
+
+  AllocKind allocKind;
+
+ public:
+  Arena* next;
+
+ private:
+  static const size_t ARENA_FLAG_BITS = 4;
+  static const size_t DELAYED_MARKING_ARENA_BITS =
+      JS_BITS_PER_WORD - ArenaShift;
+  static_assert(
+      ARENA_FLAG_BITS + DELAYED_MARKING_ARENA_BITS <= JS_BITS_PER_WORD,
+      "Not enough space to pack flags and nextDelayedMarkingArena_ pointer "
+      "into a single word.");
+
+  size_t isNewlyCreated_ : 1;
+
+  size_t onDelayedMarkingList_ : 1;
+  size_t hasDelayedBlackMarking_ : 1;
+  size_t hasDelayedGrayMarking_ : 1;
+  size_t nextDelayedMarkingArena_ : DELAYED_MARKING_ARENA_BITS;
+
+  union {
+    ArenaCellSet* bufferedCells_;
+
+    size_t atomBitmapStart_;
+  };
+
+ public:
+  uint8_t data[ArenaSize - ArenaHeaderSize];
+
+  void init(GCRuntime* gc, AllocKind kind);
+
+  inline JS::Zone* zone() const;
+
+  void setAsFullyUnused() {
+    AllocKind kind = getAllocKind();
+    firstFreeSpan.first = firstThingOffset(kind);
+    firstFreeSpan.last = lastThingOffset(kind);
+    FreeSpan* last = firstFreeSpan.nextSpanUnchecked(this);
+    last->initAsEmpty();
+  }
+
+  inline void freeAtomMarkingBitmapIndex(GCRuntime* gc, const AutoLockGC& lock);
+
+  inline void release();
+
+  uintptr_t address() const {
+    checkAddress();
+    return uintptr_t(this);
+  }
+
+  inline void checkAddress() const;
+
+  inline ArenaChunk* chunk() const;
+
+  bool allocated() const;
+
+  AllocKind getAllocKind() const {
+    MOZ_ASSERT(IsValidAllocKind(allocKind));
+    return allocKind;
+  }
+
+  FreeSpan* getFirstFreeSpan() { return &firstFreeSpan; }
+
+  static size_t thingSize(AllocKind kind) { return ThingSizes[size_t(kind)]; }
+  static size_t thingsPerArena(AllocKind kind) {
+    return ThingsPerArena[size_t(kind)];
+  }
+  static size_t thingsSpan(AllocKind kind) {
+    return thingsPerArena(kind) * thingSize(kind);
+  }
+
+  static size_t firstThingOffset(AllocKind kind) {
+    return FirstThingOffsets[size_t(kind)];
+  }
+  static size_t lastThingOffset(AllocKind kind) {
+    return ArenaSize - thingSize(kind);
+  }
+
+  size_t getThingSize() const { return thingSize(getAllocKind()); }
+  size_t getThingsPerArena() const { return thingsPerArena(getAllocKind()); }
+  size_t getThingsSpan() const { return getThingsPerArena() * getThingSize(); }
+  size_t getFirstThingOffset() const {
+    return firstThingOffset(getAllocKind());
+  }
+
+  uintptr_t thingsStart() const { return address() + getFirstThingOffset(); }
+  uintptr_t thingsEnd() const { return address() + ArenaSize; }
+
+  bool isEmpty() const {
+    firstFreeSpan.checkSpan(this);
+    AllocKind kind = getAllocKind();
+    return firstFreeSpan.first == firstThingOffset(kind) &&
+           firstFreeSpan.last == lastThingOffset(kind);
+  }
+
+  bool isFull() const { return firstFreeSpan.isEmpty(); }
+  bool hasFreeThings() const { return !isFull(); }
+
+  size_t numFreeThings(size_t thingSize) const {
+    firstFreeSpan.checkSpan(this);
+    size_t numFree = 0;
+    const FreeSpan* span = &firstFreeSpan;
+    for (; !span->isEmpty(); span = span->nextSpan(this)) {
+      numFree += (span->last - span->first) / thingSize + 1;
+    }
+    return numFree;
+  }
+
+  size_t countFreeCells() { return numFreeThings(getThingSize()); }
+  size_t countUsedCells() { return getThingsPerArena() - countFreeCells(); }
+
+#ifdef DEBUG
+  bool inFreeList(uintptr_t thing) {
+    uintptr_t base = address();
+    const FreeSpan* span = &firstFreeSpan;
+    for (; !span->isEmpty(); span = span->nextSpan(this)) {
+      if (thing < base + span->first) {
+        return false;
+      }
+
+      if (thing <= base + span->last) {
+        return true;
+      }
+    }
+    return false;
+  }
+#endif
+
+  static bool isAligned(uintptr_t thing, size_t thingSize) {
+    uintptr_t tailOffset = ArenaSize - (thing & ArenaMask);
+    return tailOffset % thingSize == 0;
+  }
+
+  bool isNewlyCreated() const { return isNewlyCreated_; }
+
+  bool onDelayedMarkingList() const { return onDelayedMarkingList_; }
+
+  Arena* getNextDelayedMarking() const {
+    MOZ_ASSERT(onDelayedMarkingList_);
+    return reinterpret_cast<Arena*>(nextDelayedMarkingArena_ << ArenaShift);
+  }
+
+  void setNextDelayedMarkingArena(Arena* arena) {
+    MOZ_ASSERT(!(uintptr_t(arena) & ArenaMask));
+    MOZ_ASSERT(!onDelayedMarkingList_);
+    MOZ_ASSERT(!hasDelayedBlackMarking_);
+    MOZ_ASSERT(!hasDelayedGrayMarking_);
+    MOZ_ASSERT(!nextDelayedMarkingArena_);
+    onDelayedMarkingList_ = 1;
+    if (arena) {
+      nextDelayedMarkingArena_ = arena->address() >> ArenaShift;
+    }
+  }
+
+  void updateNextDelayedMarkingArena(Arena* arena) {
+    MOZ_ASSERT(!(uintptr_t(arena) & ArenaMask));
+    MOZ_ASSERT(onDelayedMarkingList_);
+    nextDelayedMarkingArena_ = arena ? arena->address() >> ArenaShift : 0;
+  }
+
+  bool hasDelayedMarking(MarkColor color) const {
+    MOZ_ASSERT(onDelayedMarkingList_);
+    return color == MarkColor::Black ? hasDelayedBlackMarking_
+                                     : hasDelayedGrayMarking_;
+  }
+
+  bool hasAnyDelayedMarking() const {
+    MOZ_ASSERT(onDelayedMarkingList_);
+    return hasDelayedBlackMarking_ || hasDelayedGrayMarking_;
+  }
+
+  void setHasDelayedMarking(MarkColor color, bool value) {
+    MOZ_ASSERT(onDelayedMarkingList_);
+    if (color == MarkColor::Black) {
+      hasDelayedBlackMarking_ = value;
+    } else {
+      hasDelayedGrayMarking_ = value;
+    }
+  }
+
+  void clearDelayedMarkingState() {
+    MOZ_ASSERT(onDelayedMarkingList_);
+    onDelayedMarkingList_ = 0;
+    hasDelayedBlackMarking_ = 0;
+    hasDelayedGrayMarking_ = 0;
+    nextDelayedMarkingArena_ = 0;
+  }
+
+  inline ArenaCellSet*& bufferedCells();
+  inline size_t& atomBitmapStart();
+
+  template <typename T, FinalizeKind finalizeKind>
+  size_t finalize(JS::GCContext* gcx, AllocKind thingKind, size_t thingSize);
+
+  static void staticAsserts();
+  static void checkLookupTables();
+
+  void unmarkAll();
+  void unmarkPreMarkedFreeCells();
+
+  void arenaAllocatedDuringGC();
+
+#ifdef DEBUG
+  void checkNoMarkedFreeCells();
+  void checkAllCellsMarkedBlack();
+#endif
+
+#if defined(DEBUG) || defined(JS_GC_ZEAL)
+  void checkNoMarkedCells();
+#endif
+};
+
+inline Arena* FreeSpan::getArena() {
+  Arena* arena = getArenaUnchecked();
+  arena->checkAddress();
+  return arena;
+}
+
+inline void FreeSpan::checkSpan(const Arena* arena) const {
+#ifdef DEBUG
+  if (!first) {
+    MOZ_ASSERT(!first && !last);
+    return;
+  }
+
+  arena->checkAddress();
+  checkRange(first, last, arena);
+
+  const FreeSpan* next = nextSpanUnchecked(arena);
+  if (next->first) {
+    checkRange(next->first, next->last, arena);
+    size_t thingSize = arena->getThingSize();
+    MOZ_ASSERT(last + 2 * thingSize <= next->first);
+  }
+#endif
+}
+
+inline void FreeSpan::checkRange(uintptr_t first, uintptr_t last,
+                                 const Arena* arena) const {
+#ifdef DEBUG
+  MOZ_ASSERT(arena);
+  MOZ_ASSERT(first <= last);
+  AllocKind thingKind = arena->getAllocKind();
+  MOZ_ASSERT(first >= Arena::firstThingOffset(thingKind));
+  MOZ_ASSERT(last <= Arena::lastThingOffset(thingKind));
+  MOZ_ASSERT((last - first) % Arena::thingSize(thingKind) == 0);
+#endif
+}
+
+class ArenaChunk : public ArenaChunkBase {
+  Arena arenas[ArenasPerChunk];
+
+  friend class GCRuntime;
+  friend class MarkingValidator;
+
+ public:
+  static ArenaChunk* fromAddress(uintptr_t addr) {
+    addr &= ~ChunkMask;
+    return reinterpret_cast<ArenaChunk*>(addr);
+  }
+
+  static bool withinValidRange(uintptr_t addr) {
+    uintptr_t offset = addr & ChunkMask;
+    if (ArenaChunk::fromAddress(addr)->isNurseryChunk()) {
+      return offset >= sizeof(ChunkBase) && offset < ChunkSize;
+    }
+    return offset >= offsetof(ArenaChunk, arenas) && offset < ChunkSize;
+  }
+
+  static size_t arenaIndex(const Arena* arena) {
+    uintptr_t addr = arena->address();
+    MOZ_ASSERT(!ArenaChunk::fromAddress(addr)->isNurseryChunk());
+    MOZ_ASSERT(withinValidRange(addr));
+    uintptr_t offset = addr & ChunkMask;
+    return (offset - offsetof(ArenaChunk, arenas)) >> ArenaShift;
+  }
+
+  static size_t pageIndex(const Arena* arena) {
+    return arenaToPageIndex(arenaIndex(arena));
+  }
+
+  static size_t arenaToPageIndex(size_t arenaIndex) {
+    static_assert((offsetof(ArenaChunk, arenas) % PageSize) == 0,
+                  "First arena should be on a page boundary");
+    return arenaIndex / ArenasPerPage;
+  }
+
+  static size_t pageToArenaIndex(size_t pageIndex) {
+    return pageIndex * ArenasPerPage;
+  }
+
+  explicit ArenaChunk(JSRuntime* runtime) : ArenaChunkBase(runtime) {}
+
+  uintptr_t address() const {
+    uintptr_t addr = reinterpret_cast<uintptr_t>(this);
+    MOZ_ASSERT(!(addr & ChunkMask));
+    return addr;
+  }
+
+  bool isEmpty() const { return info.numArenasFree == ArenasPerChunk; }
+
+  bool hasAvailableArenas() const { return !isFull(); }
+  bool isFull() const { return info.numArenasFree == 0; }
+
+  bool isNurseryChunk() const { return storeBuffer; }
+
+  Arena* allocateArena(GCRuntime* gc, JS::Zone* zone, AllocKind kind);
+
+  void releaseArena(GCRuntime* gc, Arena* arena, const AutoLockGC& lock);
+
+  void decommitFreeArenas(GCRuntime* gc, const bool& cancel, AutoLockGC& lock);
+  [[nodiscard]] bool decommitOneFreePage(GCRuntime* gc, size_t pageIndex,
+                                         const AutoLockGC& lock);
+  void decommitAllArenas();
+
+  void decommitFreeArenasWithoutUnlocking(const AutoLockGC& lock);
+
+  static void* allocate(GCRuntime* gc, StallAndRetry stallAndRetry);
+  static ArenaChunk* init(void* ptr, GCRuntime* gc, bool allMemoryCommitted);
+
+  Arena* fetchNextFreeArena(GCRuntime* gc);
+
+  void mergePendingFreeArenas(GCRuntime* gc, const AutoLockGC& lock);
+
+  ArenaChunk* next() const { return info.next; }
+
+#ifdef DEBUG
+  void verify() const;
+#else
+  void verify() const {}
+#endif
+
+ private:
+  void commitOnePage(GCRuntime* gc);
+
+  void updateFreeCountsAfterAlloc(GCRuntime* gc, size_t numArenasAlloced,
+                                  const AutoLockGC& lock);
+  void updateFreeCountsAfterFree(GCRuntime* gc, size_t numArenasFreed,
+                                 bool wasCommitted, const AutoLockGC& lock);
+
+  void updateCurrentChunkAfterAlloc(GCRuntime* gc);
+
+  bool canDecommitPage(size_t pageIndex) const;
+
+  bool isPageFree(const Arena* arena) const;
+
+  void* pageAddress(size_t pageIndex) {
+    return &arenas[pageToArenaIndex(pageIndex)];
+  }
+};
+
+inline void Arena::checkAddress() const {
+  mozilla::DebugOnly<uintptr_t> addr = uintptr_t(this);
+  MOZ_ASSERT(addr);
+  MOZ_ASSERT(!(addr & ArenaMask));
+  MOZ_ASSERT(ArenaChunk::withinValidRange(addr));
+}
+
+inline ArenaChunk* Arena::chunk() const {
+  return ArenaChunk::fromAddress(address());
+}
+
+struct alignas(gc::CellAlignBytes) NurseryCellHeader {
+  const uintptr_t allocSiteAndTraceKind;
+
+  static const uintptr_t TraceKindMask = 3;
+
+  static uintptr_t MakeValue(AllocSite* const site, JS::TraceKind kind) {
+    MOZ_ASSERT(uintptr_t(kind) <= TraceKindMask);
+    MOZ_ASSERT((uintptr_t(site) & TraceKindMask) == 0);
+    return uintptr_t(site) | uintptr_t(kind);
+  }
+
+  inline NurseryCellHeader(AllocSite* site, JS::TraceKind kind)
+      : allocSiteAndTraceKind(MakeValue(site, kind)) {}
+
+  AllocSite* allocSite() const {
+    return reinterpret_cast<AllocSite*>(allocSiteAndTraceKind & ~TraceKindMask);
+  }
+
+  JS::Zone* zone() const { return allocSite()->zone(); }
+
+  JS::TraceKind traceKind() const {
+    return JS::TraceKind(allocSiteAndTraceKind & TraceKindMask);
+  }
+
+  static const NurseryCellHeader* from(const Cell* cell) {
+    MOZ_ASSERT(IsInsideNursery(cell));
+    return reinterpret_cast<const NurseryCellHeader*>(
+        uintptr_t(cell) - sizeof(NurseryCellHeader));
+  }
+};
+
+static_assert(uintptr_t(JS::TraceKind::Object) <=
+              NurseryCellHeader::TraceKindMask);
+static_assert(uintptr_t(JS::TraceKind::String) <=
+              NurseryCellHeader::TraceKindMask);
+static_assert(uintptr_t(JS::TraceKind::BigInt) <=
+              NurseryCellHeader::TraceKindMask);
+static_assert(uintptr_t(JS::TraceKind::GetterSetter) <=
+              NurseryCellHeader::TraceKindMask);
+
+} 
+
+namespace debug {
+
+enum class MarkInfo : int {
+  BLACK = 0,
+  GRAY = 1,
+  UNMARKED = -1,
+  NURSERY_FROMSPACE = -2,
+  NURSERY_TOSPACE = -3,  
+  UNKNOWN = -4,
+  BUFFER = -5,
+};
+
+MOZ_NEVER_INLINE MarkInfo GetMarkInfo(void* vp);
+
+
+MOZ_NEVER_INLINE uintptr_t* GetMarkWordAddress(js::gc::Cell* cell);
+
+MOZ_NEVER_INLINE uintptr_t GetMarkMask(js::gc::Cell* cell, uint32_t colorBit);
+
+} 
+} 
+
+#endif /* gc_Heap_h */

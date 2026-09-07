@@ -1,0 +1,72 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SVG_DOMSVGANIMATEDLENGTHLIST_H_
+#define DOM_SVG_DOMSVGANIMATEDLENGTHLIST_H_
+
+#include "SVGElement.h"
+#include "mozilla/RefPtr.h"
+#include "nsCycleCollectionParticipant.h"
+
+namespace mozilla {
+
+class SVGAnimatedLengthList;
+class SVGLengthList;
+
+namespace dom {
+
+class DOMSVGLengthList;
+
+class DOMSVGAnimatedLengthList final : public nsWrapperCache {
+  friend class DOMSVGLengthList;
+
+ public:
+  NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(DOMSVGAnimatedLengthList)
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_NATIVE_CLASS(DOMSVGAnimatedLengthList)
+
+  static already_AddRefed<DOMSVGAnimatedLengthList> GetDOMWrapper(
+      SVGAnimatedLengthList* aList, dom::SVGElement* aElement,
+      uint8_t aAttrEnum, SVGLength::Axis aAxis);
+
+  static DOMSVGAnimatedLengthList* GetDOMWrapperIfExists(
+      SVGAnimatedLengthList* aList);
+
+  void InternalBaseValListWillChangeTo(const SVGLengthList& aNewValue);
+  void InternalAnimValListWillChangeTo(const SVGLengthList& aNewValue);
+
+  bool IsAnimating() const;
+
+  dom::SVGElement* GetParentObject() const { return mElement; }
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+  already_AddRefed<DOMSVGLengthList> BaseVal();
+  already_AddRefed<DOMSVGLengthList> AnimVal();
+
+ private:
+  DOMSVGAnimatedLengthList(dom::SVGElement* aElement, uint8_t aAttrEnum,
+                           SVGLength::Axis aAxis)
+      : mBaseVal(nullptr),
+        mAnimVal(nullptr),
+        mElement(aElement),
+        mAttrEnum(aAttrEnum),
+        mAxis(aAxis) {}
+
+  ~DOMSVGAnimatedLengthList();
+
+  SVGAnimatedLengthList& InternalAList();
+  const SVGAnimatedLengthList& InternalAList() const;
+
+  DOMSVGLengthList* mBaseVal;
+  DOMSVGLengthList* mAnimVal;
+
+  RefPtr<dom::SVGElement> mElement;
+
+  uint8_t mAttrEnum;
+  SVGLength::Axis mAxis;
+};
+
+}  
+}  
+
+#endif  // DOM_SVG_DOMSVGANIMATEDLENGTHLIST_H_

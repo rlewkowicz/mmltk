@@ -1,0 +1,82 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozStoragePrivateHelpers_h
+#define mozStoragePrivateHelpers_h
+
+
+#include "sqlite3.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "nsISerialEventTarget.h"
+#include "nsIVariant.h"
+#include "nsError.h"
+#include "js/TypeDecls.h"
+#include "Variant.h"
+
+class mozIStorageCompletionCallback;
+class nsIRunnable;
+
+namespace mozilla {
+namespace storage {
+
+
+#define ENSURE_INDEX_VALUE(aIndex, aCount) \
+  NS_ENSURE_TRUE(aIndex < aCount, NS_ERROR_INVALID_ARG)
+
+
+bool isErrorCode(int aSQLiteResultCode);
+
+nsresult convertResultCode(int aSQLiteResultCode);
+
+void checkAndLogStatementPerformance(sqlite3_stmt* aStatement);
+
+already_AddRefed<nsIVariant> convertJSValToVariant(JSContext* aCtx,
+                                                   const JS::Value& aValue);
+
+already_AddRefed<Variant_base> convertVariantToStorageVariant(
+    nsIVariant* aVariant);
+
+already_AddRefed<nsIRunnable> newCompletionEvent(
+    mozIStorageCompletionCallback* aCallback);
+
+template <class T, class V>
+nsresult DoGetBlobAsString(T* aThis, uint32_t aIndex, V& aValue) {
+  typedef typename V::char_type char_type;
+
+  uint32_t size;
+  char_type* blob;
+  nsresult rv =
+      aThis->GetBlob(aIndex, &size, reinterpret_cast<uint8_t**>(&blob));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  aValue.Assign(blob, size / sizeof(char_type));
+  delete[] blob;
+  return NS_OK;
+}
+
+template <class T, class V>
+nsresult DoBindStringAsBlobByName(T* aThis, const nsACString& aName,
+                                  const V& aValue) {
+  typedef typename V::char_type char_type;
+  return aThis->BindBlobByName(
+      aName, reinterpret_cast<const uint8_t*>(aValue.BeginReading()),
+      aValue.Length() * sizeof(char_type));
+}
+
+template <class T, class V>
+nsresult DoBindStringAsBlobByIndex(T* aThis, uint32_t aIndex, const V& aValue) {
+  typedef typename V::char_type char_type;
+  return aThis->BindBlobByIndex(
+      aIndex, reinterpret_cast<const uint8_t*>(aValue.BeginReading()),
+      aValue.Length() * sizeof(char_type));
+}
+
+inline bool IsOnCurrentSerialEventTarget(nsISerialEventTarget* aTarget) {
+  return aTarget->IsOnCurrentThread();
+}
+
+}  
+}  
+
+#endif  // mozStoragePrivateHelpers_h

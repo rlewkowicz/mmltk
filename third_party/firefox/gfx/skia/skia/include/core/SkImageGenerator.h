@@ -1,0 +1,78 @@
+/*
+ * Copyright 2013 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkImageGenerator_DEFINED)
+#define SkImageGenerator_DEFINED
+
+#include "include/core/SkData.h"
+#include "include/core/SkImageInfo.h"
+#include "include/core/SkPixmap.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkYUVAPixmaps.h"
+#include "include/private/base/SkAPI.h"
+
+#include <cstddef>
+#include <cstdint>
+
+class SkRecorder;
+
+class SK_API SkImageGenerator {
+public:
+    virtual ~SkImageGenerator() { }
+
+    uint32_t uniqueID() const { return fUniqueID; }
+
+    sk_sp<const SkData> refEncodedData() { return this->onRefEncodedData(); }
+
+    const SkImageInfo& getInfo() const { return fInfo; }
+
+    bool isValid(SkRecorder* recorder) const { return this->onIsValid(recorder); }
+
+    bool isProtected() const {
+        return this->onIsProtected();
+    }
+
+    bool getPixels(const SkImageInfo& info, void* pixels, size_t rowBytes);
+
+    bool getPixels(const SkPixmap& pm) {
+        return this->getPixels(pm.info(), pm.writable_addr(), pm.rowBytes());
+    }
+
+    bool queryYUVAInfo(const SkYUVAPixmapInfo::SupportedDataTypes& supportedDataTypes,
+                       SkYUVAPixmapInfo* yuvaPixmapInfo) const;
+
+    bool getYUVAPlanes(const SkYUVAPixmaps& yuvaPixmaps);
+
+    virtual bool isTextureGenerator() const { return false; }
+
+protected:
+    static constexpr int kNeedNewImageUniqueID = 0;
+
+    SkImageGenerator(const SkImageInfo& info, uint32_t uniqueId = kNeedNewImageUniqueID);
+
+    virtual sk_sp<const SkData> onRefEncodedData() { return nullptr; }
+
+    struct Options {};
+    virtual bool onGetPixels(const SkImageInfo&, void*, size_t, const Options&) { return false; }
+    virtual bool onIsValid(SkRecorder*) const { return true; }
+    virtual bool onIsProtected() const { return false; }
+    virtual bool onQueryYUVAInfo(const SkYUVAPixmapInfo::SupportedDataTypes&,
+                                 SkYUVAPixmapInfo*) const { return false; }
+    virtual bool onGetYUVAPlanes(const SkYUVAPixmaps&) { return false; }
+
+    const SkImageInfo fInfo;
+
+private:
+    const uint32_t fUniqueID;
+
+    SkImageGenerator(SkImageGenerator&&) = delete;
+    SkImageGenerator(const SkImageGenerator&) = delete;
+    SkImageGenerator& operator=(SkImageGenerator&&) = delete;
+    SkImageGenerator& operator=(const SkImageGenerator&) = delete;
+};
+
+#endif

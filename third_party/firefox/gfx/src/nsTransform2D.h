@@ -1,0 +1,56 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsTransform2D_h_
+#define nsTransform2D_h_
+
+#include "nsCoord.h"
+
+class nsTransform2D {
+ private:
+
+  float m00, m11, m20, m21;
+
+ public:
+  nsTransform2D(void) {
+    m20 = m21 = 0.0f;
+    m00 = m11 = 1.0f;
+  }
+
+  ~nsTransform2D(void) = default;
+
+
+  void SetToTranslate(float tx, float ty) {
+    m00 = m11 = 1.0f;
+    m20 = tx;
+    m21 = ty;
+  }
+
+
+  void GetTranslationCoord(nscoord* ptX, nscoord* ptY) const {
+    *ptX = NSToCoordRound(m20);
+    *ptY = NSToCoordRound(m21);
+  }
+
+
+  void TransformCoord(nscoord* ptX, nscoord* ptY) const;
+
+
+  void TransformCoord(nscoord* aX, nscoord* aY, nscoord* aWidth,
+                      nscoord* aHeight) const;
+
+
+  void AddScale(float ptX, float ptY) {
+    m00 *= ptX;
+    m11 *= ptY;
+  }
+
+
+  void SetScale(float ptX, float ptY) {
+    m00 = ptX;
+    m11 = ptY;
+  }
+};
+
+#endif

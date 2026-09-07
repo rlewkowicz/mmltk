@@ -1,0 +1,170 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/HTMLHRElement.h"
+
+#include "mozilla/MappedDeclarationsBuilder.h"
+#include "mozilla/dom/HTMLHRElementBinding.h"
+#include "nsCSSProps.h"
+#include "nsStyleConsts.h"
+
+NS_IMPL_NS_NEW_HTML_ELEMENT(HR)
+
+namespace mozilla::dom {
+
+HTMLHRElement::HTMLHRElement(already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo)
+    : nsGenericHTMLElement(std::move(aNodeInfo)) {}
+
+HTMLHRElement::~HTMLHRElement() = default;
+
+NS_IMPL_ELEMENT_CLONE(HTMLHRElement)
+
+bool HTMLHRElement::ParseAttribute(int32_t aNamespaceID, nsAtom* aAttribute,
+                                   const nsAString& aValue,
+                                   nsIPrincipal* aMaybeScriptedPrincipal,
+                                   nsAttrValue& aResult) {
+  static const nsAttrValue::EnumTableEntry kAlignTable[] = {
+      {"left", StyleTextAlign::Left},
+      {"right", StyleTextAlign::Right},
+      {"center", StyleTextAlign::Center},
+  };
+
+  if (aNamespaceID == kNameSpaceID_None) {
+    if (aAttribute == nsGkAtoms::width) {
+      return aResult.ParseHTMLDimension(aValue);
+    }
+    if (aAttribute == nsGkAtoms::size) {
+      return aResult.ParseIntWithBounds(aValue, 1, 1000);
+    }
+    if (aAttribute == nsGkAtoms::align) {
+      return aResult.ParseEnumValue(aValue, kAlignTable, false);
+    }
+    if (aAttribute == nsGkAtoms::color) {
+      return aResult.ParseColor(aValue);
+    }
+  }
+
+  return nsGenericHTMLElement::ParseAttribute(aNamespaceID, aAttribute, aValue,
+                                              aMaybeScriptedPrincipal, aResult);
+}
+
+void HTMLHRElement::MapAttributesIntoRule(MappedDeclarationsBuilder& aBuilder) {
+  bool noshade = false;
+
+  const nsAttrValue* colorValue = aBuilder.GetAttr(nsGkAtoms::color);
+  nscolor color;
+  bool colorIsSet = colorValue && colorValue->GetColorValue(color);
+
+  if (colorIsSet) {
+    noshade = true;
+  } else {
+    noshade = !!aBuilder.GetAttr(nsGkAtoms::noshade);
+  }
+
+  const nsAttrValue* value = aBuilder.GetAttr(nsGkAtoms::align);
+  if (value && value->Type() == nsAttrValue::eEnum) {
+    switch (StyleTextAlign(value->GetEnumValue())) {
+      case StyleTextAlign::Left:
+        aBuilder.SetPixelValueIfUnset(eCSSProperty_margin_left, 0.0f);
+        aBuilder.SetAutoValueIfUnset(eCSSProperty_margin_right);
+        break;
+      case StyleTextAlign::Right:
+        aBuilder.SetAutoValueIfUnset(eCSSProperty_margin_left);
+        aBuilder.SetPixelValueIfUnset(eCSSProperty_margin_right, 0.0f);
+        break;
+      case StyleTextAlign::Center:
+        aBuilder.SetAutoValueIfUnset(eCSSProperty_margin_left);
+        aBuilder.SetAutoValueIfUnset(eCSSProperty_margin_right);
+        break;
+      default:
+        MOZ_ASSERT_UNREACHABLE("Unknown <hr align> value");
+        break;
+    }
+  }
+  if (!aBuilder.PropertyIsSet(eCSSProperty_height)) {
+    if (noshade) {
+      aBuilder.SetAutoValue(eCSSProperty_height);
+    } else {
+      const nsAttrValue* value = aBuilder.GetAttr(nsGkAtoms::size);
+      if (value && value->Type() == nsAttrValue::eInteger) {
+        aBuilder.SetPixelValue(eCSSProperty_height,
+                               (float)value->GetIntegerValue());
+      }  
+    }
+  }
+
+  if (noshade) {
+    float sizePerSide;
+    bool allSides = true;
+    value = aBuilder.GetAttr(nsGkAtoms::size);
+    if (value && value->Type() == nsAttrValue::eInteger) {
+      sizePerSide = (float)value->GetIntegerValue() / 2.0f;
+      if (sizePerSide < 1.0f) {
+        sizePerSide = 1.0f;
+        allSides = false;
+      }
+    } else {
+      sizePerSide = 1.0f;  
+    }
+    aBuilder.SetPixelValueIfUnset(eCSSProperty_border_top_width, sizePerSide);
+    if (allSides) {
+      aBuilder.SetPixelValueIfUnset(eCSSProperty_border_right_width,
+                                    sizePerSide);
+      aBuilder.SetPixelValueIfUnset(eCSSProperty_border_bottom_width,
+                                    sizePerSide);
+      aBuilder.SetPixelValueIfUnset(eCSSProperty_border_left_width,
+                                    sizePerSide);
+    }
+
+    if (!aBuilder.PropertyIsSet(eCSSProperty_border_top_style)) {
+      aBuilder.SetKeywordValue(eCSSProperty_border_top_style,
+                               StyleBorderStyle::Solid);
+    }
+    if (allSides) {
+      aBuilder.SetKeywordValueIfUnset(eCSSProperty_border_right_style,
+                                      StyleBorderStyle::Solid);
+      aBuilder.SetKeywordValueIfUnset(eCSSProperty_border_bottom_style,
+                                      StyleBorderStyle::Solid);
+      aBuilder.SetKeywordValueIfUnset(eCSSProperty_border_left_style,
+                                      StyleBorderStyle::Solid);
+
+      for (const NonCustomCSSPropertyId* props =
+               nsCSSProps::SubpropertyEntryFor(eCSSProperty_border_radius);
+           *props != eCSSProperty_UNKNOWN; ++props) {
+        aBuilder.SetPixelValueIfUnset(*props, 10000.0f);
+      }
+    }
+  }
+  if (colorIsSet) {
+    aBuilder.SetColorValueIfUnset(eCSSProperty_color, color);
+  }
+  MapWidthAttributeInto(aBuilder);
+  MapCommonAttributesInto(aBuilder);
+}
+
+NS_IMETHODIMP_(bool)
+HTMLHRElement::IsAttributeMapped(const nsAtom* aAttribute) const {
+  static const MappedAttributeEntry attributes[] = {
+      {nsGkAtoms::align}, {nsGkAtoms::width},   {nsGkAtoms::size},
+      {nsGkAtoms::color}, {nsGkAtoms::noshade}, {nullptr},
+  };
+
+  static const MappedAttributeEntry* const map[] = {
+      attributes,
+      sCommonAttributeMap,
+  };
+
+  return FindAttributeDependence(aAttribute, map);
+}
+
+nsMapRuleToAttributesFunc HTMLHRElement::GetAttributeMappingFunction() const {
+  return &MapAttributesIntoRule;
+}
+
+JSObject* HTMLHRElement::WrapNode(JSContext* aCx,
+                                  JS::Handle<JSObject*> aGivenProto) {
+  return HTMLHRElement_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+}  

@@ -1,0 +1,734 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "XULButtonElement.h"
+
+#include "XULMenuParentElement.h"
+#include "XULPopupElement.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/EventDispatcher.h"
+#include "mozilla/EventStateManager.h"
+#include "mozilla/LookAndFeel.h"
+#include "mozilla/TextEvents.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/dom/AncestorIterator.h"
+#include "mozilla/dom/DocumentInlines.h"
+#include "mozilla/dom/MouseEventBinding.h"
+#include "mozilla/dom/NameSpaceConstants.h"
+#include "mozilla/dom/XULMenuBarElement.h"
+#include "mozilla/glue/Debug.h"
+#include "nsCaseTreatment.h"
+#include "nsChangeHint.h"
+#include "nsGkAtoms.h"
+#include "nsIDOMXULButtonElement.h"
+#include "nsISound.h"
+#include "nsITimer.h"
+#include "nsLayoutUtils.h"
+#include "nsMenuPopupFrame.h"
+#include "nsPlaceholderFrame.h"
+#include "nsPresContext.h"
+#include "nsXULPopupManager.h"
+
+namespace mozilla::dom {
+
+XULButtonElement::XULButtonElement(
+    already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo)
+    : nsXULElement(std::move(aNodeInfo)),
+      mIsAlwaysMenu(IsAnyOfXULElements(nsGkAtoms::menu, nsGkAtoms::menulist,
+                                       nsGkAtoms::menuitem)),
+      mCheckable(IsAnyOfXULElements(nsGkAtoms::menuitem,
+                                    nsGkAtoms::richlistitem, nsGkAtoms::radio,
+                                    nsGkAtoms::checkbox)) {}
+
+XULButtonElement::~XULButtonElement() {
+  StopBlinking();
+  KillMenuOpenTimer();
+}
+
+nsChangeHint XULButtonElement::GetAttributeChangeHint(
+    const nsAtom* aAttribute, AttrModType aModType) const {
+  if (aAttribute == nsGkAtoms::type &&
+      IsAnyOfXULElements(nsGkAtoms::button, nsGkAtoms::toolbarbutton)) {
+    return nsChangeHint_ReconstructFrame;
+  }
+  return nsXULElement::GetAttributeChangeHint(aAttribute, aModType);
+}
+
+static TimeStamp gMenuJustOpenedOrClosedTime = TimeStamp();
+
+void XULButtonElement::PopupOpened() {
+  if (!IsMenu()) {
+    return;
+  }
+  gMenuJustOpenedOrClosedTime = TimeStamp::Now();
+  SetAttr(kNameSpaceID_None, nsGkAtoms::open, u"true"_ns, true);
+}
+
+void XULButtonElement::PopupClosed(bool aDeselectMenu) {
+  if (!IsMenu()) {
+    return;
+  }
+  nsContentUtils::AddScriptRunner(
+      MakeAndAddRef<nsUnsetAttrRunnable>(this, nsGkAtoms::open));
+
+  if (aDeselectMenu) {
+    if (RefPtr<XULMenuParentElement> parent = GetMenuParent()) {
+      if (parent->GetActiveMenuChild() == this) {
+        parent->SetActiveMenuChild(nullptr);
+      }
+    }
+  }
+}
+
+bool XULButtonElement::IsMenuActive() const {
+  if (XULMenuParentElement* menu = GetMenuParent()) {
+    return menu->GetActiveMenuChild() == this;
+  }
+  return false;
+}
+
+void XULButtonElement::HandleEnterKeyPress(WidgetEvent& aEvent) {
+  if (IsDisabled()) {
+    return;
+  }
+  if (IsMenuPopupOpen()) {
+    return;
+  }
+  if (IsMenuItem()) {
+    ExecuteMenu(aEvent);
+  } else {
+    OpenMenuPopup(true);
+  }
+}
+
+bool XULButtonElement::IsMenuPopupOpen() {
+  nsMenuPopupFrame* popupFrame = GetMenuPopup(FlushType::None);
+  return popupFrame && popupFrame->IsOpen();
+}
+
+bool XULButtonElement::IsOnMenu() const {
+  auto* popup = XULPopupElement::FromNodeOrNull(GetMenuParent());
+  return popup && popup->IsMenu();
+}
+
+bool XULButtonElement::IsOnMenuList() const {
+  if (XULMenuParentElement* menu = GetMenuParent()) {
+    return menu->GetParent() &&
+           menu->GetParent()->IsXULElement(nsGkAtoms::menulist);
+  }
+  return false;
+}
+
+bool XULButtonElement::IsOnMenuBar() const {
+  if (XULMenuParentElement* menu = GetMenuParent()) {
+    return menu->IsMenuBar();
+  }
+  return false;
+}
+
+nsMenuPopupFrame* XULButtonElement::GetContainingPopupWithoutFlushing() const {
+  if (XULPopupElement* popup = GetContainingPopupElement()) {
+    return do_QueryFrame(popup->GetPrimaryFrame());
+  }
+  return nullptr;
+}
+
+XULPopupElement* XULButtonElement::GetContainingPopupElement() const {
+  return XULPopupElement::FromNodeOrNull(GetMenuParent());
+}
+
+bool XULButtonElement::IsOnContextMenu() const {
+  if (nsMenuPopupFrame* popup = GetContainingPopupWithoutFlushing()) {
+    return popup->IsContextMenu();
+  }
+  return false;
+}
+
+void XULButtonElement::ToggleMenuState() {
+  if (IsMenuPopupOpen()) {
+    CloseMenuPopup(false);
+  } else {
+    OpenMenuPopup(false);
+  }
+}
+
+void XULButtonElement::KillMenuOpenTimer() {
+  if (mMenuOpenTimer) {
+    mMenuOpenTimer->Cancel();
+    mMenuOpenTimer = nullptr;
+  }
+}
+
+void XULButtonElement::OpenMenuPopup(bool aSelectFirstItem) {
+  nsXULPopupManager* pm = nsXULPopupManager::GetInstance();
+  if (!pm) {
+    return;
+  }
+
+  pm->KillMenuTimer();
+  if (!pm->MayShowMenu(this)) {
+    return;
+  }
+
+  if (RefPtr<XULMenuParentElement> parent = GetMenuParent()) {
+    parent->SetActiveMenuChild(this);
+  }
+
+  OwnerDoc()->Dispatch(NS_NewRunnableFunction(
+      "AsyncOpenMenu", [self = RefPtr{this}, aSelectFirstItem] {
+        if (self->GetMenuParent() && !self->IsMenuActive()) {
+          return;
+        }
+        if (nsXULPopupManager* pm = nsXULPopupManager::GetInstance()) {
+          pm->ShowMenu(self, aSelectFirstItem);
+        }
+      }));
+}
+
+void XULButtonElement::CloseMenuPopup(bool aDeselectMenu) {
+  gMenuJustOpenedOrClosedTime = TimeStamp::Now();
+  nsXULPopupManager* pm = nsXULPopupManager::GetInstance();
+  if (!pm) {
+    return;
+  }
+  if (auto* popup = GetMenuPopupContent()) {
+    HidePopupOptions options{HidePopupOption::Async};
+    if (aDeselectMenu) {
+      options += HidePopupOption::DeselectMenu;
+    }
+    pm->HidePopup(popup, options);
+  }
+}
+
+int32_t XULButtonElement::MenuOpenCloseDelay() const {
+  if (IsOnMenuBar()) {
+    return 0;
+  }
+  return LookAndFeel::GetInt(LookAndFeel::IntID::SubmenuDelay, 300);  
+}
+
+void XULButtonElement::ExecuteMenu(Modifiers aModifiers, int16_t aButton,
+                                   bool aIsTrusted) {
+  MOZ_ASSERT(IsMenu());
+
+  StopBlinking();
+
+  auto menuType = GetMenuType();
+  if (NS_WARN_IF(!menuType)) {
+    return;
+  }
+
+  const bool userinput = dom::UserActivation::IsHandlingUserInput();
+
+  bool needToFlipChecked = false;
+  if (*menuType == MenuType::Checkbox ||
+      (*menuType == MenuType::Radio && !GetBoolAttr(nsGkAtoms::checked))) {
+    needToFlipChecked = !AttrValueIs(kNameSpaceID_None, nsGkAtoms::autocheck,
+                                     nsGkAtoms::_false, eCaseMatters);
+  }
+
+  mDelayedMenuCommandEvent = new nsXULMenuCommandEvent(
+      this, aIsTrusted, aModifiers, userinput, needToFlipChecked, aButton);
+  StartBlinking();
+}
+
+void XULButtonElement::StopBlinking() {
+  if (mMenuBlinkTimer) {
+    if (auto* parent = GetMenuParent()) {
+      parent->LockMenuUntilClosed(false);
+    }
+    mMenuBlinkTimer->Cancel();
+    mMenuBlinkTimer = nullptr;
+  }
+  mDelayedMenuCommandEvent = nullptr;
+}
+
+void XULButtonElement::PassMenuCommandEventToPopupManager() {
+  if (mDelayedMenuCommandEvent) {
+    if (RefPtr<nsXULPopupManager> pm = nsXULPopupManager::GetInstance()) {
+      RefPtr<nsXULMenuCommandEvent> event = std::move(mDelayedMenuCommandEvent);
+      nsCOMPtr<nsIContent> content = this;
+      pm->ExecuteMenu(content, event);
+    }
+  }
+  mDelayedMenuCommandEvent = nullptr;
+}
+
+static constexpr int32_t kBlinkDelay = 67;  
+
+void XULButtonElement::StartBlinking() {
+  if (!LookAndFeel::GetInt(LookAndFeel::IntID::ChosenMenuItemsShouldBlink)) {
+    PassMenuCommandEventToPopupManager();
+    return;
+  }
+
+  UnsetAttr(kNameSpaceID_None, nsGkAtoms::menuactive, true);
+  if (auto* parent = GetMenuParent()) {
+    parent->LockMenuUntilClosed(true);
+  }
+
+  NS_NewTimerWithFuncCallback(
+      getter_AddRefs(mMenuBlinkTimer),
+      [](nsITimer*, void* aClosure) MOZ_CAN_RUN_SCRIPT_BOUNDARY {
+        RefPtr self = static_cast<XULButtonElement*>(aClosure);
+        if (auto* parent = self->GetMenuParent()) {
+          if (parent->GetActiveMenuChild() == self) {
+            self->SetAttr(kNameSpaceID_None, nsGkAtoms::menuactive, u"true"_ns,
+                          true);
+          }
+        }
+        self->mMenuBlinkTimer->InitWithNamedFuncCallback(
+            [](nsITimer*, void* aClosure) MOZ_CAN_RUN_SCRIPT_BOUNDARY {
+              RefPtr self = static_cast<XULButtonElement*>(aClosure);
+              if (auto* parent = self->GetMenuParent()) {
+                parent->LockMenuUntilClosed(false);
+              }
+              self->PassMenuCommandEventToPopupManager();
+              self->StopBlinking();
+            },
+            aClosure, kBlinkDelay, nsITimer::TYPE_ONE_SHOT,
+            "XULButtonElement::ContinueBlinking"_ns);
+      },
+      this, kBlinkDelay, nsITimer::TYPE_ONE_SHOT,
+      "XULButtonElement::StartBlinking"_ns, GetMainThreadSerialEventTarget());
+}
+
+void XULButtonElement::UnbindFromTree(UnbindContext& aContext) {
+  StopBlinking();
+  nsXULElement::UnbindFromTree(aContext);
+}
+
+void XULButtonElement::ExecuteMenu(WidgetEvent& aEvent) {
+  MOZ_ASSERT(IsMenu());
+  if (nsCOMPtr<nsISound> sound = do_GetService("@mozilla.org/sound;1")) {
+    sound->PlayEventSound(nsISound::EVENT_MENU_EXECUTE);
+  }
+
+  Modifiers modifiers = 0;
+  if (WidgetInputEvent* inputEvent = aEvent.AsInputEvent()) {
+    modifiers = inputEvent->mModifiers;
+  }
+
+  int16_t button = 0;
+  if (WidgetMouseEventBase* mouseEvent = aEvent.AsMouseEventBase()) {
+    button = mouseEvent->mButton;
+  }
+
+  ExecuteMenu(modifiers, button, aEvent.IsTrusted());
+}
+
+void XULButtonElement::PostHandleEventForMenus(
+    EventChainPostVisitor& aVisitor) {
+  auto* event = aVisitor.mEvent;
+
+  if (event->mOriginalTarget != this) {
+    return;
+  }
+
+  if (auto* parent = GetMenuParent()) {
+    if (NS_WARN_IF(parent->IsLocked())) {
+      return;
+    }
+  }
+
+  if (!gMenuJustOpenedOrClosedTime.IsNull()) {
+    if (event->mMessage == eMouseDown) {
+      gMenuJustOpenedOrClosedTime = TimeStamp();
+    } else if (event->mMessage == eMouseUp) {
+      return;
+    }
+  }
+
+  if (event->mMessage == eKeyPress && !IsDisabled()) {
+    WidgetKeyboardEvent* keyEvent = event->AsKeyboardEvent();
+    uint32_t keyCode = keyEvent->mKeyCode;
+    if ((keyCode == NS_VK_F4 && !keyEvent->IsAlt()) ||
+        ((keyCode == NS_VK_UP || keyCode == NS_VK_DOWN) && keyEvent->IsAlt())) {
+      aVisitor.mEventStatus = nsEventStatus_eConsumeNoDefault;
+      ToggleMenuState();
+    }
+  } else if (event->mMessage == eMouseDown &&
+             event->AsMouseEvent()->mButton == MouseButton::ePrimary &&
+             !IsDisabled() && !IsMenuItem()) {
+    if (!IsOnMenu()) {
+      ToggleMenuState();
+    } else if (!IsMenuPopupOpen()) {
+      OpenMenuPopup(false);
+    }
+  } else if (event->mMessage == eMouseUp && IsMenuItem() && !IsDisabled() &&
+             !event->mFlags.mMultipleActionsPrevented) {
+    bool isMacCtrlClick = false;
+    bool clickMightOpenContextMenu =
+        event->AsMouseEvent()->mButton == MouseButton::eSecondary ||
+        isMacCtrlClick;
+    if (!clickMightOpenContextMenu || IsOnContextMenu()) {
+      aVisitor.mEventStatus = nsEventStatus_eConsumeNoDefault;
+      ExecuteMenu(*event);
+    }
+  } else if (event->mMessage == eContextMenu && IsOnContextMenu() &&
+             !IsMenuItem() && !IsDisabled()) {
+    aVisitor.mEventStatus = nsEventStatus_eConsumeNoDefault;
+  } else if (event->mMessage == eMouseOut) {
+    KillMenuOpenTimer();
+    if (RefPtr<XULMenuParentElement> parent = GetMenuParent()) {
+      if (parent->GetActiveMenuChild() == this) {
+        const bool shouldDeactivate = [&] {
+          if (IsMenuPopupOpen()) {
+            return false;
+          }
+          if (auto* menubar = XULMenuBarElement::FromNode(*parent)) {
+            return !menubar->IsActiveByKeyboard();
+          }
+          if (IsOnMenuList()) {
+            return false;
+          }
+          return true;
+        }();
+
+        if (shouldDeactivate) {
+          parent->SetActiveMenuChild(nullptr);
+        }
+      }
+    }
+  } else if (event->mMessage == eMouseMove && (IsOnMenu() || IsOnMenuBar())) {
+    const TimeDuration kTolerance = TimeDuration::FromMilliseconds(200);
+    if (!gMenuJustOpenedOrClosedTime.IsNull() &&
+        gMenuJustOpenedOrClosedTime + kTolerance < TimeStamp::Now()) {
+      gMenuJustOpenedOrClosedTime = TimeStamp();
+      return;
+    }
+
+    if (IsDisabled() && IsOnMenuList()) {
+      return;
+    }
+
+    RefPtr<XULMenuParentElement> parent = GetMenuParent();
+    MOZ_ASSERT(parent, "How did IsOnMenu{,Bar} return true then?");
+
+    const bool isOnOpenMenubar =
+        parent->IsMenuBar() && parent->GetActiveMenuChild() &&
+        parent->GetActiveMenuChild()->IsMenuPopupOpen();
+
+    parent->SetActiveMenuChild(this);
+
+    if (!IsMenuActive()) {
+      return;
+    }
+    if (IsDisabled() || IsMenuItem() || IsMenuPopupOpen() || mMenuOpenTimer) {
+      return;
+    }
+
+    if (parent->IsMenuBar() && !isOnOpenMenubar) {
+      return;
+    }
+
+    NS_NewTimerWithFuncCallback(
+        getter_AddRefs(mMenuOpenTimer),
+        [](nsITimer*, void* aClosure) MOZ_CAN_RUN_SCRIPT_BOUNDARY {
+          RefPtr self = static_cast<XULButtonElement*>(aClosure);
+          self->mMenuOpenTimer = nullptr;
+          if (self->IsMenuPopupOpen()) {
+            return;
+          }
+          nsXULPopupManager* pm = nsXULPopupManager::GetInstance();
+          if (!pm) {
+            return;
+          }
+          if (pm->HasContextMenu(nullptr) && !self->IsOnContextMenu()) {
+            return;
+          }
+          if (!self->IsMenuActive()) {
+            return;
+          }
+          self->OpenMenuPopup(false);
+        },
+        this, MenuOpenCloseDelay(), nsITimer::TYPE_ONE_SHOT,
+        "XULButtonElement::OpenMenu"_ns, GetMainThreadSerialEventTarget());
+  }
+}
+
+nsresult XULButtonElement::PostHandleEvent(EventChainPostVisitor& aVisitor) {
+  if (aVisitor.mEventStatus == nsEventStatus_eConsumeNoDefault) {
+    return nsXULElement::PostHandleEvent(aVisitor);
+  }
+
+  if (IsMenu()) {
+    PostHandleEventForMenus(aVisitor);
+    return nsXULElement::PostHandleEvent(aVisitor);
+  }
+
+  auto* event = aVisitor.mEvent;
+  switch (event->mMessage) {
+    case eBlur: {
+      Blurred();
+      break;
+    }
+    case eKeyDown: {
+      WidgetKeyboardEvent* keyEvent = event->AsKeyboardEvent();
+      if (!keyEvent) {
+        break;
+      }
+      if (keyEvent->ShouldWorkAsSpaceKey() && aVisitor.mPresContext &&
+          !IsDisabled()) {
+        EventStateManager* esm = aVisitor.mPresContext->EventStateManager();
+        esm->SetContentState(this, ElementState::HOVER);
+        esm->SetContentState(this, ElementState::ACTIVE);
+        mIsHandlingKeyEvent = true;
+      }
+      break;
+    }
+
+    case eKeyPress: {
+      WidgetKeyboardEvent* keyEvent = event->AsKeyboardEvent();
+      if (!keyEvent) {
+        break;
+      }
+      if (NS_VK_RETURN == keyEvent->mKeyCode) {
+        if (RefPtr<nsIDOMXULButtonElement> button = AsXULButton()) {
+          if (OnPointerClicked(*keyEvent)) {
+            aVisitor.mEventStatus = nsEventStatus_eConsumeNoDefault;
+          }
+        }
+      }
+      if (keyEvent->ShouldWorkAsSpaceKey() && mIsHandlingKeyEvent) {
+        aVisitor.mEventStatus = nsEventStatus_eConsumeNoDefault;
+      }
+      break;
+    }
+
+    case eKeyUp: {
+      WidgetKeyboardEvent* keyEvent = event->AsKeyboardEvent();
+      if (!keyEvent) {
+        break;
+      }
+      if (keyEvent->ShouldWorkAsSpaceKey()) {
+        mIsHandlingKeyEvent = false;
+        if (State().HasAllStates(ElementState::ACTIVE | ElementState::HOVER) &&
+            aVisitor.mPresContext) {
+          EventStateManager* esm = aVisitor.mPresContext->EventStateManager();
+          esm->SetContentState(nullptr, ElementState::ACTIVE);
+          esm->SetContentState(nullptr, ElementState::HOVER);
+          if (OnPointerClicked(*keyEvent)) {
+            aVisitor.mEventStatus = nsEventStatus_eConsumeNoDefault;
+          }
+        }
+      }
+      break;
+    }
+
+    case ePointerClick: {
+      WidgetMouseEvent* mouseEvent = event->AsMouseEvent();
+      if (mouseEvent->IsLeftClickEvent()) {
+        if (OnPointerClicked(*mouseEvent)) {
+          aVisitor.mEventStatus = nsEventStatus_eConsumeNoDefault;
+        }
+      }
+      break;
+    }
+
+    default:
+      break;
+  }
+
+  return nsXULElement::PostHandleEvent(aVisitor);
+}
+
+void XULButtonElement::Blurred() {
+  if (mIsHandlingKeyEvent &&
+      State().HasAllStates(ElementState::ACTIVE | ElementState::HOVER)) {
+    if (nsPresContext* pc = OwnerDoc()->GetPresContext()) {
+      EventStateManager* esm = pc->EventStateManager();
+      esm->SetContentState(nullptr, ElementState::ACTIVE);
+      esm->SetContentState(nullptr, ElementState::HOVER);
+    }
+  }
+  mIsHandlingKeyEvent = false;
+}
+
+bool XULButtonElement::OnPointerClicked(WidgetGUIEvent& aEvent) {
+  if (IsDisabled() || !IsInComposedDoc()) {
+    return false;
+  }
+
+  if (NodeInfo()->Equals(nsGkAtoms::checkbox)) {
+    SetBoolAttr(nsGkAtoms::checked, !GetBoolAttr(nsGkAtoms::checked));
+  }
+
+  RefPtr<mozilla::PresShell> presShell = OwnerDoc()->GetPresShell();
+  if (!presShell) {
+    return false;
+  }
+
+  WidgetInputEvent* inputEvent = aEvent.AsInputEvent();
+  WidgetMouseEventBase* mouseEvent = aEvent.AsMouseEventBase();
+  WidgetKeyboardEvent* keyEvent = aEvent.AsKeyboardEvent();
+  nsContentUtils::DispatchXULCommand(
+      this, aEvent.IsTrusted(),  nullptr, presShell,
+      inputEvent->IsControl(), inputEvent->IsAlt(), inputEvent->IsShift(),
+      inputEvent->IsMeta(),
+      mouseEvent ? mouseEvent->mInputSource
+                 : (keyEvent ? MouseEvent_Binding::MOZ_SOURCE_KEYBOARD
+                             : MouseEvent_Binding::MOZ_SOURCE_UNKNOWN),
+      mouseEvent ? mouseEvent->mButton : 0);
+  return true;
+}
+
+bool XULButtonElement::IsMenu() const {
+  if (mIsAlwaysMenu) {
+    return true;
+  }
+  return IsAnyOfXULElements(nsGkAtoms::button, nsGkAtoms::toolbarbutton) &&
+         AttrValueIs(kNameSpaceID_None, nsGkAtoms::type, nsGkAtoms::menu,
+                     eCaseMatters);
+}
+
+void XULButtonElement::UncheckRadioSiblings() {
+  MOZ_ASSERT(!nsContentUtils::IsSafeToRunScript());
+  MOZ_ASSERT(GetMenuType() == Some(MenuType::Radio));
+  nsAutoString groupName;
+  GetAttr(nsGkAtoms::name, groupName);
+
+  nsIContent* parent = GetParent();
+  if (!parent) {
+    return;
+  }
+
+  auto ShouldUncheck = [&](const nsIContent& aSibling) {
+    const auto* button = XULButtonElement::FromNode(aSibling);
+    if (!button || button->GetMenuType() != Some(MenuType::Radio)) {
+      return false;
+    }
+    if (const auto* attr = button->GetParsedAttr(nsGkAtoms::name)) {
+      if (!attr->Equals(groupName, eCaseMatters)) {
+        return false;
+      }
+    } else if (!groupName.IsEmpty()) {
+      return false;
+    }
+    return button->GetBoolAttr(nsGkAtoms::checked);
+  };
+
+  for (nsIContent* child = parent->GetFirstChild(); child;
+       child = child->GetNextSibling()) {
+    if (child == this || !ShouldUncheck(*child)) {
+      continue;
+    }
+    child->AsElement()->UnsetAttr(nsGkAtoms::checked, IgnoreErrors());
+  }
+}
+
+nsAtom* XULButtonElement::GetCheckedStateAttribute() const {
+  MOZ_ASSERT(mCheckable);
+  if (auto menuType = GetMenuType()) {
+    return *menuType == MenuType::Normal ? nsGkAtoms::selected
+                                         : nsGkAtoms::checked;
+  }
+  if (NodeInfo()->Equals(nsGkAtoms::radio)) {
+    return nsGkAtoms::selected;
+  }
+  return nsGkAtoms::checked;
+}
+
+void XULButtonElement::AfterSetAttr(int32_t aNamespaceID, nsAtom* aName,
+                                    const nsAttrValue* aValue,
+                                    const nsAttrValue* aOldValue,
+                                    nsIPrincipal* aSubjectPrincipal,
+                                    bool aNotify) {
+  nsXULElement::AfterSetAttr(aNamespaceID, aName, aValue, aOldValue,
+                             aSubjectPrincipal, aNotify);
+  if (aNamespaceID != kNameSpaceID_None) {
+    return;
+  }
+  if (mCheckable) {
+    if (aName == GetCheckedStateAttribute()) {
+      SetStates(ElementState::CHECKED, !!aValue, aNotify);
+    }
+    if (IsAlwaysMenu() && aName == nsGkAtoms::type) {
+      SetStates(ElementState::CHECKED, GetBoolAttr(GetCheckedStateAttribute()),
+                aNotify);
+    }
+  }
+  if (aName == nsGkAtoms::disabled) {
+    SetStates(ElementState::DISABLED, !!aValue, aNotify);
+  }
+  if (IsAlwaysMenu()) {
+    const bool shouldUncheckSiblings = [&] {
+      if (aName == nsGkAtoms::type || aName == nsGkAtoms::name) {
+        return *GetMenuType() == MenuType::Radio &&
+               GetBoolAttr(nsGkAtoms::checked);
+      }
+      if (aName == nsGkAtoms::checked && aValue) {
+        return *GetMenuType() == MenuType::Radio;
+      }
+      return false;
+    }();
+    if (shouldUncheckSiblings) {
+      UncheckRadioSiblings();
+    }
+  }
+}
+
+auto XULButtonElement::GetMenuType() const -> Maybe<MenuType> {
+  if (!IsAlwaysMenu()) {
+    return Nothing();
+  }
+
+  static Element::AttrValuesArray values[] = {nsGkAtoms::checkbox,
+                                              nsGkAtoms::radio, nullptr};
+  switch (FindAttrValueIn(kNameSpaceID_None, nsGkAtoms::type, values,
+                          eCaseMatters)) {
+    case 0:
+      return Some(MenuType::Checkbox);
+    case 1:
+      return Some(MenuType::Radio);
+    default:
+      return Some(MenuType::Normal);
+  }
+}
+
+XULMenuBarElement* XULButtonElement::GetMenuBar() const {
+  if (!IsMenu()) {
+    return nullptr;
+  }
+  return FirstAncestorOfType<XULMenuBarElement>();
+}
+
+XULMenuParentElement* XULButtonElement::GetMenuParent() const {
+  if (IsXULElement(nsGkAtoms::menulist)) {
+    return nullptr;
+  }
+  return FirstAncestorOfType<XULMenuParentElement>();
+}
+
+XULPopupElement* XULButtonElement::GetMenuPopupContent() const {
+  if (!IsMenu()) {
+    return nullptr;
+  }
+  for (auto* child = GetFirstChild(); child; child = child->GetNextSibling()) {
+    if (auto* popup = XULPopupElement::FromNode(child)) {
+      return popup;
+    }
+  }
+  return nullptr;
+}
+
+nsMenuPopupFrame* XULButtonElement::GetMenuPopupWithoutFlushing() const {
+  return const_cast<XULButtonElement*>(this)->GetMenuPopup(FlushType::None);
+}
+
+nsMenuPopupFrame* XULButtonElement::GetMenuPopup(FlushType aFlushType) {
+  RefPtr popup = GetMenuPopupContent();
+  if (!popup) {
+    return nullptr;
+  }
+  return do_QueryFrame(popup->GetPrimaryFrame(aFlushType));
+}
+
+bool XULButtonElement::OpenedWithKey() const {
+  auto* menubar = GetMenuBar();
+  return menubar && menubar->IsActiveByKeyboard();
+}
+
+}  

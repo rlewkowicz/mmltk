@@ -1,0 +1,73 @@
+/*
+ * Copyright 2006 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkGraphics_DEFINED)
+#define SkGraphics_DEFINED
+
+#include "include/core/SkRefCnt.h"
+#include "include/private/base/SkAPI.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+
+class SkData;
+class SkImageGenerator;
+class SkOpenTypeSVGDecoder;
+class SkTraceMemoryDump;
+
+class SK_API SkGraphics {
+public:
+    static void Init();
+
+    static size_t GetFontCacheLimit();
+
+    static size_t SetFontCacheLimit(size_t bytes);
+
+    static size_t GetFontCacheUsed();
+
+    static int GetFontCacheCountUsed();
+
+    static int GetFontCacheCountLimit();
+
+    static int SetFontCacheCountLimit(int count);
+
+    static int GetTypefaceCacheCountLimit();
+
+    static int SetTypefaceCacheCountLimit(int count);
+
+    static void PurgeFontCache();
+
+    static void PurgePinnedFontCache();
+
+    static size_t GetResourceCacheTotalBytesUsed();
+
+    static size_t GetResourceCacheTotalByteLimit();
+    static size_t SetResourceCacheTotalByteLimit(size_t newLimit);
+
+    static void PurgeResourceCache();
+
+    static size_t GetResourceCacheSingleAllocationByteLimit();
+    static size_t SetResourceCacheSingleAllocationByteLimit(size_t newLimit);
+
+    static void DumpMemoryStatistics(SkTraceMemoryDump* dump);
+
+    static void PurgeAllCaches();
+
+    using ImageGeneratorFromEncodedDataFactory =
+            std::unique_ptr<SkImageGenerator> (*)(sk_sp<const SkData>);
+
+    static ImageGeneratorFromEncodedDataFactory
+                    SetImageGeneratorFromEncodedDataFactory(ImageGeneratorFromEncodedDataFactory);
+
+    using OpenTypeSVGDecoderFactory =
+            std::unique_ptr<SkOpenTypeSVGDecoder> (*)(const uint8_t* svg, size_t length);
+    static OpenTypeSVGDecoderFactory SetOpenTypeSVGDecoderFactory(OpenTypeSVGDecoderFactory);
+    static OpenTypeSVGDecoderFactory GetOpenTypeSVGDecoderFactory();
+};
+
+#endif

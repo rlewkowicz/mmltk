@@ -1,0 +1,571 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "SVGPatternFrame.h"
+
+#include "AutoReferenceChainGuard.h"
+#include "SVGAnimatedTransformList.h"
+#include "gfx2DGlue.h"
+#include "gfxContext.h"
+#include "gfxMatrix.h"
+#include "gfxPattern.h"
+#include "gfxPlatform.h"
+#include "mozilla/ComputedStyle.h"
+#include "mozilla/ISVGDisplayableFrame.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/SVGContentUtils.h"
+#include "mozilla/SVGGeometryFrame.h"
+#include "mozilla/SVGObserverUtils.h"
+#include "mozilla/SVGUtils.h"
+#include "mozilla/dom/SVGPatternElement.h"
+#include "mozilla/dom/SVGUnitTypesBinding.h"
+#include "mozilla/gfx/2D.h"
+#include "nsGkAtoms.h"
+#include "nsIFrameInlines.h"
+
+using namespace mozilla::dom;
+using namespace mozilla::dom::SVGUnitTypes_Binding;
+using namespace mozilla::gfx;
+using namespace mozilla::image;
+
+namespace mozilla {
+
+
+SVGPatternFrame::SVGPatternFrame(ComputedStyle* aStyle,
+                                 nsPresContext* aPresContext)
+    : SVGPaintServerFrame(aStyle, aPresContext, kClassID),
+      mSource(nullptr),
+      mLoopFlag(false),
+      mNoHRefURI(false) {}
+
+NS_IMPL_FRAMEARENA_HELPERS(SVGPatternFrame)
+
+NS_QUERYFRAME_HEAD(SVGPatternFrame)
+  NS_QUERYFRAME_ENTRY(SVGPatternFrame)
+NS_QUERYFRAME_TAIL_INHERITING(SVGPaintServerFrame)
+
+
+nsresult SVGPatternFrame::AttributeChanged(int32_t aNameSpaceID,
+                                           nsAtom* aAttribute,
+                                           AttrModType aModType) {
+  if (aNameSpaceID == kNameSpaceID_None &&
+      (aAttribute == nsGkAtoms::patternUnits ||
+       aAttribute == nsGkAtoms::patternContentUnits ||
+       aAttribute == nsGkAtoms::patternTransform ||
+       aAttribute == nsGkAtoms::x || aAttribute == nsGkAtoms::y ||
+       aAttribute == nsGkAtoms::width || aAttribute == nsGkAtoms::height ||
+       aAttribute == nsGkAtoms::preserveAspectRatio ||
+       aAttribute == nsGkAtoms::viewBox)) {
+    SVGObserverUtils::InvalidateRenderingObservers(this);
+  }
+
+  if ((aNameSpaceID == kNameSpaceID_XLink ||
+       aNameSpaceID == kNameSpaceID_None) &&
+      aAttribute == nsGkAtoms::href) {
+    SVGObserverUtils::RemoveTemplateObserver(this);
+    mNoHRefURI = false;
+    SVGObserverUtils::InvalidateRenderingObservers(this);
+  }
+
+  return SVGPaintServerFrame::AttributeChanged(aNameSpaceID, aAttribute,
+                                               aModType);
+}
+
+#ifdef DEBUG
+void SVGPatternFrame::Init(nsIContent* aContent, nsContainerFrame* aParent,
+                           nsIFrame* aPrevInFlow) {
+  NS_ASSERTION(aContent->IsSVGElement(nsGkAtoms::pattern),
+               "Content is not an SVG pattern");
+
+  SVGPaintServerFrame::Init(aContent, aParent, aPrevInFlow);
+}
+#endif /* DEBUG */
+
+
+gfxMatrix SVGPatternFrame::GetCanvasTM() {
+  if (mCTM) {
+    return *mCTM;
+  }
+
+  if (mSource) {
+    return mSource->GetCanvasTM();
+  }
+
+  return gfxMatrix();
+}
+
+
+static float MaxExpansion(const Matrix& aMatrix) {
+  double a = aMatrix._11;
+  double b = aMatrix._12;
+  double c = aMatrix._21;
+  double d = aMatrix._22;
+  double f = (a * a + b * b + c * c + d * d) / 2;
+  double g = (a * a + b * b - c * c - d * d) / 2;
+  double h = a * c + b * d;
+  return sqrt(f + sqrt(g * g + h * h));
+}
+
+static bool IncludeBBoxScale(const SVGAnimatedViewBox& aViewBox,
+                             uint32_t aPatternContentUnits,
+                             uint32_t aPatternUnits) {
+  return (!aViewBox.IsExplicitlySet() &&
+          aPatternContentUnits == SVG_UNIT_TYPE_OBJECTBOUNDINGBOX) ||
+         (aViewBox.IsExplicitlySet() &&
+          aPatternUnits == SVG_UNIT_TYPE_OBJECTBOUNDINGBOX);
+}
+
+static Matrix GetPatternMatrix(nsIFrame* aSource,
+                               const StyleSVGPaint nsStyleSVG::* aFillOrStroke,
+                               uint16_t aPatternUnits,
+                               const gfxMatrix& patternTransform,
+                               const gfxRect& bbox, const gfxRect& callerBBox,
+                               const Matrix& callerCTM) {
+  gfxFloat minx = bbox.X();
+  gfxFloat miny = bbox.Y();
+
+  if (aPatternUnits == SVG_UNIT_TYPE_OBJECTBOUNDINGBOX) {
+    minx += callerBBox.X();
+    miny += callerBBox.Y();
+  }
+
+  double scale = 1.0 / MaxExpansion(callerCTM);
+  auto patternMatrix = patternTransform;
+  patternMatrix.PreScale(scale, scale);
+  patternMatrix.PreTranslate(minx, miny);
+
+  if (aFillOrStroke == &nsStyleSVG::mStroke) {
+    gfxMatrix userToOuterSVG;
+    if (SVGUtils::GetNonScalingStrokeTransform(aSource, &userToOuterSVG)) {
+      patternMatrix *= userToOuterSVG;
+    }
+  }
+
+  return ToMatrix(patternMatrix);
+}
+
+static nsresult GetTargetGeometry(gfxRect* aBBox,
+                                  const SVGAnimatedViewBox& aViewBox,
+                                  uint16_t aPatternContentUnits,
+                                  uint16_t aPatternUnits, nsIFrame* aTarget,
+                                  const Matrix& aContextMatrix,
+                                  const gfxRect* aOverrideBounds) {
+  *aBBox =
+      aOverrideBounds
+          ? *aOverrideBounds
+          : SVGUtils::GetBBox(aTarget, {SVGBBoxFlag::UseFrameBoundsForOuterSVG,
+                                        SVGBBoxFlag::IncludeFillGeometry});
+
+  if (IncludeBBoxScale(aViewBox, aPatternContentUnits, aPatternUnits) &&
+      aBBox->IsEmpty()) {
+    return NS_ERROR_FAILURE;
+  }
+
+  float scale = MaxExpansion(aContextMatrix);
+  if (scale <= 0) {
+    return NS_ERROR_FAILURE;
+  }
+  aBBox->Scale(scale);
+  return NS_OK;
+}
+
+void SVGPatternFrame::PaintChildren(DrawTarget* aDrawTarget,
+                                    SVGPatternFrame* aPatternWithChildren,
+                                    nsIFrame* aSource, float aGraphicOpacity,
+                                    imgDrawingParams& aImgParams) {
+  gfxContext ctx(aDrawTarget);
+  gfxGroupForBlendAutoSaveRestore autoGroupForBlend(&ctx);
+
+  if (aGraphicOpacity != 1.0f) {
+    autoGroupForBlend.PushGroupForBlendBack(gfxContentType::COLOR_ALPHA,
+                                            aGraphicOpacity);
+  }
+
+
+  if (aSource->IsSVGGeometryFrame()) {
+    aPatternWithChildren->mSource = static_cast<SVGGeometryFrame*>(aSource);
+  }
+
+  if (!aPatternWithChildren->HasAnyStateBits(NS_FRAME_DRAWING_AS_PAINTSERVER)) {
+    AutoSetRestorePaintServerState paintServer(aPatternWithChildren);
+    for (auto* kid : aPatternWithChildren->mFrames) {
+      gfxMatrix tm = *(aPatternWithChildren->mCTM);
+
+      ISVGDisplayableFrame* SVGFrame = do_QueryFrame(kid);
+      if (SVGFrame) {
+        SVGFrame->NotifySVGChanged(
+            ISVGDisplayableFrame::ChangeFlag::TransformChanged);
+        tm = SVGUtils::GetTransformMatrixInUserSpace(kid) * tm;
+      }
+
+      SVGUtils::PaintFrameWithEffects(kid, ctx, tm, aImgParams);
+    }
+  }
+
+  aPatternWithChildren->mSource = nullptr;
+}
+
+already_AddRefed<SourceSurface> SVGPatternFrame::PaintPattern(
+    const DrawTarget* aDrawTarget, Matrix* patternMatrix,
+    const Matrix& aContextMatrix, nsIFrame* aSource,
+    StyleSVGPaint nsStyleSVG::* aFillOrStroke, float aGraphicOpacity,
+    const gfxRect* aOverrideBounds, imgDrawingParams& aImgParams) {
+
+  SVGPatternFrame* patternWithChildren = GetPatternWithChildren();
+  if (!patternWithChildren) {
+    return nullptr;
+  }
+
+  const SVGAnimatedViewBox& viewBox = GetViewBox();
+
+  uint16_t patternContentUnits =
+      GetEnumValue(SVGPatternElement::PATTERNCONTENTUNITS);
+  uint16_t patternUnits = GetEnumValue(SVGPatternElement::PATTERNUNITS);
+
+
+  gfxRect callerBBox;
+  if (NS_FAILED(GetTargetGeometry(&callerBBox, viewBox, patternContentUnits,
+                                  patternUnits, aSource, aContextMatrix,
+                                  aOverrideBounds))) {
+    return nullptr;
+  }
+
+  gfxMatrix ctm = ConstructCTM(viewBox, patternContentUnits, patternUnits,
+                               callerBBox, aContextMatrix, aSource);
+  if (ctm.IsSingular()) {
+    return nullptr;
+  }
+
+  if (patternWithChildren->mCTM) {
+    *patternWithChildren->mCTM = ctm;
+  } else {
+    patternWithChildren->mCTM = std::make_unique<gfxMatrix>(ctm);
+  }
+
+  gfxRect bbox =
+      GetPatternRect(patternUnits, callerBBox, aContextMatrix, aSource);
+  if (bbox.IsEmpty()) {
+    return nullptr;
+  }
+
+  auto patternTransform = GetPatternTransform();
+
+  *patternMatrix =
+      GetPatternMatrix(aSource, aFillOrStroke, patternUnits, patternTransform,
+                       bbox, callerBBox, aContextMatrix);
+  if (patternMatrix->IsSingular()) {
+    return nullptr;
+  }
+
+  gfxSize scaledSize = bbox.Size() * MaxExpansion(ToMatrix(patternTransform));
+
+  bool resultOverflows;
+  IntSize surfaceSize =
+      SVGUtils::ConvertToSurfaceSize(scaledSize, &resultOverflows);
+
+  if (surfaceSize.width <= 0 || surfaceSize.height <= 0) {
+    return nullptr;
+  }
+
+  gfxFloat patternWidth = bbox.Width();
+  gfxFloat patternHeight = bbox.Height();
+
+  if (resultOverflows || patternWidth != surfaceSize.width ||
+      patternHeight != surfaceSize.height) {
+    patternWithChildren->mCTM->PostScale(surfaceSize.width / patternWidth,
+                                         surfaceSize.height / patternHeight);
+
+    patternMatrix->PreScale(patternWidth / surfaceSize.width,
+                            patternHeight / surfaceSize.height);
+  }
+
+  RefPtr<DrawTarget> dt = aDrawTarget->CreateSimilarDrawTargetWithBacking(
+      surfaceSize, SurfaceFormat::B8G8R8A8);
+  if (!dt || !dt->IsValid()) {
+    return nullptr;
+  }
+  dt->ClearRect(Rect(0, 0, surfaceSize.width, surfaceSize.height));
+
+  PaintChildren(dt, patternWithChildren, aSource, aGraphicOpacity, aImgParams);
+
+  return dt->GetBackingSurface();
+}
+
+SVGPatternFrame* SVGPatternFrame::GetPatternWithChildren() {
+  if (!mFrames.IsEmpty()) {
+    return this;
+  }
+
+
+  static int16_t sRefChainLengthCounter = AutoReferenceChainGuard::noChain;
+  AutoReferenceChainGuard refChainGuard(this, &mLoopFlag,
+                                        &sRefChainLengthCounter);
+  if (MOZ_UNLIKELY(!refChainGuard.Reference())) {
+    return nullptr;
+  }
+
+  SVGPatternFrame* next = GetReferencedPattern();
+  if (!next) {
+    return nullptr;
+  }
+
+  return next->GetPatternWithChildren();
+}
+
+uint16_t SVGPatternFrame::GetEnumValue(uint32_t aIndex, nsIContent* aDefault) {
+  SVGAnimatedEnumeration& thisEnum =
+      static_cast<SVGPatternElement*>(GetContent())->mEnumAttributes[aIndex];
+
+  if (thisEnum.IsExplicitlySet()) {
+    return thisEnum.GetAnimValue();
+  }
+
+  static int16_t sRefChainLengthCounter = AutoReferenceChainGuard::noChain;
+  AutoReferenceChainGuard refChainGuard(this, &mLoopFlag,
+                                        &sRefChainLengthCounter);
+  if (MOZ_UNLIKELY(!refChainGuard.Reference())) {
+    return static_cast<SVGPatternElement*>(aDefault)
+        ->mEnumAttributes[aIndex]
+        .GetAnimValue();
+  }
+
+  SVGPatternFrame* next = GetReferencedPattern();
+  return next ? next->GetEnumValue(aIndex, aDefault)
+              : static_cast<SVGPatternElement*>(aDefault)
+                    ->mEnumAttributes[aIndex]
+                    .GetAnimValue();
+}
+
+SVGPatternFrame* SVGPatternFrame::GetPatternTransformFrame(
+    SVGPatternFrame* aDefault) {
+  if (!StyleDisplay()->mTransform.IsNone()) {
+    return this;
+  }
+
+  static int16_t sRefChainLengthCounter = AutoReferenceChainGuard::noChain;
+  AutoReferenceChainGuard refChainGuard(this, &mLoopFlag,
+                                        &sRefChainLengthCounter);
+  if (MOZ_UNLIKELY(!refChainGuard.Reference())) {
+    return aDefault;
+  }
+
+  if (SVGPatternFrame* next = GetReferencedPattern()) {
+    return next->GetPatternTransformFrame(aDefault);
+  }
+  return aDefault;
+}
+
+gfxMatrix SVGPatternFrame::GetPatternTransform() {
+  return SVGUtils::GetTransformMatrixInUserSpace(
+      GetPatternTransformFrame(this));
+}
+
+const SVGAnimatedViewBox& SVGPatternFrame::GetViewBox(nsIContent* aDefault) {
+  const SVGAnimatedViewBox& thisViewBox =
+      static_cast<SVGPatternElement*>(GetContent())->mViewBox;
+
+  if (thisViewBox.IsExplicitlySet()) {
+    return thisViewBox;
+  }
+
+  static int16_t sRefChainLengthCounter = AutoReferenceChainGuard::noChain;
+  AutoReferenceChainGuard refChainGuard(this, &mLoopFlag,
+                                        &sRefChainLengthCounter);
+  if (MOZ_UNLIKELY(!refChainGuard.Reference())) {
+    return static_cast<SVGPatternElement*>(aDefault)->mViewBox;
+  }
+
+  SVGPatternFrame* next = GetReferencedPattern();
+  return next ? next->GetViewBox(aDefault)
+              : static_cast<SVGPatternElement*>(aDefault)->mViewBox;
+}
+
+const SVGAnimatedPreserveAspectRatio& SVGPatternFrame::GetPreserveAspectRatio(
+    nsIContent* aDefault) {
+  const SVGAnimatedPreserveAspectRatio& thisPar =
+      static_cast<SVGPatternElement*>(GetContent())->mPreserveAspectRatio;
+
+  if (thisPar.IsExplicitlySet()) {
+    return thisPar;
+  }
+
+  static int16_t sRefChainLengthCounter = AutoReferenceChainGuard::noChain;
+  AutoReferenceChainGuard refChainGuard(this, &mLoopFlag,
+                                        &sRefChainLengthCounter);
+  if (MOZ_UNLIKELY(!refChainGuard.Reference())) {
+    return static_cast<SVGPatternElement*>(aDefault)->mPreserveAspectRatio;
+  }
+
+  SVGPatternFrame* next = GetReferencedPattern();
+  return next ? next->GetPreserveAspectRatio(aDefault)
+              : static_cast<SVGPatternElement*>(aDefault)->mPreserveAspectRatio;
+}
+
+const SVGAnimatedLength* SVGPatternFrame::GetLengthValue(uint32_t aIndex,
+                                                         nsIContent* aDefault) {
+  const SVGAnimatedLength* thisLength =
+      &static_cast<SVGPatternElement*>(GetContent())->mLengthAttributes[aIndex];
+
+  if (thisLength->IsExplicitlySet()) {
+    return thisLength;
+  }
+
+  static int16_t sRefChainLengthCounter = AutoReferenceChainGuard::noChain;
+  AutoReferenceChainGuard refChainGuard(this, &mLoopFlag,
+                                        &sRefChainLengthCounter);
+  if (MOZ_UNLIKELY(!refChainGuard.Reference())) {
+    return &static_cast<SVGPatternElement*>(aDefault)
+                ->mLengthAttributes[aIndex];
+  }
+
+  SVGPatternFrame* next = GetReferencedPattern();
+  return next ? next->GetLengthValue(aIndex, aDefault)
+              : &static_cast<SVGPatternElement*>(aDefault)
+                     ->mLengthAttributes[aIndex];
+}
+
+
+SVGPatternFrame* SVGPatternFrame::GetReferencedPattern() {
+  if (mNoHRefURI) {
+    return nullptr;
+  }
+
+  auto GetHref = [this](nsAString& aHref) {
+    SVGPatternElement* pattern =
+        static_cast<SVGPatternElement*>(this->GetContent());
+    if (pattern->mStringAttributes[SVGPatternElement::HREF].IsExplicitlySet()) {
+      pattern->mStringAttributes[SVGPatternElement::HREF].GetAnimValue(aHref,
+                                                                       pattern);
+    } else {
+      pattern->mStringAttributes[SVGPatternElement::XLINK_HREF].GetAnimValue(
+          aHref, pattern);
+    }
+    this->mNoHRefURI = aHref.IsEmpty();
+  };
+
+
+  return do_QueryFrame(SVGObserverUtils::GetAndObserveTemplate(this, GetHref));
+}
+
+gfxRect SVGPatternFrame::GetPatternRect(uint16_t aPatternUnits,
+                                        const gfxRect& aTargetBBox,
+                                        const Matrix& aTargetCTM,
+                                        nsIFrame* aTarget) {
+  float x, y, width, height;
+
+  const SVGAnimatedLength *tmpX, *tmpY, *tmpHeight, *tmpWidth;
+  tmpX = GetLengthValue(SVGPatternElement::ATTR_X);
+  tmpY = GetLengthValue(SVGPatternElement::ATTR_Y);
+  tmpHeight = GetLengthValue(SVGPatternElement::ATTR_HEIGHT);
+  tmpWidth = GetLengthValue(SVGPatternElement::ATTR_WIDTH);
+
+  if (aPatternUnits == SVG_UNIT_TYPE_OBJECTBOUNDINGBOX) {
+    SVGElementMetrics metrics(SVGElement::FromNode(GetContent()));
+    x = SVGUtils::ObjectSpace(aTargetBBox, metrics, tmpX);
+    y = SVGUtils::ObjectSpace(aTargetBBox, metrics, tmpY);
+    width = SVGUtils::ObjectSpace(aTargetBBox, metrics, tmpWidth);
+    height = SVGUtils::ObjectSpace(aTargetBBox, metrics, tmpHeight);
+  } else {
+    if (aTarget->IsTextFrame()) {
+      aTarget = aTarget->GetParent();
+    }
+    float scale = MaxExpansion(aTargetCTM);
+    x = SVGUtils::UserSpace(aTarget, tmpX) * scale;
+    y = SVGUtils::UserSpace(aTarget, tmpY) * scale;
+    width = SVGUtils::UserSpace(aTarget, tmpWidth) * scale;
+    height = SVGUtils::UserSpace(aTarget, tmpHeight) * scale;
+  }
+
+  return gfxRect(x, y, width, height);
+}
+
+gfxMatrix SVGPatternFrame::ConstructCTM(const SVGAnimatedViewBox& aViewBox,
+                                        uint16_t aPatternContentUnits,
+                                        uint16_t aPatternUnits,
+                                        const gfxRect& callerBBox,
+                                        const Matrix& callerCTM,
+                                        nsIFrame* aTarget) {
+  if (aTarget->IsTextFrame()) {
+    aTarget = aTarget->GetParent();
+  }
+  nsIContent* targetContent = aTarget->GetContent();
+  SVGViewportElement* ctx = nullptr;
+  gfxFloat scaleX, scaleY;
+
+  if (IncludeBBoxScale(aViewBox, aPatternContentUnits, aPatternUnits)) {
+    scaleX = callerBBox.Width();
+    scaleY = callerBBox.Height();
+  } else {
+    if (targetContent->IsSVGElement()) {
+      ctx = static_cast<SVGElement*>(targetContent)->GetCtx();
+    }
+    scaleX = scaleY = MaxExpansion(callerCTM);
+  }
+
+  if (!aViewBox.IsExplicitlySet()) {
+    return gfxMatrix(scaleX, 0.0, 0.0, scaleY, 0.0, 0.0);
+  }
+  const SVGViewBox& viewBox =
+      aViewBox.GetAnimValue() * Style()->EffectiveZoom().ToFloat();
+
+  if (!viewBox.IsValid()) {
+    return gfxMatrix(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);  
+  }
+
+  float viewportWidth, viewportHeight;
+  if (targetContent->IsSVGElement()) {
+    viewportWidth = GetLengthValue(SVGPatternElement::ATTR_WIDTH)
+                        ->GetAnimValueWithZoom(ctx);
+    viewportHeight = GetLengthValue(SVGPatternElement::ATTR_HEIGHT)
+                         ->GetAnimValueWithZoom(ctx);
+  } else {
+    viewportWidth = GetLengthValue(SVGPatternElement::ATTR_WIDTH)
+                        ->GetAnimValueWithZoom(aTarget);
+    viewportHeight = GetLengthValue(SVGPatternElement::ATTR_HEIGHT)
+                         ->GetAnimValueWithZoom(aTarget);
+  }
+
+  if (viewportWidth <= 0.0f || viewportHeight <= 0.0f) {
+    return gfxMatrix(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);  
+  }
+
+  Matrix tm = SVGContentUtils::GetViewBoxTransform(
+      viewportWidth * scaleX, viewportHeight * scaleY, viewBox.x, viewBox.y,
+      viewBox.width, viewBox.height, GetPreserveAspectRatio());
+
+  return ThebesMatrix(tm);
+}
+
+already_AddRefed<gfxPattern> SVGPatternFrame::GetPaintServerPattern(
+    nsIFrame* aSource, const DrawTarget* aDrawTarget,
+    const gfxMatrix& aContextMatrix, StyleSVGPaint nsStyleSVG::* aFillOrStroke,
+    float aGraphicOpacity, imgDrawingParams& aImgParams,
+    const gfxRect* aOverrideBounds) {
+  if (aGraphicOpacity == 0.0f) {
+    return MakeAndAddRef<gfxPattern>(DeviceColor());
+  }
+
+  Matrix pMatrix;
+  RefPtr<SourceSurface> surface =
+      PaintPattern(aDrawTarget, &pMatrix, ToMatrix(aContextMatrix), aSource,
+                   aFillOrStroke, aGraphicOpacity, aOverrideBounds, aImgParams);
+
+  if (!surface) {
+    return nullptr;
+  }
+
+  auto pattern = MakeRefPtr<gfxPattern>(surface, pMatrix);
+  pattern->SetExtend(ExtendMode::REPEAT);
+
+  return pattern.forget();
+}
+
+}  
+
+
+nsIFrame* NS_NewSVGPatternFrame(mozilla::PresShell* aPresShell,
+                                mozilla::ComputedStyle* aStyle) {
+  return new (aPresShell)
+      mozilla::SVGPatternFrame(aStyle, aPresShell->GetPresContext());
+}

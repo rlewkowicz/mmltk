@@ -1,0 +1,11 @@
+[package]
+name = "whatsys"
+version = "0.3.2"
+authors = ["Jan-Erik Rediger <janerik@fnordig.de>"]
+edition = "2018"
+description = "Determine the kernel version"
+license = "MIT"
+repository = "https://github.com/badboy/whatsys"
+
+[dependencies]
+libc = "0.2"

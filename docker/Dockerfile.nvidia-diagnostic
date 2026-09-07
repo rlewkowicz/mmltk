@@ -1,0 +1,14 @@
+# syntax=docker/dockerfile:1
+
+ARG MMLTK_NVIDIA_DONOR_IMAGE
+FROM ${MMLTK_NVIDIA_DONOR_IMAGE} AS inventory
+ARG MMLTK_NVIDIA_DONOR_IMAGE
+ARG MMLTK_DIAGNOSTIC_HEADERS
+ENV MMLTK_DIAGNOSTIC_IMAGE=${MMLTK_NVIDIA_DONOR_IMAGE} \
+    PYTHONDONTWRITEBYTECODE=1
+RUN --network=none --mount=type=bind,source=tools/diagnose_nvidia_payload.py,target=/diagnostic.py \
+    --mount=type=bind,source=docker,target=/diagnostic_metadata \
+    python3 /diagnostic.py --header-list "${MMLTK_DIAGNOSTIC_HEADERS}" >/headers.json
+
+FROM scratch
+COPY --from=inventory /headers.json /

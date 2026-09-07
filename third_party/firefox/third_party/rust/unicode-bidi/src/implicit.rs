@@ -1,0 +1,462 @@
+// Copyright 2015 The Servo Project Developers. See the
+// COPYRIGHT file at the top-level directory of this distribution.
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+//! 3.3.4 - 3.3.6. Resolve implicit levels and types.
+
+#[cfg(not(feature = "smallvec"))]
+use alloc::vec::Vec;
+use core::cmp::max;
+#[cfg(feature = "smallvec")]
+use smallvec::SmallVec;
+
+use super::char_data::BidiClass::{self, *};
+use super::level::Level;
+use super::prepare::{not_removed_by_x9, IsolatingRunSequence};
+use super::{BidiDataSource, TextSource};
+
+/// 3.3.4 Resolving Weak Types
+///
+/// <http://www.unicode.org/reports/tr9/#Resolving_Weak_Types>
+#[cfg_attr(feature = "flame_it", flamer::flame)]
+pub fn resolve_weak<'a, T: TextSource<'a> + ?Sized>(
+    text: &'a T,
+    sequence: &IsolatingRunSequence,
+    processing_classes: &mut [BidiClass],
+) {
+
+    let mut prev_class_before_w4 = sequence.sos;
+    let mut prev_class_before_w5 = sequence.sos;
+    let mut prev_class_before_w1 = sequence.sos;
+    let mut last_strong_is_al = false;
+    #[cfg(feature = "smallvec")]
+    let mut et_run_indices = SmallVec::<[usize; 8]>::new(); 
+    #[cfg(not(feature = "smallvec"))]
+    let mut et_run_indices = Vec::new(); 
+    #[cfg(feature = "smallvec")]
+    let mut bn_run_indices = SmallVec::<[usize; 8]>::new(); 
+    #[cfg(not(feature = "smallvec"))]
+    let mut bn_run_indices = Vec::new(); 
+
+    for (run_index, level_run) in sequence.runs.iter().enumerate() {
+        for i in &mut level_run.clone() {
+            if processing_classes[i] == BN {
+                bn_run_indices.push(i);
+                continue;
+            }
+
+            let mut w2_processing_class = processing_classes[i];
+
+
+            if processing_classes[i] == NSM {
+                processing_classes[i] = match prev_class_before_w1 {
+                    RLI | LRI | FSI | PDI => ON,
+                    _ => prev_class_before_w1,
+                };
+                w2_processing_class = processing_classes[i];
+            }
+
+            prev_class_before_w1 = processing_classes[i];
+
+            match processing_classes[i] {
+                EN => {
+                    if last_strong_is_al {
+                        processing_classes[i] = AN;
+                    }
+                }
+                AL => processing_classes[i] = R,
+                _ => {}
+            }
+
+            match w2_processing_class {
+                L | R => {
+                    last_strong_is_al = false;
+                }
+                AL => {
+                    last_strong_is_al = true;
+                }
+                _ => {}
+            }
+
+            let class_before_w456 = processing_classes[i];
+
+            match processing_classes[i] {
+                EN => {
+                    for j in &et_run_indices {
+                        processing_classes[*j] = EN;
+                    }
+                    et_run_indices.clear();
+                }
+
+                ES | CS => {
+                    if let Some((_, char_len)) = text.char_at(i) {
+                        let mut next_class = sequence
+                            .iter_forwards_from(i + char_len, run_index)
+                            .map(|j| processing_classes[j])
+                            .find(not_removed_by_x9)
+                            .unwrap_or(sequence.eos);
+                        if next_class == EN && last_strong_is_al {
+                            next_class = AN;
+                        }
+                        processing_classes[i] =
+                            match (prev_class_before_w4, processing_classes[i], next_class) {
+                                (EN, ES, EN) | (EN, CS, EN) => EN,
+                                (AN, CS, AN) => AN,
+                                (_, _, _) => ON,
+                            };
+
+                        if processing_classes[i] == ON {
+                            for idx in sequence.iter_backwards_from(i, run_index) {
+                                let class = &mut processing_classes[idx];
+                                if *class != BN {
+                                    break;
+                                }
+                                *class = ON;
+                            }
+                            for idx in sequence.iter_forwards_from(i + char_len, run_index) {
+                                let class = &mut processing_classes[idx];
+                                if *class != BN {
+                                    break;
+                                }
+                                *class = ON;
+                            }
+                        }
+                    } else {
+                        processing_classes[i] = processing_classes[i - 1];
+                    }
+                }
+                ET => {
+                    match prev_class_before_w5 {
+                        EN => processing_classes[i] = EN,
+                        _ => {
+                            et_run_indices.extend(bn_run_indices.clone());
+
+                            et_run_indices.push(i);
+                        }
+                    }
+                }
+                _ => {}
+            }
+
+
+            bn_run_indices.clear();
+
+            prev_class_before_w5 = processing_classes[i];
+
+            if prev_class_before_w5 != ET {
+                for j in &et_run_indices {
+                    processing_classes[*j] = ON;
+                }
+                et_run_indices.clear();
+            }
+
+            prev_class_before_w4 = class_before_w456;
+        }
+    }
+    for j in &et_run_indices {
+        processing_classes[*j] = ON;
+    }
+    et_run_indices.clear();
+
+    let mut last_strong_is_l = sequence.sos == L;
+    for i in sequence.runs.iter().cloned().flatten() {
+        match processing_classes[i] {
+            EN if last_strong_is_l => {
+                processing_classes[i] = L;
+            }
+            L => {
+                last_strong_is_l = true;
+            }
+            R | AL => {
+                last_strong_is_l = false;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(feature = "smallvec")]
+type BracketPairVec = SmallVec<[BracketPair; 8]>;
+#[cfg(not(feature = "smallvec"))]
+type BracketPairVec = Vec<BracketPair>;
+
+/// 3.3.5 Resolving Neutral Types
+///
+/// <http://www.unicode.org/reports/tr9/#Resolving_Neutral_Types>
+#[cfg_attr(feature = "flame_it", flamer::flame)]
+pub fn resolve_neutral<'a, D: BidiDataSource, T: TextSource<'a> + ?Sized>(
+    text: &'a T,
+    data_source: &D,
+    sequence: &IsolatingRunSequence,
+    levels: &[Level],
+    original_classes: &[BidiClass],
+    processing_classes: &mut [BidiClass],
+) {
+    let e: BidiClass = levels[sequence.runs[0].start].bidi_class();
+    let not_e = if e == BidiClass::L {
+        BidiClass::R
+    } else {
+        BidiClass::L
+    };
+
+    let mut bracket_pairs = BracketPairVec::new();
+    identify_bracket_pairs(
+        text,
+        data_source,
+        sequence,
+        processing_classes,
+        &mut bracket_pairs,
+    );
+
+    for pair in bracket_pairs {
+        #[cfg(feature = "std")]
+        debug_assert!(
+            pair.start < processing_classes.len(),
+            "identify_bracket_pairs returned a range that is out of bounds!"
+        );
+        #[cfg(feature = "std")]
+        debug_assert!(
+            pair.end < processing_classes.len(),
+            "identify_bracket_pairs returned a range that is out of bounds!"
+        );
+        let mut found_e = false;
+        let mut found_not_e = false;
+        let mut class_to_set = None;
+
+        let start_char_len =
+            T::char_len(text.subrange(pair.start..pair.end).chars().next().unwrap());
+        for enclosed_i in sequence.iter_forwards_from(pair.start + start_char_len, pair.start_run) {
+            if enclosed_i >= pair.end {
+                #[cfg(feature = "std")]
+                debug_assert!(
+                    enclosed_i == pair.end,
+                    "If we skipped past this, the iterator is broken"
+                );
+                break;
+            }
+            let class = processing_classes[enclosed_i];
+            if class == e {
+                found_e = true;
+            } else if class == not_e {
+                found_not_e = true;
+            } else if matches!(class, BidiClass::EN | BidiClass::AN) {
+                if e == BidiClass::L {
+                    found_not_e = true;
+                } else {
+                    found_e = true;
+                }
+            }
+
+            if found_e {
+                break;
+            }
+        }
+        if found_e {
+            class_to_set = Some(e);
+        } else if found_not_e {
+            let mut previous_strong = sequence
+                .iter_backwards_from(pair.start, pair.start_run)
+                .map(|i| processing_classes[i])
+                .find(|class| {
+                    matches!(
+                        class,
+                        BidiClass::L | BidiClass::R | BidiClass::EN | BidiClass::AN
+                    )
+                })
+                .unwrap_or(sequence.sos);
+
+            if matches!(previous_strong, BidiClass::EN | BidiClass::AN) {
+                previous_strong = BidiClass::R;
+            }
+
+            class_to_set = Some(previous_strong);
+        }
+
+        if let Some(class_to_set) = class_to_set {
+            let end_char_len =
+                T::char_len(text.subrange(pair.end..text.len()).chars().next().unwrap());
+            for class in &mut processing_classes[pair.start..pair.start + start_char_len] {
+                *class = class_to_set;
+            }
+            for class in &mut processing_classes[pair.end..pair.end + end_char_len] {
+                *class = class_to_set;
+            }
+            for idx in sequence.iter_backwards_from(pair.start, pair.start_run) {
+                let class = &mut processing_classes[idx];
+                if *class != BN {
+                    break;
+                }
+                *class = class_to_set;
+            }
+
+            let nsm_start = pair.start + start_char_len;
+            for idx in sequence.iter_forwards_from(nsm_start, pair.start_run) {
+                let class = original_classes[idx];
+                if class == BidiClass::NSM || processing_classes[idx] == BN {
+                    processing_classes[idx] = class_to_set;
+                } else {
+                    break;
+                }
+            }
+            let nsm_end = pair.end + end_char_len;
+            for idx in sequence.iter_forwards_from(nsm_end, pair.end_run) {
+                let class = original_classes[idx];
+                if class == BidiClass::NSM || processing_classes[idx] == BN {
+                    processing_classes[idx] = class_to_set;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut indices = sequence.runs.iter().flat_map(Clone::clone);
+    let mut prev_class = sequence.sos;
+    while let Some(mut i) = indices.next() {
+        #[cfg(feature = "smallvec")]
+        let mut ni_run = SmallVec::<[usize; 8]>::new();
+        #[cfg(not(feature = "smallvec"))]
+        let mut ni_run = Vec::new();
+        if is_NI(processing_classes[i]) || processing_classes[i] == BN {
+            ni_run.push(i);
+            let mut next_class;
+            loop {
+                match indices.next() {
+                    Some(j) => {
+                        i = j;
+                        next_class = processing_classes[j];
+                        if is_NI(next_class) || next_class == BN {
+                            ni_run.push(i);
+                        } else {
+                            break;
+                        }
+                    }
+                    None => {
+                        next_class = sequence.eos;
+                        break;
+                    }
+                };
+            }
+            let new_class = match (prev_class, next_class) {
+                (L, L) => L,
+                (R, R)
+                | (R, AN)
+                | (R, EN)
+                | (AN, R)
+                | (AN, AN)
+                | (AN, EN)
+                | (EN, R)
+                | (EN, AN)
+                | (EN, EN) => R,
+                (_, _) => e,
+            };
+            for j in &ni_run {
+                processing_classes[*j] = new_class;
+            }
+            ni_run.clear();
+        }
+        prev_class = processing_classes[i];
+    }
+}
+
+struct BracketPair {
+    /// The text-relative index of the opening bracket.
+    start: usize,
+    /// The text-relative index of the closing bracket.
+    end: usize,
+    /// The index of the run (in the run sequence) that the opening bracket is in.
+    start_run: usize,
+    /// The index of the run (in the run sequence) that the closing bracket is in.
+    end_run: usize,
+}
+/// 3.1.3 Identifying Bracket Pairs
+///
+/// Returns all paired brackets in the source, as indices into the
+/// text source.
+///
+/// <https://www.unicode.org/reports/tr9/#BD16>
+fn identify_bracket_pairs<'a, T: TextSource<'a> + ?Sized, D: BidiDataSource>(
+    text: &'a T,
+    data_source: &D,
+    run_sequence: &IsolatingRunSequence,
+    original_classes: &[BidiClass],
+    bracket_pairs: &mut BracketPairVec,
+) {
+    #[cfg(feature = "smallvec")]
+    let mut stack = SmallVec::<[(char, usize, usize); 8]>::new();
+    #[cfg(not(feature = "smallvec"))]
+    let mut stack = Vec::new();
+
+    for (run_index, level_run) in run_sequence.runs.iter().enumerate() {
+        for (i, ch) in text.subrange(level_run.clone()).char_indices() {
+            let actual_index = level_run.start + i;
+
+            if original_classes[actual_index] != BidiClass::ON {
+                continue;
+            }
+
+            if let Some(matched) = data_source.bidi_matched_opening_bracket(ch) {
+                if matched.is_open {
+
+                    if stack.len() >= 63 {
+                        break;
+                    }
+                    stack.push((matched.opening, actual_index, run_index))
+                } else {
+
+                    for (stack_index, element) in stack.iter().enumerate().rev() {
+                        if element.0 == matched.opening {
+
+                            let pair = BracketPair {
+                                start: element.1,
+                                end: actual_index,
+                                start_run: element.2,
+                                end_run: run_index,
+                            };
+                            bracket_pairs.push(pair);
+
+                            stack.truncate(stack_index);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    bracket_pairs.sort_by_key(|r| r.start);
+}
+
+/// 3.3.6 Resolving Implicit Levels
+///
+/// Returns the maximum embedding level in the paragraph.
+///
+/// <http://www.unicode.org/reports/tr9/#Resolving_Implicit_Levels>
+#[cfg_attr(feature = "flame_it", flamer::flame)]
+pub fn resolve_levels(processing_classes: &[BidiClass], levels: &mut [Level]) -> Level {
+    let mut max_level = Level::ltr();
+    assert_eq!(processing_classes.len(), levels.len());
+    for i in 0..levels.len() {
+        match (levels[i].is_rtl(), processing_classes[i]) {
+            (false, AN) | (false, EN) => levels[i].raise(2).expect("Level number error"),
+            (false, R) | (true, L) | (true, EN) | (true, AN) => {
+                levels[i].raise(1).expect("Level number error")
+            }
+            (_, _) => {}
+        }
+        max_level = max(max_level, levels[i]);
+    }
+
+    max_level
+}
+
+/// Neutral or Isolate formatting character (B, S, WS, ON, FSI, LRI, RLI, PDI)
+///
+/// <http://www.unicode.org/reports/tr9/#NI>
+#[allow(non_snake_case)]
+fn is_NI(class: BidiClass) -> bool {
+    matches!(class, B | S | WS | ON | FSI | LRI | RLI | PDI)
+}

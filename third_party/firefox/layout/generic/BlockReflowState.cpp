@@ -1,0 +1,839 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "BlockReflowState.h"
+
+#include <algorithm>
+
+#include "LayoutLogging.h"
+#include "TextOverflow.h"
+#ifdef DEBUG
+#  include "fmt/base.h"
+#endif
+#include "mozilla/AutoRestore.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/ReflowInput.h"
+#include "mozilla/StaticPrefs_layout.h"
+#include "nsBlockFrame.h"
+#include "nsIFrameInlines.h"
+#include "nsLineLayout.h"
+#include "nsPresContext.h"
+
+#ifdef DEBUG
+#  include "nsBlockDebugFlags.h"
+#endif
+
+using namespace mozilla;
+using namespace mozilla::layout;
+
+BlockReflowState::BlockReflowState(
+    const ReflowInput& aReflowInput, nsPresContext* aPresContext,
+    nsBlockFrame* aFrame, bool aBStartMarginRoot, bool aBEndMarginRoot,
+    bool aBlockNeedsFloatManager, const nscoord aConsumedBSize,
+    const nscoord aEffectiveContentBoxBSize, const nscoord aInset)
+    : mBlock(aFrame),
+      mPresContext(aPresContext),
+      mReflowInput(aReflowInput),
+      mContentArea(aReflowInput.GetWritingMode()),
+      mInsetForBalance(aInset),
+      mContainerSize(aReflowInput.ComputedSizeAsContainerIfConstrained()),
+      mOverflowTracker(nullptr),
+      mBorderPadding(
+          mReflowInput
+              .ComputedLogicalBorderPadding(mReflowInput.GetWritingMode())
+              .ApplySkipSides(aFrame->PreReflowBlockLevelLogicalSkipSides())),
+      mMinLineHeight(aReflowInput.GetLineHeight()),
+      mLineNumber(0),
+      mTrailingClearFromPIF(UsedClear::None),
+      mConsumedBSize(aConsumedBSize),
+      mAlignContentShift(mBlock->GetAlignContentShift()) {
+  NS_ASSERTION(mConsumedBSize != NS_UNCONSTRAINEDSIZE,
+               "The consumed block-size should be constrained!");
+
+  WritingMode wm = aReflowInput.GetWritingMode();
+
+  if (aBStartMarginRoot || 0 != mBorderPadding.BStart(wm)) {
+    mFlags.mIsBStartMarginRoot = true;
+    mFlags.mShouldApplyBStartMargin = true;
+  }
+  if (aBEndMarginRoot || 0 != mBorderPadding.BEnd(wm)) {
+    mFlags.mIsBEndMarginRoot = true;
+  }
+  if (aBlockNeedsFloatManager) {
+    mFlags.mBlockNeedsFloatManager = true;
+  }
+
+  mFlags.mShouldApplyTextBoxTrimStart =
+      aReflowInput.mFlags.mShouldApplyTextBoxTrimStart;
+  mFlags.mShouldApplyTextBoxTrimAtBlockEnd =
+      aReflowInput.mFlags.mShouldApplyTextBoxTrimAtBlockEnd;
+  mFlags.mShouldApplyTextBoxTrimAtFragmentEnd =
+      aReflowInput.mFlags.mShouldApplyTextBoxTrimAtFragmentEnd;
+
+  const StyleTextBoxTrim trim = mBlock->StyleTextReset()->mTextBoxTrim;
+  const bool selfTextBoxTrimStart = bool(trim & StyleTextBoxTrim::TRIM_START);
+  const bool selfTextBoxTrimEnd = bool(trim & StyleTextBoxTrim::TRIM_END);
+
+  const bool isBoxDecorationBreakClone =
+      aFrame->StyleBorder()->mBoxDecorationBreak ==
+      StyleBoxDecorationBreak::Clone;
+
+  if (selfTextBoxTrimStart) {
+    mFlags.mShouldApplyTextBoxTrimStart =
+        !aFrame->GetPrevInFlow() || isBoxDecorationBreakClone;
+  }
+
+  if (selfTextBoxTrimEnd) {
+    mFlags.mShouldApplyTextBoxTrimAtBlockEnd = true;
+    mFlags.mShouldApplyTextBoxTrimAtFragmentEnd = isBoxDecorationBreakClone;
+  }
+
+  mFlags.mCanHaveOverflowMarkers = css::TextOverflow::CanHaveOverflowMarkers(
+      mBlock, css::TextOverflow::BeforeReflow::Yes);
+
+  MOZ_ASSERT(FloatManager(),
+             "Float manager should be valid when creating BlockReflowState!");
+
+  FloatManager()->GetTranslation(mFloatManagerI, mFloatManagerB);
+  FloatManager()->PushState(&mFloatManagerStateBefore);  
+
+  mNextInFlow = static_cast<nsBlockFrame*>(mBlock->GetNextInFlow());
+
+  LAYOUT_WARN_IF_FALSE(NS_UNCONSTRAINEDSIZE != aReflowInput.ComputedISize(),
+                       "have unconstrained width; this should only result "
+                       "from very large sizes, not attempts at intrinsic "
+                       "width calculation");
+  mContentArea.ISize(wm) = aReflowInput.ComputedISize();
+
+  const nscoord availableBSize = aReflowInput.AvailableBSize();
+  if (availableBSize != NS_UNCONSTRAINEDSIZE) {
+    const bool reserveSpaceForBlockEndBP =
+        mReflowInput.mStyleBorder->mBoxDecorationBreak ==
+            StyleBoxDecorationBreak::Clone &&
+        (aEffectiveContentBoxBSize == NS_UNCONSTRAINEDSIZE ||
+         aEffectiveContentBoxBSize + mBorderPadding.BStartEnd(wm) >
+             availableBSize);
+    const nscoord bp = reserveSpaceForBlockEndBP ? mBorderPadding.BStartEnd(wm)
+                                                 : mBorderPadding.BStart(wm);
+    mContentArea.BSize(wm) = std::max(0, availableBSize - bp);
+  } else {
+    mContentArea.BSize(wm) = NS_UNCONSTRAINEDSIZE;
+  }
+  mContentArea.IStart(wm) = mBorderPadding.IStart(wm);
+  mBCoord = mContentArea.BStart(wm) = mBorderPadding.BStart(wm);
+
+  if (mAlignContentShift) {
+    mBCoord += mAlignContentShift;
+    mContentArea.BStart(wm) += mAlignContentShift;
+
+    if (availableBSize != NS_UNCONSTRAINEDSIZE) {
+      mContentArea.BSize(wm) += mAlignContentShift;
+    }
+  }
+
+  mPrevChild = nullptr;
+  mCurrentLine = aFrame->LinesEnd();
+}
+
+void BlockReflowState::UndoAlignContentShift() {
+  if (!mAlignContentShift) {
+    return;
+  }
+
+  mBCoord -= mAlignContentShift;
+  mContentArea.BStart(mReflowInput.GetWritingMode()) -= mAlignContentShift;
+
+  if (mReflowInput.AvailableBSize() != NS_UNCONSTRAINEDSIZE) {
+    mContentArea.BSize(mReflowInput.GetWritingMode()) -= mAlignContentShift;
+  }
+}
+
+void BlockReflowState::ComputeFloatAvoidingOffsets(
+    nsIFrame* aFloatAvoidingBlock, const LogicalRect& aFloatAvailableSpace,
+    nscoord& aIStartResult, nscoord& aIEndResult) const {
+  WritingMode wm = mReflowInput.GetWritingMode();
+  NS_ASSERTION(aFloatAvailableSpace.IStart(wm) >= mContentArea.IStart(wm),
+               "bad avail space rect inline-coord");
+  NS_ASSERTION(aFloatAvailableSpace.ISize(wm) == 0 ||
+                   aFloatAvailableSpace.IEnd(wm) <= mContentArea.IEnd(wm),
+               "bad avail space rect inline-size");
+
+  nscoord iStartOffset, iEndOffset;
+  if (aFloatAvailableSpace.ISize(wm) == mContentArea.ISize(wm)) {
+    iStartOffset = 0;
+    iEndOffset = 0;
+  } else {
+    const LogicalMargin frameMargin =
+        SizeComputationInput(aFloatAvoidingBlock,
+                             mReflowInput.mRenderingContext, wm,
+                             mContentArea.ISize(wm))
+            .ComputedLogicalMargin(wm);
+
+    nscoord iStartFloatIOffset =
+        aFloatAvailableSpace.IStart(wm) - mContentArea.IStart(wm);
+    iStartOffset = std::max(iStartFloatIOffset, frameMargin.IStart(wm)) -
+                   frameMargin.IStart(wm);
+    iStartOffset = std::max(iStartOffset, 0);  
+    nscoord iEndFloatIOffset =
+        mContentArea.IEnd(wm) - aFloatAvailableSpace.IEnd(wm);
+    iEndOffset =
+        std::max(iEndFloatIOffset, frameMargin.IEnd(wm)) - frameMargin.IEnd(wm);
+    iEndOffset = std::max(iEndOffset, 0);  
+  }
+  aIStartResult = iStartOffset;
+  aIEndResult = iEndOffset;
+}
+
+LogicalRect BlockReflowState::ComputeBlockAvailSpace(
+    nsIFrame* aFrame, const nsFlowAreaRect& aFloatAvailableSpace,
+    bool aBlockAvoidsFloats) {
+#ifdef REALLY_NOISY_REFLOW
+  printf("CBAS frame=%p has floats %d\n", aFrame,
+         aFloatAvailableSpace.HasFloats());
+#endif
+  WritingMode wm = mReflowInput.GetWritingMode();
+  LogicalRect result(wm);
+  result.BStart(wm) = mBCoord;
+  result.BSize(wm) = ContentBSize() == NS_UNCONSTRAINEDSIZE
+                         ? NS_UNCONSTRAINEDSIZE
+                         : ContentBEnd() - mBCoord;
+
+  NS_ASSERTION(
+      nsBlockFrame::BlockCanIntersectFloats(aFrame) == !aBlockAvoidsFloats,
+      "unexpected replaced width");
+  if (!aBlockAvoidsFloats) {
+    if (aFloatAvailableSpace.HasFloats()) {
+      const nsStyleBorder* borderStyle = aFrame->StyleBorder();
+      switch (borderStyle->mFloatEdge) {
+        default:
+        case StyleFloatEdge::ContentBox:  
+          result.IStart(wm) = mContentArea.IStart(wm);
+          result.ISize(wm) = mContentArea.ISize(wm);
+          break;
+        case StyleFloatEdge::MarginBox: {
+          result.IStart(wm) = aFloatAvailableSpace.mRect.IStart(wm);
+          result.ISize(wm) = aFloatAvailableSpace.mRect.ISize(wm);
+        } break;
+      }
+    } else {
+      result.IStart(wm) = mContentArea.IStart(wm);
+      result.ISize(wm) = mContentArea.ISize(wm);
+    }
+  } else {
+    nscoord iStartOffset, iEndOffset;
+    ComputeFloatAvoidingOffsets(aFrame, aFloatAvailableSpace.mRect,
+                                iStartOffset, iEndOffset);
+    result.IStart(wm) = mContentArea.IStart(wm) + iStartOffset;
+    result.ISize(wm) = mContentArea.ISize(wm) - iStartOffset - iEndOffset;
+  }
+
+#ifdef REALLY_NOISY_REFLOW
+  printf("  CBAS: result %d %d %d %d\n", result.IStart(wm), result.BStart(wm),
+         result.ISize(wm), result.BSize(wm));
+#endif
+
+  return result;
+}
+
+LogicalSize BlockReflowState::ComputeAvailableSizeForFloat() const {
+  const auto wm = mReflowInput.GetWritingMode();
+  const nscoord availBSize = ContentBSize() == NS_UNCONSTRAINEDSIZE
+                                 ? NS_UNCONSTRAINEDSIZE
+                                 : std::max(0, ContentBEnd() - mBCoord);
+  return LogicalSize(wm, ContentISize(), availBSize);
+}
+
+bool BlockReflowState::FloatAvoidingBlockFitsInAvailSpace(
+    nsIFrame* aFloatAvoidingBlock,
+    const nsFlowAreaRect& aFloatAvailableSpace) const {
+  if (!aFloatAvailableSpace.HasFloats()) {
+    return true;
+  }
+
+  if (aFloatAvailableSpace.ISizeIsActuallyNegative()) {
+    return false;
+  }
+
+  WritingMode wm = mReflowInput.GetWritingMode();
+  nsBlockFrame::FloatAvoidingISizeToClear replacedISize =
+      nsBlockFrame::ISizeToClearPastFloats(*this, aFloatAvailableSpace.mRect,
+                                           aFloatAvoidingBlock);
+  return std::max(
+             aFloatAvailableSpace.mRect.IStart(wm) - mContentArea.IStart(wm),
+             replacedISize.marginIStart) +
+             replacedISize.borderBoxISize +
+             (mContentArea.IEnd(wm) - aFloatAvailableSpace.mRect.IEnd(wm)) <=
+         mContentArea.ISize(wm);
+}
+
+nsFlowAreaRect BlockReflowState::GetFloatAvailableSpaceWithState(
+    WritingMode aCBWM, nscoord aBCoord, ShapeType aShapeType,
+    nsFloatManager::SavedState* aState) const {
+  WritingMode wm = mReflowInput.GetWritingMode();
+#ifdef DEBUG
+  nscoord wI, wB;
+  FloatManager()->GetTranslation(wI, wB);
+
+  NS_ASSERTION((wI == mFloatManagerI) && (wB == mFloatManagerB),
+               "bad coord system");
+#endif
+
+  nscoord blockSize = (mContentArea.BSize(wm) == nscoord_MAX)
+                          ? nscoord_MAX
+                          : std::max(mContentArea.BEnd(wm) - aBCoord, 0);
+  nsFlowAreaRect result = FloatManager()->GetFlowArea(
+      aCBWM, wm, aBCoord, blockSize, BandInfoType::BandFromPoint, aShapeType,
+      mContentArea, aState, ContainerSize());
+  if (result.mRect.ISize(wm) < 0) {
+    result.mRect.ISize(wm) = 0;
+  }
+
+#ifdef DEBUG
+  if (nsBlockFrame::gNoisyReflow) {
+    nsIFrame::IndentBy(stdout, nsBlockFrame::gNoiseIndent);
+    fmt::println("{} band={} hasFloats={}", __func__, ToString(result.mRect),
+                 YesOrNo(result.HasFloats()));
+  }
+#endif
+  return result;
+}
+
+nsFlowAreaRect BlockReflowState::GetFloatAvailableSpaceForBSize(
+    WritingMode aCBWM, nscoord aBCoord, nscoord aBSize,
+    nsFloatManager::SavedState* aState) const {
+  WritingMode wm = mReflowInput.GetWritingMode();
+#ifdef DEBUG
+  nscoord wI, wB;
+  FloatManager()->GetTranslation(wI, wB);
+
+  NS_ASSERTION((wI == mFloatManagerI) && (wB == mFloatManagerB),
+               "bad coord system");
+#endif
+  nsFlowAreaRect result = FloatManager()->GetFlowArea(
+      aCBWM, wm, aBCoord, aBSize, BandInfoType::WidthWithinHeight,
+      ShapeType::ShapeOutside, mContentArea, aState, ContainerSize());
+  if (result.mRect.ISize(wm) < 0) {
+    result.mRect.ISize(wm) = 0;
+  }
+
+#ifdef DEBUG
+  if (nsBlockFrame::gNoisyReflow) {
+    nsIFrame::IndentBy(stdout, nsBlockFrame::gNoiseIndent);
+    fmt::println("{} band={} hasFloats={}", __func__, ToString(result.mRect),
+                 YesOrNo(result.HasFloats()));
+  }
+#endif
+  return result;
+}
+
+void BlockReflowState::ReconstructMarginBefore(nsLineList::iterator aLine) {
+  mPrevBEndMargin.Zero();
+  nsBlockFrame* block = mBlock;
+
+  nsLineList::iterator firstLine = block->LinesBegin();
+  for (;;) {
+    --aLine;
+    if (aLine->IsBlock()) {
+      mPrevBEndMargin = aLine->GetCarriedOutBEndMargin();
+      break;
+    }
+    if (!aLine->IsEmpty()) {
+      break;
+    }
+    if (aLine == firstLine) {
+      if (!mFlags.mIsBStartMarginRoot) {
+        mPrevBEndMargin.Zero();
+      }
+      break;
+    }
+  }
+}
+
+void BlockReflowState::AppendPushedFloatChain(nsIFrame* aFloatCont) {
+  nsFrameList* pushedFloats = mBlock->EnsurePushedFloats();
+  while (true) {
+    aFloatCont->AddStateBits(NS_FRAME_IS_PUSHED_OUT_OF_FLOW);
+    pushedFloats->AppendFrame(mBlock, aFloatCont);
+    aFloatCont = aFloatCont->GetNextInFlow();
+    if (!aFloatCont || aFloatCont->GetParent() != mBlock) {
+      break;
+    }
+    mBlock->StealFrame(aFloatCont);
+  }
+}
+
+void BlockReflowState::RecoverFloats(nsLineList::iterator aLine,
+                                     nscoord aDeltaBCoord) {
+  WritingMode wm = mReflowInput.GetWritingMode();
+  if (aLine->HasFloats()) {
+    for (nsIFrame* floatFrame : aLine->Floats()) {
+      if (aDeltaBCoord != 0) {
+        floatFrame->MovePositionBy(nsPoint(0, aDeltaBCoord));
+      }
+#ifdef DEBUG
+      if (nsBlockFrame::gNoisyReflow || nsBlockFrame::gNoisyFloatManager) {
+        nscoord tI, tB;
+        FloatManager()->GetTranslation(tI, tB);
+        nsIFrame::IndentBy(stdout, nsBlockFrame::gNoiseIndent);
+        printf("RecoverFloats: tIB=%d,%d (%d,%d) ", tI, tB, mFloatManagerI,
+               mFloatManagerB);
+        floatFrame->ListTag(stdout);
+        LogicalRect region =
+            nsFloatManager::GetRegionFor(wm, floatFrame, ContainerSize());
+        printf(" aDeltaBCoord=%d region={%d,%d,%d,%d}\n", aDeltaBCoord,
+               region.IStart(wm), region.BStart(wm), region.ISize(wm),
+               region.BSize(wm));
+      }
+#endif
+      FloatManager()->AddFloat(
+          floatFrame,
+          nsFloatManager::GetRegionFor(wm, floatFrame, ContainerSize()), wm,
+          ContainerSize());
+    }
+  } else if (aLine->IsBlock()) {
+    nsBlockFrame::RecoverFloatsFor(aLine->mFirstChild, *FloatManager(), wm,
+                                   ContainerSize());
+  }
+}
+
+void BlockReflowState::RecoverStateFrom(nsLineList::iterator aLine,
+                                        nscoord aDeltaBCoord) {
+  mCurrentLine = aLine;
+
+  if (aLine->HasFloats() || aLine->IsBlock()) {
+    RecoverFloats(aLine, aDeltaBCoord);
+
+#ifdef DEBUG
+    if (nsBlockFrame::gNoisyReflow || nsBlockFrame::gNoisyFloatManager) {
+      FloatManager()->List(stdout);
+    }
+#endif
+  }
+}
+
+
+bool BlockReflowState::AddFloat(nsLineLayout* aLineLayout, nsIFrame* aFloat,
+                                nscoord aAvailableISize) {
+  MOZ_ASSERT(aLineLayout, "must have line layout");
+  MOZ_ASSERT(mBlock->LinesEnd() != mCurrentLine, "null ptr");
+  MOZ_ASSERT(aFloat->HasAnyStateBits(NS_FRAME_OUT_OF_FLOW),
+             "aFloat must be an out-of-flow frame");
+
+  MOZ_ASSERT(aFloat->GetParent(), "float must have parent");
+  MOZ_ASSERT(aFloat->GetParent()->IsBlockFrameOrSubclass(),
+             "float's parent must be block");
+  if (aFloat->HasAnyStateBits(NS_FRAME_IS_PUSHED_OUT_OF_FLOW) ||
+      aFloat->GetParent() != mBlock) {
+    MOZ_ASSERT(aFloat->HasAnyStateBits(NS_FRAME_IS_PUSHED_OUT_OF_FLOW |
+                                       NS_FRAME_FIRST_REFLOW),
+               "float should be in this block unless it was marked as "
+               "pushed out-of-flow, or just inserted");
+    MOZ_ASSERT(aFloat->GetParent()->FirstContinuation() ==
+               mBlock->FirstContinuation());
+    auto* floatParent = static_cast<nsBlockFrame*>(aFloat->GetParent());
+    floatParent->StealFrame(aFloat);
+
+    aFloat->RemoveStateBits(NS_FRAME_IS_PUSHED_OUT_OF_FLOW);
+
+    mBlock->EnsureFloats()->AppendFrame(mBlock, aFloat);
+  }
+
+  nscoord oI, oB;
+  FloatManager()->GetTranslation(oI, oB);
+  nscoord dI = oI - mFloatManagerI;
+  nscoord dB = oB - mFloatManagerB;
+  FloatManager()->Translate(-dI, -dB);
+
+  bool placed = false;
+
+  bool shouldPlaceFloatBelowCurrentLine = false;
+  if (mBelowCurrentLineFloats.IsEmpty()) {
+    Maybe<nscoord> availableISizeInCurrentLine =
+        aLineLayout->LineIsEmpty() ? Nothing() : Some(aAvailableISize);
+    PlaceFloatResult result =
+        FlowAndPlaceFloat(aFloat, availableISizeInCurrentLine);
+    if (result == PlaceFloatResult::Placed) {
+      placed = true;
+      WritingMode wm = mReflowInput.GetWritingMode();
+      nsFlowAreaRect floatAvailSpace =
+          mLineBSize.isNothing()
+              ? GetFloatAvailableSpace(wm, mBCoord)
+              : GetFloatAvailableSpaceForBSize(wm, mBCoord, mLineBSize.value(),
+                                               nullptr);
+      LogicalRect availSpace(wm, floatAvailSpace.mRect.IStart(wm), mBCoord,
+                             floatAvailSpace.mRect.ISize(wm),
+                             floatAvailSpace.mRect.BSize(wm));
+      aLineLayout->UpdateBand(wm, availSpace, aFloat);
+      mCurrentLineFloats.AppendElement(aFloat);
+    } else if (result == PlaceFloatResult::ShouldPlaceInNextContinuation) {
+      (*aLineLayout->GetLine())->SetHadFloatPushed();
+    } else {
+      MOZ_ASSERT(result == PlaceFloatResult::ShouldPlaceBelowCurrentLine);
+      shouldPlaceFloatBelowCurrentLine = true;
+    }
+  } else {
+    shouldPlaceFloatBelowCurrentLine = true;
+  }
+
+  if (shouldPlaceFloatBelowCurrentLine) {
+    placed = true;
+    mBelowCurrentLineFloats.AppendElement(aFloat);
+  }
+
+  FloatManager()->Translate(dI, dB);
+
+  return placed;
+}
+
+bool BlockReflowState::CanPlaceFloat(
+    nscoord aFloatISize, const nsFlowAreaRect& aFloatAvailableSpace) {
+  return !aFloatAvailableSpace.HasFloats() ||
+         aFloatAvailableSpace.mRect.ISize(mReflowInput.GetWritingMode()) >=
+             aFloatISize;
+}
+
+static nscoord FloatMarginISize(WritingMode aCBWM,
+                                const ReflowInput& aFloatRI) {
+  if (aFloatRI.ComputedSize(aCBWM).ISize(aCBWM) == NS_UNCONSTRAINEDSIZE) {
+    return NS_UNCONSTRAINEDSIZE;  
+  }
+  return aFloatRI.ComputedSizeWithMarginBorderPadding(aCBWM).ISize(aCBWM);
+}
+
+struct ShapeInvalidationData {
+  StyleShapeOutside mShapeOutside{StyleShapeOutside::None()};
+  float mShapeImageThreshold = 0.0;
+  LengthPercentage mShapeMargin;
+
+  ShapeInvalidationData() = default;
+
+  explicit ShapeInvalidationData(const nsStyleDisplay& aDisplay) {
+    Update(aDisplay);
+  }
+
+  static bool IsNeeded(const nsStyleDisplay& aDisplay) {
+    return !aDisplay.mShapeOutside.IsNone();
+  }
+
+  void Update(const nsStyleDisplay& aDisplay) {
+    MOZ_ASSERT(IsNeeded(aDisplay));
+    mShapeOutside = aDisplay.mShapeOutside;
+    mShapeImageThreshold = aDisplay.mShapeImageThreshold;
+    mShapeMargin = aDisplay.mShapeMargin;
+  }
+
+  bool Matches(const nsStyleDisplay& aDisplay) const {
+    return mShapeOutside == aDisplay.mShapeOutside &&
+           mShapeImageThreshold == aDisplay.mShapeImageThreshold &&
+           mShapeMargin == aDisplay.mShapeMargin;
+  }
+};
+
+NS_DECLARE_FRAME_PROPERTY_DELETABLE(ShapeInvalidationDataProperty,
+                                    ShapeInvalidationData)
+
+BlockReflowState::PlaceFloatResult BlockReflowState::FlowAndPlaceFloat(
+    nsIFrame* aFloat, Maybe<nscoord> aAvailableISizeInCurrentLine) {
+  MOZ_ASSERT(aFloat->GetParent() == mBlock, "Float frame has wrong parent");
+
+  WritingMode wm = mReflowInput.GetWritingMode();
+  AutoRestore<nscoord> restoreBCoord(mBCoord);
+
+  auto HasFloatPushedDown = [this, &restoreBCoord]() {
+    return mBCoord != restoreBCoord.SavedValue();
+  };
+
+  const nsStyleDisplay* floatDisplay = aFloat->StyleDisplay();
+
+  LogicalRect oldRegion =
+      nsFloatManager::GetRegionFor(wm, aFloat, ContainerSize());
+
+  ShapeInvalidationData* invalidationData =
+      aFloat->GetProperty(ShapeInvalidationDataProperty());
+
+  mBCoord = std::max(FloatManager()->LowestFloatBStart(), mBCoord);
+
+  if (StyleClear::None != floatDisplay->mClear) {
+    auto [bCoord, result] = ClearFloats(mBCoord, floatDisplay->UsedClear(wm));
+    if (result == ClearFloatsResult::FloatsPushedOrSplit) {
+      PushFloatPastBreak(aFloat);
+      return PlaceFloatResult::ShouldPlaceInNextContinuation;
+    }
+    mBCoord = bCoord;
+  }
+
+  LogicalSize availSize = ComputeAvailableSizeForFloat();
+  const WritingMode floatWM = aFloat->GetWritingMode();
+  Maybe<ReflowInput> floatRI(std::in_place, mPresContext, mReflowInput, aFloat,
+                             availSize.ConvertTo(floatWM, wm));
+
+  nscoord floatMarginISize = FloatMarginISize(wm, *floatRI);
+  LogicalMargin floatMargin = floatRI->ComputedLogicalMargin(wm);
+  nsReflowStatus reflowStatus;
+
+  bool earlyFloatReflow =
+      aFloat->IsLetterFrame() || floatMarginISize == NS_UNCONSTRAINEDSIZE;
+  if (earlyFloatReflow) {
+    mBlock->ReflowFloat(*this, *floatRI, aFloat, reflowStatus);
+    floatMarginISize = aFloat->ISize(wm) + floatMargin.IStartEnd(wm);
+    NS_ASSERTION(reflowStatus.IsComplete(),
+                 "letter frames and orthogonal floats with auto block-size "
+                 "shouldn't break, and if they do now, then they're breaking "
+                 "at the wrong point");
+  }
+
+  if (aAvailableISizeInCurrentLine &&
+      floatMarginISize > *aAvailableISizeInCurrentLine) {
+    return PlaceFloatResult::ShouldPlaceBelowCurrentLine;
+  }
+
+  UsedFloat floatStyle = floatDisplay->UsedFloat(wm);
+  MOZ_ASSERT(UsedFloat::Left == floatStyle || UsedFloat::Right == floatStyle,
+             "Invalid float type!");
+
+  bool mustPlaceFloat =
+      mReflowInput.mFlags.mIsTopOfPage && IsAdjacentWithBStart();
+
+  nsFlowAreaRect floatAvailableSpace =
+      GetFloatAvailableSpaceForPlacingFloat(wm, mBCoord);
+
+  for (;;) {
+    if (mReflowInput.AvailableBSize() != NS_UNCONSTRAINEDSIZE &&
+        floatAvailableSpace.mRect.BSize(wm) <= 0 && !mustPlaceFloat) {
+      PushFloatPastBreak(aFloat);
+      return PlaceFloatResult::ShouldPlaceInNextContinuation;
+    }
+
+    if (CanPlaceFloat(floatMarginISize, floatAvailableSpace)) {
+      break;
+    }
+
+    mBCoord += floatAvailableSpace.mRect.BSize(wm);
+    floatAvailableSpace = GetFloatAvailableSpaceForPlacingFloat(wm, mBCoord);
+    mustPlaceFloat = false;
+  }
+
+
+
+  LogicalPoint floatPos(wm);
+  bool leftFloat = floatStyle == UsedFloat::Left;
+
+  if (leftFloat == wm.IsBidiLTR()) {
+    floatPos.I(wm) = floatAvailableSpace.mRect.IStart(wm);
+  } else {
+    floatPos.I(wm) = floatAvailableSpace.mRect.IEnd(wm) - floatMarginISize;
+  }
+  floatPos.B(wm) = std::max(mBCoord, ContentBStart());
+
+  if (!earlyFloatReflow) {
+    const LogicalSize oldAvailSize = availSize;
+    availSize = ComputeAvailableSizeForFloat();
+    if (oldAvailSize != availSize) {
+      floatRI.reset();
+      floatRI.emplace(mPresContext, mReflowInput, aFloat,
+                      availSize.ConvertTo(floatWM, wm));
+    }
+    if (floatRI->mFlags.mIsTopOfPage && HasFloatPushedDown()) {
+      NS_ASSERTION(!mustPlaceFloat,
+                   "mustPlaceFloat shouldn't be set if we're not at the "
+                   "top-of-page!");
+      floatRI->mFlags.mIsTopOfPage = false;
+    }
+    mBlock->ReflowFloat(*this, *floatRI, aFloat, reflowStatus);
+  }
+  if (aFloat->GetPrevInFlow()) {
+    floatMargin.BStart(wm) = 0;
+  }
+  if (reflowStatus.IsIncomplete()) {
+    floatMargin.BEnd(wm) = 0;
+  }
+
+  const nscoord availBSize = floatRI->AvailableSize(floatWM).BSize(floatWM);
+  const bool isTruncated =
+      availBSize != NS_UNCONSTRAINEDSIZE && aFloat->BSize(floatWM) > availBSize;
+  if ((!floatRI->mFlags.mIsTopOfPage && isTruncated) ||
+      reflowStatus.IsInlineBreakBefore()) {
+    PushFloatPastBreak(aFloat);
+    return PlaceFloatResult::ShouldPlaceInNextContinuation;
+  }
+
+  if (ContentBSize() != NS_UNCONSTRAINEDSIZE && !mustPlaceFloat &&
+      (!mReflowInput.mFlags.mIsTopOfPage || floatPos.B(wm) > 0) &&
+      StyleBreakWithin::Avoid == aFloat->StyleDisplay()->mBreakInside &&
+      (!reflowStatus.IsFullyComplete() ||
+       aFloat->BSize(wm) + floatMargin.BStartEnd(wm) >
+           ContentBEnd() - floatPos.B(wm)) &&
+      !aFloat->GetPrevInFlow()) {
+    PushFloatPastBreak(aFloat);
+    return PlaceFloatResult::ShouldPlaceInNextContinuation;
+  }
+
+  LogicalPoint origin(wm, floatMargin.IStart(wm) + floatPos.I(wm),
+                      floatMargin.BStart(wm) + floatPos.B(wm));
+
+  const LogicalMargin floatOffsets = floatRI->ComputedLogicalOffsets(wm);
+  ReflowInput::ApplyRelativePositioning(aFloat, wm, floatOffsets, &origin,
+                                        ContainerSize());
+
+  bool moved = aFloat->GetLogicalPosition(wm, ContainerSize()) != origin;
+  if (moved) {
+    aFloat->SetPosition(wm, origin, ContainerSize());
+  }
+
+  mFloatOverflowAreas.UnionWith(aFloat->GetOverflowAreasRelativeToParent());
+
+  LogicalRect region = nsFloatManager::CalculateRegionFor(
+      wm, aFloat, floatMargin, ContainerSize());
+  if (reflowStatus.IsIncomplete() && (NS_UNCONSTRAINEDSIZE != ContentBSize())) {
+    region.BSize(wm) =
+        std::max(region.BSize(wm), ContentBSize() - floatPos.B(wm));
+  }
+  FloatManager()->AddFloat(aFloat, region, wm, ContainerSize());
+
+  nsFloatManager::StoreRegionFor(wm, aFloat, region, ContainerSize());
+
+  const bool invalidationDataNeeded =
+      ShapeInvalidationData::IsNeeded(*floatDisplay);
+
+  if (!region.IsEqualEdges(oldRegion) ||
+      !!invalidationData != invalidationDataNeeded ||
+      (invalidationData && !invalidationData->Matches(*floatDisplay))) {
+    nscoord blockStart = std::min(region.BStart(wm), oldRegion.BStart(wm));
+    nscoord blockEnd = std::max(region.BEnd(wm), oldRegion.BEnd(wm));
+    FloatManager()->IncludeInDamage(blockStart, blockEnd);
+  }
+
+  if (invalidationDataNeeded) {
+    if (invalidationData) {
+      invalidationData->Update(*floatDisplay);
+    } else {
+      aFloat->SetProperty(ShapeInvalidationDataProperty(),
+                          new ShapeInvalidationData(*floatDisplay));
+    }
+  } else if (invalidationData) {
+    invalidationData = nullptr;
+    aFloat->RemoveProperty(ShapeInvalidationDataProperty());
+  }
+
+  if (!reflowStatus.IsFullyComplete()) {
+    mBlock->SplitFloat(*this, aFloat, reflowStatus);
+  } else {
+    MOZ_ASSERT(!aFloat->GetNextInFlow());
+  }
+
+#ifdef DEBUG
+  if (nsBlockFrame::gNoisyFloatManager) {
+    nscoord tI, tB;
+    FloatManager()->GetTranslation(tI, tB);
+    mBlock->ListTag(stdout);
+    printf(": FlowAndPlaceFloat: AddFloat: tIB=%d,%d (%d,%d) {%d,%d,%d,%d}\n",
+           tI, tB, mFloatManagerI, mFloatManagerB, region.IStart(wm),
+           region.BStart(wm), region.ISize(wm), region.BSize(wm));
+  }
+
+  if (nsBlockFrame::gNoisyReflow) {
+    nsRect r = aFloat->GetRect();
+    nsIFrame::IndentBy(stdout, nsBlockFrame::gNoiseIndent);
+    printf("placed float: ");
+    aFloat->ListTag(stdout);
+    printf(" %d,%d,%d,%d\n", r.x, r.y, r.width, r.height);
+  }
+#endif
+
+  return PlaceFloatResult::Placed;
+}
+
+void BlockReflowState::PushFloatPastBreak(nsIFrame* aFloat) {
+  WritingMode wm = mReflowInput.GetWritingMode();
+  UsedFloat floatStyle = aFloat->StyleDisplay()->UsedFloat(wm);
+  if (floatStyle == UsedFloat::Left) {
+    FloatManager()->SetPushedLeftFloatPastBreak();
+  } else {
+    MOZ_ASSERT(floatStyle == UsedFloat::Right, "Unexpected float value!");
+    FloatManager()->SetPushedRightFloatPastBreak();
+  }
+
+  mBlock->StealFrame(aFloat);
+  AppendPushedFloatChain(aFloat);
+  mReflowStatus.SetOverflowIncomplete();
+}
+
+void BlockReflowState::PlaceBelowCurrentLineFloats(nsLineBox* aLine) {
+  MOZ_ASSERT(!mBelowCurrentLineFloats.IsEmpty());
+  nsTArray<nsIFrame*> floatsPlacedInLine;
+  for (nsIFrame* f : mBelowCurrentLineFloats) {
+#ifdef DEBUG
+    if (nsBlockFrame::gNoisyReflow) {
+      nsIFrame::IndentBy(stdout, nsBlockFrame::gNoiseIndent);
+      printf("placing bcl float: ");
+      f->ListTag(stdout);
+      printf("\n");
+    }
+#endif
+    PlaceFloatResult result = FlowAndPlaceFloat(f);
+    MOZ_ASSERT(result != PlaceFloatResult::ShouldPlaceBelowCurrentLine,
+               "We are already dealing with below current line floats!");
+    if (result == PlaceFloatResult::Placed) {
+      floatsPlacedInLine.AppendElement(f);
+    }
+  }
+  if (floatsPlacedInLine.Length() != mBelowCurrentLineFloats.Length()) {
+    aLine->SetHadFloatPushed();
+  }
+  aLine->AppendFloats(std::move(floatsPlacedInLine));
+  mBelowCurrentLineFloats.Clear();
+}
+
+std::tuple<nscoord, BlockReflowState::ClearFloatsResult>
+BlockReflowState::ClearFloats(nscoord aBCoord, UsedClear aClearType,
+                              nsIFrame* aFloatAvoidingBlock) {
+#ifdef DEBUG
+  if (nsBlockFrame::gNoisyReflow) {
+    nsIFrame::IndentBy(stdout, nsBlockFrame::gNoiseIndent);
+    printf("clear floats: in: aBCoord=%d\n", aBCoord);
+  }
+#endif
+
+  if (!FloatManager()->HasAnyFloats()) {
+    return {aBCoord, ClearFloatsResult::BCoordNoChange};
+  }
+
+  nscoord newBCoord = aBCoord;
+
+  if (aClearType != UsedClear::None) {
+    newBCoord = FloatManager()->ClearFloats(newBCoord, aClearType);
+
+    if (FloatManager()->ClearContinues(aClearType)) {
+      return {newBCoord, ClearFloatsResult::FloatsPushedOrSplit};
+    }
+  }
+
+  if (aFloatAvoidingBlock) {
+    auto cbWM = aFloatAvoidingBlock->GetContainingBlock()->GetWritingMode();
+    for (;;) {
+      nsFlowAreaRect floatAvailableSpace =
+          GetFloatAvailableSpace(cbWM, newBCoord);
+      if (FloatAvoidingBlockFitsInAvailSpace(aFloatAvoidingBlock,
+                                             floatAvailableSpace)) {
+        break;
+      }
+      if (!AdvanceToNextBand(floatAvailableSpace.mRect, &newBCoord)) {
+        break;
+      }
+    }
+  }
+
+#ifdef DEBUG
+  if (nsBlockFrame::gNoisyReflow) {
+    nsIFrame::IndentBy(stdout, nsBlockFrame::gNoiseIndent);
+    printf("clear floats: out: y=%d\n", newBCoord);
+  }
+#endif
+
+  ClearFloatsResult result = newBCoord == aBCoord
+                                 ? ClearFloatsResult::BCoordNoChange
+                                 : ClearFloatsResult::BCoordAdvanced;
+  return {newBCoord, result};
+}

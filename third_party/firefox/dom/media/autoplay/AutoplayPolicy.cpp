@@ -1,0 +1,374 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "AutoplayPolicy.h"
+
+#include "mozilla/Components.h"
+#include "mozilla/Logging.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/StaticPrefs_media.h"
+#include "mozilla/dom/AudioContext.h"
+#include "mozilla/dom/ContentMediaController.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/FeaturePolicyUtils.h"
+#include "mozilla/dom/HTMLMediaElement.h"
+#include "mozilla/dom/HTMLMediaElementBinding.h"
+#include "mozilla/dom/NavigatorBinding.h"
+#include "mozilla/dom/UserActivation.h"
+#include "mozilla/dom/WindowContext.h"
+#include "nsContentUtils.h"
+#include "nsGlobalWindowInner.h"
+#include "nsIAutoplay.h"
+#include "nsIDocShell.h"
+#include "nsIDocShellTreeItem.h"
+#include "nsIPermissionManager.h"
+#include "nsIPrincipal.h"
+#include "nsPIDOMWindow.h"
+#include "nsPIDOMWindowInlines.h"
+
+mozilla::LazyLogModule gAutoplayPermissionLog("Autoplay");
+
+#define AUTOPLAY_LOG(msg, ...) \
+  MOZ_LOG_FMT(gAutoplayPermissionLog, LogLevel::Debug, msg, ##__VA_ARGS__)
+
+using namespace mozilla::dom;
+
+namespace mozilla::media {
+
+static const uint32_t sPOLICY_STICKY_ACTIVATION = 0;
+static const uint32_t sPOLICY_USER_INPUT_DEPTH = 2;
+
+static uint32_t SiteAutoplayPerm(nsPIDOMWindowInner* aWindow) {
+  if (!aWindow || !aWindow->GetBrowsingContext()) {
+    return nsIPermissionManager::UNKNOWN_ACTION;
+  }
+
+  WindowContext* topContext =
+      aWindow->GetBrowsingContext()->GetTopWindowContext();
+  if (!topContext) {
+    return nsIPermissionManager::UNKNOWN_ACTION;
+  }
+  return topContext->GetAutoplayPermission();
+}
+
+static bool IsWindowAllowedToPlayByUserGesture(nsPIDOMWindowInner* aWindow) {
+  if (!aWindow) {
+    return false;
+  }
+
+  WindowContext* topContext =
+      aWindow->GetBrowsingContext()->GetTopWindowContext();
+  if (topContext && topContext->HasBeenUserGestureActivated()) {
+    AUTOPLAY_LOG(
+        "Allow autoplay as top-level context has been activated by user "
+        "gesture.");
+    return true;
+  }
+  return false;
+}
+
+static bool IsWindowAllowedToPlayByTraits(nsPIDOMWindowInner* aWindow) {
+  if (!aWindow) {
+    return false;
+  }
+
+  Document* currentDoc = aWindow->GetExtantDoc();
+  if (!currentDoc) {
+    return false;
+  }
+
+  bool isTopLevelContent = !aWindow->GetBrowsingContext()->GetParent();
+  if (currentDoc->MediaDocumentKind() == Document::MediaDocumentKind::Video &&
+      isTopLevelContent) {
+    AUTOPLAY_LOG("Allow top-level video document to autoplay.");
+    return true;
+  }
+
+  if (currentDoc->GetPrincipal()->Equals(
+          nsContentUtils::GetFingerprintingProtectionPrincipal())) {
+    AUTOPLAY_LOG("Allow autoplay as in fingerprinting protection document.");
+    return true;
+  }
+
+  return false;
+}
+
+static bool IsWindowAllowedToPlayOverall(nsPIDOMWindowInner* aWindow) {
+  return IsWindowAllowedToPlayByUserGesture(aWindow) ||
+         IsWindowAllowedToPlayByTraits(aWindow);
+}
+
+static uint32_t DefaultAutoplayBehaviour() {
+  int32_t prefValue = StaticPrefs::media_autoplay_default();
+  if (prefValue == nsIAutoplay::ALLOWED) {
+    return nsIAutoplay::ALLOWED;
+  }
+  if (prefValue == nsIAutoplay::BLOCKED_ALL) {
+    return nsIAutoplay::BLOCKED_ALL;
+  }
+  return nsIAutoplay::BLOCKED;
+}
+
+static bool IsMediaElementInaudible(const HTMLMediaElement& aElement) {
+  if (aElement.Volume() == 0.0 || aElement.Muted()) {
+    AUTOPLAY_LOG("Media {} is muted.", fmt::ptr(&aElement));
+    return true;
+  }
+
+  if (!aElement.HasAudio() &&
+      aElement.ReadyState() >= HTMLMediaElement_Binding::HAVE_METADATA) {
+    AUTOPLAY_LOG("Media {} has no audio track", fmt::ptr(&aElement));
+    return true;
+  }
+
+  return false;
+}
+
+static bool IsEnableBlockingWebAudioByUserGesturePolicy() {
+  return StaticPrefs::media_autoplay_blocking_policy() ==
+         sPOLICY_STICKY_ACTIVATION;
+}
+
+static bool IsAllowedToPlayByBlockingModel(const HTMLMediaElement& aElement) {
+  const uint32_t policy = StaticPrefs::media_autoplay_blocking_policy();
+  if (policy == sPOLICY_STICKY_ACTIVATION) {
+    const bool isAllowed =
+        IsWindowAllowedToPlayOverall(aElement.OwnerDoc()->GetInnerWindow());
+    AUTOPLAY_LOG("Use 'sticky-activation', isAllowed={}", isAllowed);
+    return isAllowed;
+  }
+  const bool isElementBlessed = aElement.IsBlessed();
+  if (policy == sPOLICY_USER_INPUT_DEPTH) {
+    const bool isUserInput = UserActivation::IsHandlingUserInput();
+    AUTOPLAY_LOG("Use 'User-Input-Depth', isBlessed={}, isUserInput={}",
+                 isElementBlessed, isUserInput);
+    return isElementBlessed || isUserInput;
+  }
+  const bool hasTransientActivation =
+      aElement.OwnerDoc()->HasValidTransientUserGestureActivation();
+  AUTOPLAY_LOG(
+      "Use 'transient-activation', isBlessed={}, "
+      "hasValidTransientActivation={}",
+      isElementBlessed, hasTransientActivation);
+  return isElementBlessed || hasTransientActivation;
+}
+
+
+bool AutoplayPolicy::IsAudioInterruptedByPlatform(nsPIDOMWindowInner* aWindow) {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (!StaticPrefs::dom_audio_session_block_start_during_interrupt_enabled()) {
+    return false;
+  }
+  if (!aWindow) {
+    return false;
+  }
+  ContentMediaController* controller =
+      nsGlobalWindowInner::Cast(aWindow)->GetContentMediaController();
+  return controller && controller->IsAudioInterruptedByPlatform();
+}
+
+static bool IsAllowedToPlayInternal(const HTMLMediaElement& aElement) {
+  if (!IsMediaElementInaudible(aElement) &&
+      AutoplayPolicy::IsAudioInterruptedByPlatform(
+          aElement.OwnerDoc()->GetInnerWindow())) {
+    AUTOPLAY_LOG("Media {} blocked: audible playback interrupted by platform",
+                 fmt::ptr(&aElement));
+    return false;
+  }
+  bool isInaudible = IsMediaElementInaudible(aElement);
+  bool isUsingAutoplayModel = IsAllowedToPlayByBlockingModel(aElement);
+
+  uint32_t defaultBehaviour = DefaultAutoplayBehaviour();
+  uint32_t sitePermission =
+      SiteAutoplayPerm(aElement.OwnerDoc()->GetInnerWindow());
+
+  AUTOPLAY_LOG(
+      "IsAllowedToPlayInternal, isInaudible={},"
+      "isUsingAutoplayModel={}, sitePermission={}, defaultBehaviour={}",
+      isInaudible, isUsingAutoplayModel, sitePermission, defaultBehaviour);
+
+  if (sitePermission == nsIPermissionManager::ALLOW_ACTION) {
+    return true;
+  }
+
+  if (sitePermission == nsIPermissionManager::DENY_ACTION) {
+    return isInaudible || isUsingAutoplayModel;
+  }
+
+  if (sitePermission == nsIAutoplay::BLOCKED_ALL) {
+    return isUsingAutoplayModel;
+  }
+
+  if (defaultBehaviour == nsIAutoplay::ALLOWED) {
+    return true;
+  }
+
+  if (defaultBehaviour == nsIAutoplay::BLOCKED) {
+    return isInaudible || isUsingAutoplayModel;
+  }
+
+  MOZ_ASSERT(defaultBehaviour == nsIAutoplay::BLOCKED_ALL);
+  return isUsingAutoplayModel;
+}
+
+bool AutoplayPolicy::IsAllowedToPlay(const HTMLMediaElement& aElement) {
+  const bool result = IsAllowedToPlayInternal(aElement);
+  AUTOPLAY_LOG("IsAllowedToPlay, mediaElement={}, isAllowToPlay={}",
+               fmt::ptr(&aElement), result ? "allowed" : "blocked");
+  return result;
+}
+
+bool AutoplayPolicy::IsAllowedToPlay(const AudioContext& aContext) {
+  if (aContext.IsOffline()) {
+    return true;
+  }
+
+  if (IsAudioInterruptedByPlatform(aContext.GetOwnerWindow())) {
+    AUTOPLAY_LOG("AudioContext {} blocked: audio interrupted by platform",
+                 fmt::ptr(&aContext));
+    return false;
+  }
+
+  if (!IsEnableBlockingWebAudioByUserGesturePolicy()) {
+    return true;
+  }
+
+  nsPIDOMWindowInner* window = aContext.GetOwnerWindow();
+  uint32_t sitePermission = SiteAutoplayPerm(window);
+
+  if (sitePermission == nsIPermissionManager::ALLOW_ACTION) {
+    AUTOPLAY_LOG(
+        "Allow autoplay as document has permanent autoplay permission.");
+    return true;
+  }
+
+  if (DefaultAutoplayBehaviour() == nsIAutoplay::ALLOWED &&
+      sitePermission != nsIPermissionManager::DENY_ACTION &&
+      sitePermission != nsIAutoplay::BLOCKED_ALL) {
+    AUTOPLAY_LOG(
+        "Allow autoplay as global autoplay setting is allowing autoplay by "
+        "default.");
+    return true;
+  }
+
+  return IsWindowAllowedToPlayOverall(window);
+}
+
+enum class DocumentAutoplayPolicy : uint8_t {
+  Allowed,
+  Allowed_muted,
+  Disallowed
+};
+
+DocumentAutoplayPolicy IsDocAllowedToPlay(const Document& aDocument) {
+  RefPtr<nsPIDOMWindowInner> window = aDocument.GetInnerWindow();
+
+  const uint32_t sitePermission = SiteAutoplayPerm(window);
+  const uint32_t globalPermission = DefaultAutoplayBehaviour();
+  const uint32_t policy = StaticPrefs::media_autoplay_blocking_policy();
+  const bool isWindowAllowedToPlayByGesture =
+      policy != sPOLICY_USER_INPUT_DEPTH &&
+      IsWindowAllowedToPlayByUserGesture(window);
+  const bool isWindowAllowedToPlayByTraits =
+      IsWindowAllowedToPlayByTraits(window);
+
+  AUTOPLAY_LOG(
+      "IsDocAllowedToPlay(), policy={}, sitePermission={}, "
+      "globalPermission={}, isWindowAllowedToPlayByGesture={}, "
+      "isWindowAllowedToPlayByTraits={}",
+      policy, sitePermission, globalPermission, isWindowAllowedToPlayByGesture,
+      isWindowAllowedToPlayByTraits);
+
+  if ((globalPermission == nsIAutoplay::ALLOWED &&
+       (sitePermission != nsIPermissionManager::DENY_ACTION &&
+        sitePermission != nsIAutoplay::BLOCKED_ALL)) ||
+      sitePermission == nsIPermissionManager::ALLOW_ACTION ||
+      isWindowAllowedToPlayByGesture || isWindowAllowedToPlayByTraits) {
+    return DocumentAutoplayPolicy::Allowed;
+  }
+
+  if ((globalPermission == nsIAutoplay::BLOCKED &&
+       sitePermission != nsIAutoplay::BLOCKED_ALL) ||
+      sitePermission == nsIPermissionManager::DENY_ACTION) {
+    return DocumentAutoplayPolicy::Allowed_muted;
+  }
+
+  return DocumentAutoplayPolicy::Disallowed;
+}
+
+uint32_t AutoplayPolicy::GetSiteAutoplayPermission(nsIPrincipal* aPrincipal) {
+  if (!aPrincipal) {
+    return nsIPermissionManager::DENY_ACTION;
+  }
+
+  nsCOMPtr<nsIPermissionManager> permMgr =
+      components::PermissionManager::Service();
+  if (!permMgr) {
+    return nsIPermissionManager::DENY_ACTION;
+  }
+
+  uint32_t perm = nsIPermissionManager::DENY_ACTION;
+  permMgr->TestExactPermissionFromPrincipal(aPrincipal, "autoplay-media"_ns,
+                                            &perm);
+  return perm;
+}
+
+dom::AutoplayPolicy AutoplayPolicy::GetAutoplayPolicy(
+    const dom::HTMLMediaElement& aElement) {
+  const uint32_t sitePermission =
+      SiteAutoplayPerm(aElement.OwnerDoc()->GetInnerWindow());
+  const uint32_t globalPermission = DefaultAutoplayBehaviour();
+  const bool isAllowedToPlayByBlockingModel =
+      IsAllowedToPlayByBlockingModel(aElement);
+
+  AUTOPLAY_LOG(
+      "IsAllowedToPlay(element), sitePermission={}, globalPermission={}, "
+      "isAllowedToPlayByBlockingModel={}",
+      sitePermission, globalPermission, isAllowedToPlayByBlockingModel);
+
+
+  if (sitePermission == nsIPermissionManager::ALLOW_ACTION ||
+      (globalPermission == nsIAutoplay::ALLOWED &&
+       (sitePermission != nsIPermissionManager::DENY_ACTION &&
+        sitePermission != nsIAutoplay::BLOCKED_ALL)) ||
+      isAllowedToPlayByBlockingModel) {
+    return dom::AutoplayPolicy::Allowed;
+  }
+
+  if (sitePermission == nsIPermissionManager::DENY_ACTION ||
+      (globalPermission == nsIAutoplay::BLOCKED &&
+       sitePermission != nsIAutoplay::BLOCKED_ALL)) {
+    return dom::AutoplayPolicy::Allowed_muted;
+  }
+
+  return dom::AutoplayPolicy::Disallowed;
+}
+
+dom::AutoplayPolicy AutoplayPolicy::GetAutoplayPolicy(
+    const dom::AudioContext& aContext) {
+  if (AutoplayPolicy::IsAllowedToPlay(aContext)) {
+    return dom::AutoplayPolicy::Allowed;
+  }
+  return dom::AutoplayPolicy::Disallowed;
+}
+
+dom::AutoplayPolicy AutoplayPolicy::GetAutoplayPolicy(
+    const dom::AutoplayPolicyMediaType& aType, const dom::Document& aDoc) {
+  DocumentAutoplayPolicy policy = IsDocAllowedToPlay(aDoc);
+  if (aType == dom::AutoplayPolicyMediaType::Audiocontext) {
+    return policy == DocumentAutoplayPolicy::Allowed
+               ? dom::AutoplayPolicy::Allowed
+               : dom::AutoplayPolicy::Disallowed;
+  }
+  MOZ_ASSERT(aType == dom::AutoplayPolicyMediaType::Mediaelement);
+  if (policy == DocumentAutoplayPolicy::Allowed) {
+    return dom::AutoplayPolicy::Allowed;
+  }
+  if (policy == DocumentAutoplayPolicy::Allowed_muted) {
+    return dom::AutoplayPolicy::Allowed_muted;
+  }
+  return dom::AutoplayPolicy::Disallowed;
+}
+
+}  

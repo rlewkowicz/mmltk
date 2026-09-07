@@ -1,0 +1,79 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_GraphRunner_h
+#define mozilla_GraphRunner_h
+
+#include <thread>
+
+#include "GraphDriver.h"
+#include "MediaSegment.h"
+#include "mozilla/Monitor.h"
+
+struct PRThread;
+
+namespace mozilla {
+
+class AudioMixer;
+class MediaTrackGraphImpl;
+
+class GraphRunner final : public Runnable {
+  using IterationResult = GraphInterface::IterationResult;
+
+ public:
+  static already_AddRefed<GraphRunner> Create(MediaTrackGraphImpl* aGraph);
+
+  MOZ_CAN_RUN_SCRIPT void Shutdown();
+
+  IterationResult OneIteration(GraphTime aStateTime,
+                               MixerCallbackReceiver* aMixerReceiver);
+
+  NS_IMETHOD Run() override;
+
+  bool OnThread() const;
+
+#ifdef DEBUG
+  bool InDriverIteration(const GraphDriver* aDriver) const;
+#endif
+
+ private:
+  explicit GraphRunner(MediaTrackGraphImpl* aGraph,
+                       already_AddRefed<nsIThread> aThread);
+  ~GraphRunner();
+
+  class IterationState {
+    GraphTime mStateTime;
+    MixerCallbackReceiver* MOZ_NON_OWNING_REF mMixerReceiver;
+
+   public:
+    IterationState(GraphTime aStateTime, MixerCallbackReceiver* aMixerReceiver)
+        : mStateTime(aStateTime), mMixerReceiver(aMixerReceiver) {}
+    IterationState& operator=(const IterationState& aOther) = default;
+    GraphTime StateTime() const { return mStateTime; }
+    MixerCallbackReceiver* MixerReceiver() const { return mMixerReceiver; }
+  };
+
+  Monitor mMonitor;
+  MediaTrackGraphImpl* const mGraph;
+  Maybe<IterationState> mIterationState MOZ_GUARDED_BY(mMonitor);
+  IterationResult mIterationResult MOZ_GUARDED_BY(mMonitor);
+
+  enum class ThreadState {
+    Wait,      
+    Run,       
+    Shutdown,  
+  };
+  ThreadState mThreadState MOZ_GUARDED_BY(mMonitor);
+
+  const nsCOMPtr<nsIThread> mThread;
+
+#ifdef DEBUG
+  std::thread::id mAudioDriverThreadId = std::thread::id();
+  nsIThread* mClockDriverThread = nullptr;
+#endif
+};
+
+}  
+
+#endif

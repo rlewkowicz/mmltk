@@ -1,0 +1,1716 @@
+/* pngpriv.h - private declarations for use inside libpng
+ *
+ * Copyright (c) 2018-2025 Cosmin Truta
+ * Copyright (c) 1998-2002,2004,2006-2018 Glenn Randers-Pehrson
+ * Copyright (c) 1996-1997 Andreas Dilger
+ * Copyright (c) 1995-1996 Guy Eric Schalnat, Group 42, Inc.
+ *
+ * This code is released under the libpng license.
+ * For conditions of distribution and use, see the disclaimer
+ * and license in png.h
+ */
+
+
+
+#if !defined(PNGPRIV_H)
+#  define PNGPRIV_H
+#else
+#  error Duplicate inclusion of pngpriv.h; please check the libpng source files
+#endif
+
+#if defined(PNG_H) || defined(PNGCONF_H) || defined(PNGLCONF_H)
+#  error This file must not be included by applications; please include <png.h>
+#endif
+
+#if !defined(_POSIX_SOURCE)
+#  define _POSIX_SOURCE 1 /* Just the POSIX 1003.1 and C89 APIs */
+#endif
+
+#if !defined(PNG_VERSION_INFO_ONLY)
+#  include <stdlib.h>
+#  include <string.h>
+#endif
+
+#define PNGLIB_BUILD /*libpng is being built, not used*/
+
+#if defined(HAVE_CONFIG_H) && !defined(PNG_NO_CONFIG_H)
+#  include <config.h>
+#  define PNG_RESTRICT restrict
+#endif
+
+#include "pnglibconf.h"
+
+#if defined(PNG_PREFIX) && !defined(PNGPREFIX_H)
+#  include "pngprefix.h"
+#endif
+
+#if defined(PNG_USER_CONFIG)
+#  include "pngusr.h"
+#if !defined(PNG_USER_PRIVATEBUILD)
+#    define PNG_USER_PRIVATEBUILD "Custom libpng build"
+#endif
+#if !defined(PNG_USER_DLLFNAME_POSTFIX)
+#    define PNG_USER_DLLFNAME_POSTFIX "Cb"
+#endif
+#endif
+
+#if !defined(PNG_ARM_NEON_OPT)
+#if (defined(__ARM_NEON__) || defined(__ARM_NEON)) && \
+   defined(PNG_ALIGNED_MEMORY_SUPPORTED)
+#     define PNG_ARM_NEON_OPT 2
+#else
+#     define PNG_ARM_NEON_OPT 0
+#endif
+#endif
+
+#if !defined(PNG_RISCV_RVV_OPT)
+
+#  define PNG_RISCV_RVV_OPT 0
+#endif
+
+#if PNG_ARM_NEON_OPT > 0
+#  define PNG_FILTER_OPTIMIZATIONS png_init_filter_functions_neon
+#if !defined(PNG_ARM_NEON_IMPLEMENTATION)
+#     define PNG_ARM_NEON_IMPLEMENTATION 1
+#endif
+#else
+#     define PNG_ARM_NEON_IMPLEMENTATION 0
+#endif
+
+#if !defined(PNG_MIPS_MSA_OPT)
+#if defined(__mips_msa) && (__mips_isa_rev >= 5) && \
+   defined(PNG_ALIGNED_MEMORY_SUPPORTED)
+#     define PNG_MIPS_MSA_OPT 2
+#else
+#     define PNG_MIPS_MSA_OPT 0
+#endif
+#endif
+
+#if !defined(PNG_MIPS_MMI_OPT)
+#if defined(PNG_MIPS_MMI)
+#if defined(__mips_loongson_mmi) && (_MIPS_SIM == _ABI64) && \
+     defined(PNG_ALIGNED_MEMORY_SUPPORTED)
+#       define PNG_MIPS_MMI_OPT 1
+#else
+#       define PNG_MIPS_MMI_OPT 0
+#endif
+#else
+#    define PNG_MIPS_MMI_OPT 0
+#endif
+#endif
+
+#if !defined(PNG_POWERPC_VSX_OPT)
+#if defined(__PPC64__) && defined(__ALTIVEC__) && defined(__VSX__)
+#     define PNG_POWERPC_VSX_OPT 2
+#else
+#     define PNG_POWERPC_VSX_OPT 0
+#endif
+#endif
+
+#if !defined(PNG_LOONGARCH_LSX_OPT)
+#if defined(__loongarch_sx)
+#     define PNG_LOONGARCH_LSX_OPT 1
+#else
+#     define PNG_LOONGARCH_LSX_OPT 0
+#endif
+#endif
+
+#if !defined(PNG_INTEL_SSE_OPT)
+#if defined(PNG_INTEL_SSE)
+#if defined(__SSE4_1__) || defined(__AVX__) || defined(__SSSE3__) || \
+       defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64) || \
+       (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#         define PNG_INTEL_SSE_OPT 1
+#else
+#         define PNG_INTEL_SSE_OPT 0
+#endif
+#else
+#      define PNG_INTEL_SSE_OPT 0
+#endif
+#endif
+
+#if PNG_INTEL_SSE_OPT > 0
+#if !defined(PNG_INTEL_SSE_IMPLEMENTATION)
+#if defined(__SSE4_1__) || defined(__AVX__)
+#         define PNG_INTEL_SSE_IMPLEMENTATION 3
+#elif defined(__SSSE3__)
+#         define PNG_INTEL_SSE_IMPLEMENTATION 2
+#elif defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64) || \
+       (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#         define PNG_INTEL_SSE_IMPLEMENTATION 1
+#else
+#         define PNG_INTEL_SSE_IMPLEMENTATION 0
+#endif
+#endif
+
+#if PNG_INTEL_SSE_IMPLEMENTATION > 0
+#      define PNG_FILTER_OPTIMIZATIONS png_init_filter_functions_sse2
+#endif
+#else
+#   define PNG_INTEL_SSE_IMPLEMENTATION 0
+#endif
+
+#if PNG_MIPS_MSA_OPT > 0
+#if !defined(PNG_MIPS_MSA_IMPLEMENTATION)
+#if defined(__mips_msa)
+#if defined(__clang__)
+#elif defined(__GNUC__)
+#if __GNUC__ < 4 || (__GNUC__ == 4 && __GNUC_MINOR__ < 7)
+#              define PNG_MIPS_MSA_IMPLEMENTATION 2
+#endif
+#endif
+#else
+#        define PNG_MIPS_MSA_IMPLEMENTATION 2
+#endif
+#endif
+
+#if !defined(PNG_MIPS_MSA_IMPLEMENTATION)
+#     define PNG_MIPS_MSA_IMPLEMENTATION 1
+#     define PNG_FILTER_OPTIMIZATIONS png_init_filter_functions_mips
+#endif
+#else
+#  define PNG_MIPS_MSA_IMPLEMENTATION 0
+#endif
+
+#if PNG_MIPS_MMI_OPT > 0
+#if !defined(PNG_MIPS_MMI_IMPLEMENTATION)
+#if defined(__mips_loongson_mmi) && (_MIPS_SIM == _ABI64)
+#        define PNG_MIPS_MMI_IMPLEMENTATION 2
+#else
+#        define PNG_MIPS_MMI_IMPLEMENTATION 0
+#endif
+#endif
+
+#if PNG_MIPS_MMI_IMPLEMENTATION > 0
+#      define PNG_FILTER_OPTIMIZATIONS png_init_filter_functions_mips
+#endif
+#else
+#   define PNG_MIPS_MMI_IMPLEMENTATION 0
+#endif
+
+#if PNG_POWERPC_VSX_OPT > 0
+#  define PNG_FILTER_OPTIMIZATIONS png_init_filter_functions_vsx
+#  define PNG_POWERPC_VSX_IMPLEMENTATION 1
+#else
+#  define PNG_POWERPC_VSX_IMPLEMENTATION 0
+#endif
+
+#if PNG_LOONGARCH_LSX_OPT > 0
+#   define PNG_FILTER_OPTIMIZATIONS png_init_filter_functions_lsx
+#   define PNG_LOONGARCH_LSX_IMPLEMENTATION 1
+#else
+#   define PNG_LOONGARCH_LSX_IMPLEMENTATION 0
+#endif
+
+#if PNG_RISCV_RVV_OPT > 0 && __riscv_v >= 1000000
+#  define PNG_FILTER_OPTIMIZATIONS png_init_filter_functions_rvv
+#if !defined(PNG_RISCV_RVV_IMPLEMENTATION)
+#     define PNG_RISCV_RVV_IMPLEMENTATION 1
+#endif
+#else
+#  define PNG_RISCV_RVV_IMPLEMENTATION 0
+#endif
+
+#if !defined(PNG_BUILD_DLL)
+#if defined(DLL_EXPORT)
+#     define PNG_BUILD_DLL
+#else
+#if defined(_WINDLL)
+#        define PNG_BUILD_DLL
+#else
+#if defined(__DLL__)
+#           define PNG_BUILD_DLL
+#else
+#endif
+#endif
+#endif
+#endif
+
+#if !defined(PNG_IMPEXP)
+#if defined(PNG_BUILD_DLL)
+#     define PNG_IMPEXP PNG_DLL_EXPORT
+#else
+#     define PNG_IMPEXP
+#endif
+#endif
+
+#if !defined(PNG_DEPRECATED)
+#  define PNG_DEPRECATED
+#endif
+#if !defined(PNG_PRIVATE)
+#  define PNG_PRIVATE
+#endif
+
+#if !defined(PNG_INTERNAL_DATA)
+#  define PNG_INTERNAL_DATA(type, name, array) PNG_LINKAGE_DATA type name array
+#endif
+
+#if !defined(PNG_INTERNAL_FUNCTION)
+#  define PNG_INTERNAL_FUNCTION(type, name, args, attributes)\
+      PNG_LINKAGE_FUNCTION PNG_FUNCTION(type, name, args, PNG_EMPTY attributes)
+#endif
+
+#if !defined(PNG_INTERNAL_CALLBACK)
+#  define PNG_INTERNAL_CALLBACK(type, name, args, attributes)\
+      PNG_LINKAGE_CALLBACK PNG_FUNCTION(type, (PNGCBAPI name), args,\
+         PNG_EMPTY attributes)
+#endif
+
+#if !defined(PNG_FP_EXPORT)
+#if !defined(PNG_FLOATING_POINT_SUPPORTED)
+#     define PNG_FP_EXPORT(ordinal, type, name, args)\
+         PNG_INTERNAL_FUNCTION(type, name, args, PNG_EMPTY);
+#if !defined(PNG_VERSION_INFO_ONLY)
+         typedef struct png_incomplete png_double;
+         typedef png_double*           png_doublep;
+         typedef const png_double*     png_const_doublep;
+         typedef png_double**          png_doublepp;
+#endif
+#endif
+#endif
+#if !defined(PNG_FIXED_EXPORT)
+#if !defined(PNG_FIXED_POINT_SUPPORTED)
+#     define PNG_FIXED_EXPORT(ordinal, type, name, args)\
+         PNG_INTERNAL_FUNCTION(type, name, args, PNG_EMPTY);
+#endif
+#endif
+
+#include "png.h"
+
+#if !defined(PNG_DLL_EXPORT)
+#  define PNG_DLL_EXPORT
+#endif
+
+#if !defined(PNG_RELEASE_BUILD)
+#  define PNG_RELEASE_BUILD (PNG_LIBPNG_BUILD_BASE_TYPE >= PNG_LIBPNG_BUILD_RC)
+#endif
+
+
+#if defined(MAXSEG_64K) && !defined(PNG_MAX_MALLOC_64K)
+#  define PNG_MAX_MALLOC_64K
+#endif
+
+#if !defined(PNG_UNUSED)
+#  define PNG_UNUSED(param) (void)param;
+#endif
+
+#if (PNG_ZBUF_SIZE > 65536L) && defined(PNG_MAX_MALLOC_64K)
+#  undef PNG_ZBUF_SIZE
+#  define PNG_ZBUF_SIZE 65536L
+#endif
+
+#if defined(PNG_WARNINGS_SUPPORTED)
+#  define PNG_WARNING_PARAMETERS(p) png_warning_parameters p;
+#else
+#  define png_warning_parameter(p,number,string) ((void)0)
+#  define png_warning_parameter_unsigned(p,number,format,value) ((void)0)
+#  define png_warning_parameter_signed(p,number,format,value) ((void)0)
+#  define png_formatted_warning(pp,p,message) ((void)(pp))
+#  define PNG_WARNING_PARAMETERS(p)
+#endif
+#if !defined(PNG_ERROR_TEXT_SUPPORTED)
+#  define png_fixed_error(s1,s2) png_err(s1)
+#endif
+
+#if defined(PNG_FIXED_POINT_SUPPORTED)
+#  define PNGFAPI PNGAPI
+#else
+#  define PNGFAPI /* PRIVATE */
+#endif
+
+#if !defined(PNG_VERSION_INFO_ONLY)
+
+#if defined(__cplusplus)
+#  define png_voidcast(type, value) static_cast<type>(value)
+#  define png_constcast(type, value) const_cast<type>(value)
+#  define png_aligncast(type, value) \
+   static_cast<type>(static_cast<void*>(value))
+#  define png_aligncastconst(type, value) \
+   static_cast<type>(static_cast<const void*>(value))
+#else
+#  define png_voidcast(type, value) (value)
+#  define png_constcast(type, value) ((type)(void*)(const void*)(value))
+#  define png_aligncast(type, value) ((void*)(value))
+#  define png_aligncastconst(type, value) ((const void*)(value))
+#endif
+
+#if defined(PNG_FLOATING_POINT_SUPPORTED) ||\
+    defined(PNG_FLOATING_ARITHMETIC_SUPPORTED)
+#  include <float.h>
+
+#  include <math.h>
+
+#if defined(_AMIGA) && defined(__SASC) && defined(_M68881)
+#    include <m68881.h>
+#endif
+#endif
+
+#if defined(__TURBOC__) && defined(__MSDOS__)
+#  include <mem.h>
+#  include <alloc.h>
+#endif
+
+#if 0 || 0 || defined(__NT__)
+#  include <windows.h>
+#endif
+#endif
+
+
+#if !defined(PNG_ABORT)
+#  define PNG_ABORT() abort()
+#endif
+
+#define PNG_ALIGN_NONE      0 /* do not use data alignment */
+#define PNG_ALIGN_ALWAYS    1 /* assume unaligned accesses are OK */
+#if defined(offsetof)
+#  define PNG_ALIGN_OFFSET  2 /* use offsetof to determine alignment */
+#else
+#  define PNG_ALIGN_OFFSET -1 /* prevent the use of this */
+#endif
+#define PNG_ALIGN_SIZE      3 /* use sizeof to determine alignment */
+
+#if !defined(PNG_ALIGN_TYPE)
+#  define PNG_ALIGN_TYPE PNG_ALIGN_SIZE
+#endif
+
+#if PNG_ALIGN_TYPE == PNG_ALIGN_SIZE
+#  define png_alignof(type) (sizeof(type))
+#else
+#if PNG_ALIGN_TYPE == PNG_ALIGN_OFFSET
+#    define png_alignof(type) offsetof(struct{char c; type t;}, t)
+#else
+#if PNG_ALIGN_TYPE == PNG_ALIGN_ALWAYS
+#      define png_alignof(type) 1
+#endif
+#endif
+#endif
+
+#if defined(png_alignof)
+#  define png_isaligned(ptr, type) \
+   (((type)(size_t)((const void*)(ptr)) & (type)(png_alignof(type)-1)) == 0)
+#else
+#  define png_isaligned(ptr, type) 0
+#endif
+
+
+
+#define PNG_HAVE_IDAT               0x04U
+#define PNG_HAVE_IEND               0x10U
+#define PNG_HAVE_CHUNK_HEADER      0x100U
+#define PNG_WROTE_tIME             0x200U
+#define PNG_WROTE_INFO_BEFORE_PLTE 0x400U
+#define PNG_BACKGROUND_IS_GRAY     0x800U
+#define PNG_HAVE_PNG_SIGNATURE    0x1000U
+#define PNG_HAVE_CHUNK_AFTER_IDAT 0x2000U /* Have another chunk after IDAT */
+#define PNG_WROTE_eXIf            0x4000U
+#define PNG_IS_READ_STRUCT        0x8000U /* Else is a write struct */
+#if defined(PNG_APNG_SUPPORTED)
+#define PNG_HAVE_acTL            0x10000U
+#define PNG_HAVE_fcTL            0x20000U
+#endif
+
+#define PNG_BGR                 0x0001U
+#define PNG_INTERLACE           0x0002U
+#define PNG_PACK                0x0004U
+#define PNG_SHIFT               0x0008U
+#define PNG_SWAP_BYTES          0x0010U
+#define PNG_INVERT_MONO         0x0020U
+#define PNG_QUANTIZE            0x0040U
+#define PNG_COMPOSE             0x0080U    /* Was PNG_BACKGROUND */
+#define PNG_BACKGROUND_EXPAND   0x0100U
+#define PNG_EXPAND_16           0x0200U    /* Added to libpng 1.5.2 */
+#define PNG_16_TO_8             0x0400U    /* Becomes 'chop' in 1.5.4 */
+#define PNG_RGBA                0x0800U
+#define PNG_EXPAND              0x1000U
+#define PNG_GAMMA               0x2000U
+#define PNG_GRAY_TO_RGB         0x4000U
+#define PNG_FILLER              0x8000U
+#define PNG_PACKSWAP           0x10000U
+#define PNG_SWAP_ALPHA         0x20000U
+#define PNG_STRIP_ALPHA        0x40000U
+#define PNG_INVERT_ALPHA       0x80000U
+#define PNG_USER_TRANSFORM    0x100000U
+#define PNG_RGB_TO_GRAY_ERR   0x200000U
+#define PNG_RGB_TO_GRAY_WARN  0x400000U
+#define PNG_RGB_TO_GRAY       0x600000U /* two bits, RGB_TO_GRAY_ERR|WARN */
+#define PNG_ENCODE_ALPHA      0x800000U /* Added to libpng-1.5.4 */
+#define PNG_ADD_ALPHA        0x1000000U /* Added to libpng-1.2.7 */
+#define PNG_EXPAND_tRNS      0x2000000U /* Added to libpng-1.2.9 */
+#define PNG_SCALE_16_TO_8    0x4000000U /* Added to libpng-1.5.4 */
+#define PNG_STRUCT_PNG   0x0001U
+#define PNG_STRUCT_INFO  0x0002U
+
+#define PNG_FLAG_ZLIB_CUSTOM_STRATEGY     0x0001U
+#define PNG_FLAG_ZSTREAM_INITIALIZED      0x0002U /* Added to libpng-1.6.0 */
+#define PNG_FLAG_ZSTREAM_ENDED            0x0008U /* Added to libpng-1.6.0 */
+#define PNG_FLAG_ROW_INIT                 0x0040U
+#define PNG_FLAG_FILLER_AFTER             0x0080U
+#define PNG_FLAG_CRC_ANCILLARY_USE        0x0100U
+#define PNG_FLAG_CRC_ANCILLARY_NOWARN     0x0200U
+#define PNG_FLAG_CRC_CRITICAL_USE         0x0400U
+#define PNG_FLAG_CRC_CRITICAL_IGNORE      0x0800U
+#define PNG_FLAG_OPTIMIZE_ALPHA           0x2000U /* Added to libpng-1.5.4 */
+#define PNG_FLAG_DETECT_UNINITIALIZED     0x4000U /* Added to libpng-1.5.4 */
+#define PNG_FLAG_LIBRARY_MISMATCH        0x20000U
+#define PNG_FLAG_STRIP_ERROR_TEXT        0x80000U
+#define PNG_FLAG_BENIGN_ERRORS_WARN     0x100000U /* Added to libpng-1.4.0 */
+#define PNG_FLAG_APP_WARNINGS_WARN      0x200000U /* Added to libpng-1.6.0 */
+#define PNG_FLAG_APP_ERRORS_WARN        0x400000U /* Added to libpng-1.6.0 */
+
+#define PNG_FLAG_CRC_ANCILLARY_MASK (PNG_FLAG_CRC_ANCILLARY_USE | \
+                                     PNG_FLAG_CRC_ANCILLARY_NOWARN)
+
+#define PNG_FLAG_CRC_CRITICAL_MASK  (PNG_FLAG_CRC_CRITICAL_USE | \
+                                     PNG_FLAG_CRC_CRITICAL_IGNORE)
+
+#define PNG_FLAG_CRC_MASK           (PNG_FLAG_CRC_ANCILLARY_MASK | \
+                                     PNG_FLAG_CRC_CRITICAL_MASK)
+
+
+#define PNG_COLOR_DIST(c1, c2) (abs((int)((c1).red) - (int)((c2).red)) + \
+   abs((int)((c1).green) - (int)((c2).green)) + \
+   abs((int)((c1).blue) - (int)((c2).blue)))
+
+#define PNG_DIV65535(v24) (((v24) + 32895) >> 16)
+#define PNG_DIV257(v16) PNG_DIV65535((png_uint_32)(v16) * 255)
+
+#define PNG_ROWBYTES(pixel_bits, width) \
+    ((pixel_bits) >= 8 ? \
+    ((size_t)(width) * (((size_t)(pixel_bits)) >> 3)) : \
+    (( ((size_t)(width) * ((size_t)(pixel_bits))) + 7) >> 3) )
+
+#define PNG_TRAILBITS(pixel_bits, width) \
+    (((pixel_bits) * ((width) % (png_uint_32)8)) % 8)
+
+#define PNG_PADBITS(pixel_bits, width) \
+    ((8 - PNG_TRAILBITS(pixel_bits, width)) % 8)
+
+#define PNG_OUT_OF_RANGE(value, ideal, delta) \
+   ( (value) < (ideal)-(delta) || (value) > (ideal)+(delta) )
+
+#if defined(PNG_FLOATING_POINT_SUPPORTED)
+#define png_float(png_ptr, fixed, s) (.00001 * (fixed))
+
+#if defined(PNG_FIXED_POINT_MACRO_SUPPORTED)
+#define png_fixed(png_ptr, fp, s) ((fp) <= 21474 && (fp) >= -21474 ?\
+    ((png_fixed_point)(100000 * (fp))) : (png_fixed_error(png_ptr, s),0))
+#define png_fixed_ITU(png_ptr, fp, s) ((fp) <= 214748 && (fp) >= 0 ?\
+    ((png_uint_32)(10000 * (fp))) : (png_fixed_error(png_ptr, s),0))
+#endif
+#endif
+
+#define PNG_32b(b,s) (((0xFFFFFFFFU)&(b)) << (s))
+#define PNG_U32(b1,b2,b3,b4) \
+   (PNG_32b(b1,24) | PNG_32b(b2,16) | PNG_32b(b3,8) | PNG_32b(b4,0))
+
+#define PNG_32to8(cn,s) (((cn) >> (s)) & 0xffU)
+#define PNG_CN_VALID_UPPER(b) ((b) >= 65 && (b) <= 90) /* upper-case ASCII */
+#define PNG_CN_VALID_ASCII(b) PNG_CN_VALID_UPPER((b) & ~32U)
+#define PNG_CHUNK_NAME_VALID(cn) (\
+   PNG_CN_VALID_ASCII(PNG_32to8(cn,24)) && \
+   PNG_CN_VALID_ASCII(PNG_32to8(cn,16)) && \
+   PNG_CN_VALID_UPPER(PNG_32to8(cn, 8)) && \
+   PNG_CN_VALID_ASCII(PNG_32to8(cn, 0))   )
+
+#define png_IDAT PNG_U32( 73,  68,  65,  84)
+#define png_IEND PNG_U32( 73,  69,  78,  68)
+#define png_IHDR PNG_U32( 73,  72,  68,  82)
+#define png_PLTE PNG_U32( 80,  76,  84,  69)
+#define png_acTL PNG_U32( 97,  99,  84,  76) /* PNGv3: APNG */
+#define png_bKGD PNG_U32( 98,  75,  71,  68)
+#define png_cHRM PNG_U32( 99,  72,  82,  77)
+#define png_cICP PNG_U32( 99,  73,  67,  80) /* PNGv3 */
+#define png_cLLI PNG_U32( 99,  76,  76,  73) /* PNGv3 */
+#define png_eXIf PNG_U32(101,  88,  73, 102) /* registered July 2017 */
+#define png_fcTL PNG_U32(102,  99,  84,  76) /* PNGv3: APNG */
+#define png_fdAT PNG_U32(102, 100,  65,  84) /* PNGv3: APNG */
+#define png_fRAc PNG_U32(102,  82,  65,  99) /* registered, not defined */
+#define png_gAMA PNG_U32(103,  65,  77,  65)
+#define png_gIFg PNG_U32(103,  73,  70, 103)
+#define png_gIFt PNG_U32(103,  73,  70, 116) /* deprecated */
+#define png_gIFx PNG_U32(103,  73,  70, 120)
+#define png_hIST PNG_U32(104,  73,  83,  84)
+#define png_iCCP PNG_U32(105,  67,  67,  80)
+#define png_iTXt PNG_U32(105,  84,  88, 116)
+#define png_mDCV PNG_U32(109,  68,  67,  86) /* PNGv3 */
+#define png_oFFs PNG_U32(111,  70,  70, 115)
+#define png_pCAL PNG_U32(112,  67,  65,  76)
+#define png_pHYs PNG_U32(112,  72,  89, 115)
+#define png_sBIT PNG_U32(115,  66,  73,  84)
+#define png_sCAL PNG_U32(115,  67,  65,  76)
+#define png_sPLT PNG_U32(115,  80,  76,  84)
+#define png_sRGB PNG_U32(115,  82,  71,  66)
+#define png_sTER PNG_U32(115,  84,  69,  82)
+#define png_tEXt PNG_U32(116,  69,  88, 116)
+#define png_tIME PNG_U32(116,  73,  77,  69)
+#define png_tRNS PNG_U32(116,  82,  78,  83)
+#define png_zTXt PNG_U32(122,  84,  88, 116)
+
+#if defined(PNG_APNG_SUPPORTED)
+#define png_acTL PNG_U32( 97,  99,  84,  76)
+#define png_fcTL PNG_U32(102,  99,  84,  76)
+#define png_fdAT PNG_U32(102, 100,  65,  84)
+
+#define PNG_FIRST_FRAME_HIDDEN       0x0001U
+#define PNG_APNG_APP                 0x0002U
+#endif
+
+#define PNG_CHUNK_FROM_STRING(s)\
+   PNG_U32(0xff & (s)[0], 0xff & (s)[1], 0xff & (s)[2], 0xff & (s)[3])
+
+#define PNG_STRING_FROM_CHUNK(s,c)\
+   (void)(((char*)(s))[0]=(char)(((c)>>24) & 0xff), \
+   ((char*)(s))[1]=(char)(((c)>>16) & 0xff),\
+   ((char*)(s))[2]=(char)(((c)>>8) & 0xff), \
+   ((char*)(s))[3]=(char)((c & 0xff)))
+
+#define PNG_CSTRING_FROM_CHUNK(s,c)\
+   (void)(PNG_STRING_FROM_CHUNK(s,c), ((char*)(s))[4] = 0)
+
+#define PNG_CHUNK_ANCILLARY(c)   (1 & ((c) >> 29))
+#define PNG_CHUNK_CRITICAL(c)     (!PNG_CHUNK_ANCILLARY(c))
+#define PNG_CHUNK_PRIVATE(c)      (1 & ((c) >> 21))
+#define PNG_CHUNK_RESERVED(c)     (1 & ((c) >> 13))
+#define PNG_CHUNK_SAFE_TO_COPY(c) (1 & ((c) >>  5))
+
+#define PNG_KNOWN_CHUNKS\
+   PNG_CHUNK(IHDR,  0)\
+   PNG_CHUNK(PLTE,  1)\
+   PNG_CHUNK(IDAT,  2)\
+   PNG_CHUNK(IEND,  3)\
+   PNG_CHUNK(acTL,  4)\
+   PNG_CHUNK(bKGD,  5)\
+   PNG_CHUNK(cHRM,  6)\
+   PNG_CHUNK(cICP,  7)\
+   PNG_CHUNK(cLLI,  8)\
+   PNG_CHUNK(eXIf,  9)\
+   PNG_CHUNK(fcTL, 10)\
+   PNG_CHUNK(fdAT, 11)\
+   PNG_CHUNK(gAMA, 12)\
+   PNG_CHUNK(hIST, 13)\
+   PNG_CHUNK(iCCP, 14)\
+   PNG_CHUNK(iTXt, 15)\
+   PNG_CHUNK(mDCV, 16)\
+   PNG_CHUNK(oFFs, 17)\
+   PNG_CHUNK(pCAL, 18)\
+   PNG_CHUNK(pHYs, 19)\
+   PNG_CHUNK(sBIT, 20)\
+   PNG_CHUNK(sCAL, 21)\
+   PNG_CHUNK(sPLT, 22)\
+   PNG_CHUNK(sRGB, 23)\
+   PNG_CHUNK(tEXt, 24)\
+   PNG_CHUNK(tIME, 25)\
+   PNG_CHUNK(tRNS, 26)\
+   PNG_CHUNK(zTXt, 27)
+
+#define PNG_GAMMA_MAC_OLD 151724  /* Assume '1.8' is really 2.2/1.45! */
+#define PNG_GAMMA_MAC_INVERSE 65909
+#define PNG_GAMMA_sRGB_INVERSE 45455
+
+#define PNG_LIB_GAMMA_MIN 1000
+#define PNG_LIB_GAMMA_MAX 10000000
+
+#if !defined(PNG_VERSION_INFO_ONLY)
+
+#include "pngstruct.h"
+#include "pnginfo.h"
+
+#if PNG_ZLIB_VERNUM != 0 && PNG_ZLIB_VERNUM != ZLIB_VERNUM
+#  error The include path of <zlib.h> is incorrect
+#endif
+
+typedef const png_uint_16p * png_const_uint_16pp;
+
+#if defined(PNG_SIMPLIFIED_READ_SUPPORTED) ||\
+   defined(PNG_SIMPLIFIED_WRITE_SUPPORTED)
+#if defined(PNG_SIMPLIFIED_READ_SUPPORTED)
+PNG_INTERNAL_DATA(const png_uint_16, png_sRGB_table, [256]);
+#endif
+
+PNG_INTERNAL_DATA(const png_uint_16, png_sRGB_base, [512]);
+PNG_INTERNAL_DATA(const png_byte, png_sRGB_delta, [512]);
+
+#define PNG_sRGB_FROM_LINEAR(linear) \
+  ((png_byte)(0xff & ((png_sRGB_base[(linear)>>15] \
+   + ((((linear) & 0x7fff)*png_sRGB_delta[(linear)>>15])>>12)) >> 8)))
+#endif
+
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+#define PNG_UNEXPECTED_ZLIB_RETURN (-7)
+PNG_INTERNAL_FUNCTION(void, png_zstream_error,
+   (png_structrp png_ptr, int ret),
+   PNG_EMPTY);
+
+#if defined(PNG_WRITE_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_free_buffer_list,
+   (png_structrp png_ptr, png_compression_bufferp *list),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_FLOATING_POINT_SUPPORTED) && \
+   !defined(PNG_FIXED_POINT_MACRO_SUPPORTED) && \
+   (defined(PNG_gAMA_SUPPORTED) || defined(PNG_cHRM_SUPPORTED) || \
+   defined(PNG_sCAL_SUPPORTED) || defined(PNG_READ_BACKGROUND_SUPPORTED) || \
+   defined(PNG_mDCV_SUPPORTED) || \
+   defined(PNG_READ_RGB_TO_GRAY_SUPPORTED)) || \
+   (defined(PNG_sCAL_SUPPORTED) && \
+   defined(PNG_FLOATING_ARITHMETIC_SUPPORTED))
+PNG_INTERNAL_FUNCTION(png_fixed_point, png_fixed,
+   (png_const_structrp png_ptr, double fp, png_const_charp text),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_FLOATING_POINT_SUPPORTED) && \
+   !defined(PNG_FIXED_POINT_MACRO_SUPPORTED) && \
+   (defined(PNG_cLLI_SUPPORTED) || defined(PNG_mDCV_SUPPORTED))
+PNG_INTERNAL_FUNCTION(png_uint_32, png_fixed_ITU,
+   (png_const_structrp png_ptr, double fp, png_const_charp text),
+   PNG_EMPTY);
+#endif
+
+PNG_INTERNAL_FUNCTION(int, png_user_version_check,
+   (png_structrp png_ptr, png_const_charp user_png_ver),
+   PNG_EMPTY);
+
+#if defined(PNG_READ_SUPPORTED)
+#if defined(PNG_SET_USER_LIMITS_SUPPORTED)
+#  define png_chunk_max(png_ptr) ((png_ptr)->user_chunk_malloc_max)
+
+#elif PNG_USER_CHUNK_MALLOC_MAX > 0 /* compile-time limit */
+#  define png_chunk_max(png_ptr) ((void)png_ptr, PNG_USER_CHUNK_MALLOC_MAX)
+
+#elif (defined PNG_MAX_MALLOC_64K)  /* legacy system limit */
+#  define png_chunk_max(png_ptr) ((void)png_ptr, 65536U)
+
+#else
+#  define png_chunk_max(png_ptr) ((void)png_ptr, PNG_SIZE_MAX)
+#endif
+#endif
+
+PNG_INTERNAL_FUNCTION(png_voidp, png_malloc_base,
+   (png_const_structrp png_ptr, png_alloc_size_t size),
+   PNG_ALLOCATED);
+
+#if defined(PNG_TEXT_SUPPORTED) || defined(PNG_sPLT_SUPPORTED) ||\
+   defined(PNG_STORE_UNKNOWN_CHUNKS_SUPPORTED)
+PNG_INTERNAL_FUNCTION(png_voidp, png_malloc_array,
+   (png_const_structrp png_ptr, int nelements, size_t element_size),
+   PNG_ALLOCATED);
+
+PNG_INTERNAL_FUNCTION(png_voidp, png_realloc_array,
+   (png_const_structrp png_ptr,
+    png_const_voidp array, int old_elements, int add_elements,
+    size_t element_size),
+   PNG_ALLOCATED);
+#endif
+
+PNG_INTERNAL_FUNCTION(png_structp, png_create_png_struct,
+   (png_const_charp user_png_ver,
+    png_voidp error_ptr, png_error_ptr error_fn, png_error_ptr warn_fn,
+    png_voidp mem_ptr, png_malloc_ptr malloc_fn, png_free_ptr free_fn),
+   PNG_ALLOCATED);
+
+PNG_INTERNAL_FUNCTION(void, png_destroy_png_struct,
+   (png_structrp png_ptr),
+   PNG_EMPTY);
+
+PNG_INTERNAL_FUNCTION(void, png_free_jmpbuf,
+   (png_structrp png_ptr),
+   PNG_EMPTY);
+
+PNG_INTERNAL_FUNCTION(voidpf, png_zalloc,
+   (voidpf png_ptr, uInt items, uInt size),
+   PNG_ALLOCATED);
+
+PNG_INTERNAL_FUNCTION(void, png_zfree,
+   (voidpf png_ptr, voidpf ptr),
+   PNG_EMPTY);
+
+
+PNG_INTERNAL_FUNCTION(void PNGCBAPI, png_default_read_data,
+   (png_structp png_ptr, png_bytep data, size_t length),
+   PNG_EMPTY);
+
+#if defined(PNG_PROGRESSIVE_READ_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void PNGCBAPI, png_push_fill_buffer,
+   (png_structp png_ptr, png_bytep buffer, size_t length),
+   PNG_EMPTY);
+#endif
+
+PNG_INTERNAL_FUNCTION(void PNGCBAPI, png_default_write_data,
+   (png_structp png_ptr, png_bytep data, size_t length),
+   PNG_EMPTY);
+
+#if defined(PNG_WRITE_FLUSH_SUPPORTED)
+#if defined(PNG_STDIO_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void PNGCBAPI, png_default_flush,
+   (png_structp png_ptr),
+   PNG_EMPTY);
+#endif
+#endif
+
+PNG_INTERNAL_FUNCTION(void, png_reset_crc,
+   (png_structrp png_ptr),
+   PNG_EMPTY);
+
+PNG_INTERNAL_FUNCTION(void, png_write_data,
+   (png_structrp png_ptr, png_const_bytep data, size_t length),
+   PNG_EMPTY);
+
+PNG_INTERNAL_FUNCTION(void, png_read_sig,
+   (png_structrp png_ptr, png_inforp info_ptr),
+   PNG_EMPTY);
+
+PNG_INTERNAL_FUNCTION(png_uint_32, png_read_chunk_header,
+   (png_structrp png_ptr),
+   PNG_EMPTY);
+
+PNG_INTERNAL_FUNCTION(void, png_read_data,
+   (png_structrp png_ptr, png_bytep data, size_t length),
+   PNG_EMPTY);
+
+PNG_INTERNAL_FUNCTION(void, png_crc_read,
+   (png_structrp png_ptr, png_bytep buf, png_uint_32 length),
+   PNG_EMPTY);
+
+PNG_INTERNAL_FUNCTION(int, png_crc_finish,
+   (png_structrp png_ptr, png_uint_32 skip),
+   PNG_EMPTY);
+
+PNG_INTERNAL_FUNCTION(void, png_calculate_crc,
+   (png_structrp png_ptr, png_const_bytep ptr, size_t length),
+   PNG_EMPTY);
+
+#if defined(PNG_WRITE_FLUSH_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_flush,
+   (png_structrp png_ptr),
+   PNG_EMPTY);
+#endif
+
+
+PNG_INTERNAL_FUNCTION(void, png_write_IHDR,
+   (png_structrp png_ptr,
+    png_uint_32 width, png_uint_32 height, int bit_depth, int color_type,
+    int compression_method, int filter_method, int interlace_method),
+   PNG_EMPTY);
+
+PNG_INTERNAL_FUNCTION(void, png_write_PLTE,
+   (png_structrp png_ptr,
+    png_const_colorp palette, png_uint_32 num_pal),
+   PNG_EMPTY);
+
+PNG_INTERNAL_FUNCTION(void, png_compress_IDAT,
+   (png_structrp png_ptr,
+    png_const_bytep row_data, png_alloc_size_t row_data_length, int flush),
+   PNG_EMPTY);
+
+PNG_INTERNAL_FUNCTION(void, png_write_IEND,
+   (png_structrp png_ptr),
+   PNG_EMPTY);
+
+#if defined(PNG_WRITE_gAMA_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_write_gAMA_fixed,
+   (png_structrp png_ptr, png_fixed_point file_gamma),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_WRITE_sBIT_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_write_sBIT,
+   (png_structrp png_ptr, png_const_color_8p sbit, int color_type),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_WRITE_cHRM_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_write_cHRM_fixed,
+   (png_structrp png_ptr, const png_xy *xy),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_WRITE_cICP_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_write_cICP,
+   (png_structrp png_ptr,
+    png_byte colour_primaries, png_byte transfer_function,
+    png_byte matrix_coefficients, png_byte video_full_range_flag),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_WRITE_cLLI_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_write_cLLI_fixed,
+   (png_structrp png_ptr, png_uint_32 maxCLL, png_uint_32 maxFALL),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_WRITE_mDCV_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_write_mDCV_fixed,
+   (png_structrp png_ptr,
+    png_uint_16 red_x, png_uint_16 red_y,
+    png_uint_16 green_x, png_uint_16 green_y,
+    png_uint_16 blue_x, png_uint_16 blue_y,
+    png_uint_16 white_x, png_uint_16 white_y,
+    png_uint_32 maxDL, png_uint_32 minDL),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_WRITE_sRGB_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_write_sRGB,
+   (png_structrp png_ptr, int intent),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_WRITE_eXIf_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_write_eXIf,
+   (png_structrp png_ptr, png_bytep exif, int num_exif),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_WRITE_iCCP_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_write_iCCP,
+   (png_structrp png_ptr,
+    png_const_charp name, png_const_bytep profile, png_uint_32 proflen),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_WRITE_sPLT_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_write_sPLT,
+   (png_structrp png_ptr, png_const_sPLT_tp palette),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_WRITE_tRNS_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_write_tRNS,
+   (png_structrp png_ptr,
+    png_const_bytep trans, png_const_color_16p values, int number,
+    int color_type),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_WRITE_bKGD_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_write_bKGD,
+   (png_structrp png_ptr, png_const_color_16p values, int color_type),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_WRITE_hIST_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_write_hIST,
+   (png_structrp png_ptr, png_const_uint_16p hist, int num_hist),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_WRITE_tEXt_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_write_tEXt,
+   (png_structrp png_ptr,
+    png_const_charp key, png_const_charp text, size_t text_len),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_WRITE_zTXt_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_write_zTXt,
+   (png_structrp png_ptr,
+    png_const_charp key, png_const_charp text, int compression),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_WRITE_iTXt_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_write_iTXt,
+   (png_structrp png_ptr,
+    int compression, png_const_charp key, png_const_charp lang,
+    png_const_charp lang_key, png_const_charp text),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_TEXT_SUPPORTED)
+PNG_INTERNAL_FUNCTION(int, png_set_text_2,
+   (png_const_structrp png_ptr,
+    png_inforp info_ptr, png_const_textp text_ptr, int num_text),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_WRITE_oFFs_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_write_oFFs,
+   (png_structrp png_ptr,
+    png_int_32 x_offset, png_int_32 y_offset, int unit_type),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_WRITE_pCAL_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_write_pCAL,
+   (png_structrp png_ptr,
+    png_charp purpose, png_int_32 X0, png_int_32 X1,
+    int type, int nparams, png_const_charp units, png_charpp params),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_WRITE_pHYs_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_write_pHYs,
+   (png_structrp png_ptr,
+    png_uint_32 x_pixels_per_unit, png_uint_32 y_pixels_per_unit,
+    int unit_type),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_WRITE_tIME_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_write_tIME,
+   (png_structrp png_ptr, png_const_timep mod_time),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_WRITE_sCAL_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_write_sCAL_s,
+   (png_structrp png_ptr,
+    int unit, png_const_charp width, png_const_charp height),
+   PNG_EMPTY);
+#endif
+
+PNG_INTERNAL_FUNCTION(void, png_write_finish_row,
+   (png_structrp png_ptr),
+   PNG_EMPTY);
+
+PNG_INTERNAL_FUNCTION(void, png_write_start_row,
+   (png_structrp png_ptr),
+   PNG_EMPTY);
+
+#if !defined(PNG_USE_COMPILE_TIME_MASKS)
+#  define PNG_USE_COMPILE_TIME_MASKS 1
+#endif
+PNG_INTERNAL_FUNCTION(void, png_combine_row,
+   (png_const_structrp png_ptr, png_bytep row, int display),
+   PNG_EMPTY);
+
+#if defined(PNG_READ_INTERLACING_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_do_read_interlace,
+   (png_row_infop row_info,
+    png_bytep row, int pass, png_uint_32 transformations),
+   PNG_EMPTY);
+#endif
+
+
+#if defined(PNG_WRITE_INTERLACING_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_do_write_interlace,
+   (png_row_infop row_info, png_bytep row, int pass),
+   PNG_EMPTY);
+#endif
+
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row,
+   (png_structrp pp, png_row_infop row_info,
+    png_bytep row, png_const_bytep prev_row, int filter),
+   PNG_EMPTY);
+
+#if PNG_ARM_NEON_OPT > 0
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_up_neon,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_sub3_neon,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_sub4_neon,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_avg3_neon,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_avg4_neon,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_paeth3_neon,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_paeth4_neon,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+#endif
+
+#if PNG_MIPS_MSA_IMPLEMENTATION == 1
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_up_msa,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_sub3_msa,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_sub4_msa,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_avg3_msa,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_avg4_msa,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_paeth3_msa,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_paeth4_msa,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+#endif
+
+#if PNG_MIPS_MMI_IMPLEMENTATION > 0
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_up_mmi,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_sub3_mmi,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_sub4_mmi,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_avg3_mmi,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_avg4_mmi,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_paeth3_mmi,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_paeth4_mmi,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+#endif
+
+#if PNG_POWERPC_VSX_OPT > 0
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_up_vsx,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_sub3_vsx,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_sub4_vsx,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_avg3_vsx,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_avg4_vsx,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_paeth3_vsx,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_paeth4_vsx,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+#endif
+
+#if PNG_INTEL_SSE_IMPLEMENTATION > 0
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_sub3_sse2,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_sub4_sse2,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_avg3_sse2,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_avg4_sse2,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_paeth3_sse2,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_paeth4_sse2,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+#endif
+
+#if PNG_LOONGARCH_LSX_IMPLEMENTATION == 1
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_up_lsx,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_sub3_lsx,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_sub4_lsx,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_avg3_lsx,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_avg4_lsx,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_paeth3_lsx,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_paeth4_lsx,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+#endif
+
+#if PNG_RISCV_RVV_IMPLEMENTATION == 1
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_up_rvv,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_sub3_rvv,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_sub4_rvv,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_avg3_rvv,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_avg4_rvv,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_paeth3_rvv,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_filter_row_paeth4_rvv,
+   (png_row_infop row_info, png_bytep row, png_const_bytep prev_row),
+   PNG_EMPTY);
+#endif
+
+PNG_INTERNAL_FUNCTION(void, png_write_find_filter,
+   (png_structrp png_ptr, png_row_infop row_info),
+   PNG_EMPTY);
+
+#if defined(PNG_SEQUENTIAL_READ_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_read_IDAT_data,
+   (png_structrp png_ptr, png_bytep output, png_alloc_size_t avail_out),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_finish_IDAT,
+   (png_structrp png_ptr),
+   PNG_EMPTY);
+
+PNG_INTERNAL_FUNCTION(void, png_read_finish_row,
+   (png_structrp png_ptr),
+   PNG_EMPTY);
+#endif
+
+PNG_INTERNAL_FUNCTION(void, png_read_start_row,
+   (png_structrp png_ptr),
+   PNG_EMPTY);
+
+#if ZLIB_VERNUM >= 0x1240
+PNG_INTERNAL_FUNCTION(int, png_zlib_inflate,
+   (png_structrp png_ptr, int flush),
+   PNG_EMPTY);
+#  define PNG_INFLATE(pp, flush) png_zlib_inflate(pp, flush)
+#else
+#  define PNG_INFLATE(pp, flush) inflate(&(pp)->zstream, flush)
+#endif
+
+#if defined(PNG_READ_TRANSFORMS_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_read_transform_info,
+   (png_structrp png_ptr, png_inforp info_ptr),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_WRITE_FILLER_SUPPORTED) || \
+    defined(PNG_READ_STRIP_ALPHA_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_do_strip_channel,
+   (png_row_infop row_info, png_bytep row, int at_start),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_16BIT_SUPPORTED)
+#if defined(PNG_READ_SWAP_SUPPORTED) || defined(PNG_WRITE_SWAP_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_do_swap,
+   (png_row_infop row_info, png_bytep row),
+   PNG_EMPTY);
+#endif
+#endif
+
+#if defined(PNG_READ_PACKSWAP_SUPPORTED) || \
+    defined(PNG_WRITE_PACKSWAP_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_do_packswap,
+   (png_row_infop row_info, png_bytep row),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_READ_INVERT_SUPPORTED) || defined(PNG_WRITE_INVERT_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_do_invert,
+   (png_row_infop row_info, png_bytep row),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_READ_BGR_SUPPORTED) || defined(PNG_WRITE_BGR_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_do_bgr,
+   (png_row_infop row_info, png_bytep row),
+   PNG_EMPTY);
+#endif
+
+typedef enum
+{
+   handled_error = 0,  
+   handled_discarded,  
+   handled_saved,      
+   handled_ok          
+} png_handle_result_code;
+
+PNG_INTERNAL_FUNCTION(png_handle_result_code, png_handle_unknown,
+   (png_structrp png_ptr, png_inforp info_ptr, png_uint_32 length, int keep),
+   PNG_EMPTY);
+
+PNG_INTERNAL_FUNCTION(png_handle_result_code, png_handle_chunk,
+   (png_structrp png_ptr, png_inforp info_ptr, png_uint_32 length),
+   PNG_EMPTY);
+
+#if defined(PNG_READ_UNKNOWN_CHUNKS_SUPPORTED) ||\
+    defined(PNG_HANDLE_AS_UNKNOWN_SUPPORTED)
+PNG_INTERNAL_FUNCTION(int, png_chunk_unknown_handling,
+   (png_const_structrp png_ptr, png_uint_32 chunk_name),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_READ_TRANSFORMS_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_do_read_transformations,
+   (png_structrp png_ptr, png_row_infop row_info),
+   PNG_EMPTY);
+#endif
+#if defined(PNG_WRITE_TRANSFORMS_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_do_write_transformations,
+   (png_structrp png_ptr, png_row_infop row_info),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_READ_TRANSFORMS_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_init_read_transformations,
+   (png_structrp png_ptr),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_PROGRESSIVE_READ_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_push_read_chunk,
+   (png_structrp png_ptr, png_inforp info_ptr),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_push_read_sig,
+   (png_structrp png_ptr, png_inforp info_ptr),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_push_check_crc,
+   (png_structrp png_ptr),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_push_save_buffer,
+   (png_structrp png_ptr),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_push_restore_buffer,
+   (png_structrp png_ptr, png_bytep buffer, size_t buffer_length),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_push_read_IDAT,
+   (png_structrp png_ptr),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_process_IDAT_data,
+   (png_structrp png_ptr, png_bytep buffer, size_t buffer_length),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_push_process_row,
+   (png_structrp png_ptr),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_push_have_info,
+   (png_structrp png_ptr, png_inforp info_ptr),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_push_have_end,
+   (png_structrp png_ptr, png_inforp info_ptr),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_push_have_row,
+   (png_structrp png_ptr, png_bytep row),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_push_read_end,
+   (png_structrp png_ptr, png_inforp info_ptr),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_process_some_data,
+   (png_structrp png_ptr, png_inforp info_ptr),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_read_push_finish_row,
+   (png_structrp png_ptr),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_APNG_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void,png_ensure_fcTL_is_valid,(png_structp png_ptr,
+   png_uint_32 width, png_uint_32 height,
+   png_uint_32 x_offset, png_uint_32 y_offset,
+   png_uint_16 delay_num, png_uint_16 delay_den,
+   png_byte dispose_op, png_byte blend_op),PNG_EMPTY);
+
+#if defined(PNG_READ_APNG_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void,png_handle_acTL,(png_structp png_ptr,
+   png_infop info_ptr, png_uint_32 length),PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void,png_handle_fcTL,(png_structp png_ptr,
+   png_infop info_ptr, png_uint_32 length),PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void,png_handle_fdAT,(png_structp png_ptr,
+   png_infop info_ptr, png_uint_32 length),PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void,png_have_info,(png_structp png_ptr,
+   png_infop info_ptr),PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void,png_ensure_sequence_number,(png_structp png_ptr,
+   png_uint_32 length),PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void,png_read_reset,(png_structp png_ptr),PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void,png_read_reinit,(png_structp png_ptr,
+   png_infop info_ptr),PNG_EMPTY);
+#if defined(PNG_PROGRESSIVE_READ_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void,png_progressive_read_reset,(png_structp png_ptr),
+   PNG_EMPTY);
+#endif
+#endif
+
+#if defined(PNG_WRITE_APNG_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void,png_write_acTL,(png_structp png_ptr,
+   png_uint_32 num_frames, png_uint_32 num_plays),PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void,png_write_fcTL,(png_structp png_ptr,
+   png_uint_32 width, png_uint_32 height,
+   png_uint_32 x_offset, png_uint_32 y_offset,
+   png_uint_16 delay_num, png_uint_16 delay_den,
+   png_byte dispose_op, png_byte blend_op),PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void,png_write_fdAT,(png_structp png_ptr,
+   png_const_bytep data, png_size_t length),PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void,png_write_reset,(png_structp png_ptr),PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void,png_write_reinit,(png_structp png_ptr,
+   png_infop info_ptr, png_uint_32 width, png_uint_32 height),PNG_EMPTY);
+#endif
+#endif
+
+#if defined(PNG_iCCP_SUPPORTED)
+#if defined(PNG_READ_iCCP_SUPPORTED)
+PNG_INTERNAL_FUNCTION(int, png_icc_check_length,
+   (png_const_structrp png_ptr,
+    png_const_charp name, png_uint_32 profile_length),
+   PNG_EMPTY);
+#endif
+PNG_INTERNAL_FUNCTION(int, png_icc_check_header,
+   (png_const_structrp png_ptr,
+    png_const_charp name, png_uint_32 profile_length,
+    png_const_bytep profile , int color_type),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(int, png_icc_check_tag_table,
+   (png_const_structrp png_ptr,
+    png_const_charp name, png_uint_32 profile_length,
+    png_const_bytep profile ),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_READ_RGB_TO_GRAY_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_set_rgb_coefficients,
+   (png_structrp png_ptr),
+   PNG_EMPTY);
+#endif
+
+PNG_INTERNAL_FUNCTION(void, png_check_IHDR,
+   (png_const_structrp png_ptr,
+    png_uint_32 width, png_uint_32 height, int bit_depth, int color_type,
+    int interlace_type, int compression_type, int filter_type),
+   PNG_EMPTY);
+
+#if defined(PNG_READ_CHECK_FOR_INVALID_INDEX_SUPPORTED) || \
+    defined(PNG_WRITE_CHECK_FOR_INVALID_INDEX_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_do_check_palette_indexes,
+   (png_structrp png_ptr, png_row_infop row_info),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_FLOATING_POINT_SUPPORTED) && defined(PNG_ERROR_TEXT_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_fixed_error,
+   (png_const_structrp png_ptr, png_const_charp name),
+   PNG_NORETURN);
+#endif
+
+PNG_INTERNAL_FUNCTION(size_t, png_safecat,
+   (png_charp buffer, size_t bufsize, size_t pos, png_const_charp string),
+   PNG_EMPTY);
+
+#if defined(PNG_WARNINGS_SUPPORTED) || defined(PNG_TIME_RFC1123_SUPPORTED)
+PNG_INTERNAL_FUNCTION(png_charp, png_format_number,
+   (png_const_charp start, png_charp end, int format, png_alloc_size_t number),
+   PNG_EMPTY);
+
+#define PNG_FORMAT_NUMBER(buffer,format,number) \
+   png_format_number(buffer, buffer + (sizeof buffer), format, number)
+
+#define PNG_NUMBER_BUFFER_SIZE 24
+
+#define PNG_NUMBER_FORMAT_u     1 /* chose unsigned API! */
+#define PNG_NUMBER_FORMAT_02u   2
+#define PNG_NUMBER_FORMAT_d     1 /* chose signed API! */
+#define PNG_NUMBER_FORMAT_02d   2
+#define PNG_NUMBER_FORMAT_x     3
+#define PNG_NUMBER_FORMAT_02x   4
+#define PNG_NUMBER_FORMAT_fixed 5 /* choose the signed API */
+#endif
+
+#if defined(PNG_WARNINGS_SUPPORTED)
+#  define PNG_WARNING_PARAMETER_SIZE 32
+#  define PNG_WARNING_PARAMETER_COUNT 8 /* Maximum 9; see pngerror.c */
+
+typedef char png_warning_parameters[PNG_WARNING_PARAMETER_COUNT][
+   PNG_WARNING_PARAMETER_SIZE];
+
+PNG_INTERNAL_FUNCTION(void, png_warning_parameter,
+   (png_warning_parameters p, int number, png_const_charp string),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_warning_parameter_unsigned,
+   (png_warning_parameters p, int number, int format, png_alloc_size_t value),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_warning_parameter_signed,
+   (png_warning_parameters p, int number, int format, png_int_32 value),
+   PNG_EMPTY);
+
+PNG_INTERNAL_FUNCTION(void, png_formatted_warning,
+   (png_const_structrp png_ptr,
+    png_warning_parameters p, png_const_charp message),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_BENIGN_ERRORS_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_app_warning,
+   (png_const_structrp png_ptr, png_const_charp message),
+   PNG_EMPTY);
+
+PNG_INTERNAL_FUNCTION(void, png_app_error,
+   (png_const_structrp png_ptr, png_const_charp message),
+   PNG_EMPTY);
+#else
+#  define png_app_warning(pp,s) png_warning(pp,s)
+#  define png_app_error(pp,s) png_error(pp,s)
+#endif
+
+PNG_INTERNAL_FUNCTION(void, png_chunk_report,
+   (png_const_structrp png_ptr, png_const_charp message, int error),
+   PNG_EMPTY);
+#define PNG_CHUNK_WARNING     0 /* never an error */
+#define PNG_CHUNK_WRITE_ERROR 1 /* an error only on write */
+#define PNG_CHUNK_ERROR       2 /* always an error */
+
+#if defined(PNG_sCAL_SUPPORTED)
+#define PNG_sCAL_MAX_DIGITS (PNG_sCAL_PRECISION+1/*.*/+1/*E*/+10/*exponent*/)
+
+#if defined(PNG_FLOATING_POINT_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_ascii_from_fp,
+   (png_const_structrp png_ptr,
+    png_charp ascii, size_t size, double fp, unsigned int precision),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_FIXED_POINT_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_ascii_from_fixed,
+   (png_const_structrp png_ptr,
+    png_charp ascii, size_t size, png_fixed_point fp),
+   PNG_EMPTY);
+#endif
+#endif
+
+#if defined(PNG_sCAL_SUPPORTED) || defined(PNG_pCAL_SUPPORTED)
+#define PNG_FP_INTEGER    0  /* before or in integer */
+#define PNG_FP_FRACTION   1  /* before or in fraction */
+#define PNG_FP_EXPONENT   2  /* before or in exponent */
+#define PNG_FP_STATE      3  /* mask for the above */
+#define PNG_FP_SAW_SIGN   4  /* Saw +/- in current state */
+#define PNG_FP_SAW_DIGIT  8  /* Saw a digit in current state */
+#define PNG_FP_SAW_DOT   16  /* Saw a dot in current state */
+#define PNG_FP_SAW_E     32  /* Saw an E (or e) in current state */
+#define PNG_FP_SAW_ANY   60  /* Saw any of the above 4 */
+
+#define PNG_FP_WAS_VALID 64  /* Preceding substring is a valid fp number */
+#define PNG_FP_NEGATIVE 128  /* A negative number, including "-0" */
+#define PNG_FP_NONZERO  256  /* A non-zero value */
+#define PNG_FP_STICKY   448  /* The above three flags */
+
+#define PNG_FP_INVALID  512  /* Available for callers as a distinct value */
+
+#define PNG_FP_MAYBE      0  /* The number may be valid in the future */
+#define PNG_FP_OK         1  /* The number is valid */
+
+#define PNG_FP_NZ_MASK (PNG_FP_SAW_DIGIT | PNG_FP_NEGATIVE | PNG_FP_NONZERO)
+#define PNG_FP_Z_MASK (PNG_FP_SAW_DIGIT | PNG_FP_NONZERO)
+#define PNG_FP_IS_ZERO(state) (((state) & PNG_FP_Z_MASK) == PNG_FP_SAW_DIGIT)
+#define PNG_FP_IS_POSITIVE(state) (((state) & PNG_FP_NZ_MASK) == PNG_FP_Z_MASK)
+#define PNG_FP_IS_NEGATIVE(state) (((state) & PNG_FP_NZ_MASK) == PNG_FP_NZ_MASK)
+
+PNG_INTERNAL_FUNCTION(int, png_check_fp_number,
+   (png_const_charp string, size_t size, int *statep, size_t *whereami),
+   PNG_EMPTY);
+
+PNG_INTERNAL_FUNCTION(int, png_check_fp_string,
+   (png_const_charp string, size_t size),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_READ_GAMMA_SUPPORTED) ||\
+    defined(PNG_COLORSPACE_SUPPORTED) ||\
+    defined(PNG_INCH_CONVERSIONS_SUPPORTED) ||\
+    defined(PNG_READ_pHYs_SUPPORTED)
+PNG_INTERNAL_FUNCTION(int, png_muldiv,
+   (png_fixed_point_p res, png_fixed_point a,
+    png_int_32 multiplied_by, png_int_32 divided_by),
+   PNG_EMPTY);
+
+PNG_INTERNAL_FUNCTION(png_fixed_point, png_reciprocal,
+   (png_fixed_point a),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_READ_GAMMA_SUPPORTED)
+PNG_INTERNAL_FUNCTION(png_fixed_point, png_reciprocal2,
+   (png_fixed_point a, png_fixed_point b),
+   PNG_EMPTY);
+
+PNG_INTERNAL_FUNCTION(int, png_gamma_significant,
+   (png_fixed_point gamma_value),
+   PNG_EMPTY);
+
+PNG_INTERNAL_FUNCTION(png_fixed_point, png_resolve_file_gamma,
+   (png_const_structrp png_ptr),
+   PNG_EMPTY);
+
+PNG_INTERNAL_FUNCTION(png_uint_16, png_gamma_correct,
+   (png_structrp png_ptr, unsigned int value, png_fixed_point gamma_value),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(png_uint_16, png_gamma_16bit_correct,
+   (unsigned int value, png_fixed_point gamma_value),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(png_byte, png_gamma_8bit_correct,
+   (unsigned int value, png_fixed_point gamma_value),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_destroy_gamma_table,
+   (png_structrp png_ptr),
+   PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(void, png_build_gamma_table,
+   (png_structrp png_ptr, int bit_depth),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_READ_RGB_TO_GRAY_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_set_rgb_coefficients,
+   (png_structrp png_ptr),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_cHRM_SUPPORTED) || defined(PNG_READ_RGB_TO_GRAY_SUPPORTED)
+PNG_INTERNAL_FUNCTION(int, png_XYZ_from_xy,
+   (png_XYZ *XYZ, const png_xy *xy),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_COLORSPACE_SUPPORTED)
+PNG_INTERNAL_FUNCTION(int, png_xy_from_XYZ,
+   (png_xy *xy, const png_XYZ *XYZ),
+   PNG_EMPTY);
+#endif
+
+#if defined(PNG_SIMPLIFIED_READ_SUPPORTED) ||\
+    defined(PNG_SIMPLIFIED_WRITE_SUPPORTED)
+typedef struct png_control
+{
+   png_structp png_ptr;
+   png_infop   info_ptr;
+   png_voidp   error_buf;           
+
+   png_const_bytep memory;          
+   size_t          size;            
+
+   unsigned int for_write       :1; 
+   unsigned int owned_file      :1; 
+} png_control;
+
+#if defined(__cplusplus)
+#  define png_control_jmp_buf(pc) (((jmp_buf*)((pc)->error_buf))[0])
+#else
+#  define png_control_jmp_buf(pc) ((pc)->error_buf)
+#endif
+
+PNG_INTERNAL_CALLBACK(void, png_safe_error,
+   (png_structp png_ptr, png_const_charp error_message),
+   PNG_NORETURN);
+
+#if defined(PNG_WARNINGS_SUPPORTED)
+PNG_INTERNAL_CALLBACK(void, png_safe_warning,
+   (png_structp png_ptr, png_const_charp warning_message),
+   PNG_EMPTY);
+#else
+#  define png_safe_warning 0/*dummy argument*/
+#endif
+
+PNG_INTERNAL_FUNCTION(int, png_safe_execute,
+   (png_imagep image, int (*function)(png_voidp), png_voidp arg),
+   PNG_EMPTY);
+
+PNG_INTERNAL_FUNCTION(int, png_image_error,
+   (png_imagep image, png_const_charp error_message),
+   PNG_EMPTY);
+
+#if !defined(PNG_SIMPLIFIED_READ_SUPPORTED)
+PNG_INTERNAL_FUNCTION(void, png_image_free,
+   (png_imagep image),
+   PNG_EMPTY);
+#endif
+
+#endif
+
+#if defined(PNG_FILTER_OPTIMIZATIONS)
+PNG_INTERNAL_FUNCTION(void, PNG_FILTER_OPTIMIZATIONS,
+   (png_structp png_ptr, unsigned int bpp),
+   PNG_EMPTY);
+#else
+#if PNG_ARM_NEON_OPT > 0
+PNG_INTERNAL_FUNCTION(void, png_init_filter_functions_neon,
+   (png_structp png_ptr, unsigned int bpp),
+   PNG_EMPTY);
+#endif
+
+#if PNG_MIPS_MSA_IMPLEMENTATION == 1
+PNG_INTERNAL_FUNCTION(void, png_init_filter_functions_mips,
+   (png_structp png_ptr, unsigned int bpp),
+   PNG_EMPTY);
+#endif
+
+#if PNG_MIPS_MMI_IMPLEMENTATION > 0
+PNG_INTERNAL_FUNCTION(void, png_init_filter_functions_mips,
+   (png_structp png_ptr, unsigned int bpp),
+   PNG_EMPTY);
+#endif
+
+#if PNG_INTEL_SSE_IMPLEMENTATION > 0
+PNG_INTERNAL_FUNCTION(void, png_init_filter_functions_sse2,
+   (png_structp png_ptr, unsigned int bpp),
+   PNG_EMPTY);
+#endif
+#endif
+
+#if PNG_LOONGARCH_LSX_OPT > 0
+PNG_INTERNAL_FUNCTION(void, png_init_filter_functions_lsx,
+   (png_structp png_ptr, unsigned int bpp),
+   PNG_EMPTY);
+#endif
+
+#if PNG_RISCV_RVV_IMPLEMENTATION == 1
+PNG_INTERNAL_FUNCTION(void, png_init_filter_functions_rvv,
+   (png_structp png_ptr, unsigned int bpp),
+   PNG_EMPTY);
+#endif
+
+PNG_INTERNAL_FUNCTION(png_uint_32, png_check_keyword,
+   (png_structrp png_ptr, png_const_charp key, png_bytep new_key),
+   PNG_EMPTY);
+
+#if PNG_ARM_NEON_IMPLEMENTATION == 1
+PNG_INTERNAL_FUNCTION(void,
+                      png_riffle_palette_neon,
+                      (png_structrp),
+                      PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(int,
+                      png_do_expand_palette_rgba8_neon,
+                      (png_structrp,
+                       png_row_infop,
+                       png_const_bytep,
+                       const png_bytepp,
+                       const png_bytepp),
+                      PNG_EMPTY);
+PNG_INTERNAL_FUNCTION(int,
+                      png_do_expand_palette_rgb8_neon,
+                      (png_structrp,
+                       png_row_infop,
+                       png_const_bytep,
+                       const png_bytepp,
+                       const png_bytepp),
+                      PNG_EMPTY);
+#endif
+
+
+#include "pngdebug.h"
+
+#if defined(__cplusplus)
+}
+#endif
+
+#endif

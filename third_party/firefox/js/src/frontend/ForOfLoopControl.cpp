@@ -1,0 +1,214 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "frontend/ForOfLoopControl.h"
+
+#include "frontend/BytecodeEmitter.h"  // BytecodeEmitter
+#include "frontend/EmitterScope.h"     // EmitterScope
+#include "frontend/IfEmitter.h"        // InternalIfEmitter
+#include "vm/CompletionKind.h"         // CompletionKind
+#include "vm/Opcodes.h"                // JSOp
+
+using namespace js;
+using namespace js::frontend;
+
+ForOfLoopControl::ForOfLoopControl(BytecodeEmitter* bce, int32_t iterDepth,
+                                   SelfHostedIter selfHostedIter,
+                                   IteratorKind iterKind)
+    : LoopControl(bce, StatementKind::ForOfLoop),
+      iterDepth_(iterDepth),
+      numYieldsAtBeginCodeNeedingIterClose_(UINT32_MAX),
+      selfHostedIter_(selfHostedIter),
+      iterKind_(iterKind) {}
+
+bool ForOfLoopControl::emitBeginCodeNeedingIteratorClose(BytecodeEmitter* bce) {
+  tryCatch_.emplace(bce, TryEmitter::Kind::TryCatch,
+                    TryEmitter::ControlKind::NonSyntactic);
+
+  if (!tryCatch_->emitTry()) {
+    return false;
+  }
+
+  MOZ_ASSERT(numYieldsAtBeginCodeNeedingIterClose_ == UINT32_MAX);
+  numYieldsAtBeginCodeNeedingIterClose_ = bce->bytecodeSection().numYields();
+
+  return true;
+}
+
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+bool ForOfLoopControl::prepareForForOfLoopIteration(
+    BytecodeEmitter* bce, const EmitterScope* headLexicalEmitterScope,
+    bool hasAwaitUsing) {
+  MOZ_ASSERT(headLexicalEmitterScope);
+  if (headLexicalEmitterScope->hasDisposables()) {
+    forOfDisposalEmitter_.emplace(bce, hasAwaitUsing);
+    return forOfDisposalEmitter_->prepareForForOfLoopIteration();
+  }
+  return true;
+}
+#endif
+
+bool ForOfLoopControl::emitEndCodeNeedingIteratorClose(BytecodeEmitter* bce) {
+  if (!tryCatch_->emitCatch(TryEmitter::ExceptionStack::Yes)) {
+    return false;
+  }
+
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+  if (forOfDisposalEmitter_.isSome()) {
+    if (!bce->emit1(JSOp::Swap)) {
+      return false;
+    }
+    if (!bce->emit1(JSOp::True)) {
+      return false;
+    }
+    if (!forOfDisposalEmitter_->prepareForForOfIteratorClose()) {
+      return false;
+    }
+    if (!bce->emit1(JSOp::Pop)) {
+      return false;
+    }
+    if (!bce->emit1(JSOp::Swap)) {
+      return false;
+    }
+  }
+#endif
+
+  unsigned slotFromTop = bce->bytecodeSection().stackDepth() - iterDepth_;
+  if (!bce->emitDupAt(slotFromTop)) {
+    return false;
+  }
+
+  if (!emitIteratorCloseInInnermostScopeWithTryNote(bce,
+                                                    CompletionKind::Throw)) {
+    return false;  
+  }
+
+  if (!bce->emit1(JSOp::ThrowWithStack)) {
+    return false;
+  }
+
+  uint32_t numYieldsEmitted = bce->bytecodeSection().numYields();
+  if (numYieldsEmitted > numYieldsAtBeginCodeNeedingIterClose_) {
+    if (!tryCatch_->emitFinally()) {
+      return false;
+    }
+    InternalIfEmitter ifGeneratorClosing(bce);
+    if (!bce->emitPickN(2)) {
+      return false;
+    }
+    if (!bce->emit1(JSOp::IsGenClosing)) {
+      return false;
+    }
+    if (!ifGeneratorClosing.emitThen()) {
+      return false;
+    }
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+    if (forOfDisposalEmitter_.isSome()) {
+      if (!bce->emit1(JSOp::Swap)) {
+        return false;
+      }
+      if (!forOfDisposalEmitter_->prepareForForOfIteratorClose()) {
+        return false;
+      }
+      if (!bce->emit1(JSOp::Swap)) {
+        return false;
+      }
+    }
+#endif
+    if (!bce->emitDupAt(slotFromTop + 1)) {
+      return false;
+    }
+    if (!emitIteratorCloseInInnermostScopeWithTryNote(bce,
+                                                      CompletionKind::Normal)) {
+      return false;
+    }
+    if (!ifGeneratorClosing.emitEnd()) {
+      return false;
+    }
+    if (!bce->emitUnpickN(2)) {
+      return false;
+    }
+  }
+
+  if (!tryCatch_->emitEnd()) {
+    return false;
+  }
+
+  tryCatch_.reset();
+  numYieldsAtBeginCodeNeedingIterClose_ = UINT32_MAX;
+
+  return true;
+}
+
+bool ForOfLoopControl::emitIteratorCloseInInnermostScopeWithTryNote(
+    BytecodeEmitter* bce, CompletionKind completionKind) {
+  BytecodeOffset start = bce->bytecodeSection().offset();
+  if (!emitIteratorCloseInScope(bce, *bce->innermostEmitterScope(),
+                                completionKind)) {
+    return false;
+  }
+  BytecodeOffset end = bce->bytecodeSection().offset();
+  return bce->addTryNote(TryNoteKind::ForOfIterClose, 0, start, end);
+}
+
+bool ForOfLoopControl::emitIteratorCloseInScope(BytecodeEmitter* bce,
+                                                EmitterScope& currentScope,
+                                                CompletionKind completionKind) {
+  return bce->emitIteratorCloseInScope(currentScope, iterKind_, completionKind,
+                                       selfHostedIter_);
+}
+
+bool ForOfLoopControl::emitPrepareForNonLocalJumpFromScope(
+    BytecodeEmitter* bce, EmitterScope& currentScope, bool isTarget,
+    BytecodeOffset* tryNoteStart) {
+  if (!bce->emit1(JSOp::Pop)) {
+    return false;
+  }
+
+  if (!bce->emit1(JSOp::Swap)) {
+    return false;
+  }
+  if (!bce->emit1(JSOp::Pop)) {
+    return false;
+  }
+
+  *tryNoteStart = bce->bytecodeSection().offset();
+
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+  NonLocalIteratorCloseUsingEmitter disposeBeforeIterClose(bce);
+
+  if (!disposeBeforeIterClose.prepareForIteratorClose(currentScope)) {
+    return false;
+  }
+#endif
+
+  if (!bce->emit1(JSOp::Dup)) {
+    return false;
+  }
+
+  if (!emitIteratorCloseInScope(bce, currentScope, CompletionKind::Normal)) {
+    return false;
+  }
+
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+  if (!disposeBeforeIterClose.emitEnd()) {
+    return false;
+  }
+#endif
+
+  if (isTarget) {
+    if (!bce->emit1(JSOp::Undefined)) {
+      return false;
+    }
+    if (!bce->emit1(JSOp::Undefined)) {
+      return false;
+    }
+  } else {
+    if (!bce->emit1(JSOp::Pop)) {
+      return false;
+    }
+  }
+
+  return true;
+}

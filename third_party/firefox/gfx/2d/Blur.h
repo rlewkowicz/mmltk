@@ -1,0 +1,101 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_GFX_BLUR_H_
+#define MOZILLA_GFX_BLUR_H_
+
+#include "mozilla/gfx/Rect.h"
+#include "mozilla/gfx/Point.h"
+#include "mozilla/gfx/Types.h"
+
+class SkSurface;
+
+namespace mozilla {
+namespace gfx {
+
+class DrawTargetSkia;
+
+#ifdef _MSC_VER
+#  pragma warning(disable : 4251)
+#endif
+
+class GFX2D_API GaussianBlur final {
+ public:
+  GaussianBlur(const Rect& aRect, const IntSize& aSpreadRadius,
+               const Point& aSigma, const Rect* aDirtyRect,
+               const Rect* aSkipRect, SurfaceFormat aFormat = SurfaceFormat::A8,
+               bool aClamp = false);
+
+  explicit GaussianBlur(const Point& aSigma, bool aClamp = false);
+
+  GaussianBlur() = default;
+
+  void Init(const Rect& aRect, const IntSize& aSpreadRadius,
+            const Point& aBlurSigma, const Rect* aDirtyRect,
+            const Rect* aSkipRect, SurfaceFormat aFormat = SurfaceFormat::A8,
+            bool aClamp = false);
+
+  ~GaussianBlur() = default;
+
+  IntSize GetSize() const;
+
+  SurfaceFormat GetFormat() const;
+
+  int32_t GetStride() const;
+
+  IntRect GetRect() const;
+
+  Rect* GetDirtyRect();
+
+  IntSize GetSpreadRadius() const { return mSpreadRadius; }
+
+  Point GetBlurSigma() const { return mBlurSigma; }
+
+  IntSize GetBlurRadius() const { return mBlurRadius; }
+
+  IntRect GetSkipRect() const { return mSkipRect; }
+
+  size_t GetSurfaceAllocationSize() const;
+
+  void Blur(uint8_t* aData, int32_t aStride, const IntSize& aSize,
+            SurfaceFormat aFormat = SurfaceFormat::UNKNOWN) const;
+
+  static IntSize CalculateBlurRadius(const Point& aStandardDeviation);
+  static Float CalculateBlurSigma(int32_t aBlurRadius);
+
+ private:
+  IntRect mSkipRect;
+
+  IntRect mRect;
+
+  Rect mDirtyRect;
+
+  IntSize mSpreadRadius;
+
+  Point mBlurSigma;
+
+  IntSize mBlurRadius;
+
+  SurfaceFormat mFormat = SurfaceFormat::UNKNOWN;
+
+  bool mClamp = false;
+
+  int32_t mStride = 0;
+
+  size_t mSurfaceAllocationSize = 0;
+
+  bool mHasDirtyRect = false;
+
+  bool Spread(uint8_t* aData, int32_t aStride, const IntSize& aSize,
+              SurfaceFormat aFormat) const;
+
+  friend class DrawTargetSkia;
+
+  bool BlurSkSurface(SkSurface* aSurface) const;
+};
+
+}  
+}  
+
+#endif /* MOZILLA_GFX_BLUR_H_ */

@@ -1,0 +1,459 @@
+// Copyright 2017 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+
+#if !defined(ABSL_BASE_ATTRIBUTES_H_)
+#define ABSL_BASE_ATTRIBUTES_H_
+
+#include "absl/base/config.h"
+
+#if defined(__has_attribute)
+#define ABSL_HAVE_ATTRIBUTE(x) __has_attribute(x)
+#else
+#define ABSL_HAVE_ATTRIBUTE(x) 0
+#endif
+
+#if defined(__cplusplus) && defined(__has_cpp_attribute)
+#define ABSL_HAVE_CPP_ATTRIBUTE(x) __has_cpp_attribute(x)
+#else
+#define ABSL_HAVE_CPP_ATTRIBUTE(x) 0
+#endif
+
+
+#if ABSL_HAVE_ATTRIBUTE(format) || (defined(__GNUC__) && !defined(__clang__))
+#define ABSL_PRINTF_ATTRIBUTE(string_index, first_to_check) \
+  __attribute__((__format__(__printf__, string_index, first_to_check)))
+#define ABSL_SCANF_ATTRIBUTE(string_index, first_to_check) \
+  __attribute__((__format__(__scanf__, string_index, first_to_check)))
+#else
+#define ABSL_PRINTF_ATTRIBUTE(string_index, first_to_check)
+#define ABSL_SCANF_ATTRIBUTE(string_index, first_to_check)
+#endif
+
+#if ABSL_HAVE_ATTRIBUTE(always_inline) || \
+    (defined(__GNUC__) && !defined(__clang__))
+#define ABSL_ATTRIBUTE_ALWAYS_INLINE __attribute__((always_inline))
+#define ABSL_HAVE_ATTRIBUTE_ALWAYS_INLINE 1
+#else
+#define ABSL_ATTRIBUTE_ALWAYS_INLINE
+#endif
+
+#if ABSL_HAVE_ATTRIBUTE(noinline) || (defined(__GNUC__) && !defined(__clang__))
+#define ABSL_ATTRIBUTE_NOINLINE __attribute__((noinline))
+#define ABSL_HAVE_ATTRIBUTE_NOINLINE 1
+#else
+#define ABSL_ATTRIBUTE_NOINLINE
+#endif
+
+#if ABSL_HAVE_ATTRIBUTE(disable_tail_calls)
+#define ABSL_HAVE_ATTRIBUTE_NO_TAIL_CALL 1
+#define ABSL_ATTRIBUTE_NO_TAIL_CALL __attribute__((disable_tail_calls))
+#elif defined(__GNUC__) && !defined(__clang__) && !defined(__e2k__)
+#define ABSL_HAVE_ATTRIBUTE_NO_TAIL_CALL 1
+#define ABSL_ATTRIBUTE_NO_TAIL_CALL \
+  __attribute__((optimize("no-optimize-sibling-calls")))
+#else
+#define ABSL_ATTRIBUTE_NO_TAIL_CALL
+#define ABSL_HAVE_ATTRIBUTE_NO_TAIL_CALL 0
+#endif
+
+#if (ABSL_HAVE_ATTRIBUTE(weak) ||                                 \
+     (defined(__GNUC__) && !defined(__clang__))) &&               \
+    (!0 ||                                          \
+     (defined(__clang__) && __clang_major__ >= 9 &&               \
+      !defined(ABSL_BUILD_DLL) && !defined(ABSL_CONSUME_DLL))) && \
+    !defined(__MINGW32__)
+#undef ABSL_ATTRIBUTE_WEAK
+#define ABSL_ATTRIBUTE_WEAK __attribute__((weak))
+#define ABSL_HAVE_ATTRIBUTE_WEAK 1
+#else
+#define ABSL_ATTRIBUTE_WEAK
+#define ABSL_HAVE_ATTRIBUTE_WEAK 0
+#endif
+
+#if ABSL_HAVE_ATTRIBUTE(nonnull) || (defined(__GNUC__) && !defined(__clang__))
+#define ABSL_ATTRIBUTE_NONNULL(arg_index) __attribute__((nonnull(arg_index)))
+#else
+#define ABSL_ATTRIBUTE_NONNULL(...)
+#endif
+
+#if ABSL_HAVE_ATTRIBUTE(noreturn) || (defined(__GNUC__) && !defined(__clang__))
+#define ABSL_ATTRIBUTE_NORETURN __attribute__((noreturn))
+#elif defined(_MSC_VER)
+#define ABSL_ATTRIBUTE_NORETURN __declspec(noreturn)
+#else
+#define ABSL_ATTRIBUTE_NORETURN
+#endif
+
+#if defined(ABSL_HAVE_ADDRESS_SANITIZER) && \
+    ABSL_HAVE_ATTRIBUTE(no_sanitize_address)
+#define ABSL_ATTRIBUTE_NO_SANITIZE_ADDRESS __attribute__((no_sanitize_address))
+#elif defined(ABSL_HAVE_ADDRESS_SANITIZER) && defined(_MSC_VER) && \
+    _MSC_VER >= 1928
+#define ABSL_ATTRIBUTE_NO_SANITIZE_ADDRESS __declspec(no_sanitize_address)
+#elif defined(ABSL_HAVE_HWADDRESS_SANITIZER) && ABSL_HAVE_ATTRIBUTE(no_sanitize)
+#define ABSL_ATTRIBUTE_NO_SANITIZE_ADDRESS \
+  __attribute__((no_sanitize("hwaddress")))
+#else
+#define ABSL_ATTRIBUTE_NO_SANITIZE_ADDRESS
+#endif
+
+#if ABSL_HAVE_ATTRIBUTE(no_sanitize_memory)
+#define ABSL_ATTRIBUTE_NO_SANITIZE_MEMORY __attribute__((no_sanitize_memory))
+#else
+#define ABSL_ATTRIBUTE_NO_SANITIZE_MEMORY
+#endif
+
+#if ABSL_HAVE_ATTRIBUTE(no_sanitize_thread)
+#define ABSL_ATTRIBUTE_NO_SANITIZE_THREAD __attribute__((no_sanitize_thread))
+#else
+#define ABSL_ATTRIBUTE_NO_SANITIZE_THREAD
+#endif
+
+#if ABSL_HAVE_ATTRIBUTE(no_sanitize_undefined)
+#define ABSL_ATTRIBUTE_NO_SANITIZE_UNDEFINED \
+  __attribute__((no_sanitize_undefined))
+#elif ABSL_HAVE_ATTRIBUTE(no_sanitize)
+#define ABSL_ATTRIBUTE_NO_SANITIZE_UNDEFINED \
+  __attribute__((no_sanitize("undefined")))
+#else
+#define ABSL_ATTRIBUTE_NO_SANITIZE_UNDEFINED
+#endif
+
+#if ABSL_HAVE_ATTRIBUTE(no_sanitize) && defined(__llvm__)
+#define ABSL_ATTRIBUTE_NO_SANITIZE_CFI __attribute__((no_sanitize("cfi")))
+#else
+#define ABSL_ATTRIBUTE_NO_SANITIZE_CFI
+#endif
+
+#if ABSL_HAVE_ATTRIBUTE(no_sanitize)
+#define ABSL_ATTRIBUTE_NO_SANITIZE_SAFESTACK \
+  __attribute__((no_sanitize("safe-stack")))
+#else
+#define ABSL_ATTRIBUTE_NO_SANITIZE_SAFESTACK
+#endif
+
+#if ABSL_HAVE_ATTRIBUTE(returns_nonnull)
+#define ABSL_ATTRIBUTE_RETURNS_NONNULL __attribute__((returns_nonnull))
+#else
+#define ABSL_ATTRIBUTE_RETURNS_NONNULL
+#endif
+
+#if defined(ABSL_HAVE_ATTRIBUTE_SECTION)
+#error ABSL_HAVE_ATTRIBUTE_SECTION cannot be directly set
+#elif (ABSL_HAVE_ATTRIBUTE(section) ||                \
+       (defined(__GNUC__) && !defined(__clang__))) && \
+    !0 && ABSL_HAVE_ATTRIBUTE_WEAK
+#define ABSL_HAVE_ATTRIBUTE_SECTION 1
+
+#if !defined(ABSL_ATTRIBUTE_SECTION)
+#define ABSL_ATTRIBUTE_SECTION(name) \
+  __attribute__((section(#name))) __attribute__((noinline))
+#endif
+
+#if !defined(ABSL_ATTRIBUTE_SECTION_VARIABLE)
+#define ABSL_ATTRIBUTE_SECTION_VARIABLE(name) __attribute__((section(#name)))
+#endif
+
+#if !defined(ABSL_DECLARE_ATTRIBUTE_SECTION_VARS)
+#define ABSL_DECLARE_ATTRIBUTE_SECTION_VARS(name)   \
+  extern char __start_##name[] ABSL_ATTRIBUTE_WEAK; \
+  extern char __stop_##name[] ABSL_ATTRIBUTE_WEAK
+#endif
+#if !defined(ABSL_DEFINE_ATTRIBUTE_SECTION_VARS)
+#define ABSL_INIT_ATTRIBUTE_SECTION_VARS(name)
+#define ABSL_DEFINE_ATTRIBUTE_SECTION_VARS(name)
+#endif
+
+#define ABSL_ATTRIBUTE_SECTION_START(name) \
+  (reinterpret_cast<void *>(__start_##name))
+#define ABSL_ATTRIBUTE_SECTION_STOP(name) \
+  (reinterpret_cast<void *>(__stop_##name))
+
+#else
+
+#define ABSL_HAVE_ATTRIBUTE_SECTION 0
+
+#define ABSL_ATTRIBUTE_SECTION(name)
+#define ABSL_ATTRIBUTE_SECTION_VARIABLE(name)
+#define ABSL_INIT_ATTRIBUTE_SECTION_VARS(name)
+#define ABSL_DEFINE_ATTRIBUTE_SECTION_VARS(name)
+#define ABSL_DECLARE_ATTRIBUTE_SECTION_VARS(name)
+#define ABSL_ATTRIBUTE_SECTION_START(name) (reinterpret_cast<void *>(0))
+#define ABSL_ATTRIBUTE_SECTION_STOP(name) (reinterpret_cast<void *>(0))
+
+#endif
+
+#if ABSL_HAVE_ATTRIBUTE(force_align_arg_pointer) || \
+    (defined(__GNUC__) && !defined(__clang__))
+#if defined(__i386__)
+#define ABSL_ATTRIBUTE_STACK_ALIGN_FOR_OLD_LIBC \
+  __attribute__((force_align_arg_pointer))
+#define ABSL_REQUIRE_STACK_ALIGN_TRAMPOLINE (0)
+#elif defined(__x86_64__)
+#define ABSL_REQUIRE_STACK_ALIGN_TRAMPOLINE (1)
+#define ABSL_ATTRIBUTE_STACK_ALIGN_FOR_OLD_LIBC
+#else
+#define ABSL_REQUIRE_STACK_ALIGN_TRAMPOLINE (0)
+#define ABSL_ATTRIBUTE_STACK_ALIGN_FOR_OLD_LIBC
+#endif
+#else
+#define ABSL_ATTRIBUTE_STACK_ALIGN_FOR_OLD_LIBC
+#define ABSL_REQUIRE_STACK_ALIGN_TRAMPOLINE (0)
+#endif
+
+#if defined(__clang__) && ABSL_HAVE_ATTRIBUTE(warn_unused_result)
+#define ABSL_MUST_USE_RESULT __attribute__((warn_unused_result))
+#else
+#define ABSL_MUST_USE_RESULT
+#endif
+
+#if ABSL_HAVE_ATTRIBUTE(hot) || (defined(__GNUC__) && !defined(__clang__))
+#define ABSL_ATTRIBUTE_HOT __attribute__((hot))
+#else
+#define ABSL_ATTRIBUTE_HOT
+#endif
+
+#if ABSL_HAVE_ATTRIBUTE(cold) || (defined(__GNUC__) && !defined(__clang__))
+#define ABSL_ATTRIBUTE_COLD __attribute__((cold))
+#else
+#define ABSL_ATTRIBUTE_COLD
+#endif
+
+#if ABSL_HAVE_CPP_ATTRIBUTE(clang::xray_always_instrument) && \
+    !defined(ABSL_NO_XRAY_ATTRIBUTES) && !0
+#define ABSL_XRAY_ALWAYS_INSTRUMENT [[clang::xray_always_instrument]]
+#define ABSL_XRAY_NEVER_INSTRUMENT [[clang::xray_never_instrument]]
+#if ABSL_HAVE_CPP_ATTRIBUTE(clang::xray_log_args)
+#define ABSL_XRAY_LOG_ARGS(N) \
+  [[clang::xray_always_instrument, clang::xray_log_args(N)]]
+#else
+#define ABSL_XRAY_LOG_ARGS(N) [[clang::xray_always_instrument]]
+#endif
+#else
+#define ABSL_XRAY_ALWAYS_INSTRUMENT
+#define ABSL_XRAY_NEVER_INSTRUMENT
+#define ABSL_XRAY_LOG_ARGS(N)
+#endif
+
+// The clang-tidy check bugprone-use-after-move allows member functions of types
+#if ABSL_HAVE_CPP_ATTRIBUTE(clang::annotate) && defined(__clang__) && \
+    __clang_major__ >= 12
+#define ABSL_ATTRIBUTE_NULL_AFTER_MOVE                       \
+  [[clang::annotate("clang-tidy", "bugprone-use-after-move", \
+                    "null_after_move")]]
+#else
+#define ABSL_ATTRIBUTE_NULL_AFTER_MOVE
+#endif
+
+// The clang-tidy check bugprone-use-after-move allows member functions marked
+#if ABSL_HAVE_CPP_ATTRIBUTE(clang::reinitializes)
+#define ABSL_ATTRIBUTE_REINITIALIZES [[clang::reinitializes]]
+#else
+#define ABSL_ATTRIBUTE_REINITIALIZES
+#endif
+
+
+#if ABSL_HAVE_ATTRIBUTE(unused) || (defined(__GNUC__) && !defined(__clang__))
+#undef ABSL_ATTRIBUTE_UNUSED
+#define ABSL_ATTRIBUTE_UNUSED __attribute__((__unused__))
+#else
+#define ABSL_ATTRIBUTE_UNUSED
+#endif
+
+#if ABSL_HAVE_ATTRIBUTE(tls_model) || (defined(__GNUC__) && !defined(__clang__))
+#define ABSL_ATTRIBUTE_INITIAL_EXEC __attribute__((tls_model("initial-exec")))
+#else
+#define ABSL_ATTRIBUTE_INITIAL_EXEC
+#endif
+
+#if ABSL_HAVE_ATTRIBUTE(packed) || (defined(__GNUC__) && !defined(__clang__))
+#define ABSL_ATTRIBUTE_PACKED __attribute__((__packed__))
+#else
+#define ABSL_ATTRIBUTE_PACKED
+#endif
+
+#if ABSL_HAVE_ATTRIBUTE(aligned) || (defined(__GNUC__) && !defined(__clang__))
+#define ABSL_ATTRIBUTE_FUNC_ALIGN(bytes) __attribute__((aligned(bytes)))
+#else
+#define ABSL_ATTRIBUTE_FUNC_ALIGN(bytes)
+#endif
+
+// ABSL_FALLTHROUGH_INTENDED
+// indicate intentional fallthrough and turn off warnings about any lack of a
+// `break` statement. The ABSL_FALLTHROUGH_INTENDED macro should be followed by
+//        ABSL_FALLTHROUGH_INTENDED;  // Use instead of/along with annotations
+// with unannotated fallthrough using the warning `-Wimplicit-fallthrough`. See
+// https://clang.llvm.org/docs/AttributeReference.html#fallthrough-clang-fallthrough
+// When used with unsupported compilers, the ABSL_FALLTHROUGH_INTENDED macro has
+
+#if defined(ABSL_FALLTHROUGH_INTENDED)
+#error "ABSL_FALLTHROUGH_INTENDED should not be defined."
+#elif ABSL_HAVE_CPP_ATTRIBUTE(fallthrough)
+#define ABSL_FALLTHROUGH_INTENDED [[fallthrough]]
+#elif ABSL_HAVE_CPP_ATTRIBUTE(clang::fallthrough)
+#define ABSL_FALLTHROUGH_INTENDED [[clang::fallthrough]]
+#elif ABSL_HAVE_CPP_ATTRIBUTE(gnu::fallthrough)
+#define ABSL_FALLTHROUGH_INTENDED [[gnu::fallthrough]]
+#else
+#define ABSL_FALLTHROUGH_INTENDED \
+  do {                            \
+  } while (0)
+#endif
+
+// turns this warning off by default, instead relying on clang-tidy to report
+#if ABSL_HAVE_ATTRIBUTE(deprecated)
+#define ABSL_DEPRECATED(message) __attribute__((deprecated(message)))
+#else
+#define ABSL_DEPRECATED(message)
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#define ABSL_INTERNAL_DISABLE_DEPRECATED_DECLARATION_WARNING \
+  _Pragma("GCC diagnostic push")             \
+  _Pragma("GCC diagnostic ignored \"-Wdeprecated-declarations\"")
+#define ABSL_INTERNAL_RESTORE_DEPRECATED_DECLARATION_WARNING \
+  _Pragma("GCC diagnostic pop")
+#elif defined(_MSC_VER)
+#define ABSL_INTERNAL_DISABLE_DEPRECATED_DECLARATION_WARNING \
+  _Pragma("warning(push)") _Pragma("warning(disable: 4996)")
+#define ABSL_INTERNAL_RESTORE_DEPRECATED_DECLARATION_WARNING \
+  _Pragma("warning(pop)")
+#else
+#define ABSL_INTERNAL_DISABLE_DEPRECATED_DECLARATION_WARNING
+#define ABSL_INTERNAL_RESTORE_DEPRECATED_DECLARATION_WARNING
+#endif
+
+// Do NOT attempt to suppress or demote the error generated by this attribute.
+#if defined(__cplusplus)
+#if ABSL_HAVE_CPP_ATTRIBUTE(clang::require_explicit_initialization)
+// clang-format off
+#define ABSL_REQUIRE_EXPLICIT_INIT \
+  [[clang::require_explicit_initialization]] = \
+    AbslInternal_YouForgotToExplicitlyInitializeAField::v
+#else
+#define ABSL_REQUIRE_EXPLICIT_INIT \
+  = AbslInternal_YouForgotToExplicitlyInitializeAField::v
+#endif
+// clang-format on
+#else
+// clang-format off
+#if ABSL_HAVE_ATTRIBUTE(require_explicit_initialization)
+#define ABSL_REQUIRE_EXPLICIT_INIT \
+  __attribute__((require_explicit_initialization))
+#else
+#define ABSL_REQUIRE_EXPLICIT_INIT \
+  /* No portable fallback for C is available */
+#endif
+// clang-format on
+#endif
+
+#if defined(__cplusplus)
+struct AbslInternal_YouForgotToExplicitlyInitializeAField {
+  template <class T>
+#if !defined(SWIG)
+  constexpr
+#endif
+  operator T() const /* NOLINT */ {
+    const void *volatile deliberately_volatile_ptr = nullptr;
+    for (;;) {
+      deliberately_volatile_ptr = this;  
+      (void)deliberately_volatile_ptr;
+    }
+  }
+  static AbslInternal_YouForgotToExplicitlyInitializeAField v;
+};
+#endif
+
+#if defined(__cpp_constinit) && __cpp_constinit >= 201907L
+#define ABSL_CONST_INIT constinit
+#elif ABSL_HAVE_CPP_ATTRIBUTE(clang::require_constant_initialization)
+#define ABSL_CONST_INIT [[clang::require_constant_initialization]]
+#else
+#define ABSL_CONST_INIT
+#endif
+
+#if ABSL_HAVE_CPP_ATTRIBUTE(gnu::pure)
+#define ABSL_ATTRIBUTE_PURE_FUNCTION [[gnu::pure]]
+#elif ABSL_HAVE_ATTRIBUTE(pure)
+#define ABSL_ATTRIBUTE_PURE_FUNCTION __attribute__((pure))
+#else
+#define ABSL_ATTRIBUTE_PURE_FUNCTION ABSL_MUST_USE_RESULT
+#endif
+
+#if defined(_MSC_VER) && !defined(__clang__)
+#define ABSL_ATTRIBUTE_CONST_FUNCTION ABSL_ATTRIBUTE_PURE_FUNCTION
+#elif ABSL_HAVE_CPP_ATTRIBUTE(gnu::const)
+#define ABSL_ATTRIBUTE_CONST_FUNCTION [[gnu::const]]
+#elif ABSL_HAVE_ATTRIBUTE(const)
+#define ABSL_ATTRIBUTE_CONST_FUNCTION __attribute__((const))
+#else
+#define ABSL_ATTRIBUTE_CONST_FUNCTION ABSL_ATTRIBUTE_PURE_FUNCTION
+#endif
+
+#if ABSL_HAVE_CPP_ATTRIBUTE(clang::lifetimebound)
+#define ABSL_ATTRIBUTE_LIFETIME_BOUND [[clang::lifetimebound]]
+#elif ABSL_HAVE_CPP_ATTRIBUTE(msvc::lifetimebound)
+#define ABSL_ATTRIBUTE_LIFETIME_BOUND [[msvc::lifetimebound]]
+#elif ABSL_HAVE_ATTRIBUTE(lifetimebound)
+#define ABSL_ATTRIBUTE_LIFETIME_BOUND __attribute__((lifetimebound))
+#else
+#define ABSL_ATTRIBUTE_LIFETIME_BOUND
+#endif
+
+#if ABSL_HAVE_CPP_ATTRIBUTE(clang::lifetime_capture_by)
+#define ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(Owner) \
+  [[clang::lifetime_capture_by(Owner)]]
+#else
+#define ABSL_INTERNAL_ATTRIBUTE_CAPTURED_BY(Owner)
+#endif
+
+#if ABSL_HAVE_CPP_ATTRIBUTE(gsl::Pointer) && \
+    (!defined(__clang_major__) || __clang_major__ >= 13)
+#define ABSL_ATTRIBUTE_VIEW [[gsl::Pointer]]
+#else
+#define ABSL_ATTRIBUTE_VIEW
+#endif
+
+#if ABSL_HAVE_CPP_ATTRIBUTE(gsl::Owner) && \
+    (!defined(__clang_major__) || __clang_major__ >= 13)
+#define ABSL_ATTRIBUTE_OWNER [[gsl::Owner]]
+#else
+#define ABSL_ATTRIBUTE_OWNER
+#endif
+
+#define ABSL_ATTRIBUTE_TRIVIAL_ABI
+
+#if defined(_MSC_VER) && _MSC_VER >= 1929
+#define ABSL_ATTRIBUTE_NO_UNIQUE_ADDRESS [[msvc::no_unique_address]]
+#elif ABSL_HAVE_CPP_ATTRIBUTE(no_unique_address)
+#define ABSL_ATTRIBUTE_NO_UNIQUE_ADDRESS [[no_unique_address]]
+#else
+#define ABSL_ATTRIBUTE_NO_UNIQUE_ADDRESS
+#endif
+
+#if ABSL_HAVE_CPP_ATTRIBUTE(clang::uninitialized)
+#define ABSL_ATTRIBUTE_UNINITIALIZED [[clang::uninitialized]]
+#elif ABSL_HAVE_CPP_ATTRIBUTE(gnu::uninitialized)
+#define ABSL_ATTRIBUTE_UNINITIALIZED [[gnu::uninitialized]]
+#elif ABSL_HAVE_ATTRIBUTE(uninitialized)
+#define ABSL_ATTRIBUTE_UNINITIALIZED __attribute__((uninitialized))
+#else
+#define ABSL_ATTRIBUTE_UNINITIALIZED
+#endif
+
+#if ABSL_HAVE_CPP_ATTRIBUTE(gnu::warn_unused)
+#define ABSL_ATTRIBUTE_WARN_UNUSED [[gnu::warn_unused]]
+#else
+#define ABSL_ATTRIBUTE_WARN_UNUSED
+#endif
+
+#endif

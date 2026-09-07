@@ -1,0 +1,1066 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsTimerImpl.h"
+#include "TimerThread.h"
+#include "nsThreadUtils.h"
+
+#include "nsIObserverService.h"
+#include "nsIPropertyBag2.h"
+#include "mozilla/Services.h"
+#include "mozilla/ChaosMode.h"
+#include "mozilla/ArenaAllocator.h"
+#include "mozilla/OperatorNewExtensions.h"
+#include "mozilla/StaticPrefs_timer.h"
+
+
+#include <bit>
+
+using namespace mozilla;
+
+
+#if defined(TIMERS_RUNTIME_STATS)
+class StaticTimersStats {
+ public:
+  explicit StaticTimersStats(const char* aName) : mName(aName) {}
+
+  ~StaticTimersStats() {
+    using ULL = unsigned long long;
+    ULL n = static_cast<ULL>(mCount);
+    if (n == 0) {
+      printf("Timers stats `%s`: (nothing)\n", mName);
+    } else if (ULL sumNs = static_cast<ULL>(mSumDurationsNs); sumNs == 0) {
+      printf("Timers stats `%s`: %llu\n", mName, n);
+    } else {
+      printf("Timers stats `%s`: %llu ns / %llu = %llu ns, max %llu ns\n",
+             mName, sumNs, n, sumNs / n,
+             static_cast<ULL>(mLongestDurationNs));
+    }
+  }
+
+  void AddDurationFrom(TimeStamp aStart) {
+    DurationNs duration = static_cast<DurationNs>(
+        (TimeStamp::Now() - aStart).ToMicroseconds() * 1000 + 0.5);
+    mSumDurationsNs += duration;
+    ++mCount;
+    for (;;) {
+      DurationNs longest = mLongestDurationNs;
+      if (MOZ_LIKELY(longest >= duration)) {
+        break;
+      }
+      if (MOZ_LIKELY(mLongestDurationNs.compareExchange(longest, duration))) {
+        break;
+      }
+    }
+  }
+
+  void AddCount() {
+    MOZ_ASSERT(mSumDurationsNs == 0, "Don't mix counts and durations");
+    ++mCount;
+  }
+
+ private:
+  using DurationNs = uint64_t;
+  using Count = uint32_t;
+
+  Atomic<DurationNs> mSumDurationsNs{0};
+  Atomic<DurationNs> mLongestDurationNs{0};
+  Atomic<Count> mCount{0};
+  const char* mName;
+};
+
+class MOZ_RAII AutoTimersStats {
+ public:
+  explicit AutoTimersStats(StaticTimersStats& aStats)
+      : mStats(aStats), mStart(TimeStamp::Now()) {}
+
+  ~AutoTimersStats() { mStats.AddDurationFrom(mStart); }
+
+ private:
+  StaticTimersStats& mStats;
+  TimeStamp mStart;
+};
+
+#  define AUTO_TIMERS_STATS(name)                  \
+    static ::StaticTimersStats sStat##name(#name); \
+    ::AutoTimersStats autoStat##name(sStat##name);
+
+#  define COUNT_TIMERS_STATS(name)                 \
+    static ::StaticTimersStats sStat##name(#name); \
+    sStat##name.AddCount();
+
+#else
+
+#  define AUTO_TIMERS_STATS(name)
+#  define COUNT_TIMERS_STATS(name)
+
+#endif
+
+NS_IMPL_ISUPPORTS_INHERITED(TimerThread, Runnable, nsIObserver)
+
+TimerThread::TimerThread()
+    : Runnable("TimerThread"),
+      mInitialized(false),
+      mMonitor("TimerThread.mMonitor"),
+      mShutdown(false),
+      mWaiting(false),
+      mNotified(false),
+      mSleeping(false),
+      mAllowedEarlyFiringMicroseconds(0) {}
+
+TimerThread::~TimerThread() {
+  mThread = nullptr;
+
+  NS_ASSERTION(mTimers.IsEmpty(), "Timers remain in TimerThread::~TimerThread");
+
+#if TIMER_THREAD_STATISTICS
+  {
+    TimerThreadMonitorAutoLock lock(mMonitor);
+    PrintStatistics();
+  }
+#endif
+}
+
+namespace {
+
+class TimerObserverRunnable : public Runnable {
+ public:
+  explicit TimerObserverRunnable(nsIObserver* aObserver)
+      : mozilla::Runnable("TimerObserverRunnable"), mObserver(aObserver) {}
+
+  NS_DECL_NSIRUNNABLE
+
+ private:
+  nsCOMPtr<nsIObserver> mObserver;
+};
+
+NS_IMETHODIMP
+TimerObserverRunnable::Run() {
+  nsCOMPtr<nsIObserverService> observerService =
+      mozilla::services::GetObserverService();
+  if (observerService) {
+    observerService->AddObserver(mObserver, "sleep_notification", false);
+    observerService->AddObserver(mObserver, "wake_notification", false);
+    observerService->AddObserver(mObserver, "suspend_process_notification",
+                                 false);
+    observerService->AddObserver(mObserver, "resume_process_notification",
+                                 false);
+  }
+  return NS_OK;
+}
+
+}  
+
+namespace {
+
+
+class TimerEventAllocator {
+ private:
+  struct FreeEntry {
+    FreeEntry* mNext;
+  };
+
+  ArenaAllocator<4096> mPool MOZ_GUARDED_BY(mMonitor);
+  FreeEntry* mFirstFree MOZ_GUARDED_BY(mMonitor);
+  mozilla::Monitor mMonitor;
+
+ public:
+  TimerEventAllocator()
+      : mFirstFree(nullptr), mMonitor("TimerEventAllocator") {}
+
+  ~TimerEventAllocator() = default;
+
+  void* Alloc(size_t aSize);
+  void Free(void* aPtr);
+};
+
+}  
+
+class nsTimerEvent final : public CancelableRunnable {
+ public:
+  NS_IMETHOD Run() override;
+
+  nsresult Cancel() override {
+    mTimer->Cancel();
+    return NS_OK;
+  }
+
+#if defined(MOZ_COLLECTING_RUNNABLE_TELEMETRY)
+  NS_IMETHOD GetName(nsACString& aName) override;
+#endif
+
+  explicit nsTimerEvent(already_AddRefed<nsTimerImpl> aTimer,
+                        uint64_t aTimerSeq)
+      : mozilla::CancelableRunnable("nsTimerEvent"),
+        mTimer(aTimer),
+        mTimerSeq(aTimerSeq) {
+
+    AddAllocatorRef();
+
+    if (MOZ_LOG_TEST(GetTimerLog(), LogLevel::Debug)) {
+      mInitTime = TimeStamp::Now();
+    }
+  }
+
+  static void Init();
+  static void Shutdown();
+
+  static void* operator new(size_t aSize) noexcept(true) {
+    return sAllocator->Alloc(aSize);
+  }
+  void operator delete(void* aPtr) {
+    sAllocator->Free(aPtr);
+    ReleaseAllocatorRef();
+  }
+
+  already_AddRefed<nsTimerImpl> ForgetTimer() { return mTimer.forget(); }
+
+  nsTimerEvent(const nsTimerEvent&) = delete;
+  nsTimerEvent& operator=(const nsTimerEvent&) = delete;
+  nsTimerEvent& operator=(const nsTimerEvent&&) = delete;
+
+ private:
+  ~nsTimerEvent() = default;
+
+  static void AddAllocatorRef() { ++sAllocatorRefs; }
+  static void ReleaseAllocatorRef() {
+    nsrefcnt count = --sAllocatorRefs;
+    if (count == 0) {
+      delete sAllocator;
+      sAllocator = nullptr;
+    }
+  }
+
+  TimeStamp mInitTime;
+  RefPtr<nsTimerImpl> mTimer;
+  const uint64_t mTimerSeq;
+  static TimerEventAllocator* sAllocator;
+  static ThreadSafeAutoRefCnt sAllocatorRefs;
+};
+
+TimerEventAllocator* nsTimerEvent::sAllocator = nullptr;
+ThreadSafeAutoRefCnt nsTimerEvent::sAllocatorRefs;
+
+namespace {
+
+void* TimerEventAllocator::Alloc(size_t aSize) {
+  MOZ_ASSERT(aSize == sizeof(nsTimerEvent));
+
+  mozilla::MonitorAutoLock lock(mMonitor);
+
+  void* p;
+  if (mFirstFree) {
+    p = mFirstFree;
+    mFirstFree = mFirstFree->mNext;
+  } else {
+    p = mPool.Allocate(aSize, fallible);
+  }
+
+  return p;
+}
+
+void TimerEventAllocator::Free(void* aPtr) {
+  mozilla::MonitorAutoLock lock(mMonitor);
+
+  FreeEntry* entry = reinterpret_cast<FreeEntry*>(aPtr);
+
+  entry->mNext = mFirstFree;
+  mFirstFree = entry;
+}
+
+}  
+
+void nsTimerEvent::Init() {
+  sAllocator = new TimerEventAllocator();
+  AddAllocatorRef();  
+}
+
+void nsTimerEvent::Shutdown() {
+  ReleaseAllocatorRef();  
+}
+
+#if defined(MOZ_COLLECTING_RUNNABLE_TELEMETRY)
+NS_IMETHODIMP
+nsTimerEvent::GetName(nsACString& aName) {
+  bool current;
+  MOZ_RELEASE_ASSERT(
+      NS_SUCCEEDED(mTimer->mEventTarget->IsOnCurrentThread(&current)) &&
+      current);
+
+  mTimer->GetName(aName);
+  return NS_OK;
+}
+#endif
+
+NS_IMETHODIMP
+nsTimerEvent::Run() {
+  if (MOZ_LOG_TEST(GetTimerLog(), LogLevel::Debug)) {
+    TimeStamp now = TimeStamp::Now();
+    MOZ_LOG(GetTimerLog(), LogLevel::Debug,
+            ("[this=%p] time between PostTimerEvent() and Fire(): %fms\n", this,
+             (now - mInitTime).ToMilliseconds()));
+  }
+
+  mTimer->Fire(mTimerSeq);
+
+  return NS_OK;
+}
+
+nsresult TimerThread::Init() {
+  mMonitor.AssertCurrentThreadOwns();
+  MOZ_LOG(GetTimerLog(), LogLevel::Debug,
+          ("TimerThread::Init [%d]\n", mInitialized));
+
+  if (!mInitialized) {
+    nsTimerEvent::Init();
+
+    nsresult rv =
+        NS_NewNamedThread("Timer", getter_AddRefs(mThread), this,
+                          {.stackSize = nsIThreadManager::DEFAULT_STACK_SIZE,
+                           .blockDispatch = true});
+    if (NS_FAILED(rv)) {
+      mThread = nullptr;
+    } else {
+      RefPtr r = MakeRefPtr<TimerObserverRunnable>(this);
+      if (NS_IsMainThread()) {
+        r->Run();
+      } else {
+        NS_DispatchToMainThread(r);
+      }
+    }
+
+    mInitialized = true;
+  }
+
+  if (!mThread) {
+    return NS_ERROR_FAILURE;
+  }
+
+  return NS_OK;
+}
+
+nsresult TimerThread::Shutdown() {
+  MOZ_LOG(GetTimerLog(), LogLevel::Debug, ("TimerThread::Shutdown begin\n"));
+
+  if (!mThread) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  nsTArray<Entry> timers;
+  {
+    TimerThreadMonitorAutoLock lock(mMonitor);
+
+    mShutdown = true;
+
+    if (mWaiting) {
+      mNotified = true;
+      mMonitor.Notify();
+    }
+
+    timers = std::move(mTimers);
+    MOZ_ASSERT(mTimers.IsEmpty());
+
+    for (auto& entry : timers) {
+      if (entry.mTimerImpl) {
+        entry.mTimerImpl->SetIsInTimerThread(false);
+      }
+    }
+  }
+
+  for (const auto& entry : timers) {
+    if (entry.mTimerImpl) {
+      entry.mTimerImpl->Cancel();
+    }
+  }
+
+  mThread->Shutdown();  
+
+  nsTimerEvent::Shutdown();
+
+  MOZ_LOG(GetTimerLog(), LogLevel::Debug, ("TimerThread::Shutdown end\n"));
+  return NS_OK;
+}
+
+namespace {
+
+struct MicrosecondsToInterval {
+  PRIntervalTime operator[](size_t aMs) const {
+    return PR_MicrosecondsToInterval(aMs);
+  }
+};
+
+struct IntervalComparator {
+  int operator()(PRIntervalTime aInterval) const {
+    return (0 < aInterval) ? -1 : 1;
+  }
+};
+
+}  
+
+TimerThread::WakeupTime TimerThread::ComputeWakeupTimeFromTimers() const {
+  mMonitor.AssertCurrentThreadOwns();
+
+  if (mTimers.IsEmpty()) {
+    return {{}, {}};
+  }
+
+  MOZ_ASSERT(mTimers[0].mTimerImpl);
+
+
+  const TimeDuration minTimerDelay = TimeDuration::FromMilliseconds(
+      StaticPrefs::timer_minimum_firing_delay_tolerance_ms());
+  const TimeDuration maxTimerDelay = TimeDuration::FromMilliseconds(
+      StaticPrefs::timer_maximum_firing_delay_tolerance_ms());
+
+  TimeStamp bundleWakeup = mTimers[0].mTimeout;
+
+  TimeStamp cutoffTime =
+      bundleWakeup + ComputeAcceptableFiringDelay(mTimers[0].mDelay,
+                                                  minTimerDelay, maxTimerDelay);
+
+  const size_t timerCount = mTimers.Length();
+  for (size_t entryIndex = 1; entryIndex < timerCount; ++entryIndex) {
+    const Entry& curEntry = mTimers[entryIndex];
+    const nsTimerImpl* curTimer = curEntry.mTimerImpl;
+    if (!curTimer) {
+      continue;
+    }
+
+    const TimeStamp curTimerDue = curEntry.mTimeout;
+    if (curTimerDue > cutoffTime) {
+      break;
+    }
+
+    bundleWakeup = curTimerDue;
+    const TimeDuration timerDelay = ComputeAcceptableFiringDelay(
+        curEntry.mDelay, minTimerDelay, maxTimerDelay);
+    cutoffTime = std::min(curTimerDue + timerDelay, cutoffTime);
+    MOZ_ASSERT(bundleWakeup <= cutoffTime);
+  }
+
+  MOZ_ASSERT(bundleWakeup - mTimers[0].mTimeout <=
+             ComputeAcceptableFiringDelay(mTimers[0].mDelay, minTimerDelay,
+                                          maxTimerDelay));
+
+  return {bundleWakeup, cutoffTime - bundleWakeup};
+}
+
+TimeDuration TimerThread::ComputeAcceptableFiringDelay(
+    TimeDuration timerDuration, TimeDuration minDelay,
+    TimeDuration maxDelay) const {
+  constexpr int64_t timerDurationDivider = 8;
+  static_assert(
+      std::has_single_bit(static_cast<uint64_t>(timerDurationDivider)));
+  const TimeDuration tmp = timerDuration / timerDurationDivider;
+  return std::clamp(tmp, minDelay, maxDelay);
+}
+
+uint64_t TimerThread::FireDueTimers(TimeDuration aAllowedEarlyFiring) {
+  RemoveLeadingCanceledTimersInternal();
+
+  uint64_t timersFired = 0;
+  TimeStamp lastNow = TimeStamp::Now();
+
+  while (!mTimers.IsEmpty()) {
+    Entry& frontEntry = mTimers[0];
+    MOZ_ASSERT(frontEntry.IsTimerInThreadAndUnchanged());
+
+    if (lastNow + aAllowedEarlyFiring < frontEntry.mTimeout) {
+      lastNow = TimeStamp::Now();
+      if (lastNow + aAllowedEarlyFiring < frontEntry.mTimeout) {
+        break;
+      }
+    }
+
+    {
+      ++timersFired;
+      LogTimerEvent::Run run(frontEntry.mTimerImpl.get());
+      PostTimerEvent(frontEntry);
+    }
+
+    if (mShutdown) {
+      break;
+    }
+
+    RemoveLeadingCanceledTimersInternal();
+  }
+
+  return timersFired;
+}
+
+class TelemetryQueue {
+ public:
+  TelemetryQueue() {
+    mQueuedTimersFiredPerWakeup.SetLengthAndRetainStorage(
+        kMaxQueuedTimersFired);
+  }
+
+  ~TelemetryQueue() {
+    if (mQueuedTimersFiredCount != 0) {
+      mQueuedTimersFiredPerWakeup.SetLengthAndRetainStorage(
+          mQueuedTimersFiredCount);
+
+    }
+  }
+
+  void AccumulateAndMaybeSendTelemetry(uint64_t timersFiredThisWakeup) {
+    mQueuedTimersFiredPerWakeup[mQueuedTimersFiredCount] =
+        timersFiredThisWakeup;
+    ++mQueuedTimersFiredCount;
+    if (mQueuedTimersFiredCount == kMaxQueuedTimersFired) {
+
+      mQueuedTimersFiredCount = 0;
+    }
+  }
+
+ private:
+  static constexpr size_t kMaxQueuedTimersFired = 128;
+  AutoTArray<uint64_t, kMaxQueuedTimersFired> mQueuedTimersFiredPerWakeup;
+  size_t mQueuedTimersFiredCount = 0;
+};
+
+void TimerThread::Wait(TimeDuration aWaitFor, TimeDuration aTolerance)
+    MOZ_REQUIRES(mMonitor) {
+  mWaiting = true;
+  mNotified = false;
+  {
+    mMonitor.Wait(aWaitFor);
+  }
+  mWaiting = false;
+}
+
+NS_IMETHODIMP
+TimerThread::Run() {
+  TimerThreadMonitorAutoLock lock(mMonitor);
+
+  mAllowedEarlyFiringMicroseconds = 250;
+  const TimeDuration normalAllowedEarlyFiring =
+      TimeDuration::FromMicroseconds(mAllowedEarlyFiringMicroseconds);
+
+  TelemetryQueue telemetryQueue;
+
+  while (!mShutdown) {
+    const bool chaosModeActive =
+        ChaosMode::isActive(ChaosFeature::TimerScheduling);
+
+    TimeDuration waitFor, waitTolerance;
+    if (!mSleeping) {
+      const TimeDuration allowedEarlyFiring =
+          !chaosModeActive
+              ? normalAllowedEarlyFiring
+              : TimeDuration::FromMicroseconds(ChaosMode::randomUint32LessThan(
+                    4 * mAllowedEarlyFiringMicroseconds));
+
+      const TimeDuration chaosWaitDelay =
+          !chaosModeActive ? TimeDuration::Zero()
+                           : TimeDuration::FromMicroseconds(
+                                 ChaosMode::randomInt32InRange(-10000, 10000));
+
+      const uint64_t timersFiredThisWakeup = FireDueTimers(allowedEarlyFiring);
+
+      if (mShutdown) {
+        break;
+      }
+
+      const auto [wakeupTime, wakeupTolerance] = ComputeWakeupTimeFromTimers();
+      mIntendedWakeupTime = wakeupTime;
+      waitTolerance = wakeupTolerance;
+
+      telemetryQueue.AccumulateAndMaybeSendTelemetry(timersFiredThisWakeup);
+
+#if TIMER_THREAD_STATISTICS
+      CollectTimersFiredStatistics(timersFiredThisWakeup);
+#endif
+
+      const TimeStamp now = TimeStamp::Now();
+      waitFor = !wakeupTime.IsNull()
+                    ? std::max(TimeDuration::Zero(),
+                               wakeupTime + chaosWaitDelay - now)
+                    : TimeDuration::Forever();
+
+      if (MOZ_LOG_TEST(GetTimerLog(), LogLevel::Debug)) {
+        if (waitFor == TimeDuration::Forever())
+          MOZ_LOG(GetTimerLog(), LogLevel::Debug, ("waiting forever\n"));
+        else
+          MOZ_LOG(GetTimerLog(), LogLevel::Debug,
+                  ("waiting for %f\n", waitFor.ToMilliseconds()));
+      }
+    } else {
+      mIntendedWakeupTime = TimeStamp{};
+      uint32_t milliseconds = 100;
+      if (chaosModeActive) {
+        milliseconds = ChaosMode::randomUint32LessThan(200);
+      }
+      waitFor = TimeDuration::FromMilliseconds(milliseconds);
+
+      static constexpr double sWaitToleranceWhenSleeping_ms = 32.0;
+      waitTolerance =
+          TimeDuration::FromMilliseconds(sWaitToleranceWhenSleeping_ms);
+    }
+
+    Wait(waitFor, waitTolerance);
+
+#if TIMER_THREAD_STATISTICS
+    CollectWakeupStatistics();
+#endif
+  }
+
+  return NS_OK;
+}
+
+nsresult TimerThread::AddTimer(nsTimerImpl* aTimer,
+                               const MutexAutoLock& aProofOfLock) {
+  TimerThreadMonitorAutoLock lock(mMonitor);
+  AUTO_TIMERS_STATS(TimerThread_AddTimer);
+
+  if (mShutdown) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  if (!aTimer->mEventTarget) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  nsresult rv = Init();
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  const TimeDuration minTimerDelay = TimeDuration::FromMilliseconds(
+      StaticPrefs::timer_minimum_firing_delay_tolerance_ms());
+  const TimeDuration maxTimerDelay = TimeDuration::FromMilliseconds(
+      StaticPrefs::timer_maximum_firing_delay_tolerance_ms());
+  const TimeDuration firingDelay = ComputeAcceptableFiringDelay(
+      aTimer->mDelay, minTimerDelay, maxTimerDelay);
+  const bool firingBeforeNextWakeup =
+      mIntendedWakeupTime.IsNull() ||
+      (aTimer->mTimeout + firingDelay < mIntendedWakeupTime);
+  const bool wakeUpTimerThread =
+      mWaiting && (firingBeforeNextWakeup || aTimer->mDelay.IsZero());
+
+#if TIMER_THREAD_STATISTICS
+  if (mTotalTimersAdded == 0) {
+    mFirstTimerAdded = TimeStamp::Now();
+  }
+  ++mTotalTimersAdded;
+#endif
+
+  MOZ_ASSERT(!aTimer->IsInTimerThread());
+
+  AddTimerInternal(*aTimer);
+  aTimer->SetIsInTimerThread(true);
+
+  if (wakeUpTimerThread) {
+    mNotified = true;
+    mMonitor.Notify();
+  }
+
+  return NS_OK;
+}
+
+nsresult TimerThread::RemoveTimer(nsTimerImpl* aTimer,
+                                  const MutexAutoLock& aProofOfLock) {
+  TimerThreadMonitorAutoLock lock(mMonitor);
+  AUTO_TIMERS_STATS(TimerThread_RemoveTimer);
+
+
+  bool wasInThread = RemoveTimerInternal(*aTimer);
+  if (!wasInThread) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+  aTimer->SetIsInTimerThread(false);
+
+#if TIMER_THREAD_STATISTICS
+  ++mTotalTimersRemoved;
+#endif
+
+
+  return NS_OK;
+}
+
+TimeStamp TimerThread::FindNextFireTimeForCurrentThread(TimeStamp aDefault,
+                                                        uint32_t aSearchBound) {
+  TimerThreadMonitorAutoLock lock(mMonitor);
+  AUTO_TIMERS_STATS(TimerThread_FindNextFireTimeForCurrentThread);
+
+  for (const Entry& entry : mTimers) {
+    const nsTimerImpl* timer = entry.mTimerImpl;
+    if (timer) {
+      if (entry.mTimeout > aDefault) {
+        return aDefault;
+      }
+
+      if (!timer->IsLowPriority()) {
+        bool isOnCurrentThread = false;
+        nsresult rv =
+            timer->mEventTarget->IsOnCurrentThread(&isOnCurrentThread);
+        if (NS_SUCCEEDED(rv) && isOnCurrentThread) {
+          return entry.mTimeout;
+        }
+      }
+
+      if (aSearchBound == 0) {
+        TimeStamp fallbackDeadline =
+            TimeStamp::Now() + TimeDuration::FromMilliseconds(16);
+        return fallbackDeadline < aDefault ? fallbackDeadline : aDefault;
+      }
+
+      --aSearchBound;
+    }
+  }
+
+  return aDefault;
+}
+
+void TimerThread::AssertTimersSortedAndUnique() {
+  MOZ_ASSERT(std::is_sorted(mTimers.begin(), mTimers.end()),
+             "mTimers must be sorted.");
+  MOZ_ASSERT(
+      std::adjacent_find(mTimers.begin(), mTimers.end()) == mTimers.end(),
+      "mTimers must not contain duplicate entries.");
+}
+
+void TimerThread::AddTimerInternal(nsTimerImpl& aTimer) {
+  mMonitor.AssertCurrentThreadOwns();
+  aTimer.mMutex.AssertCurrentThreadOwns();
+  AUTO_TIMERS_STATS(TimerThread_AddTimerInternal);
+  LogTimerEvent::LogDispatch(&aTimer);
+
+  Entry toBeAdded{aTimer};
+  size_t insertAt = mTimers.IndexOfFirstElementGt(toBeAdded);
+
+  if (insertAt > 0 && !mTimers[insertAt - 1].mTimerImpl) {
+    AUTO_TIMERS_STATS(TimerThread_AddTimerInternal_ReuseBefore);
+    mTimers[insertAt - 1] = std::move(toBeAdded);
+    AssertTimersSortedAndUnique();
+    return;
+  }
+
+  bool usedEmptySlot = false;
+
+  if (insertAt < mTimers.Length()) {
+    AUTO_TIMERS_STATS(TimerThread_AddTimerInternal_ShiftAndFindEmptySlot);
+    Span<Entry> tail = Span{mTimers}.From(insertAt);
+    for (Entry& e : tail) {
+      if (!e.mTimerImpl) {
+        e = std::move(toBeAdded);
+        usedEmptySlot = true;
+        break;
+      }
+      std::swap(e, toBeAdded);
+    }
+  }
+
+  if (!usedEmptySlot) {
+    AUTO_TIMERS_STATS(TimerThread_AddTimerInternal_Expand);
+    mTimers.AppendElement(std::move(toBeAdded));
+  }
+
+  AssertTimersSortedAndUnique();
+}
+
+bool TimerThread::RemoveTimerInternal(nsTimerImpl& aTimer) {
+  mMonitor.AssertCurrentThreadOwns();
+  aTimer.mMutex.AssertCurrentThreadOwns();
+  AUTO_TIMERS_STATS(TimerThread_RemoveTimerInternal);
+  if (!aTimer.IsInTimerThread()) {
+    COUNT_TIMERS_STATS(TimerThread_RemoveTimerInternal_not_in_list);
+    return false;
+  }
+
+  size_t removeAt = mTimers.BinaryIndexOf(EntryKey{aTimer});
+  if (removeAt != nsTArray<Entry>::NoIndex) {
+    MOZ_ASSERT(mTimers[removeAt].mTimerImpl == &aTimer);
+    mTimers[removeAt].mTimerImpl = nullptr;
+    AssertTimersSortedAndUnique();
+    return true;
+  }
+
+  MOZ_ASSERT_UNREACHABLE("Not found in the list but it should be!?");
+  return false;
+}
+
+void TimerThread::RemoveLeadingCanceledTimersInternal() {
+  mMonitor.AssertCurrentThreadOwns();
+  AUTO_TIMERS_STATS(TimerThread_RemoveLeadingCanceledTimersInternal);
+
+  AssertTimersSortedAndUnique();
+
+  size_t toRemove = 0;
+  while (toRemove < mTimers.Length() && !mTimers[toRemove].mTimerImpl) {
+    ++toRemove;
+  }
+  mTimers.RemoveElementsAt(0, toRemove);
+}
+
+void TimerThread::PostTimerEvent(Entry& aPostMe) {
+  mMonitor.AssertCurrentThreadOwns();
+  AUTO_TIMERS_STATS(TimerThread_PostTimerEvent);
+
+  RefPtr<nsTimerImpl> timer(std::move(aPostMe.mTimerImpl));
+  timer->SetIsInTimerThread(false);
+
+#if TIMER_THREAD_STATISTICS
+  const double actualFiringDelay =
+      std::max((TimeStamp::Now() - timer->mTimeout).ToMilliseconds(), 0.0);
+  if (mNotified) {
+    ++mTotalTimersFiredNotified;
+    mTotalActualTimerFiringDelayNotified += actualFiringDelay;
+  } else {
+    ++mTotalTimersFiredUnnotified;
+    mTotalActualTimerFiringDelayUnnotified += actualFiringDelay;
+  }
+#endif
+
+  if (!timer->mEventTarget) {
+    NS_ERROR("Attempt to post timer event to NULL event target");
+    return;
+  }
+
+
+
+  void* p = nsTimerEvent::operator new(sizeof(nsTimerEvent));
+  if (!p) {
+    return;
+  }
+
+
+  nsCOMPtr<nsIEventTarget> lockedTargetPtr = timer->mEventTarget;
+  RefPtr<nsTimerEvent> lockedEventPtr =
+      ::new (KnownNotNull, p) nsTimerEvent(timer.forget(), aPostMe.mTimerSeq);
+  {
+    TimerThreadMonitorAutoUnlock unlock(mMonitor);
+    nsCOMPtr<nsIEventTarget> target = lockedTargetPtr.forget();
+    RefPtr<nsTimerEvent> event = lockedEventPtr.forget();
+    target->Dispatch(event.forget(), NS_DISPATCH_FALLIBLE);
+  }
+}
+
+void TimerThread::DoBeforeSleep() {
+  TimerThreadMonitorAutoLock lock(mMonitor);
+  mSleeping = true;
+}
+
+void TimerThread::DoAfterSleep() {
+  TimerThreadMonitorAutoLock lock(mMonitor);
+  mSleeping = false;
+
+  mNotified = true;
+  mMonitor.Notify();
+}
+
+NS_IMETHODIMP
+TimerThread::Observe(nsISupports* , const char* aTopic,
+                     const char16_t* ) {
+  if (StaticPrefs::timer_ignore_sleep_wake_notifications()) {
+    return NS_OK;
+  }
+
+  if (strcmp(aTopic, "sleep_notification") == 0 ||
+      strcmp(aTopic, "suspend_process_notification") == 0) {
+    DoBeforeSleep();
+  } else if (strcmp(aTopic, "wake_notification") == 0 ||
+             strcmp(aTopic, "resume_process_notification") == 0) {
+    DoAfterSleep();
+  }
+
+  return NS_OK;
+}
+
+uint32_t TimerThread::AllowedEarlyFiringMicroseconds() {
+  TimerThreadMonitorAutoLock lock(mMonitor);
+  return mAllowedEarlyFiringMicroseconds;
+}
+
+#if TIMER_THREAD_STATISTICS
+void TimerThread::CollectTimersFiredStatistics(uint64_t timersFiredThisWakeup) {
+  mMonitor.AssertCurrentThreadOwns();
+
+  size_t bucketIndex = 0;
+  while (bucketIndex < sTimersFiredPerWakeupBucketCount - 1 &&
+         timersFiredThisWakeup > sTimersFiredPerWakeupThresholds[bucketIndex]) {
+    ++bucketIndex;
+  }
+  MOZ_ASSERT(bucketIndex < sTimersFiredPerWakeupBucketCount);
+  ++mTimersFiredPerWakeup[bucketIndex];
+
+  ++mTotalWakeupCount;
+  if (mNotified) {
+    ++mTimersFiredPerNotifiedWakeup[bucketIndex];
+    ++mTotalNotifiedWakeupCount;
+  } else {
+    ++mTimersFiredPerUnnotifiedWakeup[bucketIndex];
+    ++mTotalUnnotifiedWakeupCount;
+  }
+}
+
+void TimerThread::CollectWakeupStatistics() {
+  mMonitor.AssertCurrentThreadOwns();
+
+  const TimeStamp now = TimeStamp::Now();
+  if (!mNotified && !mIntendedWakeupTime.IsNull() &&
+      now < mIntendedWakeupTime) {
+    ++mEarlyWakeups;
+    const double earlinessms = (mIntendedWakeupTime - now).ToMilliseconds();
+    mTotalEarlyWakeupTime += earlinessms;
+  }
+}
+
+void TimerThread::PrintStatistics() const {
+  mMonitor.AssertCurrentThreadOwns();
+
+  const TimeStamp freshNow = TimeStamp::Now();
+  const double timeElapsed = mFirstTimerAdded.IsNull()
+                                 ? 0.0
+                                 : (freshNow - mFirstTimerAdded).ToSeconds();
+  printf_stderr("TimerThread Stats (Total time %8.2fs)\n", timeElapsed);
+
+  printf_stderr("Added: %6llu Removed: %6llu Fired: %6llu\n", mTotalTimersAdded,
+                mTotalTimersRemoved,
+                mTotalTimersFiredNotified + mTotalTimersFiredUnnotified);
+
+  auto PrintTimersFiredBucket =
+      [](const AutoTArray<size_t, sTimersFiredPerWakeupBucketCount>& buckets,
+         const size_t wakeupCount, const size_t timersFiredCount,
+         const double totalTimerDelay, const char* label) {
+        printf_stderr("%s : [", label);
+        for (size_t bucketVal : buckets) {
+          printf_stderr(" %5llu", bucketVal);
+        }
+        printf_stderr(
+            " ] Wake-ups/timer %6llu / %6llu (%7.4f) Avg Timer Delay %7.4f\n",
+            wakeupCount, timersFiredCount,
+            static_cast<double>(wakeupCount) / timersFiredCount,
+            totalTimerDelay / timersFiredCount);
+      };
+
+  printf_stderr("Wake-ups:\n");
+  PrintTimersFiredBucket(
+      mTimersFiredPerWakeup, mTotalWakeupCount,
+      mTotalTimersFiredNotified + mTotalTimersFiredUnnotified,
+      mTotalActualTimerFiringDelayNotified +
+          mTotalActualTimerFiringDelayUnnotified,
+      "Total      ");
+  PrintTimersFiredBucket(mTimersFiredPerNotifiedWakeup,
+                         mTotalNotifiedWakeupCount, mTotalTimersFiredNotified,
+                         mTotalActualTimerFiringDelayNotified, "Notified   ");
+  PrintTimersFiredBucket(mTimersFiredPerUnnotifiedWakeup,
+                         mTotalUnnotifiedWakeupCount,
+                         mTotalTimersFiredUnnotified,
+                         mTotalActualTimerFiringDelayUnnotified, "Unnotified ");
+
+  printf_stderr("Early Wake-ups: %6llu Avg: %7.4fms\n", mEarlyWakeups,
+                mTotalEarlyWakeupTime / mEarlyWakeups);
+}
+#endif
+
+class nsReadOnlyTimer final : public nsITimer {
+ public:
+  explicit nsReadOnlyTimer(const nsACString& aName, uint32_t aDelay,
+                           uint32_t aType)
+      : mName(aName), mDelay(aDelay), mType(aType) {}
+  NS_DECL_ISUPPORTS
+
+  NS_IMETHOD Init(nsIObserver* aObserver, uint32_t aDelayInMs,
+                  uint32_t aType) override {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+  NS_IMETHOD InitWithCallback(nsITimerCallback* aCallback, uint32_t aDelayInMs,
+                              uint32_t aType) override {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+  NS_IMETHOD InitHighResolutionWithCallback(nsITimerCallback* aCallback,
+                                            const mozilla::TimeDuration& aDelay,
+                                            uint32_t aType) override {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+  NS_IMETHOD Cancel(void) override { return NS_ERROR_NOT_IMPLEMENTED; }
+  NS_IMETHOD InitWithNamedFuncCallback(nsTimerCallbackFunc aCallback,
+                                       void* aClosure, uint32_t aDelay,
+                                       uint32_t aType,
+                                       const nsACString& aName) override {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+  NS_IMETHOD InitHighResolutionWithNamedFuncCallback(
+      nsTimerCallbackFunc aCallback, void* aClosure,
+      const mozilla::TimeDuration& aDelay, uint32_t aType,
+      const nsACString& aName) override {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+
+  NS_IMETHOD GetName(nsACString& aName) override {
+    aName = mName;
+    return NS_OK;
+  }
+  NS_IMETHOD GetDelay(uint32_t* aDelay) override {
+    *aDelay = mDelay;
+    return NS_OK;
+  }
+  NS_IMETHOD SetDelay(uint32_t aDelay) override {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+  NS_IMETHOD GetType(uint32_t* aType) override {
+    *aType = mType;
+    return NS_OK;
+  }
+  NS_IMETHOD SetType(uint32_t aType) override {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+  NS_IMETHOD GetClosure(void** aClosure) override {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+  NS_IMETHOD GetCallback(nsITimerCallback** aCallback) override {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+  NS_IMETHOD GetTarget(nsIEventTarget** aTarget) override {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+  NS_IMETHOD SetTarget(nsIEventTarget* aTarget) override {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+  NS_IMETHOD GetAllowedEarlyFiringMicroseconds(
+      uint32_t* aAllowedEarlyFiringMicroseconds) override {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+  size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) override {
+    return sizeof(*this);
+  }
+
+ private:
+  nsCString mName;
+  uint32_t mDelay;
+  uint32_t mType;
+  ~nsReadOnlyTimer() = default;
+};
+
+NS_IMPL_ISUPPORTS(nsReadOnlyTimer, nsITimer)
+
+nsresult TimerThread::GetTimers(nsTArray<RefPtr<nsITimer>>& aRetVal) {
+  nsTArray<RefPtr<nsTimerImpl>> timers;
+  {
+    TimerThreadMonitorAutoLock lock(mMonitor);
+    for (const auto& entry : mTimers) {
+      nsTimerImpl* timer = entry.mTimerImpl;
+      if (!timer) {
+        continue;
+      }
+      timers.AppendElement(timer);
+    }
+  }
+
+  for (nsTimerImpl* timer : timers) {
+    nsAutoCString name;
+    timer->GetName(name);
+
+    uint32_t delay;
+    timer->GetDelay(&delay);
+
+    uint32_t type;
+    timer->GetType(&type);
+
+    aRetVal.AppendElement(new nsReadOnlyTimer(name, delay, type));
+  }
+
+  return NS_OK;
+}

@@ -1,0 +1,56 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsThreadSyncDispatch_h_
+#define nsThreadSyncDispatch_h_
+
+#include "mozilla/Atomics.h"
+#include "mozilla/DebugOnly.h"
+#include "mozilla/SpinEventLoopUntil.h"
+
+#include "nsThreadUtils.h"
+#include "MaybeLeakRefPtr.h"
+
+class nsThreadSyncDispatch : public mozilla::Runnable {
+ public:
+  nsThreadSyncDispatch(already_AddRefed<nsIEventTarget> aOrigin,
+                       already_AddRefed<nsIRunnable> aTask)
+      : Runnable("nsThreadSyncDispatch"),
+        mOrigin(aOrigin),
+        mSyncTask(std::move(aTask),  false),
+        mIsPending(true) {}
+
+  bool IsPending() {
+    return mIsPending;
+  }
+
+  void SpinEventLoopUntilComplete(const nsACString& aVeryGoodReasonToDoThis) {
+    mozilla::SpinEventLoopUntil(aVeryGoodReasonToDoThis,
+                                [&]() -> bool { return !IsPending(); });
+  }
+
+ private:
+  NS_IMETHOD Run() override {
+    if (nsCOMPtr<nsIRunnable> task = mSyncTask.forget()) {
+      MOZ_ASSERT(!mSyncTask);
+
+      mozilla::DebugOnly<nsresult> result = task->Run();
+      MOZ_ASSERT(NS_SUCCEEDED(result), "task in sync dispatch should not fail");
+
+      task = nullptr;
+
+      mIsPending = false;
+
+      mOrigin->Dispatch(this, NS_DISPATCH_IGNORE_BLOCK_DISPATCH);
+    }
+
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIEventTarget> mOrigin;
+  mozilla::MaybeLeakRefPtr<nsIRunnable> mSyncTask;
+  mozilla::Atomic<bool, mozilla::ReleaseAcquire> mIsPending;
+};
+
+#endif  // nsThreadSyncDispatch_h_

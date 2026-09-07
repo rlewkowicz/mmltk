@@ -1,0 +1,84 @@
+//! [Unlock Notification](http://sqlite.org/unlock_notify.html)
+
+use std::ffi::{c_int, c_void};
+use std::panic::catch_unwind;
+use std::sync::{Condvar, Mutex};
+
+use crate::ffi;
+
+struct UnlockNotification {
+    cond: Condvar,      
+    mutex: Mutex<bool>, 
+}
+
+#[expect(clippy::mutex_atomic)]
+impl UnlockNotification {
+    fn new() -> Self {
+        Self {
+            cond: Condvar::new(),
+            mutex: Mutex::new(false),
+        }
+    }
+
+    fn fired(&self) {
+        let mut flag = unpoison(self.mutex.lock());
+        *flag = true;
+        self.cond.notify_one();
+    }
+
+    fn wait(&self) {
+        let mut fired = unpoison(self.mutex.lock());
+        while !*fired {
+            fired = unpoison(self.cond.wait(fired));
+        }
+    }
+}
+
+#[inline]
+fn unpoison<T>(r: Result<T, std::sync::PoisonError<T>>) -> T {
+    r.unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// This function is an unlock-notify callback
+unsafe extern "C" fn unlock_notify_cb(ap_arg: *mut *mut c_void, n_arg: c_int) {
+    use std::slice::from_raw_parts;
+    let args = from_raw_parts(ap_arg as *const &UnlockNotification, n_arg as usize);
+    for un in args {
+        drop(catch_unwind(std::panic::AssertUnwindSafe(|| un.fired())));
+    }
+}
+
+pub unsafe fn is_locked(db: *mut ffi::sqlite3, rc: c_int) -> bool {
+    rc == ffi::SQLITE_LOCKED_SHAREDCACHE
+        || (rc & 0xFF) == ffi::SQLITE_LOCKED
+            && ffi::sqlite3_extended_errcode(db) == ffi::SQLITE_LOCKED_SHAREDCACHE
+}
+
+/// This function assumes that an SQLite API call (either `sqlite3_prepare_v2()`
+/// or `sqlite3_step()`) has just returned `SQLITE_LOCKED`. The argument is the
+/// associated database connection.
+///
+/// This function calls `sqlite3_unlock_notify()` to register for an
+/// unlock-notify callback, then blocks until that callback is delivered
+/// and returns `SQLITE_OK`. The caller should then retry the failed operation.
+///
+/// Or, if `sqlite3_unlock_notify()` indicates that to block would deadlock
+/// the system, then this function returns `SQLITE_LOCKED` immediately. In
+/// this case the caller should not retry the operation and should roll
+/// back the current transaction (if any).
+#[cfg(feature = "unlock_notify")]
+pub unsafe fn wait_for_unlock_notify(db: *mut ffi::sqlite3) -> c_int {
+    let un = UnlockNotification::new();
+    let rc = ffi::sqlite3_unlock_notify(
+        db,
+        Some(unlock_notify_cb),
+        &un as *const UnlockNotification as *mut c_void,
+    );
+    debug_assert!(
+        rc == ffi::SQLITE_LOCKED || rc == ffi::SQLITE_LOCKED_SHAREDCACHE || rc == ffi::SQLITE_OK
+    );
+    if rc == ffi::SQLITE_OK {
+        un.wait();
+    }
+    rc
+}

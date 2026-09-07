@@ -1,0 +1,273 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "RenderCompositorEGL.h"
+
+#include "GLContext.h"
+#include "GLContextEGL.h"
+#include "GLContextProvider.h"
+#include "GLLibraryEGL.h"
+#include "mozilla/StaticPrefs_gfx.h"
+#include "mozilla/gfx/Logging.h"
+#include "mozilla/gfx/gfxVars.h"
+#include "mozilla/layers/BuildConstants.h"
+#include "mozilla/webrender/RenderThread.h"
+#include "mozilla/widget/CompositorWidget.h"
+
+#if defined(MOZ_WIDGET_GTK)
+#  include "mozilla/WidgetUtilsGtk.h"
+#  include "mozilla/widget/GtkCompositorWidget.h"
+#endif
+
+
+namespace mozilla::wr {
+
+extern LazyLogModule gRenderThreadLog;
+#define LOG(...) MOZ_LOG(gRenderThreadLog, LogLevel::Debug, (__VA_ARGS__))
+
+UniquePtr<RenderCompositor> RenderCompositorEGL::Create(
+    const RefPtr<widget::CompositorWidget>& aWidget, nsACString& aError) {
+  if (kIsLinux && !gfx::gfxVars::UseEGL()) {
+    return nullptr;
+  }
+  RefPtr<gl::GLContext> gl = RenderThread::Get()->SingletonGL(aError);
+  if (!gl) {
+    if (aError.IsEmpty()) {
+      aError.Assign("RcANGLE(no shared GL)"_ns);
+    } else {
+      aError.Append("(Create)"_ns);
+    }
+    return nullptr;
+  }
+  return MakeUnique<RenderCompositorEGL>(aWidget, std::move(gl));
+}
+
+EGLSurface RenderCompositorEGL::CreateEGLSurface() {
+  EGLSurface surface = EGL_NO_SURFACE;
+  surface = gl::GLContextEGL::CreateEGLSurfaceForCompositorWidget(
+      mWidget, gl::GLContextEGL::Cast(gl())->mSurfaceConfig);
+  if (surface == EGL_NO_SURFACE) {
+    const auto* renderThread = RenderThread::Get();
+    gfxCriticalNote << "Failed to create EGLSurface. "
+                    << renderThread->RendererCount() << " renderers, "
+                    << renderThread->ActiveRendererCount() << " active.";
+  }
+  return surface;
+}
+
+RenderCompositorEGL::RenderCompositorEGL(
+    const RefPtr<widget::CompositorWidget>& aWidget,
+    RefPtr<gl::GLContext>&& aGL)
+    : RenderCompositor(aWidget), mGL(aGL), mEGLSurface(EGL_NO_SURFACE) {
+  MOZ_ASSERT(mGL);
+  LOG("RenderCompositorEGL::RenderCompositorEGL()");
+#if defined(MOZ_WAYLAND)
+  if (widget::GdkIsWaylandDisplay()) {
+    mEGLSurface = CreateEGLSurface();
+    if (!mEGLSurface) {
+      RenderThread::Get()->HandleWebRenderError(WebRenderError::NEW_SURFACE);
+      return;
+    }
+    const auto& gle = gl::GLContextEGL::Cast(gl());
+    const auto& egl = gle->mEgl;
+    MakeCurrent();
+
+    const int interval = gfx::gfxVars::SwapIntervalEGL() ? 1 : 0;
+    egl->fSwapInterval(interval);
+  }
+#endif
+}
+
+RenderCompositorEGL::~RenderCompositorEGL() {
+  LOG("RenderCompositorEGL::~RenderCompositorEGL()");
+  DestroyEGLSurface();
+}
+
+bool RenderCompositorEGL::BeginFrame() {
+  LOG("RenderCompositorEGL::BeginFrame()");
+  if (kIsLinux && mEGLSurface == EGL_NO_SURFACE) {
+    gfxCriticalNote
+        << "We don't have EGLSurface to draw into. Called too early?";
+    return false;
+  }
+#if defined(MOZ_WAYLAND)
+  if (auto* gtkWidget = mWidget->AsGTK()) {
+    gtkWidget->SetEGLNativeWindowSize(GetBufferSize());
+  }
+#endif
+  if (!MakeCurrent()) {
+    gfxCriticalNote << "Failed to make render context current, can't draw.";
+    return false;
+  }
+
+
+  return true;
+}
+
+RenderedFrameId RenderCompositorEGL::EndFrame(
+    const nsTArray<DeviceIntRect>& aDirtyRects) {
+  LOG("RenderCompositorEGL::EndFrame()");
+
+  RenderedFrameId frameId = GetNextRenderFrameId();
+#if defined(MOZ_WIDGET_GTK)
+  if (mWidget->IsHidden()) {
+    return frameId;
+  }
+#endif
+  if (mEGLSurface != EGL_NO_SURFACE && aDirtyRects.Length() > 0) {
+    gfx::IntRegion bufferInvalid;
+    const auto bufferSize = GetBufferSize();
+    for (const DeviceIntRect& rect : aDirtyRects) {
+      const auto left = std::clamp(rect.min.x, 0, bufferSize.width);
+      const auto top = std::clamp(rect.min.y, 0, bufferSize.height);
+
+      const auto right = std::clamp(rect.max.x, 0, bufferSize.width);
+      const auto bottom = std::clamp(rect.max.y, 0, bufferSize.height);
+
+      const auto width = right - left;
+      const auto height = bottom - top;
+
+      bufferInvalid.OrWith(
+          gfx::IntRect(left, (GetBufferSize().height - bottom), width, height));
+    }
+    gl()->SetDamage(bufferInvalid);
+  }
+
+#if defined(MOZ_WAYLAND)
+  UniquePtr<widget::WaylandSurfaceLock> lock;
+  if (auto* gtkWidget = mWidget->AsGTK()) {
+    lock = gtkWidget->LockSurface();
+  }
+#endif
+  gl()->SwapBuffers();
+  return frameId;
+}
+
+void RenderCompositorEGL::Pause() {
+  if (kIsAndroid) {
+    DestroyEGLSurface();
+  }
+}
+
+bool RenderCompositorEGL::Resume() {
+  LOG("RenderCompositorEGL::Resume()");
+  if (kIsAndroid) {
+    DestroyEGLSurface();
+
+    auto size = GetBufferSize();
+    GLint maxTextureSize = 0;
+    gl()->fGetIntegerv(LOCAL_GL_MAX_TEXTURE_SIZE, (GLint*)&maxTextureSize);
+
+    if (maxTextureSize < size.width || maxTextureSize < size.height) {
+      gfxCriticalNote << "Too big ANativeWindow size(" << size.width << ", "
+                      << size.height << ") MaxTextureSize " << maxTextureSize;
+      return false;
+    }
+
+    mEGLSurface = CreateEGLSurface();
+    if (mEGLSurface == EGL_NO_SURFACE) {
+      if (!mHandlingNewSurfaceError) {
+        mHandlingNewSurfaceError = true;
+      } else {
+        RenderThread::Get()->HandleWebRenderError(WebRenderError::NEW_SURFACE);
+      }
+      return false;
+    }
+    mHandlingNewSurfaceError = false;
+
+    gl::GLContextEGL::Cast(gl())->SetEGLSurfaceOverride(mEGLSurface);
+  } else if (kIsLinux) {
+  }
+  return true;
+}
+
+bool RenderCompositorEGL::IsPaused() { return mEGLSurface == EGL_NO_SURFACE; }
+
+bool RenderCompositorEGL::MakeCurrent() {
+  const auto& gle = gl::GLContextEGL::Cast(gl());
+
+  gle->SetEGLSurfaceOverride(mEGLSurface);
+  bool ok = gl()->MakeCurrent();
+  if (!gl()->IsGLES() && ok && mEGLSurface != EGL_NO_SURFACE) {
+    gl()->fDrawBuffer(gl()->IsDoubleBuffered() ? LOCAL_GL_BACK
+                                               : LOCAL_GL_FRONT);
+  }
+  return ok;
+}
+
+void RenderCompositorEGL::DestroyEGLSurface() {
+  const auto& gle = gl::GLContextEGL::Cast(gl());
+  const auto& egl = gle->mEgl;
+
+  if (mEGLSurface) {
+    gle->SetEGLSurfaceOverride(EGL_NO_SURFACE);
+    gl::GLContextEGL::DestroySurface(*egl, mEGLSurface);
+    mEGLSurface = nullptr;
+  }
+}
+
+RefPtr<layers::Fence> RenderCompositorEGL::GetAndResetReleaseFence() {
+  return nullptr;
+}
+
+LayoutDeviceIntSize RenderCompositorEGL::GetBufferSize() {
+  return mWidget->GetClientSize();
+}
+
+bool RenderCompositorEGL::UsePartialPresent() {
+  return gfx::gfxVars::WebRenderMaxPartialPresentRects() > 0;
+}
+
+bool RenderCompositorEGL::RequestFullRender() { return false; }
+
+uint32_t RenderCompositorEGL::GetMaxPartialPresentRects() {
+  return gfx::gfxVars::WebRenderMaxPartialPresentRects();
+}
+
+bool RenderCompositorEGL::ShouldDrawPreviousPartialPresentRegions() {
+  return true;
+}
+
+size_t RenderCompositorEGL::GetBufferAge() const {
+  if (!StaticPrefs::
+          gfx_webrender_allow_partial_present_buffer_age_AtStartup()) {
+    return 0;
+  }
+  return gl()->GetBufferAge();
+}
+
+void RenderCompositorEGL::SetBufferDamageRegion(const wr::DeviceIntRect* aRects,
+                                                size_t aNumRects) {
+  const auto& gle = gl::GLContextEGL::Cast(gl());
+  const auto& egl = gle->mEgl;
+  if (gle->HasKhrPartialUpdate() &&
+      StaticPrefs::gfx_webrender_allow_partial_present_buffer_age_AtStartup()) {
+    std::vector<EGLint> rects;
+    rects.reserve(4 * aNumRects);
+    const auto bufferSize = GetBufferSize();
+    for (size_t i = 0; i < aNumRects; i++) {
+      const auto left = std::clamp(aRects[i].min.x, 0, bufferSize.width);
+      const auto top = std::clamp(aRects[i].min.y, 0, bufferSize.height);
+
+      const auto right = std::clamp(aRects[i].max.x, 0, bufferSize.width);
+      const auto bottom = std::clamp(aRects[i].max.y, 0, bufferSize.height);
+
+      const auto width = right - left;
+      const auto height = bottom - top;
+
+      rects.push_back(left);
+      rects.push_back(bufferSize.height - bottom);
+      rects.push_back(width);
+      rects.push_back(height);
+    }
+    const auto ret =
+        egl->fSetDamageRegion(mEGLSurface, rects.data(), rects.size() / 4);
+    if (ret == LOCAL_EGL_FALSE) {
+      const auto err = egl->mLib->fGetError();
+      gfxCriticalError() << "Error in eglSetDamageRegion: " << gfx::hexa(err);
+    }
+  }
+}
+
+}  

@@ -1,0 +1,380 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsImageFrame_h_
+#define nsImageFrame_h_
+
+#include "imgIContainer.h"
+#include "imgINotificationObserver.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/StaticPtr.h"
+#include "nsAtomicContainerFrame.h"
+#include "nsDisplayList.h"
+#include "nsIObserver.h"
+#include "nsIReflowCallback.h"
+#include "nsTObserverArray.h"
+
+class nsFontMetrics;
+class nsImageMap;
+class nsIURI;
+class nsILoadGroup;
+class nsPresContext;
+class nsImageFrame;
+class nsTransform2D;
+class nsImageLoadingContent;
+
+namespace mozilla {
+class nsDisplayImage;
+class PresShell;
+namespace layers {
+class ImageContainer;
+class LayerManager;
+}  
+}  
+
+class nsImageListener final : public imgINotificationObserver {
+ protected:
+  virtual ~nsImageListener();
+
+ public:
+  explicit nsImageListener(nsImageFrame* aFrame);
+
+  NS_DECL_ISUPPORTS
+  NS_DECL_IMGINOTIFICATIONOBSERVER
+
+  void SetFrame(nsImageFrame* frame) { mFrame = frame; }
+
+ private:
+  nsImageFrame* mFrame;
+};
+
+class nsImageFrame : public nsAtomicContainerFrame, public nsIReflowCallback {
+ public:
+  template <typename T>
+  using Maybe = mozilla::Maybe<T>;
+  using Nothing = mozilla::Nothing;
+  using Visibility = mozilla::Visibility;
+
+  typedef mozilla::image::ImgDrawResult ImgDrawResult;
+  typedef mozilla::layers::ImageContainer ImageContainer;
+  typedef mozilla::layers::LayerManager LayerManager;
+
+  NS_DECL_FRAMEARENA_HELPERS(nsImageFrame)
+  NS_DECL_QUERYFRAME
+
+  void Destroy(DestroyContext&) override;
+  void DidSetComputedStyle(ComputedStyle* aOldStyle) final;
+
+  void Init(nsIContent* aContent, nsContainerFrame* aParent,
+            nsIFrame* aPrevInFlow) override;
+  void BuildDisplayList(nsDisplayListBuilder*, const nsDisplayListSet&) final;
+
+  nscoord IntrinsicISize(const mozilla::IntrinsicSizeInput& aInput,
+                         mozilla::IntrinsicISizeType aType) final;
+
+  mozilla::IntrinsicSize GetIntrinsicSize() final { return mIntrinsicSize; }
+  mozilla::AspectRatio GetIntrinsicRatio() const final {
+    return mIntrinsicRatio;
+  }
+  void Reflow(nsPresContext*, ReflowOutput&, const ReflowInput&,
+              nsReflowStatus&) override;
+  bool IsLeafDynamic() const override;
+
+  nsIContent* GetExplicitEventTargetContent(
+      const mozilla::WidgetEvent* = nullptr) const final;
+  using nsIFrame::GetExplicitEventTargetContent;
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  nsresult HandleEvent(nsPresContext*, mozilla::WidgetGUIEvent*,
+                       nsEventStatus*) override;
+  Cursor GetCursor(const nsPoint&) override;
+  nsresult AttributeChanged(int32_t aNameSpaceID, nsAtom* aAttribute,
+                            AttrModType aModType) final;
+
+  void OnVisibilityChange(
+      Visibility aNewVisibility,
+      const Maybe<OnNonvisible>& aNonvisibleAction = Nothing()) final;
+
+  void MarkIntrinsicISizesDirty() override;
+
+  void ResponsiveContentDensityChanged();
+  void ElementStateChanged(mozilla::dom::ElementState) override;
+  void SetupOwnedRequest();
+  void DeinitOwnedRequest();
+  bool ShouldShowBrokenImageIcon() const;
+
+  bool IsForImageLoadingContent() const {
+    return mKind == Kind::ImageLoadingContent;
+  }
+
+  void UpdateXULImage();
+  const mozilla::StyleImage* GetImageFromStyle() const;
+
+#ifdef ACCESSIBILITY
+  mozilla::a11y::AccType AccessibleType() override;
+#endif
+
+#ifdef DEBUG_FRAME_DUMP
+  nsresult GetFrameName(nsAString& aResult) const override;
+  void List(FILE* out = stderr, const char* aPrefix = "",
+            ListFlags aFlags = ListFlags()) const final;
+#endif
+
+  LogicalSides GetLogicalSkipSides() const final;
+
+  static void ReleaseGlobals();
+
+  already_AddRefed<imgIRequest> GetCurrentRequest() const;
+  void Notify(imgIRequest*, int32_t aType, const nsIntRect* aData);
+
+  static bool ShouldCreateImageFrameForContentProperty(
+      const mozilla::dom::Element&, const ComputedStyle&);
+
+  enum class ImageFrameType {
+    ForContentProperty,
+    ForElementRequest,
+    None,
+  };
+  static ImageFrameType ImageFrameTypeFor(const mozilla::dom::Element&,
+                                          const ComputedStyle&);
+
+  ImgDrawResult DisplayAltFeedback(gfxContext& aRenderingContext,
+                                   const nsRect& aDirtyRect, nsPoint aPt,
+                                   uint32_t aFlags);
+
+  ImgDrawResult DisplayAltFeedbackWithoutLayer(
+      nsDisplayItem*, mozilla::wr::DisplayListBuilder&,
+      mozilla::wr::IpcResourceUpdateQueue&,
+      const mozilla::layers::StackingContextHelper&,
+      mozilla::layers::RenderRootStateManager*, nsDisplayListBuilder*,
+      nsPoint aPt, uint32_t aFlags);
+
+  mozilla::dom::Element* GetMapElement() const;
+
+  bool HasImageMap() const { return mImageMap || GetMapElement(); }
+
+  nsImageMap* GetImageMap();
+  nsImageMap* GetExistingImageMap() const { return mImageMap; }
+
+  void AddInlineMinISize(const mozilla::IntrinsicSizeInput& aInput,
+                         InlineMinISizeData* aData) final;
+
+  void DisconnectMap();
+
+  bool ReflowFinished() final;
+  void ReflowCallbackCanceled() final;
+
+  enum class Kind : uint8_t {
+    ImageLoadingContent,
+    XULImage,
+    ContentProperty,
+    ContentPropertyAtIndex,
+    ListStyleImage,
+    ViewTransition,
+  };
+
+  nsImageFrame* CreateContinuingFrame(mozilla::PresShell*,
+                                      ComputedStyle*) const;
+
+  mozilla::AspectRatio ComputeIntrinsicRatioForImage(
+      imgIContainer*, bool aIgnoreContainment = false) const;
+
+  nsSize GetComputedSize() const { return mComputedSize; }
+
+ private:
+  friend nsIFrame* NS_NewImageFrame(mozilla::PresShell*, ComputedStyle*);
+  friend nsIFrame* NS_NewXULImageFrame(mozilla::PresShell*, ComputedStyle*);
+  friend nsIFrame* NS_NewImageFrameForContentProperty(mozilla::PresShell*,
+                                                      ComputedStyle*);
+  friend nsIFrame* NS_NewImageFrameForGeneratedContentIndex(mozilla::PresShell*,
+                                                            ComputedStyle*);
+  friend nsIFrame* NS_NewImageFrameForListStyleImage(mozilla::PresShell*,
+                                                     ComputedStyle*);
+  friend nsIFrame* NS_NewImageFrameForViewTransition(mozilla::PresShell*,
+                                                     ComputedStyle*);
+
+  nsImageFrame(ComputedStyle* aStyle, nsPresContext* aPresContext, Kind aKind)
+      : nsImageFrame(aStyle, aPresContext, kClassID, aKind) {}
+
+  nsImageFrame(ComputedStyle*, nsPresContext* aPresContext, ClassID, Kind);
+
+  void ReflowChildren(nsPresContext*, const ReflowInput&,
+                      const mozilla::LogicalSize& aImageSize);
+
+  void UpdateIntrinsicSizeAndRatio();
+
+ protected:
+  nsImageFrame(ComputedStyle* aStyle, nsPresContext* aPresContext, ClassID aID)
+      : nsImageFrame(aStyle, aPresContext, aID, Kind::ImageLoadingContent) {}
+
+  ~nsImageFrame() override;
+
+  void EnsureIntrinsicSizeAndRatio(bool aConsiderIntrinsicsDirty = false);
+
+  bool GotInitialReflow() const {
+    return !HasAnyStateBits(NS_FRAME_FIRST_REFLOW);
+  }
+
+  SizeComputationResult ComputeSize(
+      const SizeComputationInput& aSizingInput, mozilla::WritingMode aWM,
+      const mozilla::LogicalSize& aCBSize, nscoord aAvailableISize,
+      const mozilla::LogicalSize& aMargin,
+      const mozilla::LogicalSize& aBorderPadding,
+      const mozilla::StyleSizeOverrides& aSizeOverrides,
+      mozilla::ComputeSizeFlags aFlags) final;
+
+  bool IsServerImageMap();
+
+  mozilla::CSSIntPoint TranslateEventCoords(const nsPoint&) const;
+
+  bool GetAnchorHREFTargetAndNode(nsIURI** aHref, nsString& aTarget,
+                                  nsIContent** aNode);
+  nscoord MeasureString(const char16_t* aString, int32_t aLength,
+                        nscoord aMaxWidth, uint32_t& aMaxFit,
+                        gfxContext& aContext, nsFontMetrics& aFontMetrics);
+
+  void DisplayAltText(nsPresContext* aPresContext,
+                      gfxContext& aRenderingContext, const nsString& aAltText,
+                      const nsRect& aRect);
+
+  ImgDrawResult PaintImage(gfxContext& aRenderingContext, nsPoint aPt,
+                           const nsRect& aDirtyRect, imgIContainer* aImage,
+                           uint32_t aFlags);
+
+  void MaybeDecodeForPredictedSize();
+
+ protected:
+  friend class nsImageListener;
+  friend class nsImageLoadingContent;
+  friend class mozilla::PresShell;
+
+  void OnSizeAvailable(imgIRequest* aRequest, imgIContainer* aImage);
+  void OnFrameUpdate(imgIRequest* aRequest, const nsIntRect* aRect);
+  void OnLoadComplete(imgIRequest* aRequest);
+  mozilla::IntrinsicSize ComputeIntrinsicSize(
+      bool aIgnoreContainment = false) const;
+  bool ShouldUseMappedAspectRatio() const;
+
+  nsAtom* GetViewTransitionName() const;
+  Maybe<nsSize> GetViewTransitionBorderBoxSize() const;
+  mozilla::wr::ImageKey GetViewTransitionImageKey(
+      mozilla::layers::RenderRootStateManager*,
+      mozilla::wr::IpcResourceUpdateQueue&) const;
+
+  void NotifyNewCurrentRequest(imgIRequest* aRequest);
+
+  void SetForceSyncDecoding(bool aForce) { mForceSyncDecoding = aForce; }
+
+  void AssertSyncDecodingHintIsInSync() const
+#ifndef DEBUG
+      {}
+#else
+      ;
+#endif
+
+  nsRect GetDestRect(const nsRect& aFrameContentBox,
+                     nsPoint* aAnchorPoint = nullptr);
+
+ private:
+  nscoord GetContinuationOffset() const;
+  bool ShouldDisplaySelection();
+
+  bool UpdateIntrinsicSize();
+
+  bool UpdateIntrinsicRatio();
+
+  bool GetSourceToDestTransform(nsTransform2D& aTransform);
+
+  bool IsPendingLoad(imgIRequest*) const;
+
+  void UpdateImage(imgIRequest*, imgIContainer*);
+
+  nsRect SourceRectToDest(const nsIntRect& aRect);
+
+  void InvalidateSelf(const nsIntRect* aLayerInvalidRect,
+                      const nsRect* aFrameInvalidRect);
+
+  void MaybeSendIntrinsicSizeAndRatioToEmbedder();
+  void MaybeSendIntrinsicSizeAndRatioToEmbedder(Maybe<mozilla::IntrinsicSize>,
+                                                Maybe<mozilla::AspectRatio>);
+
+  RefPtr<nsImageMap> mImageMap;
+
+  RefPtr<nsImageListener> mListener;
+
+  RefPtr<imgRequestProxy> mOwnedRequest;
+
+  nsCOMPtr<imgIContainer> mImage;
+  nsCOMPtr<imgIContainer> mPrevImage;
+
+  nsSize mComputedSize;
+
+  mozilla::IntrinsicSize mIntrinsicSize;
+
+  mozilla::AspectRatio mIntrinsicRatio;
+
+  const Kind mKind;
+  bool mOwnedRequestRegistered = false;
+  bool mDisplayingIcon = false;
+  bool mFirstFrameComplete = false;
+  bool mReflowCallbackPosted = false;
+  bool mForceSyncDecoding = false;
+  bool mIsInObjectOrEmbed = false;
+
+ public:
+  friend class mozilla::nsDisplayImage;
+  friend class nsDisplayGradient;
+};
+
+namespace mozilla {
+class nsDisplayImage final : public nsPaintedDisplayItem {
+ public:
+  typedef mozilla::layers::LayerManager LayerManager;
+
+  nsDisplayImage(nsDisplayListBuilder* aBuilder, nsImageFrame* aFrame)
+      : nsPaintedDisplayItem(aBuilder, aFrame) {
+    MOZ_COUNT_CTOR(nsDisplayImage);
+  }
+
+  MOZ_COUNTED_DTOR_FINAL(nsDisplayImage)
+
+  void Paint(nsDisplayListBuilder*, gfxContext* aCtx) final;
+
+  nsRect GetDestRect() const;
+  nsRect GetDestRectViewTransition() const;
+
+  nsRect GetBounds(bool* aSnap) const {
+    *aSnap = true;
+    return Frame()->InkOverflowRectRelativeToSelf() + ToReferenceFrame();
+  }
+
+  nsRect GetBounds(nsDisplayListBuilder*, bool* aSnap) const final {
+    return GetBounds(aSnap);
+  }
+
+  nsRegion GetOpaqueRegion(nsDisplayListBuilder*, bool* aSnap) const final;
+
+  bool CreateWebRenderCommands(mozilla::wr::DisplayListBuilder&,
+                               mozilla::wr::IpcResourceUpdateQueue&,
+                               const StackingContextHelper&,
+                               mozilla::layers::RenderRootStateManager*,
+                               nsDisplayListBuilder*) final;
+
+  void MaybeCreateWebRenderCommandsForViewTransition(
+      mozilla::wr::DisplayListBuilder&, mozilla::wr::IpcResourceUpdateQueue&,
+      const StackingContextHelper&, mozilla::layers::RenderRootStateManager*,
+      nsDisplayListBuilder*);
+
+  nsImageFrame* Frame() const {
+    MOZ_ASSERT(mFrame->IsImageFrame() || mFrame->IsImageControlFrame());
+    return static_cast<nsImageFrame*>(mFrame);
+  }
+
+  NS_DISPLAY_DECL_NAME("Image", TYPE_IMAGE)
+};
+
+}  
+
+#endif /* nsImageFrame_h_ */

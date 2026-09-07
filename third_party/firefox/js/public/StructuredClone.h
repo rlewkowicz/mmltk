@@ -1,0 +1,458 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef js_StructuredClone_h
+#define js_StructuredClone_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/BufferList.h"
+#include "mozilla/CheckedInt.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/StringBuffer.h"
+
+#include <stdint.h>
+#include <utility>
+
+#include "jstypes.h"
+
+#include "js/AllocPolicy.h"
+#include "js/RootingAPI.h"
+#include "js/TypeDecls.h"
+#include "js/Vector.h"
+
+
+struct JSStructuredCloneReader;
+struct JSStructuredCloneWriter;
+
+#define JS_STRUCTURED_CLONE_VERSION 8
+
+namespace JS {
+
+enum class StructuredCloneScope : uint32_t {
+  SameProcess = 1,
+
+  DifferentProcess,
+
+  LastResolvedScope = DifferentProcess,
+
+  DifferentProcessForIndexedDB,
+
+  Unassigned,
+
+  UnknownDestination,
+};
+
+enum TransferableOwnership {
+  SCTAG_TMO_UNFILLED = 0,
+
+  SCTAG_TMO_UNOWNED = 1,
+
+  SCTAG_TMO_FIRST_OWNED = 2,
+
+  SCTAG_TMO_ALLOC_DATA = SCTAG_TMO_FIRST_OWNED,
+
+  SCTAG_TMO_MAPPED_DATA = 3,
+
+  SCTAG_TMO_CUSTOM = 4,
+
+  SCTAG_TMO_USER_MIN
+};
+
+class CloneDataPolicy {
+  bool allowIntraClusterClonableSharedObjects_;
+  bool allowSharedMemoryObjects_;
+
+ public:
+
+  CloneDataPolicy()
+      : allowIntraClusterClonableSharedObjects_(false),
+        allowSharedMemoryObjects_(false) {}
+
+
+  void allowIntraClusterClonableSharedObjects() {
+    allowIntraClusterClonableSharedObjects_ = true;
+  }
+  bool areIntraClusterClonableSharedObjectsAllowed() const {
+    return allowIntraClusterClonableSharedObjects_;
+  }
+
+  void allowSharedMemoryObjects() { allowSharedMemoryObjects_ = true; }
+  bool areSharedMemoryObjectsAllowed() const {
+    return allowSharedMemoryObjects_;
+  }
+};
+
+} 
+
+typedef JSObject* (*ReadStructuredCloneOp)(
+    JSContext* cx, JSStructuredCloneReader* r,
+    const JS::CloneDataPolicy& cloneDataPolicy, uint32_t tag, uint32_t data,
+    void* closure);
+
+typedef bool (*WriteStructuredCloneOp)(JSContext* cx,
+                                       JSStructuredCloneWriter* w,
+                                       JS::HandleObject obj,
+                                       bool* sameProcessScopeRequired,
+                                       void* closure);
+
+typedef void (*StructuredCloneErrorOp)(JSContext* cx, uint32_t errorid,
+                                       void* closure, const char* errorMessage);
+
+typedef bool (*ReadTransferStructuredCloneOp)(
+    JSContext* cx, JSStructuredCloneReader* r,
+    const JS::CloneDataPolicy& aCloneDataPolicy, uint32_t tag, void* content,
+    uint64_t extraData, void* closure, JS::MutableHandleObject returnObject);
+
+typedef bool (*TransferStructuredCloneOp)(JSContext* cx,
+                                          JS::Handle<JSObject*> obj,
+                                          void* closure,
+                                          uint32_t* tag,
+                                          JS::TransferableOwnership* ownership,
+                                          void** content, uint64_t* extraData);
+
+typedef void (*FreeTransferStructuredCloneOp)(
+    uint32_t tag, JS::TransferableOwnership ownership, void* content,
+    uint64_t extraData, void* closure);
+
+typedef bool (*CanTransferStructuredCloneOp)(JSContext* cx,
+                                             JS::Handle<JSObject*> obj,
+                                             bool* sameProcessScopeRequired,
+                                             void* closure);
+
+typedef bool (*SharedArrayBufferClonedOp)(JSContext* cx, bool receiving,
+                                          void* closure);
+
+struct JSStructuredCloneCallbacks {
+  ReadStructuredCloneOp read;
+  WriteStructuredCloneOp write;
+  StructuredCloneErrorOp reportError;
+  ReadTransferStructuredCloneOp readTransfer;
+  TransferStructuredCloneOp writeTransfer;
+  FreeTransferStructuredCloneOp freeTransfer;
+  CanTransferStructuredCloneOp canTransfer;
+  SharedArrayBufferClonedOp sabCloned;
+};
+
+enum OwnTransferablePolicy {
+  OwnsTransferablesIfAny,
+
+  IgnoreTransferablesIfAny,
+
+  NoTransferables
+};
+
+namespace js {
+class SharedArrayRawBuffer;
+
+class SharedArrayRawBufferRefs {
+ public:
+  SharedArrayRawBufferRefs() = default;
+  SharedArrayRawBufferRefs(SharedArrayRawBufferRefs&& other) = default;
+  SharedArrayRawBufferRefs& operator=(SharedArrayRawBufferRefs&& other);
+  ~SharedArrayRawBufferRefs();
+
+  [[nodiscard]] bool acquire(JSContext* cx, SharedArrayRawBuffer* rawbuf);
+  [[nodiscard]] bool acquireAll(JSContext* cx,
+                                const SharedArrayRawBufferRefs& that);
+  void takeOwnership(SharedArrayRawBufferRefs&&);
+  void releaseAll();
+
+ private:
+  js::Vector<js::SharedArrayRawBuffer*, 0, js::SystemAllocPolicy> refs_;
+};
+
+template <typename T, typename AllocPolicy>
+struct BufferIterator;
+}  
+
+class MOZ_NON_MEMMOVABLE JS_PUBLIC_API JSStructuredCloneData {
+ public:
+  using BufferList = mozilla::BufferList<js::SystemAllocPolicy>;
+  using Iterator = BufferList::IterImpl;
+
+ private:
+  static const size_t kStandardCapacity = 4096;
+
+  BufferList bufList_;
+
+  JS::StructuredCloneScope scope_;
+
+  const JSStructuredCloneCallbacks* callbacks_ = nullptr;
+  void* closure_ = nullptr;
+  OwnTransferablePolicy ownTransferables_ =
+      OwnTransferablePolicy::NoTransferables;
+  js::SharedArrayRawBufferRefs refsHeld_;
+
+  using StringBuffers =
+      js::Vector<RefPtr<mozilla::StringBuffer>, 4, js::SystemAllocPolicy>;
+  StringBuffers stringBufferRefsHeld_;
+
+  friend struct JSStructuredCloneWriter;
+  friend class JS_PUBLIC_API JSAutoStructuredCloneBuffer;
+  template <typename T, typename AllocPolicy>
+  friend struct js::BufferIterator;
+
+ public:
+  explicit JSStructuredCloneData(JS::StructuredCloneScope scope)
+      : bufList_(0, 0, kStandardCapacity, js::SystemAllocPolicy()),
+        scope_(scope) {}
+
+  JSStructuredCloneData(BufferList&& buffers, JS::StructuredCloneScope scope,
+                        OwnTransferablePolicy ownership)
+      : bufList_(std::move(buffers)),
+        scope_(scope),
+        ownTransferables_(ownership) {}
+  JSStructuredCloneData(JSStructuredCloneData&& other) = default;
+  JSStructuredCloneData& operator=(JSStructuredCloneData&& other) = default;
+  ~JSStructuredCloneData();
+
+  void setCallbacks(const JSStructuredCloneCallbacks* callbacks, void* closure,
+                    OwnTransferablePolicy policy) {
+    callbacks_ = callbacks;
+    closure_ = closure;
+    ownTransferables_ = policy;
+  }
+
+  [[nodiscard]] bool Init(size_t initialCapacity = 0) {
+    return bufList_.Init(0, initialCapacity);
+  }
+
+  JS::StructuredCloneScope scope() const {
+    if (scope_ == JS::StructuredCloneScope::UnknownDestination) {
+      return JS::StructuredCloneScope::DifferentProcess;
+    }
+    return scope_;
+  }
+
+  void sameProcessScopeRequired() {
+    if (scope_ == JS::StructuredCloneScope::UnknownDestination) {
+      scope_ = JS::StructuredCloneScope::SameProcess;
+    }
+  }
+
+  void initScope(JS::StructuredCloneScope newScope) {
+    MOZ_ASSERT(Size() == 0, "initScope() of nonempty JSStructuredCloneData");
+    if (scope() != JS::StructuredCloneScope::Unassigned) {
+      MOZ_ASSERT(scope() == newScope,
+                 "Cannot change scope after it has been initialized");
+    }
+    scope_ = newScope;
+  }
+
+  size_t Size() const { return bufList_.Size(); }
+
+  const Iterator Start() const { return bufList_.Iter(); }
+
+  [[nodiscard]] bool Advance(Iterator& iter, size_t distance) const {
+    return iter.AdvanceAcrossSegments(bufList_, distance);
+  }
+
+  [[nodiscard]] bool ReadBytes(Iterator& iter, char* buffer,
+                               size_t size) const {
+    return bufList_.ReadBytes(iter, buffer, size);
+  }
+
+  [[nodiscard]] bool AppendBytes(const char* data, size_t size) {
+    MOZ_ASSERT(scope() != JS::StructuredCloneScope::Unassigned);
+    return bufList_.WriteBytes(data, size);
+  }
+
+  [[nodiscard]] bool UpdateBytes(Iterator& iter, const char* data,
+                                 size_t size) const {
+    MOZ_ASSERT(scope() != JS::StructuredCloneScope::Unassigned);
+    while (size > 0) {
+      size_t remaining = iter.RemainingInSegment();
+      size_t nbytes = std::min(remaining, size);
+      memcpy(iter.Data(), data, nbytes);
+      data += nbytes;
+      size -= nbytes;
+      iter.Advance(bufList_, nbytes);
+    }
+    return true;
+  }
+
+  char* AllocateBytes(size_t maxSize, size_t* size) {
+    return bufList_.AllocateBytes(maxSize, size);
+  }
+
+  void Clear() {
+    discardTransferables();
+    bufList_.Clear();
+  }
+
+  JSStructuredCloneData Borrow(Iterator& iter, size_t size,
+                               bool* success) const {
+    MOZ_ASSERT(scope() == JS::StructuredCloneScope::DifferentProcess);
+    return JSStructuredCloneData(
+        bufList_.Borrow<js::SystemAllocPolicy>(iter, size, success), scope(),
+        IgnoreTransferablesIfAny);
+  }
+
+  template <typename FunctionToApply>
+  bool ForEachDataChunk(FunctionToApply&& function) const {
+    Iterator iter = bufList_.Iter();
+    while (!iter.Done()) {
+      if (!function(iter.Data(), iter.RemainingInSegment())) {
+        return false;
+      }
+      iter.Advance(bufList_, iter.RemainingInSegment());
+    }
+    return true;
+  }
+
+  [[nodiscard]] bool Append(const JSStructuredCloneData& other) {
+    MOZ_ASSERT(scope() == other.scope());
+    return other.ForEachDataChunk(
+        [&](const char* data, size_t size) { return AppendBytes(data, size); });
+  }
+
+  size_t SizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) {
+    return bufList_.SizeOfExcludingThis(mallocSizeOf);
+  }
+
+  void discardTransferables();
+
+ private:
+  JS::StructuredCloneScope scopeForInternalWriting() const { return scope_; }
+};
+
+JS_PUBLIC_API bool JS_ReadStructuredClone(
+    JSContext* cx, const JSStructuredCloneData& data, uint32_t version,
+    JS::StructuredCloneScope scope, JS::MutableHandleValue vp,
+    const JS::CloneDataPolicy& cloneDataPolicy,
+    const JSStructuredCloneCallbacks* optionalCallbacks, void* closure);
+
+JS_PUBLIC_API bool JS_WriteStructuredClone(
+    JSContext* cx, JS::HandleValue v, JSStructuredCloneData* data,
+    JS::StructuredCloneScope scope, const JS::CloneDataPolicy& cloneDataPolicy,
+    const JSStructuredCloneCallbacks* optionalCallbacks, void* closure,
+    JS::HandleValue transferable);
+
+JS_PUBLIC_API bool JS_StructuredCloneHasTransferables(
+    JSStructuredCloneData& data, bool* hasTransferable);
+
+JS_PUBLIC_API bool JS_StructuredClone(
+    JSContext* cx, JS::HandleValue v, JS::MutableHandleValue vp,
+    const JSStructuredCloneCallbacks* optionalCallbacks, void* closure);
+
+class JS_PUBLIC_API JSAutoStructuredCloneBuffer {
+  JSStructuredCloneData data_;
+  uint32_t version_;
+
+ public:
+  JSAutoStructuredCloneBuffer(JS::StructuredCloneScope scope,
+                              const JSStructuredCloneCallbacks* callbacks,
+                              void* closure)
+      : data_(scope), version_(JS_STRUCTURED_CLONE_VERSION) {
+    data_.setCallbacks(callbacks, closure,
+                       OwnTransferablePolicy::NoTransferables);
+  }
+
+  JSAutoStructuredCloneBuffer(JSAutoStructuredCloneBuffer&& other);
+  JSAutoStructuredCloneBuffer& operator=(JSAutoStructuredCloneBuffer&& other);
+
+  ~JSAutoStructuredCloneBuffer() { clear(); }
+
+  JSStructuredCloneData& data() { return data_; }
+  bool empty() const { return !data_.Size(); }
+
+  void clear();
+
+  JS::StructuredCloneScope scope() const { return data_.scope(); }
+
+  uint32_t version() const { return version_; }
+
+  void adopt(JSStructuredCloneData&& data,
+             uint32_t version = JS_STRUCTURED_CLONE_VERSION,
+             const JSStructuredCloneCallbacks* callbacks = nullptr,
+             void* closure = nullptr);
+
+  void giveTo(JSStructuredCloneData* data);
+
+  bool read(JSContext* cx, JS::MutableHandleValue vp,
+            const JS::CloneDataPolicy& cloneDataPolicy = JS::CloneDataPolicy(),
+            const JSStructuredCloneCallbacks* optionalCallbacks = nullptr,
+            void* closure = nullptr);
+
+  bool write(JSContext* cx, JS::HandleValue v,
+             const JSStructuredCloneCallbacks* optionalCallbacks = nullptr,
+             void* closure = nullptr);
+
+  bool write(JSContext* cx, JS::HandleValue v, JS::HandleValue transferable,
+             const JS::CloneDataPolicy& cloneDataPolicy,
+             const JSStructuredCloneCallbacks* optionalCallbacks = nullptr,
+             void* closure = nullptr);
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) {
+    return data_.SizeOfExcludingThis(mallocSizeOf);
+  }
+
+  size_t sizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf) {
+    return mallocSizeOf(this) + sizeOfExcludingThis(mallocSizeOf);
+  }
+
+ private:
+  JSAutoStructuredCloneBuffer(const JSAutoStructuredCloneBuffer& other) =
+      delete;
+  JSAutoStructuredCloneBuffer& operator=(
+      const JSAutoStructuredCloneBuffer& other) = delete;
+};
+
+#define JS_SCTAG_USER_MIN ((uint32_t)0xFFFF8000)
+#define JS_SCTAG_USER_MAX ((uint32_t)0xFFFFFFFF)
+
+#define JS_SCERR_RECURSION 0
+#define JS_SCERR_TRANSFERABLE 1
+#define JS_SCERR_DUP_TRANSFERABLE 2
+#define JS_SCERR_UNSUPPORTED_TYPE 3
+#define JS_SCERR_SHMEM_TRANSFERABLE 4
+#define JS_SCERR_TYPED_ARRAY_DETACHED 5
+#define JS_SCERR_WASM_NO_TRANSFER 6
+#define JS_SCERR_NOT_CLONABLE 7
+#define JS_SCERR_NOT_CLONABLE_WITH_COOP_COEP 8
+#define JS_SCERR_TRANSFERABLE_TWICE 9
+
+JS_PUBLIC_API bool JS_ReadUint32Pair(JSStructuredCloneReader* r, uint32_t* p1,
+                                     uint32_t* p2);
+
+JS_PUBLIC_API bool JS_ReadBytes(JSStructuredCloneReader* r, void* p,
+                                size_t len);
+
+JS_PUBLIC_API bool JS_ReadString(JSStructuredCloneReader* r,
+                                 JS::MutableHandleString str);
+
+JS_PUBLIC_API bool JS_ReadDouble(JSStructuredCloneReader* r, double* v);
+
+JS_PUBLIC_API bool JS_ReadTypedArray(JSStructuredCloneReader* r,
+                                     JS::MutableHandleValue vp);
+
+JS_PUBLIC_API bool JS_WriteUint32PairUnchecked(JSStructuredCloneWriter* w,
+                                               uint32_t tag, uint32_t data);
+JS_PUBLIC_API inline bool JS_WriteUint32Pair(JSStructuredCloneWriter* w,
+                                             mozilla::CheckedUint32 tag,
+                                             mozilla::CheckedUint32 data) {
+  if (!tag.isValid() || !data.isValid()) [[unlikely]] {
+    return false;
+  }
+  return JS_WriteUint32PairUnchecked(w, tag.value(), data.value());
+}
+
+JS_PUBLIC_API bool JS_WriteBytes(JSStructuredCloneWriter* w, const void* p,
+                                 size_t len);
+
+JS_PUBLIC_API bool JS_WriteString(JSStructuredCloneWriter* w,
+                                  JS::HandleString str);
+
+JS_PUBLIC_API bool JS_WriteDouble(JSStructuredCloneWriter* w, double v);
+
+JS_PUBLIC_API bool JS_WriteTypedArray(JSStructuredCloneWriter* w,
+                                      JS::HandleValue v);
+
+JS_PUBLIC_API bool JS_ObjectNotWritten(JSStructuredCloneWriter* w,
+                                       JS::HandleObject obj);
+
+JS_PUBLIC_API JS::StructuredCloneScope JS_GetStructuredCloneScope(
+    JSStructuredCloneWriter* w);
+
+#endif /* js_StructuredClone_h */

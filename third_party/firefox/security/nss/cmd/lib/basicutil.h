@@ -1,0 +1,108 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef _BASIC_UTILS_H_
+#define _BASIC_UTILS_H_
+
+#include "seccomon.h"
+#include "secitem.h"
+#include "secoid.h"
+#include "secoidt.h"
+#include "secport.h"
+#include "prerror.h"
+#include "base64.h"
+#include "secasn1.h"
+#include "secder.h"
+#include "ecl-exp.h"
+#include <stdio.h>
+
+#ifdef SECUTIL_NEW
+typedef int (*SECU_PPFunc)(PRFileDesc *out, const SECItem *item,
+                           const char *msg, int level);
+#else
+typedef int (*SECU_PPFunc)(FILE *out, const SECItem *item, const char *msg, int level);
+#endif
+
+extern void SECU_PrintError(const char *progName, const char *msg, ...);
+
+extern void SECU_PrintSystemError(const char *progName, const char *msg, ...);
+
+extern void SECU_PrintErrMsg(FILE *out, int level, const char *progName,
+                             const char *msg, ...);
+
+extern SECStatus SECU_FileToItem(SECItem *dst, PRFileDesc *src);
+extern SECStatus SECU_TextFileToItem(SECItem *dst, PRFileDesc *src);
+
+extern void SECU_Indent(FILE *out, int level);
+
+extern void SECU_Newline(FILE *out);
+
+extern void SECU_PrintInteger(FILE *out, const SECItem *i, const char *m,
+                              int level);
+
+extern void SECU_PrintAsHex(FILE *out, const SECItem *i, const char *m,
+                            int level);
+
+extern void SECU_PrintBuf(FILE *out, const char *msg, const void *vp, int len);
+
+extern int SECU_PrintPrivateKey(FILE *out, SECItem *der, char *m, int level);
+
+extern SECStatus SECU_PKCS11Init(PRBool readOnly);
+
+extern int SECU_PrintSignedData(FILE *out, SECItem *der, const char *m,
+                                int level, SECU_PPFunc inner);
+
+extern void SECU_PrintString(FILE *out, const SECItem *si, const char *m,
+                             int level);
+extern void SECU_PrintAny(FILE *out, const SECItem *i, const char *m, int level);
+
+extern void SECU_PrintPRandOSError(const char *progName);
+
+void
+SECU_SECItemToHex(const SECItem *item, char *dst);
+
+SECStatus
+SECU_SECItemHexStringToBinary(SECItem *srcdest);
+
+extern SECItem *SECU_HexString2SECItem(PLArenaPool *arena, SECItem *item,
+                                       const char *str);
+
+extern SECStatus SECU_ecName2params(ECCurveName curve, SECItem *params);
+
+
+typedef struct {
+    char flag;
+    PRBool needsArg;
+    char *arg;
+    PRBool activated;
+    char *longform;
+} secuCommandFlag;
+
+typedef struct
+{
+    int numCommands;
+    int numOptions;
+
+    secuCommandFlag *commands;
+    secuCommandFlag *options;
+} secuCommand;
+
+SECStatus
+SECU_ParseCommandLine(int argc, char **argv, char *progName,
+                      const secuCommand *cmd);
+char *
+SECU_GetOptionArg(const secuCommand *cmd, int optionNum);
+
+
+void printflags(char *trusts, unsigned int flags);
+
+#if !defined(XP_UNIX)
+extern int ffs(unsigned int i);
+#endif
+
+#include "secerr.h"
+
+extern const char *hex;
+extern const char printable[];
+
+#endif /* _BASIC_UTILS_H_ */

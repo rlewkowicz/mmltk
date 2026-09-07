@@ -1,0 +1,812 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsTextRunTransformations.h"
+
+#include <utility>
+
+#include "GreekCasing.h"
+#include "IrishCasing.h"
+#include "MathMLTextRunFactory.h"
+#include "mozilla/ComputedStyleInlines.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/StaticPrefs_layout.h"
+#include "mozilla/StaticPrefs_mathml.h"
+#include "mozilla/TextEditor.h"
+#include "mozilla/Utf16.h"
+#include "mozilla/gfx/2D.h"
+#include "nsLineBreaker.h"
+#include "nsSpecialCasingData.h"
+#include "nsStyleConsts.h"
+#include "nsStyleUtil.h"
+#include "nsTextFrameUtils.h"
+#include "nsUnicharUtils.h"
+#include "nsUnicodeProperties.h"
+
+using namespace mozilla;
+using namespace mozilla::gfx;
+
+#define LATIN_CAPITAL_LETTER_I_WITH_DOT_ABOVE 0x0130
+#define LATIN_SMALL_LETTER_DOTLESS_I 0x0131
+
+#define GREEK_CAPITAL_LETTER_SIGMA 0x03A3
+#define GREEK_SMALL_LETTER_FINAL_SIGMA 0x03C2
+#define GREEK_SMALL_LETTER_SIGMA 0x03C3
+
+already_AddRefed<nsTransformedTextRun> nsTransformedTextRun::Create(
+    const gfxTextRunFactory::Parameters* aParams,
+    nsTransformingTextRunFactory* aFactory, gfxFontGroup* aFontGroup,
+    const char16_t* aString, uint32_t aLength,
+    const gfx::ShapedTextFlags aFlags, const nsTextFrameUtils::Flags aFlags2,
+    nsTArray<RefPtr<nsTransformedCharStyle>>&& aStyles, bool aOwnsFactory) {
+  NS_ASSERTION(!(aFlags & gfx::ShapedTextFlags::TEXT_IS_8BIT),
+               "didn't expect text to be marked as 8-bit here");
+
+  void* storage =
+      AllocateStorageForTextRun(sizeof(nsTransformedTextRun), aLength);
+  if (!storage) {
+    return nullptr;
+  }
+
+  RefPtr<nsTransformedTextRun> result = new (storage)
+      nsTransformedTextRun(aParams, aFactory, aFontGroup, aString, aLength,
+                           aFlags, aFlags2, std::move(aStyles), aOwnsFactory);
+  return result.forget();
+}
+
+void nsTransformedTextRun::SetCapitalization(uint32_t aStart, uint32_t aLength,
+                                             bool* aCapitalization) {
+  if (mCapitalize.IsEmpty()) {
+    mCapitalize.AppendElements(GetLength());
+    memset(mCapitalize.Elements(), 0, GetLength() * sizeof(bool));
+  }
+  memcpy(mCapitalize.Elements() + aStart, aCapitalization,
+         aLength * sizeof(bool));
+  mNeedsRebuild = true;
+}
+
+bool nsTransformedTextRun::SetPotentialLineBreaks(Range aRange,
+                                                  const uint8_t* aBreakBefore) {
+  bool changed = gfxTextRun::SetPotentialLineBreaks(aRange, aBreakBefore);
+  if (changed) {
+    mNeedsRebuild = true;
+  }
+  return changed;
+}
+
+void nsTransformedTextRun::SetEmergencyWrapPositions() {
+  bool prevWasHyphen = false;
+  for (uint32_t pos : IntegerRange(mString.Length())) {
+    const char16_t ch = mString[pos];
+    if (prevWasHyphen) {
+      if (nsContentUtils::IsAlphanumeric(ch)) {
+        mCharacterGlyphs[pos].SetCanBreakBefore(
+            CompressedGlyph::FLAG_BREAK_TYPE_EMERGENCY_WRAP);
+      }
+      prevWasHyphen = false;
+    }
+    if (nsContentUtils::IsHyphen(ch) && pos &&
+        nsContentUtils::IsAlphanumeric(mString[pos - 1])) {
+      prevWasHyphen = true;
+    }
+  }
+}
+
+size_t nsTransformedTextRun::SizeOfExcludingThis(
+    mozilla::MallocSizeOf aMallocSizeOf) {
+  size_t total = gfxTextRun::SizeOfExcludingThis(aMallocSizeOf);
+  total += mStyles.ShallowSizeOfExcludingThis(aMallocSizeOf);
+  total += mCapitalize.ShallowSizeOfExcludingThis(aMallocSizeOf);
+  if (mOwnsFactory) {
+    total += aMallocSizeOf(mFactory);
+  }
+  return total;
+}
+
+size_t nsTransformedTextRun::SizeOfIncludingThis(
+    mozilla::MallocSizeOf aMallocSizeOf) {
+  return aMallocSizeOf(this) + SizeOfExcludingThis(aMallocSizeOf);
+}
+
+already_AddRefed<nsTransformedTextRun>
+nsTransformingTextRunFactory::MakeTextRun(
+    const char16_t* aString, uint32_t aLength,
+    const gfxTextRunFactory::Parameters* aParams, gfxFontGroup* aFontGroup,
+    gfx::ShapedTextFlags aFlags, nsTextFrameUtils::Flags aFlags2,
+    nsTArray<RefPtr<nsTransformedCharStyle>>&& aStyles, bool aOwnsFactory) {
+  return nsTransformedTextRun::Create(aParams, this, aFontGroup, aString,
+                                      aLength, aFlags, aFlags2,
+                                      std::move(aStyles), aOwnsFactory);
+}
+
+already_AddRefed<nsTransformedTextRun>
+nsTransformingTextRunFactory::MakeTextRun(
+    const uint8_t* aString, uint32_t aLength,
+    const gfxTextRunFactory::Parameters* aParams, gfxFontGroup* aFontGroup,
+    gfx::ShapedTextFlags aFlags, nsTextFrameUtils::Flags aFlags2,
+    nsTArray<RefPtr<nsTransformedCharStyle>>&& aStyles, bool aOwnsFactory) {
+  NS_ConvertASCIItoUTF16 unicodeString(reinterpret_cast<const char*>(aString),
+                                       aLength);
+  return MakeTextRun(unicodeString.get(), aLength, aParams, aFontGroup,
+                     aFlags & ~gfx::ShapedTextFlags::TEXT_IS_8BIT, aFlags2,
+                     std::move(aStyles), aOwnsFactory);
+}
+
+void MergeCharactersInTextRun(gfxTextRun* aDest, gfxTextRun* aSrc,
+                              const bool* aCharsToMerge,
+                              const bool* aDeletedChars) {
+  MOZ_ASSERT(!aDest->TrailingGlyphRun(), "unexpected glyphRuns in aDest!");
+  uint32_t offset = 0;
+  AutoTArray<gfxTextRun::DetailedGlyph, 4> glyphs;
+  const gfxTextRun::CompressedGlyph continuationGlyph =
+      gfxTextRun::CompressedGlyph::MakeComplex(false, false);
+  const gfxTextRun::CompressedGlyph* srcGlyphs = aSrc->GetCharacterGlyphs();
+  gfxTextRun::CompressedGlyph* destGlyphs = aDest->GetCharacterGlyphs();
+  for (gfxTextRun::GlyphRunIterator iter(aSrc, gfxTextRun::Range(aSrc));
+       !iter.AtEnd(); iter.NextRun()) {
+    const gfxTextRun::GlyphRun* run = iter.GlyphRun();
+    aDest->AddGlyphRun(run->mFont, run->mMatchType, offset, false,
+                       run->mOrientation, run->mIsCJK);
+
+    bool anyMissing = false;
+    uint32_t mergeRunStart = iter.StringStart();
+    gfxTextRun::CompressedGlyph mergedGlyph = srcGlyphs[mergeRunStart];
+    uint32_t stringEnd = iter.StringEnd();
+    for (uint32_t k = iter.StringStart(); k < stringEnd; ++k) {
+      const gfxTextRun::CompressedGlyph g = srcGlyphs[k];
+      if (g.IsSimpleGlyph()) {
+        if (!anyMissing) {
+          gfxTextRun::DetailedGlyph details;
+          details.mGlyphID = g.GetSimpleGlyph();
+          details.mAdvance = g.GetSimpleAdvance();
+          glyphs.AppendElement(details);
+        }
+      } else {
+        if (g.IsMissing()) {
+          anyMissing = true;
+          glyphs.Clear();
+        }
+        if (g.GetGlyphCount() > 0) {
+          glyphs.AppendElements(aSrc->GetDetailedGlyphs(k), g.GetGlyphCount());
+        }
+      }
+
+      if (k + 1 < iter.StringEnd() && aCharsToMerge[k + 1]) {
+        continue;
+      }
+
+      NS_WARNING_ASSERTION(
+          !aCharsToMerge[mergeRunStart],
+          "unable to merge across a glyph run boundary, glyph(s) discarded");
+      if (!aCharsToMerge[mergeRunStart]) {
+        if (mergedGlyph.IsSimpleGlyph() && glyphs.Length() == 1) {
+          destGlyphs[offset] = mergedGlyph;
+        } else {
+          mergedGlyph.SetComplex(mergedGlyph.IsClusterStart(),
+                                 mergedGlyph.IsLigatureGroupStart());
+          if (glyphs.Length() > 1 &&
+              std::all_of(glyphs.cbegin(), glyphs.cend(),
+                          [](const gfxTextRun::DetailedGlyph& g) -> bool {
+                            return g.mAdvance > 0;
+                          })) {
+            mergedGlyph.SetApplyLetterSpacingBetweenDetailedGlyphs();
+          }
+          destGlyphs[offset] = mergedGlyph;
+          aDest->SetDetailedGlyphs(offset, glyphs.Length(), glyphs.Elements());
+          if (anyMissing) {
+            destGlyphs[offset].SetMissing();
+          }
+        }
+        offset++;
+
+        while (offset < aDest->GetLength() && aDeletedChars[offset]) {
+          destGlyphs[offset++] = continuationGlyph;
+        }
+      }
+
+      glyphs.Clear();
+      anyMissing = false;
+      mergeRunStart = k + 1;
+      if (mergeRunStart < stringEnd) {
+        mergedGlyph = srcGlyphs[mergeRunStart];
+      }
+    }
+    NS_ASSERTION(glyphs.Length() == 0,
+                 "Leftover glyphs, don't request merging of the last character "
+                 "with its next!");
+  }
+  NS_ASSERTION(offset == aDest->GetLength(), "Bad offset calculations");
+}
+
+gfxTextRunFactory::Parameters GetParametersForInner(
+    nsTransformedTextRun* aTextRun, gfx::ShapedTextFlags* aFlags,
+    DrawTarget* aRefDrawTarget) {
+  gfxTextRunFactory::Parameters params = {
+      aRefDrawTarget, nullptr, nullptr,
+      nullptr,        0,       aTextRun->GetAppUnitsPerDevUnit()};
+  *aFlags = aTextRun->GetFlags();
+  return params;
+}
+
+enum LanguageSpecificCasingBehavior {
+  eLSCB_None,       
+  eLSCB_Dutch,      
+  eLSCB_Greek,      
+  eLSCB_Irish,      
+  eLSCB_Turkish,    
+  eLSCB_Lithuanian  
+};
+
+static LanguageSpecificCasingBehavior GetCasingFor(const nsAtom* aLang) {
+  if (!aLang) {
+    return eLSCB_None;
+  }
+  if (nsStyleUtil::MatchesLanguagePrefix(aLang, u"tr") ||
+      nsStyleUtil::MatchesLanguagePrefix(aLang, u"az") ||
+      nsStyleUtil::MatchesLanguagePrefix(aLang, u"ba") ||
+      nsStyleUtil::MatchesLanguagePrefix(aLang, u"crh") ||
+      nsStyleUtil::MatchesLanguagePrefix(aLang, u"tt")) {
+    return eLSCB_Turkish;
+  }
+  if (nsStyleUtil::MatchesLanguagePrefix(aLang, u"nl")) {
+    return eLSCB_Dutch;
+  }
+  if (nsStyleUtil::MatchesLanguagePrefix(aLang, u"el")) {
+    return eLSCB_Greek;
+  }
+  if (nsStyleUtil::MatchesLanguagePrefix(aLang, u"ga")) {
+    return eLSCB_Irish;
+  }
+  if (nsStyleUtil::MatchesLanguagePrefix(aLang, u"lt")) {
+    return eLSCB_Lithuanian;
+  }
+  return eLSCB_None;
+}
+
+bool nsCaseTransformTextRunFactory::TransformString(
+    const nsAString& aString, nsString& aConvertedString,
+    const Maybe<StyleTextTransform>& aGlobalTransform, char16_t aMaskChar,
+    bool aCaseTransformsOnly, bool aUseCapitalEsZet, const nsAtom* aLanguage,
+    nsTArray<bool>& aCharsToMergeArray, nsTArray<bool>& aDeletedCharsArray,
+    const nsTransformedTextRun* aTextRun, uint32_t aOffsetInTextRun,
+    nsTArray<uint8_t>* aCanBreakBeforeArray,
+    nsTArray<RefPtr<nsTransformedCharStyle>>* aStyleArray) {
+  bool auxiliaryOutputArrays = aCanBreakBeforeArray && aStyleArray;
+  MOZ_ASSERT(!auxiliaryOutputArrays || aTextRun,
+             "text run must be provided to use aux output arrays");
+
+  uint32_t length = aString.Length();
+  const char16_t* str = aString.BeginReading();
+  const char16_t mask = aMaskChar ? aMaskChar : TextEditor::PasswordMask();
+
+  bool mergeNeeded = false;
+
+  bool capitalizeDutchIJ = false;
+  bool prevIsLetter = false;
+  bool ntPrefix = false;  
+  bool seenSoftDotted = false;  
+  uint32_t sigmaIndex = uint32_t(-1);
+  nsUGenCategory cat;
+
+  StyleTextTransform style = aGlobalTransform.valueOr(StyleTextTransform::NONE);
+  bool forceNonFullWidth = false;
+  const nsAtom* lang = aLanguage;
+
+  LanguageSpecificCasingBehavior languageSpecificCasing = GetCasingFor(lang);
+  mozilla::GreekCasing::State greekState;
+  mozilla::IrishCasing::State irishState;
+  uint32_t irishMark = uint32_t(-1);  
+  uint32_t irishMarkSrc = uint32_t(-1);  
+  uint32_t greekMark = uint32_t(-1);  
+  const char16_t kGreekUpperEta = 0x0397;
+
+  bool capitalizeNext = true;
+
+  for (uint32_t i = 0; i < length; ++i, ++aOffsetInTextRun) {
+    uint32_t ch = str[i];
+
+    RefPtr<nsTransformedCharStyle> charStyle;
+    if (aTextRun) {
+      charStyle = aTextRun->mStyles[aOffsetInTextRun];
+      style = aGlobalTransform.valueOr(charStyle->mTextTransform);
+      forceNonFullWidth = charStyle->mForceNonFullWidth;
+
+      nsAtom* newLang =
+          charStyle->mExplicitLanguage ? charStyle->mLanguage.get() : nullptr;
+      if (lang != newLang) {
+        lang = newLang;
+        languageSpecificCasing = GetCasingFor(lang);
+        greekState.Reset();
+        irishState.Reset();
+        irishMark = uint32_t(-1);
+        irishMarkSrc = uint32_t(-1);
+        greekMark = uint32_t(-1);
+      }
+    }
+
+    MOZ_ASSERT_IF(aMaskChar, !(charStyle && charStyle->mMaskPassword));
+
+    bool maskPassword = (charStyle && charStyle->mMaskPassword) || aMaskChar;
+    int extraChars = 0;
+    const unicode::MultiCharMapping* mcm;
+    bool inhibitBreakBefore = false;  
+
+    if (i < length - 1 && mozilla::IsSurrogatePair(ch, str[i + 1])) {
+      ch = mozilla::SurrogateToUCS4(ch, str[i + 1]);
+    }
+    const uint32_t originalCh = ch;
+
+    if (!maskPassword) {
+      switch ((style & StyleTextTransform::CASE_TRANSFORMS)._0) {
+        case StyleTextTransform::NONE._0:
+          break;
+        case StyleTextTransform::LOWERCASE._0:
+          if (languageSpecificCasing == eLSCB_Turkish) {
+            if (ch == 'I') {
+              ch = LATIN_SMALL_LETTER_DOTLESS_I;
+              prevIsLetter = true;
+              sigmaIndex = uint32_t(-1);
+              break;
+            }
+            if (ch == LATIN_CAPITAL_LETTER_I_WITH_DOT_ABOVE) {
+              ch = 'i';
+              prevIsLetter = true;
+              sigmaIndex = uint32_t(-1);
+              break;
+            }
+          }
+
+          if (languageSpecificCasing == eLSCB_Lithuanian) {
+            // clang-format off
+            // clang-format on
+            if (ch == 'I' || ch == 'J' || ch == 0x012E) {
+              ch = ToLowerCase(ch);
+              prevIsLetter = true;
+              seenSoftDotted = true;
+              sigmaIndex = uint32_t(-1);
+              break;
+            }
+            if (ch == 0x00CC) {
+              aConvertedString.Append('i');
+              aConvertedString.Append(0x0307);
+              extraChars += 2;
+              ch = 0x0300;
+              prevIsLetter = true;
+              seenSoftDotted = false;
+              sigmaIndex = uint32_t(-1);
+              break;
+            }
+            if (ch == 0x00CD) {
+              aConvertedString.Append('i');
+              aConvertedString.Append(0x0307);
+              extraChars += 2;
+              ch = 0x0301;
+              prevIsLetter = true;
+              seenSoftDotted = false;
+              sigmaIndex = uint32_t(-1);
+              break;
+            }
+            if (ch == 0x0128) {
+              aConvertedString.Append('i');
+              aConvertedString.Append(0x0307);
+              extraChars += 2;
+              ch = 0x0303;
+              prevIsLetter = true;
+              seenSoftDotted = false;
+              sigmaIndex = uint32_t(-1);
+              break;
+            }
+          }
+
+          cat = unicode::GetGenCategory(ch);
+
+          if (languageSpecificCasing == eLSCB_Irish &&
+              cat == nsUGenCategory::kLetter) {
+            if (!prevIsLetter && (ch == 'n' || ch == 't')) {
+              ntPrefix = true;
+            } else {
+              if (ntPrefix && mozilla::IrishCasing::IsUpperVowel(ch)) {
+                aConvertedString.Append('-');
+                ++extraChars;
+              }
+              ntPrefix = false;
+            }
+          } else {
+            ntPrefix = false;
+          }
+
+          if (seenSoftDotted && cat == nsUGenCategory::kMark) {
+            if (ch == 0x0300 || ch == 0x0301 || ch == 0x0303) {
+              aConvertedString.Append(0x0307);
+              ++extraChars;
+            }
+          }
+          seenSoftDotted = false;
+
+
+          if (sigmaIndex != uint32_t(-1)) {
+            if (cat == nsUGenCategory::kLetter) {
+              aConvertedString.SetCharAt(GREEK_SMALL_LETTER_SIGMA, sigmaIndex);
+            }
+          }
+
+          if (ch == GREEK_CAPITAL_LETTER_SIGMA) {
+            if (prevIsLetter) {
+              ch = GREEK_SMALL_LETTER_FINAL_SIGMA;
+              sigmaIndex = aConvertedString.Length();
+            } else {
+              ch = GREEK_SMALL_LETTER_SIGMA;
+              sigmaIndex = uint32_t(-1);
+            }
+            prevIsLetter = true;
+            break;
+          }
+
+          if (cat != nsUGenCategory::kMark) {
+            prevIsLetter = (cat == nsUGenCategory::kLetter);
+            sigmaIndex = uint32_t(-1);
+          }
+
+          mcm = unicode::SpecialLower(ch);
+          if (mcm) {
+            int j = 0;
+            while (j < 2 && mcm->mMappedChars[j + 1]) {
+              aConvertedString.Append(mcm->mMappedChars[j]);
+              ++extraChars;
+              ++j;
+            }
+            ch = mcm->mMappedChars[j];
+            break;
+          }
+
+          ch = ToLowerCase(ch);
+          break;
+
+        case StyleTextTransform::UPPERCASE._0:
+          if (languageSpecificCasing == eLSCB_Turkish && ch == 'i') {
+            ch = LATIN_CAPITAL_LETTER_I_WITH_DOT_ABOVE;
+            break;
+          }
+
+          if (languageSpecificCasing == eLSCB_Greek) {
+            bool markEta;
+            bool updateEta;
+            ch = mozilla::GreekCasing::UpperCase(ch, greekState, markEta,
+                                                 updateEta);
+            if (markEta) {
+              greekMark = aConvertedString.Length();
+            } else if (updateEta) {
+              MOZ_ASSERT(aConvertedString.Length() > 0 &&
+                             greekMark < aConvertedString.Length(),
+                         "bad greekMark!");
+              aConvertedString.SetCharAt(kGreekUpperEta, greekMark);
+              greekMark = uint32_t(-1);
+            }
+            break;
+          }
+
+          if (languageSpecificCasing == eLSCB_Lithuanian) {
+            if (ch == 'i' || ch == 'j' || ch == 0x012F) {
+              seenSoftDotted = true;
+              ch = ToTitleCase(ch);
+              break;
+            }
+            if (seenSoftDotted) {
+              seenSoftDotted = false;
+              if (ch == 0x0307) {
+                ch = uint32_t(-1);
+                break;
+              }
+            }
+          }
+
+          if (languageSpecificCasing == eLSCB_Irish) {
+            bool mark;
+            uint8_t action;
+            ch = mozilla::IrishCasing::UpperCase(ch, irishState, mark, action);
+            if (mark) {
+              irishMark = aConvertedString.Length();
+              irishMarkSrc = i;
+              break;
+            } else if (action) {
+              nsString& str = aConvertedString;  
+              switch (action) {
+                case 1:
+                  MOZ_ASSERT(str.Length() > 0 && irishMark < str.Length(),
+                             "bad irishMark!");
+                  str.SetCharAt(ToLowerCase(str[irishMark]), irishMark);
+                  irishMark = uint32_t(-1);
+                  irishMarkSrc = uint32_t(-1);
+                  break;
+                case 2:
+                  MOZ_ASSERT(str.Length() >= 2 && irishMark == str.Length() - 2,
+                             "bad irishMark!");
+                  str.SetCharAt(ToLowerCase(str[irishMark]), irishMark);
+                  str.SetCharAt(ToLowerCase(str[irishMark + 1]), irishMark + 1);
+                  irishMark = uint32_t(-1);
+                  irishMarkSrc = uint32_t(-1);
+                  break;
+                case 3:
+                  MOZ_ASSERT(str.Length() >= 2 && irishMark == str.Length() - 2,
+                             "bad irishMark!");
+                  MOZ_ASSERT(
+                      irishMark != uint32_t(-1) && irishMarkSrc != uint32_t(-1),
+                      "failed to set irishMarks");
+                  str.Replace(irishMark, 2, ToLowerCase(str[irishMark]));
+                  aDeletedCharsArray[irishMarkSrc + 1] = true;
+                  uint32_t len = aCharsToMergeArray.Length();
+                  MOZ_ASSERT(len >= 2);
+                  aCharsToMergeArray.TruncateLength(len - 1);
+                  if (auxiliaryOutputArrays) {
+                    MOZ_ASSERT(aStyleArray->Length() == len);
+                    MOZ_ASSERT(aCanBreakBeforeArray->Length() == len);
+                    aStyleArray->TruncateLength(len - 1);
+                    aCanBreakBeforeArray->TruncateLength(len - 1);
+                    inhibitBreakBefore = true;
+                  }
+                  mergeNeeded = true;
+                  irishMark = uint32_t(-1);
+                  irishMarkSrc = uint32_t(-1);
+                  break;
+              }
+              break;
+            }
+            // If we didn't have any special action to perform, fall through
+          }
+
+          if (ch == 0x00DF && aUseCapitalEsZet) {
+            ch = 0x1E9E;
+            break;
+          }
+
+          mcm = unicode::SpecialUpper(ch);
+          if (mcm) {
+            int j = 0;
+            while (j < 2 && mcm->mMappedChars[j + 1]) {
+              aConvertedString.Append(mcm->mMappedChars[j]);
+              ++extraChars;
+              ++j;
+            }
+            ch = mcm->mMappedChars[j];
+            break;
+          }
+
+          ch = ToUpperCase(ch);
+          break;
+
+        case StyleTextTransform::CAPITALIZE._0: {
+          if (capitalizeDutchIJ && ch == 'j') {
+            ch = 'J';
+            capitalizeDutchIJ = false;
+            break;
+          }
+          capitalizeDutchIJ = false;
+          bool doCapitalize = false;
+          if (aTextRun) {
+            if (aOffsetInTextRun < aTextRun->mCapitalize.Length()) {
+              doCapitalize = aTextRun->mCapitalize[aOffsetInTextRun];
+            }
+          } else {
+            doCapitalize = nsLineBreaker::ShouldCapitalize(ch, capitalizeNext);
+          }
+          if (doCapitalize) {
+            if (languageSpecificCasing == eLSCB_Turkish && ch == 'i') {
+              ch = LATIN_CAPITAL_LETTER_I_WITH_DOT_ABOVE;
+              break;
+            }
+            if (languageSpecificCasing == eLSCB_Dutch && ch == 'i') {
+              ch = 'I';
+              capitalizeDutchIJ = true;
+              break;
+            }
+            if (languageSpecificCasing == eLSCB_Lithuanian) {
+              if (ch == 'i' || ch == 'j' || ch == 0x012F) {
+                seenSoftDotted = true;
+                ch = ToTitleCase(ch);
+                break;
+              }
+              if (seenSoftDotted) {
+                seenSoftDotted = false;
+                if (ch == 0x0307) {
+                  ch = uint32_t(-1);
+                  break;
+                }
+              }
+            }
+
+            mcm = unicode::SpecialTitle(ch);
+            if (mcm) {
+              int j = 0;
+              while (j < 2 && mcm->mMappedChars[j + 1]) {
+                aConvertedString.Append(mcm->mMappedChars[j]);
+                ++extraChars;
+                ++j;
+              }
+              ch = mcm->mMappedChars[j];
+              break;
+            }
+
+            ch = ToTitleCase(ch);
+          }
+          break;
+        }
+
+        case StyleTextTransform::MATH_AUTO._0:
+          if (length == 1) {
+            uint32_t ch2 =
+                MathMLTextRunFactory::MathVariant(ch, StyleMathVariant::Italic);
+            if (StaticPrefs::mathml_mathvariant_styling_fallback_disabled()) {
+              ch = ch2;
+            } else if (ch2 != ch) {
+              auto* fontGroup = aTextRun->GetFontGroup();
+              fontGroup->EnsureFontList();
+              FontMatchType matchType;
+              RefPtr<gfxFont> mathFont = fontGroup->FindFontForChar(
+                  ch2, 0, 0, intl::Script::COMMON, nullptr, &matchType);
+              if (mathFont) {
+                ch = ch2;
+              }
+            }
+          }
+          break;
+        default:
+          MOZ_ASSERT_UNREACHABLE("all cases should be handled");
+          break;
+      }
+
+      if (!aCaseTransformsOnly) {
+        if (!forceNonFullWidth && (style & StyleTextTransform::FULL_WIDTH)) {
+          ch = unicode::GetFullWidth(ch);
+        }
+
+        if (style & StyleTextTransform::FULL_SIZE_KANA) {
+          // clang-format off
+          static const uint32_t kSmallKanas[] = {
+              0x3041, 0x3043, 0x3045, 0x3047, 0x3049, 0x3063, 0x3083, 0x3085, 0x3087,
+              0x308E, 0x3095, 0x3096,
+              0x30A1, 0x30A3, 0x30A5, 0x30A7, 0x30A9, 0x30C3, 0x30E3, 0x30E5, 0x30E7,
+              0x30EE, 0x30F5, 0x30F6, 0x31F0, 0x31F1, 0x31F2, 0x31F3, 0x31F4, 0x31F5,
+              0x31F6, 0x31F7, 0x31F8, 0x31F9, 0x31FA, 0x31FB, 0x31FC, 0x31FD, 0x31FE,
+              0x31FF,
+              0xFF67, 0xFF68, 0xFF69, 0xFF6A, 0xFF6B, 0xFF6C, 0xFF6D, 0xFF6E, 0xFF6F,
+              0x1B132, 0x1B150, 0x1B151, 0x1B152, 0x1B155, 0x1B164, 0x1B165, 0x1B166,
+              0x1B167};
+          static const uint16_t kFullSizeKanas[] = {
+              0x3042, 0x3044, 0x3046, 0x3048, 0x304A, 0x3064, 0x3084, 0x3086, 0x3088,
+              0x308F, 0x304B, 0x3051,
+              0x30A2, 0x30A4, 0x30A6, 0x30A8, 0x30AA, 0x30C4, 0x30E4, 0x30E6, 0x30E8,
+              0x30EF, 0x30AB, 0x30B1, 0x30AF, 0x30B7, 0x30B9, 0x30C8, 0x30CC, 0x30CF,
+              0x30D2, 0x30D5, 0x30D8, 0x30DB, 0x30E0, 0x30E9, 0x30EA, 0x30EB, 0x30EC,
+              0x30ED,
+              0xFF71, 0xFF72, 0xFF73, 0xFF74, 0xFF75, 0xFF94, 0xFF95, 0xFF96, 0xFF82,
+              0x3053, 0x3090, 0x3091, 0x3092, 0x30B3, 0x30F0, 0x30F1, 0x30F2, 0x30F3};
+          // clang-format on
+
+          size_t index;
+          const uint16_t len = std::size(kSmallKanas);
+          if (mozilla::BinarySearch(kSmallKanas, 0, len, ch, &index)) {
+            ch = kFullSizeKanas[index];
+          }
+        }
+      }
+
+      if (forceNonFullWidth) {
+        ch = unicode::GetFullWidthInverse(ch);
+      }
+    }
+
+    if (ch == uint32_t(-1)) {
+      aDeletedCharsArray.AppendElement(true);
+      mergeNeeded = true;
+    } else {
+      aDeletedCharsArray.AppendElement(false);
+      aCharsToMergeArray.AppendElement(false);
+      if (auxiliaryOutputArrays) {
+        aStyleArray->AppendElement(charStyle);
+        aCanBreakBeforeArray->AppendElement(
+            inhibitBreakBefore
+                ? gfxShapedText::CompressedGlyph::FLAG_BREAK_TYPE_NONE
+                : aTextRun->CanBreakBefore(aOffsetInTextRun));
+      }
+
+      if (mozilla::IsInBMP(ch)) {
+        aConvertedString.Append(maskPassword ? mask : ch);
+      } else {
+        if (maskPassword) {
+          aConvertedString.Append(mask);
+          aConvertedString.Append(mask);
+        } else {
+          aConvertedString.Append(mozilla::HighSurrogate(ch));
+          aConvertedString.Append(mozilla::LowSurrogate(ch));
+        }
+        ++extraChars;
+      }
+      if (!mozilla::IsInBMP(originalCh)) {
+        ++aOffsetInTextRun;
+        ++i;
+        aDeletedCharsArray.AppendElement(true);
+      }
+
+      while (extraChars-- > 0) {
+        mergeNeeded = true;
+        aCharsToMergeArray.AppendElement(true);
+        if (auxiliaryOutputArrays) {
+          aStyleArray->AppendElement(charStyle);
+          aCanBreakBeforeArray->AppendElement(
+              gfxShapedText::CompressedGlyph::FLAG_BREAK_TYPE_NONE);
+        }
+      }
+    }
+  }
+
+  if (auxiliaryOutputArrays) {
+    DebugOnly<uint32_t> len = aCharsToMergeArray.Length();
+    MOZ_ASSERT(aStyleArray->Length() == len);
+    MOZ_ASSERT(aCanBreakBeforeArray->Length() == len);
+  }
+
+  return mergeNeeded;
+}
+
+void nsCaseTransformTextRunFactory::RebuildTextRun(
+    nsTransformedTextRun* aTextRun, DrawTarget* aRefDrawTarget,
+    gfxMissingFontRecorder* aMFR) {
+  nsAutoString convertedString;
+  AutoTArray<bool, 50> charsToMergeArray;
+  AutoTArray<bool, 50> deletedCharsArray;
+  AutoTArray<uint8_t, 50> canBreakBeforeArray;
+  AutoTArray<RefPtr<nsTransformedCharStyle>, 50> styleArray;
+
+  auto globalTransform =
+      mAllUppercase ? Some(StyleTextTransform::UPPERCASE) : Nothing();
+  bool mergeNeeded = TransformString(
+      aTextRun->mString, convertedString, globalTransform, mMaskChar,
+       false, mUseCapitalEsZet, nullptr,
+      charsToMergeArray, deletedCharsArray, aTextRun, 0, &canBreakBeforeArray,
+      &styleArray);
+
+  gfx::ShapedTextFlags flags;
+  gfxTextRunFactory::Parameters innerParams =
+      GetParametersForInner(aTextRun, &flags, aRefDrawTarget);
+  gfxFontGroup* fontGroup = aTextRun->GetFontGroup();
+
+  RefPtr<nsTransformedTextRun> transformedChild;
+  RefPtr<gfxTextRun> cachedChild;
+  gfxTextRun* child;
+
+  if (mInnerTransformingTextRunFactory) {
+    transformedChild = mInnerTransformingTextRunFactory->MakeTextRun(
+        convertedString.BeginReading(), convertedString.Length(), &innerParams,
+        fontGroup, flags, nsTextFrameUtils::Flags(), std::move(styleArray),
+        false);
+    child = transformedChild.get();
+  } else {
+    cachedChild = fontGroup->MakeTextRun(
+        convertedString.BeginReading(), convertedString.Length(), &innerParams,
+        flags, nsTextFrameUtils::Flags(), aMFR);
+    child = cachedChild.get();
+  }
+  if (!child) {
+    return;
+  }
+  NS_ASSERTION(convertedString.Length() == canBreakBeforeArray.Length(),
+               "Dropped characters or break-before values somewhere!");
+  gfxTextRun::Range range(0, uint32_t(canBreakBeforeArray.Length()));
+  child->SetPotentialLineBreaks(range, canBreakBeforeArray.Elements());
+  if (transformedChild) {
+    transformedChild->FinishSettingProperties(aRefDrawTarget, aMFR);
+  }
+
+  aTextRun->ResetGlyphRuns();
+  if (mergeNeeded) {
+    NS_ASSERTION(charsToMergeArray.Length() == child->GetLength(),
+                 "source length mismatch");
+    NS_ASSERTION(deletedCharsArray.Length() == aTextRun->GetLength(),
+                 "destination length mismatch");
+    MergeCharactersInTextRun(aTextRun, child, charsToMergeArray.Elements(),
+                             deletedCharsArray.Elements());
+  } else {
+    aTextRun->CopyGlyphDataFrom(child, gfxTextRun::Range(child), 0);
+  }
+}

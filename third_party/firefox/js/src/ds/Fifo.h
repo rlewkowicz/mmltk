@@ -1,0 +1,161 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef js_Fifo_h
+#define js_Fifo_h
+
+#include <algorithm>
+#include <utility>
+
+#include "js/Vector.h"
+
+namespace js {
+
+template <typename T, size_t MinInlineCapacity = 0,
+          class AllocPolicy = TempAllocPolicy,
+          template <typename, size_t, class, typename...> class VectorType =
+              Vector>
+class Fifo {
+  static_assert(MinInlineCapacity % 2 == 0, "MinInlineCapacity must be even!");
+
+ protected:
+  VectorType<T, MinInlineCapacity / 2, AllocPolicy> front_;
+  VectorType<T, MinInlineCapacity / 2, AllocPolicy> rear_;
+
+ private:
+  void fixup() {
+    if (front_.empty() && !rear_.empty()) {
+      front_.swap(rear_);
+      std::reverse(front_.begin(), front_.end());
+    }
+  }
+
+ public:
+  explicit Fifo(AllocPolicy alloc = AllocPolicy())
+      : front_(alloc), rear_(alloc) {}
+
+  Fifo(Fifo&& rhs)
+      : front_(std::move(rhs.front_)), rear_(std::move(rhs.rear_)) {}
+
+  Fifo& operator=(Fifo&& rhs) {
+    MOZ_ASSERT(&rhs != this, "self-move disallowed");
+    this->~Fifo();
+    new (this) Fifo(std::move(rhs));
+    return *this;
+  }
+
+  Fifo(const Fifo&) = delete;
+  Fifo& operator=(const Fifo&) = delete;
+
+  size_t length() const {
+    MOZ_ASSERT_IF(rear_.length() > 0, front_.length() > 0);  
+    return front_.length() + rear_.length();
+  }
+
+  bool empty() const {
+    MOZ_ASSERT_IF(rear_.length() > 0, front_.length() > 0);  
+    return front_.empty();
+  }
+
+  struct ConstIterator {
+    const Fifo& self_;
+    size_t idx_;
+
+    ConstIterator(const Fifo& self, size_t idx) : self_(self), idx_(idx) {}
+
+    ConstIterator& operator++() {
+      ++idx_;
+      return *this;
+    }
+
+    const T& operator*() const {
+      size_t split = self_.front_.length();
+      return (idx_ < split) ? self_.front_[(split - 1) - idx_]
+                            : self_.rear_[idx_ - split];
+    }
+
+    bool operator!=(const ConstIterator& other) const {
+      return (&self_ != &other.self_) || (idx_ != other.idx_);
+    }
+  };
+
+  ConstIterator begin() const { return ConstIterator(*this, 0); }
+
+  ConstIterator end() const { return ConstIterator(*this, length()); }
+
+  template <typename U>
+  [[nodiscard]] bool pushBack(U&& u) {
+    if (!rear_.append(std::forward<U>(u))) {
+      return false;
+    }
+    fixup();
+    return true;
+  }
+
+  template <typename... Args>
+  [[nodiscard]] bool emplaceBack(Args&&... args) {
+    if (!rear_.emplaceBack(std::forward<Args>(args)...)) {
+      return false;
+    }
+    fixup();
+    return true;
+  }
+
+  template <typename... Args>
+  [[nodiscard]] bool emplaceFront(Args&&... args) {
+    return front_.emplaceBack(std::forward<Args>(args)...);
+  }
+
+  T& front() {
+    MOZ_ASSERT(!empty());
+    return front_.back();
+  }
+  const T& front() const {
+    MOZ_ASSERT(!empty());
+    return front_.back();
+  }
+
+  void popFront() {
+    MOZ_ASSERT(!empty());
+    front_.popBack();
+    fixup();
+  }
+
+  T popCopyFront() {
+    T ret = front();
+    popFront();
+    return ret;
+  }
+
+  void clear() {
+    front_.clear();
+    rear_.clear();
+  }
+
+  template <class Pred>
+  size_t eraseIf(Pred pred) {
+    size_t frontLength = front_.length();
+    front_.eraseIf(pred);
+    size_t erased = frontLength - front_.length();
+
+    size_t rearLength = rear_.length();
+    rear_.eraseIf(pred);
+    erased += rearLength - rear_.length();
+
+    fixup();
+    return erased;
+  }
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+    return front_.sizeOfExcludingThis(mallocSizeOf) +
+           rear_.sizeOfExcludingThis(mallocSizeOf);
+  }
+  size_t sizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+    return mallocSizeOf(this) + sizeOfExcludingThis(mallocSizeOf);
+  }
+};
+
+}  
+
+#endif /* js_Fifo_h */

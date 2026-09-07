@@ -1,0 +1,1988 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/cache/Manager.h"
+
+#include "QuotaClientImpl.h"
+#include "Types.h"
+#include "mozStorageHelper.h"
+#include "mozilla/AppShutdown.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/AutoRestore.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/StaticMutex.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/dom/InternalResponse.h"
+#include "mozilla/dom/cache/CacheTypes.h"
+#include "mozilla/dom/cache/Context.h"
+#include "mozilla/dom/cache/DBAction.h"
+#include "mozilla/dom/cache/DBSchema.h"
+#include "mozilla/dom/cache/FileUtils.h"
+#include "mozilla/dom/cache/ManagerId.h"
+#include "mozilla/dom/cache/SavedTypes.h"
+#include "mozilla/dom/cache/StreamList.h"
+#include "mozilla/dom/cache/Types.h"
+#include "mozilla/dom/quota/Client.h"
+#include "mozilla/dom/quota/ClientDirectoryLock.h"
+#include "mozilla/dom/quota/ClientImpl.h"
+#include "mozilla/dom/quota/QuotaManager.h"
+#include "mozilla/dom/quota/StringifyUtils.h"
+#include "mozilla/ipc/BackgroundParent.h"
+#include "nsID.h"
+#include "nsIFile.h"
+#include "nsIInputStream.h"
+#include "nsIThread.h"
+#include "nsIUUIDGenerator.h"
+#include "nsTObserverArray.h"
+#include "nsThreadUtils.h"
+
+namespace mozilla::dom::cache {
+
+using mozilla::dom::quota::ClientDirectoryLock;
+using mozilla::dom::quota::CloneFileAndAppend;
+
+namespace {
+
+template <typename Callable>
+nsresult MaybeUpdatePaddingFile(nsIFile* aBaseDir, mozIStorageConnection* aConn,
+                                const int64_t aIncreaseSize,
+                                const int64_t aDecreaseSize,
+                                Callable aCommitHook) {
+  MOZ_ASSERT(!NS_IsMainThread());
+  MOZ_DIAGNOSTIC_ASSERT(aBaseDir);
+  MOZ_DIAGNOSTIC_ASSERT(aConn);
+  MOZ_DIAGNOSTIC_ASSERT(aIncreaseSize >= 0);
+  MOZ_DIAGNOSTIC_ASSERT(aDecreaseSize >= 0);
+
+  RefPtr<CacheQuotaClient> cacheQuotaClient = CacheQuotaClient::Get();
+  MOZ_DIAGNOSTIC_ASSERT(cacheQuotaClient);
+
+  QM_TRY(MOZ_TO_RESULT(cacheQuotaClient->MaybeUpdatePaddingFileInternal(
+      *aBaseDir, *aConn, aIncreaseSize, aDecreaseSize, aCommitHook)));
+
+  return NS_OK;
+}
+
+Maybe<CipherKey> GetOrCreateCipherKey(NotNull<Context*> aContext,
+                                      const nsID& aBodyId, bool aCreate) {
+  const auto& maybeMetadata = aContext->MaybeCacheDirectoryMetadataRef();
+  MOZ_DIAGNOSTIC_ASSERT(maybeMetadata);
+
+  auto privateOrigin = maybeMetadata->mIsPrivate;
+  if (!privateOrigin) {
+    return Nothing{};
+  }
+
+  nsCString bodyIdStr{aBodyId.ToString().get()};
+
+  auto& cipherKeyManager = aContext->MutableCipherKeyManagerRef();
+
+  return aCreate ? Some(cipherKeyManager.Ensure(bodyIdStr))
+                 : cipherKeyManager.Get(bodyIdStr);
+}
+
+class SetupAction final : public SyncDBAction {
+ public:
+  SetupAction() : SyncDBAction(DBAction::Create) {}
+
+  virtual nsresult RunSyncWithDBOnTarget(
+      const CacheDirectoryMetadata& aDirectoryMetadata, nsIFile* aDBDir,
+      mozIStorageConnection* aConn) override {
+    MOZ_DIAGNOSTIC_ASSERT(aDBDir);
+
+    QM_TRY(MOZ_TO_RESULT(BodyCreateDir(*aDBDir)));
+
+    QM_TRY(MOZ_TO_RESULT(db::CreateOrMigrateSchema(*aDBDir, *aConn)));
+
+    if (MarkerFileExists(aDirectoryMetadata)) {
+      NS_WARNING("Cache not shutdown cleanly! Cleaning up stale data...");
+      mozStorageTransaction trans(aConn, false,
+                                  mozIStorageConnection::TRANSACTION_IMMEDIATE);
+
+      QM_TRY(MOZ_TO_RESULT(trans.Start()));
+
+      QM_TRY_INSPECT(const auto& orphanedCacheIdList,
+                     db::FindOrphanedCacheIds(*aConn));
+
+      QM_TRY_INSPECT(
+          const CheckedInt64& overallDeletedPaddingSize,
+          Reduce(
+              orphanedCacheIdList, CheckedInt64(0),
+              [aConn, &aDirectoryMetadata, &aDBDir](
+                  CheckedInt64 oldValue, const Maybe<const CacheId&>& element)
+                  -> Result<CheckedInt64, nsresult> {
+                QM_TRY_INSPECT(const auto& deletionInfo,
+                               db::DeleteCacheId(*aConn, *element));
+
+                QM_TRY(MOZ_TO_RESULT(
+                    BodyDeleteFiles(aDirectoryMetadata, *aDBDir,
+                                    deletionInfo.mDeletedBodyIdList)));
+
+                if (deletionInfo.mDeletedPaddingSize > 0) {
+                  DecreaseUsageForDirectoryMetadata(
+                      aDirectoryMetadata, deletionInfo.mDeletedPaddingSize);
+                }
+
+                return oldValue + deletionInfo.mDeletedPaddingSize;
+              }));
+
+      QM_TRY_UNWRAP(auto knownBodyIds, db::GetKnownBodyIds(*aConn));
+
+      QM_TRY(MOZ_TO_RESULT(
+          BodyDeleteOrphanedFiles(aDirectoryMetadata, *aDBDir, knownBodyIds)));
+
+      QM_WARNONLY_TRY(QM_TO_RESULT(
+          MaybeUpdatePaddingFile(aDBDir, aConn,  0,
+                                 overallDeletedPaddingSize.value(),
+                                 [&trans]() { return trans.Commit(); })));
+    }
+
+    if (DirectoryPaddingFileExists(*aDBDir, DirPaddingFile::TMP_FILE) ||
+        !DirectoryPaddingFileExists(*aDBDir, DirPaddingFile::FILE)) {
+      QM_TRY(MOZ_TO_RESULT(RestorePaddingFile(aDBDir, aConn)));
+    }
+
+    return NS_OK;
+  }
+};
+
+
+class DeleteOrphanedBodyAction final : public Action {
+ public:
+  using DeletedBodyIdList = AutoTArray<nsID, 64>;
+
+  explicit DeleteOrphanedBodyAction(DeletedBodyIdList&& aDeletedBodyIdList)
+      : mDeletedBodyIdList(std::move(aDeletedBodyIdList)) {}
+
+  explicit DeleteOrphanedBodyAction(const nsID& aBodyId)
+      : mDeletedBodyIdList{aBodyId} {}
+
+  void RunOnTarget(SafeRefPtr<Resolver> aResolver,
+                   const Maybe<CacheDirectoryMetadata>& aDirectoryMetadata,
+                   Data*,
+                   const Maybe<CipherKey>& ) override {
+    MOZ_DIAGNOSTIC_ASSERT(aResolver);
+    MOZ_DIAGNOSTIC_ASSERT(aDirectoryMetadata);
+    MOZ_DIAGNOSTIC_ASSERT(aDirectoryMetadata->mDir);
+
+
+    const auto resolve = [&aResolver](const nsresult rv) {
+      aResolver->Resolve(rv);
+    };
+
+    QM_TRY_INSPECT(const auto& dbDir,
+                   CloneFileAndAppend(*aDirectoryMetadata->mDir, u"cache"_ns),
+                   QM_VOID, resolve);
+
+    QM_TRY(MOZ_TO_RESULT(BodyDeleteFiles(*aDirectoryMetadata, *dbDir,
+                                         mDeletedBodyIdList)),
+           QM_VOID, resolve);
+
+    aResolver->Resolve(NS_OK);
+  }
+
+ private:
+  DeletedBodyIdList mDeletedBodyIdList;
+};
+
+bool IsHeadRequest(const CacheRequest& aRequest,
+                   const CacheQueryParams& aParams) {
+  return !aParams.ignoreMethod() &&
+         aRequest.method().LowerCaseEqualsLiteral("head");
+}
+
+bool IsHeadRequest(const Maybe<CacheRequest>& aRequest,
+                   const CacheQueryParams& aParams) {
+  if (aRequest.isSome()) {
+    return !aParams.ignoreMethod() &&
+           aRequest.ref().method().LowerCaseEqualsLiteral("head");
+  }
+  return false;
+}
+
+auto MatchByCacheId(CacheId aCacheId) {
+  return [aCacheId](const auto& entry) { return entry.mCacheId == aCacheId; };
+}
+
+auto MatchByBodyId(const nsID& aBodyId) {
+  return [&aBodyId](const auto& entry) { return entry.mBodyId == aBodyId; };
+}
+
+}  
+
+
+class Manager::Factory {
+ public:
+  friend class StaticAutoPtr<Manager::Factory>;
+
+  static Result<SafeRefPtr<Manager>, nsresult> AcquireCreateIfNonExistent(
+      const SafeRefPtr<ManagerId>& aManagerId) {
+    mozilla::ipc::AssertIsOnBackgroundThread();
+
+    MOZ_ASSERT(AppShutdown::GetCurrentShutdownPhase() <
+               ShutdownPhase::AppShutdownQM);
+    if (AppShutdown::GetCurrentShutdownPhase() >=
+        ShutdownPhase::AppShutdownQM) {
+      NS_WARNING(
+          "Attempt to AcquireCreateIfNonExistent a Manager during QM "
+          "shutdown.");
+      return Err(NS_ERROR_ILLEGAL_DURING_SHUTDOWN);
+    }
+
+    QM_TRY(MOZ_TO_RESULT(MaybeCreateInstance()));
+
+    SafeRefPtr<Manager> ref = Acquire(*aManagerId);
+    if (!ref) {
+      nsCOMPtr<nsIThread> ioThread;
+      QM_TRY(MOZ_TO_RESULT(
+          NS_NewNamedThread("DOMCacheThread", getter_AddRefs(ioThread))));
+
+      ref = MakeSafeRefPtr<Manager>(aManagerId.clonePtr(), ioThread,
+                                    ConstructorGuard{});
+
+      const SafeRefPtr<Manager> oldManager = Acquire(*aManagerId, Closing);
+      ref->Init(oldManager.maybeDeref());
+
+      MOZ_ASSERT(!sFactory->mManagerList.Contains(ref));
+      sFactory->mManagerList.AppendElement(
+          WrapNotNullUnchecked(ref.unsafeGetRawPtr()));
+    }
+
+    return ref;
+  }
+
+  static void Remove(Manager& aManager) {
+    mozilla::ipc::AssertIsOnBackgroundThread();
+    MOZ_DIAGNOSTIC_ASSERT(sFactory);
+
+    MOZ_ALWAYS_TRUE(sFactory->mManagerList.RemoveElement(&aManager));
+
+    quota::QuotaManager::SafeMaybeRecordQuotaClientShutdownStep(
+        quota::Client::DOMCACHE, "Manager removed"_ns);
+
+    MaybeDestroyInstance();
+  }
+
+  static void Abort(const Client::DirectoryLockIdTable& aDirectoryLockIds) {
+    mozilla::ipc::AssertIsOnBackgroundThread();
+
+    AbortMatching([&aDirectoryLockIds](const auto& manager) {
+      return Client::IsLockForObjectAcquiredAndContainedInLockTable(
+          manager, aDirectoryLockIds);
+    });
+  }
+
+  static void AbortAll() {
+    mozilla::ipc::AssertIsOnBackgroundThread();
+
+    AbortMatching([](const auto&) { return true; });
+  }
+
+  static void ShutdownAll() {
+    mozilla::ipc::AssertIsOnBackgroundThread();
+
+    if (!sFactory) {
+      return;
+    }
+
+    MOZ_DIAGNOSTIC_ASSERT(!sFactory->mManagerList.IsEmpty());
+
+    {
+      AutoRestore<bool> restore(sFactory->mInSyncAbortOrShutdown);
+      sFactory->mInSyncAbortOrShutdown = true;
+
+      for (const auto& manager : sFactory->mManagerList.ForwardRange()) {
+        auto pinnedManager =
+            SafeRefPtr{manager.get(), AcquireStrongRefFromRawPtr{}};
+        pinnedManager->Shutdown();
+      }
+    }
+
+    MaybeDestroyInstance();
+  }
+
+  static bool IsShutdownAllComplete() {
+    mozilla::ipc::AssertIsOnBackgroundThread();
+    return !sFactory;
+  }
+
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+  static void RecordMayNotDeleteCSCP(
+      mozilla::ipc::ActorId aCacheStreamControlParentId) {
+    if (sFactory) {
+      sFactory->mPotentiallyUnreleasedCSCP.AppendElement(
+          aCacheStreamControlParentId);
+    }
+  }
+
+  static void RecordHaveDeletedCSCP(
+      mozilla::ipc::ActorId aCacheStreamControlParentId) {
+    if (sFactory) {
+      sFactory->mPotentiallyUnreleasedCSCP.RemoveElement(
+          aCacheStreamControlParentId);
+    }
+  }
+#endif
+  static nsCString GetShutdownStatus() {
+    mozilla::ipc::AssertIsOnBackgroundThread();
+
+    nsCString data;
+
+    if (sFactory && !sFactory->mManagerList.IsEmpty()) {
+      data.Append(
+          "ManagerList: "_ns +
+          IntToCString(static_cast<uint64_t>(sFactory->mManagerList.Length())) +
+          kStringifyStartSet);
+
+      for (const auto& manager : sFactory->mManagerList.NonObservingRange()) {
+        manager->Stringify(data);
+      }
+
+      data.Append(kStringifyEndSet);
+      if (sFactory->mPotentiallyUnreleasedCSCP.Length() > 0) {
+        data.Append(
+            "There have been CSCP instances whose"
+            "Send__delete__ might not have freed them.");
+      }
+    }
+
+    return data;
+  }
+
+ private:
+  Factory() : mInSyncAbortOrShutdown(false) {
+    MOZ_COUNT_CTOR(cache::Manager::Factory);
+  }
+
+  ~Factory() {
+    MOZ_COUNT_DTOR(cache::Manager::Factory);
+    MOZ_DIAGNOSTIC_ASSERT(mManagerList.IsEmpty());
+    MOZ_DIAGNOSTIC_ASSERT(!mInSyncAbortOrShutdown);
+  }
+
+  static nsresult MaybeCreateInstance() {
+    mozilla::ipc::AssertIsOnBackgroundThread();
+
+    if (!sFactory) {
+      sFactory = new Factory();
+    }
+
+
+    return NS_OK;
+  }
+
+  static void MaybeDestroyInstance() {
+    mozilla::ipc::AssertIsOnBackgroundThread();
+    MOZ_DIAGNOSTIC_ASSERT(sFactory);
+
+    if (!sFactory->mManagerList.IsEmpty() || sFactory->mInSyncAbortOrShutdown) {
+      return;
+    }
+
+    sFactory = nullptr;
+  }
+
+  static SafeRefPtr<Manager> Acquire(const ManagerId& aManagerId,
+                                     State aState = Open) {
+    mozilla::ipc::AssertIsOnBackgroundThread();
+
+    QM_TRY(MOZ_TO_RESULT(MaybeCreateInstance()), nullptr);
+
+    const auto range = Reversed(sFactory->mManagerList.NonObservingRange());
+    const auto foundIt = std::find_if(
+        range.begin(), range.end(), [aState, &aManagerId](const auto& manager) {
+          return aState == manager->GetState() &&
+                 *manager->mManagerId == aManagerId;
+        });
+    return foundIt != range.end()
+               ? SafeRefPtr{foundIt->get(), AcquireStrongRefFromRawPtr{}}
+               : nullptr;
+  }
+
+  template <typename Condition>
+  static void AbortMatching(const Condition& aCondition) {
+    mozilla::ipc::AssertIsOnBackgroundThread();
+
+    if (!sFactory) {
+      return;
+    }
+
+    MOZ_DIAGNOSTIC_ASSERT(!sFactory->mManagerList.IsEmpty());
+
+    {
+      AutoRestore<bool> restore(sFactory->mInSyncAbortOrShutdown);
+      sFactory->mInSyncAbortOrShutdown = true;
+
+      for (const auto& manager : sFactory->mManagerList.ForwardRange()) {
+        if (aCondition(*manager)) {
+          auto pinnedManager =
+              SafeRefPtr{manager.get(), AcquireStrongRefFromRawPtr{}};
+          pinnedManager->Abort();
+        }
+      }
+    }
+
+    MaybeDestroyInstance();
+  }
+
+  static StaticAutoPtr<Factory> sFactory;
+
+  nsTObserverArray<NotNull<Manager*>> mManagerList;
+
+  bool mInSyncAbortOrShutdown;
+
+  nsTArray<mozilla::ipc::ActorId> mPotentiallyUnreleasedCSCP;
+};
+
+StaticAutoPtr<Manager::Factory> Manager::Factory::sFactory;
+
+
+class Manager::BaseAction : public SyncDBAction {
+ protected:
+  BaseAction(SafeRefPtr<Manager> aManager, ListenerId aListenerId)
+      : SyncDBAction(DBAction::Existing),
+        mManager(std::move(aManager)),
+        mListenerId(aListenerId) {}
+
+  virtual void Complete(Listener* aListener, ErrorResult&& aRv) = 0;
+
+  virtual void CompleteOnInitiatingThread(nsresult aRv) override {
+    NS_ASSERT_OWNINGTHREAD(Manager::BaseAction);
+    Listener* listener = mManager->GetListener(mListenerId);
+    if (listener) {
+      Complete(listener, ErrorResult(aRv));
+    }
+
+    mManager = nullptr;
+  }
+
+  SafeRefPtr<Manager> mManager;
+  const ListenerId mListenerId;
+};
+
+
+class Manager::DeleteOrphanedCacheAction final : public SyncDBAction {
+ public:
+  DeleteOrphanedCacheAction(SafeRefPtr<Manager> aManager, CacheId aCacheId)
+      : SyncDBAction(DBAction::Existing),
+        mManager(std::move(aManager)),
+        mCacheId(aCacheId) {}
+
+  virtual nsresult RunSyncWithDBOnTarget(
+      const CacheDirectoryMetadata& aDirectoryMetadata, nsIFile* aDBDir,
+      mozIStorageConnection* aConn) override {
+    mDirectoryMetadata.emplace(aDirectoryMetadata);
+
+    mozStorageTransaction trans(aConn, false,
+                                mozIStorageConnection::TRANSACTION_IMMEDIATE);
+
+    QM_TRY(MOZ_TO_RESULT(trans.Start()));
+
+    QM_TRY_UNWRAP(mDeletionInfo, db::DeleteCacheId(*aConn, mCacheId));
+
+    QM_TRY(MOZ_TO_RESULT(MaybeUpdatePaddingFile(
+        aDBDir, aConn,  0, mDeletionInfo.mDeletedPaddingSize,
+        [&trans]() mutable { return trans.Commit(); })));
+
+    return NS_OK;
+  }
+
+  virtual void CompleteOnInitiatingThread(nsresult aRv) override {
+    if (NS_FAILED(aRv)) {
+      mDeletionInfo.mDeletedBodyIdList.Clear();
+      mDeletionInfo.mDeletedPaddingSize = 0;
+    }
+
+    mManager->NoteOrphanedBodyIdList(mDeletionInfo.mDeletedBodyIdList);
+
+    if (mDeletionInfo.mDeletedPaddingSize > 0) {
+      DecreaseUsageForDirectoryMetadata(*mDirectoryMetadata,
+                                        mDeletionInfo.mDeletedPaddingSize);
+    }
+
+    mManager = nullptr;
+  }
+
+ private:
+  SafeRefPtr<Manager> mManager;
+  const CacheId mCacheId;
+  DeletionInfo mDeletionInfo;
+  Maybe<CacheDirectoryMetadata> mDirectoryMetadata;
+};
+
+
+class Manager::CacheMatchAction final : public Manager::BaseAction {
+ public:
+  CacheMatchAction(SafeRefPtr<Manager> aManager, ListenerId aListenerId,
+                   CacheId aCacheId, const CacheMatchArgs& aArgs,
+                   SafeRefPtr<StreamList> aStreamList)
+      : BaseAction(std::move(aManager), aListenerId),
+        mCacheId(aCacheId),
+        mArgs(aArgs),
+        mStreamList(std::move(aStreamList)),
+        mFoundResponse(false) {}
+
+  virtual nsresult RunSyncWithDBOnTarget(
+      const CacheDirectoryMetadata& aDirectoryMetadata, nsIFile* aDBDir,
+      mozIStorageConnection* aConn) override {
+    MOZ_DIAGNOSTIC_ASSERT(aDBDir);
+
+    QM_TRY_INSPECT(
+        const auto& maybeResponse,
+        db::CacheMatch(*aConn, mCacheId, mArgs.request(), mArgs.params()));
+
+    mFoundResponse = maybeResponse.isSome();
+    if (mFoundResponse) {
+      mResponse = std::move(maybeResponse.ref());
+    }
+
+    if (!mFoundResponse || !mResponse.mHasBodyId ||
+        IsHeadRequest(mArgs.request(), mArgs.params())) {
+      mResponse.mHasBodyId = false;
+      return NS_OK;
+    }
+
+    const auto& bodyId = mResponse.mBodyId;
+
+    nsCOMPtr<nsIInputStream> stream;
+    if (mArgs.openMode() == OpenMode::Eager) {
+      QM_TRY_UNWRAP(
+          stream,
+          BodyOpen(aDirectoryMetadata, *aDBDir, bodyId,
+                   GetOrCreateCipherKey(WrapNotNull(mManager->mContext), bodyId,
+                                         false)));
+    }
+
+    if (IsCanceled() ||
+        AppShutdown::IsInOrBeyond(ShutdownPhase::AppShutdownQM)) {
+      if (stream) {
+        stream->Close();
+      }
+      return NS_ERROR_ABORT;
+    }
+
+    mStreamList->Add(mResponse.mBodyId, std::move(stream));
+
+    return NS_OK;
+  }
+
+  virtual void Complete(Listener* aListener, ErrorResult&& aRv) override {
+    if (!mFoundResponse) {
+      aListener->OnOpComplete(std::move(aRv), CacheMatchResult(Nothing()));
+    } else {
+      mStreamList->Activate(mCacheId);
+      aListener->OnOpComplete(std::move(aRv), CacheMatchResult(Nothing()),
+                              mResponse, *mStreamList);
+    }
+    mStreamList = nullptr;
+  }
+
+  virtual bool MatchesCacheId(CacheId aCacheId) const override {
+    return aCacheId == mCacheId;
+  }
+
+ private:
+  const CacheId mCacheId;
+  const CacheMatchArgs mArgs;
+  SafeRefPtr<StreamList> mStreamList;
+  bool mFoundResponse;
+  SavedResponse mResponse;
+};
+
+
+class Manager::CacheMatchAllAction final : public Manager::BaseAction {
+ public:
+  CacheMatchAllAction(SafeRefPtr<Manager> aManager, ListenerId aListenerId,
+                      CacheId aCacheId, const CacheMatchAllArgs& aArgs,
+                      SafeRefPtr<StreamList> aStreamList)
+      : BaseAction(std::move(aManager), aListenerId),
+        mCacheId(aCacheId),
+        mArgs(aArgs),
+        mStreamList(std::move(aStreamList)) {}
+
+  virtual nsresult RunSyncWithDBOnTarget(
+      const CacheDirectoryMetadata& aDirectoryMetadata, nsIFile* aDBDir,
+      mozIStorageConnection* aConn) override {
+    MOZ_DIAGNOSTIC_ASSERT(aDBDir);
+
+    QM_TRY_UNWRAP(mSavedResponses,
+                  db::CacheMatchAll(*aConn, mCacheId, mArgs.maybeRequest(),
+                                    mArgs.params()));
+
+    for (uint32_t i = 0; i < mSavedResponses.Length(); ++i) {
+      if (!mSavedResponses[i].mHasBodyId ||
+          IsHeadRequest(mArgs.maybeRequest(), mArgs.params())) {
+        mSavedResponses[i].mHasBodyId = false;
+        continue;
+      }
+
+      const auto& bodyId = mSavedResponses[i].mBodyId;
+
+      nsCOMPtr<nsIInputStream> stream;
+      if (mArgs.openMode() == OpenMode::Eager) {
+        QM_TRY_UNWRAP(stream,
+                      BodyOpen(aDirectoryMetadata, *aDBDir, bodyId,
+                               GetOrCreateCipherKey(
+                                   WrapNotNull(mManager->mContext), bodyId,
+                                    false)));
+      }
+
+      if (IsCanceled() ||
+          AppShutdown::IsInOrBeyond(ShutdownPhase::AppShutdownQM)) {
+        if (stream) {
+          stream->Close();
+        }
+        return NS_ERROR_ABORT;
+      }
+
+      mStreamList->Add(mSavedResponses[i].mBodyId, std::move(stream));
+    }
+
+    return NS_OK;
+  }
+
+  virtual void Complete(Listener* aListener, ErrorResult&& aRv) override {
+    mStreamList->Activate(mCacheId);
+    aListener->OnOpComplete(std::move(aRv), CacheMatchAllResult(),
+                            mSavedResponses, *mStreamList);
+    mStreamList = nullptr;
+  }
+
+  virtual bool MatchesCacheId(CacheId aCacheId) const override {
+    return aCacheId == mCacheId;
+  }
+
+ private:
+  const CacheId mCacheId;
+  const CacheMatchAllArgs mArgs;
+  SafeRefPtr<StreamList> mStreamList;
+  nsTArray<SavedResponse> mSavedResponses;
+};
+
+
+class Manager::CachePutAllAction final : public DBAction {
+ public:
+  CachePutAllAction(
+      SafeRefPtr<Manager> aManager, ListenerId aListenerId, CacheId aCacheId,
+      const nsTArray<CacheRequestResponse>& aPutList,
+      const nsTArray<nsCOMPtr<nsIInputStream>>& aRequestStreamList,
+      const nsTArray<nsCOMPtr<nsIInputStream>>& aResponseStreamList)
+      : DBAction(DBAction::Existing),
+        mManager(std::move(aManager)),
+        mListenerId(aListenerId),
+        mCacheId(aCacheId),
+        mList(aPutList.Length()),
+        mExpectedAsyncCopyCompletions(1),
+        mAsyncResult(NS_OK),
+        mMutex("cache::Manager::CachePutAllAction"),
+        mUpdatedPaddingSize(0),
+        mDeletedPaddingSize(0) {
+    MOZ_DIAGNOSTIC_ASSERT(!aPutList.IsEmpty());
+    MOZ_DIAGNOSTIC_ASSERT(aPutList.Length() == aRequestStreamList.Length());
+    MOZ_DIAGNOSTIC_ASSERT(aPutList.Length() == aResponseStreamList.Length());
+
+    for (uint32_t i = 0; i < aPutList.Length(); ++i) {
+      Entry* entry = mList.AppendElement();
+      entry->mRequest = aPutList[i].request();
+      entry->mRequestStream = aRequestStreamList[i];
+      entry->mResponse = aPutList[i].response();
+      entry->mResponseStream = aResponseStreamList[i];
+    }
+  }
+
+ private:
+  ~CachePutAllAction() = default;
+
+  virtual void RunWithDBOnTarget(
+      SafeRefPtr<Resolver> aResolver,
+      const CacheDirectoryMetadata& aDirectoryMetadata, nsIFile* aDBDir,
+      mozIStorageConnection* aConn) override {
+    MOZ_DIAGNOSTIC_ASSERT(aResolver);
+    MOZ_DIAGNOSTIC_ASSERT(aDBDir);
+    MOZ_DIAGNOSTIC_ASSERT(aConn);
+    MOZ_DIAGNOSTIC_ASSERT(!mResolver);
+    MOZ_DIAGNOSTIC_ASSERT(!mDBDir);
+    MOZ_DIAGNOSTIC_ASSERT(!mConn);
+
+    MOZ_DIAGNOSTIC_ASSERT(!mTarget);
+    mTarget = GetCurrentSerialEventTarget();
+    MOZ_DIAGNOSTIC_ASSERT(mTarget);
+
+    MOZ_DIAGNOSTIC_ASSERT(mExpectedAsyncCopyCompletions == 1);
+
+    mResolver = std::move(aResolver);
+    mDBDir = aDBDir;
+    mConn = aConn;
+    mDirectoryMetadata.emplace(aDirectoryMetadata);
+
+    const nsresult rv = [this, &aDirectoryMetadata]() -> nsresult {
+      QM_TRY(CollectEachInRange(
+          mList, [this, &aDirectoryMetadata](auto& entry) -> nsresult {
+            QM_TRY(MOZ_TO_RESULT(
+                StartStreamCopy(aDirectoryMetadata, entry, RequestStream,
+                                &mExpectedAsyncCopyCompletions)));
+
+            QM_TRY(MOZ_TO_RESULT(
+                StartStreamCopy(aDirectoryMetadata, entry, ResponseStream,
+                                &mExpectedAsyncCopyCompletions)));
+
+            return NS_OK;
+          }));
+
+      return NS_OK;
+    }();
+
+    OnAsyncCopyComplete(rv);
+  }
+
+  void OnAsyncCopyComplete(nsresult aRv) {
+    MOZ_ASSERT(mTarget->IsOnCurrentThread());
+    MOZ_DIAGNOSTIC_ASSERT(mConn);
+    MOZ_DIAGNOSTIC_ASSERT(mResolver);
+    MOZ_DIAGNOSTIC_ASSERT(mExpectedAsyncCopyCompletions > 0);
+
+    if (NS_SUCCEEDED(aRv) && IsCanceled()) {
+      aRv = NS_ERROR_ABORT;
+    }
+
+    if (NS_FAILED(aRv) && NS_SUCCEEDED(mAsyncResult)) {
+      CancelAllStreamCopying();
+      mAsyncResult = aRv;
+    }
+
+    mExpectedAsyncCopyCompletions -= 1;
+    if (mExpectedAsyncCopyCompletions > 0) {
+      return;
+    }
+
+    {
+      MutexAutoLock lock(mMutex);
+      mCopyContextList.Clear();
+    }
+
+    if (NS_FAILED(mAsyncResult)) {
+      DoResolve(mAsyncResult);
+      return;
+    }
+
+    mozStorageTransaction trans(mConn, false,
+                                mozIStorageConnection::TRANSACTION_IMMEDIATE);
+
+    QM_TRY(MOZ_TO_RESULT(trans.Start()), QM_VOID);
+
+    const nsresult rv = [this, &trans]() -> nsresult {
+      QM_TRY(CollectEachInRange(mList, [this](Entry& e) -> nsresult {
+        if (e.mRequestStream) {
+          QM_TRY_UNWRAP(int64_t bodyDiskSize,
+                        BodyFinalizeWrite(*mDBDir, e.mRequestBodyId));
+          e.mRequest.bodyDiskSize() = bodyDiskSize;
+        } else {
+          e.mRequest.bodyDiskSize() = 0;
+        }
+        if (e.mResponseStream) {
+          if (e.mResponse.type() == ResponseType::Opaque) {
+            QM_TRY(OkIf(e.mResponse.paddingSize() ==
+                            InternalResponse::UNKNOWN_PADDING_SIZE ||
+                        e.mResponse.paddingSize() >= 0),
+                   NS_ERROR_UNEXPECTED);
+
+            QM_TRY(MOZ_TO_RESULT(BodyMaybeUpdatePaddingSize(
+                *mDirectoryMetadata, *mDBDir, e.mResponseBodyId,
+                e.mResponse.paddingInfo(), &e.mResponse.paddingSize())));
+
+            MOZ_DIAGNOSTIC_ASSERT(INT64_MAX - e.mResponse.paddingSize() >=
+                                  mUpdatedPaddingSize);
+            mUpdatedPaddingSize += e.mResponse.paddingSize();
+          }
+
+          QM_TRY_UNWRAP(int64_t bodyDiskSize,
+                        BodyFinalizeWrite(*mDBDir, e.mResponseBodyId));
+          e.mResponse.bodyDiskSize() = bodyDiskSize;
+        } else {
+          e.mResponse.bodyDiskSize() = 0;
+        }
+
+        QM_TRY_UNWRAP(
+            auto deletionInfo,
+            db::CachePut(*mConn, mCacheId, e.mRequest,
+                         e.mRequestStream ? &e.mRequestBodyId : nullptr,
+                         e.mResponse,
+                         e.mResponseStream ? &e.mResponseBodyId : nullptr));
+
+        const int64_t deletedPaddingSize = deletionInfo.mDeletedPaddingSize;
+        mDeletedBodyIdList = std::move(deletionInfo.mDeletedBodyIdList);
+
+        MOZ_DIAGNOSTIC_ASSERT(INT64_MAX - mDeletedPaddingSize >=
+                              deletedPaddingSize);
+        mDeletedPaddingSize += deletedPaddingSize;
+
+        return NS_OK;
+      }));
+
+      QM_TRY(MOZ_TO_RESULT(MaybeUpdatePaddingFile(
+          mDBDir, mConn, mUpdatedPaddingSize, mDeletedPaddingSize,
+          [&trans]() mutable { return trans.Commit(); })));
+
+      return NS_OK;
+    }();
+
+    DoResolve(rv);
+  }
+
+  virtual void CompleteOnInitiatingThread(nsresult aRv) override {
+    NS_ASSERT_OWNINGTHREAD(Action);
+
+    for (uint32_t i = 0; i < mList.Length(); ++i) {
+      mList[i].mRequestStream = nullptr;
+      mList[i].mResponseStream = nullptr;
+    }
+
+    if (NS_FAILED(aRv)) {
+      mDeletedBodyIdList.Clear();
+      mDeletedPaddingSize = 0;
+    }
+
+    mManager->NoteOrphanedBodyIdList(mDeletedBodyIdList);
+
+    if (mDeletedPaddingSize > 0) {
+      DecreaseUsageForDirectoryMetadata(*mDirectoryMetadata,
+                                        mDeletedPaddingSize);
+    }
+
+    Listener* listener = mManager->GetListener(mListenerId);
+    mManager = nullptr;
+    if (listener) {
+      listener->OnOpComplete(ErrorResult(aRv), CachePutAllResult());
+    }
+  }
+
+  virtual void CancelOnInitiatingThread() override {
+    NS_ASSERT_OWNINGTHREAD(Action);
+    Action::CancelOnInitiatingThread();
+    CancelAllStreamCopying();
+  }
+
+  virtual bool MatchesCacheId(CacheId aCacheId) const override {
+    NS_ASSERT_OWNINGTHREAD(Action);
+    return aCacheId == mCacheId;
+  }
+
+  struct Entry {
+    CacheRequest mRequest;
+    nsCOMPtr<nsIInputStream> mRequestStream;
+    nsID mRequestBodyId{};
+    nsCOMPtr<nsISupports> mRequestCopyContext;
+
+    CacheResponse mResponse;
+    nsCOMPtr<nsIInputStream> mResponseStream;
+    nsID mResponseBodyId{};
+    nsCOMPtr<nsISupports> mResponseCopyContext;
+  };
+
+  enum StreamId { RequestStream, ResponseStream };
+
+  nsresult StartStreamCopy(const CacheDirectoryMetadata& aDirectoryMetadata,
+                           Entry& aEntry, StreamId aStreamId,
+                           uint32_t* aCopyCountOut) {
+    MOZ_ASSERT(mTarget->IsOnCurrentThread());
+    MOZ_DIAGNOSTIC_ASSERT(aCopyCountOut);
+
+    if (IsCanceled()) {
+      return NS_ERROR_ABORT;
+    }
+
+    MOZ_DIAGNOSTIC_ASSERT(aStreamId == RequestStream ||
+                          aStreamId == ResponseStream);
+
+    const auto& source = aStreamId == RequestStream ? aEntry.mRequestStream
+                                                    : aEntry.mResponseStream;
+
+    if (!source) {
+      return NS_OK;
+    }
+    QM_TRY_INSPECT(const auto& idGen,
+                   MOZ_TO_RESULT_GET_TYPED(nsCOMPtr<nsIUUIDGenerator>,
+                                           MOZ_SELECT_OVERLOAD(do_GetService),
+                                           "@mozilla.org/uuid-generator;1"));
+
+    nsID bodyId{};
+    QM_TRY(MOZ_TO_RESULT(idGen->GenerateUUIDInPlace(&bodyId)));
+
+    Maybe<CipherKey> maybeKey =
+        GetOrCreateCipherKey(WrapNotNull(mManager->mContext), bodyId,
+                              true);
+
+    QM_TRY_INSPECT(
+        const auto& copyContext,
+        BodyStartWriteStream(aDirectoryMetadata, *mDBDir, bodyId, maybeKey,
+                             *source, this, AsyncCopyCompleteFunc));
+
+    if (aStreamId == RequestStream) {
+      aEntry.mRequestBodyId = bodyId;
+    } else {
+      aEntry.mResponseBodyId = bodyId;
+    }
+
+    mBodyIdWrittenList.AppendElement(bodyId);
+
+    if (copyContext) {
+      MutexAutoLock lock(mMutex);
+      mCopyContextList.AppendElement(copyContext);
+    }
+
+    *aCopyCountOut += 1;
+
+    return NS_OK;
+  }
+
+  void CancelAllStreamCopying() {
+    MutexAutoLock lock(mMutex);
+    for (uint32_t i = 0; i < mCopyContextList.Length(); ++i) {
+      MOZ_DIAGNOSTIC_ASSERT(mCopyContextList[i]);
+      BodyCancelWrite(*mCopyContextList[i]);
+    }
+    mCopyContextList.Clear();
+  }
+
+  static void AsyncCopyCompleteFunc(void* aClosure, nsresult aRv) {
+    MOZ_DIAGNOSTIC_ASSERT(aClosure);
+    CachePutAllAction* action = static_cast<CachePutAllAction*>(aClosure);
+    action->CallOnAsyncCopyCompleteOnTargetThread(aRv);
+  }
+
+  void CallOnAsyncCopyCompleteOnTargetThread(nsresult aRv) {
+    nsCOMPtr<nsIRunnable> runnable = NewNonOwningRunnableMethod<nsresult>(
+        "dom::cache::Manager::CachePutAllAction::OnAsyncCopyComplete", this,
+        &CachePutAllAction::OnAsyncCopyComplete, aRv);
+    MOZ_ALWAYS_SUCCEEDS(
+        mTarget->Dispatch(runnable.forget(), nsIThread::DISPATCH_NORMAL));
+  }
+
+  void DoResolve(nsresult aRv) {
+    MOZ_ASSERT(mTarget->IsOnCurrentThread());
+
+#ifdef DEBUG
+    {
+      MutexAutoLock lock(mMutex);
+      MOZ_ASSERT(mCopyContextList.IsEmpty());
+    }
+#endif
+
+    if (NS_FAILED(aRv)) {
+      BodyDeleteFiles(*mDirectoryMetadata, *mDBDir, mBodyIdWrittenList);
+      if (mUpdatedPaddingSize > 0) {
+        DecreaseUsageForDirectoryMetadata(*mDirectoryMetadata,
+                                          mUpdatedPaddingSize);
+      }
+    }
+
+    mConn = nullptr;
+
+    mTarget = nullptr;
+
+    SafeRefPtr<Action::Resolver> resolver = std::move(mResolver);
+    resolver->Resolve(aRv);
+  }
+
+  SafeRefPtr<Manager> mManager;
+  const ListenerId mListenerId;
+
+  const CacheId mCacheId;
+  nsTArray<Entry> mList;
+  uint32_t mExpectedAsyncCopyCompletions;
+
+  SafeRefPtr<Resolver> mResolver;
+  nsCOMPtr<nsIFile> mDBDir;
+  nsCOMPtr<mozIStorageConnection> mConn;
+  nsCOMPtr<nsISerialEventTarget> mTarget;
+  nsresult mAsyncResult;
+  nsTArray<nsID> mBodyIdWrittenList;
+
+  nsTArray<nsID> mDeletedBodyIdList;
+
+  Mutex mMutex MOZ_UNANNOTATED;
+  nsTArray<nsCOMPtr<nsISupports>> mCopyContextList;
+
+  Maybe<CacheDirectoryMetadata> mDirectoryMetadata;
+  int64_t mUpdatedPaddingSize;
+  int64_t mDeletedPaddingSize;
+};
+
+
+class Manager::CacheDeleteAction final : public Manager::BaseAction {
+ public:
+  CacheDeleteAction(SafeRefPtr<Manager> aManager, ListenerId aListenerId,
+                    CacheId aCacheId, const CacheDeleteArgs& aArgs)
+      : BaseAction(std::move(aManager), aListenerId),
+        mCacheId(aCacheId),
+        mArgs(aArgs),
+        mSuccess(false) {}
+
+  virtual nsresult RunSyncWithDBOnTarget(
+      const CacheDirectoryMetadata& aDirectoryMetadata, nsIFile* aDBDir,
+      mozIStorageConnection* aConn) override {
+    mDirectoryMetadata.emplace(aDirectoryMetadata);
+
+    mozStorageTransaction trans(aConn, false,
+                                mozIStorageConnection::TRANSACTION_IMMEDIATE);
+
+    QM_TRY(MOZ_TO_RESULT(trans.Start()));
+
+    QM_TRY_UNWRAP(
+        auto maybeDeletionInfo,
+        db::CacheDelete(*aConn, mCacheId, mArgs.request(), mArgs.params()));
+
+    mSuccess = maybeDeletionInfo.isSome();
+    if (mSuccess) {
+      mDeletionInfo = std::move(maybeDeletionInfo.ref());
+    }
+
+    QM_TRY(MOZ_TO_RESULT(MaybeUpdatePaddingFile(
+               aDBDir, aConn,  0,
+               mDeletionInfo.mDeletedPaddingSize,
+               [&trans]() mutable { return trans.Commit(); })),
+           QM_PROPAGATE, [this](const nsresult) { mSuccess = false; });
+
+    return NS_OK;
+  }
+
+  virtual void Complete(Listener* aListener, ErrorResult&& aRv) override {
+    if (aRv.Failed()) {
+      mDeletionInfo.mDeletedBodyIdList.Clear();
+      mDeletionInfo.mDeletedPaddingSize = 0;
+    }
+
+    mManager->NoteOrphanedBodyIdList(mDeletionInfo.mDeletedBodyIdList);
+
+    if (mDeletionInfo.mDeletedPaddingSize > 0) {
+      DecreaseUsageForDirectoryMetadata(*mDirectoryMetadata,
+                                        mDeletionInfo.mDeletedPaddingSize);
+    }
+
+    aListener->OnOpComplete(std::move(aRv), CacheDeleteResult(mSuccess));
+  }
+
+  virtual bool MatchesCacheId(CacheId aCacheId) const override {
+    return aCacheId == mCacheId;
+  }
+
+ private:
+  const CacheId mCacheId;
+  const CacheDeleteArgs mArgs;
+  bool mSuccess;
+  DeletionInfo mDeletionInfo;
+  Maybe<CacheDirectoryMetadata> mDirectoryMetadata;
+};
+
+
+class Manager::CacheKeysAction final : public Manager::BaseAction {
+ public:
+  CacheKeysAction(SafeRefPtr<Manager> aManager, ListenerId aListenerId,
+                  CacheId aCacheId, const CacheKeysArgs& aArgs,
+                  SafeRefPtr<StreamList> aStreamList)
+      : BaseAction(std::move(aManager), aListenerId),
+        mCacheId(aCacheId),
+        mArgs(aArgs),
+        mStreamList(std::move(aStreamList)) {}
+
+  virtual nsresult RunSyncWithDBOnTarget(
+      const CacheDirectoryMetadata& aDirectoryMetadata, nsIFile* aDBDir,
+      mozIStorageConnection* aConn) override {
+    MOZ_DIAGNOSTIC_ASSERT(aDBDir);
+
+    QM_TRY_UNWRAP(
+        mSavedRequests,
+        db::CacheKeys(*aConn, mCacheId, mArgs.maybeRequest(), mArgs.params()));
+
+    for (uint32_t i = 0; i < mSavedRequests.Length(); ++i) {
+      if (!mSavedRequests[i].mHasBodyId ||
+          IsHeadRequest(mArgs.maybeRequest(), mArgs.params())) {
+        mSavedRequests[i].mHasBodyId = false;
+        continue;
+      }
+
+      const auto& bodyId = mSavedRequests[i].mBodyId;
+
+      nsCOMPtr<nsIInputStream> stream;
+      if (mArgs.openMode() == OpenMode::Eager) {
+        QM_TRY_UNWRAP(stream,
+                      BodyOpen(aDirectoryMetadata, *aDBDir, bodyId,
+                               GetOrCreateCipherKey(
+                                   WrapNotNull(mManager->mContext), bodyId,
+                                    false)));
+      }
+
+      if (IsCanceled() ||
+          AppShutdown::IsInOrBeyond(ShutdownPhase::AppShutdownQM)) {
+        if (stream) {
+          stream->Close();
+        }
+        return NS_ERROR_ABORT;
+      }
+
+      mStreamList->Add(mSavedRequests[i].mBodyId, std::move(stream));
+    }
+
+    return NS_OK;
+  }
+
+  virtual void Complete(Listener* aListener, ErrorResult&& aRv) override {
+    mStreamList->Activate(mCacheId);
+    aListener->OnOpComplete(std::move(aRv), CacheKeysResult(), mSavedRequests,
+                            *mStreamList);
+    mStreamList = nullptr;
+  }
+
+  virtual bool MatchesCacheId(CacheId aCacheId) const override {
+    return aCacheId == mCacheId;
+  }
+
+ private:
+  const CacheId mCacheId;
+  const CacheKeysArgs mArgs;
+  SafeRefPtr<StreamList> mStreamList;
+  nsTArray<SavedRequest> mSavedRequests;
+};
+
+
+class Manager::StorageMatchAction final : public Manager::BaseAction {
+ public:
+  StorageMatchAction(SafeRefPtr<Manager> aManager, ListenerId aListenerId,
+                     Namespace aNamespace, const StorageMatchArgs& aArgs,
+                     SafeRefPtr<StreamList> aStreamList)
+      : BaseAction(std::move(aManager), aListenerId),
+        mNamespace(aNamespace),
+        mArgs(aArgs),
+        mStreamList(std::move(aStreamList)),
+        mFoundResponse(false) {}
+
+  virtual nsresult RunSyncWithDBOnTarget(
+      const CacheDirectoryMetadata& aDirectoryMetadata, nsIFile* aDBDir,
+      mozIStorageConnection* aConn) override {
+    MOZ_DIAGNOSTIC_ASSERT(aDBDir);
+
+    auto maybeResponse =
+        db::StorageMatch(*aConn, mNamespace, mArgs.request(), mArgs.params());
+    if (NS_WARN_IF(maybeResponse.isErr())) {
+      return maybeResponse.unwrapErr();
+    }
+
+    mFoundResponse = maybeResponse.inspect().isSome();
+    if (mFoundResponse) {
+      mSavedResponse = maybeResponse.unwrap().ref();
+    }
+
+    if (!mFoundResponse || !mSavedResponse.mHasBodyId ||
+        IsHeadRequest(mArgs.request(), mArgs.params())) {
+      mSavedResponse.mHasBodyId = false;
+      return NS_OK;
+    }
+
+    const auto& bodyId = mSavedResponse.mBodyId;
+
+    nsCOMPtr<nsIInputStream> stream;
+    if (mArgs.openMode() == OpenMode::Eager) {
+      QM_TRY_UNWRAP(
+          stream,
+          BodyOpen(aDirectoryMetadata, *aDBDir, bodyId,
+                   GetOrCreateCipherKey(WrapNotNull(mManager->mContext), bodyId,
+                                         false)));
+    }
+
+    if (IsCanceled() ||
+        AppShutdown::IsInOrBeyond(ShutdownPhase::AppShutdownQM)) {
+      if (stream) {
+        stream->Close();
+      }
+      return NS_ERROR_ABORT;
+    }
+
+    mStreamList->Add(mSavedResponse.mBodyId, std::move(stream));
+
+    return NS_OK;
+  }
+
+  virtual void Complete(Listener* aListener, ErrorResult&& aRv) override {
+    if (!mFoundResponse) {
+      aListener->OnOpComplete(std::move(aRv), StorageMatchResult(Nothing()));
+    } else {
+      mStreamList->Activate(mSavedResponse.mCacheId);
+      aListener->OnOpComplete(std::move(aRv), StorageMatchResult(Nothing()),
+                              mSavedResponse, *mStreamList);
+    }
+    mStreamList = nullptr;
+  }
+
+ private:
+  const Namespace mNamespace;
+  const StorageMatchArgs mArgs;
+  SafeRefPtr<StreamList> mStreamList;
+  bool mFoundResponse;
+  SavedResponse mSavedResponse;
+};
+
+
+class Manager::StorageHasAction final : public Manager::BaseAction {
+ public:
+  StorageHasAction(SafeRefPtr<Manager> aManager, ListenerId aListenerId,
+                   Namespace aNamespace, const StorageHasArgs& aArgs)
+      : BaseAction(std::move(aManager), aListenerId),
+        mNamespace(aNamespace),
+        mArgs(aArgs),
+        mCacheFound(false) {}
+
+  virtual nsresult RunSyncWithDBOnTarget(
+      const CacheDirectoryMetadata& aDirectoryMetadata, nsIFile* aDBDir,
+      mozIStorageConnection* aConn) override {
+    QM_TRY_INSPECT(const auto& maybeCacheId,
+                   db::StorageGetCacheId(*aConn, mNamespace, mArgs.key()));
+
+    mCacheFound = maybeCacheId.isSome();
+
+    return NS_OK;
+  }
+
+  virtual void Complete(Listener* aListener, ErrorResult&& aRv) override {
+    aListener->OnOpComplete(std::move(aRv), StorageHasResult(mCacheFound));
+  }
+
+ private:
+  const Namespace mNamespace;
+  const StorageHasArgs mArgs;
+  bool mCacheFound;
+};
+
+
+class Manager::StorageOpenAction final : public Manager::BaseAction {
+ public:
+  StorageOpenAction(SafeRefPtr<Manager> aManager, ListenerId aListenerId,
+                    Namespace aNamespace, const StorageOpenArgs& aArgs)
+      : BaseAction(std::move(aManager), aListenerId),
+        mNamespace(aNamespace),
+        mArgs(aArgs),
+        mCacheId(INVALID_CACHE_ID) {}
+
+  virtual nsresult RunSyncWithDBOnTarget(
+      const CacheDirectoryMetadata& aDirectoryMetadata, nsIFile* aDBDir,
+      mozIStorageConnection* aConn) override {
+    mozStorageTransaction trans(aConn, false,
+                                mozIStorageConnection::TRANSACTION_IMMEDIATE);
+
+    QM_TRY(MOZ_TO_RESULT(trans.Start()));
+
+    QM_TRY_INSPECT(const auto& maybeCacheId,
+                   db::StorageGetCacheId(*aConn, mNamespace, mArgs.key()));
+
+    if (maybeCacheId.isSome()) {
+      mCacheId = maybeCacheId.ref();
+      MOZ_DIAGNOSTIC_ASSERT(mCacheId != INVALID_CACHE_ID);
+      return NS_OK;
+    }
+
+    QM_TRY_UNWRAP(mCacheId, db::CreateCacheId(*aConn));
+
+    QM_TRY(MOZ_TO_RESULT(
+        db::StoragePutCache(*aConn, mNamespace, mArgs.key(), mCacheId)));
+
+    QM_TRY(MOZ_TO_RESULT(trans.Commit()));
+
+    MOZ_DIAGNOSTIC_ASSERT(mCacheId != INVALID_CACHE_ID);
+    return NS_OK;
+  }
+
+  virtual void Complete(Listener* aListener, ErrorResult&& aRv) override {
+    MOZ_DIAGNOSTIC_ASSERT(aRv.Failed() || mCacheId != INVALID_CACHE_ID);
+    aListener->OnOpComplete(
+        std::move(aRv), StorageOpenResult((PCacheParent*)nullptr, mNamespace),
+        mCacheId);
+  }
+
+ private:
+  const Namespace mNamespace;
+  const StorageOpenArgs mArgs;
+  CacheId mCacheId;
+};
+
+
+class Manager::StorageDeleteAction final : public Manager::BaseAction {
+ public:
+  StorageDeleteAction(SafeRefPtr<Manager> aManager, ListenerId aListenerId,
+                      Namespace aNamespace, const StorageDeleteArgs& aArgs)
+      : BaseAction(std::move(aManager), aListenerId),
+        mNamespace(aNamespace),
+        mArgs(aArgs),
+        mCacheDeleted(false),
+        mCacheId(INVALID_CACHE_ID) {}
+
+  virtual nsresult RunSyncWithDBOnTarget(
+      const CacheDirectoryMetadata& aDirectoryMetadata, nsIFile* aDBDir,
+      mozIStorageConnection* aConn) override {
+    mozStorageTransaction trans(aConn, false,
+                                mozIStorageConnection::TRANSACTION_IMMEDIATE);
+
+    QM_TRY(MOZ_TO_RESULT(trans.Start()));
+
+    QM_TRY_INSPECT(const auto& maybeCacheId,
+                   db::StorageGetCacheId(*aConn, mNamespace, mArgs.key()));
+
+    if (maybeCacheId.isNothing()) {
+      mCacheDeleted = false;
+      return NS_OK;
+    }
+    mCacheId = maybeCacheId.ref();
+
+    QM_TRY(
+        MOZ_TO_RESULT(db::StorageForgetCache(*aConn, mNamespace, mArgs.key())));
+
+    QM_TRY(MOZ_TO_RESULT(trans.Commit()));
+
+    mCacheDeleted = true;
+    return NS_OK;
+  }
+
+  virtual void Complete(Listener* aListener, ErrorResult&& aRv) override {
+    if (mCacheDeleted) {
+      if (!mManager->SetCacheIdOrphanedIfRefed(mCacheId)) {
+        const auto pinnedContext =
+            SafeRefPtr{mManager->mContext, AcquireStrongRefFromRawPtr{}};
+
+        if (pinnedContext->IsCanceled()) {
+          pinnedContext->NoteOrphanedData();
+        } else {
+          pinnedContext->CancelForCacheId(mCacheId);
+          pinnedContext->Dispatch(MakeSafeRefPtr<DeleteOrphanedCacheAction>(
+              mManager.clonePtr(), mCacheId));
+        }
+      }
+    }
+
+    aListener->OnOpComplete(std::move(aRv), StorageDeleteResult(mCacheDeleted));
+  }
+
+ private:
+  const Namespace mNamespace;
+  const StorageDeleteArgs mArgs;
+  bool mCacheDeleted;
+  CacheId mCacheId;
+};
+
+
+class Manager::StorageKeysAction final : public Manager::BaseAction {
+ public:
+  StorageKeysAction(SafeRefPtr<Manager> aManager, ListenerId aListenerId,
+                    Namespace aNamespace)
+      : BaseAction(std::move(aManager), aListenerId), mNamespace(aNamespace) {}
+
+  virtual nsresult RunSyncWithDBOnTarget(
+      const CacheDirectoryMetadata& aDirectoryMetadata, nsIFile* aDBDir,
+      mozIStorageConnection* aConn) override {
+    QM_TRY_UNWRAP(mKeys, db::StorageGetKeys(*aConn, mNamespace));
+
+    return NS_OK;
+  }
+
+  virtual void Complete(Listener* aListener, ErrorResult&& aRv) override {
+    if (aRv.Failed()) {
+      mKeys.Clear();
+    }
+    aListener->OnOpComplete(std::move(aRv), StorageKeysResult(mKeys));
+  }
+
+ private:
+  const Namespace mNamespace;
+  nsTArray<nsString> mKeys;
+};
+
+
+class Manager::OpenStreamAction final : public Manager::BaseAction {
+ public:
+  OpenStreamAction(SafeRefPtr<Manager> aManager, ListenerId aListenerId,
+                   InputStreamResolver&& aResolver, const nsID& aBodyId)
+      : BaseAction(std::move(aManager), aListenerId),
+        mResolver(std::move(aResolver)),
+        mBodyId(aBodyId) {}
+
+  virtual nsresult RunSyncWithDBOnTarget(
+      const CacheDirectoryMetadata& aDirectoryMetadata, nsIFile* aDBDir,
+      mozIStorageConnection* aConn) override {
+    MOZ_DIAGNOSTIC_ASSERT(aDBDir);
+
+    QM_TRY_UNWRAP(
+        mBodyStream,
+        BodyOpen(aDirectoryMetadata, *aDBDir, mBodyId,
+                 GetOrCreateCipherKey(WrapNotNull(mManager->mContext), mBodyId,
+                                       false)));
+
+    return NS_OK;
+  }
+
+  virtual void Complete(Listener* aListener, ErrorResult&& aRv) override {
+    if (aRv.Failed()) {
+      aRv.SuppressException();
+      mResolver(nullptr);
+    } else {
+      mResolver(std::move(mBodyStream));
+    }
+
+    mResolver = nullptr;
+  }
+
+ private:
+  InputStreamResolver mResolver;
+  const nsID mBodyId;
+  nsCOMPtr<nsIInputStream> mBodyStream;
+};
+
+
+Manager::ListenerId Manager::sNextListenerId = 0;
+
+void Manager::Listener::OnOpComplete(ErrorResult&& aRv,
+                                     const CacheOpResult& aResult) {
+  OnOpComplete(std::move(aRv), aResult, INVALID_CACHE_ID, Nothing());
+}
+
+void Manager::Listener::OnOpComplete(ErrorResult&& aRv,
+                                     const CacheOpResult& aResult,
+                                     CacheId aOpenedCacheId) {
+  OnOpComplete(std::move(aRv), aResult, aOpenedCacheId, Nothing());
+}
+
+void Manager::Listener::OnOpComplete(ErrorResult&& aRv,
+                                     const CacheOpResult& aResult,
+                                     const SavedResponse& aSavedResponse,
+                                     StreamList& aStreamList) {
+  AutoTArray<SavedResponse, 1> responseList;
+  responseList.AppendElement(aSavedResponse);
+  OnOpComplete(
+      std::move(aRv), aResult, INVALID_CACHE_ID,
+      Some(StreamInfo{responseList, nsTArray<SavedRequest>(), aStreamList}));
+}
+
+void Manager::Listener::OnOpComplete(
+    ErrorResult&& aRv, const CacheOpResult& aResult,
+    const nsTArray<SavedResponse>& aSavedResponseList,
+    StreamList& aStreamList) {
+  OnOpComplete(std::move(aRv), aResult, INVALID_CACHE_ID,
+               Some(StreamInfo{aSavedResponseList, nsTArray<SavedRequest>(),
+                               aStreamList}));
+}
+
+void Manager::Listener::OnOpComplete(
+    ErrorResult&& aRv, const CacheOpResult& aResult,
+    const nsTArray<SavedRequest>& aSavedRequestList, StreamList& aStreamList) {
+  OnOpComplete(std::move(aRv), aResult, INVALID_CACHE_ID,
+               Some(StreamInfo{nsTArray<SavedResponse>(), aSavedRequestList,
+                               aStreamList}));
+}
+
+Result<SafeRefPtr<Manager>, nsresult> Manager::AcquireCreateIfNonExistent(
+    const SafeRefPtr<ManagerId>& aManagerId) {
+  mozilla::ipc::AssertIsOnBackgroundThread();
+  return Factory::AcquireCreateIfNonExistent(aManagerId);
+}
+
+void Manager::InitiateShutdown() {
+  mozilla::ipc::AssertIsOnBackgroundThread();
+
+  Factory::AbortAll();
+
+  Factory::ShutdownAll();
+}
+
+bool Manager::IsShutdownAllComplete() {
+  mozilla::ipc::AssertIsOnBackgroundThread();
+
+  return Factory::IsShutdownAllComplete();
+}
+
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+void Manager::RecordMayNotDeleteCSCP(
+    mozilla::ipc::ActorId aCacheStreamControlParentId) {
+  Factory::RecordMayNotDeleteCSCP(aCacheStreamControlParentId);
+}
+
+void Manager::RecordHaveDeletedCSCP(
+    mozilla::ipc::ActorId aCacheStreamControlParentId) {
+  Factory::RecordHaveDeletedCSCP(aCacheStreamControlParentId);
+}
+#endif
+
+nsCString Manager::GetShutdownStatus() {
+  mozilla::ipc::AssertIsOnBackgroundThread();
+
+  return Factory::GetShutdownStatus();
+}
+
+void Manager::Abort(const Client::DirectoryLockIdTable& aDirectoryLockIds) {
+  mozilla::ipc::AssertIsOnBackgroundThread();
+
+  Factory::Abort(aDirectoryLockIds);
+}
+
+void Manager::AbortAll() {
+  mozilla::ipc::AssertIsOnBackgroundThread();
+
+  Factory::AbortAll();
+}
+
+void Manager::RemoveListener(Listener* aListener) {
+  NS_ASSERT_OWNINGTHREAD(Manager);
+  mListeners.RemoveElement(aListener, ListenerEntryListenerComparator());
+  MOZ_ASSERT(
+      !mListeners.Contains(aListener, ListenerEntryListenerComparator()));
+  MaybeAllowContextToClose();
+}
+
+void Manager::RemoveContext(Context& aContext) {
+  NS_ASSERT_OWNINGTHREAD(Manager);
+  MOZ_DIAGNOSTIC_ASSERT(mContext);
+  MOZ_DIAGNOSTIC_ASSERT(mContext == &aContext);
+
+  MOZ_DIAGNOSTIC_ASSERT(mState == Closing);
+
+  if (std::any_of(
+          mCacheIdRefs.cbegin(), mCacheIdRefs.cend(),
+          [](const auto& cacheIdRef) { return cacheIdRef.mOrphaned; }) ||
+      std::any_of(mBodyIdRefs.cbegin(), mBodyIdRefs.cend(),
+                  [](const auto& bodyIdRef) { return bodyIdRef.mOrphaned; })) {
+    aContext.NoteOrphanedData();
+  }
+
+  mContext = nullptr;
+
+  Factory::Remove(*this);
+}
+
+void Manager::NoteClosing() {
+  NS_ASSERT_OWNINGTHREAD(Manager);
+  mState = Closing;
+}
+
+Manager::State Manager::GetState() const {
+  NS_ASSERT_OWNINGTHREAD(Manager);
+  return mState;
+}
+
+void Manager::AddRefCacheId(CacheId aCacheId) {
+  NS_ASSERT_OWNINGTHREAD(Manager);
+
+  const auto end = mCacheIdRefs.end();
+  const auto foundIt =
+      std::find_if(mCacheIdRefs.begin(), end, MatchByCacheId(aCacheId));
+  if (foundIt != end) {
+    foundIt->mCount += 1;
+    return;
+  }
+
+  mCacheIdRefs.AppendElement(CacheIdRefCounter{aCacheId, 1, false});
+}
+
+void Manager::ReleaseCacheId(CacheId aCacheId) {
+  NS_ASSERT_OWNINGTHREAD(Manager);
+
+  const auto end = mCacheIdRefs.end();
+  const auto foundIt =
+      std::find_if(mCacheIdRefs.begin(), end, MatchByCacheId(aCacheId));
+  if (foundIt != end) {
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+    const uint32_t oldRef = foundIt->mCount;
+#endif
+    foundIt->mCount -= 1;
+    MOZ_DIAGNOSTIC_ASSERT(foundIt->mCount < oldRef);
+    if (foundIt->mCount == 0) {
+      const bool orphaned = foundIt->mOrphaned;
+      mCacheIdRefs.RemoveElementAt(foundIt);
+      const auto pinnedContext =
+          SafeRefPtr{mContext, AcquireStrongRefFromRawPtr{}};
+      if (orphaned && pinnedContext) {
+        if (pinnedContext->IsCanceled()) {
+          pinnedContext->NoteOrphanedData();
+        } else {
+          pinnedContext->CancelForCacheId(aCacheId);
+          pinnedContext->Dispatch(MakeSafeRefPtr<DeleteOrphanedCacheAction>(
+              SafeRefPtrFromThis(), aCacheId));
+        }
+      }
+    }
+    MaybeAllowContextToClose();
+    return;
+  }
+
+  MOZ_ASSERT_UNREACHABLE("Attempt to release CacheId that is not referenced!");
+}
+
+void Manager::AddRefBodyId(const nsID& aBodyId) {
+  NS_ASSERT_OWNINGTHREAD(Manager);
+
+  const auto end = mBodyIdRefs.end();
+  const auto foundIt =
+      std::find_if(mBodyIdRefs.begin(), end, MatchByBodyId(aBodyId));
+  if (foundIt != end) {
+    foundIt->mCount += 1;
+    return;
+  }
+
+  mBodyIdRefs.AppendElement(BodyIdRefCounter{aBodyId, 1, false});
+}
+
+void Manager::ReleaseBodyId(const nsID& aBodyId) {
+  NS_ASSERT_OWNINGTHREAD(Manager);
+
+  const auto end = mBodyIdRefs.end();
+  const auto foundIt =
+      std::find_if(mBodyIdRefs.begin(), end, MatchByBodyId(aBodyId));
+  if (foundIt != end) {
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+    const uint32_t oldRef = foundIt->mCount;
+#endif
+    foundIt->mCount -= 1;
+    MOZ_DIAGNOSTIC_ASSERT(foundIt->mCount < oldRef);
+    if (foundIt->mCount < 1) {
+      const bool orphaned = foundIt->mOrphaned;
+      mBodyIdRefs.RemoveElementAt(foundIt);
+      const auto pinnedContext =
+          SafeRefPtr{mContext, AcquireStrongRefFromRawPtr{}};
+      if (orphaned && pinnedContext) {
+        if (pinnedContext->IsCanceled()) {
+          pinnedContext->NoteOrphanedData();
+        } else {
+          pinnedContext->Dispatch(
+              MakeSafeRefPtr<DeleteOrphanedBodyAction>(aBodyId));
+        }
+      }
+    }
+    MaybeAllowContextToClose();
+    return;
+  }
+
+  MOZ_ASSERT_UNREACHABLE("Attempt to release BodyId that is not referenced!");
+}
+
+const ManagerId& Manager::GetManagerId() const { return *mManagerId; }
+
+void Manager::AddStreamList(StreamList& aStreamList) {
+  NS_ASSERT_OWNINGTHREAD(Manager);
+  mStreamLists.AppendElement(WrapNotNullUnchecked(&aStreamList));
+}
+
+void Manager::RemoveStreamList(StreamList& aStreamList) {
+  NS_ASSERT_OWNINGTHREAD(Manager);
+  mStreamLists.RemoveElement(&aStreamList);
+}
+
+void Manager::ExecuteCacheOp(Listener* aListener, CacheId aCacheId,
+                             const CacheOpArgs& aOpArgs) {
+  NS_ASSERT_OWNINGTHREAD(Manager);
+  MOZ_DIAGNOSTIC_ASSERT(aListener);
+  MOZ_DIAGNOSTIC_ASSERT(aOpArgs.type() != CacheOpArgs::TCachePutAllArgs);
+
+  if (NS_WARN_IF(mState == Closing)) {
+    aListener->OnOpComplete(ErrorResult(NS_ERROR_FAILURE), void_t());
+    return;
+  }
+
+  const auto pinnedContext = SafeRefPtr{mContext, AcquireStrongRefFromRawPtr{}};
+  MOZ_DIAGNOSTIC_ASSERT(!pinnedContext->IsCanceled());
+
+  auto action = [this, aListener, aCacheId, &aOpArgs,
+                 &pinnedContext]() -> SafeRefPtr<Action> {
+    const ListenerId listenerId = SaveListener(aListener);
+
+    if (CacheOpArgs::TCacheDeleteArgs == aOpArgs.type()) {
+      return MakeSafeRefPtr<CacheDeleteAction>(SafeRefPtrFromThis(), listenerId,
+                                               aCacheId,
+                                               aOpArgs.get_CacheDeleteArgs());
+    }
+
+    auto streamList = MakeSafeRefPtr<StreamList>(SafeRefPtrFromThis(),
+                                                 pinnedContext.clonePtr());
+
+    switch (aOpArgs.type()) {
+      case CacheOpArgs::TCacheMatchArgs:
+        return MakeSafeRefPtr<CacheMatchAction>(
+            SafeRefPtrFromThis(), listenerId, aCacheId,
+            aOpArgs.get_CacheMatchArgs(), std::move(streamList));
+      case CacheOpArgs::TCacheMatchAllArgs:
+        return MakeSafeRefPtr<CacheMatchAllAction>(
+            SafeRefPtrFromThis(), listenerId, aCacheId,
+            aOpArgs.get_CacheMatchAllArgs(), std::move(streamList));
+      case CacheOpArgs::TCacheKeysArgs:
+        return MakeSafeRefPtr<CacheKeysAction>(
+            SafeRefPtrFromThis(), listenerId, aCacheId,
+            aOpArgs.get_CacheKeysArgs(), std::move(streamList));
+      default:
+        MOZ_CRASH("Unknown Cache operation!");
+    }
+  }();
+
+  pinnedContext->Dispatch(std::move(action));
+}
+
+void Manager::ExecuteStorageOp(Listener* aListener, Namespace aNamespace,
+                               const CacheOpArgs& aOpArgs) {
+  NS_ASSERT_OWNINGTHREAD(Manager);
+  MOZ_DIAGNOSTIC_ASSERT(aListener);
+
+  if (NS_WARN_IF(mState == Closing)) {
+    aListener->OnOpComplete(ErrorResult(NS_ERROR_FAILURE), void_t());
+    return;
+  }
+
+  const auto pinnedContext = SafeRefPtr{mContext, AcquireStrongRefFromRawPtr{}};
+  MOZ_DIAGNOSTIC_ASSERT(!pinnedContext->IsCanceled());
+
+  auto action = [this, aListener, aNamespace, &aOpArgs,
+                 &pinnedContext]() -> SafeRefPtr<Action> {
+    const ListenerId listenerId = SaveListener(aListener);
+
+    switch (aOpArgs.type()) {
+      case CacheOpArgs::TStorageMatchArgs:
+        return MakeSafeRefPtr<StorageMatchAction>(
+            SafeRefPtrFromThis(), listenerId, aNamespace,
+            aOpArgs.get_StorageMatchArgs(),
+            MakeSafeRefPtr<StreamList>(SafeRefPtrFromThis(),
+                                       pinnedContext.clonePtr()));
+      case CacheOpArgs::TStorageHasArgs:
+        return MakeSafeRefPtr<StorageHasAction>(SafeRefPtrFromThis(),
+                                                listenerId, aNamespace,
+                                                aOpArgs.get_StorageHasArgs());
+      case CacheOpArgs::TStorageOpenArgs:
+        return MakeSafeRefPtr<StorageOpenAction>(SafeRefPtrFromThis(),
+                                                 listenerId, aNamespace,
+                                                 aOpArgs.get_StorageOpenArgs());
+      case CacheOpArgs::TStorageDeleteArgs:
+        return MakeSafeRefPtr<StorageDeleteAction>(
+            SafeRefPtrFromThis(), listenerId, aNamespace,
+            aOpArgs.get_StorageDeleteArgs());
+      case CacheOpArgs::TStorageKeysArgs:
+        return MakeSafeRefPtr<StorageKeysAction>(SafeRefPtrFromThis(),
+                                                 listenerId, aNamespace);
+      default:
+        MOZ_CRASH("Unknown CacheStorage operation!");
+    }
+  }();
+
+  pinnedContext->Dispatch(std::move(action));
+}
+
+void Manager::ExecuteOpenStream(Listener* aListener,
+                                InputStreamResolver&& aResolver,
+                                const nsID& aBodyId) {
+  NS_ASSERT_OWNINGTHREAD(Manager);
+  MOZ_DIAGNOSTIC_ASSERT(aListener);
+  MOZ_DIAGNOSTIC_ASSERT(aResolver);
+
+  if (NS_WARN_IF(mState == Closing)) {
+    aResolver(nullptr);
+    return;
+  }
+
+  const auto pinnedContext = SafeRefPtr{mContext, AcquireStrongRefFromRawPtr{}};
+  MOZ_DIAGNOSTIC_ASSERT(!pinnedContext->IsCanceled());
+
+  ListenerId listenerId = SaveListener(aListener);
+
+  pinnedContext->Dispatch(MakeSafeRefPtr<OpenStreamAction>(
+      SafeRefPtrFromThis(), listenerId, std::move(aResolver), aBodyId));
+}
+
+void Manager::ExecutePutAll(
+    Listener* aListener, CacheId aCacheId,
+    const nsTArray<CacheRequestResponse>& aPutList,
+    const nsTArray<nsCOMPtr<nsIInputStream>>& aRequestStreamList,
+    const nsTArray<nsCOMPtr<nsIInputStream>>& aResponseStreamList) {
+  NS_ASSERT_OWNINGTHREAD(Manager);
+  MOZ_DIAGNOSTIC_ASSERT(aListener);
+
+  if (NS_WARN_IF(mState == Closing)) {
+    aListener->OnOpComplete(ErrorResult(NS_ERROR_FAILURE), CachePutAllResult());
+    return;
+  }
+
+  const auto pinnedContext = SafeRefPtr{mContext, AcquireStrongRefFromRawPtr{}};
+  MOZ_DIAGNOSTIC_ASSERT(!pinnedContext->IsCanceled());
+
+  ListenerId listenerId = SaveListener(aListener);
+  pinnedContext->Dispatch(MakeSafeRefPtr<CachePutAllAction>(
+      SafeRefPtrFromThis(), listenerId, aCacheId, aPutList, aRequestStreamList,
+      aResponseStreamList));
+}
+
+Manager::Manager(SafeRefPtr<ManagerId> aManagerId, nsIThread* aIOThread,
+                 const ConstructorGuard&)
+    : mManagerId(std::move(aManagerId)),
+      mIOThread(aIOThread),
+      mContext(nullptr),
+      mShuttingDown(false),
+      mState(Open) {
+  MOZ_DIAGNOSTIC_ASSERT(mManagerId);
+  MOZ_DIAGNOSTIC_ASSERT(mIOThread);
+}
+
+Manager::~Manager() {
+  NS_ASSERT_OWNINGTHREAD(Manager);
+  MOZ_DIAGNOSTIC_ASSERT(mState == Closing);
+  MOZ_DIAGNOSTIC_ASSERT(!mContext);
+
+  nsCOMPtr<nsIThread> ioThread;
+  mIOThread.swap(ioThread);
+
+  MOZ_ALWAYS_SUCCEEDS(NS_DispatchToMainThread(NewRunnableMethod(
+      "nsIThread::AsyncShutdown", ioThread, &nsIThread::AsyncShutdown)));
+}
+
+void Manager::Init(Maybe<Manager&> aOldManager) {
+  NS_ASSERT_OWNINGTHREAD(Manager);
+
+  SafeRefPtr<Context> ref = Context::Create(
+      SafeRefPtrFromThis(), mIOThread, MakeSafeRefPtr<SetupAction>(),
+      aOldManager ? SomeRef(*aOldManager->mContext) : Nothing());
+  mContext = ref.unsafeGetRawPtr();
+}
+
+void Manager::Shutdown() {
+  NS_ASSERT_OWNINGTHREAD(Manager);
+
+  if (mShuttingDown) {
+    return;
+  }
+
+  mShuttingDown = true;
+
+  NoteClosing();
+
+  if (mContext) {
+    const auto pinnedContext =
+        SafeRefPtr{mContext, AcquireStrongRefFromRawPtr{}};
+    pinnedContext->CancelAll();
+    return;
+  }
+}
+
+Maybe<ClientDirectoryLock&> Manager::MaybeDirectoryLockRef() const {
+  NS_ASSERT_OWNINGTHREAD(Manager);
+  MOZ_DIAGNOSTIC_ASSERT(mContext);
+
+  return mContext->MaybeDirectoryLockRef();
+}
+
+void Manager::Abort() {
+  NS_ASSERT_OWNINGTHREAD(Manager);
+  MOZ_DIAGNOSTIC_ASSERT(mContext);
+
+  NoteClosing();
+
+  const auto pinnedContext = SafeRefPtr{mContext, AcquireStrongRefFromRawPtr{}};
+  pinnedContext->CancelAll();
+}
+
+Manager::ListenerId Manager::SaveListener(Listener* aListener) {
+  NS_ASSERT_OWNINGTHREAD(Manager);
+
+  ListenerList::index_type index =
+      mListeners.IndexOf(aListener, 0, ListenerEntryListenerComparator());
+  if (index != ListenerList::NoIndex) {
+    return mListeners[index].mId;
+  }
+
+  ListenerId id = sNextListenerId;
+  sNextListenerId += 1;
+
+  mListeners.AppendElement(ListenerEntry(id, aListener));
+  return id;
+}
+
+Manager::Listener* Manager::GetListener(ListenerId aListenerId) const {
+  NS_ASSERT_OWNINGTHREAD(Manager);
+  ListenerList::index_type index =
+      mListeners.IndexOf(aListenerId, 0, ListenerEntryIdComparator());
+  if (index != ListenerList::NoIndex) {
+    return mListeners[index].mListener;
+  }
+
+  return nullptr;
+}
+
+bool Manager::SetCacheIdOrphanedIfRefed(CacheId aCacheId) {
+  NS_ASSERT_OWNINGTHREAD(Manager);
+
+  const auto end = mCacheIdRefs.end();
+  const auto foundIt =
+      std::find_if(mCacheIdRefs.begin(), end, MatchByCacheId(aCacheId));
+  if (foundIt != end) {
+    MOZ_DIAGNOSTIC_ASSERT(foundIt->mCount > 0);
+    MOZ_DIAGNOSTIC_ASSERT(!foundIt->mOrphaned);
+    foundIt->mOrphaned = true;
+    return true;
+  }
+
+  return false;
+}
+
+
+bool Manager::SetBodyIdOrphanedIfRefed(const nsID& aBodyId) {
+  NS_ASSERT_OWNINGTHREAD(Manager);
+
+  const auto end = mBodyIdRefs.end();
+  const auto foundIt =
+      std::find_if(mBodyIdRefs.begin(), end, MatchByBodyId(aBodyId));
+  if (foundIt != end) {
+    MOZ_DIAGNOSTIC_ASSERT(foundIt->mCount > 0);
+    MOZ_DIAGNOSTIC_ASSERT(!foundIt->mOrphaned);
+    foundIt->mOrphaned = true;
+    return true;
+  }
+
+  return false;
+}
+
+void Manager::NoteOrphanedBodyIdList(const nsTArray<nsID>& aDeletedBodyIdList) {
+  NS_ASSERT_OWNINGTHREAD(Manager);
+
+  DeleteOrphanedBodyAction::DeletedBodyIdList deleteNowList;
+  deleteNowList.SetCapacity(aDeletedBodyIdList.Length());
+
+  std::copy_if(aDeletedBodyIdList.cbegin(), aDeletedBodyIdList.cend(),
+               MakeBackInserter(deleteNowList), [&](const auto& deletedBodyId) {
+                 return !SetBodyIdOrphanedIfRefed(deletedBodyId);
+               });
+
+  const auto pinnedContext = SafeRefPtr{mContext, AcquireStrongRefFromRawPtr{}};
+  if (!deleteNowList.IsEmpty() && pinnedContext &&
+      !pinnedContext->IsCanceled()) {
+    pinnedContext->Dispatch(
+        MakeSafeRefPtr<DeleteOrphanedBodyAction>(std::move(deleteNowList)));
+  }
+}
+
+void Manager::MaybeAllowContextToClose() {
+  NS_ASSERT_OWNINGTHREAD(Manager);
+
+  const auto pinnedContext = SafeRefPtr{mContext, AcquireStrongRefFromRawPtr{}};
+  if (pinnedContext && mListeners.IsEmpty() && mCacheIdRefs.IsEmpty() &&
+      mBodyIdRefs.IsEmpty()) {
+    NoteClosing();
+
+    pinnedContext->AllowToClose();
+  }
+}
+
+void Manager::DoStringify(nsACString& aData) {
+  aData.Append("Manager "_ns + kStringifyStartInstance +
+               "Origin:"_ns +
+               quota::AnonymizedOriginString(GetManagerId().QuotaOrigin()) +
+               kStringifyDelimiter +
+               "State:"_ns + IntToCString(mState) + kStringifyDelimiter);
+
+  aData.AppendLiteral("Context:");
+  if (mContext) {
+    mContext->Stringify(aData);
+  } else {
+    aData.AppendLiteral("0");
+  }
+
+  aData.Append(kStringifyEndInstance);
+}
+
+}  

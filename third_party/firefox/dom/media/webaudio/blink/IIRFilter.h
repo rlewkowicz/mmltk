@@ -1,0 +1,42 @@
+// Copyright 2016 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(IIRFilter_h)
+#define IIRFilter_h
+
+#include "nsTArray.h"
+
+typedef nsTArray<double> AudioDoubleArray;
+
+namespace blink {
+
+class IIRFilter final {
+ public:
+  const static size_t kMaxOrder = 19;
+  IIRFilter(const AudioDoubleArray* feedforwardCoef,
+            const AudioDoubleArray* feedbackCoef);
+  ~IIRFilter();
+
+  void process(const float* sourceP, float* destP, size_t framesToProcess);
+
+  void reset();
+
+  void getFrequencyResponse(int nFrequencies, const float* frequency,
+                            float* magResponse, float* phaseResponse);
+
+  bool buffersAreZero();
+
+ private:
+  AudioDoubleArray m_xBuffer;
+  AudioDoubleArray m_yBuffer;
+
+  int m_bufferIndex;
+
+  const AudioDoubleArray* m_feedback;
+  const AudioDoubleArray* m_feedforward;
+};
+
+}  
+
+#endif

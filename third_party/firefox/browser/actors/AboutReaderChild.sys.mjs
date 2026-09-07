@@ -1,0 +1,225 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+const lazy = {};
+
+ChromeUtils.defineESModuleGetters(lazy, {
+  AboutReader: "moz-src:///toolkit/components/reader/AboutReader.sys.mjs",
+  ReaderMode: "moz-src:///toolkit/components/reader/ReaderMode.sys.mjs",
+  Readerable: "resource://gre/modules/Readerable.sys.mjs",
+});
+
+var gUrlsToDocContentType = new Map();
+var gUrlsToDocTitle = new Map();
+
+export class AboutReaderChild extends JSWindowActorChild {
+  constructor() {
+    super();
+
+    this._reader = null;
+    this._articlePromise = null;
+    this._isLeavingReaderableReaderMode = false;
+  }
+
+  didDestroy() {
+    this.cancelPotentialPendingReadabilityCheck();
+    this.readerModeHidden();
+  }
+
+  readerModeHidden() {
+    if (this._reader) {
+      this._reader.clearActor();
+    }
+    this._reader = null;
+  }
+
+  async receiveMessage(message) {
+    switch (message.name) {
+      case "Reader:ToggleReaderMode":
+        if (!this.isAboutReader) {
+          gUrlsToDocContentType.set(
+            this.document.URL,
+            this.document.contentType
+          );
+          gUrlsToDocTitle.set(this.document.URL, this.document.title);
+          this._articlePromise = lazy.ReaderMode.parseDocument(
+            this.document
+          ).catch(console.error);
+
+          let article = await this._articlePromise;
+          this.sendAsyncMessage("Reader:EnterReaderMode", article);
+        } else {
+          this.closeReaderMode();
+        }
+        break;
+
+      case "Reader:PushState":
+        this.updateReaderButton(!!(message.data && message.data.isArticle));
+        break;
+      case "Reader:EnterReaderMode": {
+        lazy.ReaderMode.enterReaderMode(this.docShell, this.contentWindow);
+        break;
+      }
+      case "Reader:LeaveReaderMode": {
+        lazy.ReaderMode.leaveReaderMode(this.docShell, this.contentWindow);
+        break;
+      }
+    }
+
+    if (this._reader) {
+      this._reader.receiveMessage(message);
+    }
+  }
+
+  get isAboutReader() {
+    if (!this.document) {
+      return false;
+    }
+    return this.document.documentURI.startsWith("about:reader");
+  }
+
+  get isReaderableAboutReader() {
+    return this.isAboutReader && !this.document.documentElement.dataset.isError;
+  }
+
+  handleEvent(aEvent) {
+    if (aEvent.originalTarget.defaultView != this.contentWindow) {
+      return;
+    }
+
+    switch (aEvent.type) {
+      case "DOMContentLoaded":
+        if (!this.isAboutReader) {
+          this.updateReaderButton();
+          return;
+        }
+
+        if (this.document.body) {
+          let url = this.document.documentURI;
+          if (!this._articlePromise) {
+            url = decodeURIComponent(url.substr("about:reader?url=".length));
+            this._articlePromise = this.sendQuery("Reader:GetCachedArticle", {
+              url,
+            });
+          }
+          this.sendAsyncMessage("Reader:UpdateReaderButton");
+          let docContentType =
+            gUrlsToDocContentType.get(url) === "text/plain"
+              ? "text/plain"
+              : "document";
+
+          let docTitle = gUrlsToDocTitle.get(url);
+          this._reader = new lazy.AboutReader(
+            this,
+            this._articlePromise,
+            docContentType,
+            docTitle
+          );
+          this._articlePromise = null;
+        }
+        break;
+
+      case "pagehide":
+        this.cancelPotentialPendingReadabilityCheck();
+        this.sendAsyncMessage("Reader:UpdateReaderButton", {
+          isArticle: this._isLeavingReaderableReaderMode,
+        });
+        this._isLeavingReaderableReaderMode = false;
+        break;
+
+      case "pageshow":
+        if (aEvent.persisted && this.canDoReadabilityCheck()) {
+          this.performReadabilityCheckNow();
+        }
+        break;
+    }
+  }
+
+  updateReaderButton(forceNonArticle) {
+    if (!this.canDoReadabilityCheck()) {
+      return;
+    }
+
+    this.scheduleReadabilityCheckPostPaint(forceNonArticle);
+  }
+
+  canDoReadabilityCheck() {
+    return (
+      lazy.Readerable.isEnabledForParseOnLoad &&
+      !this.isAboutReader &&
+      this.contentWindow &&
+      this.contentWindow.windowRoot &&
+      this.contentWindow.HTMLDocument.isInstance(this.document) &&
+      !this.document.mozSyntheticDocument
+    );
+  }
+
+  cancelPotentialPendingReadabilityCheck() {
+    if (this._pendingReadabilityCheck) {
+      if (this._listenerWindow) {
+        this._listenerWindow.removeEventListener(
+          "MozAfterPaint",
+          this._pendingReadabilityCheck
+        );
+      }
+      delete this._pendingReadabilityCheck;
+      delete this._listenerWindow;
+    }
+  }
+
+  scheduleReadabilityCheckPostPaint(forceNonArticle) {
+    if (this._pendingReadabilityCheck) {
+      this.cancelPotentialPendingReadabilityCheck();
+    }
+    this._pendingReadabilityCheck = this.onPaintWhenWaitedFor.bind(
+      this,
+      forceNonArticle
+    );
+
+    this._listenerWindow = this.contentWindow.windowRoot;
+    this.contentWindow.windowRoot.addEventListener(
+      "MozAfterPaint",
+      this._pendingReadabilityCheck
+    );
+  }
+
+  onPaintWhenWaitedFor(forceNonArticle, event) {
+    if (!event.clientRects.length) {
+      return;
+    }
+
+    this.performReadabilityCheckNow(forceNonArticle);
+  }
+
+  performReadabilityCheckNow(forceNonArticle) {
+    this.cancelPotentialPendingReadabilityCheck();
+
+    let document;
+    try {
+      document = this.document;
+    } catch (ex) {
+      return;
+    }
+
+    if (
+      lazy.Readerable.shouldCheckUri(document.baseURIObject, true) &&
+      lazy.Readerable.isProbablyReaderable(document)
+    ) {
+      this.sendAsyncMessage("Reader:UpdateReaderButton", {
+        isArticle: true,
+      });
+    } else if (forceNonArticle) {
+      this.sendAsyncMessage("Reader:UpdateReaderButton", {
+        isArticle: false,
+      });
+    }
+  }
+
+  closeReaderMode() {
+    if (this.isAboutReader) {
+      this._isLeavingReaderableReaderMode = this.isReaderableAboutReader;
+      this.sendAsyncMessage("Reader:LeaveReaderMode", {});
+    }
+  }
+}

@@ -1,0 +1,41 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+#ifndef __SOURCE_NUMBER_UTYPES_H__
+#define __SOURCE_NUMBER_UTYPES_H__
+
+#include "unicode/numberformatter.h"
+#include "number_types.h"
+#include "number_decimalquantity.h"
+#include "formatted_string_builder.h"
+#include "formattedval_impl.h"
+
+U_NAMESPACE_BEGIN
+namespace number::impl {
+
+const DecimalQuantity* validateUFormattedNumberToDecimalQuantity(
+    const UFormattedNumber* uresult, UErrorCode& status);
+
+
+class U_I18N_API UFormattedNumberData : public FormattedValueStringBuilderImpl {
+public:
+    UFormattedNumberData() : FormattedValueStringBuilderImpl(kUndefinedField) {}
+    virtual ~UFormattedNumberData();
+
+    UFormattedNumberData(UFormattedNumberData&&) = default;
+    UFormattedNumberData& operator=(UFormattedNumberData&&) = default;
+
+    DecimalQuantity quantity;
+
+    MeasureUnit outputUnit;
+
+    const char *gender = "";
+};
+
+} 
+U_NAMESPACE_END
+
+#endif //__SOURCE_NUMBER_UTYPES_H__
+#endif /* #if !UCONFIG_NO_FORMATTING */

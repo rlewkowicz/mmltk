@@ -1,0 +1,263 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+"use strict";
+
+const { setText, checkCertHelper } = ChromeUtils.importESModule(
+  "resource://gre/modules/psm/pippki.sys.mjs"
+);
+
+var gDialog;
+var gSecInfo;
+var gCert;
+var gChecking;
+var gBroken;
+var gNeedReset;
+
+const { PrivateBrowsingUtils } = ChromeUtils.importESModule(
+  "resource://gre/modules/PrivateBrowsingUtils.sys.mjs"
+);
+
+function initExceptionDialog() {
+  gNeedReset = false;
+  gDialog = document.getElementById("exceptiondialog");
+  let warningText = document.getElementById("warningText");
+  document.l10n.setAttributes(warningText, "add-exception-branded-warning");
+  let confirmButton = gDialog.getButton("extra1");
+  let l10nUpdatedElements = [confirmButton, warningText];
+  confirmButton.disabled = true;
+
+  document
+    .getElementById("locationTextBox")
+    .addEventListener("input", () => handleTextChange());
+  var args = window.arguments;
+  if (args && args[0]) {
+    if (args[0].location) {
+      document.getElementById("locationTextBox").value = args[0].location;
+      document.getElementById("checkCertButton").disabled = false;
+
+      if (args[0].securityInfo) {
+        gSecInfo = args[0].securityInfo;
+        gCert = gSecInfo.serverCert;
+        gBroken = true;
+        l10nUpdatedElements = l10nUpdatedElements.concat(updateCertStatus());
+      } else if (args[0].prefetchCert) {
+        document.getElementById("checkCertButton").disabled = true;
+        gChecking = true;
+        l10nUpdatedElements = l10nUpdatedElements.concat(updateCertStatus());
+
+        window.setTimeout(checkCert, 0);
+      }
+    }
+
+    args[0].exceptionAdded = false;
+  }
+
+  for (let id of [
+    "warningSupplemental",
+    "certLocationLabel",
+    "checkCertButton",
+    "statusDescription",
+    "statusLongDescription",
+    "permanent",
+  ]) {
+    let element = document.getElementById(id);
+    l10nUpdatedElements.push(element);
+  }
+
+  document.l10n
+    .translateElements(l10nUpdatedElements)
+    .then(() => window.sizeToContent());
+
+  document.addEventListener("dialogextra1", addException);
+  document.addEventListener("dialogextra2", checkCert);
+}
+
+function grabCert(req, evt) {
+  if (req.channel && req.channel.securityInfo) {
+    gSecInfo = req.channel.securityInfo;
+    gCert = gSecInfo ? gSecInfo.serverCert : null;
+  }
+  gBroken = evt.type == "error";
+  gChecking = false;
+  document.l10n
+    .translateElements(updateCertStatus())
+    .then(() => window.sizeToContent());
+}
+
+async function checkCert() {
+  gCert = null;
+  gSecInfo = null;
+  gChecking = true;
+  gBroken = false;
+  await document.l10n.translateElements(updateCertStatus());
+  window.sizeToContent();
+
+  let uri = getURI();
+
+  if (uri) {
+    checkCertHelper(uri, grabCert);
+  } else {
+    gChecking = false;
+    await document.l10n.translateElements(updateCertStatus());
+    window.sizeToContent();
+  }
+}
+
+function getURI() {
+  let locationTextBox = document.getElementById("locationTextBox");
+  let { preferredURI: uri } = Services.uriFixup.getFixupURIInfo(
+    locationTextBox.value
+  );
+
+  if (!uri) {
+    return null;
+  }
+
+  let mutator = uri.mutate();
+  if (uri.scheme == "http") {
+    mutator.setScheme("https");
+  }
+
+  if (uri.port == -1) {
+    mutator.setPort(443);
+  }
+
+  return mutator.finalize();
+}
+
+function resetDialog() {
+  document.getElementById("permanent").disabled = true;
+  gDialog.getButton("extra1").disabled = true;
+  setText(document, "headerDescription", "");
+  setText(document, "statusDescription", "");
+  setText(document, "statusLongDescription", "");
+  setText(document, "status2Description", "");
+  setText(document, "status2LongDescription", "");
+  setText(document, "status3Description", "");
+  setText(document, "status3LongDescription", "");
+  window.sizeToContent();
+}
+
+function handleTextChange() {
+  var checkCertButton = document.getElementById("checkCertButton");
+  checkCertButton.disabled = !document.getElementById("locationTextBox").value;
+  if (gNeedReset) {
+    gNeedReset = false;
+    resetDialog();
+  }
+}
+
+function updateCertStatus() {
+  var shortDesc, longDesc;
+  let l10nUpdatedElements = [];
+  if (gCert) {
+    if (gBroken) {
+      var mms = "add-exception-domain-mismatch-short";
+      var mml = "add-exception-domain-mismatch-long";
+      var exs = "add-exception-expired-short";
+      var exl = "add-exception-expired-long";
+      var uts = "add-exception-unverified-or-bad-signature-short";
+      var utl = "add-exception-unverified-or-bad-signature-long";
+      if (
+        gSecInfo.overridableErrorCategory ==
+        Ci.nsITransportSecurityInfo.ERROR_TRUST
+      ) {
+        shortDesc = uts;
+        longDesc = utl;
+      } else if (
+        gSecInfo.overridableErrorCategory ==
+        Ci.nsITransportSecurityInfo.ERROR_DOMAIN
+      ) {
+        shortDesc = mms;
+        longDesc = mml;
+      } else if (
+        gSecInfo.overridableErrorCategory ==
+        Ci.nsITransportSecurityInfo.ERROR_TIME
+      ) {
+        shortDesc = exs;
+        longDesc = exl;
+      }
+      gDialog.getButton("extra1").disabled = false;
+
+      var inPrivateBrowsing = inPrivateBrowsingMode();
+      var pe = document.getElementById("permanent");
+      pe.disabled = inPrivateBrowsing;
+      pe.checked = !inPrivateBrowsing;
+
+      let headerDescription = document.getElementById("headerDescription");
+      document.l10n.setAttributes(
+        headerDescription,
+        "add-exception-invalid-header"
+      );
+      l10nUpdatedElements.push(headerDescription);
+    } else {
+      shortDesc = "add-exception-valid-short";
+      longDesc = "add-exception-valid-long";
+      gDialog.getButton("extra1").disabled = true;
+      document.getElementById("permanent").disabled = true;
+    }
+
+    document.getElementById("checkCertButton").disabled = false;
+
+    Services.obs.notifyObservers(window, "cert-exception-ui-ready");
+  } else if (gChecking) {
+    shortDesc = "add-exception-checking-short";
+    longDesc = "add-exception-checking-long";
+    document.getElementById("checkCertButton").disabled = true;
+    gDialog.getButton("extra1").disabled = true;
+    document.getElementById("permanent").disabled = true;
+  } else {
+    shortDesc = "add-exception-no-cert-short";
+    longDesc = "add-exception-no-cert-long";
+    document.getElementById("checkCertButton").disabled = false;
+    gDialog.getButton("extra1").disabled = true;
+    document.getElementById("permanent").disabled = true;
+  }
+  let statusDescription = document.getElementById("statusDescription");
+  let statusLongDescription = document.getElementById("statusLongDescription");
+  document.l10n.setAttributes(statusDescription, shortDesc);
+  document.l10n.setAttributes(statusLongDescription, longDesc);
+  l10nUpdatedElements.push(statusDescription);
+  l10nUpdatedElements.push(statusLongDescription);
+
+  gNeedReset = true;
+  return l10nUpdatedElements;
+}
+
+function addException() {
+  if (!gCert || !gSecInfo) {
+    return;
+  }
+
+  var overrideService = Cc["@mozilla.org/security/certoverride;1"].getService(
+    Ci.nsICertOverrideService
+  );
+  var permanentCheckbox = document.getElementById("permanent");
+  var shouldStorePermanently =
+    permanentCheckbox.checked && !inPrivateBrowsingMode();
+  var uri = getURI();
+  overrideService.rememberValidityOverride(
+    uri.asciiHost,
+    uri.port,
+    {},
+    gCert,
+    !shouldStorePermanently
+  );
+
+  let args = window.arguments;
+  if (args && args[0]) {
+    args[0].exceptionAdded = true;
+  }
+
+  gDialog.acceptDialog();
+}
+
+function inPrivateBrowsingMode() {
+  return window.isChromeWindow
+    ? PrivateBrowsingUtils.isWindowPrivate(window)
+    : PrivateBrowsingUtils.isContentWindowPrivate(window);
+}
+
+window.addEventListener("load", () => initExceptionDialog());

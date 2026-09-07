@@ -1,0 +1,237 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef frontend_FrontendContext_h
+#define frontend_FrontendContext_h
+
+#include "mozilla/Assertions.h"  // MOZ_ASSERT
+#include "mozilla/Attributes.h"  // MOZ_STACK_CLASS
+#include "mozilla/Maybe.h"       // mozilla::Maybe
+
+#include <stddef.h>  // size_t
+
+#include "js/AllocPolicy.h"  // SystemAllocPolicy, AllocFunction
+#include "js/ErrorReport.h"  // JSErrorCallback, JSErrorFormatString
+#include "js/Stack.h"  // JS::NativeStackSize, JS::NativeStackLimit, JS::NativeStackLimitMax
+#include "js/Vector.h"          // Vector
+#include "vm/ErrorReporting.h"  // CompileError
+#include "vm/MallocProvider.h"  // MallocProvider
+#include "vm/SharedScriptDataTableHolder.h"  // js::SharedScriptDataTableHolder, js::globalSharedScriptDataTableHolder
+
+struct JSContext;
+
+namespace js {
+
+class FrontendContext;
+
+namespace frontend {
+class NameCollectionPool;
+}  
+
+struct FrontendErrors {
+  FrontendErrors() = default;
+  mozilla::Maybe<CompileError> error;
+  Vector<CompileError, 0, SystemAllocPolicy> warnings;
+  bool overRecursed = false;
+  bool outOfMemory = false;
+  bool allocationOverflow = false;
+
+  bool extraBindingsAreNotUsed = false;
+
+  bool hadErrors() const {
+    return outOfMemory || overRecursed || allocationOverflow ||
+           extraBindingsAreNotUsed || error;
+  }
+
+  void clearErrors();
+  void clearWarnings();
+};
+
+class FrontendAllocator : public MallocProvider<FrontendAllocator> {
+ private:
+  FrontendContext* const fc_;
+
+ public:
+  explicit FrontendAllocator(FrontendContext* fc) : fc_(fc) {}
+
+  void* onOutOfMemory(js::AllocFunction allocFunc, arena_id_t arena,
+                      size_t nbytes, void* reallocPtr = nullptr);
+  void reportAllocOverflow();
+};
+
+class FrontendContext {
+ private:
+  FrontendAllocator alloc_;
+  js::FrontendErrors errors_;
+
+  frontend::NameCollectionPool* nameCollectionPool_;
+  bool ownNameCollectionPool_;
+
+  js::SharedScriptDataTableHolder* scriptDataTableHolder_;
+
+  JS::NativeStackLimit stackLimit_ = JS::NativeStackLimitMax;
+
+#ifdef DEBUG
+  mozilla::Maybe<size_t> stackLimitThreadId_;
+
+  void* previousStackPointer_ = nullptr;
+#endif
+
+ protected:
+  JSContext* maybeCx_ = nullptr;
+
+ public:
+  FrontendContext()
+      : alloc_(this),
+        nameCollectionPool_(nullptr),
+        ownNameCollectionPool_(false),
+        scriptDataTableHolder_(&js::globalSharedScriptDataTableHolder) {}
+  ~FrontendContext();
+
+  void setStackQuota(JS::NativeStackSize stackSize);
+  JS::NativeStackLimit stackLimit() const { return stackLimit_; }
+
+  bool allocateOwnedPool();
+
+  frontend::NameCollectionPool& nameCollectionPool() {
+    MOZ_ASSERT(
+        nameCollectionPool_,
+        "Either allocateOwnedPool or setCurrentJSContext must be called");
+    return *nameCollectionPool_;
+  }
+
+  js::SharedScriptDataTableHolder* scriptDataTableHolder() {
+    MOZ_ASSERT(scriptDataTableHolder_);
+    return scriptDataTableHolder_;
+  }
+
+  FrontendAllocator* getAllocator() { return &alloc_; }
+
+  void setCurrentJSContext(JSContext* cx);
+
+  JSContext* maybeCurrentJSContext() { return maybeCx_; }
+
+  enum class Warning { Suppress, Report };
+
+  bool convertToRuntimeError(JSContext* cx, Warning warning = Warning::Report);
+
+  mozilla::Maybe<CompileError>& maybeError() { return errors_.error; }
+  Vector<CompileError, 0, SystemAllocPolicy>& warnings() {
+    return errors_.warnings;
+  }
+
+  void reportError(js::CompileError&& err);
+  bool reportWarning(js::CompileError&& err);
+
+  void* onOutOfMemory(js::AllocFunction allocFunc, arena_id_t arena,
+                      size_t nbytes, void* reallocPtr = nullptr);
+  void onAllocationOverflow();
+
+  void onOutOfMemory();
+  void onOverRecursed();
+
+  void recoverFromOutOfMemory();
+
+  const JSErrorFormatString* gcSafeCallback(JSErrorCallback callback,
+                                            void* userRef,
+                                            const unsigned errorNumber);
+
+  bool hadOutOfMemory() const { return errors_.outOfMemory; }
+  bool hadOverRecursed() const { return errors_.overRecursed; }
+  bool hadAllocationOverflow() const { return errors_.allocationOverflow; }
+  bool extraBindingsAreNotUsed() const {
+    return errors_.extraBindingsAreNotUsed;
+  }
+  void reportExtraBindingsAreNotUsed() {
+    errors_.extraBindingsAreNotUsed = true;
+  }
+  void clearNoExtraBindingReferencesFound() {
+    errors_.extraBindingsAreNotUsed = false;
+  }
+  bool hadErrors() const;
+  void clearErrors();
+  void clearWarnings();
+
+#ifdef __wasi__
+  void incWasiRecursionDepth();
+  void decWasiRecursionDepth();
+  bool checkWasiRecursionLimit();
+#endif  // __wasi__
+
+#ifdef DEBUG
+  void setNativeStackLimitThread();
+  void assertNativeStackLimitThread();
+#endif
+
+#ifdef DEBUG
+  void checkAndUpdateFrontendContextRecursionLimit(void* sp);
+#endif
+
+ private:
+  void ReportOutOfMemory();
+  void addPendingOutOfMemory();
+};
+
+class MOZ_STACK_CLASS AutoReportFrontendContext : public FrontendContext {
+  JSContext* cx_;
+
+  Warning warning_;
+
+ public:
+  explicit AutoReportFrontendContext(JSContext* cx,
+                                     Warning warning = Warning::Report)
+      : cx_(cx), warning_(warning) {
+    setCurrentJSContext(cx_);
+    MOZ_ASSERT(cx_ == maybeCx_);
+  }
+
+  ~AutoReportFrontendContext() {
+    if (cx_) {
+      convertToRuntimeErrorAndClear();
+    }
+  }
+
+  void clearAutoReport() { cx_ = nullptr; }
+
+  bool convertToRuntimeErrorAndClear() {
+    bool result = convertToRuntimeError(cx_, warning_);
+    cx_ = nullptr;
+    return result;
+  }
+};
+
+class ManualReportFrontendContext : public FrontendContext {
+  JSContext* cx_;
+#ifdef DEBUG
+  bool handled_ = false;
+#endif
+
+ public:
+  explicit ManualReportFrontendContext(JSContext* cx) : cx_(cx) {
+    setCurrentJSContext(cx_);
+  }
+
+  ~ManualReportFrontendContext() { MOZ_ASSERT(handled_); }
+
+  void ok() {
+#ifdef DEBUG
+    handled_ = true;
+#endif
+  }
+
+  void failure() {
+#ifdef DEBUG
+    handled_ = true;
+#endif
+    convertToRuntimeError(cx_);
+  }
+};
+
+extern FrontendContext* NewFrontendContext();
+
+extern void DestroyFrontendContext(FrontendContext* fc);
+
+}  
+
+#endif /* frontend_FrontendContext_h */

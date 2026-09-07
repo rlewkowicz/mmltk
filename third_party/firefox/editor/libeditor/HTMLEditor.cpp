@@ -1,0 +1,6672 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "HTMLEditor.h"
+#include "HTMLEditHelpers.h"
+#include "HTMLEditorInlines.h"
+#include "HTMLEditorNestedClasses.h"
+
+#include "AutoClonedRangeArray.h"
+#include "AutoSelectionRestorer.h"
+#include "CSSEditUtils.h"
+#include "EditAction.h"
+#include "EditorBase.h"
+#include "EditorDOMAPIWrapper.h"
+#include "EditorDOMPoint.h"
+#include "EditorLineBreak.h"
+#include "EditorUtils.h"
+#include "ErrorList.h"
+#include "HTMLEditorEventListener.h"
+#include "HTMLEditUtils.h"
+#include "InsertNodeTransaction.h"
+#include "JoinNodesTransaction.h"
+#include "MoveNodeTransaction.h"
+#include "PendingStyles.h"
+#include "ReplaceTextTransaction.h"
+#include "SplitNodeTransaction.h"
+#include "WhiteSpaceVisibilityKeeper.h"
+#include "WSRunScanner.h"
+
+#include "mozilla/ComposerCommandsUpdater.h"
+#include "mozilla/ContentIterator.h"
+#include "mozilla/DebugOnly.h"
+#include "mozilla/EditorForwards.h"
+#include "mozilla/Encoding.h"  // for Encoding
+#include "mozilla/FlushType.h"
+#include "mozilla/IMEStateManager.h"
+#include "mozilla/IntegerRange.h"  // for IntegerRange
+#include "mozilla/Preferences.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/StaticPrefs_editor.h"
+#include "mozilla/StyleSheet.h"
+#include "mozilla/StyleSheetInlines.h"
+#include "mozilla/TextControlElement.h"
+#include "mozilla/TextEditor.h"
+#include "mozilla/TextEvents.h"
+#include "mozilla/ToString.h"
+#include "mozilla/css/Loader.h"
+#include "mozilla/dom/AncestorIterator.h"
+#include "mozilla/dom/Attr.h"
+#include "mozilla/dom/BorrowedAttrInfo.h"
+#include "mozilla/dom/CharacterDataBuffer.h"
+#include "mozilla/dom/DocumentFragment.h"
+#include "mozilla/dom/DocumentInlines.h"
+#include "mozilla/dom/EditContext.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/ElementInlines.h"
+#include "mozilla/dom/Event.h"
+#include "mozilla/dom/EventTarget.h"
+#include "mozilla/dom/HTMLAnchorElement.h"
+#include "mozilla/dom/HTMLBodyElement.h"
+#include "mozilla/dom/HTMLBRElement.h"
+#include "mozilla/dom/HTMLButtonElement.h"
+#include "mozilla/dom/HTMLSummaryElement.h"
+#include "mozilla/dom/NameSpaceConstants.h"
+#include "mozilla/dom/Selection.h"
+
+#include "mozilla/dom/ContentList.h"
+#include "mozilla/Utf16.h"
+#include "nsContentUtils.h"
+#include "nsCRT.h"
+#include "nsDebug.h"
+#include "nsElementTable.h"
+#include "nsFocusManager.h"
+#include "nsGenericHTMLElement.h"
+#include "nsGkAtoms.h"
+#include "nsHTMLDocument.h"
+#include "nsIContent.h"
+#include "nsIContentInlines.h"  // for nsINode::IsInDesignMode()
+#include "nsIEditActionListener.h"
+#include "nsIFrame.h"
+#include "nsIPrincipal.h"
+#include "nsISelectionController.h"
+#include "nsIURI.h"
+#include "nsIWidget.h"
+#include "nsNetUtil.h"
+#include "nsPresContext.h"
+#include "nsPrintfCString.h"
+#include "nsPIDOMWindow.h"
+#include "nsStyledElement.h"
+#include "nsUnicharUtils.h"
+
+namespace mozilla {
+
+using namespace dom;
+using namespace widget;
+
+LazyLogModule gHTMLEditorFocusLog("HTMLEditorFocus");
+
+using EmptyCheckOption = HTMLEditUtils::EmptyCheckOption;
+using LeafNodeOption = HTMLEditUtils::LeafNodeOption;
+using LeafNodeOptions = HTMLEditUtils::LeafNodeOptions;
+
+static bool IsLinkTag(const nsAtom& aTagName) {
+  return &aTagName == nsGkAtoms::href;
+}
+
+static bool IsNamedAnchorTag(const nsAtom& aTagName) {
+  return &aTagName == nsGkAtoms::anchor;
+}
+
+struct MOZ_STACK_CLASS SavedRange final {
+  RefPtr<Selection> mSelection;
+  nsCOMPtr<nsINode> mStartContainer;
+  nsCOMPtr<nsINode> mEndContainer;
+  uint32_t mStartOffset = 0;
+  uint32_t mEndOffset = 0;
+};
+
+
+template Result<CreateContentResult, nsresult>
+HTMLEditor::InsertNodeIntoProperAncestorWithTransaction(
+    nsIContent& aContentToInsert, const EditorDOMPoint& aPointToInsert,
+    SplitAtEdges aSplitAtEdges);
+template Result<CreateElementResult, nsresult>
+HTMLEditor::InsertNodeIntoProperAncestorWithTransaction(
+    Element& aContentToInsert, const EditorDOMPoint& aPointToInsert,
+    SplitAtEdges aSplitAtEdges);
+template Result<CreateTextResult, nsresult>
+HTMLEditor::InsertNodeIntoProperAncestorWithTransaction(
+    Text& aContentToInsert, const EditorDOMPoint& aPointToInsert,
+    SplitAtEdges aSplitAtEdges);
+
+MOZ_RUNINIT HTMLEditor::InitializeInsertingElement
+    HTMLEditor::DoNothingForNewElement =
+        [](HTMLEditor&, Element&, const EditorDOMPoint&) { return NS_OK; };
+
+MOZ_RUNINIT HTMLEditor::InitializeInsertingElement
+    HTMLEditor::InsertNewBRElement =
+        [](HTMLEditor& aHTMLEditor, Element& aNewElement,
+           const EditorDOMPoint&) MOZ_CAN_RUN_SCRIPT_BOUNDARY {
+          MOZ_ASSERT(!aNewElement.IsInComposedDoc());
+          Result<CreateLineBreakResult, nsresult> insertBRElementResultOrError =
+              aHTMLEditor.InsertLineBreak(WithTransaction::No,
+                                          LineBreakType::BRElement,
+                                          EditorDOMPoint(&aNewElement, 0u));
+          if (MOZ_UNLIKELY(insertBRElementResultOrError.isErr())) {
+            NS_WARNING(
+                "HTMLEditor::InsertLineBreak(WithTransaction::No, "
+                "LineBreakType::BRElement) failed");
+            return insertBRElementResultOrError.unwrapErr();
+          }
+          insertBRElementResultOrError.unwrap().IgnoreCaretPointSuggestion();
+          return NS_OK;
+        };
+
+Result<CreateElementResult, nsresult>
+HTMLEditor::AppendNewElementToInsertingElement(
+    HTMLEditor& aHTMLEditor, const nsStaticAtom& aTagName, Element& aNewElement,
+    const InitializeInsertingElement& aInitializer) {
+  MOZ_ASSERT(!aNewElement.IsInComposedDoc());
+  Result<CreateElementResult, nsresult> createNewElementResult =
+      aHTMLEditor.CreateAndInsertElement(
+          WithTransaction::No, const_cast<nsStaticAtom&>(aTagName),
+          EditorDOMPoint(&aNewElement, 0u), aInitializer);
+  NS_WARNING_ASSERTION(
+      createNewElementResult.isOk(),
+      "HTMLEditor::CreateAndInsertElement(WithTransaction::No) failed");
+  return createNewElementResult;
+}
+
+Result<CreateElementResult, nsresult>
+HTMLEditor::AppendNewElementWithBRToInsertingElement(
+    HTMLEditor& aHTMLEditor, const nsStaticAtom& aTagName,
+    Element& aNewElement) {
+  MOZ_ASSERT(!aNewElement.IsInComposedDoc());
+  Result<CreateElementResult, nsresult> createNewElementWithBRResult =
+      HTMLEditor::AppendNewElementToInsertingElement(
+          aHTMLEditor, aTagName, aNewElement, HTMLEditor::InsertNewBRElement);
+  NS_WARNING_ASSERTION(
+      createNewElementWithBRResult.isOk(),
+      "HTMLEditor::AppendNewElementToInsertingElement() failed");
+  return createNewElementWithBRResult;
+}
+
+MOZ_RUNINIT HTMLEditor::AttributeFilter HTMLEditor::CopyAllAttributes =
+    [](HTMLEditor&, const Element&, const Element&, int32_t, const nsAtom&,
+       nsString&) { return true; };
+MOZ_RUNINIT HTMLEditor::AttributeFilter HTMLEditor::CopyAllAttributesExceptId =
+    [](HTMLEditor&, const Element&, const Element&, int32_t aNamespaceID,
+       const nsAtom& aAttrName, nsString&) {
+      return aNamespaceID != kNameSpaceID_None || &aAttrName != nsGkAtoms::id;
+    };
+MOZ_RUNINIT HTMLEditor::AttributeFilter HTMLEditor::CopyAllAttributesExceptDir =
+    [](HTMLEditor&, const Element&, const Element&, int32_t aNamespaceID,
+       const nsAtom& aAttrName, nsString&) {
+      return aNamespaceID != kNameSpaceID_None || &aAttrName != nsGkAtoms::dir;
+    };
+MOZ_RUNINIT HTMLEditor::AttributeFilter
+    HTMLEditor::CopyAllAttributesExceptIdAndDir =
+        [](HTMLEditor&, const Element&, const Element&, int32_t aNamespaceID,
+           const nsAtom& aAttrName, nsString&) {
+          return !(
+              aNamespaceID == kNameSpaceID_None &&
+              (&aAttrName == nsGkAtoms::id || &aAttrName == nsGkAtoms::dir));
+        };
+
+HTMLEditor::HTMLEditor(const Document& aDocument)
+    : EditorBase(EditorBase::EditorType::HTML),
+      mCRInParagraphCreatesParagraph(false),
+      mIsObjectResizingEnabled(
+          StaticPrefs::editor_resizing_enabled_by_default()),
+      mIsResizing(false),
+      mPreserveRatio(false),
+      mResizedObjectIsAnImage(false),
+      mIsAbsolutelyPositioningEnabled(
+          StaticPrefs::editor_positioning_enabled_by_default()),
+      mResizedObjectIsAbsolutelyPositioned(false),
+      mGrabberClicked(false),
+      mIsMoving(false),
+      mSnapToGridEnabled(false),
+      mIsInlineTableEditingEnabled(
+          StaticPrefs::editor_inline_table_editing_enabled_by_default()),
+      mIsCSSPrefChecked(StaticPrefs::editor_use_css()),
+      mOriginalX(0),
+      mOriginalY(0),
+      mResizedObjectX(0),
+      mResizedObjectY(0),
+      mResizedObjectWidth(0),
+      mResizedObjectHeight(0),
+      mResizedObjectMarginLeft(0),
+      mResizedObjectMarginTop(0),
+      mResizedObjectBorderLeft(0),
+      mResizedObjectBorderTop(0),
+      mXIncrementFactor(0),
+      mYIncrementFactor(0),
+      mWidthIncrementFactor(0),
+      mHeightIncrementFactor(0),
+      mInfoXIncrement(20),
+      mInfoYIncrement(20),
+      mPositionedObjectX(0),
+      mPositionedObjectY(0),
+      mPositionedObjectWidth(0),
+      mPositionedObjectHeight(0),
+      mPositionedObjectMarginLeft(0),
+      mPositionedObjectMarginTop(0),
+      mPositionedObjectBorderLeft(0),
+      mPositionedObjectBorderTop(0),
+      mGridSize(0),
+      mDefaultParagraphSeparator(ParagraphSeparator::div) {}
+
+HTMLEditor::~HTMLEditor() {
+
+
+
+
+  mPendingStylesToApplyToNewContent = nullptr;
+
+  if (mDisabledLinkHandling) {
+    if (Document* doc = GetDocument()) {
+      doc->SetLinkHandlingEnabled(mOldLinkHandlingEnabled);
+    }
+  }
+
+  RemoveEventListeners();
+
+  HideAnonymousEditingUIs();
+}
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(HTMLEditor)
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_INHERITED(HTMLEditor, EditorBase)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mPendingStylesToApplyToNewContent)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mComposerCommandsUpdater)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mSelectedRangeForTopLevelEditSubAction)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mChangedRangeForTopLevelEditSubAction)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mPaddingBRElementForEmptyEditor)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mLastCollapsibleWhiteSpaceAppendedTextNode)
+  tmp->HideAnonymousEditingUIs();
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(HTMLEditor, EditorBase)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mPendingStylesToApplyToNewContent)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mComposerCommandsUpdater)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mSelectedRangeForTopLevelEditSubAction)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mChangedRangeForTopLevelEditSubAction)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mPaddingBRElementForEmptyEditor)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mLastCollapsibleWhiteSpaceAppendedTextNode)
+
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mTopLeftHandle)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mTopHandle)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mTopRightHandle)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mLeftHandle)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mRightHandle)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mBottomLeftHandle)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mBottomHandle)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mBottomRightHandle)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mActivatedHandle)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mResizingShadow)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mResizingInfo)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mResizedObject)
+
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mAbsolutelyPositionedObject)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mGrabber)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mPositioningShadow)
+
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mInlineEditedCell)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mAddColumnBeforeButton)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mRemoveColumnButton)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mAddColumnAfterButton)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mAddRowBeforeButton)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mRemoveRowButton)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mAddRowAfterButton)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_ADDREF_INHERITED(HTMLEditor, EditorBase)
+NS_IMPL_RELEASE_INHERITED(HTMLEditor, EditorBase)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(HTMLEditor)
+  NS_INTERFACE_MAP_ENTRY(nsIHTMLEditor)
+  NS_INTERFACE_MAP_ENTRY(nsIHTMLObjectResizer)
+  NS_INTERFACE_MAP_ENTRY(nsIHTMLAbsPosEditor)
+  NS_INTERFACE_MAP_ENTRY(nsIHTMLInlineTableEditor)
+  NS_INTERFACE_MAP_ENTRY(nsITableEditor)
+  NS_INTERFACE_MAP_ENTRY(nsIMutationObserver)
+  NS_INTERFACE_MAP_ENTRY(nsIEditorMailSupport)
+NS_INTERFACE_MAP_END_INHERITING(EditorBase)
+
+nsresult HTMLEditor::Init(Document& aDocument,
+                          ComposerCommandsUpdater& aComposerCommandsUpdater,
+                          uint32_t aFlags) {
+  MOZ_ASSERT(!mInitSucceeded,
+             "HTMLEditor::Init() called again without calling PreDestroy()?");
+
+  MOZ_DIAGNOSTIC_ASSERT(!mComposerCommandsUpdater ||
+                        mComposerCommandsUpdater == &aComposerCommandsUpdater);
+  mComposerCommandsUpdater = &aComposerCommandsUpdater;
+
+  RefPtr<PresShell> presShell = aDocument.GetPresShell();
+  if (NS_WARN_IF(!presShell)) {
+    return NS_ERROR_FAILURE;
+  }
+  nsresult rv = InitInternal(aDocument, nullptr, *presShell, aFlags);
+  if (NS_FAILED(rv)) {
+    NS_WARNING("EditorBase::InitInternal() failed");
+    return rv;
+  }
+
+  aDocument.AddMutationObserverUnlessExists(this);
+
+  if (!mRootElement) {
+    UpdateRootElement();
+  }
+
+  if (IsMailEditor()) {
+    DebugOnly<nsresult> rvIgnored = SetAbsolutePositioningEnabled(false);
+    NS_WARNING_ASSERTION(
+        NS_SUCCEEDED(rvIgnored),
+        "HTMLEditor::SetAbsolutePositioningEnabled(false) failed, but ignored");
+    rvIgnored = SetSnapToGridEnabled(false);
+    NS_WARNING_ASSERTION(
+        NS_SUCCEEDED(rvIgnored),
+        "HTMLEditor::SetSnapToGridEnabled(false) failed, but ignored");
+  }
+
+  Document* document = GetDocument();
+  if (NS_WARN_IF(!document)) {
+    return NS_ERROR_FAILURE;
+  }
+  if (!IsPlaintextMailComposer() && !IsInteractionAllowed()) {
+    mDisabledLinkHandling = true;
+    mOldLinkHandlingEnabled = document->LinkHandlingEnabled();
+    document->SetLinkHandlingEnabled(false);
+  }
+
+  mPendingStylesToApplyToNewContent = new PendingStyles();
+
+  AutoEditActionDataSetter editActionData(*this, EditAction::eInitializing);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    return NS_ERROR_FAILURE;
+  }
+
+  rv = InitEditorContentAndSelection();
+  if (NS_FAILED(rv)) {
+    NS_WARNING("HTMLEditor::InitEditorContentAndSelection() failed");
+    return EditorBase::ToGenericNSResult(rv);
+  }
+
+  ClearUndoRedo();
+  EnableUndoRedo();  
+
+  if (mTransactionManager) {
+    mTransactionManager->Attach(*this);
+  }
+
+  MOZ_ASSERT(!mInitSucceeded, "HTMLEditor::Init() shouldn't be nested");
+  mInitSucceeded = true;
+  editActionData.OnEditorInitialized();
+  return NS_OK;
+}
+
+nsresult HTMLEditor::PostCreate() {
+  AutoEditActionDataSetter editActionData(*this, EditAction::eNotEditing);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  nsresult rv = PostCreateInternal();
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "EditorBase::PostCreatInternal() failed");
+  return rv;
+}
+
+void HTMLEditor::PreDestroy() {
+  if (mDidPreDestroy) {
+    return;
+  }
+
+  mInitSucceeded = false;
+
+
+  RefPtr<Document> document = GetDocument();
+  if (document) {
+    document->RemoveMutationObserver(this);
+  }
+
+  PresShell* presShell = GetPresShell();
+  if (presShell && presShell->IsDestroying()) {
+    RefPtr<HTMLEditor> self = this;
+    nsContentUtils::AddScriptRunner(NS_NewRunnableFunction(
+        "HTMLEditor::PreDestroy", [self]() MOZ_CAN_RUN_SCRIPT_BOUNDARY_LAMBDA {
+          self->HideAnonymousEditingUIs();
+        }));
+  } else {
+    HideAnonymousEditingUIs();
+  }
+
+  mPaddingBRElementForEmptyEditor = nullptr;
+
+  PreDestroyInternal();
+}
+
+bool HTMLEditor::IsStyleEditable(const Element* aEditingHost) const {
+  if (IsInDesignMode()) {
+    return true;
+  }
+  if (IsPlaintextMailComposer()) {
+    return false;
+  }
+  const Element* const editingHost =
+      aEditingHost ? aEditingHost : ComputeEditingHost(LimitInBodyElement::No);
+  if (!editingHost) {
+    return true;
+  }
+  return !editingHost->IsContentEditablePlainTextOnly() &&
+         !editingHost->HasFlag(ELEMENT_HAS_EDIT_CONTEXT);
+}
+
+NS_IMETHODIMP HTMLEditor::GetDocumentCharacterSet(nsACString& aCharacterSet) {
+  nsresult rv = GetDocumentCharsetInternal(aCharacterSet);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "HTMLEditor::GetDocumentCharsetInternal() failed");
+  return rv;
+}
+
+NS_IMETHODIMP HTMLEditor::SetDocumentCharacterSet(
+    const nsACString& aCharacterSet) {
+  AutoEditActionDataSetter editActionData(*this, EditAction::eSetCharacterSet);
+  nsresult rv = editActionData.CanHandleAndMaybeDispatchBeforeInputEvent();
+  if (NS_FAILED(rv)) {
+    NS_WARNING_ASSERTION(rv == NS_ERROR_EDITOR_ACTION_CANCELED,
+                         "CanHandleAndMaybeDispatchBeforeInputEvent() failed");
+    return EditorBase::ToGenericNSResult(rv);
+  }
+
+  RefPtr<Document> document = GetDocument();
+  if (NS_WARN_IF(!document)) {
+    return EditorBase::ToGenericNSResult(NS_ERROR_NOT_INITIALIZED);
+  }
+  const Encoding* encoding = Encoding::ForLabelNoReplacement(aCharacterSet);
+  if (!encoding) {
+    NS_WARNING("Encoding::ForLabelNoReplacement() failed");
+    return EditorBase::ToGenericNSResult(NS_ERROR_INVALID_ARG);
+  }
+  document->SetDocumentCharacterSet(WrapNotNull(encoding));
+
+  if (UpdateMetaCharsetWithTransaction(*document, aCharacterSet)) {
+    return NS_OK;
+  }
+
+  if (aCharacterSet.IsEmpty()) {
+    return NS_OK;
+  }
+
+  RefPtr<ContentList> headElementList =
+      document->GetElementsByTagName(u"head"_ns);
+  if (NS_WARN_IF(!headElementList)) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIContent> primaryHeadElement = headElementList->Item(0);
+  if (NS_WARN_IF(!primaryHeadElement)) {
+    return NS_OK;
+  }
+
+  Result<CreateElementResult, nsresult> createNewMetaElementResult =
+      CreateAndInsertElement(
+          WithTransaction::Yes, *nsGkAtoms::meta,
+          EditorDOMPoint(primaryHeadElement, 0),
+          [&aCharacterSet](HTMLEditor&, Element& aMetaElement,
+                           const EditorDOMPoint&) {
+            MOZ_ASSERT(!aMetaElement.IsInComposedDoc());
+            DebugOnly<nsresult> rvIgnored =
+                aMetaElement.SetAttr(kNameSpaceID_None, nsGkAtoms::httpEquiv,
+                                     u"Content-Type"_ns, false);
+            NS_WARNING_ASSERTION(
+                NS_SUCCEEDED(rvIgnored),
+                "Element::SetAttr(nsGkAtoms::httpEquiv, \"Content-Type\", "
+                "false) failed, but ignored");
+            rvIgnored =
+                aMetaElement.SetAttr(kNameSpaceID_None, nsGkAtoms::content,
+                                     u"text/html;charset="_ns +
+                                         NS_ConvertASCIItoUTF16(aCharacterSet),
+                                     false);
+            NS_WARNING_ASSERTION(
+                NS_SUCCEEDED(rvIgnored),
+                nsPrintfCString(
+                    "Element::SetAttr(nsGkAtoms::content, "
+                    "\"text/html;charset=%s\", false) failed, but ignored",
+                    nsPromiseFlatCString(aCharacterSet).get())
+                    .get());
+            return NS_OK;
+          });
+  NS_WARNING_ASSERTION(createNewMetaElementResult.isOk(),
+                       "HTMLEditor::CreateAndInsertElement(WithTransaction::"
+                       "Yes, nsGkAtoms::meta) failed, but ignored");
+  createNewMetaElementResult.inspect().IgnoreCaretPointSuggestion();
+  return NS_OK;
+}
+
+bool HTMLEditor::UpdateMetaCharsetWithTransaction(
+    Document& aDocument, const nsACString& aCharacterSet) {
+  RefPtr<ContentList> metaElementList =
+      aDocument.GetElementsByTagName(u"meta"_ns);
+  if (NS_WARN_IF(!metaElementList)) {
+    return false;
+  }
+
+  for (uint32_t i = 0; i < metaElementList->Length(true); ++i) {
+    RefPtr<Element> metaElement = metaElementList->Item(i);
+    MOZ_ASSERT(metaElement);
+
+    nsAutoString currentValue;
+    metaElement->GetAttr(nsGkAtoms::httpEquiv, currentValue);
+
+    if (!FindInReadable(u"content-type"_ns, currentValue,
+                        nsCaseInsensitiveStringComparator)) {
+      continue;
+    }
+
+    metaElement->GetAttr(nsGkAtoms::content, currentValue);
+
+    constexpr auto charsetEquals = u"charset="_ns;
+    nsAString::const_iterator originalStart, start, end;
+    originalStart = currentValue.BeginReading(start);
+    currentValue.EndReading(end);
+    if (!FindInReadable(charsetEquals, start, end,
+                        nsCaseInsensitiveStringComparator)) {
+      continue;
+    }
+
+    nsresult rv = SetAttributeWithTransaction(
+        *metaElement, *nsGkAtoms::content,
+        Substring(originalStart, start) + charsetEquals +
+            NS_ConvertASCIItoUTF16(aCharacterSet));
+    NS_WARNING_ASSERTION(
+        NS_SUCCEEDED(rv),
+        "EditorBase::SetAttributeWithTransaction(nsGkAtoms::content) failed");
+    return NS_SUCCEEDED(rv);
+  }
+  return false;
+}
+
+NS_IMETHODIMP HTMLEditor::NotifySelectionChanged(Document* aDocument,
+                                                 Selection* aSelection,
+                                                 int16_t aReason,
+                                                 int32_t aAmount) {
+  if (NS_WARN_IF(!aDocument) || NS_WARN_IF(!aSelection)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  AutoEditActionDataSetter editActionData(*this, EditAction::eNotEditing);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  if (mPendingStylesToApplyToNewContent) {
+    RefPtr<PendingStyles> pendingStyles = mPendingStylesToApplyToNewContent;
+    pendingStyles->OnSelectionChange(*this, aReason);
+
+    if ((aReason & (nsISelectionListener::MOUSEDOWN_REASON |
+                    nsISelectionListener::KEYPRESS_REASON |
+                    nsISelectionListener::SELECTALL_REASON)) &&
+        aSelection) {
+      DebugOnly<nsresult> rv = RefreshEditingUI();
+      NS_WARNING_ASSERTION(
+          NS_SUCCEEDED(rv),
+          "HTMLEditor::RefreshEditingUI() failed, but ignored");
+    }
+  }
+
+  if (mHasFocus) {
+    if (auto focusedElement = GetFocusedElement()) {
+      auto newStateOrError = GetPreferredIMEState();
+      NS_WARNING_ASSERTION(newStateOrError.isOk(),
+                           "EditorBase::GetPreferredIMEState() failed");
+      if (MOZ_LIKELY(newStateOrError.isOk())) {
+        IMEStateManager::UpdateIMEState(newStateOrError.unwrap(),
+                                        focusedElement, *this);
+      }
+    }
+  }
+
+  if (mComposerCommandsUpdater) {
+    RefPtr<ComposerCommandsUpdater> updater = mComposerCommandsUpdater;
+    updater->OnSelectionChange();
+  }
+
+  nsresult rv = EditorBase::NotifySelectionChanged(aDocument, aSelection,
+                                                   aReason, aAmount);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "EditorBase::NotifySelectionChanged() failed");
+  return rv;
+}
+
+void HTMLEditor::UpdateRootElement() {
+
+  mRootElement = GetBodyElement();
+  if (!mRootElement) {
+    RefPtr<Document> doc = GetDocument();
+    if (doc) {
+      mRootElement = doc->GetDocumentElement();
+    }
+  }
+}
+
+static bool ShouldHandleFocusOn(const nsINode* aNode) {
+  if (!aNode) {
+    return false;
+  }
+  if (aNode->IsDocument()) {
+    if (!aNode->IsInDesignMode()) {
+      return false;
+    }
+  } else if (!aNode->IsContent()) {
+    return false;
+  }
+  return true;
+}
+
+void HTMLEditor::WillFocusNode(PresShell& aPresShell, nsINode* aNode) {
+  if (!ShouldHandleFocusOn(aNode)) {
+    return;
+  }
+  const RefPtr<HTMLEditor> htmlEditor =
+      nsContentUtils::GetHTMLEditor(aPresShell.GetPresContext());
+  if (!htmlEditor) {
+    return;
+  }
+  DebugOnly<nsresult> rv = htmlEditor->OnFocus(*aNode);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "HTMLEditor::OnFocus() failed, but ignore");
+}
+
+void HTMLEditor::WillBlurNode(PresShell& aPresShell, nsINode* aNode) {
+  const RefPtr<HTMLEditor> htmlEditor =
+      nsContentUtils::GetHTMLEditor(aPresShell.GetPresContext());
+  if (!htmlEditor) {
+    return;
+  }
+  DebugOnly<nsresult> rv = htmlEditor->OnBlur(aNode);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "HTMLEditor::OnBlur() failed, but ignore");
+}
+
+nsresult HTMLEditor::FocusedElementOrDocumentBecomesEditable(
+    Document& aDocument, Element* aElement) {
+  MOZ_LOG(gHTMLEditorFocusLog, LogLevel::Info,
+          ("%s(aDocument=%p, aElement=%s): mHasFocus=%s, mIsInDesignMode=%s, "
+           "aDocument.IsInDesignMode()=%s, aElement->IsInDesignMode()=%s",
+           __FUNCTION__, &aDocument, ToString(RefPtr{aElement}).c_str(),
+           mHasFocus ? "true" : "false", mIsInDesignMode ? "true" : "false",
+           aDocument.IsInDesignMode() ? "true" : "false",
+           aElement ? (aElement->IsInDesignMode() ? "true" : "false") : "N/A"));
+
+  const bool enteringInDesignMode =
+      (aDocument.IsInDesignMode() && (!aElement || aElement->IsInDesignMode()));
+
+  if (mHasFocus) {
+    if (enteringInDesignMode) {
+      mIsInDesignMode = true;
+      return NS_OK;
+    }
+    Result<IMEState, nsresult> newStateOrError = GetPreferredIMEState();
+    if (MOZ_UNLIKELY(newStateOrError.isErr())) {
+      NS_WARNING("HTMLEditor::GetPreferredIMEState() failed");
+      mIsInDesignMode = false;
+      return NS_OK;
+    }
+    const RefPtr<Element> focusedElement = GetFocusedElement();
+    if (focusedElement) {
+      MOZ_ASSERT(focusedElement == aElement);
+      TextControlElement* const textControlElement =
+          TextControlElement::FromNode(focusedElement);
+      if (textControlElement &&
+          textControlElement->IsSingleLineTextControlOrTextArea()) {
+        mHasFocus = false;
+        DebugOnly<nsresult> rv = FinalizeSelection();
+        NS_WARNING_ASSERTION(
+            NS_SUCCEEDED(rv),
+            "HTMLEditor::FinalizeSelection() failed, but ignored");
+        mIsInDesignMode = false;
+      }
+      IMEStateManager::UpdateIMEState(newStateOrError.unwrap(), focusedElement,
+                                      *this);
+    }
+    mIsInDesignMode = false;
+    return NS_OK;
+  }
+
+  if (enteringInDesignMode) {
+    MOZ_ASSERT(&aDocument == GetDocument());
+    nsresult rv = OnFocus(aDocument);
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rv), "HTMLEditor::OnFocus() failed");
+    return rv;
+  }
+
+  if (NS_WARN_IF(!aElement)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  MOZ_ASSERT(nsFocusManager::GetFocusedElementStatic() == aElement);
+  nsresult rv = OnFocus(*aElement);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv), "HTMLEditor::OnFocus() failed");
+
+
+  return rv;
+}
+
+nsresult HTMLEditor::OnFocus(const nsINode& aOriginalEventTargetNode) {
+  MOZ_LOG(gHTMLEditorFocusLog, LogLevel::Info,
+          ("%s(aOriginalEventTargetNode=%s): mIsInDesignMode=%s, "
+           "aOriginalEventTargetNode.IsInDesignMode()=%s",
+           __FUNCTION__, ToString(RefPtr{&aOriginalEventTargetNode}).c_str(),
+           mIsInDesignMode ? "true" : "false",
+           aOriginalEventTargetNode.IsInDesignMode() ? "true" : "false"));
+
+  if (!CanKeepHandlingFocusEvent(aOriginalEventTargetNode)) {
+    return NS_OK;
+  }
+
+  AutoEditActionDataSetter editActionData(*this, EditAction::eNotEditing);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    return NS_ERROR_FAILURE;
+  }
+
+  mHasFocus = true;
+  nsresult rv = EditorBase::OnFocus(aOriginalEventTargetNode);
+  if (NS_FAILED(rv)) {
+    mHasFocus = false;
+    NS_WARNING("EditorBase::OnFocus() failed");
+    return rv;
+  }
+  mIsInDesignMode = aOriginalEventTargetNode.IsInDesignMode();
+  if (StaticPrefs::dom_editcontext_enabled() && EditContext::IsAnyAttached()) {
+    aOriginalEventTargetNode.OwnerDoc()->UpdateTextEditContext();
+  }
+
+  return NS_OK;
+}
+
+void HTMLEditor::PostHandleFocusEvent(const nsINode& aFocusEventTargetNode) {
+  if (!ShouldHandleFocusOn(&aFocusEventTargetNode)) {
+    return;
+  }
+
+  MOZ_LOG(
+      gHTMLEditorFocusLog, LogLevel::Info,
+      ("%s(aFocusEvent={ GetOriginalDOMEventTarget()=%s }): "
+       "mIsInDesignMode=%s, "
+       "aOriginalEventTargetNode.IsInDesignMode()=%s, mHasFocus=%s, "
+       "GetFocusedElement()=%s",
+       __FUNCTION__, ToString(RefPtr{&aFocusEventTargetNode}).c_str(),
+       mIsInDesignMode ? "true" : "false",
+       aFocusEventTargetNode.IsInDesignMode() ? "true" : "false",
+       TrueOrFalse(mHasFocus), ToString(RefPtr{GetFocusedElement()}).c_str()));
+
+  if (!CanKeepHandlingFocusEvent(aFocusEventTargetNode)) {
+    return;
+  }
+
+  AutoEditActionDataSetter editActionData(*this, EditAction::eNotEditing);
+  if (NS_WARN_IF(!editActionData.CanHandle())) [[unlikely]] {
+    return;
+  }
+  return EditorBase::PostHandleFocusEvent(aFocusEventTargetNode);
+}
+
+nsresult HTMLEditor::FocusedElementOrDocumentBecomesNotEditable(
+    HTMLEditor* aHTMLEditor, Document& aDocument, Element* aElement) {
+  MOZ_LOG(
+      gHTMLEditorFocusLog, LogLevel::Info,
+      ("%s(aHTMLEditor=%p, aDocument=%p, aElement=%s): "
+       "aHTMLEditor->HasFocus()=%s, aHTMLEditor->IsInDesignMode()=%s, "
+       "aDocument.IsInDesignMode()=%s, aElement->IsInDesignMode()=%s, "
+       "nsFocusManager::GetFocusedElementStatic()=%s",
+       __FUNCTION__, aHTMLEditor, &aDocument,
+       ToString(RefPtr{aElement}).c_str(),
+       aHTMLEditor ? (aHTMLEditor->HasFocus() ? "true" : "false") : "N/A",
+       aHTMLEditor ? (aHTMLEditor->IsInDesignMode() ? "true" : "false") : "N/A",
+       aDocument.IsInDesignMode() ? "true" : "false",
+       aElement ? (aElement->IsInDesignMode() ? "true" : "false") : "N/A",
+       ToString(RefPtr{nsFocusManager::GetFocusedElementStatic()}).c_str()));
+
+  nsresult rv = [&]() MOZ_CAN_RUN_SCRIPT {
+    if (!aHTMLEditor || !aHTMLEditor->HasFocus()) {
+      return NS_OK;
+    }
+
+    aHTMLEditor->mHasFocus = false;
+    nsresult rv = aHTMLEditor->FinalizeSelection();
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                         "HTMLEditor::FinalizeSelection() failed");
+    aHTMLEditor->mIsInDesignMode = false;
+
+    if (StaticPrefs::dom_editcontext_enabled() &&
+        EditContext::IsAnyAttached()) {
+      aDocument.UpdateTextEditContext();
+    }
+
+    RefPtr<Element> focusedElement = nsFocusManager::GetFocusedElementStatic();
+    if (focusedElement && !focusedElement->IsInComposedDoc()) {
+      focusedElement = nullptr;
+    }
+    TextControlElement* const focusedTextControlElement =
+        TextControlElement::FromNodeOrNull(focusedElement);
+    if ((focusedElement && focusedElement->IsEditable() &&
+         focusedElement->OwnerDoc() == aHTMLEditor->GetDocument() &&
+         (!focusedTextControlElement ||
+          !focusedTextControlElement->IsSingleLineTextControlOrTextArea())) ||
+        (!focusedElement && aDocument.IsInDesignMode())) {
+      DebugOnly<nsresult> rvIgnored = aHTMLEditor->OnFocus(
+          focusedElement ? static_cast<nsINode&>(*focusedElement)
+                         : static_cast<nsINode&>(aDocument));
+      NS_WARNING_ASSERTION(NS_SUCCEEDED(rvIgnored),
+                           "HTMLEditor::OnFocus() failed, but ignored");
+    } else if (focusedTextControlElement &&
+               focusedTextControlElement->IsSingleLineTextControlOrTextArea()) {
+      if (const RefPtr<TextEditor> textEditor =
+              focusedTextControlElement->GetExtantTextEditor()) {
+        textEditor->OnFocus(*focusedElement);
+      }
+    }
+    return rv;
+  }();
+
+  if (const RefPtr<nsPresContext> presContext = aDocument.GetPresContext()) {
+    const RefPtr<Element> focusedElementInDocument =
+        Element::FromNodeOrNull(aDocument.GetUnretargetedFocusedContent());
+    MOZ_ASSERT_IF(focusedElementInDocument,
+                  focusedElementInDocument->GetPresContext(
+                      Element::PresContextFor::eForComposedDoc));
+    IMEStateManager::MaybeOnEditableStateDisabled(*presContext,
+                                                  focusedElementInDocument);
+  }
+
+  return rv;
+}
+
+nsresult HTMLEditor::OnBlur(const EventTarget* aEventTarget) {
+  MOZ_LOG(gHTMLEditorFocusLog, LogLevel::Info,
+          ("%s(aEventTarget=%s): mHasFocus=%s, mIsInDesignMode=%s, "
+           "aEventTarget->IsInDesignMode()=%s",
+           __FUNCTION__, ToString(RefPtr{aEventTarget}).c_str(),
+           mHasFocus ? "true" : "false", mIsInDesignMode ? "true" : "false",
+           nsINode::FromEventTargetOrNull(aEventTarget)
+               ? (nsINode::FromEventTarget(aEventTarget)->IsInDesignMode()
+                      ? "true"
+                      : "false")
+               : "N/A"));
+  const Element* eventTargetAsElement =
+      Element::FromEventTargetOrNull(aEventTarget);
+
+  const Element* focusedElement = nsFocusManager::GetFocusedElementStatic();
+  if (focusedElement && focusedElement != eventTargetAsElement) {
+    mIsInDesignMode = false;
+    mHasFocus = false;
+    return NS_OK;
+  }
+
+  if (mIsInDesignMode && eventTargetAsElement &&
+      eventTargetAsElement->IsInComposedDoc()) {
+    return NS_OK;
+  }
+
+  mHasFocus = false;
+  nsresult rv = FinalizeSelection();
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "EditorBase::FinalizeSelection() failed");
+  mIsInDesignMode = false;
+  if (StaticPrefs::dom_editcontext_enabled() && EditContext::IsAnyAttached() &&
+      eventTargetAsElement) {
+    eventTargetAsElement->OwnerDoc()->UpdateTextEditContext();
+  }
+
+  return rv;
+}
+
+Element* HTMLEditor::FindSelectionRoot(const nsINode& aNode) const {
+  MOZ_ASSERT(aNode.IsDocument() || aNode.IsContent(),
+             "aNode must be content or document node");
+
+  if (NS_WARN_IF(!aNode.IsInComposedDoc())) {
+    return nullptr;
+  }
+
+  if (aNode.IsInDesignMode()) {
+    return GetDocument()->GetRootElement();
+  }
+
+  nsIContent* content = const_cast<nsIContent*>(aNode.AsContent());
+  if (!content->HasFlag(NODE_IS_EDITABLE)) {
+    if (content->IsElement() &&
+        content->AsElement()->State().HasState(ElementState::READWRITE)) {
+      return content->AsElement();
+    }
+    return nullptr;
+  }
+
+  return content->GetEditingHost();
+}
+
+bool HTMLEditor::EntireDocumentIsEditable() const {
+  Document* document = GetDocument();
+  return document && document->GetDocumentElement() &&
+         (document->GetDocumentElement()->IsEditable() ||
+          (document->GetBody() && document->GetBody()->IsEditable()));
+}
+
+dom::EditContext* HTMLEditor::ComputeEditContext() const {
+  if (!StaticPrefs::dom_editcontext_enabled() ||
+      !EditContext::IsAnyAttached()) {
+    return nullptr;
+  }
+  if (auto* element = nsGenericHTMLElement::FromNodeOrNull(
+          ComputeEditingHost(LimitInBodyElement::No))) {
+    return element->GetEditContext();
+  }
+  return nullptr;
+}
+
+bool HTMLEditor::IsFiringTextUpdate() const {
+  EditContext* editContext = GetEditActionEditContext();
+  return editContext && editContext->IsFiringTextUpdate();
+}
+
+void HTMLEditor::CreateEventListeners() {
+  if (!mEventListener) {
+    mEventListener = new HTMLEditorEventListener();
+  }
+}
+
+nsresult HTMLEditor::InstallEventListeners() {
+  MOZ_ASSERT(GetDocument());
+  if (MOZ_UNLIKELY(!GetDocument()) || NS_WARN_IF(!mEventListener)) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+
+  HTMLEditorEventListener* listener =
+      reinterpret_cast<HTMLEditorEventListener*>(mEventListener.get());
+  nsresult rv = listener->Connect(this);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "HTMLEditorEventListener::Connect() failed");
+  return rv;
+}
+
+void HTMLEditor::Detach(
+    const ComposerCommandsUpdater& aComposerCommandsUpdater) {
+  MOZ_DIAGNOSTIC_ASSERT_IF(
+      mComposerCommandsUpdater,
+      &aComposerCommandsUpdater == mComposerCommandsUpdater);
+  if (mComposerCommandsUpdater == &aComposerCommandsUpdater) {
+    mComposerCommandsUpdater = nullptr;
+    if (mTransactionManager) {
+      mTransactionManager->Detach(*this);
+    }
+  }
+}
+
+NS_IMETHODIMP HTMLEditor::BeginningOfDocument() {
+  AutoEditActionDataSetter editActionData(*this, EditAction::eNotEditing);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  nsresult rv = MaybeCollapseSelectionAtFirstEditableNode(false);
+  NS_WARNING_ASSERTION(
+      NS_SUCCEEDED(rv),
+      "HTMLEditor::MaybeCollapseSelectionAtFirstEditableNode(false) failed");
+  return rv;
+}
+
+NS_IMETHODIMP HTMLEditor::EndOfDocument() {
+  AutoEditActionDataSetter editActionData(*this, EditAction::eNotEditing);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+  nsresult rv = CollapseSelectionToEndOfLastLeafNodeOfDocument();
+  NS_WARNING_ASSERTION(
+      NS_SUCCEEDED(rv),
+      "HTMLEditor::CollapseSelectionToEndOfLastLeafNodeOfDocument() failed");
+  return rv;
+}
+
+nsresult HTMLEditor::CollapseSelectionToEndOfLastLeafNodeOfDocument() const {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+
+  if (!EntireDocumentIsEditable()) {
+    return NS_OK;
+  }
+
+  RefPtr<Element> bodyOrDocumentElement = GetRoot();
+  if (NS_WARN_IF(!bodyOrDocumentElement)) {
+    return NS_ERROR_NULL_POINTER;
+  }
+
+  auto pointToPutCaret = [&]() -> EditorRawDOMPoint {
+    nsCOMPtr<nsIContent> lastLeafContent =
+        HTMLEditUtils::GetLastLeafContent(*bodyOrDocumentElement, {});
+    if (!lastLeafContent) {
+      return EditorRawDOMPoint::AtEndOf(*bodyOrDocumentElement);
+    }
+    return lastLeafContent->IsText() ||
+                   HTMLEditUtils::IsContainerNode(*lastLeafContent)
+               ? EditorRawDOMPoint::AtEndOf(*lastLeafContent)
+               : EditorRawDOMPoint(lastLeafContent);
+  }();
+  nsresult rv = CollapseSelectionTo(pointToPutCaret);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "EditorBase::CollapseSelectionTo() failed");
+  return rv;
+}
+
+void HTMLEditor::InitializeSelectionAncestorLimit(
+    Element& aAncestorLimit) const {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+
+
+  bool tryToCollapseSelectionAtFirstEditableNode = true;
+  if (SelectionRef().RangeCount() == 1 && SelectionRef().IsCollapsed()) {
+    Element* editingHost = ComputeEditingHost();
+    const nsRange* range = SelectionRef().GetRangeAt(0);
+    if (range->GetStartContainer() == editingHost && !range->StartOffset()) {
+      tryToCollapseSelectionAtFirstEditableNode = false;
+    }
+  }
+
+  EditorBase::InitializeSelectionAncestorLimit(aAncestorLimit);
+
+  if (tryToCollapseSelectionAtFirstEditableNode) {
+    DebugOnly<nsresult> rvIgnored =
+        MaybeCollapseSelectionAtFirstEditableNode(true);
+    NS_WARNING_ASSERTION(
+        NS_SUCCEEDED(rvIgnored),
+        "HTMLEditor::MaybeCollapseSelectionAtFirstEditableNode(true) failed, "
+        "but ignored");
+  }
+
+  if (aAncestorLimit.HasIndependentSelection()) {
+    SelectionRef().SetAncestorLimiter(nullptr);
+  }
+}
+
+nsresult HTMLEditor::MaybeCollapseSelectionAtFirstEditableNode(
+    bool aIgnoreIfSelectionInEditingHost) const {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+
+  RefPtr<Element> editingHost = ComputeEditingHost(LimitInBodyElement::No);
+  if (NS_WARN_IF(!editingHost)) {
+    return NS_OK;
+  }
+
+  if (aIgnoreIfSelectionInEditingHost && SelectionRef().RangeCount() == 1) {
+    const nsRange* range = SelectionRef().GetRangeAt(0);
+    if (!range->Collapsed() ||
+        range->GetStartContainer() != editingHost.get() ||
+        range->StartOffset()) {
+      return NS_OK;
+    }
+  }
+
+  constexpr LeafNodeOptions leafNodeOptions = {
+      LeafNodeOption::TreatNonEditableNodeAsLeafNode,
+      LeafNodeOption::TreatChildBlockAsLeafNode,
+  };
+  for (nsIContent* leafContent = HTMLEditUtils::GetFirstLeafContent(
+           *editingHost, leafNodeOptions,
+           BlockInlineCheck::UseComputedDisplayStyle);
+       leafContent;) {
+    if (!EditorUtils::IsEditableContent(*leafContent, EditorType::HTML)) {
+      MOZ_ASSERT(leafContent->GetParent());
+      MOZ_ASSERT(EditorUtils::IsEditableContent(*leafContent->GetParent(),
+                                                EditorType::HTML));
+      if (const Element* editableBlockElementOrInlineEditingHost =
+              HTMLEditUtils::GetAncestorElement(
+                  *leafContent,
+                  HTMLEditUtils::ClosestEditableBlockElementOrInlineEditingHost,
+                  BlockInlineCheck::UseComputedDisplayStyle)) {
+        nsresult rv = CollapseSelectionTo(
+            EditorDOMPoint(editableBlockElementOrInlineEditingHost, 0));
+        NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                             "EditorBase::CollapseSelectionTo() failed");
+        return rv;
+      }
+      NS_WARNING("Found leaf content did not have editable parent, why?");
+      return NS_ERROR_FAILURE;
+    }
+
+    if (Element* leafElement = Element::FromNode(leafContent)) {
+      if (HTMLEditUtils::IsInlineContent(
+              *leafElement, BlockInlineCheck::UseComputedDisplayStyle) &&
+          !HTMLEditUtils::IsNeverElementContentsEditableByUser(*leafElement) &&
+          HTMLEditUtils::CanNodeContain(*leafElement,
+                                        *nsGkAtoms::textTagName)) {
+        leafContent = HTMLEditUtils::GetNextLeafContentOrNextBlockElement(
+            *leafElement, leafNodeOptions,
+            BlockInlineCheck::UseComputedDisplayStyle, editingHost);
+        continue;
+      }
+    }
+
+    if (Text* text = leafContent->GetAsText()) {
+      const WSScanResult scanResultInTextNode =
+          WSRunScanner::ScanInclusiveNextVisibleNodeOrBlockBoundary(
+              {WSRunScanner::Option::OnlyEditableNodes},
+              EditorRawDOMPoint(text, 0));
+      if ((scanResultInTextNode.InVisibleOrCollapsibleCharacters() ||
+           scanResultInTextNode.ReachedPreformattedLineBreak()) &&
+          scanResultInTextNode.TextPtr() == text) {
+        nsresult rv = CollapseSelectionTo(
+            scanResultInTextNode.PointAtReachedContent<EditorRawDOMPoint>());
+        NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                             "EditorBase::CollapseSelectionTo() failed");
+        return rv;
+      }
+      leafContent = HTMLEditUtils::GetNextLeafContentOrNextBlockElement(
+          *leafContent, leafNodeOptions,
+          BlockInlineCheck::UseComputedDisplayStyle, editingHost);
+      continue;
+    }
+
+    if (!HTMLEditUtils::CanNodeContain(*leafContent, *nsGkAtoms::textTagName) ||
+        HTMLEditUtils::IsNeverElementContentsEditableByUser(*leafContent)) {
+      MOZ_ASSERT(leafContent->GetParent());
+      if (EditorUtils::IsEditableContent(*leafContent, EditorType::HTML)) {
+        nsresult rv = CollapseSelectionTo(EditorDOMPoint(leafContent));
+        NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                             "EditorBase::CollapseSelectionTo() failed");
+        return rv;
+      }
+      MOZ_ASSERT_UNREACHABLE(
+          "How do we reach editable leaf in non-editable element?");
+      nsresult rv = CollapseSelectionTo(EditorDOMPoint(editingHost, 0));
+      NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                           "EditorBase::CollapseSelectionTo() failed");
+      return rv;
+    }
+
+    if (HTMLEditUtils::IsBlockElement(
+            *leafContent, BlockInlineCheck::UseComputedDisplayStyle) &&
+        !HTMLEditUtils::IsEmptyNode(
+            *leafContent,
+            {EmptyCheckOption::TreatSingleBRElementAsVisible,
+             EmptyCheckOption::TreatNonEditableContentAsInvisible}) &&
+        !HTMLEditUtils::IsNeverElementContentsEditableByUser(*leafContent)) {
+      leafContent = HTMLEditUtils::GetFirstLeafContent(
+          *leafContent, leafNodeOptions,
+          BlockInlineCheck::UseComputedDisplayStyle);
+      continue;
+    }
+
+    leafContent = HTMLEditUtils::GetNextLeafContentOrNextBlockElement(
+        *leafContent, leafNodeOptions,
+        BlockInlineCheck::UseComputedDisplayStyle, editingHost);
+  }
+
+  nsresult rv = CollapseSelectionTo(EditorDOMPoint(editingHost, 0));
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "EditorBase::CollapseSelectionTo() failed");
+  return rv;
+}
+
+void HTMLEditor::PreHandleMouseDown(const MouseEvent& aMouseDownEvent) {
+  if (mPendingStylesToApplyToNewContent) {
+    mPendingStylesToApplyToNewContent->PreHandleMouseEvent(aMouseDownEvent);
+  }
+}
+
+void HTMLEditor::PreHandleMouseUp(const MouseEvent& aMouseUpEvent) {
+  if (mPendingStylesToApplyToNewContent) {
+    mPendingStylesToApplyToNewContent->PreHandleMouseEvent(aMouseUpEvent);
+  }
+}
+
+void HTMLEditor::PreHandleSelectionChangeCommand(Command aCommand) {
+  if (mPendingStylesToApplyToNewContent) {
+    mPendingStylesToApplyToNewContent->PreHandleSelectionChangeCommand(
+        aCommand);
+  }
+}
+
+void HTMLEditor::PostHandleSelectionChangeCommand(Command aCommand) {
+  if (!mPendingStylesToApplyToNewContent) {
+    return;
+  }
+
+  AutoEditActionDataSetter editActionData(*this, EditAction::eNotEditing);
+  if (!editActionData.CanHandle()) {
+    return;
+  }
+  mPendingStylesToApplyToNewContent->PostHandleSelectionChangeCommand(*this,
+                                                                      aCommand);
+}
+
+nsresult HTMLEditor::HandleKeyPressEvent(WidgetKeyboardEvent* aKeyboardEvent) {
+  if (NS_WARN_IF(!aKeyboardEvent)) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  if (IsReadonly()) {
+    HandleKeyPressEventInReadOnlyMode(*aKeyboardEvent);
+    return NS_OK;
+  }
+
+  MOZ_ASSERT(aKeyboardEvent->mMessage == eKeyPress,
+             "HandleKeyPressEvent gets non-keypress event");
+
+  switch (aKeyboardEvent->mKeyCode) {
+    case NS_VK_META:
+    case NS_VK_WIN:
+    case NS_VK_SHIFT:
+    case NS_VK_CONTROL:
+    case NS_VK_ALT:
+      aKeyboardEvent->PreventDefault();
+      return NS_OK;
+
+    case NS_VK_BACK:
+    case NS_VK_DELETE: {
+      nsresult rv = EditorBase::HandleKeyPressEvent(aKeyboardEvent);
+      NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                           "EditorBase::HandleKeyPressEvent() failed");
+      return rv;
+    }
+    case NS_VK_TAB: {
+      if (IsTabbable()) {
+        return NS_OK;
+      }
+
+      if (IsPlaintextMailComposer()) {
+        if (aKeyboardEvent->IsShift() || aKeyboardEvent->IsControl() ||
+            aKeyboardEvent->IsAlt() || aKeyboardEvent->IsMeta()) {
+          return NS_OK;
+        }
+
+        aKeyboardEvent->PreventDefault();
+        nsresult rv = OnInputText(u"\t"_ns);
+        NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                             "EditorBase::OnInputText(\\t) failed");
+        return rv;
+      }
+
+      if (aKeyboardEvent->IsControl() || aKeyboardEvent->IsAlt() ||
+          aKeyboardEvent->IsMeta()) {
+        return NS_OK;
+      }
+
+      RefPtr<Selection> selection = GetSelection();
+      if (NS_WARN_IF(!selection) || NS_WARN_IF(!selection->RangeCount())) {
+        return NS_ERROR_FAILURE;
+      }
+
+      nsINode* startContainer = selection->GetRangeAt(0)->GetStartContainer();
+      MOZ_ASSERT(startContainer);
+      if (!startContainer->IsContent()) {
+        break;
+      }
+
+      const Element* editableBlockElement =
+          HTMLEditUtils::GetInclusiveAncestorElement(
+              *startContainer->AsContent(),
+              HTMLEditUtils::ClosestEditableBlockElement,
+              BlockInlineCheck::UseComputedDisplayOutsideStyle);
+      if (!editableBlockElement) {
+        break;
+      }
+
+      if (HTMLEditUtils::IsAnyTableElementExceptColumnElement(
+              *editableBlockElement)) {
+        Result<EditActionResult, nsresult> result =
+            HandleTabKeyPressInTable(aKeyboardEvent);
+        if (MOZ_UNLIKELY(result.isErr())) {
+          NS_WARNING("HTMLEditor::HandleTabKeyPressInTable() failed");
+          return EditorBase::ToGenericNSResult(result.unwrapErr());
+        }
+        if (!result.inspect().Handled()) {
+          return NS_OK;
+        }
+        nsresult rv = ScrollSelectionFocusIntoView();
+        NS_WARNING_ASSERTION(
+            NS_SUCCEEDED(rv),
+            "EditorBase::ScrollSelectionFocusIntoView() failed");
+        return EditorBase::ToGenericNSResult(rv);
+      }
+
+      if (HTMLEditUtils::IsListItemElement(*editableBlockElement)) {
+        aKeyboardEvent->PreventDefault();
+        if (!aKeyboardEvent->IsShift()) {
+          nsresult rv = IndentAsAction();
+          NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                               "HTMLEditor::IndentAsAction() failed");
+          return EditorBase::ToGenericNSResult(rv);
+        }
+        nsresult rv = OutdentAsAction();
+        NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                             "HTMLEditor::OutdentAsAction() failed");
+        return EditorBase::ToGenericNSResult(rv);
+      }
+
+      if (aKeyboardEvent->IsShift()) {
+        return NS_OK;
+      }
+      aKeyboardEvent->PreventDefault();
+      nsresult rv = OnInputText(u"\t"_ns);
+      NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                           "EditorBase::OnInputText(\\t) failed");
+      return EditorBase::ToGenericNSResult(rv);
+    }
+    case NS_VK_RETURN: {
+      if (!aKeyboardEvent->IsInputtingLineBreak()) {
+        return NS_OK;
+      }
+      aKeyboardEvent->PreventDefault();
+      const RefPtr<Element> editingHost =
+          ComputeEditingHost(LimitInBodyElement::No);
+      if (NS_WARN_IF(!editingHost)) {
+        return NS_ERROR_UNEXPECTED;
+      }
+      if (aKeyboardEvent->IsShift() ||
+          editingHost->IsContentEditablePlainTextOnly()) {
+        nsresult rv = InsertLineBreakAsAction();
+        NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                             "HTMLEditor::InsertLineBreakAsAction() failed");
+        return EditorBase::ToGenericNSResult(rv);
+      }
+      nsresult rv = InsertParagraphSeparatorAsAction();
+      NS_WARNING_ASSERTION(
+          NS_SUCCEEDED(rv),
+          "HTMLEditor::InsertParagraphSeparatorAsAction() failed");
+      return EditorBase::ToGenericNSResult(rv);
+    }
+  }
+
+  if (!aKeyboardEvent->IsInputtingText()) {
+    return NS_OK;
+  }
+  aKeyboardEvent->PreventDefault();
+  if (!StaticPrefs::dom_event_keypress_dispatch_once_per_surrogate_pair() &&
+      !StaticPrefs::dom_event_keypress_key_allow_lone_surrogate() &&
+      aKeyboardEvent->mKeyValue.IsEmpty() &&
+      mozilla::IsSurrogate(aKeyboardEvent->mCharCode)) {
+    return NS_OK;
+  }
+  nsAutoString str(aKeyboardEvent->mKeyValue);
+  if (str.IsEmpty()) {
+    str.Assign(static_cast<char16_t>(aKeyboardEvent->mCharCode));
+  }
+  nsresult rv = OnInputText(str);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv), "EditorBase::OnInputText() failed");
+  return rv;
+}
+
+NS_IMETHODIMP HTMLEditor::NodeIsBlock(nsINode* aNode, bool* aIsBlock) {
+  if (NS_WARN_IF(!aNode)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+  if (MOZ_UNLIKELY(!aNode->IsElement())) {
+    *aIsBlock = false;
+    return NS_OK;
+  }
+  if (aNode->IsInComposedDoc()) {
+    if (RefPtr<PresShell> presShell = GetPresShell()) {
+      presShell->FlushPendingNotifications(FlushType::Style);
+    }
+  }
+  *aIsBlock = HTMLEditUtils::IsBlockElement(
+      *aNode->AsElement(), BlockInlineCheck::UseComputedDisplayOutsideStyle);
+  return NS_OK;
+}
+
+NS_IMETHODIMP HTMLEditor::UpdateBaseURL() {
+  RefPtr<Document> document = GetDocument();
+  if (NS_WARN_IF(!document)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  RefPtr<ContentList> baseElementList =
+      document->GetElementsByTagName(u"base"_ns);
+
+  if (!baseElementList || !baseElementList->Item(0)) {
+    document->SetBaseURI(document->GetDocumentURI());
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP HTMLEditor::InsertLineBreak() {
+  AutoEditActionDataSetter editActionData(
+      *this, EditAction::eInsertParagraphSeparator);
+  nsresult rv = editActionData.CanHandleAndMaybeDispatchBeforeInputEvent();
+  if (NS_FAILED(rv)) {
+    NS_WARNING_ASSERTION(rv == NS_ERROR_EDITOR_ACTION_CANCELED,
+                         "CanHandleAndMaybeDispatchBeforeInputEvent(), failed");
+    return EditorBase::ToGenericNSResult(rv);
+  }
+
+  const RefPtr<Element> editingHost =
+      ComputeEditingHost(LimitInBodyElement::No);
+  if (!editingHost) {
+    return NS_SUCCESS_DOM_NO_OPERATION;
+  }
+
+  Result<EditActionResult, nsresult> result =
+      InsertParagraphSeparatorAsSubAction(*editingHost);
+  if (MOZ_UNLIKELY(result.isErr())) {
+    NS_WARNING("HTMLEditor::InsertParagraphSeparatorAsSubAction() failed");
+    return EditorBase::ToGenericNSResult(result.unwrapErr());
+  }
+  return NS_OK;
+}
+
+nsresult HTMLEditor::InsertLineBreakAsAction(nsIPrincipal* aPrincipal) {
+  AutoEditActionDataSetter editActionData(*this, EditAction::eInsertLineBreak,
+                                          aPrincipal);
+  nsresult rv = editActionData.CanHandleAndMaybeDispatchBeforeInputEvent();
+  if (NS_FAILED(rv)) {
+    NS_WARNING_ASSERTION(rv == NS_ERROR_EDITOR_ACTION_CANCELED,
+                         "CanHandleAndMaybeDispatchBeforeInputEvent(), failed");
+    return EditorBase::ToGenericNSResult(rv);
+  }
+
+  if (IsSelectionRangeContainerNotContent()) {
+    return NS_SUCCESS_DOM_NO_OPERATION;
+  }
+
+  rv = InsertLineBreakAsSubAction();
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "HTMLEditor::InsertLineBreakAsSubAction() failed");
+  return NS_FAILED(rv) ? rv : NS_OK;
+}
+
+nsresult HTMLEditor::InsertParagraphSeparatorAsAction(
+    nsIPrincipal* aPrincipal) {
+  AutoEditActionDataSetter editActionData(
+      *this, EditAction::eInsertParagraphSeparator, aPrincipal);
+  nsresult rv = editActionData.CanHandleAndMaybeDispatchBeforeInputEvent();
+  if (NS_FAILED(rv)) {
+    NS_WARNING_ASSERTION(rv == NS_ERROR_EDITOR_ACTION_CANCELED,
+                         "CanHandleAndMaybeDispatchBeforeInputEvent(), failed");
+    return EditorBase::ToGenericNSResult(rv);
+  }
+
+  const RefPtr<Element> editingHost =
+      ComputeEditingHost(LimitInBodyElement::No);
+  if (!editingHost) {
+    return NS_SUCCESS_DOM_NO_OPERATION;
+  }
+
+  Result<EditActionResult, nsresult> result =
+      InsertParagraphSeparatorAsSubAction(*editingHost);
+  if (MOZ_UNLIKELY(result.isErr())) {
+    NS_WARNING("HTMLEditor::InsertParagraphSeparatorAsSubAction() failed");
+    return EditorBase::ToGenericNSResult(result.unwrapErr());
+  }
+  return NS_OK;
+}
+
+Result<EditActionResult, nsresult> HTMLEditor::HandleTabKeyPressInTable(
+    WidgetKeyboardEvent* aKeyboardEvent) {
+  MOZ_ASSERT(aKeyboardEvent);
+
+  AutoEditActionDataSetter dummyEditActionData(*this, EditAction::eNotEditing);
+  if (NS_WARN_IF(!dummyEditActionData.CanHandle())) {
+    return EditActionResult::IgnoredResult();
+  }
+
+  const RefPtr<Element> cellElement =
+      GetInclusiveAncestorByTagNameAtSelection(*nsGkAtoms::td);
+  if (!cellElement) {
+    NS_WARNING(
+        "HTMLEditor::GetInclusiveAncestorByTagNameAtSelection(*nsGkAtoms::td) "
+        "returned nullptr");
+    return EditActionResult::IgnoredResult();
+  }
+
+  RefPtr<Element> table =
+      HTMLEditUtils::GetClosestAncestorTableElement(*cellElement);
+  if (!table) {
+    NS_WARNING("HTMLEditor::GetClosestAncestorTableElement() failed");
+    return EditActionResult::IgnoredResult();
+  }
+
+  PostContentIterator postOrderIter;
+  nsresult rv = postOrderIter.Init(table);
+  if (NS_FAILED(rv)) {
+    NS_WARNING("PostContentIterator::Init() failed");
+    return Err(rv);
+  }
+  rv = postOrderIter.PositionAt(cellElement);
+  if (NS_FAILED(rv)) {
+    NS_WARNING("PostContentIterator::PositionAt() failed");
+    return Err(rv);
+  }
+
+  do {
+    if (aKeyboardEvent->IsShift()) {
+      postOrderIter.Prev();
+    } else {
+      postOrderIter.Next();
+    }
+
+    const RefPtr<Element> element =
+        Element::FromNodeOrNull(postOrderIter.GetCurrentNode());
+    if (element && HTMLEditUtils::IsTableCellElement(*element) &&
+        HTMLEditUtils::GetClosestAncestorTableElement(*element) == table) {
+      aKeyboardEvent->PreventDefault();
+      CollapseSelectionToDeepestNonTableFirstChild(element);
+      if (NS_WARN_IF(Destroyed())) {
+        return Err(NS_ERROR_EDITOR_DESTROYED);
+      }
+      return EditActionResult::HandledResult();
+    }
+  } while (!postOrderIter.IsDone());
+
+  if (aKeyboardEvent->IsShift()) {
+    return EditActionResult::IgnoredResult();
+  }
+
+  AutoEditActionDataSetter editActionData(*this,
+                                          EditAction::eInsertTableRowElement);
+  rv = editActionData.CanHandleAndMaybeDispatchBeforeInputEvent();
+  if (NS_FAILED(rv)) {
+    NS_WARNING_ASSERTION(rv == NS_ERROR_EDITOR_ACTION_CANCELED,
+                         "CanHandleAndMaybeDispatchBeforeInputEvent(), failed");
+    return Err(rv);
+  }
+  rv = InsertTableRowsWithTransaction(*cellElement, 1,
+                                      InsertPosition::eAfterSelectedCell);
+  if (NS_WARN_IF(Destroyed())) {
+    return Err(NS_ERROR_EDITOR_DESTROYED);
+  }
+  if (NS_FAILED(rv)) {
+    NS_WARNING(
+        "HTMLEditor::InsertTableRowsWithTransaction(*cellElement, 1, "
+        "InsertPosition::eAfterSelectedCell) failed");
+    return Err(rv);
+  }
+  aKeyboardEvent->PreventDefault();
+  RefPtr<Element> tblElement, cell;
+  int32_t row;
+  rv = GetCellContext(getter_AddRefs(tblElement), getter_AddRefs(cell), nullptr,
+                      nullptr, &row, nullptr);
+  if (NS_FAILED(rv)) {
+    NS_WARNING("HTMLEditor::GetCellContext() failed");
+    return Err(rv);
+  }
+  if (!tblElement) {
+    NS_WARNING("HTMLEditor::GetCellContext() didn't return table element");
+    return Err(NS_ERROR_FAILURE);
+  }
+  cell = GetTableCellElementAt(*tblElement, row, 0);
+  if (cell) {
+    nsresult rv = CollapseSelectionToStartOf(*cell);
+    if (NS_FAILED(rv)) {
+      NS_WARNING("EditorBase::CollapseSelectionToStartOf() failed");
+      return Err(NS_ERROR_EDITOR_DESTROYED);
+    }
+  }
+  if (NS_WARN_IF(Destroyed())) {
+    return Err(NS_ERROR_EDITOR_DESTROYED);
+  }
+  return EditActionResult::HandledResult();
+}
+
+void HTMLEditor::CollapseSelectionToDeepestNonTableFirstChild(nsINode* aNode) {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+
+  MOZ_ASSERT(aNode);
+
+  nsCOMPtr<nsINode> node = aNode;
+
+  for (nsIContent* child = node->GetFirstChild(); child;
+       child = child->GetFirstChild()) {
+    if (child->IsHTMLElement(nsGkAtoms::table) ||
+        !HTMLEditUtils::IsContainerNode(*child)) {
+      break;
+    }
+    node = child;
+  }
+
+  DebugOnly<nsresult> rvIgnored = CollapseSelectionToStartOf(*node);
+  NS_WARNING_ASSERTION(
+      NS_SUCCEEDED(rvIgnored),
+      "EditorBase::CollapseSelectionToStartOf() failed, but ignored");
+}
+
+NS_IMETHODIMP HTMLEditor::InsertElementAtSelection(Element* aElement,
+                                                   bool aDeleteSelection) {
+  InsertElementOptions options;
+  if (aDeleteSelection) {
+    options += InsertElementOption::DeleteSelection;
+  }
+  nsresult rv = InsertElementAtSelectionAsAction(aElement, options);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "HTMLEditor::InsertElementAtSelectionAsAction() failed");
+  return rv;
+}
+
+nsresult HTMLEditor::InsertElementAtSelectionAsAction(
+    Element* aElement, const InsertElementOptions aOptions,
+    nsIPrincipal* aPrincipal) {
+  if (NS_WARN_IF(!aElement)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  if (IsReadonly()) {
+    return NS_OK;
+  }
+
+  AutoEditActionDataSetter editActionData(
+      *this, HTMLEditUtils::GetEditActionForInsert(*aElement), aPrincipal);
+  nsresult rv = editActionData.CanHandleAndMaybeDispatchBeforeInputEvent();
+  if (NS_FAILED(rv)) {
+    NS_WARNING_ASSERTION(rv == NS_ERROR_EDITOR_ACTION_CANCELED,
+                         "CanHandleAndMaybeDispatchBeforeInputEvent(), failed");
+    return EditorBase::ToGenericNSResult(rv);
+  }
+
+  DebugOnly<nsresult> rvIgnored = CommitComposition();
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rvIgnored),
+                       "EditorBase::CommitComposition() failed, but ignored");
+
+  {
+    Result<EditActionResult, nsresult> result = CanHandleHTMLEditSubAction();
+    if (MOZ_UNLIKELY(result.isErr())) {
+      NS_WARNING("HTMLEditor::CanHandleHTMLEditSubAction() failed");
+      return EditorBase::ToGenericNSResult(result.unwrapErr());
+    }
+    if (result.inspect().Canceled()) {
+      return NS_OK;
+    }
+  }
+
+  UndefineCaretBidiLevel();
+
+  AutoPlaceholderBatch treatAsOneTransaction(
+      *this, ScrollSelectionIntoView::Yes, __FUNCTION__);
+  IgnoredErrorResult ignoredError;
+  AutoEditSubActionNotifier startToHandleEditSubAction(
+      *this, EditSubAction::eInsertElement, nsIEditor::eNext, ignoredError);
+  if (NS_WARN_IF(ignoredError.ErrorCodeIs(NS_ERROR_EDITOR_DESTROYED))) {
+    return ignoredError.StealNSResult();
+  }
+  NS_WARNING_ASSERTION(
+      !ignoredError.Failed(),
+      "HTMLEditor::OnStartToHandleTopLevelEditSubAction() failed, but ignored");
+
+  const RefPtr<Element> editingHost =
+      ComputeEditingHost(LimitInBodyElement::No);
+  if (NS_WARN_IF(!editingHost)) {
+    return EditorBase::ToGenericNSResult(NS_ERROR_FAILURE);
+  }
+
+  rv = EnsureNoPaddingBRElementForEmptyEditor();
+  if (NS_WARN_IF(rv == NS_ERROR_EDITOR_DESTROYED)) {
+    return EditorBase::ToGenericNSResult(NS_ERROR_EDITOR_DESTROYED);
+  }
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "EditorBase::EnsureNoPaddingBRElementForEmptyEditor() "
+                       "failed, but ignored");
+
+  if (NS_SUCCEEDED(rv) && SelectionRef().IsCollapsed()) {
+    nsresult rv = EnsureCaretNotAfterInvisibleBRElement(*editingHost);
+    if (NS_WARN_IF(rv == NS_ERROR_EDITOR_DESTROYED)) {
+      return EditorBase::ToGenericNSResult(NS_ERROR_EDITOR_DESTROYED);
+    }
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                         "HTMLEditor::EnsureCaretNotAfterInvisibleBRElement() "
+                         "failed, but ignored");
+    if (NS_SUCCEEDED(rv)) {
+      nsresult rv = PrepareInlineStylesForCaret();
+      if (NS_WARN_IF(rv == NS_ERROR_EDITOR_DESTROYED)) {
+        return EditorBase::ToGenericNSResult(NS_ERROR_EDITOR_DESTROYED);
+      }
+      NS_WARNING_ASSERTION(
+          NS_SUCCEEDED(rv),
+          "HTMLEditor::PrepareInlineStylesForCaret() failed, but ignored");
+    }
+  }
+
+  if (aOptions.contains(InsertElementOption::DeleteSelection) &&
+      !SelectionRef().IsCollapsed()) {
+    if (!HTMLEditUtils::IsBlockElement(
+            *aElement, BlockInlineCheck::UseComputedDisplayOutsideStyle)) {
+      nsresult rv = DeleteSelectionAsSubAction(
+          eNone,
+          aOptions.contains(InsertElementOption::SplitAncestorInlineElements)
+              ? eStrip
+              : eNoStrip);
+      if (NS_FAILED(rv)) {
+        NS_WARNING(
+            "EditorBase::DeleteSelectionAsSubAction(eNone, eNoStrip) failed");
+        return EditorBase::ToGenericNSResult(rv);
+      }
+    }
+
+    nsresult rv = DeleteSelectionAndPrepareToCreateNode();
+    if (NS_FAILED(rv)) {
+      NS_WARNING("HTMLEditor::DeleteSelectionAndPrepareToCreateNode() failed");
+      return rv;
+    }
+  }
+  else {
+    if (HTMLEditUtils::IsNamedAnchorElement(*aElement)) {
+      IgnoredErrorResult ignoredError;
+      SelectionRef().CollapseToStart(ignoredError);
+      if (NS_WARN_IF(Destroyed())) {
+        return EditorBase::ToGenericNSResult(NS_ERROR_EDITOR_DESTROYED);
+      }
+      NS_WARNING_ASSERTION(!ignoredError.Failed(),
+                           "Selection::CollapseToStart() failed, but ignored");
+    } else {
+      IgnoredErrorResult ignoredError;
+      SelectionRef().CollapseToEnd(ignoredError);
+      if (NS_WARN_IF(Destroyed())) {
+        return EditorBase::ToGenericNSResult(NS_ERROR_EDITOR_DESTROYED);
+      }
+      NS_WARNING_ASSERTION(!ignoredError.Failed(),
+                           "Selection::CollapseToEnd() failed, but ignored");
+    }
+  }
+
+  if (!SelectionRef().GetAnchorNode()) {
+    return NS_OK;
+  }
+  if (NS_WARN_IF(!SelectionRef().GetAnchorNode()->IsInclusiveDescendantOf(
+          editingHost))) {
+    return NS_ERROR_FAILURE;
+  }
+
+  EditorRawDOMPoint atAnchor(SelectionRef().AnchorRef());
+  EditorDOMPoint pointToInsert =
+      HTMLEditUtils::GetBetterInsertionPointFor<EditorDOMPoint>(*aElement,
+                                                                atAnchor);
+  if (!pointToInsert.IsSet()) {
+    NS_WARNING("HTMLEditUtils::GetBetterInsertionPointFor() failed");
+    return NS_ERROR_FAILURE;
+  }
+  Result<EditorDOMPoint, nsresult> pointToInsertOrError =
+      WhiteSpaceVisibilityKeeper::NormalizeWhiteSpacesToSplitAt(
+          *this, pointToInsert,
+          {WhiteSpaceVisibilityKeeper::NormalizeOption::
+               StopIfFollowingWhiteSpacesStartsWithNBSP});
+  if (MOZ_UNLIKELY(pointToInsertOrError.isErr())) {
+    NS_WARNING(
+        "WhiteSpaceVisibilityKeeper::NormalizeWhiteSpacesToSplitAt() failed");
+    return pointToInsertOrError.propagateErr();
+  }
+  pointToInsert = pointToInsertOrError.unwrap();
+  if (NS_WARN_IF(!pointToInsert.IsSetAndValidInComposedDoc())) {
+    return Err(NS_ERROR_EDITOR_UNEXPECTED_DOM_TREE);
+  }
+
+  if (aOptions.contains(InsertElementOption::SplitAncestorInlineElements)) {
+    if (const RefPtr<Element> topmostInlineElement = Element::FromNodeOrNull(
+            HTMLEditUtils::GetMostDistantAncestorInlineElement(
+                *pointToInsert.ContainerAs<nsIContent>(),
+                BlockInlineCheck::UseComputedDisplayOutsideStyle,
+                editingHost))) {
+      Result<SplitNodeResult, nsresult> splitInlinesResult =
+          SplitNodeDeepWithTransaction(
+              *topmostInlineElement, pointToInsert,
+              SplitAtEdges::eDoNotCreateEmptyContainer);
+      if (MOZ_UNLIKELY(splitInlinesResult.isErr())) {
+        NS_WARNING("HTMLEditor::SplitNodeDeepWithTransaction() failed");
+        return splitInlinesResult.unwrapErr();
+      }
+      splitInlinesResult.inspect().IgnoreCaretPointSuggestion();
+      auto splitPoint =
+          splitInlinesResult.inspect().AtSplitPoint<EditorDOMPoint>();
+      if (MOZ_LIKELY(splitPoint.IsSet())) {
+        pointToInsert = std::move(splitPoint);
+      }
+    }
+  }
+  {
+    Result<CreateElementResult, nsresult> insertElementResult =
+        InsertNodeIntoProperAncestorWithTransaction<Element>(
+            *aElement, pointToInsert,
+            SplitAtEdges::eAllowToCreateEmptyContainer);
+    if (MOZ_UNLIKELY(insertElementResult.isErr())) {
+      NS_WARNING(
+          "HTMLEditor::InsertNodeIntoProperAncestorWithTransaction("
+          "SplitAtEdges::eAllowToCreateEmptyContainer) failed");
+      return EditorBase::ToGenericNSResult(insertElementResult.unwrapErr());
+    }
+    if (MOZ_LIKELY(aElement->IsInComposedDoc())) {
+      const auto afterElement = EditorDOMPoint::After(*aElement);
+      if (MOZ_LIKELY(afterElement.IsInContentNode())) {
+        nsresult rv = EnsureNoFollowingUnnecessaryLineBreak(
+            afterElement,
+            PreservePreformattedLineBreak::Yes,
+            PaddingForEmptyBlock::Significant, *editingHost);
+        if (NS_FAILED(rv)) {
+          NS_WARNING(
+              "HTMLEditor::EnsureNoFollowingUnnecessaryLineBreak() failed");
+          return EditorBase::ToGenericNSResult(rv);
+        }
+      }
+    }
+    insertElementResult.inspect().IgnoreCaretPointSuggestion();
+  }
+  if (!SetCaretInTableCell(aElement)) {
+    if (NS_WARN_IF(Destroyed())) {
+      return EditorBase::ToGenericNSResult(NS_ERROR_EDITOR_DESTROYED);
+    }
+    nsresult rv = CollapseSelectionTo(EditorRawDOMPoint::After(*aElement));
+    if (NS_FAILED(rv)) {
+      NS_WARNING("HTMLEditor::CollapseSelectionTo() failed");
+      return EditorBase::ToGenericNSResult(rv);
+    }
+  }
+
+  if (!aElement->IsHTMLElement(nsGkAtoms::table) ||
+      !HTMLEditUtils::IsLastChild(
+          *aElement, {LeafNodeOption::IgnoreNonEditableNode},
+          BlockInlineCheck::UseComputedDisplayOutsideStyle)) {
+    return NS_OK;
+  }
+
+  Result<CreateLineBreakResult, nsresult> insertBRElementResultOrError =
+      InsertLineBreak(WithTransaction::Yes, LineBreakType::BRElement,
+                      EditorDOMPoint::After(*aElement),
+                      ePrevious);
+  if (MOZ_UNLIKELY(insertBRElementResultOrError.isErr())) {
+    NS_WARNING(
+        "HTMLEditor::InsertLineBreak(WithTransaction::Yes, "
+        "LineBreakType::BRElement, ePrevious) failed");
+    return EditorBase::ToGenericNSResult(
+        insertBRElementResultOrError.unwrapErr());
+  }
+  CreateLineBreakResult insertBRElementResult =
+      insertBRElementResultOrError.unwrap();
+  MOZ_ASSERT(insertBRElementResult.Handled());
+  rv = insertBRElementResult.SuggestCaretPointTo(*this, {});
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "CaretPoint::SuggestCaretPointTo() failed");
+  return EditorBase::ToGenericNSResult(rv);
+}
+
+template <typename NodeType>
+Result<CreateNodeResultBase<NodeType>, nsresult>
+HTMLEditor::InsertNodeIntoProperAncestorWithTransaction(
+    NodeType& aContentToInsert, const EditorDOMPoint& aPointToInsert,
+    SplitAtEdges aSplitAtEdges) {
+  MOZ_ASSERT(aPointToInsert.IsSetAndValidInComposedDoc());
+  if (NS_WARN_IF(!aPointToInsert.IsInContentNode())) {
+    return Err(NS_ERROR_FAILURE);
+  }
+  MOZ_ASSERT(aPointToInsert.IsSetAndValid());
+
+  if (aContentToInsert.NodeType() == nsINode::DOCUMENT_TYPE_NODE ||
+      aContentToInsert.NodeType() == nsINode::PROCESSING_INSTRUCTION_NODE) {
+    return CreateNodeResultBase<NodeType>::NotHandled();
+  }
+
+  EditorDOMPoint pointToInsert(aPointToInsert);
+  MOZ_ASSERT(pointToInsert.IsInContentNode());
+  while (!HTMLEditUtils::CanNodeContain(*pointToInsert.GetContainer(),
+                                        aContentToInsert)) {
+    if (MOZ_UNLIKELY(pointToInsert.IsContainerHTMLElement(nsGkAtoms::body) ||
+                     HTMLEditUtils::IsAnyTableElementExceptColumnElement(
+                         *pointToInsert.ContainerAs<nsIContent>()))) {
+      NS_WARNING(
+          "There was no proper container element to insert the content node in "
+          "the document");
+      return Err(NS_ERROR_FAILURE);
+    }
+
+    pointToInsert = pointToInsert.ParentPoint();
+
+    if (MOZ_UNLIKELY(
+            !pointToInsert.IsInContentNode() ||
+            !EditorUtils::IsEditableContent(
+                *pointToInsert.ContainerAs<nsIContent>(), EditorType::HTML))) {
+      NS_WARNING(
+          "There was no proper container element to insert the content node in "
+          "the editing host");
+      return Err(NS_ERROR_FAILURE);
+    }
+  }
+
+  if (pointToInsert != aPointToInsert) {
+    MOZ_ASSERT(pointToInsert.GetChild());
+    Result<SplitNodeResult, nsresult> splitNodeResult =
+        SplitNodeDeepWithTransaction(MOZ_KnownLive(*pointToInsert.GetChild()),
+                                     aPointToInsert, aSplitAtEdges);
+    if (MOZ_UNLIKELY(splitNodeResult.isErr())) {
+      NS_WARNING("HTMLEditor::SplitNodeDeepWithTransaction() failed");
+      return splitNodeResult.propagateErr();
+    }
+    pointToInsert =
+        splitNodeResult.inspect().template AtSplitPoint<EditorDOMPoint>();
+    MOZ_ASSERT(pointToInsert.IsSetAndValidInComposedDoc());
+    splitNodeResult.inspect().IgnoreCaretPointSuggestion();
+  }
+
+  Result<CreateNodeResultBase<NodeType>, nsresult> insertContentNodeResult =
+      InsertNodeWithTransaction<NodeType>(aContentToInsert, pointToInsert);
+  if (MOZ_LIKELY(insertContentNodeResult.isOk()) &&
+      MOZ_UNLIKELY(NS_WARN_IF(!aContentToInsert.GetParentNode()) ||
+                   NS_WARN_IF(aContentToInsert.GetParentNode() !=
+                              pointToInsert.GetContainer()))) {
+    NS_WARNING(
+        "EditorBase::InsertNodeWithTransaction() succeeded, but the inserted "
+        "node was moved or removed by the web app");
+    insertContentNodeResult.inspect().IgnoreCaretPointSuggestion();
+    return Err(NS_ERROR_EDITOR_UNEXPECTED_DOM_TREE);
+  }
+  NS_WARNING_ASSERTION(insertContentNodeResult.isOk(),
+                       "EditorBase::InsertNodeWithTransaction() failed");
+  return insertContentNodeResult;
+}
+
+NS_IMETHODIMP HTMLEditor::SelectElement(Element* aElement) {
+  if (NS_WARN_IF(!aElement)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  AutoEditActionDataSetter editActionData(*this, EditAction::eNotEditing);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  nsresult rv = SelectContentInternal(MOZ_KnownLive(*aElement));
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "HTMLEditor::SelectContentInternal() failed");
+  return rv;
+}
+
+nsresult HTMLEditor::SelectContentInternal(nsIContent& aContentToSelect) {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+
+  const RefPtr<Element> editingHost = ComputeEditingHost();
+  if (NS_WARN_IF(!editingHost) ||
+      NS_WARN_IF(!aContentToSelect.IsInclusiveDescendantOf(editingHost))) {
+    return NS_ERROR_FAILURE;
+  }
+
+  EditorRawDOMPoint newSelectionStart(&aContentToSelect);
+  if (NS_WARN_IF(!newSelectionStart.IsSet())) {
+    return NS_ERROR_FAILURE;
+  }
+  EditorRawDOMPoint newSelectionEnd(EditorRawDOMPoint::After(aContentToSelect));
+  MOZ_ASSERT(newSelectionEnd.IsSet());
+  ErrorResult error;
+  SelectionRef().SetStartAndEndInLimiter(newSelectionStart, newSelectionEnd,
+                                         error);
+  NS_WARNING_ASSERTION(!error.Failed(),
+                       "Selection::SetStartAndEndInLimiter() failed");
+  return error.StealNSResult();
+}
+
+nsresult HTMLEditor::AppendContentToSelectionAsRange(nsIContent& aContent) {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+
+  EditorRawDOMPoint atContent(&aContent);
+  if (NS_WARN_IF(!atContent.IsSet())) {
+    return NS_ERROR_FAILURE;
+  }
+
+  RefPtr<nsRange> range = nsRange::Create(
+      atContent.ToRawRangeBoundary(),
+      atContent.NextPoint().ToRawRangeBoundary(), IgnoreErrors());
+  if (NS_WARN_IF(!range)) {
+    NS_WARNING("nsRange::Create() failed");
+    return NS_ERROR_FAILURE;
+  }
+
+  ErrorResult error;
+  SelectionRef().AddRangeAndSelectFramesAndNotifyListeners(*range, error);
+  if (NS_WARN_IF(Destroyed())) {
+    if (error.Failed()) {
+      error.SuppressException();
+    }
+    return NS_ERROR_EDITOR_DESTROYED;
+  }
+  NS_WARNING_ASSERTION(!error.Failed(), "Failed to add range to Selection");
+  return error.StealNSResult();
+}
+
+nsresult HTMLEditor::ClearSelection() {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+
+  ErrorResult error;
+  SelectionRef().RemoveAllRanges(error);
+  if (NS_WARN_IF(Destroyed())) {
+    if (error.Failed()) {
+      error.SuppressException();
+    }
+    return NS_ERROR_EDITOR_DESTROYED;
+  }
+  NS_WARNING_ASSERTION(!error.Failed(), "Selection::RemoveAllRanges() failed");
+  return error.StealNSResult();
+}
+
+nsresult HTMLEditor::FormatBlockAsAction(const nsAString& aParagraphFormat,
+                                         nsIPrincipal* aPrincipal) {
+  if (NS_WARN_IF(aParagraphFormat.IsEmpty())) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  AutoEditActionDataSetter editActionData(
+      *this, EditAction::eInsertBlockElement, aPrincipal);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  const RefPtr<Element> editingHost =
+      ComputeEditingHost(LimitInBodyElement::No);
+  if (!editingHost || !IsStyleEditable(editingHost)) {
+    return NS_SUCCESS_DOM_NO_OPERATION;
+  }
+
+  nsresult rv = editActionData.MaybeDispatchBeforeInputEvent();
+  if (NS_FAILED(rv)) {
+    NS_WARNING_ASSERTION(rv == NS_ERROR_EDITOR_ACTION_CANCELED,
+                         "MaybeDispatchBeforeInputEvent(), failed");
+    return EditorBase::ToGenericNSResult(rv);
+  }
+
+  RefPtr<nsAtom> tagName = NS_Atomize(aParagraphFormat);
+  MOZ_ASSERT(tagName);
+  if (NS_WARN_IF(!tagName->IsStatic()) ||
+      NS_WARN_IF(!HTMLEditUtils::IsFormatTagForFormatBlockCommand(
+          *tagName->AsStatic()))) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  if (tagName == nsGkAtoms::dd || tagName == nsGkAtoms::dt) {
+    Result<EditActionResult, nsresult> result =
+        MakeOrChangeListAndListItemAsSubAction(
+            MOZ_KnownLive(*tagName->AsStatic()), EmptyString(),
+            SelectAllOfCurrentList::No, *editingHost);
+    if (MOZ_UNLIKELY(result.isErr())) {
+      NS_WARNING(
+          "HTMLEditor::MakeOrChangeListAndListItemAsSubAction("
+          "SelectAllOfCurrentList::No) failed");
+      return EditorBase::ToGenericNSResult(result.unwrapErr());
+    }
+    return NS_OK;
+  }
+
+  rv = FormatBlockContainerAsSubAction(MOZ_KnownLive(*tagName->AsStatic()),
+                                       FormatBlockMode::HTMLFormatBlockCommand,
+                                       *editingHost);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "HTMLEditor::FormatBlockContainerAsSubAction() failed");
+  return EditorBase::ToGenericNSResult(rv);
+}
+
+nsresult HTMLEditor::SetParagraphStateAsAction(
+    const nsAString& aParagraphFormat, nsIPrincipal* aPrincipal) {
+  AutoEditActionDataSetter editActionData(
+      *this, EditAction::eInsertBlockElement, aPrincipal);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  const RefPtr<Element> editingHost =
+      ComputeEditingHost(LimitInBodyElement::No);
+  if (!editingHost || !IsStyleEditable(editingHost)) {
+    return NS_SUCCESS_DOM_NO_OPERATION;
+  }
+
+  nsresult rv = editActionData.MaybeDispatchBeforeInputEvent();
+  if (NS_FAILED(rv)) {
+    NS_WARNING_ASSERTION(rv == NS_ERROR_EDITOR_ACTION_CANCELED,
+                         "MaybeDispatchBeforeInputEvent(), failed");
+    return EditorBase::ToGenericNSResult(rv);
+  }
+
+
+  nsAutoString lowerCaseTagName(aParagraphFormat);
+  ToLowerCase(lowerCaseTagName);
+  RefPtr<nsAtom> tagName = NS_Atomize(lowerCaseTagName);
+  MOZ_ASSERT(tagName);
+  if (NS_WARN_IF(!tagName->IsStatic())) {
+    return NS_ERROR_INVALID_ARG;
+  }
+  if (tagName == nsGkAtoms::dd || tagName == nsGkAtoms::dt) {
+    Result<EditActionResult, nsresult> result =
+        MakeOrChangeListAndListItemAsSubAction(
+            MOZ_KnownLive(*tagName->AsStatic()), EmptyString(),
+            SelectAllOfCurrentList::No, *editingHost);
+    if (MOZ_UNLIKELY(result.isErr())) {
+      NS_WARNING(
+          "HTMLEditor::MakeOrChangeListAndListItemAsSubAction("
+          "SelectAllOfCurrentList::No) failed");
+      return EditorBase::ToGenericNSResult(result.unwrapErr());
+    }
+    return NS_OK;
+  }
+
+  rv = FormatBlockContainerAsSubAction(
+      MOZ_KnownLive(*tagName->AsStatic()),
+      FormatBlockMode::XULParagraphStateCommand, *editingHost);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "HTMLEditor::FormatBlockContainerAsSubAction() failed");
+  return EditorBase::ToGenericNSResult(rv);
+}
+
+bool HTMLEditor::IsFormatElement(FormatBlockMode aFormatBlockMode,
+                                 const nsIContent& aContent) {
+  return MOZ_LIKELY(aFormatBlockMode == FormatBlockMode::HTMLFormatBlockCommand)
+             ? HTMLEditUtils::IsFormatElementForFormatBlockCommand(aContent)
+             : (HTMLEditUtils::IsFormatElementForParagraphStateCommand(
+                    aContent) &&
+                !aContent.IsAnyOfHTMLElements(nsGkAtoms::dd, nsGkAtoms::dl,
+                                              nsGkAtoms::dt));
+}
+
+NS_IMETHODIMP HTMLEditor::GetParagraphState(bool* aMixed,
+                                            nsAString& aFirstParagraphState) {
+  if (NS_WARN_IF(!aMixed)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+  if (!mInitSucceeded) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  ErrorResult error;
+  ParagraphStateAtSelection paragraphState(
+      *this, FormatBlockMode::XULParagraphStateCommand, error);
+  if (error.Failed()) {
+    NS_WARNING("ParagraphStateAtSelection failed");
+    return error.StealNSResult();
+  }
+
+  *aMixed = paragraphState.IsMixed();
+  if (NS_WARN_IF(!paragraphState.GetFirstParagraphStateAtSelection())) {
+    aFirstParagraphState.AssignASCII("x");
+  } else {
+    paragraphState.GetFirstParagraphStateAtSelection()->ToString(
+        aFirstParagraphState);
+  }
+  return NS_OK;
+}
+
+nsresult HTMLEditor::GetBackgroundColorState(bool* aMixed,
+                                             nsAString& aOutColor) {
+  if (NS_WARN_IF(!aMixed)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  AutoEditActionDataSetter editActionData(*this, EditAction::eNotEditing);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  if (IsCSSEnabled()) {
+    nsresult rv = GetCSSBackgroundColorState(
+        aMixed, aOutColor,
+        {RetrievingBackgroundColorOption::OnlyBlockBackgroundColor,
+         RetrievingBackgroundColorOption::
+             DefaultColorIfNoSpecificBackgroundColor});
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                         "HTMLEditor::GetCSSBackgroundColorState() failed");
+    return EditorBase::ToGenericNSResult(rv);
+  }
+  nsresult rv = GetHTMLBackgroundColorState(aMixed, aOutColor);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "HTMLEditor::GetCSSBackgroundColorState() failed");
+  return EditorBase::ToGenericNSResult(rv);
+}
+
+NS_IMETHODIMP HTMLEditor::GetHighlightColorState(bool* aMixed,
+                                                 nsAString& aOutColor) {
+  if (NS_WARN_IF(!aMixed)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  *aMixed = false;
+  aOutColor.AssignLiteral("transparent");
+  if (!IsCSSEnabled() && IsMailEditor()) {
+    return NS_OK;
+  }
+
+  AutoEditActionDataSetter editActionData(*this, EditAction::eNotEditing);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  RetrievingBackgroundColorOptions options;
+  if (IsMailEditor()) {
+    options += RetrievingBackgroundColorOption::StopAtInclusiveAncestorBlock;
+  }
+  nsresult rv = GetCSSBackgroundColorState(aMixed, aOutColor, options);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "HTMLEditor::GetCSSBackgroundColorState() failed");
+  return rv;
+}
+
+nsresult HTMLEditor::GetCSSBackgroundColorState(
+    bool* aMixed, nsAString& aOutColor,
+    RetrievingBackgroundColorOptions aOptions) {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+
+  if (NS_WARN_IF(!aMixed)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  *aMixed = false;
+  aOutColor.AssignLiteral("transparent");
+
+  RefPtr<const nsRange> firstRange = SelectionRef().GetRangeAt(0);
+  if (NS_WARN_IF(!firstRange)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsCOMPtr<nsINode> startContainer = firstRange->GetStartContainer();
+  if (NS_WARN_IF(!startContainer) || NS_WARN_IF(!startContainer->IsContent())) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsIContent* contentToExamine;
+  if (SelectionRef().IsCollapsed() || startContainer->IsText()) {
+    if (NS_WARN_IF(!startContainer->IsContent())) {
+      return NS_ERROR_FAILURE;
+    }
+    contentToExamine = startContainer->AsContent();
+  } else {
+    contentToExamine = firstRange->GetChildAtStartOffset();
+  }
+
+  if (NS_WARN_IF(!contentToExamine)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (aOptions.contains(
+          RetrievingBackgroundColorOption::OnlyBlockBackgroundColor)) {
+    Element* const closestBlockElement =
+        HTMLEditUtils::GetInclusiveAncestorElement(
+            *contentToExamine, HTMLEditUtils::ClosestBlockElement,
+            BlockInlineCheck::UseComputedDisplayOutsideStyle);
+    if (NS_WARN_IF(!closestBlockElement)) {
+      return NS_OK;
+    }
+
+    for (RefPtr<Element> blockElement = closestBlockElement; blockElement;) {
+      RefPtr<Element> nextBlockElement = HTMLEditUtils::GetAncestorElement(
+          *blockElement, HTMLEditUtils::ClosestBlockElement,
+          BlockInlineCheck::UseComputedDisplayOutsideStyle);
+      DebugOnly<nsresult> rvIgnored = CSSEditUtils::GetComputedProperty(
+          *blockElement, *nsGkAtoms::background_color, aOutColor);
+      if (NS_WARN_IF(Destroyed())) {
+        return NS_ERROR_EDITOR_DESTROYED;
+      }
+      if (MaybeNodeRemovalsObservedByDevTools() &&
+          NS_WARN_IF(nextBlockElement !=
+                     HTMLEditUtils::GetAncestorElement(
+                         *blockElement, HTMLEditUtils::ClosestBlockElement,
+                         BlockInlineCheck::UseComputedDisplayOutsideStyle))) {
+        return NS_ERROR_EDITOR_UNEXPECTED_DOM_TREE;
+      }
+      NS_WARNING_ASSERTION(NS_SUCCEEDED(rvIgnored),
+                           "CSSEditUtils::GetComputedProperty(nsGkAtoms::"
+                           "background_color) failed, but ignored");
+      if (!HTMLEditUtils::IsTransparentCSSColor(aOutColor)) {
+        return NS_OK;
+      }
+      if (aOptions.contains(
+              RetrievingBackgroundColorOption::StopAtInclusiveAncestorBlock)) {
+        aOutColor.AssignLiteral("transparent");
+        return NS_OK;
+      }
+      blockElement = std::move(nextBlockElement);
+    }
+
+    if (aOptions.contains(RetrievingBackgroundColorOption::
+                              DefaultColorIfNoSpecificBackgroundColor) &&
+        HTMLEditUtils::IsTransparentCSSColor(aOutColor)) {
+      CSSEditUtils::GetDefaultBackgroundColor(aOutColor);
+    }
+    return NS_OK;
+  }
+
+  if (contentToExamine->IsText()) {
+    contentToExamine = contentToExamine->GetParent();
+  }
+  if (!contentToExamine) {
+    return NS_OK;
+  }
+
+  for (RefPtr<Element> element :
+       contentToExamine->InclusiveAncestorsOfType<Element>()) {
+    if (aOptions.contains(
+            RetrievingBackgroundColorOption::StopAtInclusiveAncestorBlock) &&
+        HTMLEditUtils::IsBlockElement(
+            *element, BlockInlineCheck::UseComputedDisplayOutsideStyle)) {
+      aOutColor.AssignLiteral("transparent");
+      break;
+    }
+
+    nsCOMPtr<nsINode> parentNode = element->GetParentNode();
+    DebugOnly<nsresult> rvIgnored = CSSEditUtils::GetComputedProperty(
+        *element, *nsGkAtoms::background_color, aOutColor);
+    if (NS_WARN_IF(Destroyed())) {
+      return NS_ERROR_EDITOR_DESTROYED;
+    }
+    if (NS_WARN_IF(parentNode != element->GetParentNode())) {
+      return NS_ERROR_EDITOR_UNEXPECTED_DOM_TREE;
+    }
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rvIgnored),
+                         "CSSEditUtils::GetComputedProperty(nsGkAtoms::"
+                         "background_color) failed, but ignored");
+    if (!HTMLEditUtils::IsTransparentCSSColor(aOutColor)) {
+      HTMLEditUtils::GetNormalizedCSSColorValue(
+          aOutColor, HTMLEditUtils::ZeroAlphaColor::RGBAValue, aOutColor);
+      return NS_OK;
+    }
+  }
+  if (aOptions.contains(RetrievingBackgroundColorOption::
+                            DefaultColorIfNoSpecificBackgroundColor) &&
+      HTMLEditUtils::IsTransparentCSSColor(aOutColor)) {
+    CSSEditUtils::GetDefaultBackgroundColor(aOutColor);
+  }
+  return NS_OK;
+}
+
+nsresult HTMLEditor::GetHTMLBackgroundColorState(bool* aMixed,
+                                                 nsAString& aOutColor) {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+
+  if (NS_WARN_IF(!aMixed)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  *aMixed = false;
+  aOutColor.Truncate();
+
+  Result<RefPtr<Element>, nsresult> cellOrRowOrTableElementOrError =
+      GetSelectedOrParentTableElement();
+  if (cellOrRowOrTableElementOrError.isErr()) {
+    NS_WARNING("HTMLEditor::GetSelectedOrParentTableElement() returned error");
+    return cellOrRowOrTableElementOrError.unwrapErr();
+  }
+
+  for (RefPtr<Element> element = cellOrRowOrTableElementOrError.unwrap();
+       element; element = element->GetParentElement()) {
+    element->GetAttr(nsGkAtoms::bgcolor, aOutColor);
+
+    if (!aOutColor.IsEmpty()) {
+      return NS_OK;
+    }
+
+    if (element->IsHTMLElement(nsGkAtoms::body)) {
+      return NS_OK;
+    }
+
+  }
+
+  Element* rootElement = GetRoot();
+  if (NS_WARN_IF(!rootElement)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  rootElement->GetAttr(nsGkAtoms::bgcolor, aOutColor);
+  return NS_OK;
+}
+
+NS_IMETHODIMP HTMLEditor::GetListState(bool* aMixed, bool* aOL, bool* aUL,
+                                       bool* aDL) {
+  if (NS_WARN_IF(!aMixed) || NS_WARN_IF(!aOL) || NS_WARN_IF(!aUL) ||
+      NS_WARN_IF(!aDL)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+  if (!mInitSucceeded) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  ErrorResult error;
+  ListElementSelectionState state(*this, error);
+  if (error.Failed()) {
+    NS_WARNING("ListElementSelectionState failed");
+    return error.StealNSResult();
+  }
+
+  *aMixed = state.IsNotOneTypeListElementSelected();
+  *aOL = state.IsOLElementSelected();
+  *aUL = state.IsULElementSelected();
+  *aDL = state.IsDLElementSelected();
+  return NS_OK;
+}
+
+NS_IMETHODIMP HTMLEditor::GetListItemState(bool* aMixed, bool* aLI, bool* aDT,
+                                           bool* aDD) {
+  if (NS_WARN_IF(!aMixed) || NS_WARN_IF(!aLI) || NS_WARN_IF(!aDT) ||
+      NS_WARN_IF(!aDD)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+  if (!mInitSucceeded) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  ErrorResult error;
+  ListItemElementSelectionState state(*this, error);
+  if (error.Failed()) {
+    NS_WARNING("ListItemElementSelectionState failed");
+    return error.StealNSResult();
+  }
+
+  *aMixed = state.IsNotOneTypeDefinitionListItemElementSelected();
+  *aLI = state.IsLIElementSelected();
+  *aDT = state.IsDTElementSelected();
+  *aDD = state.IsDDElementSelected();
+  return NS_OK;
+}
+
+NS_IMETHODIMP HTMLEditor::GetAlignment(bool* aMixed,
+                                       nsIHTMLEditor::EAlignment* aAlign) {
+  if (NS_WARN_IF(!aMixed) || NS_WARN_IF(!aAlign)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+  if (!mInitSucceeded) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  ErrorResult error;
+  AlignStateAtSelection state(*this, error);
+  if (error.Failed()) {
+    NS_WARNING("AlignStateAtSelection failed");
+    return error.StealNSResult();
+  }
+
+  *aMixed = false;
+  *aAlign = state.AlignmentAtSelectionStart();
+  return NS_OK;
+}
+
+NS_IMETHODIMP HTMLEditor::MakeOrChangeList(const nsAString& aListType,
+                                           bool aEntireList,
+                                           const nsAString& aBulletType) {
+  RefPtr<nsAtom> listTagName = NS_Atomize(aListType);
+  if (NS_WARN_IF(!listTagName) || NS_WARN_IF(!listTagName->IsStatic())) {
+    return NS_ERROR_INVALID_ARG;
+  }
+  nsresult rv = MakeOrChangeListAsAction(
+      MOZ_KnownLive(*listTagName->AsStatic()), aBulletType,
+      aEntireList ? SelectAllOfCurrentList::Yes : SelectAllOfCurrentList::No);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "HTMLEditor::MakeOrChangeListAsAction() failed");
+  return rv;
+}
+
+nsresult HTMLEditor::MakeOrChangeListAsAction(
+    const nsStaticAtom& aListElementTagName, const nsAString& aBulletType,
+    SelectAllOfCurrentList aSelectAllOfCurrentList, nsIPrincipal* aPrincipal) {
+  if (NS_WARN_IF(!mInitSucceeded)) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  AutoEditActionDataSetter editActionData(
+      *this, HTMLEditUtils::GetEditActionForInsert(aListElementTagName),
+      aPrincipal);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  const RefPtr<Element> editingHost =
+      ComputeEditingHost(LimitInBodyElement::No);
+  if (!editingHost || !IsStyleEditable(editingHost)) {
+    return NS_SUCCESS_DOM_NO_OPERATION;
+  }
+
+  nsresult rv = editActionData.MaybeDispatchBeforeInputEvent();
+  if (NS_FAILED(rv)) {
+    NS_WARNING_ASSERTION(rv == NS_ERROR_EDITOR_ACTION_CANCELED,
+                         "MaybeDispatchBeforeInputEvent(), failed");
+    return EditorBase::ToGenericNSResult(rv);
+  }
+
+  Result<EditActionResult, nsresult> result =
+      MakeOrChangeListAndListItemAsSubAction(aListElementTagName, aBulletType,
+                                             aSelectAllOfCurrentList,
+                                             *editingHost);
+  if (MOZ_UNLIKELY(result.isErr())) {
+    NS_WARNING("HTMLEditor::MakeOrChangeListAndListItemAsSubAction() failed");
+    return EditorBase::ToGenericNSResult(result.unwrapErr());
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP HTMLEditor::RemoveList(const nsAString& aListType) {
+  nsresult rv = RemoveListAsAction(aListType);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "HTMLEditor::RemoveListAsAction() failed");
+  return rv;
+}
+
+nsresult HTMLEditor::RemoveListAsAction(const nsAString& aListType,
+                                        nsIPrincipal* aPrincipal) {
+  if (NS_WARN_IF(!mInitSucceeded)) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+
+  RefPtr<nsAtom> listAtom = NS_Atomize(aListType);
+  if (NS_WARN_IF(!listAtom)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+  AutoEditActionDataSetter editActionData(
+      *this, HTMLEditUtils::GetEditActionForRemoveList(*listAtom), aPrincipal);
+  nsresult rv = editActionData.CanHandleAndMaybeDispatchBeforeInputEvent();
+  if (NS_FAILED(rv)) {
+    NS_WARNING_ASSERTION(rv == NS_ERROR_EDITOR_ACTION_CANCELED,
+                         "CanHandleAndMaybeDispatchBeforeInputEvent(), failed");
+    return EditorBase::ToGenericNSResult(rv);
+  }
+
+  const RefPtr<Element> editingHost = ComputeEditingHost();
+  if (!editingHost) {
+    return NS_SUCCESS_DOM_NO_OPERATION;
+  }
+
+  rv = RemoveListAtSelectionAsSubAction(*editingHost);
+  NS_WARNING_ASSERTION(NS_FAILED(rv),
+                       "HTMLEditor::RemoveListAtSelectionAsSubAction() failed");
+  return rv;
+}
+
+nsresult HTMLEditor::FormatBlockContainerAsSubAction(
+    const nsStaticAtom& aTagName, FormatBlockMode aFormatBlockMode,
+    const Element& aEditingHost) {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+
+  if (NS_WARN_IF(!mInitSucceeded)) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  MOZ_ASSERT(&aTagName != nsGkAtoms::dd && &aTagName != nsGkAtoms::dt);
+
+  AutoPlaceholderBatch treatAsOneTransaction(
+      *this, ScrollSelectionIntoView::Yes, __FUNCTION__);
+  IgnoredErrorResult ignoredError;
+  AutoEditSubActionNotifier startToHandleEditSubAction(
+      *this, EditSubAction::eCreateOrRemoveBlock, nsIEditor::eNext,
+      ignoredError);
+  if (NS_WARN_IF(ignoredError.ErrorCodeIs(NS_ERROR_EDITOR_DESTROYED))) {
+    return ignoredError.StealNSResult();
+  }
+  NS_WARNING_ASSERTION(
+      !ignoredError.Failed(),
+      "HTMLEditor::OnStartToHandleTopLevelEditSubAction() failed, but ignored");
+
+  {
+    Result<EditActionResult, nsresult> result = CanHandleHTMLEditSubAction();
+    if (MOZ_UNLIKELY(result.isErr())) {
+      NS_WARNING("HTMLEditor::CanHandleHTMLEditSubAction() failed");
+      return result.unwrapErr();
+    }
+    if (result.inspect().Canceled()) {
+      return NS_OK;
+    }
+  }
+
+  if (IsSelectionRangeContainerNotContent()) {
+    return NS_SUCCESS_DOM_NO_OPERATION;
+  }
+
+  nsresult rv = EnsureNoPaddingBRElementForEmptyEditor();
+  if (NS_WARN_IF(rv == NS_ERROR_EDITOR_DESTROYED)) {
+    return NS_ERROR_EDITOR_DESTROYED;
+  }
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "EditorBase::EnsureNoPaddingBRElementForEmptyEditor() "
+                       "failed, but ignored");
+
+  if (NS_SUCCEEDED(rv) && SelectionRef().IsCollapsed()) {
+    nsresult rv = EnsureCaretNotAfterInvisibleBRElement(aEditingHost);
+    if (NS_WARN_IF(rv == NS_ERROR_EDITOR_DESTROYED)) {
+      return NS_ERROR_EDITOR_DESTROYED;
+    }
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                         "HTMLEditor::EnsureCaretNotAfterInvisibleBRElement() "
+                         "failed, but ignored");
+    if (NS_SUCCEEDED(rv)) {
+      nsresult rv = PrepareInlineStylesForCaret();
+      if (NS_WARN_IF(rv == NS_ERROR_EDITOR_DESTROYED)) {
+        return NS_ERROR_EDITOR_DESTROYED;
+      }
+      NS_WARNING_ASSERTION(
+          NS_SUCCEEDED(rv),
+          "HTMLEditor::PrepareInlineStylesForCaret() failed, but ignored");
+    }
+  }
+
+  AutoClonedSelectionRangeArray selectionRanges(SelectionRef());
+  Result<RefPtr<Element>, nsresult> suggestBlockElementToPutCaretOrError =
+      FormatBlockContainerWithTransaction(selectionRanges, aTagName,
+                                          aFormatBlockMode, aEditingHost);
+  if (suggestBlockElementToPutCaretOrError.isErr()) {
+    NS_WARNING("HTMLEditor::FormatBlockContainerWithTransaction() failed");
+    return suggestBlockElementToPutCaretOrError.unwrapErr();
+  }
+
+  if (selectionRanges.HasSavedRanges()) {
+    selectionRanges.RestoreFromSavedRanges();
+  }
+
+  if (selectionRanges.IsCollapsed()) {
+    Result<CreateLineBreakResult, nsresult>
+        insertPaddingBRElementResultOrError =
+            InsertPaddingBRElementIfInEmptyBlock(
+                selectionRanges.GetFirstRangeStartPoint<EditorDOMPoint>(),
+                eNoStrip);
+    if (MOZ_UNLIKELY(insertPaddingBRElementResultOrError.isErr())) {
+      NS_WARNING(
+          "HTMLEditor::InsertPaddingBRElementIfInEmptyBlock(eNoStrip) failed");
+      return insertPaddingBRElementResultOrError.unwrapErr();
+    }
+    EditorDOMPoint pointToPutCaret;
+    insertPaddingBRElementResultOrError.unwrap().MoveCaretPointTo(
+        pointToPutCaret, *this,
+        {SuggestCaret::OnlyIfHasSuggestion,
+         SuggestCaret::OnlyIfTransactionsAllowedToDoIt});
+    if (pointToPutCaret.IsSet()) {
+      nsresult rv = selectionRanges.Collapse(pointToPutCaret);
+      if (NS_FAILED(rv)) {
+        NS_WARNING("AutoClonedRangeArray::Collapse() failed");
+        return rv;
+      }
+    }
+  }
+
+  if (!suggestBlockElementToPutCaretOrError.inspect() ||
+      !selectionRanges.IsCollapsed()) {
+    nsresult rv = selectionRanges.ApplyTo(SelectionRef());
+    if (NS_WARN_IF(Destroyed())) {
+      return NS_ERROR_EDITOR_DESTROYED;
+    }
+    NS_WARNING_ASSERTION(
+        NS_SUCCEEDED(rv),
+        "AutoClonedSelectionRangeArray::ApplyTo() failed, but ignored");
+    return rv;
+  }
+
+  const auto firstSelectionStartPoint =
+      selectionRanges.GetFirstRangeStartPoint<EditorRawDOMPoint>();
+  if (NS_WARN_IF(!firstSelectionStartPoint.IsSetAndValidInComposedDoc())) {
+    return NS_ERROR_FAILURE;
+  }
+  Result<EditorRawDOMPoint, nsresult> pointInBlockElementOrError =
+      HTMLEditUtils::ComputePointToPutCaretInElementIfOutside<
+          EditorRawDOMPoint>(*suggestBlockElementToPutCaretOrError.inspect(),
+                             firstSelectionStartPoint);
+  NS_WARNING_ASSERTION(
+      pointInBlockElementOrError.isOk(),
+      "HTMLEditUtils::ComputePointToPutCaretInElementIfOutside() failed, but "
+      "ignored");
+  if (MOZ_LIKELY(pointInBlockElementOrError.isOk()) &&
+      pointInBlockElementOrError.inspect().IsSet()) {
+    nsresult rv =
+        selectionRanges.Collapse(pointInBlockElementOrError.inspect());
+    if (NS_FAILED(rv)) {
+      NS_WARNING("AutoClonedRangeArray::Collapse() failed");
+      return rv;
+    }
+  }
+
+  rv = selectionRanges.ApplyTo(SelectionRef());
+  if (NS_WARN_IF(Destroyed())) {
+    return NS_ERROR_EDITOR_DESTROYED;
+  }
+  NS_WARNING_ASSERTION(
+      NS_SUCCEEDED(rv),
+      "AutoClonedSelectionRangeArray::ApplyTo() failed, but ignored");
+  return rv;
+}
+
+nsresult HTMLEditor::IndentAsAction(nsIPrincipal* aPrincipal) {
+  if (NS_WARN_IF(!mInitSucceeded)) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  AutoEditActionDataSetter editActionData(*this, EditAction::eIndent,
+                                          aPrincipal);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  const RefPtr<Element> editingHost =
+      ComputeEditingHost(LimitInBodyElement::No);
+  if (!editingHost || !IsStyleEditable(editingHost)) {
+    return NS_SUCCESS_DOM_NO_OPERATION;
+  }
+
+  nsresult rv = editActionData.MaybeDispatchBeforeInputEvent();
+  if (NS_FAILED(rv)) {
+    NS_WARNING_ASSERTION(rv == NS_ERROR_EDITOR_ACTION_CANCELED,
+                         "MaybeDispatchBeforeInputEvent(), failed");
+    return EditorBase::ToGenericNSResult(rv);
+  }
+
+  Result<EditActionResult, nsresult> result = IndentAsSubAction(*editingHost);
+  if (MOZ_UNLIKELY(result.isErr())) {
+    NS_WARNING("HTMLEditor::IndentAsSubAction() failed");
+    return EditorBase::ToGenericNSResult(result.unwrapErr());
+  }
+  return NS_OK;
+}
+
+nsresult HTMLEditor::OutdentAsAction(nsIPrincipal* aPrincipal) {
+  if (NS_WARN_IF(!mInitSucceeded)) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  AutoEditActionDataSetter editActionData(*this, EditAction::eOutdent,
+                                          aPrincipal);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  const RefPtr<Element> editingHost =
+      ComputeEditingHost(LimitInBodyElement::No);
+  if (!editingHost || !IsStyleEditable(editingHost)) {
+    return NS_SUCCESS_DOM_NO_OPERATION;
+  }
+
+  nsresult rv = editActionData.MaybeDispatchBeforeInputEvent();
+  if (NS_FAILED(rv)) {
+    NS_WARNING_ASSERTION(rv == NS_ERROR_EDITOR_ACTION_CANCELED,
+                         "MaybeDispatchBeforeInputEvent(), failed");
+    return EditorBase::ToGenericNSResult(rv);
+  }
+
+  Result<EditActionResult, nsresult> result = OutdentAsSubAction(*editingHost);
+  if (MOZ_UNLIKELY(result.isErr())) {
+    NS_WARNING("HTMLEditor::OutdentAsSubAction() failed");
+    return EditorBase::ToGenericNSResult(result.unwrapErr());
+  }
+  return NS_OK;
+}
+
+
+nsresult HTMLEditor::AlignAsAction(const nsAString& aAlignType,
+                                   nsIPrincipal* aPrincipal) {
+  AutoEditActionDataSetter editActionData(
+      *this, HTMLEditUtils::GetEditActionForAlignment(aAlignType), aPrincipal);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  const RefPtr<Element> editingHost =
+      ComputeEditingHost(LimitInBodyElement::No);
+  if (!editingHost || !IsStyleEditable(editingHost)) {
+    return NS_SUCCESS_DOM_NO_OPERATION;
+  }
+
+  nsresult rv = editActionData.MaybeDispatchBeforeInputEvent();
+  if (NS_FAILED(rv)) {
+    NS_WARNING_ASSERTION(rv == NS_ERROR_EDITOR_ACTION_CANCELED,
+                         "MaybeDispatchBeforeInputEvent(), failed");
+    return EditorBase::ToGenericNSResult(rv);
+  }
+
+  Result<EditActionResult, nsresult> result =
+      AlignAsSubAction(aAlignType, *editingHost);
+  if (MOZ_UNLIKELY(result.isErr())) {
+    NS_WARNING("HTMLEditor::AlignAsSubAction() failed");
+    return EditorBase::ToGenericNSResult(result.unwrapErr());
+  }
+  return NS_OK;
+}
+
+Element* HTMLEditor::GetInclusiveAncestorByTagName(const nsStaticAtom& aTagName,
+                                                   nsIContent& aContent) const {
+  MOZ_ASSERT(&aTagName != nsGkAtoms::_empty);
+
+  AutoEditActionDataSetter editActionData(*this, EditAction::eNotEditing);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    return nullptr;
+  }
+
+  return GetInclusiveAncestorByTagNameInternal(aTagName, aContent);
+}
+
+Element* HTMLEditor::GetInclusiveAncestorByTagNameAtSelection(
+    const nsStaticAtom& aTagName) const {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+  MOZ_ASSERT(&aTagName != nsGkAtoms::_empty);
+
+  const EditorRawDOMPoint atAnchor(SelectionRef().AnchorRef());
+  if (NS_WARN_IF(!atAnchor.IsInContentNode())) {
+    return nullptr;
+  }
+
+  nsIContent* content = nullptr;
+  if (atAnchor.GetContainer()->HasChildNodes() &&
+      atAnchor.ContainerAs<nsIContent>()) {
+    content = atAnchor.GetChild();
+  }
+  if (!content) {
+    content = atAnchor.ContainerAs<nsIContent>();
+    if (NS_WARN_IF(!content)) {
+      return nullptr;
+    }
+  }
+  return GetInclusiveAncestorByTagNameInternal(aTagName, *content);
+}
+
+Element* HTMLEditor::GetInclusiveAncestorByTagNameInternal(
+    const nsStaticAtom& aTagName, const nsIContent& aContent) const {
+  MOZ_ASSERT(&aTagName != nsGkAtoms::_empty);
+
+  Element* currentElement = aContent.GetAsElementOrParentElement();
+  if (NS_WARN_IF(!currentElement)) {
+    MOZ_ASSERT(!aContent.GetParentNode());
+    return nullptr;
+  }
+
+  bool lookForLink = IsLinkTag(aTagName);
+  bool lookForNamedAnchor = IsNamedAnchorTag(aTagName);
+  for (Element* const element :
+       currentElement->InclusiveAncestorsOfType<Element>()) {
+    if (element->IsHTMLElement(nsGkAtoms::body)) {
+      return nullptr;
+    }
+    if (lookForLink) {
+      if (HTMLEditUtils::IsHyperlinkElement(*element)) {
+        return element;
+      }
+    } else if (lookForNamedAnchor) {
+      if (HTMLEditUtils::IsNamedAnchorElement(*element)) {
+        return element;
+      }
+    } else if (&aTagName == nsGkAtoms::list) {
+      if (HTMLEditUtils::IsListElement(*element)) {
+        return element;
+      }
+    } else if (&aTagName == nsGkAtoms::td) {
+      if (HTMLEditUtils::IsTableCellElement(*element)) {
+        return element;
+      }
+    } else if (&aTagName == element->NodeInfo()->NameAtom()) {
+      return element;
+    }
+  }
+  return nullptr;
+}
+
+NS_IMETHODIMP HTMLEditor::GetElementOrParentByTagName(const nsAString& aTagName,
+                                                      nsINode* aNode,
+                                                      Element** aReturn) {
+  if (NS_WARN_IF(aTagName.IsEmpty()) || NS_WARN_IF(!aReturn)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  nsStaticAtom* tagName = EditorUtils::GetTagNameAtom(aTagName);
+  if (NS_WARN_IF(!tagName)) {
+    return NS_SUCCESS_EDITOR_ELEMENT_NOT_FOUND;
+  }
+  if (NS_WARN_IF(tagName == nsGkAtoms::_empty)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  if (!aNode) {
+    AutoEditActionDataSetter dummyEditAction(*this, EditAction::eNotEditing);
+    if (NS_WARN_IF(!dummyEditAction.CanHandle())) {
+      return NS_ERROR_NOT_AVAILABLE;
+    }
+    RefPtr<Element> parentElement =
+        GetInclusiveAncestorByTagNameAtSelection(*tagName);
+    if (!parentElement) {
+      return NS_SUCCESS_EDITOR_ELEMENT_NOT_FOUND;
+    }
+    parentElement.forget(aReturn);
+    return NS_OK;
+  }
+
+  if (!aNode->IsContent() || !aNode->GetAsElementOrParentElement()) {
+    return NS_SUCCESS_EDITOR_ELEMENT_NOT_FOUND;
+  }
+
+  RefPtr<Element> parentElement =
+      GetInclusiveAncestorByTagName(*tagName, *aNode->AsContent());
+  if (!parentElement) {
+    return NS_SUCCESS_EDITOR_ELEMENT_NOT_FOUND;
+  }
+  parentElement.forget(aReturn);
+  return NS_OK;
+}
+
+NS_IMETHODIMP HTMLEditor::GetSelectedElement(const nsAString& aTagName,
+                                             nsISupports** aReturn) {
+  if (NS_WARN_IF(!aReturn)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+  *aReturn = nullptr;
+
+  AutoEditActionDataSetter editActionData(*this, EditAction::eNotEditing);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  ErrorResult error;
+  nsStaticAtom* tagName = EditorUtils::GetTagNameAtom(aTagName);
+  if (!aTagName.IsEmpty() && !tagName) {
+    return NS_OK;
+  }
+  RefPtr<nsINode> selectedNode = GetSelectedElement(tagName, error);
+  NS_WARNING_ASSERTION(!error.Failed(),
+                       "HTMLEditor::GetSelectedElement() failed");
+  selectedNode.forget(aReturn);
+  return error.StealNSResult();
+}
+
+already_AddRefed<Element> HTMLEditor::GetSelectedElement(const nsAtom* aTagName,
+                                                         ErrorResult& aRv) {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+
+  MOZ_ASSERT(!aRv.Failed());
+
+  if (SelectionRef().RangeCount() != 1) {
+    return nullptr;
+  }
+
+  bool isLinkTag = aTagName && IsLinkTag(*aTagName);
+  bool isNamedAnchorTag = aTagName && IsNamedAnchorTag(*aTagName);
+
+  RefPtr<nsRange> firstRange = SelectionRef().GetRangeAt(0);
+  MOZ_ASSERT(firstRange);
+
+  const RangeBoundary& startRef = firstRange->StartRef();
+  if (NS_WARN_IF(!startRef.IsSet())) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return nullptr;
+  }
+  const RangeBoundary& endRef = firstRange->EndRef();
+  if (NS_WARN_IF(!endRef.IsSet())) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return nullptr;
+  }
+
+  if (startRef.GetContainer() == endRef.GetContainer()) {
+    nsIContent* const startContent = startRef.GetChildAtOffset();
+    nsIContent* const endContent = endRef.GetChildAtOffset();
+    if (startContent && endContent &&
+        startContent->GetNextSibling() == endContent) {
+      if (!aTagName) {
+        if (!startContent->IsElement()) {
+          return nullptr;
+        }
+        return do_AddRef(startContent->AsElement());
+      }
+      if (aTagName == startContent->NodeInfo()->NameAtom() ||
+          (isLinkTag && HTMLEditUtils::IsHyperlinkElement(*startContent)) ||
+          (isNamedAnchorTag &&
+           HTMLEditUtils::IsNamedAnchorElement(*startContent))) {
+        MOZ_ASSERT(startContent->IsElement());
+        return do_AddRef(startContent->AsElement());
+      }
+    }
+  }
+
+  if (isLinkTag && startRef.GetContainer()->IsContent() &&
+      endRef.GetContainer()->IsContent()) {
+    Element* parentLinkOfStart = GetInclusiveAncestorByTagNameInternal(
+        *nsGkAtoms::href, *startRef.GetContainer()->AsContent());
+    if (parentLinkOfStart) {
+      if (SelectionRef().IsCollapsed()) {
+        return do_AddRef(parentLinkOfStart);
+      }
+      Element* parentLinkOfEnd = GetInclusiveAncestorByTagNameInternal(
+          *nsGkAtoms::href, *endRef.GetContainer()->AsContent());
+      if (parentLinkOfStart == parentLinkOfEnd) {
+        return do_AddRef(parentLinkOfStart);
+      }
+    }
+  }
+
+  if (SelectionRef().IsCollapsed()) {
+    return nullptr;
+  }
+
+  PostContentIterator postOrderIter;
+  nsresult rv = postOrderIter.Init(firstRange);
+  if (NS_FAILED(rv)) {
+    aRv.Throw(rv);
+    return nullptr;
+  }
+
+  RefPtr<Element> lastElementInRange;
+  for (nsINode* lastNodeInRange = nullptr; !postOrderIter.IsDone();
+       postOrderIter.Next()) {
+    if (lastElementInRange) {
+      return nullptr;
+    }
+
+    nsINode* currentNode = postOrderIter.GetCurrentNode();
+    MOZ_ASSERT(currentNode);
+    if (lastNodeInRange && lastNodeInRange->GetParentNode() != currentNode &&
+        lastNodeInRange->GetNextSibling() != currentNode) {
+      return nullptr;
+    }
+
+    lastNodeInRange = currentNode;
+
+    lastElementInRange = Element::FromNodeOrNull(lastNodeInRange);
+    if (!lastElementInRange) {
+      continue;
+    }
+
+    if (nsIContent* nextSibling = lastElementInRange->GetNextSibling()) {
+      if (nextSibling->IsHTMLElement(nsGkAtoms::br)) {
+        return nullptr;
+      }
+      nsIContent* firstEditableLeaf = HTMLEditUtils::GetFirstLeafContent(
+          *nextSibling,
+          {});
+      if (firstEditableLeaf &&
+          firstEditableLeaf->IsHTMLElement(nsGkAtoms::br)) {
+        return nullptr;
+      }
+    }
+
+    if (!aTagName) {
+      continue;
+    }
+
+    if (isLinkTag && HTMLEditUtils::IsHyperlinkElement(*lastElementInRange)) {
+      continue;
+    }
+
+    if (isNamedAnchorTag &&
+        HTMLEditUtils::IsNamedAnchorElement(*lastElementInRange)) {
+      continue;
+    }
+
+    if (aTagName == lastElementInRange->NodeInfo()->NameAtom()) {
+      continue;
+    }
+
+    return nullptr;
+  }
+  return lastElementInRange.forget();
+}
+
+Result<CreateElementResult, nsresult> HTMLEditor::CreateAndInsertElement(
+    WithTransaction aWithTransaction, const nsAtom& aTagName,
+    const EditorDOMPoint& aPointToInsert,
+    const InitializeInsertingElement& aInitializer) {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+  MOZ_ASSERT(aPointToInsert.IsSetAndValid());
+
+  (void)aPointToInsert.Offset();
+
+  IgnoredErrorResult ignoredError;
+  AutoEditSubActionNotifier startToHandleEditSubAction(
+      *this, EditSubAction::eCreateNode, nsIEditor::eNext, ignoredError);
+  if (NS_WARN_IF(ignoredError.ErrorCodeIs(NS_ERROR_EDITOR_DESTROYED))) {
+    return Err(NS_ERROR_EDITOR_DESTROYED);
+  }
+  NS_WARNING_ASSERTION(
+      !ignoredError.Failed(),
+      "HTMLEditor::OnStartToHandleTopLevelEditSubAction() failed, but ignored");
+
+
+  auto createNewElementResult =
+      [&]() MOZ_CAN_RUN_SCRIPT -> Result<CreateElementResult, nsresult> {
+    RefPtr<Element> newElement = CreateHTMLContent(&aTagName);
+    if (MOZ_UNLIKELY(!newElement)) {
+      NS_WARNING("EditorBase::CreateHTMLContent() failed");
+      return Err(NS_ERROR_FAILURE);
+    }
+    nsresult rv = MarkElementDirty(*newElement);
+    if (MOZ_UNLIKELY(rv == NS_ERROR_EDITOR_DESTROYED)) {
+      NS_WARNING("EditorBase::MarkElementDirty() caused destroying the editor");
+      return Err(NS_ERROR_EDITOR_DESTROYED);
+    }
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                         "EditorBase::MarkElementDirty() failed, but ignored");
+    rv = aInitializer(*this, *newElement, aPointToInsert);
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rv), "aInitializer failed");
+    if (NS_WARN_IF(Destroyed())) {
+      return Err(NS_ERROR_EDITOR_DESTROYED);
+    }
+    RefPtr<InsertNodeTransaction> transaction =
+        InsertNodeTransaction::Create(*this, *newElement, aPointToInsert);
+    rv = aWithTransaction == WithTransaction::Yes
+             ? DoTransactionInternal(transaction)
+             : transaction->DoTransaction();
+    if (MOZ_UNLIKELY(Destroyed())) {
+      NS_WARNING(
+          "InsertNodeTransaction::DoTransaction() caused destroying the "
+          "editor");
+      return Err(NS_ERROR_EDITOR_DESTROYED);
+    }
+    if (NS_FAILED(rv)) {
+      NS_WARNING("InsertNodeTransaction::DoTransaction() failed");
+      return Err(rv);
+    }
+    if (newElement &&
+        newElement->GetParentNode() != aPointToInsert.GetContainer()) {
+      NS_WARNING("The new element was not inserted into the expected node");
+      return Err(NS_ERROR_EDITOR_UNEXPECTED_DOM_TREE);
+    }
+    return CreateElementResult(
+        std::move(newElement),
+        transaction->SuggestPointToPutCaret<EditorDOMPoint>());
+  }();
+
+  if (MOZ_UNLIKELY(createNewElementResult.isErr())) {
+    NS_WARNING("EditorBase::DoTransactionInternal() failed");
+    DebugOnly<nsresult> rvIgnored =
+        RangeUpdaterRef().SelAdjCreateNode(aPointToInsert);
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rvIgnored),
+                         "RangeUpdater::SelAdjCreateNode() failed");
+    return createNewElementResult;
+  }
+
+  DebugOnly<nsresult> rvIgnored =
+      RangeUpdaterRef().SelAdjCreateNode(EditorRawDOMPoint(
+          aPointToInsert.GetContainer(), aPointToInsert.Offset()));
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rvIgnored),
+                       "RangeUpdater::SelAdjCreateNode() failed, but ignored");
+  if (MOZ_LIKELY(createNewElementResult.inspect().GetNewNode())) {
+    TopLevelEditSubActionDataRef().DidCreateElement(
+        *this, *createNewElementResult.inspect().GetNewNode());
+  }
+
+  return createNewElementResult;
+}
+
+nsresult HTMLEditor::CopyAttributes(WithTransaction aWithTransaction,
+                                    Element& aDestElement, Element& aSrcElement,
+                                    const AttributeFilter& aFilterFunc) {
+  if (!aSrcElement.GetAttrCount()) {
+    return NS_OK;
+  }
+  struct MOZ_STACK_CLASS AttrCache {
+    int32_t mNamespaceID;
+    const OwningNonNull<nsAtom> mName;
+    nsString mValue;
+  };
+  AutoTArray<AttrCache, 16> srcAttrs;
+  srcAttrs.SetCapacity(aSrcElement.GetAttrCount());
+  for (const uint32_t i : IntegerRange(aSrcElement.GetAttrCount())) {
+    const BorrowedAttrInfo attrInfo = aSrcElement.GetAttrInfoAt(i);
+    if (const nsAttrName* attrName = attrInfo.mName) {
+      MOZ_ASSERT(attrName->LocalName());
+      MOZ_ASSERT(attrInfo.mValue);
+      nsString attrValue;
+      attrInfo.mValue->ToString(attrValue);
+      srcAttrs.AppendElement(AttrCache{attrInfo.mName->NamespaceID(),
+                                       *attrName->LocalName(),
+                                       std::move(attrValue)});
+    }
+  }
+  if (aWithTransaction == WithTransaction::No) {
+    for (auto& attr : srcAttrs) {
+      if (!aFilterFunc(*this, aSrcElement, aDestElement, attr.mNamespaceID,
+                       attr.mName, attr.mValue)) {
+        continue;
+      }
+      DebugOnly<nsresult> rvIgnored =
+          AutoElementAttrAPIWrapper(*this, aDestElement)
+              .SetAttr(MOZ_KnownLive(attr.mName), attr.mValue, false);
+      NS_WARNING_ASSERTION(
+          NS_SUCCEEDED(rvIgnored) && rvIgnored != NS_ERROR_EDITOR_DESTROYED,
+          "AutoElementAttrAPIWrapper::SetAttr() failed, but ignored");
+    }
+    if (NS_WARN_IF(Destroyed())) {
+      return NS_ERROR_EDITOR_DESTROYED;
+    }
+    return NS_OK;
+  }
+  MOZ_ASSERT_UNREACHABLE("Not implemented yet, but you try to use this");
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+already_AddRefed<Element> HTMLEditor::CreateElementWithDefaults(
+    const nsAtom& aTagName) {
+
+  AutoEditActionDataSetter editActionData(*this, EditAction::eNotEditing);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    return nullptr;
+  }
+
+  const nsAtom* realTagName = IsLinkTag(aTagName) || IsNamedAnchorTag(aTagName)
+                                  ? nsGkAtoms::a
+                                  : &aTagName;
+
+
+  RefPtr<Element> newElement = CreateHTMLContent(realTagName);
+  if (!newElement) {
+    return nullptr;
+  }
+
+  IgnoredErrorResult ignoredError;
+  newElement->SetAttribute(u"_moz_dirty"_ns, u""_ns, ignoredError);
+  NS_WARNING_ASSERTION(!ignoredError.Failed(),
+                       "Element::SetAttribute(_moz_dirty) failed, but ignored");
+  ignoredError.SuppressException();
+
+  if (realTagName == nsGkAtoms::table) {
+    newElement->SetAttr(nsGkAtoms::cellpadding, u"2"_ns, ignoredError);
+    if (ignoredError.Failed()) {
+      NS_WARNING("Element::SetAttr(nsGkAtoms::cellpadding, 2) failed");
+      return nullptr;
+    }
+    ignoredError.SuppressException();
+
+    newElement->SetAttr(nsGkAtoms::cellspacing, u"2"_ns, ignoredError);
+    if (ignoredError.Failed()) {
+      NS_WARNING("Element::SetAttr(nsGkAtoms::cellspacing, 2) failed");
+      return nullptr;
+    }
+    ignoredError.SuppressException();
+
+    newElement->SetAttr(nsGkAtoms::border, u"1"_ns, ignoredError);
+    if (ignoredError.Failed()) {
+      NS_WARNING("Element::SetAttr(nsGkAtoms::border, 1) failed");
+      return nullptr;
+    }
+  } else if (realTagName == nsGkAtoms::td) {
+    nsresult rv = SetAttributeOrEquivalent(newElement, nsGkAtoms::valign,
+                                           u"top"_ns, true);
+    if (NS_FAILED(rv)) {
+      NS_WARNING(
+          "HTMLEditor::SetAttributeOrEquivalent(nsGkAtoms::valign, top) "
+          "failed");
+      return nullptr;
+    }
+  }
+
+  return newElement.forget();
+}
+
+NS_IMETHODIMP HTMLEditor::CreateElementWithDefaults(const nsAString& aTagName,
+                                                    Element** aReturn) {
+  if (NS_WARN_IF(aTagName.IsEmpty()) || NS_WARN_IF(!aReturn)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  *aReturn = nullptr;
+
+  nsStaticAtom* tagName = EditorUtils::GetTagNameAtom(aTagName);
+  if (NS_WARN_IF(!tagName)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+  RefPtr<Element> newElement =
+      CreateElementWithDefaults(MOZ_KnownLive(*tagName));
+  if (!newElement) {
+    NS_WARNING("HTMLEditor::CreateElementWithDefaults() failed");
+    return NS_ERROR_FAILURE;
+  }
+  newElement.forget(aReturn);
+  return NS_OK;
+}
+
+NS_IMETHODIMP HTMLEditor::InsertLinkAroundSelection(Element* aAnchorElement) {
+  nsresult rv = InsertLinkAroundSelectionAsAction(aAnchorElement);
+  NS_WARNING_ASSERTION(
+      NS_SUCCEEDED(rv),
+      "HTMLEditor::InsertLinkAroundSelectionAsAction() failed");
+  return rv;
+}
+
+nsresult HTMLEditor::InsertLinkAroundSelectionAsAction(
+    Element* aAnchorElement, nsIPrincipal* aPrincipal) {
+  if (NS_WARN_IF(!aAnchorElement)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  AutoEditActionDataSetter editActionData(*this, EditAction::eInsertLinkElement,
+                                          aPrincipal);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  RefPtr<Element> const editingHost =
+      ComputeEditingHost(LimitInBodyElement::No);
+  if (NS_WARN_IF(!editingHost)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (!IsStyleEditable(editingHost)) {
+    return NS_SUCCESS_DOM_NO_OPERATION;
+  }
+
+  if (SelectionRef().IsCollapsed()) {
+    NS_WARNING("Selection was collapsed");
+    return NS_OK;
+  }
+
+  RefPtr<HTMLAnchorElement> anchor =
+      HTMLAnchorElement::FromNodeOrNull(aAnchorElement);
+  if (!anchor) {
+    return NS_OK;
+  }
+
+  nsAutoString rawHref;
+  anchor->GetAttr(nsGkAtoms::href, rawHref);
+  editActionData.SetData(rawHref);
+
+  nsresult rv = editActionData.MaybeDispatchBeforeInputEvent();
+  if (NS_FAILED(rv)) {
+    NS_WARNING_ASSERTION(rv == NS_ERROR_EDITOR_ACTION_CANCELED,
+                         "MaybeDispatchBeforeInputEvent(), failed");
+    return EditorBase::ToGenericNSResult(rv);
+  }
+
+  {
+    nsAutoCString href;
+    anchor->GetHref(href);
+    if (href.IsEmpty()) {
+      return NS_OK;
+    }
+  }
+
+  AutoPlaceholderBatch treatAsOneTransaction(
+      *this, ScrollSelectionIntoView::Yes, __FUNCTION__);
+
+  AutoTArray<EditorInlineStyleAndValue, 32> stylesToSet;
+  if (const uint32_t attrCount = anchor->GetAttrCount()) {
+    stylesToSet.SetCapacity(attrCount);
+    for (const uint32_t i : IntegerRange(attrCount)) {
+      const BorrowedAttrInfo attrInfo = anchor->GetAttrInfoAt(i);
+      if (const nsAttrName* attrName = attrInfo.mName) {
+        if (attrName->IsAtom() && attrName->Equals(nsGkAtoms::mozdirty)) {
+          continue;
+        }
+        RefPtr<nsAtom> attributeName = attrName->LocalName();
+        MOZ_ASSERT(attrInfo.mValue);
+        nsString attrValue;
+        attrInfo.mValue->ToString(attrValue);
+        stylesToSet.AppendElement(EditorInlineStyleAndValue(
+            *nsGkAtoms::a, std::move(attributeName), std::move(attrValue)));
+      }
+    }
+  }
+  rv = SetInlinePropertiesAsSubAction(stylesToSet, *editingHost);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "HTMLEditor::SetInlinePropertiesAsSubAction() failed");
+  return rv;
+}
+
+nsresult HTMLEditor::SetHTMLBackgroundColorWithTransaction(
+    const nsAString& aColor) {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+
+  bool isCellSelected = false;
+  Result<RefPtr<Element>, nsresult> cellOrRowOrTableElementOrError =
+      GetSelectedOrParentTableElement(&isCellSelected);
+  if (cellOrRowOrTableElementOrError.isErr()) {
+    NS_WARNING("HTMLEditor::GetSelectedOrParentTableElement() failed");
+    return cellOrRowOrTableElementOrError.unwrapErr();
+  }
+
+  bool setColor = !aColor.IsEmpty();
+  RefPtr<Element> rootElementOfBackgroundColor =
+      cellOrRowOrTableElementOrError.unwrap();
+  if (rootElementOfBackgroundColor) {
+    if (isCellSelected || rootElementOfBackgroundColor->IsAnyOfHTMLElements(
+                              nsGkAtoms::table, nsGkAtoms::tr)) {
+      SelectedTableCellScanner scanner(SelectionRef());
+      if (scanner.IsInTableCellSelectionMode()) {
+        if (setColor) {
+          for (const OwningNonNull<Element>& cellElement :
+               scanner.ElementsRef()) {
+            nsresult rv = SetAttributeWithTransaction(
+                MOZ_KnownLive(cellElement), *nsGkAtoms::bgcolor, aColor);
+            if (NS_WARN_IF(Destroyed())) {
+              return NS_ERROR_EDITOR_DESTROYED;
+            }
+            if (NS_FAILED(rv)) {
+              NS_WARNING(
+                  "EditorBase::::SetAttributeWithTransaction(nsGkAtoms::"
+                  "bgcolor) failed");
+              return rv;
+            }
+          }
+          return NS_OK;
+        }
+        for (const OwningNonNull<Element>& cellElement :
+             scanner.ElementsRef()) {
+          nsresult rv = RemoveAttributeWithTransaction(
+              MOZ_KnownLive(cellElement), *nsGkAtoms::bgcolor);
+          if (NS_FAILED(rv)) {
+            NS_WARNING(
+                "EditorBase::RemoveAttributeWithTransaction(nsGkAtoms::bgcolor)"
+                " failed");
+            return rv;
+          }
+        }
+        return NS_OK;
+      }
+    }
+    // If we failed to find a cell, fall through to use originally-found element
+  } else {
+    rootElementOfBackgroundColor = GetRoot();
+    if (NS_WARN_IF(!rootElementOfBackgroundColor)) {
+      return NS_ERROR_FAILURE;
+    }
+  }
+  if (setColor) {
+    nsresult rv = SetAttributeWithTransaction(*rootElementOfBackgroundColor,
+                                              *nsGkAtoms::bgcolor, aColor);
+    NS_WARNING_ASSERTION(
+        NS_SUCCEEDED(rv),
+        "EditorBase::SetAttributeWithTransaction(nsGkAtoms::bgcolor) failed");
+    return rv;
+  }
+  nsresult rv = RemoveAttributeWithTransaction(*rootElementOfBackgroundColor,
+                                               *nsGkAtoms::bgcolor);
+  NS_WARNING_ASSERTION(
+      NS_SUCCEEDED(rv),
+      "EditorBase::RemoveAttributeWithTransaction(nsGkAtoms::bgcolor) failed");
+  return rv;
+}
+
+Result<CaretPoint, nsresult>
+HTMLEditor::DeleteEmptyInclusiveAncestorInlineElements(
+    nsIContent& aContent, const Element& aEditingHost) {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+  MOZ_ASSERT(HTMLEditUtils::IsRemovableFromParentNode(aContent));
+
+  constexpr static HTMLEditUtils::EmptyCheckOptions kOptionsToCheckInline =
+      HTMLEditUtils::EmptyCheckOptions{
+          EmptyCheckOption::TreatBlockAsVisible,
+          EmptyCheckOption::TreatListItemAsVisible,
+          EmptyCheckOption::TreatSingleBRElementAsVisible,
+          EmptyCheckOption::TreatTableCellAsVisible};
+
+  if (&aContent == &aEditingHost ||
+      HTMLEditUtils::IsBlockElement(
+          aContent, BlockInlineCheck::UseComputedDisplayOutsideStyle) ||
+      !HTMLEditUtils::IsRemovableFromParentNode(aContent) ||
+      !aContent.GetParent() ||
+      !HTMLEditUtils::IsEmptyNode(aContent, kOptionsToCheckInline)) {
+    return CaretPoint(EditorDOMPoint());
+  }
+
+  OwningNonNull<nsIContent> content = aContent;
+  for (nsIContent* parentContent : aContent.AncestorsOfType<nsIContent>()) {
+    if (HTMLEditUtils::IsBlockElement(
+            *parentContent, BlockInlineCheck::UseComputedDisplayStyle) ||
+        !HTMLEditUtils::IsRemovableFromParentNode(*parentContent) ||
+        parentContent == &aEditingHost) {
+      break;
+    }
+    bool parentIsEmpty = true;
+    if (parentContent->GetChildCount() > 1) {
+      for (nsIContent* sibling = parentContent->GetFirstChild(); sibling;
+           sibling = sibling->GetNextSibling()) {
+        if (sibling == content) {
+          continue;
+        }
+        if (!HTMLEditUtils::IsEmptyNode(*sibling, kOptionsToCheckInline)) {
+          parentIsEmpty = false;
+          break;
+        }
+      }
+    }
+    if (!parentIsEmpty) {
+      break;
+    }
+    content = *parentContent;
+  }
+
+  const nsCOMPtr<nsIContent> nextSibling = content->GetNextSibling();
+  const nsCOMPtr<nsINode> parentNode = content->GetParentNode();
+  MOZ_ASSERT(parentNode);
+  nsresult rv = DeleteNodeWithTransaction(content);
+  if (NS_FAILED(rv)) {
+    NS_WARNING("EditorBase::DeleteNodeWithTransaction() failed");
+    return Err(rv);
+  }
+  if (NS_WARN_IF(nextSibling && nextSibling->GetParentNode() != parentNode) ||
+      NS_WARN_IF(!HTMLEditUtils::IsSimplyEditableNode(*parentNode))) {
+    return Err(NS_ERROR_EDITOR_UNEXPECTED_DOM_TREE);
+  }
+  return CaretPoint(nextSibling ? EditorDOMPoint(nextSibling)
+                                : EditorDOMPoint::AtEndOf(*parentNode));
+}
+
+nsresult HTMLEditor::DeleteAllChildrenWithTransaction(Element& aElement) {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+
+  IgnoredErrorResult ignoredError;
+  AutoEditSubActionNotifier startToHandleEditSubAction(
+      *this, EditSubAction::eDeleteNode, nsIEditor::eNext, ignoredError);
+  if (NS_WARN_IF(ignoredError.ErrorCodeIs(NS_ERROR_EDITOR_DESTROYED))) {
+    return ignoredError.StealNSResult();
+  }
+  NS_WARNING_ASSERTION(
+      !ignoredError.Failed(),
+      "OnStartToHandleTopLevelEditSubAction() failed, but ignored");
+
+  while (nsCOMPtr<nsIContent> child = aElement.GetLastChild()) {
+    nsresult rv = DeleteNodeWithTransaction(*child);
+    if (NS_FAILED(rv)) {
+      NS_WARNING("EditorBase::DeleteNodeWithTransaction() failed");
+      return rv;
+    }
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP HTMLEditor::DeleteNode(nsINode* aNode, bool aPreserveSelection,
+                                     uint8_t aOptionalArgCount) {
+  if (NS_WARN_IF(!aNode) || NS_WARN_IF(!aNode->IsContent())) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  AutoEditActionDataSetter editActionData(*this, EditAction::eRemoveNode);
+  nsresult rv = editActionData.CanHandleAndMaybeDispatchBeforeInputEvent();
+  if (NS_FAILED(rv)) {
+    NS_WARNING_ASSERTION(rv == NS_ERROR_EDITOR_ACTION_CANCELED,
+                         "CanHandleAndMaybeDispatchBeforeInputEvent(), failed");
+    return EditorBase::ToGenericNSResult(rv);
+  }
+
+  AutoPlaceholderBatch treatAsOneTransaction(
+      *this,
+      ScrollSelectionIntoView::No,  
+      __FUNCTION__);
+
+  Maybe<AutoTransactionsConserveSelection> preserveSelection;
+  if (aOptionalArgCount && aPreserveSelection) {
+    preserveSelection.emplace(*this);
+  }
+
+  rv = DeleteNodeWithTransaction(MOZ_KnownLive(*aNode->AsContent()));
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "EditorBase::DeleteNodeWithTransaction() failed");
+  return rv;
+}
+
+Result<CaretPoint, nsresult> HTMLEditor::DeleteTextWithTransaction(
+    Text& aTextNode, uint32_t aOffset, uint32_t aLength) {
+  if (NS_WARN_IF(!HTMLEditUtils::IsSimplyEditableNode(aTextNode))) {
+    return Err(NS_ERROR_FAILURE);
+  }
+
+  Result<CaretPoint, nsresult> caretPointOrError =
+      EditorBase::DeleteTextWithTransaction(aTextNode, aOffset, aLength);
+  NS_WARNING_ASSERTION(caretPointOrError.isOk(),
+                       "EditorBase::DeleteTextWithTransaction() failed");
+  return caretPointOrError;
+}
+
+Result<InsertTextResult, nsresult> HTMLEditor::ReplaceTextWithTransaction(
+    dom::Text& aTextNode, const ReplaceWhiteSpacesData& aData) {
+  Result<InsertTextResult, nsresult> insertTextResultOrError =
+      ReplaceTextWithTransaction(aTextNode, aData.mReplaceStartOffset,
+                                 aData.ReplaceLength(),
+                                 aData.mNormalizedString);
+  if (MOZ_UNLIKELY(insertTextResultOrError.isErr()) ||
+      aData.mNewOffsetAfterReplace > aTextNode.TextDataLength()) {
+    return insertTextResultOrError;
+  }
+  InsertTextResult insertTextResult = insertTextResultOrError.unwrap();
+  insertTextResult.IgnoreCaretPointSuggestion();
+  EditorDOMPoint pointToPutCaret(&aTextNode, aData.mNewOffsetAfterReplace);
+  return InsertTextResult(std::move(insertTextResult),
+                          std::move(pointToPutCaret));
+}
+
+Result<InsertTextResult, nsresult> HTMLEditor::ReplaceTextWithTransaction(
+    Text& aTextNode, uint32_t aOffset, uint32_t aLength,
+    const nsAString& aStringToInsert) {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+  MOZ_ASSERT(aLength > 0 || !aStringToInsert.IsEmpty());
+
+  if (aStringToInsert.IsEmpty()) {
+    Result<CaretPoint, nsresult> caretPointOrError =
+        DeleteTextWithTransaction(aTextNode, aOffset, aLength);
+    if (MOZ_UNLIKELY(caretPointOrError.isErr())) {
+      NS_WARNING("HTMLEditor::DeleteTextWithTransaction() failed");
+      return caretPointOrError.propagateErr();
+    }
+    return InsertTextResult(EditorDOMPoint(&aTextNode, aOffset),
+                            caretPointOrError.unwrap());
+  }
+
+  if (!aLength) {
+    Result<InsertTextResult, nsresult> insertTextResult =
+        InsertTextWithTransaction(aStringToInsert,
+                                  EditorDOMPoint(&aTextNode, aOffset),
+                                  InsertTextTo::ExistingTextNodeIfAvailable);
+    NS_WARNING_ASSERTION(insertTextResult.isOk(),
+                         "HTMLEditor::InsertTextWithTransaction() failed");
+    return insertTextResult;
+  }
+
+  if (NS_WARN_IF(!HTMLEditUtils::IsSimplyEditableNode(aTextNode))) {
+    return Err(NS_ERROR_FAILURE);
+  }
+
+  IgnoredErrorResult ignoredError;
+  AutoEditSubActionNotifier startToHandleEditSubAction(
+      *this, EditSubAction::eInsertText, nsIEditor::eNext, ignoredError);
+  if (NS_WARN_IF(ignoredError.ErrorCodeIs(NS_ERROR_EDITOR_DESTROYED))) {
+    return Err(NS_ERROR_EDITOR_DESTROYED);
+  }
+  NS_WARNING_ASSERTION(
+      !ignoredError.Failed(),
+      "HTMLEditor::OnStartToHandleTopLevelEditSubAction() failed, but ignored");
+
+  EditorDOMPointInText pointToInsert(&aTextNode, aOffset);
+
+  RefPtr<ReplaceTextTransaction> transaction = ReplaceTextTransaction::Create(
+      *this, aStringToInsert, aTextNode, aOffset, aLength);
+  MOZ_ASSERT(transaction);
+
+  if (aLength && !mActionListeners.IsEmpty()) {
+    for (auto& listener : mActionListeners.Clone()) {
+      DebugOnly<nsresult> rvIgnored =
+          listener->WillDeleteText(&aTextNode, aOffset, aLength);
+      NS_WARNING_ASSERTION(
+          NS_SUCCEEDED(rvIgnored),
+          "nsIEditActionListener::WillDeleteText() failed, but ignored");
+    }
+  }
+
+  nsresult rv = DoTransactionInternal(transaction);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "EditorBase::DoTransactionInternal() failed");
+
+
+  EditorDOMPoint endOfInsertedText(&aTextNode,
+                                   aOffset + aStringToInsert.Length());
+
+  if (pointToInsert.IsSet()) {
+    auto [begin, end] = ComputeInsertedRange(pointToInsert, aStringToInsert);
+    if (begin.IsSet() && end.IsSet()) {
+      TopLevelEditSubActionDataRef().DidDeleteText(
+          *this, begin.RefOrTo<EditorRawDOMPoint>());
+      TopLevelEditSubActionDataRef().DidInsertText(
+          *this, begin.RefOrTo<EditorRawDOMPoint>(),
+          end.RefOrTo<EditorRawDOMPoint>());
+    }
+
+  }
+
+  if (!mActionListeners.IsEmpty()) {
+    for (auto& listener : mActionListeners.Clone()) {
+      DebugOnly<nsresult> rvIgnored =
+          listener->DidInsertText(&aTextNode, aOffset, aStringToInsert, rv);
+      NS_WARNING_ASSERTION(
+          NS_SUCCEEDED(rvIgnored),
+          "nsIEditActionListener::DidInsertText() failed, but ignored");
+    }
+  }
+
+  if (NS_WARN_IF(Destroyed())) {
+    return Err(NS_ERROR_EDITOR_DESTROYED);
+  }
+
+  return InsertTextResult(
+      std::move(endOfInsertedText),
+      transaction->SuggestPointToPutCaret<EditorDOMPoint>());
+}
+
+Result<InsertTextResult, nsresult>
+HTMLEditor::InsertOrReplaceTextWithTransaction(
+    const EditorDOMPoint& aPointToInsert,
+    const NormalizedStringToInsertText& aData) {
+  MOZ_ASSERT(aPointToInsert.IsInContentNodeAndValid());
+  MOZ_ASSERT_IF(aData.ReplaceLength(), aPointToInsert.IsInTextNode());
+
+  Result<InsertTextResult, nsresult> insertTextResultOrError =
+      !aData.ReplaceLength()
+          ? InsertTextWithTransaction(aData.mNormalizedString, aPointToInsert,
+                                      InsertTextTo::SpecifiedPoint)
+          : ReplaceTextWithTransaction(
+                MOZ_KnownLive(*aPointToInsert.ContainerAs<Text>()),
+                aData.mReplaceStartOffset, aData.ReplaceLength(),
+                aData.mNormalizedString);
+  if (MOZ_UNLIKELY(insertTextResultOrError.isErr())) {
+    NS_WARNING(!aData.ReplaceLength()
+                   ? "HTMLEditor::InsertTextWithTransaction() failed"
+                   : "HTMLEditor::ReplaceTextWithTransaction() failed");
+    return insertTextResultOrError;
+  }
+  InsertTextResult insertTextResult = insertTextResultOrError.unwrap();
+  if (!aData.ReplaceLength()) {
+    auto pointToPutCaret = [&]() -> EditorDOMPoint {
+      return insertTextResult.HasCaretPointSuggestion()
+                 ? insertTextResult.UnwrapCaretPoint()
+                 : insertTextResult.EndOfInsertedTextRef();
+    }();
+    return InsertTextResult(std::move(insertTextResult),
+                            std::move(pointToPutCaret));
+  }
+  insertTextResult.IgnoreCaretPointSuggestion();
+  Text* const insertedTextNode =
+      insertTextResult.EndOfInsertedTextRef().GetContainerAs<Text>();
+  if (NS_WARN_IF(!insertedTextNode) ||
+      NS_WARN_IF(!insertedTextNode->IsInComposedDoc()) ||
+      NS_WARN_IF(!HTMLEditUtils::IsSimplyEditableNode(*insertedTextNode))) {
+    return Err(NS_ERROR_EDITOR_UNEXPECTED_DOM_TREE);
+  }
+  const uint32_t expectedEndOffset = aData.EndOffsetOfInsertedText();
+  if (NS_WARN_IF(expectedEndOffset > insertedTextNode->TextDataLength())) {
+    return Err(NS_ERROR_EDITOR_UNEXPECTED_DOM_TREE);
+  }
+  EditorDOMPoint endOfNewString(insertedTextNode, expectedEndOffset);
+  EditorDOMPoint pointToPutCaret = endOfNewString;
+  return InsertTextResult(std::move(endOfNewString),
+                          CaretPoint(std::move(pointToPutCaret)));
+}
+
+Result<InsertTextResult, nsresult> HTMLEditor::InsertTextWithTransaction(
+    const nsAString& aStringToInsert, const EditorDOMPoint& aPointToInsert,
+    InsertTextTo aInsertTextTo) {
+  if (NS_WARN_IF(!aPointToInsert.IsSet())) {
+    return Err(NS_ERROR_INVALID_ARG);
+  }
+
+  if (NS_WARN_IF(!HTMLEditUtils::IsSimplyEditableNode(
+          *aPointToInsert.GetContainer()))) {
+    return Err(NS_ERROR_FAILURE);
+  }
+
+  return EditorBase::InsertTextWithTransaction(aStringToInsert, aPointToInsert,
+                                               aInsertTextTo);
+}
+
+Result<EditorDOMPoint, nsresult> HTMLEditor::PrepareToInsertLineBreak(
+    LineBreakType aLineBreakType, const EditorDOMPoint& aPointToInsert) {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+
+  if (NS_WARN_IF(!aPointToInsert.IsInContentNode())) {
+    return Err(NS_ERROR_FAILURE);
+  }
+
+  const auto CanInsertLineBreak = [aLineBreakType](const nsIContent& aContent) {
+    if (aLineBreakType == LineBreakType::BRElement) {
+      return HTMLEditUtils::CanNodeContain(aContent, *nsGkAtoms::br);
+    }
+    MOZ_ASSERT(aLineBreakType == LineBreakType::Linefeed);
+    return HTMLEditUtils::CanNodeContain(aContent, *nsGkAtoms::textTagName) &&
+           EditorUtils::IsNewLinePreformatted(aContent);
+  };
+
+  const bool canNormalizeWhiteSpaces = mInitSucceeded;
+
+  if (!aPointToInsert.IsInTextNode()) {
+    if (NS_WARN_IF(
+            !CanInsertLineBreak(*aPointToInsert.ContainerAs<nsIContent>()))) {
+      return Err(NS_ERROR_FAILURE);
+    }
+    if (!canNormalizeWhiteSpaces) {
+      return aPointToInsert;
+    }
+    Result<EditorDOMPoint, nsresult> pointToInsertOrError =
+        WhiteSpaceVisibilityKeeper::NormalizeWhiteSpacesToSplitAt(
+            *this, aPointToInsert,
+            {WhiteSpaceVisibilityKeeper::NormalizeOption::
+                 StopIfPrecedingWhiteSpacesEndsWithNBP});
+    if (NS_WARN_IF(pointToInsertOrError.isErr())) {
+      return pointToInsertOrError.propagateErr();
+    }
+    return pointToInsertOrError.unwrap();
+  }
+
+  const Element* const containerOrNewLineBreak =
+      aPointToInsert.GetContainerParentAs<Element>();
+  if (NS_WARN_IF(!containerOrNewLineBreak) ||
+      NS_WARN_IF(!CanInsertLineBreak(*containerOrNewLineBreak))) {
+    return Err(NS_ERROR_FAILURE);
+  }
+
+  Result<EditorDOMPoint, nsresult> pointToInsertOrError =
+      canNormalizeWhiteSpaces
+          ? WhiteSpaceVisibilityKeeper::NormalizeWhiteSpacesToSplitAt(
+                *this, aPointToInsert,
+                {WhiteSpaceVisibilityKeeper::NormalizeOption::
+                     StopIfPrecedingWhiteSpacesEndsWithNBP})
+          : aPointToInsert;
+  if (NS_WARN_IF(pointToInsertOrError.isErr())) {
+    return pointToInsertOrError.propagateErr();
+  }
+  const EditorDOMPoint pointToInsert = pointToInsertOrError.unwrap();
+  if (!pointToInsert.IsInTextNode()) {
+    return pointToInsert.ParentPoint();
+  }
+
+  if (pointToInsert.IsStartOfContainer()) {
+    return pointToInsert.ParentPoint();
+  }
+
+  if (pointToInsert.IsEndOfContainer()) {
+    return EditorDOMPoint::After(*pointToInsert.ContainerAs<Text>());
+  }
+
+  MOZ_DIAGNOSTIC_ASSERT(pointToInsert.IsSetAndValid());
+
+  Result<SplitNodeResult, nsresult> splitTextNodeResult =
+      SplitNodeWithTransaction(pointToInsert);
+  if (MOZ_UNLIKELY(splitTextNodeResult.isErr())) {
+    NS_WARNING("HTMLEditor::SplitNodeWithTransaction() failed");
+    return splitTextNodeResult.propagateErr();
+  }
+
+  nsresult rv = splitTextNodeResult.inspect().SuggestCaretPointTo(
+      *this, {SuggestCaret::OnlyIfTransactionsAllowedToDoIt});
+  if (NS_FAILED(rv)) {
+    NS_WARNING("SplitNodeResult::SuggestCaretPointTo() failed");
+    return Err(rv);
+  }
+
+  auto atNextContent =
+      splitTextNodeResult.inspect().AtNextContent<EditorDOMPoint>();
+  if (MOZ_UNLIKELY(!atNextContent.IsInContentNode())) {
+    NS_WARNING("The next node seems not in the DOM tree");
+    return Err(NS_ERROR_FAILURE);
+  }
+  return atNextContent;
+}
+
+Maybe<HTMLEditor::LineBreakType> HTMLEditor::GetPreferredLineBreakType(
+    const nsINode& aNode, const Element& aEditingHost) const {
+  const Element* const container = aNode.GetAsElementOrParentElement();
+  if (MOZ_UNLIKELY(!container)) {
+    return Nothing();
+  }
+  if (GetDefaultParagraphSeparator() == ParagraphSeparator::br) {
+    return Some(LineBreakType::BRElement);
+  }
+  if (IsMailEditor() || IsPlaintextMailComposer()) {
+    return Some(LineBreakType::BRElement);
+  }
+  if (HTMLEditUtils::ShouldInsertLinefeedCharacter(EditorDOMPoint(container, 0),
+                                                   aEditingHost) &&
+      HTMLEditUtils::CanNodeContain(*container, *nsGkAtoms::textTagName)) {
+    return Some(LineBreakType::Linefeed);
+  }
+  if (MOZ_UNLIKELY(
+          !HTMLEditUtils::CanNodeContain(*container, *nsGkAtoms::br))) {
+    return Nothing();
+  }
+  return Some(LineBreakType::BRElement);
+}
+
+Result<CreateLineBreakResult, nsresult> HTMLEditor::InsertLineBreak(
+    WithTransaction aWithTransaction, LineBreakType aLineBreakType,
+    const EditorDOMPoint& aPointToInsert, EDirection aSelect ) {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+
+  Result<EditorDOMPoint, nsresult> pointToInsertOrError =
+      PrepareToInsertLineBreak(aLineBreakType, aPointToInsert);
+  if (MOZ_UNLIKELY(pointToInsertOrError.isErr())) {
+    NS_WARNING(
+        nsPrintfCString("HTMLEditor::PrepareToInsertLineBreak(%s) failed",
+                        ToString(aWithTransaction).c_str())
+            .get());
+    return pointToInsertOrError.propagateErr();
+  }
+  EditorDOMPoint pointToInsert = pointToInsertOrError.unwrap();
+  MOZ_ASSERT(pointToInsert.IsInContentNode());
+  MOZ_ASSERT(pointToInsert.IsSetAndValid());
+
+  auto lineBreakOrError = [&]() MOZ_NEVER_INLINE_DEBUG MOZ_CAN_RUN_SCRIPT
+      -> Result<EditorLineBreak, nsresult> {
+    if (aLineBreakType == LineBreakType::BRElement) {
+      Result<CreateElementResult, nsresult> insertBRElementResultOrError =
+          InsertBRElement(aWithTransaction, BRElementType::Normal,
+                          pointToInsert);
+      if (MOZ_UNLIKELY(insertBRElementResultOrError.isErr())) {
+        NS_WARNING(
+            nsPrintfCString(
+                "EditorBase::InsertBRElement(%s, BRElementType::Normal) failed",
+                ToString(aWithTransaction).c_str())
+                .get());
+        return insertBRElementResultOrError.propagateErr();
+      }
+      CreateElementResult insertBRElementResult =
+          insertBRElementResultOrError.unwrap();
+      MOZ_ASSERT(insertBRElementResult.Handled());
+      insertBRElementResult.IgnoreCaretPointSuggestion();
+      return EditorLineBreak(insertBRElementResult.UnwrapNewNode());
+    }
+    MOZ_ASSERT(aLineBreakType == LineBreakType::Linefeed);
+    RefPtr<Text> newTextNode = CreateTextNode(u"\n"_ns);
+    if (NS_WARN_IF(!newTextNode)) {
+      return Err(NS_ERROR_FAILURE);
+    }
+    if (aWithTransaction == WithTransaction::Yes) {
+      Result<CreateTextResult, nsresult> insertTextNodeResult =
+          InsertNodeWithTransaction<Text>(*newTextNode, pointToInsert);
+      if (MOZ_UNLIKELY(insertTextNodeResult.isErr())) {
+        NS_WARNING("EditorBase::InsertNodeWithTransaction() failed");
+        return insertTextNodeResult.propagateErr();
+      }
+      insertTextNodeResult.unwrap().IgnoreCaretPointSuggestion();
+    } else {
+      (void)pointToInsert.Offset();
+      RefPtr<InsertNodeTransaction> transaction =
+          InsertNodeTransaction::Create(*this, *newTextNode, pointToInsert);
+      nsresult rv = transaction->DoTransaction();
+      if (NS_WARN_IF(Destroyed())) {
+        return Err(NS_ERROR_EDITOR_DESTROYED);
+      }
+      if (NS_FAILED(rv)) {
+        NS_WARNING("InsertNodeTransaction::DoTransaction() failed");
+        return Err(rv);
+      }
+      if (NS_WARN_IF(newTextNode->GetParentNode() !=
+                     pointToInsert.GetContainer())) {
+        return Err(NS_ERROR_EDITOR_UNEXPECTED_DOM_TREE);
+      }
+      RangeUpdaterRef().SelAdjInsertNode(EditorRawDOMPoint(
+          pointToInsert.GetContainer(), pointToInsert.Offset()));
+    }
+    if (NS_WARN_IF(!newTextNode->TextDataLength() ||
+                   newTextNode->DataBuffer().CharAt(0) != '\n')) {
+      return Err(NS_ERROR_EDITOR_UNEXPECTED_DOM_TREE);
+    }
+    return EditorLineBreak(std::move(newTextNode), 0u);
+  }();
+  if (MOZ_UNLIKELY(lineBreakOrError.isErr())) {
+    return lineBreakOrError.propagateErr();
+  }
+  EditorLineBreak lineBreak = lineBreakOrError.unwrap();
+  auto pointToPutCaret = [&]() -> EditorDOMPoint {
+    switch (aSelect) {
+      case eNext: {
+        return lineBreak.After<EditorDOMPoint>();
+      }
+      case ePrevious: {
+        return lineBreak.Before<EditorDOMPoint>();
+      }
+      default:
+        NS_WARNING(
+            "aSelect has invalid value, the caller need to set selection "
+            "by itself");
+        [[fallthrough]];
+      case eNone:
+        return lineBreak.To<EditorDOMPoint>();
+    }
+  }();
+  return CreateLineBreakResult(std::move(lineBreak),
+                               std::move(pointToPutCaret));
+}
+
+nsresult HTMLEditor::EnsureNoFollowingUnnecessaryLineBreak(
+    const EditorDOMPoint& aNextOrAfterModifiedPoint,
+    PreservePreformattedLineBreak aPreservePreformattedLineBreak,
+    PaddingForEmptyBlock aPaddingForEmptyBlock, const Element& aEditingHost) {
+  MOZ_ASSERT(aNextOrAfterModifiedPoint.IsInContentNode());
+  MOZ_ASSERT(aNextOrAfterModifiedPoint.IsSetAndValid());
+
+  if (IsPlaintextMailComposer()) {
+    const Element* const blockElement =
+        HTMLEditUtils::GetInclusiveAncestorElement(
+            *aNextOrAfterModifiedPoint.ContainerAs<nsIContent>(),
+            HTMLEditUtils::ClosestEditableBlockElement,
+            BlockInlineCheck::UseComputedDisplayStyle);
+    if (blockElement && HTMLEditUtils::IsMailCiteElement(*blockElement) &&
+        HTMLEditUtils::IsInlineContent(*blockElement,
+                                       BlockInlineCheck::UseHTMLDefaultStyle)) {
+      return NS_OK;
+    }
+  }
+
+  const bool isWhiteSpacePreformatted = EditorUtils::IsWhiteSpacePreformatted(
+      *aNextOrAfterModifiedPoint.ContainerAs<nsIContent>());
+  const DebugOnly<bool> isNewLinePreformatted =
+      EditorUtils::IsNewLinePreformatted(
+          *aNextOrAfterModifiedPoint.ContainerAs<nsIContent>());
+
+  const WSScanResult nextThing =
+      HTMLEditUtils::ScanInclusiveNextThingWithIgnoringUnnecessaryLineBreak(
+          aNextOrAfterModifiedPoint, aPaddingForEmptyBlock, aEditingHost);
+  const Maybe<EditorLineBreak>& unnecessaryLineBreak =
+      nextThing.MaybeIgnoredLineBreak();
+  if (unnecessaryLineBreak.isNothing() ||
+      !unnecessaryLineBreak->IsInclusiveDescendantOf(aEditingHost) ||
+      !unnecessaryLineBreak->IsDeletableFromComposedDoc()) [[likely]] {
+    return NS_OK;
+  }
+  if (unnecessaryLineBreak->IsHTMLBRElement()) {
+    if (IsPlaintextMailComposer()) {
+      if (nextThing.ReachedOtherBlockElement() &&
+          HTMLEditUtils::IsMailCiteElement(*nextThing.ElementPtr()) &&
+          HTMLEditUtils::IsInlineContent(
+              *nextThing.ElementPtr(), BlockInlineCheck::UseHTMLDefaultStyle)) {
+        return NS_OK;
+      }
+    }
+    if (HTMLEditUtils::GetMostDistantAncestorEditableEmptyInlineElement(
+            unnecessaryLineBreak->BRElementRef(),
+            BlockInlineCheck::UseComputedDisplayStyle)) {
+      return NS_OK;
+    }
+    nsresult rv = DeleteNodeWithTransaction(
+        MOZ_KnownLive(unnecessaryLineBreak->BRElementRef()));
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                         "EditorBase::DeleteNodeWithTransaction() failed "
+                         "to delete unnecessary <br>");
+    return rv;
+  }
+  MOZ_ASSERT(isNewLinePreformatted);
+  if (aPreservePreformattedLineBreak == PreservePreformattedLineBreak::Yes) {
+    if (aPaddingForEmptyBlock == PaddingForEmptyBlock::Significant ||
+        !unnecessaryLineBreak->IsPaddingForEmptyBlock()) {
+      return NS_OK;
+    }
+  }
+  const auto IsVisibleChar = [&](char16_t aChar) {
+    switch (aChar) {
+      case HTMLEditUtils::kNewLine:
+        return true;
+      case HTMLEditUtils::kSpace:
+      case HTMLEditUtils::kTab:
+      case HTMLEditUtils::kCarriageReturn:
+        return isWhiteSpacePreformatted;
+      default:
+        return true;
+    }
+  };
+  const CharacterDataBuffer& characterDataBuffer =
+      unnecessaryLineBreak->TextRef().DataBuffer();
+  const uint32_t length = characterDataBuffer.GetLength();
+  const DebugOnly<const char16_t> lastChar =
+      characterDataBuffer.CharAt(length - 1);
+  MOZ_ASSERT(lastChar == HTMLEditUtils::kNewLine);
+  const bool textNodeHasVisibleChar = [&]() {
+    if (length == 1u) {
+      return false;
+    }
+    for (const uint32_t offset : Reversed(IntegerRange(length - 1))) {
+      if (IsVisibleChar(characterDataBuffer.CharAt(offset))) {
+        return true;
+      }
+    }
+    return false;
+  }();
+  if (!textNodeHasVisibleChar) {
+    if (HTMLEditUtils::GetMostDistantAncestorEditableEmptyInlineElement(
+            unnecessaryLineBreak->TextRef(),
+            BlockInlineCheck::UseComputedDisplayStyle)) {
+      return NS_OK;
+    }
+    nsresult rv = DeleteNodeWithTransaction(
+        MOZ_KnownLive(unnecessaryLineBreak->TextRef()));
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                         "EditorBase::DeleteNodeWithTransaction() failed "
+                         "to delete unnecessary Text node");
+    return rv;
+  }
+  Result<CaretPoint, nsresult> result =
+      DeleteTextWithTransaction(MOZ_KnownLive(unnecessaryLineBreak->TextRef()),
+                                unnecessaryLineBreak->Offset(), 1);
+  if (MOZ_UNLIKELY(result.isErr())) {
+    NS_WARNING("HTMLEditor::DeleteTextWithTransaction() failed");
+    return result.unwrapErr();
+  }
+  result.unwrap().IgnoreCaretPointSuggestion();
+  return NS_OK;
+}
+
+Result<CreateElementResult, nsresult>
+HTMLEditor::InsertContainerWithTransaction(
+    nsIContent& aContentToBeWrapped, const nsAtom& aWrapperTagName,
+    const InitializeInsertingElement& aInitializer) {
+  EditorDOMPoint pointToInsertNewContainer(&aContentToBeWrapped);
+  if (NS_WARN_IF(!pointToInsertNewContainer.IsSet())) {
+    return Err(NS_ERROR_FAILURE);
+  }
+  MOZ_ALWAYS_TRUE(pointToInsertNewContainer.AdvanceOffset());
+
+  RefPtr<Element> newContainer = CreateHTMLContent(&aWrapperTagName);
+  if (NS_WARN_IF(!newContainer)) {
+    return Err(NS_ERROR_FAILURE);
+  }
+
+  if (&aInitializer != &HTMLEditor::DoNothingForNewElement) {
+    nsresult rv = aInitializer(*this, *newContainer,
+                               EditorDOMPoint(&aContentToBeWrapped));
+    if (NS_WARN_IF(Destroyed())) {
+      return Err(NS_ERROR_EDITOR_DESTROYED);
+    }
+    if (NS_FAILED(rv)) {
+      NS_WARNING("aInitializer() failed");
+      return Err(rv);
+    }
+  }
+
+  AutoInsertContainerSelNotify selNotify(RangeUpdaterRef());
+
+  nsresult rv = DeleteNodeWithTransaction(aContentToBeWrapped);
+  if (NS_FAILED(rv)) {
+    NS_WARNING("EditorBase::DeleteNodeWithTransaction() failed");
+    return Err(rv);
+  }
+
+  {
+    AutoTransactionsConserveSelection conserveSelection(*this);
+    Result<CreateContentResult, nsresult> insertContentNodeResult =
+        InsertNodeWithTransaction(aContentToBeWrapped,
+                                  EditorDOMPoint(newContainer, 0u));
+    if (MOZ_UNLIKELY(insertContentNodeResult.isErr())) {
+      NS_WARNING("EditorBase::InsertNodeWithTransaction() failed");
+      return insertContentNodeResult.propagateErr();
+    }
+    insertContentNodeResult.inspect().IgnoreCaretPointSuggestion();
+  }
+
+  Result<CreateElementResult, nsresult> insertNewContainerElementResult =
+      InsertNodeWithTransaction<Element>(*newContainer,
+                                         pointToInsertNewContainer);
+  NS_WARNING_ASSERTION(insertNewContainerElementResult.isOk(),
+                       "EditorBase::InsertNodeWithTransaction() failed");
+  return insertNewContainerElementResult;
+}
+
+Result<CreateElementResult, nsresult>
+HTMLEditor::ReplaceContainerWithTransactionInternal(
+    Element& aOldContainer, const nsAtom& aTagName, const nsAtom& aAttribute,
+    const nsAString& aAttributeValue, bool aCloneAllAttributes) {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+
+  if (NS_WARN_IF(!HTMLEditUtils::IsRemovableNode(aOldContainer)) ||
+      NS_WARN_IF(!HTMLEditUtils::IsSimplyEditableNode(aOldContainer))) {
+    return Err(NS_ERROR_FAILURE);
+  }
+
+  OwningNonNull<Element> containerElementToDelete = aOldContainer;
+  if (aOldContainer.IsAnyOfHTMLElements(nsGkAtoms::dd, nsGkAtoms::dt) &&
+      &aTagName != nsGkAtoms::dt && &aTagName != nsGkAtoms::dd &&
+      aOldContainer.GetParentNode()->IsHTMLElement(nsGkAtoms::dl)) {
+    OwningNonNull<Element> const dlElement = *aOldContainer.GetParentElement();
+    if (NS_WARN_IF(!HTMLEditUtils::IsRemovableNode(dlElement)) ||
+        NS_WARN_IF(!HTMLEditUtils::IsSimplyEditableNode(dlElement))) {
+      return Err(NS_ERROR_FAILURE);
+    }
+    Result<SplitRangeOffFromNodeResult, nsresult> splitDLElementResult =
+        SplitRangeOffFromElement(dlElement, aOldContainer, aOldContainer);
+    if (MOZ_UNLIKELY(splitDLElementResult.isErr())) {
+      NS_WARNING("HTMLEditor::SplitRangeOffFromElement() failed");
+      return splitDLElementResult.propagateErr();
+    }
+    splitDLElementResult.inspect().IgnoreCaretPointSuggestion();
+    RefPtr<Element> middleDLElement = aOldContainer.GetParentElement();
+    if (NS_WARN_IF(!middleDLElement) ||
+        NS_WARN_IF(!middleDLElement->IsHTMLElement(nsGkAtoms::dl)) ||
+        NS_WARN_IF(!HTMLEditUtils::IsRemovableNode(*middleDLElement))) {
+      NS_WARNING("The parent <dl> was lost at splitting it");
+      return Err(NS_ERROR_EDITOR_UNEXPECTED_DOM_TREE);
+    }
+    containerElementToDelete = std::move(middleDLElement);
+  }
+
+  const RefPtr<Element> newContainer = CreateHTMLContent(&aTagName);
+  if (NS_WARN_IF(!newContainer)) {
+    return Err(NS_ERROR_FAILURE);
+  }
+
+  if (aCloneAllAttributes) {
+    MOZ_ASSERT(&aAttribute == nsGkAtoms::_empty);
+    CloneAttributesWithTransaction(*newContainer, aOldContainer);
+  } else if (&aAttribute != nsGkAtoms::_empty) {
+    nsresult rv = newContainer->SetAttr(kNameSpaceID_None,
+                                        const_cast<nsAtom*>(&aAttribute),
+                                        aAttributeValue, true);
+    if (NS_FAILED(rv)) {
+      NS_WARNING("Element::SetAttr() failed");
+      return Err(NS_ERROR_FAILURE);
+    }
+  }
+
+  const OwningNonNull<nsINode> parentNode =
+      *containerElementToDelete->GetParentNode();
+  const nsCOMPtr<nsINode> referenceNode =
+      containerElementToDelete->GetNextSibling();
+  AutoReplaceContainerSelNotify selStateNotify(RangeUpdaterRef(), aOldContainer,
+                                               *newContainer);
+  if (aOldContainer.HasChildren()) {
+    const OwningNonNull<nsIContent> firstChild = *aOldContainer.GetFirstChild();
+    const OwningNonNull<nsIContent> lastChild = *aOldContainer.GetLastChild();
+    Result<MoveNodeResult, nsresult> moveChildrenResultOrError =
+        MoveSiblingsWithTransaction(firstChild, lastChild,
+                                    EditorDOMPoint(newContainer, 0));
+    if (MOZ_UNLIKELY(moveChildrenResultOrError.isErr())) {
+      NS_WARNING("HTMLEditor::MoveSiblingsWithTransaction() failed");
+      return moveChildrenResultOrError.propagateErr();
+    }
+    moveChildrenResultOrError.inspect().IgnoreCaretPointSuggestion();
+  }
+
+  nsresult rv = DeleteNodeWithTransaction(containerElementToDelete);
+  if (NS_FAILED(rv)) {
+    NS_WARNING("EditorBase::DeleteNodeWithTransaction() failed");
+    return Err(rv);
+  }
+
+  if (referenceNode && (!referenceNode->GetParentNode() ||
+                        parentNode != referenceNode->GetParentNode())) {
+    NS_WARNING(
+        "The reference node for insertion has been moved to different parent, "
+        "so we got lost the insertion point");
+    return Err(NS_ERROR_EDITOR_UNEXPECTED_DOM_TREE);
+  }
+
+  Result<CreateElementResult, nsresult> insertNewContainerElementResult =
+      InsertNodeWithTransaction<Element>(
+          *newContainer, referenceNode ? EditorDOMPoint(referenceNode)
+                                       : EditorDOMPoint::AtEndOf(*parentNode));
+  NS_WARNING_ASSERTION(insertNewContainerElementResult.isOk(),
+                       "EditorBase::InsertNodeWithTransaction() failed");
+  MOZ_ASSERT_IF(
+      insertNewContainerElementResult.isOk(),
+      insertNewContainerElementResult.inspect().GetNewNode() == newContainer);
+  return insertNewContainerElementResult;
+}
+
+Result<EditorDOMPoint, nsresult> HTMLEditor::RemoveContainerWithTransaction(
+    Element& aElement) {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+
+  if (NS_WARN_IF(!HTMLEditUtils::IsRemovableNode(aElement)) ||
+      NS_WARN_IF(!HTMLEditUtils::IsSimplyEditableNode(aElement))) {
+    return Err(NS_ERROR_FAILURE);
+  }
+
+  AutoRemoveContainerSelNotify selNotify(RangeUpdaterRef(),
+                                         EditorRawDOMPoint(&aElement));
+  const nsCOMPtr<nsINode> parentNode = aElement.GetParentNode();
+  const nsCOMPtr<nsIContent> nextSibling = aElement.GetNextSibling();
+  EditorDOMPoint pointToPutCaret;
+  if (aElement.HasChildren()) {
+    const OwningNonNull<nsIContent> firstChild = *aElement.GetFirstChild();
+    const OwningNonNull<nsIContent> lastChild = *aElement.GetLastChild();
+    Result<MoveNodeResult, nsresult> moveChildrenResultOrError =
+        MoveSiblingsWithTransaction(firstChild, lastChild,
+                                    nextSibling
+                                        ? EditorDOMPoint(nextSibling)
+                                        : EditorDOMPoint::AtEndOf(*parentNode));
+    if (MOZ_UNLIKELY(moveChildrenResultOrError.isErr())) {
+      NS_WARNING("HTMLEditor::MoveSiblingsWithTransaction() failed");
+      return moveChildrenResultOrError.propagateErr();
+    }
+    pointToPutCaret = moveChildrenResultOrError.unwrap().UnwrapCaretPoint();
+  }
+  {
+    AutoTrackDOMPoint trackPointToPutCaret(RangeUpdaterRef(), &pointToPutCaret);
+    nsresult rv = DeleteNodeWithTransaction(aElement);
+    if (NS_FAILED(rv)) {
+      NS_WARNING("EditorBase::DeleteNodeWithTransaction() failed");
+      return Err(rv);
+    }
+    if (NS_WARN_IF(nextSibling && nextSibling->GetParentNode() != parentNode)) {
+      return Err(NS_ERROR_EDITOR_DESTROYED);
+    }
+  }
+  if (pointToPutCaret.IsSetAndValidInComposedDoc()) {
+    return pointToPutCaret;
+  }
+  return nextSibling && nextSibling->GetParentNode() == parentNode
+             ? EditorDOMPoint(nextSibling)
+             : EditorDOMPoint::AtEndOf(*parentNode);
+}
+
+nsresult HTMLEditor::SelectEntireDocument() {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+
+  if (!mInitSucceeded) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  RefPtr<Element> bodyOrDocumentElement = GetRoot();
+  if (NS_WARN_IF(!bodyOrDocumentElement)) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  if (IsEmpty()) {
+    nsresult rv = CollapseSelectionToStartOf(*bodyOrDocumentElement);
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                         "EditorBase::CollapseSelectionToStartOf() failed");
+    return rv;
+  }
+
+  ErrorResult error;
+  SelectionRef().SelectAllChildren(*bodyOrDocumentElement, error);
+  if (NS_WARN_IF(Destroyed())) {
+    error.SuppressException();
+    return NS_ERROR_EDITOR_DESTROYED;
+  }
+  NS_WARNING_ASSERTION(!error.Failed(),
+                       "Selection::SelectAllChildren() failed");
+  return error.StealNSResult();
+}
+
+nsresult HTMLEditor::SelectAllInternal() {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+
+  CommitComposition();
+  const RefPtr<Document> doc = GetDocument();
+  if (NS_WARN_IF(!doc)) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  auto GetBodyElementIfElementIsParentOfHTMLBody =
+      [](const Element& aElement) -> Element* {
+    if (!aElement.OwnerDoc()->IsHTMLDocument()) {
+      return const_cast<Element*>(&aElement);
+    }
+    HTMLBodyElement* bodyElement = aElement.OwnerDoc()->GetBodyElement();
+    return bodyElement && nsContentUtils::ContentIsFlattenedTreeDescendantOf(
+                              bodyElement, &aElement)
+               ? bodyElement
+               : const_cast<Element*>(&aElement);
+  };
+
+  const nsCOMPtr<nsIContent> selectionRootContent =
+      [&]() MOZ_CAN_RUN_SCRIPT -> nsIContent* {
+    const RefPtr<Element> elementForComputingSelectionRoot = [&]() -> Element* {
+      if (SelectionRef().RangeCount()) {
+        if (nsIContent* content =
+                nsIContent::FromNodeOrNull(SelectionRef().GetAnchorNode())) {
+          if (content->IsElement()) {
+            return content->AsElement();
+          }
+          if (Element* parentElement =
+                  content->GetParentElementCrossingShadowRoot()) {
+            return parentElement;
+          }
+        }
+      }
+      if (Element* focusedElement = GetFocusedElement()) {
+        return focusedElement;
+      }
+      if (Element* const bodyElement = GetBodyElement()) {
+        return bodyElement;
+      }
+      return doc->GetDocumentElement();
+    }();
+    if (MOZ_UNLIKELY(!elementForComputingSelectionRoot)) {
+      return nullptr;
+    }
+
+    RefPtr<PresShell> presShell = GetPresShell();
+    nsIContent* computedSelectionRootContent =
+        elementForComputingSelectionRoot->GetSelectionRootContent(
+            presShell, nsINode::IgnoreOwnIndependentSelection::Yes,
+            nsINode::AllowCrossShadowBoundary::No);
+    if (NS_WARN_IF(!computedSelectionRootContent)) {
+      return nullptr;
+    }
+    if (MOZ_UNLIKELY(!computedSelectionRootContent->IsElement())) {
+      return computedSelectionRootContent;
+    }
+    if (ShadowRoot* const shadowRoot =
+            computedSelectionRootContent->GetShadowRootForSelection()) {
+      return shadowRoot;
+    }
+    return GetBodyElementIfElementIsParentOfHTMLBody(
+        *computedSelectionRootContent->AsElement());
+  }();
+  if (MOZ_UNLIKELY(!selectionRootContent)) {
+    return NS_OK;
+  }
+
+  Maybe<Selection::AutoUserInitiated> userSelection;
+  if (!selectionRootContent->IsEditable()) {
+    userSelection.emplace(SelectionRef());
+  }
+  ErrorResult error;
+  SelectionRef().SelectAllChildren(*selectionRootContent, error);
+  NS_WARNING_ASSERTION(!error.Failed(),
+                       "Selection::SelectAllChildren() failed");
+  return error.StealNSResult();
+}
+
+bool HTMLEditor::SetCaretInTableCell(Element* aElement) {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+
+  if (!aElement || !aElement->IsHTMLElement() ||
+      !HTMLEditUtils::IsAnyTableElementExceptColumnElement(*aElement)) {
+    return false;
+  }
+  const RefPtr<Element> editingHost = ComputeEditingHost();
+  if (!editingHost || !aElement->IsInclusiveDescendantOf(editingHost)) {
+    return false;
+  }
+
+  nsCOMPtr<nsIContent> deepestFirstChild = aElement;
+  while (deepestFirstChild->HasChildren()) {
+    deepestFirstChild = deepestFirstChild->GetFirstChild();
+  }
+
+  nsresult rv = CollapseSelectionToStartOf(*deepestFirstChild);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "EditorBase::CollapseSelectionToStartOf() failed");
+  return NS_SUCCEEDED(rv);
+}
+
+nsresult HTMLEditor::CollapseAdjacentTextNodes(nsRange& aRange) {
+  AutoTransactionsConserveSelection dontChangeMySelection(*this);
+
+  DOMSubtreeIterator subtreeIter;
+  if (NS_FAILED(subtreeIter.Init(aRange))) {
+    NS_WARNING("DOMSubtreeIterator::Init() failed");
+    return NS_ERROR_FAILURE;
+  }
+  AutoTArray<OwningNonNull<Text>, 8> textNodes;
+  subtreeIter.AppendNodesToArray(
+      +[](nsINode& aNode, void*) -> bool {
+        return EditorUtils::IsEditableContent(*aNode.AsText(),
+                                              EditorType::HTML);
+      },
+      textNodes);
+
+  if (textNodes.Length() < 2) {
+    return NS_OK;
+  }
+
+  OwningNonNull<Text> leftTextNode = textNodes[0];
+  for (size_t rightTextNodeIndex = 1; rightTextNodeIndex < textNodes.Length();
+       rightTextNodeIndex++) {
+    OwningNonNull<Text>& rightTextNode = textNodes[rightTextNodeIndex];
+    if (HTMLEditUtils::TextHasOnlyOnePreformattedLinefeed(leftTextNode)) {
+      leftTextNode = rightTextNode;
+      continue;
+    }
+    if (HTMLEditUtils::TextHasOnlyOnePreformattedLinefeed(rightTextNode)) {
+      if (++rightTextNodeIndex == textNodes.Length()) {
+        break;
+      }
+      leftTextNode = textNodes[rightTextNodeIndex];
+      continue;
+    }
+    if (leftTextNode->GetNextSibling() != rightTextNode) {
+      leftTextNode = rightTextNode;
+      continue;
+    }
+    Result<JoinNodesResult, nsresult> joinNodesResultOrError =
+        JoinTextNodesWithNormalizeWhiteSpaces(MOZ_KnownLive(leftTextNode),
+                                              MOZ_KnownLive(rightTextNode));
+    if (MOZ_UNLIKELY(joinNodesResultOrError.isErr())) {
+      NS_WARNING("HTMLEditor::JoinTextNodesWithNormalizeWhiteSpaces() failed");
+      return joinNodesResultOrError.unwrapErr();
+    }
+  }
+
+  return NS_OK;
+}
+
+nsresult HTMLEditor::SetSelectionAtDocumentStart() {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+
+  RefPtr<Element> rootElement = GetRoot();
+  if (NS_WARN_IF(!rootElement)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsresult rv = CollapseSelectionToStartOf(*rootElement);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "EditorBase::CollapseSelectionToStartOf() failed");
+  return rv;
+}
+
+Result<EditorDOMPoint, nsresult>
+HTMLEditor::RemoveBlockContainerWithTransaction(Element& aElement) {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+
+
+  const RefPtr<Element> parentElement = aElement.GetParentElement();
+  if (NS_WARN_IF((!parentElement))) {
+    return Err(NS_ERROR_FAILURE);
+  }
+  EditorDOMPoint pointToPutCaret;
+  if (HTMLEditUtils::CanNodeContain(*parentElement, *nsGkAtoms::br)) {
+    if (const nsCOMPtr<nsIContent> child = HTMLEditUtils::GetFirstChild(
+            aElement, {LeafNodeOption::IgnoreNonEditableNode},
+            BlockInlineCheck::UseComputedDisplayOutsideStyle)) {
+
+      if (nsIContent* const previousSibling = HTMLEditUtils::GetPreviousSibling(
+              aElement, {LeafNodeOption::IgnoreNonEditableNode},
+              BlockInlineCheck::UseComputedDisplayOutsideStyle)) {
+        if (!HTMLEditUtils::IsBlockElement(
+                *previousSibling,
+                BlockInlineCheck::UseComputedDisplayOutsideStyle) &&
+            !previousSibling->IsHTMLElement(nsGkAtoms::br) &&
+            !HTMLEditUtils::IsBlockElement(
+                *child, BlockInlineCheck::UseComputedDisplayOutsideStyle)) {
+          Result<CreateLineBreakResult, nsresult> insertBRElementResultOrError =
+              InsertLineBreak(WithTransaction::Yes, LineBreakType::BRElement,
+                              EditorDOMPoint(&aElement));
+          if (MOZ_UNLIKELY(insertBRElementResultOrError.isErr())) {
+            NS_WARNING(
+                "HTMLEditor::InsertLineBreak(WithTransaction::Yes, "
+                "LineBreakType::BRElement) failed");
+            return insertBRElementResultOrError.propagateErr();
+          }
+          CreateLineBreakResult insertBRElementResult =
+              insertBRElementResultOrError.unwrap();
+          MOZ_ASSERT(insertBRElementResult.Handled());
+          insertBRElementResult.IgnoreCaretPointSuggestion();
+          pointToPutCaret = EditorDOMPoint(&aElement, 0);
+        }
+      }
+
+
+      if (nsIContent* const nextSibling = HTMLEditUtils::GetNextSibling(
+              aElement, {LeafNodeOption::IgnoreNonEditableNode},
+              BlockInlineCheck::UseComputedDisplayOutsideStyle)) {
+        if (nextSibling &&
+            !HTMLEditUtils::IsBlockElement(
+                *nextSibling, BlockInlineCheck::UseComputedDisplayStyle)) {
+          if (nsIContent* const lastChild = HTMLEditUtils::GetLastChild(
+                  aElement, {LeafNodeOption::IgnoreNonEditableNode},
+                  BlockInlineCheck::UseComputedDisplayOutsideStyle)) {
+            if (!HTMLEditUtils::IsBlockElement(
+                    *lastChild, BlockInlineCheck::UseComputedDisplayStyle) &&
+                !lastChild->IsHTMLElement(nsGkAtoms::br)) {
+              Result<CreateLineBreakResult, nsresult>
+                  insertBRElementResultOrError = InsertLineBreak(
+                      WithTransaction::Yes, LineBreakType::BRElement,
+                      EditorDOMPoint::After(aElement));
+              if (MOZ_UNLIKELY(insertBRElementResultOrError.isErr())) {
+                NS_WARNING(
+                    "HTMLEditor::InsertLineBreak(WithTransaction::Yes, "
+                    "LineBreakType::BRElement) failed");
+                return insertBRElementResultOrError.propagateErr();
+              }
+              CreateLineBreakResult insertBRElementResult =
+                  insertBRElementResultOrError.unwrap();
+              MOZ_ASSERT(insertBRElementResult.Handled());
+              insertBRElementResult.IgnoreCaretPointSuggestion();
+              pointToPutCaret = EditorDOMPoint::AtEndOf(aElement);
+            }
+          }
+        }
+      }
+    } else if (nsIContent* const previousSibling =
+                   HTMLEditUtils::GetPreviousSibling(
+                       aElement, {LeafNodeOption::IgnoreNonEditableNode},
+                       BlockInlineCheck::UseComputedDisplayOutsideStyle)) {
+      if (!HTMLEditUtils::IsBlockElement(
+              *previousSibling, BlockInlineCheck::UseComputedDisplayStyle) &&
+          !previousSibling->IsHTMLElement(nsGkAtoms::br)) {
+        if (nsIContent* nextSibling = HTMLEditUtils::GetNextSibling(
+                aElement, {LeafNodeOption::IgnoreNonEditableNode},
+                BlockInlineCheck::UseComputedDisplayOutsideStyle)) {
+          if (!HTMLEditUtils::IsBlockElement(
+                  *nextSibling, BlockInlineCheck::UseComputedDisplayStyle) &&
+              !nextSibling->IsHTMLElement(nsGkAtoms::br)) {
+            Result<CreateLineBreakResult, nsresult>
+                insertBRElementResultOrError = InsertLineBreak(
+                    WithTransaction::Yes, LineBreakType::BRElement,
+                    EditorDOMPoint(&aElement));
+            if (MOZ_UNLIKELY(insertBRElementResultOrError.isErr())) {
+              NS_WARNING(
+                  "HTMLEditor::InsertLineBreak(WithTransaction::Yes, "
+                  "LineBreakType::BRElement) failed");
+              return insertBRElementResultOrError.propagateErr();
+            }
+            CreateLineBreakResult insertBRElementResult =
+                insertBRElementResultOrError.unwrap();
+            MOZ_ASSERT(insertBRElementResult.Handled());
+            insertBRElementResult.IgnoreCaretPointSuggestion();
+            pointToPutCaret = EditorDOMPoint(&aElement, 0);
+          }
+        }
+      }
+    }
+  }
+
+  AutoTrackDOMPoint trackPointToPutCaret(RangeUpdaterRef(), &pointToPutCaret);
+  Result<EditorDOMPoint, nsresult> unwrapBlockElementResult =
+      RemoveContainerWithTransaction(aElement);
+  if (MOZ_UNLIKELY(unwrapBlockElementResult.isErr())) {
+    NS_WARNING("HTMLEditor::RemoveContainerWithTransaction() failed");
+    return unwrapBlockElementResult;
+  }
+  trackPointToPutCaret.Flush(StopTracking::Yes);
+  if (AllowsTransactionsToChangeSelection() &&
+      unwrapBlockElementResult.inspect().IsSet()) {
+    pointToPutCaret = unwrapBlockElementResult.unwrap();
+  }
+  return pointToPutCaret;  
+}
+
+Result<SplitNodeResult, nsresult> HTMLEditor::SplitNodeWithTransaction(
+    const EditorDOMPoint& aStartOfRightNode) {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+
+  if (NS_WARN_IF(!aStartOfRightNode.IsInContentNode())) {
+    return Err(NS_ERROR_INVALID_ARG);
+  }
+  MOZ_ASSERT(aStartOfRightNode.IsSetAndValid());
+
+  if (NS_WARN_IF(!HTMLEditUtils::IsSplittableNode(
+          *aStartOfRightNode.ContainerAs<nsIContent>()))) {
+    return Err(NS_ERROR_EDITOR_UNEXPECTED_DOM_TREE);
+  }
+
+  IgnoredErrorResult ignoredError;
+  AutoEditSubActionNotifier startToHandleEditSubAction(
+      *this, EditSubAction::eSplitNode, nsIEditor::eNext, ignoredError);
+  if (NS_WARN_IF(ignoredError.ErrorCodeIs(NS_ERROR_EDITOR_DESTROYED))) {
+    return Err(NS_ERROR_EDITOR_DESTROYED);
+  }
+  NS_WARNING_ASSERTION(
+      !ignoredError.Failed(),
+      "OnStartToHandleTopLevelEditSubAction() failed, but ignored");
+
+  RefPtr<SplitNodeTransaction> transaction =
+      SplitNodeTransaction::Create(*this, aStartOfRightNode);
+  nsresult rv = DoTransactionInternal(transaction);
+  if (NS_WARN_IF(Destroyed())) {
+    NS_WARNING(
+        "EditorBase::DoTransactionInternal() caused destroying the editor");
+    return Err(NS_ERROR_EDITOR_DESTROYED);
+  }
+  if (NS_FAILED(rv)) {
+    NS_WARNING("EditorBase::DoTransactionInternal() failed");
+    return Err(rv);
+  }
+
+  nsIContent* newContent = transaction->GetNewContent();
+  nsIContent* splitContent = transaction->GetSplitContent();
+  if (NS_WARN_IF(!newContent) || NS_WARN_IF(!splitContent)) {
+    return Err(NS_ERROR_FAILURE);
+  }
+  TopLevelEditSubActionDataRef().DidSplitContent(*this, *splitContent,
+                                                 *newContent);
+  if (NS_WARN_IF(!newContent->IsInComposedDoc()) ||
+      NS_WARN_IF(!splitContent->IsInComposedDoc())) {
+    return Err(NS_ERROR_EDITOR_UNEXPECTED_DOM_TREE);
+  }
+
+  return SplitNodeResult(*newContent, *splitContent);
+}
+
+Result<SplitNodeResult, nsresult> HTMLEditor::SplitNodeDeepWithTransaction(
+    nsIContent& aMostAncestorToSplit,
+    const EditorDOMPoint& aDeepestStartOfRightNode,
+    SplitAtEdges aSplitAtEdges) {
+  MOZ_ASSERT(aDeepestStartOfRightNode.IsSetAndValidInComposedDoc());
+  MOZ_ASSERT(
+      aDeepestStartOfRightNode.GetContainer() == &aMostAncestorToSplit ||
+      EditorUtils::IsDescendantOf(*aDeepestStartOfRightNode.GetContainer(),
+                                  aMostAncestorToSplit));
+
+  if (NS_WARN_IF(!aDeepestStartOfRightNode.IsInComposedDoc())) {
+    return Err(NS_ERROR_INVALID_ARG);
+  }
+
+  nsCOMPtr<nsIContent> newLeftNodeOfMostAncestor;
+  EditorDOMPoint atStartOfRightNode(aDeepestStartOfRightNode);
+  SplitNodeResult lastResult = SplitNodeResult::NotHandled(atStartOfRightNode);
+  MOZ_ASSERT(lastResult.AtSplitPoint<EditorRawDOMPoint>()
+                 .IsSetAndValidInComposedDoc());
+
+  while (true) {
+    auto* splittingContent = atStartOfRightNode.GetContainerAs<nsIContent>();
+    if (NS_WARN_IF(!splittingContent)) {
+      lastResult.IgnoreCaretPointSuggestion();
+      return Err(NS_ERROR_FAILURE);
+    }
+    if (NS_WARN_IF(splittingContent != &aMostAncestorToSplit &&
+                   !atStartOfRightNode.GetContainerParentAs<nsIContent>())) {
+      lastResult.IgnoreCaretPointSuggestion();
+      return Err(NS_ERROR_FAILURE);
+    }
+    if (!HTMLEditUtils::IsSplittableNode(*splittingContent)) {
+      if (splittingContent == &aMostAncestorToSplit) {
+        return lastResult;
+      }
+      atStartOfRightNode.Set(splittingContent);
+      continue;
+    }
+
+    if ((aSplitAtEdges == SplitAtEdges::eAllowToCreateEmptyContainer &&
+         !atStartOfRightNode.IsInTextNode()) ||
+        (!atStartOfRightNode.IsStartOfContainer() &&
+         !atStartOfRightNode.IsEndOfContainer())) {
+      Result<SplitNodeResult, nsresult> splitNodeResult =
+          SplitNodeWithTransaction(atStartOfRightNode);
+      if (MOZ_UNLIKELY(splitNodeResult.isErr())) {
+        lastResult.IgnoreCaretPointSuggestion();
+        return splitNodeResult;
+      }
+      lastResult = SplitNodeResult::MergeWithDeeperSplitNodeResult(
+          splitNodeResult.unwrap(), lastResult);
+      if (NS_WARN_IF(!lastResult.AtSplitPoint<EditorRawDOMPoint>()
+                          .IsInComposedDoc())) {
+        return Err(NS_ERROR_EDITOR_UNEXPECTED_DOM_TREE);
+      }
+      MOZ_ASSERT(lastResult.HasCaretPointSuggestion());
+      MOZ_ASSERT(lastResult.GetOriginalContent() == splittingContent);
+      if (splittingContent == &aMostAncestorToSplit) {
+        return lastResult;
+      }
+
+      atStartOfRightNode = lastResult.AtNextContent<EditorDOMPoint>();
+    }
+    else if (!atStartOfRightNode.IsStartOfContainer()) {
+      lastResult = SplitNodeResult::HandledButDidNotSplitDueToEndOfContainer(
+          *splittingContent, &lastResult);
+      MOZ_ASSERT(lastResult.AtSplitPoint<EditorRawDOMPoint>()
+                     .IsSetAndValidInComposedDoc());
+      if (splittingContent == &aMostAncestorToSplit) {
+        return lastResult;
+      }
+
+      atStartOfRightNode.SetAfter(splittingContent);
+    }
+    else {
+      if (splittingContent == &aMostAncestorToSplit) {
+        return SplitNodeResult::HandledButDidNotSplitDueToStartOfContainer(
+            *splittingContent, &lastResult);
+      }
+
+      lastResult = SplitNodeResult::NotHandled(atStartOfRightNode, &lastResult);
+      MOZ_ASSERT(lastResult.AtSplitPoint<EditorRawDOMPoint>()
+                     .IsSetAndValidInComposedDoc());
+      atStartOfRightNode.Set(splittingContent);
+      MOZ_ASSERT(atStartOfRightNode.IsSetAndValidInComposedDoc());
+    }
+  }
+
+}
+
+Result<SplitNodeResult, nsresult> HTMLEditor::DoSplitNode(
+    const EditorDOMPoint& aStartOfRightNode, nsIContent& aNewNode) {
+  (void)aStartOfRightNode.Offset();
+
+  if (NS_WARN_IF(!aStartOfRightNode.IsInContentNode())) {
+    return Err(NS_ERROR_INVALID_ARG);
+  }
+  MOZ_DIAGNOSTIC_ASSERT(aStartOfRightNode.IsSetAndValid());
+
+  AutoTArray<SavedRange, 10> savedRanges;
+  for (SelectionType selectionType : kPresentSelectionTypes) {
+    SavedRange savingRange;
+    savingRange.mSelection = GetSelection(selectionType);
+    if (NS_WARN_IF(!savingRange.mSelection &&
+                   selectionType == SelectionType::eNormal)) {
+      return Err(NS_ERROR_FAILURE);
+    }
+    if (!savingRange.mSelection) {
+      continue;
+    }
+
+    for (uint32_t j : IntegerRange(savingRange.mSelection->RangeCount())) {
+      const nsRange* r = savingRange.mSelection->GetRangeAt(j);
+      MOZ_ASSERT(r);
+      MOZ_ASSERT(r->IsPositioned());
+      savingRange.mStartContainer = r->GetStartContainer();
+      savingRange.mStartOffset = r->StartOffset();
+      savingRange.mEndContainer = r->GetEndContainer();
+      savingRange.mEndOffset = r->EndOffset();
+
+      savedRanges.AppendElement(savingRange);
+    }
+  }
+
+  const nsCOMPtr<nsINode> containerParentNode =
+      aStartOfRightNode.GetContainerParent();
+  if (NS_WARN_IF(!containerParentNode)) {
+    return Err(NS_ERROR_FAILURE);
+  }
+
+
+  MOZ_DIAGNOSTIC_ASSERT_IF(aStartOfRightNode.IsInTextNode(), aNewNode.IsText());
+  MOZ_DIAGNOSTIC_ASSERT_IF(!aStartOfRightNode.IsInTextNode(),
+                           !aNewNode.IsText());
+  const nsCOMPtr<nsIContent> firstChildOfRightNode =
+      aStartOfRightNode.GetChild();
+  nsresult rv = [&]() MOZ_NEVER_INLINE_DEBUG MOZ_CAN_RUN_SCRIPT {
+    if (aStartOfRightNode.IsEndOfContainer()) {
+      return NS_OK;  
+    }
+    if (aStartOfRightNode.IsInTextNode()) {
+      Text* originalTextNode = aStartOfRightNode.ContainerAs<Text>();
+      Text* newTextNode = aNewNode.AsText();
+      nsAutoString movingText;
+      const uint32_t cutStartOffset = aStartOfRightNode.Offset();
+      const uint32_t cutLength =
+          originalTextNode->Length() - aStartOfRightNode.Offset();
+      IgnoredErrorResult error;
+      originalTextNode->SubstringData(cutStartOffset, cutLength, movingText,
+                                      error);
+      NS_WARNING_ASSERTION(!error.Failed(),
+                           "Text::SubstringData() failed, but ignored");
+      error.SuppressException();
+
+      DoDeleteText(MOZ_KnownLive(*originalTextNode), cutStartOffset, cutLength,
+                   error);
+      NS_WARNING_ASSERTION(!error.Failed(),
+                           "EditorBase::DoDeleteText() failed, but ignored");
+      error.SuppressException();
+
+      DoSetText(MOZ_KnownLive(*newTextNode), movingText, error);
+      NS_WARNING_ASSERTION(!error.Failed(),
+                           "EditorBase::DoSetText() failed, but ignored");
+      return NS_OK;
+    }
+
+    if (!firstChildOfRightNode->GetPreviousSibling()) {
+      nsresult rv = MoveAllChildren(
+          MOZ_KnownLive(*aStartOfRightNode.GetContainer()),
+          EditorRawDOMPoint(&aNewNode, 0u));
+      NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                           "HTMLEditor::MoveAllChildren() failed");
+      return rv;
+    }
+
+    nsresult rv = MoveInclusiveNextSiblings(*firstChildOfRightNode,
+                                            EditorRawDOMPoint(&aNewNode, 0u));
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                         "HTMLEditor::MoveInclusiveNextSiblings() failed");
+    return rv;
+  }();
+
+  if (NS_WARN_IF(!aStartOfRightNode.GetContainerParent())) {
+    return NS_WARN_IF(Destroyed()) ? Err(NS_ERROR_EDITOR_DESTROYED)
+                                   : Err(NS_ERROR_FAILURE);
+  }
+
+  {
+    const nsCOMPtr<nsIContent> nextSibling =
+        aStartOfRightNode.GetContainer()->GetNextSibling();
+    AutoNodeAPIWrapper nodeWrapper(*this, *containerParentNode);
+    nsresult rv = nodeWrapper.InsertBefore(aNewNode, nextSibling);
+    if (NS_FAILED(rv)) {
+      NS_WARNING("AutoNodeAPIWrapper::InsertBefore() failed");
+      return Err(rv);
+    }
+    NS_WARNING_ASSERTION(
+        nodeWrapper.IsExpectedResult(),
+        "Inserting new node caused other mutations, but ignored");
+  }
+  if (NS_FAILED(rv)) {
+    NS_WARNING("Moving children from left node to right node failed");
+    return Err(rv);
+  }
+
+  if (RefPtr<PresShell> presShell = GetPresShell()) {
+    presShell->FlushPendingNotifications(FlushType::Frames);
+  }
+  NS_WARNING_ASSERTION(!Destroyed(),
+                       "The editor is destroyed during splitting a node");
+
+  const bool allowedTransactionsToChangeSelection =
+      AllowsTransactionsToChangeSelection();
+
+  IgnoredErrorResult error;
+  RefPtr<Selection> previousSelection;
+  for (SavedRange& savedRange : savedRanges) {
+    if (savedRange.mSelection != previousSelection) {
+      MOZ_KnownLive(savedRange.mSelection)->RemoveAllRanges(error);
+      if (MOZ_UNLIKELY(error.Failed())) {
+        NS_WARNING("Selection::RemoveAllRanges() failed");
+        return Err(error.StealNSResult());
+      }
+      previousSelection = savedRange.mSelection;
+    }
+
+    if (allowedTransactionsToChangeSelection &&
+        savedRange.mSelection->Type() == SelectionType::eNormal) {
+      continue;
+    }
+
+    auto AdjustDOMPoint = [&](nsCOMPtr<nsINode>& aContainer,
+                              uint32_t& aOffset) {
+      if (aContainer != aStartOfRightNode.GetContainer()) {
+        return;
+      }
+
+      if (aOffset >= aStartOfRightNode.Offset()) {
+        aContainer = &aNewNode;
+        aOffset -= aStartOfRightNode.Offset();
+      }
+    };
+    AdjustDOMPoint(savedRange.mStartContainer, savedRange.mStartOffset);
+    AdjustDOMPoint(savedRange.mEndContainer, savedRange.mEndOffset);
+
+    RefPtr<nsRange> newRange =
+        nsRange::Create(savedRange.mStartContainer, savedRange.mStartOffset,
+                        savedRange.mEndContainer, savedRange.mEndOffset, error);
+    if (MOZ_UNLIKELY(error.Failed())) {
+      NS_WARNING("nsRange::Create() failed");
+      return Err(error.StealNSResult());
+    }
+    MOZ_KnownLive(savedRange.mSelection)
+        ->AddRangeAndSelectFramesAndNotifyListeners(*newRange, error);
+    if (MOZ_UNLIKELY(error.Failed())) {
+      NS_WARNING(
+          "Selection::AddRangeAndSelectFramesAndNotifyListeners() failed");
+      return Err(error.StealNSResult());
+    }
+  }
+
+
+  if (NS_WARN_IF(containerParentNode !=
+                 aStartOfRightNode.GetContainer()->GetParentNode()) ||
+      NS_WARN_IF(containerParentNode != aNewNode.GetParentNode()) ||
+      NS_WARN_IF(aNewNode.GetPreviousSibling() !=
+                 aStartOfRightNode.GetContainer())) {
+    return Err(NS_ERROR_EDITOR_UNEXPECTED_DOM_TREE);
+  }
+
+  DebugOnly<nsresult> rvIgnored = RangeUpdaterRef().SelAdjSplitNode(
+      *aStartOfRightNode.ContainerAs<nsIContent>(), aStartOfRightNode.Offset(),
+      aNewNode);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rvIgnored),
+                       "RangeUpdater::SelAdjSplitNode() failed, but ignored");
+
+  return SplitNodeResult(aNewNode,
+                         *aStartOfRightNode.ContainerAs<nsIContent>());
+}
+
+Result<JoinNodesResult, nsresult> HTMLEditor::JoinNodesWithTransaction(
+    nsIContent& aLeftContent, nsIContent& aRightContent) {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+  MOZ_ASSERT(&aLeftContent != &aRightContent);
+  MOZ_ASSERT(aLeftContent.GetParentNode());
+  MOZ_ASSERT(aRightContent.GetParentNode());
+  MOZ_ASSERT(aLeftContent.GetParentNode() == aRightContent.GetParentNode());
+
+  IgnoredErrorResult ignoredError;
+  AutoEditSubActionNotifier startToHandleEditSubAction(
+      *this, EditSubAction::eJoinNodes, nsIEditor::ePrevious, ignoredError);
+  if (NS_WARN_IF(ignoredError.ErrorCodeIs(NS_ERROR_EDITOR_DESTROYED))) {
+    return Err(ignoredError.StealNSResult());
+  }
+  NS_WARNING_ASSERTION(
+      !ignoredError.Failed(),
+      "HTMLEditor::OnStartToHandleTopLevelEditSubAction() failed, but ignored");
+
+  if (NS_WARN_IF(!aRightContent.GetParentNode())) {
+    return Err(NS_ERROR_FAILURE);
+  }
+
+  RefPtr<JoinNodesTransaction> transaction =
+      JoinNodesTransaction::MaybeCreate(*this, aLeftContent, aRightContent);
+  if (MOZ_UNLIKELY(!transaction)) {
+    NS_WARNING("JoinNodesTransaction::MaybeCreate() failed");
+    return Err(NS_ERROR_FAILURE);
+  }
+
+  const nsresult rv = DoTransactionInternal(transaction);
+  if (NS_WARN_IF(Destroyed())) {
+    return Err(NS_ERROR_EDITOR_DESTROYED);
+  }
+
+  if (NS_WARN_IF(!transaction->GetRemovedContent()) ||
+      NS_WARN_IF(!transaction->GetExistingContent())) {
+    return Err(NS_ERROR_UNEXPECTED);
+  }
+
+  if (NS_WARN_IF(transaction->GetExistingContent()->GetParent() !=
+                 transaction->GetParentNode())) {
+    return Err(NS_ERROR_EDITOR_UNEXPECTED_DOM_TREE);
+  }
+
+  if (NS_FAILED(rv)) {
+    NS_WARNING("EditorBase::DoTransactionInternal() failed");
+    return Err(rv);
+  }
+
+  return JoinNodesResult(transaction->CreateJoinedPoint<EditorDOMPoint>(),
+                         *transaction->GetRemovedContent());
+}
+
+void HTMLEditor::DidJoinNodesTransaction(
+    const JoinNodesTransaction& aTransaction, nsresult aDoJoinNodesResult) {
+  if (MOZ_UNLIKELY(NS_WARN_IF(!aTransaction.GetRemovedContent()) ||
+                   NS_WARN_IF(!aTransaction.GetExistingContent()))) {
+    return;
+  }
+
+  if (MOZ_UNLIKELY(aTransaction.GetExistingContent()->GetParentNode() !=
+                   aTransaction.GetParentNode())) {
+    return;
+  }
+
+  TopLevelEditSubActionDataRef().DidJoinContents(
+      *this, aTransaction.CreateJoinedPoint<EditorRawDOMPoint>());
+
+  if (!mActionListeners.IsEmpty()) {
+    for (auto& listener : mActionListeners.Clone()) {
+      DebugOnly<nsresult> rvIgnored = listener->DidJoinContents(
+          aTransaction.CreateJoinedPoint<EditorRawDOMPoint>(),
+          aTransaction.GetRemovedContent());
+      NS_WARNING_ASSERTION(
+          NS_SUCCEEDED(rvIgnored),
+          "nsIEditActionListener::DidJoinContents() failed, but ignored");
+    }
+  }
+}
+
+nsresult HTMLEditor::DoJoinNodes(nsIContent& aContentToKeep,
+                                 nsIContent& aContentToRemove) {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+
+  const uint32_t keepingContentLength = aContentToKeep.Length();
+  const EditorDOMPoint oldPointAtRightContent(&aContentToRemove);
+  if (MOZ_LIKELY(oldPointAtRightContent.IsSet())) {
+    (void)oldPointAtRightContent.Offset();  
+  }
+
+  AutoTArray<SavedRange, 10> savedRanges;
+  {
+    EditorRawDOMPoint atRemovingNode(&aContentToRemove);
+    EditorRawDOMPoint atNodeToKeep(&aContentToKeep);
+    for (SelectionType selectionType : kPresentSelectionTypes) {
+      SavedRange savingRange;
+      savingRange.mSelection = GetSelection(selectionType);
+      if (selectionType == SelectionType::eNormal) {
+        if (NS_WARN_IF(!savingRange.mSelection)) {
+          return NS_ERROR_FAILURE;
+        }
+      } else if (!savingRange.mSelection) {
+        continue;
+      }
+
+      const uint32_t rangeCount = savingRange.mSelection->RangeCount();
+      for (const uint32_t j : IntegerRange(rangeCount)) {
+        MOZ_ASSERT(savingRange.mSelection->RangeCount() == rangeCount);
+        const RefPtr<nsRange> r = savingRange.mSelection->GetRangeAt(j);
+        MOZ_ASSERT(r);
+        MOZ_ASSERT(r->IsPositioned());
+        savingRange.mStartContainer = r->GetStartContainer();
+        savingRange.mStartOffset = r->StartOffset();
+        savingRange.mEndContainer = r->GetEndContainer();
+        savingRange.mEndOffset = r->EndOffset();
+
+        if (savingRange.mStartContainer) {
+          MOZ_ASSERT(savingRange.mEndContainer);
+          auto AdjustDOMPoint = [&](nsCOMPtr<nsINode>& aContainer,
+                                    uint32_t& aOffset) {
+            if (aContainer == atRemovingNode.GetContainer() &&
+                atNodeToKeep.Offset() < aOffset &&
+                aOffset <= atRemovingNode.Offset()) {
+              aContainer = &aContentToKeep;
+              aOffset = keepingContentLength;
+            }
+          };
+          AdjustDOMPoint(savingRange.mStartContainer, savingRange.mStartOffset);
+          AdjustDOMPoint(savingRange.mEndContainer, savingRange.mEndOffset);
+        }
+
+        savedRanges.AppendElement(savingRange);
+      }
+    }
+  }
+
+  nsresult rv = [&]() MOZ_NEVER_INLINE_DEBUG MOZ_CAN_RUN_SCRIPT {
+    if (aContentToKeep.IsText() && aContentToRemove.IsText()) {
+      nsAutoString rightText;
+      aContentToRemove.AsText()->GetData(rightText);
+      {
+        AutoNodeAPIWrapper nodeWrapper(*this, aContentToRemove);
+        if (NS_FAILED(nodeWrapper.Remove())) {
+          NS_WARNING("AutoNodeAPIWrapper::Remove() failed, but ignored");
+        } else {
+          NS_WARNING_ASSERTION(
+              nodeWrapper.IsExpectedResult(),
+              "Deleting node caused other mutations, but ignored");
+        }
+      }
+      IgnoredErrorResult ignoredError;
+      DoInsertText(MOZ_KnownLive(*aContentToKeep.AsText()),
+                   aContentToKeep.AsText()->TextDataLength(), rightText,
+                   ignoredError);
+      if (NS_WARN_IF(Destroyed())) {
+        return NS_ERROR_EDITOR_DESTROYED;
+      }
+      NS_WARNING_ASSERTION(!ignoredError.Failed(),
+                           "EditorBase::DoSetText() failed, but ignored");
+      return NS_OK;
+    }
+    AutoTArray<OwningNonNull<nsIContent>, 64> arrayOfChildContents;
+    HTMLEditUtils::CollectAllChildren(aContentToRemove, arrayOfChildContents);
+    {
+      AutoNodeAPIWrapper nodeWrapper(*this, aContentToRemove);
+      if (NS_FAILED(nodeWrapper.Remove())) {
+        NS_WARNING("AutoNodeAPIWrapper::Remove() failed, but ignored");
+      } else {
+        NS_WARNING_ASSERTION(
+            nodeWrapper.IsExpectedResult(),
+            "Deleting node caused other mutations, but ignored");
+      }
+    }
+    nsresult rv = NS_OK;
+    for (const OwningNonNull<nsIContent>& child : arrayOfChildContents) {
+      AutoNodeAPIWrapper nodeWrapper(*this, aContentToKeep);
+      nsresult rvInner = nodeWrapper.AppendChild(MOZ_KnownLive(child));
+      if (NS_FAILED(rvInner)) {
+        NS_WARNING("AutoNodeAPIWrapper::AppendChild() failed");
+        rv = rvInner;
+      } else {
+        NS_WARNING_ASSERTION(
+            nodeWrapper.IsExpectedResult(),
+            "Appending child caused other mutations, but ignored");
+      }
+    }
+    if (NS_WARN_IF(Destroyed())) {
+      return NS_ERROR_EDITOR_DESTROYED;
+    }
+    return rv;
+  }();
+
+  if (MOZ_LIKELY(oldPointAtRightContent.IsSet())) {
+    DebugOnly<nsresult> rvIgnored = RangeUpdaterRef().SelAdjJoinNodes(
+        EditorRawDOMPoint(&aContentToKeep, std::min(keepingContentLength,
+                                                    aContentToKeep.Length())),
+        aContentToRemove, oldPointAtRightContent);
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rvIgnored),
+                         "RangeUpdater::SelAdjJoinNodes() failed, but ignored");
+  }
+  if (MOZ_UNLIKELY(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  const bool allowedTransactionsToChangeSelection =
+      AllowsTransactionsToChangeSelection();
+
+  RefPtr<Selection> previousSelection;
+  for (SavedRange& savedRange : savedRanges) {
+    if (savedRange.mSelection != previousSelection) {
+      IgnoredErrorResult error;
+      MOZ_KnownLive(savedRange.mSelection)->RemoveAllRanges(error);
+      if (NS_WARN_IF(Destroyed())) {
+        return NS_ERROR_EDITOR_DESTROYED;
+      }
+      if (error.Failed()) {
+        NS_WARNING("Selection::RemoveAllRanges() failed");
+        return error.StealNSResult();
+      }
+      previousSelection = savedRange.mSelection;
+    }
+
+    if (allowedTransactionsToChangeSelection &&
+        savedRange.mSelection->Type() == SelectionType::eNormal) {
+      continue;
+    }
+
+    auto AdjustDOMPoint = [&](nsCOMPtr<nsINode>& aContainer,
+                              uint32_t& aOffset) {
+      if (aContainer == &aContentToRemove) {
+        aContainer = &aContentToKeep;
+        aOffset += keepingContentLength;
+      }
+    };
+    AdjustDOMPoint(savedRange.mStartContainer, savedRange.mStartOffset);
+    AdjustDOMPoint(savedRange.mEndContainer, savedRange.mEndOffset);
+
+    const RefPtr<nsRange> newRange = nsRange::Create(
+        savedRange.mStartContainer, savedRange.mStartOffset,
+        savedRange.mEndContainer, savedRange.mEndOffset, IgnoreErrors());
+    if (!newRange) {
+      NS_WARNING("nsRange::Create() failed");
+      return NS_ERROR_FAILURE;
+    }
+
+    IgnoredErrorResult error;
+    MOZ_KnownLive(savedRange.mSelection)
+        ->AddRangeAndSelectFramesAndNotifyListeners(*newRange, error);
+    if (NS_WARN_IF(Destroyed())) {
+      return NS_ERROR_EDITOR_DESTROYED;
+    }
+    if (NS_WARN_IF(error.Failed())) {
+      return error.StealNSResult();
+    }
+  }
+
+  if (allowedTransactionsToChangeSelection) {
+    DebugOnly<nsresult> rvIgnored = CollapseSelectionToStartOf(aContentToKeep);
+    if (MOZ_UNLIKELY(rv == NS_ERROR_EDITOR_DESTROYED)) {
+      NS_WARNING(
+          "EditorBase::CollapseSelectionTo() caused destroying the editor");
+      return NS_ERROR_EDITOR_DESTROYED;
+    }
+    NS_WARNING_ASSERTION(
+        NS_SUCCEEDED(rv),
+        "EditorBases::CollapseSelectionTos() failed, but ignored");
+  }
+
+  return NS_OK;
+}
+
+Result<MoveNodeResult, nsresult> HTMLEditor::MoveNodeWithTransaction(
+    nsIContent& aContentToMove, const EditorDOMPoint& aPointToInsert) {
+  MOZ_ASSERT(aPointToInsert.IsSetAndValid());
+
+  EditorDOMPoint oldPoint(&aContentToMove);
+  if (NS_WARN_IF(!oldPoint.IsSet())) {
+    return Err(NS_ERROR_FAILURE);
+  }
+
+  if (aPointToInsert == oldPoint) {
+    return MoveNodeResult::IgnoredResult(aPointToInsert.NextPoint());
+  }
+
+  RefPtr<MoveNodeTransaction> moveNodeTransaction =
+      MoveNodeTransaction::MaybeCreate(*this, aContentToMove, aPointToInsert);
+  if (MOZ_UNLIKELY(!moveNodeTransaction)) {
+    NS_WARNING("MoveNodeTransaction::MaybeCreate() failed");
+    return Err(NS_ERROR_FAILURE);
+  }
+
+  IgnoredErrorResult ignoredError;
+  AutoEditSubActionNotifier startToHandleEditSubAction(
+      *this, EditSubAction::eMoveNode, nsIEditor::eNext, ignoredError);
+  if (NS_WARN_IF(ignoredError.ErrorCodeIs(NS_ERROR_EDITOR_DESTROYED))) {
+    return Err(ignoredError.StealNSResult());
+  }
+  NS_WARNING_ASSERTION(
+      !ignoredError.Failed(),
+      "TextEditor::OnStartToHandleTopLevelEditSubAction() failed, but ignored");
+
+  TopLevelEditSubActionDataRef().WillDeleteContent(*this, aContentToMove);
+
+  nsresult rv = DoTransactionInternal(moveNodeTransaction);
+  if (!mActionListeners.IsEmpty()) {
+    for (auto& listener : mActionListeners.Clone()) {
+      DebugOnly<nsresult> rvIgnored =
+          listener->DidDeleteNode(&aContentToMove, rv);
+      NS_WARNING_ASSERTION(
+          NS_SUCCEEDED(rvIgnored),
+          "nsIEditActionListener::DidDeleteNode() failed, but ignored");
+    }
+  }
+
+  if (MOZ_UNLIKELY(Destroyed())) {
+    NS_WARNING(
+        "MoveNodeTransaction::DoTransaction() caused destroying the editor");
+    return Err(NS_ERROR_EDITOR_DESTROYED);
+  }
+
+  if (NS_FAILED(rv)) {
+    NS_WARNING("MoveNodeTransaction::DoTransaction() failed");
+    return Err(rv);
+  }
+
+  TopLevelEditSubActionDataRef().DidInsertContent(*this, aContentToMove);
+
+  return MoveNodeResult::HandledResult(
+      moveNodeTransaction->SuggestNextInsertionPoint().To<EditorDOMPoint>(),
+      moveNodeTransaction->SuggestPointToPutCaret().To<EditorDOMPoint>());
+}
+
+Result<MoveNodeResult, nsresult> HTMLEditor::MoveSiblingsWithTransaction(
+    nsIContent& aFirstContentToMove, nsIContent& aLastContentToMove,
+    const EditorDOMPoint& aPointToInsert) {
+  MOZ_ASSERT(aPointToInsert.IsSetAndValid());
+  MOZ_ASSERT(aFirstContentToMove.GetParentNode() ==
+             aLastContentToMove.GetParentNode());
+  if (&aFirstContentToMove == &aLastContentToMove) {
+    Result<MoveNodeResult, nsresult> moveNodeResultOrError =
+        MoveNodeWithTransaction(aFirstContentToMove, aPointToInsert);
+    NS_WARNING_ASSERTION(moveNodeResultOrError.isOk(),
+                         "HTMLEditor::MoveNodeWithTransaction() failed");
+    return moveNodeResultOrError;
+  }
+
+  MOZ_ASSERT(*aFirstContentToMove.ComputeIndexInParentNode() <
+             *aLastContentToMove.ComputeIndexInParentNode());
+
+  {
+    const EditorDOMPoint atFirstContent(&aFirstContentToMove);
+    if (NS_WARN_IF(!atFirstContent.IsSet())) {
+      return Err(NS_ERROR_FAILURE);
+    }
+    const EditorDOMPoint atLastContent(&aLastContentToMove);
+    if (NS_WARN_IF(!atLastContent.IsSet())) {
+      return Err(NS_ERROR_FAILURE);
+    }
+    if (aPointToInsert.GetContainer() == atFirstContent.GetContainer() &&
+        atFirstContent.EqualsOrIsBefore(aPointToInsert) &&
+        aPointToInsert.EqualsOrIsBefore(
+            atLastContent.NextPoint<EditorRawDOMPoint>())) {
+      return MoveNodeResult::IgnoredResult(atLastContent.NextPoint());
+    }
+  }
+
+  const RefPtr<MoveSiblingsTransaction> moveSiblingsTransaction =
+      MoveSiblingsTransaction::MaybeCreate(*this, aFirstContentToMove,
+                                           aLastContentToMove, aPointToInsert);
+  if (MOZ_UNLIKELY(!moveSiblingsTransaction)) {
+    NS_WARNING("MoveNodeTransaction::MaybeCreate() failed");
+    return Err(NS_ERROR_FAILURE);
+  }
+
+  IgnoredErrorResult ignoredError;
+  AutoEditSubActionNotifier startToHandleEditSubAction(
+      *this, EditSubAction::eMoveNode, nsIEditor::eNext, ignoredError);
+  if (NS_WARN_IF(ignoredError.ErrorCodeIs(NS_ERROR_EDITOR_DESTROYED))) {
+    return Err(ignoredError.StealNSResult());
+  }
+  NS_WARNING_ASSERTION(
+      !ignoredError.Failed(),
+      "TextEditor::OnStartToHandleTopLevelEditSubAction() failed, but ignored");
+
+  TopLevelEditSubActionDataRef().WillDeleteContent(*this, aFirstContentToMove);
+  TopLevelEditSubActionDataRef().WillDeleteContent(*this, aLastContentToMove);
+
+  nsresult rv = DoTransactionInternal(moveSiblingsTransaction);
+  Maybe<CopyableAutoTArray<OwningNonNull<nsIContent>, 64>> movedSiblings;
+  if (!mActionListeners.IsEmpty()) {
+    if (!movedSiblings) {
+      movedSiblings.emplace(moveSiblingsTransaction->TargetSiblings());
+    }
+    for (auto& listener : mActionListeners.Clone()) {
+      for (const OwningNonNull<nsIContent>& movedContent :
+           movedSiblings.ref()) {
+        DebugOnly<nsresult> rvIgnored =
+            listener->DidDeleteNode(MOZ_KnownLive(movedContent), rv);
+        NS_WARNING_ASSERTION(
+            NS_SUCCEEDED(rvIgnored),
+            "nsIEditActionListener::DidDeleteNode() failed, but ignored");
+      }
+    }
+  }
+
+  if (MOZ_UNLIKELY(Destroyed())) {
+    NS_WARNING(
+        "MoveNodeTransaction::DoTransaction() caused destroying the editor");
+    return Err(NS_ERROR_EDITOR_DESTROYED);
+  }
+
+  if (NS_FAILED(rv)) {
+    NS_WARNING("MoveNodeTransaction::DoTransaction() failed");
+    return Err(rv);
+  }
+
+  nsIContent* const firstMovedContentInExpectedContainer =
+      moveSiblingsTransaction->GetFirstMovedContent();
+  nsIContent* const lastMovedContentInExpectedContainer =
+      moveSiblingsTransaction->GetLastMovedContent();
+  if (!firstMovedContentInExpectedContainer) {
+    return MoveNodeResult::IgnoredResult(aPointToInsert);
+  }
+  MOZ_ASSERT(lastMovedContentInExpectedContainer);
+
+  TopLevelEditSubActionDataRef().DidInsertContent(
+      *this, *firstMovedContentInExpectedContainer);
+  if (firstMovedContentInExpectedContainer ==
+      lastMovedContentInExpectedContainer) {
+    return MoveNodeResult::HandledResult(
+        moveSiblingsTransaction->SuggestNextInsertionPoint()
+            .To<EditorDOMPoint>(),
+        moveSiblingsTransaction->SuggestPointToPutCaret().To<EditorDOMPoint>());
+  }
+  TopLevelEditSubActionDataRef().DidInsertContent(
+      *this, *lastMovedContentInExpectedContainer);
+  return MoveNodeResult::HandledResult(
+      *firstMovedContentInExpectedContainer,
+      moveSiblingsTransaction->SuggestNextInsertionPoint().To<EditorDOMPoint>(),
+      moveSiblingsTransaction->SuggestPointToPutCaret().To<EditorDOMPoint>());
+}
+
+Result<RefPtr<Element>, nsresult> HTMLEditor::DeleteSelectionAndCreateElement(
+    nsAtom& aTag, const InitializeInsertingElement& aInitializer) {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+
+  nsresult rv = DeleteSelectionAndPrepareToCreateNode();
+  if (NS_FAILED(rv)) {
+    NS_WARNING("HTMLEditor::DeleteSelectionAndPrepareToCreateNode() failed");
+    return Err(rv);
+  }
+
+  EditorDOMPoint pointToInsert(SelectionRef().AnchorRef());
+  if (!pointToInsert.IsSet()) {
+    return Err(NS_ERROR_FAILURE);
+  }
+  Result<CreateElementResult, nsresult> createNewElementResult =
+      CreateAndInsertElement(WithTransaction::Yes, aTag, pointToInsert,
+                             aInitializer);
+  if (MOZ_UNLIKELY(createNewElementResult.isErr())) {
+    NS_WARNING(
+        "HTMLEditor::CreateAndInsertElement(WithTransaction::Yes) failed");
+    return createNewElementResult.propagateErr();
+  }
+  MOZ_ASSERT(createNewElementResult.inspect().GetNewNode());
+
+  createNewElementResult.inspect().IgnoreCaretPointSuggestion();
+  rv = CollapseSelectionTo(
+      EditorRawDOMPoint::After(*createNewElementResult.inspect().GetNewNode()));
+  if (NS_FAILED(rv)) {
+    NS_WARNING("EditorBase::CollapseSelectionTo() failed");
+    return Err(rv);
+  }
+  return createNewElementResult.unwrap().UnwrapNewNode();
+}
+
+nsresult HTMLEditor::DeleteSelectionAndPrepareToCreateNode() {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+
+  if (NS_WARN_IF(!SelectionRef().GetAnchorFocusRange())) {
+    return NS_OK;
+  }
+
+  if (!SelectionRef().GetAnchorFocusRange()->Collapsed()) {
+    nsresult rv =
+        DeleteSelectionAsSubAction(nsIEditor::eNone, nsIEditor::eStrip);
+    if (NS_FAILED(rv)) {
+      NS_WARNING("EditorBase::DeleteSelectionAsSubAction() failed");
+      return rv;
+    }
+    MOZ_ASSERT(SelectionRef().GetAnchorFocusRange() &&
+                   SelectionRef().GetAnchorFocusRange()->Collapsed(),
+               "Selection not collapsed after delete");
+  }
+
+  EditorDOMPoint atAnchor(SelectionRef().AnchorRef());
+  if (NS_WARN_IF(!atAnchor.IsSet()) || !atAnchor.IsInDataNode()) {
+    return NS_OK;
+  }
+
+  if (NS_WARN_IF(!atAnchor.GetContainerParent())) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (atAnchor.IsStartOfContainer()) {
+    const EditorRawDOMPoint atAnchorContainer(atAnchor.GetContainer());
+    if (NS_WARN_IF(!atAnchorContainer.IsSetAndValid())) {
+      return NS_ERROR_FAILURE;
+    }
+    nsresult rv = CollapseSelectionTo(atAnchorContainer);
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                         "EditorBase::CollapseSelectionTo() failed");
+    return rv;
+  }
+
+  if (atAnchor.IsEndOfContainer()) {
+    EditorRawDOMPoint afterAnchorContainer(atAnchor.GetContainer());
+    if (NS_WARN_IF(!afterAnchorContainer.AdvanceOffset())) {
+      return NS_ERROR_FAILURE;
+    }
+    nsresult rv = CollapseSelectionTo(afterAnchorContainer);
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                         "EditorBase::CollapseSelectionTo() failed");
+    return rv;
+  }
+
+  Result<SplitNodeResult, nsresult> splitAtAnchorResult =
+      SplitNodeWithTransaction(atAnchor);
+  if (MOZ_UNLIKELY(splitAtAnchorResult.isErr())) {
+    NS_WARNING("HTMLEditor::SplitNodeWithTransaction() failed");
+    return splitAtAnchorResult.unwrapErr();
+  }
+
+  splitAtAnchorResult.inspect().IgnoreCaretPointSuggestion();
+  const auto atRightContent =
+      splitAtAnchorResult.inspect().AtNextContent<EditorRawDOMPoint>();
+  if (NS_WARN_IF(!atRightContent.IsSet())) {
+    return NS_ERROR_FAILURE;
+  }
+  MOZ_ASSERT(atRightContent.IsSetAndValid());
+  nsresult rv = CollapseSelectionTo(atRightContent);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "EditorBase::CollapseSelectionTo() failed");
+  return rv;
+}
+
+bool HTMLEditor::IsEmpty() const {
+  if (mPaddingBRElementForEmptyEditor) {
+    return true;
+  }
+
+  const Element* activeElement =
+      GetDocument() ? GetDocument()->GetActiveElement() : nullptr;
+  const Element* editingHostOrBodyOrRootElement =
+      activeElement && activeElement->IsEditable()
+          ? ComputeEditingHost(*activeElement, LimitInBodyElement::No)
+          : ComputeEditingHost(LimitInBodyElement::No);
+  if (MOZ_UNLIKELY(!editingHostOrBodyOrRootElement)) {
+    editingHostOrBodyOrRootElement = GetRoot();
+    if (!editingHostOrBodyOrRootElement) {
+      return true;
+    }
+  }
+
+  for (nsIContent* childContent =
+           editingHostOrBodyOrRootElement->GetFirstChild();
+       childContent; childContent = childContent->GetNextSibling()) {
+    if (!childContent->IsText() || childContent->Length()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+nsresult HTMLEditor::SetAttributeOrEquivalent(Element* aElement,
+                                              nsAtom* aAttribute,
+                                              const nsAString& aValue,
+                                              bool aSuppressTransaction) {
+  MOZ_ASSERT(aElement);
+  MOZ_ASSERT(aAttribute);
+
+  nsAutoScriptBlocker scriptBlocker;
+  nsStyledElement* styledElement = nsStyledElement::FromNodeOrNull(aElement);
+  if (!IsCSSEnabled()) {
+    if (EditorElementStyle::IsHTMLStyle(aAttribute)) {
+      const EditorElementStyle elementStyle =
+          EditorElementStyle::Create(*aAttribute);
+      if (styledElement && elementStyle.IsCSSRemovable(*styledElement)) {
+        nsresult rv = CSSEditUtils::RemoveCSSEquivalentToStyle(
+            aSuppressTransaction ? WithTransaction::No : WithTransaction::Yes,
+            *this, MOZ_KnownLive(*styledElement), elementStyle, nullptr);
+        if (NS_WARN_IF(rv == NS_ERROR_EDITOR_DESTROYED)) {
+          return NS_ERROR_EDITOR_DESTROYED;
+        }
+        NS_WARNING_ASSERTION(
+            NS_SUCCEEDED(rv),
+            "CSSEditUtils::RemoveCSSEquivalentToStyle() failed, but ignored");
+      }
+    }
+    if (aSuppressTransaction) {
+      AutoElementAttrAPIWrapper elementWrapper(*this, *aElement);
+      nsresult rv = elementWrapper.SetAttr(aAttribute, aValue, true);
+      if (NS_FAILED(rv)) {
+        NS_WARNING("AutoElementAttrAPIWrapper::SetAttr() failed");
+        return rv;
+      }
+      NS_WARNING_ASSERTION(
+          elementWrapper.IsExpectedResult(aValue),
+          "Setting attribute caused other mutations, but ignored");
+      return NS_OK;
+    }
+    nsresult rv = SetAttributeWithTransaction(*aElement, *aAttribute, aValue);
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                         "EditorBase::SetAttributeWithTransaction() failed");
+    return rv;
+  }
+
+  if (EditorElementStyle::IsHTMLStyle(aAttribute)) {
+    const EditorElementStyle elementStyle =
+        EditorElementStyle::Create(*aAttribute);
+    if (styledElement && elementStyle.IsCSSSettable(*styledElement)) {
+      Result<size_t, nsresult> count = CSSEditUtils::SetCSSEquivalentToStyle(
+          aSuppressTransaction ? WithTransaction::No : WithTransaction::Yes,
+          *this, MOZ_KnownLive(*styledElement), elementStyle, &aValue);
+      if (MOZ_UNLIKELY(count.isErr())) {
+        if (NS_WARN_IF(count.inspectErr() == NS_ERROR_EDITOR_DESTROYED)) {
+          return NS_ERROR_EDITOR_DESTROYED;
+        }
+        NS_WARNING(
+            "CSSEditUtils::SetCSSEquivalentToStyle() failed, but ignored");
+      }
+      if (count.inspect()) {
+        nsAutoString existingValue;
+        if (!aElement->GetAttr(aAttribute, existingValue)) {
+          return NS_OK;
+        }
+
+        if (aSuppressTransaction) {
+          AutoElementAttrAPIWrapper elementWrapper(*this, *aElement);
+          nsresult rv = elementWrapper.UnsetAttr(aAttribute, true);
+          if (NS_FAILED(rv)) {
+            NS_WARNING("AutoElementAttrAPIWrapper::UnsetAttr() failed");
+            return rv;
+          }
+          NS_WARNING_ASSERTION(
+              elementWrapper.IsExpectedResult(EmptyString()),
+              "Removing attribute caused other mutations, but ignored");
+          return NS_OK;
+        }
+        nsresult rv = RemoveAttributeWithTransaction(*aElement, *aAttribute);
+        NS_WARNING_ASSERTION(
+            NS_SUCCEEDED(rv),
+            "EditorBase::RemoveAttributeWithTransaction() failed");
+        return rv;
+      }
+    }
+  }
+
+  if (aAttribute == nsGkAtoms::style) {
+    nsString existingValue;  
+    aElement->GetAttr(nsGkAtoms::style, existingValue);
+    if (!existingValue.IsEmpty()) {
+      existingValue.Append(HTMLEditUtils::kSpace);
+    }
+    existingValue.Append(aValue);
+    if (aSuppressTransaction) {
+      AutoElementAttrAPIWrapper elementWrapper(*this, *aElement);
+      nsresult rv =
+          elementWrapper.SetAttr(nsGkAtoms::style, existingValue, true);
+      if (NS_FAILED(rv)) {
+        NS_WARNING("AutoElementAttrAPIWrapper::SetAttr() failed");
+        return rv;
+      }
+      NS_WARNING_ASSERTION(
+          elementWrapper.IsExpectedResult(existingValue),
+          "Setting style attribute caused other mutations, but ignored");
+      return NS_OK;
+    }
+    nsresult rv = SetAttributeWithTransaction(*aElement, *nsGkAtoms::style,
+                                              existingValue);
+    NS_WARNING_ASSERTION(
+        NS_SUCCEEDED(rv),
+        "EditorBase::SetAttributeWithTransaction(nsGkAtoms::style) failed");
+    return rv;
+  }
+
+  if (aSuppressTransaction) {
+    AutoElementAttrAPIWrapper elementWrapper(*this, *aElement);
+    nsresult rv = elementWrapper.SetAttr(aAttribute, aValue, true);
+    if (NS_FAILED(rv)) {
+      NS_WARNING("AutoElementAttrAPIWrapper::SetAttr() failed");
+      return rv;
+    }
+    NS_WARNING_ASSERTION(
+        elementWrapper.IsExpectedResult(aValue),
+        "Setting attribute caused other mutations, but ignored");
+    return NS_OK;
+  }
+  nsresult rv = SetAttributeWithTransaction(*aElement, *aAttribute, aValue);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "EditorBase::SetAttributeWithTransaction() failed");
+  return rv;
+}
+
+nsresult HTMLEditor::RemoveAttributeOrEquivalent(Element* aElement,
+                                                 nsAtom* aAttribute,
+                                                 bool aSuppressTransaction) {
+  MOZ_ASSERT(aElement);
+  MOZ_ASSERT(aAttribute);
+
+  if (IsCSSEnabled() && EditorElementStyle::IsHTMLStyle(aAttribute)) {
+    const EditorElementStyle elementStyle =
+        EditorElementStyle::Create(*aAttribute);
+    if (elementStyle.IsCSSRemovable(*aElement)) {
+      nsStyledElement* styledElement =
+          nsStyledElement::FromNodeOrNull(aElement);
+      if (NS_WARN_IF(!styledElement)) {
+        return NS_ERROR_INVALID_ARG;
+      }
+      nsresult rv = CSSEditUtils::RemoveCSSEquivalentToStyle(
+          aSuppressTransaction ? WithTransaction::No : WithTransaction::Yes,
+          *this, MOZ_KnownLive(*styledElement), elementStyle, nullptr);
+      if (NS_FAILED(rv)) {
+        NS_WARNING("CSSEditUtils::RemoveCSSEquivalentToStyle() failed");
+        return rv;
+      }
+    }
+  }
+
+  if (!aElement->HasAttr(aAttribute)) {
+    return NS_OK;
+  }
+
+  if (aSuppressTransaction) {
+    AutoElementAttrAPIWrapper elementWrapper(*this, *aElement);
+    nsresult rv = elementWrapper.UnsetAttr(aAttribute, true);
+    if (NS_FAILED(rv)) {
+      NS_WARNING("AutoElementAttrAPIWrapper::UnsetAttr() failed");
+      return rv;
+    }
+    NS_WARNING_ASSERTION(
+        elementWrapper.IsExpectedResult(EmptyString()),
+        "Removing attribute caused other mutations, but ignored");
+    return NS_OK;
+  }
+  nsresult rv = RemoveAttributeWithTransaction(*aElement, *aAttribute);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "EditorBase::RemoveAttributeWithTransaction() failed");
+  return rv;
+}
+
+NS_IMETHODIMP HTMLEditor::SetIsCSSEnabled(bool aIsCSSPrefChecked) {
+  AutoEditActionDataSetter editActionData(*this,
+                                          EditAction::eEnableOrDisableCSS);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  mIsCSSPrefChecked = aIsCSSPrefChecked;
+  return NS_OK;
+}
+
+nsresult HTMLEditor::SetBlockBackgroundColorWithCSSAsSubAction(
+    const nsAString& aColor) {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+
+  AutoPlaceholderBatch treatAsOneTransaction(
+      *this, ScrollSelectionIntoView::Yes, __FUNCTION__);
+
+  CommitComposition();
+
+  if (IsPlaintextMailComposer()) {
+    return NS_OK;
+  }
+
+  {
+    Result<EditActionResult, nsresult> result = CanHandleHTMLEditSubAction();
+    if (MOZ_UNLIKELY(result.isErr())) {
+      NS_WARNING("HTMLEditor::CanHandleHTMLEditSubAction() failed");
+      return result.unwrapErr();
+    }
+    if (result.inspect().Canceled()) {
+      return NS_OK;
+    }
+  }
+
+  IgnoredErrorResult ignoredError;
+  AutoEditSubActionNotifier startToHandleEditSubAction(
+      *this, EditSubAction::eInsertElement, nsIEditor::eNext, ignoredError);
+  if (NS_WARN_IF(ignoredError.ErrorCodeIs(NS_ERROR_EDITOR_DESTROYED))) {
+    return ignoredError.StealNSResult();
+  }
+  NS_WARNING_ASSERTION(!ignoredError.Failed(),
+                       "HTMLEditor::OnStartToHandleTopLevelEditSubAction() "
+                       "failed, but ignored");
+
+  AutoTransactionsConserveSelection dontChangeMySelection(*this);
+
+  AutoClonedSelectionRangeArray selectionRanges(SelectionRef());
+  MOZ_ALWAYS_TRUE(selectionRanges.SaveAndTrackRanges(*this));
+  for (const OwningNonNull<nsRange>& domRange : selectionRanges.Ranges()) {
+    EditorDOMRange range(domRange);
+    if (NS_WARN_IF(!range.IsPositioned())) {
+      continue;
+    }
+
+    if (range.InSameContainer()) {
+      if (range.StartRef().IsInTextNode()) {
+        const RefPtr<nsStyledElement> editableBlockStyledElement =
+            nsStyledElement::FromNodeOrNull(HTMLEditUtils::GetAncestorElement(
+                *range.StartRef().ContainerAs<Text>(),
+                HTMLEditUtils::ClosestEditableBlockElement,
+                BlockInlineCheck::UseComputedDisplayOutsideStyle));
+        if (!editableBlockStyledElement ||
+            !EditorElementStyle::BGColor().IsCSSSettable(
+                *editableBlockStyledElement)) {
+          continue;
+        }
+        Result<size_t, nsresult> result = CSSEditUtils::SetCSSEquivalentToStyle(
+            WithTransaction::Yes, *this, *editableBlockStyledElement,
+            EditorElementStyle::BGColor(), &aColor);
+        if (MOZ_UNLIKELY(result.isErr())) {
+          if (NS_WARN_IF(result.inspectErr() == NS_ERROR_EDITOR_DESTROYED)) {
+            return NS_ERROR_EDITOR_DESTROYED;
+          }
+          NS_WARNING(
+              "CSSEditUtils::SetCSSEquivalentToStyle(EditorElementStyle::"
+              "BGColor()) failed, but ignored");
+        }
+        continue;
+      }
+
+      if (range.Collapsed() &&
+          range.StartRef().IsContainerHTMLElement(nsGkAtoms::body)) {
+        const RefPtr<nsStyledElement> styledElement =
+            range.StartRef().GetContainerAs<nsStyledElement>();
+        if (!styledElement ||
+            !EditorElementStyle::BGColor().IsCSSSettable(*styledElement)) {
+          continue;
+        }
+        Result<size_t, nsresult> result = CSSEditUtils::SetCSSEquivalentToStyle(
+            WithTransaction::Yes, *this, *styledElement,
+            EditorElementStyle::BGColor(), &aColor);
+        if (MOZ_UNLIKELY(result.isErr())) {
+          if (NS_WARN_IF(result.inspectErr() == NS_ERROR_EDITOR_DESTROYED)) {
+            return NS_ERROR_EDITOR_DESTROYED;
+          }
+          NS_WARNING(
+              "CSSEditUtils::SetCSSEquivalentToStyle(EditorElementStyle::"
+              "BGColor()) failed, but ignored");
+        }
+        continue;
+      }
+
+      if ((range.StartRef().IsStartOfContainer() &&
+           range.EndRef().IsStartOfContainer()) ||
+          range.StartRef().Offset() + 1 == range.EndRef().Offset()) {
+        if (NS_WARN_IF(range.StartRef().IsInDataNode())) {
+          continue;
+        }
+        const RefPtr<nsStyledElement> editableBlockStyledElement =
+            nsStyledElement::FromNodeOrNull(
+                HTMLEditUtils::GetInclusiveAncestorElement(
+                    *range.StartRef().GetChild(),
+                    HTMLEditUtils::ClosestEditableBlockElement,
+                    BlockInlineCheck::UseComputedDisplayOutsideStyle));
+        if (!editableBlockStyledElement ||
+            !EditorElementStyle::BGColor().IsCSSSettable(
+                *editableBlockStyledElement)) {
+          continue;
+        }
+        Result<size_t, nsresult> result = CSSEditUtils::SetCSSEquivalentToStyle(
+            WithTransaction::Yes, *this, *editableBlockStyledElement,
+            EditorElementStyle::BGColor(), &aColor);
+        if (MOZ_UNLIKELY(result.isErr())) {
+          if (NS_WARN_IF(result.inspectErr() == NS_ERROR_EDITOR_DESTROYED)) {
+            return NS_ERROR_EDITOR_DESTROYED;
+          }
+          NS_WARNING(
+              "CSSEditUtils::SetCSSEquivalentToStyle(EditorElementStyle::"
+              "BGColor()) failed, but ignored");
+        }
+        continue;
+      }
+    }  
+
+    AutoTArray<OwningNonNull<nsIContent>, 64> arrayOfContents;
+    {
+      ContentSubtreeIterator subtreeIter;
+      nsresult rv = subtreeIter.Init(range.StartRef().ToRawRangeBoundary(),
+                                     range.EndRef().ToRawRangeBoundary());
+      NS_WARNING_ASSERTION(
+          NS_SUCCEEDED(rv),
+          "ContentSubtreeIterator::Init() failed, but ignored");
+      if (NS_SUCCEEDED(rv)) {
+        for (; !subtreeIter.IsDone(); subtreeIter.Next()) {
+          nsINode* node = subtreeIter.GetCurrentNode();
+          if (NS_WARN_IF(!node)) {
+            return NS_ERROR_FAILURE;
+          }
+          if (node->IsContent() && EditorUtils::IsEditableContent(
+                                       *node->AsContent(), EditorType::HTML)) {
+            arrayOfContents.AppendElement(*node->AsContent());
+          }
+        }
+      }
+    }
+
+    RefPtr<Element> handledBlockParent;
+
+    if (range.StartRef().IsInTextNode() &&
+        EditorUtils::IsEditableContent(*range.StartRef().ContainerAs<Text>(),
+                                       EditorType::HTML)) {
+      Element* const editableBlockElement = HTMLEditUtils::GetAncestorElement(
+          *range.StartRef().ContainerAs<Text>(),
+          HTMLEditUtils::ClosestEditableBlockElement,
+          BlockInlineCheck::UseComputedDisplayOutsideStyle);
+      if (editableBlockElement && handledBlockParent != editableBlockElement) {
+        handledBlockParent = editableBlockElement;
+        nsStyledElement* const blockStyledElement =
+            nsStyledElement::FromNode(handledBlockParent);
+        if (blockStyledElement &&
+            EditorElementStyle::BGColor().IsCSSSettable(*blockStyledElement)) {
+          Result<size_t, nsresult> result =
+              CSSEditUtils::SetCSSEquivalentToStyle(
+                  WithTransaction::Yes, *this,
+                  MOZ_KnownLive(*blockStyledElement),
+                  EditorElementStyle::BGColor(), &aColor);
+          if (MOZ_UNLIKELY(result.isErr())) {
+            if (NS_WARN_IF(result.inspectErr() == NS_ERROR_EDITOR_DESTROYED)) {
+              return NS_ERROR_EDITOR_DESTROYED;
+            }
+            NS_WARNING(
+                "CSSEditUtils::SetCSSEquivalentToStyle(EditorElementStyle::"
+                "BGColor()) failed, but ignored");
+          }
+        }
+      }
+    }
+
+    for (OwningNonNull<nsIContent>& content : arrayOfContents) {
+      Element* const editableBlockElement =
+          HTMLEditUtils::GetInclusiveAncestorElement(
+              content, HTMLEditUtils::ClosestEditableBlockElement,
+              BlockInlineCheck::UseComputedDisplayOutsideStyle);
+      if (editableBlockElement && handledBlockParent != editableBlockElement) {
+        handledBlockParent = editableBlockElement;
+        nsStyledElement* const blockStyledElement =
+            nsStyledElement::FromNode(handledBlockParent);
+        if (blockStyledElement &&
+            EditorElementStyle::BGColor().IsCSSSettable(*blockStyledElement)) {
+          Result<size_t, nsresult> result =
+              CSSEditUtils::SetCSSEquivalentToStyle(
+                  WithTransaction::Yes, *this,
+                  MOZ_KnownLive(*blockStyledElement),
+                  EditorElementStyle::BGColor(), &aColor);
+          if (MOZ_UNLIKELY(result.isErr())) {
+            if (NS_WARN_IF(result.inspectErr() == NS_ERROR_EDITOR_DESTROYED)) {
+              return NS_ERROR_EDITOR_DESTROYED;
+            }
+            NS_WARNING(
+                "CSSEditUtils::SetCSSEquivalentToStyle(EditorElementStyle::"
+                "BGColor()) failed, but ignored");
+          }
+        }
+      }
+    }
+
+    if (range.EndRef().IsInTextNode() &&
+        EditorUtils::IsEditableContent(*range.EndRef().ContainerAs<Text>(),
+                                       EditorType::HTML)) {
+      Element* const editableBlockElement = HTMLEditUtils::GetAncestorElement(
+          *range.EndRef().ContainerAs<Text>(),
+          HTMLEditUtils::ClosestEditableBlockElement,
+          BlockInlineCheck::UseComputedDisplayOutsideStyle);
+      if (editableBlockElement && handledBlockParent != editableBlockElement) {
+        const RefPtr<nsStyledElement> blockStyledElement =
+            nsStyledElement::FromNode(editableBlockElement);
+        if (blockStyledElement &&
+            EditorElementStyle::BGColor().IsCSSSettable(*blockStyledElement)) {
+          Result<size_t, nsresult> result =
+              CSSEditUtils::SetCSSEquivalentToStyle(
+                  WithTransaction::Yes, *this, *blockStyledElement,
+                  EditorElementStyle::BGColor(), &aColor);
+          if (MOZ_UNLIKELY(result.isErr())) {
+            if (NS_WARN_IF(result.inspectErr() == NS_ERROR_EDITOR_DESTROYED)) {
+              return NS_ERROR_EDITOR_DESTROYED;
+            }
+            NS_WARNING(
+                "CSSEditUtils::SetCSSEquivalentToStyle(EditorElementStyle::"
+                "BGColor()) failed, but ignored");
+          }
+        }
+      }
+    }
+  }  
+
+  MOZ_ASSERT(selectionRanges.HasSavedRanges());
+  selectionRanges.RestoreFromSavedRanges();
+  nsresult rv = selectionRanges.ApplyTo(SelectionRef());
+  if (NS_WARN_IF(Destroyed())) {
+    return NS_ERROR_EDITOR_DESTROYED;
+  }
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "AutoClonedSelectionRangeArray::ApplyTo() failed");
+  return rv;
+}
+
+NS_IMETHODIMP HTMLEditor::SetBackgroundColor(const nsAString& aColor) {
+  nsresult rv = SetBackgroundColorAsAction(aColor);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "HTMLEditor::SetBackgroundColorAsAction() failed");
+  return rv;
+}
+
+nsresult HTMLEditor::SetBackgroundColorAsAction(const nsAString& aColor,
+                                                nsIPrincipal* aPrincipal) {
+  AutoEditActionDataSetter editActionData(
+      *this, EditAction::eSetBackgroundColor, aPrincipal);
+  nsresult rv = editActionData.CanHandleAndMaybeDispatchBeforeInputEvent();
+  if (NS_FAILED(rv)) {
+    NS_WARNING_ASSERTION(rv == NS_ERROR_EDITOR_ACTION_CANCELED,
+                         "CanHandleAndMaybeDispatchBeforeInputEvent(), failed");
+    return EditorBase::ToGenericNSResult(rv);
+  }
+
+  if (IsCSSEnabled()) {
+    nsresult rv = SetBlockBackgroundColorWithCSSAsSubAction(aColor);
+    NS_WARNING_ASSERTION(
+        NS_SUCCEEDED(rv),
+        "HTMLEditor::SetBlockBackgroundColorWithCSSAsSubAction() failed");
+    return EditorBase::ToGenericNSResult(rv);
+  }
+
+  rv = SetHTMLBackgroundColorWithTransaction(aColor);
+  NS_WARNING_ASSERTION(
+      NS_SUCCEEDED(rv),
+      "HTMLEditor::SetHTMLBackgroundColorWithTransaction() failed");
+  return EditorBase::ToGenericNSResult(rv);
+}
+
+Result<EditorDOMPoint, nsresult>
+HTMLEditor::CopyLastEditableChildStylesWithTransaction(
+    Element& aPreviousBlock, Element& aNewBlock, const Element& aEditingHost) {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+
+  AutoTArray<OwningNonNull<nsIContent>, 32> newBlockChildren;
+  HTMLEditUtils::CollectAllChildren(aNewBlock, newBlockChildren);
+  for (const OwningNonNull<nsIContent>& child : newBlockChildren) {
+    nsresult rv = DeleteNodeWithTransaction(MOZ_KnownLive(child));
+    if (NS_FAILED(rv)) {
+      NS_WARNING("EditorBase::DeleteNodeWithTransaction() failed");
+      return Err(rv);
+    }
+  }
+  if (MOZ_UNLIKELY(aNewBlock.GetFirstChild())) {
+    return Err(NS_ERROR_EDITOR_UNEXPECTED_DOM_TREE);
+  }
+
+
+  nsIContent* deepestEditableContent = HTMLEditUtils::GetPreviousLeafContent(
+      EditorRawDOMPoint::AtEndOf(aPreviousBlock),
+      {LeafNodeOption::IgnoreNonEditableNode},
+      BlockInlineCheck::UseComputedDisplayOutsideStyle);
+  while (deepestEditableContent &&
+         deepestEditableContent->IsHTMLElement(nsGkAtoms::br)) {
+    deepestEditableContent = HTMLEditUtils::GetPreviousLeafContent(
+        *deepestEditableContent, {LeafNodeOption::IgnoreNonEditableNode},
+        BlockInlineCheck::UseComputedDisplayOutsideStyle, &aEditingHost);
+  }
+  if (!deepestEditableContent) {
+    return EditorDOMPoint(&aNewBlock, 0u);
+  }
+
+  Element* deepestVisibleEditableElement =
+      deepestEditableContent->GetAsElementOrParentElement();
+  if (!deepestVisibleEditableElement) {
+    return EditorDOMPoint(&aNewBlock, 0u);
+  }
+
+  RefPtr<Element> lastClonedElement, firstClonedElement;
+  for (RefPtr<Element> elementInPreviousBlock = deepestVisibleEditableElement;
+       elementInPreviousBlock && elementInPreviousBlock != &aPreviousBlock;
+       elementInPreviousBlock = elementInPreviousBlock->GetParentElement()) {
+    if (!HTMLEditUtils::IsInlineStyleElement(*elementInPreviousBlock) &&
+        !elementInPreviousBlock->IsHTMLElement(nsGkAtoms::span)) {
+      continue;
+    }
+    OwningNonNull<nsAtom> tagName =
+        *elementInPreviousBlock->NodeInfo()->NameAtom();
+    if (!firstClonedElement) {
+      Result<CreateElementResult, nsresult> createNewElementResult =
+          CreateAndInsertElement(
+              WithTransaction::Yes, tagName, EditorDOMPoint(&aNewBlock, 0u),
+              [&elementInPreviousBlock](
+                  HTMLEditor& aHTMLEditor, Element& aNewElement,
+                  const EditorDOMPoint&) MOZ_CAN_RUN_SCRIPT_BOUNDARY {
+                aHTMLEditor.CloneAttributesWithTransaction(
+                    aNewElement, *elementInPreviousBlock);
+                return NS_OK;
+              });
+      if (MOZ_UNLIKELY(createNewElementResult.isErr())) {
+        NS_WARNING(
+            "HTMLEditor::CreateAndInsertElement(WithTransaction::Yes) failed");
+        return createNewElementResult.propagateErr();
+      }
+      CreateElementResult unwrappedCreateNewElementResult =
+          createNewElementResult.unwrap();
+      unwrappedCreateNewElementResult.IgnoreCaretPointSuggestion();
+      firstClonedElement = lastClonedElement =
+          unwrappedCreateNewElementResult.UnwrapNewNode();
+      continue;
+    }
+    Result<CreateElementResult, nsresult> wrapClonedElementResult =
+        InsertContainerWithTransaction(*lastClonedElement, tagName);
+    if (MOZ_UNLIKELY(wrapClonedElementResult.isErr())) {
+      NS_WARNING("HTMLEditor::InsertContainerWithTransaction() failed");
+      return wrapClonedElementResult.propagateErr();
+    }
+    CreateElementResult unwrappedWrapClonedElementResult =
+        wrapClonedElementResult.unwrap();
+    unwrappedWrapClonedElementResult.IgnoreCaretPointSuggestion();
+    MOZ_ASSERT(unwrappedWrapClonedElementResult.GetNewNode());
+    lastClonedElement = unwrappedWrapClonedElementResult.UnwrapNewNode();
+    CloneAttributesWithTransaction(*lastClonedElement, *elementInPreviousBlock);
+    if (NS_WARN_IF(Destroyed())) {
+      return Err(NS_ERROR_EDITOR_DESTROYED);
+    }
+  }
+
+  if (!firstClonedElement) {
+    return EditorDOMPoint(&aNewBlock, 0u);
+  }
+
+  Result<CreateLineBreakResult, nsresult> insertBRElementResultOrError =
+      InsertLineBreak(WithTransaction::Yes, LineBreakType::BRElement,
+                      EditorDOMPoint(firstClonedElement, 0u));
+  if (MOZ_UNLIKELY(insertBRElementResultOrError.isErr())) {
+    NS_WARNING(
+        "HTMLEditor::InsertLineBreak(WithTransaction::Yes, "
+        "LineBreakType::BRElement) failed");
+    return insertBRElementResultOrError.propagateErr();
+  }
+  CreateLineBreakResult insertBRElementResult =
+      insertBRElementResultOrError.unwrap();
+  MOZ_ASSERT(insertBRElementResult.Handled());
+  insertBRElementResult.IgnoreCaretPointSuggestion();
+  return insertBRElementResult.AtLineBreak<EditorDOMPoint>();
+}
+
+nsresult HTMLEditor::GetElementOrigin(Element& aElement, int32_t& aX,
+                                      int32_t& aY) {
+  aX = 0;
+  aY = 0;
+
+  if (NS_WARN_IF(!IsInitialized())) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+  PresShell* presShell = GetPresShell();
+  if (NS_WARN_IF(!presShell)) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  nsIFrame* frame = aElement.GetPrimaryFrame();
+  if (NS_WARN_IF(!frame)) {
+    return NS_OK;
+  }
+
+  nsIFrame* absoluteContainerBlockFrame =
+      presShell->GetAbsoluteContainingBlock(frame);
+  if (NS_WARN_IF(!absoluteContainerBlockFrame)) {
+    return NS_OK;
+  }
+  nsPoint off = frame->GetOffsetTo(absoluteContainerBlockFrame);
+  aX = nsPresContext::AppUnitsToIntCSSPixels(off.x);
+  aY = nsPresContext::AppUnitsToIntCSSPixels(off.y);
+
+  return NS_OK;
+}
+
+Element* HTMLEditor::GetSelectionContainerElement() const {
+  MOZ_ASSERT(IsEditActionDataAvailable());
+
+  nsINode* focusNode = nullptr;
+  if (SelectionRef().IsCollapsed()) {
+    focusNode = SelectionRef().GetFocusNode();
+    if (NS_WARN_IF(!focusNode)) {
+      return nullptr;
+    }
+  } else {
+    const uint32_t rangeCount = SelectionRef().RangeCount();
+    MOZ_ASSERT(rangeCount, "If 0, Selection::IsCollapsed() should return true");
+
+    if (rangeCount == 1) {
+      const nsRange* range = SelectionRef().GetRangeAt(0);
+
+      const RangeBoundary& startRef = range->StartRef();
+      const RangeBoundary& endRef = range->EndRef();
+
+      if (startRef.GetContainer()->IsElement() &&
+          startRef.GetContainer() == endRef.GetContainer() &&
+          startRef.GetChildAtOffset() &&
+          startRef.GetChildAtOffset()->GetNextSibling() ==
+              endRef.GetChildAtOffset()) {
+        focusNode = startRef.GetChildAtOffset();
+        MOZ_ASSERT(focusNode, "Start container must not be nullptr");
+      } else {
+        focusNode = range->GetClosestCommonInclusiveAncestor();
+        if (!focusNode) {
+          NS_WARNING(
+              "AbstractRange::GetClosestCommonInclusiveAncestor() returned "
+              "nullptr");
+          return nullptr;
+        }
+      }
+    } else {
+      for (const uint32_t i : IntegerRange(rangeCount)) {
+        MOZ_ASSERT(SelectionRef().RangeCount() == rangeCount);
+        const nsRange* range = SelectionRef().GetRangeAt(i);
+        MOZ_ASSERT(range);
+        nsINode* startContainer = range->GetStartContainer();
+        if (!focusNode) {
+          focusNode = startContainer;
+        } else if (focusNode != startContainer) {
+          focusNode = startContainer->GetParentNode();
+          break;
+        }
+      }
+      if (!focusNode) {
+        NS_WARNING("Focused node of selection was not found");
+        return nullptr;
+      }
+    }
+  }
+
+  if (focusNode->IsText()) {
+    focusNode = focusNode->GetParentNode();
+    if (NS_WARN_IF(!focusNode)) {
+      return nullptr;
+    }
+  }
+
+  if (NS_WARN_IF(!focusNode->IsElement())) {
+    return nullptr;
+  }
+  return focusNode->AsElement();
+}
+
+NS_IMETHODIMP HTMLEditor::IsAnonymousElement(Element* aElement, bool* aReturn) {
+  if (NS_WARN_IF(!aElement)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+  *aReturn = aElement->IsRootOfNativeAnonymousSubtree();
+  return NS_OK;
+}
+
+nsresult HTMLEditor::SetReturnInParagraphCreatesNewParagraph(
+    bool aCreatesNewParagraph) {
+  mCRInParagraphCreatesParagraph = aCreatesNewParagraph;
+  return NS_OK;
+}
+
+bool HTMLEditor::GetReturnInParagraphCreatesNewParagraph() const {
+  return mCRInParagraphCreatesParagraph;
+}
+
+nsresult HTMLEditor::GetReturnInParagraphCreatesNewParagraph(
+    bool* aCreatesNewParagraph) {
+  *aCreatesNewParagraph = mCRInParagraphCreatesParagraph;
+  return NS_OK;
+}
+
+NS_IMETHODIMP HTMLEditor::GetWrapWidth(int32_t* aWrapColumn) {
+  if (NS_WARN_IF(!aWrapColumn)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+  *aWrapColumn = WrapWidth();
+  return NS_OK;
+}
+
+static void CutStyle(const char* stylename, nsString& styleValue) {
+  int32_t styleStart = styleValue.LowerCaseFindASCII(stylename);
+  if (styleStart >= 0) {
+    int32_t styleEnd = styleValue.Find(u";", styleStart);
+    if (styleEnd > styleStart) {
+      styleValue.Cut(styleStart, styleEnd - styleStart + 1);
+    } else {
+      styleValue.Cut(styleStart, styleValue.Length() - styleStart);
+    }
+  }
+}
+
+NS_IMETHODIMP HTMLEditor::SetWrapWidth(int32_t aWrapColumn) {
+  AutoEditActionDataSetter editActionData(*this, EditAction::eSetWrapWidth);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  mWrapColumn = aWrapColumn;
+
+  if (!IsPlaintextMailComposer()) {
+    return NS_OK;
+  }
+
+  const RefPtr<Element> rootElement = GetRoot();
+  if (NS_WARN_IF(!rootElement)) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  nsAutoString styleValue;
+  rootElement->GetAttr(nsGkAtoms::style, styleValue);
+
+  CutStyle("white-space", styleValue);
+  CutStyle("width", styleValue);
+  CutStyle("font-family", styleValue);
+
+  if (!styleValue.IsEmpty()) {
+    styleValue.Trim("; \t", false, true);
+    styleValue.AppendLiteral("; ");
+  }
+
+  if (IsWrapHackEnabled() && aWrapColumn >= 0) {
+    styleValue.AppendLiteral("font-family: -moz-fixed; ");
+  }
+
+  if (aWrapColumn > 0) {
+    styleValue.AppendLiteral("white-space: pre-wrap; width: ");
+    styleValue.AppendInt(aWrapColumn);
+    styleValue.AppendLiteral("ch;");
+  } else if (!aWrapColumn) {
+    styleValue.AppendLiteral("white-space: pre-wrap;");
+  } else {
+    styleValue.AppendLiteral("white-space: pre;");
+  }
+
+  AutoElementAttrAPIWrapper elementWrapper(*this, *rootElement);
+  nsresult rv = elementWrapper.SetAttr(nsGkAtoms::style, styleValue, true);
+  if (NS_FAILED(rv)) {
+    NS_WARNING("AutoElementAttrAPIWrapper::SetAttr() failed");
+    return rv;
+  }
+  NS_WARNING_ASSERTION(
+      elementWrapper.IsExpectedResult(styleValue),
+      "Setting style attribute caused other mutations, but ignored");
+  return NS_OK;
+}
+
+Element* HTMLEditor::GetFocusedElement() const {
+  Element* const focusedElement = nsFocusManager::GetFocusedElementStatic();
+
+  Document* document = GetDocument();
+  if (NS_WARN_IF(!document)) {
+    return nullptr;
+  }
+  const bool inDesignMode = focusedElement ? focusedElement->IsInDesignMode()
+                                           : document->IsInDesignMode();
+  if (!focusedElement) {
+    if (inDesignMode && OurWindowHasFocus()) {
+      return document->GetRootElement();
+    }
+    return nullptr;
+  }
+
+  if (inDesignMode) {
+    return OurWindowHasFocus() &&
+                   focusedElement->IsInclusiveDescendantOf(document)
+               ? focusedElement
+               : nullptr;
+  }
+
+
+  if (!focusedElement->HasFlag(NODE_IS_EDITABLE) ||
+      focusedElement->HasIndependentSelection()) {
+    return nullptr;
+  }
+  return OurWindowHasFocus() ? focusedElement : nullptr;
+}
+
+bool HTMLEditor::IsActiveInDOMWindow() const {
+  nsFocusManager* focusManager = nsFocusManager::GetFocusManager();
+  if (NS_WARN_IF(!focusManager)) {
+    return false;
+  }
+
+  Document* document = GetDocument();
+  if (NS_WARN_IF(!document)) {
+    return false;
+  }
+
+  if (IsInDesignMode()) {
+    return true;
+  }
+
+  nsPIDOMWindowOuter* ourWindow = document->GetWindow();
+  nsCOMPtr<nsPIDOMWindowOuter> win;
+  nsIContent* content = nsFocusManager::GetFocusedDescendant(
+      ourWindow, nsFocusManager::eOnlyCurrentWindow, getter_AddRefs(win));
+  if (!content) {
+    return false;
+  }
+
+  if (content->IsInDesignMode()) {
+    return true;
+  }
+
+
+  if (!content->HasFlag(NODE_IS_EDITABLE) ||
+      content->HasIndependentSelection()) {
+    return false;
+  }
+  return true;
+}
+
+Element* HTMLEditor::ComputeEditingHostInternal(
+    const nsIContent* aContent, LimitInBodyElement aLimitInBodyElement) const {
+  Document* document = GetDocument();
+  if (NS_WARN_IF(!document)) {
+    return nullptr;
+  }
+
+  auto MaybeLimitInBodyElement =
+      [&](const Element* aCandidateEditingHost) -> Element* {
+    if (!aCandidateEditingHost) {
+      return nullptr;
+    }
+    if (aLimitInBodyElement != LimitInBodyElement::Yes) {
+      return const_cast<Element*>(aCandidateEditingHost);
+    }
+    auto* body = document->GetBodyElement();
+    if (body && nsContentUtils::ContentIsFlattenedTreeDescendantOf(
+                    aCandidateEditingHost, body)) {
+      return const_cast<Element*>(aCandidateEditingHost);
+    }
+    return body && body->IsEditable() ? body : nullptr;
+  };
+
+  AutoEditActionDataSetter editActionData(*this, EditAction::eNotEditing);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    return nullptr;
+  }
+
+  const nsIContent* const content = [&]() -> const nsIContent* {
+    if (aContent) {
+      return aContent;
+    }
+    nsIContent* selectionCommonAncestor = nullptr;
+    for (uint32_t i : IntegerRange(SelectionRef().RangeCount())) {
+      nsRange* range = SelectionRef().GetRangeAt(i);
+      MOZ_ASSERT(range);
+      nsIContent* commonAncestor =
+          nsIContent::FromNodeOrNull(range->GetCommonAncestorContainer(
+              IgnoreErrors(), AllowRangeCrossShadowBoundary::Yes));
+      if (MOZ_UNLIKELY(!commonAncestor)) {
+        continue;
+      }
+      if (!selectionCommonAncestor) {
+        selectionCommonAncestor = commonAncestor;
+      } else {
+        selectionCommonAncestor = nsIContent::FromNodeOrNull(
+            nsContentUtils::GetCommonFlattenedTreeAncestorForSelection(
+                commonAncestor, selectionCommonAncestor));
+      }
+    }
+    if (selectionCommonAncestor) {
+      return selectionCommonAncestor;
+    }
+    nsPIDOMWindowInner* const innerWindow = document->GetInnerWindow();
+    if (MOZ_UNLIKELY(!innerWindow)) {
+      return nullptr;
+    }
+    if (Element* focusedElementInWindow = innerWindow->GetFocusedElement()) {
+      if (focusedElementInWindow->ChromeOnlyAccess()) {
+        focusedElementInWindow = Element::FromNodeOrNull(
+            focusedElementInWindow
+                ->GetClosestNativeAnonymousSubtreeRootParentOrHost());
+      }
+      if (focusedElementInWindow) {
+        return focusedElementInWindow->IsEditable() ? focusedElementInWindow
+                                                    : nullptr;
+      }
+    }
+    if (document->IsInDesignMode()) {
+      auto* body = document->GetBodyElement();
+      return body && body->IsEditable() ? body : nullptr;
+    }
+    return nullptr;
+  }();
+  if (!content && document->IsInDesignMode()) {
+    auto* body = document->GetBodyElement();
+    return body && body->IsEditable() ? body : nullptr;
+  }
+
+  if (NS_WARN_IF(!content)) {
+    return nullptr;
+  }
+
+  if (!content->HasFlag(NODE_IS_EDITABLE)) {
+    return nullptr;
+  }
+
+  if (MOZ_UNLIKELY(content->IsInNativeAnonymousSubtree())) {
+    bool isInEditContextSubtree = false;
+    if (EditContext* editContext = document->GetActiveEditContext()) {
+      isInEditContextSubtree = content == &editContext->TextContainer() ||
+                               content == &editContext->TextNode();
+    }
+    if (!isInEditContextSubtree) {
+      return nullptr;
+    }
+  }
+
+  return MaybeLimitInBodyElement(
+      const_cast<nsIContent*>(content)->GetEditingHost());
+}
+
+void HTMLEditor::NotifyEditingHostMaybeChanged() {
+  if (MOZ_UNLIKELY(NS_WARN_IF(!GetDocument()))) {
+    return;
+  }
+
+  AutoEditActionDataSetter editActionData(*this, EditAction::eNotEditing);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    return;
+  }
+
+  nsIContent* ancestorLimiter = SelectionRef().GetAncestorLimiter();
+  if (!ancestorLimiter) {
+    return;
+  }
+
+  Element* const editingHost = ComputeEditingHost();
+  if (NS_WARN_IF(!editingHost)) {
+    return;
+  }
+
+  if (ancestorLimiter->IsInclusiveDescendantOf(editingHost) ||
+      (ancestorLimiter->IsInDesignMode() != editingHost->IsInDesignMode())) {
+    EditorBase::InitializeSelectionAncestorLimit(*editingHost);
+  }
+}
+
+EventTarget* HTMLEditor::GetDOMEventTarget() const {
+  Document* doc = GetDocument();
+  MOZ_ASSERT(doc, "The HTMLEditor has not been initialized yet");
+  if (!doc) {
+    return nullptr;
+  }
+
+  if (nsPIDOMWindowOuter* win = doc->GetWindow()) {
+    return win->GetParentTarget();
+  }
+  return nullptr;
+}
+
+Element* HTMLEditor::GetBodyElement() const {
+  Document* document = GetDocument();
+  MOZ_ASSERT(document, "The HTMLEditor hasn't been initialized yet");
+  if (NS_WARN_IF(!document)) {
+    return nullptr;
+  }
+  return document->GetBody();
+}
+
+nsINode* HTMLEditor::GetFocusedNode() const {
+  Element* focusedElement = GetFocusedElement();
+  if (!focusedElement) {
+    return nullptr;
+  }
+
+
+  if ((focusedElement = nsFocusManager::GetFocusedElementStatic())) {
+    return focusedElement;
+  }
+
+  return GetDocument();
+}
+
+bool HTMLEditor::OurWindowHasFocus() const {
+  nsFocusManager* focusManager = nsFocusManager::GetFocusManager();
+  if (NS_WARN_IF(!focusManager)) {
+    return false;
+  }
+  nsPIDOMWindowOuter* focusedWindow = focusManager->GetFocusedWindow();
+  if (!focusedWindow) {
+    return false;
+  }
+  Document* document = GetDocument();
+  if (NS_WARN_IF(!document)) {
+    return false;
+  }
+  nsPIDOMWindowOuter* ourWindow = document->GetWindow();
+  return ourWindow == focusedWindow;
+}
+
+bool HTMLEditor::IsAcceptableInputEvent(WidgetGUIEvent* aGUIEvent) const {
+  if (!EditorBase::IsAcceptableInputEvent(aGUIEvent)) {
+    return false;
+  }
+
+  if (mComposition && aGUIEvent->AsCompositionEvent()) {
+    return true;
+  }
+
+  nsCOMPtr<nsINode> eventTargetNode =
+      nsINode::FromEventTargetOrNull(aGUIEvent->GetOriginalDOMEventTarget());
+  if (NS_WARN_IF(!eventTargetNode)) {
+    return false;
+  }
+
+  if (eventTargetNode->IsContent()) {
+    eventTargetNode =
+        eventTargetNode->AsContent()->FindFirstNonChromeOnlyAccessContent();
+    if (NS_WARN_IF(!eventTargetNode)) {
+      return false;
+    }
+  }
+
+  RefPtr<Document> document = GetDocument();
+  if (NS_WARN_IF(!document)) {
+    return false;
+  }
+
+  if (eventTargetNode->IsInDesignMode()) {
+    if (eventTargetNode->IsDocument()) {
+      return eventTargetNode == document;
+    }
+    if (NS_WARN_IF(!eventTargetNode->IsContent())) {
+      return false;
+    }
+    if (document == eventTargetNode->GetUncomposedDoc()) {
+      return true;
+    }
+  }
+
+  if (aGUIEvent->mMessage == eKeyPress &&
+      aGUIEvent->AsKeyboardEvent()->ShouldWorkAsSpaceKey()) {
+    nsGenericHTMLElement* element =
+        HTMLButtonElement::FromNode(eventTargetNode);
+    if (!element) {
+      element = HTMLSummaryElement::FromNode(eventTargetNode);
+    }
+
+    if (element && element->IsContentEditable()) {
+      return false;
+    }
+  }
+  if (NS_WARN_IF(!eventTargetNode->IsContent())) {
+    return false;
+  }
+
+  if (aGUIEvent->AsMouseEventBase()) {
+    nsIContent* editingHost = ComputeEditingHost();
+    if (!editingHost) {
+      return false;
+    }
+    if (eventTargetNode == document->GetRootElement() &&
+        !eventTargetNode->HasFlag(NODE_IS_EDITABLE) &&
+        editingHost == document->GetBodyElement()) {
+      eventTargetNode = editingHost;
+    }
+    if (!eventTargetNode->IsInclusiveDescendantOf(editingHost)) {
+      return false;
+    }
+    if (eventTargetNode->AsContent()->HasIndependentSelection()) {
+      return false;
+    }
+    return eventTargetNode->HasFlag(NODE_IS_EDITABLE);
+  }
+
+  if (!eventTargetNode->HasFlag(NODE_IS_EDITABLE) ||
+      eventTargetNode->AsContent()->HasIndependentSelection()) {
+    return false;
+  }
+
+  return IsActiveInDOMWindow();
+}
+
+Result<widget::IMEState, nsresult> HTMLEditor::GetPreferredIMEState() const {
+  bool enableIME = [&]() {
+    if (IsReadonly()) {
+      return false;
+    }
+    const Selection* selection = GetSelection();
+    if (NS_WARN_IF(!selection)) {
+      return false;
+    }
+    if (selection->RangeCount() == 0) {
+      return true;
+    }
+    const nsRange* range = selection->GetRangeAt(0);
+    return range->IsPositioned() && range->GetStartContainer()->IsEditable() &&
+           range->GetEndContainer()->IsEditable();
+  }();
+  return IMEState{enableIME ? IMEEnabled::Enabled : IMEEnabled::Disabled,
+                  IMEState::DONT_CHANGE_OPEN_STATE};
+}
+
+already_AddRefed<Element> HTMLEditor::GetInputEventTargetElement() const {
+  if (MOZ_UNLIKELY(!SelectionRef().RangeCount())) {
+    return nullptr;
+  }
+
+  RefPtr<Element> target = ComputeEditingHost(LimitInBodyElement::No);
+  if (target) {
+    return target.forget();
+  }
+
+  nsIContent* focusContent =
+      nsIContent::FromNodeOrNull(SelectionRef().GetFocusNode());
+  if (!focusContent || focusContent->IsEditable()) {
+    return nullptr;
+  }
+  for (Element* element : focusContent->AncestorsOfType<Element>()) {
+    if (element->IsEditable()) {
+      target = element->GetEditingHost();
+      return target.forget();
+    }
+  }
+  return nullptr;
+}
+
+}  

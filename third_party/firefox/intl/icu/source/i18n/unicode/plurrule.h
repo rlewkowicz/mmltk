@@ -1,0 +1,166 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*******************************************************************************
+* Copyright (C) 2008-2015, International Business Machines Corporation and
+* others. All Rights Reserved.
+*******************************************************************************
+*
+*
+* File PLURRULE.H
+*
+* Modification History:*
+*   Date        Name        Description
+*
+********************************************************************************
+*/
+
+#ifndef PLURRULE
+#define PLURRULE
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/format.h"
+#include "unicode/upluralrules.h"
+#ifndef U_HIDE_INTERNAL_API
+#include "unicode/numfmt.h"
+#endif  /* U_HIDE_INTERNAL_API */
+
+#define UPLRULES_NO_UNIQUE_VALUE ((double)-0.00123456777)
+
+U_NAMESPACE_BEGIN
+
+class Hashtable;
+class IFixedDecimal;
+class FixedDecimal;
+class RuleChain;
+class PluralRuleParser;
+class PluralKeywordEnumeration;
+class AndConstraint;
+class SharedPluralRules;
+class StandardPluralRanges;
+
+namespace number {
+class FormattedNumber;
+class FormattedNumberRange;
+namespace impl {
+class UFormattedNumberRangeData;
+class DecimalQuantity;
+class DecNum;
+}
+}
+
+#ifndef U_HIDE_INTERNAL_API
+using icu::number::impl::DecimalQuantity;
+#endif  /* U_HIDE_INTERNAL_API */
+
+class U_I18N_API PluralRules : public UObject {
+public:
+
+    PluralRules(UErrorCode& status);
+
+    PluralRules(const PluralRules& other);
+
+    virtual ~PluralRules();
+
+    PluralRules* clone() const;
+
+    PluralRules& operator=(const PluralRules&);
+
+    static PluralRules* U_EXPORT2 createRules(const UnicodeString& description,
+                                              UErrorCode& status);
+
+    static PluralRules* U_EXPORT2 createDefaultRules(UErrorCode& status);
+
+    static PluralRules* U_EXPORT2 forLocale(const Locale& locale, UErrorCode& status);
+
+    static PluralRules* U_EXPORT2 forLocale(const Locale& locale, UPluralType type, UErrorCode& status);
+
+#ifndef U_HIDE_INTERNAL_API
+    static StringEnumeration* U_EXPORT2 getAvailableLocales(UErrorCode &status);
+
+    static PluralRules* U_EXPORT2 internalForLocale(const Locale& locale, UPluralType type, UErrorCode& status);
+
+    static const SharedPluralRules* U_EXPORT2 createSharedInstance(
+            const Locale& locale, UPluralType type, UErrorCode& status);
+
+
+#endif  /* U_HIDE_INTERNAL_API */
+
+    UnicodeString select(int32_t number) const;
+
+    UnicodeString select(double number) const;
+
+    UnicodeString select(const number::FormattedNumber& number, UErrorCode& status) const;
+
+    UnicodeString select(const number::FormattedNumberRange& range, UErrorCode& status) const;
+
+#ifndef U_HIDE_INTERNAL_API
+    UnicodeString select(const IFixedDecimal &number) const;
+    UnicodeString select(const number::impl::UFormattedNumberRangeData* urange, UErrorCode& status) const;
+#endif  /* U_HIDE_INTERNAL_API */
+
+    StringEnumeration* getKeywords(UErrorCode& status) const;
+
+#ifndef U_HIDE_DEPRECATED_API
+    double getUniqueKeywordValue(const UnicodeString& keyword);
+
+    int32_t getAllKeywordValues(const UnicodeString &keyword,
+                                double *dest, int32_t destCapacity,
+                                UErrorCode& status);
+#endif  /* U_HIDE_DEPRECATED_API */
+
+    int32_t getSamples(const UnicodeString &keyword,
+                       double *dest, int32_t destCapacity,
+                       UErrorCode& status);
+
+#ifndef U_HIDE_INTERNAL_API
+    int32_t getSamples(const UnicodeString &keyword,
+                       DecimalQuantity *dest, int32_t destCapacity,
+                       UErrorCode& status);
+#endif  /* U_HIDE_INTERNAL_API */
+
+    UBool isKeyword(const UnicodeString& keyword) const;
+
+
+    UnicodeString getKeywordOther() const;
+
+#ifndef U_HIDE_INTERNAL_API
+     UnicodeString getRules() const;
+#endif  /* U_HIDE_INTERNAL_API */
+
+    virtual bool operator==(const PluralRules& other) const;
+
+    bool operator!=(const PluralRules& other) const  {return !operator==(other);}
+
+
+    static UClassID U_EXPORT2 getStaticClassID();
+
+    virtual UClassID getDynamicClassID() const override;
+
+
+private:
+    RuleChain  *mRules;
+    StandardPluralRanges *mStandardPluralRanges;
+
+    PluralRules() = delete;   
+    UnicodeString   getRuleFromResource(const Locale& locale, UPluralType type, UErrorCode& status);
+    RuleChain      *rulesForKeyword(const UnicodeString &keyword) const;
+    PluralRules    *clone(UErrorCode& status) const;
+
+    UErrorCode mInternalStatus;
+
+    friend class PluralRuleParser;
+};
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif // _PLURRULE

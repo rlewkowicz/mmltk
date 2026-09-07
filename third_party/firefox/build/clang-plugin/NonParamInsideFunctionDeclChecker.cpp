@@ -1,0 +1,153 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "NonParamInsideFunctionDeclChecker.h"
+#include "CustomMatchers.h"
+#include "clang/Basic/TargetInfo.h"
+
+class NonParamAnnotation : public CustomTypeAnnotation {
+public:
+  NonParamAnnotation() : CustomTypeAnnotation(moz_non_param, "non-param"){};
+
+protected:
+  static unsigned checkExplicitAlignment(const Decl *D) {
+    ASTContext &Context = D->getASTContext();
+#if CLANG_VERSION_FULL >= 1600
+    unsigned PointerAlign = Context.getTargetInfo().getPointerAlign(LangAS::Default);
+#else
+    unsigned PointerAlign = Context.getTargetInfo().getPointerAlign(0);
+#endif
+
+    unsigned MaxAlign = D->getMaxAlignment();
+    if (MaxAlign > PointerAlign) {
+      return Context.toCharUnitsFromBits(MaxAlign).getQuantity();
+    }
+    return 0;
+  }
+
+  static bool canPassAsTemporary(const CXXRecordDecl *D) {
+    bool HasNonDeletedCopyOrMove = false;
+
+    if (D->needsImplicitCopyConstructor() &&
+        !D->defaultedCopyConstructorIsDeleted()) {
+      if (!D->hasTrivialCopyConstructorForCall())
+        return false;
+      HasNonDeletedCopyOrMove = true;
+    }
+
+    if (D->needsImplicitMoveConstructor() &&
+        !D->defaultedMoveConstructorIsDeleted()) {
+      if (!D->hasTrivialMoveConstructorForCall())
+        return false;
+      HasNonDeletedCopyOrMove = true;
+    }
+
+    if (D->needsImplicitDestructor() && !D->defaultedDestructorIsDeleted() &&
+        !D->hasTrivialDestructorForCall())
+      return false;
+
+    for (const CXXMethodDecl *MD : D->methods()) {
+      if (MD->isDeleted())
+        continue;
+
+      auto *CD = dyn_cast<CXXConstructorDecl>(MD);
+      if (CD && CD->isCopyOrMoveConstructor())
+        HasNonDeletedCopyOrMove = true;
+      else if (!isa<CXXDestructorDecl>(MD))
+        continue;
+
+      if (!MD->isTrivialForCall())
+        return false;
+    }
+
+    return HasNonDeletedCopyOrMove;
+  }
+
+  std::string getImplicitReason(const TagDecl *D,
+                                VisitFlags &ToVisit) const override {
+    if (!D->getASTContext().getTargetInfo().getCXXABI().isMicrosoft() &&
+        D->isInStdNamespace()) {
+      StringRef Name = getNameChecked(D);
+      if (Name == "function") {
+        ToVisit = VISIT_NONE;
+        return "";
+      }
+    }
+
+    auto RD = dyn_cast<CXXRecordDecl>(D);
+    if (RD && RD->isCompleteDefinition() && canPassAsTemporary(RD)) {
+      return "";
+    }
+
+    if (unsigned ExplicitAlign = checkExplicitAlignment(D)) {
+      return "it has an explicit alignment of '" +
+             std::to_string(ExplicitAlign) + "'";
+    }
+
+    if (auto RD = dyn_cast<RecordDecl>(D)) {
+      for (auto F : RD->fields()) {
+        if (unsigned ExplicitAlign = checkExplicitAlignment(F)) {
+          return ("member '" + F->getName() +
+                  "' has an explicit alignment of '" +
+                  std::to_string(ExplicitAlign) + "'")
+              .str();
+        }
+      }
+    }
+
+    return "";
+  }
+};
+NonParamAnnotation NonParam;
+
+void NonParamInsideFunctionDeclChecker::registerMatchers(
+    MatchFinder *AstMatcher) {
+  AstMatcher->addMatcher(
+      functionDecl(isDefinition(),
+                   isFirstParty(),
+                   optionally(hasAncestor(
+                       classTemplateSpecializationDecl().bind("spec"))),
+                   unless(isDeleted()))
+          .bind("func"),
+      this);
+  AstMatcher->addMatcher(lambdaExpr().bind("lambda"), this);
+}
+
+void NonParamInsideFunctionDeclChecker::check(
+    const MatchFinder::MatchResult &Result) {
+  static DenseSet<const FunctionDecl *> CheckedFunctionDecls;
+
+  const FunctionDecl *func = Result.Nodes.getNodeAs<FunctionDecl>("func");
+  if (!func) {
+    func = Result.Nodes.getNodeAs<LambdaExpr>("lambda")->getCallOperator();
+  }
+
+  if (CheckedFunctionDecls.count(func)) {
+    return;
+  }
+  CheckedFunctionDecls.insert(func);
+
+  const ClassTemplateSpecializationDecl *Spec =
+      Result.Nodes.getNodeAs<ClassTemplateSpecializationDecl>("spec");
+
+  for (ParmVarDecl *p : func->parameters()) {
+    QualType T = p->getType().withoutLocalFastQualifiers();
+    if (NonParam.hasEffectiveAnnotation(T)) {
+      diag(p->getLocation(), "Type %0 must not be used as parameter",
+           DiagnosticIDs::Error)
+          << T;
+      diag(p->getLocation(),
+           "Please consider passing a const reference instead",
+           DiagnosticIDs::Note);
+
+      if (Spec) {
+        diag(Spec->getPointOfInstantiation(),
+             "The bad argument was passed to %0 here", DiagnosticIDs::Note)
+            << Spec->getSpecializedTemplate();
+      }
+
+      NonParam.dumpAnnotationReason(*this, T, p->getLocation());
+    }
+  }
+}

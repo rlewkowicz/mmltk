@@ -1,0 +1,45 @@
+// Copyright 2019 The ANGLE Project Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(COMPILER_TRANSLATOR_VALIDATEAST_H_)
+#define COMPILER_TRANSLATOR_VALIDATEAST_H_
+
+#include "compiler/translator/BaseTypes.h"
+#include "compiler/translator/Common.h"
+
+namespace sh
+{
+class TDiagnostics;
+class TIntermNode;
+
+struct ValidateASTOptions
+{
+
+    bool validateSingleParent = true;
+    bool validateVariableReferences = true;
+    bool validateSpecConstReferences = false;
+    bool validateOps = true;
+    bool validateBuiltInOps = true;
+    bool validateFunctionCall = true;
+    bool validateNoRawFunctionCalls = true;
+    bool validateNullNodes = true;
+    bool validateQualifiers = true;
+    bool validatePrecision = true;
+    bool validateInitializers = true;  
+    bool validateUniqueFunctions = true;  
+    bool validateStructUsage = true;
+    bool validateExpressionTypes = true;
+    bool validateMultiDeclarations = true;
+    bool validateNoStatementsAfterBranch = true;
+    bool validateNoSwizzleOfSwizzle = true;
+    bool validateNoQualifiersOnConstructors = true;
+
+    bool validateNoMoreTransformations = false;
+};
+
+bool ValidateAST(TIntermNode *root, TDiagnostics *diagnostics, const ValidateASTOptions &options);
+
+}  
+
+#endif

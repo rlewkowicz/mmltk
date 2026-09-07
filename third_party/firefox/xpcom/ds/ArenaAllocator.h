@@ -1,0 +1,157 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_ArenaAllocator_h
+#define mozilla_ArenaAllocator_h
+
+#include <algorithm>
+#include <cstdint>
+
+#include "mozilla/Assertions.h"
+#include "mozilla/fallible.h"
+#include "mozilla/Likely.h"
+#include "mozilla/MathAlgorithms.h"
+#include "mozilla/MemoryChecking.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/OperatorNewExtensions.h"
+#include "mozilla/Poison.h"
+#include "nsDebug.h"
+
+namespace mozilla {
+
+template <size_t ArenaSize, size_t Alignment = 1>
+class ArenaAllocator {
+ public:
+  constexpr ArenaAllocator() : mHead(), mCurrent(nullptr) {
+    static_assert(
+        mozilla::FloorLog2(Alignment) == mozilla::CeilingLog2(Alignment),
+        "ArenaAllocator alignment must be a power of two");
+  }
+
+  ArenaAllocator(const ArenaAllocator&) = delete;
+  ArenaAllocator& operator=(const ArenaAllocator&) = delete;
+
+  ~ArenaAllocator() { Clear(); }
+
+  MOZ_ALWAYS_INLINE void* Allocate(size_t aSize, const fallible_t&) {
+    MOZ_RELEASE_ASSERT(aSize, "Allocation size must be non-zero");
+    return InternalAllocate(AlignedSize(aSize));
+  }
+
+  void* Allocate(size_t aSize) {
+    void* p = Allocate(aSize, fallible);
+    if (MOZ_UNLIKELY(!p)) {
+      NS_ABORT_OOM(std::max(aSize, ArenaSize));
+    }
+
+    return p;
+  }
+
+  void Clear() {
+    auto a = mHead.next;
+    while (a) {
+      auto tmp = a;
+      a = a->next;
+      free(tmp);
+    }
+
+    mHead.next = nullptr;
+    mCurrent = nullptr;
+  }
+
+  static constexpr size_t AlignedSize(size_t aSize) {
+    return (aSize + (Alignment - 1)) & ~(Alignment - 1);
+  }
+
+  size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const {
+    size_t s = 0;
+    for (auto arena = mHead.next; arena; arena = arena->next) {
+      s += aMallocSizeOf(arena);
+    }
+
+    return s;
+  }
+
+  void Check() {
+    if (mCurrent) {
+      mCurrent->canary.Check();
+    }
+  }
+
+ private:
+  struct ArenaHeader {
+    uintptr_t offset;
+    uintptr_t tail;
+  };
+
+  struct ArenaChunk {
+    constexpr ArenaChunk() : header{0, 0}, next(nullptr) {}
+
+    explicit ArenaChunk(size_t aSize)
+        : header{AlignedSize(uintptr_t(this + 1)), uintptr_t(this) + aSize},
+          next(nullptr) {}
+
+    CorruptionCanary canary;
+    ArenaHeader header;
+    ArenaChunk* next;
+
+    void* Allocate(size_t aSize) {
+      MOZ_ASSERT(aSize <= Available());
+      char* p = reinterpret_cast<char*>(header.offset);
+      MOZ_RELEASE_ASSERT(p);
+      header.offset += aSize;
+      canary.Check();
+      MOZ_MAKE_MEM_UNDEFINED(p, aSize);
+      return p;
+    }
+
+    size_t Available() const { return header.tail - header.offset; }
+  };
+
+  ArenaChunk* AllocateChunk(size_t aSize) {
+    static const size_t kOffset = AlignedSize(sizeof(ArenaChunk));
+    MOZ_ASSERT(kOffset < aSize);
+
+    const size_t chunkSize = aSize + kOffset;
+    void* p = malloc(chunkSize);
+    if (!p) {
+      return nullptr;
+    }
+
+    ArenaChunk* arena = new (KnownNotNull, p) ArenaChunk(chunkSize);
+    MOZ_MAKE_MEM_NOACCESS((void*)arena->header.offset,
+                          arena->header.tail - arena->header.offset);
+
+    arena->next = mHead.next;
+    mHead.next = arena;
+
+    if (aSize == ArenaSize - kOffset) {
+      mCurrent = arena;
+    }
+
+    return arena;
+  }
+
+  MOZ_ALWAYS_INLINE void* InternalAllocate(size_t aSize) {
+    static_assert(ArenaSize > AlignedSize(sizeof(ArenaChunk)),
+                  "Arena size must be greater than the header size");
+
+    static const size_t kMaxArenaCapacity =
+        ArenaSize - AlignedSize(sizeof(ArenaChunk));
+
+    if (mCurrent && aSize <= mCurrent->Available()) {
+      return mCurrent->Allocate(aSize);
+    }
+
+    ArenaChunk* arena = AllocateChunk(std::max(kMaxArenaCapacity, aSize));
+    return arena ? arena->Allocate(aSize) : nullptr;
+  }
+
+  ArenaChunk mHead;
+  ArenaChunk* mCurrent;
+};
+
+}  
+
+#endif  // mozilla_ArenaAllocator_h

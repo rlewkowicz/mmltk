@@ -1,0 +1,137 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MP3_DEMUXER_H_
+#define MP3_DEMUXER_H_
+
+#include "MP3FrameParser.h"
+#include "MediaDataDemuxer.h"
+#include "MediaResource.h"
+
+namespace mozilla {
+
+class MP3TrackDemuxer;
+
+DDLoggedTypeDeclNameAndBase(MP3Demuxer, MediaDataDemuxer);
+DDLoggedTypeNameAndBase(MP3TrackDemuxer, MediaTrackDemuxer);
+
+class MP3Demuxer : public MediaDataDemuxer,
+                   public DecoderDoctorLifeLogger<MP3Demuxer> {
+ public:
+  explicit MP3Demuxer(MediaResource* aSource);
+  RefPtr<InitPromise> Init() override;
+  uint32_t GetNumberTracks(TrackInfo::TrackType aType) const override;
+  already_AddRefed<MediaTrackDemuxer> GetTrackDemuxer(
+      TrackInfo::TrackType aType, uint32_t aTrackNumber) override;
+  bool IsSeekable() const override;
+  void NotifyDataArrived() override;
+  void NotifyDataRemoved() override;
+
+ private:
+  bool InitInternal();
+
+  RefPtr<MediaResource> mSource;
+  RefPtr<MP3TrackDemuxer> mTrackDemuxer;
+};
+
+class MP3TrackDemuxer : public MediaTrackDemuxer,
+                        public DecoderDoctorLifeLogger<MP3TrackDemuxer> {
+ public:
+  explicit MP3TrackDemuxer(MediaResource* aSource);
+
+  bool Init();
+
+  int64_t StreamLength() const;
+
+  media::NullableTimeUnit Duration() const;
+
+  media::TimeUnit Duration(int64_t aNumFrames) const;
+
+  media::TimeUnit SeekPosition() const;
+
+  const FrameParser::Frame& LastFrame() const;
+  RefPtr<MediaRawData> DemuxSample();
+
+  const ID3Parser::ID3Header& ID3Header() const;
+  const FrameParser::VBRHeader& VBRInfo() const;
+
+  UniquePtr<TrackInfo> GetInfo() const override;
+  RefPtr<SeekPromise> Seek(const media::TimeUnit& aTime) override;
+  RefPtr<SamplesPromise> GetSamples(int32_t aNumSamples = 1) override;
+  void Reset() override;
+  RefPtr<SkipAccessPointPromise> SkipToNextRandomAccessPoint(
+      const media::TimeUnit& aTimeThreshold) override;
+  int64_t GetResourceOffset() const override;
+  media::TimeIntervals GetBuffered() override;
+  uint32_t EncoderDelayFrames() const;
+  uint32_t PaddingFrames() const;
+
+ private:
+  ~MP3TrackDemuxer() = default;
+
+  media::TimeUnit FastSeek(const media::TimeUnit& aTime);
+
+  media::TimeUnit ScanUntil(const media::TimeUnit& aTime);
+
+  MediaByteRange FindFirstFrame();
+
+  MediaByteRange FindNextFrame();
+
+  bool SkipNextFrame(const MediaByteRange& aRange);
+
+  already_AddRefed<MediaRawData> GetNextFrame(const MediaByteRange& aRange);
+
+  void UpdateState(const MediaByteRange& aRange);
+
+  int64_t OffsetFromFrameIndex(int64_t aFrameIndex) const;
+
+  int64_t FrameIndexFromOffset(int64_t aOffset) const;
+
+  int64_t FrameIndexFromTime(const media::TimeUnit& aTime) const;
+
+  uint32_t Read(uint8_t* aBuffer, int64_t aOffset, uint32_t aSize);
+
+  double AverageFrameLength() const;
+
+  Maybe<uint32_t> ValidNumAudioFrames() const;
+
+  media::TimeUnit EncoderDelay() const;
+
+  media::TimeUnit Padding() const;
+
+  MediaResourceIndex mSource;
+
+  FrameParser mParser;
+
+  bool mFrameLock;
+
+  int64_t mOffset;
+
+  int64_t mFirstFrameOffset;
+
+  uint64_t mNumParsedFrames;
+
+  int64_t mFrameIndex;
+
+  int64_t mTotalFrameLen;
+
+  uint32_t mSamplesPerFrame;
+
+  uint32_t mSamplesPerSecond;
+
+  uint32_t mChannels;
+
+  uint32_t mBitrate = 0;
+
+  UniquePtr<AudioInfo> mInfo;
+
+  uint32_t mEncoderDelay = 0;
+  uint32_t mEncoderPadding = 0;
+  int32_t mRemainingEncoderPadding = 0;
+  bool mEOS = false;
+};
+
+}  
+
+#endif

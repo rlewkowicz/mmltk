@@ -1,0 +1,253 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "RenderCompositorSWGL.h"
+
+#include "mozilla/gfx/Logging.h"
+#include "mozilla/widget/CompositorWidget.h"
+
+#if defined(MOZ_WIDGET_GTK)
+#  include "mozilla/WidgetUtilsGtk.h"
+#endif
+
+namespace mozilla {
+using namespace gfx;
+
+namespace wr {
+
+extern LazyLogModule gRenderThreadLog;
+#define LOG(...) MOZ_LOG(gRenderThreadLog, LogLevel::Debug, (__VA_ARGS__))
+
+UniquePtr<RenderCompositor> RenderCompositorSWGL::Create(
+    const RefPtr<widget::CompositorWidget>& aWidget, nsACString& aError) {
+  void* ctx = wr_swgl_create_context();
+  if (!ctx) {
+    gfxCriticalNote << "Failed SWGL context creation for WebRender";
+    return nullptr;
+  }
+  return MakeUnique<RenderCompositorSWGL>(aWidget, ctx);
+}
+
+RenderCompositorSWGL::RenderCompositorSWGL(
+    const RefPtr<widget::CompositorWidget>& aWidget, void* aContext)
+    : RenderCompositor(aWidget), mContext(aContext) {
+  MOZ_ASSERT(mContext);
+  LOG("RenderCompositorSWGL::RenderCompositorSWGL()");
+}
+
+RenderCompositorSWGL::~RenderCompositorSWGL() {
+  LOG("RenderCompositorSWGL::~RenderCompositorSWGL()");
+
+  wr_swgl_destroy_context(mContext);
+}
+
+void RenderCompositorSWGL::ClearMappedBuffer() {
+  mMappedData = nullptr;
+  mMappedStride = 0;
+  mDT = nullptr;
+}
+
+bool RenderCompositorSWGL::MakeCurrent() {
+  wr_swgl_make_current(mContext);
+  return true;
+}
+
+bool RenderCompositorSWGL::BeginFrame() {
+  mRenderWidgetSize = Some(mWidget->GetClientSize());
+#if defined(MOZ_WIDGET_GTK)
+  if (mLastRenderWidgetSize != mRenderWidgetSize.value()) {
+    mLastRenderWidgetSize = mRenderWidgetSize.value();
+    mRequestFullRender = true;
+  }
+#endif
+  ClearMappedBuffer();
+  mDirtyRegion = LayoutDeviceIntRect(LayoutDeviceIntPoint(), GetBufferSize());
+  wr_swgl_make_current(mContext);
+  return true;
+}
+
+bool RenderCompositorSWGL::AllocateMappedBuffer(
+    const wr::DeviceIntRect* aOpaqueRects, size_t aNumOpaqueRects) {
+  MOZ_ASSERT(!mDT);
+  mDT = mWidget->StartRemoteDrawingInRegion(mDirtyRegion);
+  if (!mDT) {
+    gfxCriticalNoteOnce
+        << "RenderCompositorSWGL failed mapping default framebuffer, no dt";
+    return false;
+  }
+  uint8_t* data = nullptr;
+  gfx::IntSize size;
+  int32_t stride = 0;
+  gfx::SurfaceFormat format = gfx::SurfaceFormat::UNKNOWN;
+  if (!mSurface && mDT->LockBits(&data, &size, &stride, &format) &&
+      (format != gfx::SurfaceFormat::B8G8R8A8 &&
+       format != gfx::SurfaceFormat::B8G8R8X8)) {
+    mDT->ReleaseBits(data);
+    data = nullptr;
+  }
+  LayoutDeviceIntRect bounds = mDirtyRegion.GetBounds();
+  if (data) {
+    mMappedData = data;
+    mMappedStride = stride;
+    if (size != bounds.Size().ToUnknownSize()) {
+      bounds.ExpandToEnclose(LayoutDeviceIntPoint(0, 0));
+    }
+    bounds.IntersectRect(
+        bounds,
+        LayoutDeviceIntRect(bounds.TopLeft(),
+                            LayoutDeviceIntSize(size.width, size.height)));
+  } else {
+    size = bounds.Size().ToUnknownSize();
+    if (!mSurface || mSurface->GetSize() != size) {
+      mSurface = gfx::Factory::CreateDataSourceSurface(
+          size, gfx::SurfaceFormat::B8G8R8A8);
+    }
+    gfx::DataSourceSurface::MappedSurface map = {nullptr, 0};
+    if (!mSurface || !mSurface->Map(gfx::DataSourceSurface::READ_WRITE, &map)) {
+      mWidget->EndRemoteDrawingInRegion(mDT, mDirtyRegion);
+      ClearMappedBuffer();
+      gfxCriticalNoteOnce
+          << "RenderCompositorSWGL failed mapping default framebuffer, no surf";
+      return false;
+    }
+    mMappedData = map.mData;
+    mMappedStride = map.mStride;
+  }
+  MOZ_ASSERT(mMappedData != nullptr && mMappedStride > 0);
+  wr_swgl_init_default_framebuffer(mContext, bounds.x, bounds.y, bounds.width,
+                                   bounds.height, mMappedStride, mMappedData);
+
+  LayoutDeviceIntRegion opaque;
+  for (size_t i = 0; i < aNumOpaqueRects; i++) {
+    const auto& rect = aOpaqueRects[i];
+    opaque.OrWith(LayoutDeviceIntRect(rect.min.x, rect.min.y, rect.width(),
+                                      rect.height()));
+  }
+
+  LayoutDeviceIntRegion clear = mWidget->GetTransparentRegion();
+  clear.AndWith(mDirtyRegion);
+  clear.SubOut(opaque);
+  for (auto iter = clear.RectIter(); !iter.Done(); iter.Next()) {
+    const auto& rect = iter.Get();
+    wr_swgl_clear_color_rect(mContext, 0, rect.x, rect.y, rect.width,
+                             rect.height, 0, 0, 0, 0);
+  }
+
+  return true;
+}
+
+void RenderCompositorSWGL::StartCompositing(
+    wr::ColorF aClearColor, const wr::DeviceIntRect* aDirtyRects,
+    size_t aNumDirtyRects, const wr::DeviceIntRect* aOpaqueRects,
+    size_t aNumOpaqueRects) {
+  if (mDT) {
+    CommitMappedBuffer(false);
+    mDirtyRegion = LayoutDeviceIntRect(LayoutDeviceIntPoint(), GetBufferSize());
+  }
+  if (aNumDirtyRects) {
+    auto bounds = mDirtyRegion.GetBounds();
+    mDirtyRegion.SetEmpty();
+    for (size_t i = 0; i < aNumDirtyRects; i++) {
+      const auto& rect = aDirtyRects[i];
+      mDirtyRegion.OrWith(LayoutDeviceIntRect(rect.min.x, rect.min.y,
+                                              rect.width(), rect.height()));
+    }
+    mDirtyRegion.AndWith(bounds);
+  }
+  if (mDirtyRegion.IsEmpty() ||
+      !AllocateMappedBuffer(aOpaqueRects, aNumOpaqueRects)) {
+    auto bounds = mDirtyRegion.GetBounds();
+    bounds.width = std::max(bounds.width, 2);
+    bounds.height = std::max(bounds.height, 2);
+    wr_swgl_init_default_framebuffer(mContext, bounds.x, bounds.y, bounds.width,
+                                     bounds.height, 0, nullptr);
+  }
+}
+
+void RenderCompositorSWGL::CommitMappedBuffer(bool aDirty) {
+  if (!mDT) {
+    mDirtyRegion.SetEmpty();
+    return;
+  }
+  if (aDirty) {
+    wr_swgl_resolve_framebuffer(mContext, 0);
+  }
+  wr_swgl_init_default_framebuffer(mContext, 0, 0, 0, 0, 0, nullptr);
+  MOZ_ASSERT(mMappedData != nullptr);
+  if (mSurface) {
+    mSurface->Unmap();
+    if (aDirty) {
+      LayoutDeviceIntRect bounds = mDirtyRegion.GetBounds();
+      gfx::IntPoint srcOffset = bounds.TopLeft().ToUnknownPoint();
+      gfx::IntPoint dstOffset = mDT->GetSize() == bounds.Size().ToUnknownSize()
+                                    ? srcOffset
+                                    : gfx::IntPoint(0, 0);
+      for (auto iter = mDirtyRegion.RectIter(); !iter.Done(); iter.Next()) {
+        gfx::IntRect dirtyRect = iter.Get().ToUnknownRect();
+        mDT->CopySurface(mSurface, dirtyRect - srcOffset,
+                         dirtyRect.TopLeft() - dstOffset);
+      }
+    }
+  } else {
+    mDT->ReleaseBits(mMappedData);
+  }
+  mDT->Flush();
+
+  mWidget->EndRemoteDrawingInRegion(mDT, mDirtyRegion);
+  mDirtyRegion.SetEmpty();
+  ClearMappedBuffer();
+}
+
+void RenderCompositorSWGL::CancelFrame() {
+  CommitMappedBuffer(false);
+  mRenderWidgetSize = Nothing();
+}
+
+RenderedFrameId RenderCompositorSWGL::EndFrame(
+    const nsTArray<DeviceIntRect>& aDirtyRects) {
+  RenderedFrameId frameId = GetNextRenderFrameId();
+  CommitMappedBuffer();
+  mRenderWidgetSize = Nothing();
+  return frameId;
+}
+
+bool RenderCompositorSWGL::RequestFullRender() {
+#if defined(MOZ_WIDGET_GTK)
+  if (mRequestFullRender) {
+    mRequestFullRender = false;
+    return true;
+  }
+  return false;
+#else
+  return false;
+#endif
+}
+
+void RenderCompositorSWGL::Pause() {}
+
+bool RenderCompositorSWGL::Resume() {
+#if defined(MOZ_WIDGET_GTK)
+  mRequestFullRender = true;
+#endif
+  return true;
+}
+
+LayoutDeviceIntSize RenderCompositorSWGL::GetBufferSize() {
+  return mRenderWidgetSize ? mRenderWidgetSize.value()
+                           : mWidget->GetClientSize();
+}
+
+void RenderCompositorSWGL::GetCompositorCapabilities(
+    CompositorCapabilities* aCaps) {
+  aCaps->max_update_rects = 1;
+
+#if defined(MOZ_WIDGET_GTK)
+  aCaps->redraw_on_invalidation = widget::GdkIsX11Display();
+#else
+  aCaps->redraw_on_invalidation = true;
+#endif
+}
+
+}  
+}  

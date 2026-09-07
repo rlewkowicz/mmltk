@@ -1,0 +1,119 @@
+/*
+ * Copyright 2016 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+
+#ifndef wasm_wasm_baseline_defs_h
+#define wasm_wasm_baseline_defs_h
+
+#include "jit/AtomicOp.h"
+#include "jit/IonTypes.h"
+#include "jit/JitAllocPolicy.h"
+#include "jit/Label.h"
+#include "jit/RegisterAllocator.h"
+#include "jit/Registers.h"
+#include "jit/RegisterSets.h"
+#if defined(JS_CODEGEN_ARM)
+#  include "jit/arm/Assembler-arm.h"
+#endif
+#if defined(JS_CODEGEN_X64) || defined(JS_CODEGEN_X86)
+#  include "jit/x86-shared/Architecture-x86-shared.h"
+#  include "jit/x86-shared/Assembler-x86-shared.h"
+#endif
+#if defined(JS_CODEGEN_MIPS64)
+#  include "jit/mips-shared/Assembler-mips-shared.h"
+#  include "jit/mips64/Assembler-mips64.h"
+#endif
+#if defined(JS_CODEGEN_LOONG64)
+#  include "jit/loong64/Assembler-loong64.h"
+#endif
+#if defined(JS_CODEGEN_RISCV64)
+#  include "jit/riscv64/Assembler-riscv64.h"
+#endif
+#include "js/ScalarType.h"
+#include "util/Memory.h"
+#include "wasm/WasmCodegenTypes.h"
+#include "wasm/WasmDebugFrame.h"
+#include "wasm/WasmGC.h"
+#include "wasm/WasmGcObject.h"
+#include "wasm/WasmGenerator.h"
+#include "wasm/WasmInstance.h"
+#include "wasm/WasmOpIter.h"
+#include "wasm/WasmSignalHandlers.h"
+#include "wasm/WasmStubs.h"
+#include "wasm/WasmValidate.h"
+
+namespace js {
+namespace wasm {
+
+using HandleNaNSpecially = bool;
+using InvertBranch = bool;
+using IsKnownNotZero = bool;
+using IsUnsigned = bool;
+using IsRemainder = bool;
+using NeedsBoundsCheck = bool;
+using WantResult = bool;
+using ZeroOnOverflow = bool;
+
+class BaseStackFrame;
+
+enum class RestoreState {
+  None,
+  PinnedRegs,
+  All,
+};
+enum class RhsDestOp { True = true };
+
+
+#ifdef JS_CODEGEN_X64
+#  define RABALDR_ZERO_EXTENDS
+#  define RABALDR_PIN_INSTANCE
+#endif
+
+#ifdef JS_CODEGEN_ARM64
+#  define RABALDR_CHUNKY_STACK
+#  define RABALDR_ZERO_EXTENDS
+#  define RABALDR_PIN_INSTANCE
+#endif
+
+#ifdef JS_CODEGEN_X86
+#  define RABALDR_INT_DIV_I64_CALLOUT
+#endif
+
+#ifdef JS_CODEGEN_ARM
+#  define RABALDR_INT_DIV_I64_CALLOUT
+#  define RABALDR_I64_TO_FLOAT_CALLOUT
+#  define RABALDR_FLOAT_TO_I64_CALLOUT
+#endif
+
+#ifdef JS_CODEGEN_MIPS64
+#  define RABALDR_PIN_INSTANCE
+#endif
+
+#ifdef JS_CODEGEN_LOONG64
+#  define RABALDR_PIN_INSTANCE
+#endif
+
+#ifdef JS_CODEGEN_RISCV64
+#  define RABALDR_PIN_INSTANCE
+#endif
+
+
+static constexpr size_t MaxPushesPerOpcode = 10;
+
+}  
+}  
+
+#endif  // wasm_wasm_baseline_defs_h

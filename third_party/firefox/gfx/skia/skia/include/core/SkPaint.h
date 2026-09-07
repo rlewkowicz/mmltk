@@ -1,0 +1,242 @@
+/*
+ * Copyright 2006 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkPaint_DEFINED)
+#define SkPaint_DEFINED
+
+#include "include/core/SkColor.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkScalar.h"
+#include "include/core/SkTypes.h"
+#include "include/private/base/SkCPUTypes.h"
+#include "include/private/base/SkFloatingPoint.h"
+#include "include/private/base/SkTo.h"
+#include "include/private/base/SkTypeTraits.h"
+
+#include <cstdint>
+#include <optional>
+#include <type_traits>
+
+class SkBlender;
+class SkColorFilter;
+class SkColorSpace;
+class SkImageFilter;
+class SkMaskFilter;
+class SkPathEffect;
+class SkShader;
+enum class SkBlendMode;
+struct SkRect;
+
+class SK_API SkPaint {
+public:
+
+    SkPaint();
+
+    explicit SkPaint(const SkColor4f& color, SkColorSpace* colorSpace = nullptr);
+
+    SkPaint(const SkPaint& paint);
+
+    SkPaint(SkPaint&& paint);
+
+    ~SkPaint();
+
+    SkPaint& operator=(const SkPaint& paint);
+
+    SkPaint& operator=(SkPaint&& paint);
+
+    SK_API friend bool operator==(const SkPaint& a, const SkPaint& b);
+
+    friend bool operator!=(const SkPaint& a, const SkPaint& b) {
+        return !(a == b);
+    }
+
+    void reset();
+
+    bool isAntiAlias() const {
+        return SkToBool(fBitfields.fAntiAlias);
+    }
+
+    void setAntiAlias(bool aa) { fBitfields.fAntiAlias = static_cast<unsigned>(aa); }
+
+    bool isDither() const {
+        return SkToBool(fBitfields.fDither);
+    }
+
+    void setDither(bool dither) { fBitfields.fDither = static_cast<unsigned>(dither); }
+
+    enum Style : uint8_t {
+        kFill_Style,          
+        kStroke_Style,        
+        kStrokeAndFill_Style, 
+    };
+
+    static constexpr int kStyleCount = kStrokeAndFill_Style + 1;
+
+    Style getStyle() const { return (Style)fBitfields.fStyle; }
+
+    void setStyle(Style style);
+
+    void setStroke(bool);
+
+    SkColor getColor() const { return fColor4f.toSkColor(); }
+
+    SkColor4f getColor4f() const { return fColor4f; }
+
+    void setColor(SkColor color);
+
+    void setColor(const SkColor4f& color, SkColorSpace* colorSpace = nullptr);
+
+    void setColor4f(const SkColor4f& color, SkColorSpace* colorSpace = nullptr) {
+        this->setColor(color, colorSpace);
+    }
+
+    float getAlphaf() const { return fColor4f.fA; }
+
+    uint8_t getAlpha() const {
+        return static_cast<uint8_t>(sk_float_round2int(this->getAlphaf() * 255));
+    }
+
+    void setAlphaf(float a);
+
+    void setAlpha(U8CPU a) {
+        this->setAlphaf(a * (1.0f / 255));
+    }
+
+    void setARGB(U8CPU a, U8CPU r, U8CPU g, U8CPU b);
+
+    SkScalar getStrokeWidth() const { return fWidth; }
+
+    void setStrokeWidth(SkScalar width);
+
+    SkScalar getStrokeMiter() const { return fMiterLimit; }
+
+    void setStrokeMiter(SkScalar miterLimit);
+
+    enum Cap {
+        kButt_Cap,                  
+        kRound_Cap,                 
+        kSquare_Cap,                
+        kLast_Cap    = kSquare_Cap, 
+        kDefault_Cap = kButt_Cap,   
+    };
+
+    static constexpr int kCapCount = kLast_Cap + 1;
+
+    enum Join : uint8_t {
+        kMiter_Join,                 
+        kRound_Join,                 
+        kBevel_Join,                 
+        kLast_Join    = kBevel_Join, 
+        kDefault_Join = kMiter_Join, 
+    };
+
+    static constexpr int kJoinCount = kLast_Join + 1;
+
+    Cap getStrokeCap() const { return (Cap)fBitfields.fCapType; }
+
+    void setStrokeCap(Cap cap);
+
+    Join getStrokeJoin() const { return (Join)fBitfields.fJoinType; }
+
+    void setStrokeJoin(Join join);
+
+    SkShader* getShader() const { return fShader.get(); }
+
+    sk_sp<SkShader> refShader() const;
+
+    void setShader(sk_sp<SkShader> shader);
+
+    SkColorFilter* getColorFilter() const { return fColorFilter.get(); }
+
+    sk_sp<SkColorFilter> refColorFilter() const;
+
+    void setColorFilter(sk_sp<SkColorFilter> colorFilter);
+
+    std::optional<SkBlendMode> asBlendMode() const;
+
+    SkBlendMode getBlendMode_or(SkBlendMode defaultMode) const;
+
+    bool isSrcOver() const;
+
+    void setBlendMode(SkBlendMode mode);
+
+    SkBlender* getBlender() const { return fBlender.get(); }
+
+    sk_sp<SkBlender> refBlender() const;
+
+    void setBlender(sk_sp<SkBlender> blender);
+
+    SkPathEffect* getPathEffect() const { return fPathEffect.get(); }
+
+    sk_sp<SkPathEffect> refPathEffect() const;
+
+    void setPathEffect(sk_sp<SkPathEffect> pathEffect);
+
+    SkMaskFilter* getMaskFilter() const { return fMaskFilter.get(); }
+
+    sk_sp<SkMaskFilter> refMaskFilter() const;
+
+    void setMaskFilter(sk_sp<SkMaskFilter> maskFilter);
+
+    SkImageFilter* getImageFilter() const { return fImageFilter.get(); }
+
+    sk_sp<SkImageFilter> refImageFilter() const;
+
+    void setImageFilter(sk_sp<SkImageFilter> imageFilter);
+
+    bool nothingToDraw() const;
+
+    bool canComputeFastBounds() const;
+
+    const SkRect& computeFastBounds(const SkRect& orig, SkRect* storage) const;
+
+    const SkRect& computeFastStrokeBounds(const SkRect& orig,
+                                          SkRect* storage) const {
+        return this->doComputeFastBounds(orig, storage, kStroke_Style);
+    }
+
+    const SkRect& doComputeFastBounds(const SkRect& orig, SkRect* storage,
+                                      Style style) const;
+
+    using sk_is_trivially_relocatable = std::true_type;
+
+private:
+    sk_sp<SkPathEffect>   fPathEffect;
+    sk_sp<SkShader>       fShader;
+    sk_sp<SkMaskFilter>   fMaskFilter;
+    sk_sp<SkColorFilter>  fColorFilter;
+    sk_sp<SkImageFilter>  fImageFilter;
+    sk_sp<SkBlender>      fBlender;
+
+    SkColor4f       fColor4f;
+    SkScalar        fWidth;
+    SkScalar        fMiterLimit;
+    union {
+        struct {
+            unsigned    fAntiAlias : 1;
+            unsigned    fDither : 1;
+            unsigned    fCapType : 2;
+            unsigned    fJoinType : 2;
+            unsigned    fStyle : 2;
+            unsigned    fPadding : 24;  
+        } fBitfields;
+        uint32_t fBitfieldsUInt;
+    };
+
+    static_assert(::sk_is_trivially_relocatable<decltype(fPathEffect)>::value);
+    static_assert(::sk_is_trivially_relocatable<decltype(fShader)>::value);
+    static_assert(::sk_is_trivially_relocatable<decltype(fMaskFilter)>::value);
+    static_assert(::sk_is_trivially_relocatable<decltype(fColorFilter)>::value);
+    static_assert(::sk_is_trivially_relocatable<decltype(fImageFilter)>::value);
+    static_assert(::sk_is_trivially_relocatable<decltype(fBlender)>::value);
+    static_assert(::sk_is_trivially_relocatable<decltype(fColor4f)>::value);
+    static_assert(::sk_is_trivially_relocatable<decltype(fBitfields)>::value);
+
+    friend class SkPaintPriv;
+};
+
+#endif

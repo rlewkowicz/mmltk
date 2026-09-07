@@ -1,0 +1,63 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_TimelineCollection_h
+#define mozilla_TimelineCollection_h
+
+#include "mozilla/LinkedList.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/PseudoStyleRequest.h"
+#include "mozilla/RefPtr.h"
+#include "nsAtomHashKeys.h"
+#include "nsTHashMap.h"
+
+class nsAtom;
+
+namespace mozilla {
+namespace dom {
+class Element;
+}
+
+template <class TimelineType>
+class TimelineCollection final
+    : public LinkedListElement<TimelineCollection<TimelineType>> {
+ public:
+  using SelfType = TimelineCollection<TimelineType>;
+  using TimelineMap = nsTHashMap<RefPtr<const nsAtom>, RefPtr<TimelineType>>;
+
+  TimelineCollection(dom::Element& aElement,
+                     const PseudoStyleRequest& aPseudoRequest)
+      : mElement(aElement), mPseudo(aPseudoRequest) {
+    MOZ_COUNT_CTOR(TimelineCollection);
+  }
+
+  ~TimelineCollection();
+
+  already_AddRefed<TimelineType> Lookup(const nsAtom* aName) const {
+    return mTimelines.Get(aName).forget();
+  }
+
+  already_AddRefed<TimelineType> Extract(const nsAtom* aName) {
+    Maybe<RefPtr<TimelineType>> timeline = mTimelines.Extract(aName);
+    return timeline ? timeline->forget() : nullptr;
+  }
+
+  void Swap(TimelineMap& aValue) { mTimelines.SwapElements(aValue); }
+
+  void Destroy();
+
+  static TimelineCollection* Get(const dom::Element* aElement,
+                                 const PseudoStyleRequest& aPseudoRequest);
+  const TimelineMap& Timelines() const { return mTimelines; }
+
+ private:
+  dom::Element& mElement;
+  const PseudoStyleRequest mPseudo;
+
+  TimelineMap mTimelines;
+};
+
+}  
+
+#endif  // mozilla_TimelineCollection_h

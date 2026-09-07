@@ -1,0 +1,58 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_WidgetUtils_h
+#define mozilla_WidgetUtils_h
+
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/gfx/Matrix.h"
+#include "nsRect.h"
+
+class nsIWidget;
+class nsPIDOMWindowOuter;
+
+namespace mozilla {
+
+enum ScreenRotation : uint8_t {
+  ROTATION_0 = 0,
+  ROTATION_90,
+  ROTATION_180,
+  ROTATION_270,
+
+  ROTATION_COUNT
+};
+
+gfx::Matrix ComputeTransformForRotation(const nsIntRect& aBounds,
+                                        ScreenRotation aRotation);
+
+gfx::Matrix ComputeTransformForUnRotation(const nsIntRect& aBounds,
+                                          ScreenRotation aRotation);
+
+nsIntRect RotateRect(nsIntRect aRect, const nsIntRect& aBounds,
+                     ScreenRotation aRotation);
+
+namespace widget {
+
+class WidgetUtils {
+ public:
+  static void Shutdown();
+
+  static already_AddRefed<nsIWidget> DOMWindowToWidget(
+      nsPIDOMWindowOuter* aDOMWindow);
+
+  static uint32_t ComputeKeyCodeFromChar(uint32_t aCharCode);
+
+  static void GetLatinCharCodeForKeyCode(uint32_t aKeyCode, bool aIsCapsLock,
+                                         uint32_t* aUnshiftedCharCode,
+                                         uint32_t* aShiftedCharCode);
+
+  static void SendBidiKeyboardInfoToContent();
+
+  static void GetBrandShortName(nsAString& aBrandName);
+};
+
+}  
+}  
+
+#endif  // mozilla_WidgetUtils_h

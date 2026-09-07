@@ -1,0 +1,413 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "RemoteWorkerManager.h"
+
+#include <utility>
+
+#include "RemoteWorkerServiceParent.h"
+#include "mozilla/AppShutdown.h"
+#include "mozilla/SchedulerGroup.h"
+#include "mozilla/dom/ContentChild.h"  // ContentChild::GetSingleton
+#include "mozilla/dom/PRemoteWorkerNonLifeCycleOpControllerChild.h"
+#include "mozilla/dom/PRemoteWorkerNonLifeCycleOpControllerParent.h"
+#include "mozilla/dom/ProcessIsolation.h"
+#include "mozilla/dom/RemoteWorkerController.h"
+#include "mozilla/dom/RemoteWorkerNonLifeCycleOpControllerParent.h"
+#include "mozilla/dom/RemoteWorkerParent.h"
+#include "mozilla/ipc/BackgroundParent.h"
+#include "mozilla/ipc/BackgroundUtils.h"
+#include "mozilla/ipc/PBackgroundParent.h"
+#include "mozilla/net/CookieServiceParent.h"
+#include "mozilla/net/NeckoParent.h"
+#include "nsCOMPtr.h"
+#include "nsIXULRuntime.h"
+#include "nsImportModule.h"
+#include "nsTArray.h"
+#include "nsThreadUtils.h"
+
+mozilla::LazyLogModule gRemoteWorkerManagerLog("RemoteWorkerManager");
+
+#ifdef LOG
+#  undef LOG
+#endif
+#define LOG(fmt) \
+  MOZ_LOG(gRemoteWorkerManagerLog, mozilla::LogLevel::Verbose, fmt)
+
+namespace mozilla {
+
+using namespace ipc;
+using namespace net;
+
+namespace dom {
+
+namespace {
+
+RemoteWorkerManager* sRemoteWorkerManager;
+
+bool IsServiceWorker(const RemoteWorkerData& aData) {
+  return aData.serviceWorkerData().type() ==
+         OptionalServiceWorkerData::TServiceWorkerData;
+}
+
+void TransmitPermissionsAndCookiesAndBlobURLsForPrincipalInfo(
+    ContentParent* aContentParent, const PrincipalInfo& aPrincipalInfo) {
+  AssertIsOnMainThread();
+  MOZ_ASSERT(aContentParent);
+
+  auto principalOrErr = PrincipalInfoToPrincipal(aPrincipalInfo);
+
+  if (NS_WARN_IF(principalOrErr.isErr())) {
+    return;
+  }
+
+  nsCOMPtr<nsIPrincipal> principal = principalOrErr.unwrap();
+
+  aContentParent->TransmitBlobURLsForPrincipal(principal);
+
+  MOZ_ALWAYS_SUCCEEDS(
+      aContentParent->TransmitPermissionsForPrincipal(principal));
+
+  CookieServiceParent* cs = nullptr;
+
+  PNeckoParent* neckoParent =
+      LoneManagedOrNullAsserts(aContentParent->ManagedPNeckoParent());
+  if (neckoParent) {
+    PCookieServiceParent* csParent =
+        LoneManagedOrNullAsserts(neckoParent->ManagedPCookieServiceParent());
+    if (csParent) {
+      cs = static_cast<CookieServiceParent*>(csParent);
+    }
+  }
+
+  if (cs) {
+    nsCOMPtr<nsIURI> uri = principal->GetURI();
+    cs->UpdateCookieInContentList(uri, principal->OriginAttributesRef());
+  } else {
+    aContentParent->AddPrincipalToCookieInProcessCache(principal);
+  }
+}
+
+}  
+
+bool RemoteWorkerManager::MatchRemoteType(const nsACString& processRemoteType,
+                                          const nsACString& workerRemoteType) {
+  LOG(("MatchRemoteType [processRemoteType=%s, workerRemoteType=%s]",
+       PromiseFlatCString(processRemoteType).get(),
+       PromiseFlatCString(workerRemoteType).get()));
+
+  MOZ_ASSERT(!IsWebCoopCoepRemoteType(workerRemoteType));
+
+  return processRemoteType.Equals(workerRemoteType);
+}
+
+Result<nsCString, nsresult> RemoteWorkerManager::GetRemoteType(
+    const nsCOMPtr<nsIPrincipal>& aPrincipal, WorkerKind aWorkerKind,
+    const nsACString& aCurrentRemoteType) {
+  AssertIsOnMainThread();
+
+  MOZ_ASSERT_IF(aWorkerKind == WorkerKind::WorkerKindService,
+                aPrincipal->GetIsContentPrincipal());
+
+  if (!BrowserTabsRemoteAutostart()) {
+    LOG(("GetRemoteType: Loading in parent process as e10s is disabled"));
+    return NOT_REMOTE_TYPE;
+  }
+
+  auto result = IsolationOptionsForWorker(
+      aPrincipal, aWorkerKind, aCurrentRemoteType, FissionAutostart());
+  if (NS_WARN_IF(result.isErr())) {
+    LOG(("GetRemoteType Abort: IsolationOptionsForWorker failed"));
+    return Err(NS_ERROR_DOM_ABORT_ERR);
+  }
+  auto options = result.unwrap();
+
+  if (MOZ_LOG_TEST(gRemoteWorkerManagerLog, LogLevel::Verbose)) {
+    nsCString principalOrigin;
+    aPrincipal->GetOrigin(principalOrigin);
+
+    LOG(
+        ("GetRemoteType workerType=%s, principal=%s, "
+         "preferredRemoteType=%s, selectedRemoteType=%s",
+         aWorkerKind == WorkerKind::WorkerKindService ? "service" : "shared",
+         principalOrigin.get(), PromiseFlatCString(aCurrentRemoteType).get(),
+         options.mRemoteType.get()));
+  }
+
+  return options.mRemoteType;
+}
+
+already_AddRefed<RemoteWorkerManager> RemoteWorkerManager::GetOrCreate() {
+  AssertIsInMainProcess();
+  AssertIsOnBackgroundThread();
+
+  if (!sRemoteWorkerManager) {
+    sRemoteWorkerManager = new RemoteWorkerManager();
+  }
+
+  RefPtr<RemoteWorkerManager> rwm = sRemoteWorkerManager;
+  return rwm.forget();
+}
+
+RemoteWorkerManager::RemoteWorkerManager() : mParentActor(nullptr) {
+  AssertIsInMainProcess();
+  AssertIsOnBackgroundThread();
+  MOZ_ASSERT(!sRemoteWorkerManager);
+}
+
+RemoteWorkerManager::~RemoteWorkerManager() {
+  AssertIsInMainProcess();
+  AssertIsOnBackgroundThread();
+  MOZ_ASSERT(sRemoteWorkerManager == this);
+  sRemoteWorkerManager = nullptr;
+}
+
+void RemoteWorkerManager::RegisterActor(RemoteWorkerServiceParent* aActor) {
+  AssertIsInMainProcess();
+  AssertIsOnBackgroundThread();
+  MOZ_ASSERT(aActor);
+
+  if (!aActor->IsOtherProcessActor()) {
+    MOZ_ASSERT(!mParentActor);
+    mParentActor = aActor;
+    return;
+  }
+
+  MOZ_ASSERT(!mChildActors.Contains(aActor));
+  mChildActors.AppendElement(aActor);
+}
+
+void RemoteWorkerManager::UnregisterActor(RemoteWorkerServiceParent* aActor) {
+  AssertIsInMainProcess();
+  AssertIsOnBackgroundThread();
+  MOZ_ASSERT(aActor);
+
+  if (aActor == mParentActor) {
+    mParentActor = nullptr;
+  } else {
+    MOZ_ASSERT(mChildActors.Contains(aActor));
+    mChildActors.RemoveElement(aActor);
+  }
+}
+
+void RemoteWorkerManager::Launch(RemoteWorkerController* aController,
+                                 const RemoteWorkerData& aData,
+                                 base::ProcessId aProcessId) {
+  AssertIsInMainProcess();
+  AssertIsOnBackgroundThread();
+
+  TargetActorAndKeepAlive target = SelectTargetActor(aData, aProcessId);
+
+  if (!target.mActor) {
+    LaunchNewContentProcess(aData)->Then(
+        GetCurrentSerialEventTarget(), __func__,
+        [self = RefPtr{this}, controller = RefPtr{aController},
+         data = aData](TargetActorAndKeepAlive&& aTarget) {
+          if (aTarget.mActor->CanSend()) {
+            self->LaunchInternal(controller, aTarget.mActor,
+                                 std::move(aTarget.mKeepAlive), data);
+          } else {
+            controller->CreationFailed();
+          }
+        },
+        [controller = RefPtr{aController}](nsresult) {
+          controller->CreationFailed();
+        });
+    return;
+  }
+
+  LaunchInternal(aController, target.mActor, std::move(target.mKeepAlive),
+                 aData);
+}
+
+void RemoteWorkerManager::LaunchInternal(
+    RemoteWorkerController* aController,
+    RemoteWorkerServiceParent* aTargetActor,
+    UniqueThreadsafeContentParentKeepAlive&& aKeepAlive,
+    const RemoteWorkerData& aData) {
+  AssertIsInMainProcess();
+  AssertIsOnBackgroundThread();
+  MOZ_ASSERT(aController);
+  MOZ_ASSERT(aTargetActor);
+  MOZ_ASSERT(aTargetActor == mParentActor ||
+             mChildActors.Contains(aTargetActor));
+
+  if (aTargetActor != mParentActor) {
+    MOZ_ASSERT(aKeepAlive);
+
+    nsCOMPtr<nsIRunnable> r = NS_NewRunnableFunction(
+        __func__, [contentHandle = RefPtr{aKeepAlive.get()},
+                   principalInfo = aData.principalInfo()] {
+          AssertIsOnMainThread();
+          if (RefPtr<ContentParent> contentParent =
+                  contentHandle->GetContentParent()) {
+            TransmitPermissionsAndCookiesAndBlobURLsForPrincipalInfo(
+                contentParent, principalInfo);
+          }
+        });
+
+    MOZ_ALWAYS_SUCCEEDS(SchedulerGroup::Dispatch(r.forget()));
+  }
+
+  RefPtr<RemoteWorkerParent> workerActor =
+      MakeAndAddRef<RemoteWorkerParent>(std::move(aKeepAlive));
+
+  mozilla::ipc::Endpoint<PRemoteWorkerNonLifeCycleOpControllerParent> parentEp;
+  mozilla::ipc::Endpoint<PRemoteWorkerNonLifeCycleOpControllerChild> childEp;
+  MOZ_ALWAYS_SUCCEEDS(PRemoteWorkerNonLifeCycleOpController::CreateEndpoints(
+      &parentEp, &childEp));
+
+  MOZ_ASSERT(!aController->mNonLifeCycleOpController);
+  aController->mNonLifeCycleOpController =
+      MakeAndAddRef<RemoteWorkerNonLifeCycleOpControllerParent>(aController);
+
+  parentEp.Bind(aController->mNonLifeCycleOpController);
+
+  if (!aTargetActor->SendPRemoteWorkerConstructor(workerActor, aData,
+                                                  std::move(childEp))) {
+    AsyncCreationFailed(aController);
+    return;
+  }
+
+  aController->SetWorkerActor(workerActor);
+  workerActor->SetController(aController);
+}
+
+void RemoteWorkerManager::AsyncCreationFailed(
+    RemoteWorkerController* aController) {
+  RefPtr<RemoteWorkerController> controller = aController;
+  nsCOMPtr<nsIRunnable> r =
+      NS_NewRunnableFunction("RemoteWorkerManager::AsyncCreationFailed",
+                             [controller]() { controller->CreationFailed(); });
+
+  NS_DispatchToCurrentThread(r.forget());
+}
+
+template <typename Callback>
+void RemoteWorkerManager::ForEachActor(
+    Callback&& aCallback, const nsACString& aRemoteType,
+    Maybe<base::ProcessId> aProcessId) const {
+  AssertIsOnBackgroundThread();
+
+  const auto length = mChildActors.Length();
+
+  auto end = static_cast<uint32_t>(rand()) % length;
+  if (aProcessId) {
+    for (auto j = length - 1; j > 0; j--) {
+      if (mChildActors[j]->OtherPid() == *aProcessId) {
+        end = j;
+        break;
+      }
+    }
+  }
+
+  uint32_t i = end;
+
+  do {
+    MOZ_ASSERT(i < mChildActors.Length());
+    RemoteWorkerServiceParent* actor = mChildActors[i];
+
+    if (MatchRemoteType(actor->GetRemoteType(), aRemoteType)) {
+      ThreadsafeContentParentHandle* contentHandle =
+          actor->GetContentParentHandle();
+
+      if (!aCallback(actor, contentHandle)) {
+        break;
+      }
+    }
+
+    i = (i + 1) % length;
+  } while (i != end);
+}
+
+RemoteWorkerManager::TargetActorAndKeepAlive
+RemoteWorkerManager::SelectTargetActorInternal(
+    const RemoteWorkerData& aData, base::ProcessId aProcessId) const {
+  AssertIsOnBackgroundThread();
+  MOZ_ASSERT(!mChildActors.IsEmpty());
+
+  RemoteWorkerServiceParent* actor = nullptr;
+  UniqueThreadsafeContentParentKeepAlive keepAlive;
+
+  const auto& workerRemoteType = aData.remoteType();
+
+  ForEachActor(
+      [&](RemoteWorkerServiceParent* aActor,
+          ThreadsafeContentParentHandle* aContentHandle) {
+        if ((keepAlive = aContentHandle->TryAddKeepAlive())) {
+          actor = aActor;
+          return false;
+        }
+        MOZ_ASSERT(!actor);
+        return true;
+      },
+      workerRemoteType, IsServiceWorker(aData) ? Nothing() : Some(aProcessId));
+
+  return {actor, std::move(keepAlive)};
+}
+
+RemoteWorkerManager::TargetActorAndKeepAlive
+RemoteWorkerManager::SelectTargetActor(const RemoteWorkerData& aData,
+                                       base::ProcessId aProcessId) {
+  AssertIsInMainProcess();
+  AssertIsOnBackgroundThread();
+
+  if (aData.principalInfo().type() == PrincipalInfo::TSystemPrincipalInfo) {
+    MOZ_ASSERT(mParentActor);
+    return {mParentActor, nullptr};
+  }
+
+  if (!BrowserTabsRemoteAutostart()) {
+    MOZ_ASSERT(mParentActor);
+    return {mParentActor, nullptr};
+  }
+
+  MOZ_ASSERT(aProcessId != base::GetCurrentProcId());
+
+  if (mChildActors.IsEmpty()) {
+    return {nullptr, nullptr};
+  }
+
+  return SelectTargetActorInternal(aData, aProcessId);
+}
+
+RefPtr<RemoteWorkerManager::LaunchProcessPromise>
+RemoteWorkerManager::LaunchNewContentProcess(const RemoteWorkerData& aData) {
+  AssertIsInMainProcess();
+  AssertIsOnBackgroundThread();
+
+  return InvokeAsync(GetMainThreadSerialEventTarget(), __func__,
+                     [remoteType = aData.remoteType()]() {
+                       if (AppShutdown::IsInOrBeyond(
+                               ShutdownPhase::AppShutdownConfirmed)) {
+                         return ContentParent::LaunchPromise::CreateAndReject(
+                             NS_ERROR_ILLEGAL_DURING_SHUTDOWN, __func__);
+                       }
+
+                       return ContentParent::GetNewOrUsedBrowserProcessAsync(
+                            remoteType,
+                            nullptr,
+                           hal::ProcessPriority::PROCESS_PRIORITY_FOREGROUND,
+                            true);
+                     })
+      ->Then(
+          GetMainThreadSerialEventTarget(), __func__,
+          [](UniqueContentParentKeepAlive&& aContentParent) {
+            RefPtr<RemoteWorkerServiceParent> actor =
+                aContentParent->GetRemoteWorkerServiceParent();
+            MOZ_ASSERT(actor, "RemoteWorkerServiceParent not initialized?");
+            return RemoteWorkerManager::LaunchProcessPromise::CreateAndResolve(
+                TargetActorAndKeepAlive{
+                    actor, UniqueContentParentKeepAliveToThreadsafe(
+                               std::move(aContentParent))},
+                __func__);
+          },
+          [](nsresult aError) {
+            return RemoteWorkerManager::LaunchProcessPromise::CreateAndReject(
+                aError, __func__);
+          });
+}
+
+}  
+}  

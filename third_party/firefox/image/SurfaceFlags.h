@@ -1,0 +1,61 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_image_SurfaceFlags_h
+#define mozilla_image_SurfaceFlags_h
+
+#include "imgIContainer.h"
+#include "mozilla/TypedEnumBits.h"
+
+namespace mozilla {
+namespace image {
+
+enum class SurfaceFlags : uint8_t {
+  NO_PREMULTIPLY_ALPHA = 1 << 0,
+  NO_COLORSPACE_CONVERSION = 1 << 1,
+  TO_SRGB_COLORSPACE = 1 << 2,
+  RECORD_BLOB = 1 << 3,
+};
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(SurfaceFlags)
+
+inline SurfaceFlags DefaultSurfaceFlags() { return SurfaceFlags(); }
+
+inline SurfaceFlags ToSurfaceFlags(uint32_t aFlags) {
+  SurfaceFlags flags = DefaultSurfaceFlags();
+  if (aFlags & imgIContainer::FLAG_DECODE_NO_PREMULTIPLY_ALPHA) {
+    flags |= SurfaceFlags::NO_PREMULTIPLY_ALPHA;
+  }
+  if (aFlags & imgIContainer::FLAG_DECODE_NO_COLORSPACE_CONVERSION) {
+    flags |= SurfaceFlags::NO_COLORSPACE_CONVERSION;
+  }
+  if (aFlags & imgIContainer::FLAG_DECODE_TO_SRGB_COLORSPACE) {
+    flags |= SurfaceFlags::TO_SRGB_COLORSPACE;
+  }
+  if (aFlags & imgIContainer::FLAG_RECORD_BLOB) {
+    flags |= SurfaceFlags::RECORD_BLOB;
+  }
+  return flags;
+}
+
+inline uint32_t FromSurfaceFlags(SurfaceFlags aFlags) {
+  uint32_t flags = imgIContainer::DECODE_FLAGS_DEFAULT;
+  if (aFlags & SurfaceFlags::NO_PREMULTIPLY_ALPHA) {
+    flags |= imgIContainer::FLAG_DECODE_NO_PREMULTIPLY_ALPHA;
+  }
+  if (aFlags & SurfaceFlags::NO_COLORSPACE_CONVERSION) {
+    flags |= imgIContainer::FLAG_DECODE_NO_COLORSPACE_CONVERSION;
+  }
+  if (aFlags & SurfaceFlags::TO_SRGB_COLORSPACE) {
+    flags |= imgIContainer::FLAG_DECODE_TO_SRGB_COLORSPACE;
+  }
+  if (aFlags & SurfaceFlags::RECORD_BLOB) {
+    flags |= imgIContainer::FLAG_RECORD_BLOB;
+  }
+  return flags;
+}
+
+}  
+}  
+
+#endif  // mozilla_image_SurfaceFlags_h

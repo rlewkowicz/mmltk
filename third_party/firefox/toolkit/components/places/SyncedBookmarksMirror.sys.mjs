@@ -1,0 +1,2066 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+
+const lazy = {};
+
+ChromeUtils.defineESModuleGetters(lazy, {
+  Async: "resource://services-common/async.sys.mjs",
+  Log: "resource://gre/modules/Log.sys.mjs",
+  PlacesSyncUtils: "resource://gre/modules/PlacesSyncUtils.sys.mjs",
+  PlacesUtils: "resource://gre/modules/PlacesUtils.sys.mjs",
+});
+
+ChromeUtils.defineLazyGetter(lazy, "MirrorLog", () =>
+  lazy.Log.repository.getLogger("Sync.Engine.Bookmarks.Mirror")
+);
+
+const SyncedBookmarksMerger = Components.Constructor(
+  "@mozilla.org/browser/synced-bookmarks-merger;1",
+  "mozISyncedBookmarksMerger"
+);
+
+const DB_URL_LENGTH_MAX = 65536;
+const DB_TITLE_LENGTH_MAX = 4096;
+
+const MIRROR_SCHEMA_VERSION = 9;
+
+ChromeUtils.defineLazyGetter(lazy, "yieldState", () => lazy.Async.yieldState());
+
+class ProgressTracker {
+  constructor(recordStepTelemetry) {
+    this.recordStepTelemetry = recordStepTelemetry;
+    this.steps = [];
+  }
+
+  step(name, took = -1, counts = null) {
+    let info = { step: name, at: Date.now() };
+    if (took > -1) {
+      info.took = took;
+    }
+    if (counts) {
+      info.counts = counts;
+    }
+    this.steps.push(info);
+  }
+
+  stepWithTelemetry(name, took, counts = null) {
+    this.step(name, took, counts);
+    this.recordStepTelemetry(name, took, counts);
+  }
+
+  stepWithItemCount(name, took, count) {
+    this.stepWithTelemetry(name, took, [{ name: "items", count }]);
+  }
+
+  reset() {
+    this.steps = [];
+  }
+
+  fetchState() {
+    return { steps: this.steps };
+  }
+}
+
+ProgressTracker.STEPS = {
+  FETCH_LOCAL_TREE: "fetchLocalTree",
+  FETCH_REMOTE_TREE: "fetchRemoteTree",
+  MERGE: "merge",
+  APPLY: "apply",
+  NOTIFY_OBSERVERS: "notifyObservers",
+  FETCH_LOCAL_CHANGE_RECORDS: "fetchLocalChangeRecords",
+  FINALIZE: "finalize",
+};
+
+export class SyncedBookmarksMirror {
+  constructor(
+    db,
+    wasCorrupt = false,
+    {
+      recordStepTelemetry,
+      recordValidationTelemetry,
+      finalizeAt = lazy.PlacesUtils.history.shutdownClient.jsclient,
+    }
+  ) {
+    this.db = db;
+    this.wasCorrupt = wasCorrupt;
+    this.recordValidationTelemetry = recordValidationTelemetry;
+
+    this.merger = new SyncedBookmarksMerger();
+    this.merger.db = db.unsafeRawConnection.QueryInterface(
+      Ci.mozIStorageConnection
+    );
+
+    this.progress = new ProgressTracker(recordStepTelemetry);
+    this.finalizeController = new AbortController();
+    this.finalizeAt = finalizeAt;
+    this.finalizeBound = () => this.finalize({ alsoCleanup: false });
+    this.finalizeAt.addBlocker(
+      "SyncedBookmarksMirror: finalize",
+      this.finalizeBound,
+      { fetchState: () => this.progress }
+    );
+  }
+
+  static async open(options) {
+    let db = await lazy.PlacesUtils.promiseUnsafeWritableDBConnection();
+    if (!db) {
+      throw new TypeError("Can't open mirror without Places connection");
+    }
+    let path;
+    if (PathUtils.isAbsolute(options.path)) {
+      path = options.path;
+    } else {
+      path = PathUtils.join(PathUtils.profileDir, options.path);
+    }
+    let wasCorrupt = false;
+    try {
+      await attachAndInitMirrorDatabase(db, path);
+    } catch (ex) {
+      if (isDatabaseCorrupt(ex)) {
+        lazy.MirrorLog.warn(
+          "Error attaching mirror to Places; removing and " +
+            "recreating mirror",
+          ex
+        );
+        wasCorrupt = true;
+        await IOUtils.remove(path);
+        await attachAndInitMirrorDatabase(db, path);
+      } else {
+        lazy.MirrorLog.error(
+          "Unrecoverable error attaching mirror to Places",
+          ex
+        );
+        throw ex;
+      }
+    }
+    return new SyncedBookmarksMirror(db, wasCorrupt, options);
+  }
+
+  async getCollectionHighWaterMark() {
+    let rows = await this.db.executeCached(
+      `
+      SELECT MAX(
+        IFNULL((SELECT MAX(serverModified) - 1000 FROM items), 0),
+        IFNULL((SELECT CAST(value AS INTEGER) FROM meta
+                WHERE key = :modifiedKey), 0)
+      ) AS highWaterMark`,
+      { modifiedKey: SyncedBookmarksMirror.META_KEY.LAST_MODIFIED }
+    );
+    let highWaterMark = rows[0].getResultByName("highWaterMark");
+    return highWaterMark / 1000;
+  }
+
+  async setCollectionLastModified(lastModifiedSeconds) {
+    let lastModified = Math.floor(
+       (lastModifiedSeconds) * 1000
+    );
+    if (!Number.isInteger(lastModified)) {
+      throw new TypeError("Invalid collection last modified time");
+    }
+    await this.db.executeBeforeShutdown(
+      "SyncedBookmarksMirror: setCollectionLastModified",
+      db =>
+        db.executeCached(
+          `
+        REPLACE INTO meta(key, value)
+        VALUES(:modifiedKey, :lastModified)`,
+          {
+            modifiedKey: SyncedBookmarksMirror.META_KEY.LAST_MODIFIED,
+            lastModified,
+          }
+        )
+    );
+  }
+
+  async getSyncId() {
+    let rows = await this.db.executeCached(
+      `
+      SELECT value FROM meta WHERE key = :syncIdKey`,
+      { syncIdKey: SyncedBookmarksMirror.META_KEY.SYNC_ID }
+    );
+    return rows.length ? rows[0].getResultByName("value") : "";
+  }
+
+  async ensureCurrentSyncId(newSyncId) {
+    if (!newSyncId || typeof newSyncId != "string") {
+      throw new TypeError("Invalid new bookmarks sync ID");
+    }
+    let existingSyncId = await this.getSyncId();
+    if (existingSyncId == newSyncId) {
+      lazy.MirrorLog.trace("Sync ID up-to-date in mirror", { existingSyncId });
+      return;
+    }
+    lazy.MirrorLog.info(
+      "Sync ID changed from ${existingSyncId} to " +
+        "${newSyncId}; resetting mirror",
+      { existingSyncId, newSyncId }
+    );
+    await this.db.executeBeforeShutdown(
+      "SyncedBookmarksMirror: ensureCurrentSyncId",
+      db =>
+        db.executeTransaction(async function () {
+          await resetMirror(db);
+          await db.execute(
+            `
+          REPLACE INTO meta(key, value)
+          VALUES(:syncIdKey, :newSyncId)`,
+            { syncIdKey: SyncedBookmarksMirror.META_KEY.SYNC_ID, newSyncId }
+          );
+        })
+    );
+  }
+
+  async store(records, { needsMerge = true, signal = null } = {}) {
+    let finalizeOrInterruptSignal = signal
+      ? AbortSignal.any([this.finalizeController.signal, signal])
+      : this.finalizeController.signal;
+
+    let options = {
+      needsMerge,
+      signal: finalizeOrInterruptSignal,
+    };
+
+    await this.db.executeBeforeShutdown("SyncedBookmarksMirror: store", db =>
+      db.executeTransaction(async () => {
+        for (let record of records) {
+          if (options.signal.aborted) {
+            throw new SyncedBookmarksMirror.InterruptedError(
+              "Interrupted while storing incoming items"
+            );
+          }
+          let guid = lazy.PlacesSyncUtils.bookmarks.recordIdToGuid(record.id);
+          if (guid == lazy.PlacesUtils.bookmarks.rootGuid) {
+            throw new TypeError("Can't store Places root");
+          }
+          if (lazy.MirrorLog.level <= lazy.Log.Level.Trace) {
+            lazy.MirrorLog.trace(
+              `Storing in mirror: ${record.cleartextToString()}`
+            );
+          }
+          switch (record.type) {
+            case "bookmark":
+              await this.storeRemoteBookmark(record, options);
+              continue;
+
+            case "query":
+              await this.storeRemoteQuery(record, options);
+              continue;
+
+            case "folder":
+              await this.storeRemoteFolder(record, options);
+              continue;
+
+            case "livemark":
+              await this.storeRemoteLivemark(record, options);
+              continue;
+
+            case "separator":
+              await this.storeRemoteSeparator(record, options);
+              continue;
+
+            default:
+              if (record.deleted) {
+                await this.storeRemoteTombstone(record, options);
+                continue;
+              }
+          }
+          lazy.MirrorLog.warn("Ignoring record with unknown type", record.type);
+        }
+      })
+    );
+  }
+
+  async apply({
+    localTimeSeconds,
+    remoteTimeSeconds,
+    notifyInStableOrder,
+    signal = null,
+  } = {}) {
+
+    let finalizeOrInterruptSignal = signal
+      ? AbortSignal.any([this.finalizeController.signal, signal])
+      : this.finalizeController.signal;
+
+    let changeRecords;
+    try {
+      changeRecords = await this.tryApply(
+        finalizeOrInterruptSignal,
+        localTimeSeconds,
+        remoteTimeSeconds,
+        notifyInStableOrder
+      );
+    } finally {
+      this.progress.reset();
+    }
+
+    return changeRecords;
+  }
+
+  async tryApply(
+    signal,
+    localTimeSeconds,
+    remoteTimeSeconds,
+    notifyInStableOrder = false
+  ) {
+    let wasMerged = await withTiming("Merging bookmarks in Rust", () =>
+      this.merge(signal, localTimeSeconds, remoteTimeSeconds)
+    );
+
+    if (!wasMerged) {
+      lazy.MirrorLog.debug("No changes detected in both mirror and Places");
+      return {};
+    }
+
+
+    let observersToNotify = new BookmarkObserverRecorder(this.db, {
+      signal,
+      notifyInStableOrder,
+    });
+
+    await withTiming(
+      "Notifying Places observers",
+      async () => {
+        try {
+          await observersToNotify.notifyAll();
+        } catch (ex) {
+          await lazy.PlacesUtils.keywords.invalidateCachedKeywords();
+          lazy.MirrorLog.warn("Error notifying Places observers", ex);
+        } finally {
+          await this.db.executeTransaction(async () => {
+            await this.db.execute(`DELETE FROM itemsAdded`);
+            await this.db.execute(`DELETE FROM guidsChanged`);
+            await this.db.execute(`DELETE FROM itemsChanged`);
+            await this.db.execute(`DELETE FROM itemsRemoved`);
+            await this.db.execute(`DELETE FROM itemsMoved`);
+          });
+        }
+      },
+      time =>
+        this.progress.stepWithTelemetry(
+          ProgressTracker.STEPS.NOTIFY_OBSERVERS,
+          time
+        )
+    );
+
+    let { changeRecords } = await withTiming(
+      "Fetching records for local items to upload",
+      async () => {
+        try {
+          let result = await this.fetchLocalChangeRecords(signal);
+          return result;
+        } finally {
+          await this.db.execute(`DELETE FROM itemsToUpload`);
+        }
+      },
+      (time, result) =>
+        this.progress.stepWithItemCount(
+          ProgressTracker.STEPS.FETCH_LOCAL_CHANGE_RECORDS,
+          time,
+          result.count
+        )
+    );
+
+    return changeRecords;
+  }
+
+  merge(signal, localTimeSeconds = Date.now() / 1000, remoteTimeSeconds = 0) {
+    return new Promise((resolve, reject) => {
+      let op = null;
+      function onAbort() {
+        signal.removeEventListener("abort", onAbort);
+        op.cancel();
+      }
+      let callback = {
+        QueryInterface: ChromeUtils.generateQI([
+          "mozISyncedBookmarksMirrorProgressListener",
+          "mozISyncedBookmarksMirrorCallback",
+        ]),
+        onFetchLocalTree: (took, itemCount, deleteCount) => {
+          let counts = [
+            {
+              name: "items",
+              count: itemCount,
+            },
+            {
+              name: "deletions",
+              count: deleteCount,
+            },
+          ];
+          this.progress.stepWithTelemetry(
+            ProgressTracker.STEPS.FETCH_LOCAL_TREE,
+            took,
+            counts
+          );
+        },
+        onFetchRemoteTree: (took, itemCount, deleteCount, problemsBag) => {
+          let counts = [
+            {
+              name: "items",
+              count: itemCount,
+            },
+            {
+              name: "deletions",
+              count: deleteCount,
+            },
+          ];
+          this.progress.stepWithTelemetry(
+            ProgressTracker.STEPS.FETCH_REMOTE_TREE,
+            took,
+            counts
+          );
+          let problems = bagToNamedCounts(problemsBag, [
+            "orphans",
+            "misparentedRoots",
+            "multipleParents",
+            "nonFolderParents",
+            "parentChildDisagreements",
+            "missingChildren",
+          ]);
+          let checked = itemCount + deleteCount;
+          this.recordValidationTelemetry(took, checked, problems);
+        },
+        onMerge: (took, countsBag) => {
+          let counts = bagToNamedCounts(countsBag, [
+            "items",
+            "dupes",
+            "remoteRevives",
+            "localDeletes",
+            "localRevives",
+            "remoteDeletes",
+          ]);
+          this.progress.stepWithTelemetry(
+            ProgressTracker.STEPS.MERGE,
+            took,
+            counts
+          );
+        },
+        onApply: took => {
+          this.progress.stepWithTelemetry(ProgressTracker.STEPS.APPLY, took);
+        },
+        handleSuccess(result) {
+          signal.removeEventListener("abort", onAbort);
+          resolve(result);
+        },
+        handleError(code, message) {
+          signal.removeEventListener("abort", onAbort);
+          switch (code) {
+            case Cr.NS_ERROR_STORAGE_BUSY:
+              reject(new SyncedBookmarksMirror.MergeConflictError(message));
+              break;
+
+            case Cr.NS_ERROR_ABORT:
+              reject(new SyncedBookmarksMirror.InterruptedError(message));
+              break;
+
+            default:
+              reject(new SyncedBookmarksMirror.MergeError(message));
+          }
+        },
+      };
+      op = this.merger.merge(localTimeSeconds, remoteTimeSeconds, callback);
+      if (signal.aborted) {
+        op.cancel();
+      } else {
+        signal.addEventListener("abort", onAbort);
+      }
+    });
+  }
+
+  async reset() {
+    await this.db.executeBeforeShutdown("SyncedBookmarksMirror: reset", db =>
+      db.executeTransaction(() => resetMirror(db))
+    );
+  }
+
+  async fetchUnmergedGuids() {
+    let rows = await this.db.execute(`
+      SELECT guid FROM items
+      WHERE needsMerge
+      ORDER BY guid`);
+    return rows.map(row => row.getResultByName("guid"));
+  }
+
+  async storeRemoteBookmark(record, { needsMerge, signal }) {
+    let guid = lazy.PlacesSyncUtils.bookmarks.recordIdToGuid(record.id);
+
+    let url = validateURL(record.bmkUri);
+    if (url) {
+      await this.maybeStoreRemoteURL(url);
+    }
+
+    let parentGuid = lazy.PlacesSyncUtils.bookmarks.recordIdToGuid(
+      record.parentid
+    );
+    let serverModified = determineServerModified(record);
+    let dateAdded = determineDateAdded(record);
+    let title = validateTitle(record.title);
+    let keyword = validateKeyword(record.keyword);
+    let validity = url
+      ? Ci.mozISyncedBookmarksMerger.VALIDITY_VALID
+      : Ci.mozISyncedBookmarksMerger.VALIDITY_REPLACE;
+
+    let unknownFields = lazy.PlacesSyncUtils.extractUnknownFields(
+      record.cleartext,
+      [
+        "bmkUri",
+        "description",
+        "keyword",
+        "tags",
+        "title",
+        ...COMMON_UNKNOWN_FIELDS,
+      ]
+    );
+    await this.db.executeCached(
+      `
+      REPLACE INTO items(guid, parentGuid, serverModified, needsMerge, kind,
+                         dateAdded, title, keyword, validity, unknownFields,
+                         urlId)
+      VALUES(:guid, :parentGuid, :serverModified, :needsMerge, :kind,
+             :dateAdded, NULLIF(:title, ''), :keyword, :validity, :unknownFields,
+             (SELECT id FROM urls
+              WHERE hash = hash(:url) AND
+                    url = :url))`,
+      {
+        guid,
+        parentGuid,
+        serverModified,
+        needsMerge,
+        kind: Ci.mozISyncedBookmarksMerger.KIND_BOOKMARK,
+        dateAdded,
+        title,
+        keyword,
+        url: url ? url.href : null,
+        validity,
+        unknownFields,
+      }
+    );
+
+    let tags = record.tags;
+    if (tags && Array.isArray(tags)) {
+      for (let rawTag of tags) {
+        if (signal.aborted) {
+          throw new SyncedBookmarksMirror.InterruptedError(
+            "Interrupted while storing tags for incoming bookmark"
+          );
+        }
+        let tag = validateTag(rawTag);
+        if (!tag) {
+          continue;
+        }
+        await this.db.executeCached(
+          `
+          INSERT INTO tags(itemId, tag)
+          SELECT id, :tag FROM items
+          WHERE guid = :guid`,
+          { tag, guid }
+        );
+      }
+    }
+  }
+
+  async storeRemoteQuery(record, { needsMerge }) {
+    let guid = lazy.PlacesSyncUtils.bookmarks.recordIdToGuid(record.id);
+
+    let validity = Ci.mozISyncedBookmarksMerger.VALIDITY_VALID;
+
+    let url = validateURL(record.bmkUri);
+    if (url) {
+      let params = new URLSearchParams(url.href.slice(url.protocol.length));
+      let type = +params.get("type");
+      if (type == Ci.nsINavHistoryQueryOptions.RESULTS_AS_TAG_CONTENTS) {
+        let tagFolderName = validateTag(record.folderName);
+        if (tagFolderName) {
+          try {
+            url.href = `place:tag=${tagFolderName}`;
+            validity = Ci.mozISyncedBookmarksMerger.VALIDITY_REUPLOAD;
+          } catch (ex) {
+            url = null;
+          }
+        } else {
+          url = null;
+        }
+      } else {
+        let folder = params.get("folder");
+        if (folder && !params.has("excludeItems")) {
+          try {
+            url.href = `${url.href}&excludeItems=1`;
+            validity = Ci.mozISyncedBookmarksMerger.VALIDITY_REUPLOAD;
+          } catch (ex) {
+            url = null;
+          }
+        }
+      }
+
+    }
+
+    if (url) {
+      await this.maybeStoreRemoteURL(url);
+    } else {
+      validity = Ci.mozISyncedBookmarksMerger.VALIDITY_REPLACE;
+    }
+
+    let parentGuid = lazy.PlacesSyncUtils.bookmarks.recordIdToGuid(
+      record.parentid
+    );
+    let serverModified = determineServerModified(record);
+    let dateAdded = determineDateAdded(record);
+    let title = validateTitle(record.title);
+
+    let unknownFields = lazy.PlacesSyncUtils.extractUnknownFields(
+      record.cleartext,
+      [
+        "bmkUri",
+        "description",
+        "folderName",
+        "keyword",
+        "queryId",
+        "tags",
+        "title",
+        ...COMMON_UNKNOWN_FIELDS,
+      ]
+    );
+
+    await this.db.executeCached(
+      `
+      REPLACE INTO items(guid, parentGuid, serverModified, needsMerge, kind,
+                         dateAdded, title,
+                         urlId,
+                         validity, unknownFields)
+      VALUES(:guid, :parentGuid, :serverModified, :needsMerge, :kind,
+             :dateAdded, NULLIF(:title, ''),
+             (SELECT id FROM urls
+              WHERE hash = hash(:url) AND
+                    url = :url),
+             :validity, :unknownFields)`,
+      {
+        guid,
+        parentGuid,
+        serverModified,
+        needsMerge,
+        kind: Ci.mozISyncedBookmarksMerger.KIND_QUERY,
+        dateAdded,
+        title,
+        url: url ? url.href : null,
+        validity,
+        unknownFields,
+      }
+    );
+  }
+
+  async storeRemoteFolder(record, { needsMerge, signal }) {
+    let guid = lazy.PlacesSyncUtils.bookmarks.recordIdToGuid(record.id);
+    let parentGuid = lazy.PlacesSyncUtils.bookmarks.recordIdToGuid(
+      record.parentid
+    );
+    let serverModified = determineServerModified(record);
+    let dateAdded = determineDateAdded(record);
+    let title = validateTitle(record.title);
+    let unknownFields = lazy.PlacesSyncUtils.extractUnknownFields(
+      record.cleartext,
+      ["children", "description", "title", ...COMMON_UNKNOWN_FIELDS]
+    );
+    await this.db.executeCached(
+      `
+      REPLACE INTO items(guid, parentGuid, serverModified, needsMerge, kind,
+                         dateAdded, title, unknownFields)
+      VALUES(:guid, :parentGuid, :serverModified, :needsMerge, :kind,
+             :dateAdded, NULLIF(:title, ''), :unknownFields)`,
+      {
+        guid,
+        parentGuid,
+        serverModified,
+        needsMerge,
+        kind: Ci.mozISyncedBookmarksMerger.KIND_FOLDER,
+        dateAdded,
+        title,
+        unknownFields,
+      }
+    );
+
+    let children = record.children;
+    if (children && Array.isArray(children)) {
+      let offset = 0;
+      for (let chunk of lazy.PlacesUtils.chunkArray(
+        children,
+        this.db.variableLimit - 1
+      )) {
+        if (signal.aborted) {
+          throw new SyncedBookmarksMirror.InterruptedError(
+            "Interrupted while storing children for incoming folder"
+          );
+        }
+        let valuesFragment = Array.from(
+          { length: chunk.length },
+          (_, index) => `(?${index + 2}, ?1, ${offset + index})`
+        ).join(",");
+        await this.db.execute(
+          `
+          INSERT INTO structure(guid, parentGuid, position)
+          VALUES ${valuesFragment}`,
+          [guid, ...chunk.map(lazy.PlacesSyncUtils.bookmarks.recordIdToGuid)]
+        );
+        offset += chunk.length;
+      }
+    }
+  }
+
+  async storeRemoteLivemark(record, { needsMerge }) {
+    let guid = lazy.PlacesSyncUtils.bookmarks.recordIdToGuid(record.id);
+    let parentGuid = lazy.PlacesSyncUtils.bookmarks.recordIdToGuid(
+      record.parentid
+    );
+    let serverModified = determineServerModified(record);
+    let feedURL = validateURL(record.feedUri);
+    let dateAdded = determineDateAdded(record);
+    let title = validateTitle(record.title);
+    let siteURL = validateURL(record.siteUri);
+
+    let validity = feedURL
+      ? Ci.mozISyncedBookmarksMerger.VALIDITY_VALID
+      : Ci.mozISyncedBookmarksMerger.VALIDITY_REPLACE;
+
+    let unknownFields = lazy.PlacesSyncUtils.extractUnknownFields(
+      record.cleartext,
+      [
+        "children",
+        "description",
+        "feedUri",
+        "siteUri",
+        "title",
+        ...COMMON_UNKNOWN_FIELDS,
+      ]
+    );
+
+    await this.db.executeCached(
+      `
+      REPLACE INTO items(guid, parentGuid, serverModified, needsMerge, kind,
+                         dateAdded, title, feedURL, siteURL, validity, unknownFields)
+      VALUES(:guid, :parentGuid, :serverModified, :needsMerge, :kind,
+             :dateAdded, NULLIF(:title, ''), :feedURL, :siteURL, :validity, :unknownFields)`,
+      {
+        guid,
+        parentGuid,
+        serverModified,
+        needsMerge,
+        kind: Ci.mozISyncedBookmarksMerger.KIND_LIVEMARK,
+        dateAdded,
+        title,
+        feedURL: feedURL ? feedURL.href : null,
+        siteURL: siteURL ? siteURL.href : null,
+        validity,
+        unknownFields,
+      }
+    );
+  }
+
+  async storeRemoteSeparator(record, { needsMerge }) {
+    let guid = lazy.PlacesSyncUtils.bookmarks.recordIdToGuid(record.id);
+    let parentGuid = lazy.PlacesSyncUtils.bookmarks.recordIdToGuid(
+      record.parentid
+    );
+    let serverModified = determineServerModified(record);
+    let dateAdded = determineDateAdded(record);
+    let unknownFields = lazy.PlacesSyncUtils.extractUnknownFields(
+      record.cleartext,
+      ["pos", ...COMMON_UNKNOWN_FIELDS]
+    );
+
+    await this.db.executeCached(
+      `
+      REPLACE INTO items(guid, parentGuid, serverModified, needsMerge, kind,
+                         dateAdded, unknownFields)
+      VALUES(:guid, :parentGuid, :serverModified, :needsMerge, :kind,
+             :dateAdded, :unknownFields)`,
+      {
+        guid,
+        parentGuid,
+        serverModified,
+        needsMerge,
+        kind: Ci.mozISyncedBookmarksMerger.KIND_SEPARATOR,
+        dateAdded,
+        unknownFields,
+      }
+    );
+  }
+
+  async storeRemoteTombstone(record, { needsMerge }) {
+    let guid = lazy.PlacesSyncUtils.bookmarks.recordIdToGuid(record.id);
+    let serverModified = determineServerModified(record);
+
+    await this.db.executeCached(
+      `
+      REPLACE INTO items(guid, serverModified, needsMerge, isDeleted)
+      VALUES(:guid, :serverModified, :needsMerge, 1)`,
+      { guid, serverModified, needsMerge }
+    );
+  }
+
+  async maybeStoreRemoteURL(url) {
+    await this.db.executeCached(
+      `
+      INSERT OR IGNORE INTO urls(guid, url, hash, revHost)
+      VALUES(IFNULL((SELECT guid FROM urls
+                     WHERE hash = hash(:url) AND
+                                  url = :url),
+                    GENERATE_GUID()), :url, hash(:url), :revHost)`,
+      { url: url.href, revHost: lazy.PlacesUtils.getReversedHost(url) }
+    );
+  }
+
+  async fetchLocalChangeRecords(signal) {
+    let changeRecords = {};
+    let childRecordIdsByLocalParentId = new Map();
+    let tagsByLocalId = new Map();
+
+    let childGuidRows = [];
+    await this.db.execute(
+      `SELECT parentId, guid FROM structureToUpload
+       ORDER BY parentId, position`,
+      null,
+      (row, cancel) => {
+        if (signal.aborted) {
+          cancel();
+        } else {
+          childGuidRows.push(row);
+        }
+      }
+    );
+
+    await lazy.Async.yieldingForEach(
+      childGuidRows,
+      row => {
+        if (signal.aborted) {
+          throw new SyncedBookmarksMirror.InterruptedError(
+            "Interrupted while fetching structure to upload"
+          );
+        }
+        let localParentId = row.getResultByName("parentId");
+        let childRecordId = lazy.PlacesSyncUtils.bookmarks.guidToRecordId(
+          row.getResultByName("guid")
+        );
+        let childRecordIds = childRecordIdsByLocalParentId.get(localParentId);
+        if (childRecordIds) {
+          childRecordIds.push(childRecordId);
+        } else {
+          childRecordIdsByLocalParentId.set(localParentId, [childRecordId]);
+        }
+      },
+      lazy.yieldState
+    );
+
+    let tagRows = [];
+    await this.db.execute(
+      `SELECT id, tag FROM tagsToUpload`,
+      null,
+      (row, cancel) => {
+        if (signal.aborted) {
+          cancel();
+        } else {
+          tagRows.push(row);
+        }
+      }
+    );
+
+    await lazy.Async.yieldingForEach(
+      tagRows,
+      row => {
+        if (signal.aborted) {
+          throw new SyncedBookmarksMirror.InterruptedError(
+            "Interrupted while fetching tags to upload"
+          );
+        }
+        let localId = row.getResultByName("id");
+        let tag = row.getResultByName("tag");
+        let tags = tagsByLocalId.get(localId);
+        if (tags) {
+          tags.push(tag);
+        } else {
+          tagsByLocalId.set(localId, [tag]);
+        }
+      },
+      lazy.yieldState
+    );
+
+    let itemRows = [];
+    await this.db.execute(
+      `SELECT id, syncChangeCounter, guid, isDeleted, type, isQuery,
+              tagFolderName, keyword, url, IFNULL(title, '') AS title,
+              position, parentGuid, unknownFields,
+              IFNULL(parentTitle, '') AS parentTitle, dateAdded
+       FROM itemsToUpload`,
+      null,
+      (row, cancel) => {
+        if (signal.aborted) {
+          cancel();
+        } else {
+          itemRows.push(row);
+        }
+      }
+    );
+
+    await lazy.Async.yieldingForEach(
+      itemRows,
+      row => {
+        if (signal.aborted) {
+          throw new SyncedBookmarksMirror.InterruptedError(
+            "Interrupted while fetching items to upload"
+          );
+        }
+        let syncChangeCounter = row.getResultByName("syncChangeCounter");
+
+        let guid = row.getResultByName("guid");
+        let recordId = lazy.PlacesSyncUtils.bookmarks.guidToRecordId(guid);
+
+        let isDeleted = row.getResultByName("isDeleted");
+        if (isDeleted) {
+          changeRecords[recordId] = new BookmarkChangeRecord(
+            syncChangeCounter,
+            {
+              id: recordId,
+              deleted: true,
+            }
+          );
+          return;
+        }
+
+        let parentGuid = row.getResultByName("parentGuid");
+        let parentRecordId =
+          lazy.PlacesSyncUtils.bookmarks.guidToRecordId(parentGuid);
+
+        let unknownFieldsRow = row.getResultByName("unknownFields");
+        let unknownFields = unknownFieldsRow
+          ? JSON.parse(unknownFieldsRow)
+          : null;
+        let type = row.getResultByName("type");
+        switch (type) {
+          case lazy.PlacesUtils.bookmarks.TYPE_BOOKMARK: {
+            let isQuery = row.getResultByName("isQuery");
+            if (isQuery) {
+              let queryCleartext = {
+                id: recordId,
+                type: "query",
+                parentid: parentRecordId,
+                hasDupe: true,
+                parentName: row.getResultByName("parentTitle"),
+                dateAdded: row.getResultByName("dateAdded") || undefined,
+                bmkUri: row.getResultByName("url"),
+                title: row.getResultByName("title"),
+                folderName: row.getResultByName("tagFolderName") || undefined,
+                ...unknownFields,
+              };
+              changeRecords[recordId] = new BookmarkChangeRecord(
+                syncChangeCounter,
+                queryCleartext
+              );
+              return;
+            }
+
+            let bookmarkCleartext = {
+              id: recordId,
+              type: "bookmark",
+              parentid: parentRecordId,
+              hasDupe: true,
+              parentName: row.getResultByName("parentTitle"),
+              dateAdded: row.getResultByName("dateAdded") || undefined,
+              bmkUri: row.getResultByName("url"),
+              title: row.getResultByName("title"),
+              ...unknownFields,
+            };
+            let keyword = row.getResultByName("keyword");
+            if (keyword) {
+              bookmarkCleartext.keyword = keyword;
+            }
+            let localId = row.getResultByName("id");
+            let tags = tagsByLocalId.get(localId);
+            if (tags) {
+              bookmarkCleartext.tags = tags;
+            }
+            changeRecords[recordId] = new BookmarkChangeRecord(
+              syncChangeCounter,
+              bookmarkCleartext
+            );
+            return;
+          }
+
+          case lazy.PlacesUtils.bookmarks.TYPE_FOLDER: {
+            let folderCleartext = {
+              id: recordId,
+              type: "folder",
+              parentid: parentRecordId,
+              hasDupe: true,
+              parentName: row.getResultByName("parentTitle"),
+              dateAdded: row.getResultByName("dateAdded") || undefined,
+              title: row.getResultByName("title"),
+              ...unknownFields,
+            };
+            let localId = row.getResultByName("id");
+            let childRecordIds = childRecordIdsByLocalParentId.get(localId);
+            folderCleartext.children = childRecordIds || [];
+            changeRecords[recordId] = new BookmarkChangeRecord(
+              syncChangeCounter,
+              folderCleartext
+            );
+            return;
+          }
+
+          case lazy.PlacesUtils.bookmarks.TYPE_SEPARATOR: {
+            let separatorCleartext = {
+              id: recordId,
+              type: "separator",
+              parentid: parentRecordId,
+              hasDupe: true,
+              parentName: row.getResultByName("parentTitle"),
+              dateAdded: row.getResultByName("dateAdded") || undefined,
+              pos: row.getResultByName("position"),
+              ...unknownFields,
+            };
+            changeRecords[recordId] = new BookmarkChangeRecord(
+              syncChangeCounter,
+              separatorCleartext
+            );
+            return;
+          }
+
+          default:
+            throw new TypeError("Can't create record for unknown Places item");
+        }
+      },
+      lazy.yieldState
+    );
+
+    return { changeRecords, count: itemRows.length };
+  }
+
+  finalize({ alsoCleanup = true } = {}) {
+    if (!this.finalizePromise) {
+      this.finalizePromise = (async () => {
+        this.progress.step(ProgressTracker.STEPS.FINALIZE);
+        this.finalizeController.abort();
+        this.merger.reset();
+        if (alsoCleanup) {
+          await cleanupMirrorDatabase(this.db);
+        }
+        await this.db.execute(`PRAGMA mirror.optimize(0x12)`);
+        await this.db.execute(`DETACH mirror`);
+        this.finalizeAt.removeBlocker(this.finalizeBound);
+      })();
+    }
+    return this.finalizePromise;
+  }
+}
+
+SyncedBookmarksMirror.META_KEY = {
+  LAST_MODIFIED: "collection/lastModified",
+  SYNC_ID: "collection/syncId",
+};
+
+class InterruptedError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "InterruptedError";
+  }
+}
+SyncedBookmarksMirror.InterruptedError = InterruptedError;
+
+class MergeError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "MergeError";
+  }
+}
+SyncedBookmarksMirror.MergeError = MergeError;
+
+class MergeConflictError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "MergeConflictError";
+  }
+}
+SyncedBookmarksMirror.MergeConflictError = MergeConflictError;
+
+class DatabaseCorruptError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "DatabaseCorruptError";
+  }
+}
+
+function isDatabaseCorrupt(error) {
+  if (error instanceof DatabaseCorruptError) {
+    return true;
+  }
+  if (error.errors) {
+    return error.errors.some(
+      e =>
+        e instanceof Ci.mozIStorageError &&
+        (e.result == Ci.mozIStorageError.CORRUPT ||
+          e.result == Ci.mozIStorageError.NOTADB)
+    );
+  }
+  return false;
+}
+
+async function attachAndInitMirrorDatabase(db, path) {
+  await db.execute(`ATTACH :path AS mirror`, { path });
+  try {
+    await db.executeTransaction(async function () {
+      let currentSchemaVersion = await db.getSchemaVersion("mirror");
+      if (currentSchemaVersion > 0) {
+        if (currentSchemaVersion < MIRROR_SCHEMA_VERSION) {
+          await migrateMirrorSchema(db, currentSchemaVersion);
+        }
+      } else {
+        await initializeMirrorDatabase(db);
+      }
+      await db.setSchemaVersion(MIRROR_SCHEMA_VERSION, "mirror");
+      await initializeTempMirrorEntities(db);
+    });
+  } catch (ex) {
+    await db.execute(`DETACH mirror`);
+    throw ex;
+  }
+}
+
+async function migrateMirrorSchema(db, currentSchemaVersion) {
+  if (currentSchemaVersion < 5) {
+    throw new DatabaseCorruptError(
+      `Can't migrate from schema version ${currentSchemaVersion}; too old`
+    );
+  }
+  if (currentSchemaVersion < 6) {
+    await db.execute(`CREATE INDEX IF NOT EXISTS mirror.itemURLs ON
+                      items(urlId)`);
+    await db.execute(`CREATE INDEX IF NOT EXISTS mirror.itemKeywords ON
+                      items(keyword) WHERE keyword NOT NULL`);
+  }
+  if (currentSchemaVersion < 7) {
+    await db.execute(`CREATE INDEX IF NOT EXISTS mirror.structurePositions ON
+                      structure(parentGuid, position)`);
+  }
+  if (currentSchemaVersion < 8) {
+    await db.execute(`UPDATE moz_bookmarks AS b
+                      SET syncStatus = ${lazy.PlacesUtils.bookmarks.SYNC_STATUS.NORMAL}
+                      WHERE EXISTS (SELECT 1 FROM mirror.items
+                                    WHERE guid = b.guid)`);
+  }
+  if (currentSchemaVersion < 9) {
+    let columns = await db.execute(`PRAGMA table_info(items)`);
+    let exists = columns.find(
+      row => row.getResultByName("name") === "unknownFields"
+    );
+    if (!exists) {
+      await db.execute(`ALTER TABLE items ADD COLUMN unknownFields TEXT`);
+    }
+  }
+}
+
+async function initializeMirrorDatabase(db) {
+  await db.execute(`CREATE TABLE mirror.meta(
+    key TEXT PRIMARY KEY,
+    value NOT NULL
+  ) WITHOUT ROWID`);
+
+  await db.execute(`CREATE TABLE mirror.items(
+    id INTEGER PRIMARY KEY,
+    guid TEXT UNIQUE NOT NULL,
+    /* The "parentid" from the record. */
+    parentGuid TEXT,
+    /* The server modified time, in milliseconds. */
+    serverModified INTEGER NOT NULL DEFAULT 0,
+    needsMerge BOOLEAN NOT NULL DEFAULT 0,
+    validity INTEGER NOT NULL DEFAULT ${Ci.mozISyncedBookmarksMerger.VALIDITY_VALID},
+    isDeleted BOOLEAN NOT NULL DEFAULT 0,
+    kind INTEGER NOT NULL DEFAULT -1,
+    /* The creation date, in milliseconds. */
+    dateAdded INTEGER NOT NULL DEFAULT 0,
+    title TEXT,
+    urlId INTEGER REFERENCES urls(id)
+                  ON DELETE SET NULL,
+    keyword TEXT,
+    description TEXT,
+    loadInSidebar BOOLEAN,
+    smartBookmarkName TEXT,
+    feedURL TEXT,
+    siteURL TEXT,
+    unknownFields TEXT
+  )`);
+
+  await db.execute(`CREATE TABLE mirror.structure(
+    guid TEXT,
+    parentGuid TEXT REFERENCES items(guid)
+                    ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    PRIMARY KEY(parentGuid, guid)
+  ) WITHOUT ROWID`);
+
+  await db.execute(`CREATE TABLE mirror.urls(
+    id INTEGER PRIMARY KEY,
+    guid TEXT NOT NULL,
+    url TEXT NOT NULL,
+    hash INTEGER NOT NULL,
+    revHost TEXT NOT NULL
+  )`);
+
+  await db.execute(`CREATE TABLE mirror.tags(
+    itemId INTEGER NOT NULL REFERENCES items(id)
+                            ON DELETE CASCADE,
+    tag TEXT NOT NULL
+  )`);
+
+  await db.execute(
+    `CREATE INDEX mirror.structurePositions ON structure(parentGuid, position)`
+  );
+
+  await db.execute(`CREATE INDEX mirror.urlHashes ON urls(hash)`);
+
+  await db.execute(`CREATE INDEX mirror.itemURLs ON items(urlId)`);
+
+  await db.execute(`CREATE INDEX mirror.itemKeywords ON items(keyword)
+                    WHERE keyword NOT NULL`);
+
+  await createMirrorRoots(db);
+}
+
+async function cleanupMirrorDatabase(db) {
+  await db.executeTransaction(async function () {
+    await db.execute(`DROP TABLE changeGuidOps`);
+    await db.execute(`DROP TABLE itemsToApply`);
+    await db.execute(`DROP TABLE applyNewLocalStructureOps`);
+    await db.execute(`DROP VIEW localTags`);
+    await db.execute(`DROP TABLE itemsAdded`);
+    await db.execute(`DROP TABLE guidsChanged`);
+    await db.execute(`DROP TABLE itemsChanged`);
+    await db.execute(`DROP TABLE itemsMoved`);
+    await db.execute(`DROP TABLE itemsRemoved`);
+    await db.execute(`DROP TABLE itemsToUpload`);
+    await db.execute(`DROP TABLE structureToUpload`);
+    await db.execute(`DROP TABLE tagsToUpload`);
+  });
+}
+
+async function createMirrorRoots(db) {
+  const syncableRoots = [
+    {
+      guid: lazy.PlacesUtils.bookmarks.rootGuid,
+      parentGuid: lazy.PlacesUtils.bookmarks.rootGuid,
+      position: -1,
+      needsMerge: false,
+    },
+    ...lazy.PlacesUtils.bookmarks.userContentRoots.map((guid, position) => {
+      return {
+        guid,
+        parentGuid: lazy.PlacesUtils.bookmarks.rootGuid,
+        position,
+        needsMerge: true,
+      };
+    }),
+  ];
+
+  for (let { guid, parentGuid, position, needsMerge } of syncableRoots) {
+    await db.executeCached(
+      `
+      INSERT INTO items(guid, parentGuid, kind, needsMerge)
+      VALUES(:guid, :parentGuid, :kind, :needsMerge)`,
+      {
+        guid,
+        parentGuid,
+        kind: Ci.mozISyncedBookmarksMerger.KIND_FOLDER,
+        needsMerge,
+      }
+    );
+
+    await db.executeCached(
+      `
+      INSERT INTO structure(guid, parentGuid, position)
+      VALUES(:guid, :parentGuid, :position)`,
+      { guid, parentGuid, position }
+    );
+  }
+}
+
+async function initializeTempMirrorEntities(db) {
+  await db.execute(`CREATE TEMP TABLE changeGuidOps(
+    localGuid TEXT PRIMARY KEY,
+    mergedGuid TEXT UNIQUE NOT NULL,
+    syncStatus INTEGER,
+    level INTEGER NOT NULL,
+    lastModifiedMicroseconds INTEGER NOT NULL
+  ) WITHOUT ROWID`);
+
+  await db.execute(`
+    CREATE TEMP TRIGGER changeGuids
+    AFTER DELETE ON changeGuidOps
+    BEGIN
+      /* Record item changed notifications for the updated GUIDs. */
+      INSERT INTO guidsChanged(itemId, oldGuid, level)
+      SELECT b.id, OLD.localGuid, OLD.level
+      FROM moz_bookmarks b
+      WHERE b.guid = OLD.localGuid;
+
+      UPDATE moz_bookmarks SET
+        guid = OLD.mergedGuid,
+        lastModified = OLD.lastModifiedMicroseconds,
+        syncStatus = IFNULL(OLD.syncStatus, syncStatus)
+      WHERE guid = OLD.localGuid;
+    END`);
+
+  await db.execute(`CREATE TEMP TABLE itemsToApply(
+    mergedGuid TEXT PRIMARY KEY,
+    localId INTEGER UNIQUE,
+    remoteId INTEGER UNIQUE NOT NULL,
+    remoteGuid TEXT UNIQUE NOT NULL,
+    newLevel INTEGER NOT NULL,
+    newType INTEGER NOT NULL,
+    localDateAddedMicroseconds INTEGER,
+    remoteDateAddedMicroseconds INTEGER NOT NULL,
+    lastModifiedMicroseconds INTEGER NOT NULL,
+    oldTitle TEXT,
+    newTitle TEXT,
+    oldPlaceId INTEGER,
+    newPlaceId INTEGER,
+    newKeyword TEXT
+  )`);
+
+  await db.execute(`CREATE INDEX existingItems ON itemsToApply(localId)
+                    WHERE localId NOT NULL`);
+
+  await db.execute(`CREATE INDEX oldPlaceIds ON itemsToApply(oldPlaceId)
+                    WHERE oldPlaceId NOT NULL`);
+
+  await db.execute(`CREATE INDEX newPlaceIds ON itemsToApply(newPlaceId)
+                    WHERE newPlaceId NOT NULL`);
+
+  await db.execute(`CREATE INDEX newKeywords ON itemsToApply(newKeyword)
+                    WHERE newKeyword NOT NULL`);
+
+  await db.execute(`CREATE TEMP TABLE applyNewLocalStructureOps(
+    mergedGuid TEXT PRIMARY KEY,
+    mergedParentGuid TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    level INTEGER NOT NULL
+  ) WITHOUT ROWID`);
+
+  await db.execute(`
+    CREATE TEMP TRIGGER applyNewLocalStructure
+    AFTER DELETE ON applyNewLocalStructureOps
+    BEGIN
+      INSERT INTO itemsMoved(itemId, oldParentId, oldParentGuid, oldPosition,
+                             level)
+      SELECT b.id, p.id, p.guid, b.position, OLD.level
+      FROM moz_bookmarks b
+      JOIN moz_bookmarks p ON p.id = b.parent
+      WHERE b.guid = OLD.mergedGuid;
+
+      UPDATE moz_bookmarks SET
+        parent = (SELECT id FROM moz_bookmarks
+                  WHERE guid = OLD.mergedParentGuid),
+        position = OLD.position
+      WHERE guid = OLD.mergedGuid;
+    END`);
+
+  await db.execute(`
+    CREATE TEMP VIEW localTags(tagEntryId, tagEntryGuid, tagFolderId,
+                               tagFolderGuid, tagEntryPosition, tagEntryType,
+                               tag, placeId, lastModifiedMicroseconds) AS
+    SELECT b.id, b.guid, p.id, p.guid, b.position, b.type,
+           p.title, b.fk, b.lastModified
+    FROM moz_bookmarks b
+    JOIN moz_bookmarks p ON p.id = b.parent
+    WHERE b.type = ${lazy.PlacesUtils.bookmarks.TYPE_BOOKMARK} AND
+          p.parent = (SELECT id FROM moz_bookmarks
+                      WHERE guid = '${lazy.PlacesUtils.bookmarks.tagsGuid}')`);
+
+  await db.execute(`
+    CREATE TEMP TRIGGER untagLocalPlace
+    INSTEAD OF DELETE ON localTags
+    BEGIN
+      /* Record an item removed notification for the tag entry. */
+      INSERT INTO itemsRemoved(itemId, parentId, position, type, placeId, guid,
+                               parentGuid, title, isUntagging)
+      VALUES(OLD.tagEntryId, OLD.tagFolderId, OLD.tagEntryPosition,
+             OLD.tagEntryType, OLD.placeId, OLD.tagEntryGuid,
+             OLD.tagFolderGuid, OLD.tag, 1);
+
+      DELETE FROM moz_bookmarks WHERE id = OLD.tagEntryId;
+
+      /* Fix the positions of the sibling tag entries. */
+      UPDATE moz_bookmarks SET
+        position = position - 1
+      WHERE parent = OLD.tagFolderId AND
+            position > OLD.tagEntryPosition;
+    END`);
+
+  await db.execute(`
+    CREATE TEMP TRIGGER tagLocalPlace
+    INSTEAD OF INSERT ON localTags
+    BEGIN
+      /* Ensure the tag folder exists. */
+      INSERT OR IGNORE INTO moz_bookmarks(guid, parent, position, type, title,
+                                          dateAdded, lastModified)
+      VALUES(IFNULL((SELECT b.guid FROM moz_bookmarks b
+                     JOIN moz_bookmarks p ON p.id = b.parent
+                     WHERE b.title = NEW.tag AND
+                           p.guid = '${lazy.PlacesUtils.bookmarks.tagsGuid}'),
+                    GENERATE_GUID()),
+             (SELECT id FROM moz_bookmarks
+              WHERE guid = '${lazy.PlacesUtils.bookmarks.tagsGuid}'),
+             (SELECT COUNT(*) FROM moz_bookmarks b
+              JOIN moz_bookmarks p ON p.id = b.parent
+              WHERE p.guid = '${lazy.PlacesUtils.bookmarks.tagsGuid}'),
+             ${lazy.PlacesUtils.bookmarks.TYPE_FOLDER}, NEW.tag,
+             NEW.lastModifiedMicroseconds,
+             NEW.lastModifiedMicroseconds);
+
+      /* Record an item added notification if we created a tag folder.
+         "CHANGES()" returns the number of rows affected by the INSERT above:
+         1 if we created the folder, or 0 if the folder already existed. */
+      INSERT INTO itemsAdded(guid, isTagging)
+      SELECT b.guid, 1
+      FROM moz_bookmarks b
+      JOIN moz_bookmarks p ON p.id = b.parent
+      WHERE CHANGES() > 0 AND
+            b.title = NEW.tag AND
+            p.guid = '${lazy.PlacesUtils.bookmarks.tagsGuid}';
+
+      /* Add a tag entry for the URL under the tag folder. Omitting the place
+         ID creates a tag folder without tagging the URL. */
+      INSERT OR IGNORE INTO moz_bookmarks(guid, parent, position, type, fk,
+                                          dateAdded, lastModified)
+      SELECT IFNULL((SELECT b.guid FROM moz_bookmarks b
+                     JOIN moz_bookmarks p ON p.id = b.parent
+                     WHERE b.fk = NEW.placeId AND
+                           p.title = NEW.tag AND
+                           p.parent = (SELECT id FROM moz_bookmarks
+                                       WHERE guid = '${lazy.PlacesUtils.bookmarks.tagsGuid}')),
+                    GENERATE_GUID()),
+             (SELECT b.id FROM moz_bookmarks b
+              JOIN moz_bookmarks p ON p.id = b.parent
+              WHERE p.guid = '${lazy.PlacesUtils.bookmarks.tagsGuid}' AND
+                    b.title = NEW.tag),
+             (SELECT COUNT(*) FROM moz_bookmarks b
+              JOIN moz_bookmarks p ON p.id = b.parent
+              WHERE p.title = NEW.tag AND
+                    p.parent = (SELECT id FROM moz_bookmarks
+                                WHERE guid = '${lazy.PlacesUtils.bookmarks.tagsGuid}')),
+             ${lazy.PlacesUtils.bookmarks.TYPE_BOOKMARK}, NEW.placeId,
+             NEW.lastModifiedMicroseconds,
+             NEW.lastModifiedMicroseconds
+      WHERE NEW.placeId NOT NULL;
+
+      /* Record an item added notification for the tag entry. */
+      INSERT INTO itemsAdded(guid, isTagging)
+      SELECT b.guid, 1
+      FROM moz_bookmarks b
+      JOIN moz_bookmarks p ON p.id = b.parent
+      WHERE CHANGES() > 0 AND
+            b.fk = NEW.placeId AND
+            p.title = NEW.tag AND
+            p.parent = (SELECT id FROM moz_bookmarks
+                        WHERE guid = '${lazy.PlacesUtils.bookmarks.tagsGuid}');
+    END`);
+
+  await db.execute(`CREATE TEMP TABLE itemsAdded(
+    guid TEXT PRIMARY KEY,
+    isTagging BOOLEAN NOT NULL DEFAULT 0,
+    keywordChanged BOOLEAN NOT NULL DEFAULT 0,
+    level INTEGER NOT NULL DEFAULT -1
+  ) WITHOUT ROWID`);
+
+  await db.execute(`CREATE INDEX addedItemLevels ON itemsAdded(level)`);
+
+  await db.execute(`CREATE TEMP TABLE guidsChanged(
+    itemId INTEGER PRIMARY KEY,
+    oldGuid TEXT NOT NULL,
+    level INTEGER NOT NULL DEFAULT -1
+  )`);
+
+  await db.execute(`CREATE INDEX changedGuidLevels ON guidsChanged(level)`);
+
+  await db.execute(`CREATE TEMP TABLE itemsChanged(
+    itemId INTEGER PRIMARY KEY,
+    oldTitle TEXT,
+    oldPlaceId INTEGER,
+    keywordChanged BOOLEAN NOT NULL DEFAULT 0,
+    level INTEGER NOT NULL DEFAULT -1
+  )`);
+
+  await db.execute(`CREATE INDEX changedItemLevels ON itemsChanged(level)`);
+
+  await db.execute(`CREATE TEMP TABLE itemsMoved(
+    itemId INTEGER PRIMARY KEY,
+    oldParentId INTEGER NOT NULL,
+    oldParentGuid TEXT NOT NULL,
+    oldPosition INTEGER NOT NULL,
+    level INTEGER NOT NULL DEFAULT -1
+  )`);
+
+  await db.execute(`CREATE INDEX movedItemLevels ON itemsMoved(level)`);
+
+  await db.execute(`CREATE TEMP TABLE itemsRemoved(
+    itemId INTEGER PRIMARY KEY,
+    guid TEXT NOT NULL,
+    parentId INTEGER NOT NULL,
+    position INTEGER NOT NULL,
+    type INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    placeId INTEGER,
+    parentGuid TEXT NOT NULL,
+    /* We record the original level of the removed item in the tree so that we
+       can notify children before parents. */
+    level INTEGER NOT NULL DEFAULT -1,
+    isUntagging BOOLEAN NOT NULL DEFAULT 0,
+    keywordRemoved BOOLEAN NOT NULL DEFAULT 0
+  )`);
+
+  await db.execute(
+    `CREATE INDEX removedItemLevels ON itemsRemoved(level DESC)`
+  );
+
+  await db.execute(`CREATE TEMP TABLE itemsToUpload(
+    id INTEGER PRIMARY KEY,
+    guid TEXT UNIQUE NOT NULL,
+    syncChangeCounter INTEGER NOT NULL,
+    isDeleted BOOLEAN NOT NULL DEFAULT 0,
+    parentGuid TEXT,
+    parentTitle TEXT,
+    dateAdded INTEGER, /* In milliseconds. */
+    type INTEGER,
+    title TEXT,
+    placeId INTEGER,
+    isQuery BOOLEAN NOT NULL DEFAULT 0,
+    url TEXT,
+    tagFolderName TEXT,
+    keyword TEXT,
+    position INTEGER,
+    unknownFields TEXT
+  )`);
+
+  await db.execute(`CREATE TEMP TABLE structureToUpload(
+    guid TEXT PRIMARY KEY,
+    parentId INTEGER NOT NULL REFERENCES itemsToUpload(id)
+                              ON DELETE CASCADE,
+    position INTEGER NOT NULL
+  ) WITHOUT ROWID`);
+
+  await db.execute(
+    `CREATE INDEX parentsToUpload ON structureToUpload(parentId, position)`
+  );
+
+  await db.execute(`CREATE TEMP TABLE tagsToUpload(
+    id INTEGER REFERENCES itemsToUpload(id)
+               ON DELETE CASCADE,
+    tag TEXT,
+    PRIMARY KEY(id, tag)
+  ) WITHOUT ROWID`);
+}
+
+async function resetMirror(db) {
+  await db.execute(`DELETE FROM meta`);
+  await db.execute(`DELETE FROM structure`);
+  await db.execute(`DELETE FROM items`);
+  await db.execute(`DELETE FROM urls`);
+
+  await createMirrorRoots(db);
+}
+
+function determineServerModified(record) {
+  return Math.max(record.modified * 1000, 0) || 0;
+}
+
+function determineDateAdded(record) {
+  let serverModified = determineServerModified(record);
+  return lazy.PlacesSyncUtils.bookmarks.ratchetTimestampBackwards(
+    record.dateAdded,
+    serverModified
+  );
+}
+
+function validateTitle(rawTitle) {
+  if (typeof rawTitle != "string" || !rawTitle) {
+    return null;
+  }
+  return rawTitle.slice(0, DB_TITLE_LENGTH_MAX);
+}
+
+function validateURL(rawURL) {
+  if (typeof rawURL != "string" || rawURL.length > DB_URL_LENGTH_MAX) {
+    return null;
+  }
+  return URL.parse(rawURL);
+}
+
+function validateKeyword(rawKeyword) {
+  if (typeof rawKeyword != "string") {
+    return null;
+  }
+  let keyword = rawKeyword.trim();
+  return keyword ? keyword.toLowerCase() : null;
+}
+
+function validateTag(rawTag) {
+  if (typeof rawTag != "string") {
+    return null;
+  }
+  let tag = rawTag.trim();
+  if (!tag || tag.length > lazy.PlacesUtils.bookmarks.MAX_TAG_LENGTH) {
+    return null;
+  }
+  return tag;
+}
+
+async function withTiming(name, func, recordTiming) {
+  lazy.MirrorLog.debug(name);
+
+  let startTime = ChromeUtils.now();
+  let result = await func();
+  let elapsedTime = ChromeUtils.now() - startTime;
+
+  lazy.MirrorLog.debug(`${name} took ${elapsedTime.toFixed(3)}ms`);
+  if (typeof recordTiming == "function") {
+    recordTiming(elapsedTime, result);
+  }
+
+  return result;
+}
+
+class BookmarkObserverRecorder {
+  constructor(db, { notifyInStableOrder, signal }) {
+    this.db = db;
+    this.notifyInStableOrder = notifyInStableOrder;
+    this.signal = signal;
+    this.placesEvents = [];
+    this.shouldInvalidateKeywords = false;
+  }
+
+  async notifyAll() {
+    await this.noteAllChanges();
+    if (this.shouldInvalidateKeywords) {
+      await lazy.PlacesUtils.keywords.invalidateCachedKeywords();
+    }
+    this.notifyBookmarkObservers();
+    if (this.signal.aborted) {
+      throw new SyncedBookmarksMirror.InterruptedError(
+        "Interrupted before recalculating frecencies for new URLs"
+      );
+    }
+  }
+
+  orderBy(level, parent, position) {
+    return `ORDER BY ${
+      this.notifyInStableOrder ? `${level}, ${parent}, ${position}` : level
+    }`;
+  }
+
+  async noteAllChanges() {
+    lazy.MirrorLog.trace("Recording observer notifications for removed items");
+    await this.db.execute(
+      `SELECT v.itemId AS id, v.parentId, v.parentGuid, v.position, v.type,
+              (SELECT h.url FROM moz_places h WHERE h.id = v.placeId) AS url,
+              v.title, v.guid, v.isUntagging, v.keywordRemoved
+       FROM itemsRemoved v
+       ${this.orderBy("v.level", "v.parentId", "v.position")}`,
+      null,
+      (row, cancel) => {
+        if (this.signal.aborted) {
+          cancel();
+          return;
+        }
+        let info = {
+          id: row.getResultByName("id"),
+          parentId: row.getResultByName("parentId"),
+          position: row.getResultByName("position"),
+          type: row.getResultByName("type"),
+          urlHref: row.getResultByName("url"),
+          title: row.getResultByName("title"),
+          guid: row.getResultByName("guid"),
+          parentGuid: row.getResultByName("parentGuid"),
+          isUntagging: row.getResultByName("isUntagging"),
+        };
+        this.noteItemRemoved(info);
+        if (row.getResultByName("keywordRemoved")) {
+          this.shouldInvalidateKeywords = true;
+        }
+      }
+    );
+    if (this.signal.aborted) {
+      throw new SyncedBookmarksMirror.InterruptedError(
+        "Interrupted while recording observer notifications for removed items"
+      );
+    }
+
+    lazy.MirrorLog.trace("Recording observer notifications for changed GUIDs");
+    await this.db.execute(
+      `SELECT b.id, b.lastModified, b.type, b.guid AS newGuid,
+              p.guid AS parentGuid, gp.guid AS grandParentGuid
+       FROM guidsChanged c
+       JOIN moz_bookmarks b ON b.id = c.itemId
+       JOIN moz_bookmarks p ON p.id = b.parent
+       LEFT JOIN moz_bookmarks gp ON gp.id = p.parent
+       ${this.orderBy("c.level", "b.parent", "b.position")}`,
+      null,
+      (row, cancel) => {
+        if (this.signal.aborted) {
+          cancel();
+          return;
+        }
+        let info = {
+          id: row.getResultByName("id"),
+          lastModified: row.getResultByName("lastModified"),
+          type: row.getResultByName("type"),
+          newGuid: row.getResultByName("newGuid"),
+          parentGuid: row.getResultByName("parentGuid"),
+          grandParentGuid: row.getResultByName("grandParentGuid"),
+        };
+        this.noteGuidChanged(info);
+      }
+    );
+    if (this.signal.aborted) {
+      throw new SyncedBookmarksMirror.InterruptedError(
+        "Interrupted while recording observer notifications for changed GUIDs"
+      );
+    }
+
+    lazy.MirrorLog.trace("Recording observer notifications for new items");
+    await this.db.execute(
+      `SELECT b.id, p.id AS parentId, b.position, b.type,
+              IFNULL(b.title, '') AS title, b.dateAdded, b.guid,
+              p.guid AS parentGuid, n.isTagging, n.keywordChanged,
+              h.url AS url, IFNULL(h.frecency, 0) AS frecency,
+              IFNULL(h.hidden, 0) AS hidden,
+              IFNULL(h.visit_count, 0) AS visit_count,
+              h.last_visit_date,
+              (SELECT group_concat(pp.title ORDER BY pp.title)
+               FROM moz_bookmarks bb
+               JOIN moz_bookmarks pp ON pp.id = bb.parent
+               JOIN moz_bookmarks gg ON gg.id = pp.parent
+               WHERE bb.fk = h.id
+               AND gg.guid = '${lazy.PlacesUtils.bookmarks.tagsGuid}'
+              ) AS tags,
+              t.guid AS tGuid, t.id AS tId, t.title AS tTitle
+       FROM itemsAdded n
+       JOIN moz_bookmarks b ON b.guid = n.guid
+       JOIN moz_bookmarks p ON p.id = b.parent
+       LEFT JOIN moz_places h ON h.id = b.fk
+       LEFT JOIN moz_bookmarks t ON t.guid = target_folder_guid(url)
+       ${this.orderBy("n.level", "b.parent", "b.position")}`,
+      null,
+      (row, cancel) => {
+        if (this.signal.aborted) {
+          cancel();
+          return;
+        }
+
+        let lastVisitDate = row.getResultByName("last_visit_date");
+
+        let info = {
+          id: row.getResultByName("id"),
+          parentId: row.getResultByName("parentId"),
+          position: row.getResultByName("position"),
+          type: row.getResultByName("type"),
+          urlHref: row.getResultByName("url"),
+          title: row.getResultByName("title"),
+          dateAdded: row.getResultByName("dateAdded"),
+          guid: row.getResultByName("guid"),
+          parentGuid: row.getResultByName("parentGuid"),
+          isTagging: row.getResultByName("isTagging"),
+          frecency: row.getResultByName("frecency"),
+          hidden: row.getResultByName("hidden"),
+          visitCount: row.getResultByName("visit_count"),
+          lastVisitDate: lastVisitDate
+            ? lazy.PlacesUtils.toDate(lastVisitDate).getTime()
+            : null,
+          tags: row.getResultByName("tags"),
+          targetFolderGuid: row.getResultByName("tGuid"),
+          targetFolderItemId: row.getResultByName("tId"),
+          targetFolderTitle: row.getResultByName("tTitle"),
+        };
+
+        this.noteItemAdded(info);
+        if (row.getResultByName("keywordChanged")) {
+          this.shouldInvalidateKeywords = true;
+        }
+      }
+    );
+    if (this.signal.aborted) {
+      throw new SyncedBookmarksMirror.InterruptedError(
+        "Interrupted while recording observer notifications for new items"
+      );
+    }
+
+    lazy.MirrorLog.trace("Recording observer notifications for moved items");
+    await this.db.execute(
+      `SELECT b.id, b.guid, b.type, p.guid AS newParentGuid, c.oldParentGuid,
+              b.position AS newPosition, c.oldPosition,
+              gp.guid AS grandParentGuid,
+              h.url AS url, IFNULL(b.title, '') AS title,
+              IFNULL(h.frecency, 0) AS frecency, IFNULL(h.hidden, 0) AS hidden,
+              IFNULL(h.visit_count, 0) AS visit_count,
+              b.dateAdded, h.last_visit_date,
+              (SELECT group_concat(pp.title ORDER BY pp.title)
+               FROM moz_bookmarks bb
+               JOIN moz_bookmarks pp ON pp.id = bb.parent
+               JOIN moz_bookmarks gg ON gg.id = pp.parent
+               WHERE bb.fk = h.id
+               AND gg.guid = '${lazy.PlacesUtils.bookmarks.tagsGuid}'
+              ) AS tags
+       FROM itemsMoved c
+       JOIN moz_bookmarks b ON b.id = c.itemId
+       JOIN moz_bookmarks p ON p.id = b.parent
+       LEFT JOIN moz_bookmarks gp ON gp.id = p.parent
+       LEFT JOIN moz_places h ON h.id = b.fk
+       ${this.orderBy("c.level", "b.parent", "b.position")}`,
+      null,
+      (row, cancel) => {
+        if (this.signal.aborted) {
+          cancel();
+          return;
+        }
+        let lastVisitDate = row.getResultByName("last_visit_date");
+        let info = {
+          id: row.getResultByName("id"),
+          guid: row.getResultByName("guid"),
+          type: row.getResultByName("type"),
+          newParentGuid: row.getResultByName("newParentGuid"),
+          oldParentGuid: row.getResultByName("oldParentGuid"),
+          newPosition: row.getResultByName("newPosition"),
+          oldPosition: row.getResultByName("oldPosition"),
+          urlHref: row.getResultByName("url"),
+          grandParentGuid: row.getResultByName("grandParentGuid"),
+          title: row.getResultByName("title"),
+          frecency: row.getResultByName("frecency"),
+          hidden: row.getResultByName("hidden"),
+          visitCount: row.getResultByName("visit_count"),
+          dateAdded: lazy.PlacesUtils.toDate(
+            row.getResultByName("dateAdded")
+          ).getTime(),
+          lastVisitDate: lastVisitDate
+            ? lazy.PlacesUtils.toDate(lastVisitDate).getTime()
+            : null,
+          tags: row.getResultByName("tags"),
+        };
+        this.noteItemMoved(info);
+      }
+    );
+    if (this.signal.aborted) {
+      throw new SyncedBookmarksMirror.InterruptedError(
+        "Interrupted while recording observer notifications for moved items"
+      );
+    }
+
+    lazy.MirrorLog.trace("Recording observer notifications for changed items");
+    await this.db.execute(
+      `SELECT b.id, b.guid, b.lastModified, b.type,
+              IFNULL(b.title, '') AS newTitle,
+              IFNULL(c.oldTitle, '') AS oldTitle,
+              (SELECT h.url FROM moz_places h
+               WHERE h.id = b.fk) AS newURL,
+              (SELECT h.url FROM moz_places h
+               WHERE h.id = c.oldPlaceId) AS oldURL,
+              p.id AS parentId, p.guid AS parentGuid,
+              c.keywordChanged,
+              gp.guid AS grandParentGuid,
+              (SELECT h.url FROM moz_places h WHERE h.id = b.fk) AS url
+       FROM itemsChanged c
+       JOIN moz_bookmarks b ON b.id = c.itemId
+       JOIN moz_bookmarks p ON p.id = b.parent
+       LEFT JOIN moz_bookmarks gp ON gp.id = p.parent
+       ${this.orderBy("c.level", "b.parent", "b.position")}`,
+      null,
+      (row, cancel) => {
+        if (this.signal.aborted) {
+          cancel();
+          return;
+        }
+        let info = {
+          id: row.getResultByName("id"),
+          guid: row.getResultByName("guid"),
+          lastModified: row.getResultByName("lastModified"),
+          type: row.getResultByName("type"),
+          newTitle: row.getResultByName("newTitle"),
+          oldTitle: row.getResultByName("oldTitle"),
+          newURLHref: row.getResultByName("newURL"),
+          oldURLHref: row.getResultByName("oldURL"),
+          parentId: row.getResultByName("parentId"),
+          parentGuid: row.getResultByName("parentGuid"),
+          grandParentGuid: row.getResultByName("grandParentGuid"),
+        };
+        this.noteItemChanged(info);
+        if (row.getResultByName("keywordChanged")) {
+          this.shouldInvalidateKeywords = true;
+        }
+      }
+    );
+    if (this.signal.aborted) {
+      throw new SyncedBookmarksMirror.InterruptedError(
+        "Interrupted while recording observer notifications for changed items"
+      );
+    }
+  }
+
+  noteItemAdded(info) {
+    this.placesEvents.push(
+      new PlacesBookmarkAddition({
+        id: info.id,
+        parentId: info.parentId,
+        index: info.position,
+        url: info.urlHref || "",
+        title: info.title,
+        dateAdded: info.dateAdded / 1000,
+        guid: info.guid,
+        parentGuid: info.parentGuid,
+        source: lazy.PlacesUtils.bookmarks.SOURCES.SYNC,
+        itemType: info.type,
+        isTagging: info.isTagging,
+        tags: info.tags,
+        frecency: info.frecency,
+        hidden: info.hidden,
+        visitCount: info.visitCount,
+        lastVisitDate: info.lastVisitDate,
+        targetFolderGuid: info.targetFolderGuid,
+        targetFolderItemId: info.targetFolderItemId,
+        targetFolderTitle: info.targetFolderTitle,
+      })
+    );
+  }
+
+  noteGuidChanged(info) {
+    this.placesEvents.push(
+      new PlacesBookmarkGuid({
+        id: info.id,
+        itemType: info.type,
+        url: info.urlHref,
+        guid: info.newGuid,
+        parentGuid: info.parentGuid,
+        lastModified: info.lastModified,
+        source: lazy.PlacesUtils.bookmarks.SOURCES.SYNC,
+        isTagging:
+          info.parentGuid === lazy.PlacesUtils.bookmarks.tagsGuid ||
+          info.grandParentGuid === lazy.PlacesUtils.bookmarks.tagsGuid,
+      })
+    );
+  }
+
+  noteItemMoved(info) {
+    this.placesEvents.push(
+      new PlacesBookmarkMoved({
+        id: info.id,
+        itemType: info.type,
+        url: info.urlHref,
+        title: info.title,
+        guid: info.guid,
+        parentGuid: info.newParentGuid,
+        source: lazy.PlacesUtils.bookmarks.SOURCES.SYNC,
+        index: info.newPosition,
+        oldParentGuid: info.oldParentGuid,
+        oldIndex: info.oldPosition,
+        isTagging:
+          info.newParentGuid === lazy.PlacesUtils.bookmarks.tagsGuid ||
+          info.grandParentGuid === lazy.PlacesUtils.bookmarks.tagsGuid,
+        tags: info.tags,
+        frecency: info.frecency,
+        hidden: info.hidden,
+        visitCount: info.visitCount,
+        dateAdded: info.dateAdded,
+        lastVisitDate: info.lastVisitDate,
+      })
+    );
+  }
+
+  noteItemChanged(info) {
+    if (info.oldTitle != info.newTitle) {
+      this.placesEvents.push(
+        new PlacesBookmarkTitle({
+          id: info.id,
+          itemType: info.type,
+          url: info.urlHref,
+          guid: info.guid,
+          parentGuid: info.parentGuid,
+          title: info.newTitle,
+          lastModified: info.lastModified,
+          source: lazy.PlacesUtils.bookmarks.SOURCES.SYNC,
+          isTagging:
+            info.parentGuid === lazy.PlacesUtils.bookmarks.tagsGuid ||
+            info.grandParentGuid === lazy.PlacesUtils.bookmarks.tagsGuid,
+        })
+      );
+    }
+    if (info.oldURLHref != info.newURLHref) {
+      this.placesEvents.push(
+        new PlacesBookmarkUrl({
+          id: info.id,
+          itemType: info.type,
+          url: info.newURLHref,
+          guid: info.guid,
+          parentGuid: info.parentGuid,
+          lastModified: info.lastModified,
+          source: lazy.PlacesUtils.bookmarks.SOURCES.SYNC,
+          isTagging:
+            info.parentGuid === lazy.PlacesUtils.bookmarks.tagsGuid ||
+            info.grandParentGuid === lazy.PlacesUtils.bookmarks.tagsGuid,
+        })
+      );
+    }
+  }
+
+  noteItemRemoved(info) {
+    this.placesEvents.push(
+      new PlacesBookmarkRemoved({
+        id: info.id,
+        parentId: info.parentId,
+        index: info.position,
+        url: info.urlHref || "",
+        title: info.title,
+        guid: info.guid,
+        parentGuid: info.parentGuid,
+        source: lazy.PlacesUtils.bookmarks.SOURCES.SYNC,
+        itemType: info.type,
+        isTagging: info.isUntagging,
+        isDescendantRemoval: false,
+      })
+    );
+  }
+
+  notifyBookmarkObservers() {
+    lazy.MirrorLog.trace("Notifying bookmark observers");
+
+    if (this.placesEvents.length) {
+      PlacesObservers.notifyListeners(this.placesEvents);
+    }
+
+    lazy.MirrorLog.trace("Notified bookmark observers");
+  }
+}
+
+class BookmarkChangeRecord {
+  constructor(syncChangeCounter, cleartext) {
+    this.tombstone = cleartext.deleted === true;
+    this.counter = syncChangeCounter;
+    this.cleartext = cleartext;
+    this.synced = false;
+  }
+}
+
+function bagToNamedCounts(bag, names) {
+  let counts = [];
+  for (let name of names) {
+    let count = bag.getProperty(name);
+    if (count > 0) {
+      counts.push({ name, count });
+    }
+  }
+  return counts;
+}
+
+const COMMON_UNKNOWN_FIELDS = [
+  "dateAdded",
+  "hasDupe",
+  "id",
+  "modified",
+  "parentid",
+  "parentName",
+  "type",
+];
+

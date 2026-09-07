@@ -1,0 +1,236 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef nsTableRowGroupFrame_h_
+#define nsTableRowGroupFrame_h_
+
+#include "mozilla/WritingModes.h"
+#include "nsAtom.h"
+#include "nsContainerFrame.h"
+#include "nsILineIterator.h"
+#include "nsTArray.h"
+#include "nsTableFrame.h"
+#include "nscore.h"
+
+class nsTableRowFrame;
+namespace mozilla {
+class PresShell;
+struct TableRowGroupReflowInput;
+}  
+
+#define MIN_ROWS_NEEDING_CURSOR 20
+
+class nsTableRowGroupFrame final : public nsContainerFrame,
+                                   public nsILineIterator {
+ public:
+  NS_DECL_QUERYFRAME
+  NS_DECL_FRAMEARENA_HELPERS(nsTableRowGroupFrame)
+
+  friend nsTableRowGroupFrame* NS_NewTableRowGroupFrame(
+      mozilla::PresShell* aPresShell, ComputedStyle* aStyle);
+  virtual ~nsTableRowGroupFrame();
+
+  void Init(nsIContent* aContent, nsContainerFrame* aParent,
+            nsIFrame* aPrevInFlow) override {
+    nsContainerFrame::Init(aContent, aParent, aPrevInFlow);
+    if (!aPrevInFlow) {
+      mWritingMode = GetTableFrame()->GetWritingMode();
+    }
+  }
+
+  void Destroy(DestroyContext&) override;
+
+  void DidSetComputedStyle(ComputedStyle* aOldComputedStyle) override;
+
+  void AppendFrames(ChildListID aListID, nsFrameList&& aFrameList) override;
+  void InsertFrames(ChildListID aListID, nsIFrame* aPrevFrame,
+                    const nsLineList::iterator* aPrevFrameLine,
+                    nsFrameList&& aFrameList) override;
+  void RemoveFrame(DestroyContext&, ChildListID, nsIFrame*) override;
+
+  nsMargin GetUsedMargin() const override;
+  nsMargin GetUsedBorder() const override;
+  nsMargin GetUsedPadding() const override;
+
+  void BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                        const nsDisplayListSet& aLists) override;
+
+  void Reflow(nsPresContext* aPresContext, ReflowOutput& aDesiredSize,
+              const ReflowInput& aReflowInput,
+              nsReflowStatus& aStatus) override;
+
+  bool ComputeCustomOverflow(mozilla::OverflowAreas& aOverflowAreas) override;
+
+#ifdef DEBUG_FRAME_DUMP
+  nsresult GetFrameName(nsAString& aResult) const override;
+#endif
+
+  nsTableRowFrame* GetFirstRow() const;
+  nsTableRowFrame* GetLastRow() const;
+
+  nsTableFrame* GetTableFrame() const {
+    nsIFrame* parent = GetParent();
+    MOZ_ASSERT(parent && parent->IsTableFrame());
+    return static_cast<nsTableFrame*>(parent);
+  }
+
+  int32_t GetRowCount() const;
+
+  int32_t GetStartRowIndex() const;
+
+  void AdjustRowIndices(int32_t aRowIndex, int32_t anAdjustment);
+
+  int32_t GetAdjustmentForStoredIndex(int32_t aStoredIndex);
+
+  void MarkRowsAsDeleted(nsTableRowFrame& aStartRowFrame,
+                         int32_t aNumRowsToDelete);
+
+  void AddDeletedRowIndex(int32_t aDeletedRowStoredIndex);
+
+  void InitRepeatedFrame(nsTableRowGroupFrame* aHeaderFooterFrame);
+
+  nscoord GetBSizeBasis(const ReflowInput& aReflowInput);
+
+  mozilla::LogicalMargin GetBCBorderWidth(mozilla::WritingMode aWM);
+
+  nscoord CollapseRowGroupIfNecessary(nscoord aBTotalOffset, nscoord aISize,
+                                      mozilla::WritingMode aWM);
+
+ public:
+
+  int32_t GetNumLines() const final;
+
+  bool IsLineIteratorFlowRTL() final;
+
+  Result<LineInfo, nsresult> GetLine(int32_t aLineNumber) final;
+
+  int32_t FindLineContaining(const nsIFrame* aFrame,
+                             int32_t aStartLine = 0) final;
+
+  NS_IMETHOD FindFrameAt(int32_t aLineNumber, nsPoint aPos,
+                         nsIFrame** aFrameFound, bool* aPosIsBeforeFirstFrame,
+                         bool* aPosIsAfterLastFrame) final;
+
+
+  NS_IMETHOD CheckLineOrder(int32_t aLine, bool* aIsReordered,
+                            nsIFrame** aFirstVisual,
+                            nsIFrame** aLastVisual) final;
+
+  struct FrameCursorData {
+    nsTArray<nsIFrame*> mFrames;
+    uint32_t mCursorIndex;
+    nscoord mOverflowAbove;
+    nscoord mOverflowBelow;
+
+    FrameCursorData()
+        : mFrames(MIN_ROWS_NEEDING_CURSOR),
+          mCursorIndex(0),
+          mOverflowAbove(0),
+          mOverflowBelow(0) {}
+
+    bool AppendFrame(nsIFrame* aFrame);
+
+    void FinishBuildingCursor() { mFrames.Compact(); }
+  };
+
+  void ClearRowCursor();
+
+  nsIFrame* GetFirstRowContaining(nscoord aY, nscoord* aOverflowAbove);
+
+  FrameCursorData* SetupRowCursor();
+
+  bool CanProvideLineIterator() const final { return true; }
+  nsILineIterator* GetLineIterator() final { return this; }
+
+  void InvalidateFrame(uint32_t aDisplayItemKey = 0,
+                       bool aRebuildDisplayItems = true) override;
+  void InvalidateFrameWithRect(const nsRect& aRect,
+                               uint32_t aDisplayItemKey = 0,
+                               bool aRebuildDisplayItems = true) override;
+  void InvalidateFrameForRemoval() override { InvalidateFrameSubtree(); }
+
+ protected:
+  explicit nsTableRowGroupFrame(ComputedStyle* aStyle,
+                                nsPresContext* aPresContext);
+
+  void InitChildReflowInput(nsPresContext* aPresContext, bool aBorderCollapse,
+                            ReflowInput& aReflowInput);
+
+  LogicalSides GetLogicalSkipSides() const override;
+
+  void PlaceChild(nsPresContext* aPresContext,
+                  mozilla::TableRowGroupReflowInput& aReflowInput,
+                  nsIFrame* aKidFrame, const ReflowInput& aKidReflowInput,
+                  mozilla::WritingMode aWM,
+                  const mozilla::LogicalPoint& aKidPosition,
+                  const nsSize& aContainerSize, ReflowOutput& aDesiredSize,
+                  const nsRect& aOriginalKidRect,
+                  const nsRect& aOriginalKidInkOverflow);
+
+  void CalculateRowBSizes(nsPresContext* aPresContext,
+                          ReflowOutput& aDesiredSize,
+                          const ReflowInput& aReflowInput);
+
+  void DidResizeRows(ReflowOutput& aDesiredSize);
+
+  void ReflowChildren(nsPresContext* aPresContext, ReflowOutput& aDesiredSize,
+                      mozilla::TableRowGroupReflowInput& aReflowInput,
+                      nsReflowStatus& aStatus,
+                      bool* aPageBreakBeforeEnd = nullptr);
+
+  void SplitRowGroup(nsPresContext* aPresContext, ReflowOutput& aDesiredSize,
+                     const ReflowInput& aReflowInput, nsTableFrame* aTableFrame,
+                     nsReflowStatus& aStatus, bool aRowForcedPageBreak);
+
+  void SplitSpanningCells(nsPresContext* aPresContext,
+                          const ReflowInput& aReflowInput,
+                          nsTableFrame* aTableFrame, nsTableRowFrame* aFirstRow,
+                          nsTableRowFrame* aLastRow, bool aFirstRowIsTopOfPage,
+                          nscoord aSpanningRowBEnd,
+                          const nsSize& aContainerSize,
+                          nsTableRowFrame*& aContRowFrame,
+                          nsTableRowFrame*& aFirstTruncatedRow,
+                          nscoord& aDesiredBSize);
+
+  nsTableRowFrame* CreateContinuingRowFrame(nsIFrame* aRowFrame);
+
+  bool IsSimpleRowFrame(nsTableFrame* aTableFrame, nsTableRowFrame* aRowFrame);
+
+  void GetNextRowSibling(nsIFrame** aRowFrame);
+
+  void UndoContinuedRow(nsPresContext* aPresContext, nsTableRowFrame* aRow);
+
+ public:
+  bool IsRepeatable() const;
+  void SetRepeatable(bool aRepeatable);
+  bool HasStyleBSize() const;
+  void SetHasStyleBSize(bool aValue);
+  bool HasInternalBreakBefore() const;
+  bool HasInternalBreakAfter() const;
+};
+
+inline bool nsTableRowGroupFrame::IsRepeatable() const {
+  return HasAnyStateBits(NS_ROWGROUP_REPEATABLE);
+}
+
+inline void nsTableRowGroupFrame::SetRepeatable(bool aRepeatable) {
+  if (aRepeatable) {
+    AddStateBits(NS_ROWGROUP_REPEATABLE);
+  } else {
+    RemoveStateBits(NS_ROWGROUP_REPEATABLE);
+  }
+}
+
+inline bool nsTableRowGroupFrame::HasStyleBSize() const {
+  return HasAnyStateBits(NS_ROWGROUP_HAS_STYLE_BSIZE);
+}
+
+inline void nsTableRowGroupFrame::SetHasStyleBSize(bool aValue) {
+  if (aValue) {
+    AddStateBits(NS_ROWGROUP_HAS_STYLE_BSIZE);
+  } else {
+    RemoveStateBits(NS_ROWGROUP_HAS_STYLE_BSIZE);
+  }
+}
+
+#endif

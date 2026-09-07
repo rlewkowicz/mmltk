@@ -1,0 +1,77 @@
+/*
+ * Copyright 2013 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkStreamPriv_DEFINED)
+#define SkStreamPriv_DEFINED
+
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkStream.h"
+#include "src/base/SkEndian.h"
+
+#include <cstdint>
+
+class SkData;
+
+namespace SkStreamPriv {
+
+sk_sp<SkData> CopyStreamToData(SkStream* stream);
+
+bool Copy(SkWStream* out, SkStream* input);
+
+class DebugfStream final : public SkWStream {
+public:
+    bool write(const void* buffer, size_t size) override;
+    size_t bytesWritten() const override;
+
+private:
+    size_t fBytesWritten = 0;
+};
+
+inline bool WriteU16BE(SkWStream* s, uint16_t value) {
+    value = SkEndian_SwapBE16(value);
+    return s->write(&value, sizeof(value));
+}
+
+inline bool WriteU32BE(SkWStream* s, uint32_t value) {
+    value = SkEndian_SwapBE32(value);
+    return s->write(&value, sizeof(value));
+}
+
+inline bool WriteS32BE(SkWStream* s, int32_t value) {
+    value = SkEndian_SwapBE32(value);
+    return s->write(&value, sizeof(value));
+}
+
+inline bool ReadU16BE(SkStream* s, uint16_t* value) {
+    if (!s->readU16(value)) {
+        return false;
+    }
+    *value = SkEndian_SwapBE16(*value);
+    return true;
+}
+
+inline bool ReadU32BE(SkStream* s, uint32_t* value) {
+    if (!s->readU32(value)) {
+        return false;
+    }
+    *value = SkEndian_SwapBE32(*value);
+    return true;
+}
+
+inline bool ReadS32BE(SkStream* s, int32_t* value) {
+    if (!s->readS32(value)) {
+        return false;
+    }
+    *value = SkEndian_SwapBE32(*value);
+    return true;
+}
+
+bool RemainingLengthIsBelow(SkStream* stream, size_t len);
+
+}  
+
+#endif

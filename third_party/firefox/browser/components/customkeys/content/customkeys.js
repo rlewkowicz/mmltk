@@ -1,0 +1,330 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+const table = document.getElementById("table");
+
+function notifyUpdate() {
+  window.dispatchEvent(new CustomEvent("CustomKeysUpdate"));
+}
+
+async function buildTable() {
+  const keys = await RPMSendQuery("CustomKeys:GetKeys");
+  for (const category in keys) {
+    const categoryCard = document.createElement("moz-card");
+    categoryCard.type = "accordion";
+    categoryCard.className = "category";
+    if (category.startsWith("customkeys-")) {
+      categoryCard.setAttribute("data-l10n-id", category);
+    } else {
+      categoryCard.heading = category;
+    }
+    categoryCard.headingLevel = 2;
+    table.append(categoryCard);
+
+    const boxGroup = document.createElement("moz-box-group");
+    categoryCard.append(boxGroup);
+    const categoryKeys = keys[category];
+
+    for (const keyId in categoryKeys) {
+      const row = document.createElement("moz-box-item");
+      row.className = "key";
+      const key = categoryKeys[keyId];
+      row.dataset.id = keyId;
+
+      let keyLabelText = key.title;
+      if (key.title.startsWith("customkeys-")) {
+        keyLabelText = await document.l10n.formatValue(key.title);
+        row.dataset.label = keyLabelText;
+      }
+      row.role = "group";
+      row.ariaLabel = keyLabelText;
+
+      const keyContent = document.createElement("div");
+      keyContent.className = "key-content";
+
+      const keyLabel = document.createElement("span");
+      keyLabel.className = "key-label";
+      keyLabel.textContent = keyLabelText;
+      keyContent.append(keyLabel);
+
+      const keyActions = document.createElement("div");
+      keyActions.className = "key-actions";
+
+      const inputCurrentKey = document.createElement("moz-input-text");
+      inputCurrentKey.className = "currentShortcut";
+      if (!key.shortcut) {
+        inputCurrentKey.setAttribute(
+          "data-l10n-id",
+          "customkeys-shortcut-unassigned"
+        );
+      }
+      inputCurrentKey.value = key.shortcut;
+      inputCurrentKey.ariaLabel = await document.l10n.formatValue(
+        "customkeys-shortcut-input",
+        { keyLabel: keyLabelText }
+      );
+      inputCurrentKey.readonly = true;
+      keyActions.append(inputCurrentKey);
+
+      const buttonChange = document.createElement("moz-button");
+      buttonChange.className = "change";
+      buttonChange.setAttribute("data-l10n-id", "customkeys-key-edit");
+      buttonChange.type = "icon ghost";
+      buttonChange.iconSrc = "chrome://global/skin/icons/edit-outline.svg";
+      keyActions.append(buttonChange);
+
+      const inputNewKey = document.createElement("moz-input-text");
+      inputNewKey.className = "newKey";
+      inputNewKey.setAttribute("data-l10n-id", "customkeys-key-new");
+      inputNewKey.setAttribute("inputlayout", "inline-end");
+      keyActions.append(inputNewKey);
+
+      const buttonClear = document.createElement("moz-button");
+      buttonClear.className = "clear";
+      buttonClear.setAttribute("data-l10n-id", "customkeys-key-clear");
+      buttonClear.type = "icon ghost";
+      buttonClear.iconSrc = "chrome://global/skin/icons/close.svg";
+      keyActions.append(buttonClear);
+
+      const buttonReset = document.createElement("moz-button");
+      buttonReset.className = "reset";
+      buttonReset.setAttribute("data-l10n-id", "customkeys-key-reset");
+      buttonReset.type = "icon ghost";
+      buttonReset.iconSrc =
+        "chrome://global/skin/icons/arrow-counterclockwise-16.svg";
+      keyActions.append(buttonReset);
+
+      keyContent.append(keyActions);
+
+      row.append(keyContent);
+      boxGroup.append(row);
+      updateKey(row, key);
+    }
+  }
+  table.querySelector("moz-card").expanded = true;
+
+  notifyUpdate();
+}
+
+function updateKey(row, data) {
+  const input = row.querySelector(".currentShortcut");
+  input.value = data.shortcut;
+  if (!input.value) {
+    input.setAttribute("data-l10n-id", "customkeys-shortcut-unassigned");
+  } else {
+    input.removeAttribute("data-l10n-id");
+    input.removeAttribute("placeholder");
+  }
+  row.classList.toggle("customized", data.isCustomized);
+  row.classList.toggle("assigned", !!data.shortcut);
+}
+
+async function maybeHandleConflict(data) {
+  for (const row of table.querySelectorAll(".key")) {
+    if (data.shortcut != row.querySelector(".currentShortcut").value) {
+      continue; 
+    }
+    const conflictId = row.dataset.id;
+    if (conflictId == data.id) {
+      return false;
+    }
+    const conflictDesc = row.ariaLabel;
+    const [title, body, buttonCancel, buttonConfirm] =
+      await document.l10n.formatValues([
+        { id: "customkeys-conflict-confirm-title" },
+        {
+          id: "customkeys-conflict-confirm-body",
+          args: { conflict: conflictDesc },
+        },
+        { id: "customkeys-conflict-confirm-button-cancel" },
+        { id: "customkeys-conflict-confirm-button-confirm" },
+      ]);
+    if (
+      !(await RPMSendQuery("CustomKeys:Confirm", {
+        title,
+        body,
+        buttonCancel,
+        buttonConfirm,
+      }))
+    ) {
+      return false; 
+    }
+    const newData = await RPMSendQuery("CustomKeys:ClearKey", conflictId);
+    updateKey(row, newData);
+    return true;
+  }
+  return true;
+}
+
+async function onAction(event) {
+  const row = event.target.closest("moz-box-item");
+  if (!row) {
+    return; 
+  }
+  const keyId = row.dataset.id;
+  if (event.target.className == "reset") {
+    const data = await RPMSendQuery("CustomKeys:GetDefaultKey", keyId);
+    if (await maybeHandleConflict(data)) {
+      const newData = await RPMSendQuery("CustomKeys:ResetKey", keyId);
+      updateKey(row, newData);
+      if (newData.shortcut) {
+        row.querySelector(".clear").focus();
+      } else {
+        row.querySelector(".change").focus();
+      }
+      notifyUpdate();
+    }
+  } else if (event.target.className == "change") {
+    row.classList.add("editing");
+    RPMSendAsyncMessage("CustomKeys:CaptureKey", true);
+    row.querySelector(".newKey").focus();
+  } else if (event.target.className == "clear") {
+    const newData = await RPMSendQuery("CustomKeys:ClearKey", keyId);
+    updateKey(row, newData);
+    row.querySelector(".reset").focus();
+    notifyUpdate();
+  }
+}
+
+async function onKey({ data }) {
+  const input = document.activeElement;
+  const row = input.closest("moz-box-item");
+  data.id = row.dataset.id;
+  if (data.isModifier) {
+    input.value = data.modifierString;
+    await input.updateComplete;
+    input.select();
+    return;
+  }
+  if (!data.isValid) {
+    input.value = await document.l10n.formatValue("customkeys-key-invalid");
+    await input.updateComplete;
+    input.select();
+    return;
+  }
+  if (await maybeHandleConflict(data)) {
+    const newData = await RPMSendQuery("CustomKeys:ChangeKey", data);
+    updateKey(row, newData);
+  }
+  RPMSendAsyncMessage("CustomKeys:CaptureKey", false);
+  row.classList.remove("editing");
+  row.querySelector(".change").focus();
+  notifyUpdate();
+}
+
+function onFocusLost(event) {
+  if (event.target.className == "newKey") {
+    RPMSendAsyncMessage("CustomKeys:CaptureKey", false);
+    const row = event.target.closest("moz-box-item");
+    row.classList.remove("editing");
+    event.target.value = "";
+  }
+}
+
+function clearSearchHighlights(row) {
+  const labelEl = row.querySelector(".key-label");
+  if (labelEl.querySelector(".search-highlight")) {
+    labelEl.textContent = row.ariaLabel;
+  }
+}
+
+function applySearchHighlights(query, row) {
+  const labelEl = row.querySelector(".key-label");
+  if (!labelEl) {
+    return;
+  }
+  const text = row.ariaLabel;
+  const lower = text.toLowerCase();
+  const frag = document.createDocumentFragment();
+  let lastIndex = 0;
+  let i = -1;
+  while ((i = lower.indexOf(query, lastIndex)) >= 0) {
+    if (i > lastIndex) {
+      frag.append(text.slice(lastIndex, i));
+    }
+    const mark = document.createElement("mark");
+    mark.className = "search-highlight";
+    mark.textContent = text.slice(i, i + query.length);
+    frag.append(mark);
+    lastIndex = i + query.length;
+  }
+  if (lastIndex < text.length) {
+    frag.append(text.slice(lastIndex));
+  }
+  labelEl.replaceChildren(frag);
+}
+
+function onSearchInput(event) {
+  const query = event.target.value.toLowerCase();
+  const cards = table.querySelectorAll(".category");
+
+  for (const row of table.querySelectorAll(".key")) {
+    const isMatching = !query || row.ariaLabel.toLowerCase().includes(query);
+    row.hidden = !isMatching;
+    row.classList.toggle("hidden", !isMatching);
+    if (query) {
+      applySearchHighlights(query, row);
+    } else {
+      clearSearchHighlights(row);
+    }
+  }
+  for (const [i, card] of cards.entries()) {
+    const hasMatches = card.querySelector(".key:not([hidden])");
+    card.hidden = !hasMatches;
+    card.expanded = query ? hasMatches : i === 0;
+    if (hasMatches) {
+      card.classList.remove("hidden");
+    } else {
+      card.classList.add("hidden");
+    }
+  }
+
+  notifyUpdate();
+}
+
+async function onResetAll() {
+  const [title, body, buttonCancel, buttonConfirm] =
+    await document.l10n.formatValues([
+      { id: "customkeys-reset-all-confirm-title" },
+      { id: "customkeys-reset-all-confirm-body" },
+      { id: "customkeys-reset-all-confirm-button-cancel" },
+      { id: "customkeys-reset-all-confirm-button-confirm" },
+    ]);
+  if (
+    !(await RPMSendQuery("CustomKeys:Confirm", {
+      title,
+      body,
+      buttonCancel,
+      buttonConfirm,
+    }))
+  ) {
+    return; 
+  }
+  await RPMSendQuery("CustomKeys:ResetAll");
+  const keysByCat = await RPMSendQuery("CustomKeys:GetKeys");
+  const keysById = {};
+  for (const category in keysByCat) {
+    const categoryKeys = keysByCat[category];
+    for (const keyId in categoryKeys) {
+      keysById[keyId] = categoryKeys[keyId];
+    }
+  }
+  for (const row of table.querySelectorAll(".key")) {
+    const data = keysById[row.dataset.id];
+    if (data) {
+      updateKey(row, data);
+    }
+  }
+  notifyUpdate();
+}
+
+buildTable();
+table.addEventListener("click", onAction);
+RPMAddMessageListener("CustomKeys:CapturedKey", onKey);
+table.addEventListener("focusout", onFocusLost);
+customElements.whenDefined("customkeys-sidebar").then(async () => {
+  await document.querySelector("customkeys-sidebar").updateComplete;
+  document.getElementById("search").addEventListener("input", onSearchInput);
+  document.getElementById("resetAll").addEventListener("click", onResetAll);
+});

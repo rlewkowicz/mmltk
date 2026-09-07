@@ -1,0 +1,47 @@
+{
+  "donor": "nvcr.io/nvidia/pytorch:26.08-py3@sha256:33ef5fc15e8937602d64022209cdb2777b32dadf742f41332023d946041b3c14",
+  "platform": "linux/amd64",
+  "ubuntu": "24.04",
+  "versions": {
+    "cuda": "13.4.1",
+    "torch": "2.14.0a0+4fdf77b940",
+    "tensorrt": "11.2.1.2"
+  },
+  "donor_metadata": {
+    "cuda_version": "13.4.1.012",
+    "nvcc_version": "13.4.59",
+    "cudart_package": "cuda-cudart-13-4",
+    "cudart_version": "13.4.49-1",
+    "torch_distribution_version": "2.14.0a0+4fdf77b940.nv26.8.63802676",
+    "torch_runtime_version": "2.14.0a0+4fdf77b940.nv26.08"
+  },
+  "cuda_source": "/usr/local/cuda-13.4",
+  "cuda_root": "/usr/local/cuda-13.4",
+  "torch_source": "/usr/local/lib/python3.12/dist-packages/torch",
+  "torch_root": "/opt/pytorch",
+  "python_root": "/opt/nvidia/python",
+  "python_abi": "3.12",
+  "native_root": "/opt/nvidia",
+  "tensorrt_root": "/opt/tensorrt",
+  "notice_root": "/usr/share/licenses/mmltk-nvidia",
+  "library_order": ["torch_root", "tensorrt_root", "native_root", "cuda_root"],
+  "python_packages": ["torch", "numpy"],
+  "notice_distributions": ["mkl"],
+  "library_roots": ["/usr/lib/x86_64-linux-gnu", "/usr/local/lib", "/opt/nvidia/*/lib", "/opt/nvidia/*/lib64", "/opt/nvshmem/lib", "/opt/nvshmem/lib64", "/usr/local/tensorrt/lib", "/opt/tensorrt/lib", "/usr/local/lib/python3.12/dist-packages/nvidia/*/lib"],
+  "component_library_prefixes": ["/opt/nvidia", "/opt/nvshmem", "/opt/tensorrt", "/usr/local/tensorrt", "/usr/local/lib/python3.12/dist-packages"],
+  "audited_native_roots": ["/opt/hpcx/ompi/lib", "/opt/hpcx/ucx/lib", "/opt/hpcx/ucc/lib"],
+  "audited_native_reason": "Pinned Torch libtorch_cpu/libtorch_cuda/libtorch_python and NVSHMEM bootstrap/transport ELF closure requires Open MPI, UCX, and UCC. Retain their runtime libraries, plugins, component data, and notices.",
+  "components": [
+    {"name": "tensorrt", "libraries": ["libnvinfer*.so*", "libnvonnxparser*.so*"], "headers": ["NvInfer*.h", "NvOnnxParser*.h"], "required": true},
+    {"name": "cudnn", "libraries": ["libcudnn*.so*"], "headers": ["cudnn*.h"], "required": true},
+    {"name": "nccl", "libraries": ["libnccl.so*"], "headers": ["nccl.h"], "required": true},
+    {"name": "mkl", "libraries": ["libmkl*.so*"], "headers": [], "required": true, "reason": "LibTorch CPU ONNX tracing loads MKL vector-math and CPU-dispatch libraries dynamically; Intel SYCL is unused."},
+    {"name": "cusparselt", "libraries": ["libcusparseLt*.so*"], "headers": ["cusparseLt.h"], "required": false},
+    {"name": "nvshmem", "libraries": ["libnvshmem*.so*", "nvshmem_bootstrap*.so*", "nvshmem_transport*.so*"], "headers": [], "required": false}
+  ],
+  "header_roots": ["/usr/include", "/usr/include/x86_64-linux-gnu", "/usr/local/include", "/opt/nvidia/*/include", "/usr/local/lib/python3.12/dist-packages/nvidia/*/include"],
+  "external_driver_libraries": ["libcuda.so.1", "libnvidia-ml.so.1", "libnvidia-ptxjitcompiler.so.1", "libnvidia-nvvm.so.4"],
+  "excluded_names": ["dali", "hpcx", "hpc-x", "doca", "nccl-net", "nsight", "jupyter", "transformer_engine", "modelopt", "libucx_perftest_", "libuct_xpmem", "mca_coll_hcoll", "libucc_tl_sharp", "hwloc_opencl", "libmkl_sycl"],
+  "notice_patterns": ["*LICENSE*", "*License*", "*license*", "*NOTICE*", "*notice*", "EULA*", "*COPYING*"],
+  "modes": ["development", "runtime"]
+}

@@ -1,0 +1,34 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_DOMSlots_h
+#define mozilla_dom_DOMSlots_h
+
+#define DOM_OBJECT_SLOT 0
+
+#define DOM_INSTANCE_RESERVED_SLOTS 1
+
+enum {
+  INTERFACE_OBJECT_INFO_RESERVED_SLOT = 0,
+  INTERFACE_OBJECT_FIRST_LEGACY_FACTORY_FUNCTION,
+};
+#define INTERFACE_OBJECT_MAX_SLOTS 3
+
+enum { LEGACY_FACTORY_FUNCTION_RESERVED_SLOT = 0 };
+
+#define DOM_INTERFACE_PROTO_SLOTS_BASE 0
+
+#define OBSERVABLE_ARRAY_DOM_INTERFACE_SLOT 0
+
+#define OBSERVABLE_ARRAY_BACKING_LIST_OBJECT_SLOT 1
+
+namespace mozilla::dom {
+
+enum ExpandoSlots {
+  DOM_EXPANDO_RESERVED_SLOTS = 4,
+};
+
+}  
+
+#endif /* mozilla_dom_DOMSlots_h */

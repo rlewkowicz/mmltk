@@ -1,0 +1,117 @@
+/*
+ * Copyright 2017 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkVertices_DEFINED)
+#define SkVertices_DEFINED
+
+#include "include/core/SkColor.h"
+#include "include/core/SkPoint.h"
+#include "include/core/SkRect.h"
+#include "include/core/SkRefCnt.h"
+#include "include/private/base/SkAPI.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+
+class SkVerticesPriv;
+
+class SK_API SkVertices : public SkNVRefCnt<SkVertices> {
+    struct Desc;
+    struct Sizes;
+public:
+    enum VertexMode {
+        kTriangles_VertexMode,
+        kTriangleStrip_VertexMode,
+        kTriangleFan_VertexMode,
+
+        kLast_VertexMode = kTriangleFan_VertexMode,
+    };
+
+    static sk_sp<SkVertices> MakeCopy(VertexMode mode, int vertexCount,
+                                      const SkPoint positions[],
+                                      const SkPoint texs[],
+                                      const SkColor colors[],
+                                      int indexCount,
+                                      const uint16_t indices[]);
+
+    static sk_sp<SkVertices> MakeCopy(VertexMode mode, int vertexCount,
+                                      const SkPoint positions[],
+                                      const SkPoint texs[],
+                                      const SkColor colors[]) {
+        return MakeCopy(mode,
+                        vertexCount,
+                        positions,
+                        texs,
+                        colors,
+                        0,
+                        nullptr);
+    }
+
+    enum BuilderFlags {
+        kHasTexCoords_BuilderFlag   = 1 << 0,
+        kHasColors_BuilderFlag      = 1 << 1,
+    };
+    class SK_API Builder {
+    public:
+        Builder(VertexMode mode, int vertexCount, int indexCount, uint32_t flags);
+
+        bool isValid() const { return fVertices != nullptr; }
+
+        SkPoint* positions();
+        uint16_t* indices();        
+
+        SkPoint* texCoords();       
+        SkColor* colors();          
+
+        sk_sp<SkVertices> detach();
+
+    private:
+        Builder(const Desc&);
+
+        void init(const Desc&);
+
+        sk_sp<SkVertices> fVertices;
+        std::unique_ptr<uint8_t[]> fIntermediateFanIndices;
+
+        friend class SkVertices;
+        friend class SkVerticesPriv;
+    };
+
+    uint32_t uniqueID() const { return fUniqueID; }
+    const SkRect& bounds() const { return fBounds; }
+
+    size_t approximateSize() const;
+
+    SkVerticesPriv priv();
+    const SkVerticesPriv priv() const;  // NOLINT(readability-const-return-type)
+
+private:
+    SkVertices() {}
+
+    friend class SkVerticesPriv;
+
+    friend class SkNVRefCnt<SkVertices>;
+    void operator delete(void* p);
+
+    Sizes getSizes() const;
+
+    uint32_t fUniqueID;
+
+    SkPoint*     fPositions;        
+    uint16_t*    fIndices;          
+    SkPoint*     fTexs;             
+    SkColor*     fColors;           
+
+    SkRect  fBounds;    
+    int     fVertexCount;
+    int     fIndexCount;
+
+    VertexMode fMode;
+};
+
+#endif

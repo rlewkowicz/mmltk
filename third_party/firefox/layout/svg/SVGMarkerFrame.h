@@ -1,0 +1,145 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef LAYOUT_SVG_SVGMARKERFRAME_H_
+#define LAYOUT_SVG_SVGMARKERFRAME_H_
+
+#include "gfxMatrix.h"
+#include "gfxRect.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/SVGContainerFrame.h"
+#include "nsIFrame.h"
+#include "nsLiteralString.h"
+#include "nsQueryFrame.h"
+
+class gfxContext;
+
+namespace mozilla {
+
+class PresShell;
+class SVGGeometryFrame;
+
+struct SVGMark;
+
+namespace dom {
+class SVGViewportElement;
+}  
+}  
+
+nsContainerFrame* NS_NewSVGMarkerFrame(mozilla::PresShell* aPresShell,
+                                       mozilla::ComputedStyle* aStyle);
+nsContainerFrame* NS_NewSVGMarkerAnonChildFrame(mozilla::PresShell* aPresShell,
+                                                mozilla::ComputedStyle* aStyle);
+
+namespace mozilla {
+
+class SVGMarkerFrame final : public SVGContainerFrame {
+  using imgDrawingParams = image::imgDrawingParams;
+
+  friend class SVGMarkerAnonChildFrame;
+  friend nsContainerFrame* ::NS_NewSVGMarkerFrame(
+      mozilla::PresShell* aPresShell, ComputedStyle* aStyle);
+
+ protected:
+  explicit SVGMarkerFrame(ComputedStyle* aStyle, nsPresContext* aPresContext)
+      : SVGContainerFrame(aStyle, aPresContext, kClassID),
+        mMarkedFrame(nullptr),
+        mInUse(false),
+        mInUse2(false) {
+    AddStateBits(NS_FRAME_IS_NONDISPLAY);
+  }
+
+ public:
+  NS_DECL_FRAMEARENA_HELPERS(SVGMarkerFrame)
+
+#ifdef DEBUG
+  void Init(nsIContent* aContent, nsContainerFrame* aParent,
+            nsIFrame* aPrevInFlow) override;
+#endif
+
+  void BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                        const nsDisplayListSet& aLists) override {}
+
+  nsresult AttributeChanged(int32_t aNameSpaceID, nsAtom* aAttribute,
+                            AttrModType aModType) override;
+
+#ifdef DEBUG_FRAME_DUMP
+  nsresult GetFrameName(nsAString& aResult) const override {
+    return MakeFrameName(u"SVGMarker"_ns, aResult);
+  }
+#endif
+
+  nsContainerFrame* GetContentInsertionFrame() override {
+    MOZ_ASSERT(
+        PrincipalChildList().FirstChild() &&
+            PrincipalChildList().FirstChild()->IsSVGMarkerAnonChildFrame(),
+        "Where is our anonymous child?");
+    return PrincipalChildList().FirstChild()->GetContentInsertionFrame();
+  }
+
+  void PaintMark(gfxContext& aContext, const gfxMatrix& aToMarkedFrameUserSpace,
+                 SVGGeometryFrame* aMarkedFrame, const SVGMark& aMark,
+                 float aStrokeWidth, imgDrawingParams& aImgParams);
+
+  SVGBBox GetMarkBBoxContribution(const Matrix& aToBBoxUserspace,
+                                  SVGBBoxFlags aFlags,
+                                  SVGGeometryFrame* aMarkedFrame,
+                                  const SVGMark& aMark, float aStrokeWidth);
+
+  void AppendDirectlyOwnedAnonBoxes(nsTArray<OwnedAnonBox>& aResult) override;
+
+ private:
+  SVGGeometryFrame* mMarkedFrame;
+  Matrix mMarkerTM;
+
+  gfxMatrix GetCanvasTM() override;
+
+  class MOZ_RAII AutoMarkerReferencer {
+   public:
+    AutoMarkerReferencer(SVGMarkerFrame* aFrame,
+                         SVGGeometryFrame* aMarkedFrame);
+    ~AutoMarkerReferencer();
+
+   private:
+    SVGMarkerFrame* mFrame;
+  };
+
+  void SetParentCoordCtxProvider(dom::SVGViewportElement* aContext);
+
+  bool mInUse;
+
+  bool mInUse2;
+};
+
+
+class SVGMarkerAnonChildFrame final : public SVGDisplayContainerFrame {
+  friend nsContainerFrame* ::NS_NewSVGMarkerAnonChildFrame(
+      mozilla::PresShell* aPresShell, ComputedStyle* aStyle);
+
+  explicit SVGMarkerAnonChildFrame(ComputedStyle* aStyle,
+                                   nsPresContext* aPresContext)
+      : SVGDisplayContainerFrame(aStyle, aPresContext, kClassID) {}
+
+ public:
+  NS_DECL_FRAMEARENA_HELPERS(SVGMarkerAnonChildFrame)
+
+#ifdef DEBUG
+  void Init(nsIContent* aContent, nsContainerFrame* aParent,
+            nsIFrame* aPrevInFlow) override;
+#endif
+
+#ifdef DEBUG_FRAME_DUMP
+  nsresult GetFrameName(nsAString& aResult) const override {
+    return MakeFrameName(u"SVGMarkerAnonChild"_ns, aResult);
+  }
+#endif
+
+  gfxMatrix GetCanvasTM() override {
+    return static_cast<SVGMarkerFrame*>(GetParent())->GetCanvasTM();
+  }
+};
+
+}  
+
+#endif  // LAYOUT_SVG_SVGMARKERFRAME_H_

@@ -1,0 +1,57 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef _mozilla_widget_GfxInfoCollector_h_
+#define _mozilla_widget_GfxInfoCollector_h_
+
+#include "mozilla/Attributes.h"
+#include "nsStringFwd.h"
+#include "js/RootingAPI.h"
+
+namespace mozilla {
+namespace widget {
+
+class MOZ_STACK_CLASS InfoObject {
+  friend class GfxInfoBase;
+
+ public:
+  void DefineProperty(const char* name, int value);
+  void DefineProperty(const char* name, const nsAString& value);
+  void DefineProperty(const char* name, const char* value);
+
+  InfoObject(InfoObject&) = delete;
+
+ private:
+  explicit InfoObject(JSContext* aCx);
+
+  JSContext* mCx;
+  JS::Rooted<JSObject*> mObj;
+  bool mOk;
+};
+
+
+class GfxInfoCollectorBase {
+ public:
+  GfxInfoCollectorBase();
+  virtual void GetInfo(InfoObject& obj) = 0;
+  virtual ~GfxInfoCollectorBase();
+};
+
+template <class T>
+class GfxInfoCollector : public GfxInfoCollectorBase {
+ public:
+  GfxInfoCollector(T* aPointer, void (T::*aFunc)(InfoObject& obj))
+      : mPointer(aPointer), mFunc(aFunc) {}
+  virtual void GetInfo(InfoObject& obj) override { (mPointer->*mFunc)(obj); }
+
+ protected:
+  T* mPointer;
+  void (T::*mFunc)(InfoObject& obj);
+};
+
+}  
+}  
+
+#endif

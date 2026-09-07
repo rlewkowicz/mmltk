@@ -1,0 +1,104 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/ReportingUtils.h"
+
+#include "mozilla/dom/CSPViolationReportBody.h"
+#include "mozilla/dom/Report.h"
+#include "mozilla/dom/ReportBody.h"
+#include "mozilla/dom/ReportDeliver.h"
+#include "mozilla/dom/SecurityPolicyViolationEvent.h"
+#include "mozilla/dom/WorkerPrivate.h"
+#include "nsAtom.h"
+#include "nsIGlobalObject.h"
+#include "nsIURIMutator.h"
+#include "nsNetUtil.h"
+#include "nsPIDOMWindowInlines.h"
+
+namespace mozilla::dom {
+
+void ReportingUtils::StripURL(nsIURI* aURI, nsACString& outStrippedURL) {
+  if (!net::SchemeIsHttpOrHttps(aURI)) {
+    aURI->GetScheme(outStrippedURL);
+    return;
+  }
+
+  nsCOMPtr<nsIURI> stripped;
+  if (NS_FAILED(NS_MutateURI(aURI).SetRef(""_ns).SetUserPass(""_ns).Finalize(
+          stripped))) {
+    aURI->GetScheme(outStrippedURL);
+    return;
+  }
+
+  stripped->GetSpec(outStrippedURL);
+}
+
+void ReportingUtils::StripLocationFileName(
+    const mozilla::JSCallingLocation& aLocation,
+    nsACString& outStrippedFileName) {
+  nsCOMPtr<nsIURI> uri;
+  if (aLocation.mResource.is<nsCOMPtr<nsIURI>>()) {
+    uri = aLocation.mResource.as<nsCOMPtr<nsIURI>>();
+  } else {
+    (void)NS_NewURI(getter_AddRefs(uri), aLocation.FileName());
+  }
+
+  if (uri) {
+    ReportingUtils::StripURL(uri, outStrippedFileName);
+  }
+}
+
+void ReportingUtils::Report(nsIGlobalObject* aGlobal, nsAtom* aType,
+                            const nsAString& aGroupName, const nsAString& aURL,
+                            ReportBody* aBody) {
+  MOZ_RELEASE_ASSERT(aGlobal && aBody);
+
+  nsDependentAtomString type(aType);
+
+  RefPtr<mozilla::dom::Report> report =
+      new mozilla::dom::Report(aGlobal, type, aURL, aBody);
+  aGlobal->BroadcastReport(report);
+
+  if (aGroupName.IsEmpty() || aGroupName.IsVoid()) {
+    return;
+  }
+
+  uint64_t associatedBrowsingContextId = 0;
+
+  if (nsPIDOMWindowInner* window = aGlobal->GetAsInnerWindow()) {
+    if (BrowsingContext* bc = window->GetBrowsingContext()) {
+      associatedBrowsingContextId = bc->Id();
+    }
+  } else if (WorkerPrivate* workerPrivate = GetCurrentThreadWorkerPrivate()) {
+    associatedBrowsingContextId = workerPrivate->AssociatedBrowsingContextID();
+  }
+
+  ReportDeliver::AttemptDelivery(aGlobal, type, aGroupName, aURL, aBody,
+                                 associatedBrowsingContextId);
+}
+
+void ReportingUtils::DeserializeSecurityViolationEventAndReport(
+    mozilla::dom::EventTarget* aTarget, nsIGlobalObject* aGlobal,
+    const nsAString& aSecurityPolicyViolationInitJSON,
+    const nsAString& aReportGroupName) {
+  SecurityPolicyViolationEventInit violationEventInit;
+
+  if (NS_WARN_IF(!violationEventInit.Init(aSecurityPolicyViolationInitJSON))) {
+    return;
+  }
+
+  RefPtr<mozilla::dom::Event> event =
+      mozilla::dom::SecurityPolicyViolationEvent::Constructor(
+          aTarget, u"securitypolicyviolation"_ns, violationEventInit);
+  event->SetTrusted(true);
+
+  aTarget->DispatchEvent(*event, IgnoreErrors());
+
+  RefPtr<CSPViolationReportBody> body =
+      new CSPViolationReportBody(aGlobal, violationEventInit);
+  ReportingUtils::Report(aGlobal, nsGkAtoms::cspViolation, aReportGroupName,
+                         violationEventInit.mDocumentURI, body);
+}
+
+}  

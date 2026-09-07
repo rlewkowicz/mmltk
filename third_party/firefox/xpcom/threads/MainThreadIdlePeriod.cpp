@@ -1,0 +1,58 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "MainThreadIdlePeriod.h"
+
+#include "mozilla/Preferences.h"
+#include "mozilla/StaticPrefs_idle_period.h"
+#include "mozilla/dom/Document.h"
+#include "nsRefreshDriver.h"
+#include "nsThreadUtils.h"
+
+static const double kLongIdlePeriodMS = 50.0;
+
+
+static const uint32_t kMaxTimerThreadBound = 25;  
+
+namespace mozilla {
+
+NS_IMETHODIMP
+MainThreadIdlePeriod::GetIdlePeriodHint(TimeStamp* aIdleDeadline) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aIdleDeadline);
+
+  TimeStamp now = TimeStamp::Now();
+  TimeStamp currentGuess =
+      now + TimeDuration::FromMilliseconds(kLongIdlePeriodMS);
+
+  currentGuess = nsRefreshDriver::GetIdleDeadlineHint(
+      currentGuess, nsRefreshDriver::IdleCheck::AllVsyncListeners);
+  currentGuess = NS_GetTimerDeadlineHintOnCurrentThread(currentGuess,
+                                                        kMaxTimerThreadBound);
+
+  double highRateMultiplier = nsRefreshDriver::HighRateMultiplier();
+  TimeDuration minIdlePeriod = TimeDuration::FromMilliseconds(
+      std::max(highRateMultiplier * StaticPrefs::idle_period_min(), 1.0));
+  bool busySoon = currentGuess.IsNull() ||
+                  (now >= (currentGuess - minIdlePeriod)) ||
+                  currentGuess < mLastIdleDeadline;
+
+  if (!busySoon && XRE_IsContentProcess() &&
+      mozilla::dom::Document::HasRecentlyStartedForegroundLoads()) {
+    TimeDuration minIdlePeriod = TimeDuration::FromMilliseconds(std::max(
+        highRateMultiplier * StaticPrefs::idle_period_during_page_load_min(),
+        1.0));
+    busySoon = (now >= (currentGuess - minIdlePeriod));
+  }
+
+  if (!busySoon) {
+    *aIdleDeadline = mLastIdleDeadline = currentGuess;
+  }
+
+  return NS_OK;
+}
+
+float MainThreadIdlePeriod::GetLongIdlePeriod() { return kLongIdlePeriodMS; }
+
+}  

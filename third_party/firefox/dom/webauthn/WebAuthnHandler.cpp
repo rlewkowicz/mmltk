@@ -1,0 +1,815 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/WebAuthnHandler.h"
+
+#include "WebAuthnCoseIdentifiers.h"
+#include "WebAuthnEnumStrings.h"
+#include "WebAuthnTransportIdentifiers.h"
+#include "hasht.h"
+#include "mozilla/Base64.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/BounceTrackingProtection.h"
+#include "mozilla/dom/AuthenticatorAssertionResponse.h"
+#include "mozilla/dom/AuthenticatorAttestationResponse.h"
+#include "mozilla/dom/PWebAuthnTransaction.h"
+#include "mozilla/dom/PublicKeyCredential.h"
+#include "mozilla/dom/WebAuthenticationBinding.h"
+#include "mozilla/dom/WebAuthnTransactionChild.h"
+#include "mozilla/dom/WebAuthnUtil.h"
+#include "mozilla/dom/WindowGlobalChild.h"
+#include "nsContentUtils.h"
+#include "nsHTMLDocument.h"
+#include "nsIURIMutator.h"
+#include "nsThreadUtils.h"
+
+
+using namespace mozilla::ipc;
+
+namespace mozilla::dom {
+
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(WebAuthnHandler)
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTION(WebAuthnHandler, mWindow, mTransaction)
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(WebAuthnHandler)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(WebAuthnHandler)
+
+
+static uint8_t SerializeTransports(
+    const mozilla::dom::Sequence<nsString>& aTransports) {
+  uint8_t transports = 0;
+
+  static_assert(MOZ_WEBAUTHN_ENUM_STRINGS_VERSION == 3);
+  for (const nsAString& str : aTransports) {
+    if (str.EqualsLiteral(MOZ_WEBAUTHN_AUTHENTICATOR_TRANSPORT_USB)) {
+      transports |= MOZ_WEBAUTHN_AUTHENTICATOR_TRANSPORT_ID_USB;
+    } else if (str.EqualsLiteral(MOZ_WEBAUTHN_AUTHENTICATOR_TRANSPORT_NFC)) {
+      transports |= MOZ_WEBAUTHN_AUTHENTICATOR_TRANSPORT_ID_NFC;
+    } else if (str.EqualsLiteral(MOZ_WEBAUTHN_AUTHENTICATOR_TRANSPORT_BLE)) {
+      transports |= MOZ_WEBAUTHN_AUTHENTICATOR_TRANSPORT_ID_BLE;
+    } else if (str.EqualsLiteral(
+                   MOZ_WEBAUTHN_AUTHENTICATOR_TRANSPORT_INTERNAL)) {
+      transports |= MOZ_WEBAUTHN_AUTHENTICATOR_TRANSPORT_ID_INTERNAL;
+    } else if (str.EqualsLiteral(MOZ_WEBAUTHN_AUTHENTICATOR_TRANSPORT_HYBRID) ||
+               str.EqualsLiteral(MOZ_WEBAUTHN_AUTHENTICATOR_TRANSPORT_CABLE)) {
+      transports |= MOZ_WEBAUTHN_AUTHENTICATOR_TRANSPORT_ID_HYBRID;
+    }
+  }
+  return transports;
+}
+
+
+WebAuthnHandler::~WebAuthnHandler() {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (mActor) {
+    if (mTransaction.isSome()) {
+      CancelTransaction(NS_ERROR_DOM_ABORT_ERR);
+    }
+    mActor->SetHandler(nullptr);
+  }
+}
+
+bool WebAuthnHandler::MaybeCreateActor() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (mActor) {
+    return true;
+  }
+
+  RefPtr<WebAuthnTransactionChild> actor = new WebAuthnTransactionChild();
+
+  WindowGlobalChild* windowGlobalChild = mWindow->GetWindowGlobalChild();
+  if (!windowGlobalChild ||
+      !windowGlobalChild->SendPWebAuthnTransactionConstructor(actor)) {
+    return false;
+  }
+
+  mActor = actor;
+  mActor->SetHandler(this);
+
+  return true;
+}
+
+void WebAuthnHandler::ActorDestroyed() {
+  MOZ_ASSERT(NS_IsMainThread());
+  mActor = nullptr;
+}
+
+void WebAuthnHandler::MakeCredential(
+    JSContext* aCx, const PublicKeyCredentialCreationOptions& aOptions,
+    const Optional<OwningNonNull<AbortSignal>>& aSignal,
+    const RefPtr<Promise>& aPromise) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (mTransaction.isSome()) {
+    CancelTransaction(NS_ERROR_DOM_ABORT_ERR);
+  }
+
+  if (!MaybeCreateActor()) {
+    aPromise->MaybeReject(NS_ERROR_DOM_OPERATION_ERR);
+    return;
+  }
+
+  nsCOMPtr<Document> doc = mWindow->GetDoc();
+  if (!IsWebAuthnAllowedInDocument(doc)) {
+    aPromise->MaybeReject(NS_ERROR_DOM_SECURITY_ERR);
+    return;
+  }
+
+  nsCOMPtr<nsIPrincipal> principal = doc->NodePrincipal();
+
+  nsCString rpId;
+  if (aOptions.mRp.mId.WasPassed()) {
+    rpId = NS_ConvertUTF16toUTF8(aOptions.mRp.mId.Value());
+  } else {
+    nsresult rv = DefaultRpId(principal, rpId);
+    if (NS_FAILED(rv)) {
+      aPromise->MaybeReject(NS_ERROR_FAILURE);
+      return;
+    }
+  }
+  CryptoBuffer userId;
+  userId.Assign(aOptions.mUser.mId);
+  if (userId.Length() > 64) {
+    aPromise->MaybeRejectWithTypeError("user.id is too long");
+    return;
+  }
+
+  uint32_t adjustedTimeout = WebAuthnTimeout(aOptions.mTimeout);
+
+  if (aOptions.mExtensions.mAppid.WasPassed()) {
+    aPromise->MaybeReject(NS_ERROR_DOM_NOT_SUPPORTED_ERR);
+    return;
+  }
+
+  nsTArray<CoseAlg> coseAlgos;
+  if (aOptions.mPubKeyCredParams.IsEmpty()) {
+    coseAlgos.AppendElement(static_cast<long>(CoseAlgorithmIdentifier::ES256));
+    coseAlgos.AppendElement(static_cast<long>(CoseAlgorithmIdentifier::RS256));
+  } else {
+    for (size_t a = 0; a < aOptions.mPubKeyCredParams.Length(); ++a) {
+      if (!aOptions.mPubKeyCredParams[a].mType.EqualsLiteral(
+              MOZ_WEBAUTHN_PUBLIC_KEY_CREDENTIAL_TYPE_PUBLIC_KEY)) {
+        continue;
+      }
+
+      coseAlgos.AppendElement(aOptions.mPubKeyCredParams[a].mAlg);
+    }
+  }
+
+  if (coseAlgos.IsEmpty() && !aOptions.mPubKeyCredParams.IsEmpty()) {
+    aPromise->MaybeReject(NS_ERROR_DOM_NOT_SUPPORTED_ERR);
+    return;
+  }
+
+
+  CryptoBuffer challenge;
+  if (!challenge.Assign(aOptions.mChallenge)) {
+    aPromise->MaybeReject(NS_ERROR_DOM_SECURITY_ERR);
+    return;
+  }
+
+  nsTArray<WebAuthnScopedCredential> excludeList;
+  for (const auto& s : aOptions.mExcludeCredentials) {
+    WebAuthnScopedCredential c;
+    CryptoBuffer cb;
+    cb.Assign(s.mId);
+    c.id() = cb;
+    if (s.mTransports.WasPassed()) {
+      c.transports() = SerializeTransports(s.mTransports.Value());
+    }
+    excludeList.AppendElement(c);
+  }
+
+  nsTArray<WebAuthnExtension> extensions;
+
+  if (aOptions.mExtensions.mHmacCreateSecret.WasPassed()) {
+    bool hmacCreateSecret = aOptions.mExtensions.mHmacCreateSecret.Value();
+    if (hmacCreateSecret) {
+      extensions.AppendElement(WebAuthnExtensionHmacSecret(hmacCreateSecret));
+    }
+  }
+
+  if (aOptions.mExtensions.mCredentialProtectionPolicy.WasPassed()) {
+    bool enforceCredProtect = false;
+    if (aOptions.mExtensions.mEnforceCredentialProtectionPolicy.WasPassed()) {
+      enforceCredProtect =
+          aOptions.mExtensions.mEnforceCredentialProtectionPolicy.Value();
+    }
+    extensions.AppendElement(WebAuthnExtensionCredProtect(
+        aOptions.mExtensions.mCredentialProtectionPolicy.Value(),
+        enforceCredProtect));
+  }
+
+  if (aOptions.mExtensions.mCredProps.WasPassed()) {
+    bool credProps = aOptions.mExtensions.mCredProps.Value();
+    if (credProps) {
+      extensions.AppendElement(WebAuthnExtensionCredProps(credProps));
+    }
+  }
+
+  if (aOptions.mExtensions.mMinPinLength.WasPassed()) {
+    bool minPinLength = aOptions.mExtensions.mMinPinLength.Value();
+    if (minPinLength) {
+      extensions.AppendElement(WebAuthnExtensionMinPinLength(minPinLength));
+    }
+  }
+
+  if (aOptions.mExtensions.mLargeBlob.WasPassed()) {
+    if (aOptions.mExtensions.mLargeBlob.Value().mRead.WasPassed() ||
+        aOptions.mExtensions.mLargeBlob.Value().mWrite.WasPassed()) {
+      aPromise->MaybeReject(NS_ERROR_DOM_NOT_SUPPORTED_ERR);
+      return;
+    }
+    Maybe<bool> supportRequired;
+    const Optional<nsString>& largeBlobSupport =
+        aOptions.mExtensions.mLargeBlob.Value().mSupport;
+    if (largeBlobSupport.WasPassed()) {
+      supportRequired.emplace(largeBlobSupport.Value().Equals(u"required"_ns));
+    }
+    nsTArray<uint8_t> write;  
+    extensions.AppendElement(
+        WebAuthnExtensionLargeBlob(supportRequired, write));
+  }
+
+  if (aOptions.mExtensions.mPrf.WasPassed()) {
+    const AuthenticationExtensionsPRFInputs& prf =
+        aOptions.mExtensions.mPrf.Value();
+
+    Maybe<WebAuthnExtensionPrfValues> eval = Nothing();
+    if (prf.mEval.WasPassed()) {
+      CryptoBuffer first;
+      first.Assign(prf.mEval.Value().mFirst);
+      const bool secondMaybe = prf.mEval.Value().mSecond.WasPassed();
+      CryptoBuffer second;
+      if (secondMaybe) {
+        second.Assign(prf.mEval.Value().mSecond.Value());
+      }
+      eval = Some(WebAuthnExtensionPrfValues(first, secondMaybe, second));
+    }
+
+    const bool evalByCredentialMaybe = prf.mEvalByCredential.WasPassed();
+    nsTArray<WebAuthnExtensionPrfEvalByCredentialEntry> evalByCredential;
+    if (evalByCredentialMaybe) {
+      aPromise->MaybeReject(NS_ERROR_DOM_NOT_SUPPORTED_ERR);
+      return;
+    }
+
+    extensions.AppendElement(
+        WebAuthnExtensionPrf(eval, evalByCredentialMaybe, evalByCredential));
+  }
+
+  const auto& selection = aOptions.mAuthenticatorSelection;
+  const auto& attachment = selection.mAuthenticatorAttachment;
+  const nsString& attestation = aOptions.mAttestation;
+
+  Maybe<nsString> authenticatorAttachment;
+  if (attachment.WasPassed()) {
+    authenticatorAttachment.emplace(attachment.Value());
+  }
+
+  static_assert(MOZ_WEBAUTHN_ENUM_STRINGS_VERSION == 3);
+  bool useResidentKeyValue =
+      selection.mResidentKey.WasPassed() &&
+      (selection.mResidentKey.Value().EqualsLiteral(
+           MOZ_WEBAUTHN_RESIDENT_KEY_REQUIREMENT_REQUIRED) ||
+       selection.mResidentKey.Value().EqualsLiteral(
+           MOZ_WEBAUTHN_RESIDENT_KEY_REQUIREMENT_PREFERRED) ||
+       selection.mResidentKey.Value().EqualsLiteral(
+           MOZ_WEBAUTHN_RESIDENT_KEY_REQUIREMENT_DISCOURAGED));
+
+  nsString residentKey;
+  if (useResidentKeyValue) {
+    residentKey = selection.mResidentKey.Value();
+  } else {
+    if (selection.mRequireResidentKey) {
+      residentKey.AssignLiteral(MOZ_WEBAUTHN_RESIDENT_KEY_REQUIREMENT_REQUIRED);
+    } else {
+      residentKey.AssignLiteral(
+          MOZ_WEBAUTHN_RESIDENT_KEY_REQUIREMENT_DISCOURAGED);
+    }
+  }
+
+  WebAuthnAuthenticatorSelection authSelection(
+      residentKey, selection.mUserVerification, authenticatorAttachment);
+
+  WebAuthnMakeCredentialRpInfo rpInfo(aOptions.mRp.mName);
+
+  WebAuthnMakeCredentialUserInfo userInfo(userId, aOptions.mUser.mName,
+                                          aOptions.mUser.mDisplayName);
+
+  if (aSignal.WasPassed() && aSignal.Value().Aborted()) {
+    JS::Rooted<JS::Value> reason(aCx);
+    aSignal.Value().GetReason(aCx, &reason);
+    aPromise->MaybeReject(reason);
+    return;
+  }
+
+  nsString json;
+  nsresult rv = SerializeWebAuthnCreationOptions(
+      aCx, NS_ConvertUTF8toUTF16(rpId), aOptions, json);
+  if (NS_FAILED(rv)) {
+    aPromise->MaybeReject(NS_ERROR_DOM_OPERATION_ERR);
+    return;
+  }
+
+  WebAuthnMakeCredentialInfo info(
+      rpId, challenge, adjustedTimeout, excludeList, rpInfo, userInfo,
+      coseAlgos, extensions, authSelection, attestation, aOptions.mHints, json);
+
+  AbortSignal* signal = nullptr;
+  if (aSignal.WasPassed()) {
+    signal = &aSignal.Value();
+    Follow(signal);
+  }
+
+  MOZ_ASSERT(mTransaction.isNothing());
+  mTransaction =
+      Some(WebAuthnTransaction(aPromise, WebAuthnTransactionType::Create));
+  mActor->SendRequestRegister(info)
+      ->Then(
+          GetCurrentSerialEventTarget(), __func__,
+          [self = RefPtr{this}](
+              const PWebAuthnTransactionChild::RequestRegisterPromise::
+                  ResolveOrRejectValue& aValue) {
+            self->mTransaction.ref().mRegisterHolder.Complete();
+            if (aValue.IsResolve() && aValue.ResolveValue().type() ==
+                                          WebAuthnMakeCredentialResponse::Type::
+                                              TWebAuthnMakeCredentialResult) {
+              self->FinishMakeCredential(aValue.ResolveValue());
+            } else if (aValue.IsResolve()) {
+              self->RejectTransaction(aValue.ResolveValue());
+            } else {
+              self->RejectTransaction(NS_ERROR_DOM_NOT_ALLOWED_ERR);
+            }
+          })
+      ->Track(mTransaction.ref().mRegisterHolder);
+}
+
+void WebAuthnHandler::GetAssertion(
+    JSContext* aCx, const PublicKeyCredentialRequestOptions& aOptions,
+    const bool aConditionallyMediated,
+    const Optional<OwningNonNull<AbortSignal>>& aSignal,
+    const RefPtr<Promise>& aPromise) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (mTransaction.isSome()) {
+    CancelTransaction(NS_ERROR_DOM_ABORT_ERR);
+  }
+
+  if (!MaybeCreateActor()) {
+    aPromise->MaybeReject(NS_ERROR_DOM_OPERATION_ERR);
+    return;
+  }
+
+  nsCOMPtr<Document> doc = mWindow->GetDoc();
+  if (!IsWebAuthnAllowedInDocument(doc)) {
+    aPromise->MaybeReject(NS_ERROR_DOM_SECURITY_ERR);
+    return;
+  }
+
+  nsCOMPtr<nsIPrincipal> principal = doc->NodePrincipal();
+
+  nsCString rpId;
+  if (aOptions.mRpId.WasPassed()) {
+    rpId = NS_ConvertUTF16toUTF8(aOptions.mRpId.Value());
+  } else {
+    nsresult rv = DefaultRpId(principal, rpId);
+    if (NS_FAILED(rv)) {
+      aPromise->MaybeReject(NS_ERROR_FAILURE);
+      return;
+    }
+  }
+  uint32_t adjustedTimeout = WebAuthnTimeout(aOptions.mTimeout);
+
+  if (aOptions.mAllowCredentials.Length() > kWebAuthnMaxAllowedCredentials) {
+    aPromise->MaybeReject(NS_ERROR_DOM_SECURITY_ERR);
+    return;
+  }
+
+  CryptoBuffer challenge;
+  if (!challenge.Assign(aOptions.mChallenge)) {
+    aPromise->MaybeReject(NS_ERROR_DOM_SECURITY_ERR);
+    return;
+  }
+
+  nsTArray<WebAuthnScopedCredential> allowList;
+  for (const auto& s : aOptions.mAllowCredentials) {
+    if (s.mType.EqualsLiteral(
+            MOZ_WEBAUTHN_PUBLIC_KEY_CREDENTIAL_TYPE_PUBLIC_KEY)) {
+      WebAuthnScopedCredential c;
+      CryptoBuffer cb;
+      cb.Assign(s.mId);
+      c.id() = cb;
+      if (s.mTransports.WasPassed()) {
+        c.transports() = SerializeTransports(s.mTransports.Value());
+      }
+      allowList.AppendElement(c);
+    }
+  }
+  if (allowList.Length() == 0 && aOptions.mAllowCredentials.Length() != 0) {
+    aPromise->MaybeReject(NS_ERROR_DOM_NOT_ALLOWED_ERR);
+    return;
+  }
+
+  nsTArray<WebAuthnExtension> extensions;
+
+  if (aOptions.mExtensions.mCredProps.WasPassed()) {
+    aPromise->MaybeReject(NS_ERROR_DOM_NOT_SUPPORTED_ERR);
+    return;
+  }
+
+  if (aOptions.mExtensions.mMinPinLength.WasPassed()) {
+    aPromise->MaybeReject(NS_ERROR_DOM_NOT_SUPPORTED_ERR);
+    return;
+  }
+
+  Maybe<nsCString> maybeAppId;
+  if (aOptions.mExtensions.mAppid.WasPassed()) {
+    nsCString appId(NS_ConvertUTF16toUTF8(aOptions.mExtensions.mAppid.Value()));
+
+    if (appId.IsEmpty() || appId.EqualsLiteral("null")) {
+      auto* basePrin = BasePrincipal::Cast(principal);
+      nsresult rv = basePrin->GetWebExposedOriginSerialization(appId);
+      if (NS_FAILED(rv)) {
+        aPromise->MaybeReject(NS_ERROR_DOM_SECURITY_ERR);
+        return;
+      }
+    }
+
+    maybeAppId.emplace(std::move(appId));
+  }
+
+  if (aOptions.mExtensions.mLargeBlob.WasPassed()) {
+    const AuthenticationExtensionsLargeBlobInputs& extLargeBlob =
+        aOptions.mExtensions.mLargeBlob.Value();
+    if (extLargeBlob.mSupport.WasPassed() ||
+        (extLargeBlob.mRead.WasPassed() && extLargeBlob.mWrite.WasPassed()) ||
+        (extLargeBlob.mWrite.WasPassed() &&
+         aOptions.mAllowCredentials.Length() != 1)) {
+      aPromise->MaybeReject(NS_ERROR_DOM_NOT_SUPPORTED_ERR);
+      return;
+    }
+    Maybe<bool> read = Nothing();
+    if (extLargeBlob.mRead.WasPassed() && extLargeBlob.mRead.Value()) {
+      read.emplace(true);
+    }
+
+    CryptoBuffer write;
+    if (extLargeBlob.mWrite.WasPassed()) {
+      read.emplace(false);
+      write.Assign(extLargeBlob.mWrite.Value());
+    }
+    extensions.AppendElement(WebAuthnExtensionLargeBlob(read, write));
+  }
+
+  if (aOptions.mExtensions.mPrf.WasPassed()) {
+    const AuthenticationExtensionsPRFInputs& prf =
+        aOptions.mExtensions.mPrf.Value();
+
+    Maybe<WebAuthnExtensionPrfValues> eval = Nothing();
+    if (prf.mEval.WasPassed()) {
+      CryptoBuffer first;
+      first.Assign(prf.mEval.Value().mFirst);
+      const bool secondMaybe = prf.mEval.Value().mSecond.WasPassed();
+      CryptoBuffer second;
+      if (secondMaybe) {
+        second.Assign(prf.mEval.Value().mSecond.Value());
+      }
+      eval = Some(WebAuthnExtensionPrfValues(first, secondMaybe, second));
+    }
+
+    const bool evalByCredentialMaybe = prf.mEvalByCredential.WasPassed();
+    nsTArray<WebAuthnExtensionPrfEvalByCredentialEntry> evalByCredential;
+    if (evalByCredentialMaybe) {
+      if (allowList.Length() == 0) {
+        aPromise->MaybeReject(NS_ERROR_DOM_NOT_SUPPORTED_ERR);
+        return;
+      }
+
+      for (const auto& entry : prf.mEvalByCredential.Value().Entries()) {
+        FallibleTArray<uint8_t> evalByCredentialEntryId;
+        nsresult rv = Base64URLDecode(NS_ConvertUTF16toUTF8(entry.mKey),
+                                      Base64URLDecodePaddingPolicy::Ignore,
+                                      evalByCredentialEntryId);
+        if (NS_FAILED(rv)) {
+          aPromise->MaybeReject(NS_ERROR_DOM_SYNTAX_ERR);
+          return;
+        }
+
+        bool foundMatchingAllowListEntry = false;
+        for (const auto& cred : allowList) {
+          if (evalByCredentialEntryId == cred.id()) {
+            foundMatchingAllowListEntry = true;
+          }
+        }
+        if (!foundMatchingAllowListEntry) {
+          aPromise->MaybeReject(NS_ERROR_DOM_SYNTAX_ERR);
+          return;
+        }
+
+        CryptoBuffer first;
+        first.Assign(entry.mValue.mFirst);
+        const bool secondMaybe = entry.mValue.mSecond.WasPassed();
+        CryptoBuffer second;
+        if (secondMaybe) {
+          second.Assign(entry.mValue.mSecond.Value());
+        }
+        evalByCredential.AppendElement(
+            WebAuthnExtensionPrfEvalByCredentialEntry(
+                evalByCredentialEntryId,
+                WebAuthnExtensionPrfValues(first, secondMaybe, second)));
+      }
+    }
+
+    extensions.AppendElement(
+        WebAuthnExtensionPrf(eval, evalByCredentialMaybe, evalByCredential));
+  }
+
+  if (aSignal.WasPassed() && aSignal.Value().Aborted()) {
+    JS::Rooted<JS::Value> reason(aCx);
+    aSignal.Value().GetReason(aCx, &reason);
+    aPromise->MaybeReject(reason);
+    return;
+  }
+
+  nsString json;
+  nsresult rv = SerializeWebAuthnRequestOptions(
+      aCx, NS_ConvertUTF8toUTF16(rpId), aOptions, json);
+  if (NS_FAILED(rv)) {
+    aPromise->MaybeReject(NS_ERROR_DOM_OPERATION_ERR);
+    return;
+  }
+
+  WebAuthnGetAssertionInfo info(rpId, maybeAppId, challenge, adjustedTimeout,
+                                allowList, extensions,
+                                aOptions.mUserVerification,
+                                aConditionallyMediated, aOptions.mHints, json);
+
+  AbortSignal* signal = nullptr;
+  if (aSignal.WasPassed()) {
+    signal = &aSignal.Value();
+    Follow(signal);
+  }
+
+  MOZ_ASSERT(mTransaction.isNothing());
+  mTransaction =
+      Some(WebAuthnTransaction(aPromise, WebAuthnTransactionType::Get));
+  mActor->SendRequestSign(info)
+      ->Then(
+          GetCurrentSerialEventTarget(), __func__,
+          [self = RefPtr{this}](
+              const PWebAuthnTransactionChild::RequestSignPromise::
+                  ResolveOrRejectValue& aValue) {
+            self->mTransaction.ref().mSignHolder.Complete();
+            if (aValue.IsResolve() && aValue.ResolveValue().type() ==
+                                          WebAuthnGetAssertionResponse::Type::
+                                              TWebAuthnGetAssertionResult) {
+              self->FinishGetAssertion(aValue.ResolveValue());
+            } else if (aValue.IsResolve()) {
+              self->RejectTransaction(aValue.ResolveValue());
+            } else {
+              self->RejectTransaction(NS_ERROR_DOM_NOT_ALLOWED_ERR);
+            }
+          })
+      ->Track(mTransaction.ref().mSignHolder);
+}
+
+void WebAuthnHandler::Store(const Credential& aCredential,
+                            const RefPtr<Promise>& aPromise) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (mTransaction.isSome()) {
+    CancelTransaction(NS_ERROR_DOM_ABORT_ERR);
+  }
+
+  aPromise->MaybeReject(NS_ERROR_DOM_NOT_SUPPORTED_ERR);
+}
+
+void WebAuthnHandler::IsUVPAA(const RefPtr<Promise>& aPromise) {
+  if (!MaybeCreateActor()) {
+    aPromise->MaybeReject(NS_ERROR_DOM_OPERATION_ERR);
+    return;
+  }
+
+  mActor->SendRequestIsUVPAA()->Then(
+      GetCurrentSerialEventTarget(), __func__,
+      [promise = RefPtr{aPromise}](
+          const PWebAuthnTransactionChild::RequestIsUVPAAPromise::
+              ResolveOrRejectValue& aValue) {
+        if (aValue.IsResolve()) {
+          promise->MaybeResolve(aValue.ResolveValue());
+        } else {
+          promise->MaybeReject(NS_ERROR_DOM_NOT_ALLOWED_ERR);
+        }
+      });
+}
+
+void WebAuthnHandler::FinishMakeCredential(
+    const WebAuthnMakeCredentialResult& aResult) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(mTransaction.isSome());
+
+  nsAutoCString keyHandleBase64Url;
+  nsresult rv = Base64URLEncode(
+      aResult.KeyHandle().Length(), aResult.KeyHandle().Elements(),
+      Base64URLEncodePaddingPolicy::Omit, keyHandleBase64Url);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    RejectTransaction(rv);
+    return;
+  }
+
+  RefPtr<AuthenticatorAttestationResponse> attestation =
+      new AuthenticatorAttestationResponse(mWindow);
+  attestation->SetClientDataJSON(aResult.ClientDataJSON());
+  attestation->SetAttestationObject(aResult.AttestationObject());
+  attestation->SetTransports(aResult.Transports());
+
+  RefPtr<PublicKeyCredential> credential = new PublicKeyCredential(mWindow);
+  credential->SetId(NS_ConvertASCIItoUTF16(keyHandleBase64Url));
+  credential->SetType(u"public-key"_ns);
+  credential->SetRawId(aResult.KeyHandle());
+  credential->SetAttestationResponse(attestation);
+
+  if (aResult.AuthenticatorAttachment().isSome()) {
+    credential->SetAuthenticatorAttachment(aResult.AuthenticatorAttachment());
+
+
+  } else {
+
+  }
+
+  for (const auto& ext : aResult.Extensions()) {
+    if (ext.type() ==
+        WebAuthnExtensionResult::TWebAuthnExtensionResultCredProps) {
+      bool credPropsRk = ext.get_WebAuthnExtensionResultCredProps().rk();
+      credential->SetClientExtensionResultCredPropsRk(credPropsRk);
+      if (credPropsRk) {
+
+      }
+    }
+    if (ext.type() ==
+        WebAuthnExtensionResult::TWebAuthnExtensionResultHmacSecret) {
+      bool hmacCreateSecret =
+          ext.get_WebAuthnExtensionResultHmacSecret().hmacCreateSecret();
+      credential->SetClientExtensionResultHmacSecret(hmacCreateSecret);
+    }
+    if (ext.type() ==
+        WebAuthnExtensionResult::TWebAuthnExtensionResultLargeBlob) {
+      credential->InitClientExtensionResultLargeBlob();
+      credential->SetClientExtensionResultLargeBlobSupported(
+          ext.get_WebAuthnExtensionResultLargeBlob().flag());
+    }
+    if (ext.type() == WebAuthnExtensionResult::TWebAuthnExtensionResultPrf) {
+      credential->InitClientExtensionResultPrf();
+      const Maybe<bool> prfEnabled =
+          ext.get_WebAuthnExtensionResultPrf().enabled();
+      if (prfEnabled.isSome()) {
+        credential->SetClientExtensionResultPrfEnabled(prfEnabled.value());
+      }
+      const Maybe<WebAuthnExtensionPrfValues> prfValues =
+          ext.get_WebAuthnExtensionResultPrf().results();
+      if (prfValues.isSome()) {
+        credential->SetClientExtensionResultPrfResultsFirst(
+            prfValues.value().first());
+        if (prfValues.value().secondMaybe()) {
+          credential->SetClientExtensionResultPrfResultsSecond(
+              prfValues.value().second());
+        }
+      }
+    }
+  }
+
+  ResolveTransaction(credential);
+}
+
+void WebAuthnHandler::FinishGetAssertion(
+    const WebAuthnGetAssertionResult& aResult) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(mTransaction.isSome());
+
+  nsAutoCString keyHandleBase64Url;
+  nsresult rv = Base64URLEncode(
+      aResult.KeyHandle().Length(), aResult.KeyHandle().Elements(),
+      Base64URLEncodePaddingPolicy::Omit, keyHandleBase64Url);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    RejectTransaction(rv);
+    return;
+  }
+
+  RefPtr<AuthenticatorAssertionResponse> assertion =
+      new AuthenticatorAssertionResponse(mWindow);
+  assertion->SetClientDataJSON(aResult.ClientDataJSON());
+  assertion->SetAuthenticatorData(aResult.AuthenticatorData());
+  assertion->SetSignature(aResult.Signature());
+  assertion->SetUserHandle(aResult.UserHandle());  
+
+  RefPtr<PublicKeyCredential> credential = new PublicKeyCredential(mWindow);
+  credential->SetId(NS_ConvertASCIItoUTF16(keyHandleBase64Url));
+  credential->SetType(u"public-key"_ns);
+  credential->SetRawId(aResult.KeyHandle());
+  credential->SetAssertionResponse(assertion);
+
+  if (aResult.AuthenticatorAttachment().isSome()) {
+    credential->SetAuthenticatorAttachment(aResult.AuthenticatorAttachment());
+
+
+  } else {
+
+  }
+
+  for (const auto& ext : aResult.Extensions()) {
+    if (ext.type() == WebAuthnExtensionResult::TWebAuthnExtensionResultAppId) {
+      bool appid = ext.get_WebAuthnExtensionResultAppId().AppId();
+      credential->SetClientExtensionResultAppId(appid);
+    }
+    if (ext.type() ==
+        WebAuthnExtensionResult::TWebAuthnExtensionResultLargeBlob) {
+      if (ext.get_WebAuthnExtensionResultLargeBlob().flag() &&
+          ext.get_WebAuthnExtensionResultLargeBlob().written()) {
+        credential->InitClientExtensionResultLargeBlob();
+      } else if (ext.get_WebAuthnExtensionResultLargeBlob().flag()) {
+        const nsTArray<uint8_t>& largeBlobValue =
+            ext.get_WebAuthnExtensionResultLargeBlob().blob();
+        credential->InitClientExtensionResultLargeBlob();
+        credential->SetClientExtensionResultLargeBlobValue(largeBlobValue);
+      } else {
+        bool largeBlobWritten =
+            ext.get_WebAuthnExtensionResultLargeBlob().written();
+        credential->InitClientExtensionResultLargeBlob();
+        credential->SetClientExtensionResultLargeBlobWritten(largeBlobWritten);
+      }
+    }
+    if (ext.type() == WebAuthnExtensionResult::TWebAuthnExtensionResultPrf) {
+      credential->InitClientExtensionResultPrf();
+      Maybe<WebAuthnExtensionPrfValues> prfResults =
+          ext.get_WebAuthnExtensionResultPrf().results();
+      if (prfResults.isSome()) {
+        credential->SetClientExtensionResultPrfResultsFirst(
+            prfResults.value().first());
+        if (prfResults.value().secondMaybe()) {
+          credential->SetClientExtensionResultPrfResultsSecond(
+              prfResults.value().second());
+        }
+      }
+    }
+  }
+
+  nsIGlobalObject* global = mTransaction.ref().mPromise->GetGlobalObject();
+  if (global) {
+    nsPIDOMWindowInner* window = global->GetAsInnerWindow();
+    if (window) {
+      (void)BounceTrackingProtection::RecordUserActivation(
+          window->GetWindowContext());
+    }
+  }
+
+  ResolveTransaction(credential);
+}
+
+void WebAuthnHandler::RunAbortAlgorithm() {
+  if (NS_WARN_IF(mTransaction.isNothing())) {
+    return;
+  }
+
+  nsCOMPtr<nsIGlobalObject> global = do_QueryInterface(mWindow);
+
+  AutoJSAPI jsapi;
+  if (!jsapi.Init(global)) {
+    CancelTransaction(NS_ERROR_DOM_ABORT_ERR);
+    return;
+  }
+  JSContext* cx = jsapi.cx();
+  JS::Rooted<JS::Value> reason(cx);
+  Signal()->GetReason(cx, &reason);
+  CancelTransaction(reason);
+}
+
+void WebAuthnHandler::ResolveTransaction(
+    const RefPtr<PublicKeyCredential>& aCredential) {
+  MOZ_ASSERT(mTransaction.isSome());
+
+  RefPtr<Promise> promise = mTransaction.ref().mPromise;
+  mTransaction.reset();
+  Unfollow();
+
+  promise->MaybeResolve(aCredential);
+}
+
+template <typename T>
+void WebAuthnHandler::RejectTransaction(const T& aReason) {
+  MOZ_ASSERT(mTransaction.isSome());
+
+  RefPtr<Promise> promise = mTransaction.ref().mPromise;
+  mTransaction.reset();
+  Unfollow();
+
+  promise->MaybeReject(aReason);
+}
+
+}  

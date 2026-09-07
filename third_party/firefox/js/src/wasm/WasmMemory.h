@@ -1,0 +1,211 @@
+/*
+ * Copyright 2021 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#ifndef wasm_memory_h
+#define wasm_memory_h
+
+#include "mozilla/CheckedInt.h"
+#include "mozilla/Maybe.h"
+
+#include <compare>  // std::strong_ordering
+#include <stdint.h>
+
+#include "js/Value.h"
+#include "vm/NativeObject.h"
+#include "wasm/WasmConstants.h"
+#include "wasm/WasmValType.h"
+
+namespace js {
+namespace wasm {
+
+
+enum class AddressType : uint8_t { I32, I64 };
+
+inline ValType ToValType(AddressType at) {
+  return at == AddressType::I64 ? ValType::I64 : ValType::I32;
+}
+
+inline AddressType MinAddressType(AddressType a, AddressType b) {
+  return (a == AddressType::I32 || b == AddressType::I32) ? AddressType::I32
+                                                          : AddressType::I64;
+}
+
+extern bool ToAddressType(JSContext* cx, HandleValue value,
+                          AddressType* addressType);
+
+extern bool ToPageSize(JSContext* cx, HandleValue value, PageSize* pageSize);
+
+extern const char* ToString(AddressType addressType);
+
+static constexpr unsigned PageSizeInBytes(PageSize sz) {
+  return 1U << static_cast<uint8_t>(sz);
+}
+
+static constexpr unsigned StandardPageSizeBytes =
+    PageSizeInBytes(PageSize::Standard);
+static_assert(StandardPageSizeBytes == 64 * 1024);
+
+static_assert((StandardPageSizeBytes * MaxMemory64StandardPagesValidation) <=
+              (uint64_t(1) << 53) - 1);
+
+struct Pages {
+ private:
+  uint64_t pageCount_;
+  PageSize pageSize_;
+
+  constexpr Pages(uint64_t pageCount, PageSize pageSize)
+      : pageCount_(pageCount), pageSize_(pageSize) {}
+
+ public:
+  static constexpr Pages fromPageCount(uint64_t pageCount, PageSize pageSize) {
+    return Pages(pageCount, pageSize);
+  }
+
+  static constexpr Pages forPageSize(PageSize pageSize) {
+    return Pages(0, pageSize);
+  }
+
+  static constexpr bool byteLengthIsMultipleOfPageSize(size_t byteLength,
+                                                       PageSize pageSize) {
+    return byteLength % PageSizeInBytes(pageSize) == 0;
+  }
+
+  static constexpr Pages fromByteLengthExact(size_t byteLength,
+                                             PageSize pageSize) {
+    MOZ_RELEASE_ASSERT(byteLengthIsMultipleOfPageSize(byteLength, pageSize));
+    return Pages(byteLength / PageSizeInBytes(pageSize), pageSize);
+  }
+
+  Pages& operator=(const Pages& other) {
+    MOZ_RELEASE_ASSERT(other.pageSize_ == pageSize_);
+    pageCount_ = other.pageCount_;
+    return *this;
+  }
+
+  uint64_t pageCount() const { return pageCount_; }
+  PageSize pageSize() const { return pageSize_; }
+
+  bool hasByteLength() const {
+    mozilla::CheckedInt<size_t> length(pageCount_);
+    length *= PageSizeInBytes(pageSize_);
+    return length.isValid();
+  }
+
+  size_t byteLength() const {
+    mozilla::CheckedInt<size_t> length(pageCount_);
+    length *= PageSizeInBytes(pageSize_);
+    return length.value();
+  }
+
+  uint64_t byteLength64() const {
+    mozilla::CheckedInt<uint64_t> length(pageCount_);
+    length *= PageSizeInBytes(pageSize_);
+    return length.value();
+  }
+
+  bool checkedIncrement(uint64_t delta) {
+    mozilla::CheckedInt<uint64_t> newValue = pageCount_;
+    newValue += delta;
+    if (!newValue.isValid()) {
+      return false;
+    }
+    pageCount_ = newValue.value();
+    return true;
+  }
+
+
+  constexpr auto operator<=>(const Pages& other) const {
+    MOZ_RELEASE_ASSERT(other.pageSize_ == pageSize_);
+    return pageCount_ <=> other.pageCount_;
+  }
+  constexpr auto operator==(const Pages& other) const {
+    MOZ_RELEASE_ASSERT(other.pageSize_ == pageSize_);
+    return pageCount_ == other.pageCount_;
+  }
+};
+
+extern Pages MaxMemoryPages(AddressType t, PageSize pageSize);
+
+static inline size_t MaxMemoryBytes(AddressType t, PageSize pageSize) {
+  return MaxMemoryPages(t, pageSize).byteLength();
+}
+
+extern size_t MaxMemoryBoundsCheckLimit(AddressType t, PageSize pageSize);
+
+static inline uint64_t MaxMemoryPagesValidation(AddressType addressType,
+                                                PageSize pageSize) {
+#ifdef ENABLE_WASM_CUSTOM_PAGE_SIZES
+  if (pageSize == PageSize::Tiny) {
+    return addressType == AddressType::I32 ? MaxMemory32TinyPagesValidation
+                                           : MaxMemory64TinyPagesValidation;
+  }
+#endif
+
+  MOZ_ASSERT(pageSize == PageSize::Standard);
+  return addressType == AddressType::I32 ? MaxMemory32StandardPagesValidation
+                                         : MaxMemory64StandardPagesValidation;
+}
+
+static inline uint64_t MaxTableElemsValidation(AddressType addressType) {
+  return addressType == AddressType::I32 ? MaxTable32ElemsValidation
+                                         : MaxTable64ElemsValidation;
+}
+
+extern Pages ClampedMaxPages(AddressType t, Pages initialPages,
+                             const mozilla::Maybe<Pages>& sourceMaxPages,
+                             bool useHugeMemory);
+
+extern size_t ComputeMappedSize(Pages clampedMaxPages);
+
+extern uint64_t GetMaxOffsetGuardLimit(bool hugeMemory, PageSize sz);
+
+extern uint64_t RoundUpToNextValidBoundsCheckImmediate(uint64_t i);
+
+#ifdef WASM_SUPPORTS_HUGE_MEMORY
+
+static const uint64_t HugeIndexRange = uint64_t(UINT32_MAX) + 1;
+static const uint64_t HugeOffsetGuardLimit = 1 << 25;
+static const uint64_t HugeUnalignedGuardPage = StandardPageSizeBytes;
+
+static const uint64_t HugeMappedSize =
+    HugeIndexRange + HugeOffsetGuardLimit + HugeUnalignedGuardPage;
+
+static_assert(HugeMappedSize % StandardPageSizeBytes == 0);
+
+#endif
+
+static const size_t GuardSize = StandardPageSizeBytes;
+
+static const size_t NullPtrGuardSize = 4096;
+
+static inline bool MemoryBoundsCheck(uint32_t offset, uint32_t len,
+                                     size_t memLen) {
+  uint64_t offsetLimit = uint64_t(offset) + uint64_t(len);
+  return offsetLimit <= memLen;
+}
+
+static inline bool MemoryBoundsCheck(uint64_t offset, uint64_t len,
+                                     size_t memLen) {
+  uint64_t offsetLimit = offset + len;
+  bool didOverflow = offsetLimit < offset;
+  bool tooLong = memLen < offsetLimit;
+  return !didOverflow && !tooLong;
+}
+
+}  
+}  
+
+#endif  // wasm_memory_h

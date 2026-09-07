@@ -1,0 +1,773 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "Performance.h"
+
+#include "PerformanceEntry.h"
+#include "PerformanceMainThread.h"
+#include "PerformanceMark.h"
+#include "PerformanceMeasure.h"
+#include "PerformanceObserver.h"
+#include "PerformanceResourceTiming.h"
+#include "PerformanceService.h"
+#include "PerformanceWorker.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/IntegerPrintfMacros.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/dom/MessagePortBinding.h"
+#include "mozilla/dom/PerformanceBinding.h"
+#include "mozilla/dom/PerformanceEntryEvent.h"
+#include "mozilla/dom/PerformanceNavigationBinding.h"
+#include "mozilla/dom/PerformanceNavigationTiming.h"
+#include "mozilla/dom/PerformanceObserverBinding.h"
+#include "mozilla/dom/WorkerPrivate.h"
+#include "mozilla/dom/WorkerRunnable.h"
+#include "mozilla/dom/WorkerScope.h"
+#include "nsGlobalWindowInner.h"
+#include "nsRFPService.h"
+
+#define PERFLOG(msg, ...) printf_stderr(msg, ##__VA_ARGS__)
+
+namespace mozilla::dom {
+
+enum class Performance::ResolveTimestampAttribute {
+  Start,
+  End,
+  Duration,
+};
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(Performance)
+NS_INTERFACE_MAP_END_INHERITING(DOMEventTargetHelper)
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED(Performance, DOMEventTargetHelper,
+                                   mUserEntries, mResourceEntries,
+                                   mSecondaryResourceEntries, mObservers);
+
+NS_IMPL_ADDREF_INHERITED(Performance, DOMEventTargetHelper)
+NS_IMPL_RELEASE_INHERITED(Performance, DOMEventTargetHelper)
+
+already_AddRefed<Performance> Performance::CreateForMainThread(
+    nsPIDOMWindowInner* aWindow, nsIPrincipal* aPrincipal,
+    nsDOMNavigationTiming* aDOMTiming, nsITimedChannel* aChannel) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  MOZ_ASSERT(aWindow->AsGlobal());
+  RefPtr<Performance> performance =
+      new PerformanceMainThread(aWindow, aDOMTiming, aChannel);
+  return performance.forget();
+}
+
+already_AddRefed<Performance> Performance::CreateForWorker(
+    WorkerGlobalScope* aGlobalScope) {
+  MOZ_ASSERT(aGlobalScope);
+
+  RefPtr<Performance> performance = new PerformanceWorker(aGlobalScope);
+  return performance.forget();
+}
+
+already_AddRefed<Performance> Performance::Get(JSContext* aCx,
+                                               nsIGlobalObject* aGlobal) {
+  RefPtr<Performance> performance;
+  if (NS_IsMainThread()) {
+    nsCOMPtr<nsPIDOMWindowInner> window = do_QueryInterface(aGlobal);
+    if (!window) {
+      return nullptr;
+    }
+
+    performance = window->GetPerformance();
+    return performance.forget();
+  }
+
+  const WorkerPrivate* workerPrivate = GetWorkerPrivateFromContext(aCx);
+  if (!workerPrivate) {
+    return nullptr;
+  }
+
+  WorkerGlobalScope* scope = workerPrivate->GlobalScope();
+  MOZ_ASSERT(scope);
+  performance = scope->GetPerformance();
+
+  return performance.forget();
+}
+
+Performance::Performance(nsIGlobalObject* aGlobal)
+    : DOMEventTargetHelper(aGlobal),
+      mResourceTimingBufferSize(kDefaultResourceTimingBufferSize),
+      mPendingNotificationObserversTask(false),
+      mPendingResourceTimingBufferFullEvent(false),
+      mRTPCallerType(aGlobal->GetRTPCallerType()),
+      mCrossOriginIsolated(aGlobal->CrossOriginIsolated()),
+      mShouldResistFingerprinting(aGlobal->ShouldResistFingerprinting(
+          RFPTarget::ReduceTimerPrecision)) {}
+
+Performance::~Performance() = default;
+
+DOMHighResTimeStamp Performance::TimeStampToDOMHighResForRendering(
+    TimeStamp aTimeStamp) const {
+  DOMHighResTimeStamp stamp = GetDOMTiming()->TimeStampToDOMHighRes(aTimeStamp);
+  return nsRFPService::ReduceTimePrecisionAsMSecsRFPOnly(stamp, 0,
+                                                         mRTPCallerType);
+}
+
+DOMHighResTimeStamp Performance::Now() {
+  DOMHighResTimeStamp rawTime = NowUnclamped();
+
+  if (mRTPCallerType == RTPCallerType::SystemPrincipal) {
+    return rawTime;
+  }
+
+  return nsRFPService::ReduceTimePrecisionAsMSecs(
+      rawTime, GetRandomTimelineSeed(), mRTPCallerType);
+}
+
+DOMHighResTimeStamp Performance::NowUnclamped() const {
+  TimeDuration duration = TimeStamp::Now() - CreationTimeStamp();
+  return duration.ToMilliseconds();
+}
+
+DOMHighResTimeStamp Performance::TimeOrigin() {
+  if (!mPerformanceService) {
+    mPerformanceService = PerformanceService::GetOrCreate();
+  }
+
+  MOZ_ASSERT(mPerformanceService);
+  DOMHighResTimeStamp rawTimeOrigin =
+      mPerformanceService->TimeOrigin(CreationTimeStamp());
+  return nsRFPService::ReduceTimePrecisionAsMSecs(rawTimeOrigin, 0,
+                                                  mRTPCallerType);
+}
+
+JSObject* Performance::WrapObject(JSContext* aCx,
+                                  JS::Handle<JSObject*> aGivenProto) {
+  return Performance_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+void Performance::GetEntries(nsTArray<RefPtr<PerformanceEntry>>& aRetval) {
+  aRetval = mResourceEntries.Clone();
+  aRetval.AppendElements(mUserEntries);
+  aRetval.Sort(PerformanceEntryComparator());
+}
+
+void Performance::GetEntriesByType(
+    const nsAString& aEntryType, nsTArray<RefPtr<PerformanceEntry>>& aRetval) {
+  RefPtr<nsAtom> entryType = NS_Atomize(aEntryType);
+  if (entryType == nsGkAtoms::resource) {
+    aRetval = mResourceEntries.Clone();
+    return;
+  }
+
+  aRetval.Clear();
+
+  if (entryType == nsGkAtoms::mark || entryType == nsGkAtoms::measure) {
+    for (PerformanceEntry* entry : mUserEntries) {
+      if (entry->GetEntryType() == entryType) {
+        aRetval.AppendElement(entry);
+      }
+    }
+  }
+}
+
+void Performance::GetEntriesByName(
+    const nsAString& aName, const Optional<nsAString>& aEntryType,
+    nsTArray<RefPtr<PerformanceEntry>>& aRetval) {
+  aRetval.Clear();
+
+  RefPtr<nsAtom> name = NS_Atomize(aName);
+  RefPtr<nsAtom> entryType =
+      aEntryType.WasPassed() ? NS_Atomize(aEntryType.Value()) : nullptr;
+
+  if (entryType) {
+    if (entryType == nsGkAtoms::mark || entryType == nsGkAtoms::measure) {
+      for (PerformanceEntry* entry : mUserEntries) {
+        if (entry->GetName() == name && entry->GetEntryType() == entryType) {
+          aRetval.AppendElement(entry);
+        }
+      }
+      return;
+    }
+    if (entryType == nsGkAtoms::resource) {
+      for (PerformanceEntry* entry : mResourceEntries) {
+        MOZ_ASSERT(entry->GetEntryType() == entryType);
+        if (entry->GetName() == name) {
+          aRetval.AppendElement(entry);
+        }
+      }
+      return;
+    }
+    return;
+  }
+
+  nsTArray<PerformanceEntry*> qualifiedResourceEntries;
+  nsTArray<PerformanceEntry*> qualifiedUserEntries;
+  for (PerformanceEntry* entry : mResourceEntries) {
+    if (entry->GetName() == name) {
+      qualifiedResourceEntries.AppendElement(entry);
+    }
+  }
+
+  for (PerformanceEntry* entry : mUserEntries) {
+    if (entry->GetName() == name) {
+      qualifiedUserEntries.AppendElement(entry);
+    }
+  }
+
+  size_t resourceEntriesIdx = 0, userEntriesIdx = 0;
+  aRetval.SetCapacity(qualifiedResourceEntries.Length() +
+                      qualifiedUserEntries.Length());
+
+  PerformanceEntryComparator comparator;
+
+  while (resourceEntriesIdx < qualifiedResourceEntries.Length() &&
+         userEntriesIdx < qualifiedUserEntries.Length()) {
+    if (comparator.LessThan(qualifiedResourceEntries[resourceEntriesIdx],
+                            qualifiedUserEntries[userEntriesIdx])) {
+      aRetval.AppendElement(qualifiedResourceEntries[resourceEntriesIdx]);
+      ++resourceEntriesIdx;
+    } else {
+      aRetval.AppendElement(qualifiedUserEntries[userEntriesIdx]);
+      ++userEntriesIdx;
+    }
+  }
+
+  while (resourceEntriesIdx < qualifiedResourceEntries.Length()) {
+    aRetval.AppendElement(qualifiedResourceEntries[resourceEntriesIdx]);
+    ++resourceEntriesIdx;
+  }
+
+  while (userEntriesIdx < qualifiedUserEntries.Length()) {
+    aRetval.AppendElement(qualifiedUserEntries[userEntriesIdx]);
+    ++userEntriesIdx;
+  }
+}
+
+void Performance::GetEntriesByTypeForObserver(
+    const nsAString& aEntryType, nsTArray<RefPtr<PerformanceEntry>>& aRetval) {
+  GetEntriesByType(aEntryType, aRetval);
+}
+
+void Performance::ClearUserEntries(const Optional<nsAString>& aEntryName,
+                                   const nsAString& aEntryType) {
+  MOZ_ASSERT(!aEntryType.IsEmpty());
+  RefPtr<nsAtom> name =
+      aEntryName.WasPassed() ? NS_Atomize(aEntryName.Value()) : nullptr;
+  RefPtr<nsAtom> entryType = NS_Atomize(aEntryType);
+  mUserEntries.RemoveElementsBy([name, entryType](const auto& entry) {
+    return (!name || entry->GetName() == name) &&
+           (entry->GetEntryType() == entryType);
+  });
+}
+
+void Performance::ClearResourceTimings() { mResourceEntries.Clear(); }
+
+already_AddRefed<PerformanceMark> Performance::Mark(
+    JSContext* aCx, const nsAString& aName,
+    const PerformanceMarkOptions& aMarkOptions, ErrorResult& aRv) {
+  nsCOMPtr<nsIGlobalObject> parent = GetParentObject();
+  if (!parent || parent->IsDying() || !parent->HasJSGlobal()) {
+    aRv.ThrowInvalidStateError("Global object is unavailable");
+    return nullptr;
+  }
+
+  GlobalObject global(aCx, parent->GetGlobalJSObject());
+  if (global.Failed()) {
+    aRv.ThrowInvalidStateError("Global object is unavailable");
+    return nullptr;
+  }
+
+  RefPtr<PerformanceMark> performanceMark =
+      PerformanceMark::Constructor(global, aName, aMarkOptions, aRv);
+  if (aRv.Failed()) {
+    return nullptr;
+  }
+
+  InsertUserEntry(performanceMark);
+
+  return performanceMark.forget();
+}
+
+void Performance::ClearMarks(const Optional<nsAString>& aName) {
+  ClearUserEntries(aName, u"mark"_ns);
+}
+
+bool Performance::IsPerformanceTimingAttribute(const nsAString& aName) const {
+  static const char* attributes[] = {"navigationStart",
+                                     "unloadEventStart",
+                                     "unloadEventEnd",
+                                     "redirectStart",
+                                     "redirectEnd",
+                                     "fetchStart",
+                                     "domainLookupStart",
+                                     "domainLookupEnd",
+                                     "connectStart",
+                                     "secureConnectionStart",
+                                     "connectEnd",
+                                     "requestStart",
+                                     "responseStart",
+                                     "responseEnd",
+                                     "domLoading",
+                                     "domInteractive",
+                                     "domContentLoadedEventStart",
+                                     "domContentLoadedEventEnd",
+                                     "domComplete",
+                                     "loadEventStart",
+                                     "loadEventEnd",
+                                     nullptr};
+
+  for (uint32_t i = 0; attributes[i]; ++i) {
+    if (aName.EqualsASCII(attributes[i])) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+DOMHighResTimeStamp Performance::ConvertMarkToTimestampWithString(
+    const nsAString& aName, ErrorResult& aRv, bool aReturnUnclamped) {
+  if (IsPerformanceTimingAttribute(aName)) {
+    return ConvertNameToTimestamp(aName, aRv);
+  }
+
+  RefPtr<nsAtom> name = NS_Atomize(aName);
+  for (const PerformanceEntry* entry : Reversed(mUserEntries)) {
+    if (entry->GetName() == name && entry->GetEntryType() == nsGkAtoms::mark) {
+      if (aReturnUnclamped) {
+        return entry->UnclampedStartTime();
+      }
+      return entry->StartTime();
+    }
+  }
+
+  nsPrintfCString errorMsg("Given mark name, %s, is unknown",
+                           NS_ConvertUTF16toUTF8(aName).get());
+  aRv.ThrowSyntaxError(errorMsg);
+  return 0;
+}
+
+DOMHighResTimeStamp Performance::ConvertMarkToTimestampWithDOMHighResTimeStamp(
+    const ResolveTimestampAttribute aAttribute,
+    const DOMHighResTimeStamp aTimestamp, ErrorResult& aRv) {
+  if (aTimestamp < 0) {
+    nsAutoCString attributeName;
+    switch (aAttribute) {
+      case ResolveTimestampAttribute::Start:
+        attributeName = "start";
+        break;
+      case ResolveTimestampAttribute::End:
+        attributeName = "end";
+        break;
+      case ResolveTimestampAttribute::Duration:
+        attributeName = "duration";
+        break;
+    }
+
+    nsPrintfCString errorMsg("Given attribute %s cannot be negative",
+                             attributeName.get());
+    aRv.ThrowTypeError(errorMsg);
+  }
+  return aTimestamp;
+}
+
+DOMHighResTimeStamp Performance::ConvertMarkToTimestamp(
+    const ResolveTimestampAttribute aAttribute,
+    const OwningStringOrDouble& aMarkNameOrTimestamp, ErrorResult& aRv,
+    bool aReturnUnclamped) {
+  if (aMarkNameOrTimestamp.IsString()) {
+    return ConvertMarkToTimestampWithString(aMarkNameOrTimestamp.GetAsString(),
+                                            aRv, aReturnUnclamped);
+  }
+
+  return ConvertMarkToTimestampWithDOMHighResTimeStamp(
+      aAttribute, aMarkNameOrTimestamp.GetAsDouble(), aRv);
+}
+
+DOMHighResTimeStamp Performance::ConvertNameToTimestamp(const nsAString& aName,
+                                                        ErrorResult& aRv) {
+  if (!IsGlobalObjectWindow()) {
+    nsPrintfCString errorMsg(
+        "Cannot get PerformanceTiming attribute values for non-Window global "
+        "object. Given: %s",
+        NS_ConvertUTF16toUTF8(aName).get());
+    aRv.ThrowTypeError(errorMsg);
+    return 0;
+  }
+
+  if (aName.EqualsASCII("navigationStart")) {
+    return 0;
+  }
+
+  const DOMHighResTimeStamp startTime =
+      GetPerformanceTimingFromString(u"navigationStart"_ns);
+  const DOMHighResTimeStamp endTime = GetPerformanceTimingFromString(aName);
+  MOZ_ASSERT(endTime >= 0);
+  if (endTime == 0) {
+    nsPrintfCString errorMsg(
+        "Given PerformanceTiming attribute, %s, isn't available yet",
+        NS_ConvertUTF16toUTF8(aName).get());
+    aRv.ThrowInvalidAccessError(errorMsg);
+    return 0;
+  }
+
+  return endTime - startTime;
+}
+
+DOMHighResTimeStamp Performance::ResolveEndTimeForMeasure(
+    const Optional<nsAString>& aEndMark,
+    const Maybe<const PerformanceMeasureOptions&>& aOptions, ErrorResult& aRv,
+    bool aReturnUnclamped) {
+  DOMHighResTimeStamp endTime;
+  if (aEndMark.WasPassed()) {
+    endTime = ConvertMarkToTimestampWithString(aEndMark.Value(), aRv,
+                                               aReturnUnclamped);
+  } else if (aOptions && aOptions->mEnd.WasPassed()) {
+    endTime =
+        ConvertMarkToTimestamp(ResolveTimestampAttribute::End,
+                               aOptions->mEnd.Value(), aRv, aReturnUnclamped);
+  } else if (aOptions && aOptions->mStart.WasPassed() &&
+             aOptions->mDuration.WasPassed()) {
+    const DOMHighResTimeStamp start =
+        ConvertMarkToTimestamp(ResolveTimestampAttribute::Start,
+                               aOptions->mStart.Value(), aRv, aReturnUnclamped);
+    if (aRv.Failed()) {
+      return 0;
+    }
+
+    const DOMHighResTimeStamp duration =
+        ConvertMarkToTimestampWithDOMHighResTimeStamp(
+            ResolveTimestampAttribute::Duration, aOptions->mDuration.Value(),
+            aRv);
+    if (aRv.Failed()) {
+      return 0;
+    }
+
+    endTime = start + duration;
+  } else if (aReturnUnclamped) {
+    endTime = NowUnclamped();
+  } else {
+    endTime = Now();
+  }
+
+  return endTime;
+}
+
+DOMHighResTimeStamp Performance::ResolveStartTimeForMeasure(
+    const Maybe<const nsAString&>& aStartMark,
+    const Maybe<const PerformanceMeasureOptions&>& aOptions, ErrorResult& aRv,
+    bool aReturnUnclamped) {
+  DOMHighResTimeStamp startTime;
+  if (aOptions && aOptions->mStart.WasPassed()) {
+    startTime =
+        ConvertMarkToTimestamp(ResolveTimestampAttribute::Start,
+                               aOptions->mStart.Value(), aRv, aReturnUnclamped);
+  } else if (aOptions && aOptions->mDuration.WasPassed() &&
+             aOptions->mEnd.WasPassed()) {
+    const DOMHighResTimeStamp duration =
+        ConvertMarkToTimestampWithDOMHighResTimeStamp(
+            ResolveTimestampAttribute::Duration, aOptions->mDuration.Value(),
+            aRv);
+    if (aRv.Failed()) {
+      return 0;
+    }
+
+    const DOMHighResTimeStamp end =
+        ConvertMarkToTimestamp(ResolveTimestampAttribute::End,
+                               aOptions->mEnd.Value(), aRv, aReturnUnclamped);
+    if (aRv.Failed()) {
+      return 0;
+    }
+
+    startTime = end - duration;
+  } else if (aStartMark) {
+    startTime =
+        ConvertMarkToTimestampWithString(*aStartMark, aRv, aReturnUnclamped);
+  } else {
+    startTime = 0;
+  }
+
+  return startTime;
+}
+
+already_AddRefed<PerformanceMeasure> Performance::Measure(
+    JSContext* aCx, const nsAString& aName,
+    const StringOrPerformanceMeasureOptions& aStartOrMeasureOptions,
+    const Optional<nsAString>& aEndMark, ErrorResult& aRv) {
+  if (!GetParentObject()) {
+    aRv.ThrowInvalidStateError("Global object is unavailable");
+    return nullptr;
+  }
+
+  Maybe<const PerformanceMeasureOptions&> options;
+  if (aStartOrMeasureOptions.IsPerformanceMeasureOptions()) {
+    options.emplace(aStartOrMeasureOptions.GetAsPerformanceMeasureOptions());
+  }
+
+  const bool isOptionsNotEmpty =
+      options.isSome() &&
+      (!options->mDetail.isUndefined() || options->mStart.WasPassed() ||
+       options->mEnd.WasPassed() || options->mDuration.WasPassed());
+  if (isOptionsNotEmpty) {
+    if (aEndMark.WasPassed()) {
+      aRv.ThrowTypeError(
+          "Cannot provide separate endMark argument if "
+          "PerformanceMeasureOptions argument is given");
+      return nullptr;
+    }
+
+    if (!options->mStart.WasPassed() && !options->mEnd.WasPassed()) {
+      aRv.ThrowTypeError(
+          "PerformanceMeasureOptions must have start and/or end member");
+      return nullptr;
+    }
+
+    if (options->mStart.WasPassed() && options->mDuration.WasPassed() &&
+        options->mEnd.WasPassed()) {
+      aRv.ThrowTypeError(
+          "PerformanceMeasureOptions cannot have all of the following members: "
+          "start, duration, and end");
+      return nullptr;
+    }
+  }
+
+  const DOMHighResTimeStamp endTime = ResolveEndTimeForMeasure(
+      aEndMark, options, aRv,  false);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+
+  Maybe<const nsAString&> startMark;
+  if (aStartOrMeasureOptions.IsString()) {
+    startMark.emplace(aStartOrMeasureOptions.GetAsString());
+  }
+  const DOMHighResTimeStamp startTime = ResolveStartTimeForMeasure(
+      startMark, options, aRv,  false);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+
+  JS::Rooted<JS::Value> detail(aCx);
+  if (options && !options->mDetail.isNullOrUndefined()) {
+    StructuredSerializeOptions serializeOptions;
+    JS::Rooted<JS::Value> valueToClone(aCx, options->mDetail);
+    nsContentUtils::StructuredClone(aCx, GetParentObject(), valueToClone,
+                                    serializeOptions, &detail, aRv);
+    if (aRv.Failed()) {
+      return nullptr;
+    }
+  } else {
+    detail.setNull();
+  }
+
+  RefPtr<PerformanceMeasure> performanceMeasure = new PerformanceMeasure(
+      GetParentObject(), aName, startTime, endTime, detail);
+  InsertUserEntry(performanceMeasure);
+
+  return performanceMeasure.forget();
+}
+
+void Performance::ClearMeasures(const Optional<nsAString>& aName) {
+  ClearUserEntries(aName, u"measure"_ns);
+}
+
+void Performance::LogEntry(PerformanceEntry* aEntry,
+                           const nsACString& aOwner) const {
+  PERFLOG("Performance Entry: %s|%s|%s|%f|%f|%" PRIu64 "\n",
+          PromiseFlatCString(aOwner).get(),
+          NS_ConvertUTF16toUTF8(aEntry->GetEntryType()->GetUTF16String()).get(),
+          NS_ConvertUTF16toUTF8(aEntry->GetName()->GetUTF16String()).get(),
+          aEntry->StartTime(), aEntry->Duration(),
+          static_cast<uint64_t>(PR_Now() / PR_USEC_PER_MSEC));
+}
+
+void Performance::TimingNotification(PerformanceEntry* aEntry,
+                                     const nsACString& aOwner,
+                                     const double aEpoch) {
+  PerformanceEntryEventInit init;
+  init.mBubbles = false;
+  init.mCancelable = false;
+  aEntry->GetName(init.mName);
+  aEntry->GetEntryType(init.mEntryType);
+  init.mStartTime = aEntry->StartTime();
+  init.mDuration = aEntry->Duration();
+  init.mEpoch = aEpoch;
+  CopyUTF8toUTF16(aOwner, init.mOrigin);
+
+  RefPtr<PerformanceEntryEvent> perfEntryEvent =
+      PerformanceEntryEvent::Constructor(this, u"performanceentry"_ns, init);
+  if (RefPtr<nsGlobalWindowInner> owner = GetOwnerWindow()) {
+    owner->DispatchEvent(*perfEntryEvent);
+  }
+}
+
+void Performance::InsertUserEntry(PerformanceEntry* aEntry) {
+  mUserEntries.InsertElementSorted(aEntry, PerformanceEntryComparator());
+
+  QueueEntry(aEntry);
+}
+
+void Performance::ResourceTimingBufferFullEvent() {
+  while (!mSecondaryResourceEntries.IsEmpty()) {
+    uint32_t secondaryResourceEntriesBeforeCount = 0;
+    uint32_t secondaryResourceEntriesAfterCount = 0;
+
+    secondaryResourceEntriesBeforeCount = mSecondaryResourceEntries.Length();
+
+    if (!CanAddResourceTimingEntry()) {
+      DispatchResourceTimingBufferFullEvent();
+    }
+
+    while (!mSecondaryResourceEntries.IsEmpty() &&
+           CanAddResourceTimingEntry()) {
+      mResourceEntries.InsertElementSorted(
+          mSecondaryResourceEntries.ElementAt(0), PerformanceEntryComparator());
+      mSecondaryResourceEntries.RemoveElementAt(0);
+    }
+
+    secondaryResourceEntriesAfterCount = mSecondaryResourceEntries.Length();
+
+    if (secondaryResourceEntriesBeforeCount <=
+        secondaryResourceEntriesAfterCount) {
+      mSecondaryResourceEntries.Clear();
+      break;
+    }
+  }
+  mPendingResourceTimingBufferFullEvent = false;
+}
+
+void Performance::SetResourceTimingBufferSize(uint64_t aMaxSize) {
+  mResourceTimingBufferSize = aMaxSize;
+}
+
+MOZ_ALWAYS_INLINE bool Performance::CanAddResourceTimingEntry() {
+  return mResourceEntries.Length() < mResourceTimingBufferSize;
+}
+
+void Performance::InsertResourceEntry(PerformanceEntry* aEntry) {
+  MOZ_ASSERT(aEntry);
+
+  QueueEntry(aEntry);
+
+  if (CanAddResourceTimingEntry() && !mPendingResourceTimingBufferFullEvent) {
+    mResourceEntries.InsertElementSorted(aEntry, PerformanceEntryComparator());
+    return;
+  }
+
+  if (!mPendingResourceTimingBufferFullEvent) {
+    mPendingResourceTimingBufferFullEvent = true;
+
+    NS_DispatchToCurrentThread(NewCancelableRunnableMethod(
+        "Performance::ResourceTimingBufferFullEvent", this,
+        &Performance::ResourceTimingBufferFullEvent));
+  }
+  mSecondaryResourceEntries.InsertElementSorted(aEntry,
+                                                PerformanceEntryComparator());
+}
+
+void Performance::AddObserver(PerformanceObserver* aObserver) {
+  mObservers.AppendElementUnlessExists(aObserver);
+}
+
+void Performance::RemoveObserver(PerformanceObserver* aObserver) {
+  mObservers.RemoveElement(aObserver);
+}
+
+void Performance::NotifyObservers() {
+  mPendingNotificationObserversTask = false;
+  NS_OBSERVER_ARRAY_NOTIFY_XPCOM_OBSERVERS(mObservers, Notify, ());
+}
+
+void Performance::CancelNotificationObservers() {
+  mPendingNotificationObserversTask = false;
+}
+
+class NotifyObserversTask final : public CancelableRunnable {
+ public:
+  explicit NotifyObserversTask(Performance* aPerformance)
+      : CancelableRunnable("dom::NotifyObserversTask"),
+        mPerformance(aPerformance) {
+    MOZ_ASSERT(mPerformance);
+  }
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  NS_IMETHOD Run() override {
+    MOZ_ASSERT(mPerformance);
+    RefPtr<Performance> performance(mPerformance);
+    performance->NotifyObservers();
+    return NS_OK;
+  }
+
+  nsresult Cancel() override {
+    mPerformance->CancelNotificationObservers();
+    mPerformance = nullptr;
+    return NS_OK;
+  }
+
+ private:
+  ~NotifyObserversTask() = default;
+
+  RefPtr<Performance> mPerformance;
+};
+
+void Performance::QueueNotificationObserversTask() {
+  if (!mPendingNotificationObserversTask) {
+    RunNotificationObserversTask();
+  }
+}
+
+void Performance::RunNotificationObserversTask() {
+  mPendingNotificationObserversTask = true;
+  nsCOMPtr<nsIRunnable> task = new NotifyObserversTask(this);
+  nsresult rv;
+  if (nsIGlobalObject* global = GetRelevantGlobal()) {
+    rv = global->Dispatch(task.forget());
+  } else {
+    rv = NS_DispatchToCurrentThread(task.forget());
+  }
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    mPendingNotificationObserversTask = false;
+  }
+}
+
+void Performance::QueueEntry(PerformanceEntry* aEntry) {
+  nsTObserverArray<PerformanceObserver*> interestedObservers;
+  if (!mObservers.IsEmpty()) {
+    const auto [begin, end] = mObservers.NonObservingRange();
+    std::copy_if(begin, end, MakeBackInserter(interestedObservers),
+                 [&](PerformanceObserver* observer) {
+                   return observer->ObservesTypeOfEntry(aEntry);
+                 });
+  }
+
+  NS_OBSERVER_ARRAY_NOTIFY_XPCOM_OBSERVERS(interestedObservers, QueueEntry,
+                                           (aEntry));
+
+  aEntry->BufferEntryIfNeeded();
+
+  if (!interestedObservers.IsEmpty()) {
+    QueueNotificationObserversTask();
+  }
+}
+
+void Performance::MemoryPressure() {}
+
+size_t Performance::SizeOfUserEntries(
+    mozilla::MallocSizeOf aMallocSizeOf) const {
+  size_t userEntries = 0;
+  for (const PerformanceEntry* entry : mUserEntries) {
+    userEntries += entry->SizeOfIncludingThis(aMallocSizeOf);
+  }
+  return userEntries;
+}
+
+size_t Performance::SizeOfResourceEntries(
+    mozilla::MallocSizeOf aMallocSizeOf) const {
+  size_t resourceEntries = 0;
+  for (const PerformanceEntry* entry : mResourceEntries) {
+    resourceEntries += entry->SizeOfIncludingThis(aMallocSizeOf);
+  }
+  return resourceEntries;
+}
+
+}  

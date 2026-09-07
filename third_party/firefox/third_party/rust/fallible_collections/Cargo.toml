@@ -1,0 +1,42 @@
+
+[package]
+edition = "2021"
+rust-version = "1.64"
+name = "fallible_collections"
+version = "0.5.1"
+authors = ["vcombey <vcombey@student.42.fr>"]
+build = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "a crate which adds fallible allocation api to std collections"
+keywords = [
+    "fallible",
+    "allocation",
+    "collections",
+    "oom",
+    "try-reserve",
+]
+categories = [
+    "rust-patterns",
+    "memory-management",
+]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/vcombey/fallible_collections.git"
+
+[lib]
+name = "fallible_collections"
+path = "src/lib.rs"
+
+[dependencies.hashbrown]
+version = "0.14"
+optional = true
+
+[features]
+default = ["hashmap"]
+hashmap = ["dep:hashbrown"]
+rust_1_57 = []
+std = []
+std_io = ["std"]
+unstable = []

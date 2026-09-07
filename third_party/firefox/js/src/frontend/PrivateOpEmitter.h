@@ -1,0 +1,120 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef frontend_PrivateOpEmitter_h
+#define frontend_PrivateOpEmitter_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/Maybe.h"
+
+#include <stddef.h>
+
+#include "frontend/NameAnalysisTypes.h"  // NameLocation
+#include "frontend/ParserAtom.h"         // TaggedParserAtomIndex
+
+namespace js {
+namespace frontend {
+
+struct BytecodeEmitter;
+enum class ValueUsage;
+
+class MOZ_STACK_CLASS PrivateOpEmitter {
+ public:
+  enum class Kind {
+    Get,
+    Call,
+    Delete,
+    PostIncrement,
+    PreIncrement,
+    PostDecrement,
+    PreDecrement,
+    SimpleAssignment,
+    PropInit,
+    CompoundAssignment,
+    ErgonomicBrandCheck,
+  };
+
+ private:
+  BytecodeEmitter* bce_;
+
+  Kind kind_;
+
+  TaggedParserAtomIndex name_;
+
+  mozilla::Maybe<NameLocation> loc_;
+
+  mozilla::Maybe<NameLocation> brandLoc_{};
+
+#ifdef DEBUG
+  enum class State {
+    Start,
+
+    Reference,
+
+    Get,
+
+    Assignment,
+  };
+  State state_ = State::Start;
+#endif
+
+ public:
+  PrivateOpEmitter(BytecodeEmitter* bce, Kind kind, TaggedParserAtomIndex name);
+
+ private:
+  [[nodiscard]] bool isCall() const { return kind_ == Kind::Call; }
+
+  [[nodiscard]] bool isSimpleAssignment() const {
+    return kind_ == Kind::SimpleAssignment;
+  }
+
+  [[nodiscard]] bool isFieldInit() const { return kind_ == Kind::PropInit; }
+
+  [[nodiscard]] bool isBrandCheck() const {
+    return kind_ == Kind::ErgonomicBrandCheck;
+  }
+
+  [[nodiscard]] bool isCompoundAssignment() const {
+    return kind_ == Kind::CompoundAssignment;
+  }
+
+  [[nodiscard]] bool isIncDec() const {
+    return isPostIncDec() || isPreIncDec();
+  }
+
+  [[nodiscard]] bool isPostIncDec() const {
+    return kind_ == Kind::PostIncrement || kind_ == Kind::PostDecrement;
+  }
+
+  [[nodiscard]] bool isPreIncDec() const {
+    return kind_ == Kind::PreIncrement || kind_ == Kind::PreDecrement;
+  }
+
+  [[nodiscard]] bool isInc() const {
+    return kind_ == Kind::PostIncrement || kind_ == Kind::PreIncrement;
+  }
+
+  [[nodiscard]] bool init();
+
+  [[nodiscard]] bool emitLoad(TaggedParserAtomIndex name,
+                              const NameLocation& loc);
+
+  [[nodiscard]] bool emitLoadPrivateBrand();
+
+ public:
+  [[nodiscard]] bool emitBrandCheck();
+
+  [[nodiscard]] bool emitReference();
+  [[nodiscard]] bool emitGet();
+  [[nodiscard]] bool emitGetForCallOrNew();
+  [[nodiscard]] bool emitAssignment();
+  [[nodiscard]] bool emitIncDec(ValueUsage valueUsage);
+
+  size_t numReferenceSlots() const { return 2; }
+};
+
+} 
+} 
+
+#endif /* frontend_PrivateOpEmitter_h */

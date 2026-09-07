@@ -1,0 +1,506 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
+
+function elideMiddleOfString(str, threshold) {
+  const searchDistance = 5;
+  const stubLength = threshold / 2 - searchDistance;
+  if (str.length <= threshold || stubLength < searchDistance) {
+    return str;
+  }
+
+  function searchElisionPoint(position) {
+    let unsplittableCharacter = c => /[\p{M}\uDC00-\uDFFF]/u.test(c);
+    for (let i = 0; i < searchDistance; i++) {
+      if (!unsplittableCharacter(str[position + i])) {
+        return position + i;
+      }
+
+      if (!unsplittableCharacter(str[position - i])) {
+        return position - i;
+      }
+    }
+    return position;
+  }
+
+  let elisionStart = searchElisionPoint(stubLength);
+  let elisionEnd = searchElisionPoint(str.length - stubLength);
+  if (elisionStart < elisionEnd) {
+    str = str.slice(0, elisionStart) + "\u2026" + str.slice(elisionEnd);
+  }
+  return str;
+}
+
+
+export var ProcessHangMonitor = {
+  get WAIT_EXPIRATION_TIME() {
+    try {
+      return Services.prefs.getIntPref("browser.hangNotification.waitPeriod");
+    } catch (ex) {
+      return 10000;
+    }
+  },
+
+  _shuttingDown: false,
+
+  _activeReports: new Map(),
+
+  _pausedReports: new Map(),
+
+  init() {
+    Services.obs.addObserver(this, "process-hang-report");
+    Services.obs.addObserver(this, "clear-hang-report");
+    Services.obs.addObserver(this, "quit-application-granted");
+    Services.obs.addObserver(this, "xpcom-shutdown");
+    Services.ww.registerNotification(this);
+  },
+
+  terminateScript(win) {
+    this.handleUserInput(win, report => report.terminateScript());
+  },
+
+  debugScript(win) {
+    this.handleUserInput(win, report => {
+      function callback() {
+        report.endStartingDebugger();
+      }
+
+      this._recordTelemetryForReport(report, "debugging");
+      report.beginStartingDebugger();
+
+      let svc = Cc["@mozilla.org/dom/slow-script-debug;1"].getService(
+        Ci.nsISlowScriptDebug
+      );
+      let handler = svc.remoteActivationHandler;
+      handler.handleSlowScriptDebug(report.scriptBrowser, callback);
+    });
+  },
+
+  stopIt(win) {
+    let report = this.findActiveReport(win.gBrowser.selectedBrowser);
+    if (!report) {
+      return;
+    }
+
+    this._recordTelemetryForReport(report, "user-aborted");
+    this.terminateScript(win);
+  },
+
+  stopHang(report, endReason, backupInfo) {
+    this._recordTelemetryForReport(report, endReason, backupInfo);
+    report.terminateScript();
+  },
+
+  waitLonger(win) {
+    let report = this.findActiveReport(win.gBrowser.selectedBrowser);
+    if (!report) {
+      return;
+    }
+    let reportInfo = this._activeReports.get(report);
+    reportInfo.waitCount++;
+
+    this.removeActiveReport(report);
+
+
+    let timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+    timer.initWithCallback(
+      () => {
+        for (let [stashedReport, pausedInfo] of this._pausedReports) {
+          if (pausedInfo.timer === timer) {
+            this.removePausedReport(stashedReport);
+
+            this._activeReports.set(report, pausedInfo);
+            this.updateWindows();
+            break;
+          }
+        }
+      },
+      this.WAIT_EXPIRATION_TIME,
+      timer.TYPE_ONE_SHOT
+    );
+
+    reportInfo.timer = timer;
+    this._pausedReports.set(report, reportInfo);
+
+    this.updateWindows();
+  },
+
+  handleUserInput(win, func) {
+    let report = this.findActiveReport(win.gBrowser.selectedBrowser);
+    if (!report) {
+      return null;
+    }
+    this.removeActiveReport(report);
+
+    return func(report);
+  },
+
+  observe(subject, topic) {
+    switch (topic) {
+      case "xpcom-shutdown": {
+        Services.obs.removeObserver(this, "xpcom-shutdown");
+        Services.obs.removeObserver(this, "process-hang-report");
+        Services.obs.removeObserver(this, "clear-hang-report");
+        Services.obs.removeObserver(this, "quit-application-granted");
+        Services.ww.unregisterNotification(this);
+        break;
+      }
+
+      case "quit-application-granted": {
+        this.onQuitApplicationGranted();
+        break;
+      }
+
+      case "process-hang-report": {
+        this.reportHang(subject.QueryInterface(Ci.nsIHangReport));
+        break;
+      }
+
+      case "clear-hang-report": {
+        this.clearHang(subject.QueryInterface(Ci.nsIHangReport));
+        break;
+      }
+
+      case "domwindowopened": {
+        let win = subject;
+        let listener = () => {
+          win.removeEventListener("load", listener, true);
+          this.updateWindows();
+        };
+        win.addEventListener("load", listener, true);
+        break;
+      }
+
+      case "domwindowclosed": {
+        let win = subject;
+        this.onWindowClosed(win);
+        break;
+      }
+    }
+  },
+
+  onQuitApplicationGranted() {
+    this._shuttingDown = true;
+    this.stopAllHangs("quit-application-granted");
+    this.updateWindows();
+  },
+
+  onWindowClosed(win) {
+    let maybeStopHang = report => {
+      let hungBrowserWindow = null;
+      try {
+        hungBrowserWindow = report.scriptBrowser.documentGlobal;
+      } catch (e) {
+      }
+      if (!hungBrowserWindow || hungBrowserWindow == win) {
+        this.stopHang(report, "window-closed");
+        return true;
+      }
+      return false;
+    };
+
+    for (let [report] of this._activeReports) {
+      if (maybeStopHang(report)) {
+        this._activeReports.delete(report);
+      }
+    }
+
+    for (let [pausedReport] of this._pausedReports) {
+      if (maybeStopHang(pausedReport)) {
+        this.removePausedReport(pausedReport);
+      }
+    }
+
+    this.updateWindows();
+  },
+
+  stopAllHangs(endReason) {
+    for (let [report] of this._activeReports) {
+      this.stopHang(report, endReason);
+    }
+
+    this._activeReports = new Map();
+
+    for (let [pausedReport] of this._pausedReports) {
+      this.stopHang(pausedReport, endReason);
+      this.removePausedReport(pausedReport);
+    }
+  },
+
+  findActiveReport(browser) {
+    let frameLoader = browser.frameLoader;
+    for (let report of this._activeReports.keys()) {
+      if (report.isReportForBrowserOrChildren(frameLoader)) {
+        return report;
+      }
+    }
+    return null;
+  },
+
+  findPausedReport(browser) {
+    let frameLoader = browser.frameLoader;
+    for (let [report] of this._pausedReports) {
+      if (report.isReportForBrowserOrChildren(frameLoader)) {
+        return report;
+      }
+    }
+    return null;
+  },
+
+  _recordTelemetryForReport(report, endReason, backupInfo) {
+    let info =
+      this._activeReports.get(report) ||
+      this._pausedReports.get(report) ||
+      backupInfo;
+    if (!info) {
+      return;
+    }
+    try {
+      let uri_type;
+      if (report.scriptFileName?.startsWith("debugger")) {
+        uri_type = "devtools";
+      } else {
+        try {
+          let url = new URL(report.scriptFileName);
+          if (url.protocol == "chrome:" || url.protocol == "resource:") {
+            uri_type = "browser";
+          } else {
+            uri_type = "content";
+          }
+        } catch (ex) {
+          console.error(ex);
+          uri_type = "unknown";
+        }
+      }
+      let uptime = 0;
+      if (info.notificationTime) {
+        uptime = ChromeUtils.now() - info.notificationTime;
+      }
+      uptime = "" + uptime;
+      let hangDuration =
+        report.hangDuration + ChromeUtils.now() - info.lastReportFromChild;
+    } catch (ex) {
+      console.error(ex);
+    }
+  },
+
+  removeActiveReport(report) {
+    this._activeReports.delete(report);
+    this.updateWindows();
+  },
+
+  removePausedReport(report) {
+    let info = this._pausedReports.get(report);
+    info?.timer?.cancel();
+    this._pausedReports.delete(report);
+  },
+
+  updateWindows() {
+    let e = Services.wm.getEnumerator("navigator:browser");
+
+    if (!e.hasMoreElements()) {
+      this.stopAllHangs("no-windows-left");
+      return;
+    }
+
+    for (let win of e) {
+      this.updateWindow(win);
+
+      if (this._activeReports.size) {
+        this.trackWindow(win);
+      } else {
+        this.untrackWindow(win);
+      }
+    }
+  },
+
+  updateWindow(win) {
+    let report = this.findActiveReport(win.gBrowser.selectedBrowser);
+
+    if (report) {
+      let info = this._activeReports.get(report);
+      if (info && !info.notificationTime) {
+        info.notificationTime = ChromeUtils.now();
+      }
+      this.showNotification(win, report);
+    } else {
+      this.hideNotification(win);
+    }
+  },
+
+  async showNotification(win, report) {
+    let bundle = win.gNavigatorBundle;
+
+    let buttons = [
+      {
+        label: bundle.getString("processHang.button_stop2.label"),
+        accessKey: bundle.getString("processHang.button_stop2.accessKey"),
+        callback() {
+          ProcessHangMonitor.stopIt(win);
+        },
+      },
+    ];
+
+    let message;
+    let doc = win.document;
+    let brandShortName = doc
+      .getElementById("bundle_brand")
+      .getString("brandShortName");
+    let notificationTag;
+    let scriptBrowser = report.scriptBrowser;
+    if (scriptBrowser == win.gBrowser?.selectedBrowser) {
+      notificationTag = "selected-tab";
+      message = bundle.getFormattedString("processHang.selected_tab.label", [
+        brandShortName,
+      ]);
+    } else {
+      let tab =
+        scriptBrowser?.documentGlobal.gBrowser?.getTabForBrowser(scriptBrowser);
+      if (!tab) {
+        notificationTag = "nonspecific_tab";
+        message = bundle.getFormattedString(
+          "processHang.nonspecific_tab.label",
+          [brandShortName]
+        );
+      } else {
+        notificationTag = scriptBrowser.browserId.toString();
+        let title = tab.getAttribute("label");
+        title = elideMiddleOfString(title, 60);
+        message = bundle.getFormattedString("processHang.specific_tab.label", [
+          title,
+          brandShortName,
+        ]);
+      }
+    }
+
+    let notification =
+      win.gNotificationBox.getNotificationWithValue("process-hang");
+    if (notificationTag == notification?.getAttribute("notification-tag")) {
+      return;
+    }
+
+    if (notification) {
+      notification.label = message;
+      notification.setAttribute("notification-tag", notificationTag);
+      return;
+    }
+
+    if (
+      AppConstants.MOZ_DEV_EDITION ||
+      AppConstants.NIGHTLY_BUILD ||
+      report.scriptBrowser.browsingContext.watchedByDevTools
+    ) {
+      buttons.push({
+        label: bundle.getString("processHang.button_debug.label"),
+        accessKey: bundle.getString("processHang.button_debug.accessKey"),
+        callback() {
+          ProcessHangMonitor.debugScript(win);
+        },
+      });
+    }
+
+    try {
+      let hangNotification = await win.gNotificationBox.appendNotification(
+        "process-hang",
+        {
+          label: message,
+          image: "chrome://browser/content/aboutRobots-icon.png",
+          priority: win.gNotificationBox.PRIORITY_INFO_HIGH,
+          eventCallback: event => {
+            if (event == "dismissed") {
+              ProcessHangMonitor.waitLonger(win);
+            }
+          },
+        },
+        buttons
+      );
+      hangNotification.setAttribute("notification-tag", notificationTag);
+    } catch (err) {
+      console.warn(err);
+    }
+  },
+
+  hideNotification(win) {
+    let notification =
+      win.gNotificationBox.getNotificationWithValue("process-hang");
+    if (notification) {
+      win.gNotificationBox.removeNotification(notification);
+    }
+  },
+
+  trackWindow(win) {
+    win.gBrowser.tabContainer.addEventListener("TabSelect", this, true);
+    win.gBrowser.tabContainer.addEventListener(
+      "TabRemotenessChange",
+      this,
+      true
+    );
+  },
+
+  untrackWindow(win) {
+    win.gBrowser.tabContainer.removeEventListener("TabSelect", this, true);
+    win.gBrowser.tabContainer.removeEventListener(
+      "TabRemotenessChange",
+      this,
+      true
+    );
+  },
+
+  handleEvent(event) {
+    let win = event.target.documentGlobal;
+
+    if (event.type == "TabSelect" || event.type == "TabRemotenessChange") {
+      if (event.type == "TabSelect" && event.detail.previousTab) {
+        let r =
+          this.findActiveReport(event.detail.previousTab.linkedBrowser) ||
+          this.findPausedReport(event.detail.previousTab.linkedBrowser);
+        if (r) {
+          let info = this._activeReports.get(r) || this._pausedReports.get(r);
+          info.deselectCount++;
+        }
+      }
+      this.updateWindow(win);
+    }
+  },
+
+  reportHang(report) {
+    let now = ChromeUtils.now();
+    if (this._shuttingDown) {
+      this.stopHang(report, "shutdown-in-progress", {
+        lastReportFromChild: now,
+        waitCount: 0,
+        deselectCount: 0,
+      });
+      return;
+    }
+
+    if (this._activeReports.has(report)) {
+      this._activeReports.get(report).lastReportFromChild = now;
+      this.updateWindows();
+      return;
+    }
+
+    if (this._pausedReports.has(report)) {
+      this._pausedReports.get(report).lastReportFromChild = now;
+      return;
+    }
+
+
+    this._activeReports.set(report, {
+      deselectCount: 0,
+      lastReportFromChild: now,
+      waitCount: 0,
+    });
+    this.updateWindows();
+  },
+
+  clearHang(report) {
+    this._recordTelemetryForReport(report, "cleared");
+
+    this.removeActiveReport(report);
+    this.removePausedReport(report);
+    report.userCanceled();
+  },
+};

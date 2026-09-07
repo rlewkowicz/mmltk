@@ -1,0 +1,86 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef nsILineIterator_h_
+#define nsILineIterator_h_
+
+#include "mozilla/Attributes.h"
+#include "mozilla/Result.h"
+#include "mozilla/WritingModes.h"
+#include "nsINode.h"
+#include "nsRect.h"
+#include "nscore.h"
+
+class nsIFrame;
+
+class nsILineIterator {
+ protected:
+  ~nsILineIterator() = default;
+
+ public:
+  virtual int32_t GetNumLines() const = 0;
+
+  virtual bool IsLineIteratorFlowRTL() = 0;
+
+  struct LineInfo {
+    nsIFrame* mFirstFrameOnLine = nullptr;
+    int32_t mNumFramesOnLine = 0;
+    nsRect mLineBounds;
+    bool mIsWrapped = false;
+
+    nsIFrame* GetLastFrameOnLine() const;
+  };
+
+  virtual mozilla::Result<LineInfo, nsresult> GetLine(int32_t aLineNumber) = 0;
+
+  virtual int32_t FindLineContaining(const nsIFrame* aFrame,
+                                     int32_t aStartLine = 0) = 0;
+
+  NS_IMETHOD FindFrameAt(int32_t aLineNumber, nsPoint aPos,
+                         nsIFrame** aFrameFound, bool* aPosIsBeforeFirstFrame,
+                         bool* aPosIsAfterLastFrame) = 0;
+
+  NS_IMETHOD CheckLineOrder(int32_t aLine, bool* aIsReordered,
+                            nsIFrame** aFirstVisual,
+                            nsIFrame** aLastVisual) = 0;
+};
+
+namespace mozilla {
+
+struct LineFrameFinder {
+  LineFrameFinder(const nsPoint& aPos, const nsSize& aContainerSize,
+                  WritingMode aWM, bool aIsReversed)
+      : mPos(aWM, aPos, aContainerSize),
+        mContainerSize(aContainerSize),
+        mWM(aWM),
+        mIsReversed(aIsReversed) {}
+
+  void Scan(nsIFrame*);
+  void Finish(nsIFrame**, bool* aPosIsBeforeFirstFrame,
+              bool* aPosIsAfterLastFrame);
+
+  const LogicalPoint mPos;
+  const nsSize mContainerSize;
+  const WritingMode mWM;
+  const bool mIsReversed;
+
+  bool IsDone() const { return mDone; }
+
+ private:
+  bool mDone = false;
+  nsIFrame* mFirstFrame = nullptr;
+  nsIFrame* mClosestFromStart = nullptr;
+  nsIFrame* mClosestFromEnd = nullptr;
+};
+
+}  
+
+class MOZ_RAII AutoAssertNoDomMutations final {
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+  nsMutationGuard mGuard;
+#endif
+ public:
+  ~AutoAssertNoDomMutations() { MOZ_DIAGNOSTIC_ASSERT(!mGuard.Mutated(0)); }
+};
+
+#endif /* nsILineIterator_h_ */

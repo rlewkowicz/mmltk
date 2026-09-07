@@ -1,0 +1,70 @@
+/*
+ * Copyright (c) 2022, Alliance for Open Media. All rights reserved.
+ *
+ * This source code is subject to the terms of the BSD 2 Clause License and
+ * the Alliance for Open Media Patent License 1.0. If the BSD 2 Clause License
+ * was not distributed with this source code in the LICENSE file, you can
+ * obtain it at www.aomedia.org/license/software. If the Alliance for Open
+ * Media Patent License 1.0 was not distributed with this source code in the
+ * PATENTS file, you can obtain it at www.aomedia.org/license/patent.
+ */
+
+#if !defined(AOM_AV1_ENCODER_MCOMP_STRUCTS_H_)
+#define AOM_AV1_ENCODER_MCOMP_STRUCTS_H_
+
+#include "av1/common/mv.h"
+
+#define MAX_MVSEARCH_STEPS 11
+#define MAX_FULL_PEL_VAL ((1 << (MAX_MVSEARCH_STEPS - 1)) - 1)
+#define MAX_FIRST_STEP (1 << (MAX_MVSEARCH_STEPS - 1))
+#define MAX_WARP_SEARCH_NEIGHBORS 8
+
+#define SEARCH_RANGE_8P 3
+#define SEARCH_GRID_STRIDE_8P (2 * SEARCH_RANGE_8P + 1)
+#define SEARCH_GRID_CENTER_8P \
+  (SEARCH_RANGE_8P * SEARCH_GRID_STRIDE_8P + SEARCH_RANGE_8P)
+
+typedef struct {
+  FULLPEL_MV coord;
+  int coord_offset;
+} search_neighbors;
+typedef struct search_site {
+  FULLPEL_MV mv;
+  int offset;
+} search_site;
+
+typedef struct search_site_config {
+  search_site site[MAX_MVSEARCH_STEPS * 2][16 + 1];
+  int num_search_steps;
+  int searches_per_step[MAX_MVSEARCH_STEPS * 2];
+  int radius[MAX_MVSEARCH_STEPS * 2];
+  int stride;
+} search_site_config;
+
+enum {
+  DIAMOND = 0,
+  NSTEP = 1,
+  NSTEP_8PT = 2,
+  CLAMPED_DIAMOND = 3,
+  HEX = 4,
+  BIGDIA = 5,
+  FAST_DIAMOND = 6,
+  FAST_BIGDIA = 7,
+  VFAST_DIAMOND = 8,
+  NUM_SEARCH_METHODS,
+  NUM_DISTINCT_SEARCH_METHODS = BIGDIA + 1,
+} UENUM1BYTE(SEARCH_METHODS);
+
+typedef struct warp_search_config {
+  int num_neighbors;
+  MV neighbors[MAX_WARP_SEARCH_NEIGHBORS];
+  uint8_t neighbor_mask[MAX_WARP_SEARCH_NEIGHBORS];
+} warp_search_config;
+
+enum {
+  WARP_SEARCH_DIAMOND,
+  WARP_SEARCH_SQUARE,
+  WARP_SEARCH_METHODS
+} UENUM1BYTE(WARP_SEARCH_METHOD);
+
+#endif

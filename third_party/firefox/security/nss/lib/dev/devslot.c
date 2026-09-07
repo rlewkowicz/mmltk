@@ -1,0 +1,281 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "pkcs11.h"
+
+#ifndef DEVM_H
+#include "devm.h"
+#endif /* DEVM_H */
+
+#ifndef CKHELPER_H
+#include "ckhelper.h"
+#endif /* CKHELPER_H */
+
+#include "pkim.h"
+#include "dev3hack.h"
+#include "pk11func.h"
+
+#define NSSSLOT_TOKEN_DELAY_TIME 1
+
+
+#define NSSSLOT_IS_FRIENDLY(slot) \
+    (slot->base.flags & NSSSLOT_FLAGS_FRIENDLY)
+
+static PRIntervalTime s_token_delay_time = 0;
+
+NSS_IMPLEMENT PRStatus
+nssSlot_Destroy(
+    NSSSlot *slot)
+{
+    if (slot) {
+        if (PR_ATOMIC_DECREMENT(&slot->base.refCount) == 0) {
+            PK11_FreeSlot(slot->pk11slot);
+            PR_DestroyLock(slot->base.lock);
+            PR_DestroyCondVar(slot->isPresentCondition);
+            PR_DestroyLock(slot->isPresentLock);
+            return nssArena_Destroy(slot->base.arena);
+        }
+    }
+    return PR_SUCCESS;
+}
+
+void
+nssSlot_EnterMonitor(NSSSlot *slot)
+{
+    if (slot->lock) {
+        PR_Lock(slot->lock);
+    }
+}
+
+void
+nssSlot_ExitMonitor(NSSSlot *slot)
+{
+    if (slot->lock) {
+        PR_Unlock(slot->lock);
+    }
+}
+
+NSS_IMPLEMENT void
+NSSSlot_Destroy(
+    NSSSlot *slot)
+{
+    (void)nssSlot_Destroy(slot);
+}
+
+NSS_IMPLEMENT NSSSlot *
+nssSlot_AddRef(
+    NSSSlot *slot)
+{
+    PR_ATOMIC_INCREMENT(&slot->base.refCount);
+    return slot;
+}
+
+NSS_IMPLEMENT NSSUTF8 *
+nssSlot_GetName(
+    NSSSlot *slot)
+{
+    return slot->base.name;
+}
+
+NSS_IMPLEMENT void
+nssSlot_ResetDelay(
+    NSSSlot *slot)
+{
+    PR_Lock(slot->isPresentLock);
+    slot->lastTokenPingState = nssSlotLastPingState_Reset;
+    PR_Unlock(slot->isPresentLock);
+}
+
+static PRBool
+token_status_checked(const NSSSlot *slot)
+{
+    PRIntervalTime time;
+    int lastPingState = slot->lastTokenPingState;
+    if (slot->isPresentThread == PR_GetCurrentThread()) {
+        return PR_TRUE;
+    }
+    if (s_token_delay_time == 0) {
+        s_token_delay_time = PR_SecondsToInterval(NSSSLOT_TOKEN_DELAY_TIME);
+    }
+    time = PR_IntervalNow();
+    if ((lastPingState == nssSlotLastPingState_Valid) && ((time - slot->lastTokenPingTime) < s_token_delay_time)) {
+        return PR_TRUE;
+    }
+    return PR_FALSE;
+}
+
+NSS_IMPLEMENT PRBool
+nssSlot_IsTokenPresent(
+    NSSSlot *slot)
+{
+    CK_RV ckrv;
+    PRStatus nssrv;
+    NSSToken *nssToken = NULL;
+    nssSession *session;
+    CK_SLOT_INFO slotInfo;
+    void *epv;
+    PRBool isPresent = PR_FALSE;
+    PRBool doUpdateCachedCerts = PR_FALSE;
+
+    if (nssSlot_IsPermanent(slot)) {
+        return !PK11_IsDisabled(slot->pk11slot);
+    }
+
+    PR_Lock(slot->isPresentLock);
+    if (token_status_checked(slot)) {
+        CK_FLAGS ckFlags = slot->ckFlags;
+        PR_Unlock(slot->isPresentLock);
+        return ((ckFlags & CKF_TOKEN_PRESENT) != 0);
+    }
+    PR_Unlock(slot->isPresentLock);
+
+    epv = slot->epv;
+    if (!epv) {
+        return PR_FALSE;
+    }
+
+    PR_Lock(slot->isPresentLock);
+    while (slot->isPresentThread) {
+        PR_WaitCondVar(slot->isPresentCondition, PR_INTERVAL_NO_TIMEOUT);
+    }
+    if (token_status_checked(slot)) {
+        CK_FLAGS ckFlags = slot->ckFlags;
+        PR_Unlock(slot->isPresentLock);
+        return ((ckFlags & CKF_TOKEN_PRESENT) != 0);
+    }
+    slot->lastTokenPingState = nssSlotLastPingState_Update;
+    slot->isPresentThread = PR_GetCurrentThread();
+
+    PR_Unlock(slot->isPresentLock);
+
+    nssToken = PK11Slot_GetNSSToken(slot->pk11slot);
+    if (!nssToken) {
+        isPresent = PR_FALSE;
+        goto done;
+    }
+
+    if (PK11_GetSlotInfo(slot->pk11slot, &slotInfo) != SECSuccess) {
+        nssToken->base.name[0] = 0; 
+        isPresent = PR_FALSE;
+        goto done;
+    }
+    slot->ckFlags = slotInfo.flags;
+    if ((slot->ckFlags & CKF_TOKEN_PRESENT) == 0) {
+        session = nssToken_GetDefaultSession(nssToken);
+        if (session) {
+            nssSession_EnterMonitor(session);
+            if (session->handle != CK_INVALID_HANDLE) {
+                CKAPI(epv)
+                    ->C_CloseSession(session->handle);
+                session->handle = CK_INVALID_HANDLE;
+            }
+            nssSession_ExitMonitor(session);
+        }
+        if (nssToken->base.name[0] != 0) {
+            nssToken->base.name[0] = 0; 
+            nssToken_NotifyCertsNotVisible(nssToken);
+        }
+        nssToken->base.name[0] = 0; 
+        nssToken_Remove(nssToken);
+        isPresent = PR_FALSE;
+        goto done;
+    }
+    session = nssToken_GetDefaultSession(nssToken);
+    if (session) {
+        PRBool tokenRemoved;
+        nssSession_EnterMonitor(session);
+        if (session->handle != CK_INVALID_HANDLE) {
+            CK_SESSION_INFO sessionInfo;
+            ckrv = CKAPI(epv)->C_GetSessionInfo(session->handle, &sessionInfo);
+            if (ckrv != CKR_OK) {
+                CKAPI(epv)
+                    ->C_CloseSession(session->handle);
+                session->handle = CK_INVALID_HANDLE;
+            }
+        }
+        tokenRemoved = (session->handle == CK_INVALID_HANDLE);
+        nssSession_ExitMonitor(session);
+        if (!tokenRemoved) {
+            isPresent = PR_TRUE;
+            goto done;
+        }
+    }
+    nssToken_NotifyCertsNotVisible(nssToken);
+    nssToken_Remove(nssToken);
+    if (nssToken->base.name[0] == 0) {
+        doUpdateCachedCerts = PR_TRUE;
+    }
+    if (PK11_InitToken(slot->pk11slot, PR_FALSE) != SECSuccess) {
+        isPresent = PR_FALSE;
+        goto done;
+    }
+    if (doUpdateCachedCerts) {
+        nssTrustDomain_UpdateCachedTokenCerts(nssToken->trustDomain,
+                                              nssToken);
+    }
+    nssrv = nssToken_Refresh(nssToken);
+    if (nssrv != PR_SUCCESS) {
+        nssToken->base.name[0] = 0; 
+        slot->ckFlags &= ~CKF_TOKEN_PRESENT;
+        isPresent = PR_FALSE;
+        goto done;
+    }
+    isPresent = PR_TRUE;
+done:
+    if (nssToken) {
+        (void)nssToken_Destroy(nssToken);
+    }
+    PR_Lock(slot->isPresentLock);
+    if (slot->lastTokenPingState == nssSlotLastPingState_Update) {
+        slot->lastTokenPingTime = PR_IntervalNow();
+        slot->lastTokenPingState = nssSlotLastPingState_Valid;
+    }
+    slot->isPresentThread = NULL;
+    PR_NotifyAllCondVar(slot->isPresentCondition);
+    PR_Unlock(slot->isPresentLock);
+    return isPresent;
+}
+
+NSS_IMPLEMENT void *
+nssSlot_GetCryptokiEPV(
+    NSSSlot *slot)
+{
+    return slot->epv;
+}
+
+NSS_IMPLEMENT NSSToken *
+nssSlot_GetToken(
+    NSSSlot *slot)
+{
+    NSSToken *rvToken = NULL;
+
+    if (nssSlot_IsTokenPresent(slot)) {
+        rvToken = PK11Slot_GetNSSToken(slot->pk11slot);
+    }
+
+    return rvToken;
+}
+
+NSS_IMPLEMENT PRStatus
+nssSession_EnterMonitor(
+    nssSession *s)
+{
+    if (s->lock)
+        PR_Lock(s->lock);
+    return PR_SUCCESS;
+}
+
+NSS_IMPLEMENT PRStatus
+nssSession_ExitMonitor(
+    nssSession *s)
+{
+    return (s->lock) ? PR_Unlock(s->lock) : PR_SUCCESS;
+}
+
+NSS_EXTERN PRBool
+nssSession_IsReadWrite(
+    nssSession *s)
+{
+    return s->isRW;
+}

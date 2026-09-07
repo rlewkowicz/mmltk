@@ -1,0 +1,52 @@
+/*
+ * Copyright 2016 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkScaleToSides_DEFINED)
+#define SkScaleToSides_DEFINED
+
+#include "include/core/SkScalar.h"
+#include "include/core/SkTypes.h"
+
+#include <cmath>
+#include <utility>
+
+class SkScaleToSides {
+public:
+    static void AdjustRadii(double limit, double scale, SkScalar* a, SkScalar* b) {
+        SkASSERTF(scale < 1.0 && scale > 0.0, "scale: %g", scale);
+
+        *a = (float)((double)*a * scale);
+        *b = (float)((double)*b * scale);
+
+        if (*a + *b > limit) {
+            float* minRadius = a;
+            float* maxRadius = b;
+
+            if (*minRadius > *maxRadius) {
+                using std::swap;
+                swap(minRadius, maxRadius);
+            }
+
+            float newMinRadius = *minRadius;
+
+            float newMaxRadius = (float)(limit - newMinRadius);
+
+            while (newMaxRadius + newMinRadius > limit) {
+                newMaxRadius = nextafterf(newMaxRadius, 0.0f);
+            }
+            *maxRadius = newMaxRadius;
+        }
+
+        SkASSERTF(*a >= 0.0f && *b >= 0.0f, "a: %g, b: %g, limit: %g, scale: %g", *a, *b, limit,
+                  scale);
+
+        SkASSERTF(*a + *b <= limit,
+                  "\nlimit: %.17f, sum: %.17f, a: %.10f, b: %.10f, scale: %.20f",
+                  limit, *a + *b, *a, *b, scale);
+    }
+};
+#endif

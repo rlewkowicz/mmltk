@@ -1,0 +1,739 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+var BrowserPageActions = {
+  _panelNode: null,
+  get mainButtonNode() {
+    delete this.mainButtonNode;
+    return (this.mainButtonNode = document.getElementById("pageActionButton"));
+  },
+
+  get panelNode() {
+    if (!this._panelNode) {
+      this.initializePanel();
+    }
+    delete this.panelNode;
+    return (this.panelNode = this._panelNode);
+  },
+
+  get multiViewNode() {
+    delete this.multiViewNode;
+    return (this.multiViewNode = document.getElementById(
+      "pageActionPanelMultiView"
+    ));
+  },
+
+  get mainViewNode() {
+    delete this.mainViewNode;
+    return (this.mainViewNode = document.getElementById(
+      "pageActionPanelMainView"
+    ));
+  },
+
+  get mainViewBodyNode() {
+    delete this.mainViewBodyNode;
+    return (this.mainViewBodyNode = this.mainViewNode.querySelector(
+      ".panel-subview-body"
+    ));
+  },
+
+  init() {
+    this.placeAllActionsInUrlbar();
+    this._onPanelShowing = this._onPanelShowing.bind(this);
+  },
+
+  _onPanelShowing() {
+    this.initializePanel();
+    for (let action of PageActions.actionsInPanel(window)) {
+      let buttonNode = this.panelButtonNodeForActionID(action.id);
+      action.onShowingInPanel(buttonNode);
+    }
+  },
+
+  placeLazyActionsInPanel() {
+    let actions = this._actionsToLazilyPlaceInPanel;
+    this._actionsToLazilyPlaceInPanel = [];
+    for (let action of actions) {
+      this._placeActionInPanelNow(action);
+    }
+  },
+
+  _actionsToLazilyPlaceInPanel: [],
+
+  placeAllActionsInUrlbar() {
+    let urlbarActions = PageActions.actionsInUrlbar(window);
+    for (let action of urlbarActions) {
+      this.placeActionInUrlbar(action);
+    }
+    this._updateMainButtonAttributes();
+  },
+
+  initializePanel() {
+    if (!this._panelNode) {
+      let template = document.getElementById("pageActionPanelTemplate");
+      template.replaceWith(template.content);
+      this._panelNode = document.getElementById("pageActionPanel");
+      this._panelNode.addEventListener("popupshowing", this._onPanelShowing);
+    }
+
+    for (let action of PageActions.actionsInPanel(window)) {
+      this.placeActionInPanel(action);
+    }
+    this.placeLazyActionsInPanel();
+  },
+
+  placeAction(action) {
+    this.placeActionInPanel(action);
+    this.placeActionInUrlbar(action);
+    this._updateMainButtonAttributes();
+  },
+
+  placeActionInPanel(action) {
+    if (this._panelNode && this.panelNode.state != "closed") {
+      this._placeActionInPanelNow(action);
+    } else {
+      if (
+        this._actionsToLazilyPlaceInPanel.findIndex(a => a.id == action.id) >= 0
+      ) {
+        return;
+      }
+      this._actionsToLazilyPlaceInPanel.push(action);
+    }
+  },
+
+  _placeActionInPanelNow(action) {
+    if (action.shouldShowInPanel(window)) {
+      this._addActionToPanel(action);
+    } else {
+      this._removeActionFromPanel(action);
+    }
+  },
+
+  _addActionToPanel(action) {
+    let id = this.panelButtonNodeIDForActionID(action.id);
+    let node = document.getElementById(id);
+    if (node) {
+      return;
+    }
+    this._maybeNotifyBeforePlacedInWindow(action);
+    node = this._makePanelButtonNodeForAction(action);
+    node.id = id;
+    let insertBeforeNode = this._getNextNode(action, false);
+    this.mainViewBodyNode.insertBefore(node, insertBeforeNode);
+    this.updateAction(action, null, {
+      panelNode: node,
+    });
+    this._updateActionDisabledInPanel(action, node);
+    action.onPlacedInPanel(node);
+    this._addOrRemoveSeparatorsInPanel();
+  },
+
+  _removeActionFromPanel(action) {
+    let lazyIndex = this._actionsToLazilyPlaceInPanel.findIndex(
+      a => a.id == action.id
+    );
+    if (lazyIndex >= 0) {
+      this._actionsToLazilyPlaceInPanel.splice(lazyIndex, 1);
+    }
+    let node = this.panelButtonNodeForActionID(action.id);
+    if (!node) {
+      return;
+    }
+    node.remove();
+    if (action.getWantsSubview(window)) {
+      let panelViewNodeID = this._panelViewNodeIDForActionID(action.id, false);
+      let panelViewNode = document.getElementById(panelViewNodeID);
+      if (panelViewNode) {
+        panelViewNode.remove();
+      }
+    }
+    this._addOrRemoveSeparatorsInPanel();
+  },
+
+  _addOrRemoveSeparatorsInPanel() {
+    let actions = PageActions.actionsInPanel(window);
+    let ids = [
+      PageActions.ACTION_ID_BUILT_IN_SEPARATOR,
+      PageActions.ACTION_ID_TRANSIENT_SEPARATOR,
+    ];
+    for (let id of ids) {
+      let sep = actions.find(a => a.id == id);
+      if (sep) {
+        this._addActionToPanel(sep);
+      } else {
+        let node = this.panelButtonNodeForActionID(id);
+        if (node) {
+          node.remove();
+        }
+      }
+    }
+  },
+
+  _updateMainButtonAttributes() {
+    this.mainButtonNode.toggleAttribute(
+      "multiple-children",
+      PageActions.actions.length > 1
+    );
+  },
+
+  _getNextNode(action, forUrlbar) {
+    let actions = forUrlbar
+      ? PageActions.actionsInUrlbar(window)
+      : PageActions.actionsInPanel(window);
+    let index = actions.findIndex(a => a.id == action.id);
+    if (index < 0) {
+      return null;
+    }
+    for (let i = index + 1; i < actions.length; i++) {
+      let node = forUrlbar
+        ? this.urlbarButtonNodeForActionID(actions[i].id)
+        : this.panelButtonNodeForActionID(actions[i].id);
+      if (node) {
+        return node;
+      }
+    }
+    return null;
+  },
+
+  _maybeNotifyBeforePlacedInWindow(action) {
+    if (!this._isActionPlacedInWindow(action)) {
+      action.onBeforePlacedInWindow(window);
+    }
+  },
+
+  _isActionPlacedInWindow(action) {
+    if (this.panelButtonNodeForActionID(action.id)) {
+      return true;
+    }
+    let urlbarNode = this.urlbarButtonNodeForActionID(action.id);
+    return urlbarNode && !urlbarNode.hidden;
+  },
+
+  _makePanelButtonNodeForAction(action) {
+    if (action.__isSeparator) {
+      let node = document.createXULElement("toolbarseparator");
+      return node;
+    }
+    let buttonNode = document.createXULElement("toolbarbutton");
+    buttonNode.classList.add(
+      "subviewbutton",
+      "subviewbutton-iconic",
+      "pageAction-panel-button"
+    );
+    if (action.isBadged) {
+      buttonNode.setAttribute("badged", "true");
+    }
+    buttonNode.setAttribute("actionid", action.id);
+    buttonNode.addEventListener("command", event => {
+      this.doCommandForAction(action, event, buttonNode);
+    });
+    return buttonNode;
+  },
+
+  _makePanelViewNodeForAction(action, forUrlbar) {
+    let panelViewNode = document.createXULElement("panelview");
+    panelViewNode.id = this._panelViewNodeIDForActionID(action.id, forUrlbar);
+    panelViewNode.classList.add("PanelUI-subView");
+    let bodyNode = document.createXULElement("vbox");
+    bodyNode.id = panelViewNode.id + "-body";
+    bodyNode.classList.add("panel-subview-body");
+    panelViewNode.appendChild(bodyNode);
+    return panelViewNode;
+  },
+
+  togglePanelForAction(action, panelNode = null, event = null) {
+    let aaPanelNode = this.activatedActionPanelNode;
+    if (panelNode) {
+      if (panelNode.state != "closed") {
+        PanelMultiView.hidePopup(panelNode);
+        return;
+      }
+      if (aaPanelNode) {
+        PanelMultiView.hidePopup(aaPanelNode);
+      }
+    } else if (aaPanelNode) {
+      PanelMultiView.hidePopup(aaPanelNode);
+      return;
+    } else {
+      panelNode = this._makeActivatedActionPanelForAction(action);
+    }
+
+    PanelMultiView.hidePopup(this.panelNode);
+
+    let anchorNode = this.panelAnchorNodeForAction(action);
+    PanelMultiView.openPopup(panelNode, anchorNode, {
+      position: "bottomright topright",
+      triggerEvent: event,
+    }).catch(console.error);
+  },
+
+  _makeActivatedActionPanelForAction(action) {
+    let panelNode = document.createXULElement("panel");
+    panelNode.id = this._activatedActionPanelID;
+    panelNode.classList.add("cui-widget-panel", "panel-no-padding");
+    panelNode.setAttribute("actionID", action.id);
+    panelNode.setAttribute("role", "group");
+    panelNode.setAttribute("type", "arrow");
+    panelNode.setAttribute("flip", "slide");
+    panelNode.setAttribute("noautofocus", "true");
+    panelNode.setAttribute("tabspecific", "true");
+
+    let panelViewNode = null;
+    let iframeNode = null;
+
+    if (action.getWantsSubview(window)) {
+      let multiViewNode = document.createXULElement("panelmultiview");
+      panelViewNode = this._makePanelViewNodeForAction(action, true);
+      multiViewNode.setAttribute("mainViewId", panelViewNode.id);
+      multiViewNode.appendChild(panelViewNode);
+      panelNode.appendChild(multiViewNode);
+    } else if (action.wantsIframe) {
+      iframeNode = document.createXULElement("iframe");
+      iframeNode.setAttribute("type", "content");
+      panelNode.appendChild(iframeNode);
+    }
+
+    let popupSet = document.getElementById("mainPopupSet");
+    popupSet.appendChild(panelNode);
+    panelNode.addEventListener(
+      "popuphidden",
+      () => {
+        PanelMultiView.removePopup(panelNode);
+      },
+      { once: true }
+    );
+
+    if (iframeNode) {
+      panelNode.addEventListener(
+        "popupshowing",
+        () => {
+          action.onIframeShowing(iframeNode, panelNode);
+        },
+        { once: true }
+      );
+      panelNode.addEventListener(
+        "popupshown",
+        () => {
+          iframeNode.focus();
+        },
+        { once: true }
+      );
+      panelNode.addEventListener(
+        "popuphiding",
+        () => {
+          action.onIframeHiding(iframeNode, panelNode);
+        },
+        { once: true }
+      );
+      panelNode.addEventListener(
+        "popuphidden",
+        () => {
+          action.onIframeHidden(iframeNode, panelNode);
+        },
+        { once: true }
+      );
+    }
+
+    if (panelViewNode) {
+      action.onSubviewPlaced(panelViewNode);
+      panelNode.addEventListener(
+        "popupshowing",
+        () => {
+          action.onSubviewShowing(panelViewNode);
+        },
+        { once: true }
+      );
+    }
+
+    return panelNode;
+  },
+
+  panelAnchorNodeForAction(action, event) {
+    if (event && event.target.closest("panel") == this.panelNode) {
+      return this.mainButtonNode;
+    }
+
+    let potentialAnchorNodes = [
+      document.getElementById(action?.anchorIDOverride),
+      document.getElementById(
+        action && this.urlbarButtonNodeIDForActionID(action.id)
+      ),
+      document.getElementById(this.mainButtonNode.id),
+      document.getElementById("identity-icon"),
+    ];
+    for (let node of potentialAnchorNodes) {
+      if (node && !node.hidden) {
+        let bounds = window.windowUtils.getBoundsWithoutFlushing(node);
+        if (bounds.height > 0 && bounds.width > 0) {
+          return node;
+        }
+      }
+    }
+    let id = action ? action.id : "<no action>";
+    throw new Error(`PageActions: No anchor node for ${id}`);
+  },
+
+  get activatedActionPanelNode() {
+    return document.getElementById(this._activatedActionPanelID);
+  },
+
+  get _activatedActionPanelID() {
+    return "pageActionActivatedActionPanel";
+  },
+
+  placeActionInUrlbar(action) {
+    let id = this.urlbarButtonNodeIDForActionID(action.id);
+    let node = document.getElementById(id);
+
+    if (!action.shouldShowInUrlbar(window)) {
+      if (node) {
+        if (action.__urlbarNodeInMarkup) {
+          node.hidden = true;
+        } else {
+          node.remove();
+        }
+      }
+      return;
+    }
+
+    let newlyPlaced = false;
+    if (action.__urlbarNodeInMarkup) {
+      this._maybeNotifyBeforePlacedInWindow(action);
+      node = document.getElementById(id);
+      if (!node) {
+        return;
+      }
+      newlyPlaced = node.hidden;
+      node.hidden = false;
+    } else if (!node) {
+      newlyPlaced = true;
+      this._maybeNotifyBeforePlacedInWindow(action);
+      node = this._makeUrlbarButtonNode(action);
+      node.id = id;
+    }
+
+    if (!newlyPlaced) {
+      return;
+    }
+
+    let insertBeforeNode = this._getNextNode(action, true);
+    this.mainButtonNode.parentNode.insertBefore(node, insertBeforeNode);
+    this.updateAction(action, null, {
+      urlbarNode: node,
+    });
+    action.onPlacedInUrlbar(node);
+  },
+
+  _makeUrlbarButtonNode(action) {
+    let buttonNode = document.createXULElement("hbox");
+    buttonNode.classList.add("urlbar-page-action");
+    buttonNode.setAttribute("actionid", action.id);
+    buttonNode.setAttribute("role", "button");
+    let commandHandler = event => {
+      this.doCommandForAction(action, event, buttonNode);
+    };
+    buttonNode.addEventListener("click", commandHandler);
+    buttonNode.addEventListener("keypress", commandHandler);
+
+    let imageNode = document.createXULElement("image");
+    imageNode.classList.add("urlbar-icon");
+    buttonNode.appendChild(imageNode);
+    return buttonNode;
+  },
+
+  removeAction(action) {
+    this._removeActionFromPanel(action);
+    this._removeActionFromUrlbar(action);
+    action.onRemovedFromWindow(window);
+    this._updateMainButtonAttributes();
+  },
+
+  _removeActionFromUrlbar(action) {
+    let node = this.urlbarButtonNodeForActionID(action.id);
+    if (node) {
+      node.remove();
+    }
+  },
+
+  updateAction(action, propertyName = null, opts = {}) {
+    let anyNodeGiven = "panelNode" in opts || "urlbarNode" in opts;
+    let panelNode = anyNodeGiven
+      ? opts.panelNode || null
+      : this.panelButtonNodeForActionID(action.id);
+    let urlbarNode = anyNodeGiven
+      ? opts.urlbarNode || null
+      : this.urlbarButtonNodeForActionID(action.id);
+    let value = opts.value || undefined;
+    if (propertyName) {
+      this[this._updateMethods[propertyName]](
+        action,
+        panelNode,
+        urlbarNode,
+        value
+      );
+    } else {
+      for (let name of ["iconURL", "title", "tooltip", "wantsSubview"]) {
+        this[this._updateMethods[name]](action, panelNode, urlbarNode, value);
+      }
+    }
+  },
+
+  _updateMethods: {
+    disabled: "_updateActionDisabled",
+    iconURL: "_updateActionIconURL",
+    title: "_updateActionLabeling",
+    tooltip: "_updateActionTooltip",
+    wantsSubview: "_updateActionWantsSubview",
+  },
+
+  _updateActionDisabled(
+    action,
+    panelNode,
+    urlbarNode,
+    disabled = action.getDisabled(window)
+  ) {
+    if (action.__transient) {
+      this.placeActionInPanel(action);
+    } else {
+      this._updateActionDisabledInPanel(action, panelNode, disabled);
+    }
+    this.placeActionInUrlbar(action);
+  },
+
+  _updateActionDisabledInPanel(
+    action,
+    panelNode,
+    disabled = action.getDisabled(window)
+  ) {
+    if (panelNode) {
+      if (disabled) {
+        panelNode.setAttribute("disabled", "true");
+      } else {
+        panelNode.removeAttribute("disabled");
+      }
+    }
+  },
+
+  _updateActionIconURL(
+    action,
+    panelNode,
+    urlbarNode,
+    properties = action.getIconProperties(window)
+  ) {
+    for (let [prop, value] of Object.entries(properties)) {
+      if (panelNode) {
+        panelNode.style.setProperty(prop, value);
+      }
+      if (urlbarNode) {
+        urlbarNode.style.setProperty(prop, value);
+      }
+    }
+  },
+
+  _updateActionLabeling(
+    action,
+    panelNode,
+    urlbarNode,
+    title = action.getTitle(window)
+  ) {
+    if (panelNode) {
+      panelNode.setAttribute("label", title);
+    }
+    if (urlbarNode) {
+      urlbarNode.setAttribute("aria-label", title);
+      let tooltip = action.getTooltip(window);
+      if (!tooltip) {
+        urlbarNode.setAttribute("tooltiptext", title);
+      }
+    }
+  },
+
+  _updateActionTooltip(
+    action,
+    panelNode,
+    urlbarNode,
+    tooltip = action.getTooltip(window)
+  ) {
+    if (urlbarNode) {
+      if (!tooltip) {
+        tooltip = action.getTitle(window);
+      }
+      if (tooltip) {
+        urlbarNode.setAttribute("tooltiptext", tooltip);
+      }
+    }
+  },
+
+  _updateActionWantsSubview(
+    action,
+    panelNode,
+    urlbarNode,
+    wantsSubview = action.getWantsSubview(window)
+  ) {
+    if (!panelNode) {
+      return;
+    }
+    let panelViewID = this._panelViewNodeIDForActionID(action.id, false);
+    let panelViewNode = document.getElementById(panelViewID);
+    panelNode.classList.toggle("subviewbutton-nav", wantsSubview);
+    if (!wantsSubview) {
+      if (panelViewNode) {
+        panelViewNode.remove();
+      }
+      return;
+    }
+    if (!panelViewNode) {
+      panelViewNode = this._makePanelViewNodeForAction(action, false);
+      this.multiViewNode.appendChild(panelViewNode);
+      action.onSubviewPlaced(panelViewNode);
+    }
+  },
+
+  doCommandForAction(action, event, buttonNode) {
+    if (event && event.type == "click" && event.button != 0) {
+      return;
+    }
+    if (event && event.type == "keypress") {
+      if (event.key != " " && event.key != "Enter") {
+        return;
+      }
+      event.stopPropagation();
+    }
+    if (
+      action.getWantsSubview(window) &&
+      buttonNode &&
+      buttonNode.closest("panel") == this.panelNode
+    ) {
+      let panelViewNodeID = this._panelViewNodeIDForActionID(action.id, false);
+      let panelViewNode = document.getElementById(panelViewNodeID);
+      action.onSubviewShowing(panelViewNode);
+      this.multiViewNode.showSubView(panelViewNode, buttonNode);
+      return;
+    }
+    PanelMultiView.hidePopup(this.panelNode);
+
+    let aaPanelNode = this.activatedActionPanelNode;
+    if (!aaPanelNode || aaPanelNode.getAttribute("actionID") != action.id) {
+      action.onCommand(event, buttonNode);
+    }
+    if (action.getWantsSubview(window) || action.wantsIframe) {
+      this.togglePanelForAction(action, null, event);
+    }
+  },
+
+  actionForNode(node) {
+    if (!node) {
+      return null;
+    }
+    let actionID = this._actionIDForNodeID(node.id);
+    let action = PageActions.actionForID(actionID);
+    if (!action) {
+      for (let n = node.parentNode; n && !action; n = n.parentNode) {
+        if (n.id == "page-action-buttons" || n.localName == "panelview") {
+          break;
+        }
+        actionID = this._actionIDForNodeID(n.id);
+        action = PageActions.actionForID(actionID);
+      }
+    }
+    return action && !action.__isSeparator ? action : null;
+  },
+
+  panelButtonNodeForActionID(actionID) {
+    return document.getElementById(this.panelButtonNodeIDForActionID(actionID));
+  },
+
+  panelButtonNodeIDForActionID(actionID) {
+    return `pageAction-panel-${actionID}`;
+  },
+
+  urlbarButtonNodeForActionID(actionID) {
+    return document.getElementById(
+      this.urlbarButtonNodeIDForActionID(actionID)
+    );
+  },
+
+  urlbarButtonNodeIDForActionID(actionID) {
+    let action = PageActions.actionForID(actionID);
+    if (action && action.urlbarIDOverride) {
+      return action.urlbarIDOverride;
+    }
+    return `pageAction-urlbar-${actionID}`;
+  },
+
+  _panelViewNodeIDForActionID(actionID, forUrlbar) {
+    let placementID = forUrlbar ? "urlbar" : "panel";
+    return `pageAction-${placementID}-${actionID}-subview`;
+  },
+
+  _actionIDForNodeID(nodeID) {
+    if (!nodeID) {
+      return null;
+    }
+    let match = nodeID.match(/^pageAction-(?:panel|urlbar)-(.+)$/);
+    if (match) {
+      return match[1];
+    }
+    for (let action of PageActions.actions) {
+      if (action.urlbarIDOverride && action.urlbarIDOverride == nodeID) {
+        return action.id;
+      }
+    }
+    return null;
+  },
+
+  mainButtonClicked(event) {
+    event.stopPropagation();
+    if (
+      (event.type == "mousedown" &&
+        (event.button != 0 ||
+          (AppConstants.platform == "macosx" && event.ctrlKey))) ||
+      (event.type == "keypress" &&
+        event.charCode != KeyEvent.DOM_VK_SPACE &&
+        event.keyCode != KeyEvent.DOM_VK_RETURN)
+    ) {
+      return;
+    }
+
+    let panelNode = this.activatedActionPanelNode;
+    if (panelNode && panelNode.anchorNode.id == this.mainButtonNode.id) {
+      PanelMultiView.hidePopup(panelNode);
+      return;
+    }
+
+    if (this.panelNode.state == "open") {
+      PanelMultiView.hidePopup(this.panelNode);
+    } else if (this.panelNode.state == "closed") {
+      this.showPanel(event);
+    }
+  },
+
+  showPanel(event = null) {
+    this.panelNode.hidden = false;
+    PanelMultiView.openPopup(this.panelNode, this.mainButtonNode, {
+      position: "bottomright topright",
+      triggerEvent: event,
+    }).catch(console.error);
+  },
+
+  onLocationChange() {
+    for (let action of PageActions.actions) {
+      action.onLocationChange(window);
+    }
+  },
+};
+
+
+BrowserPageActions.bookmark = {
+  onShowingInPanel(buttonNode) {
+    if (buttonNode.label == "null") {
+      BookmarkingUI.updateBookmarkPageMenuItem();
+    }
+  },
+
+  onCommand(event) {
+    PanelMultiView.hidePopup(BrowserPageActions.panelNode);
+    BookmarkingUI.onStarCommand(event);
+  },
+};

@@ -1,0 +1,224 @@
+/*
+ * Copyright 2008 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkWriter32_DEFINED)
+#define SkWriter32_DEFINED
+
+#include "include/core/SkData.h"
+#include "include/core/SkPath.h"
+#include "include/core/SkPoint.h"
+#include "include/core/SkPoint3.h"
+#include "include/core/SkRRect.h"
+#include "include/core/SkRect.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkRegion.h"
+#include "include/core/SkScalar.h"
+#include "include/core/SkStream.h"
+#include "include/core/SkTypes.h"
+#include "include/private/base/SkAlign.h"
+#include "include/private/base/SkMalloc.h"
+#include "include/private/base/SkNoncopyable.h"
+#include "include/private/base/SkTemplates.h"
+#include "include/private/base/SkTo.h"
+
+#include <cstdint>
+#include <cstring>
+
+class SkMatrix;
+struct SkSamplingOptions;
+
+class SkWriter32 : SkNoncopyable {
+public:
+    SkWriter32(void* external = nullptr, size_t externalBytes = 0) {
+        this->reset(external, externalBytes);
+    }
+
+    size_t bytesWritten() const { return fUsed; }
+
+    bool usingInitialStorage() const { return fData == fExternal; }
+
+    void reset(void* external = nullptr, size_t externalBytes = 0) {
+        SkASSERT(SkIsAlign4((uintptr_t)external));
+        externalBytes &= ~3;
+
+        fData = (uint8_t*)external;
+        fCapacity = externalBytes;
+        fUsed = 0;
+        fExternal = external;
+    }
+
+    uint32_t* reserve(size_t size) {
+        SkASSERT(SkAlign4(size) == size);
+        size_t offset = fUsed;
+        size_t totalRequired = fUsed + size;
+        if (totalRequired > fCapacity) {
+            this->growToAtLeast(totalRequired);
+        }
+        fUsed = totalRequired;
+        return (uint32_t*)(fData + offset);
+    }
+
+    template<typename T>
+    const T& readTAt(size_t offset) const {
+        SkASSERT(SkAlign4(offset) == offset);
+        SkASSERT(offset < fUsed);
+        return *(T*)(fData + offset);
+    }
+
+    template<typename T>
+    void overwriteTAt(size_t offset, const T& value) {
+        SkASSERT(SkAlign4(offset) == offset);
+        SkASSERT(offset < fUsed);
+        *(T*)(fData + offset) = value;
+    }
+
+    bool writeBool(bool value) {
+        this->write32(value);
+        return value;
+    }
+
+    void writeInt(int32_t value) {
+        this->write32(value);
+    }
+
+    void write8(int32_t value) {
+        *(int32_t*)this->reserve(sizeof(value)) = value & 0xFF;
+    }
+
+    void write16(int32_t value) {
+        *(int32_t*)this->reserve(sizeof(value)) = value & 0xFFFF;
+    }
+
+    void write32(int32_t value) {
+        *(int32_t*)this->reserve(sizeof(value)) = value;
+    }
+
+    void writeScalar(SkScalar value) {
+        *(SkScalar*)this->reserve(sizeof(value)) = value;
+    }
+
+    void writePoint(const SkPoint& pt) {
+        *(SkPoint*)this->reserve(sizeof(pt)) = pt;
+    }
+
+    void writePoint3(const SkPoint3& pt) {
+        *(SkPoint3*)this->reserve(sizeof(pt)) = pt;
+    }
+
+    void writeRect(const SkRect& rect) {
+        *(SkRect*)this->reserve(sizeof(rect)) = rect;
+    }
+
+    void writeIRect(const SkIRect& rect) {
+        *(SkIRect*)this->reserve(sizeof(rect)) = rect;
+    }
+
+    void writeRRect(const SkRRect& rrect) {
+        rrect.writeToMemory(this->reserve(SkRRect::kSizeInMemory));
+    }
+
+    void writePath(const SkPath& path) {
+        size_t size = path.writeToMemory(nullptr);
+        SkASSERT(SkAlign4(size) == size);
+        path.writeToMemory(this->reserve(size));
+    }
+
+    void writeMatrix(const SkMatrix& matrix);
+
+    void writeRegion(const SkRegion& rgn) {
+        size_t size = rgn.writeToMemory(nullptr);
+        SkASSERT(SkAlign4(size) == size);
+        rgn.writeToMemory(this->reserve(size));
+    }
+
+    void writeSampling(const SkSamplingOptions& sampling);
+
+    void writeMul4(const void* values, size_t size) {
+        this->write(values, size);
+    }
+
+    void write(const void* values, size_t size) {
+        SkASSERT(SkAlign4(size) == size);
+        sk_careful_memcpy(this->reserve(size), values, size);
+    }
+
+    uint32_t* reservePad(size_t size) {
+        size_t alignedSize = SkAlign4(size);
+        uint32_t* p = this->reserve(alignedSize);
+        if (alignedSize != size) {
+            SkASSERT(alignedSize >= 4);
+            p[alignedSize / 4 - 1] = 0;
+        }
+        return p;
+    }
+
+    void writePad(const void* src, size_t size) {
+        sk_careful_memcpy(this->reservePad(size), src, size);
+    }
+
+    void writeString(const char* str, size_t len = (size_t)-1);
+
+    static size_t WriteStringSize(const char* str, size_t len = (size_t)-1);
+
+    void writeData(const SkData* data) {
+        uint32_t len = data ? SkToU32(data->size()) : 0;
+        this->write32(len);
+        if (data) {
+            this->writePad(data->data(), len);
+        }
+    }
+
+    static size_t WriteDataSize(const SkData* data) {
+        return 4 + SkAlign4(data ? data->size() : 0);
+    }
+
+    void rewindToOffset(size_t offset) {
+        SkASSERT(SkAlign4(offset) == offset);
+        SkASSERT(offset <= bytesWritten());
+        fUsed = offset;
+    }
+
+    void flatten(void* dst) const {
+        memcpy(dst, fData, fUsed);
+    }
+
+    bool writeToStream(SkWStream* stream) const {
+        return stream->write(fData, fUsed);
+    }
+
+    size_t readFromStream(SkStream* stream, size_t length) {
+        return stream->read(this->reservePad(length), length);
+    }
+
+    sk_sp<SkData> snapshotAsData() const;
+private:
+    void growToAtLeast(size_t size);
+
+    uint8_t* fData;                    
+    size_t fCapacity;                  
+    size_t fUsed;                      
+    void* fExternal;                   
+    skia_private::AutoTMalloc<uint8_t> fInternal;  
+};
+
+template <size_t SIZE> class SkSWriter32 : public SkWriter32 {
+public:
+    SkSWriter32() { this->reset(); }
+
+    void reset() {this->INHERITED::reset(fData.fStorage, SIZE); }
+
+private:
+    union {
+        void*   fPtrAlignment;
+        double  fDoubleAlignment;
+        char    fStorage[SIZE];
+    } fData;
+
+    using INHERITED = SkWriter32;
+};
+
+#endif

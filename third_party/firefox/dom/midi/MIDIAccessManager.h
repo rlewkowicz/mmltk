@@ -1,0 +1,49 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_MIDIAccessManager_h
+#define mozilla_dom_MIDIAccessManager_h
+
+#include "mozilla/Observer.h"
+#include "mozilla/dom/MIDITypes.h"
+#include "nsPIDOMWindow.h"
+
+namespace mozilla::dom {
+
+class MIDIAccess;
+class MIDIManagerChild;
+struct MIDIOptions;
+class MIDIPortChangeEvent;
+class MIDIPortInfo;
+class Promise;
+
+class MIDIAccessManager final {
+ public:
+  NS_INLINE_DECL_REFCOUNTING(MIDIAccessManager);
+  already_AddRefed<Promise> RequestMIDIAccess(nsPIDOMWindowInner* aWindow,
+                                              const MIDIOptions& aOptions,
+                                              ErrorResult& aRv);
+  void CreateMIDIAccess(nsPIDOMWindowInner* aWindow, bool aNeedsSysex,
+                        Promise* aPromise);
+  static MIDIAccessManager* Get();
+  static bool IsRunning();
+  void Update(const MIDIPortList& aPortList);
+  bool AddObserver(Observer<MIDIPortList>* aObserver);
+  void RemoveObserver(Observer<MIDIPortList>* aObserver);
+  void SendRefresh();
+
+ private:
+  MIDIAccessManager();
+  ~MIDIAccessManager();
+  void StartActor();
+  bool mHasPortList;
+  MIDIPortList mPortList;
+  nsTArray<RefPtr<MIDIAccess>> mAccessHolder;
+  ObserverList<MIDIPortList> mChangeObservers;
+  RefPtr<MIDIManagerChild> mChild;
+};
+
+}  
+
+#endif  // mozilla_dom_MIDIAccessManager_h

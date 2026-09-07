@@ -1,0 +1,1481 @@
+// Copyright 2008 Google Inc.  All rights reserved.
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
+
+#if !defined(GOOGLE_PROTOBUF_PARSE_CONTEXT_H__)
+#define GOOGLE_PROTOBUF_PARSE_CONTEXT_H__
+
+#include <algorithm>
+#include <climits>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <string>
+#include <type_traits>
+#include <utility>
+
+#include "absl/base/casts.h"
+#include "absl/base/config.h"
+#include "absl/base/prefetch.h"
+#include "absl/log/absl_check.h"
+#include "absl/log/absl_log.h"
+#include "absl/strings/cord.h"
+#include "absl/strings/internal/resize_uninitialized.h"
+#include "absl/strings/string_view.h"
+#include "absl/types/span.h"
+#include "google/protobuf/arena.h"
+#include "google/protobuf/arenastring.h"
+#include "google/protobuf/endian.h"
+#include "google/protobuf/inlined_string_field.h"
+#include "google/protobuf/io/coded_stream.h"
+#include "google/protobuf/io/zero_copy_stream.h"
+#include "google/protobuf/message_lite.h"
+#include "google/protobuf/metadata_lite.h"
+#include "google/protobuf/micro_string.h"
+#include "google/protobuf/port.h"
+#include "google/protobuf/repeated_field.h"
+#include "google/protobuf/repeated_ptr_field.h"
+#include "google/protobuf/wire_format_lite.h"
+#include "utf8_validity.h"
+
+
+#include "google/protobuf/port_def.inc"
+
+
+namespace google {
+namespace protobuf {
+
+class UnknownFieldSet;
+class DescriptorPool;
+class MessageFactory;
+
+namespace internal {
+
+class LazyField;
+
+PROTOBUF_EXPORT void WriteVarint(uint32_t num, uint64_t val, std::string* s);
+PROTOBUF_EXPORT void WriteLengthDelimited(uint32_t num, absl::string_view val,
+                                          std::string* s);
+inline void WriteVarint(uint32_t num, uint64_t val, UnknownFieldSet* unknown);
+inline void WriteLengthDelimited(uint32_t num, absl::string_view val,
+                                 UnknownFieldSet* unknown);
+
+int CountVarintsAssumingLargeArray(const char* ptr, const char* end);
+
+bool VerifyBoolsAssumingLargeArray(const char* ptr, const char* end);
+
+
+
+class PROTOBUF_EXPORT EpsCopyInputStream {
+ public:
+  enum { kMaxCordBytesToCopy = 512 };
+  explicit EpsCopyInputStream(bool enable_aliasing)
+      : aliasing_(enable_aliasing ? kOnPatch : kNoAliasing) {}
+
+  void BackUp(const char* ptr) {
+    ABSL_DCHECK(ptr <= buffer_end_ + kSlopBytes);
+    int count;
+    if (next_chunk_ == patch_buffer_) {
+      count = BytesAvailable(ptr);
+    } else {
+      count = size_ + static_cast<int>(buffer_end_ - ptr);
+    }
+    if (count > 0) StreamBackUp(count);
+  }
+
+  class PROTOBUF_FUTURE_ADD_EARLY_WARN_UNUSED LimitToken {
+   public:
+    LimitToken() { internal::PoisonMemoryRegion(&token_, sizeof(token_)); }
+
+    explicit LimitToken(int token) : token_(token) {
+      internal::UnpoisonMemoryRegion(&token_, sizeof(token_));
+    }
+
+    LimitToken(const LimitToken&) = delete;
+    LimitToken& operator=(const LimitToken&) = delete;
+
+    LimitToken(LimitToken&& other) { *this = std::move(other); }
+
+    LimitToken& operator=(LimitToken&& other) {
+      internal::UnpoisonMemoryRegion(&token_, sizeof(token_));
+      token_ = other.token_;
+      internal::PoisonMemoryRegion(&other.token_, sizeof(token_));
+      return *this;
+    }
+
+    ~LimitToken() { internal::UnpoisonMemoryRegion(&token_, sizeof(token_)); }
+
+    int token() && {
+      int t = token_;
+      internal::PoisonMemoryRegion(&token_, sizeof(token_));
+      return t;
+    }
+
+   private:
+    int token_;
+  };
+
+  [[nodiscard]] LimitToken PushLimit(const char* ptr, int limit) {
+    ABSL_DCHECK(limit >= 0 && limit <= INT_MAX - kSlopBytes);
+    limit += static_cast<int>(ptr - buffer_end_);
+    limit_end_ = buffer_end_ + (std::min)(0, limit);
+    auto old_limit = limit_;
+    limit_ = limit;
+    return LimitToken(old_limit - limit);
+  }
+
+  [[nodiscard]] bool PopLimit(LimitToken delta) {
+    limit_ = limit_ + std::move(delta).token();
+    if (ABSL_PREDICT_FALSE(!EndedAtLimit())) return false;
+    limit_end_ = buffer_end_ + (std::min)(0, limit_);
+    return true;
+  }
+
+  [[nodiscard]] const char* Skip(const char* ptr, int size) {
+    if (CanReadFromPtr(size, ptr)) {
+      return ptr + size;
+    }
+    return SkipFallback(ptr, size);
+  }
+  [[nodiscard]] const char* ReadString(const char* ptr, int size,
+                                       std::string* s) {
+    if (CanReadFromPtr(size, ptr)) {
+      absl::strings_internal::STLStringResizeUninitialized(s, size);
+      char* z = &(*s)[0];
+      memcpy(z, ptr, size);
+      return ptr + size;
+    }
+    return ReadStringFallback(ptr, size, s);
+  }
+  [[nodiscard]] const char* AppendString(const char* ptr, int size,
+                                         std::string* s) {
+    if (CanReadFromPtr(size, ptr)) {
+      s->append(ptr, size);
+      return ptr + size;
+    }
+    return AppendStringFallback(ptr, size, s);
+  }
+
+  [[nodiscard]] const char* ReadArray(const char* ptr, absl::Span<char> out);
+  [[nodiscard]] const char* VerifyUTF8(const char* ptr, size_t size);
+
+  [[nodiscard]] const char* ReadMicroString(const char* ptr, MicroString& str,
+                                            Arena* arena);
+  [[nodiscard]] const char* ReadMicroStringWithSize(const char* ptr, int size,
+                                                    MicroString& str,
+                                                    Arena* arena);
+  [[nodiscard]] const char* ReadMicroStringFallback(const char* ptr, int size,
+                                                    MicroString& str,
+                                                    Arena* arena);
+
+  [[nodiscard]] const char* ReadArenaString(const char* ptr, ArenaStringPtr* s,
+                                            Arena* arena);
+
+  [[nodiscard]] const char* ReadCord(const char* ptr, int size,
+                                     ::absl::Cord* cord) {
+    if (IsRequestedLessThanOrEqualTo(
+            size, std::min<int>(BytesAvailable(ptr), kMaxCordBytesToCopy))) {
+      *cord = absl::string_view(ptr, size);
+      return ptr + size;
+    }
+    return ReadCordFallback(ptr, size, cord);
+  }
+
+
+  template <typename FuncT>
+  [[nodiscard]] const char* ReadChunkAndCallback(const char* ptr, int size,
+                                                 FuncT&& callback) {
+    if (CanReadFromPtr(size, ptr)) {
+      callback(ptr, size);
+      return ptr + size;
+    }
+    return AppendSize(ptr, size, callback);
+  }
+
+  template <typename Tag, typename T>
+  [[nodiscard]] const char* ReadRepeatedFixed(const char* ptr, Arena* arena,
+                                              Tag expected_tag,
+                                              RepeatedField<T>* out);
+
+  template <typename T>
+  [[nodiscard]] const char* ReadPackedFixed(const char* ptr, Arena* arena,
+                                            int size, RepeatedField<T>* out);
+  template <typename Add>
+  static const char* ReadPackedVarintArray(const char* ptr, const char* end,
+                                           Add add);
+  template <typename Convert, typename T>
+  static const char* ReadPackedVarintArrayWithField(const char* ptr,
+                                                    const char* end,
+                                                    Arena* arena, Convert conv,
+                                                    RepeatedField<T>& out);
+  template <typename Add>
+  [[nodiscard]] const char* ReadPackedVarint(const char* ptr, Add add) {
+    return ReadPackedVarint(ptr, add, [](int) {});
+  }
+  template <typename Add, typename SizeCb>
+  [[nodiscard]] const char* ReadPackedVarint(const char* ptr, Add add,
+                                             SizeCb size_callback);
+  template <typename Convert, typename T>
+  [[nodiscard]] const char* ReadPackedVarintWithField(const char* ptr,
+                                                      Arena* arena,
+                                                      Convert conv,
+                                                      RepeatedField<T>& out);
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD uint32_t LastTag() const {
+    return last_tag_minus_1_ + 1;
+  }
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool ConsumeEndGroup(uint32_t start_tag) {
+    bool res = last_tag_minus_1_ == start_tag;
+    last_tag_minus_1_ = 0;
+    return res;
+  }
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool EndedAtLimit() const {
+    return last_tag_minus_1_ == 0;
+  }
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool EndedAtEndOfStream() const {
+    return last_tag_minus_1_ == 1;
+  }
+  void SetLastTag(uint32_t tag) { last_tag_minus_1_ = tag - 1; }
+  void SetEndOfStream() { last_tag_minus_1_ = 1; }
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool IsExceedingLimit(const char* ptr) {
+    return ptr > limit_end_ &&
+           (next_chunk_ == nullptr || ptr - buffer_end_ > limit_);
+  }
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool AliasingEnabled() const {
+    return aliasing_ != kNoAliasing;
+  }
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD int BytesUntilLimit(
+      const char* ptr) const {
+    return limit_ + static_cast<int>(buffer_end_ - ptr);
+  }
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD int MaximumReadSize(
+      const char* ptr) const {
+    return static_cast<int>(limit_end_ - ptr) + kSlopBytes;
+  }
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool DataAvailable(const char* ptr) {
+    return ptr < limit_end_;
+  }
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD int BytesAvailable(
+      const char* ptr) const {
+    ABSL_DCHECK_NE(ptr, nullptr);
+    ptrdiff_t available = buffer_end_ + kSlopBytes - ptr;
+    ABSL_DCHECK_GE(available, 0);
+    ABSL_DCHECK_LE(available, INT_MAX);
+    return static_cast<int>(available);
+  }
+
+  template <typename SinkT>
+  [[nodiscard]] const char* SkipMaybeFlush(const char* ptr, int64_t size,
+                                           SinkT& sink) {
+    if (size <= BytesAvailable(ptr)) {
+      return ptr + size;
+    }
+    return AdvancePtrMaybeFlush<char>(ptr, size, sink,
+                                      [](absl::string_view) { return true; });
+  }
+
+  template <typename SinkT>
+  [[nodiscard]] const char* ReadArrayMaybeFlush(const char* ptr,
+                                                absl::Span<char> out,
+                                                SinkT& sink);
+
+  template <typename DataT, typename SinkT, typename PeekFunc>
+  [[nodiscard]] const char* AdvancePtrMaybeFlush(const char* ptr, int64_t count,
+                                                 SinkT& sink,
+                                                 PeekFunc&& peek_func) {
+    const char* end = buffer_end_ + kSlopBytes;
+    int64_t size = count * sizeof(DataT);
+    ABSL_DCHECK_NE(ptr, nullptr);
+    ABSL_DCHECK_LE(ptr, end);
+
+    int64_t available = end - ptr;
+    if (ABSL_PREDICT_TRUE(available >= size)) {
+      if (!peek_func(absl::string_view(ptr, size))) return nullptr;
+      return ptr + size;
+    }
+    int64_t round_down_size = available / sizeof(DataT) * sizeof(DataT);
+
+    if (!peek_func(absl::string_view(ptr, round_down_size))) return nullptr;
+    ptr += round_down_size;
+#if !0 && !defined(__hexagon__)
+    PROTOBUF_ALWAYS_INLINE_CALL
+#endif
+    sink.Flush(ptr);
+    size -= round_down_size;
+
+    do {
+      int overrun = static_cast<int>(ptr - buffer_end_);
+      ABSL_DCHECK_GE(overrun, 0);
+      ABSL_DCHECK_LE(overrun, kSlopBytes);
+
+      ptr = NextBuffer(overrun, -1);
+      if (ABSL_PREDICT_FALSE(ptr == nullptr)) return nullptr;
+      limit_ -= buffer_end_ - ptr;  
+      ptr += overrun;
+      limit_end_ = buffer_end_ + std::min(0, limit_);
+
+      int64_t chunk_round_down_size =
+          BytesAvailable(ptr) / sizeof(DataT) * sizeof(DataT);
+      int64_t append_size = std::min(size, chunk_round_down_size);
+
+      absl::string_view view(ptr, static_cast<size_t>(append_size));
+      if (!peek_func(view)) return nullptr;
+#if !0 && !defined(__hexagon__)
+      PROTOBUF_ALWAYS_INLINE_CALL
+#endif
+      sink.Append(view);
+
+      ptr += append_size;
+      size -= append_size;
+    } while (size > 0);
+
+    sink.Reset(ptr);
+    return ptr;
+  }
+
+  struct WireFormatNoOpSink {
+    static constexpr bool kIsLazySink = false;
+    void Flush(const char* p) {}
+    void Append(absl::string_view view) {}
+    void Reset(const char* p) {}
+  };
+
+ protected:
+  template <typename SinkT>
+  bool DoneWithCheck(const char** ptr, int d, SinkT& sink) {
+    ABSL_DCHECK(*ptr);
+    if (ABSL_PREDICT_TRUE(*ptr < limit_end_)) return false;
+    int overrun = static_cast<int>(*ptr - buffer_end_);
+    ABSL_DCHECK_LE(overrun, kSlopBytes);  
+    if (overrun ==
+        limit_) {  
+      sink.Flush(*ptr);
+      sink.Reset(*ptr);
+      if (overrun > 0 && next_chunk_ == nullptr) *ptr = nullptr;
+      return true;
+    }
+    sink.Flush(*ptr);
+    auto res = DoneFallback(overrun, d);
+    *ptr = res.first;
+    sink.Reset(res.first);
+    return res.second;
+  }
+
+  const char* InitFrom(absl::string_view flat) {
+    overall_limit_ = 0;
+    if (flat.size() > kSlopBytes) {
+      limit_ = kSlopBytes;
+      limit_end_ = buffer_end_ = flat.data() + flat.size() - kSlopBytes;
+      next_chunk_ = patch_buffer_;
+      if (aliasing_ == kOnPatch) aliasing_ = kNoDelta;
+      return flat.data();
+    } else {
+      if (!flat.empty()) {
+        std::memcpy(patch_buffer_, flat.data(), flat.size());
+      }
+      limit_ = 0;
+      limit_end_ = buffer_end_ = patch_buffer_ + flat.size();
+      next_chunk_ = nullptr;
+      if (aliasing_ == kOnPatch) {
+        aliasing_ = reinterpret_cast<std::uintptr_t>(flat.data()) -
+                    reinterpret_cast<std::uintptr_t>(patch_buffer_);
+      }
+      return patch_buffer_;
+    }
+  }
+
+  const char* InitFrom(io::ZeroCopyInputStream* zcis);
+
+  const char* InitFrom(io::ZeroCopyInputStream* zcis, int limit) {
+    if (limit == -1) return InitFrom(zcis);
+    overall_limit_ = limit;
+    auto res = InitFrom(zcis);
+    limit_ = limit - static_cast<int>(buffer_end_ - res);
+    limit_end_ = buffer_end_ + (std::min)(0, limit_);
+    return res;
+  }
+
+  const char* InitFrom(const BoundedZCIS& bounded_zcis) {
+    return InitFrom(bounded_zcis.zcis, bounded_zcis.limit);
+  }
+
+ protected:
+  enum { kSlopBytes = 16, kPatchBufferSize = 32 };
+  static_assert(kPatchBufferSize >= kSlopBytes * 2,
+                "Patch buffer needs to be at least large enough to hold all "
+                "the slop bytes from the previous buffer, plus the first "
+                "kSlopBytes from the next buffer.");
+
+ private:
+  const char* limit_end_;  
+  const char* buffer_end_;
+  const char* next_chunk_;
+  int size_;
+  int limit_;  
+  io::ZeroCopyInputStream* zcis_ = nullptr;
+  char patch_buffer_[kPatchBufferSize] = {};
+  enum { kNoAliasing = 0, kOnPatch = 1, kNoDelta = 2 };
+  std::uintptr_t aliasing_ = kNoAliasing;
+  uint32_t last_tag_minus_1_ = 0;
+  int overall_limit_ = INT_MAX;  
+
+  bool IsRequestedLessThanOrEqualTo(int requested, int available);
+
+  bool CanReadFromPtr(int requested, const char* ptr);
+
+  bool HasEnoughTillLimit(int requested, const char* ptr);
+
+  std::pair<const char*, bool> DoneFallback(int overrun, int depth);
+  const char* Next();
+  const char* NextBuffer(int overrun, int depth);
+  const char* SkipFallback(const char* ptr, int size);
+  const char* AppendStringFallback(const char* ptr, int size, std::string* str);
+  const char* VerifyUTF8Fallback(const char* ptr, size_t size);
+  const char* ReadStringFallback(const char* ptr, int size, std::string* str);
+  const char* ReadArrayFallback(const char* ptr, absl::Span<char> out);
+  const char* ReadCordFallback(const char* ptr, int size, absl::Cord* cord);
+  static bool ParseEndsInSlopRegion(const char* begin, int overrun, int depth);
+  bool StreamNext(const void** data) {
+    bool res = zcis_->Next(data, &size_);
+    if (res) overall_limit_ -= size_;
+    return res;
+  }
+  void StreamBackUp(int count) {
+    zcis_->BackUp(count);
+    overall_limit_ += count;
+  }
+
+  template <typename A>
+  const char* AppendSize(const char* ptr, uint32_t size, const A& append) {
+    constexpr bool kCheckReturn =
+        std::is_invocable_r_v<bool, decltype(append), const char*, int>;
+
+    ABSL_DCHECK_GE(BytesAvailable(ptr), 0);
+    uint32_t chunk_size = static_cast<uint32_t>(BytesAvailable(ptr));
+    do {
+      ABSL_DCHECK_GT(size, chunk_size);
+      if (next_chunk_ == nullptr) return nullptr;
+      if constexpr (kCheckReturn) {
+        if (!append(ptr, chunk_size)) return nullptr;
+      } else {
+        append(ptr, chunk_size);
+      }
+      ptr += chunk_size;
+      size -= chunk_size;
+      if (limit_ <= kSlopBytes) return nullptr;
+      ptr = Next();
+      if (ptr == nullptr) return nullptr;  
+      ptr += kSlopBytes;
+      chunk_size = BytesAvailable(ptr);
+    } while (size > chunk_size);
+
+    if constexpr (kCheckReturn) {
+      if (!append(ptr, size)) return nullptr;
+    } else {
+      append(ptr, size);
+    }
+    return ptr + size;
+  }
+
+  template <typename A>
+  const char* AppendUntilEnd(const char* ptr, const A& append) {
+    if (ptr - buffer_end_ > limit_) return nullptr;
+    while (limit_ > kSlopBytes) {
+      size_t chunk_size = BytesAvailable(ptr);
+      append(ptr, chunk_size);
+      ptr = Next();
+      if (ptr == nullptr) return limit_end_;
+      ptr += kSlopBytes;
+    }
+    auto end = buffer_end_ + limit_;
+    ABSL_DCHECK(end >= ptr);
+    append(ptr, end - ptr);
+    return end;
+  }
+
+  [[nodiscard]] const char* AppendString(const char* ptr, std::string* str) {
+    return AppendUntilEnd(
+        ptr, [str](const char* p, ptrdiff_t s) { str->append(p, s); });
+  }
+  friend class ImplicitWeakMessage;
+
+  friend PROTOBUF_EXPORT std::pair<const char*, int32_t> ReadSizeFallback(
+      const char* p, uint32_t res);
+};
+
+using LazyEagerVerifyFnType = const char* (*)(const char* ptr,
+                                              ParseContext* ctx);
+using LazyEagerVerifyFnRef = std::remove_pointer<LazyEagerVerifyFnType>::type&;
+
+class PROTOBUF_EXPORT ParseContext : public EpsCopyInputStream {
+ public:
+  struct Data {
+    const DescriptorPool* pool = nullptr;
+    MessageFactory* factory = nullptr;
+  };
+
+  template <typename... T>
+  ParseContext(int depth, bool aliasing, const char** start, T&&... args)
+      : EpsCopyInputStream(aliasing), depth_(depth) {
+    *start = InitFrom(std::forward<T>(args)...);
+  }
+
+  struct Spawn {};
+  static constexpr Spawn kSpawn = {};
+
+  template <typename... T>
+  ParseContext(Spawn, const ParseContext& ctx, const char** start, T&&... args)
+      : EpsCopyInputStream(false),
+        depth_(ctx.depth_),
+        data_(ctx.data_)
+  {
+    *start = InitFrom(std::forward<T>(args)...);
+  }
+
+  ParseContext(ParseContext&&) = delete;
+  ParseContext& operator=(ParseContext&&) = delete;
+  ParseContext& operator=(const ParseContext&) = delete;
+
+  void TrackCorrectEnding() { group_depth_ = 0; }
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool Done(const char** ptr) {
+    WireFormatNoOpSink sink;
+    return DoneWithCheck(ptr, group_depth_, sink);
+  }
+
+  template <typename SinkT>
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD const char* VerifyUTF8MaybeFlush(
+      const char* ptr, int64_t size, SinkT& sink) {
+    if (size <= BytesAvailable(ptr)) {
+      return utf8_range::IsStructurallyValid({ptr, static_cast<size_t>(size)})
+                 ? ptr + size
+                 : nullptr;
+    }
+    return VerifyUTF8MaybeFlushFallback(ptr, size, sink);
+  }
+  template <typename SinkT>
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD const char* VerifyUTF8MaybeFlushFallback(
+      const char* ptr, int64_t size, SinkT& sink);
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD int depth() const { return depth_; }
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD Data& data() { return data_; }
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD const Data& data() const { return data_; }
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD const char* ParseMessage(MessageLite* msg,
+                                                               const char* ptr);
+
+  template <typename Func>
+  [[nodiscard]] const char* ParseLengthDelimitedInlined(const char*,
+                                                        const Func& func);
+
+  template <typename Func>
+  [[nodiscard]] const char* ParseGroupInlined(const char* ptr,
+                                              uint32_t start_tag,
+                                              const Func& func);
+
+  template <typename Parser = TcParser>
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD PROTOBUF_ALWAYS_INLINE const char*
+  ParseMessage(MessageLite* msg, const TcParseTableBase* tc_table,
+               const char* ptr) {
+    return ParseLengthDelimitedInlined(ptr, [&](const char* ptr) {
+      return Parser::ParseLoop(msg, ptr, this, tc_table);
+    });
+  }
+  template <typename Parser = TcParser>
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD PROTOBUF_ALWAYS_INLINE const char*
+  ParseGroup(MessageLite* msg, const TcParseTableBase* tc_table,
+             const char* ptr, uint32_t start_tag) {
+    return ParseGroupInlined(ptr, start_tag, [&](const char* ptr) {
+      return Parser::ParseLoop(msg, ptr, this, tc_table);
+    });
+  }
+
+  [[nodiscard]] PROTOBUF_NDEBUG_INLINE const char* ParseGroup(MessageLite* msg,
+                                                              const char* ptr,
+                                                              uint32_t tag) {
+    if (--depth_ < 0) return nullptr;
+    group_depth_++;
+    auto old_depth = depth_;
+    auto old_group_depth = group_depth_;
+    ptr = msg->_InternalParse(ptr, this);
+    if (ptr != nullptr) {
+      ABSL_DCHECK_EQ(old_depth, depth_);
+      ABSL_DCHECK_EQ(old_group_depth, group_depth_);
+    }
+    group_depth_--;
+    depth_++;
+    if (ABSL_PREDICT_FALSE(!ConsumeEndGroup(tag))) return nullptr;
+    return ptr;
+  }
+  template <typename Func>
+  [[nodiscard]] PROTOBUF_ALWAYS_INLINE const char* ParseWithLengthInlined(
+      const char* ptr, uint32_t length, const Func& func);
+
+ private:
+  [[nodiscard]] const char* ReadSizeAndPushLimitAndDepth(const char* ptr,
+                                                         LimitToken* old_limit);
+
+  [[nodiscard]] PROTOBUF_ALWAYS_INLINE const char*
+  ReadSizeAndPushLimitAndDepthInlined(const char* ptr, LimitToken* old_limit);
+
+  int depth_;
+  int group_depth_ = std::numeric_limits<int16_t>::min();
+  Data data_;
+};
+
+struct WireFormatStringSink {
+  static constexpr bool kIsLazySink = false;
+  explicit WireFormatStringSink(const char* ptr) : prev(ptr) {}
+
+  void Flush(const char* ptr);
+  void Append(absl::string_view view);
+  void Reset(const char* ptr) { prev = ptr; }
+
+  std::string FlattenedDataForTesting() const { return data; }
+
+  const char* prev;
+  std::string data;
+};
+
+extern template const char* EpsCopyInputStream::ReadArrayMaybeFlush(
+    const char* ptr, absl::Span<char> out, WireFormatNoOpSink& sink);
+extern template const char* EpsCopyInputStream::ReadArrayMaybeFlush(
+    const char* ptr, absl::Span<char> out, WireFormatStringSink& sink);
+
+extern template const char* ParseContext::VerifyUTF8MaybeFlushFallback(
+    const char* ptr, int64_t size, WireFormatNoOpSink& sink);
+extern template const char* ParseContext::VerifyUTF8MaybeFlushFallback(
+    const char* ptr, int64_t size, WireFormatStringSink& sink);
+
+template <int>
+struct EndianHelper;
+
+template <>
+struct EndianHelper<1> {
+  static uint8_t Load(const void* p) { return *static_cast<const uint8_t*>(p); }
+};
+
+template <>
+struct EndianHelper<2> {
+  static uint16_t Load(const void* p) {
+    uint16_t tmp;
+    std::memcpy(&tmp, p, 2);
+    return little_endian::ToHost(tmp);
+  }
+};
+
+template <>
+struct EndianHelper<4> {
+  static uint32_t Load(const void* p) {
+    uint32_t tmp;
+    std::memcpy(&tmp, p, 4);
+    return little_endian::ToHost(tmp);
+  }
+};
+
+template <>
+struct EndianHelper<8> {
+  static uint64_t Load(const void* p) {
+    uint64_t tmp;
+    std::memcpy(&tmp, p, 8);
+    return little_endian::ToHost(tmp);
+  }
+};
+
+template <typename T>
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD T UnalignedLoad(const char* p) {
+  auto tmp = EndianHelper<sizeof(T)>::Load(p);
+  T res;
+  memcpy(&res, &tmp, sizeof(T));
+  return res;
+}
+template <typename T, typename Void,
+          typename = std::enable_if_t<std::is_same<Void, void>::value>>
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD T UnalignedLoad(const Void* p) {
+  return UnalignedLoad<T>(reinterpret_cast<const char*>(p));
+}
+
+template <typename T>
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD T
+UnalignedLoadAndIncrement(const char** ptr) {
+  T value = UnalignedLoad<T>(*ptr);
+  *ptr += sizeof(T);
+  return value;
+}
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+PROTOBUF_EXPORT
+std::pair<const char*, uint32_t> VarintParseSlow32(const char* p, uint32_t res);
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+PROTOBUF_EXPORT
+std::pair<const char*, uint64_t> VarintParseSlow64(const char* p, uint32_t res);
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+inline const char* VarintParseSlow(const char* p, uint32_t res, uint32_t* out) {
+  auto tmp = VarintParseSlow32(p, res);
+  *out = tmp.second;
+  return tmp.first;
+}
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+inline const char* VarintParseSlow(const char* p, uint32_t res, uint64_t* out) {
+  auto tmp = VarintParseSlow64(p, res);
+  *out = tmp.second;
+  return tmp.first;
+}
+
+#if defined(__aarch64__) && !defined(_MSC_VER)
+template <typename V1Type>
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD PROTOBUF_ALWAYS_INLINE V1Type
+ValueBarrier(V1Type value1) {
+  asm("" : "+r"(value1));
+  return value1;
+}
+
+template <typename V1Type, typename V2Type>
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD PROTOBUF_ALWAYS_INLINE V1Type
+ValueBarrier(V1Type value1, V2Type value2) {
+  asm("" : "+r"(value1) : "r"(value2));
+  return value1;
+}
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+static PROTOBUF_ALWAYS_INLINE uint64_t Ubfx7(uint64_t data, uint64_t start) {
+  return ValueBarrier((data >> start) & 0x7f);
+}
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+PROTOBUF_ALWAYS_INLINE uint64_t ExtractAndMergeTwoChunks(uint64_t data,
+                                                         uint64_t first_byte) {
+  ABSL_DCHECK_LE(first_byte, 6U);
+  uint64_t first = Ubfx7(data, first_byte * 8);
+  uint64_t second = Ubfx7(data, (first_byte + 1) * 8);
+  return ValueBarrier(first | (second << 7));
+}
+
+struct SlowPathEncodedInfo {
+  const char* p;
+  uint64_t last8;
+  uint64_t valid_bits;
+  uint64_t valid_chunk_bits;
+  uint64_t masked_cont_bits;
+};
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+PROTOBUF_ALWAYS_INLINE SlowPathEncodedInfo
+ComputeLengthAndUpdateP(const char* p) {
+  SlowPathEncodedInfo result;
+  std::memcpy(&result.last8, p + 2, sizeof(result.last8));
+  uint64_t mask = ValueBarrier(0x8080808080808080);
+  result.masked_cont_bits = ValueBarrier(mask & ~result.last8);
+  result.valid_bits = absl::countr_zero(result.masked_cont_bits);
+  uint64_t set_continuation_bits = result.valid_bits >> 3;
+  result.p = p + set_continuation_bits + 3;
+  result.valid_chunk_bits = result.valid_bits - set_continuation_bits;
+  return result;
+}
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+PROTOBUF_ALWAYS_INLINE std::pair<const char*, uint64_t> VarintParseSlowArm64(
+    const char* p, uint64_t first8) {
+  constexpr uint64_t kResultMaskUnshifted = 0xffffffffffffc000ULL;
+  constexpr uint64_t kFirstResultBitChunk2 = 2 * 7;
+  constexpr uint64_t kFirstResultBitChunk4 = 4 * 7;
+  constexpr uint64_t kFirstResultBitChunk6 = 6 * 7;
+  constexpr uint64_t kFirstResultBitChunk8 = 8 * 7;
+
+  SlowPathEncodedInfo info = ComputeLengthAndUpdateP(p);
+  uint64_t merged_01 = ExtractAndMergeTwoChunks(first8, 0);
+  uint64_t merged_23 = ExtractAndMergeTwoChunks(first8, 2);
+  uint64_t merged_45 = ExtractAndMergeTwoChunks(first8, 4);
+  uint64_t result = merged_01 | (merged_23 << kFirstResultBitChunk2) |
+                    (merged_45 << kFirstResultBitChunk4);
+  uint64_t result_mask = kResultMaskUnshifted << info.valid_chunk_bits;
+  if (ABSL_PREDICT_FALSE(info.masked_cont_bits == 0)) {
+    return {nullptr, 0};
+  }
+  if (ABSL_PREDICT_FALSE((info.valid_bits & 0x20) != 0)) {
+    uint64_t merged_67 = ExtractAndMergeTwoChunks(first8, 6);
+    uint64_t merged_89 =
+        ExtractAndMergeTwoChunks(info.last8, 6);
+    result |= merged_67 << kFirstResultBitChunk6;
+    result |= merged_89 << kFirstResultBitChunk8;
+  }
+  result &= ~result_mask;
+  return {info.p, result};
+}
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+PROTOBUF_ALWAYS_INLINE std::pair<const char*, uint32_t> VarintParseSlowArm32(
+    const char* p, uint64_t first8) {
+  constexpr uint64_t kResultMaskUnshifted = 0xffffffffffffc000ULL;
+  constexpr uint64_t kFirstResultBitChunk1 = 1 * 7;
+  constexpr uint64_t kFirstResultBitChunk3 = 3 * 7;
+
+  SlowPathEncodedInfo info = ComputeLengthAndUpdateP(p);
+  uint64_t merged_12 = ExtractAndMergeTwoChunks(first8, 1);
+  uint64_t merged_34 = ExtractAndMergeTwoChunks(first8, 3);
+  first8 = ValueBarrier(first8, p);
+  uint64_t result = Ubfx7(first8, 0);
+  result = ValueBarrier(result | merged_12 << kFirstResultBitChunk1);
+  result = ValueBarrier(result | merged_34 << kFirstResultBitChunk3);
+  uint64_t result_mask = kResultMaskUnshifted << info.valid_chunk_bits;
+  result &= ~result_mask;
+  info.masked_cont_bits = ValueBarrier(info.masked_cont_bits, result);
+  if (ABSL_PREDICT_FALSE(info.masked_cont_bits == 0)) {
+    return {nullptr, 0};
+  }
+  return {info.p, result};
+}
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+static const char* VarintParseSlowArm(const char* p, uint32_t* out,
+                                      uint64_t first8) {
+  auto tmp = VarintParseSlowArm32(p, first8);
+  *out = tmp.second;
+  return tmp.first;
+}
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+static const char* VarintParseSlowArm(const char* p, uint64_t* out,
+
+                                      uint64_t first8) {
+  auto tmp = VarintParseSlowArm64(p, first8);
+  *out = tmp.second;
+  return tmp.first;
+}
+#endif
+
+template <typename T>
+[[nodiscard]] const char* VarintParse(const char* p, T* out) {
+  AssertBytesAreReadable(p, 10);
+#if defined(__aarch64__) && defined(ABSL_IS_LITTLE_ENDIAN) && !defined(_MSC_VER)
+  uint64_t first8;
+  std::memcpy(&first8, p, sizeof(first8));
+  if (ABSL_PREDICT_TRUE((first8 & 0x80) == 0)) {
+    *out = static_cast<uint8_t>(first8);
+    return p + 1;
+  }
+  if (ABSL_PREDICT_TRUE((first8 & 0x8000) == 0)) {
+    uint64_t chunk1;
+    uint64_t chunk2;
+    chunk1 = Ubfx7(first8, 0);
+    chunk2 = Ubfx7(first8, 8);
+    *out = chunk1 | (chunk2 << 7);
+    return p + 2;
+  }
+  return VarintParseSlowArm(p, out, first8);
+#else
+  auto ptr = reinterpret_cast<const uint8_t*>(p);
+  uint32_t res = ptr[0];
+  if ((res & 0x80) == 0) {
+    *out = res;
+    return p + 1;
+  }
+  return VarintParseSlow(p, res, out);
+#endif
+}
+
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+PROTOBUF_EXPORT
+std::pair<const char*, uint32_t> ReadTagFallback(const char* p, uint32_t res);
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+inline const char* ReadTag(const char* p, uint32_t* out,
+                           uint32_t  = 0) {
+  uint32_t res = static_cast<uint8_t>(p[0]);
+  if (res < 128) {
+    *out = res;
+    return p + 1;
+  }
+  uint32_t second = static_cast<uint8_t>(p[1]);
+  res += (second - 1) << 7;
+  if (second < 128) {
+    *out = res;
+    return p + 2;
+  }
+  auto tmp = ReadTagFallback(p, res);
+  *out = tmp.second;
+  return tmp.first;
+}
+
+template <class T>
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+    [[nodiscard]] PROTOBUF_ALWAYS_INLINE constexpr T
+    RotateLeft(T x, int s) noexcept {
+  return static_cast<T>(x << (s & (std::numeric_limits<T>::digits - 1))) |
+         static_cast<T>(x >> ((-s) & (std::numeric_limits<T>::digits - 1)));
+}
+
+[[nodiscard]] PROTOBUF_ALWAYS_INLINE uint64_t
+RotRight7AndReplaceLowByte(uint64_t res, const char byte) {
+#if defined(__x86_64__) && defined(__GNUC__)
+  asm("ror $7,%0\n\t"
+      "movb %1,%b0"
+      : "+r"(res)
+      : "m"(byte));
+#else
+  res = RotateLeft(res, -7);
+  res = res & ~0xFF;
+  res |= 0xFF & byte;
+#endif
+  return res;
+}
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+PROTOBUF_ALWAYS_INLINE const char* ReadTagInlined(const char* ptr,
+                                                  uint32_t* out) {
+  uint64_t res = 0xFF & ptr[0];
+  if (ABSL_PREDICT_FALSE(res >= 128)) {
+    res = RotRight7AndReplaceLowByte(res, ptr[1]);
+    if (ABSL_PREDICT_FALSE(res & 0x80)) {
+      res = RotRight7AndReplaceLowByte(res, ptr[2]);
+      if (ABSL_PREDICT_FALSE(res & 0x80)) {
+        res = RotRight7AndReplaceLowByte(res, ptr[3]);
+        if (ABSL_PREDICT_FALSE(res & 0x80)) {
+          res = RotRight7AndReplaceLowByte(res, ptr[4]);
+          if (ABSL_PREDICT_FALSE(res & 0x80)) {
+            *out = 0;
+            return nullptr;
+          }
+          *out = static_cast<uint32_t>(RotateLeft(res, 28));
+#if defined(__GNUC__)
+          asm("" : "+r"(ptr));
+#endif
+          return ptr + 5;
+        }
+        *out = static_cast<uint32_t>(RotateLeft(res, 21));
+        return ptr + 4;
+      }
+      *out = static_cast<uint32_t>(RotateLeft(res, 14));
+      return ptr + 3;
+    }
+    *out = static_cast<uint32_t>(RotateLeft(res, 7));
+    return ptr + 2;
+  }
+  *out = static_cast<uint32_t>(res);
+  return ptr + 1;
+}
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+inline uint32_t DecodeTwoBytes(const char** ptr) {
+  uint32_t value = UnalignedLoad<uint16_t>(*ptr);
+  uint32_t x = static_cast<int8_t>(value);
+  value &= x;  
+  value += x;
+  *ptr += value < x ? 2 : 1;
+  return value;
+}
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+inline const char* ParseBigVarint(const char* p, uint64_t* out) {
+  auto pnew = p;
+  auto tmp = DecodeTwoBytes(&pnew);
+  uint64_t res = tmp >> 1;
+  if (ABSL_PREDICT_TRUE(static_cast<std::int16_t>(tmp) >= 0)) {
+    *out = res;
+    return pnew;
+  }
+  for (std::uint32_t i = 1; i < 5; i++) {
+    pnew = p + 2 * i;
+    tmp = DecodeTwoBytes(&pnew);
+    res += (static_cast<std::uint64_t>(tmp) - 2) << (14 * i - 1);
+    if (ABSL_PREDICT_TRUE(static_cast<std::int16_t>(tmp) >= 0)) {
+      *out = res;
+      return pnew;
+    }
+  }
+  return nullptr;
+}
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+PROTOBUF_EXPORT
+std::pair<const char*, int32_t> ReadSizeFallback(const char* p, uint32_t res);
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+inline uint32_t ReadSize(const char** pp) {
+  auto p = *pp;
+  uint32_t res = static_cast<uint8_t>(p[0]);
+  if (res < 128) {
+    *pp = p + 1;
+    return res;
+  }
+  auto x = ReadSizeFallback(p, res);
+  *pp = x.first;
+  return x.second;
+}
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+inline uint64_t ReadVarint64(const char** p) {
+  uint64_t tmp;
+  *p = VarintParse(*p, &tmp);
+  return tmp;
+}
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+inline uint32_t ReadVarint32(const char** p) {
+  uint32_t tmp;
+  *p = VarintParse(*p, &tmp);
+  return tmp;
+}
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+inline int64_t ReadVarintZigZag64(const char** p) {
+  uint64_t tmp;
+  *p = VarintParse(*p, &tmp);
+  return WireFormatLite::ZigZagDecode64(tmp);
+}
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+inline int32_t ReadVarintZigZag32(const char** p) {
+  uint64_t tmp;
+  *p = VarintParse(*p, &tmp);
+  return WireFormatLite::ZigZagDecode32(static_cast<uint32_t>(tmp));
+}
+
+template <typename Func>
+[[nodiscard]] PROTOBUF_ALWAYS_INLINE const char*
+ParseContext::ParseLengthDelimitedInlined(const char* ptr, const Func& func) {
+  LimitToken old;
+  ptr = ReadSizeAndPushLimitAndDepthInlined(ptr, &old);
+  if (ptr == nullptr) return ptr;
+  auto old_depth = depth_;
+  PROTOBUF_ALWAYS_INLINE_CALL ptr = func(ptr);
+  if (ptr != nullptr) ABSL_DCHECK_EQ(old_depth, depth_);
+  depth_++;
+  if (!PopLimit(std::move(old))) return nullptr;
+  return ptr;
+}
+
+template <typename Func>
+[[nodiscard]] PROTOBUF_ALWAYS_INLINE const char*
+ParseContext::ParseGroupInlined(const char* ptr, uint32_t start_tag,
+                                const Func& func) {
+  if (--depth_ < 0) return nullptr;
+  group_depth_++;
+  auto old_depth = depth_;
+  auto old_group_depth = group_depth_;
+  PROTOBUF_ALWAYS_INLINE_CALL ptr = func(ptr);
+  if (ptr != nullptr) {
+    ABSL_DCHECK_EQ(old_depth, depth_);
+    ABSL_DCHECK_EQ(old_group_depth, group_depth_);
+  }
+  group_depth_--;
+  depth_++;
+  if (ABSL_PREDICT_FALSE(!ConsumeEndGroup(start_tag))) return nullptr;
+  return ptr;
+}
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+inline const char* ParseContext::ReadSizeAndPushLimitAndDepthInlined(
+    const char* ptr, LimitToken* old_limit) {
+  int size = ReadSize(&ptr);
+  if (ABSL_PREDICT_FALSE(!ptr) || depth_ <= 0) {
+    return nullptr;
+  }
+  *old_limit = PushLimit(ptr, size);
+  --depth_;
+  return ptr;
+}
+
+template <typename Func>
+[[nodiscard]] PROTOBUF_ALWAYS_INLINE const char*
+ParseContext::ParseWithLengthInlined(const char* ptr, uint32_t length,
+                                     const Func& func) {
+  ABSL_DCHECK_NE(ptr, nullptr);
+  LimitToken old;
+  old = PushLimit(ptr, length);
+  --depth_;
+  auto old_depth = depth_;
+  PROTOBUF_ALWAYS_INLINE_CALL ptr = func(ptr);
+  if (ptr != nullptr) ABSL_DCHECK_EQ(old_depth, depth_);
+  depth_++;
+  if (!PopLimit(std::move(old))) return nullptr;
+  return ptr;
+}
+
+inline const char* EpsCopyInputStream::ReadMicroString(const char* ptr,
+                                                       MicroString& str,
+                                                       Arena* arena) {
+  int size = ReadSize(&ptr);
+  if (!ptr) return nullptr;
+
+  return ReadMicroStringWithSize(ptr, size, str, arena);
+}
+
+inline const char* EpsCopyInputStream::ReadMicroStringWithSize(const char* ptr,
+                                                               int size,
+                                                               MicroString& str,
+                                                               Arena* arena) {
+  if (size <= BytesAvailable(ptr)) {
+    str.Set(absl::string_view(ptr, size), arena);
+    return ptr + size;
+  }
+  return ReadMicroStringFallback(ptr, size, str, arena);
+}
+
+template <typename Tag, typename T>
+const char* EpsCopyInputStream::ReadRepeatedFixed(const char* ptr, Arena* arena,
+                                                  Tag expected_tag,
+                                                  RepeatedField<T>* out) {
+  do {
+    out->AddWithArena(arena, UnalignedLoad<T>(ptr));
+    ptr += sizeof(T);
+    if (ABSL_PREDICT_FALSE(ptr >= limit_end_)) return ptr;
+  } while (UnalignedLoad<Tag>(ptr) == expected_tag && (ptr += sizeof(Tag)));
+  return ptr;
+}
+
+
+#define GOOGLE_PROTOBUF_ASSERT_RETURN(predicate, ret) \
+  if (!(predicate)) {                                  \
+                               \
+            \
+    return ret;                                        \
+  }
+
+#define GOOGLE_PROTOBUF_PARSER_ASSERT(predicate) \
+  GOOGLE_PROTOBUF_ASSERT_RETURN(predicate, nullptr)
+
+template <typename T>
+const char* EpsCopyInputStream::ReadPackedFixed(const char* ptr, Arena* arena,
+                                                int size,
+                                                RepeatedField<T>* out) {
+  ABSL_DCHECK_EQ(arena, out->GetArena());
+  GOOGLE_PROTOBUF_PARSER_ASSERT(ptr);
+  int nbytes = BytesAvailable(ptr);
+  while (size > nbytes) {
+    int num = nbytes / sizeof(T);
+    int old_entries = out->size();
+    out->ReserveWithArena(arena, old_entries + num);
+    int block_size = num * sizeof(T);
+    auto dst = out->AddNAlreadyReserved(num);
+#if defined(ABSL_IS_LITTLE_ENDIAN)
+    std::memcpy(dst, ptr, block_size);
+#else
+    for (int i = 0; i < num; i++)
+      dst[i] = UnalignedLoad<T>(ptr + i * sizeof(T));
+#endif
+    size -= block_size;
+    if (limit_ <= kSlopBytes) return nullptr;
+    ptr = Next();
+    if (ptr == nullptr) return nullptr;
+    ptr += kSlopBytes - (nbytes - block_size);
+    nbytes = BytesAvailable(ptr);
+  }
+  int num = size / sizeof(T);
+  int block_size = num * sizeof(T);
+  if (num == 0) return size == block_size ? ptr : nullptr;
+  int old_entries = out->size();
+  out->ReserveWithArena(arena, old_entries + num);
+  auto dst = out->AddNAlreadyReserved(num);
+#if defined(ABSL_IS_LITTLE_ENDIAN)
+  ABSL_CHECK(dst != nullptr) << out << "," << num;
+  std::memcpy(dst, ptr, block_size);
+#else
+  for (int i = 0; i < num; i++) dst[i] = UnalignedLoad<T>(ptr + i * sizeof(T));
+#endif
+  ptr += block_size;
+  if (size != block_size) return nullptr;
+  return ptr;
+}
+
+template <typename Add>
+const char* EpsCopyInputStream::ReadPackedVarintArray(const char* ptr,
+                                                      const char* end,
+                                                      Add add) {
+  while (ptr < end) {
+    uint64_t varint;
+    ptr = VarintParse(ptr, &varint);
+    if (ptr == nullptr) return nullptr;
+    add(varint);
+  }
+  return ptr;
+}
+
+template <typename Convert, typename T>
+const char* EpsCopyInputStream::ReadPackedVarintArrayWithField(
+    const char* ptr, const char* end, Arena* arena, Convert conv,
+    RepeatedField<T>& out) {
+  ABSL_DCHECK_EQ(arena, out.GetArena());
+
+  if (end - ptr >= 16) {
+    if constexpr (std::is_same_v<T, bool> && sizeof(bool) == sizeof(uint8_t)) {
+      if (absl::bit_cast<uint8_t>(false) == 0 &&  
+          absl::bit_cast<uint8_t>(true) == 1) {
+        if (VerifyBoolsAssumingLargeArray(ptr, end)) {
+          const int count = end - ptr;
+          out.ReserveWithArena(arena, out.size() + count);
+          T* x = out.AddNAlreadyReserved(count);
+          std::memcpy(x, ptr, count);
+          return end;
+        }
+      }
+    }
+    int count = CountVarintsAssumingLargeArray(ptr, end);
+    if (count == end - ptr) {
+      out.ReserveWithArena(arena, out.size() + count);
+      T* x = out.AddNAlreadyReserved(count);
+      for (; ptr != end; ++ptr) {
+        *x = conv(static_cast<uint8_t>(*ptr));
+        ++x;
+      }
+    } else {
+      if (end[-1] & 0x80) count++;
+      int old_size = out.size();
+      out.ReserveWithArena(arena, old_size + count);
+      T* x = out.AddNAlreadyReserved(count);
+      ptr = ReadPackedVarintArray(ptr, end, [&](uint64_t varint) {
+        *x = conv(varint);
+        ++x;
+      });
+      int new_size = x - out.data();
+      ABSL_DCHECK_LE(new_size, old_size + count);
+      out.Truncate(new_size);
+    }
+    return ptr;
+  } else {
+    return ReadPackedVarintArray(ptr, end, [&](uint64_t varint) {
+      out.AddWithArena(arena, conv(varint));
+    });
+  }
+}
+
+template <typename Convert, typename T>
+const char* EpsCopyInputStream::ReadPackedVarintWithField(
+    const char* ptr, Arena* arena, Convert conv, RepeatedField<T>& out) {
+  int size = ReadSize(&ptr);
+
+  GOOGLE_PROTOBUF_PARSER_ASSERT(ptr);
+  int chunk_size = static_cast<int>(buffer_end_ - ptr);
+  while (size > chunk_size) {
+    ptr = ReadPackedVarintArrayWithField(ptr, buffer_end_, arena, conv, out);
+    if (ptr == nullptr) return nullptr;
+    int overrun = static_cast<int>(ptr - buffer_end_);
+    ABSL_DCHECK(overrun >= 0 && overrun <= kSlopBytes);
+    if (size - chunk_size <= kSlopBytes) {
+      char buf[kSlopBytes + 10] = {};
+      std::memcpy(buf, buffer_end_, kSlopBytes);
+      ABSL_CHECK_LE(size - chunk_size, kSlopBytes);
+      auto end = buf + (size - chunk_size);
+      auto result = ReadPackedVarintArray(
+          buf + overrun, end,
+          [&](uint64_t varint) { out.AddWithArena(arena, conv(varint)); });
+      if (result == nullptr || result != end) return nullptr;
+      return buffer_end_ + (result - buf);
+    }
+    size -= overrun + chunk_size;
+    ABSL_DCHECK_GT(size, 0);
+    if (limit_ <= kSlopBytes) return nullptr;
+    ptr = Next();
+    if (ptr == nullptr) return nullptr;
+    ptr += overrun;
+    chunk_size = static_cast<int>(buffer_end_ - ptr);
+  }
+  auto end = ptr + size;
+  ptr = ReadPackedVarintArrayWithField(ptr, end, arena, conv, out);
+  return end == ptr ? ptr : nullptr;
+}
+
+template <typename Add, typename SizeCb>
+const char* EpsCopyInputStream::ReadPackedVarint(const char* ptr, Add add,
+                                                 SizeCb size_callback) {
+  int size = ReadSize(&ptr);
+  size_callback(size);
+
+  GOOGLE_PROTOBUF_PARSER_ASSERT(ptr);
+  int chunk_size = static_cast<int>(buffer_end_ - ptr);
+  while (size > chunk_size) {
+    ptr = ReadPackedVarintArray(ptr, buffer_end_, add);
+    if (ptr == nullptr) return nullptr;
+    int overrun = static_cast<int>(ptr - buffer_end_);
+    ABSL_DCHECK(overrun >= 0 && overrun <= kSlopBytes);
+    if (size - chunk_size <= kSlopBytes) {
+      char buf[kSlopBytes + 10] = {};
+      std::memcpy(buf, buffer_end_, kSlopBytes);
+      ABSL_CHECK_LE(size - chunk_size, kSlopBytes);
+      auto end = buf + (size - chunk_size);
+      auto res = ReadPackedVarintArray(buf + overrun, end, add);
+      if (res == nullptr || res != end) return nullptr;
+      return buffer_end_ + (res - buf);
+    }
+    size -= overrun + chunk_size;
+    ABSL_DCHECK_GT(size, 0);
+    if (limit_ <= kSlopBytes) return nullptr;
+    ptr = Next();
+    if (ptr == nullptr) return nullptr;
+    ptr += overrun;
+    chunk_size = static_cast<int>(buffer_end_ - ptr);
+  }
+  auto end = ptr + size;
+  ptr = ReadPackedVarintArray(ptr, end, add);
+  return end == ptr ? ptr : nullptr;
+}
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+PROTOBUF_EXPORT
+bool VerifyUTF8(absl::string_view s, const char* field_name);
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+inline bool VerifyUTF8(const std::string* s, const char* field_name) {
+  return VerifyUTF8(*s, field_name);
+}
+
+[[nodiscard]] PROTOBUF_EXPORT const char* InlineGreedyStringParser(
+    std::string* s, const char* ptr, ParseContext* ctx);
+
+[[nodiscard]] inline const char* InlineCordParser(::absl::Cord* cord,
+                                                  const char* ptr,
+                                                  ParseContext* ctx) {
+  int size = ReadSize(&ptr);
+  if (!ptr) return nullptr;
+  return ctx->ReadCord(ptr, size, cord);
+}
+
+
+template <typename T>
+[[nodiscard]] const char* FieldParser(uint64_t tag, T& field_parser,
+                                      const char* ptr, ParseContext* ctx) {
+  uint32_t number = tag >> 3;
+  GOOGLE_PROTOBUF_PARSER_ASSERT(number != 0);
+  using WireType = internal::WireFormatLite::WireType;
+  switch (tag & 7) {
+    case WireType::WIRETYPE_VARINT: {
+      uint64_t value;
+      ptr = VarintParse(ptr, &value);
+      GOOGLE_PROTOBUF_PARSER_ASSERT(ptr);
+      field_parser.AddVarint(number, value);
+      break;
+    }
+    case WireType::WIRETYPE_FIXED64: {
+      uint64_t value = UnalignedLoad<uint64_t>(ptr);
+      ptr += 8;
+      field_parser.AddFixed64(number, value);
+      break;
+    }
+    case WireType::WIRETYPE_LENGTH_DELIMITED: {
+      ptr = field_parser.ParseLengthDelimited(number, ptr, ctx);
+      GOOGLE_PROTOBUF_PARSER_ASSERT(ptr);
+      break;
+    }
+    case WireType::WIRETYPE_START_GROUP: {
+      ptr = field_parser.ParseGroup(number, ptr, ctx);
+      GOOGLE_PROTOBUF_PARSER_ASSERT(ptr);
+      break;
+    }
+    case WireType::WIRETYPE_END_GROUP: {
+      ABSL_LOG(FATAL) << "Can't happen";
+      break;
+    }
+    case WireType::WIRETYPE_FIXED32: {
+      uint32_t value = UnalignedLoad<uint32_t>(ptr);
+      ptr += 4;
+      field_parser.AddFixed32(number, value);
+      break;
+    }
+    default:
+      return nullptr;
+  }
+  return ptr;
+}
+
+template <typename T>
+[[nodiscard]] const char* WireFormatParser(T& field_parser, const char* ptr,
+                                           ParseContext* ctx) {
+  while (!ctx->Done(&ptr)) {
+    uint32_t tag;
+    ptr = ReadTag(ptr, &tag);
+    GOOGLE_PROTOBUF_PARSER_ASSERT(ptr != nullptr);
+    if (tag == 0 || (tag & 7) == 4) {
+      ctx->SetLastTag(tag);
+      return ptr;
+    }
+    ptr = FieldParser(tag, field_parser, ptr, ctx);
+    GOOGLE_PROTOBUF_PARSER_ASSERT(ptr != nullptr);
+  }
+  return ptr;
+}
+
+
+[[nodiscard]] PROTOBUF_EXPORT const char* PackedInt32Parser(void* object,
+                                                            Arena* arena,
+                                                            const char* ptr,
+                                                            ParseContext* ctx);
+[[nodiscard]] PROTOBUF_EXPORT const char* PackedUInt32Parser(void* object,
+                                                             Arena* arena,
+                                                             const char* ptr,
+                                                             ParseContext* ctx);
+[[nodiscard]] PROTOBUF_EXPORT const char* PackedInt64Parser(void* object,
+                                                            Arena* arena,
+                                                            const char* ptr,
+                                                            ParseContext* ctx);
+[[nodiscard]] PROTOBUF_EXPORT const char* PackedUInt64Parser(void* object,
+                                                             Arena* arena,
+                                                             const char* ptr,
+                                                             ParseContext* ctx);
+[[nodiscard]] PROTOBUF_EXPORT const char* PackedSInt32Parser(void* object,
+                                                             Arena* arena,
+                                                             const char* ptr,
+                                                             ParseContext* ctx);
+[[nodiscard]] PROTOBUF_EXPORT const char* PackedSInt64Parser(void* object,
+                                                             Arena* arena,
+                                                             const char* ptr,
+                                                             ParseContext* ctx);
+[[nodiscard]] PROTOBUF_EXPORT const char* PackedEnumParser(void* object,
+                                                           Arena* arena,
+                                                           const char* ptr,
+                                                           ParseContext* ctx);
+
+template <typename T, typename Validator>
+[[nodiscard]] const char* PackedEnumParserArg(void* object, const char* ptr,
+                                              ParseContext* ctx,
+                                              Validator validator,
+                                              InternalMetadata* metadata,
+                                              int field_num) {
+  return ctx->ReadPackedVarint(
+      ptr, [object, validator, metadata, field_num](int32_t val) {
+        if (validator.IsValid(val)) {
+          static_cast<RepeatedField<int>*>(object)->Add(val);
+        } else {
+          WriteVarint(field_num, val, metadata->mutable_unknown_fields<T>());
+        }
+      });
+}
+
+[[nodiscard]] PROTOBUF_EXPORT const char* PackedBoolParser(void* object,
+                                                           Arena* arena,
+                                                           const char* ptr,
+                                                           ParseContext* ctx);
+[[nodiscard]] PROTOBUF_EXPORT const char* PackedFixed32Parser(
+    void* object, Arena* arena, const char* ptr, ParseContext* ctx);
+[[nodiscard]] PROTOBUF_EXPORT const char* PackedSFixed32Parser(
+    void* object, Arena* arena, const char* ptr, ParseContext* ctx);
+[[nodiscard]] PROTOBUF_EXPORT const char* PackedFixed64Parser(
+    void* object, Arena* arena, const char* ptr, ParseContext* ctx);
+[[nodiscard]] PROTOBUF_EXPORT const char* PackedSFixed64Parser(
+    void* object, Arena* arena, const char* ptr, ParseContext* ctx);
+[[nodiscard]] PROTOBUF_EXPORT const char* PackedFloatParser(void* object,
+                                                            Arena* arena,
+                                                            const char* ptr,
+                                                            ParseContext* ctx);
+[[nodiscard]] PROTOBUF_EXPORT const char* PackedDoubleParser(void* object,
+                                                             Arena* arena,
+                                                             const char* ptr,
+                                                             ParseContext* ctx);
+
+[[nodiscard]] PROTOBUF_EXPORT const char* UnknownGroupLiteParse(
+    std::string* unknown, const char* ptr, ParseContext* ctx);
+[[nodiscard]] PROTOBUF_EXPORT const char* UnknownFieldParse(
+    uint32_t tag, std::string* unknown, const char* ptr, ParseContext* ctx);
+
+}  
+}  
+}  
+
+#include "google/protobuf/port_undef.inc"
+
+#endif

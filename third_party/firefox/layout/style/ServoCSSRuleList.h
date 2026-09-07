@@ -1,0 +1,82 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_ServoCSSRuleList_h
+#define mozilla_ServoCSSRuleList_h
+
+#include "mozilla/ServoBindingTypes.h"
+#include "mozilla/dom/CSSRuleList.h"
+
+namespace mozilla {
+
+namespace dom {
+class CSSStyleRule;
+}  
+class StyleSheet;
+namespace css {
+class GroupRule;
+class Rule;
+}  
+
+class ServoCSSRuleList final : public dom::CSSRuleList {
+ public:
+  ServoCSSRuleList(already_AddRefed<StyleLockedCssRules> aRawRules,
+                   StyleSheet* aSheet, css::GroupRule* aParentRule);
+  css::GroupRule* GetParentRule() const { return mParentRule; }
+  void DropSheetReference();
+  void DropParentRuleReference();
+
+  void DropReferences() {
+    DropSheetReference();
+    DropParentRuleReference();
+  }
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(ServoCSSRuleList, dom::CSSRuleList)
+
+  StyleSheet* GetParentObject() final { return mStyleSheet; }
+
+  css::Rule* IndexedGetter(uint32_t aIndex, bool& aFound) final;
+  uint32_t Length() final { return mRules.Length(); }
+
+  css::Rule* GetRule(uint32_t aIndex);
+  nsresult InsertRule(const nsACString& aRule, uint32_t aIndex);
+  nsresult DeleteRule(uint32_t aIndex);
+
+  void SetRawContents(RefPtr<StyleLockedCssRules>, bool aFromClone);
+  void SetRawAfterClone(RefPtr<StyleLockedCssRules> aRules) {
+    SetRawContents(std::move(aRules),  true);
+  }
+
+ private:
+  virtual ~ServoCSSRuleList();
+
+  static const uintptr_t kMaxRuleType = UINT8_MAX;
+
+  static uintptr_t CastToUint(css::Rule* aPtr) {
+    return reinterpret_cast<uintptr_t>(aPtr);
+  }
+  static css::Rule* CastToPtr(uintptr_t aInt) {
+    MOZ_ASSERT(aInt > kMaxRuleType);
+    return reinterpret_cast<css::Rule*>(aInt);
+  }
+
+  template <typename Func>
+  void EnumerateInstantiatedRules(Func aCallback);
+
+  void DropAllRules();
+  void ResetRules();
+
+  bool IsReadOnly() const;
+
+  StyleSheet* mStyleSheet = nullptr;
+  css::GroupRule* mParentRule = nullptr;
+  RefPtr<StyleLockedCssRules> mRawRules;
+  nsTArray<uintptr_t> mRules;
+};
+
+}  
+
+#endif  // mozilla_ServoCSSRuleList_h

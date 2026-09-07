@@ -1,0 +1,80 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsSegmentedBuffer_h_
+#define nsSegmentedBuffer_h_
+
+#include <stddef.h>
+
+#include "nsCOMPtr.h"
+#include "nsDebug.h"
+#include "nsError.h"
+#include "nsTArray.h"
+#include "mozilla/DataMutex.h"
+#include "mozilla/UniquePtrExtensions.h"
+
+class nsIEventTarget;
+
+class nsSegmentedBuffer {
+ public:
+  nsSegmentedBuffer()
+      : mSegmentSize(0),
+        mSegmentArray(nullptr),
+        mSegmentArrayCount(0),
+        mFirstSegmentIndex(0),
+        mLastSegmentIndex(0) {}
+
+  ~nsSegmentedBuffer() { Clear(); }
+
+  nsresult Init(uint32_t aSegmentSize);
+
+  char* AppendNewSegment(mozilla::UniqueFreePtr<char> aSegment = nullptr);
+
+  mozilla::UniqueFreePtr<char> PopFirstSegment();
+
+  mozilla::UniqueFreePtr<char> PopLastSegment();
+
+  bool ReallocLastSegment(size_t aNewSize);
+
+  void Clear();  
+
+  inline uint32_t GetSegmentCount() {
+    if (mFirstSegmentIndex <= mLastSegmentIndex) {
+      return mLastSegmentIndex - mFirstSegmentIndex;
+    } else {
+      return mSegmentArrayCount + mLastSegmentIndex - mFirstSegmentIndex;
+    }
+  }
+
+  inline uint32_t GetSegmentSize() { return mSegmentSize; }
+
+  inline char* GetSegment(uint32_t aIndex) {
+    NS_ASSERTION(aIndex < GetSegmentCount(), "index out of bounds");
+    int32_t i = ModSegArraySize(mFirstSegmentIndex + (int32_t)aIndex);
+    return mSegmentArray[i];
+  }
+
+ protected:
+  inline int32_t ModSegArraySize(int32_t aIndex) {
+    uint32_t result = aIndex & (mSegmentArrayCount - 1);
+    NS_ASSERTION(result == aIndex % mSegmentArrayCount,
+                 "non-power-of-2 mSegmentArrayCount");
+    return result;
+  }
+
+  inline bool IsFull() {
+    return ModSegArraySize(mLastSegmentIndex + 1) == mFirstSegmentIndex;
+  }
+
+ protected:
+  uint32_t mSegmentSize;
+  char** mSegmentArray;
+  uint32_t mSegmentArrayCount;
+  int32_t mFirstSegmentIndex;
+  int32_t mLastSegmentIndex;
+};
+
+#define NS_SEGMENTARRAY_INITIAL_COUNT 32
+
+#endif  // nsSegmentedBuffer_h_

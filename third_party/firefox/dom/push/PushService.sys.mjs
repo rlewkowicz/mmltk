@@ -1,0 +1,1196 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+import { clearTimeout, setTimeout } from "resource://gre/modules/Timer.sys.mjs";
+import { XPCOMUtils } from "resource://gre/modules/XPCOMUtils.sys.mjs";
+import { ChromePushSubscription } from "./ChromePushSubscription.sys.mjs";
+
+const lazy = {};
+
+XPCOMUtils.defineLazyServiceGetter(
+  lazy,
+  "gPushNotifier",
+  "@mozilla.org/push/Notifier;1",
+  Ci.nsIPushNotifier
+);
+ChromeUtils.defineESModuleGetters(lazy, {
+  PushCrypto: "resource://gre/modules/PushCrypto.sys.mjs",
+  PushServiceWebSocket: "resource://gre/modules/PushServiceWebSocket.sys.mjs",
+  pushBroadcastService: "resource://gre/modules/PushBroadcastService.sys.mjs",
+});
+
+ChromeUtils.defineLazyGetter(lazy, "console", () => {
+  return console.createInstance({
+    maxLogLevelPref: "dom.push.loglevel",
+    prefix: "PushService",
+  });
+});
+
+const prefs = Services.prefs.getBranch("dom.push.");
+
+const PUSH_SERVICE_UNINIT = 0;
+const PUSH_SERVICE_INIT = 1; 
+const PUSH_SERVICE_ACTIVATING = 2; 
+const PUSH_SERVICE_CONNECTION_DISABLE = 3;
+const PUSH_SERVICE_ACTIVE_OFFLINE = 4;
+const PUSH_SERVICE_RUNNING = 5;
+
+
+const STARTING_SERVICE_EVENT = 0;
+const CHANGING_SERVICE_EVENT = 1;
+const STOPPING_SERVICE_EVENT = 2;
+const UNINIT_EVENT = 3;
+
+function getServiceForServerURI(uri) {
+  let allowInsecure = prefs.getBoolPref(
+    "testing.allowInsecureServerURL",
+    false
+  );
+  if (uri.scheme == "wss" || (allowInsecure && uri.scheme == "ws")) {
+    return lazy.PushServiceWebSocket;
+  }
+  return null;
+}
+
+function errorWithResult(message, result = Cr.NS_ERROR_FAILURE) {
+  let error = new Error(message);
+  error.result = result;
+  return error;
+}
+
+export var PushService = {
+  _service: null,
+  _state: PUSH_SERVICE_UNINIT,
+  _db: null,
+  _options: null,
+  _visibleNotifications: new Map(),
+
+  _updateQuotaTestCallback: null,
+
+  _updateQuotaTimeouts: new Set(),
+
+  _stateChangeProcessQueue: null,
+  _stateChangeProcessEnqueue(op) {
+    if (!this._stateChangeProcessQueue) {
+      this._stateChangeProcessQueue = Promise.resolve();
+    }
+
+    this._stateChangeProcessQueue = this._stateChangeProcessQueue
+      .then(op)
+      .catch(error => {
+        lazy.console.error(
+          "stateChangeProcessEnqueue: Error transitioning state",
+          error
+        );
+        return this._shutdownService();
+      })
+      .catch(error => {
+        lazy.console.error(
+          "stateChangeProcessEnqueue: Error shutting down service",
+          error
+        );
+      });
+    return this._stateChangeProcessQueue;
+  },
+
+  _pendingRegisterRequest: {},
+  _notifyActivated: null,
+  _activated: null,
+  _checkActivated() {
+    if (this._state < PUSH_SERVICE_ACTIVATING) {
+      return Promise.reject(new Error("Push service not active"));
+    }
+    if (this._state > PUSH_SERVICE_ACTIVATING) {
+      return Promise.resolve();
+    }
+    if (!this._activated) {
+      this._activated = new Promise((resolve, reject) => {
+        this._notifyActivated = { resolve, reject };
+      });
+    }
+    return this._activated;
+  },
+
+  _makePendingKey(aPageRecord) {
+    return aPageRecord.scope + "|" + aPageRecord.originAttributes;
+  },
+
+  _lookupOrPutPendingRequest(aPageRecord) {
+    let key = this._makePendingKey(aPageRecord);
+    if (this._pendingRegisterRequest[key]) {
+      return this._pendingRegisterRequest[key];
+    }
+
+    return (this._pendingRegisterRequest[key] =
+      this._registerWithServer(aPageRecord));
+  },
+
+  _deletePendingRequest(aPageRecord) {
+    let key = this._makePendingKey(aPageRecord);
+    if (this._pendingRegisterRequest[key]) {
+      delete this._pendingRegisterRequest[key];
+    }
+  },
+
+  _setState(aNewState) {
+    lazy.console.debug(
+      "setState()",
+      "new state",
+      aNewState,
+      "old state",
+      this._state
+    );
+
+    if (this._state == aNewState) {
+      return;
+    }
+
+    if (this._state == PUSH_SERVICE_ACTIVATING) {
+      if (this._notifyActivated) {
+        if (aNewState < PUSH_SERVICE_ACTIVATING) {
+          this._notifyActivated.reject(new Error("Push service not active"));
+        } else {
+          this._notifyActivated.resolve();
+        }
+      }
+      this._notifyActivated = null;
+      this._activated = null;
+    }
+    this._state = aNewState;
+  },
+
+  async _changeStateOfflineEvent(offline, calledFromConnEnabledEvent) {
+    lazy.console.debug("changeStateOfflineEvent()", offline);
+
+    if (
+      this._state < PUSH_SERVICE_ACTIVE_OFFLINE &&
+      this._state != PUSH_SERVICE_ACTIVATING &&
+      !calledFromConnEnabledEvent
+    ) {
+      return;
+    }
+
+    if (offline) {
+      if (this._state == PUSH_SERVICE_RUNNING) {
+        this._service.disconnect();
+      }
+      this._setState(PUSH_SERVICE_ACTIVE_OFFLINE);
+      return;
+    }
+
+    if (this._state == PUSH_SERVICE_RUNNING) {
+      this._service.disconnect();
+    }
+
+    let broadcastListeners = await lazy.pushBroadcastService.getListeners();
+
+    this._setState(PUSH_SERVICE_RUNNING);
+
+    this._service.connect(broadcastListeners);
+  },
+
+  _changeStateConnectionEnabledEvent(enabled) {
+    lazy.console.debug("changeStateConnectionEnabledEvent()", enabled);
+
+    if (
+      this._state < PUSH_SERVICE_CONNECTION_DISABLE &&
+      this._state != PUSH_SERVICE_ACTIVATING
+    ) {
+      return Promise.resolve();
+    }
+
+    if (enabled) {
+      return this._changeStateOfflineEvent(Services.io.offline, true);
+    }
+
+    if (this._state == PUSH_SERVICE_RUNNING) {
+      this._service.disconnect();
+    }
+    this._setState(PUSH_SERVICE_CONNECTION_DISABLE);
+    return Promise.resolve();
+  },
+
+  changeTestServer(url, options = {}) {
+    lazy.console.debug("changeTestServer()");
+
+    return this._stateChangeProcessEnqueue(_ => {
+      if (this._state < PUSH_SERVICE_ACTIVATING) {
+        lazy.console.debug("changeTestServer: PushService not activated?");
+        return Promise.resolve();
+      }
+
+      return this._changeServerURL(url, CHANGING_SERVICE_EVENT, options);
+    });
+  },
+
+  observe: function observe(aSubject, aTopic, aData) {
+    switch (aTopic) {
+      case "quit-application":
+        this.uninit();
+        break;
+      case "network:offline-status-changed":
+        this._stateChangeProcessEnqueue(_ =>
+          this._changeStateOfflineEvent(aData === "offline", false)
+        );
+        break;
+
+      case "nsPref:changed":
+        if (aData == "serverURL") {
+          lazy.console.debug(
+            "observe: dom.push.serverURL changed for websocket",
+            prefs.getStringPref("serverURL")
+          );
+          this._stateChangeProcessEnqueue(_ =>
+            this._changeServerURL(
+              prefs.getStringPref("serverURL"),
+              CHANGING_SERVICE_EVENT
+            )
+          );
+        } else if (aData == "connection.enabled") {
+          this._stateChangeProcessEnqueue(_ =>
+            this._changeStateConnectionEnabledEvent(
+              prefs.getBoolPref("connection.enabled")
+            )
+          );
+        }
+        break;
+
+      case "idle-daily":
+        this._dropExpiredRegistrations().catch(error => {
+          lazy.console.error(
+            "Failed to drop expired registrations on idle",
+            error
+          );
+        });
+        break;
+
+      case "perm-changed":
+        this._onPermissionChange(aSubject, aData).catch(error => {
+          lazy.console.error(
+            "onPermissionChange: Error updating registrations:",
+            error
+          );
+        });
+        break;
+
+      case "clear-origin-attributes-data":
+        this._clearOriginData(aData).catch(error => {
+          lazy.console.error(
+            "clearOriginData: Error clearing origin data:",
+            error
+          );
+        });
+        break;
+    }
+  },
+
+  _clearOriginData(data) {
+    lazy.console.log("clearOriginData()");
+
+    if (!data) {
+      return Promise.resolve();
+    }
+
+    let pattern = JSON.parse(data);
+    return this._dropRegistrationsIf(record =>
+      record.matchesOriginAttributes(pattern)
+    );
+  },
+
+  _backgroundUnregister(record, reason) {
+    lazy.console.debug("backgroundUnregister()");
+
+    if (!this._service.isConnected() || !record) {
+      return;
+    }
+
+    lazy.console.debug("backgroundUnregister: Notifying server", record);
+    this._sendUnregister(record, reason)
+      .then(() => {
+        lazy.gPushNotifier.notifySubscriptionModified(
+          record.scope,
+          record.principal
+        );
+      })
+      .catch(e => {
+        lazy.console.error("backgroundUnregister: Error notifying server", e);
+      });
+  },
+
+  _findService(serverURL) {
+    lazy.console.debug("findService()");
+
+    if (!serverURL) {
+      lazy.console.warn("findService: No dom.push.serverURL found");
+      return [];
+    }
+
+    let uri;
+    try {
+      uri = Services.io.newURI(serverURL);
+    } catch (e) {
+      lazy.console.warn(
+        "findService: Error creating valid URI from",
+        "dom.push.serverURL",
+        serverURL
+      );
+      return [];
+    }
+
+    let service = getServiceForServerURI(uri);
+    return [service, uri];
+  },
+
+  _changeServerURL(serverURI, event, options = {}) {
+    lazy.console.debug("changeServerURL()");
+
+    switch (event) {
+      case UNINIT_EVENT:
+        return this._stopService(event);
+
+      case STARTING_SERVICE_EVENT: {
+        let [service, uri] = this._findService(serverURI);
+        if (!service) {
+          this._setState(PUSH_SERVICE_INIT);
+          return Promise.resolve();
+        }
+        return this._startService(service, uri, options).then(_ =>
+          this._changeStateConnectionEnabledEvent(
+            prefs.getBoolPref("connection.enabled")
+          )
+        );
+      }
+      case CHANGING_SERVICE_EVENT: {
+        let [service, uri] = this._findService(serverURI);
+        if (service) {
+          if (this._state == PUSH_SERVICE_INIT) {
+            this._setState(PUSH_SERVICE_ACTIVATING);
+            return this._startService(service, uri, options).then(_ =>
+              this._changeStateConnectionEnabledEvent(
+                prefs.getBoolPref("connection.enabled")
+              )
+            );
+          }
+          this._setState(PUSH_SERVICE_ACTIVATING);
+          return this._stopService(CHANGING_SERVICE_EVENT)
+            .then(_ => this._startService(service, uri, options))
+            .then(_ =>
+              this._changeStateConnectionEnabledEvent(
+                prefs.getBoolPref("connection.enabled")
+              )
+            );
+        }
+        if (this._state == PUSH_SERVICE_INIT) {
+          return Promise.resolve();
+        }
+        this._setState(PUSH_SERVICE_INIT);
+        return this._stopService(STOPPING_SERVICE_EVENT);
+      }
+      default:
+        lazy.console.error("Unexpected event in _changeServerURL", event);
+        return Promise.reject(new Error(`Unexpected event ${event}`));
+    }
+  },
+
+  async init(options = {}) {
+    lazy.console.debug("init()");
+
+    if (this._state > PUSH_SERVICE_UNINIT) {
+      return;
+    }
+
+    this._setState(PUSH_SERVICE_ACTIVATING);
+
+    prefs.addObserver("serverURL", this);
+    Services.obs.addObserver(this, "quit-application");
+
+    if (options.serverURI) {
+
+      await this._stateChangeProcessEnqueue(_ =>
+        this._changeServerURL(
+          options.serverURI,
+          STARTING_SERVICE_EVENT,
+          options
+        )
+      );
+    } else {
+      await this._stateChangeProcessEnqueue(_ =>
+        this._changeServerURL(
+          prefs.getStringPref("serverURL"),
+          STARTING_SERVICE_EVENT
+        )
+      );
+    }
+  },
+
+  _startObservers() {
+    lazy.console.debug("startObservers()");
+
+    if (this._state != PUSH_SERVICE_ACTIVATING) {
+      return;
+    }
+
+    Services.obs.addObserver(this, "clear-origin-attributes-data");
+
+    Services.obs.addObserver(this, "network:offline-status-changed");
+
+    prefs.addObserver("connection.enabled", this);
+
+    Services.obs.addObserver(this, "idle-daily");
+
+    Services.obs.addObserver(this, "perm-changed");
+  },
+
+  _startService(service, serverURI, options) {
+    lazy.console.debug("startService()");
+
+    if (this._state != PUSH_SERVICE_ACTIVATING) {
+      return Promise.reject();
+    }
+
+    this._service = service;
+
+    this._db = options.db;
+    if (!this._db) {
+      this._db = this._service.newPushDB();
+    }
+
+    return this._service.init(options, this, serverURI).then(() => {
+      this._startObservers();
+      return this._dropExpiredRegistrations();
+    });
+  },
+
+  _stopService(event) {
+    lazy.console.debug("stopService()");
+
+    if (this._state < PUSH_SERVICE_ACTIVATING) {
+      return Promise.resolve();
+    }
+
+    this._stopObservers();
+
+    this._service.disconnect();
+    this._service.uninit();
+    this._service = null;
+
+    this._updateQuotaTimeouts.forEach(timeoutID => clearTimeout(timeoutID));
+    this._updateQuotaTimeouts.clear();
+
+    if (!this._db) {
+      return Promise.resolve();
+    }
+    if (event == UNINIT_EVENT) {
+      this._db.close();
+      this._db = null;
+      return Promise.resolve();
+    }
+
+    return this.dropUnexpiredRegistrations().then(
+      _ => {
+        this._db.close();
+        this._db = null;
+      },
+      () => {
+        this._db.close();
+        this._db = null;
+      }
+    );
+  },
+
+  _stopObservers() {
+    lazy.console.debug("stopObservers()");
+
+    if (this._state < PUSH_SERVICE_ACTIVATING) {
+      return;
+    }
+
+    prefs.removeObserver("connection.enabled", this);
+
+    Services.obs.removeObserver(this, "network:offline-status-changed");
+    Services.obs.removeObserver(this, "clear-origin-attributes-data");
+    Services.obs.removeObserver(this, "idle-daily");
+    Services.obs.removeObserver(this, "perm-changed");
+  },
+
+  _shutdownService() {
+    let promiseChangeURL = this._changeServerURL("", UNINIT_EVENT);
+    this._setState(PUSH_SERVICE_UNINIT);
+    lazy.console.debug("shutdownService: shutdown complete!");
+    return promiseChangeURL;
+  },
+
+  async uninit() {
+    lazy.console.debug("uninit()");
+
+    if (this._state == PUSH_SERVICE_UNINIT) {
+      return;
+    }
+
+    prefs.removeObserver("serverURL", this);
+    Services.obs.removeObserver(this, "quit-application");
+
+    await this._stateChangeProcessEnqueue(_ => this._shutdownService());
+  },
+
+  dropUnexpiredRegistrations() {
+    return this._db.clearIf(record => {
+      if (record.isExpired()) {
+        return false;
+      }
+      this._notifySubscriptionChangeObservers(record);
+      return true;
+    });
+  },
+
+  _notifySubscriptionChangeObservers(record) {
+    if (!record) {
+      return;
+    }
+    lazy.gPushNotifier.notifySubscriptionChange(
+      record.scope,
+      record.principal,
+      new ChromePushSubscription(record.toSubscription())
+    );
+  },
+
+  dropRegistrationAndNotifyApp(aKeyID) {
+    return this._db
+      .delete(aKeyID)
+      .then(record => this._notifySubscriptionChangeObservers(record));
+  },
+
+  updateRecordAndNotifyApp(aKeyID, aUpdateFunc) {
+    return this._db.update(aKeyID, aUpdateFunc).then(record => {
+      this._notifySubscriptionChangeObservers(record);
+      return record;
+    });
+  },
+
+  ensureCrypto(record) {
+    if (
+      record.hasAuthenticationSecret() &&
+      record.p256dhPublicKey &&
+      record.p256dhPrivateKey
+    ) {
+      return Promise.resolve(record);
+    }
+
+    let keygen = Promise.resolve([]);
+    if (!record.p256dhPublicKey || !record.p256dhPrivateKey) {
+      keygen = lazy.PushCrypto.generateKeys();
+    }
+    return keygen.then(
+      ([pubKey, privKey]) => {
+        return this.updateRecordAndNotifyApp(record.keyID, recordToUpdate => {
+          if (
+            !recordToUpdate.p256dhPublicKey ||
+            !recordToUpdate.p256dhPrivateKey
+          ) {
+            recordToUpdate.p256dhPublicKey = pubKey;
+            recordToUpdate.p256dhPrivateKey = privKey;
+          }
+          if (!recordToUpdate.hasAuthenticationSecret()) {
+            recordToUpdate.authenticationSecret =
+              lazy.PushCrypto.generateAuthenticationSecret();
+          }
+          return recordToUpdate;
+        });
+      },
+      error => {
+        return this.dropRegistrationAndNotifyApp(record.keyID).then(() =>
+          Promise.reject(error)
+        );
+      }
+    );
+  },
+
+  receivedPushMessage(keyID, messageID, headers, data, updateFunc) {
+    lazy.console.debug("receivedPushMessage()");
+
+    return this._updateRecordAfterPush(keyID, updateFunc)
+      .then(record => {
+        if (record.quotaApplies()) {
+          let timeoutID = setTimeout(_ => {
+            this._updateQuota(keyID);
+            if (!this._updateQuotaTimeouts.delete(timeoutID)) {
+              lazy.console.debug(
+                "receivedPushMessage: quota update timeout missing?"
+              );
+            }
+          }, prefs.getIntPref("quotaUpdateDelay"));
+          this._updateQuotaTimeouts.add(timeoutID);
+        }
+        return this._decryptAndNotifyApp(record, messageID, headers, data);
+      })
+      .catch(error => {
+        lazy.console.error("receivedPushMessage: Error notifying app", error);
+        return Ci.nsIPushErrorReporter.ACK_NOT_DELIVERED;
+      });
+  },
+
+  receivedBroadcastMessage(message, context) {
+    lazy.pushBroadcastService
+      .receivedBroadcastMessage(message.broadcasts, context)
+      .catch(e => {
+        lazy.console.error(e);
+      });
+  },
+
+  _updateRecordAfterPush(keyID, updateFunc) {
+    return this.getByKeyID(keyID)
+      .then(record => {
+        if (!record) {
+          throw new Error("No record for key ID " + keyID);
+        }
+        return record
+          .getLastVisit()
+          .then(lastVisit => {
+            if (!isFinite(lastVisit)) {
+              throw new Error("Ignoring message sent to unvisited origin");
+            }
+            return lastVisit;
+          })
+          .then(lastVisit => {
+            return this._db.update(keyID, recordToUpdate => {
+              let newRecord = updateFunc(recordToUpdate);
+              if (!newRecord) {
+                return null;
+              }
+              if (newRecord.isExpired()) {
+                return null;
+              }
+              newRecord.receivedPush(lastVisit);
+              return newRecord;
+            });
+          });
+      })
+      .then(record => {
+        lazy.gPushNotifier.notifySubscriptionModified(
+          record.scope,
+          record.principal
+        );
+        return record;
+      });
+  },
+
+  _decryptAndNotifyApp(record, messageID, headers, data) {
+    return lazy.PushCrypto.decrypt(
+      record.p256dhPrivateKey,
+      record.p256dhPublicKey,
+      record.authenticationSecret,
+      headers,
+      data
+    ).then(
+      message => this._notifyApp(record, messageID, message),
+      error => {
+        lazy.console.warn(
+          "decryptAndNotifyApp: Error decrypting message",
+          record.scope,
+          messageID,
+          error
+        );
+
+        let message = error.format(record.scope);
+        lazy.gPushNotifier.notifyError(
+          record.scope,
+          record.principal,
+          message,
+          Ci.nsIScriptError.errorFlag
+        );
+        return Ci.nsIPushErrorReporter.ACK_DECRYPTION_ERROR;
+      }
+    );
+  },
+
+  _updateQuota(keyID) {
+    lazy.console.debug("updateQuota()");
+
+    this._db
+      .update(keyID, record => {
+        if (record.isExpired()) {
+          lazy.console.debug(
+            "updateQuota: Trying to update quota for expired record",
+            record
+          );
+          return null;
+        }
+        if (record.uri && !this._visibleNotifications.has(record.uri.prePath)) {
+          record.reduceQuota();
+        }
+        return record;
+      })
+      .then(record => {
+        if (record.isExpired()) {
+          this._backgroundUnregister(
+            record,
+            Ci.nsIPushErrorReporter.UNSUBSCRIBE_QUOTA_EXCEEDED
+          );
+        } else {
+          lazy.gPushNotifier.notifySubscriptionModified(
+            record.scope,
+            record.principal
+          );
+        }
+        if (this._updateQuotaTestCallback) {
+          this._updateQuotaTestCallback();
+        }
+      })
+      .catch(error => {
+        lazy.console.debug(
+          "updateQuota: Error while trying to update quota",
+          error
+        );
+      });
+  },
+
+  notificationForOriginShown(origin) {
+    lazy.console.debug("notificationForOriginShown()", origin);
+    let count;
+    if (this._visibleNotifications.has(origin)) {
+      count = this._visibleNotifications.get(origin);
+    } else {
+      count = 0;
+    }
+    this._visibleNotifications.set(origin, count + 1);
+  },
+
+  notificationForOriginClosed(origin) {
+    lazy.console.debug("notificationForOriginClosed()", origin);
+    let count;
+    if (this._visibleNotifications.has(origin)) {
+      count = this._visibleNotifications.get(origin);
+    } else {
+      lazy.console.debug(
+        "notificationForOriginClosed: closing notification that has not been shown?"
+      );
+      return;
+    }
+    if (count > 1) {
+      this._visibleNotifications.set(origin, count - 1);
+    } else {
+      this._visibleNotifications.delete(origin);
+    }
+  },
+
+  reportDeliveryError(messageID, reason) {
+    lazy.console.debug("reportDeliveryError()", messageID, reason);
+    if (this._state == PUSH_SERVICE_RUNNING && this._service.isConnected()) {
+      this._service.reportDeliveryError(messageID, reason);
+    }
+  },
+
+  _notifyApp(aPushRecord, messageID, message) {
+    if (
+      !aPushRecord ||
+      !aPushRecord.scope ||
+      aPushRecord.originAttributes === undefined
+    ) {
+      lazy.console.error("notifyApp: Invalid record", aPushRecord);
+      return Ci.nsIPushErrorReporter.ACK_NOT_DELIVERED;
+    }
+
+    lazy.console.debug("notifyApp()", aPushRecord.scope);
+
+    if (!aPushRecord.hasPermission()) {
+      lazy.console.warn("notifyApp: Missing push permission", aPushRecord);
+      return Ci.nsIPushErrorReporter.ACK_NOT_DELIVERED;
+    }
+
+    let payload = ArrayBuffer.isView(message)
+      ? new Uint8Array(message.buffer)
+      : message;
+
+    if (aPushRecord.quotaApplies()) {
+    }
+
+    if (payload) {
+      lazy.gPushNotifier.notifyPushWithData(
+        aPushRecord.scope,
+        aPushRecord.principal,
+        messageID,
+        payload
+      );
+    } else {
+      lazy.gPushNotifier.notifyPush(
+        aPushRecord.scope,
+        aPushRecord.principal,
+        messageID
+      );
+    }
+
+    return Ci.nsIPushErrorReporter.ACK_DELIVERED;
+  },
+
+  getByKeyID(aKeyID) {
+    return this._db.getByKeyID(aKeyID);
+  },
+
+  getAllUnexpired() {
+    return this._db.getAllUnexpired();
+  },
+
+  _sendRequest(action, ...params) {
+    if (this._state == PUSH_SERVICE_CONNECTION_DISABLE) {
+      return Promise.reject(new Error("Push service disabled"));
+    }
+    if (this._state == PUSH_SERVICE_ACTIVE_OFFLINE) {
+      return Promise.reject(new Error("Push service offline"));
+    }
+    return this._checkActivated().then(_ => {
+      switch (action) {
+        case "register":
+          return this._service.register(...params);
+        case "unregister":
+          return this._service.unregister(...params);
+      }
+      return Promise.reject(new Error("Unknown request type: " + action));
+    });
+  },
+
+  _registerWithServer(aPageRecord) {
+    lazy.console.debug("registerWithServer()", aPageRecord);
+
+    return this._sendRequest("register", aPageRecord)
+      .then(
+        record => this._onRegisterSuccess(record),
+        err => this._onRegisterError(err)
+      )
+      .then(
+        record => {
+          this._deletePendingRequest(aPageRecord);
+          lazy.gPushNotifier.notifySubscriptionModified(
+            record.scope,
+            record.principal
+          );
+          return record.toSubscription();
+        },
+        err => {
+          this._deletePendingRequest(aPageRecord);
+          throw err;
+        }
+      );
+  },
+
+  _sendUnregister(aRecord, aReason) {
+    return this._sendRequest("unregister", aRecord, aReason);
+  },
+
+  _onRegisterSuccess(aRecord) {
+    lazy.console.debug("_onRegisterSuccess()");
+
+    return this._db.put(aRecord).catch(error => {
+      this._backgroundUnregister(
+        aRecord,
+        Ci.nsIPushErrorReporter.UNSUBSCRIBE_MANUAL
+      );
+      throw error;
+    });
+  },
+
+  _onRegisterError(reply) {
+    lazy.console.debug("_onRegisterError()");
+
+    if (!reply.error) {
+      lazy.console.warn(
+        "onRegisterError: Called without valid error message!",
+        reply
+      );
+      throw new Error("Registration error");
+    }
+    throw reply.error;
+  },
+
+  notificationsCleared() {
+    this._visibleNotifications.clear();
+  },
+
+  _getByPageRecord(pageRecord) {
+    return this._checkActivated().then(_ =>
+      this._db.getByIdentifiers(pageRecord)
+    );
+  },
+
+  register(aPageRecord) {
+    lazy.console.debug("register()", aPageRecord);
+
+    let keyPromise;
+    if (aPageRecord.appServerKey && aPageRecord.appServerKey.length) {
+      let keyView = new Uint8Array(aPageRecord.appServerKey);
+      keyPromise = lazy.PushCrypto.validateAppServerKey(keyView).catch(() => {
+        throw errorWithResult(
+          "Invalid app server key",
+          Cr.NS_ERROR_DOM_PUSH_INVALID_KEY_ERR
+        );
+      });
+    } else {
+      keyPromise = Promise.resolve(null);
+    }
+
+    return Promise.all([keyPromise, this._getByPageRecord(aPageRecord)]).then(
+      ([appServerKey, record]) => {
+        aPageRecord.appServerKey = appServerKey;
+        if (!record) {
+          return this._lookupOrPutPendingRequest(aPageRecord);
+        }
+        if (!record.matchesAppServerKey(appServerKey)) {
+          throw errorWithResult(
+            "Mismatched app server key",
+            Cr.NS_ERROR_DOM_PUSH_MISMATCHED_KEY_ERR
+          );
+        }
+        if (record.isExpired()) {
+          return record
+            .quotaChanged()
+            .then(isChanged => {
+              if (isChanged) {
+                return this.dropRegistrationAndNotifyApp(record.keyID);
+              }
+              throw new Error("Push subscription expired");
+            })
+            .then(_ => this._lookupOrPutPendingRequest(aPageRecord));
+        }
+        return record.toSubscription();
+      }
+    );
+  },
+
+  async subscribeBroadcast(broadcastId, version) {
+    if (this._state != PUSH_SERVICE_RUNNING) {
+      return;
+    }
+
+    await this._service.sendSubscribeBroadcast(broadcastId, version);
+  },
+
+  unregister(aPageRecord) {
+    lazy.console.debug("unregister()", aPageRecord);
+
+    return this._getByPageRecord(aPageRecord).then(record => {
+      if (record === null) {
+        return false;
+      }
+
+      let reason = Ci.nsIPushErrorReporter.UNSUBSCRIBE_MANUAL;
+      return Promise.all([
+        this._sendUnregister(record, reason),
+        this._db.delete(record.keyID).then(rec => {
+          if (rec) {
+            lazy.gPushNotifier.notifySubscriptionModified(
+              rec.scope,
+              rec.principal
+            );
+          }
+        }),
+      ]).then(([success]) => success);
+    });
+  },
+
+  clear({ principal, domain, originAttributesPattern }) {
+    return this._checkActivated()
+      .then(_ => {
+        return this._dropRegistrationsIf(record => {
+          if (domain == "*") {
+            return true;
+          }
+          if (record.uri == null) {
+            return false;
+          }
+
+          let originAttributes;
+          if (principal || originAttributesPattern) {
+            try {
+              originAttributes =
+                ChromeUtils.CreateOriginAttributesFromOriginSuffix(
+                  record.originAttributes
+                );
+            } catch (e) {
+              console.warn("Error while parsing record OA suffix.", e);
+              return false;
+            }
+          }
+
+          if (principal) {
+            let recordPrincipal =
+              Services.scriptSecurityManager.createContentPrincipal(
+                record.uri,
+                originAttributes
+              );
+            return recordPrincipal.equals(principal);
+          }
+
+          if (!record.uri.host) {
+            return false;
+          }
+
+          return Services.clearData.hostMatchesSite(
+            record.uri.host,
+            originAttributes,
+            domain,
+            originAttributesPattern
+          );
+        });
+      })
+      .catch(e => {
+        lazy.console.warn(
+          "clear: Error dropping subscriptions for domain or principal",
+          domain,
+          e
+        );
+        return Promise.resolve();
+      });
+  },
+
+  registration(aPageRecord) {
+    lazy.console.debug("registration()");
+
+    return this._getByPageRecord(aPageRecord).then(record => {
+      if (!record) {
+        return null;
+      }
+      if (record.isExpired()) {
+        return record.quotaChanged().then(isChanged => {
+          if (isChanged) {
+            return this.dropRegistrationAndNotifyApp(record.keyID).then(
+              _ => null
+            );
+          }
+          return null;
+        });
+      }
+      return record.toSubscription();
+    });
+  },
+
+  _dropExpiredRegistrations() {
+    lazy.console.debug("dropExpiredRegistrations()");
+
+    return this._db.getAllExpired().then(records => {
+      return Promise.all(
+        records.map(record =>
+          record
+            .quotaChanged()
+            .then(isChanged => {
+              if (isChanged) {
+                this.dropRegistrationAndNotifyApp(record.keyID);
+              }
+            })
+            .catch(error => {
+              lazy.console.error(
+                "dropExpiredRegistrations: Error dropping registration",
+                record.keyID,
+                error
+              );
+            })
+        )
+      );
+    });
+  },
+
+  _onPermissionChange(subject, data) {
+    lazy.console.debug("onPermissionChange()");
+
+    if (data == "cleared") {
+      return this._clearPermissions();
+    }
+
+    let permission = subject.QueryInterface(Ci.nsIPermission);
+    if (permission.type != "desktop-notification") {
+      return Promise.resolve();
+    }
+
+    return this._updatePermission(permission, data);
+  },
+
+  _clearPermissions() {
+    lazy.console.debug("clearPermissions()");
+
+    return this._db.clearIf(record => {
+      if (!record.quotaApplies()) {
+        return false;
+      }
+      this._backgroundUnregister(
+        record,
+        Ci.nsIPushErrorReporter.UNSUBSCRIBE_PERMISSION_REVOKED
+      );
+      return true;
+    });
+  },
+
+  _updatePermission(permission, type) {
+    lazy.console.debug("updatePermission()");
+
+    let isAllow = permission.capability == Ci.nsIPermissionManager.ALLOW_ACTION;
+    let isChange = type == "added" || type == "changed";
+
+    if (isAllow && isChange) {
+      return this._forEachPrincipal(permission.principal, (record, cursor) =>
+        this._permissionAllowed(record, cursor)
+      );
+    } else if (isChange || (isAllow && type == "deleted")) {
+      return this._forEachPrincipal(permission.principal, (record, cursor) =>
+        this._permissionDenied(record, cursor)
+      );
+    }
+
+    return Promise.resolve();
+  },
+
+  _forEachPrincipal(principal, callback) {
+    return this._db.forEachOrigin(
+      principal.URI.prePath,
+      ChromeUtils.originAttributesToSuffix(principal.originAttributes),
+      callback
+    );
+  },
+
+  _permissionDenied(record, cursor) {
+    lazy.console.debug("permissionDenied()");
+
+    if (!record.quotaApplies() || record.isExpired()) {
+      return;
+    }
+    this._backgroundUnregister(
+      record,
+      Ci.nsIPushErrorReporter.UNSUBSCRIBE_PERMISSION_REVOKED
+    );
+    record.setQuota(0);
+    cursor.update(record);
+  },
+
+  _permissionAllowed(record, cursor) {
+    lazy.console.debug("permissionAllowed()");
+
+    if (!record.quotaApplies()) {
+      return;
+    }
+    if (record.isExpired()) {
+      this._notifySubscriptionChangeObservers(record);
+      cursor.delete();
+      return;
+    }
+    record.resetQuota();
+    cursor.update(record);
+  },
+
+  _dropRegistrationsIf(predicate) {
+    return this._db.clearIf(record => {
+      if (!predicate(record)) {
+        return false;
+      }
+      if (record.hasPermission()) {
+        this._notifySubscriptionChangeObservers(record);
+      }
+      if (!record.isExpired()) {
+        if (!record.systemRecord) {
+        }
+        this._backgroundUnregister(
+          record,
+          Ci.nsIPushErrorReporter.UNSUBSCRIBE_MANUAL
+        );
+      }
+      return true;
+    });
+  },
+};

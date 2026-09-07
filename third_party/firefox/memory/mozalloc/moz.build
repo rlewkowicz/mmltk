@@ -1,0 +1,12 @@
+NoVisibilityFlags()
+EXPORTS.mozilla += ['cxxalloc.h', 'mozalloc.h', 'mozalloc_abort.h', 'mozalloc_oom.h']
+if CONFIG['WRAP_STL_INCLUDES']:
+    EXPORTS.mozilla += ['throw_gcc.h']
+UNIFIED_SOURCES += ['mozalloc.cpp', 'mozalloc_abort.cpp', 'mozalloc_oom.cpp']
+if CONFIG['MOZ_MEMORY']:
+    SOURCES += ['cxxalloc.cpp']
+FINAL_LIBRARY = 'mozglue'
+DEFINES['_GNU_SOURCE'] = True
+DisableStlWrapping()
+LOCAL_INCLUDES += ['!/xpcom', '/memory/build']
+DIST_INSTALL = True

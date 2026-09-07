@@ -1,0 +1,33 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+
+if CONFIG["MOZ_ENTERPRISE"]:
+    MOZ_SRC_FILES += [
+        "enterprise/IPPAlwaysOn.sys.mjs",
+        "enterprise/IPPEnterpriseAuthProvider.sys.mjs",
+    ]
+
+MOZ_SRC_FILES += [
+    "fxa/GuardianClient.sys.mjs",
+    "fxa/IPPFxaActivateAuthProvider.sys.mjs",
+    "fxa/IPPSignInWatcher.sys.mjs",
+    "GuardianTypes.sys.mjs",
+    "IPPAuthProvider.sys.mjs",
+    "IPPAutoRestore.sys.mjs",
+    "IPPAutoStart.sys.mjs",
+    "IPPChannelFilter.sys.mjs",
+    "IPPEarlyStartupFilter.sys.mjs",
+    "IPPExceptionsManager.sys.mjs",
+    "IPPLifecycleHelper.sys.mjs",
+    "IPPNetworkErrorObserver.sys.mjs",
+    "IPPNetworkUtils.sys.mjs",
+    "IPPNimbusHelper.sys.mjs",
+    "IPPProxyManager.sys.mjs",
+    "IPProtectionActivator.sys.mjs",
+    "IPProtectionServerlist.sys.mjs",
+    "IPProtectionService.sys.mjs",
+    "IPPSessionPrefManager.sys.mjs",
+    "IPPStartupCache.sys.mjs",
+]

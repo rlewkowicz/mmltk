@@ -1,0 +1,176 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+#include "PrototypeDocumentParser.h"
+
+#include "nsXULPrototypeCache.h"
+#include "nsXULContentSink.h"
+#include "nsXULPrototypeDocument.h"
+#include "mozilla/Encoding.h"
+#include "nsCharsetSource.h"
+#include "nsParser.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/PrototypeDocumentContentSink.h"
+
+using namespace mozilla::dom;
+
+namespace mozilla {
+namespace parser {
+
+PrototypeDocumentParser::PrototypeDocumentParser(nsIURI* aDocumentURI,
+                                                 dom::Document* aDocument)
+    : mDocumentURI(aDocumentURI),
+      mDocument(aDocument),
+      mPrototypeAlreadyLoaded(false),
+      mIsComplete(false) {}
+
+PrototypeDocumentParser::~PrototypeDocumentParser() = default;
+
+NS_INTERFACE_TABLE_HEAD(PrototypeDocumentParser)
+  NS_INTERFACE_TABLE(PrototypeDocumentParser, nsIParser, nsIStreamListener,
+                     nsIRequestObserver)
+  NS_INTERFACE_TABLE_TO_MAP_SEGUE_CYCLE_COLLECTION(PrototypeDocumentParser)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(PrototypeDocumentParser)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(PrototypeDocumentParser)
+
+NS_IMPL_CYCLE_COLLECTION(PrototypeDocumentParser, mDocumentURI, mOriginalSink,
+                         mDocument, mStreamListener, mCurrentPrototype)
+
+NS_IMETHODIMP_(void)
+PrototypeDocumentParser::SetContentSink(nsIContentSink* aSink) {
+  MOZ_ASSERT(aSink, "sink cannot be null!");
+  mOriginalSink = static_cast<PrototypeDocumentContentSink*>(aSink);
+  MOZ_ASSERT(mOriginalSink);
+
+  aSink->SetParser(this);
+}
+
+NS_IMETHODIMP_(nsIContentSink*)
+PrototypeDocumentParser::GetContentSink() { return mOriginalSink; }
+
+nsIStreamListener* PrototypeDocumentParser::GetStreamListener() { return this; }
+
+NS_IMETHODIMP_(bool)
+PrototypeDocumentParser::IsComplete() { return mIsComplete; }
+
+NS_IMETHODIMP
+PrototypeDocumentParser::Parse(nsIURI* aURL) {
+  nsXULPrototypeDocument* proto =
+      mDocumentURI->SchemeIs("chrome")
+          ? nsXULPrototypeCache::GetInstance()->GetPrototype(mDocumentURI)
+          : nullptr;
+
+  nsresult rv;
+  if (proto) {
+    mCurrentPrototype = proto;
+
+    mDocument->SetPrincipals(proto->DocumentPrincipal(),
+                             proto->DocumentPrincipal());
+  } else {
+
+    nsCOMPtr<nsIParser> parser;
+    nsCOMPtr<nsIPrincipal> principal = mDocument->NodePrincipal();
+    rv =
+        PrepareToLoadPrototype(mDocumentURI, principal, getter_AddRefs(parser));
+    if (NS_FAILED(rv)) return rv;
+
+    nsCOMPtr<nsIStreamListener> listener = do_QueryInterface(parser, &rv);
+    NS_ASSERTION(NS_SUCCEEDED(rv), "parser doesn't support nsIStreamListener");
+    if (NS_FAILED(rv)) return rv;
+
+    mStreamListener = std::move(listener);
+
+    parser->Parse(mDocumentURI);
+  }
+
+  RefPtr<PrototypeDocumentParser> self = this;
+  rv = mCurrentPrototype->AwaitLoadDone(
+      [self]() { self->OnPrototypeLoadDone(); }, &mPrototypeAlreadyLoaded);
+  if (NS_FAILED(rv)) return rv;
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+PrototypeDocumentParser::OnStartRequest(nsIRequest* request) {
+  if (nsCOMPtr<nsIStreamListener> streamListener = mStreamListener) {
+    return streamListener->OnStartRequest(request);
+  }
+  return NS_ERROR_PARSED_DATA_CACHED;
+}
+
+NS_IMETHODIMP
+PrototypeDocumentParser::OnStopRequest(nsIRequest* request, nsresult aStatus) {
+  if (nsCOMPtr<nsIStreamListener> streamListener = mStreamListener) {
+    return streamListener->OnStopRequest(request, aStatus);
+  }
+  if (mPrototypeAlreadyLoaded) {
+    return this->OnPrototypeLoadDone();
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+PrototypeDocumentParser::OnDataAvailable(nsIRequest* request,
+                                         nsIInputStream* aInStr,
+                                         uint64_t aSourceOffset,
+                                         uint32_t aCount) {
+  if (nsCOMPtr<nsIStreamListener> streamListener = mStreamListener) {
+    return streamListener->OnDataAvailable(request, aInStr, aSourceOffset,
+                                           aCount);
+  }
+  MOZ_ASSERT_UNREACHABLE("Cached prototype doesn't receive data");
+  return NS_ERROR_UNEXPECTED;
+}
+
+nsresult PrototypeDocumentParser::OnPrototypeLoadDone() {
+  MOZ_ASSERT(!mIsComplete, "Should not be called more than once.");
+  mIsComplete = true;
+
+  RefPtr<PrototypeDocumentContentSink> sink = mOriginalSink;
+  RefPtr<nsXULPrototypeDocument> prototype = mCurrentPrototype;
+  return sink->OnPrototypeLoadDone(prototype);
+}
+
+nsresult PrototypeDocumentParser::PrepareToLoadPrototype(
+    nsIURI* aURI, nsIPrincipal* aDocumentPrincipal, nsIParser** aResult) {
+  nsresult rv;
+
+  rv = NS_NewXULPrototypeDocument(getter_AddRefs(mCurrentPrototype));
+  if (NS_FAILED(rv)) return rv;
+
+  rv = mCurrentPrototype->InitPrincipal(aURI, aDocumentPrincipal);
+  if (NS_FAILED(rv)) {
+    mCurrentPrototype = nullptr;
+    return rv;
+  }
+
+  if (mDocumentURI->SchemeIs("chrome") &&
+      nsXULPrototypeCache::GetInstance()->IsEnabled()) {
+    nsXULPrototypeCache::GetInstance()->PutPrototype(mCurrentPrototype);
+  }
+
+  mDocument->SetPrincipals(aDocumentPrincipal, aDocumentPrincipal);
+
+  RefPtr<XULContentSinkImpl> sink = new XULContentSinkImpl();
+
+  rv = sink->Init(mDocument, mCurrentPrototype);
+  NS_ASSERTION(NS_SUCCEEDED(rv), "Unable to initialize datasource sink");
+  if (NS_FAILED(rv)) return rv;
+
+  nsCOMPtr<nsIParser> parser = new nsParser();
+
+  parser->SetCommand(eViewNormal);
+
+  parser->SetDocumentCharset(UTF_8_ENCODING, kCharsetFromDocTypeDefault);
+  parser->SetContentSink(sink);  
+
+  parser.forget(aResult);
+  return NS_OK;
+}
+
+}  
+}  

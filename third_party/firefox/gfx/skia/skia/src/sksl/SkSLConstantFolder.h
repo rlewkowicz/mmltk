@@ -1,0 +1,48 @@
+/*
+ * Copyright 2020 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SKSL_CONSTANT_FOLDER)
+#define SKSL_CONSTANT_FOLDER
+
+#include <memory>
+
+#include "src/sksl/SkSLDefines.h"
+#include "src/sksl/SkSLOperator.h"
+
+namespace SkSL {
+
+class Context;
+class Expression;
+class Position;
+class Type;
+
+class ConstantFolder {
+public:
+    static bool GetConstantInt(const Expression& value, SKSL_INT* out);
+
+    static bool GetConstantValue(const Expression& value, double* out);
+
+    static const Expression* GetConstantValueForVariable(const Expression& value);
+
+    static const Expression* GetConstantValueOrNull(const Expression& value);
+
+    static bool IsConstantSplat(const Expression& expr, double value);
+
+    static std::unique_ptr<Expression> MakeConstantValueForVariable(Position pos,
+            std::unique_ptr<Expression> expr);
+
+    static std::unique_ptr<Expression> Simplify(const Context& context,
+                                                Position pos,
+                                                const Expression& left,
+                                                Operator op,
+                                                const Expression& right,
+                                                const Type& resultType);
+};
+
+}  
+
+#endif

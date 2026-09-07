@@ -1,0 +1,127 @@
+// Copyright (c) 2008 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include "base/process_util.h"
+
+#include <string>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#if defined(MOZ_CODE_COVERAGE)
+#  include "nsString.h"
+#endif
+
+#include "mozilla/ipc/LaunchError.h"
+
+
+#if defined(MOZ_CODE_COVERAGE)
+#  include "prenv.h"
+#  include "mozilla/ipc/EnvironmentMap.h"
+#endif
+
+#include "base/command_line.h"
+#include "base/eintr_wrapper.h"
+#include "base/logging.h"
+#include "mozilla/ipc/FileDescriptor.h"
+#include "mozilla/ipc/FileDescriptorShuffle.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/Result.h"
+
+
+namespace {
+
+MOZ_RUNINIT static mozilla::EnvironmentLog gProcessLog("MOZ_PROCESS_LOG");
+
+}  
+
+namespace base {
+
+Result<Ok, LaunchError> LaunchApp(const std::vector<std::string>& argv,
+                                  LaunchOptions&& options,
+                                  ProcessHandle* process_handle) {
+  mozilla::UniquePtr<char*[]> argv_cstr(new char*[argv.size() + 1]);
+
+  struct {
+    pid_t Fork() { return fork(); }
+  } launcher;
+
+  EnvironmentArray env_storage;
+  const EnvironmentArray& envp =
+      options.full_env ? options.full_env
+                       : (env_storage = BuildEnvironmentArray(options.env_map));
+
+  mozilla::ipc::FileDescriptorShuffle shuffle;
+  if (!shuffle.Init(options.fds_to_remap)) {
+    CHROMIUM_LOG(WARNING) << "FileDescriptorShuffle::Init failed";
+    return Err(LaunchError("FileDescriptorShuffle", errno));
+  }
+
+#if defined(MOZ_CODE_COVERAGE)
+  void (*ccovSigHandler)(int) = signal(SIGUSR1, SIG_IGN);
+  const char* gcov_child_prefix = PR_GetEnv("GCOV_CHILD_PREFIX");
+#endif
+
+  pid_t pid = launcher.Fork();
+
+  if (pid < 0) {
+    CHROMIUM_LOG(WARNING) << "fork() failed: " << strerror(errno);
+    return Err(LaunchError("fork", errno));
+  }
+
+  if (pid == 0) {
+    if (!options.workdir.empty()) {
+      if (chdir(options.workdir.c_str()) != 0) {
+        DLOG(ERROR) << "chdir failed " << options.workdir;
+        _exit(127);
+      }
+    }
+
+    for (const auto& fds : shuffle.Dup2Sequence()) {
+      if (HANDLE_EINTR(dup2(fds.first, fds.second)) != fds.second) {
+        DLOG(ERROR) << "dup2 failed";
+        _exit(127);
+      }
+    }
+
+    CloseSuperfluousFds(&shuffle, [](void* aCtx, int aFd) {
+      return static_cast<decltype(&shuffle)>(aCtx)->MapsTo(aFd);
+    });
+
+    for (size_t i = 0; i < argv.size(); i++)
+      argv_cstr[i] = const_cast<char*>(argv[i].c_str());
+    argv_cstr[argv.size()] = nullptr;
+
+#if defined(MOZ_CODE_COVERAGE)
+    if (gcov_child_prefix && !options.full_env) {
+      const pid_t child_pid = getpid();
+      nsAutoCString new_gcov_prefix(gcov_child_prefix);
+      new_gcov_prefix.Append(std::to_string((size_t)child_pid));
+      EnvironmentMap new_map = options.env_map;
+      new_map[ENVIRONMENT_LITERAL("GCOV_PREFIX")] =
+          ENVIRONMENT_STRING(new_gcov_prefix.get());
+      env_storage = BuildEnvironmentArray(new_map);
+    }
+#endif
+
+    execve(argv_cstr[0], argv_cstr.get(), envp.get());
+    DLOG(ERROR) << "FAILED TO exec() CHILD PROCESS, path: " << argv_cstr[0];
+    _exit(127);
+  }
+
+
+#if defined(MOZ_CODE_COVERAGE)
+  signal(SIGUSR1, ccovSigHandler);
+#endif
+
+  gProcessLog.print("==> process %d launched child process %d\n",
+                    GetCurrentProcId(), pid);
+  if (options.wait) HANDLE_EINTR(waitpid(pid, nullptr, 0));
+
+  if (process_handle) *process_handle = pid;
+
+  return Ok();
+}
+
+}  

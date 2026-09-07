@@ -1,0 +1,106 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_StaticPresData_h
+#define mozilla_StaticPresData_h
+
+#include "mozilla/RWLock.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/UniquePtr.h"
+#include "nsAtom.h"
+#include "nsCOMPtr.h"
+#include "nsCoord.h"
+#include "nsFont.h"
+#include "nsLanguageAtomService.h"
+
+namespace mozilla {
+
+struct LangGroupFontPrefs {
+  explicit LangGroupFontPrefs(nsStaticAtom* aLangGroupAtom)
+      : mLangGroup(aLangGroupAtom),
+        mMinimumFontSize({0}),
+        mDefaultVariableFont(StyleGenericFontFamily::Serif, {0}),
+        mDefaultSerifFont(StyleGenericFontFamily::Serif, {0}),
+        mDefaultSansSerifFont(StyleGenericFontFamily::SansSerif, {0}),
+        mDefaultMonospaceFont(StyleGenericFontFamily::Monospace, {0}),
+        mDefaultCursiveFont(StyleGenericFontFamily::Cursive, {0}),
+        mDefaultFantasyFont(StyleGenericFontFamily::Fantasy, {0}),
+        mDefaultSystemUiFont(StyleGenericFontFamily::SystemUi, {0}) {
+    Initialize();
+  }
+
+  StyleGenericFontFamily GetDefaultGeneric() const {
+    return mDefaultVariableFont.family.families.list.AsSpan()[0].AsGeneric();
+  }
+
+  const nsFont* GetDefaultFont(StyleGenericFontFamily aFamily) const {
+    switch (aFamily) {
+      case StyleGenericFontFamily::None:
+        return &mDefaultVariableFont;
+      case StyleGenericFontFamily::Serif:
+        return &mDefaultSerifFont;
+      case StyleGenericFontFamily::SansSerif:
+        return &mDefaultSansSerifFont;
+      case StyleGenericFontFamily::Monospace:
+        return &mDefaultMonospaceFont;
+      case StyleGenericFontFamily::Cursive:
+        return &mDefaultCursiveFont;
+      case StyleGenericFontFamily::Fantasy:
+        return &mDefaultFantasyFont;
+      case StyleGenericFontFamily::Math:
+        return &mDefaultSerifFont;
+      case StyleGenericFontFamily::SystemUi:
+        return &mDefaultSystemUiFont;
+      case StyleGenericFontFamily::MozEmoji:
+        break;
+    }
+    MOZ_ASSERT_UNREACHABLE("invalid font id");
+    return nullptr;
+  }
+
+  nsStaticAtom* mLangGroup;
+  Length mMinimumFontSize;
+  nsFont mDefaultVariableFont;
+  nsFont mDefaultSerifFont;
+  nsFont mDefaultSansSerifFont;
+  nsFont mDefaultMonospaceFont;
+  nsFont mDefaultCursiveFont;
+  nsFont mDefaultFantasyFont;
+  nsFont mDefaultSystemUiFont;
+  UniquePtr<LangGroupFontPrefs> mNext;
+
+ private:
+  void Initialize();
+};
+
+class StaticPresData {
+ public:
+  static void Init();
+  static void Shutdown();
+
+  static StaticPresData* Get();
+
+  nsStaticAtom* GetLangGroup(nsAtom* aLanguage) const;
+
+  const LangGroupFontPrefs* GetFontPrefsForLang(nsAtom* aLanguage);
+
+  void InvalidateFontPrefs() {
+    AutoWriteLock lock(mLock);
+    mLangGroupFontPrefs.reset(nullptr);
+  }
+
+ private:
+  StaticPresData();
+  ~StaticPresData() = default;
+  friend class StaticAutoPtr<StaticPresData>;
+
+  nsLanguageAtomService* mLangService;
+  UniquePtr<LangGroupFontPrefs> mLangGroupFontPrefs MOZ_GUARDED_BY(mLock);
+
+  RWLock mLock{"StaticPresData::mLock"};
+};
+
+}  
+
+#endif  // mozilla_StaticPresData_h

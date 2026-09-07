@@ -1,0 +1,995 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsHTTPSOnlyUtils.h"
+
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/Components.h"
+#include "mozilla/NullPrincipal.h"
+#include "mozilla/OriginAttributes.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/net/DNS.h"
+#include "nsContentUtils.h"
+#include "nsDNSPrefetch.h"
+#include "nsIEffectiveTLDService.h"
+#include "nsIHttpChannel.h"
+#include "nsIHttpChannelInternal.h"
+#include "nsIHttpsOnlyModePermission.h"
+#include "nsILoadInfo.h"
+#include "nsIPermissionManager.h"
+#include "nsIPrincipal.h"
+#include "nsIRedirectHistoryEntry.h"
+#include "nsIScriptError.h"
+#include "nsIURIMutator.h"
+#include "nsNetUtil.h"
+#include "prnetdb.h"
+
+nsHTTPSOnlyUtils::UpgradeMode nsHTTPSOnlyUtils::GetUpgradeMode(
+    bool aFromPrivateWindow,
+    nsILoadInfo::SchemelessInputType aSchemelessInputType) {
+  if (mozilla::StaticPrefs::dom_security_https_only_mode() ||
+      (aFromPrivateWindow &&
+       mozilla::StaticPrefs::dom_security_https_only_mode_pbm())) {
+    return nsHTTPSOnlyUtils::HTTPS_ONLY_MODE;
+  }
+
+  if (mozilla::StaticPrefs::dom_security_https_first() ||
+      (aFromPrivateWindow &&
+       mozilla::StaticPrefs::dom_security_https_first_pbm())) {
+    return nsHTTPSOnlyUtils::HTTPS_FIRST_MODE;
+  }
+
+  if (mozilla::StaticPrefs::dom_security_https_first_schemeless() &&
+      aSchemelessInputType == nsILoadInfo::SchemelessInputTypeSchemeless) {
+    return nsHTTPSOnlyUtils::SCHEMELESS_HTTPS_FIRST_MODE;
+  }
+
+  return NO_UPGRADE_MODE;
+}
+
+nsHTTPSOnlyUtils::UpgradeMode nsHTTPSOnlyUtils::GetUpgradeMode(
+    nsILoadInfo* aLoadInfo) {
+  bool isPrivateWin = aLoadInfo->GetOriginAttributes().IsPrivateBrowsing();
+  return GetUpgradeMode(isPrivateWin, aLoadInfo->GetSchemelessInput());
+}
+
+void nsHTTPSOnlyUtils::PotentiallyFireHttpRequestToShortenTimout(
+    mozilla::net::DocumentLoadListener* aDocumentLoadListener) {
+  if (!mozilla::StaticPrefs::
+          dom_security_https_only_mode_send_http_background_request()) {
+    return;
+  }
+
+  nsCOMPtr<nsIChannel> channel = aDocumentLoadListener->GetChannel();
+  if (!channel) {
+    return;
+  }
+
+  nsCOMPtr<nsILoadInfo> loadInfo = channel->LoadInfo();
+  UpgradeMode upgradeMode = GetUpgradeMode(loadInfo);
+
+  if (upgradeMode == NO_UPGRADE_MODE) {
+    return;
+  }
+
+  if (loadInfo->GetExternalContentPolicyType() !=
+      ExtContentPolicy::TYPE_DOCUMENT) {
+    return;
+  }
+
+  uint32_t httpsOnlyStatus = loadInfo->GetHttpsOnlyStatus();
+  if (httpsOnlyStatus & nsILoadInfo::nsILoadInfo::HTTPS_ONLY_EXEMPT) {
+    return;
+  }
+
+  nsCOMPtr<nsIHttpChannel> httpChannel(do_QueryInterface(channel));
+  if (!httpChannel) {
+    return;
+  }
+
+  nsAutoCString method;
+  (void)httpChannel->GetRequestMethod(method);
+  if (!method.EqualsLiteral("GET")) {
+    return;
+  }
+
+  nsCOMPtr<nsIURI> channelURI;
+  channel->GetURI(getter_AddRefs(channelURI));
+  if (!channelURI->SchemeIs("http")) {
+    return;
+  }
+
+  if (!mozilla::StaticPrefs::dom_security_https_first_for_custom_ports() &&
+      (upgradeMode == HTTPS_FIRST_MODE ||
+       upgradeMode == SCHEMELESS_HTTPS_FIRST_MODE)) {
+    int32_t port = 0;
+    nsresult rv = channelURI->GetPort(&port);
+    int defaultPortforScheme = NS_GetDefaultPort("http");
+    if (NS_SUCCEEDED(rv) && port != defaultPortforScheme && port != -1) {
+      return;
+    }
+  }
+
+  if (OnionException(channelURI) || LoopbackOrLocalException(channelURI)) {
+    return;
+  }
+
+  RefPtr<nsIRunnable> task =
+      new TestHTTPAnswerRunnable(channelURI, aDocumentLoadListener);
+  NS_DispatchToMainThread(task.forget());
+}
+
+bool nsHTTPSOnlyUtils::ShouldUpgradeRequest(nsIURI* aURI,
+                                            nsILoadInfo* aLoadInfo) {
+  if (GetUpgradeMode(aLoadInfo) != HTTPS_ONLY_MODE) {
+    return false;
+  }
+
+  if (OnionException(aURI) || LoopbackOrLocalException(aURI)) {
+    return false;
+  }
+
+  uint32_t httpsOnlyStatus = aLoadInfo->GetHttpsOnlyStatus();
+  if (httpsOnlyStatus & nsILoadInfo::HTTPS_ONLY_EXEMPT) {
+    AutoTArray<nsString, 1> params = {
+        NS_ConvertUTF8toUTF16(aURI->GetSpecOrDefault())};
+    nsHTTPSOnlyUtils::LogLocalizedString("HTTPSOnlyNoUpgradeException", params,
+                                         nsIScriptError::infoFlag, aLoadInfo,
+                                         aURI);
+    return false;
+  }
+
+  ExtContentPolicyType contentType = aLoadInfo->GetExternalContentPolicyType();
+  if (contentType != ExtContentPolicy::TYPE_DOCUMENT) {
+    if (!aLoadInfo->TriggeringPrincipal()->IsSystemPrincipal() &&
+        TestIfPrincipalIsExempt(aLoadInfo->TriggeringPrincipal(),
+                                HTTPS_ONLY_MODE)) {
+      return false;
+    }
+  }
+
+  if (contentType == ExtContentPolicyType::TYPE_SAVEAS_DOWNLOAD) {
+    return false;
+  }
+
+  nsAutoCString scheme;
+  aURI->GetScheme(scheme);
+  scheme.AppendLiteral("s");
+  NS_ConvertUTF8toUTF16 reportSpec(aURI->GetSpecOrDefault());
+  NS_ConvertUTF8toUTF16 reportScheme(scheme);
+
+  bool isSpeculative = aLoadInfo->GetExternalContentPolicyType() ==
+                       ExtContentPolicy::TYPE_SPECULATIVE;
+  AutoTArray<nsString, 2> params = {reportSpec, reportScheme};
+  nsHTTPSOnlyUtils::LogLocalizedString(
+      isSpeculative ? "HTTPSOnlyUpgradeSpeculativeConnection"
+                    : "HTTPSOnlyUpgradeRequest",
+      params, nsIScriptError::warningFlag, aLoadInfo, aURI);
+
+  if (httpsOnlyStatus & nsILoadInfo::HTTPS_ONLY_UNINITIALIZED) {
+    httpsOnlyStatus ^= nsILoadInfo::HTTPS_ONLY_UNINITIALIZED;
+    httpsOnlyStatus |= nsILoadInfo::HTTPS_ONLY_UPGRADED_LISTENER_NOT_REGISTERED;
+    aLoadInfo->SetHttpsOnlyStatus(httpsOnlyStatus);
+  }
+  return true;
+}
+
+bool nsHTTPSOnlyUtils::ShouldUpgradeWebSocket(nsIURI* aURI,
+                                              nsILoadInfo* aLoadInfo) {
+  if (GetUpgradeMode(aLoadInfo) != HTTPS_ONLY_MODE) {
+    return false;
+  }
+
+  if (OnionException(aURI) || LoopbackOrLocalException(aURI)) {
+    return false;
+  }
+
+  uint32_t httpsOnlyStatus = aLoadInfo->GetHttpsOnlyStatus();
+  if (httpsOnlyStatus & nsILoadInfo::HTTPS_ONLY_EXEMPT) {
+    AutoTArray<nsString, 1> params = {
+        NS_ConvertUTF8toUTF16(aURI->GetSpecOrDefault())};
+    nsHTTPSOnlyUtils::LogLocalizedString("HTTPSOnlyNoUpgradeException", params,
+                                         nsIScriptError::infoFlag, aLoadInfo,
+                                         aURI);
+    return false;
+  }
+
+  if (!aLoadInfo->TriggeringPrincipal()->IsSystemPrincipal() &&
+      TestIfPrincipalIsExempt(aLoadInfo->TriggeringPrincipal(),
+                              HTTPS_ONLY_MODE)) {
+    return false;
+  }
+
+  nsAutoCString scheme;
+  aURI->GetScheme(scheme);
+  scheme.AppendLiteral("s");
+  NS_ConvertUTF8toUTF16 reportSpec(aURI->GetSpecOrDefault());
+  NS_ConvertUTF8toUTF16 reportScheme(scheme);
+
+  AutoTArray<nsString, 2> params = {reportSpec, reportScheme};
+  nsHTTPSOnlyUtils::LogLocalizedString("HTTPSOnlyUpgradeRequest", params,
+                                       nsIScriptError::warningFlag, aLoadInfo,
+                                       aURI);
+  return true;
+}
+
+bool nsHTTPSOnlyUtils::IsUpgradeDowngradeEndlessLoop(
+    nsIURI* aOldURI, nsIURI* aNewURI, nsILoadInfo* aLoadInfo,
+    const mozilla::EnumSet<UpgradeDowngradeEndlessLoopOptions>& aOptions) {
+  UpgradeMode upgradeMode = GetUpgradeMode(aLoadInfo);
+  bool enforceForHTTPSOnlyMode =
+      upgradeMode == HTTPS_ONLY_MODE &&
+      aOptions.contains(
+          UpgradeDowngradeEndlessLoopOptions::EnforceForHTTPSOnlyMode);
+  bool enforceForHTTPSFirstMode =
+      upgradeMode == HTTPS_FIRST_MODE &&
+      aOptions.contains(
+          UpgradeDowngradeEndlessLoopOptions::EnforceForHTTPSFirstMode);
+  bool enforceForHTTPSRR =
+      aOptions.contains(UpgradeDowngradeEndlessLoopOptions::EnforceForHTTPSRR);
+  if (!enforceForHTTPSOnlyMode && !enforceForHTTPSFirstMode &&
+      !enforceForHTTPSRR) {
+    return false;
+  }
+
+  if (!mozilla::StaticPrefs::
+          dom_security_https_only_mode_break_upgrade_downgrade_endless_loop() &&
+      !enforceForHTTPSRR) {
+    return false;
+  }
+
+  if (aLoadInfo->GetExternalContentPolicyType() !=
+      ExtContentPolicy::TYPE_DOCUMENT) {
+    return false;
+  }
+
+  uint32_t httpsOnlyStatus = aLoadInfo->GetHttpsOnlyStatus();
+  if ((httpsOnlyStatus & nsILoadInfo::HTTPS_ONLY_EXEMPT) &&
+      !enforceForHTTPSRR) {
+    return false;
+  }
+
+  if (IsHttpDowngrade(aOldURI, aNewURI)) {
+    return true;
+  }
+
+
+  if (aLoadInfo->GetHasValidUserGestureActivation()) {
+    return false;
+  }
+
+  nsCOMPtr<nsIPrincipal> triggeringPrincipal = aLoadInfo->TriggeringPrincipal();
+  if (!triggeringPrincipal->SchemeIs("https")) {
+    return false;
+  }
+
+  if (!IsHttpDowngrade(aNewURI, aOldURI)) {
+    return false;
+  }
+  bool isLoop = false;
+  nsresult rv = triggeringPrincipal->EqualsURI(aNewURI, &isLoop);
+  NS_ENSURE_SUCCESS(rv, false);
+  return isLoop;
+}
+
+bool nsHTTPSOnlyUtils::ShouldUpgradeHttpsFirstRequest(nsIURI* aURI,
+                                                      nsILoadInfo* aLoadInfo) {
+  MOZ_ASSERT(aURI->SchemeIs("http"), "how come the request is not 'http'?");
+
+  UpgradeMode upgradeMode = GetUpgradeMode(aLoadInfo);
+  if (upgradeMode != HTTPS_FIRST_MODE &&
+      upgradeMode != SCHEMELESS_HTTPS_FIRST_MODE) {
+    return false;
+  }
+  ExtContentPolicyType contentType = aLoadInfo->GetExternalContentPolicyType();
+  if (contentType != ExtContentPolicy::TYPE_DOCUMENT &&
+      contentType != ExtContentPolicy::TYPE_SPECULATIVE) {
+    return false;
+  }
+
+  if (OnionException(aURI) ||
+      (!mozilla::StaticPrefs::dom_security_https_first_for_local_addresses() &&
+       LoopbackOrLocalException(aURI)) ||
+      (!mozilla::StaticPrefs::dom_security_https_first_for_unknown_suffixes() &&
+       UnknownPublicSuffixException(aURI))) {
+    return false;
+  }
+
+  uint32_t httpsOnlyStatus = aLoadInfo->GetHttpsOnlyStatus();
+  if (httpsOnlyStatus & nsILoadInfo::HTTPS_ONLY_EXEMPT) {
+    return false;
+  }
+
+  if (aLoadInfo->GetSchemelessInput() ==
+          nsILoadInfo::SchemelessInputTypeSchemeful &&
+      aLoadInfo->GetExternalContentPolicyType() !=
+          ExtContentPolicy::TYPE_SPECULATIVE &&
+      aURI->SchemeIs("http")) {
+    AddHTTPSFirstException(aURI, aLoadInfo);
+    return false;
+  }
+
+  if (!mozilla::StaticPrefs::dom_security_https_first_for_custom_ports()) {
+    int defaultPortforScheme = NS_GetDefaultPort("http");
+    int32_t port = 0;
+    nsresult rv = aURI->GetPort(&port);
+    NS_ENSURE_SUCCESS(rv, false);
+    if (port != defaultPortforScheme && port != -1) {
+      return false;
+    }
+  }
+
+  if (!aLoadInfo->GetIsGETRequest()) {
+    return false;
+  }
+
+  if (upgradeMode == SCHEMELESS_HTTPS_FIRST_MODE) {
+    nsAutoCString urlCString;
+    aURI->GetSpec(urlCString);
+    NS_ConvertUTF8toUTF16 urlString(urlCString);
+
+    AutoTArray<nsString, 1> params = {urlString};
+    nsHTTPSOnlyUtils::LogLocalizedString("HTTPSFirstSchemeless", params,
+                                         nsIScriptError::warningFlag, aLoadInfo,
+                                         aURI, true);
+  } else {
+    nsAutoCString scheme;
+
+    aURI->GetScheme(scheme);
+    scheme.AppendLiteral("s");
+    NS_ConvertUTF8toUTF16 reportSpec(aURI->GetSpecOrDefault());
+    NS_ConvertUTF8toUTF16 reportScheme(scheme);
+
+    bool isSpeculative = contentType == ExtContentPolicy::TYPE_SPECULATIVE;
+    AutoTArray<nsString, 2> params = {reportSpec, reportScheme};
+    nsHTTPSOnlyUtils::LogLocalizedString(
+        isSpeculative ? "HTTPSOnlyUpgradeSpeculativeConnection"
+                      : "HTTPSOnlyUpgradeRequest",
+        params, nsIScriptError::warningFlag, aLoadInfo, aURI, true);
+  }
+
+  httpsOnlyStatus |= nsILoadInfo::HTTPS_ONLY_UPGRADED_HTTPS_FIRST;
+  aLoadInfo->SetHttpsOnlyStatus(httpsOnlyStatus);
+  return true;
+}
+
+already_AddRefed<nsIURI>
+nsHTTPSOnlyUtils::PotentiallyDowngradeHttpsFirstRequest(
+    mozilla::net::DocumentLoadListener* aDocumentLoadListener,
+    nsresult aStatus) {
+  nsCOMPtr<nsIChannel> channel = aDocumentLoadListener->GetChannel();
+  nsCOMPtr<nsILoadInfo> loadInfo = channel->LoadInfo();
+  uint32_t httpsOnlyStatus = loadInfo->GetHttpsOnlyStatus();
+  if (!(httpsOnlyStatus & nsILoadInfo::HTTPS_ONLY_UPGRADED_HTTPS_FIRST)) {
+    return nullptr;
+  }
+  loadInfo->SetHttpsOnlyStatus(
+      httpsOnlyStatus | nsILoadInfo::HTTPS_ONLY_TOP_LEVEL_LOAD_IN_PROGRESS);
+
+  nsresult status = aStatus;
+  if (NS_SUCCEEDED(aStatus)) {
+    nsCOMPtr<nsIHttpChannel> httpChannel = do_QueryInterface(channel);
+    if (!httpChannel) {
+      return nullptr;
+    }
+    uint32_t responseStatus = 0;
+    if (NS_FAILED(httpChannel->GetResponseStatus(&responseStatus))) {
+      return nullptr;
+    }
+
+    if (responseStatus >= 400 && responseStatus < 600) {
+      switch (responseStatus) {
+        case 400:
+          status = NS_ERROR_PROXY_BAD_REQUEST;
+          break;
+        case 404:
+          status = NS_ERROR_PROXY_NOT_FOUND;
+          break;
+        default:
+          status = mozilla::net::HttpProxyResponseToErrorCode(responseStatus);
+          break;
+      }
+    }
+    if (NS_SUCCEEDED(status)) {
+      return nullptr;
+    }
+  }
+
+  nsCOMPtr<nsIHttpChannelInternal> httpChannelInternal(
+      do_QueryInterface(channel));
+  if (!httpChannelInternal) {
+    return nullptr;
+  }
+  bool proxyUsed = false;
+  nsresult rv = httpChannelInternal->GetIsProxyUsed(&proxyUsed);
+  MOZ_ASSERT(NS_SUCCEEDED(rv));
+  if (!(proxyUsed && status == nsresult::NS_ERROR_UNKNOWN_HOST)
+      && HttpsUpgradeUnrelatedErrorCode(status)) {
+    return nullptr;
+  }
+
+  nsCOMPtr<nsIURI> uri;
+  rv = channel->GetURI(getter_AddRefs(uri));
+  NS_ENSURE_SUCCESS(rv, nullptr);
+
+  nsAutoCString spec;
+  nsCOMPtr<nsIURI> newURI;
+
+  if (uri->SchemeIs("https")) {
+    rv = uri->GetSpec(spec);
+    NS_ENSURE_SUCCESS(rv, nullptr);
+
+    rv = NS_NewURI(getter_AddRefs(newURI), spec);
+    NS_ENSURE_SUCCESS(rv, nullptr);
+
+    rv = NS_MutateURI(newURI).SetScheme("http"_ns).Finalize(
+        getter_AddRefs(newURI));
+    NS_ENSURE_SUCCESS(rv, nullptr);
+  } else if (uri->SchemeIs("view-source")) {
+    nsCOMPtr<nsINestedURI> nestedURI = do_QueryInterface(uri);
+    if (!nestedURI) {
+      return nullptr;
+    }
+    nsCOMPtr<nsIURI> innerURI;
+    rv = nestedURI->GetInnerURI(getter_AddRefs(innerURI));
+    NS_ENSURE_SUCCESS(rv, nullptr);
+    if (!innerURI || !innerURI->SchemeIs("https")) {
+      return nullptr;
+    }
+    rv = NS_MutateURI(innerURI).SetScheme("http"_ns).Finalize(
+        getter_AddRefs(innerURI));
+    NS_ENSURE_SUCCESS(rv, nullptr);
+
+    nsAutoCString innerSpec;
+    rv = innerURI->GetSpec(innerSpec);
+    NS_ENSURE_SUCCESS(rv, nullptr);
+
+    spec.Append("view-source:");
+    spec.Append(innerSpec);
+
+    rv = NS_NewURI(getter_AddRefs(newURI), spec);
+    NS_ENSURE_SUCCESS(rv, nullptr);
+  } else {
+    return nullptr;
+  }
+
+  NS_ConvertUTF8toUTF16 reportSpec(uri->GetSpecOrDefault());
+  AutoTArray<nsString, 1> params = {reportSpec};
+  nsHTTPSOnlyUtils::LogLocalizedString("HTTPSOnlyFailedDowngradeAgain", params,
+                                       nsIScriptError::warningFlag, loadInfo,
+                                       uri, true);
+
+  if (mozilla::StaticPrefs::
+          dom_security_https_first_add_exception_on_failure()) {
+    AddHTTPSFirstException(uri, loadInfo);
+  }
+
+  return newURI.forget();
+}
+
+void nsHTTPSOnlyUtils::UpdateLoadStateAfterHTTPSFirstDowngrade(
+    mozilla::net::DocumentLoadListener* aDocumentLoadListener,
+    nsDocShellLoadState* aLoadState) {
+  aLoadState->SetIsExemptFromHTTPSFirstMode(true);
+
+  nsCOMPtr<nsIChannel> channel = aDocumentLoadListener->GetChannel();
+  nsCOMPtr<nsILoadInfo> loadInfo = channel->LoadInfo();
+  if (loadInfo->GetSchemelessInput() ==
+      nsILoadInfo::SchemelessInputTypeSchemeless) {
+    aLoadState->SetHttpsUpgradeTelemetry(
+        nsILoadInfo::HTTPS_FIRST_SCHEMELESS_UPGRADE_DOWNGRADE);
+  } else {
+    aLoadState->SetHttpsUpgradeTelemetry(
+        nsILoadInfo::HTTPS_FIRST_UPGRADE_DOWNGRADE);
+  }
+
+  nsDOMNavigationTiming* timing = aDocumentLoadListener->GetTiming();
+  if (timing) {
+    mozilla::TimeStamp navigationStart = timing->GetNavigationStartTimeStamp();
+    if (navigationStart) {
+      mozilla::TimeDuration duration =
+          mozilla::TimeStamp::Now() - navigationStart;
+
+      nsresult channelStatus;
+      channel->GetStatus(&channelStatus);
+
+      RefPtr downgradeData = mozilla::MakeRefPtr<HTTPSFirstDowngradeData>();
+      downgradeData->downgradeTime = duration;
+      downgradeData->isOnTimer = channelStatus == NS_ERROR_NET_TIMEOUT_EXTERNAL;
+      downgradeData->isSchemeless =
+          GetUpgradeMode(loadInfo) == SCHEMELESS_HTTPS_FIRST_MODE;
+      aLoadState->SetHttpsFirstDowngradeData(downgradeData);
+    }
+  }
+}
+
+void nsHTTPSOnlyUtils::SubmitHTTPSFirstTelemetry(
+    nsCOMPtr<nsILoadInfo> const& aLoadInfo,
+    RefPtr<HTTPSFirstDowngradeData> const& aHttpsFirstDowngradeData) {
+
+  if (aHttpsFirstDowngradeData) {
+
+
+
+
+
+  } else if (aLoadInfo->GetHttpsOnlyStatus() &
+             nsILoadInfo::HTTPS_ONLY_UPGRADED_HTTPS_FIRST) {
+
+  }
+}
+
+bool nsHTTPSOnlyUtils::CouldBeHttpsOnlyError(nsIChannel* aChannel,
+                                             nsresult aError) {
+  if (!aChannel) {
+    return false;
+  }
+
+  nsCOMPtr<nsILoadInfo> loadInfo = aChannel->LoadInfo();
+  if (GetUpgradeMode(loadInfo) != HTTPS_ONLY_MODE) {
+    return false;
+  }
+
+  uint32_t httpsOnlyStatus = loadInfo->GetHttpsOnlyStatus();
+  if (httpsOnlyStatus & nsILoadInfo::HTTPS_ONLY_EXEMPT ||
+      httpsOnlyStatus & nsILoadInfo::HTTPS_ONLY_UNINITIALIZED) {
+    return false;
+  }
+
+  return !HttpsUpgradeUnrelatedErrorCode(aError);
+}
+
+bool nsHTTPSOnlyUtils::TestIfPrincipalIsExempt(nsIPrincipal* aPrincipal,
+                                               UpgradeMode aUpgradeMode) {
+  static nsCOMPtr<nsIPermissionManager> sPermMgr;
+  if (!sPermMgr) {
+    sPermMgr = mozilla::components::PermissionManager::Service();
+    mozilla::ClearOnShutdown(&sPermMgr);
+  }
+  NS_ENSURE_TRUE(sPermMgr, false);
+
+  uint32_t perm;
+  nsresult rv = sPermMgr->TestExactPermissionFromPrincipal(
+      aPrincipal, "https-only-load-insecure"_ns, &perm);
+  NS_ENSURE_SUCCESS(rv, false);
+
+  bool checkForHTTPSFirst = aUpgradeMode == HTTPS_FIRST_MODE ||
+                            aUpgradeMode == SCHEMELESS_HTTPS_FIRST_MODE;
+
+  return perm == nsIHttpsOnlyModePermission::LOAD_INSECURE_ALLOW ||
+         perm == nsIHttpsOnlyModePermission::LOAD_INSECURE_ALLOW_SESSION ||
+         (checkForHTTPSFirst &&
+          perm == nsIHttpsOnlyModePermission::HTTPSFIRST_LOAD_INSECURE_ALLOW);
+}
+
+void nsHTTPSOnlyUtils::TestSitePermissionAndPotentiallyAddExemption(
+    nsIChannel* aChannel) {
+  NS_ENSURE_TRUE_VOID(aChannel);
+
+  nsCOMPtr<nsILoadInfo> loadInfo = aChannel->LoadInfo();
+  UpgradeMode upgradeMode = GetUpgradeMode(loadInfo);
+
+  if (upgradeMode == NO_UPGRADE_MODE) {
+    return;
+  }
+
+  ExtContentPolicyType type = loadInfo->GetExternalContentPolicyType();
+  if (type != ExtContentPolicy::TYPE_DOCUMENT) {
+    return;
+  }
+
+  nsCOMPtr<nsIHttpChannel> httpChannel = do_QueryInterface(aChannel);
+  if (!httpChannel) {
+    return;
+  }
+
+  nsCOMPtr<nsIPrincipal> principal;
+  nsresult rv = nsContentUtils::GetSecurityManager()->GetChannelResultPrincipal(
+      aChannel, getter_AddRefs(principal));
+  NS_ENSURE_SUCCESS_VOID(rv);
+
+  uint32_t httpsOnlyStatus = loadInfo->GetHttpsOnlyStatus();
+  bool isPrincipalExempt = TestIfPrincipalIsExempt(principal, upgradeMode);
+  if (isPrincipalExempt) {
+    httpsOnlyStatus |= nsILoadInfo::HTTPS_ONLY_EXEMPT;
+  }
+  loadInfo->SetHttpsOnlyStatus(httpsOnlyStatus);
+
+  if (httpsOnlyStatus & nsILoadInfo::HTTPS_ONLY_EXEMPT) {
+    nsILoadInfo::HTTPSUpgradeTelemetryType httpsTelemetry =
+        nsILoadInfo::NOT_INITIALIZED;
+    loadInfo->GetHttpsUpgradeTelemetry(&httpsTelemetry);
+    if (httpsTelemetry != nsILoadInfo::HTTPS_ONLY_UPGRADE_DOWNGRADE &&
+        httpsTelemetry != nsILoadInfo::HTTPS_FIRST_UPGRADE_DOWNGRADE &&
+        httpsTelemetry !=
+            nsILoadInfo::HTTPS_FIRST_SCHEMELESS_UPGRADE_DOWNGRADE) {
+      loadInfo->SetHttpsUpgradeTelemetry(nsILoadInfo::UPGRADE_EXCEPTION);
+    }
+  }
+}
+
+bool nsHTTPSOnlyUtils::IsSafeToAcceptCORSOrMixedContent(
+    nsILoadInfo* aLoadInfo) {
+  if ((aLoadInfo->GetHttpsOnlyStatus() & nsILoadInfo::HTTPS_ONLY_EXEMPT)) {
+    return false;
+  }
+  return GetUpgradeMode(aLoadInfo) == HTTPS_ONLY_MODE;
+}
+
+bool nsHTTPSOnlyUtils::HttpsUpgradeUnrelatedErrorCode(nsresult aError) {
+  return NS_ERROR_UNKNOWN_PROTOCOL == aError ||
+         NS_ERROR_FILE_NOT_FOUND == aError ||
+         NS_ERROR_FILE_ACCESS_DENIED == aError ||
+         NS_ERROR_UNKNOWN_HOST == aError || NS_ERROR_PHISHING_URI == aError ||
+         NS_ERROR_MALWARE_URI == aError || NS_ERROR_UNWANTED_URI == aError ||
+         NS_ERROR_HARMFUL_URI == aError || NS_ERROR_CONTENT_CRASHED == aError ||
+         NS_ERROR_FRAME_CRASHED == aError ||
+         NS_ERROR_NET_EMPTY_RESPONSE == aError ||
+         NS_ERROR_NET_ERROR_RESPONSE == aError;
+}
+
+
+void nsHTTPSOnlyUtils::LogLocalizedString(const char* aName,
+                                          const nsTArray<nsString>& aParams,
+                                          uint32_t aFlags,
+                                          nsILoadInfo* aLoadInfo, nsIURI* aURI,
+                                          bool aUseHttpsFirst) {
+  nsAutoString logMsg;
+  nsContentUtils::FormatLocalizedString(PropertiesFile::SECURITY_PROPERTIES,
+                                        aName, aParams, logMsg);
+  LogMessage(logMsg, aFlags, aLoadInfo, aURI, aUseHttpsFirst);
+}
+
+void nsHTTPSOnlyUtils::LogMessage(const nsAString& aMessage, uint32_t aFlags,
+                                  nsILoadInfo* aLoadInfo, nsIURI* aURI,
+                                  bool aUseHttpsFirst) {
+  uint32_t httpsOnlyStatus = aLoadInfo->GetHttpsOnlyStatus();
+  if (httpsOnlyStatus & nsILoadInfo::HTTPS_ONLY_DO_NOT_LOG_TO_CONSOLE) {
+    return;
+  }
+
+  nsString message;
+  message.Append(aUseHttpsFirst ? u"HTTPS-First Mode: "_ns
+                                : u"HTTPS-Only Mode: "_ns);
+  message.Append(aMessage);
+
+  auto category = aUseHttpsFirst ? "HTTPSFirst"_ns : "HTTPSOnly"_ns;
+
+  uint64_t windowId = aLoadInfo->GetInnerWindowID();
+  if (!windowId) {
+    windowId = aLoadInfo->GetTriggeringWindowId();
+  }
+  if (windowId) {
+    nsContentUtils::ReportToConsoleByWindowID(
+        message, aFlags, category, windowId, mozilla::SourceLocation(aURI));
+  } else {
+    bool isPrivateWin = aLoadInfo->GetOriginAttributes().IsPrivateBrowsing();
+    nsContentUtils::LogSimpleConsoleError(message, category, isPrivateWin,
+                                          true ,
+                                          aFlags);
+  }
+}
+
+
+bool nsHTTPSOnlyUtils::OnionException(nsIURI* aURI) {
+  if (mozilla::StaticPrefs::dom_security_https_only_mode_upgrade_onion()) {
+    return false;
+  }
+  nsAutoCString host;
+  aURI->GetHost(host);
+  return StringEndsWith(host, ".onion"_ns);
+}
+
+bool nsHTTPSOnlyUtils::LoopbackOrLocalException(nsIURI* aURI) {
+  nsAutoCString asciiHost;
+  nsresult rv = aURI->GetAsciiHost(asciiHost);
+  NS_ENSURE_SUCCESS(rv, false);
+
+  if (asciiHost.EqualsLiteral("localhost") || asciiHost.EqualsLiteral("::1")) {
+    return true;
+  }
+
+  mozilla::net::NetAddr addr;
+  if (NS_FAILED(addr.InitFromString(asciiHost))) {
+    return false;
+  }
+  if (addr.IsLoopbackAddr()) {
+    return true;
+  }
+
+  bool upgradeLocal =
+      mozilla::StaticPrefs::dom_security_https_only_mode_upgrade_local();
+  return (!upgradeLocal && addr.IsIPAddrLocal());
+}
+
+bool nsHTTPSOnlyUtils::UnknownPublicSuffixException(nsIURI* aURI) {
+  nsCOMPtr<nsIEffectiveTLDService> tldService =
+      do_GetService(NS_EFFECTIVETLDSERVICE_CONTRACTID);
+  NS_ENSURE_TRUE(tldService, false);
+
+  bool hasKnownPublicSuffix;
+  nsresult rv = tldService->HasKnownPublicSuffix(aURI, &hasKnownPublicSuffix);
+  NS_ENSURE_SUCCESS(rv, false);
+
+  return !hasKnownPublicSuffix;
+}
+
+bool nsHTTPSOnlyUtils::IsHttpDowngrade(nsIURI* aFromURI, nsIURI* aToURI) {
+  MOZ_ASSERT(aFromURI);
+  MOZ_ASSERT(aToURI);
+
+  if (!aFromURI || !aToURI) {
+    return false;
+  }
+
+  if (!aToURI->SchemeIs("http")) {
+    return false;
+  }
+
+  if (!aFromURI->SchemeIs("https")) {
+    return false;
+  }
+
+  int32_t port = 0;
+  nsresult rv = aToURI->GetPort(&port);
+  NS_ENSURE_SUCCESS(rv, false);
+  if (port == -1) {
+    port = NS_GetDefaultPort("https");
+  }
+  nsCOMPtr<nsIURI> newHTTPSchemeURI;
+  rv = NS_MutateURI(aToURI)
+           .SetScheme("https"_ns)
+           .SetPort(port)
+           .Finalize(newHTTPSchemeURI);
+  NS_ENSURE_SUCCESS(rv, false);
+
+  bool uriEquals = false;
+  if (NS_FAILED(aFromURI->EqualsExceptRef(newHTTPSchemeURI, &uriEquals))) {
+    return false;
+  }
+
+  return uriEquals;
+}
+
+nsresult nsHTTPSOnlyUtils::AddHTTPSFirstException(
+    nsCOMPtr<nsIURI> aURI, nsILoadInfo* const aLoadInfo) {
+  nsresult rv =
+      NS_MutateURI(aURI).SetScheme("http"_ns).Finalize(getter_AddRefs(aURI));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  mozilla::OriginAttributes oa = aLoadInfo->GetOriginAttributes();
+  oa.SetFirstPartyDomain(true, aURI);
+
+  nsCOMPtr<nsIPermissionManager> permMgr =
+      mozilla::components::PermissionManager::Service();
+  NS_ENSURE_TRUE(permMgr, nsresult::NS_ERROR_SERVICE_NOT_AVAILABLE);
+
+  nsCOMPtr<nsIPrincipal> principal =
+      mozilla::BasePrincipal::CreateContentPrincipal(aURI, oa);
+
+  nsCString host;
+  aURI->GetHost(host);
+  LogLocalizedString("HTTPSFirstAddingException", {NS_ConvertUTF8toUTF16(host)},
+                     nsIScriptError::warningFlag, aLoadInfo, aURI, true);
+
+  uint32_t lifetime =
+      mozilla::StaticPrefs::dom_security_https_first_exception_lifetime();
+  int64_t expirationTime = (PR_Now() / PR_USEC_PER_MSEC) + lifetime;
+  rv = permMgr->AddFromPrincipal(
+      principal, "https-only-load-insecure"_ns,
+      nsIHttpsOnlyModePermission::HTTPSFIRST_LOAD_INSECURE_ALLOW,
+      nsIPermissionManager::EXPIRE_TIME, expirationTime);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+uint32_t nsHTTPSOnlyUtils::GetStatusForSubresourceLoad(
+    uint32_t aHttpsOnlyStatus) {
+  return aHttpsOnlyStatus & ~nsILoadInfo::HTTPS_ONLY_UPGRADED_HTTPS_FIRST;
+}
+
+
+NS_IMPL_ISUPPORTS_INHERITED(TestHTTPAnswerRunnable, mozilla::Runnable,
+                            nsIStreamListener, nsIInterfaceRequestor,
+                            nsITimerCallback)
+
+TestHTTPAnswerRunnable::TestHTTPAnswerRunnable(
+    nsIURI* aURI, mozilla::net::DocumentLoadListener* aDocumentLoadListener)
+    : mozilla::Runnable("TestHTTPAnswerRunnable"),
+      mURI(aURI),
+      mDocumentLoadListener(aDocumentLoadListener) {}
+
+bool TestHTTPAnswerRunnable::IsBackgroundRequestRedirected(
+    nsIHttpChannel* aChannel) {
+  if (!aChannel) {
+    return false;
+  }
+  nsCOMPtr<nsILoadInfo> loadinfo = aChannel->LoadInfo();
+  if (loadinfo->RedirectChain().IsEmpty()) {
+    return false;
+  }
+
+  nsCOMPtr<nsIURI> finalURI;
+  nsresult rv = NS_GetFinalChannelURI(aChannel, getter_AddRefs(finalURI));
+  NS_ENSURE_SUCCESS(rv, false);
+  if (!finalURI->SchemeIs("https")) {
+    return false;
+  }
+
+  nsCOMPtr<nsIPrincipal> firstURIPrincipal;
+  loadinfo->RedirectChain()[0]->GetPrincipal(getter_AddRefs(firstURIPrincipal));
+  if (!firstURIPrincipal || !firstURIPrincipal->SchemeIs("http")) {
+    return false;
+  }
+
+  nsAutoCString redirectHost;
+  nsAutoCString finalHost;
+  firstURIPrincipal->GetAsciiHost(redirectHost);
+  finalURI->GetAsciiHost(finalHost);
+  return finalHost.Equals(redirectHost);
+}
+
+NS_IMETHODIMP
+TestHTTPAnswerRunnable::OnStartRequest(nsIRequest* aRequest) {
+  nsresult requestStatus;
+  aRequest->GetStatus(&requestStatus);
+  if (requestStatus != NS_OK) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIChannel> docChannel = mDocumentLoadListener->GetChannel();
+  nsCOMPtr<nsIHttpChannel> httpsOnlyChannel = do_QueryInterface(docChannel);
+  if (httpsOnlyChannel) {
+    nsCOMPtr<nsILoadInfo> loadInfo = httpsOnlyChannel->LoadInfo();
+    uint32_t topLevelLoadInProgress =
+        loadInfo->GetHttpsOnlyStatus() &
+        nsILoadInfo::HTTPS_ONLY_TOP_LEVEL_LOAD_IN_PROGRESS;
+
+    nsCOMPtr<nsIHttpChannelInternal> httpChannelInternal =
+        do_QueryInterface(httpsOnlyChannel);
+    bool isAuthChannel = false;
+    (void)httpChannelInternal->GetIsAuthChannel(&isAuthChannel);
+    if (!topLevelLoadInProgress) {
+      nsCOMPtr<nsIHttpChannel> backgroundHttpChannel =
+          do_QueryInterface(aRequest);
+      topLevelLoadInProgress =
+          IsBackgroundRequestRedirected(backgroundHttpChannel);
+    }
+    if (!topLevelLoadInProgress && !isAuthChannel) {
+      nsresult httpsOnlyChannelStatus;
+      httpsOnlyChannel->GetStatus(&httpsOnlyChannelStatus);
+      if (httpsOnlyChannelStatus == NS_OK) {
+        httpsOnlyChannel->Cancel(NS_ERROR_NET_TIMEOUT_EXTERNAL);
+      }
+    }
+  }
+
+  aRequest->Cancel(NS_ERROR_ABORT);
+  return NS_ERROR_ABORT;
+}
+
+NS_IMETHODIMP
+TestHTTPAnswerRunnable::OnDataAvailable(nsIRequest* aRequest,
+                                        nsIInputStream* aStream,
+                                        uint64_t aOffset, uint32_t aCount) {
+  MOZ_ASSERT(false, "how come we get to ::OnDataAvailable");
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+TestHTTPAnswerRunnable::OnStopRequest(nsIRequest* aRequest,
+                                      nsresult aStatusCode) {
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+TestHTTPAnswerRunnable::GetInterface(const nsIID& aIID, void** aResult) {
+  return QueryInterface(aIID, aResult);
+}
+
+NS_IMETHODIMP
+TestHTTPAnswerRunnable::Run() {
+  {
+    nsCOMPtr<nsIChannel> origChannel = mDocumentLoadListener->GetChannel();
+    mozilla::OriginAttributes originAttributes;
+    mozilla::StoragePrincipalHelper::GetOriginAttributesForHTTPSRR(
+        origChannel, originAttributes);
+    RefPtr<nsDNSPrefetch> resolver =
+        new nsDNSPrefetch(mURI, originAttributes, origChannel->GetTRRMode());
+    nsCOMPtr<nsIHttpChannelInternal> internalChannel =
+        do_QueryInterface(origChannel);
+    nsIHttpChannelInternal::ProxyDNSStrategy dnsStrategy =
+        nsIHttpChannelInternal::PROXY_DNS_STRATEGY_ORIGIN;
+    if (internalChannel) {
+      (void)internalChannel->GetProxyDNSStrategy(&dnsStrategy);
+    }
+    uint32_t caps;
+    if (dnsStrategy != nsIHttpChannelInternal::PROXY_DNS_STRATEGY_PROXY &&
+        internalChannel && NS_SUCCEEDED(internalChannel->GetCaps(&caps))) {
+      (void)resolver->FetchHTTPSSVC(
+          caps & NS_HTTP_REFRESH_DNS, false,
+          [self = RefPtr{this}](nsIDNSHTTPSSVCRecord* aRecord) {
+            self->mHasHTTPSRR = (aRecord != nullptr);
+          });
+    }
+  }
+
+  uint32_t background_timer_ms = mozilla::StaticPrefs::
+      dom_security_https_only_fire_http_request_background_timer_ms();
+
+  return NS_NewTimerWithCallback(getter_AddRefs(mTimer), this,
+                                 background_timer_ms, nsITimer::TYPE_ONE_SHOT);
+}
+
+NS_IMETHODIMP
+TestHTTPAnswerRunnable::Notify(nsITimer* aTimer) {
+  if (mTimer) {
+    mTimer->Cancel();
+    mTimer = nullptr;
+  }
+
+  nsCOMPtr<nsIChannel> origChannel = mDocumentLoadListener->GetChannel();
+  nsCOMPtr<nsILoadInfo> origLoadInfo = origChannel->LoadInfo();
+  uint32_t origHttpsOnlyStatus = origLoadInfo->GetHttpsOnlyStatus();
+  uint32_t topLevelLoadInProgress =
+      origHttpsOnlyStatus & nsILoadInfo::HTTPS_ONLY_TOP_LEVEL_LOAD_IN_PROGRESS;
+  uint32_t downloadInProgress =
+      origHttpsOnlyStatus & nsILoadInfo::HTTPS_ONLY_DOWNLOAD_IN_PROGRESS;
+
+  bool isClientRequestedUpgrade =
+      origHttpsOnlyStatus &
+          (nsILoadInfo::HTTPS_ONLY_UPGRADED_LISTENER_NOT_REGISTERED |
+           nsILoadInfo::HTTPS_ONLY_UPGRADED_LISTENER_REGISTERED |
+           nsILoadInfo::HTTPS_ONLY_UPGRADED_HTTPS_FIRST) &&
+      !mHasHTTPSRR;
+
+  if (topLevelLoadInProgress || downloadInProgress ||
+      !isClientRequestedUpgrade) {
+    return NS_OK;
+  }
+
+  mozilla::OriginAttributes attrs = origLoadInfo->GetOriginAttributes();
+  RefPtr<nsIPrincipal> nullPrincipal = mozilla::NullPrincipal::Create(attrs);
+
+  uint32_t loadFlags =
+      nsIRequest::LOAD_ANONYMOUS | nsIRequest::INHIBIT_CACHING |
+      nsIRequest::INHIBIT_PERSISTENT_CACHING | nsIRequest::LOAD_BYPASS_CACHE |
+      nsIChannel::LOAD_BYPASS_SERVICE_WORKER;
+
+  nsCOMPtr<nsIURI> backgroundChannelURI;
+  nsAutoCString prePathStr;
+  nsresult rv = mURI->GetPrePath(prePathStr);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+  rv = NS_NewURI(getter_AddRefs(backgroundChannelURI), prePathStr);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  nsCOMPtr<nsIChannel> testHTTPChannel;
+  rv = NS_NewChannel(getter_AddRefs(testHTTPChannel), backgroundChannelURI,
+                     nullPrincipal,
+                     nsILoadInfo::SEC_ALLOW_CROSS_ORIGIN_SEC_CONTEXT_IS_NULL,
+                     nsIContentPolicy::TYPE_OTHER, nullptr, nullptr, nullptr,
+                     nullptr, loadFlags);
+
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  nsCOMPtr<nsILoadInfo> loadInfo = testHTTPChannel->LoadInfo();
+  uint32_t httpsOnlyStatus = loadInfo->GetHttpsOnlyStatus();
+  httpsOnlyStatus |= nsILoadInfo::HTTPS_ONLY_EXEMPT |
+                     nsILoadInfo::HTTPS_ONLY_DO_NOT_LOG_TO_CONSOLE |
+                     nsILoadInfo::HTTPS_ONLY_BYPASS_ORB;
+  loadInfo->SetHttpsOnlyStatus(httpsOnlyStatus);
+
+  testHTTPChannel->SetNotificationCallbacks(this);
+  testHTTPChannel->AsyncOpen(this);
+  return NS_OK;
+}

@@ -1,0 +1,1846 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "vm/SavedStacks.h"
+
+#include "mozilla/Attributes.h"
+#include "mozilla/DebugOnly.h"
+
+#include <algorithm>
+#include <utility>
+
+#include "jsapi.h"
+
+#include "builtin/Number.h"
+#include "gc/GCContext.h"
+#include "gc/HashUtil.h"
+#include "js/CharacterEncoding.h"
+#include "js/ColumnNumber.h"  // JS::LimitedColumnNumberOneOrigin, JS::TaggedColumnNumberOneOrigin
+#include "js/ErrorReport.h"           // JSErrorBase
+#include "js/friend/ErrorMessages.h"  // js::GetErrorMessage, JSMSG_*
+#include "js/PropertyAndElement.h"    // JS_DefineProperty, JS_GetProperty
+#include "js/PropertySpec.h"
+#include "js/SavedFrameAPI.h"
+#include "js/Stack.h"
+#include "js/Vector.h"
+#include "util/RandomSeed.h"
+#include "util/StringBuilder.h"
+#include "vm/Compartment.h"
+#include "vm/FrameIter.h"
+#include "vm/GeckoProfiler.h"
+#include "vm/JSScript.h"
+#include "vm/Realm.h"
+#include "vm/SavedFrame.h"
+#include "vm/WrapperObject.h"
+
+#include "debugger/DebugAPI-inl.h"
+#include "gc/StableCellHasher-inl.h"
+#include "vm/GeckoProfiler-inl.h"
+#include "vm/JSContext-inl.h"
+
+using mozilla::AddToHash;
+using mozilla::DebugOnly;
+using mozilla::Maybe;
+using mozilla::Nothing;
+using mozilla::Some;
+
+namespace js {
+
+const uint32_t ASYNC_STACK_MAX_FRAME_COUNT = 60;
+
+void LiveSavedFrameCache::trace(JSTracer* trc) {
+  if (!initialized()) {
+    return;
+  }
+
+  for (auto* entry = frames->begin(); entry < frames->end(); entry++) {
+    TraceEdge(trc, &entry->savedFrame,
+              "LiveSavedFrameCache::frames SavedFrame");
+  }
+}
+
+bool LiveSavedFrameCache::insert(JSContext* cx, FramePtr&& framePtr,
+                                 const jsbytecode* pc,
+                                 Handle<SavedFrame*> savedFrame) {
+  MOZ_ASSERT(savedFrame);
+  MOZ_ASSERT(initialized());
+
+#ifdef DEBUG
+  size_t limit = std::min(frames->length() / 2, size_t(500));
+  for (size_t i = 0; i < limit; i++) {
+    MOZ_ASSERT(Key(framePtr) != (*frames)[i].key);
+    MOZ_ASSERT(Key(framePtr) != (*frames)[frames->length() - 1 - i].key);
+  }
+#endif
+
+  if (!frames->emplaceBack(framePtr, pc, savedFrame)) {
+    ReportOutOfMemory(cx);
+    return false;
+  }
+
+  framePtr.setHasCachedSavedFrame();
+
+  return true;
+}
+
+void LiveSavedFrameCache::find(JSContext* cx, FramePtr& framePtr,
+                               const jsbytecode* pc,
+                               MutableHandle<SavedFrame*> frame) const {
+  MOZ_ASSERT(initialized());
+  MOZ_ASSERT(framePtr.hasCachedSavedFrame());
+
+
+  if (frames->empty()) {
+    frame.set(nullptr);
+    return;
+  }
+
+  if (frames->back().savedFrame->realm() != cx->realm()) {
+#ifdef DEBUG
+    auto realm = frames->back().savedFrame->realm();
+    for (const auto& f : (*frames)) {
+      MOZ_ASSERT(realm == f.savedFrame->realm());
+    }
+#endif
+    frames->clear();
+    frame.set(nullptr);
+    return;
+  }
+
+  Key key(framePtr);
+  while (key != frames->back().key) {
+    MOZ_ASSERT(frames->back().savedFrame->realm() == cx->realm());
+
+    frames->popBack();
+
+    MOZ_RELEASE_ASSERT(!frames->empty());
+  }
+
+  if (pc != frames->back().pc) {
+    frames->popBack();
+    frame.set(nullptr);
+    return;
+  }
+
+  frame.set(frames->back().savedFrame);
+}
+
+void LiveSavedFrameCache::findWithoutInvalidation(
+    const FramePtr& framePtr, MutableHandle<SavedFrame*> frame) const {
+  MOZ_ASSERT(initialized());
+  MOZ_ASSERT(framePtr.hasCachedSavedFrame());
+
+  Key key(framePtr);
+  for (auto& entry : (*frames)) {
+    if (entry.key == key) {
+      frame.set(entry.savedFrame);
+      return;
+    }
+  }
+
+  frame.set(nullptr);
+}
+
+struct MOZ_STACK_CLASS SavedFrame::Lookup {
+  Lookup(JSAtom* source, uint32_t sourceId, uint32_t line,
+         JS::TaggedColumnNumberOneOrigin column, JSAtom* functionDisplayName,
+         JSAtom* asyncCause, SavedFrame* parent, JSPrincipals* principals,
+         bool mutedErrors,
+         const Maybe<LiveSavedFrameCache::FramePtr>& framePtr = Nothing(),
+         jsbytecode* pc = nullptr, Activation* activation = nullptr)
+      : source(source),
+        sourceId(sourceId),
+        line(line),
+        column(column),
+        functionDisplayName(functionDisplayName),
+        asyncCause(asyncCause),
+        parent(parent),
+        principals(principals),
+        mutedErrors(mutedErrors),
+        framePtr(framePtr),
+        pc(pc),
+        activation(activation) {
+    MOZ_ASSERT(source);
+    MOZ_ASSERT_IF(framePtr.isSome(), activation);
+  }
+
+  explicit Lookup(SavedFrame& savedFrame)
+      : source(savedFrame.getSource()),
+        sourceId(savedFrame.getSourceId()),
+        line(savedFrame.getLine()),
+        column(savedFrame.getColumn()),
+        functionDisplayName(savedFrame.getFunctionDisplayName()),
+        asyncCause(savedFrame.getAsyncCause()),
+        parent(savedFrame.getParent()),
+        principals(savedFrame.getPrincipals()),
+        mutedErrors(savedFrame.getMutedErrors()),
+        framePtr(Nothing()),
+        pc(nullptr),
+        activation(nullptr) {
+    MOZ_ASSERT(source);
+  }
+
+  JSAtom* source;
+  uint32_t sourceId;
+
+  uint32_t line;
+
+  JS::TaggedColumnNumberOneOrigin column;
+
+  JSAtom* functionDisplayName;
+  JSAtom* asyncCause;
+  SavedFrame* parent;
+  JSPrincipals* principals;
+  bool mutedErrors;
+
+  Maybe<LiveSavedFrameCache::FramePtr> framePtr;
+  jsbytecode* pc;
+  Activation* activation;
+
+  void trace(JSTracer* trc) {
+    TraceRoot(trc, &source, "SavedFrame::Lookup::source");
+    TraceRoot(trc, &functionDisplayName,
+              "SavedFrame::Lookup::functionDisplayName");
+    TraceRoot(trc, &asyncCause, "SavedFrame::Lookup::asyncCause");
+    TraceRoot(trc, &parent, "SavedFrame::Lookup::parent");
+  }
+};
+
+using GCLookupVector =
+    GCVector<SavedFrame::Lookup, ASYNC_STACK_MAX_FRAME_COUNT>;
+
+template <class Wrapper>
+class WrappedPtrOperations<SavedFrame::Lookup, Wrapper> {
+  const SavedFrame::Lookup& value() const {
+    return static_cast<const Wrapper*>(this)->get();
+  }
+
+ public:
+  JSAtom* source() { return value().source; }
+  uint32_t sourceId() { return value().sourceId; }
+  uint32_t line() { return value().line; }
+  JS::TaggedColumnNumberOneOrigin column() { return value().column; }
+  JSAtom* functionDisplayName() { return value().functionDisplayName; }
+  JSAtom* asyncCause() { return value().asyncCause; }
+  SavedFrame* parent() { return value().parent; }
+  JSPrincipals* principals() { return value().principals; }
+  bool mutedErrors() { return value().mutedErrors; }
+  Maybe<LiveSavedFrameCache::FramePtr> framePtr() { return value().framePtr; }
+  jsbytecode* pc() { return value().pc; }
+  Activation* activation() { return value().activation; }
+};
+
+template <typename Wrapper>
+class MutableWrappedPtrOperations<SavedFrame::Lookup, Wrapper>
+    : public WrappedPtrOperations<SavedFrame::Lookup, Wrapper> {
+  SavedFrame::Lookup& value() { return static_cast<Wrapper*>(this)->get(); }
+
+ public:
+  void setParent(SavedFrame* parent) { value().parent = parent; }
+
+  void setAsyncCause(Handle<JSAtom*> asyncCause) {
+    value().asyncCause = asyncCause;
+  }
+};
+
+bool SavedFrame::HashPolicy::maybeGetHash(const Lookup& l,
+                                          HashNumber* hashOut) {
+  HashNumber parentHash;
+  if (!SavedFramePtrHasher::maybeGetHash(l.parent, &parentHash)) {
+    return false;
+  }
+  *hashOut = calculateHash(l, parentHash);
+  return true;
+}
+
+bool SavedFrame::HashPolicy::ensureHash(const Lookup& l, HashNumber* hashOut) {
+  HashNumber parentHash;
+  if (!SavedFramePtrHasher::ensureHash(l.parent, &parentHash)) {
+    return false;
+  }
+  *hashOut = calculateHash(l, parentHash);
+  return true;
+}
+
+HashNumber SavedFrame::HashPolicy::hash(const Lookup& lookup) {
+  return calculateHash(lookup, SavedFramePtrHasher::hash(lookup.parent));
+}
+
+HashNumber SavedFrame::HashPolicy::calculateHash(const Lookup& lookup,
+                                                 HashNumber parentHash) {
+  JS::AutoCheckCannotGC nogc;
+  return AddToHash(lookup.line, lookup.column.rawValue(), lookup.source,
+                   lookup.functionDisplayName, lookup.asyncCause,
+                   lookup.mutedErrors, parentHash,
+                   JSPrincipalsPtrHasher::hash(lookup.principals));
+}
+
+bool SavedFrame::HashPolicy::match(SavedFrame* existing, const Lookup& lookup) {
+  MOZ_ASSERT(existing);
+
+  if (existing->getLine() != lookup.line) {
+    return false;
+  }
+
+  if (existing->getColumn() != lookup.column) {
+    return false;
+  }
+
+  if (existing->getParent() != lookup.parent) {
+    return false;
+  }
+
+  if (existing->getPrincipals() != lookup.principals) {
+    return false;
+  }
+
+  JSAtom* source = existing->getSource();
+  if (source != lookup.source) {
+    return false;
+  }
+
+  JSAtom* functionDisplayName = existing->getFunctionDisplayName();
+  if (functionDisplayName != lookup.functionDisplayName) {
+    return false;
+  }
+
+  JSAtom* asyncCause = existing->getAsyncCause();
+  if (asyncCause != lookup.asyncCause) {
+    return false;
+  }
+
+  if (existing->getMutedErrors() != lookup.mutedErrors) {
+    return false;
+  }
+
+  return true;
+}
+
+void SavedFrame::HashPolicy::rekey(Key& key, SavedFrame* newKey) {
+  key = newKey;
+}
+
+bool SavedFrame::finishSavedFrameInit(JSContext* cx, HandleObject ctor,
+                                      HandleObject proto) {
+  return FreezeObject(cx, proto);
+}
+
+static const JSClassOps SavedFrameClassOps = {
+    .finalize = SavedFrame::finalize,
+};
+
+const ClassSpec SavedFrame::classSpec_ = {
+    GenericCreateConstructor<SavedFrame::construct, 0, gc::AllocKind::FUNCTION>,
+    GenericCreatePrototype<SavedFrame>,
+    SavedFrame::staticFunctions,
+    nullptr,
+    SavedFrame::protoFunctions,
+    SavedFrame::protoAccessors,
+    SavedFrame::finishSavedFrameInit,
+    ClassSpec::DontDefineConstructor,
+};
+
+ const JSClass SavedFrame::class_ = {
+    "SavedFrame",
+    JSCLASS_HAS_RESERVED_SLOTS(SavedFrame::JSSLOT_COUNT) |
+        JSCLASS_HAS_CACHED_PROTO(JSProto_SavedFrame) |
+        JSCLASS_FOREGROUND_FINALIZE,
+    &SavedFrameClassOps,
+    &SavedFrame::classSpec_,
+};
+
+const JSClass SavedFrame::protoClass_ = {
+    "SavedFrame.prototype",
+    JSCLASS_HAS_CACHED_PROTO(JSProto_SavedFrame),
+    JS_NULL_CLASS_OPS,
+    &SavedFrame::classSpec_,
+};
+
+ const JSFunctionSpec SavedFrame::staticFunctions[] = {
+    JS_FS_END,
+};
+
+ const JSFunctionSpec SavedFrame::protoFunctions[] = {
+    JS_FN("constructor", SavedFrame::construct, 0, 0),
+    JS_FN("toString", SavedFrame::toStringMethod, 0, 0),
+    JS_FS_END,
+};
+
+ const JSPropertySpec SavedFrame::protoAccessors[] = {
+    JS_PSG("source", SavedFrame::sourceProperty, 0),
+    JS_PSG("sourceId", SavedFrame::sourceIdProperty, 0),
+    JS_PSG("line", SavedFrame::lineProperty, 0),
+    JS_PSG("column", SavedFrame::columnProperty, 0),
+    JS_PSG("functionDisplayName", SavedFrame::functionDisplayNameProperty, 0),
+    JS_PSG("asyncCause", SavedFrame::asyncCauseProperty, 0),
+    JS_PSG("asyncParent", SavedFrame::asyncParentProperty, 0),
+    JS_PSG("parent", SavedFrame::parentProperty, 0),
+    JS_STRING_SYM_PS(toStringTag, "SavedFrame", JSPROP_READONLY),
+    JS_PS_END,
+};
+
+void SavedFrame::finalize(JS::GCContext* gcx, JSObject* obj) {
+  MOZ_ASSERT(gcx->onMainThread());
+  JSPrincipals* p = obj->as<SavedFrame>().getPrincipals();
+  if (p) {
+    JSRuntime* rt = obj->runtimeFromMainThread();
+    JS_DropPrincipals(rt->mainContextFromOwnThread(), p);
+  }
+}
+
+JSAtom* SavedFrame::getSource() {
+  const Value& v = getReservedSlot(JSSLOT_SOURCE);
+  JSString* s = v.toString();
+  return &s->asAtom();
+}
+
+uint32_t SavedFrame::getSourceId() {
+  const Value& v = getReservedSlot(JSSLOT_SOURCEID);
+  return v.toPrivateUint32();
+}
+
+uint32_t SavedFrame::getLine() {
+  const Value& v = getReservedSlot(JSSLOT_LINE);
+  return v.toPrivateUint32();
+}
+
+JS::TaggedColumnNumberOneOrigin SavedFrame::getColumn() {
+  const Value& v = getReservedSlot(JSSLOT_COLUMN);
+  return JS::TaggedColumnNumberOneOrigin::fromRaw(v.toPrivateUint32());
+}
+
+JSAtom* SavedFrame::getFunctionDisplayName() {
+  const Value& v = getReservedSlot(JSSLOT_FUNCTIONDISPLAYNAME);
+  if (v.isNull()) {
+    return nullptr;
+  }
+  JSString* s = v.toString();
+  return &s->asAtom();
+}
+
+JSAtom* SavedFrame::getAsyncCause() {
+  const Value& v = getReservedSlot(JSSLOT_ASYNCCAUSE);
+  if (v.isNull()) {
+    return nullptr;
+  }
+  JSString* s = v.toString();
+  return &s->asAtom();
+}
+
+SavedFrame* SavedFrame::getParent() const {
+  const Value& v = getReservedSlot(JSSLOT_PARENT);
+  return v.isObject() ? &v.toObject().as<SavedFrame>() : nullptr;
+}
+
+JSPrincipals* SavedFrame::getPrincipals() {
+  const Value& v = getReservedSlot(JSSLOT_PRINCIPALS);
+  if (v.isUndefined()) {
+    return nullptr;
+  }
+  return reinterpret_cast<JSPrincipals*>(uintptr_t(v.toPrivate()) & ~0b1);
+}
+
+bool SavedFrame::getMutedErrors() {
+  const Value& v = getReservedSlot(JSSLOT_PRINCIPALS);
+  if (v.isUndefined()) {
+    return true;
+  }
+  return bool(uintptr_t(v.toPrivate()) & 0b1);
+}
+
+void SavedFrame::initSource(JSAtom* source) {
+  MOZ_ASSERT(source);
+  initReservedSlot(JSSLOT_SOURCE, StringValue(source));
+}
+
+void SavedFrame::initSourceId(uint32_t sourceId) {
+  initReservedSlot(JSSLOT_SOURCEID, PrivateUint32Value(sourceId));
+}
+
+void SavedFrame::initLine(uint32_t line) {
+  initReservedSlot(JSSLOT_LINE, PrivateUint32Value(line));
+}
+
+void SavedFrame::initColumn(JS::TaggedColumnNumberOneOrigin column) {
+  initReservedSlot(JSSLOT_COLUMN, PrivateUint32Value(column.rawValue()));
+}
+
+void SavedFrame::initPrincipalsAndMutedErrors(JSPrincipals* principals,
+                                              bool mutedErrors) {
+  if (principals) {
+    JS_HoldPrincipals(principals);
+  }
+  initPrincipalsAlreadyHeldAndMutedErrors(principals, mutedErrors);
+}
+
+void SavedFrame::initPrincipalsAlreadyHeldAndMutedErrors(
+    JSPrincipals* principals, bool mutedErrors) {
+  MOZ_ASSERT_IF(principals, principals->refcount > 0);
+  uintptr_t ptr = uintptr_t(principals) | mutedErrors;
+  initReservedSlot(JSSLOT_PRINCIPALS,
+                   PrivateValue(reinterpret_cast<void*>(ptr)));
+}
+
+void SavedFrame::initFunctionDisplayName(JSAtom* maybeName) {
+  initReservedSlot(JSSLOT_FUNCTIONDISPLAYNAME,
+                   maybeName ? StringValue(maybeName) : NullValue());
+}
+
+void SavedFrame::initAsyncCause(JSAtom* maybeCause) {
+  initReservedSlot(JSSLOT_ASYNCCAUSE,
+                   maybeCause ? StringValue(maybeCause) : NullValue());
+}
+
+void SavedFrame::initParent(SavedFrame* maybeParent) {
+  initReservedSlot(JSSLOT_PARENT, ObjectOrNullValue(maybeParent));
+}
+
+void SavedFrame::initFromLookup(JSContext* cx, Handle<Lookup> lookup) {
+  if (lookup.source()) {
+    cx->markAtom(lookup.source());
+  }
+  if (lookup.functionDisplayName()) {
+    cx->markAtom(lookup.functionDisplayName());
+  }
+  if (lookup.asyncCause()) {
+    cx->markAtom(lookup.asyncCause());
+  }
+
+  initSource(lookup.source());
+  initSourceId(lookup.sourceId());
+  initLine(lookup.line());
+  initColumn(lookup.column());
+  initFunctionDisplayName(lookup.functionDisplayName());
+  initAsyncCause(lookup.asyncCause());
+  initParent(lookup.parent());
+  initPrincipalsAndMutedErrors(lookup.principals(), lookup.mutedErrors());
+}
+
+SavedFrame* SavedFrame::create(JSContext* cx) {
+  Rooted<GlobalObject*> global(cx, cx->global());
+  cx->check(global);
+
+  SavedStacks::AutoReentrancyGuard guard(cx->realm()->savedStacks());
+
+  RootedObject proto(cx,
+                     GlobalObject::getOrCreateSavedFramePrototype(cx, global));
+  if (!proto) {
+    return nullptr;
+  }
+  cx->check(proto);
+
+  return NewObjectWithGivenProto<SavedFrame>(cx, proto,
+                                             {.newKind = TenuredObject});
+}
+
+bool SavedFrame::isSelfHosted(JSContext* cx) {
+  JSAtom* source = getSource();
+  return source == cx->names().self_hosted_;
+}
+
+bool SavedFrame::isWasm() { return getColumn().isWasmFunctionIndex(); }
+
+uint32_t SavedFrame::wasmFuncIndex() {
+  return getColumn().toWasmFunctionIndex().value();
+}
+
+uint32_t SavedFrame::wasmBytecodeOffset() {
+  MOZ_ASSERT(isWasm());
+  return getLine();
+}
+
+bool SavedFrame::construct(JSContext* cx, unsigned argc, Value* vp) {
+  JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr, JSMSG_NO_CONSTRUCTOR,
+                            "SavedFrame");
+  return false;
+}
+
+static bool SavedFrameSubsumedByPrincipals(JSContext* cx,
+                                           JSPrincipals* principals,
+                                           Handle<SavedFrame*> frame) {
+  auto subsumes = cx->runtime()->securityCallbacks->subsumes;
+  if (!subsumes) {
+    return true;
+  }
+
+  MOZ_ASSERT(!ReconstructedSavedFramePrincipals::is(principals));
+
+  auto framePrincipals = frame->getPrincipals();
+
+  if (framePrincipals == &ReconstructedSavedFramePrincipals::IsSystem) {
+    return cx->runningWithTrustedPrincipals();
+  }
+  if (framePrincipals == &ReconstructedSavedFramePrincipals::IsNotSystem) {
+    return true;
+  }
+
+  return subsumes(principals, framePrincipals);
+}
+
+template <typename Matcher>
+static SavedFrame* GetFirstMatchedFrame(JSContext* cx, JSPrincipals* principals,
+                                        Matcher& matches,
+                                        Handle<SavedFrame*> frame,
+                                        JS::SavedFrameSelfHosted selfHosted,
+                                        bool& skippedAsync) {
+  skippedAsync = false;
+
+  Rooted<SavedFrame*> rootedFrame(cx, frame);
+  while (rootedFrame) {
+    if ((selfHosted == JS::SavedFrameSelfHosted::Include ||
+         !rootedFrame->isSelfHosted(cx)) &&
+        matches(cx, principals, rootedFrame)) {
+      return rootedFrame;
+    }
+
+    if (rootedFrame->getAsyncCause()) {
+      skippedAsync = true;
+    }
+
+    rootedFrame = rootedFrame->getParent();
+  }
+
+  return nullptr;
+}
+
+static SavedFrame* GetFirstSubsumedFrame(JSContext* cx,
+                                         JSPrincipals* principals,
+                                         Handle<SavedFrame*> frame,
+                                         JS::SavedFrameSelfHosted selfHosted,
+                                         bool& skippedAsync) {
+  return GetFirstMatchedFrame(cx, principals, SavedFrameSubsumedByPrincipals,
+                              frame, selfHosted, skippedAsync);
+}
+
+JS_PUBLIC_API JSObject* GetFirstSubsumedSavedFrame(
+    JSContext* cx, JSPrincipals* principals, HandleObject savedFrame,
+    JS::SavedFrameSelfHosted selfHosted) {
+  if (!savedFrame) {
+    return nullptr;
+  }
+
+  auto subsumes = cx->runtime()->securityCallbacks->subsumes;
+  if (!subsumes) {
+    return nullptr;
+  }
+
+  auto matcher = [subsumes](JSContext* cx, JSPrincipals* principals,
+                            Handle<SavedFrame*> frame) -> bool {
+    return subsumes(principals, frame->getPrincipals());
+  };
+
+  bool skippedAsync;
+  Rooted<SavedFrame*> frame(cx, &savedFrame->as<SavedFrame>());
+  return GetFirstMatchedFrame(cx, principals, matcher, frame, selfHosted,
+                              skippedAsync);
+}
+
+[[nodiscard]] static bool SavedFrame_checkThis(JSContext* cx, CallArgs& args,
+                                               const char* fnName,
+                                               MutableHandleObject frame) {
+  const Value& thisValue = args.thisv();
+
+  if (!thisValue.isObject()) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_OBJECT_REQUIRED,
+                              InformalValueTypeName(thisValue));
+    return false;
+  }
+
+  if (!thisValue.toObject().canUnwrapAs<SavedFrame>()) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_INCOMPATIBLE_PROTO, SavedFrame::class_.name,
+                              fnName, "object");
+    return false;
+  }
+
+  frame.set(&thisValue.toObject());
+  return true;
+}
+
+#define THIS_SAVEDFRAME(cx, argc, vp, fnName, args, frame) \
+  CallArgs args = CallArgsFromVp(argc, vp);                \
+  RootedObject frame(cx);                                  \
+  if (!SavedFrame_checkThis(cx, args, fnName, &frame)) return false;
+
+} 
+
+js::SavedFrame* js::UnwrapSavedFrame(JSContext* cx, JSPrincipals* principals,
+                                     HandleObject obj,
+                                     JS::SavedFrameSelfHosted selfHosted,
+                                     bool& skippedAsync) {
+  if (!obj) {
+    return nullptr;
+  }
+
+  Rooted<SavedFrame*> frame(cx, obj->maybeUnwrapAs<SavedFrame>());
+  if (!frame) {
+    return nullptr;
+  }
+
+  return GetFirstSubsumedFrame(cx, principals, frame, selfHosted, skippedAsync);
+}
+
+namespace JS {
+
+JS_PUBLIC_API SavedFrameResult GetSavedFrameSource(
+    JSContext* cx, JSPrincipals* principals, HandleObject savedFrame,
+    MutableHandleString sourcep,
+    SavedFrameSelfHosted selfHosted ) {
+  js::AssertHeapIsIdle();
+  CHECK_THREAD(cx);
+  MOZ_RELEASE_ASSERT(cx->realm());
+
+  {
+    bool skippedAsync;
+    Rooted<js::SavedFrame*> frame(
+        cx,
+        UnwrapSavedFrame(cx, principals, savedFrame, selfHosted, skippedAsync));
+    if (!frame) {
+      sourcep.set(cx->runtime()->emptyString);
+      return SavedFrameResult::AccessDenied;
+    }
+    sourcep.set(frame->getSource());
+  }
+  if (sourcep->isAtom()) {
+    cx->markAtom(&sourcep->asAtom());
+  }
+  return SavedFrameResult::Ok;
+}
+
+JS_PUBLIC_API SavedFrameResult GetSavedFrameSourceId(
+    JSContext* cx, JSPrincipals* principals, HandleObject savedFrame,
+    uint32_t* sourceIdp,
+    SavedFrameSelfHosted selfHosted ) {
+  js::AssertHeapIsIdle();
+  CHECK_THREAD(cx);
+  MOZ_RELEASE_ASSERT(cx->realm());
+
+  bool skippedAsync;
+  Rooted<js::SavedFrame*> frame(cx, UnwrapSavedFrame(cx, principals, savedFrame,
+                                                     selfHosted, skippedAsync));
+  if (!frame) {
+    *sourceIdp = 0;
+    return SavedFrameResult::AccessDenied;
+  }
+  *sourceIdp = frame->getSourceId();
+  return SavedFrameResult::Ok;
+}
+
+JS_PUBLIC_API SavedFrameResult GetSavedFrameLine(
+    JSContext* cx, JSPrincipals* principals, HandleObject savedFrame,
+    uint32_t* linep,
+    SavedFrameSelfHosted selfHosted ) {
+  js::AssertHeapIsIdle();
+  CHECK_THREAD(cx);
+  MOZ_RELEASE_ASSERT(cx->realm());
+  MOZ_ASSERT(linep);
+
+  bool skippedAsync;
+  Rooted<js::SavedFrame*> frame(cx, UnwrapSavedFrame(cx, principals, savedFrame,
+                                                     selfHosted, skippedAsync));
+  if (!frame) {
+    *linep = 0;
+    return SavedFrameResult::AccessDenied;
+  }
+  *linep = frame->getLine();
+  return SavedFrameResult::Ok;
+}
+
+JS_PUBLIC_API SavedFrameResult GetSavedFrameColumn(
+    JSContext* cx, JSPrincipals* principals, HandleObject savedFrame,
+    JS::TaggedColumnNumberOneOrigin* columnp,
+    SavedFrameSelfHosted selfHosted ) {
+  js::AssertHeapIsIdle();
+  CHECK_THREAD(cx);
+  MOZ_RELEASE_ASSERT(cx->realm());
+  MOZ_ASSERT(columnp);
+
+  bool skippedAsync;
+  Rooted<js::SavedFrame*> frame(cx, UnwrapSavedFrame(cx, principals, savedFrame,
+                                                     selfHosted, skippedAsync));
+  if (!frame) {
+    *columnp = JS::TaggedColumnNumberOneOrigin();
+    return SavedFrameResult::AccessDenied;
+  }
+  *columnp = frame->getColumn();
+  return SavedFrameResult::Ok;
+}
+
+JS_PUBLIC_API SavedFrameResult GetSavedFrameFunctionDisplayName(
+    JSContext* cx, JSPrincipals* principals, HandleObject savedFrame,
+    MutableHandleString namep,
+    SavedFrameSelfHosted selfHosted ) {
+  js::AssertHeapIsIdle();
+  CHECK_THREAD(cx);
+  MOZ_RELEASE_ASSERT(cx->realm());
+
+  {
+    bool skippedAsync;
+    Rooted<js::SavedFrame*> frame(
+        cx,
+        UnwrapSavedFrame(cx, principals, savedFrame, selfHosted, skippedAsync));
+    if (!frame) {
+      namep.set(nullptr);
+      return SavedFrameResult::AccessDenied;
+    }
+    namep.set(frame->getFunctionDisplayName());
+  }
+  if (namep && namep->isAtom()) {
+    cx->markAtom(&namep->asAtom());
+  }
+  return SavedFrameResult::Ok;
+}
+
+JS_PUBLIC_API SavedFrameResult GetSavedFrameAsyncCause(
+    JSContext* cx, JSPrincipals* principals, HandleObject savedFrame,
+    MutableHandleString asyncCausep,
+    SavedFrameSelfHosted unused_ ) {
+  js::AssertHeapIsIdle();
+  CHECK_THREAD(cx);
+  MOZ_RELEASE_ASSERT(cx->realm());
+
+  {
+    bool skippedAsync;
+    Rooted<js::SavedFrame*> frame(
+        cx, UnwrapSavedFrame(cx, principals, savedFrame,
+                             SavedFrameSelfHosted::Include, skippedAsync));
+    if (!frame) {
+      asyncCausep.set(nullptr);
+      return SavedFrameResult::AccessDenied;
+    }
+    asyncCausep.set(frame->getAsyncCause());
+    if (!asyncCausep && skippedAsync) {
+      asyncCausep.set(cx->names().Async);
+    }
+  }
+  if (asyncCausep && asyncCausep->isAtom()) {
+    cx->markAtom(&asyncCausep->asAtom());
+  }
+  return SavedFrameResult::Ok;
+}
+
+JS_PUBLIC_API SavedFrameResult GetSavedFrameAsyncParent(
+    JSContext* cx, JSPrincipals* principals, HandleObject savedFrame,
+    MutableHandleObject asyncParentp,
+    SavedFrameSelfHosted selfHosted ) {
+  js::AssertHeapIsIdle();
+  CHECK_THREAD(cx);
+  MOZ_RELEASE_ASSERT(cx->realm());
+
+  bool skippedAsync;
+  Rooted<js::SavedFrame*> frame(cx, UnwrapSavedFrame(cx, principals, savedFrame,
+                                                     selfHosted, skippedAsync));
+  if (!frame) {
+    asyncParentp.set(nullptr);
+    return SavedFrameResult::AccessDenied;
+  }
+  Rooted<js::SavedFrame*> parent(cx, frame->getParent());
+
+  Rooted<js::SavedFrame*> subsumedParent(
+      cx,
+      GetFirstSubsumedFrame(cx, principals, parent, selfHosted, skippedAsync));
+
+  if (subsumedParent && (subsumedParent->getAsyncCause() || skippedAsync)) {
+    asyncParentp.set(parent);
+  } else {
+    asyncParentp.set(nullptr);
+  }
+  return SavedFrameResult::Ok;
+}
+
+JS_PUBLIC_API SavedFrameResult GetSavedFrameParent(
+    JSContext* cx, JSPrincipals* principals, HandleObject savedFrame,
+    MutableHandleObject parentp,
+    SavedFrameSelfHosted selfHosted ) {
+  js::AssertHeapIsIdle();
+  CHECK_THREAD(cx);
+  MOZ_RELEASE_ASSERT(cx->realm());
+
+  bool skippedAsync;
+  Rooted<js::SavedFrame*> frame(cx, UnwrapSavedFrame(cx, principals, savedFrame,
+                                                     selfHosted, skippedAsync));
+  if (!frame) {
+    parentp.set(nullptr);
+    return SavedFrameResult::AccessDenied;
+  }
+  Rooted<js::SavedFrame*> parent(cx, frame->getParent());
+
+  Rooted<js::SavedFrame*> subsumedParent(
+      cx,
+      GetFirstSubsumedFrame(cx, principals, parent, selfHosted, skippedAsync));
+
+  if (subsumedParent && !(subsumedParent->getAsyncCause() || skippedAsync)) {
+    parentp.set(parent);
+  } else {
+    parentp.set(nullptr);
+  }
+  return SavedFrameResult::Ok;
+}
+
+static bool FormatStackFrameLine(js::StringBuilder& sb,
+                                 JS::Handle<js::SavedFrame*> frame) {
+  if (frame->isWasm()) {
+    return sb.append("wasm-function[") &&
+           NumberValueToStringBuilder(NumberValue(frame->wasmFuncIndex()),
+                                      sb) &&
+           sb.append(']');
+  }
+
+  return NumberValueToStringBuilder(NumberValue(frame->getLine()), sb);
+}
+
+static bool FormatStackFrameColumn(js::StringBuilder& sb,
+                                   JS::Handle<js::SavedFrame*> frame) {
+  if (frame->isWasm()) {
+    js::Int32ToCStringBuf cbuf;
+    size_t cstrlen;
+    const char* cstr =
+        Uint32ToHexCString(&cbuf, frame->wasmBytecodeOffset(), &cstrlen);
+    MOZ_ASSERT(cstr);
+
+    return sb.append("0x") && sb.append(cstr, cstrlen);
+  }
+
+  return NumberValueToStringBuilder(
+      NumberValue(frame->getColumn().oneOriginValue()), sb);
+}
+
+static bool FormatSpiderMonkeyStackFrame(JSContext* cx, js::StringBuilder& sb,
+                                         JS::Handle<js::SavedFrame*> frame,
+                                         size_t indent, bool skippedAsync) {
+  RootedString asyncCause(cx, frame->getAsyncCause());
+  if (!asyncCause && skippedAsync) {
+    asyncCause.set(cx->names().Async);
+  }
+
+  Rooted<JSAtom*> name(cx, frame->getFunctionDisplayName());
+  return (!indent || sb.appendN(' ', indent)) &&
+         (!asyncCause || (sb.append(asyncCause) && sb.append('*'))) &&
+         (!name || sb.append(name)) && sb.append('@') &&
+         sb.append(frame->getSource()) && sb.append(':') &&
+         FormatStackFrameLine(sb, frame) && sb.append(':') &&
+         FormatStackFrameColumn(sb, frame) && sb.append('\n');
+}
+
+static bool FormatV8StackFrame(JSContext* cx, js::StringBuilder& sb,
+                               JS::Handle<js::SavedFrame*> frame, size_t indent,
+                               bool lastFrame) {
+  Rooted<JSAtom*> name(cx, frame->getFunctionDisplayName());
+  return sb.appendN(' ', indent + 4) && sb.append('a') && sb.append('t') &&
+         sb.append(' ') &&
+         (!name || (sb.append(name) && sb.append(' ') && sb.append('('))) &&
+         sb.append(frame->getSource()) && sb.append(':') &&
+         FormatStackFrameLine(sb, frame) && sb.append(':') &&
+         FormatStackFrameColumn(sb, frame) && (!name || sb.append(')')) &&
+         (lastFrame || sb.append('\n'));
+}
+
+JS_PUBLIC_API bool BuildStackString(JSContext* cx, JSPrincipals* principals,
+                                    HandleObject stack,
+                                    MutableHandleString stringp, size_t indent,
+                                    js::StackFormat format) {
+  js::AssertHeapIsIdle();
+  CHECK_THREAD(cx);
+  MOZ_RELEASE_ASSERT(cx->realm());
+
+  js::JSStringBuilder sb(cx);
+
+  if (format == js::StackFormat::Default) {
+    format = cx->runtime()->stackFormat();
+  }
+  MOZ_ASSERT(format != js::StackFormat::Default);
+
+  {
+    bool skippedAsync;
+    RootedTuple<js::SavedFrame*, js::SavedFrame*, js::SavedFrame*> roots(cx);
+    RootedField<js::SavedFrame*, 0> frame(
+        roots, UnwrapSavedFrame(cx, principals, stack,
+                                SavedFrameSelfHosted::Exclude, skippedAsync));
+    if (!frame) {
+      stringp.set(cx->runtime()->emptyString);
+      return true;
+    }
+
+    RootedField<js::SavedFrame*, 1> parent(roots);
+    RootedField<js::SavedFrame*, 2> nextFrame(roots);
+    do {
+      MOZ_ASSERT(SavedFrameSubsumedByPrincipals(cx, principals, frame));
+      MOZ_ASSERT(!frame->isSelfHosted(cx));
+
+      parent = frame->getParent();
+      bool skippedNextAsync;
+      nextFrame = js::GetFirstSubsumedFrame(cx, principals, parent,
+                                            SavedFrameSelfHosted::Exclude,
+                                            skippedNextAsync);
+
+      switch (format) {
+        case js::StackFormat::SpiderMonkey:
+          if (!FormatSpiderMonkeyStackFrame(cx, sb, frame, indent,
+                                            skippedAsync)) {
+            return false;
+          }
+          break;
+        case js::StackFormat::V8:
+          if (!FormatV8StackFrame(cx, sb, frame, indent, !nextFrame)) {
+            return false;
+          }
+          break;
+        case js::StackFormat::Default:
+          MOZ_CRASH("Unexpected value");
+          break;
+      }
+
+      frame = nextFrame;
+      skippedAsync = skippedNextAsync;
+    } while (frame);
+  }
+
+  JSString* str = sb.finishString();
+  if (!str) {
+    return false;
+  }
+  cx->check(str);
+  stringp.set(str);
+  return true;
+}
+
+JS_PUBLIC_API bool IsMaybeWrappedSavedFrame(JSObject* obj) {
+  MOZ_ASSERT(obj);
+  return obj->canUnwrapAs<js::SavedFrame>();
+}
+
+JS_PUBLIC_API bool IsUnwrappedSavedFrame(JSObject* obj) {
+  MOZ_ASSERT(obj);
+  return obj->is<js::SavedFrame>();
+}
+
+static bool AssignProperty(JSContext* cx, HandleObject dst, HandleObject src,
+                           const char* property) {
+  RootedValue v(cx);
+  return JS_GetProperty(cx, src, property, &v) &&
+         JS_DefineProperty(cx, dst, property, v, JSPROP_ENUMERATE);
+}
+
+JS_PUBLIC_API JSObject* ConvertSavedFrameToPlainObject(
+    JSContext* cx, HandleObject savedFrameArg,
+    SavedFrameSelfHosted selfHosted) {
+  MOZ_ASSERT(savedFrameArg);
+
+  RootedTuple<JSObject*, JSObject*, JSObject*, Value, JSObject*> roots(cx);
+  RootedField<JSObject*, 0> savedFrame(roots, savedFrameArg);
+  RootedField<JSObject*, 1> baseConverted(roots);
+  RootedField<JSObject*, 2> lastConverted(roots);
+  RootedField<Value, 3> v(roots);
+  RootedField<JSObject*, 4> nextConverted(roots);
+
+  baseConverted = lastConverted = JS_NewObject(cx, nullptr);
+  if (!baseConverted) {
+    return nullptr;
+  }
+
+  bool foundParent;
+  do {
+    if (!AssignProperty(cx, lastConverted, savedFrame, "source") ||
+        !AssignProperty(cx, lastConverted, savedFrame, "sourceId") ||
+        !AssignProperty(cx, lastConverted, savedFrame, "line") ||
+        !AssignProperty(cx, lastConverted, savedFrame, "column") ||
+        !AssignProperty(cx, lastConverted, savedFrame, "functionDisplayName") ||
+        !AssignProperty(cx, lastConverted, savedFrame, "asyncCause")) {
+      return nullptr;
+    }
+
+    const char* parentProperties[] = {"parent", "asyncParent"};
+    foundParent = false;
+    for (const char* prop : parentProperties) {
+      if (!JS_GetProperty(cx, savedFrame, prop, &v)) {
+        return nullptr;
+      }
+      if (v.isObject()) {
+        nextConverted = JS_NewObject(cx, nullptr);
+        if (!nextConverted ||
+            !JS_DefineProperty(cx, lastConverted, prop, nextConverted,
+                               JSPROP_ENUMERATE)) {
+          return nullptr;
+        }
+        lastConverted = nextConverted;
+        savedFrame = &v.toObject();
+        foundParent = true;
+        break;
+      }
+    }
+  } while (foundParent);
+
+  return baseConverted;
+}
+
+} 
+
+namespace js {
+
+bool SavedFrame::sourceProperty(JSContext* cx, unsigned argc, Value* vp) {
+  THIS_SAVEDFRAME(cx, argc, vp, "(get source)", args, frame);
+  JSPrincipals* principals = cx->realm()->principals();
+  RootedString source(cx);
+  if (JS::GetSavedFrameSource(cx, principals, frame, &source) ==
+      JS::SavedFrameResult::Ok) {
+    if (!cx->compartment()->wrap(cx, &source)) {
+      return false;
+    }
+    args.rval().setString(source);
+  } else {
+    args.rval().setNull();
+  }
+  return true;
+}
+
+bool SavedFrame::sourceIdProperty(JSContext* cx, unsigned argc, Value* vp) {
+  THIS_SAVEDFRAME(cx, argc, vp, "(get sourceId)", args, frame);
+  JSPrincipals* principals = cx->realm()->principals();
+  uint32_t sourceId;
+  if (JS::GetSavedFrameSourceId(cx, principals, frame, &sourceId) ==
+      JS::SavedFrameResult::Ok) {
+    args.rval().setNumber(sourceId);
+  } else {
+    args.rval().setNull();
+  }
+  return true;
+}
+
+bool SavedFrame::lineProperty(JSContext* cx, unsigned argc, Value* vp) {
+  THIS_SAVEDFRAME(cx, argc, vp, "(get line)", args, frame);
+  JSPrincipals* principals = cx->realm()->principals();
+  uint32_t line;
+  if (JS::GetSavedFrameLine(cx, principals, frame, &line) ==
+      JS::SavedFrameResult::Ok) {
+    args.rval().setNumber(line);
+  } else {
+    args.rval().setNull();
+  }
+  return true;
+}
+
+bool SavedFrame::columnProperty(JSContext* cx, unsigned argc, Value* vp) {
+  THIS_SAVEDFRAME(cx, argc, vp, "(get column)", args, frame);
+  JSPrincipals* principals = cx->realm()->principals();
+  JS::TaggedColumnNumberOneOrigin column;
+  if (JS::GetSavedFrameColumn(cx, principals, frame, &column) ==
+      JS::SavedFrameResult::Ok) {
+    args.rval().setNumber(column.oneOriginValue());
+  } else {
+    args.rval().setNull();
+  }
+  return true;
+}
+
+bool SavedFrame::functionDisplayNameProperty(JSContext* cx, unsigned argc,
+                                             Value* vp) {
+  THIS_SAVEDFRAME(cx, argc, vp, "(get functionDisplayName)", args, frame);
+  JSPrincipals* principals = cx->realm()->principals();
+  RootedString name(cx);
+  JS::SavedFrameResult result =
+      JS::GetSavedFrameFunctionDisplayName(cx, principals, frame, &name);
+  if (result == JS::SavedFrameResult::Ok && name) {
+    if (!cx->compartment()->wrap(cx, &name)) {
+      return false;
+    }
+    args.rval().setString(name);
+  } else {
+    args.rval().setNull();
+  }
+  return true;
+}
+
+bool SavedFrame::asyncCauseProperty(JSContext* cx, unsigned argc, Value* vp) {
+  THIS_SAVEDFRAME(cx, argc, vp, "(get asyncCause)", args, frame);
+  JSPrincipals* principals = cx->realm()->principals();
+  RootedString asyncCause(cx);
+  JS::SavedFrameResult result =
+      JS::GetSavedFrameAsyncCause(cx, principals, frame, &asyncCause);
+  if (result == JS::SavedFrameResult::Ok && asyncCause) {
+    if (!cx->compartment()->wrap(cx, &asyncCause)) {
+      return false;
+    }
+    args.rval().setString(asyncCause);
+  } else {
+    args.rval().setNull();
+  }
+  return true;
+}
+
+bool SavedFrame::asyncParentProperty(JSContext* cx, unsigned argc, Value* vp) {
+  THIS_SAVEDFRAME(cx, argc, vp, "(get asyncParent)", args, frame);
+  JSPrincipals* principals = cx->realm()->principals();
+  RootedObject asyncParent(cx);
+  (void)JS::GetSavedFrameAsyncParent(cx, principals, frame, &asyncParent);
+  if (!cx->compartment()->wrap(cx, &asyncParent)) {
+    return false;
+  }
+  args.rval().setObjectOrNull(asyncParent);
+  return true;
+}
+
+bool SavedFrame::parentProperty(JSContext* cx, unsigned argc, Value* vp) {
+  THIS_SAVEDFRAME(cx, argc, vp, "(get parent)", args, frame);
+  JSPrincipals* principals = cx->realm()->principals();
+  RootedObject parent(cx);
+  (void)JS::GetSavedFrameParent(cx, principals, frame, &parent);
+  if (!cx->compartment()->wrap(cx, &parent)) {
+    return false;
+  }
+  args.rval().setObjectOrNull(parent);
+  return true;
+}
+
+bool SavedFrame::toStringMethod(JSContext* cx, unsigned argc, Value* vp) {
+  THIS_SAVEDFRAME(cx, argc, vp, "toString", args, frame);
+  JSPrincipals* principals = cx->realm()->principals();
+  RootedString string(cx);
+  if (!JS::BuildStackString(cx, principals, frame, &string)) {
+    return false;
+  }
+  args.rval().setString(string);
+  return true;
+}
+
+bool SavedStacks::saveCurrentStack(
+    JSContext* cx, MutableHandle<SavedFrame*> frame,
+    JS::StackCapture&& capture ,
+    HandleObject startAt ) {
+  MOZ_RELEASE_ASSERT(cx->realm());
+  MOZ_DIAGNOSTIC_ASSERT(&cx->realm()->savedStacks() == this);
+
+  if (creatingSavedFrame || cx->isExceptionPending() || !cx->global() ||
+      !cx->global()->isStandardClassResolved(JSProto_Object)) {
+    frame.set(nullptr);
+    return true;
+  }
+
+  AutoGeckoProfilerEntry labelFrame(cx, "js::SavedStacks::saveCurrentStack");
+  return insertFrames(cx, frame, std::move(capture), startAt);
+}
+
+bool SavedStacks::copyAsyncStack(JSContext* cx, HandleObject asyncStack,
+                                 HandleString asyncCause,
+                                 MutableHandle<SavedFrame*> adoptedStack,
+                                 const Maybe<size_t>& maxFrameCount) {
+  MOZ_RELEASE_ASSERT(cx->realm());
+  MOZ_DIAGNOSTIC_ASSERT(&cx->realm()->savedStacks() == this);
+
+  Rooted<JSAtom*> asyncCauseAtom(cx, AtomizeString(cx, asyncCause));
+  if (!asyncCauseAtom) {
+    return false;
+  }
+
+  Rooted<SavedFrame*> asyncStackObj(
+      cx, asyncStack->maybeUnwrapAs<js::SavedFrame>());
+  MOZ_RELEASE_ASSERT(asyncStackObj);
+  adoptedStack.set(asyncStackObj);
+
+  if (!adoptAsyncStack(cx, adoptedStack, asyncCauseAtom, maxFrameCount)) {
+    return false;
+  }
+
+  return true;
+}
+
+void SavedStacks::traceWeak(JSTracer* trc) {
+  frames.traceWeak(trc);
+  pcLocationMap.traceWeak(trc);
+}
+
+void SavedStacks::trace(JSTracer* trc) { pcLocationMap.trace(trc); }
+
+uint32_t SavedStacks::count() { return frames.count(); }
+
+void SavedStacks::clear() { frames.clear(); }
+
+size_t SavedStacks::sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) {
+  return frames.shallowSizeOfExcludingThis(mallocSizeOf) +
+         pcLocationMap.shallowSizeOfExcludingThis(mallocSizeOf);
+}
+
+static inline bool captureIsSatisfied(JSContext* cx, JSPrincipals* principals,
+                                      const JSAtom* source,
+                                      JS::StackCapture& capture) {
+  class Matcher {
+    JSContext* cx_;
+    JSPrincipals* framePrincipals_;
+    const JSAtom* frameSource_;
+
+   public:
+    Matcher(JSContext* cx, JSPrincipals* principals, const JSAtom* source)
+        : cx_(cx), framePrincipals_(principals), frameSource_(source) {}
+
+    bool operator()(JS::FirstSubsumedFrame& target) {
+      auto subsumes = cx_->runtime()->securityCallbacks->subsumes;
+      return (!subsumes || subsumes(target.principals, framePrincipals_)) &&
+             (!target.ignoreSelfHosted ||
+              frameSource_ != cx_->names().self_hosted_);
+    }
+
+    bool operator()(JS::MaxFrames& target) { return target.maxFrames == 1; }
+
+    bool operator()(JS::AllFrames&) { return false; }
+  };
+
+  Matcher m(cx, principals, source);
+  return capture.match(m);
+}
+
+bool SavedStacks::insertFrames(JSContext* cx, MutableHandle<SavedFrame*> frame,
+                               JS::StackCapture&& capture,
+                               HandleObject startAtObj) {
+  MOZ_ASSERT_IF(startAtObj, startAtObj->isCallable());
+
+
+  Rooted<js::GCLookupVector> stackChain(cx, js::GCLookupVector(cx));
+
+  Rooted<SavedFrame*> cachedParentFrame(cx, nullptr);
+
+  FrameIter iter(cx, capture.is<JS::AllFrames>()
+                         ? FrameIter::IGNORE_DEBUGGER_EVAL_PREV_LINK
+                         : FrameIter::FOLLOW_DEBUGGER_EVAL_PREV_LINK);
+
+  DebugOnly<bool> seenCached = false;
+
+  Vector<AbstractFramePtr, 4, TempAllocPolicy> unreachedEvalTargets(cx);
+
+  RootedTuple<JSFunction*, LocationValue, JSAtom*, JSAtom*, SavedFrame*> roots(
+      cx);
+  RootedField<JSFunction*> startAt(roots,
+                                   startAtObj && startAtObj->is<JSFunction>()
+                                       ? &startAtObj->as<JSFunction>()
+                                       : nullptr);
+  bool seenStartAt = !startAt;
+  bool framePushed = false;
+  RootedField<LocationValue, 1> location(roots);
+  RootedField<JSAtom*, 2> displayAtom(roots);
+  RootedField<JSAtom*, 3> causeAtom(roots);
+  RootedField<SavedFrame*> asyncParent(roots);
+
+  while (!iter.done()) {
+    Activation& activation = *iter.activation();
+    Maybe<LiveSavedFrameCache::FramePtr> framePtr =
+        LiveSavedFrameCache::FramePtr::create(cx, iter);
+
+    if (capture.is<JS::AllFrames>() && iter.hasUsableAbstractFramePtr()) {
+      unreachedEvalTargets.eraseIfEqual(iter.abstractFramePtr());
+    }
+
+    if (framePtr) {
+      DebugOnly<bool> hasGoodExcuse = framePtr->isRematerializedFrame() ||
+                                      capture.is<JS::FirstSubsumedFrame>();
+      MOZ_ASSERT_IF(seenCached,
+                    framePtr->hasCachedSavedFrame() || hasGoodExcuse);
+      seenCached |= framePtr->hasCachedSavedFrame();
+
+      if (capture.is<JS::AllFrames>() && framePtr->isInterpreterFrame() &&
+          framePtr->asInterpreterFrame().isDebuggerEvalFrame()) {
+        AbstractFramePtr target =
+            framePtr->asInterpreterFrame().evalInFramePrev();
+        if (!unreachedEvalTargets.append(target)) {
+          return false;
+        }
+      }
+    }
+
+    if (capture.is<JS::AllFrames>() && framePtr &&
+        framePtr->hasCachedSavedFrame()) {
+      auto* cache = activation.getLiveSavedFrameCache(cx);
+      if (!cache) {
+        return false;
+      }
+      cache->find(cx, *framePtr, iter.pc(), &cachedParentFrame);
+
+      if (cachedParentFrame && unreachedEvalTargets.empty()) {
+        break;
+      }
+
+      framePtr->clearHasCachedSavedFrame();
+    }
+
+    {
+      AutoRealmUnchecked ar(cx, iter.realm());
+      if (!cx->realm()->savedStacks().getLocation(cx, iter, &location)) {
+        return false;
+      }
+    }
+
+    displayAtom = iter.maybeFunctionDisplayAtom();
+
+    auto principals = iter.realm()->principals();
+    MOZ_ASSERT_IF(framePtr && !iter.isWasm(), iter.pc());
+
+    if (seenStartAt) {
+      framePushed = true;
+      if (!stackChain.emplaceBack(location.source(), location.sourceId(),
+                                  location.line(), location.column(),
+                                  displayAtom,
+                                  nullptr,  
+                                  nullptr,  
+                                  principals, iter.mutedErrors(), framePtr,
+                                  iter.pc(), &activation)) {
+        return false;
+      }
+    }
+
+    if (framePushed &&
+        captureIsSatisfied(cx, principals, location.source(), capture)) {
+      break;
+    }
+
+    if (!seenStartAt && iter.isFunctionFrame() &&
+        iter.matchCallee(cx, startAt)) {
+      seenStartAt = true;
+    }
+
+    ++iter;
+    framePtr = LiveSavedFrameCache::FramePtr::create(cx, iter);
+
+    if (iter.activation() != &activation && capture.is<JS::AllFrames>()) {
+      activation.clearLiveSavedFrameCache();
+    }
+
+    bool hasAsyncStackToAdopt =
+        iter.activation() != &activation && activation.asyncStack() &&
+        (activation.asyncCallIsExplicit() || iter.done()) &&
+        !capture.is<JS::FirstSubsumedFrame>();
+
+    if (hasAsyncStackToAdopt && stackChain.length() == 0) {
+      break;
+    }
+
+    if (hasAsyncStackToAdopt) {
+      const char* cause = activation.asyncCause();
+      causeAtom = AtomizeUTF8Chars(cx, cause, strlen(cause));
+      if (!causeAtom) {
+        return false;
+      }
+
+      Maybe<size_t> maxFrames =
+          !capture.is<JS::MaxFrames>() ? Nothing()
+          : capture.as<JS::MaxFrames>().maxFrames == 0
+              ? Nothing()
+              : Some(capture.as<JS::MaxFrames>().maxFrames);
+
+      asyncParent = activation.asyncStack();
+      if (!adoptAsyncStack(cx, &asyncParent, causeAtom, maxFrames)) {
+        return false;
+      }
+      stackChain[stackChain.length() - 1].setParent(asyncParent);
+      if (!capture.is<JS::AllFrames>() || unreachedEvalTargets.empty()) {
+        break;
+      }
+
+      seenCached = false;
+    }
+
+    if (framePushed && capture.is<JS::MaxFrames>()) {
+      capture.as<JS::MaxFrames>().maxFrames--;
+    }
+  }
+
+  frame.set(cachedParentFrame);
+  for (size_t i = stackChain.length(); i != 0; i--) {
+    MutableHandle<SavedFrame::Lookup> lookup = stackChain[i - 1];
+    if (!lookup.parent()) {
+      lookup.setParent(frame);
+    }
+
+    if (capture.is<JS::AllFrames>() && lookup.framePtr()) {
+      if (!checkForEvalInFramePrev(cx, lookup)) {
+        return false;
+      }
+    }
+
+    frame.set(getOrCreateSavedFrame(cx, lookup));
+    if (!frame) {
+      return false;
+    }
+
+    if (capture.is<JS::AllFrames>() && lookup.framePtr()) {
+      auto* cache = lookup.activation()->getLiveSavedFrameCache(cx);
+      if (!cache ||
+          !cache->insert(cx, *lookup.framePtr(), lookup.pc(), frame)) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+bool SavedStacks::adoptAsyncStack(JSContext* cx,
+                                  MutableHandle<SavedFrame*> asyncStack,
+                                  Handle<JSAtom*> asyncCause,
+                                  const Maybe<size_t>& maxFrameCount) {
+  MOZ_ASSERT(asyncStack);
+  MOZ_ASSERT(asyncCause);
+
+  size_t maxFrames = maxFrameCount.valueOr(ASYNC_STACK_MAX_FRAME_COUNT);
+
+  Rooted<js::GCLookupVector> stackChain(cx, js::GCLookupVector(cx));
+  SavedFrame* currentSavedFrame = asyncStack;
+  while (currentSavedFrame && stackChain.length() < maxFrames) {
+    if (!stackChain.emplaceBack(*currentSavedFrame)) {
+      ReportOutOfMemory(cx);
+      return false;
+    }
+
+    currentSavedFrame = currentSavedFrame->getParent();
+  }
+
+  stackChain[0].setAsyncCause(asyncCause);
+
+  if (currentSavedFrame == nullptr && asyncStack->realm() == cx->realm()) {
+    MutableHandle<SavedFrame::Lookup> lookup = stackChain[0];
+    lookup.setParent(asyncStack->getParent());
+    asyncStack.set(getOrCreateSavedFrame(cx, lookup));
+    return !!asyncStack;
+  }
+
+  if (maxFrameCount.isNothing() && currentSavedFrame) {
+    stackChain.shrinkBy(ASYNC_STACK_MAX_FRAME_COUNT / 2);
+  }
+
+  asyncStack.set(nullptr);
+  while (!stackChain.empty()) {
+    Rooted<SavedFrame::Lookup> lookup(cx, stackChain.back());
+    lookup.setParent(asyncStack);
+    asyncStack.set(getOrCreateSavedFrame(cx, lookup));
+    if (!asyncStack) {
+      return false;
+    }
+    stackChain.popBack();
+  }
+
+  return true;
+}
+
+bool SavedStacks::checkForEvalInFramePrev(
+    JSContext* cx, MutableHandle<SavedFrame::Lookup> lookup) {
+  MOZ_ASSERT(lookup.framePtr());
+  if (!lookup.framePtr()->isInterpreterFrame()) {
+    return true;
+  }
+
+  InterpreterFrame& interpreterFrame = lookup.framePtr()->asInterpreterFrame();
+  if (!interpreterFrame.isDebuggerEvalFrame()) {
+    return true;
+  }
+
+  FrameIter iter(cx, FrameIter::IGNORE_DEBUGGER_EVAL_PREV_LINK);
+  while (!iter.done() &&
+         (!iter.hasUsableAbstractFramePtr() ||
+          iter.abstractFramePtr() != interpreterFrame.evalInFramePrev())) {
+    ++iter;
+  }
+
+  Maybe<LiveSavedFrameCache::FramePtr> maybeTarget =
+      LiveSavedFrameCache::FramePtr::create(cx, iter);
+  MOZ_ASSERT(maybeTarget);
+
+  LiveSavedFrameCache::FramePtr target = *maybeTarget;
+
+  MOZ_ASSERT(target.hasCachedSavedFrame());
+
+  Rooted<SavedFrame*> saved(cx, nullptr);
+  for (Activation* act = lookup.activation(); act; act = act->prev()) {
+    auto* cache = act->getLiveSavedFrameCache(cx);
+    if (!cache) {
+      return false;
+    }
+
+    cache->findWithoutInvalidation(target, &saved);
+    if (saved) {
+      break;
+    }
+  }
+
+  MOZ_ALWAYS_TRUE(saved);
+
+  MOZ_ASSERT(saved->realm() == cx->realm());
+
+  lookup.setParent(saved);
+  return true;
+}
+
+SavedFrame* SavedStacks::getOrCreateSavedFrame(
+    JSContext* cx, Handle<SavedFrame::Lookup> lookup) {
+  const SavedFrame::Lookup& lookupInstance = lookup.get();
+  DependentAddPtr<SavedFrame::Set> p(cx, frames, lookupInstance);
+  if (p) {
+    MOZ_ASSERT(*p);
+    return *p;
+  }
+
+  SavedFrame* frame = createFrameFromLookup(cx, lookup);
+  if (!frame) {
+    return nullptr;
+  }
+
+  if (!p.add(cx, frames, lookupInstance, frame)) {
+    return nullptr;
+  }
+
+  return frame;
+}
+
+SavedFrame* SavedStacks::createFrameFromLookup(
+    JSContext* cx, Handle<SavedFrame::Lookup> lookup) {
+  Rooted<SavedFrame*> frame(cx, SavedFrame::create(cx));
+  if (!frame) {
+    return nullptr;
+  }
+  frame->initFromLookup(cx, lookup);
+
+  if (!FreezeObject(cx, frame)) {
+    return nullptr;
+  }
+
+  return frame;
+}
+
+bool SavedStacks::getLocation(JSContext* cx, const FrameIter& iter,
+                              MutableHandle<LocationValue> locationp) {
+  MOZ_DIAGNOSTIC_ASSERT(&cx->realm()->savedStacks() == this);
+  cx->check(iter.compartment());
+
+
+  if (iter.isWasm()) {
+    MOZ_ASSERT(!iter.displayURL(), "wasm script source has no displayURL.");
+    const char* filename = iter.filename() ? iter.filename() : "";
+    locationp.setSource(AtomizeUTF8Chars(cx, filename, strlen(filename)));
+    if (!locationp.source()) {
+      return false;
+    }
+
+    JS::TaggedColumnNumberOneOrigin column;
+    locationp.setLine(iter.computeLine(&column));
+    locationp.setColumn(column);
+    return true;
+  }
+
+  RootedScript script(cx, iter.script());
+  jsbytecode* pc = iter.pc();
+
+  PCLocationMap::AddPtr p = pcLocationMap.lookupForAdd(PCKey(script, pc));
+
+  if (!p) {
+    Rooted<JSAtom*> source(cx);
+    if (const char16_t* displayURL = iter.displayURL()) {
+      source = AtomizeChars(cx, displayURL, js_strlen(displayURL));
+    } else {
+      const char* filename = script->filename() ? script->filename() : "";
+      source = AtomizeUTF8Chars(cx, filename, strlen(filename));
+    }
+    if (!source) {
+      return false;
+    }
+
+    uint32_t sourceId = script->scriptSource()->id();
+    JS::LimitedColumnNumberOneOrigin column;
+    uint32_t line = PCToLineNumber(script, pc, &column);
+
+    PCKey key(script, pc);
+    LocationValue value(source, sourceId, line,
+                        JS::TaggedColumnNumberOneOrigin(column));
+    if (!pcLocationMap.add(p, key, value)) {
+      ReportOutOfMemory(cx);
+      return false;
+    }
+  }
+
+  locationp.set(p->value());
+  return true;
+}
+
+void SavedStacks::chooseSamplingProbability(Realm* realm) {
+  {
+    JSRuntime* runtime = realm->runtimeFromMainThread();
+    if (runtime->recordAllocationCallback) {
+      this->setSamplingProbability(runtime->allocationSamplingProbability);
+      return;
+    }
+  }
+
+  GlobalObject* global = realm->unsafeUnbarrieredMaybeGlobal();
+  if (!global) {
+    return;
+  }
+
+  Maybe<double> probability = DebugAPI::allocationSamplingProbability(global);
+  if (probability.isNothing()) {
+    return;
+  }
+
+  this->setSamplingProbability(*probability);
+}
+
+void SavedStacks::setSamplingProbability(double probability) {
+  if (!bernoulliSeeded) {
+    mozilla::Array<uint64_t, 2> seed;
+    GenerateXorShift128PlusSeed(seed);
+    bernoulli.setRandomState(seed[0], seed[1]);
+    bernoulliSeeded = true;
+  }
+
+  bernoulli.setProbability(probability);
+}
+
+JSObject* SavedStacks::MetadataBuilder::build(
+    JSContext* cx, HandleObject target,
+    AutoEnterOOMUnsafeRegion& oomUnsafe) const {
+  RootedObject obj(cx, target);
+
+  SavedStacks& stacks = cx->realm()->savedStacks();
+  if (!stacks.bernoulli.trial()) {
+    return nullptr;
+  }
+
+  Rooted<SavedFrame*> frame(cx);
+  if (!stacks.saveCurrentStack(cx, &frame)) {
+    oomUnsafe.crash("SavedStacksMetadataBuilder");
+  }
+
+  if (!DebugAPI::onLogAllocationSite(cx, obj, frame,
+                                     mozilla::TimeStamp::Now())) {
+    oomUnsafe.crash("SavedStacksMetadataBuilder");
+  }
+
+  auto recordAllocationCallback =
+      cx->realm()->runtimeFromMainThread()->recordAllocationCallback;
+  if (recordAllocationCallback) {
+
+    auto node = JS::ubi::Node(obj.get());
+
+    recordAllocationCallback(JS::RecordAllocationInfo{
+        node.typeName(), node.jsObjectClassName(), node.descriptiveTypeName(),
+        JS::ubi::CoarseTypeToString(node.coarseType()),
+        node.size(cx->runtime()->debuggerMallocSizeOf),
+        gc::IsInsideNursery(obj)});
+  }
+
+  MOZ_ASSERT_IF(frame, !frame->is<WrapperObject>());
+  return frame;
+}
+
+const SavedStacks::MetadataBuilder SavedStacks::metadataBuilder;
+
+constinit ReconstructedSavedFramePrincipals
+    ReconstructedSavedFramePrincipals::IsSystem;
+constinit ReconstructedSavedFramePrincipals
+    ReconstructedSavedFramePrincipals::IsNotSystem;
+
+UniqueChars BuildUTF8StackString(JSContext* cx, JSPrincipals* principals,
+                                 HandleObject stack) {
+  RootedString stackStr(cx);
+  if (!JS::BuildStackString(cx, principals, stack, &stackStr)) {
+    return nullptr;
+  }
+
+  return JS_EncodeStringToUTF8(cx, stackStr);
+}
+
+} 
+
+namespace JS {
+namespace ubi {
+
+bool ConcreteStackFrame<SavedFrame>::isSystem() const {
+  auto trustedPrincipals = get().runtimeFromAnyThread()->trustedPrincipals();
+  return get().getPrincipals() == trustedPrincipals ||
+         get().getPrincipals() ==
+             &js::ReconstructedSavedFramePrincipals::IsSystem;
+}
+
+bool ConcreteStackFrame<SavedFrame>::constructSavedFrameStack(
+    JSContext* cx, MutableHandleObject outSavedFrameStack) const {
+  outSavedFrameStack.set(&get());
+  if (!cx->compartment()->wrap(cx, outSavedFrameStack)) {
+    outSavedFrameStack.set(nullptr);
+    return false;
+  }
+  return true;
+}
+
+struct MOZ_STACK_CLASS AtomizingMatcher {
+  JSContext* cx;
+  size_t length;
+
+  explicit AtomizingMatcher(JSContext* cx, size_t length)
+      : cx(cx), length(length) {}
+
+  JSAtom* operator()(JSAtom* atom) {
+    MOZ_ASSERT(atom);
+    return atom;
+  }
+
+  JSAtom* operator()(const char16_t* chars) {
+    MOZ_ASSERT(chars);
+    return AtomizeChars(cx, chars, length);
+  }
+};
+
+JS_PUBLIC_API bool ConstructSavedFrameStackSlow(
+    JSContext* cx, JS::ubi::StackFrame& frame,
+    MutableHandleObject outSavedFrameStack) {
+  Rooted<js::GCLookupVector> stackChain(cx, js::GCLookupVector(cx));
+  Rooted<JS::ubi::StackFrame> ubiFrame(cx, frame);
+  RootedTuple<JSAtom*, JSAtom*> atomRoots(cx);
+  RootedField<JSAtom*, 0> source(atomRoots);
+  RootedField<JSAtom*, 1> functionDisplayName(atomRoots);
+
+  while (ubiFrame.get()) {
+
+    AtomizingMatcher atomizer(cx, ubiFrame.get().sourceLength());
+    source = ubiFrame.get().source().match(atomizer);
+    if (!source) {
+      return false;
+    }
+
+    functionDisplayName = nullptr;
+    auto nameLength = ubiFrame.get().functionDisplayNameLength();
+    if (nameLength > 0) {
+      AtomizingMatcher atomizer(cx, nameLength);
+      functionDisplayName =
+          ubiFrame.get().functionDisplayName().match(atomizer);
+      if (!functionDisplayName) {
+        return false;
+      }
+    }
+
+    auto principals =
+        js::ReconstructedSavedFramePrincipals::getSingleton(ubiFrame.get());
+
+    if (!stackChain.emplaceBack(source, ubiFrame.get().sourceId(),
+                                ubiFrame.get().line(), ubiFrame.get().column(),
+                                functionDisplayName,
+                                 nullptr,
+                                 nullptr, principals,
+                                 true)) {
+      ReportOutOfMemory(cx);
+      return false;
+    }
+
+    ubiFrame = ubiFrame.get().parent();
+  }
+
+  Rooted<js::SavedFrame*> parentFrame(cx);
+  for (size_t i = stackChain.length(); i != 0; i--) {
+    MutableHandle<SavedFrame::Lookup> lookup = stackChain[i - 1];
+    lookup.setParent(parentFrame);
+    parentFrame = cx->realm()->savedStacks().getOrCreateSavedFrame(cx, lookup);
+    if (!parentFrame) {
+      return false;
+    }
+  }
+
+  outSavedFrameStack.set(parentFrame);
+  return true;
+}
+
+}  
+}  

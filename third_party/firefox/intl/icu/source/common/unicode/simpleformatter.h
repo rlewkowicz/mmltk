@@ -1,0 +1,128 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+******************************************************************************
+* Copyright (C) 2014-2016, International Business Machines
+* Corporation and others.  All Rights Reserved.
+******************************************************************************
+* simpleformatter.h
+*/
+
+#ifndef __SIMPLEFORMATTER_H__
+#define __SIMPLEFORMATTER_H__
+
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+#include "unicode/unistr.h"
+
+U_NAMESPACE_BEGIN
+
+namespace number::impl {
+class SimpleModifier;
+}
+
+class U_COMMON_API SimpleFormatter final : public UMemory {
+public:
+    SimpleFormatter() : compiledPattern(static_cast<char16_t>(0)) {}
+
+    SimpleFormatter(const UnicodeString& pattern, UErrorCode &errorCode) {
+        applyPattern(pattern, errorCode);
+    }
+
+    SimpleFormatter(const UnicodeString& pattern, int32_t min, int32_t max,
+                    UErrorCode &errorCode) {
+        applyPatternMinMaxArguments(pattern, min, max, errorCode);
+    }
+
+    SimpleFormatter(const SimpleFormatter& other)
+            : compiledPattern(other.compiledPattern) {}
+
+    SimpleFormatter &operator=(const SimpleFormatter& other);
+
+    ~SimpleFormatter();
+
+    UBool applyPattern(const UnicodeString &pattern, UErrorCode &errorCode) {
+        return applyPatternMinMaxArguments(pattern, 0, INT32_MAX, errorCode);
+    }
+
+    UBool applyPatternMinMaxArguments(const UnicodeString &pattern,
+                                      int32_t min, int32_t max, UErrorCode &errorCode);
+
+    int32_t getArgumentLimit() const {
+        return getArgumentLimit(compiledPattern.getBuffer(), compiledPattern.length());
+    }
+
+    UnicodeString &format(
+            const UnicodeString &value0,
+            UnicodeString &appendTo, UErrorCode &errorCode) const;
+
+    UnicodeString &format(
+            const UnicodeString &value0,
+            const UnicodeString &value1,
+            UnicodeString &appendTo, UErrorCode &errorCode) const;
+
+    UnicodeString &format(
+            const UnicodeString &value0,
+            const UnicodeString &value1,
+            const UnicodeString &value2,
+            UnicodeString &appendTo, UErrorCode &errorCode) const;
+
+    UnicodeString &formatAndAppend(
+            const UnicodeString *const *values, int32_t valuesLength,
+            UnicodeString &appendTo,
+            int32_t *offsets, int32_t offsetsLength, UErrorCode &errorCode) const;
+
+    UnicodeString &formatAndReplace(
+            const UnicodeString *const *values, int32_t valuesLength,
+            UnicodeString &result,
+            int32_t *offsets, int32_t offsetsLength, UErrorCode &errorCode) const;
+
+    UnicodeString getTextWithNoArguments() const {
+        return getTextWithNoArguments(
+            compiledPattern.getBuffer(),
+            compiledPattern.length(),
+            nullptr,
+            0);
+    }
+
+#ifndef U_HIDE_INTERNAL_API
+    UnicodeString getTextWithNoArguments(int32_t *offsets, int32_t offsetsLength) const {
+        return getTextWithNoArguments(
+            compiledPattern.getBuffer(),
+            compiledPattern.length(),
+            offsets,
+            offsetsLength);
+    }
+#endif // U_HIDE_INTERNAL_API
+
+private:
+    UnicodeString compiledPattern;
+
+    static inline int32_t getArgumentLimit(const char16_t *compiledPattern,
+                                              int32_t compiledPatternLength) {
+        return compiledPatternLength == 0 ? 0 : compiledPattern[0];
+    }
+
+    static UnicodeString getTextWithNoArguments(
+        const char16_t *compiledPattern,
+        int32_t compiledPatternLength,
+        int32_t *offsets,
+        int32_t offsetsLength);
+
+    static UnicodeString &format(
+            const char16_t *compiledPattern, int32_t compiledPatternLength,
+            const UnicodeString *const *values,
+            UnicodeString &result, const UnicodeString *resultCopy, UBool forbidResultAsValue,
+            int32_t *offsets, int32_t offsetsLength,
+            UErrorCode &errorCode);
+
+    friend class number::impl::SimpleModifier;
+};
+
+U_NAMESPACE_END
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif  // __SIMPLEFORMATTER_H__

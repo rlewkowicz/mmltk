@@ -1,0 +1,95 @@
+/* SPDX-FileCopyrightText: Copyright © 2018 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
+
+#ifndef SPA_PARAM_PROPS_H
+#define SPA_PARAM_PROPS_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
+#include <spa/param/param.h>
+
+enum spa_prop_info {
+	SPA_PROP_INFO_START,
+	SPA_PROP_INFO_id,		
+	SPA_PROP_INFO_name,		
+	SPA_PROP_INFO_type,		
+	SPA_PROP_INFO_labels,		
+	SPA_PROP_INFO_container,	
+	SPA_PROP_INFO_params,		
+	SPA_PROP_INFO_description,	
+};
+
+enum spa_prop {
+	SPA_PROP_START,
+
+	SPA_PROP_unknown,		
+
+	SPA_PROP_START_Device	= 0x100,	
+	SPA_PROP_device,
+	SPA_PROP_deviceName,
+	SPA_PROP_deviceFd,
+	SPA_PROP_card,
+	SPA_PROP_cardName,
+
+	SPA_PROP_minLatency,
+	SPA_PROP_maxLatency,
+	SPA_PROP_periods,
+	SPA_PROP_periodSize,
+	SPA_PROP_periodEvent,
+	SPA_PROP_live,
+	SPA_PROP_rate,
+	SPA_PROP_quality,
+	SPA_PROP_bluetoothAudioCodec,
+	SPA_PROP_bluetoothOffloadActive,
+
+	SPA_PROP_START_Audio	= 0x10000,	
+	SPA_PROP_waveType,
+	SPA_PROP_frequency,
+	SPA_PROP_volume,			
+	SPA_PROP_mute,				
+	SPA_PROP_patternType,
+	SPA_PROP_ditherType,
+	SPA_PROP_truncate,
+	SPA_PROP_channelVolumes,		
+	SPA_PROP_volumeBase,			
+	SPA_PROP_volumeStep,			
+	SPA_PROP_channelMap,			
+	SPA_PROP_monitorMute,			
+	SPA_PROP_monitorVolumes,		
+	SPA_PROP_latencyOffsetNsec,		
+	SPA_PROP_softMute,			
+	SPA_PROP_softVolumes,			
+
+	SPA_PROP_iec958Codecs,			
+	SPA_PROP_volumeRampSamples,		
+	SPA_PROP_volumeRampStepSamples,		
+	SPA_PROP_volumeRampTime,		
+	SPA_PROP_volumeRampStepTime,		
+	SPA_PROP_volumeRampScale,		
+
+	SPA_PROP_START_Video	= 0x20000,	
+	SPA_PROP_brightness,
+	SPA_PROP_contrast,
+	SPA_PROP_saturation,
+	SPA_PROP_hue,
+	SPA_PROP_gamma,
+	SPA_PROP_exposure,
+	SPA_PROP_gain,
+	SPA_PROP_sharpness,
+
+	SPA_PROP_START_Other	= 0x80000,	
+	SPA_PROP_params,			
+
+
+	SPA_PROP_START_CUSTOM	= 0x1000000,
+};
+
+
+#ifdef __cplusplus
+}  
+#endif
+
+#endif /* SPA_PARAM_PROPS_H */

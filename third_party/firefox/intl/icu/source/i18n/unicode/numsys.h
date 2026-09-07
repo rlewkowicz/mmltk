@@ -1,0 +1,93 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*******************************************************************************
+* Copyright (C) 2010-2014, International Business Machines Corporation and
+* others. All Rights Reserved.
+*******************************************************************************
+*
+*
+* File NUMSYS.H
+*
+* Modification History:*
+*   Date        Name        Description
+*
+********************************************************************************
+*/
+
+#ifndef NUMSYS
+#define NUMSYS
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/format.h"
+#include "unicode/uobject.h"
+
+U_NAMESPACE_BEGIN
+
+constexpr const size_t kInternalNumSysNameCapacity = 8;
+
+
+class U_I18N_API NumberingSystem : public UObject {
+public:
+
+    NumberingSystem();
+
+    NumberingSystem(const NumberingSystem& other);
+
+    NumberingSystem& operator=(const NumberingSystem& other) = default;
+
+    virtual ~NumberingSystem();
+
+    static NumberingSystem* U_EXPORT2 createInstance(const Locale & inLocale, UErrorCode& status);
+
+    static NumberingSystem* U_EXPORT2 createInstance(UErrorCode& status);
+
+    static NumberingSystem* U_EXPORT2 createInstance(int32_t radix, UBool isAlgorithmic, const UnicodeString& description, UErrorCode& status );
+
+     static StringEnumeration * U_EXPORT2 getAvailableNames(UErrorCode& status);
+
+    static NumberingSystem* U_EXPORT2 createInstanceByName(const char* name, UErrorCode& status);
+
+
+    int32_t getRadix() const;
+
+    const char * getName() const;
+
+    virtual UnicodeString getDescription() const;
+
+
+
+    UBool isAlgorithmic() const;
+
+    static UClassID U_EXPORT2 getStaticClassID();
+
+    virtual UClassID getDynamicClassID() const override;
+
+
+private:
+    UnicodeString   desc;
+    int32_t         radix;
+    UBool           algorithmic;
+    char            name[kInternalNumSysNameCapacity+1];
+
+    void setRadix(int32_t radix);
+
+    void setAlgorithmic(UBool algorithmic);
+
+    void setDesc(const UnicodeString &desc);
+
+    void setName(const char* name);
+};
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif // _NUMSYS

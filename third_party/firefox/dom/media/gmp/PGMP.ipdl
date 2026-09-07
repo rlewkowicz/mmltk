@@ -1,0 +1,43 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+include PrefsTypes;
+include protocol PGMPContent;
+include protocol PGMPTimer;
+include protocol PGMPStorage;
+
+include "GMPParent.h";
+include "GMPChild.h";
+
+using mozilla::dom::NativeThreadId from "mozilla/dom/NativeThreadId.h";
+
+namespace mozilla {
+namespace gmp {
+
+[NeedsOtherPid, NestedUpTo=inside_sync, ChildImpl="GMPChild", ParentImpl="GMPParent", ChildProc=GMPlugin]
+sync protocol PGMP
+{
+  manages PGMPTimer;
+  manages PGMPStorage;
+
+parent:
+  async PGMPTimer();
+  async PGMPStorage();
+
+  async PGMPContentChildDestroyed();
+
+child:
+  async CrashPluginNow();
+  [Nested=inside_sync] sync StartPlugin(nsString adapter);
+  async ProvideStorageId(nsCString storageId);
+  async PreloadLibs(nsCString libs);
+  async CloseActive();
+  async InitGMPContentChild(Endpoint<PGMPContentChild> endpoint);
+  async PreferenceUpdate(Pref pref);
+
+  async Shutdown() returns (bool complete);
+};
+
+} // namespace gmp
+} // namespace mozilla

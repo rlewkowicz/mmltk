@@ -1,0 +1,121 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_media_mediaelementeventrunners_h
+#define mozilla_media_mediaelementeventrunners_h
+
+#include "mozilla/dom/PlayPromise.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsIContent.h"
+#include "nsINamed.h"
+#include "nsIRunnable.h"
+#include "nsISupportsImpl.h"
+#include "nsString.h"
+#include "nsTString.h"
+
+namespace mozilla::dom {
+
+class HTMLMediaElement;
+
+
+
+class nsMediaEventRunner : public nsIRunnable, public nsINamed {
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(nsMediaEventRunner, nsIRunnable)
+
+  explicit nsMediaEventRunner(const char* aName, HTMLMediaElement* aElement,
+                              const nsAString& aEventName = u"unknown"_ns);
+
+  void Cancel() { mElement = nullptr; }
+  NS_IMETHODIMP GetName(nsACString& aName) override {
+    aName.AssignASCII(mName);
+    return NS_OK;
+  }
+  const char* Name() const { return mName; }
+  nsString EventName() const { return mEventName; }
+
+ protected:
+  virtual ~nsMediaEventRunner() = default;
+  bool IsCancelled() const;
+  MOZ_CAN_RUN_SCRIPT nsresult FireEvent(const nsAString& aName);
+
+
+  RefPtr<HTMLMediaElement> mElement;
+  const char* mName;
+  nsString mEventName;
+  uint32_t mLoadID;
+};
+
+class nsAsyncEventRunner : public nsMediaEventRunner {
+ public:
+  nsAsyncEventRunner(const nsAString& aEventName, HTMLMediaElement* aElement)
+      : nsMediaEventRunner("nsAsyncEventRunner", aElement, aEventName) {}
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY NS_IMETHOD Run() override;
+};
+
+class nsResolveOrRejectPendingPlayPromisesRunner : public nsMediaEventRunner {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(
+      nsResolveOrRejectPendingPlayPromisesRunner, nsMediaEventRunner)
+
+  nsResolveOrRejectPendingPlayPromisesRunner(
+      HTMLMediaElement* aElement, nsTArray<RefPtr<PlayPromise>>&& aPromises,
+      nsresult aError = NS_OK);
+  void ResolveOrReject();
+  NS_IMETHOD Run() override;
+
+ protected:
+  virtual ~nsResolveOrRejectPendingPlayPromisesRunner() = default;
+
+ private:
+  nsTArray<RefPtr<PlayPromise>> mPromises;
+  nsresult mError;
+};
+
+class nsNotifyAboutPlayingRunner
+    : public nsResolveOrRejectPendingPlayPromisesRunner {
+ public:
+  nsNotifyAboutPlayingRunner(
+      HTMLMediaElement* aElement,
+      nsTArray<RefPtr<PlayPromise>>&& aPendingPlayPromises)
+      : nsResolveOrRejectPendingPlayPromisesRunner(
+            aElement, std::move(aPendingPlayPromises)) {}
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY NS_IMETHOD Run() override;
+};
+
+class nsSourceErrorEventRunner : public nsMediaEventRunner {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(nsSourceErrorEventRunner,
+                                           nsMediaEventRunner)
+  nsSourceErrorEventRunner(HTMLMediaElement* aElement, nsIContent* aSource,
+                           const nsACString& aErrorDetails)
+      : nsMediaEventRunner("nsSourceErrorEventRunner", aElement),
+        mSource(aSource),
+        mErrorDetails(NS_ConvertUTF8toUTF16(aErrorDetails)) {}
+  NS_IMETHOD Run() override;
+
+ private:
+  virtual ~nsSourceErrorEventRunner() = default;
+  nsCOMPtr<nsIContent> mSource;
+  const nsString mErrorDetails;
+};
+
+class nsTimeupdateRunner : public nsMediaEventRunner {
+ public:
+  nsTimeupdateRunner(HTMLMediaElement* aElement, bool aIsMandatory)
+      : nsMediaEventRunner("nsTimeupdateRunner", aElement, u"timeupdate"_ns),
+        mIsMandatory(aIsMandatory) {}
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY NS_IMETHOD Run() override;
+
+ private:
+  bool ShouldDispatchTimeupdate() const;
+  bool mIsMandatory;
+};
+
+}  
+
+#endif  // mozilla_media_mediaelementeventrunners_h

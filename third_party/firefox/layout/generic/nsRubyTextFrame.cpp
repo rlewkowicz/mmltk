@@ -1,0 +1,59 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "nsRubyTextFrame.h"
+
+#include "mozilla/ComputedStyle.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/WritingModes.h"
+#include "nsLineLayout.h"
+#include "nsPresContext.h"
+
+using namespace mozilla;
+
+
+
+NS_QUERYFRAME_HEAD(nsRubyTextFrame)
+  NS_QUERYFRAME_ENTRY(nsRubyTextFrame)
+NS_QUERYFRAME_TAIL_INHERITING(nsRubyContentFrame)
+
+NS_IMPL_FRAMEARENA_HELPERS(nsRubyTextFrame)
+
+nsContainerFrame* NS_NewRubyTextFrame(PresShell* aPresShell,
+                                      ComputedStyle* aStyle) {
+  return new (aPresShell) nsRubyTextFrame(aStyle, aPresShell->GetPresContext());
+}
+
+
+
+bool nsRubyTextFrame::CanContinueTextRun() const { return false; }
+
+#ifdef DEBUG_FRAME_DUMP
+nsresult nsRubyTextFrame::GetFrameName(nsAString& aResult) const {
+  return MakeFrameName(u"RubyText"_ns, aResult);
+}
+#endif
+
+void nsRubyTextFrame::BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                                       const nsDisplayListSet& aLists) {
+  if (IsCollapsed()) {
+    return;
+  }
+
+  nsRubyContentFrame::BuildDisplayList(aBuilder, aLists);
+}
+
+void nsRubyTextFrame::Reflow(nsPresContext* aPresContext,
+                             ReflowOutput& aDesiredSize,
+                             const ReflowInput& aReflowInput,
+                             nsReflowStatus& aStatus) {
+  nsRubyContentFrame::Reflow(aPresContext, aDesiredSize, aReflowInput, aStatus);
+
+  if (IsCollapsed()) {
+    WritingMode lineWM = aReflowInput.mLineLayout->GetWritingMode();
+    aDesiredSize.ISize(lineWM) = 0;
+    aDesiredSize.SetOverflowAreasToDesiredBounds();
+  }
+}

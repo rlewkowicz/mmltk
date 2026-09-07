@@ -1,0 +1,1476 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "AccessibleCaretManager.h"
+
+#include <utility>
+
+#include "AccessibleCaret.h"
+#include "AccessibleCaretEventHub.h"
+#include "AccessibleCaretLogger.h"
+#include "mozilla/AsyncEventDispatcher.h"
+#include "mozilla/AutoRestore.h"
+#include "mozilla/CaretAssociationHint.h"
+#include "mozilla/ContentIterator.h"
+#include "mozilla/FocusModel.h"
+#include "mozilla/IMEStateManager.h"
+#include "mozilla/IntegerPrintfMacros.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/ScrollContainerFrame.h"
+#include "mozilla/SelectionMovementUtils.h"
+#include "mozilla/StaticAnalysisFunctions.h"
+#include "mozilla/StaticPrefs_layout.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/MouseEventBinding.h"
+#include "mozilla/dom/NodeFilterBinding.h"
+#include "mozilla/dom/Selection.h"
+#include "mozilla/dom/TreeWalker.h"
+#include "nsCaret.h"
+#include "nsContainerFrame.h"
+#include "nsContentUtils.h"
+#include "nsDebug.h"
+#include "nsFocusManager.h"
+#include "nsFrameSelection.h"
+#include "nsGenericHTMLElement.h"
+#include "nsIFrame.h"
+#include "nsLayoutUtils.h"
+#include "nsServiceManagerUtils.h"
+
+namespace mozilla {
+
+#undef AC_LOG
+#define AC_LOG(message, ...) \
+  AC_LOG_BASE("AccessibleCaretManager (%p): " message, this, ##__VA_ARGS__);
+
+#undef AC_LOGV
+#define AC_LOGV(message, ...) \
+  AC_LOGV_BASE("AccessibleCaretManager (%p): " message, this, ##__VA_ARGS__);
+
+using namespace dom;
+using Appearance = AccessibleCaret::Appearance;
+using PositionChangedResult = AccessibleCaret::PositionChangedResult;
+
+#define AC_PROCESS_ENUM_TO_STREAM(e) \
+  case (e):                          \
+    aStream << #e;                   \
+    break;
+std::ostream& operator<<(std::ostream& aStream,
+                         const AccessibleCaretManager::CaretMode& aCaretMode) {
+  using CaretMode = AccessibleCaretManager::CaretMode;
+  switch (aCaretMode) {
+    AC_PROCESS_ENUM_TO_STREAM(CaretMode::None);
+    AC_PROCESS_ENUM_TO_STREAM(CaretMode::Cursor);
+    AC_PROCESS_ENUM_TO_STREAM(CaretMode::Selection);
+  }
+  return aStream;
+}
+
+std::ostream& operator<<(
+    std::ostream& aStream,
+    const AccessibleCaretManager::UpdateCaretsHint& aHint) {
+  using UpdateCaretsHint = AccessibleCaretManager::UpdateCaretsHint;
+  switch (aHint) {
+    AC_PROCESS_ENUM_TO_STREAM(UpdateCaretsHint::Default);
+    AC_PROCESS_ENUM_TO_STREAM(UpdateCaretsHint::RespectOldAppearance);
+    AC_PROCESS_ENUM_TO_STREAM(UpdateCaretsHint::DispatchNoEvent);
+  }
+  return aStream;
+}
+#undef AC_PROCESS_ENUM_TO_STREAM
+
+AccessibleCaretManager::AccessibleCaretManager(PresShell* aPresShell)
+    : AccessibleCaretManager{
+          aPresShell,
+          Carets{aPresShell ? MakeUnique<AccessibleCaret>(aPresShell) : nullptr,
+                 aPresShell ? MakeUnique<AccessibleCaret>(aPresShell)
+                            : nullptr}} {}
+
+AccessibleCaretManager::AccessibleCaretManager(PresShell* aPresShell,
+                                               Carets aCarets)
+    : mPresShell{aPresShell}, mCarets{std::move(aCarets)} {}
+
+AccessibleCaretManager::LayoutFlusher::~LayoutFlusher() {
+  MOZ_RELEASE_ASSERT(!mFlushing, "Going away in MaybeFlush? Bad!");
+}
+
+void AccessibleCaretManager::Terminate() {
+  mCarets.Terminate();
+  mActiveCaret = nullptr;
+  mPresShell = nullptr;
+}
+
+nsresult AccessibleCaretManager::OnSelectionChanged(Document* aDoc,
+                                                    Selection* aSel,
+                                                    int16_t aReason) {
+  Selection* selection = GetSelection();
+  AC_LOG("%s: aSel: %p, GetSelection(): %p, aReason: %d", __FUNCTION__, aSel,
+         selection, aReason);
+  if (aSel != selection) {
+    return NS_OK;
+  }
+
+  if (aReason & nsISelectionListener::IME_REASON) {
+    return NS_OK;
+  }
+
+  if (aReason == nsISelectionListener::NO_REASON ||
+      aReason == nsISelectionListener::JS_REASON) {
+    auto mode = static_cast<ScriptUpdateMode>(
+        StaticPrefs::layout_accessiblecaret_script_change_update_mode());
+    if (mode == kScriptAlwaysShow ||
+        (mode == kScriptUpdateVisible && mCarets.HasLogicallyVisibleCaret())) {
+      UpdateCarets();
+      return NS_OK;
+    }
+    HideCaretsAndDispatchCaretStateChangedEvent();
+    return NS_OK;
+  }
+
+  if (aReason & nsISelectionListener::KEYPRESS_REASON) {
+    HideCaretsAndDispatchCaretStateChangedEvent();
+    return NS_OK;
+  }
+
+  if (aReason & nsISelectionListener::MOUSEDOWN_REASON) {
+    HideCaretsAndDispatchCaretStateChangedEvent();
+    return NS_OK;
+  }
+
+  if (aReason & (nsISelectionListener::COLLAPSETOSTART_REASON |
+                 nsISelectionListener::COLLAPSETOEND_REASON)) {
+    HideCaretsAndDispatchCaretStateChangedEvent();
+    return NS_OK;
+  }
+
+  if (StaticPrefs::layout_accessiblecaret_hide_carets_for_mouse_input() &&
+      mLastInputSource == MouseEvent_Binding::MOZ_SOURCE_MOUSE) {
+    HideCaretsAndDispatchCaretStateChangedEvent();
+    return NS_OK;
+  }
+
+  if (StaticPrefs::layout_accessiblecaret_hide_carets_for_mouse_input() &&
+      mLastInputSource == MouseEvent_Binding::MOZ_SOURCE_KEYBOARD &&
+      (aReason & nsISelectionListener::SELECTALL_REASON)) {
+    HideCaretsAndDispatchCaretStateChangedEvent();
+    return NS_OK;
+  }
+
+  UpdateCarets();
+  return NS_OK;
+}
+
+void AccessibleCaretManager::HideCaretsAndDispatchCaretStateChangedEvent() {
+  if (mCarets.HasLogicallyVisibleCaret()) {
+    AC_LOG("%s", __FUNCTION__);
+    mCarets.GetFirst()->SetAppearance(Appearance::None);
+    mCarets.GetSecond()->SetAppearance(Appearance::None);
+    mIsCaretPositionChanged = false;
+    mDesiredAsyncPanZoomState.Update(*this);
+    DispatchCaretStateChangedEvent(CaretChangedReason::Visibilitychange);
+  }
+}
+
+auto AccessibleCaretManager::MaybeFlushLayout() -> Terminated {
+  if (mPresShell) {
+    mLayoutFlusher.MaybeFlush(MOZ_KnownLive(*mPresShell));
+  }
+
+  return IsTerminated();
+}
+
+void AccessibleCaretManager::UpdateCarets(const UpdateCaretsHintSet& aHint) {
+  if (MaybeFlushLayout() == Terminated::Yes) {
+    return;
+  }
+
+  mLastUpdateCaretMode = GetCaretMode();
+
+  switch (mLastUpdateCaretMode) {
+    case CaretMode::None:
+      HideCaretsAndDispatchCaretStateChangedEvent();
+      break;
+    case CaretMode::Cursor:
+      UpdateCaretsForCursorMode(aHint);
+      break;
+    case CaretMode::Selection:
+      UpdateCaretsForSelectionMode(aHint);
+      break;
+  }
+
+  mDesiredAsyncPanZoomState.Update(*this);
+}
+
+bool AccessibleCaretManager::IsCaretDisplayableInCursorMode(
+    nsIFrame** aOutFrame, int32_t* aOutOffset) const {
+  RefPtr<nsCaret> caret = mPresShell->GetOriginalCaret();
+  if (!caret || !caret->IsVisible()) {
+    return false;
+  }
+  auto frameData =
+      nsCaret::GetFrameAndOffset(nsCaret::CaretPositionFor(GetSelection()));
+  if (!GetEditingHostForFrame(frameData.mFrame)) {
+    return false;
+  }
+  if (aOutFrame) {
+    *aOutFrame = frameData.mFrame;
+  }
+  if (aOutOffset) {
+    *aOutOffset = frameData.mOffsetInFrameContent;
+  }
+  return true;
+}
+
+bool AccessibleCaretManager::HasNonEmptyTextContent(nsINode* aNode) const {
+  return nsContentUtils::HasNonEmptyTextContent(
+      aNode, nsContentUtils::eRecurseIntoChildren);
+}
+
+void AccessibleCaretManager::UpdateCaretsForCursorMode(
+    const UpdateCaretsHintSet& aHints) {
+  AC_LOG("%s, selection: %p", __FUNCTION__, GetSelection());
+
+  int32_t offset = 0;
+  nsIFrame* frame = nullptr;
+  if (!IsCaretDisplayableInCursorMode(&frame, &offset)) {
+    HideCaretsAndDispatchCaretStateChangedEvent();
+    return;
+  }
+
+  PositionChangedResult result = mCarets.GetFirst()->SetPosition(frame, offset);
+
+  switch (result) {
+    case PositionChangedResult::NotChanged:
+    case PositionChangedResult::Position:
+    case PositionChangedResult::Zoom:
+      if (!aHints.contains(UpdateCaretsHint::RespectOldAppearance)) {
+        if (HasNonEmptyTextContent(GetEditingHostForFrame(frame))) {
+          mCarets.GetFirst()->SetAppearance(Appearance::Normal);
+        } else if (
+            StaticPrefs::
+                layout_accessiblecaret_caret_shown_when_long_tapping_on_empty_content()) {
+          if (mCarets.GetFirst()->IsLogicallyVisible()) {
+            mCarets.GetFirst()->SetAppearance(Appearance::Normal);
+          } else {
+          }
+        } else {
+          mCarets.GetFirst()->SetAppearance(Appearance::NormalNotShown);
+        }
+      }
+      break;
+
+    case PositionChangedResult::Invisible:
+      mCarets.GetFirst()->SetAppearance(Appearance::NormalNotShown);
+      break;
+  }
+
+  mCarets.GetSecond()->SetAppearance(Appearance::None);
+
+  mIsCaretPositionChanged = (result == PositionChangedResult::Position);
+
+  if (mIsCaretPositionChanged && mActiveCaret) {
+    ProvideHapticFeedback(mozilla::HapticFeedbackType::TextHandleMove);
+  }
+
+  if (!aHints.contains(UpdateCaretsHint::DispatchNoEvent) && !mActiveCaret) {
+    DispatchCaretStateChangedEvent(CaretChangedReason::Updateposition);
+  }
+}
+
+void AccessibleCaretManager::UpdateCaretsForSelectionMode(
+    const UpdateCaretsHintSet& aHints) {
+  AC_LOG("%s: selection: %p", __FUNCTION__, GetSelection());
+
+  const FrameAndOffset startFrameAndOffset =
+      mPresShell ? GetFirstVisibleLeafFrameOrUnselectableChildFrame(
+                       *GetSelection()->GetFirstRange())
+                 : FrameAndOffset{};
+  nsCOMPtr<nsIContent> endContent;
+  const FrameAndOffset endFrameAndOffset =
+      mPresShell
+          ? GetLastVisibleLeafFrameOrUnselectableChildFrame(
+                *GetSelection()->GetLastRange(), getter_AddRefs(endContent))
+          : FrameAndOffset{};
+
+  if (!CompareTreePosition(
+          startFrameAndOffset.mFrame,
+          static_cast<int32_t>(startFrameAndOffset.mOffsetInFrameContent),
+          endFrameAndOffset.mFrame,
+          static_cast<int32_t>(endFrameAndOffset.mOffsetInFrameContent))) {
+    HideCaretsAndDispatchCaretStateChangedEvent();
+    return;
+  }
+
+  auto updateSingleCaret = [aHints](AccessibleCaret* aCaret, nsIFrame* aFrame,
+                                    int32_t aOffset) -> PositionChangedResult {
+    PositionChangedResult result = aCaret->SetPosition(aFrame, aOffset);
+
+    switch (result) {
+      case PositionChangedResult::NotChanged:
+      case PositionChangedResult::Position:
+      case PositionChangedResult::Zoom:
+        if (!aHints.contains(UpdateCaretsHint::RespectOldAppearance)) {
+          aCaret->SetAppearance(Appearance::Normal);
+        }
+        break;
+
+      case PositionChangedResult::Invisible:
+        aCaret->SetAppearance(Appearance::NormalNotShown);
+        break;
+    }
+    return result;
+  };
+
+  PositionChangedResult firstCaretResult = updateSingleCaret(
+      mCarets.GetFirst(), startFrameAndOffset.mFrame,
+      static_cast<int32_t>(startFrameAndOffset.mOffsetInFrameContent));
+  const uint32_t offsetInEndFrameContent =
+      endFrameAndOffset.GetFrameContent() == endContent
+          ? endFrameAndOffset.mOffsetInFrameContent
+          : endFrameAndOffset.GetFrameContent()->Length() + 1;
+  PositionChangedResult secondCaretResult =
+      updateSingleCaret(mCarets.GetSecond(), endFrameAndOffset.mFrame,
+                        static_cast<int32_t>(offsetInEndFrameContent));
+
+  mIsCaretPositionChanged =
+      firstCaretResult == PositionChangedResult::Position ||
+      secondCaretResult == PositionChangedResult::Position;
+
+  if (mIsCaretPositionChanged) {
+    if (mActiveCaret) {
+      ProvideHapticFeedback(mozilla::HapticFeedbackType::TextHandleMove);
+    }
+
+    AutoWeakFrame weakStartFrame = startFrameAndOffset.mFrame;
+    AutoWeakFrame weakEndFrame = endFrameAndOffset.mFrame;
+
+    if (MaybeFlushLayout() == Terminated::Yes) {
+      return;
+    }
+
+    if ((startFrameAndOffset.mFrame && !weakStartFrame.IsAlive()) ||
+        (endFrameAndOffset.mFrame && !weakEndFrame.IsAlive())) {
+      HideCaretsAndDispatchCaretStateChangedEvent();
+      return;
+    }
+  }
+
+  if (!aHints.contains(UpdateCaretsHint::RespectOldAppearance)) {
+    if (StaticPrefs::layout_accessiblecaret_always_tilt()) {
+      UpdateCaretsForAlwaysTilt(startFrameAndOffset.mFrame,
+                                endFrameAndOffset.mFrame);
+    } else {
+      UpdateCaretsForOverlappingTilt();
+    }
+  }
+
+  if (!aHints.contains(UpdateCaretsHint::DispatchNoEvent) && !mActiveCaret) {
+    DispatchCaretStateChangedEvent(CaretChangedReason::Updateposition);
+  }
+}
+
+void AccessibleCaretManager::DesiredAsyncPanZoomState::Update(
+    const AccessibleCaretManager& aAccessibleCaretManager) {
+  if (aAccessibleCaretManager.mActiveCaret) {
+    mValue = Value::Enabled;
+    return;
+  }
+
+  if (aAccessibleCaretManager.mIsScrollStarted) {
+    mValue = aAccessibleCaretManager.mIsCaretPositionChanged ? Value::Disabled
+                                                             : Value::Enabled;
+    return;
+  }
+
+  switch (aAccessibleCaretManager.mLastUpdateCaretMode) {
+    case CaretMode::None:
+      mValue = Value::Enabled;
+      break;
+    case CaretMode::Cursor:
+      mValue =
+          (aAccessibleCaretManager.mCarets.GetFirst()->IsVisuallyVisible() &&
+           aAccessibleCaretManager.mCarets.GetFirst()
+               ->IsInPositionFixedSubtree())
+              ? Value::Disabled
+              : Value::Enabled;
+      break;
+    case CaretMode::Selection:
+      mValue =
+          ((aAccessibleCaretManager.mCarets.GetFirst()->IsVisuallyVisible() &&
+            aAccessibleCaretManager.mCarets.GetFirst()
+                ->IsInPositionFixedSubtree()) ||
+           (aAccessibleCaretManager.mCarets.GetSecond()->IsVisuallyVisible() &&
+            aAccessibleCaretManager.mCarets.GetSecond()
+                ->IsInPositionFixedSubtree()))
+              ? Value::Disabled
+              : Value::Enabled;
+      break;
+  }
+}
+
+bool AccessibleCaretManager::UpdateCaretsForOverlappingTilt() {
+  if (!mCarets.GetFirst()->IsVisuallyVisible() ||
+      !mCarets.GetSecond()->IsVisuallyVisible()) {
+    return false;
+  }
+
+  if (!mCarets.GetFirst()->Intersects(*mCarets.GetSecond())) {
+    mCarets.GetFirst()->SetAppearance(Appearance::Normal);
+    mCarets.GetSecond()->SetAppearance(Appearance::Normal);
+    return false;
+  }
+
+  if (mCarets.GetFirst()->LogicalPosition().x <=
+      mCarets.GetSecond()->LogicalPosition().x) {
+    mCarets.GetFirst()->SetAppearance(Appearance::Left);
+    mCarets.GetSecond()->SetAppearance(Appearance::Right);
+  } else {
+    mCarets.GetFirst()->SetAppearance(Appearance::Right);
+    mCarets.GetSecond()->SetAppearance(Appearance::Left);
+  }
+
+  return true;
+}
+
+void AccessibleCaretManager::UpdateCaretsForAlwaysTilt(
+    const nsIFrame* aStartFrame, const nsIFrame* aEndFrame) {
+  if (UpdateCaretsForOverlappingTilt()) {
+    return;
+  }
+
+  if (mCarets.GetFirst()->IsVisuallyVisible()) {
+    auto startFrameWritingMode = aStartFrame->GetWritingMode();
+    mCarets.GetFirst()->SetAppearance(startFrameWritingMode.IsBidiLTR()
+                                          ? Appearance::Left
+                                          : Appearance::Right);
+  }
+  if (mCarets.GetSecond()->IsVisuallyVisible()) {
+    auto endFrameWritingMode = aEndFrame->GetWritingMode();
+    mCarets.GetSecond()->SetAppearance(
+        endFrameWritingMode.IsBidiLTR() ? Appearance::Right : Appearance::Left);
+  }
+}
+
+void AccessibleCaretManager::ProvideHapticFeedback(
+    mozilla::HapticFeedbackType aType) {
+  if (StaticPrefs::layout_accessiblecaret_hapticfeedback()) {
+    if (nsIWidget* widget = mPresShell->GetRootWidget()) {
+      widget->PerformHapticFeedback(aType);
+    }
+  }
+}
+
+nsresult AccessibleCaretManager::PressCaret(const nsPoint& aPoint,
+                                            EventClassID aEventClass) {
+  nsresult rv = NS_ERROR_FAILURE;
+
+  MOZ_ASSERT(aEventClass == eMouseEventClass || aEventClass == eTouchEventClass,
+             "Unexpected event class!");
+
+  using TouchArea = AccessibleCaret::TouchArea;
+  TouchArea touchArea =
+      aEventClass == eMouseEventClass ? TouchArea::CaretImage : TouchArea::Full;
+
+  if (mCarets.GetFirst()->Contains(aPoint, touchArea)) {
+    mActiveCaret = mCarets.GetFirst();
+    SetSelectionDirection(eDirPrevious);
+  } else if (mCarets.GetSecond()->Contains(aPoint, touchArea)) {
+    mActiveCaret = mCarets.GetSecond();
+    SetSelectionDirection(eDirNext);
+  }
+
+  if (mActiveCaret) {
+    mOffsetYToCaretLogicalPosition =
+        mActiveCaret->LogicalPosition().y - aPoint.y;
+    SetSelectionDragState(true);
+    DispatchCaretStateChangedEvent(CaretChangedReason::Presscaret, &aPoint);
+    rv = NS_OK;
+  }
+
+  return rv;
+}
+
+nsresult AccessibleCaretManager::DragCaret(const nsPoint& aPoint) {
+  MOZ_ASSERT(mActiveCaret);
+  MOZ_ASSERT(GetCaretMode() != CaretMode::None);
+
+  if (!mPresShell || !mPresShell->GetRootFrame() || !GetSelection()) {
+    return NS_ERROR_NULL_POINTER;
+  }
+
+  StopSelectionAutoScrollTimer();
+  DragCaretInternal(aPoint);
+
+  StartSelectionAutoScrollTimer(aPoint);
+  UpdateCarets();
+
+  if (StaticPrefs::layout_accessiblecaret_magnifier_enabled()) {
+    DispatchCaretStateChangedEvent(CaretChangedReason::Dragcaret, &aPoint);
+  }
+  return NS_OK;
+}
+
+nsresult AccessibleCaretManager::ReleaseCaret() {
+  MOZ_ASSERT(mActiveCaret);
+
+  mActiveCaret = nullptr;
+  SetSelectionDragState(false);
+  mDesiredAsyncPanZoomState.Update(*this);
+  DispatchCaretStateChangedEvent(CaretChangedReason::Releasecaret);
+  return NS_OK;
+}
+
+nsresult AccessibleCaretManager::TapCaret(const nsPoint& aPoint) {
+  MOZ_ASSERT(GetCaretMode() != CaretMode::None);
+
+  nsresult rv = NS_ERROR_FAILURE;
+
+  if (GetCaretMode() == CaretMode::Cursor) {
+    DispatchCaretStateChangedEvent(CaretChangedReason::Taponcaret, &aPoint);
+    rv = NS_OK;
+  }
+
+  return rv;
+}
+
+static EnumSet<nsLayoutUtils::FrameForPointOption> GetHitTestOptions() {
+  EnumSet<nsLayoutUtils::FrameForPointOption> options = {
+      nsLayoutUtils::FrameForPointOption::IgnorePaintSuppression,
+      nsLayoutUtils::FrameForPointOption::IgnoreCrossDoc};
+  return options;
+}
+
+nsresult AccessibleCaretManager::SelectWordOrShortcut(const nsPoint& aPoint) {
+  if (GetCaretMode() == CaretMode::Selection &&
+      GetSelection()->ContainsPoint(aPoint)) {
+    AC_LOG("%s: UpdateCarets() for current selection", __FUNCTION__);
+    UpdateCarets();
+    ProvideHapticFeedback(mozilla::HapticFeedbackType::LongPress);
+    return NS_OK;
+  }
+
+  if (!mPresShell) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  nsIFrame* rootFrame = mPresShell->GetRootFrame();
+  if (!rootFrame) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  AutoWeakFrame ptFrame = nsLayoutUtils::GetFrameForPoint(
+      RelativeTo{rootFrame}, aPoint, GetHitTestOptions());
+  if (!ptFrame.GetFrame()) {
+    return NS_ERROR_FAILURE;
+  }
+
+  AutoWeakFrame focusableFrame = GetFocusableFrame(ptFrame);
+
+#ifdef DEBUG_FRAME_DUMP
+  AC_LOG("%s: Found %s under (%d, %d)", __FUNCTION__, ptFrame->ListTag().get(),
+         aPoint.x, aPoint.y);
+  AC_LOG("%s: Found %s focusable", __FUNCTION__,
+         focusableFrame ? focusableFrame->ListTag().get() : "no frame");
+#endif
+
+  nsPoint ptInFrame = aPoint;
+  nsLayoutUtils::TransformPoint(RelativeTo{rootFrame}, RelativeTo{ptFrame},
+                                ptInFrame);
+
+  Element* newFocusEditingHost = GetEditingHostForFrame(ptFrame);
+  if (focusableFrame && newFocusEditingHost &&
+      !HasNonEmptyTextContent(newFocusEditingHost)) {
+    ChangeFocusToOrClearOldFocus(focusableFrame);
+
+    if (StaticPrefs::
+            layout_accessiblecaret_caret_shown_when_long_tapping_on_empty_content()) {
+      mCarets.GetFirst()->SetAppearance(Appearance::Normal);
+    }
+    UpdateCarets();
+    ProvideHapticFeedback(mozilla::HapticFeedbackType::LongPress);
+    DispatchCaretStateChangedEvent(CaretChangedReason::Longpressonemptycontent);
+    return NS_OK;
+  }
+
+  bool selectable = ptFrame->IsSelectable();
+
+#ifdef DEBUG_FRAME_DUMP
+  AC_LOG("%s: %s %s selectable.", __FUNCTION__, ptFrame->ListTag().get(),
+         selectable ? "is" : "is NOT");
+#endif
+
+  if (!selectable) {
+    return NS_ERROR_FAILURE;
+  }
+
+  IMEStateManager::NotifyIME(widget::REQUEST_TO_COMMIT_COMPOSITION,
+                             mPresShell->GetPresContext());
+  if (!ptFrame.IsAlive()) {
+    return NS_ERROR_FAILURE;
+  }
+
+  ChangeFocusToOrClearOldFocus(focusableFrame);
+  if (!ptFrame.IsAlive()) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsIFrame::ContentOffsets offsets = ptFrame->GetContentOffsetsFromPoint(
+      ptInFrame,
+      nsIFrame::SKIP_HIDDEN | nsIFrame::IGNORE_NATIVE_ANONYMOUS_SUBTREE);
+  if (offsets.content) {
+    RefPtr<nsFrameSelection> frameSelection = GetFrameSelection();
+    if (frameSelection) {
+      const FrameAndOffset textFrameAndOffsetContainingWordBoundary =
+          SelectionMovementUtils::GetFrameForNodeOffset(
+              offsets.content, offsets.offset, offsets.associate);
+      if (textFrameAndOffsetContainingWordBoundary &&
+          textFrameAndOffsetContainingWordBoundary != ptFrame) {
+        SetSelectionDragState(true);
+        frameSelection->HandleClick(
+            MOZ_KnownLive(offsets.content) ,
+            offsets.StartOffset(), offsets.EndOffset(),
+            nsFrameSelection::FocusMode::kCollapseToNewPoint,
+            offsets.associate);
+        SetSelectionDragState(false);
+        ClearMaintainedSelection();
+
+        if (StaticPrefs::
+                layout_accessiblecaret_caret_shown_when_long_tapping_on_empty_content()) {
+          mCarets.GetFirst()->SetAppearance(Appearance::Normal);
+        }
+
+        UpdateCarets();
+        ProvideHapticFeedback(mozilla::HapticFeedbackType::LongPress);
+        DispatchCaretStateChangedEvent(
+            CaretChangedReason::Longpressonemptycontent);
+
+        return NS_OK;
+      }
+    }
+  }
+
+  nsresult rv = SelectWord(ptFrame, ptInFrame);
+  UpdateCarets();
+  ProvideHapticFeedback(mozilla::HapticFeedbackType::LongPress);
+
+  return rv;
+}
+
+void AccessibleCaretManager::OnScrollStart() {
+  AC_LOG("%s", __FUNCTION__);
+
+  nsAutoScriptBlocker scriptBlocker;
+  AutoRestore<bool> saveAllowFlushingLayout(mLayoutFlusher.mAllowFlushing);
+  mLayoutFlusher.mAllowFlushing = false;
+
+  Maybe<PresShell::AutoAssertNoFlush> assert;
+  if (mPresShell) {
+    assert.emplace(*mPresShell);
+  }
+
+  mIsScrollStarted = true;
+
+  if (mCarets.HasLogicallyVisibleCaret()) {
+    DispatchCaretStateChangedEvent(CaretChangedReason::Scroll);
+  }
+}
+
+void AccessibleCaretManager::OnScrollEnd() {
+  nsAutoScriptBlocker scriptBlocker;
+  AutoRestore<bool> saveAllowFlushingLayout(mLayoutFlusher.mAllowFlushing);
+  mLayoutFlusher.mAllowFlushing = false;
+
+  Maybe<PresShell::AutoAssertNoFlush> assert;
+  if (mPresShell) {
+    assert.emplace(*mPresShell);
+  }
+
+  mIsScrollStarted = false;
+
+  if (GetCaretMode() == CaretMode::Cursor) {
+    if (!mCarets.GetFirst()->IsLogicallyVisible()) {
+      return;
+    }
+  }
+
+  if (StaticPrefs::layout_accessiblecaret_hide_carets_for_mouse_input() &&
+      (mLastInputSource == MouseEvent_Binding::MOZ_SOURCE_MOUSE ||
+       mLastInputSource == MouseEvent_Binding::MOZ_SOURCE_KEYBOARD)) {
+    AC_LOG("%s: HideCaretsAndDispatchCaretStateChangedEvent()", __FUNCTION__);
+    HideCaretsAndDispatchCaretStateChangedEvent();
+    return;
+  }
+
+  AC_LOG("%s: UpdateCarets()", __FUNCTION__);
+  UpdateCarets();
+}
+
+void AccessibleCaretManager::OnScrollPositionChanged() {
+  nsAutoScriptBlocker scriptBlocker;
+  AutoRestore<bool> saveAllowFlushingLayout(mLayoutFlusher.mAllowFlushing);
+  mLayoutFlusher.mAllowFlushing = false;
+
+  Maybe<PresShell::AutoAssertNoFlush> assert;
+  if (mPresShell) {
+    assert.emplace(*mPresShell);
+  }
+
+  if (mCarets.HasLogicallyVisibleCaret()) {
+    if (mIsScrollStarted) {
+      AC_LOG("%s: UpdateCarets(RespectOldAppearance | DispatchNoEvent)",
+             __FUNCTION__);
+      UpdateCarets({UpdateCaretsHint::RespectOldAppearance,
+                    UpdateCaretsHint::DispatchNoEvent});
+    } else {
+      AC_LOG("%s: UpdateCarets(RespectOldAppearance)", __FUNCTION__);
+      UpdateCarets(UpdateCaretsHint::RespectOldAppearance);
+    }
+  }
+}
+
+void AccessibleCaretManager::OnReflow() {
+  nsAutoScriptBlocker scriptBlocker;
+  AutoRestore<bool> saveAllowFlushingLayout(mLayoutFlusher.mAllowFlushing);
+  mLayoutFlusher.mAllowFlushing = false;
+
+  Maybe<PresShell::AutoAssertNoFlush> assert;
+  if (mPresShell) {
+    assert.emplace(*mPresShell);
+  }
+
+  if (mCarets.HasLogicallyVisibleCaret()) {
+    AC_LOG("%s: UpdateCarets(RespectOldAppearance)", __FUNCTION__);
+    UpdateCarets(UpdateCaretsHint::RespectOldAppearance);
+  }
+}
+
+void AccessibleCaretManager::OnBlur() {
+  AC_LOG("%s: HideCaretsAndDispatchCaretStateChangedEvent()", __FUNCTION__);
+  HideCaretsAndDispatchCaretStateChangedEvent();
+}
+
+void AccessibleCaretManager::OnKeyboardEvent() {
+  if (GetCaretMode() == CaretMode::Cursor) {
+    AC_LOG("%s: HideCaretsAndDispatchCaretStateChangedEvent()", __FUNCTION__);
+    HideCaretsAndDispatchCaretStateChangedEvent();
+  }
+}
+
+void AccessibleCaretManager::SetLastInputSource(uint16_t aInputSource) {
+  mLastInputSource = aInputSource;
+}
+
+bool AccessibleCaretManager::ShouldDisableApz() const {
+  return mDesiredAsyncPanZoomState.ShouldDisable();
+}
+
+Selection* AccessibleCaretManager::GetSelection() const {
+  RefPtr<nsFrameSelection> fs = GetFrameSelection();
+  if (!fs) {
+    return nullptr;
+  }
+  return &fs->NormalSelection();
+}
+
+already_AddRefed<nsFrameSelection> AccessibleCaretManager::GetFrameSelection()
+    const {
+  if (!mPresShell) {
+    return nullptr;
+  }
+
+  RefPtr<nsFrameSelection> fs = mPresShell->GetLastFocusedFrameSelection();
+  if (!fs || fs->GetPresShell() != mPresShell) {
+    return nullptr;
+  }
+
+  return fs.forget();
+}
+
+nsAutoString AccessibleCaretManager::StringifiedSelection() const {
+  nsAutoString str;
+  RefPtr<Selection> selection = GetSelection();
+  if (selection) {
+    selection->Stringify(str, CallerType::System,
+                         mLayoutFlusher.mAllowFlushing
+                             ? Selection::FlushFrames::Yes
+                             : Selection::FlushFrames::No);
+  }
+  return str;
+}
+
+Element* AccessibleCaretManager::GetEditingHostForFrame(
+    const nsIFrame* aFrame) {
+  if (!aFrame) {
+    return nullptr;
+  }
+
+  auto content = aFrame->GetContent();
+  if (!content) {
+    return nullptr;
+  }
+
+  return content->GetEditingHost();
+}
+
+AccessibleCaretManager::CaretMode AccessibleCaretManager::GetCaretMode() const {
+  const Selection* selection = GetSelection();
+  if (!selection) {
+    return CaretMode::None;
+  }
+
+  const uint32_t rangeCount = selection->RangeCount();
+  if (rangeCount <= 0) {
+    return CaretMode::None;
+  }
+
+  const nsFocusManager* fm = nsFocusManager::GetFocusManager();
+  MOZ_ASSERT(fm);
+  if (fm->GetFocusedWindow() != mPresShell->GetDocument()->GetWindow()) {
+    return CaretMode::None;
+  }
+
+  if (selection->IsCollapsed()) {
+    return CaretMode::Cursor;
+  }
+
+  return CaretMode::Selection;
+}
+
+nsIFrame* AccessibleCaretManager::GetFocusableFrame(nsIFrame* aFrame) const {
+  nsIFrame* focusableFrame = aFrame;
+  while (focusableFrame) {
+    if (focusableFrame->IsFocusable(IsFocusableFlags::WithMouse)) {
+      break;
+    }
+    focusableFrame = focusableFrame->GetParent();
+  }
+  return focusableFrame;
+}
+
+void AccessibleCaretManager::ChangeFocusToOrClearOldFocus(
+    nsIFrame* aFrame) const {
+  RefPtr<nsFocusManager> fm = nsFocusManager::GetFocusManager();
+  MOZ_ASSERT(fm);
+
+  if (aFrame) {
+    nsIContent* focusableContent = aFrame->GetContent();
+    MOZ_ASSERT(focusableContent, "Focusable frame must have content!");
+    RefPtr<Element> focusableElement = Element::FromNode(focusableContent);
+    fm->SetFocus(focusableElement, nsIFocusManager::FLAG_BYLONGPRESS);
+  } else if (nsCOMPtr<nsPIDOMWindowOuter> win =
+                 mPresShell->GetDocument()->GetWindow()) {
+    fm->ClearFocus(win);
+    fm->SetFocusedWindow(win);
+  }
+}
+
+nsresult AccessibleCaretManager::SelectWord(nsIFrame* aFrame,
+                                            const nsPoint& aPoint) const {
+  AC_LOGV("%s", __FUNCTION__);
+
+  SetSelectionDragState(true);
+  nsresult rs =
+      aFrame->SelectByTypeAtPoint(aPoint, eSelectWord, eSelectWord, 0);
+
+  SetSelectionDragState(false);
+  ClearMaintainedSelection();
+
+  if (StaticPrefs::layout_accessiblecaret_extend_selection_for_phone_number()) {
+    SelectMoreIfPhoneNumber();
+  }
+
+  return rs;
+}
+
+void AccessibleCaretManager::SetSelectionDragState(bool aState) const {
+  RefPtr<nsFrameSelection> fs = GetFrameSelection();
+  if (fs) {
+    fs->SetDragState(aState);
+  }
+}
+
+bool AccessibleCaretManager::IsPhoneNumber(const nsAString& aCandidate) const {
+  RefPtr<Document> doc = mPresShell->GetDocument();
+  nsAutoString phoneNumberRegex(u"(^\\+)?[0-9 ,\\-.\\(\\)*#pw]{1,30}$"_ns);
+  return nsContentUtils::IsPatternMatching(aCandidate,
+                                           std::move(phoneNumberRegex), doc)
+      .valueOr(false);
+}
+
+void AccessibleCaretManager::SelectMoreIfPhoneNumber() const {
+  if (IsPhoneNumber(StringifiedSelection())) {
+    SetSelectionDirection(eDirNext);
+    ExtendPhoneNumberSelection(u"forward"_ns);
+
+    SetSelectionDirection(eDirPrevious);
+    ExtendPhoneNumberSelection(u"backward"_ns);
+
+    SetSelectionDirection(eDirNext);
+  }
+}
+
+void AccessibleCaretManager::ExtendPhoneNumberSelection(
+    const nsAString& aDirection) const {
+  if (!mPresShell) {
+    return;
+  }
+
+  RefPtr<Selection> selection = GetSelection();
+
+  while (selection) {
+    const nsRange* anchorFocusRange = selection->GetAnchorFocusRange();
+    if (!anchorFocusRange) {
+      return;
+    }
+
+    RefPtr<nsRange> oldAnchorFocusRange = anchorFocusRange->CloneRange();
+
+    nsINode* oldFocusNode = selection->GetFocusNode();
+    uint32_t oldFocusOffset = selection->FocusOffset();
+    nsAutoString oldSelectedText = StringifiedSelection();
+
+    selection->Modify(u"extend"_ns, aDirection, u"character"_ns);
+    if (IsTerminated() == Terminated::Yes) {
+      return;
+    }
+
+    if (selection->GetFocusNode() == oldFocusNode &&
+        selection->FocusOffset() == oldFocusOffset) {
+      return;
+    }
+
+    nsAutoString selectedText = StringifiedSelection();
+
+    if (!IsPhoneNumber(selectedText) || oldSelectedText == selectedText) {
+      selection->SetAnchorFocusToRange(oldAnchorFocusRange);
+      return;
+    }
+  }
+}
+
+void AccessibleCaretManager::SetSelectionDirection(nsDirection aDir) const {
+  Selection* selection = GetSelection();
+  if (selection) {
+    selection->AdjustAnchorFocusForMultiRange(aDir);
+  }
+}
+
+void AccessibleCaretManager::ClearMaintainedSelection() const {
+  RefPtr<nsFrameSelection> fs = GetFrameSelection();
+  if (fs) {
+    fs->MaintainSelection(eSelectNoAmount);
+  }
+}
+
+void AccessibleCaretManager::LayoutFlusher::MaybeFlush(
+    const PresShell& aPresShell) {
+  if (mAllowFlushing) {
+    AutoRestore<bool> flushing(mFlushing);
+    mFlushing = true;
+
+    if (Document* doc = aPresShell.GetDocument()) {
+      doc->FlushPendingNotifications(FlushType::Layout);
+    }
+  }
+}
+
+static nsIFrame* GetChildFrameContainingOffset(
+    nsIFrame* aChildFrame, uint32_t aOffsetInChildFrameContent,
+    CaretAssociationHint aHint) {
+  nsIFrame* frameAtOffset = nullptr;
+  int32_t unused = 0;
+  if (NS_WARN_IF(NS_FAILED(aChildFrame->GetChildFrameContainingOffset(
+          static_cast<int32_t>(aOffsetInChildFrameContent),
+          aHint == CaretAssociationHint::After, &unused, &frameAtOffset)))) {
+    frameAtOffset = aChildFrame;
+  }
+  return frameAtOffset;
+}
+
+FrameAndOffset
+AccessibleCaretManager::GetFirstVisibleLeafFrameOrUnselectableChildFrame(
+    nsRange& aRange, nsIContent** aOutContent ,
+    int32_t* aOutOffsetInContent ) const {
+  if (!mPresShell) {
+    return {};
+  }
+
+  MOZ_ASSERT(GetCaretMode() == CaretMode::Selection);
+
+  if (MOZ_UNLIKELY(aRange.Collapsed())) {
+    return {};
+  }
+
+  const RawRangeBoundary& shrunkenStart =
+      SelectionMovementUtils::GetFirstVisiblePointAtLeaf(aRange);
+  if (MOZ_UNLIKELY(!shrunkenStart.IsSet())) {
+    return {};
+  }
+  if (aOutContent) {
+    if (nsIContent* const outContent =
+            nsIContent::FromNode(shrunkenStart.GetContainer())) {
+      *aOutContent = do_AddRef(outContent).take();
+    }
+  }
+  if (aOutOffsetInContent) {
+    *aOutOffsetInContent = static_cast<int32_t>(
+        *shrunkenStart.Offset(RawRangeBoundary::OffsetFilter::kValidOffsets));
+  }
+  if (nsIContent* const child = shrunkenStart.GetChildAtOffset()) {
+    if (nsIFrame* const childFrame = child->GetPrimaryFrame()) {
+      const uint32_t offsetInFrameContent = 0u;
+      nsIFrame* const childFrameAtOffset = GetChildFrameContainingOffset(
+          childFrame, offsetInFrameContent, CaretAssociationHint::After);
+      MOZ_ASSERT(childFrameAtOffset);
+      if (!childFrameAtOffset->IsInlineFrame() ||
+          childFrameAtOffset->IsSelfEmpty()) {
+        return {childFrameAtOffset, offsetInFrameContent};
+      }
+    }
+  }
+  nsIContent* const container =
+      nsIContent::FromNode(shrunkenStart.GetContainer());
+  if (MOZ_UNLIKELY(!container)) {
+    return {};
+  }
+  nsIFrame* const frame = container->GetPrimaryFrame();
+  if (MOZ_UNLIKELY(!frame)) {
+    return {};
+  }
+  MOZ_ASSERT(frame->IsSelectable());
+  const uint32_t offsetInFrameContent =
+      *shrunkenStart.Offset(RawRangeBoundary::OffsetFilter::kValidOffsets);
+  nsIFrame* const frameAtOffset = GetChildFrameContainingOffset(
+      frame, offsetInFrameContent, CaretAssociationHint::After);
+  MOZ_ASSERT(frameAtOffset);
+  return {frameAtOffset, offsetInFrameContent};
+}
+
+FrameAndOffset
+AccessibleCaretManager::GetLastVisibleLeafFrameOrUnselectableChildFrame(
+    nsRange& aRange, nsIContent** aOutContent ,
+    int32_t* aOutOffsetInContent ) const {
+  if (!mPresShell) {
+    return {};
+  }
+
+  MOZ_ASSERT(GetCaretMode() == CaretMode::Selection);
+
+  if (MOZ_UNLIKELY(aRange.Collapsed())) {
+    return {};
+  }
+
+  const RawRangeBoundary& shrunkenEnd =
+      SelectionMovementUtils::GetLastVisiblePointAtLeaf(aRange);
+  if (MOZ_UNLIKELY(!shrunkenEnd.IsSet())) {
+    return {};
+  }
+  if (aOutContent) {
+    if (nsIContent* const outContent =
+            nsIContent::FromNode(shrunkenEnd.GetContainer())) {
+      *aOutContent = do_AddRef(outContent).take();
+    }
+  }
+  if (aOutOffsetInContent) {
+    *aOutOffsetInContent = static_cast<int32_t>(
+        *shrunkenEnd.Offset(RawRangeBoundary::OffsetFilter::kValidOffsets));
+  }
+  if (nsIContent* const previousSiblingOfChildAtOffset = shrunkenEnd.Ref()) {
+    if (nsIFrame* const childFrame =
+            previousSiblingOfChildAtOffset->GetPrimaryFrame()) {
+      const uint32_t offsetInChildFrameContent =
+          previousSiblingOfChildAtOffset->Length();
+      nsIFrame* const childFrameAtOffset = GetChildFrameContainingOffset(
+          childFrame, offsetInChildFrameContent, CaretAssociationHint::Before);
+      MOZ_ASSERT(childFrameAtOffset);
+      if (!childFrameAtOffset->IsInlineFrame() ||
+          childFrameAtOffset->IsSelfEmpty()) {
+        return {childFrameAtOffset, offsetInChildFrameContent};
+      }
+    }
+  }
+  nsIContent* const container =
+      nsIContent::FromNode(shrunkenEnd.GetContainer());
+  if (MOZ_UNLIKELY(!container)) {
+    return {};
+  }
+  nsIFrame* const frame = container->GetPrimaryFrame();
+  if (MOZ_UNLIKELY(!frame)) {
+    return {};
+  }
+  MOZ_ASSERT(frame->IsSelectable());
+  const uint32_t offsetInFrameContent =
+      *shrunkenEnd.Offset(RawRangeBoundary::OffsetFilter::kValidOffsets);
+  nsIFrame* const frameAtOffset = GetChildFrameContainingOffset(
+      frame, offsetInFrameContent, CaretAssociationHint::Before);
+  MOZ_ASSERT(frameAtOffset);
+  return {frameAtOffset, offsetInFrameContent};
+}
+
+bool AccessibleCaretManager::RestrictCaretDraggingOffsets(
+    nsIFrame::ContentOffsets& aOffsets) {
+  if (!mPresShell) {
+    return false;
+  }
+
+  MOZ_ASSERT(GetCaretMode() == CaretMode::Selection);
+
+  nsDirection dir =
+      mActiveCaret == mCarets.GetFirst() ? eDirPrevious : eDirNext;
+  nsCOMPtr<nsIContent> content;
+  int32_t offsetInContent = 0;
+  const FrameAndOffset frameAndOffset =
+      dir == eDirNext ? GetFirstVisibleLeafFrameOrUnselectableChildFrame(
+                            *GetSelection()->GetFirstRange(),
+                            getter_AddRefs(content), &offsetInContent)
+                      : GetLastVisibleLeafFrameOrUnselectableChildFrame(
+                            *GetSelection()->GetLastRange(),
+                            getter_AddRefs(content), &offsetInContent);
+  if (!frameAndOffset) {
+    return false;
+  }
+
+  NS_ASSERTION(static_cast<int32_t>(frameAndOffset.mOffsetInFrameContent) >= 0,
+               "mOffsetInFrameContent should not be negative when casting to "
+               "signed integer");
+  const Maybe<int32_t> cmpToInactiveCaretPos =
+      nsContentUtils::ComparePoints_AllowNegativeOffsets<
+          TreeKind::ShadowIncludingDOM>(
+          aOffsets.content, aOffsets.StartOffset(),
+          frameAndOffset.GetFrameContent(),
+          static_cast<int32_t>(frameAndOffset.mOffsetInFrameContent));
+  if (NS_WARN_IF(!cmpToInactiveCaretPos)) {
+    return false;
+  }
+
+  PeekOffsetStruct limit(
+      eSelectCluster, dir,
+      static_cast<int32_t>(frameAndOffset.mOffsetInFrameContent), nsPoint(0, 0),
+      {PeekOffsetOption::JumpLines, PeekOffsetOption::StopAtScroller});
+  nsresult rv = frameAndOffset->PeekOffset(&limit);
+  if (NS_FAILED(rv)) {
+    limit.mResultContent = content;
+    limit.mContentOffset = offsetInContent;
+  }
+
+  NS_ASSERTION(limit.mContentOffset >= 0,
+               "limit.mContentOffset should not be negative");
+  const Maybe<int32_t> cmpToLimit =
+      nsContentUtils::ComparePoints_AllowNegativeOffsets<
+          TreeKind::ShadowIncludingDOM>(
+          aOffsets.content, aOffsets.StartOffset(), limit.mResultContent,
+          limit.mContentOffset);
+  if (NS_WARN_IF(!cmpToLimit)) {
+    return false;
+  }
+
+  auto SetOffsetsToLimit = [&aOffsets, &limit]() {
+    aOffsets.content = limit.mResultContent;
+    aOffsets.offset = limit.mContentOffset;
+    aOffsets.secondaryOffset = limit.mContentOffset;
+  };
+
+  if (!StaticPrefs::
+          layout_accessiblecaret_allow_dragging_across_other_caret()) {
+    if ((mActiveCaret == mCarets.GetFirst() && *cmpToLimit == 1) ||
+        (mActiveCaret == mCarets.GetSecond() && *cmpToLimit == -1)) {
+      SetOffsetsToLimit();
+    }
+  } else {
+    switch (*cmpToInactiveCaretPos) {
+      case 0:
+        SetOffsetsToLimit();
+        break;
+      case 1:
+        if (mActiveCaret == mCarets.GetFirst()) {
+          mActiveCaret = mCarets.GetSecond();
+        }
+        break;
+      case -1:
+        if (mActiveCaret == mCarets.GetSecond()) {
+          mActiveCaret = mCarets.GetFirst();
+        }
+        break;
+    }
+  }
+
+  return true;
+}
+
+bool AccessibleCaretManager::CompareTreePosition(const nsIFrame* aStartFrame,
+                                                 int32_t aStartOffset,
+                                                 const nsIFrame* aEndFrame,
+                                                 int32_t aEndOffset) const {
+  if (MOZ_UNLIKELY(!aStartFrame || !aStartFrame->GetContent() || !aEndFrame ||
+                   !aEndFrame->GetContent())) {
+    return false;
+  }
+  if (aStartFrame->GetContent() == aEndFrame->GetContent()) {
+    return aStartOffset <= aEndOffset;
+  }
+  return nsContentUtils::ComparePoints<TreeKind::ShadowIncludingDOM>(
+             ConstRawRangeBoundary(aStartFrame->GetContent(),
+                                   static_cast<uint32_t>(aStartOffset)),
+             ConstRawRangeBoundary(aEndFrame->GetContent(),
+                                   static_cast<uint32_t>(aEndOffset)))
+             .valueOr(1) <= 0;
+}
+
+nsresult AccessibleCaretManager::DragCaretInternal(const nsPoint& aPoint) {
+  MOZ_ASSERT(mPresShell);
+
+  nsIFrame* rootFrame = mPresShell->GetRootFrame();
+  MOZ_ASSERT(rootFrame, "We need root frame to compute caret dragging!");
+
+  nsPoint point = AdjustDragBoundary(
+      nsPoint(aPoint.x, aPoint.y + mOffsetYToCaretLogicalPosition));
+
+
+  nsIFrame* ptFrame = nsLayoutUtils::GetFrameForPoint(
+      RelativeTo{rootFrame}, point, GetHitTestOptions());
+  if (!ptFrame) {
+    return NS_ERROR_FAILURE;
+  }
+
+  RefPtr<nsFrameSelection> fs = GetFrameSelection();
+  MOZ_ASSERT(fs);
+
+  nsresult result;
+  nsIFrame* newFrame = nullptr;
+  nsPoint newPoint;
+  nsPoint ptInFrame = point;
+  nsLayoutUtils::TransformPoint(RelativeTo{rootFrame}, RelativeTo{ptFrame},
+                                ptInFrame);
+  result = fs->ConstrainFrameAndPointToAnchorSubtree(ptFrame, ptInFrame,
+                                                     &newFrame, newPoint);
+  if (NS_FAILED(result) || !newFrame) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (!newFrame->IsSelectable()) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsIFrame::ContentOffsets offsets = newFrame->GetContentOffsetsFromPoint(
+      newPoint, nsIFrame::IGNORE_NATIVE_ANONYMOUS_SUBTREE);
+  if (offsets.IsNull()) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (GetCaretMode() == CaretMode::Selection &&
+      !RestrictCaretDraggingOffsets(offsets)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  ClearMaintainedSelection();
+
+  const nsFrameSelection::FocusMode focusMode =
+      (GetCaretMode() == CaretMode::Selection)
+          ? nsFrameSelection::FocusMode::kExtendSelection
+          : nsFrameSelection::FocusMode::kCollapseToNewPoint;
+  int32_t startOffset, endOffset;
+  if (focusMode == nsFrameSelection::FocusMode::kCollapseToNewPoint) {
+    startOffset = endOffset = offsets.offset;
+  } else {
+    startOffset = offsets.StartOffset();
+    endOffset = offsets.EndOffset();
+  }
+  fs->HandleClick(MOZ_KnownLive(offsets.content) , startOffset,
+                  endOffset, focusMode, offsets.associate);
+  return NS_OK;
+}
+
+nsRect AccessibleCaretManager::GetAllChildFrameRectsUnion(nsIFrame* aFrame) {
+  nsRect unionRect;
+
+  for (nsIFrame* frame = aFrame->GetContentInsertionFrame(); frame;
+       frame = frame->GetNextContinuation()) {
+    Maybe<nsRect> childrenRect;
+
+    for (const auto& childList : frame->ChildLists()) {
+      for (nsIFrame* child : childList.mList) {
+        nsRect childRect = child->ScrollableOverflowRectRelativeToSelf();
+        nsLayoutUtils::TransformRect(child, frame, childRect);
+
+        if (childrenRect) {
+          *childrenRect = childrenRect->UnionEdges(childRect);
+        } else {
+          childrenRect.emplace(childRect);
+        }
+      }
+    }
+
+    if (childrenRect) {
+      if (frame != aFrame) {
+        nsLayoutUtils::TransformRect(frame, aFrame, *childrenRect);
+      }
+      unionRect = unionRect.Union(*childrenRect);
+    }
+  }
+
+  return unionRect;
+}
+
+nsPoint AccessibleCaretManager::AdjustDragBoundary(
+    const nsPoint& aPoint) const {
+  nsPoint adjustedPoint = aPoint;
+
+  auto frameData =
+      nsCaret::GetFrameAndOffset(nsCaret::CaretPositionFor(GetSelection()));
+  Element* editingHost = GetEditingHostForFrame(frameData.mFrame);
+
+  if (editingHost) {
+    nsIFrame* editingHostFrame = editingHost->GetPrimaryFrame();
+    if (editingHostFrame) {
+      nsRect boundary =
+          AccessibleCaretManager::GetAllChildFrameRectsUnion(editingHostFrame);
+      nsLayoutUtils::TransformRect(editingHostFrame, mPresShell->GetRootFrame(),
+                                   boundary);
+
+      boundary.Deflate(kBoundaryAppUnits);
+
+      adjustedPoint = boundary.ClampPoint(adjustedPoint);
+    }
+  }
+
+  if (GetCaretMode() == CaretMode::Selection &&
+      !StaticPrefs::
+          layout_accessiblecaret_allow_dragging_across_other_caret()) {
+    if (mActiveCaret == mCarets.GetFirst()) {
+      nscoord dragDownBoundaryY = mCarets.GetSecond()->LogicalPosition().y;
+      if (dragDownBoundaryY > 0 && adjustedPoint.y > dragDownBoundaryY) {
+        adjustedPoint.y = dragDownBoundaryY;
+      }
+    } else {
+      nscoord dragUpBoundaryY = mCarets.GetFirst()->LogicalPosition().y;
+      if (adjustedPoint.y < dragUpBoundaryY) {
+        adjustedPoint.y = dragUpBoundaryY;
+      }
+    }
+  }
+
+  return adjustedPoint;
+}
+
+void AccessibleCaretManager::StartSelectionAutoScrollTimer(
+    const nsPoint& aPoint) const {
+  Selection* selection = GetSelection();
+  MOZ_ASSERT(selection);
+
+  nsIFrame* anchorFrame = selection->GetPrimaryFrameForAnchorNode();
+  if (!anchorFrame) {
+    return;
+  }
+
+  ScrollContainerFrame* scrollContainerFrame =
+      nsLayoutUtils::GetNearestScrollContainerFrame(
+          anchorFrame, nsLayoutUtils::SCROLLABLE_SAME_DOC |
+                           nsLayoutUtils::SCROLLABLE_INCLUDE_HIDDEN);
+  if (!scrollContainerFrame) {
+    return;
+  }
+
+  nsIFrame* capturingFrame = scrollContainerFrame->GetScrolledFrame();
+  if (!capturingFrame) {
+    return;
+  }
+
+  nsIFrame* rootFrame = mPresShell->GetRootFrame();
+  MOZ_ASSERT(rootFrame);
+  nsPoint ptInScrolled = aPoint;
+  nsLayoutUtils::TransformPoint(RelativeTo{rootFrame},
+                                RelativeTo{capturingFrame}, ptInScrolled);
+
+  RefPtr<nsFrameSelection> fs = GetFrameSelection();
+  MOZ_ASSERT(fs);
+  fs->StartAutoScrollTimer(capturingFrame, ptInScrolled, kAutoScrollTimerDelay);
+}
+
+void AccessibleCaretManager::StopSelectionAutoScrollTimer() const {
+  RefPtr<nsFrameSelection> fs = GetFrameSelection();
+  MOZ_ASSERT(fs);
+  fs->StopAutoScrollTimer();
+}
+
+void AccessibleCaretManager::DispatchCaretStateChangedEvent(
+    CaretChangedReason aReason, const nsPoint* aPoint) {
+  if (MaybeFlushLayout() == Terminated::Yes) {
+    return;
+  }
+
+  const Selection* sel = GetSelection();
+  if (!sel) {
+    return;
+  }
+
+  Document* doc = mPresShell->GetDocument();
+  MOZ_ASSERT(doc);
+
+  CaretStateChangedEventInit init;
+  init.mBubbles = true;
+
+  const nsRange* range = sel->GetAnchorFocusRange();
+  nsINode* commonAncestorNode = nullptr;
+  if (range) {
+    commonAncestorNode = range->GetClosestCommonInclusiveAncestor();
+  }
+
+  if (!commonAncestorNode) {
+    commonAncestorNode = sel->GetFrameSelection()->GetAncestorLimiter();
+  }
+
+  auto domRect = MakeRefPtr<DOMRect>(ToSupports(doc));
+  nsRect rect = nsLayoutUtils::GetSelectionBoundingRect(sel);
+
+  nsIFrame* commonAncestorFrame = nullptr;
+  nsIFrame* rootFrame = mPresShell->GetRootFrame();
+
+  if (commonAncestorNode && commonAncestorNode->IsContent()) {
+    commonAncestorFrame = commonAncestorNode->AsContent()->GetPrimaryFrame();
+  }
+
+  if (commonAncestorFrame && rootFrame) {
+    nsLayoutUtils::TransformRect(rootFrame, commonAncestorFrame, rect);
+    nsRect clampedRect =
+        nsLayoutUtils::ClampRectToScrollFrames(commonAncestorFrame, rect);
+    nsLayoutUtils::TransformRect(commonAncestorFrame, rootFrame, clampedRect);
+    rect = clampedRect;
+    init.mSelectionVisible = !clampedRect.IsEmpty();
+  } else {
+    init.mSelectionVisible = true;
+  }
+
+  domRect->SetLayoutRect(rect);
+
+  init.mSelectionEditable = GetEditingHostForFrame(commonAncestorFrame);
+
+  init.mBoundingClientRect = domRect;
+  init.mReason = aReason;
+  init.mCollapsed = sel->IsCollapsed();
+  init.mCaretVisible = mCarets.HasLogicallyVisibleCaret();
+  init.mCaretVisuallyVisible = mCarets.HasVisuallyVisibleCaret();
+  init.mSelectedTextContent = StringifiedSelection();
+
+  if (aPoint) {
+    CSSIntPoint pt = CSSPixel::FromAppUnitsRounded(*aPoint);
+    init.mClientX = pt.x;
+    init.mClientY = pt.y;
+  }
+
+  RefPtr<CaretStateChangedEvent> event = CaretStateChangedEvent::Constructor(
+      doc, u"mozcaretstatechanged"_ns, init);
+  event->SetTrusted(true);
+
+  AC_LOG("%s: reason %" PRIu32 ", collapsed %d, caretVisible %" PRIu32,
+         __FUNCTION__, static_cast<uint32_t>(init.mReason), init.mCollapsed,
+         static_cast<uint32_t>(init.mCaretVisible));
+
+  (new AsyncEventDispatcher(doc, event.forget(), ChromeOnlyDispatch::eYes))
+      ->PostDOMEvent();
+}
+
+AccessibleCaretManager::Carets::Carets(UniquePtr<AccessibleCaret> aFirst,
+                                       UniquePtr<AccessibleCaret> aSecond)
+    : mFirst{std::move(aFirst)}, mSecond{std::move(aSecond)} {}
+
+}  

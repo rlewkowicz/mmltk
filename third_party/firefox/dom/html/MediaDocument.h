@@ -1,0 +1,99 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_MediaDocument_h
+#define mozilla_dom_MediaDocument_h
+
+#include "nsGenericHTMLElement.h"
+#include "nsHTMLDocument.h"
+#include "nsIStreamListener.h"
+#include "nsIStringBundle.h"
+#include "nsIThreadRetargetableStreamListener.h"
+
+#define NSMEDIADOCUMENT_PROPERTIES_URI \
+  "chrome://global/locale/layout/MediaDocument.properties"
+
+#define NSMEDIADOCUMENT_PROPERTIES_URI_en_US \
+  "resource://gre/res/locale/layout/MediaDocument.properties"
+
+namespace mozilla::dom {
+
+class MediaDocument : public nsHTMLDocument {
+ public:
+  MediaDocument();
+  virtual ~MediaDocument();
+
+  enum MediaDocumentKind MediaDocumentKind() const override = 0;
+
+  virtual nsresult Init(nsIPrincipal* aPrincipal,
+                        nsIPrincipal* aPartitionedPrincipal) override;
+
+  virtual nsresult StartDocumentLoad(const char* aCommand, nsIChannel* aChannel,
+                                     nsILoadGroup* aLoadGroup,
+                                     nsISupports* aContainer,
+                                     nsIStreamListener** aDocListener,
+                                     bool aReset = true) override;
+
+  virtual bool WillIgnoreCharsetOverride() override { return true; }
+
+ protected:
+  void InitialSetupDone();
+
+  [[nodiscard]] bool InitialSetupHasBeenDone() const {
+    return mDidInitialDocumentSetup;
+  }
+
+  virtual nsresult CreateSyntheticDocument();
+
+  friend class MediaDocumentStreamListener;
+  virtual nsresult StartLayout();
+
+  void GetFileName(nsAString& aResult, nsIChannel* aChannel);
+
+  nsresult LinkStylesheet(const nsAString& aStylesheet);
+  nsresult LinkScript(const nsAString& aScript);
+
+  void FormatStringFromName(const char* aName,
+                            const nsTArray<nsString>& aParams,
+                            nsAString& aResult);
+
+  void UpdateTitleAndCharset(const nsACString& aTypeStr, nsIChannel* aChannel,
+                             const char* const* aFormatNames = sFormatNames,
+                             int32_t aWidth = 0, int32_t aHeight = 0,
+                             const nsAString& aStatus = u""_ns);
+
+  nsCOMPtr<nsIStringBundle> mStringBundle;
+  nsCOMPtr<nsIStringBundle> mStringBundleEnglish;
+  static const char* const sFormatNames[4];
+
+ private:
+  enum { eWithNoInfo, eWithFile, eWithDim, eWithDimAndFile };
+
+  bool mDidInitialDocumentSetup;
+};
+
+class MediaDocumentStreamListener : public nsIThreadRetargetableStreamListener {
+ protected:
+  virtual ~MediaDocumentStreamListener();
+
+ public:
+  explicit MediaDocumentStreamListener(MediaDocument* aDocument);
+
+  NS_DECL_THREADSAFE_ISUPPORTS
+
+  NS_DECL_NSIREQUESTOBSERVER
+
+  NS_DECL_NSISTREAMLISTENER
+
+  NS_DECL_NSITHREADRETARGETABLESTREAMLISTENER
+
+  void DropDocumentRef() { mDocument = nullptr; }
+
+  RefPtr<MediaDocument> mDocument;
+  nsCOMPtr<nsIStreamListener> mNextStream;
+};
+
+}  
+
+#endif /* mozilla_dom_MediaDocument_h */

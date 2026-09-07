@@ -1,0 +1,93 @@
+// Copyright 2002 The ANGLE Project Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(COMPILER_TRANSLATOR_UTIL_H_)
+#define COMPILER_TRANSLATOR_UTIL_H_
+
+#include <stack>
+
+#include <GLSLANG/ShaderLang.h>
+#include "angle_gl.h"
+
+#include "compiler/translator/HashNames.h"
+#include "compiler/translator/ImmutableString.h"
+#include "compiler/translator/Operator_autogen.h"
+#include "compiler/translator/Types.h"
+
+bool atoi_clamp(const char *str, unsigned int *value);
+
+namespace sh
+{
+
+class TIntermBlock;
+class TIntermDeclaration;
+class TSymbolTable;
+class TIntermTyped;
+
+float NumericLexFloat32OutOfRangeToInfinity(const std::string &str, bool preserveDenorms);
+
+bool strtof_clamp(const std::string &str, float *value, bool preserveDenorms);
+
+GLenum GLVariableType(const TType &type);
+GLenum GLVariablePrecision(const TType &type);
+bool IsParam(TQualifier qualifier);
+bool IsParamOut(TQualifier qualifier);
+bool IsVaryingIn(TQualifier qualifier);
+bool IsVaryingOut(TQualifier qualifier);
+bool IsVarying(TQualifier qualifier);
+bool IsMatrixGLType(GLenum type);
+bool IsGeometryShaderInput(GLenum shaderType, TQualifier qualifier);
+bool IsTessellationControlShaderInput(GLenum shaderType, TQualifier qualifier);
+bool IsTessellationControlShaderOutput(GLenum shaderType, TQualifier qualifier);
+bool IsTessellationEvaluationShaderInput(GLenum shaderType, TQualifier qualifier);
+InterpolationType GetInterpolationType(TQualifier qualifier);
+InterpolationType GetFieldInterpolationType(TQualifier qualifier);
+
+ImmutableString ArrayString(const TType &type);
+
+ImmutableString GetTypeName(const TType &type,
+                            char prefix,
+                            ShHashFunction64 hashFunction,
+                            NameMap *nameMap);
+
+TType GetShaderVariableBasicType(const sh::ShaderVariable &var);
+
+void DeclareGlobalVariable(TIntermBlock *root, const TVariable *variable);
+
+bool IsBuiltinOutputVariable(TQualifier qualifier);
+bool IsBuiltinFragmentInputVariable(TQualifier qualifier);
+bool CanBeInvariantESSL1(TQualifier qualifier);
+bool CanBeInvariantESSL3OrGreater(TQualifier qualifier);
+bool IsShaderOutput(TQualifier qualifier);
+bool IsFragmentOutput(TQualifier qualifier);
+bool IsOutputNULL(ShShaderOutput output);
+bool IsOutputESSL(ShShaderOutput output);
+bool IsOutputGLSL(ShShaderOutput output);
+bool IsOutputSPIRV(ShShaderOutput output);
+bool IsOutputWGSL(ShShaderOutput output);
+
+bool IsInShaderStorageBlock(TIntermTyped *node);
+
+GLenum GetImageInternalFormatType(TLayoutImageInternalFormat iifq);
+bool IsSpecWithFunctionBodyNewScope(ShShaderSpec shaderSpec, int shaderVersion);
+
+bool IsPrecisionApplicableToType(TBasicType type);
+
+bool IsRedeclarableBuiltIn(const ImmutableString &name);
+
+size_t FindFieldIndex(const TFieldList &fieldList, const char *fieldName);
+
+struct Declaration
+{
+    TIntermSymbol &symbol;
+    TIntermTyped *initExpr;  
+};
+
+Declaration ViewDeclaration(TIntermDeclaration &declNode, uint32_t index = 0);
+
+bool IsIndexOp(TOperator op);
+
+}  
+
+#endif

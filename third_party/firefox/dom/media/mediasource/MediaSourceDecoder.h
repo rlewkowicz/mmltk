@@ -1,0 +1,89 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_MEDIASOURCEDECODER_H_
+#define MOZILLA_MEDIASOURCEDECODER_H_
+
+#include "MediaDecoder.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/MediaDebugInfoBinding.h"
+
+namespace mozilla {
+
+class MediaDecoderStateMachineBase;
+class MediaSourceDemuxer;
+
+namespace dom {
+
+class MediaSource;
+
+}  
+
+DDLoggedTypeDeclNameAndBase(MediaSourceDecoder, MediaDecoder);
+
+class MediaSourceDecoder : public MediaDecoder,
+                           public DecoderDoctorLifeLogger<MediaSourceDecoder> {
+ public:
+  explicit MediaSourceDecoder(MediaDecoderInit& aInit);
+
+  nsresult Load(nsIPrincipal* aPrincipal);
+  media::TimeIntervals GetSeekable() override;
+  media::TimeRanges GetSeekableTimeRanges() override;
+  media::TimeIntervals GetBuffered() override;
+
+  void Shutdown() override;
+
+  void AttachMediaSource(dom::MediaSource* aMediaSource);
+  void DetachMediaSource();
+
+  void Ended(bool aEnded);
+
+  double GetDuration() override;
+
+  void SetInitialDuration(const media::TimeUnit& aDuration);
+  void SetMediaSourceDuration(const media::TimeUnit& aDuration);
+  void SetMediaSourceDuration(double aDuration);
+
+  MediaSourceDemuxer* GetDemuxer() { return mDemuxer; }
+
+  already_AddRefed<nsIPrincipal> GetCurrentPrincipal() override;
+
+  bool HadCrossOriginRedirects() override;
+
+  bool IsTransportSeekable() override { return true; }
+
+  RefPtr<GenericPromise> RequestDebugInfo(
+      dom::MediaSourceDecoderDebugInfo& aInfo);
+
+  void AddSizeOfResources(ResourceSizes* aSizes) override;
+
+  MediaDecoderOwner::NextFrameStatus NextFrameBufferedStatus() override;
+
+  bool IsMSE() const override { return true; }
+
+  void NotifyInitDataArrived();
+
+  void NotifyDataArrived();
+
+ private:
+  already_AddRefed<MediaDecoderStateMachineBase> CreateStateMachine() override;
+
+  template <typename IntervalType>
+  IntervalType GetSeekableImpl();
+
+  void DoSetMediaSourceDuration(double aDuration);
+  media::TimeInterval ClampIntervalToEnd(const media::TimeInterval& aInterval);
+  bool CanPlayThroughImpl() override;
+
+  RefPtr<nsIPrincipal> mPrincipal;
+
+  dom::MediaSource* mMediaSource;
+  RefPtr<MediaSourceDemuxer> mDemuxer;
+
+  bool mEnded;
+};
+
+}  
+
+#endif /* MOZILLA_MEDIASOURCEDECODER_H_ */

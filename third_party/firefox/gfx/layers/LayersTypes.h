@@ -1,0 +1,508 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef GFX_LAYERSTYPES_H
+#define GFX_LAYERSTYPES_H
+
+#include <iosfwd>    // for ostream
+#include <stdint.h>  // for uint32_t
+#include <stdio.h>   // FILE
+#include <tuple>
+
+#include "Units.h"
+#include "mozilla/DefineEnum.h"  // for MOZ_DEFINE_ENUM_CLASS_WITH_BASE
+#include "mozilla/Maybe.h"
+#include "mozilla/TimeStamp.h"  // for TimeStamp
+#include "nsRegion.h"
+#include "mozilla/EnumSet.h"
+
+#ifndef MOZ_LAYERS_HAVE_LOG
+#  define MOZ_LAYERS_HAVE_LOG
+#endif
+#define MOZ_LAYERS_LOG(_args) \
+  MOZ_LOG(LayerManager::GetLog(), LogLevel::Debug, _args)
+#define MOZ_LAYERS_LOG_IF_SHADOWABLE(layer, _args)
+
+#define INVALID_OVERLAY -1
+
+
+namespace IPC {
+template <typename T>
+struct ParamTraits;
+}  
+
+namespace mozilla {
+
+enum class StyleBorderStyle : uint8_t;
+
+namespace layers {
+
+class TextureHost;
+
+#undef NONE
+#undef OPAQUE
+
+struct LayersId final {
+  uint64_t mId = 0;
+
+  auto MutTiedFields() { return std::tie(mId); }
+
+  bool IsValid() const { return mId != 0; }
+
+  explicit operator uint64_t() const { return mId; }
+
+  bool operator<(const LayersId& aOther) const { return mId < aOther.mId; }
+
+  bool operator==(const LayersId& aOther) const { return mId == aOther.mId; }
+
+  bool operator!=(const LayersId& aOther) const { return !(*this == aOther); }
+
+  friend std::ostream& operator<<(std::ostream& aStream, const LayersId& aId);
+
+  struct HashFn {
+    std::size_t operator()(const LayersId& aKey) const {
+      return std::hash<uint64_t>{}(aKey.mId);
+    }
+  };
+};
+
+template <typename T>
+struct BaseTransactionId final {
+  uint64_t mId = 0;
+
+  auto MutTiedFields() { return std::tie(mId); }
+
+  bool IsValid() const { return mId != 0; }
+
+  [[nodiscard]] BaseTransactionId<T> Next() const {
+    return BaseTransactionId<T>{mId + 1};
+  }
+
+  [[nodiscard]] BaseTransactionId<T> Prev() const {
+    return BaseTransactionId<T>{mId - 1};
+  }
+
+  int64_t operator-(const BaseTransactionId<T>& aOther) const {
+    return mId - aOther.mId;
+  }
+
+  explicit operator uint64_t() const { return mId; }
+
+  bool operator<(const BaseTransactionId<T>& aOther) const {
+    return mId < aOther.mId;
+  }
+
+  bool operator<=(const BaseTransactionId<T>& aOther) const {
+    return mId <= aOther.mId;
+  }
+
+  bool operator>(const BaseTransactionId<T>& aOther) const {
+    return mId > aOther.mId;
+  }
+
+  bool operator>=(const BaseTransactionId<T>& aOther) const {
+    return mId >= aOther.mId;
+  }
+
+  bool operator==(const BaseTransactionId<T>& aOther) const {
+    return mId == aOther.mId;
+  }
+
+  bool operator!=(const BaseTransactionId<T>& aOther) const {
+    return mId != aOther.mId;
+  }
+};
+
+class TransactionIdType {};
+typedef BaseTransactionId<TransactionIdType> TransactionId;
+
+class CompositionOpportunityType {};
+typedef BaseTransactionId<CompositionOpportunityType> CompositionOpportunityId;
+
+enum class WindowKind : int8_t { MAIN = 0, SECONDARY, LAST };
+
+enum class LayersBackend : int8_t { LAYERS_NONE = 0, LAYERS_WR, LAYERS_LAST };
+
+enum class WebRenderBackend : int8_t { HARDWARE = 0, SOFTWARE, LAST };
+
+enum class WebRenderCompositor : int8_t {
+  DRAW = 0,
+  DIRECT_COMPOSITION,
+  CORE_ANIMATION,
+  SOFTWARE,
+  D3D11,
+  OPENGL,
+  WAYLAND,
+  Unknown,
+  LAST
+};
+
+const char* GetLayersBackendName(LayersBackend aBackend);
+
+enum class TextureType : int8_t {
+  Unknown = 0,
+  D3D11,
+  MacIOSurface,
+  AndroidNativeWindow,
+  AndroidHardwareBuffer,
+  DMABUF,
+  EGLImage,
+  Last
+};
+
+enum class DrawRegionClip : int8_t { DRAW, NONE };
+
+enum class SurfaceMode : int8_t {
+  SURFACE_NONE = 0,
+  SURFACE_OPAQUE,
+  SURFACE_SINGLE_CHANNEL_ALPHA,
+  SURFACE_COMPONENT_ALPHA
+};
+
+// clang-format off
+MOZ_DEFINE_ENUM_CLASS_WITH_BASE(
+  ScaleMode, int8_t, (
+    SCALE_NONE,
+    STRETCH
+));
+// clang-format on
+
+enum EventRegionsOverride {
+  NoOverride = 0,
+  ForceDispatchToContent = (1 << 0),
+  ForceEmptyHitRegion = (1 << 1),
+  ALL_BITS = (1 << 2) - 1
+};
+
+MOZ_ALWAYS_INLINE EventRegionsOverride operator|(EventRegionsOverride a,
+                                                 EventRegionsOverride b) {
+  return (EventRegionsOverride)((int)a | (int)b);
+}
+
+MOZ_ALWAYS_INLINE EventRegionsOverride& operator|=(EventRegionsOverride& a,
+                                                   EventRegionsOverride b) {
+  a = a | b;
+  return a;
+}
+
+enum TextureDumpMode {
+  Compress,      
+  DoNotCompress  
+};
+
+typedef uint32_t TouchBehaviorFlags;
+
+typedef gfx::Matrix4x4Typed<LayerPixel, CSSTransformedLayerPixel>
+    CSSTransformMatrix;
+typedef gfx::Matrix4x4Typed<ParentLayerPixel, ParentLayerPixel>
+    AsyncTransformComponentMatrix;
+typedef gfx::Matrix4x4Typed<CSSTransformedLayerPixel, ParentLayerPixel>
+    AsyncTransformMatrix;
+
+typedef Array<gfx::DeviceColor, 4> BorderColors;
+typedef Array<LayerSize, 4> BorderCorners;
+typedef Array<LayerCoord, 4> BorderWidths;
+typedef Array<StyleBorderStyle, 4> BorderStyles;
+
+typedef Maybe<LayerRect> MaybeLayerRect;
+
+class LayerHandle final {
+  friend struct IPC::ParamTraits<mozilla::layers::LayerHandle>;
+
+ public:
+  LayerHandle() : mHandle(0) {}
+  LayerHandle(const LayerHandle& aOther) = default;
+  explicit LayerHandle(uint64_t aHandle) : mHandle(aHandle) {}
+  bool IsValid() const { return mHandle != 0; }
+  explicit operator bool() const { return IsValid(); }
+  bool operator==(const LayerHandle& aOther) const {
+    return mHandle == aOther.mHandle;
+  }
+  uint64_t Value() const { return mHandle; }
+
+ private:
+  uint64_t mHandle;
+};
+
+class CompositableHandle final {
+  friend struct IPC::ParamTraits<mozilla::layers::CompositableHandle>;
+
+ public:
+  static CompositableHandle GetNext();
+
+  CompositableHandle() : mHandle(0) {}
+  CompositableHandle(const CompositableHandle& aOther) = default;
+  explicit CompositableHandle(uint64_t aHandle) : mHandle(aHandle) {}
+  bool IsValid() const { return mHandle != 0; }
+  explicit operator bool() const { return IsValid(); }
+  explicit operator uint64_t() const { return mHandle; }
+  bool operator==(const CompositableHandle& aOther) const {
+    return mHandle == aOther.mHandle;
+  }
+  bool operator!=(const CompositableHandle& aOther) const {
+    return !(*this == aOther);
+  }
+  uint64_t Value() const { return mHandle; }
+
+ private:
+  uint64_t mHandle;
+};
+
+enum class CompositableHandleOwner : uint8_t {
+  WebRenderBridge,
+  ImageBridge,
+};
+
+struct RemoteTextureId {
+  uint64_t mId = 0;
+
+  auto MutTiedFields() { return std::tie(mId); }
+
+  static RemoteTextureId GetNext();
+
+  static constexpr RemoteTextureId Max() { return RemoteTextureId{UINT64_MAX}; }
+
+  bool IsValid() const { return mId != 0; }
+
+  explicit operator uint64_t() const { return mId; }
+
+  bool operator<(const RemoteTextureId& aOther) const {
+    return mId < aOther.mId;
+  }
+
+  bool operator>(const RemoteTextureId& aOther) const {
+    return mId > aOther.mId;
+  }
+
+  bool operator==(const RemoteTextureId& aOther) const {
+    return mId == aOther.mId;
+  }
+
+  bool operator!=(const RemoteTextureId& aOther) const {
+    return !(*this == aOther);
+  }
+
+  bool operator>=(const RemoteTextureId& aOther) const {
+    return mId >= aOther.mId;
+  }
+
+  struct HashFn {
+    std::size_t operator()(const RemoteTextureId aKey) const {
+      return std::hash<uint64_t>{}(aKey.mId);
+    }
+  };
+};
+
+struct RemoteTextureOwnerId {
+  uint64_t mId = 0;
+
+  auto MutTiedFields() { return std::tie(mId); }
+
+  static RemoteTextureOwnerId GetNext();
+
+  bool IsValid() const { return mId != 0; }
+
+  explicit operator uint64_t() const { return mId; }
+
+  bool operator<(const RemoteTextureOwnerId& aOther) const {
+    return mId < aOther.mId;
+  }
+
+  bool operator==(const RemoteTextureOwnerId& aOther) const {
+    return mId == aOther.mId;
+  }
+
+  bool operator!=(const RemoteTextureOwnerId& aOther) const {
+    return !(*this == aOther);
+  }
+
+  struct HashFn {
+    std::size_t operator()(const RemoteTextureOwnerId aKey) const {
+      return std::hash<uint64_t>{}(aKey.mId);
+    }
+  };
+};
+
+struct SurfaceDescriptorRemoteDecoderId {
+  uint64_t mId = 0;
+
+  auto MutTiedFields() { return std::tie(mId); }
+
+  static SurfaceDescriptorRemoteDecoderId GetNext();
+
+  bool IsValid() const { return mId != 0; }
+
+  explicit operator uint64_t() const { return mId; }
+
+  bool operator<(const SurfaceDescriptorRemoteDecoderId& aOther) const {
+    return mId < aOther.mId;
+  }
+
+  bool operator==(const SurfaceDescriptorRemoteDecoderId& aOther) const {
+    return mId == aOther.mId;
+  }
+
+  bool operator!=(const SurfaceDescriptorRemoteDecoderId& aOther) const {
+    return !(*this == aOther);
+  }
+
+  struct HashFn {
+    std::size_t operator()(const SurfaceDescriptorRemoteDecoderId aKey) const {
+      return std::hash<uint64_t>{}(aKey.mId);
+    }
+  };
+};
+
+typedef uint32_t RemoteTextureTxnType;
+typedef uint64_t RemoteTextureTxnId;
+
+struct GpuProcessTextureId {
+  uint64_t mId = 0;
+
+  static GpuProcessTextureId GetNext();
+
+  bool IsValid() const { return mId != 0; }
+
+  explicit operator uint64_t() const { return mId; }
+
+  bool operator==(const GpuProcessTextureId& aOther) const {
+    return mId == aOther.mId;
+  }
+
+  bool operator!=(const GpuProcessTextureId& aOther) const {
+    return !(*this == aOther);
+  }
+
+  struct HashFn {
+    std::size_t operator()(const GpuProcessTextureId aKey) const {
+      return std::hash<uint64_t>{}(aKey.mId);
+    }
+  };
+};
+
+struct CompositeProcessFencesHolderId {
+  uint64_t mId = 0;
+
+  static CompositeProcessFencesHolderId GetNext();
+
+  bool IsValid() const { return mId != 0; }
+
+  explicit operator uint64_t() const { return mId; }
+
+  bool operator==(const CompositeProcessFencesHolderId& aOther) const {
+    return mId == aOther.mId;
+  }
+
+  bool operator!=(const CompositeProcessFencesHolderId& aOther) const {
+    return !(*this == aOther);
+  }
+
+  struct HashFn {
+    std::size_t operator()(const CompositeProcessFencesHolderId aKey) const {
+      return std::hash<uint64_t>{}(aKey.mId);
+    }
+  };
+};
+
+struct GpuProcessAndroidImageReaderId {
+  uint64_t mId = 0;
+
+  static GpuProcessAndroidImageReaderId GetNext();
+
+  bool IsValid() const { return mId != 0; }
+
+  explicit operator uint64_t() const { return mId; }
+
+  bool operator==(const GpuProcessAndroidImageReaderId& aOther) const {
+    return mId == aOther.mId;
+  }
+
+  bool operator!=(const GpuProcessAndroidImageReaderId& aOther) const {
+    return !(*this == aOther);
+  }
+
+  struct HashFn {
+    std::size_t operator()(const GpuProcessAndroidImageReaderId aKey) const {
+      return std::hash<uint64_t>{}(aKey.mId);
+    }
+  };
+};
+
+struct AndroidMediaCodecFrameId {
+  uint64_t mId = 0;
+
+  static AndroidMediaCodecFrameId GetNext();
+
+  bool IsValid() const { return mId != 0; }
+
+  explicit operator uint64_t() const { return mId; }
+
+  bool operator==(const AndroidMediaCodecFrameId& aOther) const {
+    return mId == aOther.mId;
+  }
+
+  bool operator!=(const AndroidMediaCodecFrameId& aOther) const {
+    return !(*this == aOther);
+  }
+
+  struct HashFn {
+    std::size_t operator()(const AndroidMediaCodecFrameId aKey) const {
+      return std::hash<uint64_t>{}(aKey.mId);
+    }
+  };
+};
+
+// clang-format off
+MOZ_DEFINE_ENUM_CLASS_WITH_BASE(ScrollDirection, uint8_t, (
+  eVertical,
+  eHorizontal
+));
+
+std::ostream& operator<<(std::ostream& os, ScrollDirection aDirection);
+
+using ScrollDirections = EnumSet<ScrollDirection, uint8_t>;
+
+constexpr ScrollDirections EitherScrollDirection(ScrollDirection::eVertical,ScrollDirection::eHorizontal);
+constexpr ScrollDirections HorizontalScrollDirection(ScrollDirection::eHorizontal);
+constexpr ScrollDirections VerticalScrollDirection(ScrollDirection::eVertical);
+
+template <typename Point>
+ScrollDirections DirectionsInDelta(const Point& aDelta) {
+  ScrollDirections result;
+  if (aDelta.x != 0) {
+    result += ScrollDirection::eHorizontal;
+  }
+  if (aDelta.y != 0) {
+    result += ScrollDirection::eVertical;
+  }
+  return result;
+}
+
+MOZ_DEFINE_ENUM_CLASS_WITH_BASE(CompositionPayloadType, uint8_t, (
+  eKeyPress,
+
+  eAPZScroll,
+
+  eAPZPinchZoom,
+
+  eContentPaint,
+
+  eMouseUpFollowedByClick
+));
+// clang-format on
+
+extern const char* kCompositionPayloadTypeNames[kCompositionPayloadTypeCount];
+
+struct CompositionPayload {
+  bool operator==(const CompositionPayload& aOther) const {
+    return mType == aOther.mType && mTimeStamp == aOther.mTimeStamp;
+  }
+  CompositionPayloadType mType;
+  TimeStamp mTimeStamp;
+};
+
+}  
+}  
+
+#endif /* GFX_LAYERSTYPES_H */

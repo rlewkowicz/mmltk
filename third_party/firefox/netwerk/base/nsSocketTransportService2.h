@@ -1,0 +1,244 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(nsSocketTransportService2_h_)
+#define nsSocketTransportService2_h_
+
+#include "PollableEvent.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/LinkedList.h"
+#include "mozilla/Logging.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/RWLock.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/Queue.h"
+
+#include "mozilla/UniquePtr.h"
+#include "mozilla/net/DashboardTypes.h"
+#include "nsCOMPtr.h"
+#include "nsASocketHandler.h"
+#include "nsIDirectTaskDispatcher.h"
+#include "nsIObserver.h"
+#include "nsIRunnable.h"
+#include "nsIThreadInternal.h"
+#include "nsITimer.h"
+#include "nsPISocketTransportService.h"
+#include "prinit.h"
+#include "prinrval.h"
+
+struct PRPollDesc;
+class nsIPrefBranch;
+
+
+namespace mozilla {
+namespace net {
+
+extern LazyLogModule gSocketTransportLog;
+#define SOCKET_LOG(args) MOZ_LOG(gSocketTransportLog, LogLevel::Debug, args)
+#define SOCKET_LOG1(args) MOZ_LOG(gSocketTransportLog, LogLevel::Error, args)
+#define SOCKET_LOG_ENABLED() MOZ_LOG_TEST(gSocketTransportLog, LogLevel::Debug)
+
+extern LazyLogModule gUDPSocketLog;
+#define UDPSOCKET_LOG(args) MOZ_LOG(gUDPSocketLog, LogLevel::Debug, args)
+#define UDPSOCKET_LOG_ENABLED() MOZ_LOG_TEST(gUDPSocketLog, LogLevel::Debug)
+
+
+#define NS_SOCKET_POLL_TIMEOUT PR_INTERVAL_NO_TIMEOUT
+
+
+static const int32_t kMaxTCPKeepIdle = 32767;  
+static const int32_t kMaxTCPKeepIntvl = 32767;
+static const int32_t kMaxTCPKeepCount = 127;
+static const int32_t kDefaultTCPKeepCount =
+    4;  
+
+class LinkedRunnableEvent final
+    : public LinkedListElement<LinkedRunnableEvent> {
+ public:
+  explicit LinkedRunnableEvent(nsIRunnable* event) : mEvent(event) {}
+  ~LinkedRunnableEvent() = default;
+
+  already_AddRefed<nsIRunnable> TakeEvent() { return mEvent.forget(); }
+
+ private:
+  nsCOMPtr<nsIRunnable> mEvent;
+};
+
+
+class nsSocketTransportService final : public nsPISocketTransportService,
+                                       public nsISerialEventTarget,
+                                       public nsIThreadObserver,
+                                       public nsIRunnable,
+                                       public nsIObserver,
+                                       public nsINamed,
+                                       public nsIDirectTaskDispatcher {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSPISOCKETTRANSPORTSERVICE
+  NS_DECL_NSISOCKETTRANSPORTSERVICE
+  NS_DECL_NSIROUTEDSOCKETTRANSPORTSERVICE
+  NS_DECL_NSIEVENTTARGET_FULL
+  NS_DECL_NSITHREADOBSERVER
+  NS_DECL_NSIRUNNABLE
+  NS_DECL_NSIOBSERVER
+  NS_DECL_NSINAMED
+  NS_DECL_NSIDIRECTTASKDISPATCHER
+
+  static const uint32_t SOCKET_LIMIT_MIN = 50U;
+
+  nsSocketTransportService();
+
+  static uint32_t gMaxCount;
+  static PRCallOnceType gMaxCountInitOnce;
+  static PRStatus DiscoverMaxCount();
+
+  bool CanAttachSocket();
+
+  void GetSocketConnections(nsTArray<SocketInfo>*);
+  uint64_t GetSentBytes() { return mSentBytesCount; }
+  uint64_t GetReceivedBytes() { return mReceivedBytesCount; }
+
+  bool IsKeepaliveEnabled() { return mKeepaliveEnabledPref; }
+
+  PRIntervalTime MaxTimeForPrClosePref() { return mMaxTimeForPrClosePref; }
+
+  void ApplyPortRemap(uint16_t* aPort);
+
+  bool UpdatePortRemapPreference(nsACString const& aPortMappingPref);
+
+ protected:
+  ~nsSocketTransportService();
+
+ private:
+
+  nsIThread* mRawThread{nullptr};
+
+  already_AddRefed<nsIThread> GetThreadSafely();
+  already_AddRefed<nsIDirectTaskDispatcher> GetDirectTaskDispatcherSafely();
+
+ public:
+  already_AddRefed<nsIThread> GetSocketThread() { return GetThreadSafely(); }
+
+ private:
+
+  Atomic<bool> mInitialized{false};
+  Atomic<bool> mShuttingDown{false};
+
+  Mutex mLock{"nsSocketTransportService::mLock"};
+
+  nsCOMPtr<nsIThread> mThread MOZ_GUARDED_BY(mLock);
+  nsCOMPtr<nsIDirectTaskDispatcher> mDirectTaskDispatcher MOZ_GUARDED_BY(mLock);
+  UniquePtr<PollableEvent> mPollableEvent MOZ_GUARDED_BY(mLock);
+  bool mOffline MOZ_GUARDED_BY(mLock) = false;
+  bool mGoingOffline MOZ_GUARDED_BY(mLock) = false;
+
+  void Reset(bool aGuardLocals);
+
+  nsresult ShutdownThread();
+
+
+  class SocketContext {
+   public:
+    SocketContext(PRFileDesc* aFD, already_AddRefed<nsASocketHandler> aHandler,
+                  PRIntervalTime aPollStartEpoch)
+        : mFD(aFD), mHandler(aHandler), mPollStartEpoch(aPollStartEpoch) {}
+    SocketContext(PRFileDesc* aFD, nsASocketHandler* aHandler,
+                  PRIntervalTime aPollStartEpoch)
+        : mFD(aFD), mHandler(aHandler), mPollStartEpoch(aPollStartEpoch) {}
+    ~SocketContext() = default;
+
+    bool IsTimedOut(PRIntervalTime now) const;
+    void EnsureTimeout(PRIntervalTime now);
+    void DisengageTimeout();
+    PRIntervalTime TimeoutIn(PRIntervalTime now) const;
+    void MaybeResetEpoch();
+
+    PRFileDesc* mFD;
+    RefPtr<nsASocketHandler> mHandler;
+    PRIntervalTime mPollStartEpoch;  
+  };
+
+  using SocketContextList = AutoTArray<SocketContext, SOCKET_LIMIT_MIN>;
+  int64_t SockIndex(SocketContextList& aList, SocketContext* aSock);
+
+  SocketContextList mActiveList;
+  SocketContextList mIdleList;
+
+  nsresult DetachSocket(SocketContextList& listHead, SocketContext*);
+  void AddToIdleList(SocketContext* sock);
+  void AddToPollList(SocketContext* sock);
+  void RemoveFromIdleList(SocketContext* sock);
+  void RemoveFromPollList(SocketContext* sock);
+  void MoveToIdleList(SocketContext* sock);
+  void MoveToPollList(SocketContext* sock);
+
+  void InitMaxCount();
+
+  uint64_t mSentBytesCount{0};
+  uint64_t mReceivedBytesCount{0};
+
+  nsTArray<PRPollDesc> mPollList;
+
+  PRIntervalTime PollTimeout(
+      PRIntervalTime now);  
+  nsresult DoPollIteration();
+  int32_t Poll(PRIntervalTime ts);
+
+  AutoCleanLinkedList<LinkedRunnableEvent> mPendingSocketQueue;
+
+  Queue<RefPtr<nsIRunnable>> mPriorityEventQueue MOZ_GUARDED_BY(mQueueLock);
+  RWLock mQueueLock{"nsSocketTransportService::mQueueLock"};
+
+  nsresult UpdatePrefs();
+  static void UpdatePrefs(const char* aPref, void* aSelf);
+  void UpdateSendBufferPref();
+  int32_t mSendBufferSize{0};
+  int32_t mKeepaliveIdleTimeS{600};
+  int32_t mKeepaliveRetryIntervalS{1};
+  int32_t mKeepaliveProbeCount{kDefaultTCPKeepCount};
+  Atomic<bool, Relaxed> mKeepaliveEnabledPref{false};
+  TimeDuration mPollableEventTimeout MOZ_GUARDED_BY(mLock);
+
+  Atomic<bool> mServingPendingQueue{false};
+  Atomic<int32_t, Relaxed> mMaxTimePerPollIter{100};
+  Atomic<PRIntervalTime, Relaxed> mMaxTimeForPrClosePref;
+  Atomic<PRIntervalTime, Relaxed> mLastNetworkLinkChangeTime{0};
+  Atomic<PRIntervalTime, Relaxed> mNetworkLinkChangeBusyWaitPeriod;
+  Atomic<PRIntervalTime, Relaxed> mNetworkLinkChangeBusyWaitTimeout;
+
+  Atomic<bool, Relaxed> mSleepPhase{false};
+  nsCOMPtr<nsITimer> mAfterWakeUpTimer;
+
+  using TPortRemapping =
+      CopyableTArray<std::tuple<uint16_t, uint16_t, uint16_t>>;
+  Maybe<TPortRemapping> mPortRemapping;
+
+  void ApplyPortRemapPreference(TPortRemapping const& portRemapping);
+
+  void OnKeepaliveEnabledPrefChange();
+  void NotifyKeepaliveEnabledPrefChange(SocketContext* sock);
+
+  void AnalyzeConnection(nsTArray<SocketInfo>* data, SocketContext* context,
+                         bool aActive);
+
+  void ClosePrivateConnections();
+  void DetachSocketWithGuard(bool aGuardLocals, SocketContextList& socketList,
+                             int32_t index);
+
+  void MarkTheLastElementOfPendingQueue();
+
+
+  void TryRepairPollableEvent();
+
+  CopyableTArray<nsCOMPtr<nsISTSShutdownObserver>> mShutdownObservers;
+};
+
+extern nsSocketTransportService* gSocketTransportService;
+bool OnSocketThread();
+
+}  
+}  
+
+#endif

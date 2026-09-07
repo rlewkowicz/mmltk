@@ -1,0 +1,313 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "HighlightRegistry.h"
+
+#include "Document.h"
+#include "Highlight.h"
+#include "PresShell.h"
+#include "mozilla/CompactPair.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/dom/HighlightBinding.h"
+#include "mozilla/dom/HighlightRegistryBinding.h"
+#include "nsAtom.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsFrameSelection.h"
+#include "nsIContentInlines.h"
+
+namespace mozilla::dom {
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(HighlightRegistry)
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(HighlightRegistry)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mDocument)
+  for (auto const& iter : tmp->mHighlightsOrdered) {
+    iter.second()->RemoveFromHighlightRegistry(*tmp, *iter.first());
+  }
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mHighlightsOrdered)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_PRESERVED_WRAPPER
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(HighlightRegistry)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mDocument)
+  for (size_t i = 0; i < tmp->mHighlightsOrdered.Length(); ++i) {
+    NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mHighlightsOrdered[i].second())
+  }
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(HighlightRegistry)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(HighlightRegistry)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(HighlightRegistry)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+HighlightRegistry::HighlightRegistry(Document* aDocument)
+    : mDocument(aDocument) {}
+
+HighlightRegistry::~HighlightRegistry() {
+  for (auto const& iter : mHighlightsOrdered) {
+    iter.second()->RemoveFromHighlightRegistry(*this, *iter.first());
+  }
+}
+
+JSObject* HighlightRegistry::WrapObject(JSContext* aCx,
+                                        JS::Handle<JSObject*> aGivenProto) {
+  return HighlightRegistry_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+void HighlightRegistry::MaybeAddRangeToHighlightSelection(
+    AbstractRange& aRange, Highlight& aHighlight) {
+  RefPtr<nsFrameSelection> frameSelection = GetFrameSelection();
+  if (!frameSelection) {
+    return;
+  }
+  MOZ_ASSERT(frameSelection->GetPresShell());
+  Document* rangeDoc = aRange.GetComposedDocOfContainers();
+  if (rangeDoc && rangeDoc != frameSelection->GetPresShell()->GetDocument()) {
+    return;
+  }
+  for (auto const& iter : mHighlightsOrdered) {
+    if (iter.second() != &aHighlight) {
+      continue;
+    }
+
+    const RefPtr<nsAtom> highlightName = iter.first();
+    frameSelection->AddHighlightSelectionRange(highlightName, aHighlight,
+                                               aRange);
+  }
+}
+
+void HighlightRegistry::MaybeRemoveRangeFromHighlightSelection(
+    AbstractRange& aRange, Highlight& aHighlight) {
+  RefPtr<nsFrameSelection> frameSelection = GetFrameSelection();
+  if (!frameSelection) {
+    return;
+  }
+  MOZ_ASSERT(frameSelection->GetPresShell());
+
+  for (auto const& iter : mHighlightsOrdered) {
+    if (iter.second() != &aHighlight) {
+      continue;
+    }
+
+    const RefPtr<nsAtom> highlightName = iter.first();
+    frameSelection->RemoveHighlightSelectionRange(highlightName, aRange);
+  }
+}
+
+void HighlightRegistry::RemoveHighlightSelection(Highlight& aHighlight) {
+  RefPtr<nsFrameSelection> frameSelection = GetFrameSelection();
+  if (!frameSelection) {
+    return;
+  }
+  for (auto const& iter : mHighlightsOrdered) {
+    if (iter.second() != &aHighlight) {
+      continue;
+    }
+
+    const RefPtr<nsAtom> highlightName = iter.first();
+    frameSelection->RemoveHighlightSelection(highlightName);
+  }
+}
+
+void HighlightRegistry::RepaintHighlightSelection(Highlight& aHighlight) {
+  RefPtr<nsFrameSelection> frameSelection = GetFrameSelection();
+  if (!frameSelection) {
+    return;
+  }
+  for (auto const& iter : mHighlightsOrdered) {
+    if (iter.second() != &aHighlight) {
+      continue;
+    }
+
+    const RefPtr<nsAtom> highlightName = iter.first();
+    frameSelection->RepaintHighlightSelection(highlightName);
+  }
+}
+
+void HighlightRegistry::RepaintAllHighlightSelections() {
+  if (mHighlightsOrdered.IsEmpty()) {
+    return;
+  }
+  RefPtr<nsFrameSelection> frameSelection = GetFrameSelection();
+  if (!frameSelection) {
+    return;
+  }
+  for (auto const& iter : mHighlightsOrdered) {
+    frameSelection->RepaintHighlightSelection(iter.first());
+  }
+}
+
+void HighlightRegistry::AddHighlightSelectionsToFrameSelection() {
+  if (mHighlightsOrdered.IsEmpty()) {
+    return;
+  }
+  RefPtr<nsFrameSelection> frameSelection = GetFrameSelection();
+  if (!frameSelection) {
+    return;
+  }
+  for (auto const& iter : mHighlightsOrdered) {
+    RefPtr<nsAtom> highlightName = iter.first();
+    RefPtr<Highlight> highlight = iter.second();
+    frameSelection->AddHighlightSelection(highlightName, *highlight);
+  }
+}
+
+HighlightRegistry* HighlightRegistry::Set(const nsAString& aKey,
+                                          Highlight& aValue, ErrorResult& aRv) {
+  const bool highlightAlreadyPresent =
+      HighlightRegistry_Binding::MaplikeHelpers::Has(this, aKey, aRv);
+  if (aRv.Failed()) {
+    return this;
+  }
+  HighlightRegistry_Binding::MaplikeHelpers::Set(this, aKey, aValue, aRv);
+  if (aRv.Failed()) {
+    return this;
+  }
+  RefPtr<nsFrameSelection> frameSelection = GetFrameSelection();
+  RefPtr<nsAtom> highlightNameAtom = NS_AtomizeMainThread(aKey);
+  if (highlightAlreadyPresent) {
+    auto foundIter =
+        std::find_if(mHighlightsOrdered.begin(), mHighlightsOrdered.end(),
+                     [&highlightNameAtom](auto const& aElm) {
+                       return aElm.first() == highlightNameAtom;
+                     });
+    MOZ_ASSERT(foundIter != mHighlightsOrdered.end(),
+               "webIDL maplike and DOM mirror are not in sync");
+    foundIter->second()->RemoveFromHighlightRegistry(*this, *highlightNameAtom);
+    if (frameSelection) {
+      frameSelection->RemoveHighlightSelection(highlightNameAtom);
+    }
+    foundIter->second() = &aValue;
+  } else {
+    mHighlightsOrdered.AppendElement(
+        CompactPair<RefPtr<nsAtom>, RefPtr<Highlight>>(highlightNameAtom,
+                                                       &aValue));
+  }
+  aValue.AddToHighlightRegistry(*this, *highlightNameAtom);
+  if (frameSelection) {
+    frameSelection->AddHighlightSelection(highlightNameAtom, aValue);
+  }
+  return this;
+}
+
+void HighlightRegistry::Clear(ErrorResult& aRv) {
+  HighlightRegistry_Binding::MaplikeHelpers::Clear(this, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+  auto frameSelection = GetFrameSelection();
+  AutoFrameSelectionBatcher batcher(__FUNCTION__);
+  batcher.AddFrameSelection(frameSelection);
+  for (auto const& iter : mHighlightsOrdered) {
+    const RefPtr<nsAtom>& highlightName = iter.first();
+    const RefPtr<Highlight>& highlight = iter.second();
+    highlight->RemoveFromHighlightRegistry(*this, *highlightName);
+    if (frameSelection) {
+      frameSelection->RemoveHighlightSelection(MOZ_KnownLive(highlightName));
+    }
+  }
+
+  mHighlightsOrdered.Clear();
+}
+
+bool HighlightRegistry::Delete(const nsAString& aKey, ErrorResult& aRv) {
+  if (!HighlightRegistry_Binding::MaplikeHelpers::Delete(this, aKey, aRv)) {
+    return false;
+  }
+  RefPtr<nsAtom> highlightNameAtom = NS_AtomizeMainThread(aKey);
+  auto foundIter =
+      std::find_if(mHighlightsOrdered.cbegin(), mHighlightsOrdered.cend(),
+                   [&highlightNameAtom](auto const& aElm) {
+                     return aElm.first() == highlightNameAtom;
+                   });
+  MOZ_ASSERT(foundIter != mHighlightsOrdered.cend(),
+             "HighlightRegistry: maplike and internal data are out of sync!");
+
+  RefPtr<Highlight> highlight = foundIter->second();
+  mHighlightsOrdered.RemoveElementAt(foundIter);
+
+  if (auto frameSelection = GetFrameSelection()) {
+    frameSelection->RemoveHighlightSelection(highlightNameAtom);
+  }
+  highlight->RemoveFromHighlightRegistry(*this, *highlightNameAtom);
+  return true;
+}
+
+void HighlightRegistry::HighlightsFromPoint(
+    float aX, float aY, const HighlightsFromPointOptions& aOptions,
+    nsTArray<HighlightHitResult>& aResult) {
+  MOZ_ASSERT(mDocument);
+  if (mHighlightsOrdered.IsEmpty()) {
+    return;
+  }
+
+  if (aX < 0.0 || aY < 0.0) {
+    return;
+  }
+  if (const auto* presShell = mDocument->GetPresShell()) {
+    const nscoord xAsAppUnit = nsPresContext::CSSPixelsToAppUnits(aX);
+    const nscoord yAsAppUnit = nsPresContext::CSSPixelsToAppUnits(aY);
+    if (xAsAppUnit > presShell->GetLayoutViewportSize().Width() ||
+        yAsAppUnit > presShell->GetLayoutViewportSize().Height()) {
+      return;
+    }
+  } else {
+    return;
+  }
+
+  mDocument->FlushPendingNotifications(FlushType::Layout);
+
+  const RefPtr<Element> topmostElement = mDocument->ElementFromPointHelper(
+      aX, aY,  false,
+       false, ViewportType::Layout,
+       false);
+  if (topmostElement) {
+    if (ShadowRoot* const pointShadowRoot =
+            topmostElement->GetContainingShadowForSelection()) {
+      if (!aOptions.mShadowRoots.Contains(pointShadowRoot)) {
+        return;
+      }
+    }
+  }
+
+  for (const auto& namedHighlight : Reversed(mHighlightsOrdered)) {
+    const auto& highlight = namedHighlight.second();
+    nsTArray<RefPtr<AbstractRange>> rangesAtPoint =
+        highlight->RangesAtPoint(aX, aY, aOptions.mShadowRoots, topmostElement);
+    if (!rangesAtPoint.IsEmpty()) {
+      HighlightHitResult highlightHitResult;
+      highlightHitResult.mHighlight.Construct(*highlight);
+      highlightHitResult.mRanges.Construct();
+      const bool success = highlightHitResult.mRanges.Value().SetCapacity(
+          rangesAtPoint.Length(), mozilla::fallible);
+      if (!success) {
+        return;
+      }
+      for (auto& range : rangesAtPoint) {
+        (void)highlightHitResult.mRanges.Value().EmplaceBack(mozilla::fallible,
+                                                             *range);
+      }
+      aResult.AppendElement(highlightHitResult);
+    }
+  }
+
+  aResult.StableSort(
+      [](const HighlightHitResult& el1, const HighlightHitResult& el2) {
+        const int32_t p1 = el1.mHighlight.Value().Priority();
+        const int32_t p2 = el2.mHighlight.Value().Priority();
+        if (p2 > p1) return 1;
+        if (p2 < p1) return -1;
+        return 0;
+      });
+}
+
+RefPtr<nsFrameSelection> HighlightRegistry::GetFrameSelection() {
+  return RefPtr<nsFrameSelection>(
+      mDocument->GetPresShell() ? mDocument->GetPresShell()->FrameSelection()
+                                : nullptr);
+}
+
+}  

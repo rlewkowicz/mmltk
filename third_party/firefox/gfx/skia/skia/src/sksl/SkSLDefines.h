@@ -1,0 +1,39 @@
+/*
+ * Copyright 2019 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SKSL_DEFINES)
+#define SKSL_DEFINES
+
+#include <cstdint>
+
+#include "include/core/SkTypes.h"
+#include "include/private/base/SkTArray.h"
+
+using SKSL_INT = int64_t;
+using SKSL_FLOAT = float;
+
+namespace SkSL {
+
+class Expression;
+class Statement;
+
+class ExpressionArray : public skia_private::STArray<2, std::unique_ptr<Expression>> {
+public:
+    using STArray::STArray;
+
+    ExpressionArray clone() const;
+};
+
+using StatementArray = skia_private::STArray<2, std::unique_ptr<Statement>>;
+
+static constexpr int kDefaultInlineThreshold = 50;
+
+static constexpr int kVariableSlotLimit = 100000;
+
+}  
+
+#endif

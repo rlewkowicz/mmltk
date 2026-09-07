@@ -1,0 +1,1390 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+// Copyright 2019 the V8 project authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(RegexpShim_h)
+#define RegexpShim_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/MathAlgorithms.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/SegmentedVector.h"
+#include "mozilla/Sprintf.h"
+
+#include <algorithm>
+#include <bit>
+#include <optional>
+#include <ostream>
+
+#include "irregexp/RegExpTypes.h"
+#include "irregexp/util/BitFieldShim.h"
+#include "irregexp/util/BitVectorShim.h"
+#include "irregexp/util/FlagsShim.h"
+#include "irregexp/util/VectorShim.h"
+#include "irregexp/util/ZoneShim.h"
+#include "jit/JitCode.h"
+#include "jit/Label.h"
+#include "jit/shared/Assembler-shared.h"
+#include "js/friend/StackLimits.h"  // js::AutoCheckRecursionLimit
+#include "js/RegExpFlags.h"
+#include "js/Value.h"
+#include "threading/ExclusiveData.h"
+#include "vm/JSContext.h"
+#include "vm/MutexIDs.h"
+#include "vm/NativeObject.h"
+#include "vm/RegExpShared.h"
+
+namespace js::jit {
+class MacroAssembler;
+}
+
+namespace v8 {
+namespace internal {
+
+class Heap;
+class Isolate;
+class RegExpMatchInfo;
+
+namespace regexp {
+class Stack;
+class SMRegExpMacroAssembler;
+class Utils;
+}  
+
+using MacroAssembler = ::js::jit::MacroAssembler;
+
+template <typename T>
+class Handle;
+
+}  
+}  
+
+#define V8_WARN_UNUSED_RESULT [[nodiscard]]
+#define V8_EXPORT_PRIVATE
+#define V8_FALLTHROUGH [[fallthrough]]
+#define V8_NODISCARD [[nodiscard]]
+#define V8_NOEXCEPT noexcept
+#define V8_LIFETIME_BOUND /* unsupported */
+#define V8_GSL_POINTER    /* [[gsl::Pointer]] unsupported */
+
+#define V8_LIKELY(x) MOZ_LIKELY(x)
+#define V8_UNLIKELY(x) MOZ_UNLIKELY(x)
+
+#define FATAL(x) MOZ_CRASH(x)
+#define UNREACHABLE() MOZ_CRASH("unreachable code")
+#define UNIMPLEMENTED() MOZ_CRASH("unimplemented code")
+#define STATIC_ASSERT(exp) static_assert(exp, #exp)
+
+#define DCHECK MOZ_ASSERT
+#define DCHECK_EQ(lhs, rhs) MOZ_ASSERT((lhs) == (rhs))
+#define DCHECK_NE(lhs, rhs) MOZ_ASSERT((lhs) != (rhs))
+#define DCHECK_GT(lhs, rhs) MOZ_ASSERT((lhs) > (rhs))
+#define DCHECK_GE(lhs, rhs) MOZ_ASSERT((lhs) >= (rhs))
+#define DCHECK_LT(lhs, rhs) MOZ_ASSERT((lhs) < (rhs))
+#define DCHECK_LE(lhs, rhs) MOZ_ASSERT((lhs) <= (rhs))
+#define DCHECK_NULL(val) MOZ_ASSERT((val) == nullptr)
+#define DCHECK_NOT_NULL(val) MOZ_ASSERT((val) != nullptr)
+#define DCHECK_IMPLIES(lhs, rhs) MOZ_ASSERT_IF(lhs, rhs)
+#define CHECK MOZ_RELEASE_ASSERT
+#define CHECK_EQ(lhs, rhs) MOZ_RELEASE_ASSERT((lhs) == (rhs))
+#define CHECK_NE(lhs, rhs) MOZ_RELEASE_ASSERT((lhs) != (rhs))
+#define CHECK_GT(lhs, rhs) MOZ_RELEASE_ASSERT((lhs) > (rhs))
+#define CHECK_GE(lhs, rhs) MOZ_RELEASE_ASSERT((lhs) >= (rhs))
+#define CHECK_LT(lhs, rhs) MOZ_RELEASE_ASSERT((lhs) < (rhs))
+#define CHECK_LE(lhs, rhs) MOZ_RELEASE_ASSERT((lhs) <= (rhs))
+#define CHECK_IMPLIES(lhs, rhs) MOZ_RELEASE_ASSERT(!(lhs) || (rhs))
+#define CONSTEXPR_DCHECK MOZ_ASSERT
+
+#define SBXCHECK MOZ_ASSERT
+#define SBXCHECK_EQ(lhs, rhs) MOZ_ASSERT((lhs) == (rhs))
+#define SBXCHECK_NE(lhs, rhs) MOZ_ASSERT((lhs) != (rhs))
+#define SBXCHECK_GT(lhs, rhs) MOZ_ASSERT((lhs) > (rhs))
+#define SBXCHECK_GE(lhs, rhs) MOZ_ASSERT((lhs) >= (rhs))
+#define SBXCHECK_LT(lhs, rhs) MOZ_ASSERT((lhs) < (rhs))
+#define SBXCHECK_LE(lhs, rhs) MOZ_ASSERT((lhs) <= (rhs))
+
+#define GET_NTH_ARG(N, ...) CONCAT(GET_NTH_ARG_IMPL_, N)(__VA_ARGS__)
+#define GET_NTH_ARG_IMPL_0(_0, ...) _0
+#define GET_NTH_ARG_IMPL_1(_0, _1, ...) _1
+#define GET_NTH_ARG_IMPL_2(_0, _1, _2, ...) _2
+#define GET_NTH_ARG_IMPL_3(_0, _1, _2, _3, ...) _3
+#define GET_NTH_ARG_IMPL_4(_0, _1, _2, _3, _4, ...) _4
+#define GET_NTH_ARG_IMPL_5(_0, _1, _2, _3, _4, _5, ...) _5
+#define GET_NTH_ARG_IMPL_6(_0, _1, _2, _3, _4, _5, _6, ...) _6
+#define GET_NTH_ARG_IMPL_7(_0, _1, _2, _3, _4, _5, _6, _7, ...) _7
+
+#define IS_VA_EMPTY(...) GET_NTH_ARG(0, __VA_OPT__(false, ) true)
+
+#define CONCAT_(a, ...) a##__VA_ARGS__
+#define CONCAT(a, ...) CONCAT_(a, __VA_ARGS__)
+#define UNPAREN(X) CONCAT(DROP_, UNPAREN_ X)
+#define UNPAREN_(...) UNPAREN_ __VA_ARGS__
+#define DROP_UNPAREN_
+
+#define MemCopy memcpy
+
+#define PROFILE(isolate, event)
+
+#if defined(_MSC_VER)
+#  define V8PRIxPTRDIFF "Ix"
+#  define V8PRIdPTRDIFF "Id"
+#  define V8PRIuPTRDIFF "Iu"
+#else
+#  define V8PRIxPTRDIFF "tx"
+#  define V8PRIdPTRDIFF "td"
+#  define V8PRIuPTRDIFF "tu"
+#endif
+
+#define arraysize(array) (sizeof(ArraySizeHelper(array)))
+
+template <typename T, size_t N>
+char (&ArraySizeHelper(T (&array)[N]))[N];
+template <typename T, size_t N>
+char (&ArraySizeHelper(const T (&array)[N]))[N];
+
+#define DISALLOW_ASSIGN(TypeName) TypeName& operator=(const TypeName&) = delete
+
+#define DISALLOW_COPY_AND_ASSIGN(TypeName) \
+  TypeName(const TypeName&) = delete;      \
+  DISALLOW_ASSIGN(TypeName)
+
+#define DISALLOW_IMPLICIT_CONSTRUCTORS(TypeName) \
+  TypeName() = delete;                           \
+  DISALLOW_COPY_AND_ASSIGN(TypeName)
+
+#define ZONE_NAME __func__
+
+#if defined(JS_CODEGEN_ARM)
+#  define kUnalignedReadSupported !js::jit::ARMFlags::HasAlignmentFault
+#elif defined(JS_CODEGEN_MIPS64)
+#  define kUnalignedReadSupported false
+#else
+#  define kUnalignedReadSupported true
+#endif
+
+namespace v8 {
+
+template <typename T, typename U>
+constexpr inline bool IsAligned(T value, U alignment) {
+  return (value & (alignment - 1)) == 0;
+}
+
+using Address = uintptr_t;
+static const Address kNullAddress = 0;
+
+inline uintptr_t GetCurrentStackPosition() {
+  return reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
+}
+
+template <typename T>
+constexpr T RoundDown(T x, intptr_t m) {
+  static_assert(std::is_integral_v<T>);
+  DCHECK(m != 0 && ((m & (m - 1)) == 0));
+  return x & static_cast<T>(-m);
+}
+template <intptr_t m, typename T>
+constexpr T RoundDown(T x) {
+  static_assert(std::is_integral_v<T>);
+  static_assert(m != 0 && ((m & (m - 1)) == 0));
+  return x & static_cast<T>(-m);
+}
+
+template <typename T>
+constexpr T RoundUp(T x, intptr_t m) {
+  static_assert(std::is_integral_v<T>);
+  DCHECK_GE(x, 0);
+  DCHECK_GE(std::numeric_limits<T>::max() - x, m - 1);  
+  return RoundDown<T>(static_cast<T>(x + (m - 1)), m);
+}
+
+template <intptr_t m, typename T>
+constexpr T RoundUp(T x) {
+  static_assert(std::is_integral_v<T>);
+  DCHECK_GE(x, 0);
+  DCHECK_GE(std::numeric_limits<T>::max() - x, m - 1);  
+  return RoundDown<m, T>(static_cast<T>(x + (m - 1)));
+}
+
+template <typename... Args>
+void USE([[maybe_unused]] Args&&...) {};
+
+namespace base {
+
+using uc16 = char16_t;
+using uc32 = uint32_t;
+
+constexpr int kUC16Size = sizeof(base::uc16);
+
+template <typename Dst, typename Src>
+inline Dst saturated_cast(Src value);
+
+template <>
+inline uint8_t saturated_cast<uint8_t, int>(int x) {
+  return (x >= 0) ? ((x < 255) ? uint8_t(x) : 255) : 0;
+}
+template <>
+inline uint8_t saturated_cast<uint8_t, uint32_t>(uint32_t x) {
+  return (x < 255) ? uint8_t(x) : 255;
+}
+
+template <typename T, typename U>
+inline constexpr bool IsInRange(T value, U lower_limit, U higher_limit) {
+  using unsigned_T = std::make_unsigned_t<T>;
+  return static_cast<unsigned_T>(static_cast<unsigned_T>(value) -
+                                 static_cast<unsigned_T>(lower_limit)) <=
+         static_cast<unsigned_T>(static_cast<unsigned_T>(higher_limit) -
+                                 static_cast<unsigned_T>(lower_limit));
+}
+
+#define LAZY_INSTANCE_INITIALIZER \
+  {                               \
+  }
+
+template <typename T>
+class LazyInstanceImpl {
+ public:
+  LazyInstanceImpl() : value_(js::mutexid::IrregexpLazyStatic) {}
+
+  const T* Pointer() {
+    auto val = value_.lock();
+    if (val->isNothing()) {
+      val->emplace();
+    }
+    return val->ptr();
+  }
+
+ private:
+  js::ExclusiveData<mozilla::Maybe<T>> value_;
+};
+
+template <typename T>
+class LazyInstance {
+ public:
+  using type = LazyInstanceImpl<T>;
+};
+
+template <typename T>
+class LeakyObject {
+ public:
+  template <typename... Args>
+  explicit LeakyObject(Args&&... args) {
+    new (storage_) T(std::forward<Args>(args)...);
+  }
+
+  LeakyObject(const LeakyObject&) = delete;
+  LeakyObject& operator=(const LeakyObject&) = delete;
+
+  T* get() { return reinterpret_cast<T*>(storage_); }
+
+ private:
+  alignas(T) char storage_[sizeof(T)];
+};
+
+#define DEFINE_LAZY_LEAKY_OBJECT_GETTER(T, FunctionName, ...) \
+  T* FunctionName() {                                         \
+    static ::v8::base::LeakyObject<T> object{__VA_ARGS__};    \
+    return object.get();                                      \
+  }
+
+inline int HexValue(base::uc32 c) {
+  c -= '0';
+  if (static_cast<unsigned>(c) <= 9) return c;
+  c = (c | 0x20) - ('a' - '0');  
+  if (static_cast<unsigned>(c) <= 5) return c + 10;
+  return -1;
+}
+
+template <typename... Args>
+[[nodiscard]] uint32_t hash_combine(uint32_t aHash, Args... aArgs) {
+  return mozilla::AddToHash(aHash, aArgs...);
+}
+
+namespace bits {
+
+inline uint64_t CountTrailingZeros(uint64_t value) {
+  return std::countr_zero(value);
+}
+
+inline constexpr size_t RoundUpToPowerOfTwo32(size_t value) {
+  return mozilla::RoundUpPow2(value);
+}
+
+inline constexpr size_t RoundUpToPowerOfTwo(size_t value) {
+  return mozilla::RoundUpPow2(value);
+}
+
+template <typename T>
+constexpr bool IsPowerOfTwo(T value) {
+  return std::has_single_bit(value);
+}
+
+constexpr uint32_t CountPopulation(uint32_t value) {
+  return std::popcount(value);
+}
+
+}  
+
+namespace internal {
+
+template <typename T>
+class CheckedNumeric : public mozilla::CheckedInt<T> {
+ public:
+  template <typename U>
+  MOZ_IMPLICIT constexpr CheckedNumeric(U val) : mozilla::CheckedInt<T>(val) {}
+
+  template <typename Dst>
+  bool AssignIfValid(Dst* result) const {
+    if (MOZ_LIKELY(this->isValid() && std::in_range<Dst>(this->value()))) {
+      *result = this->value();
+      return true;
+    }
+    return false;
+  }
+};
+
+}  
+
+}  
+
+namespace unibrow {
+
+using uchar = unsigned int;
+
+class Latin1 {
+ public:
+  static const base::uc16 kMaxChar = 0xff;
+
+  static inline base::uc16 TryConvertToLatin1(base::uc16 c) {
+    if (c == 0x039C || c == 0x03BC) {
+      return 0xB5;
+    }
+    if (c == 0x0178) {
+      return 0xFF;
+    }
+    return c;
+  }
+};
+
+class Utf16 {
+ public:
+  static inline bool IsLeadSurrogate(int code) {
+    return js::unicode::IsLeadSurrogate(code);
+  }
+  static inline bool IsTrailSurrogate(int code) {
+    return js::unicode::IsTrailSurrogate(code);
+  }
+  static inline base::uc16 LeadSurrogate(uint32_t char_code) {
+    return js::unicode::LeadSurrogate(char_code);
+  }
+  static inline base::uc16 TrailSurrogate(uint32_t char_code) {
+    return js::unicode::TrailSurrogate(char_code);
+  }
+  static inline uint32_t CombineSurrogatePair(char16_t lead, char16_t trail) {
+    return js::unicode::UTF16Decode(lead, trail);
+  }
+  static const uchar kMaxNonSurrogateCharCode = 0xffff;
+};
+
+#if !defined(V8_INTL_SUPPORT)
+
+template <class T, int size = 256>
+class Mapping {
+ public:
+  inline Mapping() = default;
+  inline int get(uchar c, uchar n, uchar* result) {
+    CacheEntry entry = entries_[c & kMask];
+    if (entry.code_point_ == c) {
+      if (entry.offset_ == 0) {
+        return 0;
+      } else {
+        result[0] = c + entry.offset_;
+        return 1;
+      }
+    } else {
+      return CalculateValue(c, n, result);
+    }
+  }
+
+ private:
+  int CalculateValue(uchar c, uchar n, uchar* result) {
+    bool allow_caching = true;
+    int length = T::Convert(c, n, result, &allow_caching);
+    if (allow_caching) {
+      if (length == 1) {
+        entries_[c & kMask] = CacheEntry(c, result[0] - c);
+        return 1;
+      } else {
+        entries_[c & kMask] = CacheEntry(c, 0);
+        return 0;
+      }
+    } else {
+      return length;
+    }
+  }
+
+  struct CacheEntry {
+    inline CacheEntry() : code_point_(kNoChar), offset_(0) {}
+    inline CacheEntry(uchar code_point, signed offset)
+        : code_point_(code_point), offset_(offset) {}
+    uchar code_point_;
+    signed offset_;
+    static const int kNoChar = (1 << 21) - 1;
+  };
+  static const int kSize = size;
+  static const int kMask = kSize - 1;
+  CacheEntry entries_[kSize];
+};
+
+struct Ecma262Canonicalize {
+  static const int kMaxWidth = 1;
+  static int Convert(uchar c, uchar n, uchar* result, bool* allow_caching_ptr);
+};
+struct Ecma262UnCanonicalize {
+  static const int kMaxWidth = 4;
+  static int Convert(uchar c, uchar n, uchar* result, bool* allow_caching_ptr);
+};
+struct CanonicalizationRange {
+  static const int kMaxWidth = 1;
+  static int Convert(uchar c, uchar n, uchar* result, bool* allow_caching_ptr);
+};
+
+#endif
+
+struct Letter {
+  static bool Is(uchar c);
+};
+
+}  
+
+namespace internal {
+
+#define PRINTF_FORMAT(x, y) MOZ_FORMAT_PRINTF(x, y)
+void PRINTF_FORMAT(1, 2) PrintF(const char* format, ...);
+void PRINTF_FORMAT(2, 3) PrintF(FILE* out, const char* format, ...);
+
+class AllStatic {
+#if defined(DEBUG)
+ public:
+  AllStatic() = delete;
+#endif
+};
+
+class Malloced {
+ public:
+  static void* operator new(size_t size) {
+    js::AutoEnterOOMUnsafeRegion oomUnsafe;
+    void* result = js_malloc(size);
+    if (!result) {
+      oomUnsafe.crash("Irregexp Malloced shim");
+    }
+    return result;
+  }
+  static void operator delete(void* p) { js_free(p); }
+};
+
+constexpr int32_t KB = 1024;
+constexpr int32_t MB = 1024 * 1024;
+
+#define kMaxInt JSVAL_INT_MAX
+#define kMinInt JSVAL_INT_MIN
+constexpr int kSystemPointerSize = sizeof(void*);
+constexpr int kSystemPointerHexDigits = kSystemPointerSize == 4 ? 8 : 12;
+
+constexpr uint64_t kMaxSafeIntegerUint64 = (uint64_t{1} << 53) - 1;
+constexpr double kMaxSafeInteger = static_cast<double>(kMaxSafeIntegerUint64);
+
+constexpr int kBitsPerByte = 8;
+constexpr int kBitsPerByteLog2 = 3;
+constexpr int kUInt16Size = sizeof(uint16_t);
+constexpr int kInt32Size = sizeof(int32_t);
+constexpr int kUInt32Size = sizeof(uint32_t);
+constexpr int kInt64Size = sizeof(int64_t);
+
+constexpr int kMaxUInt16 = (1 << 16) - 1;
+constexpr uint32_t kMaxUInt32 = 0xffffffff;
+
+inline constexpr bool IsDecimalDigit(base::uc32 c) {
+  return c >= '0' && c <= '9';
+}
+
+inline constexpr int AsciiAlphaToLower(base::uc32 c) { return c | 0x20; }
+
+inline bool is_uint8(int64_t val) { return (val >> 8) == 0; }
+
+inline bool IsIdentifierStart(base::uc32 c) {
+  return js::unicode::IsIdentifierStart(char32_t(c));
+}
+inline bool IsIdentifierPart(base::uc32 c) {
+  return js::unicode::IsIdentifierPart(char32_t(c));
+}
+
+struct AsUC16 {
+  explicit AsUC16(char16_t v) : value(v) {}
+  char16_t value;
+};
+
+struct AsUC32 {
+  explicit AsUC32(int32_t v) : value(v) {}
+  int32_t value;
+};
+
+struct AsHex {
+  explicit AsHex(uint64_t v, uint8_t min_width = 1, bool with_prefix = false)
+      : value(v), min_width(min_width), with_prefix(with_prefix) {}
+  uint64_t value;
+  uint8_t min_width;
+  bool with_prefix;
+
+  static AsHex Address(Address a) {
+    return AsHex(a, kSystemPointerHexDigits, true);
+  }
+};
+
+std::ostream& operator<<(std::ostream& os, const AsUC16& c);
+std::ostream& operator<<(std::ostream& os, const AsUC32& c);
+std::ostream& operator<<(std::ostream& os, const AsHex& c);
+
+class StdoutStream : public std::ostream {
+ public:
+  StdoutStream();
+};
+
+using mozilla::Maybe;
+
+template <typename T>
+Maybe<T> Just(const T& value) {
+  return mozilla::Some(value);
+}
+
+template <typename T>
+mozilla::Nothing Nothing() {
+  return mozilla::Nothing();
+}
+
+template <typename T>
+using PseudoHandle = mozilla::UniquePtr<T, JS::FreePolicy>;
+
+template <typename lchar, typename rchar>
+inline int CompareCharsUnsigned(const lchar* lhs, const rchar* rhs,
+                                size_t chars) {
+  const lchar* limit = lhs + chars;
+  if (sizeof(*lhs) == sizeof(char) && sizeof(*rhs) == sizeof(char)) {
+    return memcmp(lhs, rhs, chars);
+  }
+  while (lhs < limit) {
+    int r = static_cast<int>(*lhs) - static_cast<int>(*rhs);
+    if (r != 0) return r;
+    ++lhs;
+    ++rhs;
+  }
+  return 0;
+}
+template <typename lchar, typename rchar>
+inline int CompareChars(const lchar* lhs, const rchar* rhs, size_t chars) {
+  DCHECK_LE(sizeof(lchar), 2);
+  DCHECK_LE(sizeof(rchar), 2);
+  if (sizeof(lchar) == 1) {
+    if (sizeof(rchar) == 1) {
+      return CompareCharsUnsigned(reinterpret_cast<const uint8_t*>(lhs),
+                                  reinterpret_cast<const uint8_t*>(rhs), chars);
+    } else {
+      return CompareCharsUnsigned(reinterpret_cast<const uint8_t*>(lhs),
+                                  reinterpret_cast<const char16_t*>(rhs),
+                                  chars);
+    }
+  } else {
+    if (sizeof(rchar) == 1) {
+      return CompareCharsUnsigned(reinterpret_cast<const char16_t*>(lhs),
+                                  reinterpret_cast<const uint8_t*>(rhs), chars);
+    } else {
+      return CompareCharsUnsigned(reinterpret_cast<const char16_t*>(lhs),
+                                  reinterpret_cast<const char16_t*>(rhs),
+                                  chars);
+    }
+  }
+}
+
+template <typename lchar, typename rchar>
+inline bool CompareCharsEqualUnsigned(const lchar* lhs, const rchar* rhs,
+                                      size_t chars) {
+  STATIC_ASSERT(std::is_unsigned_v<lchar>);
+  STATIC_ASSERT(std::is_unsigned_v<rchar>);
+  if (sizeof(*lhs) == sizeof(*rhs)) {
+    return memcmp(lhs, rhs, chars * sizeof(*lhs)) == 0;
+  }
+  for (const lchar* limit = lhs + chars; lhs < limit; ++lhs, ++rhs) {
+    if (*lhs != *rhs) return false;
+  }
+  return true;
+}
+
+template <typename lchar, typename rchar>
+inline bool CompareCharsEqual(const lchar* lhs, const rchar* rhs,
+                              size_t chars) {
+  using ulchar = std::make_unsigned_t<lchar>;
+  using urchar = std::make_unsigned_t<rchar>;
+  return CompareCharsEqualUnsigned(reinterpret_cast<const ulchar*>(lhs),
+                                   reinterpret_cast<const urchar*>(rhs), chars);
+}
+
+class Object {
+ public:
+  constexpr Object() : asBits_(JS::Int32Value(0).asRawBits()) {}
+
+  Object(const JS::Value& value) : asBits_(value.asRawBits()) {}
+
+  Object(uintptr_t raw) : asBits_(raw) { MOZ_CRASH("unused"); }
+
+  JS::Value value() const { return JS::Value::fromRawBits(asBits_); }
+
+  inline static Object cast(Object object) { return object; }
+
+ protected:
+  void setValue(const JS::Value& val) { asBits_ = val.asRawBits(); }
+  uint64_t asBits_;
+} JS_HAZ_GC_POINTER;
+
+inline bool IsExceptionHole(Object obj) {
+  return obj.value().isMagic(JS_INTERRUPT_REGEXP);
+}
+
+class Smi : public Object {
+ public:
+  static Smi FromInt(int32_t value) {
+    Smi smi;
+    smi.setValue(JS::Int32Value(value));
+    return smi;
+  }
+  static inline int32_t ToInt(const Object object) {
+    return object.value().toInt32();
+  }
+};
+
+class HeapObject : public Object {
+ public:
+  inline static HeapObject cast(Object object) {
+    HeapObject h;
+    h.setValue(object.value());
+    return h;
+  }
+};
+
+template <typename T>
+class Tagged {
+ public:
+  Tagged() = default;
+  MOZ_IMPLICIT Tagged(const T& value) : value_(value) {}
+  MOZ_IMPLICIT Tagged(T&& value) : value_(std::move(value)) {}
+
+  T* operator->() { return &value_; }
+  constexpr operator T() const { return value_; }
+
+ private:
+  T value_;
+};
+
+
+template <typename To, typename From>
+inline Tagged<To> UncheckedCast(Tagged<From> value) {
+  return Tagged<To>(To::cast(value));
+}
+
+template <typename To, typename From>
+inline Tagged<To> Cast(const From& value) {
+  return UncheckedCast<To>(Tagged(value));
+}
+
+class FixedArray : public HeapObject {
+ public:
+  inline void set(uint32_t index, Object value) {
+    inner()->setDenseElement(index, value.value());
+  }
+  inline static FixedArray cast(Object object) {
+    FixedArray f;
+    MOZ_ASSERT(object.value().isObject() &&
+               object.value().toObject().is<js::ArrayObject>());
+    f.setValue(object.value());
+    return f;
+  }
+  js::NativeObject* inner() {
+    return &value().toObject().as<js::NativeObject>();
+  }
+};
+
+inline uint8_t* ByteArrayData::data() {
+  static_assert(alignof(uint8_t) <= alignof(ByteArrayData),
+                "The trailing data must be aligned to start immediately "
+                "after the header with no padding.");
+  ByteArrayData* immediatelyAfter = this + 1;
+  return reinterpret_cast<uint8_t*>(immediatelyAfter);
+}
+
+template <typename T>
+T* ByteArrayData::typedData() {
+  static_assert(alignof(T) <= alignof(ByteArrayData));
+  MOZ_ASSERT(uintptr_t(data()) % alignof(T) == 0);
+  return reinterpret_cast<T*>(data());
+}
+
+template <typename T>
+T ByteArrayData::getTyped(uint32_t index) {
+  MOZ_ASSERT(index < length() / sizeof(T));
+  return typedData<T>()[index];
+}
+
+class SafeHeapObjectSize {
+  uint32_t value_;
+
+ public:
+  explicit SafeHeapObjectSize(uint32_t value) : value_(value) {}
+  uint32_t value() { return value_; }
+};
+
+template <typename T>
+void ByteArrayData::setTyped(uint32_t index, T value) {
+  MOZ_ASSERT(index < length() / sizeof(T));
+  typedData<T>()[index] = value;
+}
+
+class ByteArray : public HeapObject {
+ protected:
+  ByteArrayData* inner() const {
+    return static_cast<ByteArrayData*>(value().toPrivate());
+  }
+  friend bool IsByteArray(Object obj);
+
+ public:
+  PseudoHandle<ByteArrayData> takeOwnership(Isolate* isolate);
+  PseudoHandle<ByteArrayData> maybeTakeOwnership(Isolate* isolate);
+
+  uint8_t get(uint32_t index) { return inner()->get(index); }
+  void set(uint32_t index, uint8_t val) { inner()->set(index, val); }
+
+  SafeHeapObjectSize length() const {
+    return SafeHeapObjectSize(inner()->length());
+  }
+  SafeHeapObjectSize ulength() const { return length(); }
+  uint8_t* begin() { return inner()->data(); }
+  uint8_t* end() { return inner()->data() + inner()->length(); }
+
+  static ByteArray cast(Object object) {
+    ByteArray b;
+    b.setValue(object.value());
+    return b;
+  }
+
+  friend class regexp::SMRegExpMacroAssembler;
+};
+
+class TrustedByteArray : public ByteArray {
+ public:
+  static TrustedByteArray cast(Object object) {
+    TrustedByteArray b;
+    b.setValue(object.value());
+    return b;
+  }
+};
+
+inline bool IsByteArray(Object obj) {
+  MOZ_ASSERT(ByteArray::cast(obj).inner()->magic() ==
+             ByteArrayData::ExpectedMagic);
+  return true;
+}
+
+template <typename T>
+class FixedIntegerArray : public ByteArray {
+  static_assert(alignof(T) <= alignof(ByteArrayData));
+  static_assert(std::is_integral_v<T>);
+
+ public:
+  static Handle<FixedIntegerArray<T>> New(Isolate* isolate, uint32_t length);
+
+  T get(uint32_t index) { return inner()->template getTyped<T>(index); };
+  void set(uint32_t index, T value) {
+    inner()->template setTyped<T>(index, value);
+  }
+
+  static FixedIntegerArray<T> cast(Object object) {
+    FixedIntegerArray<T> f;
+    f.setValue(object.value());
+    return f;
+  }
+
+  SafeHeapObjectSize length() const {
+    uint32_t byteLength = ByteArray::length().value();
+    MOZ_ASSERT(byteLength % sizeof(T) == 0);
+    return SafeHeapObjectSize(byteLength / sizeof(T));
+  }
+};
+
+using FixedUInt16Array = FixedIntegerArray<uint16_t>;
+
+
+class MOZ_STACK_CLASS HandleScope {
+ public:
+  HandleScope(Isolate* isolate);
+  ~HandleScope();
+
+ private:
+  size_t level_ = 0;
+  size_t non_gc_level_ = 0;
+  Isolate* isolate_;
+
+  friend class Isolate;
+};
+
+template <typename T>
+class MOZ_NONHEAP_CLASS Handle {
+ public:
+  Handle() : location_(nullptr) {}
+  Handle(T object, Isolate* isolate);
+  Handle(const JS::Value& value, Isolate* isolate);
+
+  template <typename S,
+            typename = std::enable_if_t<std::is_convertible_v<S*, T*>>>
+  inline Handle(Handle<S> handle) : location_(handle.location_) {}
+
+  static Handle null() { return Handle(); }
+  inline bool is_null() const { return location_ == nullptr; }
+
+  inline T operator*() const { return T::cast(Object(*location_)); };
+
+  template <typename S>
+  inline static Handle<T> cast(Handle<S> that) {
+    T::cast(Object(*that.location_));
+    return Handle<T>(that.location_);
+  }
+
+  class MOZ_TEMPORARY_CLASS ObjectRef {
+   public:
+    T* operator->() { return &object_; }
+
+   private:
+    friend class Handle;
+    explicit ObjectRef(T object) : object_(object) {}
+
+    T object_;
+  };
+  inline ObjectRef operator->() const { return ObjectRef{**this}; }
+
+  static Handle<T> fromHandleValue(JS::HandleValue handle) {
+    return Handle(handle.address());
+  }
+
+ private:
+  Handle(const JS::Value* location) : location_(location) {}
+
+  template <typename>
+  friend class Handle;
+  template <typename>
+  friend class MaybeHandle;
+
+  const JS::Value* location_;
+};
+
+template <typename To, typename From>
+inline Handle<To> CheckedCast(Handle<From> value) {
+  return Handle<To>::cast(value);
+}
+
+template <typename T>
+class MOZ_NONHEAP_CLASS MaybeHandle final {
+ public:
+  MaybeHandle() : location_(nullptr) {}
+
+  template <typename S,
+            typename = std::enable_if_t<std::is_convertible_v<S*, T*>>>
+  MaybeHandle(Handle<S> handle) : location_(handle.location_) {}
+
+  inline Handle<T> ToHandleChecked() const {
+    MOZ_RELEASE_ASSERT(location_);
+    return Handle<T>(location_);
+  }
+
+  template <typename S>
+  inline bool ToHandle(Handle<S>* out) const {
+    if (location_) {
+      *out = Handle<T>(location_);
+      return true;
+    } else {
+      *out = Handle<T>();
+      return false;
+    }
+  }
+
+ private:
+  JS::Value* location_;
+};
+
+
+template <typename T>
+inline Handle<T> handle(T object, Isolate* isolate) {
+  return Handle<T>(object, isolate);
+}
+
+template <typename T>
+using DirectHandle = Handle<T>;
+
+template <typename T>
+using IndirectHandle = Handle<T>;
+
+template <typename T>
+using MaybeDirectHandle = MaybeHandle<T>;
+
+
+using DisallowGarbageCollection = JS::AutoAssertNoGC;
+
+
+class AllowGarbageCollection {
+ public:
+  AllowGarbageCollection() = default;
+};
+
+class String : public HeapObject {
+ private:
+  JSString* str() const { return value().toString(); }
+
+ public:
+  String() = default;
+  String(JSString* str) { setValue(JS::StringValue(str)); }
+
+  operator JSString*() const { return str(); }
+
+  static const int32_t kMaxOneByteCharCode = unibrow::Latin1::kMaxChar;
+  static const uint32_t kMaxOneByteCharCodeU = unibrow::Latin1::kMaxChar;
+  static const int kMaxUtf16CodeUnit = 0xffff;
+  static const uint32_t kMaxUtf16CodeUnitU = kMaxUtf16CodeUnit;
+  static const base::uc32 kMaxCodePoint = 0x10ffff;
+
+  MOZ_ALWAYS_INLINE int length() const { return str()->length(); }
+  bool IsFlat() { return str()->isLinear(); };
+
+  class FlatContent {
+   public:
+    FlatContent(JSLinearString* string, const DisallowGarbageCollection& no_gc)
+        : string_(string), no_gc_(no_gc) {}
+    inline bool IsOneByte() const { return string_->hasLatin1Chars(); }
+    inline bool IsTwoByte() const { return !string_->hasLatin1Chars(); }
+
+    base::Vector<const uint8_t> ToOneByteVector() const {
+      MOZ_ASSERT(IsOneByte());
+      return base::Vector<const uint8_t>(string_->latin1Chars(no_gc_),
+                                         string_->length());
+    }
+    base::Vector<const base::uc16> ToUC16Vector() const {
+      MOZ_ASSERT(IsTwoByte());
+      return base::Vector<const base::uc16>(string_->twoByteChars(no_gc_),
+                                            string_->length());
+    }
+    void UnsafeDisableChecksumVerification() {
+    }
+
+   private:
+    const JSLinearString* string_;
+    const JS::AutoAssertNoGC& no_gc_;
+  };
+  FlatContent GetFlatContent(const DisallowGarbageCollection& no_gc) {
+    MOZ_ASSERT(IsFlat());
+    return FlatContent(&str()->asLinear(), no_gc);
+  }
+
+  static Handle<String> Flatten(Isolate* isolate, Handle<String> string);
+
+  inline static String cast(Object object) {
+    String s;
+    MOZ_ASSERT(object.value().isString());
+    s.setValue(object.value());
+    return s;
+  }
+
+  inline static bool IsOneByteRepresentationUnderneath(String string) {
+    return string.str()->hasLatin1Chars();
+  }
+  inline bool IsOneByteRepresentation() const {
+    return str()->hasLatin1Chars();
+  }
+
+  std::unique_ptr<char[]> ToCString();
+
+  template <typename Char>
+  base::Vector<const Char> GetCharVector(
+      const DisallowGarbageCollection& no_gc);
+
+  friend class regexp::Utils;
+};
+
+template <>
+inline base::Vector<const uint8_t> String::GetCharVector(
+    const DisallowGarbageCollection& no_gc) {
+  String::FlatContent flat = GetFlatContent(no_gc);
+  MOZ_ASSERT(flat.IsOneByte());
+  return flat.ToOneByteVector();
+}
+
+template <>
+inline base::Vector<const base::uc16> String::GetCharVector(
+    const DisallowGarbageCollection& no_gc) {
+  String::FlatContent flat = GetFlatContent(no_gc);
+  MOZ_ASSERT(flat.IsTwoByte());
+  return flat.ToUC16Vector();
+}
+
+namespace regexp {
+using Flags = JS::RegExpFlags;
+using Flag = JS::RegExpFlags::Flag;
+}  
+
+class JSRegExp {
+ public:
+  static constexpr int RegistersForCaptureCount(int count) {
+    return (count + 1) * 2;
+  }
+
+  static regexp::Flags AsRegExpFlags(regexp::Flags flags) { return flags; }
+  static regexp::Flags AsJSRegExpFlags(regexp::Flags flags) { return flags; }
+
+  static Handle<String> StringFromFlags(Isolate* isolate, regexp::Flags flags);
+
+
+  static constexpr int kMaxCaptures = (1 << 15) - 1;
+
+  static constexpr int kNoBacktrackLimit = 0;
+};
+
+class RegExpData : public HeapObject {
+ public:
+  RegExpData() : HeapObject() {}
+  RegExpData(js::RegExpShared* re) { setValue(JS::PrivateGCThingValue(re)); }
+
+  void TierUpTick() { inner()->tierUpTick(); }
+
+  Tagged<TrustedByteArray> bytecode(bool is_latin1) const {
+    return TrustedByteArray::cast(
+        Object(JS::PrivateValue(inner()->getByteCode(is_latin1))));
+  }
+
+  bool has_bytecode(bool is_latin1) const {
+    return inner()->getByteCode(is_latin1) != nullptr;
+  }
+
+  uint32_t backtrack_limit() const { return 0; }
+
+  static RegExpData cast(Object object) {
+    RegExpData regexp;
+    js::gc::Cell* regexpShared = object.value().toGCThing();
+    MOZ_ASSERT(regexpShared->is<js::RegExpShared>());
+    regexp.setValue(JS::PrivateGCThingValue(regexpShared));
+    return regexp;
+  }
+
+  inline uint32_t max_register_count() const {
+    return inner()->getMaxRegisters();
+  }
+
+  regexp::Flags flags() const { return inner()->getFlags(); }
+
+  size_t capture_count() const {
+    return inner()->pairCount() - 1;
+  }
+
+  Tagged<String> escaped_source() const { return String(inner()->getSource()); }
+
+ private:
+  js::RegExpShared* inner() const {
+    return value().toGCThing()->as<js::RegExpShared>();
+  }
+};
+
+class IrRegExpData : public RegExpData {
+ public:
+  IrRegExpData() : RegExpData() {}
+  IrRegExpData(js::RegExpShared* re) : RegExpData(re) {}
+
+  static IrRegExpData cast(Object object) {
+    IrRegExpData regexp;
+    js::gc::Cell* regexpShared = object.value().toGCThing();
+    MOZ_ASSERT(regexpShared->is<js::RegExpShared>());
+    regexp.setValue(JS::PrivateGCThingValue(regexpShared));
+    return regexp;
+  }
+};
+
+inline bool IsUnicode(regexp::Flags flags) { return flags.unicode(); }
+inline bool IsGlobal(regexp::Flags flags) { return flags.global(); }
+inline bool IsIgnoreCase(regexp::Flags flags) { return flags.ignoreCase(); }
+inline bool IsMultiline(regexp::Flags flags) { return flags.multiline(); }
+inline bool IsDotAll(regexp::Flags flags) { return flags.dotAll(); }
+inline bool IsSticky(regexp::Flags flags) { return flags.sticky(); }
+inline bool IsUnicodeSets(regexp::Flags flags) { return flags.unicodeSets(); }
+inline bool IsEitherUnicode(regexp::Flags flags) {
+  return flags.unicode() || flags.unicodeSets();
+}
+
+inline std::optional<regexp::Flag> TryFlagFromChar(char c) {
+  regexp::Flag flag;
+
+  if (JS::MaybeParseRegExpFlag(c, &flag)) {
+    return flag;
+  }
+
+  return std::optional<regexp::Flag>{};
+}
+
+class Histogram {
+ public:
+  inline void AddSample(int sample) {}
+};
+
+class Counters {
+ public:
+  Histogram* regexp_backtracks() { return &regexp_backtracks_; }
+
+ private:
+  Histogram regexp_backtracks_;
+};
+
+class LocalHeap {
+ public:
+  using GCEpilogueCallback = void(void*);
+
+  void AddGCEpilogueCallback(GCEpilogueCallback, void*) {}
+  void RemoveGCEpilogueCallback(GCEpilogueCallback, void*) {}
+};
+
+enum class AllocationType : uint8_t {
+  kYoung,  
+  kOld,    
+};
+
+using StackGuard = Isolate;
+using Factory = Isolate;
+
+class Isolate {
+ public:
+  Isolate(JSContext* cx) : cx_(cx) {}
+  ~Isolate();
+  bool init();
+
+  static Isolate* Current() { return js::TlsContext.get()->isolate; }
+
+  size_t sizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+
+  regexp::Stack* regexp_stack() const { return regexpStack_; }
+
+  js::LifoAlloc* allocator() { return &cx_->tempLifoAlloc(); }
+
+  void StackOverflow() {}
+
+#if !defined(V8_INTL_SUPPORT)
+  unibrow::Mapping<unibrow::Ecma262UnCanonicalize>* jsregexp_uncanonicalize() {
+    return &jsregexp_uncanonicalize_;
+  }
+  unibrow::Mapping<unibrow::Ecma262Canonicalize>*
+  regexp_macro_assembler_canonicalize() {
+    return &regexp_macro_assembler_canonicalize_;
+  }
+  unibrow::Mapping<unibrow::CanonicalizationRange>* jsregexp_canonrange() {
+    return &jsregexp_canonrange_;
+  }
+
+ private:
+  unibrow::Mapping<unibrow::Ecma262UnCanonicalize> jsregexp_uncanonicalize_;
+  unibrow::Mapping<unibrow::Ecma262Canonicalize>
+      regexp_macro_assembler_canonicalize_;
+  unibrow::Mapping<unibrow::CanonicalizationRange> jsregexp_canonrange_;
+#endif
+
+ public:
+  void IncreaseTotalRegexpCodeGenerated(Handle<HeapObject> code) {}
+
+  Counters* counters() { return &counters_; }
+
+  LocalHeap* main_thread_local_heap() { return &main_thread_local_heap_; }
+
+  inline Factory* factory() { return this; }
+
+  Handle<ByteArray> NewByteArray(
+      int length, AllocationType allocation = AllocationType::kYoung);
+
+  Handle<TrustedByteArray> NewTrustedByteArray(
+      int length, AllocationType allocation = AllocationType::kYoung);
+
+  Handle<FixedArray> NewFixedArray(int length);
+
+  template <typename T>
+  Handle<FixedIntegerArray<T>> NewFixedIntegerArray(uint32_t length);
+
+  template <typename Char>
+  Handle<String> InternalizeString(const base::Vector<const Char>& str);
+
+  inline StackGuard* stack_guard() { return this; }
+
+  uintptr_t real_climit() { return cx_->stackLimit(JS::StackForSystemCode); }
+
+  Object HandleInterrupts() {
+    return Object(JS::MagicValue(JS_INTERRUPT_REGEXP));
+  }
+
+  JSContext* cx() const { return cx_; }
+
+  void trace(JSTracer* trc);
+
+
+  JS::Value* getHandleLocation(const JS::Value& value);
+
+ private:
+  mozilla::SegmentedVector<JS::Value, 256> handleArena_;
+  mozilla::SegmentedVector<PseudoHandle<void>, 256> uniquePtrArena_;
+
+  void* allocatePseudoHandle(size_t bytes);
+
+ public:
+  template <typename T>
+  PseudoHandle<T> takeOwnership(void* ptr);
+  template <typename T>
+  PseudoHandle<T> maybeTakeOwnership(void* ptr);
+
+  uint32_t liveHandles() const { return handleArena_.Length(); }
+  uint32_t livePseudoHandles() const { return uniquePtrArena_.Length(); }
+
+ private:
+  void openHandleScope(HandleScope& scope) {
+    scope.level_ = handleArena_.Length();
+    scope.non_gc_level_ = uniquePtrArena_.Length();
+  }
+  void closeHandleScope(size_t prevLevel, size_t prevUniqueLevel) {
+    size_t currLevel = handleArena_.Length();
+    handleArena_.PopLastN(currLevel - prevLevel);
+
+    size_t currUniqueLevel = uniquePtrArena_.Length();
+    uniquePtrArena_.PopLastN(currUniqueLevel - prevUniqueLevel);
+  }
+  friend class HandleScope;
+
+  JSContext* cx_;
+  regexp::Stack* regexpStack_{};
+  Counters counters_{};
+  LocalHeap main_thread_local_heap_;
+#if defined(DEBUG)
+ public:
+  uint32_t shouldSimulateInterrupt_ = 0;
+#endif
+};
+
+class StackLimitCheck {
+ public:
+  StackLimitCheck(Isolate* isolate) : cx_(isolate->cx()) {}
+
+  bool HasOverflowed() {
+    js::AutoCheckRecursionLimit recursion(cx_);
+    bool overflowed = !recursion.checkDontReport(cx_);
+    if (overflowed && false) {
+      fprintf(stderr, "ReportOverRecursed called\n");
+    }
+    return overflowed;
+  }
+
+  bool InterruptRequested() {
+    return cx_->hasPendingInterrupt(js::InterruptReason::CallbackUrgent);
+  }
+
+  bool JsHasOverflowed() {
+    js::AutoCheckRecursionLimit recursion(cx_);
+    return !recursion.checkDontReport(cx_);
+  }
+
+ private:
+  JSContext* cx_;
+};
+
+class ExternalReference {
+ public:
+  static const void* TopOfRegexpStack(Isolate* isolate);
+  static size_t SizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf,
+                                    regexp::Stack* regexpStack);
+};
+
+class Code : public HeapObject {
+ public:
+  uint8_t* raw_instruction_start() { return inner()->raw(); }
+
+  static Code cast(Object object) {
+    Code c;
+    js::gc::Cell* jitCode = object.value().toGCThing();
+    MOZ_ASSERT(jitCode->is<js::jit::JitCode>());
+    c.setValue(JS::PrivateGCThingValue(jitCode));
+    return c;
+  }
+  js::jit::JitCode* inner() {
+    return value().toGCThing()->as<js::jit::JitCode>();
+  }
+};
+
+class InstructionStream {};
+
+namespace regexp {
+
+inline bool operator==(const Flags& lhs, const int& rhs) {
+  return lhs.value() == rhs;
+}
+inline bool operator!=(const Flags& lhs, const int& rhs) {
+  return !(lhs == rhs);
+}
+
+class ResultVectorScope {};
+
+class Utils {
+ public:
+  static uint64_t AdvanceStringIndex(Tagged<String> string, uint64_t index,
+                                     bool unicode);
+};
+}  
+
+class Label {
+ public:
+  Label() : inner_(js::jit::Label()) {}
+
+  js::jit::Label* inner() { return &inner_; }
+
+  void Unuse() { inner_.reset(); }
+  void UnuseNear() { inner_.reset(); }
+
+  bool is_linked() { return inner_.used(); }
+  bool is_bound() { return inner_.bound(); }
+  bool is_unused() { return !inner_.used() && !inner_.bound(); }
+
+  int pos() { return inner_.offset(); }
+  void link_to(int pos) { inner_.use(pos); }
+  void bind_to(int pos) { inner_.bind(pos); }
+
+ private:
+  js::jit::Label inner_;
+  js::jit::CodeOffset patchOffset_;
+
+  friend class regexp::SMRegExpMacroAssembler;
+};
+
+#define v8_flags js::jit::JitOptions
+
+#define V8_USE_COMPUTED_GOTO 1
+#define COMPILING_IRREGEXP_FOR_EXTERNAL_EMBEDDER
+
+}  
+}  
+
+namespace V8 {
+
+inline void FatalProcessOutOfMemory(v8::internal::Isolate* isolate,
+                                    const char* msg) {
+  js::AutoEnterOOMUnsafeRegion oomUnsafe;
+  oomUnsafe.crash(msg);
+}
+
+}  
+
+#endif

@@ -1,0 +1,329 @@
+/*
+ * This file is part of FFmpeg.
+ *
+ * FFmpeg is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * FFmpeg is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with FFmpeg; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ */
+
+#ifndef AVCODEC_CBS_INTERNAL_H
+#define AVCODEC_CBS_INTERNAL_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include "config.h"
+
+#include "libavutil/log.h"
+
+#include "cbs.h"
+#include "codec_id.h"
+#include "get_bits.h"
+#include "put_bits.h"
+#include "libavutil/refstruct.h"
+
+#ifndef CBS_READ
+#define CBS_READ 1
+#endif
+#ifndef CBS_WRITE
+#define CBS_WRITE 1
+#endif
+#ifndef CBS_TRACE
+#define CBS_TRACE 1
+#endif
+
+#ifndef CBS_APV
+#define CBS_APV CONFIG_CBS_APV
+#endif
+#ifndef CBS_AV1
+#define CBS_AV1 CONFIG_CBS_AV1
+#endif
+#ifndef CBS_H264
+#define CBS_H264 CONFIG_CBS_H264
+#endif
+#ifndef CBS_H265
+#define CBS_H265 CONFIG_CBS_H265
+#endif
+#ifndef CBS_H266
+#define CBS_H266 CONFIG_CBS_H266
+#endif
+#ifndef CBS_LCEVC
+#define CBS_LCEVC CONFIG_CBS_LCEVC
+#endif
+#ifndef CBS_JPEG
+#define CBS_JPEG CONFIG_CBS_JPEG
+#endif
+#ifndef CBS_MPEG2
+#define CBS_MPEG2 CONFIG_CBS_MPEG2
+#endif
+#ifndef CBS_VP8
+#define CBS_VP8 CONFIG_CBS_VP8
+#endif
+#ifndef CBS_VP9
+#define CBS_VP9 CONFIG_CBS_VP9
+#endif
+
+enum CBSContentType {
+    CBS_CONTENT_TYPE_INTERNAL_REFS,
+    CBS_CONTENT_TYPE_COMPLEX,
+};
+
+enum {
+      CBS_MAX_LIST_UNIT_TYPES = 3,
+      CBS_MAX_REF_OFFSETS = 2,
+      CBS_UNIT_TYPE_RANGE = -1,
+};
+
+typedef const struct CodedBitstreamUnitTypeDescriptor {
+    int nb_unit_types;
+
+    union {
+        CodedBitstreamUnitType list[CBS_MAX_LIST_UNIT_TYPES];
+        struct {
+            CodedBitstreamUnitType start;
+            CodedBitstreamUnitType end;
+        } range;
+    } unit_type;
+
+    enum CBSContentType content_type;
+    size_t content_size;
+
+    union {
+        struct {
+            int nb_offsets;
+            size_t offsets[CBS_MAX_REF_OFFSETS];
+        } ref;
+
+        struct {
+            void (*content_free)(AVRefStructOpaque opaque, void *content);
+            int  (*content_clone)(void **new_content, CodedBitstreamUnit *unit);
+        } complex;
+    } type;
+} CodedBitstreamUnitTypeDescriptor;
+
+typedef struct CodedBitstreamType {
+    enum AVCodecID codec_id;
+
+    const AVClass *priv_class;
+
+    size_t priv_data_size;
+
+    CodedBitstreamUnitTypeDescriptor *unit_types;
+
+    int (*split_fragment)(CodedBitstreamContext *ctx,
+                          CodedBitstreamFragment *frag,
+                          int header);
+
+    int (*read_unit)(CodedBitstreamContext *ctx,
+                     CodedBitstreamUnit *unit);
+
+    int (*write_unit)(CodedBitstreamContext *ctx,
+                      CodedBitstreamUnit *unit,
+                      PutBitContext *pbc);
+
+    int (*discarded_unit)(CodedBitstreamContext *ctx,
+                          const CodedBitstreamUnit *unit,
+                          enum AVDiscard skip);
+
+    int (*assemble_fragment)(CodedBitstreamContext *ctx,
+                             CodedBitstreamFragment *frag);
+
+    void (*flush)(CodedBitstreamContext *ctx);
+
+    void (*close)(CodedBitstreamContext *ctx);
+} CodedBitstreamType;
+
+
+
+void CBS_FUNC(trace_header)(CodedBitstreamContext *ctx,
+                         const char *name);
+
+
+
+int CBS_FUNC(read_unsigned)(CodedBitstreamContext *ctx, GetBitContext *gbc,
+                         int width, const char *name,
+                         const int *subscripts, uint32_t *write_to,
+                         uint32_t range_min, uint32_t range_max);
+
+int CBS_FUNC(read_simple_unsigned)(CodedBitstreamContext *ctx, GetBitContext *gbc,
+                                int width, const char *name, uint32_t *write_to);
+
+int CBS_FUNC(write_unsigned)(CodedBitstreamContext *ctx, PutBitContext *pbc,
+                          int width, const char *name,
+                          const int *subscripts, uint32_t value,
+                          uint32_t range_min, uint32_t range_max);
+
+int CBS_FUNC(write_simple_unsigned)(CodedBitstreamContext *ctx, PutBitContext *pbc,
+                                 int width, const char *name, uint32_t value);
+
+int CBS_FUNC(read_signed)(CodedBitstreamContext *ctx, GetBitContext *gbc,
+                       int width, const char *name,
+                       const int *subscripts, int32_t *write_to,
+                       int32_t range_min, int32_t range_max);
+
+int CBS_FUNC(write_signed)(CodedBitstreamContext *ctx, PutBitContext *pbc,
+                        int width, const char *name,
+                        const int *subscripts, int32_t value,
+                        int32_t range_min, int32_t range_max);
+
+#define MAX_UINT_BITS(length) ((UINT64_C(1) << (length)) - 1)
+
+#define MAX_INT_BITS(length) ((INT64_C(1) << ((length) - 1)) - 1)
+
+#define MIN_INT_BITS(length) (-(INT64_C(1) << ((length) - 1)))
+
+
+#if CBS_TRACE
+#define CBS_TRACE_READ_START() \
+    GetBitContext trace_start; \
+    do { \
+        if (ctx->trace_enable) \
+            trace_start = *gbc; \
+    } while (0)
+
+#define CBS_TRACE_READ_END() \
+    do { \
+        if (ctx->trace_enable) { \
+            int start_position = get_bits_count(&trace_start); \
+            int end_position   = get_bits_count(gbc); \
+            av_assert0(start_position <= end_position); \
+            ctx->trace_read_callback(ctx->trace_context, &trace_start, \
+                                     end_position - start_position, \
+                                     name, subscripts, value); \
+        } \
+    } while (0)
+
+#define CBS_TRACE_READ_END_NO_SUBSCRIPTS() \
+    do { \
+        const int *subscripts = NULL; \
+        CBS_TRACE_READ_END(); \
+    } while (0)
+
+#define CBS_TRACE_READ_END_VALUE_ONLY() \
+    do { \
+        if (ctx->trace_enable) { \
+            ctx->trace_read_callback(ctx->trace_context, &trace_start, 0, \
+                                     name, subscripts, value); \
+        } \
+    } while (0)
+
+#define CBS_TRACE_WRITE_START() \
+    int start_position; \
+    do { \
+        if (ctx->trace_enable) \
+            start_position = put_bits_count(pbc);; \
+    } while (0)
+
+#define CBS_TRACE_WRITE_END() \
+    do { \
+        if (ctx->trace_enable) { \
+            int end_position   = put_bits_count(pbc); \
+            av_assert0(start_position <= end_position); \
+            ctx->trace_write_callback(ctx->trace_context, pbc, \
+                                      end_position - start_position, \
+                                      name, subscripts, value); \
+        } \
+    } while (0)
+
+#define CBS_TRACE_WRITE_END_NO_SUBSCRIPTS() \
+    do { \
+        const int *subscripts = NULL; \
+        CBS_TRACE_WRITE_END(); \
+    } while (0)
+
+#define CBS_TRACE_WRITE_END_VALUE_ONLY() \
+    do { \
+        if (ctx->trace_enable) { \
+            PutBitContext tmp; \
+            init_put_bits(&tmp, pbc->buf, start_position); \
+            skip_put_bits(&tmp, start_position); \
+            ctx->trace_write_callback(ctx->trace_context, &tmp, 0, \
+                                      name, subscripts, value); \
+        } \
+    } while (0)
+
+#else // CBS_TRACE
+#define CBS_TRACE_READ_START() do { } while (0)
+#define CBS_TRACE_READ_END() do { } while (0)
+#define CBS_TRACE_READ_END_NO_SUBSCRIPTS() do { } while (0)
+#define CBS_TRACE_READ_END_VALUE_ONLY() do { } while (0)
+#define CBS_TRACE_WRITE_START() do { } while (0)
+#define CBS_TRACE_WRITE_END() do { } while (0)
+#define CBS_TRACE_WRITE_END_NO_SUBSCRIPTS() do { } while (0)
+#define CBS_TRACE_WRITE_END_VALUE_ONLY() do { } while (0)
+#endif // CBS_TRACE
+
+#define TYPE_LIST(...) { __VA_ARGS__ }
+#define CBS_UNIT_TYPE_POD(type_, structure) { \
+        .nb_unit_types  = 1, \
+        .unit_type.list = { type_ }, \
+        .content_type   = CBS_CONTENT_TYPE_INTERNAL_REFS, \
+        .content_size   = sizeof(structure), \
+        .type.ref       = { .nb_offsets = 0 }, \
+    }
+#define CBS_UNIT_RANGE_POD(range_start, range_end, structure) { \
+        .nb_unit_types         = CBS_UNIT_TYPE_RANGE, \
+        .unit_type.range.start = range_start, \
+        .unit_type.range.end   = range_end, \
+        .content_type          = CBS_CONTENT_TYPE_INTERNAL_REFS, \
+        .content_size          = sizeof(structure), \
+        .type.ref              = { .nb_offsets = 0 }, \
+    }
+
+#define CBS_UNIT_TYPES_INTERNAL_REF(types, structure, ref_field) { \
+        .nb_unit_types  = FF_ARRAY_ELEMS((CodedBitstreamUnitType[])TYPE_LIST types), \
+        .unit_type.list = TYPE_LIST types, \
+        .content_type   = CBS_CONTENT_TYPE_INTERNAL_REFS, \
+        .content_size   = sizeof(structure), \
+        .type.ref       = { .nb_offsets = 1, \
+                            .offsets    = { offsetof(structure, ref_field) } }, \
+    }
+#define CBS_UNIT_TYPE_INTERNAL_REF(type, structure, ref_field) \
+    CBS_UNIT_TYPES_INTERNAL_REF((type), structure, ref_field)
+
+#define CBS_UNIT_RANGE_INTERNAL_REF(range_start, range_end, structure, ref_field) { \
+        .nb_unit_types         = CBS_UNIT_TYPE_RANGE, \
+        .unit_type.range.start = range_start, \
+        .unit_type.range.end   = range_end, \
+        .content_type          = CBS_CONTENT_TYPE_INTERNAL_REFS, \
+        .content_size          = sizeof(structure), \
+        .type.ref = { .nb_offsets = 1, \
+                      .offsets    = { offsetof(structure, ref_field) } }, \
+    }
+
+#define CBS_UNIT_TYPES_COMPLEX(types, structure, free_func) { \
+        .nb_unit_types  = FF_ARRAY_ELEMS((CodedBitstreamUnitType[])TYPE_LIST types), \
+        .unit_type.list = TYPE_LIST types, \
+        .content_type   = CBS_CONTENT_TYPE_COMPLEX, \
+        .content_size   = sizeof(structure), \
+        .type.complex   = { .content_free = free_func }, \
+    }
+#define CBS_UNIT_TYPE_COMPLEX(type, structure, free_func) \
+    CBS_UNIT_TYPES_COMPLEX((type), structure, free_func)
+
+#define CBS_UNIT_TYPE_END_OF_LIST { .nb_unit_types = 0 }
+
+
+extern const CodedBitstreamType CBS_FUNC(type_apv);
+extern const CodedBitstreamType CBS_FUNC(type_av1);
+extern const CodedBitstreamType CBS_FUNC(type_h264);
+extern const CodedBitstreamType CBS_FUNC(type_h265);
+extern const CodedBitstreamType CBS_FUNC(type_h266);
+extern const CodedBitstreamType CBS_FUNC(type_lcevc);
+extern const CodedBitstreamType CBS_FUNC(type_jpeg);
+extern const CodedBitstreamType CBS_FUNC(type_mpeg2);
+extern const CodedBitstreamType CBS_FUNC(type_vp8);
+extern const CodedBitstreamType CBS_FUNC(type_vp9);
+
+
+#endif /* AVCODEC_CBS_INTERNAL_H */

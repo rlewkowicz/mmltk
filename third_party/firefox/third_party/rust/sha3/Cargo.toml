@@ -1,0 +1,38 @@
+
+[package]
+edition = "2018"
+name = "sha3"
+version = "0.10.8"
+authors = ["RustCrypto Developers"]
+description = """
+Pure Rust implementation of SHA-3, a family of Keccak-based hash functions
+including the SHAKE family of eXtendable-Output Functions (XOFs), as well as
+the accelerated variant TurboSHAKE
+"""
+documentation = "https://docs.rs/sha3"
+keywords = [
+    "crypto",
+    "sha3",
+    "keccak",
+    "hash",
+    "digest",
+]
+categories = [
+    "cryptography",
+    "no-std",
+]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/RustCrypto/hashes"
+
+[dependencies.digest]
+version = "0.10.4"
+
+[dependencies.keccak]
+version = "0.1.4"
+
+[features]
+asm = ["keccak/asm"]
+default = ["std"]
+oid = ["digest/oid"]
+reset = []
+std = ["digest/std"]

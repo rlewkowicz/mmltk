@@ -1,0 +1,44 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_LOCKS_LOCKMANAGERCHILD_H_
+#define DOM_LOCKS_LOCKMANAGERCHILD_H_
+
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/WorkerRef.h"
+#include "mozilla/dom/locks/PLockManagerChild.h"
+#include "nsIUUIDGenerator.h"
+
+namespace mozilla::dom::locks {
+
+struct LockRequest;
+
+class LockManagerChild final : public PLockManagerChild {
+ public:
+  NS_INLINE_DECL_REFCOUNTING(LockManagerChild)
+
+  static void NotifyBFCacheOnMainThread(nsPIDOMWindowInner* aInner,
+                                        bool aCreated);
+
+  explicit LockManagerChild(nsIGlobalObject* aGlobal);
+
+  nsIGlobalObject* GetParentObject() const { return mGlobal; };
+
+  void RequestLock(const LockRequest& aRequest, const LockOptions& aOptions);
+
+  void NotifyRequestDestroy() const;
+
+  void NotifyToWindow(bool aCreated) const;
+
+ private:
+  ~LockManagerChild() = default;
+
+  nsCOMPtr<nsIGlobalObject> mGlobal;
+
+  RefPtr<IPCWorkerRef> mWorkerRef;
+};
+
+}  
+
+#endif  // DOM_LOCKS_LOCKMANAGERCHILD_H_

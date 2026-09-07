@@ -1,0 +1,248 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef AudioConverter_h
+#define AudioConverter_h
+
+#include "MediaInfo.h"
+#include "mozilla/CheckedInt.h"
+
+typedef struct SpeexResamplerState_ SpeexResamplerState;
+
+namespace mozilla {
+
+template <AudioConfig::SampleFormat T>
+struct AudioDataBufferTypeChooser;
+template <>
+struct AudioDataBufferTypeChooser<AudioConfig::FORMAT_U8> {
+  typedef uint8_t Type;
+};
+template <>
+struct AudioDataBufferTypeChooser<AudioConfig::FORMAT_S16> {
+  typedef int16_t Type;
+};
+template <>
+struct AudioDataBufferTypeChooser<AudioConfig::FORMAT_S24LSB> {
+  typedef int32_t Type;
+};
+template <>
+struct AudioDataBufferTypeChooser<AudioConfig::FORMAT_S24> {
+  typedef int32_t Type;
+};
+template <>
+struct AudioDataBufferTypeChooser<AudioConfig::FORMAT_S32> {
+  typedef int32_t Type;
+};
+template <>
+struct AudioDataBufferTypeChooser<AudioConfig::FORMAT_FLT> {
+  typedef float Type;
+};
+
+template <AudioConfig::SampleFormat Format,
+          typename Value = typename AudioDataBufferTypeChooser<Format>::Type>
+class AudioDataBuffer {
+ public:
+  AudioDataBuffer() = default;
+  AudioDataBuffer(Value* aBuffer, size_t aLength) : mBuffer(aBuffer, aLength) {}
+  explicit AudioDataBuffer(const AudioDataBuffer& aOther)
+      : mBuffer(aOther.mBuffer) {}
+  AudioDataBuffer(AudioDataBuffer&& aOther)
+      : mBuffer(std::move(aOther.mBuffer)) {}
+  template <AudioConfig::SampleFormat OtherFormat, typename OtherValue>
+  explicit AudioDataBuffer(
+      const AudioDataBuffer<OtherFormat, OtherValue>& other) {
+    MOZ_CRASH("Conversion not implemented yet");
+  }
+
+  explicit AudioDataBuffer(const AlignedByteBuffer& aBuffer)
+      : mBuffer(aBuffer) {
+    static_assert(Format == AudioConfig::FORMAT_U8,
+                  "Conversion not implemented yet");
+  }
+  explicit AudioDataBuffer(const AlignedShortBuffer& aBuffer)
+      : mBuffer(aBuffer) {
+    static_assert(Format == AudioConfig::FORMAT_S16,
+                  "Conversion not implemented yet");
+  }
+  explicit AudioDataBuffer(const AlignedFloatBuffer& aBuffer)
+      : mBuffer(aBuffer) {
+    static_assert(Format == AudioConfig::FORMAT_FLT,
+                  "Conversion not implemented yet");
+  }
+  explicit AudioDataBuffer(AlignedByteBuffer&& aBuffer)
+      : mBuffer(std::move(aBuffer)) {
+    static_assert(Format == AudioConfig::FORMAT_U8,
+                  "Conversion not implemented yet");
+  }
+  explicit AudioDataBuffer(AlignedShortBuffer&& aBuffer)
+      : mBuffer(std::move(aBuffer)) {
+    static_assert(Format == AudioConfig::FORMAT_S16,
+                  "Conversion not implemented yet");
+  }
+  explicit AudioDataBuffer(AlignedFloatBuffer&& aBuffer)
+      : mBuffer(std::move(aBuffer)) {
+    static_assert(Format == AudioConfig::FORMAT_FLT,
+                  "Conversion not implemented yet");
+  }
+  AudioDataBuffer& operator=(AudioDataBuffer&& aOther) {
+    mBuffer = std::move(aOther.mBuffer);
+    return *this;
+  }
+  AudioDataBuffer& operator=(const AudioDataBuffer& aOther) = default;
+
+  Value* Data() const { return mBuffer.Data(); }
+  size_t Length() const { return mBuffer.Length(); }
+  size_t Size() const { return mBuffer.Size(); }
+  AlignedBuffer<Value> Forget() {
+    return std::move(mBuffer);
+  }
+
+ private:
+  AlignedBuffer<Value> mBuffer;
+};
+
+typedef AudioDataBuffer<AudioConfig::FORMAT_DEFAULT> AudioSampleBuffer;
+
+class AudioConverter {
+ public:
+  AudioConverter(const AudioConfig& aIn, const AudioConfig& aOut);
+  ~AudioConverter();
+
+  template <AudioConfig::SampleFormat Format, typename Value>
+  AudioDataBuffer<Format, Value> Process(
+      AudioDataBuffer<Format, Value>&& aBuffer) {
+    MOZ_DIAGNOSTIC_ASSERT(mIn.Format() == mOut.Format() &&
+                          mIn.Format() == Format);
+    AudioDataBuffer<Format, Value> buffer = std::move(aBuffer);
+    if (CanWorkInPlace()) {
+      AlignedBuffer<Value> temp = buffer.Forget();
+      Process(temp, temp.Data(), SamplesInToFrames(temp.Length()));
+      return AudioDataBuffer<Format, Value>(std::move(temp));
+    }
+    return Process(buffer);
+  }
+
+  template <AudioConfig::SampleFormat Format, typename Value>
+  AudioDataBuffer<Format, Value> Process(
+      const AudioDataBuffer<Format, Value>& aBuffer) {
+    MOZ_DIAGNOSTIC_ASSERT(mIn.Format() == mOut.Format() &&
+                          mIn.Format() == Format);
+    size_t frames = SamplesInToFrames(aBuffer.Length());
+    AlignedBuffer<Value> temp1;
+    if (!temp1.SetLength(FramesOutToSamples(frames))) {
+      return AudioDataBuffer<Format, Value>(std::move(temp1));
+    }
+    frames = ProcessInternal(temp1.Data(), aBuffer.Data(), frames);
+    if (mIn.Rate() == mOut.Rate()) {
+      MOZ_ALWAYS_TRUE(temp1.SetLength(FramesOutToSamples(frames)));
+      return AudioDataBuffer<Format, Value>(std::move(temp1));
+    }
+
+    AlignedBuffer<Value>* outputBuffer = &temp1;
+    AlignedBuffer<Value> temp2;
+    if (!frames || mOut.Rate() > mIn.Rate()) {
+      uint32_t resampledFrames;
+      if (!ResampleRecipientFrames(frames, &resampledFrames)) {
+        return AudioDataBuffer<Format, Value>(std::move(temp2));
+      }
+      CheckedInt<size_t> outputSamples =
+          CheckedInt<size_t>(resampledFrames) * mOut.Channels();
+      if (!outputSamples.isValid() || !temp2.SetLength(outputSamples.value())) {
+        return AudioDataBuffer<Format, Value>(std::move(temp2));
+      }
+      outputBuffer = &temp2;
+    }
+    if (!frames) {
+      frames = DrainResampler(outputBuffer->Data());
+    } else {
+      frames = ResampleAudio(outputBuffer->Data(), temp1.Data(), frames);
+    }
+    MOZ_ALWAYS_TRUE(outputBuffer->SetLength(FramesOutToSamples(frames)));
+    return AudioDataBuffer<Format, Value>(std::move(*outputBuffer));
+  }
+
+  template <typename Value>
+  size_t Process(Value* aBuffer, size_t aFrames) {
+    MOZ_DIAGNOSTIC_ASSERT(mIn.Format() == mOut.Format());
+    if (!CanWorkInPlace()) {
+      return 0;
+    }
+    size_t frames = ProcessInternal(aBuffer, aBuffer, aFrames);
+    if (frames && mIn.Rate() != mOut.Rate()) {
+      frames = ResampleAudio(aBuffer, aBuffer, aFrames);
+    }
+    return frames;
+  }
+
+  template <typename Value>
+  size_t Process(AlignedBuffer<Value>& aOutBuffer, const Value* aInBuffer,
+                 size_t aFrames) {
+    MOZ_DIAGNOSTIC_ASSERT(mIn.Format() == mOut.Format());
+    MOZ_ASSERT((aFrames && aInBuffer) || !aFrames);
+    if (!aOutBuffer.SetLength(FramesOutToSamples(aFrames))) {
+      MOZ_ALWAYS_TRUE(aOutBuffer.SetLength(0));
+      return 0;
+    }
+    size_t frames = ProcessInternal(aOutBuffer.Data(), aInBuffer, aFrames);
+    MOZ_ASSERT(frames == aFrames);
+    if (mIn.Rate() == mOut.Rate()) {
+      return frames;
+    }
+    if (!frames || mOut.Rate() > mIn.Rate()) {
+      uint32_t resampledFrames;
+      if (!ResampleRecipientFrames(frames, &resampledFrames)) {
+        MOZ_ALWAYS_TRUE(aOutBuffer.SetLength(0));
+        return 0;
+      }
+      CheckedInt<size_t> outputSamples =
+          CheckedInt<size_t>(resampledFrames) * mOut.Channels();
+      if (!outputSamples.isValid() ||
+          !aOutBuffer.SetLength(outputSamples.value())) {
+        MOZ_ALWAYS_TRUE(aOutBuffer.SetLength(0));
+        return 0;
+      }
+    }
+    if (!frames) {
+      frames = DrainResampler(aOutBuffer.Data());
+    } else {
+      frames = ResampleAudio(aOutBuffer.Data(), aInBuffer, frames);
+    }
+    MOZ_ALWAYS_TRUE(aOutBuffer.SetLength(FramesOutToSamples(frames)));
+    return frames;
+  }
+
+  bool CanWorkInPlace() const;
+  bool CanReorderAudio() const {
+    return mIn.Layout().MappingTable(mOut.Layout());
+  }
+  static bool CanConvert(const AudioConfig& aIn, const AudioConfig& aOut);
+
+  const AudioConfig& InputConfig() const { return mIn; }
+  const AudioConfig& OutputConfig() const { return mOut; }
+
+ private:
+  const AudioConfig mIn;
+  const AudioConfig mOut;
+  AutoTArray<uint8_t, AudioConfig::ChannelLayout::MAX_CHANNELS>
+      mChannelOrderMap;
+  size_t ProcessInternal(void* aOut, const void* aIn, size_t aFrames);
+  void ReOrderInterleavedChannels(void* aOut, const void* aIn,
+                                  size_t aFrames) const;
+  size_t DownmixAudio(void* aOut, const void* aIn, size_t aFrames) const;
+  size_t UpmixAudio(void* aOut, const void* aIn, size_t aFrames) const;
+
+  size_t FramesOutToSamples(size_t aFrames) const;
+  size_t SamplesInToFrames(size_t aSamples) const;
+  size_t FramesOutToBytes(size_t aFrames) const;
+
+  SpeexResamplerState* mResampler;
+  size_t ResampleAudio(void* aOut, const void* aIn, size_t aFrames);
+  bool ResampleRecipientFrames(size_t aFrames, uint32_t* aOutFrames) const;
+  void RecreateResampler();
+  size_t DrainResampler(void* aOut);
+};
+
+}  
+
+#endif /* AudioConverter_h */

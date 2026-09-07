@@ -1,0 +1,198 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "CanvasShutdownManager.h"
+#include "mozilla/AppShutdown.h"
+#include "mozilla/dom/CanvasRenderingContext2D.h"
+#include "mozilla/dom/WorkerPrivate.h"
+#include "mozilla/dom/WorkerRef.h"
+#include "mozilla/dom/WorkerRunnable.h"
+#include "mozilla/gfx/CanvasManagerChild.h"
+#include "mozilla/layers/PersistentBufferProvider.h"
+
+namespace mozilla::gfx {
+
+using dom::CanvasRenderingContext2D;
+using dom::StrongWorkerRef;
+using dom::WorkerPrivate;
+
+StaticMutex CanvasShutdownManager::sManagersMutex;
+MOZ_RUNINIT std::set<CanvasShutdownManager*> CanvasShutdownManager::sManagers;
+
+MOZ_THREAD_LOCAL(CanvasShutdownManager*) CanvasShutdownManager::sLocalManager;
+
+CanvasShutdownManager::CanvasShutdownManager(StrongWorkerRef* aWorkerRef)
+    : mWorkerRef(new dom::ThreadSafeWorkerRef(aWorkerRef)) {}
+
+CanvasShutdownManager::CanvasShutdownManager() = default;
+CanvasShutdownManager::~CanvasShutdownManager() = default;
+
+std::vector<RefPtr<CanvasRenderingContext2D>>
+CanvasShutdownManager::RefActiveCanvas() const {
+  std::vector<RefPtr<CanvasRenderingContext2D>> activeCanvas;
+  activeCanvas.reserve(mActiveCanvas.size());
+  for (const auto& canvas : mActiveCanvas) {
+    activeCanvas.emplace_back(canvas);
+  }
+  return activeCanvas;
+}
+
+void CanvasShutdownManager::Destroy() {
+  auto activeCanvas = RefActiveCanvas();
+  mActiveCanvas.clear();
+  for (const auto& canvas : activeCanvas) {
+    canvas->OnShutdown();
+  }
+
+  CanvasManagerChild::Shutdown();
+  mWorkerRef = nullptr;
+}
+
+ void CanvasShutdownManager::Shutdown() {
+  auto* manager = MaybeGet();
+  if (!manager) {
+    return;
+  }
+
+  {
+    StaticMutexAutoLock lock(sManagersMutex);
+    sManagers.erase(manager);
+  }
+
+  sLocalManager.set(nullptr);
+  manager->Destroy();
+  delete manager;
+}
+
+ CanvasShutdownManager* CanvasShutdownManager::MaybeGet() {
+  if (NS_WARN_IF(!sLocalManager.init())) {
+    return nullptr;
+  }
+
+  return sLocalManager.get();
+}
+
+ CanvasShutdownManager* CanvasShutdownManager::Get() {
+  if (NS_WARN_IF(!sLocalManager.init())) {
+    return nullptr;
+  }
+
+  CanvasShutdownManager* managerWeak = sLocalManager.get();
+  if (managerWeak) {
+    return managerWeak;
+  }
+
+  if (WorkerPrivate* worker = dom::GetCurrentThreadWorkerPrivate()) {
+    RefPtr<StrongWorkerRef> workerRef = StrongWorkerRef::Create(
+        worker, "CanvasShutdownManager", []() { Shutdown(); });
+    if (NS_WARN_IF(!workerRef)) {
+      return nullptr;
+    }
+
+    CanvasShutdownManager* manager = new CanvasShutdownManager(workerRef);
+    sLocalManager.set(manager);
+
+    StaticMutexAutoLock lock(sManagersMutex);
+    sManagers.insert(manager);
+    return manager;
+  }
+
+  if (NS_IsMainThread()) {
+    if (AppShutdown::IsInOrBeyond(ShutdownPhase::AppShutdownConfirmed)) {
+      return nullptr;
+    }
+
+    CanvasShutdownManager* manager = new CanvasShutdownManager();
+    sLocalManager.set(manager);
+
+    StaticMutexAutoLock lock(sManagersMutex);
+    sManagers.insert(manager);
+    return manager;
+  }
+
+  MOZ_ASSERT_UNREACHABLE("Can only be used on main or DOM worker threads!");
+  return nullptr;
+}
+
+void CanvasShutdownManager::AddShutdownObserver(
+    dom::CanvasRenderingContext2D* aCanvas) {
+  mActiveCanvas.insert(aCanvas);
+}
+
+void CanvasShutdownManager::RemoveShutdownObserver(
+    dom::CanvasRenderingContext2D* aCanvas) {
+  mActiveCanvas.erase(aCanvas);
+}
+
+void CanvasShutdownManager::OnRemoteCanvasLost() {
+  for (const auto& canvas : RefActiveCanvas()) {
+    canvas->OnRemoteCanvasLost();
+  }
+}
+
+void CanvasShutdownManager::OnRemoteCanvasRestored() {
+  for (const auto& canvas : RefActiveCanvas()) {
+    canvas->OnRemoteCanvasRestored();
+  }
+}
+
+void CanvasShutdownManager::OnRemoteCanvasReset(
+    const nsTArray<layers::RemoteTextureOwnerId>& aOwnerIds) {
+  if (aOwnerIds.IsEmpty()) {
+    return;
+  }
+
+  for (const auto& canvas : RefActiveCanvas()) {
+    auto* bufferProvider = canvas->GetBufferProvider();
+    if (!bufferProvider) {
+      continue;
+    }
+
+    Maybe<layers::RemoteTextureOwnerId> ownerId =
+        bufferProvider->GetRemoteTextureOwnerId();
+    if (!ownerId) {
+      continue;
+    }
+
+    if (aOwnerIds.Contains(*ownerId)) {
+      canvas->OnRemoteCanvasLost();
+      canvas->OnRemoteCanvasRestored();
+    }
+  }
+}
+
+ void CanvasShutdownManager::MaybeRestoreRemoteCanvas() {
+  if (CanvasShutdownManager* manager = MaybeGet()) {
+    if (!manager->mActiveCanvas.empty()) {
+      CanvasManagerChild::Get();
+    }
+  }
+}
+
+ void CanvasShutdownManager::OnCompositorManagerRestored() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  class RestoreRunnable final : public dom::MainThreadWorkerRunnable {
+   public:
+    RestoreRunnable()
+        : MainThreadWorkerRunnable("CanvasShutdownManager::RestoreRunnable") {}
+
+    bool WorkerRun(JSContext*, WorkerPrivate*) override {
+      MaybeRestoreRemoteCanvas();
+      return true;
+    }
+  };
+
+  MaybeRestoreRemoteCanvas();
+
+  StaticMutexAutoLock lock(sManagersMutex);
+  for (const auto& manager : sManagers) {
+    if (manager->mWorkerRef) {
+      auto task = MakeRefPtr<RestoreRunnable>();
+      task->Dispatch(manager->mWorkerRef->Private());
+    }
+  }
+}
+
+}  

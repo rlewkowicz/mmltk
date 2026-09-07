@@ -1,0 +1,132 @@
+/*
+ * Copyright 2008 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "include/core/SkPoint.h"
+#include "include/core/SkTypes.h"
+#include "include/private/base/SkFloatingPoint.h"
+#include "src/core/SkPointPriv.h"
+
+#include <cmath>
+
+
+void SkPoint::scale(float scale, SkPoint* dst) const {
+    SkASSERT(dst);
+    dst->set(fX * scale, fY * scale);
+}
+
+bool SkPoint::normalize() {
+    return this->setLength(fX, fY, 1);
+}
+
+bool SkPoint::setNormalize(float x, float y) {
+    return this->setLength(x, y, 1);
+}
+
+bool SkPoint::setLength(float length) {
+    return this->setLength(fX, fY, length);
+}
+
+template <bool use_rsqrt> bool set_point_length(SkPoint* pt, float x, float y, float length,
+                                                float* orig_length = nullptr) {
+    SkASSERT(!use_rsqrt || (orig_length == nullptr));
+
+    double xx = x;
+    double yy = y;
+    double dmag = sqrt(xx * xx + yy * yy);
+    double dscale = sk_ieee_double_divide(length, dmag);
+    x *= dscale;
+    y *= dscale;
+    if (!SkIsFinite(x, y) || (x == 0 && y == 0)) {
+        pt->set(0, 0);
+        return false;
+    }
+    float mag = 0;
+    if (orig_length) {
+        mag = sk_double_to_float(dmag);
+    }
+    pt->set(x, y);
+    if (orig_length) {
+        *orig_length = mag;
+    }
+    return true;
+}
+
+float SkPoint::Normalize(SkPoint* pt) {
+    float mag;
+    if (set_point_length<false>(pt, pt->fX, pt->fY, 1.0f, &mag)) {
+        return mag;
+    }
+    return 0;
+}
+
+float SkPoint::Length(float dx, float dy) {
+    float mag2 = dx * dx + dy * dy;
+    if (SkIsFinite(mag2)) {
+        return std::sqrt(mag2);
+    } else {
+        double xx = dx;
+        double yy = dy;
+        return sk_double_to_float(sqrt(xx * xx + yy * yy));
+    }
+}
+
+bool SkPoint::setLength(float x, float y, float length) {
+    return set_point_length<false>(this, x, y, length);
+}
+
+bool SkPointPriv::SetLengthFast(SkPoint* pt, float length) {
+    return set_point_length<true>(pt, pt->fX, pt->fY, length);
+}
+
+
+
+float SkPointPriv::DistanceToLineBetweenSqd(const SkPoint& pt, const SkPoint& a,
+                                               const SkPoint& b,
+                                               Side* side) {
+
+    SkVector u = b - a;
+    SkVector v = pt - a;
+
+    float uLengthSqd = LengthSqd(u);
+    float det = u.cross(v);
+    if (side) {
+        SkASSERT(-1 == kLeft_Side &&
+                  0 == kOn_Side &&
+                  1 == kRight_Side);
+        *side = (Side)sk_float_sgn(det);
+    }
+    float temp = sk_ieee_float_divide(det, uLengthSqd);
+    temp *= det;
+    if (!SkIsFinite(temp)) {
+        return LengthSqd(v);
+    }
+    return temp;
+}
+
+float SkPointPriv::DistanceToLineSegmentBetweenSqd(const SkPoint& pt, const SkPoint& a,
+                                                      const SkPoint& b) {
+
+    SkVector u = b - a;
+    SkVector v = pt - a;
+
+    float uLengthSqd = LengthSqd(u);
+    float uDotV = SkPoint::DotProduct(u, v);
+
+    if (uDotV <= 0) {
+        return LengthSqd(v);
+    } else if (uDotV > uLengthSqd) {
+        return DistanceToSqd(b, pt);
+    } else {
+        float det = u.cross(v);
+        float temp = sk_ieee_float_divide(det, uLengthSqd);
+        temp *= det;
+        if (!SkIsFinite(temp)) {
+            return LengthSqd(v);
+        }
+        return temp;
+    }
+}

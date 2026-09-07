@@ -1,0 +1,99 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_image_AnimationSurfaceProvider_h
+#define mozilla_image_AnimationSurfaceProvider_h
+
+#include "AnimationFrameBuffer.h"
+#include "Decoder.h"
+#include "FrameAnimator.h"
+#include "IDecodingTask.h"
+#include "ISurfaceProvider.h"
+#include "mozilla/UniquePtr.h"
+
+namespace mozilla {
+namespace layers {
+class SharedSurfacesAnimation;
+}
+
+namespace image {
+
+class AnimationSurfaceProvider final : public ISurfaceProvider,
+                                       public IDecodingTask,
+                                       public IDecoderFrameRecycler {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(AnimationSurfaceProvider, override)
+
+  AnimationSurfaceProvider(NotNull<RasterImage*> aImage,
+                           const SurfaceKey& aSurfaceKey,
+                           NotNull<Decoder*> aDecoder, size_t aCurrentFrame);
+
+
+ public:
+  bool IsFinished() const override;
+  bool IsFullyDecoded() const override;
+  size_t LogicalSizeInBytes() const override;
+  void AddSizeOfExcludingThis(MallocSizeOf aMallocSizeOf,
+                              const AddSizeOfCb& aCallback) override;
+  void Reset() override;
+  void Advance(size_t aFrame) override;
+  bool MayAdvance() const override { return mCompositedFrameRequested; }
+  void MarkMayAdvance() override { mCompositedFrameRequested = true; }
+
+ protected:
+  DrawableFrameRef DrawableRef(size_t aFrame) override;
+  already_AddRefed<imgFrame> GetFrame(size_t aFrame) override;
+
+  bool IsLocked() const override { return true; }
+  void SetLocked(bool) override {}
+
+
+ public:
+  void Run() override;
+  bool ShouldPreferSyncRun() const override;
+
+  TaskPriority Priority() const override { return TaskPriority::eLow; }
+
+
+ public:
+  RawAccessFrameRef RecycleFrame(gfx::IntRect& aRecycleRect) override;
+
+
+ public:
+  nsresult UpdateKey(layers::RenderRootStateManager* aManager,
+                     wr::IpcResourceUpdateQueue& aResources,
+                     wr::ImageKey& aKey) override;
+
+ private:
+  virtual ~AnimationSurfaceProvider();
+
+  void DropImageReference();
+  void AnnounceSurfaceAvailable();
+  void FinishDecoding();
+  void RequestFrameDiscarding();
+
+  bool CheckForNewFrameAtYield();
+
+  bool CheckForNewFrameAtTerminalState();
+
+  RefPtr<RasterImage> mImage;
+
+  mutable Mutex mDecodingMutex MOZ_UNANNOTATED;
+
+  RefPtr<Decoder> mDecoder;
+
+  mutable Mutex mFramesMutex MOZ_UNANNOTATED;
+
+  UniquePtr<AnimationFrameBuffer> mFrames;
+
+  bool mCompositedFrameRequested;
+
+  RefPtr<layers::SharedSurfacesAnimation> mSharedAnimation;
+};
+
+}  
+}  
+
+#endif  // mozilla_image_AnimationSurfaceProvider_h

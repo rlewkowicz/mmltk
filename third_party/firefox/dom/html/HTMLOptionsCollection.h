@@ -1,0 +1,49 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef mozilla_dom_HTMLOptionsCollection_h
+#define mozilla_dom_HTMLOptionsCollection_h
+
+#include "mozilla/dom/ContentList.h"
+#include "mozilla/dom/HTMLOptionElement.h"
+
+namespace mozilla {
+class ErrorResult;
+
+namespace dom {
+
+class DocGroup;
+class HTMLElementOrLong;
+class HTMLOptionElementOrHTMLOptGroupElement;
+class HTMLSelectElement;
+
+class HTMLOptionsCollection final : public ContentList {
+ public:
+  HTMLOptionsCollection(HTMLSelectElement*, bool aFromParser);
+  HTMLSelectElement* Select() const;
+  DocGroup* GetDocGroup() const { return mRootNode->GetDocGroup(); }
+  static bool IsValidOption(const HTMLOptionElement&, const HTMLSelectElement&);
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  HTMLOptionElement* ItemAsOption(uint32_t aIndex) {
+    return static_cast<HTMLOptionElement*>(ContentList::Item(aIndex));
+  }
+
+  nsresult GetOptionIndex(Element* aOption, int32_t aStartIndex, bool aForward,
+                          int32_t* aIndex);
+
+  void Add(const HTMLOptionElementOrHTMLOptGroupElement& aElement,
+           const Nullable<HTMLElementOrLong>& aBefore, ErrorResult& aError);
+  void Remove(int32_t aIndex);
+  int32_t SelectedIndex();
+  void SetSelectedIndex(int32_t aSelectedIndex);
+  void IndexedSetter(uint32_t aIndex, HTMLOptionElement* aOption,
+                     ErrorResult& aError);
+  void SetLength(uint32_t aLength, ErrorResult& aError);
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_HTMLOptionsCollection_h

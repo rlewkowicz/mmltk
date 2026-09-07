@@ -1,0 +1,102 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef WebAudioUtils_h_
+#define WebAudioUtils_h_
+
+#include <cmath>
+#include <limits>
+#include <type_traits>
+
+#include "MediaSegment.h"
+#include "fdlibm.h"
+#include "mozilla/Logging.h"
+
+typedef struct SpeexResamplerState_ SpeexResamplerState;
+
+namespace mozilla {
+
+extern LazyLogModule gWebAudioAPILog;
+#define WEB_AUDIO_API_LOG(...) \
+  MOZ_LOG_FMT(gWebAudioAPILog, LogLevel::Debug, __VA_ARGS__)
+#define WEB_AUDIO_API_LOG_TEST(...) \
+  MOZ_LOG_TEST(gWebAudioAPILog, LogLevel::Debug)
+
+namespace dom::WebAudioUtils {
+
+const size_t MaxChannelCount = 32;
+const uint32_t MinSampleRate = 3000;
+const uint32_t MaxSampleRate = 768000;
+
+inline bool FuzzyEqual(float v1, float v2) { return fabsf(v1 - v2) < 1e-7f; }
+inline bool FuzzyEqual(double v1, double v2) { return fabs(v1 - v2) < 1e-7; }
+
+inline float ConvertLinearToDecibels(float aLinearValue, float aMinDecibels) {
+  MOZ_ASSERT(aLinearValue >= 0);
+  return aLinearValue > 0.0f ? 20.0f * fdlibm_log10f(aLinearValue)
+                             : aMinDecibels;
+}
+
+inline float ConvertDecibelsToLinear(float aDecibels) {
+  return fdlibm_powf(10.0f, 0.05f * aDecibels);
+}
+
+inline void FixNaN(float& aFloat) {
+  if (std::isnan(aFloat) || std::isinf(aFloat)) {
+    aFloat = 0.0f;
+  }
+}
+
+inline double DiscreteTimeConstantForSampleRate(double timeConstant,
+                                                double sampleRate) {
+  return 1.0 - fdlibm_exp(-1.0 / (sampleRate * timeConstant));
+}
+
+inline bool IsTimeValid(double aTime) {
+  return aTime >= 0 && aTime <= (MEDIA_TIME_MAX >> TRACK_RATE_MAX_BITS);
+}
+
+template <typename IntType, typename FloatType>
+IntType TruncateFloatToInt(FloatType f) {
+  using std::numeric_limits;
+  static_assert(std::is_integral_v<IntType> == true,
+                "IntType must be an integral type");
+  static_assert(std::is_floating_point_v<FloatType> == true,
+                "FloatType must be a floating point type");
+
+  if (std::isnan(f)) {
+    MOZ_CRASH("We should never see a NaN here");
+  }
+
+  if (f >= FloatType(numeric_limits<IntType>::max())) {
+    return numeric_limits<IntType>::max();
+  }
+
+  if (f <= FloatType(numeric_limits<IntType>::min())) {
+    return numeric_limits<IntType>::min();
+  }
+
+  return IntType(f);
+}
+
+void Shutdown();
+
+int SpeexResamplerProcess(SpeexResamplerState* aResampler, uint32_t aChannel,
+                          const float* aIn, uint32_t* aInLen, float* aOut,
+                          uint32_t* aOutLen);
+
+int SpeexResamplerProcess(SpeexResamplerState* aResampler, uint32_t aChannel,
+                          const int16_t* aIn, uint32_t* aInLen, float* aOut,
+                          uint32_t* aOutLen);
+
+int SpeexResamplerProcess(SpeexResamplerState* aResampler, uint32_t aChannel,
+                          const int16_t* aIn, uint32_t* aInLen, int16_t* aOut,
+                          uint32_t* aOutLen);
+
+void LogToDeveloperConsole(uint64_t aWindowID, const char* aKey);
+
+}  
+}  
+
+#endif

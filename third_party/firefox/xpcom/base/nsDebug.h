@@ -1,0 +1,252 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsDebug_h_
+#define nsDebug_h_
+
+#include "nscore.h"
+#include "nsError.h"
+
+#include "nsXPCOM.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/glue/Debug.h"
+#include "mozilla/Likely.h"
+
+#ifdef DEBUG
+#  include "mozilla/ErrorNames.h"
+#  include "mozilla/IntegerPrintfMacros.h"
+#  include "mozilla/Printf.h"
+#endif
+
+#ifdef __cplusplus
+#  ifdef DEBUG
+[[nodiscard]] inline bool NS_warn_if_impl(bool aCondition, const char* aExpr,
+                                          const char* aFile, int32_t aLine) {
+  if (MOZ_UNLIKELY(aCondition)) {
+    NS_DebugBreak(NS_DEBUG_WARNING, nullptr, aExpr, aFile, aLine);
+  }
+  return aCondition;
+}
+#    define NS_WARN_IF(condition) \
+      NS_warn_if_impl(condition, #condition, __FILE__, __LINE__)
+#  else
+#    define NS_WARN_IF(condition) (bool)(condition)
+#  endif
+#endif
+
+#ifdef DEBUG
+#  define NS_WARNING_ASSERTION(_expr, _msg)                                \
+    do {                                                                   \
+      if (!(_expr)) {                                                      \
+        NS_DebugBreak(NS_DEBUG_WARNING, _msg, #_expr, __FILE__, __LINE__); \
+      }                                                                    \
+    } while (false)
+#else
+#  define NS_WARNING_ASSERTION(_expr, _msg) \
+    do {                       \
+    } while (false)
+#endif
+
+#ifdef DEBUG
+inline void MOZ_PretendNoReturn() MOZ_PRETEND_NORETURN_FOR_STATIC_ANALYSIS {}
+#  define NS_ASSERTION(expr, str)                                          \
+    do {                                                                   \
+      if (!(expr)) {                                                       \
+        NS_DebugBreak(NS_DEBUG_ASSERTION, str, #expr, __FILE__, __LINE__); \
+        MOZ_PretendNoReturn();                                             \
+      }                                                                    \
+    } while (0)
+#else
+#  define NS_ASSERTION(expr, str) \
+    do {             \
+    } while (0)
+#endif
+
+#ifdef DEBUG
+#  define NS_ERROR(str)                                                    \
+    do {                                                                   \
+      NS_DebugBreak(NS_DEBUG_ASSERTION, str, "Error", __FILE__, __LINE__); \
+      MOZ_PretendNoReturn();                                               \
+    } while (0)
+#else
+#  define NS_ERROR(str) \
+    do {   \
+    } while (0)
+#endif
+
+#ifdef DEBUG
+#  define NS_WARNING(str) \
+    NS_DebugBreak(NS_DEBUG_WARNING, str, nullptr, __FILE__, __LINE__)
+#else
+#  define NS_WARNING(str) \
+    do {     \
+    } while (0)
+#endif
+
+#ifdef DEBUG
+#  define NS_BREAK()                                                       \
+    do {                                                                   \
+      NS_DebugBreak(NS_DEBUG_BREAK, nullptr, nullptr, __FILE__, __LINE__); \
+      MOZ_PretendNoReturn();                                               \
+    } while (0)
+#else
+#  define NS_BREAK()   \
+    do {  \
+    } while (0)
+#endif
+
+
+#ifndef HAVE_STATIC_ANNOTATIONS
+#  define HAVE_STATIC_ANNOTATIONS
+
+#  ifdef XGILL_PLUGIN
+
+#    define STATIC_PRECONDITION(COND) __attribute__((precondition(#COND)))
+#    define STATIC_PRECONDITION_ASSUME(COND) \
+      __attribute__((precondition_assume(#COND)))
+#    define STATIC_POSTCONDITION(COND) __attribute__((postcondition(#COND)))
+#    define STATIC_POSTCONDITION_ASSUME(COND) \
+      __attribute__((postcondition_assume(#COND)))
+#    define STATIC_INVARIANT(COND) __attribute__((invariant(#COND)))
+#    define STATIC_INVARIANT_ASSUME(COND) \
+      __attribute__((invariant_assume(#COND)))
+
+#    define STATIC_PASTE2(X, Y) X##Y
+#    define STATIC_PASTE1(X, Y) STATIC_PASTE2(X, Y)
+
+#    define STATIC_ASSUME(COND)                                          \
+      do {                                                               \
+        __attribute__((assume_static(#COND), unused)) int STATIC_PASTE1( \
+            assume_static_, __COUNTER__);                                \
+      } while (false)
+
+#    define STATIC_ASSERT_RUNTIME(COND)                                   \
+      do {                                                                \
+        __attribute__((assert_static_runtime(#COND),                      \
+                       unused)) int STATIC_PASTE1(assert_static_runtime_, \
+                                                  __COUNTER__);           \
+      } while (false)
+
+#  else /* XGILL_PLUGIN */
+
+#    define STATIC_PRECONDITION(COND)         /* nothing */
+#    define STATIC_PRECONDITION_ASSUME(COND)  /* nothing */
+#    define STATIC_POSTCONDITION(COND)        /* nothing */
+#    define STATIC_POSTCONDITION_ASSUME(COND) /* nothing */
+#    define STATIC_INVARIANT(COND)            /* nothing */
+#    define STATIC_INVARIANT_ASSUME(COND)     /* nothing */
+
+#    define STATIC_ASSUME(COND) \
+      do {         \
+      } while (false)
+#    define STATIC_ASSERT_RUNTIME(COND) \
+      do {                 \
+      } while (false)
+
+#  endif /* XGILL_PLUGIN */
+
+#  define STATIC_SKIP_INFERENCE STATIC_INVARIANT(skip_inference())
+
+#endif /* HAVE_STATIC_ANNOTATIONS */
+
+
+
+#define NS_ENSURE_TRUE(x, ret)                     \
+  do {                                             \
+    if (MOZ_UNLIKELY(!(x))) {                      \
+      NS_WARNING("NS_ENSURE_TRUE(" #x ") failed"); \
+      return ret;                                  \
+    }                                              \
+  } while (false)
+
+#define NS_ENSURE_FALSE(x, ret) NS_ENSURE_TRUE(!(x), ret)
+
+#define NS_ENSURE_TRUE_VOID(x)                     \
+  do {                                             \
+    if (MOZ_UNLIKELY(!(x))) {                      \
+      NS_WARNING("NS_ENSURE_TRUE(" #x ") failed"); \
+      return;                                      \
+    }                                              \
+  } while (false)
+
+#define NS_ENSURE_FALSE_VOID(x) NS_ENSURE_TRUE_VOID(!(x))
+
+
+#if defined(DEBUG) && !defined(XPCOM_GLUE_AVOID_NSPR)
+
+#  define NS_ENSURE_SUCCESS_BODY(res, ret)                         \
+    const char* name = mozilla::GetStaticErrorName(__rv);          \
+    mozilla::SmprintfPointer msg = mozilla::Smprintf(              \
+        "NS_ENSURE_SUCCESS(%s, %s) failed with "                   \
+        "result 0x%" PRIX32 "%s%s%s",                              \
+        #res, #ret, static_cast<uint32_t>(__rv), name ? " (" : "", \
+        name ? name : "", name ? ")" : "");                        \
+    NS_WARNING(msg.get());
+
+#  define NS_ENSURE_SUCCESS_BODY_VOID(res)                                     \
+    const char* name = mozilla::GetStaticErrorName(__rv);                      \
+    mozilla::SmprintfPointer msg = mozilla::Smprintf(                          \
+        "NS_ENSURE_SUCCESS_VOID(%s) failed with "                              \
+        "result 0x%" PRIX32 "%s%s%s",                                          \
+        #res, static_cast<uint32_t>(__rv), name ? " (" : "", name ? name : "", \
+        name ? ")" : "");                                                      \
+    NS_WARNING(msg.get());
+
+#else
+
+#  define NS_ENSURE_SUCCESS_BODY(res, ret) \
+    NS_WARNING("NS_ENSURE_SUCCESS(" #res ", " #ret ") failed");
+
+#  define NS_ENSURE_SUCCESS_BODY_VOID(res) \
+    NS_WARNING("NS_ENSURE_SUCCESS_VOID(" #res ") failed");
+
+#endif
+
+#define NS_ENSURE_SUCCESS(res, ret)                                \
+  do {                                                             \
+    nsresult __rv = res;  \
+    if (NS_FAILED(__rv)) {                                         \
+      NS_ENSURE_SUCCESS_BODY(res, ret)                             \
+      return ret;                                                  \
+    }                                                              \
+  } while (false)
+
+#define NS_ENSURE_SUCCESS_VOID(res)    \
+  do {                                 \
+    nsresult __rv = res;               \
+    if (NS_FAILED(__rv)) {             \
+      NS_ENSURE_SUCCESS_BODY_VOID(res) \
+      return;                          \
+    }                                  \
+  } while (false)
+
+
+#define NS_ENSURE_ARG(arg) NS_ENSURE_TRUE(arg, NS_ERROR_INVALID_ARG)
+
+#define NS_ENSURE_ARG_POINTER(arg) NS_ENSURE_TRUE(arg, NS_ERROR_INVALID_POINTER)
+
+#define NS_ENSURE_ARG_MIN(arg, min) \
+  NS_ENSURE_TRUE((arg) >= min, NS_ERROR_INVALID_ARG)
+
+#define NS_ENSURE_ARG_MAX(arg, max) \
+  NS_ENSURE_TRUE((arg) <= max, NS_ERROR_INVALID_ARG)
+
+#define NS_ENSURE_ARG_RANGE(arg, min, max) \
+  NS_ENSURE_TRUE(((arg) >= min) && ((arg) <= max), NS_ERROR_INVALID_ARG)
+
+#define NS_ENSURE_STATE(state) NS_ENSURE_TRUE(state, NS_ERROR_UNEXPECTED)
+
+
+#if (defined(DEBUG) || (defined(NIGHTLY_BUILD) && !defined(MOZ_PROFILING))) && \
+    !defined(XPCOM_GLUE_AVOID_NSPR)
+#  define MOZ_THREAD_SAFETY_OWNERSHIP_CHECKS_SUPPORTED 1
+#endif
+
+#ifdef MOZILLA_INTERNAL_API
+void NS_ABORT_OOM(size_t aSize);
+#else
+inline void NS_ABORT_OOM(size_t) { MOZ_CRASH(); }
+#endif
+
+#endif /* nsDebug_h_ */

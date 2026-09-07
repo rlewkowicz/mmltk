@@ -1,0 +1,3083 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/FontPropertyTypes.h"
+#include "mozilla/RDDProcessManager.h"
+#include "mozilla/image/ImageMemoryReporter.h"
+#include "mozilla/layers/CompositorManagerChild.h"
+#include "mozilla/layers/CompositorThread.h"
+#include "mozilla/layers/ImageBridgeChild.h"
+#include "mozilla/layers/ISurfaceAllocator.h"  // for GfxMemoryImageReporter
+#include "mozilla/layers/CompositorBridgeChild.h"
+#include "mozilla/layers/RemoteTextureMap.h"
+#include "mozilla/layers/VideoBridgeParent.h"
+#include "mozilla/webrender/RenderThread.h"
+#include "mozilla/webrender/WebRenderAPI.h"
+#include "mozilla/webrender/webrender_ffi.h"
+#include "mozilla/gfx/BuildConstants.h"
+#include "mozilla/gfx/gfxConfigManager.h"
+#include "mozilla/gfx/gfxVars.h"
+#include "mozilla/gfx/GPUProcessManager.h"
+#include "mozilla/gfx/GraphicsMessages.h"
+#include "mozilla/gfx/CanvasRenderThread.h"
+#include "mozilla/gfx/CanvasShutdownManager.h"
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/EnumTypeTraits.h"
+#include "mozilla/StaticPrefs_apz.h"
+#include "mozilla/StaticPrefs_bidi.h"
+#include "mozilla/StaticPrefs_gfx.h"
+#include "mozilla/StaticPrefs_layout.h"
+#include "mozilla/StaticPrefs_layers.h"
+#include "mozilla/StaticPrefs_media.h"
+#include "mozilla/StaticPrefs_privacy.h"
+#include "mozilla/StaticPrefs_webgl.h"
+#include "mozilla/StaticPrefs_widget.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/IntegerPrintfMacros.h"
+#include "mozilla/Base64.h"
+#include "mozilla/VsyncDispatcher.h"
+
+#include "mozilla/Logging.h"
+#include "mozilla/Components.h"
+#include "nsAppRunner.h"
+#include "nsAppDirectoryServiceDefs.h"
+#include "nsCSSProps.h"
+#include "nsContentUtils.h"
+
+#include "gfxPlatform.h"
+#include "gfxPlatformWorker.h"
+
+#include "gfxBlur.h"
+#include "gfxEnv.h"
+#include "gfxTextRun.h"
+#include "gfxUserFontSet.h"
+#include "gfxConfig.h"
+#include "GfxDriverInfo.h"
+
+#  include <unistd.h>
+
+#include "nsXULAppAPI.h"
+#include "nsDirectoryServiceUtils.h"
+#include "nsDirectoryServiceDefs.h"
+
+#if defined(MOZ_WIDGET_GTK)
+#  include "gfxPlatformGtk.h"
+#  include "DMABufFormats.h"
+#endif
+
+
+#include "gfxPlatformFontList.h"
+#include "gfxContext.h"
+#include "gfxImageSurface.h"
+#include "nsUnicodeProperties.h"
+#include "harfbuzz/hb.h"
+#include "gfx2DGlue.h"
+#include "gfxGradientCache.h"
+#include "gfxUtils.h"  // for NextPowerOfTwo
+#include "gfxFontMissingGlyphs.h"
+
+#include "nsServiceManagerUtils.h"
+#include "nsTArray.h"
+#include "nsIObserverService.h"
+#include "mozilla/widget/Screen.h"
+#include "mozilla/widget/ScreenManager.h"
+#include "MainThreadUtils.h"
+
+#include "nsWeakReference.h"
+
+#include "cairo.h"
+#include "qcms.h"
+
+#include "imgITools.h"
+
+#include "nsCRT.h"
+#include "GLContext.h"
+#include "GLContextProvider.h"
+#include "mozilla/gfx/Logging.h"
+
+#if defined(__GNUC__)
+#  pragma GCC diagnostic push
+#  pragma GCC diagnostic ignored "-Wshadow"
+#endif
+#include "skia/include/core/SkGraphics.h"
+#if defined(MOZ_ENABLE_FREETYPE)
+#  include "skia/include/ports/SkTypeface_cairo.h"
+#endif
+#include "mozilla/gfx/SkMemoryReporter.h"
+#if defined(__GNUC__)
+#  pragma GCC diagnostic pop  // -Wshadow
+#endif
+static const uint32_t kDefaultGlyphCacheSize = -1;
+
+#include "mozilla/Preferences.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/Mutex.h"
+
+#include "nsIGfxInfo.h"
+#include "nsIXULRuntime.h"
+#include "VsyncSource.h"
+#include "SoftwareVsyncSource.h"
+#include "nscore.h"  // for NS_FREE_PERMANENT_DATA
+#include "mozilla/dom/ContentChild.h"
+#include "mozilla/dom/ContentParent.h"
+#include "mozilla/dom/TouchEvent.h"
+#include "mozilla/gfx/GPUParent.h"
+#include "prsystem.h"
+
+#include "mozilla/gfx/2D.h"
+#include "mozilla/gfx/SourceSurfaceCairo.h"
+
+using namespace mozilla;
+using namespace mozilla::layers;
+using namespace mozilla::gl;
+using namespace mozilla::gfx;
+
+static bool gEverInitialized = false;
+gfxPlatform* gfxPlatform::gPlatform = nullptr;
+
+Atomic<bool, ReleaseAcquire> gfxPlatform::gCMSInitialized;
+CMSMode gfxPlatform::gCMSMode = CMSMode::Off;
+
+const ContentDeviceData* gContentDeviceInitData = nullptr;
+
+class GraphicsLogForwarder : public mozilla::gfx::LogForwarder {
+ public:
+  GraphicsLogForwarder();
+  void Log(const std::string& aString) override;
+  void CrashAction(LogReason aReason) override;
+  bool UpdateStringsVector(const std::string& aString) override;
+
+  LoggingRecord LoggingRecordCopy() override;
+
+  void SetCircularBufferSize(uint32_t aCapacity);
+
+ private:
+  bool UpdateStringsVectorInternal(const std::string& aString,
+                                   const MutexAutoLock& aProofOfLock);
+
+ private:
+  LoggingRecord mBuffer;
+  uint32_t mMaxCapacity;
+  int32_t mIndex;
+  Mutex mMutex MOZ_UNANNOTATED;
+};
+
+GraphicsLogForwarder::GraphicsLogForwarder()
+    : mMaxCapacity(0),
+      mIndex(-1),
+      mMutex("GraphicsLogForwarder") {}
+
+void GraphicsLogForwarder::SetCircularBufferSize(uint32_t aCapacity) {
+  MutexAutoLock lock(mMutex);
+
+  mMaxCapacity = aCapacity;
+  mBuffer.reserve(static_cast<size_t>(aCapacity));
+}
+
+LoggingRecord GraphicsLogForwarder::LoggingRecordCopy() {
+  MutexAutoLock lock(mMutex);
+  return mBuffer;
+}
+
+bool GraphicsLogForwarder::UpdateStringsVector(const std::string& aString) {
+  MutexAutoLock lock(mMutex);
+  return UpdateStringsVectorInternal(aString, lock);
+}
+
+bool GraphicsLogForwarder::UpdateStringsVectorInternal(
+    const std::string& aString, const MutexAutoLock& aProofOfLock) {
+  if (mMaxCapacity < 2) {
+    return false;
+  }
+
+  mIndex += 1;
+  MOZ_ASSERT(mIndex >= 0);
+
+  int32_t index = mIndex ? (mIndex - 1) % (mMaxCapacity - 1) + 1 : 0;
+  MOZ_ASSERT(index >= 0 && index < (int32_t)mMaxCapacity);
+  MOZ_ASSERT(index <= mIndex && index <= (int32_t)mBuffer.size());
+
+  double tStamp =
+      (TimeStamp::NowLoRes() - TimeStamp::ProcessCreation()).ToSeconds();
+
+  LoggingRecordEntry newEntry(mIndex, aString, tStamp);
+  if (index >= static_cast<int32_t>(mBuffer.size())) {
+    mBuffer.push_back(std::move(newEntry));
+  } else {
+    mBuffer[index] = std::move(newEntry);
+  }
+  return true;
+}
+
+class LogForwarderEvent : public Runnable {
+  virtual ~LogForwarderEvent() = default;
+
+ public:
+  NS_INLINE_DECL_REFCOUNTING_INHERITED(LogForwarderEvent, Runnable)
+
+  explicit LogForwarderEvent(const nsCString& aMessage)
+      : mozilla::Runnable("LogForwarderEvent"), mMessage(aMessage) {}
+
+  NS_IMETHOD Run() override {
+    MOZ_ASSERT(NS_IsMainThread() &&
+               (XRE_IsContentProcess() || XRE_IsGPUProcess()));
+
+    if (XRE_IsContentProcess()) {
+      dom::ContentChild* cc = dom::ContentChild::GetSingleton();
+      (void)cc->SendGraphicsError(mMessage);
+    } else if (XRE_IsGPUProcess()) {
+      GPUParent* gp = GPUParent::GetSingleton();
+      (void)gp->SendGraphicsError(mMessage);
+    }
+
+    return NS_OK;
+  }
+
+ protected:
+  nsCString mMessage;
+};
+
+void GraphicsLogForwarder::Log(const std::string& aString) {
+  MutexAutoLock lock(mMutex);
+
+  UpdateStringsVectorInternal(aString, lock);
+
+  if (!XRE_IsParentProcess()) {
+    nsCString stringToSend(aString.c_str());
+    if (NS_IsMainThread()) {
+      if (XRE_IsContentProcess()) {
+        dom::ContentChild* cc = dom::ContentChild::GetSingleton();
+        (void)cc->SendGraphicsError(stringToSend);
+      } else if (XRE_IsGPUProcess()) {
+        GPUParent* gp = GPUParent::GetSingleton();
+        (void)gp->SendGraphicsError(stringToSend);
+      }
+    } else {
+      nsCOMPtr<nsIRunnable> r1 = new LogForwarderEvent(stringToSend);
+      NS_DispatchToMainThread(r1);
+    }
+  }
+}
+
+void GraphicsLogForwarder::CrashAction(LogReason) {
+#if !defined(RELEASE_OR_BETA)
+  static bool shouldCrash = !gfxEnv::MOZ_GFX_CRASH_TELEMETRY();
+#else
+  static bool shouldCrash = gfxEnv::MOZ_GFX_CRASH_MOZ_CRASH();
+#endif
+
+  if (shouldCrash) {
+    MOZ_CRASH("GFX_CRASH");
+  }
+}
+
+#define GFX_DOWNLOADABLE_FONTS_ENABLED "gfx.downloadable_fonts.enabled"
+
+#define GFX_PREF_FALLBACK_USE_CMAPS \
+  "gfx.font_rendering.fallback.always_use_cmaps"
+
+#define GFX_PREF_OPENTYPE_SVG "gfx.font_rendering.opentype_svg.enabled"
+
+#define GFX_PREF_WORD_CACHE_CHARLIMIT "gfx.font_rendering.wordcache.charlimit"
+#define GFX_PREF_WORD_CACHE_MAXENTRIES "gfx.font_rendering.wordcache.maxentries"
+
+
+#define FONT_VARIATIONS_PREF "layout.css.font-variations.enabled"
+
+static const char* kObservedPrefs[] = {"gfx.downloadable_fonts.",
+                                       "gfx.font_rendering.", nullptr};
+
+static void FontPrefChanged(const char* aPref, void* aData) {
+  MOZ_ASSERT(aPref);
+  NS_ASSERTION(gfxPlatform::GetPlatform(), "the singleton instance has gone");
+  gfxPlatform::GetPlatform()->FontsPrefsChanged(aPref);
+}
+
+void gfxPlatform::OnMemoryPressure(layers::MemoryPressureReason aWhy) {
+  Factory::PurgeAllCaches();
+  gfxGradientCache::PurgeAllCaches();
+  gfxFontMissingGlyphs::Purge();
+  PurgeSkiaFontCache();
+  if (XRE_IsParentProcess()) {
+    layers::CompositorManagerChild* manager =
+        CompositorManagerChild::GetInstance();
+    if (manager) {
+      manager->SendNotifyMemoryPressure();
+    }
+  }
+}
+
+gfxPlatform::gfxPlatform()
+    : mAzureCanvasBackendCollector(this, &gfxPlatform::GetAzureBackendInfo),
+      mApzSupportCollector(this, &gfxPlatform::GetApzSupportInfo),
+      mFrameStatsCollector(this, &gfxPlatform::GetFrameStats),
+      mCMSInfoCollector(this, &gfxPlatform::GetCMSSupportInfo),
+      mDisplayInfoCollector(this, &gfxPlatform::GetDisplayInfo),
+      mOverlayInfoCollector(this, &gfxPlatform::GetOverlayInfo),
+      mSwapChainInfoCollector(this, &gfxPlatform::GetSwapChainInfo),
+      mCompositorBackend(layers::LayersBackend::LAYERS_NONE) {
+  mAllowDownloadableFonts = UNINITIALIZED_VALUE;
+
+  InitBackendPrefs(GetBackendPrefs());
+}
+
+bool gfxPlatform::Initialized() { return !!gPlatform; }
+
+void gfxPlatform::InitChild(const ContentDeviceData& aData) {
+  MOZ_ASSERT(XRE_IsContentProcess());
+  MOZ_ASSERT(!gPlatform,
+             "InitChild() should be called before first GetPlatform()");
+  gContentDeviceInitData = &aData;
+  Init();
+  gContentDeviceInitData = nullptr;
+}
+
+#define WR_DEBUG_PREF "gfx.webrender.debug"
+
+static void SwapIntervalPrefChangeCallback(const char* aPrefName, void*) {
+  bool egl = Preferences::GetBool("gfx.swap-interval.egl", false);
+  bool glx = Preferences::GetBool("gfx.swap-interval.glx", false);
+  gfxVars::SetSwapIntervalEGL(egl);
+  gfxVars::SetSwapIntervalGLX(glx);
+}
+
+#define WR_BOOL_PARAMETER_LIST(_)                                     \
+  _("gfx.webrender.batched-texture-uploads",                          \
+    wr::BoolParameter::BatchedUploads, true)                          \
+  _("gfx.webrender.draw-calls-for-texture-copy",                      \
+    wr::BoolParameter::DrawCallsForTextureCopy, true)                 \
+  _("gfx.webrender.pbo-uploads", wr::BoolParameter::PboUploads, true) \
+  _("gfx.webrender.multithreading", wr::BoolParameter::Multithreading, true)
+
+static void WebRenderBoolParameterChangeCallback(const char*, void*) {
+  uint32_t bits = 0;
+
+#define WR_BOOL_PARAMETER(name, key, default_val) \
+  if (Preferences::GetBool(name, default_val)) {  \
+    bits |= 1 << (uint32_t)key;                   \
+  }
+
+  WR_BOOL_PARAMETER_LIST(WR_BOOL_PARAMETER)
+#undef WR_BOOL_PARAMETER
+
+  gfx::gfxVars::SetWebRenderBoolParameters(bits);
+}
+
+static void RegisterWebRenderBoolParamCallback() {
+#define WR_BOOL_PARAMETER(name, _key, _default_val) \
+  Preferences::RegisterCallback(WebRenderBoolParameterChangeCallback, name);
+
+  WR_BOOL_PARAMETER_LIST(WR_BOOL_PARAMETER)
+#undef WR_BOOL_PARAMETER
+
+  WebRenderBoolParameterChangeCallback(nullptr, nullptr);
+}
+
+static void WebRenderDebugPrefChangeCallback(const char* aPrefName, void*) {
+  wr::DebugFlags flags{0};
+#define GFX_WEBRENDER_DEBUG(suffix, bit)                   \
+  if (Preferences::GetBool(WR_DEBUG_PREF suffix, false)) { \
+    flags |= (bit);                                        \
+  }
+
+  GFX_WEBRENDER_DEBUG(".render-targets", wr::DebugFlags::RENDER_TARGET_DBG)
+  GFX_WEBRENDER_DEBUG(".texture-cache", wr::DebugFlags::TEXTURE_CACHE_DBG)
+  GFX_WEBRENDER_DEBUG(".gpu-time-queries", wr::DebugFlags::GPU_TIME_QUERIES)
+  GFX_WEBRENDER_DEBUG(".gpu-sample-queries", wr::DebugFlags::GPU_SAMPLE_QUERIES)
+  GFX_WEBRENDER_DEBUG(".disable-batching", wr::DebugFlags::DISABLE_BATCHING)
+  GFX_WEBRENDER_DEBUG(".epochs", wr::DebugFlags::EPOCHS)
+  GFX_WEBRENDER_DEBUG(".echo-driver-messages",
+                      wr::DebugFlags::ECHO_DRIVER_MESSAGES)
+  GFX_WEBRENDER_DEBUG(".show-overdraw", wr::DebugFlags::SHOW_OVERDRAW)
+  GFX_WEBRENDER_DEBUG(".texture-cache.clear-evicted",
+                      wr::DebugFlags::TEXTURE_CACHE_DBG_CLEAR_EVICTED)
+  GFX_WEBRENDER_DEBUG(".picture-caching", wr::DebugFlags::PICTURE_CACHING_DBG)
+  GFX_WEBRENDER_DEBUG(".picture-borders", wr::DebugFlags::PICTURE_BORDERS)
+  GFX_WEBRENDER_DEBUG(".force-picture-invalidation",
+                      wr::DebugFlags::FORCE_PICTURE_INVALIDATION)
+  GFX_WEBRENDER_DEBUG(".small-screen", wr::DebugFlags::SMALL_SCREEN)
+  GFX_WEBRENDER_DEBUG(".disable-opaque-pass",
+                      wr::DebugFlags::DISABLE_OPAQUE_PASS)
+  GFX_WEBRENDER_DEBUG(".disable-alpha-pass", wr::DebugFlags::DISABLE_ALPHA_PASS)
+  GFX_WEBRENDER_DEBUG(".disable-clip-masks", wr::DebugFlags::DISABLE_CLIP_MASKS)
+  GFX_WEBRENDER_DEBUG(".disable-text-prims", wr::DebugFlags::DISABLE_TEXT_PRIMS)
+  GFX_WEBRENDER_DEBUG(".disable-gradient-prims",
+                      wr::DebugFlags::DISABLE_GRADIENT_PRIMS)
+  GFX_WEBRENDER_DEBUG(".obscure-images", wr::DebugFlags::OBSCURE_IMAGES)
+  GFX_WEBRENDER_DEBUG(".glyph-flashing", wr::DebugFlags::GLYPH_FLASHING)
+  GFX_WEBRENDER_DEBUG(".window-visibility",
+                      wr::DebugFlags::WINDOW_VISIBILITY_DBG)
+  GFX_WEBRENDER_DEBUG(".restrict-blob-size", wr::DebugFlags::RESTRICT_BLOB_SIZE)
+  GFX_WEBRENDER_DEBUG(".surface-promotion-logging",
+                      wr::DebugFlags::SURFACE_PROMOTION_LOGGING)
+  GFX_WEBRENDER_DEBUG(".missing-snapshot-panic",
+                      wr::DebugFlags::MISSING_SNAPSHOT_PANIC)
+  GFX_WEBRENDER_DEBUG(".missing-snapshot-pink",
+                      wr::DebugFlags::MISSING_SNAPSHOT_PINK)
+  GFX_WEBRENDER_DEBUG(".highlight-backdrop-filters",
+                      wr::DebugFlags::HIGHLIGHT_BACKDROP_FILTERS)
+  GFX_WEBRENDER_DEBUG(".external-composite-borders",
+                      wr::DebugFlags::EXTERNAL_COMPOSITE_BORDERS)
+  GFX_WEBRENDER_DEBUG(".dl.dump-spatial-tree",
+                      wr::DebugFlags::DUMP_SPATIAL_TREE)
+#undef GFX_WEBRENDER_DEBUG
+  gfx::gfxVars::SetWebRenderDebugFlags(flags._0);
+
+  uint32_t threshold = Preferences::GetFloat(
+      StaticPrefs::GetPrefName_gfx_webrender_debug_slow_cpu_frame_threshold(),
+      10.0);
+  gfx::gfxVars::SetWebRenderSlowCpuFrameThreshold(threshold);
+}
+
+static void WebRenderQualityPrefChangeCallback(const char* aPref, void*) {
+  gfxPlatform::GetPlatform()->UpdateForceSubpixelAAWherePossible();
+}
+
+static void WebRenderBatchingPrefChangeCallback(const char* aPrefName, void*) {
+  uint32_t count = Preferences::GetUint(
+      StaticPrefs::GetPrefName_gfx_webrender_batching_lookback(), 10);
+
+  gfx::gfxVars::SetWebRenderBatchingLookback(count);
+}
+
+static void WebRenderBlobTileSizePrefChangeCallback(const char* aPrefName,
+                                                    void*) {
+  uint32_t tileSize = Preferences::GetUint(
+      StaticPrefs::GetPrefName_gfx_webrender_blob_tile_size(), 256);
+  gfx::gfxVars::SetWebRenderBlobTileSize(tileSize);
+}
+
+static void WebRenderUploadThresholdPrefChangeCallback(const char* aPrefName,
+                                                       void*) {
+  int value = Preferences::GetInt(
+      StaticPrefs::GetPrefName_gfx_webrender_batched_upload_threshold(),
+      512 * 512);
+
+  gfxVars::SetWebRenderBatchedUploadThreshold(value);
+}
+
+static uint32_t GetSkiaGlyphCacheSize() {
+  uint32_t cacheSize =
+      StaticPrefs::gfx_content_skia_font_cache_size_AtStartup() * 1024 * 1024;
+  if (mozilla::BrowserTabsRemoteAutostart()) {
+    return XRE_IsContentProcess() ? cacheSize : kDefaultGlyphCacheSize;
+  }
+
+  return cacheSize;
+}
+
+class WebRenderMemoryReporter final : public nsIMemoryReporter {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIMEMORYREPORTER
+
+ private:
+  ~WebRenderMemoryReporter() = default;
+};
+
+struct WebRenderMemoryReporterHelper {
+  WebRenderMemoryReporterHelper(nsIHandleReportCallback* aCallback,
+                                nsISupports* aData)
+      : mCallback(aCallback), mData(aData) {}
+  nsCOMPtr<nsIHandleReportCallback> mCallback;
+  nsCOMPtr<nsISupports> mData;
+
+  void Report(size_t aBytes, const char* aName) const {
+    nsPrintfCString path("explicit/gfx/webrender/%s", aName);
+    nsCString desc("CPU heap memory used by WebRender"_ns);
+    ReportInternal(aBytes, path, desc, nsIMemoryReporter::KIND_HEAP);
+  }
+
+  void ReportTexture(size_t aBytes, const char* aName) const {
+    nsPrintfCString path("gfx/webrender/textures/%s", aName);
+    nsCString desc("GPU texture memory used by WebRender"_ns);
+    ReportInternal(aBytes, path, desc, nsIMemoryReporter::KIND_OTHER);
+  }
+
+  void ReportTotalGPUBytes(size_t aBytes) const {
+    nsCString path("gfx/webrender/total-gpu-bytes"_ns);
+    nsCString desc(nsLiteralCString(
+        "Total GPU bytes used by WebRender (should match textures/ sum)"));
+    ReportInternal(aBytes, path, desc, nsIMemoryReporter::KIND_OTHER);
+  }
+
+  void ReportInternal(size_t aBytes, nsACString& aPath, nsACString& aDesc,
+                      int32_t aKind) const {
+    nsAutoCString processName;
+    if (gfxConfig::IsEnabled(Feature::GPU_PROCESS)) {
+      GPUParent::GetGPUProcessName(processName);
+    }
+
+    mCallback->Callback(processName, aPath, aKind,
+                        nsIMemoryReporter::UNITS_BYTES, aBytes, aDesc, mData);
+  }
+};
+
+static void FinishAsyncMemoryReport() {
+  nsCOMPtr<nsIMemoryReporterManager> imgr =
+      do_GetService("@mozilla.org/memory-reporter-manager;1");
+  if (imgr) {
+    imgr->EndReport();
+  }
+}
+
+// clang-format off
+// (For some reason, clang-format gets the second macro right, but totally mangles the first).
+#define REPORT_INTERNER(id)                      \
+  helper.Report(aReport.interning.interners.id, \
+                "interning/" #id "/interners");
+// clang-format on
+
+#define REPORT_DATA_STORE(id)                     \
+  helper.Report(aReport.interning.data_stores.id, \
+                "interning/" #id "/data-stores");
+
+NS_IMPL_ISUPPORTS(WebRenderMemoryReporter, nsIMemoryReporter)
+
+NS_IMETHODIMP
+WebRenderMemoryReporter::CollectReports(nsIHandleReportCallback* aHandleReport,
+                                        nsISupports* aData, bool aAnonymize) {
+  MOZ_ASSERT(XRE_IsParentProcess());
+  MOZ_ASSERT(NS_IsMainThread());
+  layers::CompositorManagerChild* manager =
+      CompositorManagerChild::GetInstance();
+  if (!manager) {
+    FinishAsyncMemoryReport();
+    return NS_OK;
+  }
+
+  WebRenderMemoryReporterHelper helper(aHandleReport, aData);
+  manager->SendReportMemory(
+      [=](wr::MemoryReport aReport) {
+        helper.Report(aReport.clip_stores, "clip-stores");
+        helper.Report(aReport.hit_testers, "hit-testers");
+        helper.Report(aReport.fonts, "resource-cache/fonts");
+        helper.Report(aReport.weak_fonts, "resource-cache/weak-fonts");
+        helper.Report(aReport.images, "resource-cache/images");
+        helper.Report(aReport.rasterized_blobs,
+                      "resource-cache/rasterized-blobs");
+        helper.Report(aReport.texture_cache_structures,
+                      "texture-cache/structures");
+        helper.Report(aReport.shader_cache, "shader-cache");
+        helper.Report(aReport.display_list, "display-list");
+        helper.Report(aReport.upload_staging_memory, "upload-stagin-memory");
+        helper.Report(aReport.frame_allocator, "frame-allocator");
+        helper.Report(aReport.render_tasks, "frame-allocator/render-tasks");
+
+        WEBRENDER_FOR_EACH_INTERNER(REPORT_INTERNER, );
+        WEBRENDER_FOR_EACH_INTERNER(REPORT_DATA_STORE, );
+
+        helper.ReportTexture(aReport.vertex_data_textures, "vertex-data");
+        helper.ReportTexture(aReport.render_target_textures, "render-targets");
+        helper.ReportTexture(aReport.depth_target_textures, "depth-targets");
+        helper.ReportTexture(aReport.picture_tile_textures, "picture-tiles");
+        helper.ReportTexture(aReport.atlas_textures, "texture-cache/atlas");
+        helper.ReportTexture(aReport.standalone_textures,
+                             "texture-cache/standalone");
+        helper.ReportTexture(aReport.texture_upload_pbos,
+                             "texture-upload-pbos");
+        helper.ReportTexture(aReport.swap_chain, "swap-chains");
+        helper.ReportTexture(aReport.render_texture_hosts,
+                             "render-texture-hosts");
+        helper.ReportTexture(aReport.upload_staging_textures,
+                             "upload-staging-textures");
+
+        FinishAsyncMemoryReport();
+      },
+      [](mozilla::ipc::ResponseRejectReason&& aReason) {
+        FinishAsyncMemoryReport();
+      });
+
+  return NS_OK;
+}
+
+#undef REPORT_INTERNER
+#undef REPORT_DATA_STORE
+
+std::atomic<int8_t> gfxPlatform::sHasVariationFontSupport = -1;
+
+bool gfxPlatform::HasVariationFontSupport() {
+  if (sHasVariationFontSupport < 0) {
+#if defined(MOZ_WIDGET_GTK)
+    sHasVariationFontSupport = gfxPlatformGtk::CheckVariationFontSupport();
+#else
+#  error "No gfxPlatform implementation available"
+#endif
+  }
+  return sHasVariationFontSupport > 0;
+}
+
+void gfxPlatform::Init() {
+  MOZ_RELEASE_ASSERT(!XRE_IsGPUProcess(), "GFX: Not allowed in GPU process.");
+  MOZ_RELEASE_ASSERT(!XRE_IsRDDProcess(), "GFX: Not allowed in RDD process.");
+  MOZ_RELEASE_ASSERT(NS_IsMainThread(), "GFX: Not in main thread.");
+  MOZ_RELEASE_ASSERT(!gEverInitialized);
+  if (XRE_IsContentProcess()) {
+    MOZ_RELEASE_ASSERT(gContentDeviceInitData,
+                       "Content Process should cal InitChild() before "
+                       "first GetPlatform()");
+  }
+  gEverInitialized = true;
+
+  gfxVars::Initialize();
+
+  gfxConfig::Init();
+
+  if (XRE_IsParentProcess()) {
+    GPUProcessManager::Initialize();
+    RDDProcessManager::Initialize();
+
+    nsCOMPtr<nsIFile> file;
+    nsresult rv = NS_GetSpecialDirectory(NS_GRE_DIR, getter_AddRefs(file));
+    if (NS_FAILED(rv)) {
+      gfxVars::SetGREDirectory(nsString());
+    } else {
+      nsAutoString path;
+      file->GetPath(path);
+      gfxVars::SetGREDirectory(nsString(path));
+    }
+  }
+
+  if (XRE_IsParentProcess()) {
+    nsCOMPtr<nsIFile> profDir;
+    nsresult rv = NS_GetSpecialDirectory(NS_APP_PROFILE_DIR_STARTUP,
+                                         getter_AddRefs(profDir));
+    if (NS_FAILED(rv)) {
+      gfxVars::SetProfDirectory(nsString());
+    } else {
+      nsAutoString path;
+      profDir->GetPath(path);
+      gfxVars::SetProfDirectory(nsString(path));
+    }
+
+    nsAutoCString path;
+    Preferences::GetCString("layers.windowrecording.path", path);
+    gfxVars::SetLayersWindowRecordingPath(path);
+
+    if (gFxREmbedded) {
+      gfxVars::SetFxREmbedded(true);
+    }
+  }
+
+  InitMoz2DLogging();
+
+  nsCOMPtr<nsIGfxInfo> gfxInfo;
+  gfxInfo = components::GfxInfo::Service();
+
+  if (XRE_IsParentProcess()) {
+    gfxVars::SetDXInterop2Blocked(IsDXInterop2Blocked());
+    gfxVars::SetDXNV12Blocked(IsDXNV12Blocked());
+    gfxVars::SetDXP010Blocked(IsDXP010Blocked());
+    gfxVars::SetDXP016Blocked(IsDXP016Blocked());
+
+    if (gfxInfo) {
+      nsString adapterVendorID, adapterDeviceID, adapterDriverVersion;
+      gfxInfo->GetAdapterVendorID(adapterVendorID);
+      gfxInfo->GetAdapterDeviceID(adapterDeviceID);
+      gfxInfo->GetAdapterDriverVersion(adapterDriverVersion);
+      gfxVars::SetAdapterVendorID(NS_ConvertUTF16toUTF8(adapterVendorID));
+      gfxVars::SetAdapterDeviceID(NS_ConvertUTF16toUTF8(adapterDeviceID));
+      gfxVars::SetAdapterDriverVersion(
+          NS_ConvertUTF16toUTF8(adapterDriverVersion));
+    }
+  }
+
+#if defined(MOZ_WIDGET_GTK)
+  gPlatform = new gfxPlatformGtk;
+#else
+#  error "No gfxPlatform implementation available"
+#endif
+  gPlatform->PopulateScreenInfo();
+  gPlatform->InitAcceleration();
+  gPlatform->InitWebRenderConfig();
+
+  gPlatform->InitHardwareVideoConfig();
+  gPlatform->InitWebGLConfig();
+  gPlatform->InitWebGPUConfig();
+  gPlatform->InitWindowOcclusionConfig();
+  gPlatform->InitBackdropFilterConfig();
+  gPlatform->InitAcceleratedCanvas2DConfig();
+
+  if (XRE_IsParentProcess()) {
+    Preferences::RegisterCallbackAndCall(
+        VideoDecodingFailedChangedCallback,
+        "media.hardware-video-decoding.failed");
+  }
+
+
+  if (gfxConfig::IsEnabled(Feature::GPU_PROCESS)) {
+    GPUProcessManager* gpu = GPUProcessManager::Get();
+    (void)gpu->LaunchGPUProcess();
+  }
+
+  if (XRE_IsParentProcess()) {
+    RefPtr<VsyncSource> vsyncSource =
+        gfxPlatform::ForceSoftwareVsync()
+            ? gPlatform->GetSoftwareVsyncSource()
+            : gPlatform->GetGlobalHardwareVsyncSource();
+    gPlatform->mVsyncDispatcher = new VsyncDispatcher(vsyncSource);
+
+    Preferences::RegisterCallback(
+        gfxPlatform::ReInitFrameRate,
+        nsDependentCString(StaticPrefs::GetPrefName_layout_frame_rate()));
+    Preferences::RegisterCallback(
+        gfxPlatform::ReInitFrameRate,
+        nsDependentCString(
+            StaticPrefs::GetPrefName_privacy_resistFingerprinting()));
+  }
+
+  gPlatform->InitializeCMS();
+
+  SkGraphics::Init();
+#if defined(MOZ_ENABLE_FREETYPE)
+  SkInitCairoFT(gPlatform->FontHintingEnabled());
+#endif
+  gfxGradientCache::Init();
+
+  InitLayersIPC();
+
+  if (!gPlatform->CreatePlatformFontList()) {
+    MOZ_CRASH("Could not initialize gfxPlatformFontList");
+  }
+
+  gPlatform->mScreenReferenceDrawTarget =
+      gPlatform->CreateOffscreenContentDrawTarget(IntSize(1, 1),
+                                                  SurfaceFormat::B8G8R8A8);
+  if (!gPlatform->mScreenReferenceDrawTarget ||
+      !gPlatform->mScreenReferenceDrawTarget->IsValid()) {
+    if (!gPlatform->DidRenderingDeviceReset()) {
+      gfxCriticalError() << "Could not initialize mScreenReferenceDrawTarget";
+    }
+  }
+
+  if (NS_FAILED(gfxFontCache::Init())) {
+    MOZ_CRASH("Could not initialize gfxFontCache");
+  }
+
+  Preferences::RegisterPrefixCallbacks(FontPrefChanged, kObservedPrefs);
+
+  GLContext::PlatformStartup();
+
+  gPlatform->mMemoryPressureObserver =
+      layers::MemoryPressureObserver::Create(gPlatform);
+
+  nsCOMPtr<imgITools> imgTools = do_GetService("@mozilla.org/image/tools;1");
+  if (!imgTools) {
+    MOZ_CRASH("Could not initialize ImageLib");
+  }
+
+  RegisterStrongMemoryReporter(MakeAndAddRef<GfxMemoryImageReporter>());
+  if (XRE_IsParentProcess()) {
+    RegisterStrongAsyncMemoryReporter(MakeAndAddRef<WebRenderMemoryReporter>());
+  }
+
+  RegisterStrongMemoryReporter(MakeAndAddRef<SkMemoryReporter>());
+
+  uint32_t skiaCacheSize = GetSkiaGlyphCacheSize();
+  if (skiaCacheSize != kDefaultGlyphCacheSize) {
+    SkGraphics::SetFontCacheLimit(skiaCacheSize);
+  }
+
+  InitNullMetadata();
+  InitOpenGLConfig();
+
+  if (XRE_IsParentProcess()) {
+    Preferences::Unlock(FONT_VARIATIONS_PREF);
+    if (!gfxPlatform::HasVariationFontSupport()) {
+      Preferences::SetBool(FONT_VARIATIONS_PREF, false, PrefValueKind::Default);
+      Preferences::SetBool(FONT_VARIATIONS_PREF, false);
+      Preferences::Lock(FONT_VARIATIONS_PREF);
+    }
+  }
+
+  nsCOMPtr<nsIObserverService> obs = services::GetObserverService();
+  if (obs) {
+    obs->NotifyObservers(nullptr, "gfx-features-ready", nullptr);
+  }
+}
+
+void gfxPlatform::InitMemoryReportersForGPUProcess() {
+  MOZ_RELEASE_ASSERT(XRE_IsGPUProcess());
+
+  RegisterStrongMemoryReporter(MakeAndAddRef<GfxMemoryImageReporter>());
+  RegisterStrongMemoryReporter(MakeAndAddRef<SkMemoryReporter>());
+}
+
+static bool IsFeatureSupported(long aFeature, bool aDefault) {
+  nsCOMPtr<nsIGfxInfo> gfxInfo = components::GfxInfo::Service();
+  nsCString blockId;
+  int32_t status;
+  if (!NS_SUCCEEDED(gfxInfo->GetFeatureStatus(aFeature, blockId, &status))) {
+    return aDefault;
+  }
+  return status == nsIGfxInfo::FEATURE_STATUS_OK;
+}
+
+bool gfxPlatform::IsDXInterop2Blocked() {
+  return !IsFeatureSupported(nsIGfxInfo::FEATURE_DX_INTEROP2, false);
+}
+
+bool gfxPlatform::IsDXNV12Blocked() {
+  return !IsFeatureSupported(nsIGfxInfo::FEATURE_DX_NV12, false);
+}
+
+bool gfxPlatform::IsDXP010Blocked() {
+  return !IsFeatureSupported(nsIGfxInfo::FEATURE_DX_P010, false);
+}
+
+bool gfxPlatform::IsDXP016Blocked() {
+  return !IsFeatureSupported(nsIGfxInfo::FEATURE_DX_P016, false);
+}
+
+int32_t gfxPlatform::MaxTextureSize() {
+  const int32_t kMinSizePref = 2048;
+  return std::max(
+      kMinSizePref,
+      StaticPrefs::gfx_max_texture_size_AtStartup_DoNotUseDirectly());
+}
+
+int32_t gfxPlatform::MaxAllocSize() {
+  const int32_t kMinAllocPref = 10000000;
+  return std::max(kMinAllocPref,
+                  StaticPrefs::gfx_max_alloc_size_AtStartup_DoNotUseDirectly());
+}
+
+void gfxPlatform::MaybeInitializeCMS() {
+  if (XRE_IsGPUProcess()) {
+    gCMSInitialized = true;
+    return;
+  }
+  (void)GetPlatform();
+}
+
+void gfxPlatform::InitMoz2DLogging() {
+  auto fwd = new GraphicsLogForwarder();
+  fwd->SetCircularBufferSize(StaticPrefs::gfx_logging_crash_length_AtStartup());
+
+  mozilla::gfx::Config cfg;
+  cfg.mLogForwarder = fwd;
+  cfg.mMaxTextureSize = gfxPlatform::MaxTextureSize();
+  cfg.mMaxAllocSize = gfxPlatform::MaxAllocSize();
+
+  gfx::Factory::Init(cfg);
+}
+
+bool gfxPlatform::UseRemoteCanvas() {
+  return XRE_IsContentProcess() && gfx::gfxVars::UseAcceleratedCanvas2D();
+}
+
+bool gfxPlatform::UseHDR() {
+  return (StaticPrefs::gfx_color_management_hdr() && gfxVars::VideoHDR()) ||
+         StaticPrefs::gfx_color_management_hdr_force_enabled();
+}
+
+bool gfxPlatform::IsBackendAccelerated(
+    const mozilla::gfx::BackendType aBackendType) {
+  return false;
+}
+
+static bool sLayersIPCIsUp = false;
+
+void gfxPlatform::InitNullMetadata() {
+  ScrollMetadata::sNullMetadata = new ScrollMetadata();
+  ClearOnShutdown(&ScrollMetadata::sNullMetadata);
+}
+
+void gfxPlatform::Shutdown() {
+  if (!gPlatform) {
+    return;
+  }
+
+  MOZ_ASSERT(!sLayersIPCIsUp);
+
+  gfxFontCache::Shutdown();
+  gfxGradientCache::Shutdown();
+  gfxGaussianBlur::ShutdownBlurCache();
+  gfxPlatformFontList::Shutdown();
+  gfxFontMissingGlyphs::Shutdown();
+
+  gPlatform->ShutdownCMS();
+
+  Preferences::UnregisterPrefixCallbacks(FontPrefChanged, kObservedPrefs);
+
+  NS_ASSERTION(gPlatform->mMemoryPressureObserver,
+               "mMemoryPressureObserver has already gone");
+  if (gPlatform->mMemoryPressureObserver) {
+    gPlatform->mMemoryPressureObserver->Unregister();
+    gPlatform->mMemoryPressureObserver = nullptr;
+  }
+
+  if (XRE_IsParentProcess()) {
+    if (gPlatform->mGlobalHardwareVsyncSource) {
+      gPlatform->mGlobalHardwareVsyncSource->Shutdown();
+    }
+    if (gPlatform->mSoftwareVsyncSource &&
+        gPlatform->mSoftwareVsyncSource !=
+            gPlatform->mGlobalHardwareVsyncSource) {
+      gPlatform->mSoftwareVsyncSource->Shutdown();
+    }
+  }
+
+  gPlatform->mGlobalHardwareVsyncSource = nullptr;
+  gPlatform->mSoftwareVsyncSource = nullptr;
+  gPlatform->mVsyncDispatcher = nullptr;
+
+  GLContextProvider::Shutdown();
+
+
+  if (XRE_IsParentProcess()) {
+    GPUProcessManager::Shutdown();
+    RDDProcessManager::Shutdown();
+  }
+
+  gfx::Factory::ShutDown();
+  gfxVars::Shutdown();
+  gfxFont::DestroySingletons();
+
+  gfxConfig::Shutdown();
+
+  gPlatform->WillShutdown();
+
+  delete gPlatform;
+  gPlatform = nullptr;
+}
+
+void gfxPlatform::InitLayersIPC() {
+  if (sLayersIPCIsUp) {
+    return;
+  }
+  sLayersIPCIsUp = true;
+
+  if (XRE_IsParentProcess()) {
+    if (!gfxConfig::IsEnabled(Feature::GPU_PROCESS)) {
+      RemoteTextureMap::Init();
+      wr::RenderThread::Start(GPUProcessManager::Get()->AllocateNamespace());
+      image::ImageMemoryReporter::InitForWebRender();
+    }
+
+    layers::CompositorThreadHolder::Start();
+
+    if (!gfxConfig::IsEnabled(Feature::GPU_PROCESS)) {
+      gfx::CanvasRenderThread::Start();
+    }
+  }
+}
+
+void gfxPlatform::ShutdownLayersIPC() {
+  if (!sLayersIPCIsUp) {
+    return;
+  }
+  sLayersIPCIsUp = false;
+
+  if (XRE_IsContentProcess()) {
+    gfx::CanvasShutdownManager::Shutdown();
+    layers::CompositorManagerChild::Shutdown();
+    layers::ImageBridgeChild::ShutDown();
+  } else if (XRE_IsParentProcess()) {
+    VideoBridgeParent::Shutdown();
+    RDDProcessManager::RDDProcessShutdown();
+    gfx::CanvasShutdownManager::Shutdown();
+    layers::CompositorManagerChild::Shutdown();
+    layers::ImageBridgeChild::ShutDown();
+    gfx::CanvasRenderThread::Shutdown();
+    layers::CompositorThreadHolder::Shutdown();
+    RemoteTextureMap::Shutdown();
+    image::ImageMemoryReporter::ShutdownForWebRender();
+    if (wr::RenderThread::Get()) {
+      wr::RenderThread::ShutDown();
+
+      Preferences::UnregisterCallback(WebRenderDebugPrefChangeCallback,
+                                      WR_DEBUG_PREF);
+      Preferences::UnregisterCallback(
+          WebRenderBlobTileSizePrefChangeCallback,
+          nsDependentCString(
+              StaticPrefs::GetPrefName_gfx_webrender_blob_tile_size()));
+    }
+  } else {
+  }
+}
+
+void gfxPlatform::WillShutdown() {
+  mScreenReferenceSurface = nullptr;
+  mScreenReferenceDrawTarget = nullptr;
+
+  SkGraphics::PurgeFontCache();
+
+#if defined(NS_FREE_PERMANENT_DATA)
+  cairo_debug_reset_static_data();
+#endif
+}
+
+gfxPlatform::~gfxPlatform() = default;
+
+already_AddRefed<DrawTarget> gfxPlatform::CreateDrawTargetForSurface(
+    gfxASurface* aSurface, const IntSize& aSize) {
+  SurfaceFormat format = aSurface->GetSurfaceFormat();
+  RefPtr<DrawTarget> drawTarget = Factory::CreateDrawTargetForCairoSurface(
+      aSurface->CairoSurface(), aSize, &format);
+  if (!drawTarget) {
+    gfxWarning() << "gfxPlatform::CreateDrawTargetForSurface failed in "
+                    "CreateDrawTargetForCairoSurface";
+    return nullptr;
+  }
+  return drawTarget.forget();
+}
+
+cairo_user_data_key_t kSourceSurface;
+
+struct SourceSurfaceUserData {
+  RefPtr<SourceSurface> mSrcSurface;
+  BackendType mBackendType;
+};
+
+static void SourceBufferDestroy(void* srcSurfUD) {
+  delete static_cast<SourceSurfaceUserData*>(srcSurfUD);
+}
+
+UserDataKey kThebesSurface;
+
+struct DependentSourceSurfaceUserData {
+  RefPtr<gfxASurface> mSurface;
+};
+
+static void SourceSurfaceDestroyed(void* aData) {
+  delete static_cast<DependentSourceSurfaceUserData*>(aData);
+}
+
+void gfxPlatform::ClearSourceSurfaceForSurface(gfxASurface* aSurface) {
+  aSurface->SetData(&kSourceSurface, nullptr, nullptr);
+}
+
+already_AddRefed<SourceSurface> gfxPlatform::GetSourceSurfaceForSurface(
+    RefPtr<DrawTarget> aTarget, gfxASurface* aSurface, bool aIsPlugin) {
+  if (!aSurface->CairoSurface() || aSurface->CairoStatus()) {
+    return nullptr;
+  }
+
+  if (!aTarget) {
+    aTarget = gfxPlatform::GetPlatform()->ScreenReferenceDrawTarget();
+  }
+
+  void* userData = aSurface->GetData(&kSourceSurface);
+
+  if (userData) {
+    SourceSurfaceUserData* surf = static_cast<SourceSurfaceUserData*>(userData);
+
+    if (surf->mSrcSurface->IsValid() &&
+        surf->mBackendType == aTarget->GetBackendType()) {
+      RefPtr<SourceSurface> srcSurface(surf->mSrcSurface);
+      return srcSurface.forget();
+    }
+  }
+
+  SurfaceFormat format = aSurface->GetSurfaceFormat();
+
+  if (aTarget->GetBackendType() == BackendType::CAIRO) {
+    return Factory::CreateSourceSurfaceForCairoSurface(
+        aSurface->CairoSurface(), aSurface->GetSize(), format);
+  }
+
+  RefPtr<SourceSurface> srcBuffer;
+
+
+  if (!srcBuffer) {
+    RefPtr<DataSourceSurface> surf = GetWrappedDataSourceSurface(aSurface);
+    if (surf) {
+      srcBuffer = aIsPlugin
+                      ? aTarget->OptimizeSourceSurfaceForUnknownAlpha(surf)
+                      : aTarget->OptimizeSourceSurface(surf);
+
+      if (srcBuffer == surf) {
+        return srcBuffer.forget();
+      }
+    }
+  }
+
+  if (!srcBuffer) {
+    MOZ_ASSERT(aTarget->GetBackendType() != BackendType::CAIRO,
+               "We already tried CreateSourceSurfaceFromNativeSurface with a "
+               "DrawTargetCairo above");
+    srcBuffer = Factory::CreateSourceSurfaceForCairoSurface(
+        aSurface->CairoSurface(), aSurface->GetSize(), format);
+    if (srcBuffer) {
+      srcBuffer = aTarget->OptimizeSourceSurface(srcBuffer);
+    }
+  }
+
+  if (!srcBuffer) {
+    return nullptr;
+  }
+
+  if ((srcBuffer->GetType() == SurfaceType::CAIRO &&
+       static_cast<SourceSurfaceCairo*>(srcBuffer.get())->GetSurface() ==
+           aSurface->CairoSurface()) ||
+      (srcBuffer->GetType() == SurfaceType::CAIRO_IMAGE &&
+       static_cast<DataSourceSurfaceCairo*>(srcBuffer.get())->GetSurface() ==
+           aSurface->CairoSurface())) {
+    return srcBuffer.forget();
+  }
+
+  auto* srcSurfUD = new SourceSurfaceUserData;
+  srcSurfUD->mBackendType = aTarget->GetBackendType();
+  srcSurfUD->mSrcSurface = srcBuffer;
+  aSurface->SetData(&kSourceSurface, srcSurfUD, SourceBufferDestroy);
+
+  return srcBuffer.forget();
+}
+
+already_AddRefed<DataSourceSurface> gfxPlatform::GetWrappedDataSourceSurface(
+    gfxASurface* aSurface) {
+  RefPtr<gfxImageSurface> image = aSurface->GetAsImageSurface();
+  if (!image) {
+    return nullptr;
+  }
+  RefPtr<DataSourceSurface> result = Factory::CreateWrappingDataSourceSurface(
+      image->Data(), image->Stride(), image->GetSize(),
+      ImageFormatToSurfaceFormat(image->Format()));
+
+  if (!result) {
+    return nullptr;
+  }
+
+  auto* srcSurfUD = new DependentSourceSurfaceUserData;
+  srcSurfUD->mSurface = aSurface;
+  result->AddUserData(&kThebesSurface, srcSurfUD, SourceSurfaceDestroyed);
+
+  return result.forget();
+}
+
+void gfxPlatform::PopulateScreenInfo() {
+  if (!XRE_IsParentProcess()) {
+    return;
+  }
+
+  nsCOMPtr<nsIScreenManager> manager =
+      do_GetService("@mozilla.org/gfx/screenmanager;1");
+  MOZ_ASSERT(manager, "failed to get nsIScreenManager");
+
+  nsCOMPtr<nsIScreen> screen;
+  manager->GetPrimaryScreen(getter_AddRefs(screen));
+  if (!screen) {
+    return;
+  }
+
+  int32_t screenDepth;
+  screen->GetColorDepth(&screenDepth);
+  gfxVars::SetPrimaryScreenDepth(screenDepth);
+}
+
+bool gfxPlatform::SupportsAzureContentForDrawTarget(DrawTarget* aTarget) {
+  if (!aTarget || !aTarget->IsValid()) {
+    return false;
+  }
+
+  return SupportsAzureContentForType(aTarget->GetBackendType());
+}
+
+void gfxPlatform::PurgeSkiaFontCache() {
+  if (gfxPlatform::GetPlatform()->GetDefaultContentBackend() ==
+      BackendType::SKIA) {
+    SkGraphics::PurgeFontCache();
+  }
+}
+
+already_AddRefed<DrawTarget> gfxPlatform::CreateDrawTargetForBackend(
+    BackendType aBackend, const IntSize& aSize, SurfaceFormat aFormat) {
+  if (aBackend == BackendType::CAIRO) {
+    RefPtr<gfxASurface> surf =
+        CreateOffscreenSurface(aSize, SurfaceFormatToImageFormat(aFormat));
+    if (!surf || surf->CairoStatus()) {
+      return nullptr;
+    }
+    return CreateDrawTargetForSurface(surf, aSize);
+  }
+  return Factory::CreateDrawTarget(aBackend, aSize, aFormat);
+}
+
+already_AddRefed<DrawTarget> gfxPlatform::CreateOffscreenCanvasDrawTarget(
+    const IntSize& aSize, SurfaceFormat aFormat, bool aRequireSoftwareRender) {
+  NS_ASSERTION(mPreferredCanvasBackend != BackendType::NONE, "No backend.");
+
+  BackendType backend = mFallbackCanvasBackend;
+  if (!gfxPlatform::UseRemoteCanvas() ||
+      !gfxPlatform::IsBackendAccelerated(mPreferredCanvasBackend)) {
+    backend = mPreferredCanvasBackend;
+  }
+
+  if (aRequireSoftwareRender) {
+    backend = gfxPlatform::IsBackendAccelerated(mPreferredCanvasBackend)
+                  ? mFallbackCanvasBackend
+                  : mPreferredCanvasBackend;
+  }
+
+  RefPtr<DrawTarget> target =
+      CreateDrawTargetForBackend(backend, aSize, aFormat);
+
+  if (target || mFallbackCanvasBackend == BackendType::NONE) {
+    return target.forget();
+  }
+
+  return CreateDrawTargetForBackend(mFallbackCanvasBackend, aSize, aFormat);
+}
+
+already_AddRefed<DrawTarget> gfxPlatform::CreateOffscreenContentDrawTarget(
+    const IntSize& aSize, SurfaceFormat aFormat, bool aFallback) {
+  BackendType backend = (aFallback) ? mSoftwareBackend : mContentBackend;
+  NS_ASSERTION(backend != BackendType::NONE, "No backend.");
+  RefPtr<DrawTarget> dt = CreateDrawTargetForBackend(backend, aSize, aFormat);
+
+  if (!dt) {
+    return nullptr;
+  }
+
+  dt->ClearRect(gfx::Rect());
+  if (!dt->IsValid()) {
+    return nullptr;
+  }
+  return dt.forget();
+}
+
+already_AddRefed<DrawTarget> gfxPlatform::CreateSimilarSoftwareDrawTarget(
+    DrawTarget* aDT, const IntSize& aSize, SurfaceFormat aFormat) {
+  RefPtr<DrawTarget> dt;
+
+  if (Factory::DoesBackendSupportDataDrawtarget(aDT->GetBackendType())) {
+    dt = aDT->CreateSimilarDrawTarget(aSize, aFormat);
+  } else {
+    BackendType backendType = BackendType::SKIA;
+    dt = Factory::CreateDrawTarget(backendType, aSize, aFormat);
+  }
+
+  return dt.forget();
+}
+
+already_AddRefed<DrawTarget> gfxPlatform::CreateDrawTargetForData(
+    unsigned char* aData, const IntSize& aSize, int32_t aStride,
+    SurfaceFormat aFormat, bool aUninitialized, bool aIsClear) {
+  BackendType backendType = gfxVars::ContentBackend();
+  NS_ASSERTION(backendType != BackendType::NONE, "No backend.");
+
+  if (!Factory::DoesBackendSupportDataDrawtarget(backendType)) {
+    backendType = BackendType::SKIA;
+  }
+
+  RefPtr<DrawTarget> dt = Factory::CreateDrawTargetForData(
+      backendType, aData, aSize, aStride, aFormat, aUninitialized, aIsClear);
+
+  return dt.forget();
+}
+
+BackendType gfxPlatform::BackendTypeForName(const nsCString& aName) {
+  if (aName.EqualsLiteral("cairo")) return BackendType::CAIRO;
+  if (aName.EqualsLiteral("skia")) return BackendType::SKIA;
+  return BackendType::NONE;
+}
+
+nsresult gfxPlatform::GetFontList(nsAtom* aLangGroup,
+                                  const nsACString& aGenericFamily,
+                                  nsTArray<nsString>& aListOfFonts) {
+  gfxPlatformFontList::PlatformFontList()->GetFontList(
+      aLangGroup, aGenericFamily, aListOfFonts);
+  return NS_OK;
+}
+
+nsresult gfxPlatform::UpdateFontList(bool aFullRebuild) {
+  gfxPlatformFontList::PlatformFontList()->UpdateFontList(aFullRebuild);
+  return NS_OK;
+}
+
+void gfxPlatform::GetStandardFamilyName(const nsCString& aFontName,
+                                        nsACString& aFamilyName) {
+  gfxPlatformFontList::PlatformFontList()->GetStandardFamilyName(aFontName,
+                                                                 aFamilyName);
+}
+
+nsAutoCString gfxPlatform::GetDefaultFontName(
+    const nsACString& aLangGroup, const nsACString& aGenericFamily) {
+  nsAutoCString result;
+
+  auto* pfl = gfxPlatformFontList::PlatformFontList();
+  FamilyAndGeneric fam = pfl->GetDefaultFontFamily(aLangGroup, aGenericFamily);
+  if (!pfl->GetLocalizedFamilyName(fam.mFamily, result)) {
+    NS_WARNING("missing default font-family name");
+  }
+
+  return result;
+}
+
+bool gfxPlatform::DownloadableFontsEnabled() {
+  if (mAllowDownloadableFonts == UNINITIALIZED_VALUE) {
+    mAllowDownloadableFonts =
+        Preferences::GetBool(GFX_DOWNLOADABLE_FONTS_ENABLED, false);
+  }
+
+  return mAllowDownloadableFonts;
+}
+
+bool gfxPlatform::UseCmapsDuringSystemFallback() {
+  return StaticPrefs::gfx_font_rendering_fallback_always_use_cmaps();
+}
+
+bool gfxPlatform::OpenTypeSVGEnabled() {
+  return StaticPrefs::gfx_font_rendering_opentype_svg_enabled();
+}
+
+uint32_t gfxPlatform::WordCacheCharLimit() {
+  return StaticPrefs::gfx_font_rendering_wordcache_charlimit();
+}
+
+uint32_t gfxPlatform::WordCacheMaxEntries() {
+  return StaticPrefs::gfx_font_rendering_wordcache_maxentries();
+}
+
+bool gfxPlatform::IsFontFormatSupported(
+    StyleFontFaceSourceFormatKeyword aFormatHint,
+    const StyleFontFaceSourceTechFlags& aTechFlags) {
+  switch (aFormatHint) {
+    case StyleFontFaceSourceFormatKeyword::None:
+      break;
+    case StyleFontFaceSourceFormatKeyword::Collection:
+      return false;
+    case StyleFontFaceSourceFormatKeyword::Opentype:
+    case StyleFontFaceSourceFormatKeyword::Truetype:
+      break;
+    case StyleFontFaceSourceFormatKeyword::EmbeddedOpentype:
+      return false;
+    case StyleFontFaceSourceFormatKeyword::Svg:
+      return false;
+    case StyleFontFaceSourceFormatKeyword::Woff:
+      break;
+    case StyleFontFaceSourceFormatKeyword::Woff2:
+      break;
+    case StyleFontFaceSourceFormatKeyword::Unknown:
+      return false;
+    default:
+      MOZ_ASSERT_UNREACHABLE("bad format hint!");
+      return false;
+  }
+  StyleFontFaceSourceTechFlags unsupportedTechnologies =
+      StyleFontFaceSourceTechFlags::INCREMENTAL |
+      StyleFontFaceSourceTechFlags::COLOR_SBIX;
+  if (!StaticPrefs::gfx_downloadable_fonts_keep_color_bitmaps()) {
+    unsupportedTechnologies |= StyleFontFaceSourceTechFlags::COLOR_CBDT;
+  }
+  if (!StaticPrefs::gfx_font_rendering_colr_v1_enabled()) {
+    unsupportedTechnologies |= StyleFontFaceSourceTechFlags::COLOR_COLRV1;
+  }
+  if (!StaticPrefs::layout_css_font_palette_enabled()) {
+    unsupportedTechnologies |= StyleFontFaceSourceTechFlags::PALETTES;
+  }
+  if (!StaticPrefs::layout_css_font_variations_enabled()) {
+    unsupportedTechnologies |= StyleFontFaceSourceTechFlags::VARIATIONS;
+  }
+  if (aTechFlags & unsupportedTechnologies) {
+    return false;
+  }
+  return true;
+}
+
+bool gfxPlatform::IsKnownIconFontFamily(const nsAtom* aFamilyName) const {
+  return gfxPlatformFontList::PlatformFontList()->IsKnownIconFontFamily(
+      aFamilyName);
+}
+
+already_AddRefed<gfxFontEntry> gfxPlatform::LookupLocalFont(
+    FontVisibilityProvider* aFontVisibilityProvider,
+    const nsACString& aFontName, const WeightRange& aWeightForEntry,
+    const StretchRange& aStretchForEntry,
+    const SlantStyleRange& aStyleForEntry) {
+  return gfxPlatformFontList::PlatformFontList()->LookupLocalFont(
+      aFontVisibilityProvider, aFontName, aWeightForEntry, aStretchForEntry,
+      aStyleForEntry);
+}
+
+already_AddRefed<gfxFontEntry> gfxPlatform::MakePlatformFont(
+    const nsACString& aFontName, const WeightRange& aWeightForEntry,
+    const StretchRange& aStretchForEntry, const SlantStyleRange& aStyleForEntry,
+    const uint8_t* aFontData, uint32_t aLength) {
+  return gfxPlatformFontList::PlatformFontList()->MakePlatformFont(
+      aFontName, aWeightForEntry, aStretchForEntry, aStyleForEntry, aFontData,
+      aLength);
+}
+
+BackendPrefsData gfxPlatform::GetBackendPrefs() const {
+  BackendPrefsData data;
+
+  data.mCanvasBitmask = BackendTypeBit(BackendType::SKIA);
+  data.mContentBitmask = BackendTypeBit(BackendType::SKIA);
+
+#if defined(MOZ_WIDGET_GTK)
+  data.mCanvasBitmask |= BackendTypeBit(BackendType::CAIRO);
+  data.mContentBitmask |= BackendTypeBit(BackendType::CAIRO);
+#endif
+
+  data.mCanvasDefault = BackendType::SKIA;
+  data.mContentDefault = BackendType::SKIA;
+
+  return data;
+}
+
+void gfxPlatform::InitBackendPrefs(BackendPrefsData&& aPrefsData) {
+  mPreferredCanvasBackend = GetCanvasBackendPref(aPrefsData.mCanvasBitmask);
+  if (mPreferredCanvasBackend == BackendType::NONE) {
+    mPreferredCanvasBackend = aPrefsData.mCanvasDefault;
+  }
+
+  mFallbackCanvasBackend = GetCanvasBackendPref(
+      aPrefsData.mCanvasBitmask & ~BackendTypeBit(mPreferredCanvasBackend));
+
+  mContentBackendBitmask = aPrefsData.mContentBitmask;
+  mContentBackend = GetContentBackendPref(mContentBackendBitmask);
+  if (mContentBackend == BackendType::NONE) {
+    mContentBackend = aPrefsData.mContentDefault;
+    mContentBackendBitmask |= BackendTypeBit(aPrefsData.mContentDefault);
+  }
+
+  uint32_t swBackendBits = BackendTypeBit(BackendType::SKIA);
+#if defined(MOZ_WIDGET_GTK)
+  swBackendBits |= BackendTypeBit(BackendType::CAIRO);
+#endif
+  mSoftwareBackend = GetContentBackendPref(swBackendBits);
+  if (mSoftwareBackend == BackendType::NONE) {
+    mSoftwareBackend = BackendType::SKIA;
+  }
+
+  if (mFallbackCanvasBackend == BackendType::NONE) {
+    mFallbackCanvasBackend = mSoftwareBackend;
+  }
+
+  if (XRE_IsParentProcess()) {
+    gfxVars::SetContentBackend(mContentBackend);
+    gfxVars::SetSoftwareBackend(mSoftwareBackend);
+  }
+}
+
+BackendType gfxPlatform::GetCanvasBackendPref(uint32_t aBackendBitmask) {
+  return GetBackendPref("gfx.canvas.azure.backends", aBackendBitmask);
+}
+
+BackendType gfxPlatform::GetContentBackendPref(uint32_t& aBackendBitmask) {
+  return GetBackendPref("gfx.content.azure.backends", aBackendBitmask);
+}
+
+BackendType gfxPlatform::GetBackendPref(const char* aBackendPrefName,
+                                        uint32_t& aBackendBitmask) {
+  nsTArray<nsCString> backendList;
+  nsAutoCString prefString;
+  if (NS_SUCCEEDED(Preferences::GetCString(aBackendPrefName, prefString))) {
+    ParseString(prefString, ',', backendList);
+  }
+
+  uint32_t allowedBackends = 0;
+  BackendType result = BackendType::NONE;
+  for (uint32_t i = 0; i < backendList.Length(); ++i) {
+    BackendType type = BackendTypeForName(backendList[i]);
+    if (BackendTypeBit(type) & aBackendBitmask) {
+      allowedBackends |= BackendTypeBit(type);
+      if (result == BackendType::NONE) {
+        result = type;
+      }
+    }
+  }
+
+  aBackendBitmask = allowedBackends;
+  return result;
+}
+
+bool gfxPlatform::InSafeMode() {
+  static bool sSafeModeInitialized = false;
+  static bool sInSafeMode = false;
+
+  if (!sSafeModeInitialized) {
+    sSafeModeInitialized = true;
+    nsCOMPtr<nsIXULRuntime> xr = do_GetService("@mozilla.org/xre/runtime;1");
+    if (xr) {
+      xr->GetInSafeMode(&sInSafeMode);
+    }
+  }
+  return sInSafeMode;
+}
+
+bool gfxPlatform::OffMainThreadCompositingEnabled() {
+  return UsesOffMainThreadCompositing();
+}
+
+void gfxPlatform::SetCMSModeOverride(CMSMode aMode) { gCMSMode = aMode; }
+
+int gfxPlatform::GetRenderingIntent() {
+  MOZ_ASSERT(QCMS_INTENT_DEFAULT == 0);
+
+  int32_t pIntent = StaticPrefs::gfx_color_management_rendering_intent();
+  if ((pIntent < QCMS_INTENT_MIN) || (pIntent > QCMS_INTENT_MAX)) {
+    pIntent = -1;
+  }
+  return pIntent;
+}
+
+DeviceColor gfxPlatform::TransformPixel(const sRGBColor& in,
+                                        qcms_transform* transform) {
+  if (transform) {
+#if defined(IS_LITTLE_ENDIAN)
+    uint32_t packed = in.ToABGR();
+    qcms_transform_data(transform, (uint8_t*)&packed, (uint8_t*)&packed, 1);
+    auto out = DeviceColor::FromABGR(packed);
+#else
+    uint32_t packed = in.UnusualToARGB();
+    qcms_transform_data(transform, (uint8_t*)&packed + 1, (uint8_t*)&packed + 1,
+                        1);
+    auto out = DeviceColor::UnusualFromARGB(packed);
+#endif
+    out.a = in.a;
+    return out;
+  }
+  return DeviceColor(in.r, in.g, in.b, in.a);
+}
+
+nsTArray<uint8_t> gfxPlatform::GetPrefCMSOutputProfileData() {
+  const auto mirror = StaticPrefs::gfx_color_management_display_profile();
+  const auto fname = *mirror;
+  if (fname == "") {
+    return nsTArray<uint8_t>();
+  }
+
+  void* mem = nullptr;
+  size_t size = 0;
+  qcms_data_from_path(fname.get(), &mem, &size);
+
+  nsTArray<uint8_t> result;
+
+  if (mem) {
+    result.AppendElements(static_cast<uint8_t*>(mem), size);
+    free(mem);
+  }
+
+  return result;
+}
+
+Maybe<nsTArray<uint8_t>>& gfxPlatform::GetCMSOutputProfileData() {
+  return mCMSOutputProfileData;
+}
+
+CMSMode GfxColorManagementMode() {
+  const auto mode = StaticPrefs::gfx_color_management_mode();
+  if (mode >= 0 && mode <= UnderlyingValue(CMSMode::_ENUM_MAX)) {
+    return CMSMode(mode);
+  }
+  return CMSMode::Off;
+}
+
+void gfxPlatform::InitializeCMS() {
+  gCMSInitialized = true;
+  gCMSMode = GfxColorManagementMode();
+
+  mCMSsRGBProfile = qcms_profile_sRGB();
+  NS_ASSERTION(!qcms_profile_is_bogus(mCMSsRGBProfile),
+               "Builtin sRGB profile tagged as bogus!!!");
+
+  if (StaticPrefs::gfx_color_management_force_srgb() ||
+      StaticPrefs::gfx_color_management_native_srgb()) {
+    mCMSOutputProfile = mCMSsRGBProfile;
+  }
+
+  if (!mCMSOutputProfile) {
+    nsTArray<uint8_t> outputProfileData = GetPlatformCMSOutputProfileData();
+    if (!outputProfileData.IsEmpty()) {
+      mCMSOutputProfile = qcms_profile_from_memory_curves_only(
+          outputProfileData.Elements(), outputProfileData.Length());
+
+      if (mCMSOutputProfile && qcms_profile_is_bogus(mCMSOutputProfile)) {
+        NS_WARNING("system ICC profile looks bogus, ignoring, using sRGB");
+        qcms_profile_release(mCMSOutputProfile);
+        mCMSOutputProfile = nullptr;
+        mCMSOutputProfileData.reset();
+      }
+
+      if (mCMSOutputProfile && (mCMSOutputProfileData.isNothing() ||
+                                mCMSOutputProfileData->IsEmpty())) {
+        mCMSOutputProfileData = Some(std::move(outputProfileData));
+      }
+    }
+  }
+
+  if (!mCMSOutputProfile) {
+    mCMSOutputProfile = mCMSsRGBProfile;
+  }
+
+  qcms_profile_precache_output_transform(mCMSOutputProfile);
+
+  mCMSRGBTransform =
+      qcms_transform_create(mCMSsRGBProfile, QCMS_DATA_RGB_8, mCMSOutputProfile,
+                            QCMS_DATA_RGB_8, QCMS_INTENT_PERCEPTUAL);
+
+  mCMSInverseRGBTransform =
+      qcms_transform_create(mCMSOutputProfile, QCMS_DATA_RGB_8, mCMSsRGBProfile,
+                            QCMS_DATA_RGB_8, QCMS_INTENT_PERCEPTUAL);
+
+  mCMSRGBATransform = qcms_transform_create(mCMSsRGBProfile, QCMS_DATA_RGBA_8,
+                                            mCMSOutputProfile, QCMS_DATA_RGBA_8,
+                                            QCMS_INTENT_PERCEPTUAL);
+
+  mCMSBGRATransform = qcms_transform_create(mCMSsRGBProfile, QCMS_DATA_BGRA_8,
+                                            mCMSOutputProfile, QCMS_DATA_BGRA_8,
+                                            QCMS_INTENT_PERCEPTUAL);
+
+  if (StaticPrefs::gfx_color_management_enablev4()) {
+    qcms_enable_iccv4();
+  }
+}
+
+qcms_transform* gfxPlatform::GetCMSOSRGBATransform() {
+  switch (SurfaceFormat::OS_RGBA) {
+    case SurfaceFormat::B8G8R8A8:
+      return GetCMSBGRATransform();
+    case SurfaceFormat::R8G8B8A8:
+      return GetCMSRGBATransform();
+    default:
+      return nullptr;
+  }
+}
+
+qcms_data_type gfxPlatform::GetCMSOSRGBAType() {
+  switch (SurfaceFormat::OS_RGBA) {
+    case SurfaceFormat::B8G8R8A8:
+      return QCMS_DATA_BGRA_8;
+    case SurfaceFormat::R8G8B8A8:
+      return QCMS_DATA_RGBA_8;
+    default:
+      return QCMS_DATA_RGBA_8;
+  }
+}
+
+void gfxPlatform::ShutdownCMS() {
+  if (mCMSRGBTransform) {
+    qcms_transform_release(mCMSRGBTransform);
+    mCMSRGBTransform = nullptr;
+  }
+  if (mCMSInverseRGBTransform) {
+    qcms_transform_release(mCMSInverseRGBTransform);
+    mCMSInverseRGBTransform = nullptr;
+  }
+  if (mCMSRGBATransform) {
+    qcms_transform_release(mCMSRGBATransform);
+    mCMSRGBATransform = nullptr;
+  }
+  if (mCMSBGRATransform) {
+    qcms_transform_release(mCMSBGRATransform);
+    mCMSBGRATransform = nullptr;
+  }
+  if (mCMSOutputProfile) {
+    if (mCMSsRGBProfile == mCMSOutputProfile) {
+      mCMSsRGBProfile = nullptr;
+    }
+
+    qcms_profile_release(mCMSOutputProfile);
+    mCMSOutputProfile = nullptr;
+  }
+  if (mCMSsRGBProfile) {
+    qcms_profile_release(mCMSsRGBProfile);
+    mCMSsRGBProfile = nullptr;
+  }
+
+  gCMSMode = CMSMode::Off;
+}
+
+uint32_t gfxPlatform::GetBidiNumeralOption() {
+  return StaticPrefs::bidi_numeral();
+}
+
+void gfxPlatform::FlushFontAndWordCaches() {
+  gfxFontCache* fontCache = gfxFontCache::GetCache();
+  if (fontCache) {
+    fontCache->Flush();
+  }
+
+  gfxPlatform::PurgeSkiaFontCache();
+}
+
+void gfxPlatform::ForceGlobalReflow(GlobalReflowFlags aFlags) {
+  MOZ_ASSERT(NS_IsMainThread());
+  bool reframe = !!(aFlags & GlobalReflowFlags::NeedsReframe);
+  if (nsCOMPtr<nsIObserverService> obs = services::GetObserverService()) {
+    char16_t needsReframe[] = {char16_t(reframe), 0};
+    obs->NotifyObservers(nullptr, "font-info-updated", needsReframe);
+  }
+  if (XRE_IsParentProcess() &&
+      aFlags & GlobalReflowFlags::BroadcastToChildren) {
+    for (auto* process :
+         dom::ContentParent::AllProcesses(dom::ContentParent::eLive)) {
+      (void)process->SendForceGlobalReflow(aFlags);
+    }
+  }
+}
+
+void gfxPlatform::FontsPrefsChanged(const char* aPref) {
+  NS_ASSERTION(aPref != nullptr, "null preference");
+  if (!strcmp(GFX_DOWNLOADABLE_FONTS_ENABLED, aPref)) {
+    mAllowDownloadableFonts = UNINITIALIZED_VALUE;
+  } else if (!strcmp(GFX_PREF_WORD_CACHE_CHARLIMIT, aPref) ||
+             !strcmp(GFX_PREF_WORD_CACHE_MAXENTRIES, aPref)) {
+    FlushFontAndWordCaches();
+  } else if (
+      !strcmp("gfx.font_rendering.ahem_antialias_none", aPref)) {
+    FlushFontAndWordCaches();
+  } else if (!strcmp(GFX_PREF_OPENTYPE_SVG, aPref)) {
+    gfxFontCache::GetCache()->Flush();
+    gfxFontCache::GetCache()->NotifyGlyphsChanged();
+  } else if (!strcmp("gfx.font_rendering.freetype.gamma", aPref) ||
+             !strcmp("gfx.font_rendering.freetype.enhanced_contrast", aPref)) {
+    FlushFontAndWordCaches();
+    ForceGlobalReflow(GlobalReflowFlags::FontsChanged |
+                      GlobalReflowFlags::BroadcastToChildren);
+  }
+}
+
+mozilla::LogModule* gfxPlatform::GetLog(eGfxLog aWhichLog) {
+  static LazyLogModule sFontlistLog("fontlist");
+  static LazyLogModule sFontInitLog("fontinit");
+  static LazyLogModule sTextrunLog("textrun");
+  static LazyLogModule sTextrunuiLog("textrunui");
+  static LazyLogModule sCmapDataLog("cmapdata");
+  static LazyLogModule sTextPerfLog("textperf");
+  static LazyLogModule sFontQueryLog("fontquery");
+
+  switch (aWhichLog) {
+    case eGfxLog_fontlist:
+      return sFontlistLog;
+    case eGfxLog_fontinit:
+      return sFontInitLog;
+    case eGfxLog_textrun:
+      return sTextrunLog;
+    case eGfxLog_textrunui:
+      return sTextrunuiLog;
+    case eGfxLog_cmapdata:
+      return sCmapDataLog;
+    case eGfxLog_textperf:
+      return sTextPerfLog;
+    case eGfxLog_fontquery:
+      return sFontQueryLog;
+  }
+
+  MOZ_ASSERT_UNREACHABLE("Unexpected log type");
+  return nullptr;
+}
+
+RefPtr<mozilla::gfx::DrawTarget> gfxPlatform::ScreenReferenceDrawTarget() {
+  MOZ_ASSERT_IF(XRE_IsContentProcess(), NS_IsMainThread());
+  return (mScreenReferenceDrawTarget)
+             ? mScreenReferenceDrawTarget
+             : gPlatform->CreateOffscreenContentDrawTarget(
+                   IntSize(1, 1), SurfaceFormat::B8G8R8A8, true);
+}
+
+ RefPtr<mozilla::gfx::DrawTarget>
+gfxPlatform::ThreadLocalScreenReferenceDrawTarget() {
+  if (NS_IsMainThread() && gPlatform) {
+    return gPlatform->ScreenReferenceDrawTarget();
+  }
+
+  gfxPlatformWorker* platformWorker = gfxPlatformWorker::Get();
+  if (platformWorker) {
+    return platformWorker->ScreenReferenceDrawTarget();
+  }
+
+  return Factory::CreateDrawTarget(BackendType::SKIA, IntSize(1, 1),
+                                   SurfaceFormat::B8G8R8A8);
+}
+
+mozilla::gfx::SurfaceFormat gfxPlatform::Optimal2DFormatForContent(
+    gfxContentType aContent) {
+  switch (aContent) {
+    case gfxContentType::COLOR:
+      switch (GetOffscreenFormat()) {
+        case SurfaceFormat::A8R8G8B8_UINT32:
+          return mozilla::gfx::SurfaceFormat::B8G8R8A8;
+        case SurfaceFormat::X8R8G8B8_UINT32:
+          return mozilla::gfx::SurfaceFormat::B8G8R8X8;
+        case SurfaceFormat::R5G6B5_UINT16:
+          return mozilla::gfx::SurfaceFormat::R5G6B5_UINT16;
+        default:
+          MOZ_ASSERT_UNREACHABLE(
+              "unknown gfxImageFormat for "
+              "gfxContentType::COLOR");
+          return mozilla::gfx::SurfaceFormat::B8G8R8A8;
+      }
+    case gfxContentType::ALPHA:
+      return mozilla::gfx::SurfaceFormat::A8;
+    case gfxContentType::COLOR_ALPHA:
+      return mozilla::gfx::SurfaceFormat::B8G8R8A8;
+    default:
+      MOZ_ASSERT_UNREACHABLE("unknown gfxContentType");
+      return mozilla::gfx::SurfaceFormat::B8G8R8A8;
+  }
+}
+
+gfxImageFormat gfxPlatform::OptimalFormatForContent(gfxContentType aContent) {
+  switch (aContent) {
+    case gfxContentType::COLOR:
+      return GetOffscreenFormat();
+    case gfxContentType::ALPHA:
+      return SurfaceFormat::A8;
+    case gfxContentType::COLOR_ALPHA:
+      return SurfaceFormat::A8R8G8B8_UINT32;
+    default:
+      MOZ_ASSERT_UNREACHABLE("unknown gfxContentType");
+      return SurfaceFormat::A8R8G8B8_UINT32;
+  }
+}
+
+static mozilla::Atomic<bool> sLayersAccelerationPrefsInitialized(false);
+
+void gfxPlatform::VideoDecodingFailedChangedCallback(const char* aPref, void*) {
+  MOZ_ASSERT(XRE_IsParentProcess());
+  if (gPlatform) {
+    gPlatform->InitHardwareVideoConfig();
+  }
+}
+
+void gfxPlatform::UpdateForceSubpixelAAWherePossible() {
+  bool forceSubpixelAAWherePossible =
+      StaticPrefs::gfx_webrender_quality_force_subpixel_aa_where_possible();
+  gfxVars::SetForceSubpixelAAWherePossible(forceSubpixelAAWherePossible);
+}
+
+void gfxPlatform::InitAcceleration() {
+  if (sLayersAccelerationPrefsInitialized) {
+    return;
+  }
+
+  InitCompositorAccelerationPrefs();
+
+  MOZ_ASSERT(NS_IsMainThread(), "can only initialize prefs on the main thread");
+
+  if (XRE_IsParentProcess()) {
+    gfxVars::SetBrowserTabsRemoteAutostart(BrowserTabsRemoteAutostart());
+    gfxVars::SetOffscreenFormat(GetOffscreenFormat());
+    gfxVars::SetRequiresAcceleratedGLContextForCompositorOGL(
+        RequiresAcceleratedGLContextForCompositorOGL());
+  }
+
+  sLayersAccelerationPrefsInitialized = true;
+
+  if (XRE_IsParentProcess()) {
+    InitGPUProcessPrefs();
+  }
+}
+
+void gfxPlatform::InitGPUProcessPrefs() {
+  if (!StaticPrefs::layers_gpu_process_enabled_AtStartup() &&
+      !StaticPrefs::layers_gpu_process_force_enabled_AtStartup()) {
+    return;
+  }
+
+  FeatureState& gpuProc = gfxConfig::GetFeature(Feature::GPU_PROCESS);
+
+  if (!BrowserTabsRemoteAutostart()) {
+    gpuProc.DisableByDefault(FeatureStatus::Unavailable,
+                             "Multi-process mode is not enabled",
+                             "FEATURE_FAILURE_NO_E10S"_ns);
+  } else {
+    gpuProc.SetDefaultFromPref(
+        StaticPrefs::GetPrefName_layers_gpu_process_enabled(), true,
+        StaticPrefs::GetPrefDefault_layers_gpu_process_enabled());
+  }
+
+  if (StaticPrefs::layers_gpu_process_force_enabled_AtStartup()) {
+    gpuProc.UserForceEnable("User force-enabled via pref");
+  }
+
+  nsCString message;
+  nsCString failureId;
+  if (!gfxPlatform::IsGfxInfoStatusOkay(nsIGfxInfo::FEATURE_GPU_PROCESS,
+                                        &message, failureId)) {
+    gpuProc.Disable(FeatureStatus::Blocklisted, message.get(), failureId);
+    return;
+  }
+
+  InitPlatformGPUProcessPrefs();
+}
+
+void gfxPlatform::InitCompositorAccelerationPrefs() {
+  const char* acceleratedEnv = PR_GetEnv("MOZ_ACCELERATED");
+
+  FeatureState& feature = gfxConfig::GetFeature(Feature::HW_COMPOSITING);
+
+  if (feature.SetDefault(AccelerateLayersByDefault(), FeatureStatus::Blocked,
+                         "Acceleration blocked by platform")) {
+    if (StaticPrefs::
+            layers_acceleration_disabled_AtStartup_DoNotUseDirectly()) {
+      feature.UserDisable("Disabled by layers.acceleration.disabled=true",
+                          "FEATURE_FAILURE_COMP_PREF"_ns);
+    } else if (acceleratedEnv && *acceleratedEnv == '0') {
+      feature.UserDisable("Disabled by envvar", "FEATURE_FAILURE_COMP_ENV"_ns);
+    }
+  } else {
+    if (acceleratedEnv && *acceleratedEnv == '1') {
+      feature.UserEnable("Enabled by envvar");
+    }
+  }
+
+  if (StaticPrefs::
+          layers_acceleration_force_enabled_AtStartup_DoNotUseDirectly()) {
+    feature.UserForceEnable("Force-enabled by pref");
+  }
+
+  if (InSafeMode()) {
+    feature.ForceDisable(FeatureStatus::Blocked,
+                         "Acceleration blocked by safe-mode",
+                         "FEATURE_FAILURE_COMP_SAFEMODE"_ns);
+  }
+}
+
+bool gfxPlatform::WebRenderPrefEnabled() {
+  return StaticPrefs::gfx_webrender_all_AtStartup();
+}
+
+bool gfxPlatform::WebRenderEnvvarEnabled() {
+  const char* env = PR_GetEnv("MOZ_WEBRENDER");
+  return (env && *env == '1');
+}
+
+ const char* gfxPlatform::WebRenderResourcePathOverride() {
+  const char* resourcePath = PR_GetEnv("WR_RESOURCE_PATH");
+  if (!resourcePath || resourcePath[0] == '\0') {
+    return nullptr;
+  }
+  return resourcePath;
+}
+
+void gfxPlatform::InitWebRenderConfig() {
+  if (!XRE_IsParentProcess()) {
+    return;
+  }
+
+  gfxConfigManager manager;
+  manager.Init();
+  manager.ConfigureWebRender();
+
+  if (gfxConfig::IsEnabled(Feature::GPU_PROCESS)) {
+    gfxVars::SetGPUProcessEnabled(true);
+  }
+
+  MOZ_RELEASE_ASSERT(gfxConfig::IsEnabled(Feature::WEBRENDER),
+                     "Hardware WebRender is required");
+
+#if defined(MOZ_WIDGET_GTK)
+  if (!gfxConfig::IsForcedOnByUser(Feature::WEBRENDER) &&
+      StaticPrefs::gfx_webrender_reject_software_driver_AtStartup()) {
+    gfxVars::SetWebRenderRequiresHardwareDriver(true);
+  }
+#endif
+
+
+  if (gfxConfig::IsEnabled(Feature::WEBRENDER_SHADER_CACHE)) {
+    gfxVars::SetUseWebRenderProgramBinaryDisk(true);
+    bool warmUp = true;
+    gfxVars::SetShouldWarmUpWebRenderProgramBinaries(warmUp);
+  }
+
+  gfxVars::SetUseWebRenderOptimizedShaders(
+      gfxConfig::IsEnabled(Feature::WEBRENDER_OPTIMIZED_SHADERS));
+
+  Preferences::RegisterPrefixCallbackAndCall(SwapIntervalPrefChangeCallback,
+                                             "gfx.swap-interval");
+
+  Preferences::RegisterPrefixCallbackAndCall(WebRenderDebugPrefChangeCallback,
+                                             WR_DEBUG_PREF);
+
+  RegisterWebRenderBoolParamCallback();
+
+  Preferences::RegisterCallback(
+      WebRenderQualityPrefChangeCallback,
+      nsDependentCString(
+          StaticPrefs::
+              GetPrefName_gfx_webrender_quality_force_subpixel_aa_where_possible()));
+
+  Preferences::RegisterCallback(
+      WebRenderBatchingPrefChangeCallback,
+      nsDependentCString(
+          StaticPrefs::GetPrefName_gfx_webrender_batching_lookback()));
+
+  Preferences::RegisterCallbackAndCall(
+      WebRenderBlobTileSizePrefChangeCallback,
+      nsDependentCString(
+          StaticPrefs::GetPrefName_gfx_webrender_blob_tile_size()));
+
+  Preferences::RegisterCallbackAndCall(
+      WebRenderUploadThresholdPrefChangeCallback,
+      nsDependentCString(
+          StaticPrefs::GetPrefName_gfx_webrender_batched_upload_threshold()));
+
+  if (WebRenderResourcePathOverride()) {
+  }
+
+  UpdateForceSubpixelAAWherePossible();
+
+
+
+  bool allowOverlayVpAutoHDR = false;
+  if (StaticPrefs::gfx_webrender_overlay_vp_auto_hdr_AtStartup()) {
+    allowOverlayVpAutoHDR = true;
+
+    nsCString failureId;
+    int32_t status;
+    const nsCOMPtr<nsIGfxInfo> gfxInfo = components::GfxInfo::Service();
+    if (NS_FAILED(gfxInfo->GetFeatureStatus(
+            nsIGfxInfo::FEATURE_OVERLAY_VP_AUTO_HDR, failureId, &status))) {
+      allowOverlayVpAutoHDR = false;
+    } else {
+      if (status != nsIGfxInfo::FEATURE_STATUS_OK) {
+        allowOverlayVpAutoHDR = false;
+      }
+    }
+  }
+
+  if (allowOverlayVpAutoHDR) {
+    gfxVars::SetWebRenderOverlayVpAutoHDR(true);
+  }
+
+  if (StaticPrefs::gfx_webrender_overlay_hdr_AtStartup()) {
+    gfxVars::SetWebRenderOverlayHDR(true);
+  }
+
+  bool allowOverlayVpSuperResolution = false;
+  if (StaticPrefs::gfx_webrender_overlay_vp_super_resolution_AtStartup()) {
+    allowOverlayVpSuperResolution = true;
+
+    nsCString failureId;
+    int32_t status;
+    const nsCOMPtr<nsIGfxInfo> gfxInfo = components::GfxInfo::Service();
+    if (NS_FAILED(gfxInfo->GetFeatureStatus(
+            nsIGfxInfo::FEATURE_OVERLAY_VP_SUPER_RESOLUTION, failureId,
+            &status))) {
+      allowOverlayVpSuperResolution = false;
+    } else {
+      if (status != nsIGfxInfo::FEATURE_STATUS_OK) {
+        allowOverlayVpSuperResolution = false;
+      }
+    }
+  }
+
+  if (allowOverlayVpSuperResolution) {
+    gfxVars::SetWebRenderOverlayVpSuperResolution(true);
+  }
+
+  if (gfxConfig::IsEnabled(Feature::WEBRENDER_COMPOSITOR)) {
+    gfxVars::SetUseWebRenderCompositor(true);
+  }
+
+  if (gfxConfig::IsEnabled(Feature::WEBRENDER_PARTIAL)) {
+    gfxVars::SetWebRenderMaxPartialPresentRects(
+        StaticPrefs::gfx_webrender_max_partial_present_rects_AtStartup());
+  }
+
+  gfxVars::SetUseGLSwizzle(
+      IsFeatureSupported(nsIGfxInfo::FEATURE_GL_SWIZZLE, true));
+  gfxVars::SetUseWebRenderScissoredCacheClears(gfx::gfxConfig::IsEnabled(
+      gfx::Feature::WEBRENDER_SCISSORED_CACHE_CLEARS));
+
+  gfxVars::SetAllowGLNorm16Textures(
+      gfx::gfxConfig::IsEnabled(gfx::Feature::GL_NORM16_TEXTURES));
+
+  gfxUtils::RemoveShaderCacheFromDiskIfNecessary();
+}
+
+void gfxPlatform::InitHardwareVideoConfig() {
+  if (!XRE_IsParentProcess()) {
+    return;
+  }
+
+  gfxVarsCollectUpdates collect;
+
+  FeatureState& featureDec =
+      gfxConfig::GetFeature(Feature::HARDWARE_VIDEO_DECODING);
+  featureDec.Reset();
+  featureDec.EnableByDefault();
+
+  if (!StaticPrefs::media_hardware_video_decoding_enabled_AtStartup()) {
+    featureDec.UserDisable(
+        "User disabled via media.hardware-video-decoding.enabled pref",
+        "FEATURE_HARDWARE_VIDEO_DECODING_PREF_1_DISABLED"_ns);
+  }
+  else if (StaticPrefs::
+               media_hardware_video_decoding_force_enabled_AtStartup()) {
+    featureDec.UserForceEnable("Force enabled by pref");
+  }
+
+  int32_t status = nsIGfxInfo::FEATURE_STATUS_UNKNOWN;
+  nsCOMPtr<nsIGfxInfo> gfxInfo = components::GfxInfo::Service();
+  nsCString failureId;
+  if (NS_FAILED(gfxInfo->GetFeatureStatus(
+          nsIGfxInfo::FEATURE_HARDWARE_VIDEO_DECODING, failureId, &status))) {
+    featureDec.Disable(FeatureStatus::BlockedNoGfxInfo, "gfxInfo is broken",
+                       "FEATURE_FAILURE_NO_GFX_INFO"_ns);
+  } else if (status != nsIGfxInfo::FEATURE_STATUS_OK) {
+    featureDec.Disable(FeatureStatus::Blocklisted, "Blocklisted by gfxInfo",
+                       failureId);
+  }
+
+  if (status == nsIGfxInfo::FEATURE_BLOCKED_PLATFORM_TEST) {
+    featureDec.ForceDisable(FeatureStatus::Unavailable,
+                            "Force disabled by gfxInfo", failureId);
+  } else if (Preferences::GetBool("media.hardware-video-decoding.failed",
+                                  false)) {
+    featureDec.ForceDisable(FeatureStatus::Unavailable,
+                            "Force disabled by failed sanity test",
+                            "FEATURE_FAILURE_SANITY_TEST_FAILED"_ns);
+  }
+
+  FeatureState& featureEnc =
+      gfxConfig::GetFeature(Feature::HARDWARE_VIDEO_ENCODING);
+  featureEnc.Reset();
+  featureEnc.EnableByDefault();
+
+  if (!StaticPrefs::media_hardware_video_encoding_enabled_AtStartup()) {
+    featureDec.UserDisable(
+        "User disabled via media.hardware-video-encoding.enabled pref",
+        "FEATURE_HARDWARE_VIDEO_ENCODING_PREF_1_DISABLED"_ns);
+  }
+  else if (StaticPrefs::
+               media_hardware_video_encoding_force_enabled_AtStartup()) {
+    featureEnc.UserForceEnable("Force enabled by pref");
+  }
+
+  status = nsIGfxInfo::FEATURE_STATUS_UNKNOWN;
+  if (NS_FAILED(gfxInfo->GetFeatureStatus(
+          nsIGfxInfo::FEATURE_HARDWARE_VIDEO_ENCODING, failureId, &status))) {
+    featureEnc.Disable(FeatureStatus::BlockedNoGfxInfo, "gfxInfo is broken",
+                       "FEATURE_FAILURE_NO_GFX_INFO"_ns);
+  } else if (status != nsIGfxInfo::FEATURE_STATUS_OK) {
+    featureEnc.Disable(FeatureStatus::Blocklisted, "Blocklisted by gfxInfo",
+                       failureId);
+  }
+
+  if (status == nsIGfxInfo::FEATURE_BLOCKED_PLATFORM_TEST) {
+    featureEnc.ForceDisable(FeatureStatus::Unavailable,
+                            "Force disabled by gfxInfo", failureId);
+  } else if (Preferences::GetBool("media.hardware-video-decoding.failed",
+                                  false)) {
+    featureEnc.ForceDisable(FeatureStatus::Unavailable,
+                            "Force disabled by failed sanity test",
+                            "FEATURE_FAILURE_SANITY_TEST_FAILED"_ns);
+  }
+
+  FeatureState& featureHdr = gfxConfig::GetFeature(Feature::VIDEO_HDR);
+  featureHdr.Reset();
+  featureHdr.EnableByDefault();
+  if (NS_FAILED(gfxInfo->GetFeatureStatus(nsIGfxInfo::FEATURE_VIDEO_HDR,
+                                          failureId, &status))) {
+    featureHdr.Disable(FeatureStatus::BlockedNoGfxInfo, "gfxInfo is broken",
+                       "FEATURE_FAILURE_NO_GFX_INFO"_ns);
+  } else if (status != nsIGfxInfo::FEATURE_STATUS_OK) {
+    featureHdr.Disable(FeatureStatus::Blocklisted, "Blocklisted by gfxInfo",
+                       failureId);
+  }
+  gfxVars::SetVideoHDR(featureHdr.IsEnabled());
+
+  InitPlatformHardwareVideoConfig();
+  FeatureState& featureVulkanDec =
+      gfxConfig::GetFeature(Feature::HARDWARE_VIDEO_DECODING_VULKAN);
+  featureVulkanDec.Reset();
+  featureVulkanDec.EnableByDefault();
+  if (!StaticPrefs::media_hardware_video_decoding_vulkan_enabled_AtStartup()) {
+    featureVulkanDec.UserDisable(
+        "User disabled via media.hardware-video-decoding-vulkan.enabled pref",
+        "FEATURE_HARDWARE_VIDEO_DECODING_VULKAN_PREF_DISABLED"_ns);
+  }
+
+  bool canUseVulkanDecode = false;
+  int32_t vulkanDecStatus = nsIGfxInfo::FEATURE_STATUS_UNKNOWN;
+  nsCString vulkanDecFailureId;
+  if (featureVulkanDec.IsEnabled() &&
+      NS_SUCCEEDED(gfxInfo->GetFeatureStatus(
+          nsIGfxInfo::FEATURE_HARDWARE_VIDEO_DECODING_VULKAN,
+          vulkanDecFailureId, &vulkanDecStatus)) &&
+      vulkanDecStatus == nsIGfxInfo::FEATURE_STATUS_OK) {
+    canUseVulkanDecode = true;
+  }
+
+  nsCString message;
+  gfxVars::SetCanUseHardwareVideoDecoding(featureDec.IsEnabled() ||
+                                          canUseVulkanDecode);
+  gfxVars::SetCanUseHardwareVideoEncoding(featureEnc.IsEnabled());
+
+#  define CODEC_HW_FEATURE_SETUP_PLATFORM(name, type, encoder) \
+    feature##type##name.EnableByDefault();
+
+#define CODEC_HW_FEATURE_SETUP(name)                                           \
+  FeatureState& featureDec##name =                                             \
+      gfxConfig::GetFeature(Feature::name##_HW_DECODE);                        \
+  featureDec##name.Reset();                                                    \
+  if (featureDec.IsEnabled() || canUseVulkanDecode) {                          \
+    CODEC_HW_FEATURE_SETUP_PLATFORM(name, Dec, false)                          \
+    if (!IsGfxInfoStatusOkay(nsIGfxInfo::FEATURE_##name##_HW_DECODE, &message, \
+                             failureId)) {                                     \
+      featureDec##name.Disable(FeatureStatus::Blocklisted, message.get(),      \
+                               failureId);                                     \
+    }                                                                          \
+  }                                                                            \
+  gfxVars::SetUse##name##HwDecode(featureDec##name.IsEnabled());               \
+  FeatureState& featureEnc##name =                                             \
+      gfxConfig::GetFeature(Feature::name##_HW_ENCODE);                        \
+  featureEnc##name.Reset();                                                    \
+  if (featureEnc.IsEnabled()) {                                                \
+    CODEC_HW_FEATURE_SETUP_PLATFORM(name, Enc, true)                           \
+    if (!IsGfxInfoStatusOkay(nsIGfxInfo::FEATURE_##name##_HW_ENCODE, &message, \
+                             failureId)) {                                     \
+      featureEnc##name.Disable(FeatureStatus::Blocklisted, message.get(),      \
+                               failureId);                                     \
+    }                                                                          \
+  }                                                                            \
+  gfxVars::SetUse##name##HwEncode(featureEnc##name.IsEnabled());
+
+  CODEC_HW_FEATURE_SETUP(AV1)
+  CODEC_HW_FEATURE_SETUP(VP8)
+  CODEC_HW_FEATURE_SETUP(VP9)
+
+#if defined(MOZ_WIDGET_GTK) || 0 || 0
+  CODEC_HW_FEATURE_SETUP(H264)
+  CODEC_HW_FEATURE_SETUP(HEVC)
+#endif
+
+  status = nsIGfxInfo::FEATURE_STATUS_UNKNOWN;
+  gfxVars::SetHasWebrtcH264Hw(
+      NS_SUCCEEDED(gfxInfo->GetFeatureStatus(
+          nsIGfxInfo::FEATURE_WEBRTC_HW_ACCELERATION_H264, failureId,
+          &status)) &&
+      status == nsIGfxInfo::FEATURE_STATUS_OK);
+
+#undef CODEC_HW_FEATURE_SETUP_PLATFORM
+#undef CODEC_HW_FEATURE_SETUP
+}
+
+void gfxPlatform::InitWebGLConfig() {
+  if (!XRE_IsParentProcess()) return;
+
+  const nsCOMPtr<nsIGfxInfo> gfxInfo = components::GfxInfo::Service();
+
+  const auto IsFeatureOk = [&](const int32_t feature) {
+    nsCString discardFailureId;
+    int32_t status;
+    MOZ_RELEASE_ASSERT(NS_SUCCEEDED(
+        gfxInfo->GetFeatureStatus(feature, discardFailureId, &status)));
+    return (status == nsIGfxInfo::FEATURE_STATUS_OK);
+  };
+
+  FeatureState& featureWebGL = gfxConfig::GetFeature(Feature::WEBGL);
+  featureWebGL.EnableByDefault();
+
+  nsCString message;
+  nsCString failureId;
+  if (!IsGfxInfoStatusOkay(nsIGfxInfo::FEATURE_WEBGL, &message, failureId)) {
+    if (StaticPrefs::webgl_ignore_blocklist_AtStartup()) {
+      featureWebGL.UserForceEnable(
+          "Ignoring blocklist entry because webgl.ignore-blocklist is true.");
+    }
+    featureWebGL.Disable(FeatureStatus::Blocklisted, message.get(), failureId);
+  }
+
+  gfxVars::SetAllowWebgl2(IsFeatureOk(nsIGfxInfo::FEATURE_WEBGL2));
+  gfxVars::SetWebglAllowWindowsNativeGl(
+      IsFeatureOk(nsIGfxInfo::FEATURE_WEBGL_OPENGL));
+  gfxVars::SetAllowWebglAccelAngle(
+      IsFeatureOk(nsIGfxInfo::FEATURE_WEBGL_ANGLE));
+  gfxVars::SetWebglUseHardware(
+      IsFeatureOk(nsIGfxInfo::FEATURE_WEBGL_USE_HARDWARE));
+  gfxVars::SetAllowMetalAngleWebGL(
+      IsFeatureOk(nsIGfxInfo::FEATURE_WEBGL_ANGLE_METAL));
+
+  if (kIsMacOS) {
+    nsString vendorID, deviceID;
+    gfxInfo->GetAdapterVendorID(vendorID);
+    gfxInfo->GetAdapterDeviceID(deviceID);
+    if (vendorID.EqualsLiteral("0x8086") &&
+        (deviceID.EqualsLiteral("0x0116") ||
+         deviceID.EqualsLiteral("0x0126"))) {
+      gfxVars::SetWebglAllowCoreProfile(false);
+    }
+  }
+
+
+  if (!gfxConfig::IsEnabled(Feature::GPU_PROCESS) &&
+      !StaticPrefs::webgl_allow_in_parent_AtStartup()) {
+    featureWebGL.Disable(FeatureStatus::UnavailableNoGpuProcess,
+                         "Disabled without GPU process",
+                         "FEATURE_WEBGL_NO_GPU_PROCESS"_ns);
+  }
+
+  gfxVars::SetAllowWebGL(featureWebGL.IsEnabled());
+
+  bool threadsafeGL = IsFeatureOk(nsIGfxInfo::FEATURE_THREADSAFE_GL);
+  threadsafeGL |= StaticPrefs::webgl_threadsafe_gl_force_enabled_AtStartup();
+  threadsafeGL &= !StaticPrefs::webgl_threadsafe_gl_force_disabled_AtStartup();
+  gfxVars::SetSupportsThreadsafeGL(threadsafeGL);
+
+  FeatureState& feature =
+      gfxConfig::GetFeature(Feature::CANVAS_RENDERER_THREAD);
+  if (!threadsafeGL) {
+    feature.DisableByDefault(FeatureStatus::Blocked, "Thread unsafe GL",
+                             "FEATURE_FAILURE_THREAD_UNSAFE_GL"_ns);
+  } else if (!StaticPrefs::webgl_use_canvas_render_thread_AtStartup()) {
+    feature.DisableByDefault(FeatureStatus::Blocked, "Disabled by pref",
+                             "FEATURE_FAILURE_DISABLED_BY_PREF"_ns);
+  } else {
+    feature.EnableByDefault();
+  }
+  gfxVars::SetUseCanvasRenderThread(feature.IsEnabled());
+
+  bool webglOopAsyncPresentForceSync =
+      (threadsafeGL && !gfxVars::UseCanvasRenderThread()) ||
+      StaticPrefs::webgl_out_of_process_async_present_force_sync();
+  gfxVars::SetWebglOopAsyncPresentForceSync(webglOopAsyncPresentForceSync);
+
+  if (kIsAndroid) {
+    nsAutoString renderer;
+    gfxInfo->GetAdapterDeviceID(renderer);
+    if ((renderer.Find(u"Adreno (TM) 620") != -1) ||
+        (renderer.Find(u"Adreno (TM) 630") != -1)) {
+      gfxVars::SetAllowEglRbab(false);
+    }
+  }
+
+#if defined(MOZ_WIDGET_GTK)
+  if (kIsLinux) {
+    FeatureState& feature =
+        gfxConfig::GetFeature(Feature::DMABUF_SURFACE_EXPORT);
+    feature.EnableByDefault();
+    nsCString discardFailureId;
+    int32_t status;
+    if (NS_FAILED(
+            gfxInfo->GetFeatureStatus(nsIGfxInfo::FEATURE_DMABUF_SURFACE_EXPORT,
+                                      discardFailureId, &status)) ||
+        status != nsIGfxInfo::FEATURE_STATUS_OK) {
+#if defined(NIGHTLY_BUILD)
+      if (StaticPrefs::widget_dmabuf_export_force_enabled_AtStartup()) {
+        feature.UserForceEnable("Force-enabled by pref");
+      } else
+#endif
+      {
+        feature.Disable(FeatureStatus::Blocked, "Blocklisted by gfxInfo",
+                        discardFailureId);
+      }
+    }
+    gfxVars::SetUseDMABufSurfaceExport(feature.IsEnabled());
+  }
+
+  if (kIsLinux) {
+    FeatureState& feature = gfxConfig::GetFeature(Feature::DMABUF_WEBGL);
+    feature.EnableByDefault();
+    if (!StaticPrefs::widget_dmabuf_webgl_enabled_AtStartup()) {
+      feature.UserDisable("Disabled by pref",
+                          "FEATURE_FAILURE_DISABLED_BY_PREF"_ns);
+    }
+    nsCString discardFailureId;
+    int32_t status;
+    if (NS_FAILED(gfxInfo->GetFeatureStatus(nsIGfxInfo::FEATURE_DMABUF_WEBGL,
+                                            discardFailureId, &status)) ||
+        status != nsIGfxInfo::FEATURE_STATUS_OK) {
+      feature.Disable(FeatureStatus::Blocked, "Blocklisted by gfxInfo",
+                      discardFailureId);
+    }
+    gfxVars::SetUseDMABufWebGL(feature.IsEnabled());
+  }
+#endif
+}
+
+void gfxPlatform::InitWebGPUConfig() {
+  if (!XRE_IsParentProcess()) {
+    return;
+  }
+
+  nsCString message;
+  nsCString failureId;
+
+  FeatureState& featureWebGPU = gfxConfig::GetFeature(Feature::WEBGPU);
+  featureWebGPU.EnableByDefault();
+
+  if (!gfxConfig::IsEnabled(Feature::GPU_PROCESS) &&
+      !StaticPrefs::dom_webgpu_allow_in_parent_AtStartup()) {
+    featureWebGPU.Disable(FeatureStatus::UnavailableNoGpuProcess,
+                          "Disabled without GPU process",
+                          "FEATURE_WEBGPU_NO_GPU_PROCESS"_ns);
+  } else if (!IsGfxInfoStatusOkay(nsIGfxInfo::FEATURE_WEBGPU, &message,
+                                  failureId)) {
+    if (StaticPrefs::gfx_webgpu_ignore_blocklist_AtStartup()) {
+      featureWebGPU.UserForceEnable(
+          "Ignoring blocklist entry because gfx.webgpu.ignore-blocklist is "
+          "true.");
+    } else {
+      featureWebGPU.Disable(FeatureStatus::Blocklisted, message.get(),
+                            failureId);
+    }
+  }
+
+  gfxVars::SetAllowWebGPU(featureWebGPU.IsEnabled());
+
+  if (StaticPrefs::dom_webgpu_allow_present_without_readback()
+  ) {
+    gfxVars::SetAllowWebGPUPresentWithoutReadback(true);
+  }
+
+  FeatureState& featureExternalTexture =
+      gfxConfig::GetFeature(Feature::WEBGPU_EXTERNAL_TEXTURE);
+  featureExternalTexture.SetDefaultFromPref(
+      StaticPrefs::GetPrefName_dom_webgpu_external_texture_enabled(), true,
+      StaticPrefs::GetPrefDefault_dom_webgpu_external_texture_enabled());
+  if (!IsGfxInfoStatusOkay(nsIGfxInfo::FEATURE_WEBGPU_EXTERNAL_TEXTURE,
+                           &message, failureId)) {
+    featureExternalTexture.Disable(FeatureStatus::Blocklisted, message.get(),
+                                   failureId);
+  }
+  featureExternalTexture.ForceDisable(
+      FeatureStatus::Blocked,
+      "WebGPU external textures are not supported on this Operating System",
+      "WEBGPU_EXTERNAL_TEXTURE_UNSUPPORTED_OS"_ns);
+  gfxVars::SetAllowWebGPUExternalTexture(featureExternalTexture.IsEnabled());
+}
+
+
+void gfxPlatform::InitWindowOcclusionConfig() {
+  if (!XRE_IsParentProcess()) {
+    return;
+  }
+}
+
+static void BackdropFilterPrefChangeCallback(const char*, void*) {
+  FeatureState& feature = gfxConfig::GetFeature(Feature::BACKDROP_FILTER);
+
+  feature.Reset();
+  feature.EnableByDefault();
+
+  if (StaticPrefs::layout_css_backdrop_filter_force_enabled()) {
+    feature.UserForceEnable("Force enabled by pref");
+  }
+
+  nsCString message;
+  nsCString failureId;
+  if (!gfxPlatform::IsGfxInfoStatusOkay(nsIGfxInfo::FEATURE_BACKDROP_FILTER,
+                                        &message, failureId)) {
+    feature.Disable(FeatureStatus::Blocklisted, message.get(), failureId);
+  }
+
+  gfxVars::SetAllowBackdropFilter(feature.IsEnabled());
+}
+
+void gfxPlatform::InitBackdropFilterConfig() {
+  gfxVars::AddReceiver(&nsCSSProps::GfxVarReceiver());
+
+  if (!XRE_IsParentProcess()) {
+    nsCSSProps::RecomputeEnabledState(
+        StaticPrefs::GetPrefName_layout_css_backdrop_filter_enabled());
+    return;
+  }
+
+  BackdropFilterPrefChangeCallback(nullptr, nullptr);
+
+  Preferences::RegisterCallback(
+      BackdropFilterPrefChangeCallback,
+      nsDependentCString(
+          StaticPrefs::GetPrefName_layout_css_backdrop_filter_force_enabled()));
+}
+
+static void AcceleratedCanvas2DPrefChangeCallback(const char*, void*) {
+  FeatureState& feature = gfxConfig::GetFeature(Feature::ACCELERATED_CANVAS2D);
+
+  feature.Reset();
+
+  feature.SetDefaultFromPref(
+      StaticPrefs::GetPrefName_gfx_canvas_accelerated(), true,
+      StaticPrefs::GetPrefDefault_gfx_canvas_accelerated());
+
+  if (StaticPrefs::gfx_canvas_accelerated_force_enabled()) {
+    feature.UserForceEnable("Force-enabled by pref");
+  }
+
+  if (!StaticPrefs::gfx_canvas_accelerated_allow_in_parent_AtStartup() &&
+      !gfxConfig::IsEnabled(Feature::GPU_PROCESS)) {
+    feature.Disable(FeatureStatus::Blocked, "Disabled by GPU Process disabled",
+                    "FEATURE_FAILURE_DISABLED_BY_GPU_PROCESS_DISABLED"_ns);
+  } else if (!gfxConfig::IsEnabled(Feature::WEBRENDER)) {
+    feature.Disable(FeatureStatus::Blocked, "Disabled by Software WebRender",
+                    "FEATURE_FAILURE_DISABLED_BY_SOFTWARE_WEBRENDER"_ns);
+  }
+
+  nsCString message;
+  nsCString failureId;
+  if (!gfxPlatform::IsGfxInfoStatusOkay(
+          nsIGfxInfo::FEATURE_ACCELERATED_CANVAS2D, &message, failureId)) {
+    feature.Disable(FeatureStatus::Blocklisted, message.get(), failureId);
+  }
+
+  gfxVars::SetUseAcceleratedCanvas2D(feature.IsEnabled());
+}
+
+void gfxPlatform::InitAcceleratedCanvas2DConfig() {
+  if (!XRE_IsParentProcess()) {
+    return;
+  }
+
+  AcceleratedCanvas2DPrefChangeCallback(nullptr, nullptr);
+
+  Preferences::RegisterCallback(
+      AcceleratedCanvas2DPrefChangeCallback,
+      nsDependentCString(StaticPrefs::GetPrefName_gfx_canvas_accelerated()));
+  Preferences::RegisterCallback(
+      AcceleratedCanvas2DPrefChangeCallback,
+      nsDependentCString(
+          StaticPrefs::GetPrefName_gfx_canvas_accelerated_force_enabled()));
+}
+
+bool gfxPlatform::AccelerateLayersByDefault() {
+#if defined(MOZ_GL_PROVIDER) || 0
+  return true;
+#else
+  return false;
+#endif
+}
+
+bool gfxPlatform::UsesOffMainThreadCompositing() {
+  if (XRE_GetProcessType() == GeckoProcessType_GPU) {
+    return true;
+  }
+
+  static bool firstTime = true;
+  static bool result = false;
+
+  if (firstTime) {
+    MOZ_ASSERT(sLayersAccelerationPrefsInitialized);
+    result = gfxVars::BrowserTabsRemoteAutostart() ||
+             !StaticPrefs::
+                 layers_offmainthreadcomposition_force_disabled_AtStartup();
+#if defined(MOZ_WIDGET_GTK)
+    result |= StaticPrefs::
+        layers_acceleration_force_enabled_AtStartup_DoNotUseDirectly();
+
+#endif
+    firstTime = false;
+  }
+
+  return result;
+}
+
+RefPtr<mozilla::VsyncDispatcher> gfxPlatform::GetGlobalVsyncDispatcher() {
+  MOZ_ASSERT(mVsyncDispatcher,
+             "mVsyncDispatcher should have been initialized by ReInitFrameRate "
+             "during gfxPlatform init");
+  MOZ_ASSERT(XRE_IsParentProcess());
+  return mVsyncDispatcher;
+}
+
+already_AddRefed<mozilla::gfx::VsyncSource>
+gfxPlatform::GetGlobalHardwareVsyncSource() {
+  if (!mGlobalHardwareVsyncSource) {
+    mGlobalHardwareVsyncSource = CreateGlobalHardwareVsyncSource();
+  }
+  return do_AddRef(mGlobalHardwareVsyncSource);
+}
+
+already_AddRefed<mozilla::gfx::VsyncSource>
+gfxPlatform::GetSoftwareVsyncSource() {
+  if (!mSoftwareVsyncSource) {
+    double rateInMS = 1000.0 / (double)gfxPlatform::GetSoftwareVsyncRate();
+    mSoftwareVsyncSource = new mozilla::gfx::SoftwareVsyncSource(
+        TimeDuration::FromMilliseconds(rateInMS));
+  }
+  return do_AddRef(mSoftwareVsyncSource);
+}
+
+bool gfxPlatform::IsInLayoutAsapMode() {
+  return StaticPrefs::layout_frame_rate() == 0;
+}
+
+static int LayoutFrameRateFromPrefs() {
+  auto val = StaticPrefs::layout_frame_rate();
+  if (nsContentUtils::ShouldResistFingerprinting(
+          "The frame rate is a global property.", RFPTarget::FrameRate)) {
+    val = 60;
+  }
+  return val;
+}
+
+bool gfxPlatform::ForceSoftwareVsync() {
+  return LayoutFrameRateFromPrefs() > 0;
+}
+
+int gfxPlatform::GetSoftwareVsyncRate() {
+  int preferenceRate = LayoutFrameRateFromPrefs();
+  if (preferenceRate <= 0) {
+    return gfxPlatform::GetDefaultFrameRate();
+  }
+  return preferenceRate;
+}
+
+int gfxPlatform::GetDefaultFrameRate() { return 60; }
+
+void gfxPlatform::ReInitFrameRate(const char* aPrefIgnored,
+                                  void* aDataIgnored) {
+  MOZ_RELEASE_ASSERT(XRE_IsParentProcess());
+
+  if (gPlatform->mSoftwareVsyncSource) {
+    double rateInMS = 1000.0 / (double)gfxPlatform::GetSoftwareVsyncRate();
+    gPlatform->mSoftwareVsyncSource->SetVsyncRate(
+        TimeDuration::FromMilliseconds(rateInMS));
+  }
+
+  RefPtr<VsyncSource> vsyncSource =
+      gfxPlatform::ForceSoftwareVsync()
+          ? gPlatform->GetSoftwareVsyncSource()
+          : gPlatform->GetGlobalHardwareVsyncSource();
+  gPlatform->mVsyncDispatcher->SetVsyncSource(vsyncSource);
+}
+
+void gfxPlatform::ResetHardwareVsyncSource() {
+  if (gPlatform->mGlobalHardwareVsyncSource) {
+    gPlatform->mGlobalHardwareVsyncSource->Shutdown();
+    gPlatform->mGlobalHardwareVsyncSource = nullptr;
+  }
+}
+
+const char* gfxPlatform::GetAzureCanvasBackend() const {
+  BackendType backend{};
+
+  if (gfxConfig::IsEnabled(Feature::GPU_PROCESS)) {
+    BackendPrefsData data = GetBackendPrefs();
+    backend = GetCanvasBackendPref(data.mCanvasBitmask);
+    if (backend == BackendType::NONE) {
+      backend = data.mCanvasDefault;
+    }
+  } else {
+    backend = mPreferredCanvasBackend;
+  }
+
+  return GetBackendName(backend);
+}
+
+const char* gfxPlatform::GetAzureContentBackend() const {
+  BackendType backend{};
+
+  if (gfxConfig::IsEnabled(Feature::GPU_PROCESS)) {
+    BackendPrefsData data = GetBackendPrefs();
+    backend = GetContentBackendPref(data.mContentBitmask);
+    if (backend == BackendType::NONE) {
+      backend = data.mContentDefault;
+    }
+  } else {
+    backend = mContentBackend;
+  }
+
+  return GetBackendName(backend);
+}
+
+void gfxPlatform::GetAzureBackendInfo(mozilla::widget::InfoObject& aObj) {
+  if (gfxConfig::IsEnabled(Feature::GPU_PROCESS)) {
+    aObj.DefineProperty("AzureCanvasBackend (UI Process)",
+                        GetBackendName(mPreferredCanvasBackend));
+    aObj.DefineProperty("AzureFallbackCanvasBackend (UI Process)",
+                        GetBackendName(mFallbackCanvasBackend));
+    aObj.DefineProperty("AzureContentBackend (UI Process)",
+                        GetBackendName(mContentBackend));
+  } else {
+    aObj.DefineProperty("AzureFallbackCanvasBackend",
+                        GetBackendName(mFallbackCanvasBackend));
+  }
+
+  aObj.DefineProperty("AzureCanvasBackend", GetAzureCanvasBackend());
+  aObj.DefineProperty("AzureContentBackend", GetAzureContentBackend());
+}
+
+void gfxPlatform::GetApzSupportInfo(mozilla::widget::InfoObject& aObj) {
+  if (!gfxPlatform::AsyncPanZoomEnabled()) {
+    return;
+  }
+
+  if (SupportsApzWheelInput()) {
+    aObj.DefineProperty("ApzWheelInput", 1);
+  }
+
+  if (SupportsApzTouchInput()) {
+    aObj.DefineProperty("ApzTouchInput", 1);
+  }
+
+  if (SupportsApzDragInput()) {
+    aObj.DefineProperty("ApzDragInput", 1);
+  }
+
+  if (SupportsApzKeyboardInput()) {
+    aObj.DefineProperty("ApzKeyboardInput", 1);
+  }
+
+  if (SupportsApzAutoscrolling()) {
+    aObj.DefineProperty("ApzAutoscrollInput", 1);
+  }
+
+  if (SupportsApzZooming()) {
+    aObj.DefineProperty("ApzZoomingInput", 1);
+  }
+}
+
+void gfxPlatform::GetFrameStats(mozilla::widget::InfoObject& aObj) {
+  uint32_t i = 0;
+  for (FrameStats& f : mFrameStats) {
+    nsPrintfCString name("Slow Frame #%02u", ++i);
+
+    nsPrintfCString value(
+        "Frame %" PRIu64
+        "(%s) CONTENT_FRAME_TIME %d - Transaction start %f, main-thread time "
+        "%f, full paint time %f, Skipped composites %u, Composite start %f, "
+        "Resource upload time %f, Render time %f, Composite time %f",
+        f.id().mId, f.url().get(), f.contentFrameTime(),
+        (f.transactionStart() - f.refreshStart()).ToMilliseconds(),
+        (f.fwdTime() - f.transactionStart()).ToMilliseconds(),
+        f.sceneBuiltTime()
+            ? (f.sceneBuiltTime() - f.transactionStart()).ToMilliseconds()
+            : 0.0,
+        f.skippedComposites(),
+        (f.compositeStart() - f.refreshStart()).ToMilliseconds(),
+        f.resourceUploadTime(),
+        (f.compositeEnd() - f.renderStart()).ToMilliseconds(),
+        (f.compositeEnd() - f.compositeStart()).ToMilliseconds());
+    aObj.DefineProperty(name.get(), value.get());
+  }
+}
+
+void gfxPlatform::GetCMSSupportInfo(mozilla::widget::InfoObject& aObj) {
+  nsTArray<uint8_t> outputProfileData =
+      gfxPlatform::GetPlatform()->GetPlatformCMSOutputProfileData();
+  if (outputProfileData.IsEmpty()) {
+    nsPrintfCString msg("Empty profile data");
+    aObj.DefineProperty("CMSOutputProfile", msg.get());
+    return;
+  }
+
+  const size_t kMaxProfileSize = 8192;
+  if (outputProfileData.Length() >= kMaxProfileSize) {
+    nsPrintfCString msg("%zu bytes, too large", outputProfileData.Length());
+    aObj.DefineProperty("CMSOutputProfile", msg.get());
+    return;
+  }
+
+  nsString encodedProfile;
+  nsresult rv =
+      Base64Encode(reinterpret_cast<const char*>(outputProfileData.Elements()),
+                   outputProfileData.Length(), encodedProfile);
+  if (!NS_SUCCEEDED(rv)) {
+    nsPrintfCString msg("base64 encode failed 0x%08x",
+                        static_cast<uint32_t>(rv));
+    aObj.DefineProperty("CMSOutputProfile", msg.get());
+    return;
+  }
+
+  aObj.DefineProperty("CMSOutputProfile", encodedProfile);
+}
+
+void gfxPlatform::GetDisplayInfo(mozilla::widget::InfoObject& aObj) {
+  auto& screens = widget::ScreenManager::GetSingleton().CurrentScreenList();
+  aObj.DefineProperty("DisplayCount", screens.Length());
+
+  size_t i = 0;
+  for (auto& screen : screens) {
+    const LayoutDeviceIntRect rect = screen->GetRect();
+    nsPrintfCString value(
+        "%dx%d@%dHz scales:%f|%f %s", rect.width, rect.height,
+        screen->GetRefreshRate(), screen->GetContentsScaleFactor(),
+        screen->GetDefaultCSSScaleFactor(), screen->GetIsHDR() ? "HDR" : "SDR");
+
+    aObj.DefineProperty(nsPrintfCString("Display%zu", i++).get(),
+                        NS_ConvertUTF8toUTF16(value));
+  }
+
+  if (XRE_IsParentProcess()) {
+    GetPlatformDisplayInfo(aObj);
+  }
+}
+
+void gfxPlatform::GetOverlayInfo(mozilla::widget::InfoObject& aObj) {
+  if (mOverlayInfo.isNothing()) {
+    return;
+  }
+
+  auto toString = [](mozilla::layers::OverlaySupportType aType) -> const char* {
+    switch (aType) {
+      case mozilla::layers::OverlaySupportType::None:
+        return "None";
+      case mozilla::layers::OverlaySupportType::Software:
+        return "Software";
+      case mozilla::layers::OverlaySupportType::Direct:
+        return "Direct";
+      case mozilla::layers::OverlaySupportType::Scaling:
+        return "Scaling";
+      default:
+        MOZ_ASSERT_UNREACHABLE("Unexpected to be called");
+    }
+    MOZ_CRASH("Incomplete switch");
+  };
+
+  auto toStringBool = [](bool aSupported) -> const char* {
+    if (aSupported) {
+      return "Supported";
+    }
+    return "Not Supported";
+  };
+
+  nsPrintfCString value(
+      "NV12=%s YUV2=%s BGRA8=%s RGB10A2=%s RGBA16F=%s VpSR=%s VpAutoHDR=%s "
+      "HwOverlayHDR=%s",
+      toString(mOverlayInfo.ref().mNv12Overlay),
+      toString(mOverlayInfo.ref().mYuy2Overlay),
+      toString(mOverlayInfo.ref().mBgra8Overlay),
+      toString(mOverlayInfo.ref().mRgb10a2Overlay),
+      toString(mOverlayInfo.ref().mRgba16fOverlay),
+      toStringBool(mOverlayInfo.ref().mSupportsVpSuperResolution),
+      toStringBool(mOverlayInfo.ref().mSupportsVpAutoHDR),
+      toStringBool(mOverlayInfo.ref().mSupportsHDR));
+
+  aObj.DefineProperty("OverlaySupport", NS_ConvertUTF8toUTF16(value));
+}
+
+void gfxPlatform::GetSwapChainInfo(mozilla::widget::InfoObject& aObj) {
+  if (mSwapChainInfo.isNothing()) {
+    return;
+  }
+
+  auto toString = [](bool aTearingSupported) -> const char* {
+    if (aTearingSupported) {
+      return "Supported";
+    }
+    return "Not Supported";
+  };
+
+  nsPrintfCString value("%s", toString(mSwapChainInfo.ref().mTearingSupported));
+
+  aObj.DefineProperty("SwapChainTearingSupport", NS_ConvertUTF8toUTF16(value));
+}
+
+class FrameStatsComparator {
+ public:
+  bool Equals(const FrameStats& aA, const FrameStats& aB) const {
+    return aA.contentFrameTime() == aB.contentFrameTime();
+  }
+  bool LessThan(const FrameStats& aA, const FrameStats& aB) const {
+    return aA.contentFrameTime() > aB.contentFrameTime();
+  }
+};
+
+void gfxPlatform::NotifyFrameStats(nsTArray<FrameStats>&& aFrameStats) {
+  if (!StaticPrefs::gfx_logging_slow_frames_enabled_AtStartup()) {
+    return;
+  }
+
+  FrameStatsComparator comp;
+  for (FrameStats& f : aFrameStats) {
+    mFrameStats.InsertElementSorted(f, comp);
+  }
+  if (mFrameStats.Length() > 10) {
+    mFrameStats.SetLength(10);
+  }
+}
+
+uint32_t gfxPlatform::TargetFrameRate() {
+  if (gPlatform && gPlatform->mVsyncDispatcher) {
+    return round(1000.0 /
+                 gPlatform->mVsyncDispatcher->GetVsyncRate().ToMilliseconds());
+  }
+  return 0;
+}
+
+bool gfxPlatform::UseDesktopZoomingScrollbars() {
+  return StaticPrefs::apz_allow_zooming();
+}
+
+bool gfxPlatform::AsyncPanZoomEnabled() {
+  if (!BrowserTabsRemoteAutostart()) {
+    return false;
+  }
+  if (FissionAutostart()) {
+    return true;
+  }
+  return StaticPrefs::
+      layers_async_pan_zoom_enabled_AtStartup_DoNotUseDirectly();
+}
+
+bool gfxPlatform::PerfWarnings() {
+  return StaticPrefs::gfx_perf_warnings_enabled();
+}
+
+void gfxPlatform::NotifyCompositorCreated(LayersBackend aBackend) {
+  if (mCompositorBackend == aBackend) {
+    return;
+  }
+
+  if (mCompositorBackend != LayersBackend::LAYERS_NONE) {
+    gfxCriticalNote << "Compositors might be mixed (" << int(mCompositorBackend)
+                    << "," << int(aBackend) << ")";
+  }
+
+  mCompositorBackend = aBackend;
+
+  NS_DispatchToMainThread(
+      NS_NewRunnableFunction("gfxPlatform::NotifyCompositorCreated", [] {
+        if (nsCOMPtr<nsIObserverService> obsvc =
+                services::GetObserverService()) {
+          obsvc->NotifyObservers(nullptr, "compositor:created", nullptr);
+        }
+      }));
+}
+
+bool gfxPlatform::FallbackFromAcceleration(FeatureStatus, const char*,
+                                           const nsACString&, bool) {
+  MOZ_CRASH("Hardware WebRender failed; software fallback is unavailable");
+}
+
+void gfxPlatform::DisableAcceleratedCanvasForFallback(
+    FeatureStatus aStatus, const char* aMessage, const nsACString& aFailureId) {
+  if (gfxVars::UseAcceleratedCanvas2D() &&
+      !StaticPrefs::gfx_canvas_accelerated_allow_in_parent_AtStartup()) {
+    gfxConfig::Disable(Feature::ACCELERATED_CANVAS2D, aStatus, aMessage,
+                       aFailureId);
+    gfxVars::SetUseAcceleratedCanvas2D(false);
+  }
+}
+
+void gfxPlatform::DisableAllCanvasForFallback(FeatureStatus aStatus,
+                                              const char* aMessage,
+                                              const nsACString& aFailureId) {
+  DisableAcceleratedCanvasForFallback(aStatus, aMessage, aFailureId);
+
+  if (gfxVars::AllowWebGPU() &&
+      !StaticPrefs::dom_webgpu_allow_in_parent_AtStartup()) {
+    gfxConfig::Disable(Feature::WEBGPU, aStatus, aMessage, aFailureId);
+    gfxVars::SetAllowWebGPU(false);
+  }
+
+  if (gfxVars::AllowWebGL() &&
+      !StaticPrefs::webgl_allow_in_parent_AtStartup()) {
+    gfxConfig::Disable(Feature::WEBGL, aStatus, aMessage, aFailureId);
+    gfxVars::SetAllowWebGL(false);
+  }
+}
+
+void gfxPlatform::DisableGPUProcess() {
+  DisableAllCanvasForFallback(
+      FeatureStatus::UnavailableNoGpuProcess,
+      "Disabled by fallback to GPU Process disabled",
+      "FEATURE_FAILURE_DISABLED_BY_FALLBACK_GPU_PROCESS_DISABLED"_ns);
+
+  RemoteTextureMap::Init();
+  wr::RenderThread::Start(GPUProcessManager::Get()->AllocateNamespace());
+  gfx::CanvasRenderThread::Start();
+  image::ImageMemoryReporter::InitForWebRender();
+}
+
+ void gfxPlatform::DisableRemoteCanvas() {
+  if (gfxVars::UseAcceleratedCanvas2D()) {
+    gfxConfig::ForceDisable(Feature::ACCELERATED_CANVAS2D,
+                            FeatureStatus::Failed, "Disabled by runtime error",
+                            "FEATURE_ACCELERATED_CANVAS2D_RUNTIME_ERROR"_ns);
+    gfxVars::SetUseAcceleratedCanvas2D(false);
+  }
+}
+
+void gfxPlatform::ImportCachedContentDeviceData() {
+  MOZ_ASSERT(XRE_IsContentProcess());
+
+  if (!gContentDeviceInitData) {
+    return;
+  }
+
+  ImportContentDeviceData(*gContentDeviceInitData);
+  gContentDeviceInitData = nullptr;
+}
+
+void gfxPlatform::ImportContentDeviceData(
+    const mozilla::gfx::ContentDeviceData& aData) {
+  MOZ_ASSERT(XRE_IsContentProcess());
+
+  const DevicePrefs& prefs = aData.prefs();
+  gfxConfig::Inherit(Feature::HW_COMPOSITING, prefs.hwCompositing());
+
+  mCMSOutputProfileData = Some(aData.cmsOutputProfileData().Clone());
+}
+
+void gfxPlatform::BuildContentDeviceData(
+    mozilla::gfx::ContentDeviceData* aOut) {
+  MOZ_ASSERT(XRE_IsParentProcess());
+
+  aOut->prefs().hwCompositing() = gfxConfig::GetValue(Feature::HW_COMPOSITING);
+  aOut->prefs().oglCompositing() =
+      gfxConfig::GetValue(Feature::OPENGL_COMPOSITING);
+}
+
+void gfxPlatform::ImportGPUDeviceData(
+    const mozilla::gfx::GPUDeviceData& aData) {
+  MOZ_ASSERT(XRE_IsParentProcess());
+
+  gfxConfig::ImportChange(Feature::OPENGL_COMPOSITING, aData.oglCompositing());
+}
+
+bool gfxPlatform::SupportsApzTouchInput() const {
+  return dom::TouchEvent::PrefEnabled(nullptr);
+}
+
+bool gfxPlatform::SupportsApzDragInput() const {
+  return StaticPrefs::apz_drag_enabled();
+}
+
+bool gfxPlatform::SupportsApzKeyboardInput() const {
+  return StaticPrefs::apz_keyboard_enabled_AtStartup();
+}
+
+bool gfxPlatform::SupportsApzAutoscrolling() const {
+  return StaticPrefs::apz_autoscroll_enabled();
+}
+
+bool gfxPlatform::SupportsApzZooming() const {
+  return StaticPrefs::apz_allow_zooming();
+}
+
+void gfxPlatform::InitOpenGLConfig() {
+
+  FeatureState& openGLFeature =
+      gfxConfig::GetFeature(Feature::OPENGL_COMPOSITING);
+
+  if (!gfxConfig::IsEnabled(Feature::HW_COMPOSITING)) {
+    openGLFeature.DisableByDefault(FeatureStatus::Unavailable,
+                                   "Hardware compositing is disabled",
+                                   "FEATURE_FAILURE_OPENGL_NEED_HWCOMP"_ns);
+    return;
+  }
+
+  openGLFeature.EnableByDefault();
+
+  if (StaticPrefs::
+          layers_acceleration_force_enabled_AtStartup_DoNotUseDirectly()) {
+    openGLFeature.UserForceEnable("Force-enabled by pref");
+    return;
+  }
+
+  nsCString message;
+  nsCString failureId;
+  if (!IsGfxInfoStatusOkay(nsIGfxInfo::FEATURE_OPENGL_LAYERS, &message,
+                           failureId)) {
+    openGLFeature.Disable(FeatureStatus::Blocklisted, message.get(), failureId);
+  }
+}
+
+bool gfxPlatform::IsGfxInfoStatusOkay(int32_t aFeature, nsCString* aOutMessage,
+                                      nsCString& aFailureId) {
+  nsCOMPtr<nsIGfxInfo> gfxInfo = components::GfxInfo::Service();
+  if (!gfxInfo) {
+    return true;
+  }
+
+  int32_t status;
+  if (NS_SUCCEEDED(gfxInfo->GetFeatureStatus(aFeature, aFailureId, &status)) &&
+      status != nsIGfxInfo::FEATURE_STATUS_OK) {
+    aOutMessage->AssignLiteral("#BLOCKLIST_");
+    aOutMessage->AppendASCII(aFailureId.get());
+    return false;
+  }
+
+  return true;
+}

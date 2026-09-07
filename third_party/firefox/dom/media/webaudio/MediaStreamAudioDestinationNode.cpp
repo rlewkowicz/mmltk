@@ -1,0 +1,142 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "MediaStreamAudioDestinationNode.h"
+
+#include "AudioNodeEngine.h"
+#include "AudioNodeTrack.h"
+#include "AudioStreamTrack.h"
+#include "DOMMediaStream.h"
+#include "ForwardedInputTrack.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/MediaStreamAudioDestinationNodeBinding.h"
+#include "nsGlobalWindowInner.h"
+
+namespace mozilla::dom {
+
+class AudioDestinationTrackSource final : public MediaStreamTrackSource {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(AudioDestinationTrackSource,
+                                           MediaStreamTrackSource)
+
+  AudioDestinationTrackSource(MediaStreamAudioDestinationNode* aNode,
+                              mozilla::MediaTrack* aInputTrack,
+                              ProcessedMediaTrack* aTrack,
+                              nsIPrincipal* aPrincipal)
+      : MediaStreamTrackSource(
+            aPrincipal, nsString(),
+            TrackingId(TrackingId::Source::AudioDestinationNode, 0)),
+        mTrack(aTrack),
+        mPort(mTrack->AllocateInputPort(aInputTrack)),
+        mNode(aNode) {}
+
+  void Destroy() override {
+    if (!mTrack->IsDestroyed()) {
+      mTrack->Destroy();
+      mPort->Destroy();
+    }
+    if (mNode) {
+      mNode->DestroyMediaTrack();
+      mNode = nullptr;
+    }
+  }
+
+  MediaSourceEnum GetMediaSource() const override {
+    return MediaSourceEnum::AudioCapture;
+  }
+
+  void GetSettings(MediaTrackSettings& aSettings) override {}
+
+  void Stop() override { Destroy(); }
+
+  void Disable() override {}
+
+  void Enable() override {}
+
+  const RefPtr<ProcessedMediaTrack> mTrack;
+  const RefPtr<MediaInputPort> mPort;
+
+ private:
+  ~AudioDestinationTrackSource() = default;
+
+  RefPtr<MediaStreamAudioDestinationNode> mNode;
+};
+
+NS_IMPL_ADDREF_INHERITED(AudioDestinationTrackSource, MediaStreamTrackSource)
+NS_IMPL_RELEASE_INHERITED(AudioDestinationTrackSource, MediaStreamTrackSource)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(AudioDestinationTrackSource)
+NS_INTERFACE_MAP_END_INHERITING(MediaStreamTrackSource)
+NS_IMPL_CYCLE_COLLECTION_INHERITED(AudioDestinationTrackSource,
+                                   MediaStreamTrackSource, mNode)
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED(MediaStreamAudioDestinationNode, AudioNode,
+                                   mDOMStream)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(MediaStreamAudioDestinationNode)
+NS_INTERFACE_MAP_END_INHERITING(AudioNode)
+
+NS_IMPL_ADDREF_INHERITED(MediaStreamAudioDestinationNode, AudioNode)
+NS_IMPL_RELEASE_INHERITED(MediaStreamAudioDestinationNode, AudioNode)
+
+MediaStreamAudioDestinationNode::MediaStreamAudioDestinationNode(
+    AudioContext* aContext)
+    : AudioNode(aContext, 2, ChannelCountMode::Explicit,
+                ChannelInterpretation::Speakers),
+      mDOMStream(MakeAndAddRef<DOMMediaStream>(GetOwnerWindow())) {
+  nsCOMPtr<nsIPrincipal> principal = nullptr;
+  if (nsGlobalWindowInner* win = aContext->GetOwnerWindow()) {
+    Document* doc = win->GetExtantDoc();
+    principal = doc->NodePrincipal();
+  }
+  mTrack = AudioNodeTrack::Create(aContext, new AudioNodeEngine(this),
+                                  AudioNodeTrack::EXTERNAL_OUTPUT,
+                                  aContext->Graph());
+  auto source = MakeRefPtr<AudioDestinationTrackSource>(
+      this, mTrack,
+      aContext->Graph()->CreateForwardedInputTrack(MediaSegment::AUDIO),
+      principal);
+  auto track =
+      MakeRefPtr<AudioStreamTrack>(GetOwnerWindow(), source->mTrack, source);
+  mDOMStream->AddTrackInternal(track);
+}
+
+already_AddRefed<MediaStreamAudioDestinationNode>
+MediaStreamAudioDestinationNode::Create(AudioContext& aAudioContext,
+                                        const AudioNodeOptions& aOptions,
+                                        ErrorResult& aRv) {
+  MOZ_RELEASE_ASSERT(!aAudioContext.IsOffline(), "Bindings messed up?");
+
+  RefPtr<MediaStreamAudioDestinationNode> audioNode =
+      new MediaStreamAudioDestinationNode(&aAudioContext);
+
+  audioNode->Initialize(aOptions, aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+
+  return audioNode.forget();
+}
+
+size_t MediaStreamAudioDestinationNode::SizeOfExcludingThis(
+    MallocSizeOf aMallocSizeOf) const {
+  size_t amount = AudioNode::SizeOfExcludingThis(aMallocSizeOf);
+  return amount;
+}
+
+size_t MediaStreamAudioDestinationNode::SizeOfIncludingThis(
+    MallocSizeOf aMallocSizeOf) const {
+  return aMallocSizeOf(this) + SizeOfExcludingThis(aMallocSizeOf);
+}
+
+void MediaStreamAudioDestinationNode::DestroyMediaTrack() {
+  AudioNode::DestroyMediaTrack();
+}
+
+JSObject* MediaStreamAudioDestinationNode::WrapObject(
+    JSContext* aCx, JS::Handle<JSObject*> aGivenProto) {
+  return MediaStreamAudioDestinationNode_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+}  

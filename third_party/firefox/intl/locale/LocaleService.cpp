@@ -1,0 +1,710 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "LocaleService.h"
+
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/DebugOnly.h"
+#include "mozilla/Omnijar.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/Services.h"
+#include "mozilla/StaticPrefs_privacy.h"
+#include "mozilla/intl/AppDateTimeFormat.h"
+#include "mozilla/intl/Locale.h"
+#include "mozilla/intl/OSPreferences.h"
+#include "mozilla/intl/locale_service_glue_generated.h"
+#include "nsContentUtils.h"
+#include "nsDirectoryService.h"
+#include "nsDirectoryServiceDefs.h"
+#include "nsIObserverService.h"
+#include "nsStringEnumerator.h"
+#include "nsRFPService.h"
+#include "nsXULAppAPI.h"
+#include "nsZipArchive.h"
+#if defined(MOZ_WIDGET_GTK)
+#  include "mozilla/WidgetUtilsGtk.h"
+#endif
+
+#define INTL_SYSTEM_LOCALES_CHANGED "intl:system-locales-changed"
+
+#define ACCEPT_LANGUAGES_PREF "intl.accept_languages"
+#define FONT_LANGUAGE_GROUP_PREF "font.language.group"
+#define URL_FIXUP_SUFFIX_PREF "browser.fixup.alternate.suffix"
+
+#define PSEUDO_LOCALE_PREF "intl.l10n.pseudo"
+#define REQUESTED_LOCALES_PREF "intl.locale.requested"
+#define WEB_EXPOSED_LOCALES_PREF "intl.locale.privacy.web_exposed"
+
+static const char* kObservedPrefs[] = {REQUESTED_LOCALES_PREF,
+                                       WEB_EXPOSED_LOCALES_PREF,
+                                       PSEUDO_LOCALE_PREF, nullptr};
+
+using namespace mozilla::intl::ffi;
+using namespace mozilla::intl;
+using namespace mozilla;
+
+NS_IMPL_ISUPPORTS(LocaleService, mozILocaleService, nsIObserver,
+                  nsISupportsWeakReference)
+
+mozilla::StaticRefPtr<LocaleService> LocaleService::sInstance;
+
+static void SplitLocaleListStringIntoArray(nsACString& str,
+                                           nsTArray<nsCString>& aRetVal) {
+  if (str.Length() > 0) {
+    for (const nsACString& part : str.Split(',')) {
+      nsAutoCString locale(part);
+      if (LocaleService::CanonicalizeLanguageId(locale)) {
+        if (!aRetVal.Contains(locale)) {
+          aRetVal.AppendElement(locale);
+        }
+      }
+    }
+  }
+}
+
+static void ReadRequestedLocales(nsTArray<nsCString>& aRetVal) {
+  nsAutoCString str;
+  nsresult rv = Preferences::GetCString(REQUESTED_LOCALES_PREF, str);
+  const bool isRepack =
+#if defined(MOZ_WIDGET_GTK)
+      !widget::IsRunningUnderSnap();
+#else
+      true;
+#endif
+
+  if (NS_SUCCEEDED(rv)) {
+    if (str.Length() == 0) {
+      OSPreferences::GetInstance()->GetSystemLocales(aRetVal);
+    } else {
+      SplitLocaleListStringIntoArray(str, aRetVal);
+    }
+  }
+
+  if (aRetVal.IsEmpty()) {
+    if (isRepack) {
+      nsAutoCString defaultLocale;
+      LocaleService::GetInstance()->GetDefaultLocale(defaultLocale);
+      aRetVal.AppendElement(defaultLocale);
+    } else {
+      OSPreferences::GetInstance()->GetSystemLocales(aRetVal);
+    }
+  }
+}
+
+static void ReadWebExposedLocales(nsTArray<nsCString>& aRetVal) {
+  nsAutoCString str;
+  nsresult rv = Preferences::GetCString(WEB_EXPOSED_LOCALES_PREF, str);
+  if (NS_WARN_IF(NS_FAILED(rv)) || str.Length() == 0) {
+    return;
+  }
+
+  SplitLocaleListStringIntoArray(str, aRetVal);
+}
+
+LocaleService::LocaleService(bool aIsServer) : mIsServer(aIsServer) {}
+
+void LocaleService::NegotiateAppLocales(nsTArray<nsCString>& aRetVal) {
+  if (mIsServer) {
+    nsAutoCString defaultLocale;
+    AutoTArray<nsCString, 100> availableLocales;
+    AutoTArray<nsCString, 10> requestedLocales;
+    GetDefaultLocale(defaultLocale);
+    GetAvailableLocales(availableLocales);
+    GetRequestedLocales(requestedLocales);
+
+    NegotiateLanguages(requestedLocales, availableLocales, defaultLocale,
+                       kLangNegStrategyFiltering, aRetVal);
+  }
+
+  nsAutoCString lastFallbackLocale;
+  GetLastFallbackLocale(lastFallbackLocale);
+
+  if (!aRetVal.Contains(lastFallbackLocale)) {
+    aRetVal.AppendElement(lastFallbackLocale);
+  }
+}
+
+LocaleService* LocaleService::GetInstance() {
+  if (!sInstance) {
+    sInstance = new LocaleService(XRE_IsParentProcess());
+
+    if (sInstance->IsServer()) {
+      DebugOnly<nsresult> rv =
+          Preferences::AddWeakObservers(sInstance, kObservedPrefs);
+      MOZ_ASSERT(NS_SUCCEEDED(rv), "Adding observers failed.");
+
+      nsCOMPtr<nsIObserverService> obs =
+          mozilla::services::GetObserverService();
+      if (obs) {
+        obs->AddObserver(sInstance, INTL_SYSTEM_LOCALES_CHANGED, true);
+        obs->AddObserver(sInstance, NS_XPCOM_SHUTDOWN_OBSERVER_ID, true);
+      }
+    }
+    ClearOnShutdown(&sInstance, ShutdownPhase::CCPostLastCycleCollection);
+  }
+  return sInstance;
+}
+
+static void NotifyAppLocaleChanged() {
+  nsCOMPtr<nsIObserverService> obs = mozilla::services::GetObserverService();
+  if (obs) {
+    obs->NotifyObservers(nullptr, "intl:app-locales-changed", nullptr);
+  }
+  AppDateTimeFormat::ClearLocaleCache();
+}
+
+void LocaleService::RemoveObservers() {
+  if (mIsServer) {
+    Preferences::RemoveObservers(this, kObservedPrefs);
+
+    nsCOMPtr<nsIObserverService> obs = mozilla::services::GetObserverService();
+    if (obs) {
+      obs->RemoveObserver(this, INTL_SYSTEM_LOCALES_CHANGED);
+      obs->RemoveObserver(this, NS_XPCOM_SHUTDOWN_OBSERVER_ID);
+    }
+  }
+}
+
+void LocaleService::AssignAppLocales(const nsTArray<nsCString>& aAppLocales) {
+  MOZ_ASSERT(!mIsServer,
+             "This should only be called for LocaleService in client mode.");
+
+  mAppLocales = aAppLocales.Clone();
+  NotifyAppLocaleChanged();
+}
+
+void LocaleService::AssignRequestedLocales(
+    const nsTArray<nsCString>& aRequestedLocales) {
+  MOZ_ASSERT(!mIsServer,
+             "This should only be called for LocaleService in client mode.");
+
+  mRequestedLocales = aRequestedLocales.Clone();
+  nsCOMPtr<nsIObserverService> obs = mozilla::services::GetObserverService();
+  if (obs) {
+    obs->NotifyObservers(nullptr, "intl:requested-locales-changed", nullptr);
+  }
+}
+
+void LocaleService::RequestedLocalesChanged() {
+  MOZ_ASSERT(mIsServer, "This should only be called in the server mode.");
+
+  nsTArray<nsCString> newLocales;
+  ReadRequestedLocales(newLocales);
+
+  if (mRequestedLocales != newLocales) {
+    mRequestedLocales = std::move(newLocales);
+    nsCOMPtr<nsIObserverService> obs = mozilla::services::GetObserverService();
+    if (obs) {
+      obs->NotifyObservers(nullptr, "intl:requested-locales-changed", nullptr);
+    }
+    LocalesChanged();
+  }
+}
+
+void LocaleService::WebExposedLocalesChanged() {
+  MOZ_ASSERT(mIsServer, "This should only be called in the server mode.");
+
+  nsTArray<nsCString> newLocales;
+  ReadWebExposedLocales(newLocales);
+  if (mWebExposedLocales != newLocales) {
+    mWebExposedLocales = std::move(newLocales);
+  }
+}
+
+void LocaleService::LocalesChanged() {
+  MOZ_ASSERT(mIsServer, "This should only be called in the server mode.");
+
+  if (mAppLocales.IsEmpty()) {
+    return;
+  }
+
+  nsTArray<nsCString> newLocales;
+  NegotiateAppLocales(newLocales);
+
+  if (mAppLocales != newLocales) {
+    mAppLocales = std::move(newLocales);
+    NotifyAppLocaleChanged();
+  }
+}
+
+bool LocaleService::IsLocaleRTL(const nsACString& aLocale) {
+  return unic_langid_is_rtl(&aLocale);
+}
+
+bool LocaleService::IsAppLocaleRTL() {
+  nsAutoCString pseudoLocale;
+  if (NS_SUCCEEDED(Preferences::GetCString("intl.l10n.pseudo", pseudoLocale))) {
+    if (pseudoLocale.EqualsLiteral("bidi")) {
+      return true;
+    }
+    if (pseudoLocale.EqualsLiteral("accented")) {
+      return false;
+    }
+  }
+
+  nsAutoCString locale;
+  GetAppLocaleAsBCP47(locale);
+  return IsLocaleRTL(locale);
+}
+
+NS_IMETHODIMP
+LocaleService::Observe(nsISupports* aSubject, const char* aTopic,
+                       const char16_t* aData) {
+  MOZ_ASSERT(mIsServer, "This should only be called in the server mode.");
+
+  if (!strcmp(aTopic, INTL_SYSTEM_LOCALES_CHANGED)) {
+    RequestedLocalesChanged();
+    WebExposedLocalesChanged();
+  } else if (!strcmp(aTopic, NS_XPCOM_SHUTDOWN_OBSERVER_ID)) {
+    RemoveObservers();
+  } else {
+    NS_ConvertUTF16toUTF8 pref(aData);
+    if (pref.EqualsLiteral(REQUESTED_LOCALES_PREF)) {
+      RequestedLocalesChanged();
+    } else if (pref.EqualsLiteral(WEB_EXPOSED_LOCALES_PREF)) {
+      WebExposedLocalesChanged();
+    } else if (pref.EqualsLiteral(PSEUDO_LOCALE_PREF)) {
+      NotifyAppLocaleChanged();
+    }
+  }
+
+  return NS_OK;
+}
+
+bool LocaleService::LanguagesMatch(const nsACString& aRequested,
+                                   const nsACString& aAvailable) {
+  Locale requested;
+  auto requestedResult = LocaleParser::TryParse(aRequested, requested);
+  Locale available;
+  auto availableResult = LocaleParser::TryParse(aAvailable, available);
+
+  if (requestedResult.isErr() || availableResult.isErr()) {
+    return false;
+  }
+
+  if (requested.Canonicalize().isErr() || available.Canonicalize().isErr()) {
+    return false;
+  }
+
+  return requested.Language().Span() == available.Language().Span();
+}
+
+bool LocaleService::IsServer() { return mIsServer; }
+
+static bool GetGREFileContents(const char* aFilePath, nsCString* aOutString) {
+  RefPtr<nsZipArchive> zip = Omnijar::GetReader(Omnijar::GRE);
+  if (zip) {
+    nsZipItemPtr<char> item(zip, nsDependentCString(aFilePath));
+    if (!item) {
+      return false;
+    }
+    aOutString->Assign(item.Buffer(), item.Length());
+    return true;
+  }
+
+  nsCOMPtr<nsIFile> path;
+  if (NS_FAILED(nsDirectoryService::gService->Get(
+          NS_GRE_DIR, NS_GET_IID(nsIFile), getter_AddRefs(path)))) {
+    return false;
+  }
+
+  path->AppendRelativeNativePath(nsDependentCString(aFilePath));
+  bool result;
+  if (NS_FAILED(path->IsFile(&result)) || !result ||
+      NS_FAILED(path->IsReadable(&result)) || !result) {
+    return false;
+  }
+
+  FILE* fp;
+  if (NS_FAILED(path->OpenANSIFileDesc("r", &fp)) || !fp) {
+    return false;
+  }
+
+  fseek(fp, 0, SEEK_END);
+  long len = ftell(fp);
+  rewind(fp);
+  aOutString->SetLength(len);
+  size_t cc = fread(aOutString->BeginWriting(), 1, len, fp);
+
+  fclose(fp);
+
+  return cc == size_t(len);
+}
+
+void LocaleService::InitPackagedLocales() {
+  MOZ_ASSERT(mPackagedLocales.IsEmpty());
+
+  nsAutoCString localesString;
+  if (GetGREFileContents("res/multilocale.txt", &localesString)) {
+    localesString.Trim(" \t\n\r");
+    MOZ_ASSERT(!localesString.IsEmpty());
+    SplitLocaleListStringIntoArray(localesString, mPackagedLocales);
+  }
+
+  if (mPackagedLocales.IsEmpty()) {
+    nsAutoCString defaultLocale;
+    GetDefaultLocale(defaultLocale);
+    mPackagedLocales.AppendElement(defaultLocale);
+  }
+}
+
+
+NS_IMETHODIMP
+LocaleService::GetDefaultLocale(nsACString& aRetVal) {
+  if (mDefaultLocale.IsEmpty()) {
+    nsAutoCString locale;
+    GetGREFileContents("default.locale", &locale);
+    locale.Trim(" \t\n\r");
+#if defined(MOZ_UPDATER)
+    MOZ_ASSERT(!locale.IsEmpty());
+#endif
+    if (CanonicalizeLanguageId(locale)) {
+      mDefaultLocale.Assign(locale);
+    }
+
+    if (mDefaultLocale.IsEmpty()) {
+      GetLastFallbackLocale(mDefaultLocale);
+    }
+  }
+
+  aRetVal = mDefaultLocale;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+LocaleService::GetLastFallbackLocale(nsACString& aRetVal) {
+  aRetVal.AssignLiteral("en-US");
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+LocaleService::GetAppLocalesAsLangTags(nsTArray<nsCString>& aRetVal) {
+  if (mAppLocales.IsEmpty()) {
+    NegotiateAppLocales(mAppLocales);
+  }
+  for (uint32_t i = 0; i < mAppLocales.Length(); i++) {
+    nsAutoCString locale(mAppLocales[i]);
+    if (locale.LowerCaseEqualsASCII("ja-jp-macos")) {
+      aRetVal.AppendElement("ja-JP-mac");
+    } else {
+      aRetVal.AppendElement(locale);
+    }
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+LocaleService::GetAppLocalesAsBCP47(nsTArray<nsCString>& aRetVal) {
+  if (mAppLocales.IsEmpty()) {
+    NegotiateAppLocales(mAppLocales);
+  }
+  aRetVal = mAppLocales.Clone();
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+LocaleService::GetAppLocaleAsLangTag(nsACString& aRetVal) {
+  AutoTArray<nsCString, 32> locales;
+  GetAppLocalesAsLangTags(locales);
+
+  aRetVal = locales[0];
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+LocaleService::GetAppLocaleAsBCP47(nsACString& aRetVal) {
+  if (mAppLocales.IsEmpty()) {
+    NegotiateAppLocales(mAppLocales);
+  }
+  aRetVal = mAppLocales[0];
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+LocaleService::GetRegionalPrefsLocales(nsTArray<nsCString>& aRetVal) {
+  bool useOSLocales =
+      Preferences::GetBool("intl.regional_prefs.use_os_locales", false);
+
+  if (useOSLocales) {
+    if (NS_SUCCEEDED(
+            OSPreferences::GetInstance()->GetRegionalPrefsLocales(aRetVal))) {
+      return NS_OK;
+    }
+
+    GetAppLocalesAsBCP47(aRetVal);
+    return NS_OK;
+  }
+
+  nsAutoCString appLocale;
+  AutoTArray<nsCString, 10> regionalPrefsLocales;
+  LocaleService::GetInstance()->GetAppLocaleAsBCP47(appLocale);
+
+  if (NS_FAILED(OSPreferences::GetInstance()->GetRegionalPrefsLocales(
+          regionalPrefsLocales))) {
+    GetAppLocalesAsBCP47(aRetVal);
+    return NS_OK;
+  }
+
+  if (LocaleService::LanguagesMatch(appLocale, regionalPrefsLocales[0])) {
+    aRetVal = regionalPrefsLocales.Clone();
+    return NS_OK;
+  }
+
+  GetAppLocalesAsBCP47(aRetVal);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+LocaleService::GetWebExposedLocales(nsTArray<nsCString>& aRetVal) {
+  if (nsContentUtils::ShouldResistFingerprinting("No context",
+                                                 RFPTarget::JSLocale)) {
+    aRetVal = nsTArray<nsCString>({nsRFPService::GetSpoofedJSLocale()});
+    return NS_OK;
+  }
+
+  if (!mWebExposedLocales.IsEmpty()) {
+    aRetVal = mWebExposedLocales.Clone();
+    return NS_OK;
+  }
+
+  return GetRegionalPrefsLocales(aRetVal);
+}
+
+NS_IMETHODIMP
+LocaleService::NegotiateLanguages(const nsTArray<nsCString>& aRequested,
+                                  const nsTArray<nsCString>& aAvailable,
+                                  const nsACString& aDefaultLocale,
+                                  int32_t aStrategy,
+                                  nsTArray<nsCString>& aRetVal) {
+  if (aStrategy < 0 || aStrategy > 2) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+#if defined(DEBUG)
+  Locale parsedLocale;
+  auto result = LocaleParser::TryParse(aDefaultLocale, parsedLocale);
+
+  MOZ_ASSERT(
+      aDefaultLocale.IsEmpty() || result.isOk(),
+      "If specified, default locale must be a well-formed BCP47 language tag.");
+#endif
+
+  if (aStrategy == kLangNegStrategyLookup && aDefaultLocale.IsEmpty()) {
+    NS_WARNING(
+        "Default locale should be specified when using lookup strategy.");
+  }
+
+  NegotiationStrategy strategy;
+  switch (aStrategy) {
+    case kLangNegStrategyFiltering:
+      strategy = NegotiationStrategy::Filtering;
+      break;
+    case kLangNegStrategyMatching:
+      strategy = NegotiationStrategy::Matching;
+      break;
+    case kLangNegStrategyLookup:
+      strategy = NegotiationStrategy::Lookup;
+      break;
+  }
+
+  fluent_langneg_negotiate_languages(&aRequested, &aAvailable, &aDefaultLocale,
+                                     strategy, &aRetVal);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+LocaleService::GetRequestedLocales(nsTArray<nsCString>& aRetVal) {
+  if (mRequestedLocales.IsEmpty()) {
+    ReadRequestedLocales(mRequestedLocales);
+  }
+
+  aRetVal = mRequestedLocales.Clone();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+LocaleService::GetRequestedLocale(nsACString& aRetVal) {
+  if (mRequestedLocales.IsEmpty()) {
+    ReadRequestedLocales(mRequestedLocales);
+  }
+
+  if (mRequestedLocales.Length() > 0) {
+    aRetVal = mRequestedLocales[0];
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+LocaleService::SetRequestedLocales(const nsTArray<nsCString>& aRequested) {
+  MOZ_ASSERT(mIsServer, "This should only be called in the server mode.");
+  if (!mIsServer) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  nsAutoCString str;
+
+  for (auto& req : aRequested) {
+    nsAutoCString locale(req);
+    if (!CanonicalizeLanguageId(locale)) {
+      NS_ERROR("Invalid language tag provided to SetRequestedLocales!");
+      return NS_ERROR_INVALID_ARG;
+    }
+
+    if (!str.IsEmpty()) {
+      str.AppendLiteral(",");
+    }
+    str.Append(locale);
+  }
+  Preferences::SetCString(REQUESTED_LOCALES_PREF, str);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+LocaleService::GetAvailableLocales(nsTArray<nsCString>& aRetVal) {
+  MOZ_ASSERT(mIsServer, "This should only be called in the server mode.");
+  if (!mIsServer) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  if (mAvailableLocales.IsEmpty()) {
+    GetPackagedLocales(mAvailableLocales);
+  }
+
+  aRetVal = mAvailableLocales.Clone();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+LocaleService::GetIsAppLocaleRTL(bool* aRetVal) {
+  (*aRetVal) = IsAppLocaleRTL();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+LocaleService::SetAvailableLocales(const nsTArray<nsCString>& aAvailable) {
+  MOZ_ASSERT(mIsServer, "This should only be called in the server mode.");
+  if (!mIsServer) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  nsTArray<nsCString> newLocales;
+
+  for (auto& avail : aAvailable) {
+    nsAutoCString locale(avail);
+    if (!CanonicalizeLanguageId(locale)) {
+      NS_ERROR("Invalid language tag provided to SetAvailableLocales!");
+      return NS_ERROR_INVALID_ARG;
+    }
+    newLocales.AppendElement(locale);
+  }
+
+  if (newLocales != mAvailableLocales) {
+    mAvailableLocales = std::move(newLocales);
+    LocalesChanged();
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+LocaleService::GetPackagedLocales(nsTArray<nsCString>& aRetVal) {
+  if (mPackagedLocales.IsEmpty()) {
+    InitPackagedLocales();
+  }
+  aRetVal = mPackagedLocales.Clone();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+LocaleService::GetEllipsis(nsAString& aRetVal) {
+  if (mAppLocales.IsEmpty()) {
+    NegotiateAppLocales(mAppLocales);
+  }
+  ffi::locale_service_ellipsis(&mAppLocales[0], &aRetVal);
+  return NS_OK;
+}
+
+bool LocaleService::AlwaysAppendAccesskeys() {
+  if (mAppLocales.IsEmpty()) {
+    NegotiateAppLocales(mAppLocales);
+  }
+  return ffi::locale_service_always_append_accesskeys(&mAppLocales[0]);
+}
+
+bool LocaleService::InsertSeparatorBeforeAccesskeys() {
+  if (mAppLocales.IsEmpty()) {
+    NegotiateAppLocales(mAppLocales);
+  }
+  return ffi::locale_service_insert_separator_before_accesskeys(
+      &mAppLocales[0]);
+}
+
+NS_IMETHODIMP
+LocaleService::GetAlwaysAppendAccesskeys(bool* aRetVal) {
+  (*aRetVal) = AlwaysAppendAccesskeys();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+LocaleService::GetInsertSeparatorBeforeAccesskeys(bool* aRetVal) {
+  (*aRetVal) = InsertSeparatorBeforeAccesskeys();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+LocaleService::GetAcceptLanguages(nsACString& aRetVal) {
+  if (Preferences::HasUserValue(ACCEPT_LANGUAGES_PREF) ||
+      Preferences::IsLocked(ACCEPT_LANGUAGES_PREF)) {
+    nsresult rv = Preferences::GetCString(ACCEPT_LANGUAGES_PREF, aRetVal);
+    if (NS_SUCCEEDED(rv)) {
+      return NS_OK;
+    }
+  }
+
+  if (mAppLocales.IsEmpty()) {
+    NegotiateAppLocales(mAppLocales);
+  }
+  ffi::locale_service_default_accept_languages(&mAppLocales[0], &aRetVal);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+LocaleService::GetFontLanguageGroup(nsACString& aRetVal) {
+  if (Preferences::HasUserValue(FONT_LANGUAGE_GROUP_PREF) ||
+      Preferences::IsLocked(FONT_LANGUAGE_GROUP_PREF)) {
+    nsresult rv = Preferences::GetCString(FONT_LANGUAGE_GROUP_PREF, aRetVal);
+    if (NS_SUCCEEDED(rv)) {
+      return NS_OK;
+    }
+  }
+
+  if (mAppLocales.IsEmpty()) {
+    NegotiateAppLocales(mAppLocales);
+  }
+  ffi::locale_service_default_font_language_group(&mAppLocales[0], &aRetVal);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+LocaleService::GetUrlFixupSuffix(nsACString& aRetVal) {
+  if (Preferences::HasUserValue(URL_FIXUP_SUFFIX_PREF) ||
+      Preferences::IsLocked(URL_FIXUP_SUFFIX_PREF)) {
+    nsresult rv = Preferences::GetCString(URL_FIXUP_SUFFIX_PREF, aRetVal);
+    if (NS_SUCCEEDED(rv)) {
+      return NS_OK;
+    }
+  }
+
+  if (mAppLocales.IsEmpty()) {
+    NegotiateAppLocales(mAppLocales);
+  }
+  ffi::locale_service_default_url_fixup_suffix(&mAppLocales[0], &aRetVal);
+
+  return NS_OK;
+}

@@ -1,0 +1,100 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef NSFRAMETRAVERSAL_H
+#define NSFRAMETRAVERSAL_H
+
+#include <cstdint>
+
+#include "mozilla/Attributes.h"
+
+class nsIFrame;
+class nsPresContext;
+
+namespace mozilla::dom {
+class Element;
+}  
+
+class MOZ_STACK_CLASS nsFrameIterator final {
+ public:
+  using Element = mozilla::dom::Element;
+
+  void First();
+  void Next();
+  nsIFrame* CurrentItem();
+  bool IsDone();
+
+  void Last();
+  void Prev();
+
+  inline nsIFrame* Traverse(bool aForward) {
+    if (aForward) {
+      Next();
+    } else {
+      Prev();
+    }
+    return CurrentItem();
+  };
+
+  enum class Type : uint8_t {
+    Leaf,
+    PreOrder,
+    PostOrder,
+  };
+  nsFrameIterator(nsPresContext* aPresContext, nsIFrame* aStart, Type aType,
+                  bool aVisual, bool aLockInScrollView, bool aFollowOOFs,
+                  bool aSkipPopupChecks, const Element* aLimiter = nullptr);
+  ~nsFrameIterator() = default;
+
+ protected:
+  void SetCurrent(nsIFrame* aFrame) { mCurrent = aFrame; }
+  nsIFrame* GetCurrent() { return mCurrent; }
+  nsIFrame* GetStart() { return mStart; }
+  nsIFrame* GetLast() { return mLast; }
+  void SetLast(nsIFrame* aFrame) { mLast = aFrame; }
+  int8_t GetOffEdge() { return mOffEdge; }
+  void SetOffEdge(int8_t aOffEdge) { mOffEdge = aOffEdge; }
+
+
+  nsIFrame* GetParentFrameInLimiter(nsIFrame* aFrame) {
+    return GetParentFrame(aFrame, mLimiter);
+  }
+  nsIFrame* GetParentFrame(nsIFrame* aFrame, const Element* aAncestorLimiter);
+
+  nsIFrame* GetParentFrameNotPopup(nsIFrame* aFrame);
+
+  nsIFrame* GetFirstChild(nsIFrame* aFrame);
+  nsIFrame* GetLastChild(nsIFrame* aFrame);
+
+  nsIFrame* GetNextSibling(nsIFrame* aFrame);
+  nsIFrame* GetPrevSibling(nsIFrame* aFrame);
+
+
+  nsIFrame* GetFirstChildInner(nsIFrame* aFrame);
+  nsIFrame* GetLastChildInner(nsIFrame* aFrame);
+
+  nsIFrame* GetNextSiblingInner(nsIFrame* aFrame);
+  nsIFrame* GetPrevSiblingInner(nsIFrame* aFrame);
+
+  nsIFrame* GetPlaceholderFrame(nsIFrame* aFrame);
+  bool IsPopupFrame(nsIFrame* aFrame);
+
+  bool IsInvokerOpenPopoverFrame(nsIFrame* aFrame);
+
+  nsPresContext* const mPresContext;
+  const bool mLockScroll;
+  const bool mFollowOOFs;
+  const bool mSkipPopupChecks;
+  const bool mVisual;
+  const Type mType;
+
+ private:
+  nsIFrame* const mStart;
+  nsIFrame* mCurrent;
+  nsIFrame* mLast;  
+  const Element* const mLimiter;
+  int8_t mOffEdge;  
+};
+
+#endif  // NSFRAMETRAVERSAL_H

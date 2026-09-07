@@ -1,0 +1,684 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "WebRenderLayerManager.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/StaticPrefs_apz.h"
+#include "mozilla/StaticPrefs_layers.h"
+#include "mozilla/dom/BrowserChild.h"
+#include "mozilla/gfx/DrawEventRecorder.h"
+#include "mozilla/layers/CompositorBridgeChild.h"
+#include "mozilla/layers/StackingContextHelper.h"
+#include "mozilla/layers/TextureClient.h"
+#include "mozilla/layers/TransactionIdAllocator.h"
+#include "mozilla/layers/WebRenderBridgeChild.h"
+#include "nsDisplayList.h"
+#include "nsLayoutUtils.h"
+#include "WebRenderCanvasRenderer.h"
+#include "LayerUserData.h"
+
+
+namespace mozilla {
+
+namespace gfx {
+wr::PipelineId GetTemporaryWebRenderPipelineId(wr::PipelineId aMainPipeline);
+}
+
+using namespace gfx;
+
+namespace layers {
+
+bool WebRenderLayerManager::sHasInitialized = false;
+
+WebRenderLayerManager::WebRenderLayerManager(
+    nsIWidget* aWidget, already_AddRefed<WebRenderBridgeChild> aWrChild)
+    : mWidget(aWidget),
+      mWrChild(aWrChild),
+      mLatestTransactionId{0},
+      mNeedsComposite(false),
+      mIsFirstPaint(false),
+      mDestroyed(false),
+      mTarget(nullptr),
+      mPaintSequenceNumber(0),
+      mWebRenderCommandBuilder(this) {
+  MOZ_COUNT_CTOR(WebRenderLayerManager);
+  MOZ_RELEASE_ASSERT(mWidget);
+  MOZ_RELEASE_ASSERT(mWrChild);
+  mStateManager.mLayerManager = this;
+}
+
+KnowsCompositor* WebRenderLayerManager::AsKnowsCompositor() { return mWrChild; }
+
+RefPtr<WebRenderLayerManager> WebRenderLayerManager::Create(
+    nsIWidget* aWidget, PCompositorBridgeChild* aCBChild,
+    wr::PipelineId aPipelineId, nsCString& aError) {
+  MOZ_RELEASE_ASSERT(aWidget);
+  MOZ_RELEASE_ASSERT(aCBChild);
+
+  WindowKind windowKind;
+  if (aWidget->GetWindowType() != widget::WindowType::Popup) {
+    windowKind = WindowKind::MAIN;
+  } else {
+    windowKind = WindowKind::SECONDARY;
+  }
+
+  LayoutDeviceIntSize size = aWidget->GetClientSize();
+  if (!wr::WindowSizeSanityCheck(size.width, size.height)) {
+    gfxCriticalNoteOnce << "Widget size is not valid " << size
+                        << " isParent: " << XRE_IsParentProcess();
+  }
+
+  auto bridge = MakeRefPtr<WebRenderBridgeChild>(aPipelineId);
+  if (!aCBChild->SendPWebRenderBridgeConstructor(bridge, aPipelineId, size,
+                                                 windowKind)) {
+    gfxCriticalNote << "Failed to send WebRenderBridgeChild.";
+    aError.Assign(sHasInitialized
+                      ? "FEATURE_FAILURE_WEBRENDER_INITIALIZE_IPDL_POST"_ns
+                      : "FEATURE_FAILURE_WEBRENDER_INITIALIZE_IPDL_FIRST"_ns);
+    return nullptr;
+  }
+
+  return new WebRenderLayerManager(aWidget, bridge.forget());
+}
+
+bool WebRenderLayerManager::Initialize(
+    TextureFactoryIdentifier* aTextureFactoryIdentifier, nsCString& aError) {
+  MOZ_ASSERT(aTextureFactoryIdentifier);
+
+  mHasFlushedThisChild = false;
+
+  TextureFactoryIdentifier textureFactoryIdentifier;
+  wr::MaybeIdNamespace idNamespace;
+  if (!WrBridge()->SendEnsureConnected(&textureFactoryIdentifier, &idNamespace,
+                                       &aError)) {
+    gfxCriticalNote << "Failed as lost WebRenderBridgeChild.";
+    aError.Assign(sHasInitialized
+                      ? "FEATURE_FAILURE_WEBRENDER_INITIALIZE_SYNC_POST"_ns
+                      : "FEATURE_FAILURE_WEBRENDER_INITIALIZE_SYNC_FIRST"_ns);
+    return false;
+  }
+
+  if (textureFactoryIdentifier.mParentBackend == LayersBackend::LAYERS_NONE ||
+      idNamespace.isNothing()) {
+    gfxCriticalNote << "Failed to connect WebRenderBridgeChild. isParent="
+                    << XRE_IsParentProcess();
+    aError.Append(sHasInitialized ? "_POST"_ns : "_FIRST"_ns);
+    return false;
+  }
+
+  WrBridge()->SetWebRenderLayerManager(this);
+  WrBridge()->IdentifyTextureHost(textureFactoryIdentifier);
+  WrBridge()->SetNamespace(idNamespace.ref());
+  *aTextureFactoryIdentifier = textureFactoryIdentifier;
+
+  mDLBuilder = MakeUnique<wr::DisplayListBuilder>(
+      WrBridge()->GetPipeline(), WrBridge()->GetWebRenderBackend());
+
+  sHasInitialized = true;
+  return true;
+}
+
+void WebRenderLayerManager::Destroy() { DoDestroy( false); }
+
+void WebRenderLayerManager::DoDestroy(bool aIsSync) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (IsDestroyed()) {
+    return;
+  }
+
+  mDLBuilder = nullptr;
+  mUserData.Destroy();
+  mPartialPrerenderedAnimations.Clear();
+
+  mStateManager.Destroy();
+
+  mWrChild->Destroy(aIsSync);
+
+  mWebRenderCommandBuilder.Destroy();
+
+  if (mTransactionIdAllocator) {
+    RefPtr<TransactionIdAllocator> allocator = mTransactionIdAllocator;
+    TransactionId id = mLatestTransactionId;
+
+    RefPtr<Runnable> task = NS_NewRunnableFunction(
+        "TransactionIdAllocator::NotifyTransactionCompleted",
+        [allocator, id]() -> void {
+          allocator->ClearPendingTransactions();
+          allocator->NotifyTransactionCompleted(id);
+        });
+    NS_DispatchToMainThread(task.forget());
+  }
+
+  mWidget = nullptr;
+  mDestroyed = true;
+}
+
+WebRenderLayerManager::~WebRenderLayerManager() {
+  Destroy();
+  MOZ_COUNT_DTOR(WebRenderLayerManager);
+}
+
+CompositorBridgeChild* WebRenderLayerManager::GetCompositorBridgeChild() {
+  return WrBridge()->GetCompositorBridgeChild();
+}
+
+void WebRenderLayerManager::GetBackendName(nsAString& name) {
+  if (WrBridge()->GetUseLayerCompositor()) {
+    name.AssignLiteral("WebRender Layer Compositor");
+  } else {
+    name.AssignLiteral("WebRender");
+  }
+}
+
+uint32_t WebRenderLayerManager::StartFrameTimeRecording(int32_t aBufferSize) {
+  CompositorBridgeChild* renderer = GetCompositorBridgeChild();
+  if (renderer) {
+    uint32_t startIndex;
+    renderer->SendStartFrameTimeRecording(aBufferSize, &startIndex);
+    return startIndex;
+  }
+  return -1;
+}
+
+void WebRenderLayerManager::StopFrameTimeRecording(
+    uint32_t aStartIndex, nsTArray<float>& aFrameIntervals) {
+  CompositorBridgeChild* renderer = GetCompositorBridgeChild();
+  if (renderer) {
+    renderer->SendStopFrameTimeRecording(aStartIndex, &aFrameIntervals);
+  }
+}
+
+void WebRenderLayerManager::TakeCompositionPayloads(
+    nsTArray<CompositionPayload>& aPayloads) {
+  aPayloads.Clear();
+
+  std::swap(mPayload, aPayloads);
+}
+
+bool WebRenderLayerManager::BeginTransactionWithTarget(gfxContext* aTarget,
+                                                       const nsCString& aURL) {
+  mTarget = aTarget;
+  bool retval = BeginTransaction(aURL);
+  if (!retval) {
+    mTarget = nullptr;
+  }
+  return retval;
+}
+
+bool WebRenderLayerManager::BeginTransaction(const nsCString& aURL) {
+  if (!WrBridge()->IPCOpen()) {
+    gfxCriticalNote << "IPC Channel is already torn down unexpectedly\n";
+    return false;
+  }
+
+  mTransactionStart = TimeStamp::Now();
+  mURL = aURL;
+
+  ++mPaintSequenceNumber;
+  return true;
+}
+
+bool WebRenderLayerManager::EndEmptyTransaction(EndTransactionFlags aFlags) {
+  auto clearTarget = MakeScopeExit([&] { mTarget = nullptr; });
+
+  if (!WrBridge()->GetSentDisplayList()) {
+    return false;
+  }
+
+  mLatestTransactionId =
+      mTransactionIdAllocator->GetTransactionId( true);
+
+  if (aFlags & EndTransactionFlags::END_NO_COMPOSITE &&
+      !mWebRenderCommandBuilder.NeedsEmptyTransaction()) {
+    if (mPendingScrollUpdates.IsEmpty()) {
+      MOZ_ASSERT(!mTarget);
+      WrBridge()->SendSetFocusTarget(mFocusTarget);
+      mTransactionIdAllocator->RevokeTransactionId(mLatestTransactionId);
+      mLatestTransactionId = mLatestTransactionId.Prev();
+      return true;
+    }
+  }
+
+  LayoutDeviceIntSize size = mWidget->GetClientSize();
+  WrBridge()->BeginTransaction();
+
+  mWebRenderCommandBuilder.EmptyTransaction();
+
+  TimeStamp refreshStart = mTransactionIdAllocator->GetTransactionStart();
+  if (!refreshStart) {
+    refreshStart = mTransactionStart;
+  }
+
+  if (!gfxPlatform::GetPlatform()->DidRenderingDeviceReset()) {
+    if (WrBridge()->GetSyncObject() &&
+        WrBridge()->GetSyncObject()->IsSyncObjectValid()) {
+      WrBridge()->GetSyncObject()->Synchronize();
+    }
+  }
+
+  GetCompositorBridgeChild()->EndCanvasTransaction();
+
+  Maybe<TransactionData> transactionData;
+  if (mStateManager.mAsyncResourceUpdates || !mPendingScrollUpdates.IsEmpty() ||
+      WrBridge()->HasWebRenderParentCommands()) {
+    transactionData.emplace();
+    transactionData->mIdNamespace = WrBridge()->GetNamespace();
+    transactionData->mPaintSequenceNumber = mPaintSequenceNumber;
+    if (mStateManager.mAsyncResourceUpdates) {
+      mStateManager.mAsyncResourceUpdates->Flush(
+          transactionData->mResourceUpdates, transactionData->mSmallShmems,
+          transactionData->mLargeShmems);
+    }
+    transactionData->mScrollUpdates = std::move(mPendingScrollUpdates);
+    for (const auto& scrollId : transactionData->mScrollUpdates.Keys()) {
+      nsLayoutUtils::NotifyPaintSkipTransaction(scrollId);
+    }
+  }
+
+  Maybe<wr::IpcResourceUpdateQueue> nothing;
+  WrBridge()->EndEmptyTransaction(mFocusTarget, std::move(transactionData),
+                                  mLatestTransactionId,
+                                  mTransactionIdAllocator->GetVsyncId(),
+                                  mTransactionIdAllocator->GetVsyncStart(),
+                                  refreshStart, mTransactionStart, mURL);
+  mTransactionStart = TimeStamp();
+
+  MakeSnapshotIfRequired(size);
+  return true;
+}
+
+void WebRenderLayerManager::EndTransactionWithoutLayer(
+    nsDisplayList* aDisplayList, nsDisplayListBuilder* aDisplayListBuilder,
+    WrFiltersHolder&& aFilters, WebRenderBackgroundData* aBackground,
+    const double aGeckoDLBuildTime, bool aRenderOffscreen) {
+
+  auto clearTarget = MakeScopeExit([&] { mTarget = nullptr; });
+
+  WrBridge()->BeginTransaction();
+
+  LayoutDeviceIntSize size = mWidget->GetClientSize();
+
+  UniquePtr<wr::DisplayListBuilder> offscreenBuilder;
+  wr::DisplayListBuilder* diplayListBuilder = mDLBuilder.get();
+  if (aRenderOffscreen) {
+    wr::PipelineId mainId = WrBridge()->GetPipeline();
+    wr::PipelineId tmpPipeline = gfx::GetTemporaryWebRenderPipelineId(mainId);
+    offscreenBuilder = MakeUnique<wr::DisplayListBuilder>(
+        tmpPipeline, WrBridge()->GetWebRenderBackend());
+    diplayListBuilder = offscreenBuilder.get();
+  }
+
+  diplayListBuilder->Begin();
+
+  wr::IpcResourceUpdateQueue resourceUpdates(WrBridge());
+  wr::usize builderDumpIndex = 0;
+  bool containsSVGGroup = false;
+  bool dumpEnabled =
+      mWebRenderCommandBuilder.ShouldDumpDisplayList(aDisplayListBuilder);
+  if (dumpEnabled) {
+    printf_stderr("-- WebRender display list build --\n");
+  }
+
+  if (XRE_IsContentProcess() &&
+      StaticPrefs::gfx_webrender_debug_dl_dump_content_serialized()) {
+    diplayListBuilder->DumpSerializedDisplayList();
+  }
+
+  if (aDisplayList) {
+    MOZ_ASSERT(aDisplayListBuilder && !aBackground);
+
+    mWebRenderCommandBuilder.BuildWebRenderCommands(
+        *diplayListBuilder, resourceUpdates, aDisplayList, aDisplayListBuilder,
+        mScrollData, std::move(aFilters));
+
+    aDisplayListBuilder->NotifyAndClearScrollContainerFrames();
+
+    builderDumpIndex = mWebRenderCommandBuilder.GetBuilderDumpIndex();
+    containsSVGGroup = mWebRenderCommandBuilder.GetContainsSVGGroup();
+  } else {
+    MOZ_ASSERT(!aDisplayListBuilder && aBackground);
+    aBackground->AddWebRenderCommands(*diplayListBuilder);
+    if (dumpEnabled) {
+      printf_stderr("(no display list; background only)\n");
+      builderDumpIndex = diplayListBuilder->Dump(
+           1, Some(builderDumpIndex), Nothing());
+    }
+  }
+
+  if (AsyncPanZoomEnabled()) {
+    if (mIsFirstPaint) {
+      mScrollData.SetIsFirstPaint(true);
+      mIsFirstPaint = false;
+    }
+    mScrollData.SetPaintSequenceNumber(mPaintSequenceNumber);
+    if (dumpEnabled) {
+      std::stringstream str;
+      str << mScrollData;
+      print_stderr(str);
+    }
+  }
+
+  ClearAndNotifyOfFullTransactionPendingScrollInfoUpdate();
+
+  mLatestTransactionId = mTransactionIdAllocator->GetTransactionId(
+       !aRenderOffscreen);
+
+  TimeStamp refreshStart = mTransactionIdAllocator->GetTransactionStart();
+  if (!refreshStart) {
+    refreshStart = mTransactionStart;
+  }
+
+  if (mStateManager.mAsyncResourceUpdates) {
+    if (resourceUpdates.IsEmpty()) {
+      resourceUpdates.ReplaceResources(
+          std::move(mStateManager.mAsyncResourceUpdates.ref()));
+    } else {
+      WrBridge()->UpdateResources(mStateManager.mAsyncResourceUpdates.ref());
+    }
+    mStateManager.mAsyncResourceUpdates.reset();
+  }
+
+  if (aRenderOffscreen) {
+    mStateManager.DiscardUnusedImagesInTransaction(resourceUpdates);
+  } else {
+    mStateManager.DiscardImagesInTransaction(resourceUpdates);
+    WrBridge()->RemoveExpiredFontKeys(resourceUpdates);
+  }
+
+  if (!gfxPlatform::GetPlatform()->DidRenderingDeviceReset()) {
+    if (WrBridge()->GetSyncObject() &&
+        WrBridge()->GetSyncObject()->IsSyncObjectValid()) {
+      WrBridge()->GetSyncObject()->Synchronize();
+    }
+  }
+
+  GetCompositorBridgeChild()->EndCanvasTransaction();
+
+  {
+    DisplayListData dlData;
+    diplayListBuilder->End(dlData);
+    resourceUpdates.Flush(dlData.mResourceUpdates, dlData.mSmallShmems,
+                          dlData.mLargeShmems);
+    dlData.mRect =
+        LayoutDeviceRect(LayoutDevicePoint(), LayoutDeviceSize(size));
+    dlData.mScrollData.emplace(std::move(mScrollData));
+    dlData.mDLDesc.gecko_display_list_type =
+        aDisplayListBuilder && aDisplayListBuilder->PartialBuildFailed()
+            ? wr::GeckoDisplayListType::Full(aGeckoDLBuildTime)
+            : wr::GeckoDisplayListType::Partial(aGeckoDLBuildTime);
+
+    WrBridge()->EndTransaction(
+        std::move(dlData), mLatestTransactionId, containsSVGGroup,
+        mTransactionIdAllocator->GetVsyncId(), aRenderOffscreen,
+        mTransactionIdAllocator->GetVsyncStart(), refreshStart,
+        mTransactionStart, mURL);
+
+    WrBridge()->SendSetFocusTarget(mFocusTarget);
+    mFocusTarget = FocusTarget();
+  }
+
+  mStateManager.DiscardCompositorAnimations();
+
+  mTransactionStart = TimeStamp();
+
+  MakeSnapshotIfRequired(size);
+  mNeedsComposite = false;
+}
+
+void WebRenderLayerManager::SetFocusTarget(const FocusTarget& aFocusTarget) {
+  mFocusTarget = aFocusTarget;
+}
+
+bool WebRenderLayerManager::AsyncPanZoomEnabled() const {
+  return mWidget->AsyncPanZoomEnabled();
+}
+
+IntRect ToOutsideIntRect(const gfxRect& aRect) {
+  return IntRect::RoundOut(aRect.X(), aRect.Y(), aRect.Width(), aRect.Height());
+}
+
+void WebRenderLayerManager::MakeSnapshotIfRequired(LayoutDeviceIntSize aSize) {
+  auto clearTarget = MakeScopeExit([&] { mTarget = nullptr; });
+
+  if (!mTarget || !mTarget->GetDrawTarget() || aSize.IsEmpty()) {
+    return;
+  }
+
+
+  SurfaceFormat format =
+      SurfaceFormat::B8G8R8A8;
+  RefPtr<TextureClient> texture = TextureClient::CreateForRawBufferAccess(
+      WrBridge(), format, aSize.ToUnknownSize(), BackendType::SKIA,
+      TextureFlags::SNAPSHOT);
+  if (!texture) {
+    return;
+  }
+
+  texture->InitIPDLActor(WrBridge(), dom::ContentParentId());
+  if (!texture->GetIPDLActor()) {
+    return;
+  }
+
+  IntRect bounds = ToOutsideIntRect(mTarget->GetClipExtents());
+  bool needsYFlip = false;
+  if (!WrBridge()->SendGetSnapshot(WrapNotNull(texture->GetIPDLActor()),
+                                   &needsYFlip)) {
+    return;
+  }
+
+  TextureClientAutoLock autoLock(texture, OpenMode::OPEN_READ_ONLY);
+  if (!autoLock.Succeeded()) {
+    return;
+  }
+  RefPtr<DrawTarget> drawTarget = texture->BorrowDrawTarget();
+  if (!drawTarget || !drawTarget->IsValid()) {
+    return;
+  }
+  RefPtr<SourceSurface> snapshot = drawTarget->Snapshot();
+
+  Rect dst(bounds.X(), bounds.Y(), bounds.Width(), bounds.Height());
+  Rect src(0, 0, bounds.Width(), bounds.Height());
+
+  Matrix m;
+  if (needsYFlip) {
+    m = Matrix::Scaling(1.0, -1.0).PostTranslate(0.0, aSize.height);
+  }
+  SurfacePattern pattern(snapshot, ExtendMode::CLAMP, m);
+  DrawTarget* dt = mTarget->GetDrawTarget();
+  MOZ_RELEASE_ASSERT(dt);
+  dt->FillRect(dst, pattern);
+
+  mTarget = nullptr;
+}
+
+void WebRenderLayerManager::DiscardImages() {
+  wr::IpcResourceUpdateQueue resources(WrBridge());
+  mStateManager.DiscardImagesInTransaction(resources);
+  WrBridge()->UpdateResources(resources);
+}
+
+void WebRenderLayerManager::DiscardLocalImages() {
+  mStateManager.DiscardLocalImages();
+}
+
+void WebRenderLayerManager::DidComposite(
+    TransactionId aTransactionId, const mozilla::TimeStamp& aCompositeStart,
+    const mozilla::TimeStamp& aCompositeEnd) {
+  if (IsDestroyed()) {
+    return;
+  }
+
+  MOZ_ASSERT(mWidget);
+
+  RefPtr<WebRenderLayerManager> selfRef = this;
+
+  if (aTransactionId.IsValid()) {
+    nsIWidgetListener* listener = mWidget->GetWidgetListener();
+    if (listener) {
+      listener->DidCompositeWindow(aTransactionId, aCompositeStart,
+                                   aCompositeEnd);
+    }
+    listener = mWidget->GetAttachedWidgetListener();
+    if (listener) {
+      listener->DidCompositeWindow(aTransactionId, aCompositeStart,
+                                   aCompositeEnd);
+    }
+    if (mTransactionIdAllocator) {
+      mTransactionIdAllocator->NotifyTransactionCompleted(aTransactionId);
+    }
+  }
+}
+
+void WebRenderLayerManager::ClearCachedResources() {
+  if (!WrBridge()->IPCOpen()) {
+    gfxCriticalNote << "IPC Channel is already torn down unexpectedly\n";
+    return;
+  }
+  WrBridge()->BeginClearCachedResources();
+  mStateManager.FlushAsyncResourceUpdates();
+  mWebRenderCommandBuilder.ClearCachedResources();
+  DiscardImages();
+  mStateManager.ClearCachedResources();
+  if (CompositorBridgeChild* compositorBridge = GetCompositorBridgeChild()) {
+    compositorBridge->ClearCachedResources();
+  }
+  WrBridge()->EndClearCachedResources();
+}
+
+void WebRenderLayerManager::WrUpdated() {
+  ClearAsyncAnimations();
+  mStateManager.mAsyncResourceUpdates.reset();
+  mWebRenderCommandBuilder.ClearCachedResources();
+  DiscardLocalImages();
+  if (mWidget) {
+    if (dom::BrowserChild* browserChild = mWidget->GetOwningBrowserChild()) {
+      browserChild->SchedulePaint();
+    }
+  }
+}
+
+void WebRenderLayerManager::UpdateTextureFactoryIdentifier(
+    const TextureFactoryIdentifier& aNewIdentifier) {
+  WrBridge()->IdentifyTextureHost(aNewIdentifier);
+}
+
+TextureFactoryIdentifier WebRenderLayerManager::GetTextureFactoryIdentifier() {
+  return WrBridge()->GetTextureFactoryIdentifier();
+}
+
+void WebRenderLayerManager::SetTransactionIdAllocator(
+    TransactionIdAllocator* aAllocator) {
+  if (mTransactionIdAllocator && (aAllocator != mTransactionIdAllocator)) {
+    mTransactionIdAllocator->ClearPendingTransactions();
+
+    if (aAllocator) {
+      aAllocator->ResetInitialTransactionId(
+          mTransactionIdAllocator->LastTransactionId());
+    }
+  }
+
+  mTransactionIdAllocator = aAllocator;
+}
+
+TransactionId WebRenderLayerManager::GetLastTransactionId() {
+  return mLatestTransactionId;
+}
+
+void WebRenderLayerManager::FlushRendering(wr::RenderReasons aReasons) {
+  CompositorBridgeChild* cBridge = GetCompositorBridgeChild();
+  if (!cBridge) {
+    return;
+  }
+  MOZ_ASSERT(mWidget);
+
+  LayoutDeviceIntSize widgetSize = mWidget->GetClientSize();
+  bool resizing = widgetSize != mFlushWidgetSize;
+  mFlushWidgetSize = widgetSize;
+
+  if (resizing) {
+    aReasons = aReasons | wr::RenderReasons::RESIZE;
+  }
+
+  if (!mHasFlushedThisChild ||
+      (resizing && (mWidget->SynchronouslyRepaintOnResize() ||
+                    StaticPrefs::layers_force_synchronous_resize()))) {
+    cBridge->SendFlushRendering(aReasons);
+  } else {
+    cBridge->SendFlushRenderingAsync(aReasons);
+  }
+
+  mHasFlushedThisChild = true;
+}
+
+void WebRenderLayerManager::WaitOnTransactionProcessed() {
+  CompositorBridgeChild* bridge = GetCompositorBridgeChild();
+  if (bridge) {
+    bridge->SendWaitOnTransactionProcessed();
+  }
+}
+
+void WebRenderLayerManager::SendInvalidRegion(const nsIntRegion& aRegion) {
+
+  WrBridge()->SendInvalidateRenderedFrame();
+}
+
+void WebRenderLayerManager::ScheduleComposite(wr::RenderReasons aReasons) {
+  WrBridge()->SendScheduleComposite(aReasons);
+}
+
+already_AddRefed<PersistentBufferProvider>
+WebRenderLayerManager::CreatePersistentBufferProvider(
+    const gfx::IntSize& aSize, gfx::SurfaceFormat aFormat,
+    bool aWillReadFrequently) {
+  if (!aWillReadFrequently && !gfxPlatform::UseRemoteCanvas()) {
+    gfxPlatform::GetPlatform()->EnsureDevicesInitialized();
+  }
+
+  RefPtr<PersistentBufferProvider> provider =
+      PersistentBufferProviderShared::Create(
+          aSize, aFormat, AsKnowsCompositor(), aWillReadFrequently);
+  if (provider) {
+    return provider.forget();
+  }
+
+  return WindowRenderer::CreatePersistentBufferProvider(aSize, aFormat);
+}
+
+void WebRenderLayerManager::ClearAsyncAnimations() {
+  mStateManager.ClearAsyncAnimations();
+}
+
+void WebRenderLayerManager::WrReleasedImages(
+    const nsTArray<wr::ExternalImageKeyPair>& aPairs) {
+  mStateManager.WrReleasedImages(aPairs);
+}
+
+void WebRenderLayerManager::LayerUserDataDestroy(void* data) {
+  delete static_cast<LayerUserData*>(data);
+}
+
+UniquePtr<LayerUserData> WebRenderLayerManager::RemoveUserData(void* aKey) {
+  UniquePtr<LayerUserData> d(static_cast<LayerUserData*>(
+      mUserData.Remove(static_cast<gfx::UserDataKey*>(aKey))));
+  return d;
+}
+
+void WebRenderLayerManager::
+    ClearAndNotifyOfFullTransactionPendingScrollInfoUpdate() {
+  for (ScrollableLayerGuid::ViewID update : mPendingScrollUpdates.Keys()) {
+    nsLayoutUtils::NotifyApzTransaction(update);
+  }
+  mPendingScrollUpdates.Clear();
+}
+
+bool WebRenderLayerManager::AddPendingScrollUpdateForNextTransaction(
+    ScrollableLayerGuid::ViewID aScrollId,
+    const ScrollPositionUpdate& aUpdateInfo) {
+  mPendingScrollUpdates.LookupOrInsert(aScrollId).AppendElement(aUpdateInfo);
+  return true;
+}
+
+}  
+}  

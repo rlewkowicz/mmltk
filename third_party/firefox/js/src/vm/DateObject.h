@@ -1,0 +1,103 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef vm_DateObject_h_
+#define vm_DateObject_h_
+
+#include "js/Date.h"
+#include "js/Value.h"
+#include "vm/NativeObject.h"
+
+namespace js {
+
+class DateTimeInfo;
+
+class DateObject : public NativeObject {
+ public:
+  static const uint32_t UTC_TIME_SLOT = 0;
+
+ private:
+  static const uint32_t TIME_ZONE_CACHE_KEY_SLOT = 1;
+
+  static const uint32_t COMPONENTS_START_SLOT = 2;
+
+ public:
+  static const uint32_t LOCAL_TIME_SLOT = COMPONENTS_START_SLOT + 0;
+  static const uint32_t LOCAL_YEAR_SLOT = COMPONENTS_START_SLOT + 1;
+  static const uint32_t LOCAL_MONTH_SLOT = COMPONENTS_START_SLOT + 2;
+  static const uint32_t LOCAL_DATE_SLOT = COMPONENTS_START_SLOT + 3;
+  static const uint32_t LOCAL_DAY_SLOT = COMPONENTS_START_SLOT + 4;
+
+ private:
+  static const uint32_t LOCAL_SECONDS_INTO_YEAR_SLOT =
+      COMPONENTS_START_SLOT + 5;
+
+  static const uint32_t RESERVED_SLOTS = LOCAL_SECONDS_INTO_YEAR_SLOT + 1;
+
+ public:
+  static const JSClass class_;
+  static const JSClass protoClass_;
+
+  js::DateTimeInfo* dateTimeInfo() const;
+
+  const js::Value& UTCTime() const { return getFixedSlot(UTC_TIME_SLOT); }
+
+  const js::Value& localTime() const {
+    return getReservedSlot(LOCAL_TIME_SLOT);
+  }
+
+  void setUTCTime(JS::ClippedTime t);
+  void setUTCTime(JS::ClippedTime t, MutableHandleValue vp);
+
+  void fillLocalTimeSlots();
+
+  const js::Value& localYear() const {
+    return getReservedSlot(LOCAL_YEAR_SLOT);
+  }
+
+  const js::Value& localMonth() const {
+    return getReservedSlot(LOCAL_MONTH_SLOT);
+  }
+
+  const js::Value& localDate() const {
+    return getReservedSlot(LOCAL_DATE_SLOT);
+  }
+
+  const js::Value& localDay() const { return getReservedSlot(LOCAL_DAY_SLOT); }
+
+  const js::Value& localSecondsIntoYear() const {
+    return getReservedSlot(LOCAL_SECONDS_INTO_YEAR_SLOT);
+  }
+
+  static DateObject* createTemplateObject(JSContext* cx);
+
+  static constexpr size_t offsetOfUTCTimeSlot() {
+    return getFixedSlotOffset(UTC_TIME_SLOT);
+  }
+  static constexpr size_t offsetOfTimeZoneCacheKeySlot() {
+    return getFixedSlotOffset(TIME_ZONE_CACHE_KEY_SLOT);
+  }
+  static constexpr size_t offsetOfLocalTimeSlot() {
+    return getFixedSlotOffset(LOCAL_TIME_SLOT);
+  }
+  static constexpr size_t offsetOfLocalYearSlot() {
+    return getFixedSlotOffset(LOCAL_YEAR_SLOT);
+  }
+  static constexpr size_t offsetOfLocalMonthSlot() {
+    return getFixedSlotOffset(LOCAL_MONTH_SLOT);
+  }
+  static constexpr size_t offsetOfLocalDateSlot() {
+    return getFixedSlotOffset(LOCAL_DATE_SLOT);
+  }
+  static constexpr size_t offsetOfLocalDaySlot() {
+    return getFixedSlotOffset(LOCAL_DAY_SLOT);
+  }
+  static constexpr size_t offsetOfLocalSecondsIntoYearSlot() {
+    return getFixedSlotOffset(LOCAL_SECONDS_INTO_YEAR_SLOT);
+  }
+};
+
+}  
+
+#endif  // vm_DateObject_h_

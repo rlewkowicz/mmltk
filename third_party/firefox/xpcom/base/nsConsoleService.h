@@ -1,0 +1,96 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef _nsconsoleservice_h_
+#define _nsconsoleservice_h_
+
+#include <cstdint>
+
+#include "mozilla/Assertions.h"
+#include "mozilla/LinkedList.h"
+#include "mozilla/Mutex.h"
+
+#include "MainThreadUtils.h"
+#include "nsCOMPtr.h"
+#include "nsInterfaceHashtable.h"
+#include "nsHashKeys.h"
+
+#include "nsIConsoleListener.h"
+#include "nsIConsoleMessage.h"
+#include "nsIConsoleService.h"
+#include "nsIObserver.h"
+#include "nsISupports.h"
+
+template <class T>
+class nsCOMArray;
+
+class nsConsoleService final : public nsIConsoleService, public nsIObserver {
+ public:
+  nsConsoleService();
+  nsresult Init();
+
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSICONSOLESERVICE
+  NS_DECL_NSIOBSERVER
+
+  void SetIsDelivering() {
+    MOZ_ASSERT(NS_IsMainThread());
+    MOZ_ASSERT(!mDeliveringMessage);
+    mDeliveringMessage = true;
+  }
+
+  void SetDoneDelivering() {
+    MOZ_ASSERT(NS_IsMainThread());
+    MOZ_ASSERT(mDeliveringMessage);
+    mDeliveringMessage = false;
+  }
+
+  typedef nsInterfaceHashtable<nsISupportsHashKey, nsIConsoleListener>
+      ListenerHash;
+  void CollectCurrentListeners(nsCOMArray<nsIConsoleListener>& aListeners);
+
+ private:
+  class MessageElement : public mozilla::LinkedListElement<MessageElement> {
+   public:
+    explicit MessageElement(nsIConsoleMessage* aMessage) : mMessage(aMessage) {}
+
+    nsIConsoleMessage* Get() { return mMessage.get(); }
+
+    void swapMessage(nsCOMPtr<nsIConsoleMessage>& aRetVal) {
+      mMessage.swap(aRetVal);
+    }
+
+    ~MessageElement();
+
+    MessageElement(const MessageElement&) = delete;
+    MessageElement& operator=(const MessageElement&) = delete;
+    MessageElement(MessageElement&&) = delete;
+    MessageElement& operator=(MessageElement&&) = delete;
+
+   private:
+    nsCOMPtr<nsIConsoleMessage> mMessage;
+  };
+
+  ~nsConsoleService();
+
+  nsresult MaybeForwardScriptError(nsIConsoleMessage* aMessage, bool* sent);
+
+  void ClearMessagesForWindowID(const uint64_t innerID);
+  void ClearMessages() MOZ_REQUIRES(mLock);
+
+  mozilla::LinkedList<MessageElement> mMessages MOZ_GUARDED_BY(mLock);
+
+  uint32_t mCurrentSize MOZ_GUARDED_BY(mLock);
+
+  const uint32_t mMaximumSize;
+
+  bool mDeliveringMessage;
+
+  ListenerHash mListeners MOZ_GUARDED_BY(mLock);
+
+  mozilla::Mutex mLock;
+};
+
+#endif /* _nsconsoleservice_h_ */

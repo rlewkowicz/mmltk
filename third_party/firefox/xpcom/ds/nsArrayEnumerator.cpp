@@ -1,0 +1,182 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsArrayEnumerator.h"
+
+#include "nsIArray.h"
+#include "nsSimpleEnumerator.h"
+
+#include "nsCOMArray.h"
+#include "nsCOMPtr.h"
+#include "mozilla/OperatorNewExtensions.h"
+#include "mozilla/RefPtr.h"
+
+class nsSimpleArrayEnumerator final : public nsSimpleEnumerator {
+ public:
+  NS_DECL_NSISIMPLEENUMERATOR
+
+  explicit nsSimpleArrayEnumerator(nsIArray* aValueArray, const nsID& aEntryIID)
+      : mValueArray(aValueArray), mEntryIID(aEntryIID), mIndex(0) {}
+
+  const nsID& DefaultInterface() override { return mEntryIID; }
+
+ private:
+  ~nsSimpleArrayEnumerator() override = default;
+
+ protected:
+  nsCOMPtr<nsIArray> mValueArray;
+  const nsID mEntryIID;
+  uint32_t mIndex;
+};
+
+NS_IMETHODIMP
+nsSimpleArrayEnumerator::HasMoreElements(bool* aResult) {
+  MOZ_ASSERT(aResult != nullptr, "null ptr");
+  if (!aResult) {
+    return NS_ERROR_NULL_POINTER;
+  }
+
+  if (!mValueArray) {
+    *aResult = false;
+    return NS_OK;
+  }
+
+  uint32_t cnt;
+  nsresult rv = mValueArray->GetLength(&cnt);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+  *aResult = (mIndex < cnt);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsSimpleArrayEnumerator::GetNext(nsISupports** aResult) {
+  MOZ_ASSERT(aResult != nullptr, "null ptr");
+  if (!aResult) {
+    return NS_ERROR_NULL_POINTER;
+  }
+
+  if (!mValueArray) {
+    *aResult = nullptr;
+    return NS_OK;
+  }
+
+  uint32_t cnt;
+  nsresult rv = mValueArray->GetLength(&cnt);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+  if (mIndex >= cnt) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  return mValueArray->QueryElementAt(mIndex++, NS_GET_IID(nsISupports),
+                                     (void**)aResult);
+}
+
+nsresult NS_NewArrayEnumerator(nsISimpleEnumerator** aResult, nsIArray* aArray,
+                               const nsID& aEntryIID) {
+  RefPtr enumer =
+      mozilla::MakeRefPtr<nsSimpleArrayEnumerator>(aArray, aEntryIID);
+  enumer.forget(aResult);
+  return NS_OK;
+}
+
+
+class nsCOMArrayEnumerator final : public nsSimpleEnumerator {
+ public:
+  NS_DECL_NSISIMPLEENUMERATOR
+
+  static nsCOMArrayEnumerator* Allocate(const nsCOMArray_base& aArray,
+                                        const nsID& aEntryIID);
+
+  void operator delete(void* aPtr) { free(aPtr); }
+
+  const nsID& DefaultInterface() override { return mEntryIID; }
+
+ private:
+  explicit nsCOMArrayEnumerator(const nsID& aEntryIID)
+      : mIndex(0), mArraySize(0), mEntryIID(aEntryIID) {
+    mValueArray[0] = nullptr;
+  }
+
+  ~nsCOMArrayEnumerator(void) override;
+
+ protected:
+  uint32_t mIndex;      
+  uint32_t mArraySize;  
+
+  const nsID& mEntryIID;
+
+  nsISupports* mValueArray[1];
+};
+
+nsCOMArrayEnumerator::~nsCOMArrayEnumerator() {
+  for (; mIndex < mArraySize; ++mIndex) {
+    NS_IF_RELEASE(mValueArray[mIndex]);
+  }
+}
+
+NS_IMETHODIMP
+nsCOMArrayEnumerator::HasMoreElements(bool* aResult) {
+  MOZ_ASSERT(aResult != nullptr, "null ptr");
+  if (!aResult) {
+    return NS_ERROR_NULL_POINTER;
+  }
+
+  *aResult = (mIndex < mArraySize);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsCOMArrayEnumerator::GetNext(nsISupports** aResult) {
+  MOZ_ASSERT(aResult != nullptr, "null ptr");
+  if (!aResult) {
+    return NS_ERROR_NULL_POINTER;
+  }
+
+  if (mIndex >= mArraySize) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  *aResult = mValueArray[mIndex++];
+
+
+  return NS_OK;
+}
+
+nsCOMArrayEnumerator* nsCOMArrayEnumerator::Allocate(
+    const nsCOMArray_base& aArray, const nsID& aEntryIID) {
+  size_t size = sizeof(nsCOMArrayEnumerator);
+  uint32_t count;
+  if (aArray.Count() > 0) {
+    count = static_cast<uint32_t>(aArray.Count());
+    size += (count - 1) * sizeof(aArray[0]);
+  } else {
+    count = 0;
+  }
+
+  void* mem = moz_xmalloc(size);
+  auto result =
+      new (mozilla::KnownNotNull, mem) nsCOMArrayEnumerator(aEntryIID);
+
+  result->mArraySize = count;
+
+  for (uint32_t i = 0; i < count; ++i) {
+    result->mValueArray[i] = aArray[i];
+    NS_IF_ADDREF(result->mValueArray[i]);
+  }
+
+  return result;
+}
+
+nsresult NS_NewArrayEnumerator(nsISimpleEnumerator** aResult,
+                               const nsCOMArray_base& aArray,
+                               const nsID& aEntryIID) {
+  RefPtr<nsCOMArrayEnumerator> enumerator =
+      nsCOMArrayEnumerator::Allocate(aArray, aEntryIID);
+  enumerator.forget(aResult);
+  return NS_OK;
+}

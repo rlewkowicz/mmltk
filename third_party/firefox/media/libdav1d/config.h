@@ -1,0 +1,50 @@
+#pragma once
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+#  define ARCH_AARCH64 1
+#else
+#  define ARCH_AARCH64 0
+#endif
+
+#if defined(__arm__) || defined(_M_ARM)
+#  define ARCH_ARM 1
+#else
+#  define ARCH_ARM 0
+#endif
+
+#if defined(__i386__) || defined(_M_IX86)
+#  define ARCH_X86_32 1
+#else
+#  define ARCH_X86_32 0
+#endif
+
+#if defined(__x86_64__) || defined(_M_X64)
+#  define ARCH_X86_64 1
+#else
+#  define ARCH_X86_64 0
+#endif
+
+#if ARCH_X86_32 == 1 || ARCH_X86_64 == 1
+#  define ARCH_X86 1
+#else
+#  define ARCH_X86 0
+#endif
+
+#define CONFIG_16BPC 1
+#define CONFIG_8BPC 1
+
+#if defined(MOZ_DAV1D_ASM)
+#  define HAVE_ASM 1
+#else
+#  define HAVE_ASM 0
+#endif
+
+#if ARCH_AARCH64 == 1
+#  define HAVE_AS_FUNC 0
+#if defined(__linux__)
+#  define HAVE_GETAUXVAL 1
+#endif
+#  define PIC 3
+#endif
+
+

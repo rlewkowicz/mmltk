@@ -1,0 +1,73 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_ColumnSetWrapperFrame_h
+#define mozilla_ColumnSetWrapperFrame_h
+
+#include "nsBlockFrame.h"
+
+namespace mozilla {
+
+class PresShell;
+
+class ColumnSetWrapperFrame final : public nsBlockFrame {
+ public:
+  NS_DECL_FRAMEARENA_HELPERS(ColumnSetWrapperFrame)
+  NS_DECL_QUERYFRAME
+
+  friend nsBlockFrame* ::NS_NewColumnSetWrapperFrame(
+      mozilla::PresShell* aPresShell, ComputedStyle* aStyle,
+      nsFrameState aStateFlags);
+
+  void Init(nsIContent* aContent, nsContainerFrame* aParent,
+            nsIFrame* aPrevInFlow) override;
+
+  nsContainerFrame* GetContentInsertionFrame() override;
+
+  void AppendDirectlyOwnedAnonBoxes(nsTArray<OwnedAnonBox>& aResult) override;
+
+#ifdef DEBUG_FRAME_DUMP
+  nsresult GetFrameName(nsAString& aResult) const override;
+#endif
+
+  void AppendFrames(ChildListID aListID, nsFrameList&& aFrameList) override;
+
+  void InsertFrames(ChildListID aListID, nsIFrame* aPrevFrame,
+                    const nsLineList::iterator* aPrevFrameLine,
+                    nsFrameList&& aFrameList) override;
+
+  void RemoveFrame(DestroyContext&, ChildListID, nsIFrame*) override;
+
+  void MarkIntrinsicISizesDirty() override;
+
+  nscoord IntrinsicISize(const IntrinsicSizeInput& aInput,
+                         IntrinsicISizeType aType) override;
+
+  Maybe<nscoord> GetNaturalBaselineBOffset(
+      WritingMode aWM, BaselineSharingGroup aBaselineGroup,
+      BaselineExportContext aExportContext) const override;
+
+ private:
+  explicit ColumnSetWrapperFrame(ComputedStyle* aStyle,
+                                 nsPresContext* aPresContext);
+  ~ColumnSetWrapperFrame() override = default;
+
+  nscoord MinISize(const IntrinsicSizeInput& aInput);
+  nscoord PrefISize(const IntrinsicSizeInput& aInput);
+
+#ifdef DEBUG
+  static void AssertColumnSpanWrapperSubtreeIsSane(const nsIFrame* aFrame);
+#endif
+
+  template <typename Iterator>
+  Maybe<nscoord> GetBaselineBOffset(Iterator aStart, Iterator aEnd,
+                                    WritingMode aWM,
+                                    BaselineSharingGroup aBaselineGroup,
+                                    BaselineExportContext aExportContext) const;
+};
+
+}  
+
+#endif  // mozilla_ColumnSetWrapperFrame_h

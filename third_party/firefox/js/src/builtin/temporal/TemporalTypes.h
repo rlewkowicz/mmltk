@@ -1,0 +1,492 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef builtin_temporal_TemporalTypes_h
+#define builtin_temporal_TemporalTypes_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/CheckedInt.h"
+
+#include <cmath>
+#include <compare>
+#include <stdint.h>
+#include <type_traits>
+#include <utility>
+
+#include "jstypes.h"
+
+#include "builtin/temporal/TemporalUnit.h"
+#include "vm/Int128.h"
+
+namespace js::temporal {
+
+#if defined __has_builtin
+#  if __has_builtin(__builtin_assume)
+#    define JS_ASSUME(x) __builtin_assume(x)
+#  elif __has_builtin(__builtin_unreachable)
+#    define JS_ASSUME(x) \
+      if (!(x)) __builtin_unreachable()
+#  else
+#  endif
+#endif
+
+#ifndef JS_ASSUME
+#  define JS_ASSUME(x) \
+    do {               \
+    } while (false)
+#endif
+
+template <typename Derived>
+struct SecondsAndNanoseconds {
+  int64_t seconds = 0;
+
+  int32_t nanoseconds = 0;
+
+  constexpr auto operator<=>(const SecondsAndNanoseconds& other) const {
+    JS_ASSUME(nanoseconds >= 0);
+    JS_ASSUME(other.nanoseconds >= 0);
+    auto r = seconds <=> other.seconds;
+    if (r != 0) {
+      return r;
+    }
+    return nanoseconds <=> other.nanoseconds;
+  }
+
+  constexpr bool operator==(const SecondsAndNanoseconds&) const = default;
+
+ protected:
+  template <typename T, typename U, class R = Derived>
+  static constexpr R add(const SecondsAndNanoseconds<T>& self,
+                         const SecondsAndNanoseconds<U>& other) {
+
+    mozilla::CheckedInt64 secs = self.seconds;
+    secs += other.seconds;
+
+    mozilla::CheckedInt32 nanos = self.nanoseconds;
+    nanos += other.nanoseconds;
+
+    if (nanos.value() >= 1'000'000'000) {
+      secs += 1;
+      nanos -= 1'000'000'000;
+    }
+    MOZ_ASSERT(0 <= nanos.value() && nanos.value() < 1'000'000'000);
+
+    return {{secs.value(), nanos.value()}};
+  }
+
+  template <class T, class U, class R = Derived>
+  static constexpr R subtract(const SecondsAndNanoseconds<T>& self,
+                              const SecondsAndNanoseconds<U>& other) {
+
+    mozilla::CheckedInt64 secs = self.seconds;
+    secs -= other.seconds;
+
+    mozilla::CheckedInt32 nanos = self.nanoseconds;
+    nanos -= other.nanoseconds;
+
+    if (nanos.value() < 0) {
+      secs -= 1;
+      nanos += 1'000'000'000;
+    }
+    MOZ_ASSERT(0 <= nanos.value() && nanos.value() < 1'000'000'000);
+
+    return {{secs.value(), nanos.value()}};
+  }
+
+  static constexpr Derived negate(const Derived& self) {
+    return subtract(Derived{}, self);
+  }
+
+ public:
+  constexpr std::pair<int64_t, int32_t> denormalize() const {
+    int64_t sec = seconds;
+    int32_t nanos = nanoseconds;
+    if (sec < 0 && nanos > 0) {
+      sec += 1;
+      nanos -= 1'000'000'000;
+    }
+    return {sec, nanos};
+  }
+
+  constexpr Derived abs() const {
+    auto [sec, nanos] = denormalize();
+    return {{std::abs(sec), std::abs(nanos)}};
+  }
+
+  constexpr int64_t toDays() const {
+    auto [sec, nanos] = denormalize();
+    return sec / ToSeconds(TemporalUnit::Day);
+  }
+
+  constexpr int64_t toMilliseconds() const {
+    auto [sec, nanos] = denormalize();
+    return (sec * 1'000) + (nanos / 1'000'000);
+  }
+
+  constexpr Int128 toMicroseconds() const {
+    auto [sec, nanos] = denormalize();
+    return Int128{sec} * Int128{ToMicroseconds(TemporalUnit::Second)} +
+           Int128{nanos / 1'000};
+  }
+
+  constexpr Int128 toNanoseconds() const {
+    return Int128{seconds} * Int128{ToNanoseconds(TemporalUnit::Second)} +
+           Int128{nanoseconds};
+  }
+
+  template <class Other>
+  constexpr Other to() const {
+    static_assert(std::is_base_of_v<SecondsAndNanoseconds<Other>, Other>);
+    return Other{{seconds, nanoseconds}};
+  }
+
+  static constexpr Derived fromDays(int64_t days) {
+    return {{days * ToSeconds(TemporalUnit::Day), 0}};
+  }
+
+  static constexpr Derived fromMinutes(int64_t minutes) {
+    return {{minutes * ToSeconds(TemporalUnit::Minute), 0}};
+  }
+
+  static constexpr Derived fromMilliseconds(int64_t milliseconds) {
+    int64_t seconds = milliseconds / 1'000;
+    int32_t millis = int32_t(milliseconds % 1'000);
+    if (millis < 0) {
+      seconds -= 1;
+      millis += 1'000;
+    }
+    return {{seconds, millis * 1'000'000}};
+  }
+
+  static constexpr Derived fromNanoseconds(int64_t nanoseconds) {
+    int64_t seconds = nanoseconds / 1'000'000'000;
+    int32_t nanos = int32_t(nanoseconds % 1'000'000'000);
+    if (nanos < 0) {
+      seconds -= 1;
+      nanos += 1'000'000'000;
+    }
+    return {{seconds, nanos}};
+  }
+
+  static Derived fromNanoseconds(const Int128& nanoseconds) {
+    auto div = nanoseconds.divrem(Int128{1'000'000'000});
+    int64_t seconds = int64_t(div.first);
+    int32_t nanos = int32_t(div.second);
+    if (nanos < 0) {
+      seconds -= 1;
+      nanos += 1'000'000'000;
+    }
+    return {{seconds, nanos}};
+  }
+};
+
+#undef JS_ASSUME
+
+struct EpochDuration final : SecondsAndNanoseconds<EpochDuration> {
+  constexpr EpochDuration& operator+=(const EpochDuration& other) {
+    *this = add(*this, other);
+    return *this;
+  }
+
+  constexpr EpochDuration& operator-=(const EpochDuration& other) {
+    *this = subtract(*this, other);
+    return *this;
+  }
+
+  constexpr EpochDuration operator+(const EpochDuration& other) const {
+    return add(*this, other);
+  }
+
+  constexpr EpochDuration operator-(const EpochDuration& other) const {
+    return subtract(*this, other);
+  }
+
+  constexpr EpochDuration operator-() const { return negate(*this); }
+
+  static constexpr EpochDuration max() {
+    constexpr int64_t seconds = 2 * 8'640'000'000'000;
+    constexpr int64_t nanos = 0;
+    return {{seconds, nanos}};
+  }
+
+  static constexpr EpochDuration min() { return -max(); }
+};
+
+struct EpochNanoseconds final : SecondsAndNanoseconds<EpochNanoseconds> {
+  constexpr EpochNanoseconds& operator+=(const EpochDuration& other) {
+    *this = add(*this, other);
+    return *this;
+  }
+
+  constexpr EpochNanoseconds& operator-=(const EpochDuration& other) {
+    *this = subtract(*this, other);
+    return *this;
+  }
+
+  constexpr EpochNanoseconds operator+(const EpochDuration& other) const {
+    return add(*this, other);
+  }
+
+  constexpr EpochNanoseconds operator-(const EpochDuration& other) const {
+    return subtract(*this, other);
+  }
+
+  constexpr EpochDuration operator-(const EpochNanoseconds& other) const {
+    return subtract<EpochNanoseconds, EpochNanoseconds, EpochDuration>(*this,
+                                                                       other);
+  }
+
+  constexpr EpochNanoseconds operator-() const { return negate(*this); }
+
+  constexpr int64_t floorToMilliseconds() const {
+    return (seconds * 1'000) + (nanoseconds / 1'000'000);
+  }
+
+  constexpr int64_t ceilToMilliseconds() const {
+    return floorToMilliseconds() + int64_t(nanoseconds % 1'000'000 != 0);
+  }
+
+  static constexpr EpochNanoseconds max() {
+    constexpr int64_t seconds = 8'640'000'000'000;
+    constexpr int64_t nanos = 0;
+    return {{seconds, nanos}};
+  }
+
+  static constexpr EpochNanoseconds min() { return -max(); }
+};
+
+constexpr inline int32_t MinEpochDay = -100'000'001;
+constexpr inline int32_t MaxEpochDay = 100'000'000;
+
+static_assert(MinEpochDay ==
+              EpochNanoseconds::min().seconds / ToSeconds(TemporalUnit::Day) -
+                  1);
+static_assert(MaxEpochDay ==
+              EpochNanoseconds::max().seconds / ToSeconds(TemporalUnit::Day));
+
+constexpr inline int32_t MaxEpochDaysDuration = MaxEpochDay - MinEpochDay;
+
+struct ISODate final {
+  int32_t year = 0;
+
+  int32_t month = 0;
+
+  int32_t day = 0;
+
+  constexpr auto operator<=>(const ISODate&) const = default;
+
+  static constexpr ISODate min() { return {-271821, 4, 19}; }
+
+  static constexpr ISODate max() { return {275760, 9, 13}; }
+};
+
+struct Time final {
+  int32_t hour = 0;
+
+  int32_t minute = 0;
+
+  int32_t second = 0;
+
+  int32_t millisecond = 0;
+
+  int32_t microsecond = 0;
+
+  int32_t nanosecond = 0;
+
+  constexpr auto operator<=>(const Time&) const = default;
+};
+
+struct ISODateTime final {
+  ISODate date;
+  Time time;
+
+  constexpr auto operator<=>(const ISODateTime&) const = default;
+
+
+  constexpr bool operator<(const ISODateTime& other) const {
+    if (date != other.date) {
+      return date < other.date;
+    }
+    return time < other.time;
+  }
+
+  constexpr bool operator>(const ISODateTime& other) const {
+    return other < *this;
+  }
+
+  constexpr bool operator<=(const ISODateTime& other) const {
+    return !(other < *this);
+  }
+
+  constexpr bool operator>=(const ISODateTime& other) const {
+    return !(*this < other);
+  }
+};
+
+struct PackedDate final {
+  static constexpr uint32_t DayBits = 8;
+  static constexpr uint32_t MonthBits = 4;
+  static constexpr uint32_t YearBits = 20;
+
+  static constexpr uint32_t DayShift = 0;
+  static constexpr uint32_t MonthShift = DayShift + DayBits;
+  static constexpr uint32_t YearShift = MonthShift + MonthBits;
+
+  uint32_t value = 0;
+
+  static constexpr PackedDate pack(const ISODate& date) {
+    return {uint32_t((date.year << YearShift) | (date.month << MonthShift) |
+                     (date.day << DayShift))};
+  }
+
+  static constexpr ISODate unpack(const PackedDate& date) {
+    return {
+        int32_t(date.value) >> YearShift,
+        int32_t((date.value >> MonthShift) & BitMask(MonthBits)),
+        int32_t((date.value >> DayShift) & BitMask(DayBits)),
+    };
+  }
+};
+
+struct PackedTime final {
+  static constexpr uint32_t NanosecondBits = 10;
+  static constexpr uint32_t MicrosecondBits = 10;
+  static constexpr uint32_t MillisecondBits = 10;
+  static constexpr uint32_t SecondBits = 6;
+  static constexpr uint32_t MinuteBits = 6;
+  static constexpr uint32_t HourBits = 5;
+
+  static constexpr uint32_t NanosecondShift = 0;
+  static constexpr uint32_t MicrosecondShift = NanosecondShift + NanosecondBits;
+  static constexpr uint32_t MillisecondShift =
+      MicrosecondShift + MicrosecondBits;
+  static constexpr uint32_t SecondShift = MillisecondShift + MillisecondBits;
+  static constexpr uint32_t MinuteShift = SecondShift + SecondBits;
+  static constexpr uint32_t HourShift = MinuteShift + MinuteBits;
+
+  uint64_t value = 0;
+
+  static constexpr PackedTime pack(const Time& time) {
+    return {uint64_t(time.hour) << HourShift |
+            uint64_t(time.minute) << MinuteShift |
+            uint64_t(time.second) << SecondShift |
+            uint64_t(time.millisecond) << MillisecondShift |
+            uint64_t(time.microsecond) << MicrosecondShift |
+            uint64_t(time.nanosecond) << NanosecondShift};
+  }
+
+  static constexpr Time unpack(const PackedTime& time) {
+    return {
+        int32_t((time.value >> HourShift) & BitMask(HourBits)),
+        int32_t((time.value >> MinuteShift) & BitMask(MinuteBits)),
+        int32_t((time.value >> SecondShift) & BitMask(SecondBits)),
+        int32_t((time.value >> MillisecondShift) & BitMask(MillisecondBits)),
+        int32_t((time.value >> MicrosecondShift) & BitMask(MicrosecondBits)),
+        int32_t((time.value >> NanosecondShift) & BitMask(NanosecondBits)),
+    };
+  }
+};
+
+struct DateDuration;
+
+struct Duration final {
+  double years = 0;
+
+  double months = 0;
+
+  double weeks = 0;
+
+  double days = 0;
+
+  double hours = 0;
+
+  double minutes = 0;
+
+  double seconds = 0;
+
+  double milliseconds = 0;
+
+  double microseconds = 0;
+
+  double nanoseconds = 0;
+
+  constexpr bool operator==(const Duration&) const = default;
+
+  constexpr Duration negate() const {
+    return {
+        -years + (+0.0),       -months + (+0.0),       -weeks + (+0.0),
+        -days + (+0.0),        -hours + (+0.0),        -minutes + (+0.0),
+        -seconds + (+0.0),     -milliseconds + (+0.0), -microseconds + (+0.0),
+        -nanoseconds + (+0.0),
+    };
+  }
+
+  inline DateDuration toDateDuration() const;
+};
+
+struct DateDuration final {
+  int64_t years = 0;
+
+  int64_t months = 0;
+
+  int64_t weeks = 0;
+
+  int64_t days = 0;
+
+  constexpr bool operator==(const DateDuration&) const = default;
+
+  constexpr Duration toDuration() const {
+    return {
+        double(years),
+        double(months),
+        double(weeks),
+        double(days),
+    };
+  }
+};
+
+inline DateDuration Duration::toDateDuration() const {
+  return {int64_t(years), int64_t(months), int64_t(weeks), int64_t(days)};
+}
+
+struct TimeDuration final : SecondsAndNanoseconds<TimeDuration> {
+  constexpr TimeDuration& operator+=(const TimeDuration& other) {
+    *this = add(*this, other);
+    return *this;
+  }
+
+  constexpr TimeDuration& operator-=(const TimeDuration& other) {
+    *this = subtract(*this, other);
+    return *this;
+  }
+
+  constexpr TimeDuration operator+(const TimeDuration& other) const {
+    return add(*this, other);
+  }
+
+  constexpr TimeDuration operator-(const TimeDuration& other) const {
+    return subtract(*this, other);
+  }
+
+  constexpr TimeDuration operator-() const { return negate(*this); }
+
+  static constexpr TimeDuration max() {
+    constexpr int64_t seconds = 0x1f'ffff'ffff'ffff;
+    constexpr int64_t nanos = 999'999'999;
+    return {{seconds, nanos}};
+  }
+
+  static constexpr TimeDuration min() { return -max(); }
+};
+
+struct InternalDuration final {
+  DateDuration date;
+  TimeDuration time;
+
+  constexpr bool operator==(const InternalDuration&) const = default;
+};
+
+} 
+
+#endif /* builtin_temporal_TemporalTypes_h */

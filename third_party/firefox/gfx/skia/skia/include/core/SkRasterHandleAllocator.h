@@ -1,0 +1,51 @@
+/*
+ * Copyright 2016 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkRasterHandleAllocator_DEFINED)
+#define SkRasterHandleAllocator_DEFINED
+
+#include "include/core/SkImageInfo.h"
+
+class SkBitmap;
+class SkCanvas;
+class SkMatrix;
+class SkSurfaceProps;
+
+class SK_API SkRasterHandleAllocator {
+public:
+    virtual ~SkRasterHandleAllocator() = default;
+
+    typedef void* Handle;
+
+    struct Rec {
+        void    (*fReleaseProc)(void* pixels, void* ctx);
+        void*   fReleaseCtx;    
+        void*   fPixels;        
+        size_t  fRowBytes;      
+        Handle  fHandle;        
+    };
+
+    virtual bool allocHandle(const SkImageInfo&, Rec*) = 0;
+
+    virtual void updateHandle(Handle, const SkMatrix&, const SkIRect&) = 0;
+
+    static std::unique_ptr<SkCanvas> MakeCanvas(std::unique_ptr<SkRasterHandleAllocator>,
+                                                const SkImageInfo&, const Rec* rec = nullptr,
+                                                const SkSurfaceProps* props = nullptr);
+
+protected:
+    SkRasterHandleAllocator() = default;
+    SkRasterHandleAllocator(const SkRasterHandleAllocator&) = delete;
+    SkRasterHandleAllocator& operator=(const SkRasterHandleAllocator&) = delete;
+
+private:
+    friend class SkBitmapDevice;
+
+    Handle allocBitmap(const SkImageInfo&, SkBitmap*);
+};
+
+#endif

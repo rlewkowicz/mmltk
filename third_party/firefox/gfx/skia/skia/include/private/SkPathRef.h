@@ -1,0 +1,63 @@
+/*
+ * Copyright 2012 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkPathRef_DEFINED)
+#define SkPathRef_DEFINED
+
+#include "include/core/SkArc.h"
+#include "include/core/SkMatrix.h"
+#include "include/core/SkPathTypes.h" // IWYU pragma: keep
+#include "include/core/SkPoint.h"
+#include "include/core/SkRRect.h"
+#include "include/core/SkRect.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkScalar.h"
+#include "include/core/SkTypes.h"
+#include "include/private/SkIDChangeListener.h"
+#include "include/private/base/SkDebug.h"
+#include "include/private/base/SkSpan_impl.h"
+#include "include/private/base/SkTArray.h"
+#include "include/private/base/SkTo.h"
+
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <tuple>
+
+class SkMatrix;
+
+
+struct SkPathRectInfo {
+    SkRect          fRect;
+    SkPathDirection fDirection;
+    uint8_t         fStartIndex;
+};
+
+struct SkPathOvalInfo {
+    SkRect          fBounds;
+    SkPathDirection fDirection;
+    uint8_t         fStartIndex;
+};
+
+struct SkPathRRectInfo {
+    SkRRect         fRRect;
+    SkPathDirection fDirection;
+    uint8_t         fStartIndex;
+};
+
+enum class SkPathIsAType : uint8_t {
+    kGeneral,
+    kOval,
+    kRRect,
+};
+
+struct SkPathIsAData {
+    uint8_t         fStartIndex;
+    SkPathDirection fDirection;
+};
+
+#endif

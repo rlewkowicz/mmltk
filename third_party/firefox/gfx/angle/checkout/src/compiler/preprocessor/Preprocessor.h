@@ -1,0 +1,59 @@
+// Copyright 2011 The ANGLE Project Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(COMPILER_PREPROCESSOR_PREPROCESSOR_H_)
+#define COMPILER_PREPROCESSOR_PREPROCESSOR_H_
+
+#include <cstddef>
+
+#include "GLSLANG/ShaderLang.h"
+#include "common/angleutils.h"
+
+namespace angle
+{
+
+namespace pp
+{
+
+class Diagnostics;
+class DirectiveHandler;
+struct PreprocessorImpl;
+struct Token;
+
+struct PreprocessorSettings final
+{
+    PreprocessorSettings(ShShaderSpec shaderSpec)
+        : maxMacroExpansionDepth(1000), shaderSpec(shaderSpec)
+    {}
+
+    PreprocessorSettings(const PreprocessorSettings &other) = default;
+
+    int maxMacroExpansionDepth;
+    ShShaderSpec shaderSpec;
+};
+
+class Preprocessor : angle::NonCopyable
+{
+  public:
+    Preprocessor(Diagnostics *diagnostics,
+                 DirectiveHandler *directiveHandler,
+                 const PreprocessorSettings &settings);
+    ~Preprocessor();
+
+    bool init(size_t count, const char *const string[], const int length[]);
+    void predefineMacro(const char *name, int value);
+
+    void lex(Token *token);
+
+    void setMaxTokenSize(size_t maxTokenSize);
+
+  private:
+    PreprocessorImpl *mImpl;
+};
+
+}  
+
+}  
+
+#endif

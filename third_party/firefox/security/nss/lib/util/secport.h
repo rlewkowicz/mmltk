@@ -1,0 +1,232 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#if !defined(_SECPORT_H_)
+#define _SECPORT_H_
+
+#include "utilrename.h"
+#include "prlink.h"
+
+
+#if defined(unix)
+#if !defined(XP_UNIX)
+#define XP_UNIX
+#endif
+#endif
+
+#include <sys/types.h>
+
+#include <ctype.h>
+#define __STDC_WANT_LIB_EXT1__ 1
+#include <string.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include "prtypes.h"
+#include "prlog.h" /* for PR_ASSERT */
+#include "plarena.h"
+#include "plstr.h"
+
+#if !defined(SEC_BEGIN_PROTOS)
+#include "seccomon.h"
+#endif
+
+typedef struct PORTCheapArenaPool_str {
+    PLArenaPool arena;
+    PRUint32 magic; 
+} PORTCheapArenaPool;
+
+SEC_BEGIN_PROTOS
+
+extern void *PORT_Alloc(size_t len);
+extern void *PORT_Realloc(void *old, size_t len);
+extern void *PORT_ZAlloc(size_t len);
+extern void *PORT_ZAllocAligned(size_t bytes, size_t alignment, void **mem);
+extern void *PORT_ZAllocAlignedOffset(size_t bytes, size_t alignment,
+                                      size_t offset);
+extern void PORT_Free(void *ptr);
+extern void PORT_ZFree(void *ptr, size_t len);
+extern char *PORT_Strdup(const char *s);
+extern void PORT_SetError(int value);
+extern int PORT_GetError(void);
+
+extern PLArenaPool *PORT_NewArena(unsigned long chunksize);
+extern void PORT_FreeArena(PLArenaPool *arena, PRBool zero);
+
+extern void PORT_InitCheapArena(PORTCheapArenaPool *arena,
+                                unsigned long chunksize);
+extern void PORT_DestroyCheapArena(PORTCheapArenaPool *arena);
+
+extern void *PORT_ArenaAlloc(PLArenaPool *arena, size_t size);
+extern void *PORT_ArenaZAlloc(PLArenaPool *arena, size_t size);
+extern void *PORT_ArenaGrow(PLArenaPool *arena, void *ptr,
+                            size_t oldsize, size_t newsize);
+extern void *PORT_ArenaMark(PLArenaPool *arena);
+extern void PORT_ArenaRelease(PLArenaPool *arena, void *mark);
+extern void PORT_ArenaZRelease(PLArenaPool *arena, void *mark);
+extern void PORT_ArenaUnmark(PLArenaPool *arena, void *mark);
+extern char *PORT_ArenaStrdup(PLArenaPool *arena, const char *str);
+
+SEC_END_PROTOS
+
+#define PORT_Assert PR_ASSERT
+#define PORT_AssertArg PR_ASSERT_ARG
+
+#define PORT_AssertNotReached(reasonStr) PR_NOT_REACHED(reasonStr)
+
+#define PORT_GET_BYTE_BE(value, offset, len) \
+    ((unsigned char)(((len) - (offset)-1) >= sizeof(value) ? 0 : (((value) >> (((len) - (offset)-1) * PR_BITS_PER_BYTE)) & 0xff)))
+#define PORT_GET_BYTE_LE(value, offset, len) \
+    ((unsigned char)((offset) > sizeof(value) ? 0 : (((value) >> ((offset)*PR_BITS_PER_BYTE)) & 0xff)))
+
+#if defined(DEBUG)
+#define PORT_CheckSuccess(f) PR_ASSERT((f) == SECSuccess)
+#else
+#define PORT_CheckSuccess(f) (f)
+#endif
+#define PORT_ZNew(type) (type *)PORT_ZAlloc(sizeof(type))
+#define PORT_ZNewAligned(type, alignment, mem) \
+    (type *)PORT_ZAllocAlignedOffset(sizeof(type), alignment, offsetof(type, mem))
+#define PORT_New(type) (type *)PORT_Alloc(sizeof(type))
+#define PORT_ArenaNew(poolp, type) \
+    (type *)PORT_ArenaAlloc(poolp, sizeof(type))
+#define PORT_ArenaZNew(poolp, type) \
+    (type *)PORT_ArenaZAlloc(poolp, sizeof(type))
+#define PORT_NewArray(type, num) \
+    (type *)PORT_Alloc(sizeof(type) * (num))
+#define PORT_ZNewArray(type, num) \
+    (type *)PORT_ZAlloc(sizeof(type) * (num))
+#define PORT_ArenaNewArray(poolp, type, num) \
+    (type *)PORT_ArenaAlloc(poolp, sizeof(type) * (num))
+#define PORT_ArenaZNewArray(poolp, type, num) \
+    (type *)PORT_ArenaZAlloc(poolp, sizeof(type) * (num))
+
+
+#define PORT_Atoi(buff) (int)strtol(buff, NULL, 10)
+
+#define PORT_ErrorToString(err) PR_ErrorToString((err), PR_LANGUAGE_I_DEFAULT)
+
+#define PORT_ErrorToName PR_ErrorToName
+
+#define PORT_Memcmp memcmp
+#define PORT_Memcpy memcpy
+#define PORT_Memmove memmove
+#define PORT_Memset memset
+
+#define PORT_Strcasecmp PL_strcasecmp
+#define PORT_Strcat strcat
+#define PORT_Strchr strchr
+#define PORT_Strrchr strrchr
+#define PORT_Strcmp strcmp
+#define PORT_Strcpy strcpy
+#define PORT_Strlen(s) strlen(s)
+#define PORT_Strncasecmp PL_strncasecmp
+#define PORT_Strncat strncat
+#define PORT_Strncmp strncmp
+#define PORT_Strncpy strncpy
+#define PORT_Strpbrk strpbrk
+#define PORT_Strstr strstr
+#define PORT_Strtok strtok
+
+#define PORT_Tolower tolower
+
+typedef PRBool(PR_CALLBACK *PORTCharConversionWSwapFunc)(PRBool toUnicode,
+                                                         unsigned char *inBuf, unsigned int inBufLen,
+                                                         unsigned char *outBuf, unsigned int maxOutBufLen,
+                                                         unsigned int *outBufLen, PRBool swapBytes);
+
+typedef PRBool(PR_CALLBACK *PORTCharConversionFunc)(PRBool toUnicode,
+                                                    unsigned char *inBuf, unsigned int inBufLen,
+                                                    unsigned char *outBuf, unsigned int maxOutBufLen,
+                                                    unsigned int *outBufLen);
+
+SEC_BEGIN_PROTOS
+
+void PORT_SetUCS4_UTF8ConversionFunction(PORTCharConversionFunc convFunc);
+void PORT_SetUCS2_ASCIIConversionFunction(PORTCharConversionWSwapFunc convFunc);
+PRBool PORT_UCS4_UTF8Conversion(PRBool toUnicode, unsigned char *inBuf,
+                                unsigned int inBufLen, unsigned char *outBuf,
+                                unsigned int maxOutBufLen, unsigned int *outBufLen);
+PRBool PORT_UCS2_ASCIIConversion(PRBool toUnicode, unsigned char *inBuf,
+                                 unsigned int inBufLen, unsigned char *outBuf,
+                                 unsigned int maxOutBufLen, unsigned int *outBufLen,
+                                 PRBool swapBytes);
+void PORT_SetUCS2_UTF8ConversionFunction(PORTCharConversionFunc convFunc);
+PRBool PORT_UCS2_UTF8Conversion(PRBool toUnicode, unsigned char *inBuf,
+                                unsigned int inBufLen, unsigned char *outBuf,
+                                unsigned int maxOutBufLen, unsigned int *outBufLen);
+
+PRBool PORT_ISO88591_UTF8Conversion(const unsigned char *inBuf,
+                                    unsigned int inBufLen, unsigned char *outBuf,
+                                    unsigned int maxOutBufLen, unsigned int *outBufLen);
+
+extern PRBool
+sec_port_ucs4_utf8_conversion_function(
+    PRBool toUnicode,
+    unsigned char *inBuf,
+    unsigned int inBufLen,
+    unsigned char *outBuf,
+    unsigned int maxOutBufLen,
+    unsigned int *outBufLen);
+
+extern PRBool
+sec_port_ucs2_utf8_conversion_function(
+    PRBool toUnicode,
+    unsigned char *inBuf,
+    unsigned int inBufLen,
+    unsigned char *outBuf,
+    unsigned int maxOutBufLen,
+    unsigned int *outBufLen);
+
+extern PRBool
+sec_port_iso88591_utf8_conversion_function(
+    const unsigned char *inBuf,
+    unsigned int inBufLen,
+    unsigned char *outBuf,
+    unsigned int maxOutBufLen,
+    unsigned int *outBufLen);
+
+extern int NSS_PutEnv(const char *envVarName, const char *envValue);
+
+extern void PORT_SafeZero(void *p, size_t n);
+extern int NSS_SecureMemcmp(const void *a, const void *b, size_t n);
+extern unsigned int NSS_SecureMemcmpZero(const void *mem, size_t n);
+extern void NSS_SecureSelect(void *dest, const void *src0, const void *src1, size_t n, unsigned char b);
+extern PRBool NSS_GetSystemFIPSEnabled(void);
+
+PRLibrary *
+PORT_LoadLibraryFromOrigin(const char *existingShLibName,
+                           PRFuncPtr staticShLibFunc,
+                           const char *newShLibName);
+
+SEC_END_PROTOS
+
+#define PORT_CT_DUPLICATE_MSB_TO_ALL(x) ((PRUint32)((PRInt32)(x) >> (sizeof(PRInt32) * 8 - 1)))
+
+#define PORT_CT_SEL(m, l, r) (((m) & (l)) | (~(m) & (r)))
+
+#define PORT_CT_NOT_ZERO(x) (PORT_CT_DUPLICATE_MSB_TO_ALL(((x) | (0 - (x)))))
+
+#define PORT_CT_ZERO(x) (~PORT_CT_DUPLICATE_MSB_TO_ALL(((x) | (0 - (x)))))
+
+#define PORT_CT_EQ(a, b) PORT_CT_ZERO(((a) - (b)))
+#define PORT_CT_NE(a, b) PORT_CT_NOT_ZERO(((a) - (b)))
+#define PORT_CT_GT(a, b) PORT_CT_DUPLICATE_MSB_TO_ALL((b) - (a))
+#define PORT_CT_LT(a, b) PORT_CT_DUPLICATE_MSB_TO_ALL((a) - (b))
+#define PORT_CT_GE(a, b) (~PORT_CT_LT(a, b))
+#define PORT_CT_LE(a, b) (~PORT_CT_GT(a, b))
+#define PORT_CT_TRUE (~0)
+#define PORT_CT_FALSE 0
+
+#if defined(CT_VERIF)
+#include <valgrind/memcheck.h>
+#define NSS_CLASSIFY(buf, length) VALGRIND_MAKE_MEM_UNDEFINED(buf, length);
+#define NSS_DECLASSIFY(buf, length) VALGRIND_MAKE_MEM_DEFINED(buf, length);
+#else
+#define NSS_CLASSIFY(buf, length)
+#define NSS_DECLASSIFY(buf, length)
+#endif
+
+#endif

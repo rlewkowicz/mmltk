@@ -1,0 +1,6529 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/HTMLInputElement.h"
+#include "mozilla/ScopeExit.h"
+
+#include <algorithm>
+#include <cmath>
+
+#include "HTMLDataListElement.h"
+#include "HTMLFormSubmissionConstants.h"
+#include "mozilla/AsyncEventDispatcher.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/Components.h"
+#include "mozilla/ContentEvents.h"
+#include "mozilla/DebugOnly.h"
+#include "mozilla/EventDispatcher.h"
+#include "mozilla/EventStateManager.h"
+#include "mozilla/MappedDeclarationsBuilder.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/MouseEvents.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/PresState.h"
+#include "mozilla/RestyleManager.h"
+#include "mozilla/ServoCSSParser.h"
+#include "mozilla/ServoComputedData.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/TextControlState.h"
+#include "mozilla/TextEditor.h"
+#include "mozilla/TextEvents.h"
+#include "mozilla/TextUtils.h"
+#include "mozilla/TouchEvents.h"
+#include "mozilla/Try.h"
+#include "mozilla/dom/AutocompleteInfoBinding.h"
+#include "mozilla/dom/BlobImpl.h"
+#include "mozilla/dom/CustomEvent.h"
+#include "mozilla/dom/Directory.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/DocumentInlines.h"
+#include "mozilla/dom/DocumentOrShadowRoot.h"
+#include "mozilla/dom/ElementBinding.h"
+#include "mozilla/dom/FileSystemUtils.h"
+#include "mozilla/dom/FormData.h"
+#include "mozilla/dom/GetFilesHelper.h"
+#include "mozilla/dom/HTMLDataListElement.h"
+#include "mozilla/dom/HTMLOptionElement.h"
+#include "mozilla/dom/InputType.h"
+#include "mozilla/dom/MouseEvent.h"
+#include "mozilla/dom/NumericInputTypes.h"
+#include "mozilla/dom/ProgressEvent.h"
+#include "mozilla/dom/UnionTypes.h"
+#include "mozilla/dom/UserActivation.h"
+#include "mozilla/dom/WheelEventBinding.h"
+#include "mozilla/dom/WindowContext.h"
+#include "mozilla/dom/WindowGlobalChild.h"
+#include "nsAttrValueInlines.h"
+#include "nsAttrValueOrString.h"
+#include "nsBaseCommandController.h"
+#include "nsCRTGlue.h"
+#include "nsColorControlFrame.h"
+#include "nsError.h"
+#include "nsFileControlFrame.h"
+#include "nsFocusManager.h"
+#include "nsGkAtoms.h"
+#include "nsIEditor.h"
+#include "nsIFilePicker.h"
+#include "nsIFormControl.h"
+#include "nsIFrame.h"
+#include "nsIMutationObserver.h"
+#include "nsIPromptCollection.h"
+#include "nsIStringBundle.h"
+#include "nsLayoutUtils.h"
+#include "nsLinebreakConverter.h"  //to strip out carriage returns
+#include "nsNetUtil.h"
+#include "nsPIDOMWindow.h"
+#include "nsPresContext.h"
+#include "nsQueryObject.h"
+#include "nsRangeFrame.h"
+#include "nsReadableUtils.h"
+#include "nsRepeatService.h"
+#include "nsStyleConsts.h"
+#include "nsTextControlFrame.h"
+#include "nsUnicharUtils.h"
+#include "nsVariant.h"
+
+#include "mozilla/dom/RadioGroupContainer.h"
+
+#include "mozilla/dom/File.h"
+#include "mozilla/dom/FileList.h"
+#include "mozilla/dom/FileSystem.h"
+#include "mozilla/dom/FileSystemEntry.h"
+#include "nsDirectoryServiceDefs.h"
+#include "nsIContentPrefService2.h"
+#include "nsIFile.h"
+#include "nsIMIMEService.h"
+#include "nsIObserverService.h"
+
+
+#include "HTMLSplitOnSpacesTokenizer.h"
+#include "imgRequestProxy.h"
+#include "mozAutoDocUpdate.h"
+#include "mozilla/LookAndFeel.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/dom/DirectionalityUtils.h"
+#include "nsContentCreatorFunctions.h"
+#include "nsContentUtils.h"
+#include "nsFrameSelection.h"
+#include "nsIColorPicker.h"
+#include "nsIMIMEInfo.h"
+#include "nsIStringEnumerator.h"
+#include "nsImageLoadingContent.h"
+#include "nsXULControllers.h"
+
+#include "js/Date.h"
+
+#if defined(ACCESSIBILITY)
+#  include "nsAccessibilityService.h"
+#endif
+
+NS_IMPL_NS_NEW_HTML_ELEMENT_CHECK_PARSER(Input)
+
+
+namespace mozilla::dom {
+
+#define NS_OUTER_ACTIVATE_EVENT (1 << 9)
+#define NS_ORIGINAL_CHECKED_VALUE (1 << 10)
+#define NS_ORIGINAL_INDETERMINATE_VALUE (1 << 12)
+#define NS_PRE_HANDLE_BLUR_EVENT (1 << 13)
+#define NS_IN_SUBMIT_CLICK (1 << 15)
+#define NS_CONTROL_TYPE(bits)                                              \
+  ((bits) & ~(NS_OUTER_ACTIVATE_EVENT | NS_ORIGINAL_CHECKED_VALUE |        \
+              NS_ORIGINAL_INDETERMINATE_VALUE | NS_PRE_HANDLE_BLUR_EVENT | \
+              NS_IN_SUBMIT_CLICK))
+
+UploadLastDir* HTMLInputElement::gUploadLastDir;
+
+static constexpr nsAttrValue::EnumTableEntry kInputTypeTable[] = {
+    {"button", FormControlType::InputButton},
+    {"checkbox", FormControlType::InputCheckbox},
+    {"color", FormControlType::InputColor},
+    {"date", FormControlType::InputDate},
+    {"datetime-local", FormControlType::InputDatetimeLocal},
+    {"email", FormControlType::InputEmail},
+    {"file", FormControlType::InputFile},
+    {"hidden", FormControlType::InputHidden},
+    {"reset", FormControlType::InputReset},
+    {"image", FormControlType::InputImage},
+    {"month", FormControlType::InputMonth},
+    {"number", FormControlType::InputNumber},
+    {"password", FormControlType::InputPassword},
+    {"radio", FormControlType::InputRadio},
+    {"range", FormControlType::InputRange},
+    {"search", FormControlType::InputSearch},
+    {"submit", FormControlType::InputSubmit},
+    {"tel", FormControlType::InputTel},
+    {"time", FormControlType::InputTime},
+    {"url", FormControlType::InputUrl},
+    {"week", FormControlType::InputWeek},
+    {"text", FormControlType::InputText},
+};
+
+static constexpr const nsAttrValue::EnumTableEntry* kInputDefaultType =
+    &kInputTypeTable[std::size(kInputTypeTable) - 1];
+
+static constexpr nsAttrValue::EnumTableEntry kCaptureTable[] = {
+    {"user", nsIFilePicker::captureUser},
+    {"environment", nsIFilePicker::captureEnv},
+    {"", nsIFilePicker::captureDefault},
+};
+
+static constexpr const nsAttrValue::EnumTableEntry* kCaptureDefault =
+    &kCaptureTable[2];
+
+static constexpr nsAttrValue::EnumTableEntry kColorSpaceTable[] = {
+    {"limited-srgb", StyleColorSpace::Srgb},
+    {"display-p3", StyleColorSpace::DisplayP3},
+};
+
+static constexpr const nsAttrValue::EnumTableEntry* kColorSpaceDefault =
+    &kColorSpaceTable[0];
+
+using namespace blink;
+
+constexpr Decimal HTMLInputElement::kStepScaleFactorDate(86400000_d);
+constexpr Decimal HTMLInputElement::kStepScaleFactorNumberRange(1_d);
+constexpr Decimal HTMLInputElement::kStepScaleFactorTime(1000_d);
+constexpr Decimal HTMLInputElement::kStepScaleFactorMonth(1_d);
+constexpr Decimal HTMLInputElement::kStepScaleFactorWeek(7 * 86400000_d);
+constexpr Decimal HTMLInputElement::kDefaultStepBase(0_d);
+constexpr Decimal HTMLInputElement::kDefaultStepBaseWeek(-259200000_d);
+constexpr Decimal HTMLInputElement::kDefaultStep(1_d);
+constexpr Decimal HTMLInputElement::kDefaultStepTime(60_d);
+constexpr Decimal HTMLInputElement::kStepAny(0_d);
+
+const double HTMLInputElement::kMinimumYear = 1;
+const double HTMLInputElement::kMaximumYear = 275760;
+const double HTMLInputElement::kMaximumWeekInMaximumYear = 37;
+const double HTMLInputElement::kMaximumDayInMaximumYear = 13;
+const double HTMLInputElement::kMaximumMonthInMaximumYear = 9;
+const double HTMLInputElement::kMaximumWeekInYear = 53;
+const double HTMLInputElement::kMsPerDay = 24 * 60 * 60 * 1000;
+
+class DispatchChangeEventCallback final : public GetFilesCallback {
+ public:
+  explicit DispatchChangeEventCallback(HTMLInputElement* aInputElement)
+      : mInputElement(aInputElement) {
+    MOZ_ASSERT(aInputElement);
+  }
+
+  void Callback(nsresult aStatus,
+                const FallibleTArray<RefPtr<BlobImpl>>& aBlobImpls) override {
+    nsCOMPtr<nsIGlobalObject> global = mInputElement->GetRelevantGlobal();
+    if (!global) {
+      return;
+    }
+
+    nsTArray<OwningFileOrDirectory> array;
+    for (uint32_t i = 0; i < aBlobImpls.Length(); ++i) {
+      OwningFileOrDirectory* element = array.AppendElement();
+      RefPtr<File> file =
+          File::Create(mInputElement->GetRelevantGlobal(), aBlobImpls[i]);
+      if (NS_WARN_IF(!file)) {
+        return;
+      }
+
+      element->SetAsFile() = file;
+    }
+
+    mInputElement->SetFilesOrDirectories(array, true);
+    (void)NS_WARN_IF(NS_FAILED(DispatchEvents()));
+  }
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  nsresult DispatchEvents() {
+    RefPtr<HTMLInputElement> inputElement(mInputElement);
+    nsresult rv = nsContentUtils::DispatchInputEvent(inputElement);
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rv), "Failed to dispatch input event");
+    mInputElement->SetUserInteracted(true);
+    rv = nsContentUtils::DispatchTrustedEvent(mInputElement->OwnerDoc(),
+                                              mInputElement, u"change"_ns,
+                                              CanBubble::eYes, Cancelable::eNo);
+
+    return rv;
+  }
+
+ private:
+  RefPtr<HTMLInputElement> mInputElement;
+};
+
+struct HTMLInputElement::FileData {
+  nsTArray<OwningFileOrDirectory> mFilesOrDirectories;
+
+  RefPtr<GetFilesHelper> mGetFilesRecursiveHelper;
+  RefPtr<GetFilesHelper> mGetFilesNonRecursiveHelper;
+
+  nsString mFirstFilePath;
+
+  RefPtr<FileList> mFileList;
+  Sequence<RefPtr<FileSystemEntry>> mEntries;
+
+  nsString mStaticDocFileList;
+
+  void ClearGetFilesHelpers() {
+    if (mGetFilesRecursiveHelper) {
+      mGetFilesRecursiveHelper->Unlink();
+      mGetFilesRecursiveHelper = nullptr;
+    }
+
+    if (mGetFilesNonRecursiveHelper) {
+      mGetFilesNonRecursiveHelper->Unlink();
+      mGetFilesNonRecursiveHelper = nullptr;
+    }
+  }
+
+  void Traverse(nsCycleCollectionTraversalCallback& cb) {
+    FileData* tmp = this;
+    NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mFilesOrDirectories)
+    NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mFileList)
+    NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mEntries)
+    if (mGetFilesRecursiveHelper) {
+      mGetFilesRecursiveHelper->Traverse(cb);
+    }
+
+    if (mGetFilesNonRecursiveHelper) {
+      mGetFilesNonRecursiveHelper->Traverse(cb);
+    }
+  }
+
+  void Unlink() {
+    FileData* tmp = this;
+    NS_IMPL_CYCLE_COLLECTION_UNLINK(mFilesOrDirectories)
+    NS_IMPL_CYCLE_COLLECTION_UNLINK(mFileList)
+    NS_IMPL_CYCLE_COLLECTION_UNLINK(mEntries)
+    ClearGetFilesHelpers();
+  }
+};
+
+HTMLInputElement::nsFilePickerShownCallback::nsFilePickerShownCallback(
+    HTMLInputElement* aInput, nsIFilePicker* aFilePicker)
+    : mFilePicker(aFilePicker), mInput(aInput) {}
+
+NS_IMPL_ISUPPORTS(UploadLastDir::ContentPrefCallback, nsIContentPrefCallback2)
+
+NS_IMETHODIMP
+UploadLastDir::ContentPrefCallback::HandleCompletion(uint16_t aReason) {
+  nsCOMPtr<nsIFile> localFile;
+  nsAutoString prefStr;
+
+  if (aReason == nsIContentPrefCallback2::COMPLETE_ERROR || !mResult) {
+    Preferences::GetString("dom.input.fallbackUploadDir", prefStr);
+  }
+
+  if (prefStr.IsEmpty() && mResult) {
+    nsCOMPtr<nsIVariant> pref;
+    mResult->GetValue(getter_AddRefs(pref));
+    pref->GetAsAString(prefStr);
+  }
+
+  if (!prefStr.IsEmpty()) {
+    nsresult rv = NS_NewLocalFile(prefStr, getter_AddRefs(localFile));
+    (void)NS_WARN_IF(NS_FAILED(rv));
+  }
+
+  if (localFile) {
+    mFilePicker->SetDisplayDirectory(localFile);
+  } else {
+    mFilePicker->SetDisplaySpecialDirectory(
+        NS_LITERAL_STRING_FROM_CSTRING(NS_OS_DESKTOP_DIR));
+  }
+
+  mFilePicker->Open(mFpCallback);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+UploadLastDir::ContentPrefCallback::HandleResult(nsIContentPref* pref) {
+  mResult = pref;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+UploadLastDir::ContentPrefCallback::HandleError(nsresult error) {
+  return NS_OK;
+}
+
+namespace {
+
+static already_AddRefed<nsIFile> LastUsedDirectory(
+    const OwningFileOrDirectory& aData) {
+  if (aData.IsFile()) {
+    nsAutoString path;
+    ErrorResult error;
+    aData.GetAsFile()->GetMozFullPathInternal(path, error);
+    if (error.Failed() || path.IsEmpty()) {
+      error.SuppressException();
+      return nullptr;
+    }
+
+    nsCOMPtr<nsIFile> localFile;
+    nsresult rv = NS_NewLocalFile(path, getter_AddRefs(localFile));
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      return nullptr;
+    }
+
+    nsCOMPtr<nsIFile> parentFile;
+    rv = localFile->GetParent(getter_AddRefs(parentFile));
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      return nullptr;
+    }
+
+    return parentFile.forget();
+  }
+
+  MOZ_ASSERT(aData.IsDirectory());
+
+  nsCOMPtr<nsIFile> localFile = aData.GetAsDirectory()->GetInternalNsIFile();
+  MOZ_ASSERT(localFile);
+
+  return localFile.forget();
+}
+
+void GetDOMFileOrDirectoryName(const OwningFileOrDirectory& aData,
+                               nsAString& aName) {
+  if (aData.IsFile()) {
+    aData.GetAsFile()->GetName(aName);
+  } else {
+    MOZ_ASSERT(aData.IsDirectory());
+    ErrorResult rv;
+    aData.GetAsDirectory()->GetName(aName, rv);
+    if (NS_WARN_IF(rv.Failed())) {
+      rv.SuppressException();
+    }
+  }
+}
+
+void GetDOMFileOrDirectoryPath(const OwningFileOrDirectory& aData,
+                               nsAString& aPath, ErrorResult& aRv) {
+  if (aData.IsFile()) {
+    aData.GetAsFile()->GetMozFullPathInternal(aPath, aRv);
+  } else {
+    MOZ_ASSERT(aData.IsDirectory());
+    aData.GetAsDirectory()->GetFullRealPath(aPath);
+  }
+}
+
+}  
+
+NS_IMETHODIMP
+HTMLInputElement::nsFilePickerShownCallback::Done(
+    nsIFilePicker::ResultCode aResult) {
+  mInput->PickerClosed();
+
+  if (aResult == nsIFilePicker::returnCancel) {
+    RefPtr<HTMLInputElement> inputElement(mInput);
+    return nsContentUtils::DispatchTrustedEvent(
+        inputElement->OwnerDoc(), inputElement, u"cancel"_ns, CanBubble::eYes,
+        Cancelable::eNo);
+  }
+
+  mInput->OwnerDoc()->NotifyUserGestureActivation();
+
+  nsIFilePicker::Mode mode;
+  mFilePicker->GetMode(&mode);
+
+  nsTArray<OwningFileOrDirectory> newFilesOrDirectories;
+  if (mode == nsIFilePicker::modeOpenMultiple) {
+    nsCOMPtr<nsISimpleEnumerator> iter;
+    nsresult rv =
+        mFilePicker->GetDomFileOrDirectoryEnumerator(getter_AddRefs(iter));
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    if (!iter) {
+      return NS_OK;
+    }
+
+    nsCOMPtr<nsISupports> tmp;
+    bool hasMore = true;
+
+    while (NS_SUCCEEDED(iter->HasMoreElements(&hasMore)) && hasMore) {
+      iter->GetNext(getter_AddRefs(tmp));
+      RefPtr<Blob> domBlob = do_QueryObject(tmp);
+      MOZ_ASSERT(domBlob,
+                 "Null file object from FilePicker's file enumerator?");
+      if (!domBlob) {
+        continue;
+      }
+
+      OwningFileOrDirectory* element = newFilesOrDirectories.AppendElement();
+      element->SetAsFile() = domBlob->ToFile();
+    }
+  } else {
+    MOZ_ASSERT(mode == nsIFilePicker::modeOpen ||
+               mode == nsIFilePicker::modeGetFolder);
+    nsCOMPtr<nsISupports> tmp;
+    nsresult rv = mFilePicker->GetDomFileOrDirectory(getter_AddRefs(tmp));
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    if (!tmp) {
+      return NS_OK;
+    }
+
+    if (mode == nsIFilePicker::modeGetFolder) {
+      nsCOMPtr<nsIPromptCollection> prompter =
+          do_GetService("@mozilla.org/embedcomp/prompt-collection;1");
+      if (!prompter) {
+        return NS_ERROR_NOT_AVAILABLE;
+      }
+
+      bool confirmed = false;
+      BrowsingContext* bc = mInput->OwnerDoc()->GetBrowsingContext();
+
+      RefPtr<Directory> directory = static_cast<Directory*>(tmp.get());
+      nsAutoString directoryName;
+      ErrorResult error;
+      directory->GetName(directoryName, error);
+      if (NS_WARN_IF(error.Failed())) {
+        return error.StealNSResult();
+      }
+
+      rv = prompter->ConfirmFolderUpload(bc, directoryName, &confirmed);
+      NS_ENSURE_SUCCESS(rv, rv);
+      if (!confirmed) {
+        return NS_OK;
+      }
+    }
+
+    RefPtr<Blob> blob = do_QueryObject(tmp);
+    if (blob) {
+      RefPtr<File> file = blob->ToFile();
+      MOZ_ASSERT(file);
+
+      OwningFileOrDirectory* element = newFilesOrDirectories.AppendElement();
+      element->SetAsFile() = file;
+    } else if (tmp) {
+      RefPtr<Directory> directory = static_cast<Directory*>(tmp.get());
+      OwningFileOrDirectory* element = newFilesOrDirectories.AppendElement();
+      element->SetAsDirectory() = directory;
+    }
+  }
+
+  if (newFilesOrDirectories.IsEmpty()) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIFile> lastUsedDir = LastUsedDirectory(newFilesOrDirectories[0]);
+
+  if (lastUsedDir) {
+    HTMLInputElement::gUploadLastDir->StoreLastUsedDirectory(mInput->OwnerDoc(),
+                                                             lastUsedDir);
+  }
+
+  mInput->SetFilesOrDirectories(newFilesOrDirectories, true);
+
+  if (!mInput->GetRelevantGlobal()) {
+    return NS_OK;
+  }
+  RefPtr<DispatchChangeEventCallback> dispatchChangeEventCallback =
+      new DispatchChangeEventCallback(mInput);
+
+  if (StaticPrefs::dom_webkitBlink_dirPicker_enabled() &&
+      mInput->HasAttr(nsGkAtoms::webkitdirectory)) {
+
+    ErrorResult error;
+    GetFilesHelper* helper = mInput->GetOrCreateGetFilesHelper(true, error);
+    if (NS_WARN_IF(error.Failed())) {
+      return error.StealNSResult();
+    }
+
+    helper->AddCallback(dispatchChangeEventCallback);
+    return NS_OK;
+  }
+
+  return dispatchChangeEventCallback->DispatchEvents();
+}
+
+NS_IMPL_ISUPPORTS(HTMLInputElement::nsFilePickerShownCallback,
+                  nsIFilePickerShownCallback)
+
+class nsColorPickerShownCallback final : public nsIColorPickerShownCallback {
+  ~nsColorPickerShownCallback() = default;
+
+ public:
+  nsColorPickerShownCallback(HTMLInputElement* aInput,
+                             nsIColorPicker* aColorPicker)
+      : mInput(aInput), mColorPicker(aColorPicker), mValueChanged(false) {}
+
+  NS_DECL_ISUPPORTS
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  NS_IMETHOD Update(const nsAString& aColor) override;
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  NS_IMETHOD Done(const nsAString& aColor) override;
+
+ private:
+  MOZ_CAN_RUN_SCRIPT
+  nsresult UpdateInternal(const nsAString& aColor, bool aTrustedUpdate);
+
+  RefPtr<HTMLInputElement> mInput;
+  nsCOMPtr<nsIColorPicker> mColorPicker;
+  bool mValueChanged;
+};
+
+nsresult nsColorPickerShownCallback::UpdateInternal(const nsAString& aColor,
+                                                    bool aTrustedUpdate) {
+  bool valueChanged = false;
+  nsAutoString oldValue;
+  if (aTrustedUpdate) {
+    mInput->OwnerDoc()->NotifyUserGestureActivation();
+    valueChanged = true;
+  } else {
+    mInput->GetValue(oldValue, CallerType::System);
+  }
+
+  mInput->SetValue(aColor, CallerType::System, IgnoreErrors());
+
+  if (!aTrustedUpdate) {
+    nsAutoString newValue;
+    mInput->GetValue(newValue, CallerType::System);
+    if (!oldValue.Equals(newValue)) {
+      valueChanged = true;
+    }
+  }
+
+  if (!valueChanged) {
+    return NS_OK;
+  }
+
+  mValueChanged = true;
+  RefPtr<HTMLInputElement> input(mInput);
+  DebugOnly<nsresult> rvIgnored = nsContentUtils::DispatchInputEvent(input);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rvIgnored),
+                       "Failed to dispatch input event");
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsColorPickerShownCallback::Update(const nsAString& aColor) {
+  return UpdateInternal(aColor, true);
+}
+
+NS_IMETHODIMP
+nsColorPickerShownCallback::Done(const nsAString& aColor) {
+  nsresult rv = NS_OK;
+
+  mInput->PickerClosed();
+
+  if (!aColor.IsEmpty()) {
+    UpdateInternal(aColor, false);
+  }
+
+  if (mValueChanged) {
+    mInput->SetUserInteracted(true);
+    rv = nsContentUtils::DispatchTrustedEvent(
+        mInput->OwnerDoc(), static_cast<Element*>(mInput.get()), u"change"_ns,
+        CanBubble::eYes, Cancelable::eNo);
+  }
+
+  return rv;
+}
+
+NS_IMPL_ISUPPORTS(nsColorPickerShownCallback, nsIColorPickerShownCallback)
+
+static bool IsPickerBlocked(Document* aDoc) {
+  if (aDoc->ConsumeTransientUserGestureActivation()) {
+    return false;
+  }
+
+  nsContentUtils::ReportToConsole(nsIScriptError::warningFlag, "DOM"_ns, aDoc,
+                                  PropertiesFile::DOM_PROPERTIES,
+                                  "InputPickerBlockedNoUserActivation");
+  return true;
+}
+
+static Maybe<StyleAbsoluteColor> MaybeComputeColor(Document* aDocument,
+                                                   const nsAString& aValue) {
+  return ServoCSSParser::ComputeAbsoluteColor(
+      aDocument->EnsureStyleSet().RawData(), NS_ConvertUTF16toUTF8(aValue));
+}
+
+static StyleAbsoluteColor MaybeComputeColorOrBlack(Document* aDocument,
+                                                   const nsAString& aValue) {
+  return MaybeComputeColor(aDocument, aValue)
+      .valueOr(StyleAbsoluteColor::BLACK);
+}
+
+static void SerializeColorForHTMLCompatibility(const StyleAbsoluteColor& aColor,
+                                               nsAString& aResult) {
+  nscolor color = aColor.ToColor();
+  aResult.Truncate();
+  aResult.AppendPrintf("#%02x%02x%02x", NS_GET_R(color), NS_GET_G(color),
+                       NS_GET_B(color));
+}
+
+static void ClampColorComponents(StyleAbsoluteColor& aColor) {
+  MOZ_ASSERT(aColor.color_space == StyleColorSpace::Srgb);
+  aColor.components._0 = std::clamp(aColor.components._0, 0.0f, 1.0f);
+  aColor.components._1 = std::clamp(aColor.components._1, 0.0f, 1.0f);
+  aColor.components._2 = std::clamp(aColor.components._2, 0.0f, 1.0f);
+}
+
+static void SerializeColor(const StyleAbsoluteColor& aColor,
+                           StyleColorSpace aTargetColorSpace,
+                           bool aSpecifiedAlpha, nsAString& aResult) {
+  bool htmlCompatible = false;
+
+  StyleAbsoluteColor color = aColor.ToColorSpace(aTargetColorSpace);
+  if (!aSpecifiedAlpha) {
+    color.alpha = 1.0;
+  }
+
+  if (color.color_space == StyleColorSpace::Srgb) {
+    ClampColorComponents(color);
+
+    if (!aSpecifiedAlpha) {
+      htmlCompatible = true;
+    } else {
+      color.flags &= ~StyleColorFlags::IS_LEGACY_SRGB;
+    }
+  }
+
+  if (htmlCompatible) {
+    SerializeColorForHTMLCompatibility(color, aResult);
+    return;
+  }
+  nsAutoCString result;
+  Servo_AbsoluteColor_ToCss(&color, &result);
+  CopyUTF8toUTF16(result, aResult);
+}
+
+nsTArray<nsString> HTMLInputElement::GetColorsFromList() {
+  RefPtr<HTMLDataListElement> dataList = GetListInternal();
+  if (!dataList) {
+    return {};
+  }
+
+  nsTArray<nsString> colors;
+
+  RefPtr<ContentList> options = dataList->Options();
+  uint32_t length = options->Length(true);
+  for (uint32_t i = 0; i < length; ++i) {
+    auto* option = HTMLOptionElement::FromNodeOrNull(options->Item(i, false));
+    if (!option) {
+      continue;
+    }
+
+    nsAutoString value;
+    option->GetValue(value);
+    if (Maybe<StyleAbsoluteColor> result =
+            MaybeComputeColor(OwnerDoc(), value)) {
+      SerializeColor(*result, GetColorSpaceEnum(), Alpha(), value);
+      colors.AppendElement(value);
+    }
+  }
+
+  return colors;
+}
+
+nsresult HTMLInputElement::InitColorPicker() {
+  MOZ_ASSERT(IsMutable());
+
+  if (mPickerRunning) {
+    NS_WARNING("Just one nsIColorPicker is allowed");
+    return NS_ERROR_FAILURE;
+  }
+
+  nsCOMPtr<Document> doc = OwnerDoc();
+
+  RefPtr<BrowsingContext> bc = doc->GetBrowsingContext();
+  if (!bc) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (IsPickerBlocked(doc)) {
+    return NS_OK;
+  }
+
+  if (StaticPrefs::dom_forms_html_color_picker_enabled()) {
+    OpenColorPicker();
+    return NS_OK;
+  }
+
+  nsAutoString title;
+  nsContentUtils::GetLocalizedString(PropertiesFile::FORMS_PROPERTIES,
+                                     "ColorPicker", title);
+
+  nsCOMPtr<nsIColorPicker> colorPicker =
+      do_CreateInstance("@mozilla.org/colorpicker;1");
+  if (!colorPicker) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsAutoString initialValue;
+  GetNonFileValueInternal(initialValue);
+  nsTArray<nsString> colors = GetColorsFromList();
+  nsresult rv = colorPicker->Init(bc, title, initialValue, colors);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsIColorPickerShownCallback> callback =
+      new nsColorPickerShownCallback(this, colorPicker);
+
+  rv = colorPicker->Open(callback);
+  if (NS_SUCCEEDED(rv)) {
+    mPickerRunning = true;
+    SetOpenState(true);
+  }
+
+  return rv;
+}
+
+nsresult HTMLInputElement::InitFilePicker(FilePickerType aType) {
+  MOZ_ASSERT(IsMutable());
+
+  if (mPickerRunning) {
+    NS_WARNING("Just one nsIFilePicker is allowed");
+    return NS_ERROR_FAILURE;
+  }
+
+  nsCOMPtr<Document> doc = OwnerDoc();
+
+  RefPtr<BrowsingContext> bc = doc->GetBrowsingContext();
+  if (!bc) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (IsPickerBlocked(doc)) {
+    return NS_OK;
+  }
+
+  nsAutoString title;
+  nsAutoString okButtonLabel;
+  if (aType == FILE_PICKER_DIRECTORY) {
+    nsContentUtils::GetMaybeLocalizedString(PropertiesFile::FORMS_PROPERTIES,
+                                            "DirectoryUpload", doc, title);
+
+    nsContentUtils::GetMaybeLocalizedString(PropertiesFile::FORMS_PROPERTIES,
+                                            "DirectoryPickerOkButtonLabel", doc,
+                                            okButtonLabel);
+  } else {
+    nsContentUtils::GetMaybeLocalizedString(PropertiesFile::FORMS_PROPERTIES,
+                                            "FileUpload", doc, title);
+  }
+
+  nsCOMPtr<nsIFilePicker> filePicker =
+      do_CreateInstance("@mozilla.org/filepicker;1");
+  if (!filePicker) return NS_ERROR_FAILURE;
+
+  nsIFilePicker::Mode mode;
+
+  if (aType == FILE_PICKER_DIRECTORY) {
+    mode = nsIFilePicker::modeGetFolder;
+  } else if (HasAttr(nsGkAtoms::multiple)) {
+    mode = nsIFilePicker::modeOpenMultiple;
+  } else {
+    mode = nsIFilePicker::modeOpen;
+  }
+
+  nsresult rv = filePicker->Init(bc, title, mode, GetRelevantGlobal());
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (!okButtonLabel.IsEmpty()) {
+    filePicker->SetOkButtonLabel(okButtonLabel);
+  }
+
+  if (HasAttr(nsGkAtoms::accept) && aType != FILE_PICKER_DIRECTORY) {
+    SetFilePickerFiltersFromAccept(filePicker);
+
+    if (StaticPrefs::dom_capture_enabled()) {
+      if (const nsAttrValue* captureVal = GetParsedAttr(nsGkAtoms::capture)) {
+        filePicker->SetCapture(static_cast<nsIFilePicker::CaptureTarget>(
+            captureVal->GetEnumValue()));
+      }
+    }
+  } else {
+    filePicker->AppendFilters(nsIFilePicker::filterAll);
+  }
+
+  nsAutoString defaultName;
+
+  const nsTArray<OwningFileOrDirectory>& oldFiles =
+      GetFilesOrDirectoriesInternal();
+
+  nsCOMPtr<nsIFilePickerShownCallback> callback =
+      new HTMLInputElement::nsFilePickerShownCallback(this, filePicker);
+
+  nsCOMPtr<nsIObserverService> obs = services::GetObserverService();
+  if (obs) {
+    obs->NotifyObservers(ToSupports(this), "file-input-picker-opening",
+                         nullptr);
+  }
+
+  if (!oldFiles.IsEmpty() && aType != FILE_PICKER_DIRECTORY) {
+    nsAutoString path;
+
+    nsCOMPtr<nsIFile> parentFile = LastUsedDirectory(oldFiles[0]);
+    if (parentFile) {
+      filePicker->SetDisplayDirectory(parentFile);
+    }
+
+    if (oldFiles.Length() == 1) {
+      nsAutoString leafName;
+      GetDOMFileOrDirectoryName(oldFiles[0], leafName);
+
+      if (!leafName.IsEmpty()) {
+        filePicker->SetDefaultString(leafName);
+      }
+    }
+
+    rv = filePicker->Open(callback);
+    if (NS_SUCCEEDED(rv)) {
+      mPickerRunning = true;
+      SetOpenState(true);
+    }
+
+    return rv;
+  }
+
+  HTMLInputElement::gUploadLastDir->FetchDirectoryAndDisplayPicker(
+      doc, filePicker, callback);
+  mPickerRunning = true;
+  SetOpenState(true);
+  return NS_OK;
+}
+
+#define CPS_PREF_NAME u"browser.upload.lastDir"_ns
+
+NS_IMPL_ISUPPORTS(UploadLastDir, nsIObserver, nsISupportsWeakReference)
+
+void HTMLInputElement::InitUploadLastDir() {
+  gUploadLastDir = new UploadLastDir();
+  NS_ADDREF(gUploadLastDir);
+
+  nsCOMPtr<nsIObserverService> observerService = services::GetObserverService();
+  if (observerService && gUploadLastDir) {
+    observerService->AddObserver(gUploadLastDir,
+                                 "browser:purge-session-history", true);
+  }
+}
+
+void HTMLInputElement::DestroyUploadLastDir() { NS_IF_RELEASE(gUploadLastDir); }
+
+nsresult UploadLastDir::FetchDirectoryAndDisplayPicker(
+    Document* aDoc, nsIFilePicker* aFilePicker,
+    nsIFilePickerShownCallback* aFpCallback) {
+  MOZ_ASSERT(aDoc, "aDoc is null");
+  MOZ_ASSERT(aFilePicker, "aFilePicker is null");
+  MOZ_ASSERT(aFpCallback, "aFpCallback is null");
+
+  nsIURI* docURI = aDoc->GetDocumentURI();
+  MOZ_ASSERT(docURI, "docURI is null");
+
+  nsCOMPtr<nsILoadContext> loadContext = aDoc->GetLoadContext();
+  nsCOMPtr<nsIContentPrefCallback2> prefCallback =
+      new UploadLastDir::ContentPrefCallback(aFilePicker, aFpCallback);
+
+  nsCOMPtr<nsIContentPrefService2> contentPrefService =
+      do_GetService(NS_CONTENT_PREF_SERVICE_CONTRACTID);
+  if (!contentPrefService) {
+    prefCallback->HandleCompletion(nsIContentPrefCallback2::COMPLETE_ERROR);
+    return NS_OK;
+  }
+
+  nsAutoCString cstrSpec;
+  docURI->GetSpec(cstrSpec);
+  NS_ConvertUTF8toUTF16 spec(cstrSpec);
+
+  contentPrefService->GetByDomainAndName(spec, CPS_PREF_NAME, loadContext,
+                                         prefCallback);
+  return NS_OK;
+}
+
+nsresult UploadLastDir::StoreLastUsedDirectory(Document* aDoc, nsIFile* aDir) {
+  MOZ_ASSERT(aDoc, "aDoc is null");
+  if (!aDir) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIURI> docURI = aDoc->GetDocumentURI();
+  MOZ_ASSERT(docURI, "docURI is null");
+
+  nsCOMPtr<nsIContentPrefService2> contentPrefService =
+      do_GetService(NS_CONTENT_PREF_SERVICE_CONTRACTID);
+  if (!contentPrefService) return NS_ERROR_NOT_AVAILABLE;
+
+  nsAutoCString cstrSpec;
+  docURI->GetSpec(cstrSpec);
+  NS_ConvertUTF8toUTF16 spec(cstrSpec);
+
+  nsString unicodePath;
+  aDir->GetPath(unicodePath);
+  if (unicodePath.IsEmpty())  
+    return NS_OK;
+  RefPtr<nsVariantCC> prefValue = new nsVariantCC();
+  prefValue->SetAsAString(unicodePath);
+
+  nsCOMPtr<nsILoadContext> loadContext = aDoc->GetLoadContext();
+  return contentPrefService->Set(spec, CPS_PREF_NAME, prefValue, loadContext,
+                                 nullptr);
+}
+
+NS_IMETHODIMP
+UploadLastDir::Observe(nsISupports* aSubject, char const* aTopic,
+                       char16_t const* aData) {
+  if (strcmp(aTopic, "browser:purge-session-history") == 0) {
+    nsCOMPtr<nsIContentPrefService2> contentPrefService =
+        do_GetService(NS_CONTENT_PREF_SERVICE_CONTRACTID);
+    if (contentPrefService)
+      contentPrefService->RemoveByName(CPS_PREF_NAME, nullptr, nullptr);
+  }
+  return NS_OK;
+}
+
+
+HTMLInputElement::HTMLInputElement(already_AddRefed<dom::NodeInfo> aNodeInfo,
+                                   FromParser aFromParser, FromClone aFromClone)
+    : TextControlElement(std::move(aNodeInfo), aFromParser,
+                         FormControlType(kInputDefaultType->value)),
+      mAutocompleteAttrState(nsContentUtils::eAutocompleteAttrState_Unknown),
+      mAutocompleteInfoState(nsContentUtils::eAutocompleteAttrState_Unknown),
+      mDisabledChanged(false),
+      mValueChanged(false),
+      mUserInteracted(false),
+      mLastValueChangeWasInteractive(false),
+      mCheckedChanged(false),
+      mChecked(false),
+      mShouldInitChecked(false),
+      mDoneCreating(aFromParser == NOT_FROM_PARSER &&
+                    aFromClone == FromClone::No),
+      mInInternalActivate(false),
+      mCheckedIsToggled(false),
+      mIndeterminate(false),
+      mInhibitRestoration(aFromParser & FROM_PARSER_FRAGMENT),
+      mHasRange(false),
+      mIsDraggingRange(false),
+      mNumberControlSpinnerIsSpinning(false),
+      mNumberControlSpinnerSpinsUp(false),
+      mPickerRunning(false),
+      mHasBeenTypePassword(false),
+      mHasPatternAttribute(false),
+      mUserChangedSinceFocus(false),
+      mIsUserInteracting(false),
+      mRadioGroupContainer(nullptr) {
+  static_assert(sizeof(HTMLInputElement) <= 512,
+                "Keep the size of HTMLInputElement under 512 to avoid "
+                "performance regression!");
+
+  mInputData.mState = nullptr;
+
+  void* memory = mInputTypeMem;
+  mInputType = InputType::Create(this, mType, memory);
+
+  if (!gUploadLastDir) HTMLInputElement::InitUploadLastDir();
+
+  AddStatesSilently(ElementState::ENABLED | ElementState::OPTIONAL_ |
+                    ElementState::VALID | ElementState::VALUE_EMPTY |
+                    ElementState::READWRITE);
+  RemoveStatesSilently(ElementState::READONLY);
+  UpdateApzAwareFlag();
+}
+
+HTMLInputElement::~HTMLInputElement() {
+  if (mNumberControlSpinnerIsSpinning) {
+    StopNumberControlSpinnerSpin(eDisallowDispatchingEvents);
+  }
+  nsImageLoadingContent::Destroy();
+  FreeData(TextControlStateDisposition::Destroy);
+}
+
+void HTMLInputElement::FreeData(TextControlStateDisposition aStateDisposition) {
+  if (!IsSingleLineTextControl(false)) {
+    free(mInputData.mValue);
+    mInputData.mValue = nullptr;
+  } else if (mInputData.mState &&
+             aStateDisposition == TextControlStateDisposition::Destroy) {
+    mInputData.mState->Destroy();
+    mInputData.mState = nullptr;
+  }
+
+  if (mInputType) {
+    mInputType->DropReference();
+    mInputType = nullptr;
+  }
+}
+
+void HTMLInputElement::EnsureEditorState() {
+  MOZ_ASSERT(IsSingleLineTextControl(false));
+  if (!mInputData.mState) {
+    mInputData.mState = TextControlState::Construct(this);
+  }
+}
+
+TextControlState* HTMLInputElement::GetEditorState() const {
+  if (!IsSingleLineTextControl(false)) {
+    return nullptr;
+  }
+
+  const_cast<HTMLInputElement*>(this)->EnsureEditorState();
+
+  MOZ_ASSERT(mInputData.mState,
+             "Single line text controls need to have a state"
+             " associated with them");
+
+  return mInputData.mState;
+}
+
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(HTMLInputElement)
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(HTMLInputElement,
+                                                  TextControlElement)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mValidity)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mControllers)
+  if (tmp->IsSingleLineTextControl(false) && tmp->mInputData.mState) {
+    tmp->mInputData.mState->Traverse(cb);
+  }
+
+  if (tmp->mFileData) {
+    tmp->mFileData->Traverse(cb);
+  }
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_INHERITED(HTMLInputElement,
+                                                TextControlElement)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mValidity)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mControllers)
+  if (tmp->IsSingleLineTextControl(false) && tmp->mInputData.mState) {
+    tmp->mInputData.mState->Unlink();
+  }
+
+  if (tmp->mFileData) {
+    tmp->mFileData->Unlink();
+  }
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_ISUPPORTS_CYCLE_COLLECTION_INHERITED(HTMLInputElement,
+                                             TextControlElement,
+                                             imgINotificationObserver,
+                                             nsIImageLoadingContent,
+                                             nsIConstraintValidation)
+
+
+nsresult HTMLInputElement::Clone(dom::NodeInfo* aNodeInfo,
+                                 nsINode** aResult) const {
+  *aResult = nullptr;
+
+  RefPtr<HTMLInputElement> it = new (aNodeInfo->NodeInfoManager())
+      HTMLInputElement(do_AddRef(aNodeInfo), NOT_FROM_PARSER, FromClone::Yes);
+
+  nsresult rv = const_cast<HTMLInputElement*>(this)->CopyInnerTo(it);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  switch (GetValueMode()) {
+    case VALUE_MODE_VALUE:
+      if (mValueChanged) {
+        nsAutoString value;
+        GetNonFileValueInternal(value);
+        if (NS_WARN_IF(
+                NS_FAILED(rv = it->SetValueInternal(
+                              value, {ValueSetterOption::SetValueChanged})))) {
+          return rv;
+        }
+      }
+      break;
+    case VALUE_MODE_FILENAME:
+      if (it->OwnerDoc()->IsStaticDocument()) {
+        GetDisplayFileName(it->mFileData->mStaticDocFileList);
+      } else {
+        it->mFileData->ClearGetFilesHelpers();
+        it->mFileData->mFilesOrDirectories.Clear();
+        it->mFileData->mFilesOrDirectories.AppendElements(
+            mFileData->mFilesOrDirectories);
+      }
+      break;
+    case VALUE_MODE_DEFAULT_ON:
+    case VALUE_MODE_DEFAULT:
+      break;
+  }
+
+  if (mCheckedChanged) {
+    it->DoSetChecked(mChecked,  false,
+                      true);
+    it->mShouldInitChecked = false;
+  }
+
+  it->mIndeterminate = mIndeterminate;
+
+  it->DoneCreatingElement();
+
+  it->SetLastValueChangeWasInteractive(mLastValueChangeWasInteractive);
+  it.forget(aResult);
+  return NS_OK;
+}
+
+void HTMLInputElement::BeforeSetAttr(int32_t aNameSpaceID, nsAtom* aName,
+                                     const nsAttrValue* aValue, bool aNotify) {
+  if (aNameSpaceID == kNameSpaceID_None) {
+    if (aNotify && aName == nsGkAtoms::disabled) {
+      mDisabledChanged = true;
+    }
+
+    if (mType == FormControlType::InputRadio) {
+      if ((aName == nsGkAtoms::name || (aName == nsGkAtoms::type && !mForm)) &&
+          (mForm || mDoneCreating)) {
+        RemoveFromRadioGroup();
+      } else if (aName == nsGkAtoms::required) {
+        auto* container = GetCurrentRadioGroupContainer();
+
+        if (container && ((aValue && !HasAttr(aNameSpaceID, aName)) ||
+                          (!aValue && HasAttr(aNameSpaceID, aName)))) {
+          nsAutoString name;
+          GetAttr(nsGkAtoms::name, name);
+          container->RadioRequiredWillChange(name, !!aValue);
+        }
+      }
+    }
+  }
+
+  return nsGenericHTMLFormControlElementWithState::BeforeSetAttr(
+      aNameSpaceID, aName, aValue, aNotify);
+}
+
+void HTMLInputElement::AfterSetAttr(int32_t aNameSpaceID, nsAtom* aName,
+                                    const nsAttrValue* aValue,
+                                    const nsAttrValue* aOldValue,
+                                    nsIPrincipal* aSubjectPrincipal,
+                                    bool aNotify) {
+  if (aNameSpaceID == kNameSpaceID_None) {
+    bool needValidityUpdate = false;
+    if (aName == nsGkAtoms::value) {
+      if (!mValueChanged && GetValueMode() == VALUE_MODE_VALUE) {
+        SetDefaultValueAsValue();
+      } else if (GetValueMode() == VALUE_MODE_DEFAULT) {
+        ResetDirFormAssociatedElement(this, aNotify, HasDirAuto());
+      }
+      UpdateStepMismatchValidityState();
+      needValidityUpdate = true;
+    } else if (aName == nsGkAtoms::checked) {
+      if (IsRadioOrCheckbox()) {
+        SetStates(ElementState::DEFAULT, !!aValue, aNotify);
+      }
+      if (!mCheckedChanged) {
+        if (!mDoneCreating) {
+          mShouldInitChecked = true;
+        } else {
+          DoSetChecked(!!aValue, aNotify,  false);
+        }
+      }
+      needValidityUpdate = true;
+    } else if (aName == nsGkAtoms::type) {
+      FormControlType newType;
+      if (!aValue) {
+        newType = FormControlType(kInputDefaultType->value);
+      } else {
+        newType = FormControlType(aValue->GetEnumValue());
+      }
+      if (newType != mType) {
+        HandleTypeChange(newType, aNotify);
+        needValidityUpdate = true;
+      }
+    } else if (aName == nsGkAtoms::required || aName == nsGkAtoms::disabled ||
+               aName == nsGkAtoms::readonly) {
+      if (aName == nsGkAtoms::disabled) {
+        UpdateDisabledState(aNotify);
+      }
+
+      if (aName == nsGkAtoms::required && DoesRequiredApply()) {
+        UpdateRequiredState(!!aValue, aNotify);
+      }
+
+      if (aName == nsGkAtoms::readonly && !!aValue != !!aOldValue) {
+        UpdateReadOnlyState(aNotify);
+      }
+
+      UpdateValueMissingValidityState();
+
+      if (aName == nsGkAtoms::readonly || aName == nsGkAtoms::disabled) {
+        UpdateBarredFromConstraintValidation();
+      }
+      needValidityUpdate = true;
+    } else if (aName == nsGkAtoms::src) {
+      nsAttrValueOrString value(aValue);
+      mSrcTriggeringPrincipal = nsContentUtils::GetAttrTriggeringPrincipal(
+          this, value.String(), aSubjectPrincipal);
+      if (aNotify && mType == FormControlType::InputImage) {
+        if (aValue) {
+          mUseUrgentStartForChannel = UserActivation::IsHandlingUserInput();
+
+          LoadImage(value.String(), true, aNotify, eImageLoadType_Normal,
+                    mSrcTriggeringPrincipal);
+        } else {
+          CancelImageRequests(aNotify);
+        }
+      }
+    } else if (aName == nsGkAtoms::maxlength) {
+      UpdateTooLongValidityState();
+      if (auto* editor = GetExtantTextEditor()) {
+        editor->SetMaxTextLength(UsedMaxLength());
+      }
+      needValidityUpdate = true;
+    } else if (aName == nsGkAtoms::minlength) {
+      UpdateTooShortValidityState();
+      needValidityUpdate = true;
+    } else if (aName == nsGkAtoms::pattern) {
+      mHasPatternAttribute = !!aValue;
+
+      if (mDoneCreating) {
+        UpdatePatternMismatchValidityState();
+      }
+      needValidityUpdate = true;
+    } else if (aName == nsGkAtoms::multiple) {
+      UpdateTypeMismatchValidityState();
+      needValidityUpdate = true;
+    } else if (aName == nsGkAtoms::max) {
+      UpdateHasRange(aNotify);
+      mInputType->MinMaxStepAttrChanged();
+      UpdateRangeOverflowValidityState();
+      needValidityUpdate = true;
+      MOZ_ASSERT(!mDoneCreating || mType != FormControlType::InputRange ||
+                     !GetValidityState(VALIDITY_STATE_RANGE_UNDERFLOW),
+                 "HTML5 spec does not allow underflow for type=range");
+    } else if (aName == nsGkAtoms::min) {
+      UpdateHasRange(aNotify);
+      mInputType->MinMaxStepAttrChanged();
+      UpdateRangeUnderflowValidityState();
+      UpdateStepMismatchValidityState();
+      needValidityUpdate = true;
+      MOZ_ASSERT(!mDoneCreating || mType != FormControlType::InputRange ||
+                     !GetValidityState(VALIDITY_STATE_RANGE_UNDERFLOW),
+                 "HTML5 spec does not allow underflow for type=range");
+    } else if (aName == nsGkAtoms::step) {
+      mInputType->MinMaxStepAttrChanged();
+      UpdateStepMismatchValidityState();
+      needValidityUpdate = true;
+      MOZ_ASSERT(!mDoneCreating || mType != FormControlType::InputRange ||
+                     !GetValidityState(VALIDITY_STATE_RANGE_UNDERFLOW),
+                 "HTML5 spec does not allow underflow for type=range");
+    } else if (aName == nsGkAtoms::dir && aValue &&
+               aValue->Equals(nsGkAtoms::_auto, eIgnoreCase)) {
+      ResetDirFormAssociatedElement(this, aNotify, true);
+    } else if (aName == nsGkAtoms::lang) {
+      if (mType == FormControlType::InputNumber) {
+        UpdateValidityState();
+        needValidityUpdate = true;
+      }
+    } else if (aName == nsGkAtoms::autocomplete) {
+      mAutocompleteAttrState = nsContentUtils::eAutocompleteAttrState_Unknown;
+      mAutocompleteInfoState = nsContentUtils::eAutocompleteAttrState_Unknown;
+    } else if (aName == nsGkAtoms::placeholder) {
+      UpdatePlaceholder(aOldValue, aValue);
+      UpdatePlaceholderShownState();
+      needValidityUpdate = true;
+    } else if (aName == nsGkAtoms::colorspace || aName == nsGkAtoms::alpha) {
+      UpdateColor();
+    } else if (aName == nsGkAtoms::webkitdirectory) {
+
+    }
+
+    if (mType == FormControlType::InputRadio) {
+      if ((aName == nsGkAtoms::name || (aName == nsGkAtoms::type && !mForm)) &&
+          (mForm || mDoneCreating)) {
+        AddToRadioGroup();
+        UpdateValueMissingValidityStateForRadio(false);
+        needValidityUpdate = true;
+      }
+    } else if (CreatesDateTimeWidget()) {
+      if (aName == nsGkAtoms::value || aName == nsGkAtoms::readonly ||
+          aName == nsGkAtoms::tabindex || aName == nsGkAtoms::required ||
+          aName == nsGkAtoms::disabled) {
+        if (Element* dateTimeBoxElement = GetDateTimeBoxElement()) {
+          AsyncEventDispatcher::RunDOMEventWhenSafe(
+              *dateTimeBoxElement,
+              aName == nsGkAtoms::value ? u"MozDateTimeValueChanged"_ns
+                                        : u"MozDateTimeAttributeChanged"_ns,
+              CanBubble::eNo, ChromeOnlyDispatch::eNo);
+        }
+      }
+    }
+    if (needValidityUpdate) {
+      UpdateValidityElementStates(aNotify);
+    }
+  }
+
+  return nsGenericHTMLFormControlElementWithState::AfterSetAttr(
+      aNameSpaceID, aName, aValue, aOldValue, aSubjectPrincipal, aNotify);
+}
+
+void HTMLInputElement::BeforeSetForm(HTMLFormElement* aForm, bool aBindToTree) {
+  if (mType == FormControlType::InputRadio && !aBindToTree) {
+    RemoveFromRadioGroup();
+  }
+
+}
+
+void HTMLInputElement::AfterClearForm(bool aUnbindOrDelete) {
+  MOZ_ASSERT(!mForm);
+
+  if (mType == FormControlType::InputRadio && !aUnbindOrDelete &&
+      !GetCurrentRadioGroupContainer()) {
+    AddToRadioGroup();
+    UpdateValueMissingValidityStateForRadio(false);
+  }
+}
+
+void HTMLInputElement::ResultForDialogSubmit(nsAString& aResult) {
+  if (mType == FormControlType::InputImage) {
+    const auto* lastClickedPoint =
+        static_cast<CSSIntPoint*>(GetProperty(nsGkAtoms::imageClickedPoint));
+    int32_t x, y;
+    if (lastClickedPoint) {
+      x = lastClickedPoint->x;
+      y = lastClickedPoint->y;
+    } else {
+      x = y = 0;
+    }
+    aResult.AppendInt(x);
+    aResult.AppendLiteral(",");
+    aResult.AppendInt(y);
+  } else {
+    GetAttr(nsGkAtoms::value, aResult);
+  }
+}
+
+bool HTMLInputElement::Alpha() const {
+  if (!StaticPrefs::dom_forms_alpha_enabled()) {
+    return false;
+  }
+  return HasAttr(nsGkAtoms::alpha);
+}
+
+void HTMLInputElement::GetAutocomplete(nsAString& aValue) {
+  if (!DoesAutocompleteApply()) {
+    return;
+  }
+
+  aValue.Truncate();
+  const nsAttrValue* attributeVal = GetParsedAttr(nsGkAtoms::autocomplete);
+
+  mAutocompleteAttrState = nsContentUtils::SerializeAutocompleteAttribute(
+      attributeVal, aValue, mAutocompleteAttrState);
+}
+
+void HTMLInputElement::GetAutocompleteInfo(Nullable<AutocompleteInfo>& aInfo) {
+  if (!DoesAutocompleteApply()) {
+    aInfo.SetNull();
+    return;
+  }
+
+  const nsAttrValue* attributeVal = GetParsedAttr(nsGkAtoms::autocomplete);
+  mAutocompleteInfoState = nsContentUtils::SerializeAutocompleteAttribute(
+      attributeVal, aInfo.SetValue(), mAutocompleteInfoState, true);
+}
+
+void HTMLInputElement::GetCapture(nsAString& aValue) {
+  GetEnumAttr(nsGkAtoms::capture, kCaptureDefault->tag, aValue);
+}
+
+void HTMLInputElement::GetColorSpace(nsAString& aValue) const {
+  if (!StaticPrefs::dom_forms_colorspace_enabled()) {
+    aValue.Truncate();
+    aValue.AppendLiteral("limited-srgb");
+    return;
+  }
+  GetEnumAttr(nsGkAtoms::colorspace, kColorSpaceDefault->tag, aValue);
+}
+
+StyleColorSpace HTMLInputElement::GetColorSpaceEnum() const {
+  if (!StaticPrefs::dom_forms_colorspace_enabled()) {
+    return StyleColorSpace::Srgb;
+  }
+  if (const nsAttrValue* captureVal = GetParsedAttr(nsGkAtoms::colorspace)) {
+    return static_cast<StyleColorSpace>(captureVal->GetEnumValue());
+  }
+  return StyleColorSpace::Srgb;
+}
+
+void HTMLInputElement::GetFormEnctype(nsAString& aValue) {
+  GetEnumAttr(nsGkAtoms::formenctype, "", kFormDefaultEnctype->tag, aValue);
+}
+
+void HTMLInputElement::GetFormMethod(nsAString& aValue) {
+  GetEnumAttr(nsGkAtoms::formmethod, "", kFormDefaultMethod->tag, aValue);
+}
+
+void HTMLInputElement::GetType(nsAString& aValue) const {
+  GetEnumAttr(nsGkAtoms::type, kInputDefaultType->tag, aValue);
+}
+
+int32_t HTMLInputElement::TabIndexDefault() { return 0; }
+
+uint32_t HTMLInputElement::Height() {
+  if (mType != FormControlType::InputImage) {
+    return 0;
+  }
+  return GetWidthHeightForImage().height;
+}
+
+void HTMLInputElement::SetIndeterminateInternal(bool aValue,
+                                                bool aShouldInvalidate) {
+  mIndeterminate = aValue;
+  if (mType != FormControlType::InputCheckbox) {
+    return;
+  }
+
+  SetStates(ElementState::INDETERMINATE, aValue);
+
+  if (aShouldInvalidate) {
+    if (nsIFrame* frame = GetPrimaryFrame()) {
+      frame->InvalidateFrameSubtree();
+    }
+  }
+}
+
+void HTMLInputElement::SetIndeterminate(bool aValue) {
+  SetIndeterminateInternal(aValue, true);
+}
+
+uint32_t HTMLInputElement::Width() {
+  if (mType != FormControlType::InputImage) {
+    return 0;
+  }
+  return GetWidthHeightForImage().width;
+}
+
+bool HTMLInputElement::SanitizesOnValueGetter() const {
+  return mType == FormControlType::InputEmail ||
+         mType == FormControlType::InputNumber || IsDateTimeInputType(mType);
+}
+
+void HTMLInputElement::GetValue(nsAString& aValue, CallerType aCallerType) {
+  GetValueInternal(aValue, aCallerType);
+
+  if (SanitizesOnValueGetter()) {
+    SanitizeValue(aValue, SanitizationKind::ForValueGetter);
+  }
+}
+
+void HTMLInputElement::GetValueInternal(nsAString& aValue,
+                                        CallerType aCallerType) const {
+  if (mType != FormControlType::InputFile) {
+    GetNonFileValueInternal(aValue);
+    return;
+  }
+
+  if (aCallerType == CallerType::System) {
+    aValue.Assign(mFileData->mFirstFilePath);
+    return;
+  }
+
+  if (mFileData->mFilesOrDirectories.IsEmpty()) {
+    aValue.Truncate();
+    return;
+  }
+
+  nsAutoString file;
+  GetDOMFileOrDirectoryName(mFileData->mFilesOrDirectories[0], file);
+  if (file.IsEmpty()) {
+    aValue.Truncate();
+    return;
+  }
+
+  aValue.AssignLiteral("C:\\fakepath\\");
+  aValue.Append(file);
+}
+
+void HTMLInputElement::GetNonFileValueInternal(nsAString& aValue) const {
+  switch (GetValueMode()) {
+    case VALUE_MODE_VALUE:
+      if (IsSingleLineTextControl(false)) {
+        if (mInputData.mState) {
+          mInputData.mState->GetValue(aValue,  false);
+        } else {
+          aValue.Truncate();
+        }
+      } else if (!aValue.Assign(mInputData.mValue, fallible)) {
+        aValue.Truncate();
+      }
+      return;
+
+    case VALUE_MODE_FILENAME:
+      MOZ_ASSERT_UNREACHABLE("Someone screwed up here");
+      aValue.Truncate();
+      return;
+
+    case VALUE_MODE_DEFAULT:
+      GetAttr(nsGkAtoms::value, aValue);
+      return;
+
+    case VALUE_MODE_DEFAULT_ON:
+      if (!GetAttr(nsGkAtoms::value, aValue)) {
+        aValue.AssignLiteral("on");
+      }
+      return;
+  }
+}
+
+void HTMLInputElement::ClearFiles(bool aSetValueChanged) {
+  nsTArray<OwningFileOrDirectory> data;
+  SetFilesOrDirectories(data, aSetValueChanged);
+}
+
+int32_t HTMLInputElement::MonthsSinceJan1970(uint32_t aYear,
+                                             uint32_t aMonth) const {
+  return (aYear - 1970) * 12 + aMonth - 1;
+}
+
+Decimal HTMLInputElement::StringToDecimal(const nsAString& aValue) {
+  auto d = nsContentUtils::ParseHTMLFloatingPointNumber(aValue);
+  return d ? Decimal::fromDouble(*d) : Decimal::nan();
+}
+
+Decimal HTMLInputElement::GetValueAsDecimal() const {
+  nsAutoString stringValue;
+  GetNonFileValueInternal(stringValue);
+  Decimal result =
+      mInputType->ConvertStringToNumber(stringValue, InputType::Localized::Yes)
+          .mResult;
+  return result.isFinite() ? result : Decimal::nan();
+}
+
+void HTMLInputElement::SetValue(const nsAString& aValue, CallerType aCallerType,
+                                ErrorResult& aRv) {
+  if (mType == FormControlType::InputFile) {
+    if (!aValue.IsEmpty()) {
+      if (aCallerType != CallerType::System) {
+        aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+        return;
+      }
+      Sequence<nsString> list;
+      if (!list.AppendElement(aValue, fallible)) {
+        aRv.Throw(NS_ERROR_OUT_OF_MEMORY);
+        return;
+      }
+
+      MozSetFileNameArray(list, aRv);
+      return;
+    }
+    ClearFiles(true);
+  } else {
+    if (MayFireChangeOnBlur()) {
+      nsAutoString currentValue;
+      GetNonFileValueInternal(currentValue);
+
+      nsresult rv = SetValueInternal(
+          aValue, &currentValue,
+          {ValueSetterOption::ByContentAPI, ValueSetterOption::SetValueChanged,
+           ValueSetterOption::MoveCursorToEndIfValueChanged});
+      if (NS_FAILED(rv)) {
+        aRv.Throw(rv);
+        return;
+      }
+
+      if (!State().HasState(ElementState::FOCUS) && !mIsUserInteracting) {
+        GetValue(mFocusedValue, aCallerType);
+      }
+    } else {
+      nsresult rv = SetValueInternal(
+          aValue,
+          {ValueSetterOption::ByContentAPI, ValueSetterOption::SetValueChanged,
+           ValueSetterOption::MoveCursorToEndIfValueChanged});
+      if (NS_FAILED(rv)) {
+        aRv.Throw(rv);
+        return;
+      }
+    }
+  }
+}
+
+Element* HTMLInputElement::GetListForBindings() const {
+  return RetargetReferenceTargetForBindings(GetListInternal());
+}
+
+HTMLDataListElement* HTMLInputElement::GetListInternal() const {
+  nsAutoString dataListId;
+  GetAttr(nsGkAtoms::list, dataListId);
+  if (dataListId.IsEmpty()) {
+    return nullptr;
+  }
+
+  DocumentOrShadowRoot* docOrShadow = GetUncomposedDocOrConnectedShadowRoot();
+  if (!docOrShadow) {
+    return nullptr;
+  }
+
+  Element* target = docOrShadow->GetElementById(dataListId);
+  Element* list = target ? target->ResolveReferenceTarget() : nullptr;
+  return HTMLDataListElement::FromNodeOrNull(list);
+}
+
+void HTMLInputElement::SetValue(Decimal aValue, CallerType aCallerType) {
+  MOZ_ASSERT(!aValue.isInfinity(), "aValue must not be Infinity!");
+
+  if (aValue.isNaN()) {
+    SetValue(u""_ns, aCallerType, IgnoreErrors());
+    return;
+  }
+
+  nsAutoString value;
+  mInputType->ConvertNumberToString(aValue, InputType::Localized::No, value);
+  SetValue(value, aCallerType, IgnoreErrors());
+}
+
+void HTMLInputElement::GetValueAsDate(JSContext* aCx,
+                                      JS::MutableHandle<JSObject*> aObject,
+                                      ErrorResult& aRv) {
+  aObject.set(nullptr);
+  if (!IsDateTimeInputType(mType) ||
+      mType == FormControlType::InputDatetimeLocal) {
+    return;
+  }
+
+  Maybe<JS::ClippedTime> time;
+
+  switch (mType) {
+    case FormControlType::InputDate: {
+      uint32_t year, month, day;
+      nsAutoString value;
+      GetNonFileValueInternal(value);
+      if (!ParseDate(value, &year, &month, &day)) {
+        return;
+      }
+
+      time.emplace(JS::TimeClip(JS::MakeDate(year, month - 1, day)));
+      break;
+    }
+    case FormControlType::InputTime: {
+      uint32_t millisecond;
+      nsAutoString value;
+      GetNonFileValueInternal(value);
+      if (!ParseTime(value, &millisecond)) {
+        return;
+      }
+
+      time.emplace(JS::TimeClip(int64_t(millisecond)));
+      MOZ_ASSERT(time->toDouble() == millisecond,
+                 "HTML times are restricted to the day after the epoch and "
+                 "never clip");
+      break;
+    }
+    case FormControlType::InputMonth: {
+      uint32_t year, month;
+      nsAutoString value;
+      GetNonFileValueInternal(value);
+      if (!ParseMonth(value, &year, &month)) {
+        return;
+      }
+
+      time.emplace(JS::TimeClip(JS::MakeDate(year, month - 1, 1)));
+      break;
+    }
+    case FormControlType::InputWeek: {
+      uint32_t year, week;
+      nsAutoString value;
+      GetNonFileValueInternal(value);
+      if (!ParseWeek(value, &year, &week)) {
+        return;
+      }
+
+      double days = DaysSinceEpochFromWeek(year, week);
+      time.emplace(JS::TimeClip(days * kMsPerDay));
+
+      break;
+    }
+    default:
+      break;
+  }
+
+  if (time) {
+    aObject.set(JS::NewDateObject(aCx, *time));
+    if (!aObject) {
+      aRv.NoteJSContextException(aCx);
+    }
+    return;
+  }
+
+  MOZ_ASSERT(false, "Unrecognized input type");
+  aRv.Throw(NS_ERROR_UNEXPECTED);
+}
+
+void HTMLInputElement::SetValueAsDate(JSContext* aCx,
+                                      JS::Handle<JSObject*> aObj,
+                                      ErrorResult& aRv) {
+  if (!IsDateTimeInputType(mType) ||
+      mType == FormControlType::InputDatetimeLocal) {
+    aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+    return;
+  }
+
+  if (aObj) {
+    bool isDate;
+    if (!JS::ObjectIsDate(aCx, aObj, &isDate)) {
+      aRv.NoteJSContextException(aCx);
+      return;
+    }
+    if (!isDate) {
+      aRv.ThrowTypeError("Value being assigned is not a date.");
+      return;
+    }
+  }
+
+  double milliseconds;
+  if (aObj) {
+    if (!js::DateGetMsecSinceEpoch(aCx, aObj, &milliseconds)) {
+      aRv.NoteJSContextException(aCx);
+      return;
+    }
+  } else {
+    milliseconds = UnspecifiedNaN<double>();
+  }
+
+  if (std::isnan(milliseconds)) {
+    SetValue(u""_ns, CallerType::NonSystem, aRv);
+    return;
+  }
+
+  if (mType != FormControlType::InputMonth) {
+    SetValue(Decimal::fromDouble(milliseconds), CallerType::NonSystem);
+    return;
+  }
+
+  double year = JS::YearFromTime(milliseconds);
+  double month = JS::MonthFromTime(milliseconds);
+
+  if (std::isnan(year) || std::isnan(month)) {
+    SetValue(u""_ns, CallerType::NonSystem, aRv);
+    return;
+  }
+
+  int32_t months = MonthsSinceJan1970(year, month + 1);
+  SetValue(Decimal(int32_t(months)), CallerType::NonSystem);
+}
+
+void HTMLInputElement::SetValueAsNumber(double aValueAsNumber,
+                                        ErrorResult& aRv) {
+  if (std::isinf(aValueAsNumber)) {
+    aRv.ThrowTypeError("Value being assigned is infinite.");
+    return;
+  }
+
+  if (!DoesValueAsNumberApply()) {
+    aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+    return;
+  }
+
+  SetValue(Decimal::fromDouble(aValueAsNumber), CallerType::NonSystem);
+}
+
+Decimal HTMLInputElement::GetMinimum() const {
+  MOZ_ASSERT(
+      DoesValueAsNumberApply(),
+      "GetMinimum() should only be used for types that allow .valueAsNumber");
+
+  Decimal defaultMinimum =
+      mType == FormControlType::InputRange ? Decimal(0) : Decimal::nan();
+
+  if (!HasAttr(nsGkAtoms::min)) {
+    return defaultMinimum;
+  }
+
+  nsAutoString minStr;
+  GetAttr(nsGkAtoms::min, minStr);
+
+  Decimal min =
+      mInputType->ConvertStringToNumber(minStr, InputType::Localized::No)
+          .mResult;
+  return min.isFinite() ? min : defaultMinimum;
+}
+
+Decimal HTMLInputElement::GetMaximum() const {
+  MOZ_ASSERT(
+      DoesValueAsNumberApply(),
+      "GetMaximum() should only be used for types that allow .valueAsNumber");
+
+  Decimal defaultMaximum =
+      mType == FormControlType::InputRange ? Decimal(100) : Decimal::nan();
+
+  if (!HasAttr(nsGkAtoms::max)) {
+    return defaultMaximum;
+  }
+
+  nsAutoString maxStr;
+  GetAttr(nsGkAtoms::max, maxStr);
+
+  Decimal max =
+      mInputType->ConvertStringToNumber(maxStr, InputType::Localized::No)
+          .mResult;
+  return max.isFinite() ? max : defaultMaximum;
+}
+
+Decimal HTMLInputElement::GetStepBase() const {
+  MOZ_ASSERT(IsDateTimeInputType(mType) ||
+                 mType == FormControlType::InputNumber ||
+                 mType == FormControlType::InputRange,
+             "Check that kDefaultStepBase is correct for this new type");
+  nsAutoString minStr;
+  if (GetAttr(nsGkAtoms::min, minStr)) {
+    Decimal min =
+        mInputType->ConvertStringToNumber(minStr, InputType::Localized::No)
+            .mResult;
+    if (min.isFinite()) {
+      return min;
+    }
+  }
+
+  nsAutoString valueStr;
+  if (GetAttr(nsGkAtoms::value, valueStr)) {
+    Decimal value =
+        mInputType->ConvertStringToNumber(valueStr, InputType::Localized::Yes)
+            .mResult;
+    if (value.isFinite()) {
+      return value;
+    }
+  }
+
+  if (mType == FormControlType::InputWeek) {
+    return kDefaultStepBaseWeek;
+  }
+
+  return kDefaultStepBase;
+}
+
+void HTMLInputElement::GetColor(InputPickerColor& aValue) {
+  MOZ_ASSERT(mType == FormControlType::InputColor,
+             "getColor is only for type=color.");
+
+  nsAutoString value;
+  GetValue(value, CallerType::System);
+
+  StyleAbsoluteColor color = MaybeComputeColorOrBlack(OwnerDoc(), value)
+                                 .ToColorSpace(StyleColorSpace::Srgb);
+  ClampColorComponents(color);
+  aValue.mComponent1 = color.components._0;
+  aValue.mComponent2 = color.components._1;
+  aValue.mComponent3 = color.components._2;
+  aValue.mAlpha = Alpha() ? color.alpha : NAN;
+
+}
+
+MOZ_CAN_RUN_SCRIPT_BOUNDARY void HTMLInputElement::UpdateColor() {
+  if (mType != FormControlType::InputColor) {
+    return;
+  }
+  if (!mValueChanged) {
+    SetDefaultValueAsValue();
+    return;
+  }
+  nsAutoString value;
+  GetValue(value, CallerType::NonSystem);
+  SetValueInternal(value, {ValueSetterOption::ByInternalAPI});
+}
+
+void HTMLInputElement::SetUserInputColor(const InputPickerColor& aValue) {
+  MOZ_ASSERT(mType == FormControlType::InputColor,
+             "setUserInputColor is only for type=color.");
+
+  nsAutoString serialized;
+  SerializeColor(
+      StyleAbsoluteColor{
+          .components =
+              StyleColorComponents{
+                  ._0 = aValue.mComponent1,
+                  ._1 = aValue.mComponent2,
+                  ._2 = aValue.mComponent3,
+              },
+          .alpha = aValue.mAlpha,
+          .color_space = StyleColorSpace::Srgb,
+      },
+      GetColorSpaceEnum(), Alpha(), serialized);
+
+  SetUserInput(serialized, *NodePrincipal());
+}
+
+Decimal HTMLInputElement::GetValueIfStepped(int32_t aStep,
+                                            StepCallerType aCallerType,
+                                            ErrorResult& aRv) {
+  constexpr auto kNaN = Decimal::nan();
+  if (!DoStepDownStepUpApply()) {
+    aRv.ThrowInvalidStateError("Step doesn't apply to this input type");
+    return kNaN;
+  }
+
+  Decimal stepBase = GetStepBase();
+  Decimal step = GetStep();
+  if (step == kStepAny) {
+    if (aCallerType != StepCallerType::ForUserEvent) {
+      aRv.ThrowInvalidStateError("Can't step an input with step=\"any\"");
+      return kNaN;
+    }
+    step = GetDefaultStep();
+  }
+
+  Decimal minimum = GetMinimum();
+  Decimal maximum = GetMaximum();
+
+  if (!maximum.isNaN()) {
+    maximum = maximum - NS_floorModulo(maximum - stepBase, step);
+    if (!minimum.isNaN()) {
+      if (minimum > maximum) {
+        return kNaN;
+      }
+    }
+  }
+
+  Decimal value = GetValueAsDecimal();
+  bool valueWasNaN = false;
+  if (value.isNaN()) {
+    value = Decimal(0);
+    valueWasNaN = true;
+  }
+  Decimal valueBeforeStepping = value;
+
+  Decimal deltaFromStep = NS_floorModulo(value - stepBase, step);
+
+  if (deltaFromStep != Decimal(0)) {
+    if (aStep > 0) {
+      value += step - deltaFromStep;       
+      value += step * Decimal(aStep - 1);  
+    } else if (aStep < 0) {
+      value -= deltaFromStep;              
+      value += step * Decimal(aStep + 1);  
+    }
+  } else {
+    value += step * Decimal(aStep);
+  }
+
+  if (value < minimum) {
+    value = minimum;
+    deltaFromStep = NS_floorModulo(value - stepBase, step);
+    if (deltaFromStep != Decimal(0)) {
+      value += step - deltaFromStep;
+    }
+  }
+  if (value > maximum) {
+    value = maximum;
+    deltaFromStep = NS_floorModulo(value - stepBase, step);
+    if (deltaFromStep != Decimal(0)) {
+      value -= deltaFromStep;
+    }
+  }
+
+  if (!valueWasNaN &&  
+      ((aStep > 0 && value < valueBeforeStepping) ||
+       (aStep < 0 && value > valueBeforeStepping))) {
+    return kNaN;
+  }
+
+  return value;
+}
+
+void HTMLInputElement::ApplyStep(int32_t aStep, ErrorResult& aRv) {
+  Decimal nextStep = GetValueIfStepped(aStep, StepCallerType::ForScript, aRv);
+  if (aRv.Failed() || !nextStep.isFinite()) {
+    return;
+  }
+  SetValue(nextStep, CallerType::NonSystem);
+}
+
+bool HTMLInputElement::IsDateTimeInputType(FormControlType aType) {
+  switch (aType) {
+    case FormControlType::InputDate:
+    case FormControlType::InputTime:
+    case FormControlType::InputMonth:
+    case FormControlType::InputWeek:
+    case FormControlType::InputDatetimeLocal:
+      return true;
+    default:
+      return false;
+  }
+}
+
+void HTMLInputElement::MozGetFileNameArray(nsTArray<nsString>& aArray,
+                                           ErrorResult& aRv) {
+  if (NS_WARN_IF(mType != FormControlType::InputFile)) {
+    return;
+  }
+
+  const nsTArray<OwningFileOrDirectory>& filesOrDirs =
+      GetFilesOrDirectoriesInternal();
+  for (uint32_t i = 0; i < filesOrDirs.Length(); i++) {
+    nsAutoString str;
+    GetDOMFileOrDirectoryPath(filesOrDirs[i], str, aRv);
+    if (NS_WARN_IF(aRv.Failed())) {
+      return;
+    }
+
+    aArray.AppendElement(str);
+  }
+}
+
+void HTMLInputElement::MozSetFileArray(
+    const Sequence<OwningNonNull<File>>& aFiles) {
+  if (NS_WARN_IF(mType != FormControlType::InputFile)) {
+    return;
+  }
+
+  nsCOMPtr<nsIGlobalObject> global = GetRelevantGlobal();
+  MOZ_ASSERT(global);
+  if (!global) {
+    return;
+  }
+
+  nsTArray<OwningFileOrDirectory> files;
+  for (uint32_t i = 0; i < aFiles.Length(); ++i) {
+    RefPtr<File> file = File::Create(global, aFiles[i].get()->Impl());
+    if (NS_WARN_IF(!file)) {
+      return;
+    }
+
+    OwningFileOrDirectory* element = files.AppendElement();
+    element->SetAsFile() = file;
+  }
+
+  SetFilesOrDirectories(files, true);
+}
+
+void HTMLInputElement::MozSetFileNameArray(const Sequence<nsString>& aFileNames,
+                                           ErrorResult& aRv) {
+  if (NS_WARN_IF(mType != FormControlType::InputFile)) {
+    return;
+  }
+
+  if (XRE_IsContentProcess()) {
+    aRv.Throw(NS_ERROR_DOM_NOT_SUPPORTED_ERR);
+    return;
+  }
+
+  nsTArray<OwningFileOrDirectory> files;
+  for (uint32_t i = 0; i < aFileNames.Length(); ++i) {
+    nsCOMPtr<nsIFile> file;
+
+    if (StringBeginsWith(aFileNames[i], u"file:"_ns,
+                         nsASCIICaseInsensitiveStringComparator)) {
+      (void)NS_GetFileFromURLSpec(NS_ConvertUTF16toUTF8(aFileNames[i]),
+                                  getter_AddRefs(file));
+    }
+
+    if (!file) {
+      (void)NS_NewLocalFile(aFileNames[i], getter_AddRefs(file));
+    }
+
+    if (!file) {
+      continue;  
+    }
+
+    nsCOMPtr<nsIGlobalObject> global = GetRelevantGlobal();
+    if (NS_WARN_IF(!global)) {
+      continue;
+    }
+    RefPtr<File> domFile = File::CreateFromFile(global, file);
+    if (NS_WARN_IF(!domFile)) {
+      aRv.Throw(NS_ERROR_FAILURE);
+      return;
+    }
+
+    OwningFileOrDirectory* element = files.AppendElement();
+    element->SetAsFile() = domFile;
+  }
+
+  SetFilesOrDirectories(files, true);
+}
+
+void HTMLInputElement::MozSetDirectory(const nsAString& aDirectoryPath,
+                                       ErrorResult& aRv) {
+  if (NS_WARN_IF(mType != FormControlType::InputFile)) {
+    return;
+  }
+
+  nsCOMPtr<nsIFile> file;
+  aRv = NS_NewLocalFile(aDirectoryPath, getter_AddRefs(file));
+  if (NS_WARN_IF(aRv.Failed())) {
+    return;
+  }
+
+  nsIGlobalObject* global = GetRelevantGlobal();
+  if (NS_WARN_IF(!global)) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return;
+  }
+
+  RefPtr<Directory> directory = Directory::Create(global, file);
+  MOZ_ASSERT(directory);
+
+  nsTArray<OwningFileOrDirectory> array;
+  OwningFileOrDirectory* element = array.AppendElement();
+  element->SetAsDirectory() = directory;
+
+  SetFilesOrDirectories(array, true);
+}
+
+void HTMLInputElement::GetDateTimeInputBoxValue(DateTimeValue& aValue) {
+  if (NS_WARN_IF(!IsDateTimeInputType(mType)) || !mDateTimeInputBoxValue) {
+    return;
+  }
+
+  aValue = *mDateTimeInputBoxValue;
+}
+
+Element* HTMLInputElement::GetDateTimeBoxElement() {
+  if (!CreatesDateTimeWidget()) {
+    return nullptr;
+  }
+  auto* sr = GetShadowRoot();
+  if (!sr) {
+    return nullptr;
+  }
+  MOZ_ASSERT(sr->IsUAWidget());
+
+  nsIContent* inputAreaContent = sr->GetFirstChild();
+  if (inputAreaContent && inputAreaContent->GetID() == nsGkAtoms::datetimebox) {
+    return inputAreaContent->AsElement();
+  }
+  return nullptr;
+}
+
+void HTMLInputElement::OpenDateTimePicker(const DateTimeValue& aInitialValue) {
+  if (NS_WARN_IF(!IsDateTimeInputType(mType))) {
+    return;
+  }
+
+  mDateTimeInputBoxValue = MakeUnique<DateTimeValue>(aInitialValue);
+  nsContentUtils::DispatchChromeEvent(OwnerDoc(), this,
+                                      u"MozOpenDateTimePicker"_ns,
+                                      CanBubble::eYes, Cancelable::eYes);
+}
+
+void HTMLInputElement::CloseDateTimePicker() {
+  if (NS_WARN_IF(!IsDateTimeInputType(mType))) {
+    return;
+  }
+
+  nsContentUtils::DispatchChromeEvent(OwnerDoc(), this,
+                                      u"MozCloseDateTimePicker"_ns,
+                                      CanBubble::eYes, Cancelable::eYes);
+}
+
+void HTMLInputElement::SetOpenState(bool aIsOpen) {
+  SetStates(ElementState::OPEN, aIsOpen);
+}
+
+void HTMLInputElement::OpenColorPicker() {
+  if (NS_WARN_IF(mType != FormControlType::InputColor)) {
+    return;
+  }
+
+  nsContentUtils::DispatchChromeEvent(OwnerDoc(), this,
+                                      u"MozOpenColorPicker"_ns, CanBubble::eYes,
+                                      Cancelable::eYes);
+}
+
+void HTMLInputElement::SetFocusState(bool aIsFocused) {
+  if (NS_WARN_IF(!IsDateTimeInputType(mType))) {
+    return;
+  }
+  SetStates(ElementState::FOCUS | ElementState::FOCUSRING, aIsFocused);
+}
+
+void HTMLInputElement::UpdateValidityState() {
+  if (NS_WARN_IF(!IsDateTimeInputType(mType))) {
+    return;
+  }
+
+  UpdateBadInputValidityState();
+  UpdateValidityElementStates(true);
+}
+
+bool HTMLInputElement::MozIsTextField(bool aExcludePassword) {
+  if (IsDateTimeInputType(mType) || mType == FormControlType::InputNumber) {
+    return false;
+  }
+
+  return IsSingleLineTextControl(aExcludePassword);
+}
+
+void HTMLInputElement::SetUserInput(const nsAString& aValue,
+                                    nsIPrincipal& aSubjectPrincipal) {
+  AutoHandlingUserInputStatePusher inputStatePusher(true);
+
+  if (mType == FormControlType::InputFile &&
+      !aSubjectPrincipal.IsSystemPrincipal()) {
+    return;
+  }
+
+  if (mType == FormControlType::InputFile) {
+    Sequence<nsString> list;
+    if (!list.AppendElement(aValue, fallible)) {
+      return;
+    }
+
+    MozSetFileNameArray(list, IgnoreErrors());
+    return;
+  }
+
+  bool isInputEventDispatchedByTextControlState =
+      GetValueMode() == VALUE_MODE_VALUE && IsSingleLineTextControl(false);
+
+  nsresult rv = SetValueInternal(
+      aValue,
+      {ValueSetterOption::BySetUserInputAPI, ValueSetterOption::SetValueChanged,
+       ValueSetterOption::MoveCursorToEndIfValueChanged});
+  NS_ENSURE_SUCCESS_VOID(rv);
+
+  if (!isInputEventDispatchedByTextControlState) {
+    DebugOnly<nsresult> rvIgnored = nsContentUtils::DispatchInputEvent(this);
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rvIgnored),
+                         "Failed to dispatch input event");
+  }
+
+  if (CreatesDateTimeWidget() || !ShouldBlur(this)) {
+    FireChangeEventIfNeeded();
+  }
+}
+
+nsIEditor* HTMLInputElement::GetEditorForBindings() {
+  if (!GetPrimaryFrame()) {
+    GetPrimaryFrame(FlushType::Frames);
+  }
+  return GetTextEditorFromState();
+}
+
+bool HTMLInputElement::HasEditor() const { return !!GetExtantTextEditor(); }
+
+TextEditor* HTMLInputElement::GetTextEditorFromState() {
+  TextControlState* state = GetEditorState();
+  if (state) {
+    return state->GetTextEditor();
+  }
+  return nullptr;
+}
+
+TextEditor* HTMLInputElement::GetTextEditor() {
+  return GetTextEditorFromState();
+}
+
+TextEditor* HTMLInputElement::GetExtantTextEditor() const {
+  const TextControlState* const state = GetEditorState();
+  if (!state) {
+    return nullptr;
+  }
+  return state->GetExtantTextEditor();
+}
+
+nsISelectionController* HTMLInputElement::GetSelectionController() {
+  TextControlState* state = GetEditorState();
+  if (state) {
+    return state->GetSelectionController();
+  }
+  return nullptr;
+}
+
+nsFrameSelection* HTMLInputElement::GetIndependentFrameSelection() const {
+  TextControlState* state = GetEditorState();
+  if (state) {
+    return state->GetIndependentFrameSelection();
+  }
+  return nullptr;
+}
+
+void HTMLInputElement::GetDisplayFileName(nsAString& aValue) const {
+  MOZ_ASSERT(mFileData);
+
+  if (OwnerDoc()->IsStaticDocument()) {
+    aValue = mFileData->mStaticDocFileList;
+    return;
+  }
+
+  if (mFileData->mFilesOrDirectories.Length() == 1) {
+    GetDOMFileOrDirectoryName(mFileData->mFilesOrDirectories[0], aValue);
+    return;
+  }
+
+  nsAutoString value;
+
+  if (mFileData->mFilesOrDirectories.IsEmpty()) {
+    if (StaticPrefs::dom_webkitBlink_dirPicker_enabled() &&
+        HasAttr(nsGkAtoms::webkitdirectory)) {
+      nsContentUtils::GetMaybeLocalizedString(
+          PropertiesFile::FORMS_PROPERTIES, "NoDirSelected", OwnerDoc(), value);
+    } else if (HasAttr(nsGkAtoms::multiple)) {
+      nsContentUtils::GetMaybeLocalizedString(PropertiesFile::FORMS_PROPERTIES,
+                                              "NoFilesSelected", OwnerDoc(),
+                                              value);
+    } else {
+      nsContentUtils::GetMaybeLocalizedString(PropertiesFile::FORMS_PROPERTIES,
+                                              "NoFileSelected", OwnerDoc(),
+                                              value);
+    }
+  } else {
+    nsString count;
+    count.AppendInt(int(mFileData->mFilesOrDirectories.Length()));
+
+    nsContentUtils::FormatMaybeLocalizedString(
+        value, PropertiesFile::FORMS_PROPERTIES, "XFilesSelected", OwnerDoc(),
+        count);
+  }
+
+  aValue = std::move(value);
+}
+
+const nsTArray<OwningFileOrDirectory>&
+HTMLInputElement::GetFilesOrDirectoriesInternal() const {
+  return mFileData->mFilesOrDirectories;
+}
+
+void HTMLInputElement::SetFilesOrDirectories(
+    const nsTArray<OwningFileOrDirectory>& aFilesOrDirectories,
+    bool aSetValueChanged) {
+  if (NS_WARN_IF(mType != FormControlType::InputFile)) {
+    return;
+  }
+
+  MOZ_ASSERT(mFileData);
+
+  mFileData->ClearGetFilesHelpers();
+
+  if (StaticPrefs::dom_webkitBlink_filesystem_enabled()) {
+    HTMLInputElement_Binding::ClearCachedWebkitEntriesValue(this);
+    mFileData->mEntries.Clear();
+  }
+
+  mFileData->mFilesOrDirectories.Clear();
+  mFileData->mFilesOrDirectories.AppendElements(aFilesOrDirectories);
+
+  AfterSetFilesOrDirectories(aSetValueChanged);
+}
+
+void HTMLInputElement::SetFiles(FileList* aFiles, bool aSetValueChanged) {
+  MOZ_ASSERT(mFileData);
+
+  mFileData->mFilesOrDirectories.Clear();
+  mFileData->ClearGetFilesHelpers();
+
+  if (StaticPrefs::dom_webkitBlink_filesystem_enabled()) {
+    HTMLInputElement_Binding::ClearCachedWebkitEntriesValue(this);
+    mFileData->mEntries.Clear();
+  }
+
+  if (aFiles) {
+    uint32_t listLength = aFiles->Length();
+    for (uint32_t i = 0; i < listLength; i++) {
+      OwningFileOrDirectory* element =
+          mFileData->mFilesOrDirectories.AppendElement();
+      element->SetAsFile() = aFiles->Item(i);
+    }
+  }
+
+  AfterSetFilesOrDirectories(aSetValueChanged);
+}
+
+void HTMLInputElement::MozSetDndFilesAndDirectories(
+    const nsTArray<OwningFileOrDirectory>& aFilesOrDirectories) {
+  if (NS_WARN_IF(mType != FormControlType::InputFile)) {
+    return;
+  }
+
+  SetFilesOrDirectories(aFilesOrDirectories, true);
+
+  if (StaticPrefs::dom_webkitBlink_filesystem_enabled()) {
+    UpdateEntries(aFilesOrDirectories);
+  }
+
+  RefPtr<DispatchChangeEventCallback> dispatchChangeEventCallback =
+      new DispatchChangeEventCallback(this);
+
+  if (StaticPrefs::dom_webkitBlink_dirPicker_enabled() &&
+      HasAttr(nsGkAtoms::webkitdirectory)) {
+    ErrorResult rv;
+    GetFilesHelper* helper =
+        GetOrCreateGetFilesHelper(true , rv);
+    if (NS_WARN_IF(rv.Failed())) {
+      rv.SuppressException();
+      return;
+    }
+
+    helper->AddCallback(dispatchChangeEventCallback);
+  } else {
+    dispatchChangeEventCallback->DispatchEvents();
+  }
+}
+
+void HTMLInputElement::AfterSetFilesOrDirectories(bool aSetValueChanged) {
+  if (nsFileControlFrame* f = do_QueryFrame(GetPrimaryFrame())) {
+    f->SelectedFilesUpdated();
+  }
+
+  if (mFileData->mFilesOrDirectories.IsEmpty()) {
+    mFileData->mFirstFilePath.Truncate();
+  } else {
+    ErrorResult rv;
+    GetDOMFileOrDirectoryPath(mFileData->mFilesOrDirectories[0],
+                              mFileData->mFirstFilePath, rv);
+    if (NS_WARN_IF(rv.Failed())) {
+      rv.SuppressException();
+    }
+  }
+
+  if (mFileData->mFileList) {
+    mFileData->mFileList = nullptr;
+  }
+
+  if (aSetValueChanged) {
+    SetValueChanged(true);
+  }
+
+  UpdateAllValidityStates(true);
+}
+
+void HTMLInputElement::FireChangeEventIfNeeded() {
+  if (!MayFireChangeOnBlur()) {
+    return;
+  }
+
+  nsAutoString value;
+  GetValue(value, CallerType::System);
+
+  if (mValueChanged) {
+    SetUserInteracted(true);
+  }
+  const bool changedByUser = mUserChangedSinceFocus;
+  mUserChangedSinceFocus = false;
+  mIsUserInteracting = false;
+  if (mFocusedValue.Equals(value)) {
+    return;
+  }
+  mFocusedValue = std::move(value);
+  if (!changedByUser) {
+    return;
+  }
+  nsContentUtils::DispatchTrustedEvent(
+      OwnerDoc(), static_cast<nsIContent*>(this), u"change"_ns, CanBubble::eYes,
+      Cancelable::eNo);
+}
+
+FileList* HTMLInputElement::GetFiles() {
+  if (mType != FormControlType::InputFile) {
+    return nullptr;
+  }
+
+  if (!mFileData->mFileList) {
+    mFileData->mFileList = new FileList(static_cast<nsIContent*>(this));
+    for (const OwningFileOrDirectory& item : GetFilesOrDirectoriesInternal()) {
+      if (item.IsFile()) {
+        mFileData->mFileList->Append(item.GetAsFile());
+      }
+    }
+  }
+
+  return mFileData->mFileList;
+}
+
+void HTMLInputElement::SetFiles(FileList* aFiles) {
+  if (mType != FormControlType::InputFile || !aFiles) {
+    return;
+  }
+
+  SetFiles(aFiles, true);
+
+  MOZ_ASSERT(!mFileData->mFileList, "Should've cleared the existing file list");
+
+  mFileData->mFileList = aFiles;
+}
+
+void HTMLInputElement::HandleNumberControlSpin(void* aData) {
+  RefPtr input = static_cast<HTMLInputElement*>(aData);
+  NS_ASSERTION(input->mNumberControlSpinnerIsSpinning,
+               "Should have called nsRepeatService::Stop()");
+
+  if (input->mType != FormControlType::InputNumber ||
+      !input->GetPrimaryFrame()) {
+    input->StopNumberControlSpinnerSpin();
+  } else {
+    input->StepNumberControlForUserEvent(
+        input->mNumberControlSpinnerSpinsUp ? 1 : -1);
+  }
+}
+
+nsresult HTMLInputElement::SetValueInternal(
+    const nsAString& aValue, const nsAString* aOldValue,
+    const ValueSetterOptions& aOptions) {
+  MOZ_ASSERT(GetValueMode() != VALUE_MODE_FILENAME,
+             "Don't call SetValueInternal for file inputs");
+
+  const bool forcePreserveUndoHistory = mParent && mParent->IsXULElement();
+
+  if (aOptions.contains(ValueSetterOption::BySetUserInputAPI)) {
+    mUserChangedSinceFocus = true;
+  }
+
+  switch (GetValueMode()) {
+    case VALUE_MODE_VALUE: {
+      nsAutoString value(aValue);
+
+      if (mDoneCreating &&
+          !(mType == FormControlType::InputNumber &&
+            aOptions.contains(ValueSetterOption::BySetUserInputAPI))) {
+        SanitizeValue(value, SanitizationKind::ForValueSetter);
+      }
+
+      const bool setValueChanged =
+          aOptions.contains(ValueSetterOption::SetValueChanged);
+      if (setValueChanged) {
+        SetValueChanged(true);
+      }
+
+      if (IsSingleLineTextControl(false)) {
+        EnsureEditorState();
+        if (!mInputData.mState->SetValue(
+                value, aOldValue,
+                forcePreserveUndoHistory
+                    ? aOptions + ValueSetterOption::PreserveUndoHistory
+                    : aOptions)) {
+          return NS_ERROR_OUT_OF_MEMORY;
+        }
+        if (aOptions.contains(ValueSetterOption::ByContentAPI)) {
+          MaybeUpdateAllValidityStates(!mDoneCreating);
+        }
+      } else {
+        free(mInputData.mValue);
+        mInputData.mValue = ToNewUnicode(value);
+        if (setValueChanged) {
+          SetValueChanged(true);
+        }
+        if (mType == FormControlType::InputRange) {
+          nsRangeFrame* frame = do_QueryFrame(GetPrimaryFrame());
+          if (frame) {
+            frame->UpdateForValueChange();
+          }
+        } else if (CreatesDateTimeWidget() &&
+                   !aOptions.contains(ValueSetterOption::BySetUserInputAPI)) {
+          if (Element* dateTimeBoxElement = GetDateTimeBoxElement()) {
+            AsyncEventDispatcher::RunDOMEventWhenSafe(
+                *dateTimeBoxElement, u"MozDateTimeValueChanged"_ns,
+                CanBubble::eNo, ChromeOnlyDispatch::eNo);
+          }
+        }
+        if (mDoneCreating) {
+          OnValueChanged(ValueChangeKind::Internal, value.IsEmpty(), &value);
+        }
+      }
+
+      if (mType == FormControlType::InputColor) {
+        nsColorControlFrame* colorControlFrame =
+            do_QueryFrame(GetPrimaryFrame());
+        if (colorControlFrame) {
+          AutoWeakFrame weakFrame(colorControlFrame);
+          colorControlFrame->UpdateColor();
+#if defined(ACCESSIBILITY)
+          if (weakFrame.IsAlive()) {
+            if (nsAccessibilityService* accService = GetAccService()) {
+              accService->ColorValueChanged(colorControlFrame->PresShell(),
+                                            this);
+            }
+          }
+#endif
+        }
+      }
+      return NS_OK;
+    }
+
+    case VALUE_MODE_DEFAULT:
+    case VALUE_MODE_DEFAULT_ON:
+      if (mType == FormControlType::InputHidden) {
+        SetValueChanged(true);
+      }
+
+      SetLastValueChangeWasInteractive(false);
+
+      return nsGenericHTMLFormControlElementWithState::SetAttr(
+          kNameSpaceID_None, nsGkAtoms::value, aValue, true);
+
+    case VALUE_MODE_FILENAME:
+      return NS_ERROR_UNEXPECTED;
+  }
+
+  return NS_OK;
+}
+
+void HTMLInputElement::SetValueChanged(bool aValueChanged) {
+  if (mValueChanged == aValueChanged) {
+    return;
+  }
+  mValueChanged = aValueChanged;
+  UpdateTooLongValidityState();
+  UpdateTooShortValidityState();
+  UpdateValidityElementStates(true);
+}
+
+void HTMLInputElement::SetLastValueChangeWasInteractive(bool aWasInteractive) {
+  if (aWasInteractive == mLastValueChangeWasInteractive) {
+    return;
+  }
+  mLastValueChangeWasInteractive = aWasInteractive;
+  const bool wasValid = IsValid();
+  UpdateTooLongValidityState();
+  UpdateTooShortValidityState();
+  if (wasValid != IsValid()) {
+    UpdateValidityElementStates(true);
+  }
+}
+
+void HTMLInputElement::SetCheckedChanged(bool aCheckedChanged) {
+  if (mType == FormControlType::InputRadio) {
+    if (mCheckedChanged != aCheckedChanged) {
+      VisitGroup(
+          [aCheckedChanged](HTMLInputElement* aRadio) {
+            aRadio->SetCheckedChangedInternal(aCheckedChanged);
+            return true;
+          },
+          false);
+    }
+  } else {
+    SetCheckedChangedInternal(aCheckedChanged);
+  }
+}
+
+void HTMLInputElement::SetCheckedChangedInternal(bool aCheckedChanged) {
+  if (mCheckedChanged == aCheckedChanged) {
+    return;
+  }
+  mCheckedChanged = aCheckedChanged;
+  UpdateValidityElementStates(true);
+}
+
+void HTMLInputElement::SetChecked(bool aChecked) {
+  DoSetChecked(aChecked,  true,  true);
+}
+
+void HTMLInputElement::DoSetChecked(bool aChecked, bool aNotify,
+                                    bool aSetValueChanged,
+                                    bool aUpdateOtherElement) {
+  if (aSetValueChanged) {
+    SetCheckedChanged(true);
+  }
+
+  if (mChecked == aChecked) {
+    return;
+  }
+
+  if (mType != FormControlType::InputRadio) {
+    SetCheckedInternal(aChecked, aNotify);
+    return;
+  }
+
+  if (aChecked) {
+    RadioSetChecked(aNotify, aUpdateOtherElement);
+    return;
+  }
+
+  if (auto* container = GetCurrentRadioGroupContainer()) {
+    nsAutoString name;
+    GetAttr(nsGkAtoms::name, name);
+    container->SetCurrentRadioButton(name, nullptr);
+  }
+  SetCheckedInternal(false, aNotify);
+}
+
+void HTMLInputElement::RadioSetChecked(bool aNotify, bool aUpdateOtherElement) {
+  if (aUpdateOtherElement) {
+    VisitGroup([](HTMLInputElement* aRadio) {
+      aRadio->SetCheckedInternal(false, true, false);
+      return true;
+    });
+  }
+
+  if (auto* container = GetCurrentRadioGroupContainer()) {
+    nsAutoString name;
+    GetAttr(nsGkAtoms::name, name);
+    container->SetCurrentRadioButton(name, this);
+  }
+
+  SetCheckedInternal(true, aNotify);
+}
+
+RadioGroupContainer* HTMLInputElement::GetCurrentRadioGroupContainer() const {
+  NS_ASSERTION(
+      mType == FormControlType::InputRadio,
+      "GetRadioGroupContainer should only be called when type='radio'");
+  return mRadioGroupContainer;
+}
+
+RadioGroupContainer* HTMLInputElement::FindTreeRadioGroupContainer() const {
+  nsAutoString name;
+  GetAttr(nsGkAtoms::name, name);
+
+  if (name.IsEmpty()) {
+    return nullptr;
+  }
+  if (mForm) {
+    return &mForm->OwnedRadioGroupContainer();
+  }
+  if (IsInNativeAnonymousSubtree()) {
+    return nullptr;
+  }
+  if (Document* doc = GetUncomposedDoc()) {
+    return &doc->OwnedRadioGroupContainer();
+  }
+  return &static_cast<FragmentOrElement*>(SubtreeRoot())
+              ->OwnedRadioGroupContainer();
+}
+
+void HTMLInputElement::DisconnectRadioGroupContainer() {
+  mRadioGroupContainer = nullptr;
+}
+
+HTMLInputElement* HTMLInputElement::GetSelectedRadioButton() const {
+  auto* container = GetCurrentRadioGroupContainer();
+  if (!container) {
+    return nullptr;
+  }
+
+  nsAutoString name;
+  GetAttr(nsGkAtoms::name, name);
+
+  return container->GetCurrentRadioButton(name);
+}
+
+void HTMLInputElement::MaybeSubmitForm(nsPresContext* aPresContext) {
+  if (!mForm) {
+    return;
+  }
+
+  RefPtr<PresShell> presShell = aPresContext->GetPresShell();
+  if (!presShell) {
+    return;
+  }
+
+  if (RefPtr<nsGenericHTMLFormElement> submitContent =
+          mForm->GetDefaultSubmitElement()) {
+    WidgetPointerEvent event(true, ePointerClick, nullptr);
+    event.mInputSource = MouseEvent_Binding::MOZ_SOURCE_KEYBOARD;
+    // > that were generated by something other than a pointing device.
+    event.pointerId = -1;
+    nsEventStatus status = nsEventStatus_eIgnore;
+    presShell->HandleDOMEventWithTarget(submitContent, &event, &status);
+  } else if (!mForm->ImplicitSubmissionIsDisabled()) {
+    RefPtr<dom::HTMLFormElement> form(mForm);
+    form->MaybeSubmit(nullptr);
+  }
+}
+
+void HTMLInputElement::UpdateCheckedState(bool aNotify) {
+  SetStates(ElementState::CHECKED, IsRadioOrCheckbox() && mChecked, aNotify);
+}
+
+void HTMLInputElement::UpdateIndeterminateState(bool aNotify) {
+  bool indeterminate = [&] {
+    if (mType == FormControlType::InputCheckbox) {
+      return mIndeterminate;
+    }
+    if (mType == FormControlType::InputRadio) {
+      return !mChecked && !GetSelectedRadioButton();
+    }
+    return false;
+  }();
+  SetStates(ElementState::INDETERMINATE, indeterminate, aNotify);
+}
+
+void HTMLInputElement::SetCheckedInternal(bool aChecked, bool aNotify,
+                                          bool aUpdateRadioGroup) {
+  mChecked = aChecked;
+
+  if (IsRadioOrCheckbox()) {
+    SetStates(ElementState::CHECKED, aChecked, aNotify);
+  }
+
+  UpdateAllValidityStatesButNotElementState();
+  UpdateIndeterminateState(aNotify);
+  UpdateValidityElementStates(aNotify);
+
+  if (mType == FormControlType::InputRadio && aUpdateRadioGroup) {
+    UpdateRadioGroupState();
+  }
+}
+
+bool HTMLInputElement::IsNodeApzAwareInternal() const {
+  return mType == FormControlType::InputNumber ||
+         mType == FormControlType::InputRange ||
+         nsINode::IsNodeApzAwareInternal();
+}
+
+bool HTMLInputElement::IsInteractiveHTMLContent() const {
+  return mType != FormControlType::InputHidden ||
+         nsGenericHTMLFormControlElementWithState::IsInteractiveHTMLContent();
+}
+
+void HTMLInputElement::AsyncEventRunning(AsyncEventDispatcher* aEvent) {
+  nsImageLoadingContent::AsyncEventRunning(aEvent);
+}
+
+void HTMLInputElement::Select() {
+  if (!IsSingleLineTextControl(false)) {
+    return;
+  }
+
+  if (FocusState() != FocusTristate::eUnfocusable) {
+    TextControlState* state = GetEditorState();
+    MOZ_ASSERT(state, "Single line text controls are expected to have a state");
+    RefPtr<nsFrameSelection> fs = state->GetIndependentFrameSelection();
+    if (fs && fs->MouseDownRecorded()) {
+      fs->SetDelayedCaretData(nullptr);
+    }
+
+    if (RefPtr<nsFocusManager> fm = nsFocusManager::GetFocusManager()) {
+      fm->SetFocus(this, nsIFocusManager::FLAG_NOSCROLL);
+    }
+  }
+
+  SelectAll();
+}
+
+bool HTMLInputElement::NeedToInitializeEditorForEvent(
+    EventChainPreVisitor& aVisitor) const {
+  if (!IsSingleLineTextControl(false)) {
+    return false;
+  }
+
+  return TextControlElement::NeedToInitializeEditorForEvent(aVisitor);
+}
+
+bool HTMLInputElement::IsDisabledForEvents(WidgetEvent* aEvent) {
+  return IsElementDisabledForEvents(aEvent, GetPrimaryFrame());
+}
+
+bool HTMLInputElement::CheckActivationBehaviorPreconditions(
+    EventChainVisitor& aVisitor) const {
+  WidgetMouseEvent* mouseEvent = aVisitor.mEvent->AsMouseEvent();
+  bool outerActivateEvent =
+      (mouseEvent && mouseEvent->IsLeftClickEvent()) ||
+      (aVisitor.mEvent->mMessage == eLegacyDOMActivate && !mInInternalActivate);
+  if (outerActivateEvent) {
+    aVisitor.mItemFlags |= NS_OUTER_ACTIVATE_EVENT;
+  }
+  return outerActivateEvent;
+}
+
+enum class SpinnerDirection { Up, Down, None };
+static SpinnerDirection SpinnerDirectionForEvent(const WidgetEvent& aEvent,
+                                                 Element* aSpinBox) {
+  if (!aSpinBox) {
+    return SpinnerDirection::None;
+  }
+  MOZ_ASSERT(aSpinBox->GetPseudoElementType() ==
+             PseudoStyleType::MozNumberSpinBox);
+  if (aEvent.mOriginalTarget == aSpinBox->GetFirstChild()) {
+    MOZ_ASSERT(aSpinBox->GetFirstChild()->AsElement()->GetPseudoElementType() ==
+               PseudoStyleType::MozNumberSpinUp);
+    return SpinnerDirection::Up;
+  }
+  if (aEvent.mOriginalTarget == aSpinBox->GetLastChild()) {
+    MOZ_ASSERT(aSpinBox->GetLastChild()->AsElement()->GetPseudoElementType() ==
+               PseudoStyleType::MozNumberSpinDown);
+    return SpinnerDirection::Down;
+  }
+  return SpinnerDirection::None;
+}
+
+MOZ_CAN_RUN_SCRIPT_BOUNDARY
+void HTMLInputElement::GetEventTargetParent(EventChainPreVisitor& aVisitor) {
+  aVisitor.mCanHandle = false;
+  if (IsDisabledForEvents(aVisitor.mEvent)) {
+    return;
+  }
+
+  if (NeedToInitializeEditorForEvent(aVisitor)) {
+    if (auto* state = GetTextControlState()) {
+      state->EnsureEditorInitialized();
+    }
+  }
+
+  if (CheckActivationBehaviorPreconditions(aVisitor)) {
+    aVisitor.mWantsActivationBehavior = true;
+  }
+
+  aVisitor.mItemFlags |= uint8_t(mType);
+
+  if (aVisitor.mEvent->mMessage == eFocus && aVisitor.mEvent->IsTrusted() &&
+      MayFireChangeOnBlur() &&
+      !mIsDraggingRange) {
+    GetValue(mFocusedValue, CallerType::System);
+  }
+
+  if (aVisitor.mEvent->mMessage == eBlur) {
+    aVisitor.mWantsPreHandleEvent = true;
+    aVisitor.mItemFlags |= NS_PRE_HANDLE_BLUR_EVENT;
+  }
+
+  if (mType == FormControlType::InputRange &&
+      (aVisitor.mEvent->mMessage == eFocus ||
+       aVisitor.mEvent->mMessage == eBlur)) {
+    if (nsIFrame* frame = GetPrimaryFrame()) {
+      frame->InvalidateFrameSubtree();
+    }
+  }
+
+  if (mType == FormControlType::InputNumber && aVisitor.mEvent->IsTrusted()) {
+    if (mNumberControlSpinnerIsSpinning) {
+      if (aVisitor.mEvent->mMessage == eMouseMove) {
+        bool stopSpin = true;
+        switch (
+            SpinnerDirectionForEvent(*aVisitor.mEvent, GetTextEditorButton())) {
+          case SpinnerDirection::Up:
+            mNumberControlSpinnerSpinsUp = true;
+            stopSpin = false;
+            break;
+          case SpinnerDirection::Down:
+            mNumberControlSpinnerSpinsUp = false;
+            stopSpin = false;
+            break;
+          case SpinnerDirection::None:
+            break;
+        }
+        if (stopSpin) {
+          StopNumberControlSpinnerSpin();
+        }
+      } else if (aVisitor.mEvent->mMessage == eMouseUp) {
+        StopNumberControlSpinnerSpin();
+      }
+    }
+
+    if (StaticPrefs::dom_input_number_and_range_modified_by_mousewheel() &&
+        aVisitor.mEvent->mMessage == eWheel) {
+      aVisitor.mMaybeUncancelable = false;
+    }
+  }
+
+  nsGenericHTMLFormControlElementWithState::GetEventTargetParent(aVisitor);
+}
+
+void HTMLInputElement::LegacyPreActivationBehavior(
+    EventChainVisitor& aVisitor) {
+
+  MOZ_ASSERT(NS_CONTROL_TYPE(aVisitor.mItemFlags) == uint8_t(mType));
+
+  bool originalCheckedValue = false;
+  mCheckedIsToggled = false;
+
+  if (mType == FormControlType::InputCheckbox) {
+    if (mIndeterminate) {
+      SetIndeterminateInternal(false, false);
+      aVisitor.mItemFlags |= NS_ORIGINAL_INDETERMINATE_VALUE;
+    }
+
+    originalCheckedValue = Checked();
+    DoSetChecked(!originalCheckedValue,  true,
+                  true);
+    mCheckedIsToggled = true;
+
+    if (aVisitor.mEventStatus != nsEventStatus_eConsumeNoDefault) {
+      aVisitor.mEventStatus = nsEventStatus_eConsumeDoDefault;
+    }
+  } else if (mType == FormControlType::InputRadio) {
+    HTMLInputElement* selectedRadioButton = GetSelectedRadioButton();
+    aVisitor.mItemData = static_cast<Element*>(selectedRadioButton);
+
+    originalCheckedValue = Checked();
+    if (!originalCheckedValue) {
+      DoSetChecked( true,  true,
+                    true);
+      mCheckedIsToggled = true;
+    }
+
+    if (aVisitor.mEventStatus != nsEventStatus_eConsumeNoDefault) {
+      aVisitor.mEventStatus = nsEventStatus_eConsumeDoDefault;
+    }
+  }
+
+  if (originalCheckedValue) {
+    aVisitor.mItemFlags |= NS_ORIGINAL_CHECKED_VALUE;
+  }
+
+  if (mForm && mType != FormControlType::InputRadio) {
+    aVisitor.mItemFlags |= NS_IN_SUBMIT_CLICK;
+    aVisitor.mItemData = static_cast<Element*>(mForm);
+    mForm->OnSubmitClickBegin();
+
+    if ((mType == FormControlType::InputSubmit ||
+         mType == FormControlType::InputImage) &&
+        aVisitor.mDOMEvent) {
+      if (auto* mouseEvent = aVisitor.mDOMEvent->AsMouseEvent()) {
+        const CSSIntPoint pt = RoundedToInt(mouseEvent->OffsetPoint());
+        if (auto* imageClickedPoint = static_cast<CSSIntPoint*>(
+                GetProperty(nsGkAtoms::imageClickedPoint))) {
+          *imageClickedPoint = pt;
+        }
+      }
+    }
+  }
+}
+
+void HTMLInputElement::MaybeDispatchWillBlur(EventChainVisitor& aVisitor) {
+  if (!CreatesDateTimeWidget() || !aVisitor.mEvent->IsTrusted()) {
+    return;
+  }
+  RefPtr<Element> dateTimeBoxElement = GetDateTimeBoxElement();
+  if (!dateTimeBoxElement) {
+    return;
+  }
+  AutoJSAPI jsapi;
+  if (NS_WARN_IF(!jsapi.Init(GetRelevantGlobal()))) {
+    return;
+  }
+  if (!aVisitor.mDOMEvent) {
+    RefPtr<Event> event = EventDispatcher::CreateEvent(
+        aVisitor.mEvent->mOriginalTarget, aVisitor.mPresContext,
+        aVisitor.mEvent, u""_ns);
+    event.swap(aVisitor.mDOMEvent);
+  }
+  JS::Rooted<JS::Value> detail(jsapi.cx(), JS::NullHandleValue);
+  if (NS_WARN_IF(!ToJSValue(jsapi.cx(), aVisitor.mDOMEvent, &detail))) {
+    return;
+  }
+  RefPtr<CustomEvent> event =
+      NS_NewDOMCustomEvent(OwnerDoc(), aVisitor.mPresContext, nullptr);
+  event->InitCustomEvent(jsapi.cx(), u"MozDateTimeWillBlur"_ns,
+                          false,
+                          false, detail);
+  event->SetTrusted(true);
+  dateTimeBoxElement->DispatchEvent(*event);
+}
+
+nsresult HTMLInputElement::PreHandleEvent(EventChainVisitor& aVisitor) {
+  if (aVisitor.mItemFlags & NS_PRE_HANDLE_BLUR_EVENT) {
+    MOZ_ASSERT(aVisitor.mEvent->mMessage == eBlur);
+    FireChangeEventIfNeeded();
+    MaybeDispatchWillBlur(aVisitor);
+  }
+  return nsGenericHTMLFormControlElementWithState::PreHandleEvent(aVisitor);
+}
+
+void HTMLInputElement::StartRangeThumbDrag(WidgetGUIEvent* aEvent) {
+  nsRangeFrame* rangeFrame = do_QueryFrame(GetPrimaryFrame());
+  if (!rangeFrame) {
+    return;
+  }
+
+  mIsDraggingRange = true;
+  mIsUserInteracting = true;
+  mRangeThumbDragStartValue = GetValueAsDecimal();
+  PresShell::SetCapturingContent(this, CaptureFlags::IgnoreAllowedState);
+
+  GetValue(mFocusedValue, CallerType::System);
+
+  SetValueOfRangeForUserEvent(rangeFrame->GetValueAtEventPoint(aEvent),
+                              SnapToTickMarks::Yes);
+}
+
+void HTMLInputElement::FinishRangeThumbDrag(WidgetGUIEvent* aEvent) {
+  MOZ_ASSERT(mIsDraggingRange);
+
+  if (PresShell::GetCapturingContent() == this) {
+    PresShell::ReleaseCapturingContent();
+  }
+  if (aEvent) {
+    nsRangeFrame* rangeFrame = do_QueryFrame(GetPrimaryFrame());
+    SetValueOfRangeForUserEvent(rangeFrame->GetValueAtEventPoint(aEvent),
+                                SnapToTickMarks::Yes);
+  }
+  mIsDraggingRange = false;
+  FireChangeEventIfNeeded();
+}
+
+void HTMLInputElement::CancelRangeThumbDrag(bool aIsForUserEvent) {
+  MOZ_ASSERT(mIsDraggingRange);
+
+  mIsDraggingRange = false;
+  mIsUserInteracting = false;
+  if (PresShell::GetCapturingContent() == this) {
+    PresShell::ReleaseCapturingContent();
+  }
+  if (aIsForUserEvent) {
+    SetValueOfRangeForUserEvent(mRangeThumbDragStartValue,
+                                SnapToTickMarks::Yes);
+  } else {
+    nsAutoString val;
+    mInputType->ConvertNumberToString(mRangeThumbDragStartValue,
+                                      InputType::Localized::No, val);
+    SetValueInternal(val, {ValueSetterOption::BySetUserInputAPI,
+                           ValueSetterOption::SetValueChanged});
+    if (nsRangeFrame* frame = do_QueryFrame(GetPrimaryFrame())) {
+      frame->UpdateForValueChange();
+    }
+    DebugOnly<nsresult> rvIgnored = nsContentUtils::DispatchInputEvent(this);
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rvIgnored),
+                         "Failed to dispatch input event");
+  }
+}
+
+void HTMLInputElement::SetValueOfRangeForUserEvent(
+    Decimal aValue, SnapToTickMarks aSnapToTickMarks) {
+  MOZ_ASSERT(aValue.isFinite());
+  if (aSnapToTickMarks == SnapToTickMarks::Yes) {
+    MaybeSnapToTickMark(aValue);
+  }
+
+  Decimal oldValue = GetValueAsDecimal();
+
+  nsAutoString val;
+  mInputType->ConvertNumberToString(aValue, InputType::Localized::No, val);
+  SetValueInternal(val, {ValueSetterOption::BySetUserInputAPI,
+                         ValueSetterOption::SetValueChanged});
+  if (nsRangeFrame* frame = do_QueryFrame(GetPrimaryFrame())) {
+    frame->UpdateForValueChange();
+  }
+
+  if (GetValueAsDecimal() != oldValue) {
+    DebugOnly<nsresult> rvIgnored = nsContentUtils::DispatchInputEvent(this);
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rvIgnored),
+                         "Failed to dispatch input event");
+  }
+}
+
+void HTMLInputElement::StartNumberControlSpinnerSpin() {
+  MOZ_ASSERT(!mNumberControlSpinnerIsSpinning);
+
+  mNumberControlSpinnerIsSpinning = true;
+
+  nsRepeatService::GetInstance()->Start(
+      HandleNumberControlSpin, this, OwnerDoc(), "HandleNumberControlSpin"_ns);
+
+  PresShell::SetCapturingContent(this, CaptureFlags::IgnoreAllowedState);
+}
+
+void HTMLInputElement::StopNumberControlSpinnerSpin(SpinnerStopState aState) {
+  if (!mNumberControlSpinnerIsSpinning) {
+    return;
+  }
+  if (PresShell::GetCapturingContent() == this) {
+    PresShell::ReleaseCapturingContent();
+  }
+
+  nsRepeatService::GetInstance()->Stop(HandleNumberControlSpin, this);
+
+  mNumberControlSpinnerIsSpinning = false;
+
+  if (aState == eAllowDispatchingEvents) {
+    FireChangeEventIfNeeded();
+  }
+}
+
+void HTMLInputElement::StepNumberControlForUserEvent(int32_t aDirection) {
+  if (HasBadInput()) {
+    if (!IsValueEmpty()) {
+      SetUserInteracted(true);
+      return;
+    }
+  }
+
+  Decimal newValue = GetValueIfStepped(aDirection, StepCallerType::ForUserEvent,
+                                       IgnoreErrors());
+  if (!newValue.isFinite()) {
+    return;  
+  }
+
+  mIsUserInteracting = true;
+
+  nsAutoString newVal;
+  mInputType->ConvertNumberToString(newValue, InputType::Localized::No, newVal);
+  SetValueInternal(newVal, {ValueSetterOption::BySetUserInputAPI,
+                            ValueSetterOption::SetValueChanged});
+}
+
+bool HTMLInputElement::ShouldPreventDOMActivateDispatch(
+    EventTarget* aOriginalTarget) {
+
+  if (mType != FormControlType::InputFile) {
+    return false;
+  }
+
+  Element* target = Element::FromEventTargetOrNull(aOriginalTarget);
+  if (!target) {
+    return false;
+  }
+
+  return target->GetParent() == this &&
+         target->IsRootOfNativeAnonymousSubtree() &&
+         target->IsHTMLElement(nsGkAtoms::button);
+}
+
+nsresult HTMLInputElement::MaybeInitPickers(EventChainPostVisitor& aVisitor) {
+  WidgetMouseEvent* mouseEvent = aVisitor.mEvent->AsMouseEvent();
+  if (!(mouseEvent && mouseEvent->IsLeftClickEvent())) {
+    return NS_OK;
+  }
+  if (mType == FormControlType::InputFile) {
+    FilePickerType type = FILE_PICKER_FILE;
+    nsIContent* target =
+        nsIContent::FromEventTargetOrNull(aVisitor.mEvent->mOriginalTarget);
+    if (target && target->FindFirstNonChromeOnlyAccessContent() == this &&
+        StaticPrefs::dom_webkitBlink_dirPicker_enabled() &&
+        HasAttr(nsGkAtoms::webkitdirectory)) {
+      type = FILE_PICKER_DIRECTORY;
+    }
+    return InitFilePicker(type);
+  }
+  if (mType == FormControlType::InputColor) {
+    return InitColorPicker();
+  }
+
+  return NS_OK;
+}
+
+static bool IgnoreInputEventWithModifier(const WidgetInputEvent& aEvent,
+                                         bool ignoreControl) {
+  return (ignoreControl && aEvent.IsControl()) ||
+         aEvent.IsAltGraph()
+#if 0 || defined(MOZ_WIDGET_GTK)
+         || aEvent.IsMeta()
+#endif
+         || aEvent.IsFn();
+}
+
+bool HTMLInputElement::StepsInputValue(
+    const WidgetKeyboardEvent& aEvent) const {
+  if (mType != FormControlType::InputNumber) {
+    return false;
+  }
+  if (aEvent.mMessage != eKeyPress) {
+    return false;
+  }
+  if (!aEvent.IsTrusted()) {
+    return false;
+  }
+  if (aEvent.mKeyCode != NS_VK_UP && aEvent.mKeyCode != NS_VK_DOWN) {
+    return false;
+  }
+  if (IgnoreInputEventWithModifier(aEvent, false)) {
+    return false;
+  }
+  if (aEvent.DefaultPrevented()) {
+    return false;
+  }
+  if (!IsMutable()) {
+    return false;
+  }
+  return true;
+}
+
+static bool ActivatesWithKeyboard(FormControlType aType, uint32_t aKeyCode) {
+  switch (aType) {
+    case FormControlType::InputCheckbox:
+    case FormControlType::InputRadio:
+      return aKeyCode != NS_VK_RETURN;
+    case FormControlType::InputButton:
+    case FormControlType::InputReset:
+    case FormControlType::InputSubmit:
+    case FormControlType::InputFile:
+    case FormControlType::InputImage:  
+    case FormControlType::InputColor:
+      return true;
+    default:
+      return false;
+  }
+}
+
+nsresult HTMLInputElement::PostHandleEvent(EventChainPostVisitor& aVisitor) {
+  if (aVisitor.mEvent->mMessage == eBlur) {
+    if (mIsDraggingRange) {
+      FinishRangeThumbDrag();
+    } else if (mNumberControlSpinnerIsSpinning) {
+      StopNumberControlSpinnerSpin();
+    }
+  }
+
+  nsresult rv = NS_OK;
+  auto oldType = FormControlType(NS_CONTROL_TYPE(aVisitor.mItemFlags));
+
+  if (aVisitor.mEventStatus != nsEventStatus_eConsumeNoDefault &&
+      !IsSingleLineTextControl(true) && mType != FormControlType::InputNumber) {
+    WidgetMouseEvent* mouseEvent = aVisitor.mEvent->AsMouseEvent();
+    if (mouseEvent && mouseEvent->IsLeftClickEvent() &&
+        OwnerDoc()->MayHaveDOMActivateListeners() &&
+        !ShouldPreventDOMActivateDispatch(aVisitor.mEvent->mOriginalTarget)) {
+      InternalUIEvent actEvent(true, eLegacyDOMActivate, mouseEvent);
+      actEvent.mDetail = 1;
+
+      if (RefPtr<PresShell> presShell =
+              aVisitor.mPresContext ? aVisitor.mPresContext->GetPresShell()
+                                    : nullptr) {
+        nsEventStatus status = nsEventStatus_eIgnore;
+        mInInternalActivate = true;
+        rv = presShell->HandleDOMEventWithTarget(this, &actEvent, &status);
+        mInInternalActivate = false;
+
+        if (status == nsEventStatus_eConsumeNoDefault) {
+          aVisitor.mEventStatus = status;
+        }
+      }
+    }
+  }
+
+  bool preventDefault =
+      aVisitor.mEventStatus == nsEventStatus_eConsumeNoDefault;
+  if (IsDisabled() && oldType != FormControlType::InputCheckbox &&
+      oldType != FormControlType::InputRadio) {
+    preventDefault = true;
+  }
+
+  if (NS_SUCCEEDED(rv)) {
+    WidgetKeyboardEvent* keyEvent = aVisitor.mEvent->AsKeyboardEvent();
+    if (keyEvent && StepsInputValue(*keyEvent)) {
+      StepNumberControlForUserEvent(keyEvent->mKeyCode == NS_VK_UP ? 1 : -1);
+      FireChangeEventIfNeeded();
+      aVisitor.mEventStatus = nsEventStatus_eConsumeNoDefault;
+    } else if (!preventDefault) {
+      if (keyEvent && ActivatesWithKeyboard(mType, keyEvent->mKeyCode) &&
+          keyEvent->IsTrusted()) {
+        HandleKeyboardActivation(aVisitor);
+      }
+
+      switch (aVisitor.mEvent->mMessage) {
+        case eKeyDown: {
+          if (aVisitor.mPresContext && keyEvent->IsTrusted() && !IsDisabled() &&
+              keyEvent->ShouldWorkAsSpaceKey() &&
+              (mType == FormControlType::InputCheckbox ||
+               mType == FormControlType::InputRadio)) {
+            EventStateManager::SetActiveManager(
+                aVisitor.mPresContext->EventStateManager(), this);
+          }
+
+          if (keyEvent->mKeyCode == NS_VK_ESCAPE && keyEvent->IsTrusted() &&
+              !keyEvent->DefaultPrevented() && !keyEvent->mIsComposing &&
+              mType == FormControlType::InputSearch &&
+              StaticPrefs::dom_forms_search_esc() && !IsDisabledOrReadOnly() &&
+              !IsValueEmpty()) {
+            SetUserInput(EmptyString(), *NodePrincipal());
+            aVisitor.mEventStatus = nsEventStatus_eConsumeNoDefault;
+          }
+          break;
+        }
+
+        case eKeyPress: {
+          if (mType == FormControlType::InputRadio && keyEvent->IsTrusted() &&
+              !keyEvent->IsAlt() && !keyEvent->IsControl() &&
+              !keyEvent->IsMeta()) {
+            if (Document* doc = GetComposedDoc()) {
+              doc->FlushPendingNotifications(
+                  FlushType::EnsurePresShellInitAndFrames);
+            }
+            rv = MaybeHandleRadioButtonNavigation(aVisitor, keyEvent->mKeyCode);
+          }
+
+
+          if (keyEvent->mKeyCode == NS_VK_RETURN && keyEvent->IsTrusted() &&
+              (IsSingleLineTextControl(false, mType) ||
+               IsDateTimeInputType(mType) ||
+               mType == FormControlType::InputCheckbox ||
+               mType == FormControlType::InputRadio)) {
+            if (IsSingleLineTextControl(false, mType) ||
+                IsDateTimeInputType(mType)) {
+              FireChangeEventIfNeeded();
+            }
+
+            if (aVisitor.mPresContext) {
+              MaybeSubmitForm(aVisitor.mPresContext);
+            }
+          }
+
+          if (mType == FormControlType::InputRange && keyEvent->IsTrusted() &&
+              !keyEvent->IsAlt() && !keyEvent->IsControl() &&
+              !keyEvent->IsMeta() &&
+              (keyEvent->mKeyCode == NS_VK_LEFT ||
+               keyEvent->mKeyCode == NS_VK_RIGHT ||
+               keyEvent->mKeyCode == NS_VK_UP ||
+               keyEvent->mKeyCode == NS_VK_DOWN ||
+               keyEvent->mKeyCode == NS_VK_PAGE_UP ||
+               keyEvent->mKeyCode == NS_VK_PAGE_DOWN ||
+               keyEvent->mKeyCode == NS_VK_HOME ||
+               keyEvent->mKeyCode == NS_VK_END)) {
+            Decimal minimum = GetMinimum();
+            Decimal maximum = GetMaximum();
+            MOZ_ASSERT(minimum.isFinite() && maximum.isFinite());
+            if (minimum < maximum) {  
+              Decimal value = GetValueAsDecimal();
+              Decimal step = GetStep();
+              if (step == kStepAny) {
+                step = GetDefaultStep();
+              }
+              MOZ_ASSERT(value.isFinite() && step.isFinite());
+              Decimal newValue;
+              switch (keyEvent->mKeyCode) {
+                case NS_VK_LEFT:
+                  newValue = value +
+                             (GetComputedDirectionality() == Directionality::Rtl
+                                  ? step
+                                  : -step);
+                  break;
+                case NS_VK_RIGHT:
+                  newValue = value +
+                             (GetComputedDirectionality() == Directionality::Rtl
+                                  ? -step
+                                  : step);
+                  break;
+                case NS_VK_UP:
+                  newValue = value + step;
+                  break;
+                case NS_VK_DOWN:
+                  newValue = value - step;
+                  break;
+                case NS_VK_HOME:
+                  newValue = minimum;
+                  break;
+                case NS_VK_END:
+                  newValue = maximum;
+                  break;
+                case NS_VK_PAGE_UP:
+                  newValue =
+                      value + std::max(step, (maximum - minimum) / Decimal(10));
+                  break;
+                case NS_VK_PAGE_DOWN:
+                  newValue =
+                      value - std::max(step, (maximum - minimum) / Decimal(10));
+                  break;
+              }
+              SetValueOfRangeForUserEvent(newValue);
+              FireChangeEventIfNeeded();
+              aVisitor.mEventStatus = nsEventStatus_eConsumeNoDefault;
+            }
+          }
+        } break;  
+
+        case eMouseDown:
+        case eMouseUp:
+        case eMouseDoubleClick: {
+          WidgetMouseEvent* mouseEvent = aVisitor.mEvent->AsMouseEvent();
+          if (mouseEvent->mButton == MouseButton::eMiddle ||
+              mouseEvent->mButton == MouseButton::eSecondary) {
+            if (mType == FormControlType::InputButton ||
+                mType == FormControlType::InputReset ||
+                mType == FormControlType::InputSubmit) {
+              if (aVisitor.mDOMEvent) {
+                aVisitor.mDOMEvent->StopPropagation();
+              } else {
+                rv = NS_ERROR_FAILURE;
+              }
+            }
+          }
+          if (mType == FormControlType::InputNumber &&
+              aVisitor.mEvent->IsTrusted()) {
+            if (mouseEvent->mButton == MouseButton::ePrimary &&
+                !IgnoreInputEventWithModifier(*mouseEvent, false) &&
+                aVisitor.mEvent->mMessage == eMouseDown && IsMutable()) {
+              switch (SpinnerDirectionForEvent(*aVisitor.mEvent,
+                                               GetTextEditorButton())) {
+                case SpinnerDirection::Up:
+                  StepNumberControlForUserEvent(1);
+                  mNumberControlSpinnerSpinsUp = true;
+                  StartNumberControlSpinnerSpin();
+                  aVisitor.mEventStatus = nsEventStatus_eConsumeNoDefault;
+                  break;
+                case SpinnerDirection::Down:
+                  StepNumberControlForUserEvent(-1);
+                  mNumberControlSpinnerSpinsUp = false;
+                  StartNumberControlSpinnerSpin();
+                  aVisitor.mEventStatus = nsEventStatus_eConsumeNoDefault;
+                  break;
+                case SpinnerDirection::None:
+                  break;
+              }
+            }
+            if (aVisitor.mEventStatus != nsEventStatus_eConsumeNoDefault) {
+              StopNumberControlSpinnerSpin();
+            }
+          }
+          break;
+        }
+        case eWheel: {
+          if (StaticPrefs::
+                  dom_input_number_and_range_modified_by_mousewheel()) {
+            WidgetWheelEvent* wheelEvent = aVisitor.mEvent->AsWheelEvent();
+            if (!aVisitor.mEvent->DefaultPrevented() &&
+                aVisitor.mEvent->IsTrusted() && IsMutable() && wheelEvent &&
+                wheelEvent->mDeltaY != 0 &&
+                wheelEvent->mDeltaMode != WheelEvent_Binding::DOM_DELTA_PIXEL) {
+              if (mType == FormControlType::InputNumber) {
+                if (nsFocusManager::GetFocusedElementStatic() == this) {
+                  StepNumberControlForUserEvent(wheelEvent->mDeltaY > 0 ? -1
+                                                                        : 1);
+                  FireChangeEventIfNeeded();
+                  aVisitor.mEvent->PreventDefault();
+                }
+              } else if (mType == FormControlType::InputRange &&
+                         nsFocusManager::GetFocusedElementStatic() == this &&
+                         GetMinimum() < GetMaximum()) {
+                Decimal value = GetValueAsDecimal();
+                Decimal step = GetStep();
+                if (step == kStepAny) {
+                  step = GetDefaultStep();
+                }
+                MOZ_ASSERT(value.isFinite() && step.isFinite());
+                SetValueOfRangeForUserEvent(
+                    wheelEvent->mDeltaY < 0 ? value + step : value - step);
+                FireChangeEventIfNeeded();
+                aVisitor.mEvent->PreventDefault();
+              }
+            }
+          }
+          break;
+        }
+        case ePointerClick: {
+          if (!aVisitor.mEvent->DefaultPrevented() &&
+              aVisitor.mEvent->IsTrusted() &&
+              aVisitor.mEvent->AsMouseEvent()->mButton ==
+                  MouseButton::ePrimary) {
+            if (mType == FormControlType::InputSearch) {
+              Element* button = GetTextEditorButton();
+              if (button && aVisitor.mEvent->mOriginalTarget == button) {
+                SetUserInput(EmptyString(),
+                             *nsContentUtils::GetSystemPrincipal());
+              }
+            } else if (mType == FormControlType::InputPassword) {
+              Element* button = GetTextEditorButton();
+              if (button && aVisitor.mEvent->mOriginalTarget == button) {
+                SetRevealPassword(!RevealPassword());
+              }
+            }
+          }
+          break;
+        }
+        default:
+          break;
+      }
+
+      if (aVisitor.mItemFlags & NS_OUTER_ACTIVATE_EVENT) {
+        switch (mType) {
+          case FormControlType::InputReset:
+          case FormControlType::InputSubmit:
+          case FormControlType::InputImage:
+            if (mForm) {
+              aVisitor.mEvent->mFlags.mMultipleActionsPrevented = true;
+            }
+            break;
+          case FormControlType::InputCheckbox:
+          case FormControlType::InputRadio:
+            aVisitor.mEvent->mFlags.mMultipleActionsPrevented = true;
+            break;
+          default:
+            break;
+        }
+      }
+    }
+  }  
+
+  if (NS_SUCCEEDED(rv) && mType == FormControlType::InputRange) {
+    PostHandleEventForRangeThumb(aVisitor);
+  }
+
+  if (!preventDefault) {
+    MOZ_TRY(MaybeInitPickers(aVisitor));
+  }
+  return NS_OK;
+}
+
+void EndSubmitClick(EventChainPostVisitor& aVisitor) {
+  if (aVisitor.mItemFlags & NS_IN_SUBMIT_CLICK) {
+    nsCOMPtr<nsIContent> content(do_QueryInterface(aVisitor.mItemData));
+    RefPtr<HTMLFormElement> form = HTMLFormElement::FromNodeOrNull(content);
+    form->OnSubmitClickEnd();
+    form->FlushPendingSubmission();
+  }
+}
+
+void HTMLInputElement::ActivationBehavior(EventChainPostVisitor& aVisitor) {
+  auto oldType = FormControlType(NS_CONTROL_TYPE(aVisitor.mItemFlags));
+
+  auto endSubmit = MakeScopeExit([&] { EndSubmitClick(aVisitor); });
+
+  if (IsDisabled() && oldType != FormControlType::InputCheckbox &&
+      oldType != FormControlType::InputRadio) {
+    return;
+  }
+
+  if (mCheckedIsToggled && IsInComposedDoc()) {
+    SetUserInteracted(true);
+
+    DebugOnly<nsresult> rvIgnored = nsContentUtils::DispatchInputEvent(this);
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rvIgnored),
+                         "Failed to dispatch input event");
+
+    nsContentUtils::DispatchTrustedEvent<WidgetEvent>(
+        OwnerDoc(), static_cast<Element*>(this), eFormChange, CanBubble::eYes,
+        Cancelable::eNo);
+  }
+
+  switch (mType) {
+    case FormControlType::InputReset:
+    case FormControlType::InputSubmit:
+    case FormControlType::InputImage:
+      if (mForm) {
+        RefPtr<HTMLFormElement> form(mForm);
+        if (mType == FormControlType::InputReset) {
+          form->MaybeReset(this);
+        } else {
+          form->MaybeSubmit(this);
+        }
+        aVisitor.mEventStatus = nsEventStatus_eConsumeNoDefault;
+        return;
+      }
+      break;
+
+    default:
+      break;
+  }  
+  if (IsButtonControl()) {
+    nsCOMPtr<Element> eventTarget =
+        do_QueryInterface(aVisitor.mEvent->mOriginalTarget);
+    HandlePopoverTargetAction(eventTarget);
+  }
+}
+
+void HTMLInputElement::LegacyCanceledActivationBehavior(
+    EventChainPostVisitor& aVisitor) {
+  bool originalCheckedValue =
+      !!(aVisitor.mItemFlags & NS_ORIGINAL_CHECKED_VALUE);
+  auto oldType = FormControlType(NS_CONTROL_TYPE(aVisitor.mItemFlags));
+
+  if (mCheckedIsToggled) {
+    if (oldType == FormControlType::InputRadio) {
+      nsCOMPtr<nsIContent> content = do_QueryInterface(aVisitor.mItemData);
+      HTMLInputElement* selectedRadioButton =
+          HTMLInputElement::FromNodeOrNull(content);
+      if (selectedRadioButton) {
+        selectedRadioButton->SetChecked(true);
+      }
+      if (!selectedRadioButton || mType != FormControlType::InputRadio) {
+        DoSetChecked( false,  true,
+                      true);
+      }
+    } else if (oldType == FormControlType::InputCheckbox) {
+      bool originalIndeterminateValue =
+          !!(aVisitor.mItemFlags & NS_ORIGINAL_INDETERMINATE_VALUE);
+      SetIndeterminateInternal(originalIndeterminateValue, false);
+      DoSetChecked(originalCheckedValue,  true,
+                    true);
+    }
+  }
+
+  EndSubmitClick(aVisitor);
+}
+
+enum class RadioButtonMove { Back, Forward, None };
+nsresult HTMLInputElement::MaybeHandleRadioButtonNavigation(
+    EventChainPostVisitor& aVisitor, uint32_t aKeyCode) {
+  auto move = [&] {
+    switch (aKeyCode) {
+      case NS_VK_UP:
+        return RadioButtonMove::Back;
+      case NS_VK_DOWN:
+        return RadioButtonMove::Forward;
+      case NS_VK_LEFT:
+      case NS_VK_RIGHT: {
+        const bool isRtl = GetComputedDirectionality() == Directionality::Rtl;
+        return isRtl == (aKeyCode == NS_VK_LEFT) ? RadioButtonMove::Forward
+                                                 : RadioButtonMove::Back;
+      }
+    }
+    return RadioButtonMove::None;
+  }();
+  if (move == RadioButtonMove::None) {
+    return NS_OK;
+  }
+  RefPtr<HTMLInputElement> selectedRadioButton;
+  if (auto* container = GetCurrentRadioGroupContainer()) {
+    nsAutoString name;
+    GetAttr(nsGkAtoms::name, name);
+    container->GetNextRadioButton(name, move == RadioButtonMove::Back, this,
+                                  getter_AddRefs(selectedRadioButton));
+  }
+  if (!selectedRadioButton) {
+    return NS_OK;
+  }
+  FocusOptions options;
+  ErrorResult error;
+  selectedRadioButton->Focus(options, CallerType::System, error);
+  if (error.Failed()) {
+    return error.StealNSResult();
+  }
+  nsresult rv = DispatchSimulatedClick(
+      selectedRadioButton, aVisitor.mEvent->IsTrusted(), aVisitor.mPresContext);
+  if (NS_SUCCEEDED(rv)) {
+    aVisitor.mEventStatus = nsEventStatus_eConsumeNoDefault;
+  }
+  return rv;
+}
+
+void HTMLInputElement::PostHandleEventForRangeThumb(
+    EventChainPostVisitor& aVisitor) {
+  MOZ_ASSERT(mType == FormControlType::InputRange);
+
+  if (nsEventStatus_eConsumeNoDefault == aVisitor.mEventStatus ||
+      !(aVisitor.mEvent->mClass == eMouseEventClass ||
+        aVisitor.mEvent->mClass == eTouchEventClass ||
+        aVisitor.mEvent->mClass == eKeyboardEventClass)) {
+    return;
+  }
+
+  nsRangeFrame* rangeFrame = do_QueryFrame(GetPrimaryFrame());
+  if (!rangeFrame && mIsDraggingRange) {
+    CancelRangeThumbDrag();
+    return;
+  }
+
+  switch (aVisitor.mEvent->mMessage) {
+    case eMouseDown:
+    case eTouchStart: {
+      if (mIsDraggingRange) {
+        break;
+      }
+      if (PresShell::GetCapturingContent()) {
+        break;  
+      }
+      WidgetInputEvent* inputEvent = aVisitor.mEvent->AsInputEvent();
+      if (IgnoreInputEventWithModifier(*inputEvent, true)) {
+        break;  
+      }
+      if (aVisitor.mEvent->mMessage == eMouseDown) {
+        if (aVisitor.mEvent->AsMouseEvent()->mButtons ==
+            MouseButtonsFlag::ePrimaryFlag) {
+          StartRangeThumbDrag(inputEvent);
+        } else if (mIsDraggingRange) {
+          CancelRangeThumbDrag();
+        }
+      } else {
+        if (aVisitor.mEvent->AsTouchEvent()->mTouches.Length() == 1) {
+          StartRangeThumbDrag(inputEvent);
+        } else if (mIsDraggingRange) {
+          CancelRangeThumbDrag();
+        }
+      }
+      aVisitor.mEvent->mFlags.mMultipleActionsPrevented = true;
+    } break;
+
+    case eMouseMove:
+    case eTouchMove:
+      if (!mIsDraggingRange) {
+        break;
+      }
+      if (PresShell::GetCapturingContent() != this) {
+        CancelRangeThumbDrag();
+        break;
+      }
+      SetValueOfRangeForUserEvent(
+          rangeFrame->GetValueAtEventPoint(aVisitor.mEvent->AsInputEvent()),
+          SnapToTickMarks::Yes);
+      aVisitor.mEvent->mFlags.mMultipleActionsPrevented = true;
+      break;
+
+    case eMouseUp:
+    case eTouchEnd:
+      if (!mIsDraggingRange) {
+        break;
+      }
+      FinishRangeThumbDrag(aVisitor.mEvent->AsInputEvent());
+      aVisitor.mEvent->mFlags.mMultipleActionsPrevented = true;
+      break;
+
+    case eKeyPress:
+      if (mIsDraggingRange &&
+          aVisitor.mEvent->AsKeyboardEvent()->mKeyCode == NS_VK_ESCAPE) {
+        CancelRangeThumbDrag();
+      }
+      break;
+
+    case eTouchCancel:
+      if (mIsDraggingRange) {
+        CancelRangeThumbDrag();
+      }
+      break;
+
+    default:
+      break;
+  }
+}
+
+void HTMLInputElement::MaybeLoadImage() {
+  nsAutoString uri;
+  if (mType == FormControlType::InputImage && GetAttr(nsGkAtoms::src, uri) &&
+      (NS_FAILED(LoadImage(uri, false, true, eImageLoadType_Normal,
+                           mSrcTriggeringPrincipal)) ||
+       !LoadingEnabled())) {
+    CancelImageRequests(true);
+  }
+}
+
+nsresult HTMLInputElement::BindToTree(BindContext& aContext, nsINode& aParent) {
+  if (!mForm && mType == FormControlType::InputRadio) {
+    RemoveFromRadioGroup();
+  }
+
+  nsresult rv =
+      nsGenericHTMLFormControlElementWithState::BindToTree(aContext, aParent);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsImageLoadingContent::BindToTree(aContext, aParent);
+
+  if (mType == FormControlType::InputImage) {
+    if (HasAttr(nsGkAtoms::src)) {
+      mUseUrgentStartForChannel = UserActivation::IsHandlingUserInput();
+
+      nsContentUtils::AddScriptRunner(
+          NewRunnableMethod("dom::HTMLInputElement::MaybeLoadImage", this,
+                            &HTMLInputElement::MaybeLoadImage));
+    }
+  }
+
+  if (!mForm && mType == FormControlType::InputRadio) {
+    AddToRadioGroup();
+  }
+
+  ResetDirFormAssociatedElement(this, false, HasDirAuto());
+
+  UpdateValueMissingValidityState();
+
+  UpdateBarredFromConstraintValidation();
+
+  UpdateValidityElementStates(true);
+
+  if (mDoneCreating && IsInComposedDoc() && CreatesDateTimeWidget()) {
+    SetupShadowTree( false);
+  }
+
+  return rv;
+}
+
+void HTMLInputElement::SetupShadowTree(bool aNotify) {
+  MOZ_ASSERT(CreatesUAShadowTree());
+  MOZ_ASSERT(IsInComposedDoc());
+  MOZ_ASSERT(!GetShadowRoot());
+
+  auto uaWidget = NotifiesUAWidget();
+  AttachAndSetUAShadowRoot(uaWidget,
+                           uaWidget == NotifyUAWidget::Yes ? DelegatesFocus::Yes
+                                                           : DelegatesFocus::No,
+                           CustomSlotDispatch::No, aNotify);
+  if (uaWidget == NotifyUAWidget::Yes) {
+    return;
+  }
+  auto* shadow = GetShadowRoot();
+  if (!shadow) {
+    return;
+  }
+  MOZ_ASSERT(IsSingleLineTextControl());
+  TextControlElement::SetupShadowTree(*shadow, aNotify);
+}
+
+ShadowRoot* HTMLInputElement::CreateShadowTreeFromLayoutIfNeeded() {
+  if (!CreatesUAShadowTree()) {
+    return nullptr;
+  }
+  auto* existing = GetShadowRoot();
+  if (existing) {
+    return nullptr;
+  }
+  if (HasChildren()) [[unlikely]] {
+    RestyleManager::ClearServoDataFromSubtree(this,
+                                              RestyleManager::IncludeRoot::No);
+  }
+  SetupShadowTree( false);
+  return GetShadowRoot();
+}
+
+void HTMLInputElement::UnbindFromTree(UnbindContext& aContext) {
+  if (!mForm && mType == FormControlType::InputRadio) {
+    RemoveFromRadioGroup();
+  }
+
+  if (CreatesUAShadowTree() && IsInComposedDoc()) {
+    TeardownUAShadowRoot(NotifiesUAWidget());
+  }
+
+  nsImageLoadingContent::UnbindFromTree();
+  nsGenericHTMLFormControlElementWithState::UnbindFromTree(aContext);
+
+  if (!mForm && mType == FormControlType::InputRadio) {
+    AddToRadioGroup();
+  }
+
+  UpdateValueMissingValidityState();
+  UpdateBarredFromConstraintValidation();
+  UpdateValidityElementStates(false);
+}
+
+static bool SetRangeTextApplies(FormControlType aType) {
+  return aType == FormControlType::InputText ||
+         aType == FormControlType::InputSearch ||
+         aType == FormControlType::InputUrl ||
+         aType == FormControlType::InputTel ||
+         aType == FormControlType::InputPassword;
+}
+
+void HTMLInputElement::HandleTypeChange(FormControlType aNewType,
+                                        bool aNotify) {
+  FormControlType oldType = mType;
+  MOZ_ASSERT(oldType != aNewType);
+
+  mHasBeenTypePassword =
+      mHasBeenTypePassword || aNewType == FormControlType::InputPassword;
+
+  if (nsFocusManager* fm = nsFocusManager::GetFocusManager()) {
+    fm->NeedsFlushBeforeEventHandling(this);
+  }
+
+  if (oldType == FormControlType::InputPassword &&
+      State().HasState(ElementState::REVEALED)) {
+    RemoveStates(ElementState::REVEALED, aNotify);
+  }
+
+  if (aNewType == FormControlType::InputFile ||
+      oldType == FormControlType::InputFile) {
+    if (aNewType == FormControlType::InputFile) {
+      mFileData.reset(new FileData());
+    } else {
+      mFileData->Unlink();
+      mFileData = nullptr;
+    }
+  }
+
+  if (oldType == FormControlType::InputRange && mIsDraggingRange) {
+    CancelRangeThumbDrag(false);
+  }
+
+  const ValueModeType oldValueMode = GetValueMode();
+  nsAutoString oldValue;
+  if (oldValueMode == VALUE_MODE_VALUE) {
+    GetValue(oldValue, CallerType::NonSystem);
+  }
+
+  const bool wasTextControl = IsSingleLineTextControl(false, oldType);
+  const bool isTextControl = IsSingleLineTextControl(false, aNewType);
+  if (wasTextControl && !isTextControl && mInputData.mState) {
+    mInputData.mState->DeinitSelection();
+  }
+
+  FreeData(isTextControl ? TextControlStateDisposition::Reuse
+                         : TextControlStateDisposition::Destroy);
+  mType = aNewType;
+  void* memory = mInputTypeMem;
+  mInputType = InputType::Create(this, mType, memory);
+
+  if (isTextControl) {
+    if (!mInputData.mState) {
+      mInputData.mState = TextControlState::Construct(this);
+    } else {
+      if (!SupportsTextSelection(oldType)) {
+        mInputData.mState->SetSelectionRange(
+            0, 0, SelectionDirection::Forward, IgnoreErrors(),
+            TextControlState::ScrollAfterSelection::No);
+      }
+      mInputData.mState->UpdateEditorOnTypeChange();
+    }
+  }
+
+  UpdatePlaceholderShownState();
+  UpdateReadOnlyState(aNotify);
+  UpdateCheckedState(aNotify);
+  UpdateIndeterminateState(aNotify);
+  const bool isDefault = IsRadioOrCheckbox()
+                             ? DefaultChecked()
+                             : (mForm && mForm->IsDefaultSubmitElement(this));
+  SetStates(ElementState::DEFAULT, isDefault, aNotify);
+
+  switch (GetValueMode()) {
+    case VALUE_MODE_DEFAULT:
+    case VALUE_MODE_DEFAULT_ON:
+      if (oldValueMode == VALUE_MODE_VALUE && !oldValue.IsEmpty()) {
+        SetAttr(kNameSpaceID_None, nsGkAtoms::value, oldValue, true);
+      }
+      break;
+    case VALUE_MODE_VALUE: {
+      ValueSetterOptions options{ValueSetterOption::ByInternalAPI};
+      if (!SetRangeTextApplies(oldType) && SetRangeTextApplies(mType)) {
+        options +=
+            ValueSetterOption::MoveCursorToBeginSetSelectionDirectionForward;
+      }
+      if (oldValueMode != VALUE_MODE_VALUE) {
+        nsAutoString value;
+        GetAttr(nsGkAtoms::value, value);
+        SetValueInternal(value, options);
+        SetValueChanged(false);
+      } else if (mValueChanged) {
+        SetValueInternal(oldValue, options);
+      } else {
+        SetDefaultValueAsValue();
+      }
+      break;
+    }
+    case VALUE_MODE_FILENAME:
+    default:
+      break;
+  }
+
+  if (MayFireChangeOnBlur(mType) && !MayFireChangeOnBlur(oldType)) {
+    GetValue(mFocusedValue, CallerType::System);
+  } else if (!IsSingleLineTextControl(false, mType) &&
+             IsSingleLineTextControl(false, oldType)) {
+    mFocusedValue.Truncate();
+  }
+
+  if (DoesRequiredApply()) {
+    const bool isRequired = HasAttr(nsGkAtoms::required);
+    UpdateRequiredState(isRequired, aNotify);
+  } else {
+    RemoveStates(ElementState::REQUIRED_STATES, aNotify);
+  }
+
+  UpdateHasRange(aNotify);
+
+  UpdateAllValidityStatesButNotElementState();
+
+  UpdateApzAwareFlag();
+
+  UpdateBarredFromConstraintValidation();
+
+  const bool autoDirAssociated = IsAutoDirectionalityAssociated(mType);
+  if (IsAutoDirectionalityAssociated(oldType) != autoDirAssociated) {
+    ResetDirFormAssociatedElement(this, aNotify, true);
+  }
+  if (!HasDirAuto() && (oldType == FormControlType::InputTel ||
+                        mType == FormControlType::InputTel)) {
+    RecomputeDirectionality(this, aNotify);
+  }
+
+  if (oldType == FormControlType::InputImage ||
+      mType == FormControlType::InputImage) {
+    if (oldType == FormControlType::InputImage) {
+      CancelImageRequests(aNotify);
+      RemoveStates(ElementState::BROKEN, aNotify);
+    } else {
+      bool hasSrc = false;
+      if (aNotify) {
+        nsAutoString src;
+        if ((hasSrc = GetAttr(nsGkAtoms::src, src))) {
+          mUseUrgentStartForChannel = UserActivation::IsHandlingUserInput();
+
+          LoadImage(src, false, aNotify, eImageLoadType_Normal,
+                    mSrcTriggeringPrincipal);
+        }
+      } else {
+        hasSrc = HasAttr(nsGkAtoms::src);
+      }
+      if (!hasSrc) {
+        AddStates(ElementState::BROKEN, aNotify);
+      }
+    }
+    if (mAttrs.HasAttrs() && !mAttrs.IsPendingMappedAttributeEvaluation()) {
+      mAttrs.InfallibleMarkAsPendingPresAttributeEvaluation();
+      if (auto* doc = GetComposedDoc()) {
+        doc->ScheduleForPresAttrEvaluation(this);
+      }
+    }
+  }
+
+  if (IsInComposedDoc()) {
+    if (mDoneCreating) {
+      const auto oldNotifiesUAWidget = NotifiesUAWidget(oldType);
+      if (CreatesUAShadowTree()) {
+        if (wasTextControl && isTextControl) {
+          UpdateTextEditorShadowTree();
+        } else {
+          const auto notifiesUAWidget = NotifiesUAWidget();
+          if (oldNotifiesUAWidget == notifiesUAWidget &&
+              notifiesUAWidget == NotifyUAWidget::Yes) {
+            NotifyUAWidgetSetupOrChange();
+          } else {
+            TeardownUAShadowRoot(oldNotifiesUAWidget);
+            if (notifiesUAWidget == NotifyUAWidget::Yes) {
+              SetupShadowTree(aNotify);
+            }
+          }
+        }
+      } else {
+        TeardownUAShadowRoot(oldNotifiesUAWidget);
+      }
+    }
+    if (State().HasState(ElementState::FOCUS) && IsSingleLineTextControl() &&
+        !IsSingleLineTextControl( false, oldType)) {
+      AddStates(ElementState::FOCUSRING);
+    }
+  }
+}
+
+void HTMLInputElement::MaybeSnapToTickMark(Decimal& aValue) {
+  nsRangeFrame* rangeFrame = do_QueryFrame(GetPrimaryFrame());
+  if (!rangeFrame) {
+    return;
+  }
+  auto tickMark = rangeFrame->NearestTickMark(aValue);
+  if (tickMark.isNaN()) {
+    return;
+  }
+  auto rangeFrameSize = CSSPixel::FromAppUnits(rangeFrame->GetSize());
+  CSSCoord rangeTrackLength;
+  if (rangeFrame->IsHorizontal()) {
+    rangeTrackLength = rangeFrameSize.width;
+  } else {
+    rangeTrackLength = rangeFrameSize.height;
+  }
+  auto stepBase = GetStepBase();
+  auto distanceToTickMark =
+      rangeTrackLength * float(rangeFrame->GetDoubleAsFractionOfRange(
+                             stepBase + (tickMark - aValue).abs()));
+  const CSSCoord magnetEffectRange(
+      StaticPrefs::dom_range_element_magnet_effect_threshold());
+  if (distanceToTickMark <= magnetEffectRange) {
+    aValue = tickMark;
+  }
+}
+
+void HTMLInputElement::SanitizeValue(nsAString& aValue,
+                                     SanitizationKind aKind) const {
+  NS_ASSERTION(mDoneCreating, "The element creation should be finished!");
+
+  switch (mType) {
+    case FormControlType::InputText:
+    case FormControlType::InputSearch:
+    case FormControlType::InputTel:
+    case FormControlType::InputPassword: {
+      aValue.StripCRLF();
+    } break;
+    case FormControlType::InputEmail: {
+      aValue.StripCRLF();
+      aValue = nsContentUtils::TrimWhitespace<nsContentUtils::IsHTMLWhitespace>(
+          aValue);
+
+      if (Multiple() && !aValue.IsEmpty()) {
+        nsAutoString oldValue(aValue);
+        HTMLSplitOnSpacesTokenizer tokenizer(oldValue, ',');
+        aValue.Truncate(0);
+        aValue.Append(tokenizer.nextToken());
+        while (tokenizer.hasMoreTokens() ||
+               tokenizer.separatorAfterCurrentToken()) {
+          aValue.Append(',');
+          aValue.Append(tokenizer.nextToken());
+        }
+      }
+    } break;
+    case FormControlType::InputUrl: {
+      aValue.StripCRLF();
+
+      aValue = nsContentUtils::TrimWhitespace<nsContentUtils::IsHTMLWhitespace>(
+          aValue);
+    } break;
+    case FormControlType::InputNumber: {
+      auto result = mInputType->ConvertStringToNumber(
+          aValue, aKind == SanitizationKind::ForValueSetter
+                      ? InputType::Localized::No
+                      : InputType::Localized::Yes);
+      if (!result.mResult.isFinite()) {
+        aValue.Truncate();
+        return;
+      }
+      switch (aKind) {
+        case SanitizationKind::ForValueGetter: {
+          if (!result.mLocalized) {
+            return;
+          }
+          aValue.AssignASCII(result.mResult.toString().c_str());
+          break;
+        }
+        case SanitizationKind::ForDisplay:
+        case SanitizationKind::ForValueSetter: {
+          nsString localizedValue;
+          mInputType->ConvertNumberToString(
+              result.mResult, InputType::Localized::Yes, localizedValue);
+          if (!StringToDecimal(localizedValue).isFinite()) {
+            aValue = std::move(localizedValue);
+          }
+          break;
+        }
+      }
+      break;
+    }
+    case FormControlType::InputRange: {
+      Decimal minimum = GetMinimum();
+      Decimal maximum = GetMaximum();
+      MOZ_ASSERT(minimum.isFinite() && maximum.isFinite(),
+                 "type=range should have a default maximum/minimum");
+
+      bool needSanitization = false;
+
+      Decimal value =
+          mInputType->ConvertStringToNumber(aValue, InputType::Localized::Yes)
+              .mResult;
+      if (!value.isFinite()) {
+        needSanitization = true;
+        value = maximum <= minimum ? minimum
+                                   : minimum + (maximum - minimum) / Decimal(2);
+      } else if (value < minimum || maximum < minimum) {
+        needSanitization = true;
+        value = minimum;
+      } else if (value > maximum) {
+        needSanitization = true;
+        value = maximum;
+      }
+
+      Decimal step = GetStep();
+      if (step != kStepAny) {
+        Decimal stepBase = GetStepBase();
+        Decimal deltaToStep = NS_floorModulo(value - stepBase, step);
+        if (deltaToStep != Decimal(0)) {
+          MOZ_ASSERT(deltaToStep > Decimal(0),
+                     "stepBelow/stepAbove will be wrong");
+          Decimal stepBelow = value - deltaToStep;
+          Decimal stepAbove = value - deltaToStep + step;
+          Decimal halfStep = step / Decimal(2);
+          bool stepAboveIsClosest = (stepAbove - value) <= halfStep;
+          bool stepAboveInRange = stepAbove >= minimum && stepAbove <= maximum;
+          bool stepBelowInRange = stepBelow >= minimum && stepBelow <= maximum;
+
+          if ((stepAboveIsClosest || !stepBelowInRange) && stepAboveInRange) {
+            needSanitization = true;
+            value = stepAbove;
+          } else if ((!stepAboveIsClosest || !stepAboveInRange) &&
+                     stepBelowInRange) {
+            needSanitization = true;
+            value = stepBelow;
+          }
+        }
+      }
+
+      if (needSanitization) {
+        aValue.AssignASCII(value.toString().c_str());
+      }
+    } break;
+    case FormControlType::InputDate: {
+      if (!aValue.IsEmpty() && !IsValidDate(aValue)) {
+        aValue.Truncate();
+      }
+    } break;
+    case FormControlType::InputTime: {
+      if (!aValue.IsEmpty() && !IsValidTime(aValue)) {
+        aValue.Truncate();
+      }
+    } break;
+    case FormControlType::InputMonth: {
+      if (!aValue.IsEmpty() && !IsValidMonth(aValue)) {
+        aValue.Truncate();
+      }
+    } break;
+    case FormControlType::InputWeek: {
+      if (!aValue.IsEmpty() && !IsValidWeek(aValue)) {
+        aValue.Truncate();
+      }
+    } break;
+    case FormControlType::InputDatetimeLocal: {
+      if (!aValue.IsEmpty() && !IsValidDateTimeLocal(aValue)) {
+        aValue.Truncate();
+      } else {
+        NormalizeDateTimeLocal(aValue);
+      }
+    } break;
+    case FormControlType::InputColor: {
+      StyleAbsoluteColor color = MaybeComputeColorOrBlack(OwnerDoc(), aValue);
+      SerializeColor(color, GetColorSpaceEnum(), Alpha(), aValue);
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+Maybe<nscolor> HTMLInputElement::ParseSimpleColor(const nsAString& aColor) {
+  if (aColor.Length() != 7 || aColor.First() != '#') {
+    return {};
+  }
+
+  const nsAString& withoutHash = StringTail(aColor, 6);
+  nscolor color;
+  if (!NS_HexToRGBA(withoutHash, nsHexColorType::NoAlpha, &color)) {
+    return {};
+  }
+
+  return Some(color);
+}
+
+bool HTMLInputElement::IsLeapYear(uint32_t aYear) const {
+  if ((aYear % 4 == 0 && aYear % 100 != 0) || (aYear % 400 == 0)) {
+    return true;
+  }
+  return false;
+}
+
+uint32_t HTMLInputElement::DayOfWeek(uint32_t aYear, uint32_t aMonth,
+                                     uint32_t aDay, bool isoWeek) const {
+  MOZ_ASSERT(1 <= aMonth && aMonth <= 12, "month is in 1..12");
+  MOZ_ASSERT(1 <= aDay && aDay <= 31, "day is in 1..31");
+
+  int monthTable[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+  aYear -= aMonth < 3;
+
+  uint32_t day = (aYear + aYear / 4 - aYear / 100 + aYear / 400 +
+                  monthTable[aMonth - 1] + aDay) %
+                 7;
+
+  if (isoWeek) {
+    return ((day + 6) % 7) + 1;
+  }
+
+  return day;
+}
+
+uint32_t HTMLInputElement::MaximumWeekInYear(uint32_t aYear) const {
+  int day = DayOfWeek(aYear, 1, 1, true);  
+  return day == 4 || (day == 3 && IsLeapYear(aYear)) ? kMaximumWeekInYear
+                                                     : kMaximumWeekInYear - 1;
+}
+
+bool HTMLInputElement::IsValidWeek(const nsAString& aValue) const {
+  uint32_t year, week;
+  return ParseWeek(aValue, &year, &week);
+}
+
+bool HTMLInputElement::IsValidMonth(const nsAString& aValue) const {
+  uint32_t year, month;
+  return ParseMonth(aValue, &year, &month);
+}
+
+bool HTMLInputElement::IsValidDate(const nsAString& aValue) const {
+  uint32_t year, month, day;
+  return ParseDate(aValue, &year, &month, &day);
+}
+
+bool HTMLInputElement::IsValidDateTimeLocal(const nsAString& aValue) const {
+  uint32_t year, month, day, time;
+  return ParseDateTimeLocal(aValue, &year, &month, &day, &time);
+}
+
+bool HTMLInputElement::ParseYear(const nsAString& aValue,
+                                 uint32_t* aYear) const {
+  if (aValue.Length() < 4) {
+    return false;
+  }
+
+  return DigitSubStringToNumber(aValue, 0, aValue.Length(), aYear) &&
+         *aYear > 0;
+}
+
+bool HTMLInputElement::ParseMonth(const nsAString& aValue, uint32_t* aYear,
+                                  uint32_t* aMonth) const {
+  if (aValue.Length() < 7) {
+    return false;
+  }
+
+  uint32_t endOfYearOffset = aValue.Length() - 3;
+  if (aValue[endOfYearOffset] != '-') {
+    return false;
+  }
+
+  const nsAString& yearStr = Substring(aValue, 0, endOfYearOffset);
+  if (!ParseYear(yearStr, aYear)) {
+    return false;
+  }
+
+  return DigitSubStringToNumber(aValue, endOfYearOffset + 1, 2, aMonth) &&
+         *aMonth > 0 && *aMonth <= 12;
+}
+
+bool HTMLInputElement::ParseWeek(const nsAString& aValue, uint32_t* aYear,
+                                 uint32_t* aWeek) const {
+  if (aValue.Length() < 8) {
+    return false;
+  }
+
+  uint32_t endOfYearOffset = aValue.Length() - 4;
+  if (aValue[endOfYearOffset] != '-') {
+    return false;
+  }
+
+  if (aValue[endOfYearOffset + 1] != 'W') {
+    return false;
+  }
+
+  const nsAString& yearStr = Substring(aValue, 0, endOfYearOffset);
+  if (!ParseYear(yearStr, aYear)) {
+    return false;
+  }
+
+  return DigitSubStringToNumber(aValue, endOfYearOffset + 2, 2, aWeek) &&
+         *aWeek > 0 && *aWeek <= MaximumWeekInYear(*aYear);
+}
+
+bool HTMLInputElement::ParseDate(const nsAString& aValue, uint32_t* aYear,
+                                 uint32_t* aMonth, uint32_t* aDay) const {
+  if (aValue.Length() < 10) {
+    return false;
+  }
+
+  uint32_t endOfMonthOffset = aValue.Length() - 3;
+  if (aValue[endOfMonthOffset] != '-') {
+    return false;
+  }
+
+  const nsAString& yearMonthStr = Substring(aValue, 0, endOfMonthOffset);
+  if (!ParseMonth(yearMonthStr, aYear, aMonth)) {
+    return false;
+  }
+
+  return DigitSubStringToNumber(aValue, endOfMonthOffset + 1, 2, aDay) &&
+         *aDay > 0 && *aDay <= NumberOfDaysInMonth(*aMonth, *aYear);
+}
+
+bool HTMLInputElement::ParseDateTimeLocal(const nsAString& aValue,
+                                          uint32_t* aYear, uint32_t* aMonth,
+                                          uint32_t* aDay,
+                                          uint32_t* aTime) const {
+  if (aValue.Length() < 16) {
+    return false;
+  }
+
+  int32_t sepIndex = aValue.FindChar('T');
+  if (sepIndex == -1) {
+    sepIndex = aValue.FindChar(' ');
+
+    if (sepIndex == -1) {
+      return false;
+    }
+  }
+
+  const nsAString& dateStr = Substring(aValue, 0, sepIndex);
+  if (!ParseDate(dateStr, aYear, aMonth, aDay)) {
+    return false;
+  }
+
+  const nsAString& timeStr =
+      Substring(aValue, sepIndex + 1, aValue.Length() - sepIndex + 1);
+  if (!ParseTime(timeStr, aTime)) {
+    return false;
+  }
+
+  return true;
+}
+
+void HTMLInputElement::NormalizeDateTimeLocal(nsAString& aValue) const {
+  if (aValue.IsEmpty()) {
+    return;
+  }
+
+  int32_t sepIndex = aValue.FindChar(' ');
+  if (sepIndex != -1) {
+    aValue.ReplaceLiteral(sepIndex, 1, u"T");
+  } else {
+    sepIndex = aValue.FindChar('T');
+  }
+
+  if ((aValue.Length() - sepIndex) == 6) {
+    return;
+  }
+
+  if ((aValue.Length() - sepIndex) > 9) {
+    const uint32_t millisecSepIndex = sepIndex + 9;
+    uint32_t milliseconds;
+    if (!DigitSubStringToNumber(aValue, millisecSepIndex + 1,
+                                aValue.Length() - (millisecSepIndex + 1),
+                                &milliseconds)) {
+      return;
+    }
+
+    if (milliseconds != 0) {
+      return;
+    }
+
+    aValue.Cut(millisecSepIndex, aValue.Length() - millisecSepIndex);
+  }
+
+  const uint32_t secondSepIndex = sepIndex + 6;
+  uint32_t seconds;
+  if (!DigitSubStringToNumber(aValue, secondSepIndex + 1,
+                              aValue.Length() - (secondSepIndex + 1),
+                              &seconds)) {
+    return;
+  }
+
+  if (seconds != 0) {
+    return;
+  }
+
+  aValue.Cut(secondSepIndex, aValue.Length() - secondSepIndex);
+}
+
+double HTMLInputElement::DaysSinceEpochFromWeek(uint32_t aYear,
+                                                uint32_t aWeek) const {
+  double days = JS::DayFromYear(aYear) + (aWeek - 1) * 7;
+  uint32_t dayOneIsoWeekday = DayOfWeek(aYear, 1, 1, true);
+
+  if (dayOneIsoWeekday <= 4) {
+    days -= (dayOneIsoWeekday - 1);
+  } else {
+    days += (7 - dayOneIsoWeekday + 1);
+  }
+
+  return days;
+}
+
+uint32_t HTMLInputElement::NumberOfDaysInMonth(uint32_t aMonth,
+                                               uint32_t aYear) const {
+
+  static const bool longMonths[] = {true, false, true,  false, true,  false,
+                                    true, true,  false, true,  false, true};
+  MOZ_ASSERT(aMonth <= 12 && aMonth > 0);
+
+  if (longMonths[aMonth - 1]) {
+    return 31;
+  }
+
+  if (aMonth != 2) {
+    return 30;
+  }
+
+  return IsLeapYear(aYear) ? 29 : 28;
+}
+
+bool HTMLInputElement::DigitSubStringToNumber(const nsAString& aStr,
+                                              uint32_t aStart, uint32_t aLen,
+                                              uint32_t* aRetVal) {
+  MOZ_ASSERT(aStr.Length() > (aStart + aLen - 1));
+
+  for (uint32_t offset = 0; offset < aLen; ++offset) {
+    if (!IsAsciiDigit(aStr[aStart + offset])) {
+      return false;
+    }
+  }
+
+  nsresult ec;
+  *aRetVal = static_cast<uint32_t>(
+      PromiseFlatString(Substring(aStr, aStart, aLen)).ToInteger(&ec));
+
+  return NS_SUCCEEDED(ec);
+}
+
+bool HTMLInputElement::IsValidTime(const nsAString& aValue) const {
+  return ParseTime(aValue, nullptr);
+}
+
+bool HTMLInputElement::ParseTime(const nsAString& aValue, uint32_t* aResult) {
+
+  if (aValue.Length() < 5) {
+    return false;
+  }
+
+  uint32_t hours;
+  if (!DigitSubStringToNumber(aValue, 0, 2, &hours) || hours > 23) {
+    return false;
+  }
+
+  if (aValue[2] != ':') {
+    return false;
+  }
+
+  uint32_t minutes;
+  if (!DigitSubStringToNumber(aValue, 3, 2, &minutes) || minutes > 59) {
+    return false;
+  }
+
+  if (aValue.Length() == 5) {
+    if (aResult) {
+      *aResult = ((hours * 60) + minutes) * 60000;
+    }
+    return true;
+  }
+
+  if (aValue.Length() < 8 || aValue[5] != ':') {
+    return false;
+  }
+
+  uint32_t seconds;
+  if (!DigitSubStringToNumber(aValue, 6, 2, &seconds) || seconds > 59) {
+    return false;
+  }
+
+  if (aValue.Length() == 8) {
+    if (aResult) {
+      *aResult = (((hours * 60) + minutes) * 60 + seconds) * 1000;
+    }
+    return true;
+  }
+
+  if (aValue.Length() == 9 || aValue.Length() > 12 || aValue[8] != '.') {
+    return false;
+  }
+
+  uint32_t fractionsSeconds;
+  if (!DigitSubStringToNumber(aValue, 9, aValue.Length() - 9,
+                              &fractionsSeconds)) {
+    return false;
+  }
+
+  if (aResult) {
+    *aResult = (((hours * 60) + minutes) * 60 + seconds) * 1000 +
+               fractionsSeconds *
+                   pow(10.0, static_cast<int>(3 - (aValue.Length() - 9)));
+  }
+
+  return true;
+}
+
+bool HTMLInputElement::IsDateTimeTypeSupported(
+    FormControlType aDateTimeInputType) {
+  switch (aDateTimeInputType) {
+    case FormControlType::InputDate:
+    case FormControlType::InputTime:
+    case FormControlType::InputDatetimeLocal:
+      return true;
+    case FormControlType::InputMonth:
+    case FormControlType::InputWeek:
+      return StaticPrefs::dom_forms_datetime_others();
+    default:
+      return false;
+  }
+}
+
+void HTMLInputElement::GetLastInteractiveValue(nsAString& aValue) {
+  if (mLastValueChangeWasInteractive) {
+    return GetValue(aValue, CallerType::System);
+  }
+  if (TextControlState* state = GetEditorState()) {
+    return aValue.Assign(
+        state->LastInteractiveValueIfLastChangeWasNonInteractive());
+  }
+  aValue.Truncate();
+}
+
+bool HTMLInputElement::ParseAttribute(int32_t aNamespaceID, nsAtom* aAttribute,
+                                      const nsAString& aValue,
+                                      nsIPrincipal* aMaybeScriptedPrincipal,
+                                      nsAttrValue& aResult) {
+  static_assert(
+      FormControlType(kInputDefaultType->value) == FormControlType::InputText,
+      "Someone forgot to update kInputDefaultType when adding a new "
+      "input type.");
+  static_assert(
+      FormControlType(kInputTypeTable[std::size(kInputTypeTable) - 1].value) ==
+          FormControlType::InputText,
+      "Last entry in the table must be the \"text\" entry");
+
+  if (aNamespaceID == kNameSpaceID_None) {
+    if (aAttribute == nsGkAtoms::type) {
+      aResult.ParseEnumValue(aValue, kInputTypeTable, false, kInputDefaultType);
+      auto newType = FormControlType(aResult.GetEnumValue());
+      if (IsDateTimeInputType(newType) && !IsDateTimeTypeSupported(newType)) {
+        MOZ_ASSERT(&Span(kInputTypeTable).Last<1>()[0] == kInputDefaultType);
+        aResult.ParseEnumValue(aValue, Span(kInputTypeTable).Last<1>(), false,
+                               kInputDefaultType);
+      }
+
+      return true;
+    }
+    if (aAttribute == nsGkAtoms::width) {
+      return aResult.ParseHTMLDimension(aValue);
+    }
+    if (aAttribute == nsGkAtoms::height) {
+      return aResult.ParseHTMLDimension(aValue);
+    }
+    if (aAttribute == nsGkAtoms::maxlength) {
+      return aResult.ParseNonNegativeIntValue(aValue);
+    }
+    if (aAttribute == nsGkAtoms::minlength) {
+      return aResult.ParseNonNegativeIntValue(aValue);
+    }
+    if (aAttribute == nsGkAtoms::size) {
+      return aResult.ParsePositiveIntValue(aValue);
+    }
+    if (aAttribute == nsGkAtoms::align) {
+      return ParseAlignValue(aValue, aResult);
+    }
+    if (aAttribute == nsGkAtoms::formmethod) {
+      return aResult.ParseEnumValue(aValue, kFormMethodTable, false);
+    }
+    if (aAttribute == nsGkAtoms::formenctype) {
+      return aResult.ParseEnumValue(aValue, kFormEnctypeTable, false);
+    }
+    if (aAttribute == nsGkAtoms::autocomplete) {
+      aResult.ParseAtomArray(aValue);
+      return true;
+    }
+    if (aAttribute == nsGkAtoms::capture) {
+      return aResult.ParseEnumValue(aValue, kCaptureTable, false,
+                                    kCaptureDefault);
+    }
+    if (aAttribute == nsGkAtoms::colorspace) {
+      return aResult.ParseEnumValue(aValue, kColorSpaceTable, false,
+                                    kColorSpaceDefault);
+    }
+    if (ParseImageAttribute(aAttribute, aValue, aResult)) {
+      return true;
+    }
+  }
+
+  return TextControlElement::ParseAttribute(aNamespaceID, aAttribute, aValue,
+                                            aMaybeScriptedPrincipal, aResult);
+}
+
+void HTMLInputElement::ImageInputMapAttributesIntoRule(
+    MappedDeclarationsBuilder& aBuilder) {
+  nsGenericHTMLFormControlElementWithState::MapImageBorderAttributeInto(
+      aBuilder);
+  nsGenericHTMLFormControlElementWithState::MapImageMarginAttributeInto(
+      aBuilder);
+  nsGenericHTMLFormControlElementWithState::MapImageSizeAttributesInto(
+      aBuilder, MapAspectRatio::Yes);
+  nsGenericHTMLFormControlElementWithState::MapImageAlignAttributeInto(
+      aBuilder);
+  nsGenericHTMLFormControlElementWithState::MapCommonAttributesInto(aBuilder);
+}
+
+nsChangeHint HTMLInputElement::GetAttributeChangeHint(
+    const nsAtom* aAttribute, AttrModType aModType) const {
+  nsChangeHint retval =
+      nsGenericHTMLFormControlElementWithState::GetAttributeChangeHint(
+          aAttribute, aModType);
+
+  const bool isAdditionOrRemoval = IsAdditionOrRemoval(aModType);
+  const bool reconstruct = [&] {
+    if (aAttribute == nsGkAtoms::type) {
+      return true;
+    }
+
+    if (mType == FormControlType::InputFile &&
+        aAttribute == nsGkAtoms::webkitdirectory) {
+      return true;
+    }
+
+    if (mType == FormControlType::InputImage && isAdditionOrRemoval &&
+        (aAttribute == nsGkAtoms::alt || aAttribute == nsGkAtoms::value)) {
+      return true;
+    }
+    return false;
+  }();
+
+  if (reconstruct) {
+    retval |= nsChangeHint_ReconstructFrame;
+  } else if (aAttribute == nsGkAtoms::value) {
+    retval |= NS_STYLE_HINT_REFLOW;
+  } else if (aAttribute == nsGkAtoms::size && IsSingleLineTextControl(false)) {
+    retval |= NS_STYLE_HINT_REFLOW;
+  }
+
+  return retval;
+}
+
+NS_IMETHODIMP_(bool)
+HTMLInputElement::IsAttributeMapped(const nsAtom* aAttribute) const {
+  static const MappedAttributeEntry attributes[] = {
+      {nsGkAtoms::align},
+      {nullptr},
+  };
+
+  static const MappedAttributeEntry* const map[] = {
+      attributes,
+      sCommonAttributeMap,
+      sImageMarginSizeAttributeMap,
+      sImageBorderAttributeMap,
+  };
+
+  return FindAttributeDependence(aAttribute, map);
+}
+
+nsMapRuleToAttributesFunc HTMLInputElement::GetAttributeMappingFunction()
+    const {
+  if (mType == FormControlType::InputImage) {
+    return &ImageInputMapAttributesIntoRule;
+  }
+
+  return &MapCommonAttributesInto;
+}
+
+
+already_AddRefed<Promise> HTMLInputElement::GetFilesAndDirectories(
+    ErrorResult& aRv) {
+  if (mType != FormControlType::InputFile) {
+    aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+    return nullptr;
+  }
+
+  nsCOMPtr<nsIGlobalObject> global = GetRelevantGlobal();
+  MOZ_ASSERT(global);
+  if (!global) {
+    return nullptr;
+  }
+
+  RefPtr<Promise> p = Promise::Create(global, aRv);
+  if (aRv.Failed()) {
+    return nullptr;
+  }
+
+  const nsTArray<OwningFileOrDirectory>& filesAndDirs =
+      GetFilesOrDirectoriesInternal();
+
+  Sequence<OwningFileOrDirectory> filesAndDirsSeq;
+
+  if (!filesAndDirsSeq.SetLength(filesAndDirs.Length(), fallible)) {
+    p->MaybeReject(NS_ERROR_OUT_OF_MEMORY);
+    return p.forget();
+  }
+
+  for (uint32_t i = 0; i < filesAndDirs.Length(); ++i) {
+    if (filesAndDirs[i].IsDirectory()) {
+      RefPtr<Directory> directory = filesAndDirs[i].GetAsDirectory();
+
+      directory->SetContentFilters(u"filter-out-sensitive"_ns);
+      filesAndDirsSeq[i].SetAsDirectory() = directory;
+    } else {
+      MOZ_ASSERT(filesAndDirs[i].IsFile());
+
+      filesAndDirsSeq[i].SetAsFile() = filesAndDirs[i].GetAsFile();
+    }
+  }
+
+  p->MaybeResolve(filesAndDirsSeq);
+  return p.forget();
+}
+
+
+nsIControllers* HTMLInputElement::GetControllers(ErrorResult& aRv) {
+  if (IsSingleLineTextControl(false)) {
+    if (!mControllers) {
+      mControllers = new nsXULControllers();
+      if (!mControllers) {
+        aRv.Throw(NS_ERROR_FAILURE);
+        return nullptr;
+      }
+
+      RefPtr<nsBaseCommandController> commandController =
+          nsBaseCommandController::CreateEditorController();
+      if (!commandController) {
+        aRv.Throw(NS_ERROR_FAILURE);
+        return nullptr;
+      }
+
+      mControllers->AppendController(commandController);
+
+      commandController = nsBaseCommandController::CreateEditingController();
+      if (!commandController) {
+        aRv.Throw(NS_ERROR_FAILURE);
+        return nullptr;
+      }
+
+      mControllers->AppendController(commandController);
+    }
+  }
+
+  return GetExtantControllers();
+}
+
+nsresult HTMLInputElement::GetControllers(nsIControllers** aResult) {
+  NS_ENSURE_ARG_POINTER(aResult);
+
+  ErrorResult rv;
+  RefPtr<nsIControllers> controller = GetControllers(rv);
+  controller.forget(aResult);
+  return rv.StealNSResult();
+}
+
+int32_t HTMLInputElement::InputTextLength(CallerType aCallerType) {
+  nsAutoString val;
+  GetValue(val, aCallerType);
+  return val.Length();
+}
+
+void HTMLInputElement::SetSelectionRange(uint32_t aSelectionStart,
+                                         uint32_t aSelectionEnd,
+                                         const Optional<nsAString>& aDirection,
+                                         ErrorResult& aRv) {
+  if (!SupportsTextSelection()) {
+    aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+    return;
+  }
+
+  TextControlState* state = GetEditorState();
+  MOZ_ASSERT(state, "SupportsTextSelection() returned true!");
+  state->SetSelectionRange(aSelectionStart, aSelectionEnd, aDirection, aRv);
+}
+
+void HTMLInputElement::SetRangeText(const nsAString& aReplacement,
+                                    ErrorResult& aRv) {
+  if (!SupportsTextSelection()) {
+    aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+    return;
+  }
+
+  TextControlState* state = GetEditorState();
+  MOZ_ASSERT(state, "SupportsTextSelection() returned true!");
+  state->SetRangeText(aReplacement, aRv);
+}
+
+void HTMLInputElement::SetRangeText(const nsAString& aReplacement,
+                                    uint32_t aStart, uint32_t aEnd,
+                                    SelectionMode aSelectMode,
+                                    ErrorResult& aRv) {
+  if (!SupportsTextSelection()) {
+    aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+    return;
+  }
+
+  TextControlState* state = GetEditorState();
+  MOZ_ASSERT(state, "SupportsTextSelection() returned true!");
+  state->SetRangeText(aReplacement, aStart, aEnd, aSelectMode, aRv);
+}
+
+void HTMLInputElement::GetValueFromSetRangeText(nsAString& aValue) {
+  GetNonFileValueInternal(aValue);
+}
+
+nsresult HTMLInputElement::SetValueFromSetRangeText(const nsAString& aValue) {
+  return SetValueInternal(aValue, {ValueSetterOption::ByContentAPI,
+                                   ValueSetterOption::BySetRangeTextAPI,
+                                   ValueSetterOption::SetValueChanged});
+}
+
+Nullable<uint32_t> HTMLInputElement::GetSelectionStart(ErrorResult& aRv) {
+  if (!SupportsTextSelection()) {
+    return Nullable<uint32_t>();
+  }
+
+  uint32_t selStart = GetSelectionStartIgnoringType(aRv);
+  if (aRv.Failed()) {
+    return Nullable<uint32_t>();
+  }
+
+  return Nullable<uint32_t>(selStart);
+}
+
+uint32_t HTMLInputElement::GetSelectionStartIgnoringType(ErrorResult& aRv) {
+  uint32_t selEnd = 0, selStart = 0;
+  GetSelectionRange(&selStart, &selEnd, aRv);
+  return selStart;
+}
+
+void HTMLInputElement::SetSelectionStart(
+    const Nullable<uint32_t>& aSelectionStart, ErrorResult& aRv) {
+  if (!SupportsTextSelection()) {
+    aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+    return;
+  }
+
+  TextControlState* state = GetEditorState();
+  MOZ_ASSERT(state, "SupportsTextSelection() returned true!");
+  state->SetSelectionStart(aSelectionStart, aRv);
+}
+
+Nullable<uint32_t> HTMLInputElement::GetSelectionEnd(ErrorResult& aRv) {
+  if (!SupportsTextSelection()) {
+    return Nullable<uint32_t>();
+  }
+
+  uint32_t selEnd = GetSelectionEndIgnoringType(aRv);
+  if (aRv.Failed()) {
+    return Nullable<uint32_t>();
+  }
+
+  return Nullable<uint32_t>(selEnd);
+}
+
+uint32_t HTMLInputElement::GetSelectionEndIgnoringType(ErrorResult& aRv) {
+  uint32_t selEnd = 0, selStart = 0;
+  GetSelectionRange(&selStart, &selEnd, aRv);
+  return selEnd;
+}
+
+void HTMLInputElement::SetSelectionEnd(const Nullable<uint32_t>& aSelectionEnd,
+                                       ErrorResult& aRv) {
+  if (!SupportsTextSelection()) {
+    aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+    return;
+  }
+
+  TextControlState* state = GetEditorState();
+  MOZ_ASSERT(state, "SupportsTextSelection() returned true!");
+  state->SetSelectionEnd(aSelectionEnd, aRv);
+}
+
+void HTMLInputElement::GetSelectionRange(uint32_t* aSelectionStart,
+                                         uint32_t* aSelectionEnd,
+                                         ErrorResult& aRv) {
+  TextControlState* state = GetEditorState();
+  if (!state) {
+    aRv.Throw(NS_ERROR_UNEXPECTED);
+    return;
+  }
+
+  state->GetSelectionRange(aSelectionStart, aSelectionEnd, aRv);
+}
+
+void HTMLInputElement::GetSelectionDirection(nsAString& aDirection,
+                                             ErrorResult& aRv) {
+  if (!SupportsTextSelection()) {
+    aDirection.SetIsVoid(true);
+    return;
+  }
+
+  TextControlState* state = GetEditorState();
+  MOZ_ASSERT(state, "SupportsTextSelection came back true!");
+  state->GetSelectionDirectionString(aDirection, aRv);
+}
+
+void HTMLInputElement::SetSelectionDirection(const nsAString& aDirection,
+                                             ErrorResult& aRv) {
+  if (!SupportsTextSelection()) {
+    aRv.Throw(NS_ERROR_DOM_INVALID_STATE_ERR);
+    return;
+  }
+
+  TextControlState* state = GetEditorState();
+  MOZ_ASSERT(state, "SupportsTextSelection came back true!");
+  state->SetSelectionDirection(aDirection, aRv);
+}
+
+void HTMLInputElement::ShowPicker(ErrorResult& aRv) {
+  if (!IsMutable()) {
+    return aRv.ThrowInvalidStateError(
+        "This input is either disabled or readonly.");
+  }
+
+  if (mType != FormControlType::InputFile &&
+      mType != FormControlType::InputColor) {
+    nsPIDOMWindowInner* window = OwnerDoc()->GetInnerWindow();
+    WindowGlobalChild* windowGlobalChild =
+        window ? window->GetWindowGlobalChild() : nullptr;
+    if (!windowGlobalChild || !windowGlobalChild->SameOriginWithTop()) {
+      return aRv.ThrowSecurityError(
+          "Call was blocked because the current origin isn't same-origin with "
+          "top.");
+    }
+  }
+
+  if (!OwnerDoc()->HasValidTransientUserGestureActivation()) {
+    return aRv.ThrowNotAllowedError(
+        "Call was blocked due to lack of user activation.");
+  }
+
+
+
+
+  if (mType == FormControlType::InputFile) {
+    FilePickerType type = FILE_PICKER_FILE;
+    if (StaticPrefs::dom_webkitBlink_dirPicker_enabled() &&
+        HasAttr(nsGkAtoms::webkitdirectory)) {
+      type = FILE_PICKER_DIRECTORY;
+    }
+    InitFilePicker(type);
+    return;
+  }
+
+
+  if (mType == FormControlType::InputColor) {
+    InitColorPicker();
+    return;
+  }
+
+  OwnerDoc()->ConsumeTransientUserGestureActivation();
+
+  if (!IsInComposedDoc()) {
+    return;
+  }
+
+  if (IsDateTimeTypeSupported(mType)) {
+    if (CreatesDateTimeWidget()) {
+      if (RefPtr<Element> dateTimeBoxElement = GetDateTimeBoxElement()) {
+        RefPtr<Document> doc = OwnerDoc();
+        nsContentUtils::DispatchTrustedEvent(doc, dateTimeBoxElement,
+                                             u"MozDateTimeShowPickerForJS"_ns,
+                                             CanBubble::eNo, Cancelable::eNo);
+      }
+    } else {
+      DateTimeValue value;
+      GetDateTimeInputBoxValue(value);
+      OpenDateTimePicker(value);
+    }
+    return;
+  }
+
+}
+
+void HTMLInputElement::UpdateApzAwareFlag() {
+  if (mType == FormControlType::InputNumber ||
+      mType == FormControlType::InputRange) {
+    SetMayBeApzAware();
+  }
+}
+
+nsresult HTMLInputElement::SetDefaultValueAsValue() {
+  NS_ASSERTION(GetValueMode() == VALUE_MODE_VALUE,
+               "GetValueMode() should return VALUE_MODE_VALUE!");
+
+  nsAutoString resetVal;
+  GetDefaultValue(resetVal);
+
+  return SetValueInternal(resetVal, ValueSetterOption::ByInternalAPI);
+}
+
+NS_IMETHODIMP
+HTMLInputElement::Reset() {
+  SetCheckedChanged(false);
+  SetValueChanged(false);
+  SetLastValueChangeWasInteractive(false);
+  SetUserInteracted(false);
+
+  switch (GetValueMode()) {
+    case VALUE_MODE_VALUE: {
+      nsresult result = SetDefaultValueAsValue();
+      if (CreatesDateTimeWidget()) {
+        GetValue(mFocusedValue, CallerType::System);
+      }
+      return result;
+    }
+    case VALUE_MODE_DEFAULT_ON:
+      DoSetChecked(DefaultChecked(),  true,
+                    false);
+      return NS_OK;
+    case VALUE_MODE_FILENAME:
+      ClearFiles(false);
+      return NS_OK;
+    case VALUE_MODE_DEFAULT:
+    default:
+      return NS_OK;
+  }
+}
+
+NS_IMETHODIMP
+HTMLInputElement::SubmitNamesValues(FormData* aFormData) {
+  if (mType == FormControlType::InputReset ||
+      mType == FormControlType::InputButton ||
+      ((mType == FormControlType::InputSubmit ||
+        mType == FormControlType::InputImage) &&
+       aFormData->GetSubmitterElement() != this) ||
+      ((mType == FormControlType::InputRadio ||
+        mType == FormControlType::InputCheckbox) &&
+       !mChecked)) {
+    return NS_OK;
+  }
+
+  nsAutoString name;
+  GetAttr(nsGkAtoms::name, name);
+
+  if (mType == FormControlType::InputImage) {
+    const auto* lastClickedPoint =
+        static_cast<CSSIntPoint*>(GetProperty(nsGkAtoms::imageClickedPoint));
+    int32_t x, y;
+    if (lastClickedPoint) {
+      x = lastClickedPoint->x;
+      y = lastClickedPoint->y;
+    } else {
+      x = y = 0;
+    }
+
+    nsAutoString xVal, yVal;
+    xVal.AppendInt(x);
+    yVal.AppendInt(y);
+
+    if (!name.IsEmpty()) {
+      aFormData->AddNameValuePair(name + u".x"_ns, xVal);
+      aFormData->AddNameValuePair(name + u".y"_ns, yVal);
+    } else {
+      aFormData->AddNameValuePair(u"x"_ns, xVal);
+      aFormData->AddNameValuePair(u"y"_ns, yVal);
+    }
+
+    return NS_OK;
+  }
+
+  if (name.IsEmpty()) {
+    return NS_OK;
+  }
+
+  if (mType == FormControlType::InputFile) {
+
+    const nsTArray<OwningFileOrDirectory>& files =
+        GetFilesOrDirectoriesInternal();
+
+    if (files.IsEmpty()) {
+      NS_ENSURE_STATE(GetRelevantGlobal());
+      ErrorResult rv;
+      RefPtr<Blob> blob = Blob::CreateStringBlob(
+          GetRelevantGlobal(), ""_ns, u"application/octet-stream"_ns);
+      RefPtr<File> file = blob->ToFile(u""_ns, rv);
+
+      if (!rv.Failed()) {
+        aFormData->AddNameBlobPair(name, file);
+      }
+
+      return rv.StealNSResult();
+    }
+
+    for (uint32_t i = 0; i < files.Length(); ++i) {
+      if (files[i].IsFile()) {
+        aFormData->AddNameBlobPair(name, files[i].GetAsFile());
+      } else {
+        MOZ_ASSERT(files[i].IsDirectory());
+        aFormData->AddNameDirectoryPair(name, files[i].GetAsDirectory());
+      }
+    }
+
+    return NS_OK;
+  }
+
+  if (mType == FormControlType::InputHidden &&
+      name.LowerCaseEqualsLiteral("_charset_")) {
+    nsCString charset;
+    aFormData->GetCharset(charset);
+    return aFormData->AddNameValuePair(name, NS_ConvertASCIItoUTF16(charset));
+  }
+
+
+  nsAutoString value;
+  GetValue(value, CallerType::System);
+
+  if (mType == FormControlType::InputSubmit && value.IsEmpty() &&
+      !HasAttr(nsGkAtoms::value)) {
+    nsAutoString defaultValue;
+    nsContentUtils::GetMaybeLocalizedString(PropertiesFile::FORMS_PROPERTIES,
+                                            "Submit", OwnerDoc(), defaultValue);
+    value = defaultValue;
+  }
+
+  const nsresult rv = aFormData->AddNameValuePair(name, value);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  if (IsAutoDirectionalityAssociated()) {
+    return SubmitDirnameDir(aFormData);
+  }
+
+  return NS_OK;
+}
+
+static nsTArray<FileContentData> SaveFileContentData(
+    const nsTArray<OwningFileOrDirectory>& aArray) {
+  nsTArray<FileContentData> res(aArray.Length());
+  for (const auto& it : aArray) {
+    if (it.IsFile()) {
+      RefPtr<BlobImpl> impl = it.GetAsFile()->Impl();
+      res.AppendElement(std::move(impl));
+    } else {
+      MOZ_ASSERT(it.IsDirectory());
+      nsString fullPath;
+      nsresult rv = it.GetAsDirectory()->GetFullRealPath(fullPath);
+      if (NS_WARN_IF(NS_FAILED(rv))) {
+        continue;
+      }
+      res.AppendElement(std::move(fullPath));
+    }
+  }
+  return res;
+}
+
+void HTMLInputElement::SaveState() {
+  PresState* state = nullptr;
+  switch (GetValueMode()) {
+    case VALUE_MODE_DEFAULT_ON:
+      if (mCheckedChanged) {
+        state = GetPrimaryPresState();
+        if (!state) {
+          return;
+        }
+
+        state->contentData() = CheckedContentData(mChecked);
+      }
+      break;
+    case VALUE_MODE_FILENAME:
+      if (!mFileData->mFilesOrDirectories.IsEmpty()) {
+        state = GetPrimaryPresState();
+        if (!state) {
+          return;
+        }
+
+        state->contentData() =
+            SaveFileContentData(mFileData->mFilesOrDirectories);
+      }
+      break;
+    case VALUE_MODE_VALUE:
+    case VALUE_MODE_DEFAULT:
+      if ((GetValueMode() == VALUE_MODE_DEFAULT &&
+           mType != FormControlType::InputHidden) ||
+          mHasBeenTypePassword || !mValueChanged) {
+        break;
+      }
+
+      state = GetPrimaryPresState();
+      if (!state) {
+        return;
+      }
+
+      nsAutoString value;
+      GetValue(value, CallerType::System);
+
+      if (!IsSingleLineTextControl(false) &&
+          NS_FAILED(nsLinebreakConverter::ConvertStringLineBreaks(
+              value, nsLinebreakConverter::eLinebreakPlatform,
+              nsLinebreakConverter::eLinebreakContent))) {
+        NS_ERROR("Converting linebreaks failed!");
+        return;
+      }
+
+      state->contentData() =
+          TextContentData(value, mLastValueChangeWasInteractive);
+      break;
+  }
+
+  if (mDisabledChanged) {
+    if (!state) {
+      state = GetPrimaryPresState();
+    }
+    if (state) {
+      state->disabled() = HasAttr(nsGkAtoms::disabled);
+      state->disabledSet() = true;
+    }
+  }
+}
+
+void HTMLInputElement::DoneCreatingElement() {
+  MOZ_ASSERT(!mDoneCreating);
+  mDoneCreating = true;
+
+  bool restoredCheckedState = false;
+  if (!mInhibitRestoration) {
+    GenerateStateKey();
+    restoredCheckedState = RestoreFormControlState();
+  }
+
+  if (!restoredCheckedState && mShouldInitChecked) {
+    DoSetChecked(DefaultChecked(),  false,
+                  false, mForm || IsInComposedDoc());
+  }
+
+  if (GetValueMode() == VALUE_MODE_VALUE) {
+    nsAutoString value;
+    GetValue(value, CallerType::System);
+    SetValueInternal(value, ValueSetterOption::ByInternalAPI);
+
+    if (CreatesDateTimeWidget()) {
+      mFocusedValue = value;
+    }
+  }
+
+  if (CreatesDateTimeWidget() && IsInComposedDoc()) {
+    SetupShadowTree( false);
+  }
+
+  mShouldInitChecked = false;
+}
+
+void HTMLInputElement::DestroyContent() {
+  nsImageLoadingContent::Destroy();
+  TextControlElement::DestroyContent();
+}
+
+void HTMLInputElement::UpdateValidityElementStates(bool aNotify) {
+  AutoStateChangeNotifier notifier(*this, aNotify);
+  RemoveStatesSilently(ElementState::VALIDITY_STATES);
+  if (!IsCandidateForConstraintValidation()) {
+    return;
+  }
+  ElementState state;
+  if (IsValid()) {
+    state |= ElementState::VALID;
+    if (mUserInteracted) {
+      state |= ElementState::USER_VALID;
+    }
+  } else {
+    state |= ElementState::INVALID;
+    if (mUserInteracted) {
+      state |= ElementState::USER_INVALID;
+    }
+  }
+  AddStatesSilently(state);
+}
+
+static nsTArray<OwningFileOrDirectory> RestoreFileContentData(
+    nsPIDOMWindowInner* aWindow, const nsTArray<FileContentData>& aData) {
+  nsTArray<OwningFileOrDirectory> res(aData.Length());
+  for (const auto& it : aData) {
+    if (it.type() == FileContentData::TBlobImpl) {
+      if (!it.get_BlobImpl()) {
+        continue;
+      }
+
+      RefPtr<File> file = File::Create(aWindow->AsGlobal(), it.get_BlobImpl());
+      if (NS_WARN_IF(!file)) {
+        continue;
+      }
+
+      OwningFileOrDirectory* element = res.AppendElement();
+      element->SetAsFile() = file;
+    } else {
+      MOZ_ASSERT(it.type() == FileContentData::TnsString);
+      nsCOMPtr<nsIFile> file;
+      nsresult rv = NS_NewLocalFile(it.get_nsString(), getter_AddRefs(file));
+      if (NS_WARN_IF(NS_FAILED(rv))) {
+        continue;
+      }
+
+      RefPtr<Directory> directory =
+          Directory::Create(aWindow->AsGlobal(), file);
+      MOZ_ASSERT(directory);
+
+      OwningFileOrDirectory* element = res.AppendElement();
+      element->SetAsDirectory() = directory;
+    }
+  }
+  return res;
+}
+
+bool HTMLInputElement::RestoreState(PresState* aState) {
+  bool restoredCheckedState = false;
+
+  const PresContentData& inputState = aState->contentData();
+
+  switch (GetValueMode()) {
+    case VALUE_MODE_DEFAULT_ON:
+      if (inputState.type() == PresContentData::TCheckedContentData) {
+        restoredCheckedState = true;
+        bool checked = inputState.get_CheckedContentData().checked();
+        DoSetChecked(checked,  true,  true);
+      }
+      break;
+    case VALUE_MODE_FILENAME:
+      if (inputState.type() == PresContentData::TArrayOfFileContentData) {
+        nsPIDOMWindowInner* window = OwnerDoc()->GetInnerWindow();
+        if (window) {
+          nsTArray<OwningFileOrDirectory> array =
+              RestoreFileContentData(window, inputState);
+          SetFilesOrDirectories(array, true);
+        }
+      }
+      break;
+    case VALUE_MODE_VALUE:
+    case VALUE_MODE_DEFAULT:
+      if (GetValueMode() == VALUE_MODE_DEFAULT &&
+          mType != FormControlType::InputHidden) {
+        break;
+      }
+
+      if (inputState.type() == PresContentData::TTextContentData) {
+        SetValueInternal(inputState.get_TextContentData().value(),
+                         ValueSetterOption::SetValueChanged);
+        if (inputState.get_TextContentData().lastValueChangeWasInteractive()) {
+          SetLastValueChangeWasInteractive(true);
+        }
+      }
+      break;
+  }
+
+  if (aState->disabledSet() && !aState->disabled()) {
+    SetDisabled(false, IgnoreErrors());
+  }
+
+  return restoredCheckedState;
+}
+
+
+void HTMLInputElement::AddToRadioGroup() {
+  MOZ_ASSERT(!mRadioGroupContainer,
+             "Radio button must be removed from previous radio group container "
+             "before being added to another!");
+
+  auto* container = FindTreeRadioGroupContainer();
+  if (!container) {
+    return;
+  }
+
+  nsAutoString name;
+  GetAttr(nsGkAtoms::name, name);
+  MOZ_ASSERT(!name.IsEmpty());
+
+  container->AddToRadioGroup(name, this, mForm);
+  mRadioGroupContainer = container;
+
+  if (mChecked) {
+    RadioSetChecked(mDoneCreating, mForm || IsInComposedDoc());
+  } else {
+    bool indeterminate = !container->GetCurrentRadioButton(name);
+    SetStates(ElementState::INDETERMINATE, indeterminate, mDoneCreating);
+  }
+
+  bool checkedChanged = mCheckedChanged;
+
+  VisitGroup([&checkedChanged](HTMLInputElement* aRadio) {
+    checkedChanged = aRadio->GetCheckedChanged();
+    return false;
+  });
+
+  SetCheckedChangedInternal(checkedChanged);
+
+  SetValidityState(VALIDITY_STATE_VALUE_MISSING,
+                   container->GetValueMissingState(name));
+}
+
+void HTMLInputElement::RemoveFromRadioGroup() {
+  auto* container = GetCurrentRadioGroupContainer();
+  if (!container) {
+    return;
+  }
+
+  nsAutoString name;
+  GetAttr(nsGkAtoms::name, name);
+
+  if (mChecked) {
+    container->SetCurrentRadioButton(name, nullptr);
+    UpdateRadioGroupState();
+  } else {
+    AddStates(ElementState::INDETERMINATE);
+  }
+
+  UpdateValueMissingValidityStateForRadio(true);
+  container->RemoveFromRadioGroup(name, this);
+  mRadioGroupContainer = nullptr;
+}
+
+bool HTMLInputElement::IsHTMLFocusable(IsFocusableFlags aFlags,
+                                       bool* aIsFocusable, int32_t* aTabIndex) {
+  if (nsGenericHTMLFormControlElementWithState::IsHTMLFocusable(
+          aFlags, aIsFocusable, aTabIndex)) {
+    return true;
+  }
+
+  if (IsDisabled()) {
+    *aIsFocusable = false;
+    return true;
+  }
+
+  if (IsSingleLineTextControl(false) || mType == FormControlType::InputRange) {
+    *aIsFocusable = true;
+    return false;
+  }
+
+  const bool defaultFocusable = IsFormControlDefaultFocusable(aFlags);
+  if (CreatesDateTimeWidget()) {
+    if (aTabIndex) {
+      *aTabIndex = -1;
+    }
+    *aIsFocusable = true;
+    return true;
+  }
+
+  if (mType == FormControlType::InputHidden) {
+    if (aTabIndex) {
+      *aTabIndex = -1;
+    }
+    *aIsFocusable = false;
+    return false;
+  }
+
+  if (!aTabIndex) {
+    *aIsFocusable = defaultFocusable;
+    return false;
+  }
+
+  if (mType != FormControlType::InputRadio) {
+    *aIsFocusable = defaultFocusable;
+    return false;
+  }
+
+  if (mChecked) {
+    *aIsFocusable = defaultFocusable;
+    return false;
+  }
+
+  auto* container = GetCurrentRadioGroupContainer();
+  if (!container) {
+    *aIsFocusable = defaultFocusable;
+    return false;
+  }
+
+  nsAutoString name;
+  GetAttr(nsGkAtoms::name, name);
+
+  HTMLInputElement* selectedRadio = container->GetCurrentRadioButton(name);
+  if ((selectedRadio && !selectedRadio->Disabled() &&
+       selectedRadio->GetPrimaryFrame()) ||
+      container->GetFirstRadioButton(name) != this) {
+    *aTabIndex = -1;
+  }
+  *aIsFocusable = defaultFocusable;
+  return false;
+}
+
+template <typename VisitCallback>
+void HTMLInputElement::VisitGroup(VisitCallback&& aCallback, bool aSkipThis) {
+  if (auto* container = GetCurrentRadioGroupContainer()) {
+    nsAutoString name;
+    GetAttr(nsGkAtoms::name, name);
+    container->WalkRadioGroup(name, aCallback, aSkipThis ? this : nullptr);
+    return;
+  }
+
+  aCallback(this);
+}
+
+HTMLInputElement::ValueModeType HTMLInputElement::GetValueMode() const {
+  switch (mType) {
+    case FormControlType::InputHidden:
+    case FormControlType::InputSubmit:
+    case FormControlType::InputButton:
+    case FormControlType::InputReset:
+    case FormControlType::InputImage:
+      return VALUE_MODE_DEFAULT;
+    case FormControlType::InputCheckbox:
+    case FormControlType::InputRadio:
+      return VALUE_MODE_DEFAULT_ON;
+    case FormControlType::InputFile:
+      return VALUE_MODE_FILENAME;
+#if defined(DEBUG)
+    case FormControlType::InputText:
+    case FormControlType::InputPassword:
+    case FormControlType::InputSearch:
+    case FormControlType::InputTel:
+    case FormControlType::InputEmail:
+    case FormControlType::InputUrl:
+    case FormControlType::InputNumber:
+    case FormControlType::InputRange:
+    case FormControlType::InputDate:
+    case FormControlType::InputTime:
+    case FormControlType::InputColor:
+    case FormControlType::InputMonth:
+    case FormControlType::InputWeek:
+    case FormControlType::InputDatetimeLocal:
+      return VALUE_MODE_VALUE;
+    default:
+      MOZ_ASSERT_UNREACHABLE("Unexpected input type in GetValueMode()");
+      return VALUE_MODE_VALUE;
+#else
+    default:
+      return VALUE_MODE_VALUE;
+#endif
+  }
+}
+
+bool HTMLInputElement::IsMutable() const {
+  return !IsDisabled() &&
+         !(DoesReadWriteApply() && State().HasState(ElementState::READONLY));
+}
+
+bool HTMLInputElement::DoesRequiredApply() const {
+  switch (mType) {
+    case FormControlType::InputHidden:
+    case FormControlType::InputButton:
+    case FormControlType::InputImage:
+    case FormControlType::InputReset:
+    case FormControlType::InputSubmit:
+    case FormControlType::InputRange:
+    case FormControlType::InputColor:
+      return false;
+#if defined(DEBUG)
+    case FormControlType::InputRadio:
+    case FormControlType::InputCheckbox:
+    case FormControlType::InputFile:
+    case FormControlType::InputText:
+    case FormControlType::InputPassword:
+    case FormControlType::InputSearch:
+    case FormControlType::InputTel:
+    case FormControlType::InputEmail:
+    case FormControlType::InputUrl:
+    case FormControlType::InputNumber:
+    case FormControlType::InputDate:
+    case FormControlType::InputTime:
+    case FormControlType::InputMonth:
+    case FormControlType::InputWeek:
+    case FormControlType::InputDatetimeLocal:
+      return true;
+    default:
+      MOZ_ASSERT_UNREACHABLE("Unexpected input type in DoesRequiredApply()");
+      return true;
+#else
+    default:
+      return true;
+#endif
+  }
+}
+
+bool HTMLInputElement::PlaceholderApplies() const {
+  if (IsDateTimeInputType(mType)) {
+    return false;
+  }
+  return IsSingleLineTextControl(false);
+}
+
+bool HTMLInputElement::DoesMinMaxApply() const {
+  switch (mType) {
+    case FormControlType::InputNumber:
+    case FormControlType::InputDate:
+    case FormControlType::InputTime:
+    case FormControlType::InputRange:
+    case FormControlType::InputMonth:
+    case FormControlType::InputWeek:
+    case FormControlType::InputDatetimeLocal:
+      return true;
+#if defined(DEBUG)
+    case FormControlType::InputReset:
+    case FormControlType::InputSubmit:
+    case FormControlType::InputImage:
+    case FormControlType::InputButton:
+    case FormControlType::InputHidden:
+    case FormControlType::InputRadio:
+    case FormControlType::InputCheckbox:
+    case FormControlType::InputFile:
+    case FormControlType::InputText:
+    case FormControlType::InputPassword:
+    case FormControlType::InputSearch:
+    case FormControlType::InputTel:
+    case FormControlType::InputEmail:
+    case FormControlType::InputUrl:
+    case FormControlType::InputColor:
+      return false;
+    default:
+      MOZ_ASSERT_UNREACHABLE("Unexpected input type in DoesRequiredApply()");
+      return false;
+#else
+    default:
+      return false;
+#endif
+  }
+}
+
+bool HTMLInputElement::DoesAutocompleteApply() const {
+  switch (mType) {
+    case FormControlType::InputHidden:
+    case FormControlType::InputText:
+    case FormControlType::InputSearch:
+    case FormControlType::InputUrl:
+    case FormControlType::InputTel:
+    case FormControlType::InputEmail:
+    case FormControlType::InputPassword:
+    case FormControlType::InputDate:
+    case FormControlType::InputTime:
+    case FormControlType::InputNumber:
+    case FormControlType::InputRange:
+    case FormControlType::InputColor:
+    case FormControlType::InputMonth:
+    case FormControlType::InputWeek:
+    case FormControlType::InputDatetimeLocal:
+      return true;
+#if defined(DEBUG)
+    case FormControlType::InputReset:
+    case FormControlType::InputSubmit:
+    case FormControlType::InputImage:
+    case FormControlType::InputButton:
+    case FormControlType::InputRadio:
+    case FormControlType::InputCheckbox:
+    case FormControlType::InputFile:
+      return false;
+    default:
+      MOZ_ASSERT_UNREACHABLE(
+          "Unexpected input type in DoesAutocompleteApply()");
+      return false;
+#else
+    default:
+      return false;
+#endif
+  }
+}
+
+Decimal HTMLInputElement::GetStep() const {
+  MOZ_ASSERT(DoesStepApply(), "GetStep() can only be called if @step applies");
+
+  if (!HasAttr(nsGkAtoms::step)) {
+    return GetDefaultStep() * GetStepScaleFactor();
+  }
+
+  nsAutoString stepStr;
+  GetAttr(nsGkAtoms::step, stepStr);
+
+  if (stepStr.LowerCaseEqualsLiteral("any")) {
+    return kStepAny;
+  }
+
+  Decimal step = StringToDecimal(stepStr);
+  if (!step.isFinite() || step <= Decimal(0)) {
+    step = GetDefaultStep();
+  }
+
+  if (mType == FormControlType::InputDate ||
+      mType == FormControlType::InputMonth ||
+      mType == FormControlType::InputWeek) {
+    step = std::max(step.round(), Decimal(1));
+  }
+
+  return step * GetStepScaleFactor();
+}
+
+
+void HTMLInputElement::SetCustomValidity(const nsAString& aError) {
+  ConstraintValidation::SetCustomValidity(aError);
+  UpdateValidityElementStates(true);
+}
+
+bool HTMLInputElement::IsTooLong() {
+  if (!mValueChanged || !mLastValueChangeWasInteractive) {
+    return false;
+  }
+
+  return mInputType->IsTooLong();
+}
+
+bool HTMLInputElement::IsTooShort() {
+  if (!mValueChanged || !mLastValueChangeWasInteractive) {
+    return false;
+  }
+
+  return mInputType->IsTooShort();
+}
+
+bool HTMLInputElement::IsValueMissing() const {
+  MOZ_ASSERT(mType != FormControlType::InputRadio);
+
+  return mInputType->IsValueMissing();
+}
+
+bool HTMLInputElement::HasTypeMismatch() const {
+  return mInputType->HasTypeMismatch();
+}
+
+Maybe<bool> HTMLInputElement::HasPatternMismatch() const {
+  return mInputType->HasPatternMismatch();
+}
+
+bool HTMLInputElement::IsRangeOverflow() const {
+  return mInputType->IsRangeOverflow();
+}
+
+bool HTMLInputElement::IsRangeUnderflow() const {
+  return mInputType->IsRangeUnderflow();
+}
+
+bool HTMLInputElement::ValueIsStepMismatch(const Decimal& aValue) const {
+  if (aValue.isNaN()) {
+    return false;
+  }
+
+  Decimal step = GetStep();
+  if (step == kStepAny) {
+    return false;
+  }
+
+  return NS_floorModulo(aValue - GetStepBase(), step) != Decimal(0);
+}
+
+bool HTMLInputElement::HasStepMismatch() const {
+  return mInputType->HasStepMismatch();
+}
+
+bool HTMLInputElement::HasBadInput() const { return mInputType->HasBadInput(); }
+
+void HTMLInputElement::UpdateTooLongValidityState() {
+  SetValidityState(VALIDITY_STATE_TOO_LONG, IsTooLong());
+}
+
+void HTMLInputElement::UpdateTooShortValidityState() {
+  SetValidityState(VALIDITY_STATE_TOO_SHORT, IsTooShort());
+}
+
+void HTMLInputElement::UpdateValueMissingValidityStateForRadio(
+    bool aIgnoreSelf) {
+  MOZ_ASSERT(mType == FormControlType::InputRadio,
+             "This should be called only for radio input types");
+
+  HTMLInputElement* selection = GetSelectedRadioButton();
+
+  bool selected = selection || (!aIgnoreSelf && mChecked);
+  bool required = !aIgnoreSelf && IsRequired();
+
+  auto* container = GetCurrentRadioGroupContainer();
+  if (!container) {
+    SetValidityState(VALIDITY_STATE_VALUE_MISSING, false);
+    return;
+  }
+
+  nsAutoString name;
+  GetAttr(nsGkAtoms::name, name);
+
+  if (!required) {
+    required = (aIgnoreSelf && IsRequired())
+                   ? container->GetRequiredRadioCount(name) - 1
+                   : container->GetRequiredRadioCount(name);
+  }
+
+  bool valueMissing = required && !selected;
+  if (container->GetValueMissingState(name) != valueMissing) {
+    container->SetValueMissingState(name, valueMissing);
+
+    SetValidityState(VALIDITY_STATE_VALUE_MISSING, valueMissing);
+
+    nsAutoScriptBlocker scriptBlocker;
+    VisitGroup([valueMissing](HTMLInputElement* aRadio) {
+      aRadio->SetValidityState(
+          nsIConstraintValidation::VALIDITY_STATE_VALUE_MISSING, valueMissing);
+      aRadio->UpdateValidityElementStates(true);
+      return true;
+    });
+  }
+}
+
+void HTMLInputElement::UpdateValueMissingValidityState() {
+  if (mType == FormControlType::InputRadio) {
+    UpdateValueMissingValidityStateForRadio(false);
+    return;
+  }
+
+  SetValidityState(VALIDITY_STATE_VALUE_MISSING, IsValueMissing());
+}
+
+void HTMLInputElement::UpdateTypeMismatchValidityState() {
+  SetValidityState(VALIDITY_STATE_TYPE_MISMATCH, HasTypeMismatch());
+}
+
+void HTMLInputElement::UpdatePatternMismatchValidityState() {
+  Maybe<bool> hasMismatch = HasPatternMismatch();
+  if (hasMismatch.isSome()) {
+    SetValidityState(VALIDITY_STATE_PATTERN_MISMATCH, hasMismatch.value());
+  }
+}
+
+void HTMLInputElement::UpdateRangeOverflowValidityState() {
+  SetValidityState(VALIDITY_STATE_RANGE_OVERFLOW, IsRangeOverflow());
+  UpdateInRange(true);
+}
+
+void HTMLInputElement::UpdateRangeUnderflowValidityState() {
+  SetValidityState(VALIDITY_STATE_RANGE_UNDERFLOW, IsRangeUnderflow());
+  UpdateInRange(true);
+}
+
+void HTMLInputElement::UpdateStepMismatchValidityState() {
+  SetValidityState(VALIDITY_STATE_STEP_MISMATCH, HasStepMismatch());
+}
+
+void HTMLInputElement::UpdateBadInputValidityState() {
+  SetValidityState(VALIDITY_STATE_BAD_INPUT, HasBadInput());
+}
+
+void HTMLInputElement::UpdateAllValidityStates(bool aNotify) {
+  bool validBefore = IsValid();
+  UpdateAllValidityStatesButNotElementState();
+  if (validBefore != IsValid()) {
+    UpdateValidityElementStates(aNotify);
+  }
+}
+
+void HTMLInputElement::UpdateAllValidityStatesButNotElementState() {
+  UpdateTooLongValidityState();
+  UpdateTooShortValidityState();
+  UpdateValueMissingValidityState();
+  UpdateTypeMismatchValidityState();
+  UpdatePatternMismatchValidityState();
+  UpdateRangeOverflowValidityState();
+  UpdateRangeUnderflowValidityState();
+  UpdateStepMismatchValidityState();
+  UpdateBadInputValidityState();
+}
+
+void HTMLInputElement::UpdateBarredFromConstraintValidation() {
+  bool wasCandidate = IsCandidateForConstraintValidation();
+  SetBarredFromConstraintValidation(
+      mType == FormControlType::InputHidden ||
+      mType == FormControlType::InputButton ||
+      mType == FormControlType::InputReset || IsDisabled() ||
+      HasAttr(nsGkAtoms::readonly) ||
+      HasFlag(ELEMENT_IS_DATALIST_OR_HAS_DATALIST_ANCESTOR));
+  if (IsCandidateForConstraintValidation() != wasCandidate) {
+    UpdateInRange(true);
+  }
+}
+
+nsresult HTMLInputElement::GetValidationMessage(nsAString& aValidationMessage,
+                                                ValidityStateType aType) {
+  return mInputType->GetValidationMessage(aValidationMessage, aType);
+}
+
+Maybe<int32_t> HTMLInputElement::GetNumberInputCols() const {
+  struct RenderSize {
+    uint32_t mBeforeDecimal = 0;
+    uint32_t mAfterDecimal = 0;
+
+    RenderSize Max(const RenderSize& aOther) const {
+      return {std::max(mBeforeDecimal, aOther.mBeforeDecimal),
+              std::max(mAfterDecimal, aOther.mAfterDecimal)};
+    }
+
+    static RenderSize From(const Decimal& aValue) {
+      MOZ_ASSERT(aValue.isFinite());
+      nsAutoCString tmp;
+      tmp.AppendInt(aValue.value().coefficient());
+      const uint32_t sizeOfDigits = tmp.Length();
+      const uint32_t sizeOfSign = aValue.isNegative() ? 1 : 0;
+      const int32_t exponent = aValue.exponent();
+      if (exponent >= 0) {
+        return {sizeOfSign + sizeOfDigits, 0};
+      }
+
+      const int32_t sizeBeforeDecimalPoint = exponent + int32_t(sizeOfDigits);
+      if (sizeBeforeDecimalPoint > 0) {
+        return {sizeOfSign + sizeBeforeDecimalPoint,
+                sizeOfDigits - sizeBeforeDecimalPoint};
+      }
+
+      const uint32_t sizeOfZero = 1;
+      const uint32_t numberOfZeroAfterDecimalPoint = -sizeBeforeDecimalPoint;
+      return {sizeOfSign + sizeOfZero,
+              numberOfZeroAfterDecimalPoint + sizeOfDigits};
+    }
+  };
+
+  if (mType != FormControlType::InputNumber) {
+    return {};
+  }
+  Decimal min = GetMinimum();
+  if (!min.isFinite()) {
+    return {};
+  }
+  Decimal max = GetMaximum();
+  if (!max.isFinite()) {
+    return {};
+  }
+  Decimal step = GetStep();
+  if (step == kStepAny) {
+    return {};
+  }
+  MOZ_ASSERT(step.isFinite());
+  RenderSize size = RenderSize::From(min).Max(
+      RenderSize::From(max).Max(RenderSize::From(step)));
+  return Some(size.mBeforeDecimal + size.mAfterDecimal +
+              (size.mAfterDecimal ? 1 : 0));
+}
+
+Maybe<int32_t> HTMLInputElement::GetCols() {
+  if (const nsAttrValue* attr = GetParsedAttr(nsGkAtoms::size);
+      attr && attr->Type() == nsAttrValue::eInteger) {
+    int32_t cols = attr->GetIntegerValue();
+    if (cols > 0) {
+      return Some(cols);
+    }
+  }
+
+  if (Maybe<int32_t> cols = GetNumberInputCols(); cols && *cols > 0) {
+    return cols;
+  }
+
+  return {};
+}
+
+int32_t HTMLInputElement::GetWrapCols() {
+  return 0;  
+}
+
+int32_t HTMLInputElement::GetRows() { return DEFAULT_ROWS; }
+
+void HTMLInputElement::GetDefaultValueFromContent(nsAString& aValue,
+                                                  bool aForDisplay) {
+  if (!GetEditorState()) {
+    return;
+  }
+  GetDefaultValue(aValue);
+  if (mDoneCreating) {
+    SanitizeValue(aValue, aForDisplay ? SanitizationKind::ForDisplay
+                                      : SanitizationKind::ForValueGetter);
+  }
+}
+
+bool HTMLInputElement::ValueChanged() const { return mValueChanged; }
+
+void HTMLInputElement::GetTextEditorValue(nsAString& aValue) const {
+  if (TextControlState* state = GetEditorState()) {
+    state->GetValue(aValue,  true);
+  }
+}
+
+void HTMLInputElement::UpdatePlaceholderShownState() {
+  SetStates(ElementState::PLACEHOLDER_SHOWN,
+            IsValueEmpty() && PlaceholderApplies() &&
+                HasAttr(nsGkAtoms::placeholder));
+}
+
+void HTMLInputElement::OnValueChanged(ValueChangeKind aKind,
+                                      bool aNewValueEmpty,
+                                      const nsAString* aKnownNewValue) {
+  MOZ_ASSERT_IF(aKnownNewValue, aKnownNewValue->IsEmpty() == aNewValueEmpty);
+  if (aKind != ValueChangeKind::Internal) {
+    mLastValueChangeWasInteractive = aKind == ValueChangeKind::UserInteraction;
+
+    if (mLastValueChangeWasInteractive) {
+      mUserChangedSinceFocus = true;
+    }
+    if (mLastValueChangeWasInteractive &&
+        State().HasState(ElementState::AUTOFILL)) {
+      RemoveStates(ElementState::AUTOFILL | ElementState::AUTOFILL_PREVIEW);
+    }
+  }
+
+  if (aNewValueEmpty != IsValueEmpty()) {
+    SetStates(ElementState::VALUE_EMPTY, aNewValueEmpty);
+    UpdatePlaceholderShownState();
+  }
+
+  UpdateAllValidityStates(true);
+
+  ResetDirFormAssociatedElement(this, true, HasDirAuto(), aKnownNewValue);
+}
+
+bool HTMLInputElement::HasCachedSelection() {
+  TextControlState* state = GetEditorState();
+  if (!state) {
+    return false;
+  }
+  return state->IsSelectionCached() && state->HasNeverInitializedBefore() &&
+         state->GetSelectionProperties().GetStart() !=
+             state->GetSelectionProperties().GetEnd();
+}
+
+void HTMLInputElement::SetRevealPassword(bool aValue) {
+  if (NS_WARN_IF(mType != FormControlType::InputPassword)) {
+    return;
+  }
+  if (aValue == State().HasState(ElementState::REVEALED)) {
+    return;
+  }
+  RefPtr doc = OwnerDoc();
+  bool defaultAction = true;
+  nsContentUtils::DispatchEventOnlyToChrome(
+      doc, this, u"MozWillToggleReveal"_ns, CanBubble::eYes, Cancelable::eYes,
+      &defaultAction);
+  if (NS_WARN_IF(!defaultAction)) {
+    return;
+  }
+  SetStates(ElementState::REVEALED, aValue);
+}
+
+bool HTMLInputElement::RevealPassword() const {
+  if (NS_WARN_IF(mType != FormControlType::InputPassword)) {
+    return false;
+  }
+  return State().HasState(ElementState::REVEALED);
+}
+
+void HTMLInputElement::FieldSetDisabledChanged(bool aNotify) {
+  nsGenericHTMLFormControlElementWithState::FieldSetDisabledChanged(aNotify);
+
+  UpdateValueMissingValidityState();
+  UpdateBarredFromConstraintValidation();
+  UpdateValidityElementStates(aNotify);
+}
+
+void HTMLInputElement::SetFilePickerFiltersFromAccept(
+    nsIFilePicker* filePicker) {
+  filePicker->AppendFilters(nsIFilePicker::filterAll);
+
+  NS_ASSERTION(HasAttr(nsGkAtoms::accept),
+               "You should not call SetFilePickerFiltersFromAccept if the"
+               " element has no accept attribute!");
+
+  nsCOMPtr<nsIStringBundleService> stringService =
+      components::StringBundle::Service();
+  if (!stringService) {
+    return;
+  }
+  nsCOMPtr<nsIStringBundle> filterBundle;
+  if (NS_FAILED(stringService->CreateBundle(
+          "chrome://global/content/filepicker.properties",
+          getter_AddRefs(filterBundle)))) {
+    return;
+  }
+
+  nsCOMPtr<nsIMIMEService> mimeService = do_GetService("@mozilla.org/mime;1");
+  if (!mimeService) {
+    return;
+  }
+
+  nsAutoString accept;
+  GetAttr(nsGkAtoms::accept, accept);
+
+  HTMLSplitOnSpacesTokenizer tokenizer(accept, ',');
+
+  nsTArray<nsFilePickerFilter> filters;
+  nsString allExtensionsList;
+
+  while (tokenizer.hasMoreTokens()) {
+    const nsDependentSubstring& token = tokenizer.nextToken();
+
+    if (token.IsEmpty()) {
+      continue;
+    }
+
+    int32_t filterMask = 0;
+    nsString filterName;
+    nsString extensionListStr;
+
+    if (token.EqualsLiteral("image/*")) {
+      filterMask = nsIFilePicker::filterImages;
+      filterBundle->GetStringFromName("imageFilter", extensionListStr);
+    } else if (token.EqualsLiteral("audio/*")) {
+      filterMask = nsIFilePicker::filterAudio;
+      filterBundle->GetStringFromName("audioFilter", extensionListStr);
+    } else if (token.EqualsLiteral("video/*")) {
+      filterMask = nsIFilePicker::filterVideo;
+      filterBundle->GetStringFromName("videoFilter", extensionListStr);
+    } else if (token.First() == '.') {
+      if (token.Contains(';') || token.Contains('*')) {
+        continue;
+      }
+      extensionListStr = u"*"_ns + token;
+      filterName = extensionListStr;
+    } else {
+      nsCOMPtr<nsIMIMEInfo> mimeInfo;
+      if (NS_FAILED(
+              mimeService->GetFromTypeAndExtension(NS_ConvertUTF16toUTF8(token),
+                                                   ""_ns,  
+                                                   getter_AddRefs(mimeInfo))) ||
+          !mimeInfo) {
+        continue;
+      }
+
+      mimeInfo->GetDescription(filterName);
+      if (filterName.IsEmpty()) {
+        nsCString mimeTypeName;
+        mimeInfo->GetType(mimeTypeName);
+        CopyUTF8toUTF16(mimeTypeName, filterName);
+      }
+
+      nsCOMPtr<nsIUTF8StringEnumerator> extensions;
+      mimeInfo->GetFileExtensions(getter_AddRefs(extensions));
+
+      bool hasMore;
+      while (NS_SUCCEEDED(extensions->HasMore(&hasMore)) && hasMore) {
+        nsCString extension;
+        if (NS_FAILED(extensions->GetNext(extension))) {
+          continue;
+        }
+        if (!extensionListStr.IsEmpty()) {
+          extensionListStr.AppendLiteral("; ");
+        }
+        extensionListStr += u"*."_ns + NS_ConvertUTF8toUTF16(extension);
+      }
+    }
+
+    if (!filterMask && (extensionListStr.IsEmpty() || filterName.IsEmpty())) {
+      continue;
+    }
+
+    filePicker->AppendRawFilter(token);
+
+    nsFilePickerFilter filter;
+    if (filterMask) {
+      filter = nsFilePickerFilter(filterMask);
+    } else {
+      filter = nsFilePickerFilter(filterName, extensionListStr);
+    }
+
+    if (!filters.Contains(filter)) {
+      if (!allExtensionsList.IsEmpty()) {
+        allExtensionsList.AppendLiteral("; ");
+      }
+      allExtensionsList += extensionListStr;
+      filters.AppendElement(filter);
+    }
+  }
+
+  const nsTArray<nsFilePickerFilter> filtersCopy = filters.Clone();
+  for (uint32_t i = 0; i < filtersCopy.Length(); ++i) {
+    const nsFilePickerFilter& filterToCheck = filtersCopy[i];
+    if (filterToCheck.mFilterMask) {
+      continue;
+    }
+    for (uint32_t j = 0; j < filtersCopy.Length(); ++j) {
+      if (i == j) {
+        continue;
+      }
+      if (FindInReadable(filterToCheck.mFilter + u";"_ns,
+                         filtersCopy[j].mFilter + u";"_ns)) {
+        filters.RemoveElement(filterToCheck);
+      }
+    }
+  }
+
+  if (filters.Length() > 1) {
+    nsAutoString title;
+    nsContentUtils::GetLocalizedString(PropertiesFile::FORMS_PROPERTIES,
+                                       "AllSupportedTypes", title);
+    filePicker->AppendFilter(title, allExtensionsList);
+  }
+
+  for (uint32_t i = 0; i < filters.Length(); ++i) {
+    const nsFilePickerFilter& filter = filters[i];
+    if (filter.mFilterMask) {
+      filePicker->AppendFilters(filter.mFilterMask);
+    } else {
+      filePicker->AppendFilter(filter.mTitle, filter.mFilter);
+    }
+  }
+
+  if (filters.Length() >= 1) {
+    filePicker->SetFilterIndex(1);
+  }
+}
+
+Decimal HTMLInputElement::GetStepScaleFactor() const {
+  MOZ_ASSERT(DoesStepApply());
+
+  switch (mType) {
+    case FormControlType::InputDate:
+      return kStepScaleFactorDate;
+    case FormControlType::InputNumber:
+    case FormControlType::InputRange:
+      return kStepScaleFactorNumberRange;
+    case FormControlType::InputTime:
+    case FormControlType::InputDatetimeLocal:
+      return kStepScaleFactorTime;
+    case FormControlType::InputMonth:
+      return kStepScaleFactorMonth;
+    case FormControlType::InputWeek:
+      return kStepScaleFactorWeek;
+    default:
+      MOZ_ASSERT(false, "Unrecognized input type");
+      return Decimal::nan();
+  }
+}
+
+Decimal HTMLInputElement::GetDefaultStep() const {
+  MOZ_ASSERT(DoesStepApply());
+
+  switch (mType) {
+    case FormControlType::InputDate:
+    case FormControlType::InputMonth:
+    case FormControlType::InputWeek:
+    case FormControlType::InputNumber:
+    case FormControlType::InputRange:
+      return kDefaultStep;
+    case FormControlType::InputTime:
+    case FormControlType::InputDatetimeLocal:
+      return kDefaultStepTime;
+    default:
+      MOZ_ASSERT(false, "Unrecognized input type");
+      return Decimal::nan();
+  }
+}
+
+void HTMLInputElement::SetUserInteracted(bool aInteracted) {
+  if (mUserInteracted == aInteracted) {
+    return;
+  }
+  mUserInteracted = aInteracted;
+  UpdateValidityElementStates(true);
+}
+
+void HTMLInputElement::UpdateInRange(bool aNotify) {
+  AutoStateChangeNotifier notifier(*this, aNotify);
+  RemoveStatesSilently(ElementState::INRANGE | ElementState::OUTOFRANGE);
+  if (!mHasRange || !IsCandidateForConstraintValidation()) {
+    return;
+  }
+  bool outOfRange = GetValidityState(VALIDITY_STATE_RANGE_OVERFLOW) ||
+                    GetValidityState(VALIDITY_STATE_RANGE_UNDERFLOW);
+  AddStatesSilently(outOfRange ? ElementState::OUTOFRANGE
+                               : ElementState::INRANGE);
+}
+
+void HTMLInputElement::UpdateHasRange(bool aNotify) {
+  const bool newHasRange = [&] {
+    if (!DoesMinMaxApply()) {
+      return false;
+    }
+    return !GetMinimum().isNaN() || !GetMaximum().isNaN();
+  }();
+
+  if (newHasRange == mHasRange) {
+    return;
+  }
+
+  mHasRange = newHasRange;
+  UpdateInRange(aNotify);
+}
+
+void HTMLInputElement::PickerClosed() {
+  mPickerRunning = false;
+  SetOpenState(false);
+}
+
+JSObject* HTMLInputElement::WrapNode(JSContext* aCx,
+                                     JS::Handle<JSObject*> aGivenProto) {
+  return HTMLInputElement_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+GetFilesHelper* HTMLInputElement::GetOrCreateGetFilesHelper(bool aRecursiveFlag,
+                                                            ErrorResult& aRv) {
+  MOZ_ASSERT(mFileData);
+
+  if (aRecursiveFlag) {
+    if (!mFileData->mGetFilesRecursiveHelper) {
+      mFileData->mGetFilesRecursiveHelper = GetFilesHelper::Create(
+          GetFilesOrDirectoriesInternal(), aRecursiveFlag, aRv);
+      if (NS_WARN_IF(aRv.Failed())) {
+        return nullptr;
+      }
+    }
+
+    return mFileData->mGetFilesRecursiveHelper;
+  }
+
+  if (!mFileData->mGetFilesNonRecursiveHelper) {
+    mFileData->mGetFilesNonRecursiveHelper = GetFilesHelper::Create(
+        GetFilesOrDirectoriesInternal(), aRecursiveFlag, aRv);
+    if (NS_WARN_IF(aRv.Failed())) {
+      return nullptr;
+    }
+  }
+
+  return mFileData->mGetFilesNonRecursiveHelper;
+}
+
+void HTMLInputElement::UpdateEntries(
+    const nsTArray<OwningFileOrDirectory>& aFilesOrDirectories) {
+  MOZ_ASSERT(mFileData && mFileData->mEntries.IsEmpty());
+
+  nsCOMPtr<nsIGlobalObject> global = GetRelevantGlobal();
+  MOZ_ASSERT(global);
+
+  RefPtr<FileSystem> fs = FileSystem::Create(global);
+  if (NS_WARN_IF(!fs)) {
+    return;
+  }
+
+  Sequence<RefPtr<FileSystemEntry>> entries;
+  for (uint32_t i = 0; i < aFilesOrDirectories.Length(); ++i) {
+    RefPtr<FileSystemEntry> entry =
+        FileSystemEntry::Create(global, aFilesOrDirectories[i], fs);
+    MOZ_ASSERT(entry);
+
+    if (!entries.AppendElement(entry, fallible)) {
+      return;
+    }
+  }
+
+  fs->CreateRoot(entries);
+
+  mFileData->mEntries = std::move(entries);
+}
+
+void HTMLInputElement::GetWebkitEntries(
+    nsTArray<RefPtr<FileSystemEntry>>& aSequence) {
+  if (NS_WARN_IF(mType != FormControlType::InputFile)) {
+    return;
+  }
+
+
+  aSequence.AppendElements(mFileData->mEntries);
+}
+
+already_AddRefed<NodeList> HTMLInputElement::GetLabelsForBindings() {
+  return GetLabelsInternal();
+}
+
+already_AddRefed<NodeList> HTMLInputElement::GetLabelsInternal() {
+  if (!IsLabelable()) {
+    return nullptr;
+  }
+
+  return nsGenericHTMLElement::LabelsInternal();
+}
+
+void HTMLInputElement::UpdateRadioGroupState() {
+  VisitGroup([](HTMLInputElement* aRadio) {
+    aRadio->UpdateIndeterminateState(true);
+    aRadio->UpdateValidityElementStates(true);
+    return true;
+  });
+}
+
+}  
+
+#undef NS_OUTER_ACTIVATE_EVENT
+#undef NS_ORIGINAL_CHECKED_VALUE
+#undef NS_ORIGINAL_INDETERMINATE_VALUE
+#undef NS_PRE_HANDLE_BLUR_EVENT
+#undef NS_IN_SUBMIT_CLICK
+#undef NS_CONTROL_TYPE

@@ -1,0 +1,343 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/HTMLOptionElement.h"
+
+#include "BindContext.h"
+#include "HTMLOptGroupElement.h"
+#include "mozilla/dom/AncestorIterator.h"
+#include "mozilla/dom/HTMLOptionElementBinding.h"
+#include "mozilla/dom/HTMLSelectElement.h"
+#include "nsGkAtoms.h"
+#include "nsIFormControl.h"
+#include "nsStyleConsts.h"
+
+#include "mozilla/dom/Document.h"
+#include "nsCOMPtr.h"
+#include "nsContentCreatorFunctions.h"
+#include "nsNodeInfoManager.h"
+#include "nsTextNode.h"
+
+
+NS_IMPL_NS_NEW_HTML_ELEMENT(Option)
+
+namespace mozilla::dom {
+
+HTMLOptionElement::HTMLOptionElement(
+    already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo)
+    : nsGenericHTMLElement(std::move(aNodeInfo)) {
+  AddStatesSilently(ElementState::ENABLED);
+}
+
+HTMLOptionElement::~HTMLOptionElement() = default;
+
+NS_IMPL_ELEMENT_CLONE(HTMLOptionElement)
+
+mozilla::dom::Element* HTMLOptionElement::GetFormForBindings() {
+  HTMLFormElement* form = GetFormInternal();
+  return RetargetReferenceTargetForBindings(form);
+}
+
+mozilla::dom::HTMLFormElement* HTMLOptionElement::GetFormInternal() {
+  HTMLSelectElement* selectControl = GetSelect();
+  return selectControl ? selectControl->GetFormInternal() : nullptr;
+}
+
+void HTMLOptionElement::SetSelectedInternal(bool aValue, bool aNotify) {
+  mSelectedChanged = true;
+  SetStates(ElementState::CHECKED, aValue, aNotify);
+}
+
+void HTMLOptionElement::OptGroupDisabledChanged(bool aNotify) {
+  UpdateDisabledState(aNotify);
+}
+
+void HTMLOptionElement::UpdateDisabledState(bool aNotify) {
+  bool isDisabled = HasAttr(nsGkAtoms::disabled);
+
+  if (!isDisabled) {
+    for (nsINode* ancestor = GetParent(); ancestor;
+         ancestor = ancestor->GetParentNode()) {
+      if (IsOptionListBoundary(*ancestor)) {
+        break;
+      }
+      if (auto* optgroup = HTMLOptGroupElement::FromNode(ancestor)) {
+        isDisabled = optgroup->IsDisabled();
+        break;
+      }
+    }
+  }
+
+  ElementState disabledStates;
+  if (isDisabled) {
+    disabledStates |= ElementState::DISABLED;
+  } else {
+    disabledStates |= ElementState::ENABLED;
+  }
+
+  ElementState oldDisabledStates = State() & ElementState::DISABLED_STATES;
+  ElementState changedStates = disabledStates ^ oldDisabledStates;
+
+  if (!changedStates.IsEmpty()) {
+    ToggleStates(changedStates, aNotify);
+  }
+}
+
+void HTMLOptionElement::SetSelected(bool aValue) {
+  if (HTMLSelectElement* select = GetSelect()) {
+    int32_t index = Index();
+    HTMLSelectElement::OptionFlags mask{
+        HTMLSelectElement::OptionFlag::SetDisabled,
+        HTMLSelectElement::OptionFlag::Notify};
+    if (aValue) {
+      mask += HTMLSelectElement::OptionFlag::IsSelected;
+    }
+
+    select->SetOptionsSelectedByIndex(index, index, mask);
+  } else {
+    SetSelectedInternal(aValue, true);
+  }
+}
+
+int32_t HTMLOptionElement::Index() {
+  static int32_t defaultIndex = 0;
+
+  HTMLSelectElement* selectElement = GetSelect();
+  if (!selectElement) {
+    return defaultIndex;
+  }
+
+  HTMLOptionsCollection* options = selectElement->GetOptions();
+  if (!options) {
+    return defaultIndex;
+  }
+
+  int32_t index = defaultIndex;
+  MOZ_ALWAYS_SUCCEEDS(options->GetOptionIndex(this, 0, true, &index));
+  return index;
+}
+
+nsChangeHint HTMLOptionElement::GetAttributeChangeHint(
+    const nsAtom* aAttribute, AttrModType aModType) const {
+  nsChangeHint retval =
+      nsGenericHTMLElement::GetAttributeChangeHint(aAttribute, aModType);
+
+  if (aAttribute == nsGkAtoms::label) {
+    retval |= nsChangeHint_ReconstructFrame;
+  } else if (aAttribute == nsGkAtoms::text) {
+    retval |= NS_STYLE_HINT_REFLOW;
+  }
+  return retval;
+}
+
+void HTMLOptionElement::BeforeSetAttr(int32_t aNamespaceID, nsAtom* aName,
+                                      const nsAttrValue* aValue, bool aNotify) {
+  nsGenericHTMLElement::BeforeSetAttr(aNamespaceID, aName, aValue, aNotify);
+
+  if (aNamespaceID != kNameSpaceID_None || aName != nsGkAtoms::selected ||
+      mSelectedChanged) {
+    return;
+  }
+
+  HTMLSelectElement* select = GetSelect();
+  if (!select) {
+    SetStates(ElementState::CHECKED, !!aValue, aNotify);
+    return;
+  }
+
+  NS_ASSERTION(!mSelectedChanged, "Shouldn't be here");
+
+  int32_t index = Index();
+  HTMLSelectElement::OptionFlags mask =
+      HTMLSelectElement::OptionFlag::SetDisabled;
+  if (aValue) {
+    mask += HTMLSelectElement::OptionFlag::IsSelected;
+  }
+
+  if (aNotify) {
+    mask += HTMLSelectElement::OptionFlag::Notify;
+  }
+
+  select->SetOptionsSelectedByIndex(index, index, mask);
+
+  mSelectedChanged = false;
+}
+
+void HTMLOptionElement::AfterSetAttr(int32_t aNameSpaceID, nsAtom* aName,
+                                     const nsAttrValue* aValue,
+                                     const nsAttrValue* aOldValue,
+                                     nsIPrincipal* aSubjectPrincipal,
+                                     bool aNotify) {
+  if (aNameSpaceID == kNameSpaceID_None) {
+    if (aName == nsGkAtoms::disabled) {
+      UpdateDisabledState(aNotify);
+    }
+
+    if (aName == nsGkAtoms::value && Selected()) {
+      if (HTMLSelectElement* select = GetSelect()) {
+        select->UpdateValueMissingValidityState();
+      }
+    }
+
+    if (aName == nsGkAtoms::selected) {
+      SetStates(ElementState::DEFAULT, !!aValue, aNotify);
+    }
+  }
+
+  return nsGenericHTMLElement::AfterSetAttr(
+      aNameSpaceID, aName, aValue, aOldValue, aSubjectPrincipal, aNotify);
+}
+
+void HTMLOptionElement::GetText(nsAString& aText) {
+  nsAutoString text;
+
+  nsIContent* child = nsINode::GetFirstChild();
+  while (child) {
+    if (Text* textChild = child->GetAsText()) {
+      textChild->AppendTextTo(text);
+    }
+    if (child->IsHTMLElement(nsGkAtoms::script) ||
+        child->IsSVGElement(nsGkAtoms::script)) {
+      child = child->GetNextNonChildNode(this);
+    } else {
+      child = child->GetNextNode(this);
+    }
+  }
+
+  text.CompressWhitespace(true, true);
+  aText = std::move(text);
+}
+
+void HTMLOptionElement::SetText(const nsAString& aText, ErrorResult& aRv) {
+  aRv = nsContentUtils::SetNodeTextContent(this, aText, false);
+}
+
+nsresult HTMLOptionElement::BindToTree(BindContext& aContext,
+                                       nsINode& aParent) {
+  nsresult rv = nsGenericHTMLElement::BindToTree(aContext, aParent);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  UpdateDisabledState(false);
+
+  UpdateNearestAncestorSelect();
+
+
+  if (aContext.InComposedDoc() && mCachedNearestAncestorSelect && Selected()) {
+    mCachedNearestAncestorSelect->ScheduleSelectedContentUpdateScriptRunner();
+  }
+
+  return NS_OK;
+}
+
+void HTMLOptionElement::UnbindFromTree(UnbindContext& aContext) {
+  RefPtr<HTMLSelectElement> oldSelect = mCachedNearestAncestorSelect;
+
+  nsGenericHTMLElement::UnbindFromTree(aContext);
+
+  UpdateNearestAncestorSelect();
+
+  if (oldSelect && oldSelect != mCachedNearestAncestorSelect && Selected()) {
+    oldSelect->ScheduleSelectedContentUpdate();
+  }
+
+  UpdateDisabledState(false);
+}
+
+HTMLSelectElement* HTMLOptionElement::ComputeNearestAncestorSelect() const {
+  HTMLOptGroupElement* ancestorOptgroup = nullptr;
+  for (nsINode* ancestor : Ancestors(*this)) {
+    if (ancestor->IsAnyOfHTMLElements(nsGkAtoms::datalist, nsGkAtoms::hr,
+                                      nsGkAtoms::option)) {
+      return nullptr;
+    }
+    if (auto* optgroup = HTMLOptGroupElement::FromNode(ancestor)) {
+      if (ancestorOptgroup) {
+        return nullptr;
+      }
+      ancestorOptgroup = optgroup;
+      continue;
+    }
+    if (auto* select = HTMLSelectElement::FromNode(ancestor)) {
+      return select;
+    }
+  }
+  return nullptr;
+}
+
+void HTMLOptionElement::UpdateNearestAncestorSelect() {
+  mCachedNearestAncestorSelect = ComputeNearestAncestorSelect();
+}
+
+HTMLSelectElement* HTMLOptionElement::GetSelect() const {
+  return mCachedNearestAncestorSelect;
+}
+
+already_AddRefed<HTMLOptionElement> HTMLOptionElement::Option(
+    const GlobalObject& aGlobal, const nsAString& aText,
+    const Optional<nsAString>& aValue, bool aDefaultSelected, bool aSelected,
+    ErrorResult& aError) {
+  nsCOMPtr<nsPIDOMWindowInner> win = do_QueryInterface(aGlobal.GetAsSupports());
+  Document* doc;
+  if (!win || !(doc = win->GetExtantDoc())) {
+    aError.Throw(NS_ERROR_FAILURE);
+    return nullptr;
+  }
+
+  RefPtr<mozilla::dom::NodeInfo> nodeInfo = doc->NodeInfoManager()->GetNodeInfo(
+      nsGkAtoms::option, nullptr, kNameSpaceID_XHTML, ELEMENT_NODE);
+
+  auto* nim = nodeInfo->NodeInfoManager();
+  RefPtr<HTMLOptionElement> option =
+      new (nim) HTMLOptionElement(nodeInfo.forget());
+
+  if (!aText.IsEmpty()) {
+    RefPtr<nsTextNode> textContent = new (option->NodeInfo()->NodeInfoManager())
+        nsTextNode(option->NodeInfo()->NodeInfoManager());
+
+    textContent->SetText(aText, false);
+
+    option->AppendChildTo(textContent, false, aError);
+    if (aError.Failed()) {
+      return nullptr;
+    }
+  }
+
+  if (aValue.WasPassed()) {
+    aError = option->SetAttr(kNameSpaceID_None, nsGkAtoms::value,
+                             aValue.Value(), false);
+    if (aError.Failed()) {
+      return nullptr;
+    }
+  }
+
+  if (aDefaultSelected) {
+    aError =
+        option->SetAttr(kNameSpaceID_None, nsGkAtoms::selected, u""_ns, false);
+    if (aError.Failed()) {
+      return nullptr;
+    }
+  }
+
+  option->SetSelected(aSelected);
+  option->SetSelectedChanged(false);
+
+  return option.forget();
+}
+
+nsresult HTMLOptionElement::CopyInnerTo(Element* aDest) {
+  nsresult rv = nsGenericHTMLElement::CopyInnerTo(aDest);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (aDest->OwnerDoc()->IsStaticDocument()) {
+    static_cast<HTMLOptionElement*>(aDest)->SetSelected(Selected());
+  }
+  return NS_OK;
+}
+
+JSObject* HTMLOptionElement::WrapNode(JSContext* aCx,
+                                      JS::Handle<JSObject*> aGivenProto) {
+  return HTMLOptionElement_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+}  

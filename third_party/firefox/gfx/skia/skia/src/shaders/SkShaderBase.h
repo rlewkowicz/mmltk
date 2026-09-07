@@ -1,0 +1,280 @@
+/*
+ * Copyright 2017 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkShaderBase_DEFINED)
+#define SkShaderBase_DEFINED
+
+#include "include/core/SkColor.h"
+#include "include/core/SkFlattenable.h"
+#include "include/core/SkMatrix.h"
+#include "include/core/SkPoint.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkScalar.h"
+#include "include/core/SkShader.h"
+#include "include/core/SkSurfaceProps.h"
+#include "include/core/SkTypes.h"
+#include "include/private/base/SkNoncopyable.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <tuple>
+
+class SkArenaAlloc;
+class SkColorSpace;
+class SkImage;
+class SkRuntimeEffect;
+class SkWriteBuffer;
+enum SkColorType : int;
+enum class SkTileMode;
+struct SkDeserialProcs;
+struct SkStageRec;
+
+namespace SkShaders {
+class MatrixRec {
+public:
+    MatrixRec() = default;
+
+    explicit MatrixRec(const SkMatrix& ctm);
+
+    [[nodiscard]] MatrixRec concat(const SkMatrix& m) const;
+
+    [[nodiscard]] std::optional<MatrixRec> apply(const SkStageRec& rec,
+                                                 const SkMatrix& postInv = {}) const;
+
+    std::tuple<SkMatrix, bool> applyForFragmentProcessor(const SkMatrix& postInv) const;
+
+    MatrixRec applied() const;
+
+    void markTotalMatrixInvalid() { fTotalMatrixIsValid = false; }
+
+    void markCTMApplied() { fCTMApplied = true; }
+
+    bool totalMatrixIsValid() const { return fTotalMatrixIsValid; }
+
+    SkMatrix totalMatrix() const { return SkMatrix::Concat(fCTM, fTotalLocalMatrix); }
+
+    std::optional<SkMatrix> totalInverse() const {
+        return this->totalMatrix().invert();
+    }
+
+    bool hasPendingMatrix() const {
+        return (!fCTMApplied && !fCTM.isIdentity()) || !fPendingLocalMatrix.isIdentity();
+    }
+
+    bool rasterPipelineCoordsAreSeeded() const { return fCTMApplied; }
+
+private:
+    MatrixRec(const SkMatrix& ctm,
+              const SkMatrix& totalLocalMatrix,
+              const SkMatrix& pendingLocalMatrix,
+              bool totalIsValid,
+              bool ctmApplied)
+            : fCTM(ctm)
+            , fTotalLocalMatrix(totalLocalMatrix)
+            , fPendingLocalMatrix(pendingLocalMatrix)
+            , fTotalMatrixIsValid(totalIsValid)
+            , fCTMApplied(ctmApplied) {}
+
+    const SkMatrix fCTM;
+
+    const SkMatrix fTotalLocalMatrix;
+
+    const SkMatrix fPendingLocalMatrix;
+
+    bool fTotalMatrixIsValid = true;
+
+    bool fCTMApplied = false;
+};
+
+}  
+
+#define SK_ALL_SHADERS(M) \
+    M(Blend)              \
+    M(CTM)                \
+    M(Color)              \
+    M(ColorFilter)        \
+    M(CoordClamp)         \
+    M(Empty)              \
+    M(GradientBase)       \
+    M(Image)              \
+    M(LocalMatrix)        \
+    M(PerlinNoise)        \
+    M(Picture)            \
+    M(Runtime)            \
+    M(Transform)          \
+    M(TriColor)           \
+    M(WorkingColorSpace)
+
+#define SK_ALL_GRADIENTS(M) \
+    M(Conical)              \
+    M(Linear)               \
+    M(Radial)               \
+    M(Sweep)
+
+class SkShaderBase : public SkShader {
+public:
+    ~SkShaderBase() override;
+
+    sk_sp<SkShader> makeInvertAlpha() const;
+    sk_sp<SkShader> makeWithCTM(const SkMatrix&) const;  
+
+    virtual bool isConstant(SkColor4f* color = nullptr) const { return false; }
+
+    enum class ShaderType {
+#define M(type) k##type,
+        SK_ALL_SHADERS(M)
+#undef M
+    };
+
+    virtual ShaderType type() const = 0;
+
+    enum class GradientType {
+        kNone,
+#define M(type) k##type,
+        SK_ALL_GRADIENTS(M)
+#undef M
+    };
+
+    struct GradientInfo {
+        int         fColorCount    = 0;        
+        SkColor4f*  fColors        = nullptr;  
+        SkScalar*   fColorOffsets  = nullptr;  
+        SkPoint     fPoint[2];                 
+        SkScalar    fRadius[2];                
+        SkTileMode  fTileMode;
+        bool        fPremulInterp;
+    };
+
+    virtual GradientType asGradient(GradientInfo* info    = nullptr,
+                                    SkMatrix* localMatrix = nullptr) const {
+        return GradientType::kNone;
+    }
+
+    enum Flags {
+        kOpaqueAlpha_Flag = 1 << 0,
+    };
+
+    struct ContextRec {
+        ContextRec(SkAlpha paintAlpha,
+                   const SkShaders::MatrixRec& matrixRec,
+                   SkColorType dstColorType,
+                   SkColorSpace* dstColorSpace,
+                   const SkSurfaceProps& props)
+                : fMatrixRec(matrixRec)
+                , fDstColorType(dstColorType)
+                , fDstColorSpace(dstColorSpace)
+                , fProps(props)
+                , fPaintAlpha(paintAlpha) {}
+
+        static ContextRec Concat(const ContextRec& parentRec, const SkMatrix& localM) {
+            return {parentRec.fPaintAlpha,
+                    parentRec.fMatrixRec.concat(localM),
+                    parentRec.fDstColorType,
+                    parentRec.fDstColorSpace,
+                    parentRec.fProps};
+        }
+
+        const SkShaders::MatrixRec fMatrixRec;
+        SkColorType                fDstColorType;   
+        SkColorSpace*              fDstColorSpace;  
+        SkSurfaceProps             fProps;          
+        SkAlpha                    fPaintAlpha;
+
+        bool isLegacyCompatible(SkColorSpace* shadersColorSpace) const;
+    };
+
+    class Context : public ::SkNoncopyable {
+    public:
+        Context(const SkShaderBase& shader, const ContextRec&);
+
+        virtual ~Context();
+
+        virtual uint32_t getFlags() const { return 0; }
+
+        virtual void shadeSpan(int x, int y, SkPMColor[], int count) = 0;
+
+    protected:
+        const SkShaderBase& fShader;
+
+        uint8_t getPaintAlpha() const { return fPaintAlpha; }
+
+    private:
+        uint8_t fPaintAlpha;
+    };
+
+    Context* makeContext(const ContextRec&, SkArenaAlloc*) const;
+
+    bool asLuminanceColor(SkColor4f*) const;
+
+    [[nodiscard]] bool appendRootStages(const SkStageRec& rec, const SkMatrix& ctm) const;
+
+    virtual bool appendStages(const SkStageRec&, const SkShaders::MatrixRec&) const = 0;
+
+    virtual SkImage* onIsAImage(SkMatrix*, SkTileMode[2]) const {
+        return nullptr;
+    }
+
+    virtual SkRuntimeEffect* asRuntimeEffect() const { return nullptr; }
+
+    static Type GetFlattenableType() { return kSkShader_Type; }
+    Type getFlattenableType() const override { return GetFlattenableType(); }
+
+    static sk_sp<SkShaderBase> Deserialize(const void* data, size_t size,
+                                             const SkDeserialProcs* procs = nullptr) {
+        return sk_sp<SkShaderBase>(static_cast<SkShaderBase*>(
+                SkFlattenable::Deserialize(GetFlattenableType(), data, size, procs).release()));
+    }
+    static void RegisterFlattenables();
+
+    virtual sk_sp<SkShader> makeAsALocalMatrixShader(SkMatrix* localMatrix) const;
+
+    static SkMatrix ConcatLocalMatrices(const SkMatrix& parentLM, const SkMatrix& childLM) {
+#if defined(SK_BUILD_FOR_ANDROID_FRAMEWORK)  // b/256873449
+        return SkMatrix::Concat(childLM, parentLM);
+#endif
+        return SkMatrix::Concat(parentLM, childLM);
+    }
+
+protected:
+    SkShaderBase();
+
+    void flatten(SkWriteBuffer&) const override;
+
+#if defined(SK_ENABLE_LEGACY_SHADERCONTEXT)
+    virtual Context* onMakeContext(const ContextRec&, SkArenaAlloc*) const {
+        return nullptr;
+    }
+#endif
+
+    virtual bool onAsLuminanceColor(SkColor4f*) const {
+        return false;
+    }
+
+private:
+    friend class SkShaders::MatrixRec;
+};
+inline SkShaderBase* as_SB(SkShader* shader) {
+    return static_cast<SkShaderBase*>(shader);
+}
+
+inline const SkShaderBase* as_SB(const SkShader* shader) {
+    return static_cast<const SkShaderBase*>(shader);
+}
+
+inline const SkShaderBase* as_SB(const sk_sp<SkShader>& shader) {
+    return static_cast<SkShaderBase*>(shader.get());
+}
+
+void SkRegisterBlendShaderFlattenable();
+void SkRegisterColorShaderFlattenable();
+void SkRegisterCoordClampShaderFlattenable();
+void SkRegisterEmptyShaderFlattenable();
+void SkRegisterPerlinNoiseShaderFlattenable();
+void SkRegisterWorkingColorSpaceShaderFlattenable();
+
+#endif

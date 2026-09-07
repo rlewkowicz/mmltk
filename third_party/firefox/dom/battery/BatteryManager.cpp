@@ -1,0 +1,164 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "BatteryManager.h"
+
+#include <cmath>
+#include <limits>
+
+#include "Constants.h"
+#include "mozilla/DOMEventTargetHelper.h"
+#include "mozilla/Hal.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/dom/BatteryManagerBinding.h"
+#include "mozilla/dom/Document.h"
+#include "nsContentUtils.h"
+#include "nsGlobalWindowInner.h"
+
+#define LEVELCHANGE_EVENT_NAME u"levelchange"_ns
+#define CHARGINGCHANGE_EVENT_NAME u"chargingchange"_ns
+#define DISCHARGINGTIMECHANGE_EVENT_NAME u"dischargingtimechange"_ns
+#define CHARGINGTIMECHANGE_EVENT_NAME u"chargingtimechange"_ns
+
+namespace mozilla::dom::battery {
+
+BatteryManager::BatteryManager(nsPIDOMWindowInner* aWindow)
+    : DOMEventTargetHelper(aWindow),
+      mLevel(kDefaultLevel),
+      mCharging(kDefaultCharging),
+      mRemainingTime(kDefaultRemainingTime) {}
+
+void BatteryManager::Init() {
+  hal::RegisterBatteryObserver(this);
+
+  hal::BatteryInformation batteryInfo;
+  hal::GetCurrentBatteryInformation(&batteryInfo);
+
+  UpdateFromBatteryInfo(batteryInfo);
+}
+
+void BatteryManager::Shutdown() { hal::UnregisterBatteryObserver(this); }
+
+JSObject* BatteryManager::WrapObject(JSContext* aCx,
+                                     JS::Handle<JSObject*> aGivenProto) {
+  return BatteryManager_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+bool BatteryManager::Charging() const {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (Preferences::GetBool("dom.battery.test.default", false)) {
+    return true;
+  }
+  if (Preferences::GetBool("dom.battery.test.charging", false)) {
+    return true;
+  }
+  if (Preferences::GetBool("dom.battery.test.discharging", false)) {
+    return false;
+  }
+
+  return mCharging;
+}
+
+double BatteryManager::DischargingTime() const {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (Preferences::GetBool("dom.battery.test.default", false)) {
+    return std::numeric_limits<double>::infinity();
+  }
+  if (Preferences::GetBool("dom.battery.test.discharging", false)) {
+    return 42.0;
+  }
+
+  if (Charging() || mRemainingTime == kUnknownRemainingTime) {
+    return std::numeric_limits<double>::infinity();
+  }
+
+  return mRemainingTime;
+}
+
+double BatteryManager::ChargingTime() const {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (Preferences::GetBool("dom.battery.test.default", false)) {
+    return 0.0;
+  }
+  if (Preferences::GetBool("dom.battery.test.charging", false)) {
+    return 42.0;
+  }
+
+  if (!Charging() || mRemainingTime == kUnknownRemainingTime) {
+    return std::numeric_limits<double>::infinity();
+  }
+
+  return mRemainingTime;
+}
+
+double BatteryManager::Level() const {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (Preferences::GetBool("dom.battery.test.default")) {
+    return 1.0;
+  }
+
+  return mLevel;
+}
+
+void BatteryManager::UpdateFromBatteryInfo(
+    const hal::BatteryInformation& aBatteryInfo) {
+  mLevel = aBatteryInfo.level();
+
+  Document* doc = GetOwnerWindow() ? GetOwnerWindow()->GetDoc() : nullptr;
+
+  mCharging = aBatteryInfo.charging();
+  mRemainingTime = aBatteryInfo.remainingTime();
+
+  if (!nsContentUtils::IsChromeDoc(doc)) {
+    mLevel = lround(mLevel * 10.0) / 10.0;
+    if (mLevel == 1.0) {
+      mRemainingTime =
+          mCharging ? kDefaultRemainingTime : kUnknownRemainingTime;
+    } else if (mRemainingTime != kUnknownRemainingTime) {
+      const double MINUTES_15 = 15.0 * 60.0;
+      mRemainingTime =
+          fmax(lround(mRemainingTime / MINUTES_15) * MINUTES_15, MINUTES_15);
+    }
+  }
+
+  if (mLevel == 1.0 && mCharging == true &&
+      mRemainingTime != kDefaultRemainingTime) {
+    mRemainingTime = kDefaultRemainingTime;
+    NS_ERROR(
+        "Battery API: When charging and level at 1.0, remaining time "
+        "should be 0. Please fix your backend!");
+  }
+}
+
+void BatteryManager::Notify(const hal::BatteryInformation& aBatteryInfo) {
+  double previousLevel = mLevel;
+  bool previousCharging = mCharging;
+  double previousRemainingTime = mRemainingTime;
+
+  UpdateFromBatteryInfo(aBatteryInfo);
+
+  if (previousCharging != mCharging) {
+    DispatchTrustedEvent(CHARGINGCHANGE_EVENT_NAME);
+  }
+
+  if (previousLevel != mLevel) {
+    DispatchTrustedEvent(LEVELCHANGE_EVENT_NAME);
+  }
+
+  if (mCharging != previousCharging) {
+    if (previousRemainingTime != kUnknownRemainingTime) {
+      DispatchTrustedEvent(previousCharging ? CHARGINGTIMECHANGE_EVENT_NAME
+                                            : DISCHARGINGTIMECHANGE_EVENT_NAME);
+    }
+    if (mRemainingTime != kUnknownRemainingTime) {
+      DispatchTrustedEvent(mCharging ? CHARGINGTIMECHANGE_EVENT_NAME
+                                     : DISCHARGINGTIMECHANGE_EVENT_NAME);
+    }
+  } else if (previousRemainingTime != mRemainingTime) {
+    DispatchTrustedEvent(mCharging ? CHARGINGTIMECHANGE_EVENT_NAME
+                                   : DISCHARGINGTIMECHANGE_EVENT_NAME);
+  }
+}
+
+}  

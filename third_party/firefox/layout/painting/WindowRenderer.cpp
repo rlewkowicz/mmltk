@@ -1,0 +1,208 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "WindowRenderer.h"
+
+#include "gfxPlatform.h"
+#include "mozilla/EffectSet.h"
+#include "mozilla/dom/Animation.h"  // for Animation
+#include "mozilla/dom/AnimationEffect.h"
+#include "mozilla/gfx/GPUProcessManager.h"
+#include "mozilla/layers/PersistentBufferProvider.h"  // for PersistentBufferProviderBasic, PersistentBufferProvider (ptr only)
+#include "nsDisplayList.h"
+
+using namespace mozilla::gfx;
+using namespace mozilla::layers;
+
+namespace mozilla {
+
+uint32_t FrameRecorder::StartFrameTimeRecording(int32_t aBufferSize) {
+  if (mRecording.mIsPaused) {
+    mRecording.mIsPaused = false;
+
+    if (!mRecording.mIntervals.Length()) {  
+      mRecording.mIntervals.SetLength(aBufferSize);
+    }
+
+    mRecording.mLastFrameTime = TimeStamp::Now();
+
+    mRecording.mCurrentRunStartIndex = mRecording.mNextIndex;
+  }
+
+  mRecording.mLatestStartIndex = mRecording.mNextIndex;
+  return mRecording.mNextIndex;
+}
+
+void FrameRecorder::RecordFrame() {
+  if (!mRecording.mIsPaused) {
+    TimeStamp now = TimeStamp::Now();
+    uint32_t i = mRecording.mNextIndex % mRecording.mIntervals.Length();
+    mRecording.mIntervals[i] =
+        static_cast<float>((now - mRecording.mLastFrameTime).ToMilliseconds());
+    mRecording.mNextIndex++;
+    mRecording.mLastFrameTime = now;
+
+    if (mRecording.mNextIndex >
+        (mRecording.mLatestStartIndex + mRecording.mIntervals.Length())) {
+      mRecording.mIsPaused = true;
+    }
+  }
+}
+
+void FrameRecorder::StopFrameTimeRecording(uint32_t aStartIndex,
+                                           nsTArray<float>& aFrameIntervals) {
+  uint32_t bufferSize = mRecording.mIntervals.Length();
+  uint32_t length = mRecording.mNextIndex - aStartIndex;
+  if (mRecording.mIsPaused || length > bufferSize ||
+      aStartIndex < mRecording.mCurrentRunStartIndex) {
+    length = 0;
+  }
+
+  if (!length) {
+    aFrameIntervals.Clear();
+    return;  
+  }
+  aFrameIntervals.SetLength(length);
+
+  uint32_t cyclicPos = aStartIndex % bufferSize;
+  for (uint32_t i = 0; i < length; i++, cyclicPos++) {
+    if (cyclicPos == bufferSize) {
+      cyclicPos = 0;
+    }
+    aFrameIntervals[i] = mRecording.mIntervals[cyclicPos];
+  }
+}
+
+already_AddRefed<PersistentBufferProvider>
+WindowRenderer::CreatePersistentBufferProvider(
+    const mozilla::gfx::IntSize& aSize, mozilla::gfx::SurfaceFormat aFormat,
+    bool aWillReadFrequently) {
+  RefPtr<PersistentBufferProviderBasic> bufferProvider;
+  if (!aWillReadFrequently &&
+      (!gfxPlatform::UseRemoteCanvas() ||
+       !gfxPlatform::IsBackendAccelerated(
+           gfxPlatform::GetPlatform()->GetPreferredCanvasBackend()))) {
+    bufferProvider = PersistentBufferProviderBasic::Create(
+        aSize, aFormat,
+        gfxPlatform::GetPlatform()->GetPreferredCanvasBackend());
+  }
+
+  if (!bufferProvider) {
+    bufferProvider = PersistentBufferProviderBasic::Create(
+        aSize, aFormat, gfxPlatform::GetPlatform()->GetFallbackCanvasBackend());
+  }
+
+  return bufferProvider.forget();
+}
+
+void WindowRenderer::AddPartialPrerenderedAnimation(
+    uint64_t aCompositorAnimationId, dom::Animation* aAnimation) {
+  mPartialPrerenderedAnimations.InsertOrUpdate(aCompositorAnimationId,
+                                               RefPtr{aAnimation});
+  aAnimation->SetPartialPrerendered(aCompositorAnimationId);
+}
+void WindowRenderer::RemovePartialPrerenderedAnimation(
+    uint64_t aCompositorAnimationId, dom::Animation* aAnimation) {
+  MOZ_ASSERT(aAnimation);
+#ifdef DEBUG
+  RefPtr<dom::Animation> animation;
+  if (mPartialPrerenderedAnimations.Remove(aCompositorAnimationId,
+                                           getter_AddRefs(animation)) &&
+      aAnimation->GetEffect() && aAnimation->GetEffect()->AsKeyframeEffect() &&
+      animation->GetEffect() && animation->GetEffect()->AsKeyframeEffect()) {
+    MOZ_ASSERT(
+        EffectSet::GetForEffect(aAnimation->GetEffect()->AsKeyframeEffect()) ==
+        EffectSet::GetForEffect(animation->GetEffect()->AsKeyframeEffect()));
+  }
+#else
+  mPartialPrerenderedAnimations.Remove(aCompositorAnimationId);
+#endif
+  aAnimation->ResetPartialPrerendered();
+}
+void WindowRenderer::UpdatePartialPrerenderedAnimations(
+    const nsTArray<uint64_t>& aJankedAnimations) {
+  for (uint64_t id : aJankedAnimations) {
+    RefPtr<dom::Animation> animation;
+    if (mPartialPrerenderedAnimations.Remove(id, getter_AddRefs(animation))) {
+      animation->UpdatePartialPrerendered();
+    }
+  }
+}
+
+void FallbackRenderer::SetTarget(gfxContext* aTarget) { mTarget = aTarget; }
+
+bool FallbackRenderer::BeginTransaction(const nsCString& aURL) {
+  if (!mTarget) {
+    return false;
+  }
+
+  return true;
+}
+
+void FallbackRenderer::EndTransactionWithColor(const nsIntRect& aRect,
+                                               const gfx::DeviceColor& aColor) {
+  mTarget->GetDrawTarget()->FillRect(Rect(aRect), ColorPattern(aColor));
+}
+
+void FallbackRenderer::EndTransactionWithList(nsDisplayListBuilder* aBuilder,
+                                              nsDisplayList* aList,
+                                              int32_t aAppUnitsPerDevPixel,
+                                              EndTransactionFlags aFlags) {
+  if (aFlags & EndTransactionFlags::END_NO_COMPOSITE) {
+    return;
+  }
+
+  DrawTarget* dt = mTarget->GetDrawTarget();
+
+  BackendType backend = gfxPlatform::GetPlatform()->GetContentBackendFor(
+      LayersBackend::LAYERS_NONE);
+  RefPtr<DrawTarget> dest =
+      gfxPlatform::GetPlatform()->CreateDrawTargetForBackend(
+          backend, dt->GetSize(), dt->GetFormat());
+  if (dest) {
+    gfxContext ctx(dest,  true);
+
+    nsRegion opaque = aList->GetOpaqueRegion(aBuilder);
+    if (opaque.Contains(aList->GetComponentAlphaBounds(aBuilder))) {
+      dest->SetPermitSubpixelAA(true);
+    }
+
+    aList->Paint(aBuilder, &ctx, aAppUnitsPerDevPixel);
+
+    RefPtr<SourceSurface> snapshot = dest->Snapshot();
+    dt->DrawSurface(snapshot, Rect(dest->GetRect()), Rect(dest->GetRect()),
+                    DrawSurfaceOptions(),
+                    DrawOptions(1.0f, CompositionOp::OP_SOURCE));
+  }
+}
+
+BackgroundedFallbackRenderer::BackgroundedFallbackRenderer(nsIWidget* aWidget)
+    : mWidget(aWidget) {
+  MOZ_ASSERT(mWidget);
+  if (auto* gpm = gfx::GPUProcessManager::Get()) {
+    gpm->AddListener(this);
+  }
+}
+
+BackgroundedFallbackRenderer::~BackgroundedFallbackRenderer() { Destroy(); }
+
+void BackgroundedFallbackRenderer::Destroy() {
+  if (!mWidget) {
+    return;
+  }
+
+  if (auto* gpm = gfx::GPUProcessManager::Get()) {
+    gpm->RemoveListener(this);
+  }
+
+  mWidget = nullptr;
+}
+
+void BackgroundedFallbackRenderer::OnCompositorDestroyBackgrounded() {
+  if (RefPtr<nsIWidget> widget = mWidget) {
+    widget->NotifyCompositorSessionLost( nullptr);
+  }
+}
+
+}  

@@ -1,0 +1,116 @@
+
+[package]
+edition = "2018"
+rust-version = "1.67.0"
+name = "flate2"
+version = "1.1.4"
+authors = [
+    "Alex Crichton <alex@alexcrichton.com>",
+    "Josh Triplett <josh@joshtriplett.org>",
+]
+build = false
+exclude = [".*"]
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = """
+DEFLATE compression and decompression exposed as Read/BufRead/Write streams.
+Supports miniz_oxide and multiple zlib implementations. Supports zlib, gzip,
+and raw deflate streams.
+"""
+homepage = "https://github.com/rust-lang/flate2-rs"
+documentation = "https://docs.rs/flate2"
+keywords = [
+    "gzip",
+    "deflate",
+    "zlib",
+    "zlib-ng",
+    "encoding",
+]
+categories = [
+    "compression",
+    "api-bindings",
+]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rust-lang/flate2-rs"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = [
+    "--cfg",
+    "docsrs",
+]
+
+[features]
+any_impl = []
+any_zlib = ["any_impl"]
+cloudflare_zlib = [
+    "any_zlib",
+    "cloudflare-zlib-sys",
+]
+default = ["rust_backend"]
+miniz-sys = ["rust_backend"]
+rust_backend = [
+    "miniz_oxide",
+    "any_impl",
+]
+zlib = [
+    "any_zlib",
+    "libz-sys",
+]
+zlib-default = [
+    "any_zlib",
+    "libz-sys/default",
+]
+zlib-ng = [
+    "any_zlib",
+    "libz-ng-sys",
+]
+zlib-ng-compat = [
+    "zlib",
+    "libz-sys/zlib-ng",
+]
+zlib-rs = [
+    "any_zlib",
+    "libz-rs-sys",
+]
+
+[lib]
+name = "flate2"
+path = "src/lib.rs"
+
+[dependencies.cloudflare-zlib-sys]
+version = "0.3.6"
+optional = true
+
+[dependencies.crc32fast]
+version = "1.2.0"
+
+[dependencies.libz-ng-sys]
+version = "1.1.16"
+optional = true
+
+[dependencies.libz-rs-sys]
+version = "0.5.1"
+features = [
+    "std",
+    "rust-allocator",
+]
+optional = true
+default-features = false
+
+[dependencies.libz-sys]
+version = "1.1.20"
+optional = true
+default-features = false
+
+[dependencies.miniz_oxide]
+version = "0.8.5"
+features = [
+    "with-alloc",
+    "simd",
+]
+optional = true
+default-features = false

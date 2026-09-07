@@ -1,0 +1,51 @@
+// Copyright (c) 2012 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+
+#if !defined(BASE_EINTR_WRAPPER_H_)
+#define BASE_EINTR_WRAPPER_H_
+
+#if defined(XP_UNIX)
+
+#  include <errno.h>
+
+#  define HANDLE_EINTR(x)                                     \
+    ({                                                        \
+      decltype(x) eintr_wrapper_result;                       \
+      do {                                                    \
+        eintr_wrapper_result = (x);                           \
+      } while (eintr_wrapper_result == -1 && errno == EINTR); \
+      eintr_wrapper_result;                                   \
+    })
+
+#  define IGNORE_EINTR(x)                                   \
+    ({                                                      \
+      decltype(x) eintr_wrapper_result;                     \
+      do {                                                  \
+        eintr_wrapper_result = (x);                         \
+        if (eintr_wrapper_result == -1 && errno == EINTR) { \
+          eintr_wrapper_result = 0;                         \
+        }                                                   \
+      } while (0);                                          \
+      eintr_wrapper_result;                                 \
+    })
+
+#  define HANDLE_RV_EINTR(x)                   \
+    ({                                         \
+      decltype(x) eintr_wrapper_result;        \
+      do {                                     \
+        eintr_wrapper_result = (x);            \
+      } while (eintr_wrapper_result == EINTR); \
+      eintr_wrapper_result;                    \
+    })
+
+#else
+
+#  define HANDLE_EINTR(x) (x)
+#  define IGNORE_EINTR(x) (x)
+#  define HANDLE_RV_EINTR(x) (x)
+
+#endif
+
+#endif

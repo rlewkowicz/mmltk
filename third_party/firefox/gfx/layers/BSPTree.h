@@ -1,0 +1,101 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_LAYERS_BSPTREE_H
+#define MOZILLA_LAYERS_BSPTREE_H
+
+#include <list>
+#include <utility>
+
+#include "mozilla/ArenaAllocator.h"
+#include "mozilla/gfx/Polygon.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+namespace layers {
+
+template <typename T>
+struct BSPPolygon {
+  explicit BSPPolygon(T* aData) : data(aData) {}
+
+  BSPPolygon(T* aData, gfx::Polygon&& aGeometry)
+      : data(aData), geometry(Some(std::move(aGeometry))) {}
+
+  BSPPolygon(T* aData, nsTArray<gfx::Point4D>&& aPoints,
+             const gfx::Point4D& aNormal)
+      : data(aData) {
+    geometry.emplace(std::move(aPoints), aNormal);
+  }
+
+  T* data;
+  Maybe<gfx::Polygon> geometry;
+};
+
+typedef mozilla::ArenaAllocator<4096, 8> BSPTreeArena;
+
+template <typename T>
+using PolygonList = std::list<BSPPolygon<T>>;
+
+class BSPTestData {};
+using TestPolygon = BSPPolygon<BSPTestData>;
+
+template <typename T>
+struct BSPTreeNode {
+  explicit BSPTreeNode(nsTArray<PolygonList<T>*>& aListPointers)
+      : front(nullptr), back(nullptr) {
+    aListPointers.AppendElement(&layers);
+  }
+
+  const gfx::Polygon& First() const {
+    MOZ_ASSERT(!layers.empty());
+    MOZ_ASSERT(layers.front().geometry);
+    return *layers.front().geometry;
+  }
+
+  static void* operator new(size_t aSize, BSPTreeArena& mPool) {
+    return mPool.Allocate(aSize);
+  }
+
+  BSPTreeNode* front;
+  BSPTreeNode* back;
+  PolygonList<T> layers;
+};
+
+template <typename T>
+class BSPTree final {
+ public:
+  explicit BSPTree(std::list<BSPPolygon<T>>& aLayers) {
+    MOZ_ASSERT(!aLayers.empty());
+
+    mRoot = new (mPool) BSPTreeNode(mListPointers);
+    BuildTree(mRoot, aLayers);
+  }
+
+  ~BSPTree() {
+    for (PolygonList<T>* listPtr : mListPointers) {
+      listPtr->~list();
+    }
+  }
+
+  nsTArray<BSPPolygon<T>> GetDrawOrder() const {
+    nsTArray<BSPPolygon<T>> layers;
+    BuildDrawOrder(mRoot, layers);
+    return layers;
+  }
+
+ private:
+  BSPTreeArena mPool;
+  BSPTreeNode<T>* mRoot;
+  nsTArray<PolygonList<T>*> mListPointers;
+
+  void BuildDrawOrder(BSPTreeNode<T>* aNode,
+                      nsTArray<BSPPolygon<T>>& aLayers) const;
+
+  void BuildTree(BSPTreeNode<T>* aRoot, PolygonList<T>& aLayers);
+};
+
+}  
+}  
+
+#endif /* MOZILLA_LAYERS_BSPTREE_H */

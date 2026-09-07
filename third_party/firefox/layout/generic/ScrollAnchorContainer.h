@@ -1,0 +1,90 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layout_ScrollAnchorContainer_h_
+#define mozilla_layout_ScrollAnchorContainer_h_
+
+#include "mozilla/Saturate.h"
+#include "mozilla/TimeStamp.h"
+#include "nsPoint.h"
+
+class nsFrameList;
+class nsIFrame;
+
+namespace mozilla {
+class ScrollContainerFrame;
+}
+
+namespace mozilla::layout {
+
+class ScrollAnchorContainer final {
+ public:
+  explicit ScrollAnchorContainer(ScrollContainerFrame* aScrollFrame);
+  ~ScrollAnchorContainer() = default;
+
+  static ScrollAnchorContainer* FindFor(nsIFrame* aFrame);
+
+  nsIFrame* AnchorNode() const { return mAnchorNode; }
+
+  ScrollContainerFrame* Frame() const;
+
+  ScrollContainerFrame* ScrollContainer() const;
+
+  void SelectAnchor();
+
+  bool CanMaintainAnchor() const;
+
+  void UserScrolled();
+
+  void ApplyAdjustments();
+
+  void SuppressAdjustments();
+
+  enum class ScheduleSelection { No, Yes };
+  void InvalidateAnchor(ScheduleSelection = ScheduleSelection::Yes);
+
+  void Destroy();
+
+ private:
+  enum class ExamineResult {
+    Exclude,
+    PassThrough,
+    Traverse,
+    Accept,
+  };
+
+  ExamineResult ExamineAnchorCandidate(nsIFrame* aPrimaryFrame) const;
+
+  nsIFrame* FindAnchorIn(nsIFrame* aFrame) const;
+
+  nsIFrame* FindAnchorInList(const nsFrameList& aFrameList) const;
+
+  void AdjustmentMade(nscoord aAdjustment);
+
+  nsIFrame* mAnchorNode = nullptr;
+
+  struct DisablingHeuristic {
+    SaturateUint32 mConsecutiveScrollAnchoringAdjustments{0};
+
+    nscoord mConsecutiveScrollAnchoringAdjustmentLength{0};
+
+    TimeStamp mTimeStamp;
+
+    bool AdjustmentMade(const ScrollAnchorContainer&, nscoord aAdjustment);
+    void Reset();
+  } mHeuristic;
+
+  nscoord mLastAnchorOffset = 0;
+
+  bool mDisabled : 1;
+
+  bool mAnchorMightBeSubOptimal : 1;
+  bool mAnchorNodeIsDirty : 1;
+  bool mApplyingAnchorAdjustment : 1;
+  bool mSuppressAnchorAdjustment : 1;
+};
+
+}  
+
+#endif  // mozilla_layout_ScrollAnchorContainer_h_

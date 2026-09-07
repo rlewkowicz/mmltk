@@ -1,0 +1,329 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef js_Debug_h
+#define js_Debug_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/Vector.h"
+
+#include "jstypes.h"
+
+#include "js/GCAPI.h"
+#include "js/RootingAPI.h"
+#include "js/TypeDecls.h"
+#include "js/Value.h"
+
+namespace js {
+class Debugger;
+}  
+
+extern JS_PUBLIC_API bool JS_DefineDebuggerObject(JSContext* cx,
+                                                  JS::HandleObject obj);
+
+extern JS_PUBLIC_API const char* JS_GetLastOOMStackTrace(JSContext* cx);
+
+extern JS_PUBLIC_API void JS_TracerEnterLabelLatin1(JSContext* cx,
+                                                    const char* label);
+extern JS_PUBLIC_API void JS_TracerEnterLabelTwoByte(JSContext* cx,
+                                                     const char16_t* label);
+
+extern JS_PUBLIC_API bool JS_TracerIsTracing(JSContext* cx);
+
+extern JS_PUBLIC_API void JS_TracerLeaveLabelLatin1(JSContext* cx,
+                                                    const char* label);
+extern JS_PUBLIC_API void JS_TracerLeaveLabelTwoByte(JSContext* cx,
+                                                     const char16_t* label);
+
+#ifdef MOZ_EXECUTION_TRACING
+
+extern JS_PUBLIC_API bool JS_TracerBeginTracing(JSContext* cx);
+
+extern JS_PUBLIC_API bool JS_TracerEndTracing(JSContext* cx);
+
+namespace JS {
+
+enum class TracerStringEncoding {
+  Latin1,
+  TwoByte,
+  UTF8,
+};
+
+struct ValueSummary {
+  enum Flags : uint8_t {
+    GENERIC_OBJECT_HAS_DENSE_ELEMENTS = 1,
+
+    SYMBOL_NO_DESCRIPTION = 1,
+
+    NUMBER_IS_OUT_OF_LINE_MAGIC = 0xf,
+  };
+
+  static const uint32_t VERSION = 2;
+
+  static const int32_t MIN_INLINE_INT = -1;
+  static const int32_t MAX_INLINE_INT = 13;
+
+  static const size_t SMALL_STRING_LENGTH_LIMIT = 512;
+
+  static const size_t MAX_COLLECTION_VALUES = 16;
+
+  JS::ValueType type : 4;
+
+  uint8_t flags : 4;
+
+};
+
+struct ObjectSummary {
+  static const uint8_t GETTER_SETTER_MAGIC = 0x0f;
+
+  enum class Kind : uint8_t {
+    NotImplemented,
+    ArrayLike,
+    MapLike,
+    Function,
+    WrappedPrimitiveObject,
+    GenericObject,
+    ProxyObject,
+    External,
+    Error,
+  };
+
+  Kind kind;
+
+};
+
+struct ExecutionTrace {
+  enum class EventKind : uint8_t {
+    FunctionEnter = 0,
+    FunctionLeave = 1,
+    LabelEnter = 2,
+    LabelLeave = 3,
+
+    Error = 4,
+  };
+
+  enum class ImplementationType : uint8_t {
+    Interpreter = 0,
+    Baseline = 1,
+    Ion = 2,
+    Wasm = 3,
+  };
+
+  static const uint32_t MAX_ARGUMENTS_TO_RECORD = 4;
+  static const int32_t ZERO_ARGUMENTS_MAGIC = -2;
+  static const int32_t EXPIRED_VALUES_MAGIC = -1;
+  static const int32_t FUNCTION_LEAVE_VALUES = -1;
+
+  struct TracedEvent {
+    EventKind kind;
+    union {
+      struct {
+        ImplementationType implementation;
+
+        uint32_t lineNumber;
+
+        uint32_t column;
+
+        uint32_t scriptId;
+
+        uint64_t realmID;
+
+        uint32_t functionNameId;
+
+        int32_t values;
+      } functionEvent;
+
+      struct {
+        size_t label;  
+      } labelEvent;
+    };
+    double time;
+  };
+
+  struct ShapeSummary {
+    uint32_t id;
+
+    uint32_t numProperties;
+
+    size_t stringBufferOffset;
+
+  };
+
+  struct TracedJSContext {
+    mozilla::baseprofiler::BaseProfilerThreadId id;
+
+    mozilla::HashMap<uint32_t, size_t> scriptUrls;
+
+    mozilla::HashMap<uint32_t, size_t> atoms;
+
+    mozilla::Vector<uint8_t> valueBuffer;
+
+    mozilla::Vector<ShapeSummary> shapeSummaries;
+
+    mozilla::Vector<TracedEvent> events;
+  };
+
+  mozilla::Vector<char> stringBuffer;
+
+  mozilla::Vector<TracedJSContext> contexts;
+};
+}  
+
+extern JS_PUBLIC_API bool JS_TracerSnapshotTrace(JS::ExecutionTrace& trace);
+
+struct JS_TracerSummaryWriterImpl;
+
+struct JS_PUBLIC_API JS_TracerSummaryWriter {
+  JS_TracerSummaryWriterImpl* impl;
+
+  void writeUint8(uint8_t val);
+  void writeUint16(uint16_t val);
+  void writeUint32(uint32_t val);
+  void writeUint64(uint64_t val);
+
+  void writeInt8(int8_t val);
+  void writeInt16(int16_t val);
+  void writeInt32(int32_t val);
+  void writeInt64(int64_t val);
+
+  void writeUTF8String(const char* val);
+  void writeTwoByteString(const char16_t* val);
+
+  bool writeValue(JSContext* cx, JS::Handle<JS::Value> val);
+};
+
+using CustomObjectSummaryCallback = bool (*)(JSContext*,
+                                             JS::Handle<JSObject*> obj,
+                                             bool nested,
+                                             JS_TracerSummaryWriter* writer);
+
+extern JS_PUBLIC_API void JS_SetCustomObjectSummaryCallback(
+    JSContext* cx, CustomObjectSummaryCallback callback);
+
+#endif /* MOZ_EXECUTION_TRACING */
+
+namespace JS {
+namespace dbg {
+
+
+class BuilderOrigin;
+
+class Builder {
+  PersistentRootedObject debuggerObject;
+
+  js::Debugger* debugger;
+
+#ifdef DEBUG
+  void assertBuilt(JSObject* obj);
+#else
+  void assertBuilt(JSObject* obj) {}
+#endif
+
+ protected:
+  template <typename T>
+  class BuiltThing {
+    friend class BuilderOrigin;
+
+   protected:
+    Builder& owner;
+
+    PersistentRooted<T> value;
+
+    BuiltThing(JSContext* cx, Builder& owner_,
+               T value_ = SafelyInitialized<T>::create())
+        : owner(owner_), value(cx, value_) {
+      owner.assertBuilt(value_);
+    }
+
+    js::Debugger* debugger() const { return owner.debugger; }
+    JSObject* debuggerObject() const { return owner.debuggerObject; }
+
+   public:
+    BuiltThing(const BuiltThing& rhs) : owner(rhs.owner), value(rhs.value) {}
+    BuiltThing& operator=(const BuiltThing& rhs) {
+      MOZ_ASSERT(&owner == &rhs.owner);
+      owner.assertBuilt(rhs.value);
+      value = rhs.value;
+      return *this;
+    }
+
+    explicit operator bool() const {
+      return value;
+    }
+
+   private:
+    BuiltThing() = delete;
+  };
+
+ public:
+  class Object : private BuiltThing<JSObject*> {
+    friend class Builder;        
+    friend class BuilderOrigin;  
+
+    typedef BuiltThing<JSObject*> Base;
+
+    Object(JSContext* cx, Builder& owner_, HandleObject obj)
+        : Base(cx, owner_, obj.get()) {}
+
+    bool definePropertyToTrusted(JSContext* cx, const char* name,
+                                 JS::MutableHandleValue value);
+
+   public:
+    Object(JSContext* cx, Builder& owner_) : Base(cx, owner_, nullptr) {}
+    Object(const Object& rhs) = default;
+
+
+    bool defineProperty(JSContext* cx, const char* name, JS::HandleValue value);
+    bool defineProperty(JSContext* cx, const char* name,
+                        JS::HandleObject value);
+    bool defineProperty(JSContext* cx, const char* name, Object& value);
+
+    using Base::operator bool;
+  };
+
+  Object newObject(JSContext* cx);
+
+ protected:
+  Builder(JSContext* cx, js::Debugger* debugger);
+};
+
+class BuilderOrigin : public Builder {
+  template <typename T>
+  T unwrapAny(const BuiltThing<T>& thing) {
+    MOZ_ASSERT(&thing.owner == this);
+    return thing.value.get();
+  }
+
+ public:
+  BuilderOrigin(JSContext* cx, js::Debugger* debugger_)
+      : Builder(cx, debugger_) {}
+
+  JSObject* unwrap(Object& object) { return unwrapAny(object); }
+};
+
+
+JS_PUBLIC_API void SetDebuggerMallocSizeOf(JSContext* cx,
+                                           mozilla::MallocSizeOf mallocSizeOf);
+
+JS_PUBLIC_API mozilla::MallocSizeOf GetDebuggerMallocSizeOf(JSContext* cx);
+
+
+JS_PUBLIC_API bool FireOnGarbageCollectionHookRequired(JSContext* cx);
+
+JS_PUBLIC_API bool FireOnGarbageCollectionHook(
+    JSContext* cx, GarbageCollectionEvent::Ptr&& data);
+
+JS_PUBLIC_API bool IsDebugger(JSObject& obj);
+
+JS_PUBLIC_API bool GetDebuggeeGlobals(JSContext* cx, JSObject& dbgObj,
+                                      MutableHandleObjectVector vector);
+
+bool ShouldAvoidSideEffects(JSContext* cx);
+
+}  
+}  
+
+#endif /* js_Debug_h */

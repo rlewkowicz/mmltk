@@ -1,0 +1,815 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ScrollSnap.h"
+
+#include "FrameMetrics.h"
+#include "mozilla/ScrollContainerFrame.h"
+#include "mozilla/ScrollSnapInfo.h"
+#include "mozilla/ScrollSnapTargetId.h"
+#include "mozilla/ServoStyleConsts.h"
+#include "mozilla/StaticPrefs_layout.h"
+#include "mozilla/dom/Document.h"
+#include "nsContentUtils.h"
+#include "nsIFrame.h"
+#include "nsLayoutUtils.h"
+#include "nsPresContext.h"
+#include "nsString.h"
+#include "nsTArray.h"
+
+mozilla::LazyLogModule sApzScrollSnapLog("apz.scrollsnap");
+#define SCROLL_SNAP_LOG(...) \
+  MOZ_LOG(sApzScrollSnapLog, LogLevel::Debug, (__VA_ARGS__))
+
+namespace mozilla {
+
+class CalcSnapPoints final {
+  using SnapTarget = ScrollSnapInfo::SnapTarget;
+
+ public:
+  CalcSnapPoints(ScrollUnit aUnit, ScrollSnapFlags aSnapFlags,
+                 const nsPoint& aDestination, const nsPoint& aStartPos,
+                 const StyleScrollSnapStrictness& aXStrictness,
+                 const StyleScrollSnapStrictness& aYStrictness);
+  struct SnapPosition : public SnapTarget {
+    SnapPosition(const SnapTarget& aSnapTarget, nscoord aPosition,
+                 nscoord aDistanceOnOtherAxis)
+        : SnapTarget(aSnapTarget),
+          mPosition(aPosition),
+          mDistanceOnOtherAxis(aDistanceOnOtherAxis) {}
+
+    nscoord mPosition;
+    nscoord mDistanceOnOtherAxis;
+  };
+
+  void AddHorizontalEdge(const SnapTarget& aTarget);
+  void AddVerticalEdge(const SnapTarget& aTarget);
+
+  struct CandidateTracker {
+    nscoord mSecondBestEdge = nscoord_MAX;
+
+    AutoTArray<ScrollSnapTargetId, 1> mTargetIds;
+    AutoTArray<SnapPosition, 1> mBestEdges;
+    bool EdgeFound() const { return !mBestEdges.IsEmpty(); }
+  };
+  void AddEdge(const SnapPosition& aEdge, nscoord aDestination,
+               nscoord aStartPos, nscoord aScrollingDirection,
+               CandidateTracker* aCandidateTracker);
+  SnapDestination GetBestEdge(const nsSize& aSnapportSize) const;
+  nsPoint GetDefaultSnapPoint() const;
+  nscoord XDistanceBetweenBestAndSecondEdge() const {
+    return std::abs(NSCoordSaturatingSubtract(
+        mTrackerOnX.mSecondBestEdge,
+        mTrackerOnX.EdgeFound() ? mTrackerOnX.mBestEdges[0].mPosition
+                                : mDestination.x,
+        nscoord_MAX));
+  }
+  nscoord YDistanceBetweenBestAndSecondEdge() const {
+    return std::abs(NSCoordSaturatingSubtract(
+        mTrackerOnY.mSecondBestEdge,
+        mTrackerOnY.EdgeFound() ? mTrackerOnY.mBestEdges[0].mPosition
+                                : mDestination.y,
+        nscoord_MAX));
+  }
+  const nsPoint& Destination() const { return mDestination; }
+
+ protected:
+  ScrollUnit mUnit;
+  ScrollSnapFlags mSnapFlags;
+  nsPoint mDestination;  
+  nsPoint mStartPos;     
+  nsIntPoint mScrollingDirection;  
+  StyleScrollSnapStrictness mStrictnessX;
+  StyleScrollSnapStrictness mStrictnessY;
+  CandidateTracker mTrackerOnX;
+  CandidateTracker mTrackerOnY;
+};
+
+CalcSnapPoints::CalcSnapPoints(ScrollUnit aUnit, ScrollSnapFlags aSnapFlags,
+                               const nsPoint& aDestination,
+                               const nsPoint& aStartPos,
+                               const StyleScrollSnapStrictness& aXStrictness,
+                               const StyleScrollSnapStrictness& aYStrictness)
+    : mUnit(aUnit),
+      mSnapFlags(aSnapFlags),
+      mDestination(aDestination),
+      mStartPos(aStartPos),
+      mStrictnessX(aXStrictness),
+      mStrictnessY(aYStrictness) {
+  MOZ_ASSERT(aSnapFlags != ScrollSnapFlags::Disabled);
+
+  nsPoint direction = aDestination - aStartPos;
+  mScrollingDirection = nsIntPoint(0, 0);
+  if (direction.x < 0) {
+    mScrollingDirection.x = -1;
+  }
+  if (direction.x > 0) {
+    mScrollingDirection.x = 1;
+  }
+  if (direction.y < 0) {
+    mScrollingDirection.y = -1;
+  }
+  if (direction.y > 0) {
+    mScrollingDirection.y = 1;
+  }
+}
+
+nsPoint CalcSnapPoints::GetDefaultSnapPoint() const {
+  MOZ_ASSERT(mSnapFlags != ScrollSnapFlags::Disabled);
+  nsPoint defaultPoint = mDestination;
+  if ((mSnapFlags & ScrollSnapFlags::IntendedDirection) ==
+      ScrollSnapFlags::IntendedDirection) {
+    if (mStrictnessX != StyleScrollSnapStrictness::Proximity) {
+      defaultPoint.x = mStartPos.x;
+    }
+    if (mStrictnessY != StyleScrollSnapStrictness::Proximity) {
+      defaultPoint.y = mStartPos.y;
+    }
+  }
+  return defaultPoint;
+}
+
+SnapDestination CalcSnapPoints::GetBestEdge(const nsSize& aSnapportSize) const {
+  if (mTrackerOnX.EdgeFound() && mTrackerOnY.EdgeFound()) {
+    nsPoint bestCandidate(mTrackerOnX.mBestEdges[0].mPosition,
+                          mTrackerOnY.mBestEdges[0].mPosition);
+    nsRect snappedPort = nsRect(bestCandidate, aSnapportSize);
+
+
+    AutoTArray<ScrollSnapTargetId, 1> visibleTargetIdsOnX;
+    nscoord minimumDistanceOnY = nscoord_MAX;
+    size_t minimumXIndex = 0;
+    AutoTArray<ScrollSnapTargetId, 1> minimumDistanceTargetIdsOnX;
+    for (size_t i = 0; i < mTrackerOnX.mBestEdges.Length(); i++) {
+      const auto& targetX = mTrackerOnX.mBestEdges[i];
+      if (targetX.mSnapArea.Intersects(snappedPort)) {
+        visibleTargetIdsOnX.AppendElement(targetX.mTargetId);
+      }
+
+      if (targetX.mDistanceOnOtherAxis < minimumDistanceOnY) {
+        minimumDistanceOnY = targetX.mDistanceOnOtherAxis;
+        minimumXIndex = i;
+        minimumDistanceTargetIdsOnX =
+            AutoTArray<ScrollSnapTargetId, 1>{targetX.mTargetId};
+      } else if (minimumDistanceOnY != nscoord_MAX &&
+                 targetX.mDistanceOnOtherAxis == minimumDistanceOnY) {
+        minimumDistanceTargetIdsOnX.AppendElement(targetX.mTargetId);
+      }
+    }
+
+    AutoTArray<ScrollSnapTargetId, 1> visibleTargetIdsOnY;
+    nscoord minimumDistanceOnX = nscoord_MAX;
+    size_t minimumYIndex = 0;
+    AutoTArray<ScrollSnapTargetId, 1> minimumDistanceTargetIdsOnY;
+    for (size_t i = 0; i < mTrackerOnY.mBestEdges.Length(); i++) {
+      const auto& targetY = mTrackerOnY.mBestEdges[i];
+      if (targetY.mSnapArea.Intersects(snappedPort)) {
+        visibleTargetIdsOnY.AppendElement(targetY.mTargetId);
+      }
+
+      if (targetY.mDistanceOnOtherAxis < minimumDistanceOnX) {
+        minimumDistanceOnX = targetY.mDistanceOnOtherAxis;
+        minimumYIndex = i;
+        minimumDistanceTargetIdsOnY =
+            AutoTArray<ScrollSnapTargetId, 1>{targetY.mTargetId};
+      } else if (minimumDistanceOnX != nscoord_MAX &&
+                 targetY.mDistanceOnOtherAxis == minimumDistanceOnX) {
+        minimumDistanceTargetIdsOnY.AppendElement(targetY.mTargetId);
+      }
+    }
+
+    if (!visibleTargetIdsOnX.IsEmpty() && !visibleTargetIdsOnY.IsEmpty()) {
+      return SnapDestination{
+          bestCandidate,
+          ScrollSnapTargetIds{visibleTargetIdsOnX, visibleTargetIdsOnY}};
+    }
+
+
+    if ((minimumDistanceOnX == nscoord_MAX) &&
+        minimumDistanceOnY != nscoord_MAX) {
+      bestCandidate.y = *mTrackerOnX.mBestEdges[minimumXIndex].mSnapPoint.mY;
+      return SnapDestination{bestCandidate,
+                             ScrollSnapTargetIds{minimumDistanceTargetIdsOnX,
+                                                 minimumDistanceTargetIdsOnX}};
+    }
+
+    if (minimumDistanceOnX != nscoord_MAX &&
+        minimumDistanceOnY == nscoord_MAX) {
+      bestCandidate.x = *mTrackerOnY.mBestEdges[minimumYIndex].mSnapPoint.mX;
+      return SnapDestination{bestCandidate,
+                             ScrollSnapTargetIds{minimumDistanceTargetIdsOnY,
+                                                 minimumDistanceTargetIdsOnY}};
+    }
+
+    if (minimumDistanceOnX != nscoord_MAX &&
+        minimumDistanceOnY != nscoord_MAX) {
+      if (hypotf(NSCoordToFloat(mDestination.x -
+                                mTrackerOnX.mBestEdges[0].mPosition),
+                 NSCoordToFloat(minimumDistanceOnY)) <
+          hypotf(NSCoordToFloat(minimumDistanceOnX),
+                 NSCoordToFloat(mDestination.y -
+                                mTrackerOnY.mBestEdges[0].mPosition))) {
+        bestCandidate.y = *mTrackerOnX.mBestEdges[minimumXIndex].mSnapPoint.mY;
+      } else {
+        bestCandidate.x = *mTrackerOnY.mBestEdges[minimumYIndex].mSnapPoint.mX;
+      }
+      return SnapDestination{bestCandidate,
+                             ScrollSnapTargetIds{minimumDistanceTargetIdsOnX,
+                                                 minimumDistanceTargetIdsOnY}};
+    }
+    MOZ_ASSERT_UNREACHABLE("There's at least one candidate on either axis");
+  }
+
+  nsPoint defaultPoint = GetDefaultSnapPoint();
+  return SnapDestination{
+      nsPoint(mTrackerOnX.EdgeFound()
+                  ? mTrackerOnX.mBestEdges[0].mPosition
+                  : defaultPoint.x,
+              mTrackerOnY.EdgeFound()
+                  ? mTrackerOnY.mBestEdges[0].mPosition
+                  : defaultPoint.y),
+      ScrollSnapTargetIds{mTrackerOnX.mTargetIds, mTrackerOnY.mTargetIds}};
+}
+
+void CalcSnapPoints::AddHorizontalEdge(const SnapTarget& aTarget) {
+  MOZ_ASSERT(aTarget.mSnapPoint.mY);
+  AddEdge(SnapPosition{aTarget, *aTarget.mSnapPoint.mY,
+                       aTarget.mSnapPoint.mX
+                           ? std::abs(mDestination.x - *aTarget.mSnapPoint.mX)
+                           : nscoord_MAX},
+          mDestination.y, mStartPos.y, mScrollingDirection.y, &mTrackerOnY);
+}
+
+void CalcSnapPoints::AddVerticalEdge(const SnapTarget& aTarget) {
+  MOZ_ASSERT(aTarget.mSnapPoint.mX);
+  AddEdge(SnapPosition{aTarget, *aTarget.mSnapPoint.mX,
+                       aTarget.mSnapPoint.mY
+                           ? std::abs(mDestination.y - *aTarget.mSnapPoint.mY)
+                           : nscoord_MAX},
+          mDestination.x, mStartPos.x, mScrollingDirection.x, &mTrackerOnX);
+}
+
+void CalcSnapPoints::AddEdge(const SnapPosition& aEdge, nscoord aDestination,
+                             nscoord aStartPos, nscoord aScrollingDirection,
+                             CandidateTracker* aCandidateTracker) {
+  if (mSnapFlags & ScrollSnapFlags::IntendedDirection) {
+    if (aScrollingDirection == 0 ||
+        (aEdge.mPosition - aStartPos) * aScrollingDirection <= 0) {
+      return;
+    }
+  }
+
+  if (!aCandidateTracker->EdgeFound()) {
+    aCandidateTracker->mBestEdges = AutoTArray<SnapPosition, 1>{aEdge};
+    aCandidateTracker->mTargetIds =
+        AutoTArray<ScrollSnapTargetId, 1>{aEdge.mTargetId};
+    return;
+  }
+
+  auto isPreferredStopAlways = [&](const SnapPosition& aSnapPosition) -> bool {
+    MOZ_ASSERT(mSnapFlags & ScrollSnapFlags::IntendedDirection);
+    return aSnapPosition.mScrollSnapStop == StyleScrollSnapStop::Always &&
+           std::abs(aSnapPosition.mPosition - aStartPos) <
+               std::abs(aDestination - aStartPos);
+  };
+
+  const bool isOnOppositeSide =
+      ((aEdge.mPosition - aDestination) > 0) !=
+      ((aCandidateTracker->mBestEdges[0].mPosition - aDestination) > 0);
+  const nscoord distanceFromStart = aEdge.mPosition - aStartPos;
+  const nscoord distanceFromDestination = aEdge.mPosition - aDestination;
+  auto updateBestEdges = [&](bool aIsCloserThanBest, bool aIsCloserThanSecond) {
+    if (aIsCloserThanBest) {
+      if (mSnapFlags & ScrollSnapFlags::IntendedDirection &&
+          isPreferredStopAlways(aEdge)) {
+        aCandidateTracker->mSecondBestEdge = aEdge.mPosition;
+      } else if (isOnOppositeSide) {
+        aCandidateTracker->mSecondBestEdge =
+            aCandidateTracker->mBestEdges[0].mPosition;
+      }
+      aCandidateTracker->mBestEdges = AutoTArray<SnapPosition, 1>{aEdge};
+      aCandidateTracker->mTargetIds =
+          AutoTArray<ScrollSnapTargetId, 1>{aEdge.mTargetId};
+    } else {
+      if (aEdge.mPosition == aCandidateTracker->mBestEdges[0].mPosition) {
+        aCandidateTracker->mTargetIds.AppendElement(aEdge.mTargetId);
+        aCandidateTracker->mBestEdges.AppendElement(aEdge);
+      }
+      if (aIsCloserThanSecond && isOnOppositeSide) {
+        aCandidateTracker->mSecondBestEdge = aEdge.mPosition;
+      }
+    }
+  };
+
+  bool isCandidateOfBest = false;
+  bool isCandidateOfSecondBest = false;
+  switch (mUnit) {
+    case ScrollUnit::DEVICE_PIXELS:
+    case ScrollUnit::LINES:
+    case ScrollUnit::WHOLE: {
+      isCandidateOfBest =
+          std::abs(distanceFromDestination) <
+          std::abs(aCandidateTracker->mBestEdges[0].mPosition - aDestination);
+      isCandidateOfSecondBest =
+          std::abs(distanceFromDestination) <
+          std::abs(NSCoordSaturatingSubtract(aCandidateTracker->mSecondBestEdge,
+                                             aDestination, nscoord_MAX));
+      break;
+    }
+    case ScrollUnit::PAGES: {
+      nscoord overshoot = distanceFromDestination * aScrollingDirection;
+      nscoord curOvershoot =
+          (aCandidateTracker->mBestEdges[0].mPosition - aDestination) *
+          aScrollingDirection;
+
+      nscoord secondOvershoot =
+          NSCoordSaturatingSubtract(aCandidateTracker->mSecondBestEdge,
+                                    aDestination, nscoord_MAX) *
+          aScrollingDirection;
+
+      if (overshoot < 0) {
+        isCandidateOfBest = overshoot > curOvershoot || curOvershoot >= 0;
+        isCandidateOfSecondBest =
+            overshoot > secondOvershoot || secondOvershoot >= 0;
+      }
+      if (overshoot > 0) {
+        isCandidateOfBest = overshoot < curOvershoot;
+        isCandidateOfSecondBest = overshoot < secondOvershoot;
+      }
+    }
+  }
+
+  if (mSnapFlags & ScrollSnapFlags::IntendedDirection) {
+    if (isPreferredStopAlways(aEdge)) {
+      isCandidateOfBest =
+          std::abs(distanceFromStart) <
+          std::abs(aCandidateTracker->mBestEdges[0].mPosition - aStartPos);
+    } else if (isPreferredStopAlways(aCandidateTracker->mBestEdges[0])) {
+      isCandidateOfBest = false;
+    }
+  }
+
+  updateBestEdges(isCandidateOfBest, isCandidateOfSecondBest);
+}
+
+using SnapTarget = ScrollSnapInfo::SnapTarget;
+
+static void ProcessSnapPositions(CalcSnapPoints& aCalcSnapPoints,
+                                 const ScrollSnapInfo& aSnapInfo) {
+  aSnapInfo.ForEachValidTargetFor(
+      aCalcSnapPoints.Destination(), [&](const SnapTarget& aTarget) -> bool {
+        if (aTarget.mSnapPoint.mX && aSnapInfo.mScrollSnapStrictnessX !=
+                                         StyleScrollSnapStrictness::None) {
+          aCalcSnapPoints.AddVerticalEdge(aTarget);
+        }
+        if (aTarget.mSnapPoint.mY && aSnapInfo.mScrollSnapStrictnessY !=
+                                         StyleScrollSnapStrictness::None) {
+          aCalcSnapPoints.AddHorizontalEdge(aTarget);
+        }
+        return true;
+      });
+}
+
+static void ProcessSnapOverflowForAxis(
+    CalcSnapPoints& aCalcSnapPoints, layers::ScrollDirection aScrollDirection,
+    nscoord aClampedDestination, nscoord aSnapportSize,
+    const nsTArray<ScrollSnapInfo::ScrollSnapRange>& aRanges) {
+  auto addEdge = [&](nscoord aSnapPoint, const nsRect& aSnapArea) {
+    if (aScrollDirection == layers::ScrollDirection::eHorizontal) {
+      aCalcSnapPoints.AddVerticalEdge(ScrollSnapInfo::SnapTarget{
+          Some(aSnapPoint), Nothing(), aSnapArea, StyleScrollSnapStop::Normal,
+          ScrollSnapTargetId::None});
+    } else {
+      aCalcSnapPoints.AddHorizontalEdge(ScrollSnapInfo::SnapTarget{
+          Nothing(), Some(aSnapPoint), aSnapArea, StyleScrollSnapStop::Normal,
+          ScrollSnapTargetId::None});
+    }
+  };
+
+  for (const auto& range : aRanges) {
+    if (range.IsValid(aClampedDestination, aSnapportSize)) {
+      addEdge(range.FindNearestSnapPoint(aClampedDestination, aSnapportSize),
+              range.mSnapArea);
+      break;
+    }
+  }
+}
+
+static void ProcessSnapOverflow(CalcSnapPoints& aCalcSnapPoints,
+                                const ScrollSnapInfo& aSnapInfo,
+                                const nsRect& aScrollRange,
+                                const nsPoint& aDestination) {
+  nsPoint clampedDestination = aScrollRange.ClampPoint(aDestination);
+  if (aCalcSnapPoints.XDistanceBetweenBestAndSecondEdge() >
+      aSnapInfo.mSnapportSize.width) {
+    ProcessSnapOverflowForAxis(
+        aCalcSnapPoints, layers::ScrollDirection::eHorizontal,
+        clampedDestination.x, aSnapInfo.mSnapportSize.width,
+        aSnapInfo.mXRangeWiderThanSnapport);
+  }
+  if (aCalcSnapPoints.YDistanceBetweenBestAndSecondEdge() >
+      aSnapInfo.mSnapportSize.height) {
+    ProcessSnapOverflowForAxis(
+        aCalcSnapPoints, layers::ScrollDirection::eVertical,
+        clampedDestination.y, aSnapInfo.mSnapportSize.height,
+        aSnapInfo.mYRangeWiderThanSnapport);
+  }
+}
+
+Maybe<SnapDestination> ScrollSnapUtils::GetSnapPointForDestination(
+    const ScrollSnapInfo& aSnapInfo, ScrollUnit aUnit,
+    ScrollSnapFlags aSnapFlags, const nsRect& aScrollRange,
+    const nsPoint& aStartPos, const nsPoint& aDestination) {
+  if (aSnapInfo.mScrollSnapStrictnessY == StyleScrollSnapStrictness::None &&
+      aSnapInfo.mScrollSnapStrictnessX == StyleScrollSnapStrictness::None) {
+    return Nothing();
+  }
+
+  if (!aSnapInfo.HasSnapPositions()) {
+    return Nothing();
+  }
+
+  CalcSnapPoints calcSnapPoints(aUnit, aSnapFlags, aDestination, aStartPos,
+                                aSnapInfo.mScrollSnapStrictnessX,
+                                aSnapInfo.mScrollSnapStrictnessY);
+
+  ProcessSnapPositions(calcSnapPoints, aSnapInfo);
+  ProcessSnapOverflow(calcSnapPoints, aSnapInfo, aScrollRange, aDestination);
+
+  bool snapped = false;
+  auto finalPos = calcSnapPoints.GetBestEdge(aSnapInfo.mSnapportSize);
+
+  auto checkSnapOnAxis = [&snapped](StyleScrollSnapStrictness aStrictness,
+                                    nscoord aDestination, nscoord aSnapportSize,
+                                    nscoord& aFinalPosition) {
+    constexpr float proximityRatio = 0.3;
+    if (aStrictness == StyleScrollSnapStrictness::None ||
+        (aStrictness == StyleScrollSnapStrictness::Proximity &&
+         std::abs(aDestination - aFinalPosition) >
+             aSnapportSize * proximityRatio)) {
+      aFinalPosition = aDestination;
+      return;
+    }
+    snapped = true;
+  };
+
+  checkSnapOnAxis(aSnapInfo.mScrollSnapStrictnessY, aDestination.y,
+                  aSnapInfo.mSnapportSize.height, finalPos.mPosition.y);
+  checkSnapOnAxis(aSnapInfo.mScrollSnapStrictnessX, aDestination.x,
+                  aSnapInfo.mSnapportSize.width, finalPos.mPosition.x);
+
+  return snapped ? Some(finalPos) : Nothing();
+}
+
+ScrollSnapTargetId ScrollSnapUtils::GetTargetIdFor(const nsIFrame* aFrame) {
+  MOZ_ASSERT(aFrame && aFrame->GetContent());
+  return ScrollSnapTargetId{reinterpret_cast<uintptr_t>(aFrame->GetContent())};
+}
+
+static const nsIContent* ResolveSnapTargetToContent(
+    const ScrollSnapTargetId& aId) {
+  if (aId == ScrollSnapTargetId::None) {
+    return nullptr;
+  }
+  return reinterpret_cast<const nsIContent*>(aId);
+}
+
+static bool SnapTargetIsFlattenedTreeDescendantOf(
+    const ScrollSnapTargetId& aPossibleDescendant,
+    const ScrollSnapTargetId& aPossibleAncestor) {
+  MOZ_ASSERT(aPossibleAncestor != ScrollSnapTargetId::None &&
+             aPossibleDescendant != ScrollSnapTargetId::None);
+  return nsContentUtils::ContentIsFlattenedTreeDescendantOf(
+      ResolveSnapTargetToContent(aPossibleDescendant),
+      ResolveSnapTargetToContent(aPossibleAncestor));
+}
+
+static std::pair<Maybe<nscoord>, Maybe<nscoord>> GetCandidateInLastTargets(
+    const ScrollSnapInfo& aSnapInfo, const nsPoint& aCurrentPosition,
+    const UniquePtr<ScrollSnapTargetIds>& aLastSnapTargetIds,
+    const nsIContent* aFocusedContent, const nsIContent* aTargetContent,
+    const WritingMode aWM) {
+  auto GetTargetId = [](const nsIContent* aContent) -> ScrollSnapTargetId {
+    if (aContent && aContent->GetPrimaryFrame()) {
+      return ScrollSnapUtils::GetTargetIdFor(aContent->GetPrimaryFrame());
+    }
+    return ScrollSnapTargetId::None;
+  };
+
+  ScrollSnapTargetId targetIdForFocusedContent = GetTargetId(aFocusedContent);
+  ScrollSnapTargetId targetIdForTargetContent = GetTargetId(aTargetContent);
+  const bool isVertical = aWM.IsVertical();
+
+
+  AutoTArray<const ScrollSnapInfo::SnapTarget*, 2> inlineSet, blockSet;
+  const ScrollSnapInfo::SnapTarget* focusedTarget = nullptr;
+  const ScrollSnapInfo::SnapTarget* targetedTarget = nullptr;
+
+  aSnapInfo.ForEachValidTargetFor(
+      aCurrentPosition, [&](const SnapTarget& aTarget) -> bool {
+        if (aTarget.mSnapPoint.I(aWM) &&
+            aSnapInfo.StrictnessInline(aWM) !=
+                StyleScrollSnapStrictness::None &&
+            aLastSnapTargetIds->IdsOnInline(aWM).Contains(aTarget.mTargetId)) {
+          inlineSet.AppendElement(&aTarget);
+        }
+        if (aTarget.mSnapPoint.B(aWM) &&
+            aSnapInfo.StrictnessBlock(aWM) != StyleScrollSnapStrictness::None &&
+            aLastSnapTargetIds->IdsOnBlock(aWM).Contains(aTarget.mTargetId)) {
+          blockSet.AppendElement(&aTarget);
+        }
+        if (aLastSnapTargetIds->Contains(aTarget.mTargetId)) {
+          if (aTarget.mTargetId == targetIdForFocusedContent ||
+              (targetIdForFocusedContent != ScrollSnapTargetId::None &&
+               SnapTargetIsFlattenedTreeDescendantOf(targetIdForFocusedContent,
+                                                     aTarget.mTargetId))) {
+            focusedTarget = &aTarget;
+          }
+          if (aTarget.mTargetId == targetIdForTargetContent) {
+            targetedTarget = &aTarget;
+          }
+        }
+        return true;
+      });
+
+  if (MOZ_LOG_TEST(sApzScrollSnapLog, LogLevel::Debug)) {
+    SCROLL_SNAP_LOG("All snap targets: %s",
+                    ToString(aSnapInfo.mSnapTargets).c_str());
+    SCROLL_SNAP_LOG("Inline snap targets: %s", ToString(inlineSet).c_str());
+    SCROLL_SNAP_LOG("Block snap targets: %s", ToString(blockSet).c_str());
+  }
+
+  if (focusedTarget) {
+    if (focusedTarget->mSnapPoint.I(aWM) &&
+        aSnapInfo.StrictnessInline(aWM) != StyleScrollSnapStrictness::None) {
+      inlineSet = {focusedTarget};
+    }
+    if (focusedTarget->mSnapPoint.B(aWM) &&
+        aSnapInfo.StrictnessBlock(aWM) != StyleScrollSnapStrictness::None) {
+      blockSet = {focusedTarget};
+    }
+  }
+
+  if (!focusedTarget && targetedTarget) {
+    if (targetedTarget->mSnapPoint.I(aWM) &&
+        aSnapInfo.StrictnessInline(aWM) != StyleScrollSnapStrictness::None) {
+      inlineSet = {targetedTarget};
+    }
+    if (targetedTarget->mSnapPoint.B(aWM) &&
+        aSnapInfo.StrictnessBlock(aWM) != StyleScrollSnapStrictness::None) {
+      blockSet = {targetedTarget};
+    }
+  }
+
+  auto removeAncestors =
+      [](AutoTArray<const ScrollSnapInfo::SnapTarget*, 2>& aSet) {
+        if (aSet.Length() <= 1) {
+          return;
+        }
+        AutoTArray<const ScrollSnapInfo::SnapTarget*, 2> result;
+        for (const auto* candidate : aSet) {
+          bool isAncestorOfAnotherInSet = false;
+          for (const auto* other : aSet) {
+            if (other == candidate) {
+              continue;
+            }
+            if (SnapTargetIsFlattenedTreeDescendantOf(other->mTargetId,
+                                                      candidate->mTargetId)) {
+              isAncestorOfAnotherInSet = true;
+              break;
+            }
+          }
+          if (!isAncestorOfAnotherInSet) {
+            result.AppendElement(candidate);
+          }
+        }
+        aSet = std::move(result);
+      };
+  removeAncestors(inlineSet);
+  removeAncestors(blockSet);
+
+  AutoTArray<const ScrollSnapInfo::SnapTarget*, 2> intersection;
+  for (const auto* inlineTarget : inlineSet) {
+    for (const auto* blockTarget : blockSet) {
+      if (inlineTarget->mTargetId == blockTarget->mTargetId) {
+        intersection.AppendElement(inlineTarget);
+        break;
+      }
+    }
+  }
+  const auto& effective = !intersection.IsEmpty() ? intersection
+                          : !blockSet.IsEmpty()   ? blockSet
+                                                  : inlineSet;
+
+  Maybe<nscoord> x, y;
+
+  const ScrollSnapInfo::SnapTarget* inlinePick{nullptr};
+  const ScrollSnapInfo::SnapTarget* blockPick{nullptr};
+  auto pickFromInline = [&]() {
+    Maybe<nscoord>& inlineCoord = isVertical ? y : x;
+    const Maybe<nscoord>& blockCoord = isVertical ? x : y;
+    for (const auto* target : effective) {
+      const auto& sp = target->mSnapPoint.I(aWM);
+      if (!sp) {
+        continue;
+      }
+      if (!blockCoord || target->mSnapArea.Intersects(
+                             nsRect(isVertical ? nsPoint(*blockCoord, *sp)
+                                               : nsPoint(*sp, *blockCoord),
+                                    aSnapInfo.mSnapportSize))) {
+        inlineCoord = sp;
+        inlinePick = target;
+        return;
+      }
+    }
+  };
+
+  auto pickFromBlock = [&]() {
+    Maybe<nscoord>& blockCoord = isVertical ? x : y;
+    const Maybe<nscoord>& inlineCoord = isVertical ? y : x;
+    for (const auto* target : effective) {
+      const auto& sp = target->mSnapPoint.B(aWM);
+      if (!sp) {
+        continue;
+      }
+      if (!inlineCoord || target->mSnapArea.Intersects(
+                              nsRect(isVertical ? nsPoint(*sp, *inlineCoord)
+                                                : nsPoint(*inlineCoord, *sp),
+                                     aSnapInfo.mSnapportSize))) {
+        blockCoord = sp;
+        blockPick = target;
+        return;
+      }
+    }
+  };
+
+  if (aSnapInfo.StrictnessInline(aWM) != StyleScrollSnapStrictness::None) {
+    pickFromInline();
+    if (inlinePick && MOZ_LOG_TEST(sApzScrollSnapLog, LogLevel::Debug)) {
+      SCROLL_SNAP_LOG("Inline snap target pick: %s",
+                      ToString(*inlinePick).c_str());
+    }
+  }
+  if (aSnapInfo.StrictnessBlock(aWM) != StyleScrollSnapStrictness::None) {
+    pickFromBlock();
+    if (blockPick && MOZ_LOG_TEST(sApzScrollSnapLog, LogLevel::Debug)) {
+      SCROLL_SNAP_LOG("Block snap target pick: %s",
+                      ToString(*blockPick).c_str());
+    }
+  }
+
+  return {x, y};
+}
+
+Maybe<SnapDestination> ScrollSnapUtils::GetSnapPointForResnap(
+    const ScrollSnapInfo& aSnapInfo, const nsRect& aScrollRange,
+    const nsPoint& aCurrentPosition,
+    const UniquePtr<ScrollSnapTargetIds>& aLastSnapTargetIds,
+    const nsIContent* aFocusedContent, const nsIContent* aTargetContent,
+    const WritingMode aWritingMode) {
+  if (!aLastSnapTargetIds) {
+    return GetSnapPointForDestination(aSnapInfo, ScrollUnit::DEVICE_PIXELS,
+                                      ScrollSnapFlags::IntendedEndPosition,
+                                      aScrollRange, aCurrentPosition,
+                                      aCurrentPosition);
+  }
+
+  auto [x, y] =
+      GetCandidateInLastTargets(aSnapInfo, aCurrentPosition, aLastSnapTargetIds,
+                                aFocusedContent, aTargetContent, aWritingMode);
+  if (!x && !y) {
+    return GetSnapPointForDestination(aSnapInfo, ScrollUnit::DEVICE_PIXELS,
+                                      ScrollSnapFlags::IntendedEndPosition,
+                                      aScrollRange, aCurrentPosition,
+                                      aCurrentPosition);
+  }
+
+  if (!x || !y) {
+    nsPoint newPosition =
+        nsPoint(x ? *x : aCurrentPosition.x, y ? *y : aCurrentPosition.y);
+    CalcSnapPoints calcSnapPoints(
+        ScrollUnit::DEVICE_PIXELS, ScrollSnapFlags::IntendedEndPosition,
+        newPosition, newPosition, aSnapInfo.mScrollSnapStrictnessX,
+        aSnapInfo.mScrollSnapStrictnessY);
+    aSnapInfo.ForEachValidTargetFor(
+        newPosition, [&, &x = x, &y = y](const SnapTarget& aTarget) -> bool {
+          if (!x && aTarget.mSnapPoint.mX &&
+              aSnapInfo.mScrollSnapStrictnessX !=
+                  StyleScrollSnapStrictness::None) {
+            calcSnapPoints.AddVerticalEdge(aTarget);
+          }
+          if (!y && aTarget.mSnapPoint.mY &&
+              aSnapInfo.mScrollSnapStrictnessY !=
+                  StyleScrollSnapStrictness::None) {
+            calcSnapPoints.AddHorizontalEdge(aTarget);
+          }
+          return true;
+        });
+
+    auto finalPos = calcSnapPoints.GetBestEdge(aSnapInfo.mSnapportSize);
+    if (!x) {
+      x = Some(finalPos.mPosition.x);
+    }
+    if (!y) {
+      y = Some(finalPos.mPosition.y);
+    }
+  }
+
+  SnapDestination snapTarget{nsPoint(*x, *y)};
+  aSnapInfo.ForEachValidTargetFor(
+      snapTarget.mPosition,
+      [&, &x = x, &y = y](const SnapTarget& aTarget) -> bool {
+        if (aTarget.mSnapPoint.mX &&
+            aSnapInfo.mScrollSnapStrictnessX !=
+                StyleScrollSnapStrictness::None &&
+            aTarget.mSnapPoint.mX == x &&
+            aTarget.mSnapArea.Intersects(
+                nsRect(nsPoint(*x, *y), aSnapInfo.mSnapportSize))) {
+          snapTarget.mTargetIds.mIdsOnX.AppendElement(aTarget.mTargetId);
+        }
+
+        if (aTarget.mSnapPoint.mY &&
+            aSnapInfo.mScrollSnapStrictnessY !=
+                StyleScrollSnapStrictness::None &&
+            aTarget.mSnapPoint.mY == y &&
+            aTarget.mSnapArea.Intersects(
+                nsRect(nsPoint(*x, *y), aSnapInfo.mSnapportSize))) {
+          snapTarget.mTargetIds.mIdsOnY.AppendElement(aTarget.mTargetId);
+        }
+        return true;
+      });
+  return Some(snapTarget);
+}
+
+void ScrollSnapUtils::PostPendingResnapIfNeededFor(nsIFrame* aFrame) {
+  MOZ_ASSERT(aFrame);
+
+  ScrollSnapTargetId id = GetTargetIdFor(aFrame);
+  if (id == ScrollSnapTargetId::None) {
+    return;
+  }
+
+  ScrollContainerFrame* sf = nsLayoutUtils::GetNearestScrollContainerFrame(
+      aFrame, nsLayoutUtils::SCROLLABLE_SAME_DOC |
+                  nsLayoutUtils::SCROLLABLE_INCLUDE_HIDDEN);
+  if (!sf) {
+    return;
+  }
+
+  sf->PostPendingResnapIfNeeded(aFrame);
+
+  nsIContent* focusedContent =
+      aFrame->PresContext()->Document()->GetUnretargetedFocusedContent(
+          dom::Document::IncludeChromeOnly::No);
+  if (!focusedContent || !nsContentUtils::ContentIsFlattenedTreeDescendantOf(
+                             focusedContent, aFrame->GetContent())) {
+    return;
+  }
+
+  AutoTArray<nsIFrame*, 2> targets = {sf};
+  for (nsIFrame* f = sf->GetParent(); f; f = f->GetParent()) {
+    if (ScrollContainerFrame* ancestorSf = do_QueryFrame(f)) {
+      for (nsIFrame* target : targets) {
+        ancestorSf->PostPendingResnapIfNeeded(target);
+      }
+      targets.ClearAndRetainStorage();
+    }
+    targets.AppendElement(f);
+  }
+}
+
+void ScrollSnapUtils::PostPendingResnapFor(nsIFrame* aFrame) {
+  if (ScrollContainerFrame* sf = nsLayoutUtils::GetNearestScrollContainerFrame(
+          aFrame, nsLayoutUtils::SCROLLABLE_SAME_DOC |
+                      nsLayoutUtils::SCROLLABLE_INCLUDE_HIDDEN)) {
+    sf->PostPendingResnap();
+  }
+}
+
+bool ScrollSnapUtils::NeedsToRespectTargetWritingMode(
+    const nsSize& aSnapAreaSize, const nsSize& aSnapportSize) {
+  return aSnapAreaSize.width > aSnapportSize.width ||
+         aSnapAreaSize.height > aSnapportSize.height;
+}
+
+static nsRect InflateByScrollMargin(const nsRect& aTargetRect,
+                                    const nsMargin& aScrollMargin,
+                                    const nsRect& aScrolledRect) {
+  nsRect result = aTargetRect;
+  result.Inflate(aScrollMargin);
+
+  return result.Intersect(aScrolledRect);
+}
+
+nsRect ScrollSnapUtils::GetSnapAreaFor(const nsIFrame* aFrame,
+                                       const nsIFrame* aScrolledFrame,
+                                       const nsRect& aScrolledRect) {
+  nsRect targetRect = nsLayoutUtils::TransformFrameRectToAncestor(
+      aFrame, aFrame->GetRectRelativeToSelf(), aScrolledFrame);
+
+  nsMargin scrollMargin = aFrame->StyleMargin()->GetScrollMargin();
+  return InflateByScrollMargin(targetRect, scrollMargin, aScrolledRect);
+}
+
+}  

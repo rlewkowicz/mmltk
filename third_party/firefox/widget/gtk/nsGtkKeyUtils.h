@@ -1,0 +1,241 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef _nsGdkKeyUtils_h_
+#define _nsGdkKeyUtils_h_
+
+#include "mozilla/EventForwards.h"
+#include "nsIWidget.h"
+#include "nsTArray.h"
+
+#include <gdk/gdk.h>
+#ifdef MOZ_WAYLAND
+#  include <gdk/gdkwayland.h>
+#  include <xkbcommon/xkbcommon.h>
+#  ifndef XKB_VMOD_NAME_ALT
+#    define XKB_VMOD_NAME_ALT "Alt"
+#  endif
+#  ifndef XKB_VMOD_NAME_HYPER
+#    define XKB_VMOD_NAME_HYPER "Hyper"
+#  endif
+#  ifndef XKB_VMOD_NAME_LEVEL3
+#    define XKB_VMOD_NAME_LEVEL3 "LevelThree"
+#  endif
+#  ifndef XKB_VMOD_NAME_LEVEL5
+#    define XKB_VMOD_NAME_LEVEL5 "LevelFive"
+#  endif
+#  ifndef XKB_VMOD_NAME_META
+#    define XKB_VMOD_NAME_META "Meta"
+#  endif
+#  ifndef XKB_VMOD_NAME_NUM
+#    define XKB_VMOD_NAME_NUM "NumLock"
+#  endif
+#  ifndef XKB_VMOD_NAME_SCROLL
+#    define XKB_VMOD_NAME_SCROLL "ScrollLock"
+#  endif
+#  ifndef XKB_VMOD_NAME_SUPER
+#    define XKB_VMOD_NAME_SUPER "Super"
+#  endif
+#endif
+
+class nsWindow;
+
+namespace mozilla {
+namespace widget {
+
+
+class KeymapWrapper {
+ public:
+  static uint32_t ComputeDOMKeyCode(const GdkEventKey* aGdkKeyEvent);
+
+  static KeyNameIndex ComputeDOMKeyNameIndex(const GdkEventKey* aGdkKeyEvent);
+
+  static CodeNameIndex ComputeDOMCodeNameIndex(const GdkEventKey* aGdkKeyEvent);
+
+  static guint ConvertGeckoKeyCodeToGDKKeyval(const nsAString& aKeyCode);
+
+  enum MappedModifier {
+    NOT_MODIFIER = 0x0000,
+    CAPS_LOCK = 0x0001,
+    NUM_LOCK = 0x0002,
+    SCROLL_LOCK = 0x0004,
+    SHIFT = 0x0008,
+    CTRL = 0x0010,
+    ALT = 0x0020,
+    META = 0x0040,
+    SUPER = 0x0080,
+    HYPER = 0x0100,
+    LEVEL3 = 0x0200,
+    LEVEL5 = 0x0400
+  };
+
+  typedef uint32_t MappedModifiers;
+
+  static guint GetCurrentModifierState();
+
+  static uint32_t ComputeCurrentKeyModifiers();
+
+  static uint32_t ComputeKeyModifiers(guint aGdkModifierState);
+
+  static guint ConvertWidgetModifierToGdkState(
+      nsIWidget::NativeModifiers aNativeModifiers);
+
+  static void InitInputEvent(WidgetInputEvent& aInputEvent,
+                             guint aGdkModifierState, bool isEraser = false);
+
+  static void InitKeyEvent(WidgetKeyboardEvent& aKeyEvent,
+                           GdkEventKey* aGdkKeyEvent, bool aIsProcessedByIME);
+
+  static void InitKeyEventFromCommitString(WidgetKeyboardEvent& aKeyEvent,
+                                           const nsAString& aCommitString);
+
+  static bool DispatchKeyDownOrKeyUpEvent(nsWindow* aWindow,
+                                          GdkEventKey* aGdkKeyEvent,
+                                          bool aIsProcessedByIME,
+                                          bool* aIsCancelled);
+
+  static bool DispatchKeyDownOrKeyUpEvent(nsWindow* aWindow,
+                                          WidgetKeyboardEvent& aKeyboardEvent,
+                                          bool* aIsCancelled);
+
+  static void HandleKeyPressEvent(nsWindow* aWindow, GdkEventKey* aGdkKeyEvent);
+
+  static bool HandleKeyReleaseEvent(nsWindow* aWindow,
+                                    GdkEventKey* aGdkKeyEvent);
+
+  static void WillDispatchKeyboardEvent(WidgetKeyboardEvent& aKeyEvent,
+                                        GdkEventKey* aGdkKeyEvent);
+
+#ifdef MOZ_WAYLAND
+  static void SetModifierMasks(xkb_keymap* aKeymap);
+  static void HandleKeymap(uint32_t format, int fd, uint32_t size);
+
+  static void ResetRepeatState();
+  static void KeyboardHandlerForWayland(uint32_t aSerial,
+                                        uint32_t aHardwareKeycode,
+                                        uint32_t aState);
+  static void ClearKeymap();
+
+  static void EnsureInstance();
+#endif
+
+  static void ResetKeyboard();
+
+  static void Shutdown();
+
+ private:
+  static KeymapWrapper* GetInstance();
+
+  KeymapWrapper();
+  ~KeymapWrapper();
+
+  bool mInitialized;
+
+  void Init();
+#ifdef MOZ_WAYLAND
+  void InitBySystemSettingsWayland();
+#endif
+
+  struct ModifierKey {
+    guint mHardwareKeycode;
+    guint mMask;
+
+    explicit ModifierKey(guint aHardwareKeycode)
+        : mHardwareKeycode(aHardwareKeycode), mMask(0) {}
+  };
+  nsTArray<ModifierKey> mModifierKeys;
+
+  ModifierKey* GetModifierKey(guint aHardwareKeycode);
+
+  enum ModifierIndex {
+    INDEX_NUM_LOCK,
+    INDEX_SCROLL_LOCK,
+    INDEX_ALT,
+    INDEX_META,
+    INDEX_HYPER,
+    INDEX_LEVEL3,
+    INDEX_LEVEL5,
+    COUNT_OF_MODIFIER_INDEX
+  };
+  guint mModifierMasks[COUNT_OF_MODIFIER_INDEX] = {};
+
+  guint GetGdkModifierMask(MappedModifier aModifier) const;
+
+  static MappedModifier GetModifierForGDKKeyval(guint aGdkKeyval);
+
+  static const char* GetModifierName(MappedModifier aModifier);
+
+  static bool AreModifiersActive(MappedModifiers aModifiers,
+                                 guint aGdkModifierState);
+
+  GdkKeymap* mGdkKeymap;
+
+
+  static KeymapWrapper* sInstance;
+
+  static guint sLastRepeatableHardwareKeyCode;
+  enum RepeatState { NOT_PRESSED, FIRST_PRESS, REPEATING };
+  static RepeatState sRepeatState;
+
+#ifdef MOZ_WAYLAND
+  xkb_keymap* mXkbKeymap = nullptr;
+  static uint32_t sLastRepeatableSerial;
+#endif
+
+  bool IsAutoRepeatableKey(guint aHardwareKeyCode);
+
+#ifdef MOZ_WAYLAND
+  void SetKeymap(xkb_keymap* aKeymap);
+#endif
+
+  static void OnKeysChanged(GdkKeymap* aGdkKeymap,
+                            KeymapWrapper* aKeymapWrapper);
+  static void OnDirectionChanged(GdkKeymap* aGdkKeymap,
+                                 KeymapWrapper* aKeymapWrapper);
+
+  gulong mOnKeysChangedSignalHandle;
+  gulong mOnDirectionChangedSignalHandle;
+
+  static uint32_t GetCharCodeFor(const GdkEventKey* aGdkKeyEvent);
+  uint32_t GetCharCodeFor(const GdkEventKey* aGdkKeyEvent,
+                          guint aGdkModifierState, gint aGroup);
+
+  uint32_t GetUnmodifiedCharCodeFor(const GdkEventKey* aGdkKeyEvent);
+
+  gint GetKeyLevel(GdkEventKey* aGdkKeyEvent);
+
+  gint GetFirstLatinGroup();
+
+  bool IsLatinGroup(guint8 aGroup);
+
+  static bool IsBasicLatinLetterOrNumeral(uint32_t aCharCode);
+
+  static bool IsPrintableASCIICharacter(uint32_t aCharCode) {
+    return aCharCode >= 0x20 && aCharCode <= 0x7E;
+  }
+
+  static guint GetGDKKeyvalWithoutModifier(const GdkEventKey* aGdkKeyEvent);
+
+  static uint32_t GetDOMKeyCodeFromKeyPairs(guint aGdkKeyval);
+
+
+  static bool MaybeDispatchContextMenuEvent(nsWindow* aWindow,
+                                            const GdkEventKey* aEvent);
+
+  void WillDispatchKeyboardEventInternal(WidgetKeyboardEvent& aKeyEvent,
+                                         GdkEventKey* aGdkKeyEvent);
+
+  static guint GetModifierState(GdkEventKey* aGdkKeyEvent,
+                                KeymapWrapper* aWrapper);
+
+#ifdef MOZ_WAYLAND
+  void SetModifierMask(xkb_keymap* aKeymap, ModifierIndex aModifierIndex,
+                       const char* aModifierName);
+#endif
+};
+
+}  
+}  
+
+#endif /* _nsGdkKeyUtils_h_ */

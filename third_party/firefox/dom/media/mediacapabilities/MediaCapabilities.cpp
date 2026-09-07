@@ -1,0 +1,1388 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "MediaCapabilities.h"
+
+#include <utility>
+
+#include "AllocationPolicy.h"
+#include "DecoderTraits.h"
+#include "MP4Decoder.h"
+#include "MediaCapabilitiesValidation.h"
+#include "MediaInfo.h"
+#include "MediaRecorder.h"
+#include "PDMFactorySupport.h"
+#include "VPXDecoder.h"
+#include "WindowRenderer.h"
+#include "mozilla/CheckedInt.h"
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/EMEUtils.h"
+#include "mozilla/SchedulerGroup.h"
+#include "mozilla/StaticPrefs_media.h"
+#include "mozilla/TaskQueue.h"
+#include "mozilla/dom/DOMMozPromiseRequestHolder.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/MediaCapabilitiesBinding.h"
+#include "mozilla/dom/MediaKeySystemAccess.h"
+#include "mozilla/dom/MediaSource.h"
+#include "mozilla/dom/Navigator.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/WorkerCommon.h"
+#include "mozilla/dom/WorkerPrivate.h"
+#include "mozilla/dom/WorkerRef.h"
+#include "mozilla/layers/KnowsCompositor.h"
+#include "mozilla/media/MediaUtils.h"
+#include "mozilla/media/webrtc/CodecInfo.h"
+#include "mozilla/media/webrtc/H264FmtpParser.h"
+#include "nsContentUtils.h"
+#include "nsIPrincipal.h"
+
+namespace mozilla::dom {
+enum class CodecSupport : uint8_t { Supported, Unsupported, Unknown };
+static const char* EnumValueToString(const CodecSupport& aEnum) {
+  static constexpr const char* kStrings[] = {"Supported", "Unsupported",
+                                             "Unknown"};
+  return kStrings[static_cast<size_t>(aEnum)];
+}
+using CodecSupportPromise =
+    MozPromise<CodecSupport, nsresult,  true>;
+constexpr uint32_t kLowResolutionPixelCount = 640 * 480;
+struct VideoConfiguration;
+struct AudioConfiguration;
+bool MediaCapabilitiesKeySystemConfigurationToMediaKeySystemConfiguration(
+    const MediaDecodingConfiguration& aInConfig,
+    MediaKeySystemConfiguration& aOutConfig);
+
+static mediacaps::BehaviorConfig GetBehaviorConfig(nsIGlobalObject* aParent) {
+  nsAutoCString host;
+  if (nsIPrincipal* p = aParent ? aParent->PrincipalOrNull() : nullptr) {
+    p->GetAsciiHost(host);
+  }
+  auto legacyAllowlist =
+      StaticPrefs::media_mediacapabilities_legacy_allowlist();
+  auto webrtcAllowlist =
+      StaticPrefs::media_mediacapabilities_webrtc_enabled_allowlist();
+  return {
+      .mLegacy = StaticPrefs::media_mediacapabilities_legacy_enabled() ||
+                 media::HostnameInValue(*legacyAllowlist, host),
+      .mWebRTCEnabled = StaticPrefs::media_mediacapabilities_webrtc_enabled() ||
+                        media::HostnameInValue(*webrtcAllowlist, host),
+  };
+}
+}  
+
+template <>
+struct fmt::formatter<mozilla::dom::CodecSupport>
+    : fmt::formatter<std::string_view> {
+  auto format(mozilla::dom::CodecSupport aSupport,
+              fmt::format_context& aCtx) const {
+    return fmt::format_to(aCtx.out(), "{}", EnumValueToString(aSupport));
+  }
+};
+
+template <>
+struct fmt::formatter<mozilla::dom::VideoConfiguration>
+    : fmt::formatter<std::string_view> {
+  auto format(const mozilla::dom::VideoConfiguration& aConfig,
+              fmt::format_context& aCtx) const {
+    return fmt::format_to(
+        aCtx.out(),
+        "[contentType:{} width:{} height:{} bitrate:{} framerate:{} "
+        "hasAlphaChannel:{} hdrMetadataType:{} colorGamut:{} "
+        "transferFunction:{} scalabilityMode:{}]",
+        NS_ConvertUTF16toUTF8(aConfig.mContentType).get(), aConfig.mWidth,
+        aConfig.mHeight, aConfig.mBitrate, aConfig.mFramerate,
+        aConfig.mHasAlphaChannel.WasPassed()
+            ? (aConfig.mHasAlphaChannel.Value() ? "true" : "false")
+            : "?",
+        aConfig.mHdrMetadataType.WasPassed()
+            ? GetEnumString(aConfig.mHdrMetadataType.Value()).get()
+            : "?",
+        aConfig.mColorGamut.WasPassed()
+            ? GetEnumString(aConfig.mColorGamut.Value()).get()
+            : "?",
+        aConfig.mTransferFunction.WasPassed()
+            ? GetEnumString(aConfig.mTransferFunction.Value()).get()
+            : "?",
+        aConfig.mScalabilityMode.WasPassed()
+            ? NS_ConvertUTF16toUTF8(aConfig.mScalabilityMode.Value()).get()
+            : "?");
+  }
+};
+
+template <>
+struct fmt::formatter<mozilla::dom::AudioConfiguration>
+    : fmt::formatter<std::string_view> {
+  auto format(const mozilla::dom::AudioConfiguration& aConfig,
+              fmt::format_context& aCtx) const {
+    return fmt::format_to(
+        aCtx.out(), "[contentType:{} channels:{} bitrate:{} samplerate:{}]",
+        NS_ConvertUTF16toUTF8(aConfig.mContentType).get(),
+        aConfig.mChannels.WasPassed()
+            ? NS_ConvertUTF16toUTF8(aConfig.mChannels.Value()).get()
+            : "?",
+        aConfig.mBitrate.WasPassed() ? aConfig.mBitrate.Value() : 0,
+        aConfig.mSamplerate.WasPassed() ? aConfig.mSamplerate.Value() : 0);
+  }
+};
+
+template <>
+struct fmt::formatter<mozilla::dom::MediaCapabilitiesInfo>
+    : fmt::formatter<std::string_view> {
+  auto format(const mozilla::dom::MediaCapabilitiesInfo& aInfo,
+              fmt::format_context& aCtx) const {
+    return fmt::format_to(
+        aCtx.out(), "[supported:{} smooth:{} powerEfficient:{}]",
+        aInfo.mSupported ? "true" : "false", aInfo.mSmooth ? "true" : "false",
+        aInfo.mPowerEfficient ? "true" : "false");
+  }
+};
+
+template <>
+struct fmt::formatter<mozilla::dom::MediaEncodingConfiguration>
+    : fmt::formatter<std::string_view> {
+  auto format(const mozilla::dom::MediaEncodingConfiguration& aConfig,
+              fmt::format_context& aCtx) const {
+    auto out = aCtx.out();
+    out = fmt::format_to(out, "[video: ");
+    if (aConfig.mVideo.WasPassed()) {
+      out = fmt::format_to(out, "{}", aConfig.mVideo.Value());
+    } else {
+      out = fmt::format_to(out, "None");
+    }
+    out = fmt::format_to(out, ", audio: ");
+    if (aConfig.mAudio.WasPassed()) {
+      out = fmt::format_to(out, "{}", aConfig.mAudio.Value());
+    } else {
+      out = fmt::format_to(out, "None");
+    }
+    out = fmt::format_to(out, "]");
+    return out;
+  }
+};
+
+template <>
+struct fmt::formatter<mozilla::dom::MediaDecodingConfiguration>
+    : fmt::formatter<std::string_view> {
+  auto format(const mozilla::dom::MediaDecodingConfiguration& aConfig,
+              fmt::format_context& aCtx) const {
+    auto out = aCtx.out();
+    out = fmt::format_to(out, "[");
+
+    if (aConfig.mVideo.WasPassed()) {
+      out = fmt::format_to(out, "video:{}", aConfig.mVideo.Value());
+      if (aConfig.mAudio.WasPassed()) {
+        out = fmt::format_to(out, " ");
+      }
+    }
+
+    if (aConfig.mAudio.WasPassed()) {
+      out = fmt::format_to(out, "audio:{}", aConfig.mAudio.Value());
+    }
+
+    if (aConfig.mKeySystemConfiguration.WasPassed()) {
+      out =
+          fmt::format_to(out, "[keySystem:{}, ",
+                         NS_ConvertUTF16toUTF8(
+                             aConfig.mKeySystemConfiguration.Value().mKeySystem)
+                             .get());
+
+      mozilla::dom::MediaKeySystemConfiguration emeConfig;
+      if (mozilla::dom::
+              MediaCapabilitiesKeySystemConfigurationToMediaKeySystemConfiguration(
+                  aConfig, emeConfig)) {
+        nsCString emeStr =
+            mozilla::dom::MediaKeySystemAccess::ToCString(emeConfig);
+        out = std::copy(emeStr.BeginReading(), emeStr.EndReading(), out);
+      }
+      out = fmt::format_to(out, "]");
+    }
+
+    out = fmt::format_to(out, "]");
+    return out;
+  }
+};
+
+template <>
+struct fmt::formatter<mozilla::dom::MediaCapabilitiesDecodingInfo>
+    : fmt::formatter<std::string_view> {
+  auto format(const mozilla::dom::MediaCapabilitiesDecodingInfo& aInfo,
+              fmt::format_context& aCtx) const {
+    return fmt::format_to(
+        aCtx.out(),
+        "[supported:{} smooth:{} powerEfficient:{} keySystemAccess:{}]",
+        aInfo.mSupported ? "true" : "false", aInfo.mSmooth ? "true" : "false",
+        aInfo.mPowerEfficient ? "true" : "false",
+        aInfo.mKeySystemAccess ? "present" : "null");
+  }
+};
+
+mozilla::LazyLogModule sMediaCapabilitiesLog("MediaCapabilities");
+
+#define LOG(fmt, ...)                                          \
+  MOZ_LOG_FMT(sMediaCapabilitiesLog, mozilla::LogLevel::Debug, \
+              "[MediaCapabilities] {}: " fmt, __func__, __VA_ARGS__)
+
+namespace mozilla::dom {
+using mediacaps::IsValidMediaDecodingConfiguration;
+using mediacaps::IsValidMediaEncodingConfiguration;
+
+static gfx::IntSize ClampedIntSize(uint32_t aWidth, uint32_t aHeight) {
+  return gfx::IntSize(
+      static_cast<int32_t>(std::min<uint32_t>(aWidth, INT32_MAX)),
+      static_cast<int32_t>(std::min<uint32_t>(aHeight, INT32_MAX)));
+}
+
+static CodecType WebrtcMimeToCodecType(const MediaExtendedMIMEType& aMime) {
+  const nsCString& mime = aMime.Type().AsString();
+  if (mime.EqualsLiteral("video/h264")) {
+    return CodecType::H264;
+  }
+  if (mime.EqualsLiteral("video/vp8")) {
+    return CodecType::VP8;
+  }
+  if (mime.EqualsLiteral("video/vp9")) {
+    return CodecType::VP9;
+  }
+  if (mime.EqualsLiteral("video/av1")) {
+    return CodecType::AV1;
+  }
+  return CodecType::Unknown;
+}
+
+static EncoderConfig BuildEncoderConfig(const MediaExtendedMIMEType& aMime,
+                                        const VideoConfiguration& aConfig) {
+  const auto codec = WebrtcMimeToCodecType(aMime);
+  MOZ_ASSERT(codec != CodecType::Unknown);
+  const gfx::IntSize size = ClampedIntSize(aConfig.mWidth, aConfig.mHeight);
+  MOZ_ASSERT(size.width > 0 && size.height > 0);
+
+  EncoderConfig::CodecSpecific specific(void_t{});
+  if (codec == CodecType::H264) {
+
+    const auto fmtp = ParseH264Fmtp(aMime.OriginalString());
+    const H264ProfileLevel pl =
+        fmtp.mProfileLevel.isOk()
+            ? fmtp.mProfileLevel.inspect()
+            : H264ProfileLevel{H264_PROFILE::H264_PROFILE_BASE,
+                               H264_LEVEL::H264_LEVEL_3_1};
+    specific = AsVariant(
+        H264Specific(pl.mProfile, pl.mLevel, H264BitStreamFormat::ANNEXB));
+  }
+  const float framerate = static_cast<float>(aConfig.mFramerate);
+  const uint32_t fr =
+      framerate > 1.0f ? SaturatingCast<uint32_t>(std::ceil(framerate)) : 1;
+  const uint32_t bitrate = SaturatingCast<uint32_t>(aConfig.mBitrate);
+  return EncoderConfig(
+      codec, size, Usage::Realtime,
+      EncoderConfig::SampleFormat(dom::ImageBitmapFormat::YUV420P), fr,
+       0, bitrate,  0,  0,
+      mozilla::BitrateMode::Variable, HardwarePreference::None,
+      ScalabilityMode::None, specific);
+}
+
+class MOZ_STACK_CLASS CodecSupportState final {
+ public:
+  explicit CodecSupportState(const MediaCapabilities& aCaps,
+                             const mediacaps::BehaviorConfig& aBehavior)
+      : mCaps(aCaps), mBehavior(aBehavior) {}
+
+  const mozilla::WebrtcCodecInfo& WebrtcCodecInfo() const {
+    if (!mWebrtcCodecInfo) {
+      mWebrtcCodecInfo = mozilla::WebrtcCodecInfo::Create();
+    }
+    return *mWebrtcCodecInfo;
+  }
+
+  [[nodiscard]]
+  CodecSupport CheckVideoDecodeSupport(
+      const MediaDecodingConfiguration& aConfig,
+      const MediaExtendedMIMEType& aMime) const {
+    const VideoConfiguration& videoConfig = aConfig.mVideo.Value();
+    Maybe<ColorGamut> gamut = videoConfig.mColorGamut.WasPassed()
+                                  ? Some(videoConfig.mColorGamut.Value())
+                                  : Nothing();
+    Maybe<TransferFunction> transfer =
+        videoConfig.mTransferFunction.WasPassed()
+            ? Some(videoConfig.mTransferFunction.Value())
+            : Nothing();
+    return CheckCodecSupport(aMime, aConfig.mType, gamut, transfer);
+  }
+
+  [[nodiscard]]
+  CodecSupport CheckVideoEncodeSupport(
+      const MediaEncodingConfiguration& aConfig,
+      const MediaExtendedMIMEType& aMime) const {
+    const VideoConfiguration& videoConfig = aConfig.mVideo.Value();
+    Maybe<ColorGamut> gamut = videoConfig.mColorGamut.WasPassed()
+                                  ? Some(videoConfig.mColorGamut.Value())
+                                  : Nothing();
+    Maybe<TransferFunction> transfer =
+        videoConfig.mTransferFunction.WasPassed()
+            ? Some(videoConfig.mTransferFunction.Value())
+            : Nothing();
+    return CheckCodecSupport(aMime, aConfig.mType, gamut, transfer);
+  }
+
+  [[nodiscard]]
+  CodecSupport CheckAudioDecodeSupport(
+      const MediaDecodingConfiguration& aConfig,
+      const MediaExtendedMIMEType& aMime) const {
+    return CheckCodecSupport(aMime, aConfig.mType, Nothing(), Nothing());
+  }
+
+  [[nodiscard]]
+  CodecSupport CheckAudioEncodeSupport(
+      const MediaEncodingConfiguration& aConfig,
+      const MediaExtendedMIMEType& aMime) const {
+    return CheckCodecSupport(aMime, aConfig.mType, Nothing(), Nothing());
+  }
+
+ private:
+  const MediaCapabilities& mCaps;
+  mediacaps::BehaviorConfig mBehavior;
+  mutable std::unique_ptr<mozilla::WebrtcCodecInfo> mWebrtcCodecInfo;
+
+  [[nodiscard]] CodecSupport CheckCodecSupport(
+      const MediaExtendedMIMEType& aMime, MediaDecodingType aType,
+      const Maybe<ColorGamut>& aColorGamut,
+      const Maybe<TransferFunction>& aTransferFunction) const {
+    if (mediacaps::CheckMIMETypeSupport(aMime, AsVariant(aType), aColorGamut,
+                                        aTransferFunction, mBehavior)
+            .isErr()) {
+      return CodecSupport::Unsupported;
+    }
+    switch (aType) {
+      case MediaDecodingType::File:
+        return mCaps.CheckTypeForFile(aMime) ? CodecSupport::Supported
+                                             : CodecSupport::Unsupported;
+      case MediaDecodingType::Media_source:
+        return mCaps.CheckTypeForMediaSource(aMime) ? CodecSupport::Supported
+                                                    : CodecSupport::Unsupported;
+      case MediaDecodingType::Webrtc:
+        return WebrtcCodecInfo().CheckDecodeType(aMime)
+                   ? CodecSupport::Supported
+                   : CodecSupport::Unsupported;
+      default:
+        MOZ_ASSERT_UNREACHABLE("Unhandled MediaDecodingType");
+        return CodecSupport::Unsupported;
+    }
+  }
+
+  [[nodiscard]] CodecSupport CheckCodecSupport(
+      const MediaExtendedMIMEType& aMime, MediaEncodingType aType,
+      const Maybe<ColorGamut>& aColorGamut,
+      const Maybe<TransferFunction>& aTransferFunction) const {
+    if (mediacaps::CheckMIMETypeSupport(aMime, AsVariant(aType), aColorGamut,
+                                        aTransferFunction, mBehavior)
+            .isErr()) {
+      return CodecSupport::Unsupported;
+    }
+    switch (aType) {
+      case MediaEncodingType::Record:
+        return mCaps.CheckTypeForEncoder(aMime) ? CodecSupport::Supported
+                                                : CodecSupport::Unsupported;
+      case MediaEncodingType::Webrtc:
+        return WebrtcCodecInfo().CheckEncodeType(aMime)
+                   ? CodecSupport::Supported
+                   : CodecSupport::Unsupported;
+      default:
+        MOZ_ASSERT_UNREACHABLE("Unhandled MediaEncodingType");
+        return CodecSupport::Unsupported;
+    }
+  }
+};
+
+static uint32_t Av1EncoderThreads(const uint32_t aPixels,
+                                  const uint32_t aCores) {
+  if ((aPixels >= 1920u * 1080u) && (aCores > 8)) {
+    return 8;
+  } else if ((aPixels >= 640u * 360u) && (aCores > 4)) {
+    return 4;
+  } else if ((aPixels >= 320u * 180u) && (aCores > 2)) {
+    return 2;
+  }
+  return 1;
+}
+static uint32_t Vp9EncoderThreads(const uint32_t aPixels,
+                                  const uint32_t aCores) {
+  if ((aPixels >= 1280u * 720u) && (aCores > 4)) {
+    return 4;
+  } else if ((aPixels >= 640u * 360u) && (aCores > 2)) {
+    return 2;
+  }
+  return 1;
+}
+static uint32_t Vp8EncoderThreads(const uint32_t aPixels,
+                                  const uint32_t aCores) {
+  if ((aPixels >= 1920u * 1080u) && (aCores > 8)) {
+    return 8;
+  } else if ((aPixels > 1280u * 960u) && (aCores >= 6)) {
+    return 3;
+  } else if ((aPixels > 640u * 480u) && (aCores >= 3)) {
+    return (aCores >= 6 ? 3 : 2);
+  }
+  return 1;
+}
+static bool IsWebRTCSWEncodeSmooth(const VideoConfiguration& aConfig) {
+  const auto shouldForceSmooth =
+      StaticPrefs::media_mediacapabilities_webrtc_encode_smooth_override();
+  if (shouldForceSmooth == 1) {
+    return true;
+  } else if (shouldForceSmooth == 2) {
+    return false;
+  }
+
+  const NS_ConvertUTF16toUTF8 mimeStr(aConfig.mContentType);
+  const int32_t slash = mimeStr.FindChar('/');
+  if (slash < 0) {
+    return false;
+  }
+  const auto afterSlash = Substring(mimeStr, slash + 1);
+  const int32_t semi = afterSlash.FindChar(';');
+  nsAutoCString codecStr(semi >= 0 ? Substring(afterSlash, 0, semi)
+                                   : afterSlash);
+  codecStr.Trim(" \t");
+
+  static const struct {
+    const char* codec;
+    uint32_t w, h;
+    float ratio;  
+    uint32_t threads;
+  } kMeasured[] = {
+      {"h264", 426, 240, 2.06f, 1},   {"h264", 854, 480, 1.71f, 1},
+      {"h264", 1280, 720, 1.51f, 1},  {"h264", 1920, 1080, 1.37f, 1},
+      {"h264", 3840, 2160, 0.47f, 1},  
+      {"av1", 426, 240, 2.10f, 2},    {"av1", 854, 480, 1.43f, 4},
+      {"av1", 1280, 720, 0.98f, 4},   
+      {"av1", 1920, 1080, 0.73f, 4},  
+      {"av1", 3840, 2160, 0.26f, 4},  
+      {"vp9", 426, 240, 1.94f, 1},    {"vp9", 854, 480, 1.85f, 2},
+      {"vp9", 1280, 720, 1.64f, 4},   {"vp9", 1920, 1080, 1.20f, 4},
+      {"vp9", 3840, 2160, 0.50f, 4},  
+      {"vp8", 426, 240, 2.01f, 1},    {"vp8", 854, 480, 1.80f, 3},
+      {"vp8", 1280, 720, 1.54f, 3},   {"vp8", 1920, 1080, 1.31f, 3},
+      {"vp8", 3840, 2160, 0.55f, 3},  
+  };
+
+  const CheckedInt<uint32_t> pixelCount =
+      CheckedInt<uint32_t>(aConfig.mWidth) * aConfig.mHeight;
+  if (!pixelCount.isValid() || !std::isfinite(aConfig.mFramerate) ||
+      aConfig.mFramerate <= 0) {
+    return false;
+  }
+  const uint32_t pixels = pixelCount.value();
+  const uint32_t rfps =
+      std::max(1u, static_cast<uint32_t>(aConfig.mFramerate + 0.5));
+  const uint32_t cores =
+      std::max(1u, static_cast<uint32_t>(GetNumberOfProcessors()));
+
+  uint32_t actualThreads = 1;  
+  if (codecStr.EqualsIgnoreCase("av1")) {
+    actualThreads = Av1EncoderThreads(pixels, cores);
+  } else if (codecStr.EqualsIgnoreCase("vp9")) {
+    actualThreads = Vp9EncoderThreads(pixels, cores);
+  } else if (codecStr.EqualsIgnoreCase("vp8")) {
+    actualThreads = Vp8EncoderThreads(pixels, cores);
+  }
+
+  int32_t bucketIdx = -1;
+  for (int32_t i = 0; i < static_cast<int32_t>(std::size(kMeasured)); i++) {
+    if (!codecStr.EqualsIgnoreCase(kMeasured[i].codec)) {
+      continue;
+    } else if (kMeasured[i].w * kMeasured[i].h >= pixels) {
+      bucketIdx = i;
+      break;
+    }
+  }
+  if (bucketIdx < 0) {
+    return false;  
+  }
+
+  const auto& bucket = kMeasured[bucketIdx];
+  const float scaledRatio =
+      bucket.ratio * (60.0f / static_cast<float>(rfps)) *
+      (static_cast<float>(actualThreads) / static_cast<float>(bucket.threads));
+  return scaledRatio >= 1.0f;
+}
+
+template <typename T>
+[[nodiscard]]
+static bool GetThreadForAsyncRequest(
+    nsIGlobalObject* aParent, RefPtr<DOMMozPromiseRequestHolder<T>>* aHolderOut,
+    RefPtr<nsISerialEventTarget>* aTargetThreadOut,
+    RefPtr<StrongWorkerRef>* aWorkerRefOut, const char* aTag) {
+  auto holder = MakeRefPtr<DOMMozPromiseRequestHolder<T>>(aParent);
+  RefPtr<nsISerialEventTarget> target = aParent->SerialEventTarget();
+  MOZ_ASSERT(target->IsOnCurrentThread());
+
+  if (NS_IsMainThread()) {
+    *aHolderOut = std::move(holder);
+    *aTargetThreadOut = std::move(target);
+    return true;
+  }
+
+  WorkerPrivate* wp = GetCurrentThreadWorkerPrivate();
+  MOZ_ASSERT(wp, "Must be called from a worker thread");
+
+  RefPtr<StrongWorkerRef> ref = StrongWorkerRef::Create(
+      wp, aTag, [holder]() { holder->DisconnectIfExists(); });
+  if (NS_WARN_IF(!ref)) {
+    return false;
+  }
+
+  *aHolderOut = std::move(holder);
+  *aTargetThreadOut = std::move(target);
+  *aWorkerRefOut = std::move(ref);
+  return true;
+}
+
+bool MediaCapabilitiesKeySystemConfigurationToMediaKeySystemConfiguration(
+    const MediaDecodingConfiguration& aInConfig,
+    MediaKeySystemConfiguration& aOutConfig) {
+  if (!aInConfig.mKeySystemConfiguration.WasPassed()) {
+    return false;
+  }
+
+  const auto& keySystemConfig = aInConfig.mKeySystemConfiguration.Value();
+  if (!keySystemConfig.mInitDataType.IsEmpty()) {
+    if (NS_WARN_IF(!aOutConfig.mInitDataTypes.AppendElement(
+            keySystemConfig.mInitDataType, fallible))) {
+      return false;
+    }
+  }
+  if (keySystemConfig.mSessionTypes.WasPassed() &&
+      !keySystemConfig.mSessionTypes.Value().IsEmpty()) {
+    aOutConfig.mSessionTypes.Construct();
+    for (const auto& type : keySystemConfig.mSessionTypes.Value()) {
+      if (NS_WARN_IF(!aOutConfig.mSessionTypes.Value().AppendElement(
+              type, fallible))) {
+        return false;
+      }
+    }
+  }
+  aOutConfig.mDistinctiveIdentifier = keySystemConfig.mDistinctiveIdentifier;
+  aOutConfig.mPersistentState = keySystemConfig.mPersistentState;
+
+  if (aInConfig.mAudio.WasPassed()) {
+    auto* capabilitiy = aOutConfig.mAudioCapabilities.AppendElement(fallible);
+    if (NS_WARN_IF(!capabilitiy)) {
+      return false;
+    }
+    capabilitiy->mContentType = aInConfig.mAudio.Value().mContentType;
+    if (keySystemConfig.mAudio.WasPassed()) {
+      const auto& config = keySystemConfig.mAudio.Value();
+      capabilitiy->mRobustness = config.mRobustness;
+      capabilitiy->mEncryptionScheme = config.mEncryptionScheme;
+    }
+  }
+  if (aInConfig.mVideo.WasPassed()) {
+    auto* capabilitiy = aOutConfig.mVideoCapabilities.AppendElement(fallible);
+    if (NS_WARN_IF(!capabilitiy)) {
+      return false;
+    }
+    capabilitiy->mContentType = aInConfig.mVideo.Value().mContentType;
+    if (keySystemConfig.mVideo.WasPassed()) {
+      const auto& config = keySystemConfig.mVideo.Value();
+      capabilitiy->mRobustness = config.mRobustness;
+      capabilitiy->mEncryptionScheme = config.mEncryptionScheme;
+    }
+  }
+  return true;
+}
+
+MediaCapabilities::MediaCapabilities(nsIGlobalObject* aParent)
+    : mParent(aParent) {}
+
+void MediaCapabilities::CreateWebRTCDecodingInfo(
+    const MediaDecodingConfiguration& aConfiguration, Promise* aPromise,
+    Maybe<MediaContainerType> aVideoContainer,
+    Maybe<MediaContainerType> aAudioContainer) {
+  using PromiseType =
+      MozPromise<MediaCapabilitiesDecodingInfo, bool, true>;
+  RefPtr<DOMMozPromiseRequestHolder<PromiseType>> holder;
+  RefPtr<nsISerialEventTarget> targetThread;
+  RefPtr<StrongWorkerRef> workerRef;
+  if (!GetThreadForAsyncRequest<PromiseType>(
+          mParent, &holder, &targetThread, &workerRef,
+          "MediaCapabilities::DecodingInfo")) {
+    aPromise->MaybeRejectWithInvalidStateError("The worker is shutting down");
+    return;
+  }
+
+  RefPtr<TaskQueue> taskQueue =
+      TaskQueue::Create(GetMediaThreadPool(MediaThreadType::PLATFORM_DECODER),
+                        "MediaCapabilities::TaskQueue");
+  InvokeAsync(
+      taskQueue, __func__,
+      [aConfiguration, videoContainer = std::move(aVideoContainer),
+       audioContainer = std::move(aAudioContainer)] {
+        MOZ_ASSERT(videoContainer || audioContainer);
+
+        MediaCapabilitiesDecodingInfo info;
+        info.mSupported = true;  
+        info.mSmooth = true;
+        info.mPowerEfficient = true;
+
+        if (videoContainer) {
+          const auto& v = aConfiguration.mVideo.Value();
+          const auto& mime = videoContainer->ExtendedType();
+          if (WebrtcMimeToCodecType(mime) == CodecType::H264) {
+            const auto fmtp = ParseH264Fmtp(mime.OriginalString());
+            const bool invalidFmtp =
+                fmtp.mProfileLevel.isErr() &&
+                fmtp.mProfileLevel.inspectErr() == H264FmtpParseError::Invalid;
+            const bool levelTooLow =
+                fmtp.mProfileLevel.isOk() &&
+                !H264LevelFits(fmtp.mProfileLevel.inspect().mLevel, v.mWidth,
+                               v.mHeight, static_cast<double>(v.mFramerate));
+            if (invalidFmtp || levelTooLow) {
+              MediaCapabilitiesDecodingInfo unsupported;
+              unsupported.mSupported = false;
+              unsupported.mSmooth = false;
+              unsupported.mPowerEfficient = false;
+              LOG("{} -> {}", aConfiguration, unsupported);
+              return PromiseType::CreateAndResolve(
+                  std::move(unsupported), "MediaCapabilities::DecodingInfo");
+            }
+          }
+          const CheckedInt<uint32_t> pixels =
+              CheckedInt<uint32_t>(v.mWidth) * CheckedInt<uint32_t>(v.mHeight);
+          const bool lowResolution =
+              pixels.isValid() && pixels.value() <= kLowResolutionPixelCount;
+          nsCString trackMime(videoContainer->Type().AsString());
+          if (trackMime.LowerCaseEqualsLiteral("video/h264")) {
+            trackMime.AssignLiteral("video/avc");
+          }
+          auto trackInfo =
+              CreateTrackInfoWithMIMETypeAndContainerTypeExtraParameters(
+                  trackMime, *videoContainer);
+          if (!trackInfo) {
+            MediaCapabilitiesDecodingInfo unsupported;
+            unsupported.mSupported = false;
+            unsupported.mSmooth = false;
+            unsupported.mPowerEfficient = false;
+            LOG("{} -> {}", aConfiguration, unsupported);
+            return PromiseType::CreateAndResolve(
+                std::move(unsupported), "MediaCapabilities::DecodingInfo");
+          }
+          SupportDecoderParams videoParameters(
+              *trackInfo,
+              media::VideoFrameRate(static_cast<float>(v.mFramerate)));
+          auto videoSupport = SupportsVideoDecodeForWebrtc(
+              videoContainer->ExtendedType(), videoParameters);
+          if (videoSupport.isEmpty()) {
+            MediaCapabilitiesDecodingInfo unsupported;
+            unsupported.mSupported = false;
+            unsupported.mSmooth = false;
+            unsupported.mPowerEfficient = false;
+            LOG("{} -> {}", aConfiguration, unsupported);
+            return PromiseType::CreateAndResolve(
+                std::move(unsupported), "MediaCapabilities::DecodingInfo");
+          }
+          const bool hwSupported =
+              videoSupport.contains(media::DecodeSupport::HardwareDecode);
+          info.mPowerEfficient = hwSupported || lowResolution;
+        }
+
+        return PromiseType::CreateAndResolve(
+            std::move(info), "MediaCapabilities::CreateWebRTCDecodingInfo");
+      })
+      ->Then(
+          targetThread, __func__,
+          [promise = RefPtr(aPromise), workerRef,
+           holder](MediaCapabilitiesDecodingInfo&& aInfo) {
+            holder->Complete();
+            nsIGlobalObject* global = holder->GetParentObject();
+            NS_ENSURE_TRUE_VOID(global);
+            promise->MaybeResolve(std::move(aInfo));
+          },
+          [] { MOZ_CRASH("Unexpected"); })
+      ->Track(*holder);
+}
+
+already_AddRefed<Promise> MediaCapabilities::DecodingInfo(
+    const MediaDecodingConfiguration& aConfiguration, ErrorResult& aRv) {
+  RefPtr<Promise> promise = Promise::Create(mParent, aRv);
+  if (aRv.Failed()) {
+    return nullptr;
+  }
+
+  const auto behavior = GetBehaviorConfig(mParent);
+
+  if (aConfiguration.mType == MediaDecodingType::Webrtc &&
+      !behavior.mWebRTCEnabled) {
+    promise->MaybeRejectWithTypeError<MSG_INVALID_ENUM_VALUE>(
+        "type", "webrtc", "MediaDecodingType");
+    return promise.forget();
+  }
+
+  if (auto configCheck =
+          IsValidMediaDecodingConfiguration(aConfiguration, behavior);
+      configCheck.isErr()) {
+    RejectWithValidationResult(promise, configCheck.unwrapErr());
+    return promise.forget();
+  }
+
+  if (aConfiguration.mKeySystemConfiguration.WasPassed()) {
+    if (IsWorkerGlobal(mParent->GetGlobalJSObject())) {
+      promise->MaybeRejectWithInvalidStateError(
+          "key system configuration is not allowed in the worker scope");
+      return promise.forget();
+    }
+    if (auto* window = mParent->GetAsInnerWindow();
+        window && !window->IsSecureContext()) {
+      promise->MaybeRejectWithSecurityError(
+          "key system configuration is not allowed in a non-secure context");
+      return promise.forget();
+    }
+  }
+
+  CreateMediaCapabilitiesDecodingInfo(aConfiguration, aRv, promise, behavior);
+  return promise.forget();
+}
+
+void MediaCapabilities::CreateMediaCapabilitiesDecodingInfo(
+    const MediaDecodingConfiguration& aConfiguration, ErrorResult& aRv,
+    Promise* aPromise, const mediacaps::BehaviorConfig& aBehavior) {
+  LOG("Processing {}", aConfiguration);
+
+  const bool isWebRTC =
+      mediacaps::IsMediaTypeWebRTC(AsVariant(aConfiguration.mType));
+  CodecSupport videoSupported = CodecSupport::Unknown;
+  CodecSupport audioSupported = CodecSupport::Unknown;
+  CodecSupportState state(*this, aBehavior);
+
+  Maybe<MediaContainerType> videoContainer;
+  Maybe<MediaContainerType> audioContainer;
+
+  if (aConfiguration.mVideo.WasPassed()) {
+    auto videoMime = MakeMediaExtendedMIMEType(aConfiguration.mVideo.Value());
+    if (!videoMime) {
+      aPromise->MaybeRejectWithTypeError("Invalid VideoConfiguration");
+      return;
+    }
+    videoSupported = state.CheckVideoDecodeSupport(aConfiguration, *videoMime);
+    if (videoSupported == CodecSupport::Supported) {
+      videoContainer = Some(MediaContainerType(std::move(*videoMime)));
+    }
+  }
+
+  if (aConfiguration.mAudio.WasPassed()) {
+    auto audioMime = MakeMediaExtendedMIMEType(aConfiguration.mAudio.Value());
+    if (!audioMime) {
+      aPromise->MaybeRejectWithTypeError("Invalid AudioConfiguration");
+      return;
+    }
+    audioSupported = state.CheckAudioDecodeSupport(aConfiguration, *audioMime);
+    if (audioSupported == CodecSupport::Supported) {
+      audioContainer = Some(MediaContainerType(std::move(*audioMime)));
+    }
+  }
+  const bool bothSupportUnknown = videoSupported == CodecSupport::Unknown &&
+                                  audioSupported == CodecSupport::Unknown;
+
+  if (videoSupported == CodecSupport::Unsupported ||
+      audioSupported == CodecSupport::Unsupported || bothSupportUnknown) {
+    MediaCapabilitiesDecodingInfo info;
+    info.mSupported = false;
+    info.mSmooth = false;
+    info.mPowerEfficient = false;
+    aPromise->MaybeResolve(std::move(info));
+    return;
+  }
+
+  if (isWebRTC) {
+    CreateWebRTCDecodingInfo(aConfiguration, aPromise,
+                             std::move(videoContainer),
+                             std::move(audioContainer));
+  } else {
+    CreateNonWebRTCDecodingInfo(aConfiguration, aPromise,
+                                std::move(videoContainer),
+                                std::move(audioContainer));
+  }
+}
+
+static MediaCapabilitiesDecodingInfo CreateVideoDecodingInfo(
+    const TrackInfo& aConfig, const bool aShouldResistFingerprinting,
+    const bool aHardwareAccelerated) {
+  MediaCapabilitiesDecodingInfo info;
+  info.mSupported = true;
+  info.mSmooth = true;
+  info.mPowerEfficient = false;
+  if (aShouldResistFingerprinting) {
+    return info;
+  }
+  MOZ_ASSERT(aConfig.IsVideo());
+  const auto& image = aConfig.GetAsVideoInfo()->mImage;
+  const CheckedInt<uint32_t> pixels =
+      CheckedInt<uint32_t>(image.width) * CheckedInt<uint32_t>(image.height);
+  const bool lowResolution =
+      pixels.isValid() && pixels.value() <= kLowResolutionPixelCount;
+  info.mPowerEfficient = aHardwareAccelerated || lowResolution;
+  return info;
+}
+
+void MediaCapabilities::CreateNonWebRTCDecodingInfo(
+    const MediaDecodingConfiguration& aConfiguration, Promise* aPromise,
+    Maybe<MediaContainerType> aVideoContainer,
+    Maybe<MediaContainerType> aAudioContainer) {
+  nsTArray<UniquePtr<TrackInfo>> tracks;
+  if (aConfiguration.mVideo.WasPassed()) {
+    MOZ_ASSERT(aVideoContainer.isSome(),
+               "configuration is valid and supported");
+    auto videoTracks = DecoderTraits::GetTracksInfo(*aVideoContainer);
+    if (videoTracks.Length() != 1) {
+      aPromise->MaybeRejectWithTypeError(nsPrintfCString(
+          "The provided type '%s' does not have a 'codecs' parameter.",
+          aVideoContainer->OriginalString().get()));
+      return;
+    }
+    MOZ_DIAGNOSTIC_ASSERT(videoTracks.ElementAt(0),
+                          "must contain a valid trackinfo");
+    if (videoTracks[0]->GetType() != TrackInfo::kVideoTrack) {
+      aPromise->MaybeRejectWithTypeError("Invalid VideoConfiguration");
+      return;
+    }
+    tracks.AppendElements(std::move(videoTracks));
+  }
+  if (aConfiguration.mAudio.WasPassed()) {
+    MOZ_ASSERT(aAudioContainer.isSome(),
+               "configuration is valid and supported");
+    auto audioTracks = DecoderTraits::GetTracksInfo(*aAudioContainer);
+    if (audioTracks.Length() != 1) {
+      aPromise->MaybeRejectWithTypeError(nsPrintfCString(
+          "The provided type '%s' does not have a 'codecs' parameter.",
+          aAudioContainer->OriginalString().get()));
+      return;
+    }
+    MOZ_DIAGNOSTIC_ASSERT(audioTracks.ElementAt(0),
+                          "must contain a valid trackinfo");
+    if (audioTracks[0]->GetType() != TrackInfo::kAudioTrack) {
+      aPromise->MaybeRejectWithTypeError("Invalid AudioConfiguration");
+      return;
+    }
+    tracks.AppendElements(std::move(audioTracks));
+  }
+
+  RefPtr<TaskQueue> taskQueue =
+      TaskQueue::Create(GetMediaThreadPool(MediaThreadType::PLATFORM_DECODER),
+                        "MediaCapabilities::TaskQueue");
+  RefPtr<layers::KnowsCompositor> compositor = GetCompositor();
+  const bool shouldResistFingerprinting =
+      mParent->ShouldResistFingerprinting(RFPTarget::MediaCapabilities);
+  float frameRate =
+      aConfiguration.mVideo.WasPassed() && aVideoContainer.isSome()
+          ? static_cast<float>(
+                aVideoContainer->ExtendedType().GetFramerate().ref())
+          : 0.0f;
+
+  if (aConfiguration.mKeySystemConfiguration.WasPassed()) {
+    MOZ_ASSERT(
+        NS_IsMainThread(),
+        "Key system configuration qurey can not run on the worker thread!");
+
+    RefPtr<nsISerialEventTarget> mainThread = GetMainThreadSerialEventTarget();
+    if (!mainThread) {
+      aPromise->MaybeRejectWithInvalidStateError(
+          "The main thread is shutted down");
+      return;
+    }
+
+    const auto& keySystemConfig =
+        aConfiguration.mKeySystemConfiguration.Value();
+    if ((keySystemConfig.mVideo.WasPassed() &&
+         !aConfiguration.mVideo.WasPassed()) ||
+        (keySystemConfig.mAudio.WasPassed() &&
+         !aConfiguration.mAudio.WasPassed())) {
+      aPromise->MaybeRejectWithTypeError(
+          "The type of decoding config doesn't match the type of key system "
+          "config");
+      return;
+    }
+    UniquePtr<TrackInfo> videoInfo;
+    if (aConfiguration.mVideo.WasPassed() && aVideoContainer.isSome()) {
+      videoInfo = std::move(tracks[0]);
+    }
+    CheckEncryptedDecodingSupport(aConfiguration)
+        ->Then(
+            mainThread, __func__,
+            [promise = RefPtr<Promise>{aPromise}, aConfiguration, mainThread,
+             taskQueue, compositor, shouldResistFingerprinting, frameRate,
+             videoInfo = std::move(videoInfo)](
+                MediaKeySystemAccessManager::MediaKeySystemAccessPromise::
+                    ResolveOrRejectValue&& aValue) mutable {
+              if (aValue.IsReject()) {
+                MediaCapabilitiesDecodingInfo info;
+                info.mSupported = false;
+                info.mSmooth = false;
+                info.mPowerEfficient = false;
+                LOG("DRM support check rejected: {} -> {}", aConfiguration,
+                    info);
+                promise->MaybeResolve(std::move(info));
+                return;
+              }
+
+              MediaCapabilitiesDecodingInfo drmInfo;
+              drmInfo.mSupported = true;
+              drmInfo.mSmooth = true;
+              drmInfo.mPowerEfficient = false;
+              drmInfo.mKeySystemAccess = aValue.ResolveValue();
+              MOZ_ASSERT(drmInfo.mKeySystemAccess);
+              MediaKeySystemConfiguration config;
+              drmInfo.mKeySystemAccess->GetConfiguration(config);
+              const bool hwDRM = IsHardwareDecryptionSupported(config);
+
+              if (shouldResistFingerprinting) {
+                if (hwDRM) {
+                  drmInfo.mSupported = false;
+                  drmInfo.mSmooth = false;
+                  drmInfo.mPowerEfficient = false;
+                } else {
+                  drmInfo.mPowerEfficient = false;
+                }
+                LOG("RFP: suppressing DRM capabilities: {} -> {}",
+                    aConfiguration, drmInfo);
+                promise->MaybeResolve(std::move(drmInfo));
+                return;
+              }
+
+              if (hwDRM || !videoInfo) {
+                drmInfo.mPowerEfficient = hwDRM && !!videoInfo;
+                LOG("DRM hardware decrypt or no video track: {} -> {}",
+                    aConfiguration, drmInfo);
+                promise->MaybeResolve(std::move(drmInfo));
+                return;
+              }
+
+              CheckVideoDecodingInfo(taskQueue, compositor, frameRate,
+                                     false ,
+                                     std::move(videoInfo))
+                  ->Then(
+                      mainThread, __func__,
+                      [promise, drmInfo = std::move(drmInfo), aConfiguration](
+                          CapabilitiesPromise::ResolveOrRejectValue&&
+                              aDecoderResult) mutable {
+                        if (aDecoderResult.IsResolve()) {
+                          drmInfo.mPowerEfficient =
+                              aDecoderResult.ResolveValue().mPowerEfficient;
+                        } else {
+                          drmInfo.mPowerEfficient = false;
+                        }
+                        LOG("Software DRM decoder check: {} -> {}",
+                            aConfiguration, drmInfo);
+                        promise->MaybeResolve(std::move(drmInfo));
+                      });
+            });
+    return;
+  }
+
+  nsTArray<RefPtr<CapabilitiesPromise>> promises;
+
+  for (auto&& config : tracks) {
+    TrackInfo::TrackType type =
+        config->IsVideo() ? TrackInfo::kVideoTrack : TrackInfo::kAudioTrack;
+
+    MOZ_ASSERT(type == TrackInfo::kAudioTrack ||
+                   aVideoContainer->ExtendedType().GetFramerate().isSome(),
+               "framerate is a required member of VideoConfiguration");
+
+    if (type == TrackInfo::kAudioTrack) {
+      promises.AppendElement(
+          InvokeAsync(taskQueue, __func__, [config = std::move(config)]() {
+            SupportDecoderParams params{*config};
+            if (PDMFactorySupport::IsSupported(params,
+                                               nullptr )
+                    .isEmpty()) {
+              return CapabilitiesPromise::CreateAndReject(NS_ERROR_FAILURE,
+                                                          __func__);
+            }
+            MediaCapabilitiesDecodingInfo info;
+            info.mSupported = true;
+            info.mSmooth = true;
+            info.mPowerEfficient = true;
+            return CapabilitiesPromise::CreateAndResolve(std::move(info),
+                                                         __func__);
+          }));
+      continue;
+    }
+
+    promises.AppendElement(
+        CheckVideoDecodingInfo(taskQueue, compositor, frameRate,
+                               shouldResistFingerprinting, std::move(config)));
+  }
+
+  MOZ_ASSERT(tracks.Length() <= 2);
+
+  RefPtr<DOMMozPromiseRequestHolder<CapabilitiesPromise::AllPromiseType>>
+      holder;
+  RefPtr<nsISerialEventTarget> targetThread;
+  RefPtr<StrongWorkerRef> workerRef;
+  if (!GetThreadForAsyncRequest<CapabilitiesPromise::AllPromiseType>(
+          mParent, &holder, &targetThread, &workerRef,
+          "MediaCapabilities::DecodingInfo")) {
+    aPromise->MaybeRejectWithInvalidStateError("The worker is shutting down");
+    return;
+  }
+
+  CapabilitiesPromise::All(taskQueue, promises)
+      ->Then(targetThread, __func__,
+             [promise = RefPtr{aPromise}, tracks = std::move(tracks), workerRef,
+              holder, aConfiguration](
+                 CapabilitiesPromise::AllPromiseType::ResolveOrRejectValue&&
+                     aValue) {
+               holder->Complete();
+               nsIGlobalObject* global = holder->GetParentObject();
+               NS_ENSURE_TRUE_VOID(global);
+               if (aValue.IsReject()) {
+                 MediaCapabilitiesDecodingInfo info;
+                 info.mSupported = false;
+                 info.mSmooth = false;
+                 info.mPowerEfficient = false;
+                 LOG("{} -> {}", aConfiguration, info);
+                 promise->MaybeResolve(std::move(info));
+                 return;
+               }
+               bool powerEfficient = true;
+               bool smooth = true;
+               for (auto&& capability : aValue.ResolveValue()) {
+                 smooth &= capability.mSmooth;
+                 powerEfficient &= capability.mPowerEfficient;
+               }
+               MediaCapabilitiesDecodingInfo info;
+               info.mSupported = true;
+               info.mSmooth = smooth;
+               info.mPowerEfficient = powerEfficient;
+               LOG("{} -> {}", aConfiguration, info);
+               promise->MaybeResolve(std::move(info));
+             })
+      ->Track(*holder);
+}
+
+RefPtr<MediaCapabilities::CapabilitiesPromise>
+MediaCapabilities::CheckVideoDecodingInfo(
+    RefPtr<TaskQueue> aTaskQueue, RefPtr<layers::KnowsCompositor> aCompositor,
+    float aFrameRate, bool aShouldResistFingerprinting,
+    UniquePtr<TrackInfo> aConfig) {
+  MOZ_ASSERT(aConfig && aConfig->IsVideo());
+  MOZ_ASSERT(aTaskQueue);
+  RefPtr<nsISerialEventTarget> target = aTaskQueue;
+  return InvokeAsync(
+      target, __func__,
+      [taskQueue = std::move(aTaskQueue), compositor = std::move(aCompositor),
+       frameRate = aFrameRate,
+       shouldResistFingerprinting = aShouldResistFingerprinting,
+       config = std::move(aConfig)]() mutable -> RefPtr<CapabilitiesPromise> {
+        static Atomic<uint32_t> sTrackingIdCounter(0);
+        TrackingId trackingId(TrackingId::Source::MediaCapabilities,
+                              sTrackingIdCounter++,
+                              TrackingId::TrackAcrossProcesses::Yes);
+        CreateDecoderParams params{
+            *config, compositor, CreateDecoderParams::VideoFrameRate(frameRate),
+            TrackInfo::kVideoTrack, Some(std::move(trackingId))};
+        static RefPtr<AllocPolicy> sVideoAllocPolicy = [&taskQueue]() {
+          SchedulerGroup::Dispatch(NS_NewRunnableFunction(
+              "MediaCapabilities::AllocPolicy:Video", []() {
+                ClearOnShutdown(&sVideoAllocPolicy,
+                                ShutdownPhase::XPCOMShutdownThreads);
+              }));
+          return new SingleAllocPolicy(TrackInfo::TrackType::kVideoTrack,
+                                       taskQueue);
+        }();
+        return AllocationWrapper::CreateDecoder(params, sVideoAllocPolicy)
+            ->Then(
+                taskQueue, __func__,
+                [taskQueue, shouldResistFingerprinting,
+                 config = std::move(config)](
+                    AllocationWrapper::AllocateDecoderPromise::
+                        ResolveOrRejectValue&& aValue) mutable {
+                  if (aValue.IsReject()) {
+                    return CapabilitiesPromise::CreateAndReject(
+                        std::move(aValue.RejectValue()), __func__);
+                  }
+                  RefPtr<MediaDataDecoder> decoder =
+                      std::move(aValue.ResolveValue());
+                  RefPtr<CapabilitiesPromise> p = decoder->Init()->Then(
+                      taskQueue, __func__,
+                      [taskQueue, decoder, shouldResistFingerprinting,
+                       config = std::move(config)](
+                          MediaDataDecoder::InitPromise::ResolveOrRejectValue&&
+                              aValue) mutable {
+                        RefPtr<CapabilitiesPromise> p;
+                        if (aValue.IsReject()) {
+                          p = CapabilitiesPromise::CreateAndReject(
+                              std::move(aValue.RejectValue()), __func__);
+                        } else {
+                          nsAutoCString reason;
+                          bool hwAccel = decoder->IsHardwareAccelerated(reason);
+                          auto info = CreateVideoDecodingInfo(
+                              *config, shouldResistFingerprinting, hwAccel);
+                          p = CapabilitiesPromise::CreateAndResolve(
+                              std::move(info), __func__);
+                        }
+                        MOZ_ASSERT(p.get(), "the promise has been created");
+                        decoder->Shutdown()->Then(
+                            taskQueue, __func__,
+                            [taskQueue, decoder, config = std::move(config)](
+                                const ShutdownPromise::ResolveOrRejectValue&
+                                    aValue) {});
+                        return p;
+                      });
+                  return p;
+                });
+      });
+}
+
+RefPtr<MediaKeySystemAccessManager::MediaKeySystemAccessPromise>
+MediaCapabilities::CheckEncryptedDecodingSupport(
+    const MediaDecodingConfiguration& aConfiguration) {
+  using MediaKeySystemAccessPromise =
+      MediaKeySystemAccessManager::MediaKeySystemAccessPromise;
+  auto* window = mParent->GetAsInnerWindow();
+  if (NS_WARN_IF(!window)) {
+    return MediaKeySystemAccessPromise::CreateAndReject(NS_ERROR_FAILURE,
+                                                        __func__);
+  }
+
+  auto* manager = window->Navigator()->GetOrCreateMediaKeySystemAccessManager();
+  if (NS_WARN_IF(!manager)) {
+    return MediaKeySystemAccessPromise::CreateAndReject(NS_ERROR_FAILURE,
+                                                        __func__);
+  }
+
+  Sequence<MediaKeySystemConfiguration> configs;
+  auto* emeConfig = configs.AppendElement(fallible);
+  if (NS_WARN_IF(!emeConfig)) {
+    return MediaKeySystemAccessPromise::CreateAndReject(NS_ERROR_FAILURE,
+                                                        __func__);
+  }
+
+  if (!MediaCapabilitiesKeySystemConfigurationToMediaKeySystemConfiguration(
+          aConfiguration, *emeConfig)) {
+    return MediaKeySystemAccessPromise::CreateAndReject(NS_ERROR_FAILURE,
+                                                        __func__);
+  }
+  return manager->Request(
+      aConfiguration.mKeySystemConfiguration.Value().mKeySystem, configs);
+}
+
+already_AddRefed<Promise> MediaCapabilities::EncodingInfo(
+    const MediaEncodingConfiguration& aConfiguration, ErrorResult& aRv) {
+  RefPtr<Promise> encodePromise = Promise::Create(mParent, aRv);
+  if (aRv.Failed()) {
+    return nullptr;
+  }
+
+  const auto behavior = GetBehaviorConfig(mParent);
+
+  if (aConfiguration.mType == MediaEncodingType::Webrtc &&
+      !behavior.mWebRTCEnabled) {
+    encodePromise->MaybeRejectWithTypeError<MSG_INVALID_ENUM_VALUE>(
+        "type", "webrtc", "MediaEncodingType");
+    return encodePromise.forget();
+  }
+
+  if (auto configCheck =
+          IsValidMediaEncodingConfiguration(aConfiguration, behavior);
+      configCheck.isErr()) {
+    RejectWithValidationResult(encodePromise, configCheck.unwrapErr());
+    return encodePromise.forget();
+  }
+
+  LOG("Processing EncodingInfo for: {}", aConfiguration);
+
+
+  CodecSupport videoSupported = CodecSupport::Unknown;
+  CodecSupportState state(*this, behavior);
+
+  Maybe<MediaExtendedMIMEType> videoMime;
+  if (aConfiguration.mVideo.WasPassed()) {
+    videoMime =
+        MakeMediaExtendedMIMEType(aConfiguration.mVideo.Value().mContentType);
+    MOZ_ASSERT(videoMime, "Validation already succeeded");
+    if (videoMime) {
+      videoSupported =
+          state.CheckVideoEncodeSupport(aConfiguration, *videoMime);
+    }
+  }
+
+  CodecSupport audioSupported = CodecSupport::Unknown;
+
+  Maybe<MediaExtendedMIMEType> audioMime;
+  if (aConfiguration.mAudio.WasPassed()) {
+    audioMime =
+        MakeMediaExtendedMIMEType(aConfiguration.mAudio.Value().mContentType);
+    audioSupported =
+        audioMime ? state.CheckAudioEncodeSupport(aConfiguration, *audioMime)
+                  : CodecSupport::Unknown;
+  }
+
+  MediaCapabilitiesInfo info;
+  const bool bothSupportUnknown = videoSupported == CodecSupport::Unknown &&
+                                  audioSupported == CodecSupport::Unknown;
+
+  if (videoSupported == CodecSupport::Unsupported ||
+      audioSupported == CodecSupport::Unsupported || bothSupportUnknown) {
+    info.mSupported = false;
+    info.mSmooth = false;
+    info.mPowerEfficient = false;
+    encodePromise->MaybeResolve(std::move(info));
+    return encodePromise.forget();
+  }
+
+  info.mSupported = true;
+
+  using PromiseType =
+      MozPromise<MediaCapabilitiesInfo, bool, true>;
+  RefPtr<DOMMozPromiseRequestHolder<PromiseType>> holder;
+  RefPtr<nsISerialEventTarget> targetThread;
+  RefPtr<StrongWorkerRef> workerRef;
+  if (!GetThreadForAsyncRequest<PromiseType>(
+          mParent, &holder, &targetThread, &workerRef,
+          "MediaCapabilities::EncodingInfo")) {
+    return encodePromise.forget();
+  }
+
+  RefPtr<TaskQueue> taskQueue =
+      TaskQueue::Create(GetMediaThreadPool(MediaThreadType::PLATFORM_ENCODER),
+                        "MediaCapabilities::TaskQueue");
+  InvokeAsync(
+      taskQueue, __func__,
+      [aConfiguration, videoMime, videoSupported, audioMime, audioSupported,
+       info = std::move(info)]() mutable {
+        MOZ_ASSERT(audioSupported == CodecSupport::Supported ||
+                   videoSupported == CodecSupport::Supported);
+        (void)audioSupported;
+        info.mSmooth = true;
+        info.mPowerEfficient = true;
+
+        bool lowResolution = false;
+        if (videoSupported == CodecSupport::Supported) {
+          MOZ_ASSERT(aConfiguration.mVideo.WasPassed());
+          const auto& v = aConfiguration.mVideo.Value();
+          if (WebrtcMimeToCodecType(*videoMime) == CodecType::H264) {
+            const auto fmtp = ParseH264Fmtp(videoMime->OriginalString());
+            const bool invalidFmtp =
+                fmtp.mProfileLevel.isErr() &&
+                fmtp.mProfileLevel.inspectErr() == H264FmtpParseError::Invalid;
+            const bool levelTooLow =
+                fmtp.mProfileLevel.isOk() &&
+                !H264LevelFits(fmtp.mProfileLevel.inspect().mLevel, v.mWidth,
+                               v.mHeight, static_cast<double>(v.mFramerate));
+            if (invalidFmtp || levelTooLow) {
+              MediaCapabilitiesInfo unsupported;
+              unsupported.mSupported = false;
+              unsupported.mSmooth = false;
+              unsupported.mPowerEfficient = false;
+              LOG("{} -> {}", aConfiguration, unsupported);
+              return PromiseType::CreateAndResolve(
+                  std::move(unsupported), "MediaCapabilities::EncodingInfo");
+            }
+          }
+          auto encoderConfig = BuildEncoderConfig(*videoMime, v);
+          const auto videoSupport = SupportsVideoEncodeForWebrtc(encoderConfig);
+          if (videoSupport.isEmpty()) {
+            MediaCapabilitiesInfo unsupported;
+            unsupported.mSupported = false;
+            unsupported.mSmooth = false;
+            unsupported.mPowerEfficient = false;
+            LOG("{} -> {}", aConfiguration, unsupported);
+            return PromiseType::CreateAndResolve(
+                std::move(unsupported), "MediaCapabilities::EncodingInfo");
+          }
+          const bool hwSupported =
+              videoSupport.contains(media::EncodeSupport::HardwareEncode);
+          const CheckedInt<uint32_t> pixels =
+              CheckedInt<uint32_t>(v.mWidth) * CheckedInt<uint32_t>(v.mHeight);
+          lowResolution =
+              pixels.isValid() && pixels.value() <= kLowResolutionPixelCount;
+
+          info.mSmooth &= hwSupported || IsWebRTCSWEncodeSmooth(v);
+
+          info.mPowerEfficient &= (hwSupported || lowResolution);
+        }
+
+        LOG("{} -> {}", aConfiguration, info);
+
+        return PromiseType::CreateAndResolve(std::move(info),
+                                             "MediaCapabilities::EncodingInfo");
+      })
+      ->Then(
+          targetThread, __func__,
+          [encodePromise, workerRef, holder,
+           aConfiguration](MediaCapabilitiesInfo aInfo) {
+            holder->Complete();
+            nsIGlobalObject* global = holder->GetParentObject();
+            NS_ENSURE_TRUE_VOID(global);
+            encodePromise->MaybeResolve(std::move(aInfo));
+          },
+          [] { MOZ_CRASH("Unexpected"); })
+      ->Track(*holder);
+  return encodePromise.forget();
+}
+
+bool MediaCapabilities::CheckTypeForMediaSource(
+    const MediaExtendedMIMEType& aType) const {
+  IgnoredErrorResult rv;
+  MediaSource::IsTypeSupported(
+      NS_ConvertUTF8toUTF16(aType.OriginalString()),
+      nullptr , rv,
+      Some(mParent->ShouldResistFingerprinting(RFPTarget::MediaCapabilities)));
+
+  return !rv.Failed();
+}
+
+bool MediaCapabilities::CheckTypeForFile(
+    const MediaExtendedMIMEType& aType) const {
+  MediaContainerType containerType(aType);
+
+  return DecoderTraits::CanHandleContainerType(
+             containerType, nullptr ) !=
+         CANPLAY_NO;
+}
+
+bool MediaCapabilities::CheckTypeForEncoder(
+    const MediaExtendedMIMEType& aType) const {
+  return MediaRecorder::IsTypeSupported(
+      NS_ConvertUTF8toUTF16(aType.OriginalString()));
+}
+
+already_AddRefed<layers::KnowsCompositor> MediaCapabilities::GetCompositor() {
+  nsCOMPtr<nsPIDOMWindowInner> window = do_QueryInterface(GetParentObject());
+  if (NS_WARN_IF(!window)) {
+    return nullptr;
+  }
+
+  nsCOMPtr<Document> doc = window->GetExtantDoc();
+  if (NS_WARN_IF(!doc)) {
+    return nullptr;
+  }
+  WindowRenderer* renderer = nsContentUtils::WindowRendererForDocument(doc);
+  if (NS_WARN_IF(!renderer)) {
+    return nullptr;
+  }
+  RefPtr<layers::KnowsCompositor> knows = renderer->AsKnowsCompositor();
+  if (NS_WARN_IF(!knows)) {
+    return nullptr;
+  }
+  return knows->GetForMedia().forget();
+}
+
+JSObject* MediaCapabilities::WrapObject(JSContext* aCx,
+                                        JS::Handle<JSObject*> aGivenProto) {
+  return MediaCapabilities_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(MediaCapabilities)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(MediaCapabilities)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(MediaCapabilities)
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(MediaCapabilities, mParent)
+
+}  
+#undef LOG

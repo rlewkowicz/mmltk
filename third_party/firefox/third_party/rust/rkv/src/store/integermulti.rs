@@ -1,0 +1,100 @@
+// Copyright 2018 Mozilla
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+// this file except in compliance with the License. You may obtain a copy of the
+// License at http://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+// CONDITIONS OF ANY KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations under the License.
+
+use std::marker::PhantomData;
+
+use crate::{
+    backend::{BackendDatabase, BackendIter, BackendRoCursor, BackendRwTransaction},
+    error::StoreError,
+    readwrite::{Readable, Writer},
+    store::{
+        keys::{Key, PrimitiveInt},
+        multi::{Iter, MultiStore},
+    },
+    value::Value,
+};
+
+type EmptyResult = Result<(), StoreError>;
+
+#[derive(Debug, Eq, PartialEq, Copy, Clone)]
+pub struct MultiIntegerStore<D, K> {
+    inner: MultiStore<D>,
+    phantom: PhantomData<K>,
+}
+
+impl<D, K> MultiIntegerStore<D, K>
+where
+    D: BackendDatabase,
+    K: PrimitiveInt,
+{
+    pub(crate) fn new(db: D) -> MultiIntegerStore<D, K> {
+        MultiIntegerStore {
+            inner: MultiStore::new(db),
+            phantom: PhantomData,
+        }
+    }
+
+    pub fn get<'r, R, I, C>(&self, reader: &'r R, k: K) -> Result<Iter<'r, I>, StoreError>
+    where
+        R: Readable<'r, Database = D, RoCursor = C>,
+        I: BackendIter<'r>,
+        C: BackendRoCursor<'r, Iter = I>,
+        K: 'r,
+    {
+        self.inner.get(reader, Key::new(&k)?)
+    }
+
+    pub fn get_first<'r, R>(&self, reader: &'r R, k: K) -> Result<Option<Value<'r>>, StoreError>
+    where
+        R: Readable<'r, Database = D>,
+    {
+        self.inner.get_first(reader, Key::new(&k)?)
+    }
+
+    pub fn put<T>(&self, writer: &mut Writer<T>, k: K, v: &Value) -> EmptyResult
+    where
+        T: BackendRwTransaction<Database = D>,
+    {
+        self.inner.put(writer, Key::new(&k)?, v)
+    }
+
+    pub fn put_with_flags<T>(
+        &self,
+        writer: &mut Writer<T>,
+        k: K,
+        v: &Value,
+        flags: T::Flags,
+    ) -> EmptyResult
+    where
+        T: BackendRwTransaction<Database = D>,
+    {
+        self.inner.put_with_flags(writer, Key::new(&k)?, v, flags)
+    }
+
+    pub fn delete_all<T>(&self, writer: &mut Writer<T>, k: K) -> EmptyResult
+    where
+        T: BackendRwTransaction<Database = D>,
+    {
+        self.inner.delete_all(writer, Key::new(&k)?)
+    }
+
+    pub fn delete<T>(&self, writer: &mut Writer<T>, k: K, v: &Value) -> EmptyResult
+    where
+        T: BackendRwTransaction<Database = D>,
+    {
+        self.inner.delete(writer, Key::new(&k)?, v)
+    }
+
+    pub fn clear<T>(&self, writer: &mut Writer<T>) -> EmptyResult
+    where
+        T: BackendRwTransaction<Database = D>,
+    {
+        self.inner.clear(writer)
+    }
+}

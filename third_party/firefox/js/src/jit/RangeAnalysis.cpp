@@ -1,0 +1,3120 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "jit/RangeAnalysis.h"
+
+#include "mozilla/CheckedArithmetic.h"
+#include "mozilla/MathAlgorithms.h"
+
+#include <algorithm>
+#include <bit>
+
+#include "builtin/Math.h"
+#include "jit/CompileInfo.h"
+#include "jit/IonAnalysis.h"
+#include "jit/JitSpewer.h"
+#include "jit/MIR-wasm.h"
+#include "jit/MIR.h"
+#include "jit/MIRGenerator.h"
+#include "jit/MIRGraph.h"
+#include "js/Conversions.h"
+#include "js/ScalarType.h"  // js::Scalar::Type
+#include "util/Unicode.h"
+#include "vm/ArgumentsObject.h"
+#include "vm/Float16.h"
+#include "vm/TypedArrayObject.h"
+#include "vm/Uint8Clamped.h"
+
+#include "vm/BytecodeUtil-inl.h"
+
+using namespace js;
+using namespace js::jit;
+
+using JS::GenericNaN;
+using JS::ToInt32;
+using mozilla::Abs;
+using mozilla::ExponentComponent;
+using mozilla::FloorLog2;
+using mozilla::IsNegativeZero;
+using mozilla::NegativeInfinity;
+using mozilla::NumberEqualsInt32;
+using mozilla::PositiveInfinity;
+
+
+static bool IsDominatedUse(const MBasicBlock* block, const MUse* use) {
+  MNode* n = use->consumer();
+  bool isPhi = n->isDefinition() && n->toDefinition()->isPhi();
+
+  if (isPhi) {
+    MPhi* phi = n->toDefinition()->toPhi();
+    return block->dominates(phi->block()->getPredecessor(phi->indexOf(use)));
+  }
+
+  return block->dominates(n->block());
+}
+
+static inline void SpewRange(const MDefinition* def) {
+#ifdef JS_JITSPEW
+  if (JitSpewEnabled(JitSpew_Range) && def->type() != MIRType::None &&
+      def->range()) {
+    AutoJitSpewMessage msg(JitSpew_Range, "  ");
+    def->printName(msg.printer());
+    msg.append(" has range ");
+    def->range()->dump(msg.printer());
+  }
+#endif
+}
+
+#ifdef JS_JITSPEW
+static const char* TruncateKindString(TruncateKind kind) {
+  switch (kind) {
+    case TruncateKind::NoTruncate:
+      return "NoTruncate";
+    case TruncateKind::TruncateAfterBailouts:
+      return "TruncateAfterBailouts";
+    case TruncateKind::IndirectTruncate:
+      return "IndirectTruncate";
+    case TruncateKind::Truncate:
+      return "Truncate";
+    default:
+      MOZ_CRASH("Unknown truncate kind.");
+  }
+}
+
+static inline void SpewTruncate(const MDefinition* def, TruncateKind kind,
+                                bool shouldClone) {
+  if (JitSpewEnabled(JitSpew_Range)) {
+    AutoJitSpewMessage msg(JitSpew_Range, "  truncating ");
+    def->printName(msg.printer());
+    msg.append(" (kind: %s, clone: %d)", TruncateKindString(kind), shouldClone);
+  }
+}
+#else
+static inline void SpewTruncate(MDefinition* def, TruncateKind kind,
+                                bool shouldClone) {}
+#endif
+
+TempAllocator& RangeAnalysis::alloc() const { return graph_.alloc(); }
+
+static void ReplaceDominatedUsesWith(const MDefinition* orig, MDefinition* dom,
+                                     const MBasicBlock* block) {
+  for (MUseIterator i(orig->usesBegin()); i != orig->usesEnd();) {
+    MUse* use = *i++;
+    if (use->consumer() != dom && IsDominatedUse(block, use)) {
+      use->replaceProducer(dom);
+    }
+  }
+}
+
+bool RangeAnalysis::addBetaNodes() {
+  JitSpew(JitSpew_Range, "Adding beta nodes");
+
+  for (PostorderIterator i(graph_.poBegin()); i != graph_.poEnd(); i++) {
+    if (mir->shouldCancel("RangeAnalysis addBetaNodes")) {
+      return false;
+    }
+
+    MBasicBlock* block = *i;
+    JitSpew(JitSpew_Range, "Looking at block %u", block->id());
+
+    BranchDirection branch_dir;
+    MTest* test = block->immediateDominatorBranch(&branch_dir);
+
+    if (!test || !test->getOperand(0)->isCompare()) {
+      continue;
+    }
+
+    MCompare* compare = test->getOperand(0)->toCompare();
+
+    if (!compare->isNumericComparison()) {
+      continue;
+    }
+
+    if (compare->compareType() == MCompare::Compare_UInt32) {
+      continue;
+    }
+
+    MOZ_ASSERT(compare->compareType() != MCompare::Compare_IntPtr &&
+               compare->compareType() != MCompare::Compare_UIntPtr);
+
+    MDefinition* left = compare->getOperand(0);
+    MDefinition* right = compare->getOperand(1);
+    double bound;
+    double conservativeLower = NegativeInfinity<double>();
+    double conservativeUpper = PositiveInfinity<double>();
+    MDefinition* val = nullptr;
+
+    JSOp jsop = compare->jsop();
+
+    if (branch_dir == FALSE_BRANCH) {
+      jsop = NegateCompareOp(jsop);
+      conservativeLower = GenericNaN();
+      conservativeUpper = GenericNaN();
+    }
+
+    MConstant* leftConst = left->maybeConstantValue();
+    MConstant* rightConst = right->maybeConstantValue();
+    if (leftConst && leftConst->isTypeRepresentableAsDouble()) {
+      bound = leftConst->numberToDouble();
+      val = right;
+      jsop = ReverseCompareOp(jsop);
+    } else if (rightConst && rightConst->isTypeRepresentableAsDouble()) {
+      bound = rightConst->numberToDouble();
+      val = left;
+    } else if (left->type() == MIRType::Int32 &&
+               right->type() == MIRType::Int32) {
+      MDefinition* smaller = nullptr;
+      MDefinition* greater = nullptr;
+      if (jsop == JSOp::Lt) {
+        smaller = left;
+        greater = right;
+      } else if (jsop == JSOp::Gt) {
+        smaller = right;
+        greater = left;
+      }
+      if (smaller && greater) {
+        if (!alloc().ensureBallast()) {
+          return false;
+        }
+
+        MBeta* beta;
+        beta = MBeta::New(
+            alloc(), smaller,
+            Range::NewInt32Range(alloc(), JSVAL_INT_MIN, JSVAL_INT_MAX - 1));
+        block->insertBefore(*block->begin(), beta);
+        ReplaceDominatedUsesWith(smaller, beta, block);
+        JitSpew(JitSpew_Range, "  Adding beta node for smaller %u",
+                smaller->id());
+        beta = MBeta::New(
+            alloc(), greater,
+            Range::NewInt32Range(alloc(), JSVAL_INT_MIN + 1, JSVAL_INT_MAX));
+        block->insertBefore(*block->begin(), beta);
+        ReplaceDominatedUsesWith(greater, beta, block);
+        JitSpew(JitSpew_Range, "  Adding beta node for greater %u",
+                greater->id());
+      }
+      continue;
+    } else {
+      continue;
+    }
+
+    MOZ_ASSERT(val);
+
+    Range comp;
+    switch (jsop) {
+      case JSOp::Le:
+        comp.setDouble(conservativeLower, bound);
+        break;
+      case JSOp::Lt:
+        if (val->type() == MIRType::Int32) {
+          int32_t intbound;
+          if (NumberEqualsInt32(bound, &intbound) &&
+              mozilla::SafeSub(intbound, 1, &intbound)) {
+            bound = intbound;
+          }
+        }
+        comp.setDouble(conservativeLower, bound);
+
+        if (bound == 0) {
+          comp.refineToExcludeNegativeZero();
+        }
+        break;
+      case JSOp::Ge:
+        comp.setDouble(bound, conservativeUpper);
+        break;
+      case JSOp::Gt:
+        if (val->type() == MIRType::Int32) {
+          int32_t intbound;
+          if (NumberEqualsInt32(bound, &intbound) &&
+              mozilla::SafeAdd(intbound, 1, &intbound)) {
+            bound = intbound;
+          }
+        }
+        comp.setDouble(bound, conservativeUpper);
+
+        if (bound == 0) {
+          comp.refineToExcludeNegativeZero();
+        }
+        break;
+      case JSOp::StrictEq:
+      case JSOp::Eq:
+        comp.setDouble(bound, bound);
+        break;
+      case JSOp::StrictNe:
+      case JSOp::Ne:
+        if (bound == 0) {
+          comp.refineToExcludeNegativeZero();
+          break;
+        }
+        continue;  
+      default:
+        continue;
+    }
+
+    if (JitSpewEnabled(JitSpew_Range)) {
+      AutoJitSpewMessage msg(
+          JitSpew_Range, "  Adding beta node for %u with range ", val->id());
+      comp.dump(msg.printer());
+    }
+
+    if (!alloc().ensureBallast()) {
+      return false;
+    }
+
+    MBeta* beta = MBeta::New(alloc(), val, new (alloc()) Range(comp));
+    block->insertBefore(*block->begin(), beta);
+    ReplaceDominatedUsesWith(val, beta, block);
+  }
+
+  return true;
+}
+
+bool RangeAnalysis::removeBetaNodes() {
+  JitSpew(JitSpew_Range, "Removing beta nodes");
+
+  for (PostorderIterator i(graph_.poBegin()); i != graph_.poEnd(); i++) {
+    MBasicBlock* block = *i;
+    for (MDefinitionIterator iter(*i); iter;) {
+      MDefinition* def = *iter++;
+      if (def->isBeta()) {
+        auto* beta = def->toBeta();
+        MDefinition* op = beta->input();
+        JitSpew(JitSpew_Range, "  Removing beta node %u for %u", beta->id(),
+                op->id());
+        beta->justReplaceAllUsesWith(op);
+        block->discard(beta);
+      } else {
+        break;
+      }
+    }
+  }
+  return true;
+}
+
+void SymbolicBound::dump(GenericPrinter& out) const {
+  if (loop) {
+    out.printf("[loop] ");
+  }
+  sum.dump(out);
+}
+
+void SymbolicBound::dump() const {
+  Fprinter out(stderr);
+  dump(out);
+  out.printf("\n");
+  out.finish();
+}
+
+static bool IsExponentInteresting(const Range* r) {
+  if (!r->hasInt32Bounds()) {
+    return true;
+  }
+
+  if (!r->canHaveFractionalPart()) {
+    return false;
+  }
+
+  return FloorLog2(std::max(Abs(r->lower()), Abs(r->upper()))) > r->exponent();
+}
+
+void Range::dump(GenericPrinter& out) const {
+  assertInvariants();
+
+  if (canHaveFractionalPart_) {
+    out.printf("F");
+  } else {
+    out.printf("I");
+  }
+
+  out.printf("[");
+
+  if (!hasInt32LowerBound_) {
+    out.printf("?");
+  } else {
+    out.printf("%d", lower_);
+  }
+  if (symbolicLower_) {
+    out.printf(" {");
+    symbolicLower_->dump(out);
+    out.printf("}");
+  }
+
+  out.printf(", ");
+
+  if (!hasInt32UpperBound_) {
+    out.printf("?");
+  } else {
+    out.printf("%d", upper_);
+  }
+  if (symbolicUpper_) {
+    out.printf(" {");
+    symbolicUpper_->dump(out);
+    out.printf("}");
+  }
+
+  out.printf("]");
+
+  bool includesNaN = max_exponent_ == IncludesInfinityAndNaN;
+  bool includesNegativeInfinity =
+      max_exponent_ >= IncludesInfinity && !hasInt32LowerBound_;
+  bool includesPositiveInfinity =
+      max_exponent_ >= IncludesInfinity && !hasInt32UpperBound_;
+  bool includesNegativeZero = canBeNegativeZero_;
+
+  if (includesNaN || includesNegativeInfinity || includesPositiveInfinity ||
+      includesNegativeZero) {
+    out.printf(" (");
+    bool first = true;
+    if (includesNaN) {
+      if (first) {
+        first = false;
+      } else {
+        out.printf(" ");
+      }
+      out.printf("U NaN");
+    }
+    if (includesNegativeInfinity) {
+      if (first) {
+        first = false;
+      } else {
+        out.printf(" ");
+      }
+      out.printf("U -Infinity");
+    }
+    if (includesPositiveInfinity) {
+      if (first) {
+        first = false;
+      } else {
+        out.printf(" ");
+      }
+      out.printf("U Infinity");
+    }
+    if (includesNegativeZero) {
+      if (first) {
+        first = false;
+      } else {
+        out.printf(" ");
+      }
+      out.printf("U -0");
+    }
+    out.printf(")");
+  }
+  if (max_exponent_ < IncludesInfinity && IsExponentInteresting(this)) {
+    out.printf(" (< pow(2, %d+1))", max_exponent_);
+  }
+}
+
+void Range::dump() const {
+  Fprinter out(stderr);
+  dump(out);
+  out.printf("\n");
+  out.finish();
+}
+
+Range* Range::intersect(TempAllocator& alloc, const Range* lhs,
+                        const Range* rhs, bool* emptyRange) {
+  *emptyRange = false;
+
+  if (!lhs && !rhs) {
+    return nullptr;
+  }
+
+  if (!lhs) {
+    return new (alloc) Range(*rhs);
+  }
+  if (!rhs) {
+    return new (alloc) Range(*lhs);
+  }
+
+  int32_t newLower = std::max(lhs->lower_, rhs->lower_);
+  int32_t newUpper = std::min(lhs->upper_, rhs->upper_);
+
+  if (newUpper < newLower) {
+    if (!lhs->canBeNaN() || !rhs->canBeNaN()) {
+      *emptyRange = true;
+    }
+    return nullptr;
+  }
+
+  bool newHasInt32LowerBound =
+      lhs->hasInt32LowerBound_ || rhs->hasInt32LowerBound_;
+  bool newHasInt32UpperBound =
+      lhs->hasInt32UpperBound_ || rhs->hasInt32UpperBound_;
+
+  FractionalPartFlag newCanHaveFractionalPart = FractionalPartFlag(
+      lhs->canHaveFractionalPart_ && rhs->canHaveFractionalPart_);
+
+  NegativeZeroFlag newMayIncludeNegativeZero =
+      NegativeZeroFlag((lhs->canBeNegativeZero_ && rhs->canBeZero()) ||
+                       (rhs->canBeNegativeZero_ && lhs->canBeZero()));
+
+  uint16_t newExponent = std::min(lhs->max_exponent_, rhs->max_exponent_);
+
+  if (newHasInt32LowerBound && newHasInt32UpperBound &&
+      newExponent == IncludesInfinityAndNaN) {
+    return nullptr;
+  }
+
+  if (lhs->canHaveFractionalPart() != rhs->canHaveFractionalPart() ||
+      (lhs->canHaveFractionalPart() && newHasInt32LowerBound &&
+       newHasInt32UpperBound && newLower == newUpper)) {
+    refineInt32BoundsByExponent(newExponent, &newLower, &newHasInt32LowerBound,
+                                &newUpper, &newHasInt32UpperBound);
+
+    if (newLower > newUpper) {
+      *emptyRange = true;
+      return nullptr;
+    }
+  }
+
+  return new (alloc)
+      Range(newLower, newHasInt32LowerBound, newUpper, newHasInt32UpperBound,
+            newCanHaveFractionalPart, newMayIncludeNegativeZero, newExponent);
+}
+
+void Range::unionWith(const Range* other) {
+  int32_t newLower = std::min(lower_, other->lower_);
+  int32_t newUpper = std::max(upper_, other->upper_);
+
+  bool newHasInt32LowerBound =
+      hasInt32LowerBound_ && other->hasInt32LowerBound_;
+  bool newHasInt32UpperBound =
+      hasInt32UpperBound_ && other->hasInt32UpperBound_;
+
+  FractionalPartFlag newCanHaveFractionalPart = FractionalPartFlag(
+      canHaveFractionalPart_ || other->canHaveFractionalPart_);
+  NegativeZeroFlag newMayIncludeNegativeZero =
+      NegativeZeroFlag(canBeNegativeZero_ || other->canBeNegativeZero_);
+
+  uint16_t newExponent = std::max(max_exponent_, other->max_exponent_);
+
+  rawInitialize(newLower, newHasInt32LowerBound, newUpper,
+                newHasInt32UpperBound, newCanHaveFractionalPart,
+                newMayIncludeNegativeZero, newExponent);
+}
+
+Range::Range(const MDefinition* def)
+    : symbolicLower_(nullptr), symbolicUpper_(nullptr) {
+  if (const Range* other = def->range()) {
+    *this = *other;
+
+    switch (def->type()) {
+      case MIRType::Int32:
+        if (def->isToNumberInt32()) {
+          clampToInt32();
+        } else {
+          wrapAroundToInt32();
+        }
+        break;
+      case MIRType::Boolean:
+        wrapAroundToBoolean();
+        break;
+      case MIRType::None:
+        MOZ_CRASH("Asking for the range of an instruction with no value");
+      default:
+        break;
+    }
+  } else {
+    switch (def->type()) {
+      case MIRType::Int32:
+        setInt32(JSVAL_INT_MIN, JSVAL_INT_MAX);
+        break;
+      case MIRType::Boolean:
+        setInt32(0, 1);
+        break;
+      case MIRType::None:
+        MOZ_CRASH("Asking for the range of an instruction with no value");
+      default:
+        setUnknown();
+        break;
+    }
+  }
+
+  if (!hasInt32UpperBound() && def->isUrsh() &&
+      def->toUrsh()->bailoutsDisabled() && def->type() != MIRType::Int64) {
+    lower_ = INT32_MIN;
+  }
+
+  assertInvariants();
+}
+
+static uint16_t ExponentImpliedByDouble(double d) {
+  if (std::isnan(d)) {
+    return Range::IncludesInfinityAndNaN;
+  }
+  if (std::isinf(d)) {
+    return Range::IncludesInfinity;
+  }
+
+  return uint16_t(std::max(int_fast16_t(0), ExponentComponent(d)));
+}
+
+void Range::setDouble(double l, double h) {
+  MOZ_ASSERT(!(l > h));
+
+  if (l >= INT32_MIN && l <= INT32_MAX) {
+    lower_ = int32_t(::floor(l));
+    hasInt32LowerBound_ = true;
+  } else if (l >= INT32_MAX) {
+    lower_ = INT32_MAX;
+    hasInt32LowerBound_ = true;
+  } else {
+    lower_ = INT32_MIN;
+    hasInt32LowerBound_ = false;
+  }
+  if (h >= INT32_MIN && h <= INT32_MAX) {
+    upper_ = int32_t(::ceil(h));
+    hasInt32UpperBound_ = true;
+  } else if (h <= INT32_MIN) {
+    upper_ = INT32_MIN;
+    hasInt32UpperBound_ = true;
+  } else {
+    upper_ = INT32_MAX;
+    hasInt32UpperBound_ = false;
+  }
+
+  uint16_t lExp = ExponentImpliedByDouble(l);
+  uint16_t hExp = ExponentImpliedByDouble(h);
+  max_exponent_ = std::max(lExp, hExp);
+
+  canHaveFractionalPart_ = ExcludesFractionalParts;
+  canBeNegativeZero_ = ExcludesNegativeZero;
+
+  const double doubleMin = double(mozilla::BitwiseCast<float>(
+      mozilla::SpecificFloatingPointBits<float, 0, 1, 0>::value));
+  bool includesNegative = std::isnan(l) || l < doubleMin;
+  bool includesPositive = std::isnan(h) || h > -doubleMin;
+  bool crossesZero = includesNegative && includesPositive;
+
+  uint16_t minExp = std::min(lExp, hExp);
+  if (crossesZero || minExp < MaxTruncatableExponent) {
+    canHaveFractionalPart_ = IncludesFractionalParts;
+  }
+
+  if (crossesZero && (std::isnan(l) || mozilla::IsNegative(l))) {
+    canBeNegativeZero_ = IncludesNegativeZero;
+  }
+
+  optimize();
+}
+
+void Range::setDoubleSingleton(double d) {
+  setDouble(d, d);
+  assertInvariants();
+}
+
+static inline bool MissingAnyInt32Bounds(const Range* lhs, const Range* rhs) {
+  return !lhs->hasInt32Bounds() || !rhs->hasInt32Bounds();
+}
+
+Range* Range::add(TempAllocator& alloc, const Range* lhs, const Range* rhs) {
+  int64_t l = (int64_t)lhs->lower_ + (int64_t)rhs->lower_;
+  if (!lhs->hasInt32LowerBound() || !rhs->hasInt32LowerBound()) {
+    l = NoInt32LowerBound;
+  }
+
+  int64_t h = (int64_t)lhs->upper_ + (int64_t)rhs->upper_;
+  if (!lhs->hasInt32UpperBound() || !rhs->hasInt32UpperBound()) {
+    h = NoInt32UpperBound;
+  }
+
+  uint16_t e = std::max(lhs->max_exponent_, rhs->max_exponent_);
+  if (e <= Range::MaxFiniteExponent) {
+    ++e;
+  }
+
+  if (lhs->canBeInfiniteOrNaN() && rhs->canBeInfiniteOrNaN()) {
+    e = Range::IncludesInfinityAndNaN;
+  }
+
+  FractionalPartFlag canHaveFractionalPart = FractionalPartFlag(
+      lhs->canHaveFractionalPart() || rhs->canHaveFractionalPart());
+
+  NegativeZeroFlag canBeNegativeZero =
+      NegativeZeroFlag(lhs->canBeNegativeZero() && rhs->canBeNegativeZero());
+
+  if (l <= 0 && h >= 0 && canHaveFractionalPart) {
+    canBeNegativeZero = IncludesNegativeZero;
+  }
+
+  return new (alloc) Range(l, h, canHaveFractionalPart, canBeNegativeZero, e);
+}
+
+Range* Range::sub(TempAllocator& alloc, const Range* lhs, const Range* rhs) {
+  int64_t l = (int64_t)lhs->lower_ - (int64_t)rhs->upper_;
+  if (!lhs->hasInt32LowerBound() || !rhs->hasInt32UpperBound()) {
+    l = NoInt32LowerBound;
+  }
+
+  int64_t h = (int64_t)lhs->upper_ - (int64_t)rhs->lower_;
+  if (!lhs->hasInt32UpperBound() || !rhs->hasInt32LowerBound()) {
+    h = NoInt32UpperBound;
+  }
+
+  uint16_t e = std::max(lhs->max_exponent_, rhs->max_exponent_);
+  if (e <= Range::MaxFiniteExponent) {
+    ++e;
+  }
+
+  if (lhs->canBeInfiniteOrNaN() && rhs->canBeInfiniteOrNaN()) {
+    e = Range::IncludesInfinityAndNaN;
+  }
+
+  FractionalPartFlag canHaveFractionalPart = FractionalPartFlag(
+      lhs->canHaveFractionalPart() || rhs->canHaveFractionalPart());
+
+  NegativeZeroFlag canBeNegativeZero =
+      NegativeZeroFlag(lhs->canBeNegativeZero() && rhs->canBeZero());
+
+  if (l <= 0 && h >= 0 && canHaveFractionalPart) {
+    canBeNegativeZero = IncludesNegativeZero;
+  }
+
+  return new (alloc) Range(l, h, canHaveFractionalPart, canBeNegativeZero, e);
+}
+
+Range* Range::and_(TempAllocator& alloc, const Range* lhs, const Range* rhs) {
+  MOZ_ASSERT(lhs->isInt32());
+  MOZ_ASSERT(rhs->isInt32());
+
+  if (lhs->lower() < 0 && rhs->lower() < 0) {
+    return Range::NewInt32Range(alloc, INT32_MIN,
+                                std::max(lhs->upper(), rhs->upper()));
+  }
+
+  int32_t lower = 0;
+  int32_t upper = std::min(lhs->upper(), rhs->upper());
+
+  if (lhs->lower() < 0) {
+    upper = rhs->upper();
+  }
+  if (rhs->lower() < 0) {
+    upper = lhs->upper();
+  }
+
+  return Range::NewInt32Range(alloc, lower, upper);
+}
+
+Range* Range::or_(TempAllocator& alloc, const Range* lhs, const Range* rhs) {
+  MOZ_ASSERT(lhs->isInt32());
+  MOZ_ASSERT(rhs->isInt32());
+  if (lhs->lower() == lhs->upper()) {
+    if (lhs->lower() == 0) {
+      return new (alloc) Range(*rhs);
+    }
+    if (lhs->lower() == -1) {
+      return new (alloc) Range(*lhs);
+    }
+  }
+  if (rhs->lower() == rhs->upper()) {
+    if (rhs->lower() == 0) {
+      return new (alloc) Range(*lhs);
+    }
+    if (rhs->lower() == -1) {
+      return new (alloc) Range(*rhs);
+    }
+  }
+
+  MOZ_ASSERT_IF(lhs->lower() >= 0, lhs->upper() != 0);
+  MOZ_ASSERT_IF(rhs->lower() >= 0, rhs->upper() != 0);
+  MOZ_ASSERT_IF(lhs->upper() < 0, lhs->lower() != -1);
+  MOZ_ASSERT_IF(rhs->upper() < 0, rhs->lower() != -1);
+
+  int32_t lower = INT32_MIN;
+  int32_t upper = INT32_MAX;
+
+  if (lhs->lower() >= 0 && rhs->lower() >= 0) {
+    lower = std::max(lhs->lower(), rhs->lower());
+    upper = int32_t(UINT32_MAX >>
+                    std::min(std::countl_zero(uint32_t(lhs->upper())),
+                             std::countl_zero(uint32_t(rhs->upper()))));
+  } else {
+    if (lhs->upper() < 0) {
+      unsigned leadingOnes = std::countl_one(uint32_t(lhs->lower()));
+      lower = std::max(lower, ~int32_t(UINT32_MAX >> leadingOnes));
+      upper = -1;
+    }
+    if (rhs->upper() < 0) {
+      unsigned leadingOnes = std::countl_one(uint32_t(rhs->lower()));
+      lower = std::max(lower, ~int32_t(UINT32_MAX >> leadingOnes));
+      upper = -1;
+    }
+  }
+
+  return Range::NewInt32Range(alloc, lower, upper);
+}
+
+Range* Range::xor_(TempAllocator& alloc, const Range* lhs, const Range* rhs) {
+  MOZ_ASSERT(lhs->isInt32());
+  MOZ_ASSERT(rhs->isInt32());
+  int32_t lhsLower = lhs->lower();
+  int32_t lhsUpper = lhs->upper();
+  int32_t rhsLower = rhs->lower();
+  int32_t rhsUpper = rhs->upper();
+  bool invertAfter = false;
+
+  if (lhsUpper < 0) {
+    lhsLower = ~lhsLower;
+    lhsUpper = ~lhsUpper;
+    std::swap(lhsLower, lhsUpper);
+    invertAfter = !invertAfter;
+  }
+  if (rhsUpper < 0) {
+    rhsLower = ~rhsLower;
+    rhsUpper = ~rhsUpper;
+    std::swap(rhsLower, rhsUpper);
+    invertAfter = !invertAfter;
+  }
+
+  int32_t lower = INT32_MIN;
+  int32_t upper = INT32_MAX;
+  if (lhsLower == 0 && lhsUpper == 0) {
+    upper = rhsUpper;
+    lower = rhsLower;
+  } else if (rhsLower == 0 && rhsUpper == 0) {
+    upper = lhsUpper;
+    lower = lhsLower;
+  } else if (lhsLower >= 0 && rhsLower >= 0) {
+    lower = 0;
+    unsigned lhsLeadingZeros = std::countl_zero(uint32_t(lhsUpper));
+    unsigned rhsLeadingZeros = std::countl_zero(uint32_t(rhsUpper));
+    upper = std::min(rhsUpper | int32_t(UINT32_MAX >> lhsLeadingZeros),
+                     lhsUpper | int32_t(UINT32_MAX >> rhsLeadingZeros));
+  }
+
+  if (invertAfter) {
+    lower = ~lower;
+    upper = ~upper;
+    std::swap(lower, upper);
+  }
+
+  return Range::NewInt32Range(alloc, lower, upper);
+}
+
+Range* Range::not_(TempAllocator& alloc, const Range* op) {
+  MOZ_ASSERT(op->isInt32());
+  return Range::NewInt32Range(alloc, ~op->upper(), ~op->lower());
+}
+
+Range* Range::mul(TempAllocator& alloc, const Range* lhs, const Range* rhs) {
+  FractionalPartFlag newCanHaveFractionalPart = FractionalPartFlag(
+      lhs->canHaveFractionalPart_ || rhs->canHaveFractionalPart_);
+
+  NegativeZeroFlag newMayIncludeNegativeZero = NegativeZeroFlag(
+      (lhs->canHaveSignBitSet() && rhs->canBeFiniteNonNegative()) ||
+      (rhs->canHaveSignBitSet() && lhs->canBeFiniteNonNegative()));
+
+  uint16_t exponent;
+  if (!lhs->canBeInfiniteOrNaN() && !rhs->canBeInfiniteOrNaN()) {
+    exponent = lhs->numBits() + rhs->numBits() - 1;
+    if (exponent > Range::MaxFiniteExponent) {
+      exponent = Range::IncludesInfinity;
+    }
+  } else if (!lhs->canBeNaN() && !rhs->canBeNaN() &&
+             !(lhs->canBeZero() && rhs->canBeInfiniteOrNaN()) &&
+             !(rhs->canBeZero() && lhs->canBeInfiniteOrNaN())) {
+    exponent = Range::IncludesInfinity;
+  } else {
+    exponent = Range::IncludesInfinityAndNaN;
+  }
+
+  if (MissingAnyInt32Bounds(lhs, rhs)) {
+    return new (alloc)
+        Range(NoInt32LowerBound, NoInt32UpperBound, newCanHaveFractionalPart,
+              newMayIncludeNegativeZero, exponent);
+  }
+  int64_t a = (int64_t)lhs->lower() * (int64_t)rhs->lower();
+  int64_t b = (int64_t)lhs->lower() * (int64_t)rhs->upper();
+  int64_t c = (int64_t)lhs->upper() * (int64_t)rhs->lower();
+  int64_t d = (int64_t)lhs->upper() * (int64_t)rhs->upper();
+  return new (alloc)
+      Range(std::min(std::min(a, b), std::min(c, d)),
+            std::max(std::max(a, b), std::max(c, d)), newCanHaveFractionalPart,
+            newMayIncludeNegativeZero, exponent);
+}
+
+Range* Range::lsh(TempAllocator& alloc, const Range* lhs, int32_t c) {
+  MOZ_ASSERT(lhs->isInt32());
+  int32_t shift = c & 0x1f;
+
+  if ((int32_t)((uint32_t)lhs->lower() << shift << 1 >> shift >> 1) ==
+          lhs->lower() &&
+      (int32_t)((uint32_t)lhs->upper() << shift << 1 >> shift >> 1) ==
+          lhs->upper()) {
+    return Range::NewInt32Range(alloc, uint32_t(lhs->lower()) << shift,
+                                uint32_t(lhs->upper()) << shift);
+  }
+
+  return Range::NewInt32Range(alloc, INT32_MIN, INT32_MAX);
+}
+
+Range* Range::rsh(TempAllocator& alloc, const Range* lhs, int32_t c) {
+  MOZ_ASSERT(lhs->isInt32());
+  int32_t shift = c & 0x1f;
+  return Range::NewInt32Range(alloc, lhs->lower() >> shift,
+                              lhs->upper() >> shift);
+}
+
+Range* Range::ursh(TempAllocator& alloc, const Range* lhs, int32_t c) {
+  MOZ_ASSERT(lhs->isInt32());
+
+  int32_t shift = c & 0x1f;
+
+  if (lhs->isFiniteNonNegative() || lhs->isFiniteNegative()) {
+    return Range::NewUInt32Range(alloc, uint32_t(lhs->lower()) >> shift,
+                                 uint32_t(lhs->upper()) >> shift);
+  }
+
+  return Range::NewUInt32Range(alloc, 0, UINT32_MAX >> shift);
+}
+
+Range* Range::lsh(TempAllocator& alloc, const Range* lhs, const Range* rhs) {
+  MOZ_ASSERT(lhs->isInt32());
+  MOZ_ASSERT(rhs->isInt32());
+  return Range::NewInt32Range(alloc, INT32_MIN, INT32_MAX);
+}
+
+Range* Range::rsh(TempAllocator& alloc, const Range* lhs, const Range* rhs) {
+  MOZ_ASSERT(lhs->isInt32());
+  MOZ_ASSERT(rhs->isInt32());
+
+  int32_t shiftLower = rhs->lower();
+  int32_t shiftUpper = rhs->upper();
+  if ((int64_t(shiftUpper) - int64_t(shiftLower)) >= 31) {
+    shiftLower = 0;
+    shiftUpper = 31;
+  } else {
+    shiftLower &= 0x1f;
+    shiftUpper &= 0x1f;
+    if (shiftLower > shiftUpper) {
+      shiftLower = 0;
+      shiftUpper = 31;
+    }
+  }
+  MOZ_ASSERT(shiftLower >= 0 && shiftUpper <= 31);
+
+  int32_t lhsLower = lhs->lower();
+  int32_t min = lhsLower < 0 ? lhsLower >> shiftLower : lhsLower >> shiftUpper;
+  int32_t lhsUpper = lhs->upper();
+  int32_t max = lhsUpper >= 0 ? lhsUpper >> shiftLower : lhsUpper >> shiftUpper;
+
+  return Range::NewInt32Range(alloc, min, max);
+}
+
+Range* Range::ursh(TempAllocator& alloc, const Range* lhs, const Range* rhs) {
+  MOZ_ASSERT(lhs->isInt32());
+  MOZ_ASSERT(rhs->isInt32());
+  return Range::NewUInt32Range(
+      alloc, 0, lhs->isFiniteNonNegative() ? lhs->upper() : UINT32_MAX);
+}
+
+Range* Range::abs(TempAllocator& alloc, const Range* op) {
+  int32_t l = op->lower_;
+  int32_t u = op->upper_;
+  FractionalPartFlag canHaveFractionalPart = op->canHaveFractionalPart_;
+
+  NegativeZeroFlag canBeNegativeZero = ExcludesNegativeZero;
+
+  return new (alloc) Range(
+      std::max(std::max(int32_t(0), l), u == INT32_MIN ? INT32_MAX : -u), true,
+      std::max(std::max(int32_t(0), u), l == INT32_MIN ? INT32_MAX : -l),
+      op->hasInt32Bounds() && l != INT32_MIN, canHaveFractionalPart,
+      canBeNegativeZero, op->max_exponent_);
+}
+
+Range* Range::min(TempAllocator& alloc, const Range* lhs, const Range* rhs) {
+  if (lhs->canBeNaN() || rhs->canBeNaN()) {
+    return nullptr;
+  }
+
+  FractionalPartFlag newCanHaveFractionalPart = FractionalPartFlag(
+      lhs->canHaveFractionalPart_ || rhs->canHaveFractionalPart_);
+  NegativeZeroFlag newMayIncludeNegativeZero =
+      NegativeZeroFlag(lhs->canBeNegativeZero_ || rhs->canBeNegativeZero_);
+
+  return new (alloc) Range(std::min(lhs->lower_, rhs->lower_),
+                           lhs->hasInt32LowerBound_ && rhs->hasInt32LowerBound_,
+                           std::min(lhs->upper_, rhs->upper_),
+                           lhs->hasInt32UpperBound_ || rhs->hasInt32UpperBound_,
+                           newCanHaveFractionalPart, newMayIncludeNegativeZero,
+                           std::max(lhs->max_exponent_, rhs->max_exponent_));
+}
+
+Range* Range::max(TempAllocator& alloc, const Range* lhs, const Range* rhs) {
+  if (lhs->canBeNaN() || rhs->canBeNaN()) {
+    return nullptr;
+  }
+
+  FractionalPartFlag newCanHaveFractionalPart = FractionalPartFlag(
+      lhs->canHaveFractionalPart_ || rhs->canHaveFractionalPart_);
+  NegativeZeroFlag newMayIncludeNegativeZero =
+      NegativeZeroFlag(lhs->canBeNegativeZero_ || rhs->canBeNegativeZero_);
+
+  return new (alloc) Range(std::max(lhs->lower_, rhs->lower_),
+                           lhs->hasInt32LowerBound_ || rhs->hasInt32LowerBound_,
+                           std::max(lhs->upper_, rhs->upper_),
+                           lhs->hasInt32UpperBound_ && rhs->hasInt32UpperBound_,
+                           newCanHaveFractionalPart, newMayIncludeNegativeZero,
+                           std::max(lhs->max_exponent_, rhs->max_exponent_));
+}
+
+Range* Range::floor(TempAllocator& alloc, const Range* op) {
+  Range* copy = new (alloc) Range(*op);
+  if (op->canHaveFractionalPart() && op->hasInt32LowerBound()) {
+    copy->setLowerInit(int64_t(copy->lower_) - 1);
+  }
+
+  if (copy->hasInt32Bounds())
+    copy->max_exponent_ = copy->exponentImpliedByInt32Bounds();
+  else if (copy->max_exponent_ < MaxFiniteExponent)
+    copy->max_exponent_++;
+
+  copy->canHaveFractionalPart_ = ExcludesFractionalParts;
+  copy->assertInvariants();
+  return copy;
+}
+
+Range* Range::ceil(TempAllocator& alloc, const Range* op) {
+  Range* copy = new (alloc) Range(*op);
+
+  if (copy->hasInt32Bounds()) {
+    copy->max_exponent_ = copy->exponentImpliedByInt32Bounds();
+  } else if (copy->max_exponent_ < MaxFiniteExponent) {
+    copy->max_exponent_++;
+  }
+
+
+  copy->canBeNegativeZero_ = ((copy->lower_ > 0) || (copy->upper_ <= -1))
+                                 ? copy->canBeNegativeZero_
+                                 : IncludesNegativeZero;
+
+  copy->canHaveFractionalPart_ = ExcludesFractionalParts;
+  copy->assertInvariants();
+  return copy;
+}
+
+Range* Range::sign(TempAllocator& alloc, const Range* op) {
+  if (op->canBeNaN()) {
+    return nullptr;
+  }
+
+  return new (alloc)
+      Range(std::clamp(op->lower_, -1, 1), std::clamp(op->upper_, -1, 1),
+            Range::ExcludesFractionalParts,
+            NegativeZeroFlag(op->canBeNegativeZero()), 0);
+}
+
+Range* Range::NaNToZero(TempAllocator& alloc, const Range* op) {
+  Range* copy = new (alloc) Range(*op);
+  if (copy->canBeNaN()) {
+    copy->max_exponent_ = Range::IncludesInfinity;
+    if (!copy->canBeZero()) {
+      Range zero;
+      zero.setDoubleSingleton(0);
+      copy->unionWith(&zero);
+    }
+  }
+  copy->refineToExcludeNegativeZero();
+  return copy;
+}
+
+bool Range::negativeZeroMul(const Range* lhs, const Range* rhs) {
+  return (lhs->canHaveSignBitSet() && rhs->canBeFiniteNonNegative()) ||
+         (rhs->canHaveSignBitSet() && lhs->canBeFiniteNonNegative());
+}
+
+bool Range::update(const Range* other) {
+  bool changed = lower_ != other->lower_ ||
+                 hasInt32LowerBound_ != other->hasInt32LowerBound_ ||
+                 upper_ != other->upper_ ||
+                 hasInt32UpperBound_ != other->hasInt32UpperBound_ ||
+                 canHaveFractionalPart_ != other->canHaveFractionalPart_ ||
+                 canBeNegativeZero_ != other->canBeNegativeZero_ ||
+                 max_exponent_ != other->max_exponent_;
+  if (changed) {
+    lower_ = other->lower_;
+    hasInt32LowerBound_ = other->hasInt32LowerBound_;
+    upper_ = other->upper_;
+    hasInt32UpperBound_ = other->hasInt32UpperBound_;
+    canHaveFractionalPart_ = other->canHaveFractionalPart_;
+    canBeNegativeZero_ = other->canBeNegativeZero_;
+    max_exponent_ = other->max_exponent_;
+    assertInvariants();
+  }
+
+  return changed;
+}
+
+
+void MPhi::computeRange(TempAllocator& alloc) {
+  if (type() != MIRType::Int32 && type() != MIRType::Double) {
+    return;
+  }
+
+  Range* range = nullptr;
+  for (size_t i = 0, e = numOperands(); i < e; i++) {
+    if (getOperand(i)->block()->unreachable()) {
+      JitSpew(JitSpew_Range, "Ignoring unreachable input %u",
+              getOperand(i)->id());
+      continue;
+    }
+
+    if (!getOperand(i)->range()) {
+      return;
+    }
+
+    Range input(getOperand(i));
+
+    if (range) {
+      range->unionWith(&input);
+    } else {
+      range = new (alloc) Range(input);
+    }
+  }
+
+  setRange(range);
+}
+
+void MBeta::computeRange(TempAllocator& alloc) {
+  bool emptyRange = false;
+
+  Range opRange(getOperand(0));
+  Range* range = Range::intersect(alloc, &opRange, comparison_, &emptyRange);
+  if (emptyRange) {
+    JitSpew(JitSpew_Range, "Marking block for inst %u unreachable", id());
+    block()->setUnreachableUnchecked();
+  } else {
+    setRange(range);
+  }
+}
+
+void MConstant::computeRange(TempAllocator& alloc) {
+  if (isTypeRepresentableAsDouble()) {
+    double d = numberToDouble();
+    setRange(Range::NewDoubleSingletonRange(alloc, d));
+  } else if (type() == MIRType::Boolean) {
+    bool b = toBoolean();
+    setRange(Range::NewInt32Range(alloc, b, b));
+  }
+}
+
+void MCharCodeAt::computeRange(TempAllocator& alloc) {
+  setRange(Range::NewInt32Range(alloc, 0, unicode::UTF16Max));
+}
+
+void MCodePointAt::computeRange(TempAllocator& alloc) {
+  setRange(Range::NewInt32Range(alloc, 0, unicode::NonBMPMax));
+}
+
+void MClampToUint8::computeRange(TempAllocator& alloc) {
+  setRange(Range::NewUInt32Range(alloc, 0, 255));
+}
+
+void MBitAnd::computeRange(TempAllocator& alloc) {
+  if (type() != MIRType::Int32) {
+    return;
+  }
+
+  Range left(getOperand(0));
+  Range right(getOperand(1));
+  left.wrapAroundToInt32();
+  right.wrapAroundToInt32();
+
+  setRange(Range::and_(alloc, &left, &right));
+}
+
+void MBitOr::computeRange(TempAllocator& alloc) {
+  if (type() != MIRType::Int32) {
+    return;
+  }
+
+  Range left(getOperand(0));
+  Range right(getOperand(1));
+  left.wrapAroundToInt32();
+  right.wrapAroundToInt32();
+
+  setRange(Range::or_(alloc, &left, &right));
+}
+
+void MBitXor::computeRange(TempAllocator& alloc) {
+  if (type() != MIRType::Int32) {
+    return;
+  }
+
+  Range left(getOperand(0));
+  Range right(getOperand(1));
+  left.wrapAroundToInt32();
+  right.wrapAroundToInt32();
+
+  setRange(Range::xor_(alloc, &left, &right));
+}
+
+void MBitNot::computeRange(TempAllocator& alloc) {
+  if (type() == MIRType::Int64) {
+    return;
+  }
+  MOZ_ASSERT(type() == MIRType::Int32);
+
+  Range op(getOperand(0));
+  op.wrapAroundToInt32();
+
+  setRange(Range::not_(alloc, &op));
+}
+
+void MLsh::computeRange(TempAllocator& alloc) {
+  if (type() != MIRType::Int32) {
+    return;
+  }
+
+  Range left(getOperand(0));
+  Range right(getOperand(1));
+  left.wrapAroundToInt32();
+
+  MConstant* rhsConst = getOperand(1)->maybeConstantValue();
+  if (rhsConst && rhsConst->type() == MIRType::Int32) {
+    int32_t c = rhsConst->toInt32();
+    setRange(Range::lsh(alloc, &left, c));
+    return;
+  }
+
+  right.wrapAroundToShiftCount();
+  setRange(Range::lsh(alloc, &left, &right));
+}
+
+void MRsh::computeRange(TempAllocator& alloc) {
+  if (type() != MIRType::Int32) {
+    return;
+  }
+
+  Range left(getOperand(0));
+  Range right(getOperand(1));
+  left.wrapAroundToInt32();
+
+  MConstant* rhsConst = getOperand(1)->maybeConstantValue();
+  if (rhsConst && rhsConst->type() == MIRType::Int32) {
+    int32_t c = rhsConst->toInt32();
+    setRange(Range::rsh(alloc, &left, c));
+    return;
+  }
+
+  right.wrapAroundToShiftCount();
+  setRange(Range::rsh(alloc, &left, &right));
+}
+
+void MUrsh::computeRange(TempAllocator& alloc) {
+  if (type() != MIRType::Int32) {
+    return;
+  }
+
+  Range left(getOperand(0));
+  Range right(getOperand(1));
+
+  left.wrapAroundToInt32();
+  right.wrapAroundToShiftCount();
+
+  MConstant* rhsConst = getOperand(1)->maybeConstantValue();
+  if (rhsConst && rhsConst->type() == MIRType::Int32) {
+    int32_t c = rhsConst->toInt32();
+    setRange(Range::ursh(alloc, &left, c));
+  } else {
+    setRange(Range::ursh(alloc, &left, &right));
+  }
+
+  MOZ_ASSERT(range()->lower() >= 0);
+}
+
+void MAbs::computeRange(TempAllocator& alloc) {
+  if (type() != MIRType::Int32 && type() != MIRType::Double) {
+    return;
+  }
+
+  Range other(getOperand(0));
+  Range* next = Range::abs(alloc, &other);
+  if (implicitTruncate_) {
+    next->wrapAroundToInt32();
+  }
+  setRange(next);
+}
+
+void MFloor::computeRange(TempAllocator& alloc) {
+  Range other(getOperand(0));
+  setRange(Range::floor(alloc, &other));
+}
+
+void MCeil::computeRange(TempAllocator& alloc) {
+  Range other(getOperand(0));
+  setRange(Range::ceil(alloc, &other));
+}
+
+void MClz::computeRange(TempAllocator& alloc) {
+  if (type() != MIRType::Int32) {
+    return;
+  }
+  setRange(Range::NewUInt32Range(alloc, 0, 32));
+}
+
+void MCtz::computeRange(TempAllocator& alloc) {
+  if (type() != MIRType::Int32) {
+    return;
+  }
+  setRange(Range::NewUInt32Range(alloc, 0, 32));
+}
+
+void MPopcnt::computeRange(TempAllocator& alloc) {
+  if (type() != MIRType::Int32) {
+    return;
+  }
+  setRange(Range::NewUInt32Range(alloc, 0, 32));
+}
+
+void MMinMax::computeRange(TempAllocator& alloc) {
+  if (type() != MIRType::Int32 && type() != MIRType::Double) {
+    return;
+  }
+
+  Range left(getOperand(0));
+  Range right(getOperand(1));
+  setRange(isMax() ? Range::max(alloc, &left, &right)
+                   : Range::min(alloc, &left, &right));
+}
+
+void MAdd::computeRange(TempAllocator& alloc) {
+  if (type() != MIRType::Int32 && type() != MIRType::Double) {
+    return;
+  }
+  Range left(getOperand(0));
+  Range right(getOperand(1));
+  Range* next = Range::add(alloc, &left, &right);
+  if (isTruncated()) {
+    next->wrapAroundToInt32();
+  }
+  setRange(next);
+}
+
+void MSub::computeRange(TempAllocator& alloc) {
+  if (type() != MIRType::Int32 && type() != MIRType::Double) {
+    return;
+  }
+  Range left(getOperand(0));
+  Range right(getOperand(1));
+  Range* next = Range::sub(alloc, &left, &right);
+  if (isTruncated()) {
+    next->wrapAroundToInt32();
+  }
+  setRange(next);
+}
+
+void MMul::computeRange(TempAllocator& alloc) {
+  if (type() != MIRType::Int32 && type() != MIRType::Double) {
+    return;
+  }
+  Range left(getOperand(0));
+  Range right(getOperand(1));
+  if (canBeNegativeZero()) {
+    canBeNegativeZero_ = Range::negativeZeroMul(&left, &right);
+  }
+  Range* next = Range::mul(alloc, &left, &right);
+  if (!next->canBeNegativeZero()) {
+    canBeNegativeZero_ = false;
+  }
+  if (isTruncated()) {
+    next->wrapAroundToInt32();
+  }
+  setRange(next);
+}
+
+void MMod::computeRange(TempAllocator& alloc) {
+  if (type() != MIRType::Int32 && type() != MIRType::Double) {
+    return;
+  }
+  Range lhs(getOperand(0));
+  Range rhs(getOperand(1));
+
+  if (!lhs.hasInt32Bounds() || !rhs.hasInt32Bounds()) {
+    return;
+  }
+
+  if (rhs.lower() <= 0 && rhs.upper() >= 0) {
+    return;
+  }
+
+  if (type() == MIRType::Int32 && rhs.lower() > 0) {
+    bool hasDoubles = lhs.lower() < 0 || lhs.canHaveFractionalPart() ||
+                      rhs.canHaveFractionalPart();
+    bool hasUint32s =
+        IsUint32Type(getOperand(0)) &&
+        getOperand(1)->type() == MIRType::Int32 &&
+        (IsUint32Type(getOperand(1)) || getOperand(1)->isConstant());
+    if (!hasDoubles || hasUint32s) {
+      unsigned_ = true;
+    }
+  }
+
+  if (unsigned_) {
+    uint32_t lhsBound = std::max<uint32_t>(lhs.lower(), lhs.upper());
+    uint32_t rhsBound = std::max<uint32_t>(rhs.lower(), rhs.upper());
+
+    if (lhs.lower() <= -1 && lhs.upper() >= -1) {
+      lhsBound = UINT32_MAX;
+    }
+    if (rhs.lower() <= -1 && rhs.upper() >= -1) {
+      rhsBound = UINT32_MAX;
+    }
+
+    MOZ_ASSERT(!lhs.canHaveFractionalPart() && !rhs.canHaveFractionalPart());
+    --rhsBound;
+
+    setRange(Range::NewUInt32Range(alloc, 0, std::min(lhsBound, rhsBound)));
+    return;
+  }
+
+  int64_t a = Abs<int64_t>(rhs.lower());
+  int64_t b = Abs<int64_t>(rhs.upper());
+  if (a == 0 && b == 0) {
+    return;
+  }
+  int64_t rhsAbsBound = std::max(a, b);
+
+  if (!lhs.canHaveFractionalPart() && !rhs.canHaveFractionalPart()) {
+    --rhsAbsBound;
+  }
+
+  int64_t lhsAbsBound =
+      std::max(Abs<int64_t>(lhs.lower()), Abs<int64_t>(lhs.upper()));
+
+  int64_t absBound = std::min(lhsAbsBound, rhsAbsBound);
+
+  int64_t lower = lhs.lower() >= 0 ? 0 : -absBound;
+  int64_t upper = lhs.upper() <= 0 ? 0 : absBound;
+
+  Range::FractionalPartFlag newCanHaveFractionalPart =
+      Range::FractionalPartFlag(lhs.canHaveFractionalPart() ||
+                                rhs.canHaveFractionalPart());
+
+  Range::NegativeZeroFlag newMayIncludeNegativeZero =
+      Range::NegativeZeroFlag(lhs.canHaveSignBitSet());
+
+  setRange(new (alloc) Range(lower, upper, newCanHaveFractionalPart,
+                             newMayIncludeNegativeZero,
+                             std::min(lhs.exponent(), rhs.exponent())));
+}
+
+void MDiv::computeRange(TempAllocator& alloc) {
+  if (type() != MIRType::Int32 && type() != MIRType::Double) {
+    return;
+  }
+  Range lhs(getOperand(0));
+  Range rhs(getOperand(1));
+
+  if (!lhs.hasInt32Bounds() || !rhs.hasInt32Bounds()) {
+    return;
+  }
+
+  if (lhs.lower() >= 0 && rhs.lower() >= 1) {
+    setRange(new (alloc) Range(0, lhs.upper(), Range::IncludesFractionalParts,
+                               Range::IncludesNegativeZero, lhs.exponent()));
+  } else if (unsigned_ && rhs.lower() >= 1) {
+    MOZ_ASSERT(!lhs.canHaveFractionalPart() && !rhs.canHaveFractionalPart());
+    MOZ_ASSERT(!lhs.canBeNegativeZero() && !rhs.canBeNegativeZero());
+    setRange(Range::NewUInt32Range(alloc, 0, UINT32_MAX));
+  }
+}
+
+void MSqrt::computeRange(TempAllocator& alloc) {
+  Range input(getOperand(0));
+
+  if (!input.hasInt32Bounds()) {
+    return;
+  }
+
+  if (input.lower() < 0) {
+    return;
+  }
+
+  setRange(new (alloc) Range(0, input.upper(), Range::IncludesFractionalParts,
+                             input.canBeNegativeZero(), input.exponent()));
+}
+
+void MToDouble::computeRange(TempAllocator& alloc) {
+  setRange(new (alloc) Range(getOperand(0)));
+}
+
+void MToFloat32::computeRange(TempAllocator& alloc) {}
+
+void MTruncateToInt32::computeRange(TempAllocator& alloc) {
+  Range* output = new (alloc) Range(getOperand(0));
+  output->wrapAroundToInt32();
+  setRange(output);
+}
+
+void MToNumberInt32::computeRange(TempAllocator& alloc) {
+  setRange(new (alloc) Range(getOperand(0)));
+}
+
+void MBooleanToInt32::computeRange(TempAllocator& alloc) {
+  setRange(Range::NewUInt32Range(alloc, 0, 1));
+}
+
+void MLimitedTruncate::computeRange(TempAllocator& alloc) {
+  Range* output = new (alloc) Range(input());
+  setRange(output);
+}
+
+static Range* GetArrayBufferViewRange(TempAllocator& alloc, Scalar::Type type) {
+  switch (type) {
+    case Scalar::Uint8Clamped:
+    case Scalar::Uint8:
+      return Range::NewUInt32Range(alloc, 0, UINT8_MAX);
+    case Scalar::Uint16:
+      return Range::NewUInt32Range(alloc, 0, UINT16_MAX);
+    case Scalar::Uint32:
+      return Range::NewUInt32Range(alloc, 0, UINT32_MAX);
+
+    case Scalar::Int8:
+      return Range::NewInt32Range(alloc, INT8_MIN, INT8_MAX);
+    case Scalar::Int16:
+      return Range::NewInt32Range(alloc, INT16_MIN, INT16_MAX);
+    case Scalar::Int32:
+      return Range::NewInt32Range(alloc, INT32_MIN, INT32_MAX);
+
+    case Scalar::BigInt64:
+    case Scalar::BigUint64:
+    case Scalar::Int64:
+    case Scalar::Simd128:
+    case Scalar::Float16:
+    case Scalar::Float32:
+    case Scalar::Float64:
+    case Scalar::MaxTypedArrayViewType:
+      break;
+  }
+  return nullptr;
+}
+
+void MLoadUnboxedScalar::computeRange(TempAllocator& alloc) {
+  setRange(GetArrayBufferViewRange(alloc, storageType()));
+}
+
+void MLoadDataViewElement::computeRange(TempAllocator& alloc) {
+  setRange(GetArrayBufferViewRange(alloc, storageType()));
+}
+
+void MArrayLength::computeRange(TempAllocator& alloc) {
+  MOZ_ASSERT(type() == MIRType::Int32);
+  setRange(Range::NewUInt32Range(alloc, 0, INT32_MAX));
+}
+
+void MInitializedLength::computeRange(TempAllocator& alloc) {
+  setRange(
+      Range::NewUInt32Range(alloc, 0, NativeObject::MAX_DENSE_ELEMENTS_COUNT));
+}
+
+void MArrayBufferViewLength::computeRange(TempAllocator& alloc) {
+  if constexpr (ArrayBufferObject::ByteLengthLimit <= INT32_MAX) {
+    setRange(Range::NewUInt32Range(alloc, 0, INT32_MAX));
+  }
+}
+
+void MArrayBufferViewByteOffset::computeRange(TempAllocator& alloc) {
+  if constexpr (ArrayBufferObject::ByteLengthLimit <= INT32_MAX) {
+    setRange(Range::NewUInt32Range(alloc, 0, INT32_MAX));
+  }
+}
+
+void MResizableTypedArrayLength::computeRange(TempAllocator& alloc) {
+  if constexpr (ArrayBufferObject::ByteLengthLimit <= INT32_MAX) {
+    setRange(Range::NewUInt32Range(alloc, 0, INT32_MAX));
+  }
+}
+
+void MResizableDataViewByteLength::computeRange(TempAllocator& alloc) {
+  if constexpr (ArrayBufferObject::ByteLengthLimit <= INT32_MAX) {
+    setRange(Range::NewUInt32Range(alloc, 0, INT32_MAX));
+  }
+}
+
+void MTypedArrayElementSize::computeRange(TempAllocator& alloc) {
+  constexpr auto MaxTypedArraySize = sizeof(double);
+
+#define ASSERT_MAX_SIZE(_, T, N)                \
+  static_assert(sizeof(T) <= MaxTypedArraySize, \
+                "unexpected typed array type exceeding 64-bits storage");
+  JS_FOR_EACH_TYPED_ARRAY(ASSERT_MAX_SIZE)
+#undef ASSERT_MAX_SIZE
+
+  setRange(Range::NewUInt32Range(alloc, 0, MaxTypedArraySize));
+}
+
+void MStringLength::computeRange(TempAllocator& alloc) {
+  static_assert(JSString::MAX_LENGTH <= UINT32_MAX,
+                "NewUInt32Range requires a uint32 value");
+  setRange(Range::NewUInt32Range(alloc, 0, JSString::MAX_LENGTH));
+}
+
+void MArgumentsLength::computeRange(TempAllocator& alloc) {
+  static_assert(ARGS_LENGTH_MAX <= UINT32_MAX,
+                "NewUInt32Range requires a uint32 value");
+  setRange(Range::NewUInt32Range(alloc, 0, ARGS_LENGTH_MAX));
+}
+
+void MBoundsCheck::computeRange(TempAllocator& alloc) {
+  setRange(new (alloc) Range(index()));
+}
+
+void MSpectreMaskIndex::computeRange(TempAllocator& alloc) {
+  setRange(new (alloc) Range(index()));
+}
+
+void MInt32ToIntPtr::computeRange(TempAllocator& alloc) {
+  setRange(new (alloc) Range(input()));
+}
+
+void MNonNegativeIntPtrToInt32::computeRange(TempAllocator& alloc) {
+  setRange(Range::NewUInt32Range(alloc, 0, INT32_MAX));
+}
+
+void MArrayPush::computeRange(TempAllocator& alloc) {
+  MOZ_ASSERT(type() == MIRType::Int32);
+  setRange(Range::NewUInt32Range(alloc, 0, INT32_MAX));
+}
+
+void MMathFunction::computeRange(TempAllocator& alloc) {
+  Range opRange(getOperand(0));
+  switch (function()) {
+    case UnaryMathFunction::SinNative:
+    case UnaryMathFunction::SinFdlibm:
+    case UnaryMathFunction::CosNative:
+    case UnaryMathFunction::CosFdlibm:
+      if (!opRange.canBeInfiniteOrNaN()) {
+        setRange(Range::NewDoubleRange(alloc, -1.0, 1.0));
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+void MSign::computeRange(TempAllocator& alloc) {
+  Range opRange(getOperand(0));
+  setRange(Range::sign(alloc, &opRange));
+}
+
+void MRandom::computeRange(TempAllocator& alloc) {
+  Range* r = Range::NewDoubleRange(alloc, 0.0, 1.0);
+
+  r->refineToExcludeNegativeZero();
+
+  setRange(r);
+}
+
+void MNaNToZero::computeRange(TempAllocator& alloc) {
+  Range other(input());
+  setRange(Range::NaNToZero(alloc, &other));
+}
+
+
+static BranchDirection NegateBranchDirection(BranchDirection dir) {
+  return (dir == FALSE_BRANCH) ? TRUE_BRANCH : FALSE_BRANCH;
+}
+
+bool RangeAnalysis::analyzeLoop(const MBasicBlock* header) {
+  MOZ_ASSERT(header->hasUniqueBackedge());
+
+  MBasicBlock* backedge = header->backedge();
+
+  if (backedge == header) {
+    return true;
+  }
+
+  bool canOsr;
+  size_t numBlocks = MarkLoopBlocks(graph_, header, &canOsr);
+
+  if (numBlocks == 0) {
+    return true;
+  }
+
+  LoopIterationBound* iterationBound = nullptr;
+
+  MBasicBlock* block = backedge;
+  do {
+    BranchDirection direction;
+    MTest* branch = block->immediateDominatorBranch(&direction);
+
+    if (block == block->immediateDominator()) {
+      break;
+    }
+
+    block = block->immediateDominator();
+
+    if (branch) {
+      direction = NegateBranchDirection(direction);
+      MBasicBlock* otherBlock = branch->branchSuccessor(direction);
+      if (!otherBlock->isMarked()) {
+        if (!alloc().ensureBallast()) {
+          return false;
+        }
+        iterationBound = analyzeLoopIterationCount(header, branch, direction);
+        if (iterationBound) {
+          break;
+        }
+      }
+    }
+  } while (block != header);
+
+  if (!iterationBound) {
+    UnmarkLoopBlocks(graph_, header);
+    return true;
+  }
+
+  if (!loopIterationBounds.append(iterationBound)) {
+    return false;
+  }
+
+#ifdef DEBUG
+  if (JitSpewEnabled(JitSpew_Range)) {
+    Sprinter sp(GetJitContext()->cx);
+    if (!sp.init()) {
+      return false;
+    }
+    iterationBound->boundSum.dump(sp);
+    JS::UniqueChars str = sp.release();
+    if (!str) {
+      return false;
+    }
+    JitSpew(JitSpew_Range, "computed symbolic bound on backedges: %s",
+            str.get());
+  }
+#endif
+
+
+  for (MPhiIterator iter(header->phisBegin()); iter != header->phisEnd();
+       iter++) {
+    analyzeLoopPhi(iterationBound, *iter);
+  }
+
+  if (!mir->compilingWasm() && !mir->outerInfo().hadBoundsCheckBailout()) {
+
+    Vector<MBoundsCheck*, 0, JitAllocPolicy> hoistedChecks(alloc());
+
+    for (ReversePostorderIterator iter(graph_.rpoBegin(header));
+         iter != graph_.rpoEnd(); iter++) {
+      if (mir->shouldCancel("RangeAnalysis analyzeLoop")) {
+        return false;
+      }
+
+      MBasicBlock* block = *iter;
+      if (!block->isMarked()) {
+        continue;
+      }
+
+      for (MDefinitionIterator iter(block); iter; iter++) {
+        MDefinition* def = *iter;
+        if (def->isBoundsCheck() && def->isMovable()) {
+          if (!alloc().ensureBallast()) {
+            return false;
+          }
+          if (tryHoistBoundsCheck(header, def->toBoundsCheck())) {
+            if (!hoistedChecks.append(def->toBoundsCheck())) {
+              return false;
+            }
+          }
+        }
+      }
+    }
+
+    for (size_t i = 0; i < hoistedChecks.length(); i++) {
+      MBoundsCheck* ins = hoistedChecks[i];
+      ins->replaceAllUsesWith(ins->index());
+      ins->block()->discard(ins);
+    }
+  }
+
+  UnmarkLoopBlocks(graph_, header);
+  return true;
+}
+
+static inline MDefinition* DefinitionOrBetaInputDefinition(MDefinition* ins) {
+  while (ins->isBeta()) {
+    ins = ins->toBeta()->input();
+  }
+  return ins;
+}
+
+LoopIterationBound* RangeAnalysis::analyzeLoopIterationCount(
+    const MBasicBlock* header, const MTest* test, BranchDirection direction) {
+  SimpleLinearSum lhs(nullptr, 0);
+  MDefinition* rhs;
+  bool lessEqual;
+  if (!ExtractLinearInequality(test, direction, &lhs, &rhs, &lessEqual)) {
+    return nullptr;
+  }
+
+  if (rhs && rhs->block()->isMarked()) {
+    if (lhs.term && lhs.term->block()->isMarked()) {
+      return nullptr;
+    }
+    MDefinition* temp = lhs.term;
+    lhs.term = rhs;
+    rhs = temp;
+    if (!mozilla::SafeSub(0, lhs.constant, &lhs.constant)) {
+      return nullptr;
+    }
+    lessEqual = !lessEqual;
+  }
+
+  MOZ_ASSERT_IF(rhs, !rhs->block()->isMarked());
+
+  if (!lhs.term || !lhs.term->isPhi() || lhs.term->block() != header) {
+    return nullptr;
+  }
+
+
+  if (lhs.term->toPhi()->numOperands() != 2) {
+    return nullptr;
+  }
+
+  MDefinition* lhsInitial = lhs.term->toPhi()->getLoopPredecessorOperand();
+  if (lhsInitial->block()->isMarked()) {
+    return nullptr;
+  }
+
+  MDefinition* lhsWrite = DefinitionOrBetaInputDefinition(
+      lhs.term->toPhi()->getLoopBackedgeOperand());
+  if (!lhsWrite->isAdd() && !lhsWrite->isSub()) {
+    return nullptr;
+  }
+  if (!lhsWrite->block()->isMarked()) {
+    return nullptr;
+  }
+  MBasicBlock* bb = header->backedge();
+  for (; bb != lhsWrite->block() && bb != header;
+       bb = bb->immediateDominator()) {
+  }
+  if (bb != lhsWrite->block()) {
+    return nullptr;
+  }
+
+  SimpleLinearSum lhsModified = ExtractLinearSum(lhsWrite);
+
+  if (lhsModified.term != lhs.term) {
+    return nullptr;
+  }
+
+  LinearSum iterationBound(alloc());
+
+  if (lhsModified.constant == 1 && !lessEqual) {
+
+    if (rhs) {
+      if (!iterationBound.add(rhs, 1)) {
+        return nullptr;
+      }
+    }
+    if (!iterationBound.add(lhsInitial, -1)) {
+      return nullptr;
+    }
+
+    int32_t lhsConstant;
+    if (!mozilla::SafeSub(0, lhs.constant, &lhsConstant)) {
+      return nullptr;
+    }
+    if (!iterationBound.add(lhsConstant)) {
+      return nullptr;
+    }
+  } else if (lhsModified.constant == -1 && lessEqual) {
+
+    if (!iterationBound.add(lhsInitial, 1)) {
+      return nullptr;
+    }
+    if (rhs) {
+      if (!iterationBound.add(rhs, -1)) {
+        return nullptr;
+      }
+    }
+    if (!iterationBound.add(lhs.constant)) {
+      return nullptr;
+    }
+  } else {
+    return nullptr;
+  }
+
+  return new (alloc()) LoopIterationBound(test, iterationBound);
+}
+
+void RangeAnalysis::analyzeLoopPhi(const LoopIterationBound* loopBound,
+                                   MPhi* phi) {
+
+  MOZ_ASSERT(phi->numOperands() == 2);
+
+  MDefinition* initial = phi->getLoopPredecessorOperand();
+  if (initial->block()->isMarked()) {
+    return;
+  }
+
+  SimpleLinearSum modified =
+      ExtractLinearSum(phi->getLoopBackedgeOperand(), MathSpace::Infinite);
+
+  if (modified.term != phi || modified.constant == 0) {
+    return;
+  }
+
+  if (!phi->range()) {
+    phi->setRange(new (alloc()) Range(phi));
+  }
+
+  LinearSum initialSum(alloc());
+  if (!initialSum.add(initial, 1)) {
+    return;
+  }
+
+
+  LinearSum limitSum(loopBound->boundSum);
+  if (!limitSum.multiply(modified.constant) || !limitSum.add(initialSum)) {
+    return;
+  }
+
+  int32_t negativeConstant;
+  if (!mozilla::SafeSub(0, modified.constant, &negativeConstant) ||
+      !limitSum.add(negativeConstant)) {
+    return;
+  }
+
+  Range* initRange = initial->range();
+  if (modified.constant > 0) {
+    if (initRange && initRange->hasInt32LowerBound()) {
+      phi->range()->refineLower(initRange->lower());
+    }
+    phi->range()->setSymbolicLower(
+        SymbolicBound::New(alloc(), nullptr, initialSum));
+    phi->range()->setSymbolicUpper(
+        SymbolicBound::New(alloc(), loopBound, limitSum));
+  } else {
+    if (initRange && initRange->hasInt32UpperBound()) {
+      phi->range()->refineUpper(initRange->upper());
+    }
+    phi->range()->setSymbolicUpper(
+        SymbolicBound::New(alloc(), nullptr, initialSum));
+    phi->range()->setSymbolicLower(
+        SymbolicBound::New(alloc(), loopBound, limitSum));
+  }
+
+  JitSpew(JitSpew_Range, "added symbolic range on %u", phi->id());
+  SpewRange(phi);
+}
+
+static inline bool SymbolicBoundIsValid(const MBasicBlock* header,
+                                        const MBoundsCheck* ins,
+                                        const SymbolicBound* bound) {
+  if (!bound->loop) {
+    return true;
+  }
+  if (ins->block() == header) {
+    return false;
+  }
+  MBasicBlock* bb = ins->block()->immediateDominator();
+  while (bb != header && bb != bound->loop->test->block()) {
+    bb = bb->immediateDominator();
+  }
+  return bb == bound->loop->test->block();
+}
+
+bool RangeAnalysis::tryHoistBoundsCheck(const MBasicBlock* header,
+                                        const MBoundsCheck* ins) {
+  MDefinition* length = DefinitionOrBetaInputDefinition(ins->length());
+  if (length->block()->isMarked() && !length->isConstant()) {
+    return false;
+  }
+
+  SimpleLinearSum index = ExtractLinearSum(ins->index());
+  if (!index.term || !index.term->block()->isMarked()) {
+    return false;
+  }
+
+  if (!index.term->range()) {
+    return false;
+  }
+  const SymbolicBound* lower = index.term->range()->symbolicLower();
+  if (!lower || !SymbolicBoundIsValid(header, ins, lower)) {
+    return false;
+  }
+  const SymbolicBound* upper = index.term->range()->symbolicUpper();
+  if (!upper || !SymbolicBoundIsValid(header, ins, upper)) {
+    return false;
+  }
+
+  MBasicBlock* preLoop = header->loopPredecessor();
+  MOZ_ASSERT(!preLoop->isMarked());
+
+  MDefinition* lowerTerm = ConvertLinearSum(alloc(), preLoop, lower->sum,
+                                            BailoutKind::HoistBoundsCheck);
+  if (!lowerTerm) {
+    return false;
+  }
+
+  MDefinition* upperTerm = ConvertLinearSum(alloc(), preLoop, upper->sum,
+                                            BailoutKind::HoistBoundsCheck);
+  if (!upperTerm) {
+    return false;
+  }
+
+
+  int32_t lowerConstant = 0;
+  if (!mozilla::SafeSub(lowerConstant, index.constant, &lowerConstant)) {
+    return false;
+  }
+  if (!mozilla::SafeSub(lowerConstant, lower->sum.constant(), &lowerConstant)) {
+    return false;
+  }
+
+
+  int32_t upperConstant = index.constant;
+  if (!mozilla::SafeAdd(upper->sum.constant(), upperConstant, &upperConstant)) {
+    return false;
+  }
+
+  MBoundsCheckLower* lowerCheck = MBoundsCheckLower::New(alloc(), lowerTerm);
+  lowerCheck->setMinimum(lowerConstant);
+  lowerCheck->computeRange(alloc());
+  lowerCheck->collectRangeInfoPreTrunc();
+  lowerCheck->setBailoutKind(BailoutKind::HoistBoundsCheck);
+  preLoop->insertBefore(preLoop->lastIns(), lowerCheck);
+
+  if (upperTerm->isNonNegativeIntPtrToInt32() &&
+      length->type() == MIRType::IntPtr) {
+    upperTerm = upperTerm->toNonNegativeIntPtrToInt32()->input();
+  }
+
+  if (upperTerm != length || upperConstant >= 0) {
+    if (length->block()->isMarked()) {
+      MOZ_ASSERT(length->isConstant());
+      MInstruction* lengthIns = length->toInstruction();
+      lengthIns->block()->moveBefore(preLoop->lastIns(), lengthIns);
+    }
+
+    if (length->type() == MIRType::IntPtr &&
+        upperTerm->type() == MIRType::Int32) {
+      upperTerm = MInt32ToIntPtr::New(alloc(), upperTerm);
+      upperTerm->computeRange(alloc());
+      upperTerm->collectRangeInfoPreTrunc();
+      preLoop->insertBefore(preLoop->lastIns(), upperTerm->toInstruction());
+    }
+
+    MBoundsCheck* upperCheck = MBoundsCheck::New(alloc(), upperTerm, length);
+    upperCheck->setMinimum(upperConstant);
+    upperCheck->setMaximum(upperConstant);
+    upperCheck->computeRange(alloc());
+    upperCheck->collectRangeInfoPreTrunc();
+    upperCheck->setBailoutKind(BailoutKind::HoistBoundsCheck);
+    preLoop->insertBefore(preLoop->lastIns(), upperCheck);
+  }
+
+  return true;
+}
+
+bool RangeAnalysis::analyze() {
+  JitSpew(JitSpew_Range, "Doing range propagation");
+
+  for (ReversePostorderIterator iter(graph_.rpoBegin());
+       iter != graph_.rpoEnd(); iter++) {
+    if (mir->shouldCancel("RangeAnalysis analyze")) {
+      return false;
+    }
+
+    MBasicBlock* block = *iter;
+    MOZ_ASSERT(!block->unreachable() || graph_.osrBlock());
+
+    if (block->immediateDominator()->unreachable()) {
+      block->setUnreachableUnchecked();
+      continue;
+    }
+
+    for (MDefinitionIterator iter(block); iter; iter++) {
+      MDefinition* def = *iter;
+      if (!alloc().ensureBallast()) {
+        return false;
+      }
+
+      def->computeRange(alloc());
+      JitSpew(JitSpew_Range, "computing range on %u", def->id());
+      SpewRange(def);
+    }
+
+    if (block->unreachable()) {
+      continue;
+    }
+
+    if (block->isLoopHeader()) {
+      if (!analyzeLoop(block)) {
+        return false;
+      }
+    }
+
+    for (MInstructionIterator iter(block->begin()); iter != block->end();
+         iter++) {
+      iter->collectRangeInfoPreTrunc();
+    }
+  }
+
+  return true;
+}
+
+bool RangeAnalysis::addRangeAssertions() {
+  if (!JitOptions.checkRangeAnalysis) {
+    return true;
+  }
+
+  for (ReversePostorderIterator iter(graph_.rpoBegin());
+       iter != graph_.rpoEnd(); iter++) {
+    MBasicBlock* block = *iter;
+
+    if (block->unreachable()) {
+      continue;
+    }
+
+    for (MDefinitionIterator iter(block); iter; iter++) {
+      MDefinition* ins = *iter;
+
+      if (!IsNumberType(ins->type()) && ins->type() != MIRType::Boolean &&
+          ins->type() != MIRType::Value) {
+        continue;
+      }
+
+      if (ins->isIsNoIter() || ins->isIteratorHasIndices() ||
+          ins->isIteratorsMatchAndHaveIndices()) {
+        MOZ_ASSERT(ins->hasOneUse());
+        continue;
+      }
+
+      Range r(ins);
+
+      MOZ_ASSERT_IF(ins->type() == MIRType::Int64, r.isUnknown());
+
+      if (r.isUnknown() ||
+          (ins->type() == MIRType::Int32 && r.isUnknownInt32())) {
+        continue;
+      }
+
+      if (ins->isRecoveredOnBailout()) {
+        continue;
+      }
+
+      if (!alloc().ensureBallast()) {
+        return false;
+      }
+      MAssertRange* guard =
+          MAssertRange::New(alloc(), ins, new (alloc()) Range(r));
+
+      MInstruction* insertAt = nullptr;
+      if (block->graph().osrBlock() == block) {
+        insertAt = ins->toInstruction();
+      } else {
+        insertAt = block->safeInsertTop(ins);
+      }
+
+      if (insertAt == *iter) {
+        block->insertAfter(insertAt, guard);
+      } else {
+        block->insertBefore(insertAt, guard);
+      }
+    }
+  }
+
+  return true;
+}
+
+
+void Range::clampToInt32() {
+  if (isInt32()) {
+    return;
+  }
+  int32_t l = hasInt32LowerBound() ? lower() : JSVAL_INT_MIN;
+  int32_t h = hasInt32UpperBound() ? upper() : JSVAL_INT_MAX;
+  setInt32(l, h);
+}
+
+void Range::wrapAroundToInt32() {
+  if (!hasInt32Bounds()) {
+    setInt32(JSVAL_INT_MIN, JSVAL_INT_MAX);
+  } else if (canHaveFractionalPart()) {
+    canHaveFractionalPart_ = ExcludesFractionalParts;
+    canBeNegativeZero_ = ExcludesNegativeZero;
+    refineInt32BoundsByExponent(max_exponent_, &lower_, &hasInt32LowerBound_,
+                                &upper_, &hasInt32UpperBound_);
+
+    assertInvariants();
+  } else {
+    canBeNegativeZero_ = ExcludesNegativeZero;
+  }
+  MOZ_ASSERT(isInt32());
+}
+
+void Range::wrapAroundToShiftCount() {
+  wrapAroundToInt32();
+  if (lower() < 0 || upper() >= 32) {
+    setInt32(0, 31);
+  }
+}
+
+void Range::wrapAroundToBoolean() {
+  wrapAroundToInt32();
+  if (!isBoolean()) {
+    setInt32(0, 1);
+  }
+  MOZ_ASSERT(isBoolean());
+}
+
+bool MDefinition::canTruncate() const {
+  return false;
+}
+
+void MDefinition::truncate(TruncateKind kind) {
+  MOZ_CRASH("No procedure defined for truncating this instruction.");
+}
+
+bool MConstant::canTruncate() const { return IsFloatingPointType(type()); }
+
+void MConstant::truncate(TruncateKind kind) {
+  MOZ_ASSERT(canTruncate());
+
+  int32_t res = ToInt32(numberToDouble());
+  payload_.asBits = 0;
+  payload_.i32 = res;
+  setResultType(MIRType::Int32);
+  if (range()) {
+    range()->setInt32(res, res);
+  }
+}
+
+bool MPhi::canTruncate() const {
+  return type() == MIRType::Double || type() == MIRType::Int32;
+}
+
+void MPhi::truncate(TruncateKind kind) {
+  MOZ_ASSERT(canTruncate());
+  truncateKind_ = kind;
+  setResultType(MIRType::Int32);
+  if (kind >= TruncateKind::IndirectTruncate && range()) {
+    range()->wrapAroundToInt32();
+  }
+}
+
+bool MAdd::canTruncate() const {
+  return type() == MIRType::Double || type() == MIRType::Int32;
+}
+
+void MAdd::truncate(TruncateKind kind) {
+  MOZ_ASSERT(canTruncate());
+
+  setTruncateKind(kind);
+
+  setSpecialization(MIRType::Int32);
+  if (truncateKind() >= TruncateKind::IndirectTruncate && range()) {
+    range()->wrapAroundToInt32();
+  }
+}
+
+bool MSub::canTruncate() const {
+  return type() == MIRType::Double || type() == MIRType::Int32;
+}
+
+void MSub::truncate(TruncateKind kind) {
+  MOZ_ASSERT(canTruncate());
+
+  setTruncateKind(kind);
+  setSpecialization(MIRType::Int32);
+  if (truncateKind() >= TruncateKind::IndirectTruncate && range()) {
+    range()->wrapAroundToInt32();
+  }
+}
+
+bool MMul::canTruncate() const {
+  return type() == MIRType::Double || type() == MIRType::Int32;
+}
+
+void MMul::truncate(TruncateKind kind) {
+  MOZ_ASSERT(canTruncate());
+
+  setTruncateKind(kind);
+  setSpecialization(MIRType::Int32);
+  if (truncateKind() >= TruncateKind::IndirectTruncate) {
+    setCanBeNegativeZero(false);
+    if (range()) {
+      range()->wrapAroundToInt32();
+    }
+  }
+}
+
+bool MDiv::canTruncate() const {
+  return type() == MIRType::Double || type() == MIRType::Int32;
+}
+
+void MDiv::truncate(TruncateKind kind) {
+  MOZ_ASSERT(canTruncate());
+
+  setTruncateKind(kind);
+  setSpecialization(MIRType::Int32);
+
+  if (unsignedOperands()) {
+    replaceWithUnsignedOperands();
+    unsigned_ = true;
+  }
+}
+
+bool MMod::canTruncate() const {
+  return type() == MIRType::Double || type() == MIRType::Int32;
+}
+
+void MMod::truncate(TruncateKind kind) {
+  MOZ_ASSERT(canTruncate());
+
+  setTruncateKind(kind);
+  setSpecialization(MIRType::Int32);
+
+  if (unsignedOperands()) {
+    replaceWithUnsignedOperands();
+    unsigned_ = true;
+  }
+}
+
+bool MToDouble::canTruncate() const {
+  MOZ_ASSERT(type() == MIRType::Double);
+  return true;
+}
+
+void MToDouble::truncate(TruncateKind kind) {
+  MOZ_ASSERT(canTruncate());
+  setTruncateKind(kind);
+
+  setResultType(MIRType::Int32);
+  if (truncateKind() >= TruncateKind::IndirectTruncate) {
+    if (range()) {
+      range()->wrapAroundToInt32();
+    }
+  }
+}
+
+bool MLimitedTruncate::canTruncate() const { return true; }
+
+void MLimitedTruncate::truncate(TruncateKind kind) {
+  MOZ_ASSERT(canTruncate());
+  setTruncateKind(kind);
+  setResultType(MIRType::Int32);
+  if (kind >= TruncateKind::IndirectTruncate && range()) {
+    range()->wrapAroundToInt32();
+  }
+}
+
+bool MCompare::canTruncate() const {
+  if (!isDoubleComparison()) {
+    return false;
+  }
+
+  if (!Range(lhs()).isInt32() || !Range(rhs()).isInt32()) {
+    return false;
+  }
+
+  return true;
+}
+
+void MCompare::truncate(TruncateKind kind) {
+  MOZ_ASSERT(canTruncate());
+  compareType_ = Compare_Int32;
+
+  truncateOperands_ = true;
+}
+
+TruncateKind MDefinition::operandTruncateKind(size_t index) const {
+  return TruncateKind::NoTruncate;
+}
+
+TruncateKind MPhi::operandTruncateKind(size_t index) const {
+  return truncateKind_;
+}
+
+TruncateKind MTruncateToInt32::operandTruncateKind(size_t index) const {
+  return TruncateKind::Truncate;
+}
+
+TruncateKind MBinaryBitwiseInstruction::operandTruncateKind(
+    size_t index) const {
+  return TruncateKind::Truncate;
+}
+
+TruncateKind MLimitedTruncate::operandTruncateKind(size_t index) const {
+  return std::min(truncateKind(), truncateLimit_);
+}
+
+TruncateKind MAdd::operandTruncateKind(size_t index) const {
+  return std::min(truncateKind(), TruncateKind::IndirectTruncate);
+}
+
+TruncateKind MSub::operandTruncateKind(size_t index) const {
+  return std::min(truncateKind(), TruncateKind::IndirectTruncate);
+}
+
+TruncateKind MMul::operandTruncateKind(size_t index) const {
+  return std::min(truncateKind(), TruncateKind::IndirectTruncate);
+}
+
+TruncateKind MToDouble::operandTruncateKind(size_t index) const {
+  return truncateKind();
+}
+
+TruncateKind MStoreUnboxedScalar::operandTruncateKind(size_t index) const {
+  return (index == 2 && isIntegerWrite()) ? TruncateKind::Truncate
+                                          : TruncateKind::NoTruncate;
+}
+
+TruncateKind MStoreDataViewElement::operandTruncateKind(size_t index) const {
+  return (index == 2 && isIntegerWrite()) ? TruncateKind::Truncate
+                                          : TruncateKind::NoTruncate;
+}
+
+TruncateKind MStoreTypedArrayElementHole::operandTruncateKind(
+    size_t index) const {
+  return (index == 3 && isIntegerWrite()) ? TruncateKind::Truncate
+                                          : TruncateKind::NoTruncate;
+}
+
+TruncateKind MTypedArrayFill::operandTruncateKind(size_t index) const {
+  return (index == 1 && isIntegerWrite()) ? TruncateKind::Truncate
+                                          : TruncateKind::NoTruncate;
+}
+
+TruncateKind MDiv::operandTruncateKind(size_t index) const {
+  return std::min(truncateKind(), TruncateKind::TruncateAfterBailouts);
+}
+
+TruncateKind MMod::operandTruncateKind(size_t index) const {
+  return std::min(truncateKind(), TruncateKind::TruncateAfterBailouts);
+}
+
+TruncateKind MCompare::operandTruncateKind(size_t index) const {
+  MOZ_ASSERT_IF(truncateOperands_, isInt32Comparison());
+  return truncateOperands_ ? TruncateKind::TruncateAfterBailouts
+                           : TruncateKind::NoTruncate;
+}
+
+static bool TruncateTest(TempAllocator& alloc, const MTest* test) {
+
+  if (test->input()->type() != MIRType::Value) {
+    return true;
+  }
+
+  if (!test->input()->isPhi() || !test->input()->hasOneDefUse() ||
+      test->input()->isImplicitlyUsed()) {
+    return true;
+  }
+
+  MPhi* phi = test->input()->toPhi();
+  for (size_t i = 0; i < phi->numOperands(); i++) {
+    MDefinition* def = phi->getOperand(i);
+    if (!def->isBox()) {
+      return true;
+    }
+    MDefinition* inner = def->getOperand(0);
+    if (inner->type() != MIRType::Boolean && inner->type() != MIRType::Int32) {
+      return true;
+    }
+  }
+
+  for (size_t i = 0; i < phi->numOperands(); i++) {
+    MDefinition* inner = phi->getOperand(i)->getOperand(0);
+    if (inner->type() != MIRType::Int32) {
+      if (!alloc.ensureBallast()) {
+        return false;
+      }
+      MBasicBlock* block = inner->block();
+      inner = MToNumberInt32::New(alloc, inner);
+      block->insertBefore(block->lastIns(), inner->toInstruction());
+    }
+    MOZ_ASSERT(inner->type() == MIRType::Int32);
+    phi->replaceOperand(i, inner);
+  }
+
+  phi->setResultType(MIRType::Int32);
+  return true;
+}
+
+static bool CloneForDeadBranches(TempAllocator& alloc,
+                                 MInstruction* candidate) {
+  if (candidate->isCompare()) {
+    return true;
+  }
+
+  MOZ_ASSERT(candidate->canClone());
+  if (!alloc.ensureBallast()) {
+    return false;
+  }
+
+  MDefinitionVector operands(alloc);
+  size_t end = candidate->numOperands();
+  if (!operands.reserve(end)) {
+    return false;
+  }
+  for (size_t i = 0; i < end; ++i) {
+    operands.infallibleAppend(candidate->getOperand(i));
+  }
+
+  MInstruction* clone = candidate->clone(alloc, operands);
+  if (!clone) {
+    return false;
+  }
+  clone->setRange(nullptr);
+
+  clone->setImplicitlyUsedUnchecked();
+
+  candidate->block()->insertBefore(candidate, clone);
+
+  if (!candidate->maybeConstantValue()) {
+    MOZ_ASSERT(clone->canRecoverOnBailout());
+    clone->setRecoveredOnBailout();
+  }
+
+  for (MUseIterator i(candidate->usesBegin()); i != candidate->usesEnd();) {
+    MUse* use = *i++;
+    MNode* ins = use->consumer();
+    if (ins->isDefinition() && !ins->toDefinition()->isRecoveredOnBailout()) {
+      continue;
+    }
+
+    use->replaceProducer(clone);
+  }
+
+  return true;
+}
+
+struct ComputedTruncateKind {
+  TruncateKind kind = TruncateKind::NoTruncate;
+  bool shouldClone = false;
+};
+
+static ComputedTruncateKind ComputeRequestedTruncateKind(
+    const MDefinition* candidate) {
+  MOZ_ASSERT(candidate->canTruncate());
+
+  bool isCapturedResult =
+      false;  
+  bool isObservableResult =
+      false;  
+  bool isRecoverableResult = true;  
+  bool isImplicitlyUsed = candidate->isImplicitlyUsed();
+  bool hasTryBlock = candidate->block()->graph().hasTryBlock();
+
+  TruncateKind kind = TruncateKind::Truncate;
+  for (MUseIterator use(candidate->usesBegin()); use != candidate->usesEnd();
+       use++) {
+    if (use->consumer()->isResumePoint()) {
+      isCapturedResult = true;
+      isObservableResult =
+          isObservableResult ||
+          use->consumer()->toResumePoint()->isObservableOperand(*use);
+      isRecoverableResult =
+          isRecoverableResult &&
+          use->consumer()->toResumePoint()->isRecoverableOperand(*use);
+      continue;
+    }
+
+    MDefinition* consumer = use->consumer()->toDefinition();
+    if (consumer->isRecoveredOnBailout()) {
+      isCapturedResult = true;
+      isImplicitlyUsed = isImplicitlyUsed || consumer->isImplicitlyUsed();
+      continue;
+    }
+
+    TruncateKind consumerKind =
+        consumer->operandTruncateKind(consumer->indexOf(*use));
+    kind = std::min(kind, consumerKind);
+    if (kind == TruncateKind::NoTruncate) {
+      break;
+    }
+  }
+
+  if (candidate->isGuard() || candidate->isGuardRangeBailouts()) {
+    kind = std::min(kind, TruncateKind::TruncateAfterBailouts);
+  }
+
+  bool needsConversion = !candidate->range() || !candidate->range()->isInt32();
+
+  bool safeToConvert = kind == TruncateKind::Truncate && !isImplicitlyUsed &&
+                       !isObservableResult && !hasTryBlock;
+
+  bool shouldClone = false;
+  if (isCapturedResult && needsConversion && !safeToConvert) {
+    if (!JitOptions.disableRecoverIns && isRecoverableResult &&
+        candidate->canRecoverOnBailout()) {
+      shouldClone = true;
+    } else {
+      kind = std::min(kind, TruncateKind::TruncateAfterBailouts);
+    }
+  }
+
+  return {kind, shouldClone};
+}
+
+static ComputedTruncateKind ComputeTruncateKind(const MDefinition* candidate) {
+  MOZ_ASSERT(candidate->canTruncate());
+
+  if (candidate->isCompare()) {
+    return {TruncateKind::TruncateAfterBailouts};
+  }
+
+  const Range* r = candidate->range();
+  bool canHaveRoundingErrors = !r || r->canHaveRoundingErrors();
+
+  if ((candidate->isDiv() || candidate->isMod()) &&
+      candidate->type() == MIRType::Int32) {
+    canHaveRoundingErrors = false;
+  }
+
+  if (canHaveRoundingErrors) {
+    return {TruncateKind::NoTruncate};
+  }
+
+  return ComputeRequestedTruncateKind(candidate);
+}
+
+static void RemoveTruncatesOnOutput(MDefinition* truncated) {
+  if (truncated->isCompare()) {
+    return;
+  }
+
+  MOZ_ASSERT(truncated->type() == MIRType::Int32);
+  MOZ_ASSERT(Range(truncated).isInt32());
+
+  for (MUseDefIterator use(truncated); use; use++) {
+    MDefinition* def = use.def();
+    if (!def->isTruncateToInt32() && !def->isToNumberInt32()) {
+      continue;
+    }
+
+    def->replaceAllUsesWith(truncated);
+  }
+}
+
+void RangeAnalysis::adjustTruncatedInputs(MDefinition* truncated) {
+  MBasicBlock* block = truncated->block();
+  for (size_t i = 0, e = truncated->numOperands(); i < e; i++) {
+    TruncateKind kind = truncated->operandTruncateKind(i);
+    if (kind == TruncateKind::NoTruncate) {
+      continue;
+    }
+
+    MDefinition* input = truncated->getOperand(i);
+    if (input->type() == MIRType::Int32) {
+      continue;
+    }
+
+    if (input->isToDouble() && input->getOperand(0)->type() == MIRType::Int32) {
+      truncated->replaceOperand(i, input->getOperand(0));
+    } else {
+      MInstruction* op;
+      if (kind == TruncateKind::TruncateAfterBailouts) {
+        MOZ_ASSERT(!mir->outerInfo().hadEagerTruncationBailout());
+        op = MToNumberInt32::New(alloc(), truncated->getOperand(i));
+        op->setBailoutKind(BailoutKind::EagerTruncation);
+      } else {
+        op = MTruncateToInt32::New(alloc(), truncated->getOperand(i));
+      }
+
+      if (truncated->isPhi()) {
+        MBasicBlock* pred = block->getPredecessor(i);
+        pred->insertBefore(pred->lastIns(), op);
+      } else {
+        block->insertBefore(truncated->toInstruction(), op);
+      }
+      truncated->replaceOperand(i, op);
+    }
+  }
+
+  if (truncated->isToDouble()) {
+    truncated->replaceAllUsesWith(truncated->toToDouble()->getOperand(0));
+    block->discard(truncated->toToDouble());
+  }
+}
+
+bool RangeAnalysis::canTruncate(const MDefinition* def,
+                                TruncateKind kind) const {
+  MOZ_ASSERT(def->canTruncate());
+
+  if (kind == TruncateKind::NoTruncate) {
+    return false;
+  }
+
+  if (mir->outerInfo().hadEagerTruncationBailout()) {
+    if (kind == TruncateKind::TruncateAfterBailouts) {
+      return false;
+    }
+    if (def->isDiv() || def->isMod()) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool RangeAnalysis::truncate() {
+  JitSpew(JitSpew_Range, "Do range-base truncation (backward loop)");
+
+  MOZ_ASSERT(!mir->compilingWasm());
+
+  Vector<MDefinition*, 16, SystemAllocPolicy> worklist;
+
+  for (PostorderIterator block(graph_.poBegin()); block != graph_.poEnd();
+       block++) {
+    if (mir->shouldCancel("RangeAnalysis truncate")) {
+      return false;
+    }
+
+    for (MInstructionReverseIterator iter(block->rbegin());
+         iter != block->rend(); iter++) {
+      if (iter->isRecoveredOnBailout()) {
+        continue;
+      }
+
+      if (iter->type() == MIRType::None) {
+        if (iter->isTest()) {
+          if (!TruncateTest(alloc(), iter->toTest())) {
+            return false;
+          }
+        }
+        continue;
+      }
+
+      switch (iter->op()) {
+        case MDefinition::Opcode::BitAnd:
+        case MDefinition::Opcode::BitOr:
+        case MDefinition::Opcode::BitXor:
+        case MDefinition::Opcode::Lsh:
+        case MDefinition::Opcode::Rsh:
+        case MDefinition::Opcode::Ursh:
+          if (!bitops.append(static_cast<MBinaryBitwiseInstruction*>(*iter))) {
+            return false;
+          }
+          break;
+        default:;
+      }
+
+      if (!iter->canTruncate()) {
+        continue;
+      }
+
+      auto [kind, shouldClone] = ComputeTruncateKind(*iter);
+
+      if (!canTruncate(*iter, kind)) {
+        continue;
+      }
+
+      SpewTruncate(*iter, kind, shouldClone);
+
+      if (shouldClone && !CloneForDeadBranches(alloc(), *iter)) {
+        return false;
+      }
+
+      if (kind == TruncateKind::TruncateAfterBailouts) {
+        iter->setBailoutKind(BailoutKind::EagerTruncation);
+      }
+
+      iter->truncate(kind);
+
+      iter->setInWorklist();
+      if (!worklist.append(*iter)) {
+        return false;
+      }
+    }
+    for (MPhiIterator iter(block->phisBegin()), end(block->phisEnd());
+         iter != end; ++iter) {
+      if (!iter->canTruncate()) {
+        continue;
+      }
+
+      auto [kind, shouldClone] = ComputeTruncateKind(*iter);
+
+      if (shouldClone || !canTruncate(*iter, kind)) {
+        continue;
+      }
+
+      SpewTruncate(*iter, kind, shouldClone);
+
+      iter->truncate(kind);
+
+      iter->setInWorklist();
+      if (!worklist.append(*iter)) {
+        return false;
+      }
+    }
+  }
+
+  JitSpew(JitSpew_Range, "Do graph type fixup (dequeue)");
+  while (!worklist.empty()) {
+    if (!alloc().ensureBallast()) {
+      return false;
+    }
+    MDefinition* def = worklist.popCopy();
+    def->setNotInWorklist();
+    RemoveTruncatesOnOutput(def);
+    adjustTruncatedInputs(def);
+  }
+
+  return true;
+}
+
+bool RangeAnalysis::removeUnnecessaryBitops() {
+  JitSpew(JitSpew_Range, "Begin (removeUnnecessaryBitops)");
+
+  for (size_t i = 0; i < bitops.length(); i++) {
+    MBinaryBitwiseInstruction* ins = bitops[i];
+    if (ins->isRecoveredOnBailout()) {
+      continue;
+    }
+
+    MDefinition* folded = ins->foldUnnecessaryBitop();
+    if (folded != ins) {
+      ins->replaceAllLiveUsesWith(folded);
+      ins->setRecoveredOnBailout();
+    }
+  }
+
+  bitops.clear();
+  return true;
+}
+
+
+void MInArray::collectRangeInfoPreTrunc() {
+  Range indexRange(index());
+  if (indexRange.isFiniteNonNegative()) {
+    needsNegativeIntCheck_ = false;
+    setNotGuard();
+  }
+}
+
+void MLoadElementHole::collectRangeInfoPreTrunc() {
+  Range indexRange(index());
+  if (indexRange.isFiniteNonNegative()) {
+    needsNegativeIntCheck_ = false;
+    setNotGuard();
+  }
+}
+
+void MInt32ToIntPtr::collectRangeInfoPreTrunc() {
+  Range inputRange(input());
+  if (inputRange.isFiniteNonNegative()) {
+    canBeNegative_ = false;
+  }
+}
+
+void MClz::collectRangeInfoPreTrunc() {
+  Range inputRange(input());
+  if (!inputRange.canBeZero()) {
+    operandIsNeverZero_ = true;
+  }
+}
+
+void MCtz::collectRangeInfoPreTrunc() {
+  Range inputRange(input());
+  if (!inputRange.canBeZero()) {
+    operandIsNeverZero_ = true;
+  }
+}
+
+void MDiv::collectRangeInfoPreTrunc() {
+  Range lhsRange(lhs());
+  Range rhsRange(rhs());
+
+  if (lhsRange.isFiniteNonNegative()) {
+    canBeNegativeDividend_ = false;
+  }
+
+  if (!rhsRange.canBeZero()) {
+    canBeDivideByZero_ = false;
+  }
+
+  if (!lhsRange.contains(INT32_MIN)) {
+    canBeNegativeOverflow_ = false;
+  }
+
+  if (!rhsRange.contains(-1)) {
+    canBeNegativeOverflow_ = false;
+  }
+
+  if (!lhsRange.canBeZero()) {
+    canBeNegativeZero_ = false;
+  }
+
+  if (rhsRange.isFiniteNonNegative()) {
+    canBeNegativeZero_ = false;
+  }
+
+  if (type() == MIRType::Int32 && fallible()) {
+    setGuardRangeBailoutsUnchecked();
+  }
+}
+
+void MMul::collectRangeInfoPreTrunc() {
+  Range lhsRange(lhs());
+  Range rhsRange(rhs());
+
+  if (lhsRange.isFiniteNonNegative() && !lhsRange.canBeZero()) {
+    setCanBeNegativeZero(false);
+  }
+
+  if (rhsRange.isFiniteNonNegative() && !rhsRange.canBeZero()) {
+    setCanBeNegativeZero(false);
+  }
+
+  if (rhsRange.isFiniteNonNegative() && lhsRange.isFiniteNonNegative()) {
+    setCanBeNegativeZero(false);
+  }
+
+  if (rhsRange.isFiniteNegative() && lhsRange.isFiniteNegative()) {
+    setCanBeNegativeZero(false);
+  }
+}
+
+void MMod::collectRangeInfoPreTrunc() {
+  Range lhsRange(lhs());
+  Range rhsRange(rhs());
+  if (lhsRange.isFiniteNonNegative()) {
+    canBeNegativeDividend_ = false;
+  }
+  if (!rhsRange.canBeZero()) {
+    canBeDivideByZero_ = false;
+  }
+  if (type() == MIRType::Int32 && fallible()) {
+    setGuardRangeBailoutsUnchecked();
+  }
+}
+
+void MToNumberInt32::collectRangeInfoPreTrunc() {
+  Range inputRange(input());
+  if (!inputRange.canBeNegativeZero()) {
+    needsNegativeZeroCheck_ = false;
+  }
+}
+
+void MBoundsCheck::collectRangeInfoPreTrunc() {
+  Range indexRange(index());
+  Range lengthRange(length());
+  if (!indexRange.hasInt32LowerBound() || !indexRange.hasInt32UpperBound()) {
+    return;
+  }
+  if (!lengthRange.hasInt32LowerBound() || lengthRange.canBeNaN()) {
+    return;
+  }
+
+  int64_t indexLower = indexRange.lower();
+  int64_t indexUpper = indexRange.upper();
+  int64_t lengthLower = lengthRange.lower();
+  int64_t min = minimum();
+  int64_t max = maximum();
+
+  if (indexLower + min >= 0 && indexUpper + max < lengthLower) {
+    fallible_ = false;
+  }
+}
+
+void MBoundsCheckLower::collectRangeInfoPreTrunc() {
+  Range indexRange(index());
+  if (indexRange.hasInt32LowerBound() && indexRange.lower() >= minimum_) {
+    fallible_ = false;
+  }
+}
+
+void MCompare::collectRangeInfoPreTrunc() {
+  if (!Range(lhs()).canBeNaN() && !Range(rhs()).canBeNaN()) {
+    operandsAreNeverNaN_ = true;
+  }
+}
+
+void MNot::collectRangeInfoPreTrunc() {
+  if (!Range(input()).canBeNaN()) {
+    operandIsNeverNaN_ = true;
+  }
+}
+
+void MPowHalf::collectRangeInfoPreTrunc() {
+  Range inputRange(input());
+  if (!inputRange.canBeInfiniteOrNaN() || inputRange.hasInt32LowerBound()) {
+    operandIsNeverNegativeInfinity_ = true;
+  }
+  if (!inputRange.canBeNegativeZero()) {
+    operandIsNeverNegativeZero_ = true;
+  }
+  if (!inputRange.canBeNaN()) {
+    operandIsNeverNaN_ = true;
+  }
+}
+
+void MUrsh::collectRangeInfoPreTrunc() {
+  if (type() == MIRType::Int64) {
+    return;
+  }
+
+  Range lhsRange(lhs()), rhsRange(rhs());
+
+  lhsRange.wrapAroundToInt32();
+  rhsRange.wrapAroundToShiftCount();
+
+  if (lhsRange.lower() >= 0 || rhsRange.lower() >= 1) {
+    bailoutsDisabled_ = true;
+  }
+}
+
+static bool DoesMaskMatchRange(int32_t mask, const Range& range) {
+  if (range.lower() >= 0) {
+    MOZ_ASSERT(range.isInt32());
+    int bits = 1 + FloorLog2(uint32_t(range.upper()));
+    uint32_t maskNeeded = (bits == 32) ? 0xffffffff : (uint32_t(1) << bits) - 1;
+    if ((mask & maskNeeded) == maskNeeded) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+void MBinaryBitwiseInstruction::collectRangeInfoPreTrunc() {
+  Range lhsRange(lhs());
+  Range rhsRange(rhs());
+
+  if (lhs()->isConstant() && lhs()->type() == MIRType::Int32 &&
+      DoesMaskMatchRange(lhs()->toConstant()->toInt32(), rhsRange)) {
+    maskMatchesRightRange = true;
+  }
+
+  if (rhs()->isConstant() && rhs()->type() == MIRType::Int32 &&
+      DoesMaskMatchRange(rhs()->toConstant()->toInt32(), lhsRange)) {
+    maskMatchesLeftRange = true;
+  }
+}
+
+void MNaNToZero::collectRangeInfoPreTrunc() {
+  Range inputRange(input());
+
+  if (!inputRange.canBeNaN()) {
+    operandIsNeverNaN_ = true;
+  }
+  if (!inputRange.canBeNegativeZero()) {
+    operandIsNeverNegativeZero_ = true;
+  }
+}
+
+bool RangeAnalysis::prepareForUCE(bool* shouldRemoveDeadCode) {
+  *shouldRemoveDeadCode = false;
+
+  for (ReversePostorderIterator iter(graph_.rpoBegin());
+       iter != graph_.rpoEnd(); iter++) {
+    MBasicBlock* block = *iter;
+
+    if (!block->unreachable()) {
+      continue;
+    }
+
+    if (block->numPredecessors() == 0) {
+      MOZ_ASSERT(graph_.osrBlock());
+      continue;
+    }
+
+    MControlInstruction* cond = block->getPredecessor(0)->lastIns();
+    if (!cond->isTest()) {
+      continue;
+    }
+
+    MTest* test = cond->toTest();
+    MDefinition* condition = test->input();
+
+    MOZ_ASSERT(block == test->ifTrue() || block == test->ifFalse());
+    bool value = block == test->ifFalse();
+    MConstant* constant =
+        MConstant::New(alloc().fallible(), BooleanValue(value));
+    if (!constant) {
+      return false;
+    }
+
+    condition->setGuardRangeBailoutsUnchecked();
+
+    test->block()->insertBefore(test, constant);
+
+    test->replaceOperand(0, constant);
+    JitSpew(JitSpew_Range,
+            "Update condition of %u to reflect unreachable branches.",
+            test->id());
+
+    *shouldRemoveDeadCode = true;
+  }
+
+  return tryRemovingGuards();
+}
+
+bool RangeAnalysis::tryRemovingGuards() {
+  MDefinitionVector guards(alloc());
+
+  for (ReversePostorderIterator block = graph_.rpoBegin();
+       block != graph_.rpoEnd(); block++) {
+    if (mir->shouldCancel("RangeAnalysis tryRemovingGuards (block loop)")) {
+      return false;
+    }
+
+    for (MDefinitionIterator iter(*block); iter; iter++) {
+      if (!iter->isGuardRangeBailouts()) {
+        continue;
+      }
+
+      iter->setInWorklist();
+      if (!guards.append(*iter)) {
+        return false;
+      }
+    }
+  }
+
+  for (size_t i = 0; i < guards.length(); i++) {
+    if (mir->shouldCancel("RangeAnalysis tryRemovingGuards (guards loop)")) {
+      return false;
+    }
+
+    MDefinition* guard = guards[i];
+
+    guard->setNotGuardRangeBailouts();
+    if (!DeadIfUnused(guard)) {
+      guard->setGuardRangeBailouts();
+      continue;
+    }
+    guard->setGuardRangeBailouts();
+
+    if (!guard->isPhi()) {
+      if (!guard->range()) {
+        continue;
+      }
+
+      Range typeFilteredRange(guard);
+
+      if (typeFilteredRange.update(guard->range())) {
+        continue;
+      }
+    }
+
+    guard->setNotGuardRangeBailouts();
+
+    for (size_t op = 0, e = guard->numOperands(); op < e; op++) {
+      MDefinition* operand = guard->getOperand(op);
+
+      if (operand->isInWorklist()) {
+        continue;
+      }
+
+      MOZ_ASSERT(!operand->isGuardRangeBailouts());
+
+      operand->setInWorklist();
+      operand->setGuardRangeBailouts();
+      if (!guards.append(operand)) {
+        return false;
+      }
+    }
+  }
+
+  for (size_t i = 0; i < guards.length(); i++) {
+    MDefinition* guard = guards[i];
+    guard->setNotInWorklist();
+  }
+
+  return true;
+}

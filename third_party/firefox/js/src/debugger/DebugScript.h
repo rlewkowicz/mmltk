@@ -1,0 +1,111 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef dbg_DebugScript_h
+#define dbg_DebugScript_h
+
+#include <stddef.h>  // for offsetof
+#include <stddef.h>  // for size_t
+#include <stdint.h>  // for uint32_t
+
+#include "jstypes.h"
+
+#include "gc/WeakMap.h"
+#include "vm/NativeObject.h"
+
+namespace JS {
+class JS_PUBLIC_API Realm;
+}
+
+namespace js {
+
+class JSBreakpointSite;
+class Debugger;
+class DebugScriptObject;
+
+class DebugScript {
+  friend class DebugAPI;
+  friend class DebugScriptObject;
+
+  uint32_t generatorObserverCount;
+
+  uint32_t stepperCount;
+
+  size_t codeLength;
+
+  uint32_t numSites;
+
+  JSBreakpointSite* breakpoints[1];
+
+  bool needed() const {
+    return generatorObserverCount > 0 || stepperCount > 0 || numSites > 0;
+  }
+
+  static size_t allocSize(size_t codeLength) {
+    return offsetof(DebugScript, breakpoints) +
+           codeLength * sizeof(JSBreakpointSite*);
+  }
+
+  void trace(JSTracer* trc);
+  void delete_(JS::GCContext* gcx, DebugScriptObject* owner);
+
+  static DebugScript* get(JSScript* script);
+  static DebugScript* getUnbarriered(JSScript* script);
+  static DebugScript* getOrCreate(JSContext* cx, HandleScript script);
+
+ public:
+  static bool hasBreakpointSite(JSScript* script, jsbytecode* pc);
+  static JSBreakpointSite* getBreakpointSite(JSScript* script, jsbytecode* pc);
+  static JSBreakpointSite* getOrCreateBreakpointSite(JSContext* cx,
+                                                     HandleScript script,
+                                                     jsbytecode* pc);
+  static void destroyBreakpointSite(JS::GCContext* gcx, JSScript* script,
+                                    jsbytecode* pc);
+
+  static void clearBreakpointsIn(JS::GCContext* gcx, JSScript* script,
+                                 Debugger* dbg, JSObject* handler);
+
+#ifdef DEBUG
+  static uint32_t getStepperCount(JSScript* script);
+#endif
+
+  [[nodiscard]] static bool incrementStepperCount(JSContext* cx,
+                                                  HandleScript script);
+  static void decrementStepperCount(JS::GCContext* gcx, JSScript* script);
+
+  [[nodiscard]] static bool incrementGeneratorObserverCount(
+      JSContext* cx, HandleScript script);
+  static void decrementGeneratorObserverCount(JS::GCContext* gcx,
+                                              JSScript* script);
+};
+
+using UniqueDebugScript = js::UniquePtr<DebugScript, JS::FreePolicy>;
+
+class DebugScriptObject : public NativeObject {
+ public:
+  static const JSClass class_;
+
+  enum { ScriptSlot, SlotCount };
+
+  static DebugScriptObject* create(JSContext* cx, UniqueDebugScript debugScript,
+                                   size_t nbytes);
+
+  DebugScript* debugScript() const;
+
+ private:
+  static const JSClassOps classOps_;
+
+  static void trace(JSTracer* trc, JSObject* obj);
+  static void finalize(JS::GCContext* gcx, JSObject* obj);
+};
+
+class DebugScriptMap
+    : public WeakMap<JSScript*, DebugScriptObject*, ZoneAllocPolicy> {
+ public:
+  explicit DebugScriptMap(JSContext* cx);
+};
+
+} 
+
+#endif /* dbg_DebugScript_h */

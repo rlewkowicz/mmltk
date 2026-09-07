@@ -1,0 +1,78 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef WaylandVsyncSource_h_
+#define WaylandVsyncSource_h_
+
+#include "base/thread.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/Monitor.h"
+#include "mozilla/layers/NativeLayerWayland.h"
+#include "MozContainer.h"
+#include "nsWaylandDisplay.h"
+#include "VsyncSource.h"
+#include "WaylandSurface.h"
+
+namespace mozilla {
+
+using layers::NativeLayerRootWayland;
+
+class WaylandVsyncSource final : public gfx::VsyncSource {
+ public:
+  explicit WaylandVsyncSource(nsWindow* aWindow);
+  virtual ~WaylandVsyncSource();
+
+  static Maybe<TimeDuration> GetFastestVsyncRate();
+
+  void VisibleWindowCallback(uint32_t aTime = 0);
+
+  bool HiddenWindowCallback();
+
+  TimeDuration GetVsyncRate() override;
+
+  void EnableVsync() override;
+  void DisableVsync() override;
+  bool IsVsyncEnabled() override;
+  void Shutdown() override;
+
+  void EnableVSyncSource();
+  void DisableVSyncSource();
+
+  void Init();
+
+ private:
+  Maybe<TimeDuration> GetVsyncRateIfEnabled();
+
+  void CalculateVsyncRateLocked(const MutexAutoLock& aProofOfLock,
+                                TimeStamp aVsyncTimestamp);
+  void* GetWindowForLogging() { return mWindow; };
+
+  void SetHiddenWindowVSync();
+
+  void SetVSyncEventsStateLocked(const MutexAutoLock& aProofOfLock,
+                                 bool aEnabled);
+
+  Mutex mMutex;
+
+  RefPtr<nsWindow> mWindow;
+  RefPtr<widget::WaylandSurface> mWaylandSurface MOZ_GUARDED_BY(mMutex);
+
+  bool mIsShutdown MOZ_GUARDED_BY(mMutex) = false;
+  bool mVsyncEnabled MOZ_GUARDED_BY(mMutex) = false;
+  bool mVsyncSourceEnabled MOZ_GUARDED_BY(mMutex) = false;
+
+  TimeDuration mVsyncRate MOZ_GUARDED_BY(mMutex);
+  TimeStamp mLastVsyncTimeStamp MOZ_GUARDED_BY(mMutex);
+  uint32_t mLastTime MOZ_GUARDED_BY(mMutex) = 0;
+  bool mLastTimeEmulated MOZ_GUARDED_BY(mMutex) = false;
+
+  guint mHiddenWindowTimerID = 0;    
+  const guint mHiddenWindowTimeout;  
+};
+
+}  
+
+#endif  // WaylandVsyncSource_h_

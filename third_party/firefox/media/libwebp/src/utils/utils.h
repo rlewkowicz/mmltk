@@ -1,0 +1,157 @@
+// Copyright 2012 Google Inc. All Rights Reserved.
+// Use of this source code is governed by a BSD-style license
+
+#if !defined(WEBP_UTILS_UTILS_H_)
+#define WEBP_UTILS_UTILS_H_
+
+#if defined(HAVE_CONFIG_H)
+#include "src/webp/config.h"
+#endif
+
+#include <assert.h>
+
+#include "src/webp/types.h"
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+
+#if !defined(WEBP_MAX_ALLOCABLE_MEMORY)
+#if SIZE_MAX > (1ULL << 34)
+#define WEBP_MAX_ALLOCABLE_MEMORY (1ULL << 34)
+#else
+#define WEBP_MAX_ALLOCABLE_MEMORY ((1ULL << 31) - (1 << 16))
+#endif
+#endif
+
+static WEBP_INLINE int CheckSizeOverflow(uint64_t size) {
+  return size == (size_t)size;
+}
+
+WEBP_EXTERN void* WebPSafeMalloc(uint64_t nmemb, size_t size);
+WEBP_EXTERN void* WebPSafeCalloc(uint64_t nmemb, size_t size);
+
+WEBP_EXTERN void WebPSafeFree(void* const ptr);
+
+
+#define WEBP_ALIGN_CST 31
+#define WEBP_ALIGN(PTR) (((uintptr_t)(PTR) + WEBP_ALIGN_CST) & \
+                         ~(uintptr_t)WEBP_ALIGN_CST)
+
+#include <string.h>
+static WEBP_INLINE uint32_t WebPMemToUint32(const uint8_t* const ptr) {
+  uint32_t A;
+  memcpy(&A, ptr, sizeof(A));
+  return A;
+}
+
+static WEBP_INLINE int32_t WebPMemToInt32(const uint8_t* const ptr) {
+  return (int32_t)WebPMemToUint32(ptr);
+}
+
+static WEBP_INLINE void WebPUint32ToMem(uint8_t* const ptr, uint32_t val) {
+  memcpy(ptr, &val, sizeof(val));
+}
+
+static WEBP_INLINE void WebPInt32ToMem(uint8_t* const ptr, int val) {
+  WebPUint32ToMem(ptr, (uint32_t)val);
+}
+
+
+static WEBP_INLINE int GetLE16(const uint8_t* const data) {
+  return (int)(data[0] << 0) | (data[1] << 8);
+}
+
+static WEBP_INLINE int GetLE24(const uint8_t* const data) {
+  return GetLE16(data) | (data[2] << 16);
+}
+
+static WEBP_INLINE uint32_t GetLE32(const uint8_t* const data) {
+  return GetLE16(data) | ((uint32_t)GetLE16(data + 2) << 16);
+}
+
+static WEBP_INLINE void PutLE16(uint8_t* const data, int val) {
+  assert(val < (1 << 16));
+  data[0] = (val >> 0) & 0xff;
+  data[1] = (val >> 8) & 0xff;
+}
+
+static WEBP_INLINE void PutLE24(uint8_t* const data, int val) {
+  assert(val < (1 << 24));
+  PutLE16(data, val & 0xffff);
+  data[2] = (val >> 16) & 0xff;
+}
+
+static WEBP_INLINE void PutLE32(uint8_t* const data, uint32_t val) {
+  PutLE16(data, (int)(val & 0xffff));
+  PutLE16(data + 2, (int)(val >> 16));
+}
+
+#if defined(__GNUC__) && \
+    ((__GNUC__ == 3 && __GNUC_MINOR__ >= 4) || __GNUC__ >= 4)
+static WEBP_INLINE int BitsLog2Floor(uint32_t n) {
+  return 31 ^ __builtin_clz(n);
+}
+static WEBP_INLINE int BitsCtz(uint32_t n) { return __builtin_ctz(n); }
+#elif defined(_MSC_VER) && _MSC_VER > 1310 && \
+      (defined(_M_X64) || defined(_M_IX86))
+#include <intrin.h>
+#pragma intrinsic(_BitScanReverse)
+#pragma intrinsic(_BitScanForward)
+
+static WEBP_INLINE int BitsLog2Floor(uint32_t n) {
+  unsigned long first_set_bit;  // NOLINT (runtime/int)
+  _BitScanReverse(&first_set_bit, n);
+  return first_set_bit;
+}
+static WEBP_INLINE int BitsCtz(uint32_t n) {
+  unsigned long first_set_bit;  // NOLINT (runtime/int)
+  _BitScanForward(&first_set_bit, n);
+  return first_set_bit;
+}
+#else
+#define WEBP_HAVE_SLOW_CLZ_CTZ   // signal that the Clz/Ctz function are slow
+#define WEBP_NEED_LOG_TABLE_8BIT
+extern const uint8_t WebPLogTable8bit[256];
+static WEBP_INLINE int WebPLog2FloorC(uint32_t n) {
+  int log_value = 0;
+  while (n >= 256) {
+    log_value += 8;
+    n >>= 8;
+  }
+  return log_value + WebPLogTable8bit[n];
+}
+
+static WEBP_INLINE int BitsLog2Floor(uint32_t n) { return WebPLog2FloorC(n); }
+
+static WEBP_INLINE int BitsCtz(uint32_t n) {
+  int i;
+  for (i = 0; i < 32; ++i, n >>= 1) {
+    if (n & 1) return i;
+  }
+  return 32;
+}
+
+#endif
+
+
+struct WebPPicture;
+
+WEBP_EXTERN void WebPCopyPlane(const uint8_t* src, int src_stride,
+                               uint8_t* dst, int dst_stride,
+                               int width, int height);
+
+WEBP_EXTERN void WebPCopyPixels(const struct WebPPicture* const src,
+                                struct WebPPicture* const dst);
+
+
+WEBP_EXTERN int WebPGetColorPalette(const struct WebPPicture* const pic,
+                                    uint32_t* const palette);
+
+
+#if defined(__cplusplus)
+}    
+#endif
+
+#endif

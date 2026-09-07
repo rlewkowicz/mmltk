@@ -1,0 +1,128 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+const STORAGE_MAX_EVENTS = 1000;
+
+var _consoleStorage = new Map();
+
+function _isDestroyedInnerWindow(aId) {
+  if (Services.appinfo.processType !== Services.appinfo.PROCESS_TYPE_DEFAULT) {
+    return false;
+  }
+  let innerId = Number(aId);
+  return (
+    Number.isInteger(innerId) && !WindowGlobalParent.getByInnerWindowId(innerId)
+  );
+}
+
+var _logEventListeners = [];
+
+const CONSOLEAPISTORAGE_CID = Components.ID(
+  "{96cf7855-dfa9-4c6d-8276-f9705b4890f2}"
+);
+
+export function ConsoleAPIStorageService() {
+  this.init();
+}
+
+ConsoleAPIStorageService.prototype = {
+  classID: CONSOLEAPISTORAGE_CID,
+  QueryInterface: ChromeUtils.generateQI([
+    "nsIConsoleAPIStorage",
+    "nsIObserver",
+  ]),
+
+  observe: function CS_observe(aSubject, aTopic) {
+    if (aTopic == "xpcom-shutdown") {
+      Services.obs.removeObserver(this, "xpcom-shutdown");
+      Services.obs.removeObserver(this, "inner-window-destroyed");
+      Services.obs.removeObserver(this, "memory-pressure");
+    } else if (aTopic == "inner-window-destroyed") {
+      let innerWindowID = aSubject.QueryInterface(Ci.nsISupportsPRUint64).data;
+      this.clearEvents(innerWindowID + "");
+    } else if (aTopic == "memory-pressure") {
+      this.clearEvents();
+    }
+  },
+
+  init: function CS_init() {
+    Services.obs.addObserver(this, "xpcom-shutdown");
+    Services.obs.addObserver(this, "inner-window-destroyed");
+    Services.obs.addObserver(this, "memory-pressure");
+  },
+
+  getEvents: function CS_getEvents(aId) {
+    if (aId != null) {
+      return (_consoleStorage.get(aId) || []).slice(0);
+    }
+
+    let result = [];
+
+    for (let [, events] of _consoleStorage) {
+      result.push.apply(result, events);
+    }
+
+    return result.sort(function (a, b) {
+      return a.timeStamp - b.timeStamp;
+    });
+  },
+
+  addLogEventListener: function CS_addLogEventListener(aListener, aPrincipal) {
+    const clone = !aPrincipal.subsumes(
+      Cc["@mozilla.org/systemprincipal;1"].createInstance(Ci.nsIPrincipal)
+    );
+    _logEventListeners.push({
+      callback: aListener,
+      clone,
+    });
+  },
+
+  removeLogEventListener: function CS_removeLogEventListener(aListener) {
+    const index = _logEventListeners.findIndex(l => l.callback === aListener);
+    if (index != -1) {
+      _logEventListeners.splice(index, 1);
+    } else {
+      console.error(
+        "Attempted to remove a log event listener that does not exist."
+      );
+    }
+  },
+
+  recordEvent: function CS_recordEvent(aId, aEvent) {
+    if (!_isDestroyedInnerWindow(aId)) {
+      if (!_consoleStorage.has(aId)) {
+        _consoleStorage.set(aId, []);
+      }
+
+      let storage = _consoleStorage.get(aId);
+
+      storage.push(aEvent);
+
+      if (storage.length > STORAGE_MAX_EVENTS) {
+        storage.shift();
+      }
+    }
+
+    for (let { callback, clone } of _logEventListeners) {
+      try {
+        if (clone) {
+          callback(Cu.cloneInto(aEvent, callback));
+        } else {
+          callback(aEvent);
+        }
+      } catch (e) {
+        console.error(e);
+      }
+    }
+  },
+
+  clearEvents: function CS_clearEvents(aId) {
+    if (aId != null) {
+      _consoleStorage.delete(aId);
+    } else {
+      _consoleStorage.clear();
+      Services.obs.notifyObservers(null, "console-storage-reset");
+    }
+  },
+};

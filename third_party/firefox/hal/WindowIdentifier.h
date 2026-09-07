@@ -1,0 +1,46 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_hal_WindowIdentifier_h
+#define mozilla_hal_WindowIdentifier_h
+
+#include "nsCOMPtr.h"
+#include "nsTArray.h"
+
+class nsPIDOMWindowInner;
+
+namespace mozilla {
+namespace hal {
+
+class WindowIdentifier {
+ public:
+  WindowIdentifier();
+
+  explicit WindowIdentifier(nsPIDOMWindowInner* window);
+
+  WindowIdentifier(nsTArray<uint64_t>&& id, nsPIDOMWindowInner* window);
+
+  typedef nsTArray<uint64_t> IDArrayType;
+  const IDArrayType& AsArray() const;
+
+  void AppendProcessID();
+
+  bool HasTraveledThroughIPC() const;
+
+  nsPIDOMWindowInner* GetWindow() const;
+
+ private:
+  uint64_t GetWindowID() const;
+
+  AutoTArray<uint64_t, 3> mID;
+  nsCOMPtr<nsPIDOMWindowInner> mWindow;
+#ifdef DEBUG
+  bool mIsEmpty = false;
+#endif
+};
+
+}  
+}  
+
+#endif  // mozilla_hal_WindowIdentifier_h

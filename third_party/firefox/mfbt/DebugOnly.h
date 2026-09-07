@@ -1,0 +1,71 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_DebugOnly_h
+#define mozilla_DebugOnly_h
+
+#include "mozilla/Attributes.h"
+
+#ifdef DEBUG
+#  include <utility>
+#endif
+
+namespace mozilla {
+
+template <typename T>
+class MOZ_STACK_CLASS DebugOnly {
+ public:
+#ifdef DEBUG
+  T value;
+
+  DebugOnly() = default;
+  MOZ_IMPLICIT DebugOnly(T&& aOther) : value(std::move(aOther)) {}
+  MOZ_IMPLICIT DebugOnly(const T& aOther) : value(aOther) {}
+  DebugOnly(const DebugOnly& aOther) : value(aOther.value) {}
+  DebugOnly& operator=(const T& aRhs) {
+    value = aRhs;
+    return *this;
+  }
+  DebugOnly& operator=(T&& aRhs) {
+    value = std::move(aRhs);
+    return *this;
+  }
+
+  void operator++(int) { value++; }
+  void operator--(int) { value--; }
+
+
+  T* operator&() { return &value; }
+
+  operator T&() { return value; }
+  operator const T&() const { return value; }
+
+  T& operator->() { return value; }
+  const T& operator->() const { return value; }
+
+  const T& inspect() const { return value; }
+
+#else
+  DebugOnly() = default;
+  MOZ_IMPLICIT DebugOnly(const T&) {}
+  DebugOnly(const DebugOnly&) {}
+  DebugOnly& operator=(const T&) { return *this; }
+  MOZ_IMPLICIT DebugOnly(T&&) {}
+  DebugOnly& operator=(T&&) { return *this; }
+  void operator++(int) {}
+  void operator--(int) {}
+  DebugOnly& operator+=(const T&) { return *this; }
+  DebugOnly& operator-=(const T&) { return *this; }
+  DebugOnly& operator&=(const T&) { return *this; }
+  DebugOnly& operator|=(const T&) { return *this; }
+  DebugOnly& operator^=(const T&) { return *this; }
+#endif
+
+  ~DebugOnly() {}
+};
+
+}  
+
+#endif /* mozilla_DebugOnly_h */

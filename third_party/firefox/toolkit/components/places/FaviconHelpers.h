@@ -1,0 +1,191 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#pragma once
+
+#include "nsIFaviconService.h"
+#include "nsIChannelEventSink.h"
+#include "nsIInterfaceRequestor.h"
+#include "nsIStreamListener.h"
+#include "mozIPlacesPendingOperation.h"
+#include "nsThreadUtils.h"
+#include "nsProxyRelease.h"
+#include "imgLoader.h"
+#include "ConcurrentConnection.h"
+
+class nsIPrincipal;
+
+#include "Database.h"
+#include "mozilla/storage.h"
+#include "mozilla/ipc/IPCCore.h"
+
+#define ICON_STATUS_UNKNOWN 0
+#define ICON_STATUS_SAVED 1 << 0
+#define ICON_STATUS_ASSOCIATED 1 << 1
+#define ICON_STATUS_CACHED 1 << 2
+
+#define TO_CHARBUFFER(_buffer) \
+  reinterpret_cast<char*>(const_cast<uint8_t*>(_buffer))
+#define TO_INTBUFFER(_string) \
+  reinterpret_cast<uint8_t*>(const_cast<char*>(_string.get()))
+
+#define PNG_MIME_TYPE "image/png"
+#define SVG_MIME_TYPE "image/svg+xml"
+
+#define MIN_FAVICON_EXPIRATION ((PRTime)1 * 24 * 60 * 60 * PR_USEC_PER_SEC)
+#define MAX_FAVICON_EXPIRATION ((PRTime)7 * 24 * 60 * 60 * PR_USEC_PER_SEC)
+
+namespace mozilla {
+namespace places {
+
+struct IconPayload {
+  IconPayload() : id(0), width(0) {
+    data.SetIsVoid(true);
+    mimeType.SetIsVoid(true);
+  }
+
+  int64_t id;
+  uint16_t width;
+  nsCString data;
+  nsCString mimeType;
+};
+
+struct IconData {
+  IconData()
+      : expiration(0), status(ICON_STATUS_UNKNOWN), rootIcon(0), flags(0) {}
+
+  nsCString spec;
+  nsCString host;
+  PRTime expiration;
+  uint16_t status;  
+  uint8_t rootIcon;
+  CopyableTArray<IconPayload> payloads;
+  uint16_t flags;  
+};
+
+struct PageData {
+  PageData() : id(0), placeId(0), canAddToHistory(true) {
+    guid.SetIsVoid(true);
+  }
+
+  int64_t id;       
+  int64_t placeId;  
+  nsCString spec;
+  nsCString host;
+  nsCString bookmarkedSpec;
+  bool canAddToHistory;  
+  nsCString guid;
+};
+
+struct FrameData {
+  FrameData(uint16_t aIndex, uint16_t aWidth) : index(aIndex), width(aWidth) {}
+
+  uint16_t index;
+  uint16_t width;
+};
+
+class AsyncAssociateIconToPage final : public Runnable {
+ public:
+  NS_DECL_NSIRUNNABLE
+
+  AsyncAssociateIconToPage(const IconData& aIcon, const PageData& aPage);
+
+ private:
+  IconData mIcon;
+  PageData mPage;
+};
+
+class AsyncSetIconForPage final : public Runnable {
+ public:
+  NS_DECL_NSIRUNNABLE
+
+  AsyncSetIconForPage(const IconData& aIcon, const PageData& aPage,
+                      dom::Promise* aPromise);
+
+ private:
+  nsMainThreadPtrHandle<dom::Promise> mPromise;
+  IconData mIcon;
+  PageData mPage;
+};
+
+using FaviconPromise =
+    mozilla::MozPromise<nsCOMPtr<nsIFavicon>, nsresult, true>;
+using BoolPromise = mozilla::MozPromise<bool, nsresult, true>;
+
+class AsyncGetFaviconForPageRunnable final : public Runnable {
+ public:
+  NS_DECL_NSIRUNNABLE
+
+  AsyncGetFaviconForPageRunnable(
+      const nsCOMPtr<nsIURI>& aPageURI, uint16_t aPreferredWidth,
+      const RefPtr<FaviconPromise::Private>& aPromise, bool aOnConcurrentConn);
+
+ private:
+  ~AsyncGetFaviconForPageRunnable();
+
+  nsCOMPtr<nsIURI> mPageURI;
+  uint16_t mPreferredWidth;
+  nsMainThreadPtrHandle<FaviconPromise::Private> mPromise;
+  bool mOnConcurrentConn;
+};
+
+class NotifyIconObservers final : public Runnable {
+ public:
+  NS_DECL_NSIRUNNABLE
+
+  NotifyIconObservers(const IconData& aIcon, const PageData& aPage);
+
+ private:
+  IconData mIcon;
+  PageData mPage;
+};
+
+class AsyncTryCopyFaviconsRunnable final : public Runnable {
+ public:
+  NS_DECL_NSIRUNNABLE
+
+  AsyncTryCopyFaviconsRunnable(const nsCOMPtr<nsIURI>& aFromPageURI,
+                               const nsCOMPtr<nsIURI>& aToPageURI,
+                               const bool aCanAddToHistoryForToPage,
+                               const RefPtr<BoolPromise::Private>& aPromise);
+
+ private:
+  nsCOMPtr<nsIURI> mFromPageURI;
+  nsCOMPtr<nsIURI> mToPageURI;
+  bool mCanAddToHistoryForToPage;
+  nsMainThreadPtrHandle<BoolPromise::Private> mPromise;
+};
+
+class ConnectionAdapter {
+ public:
+  explicit ConnectionAdapter(const RefPtr<Database>& aDB)
+      : mDatabase(aDB), mConcurrentConnection(nullptr) {}
+
+  explicit ConnectionAdapter(const RefPtr<ConcurrentConnection>& aConn)
+      : mDatabase(nullptr), mConcurrentConnection(aConn) {}
+
+  already_AddRefed<mozIStorageStatement> GetStatement(
+      const nsCString& aQuery) const {
+    MOZ_ASSERT(!NS_IsMainThread(), "Must be on helper thread");
+
+    if (mDatabase) {
+      return mDatabase->GetStatement(aQuery);
+    }
+    if (mConcurrentConnection) {
+      return mConcurrentConnection->GetStatementOnHelperThread(aQuery);
+    }
+    return nullptr;
+  }
+
+  explicit operator bool() const {
+    return mDatabase || mConcurrentConnection.get();
+  }
+
+ private:
+  RefPtr<Database> mDatabase;
+  RefPtr<ConcurrentConnection> mConcurrentConnection;
+};
+
+}  
+}  

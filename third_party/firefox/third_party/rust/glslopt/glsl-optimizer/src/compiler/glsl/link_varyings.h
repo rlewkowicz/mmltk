@@ -1,0 +1,186 @@
+/*
+ * Copyright © 2012 Intel Corporation
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice (including the next
+ * paragraph) shall be included in all copies or substantial portions of the
+ * Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ * DEALINGS IN THE SOFTWARE.
+ */
+
+#ifndef GLSL_LINK_VARYINGS_H
+#define GLSL_LINK_VARYINGS_H
+
+
+
+#include "main/glheader.h"
+#include "program/prog_parameter.h"
+#include "util/bitset.h"
+
+struct gl_shader_program;
+struct gl_shader;
+class ir_variable;
+
+
+struct tfeedback_candidate
+{
+   ir_variable *toplevel_var;
+
+   const glsl_type *type;
+
+   unsigned offset;
+};
+
+
+class tfeedback_decl
+{
+public:
+   void init(struct gl_context *ctx, const void *mem_ctx, const char *input);
+   static bool is_same(const tfeedback_decl &x, const tfeedback_decl &y);
+   bool assign_location(struct gl_context *ctx,
+                        struct gl_shader_program *prog);
+   unsigned get_num_outputs() const;
+   bool store(struct gl_context *ctx, struct gl_shader_program *prog,
+              struct gl_transform_feedback_info *info, unsigned buffer,
+              unsigned buffer_index, const unsigned max_outputs,
+              BITSET_WORD *used_components[MAX_FEEDBACK_BUFFERS],
+              bool *explicit_stride, bool has_xfb_qualifiers,
+              const void *mem_ctx) const;
+   const tfeedback_candidate *find_candidate(gl_shader_program *prog,
+                                             hash_table *tfeedback_candidates);
+   void set_lowered_candidate(const tfeedback_candidate *candidate);
+
+   bool is_next_buffer_separator() const
+   {
+      return this->next_buffer_separator;
+   }
+
+   bool is_varying_written() const
+   {
+      if (this->next_buffer_separator || this->skip_components)
+         return false;
+
+      return this->matched_candidate->toplevel_var->data.assigned;
+   }
+
+   bool is_varying() const
+   {
+      return !this->next_buffer_separator && !this->skip_components;
+   }
+
+   bool is_aligned(unsigned dmul, unsigned offset) const
+   {
+      return (dmul * (this->array_subscript + offset)) % 4 == 0;
+   }
+
+   const char *name() const
+   {
+      return this->orig_name;
+   }
+
+   unsigned get_stream_id() const
+   {
+      return this->stream_id;
+   }
+
+   unsigned get_buffer() const
+   {
+      return this->buffer;
+   }
+
+   unsigned get_offset() const
+   {
+      return this->offset;
+   }
+
+   unsigned num_components() const
+   {
+      if (this->lowered_builtin_array_variable)
+         return this->size;
+      else
+         return this->vector_elements * this->matrix_columns * this->size *
+            (this->is_64bit() ? 2 : 1);
+   }
+
+   unsigned get_location() const {
+      return this->location;
+   }
+
+private:
+
+   bool is_64bit() const
+   {
+      return _mesa_gl_datatype_is_64bit(this->type);
+   }
+
+   const char *orig_name;
+
+   const char *var_name;
+
+   bool is_subscripted;
+
+   unsigned array_subscript;
+
+   enum {
+      none,
+      clip_distance,
+      cull_distance,
+      tess_level_outer,
+      tess_level_inner,
+   } lowered_builtin_array_variable;
+
+   int location;
+
+   unsigned buffer;
+
+   unsigned offset;
+
+   unsigned location_frac;
+
+   unsigned vector_elements;
+
+   unsigned matrix_columns;
+
+   GLenum type;
+
+   unsigned size;
+
+   unsigned skip_components;
+
+   bool next_buffer_separator;
+
+   const tfeedback_candidate *matched_candidate;
+
+   unsigned stream_id;
+};
+
+bool
+link_varyings(struct gl_shader_program *prog, unsigned first, unsigned last,
+              struct gl_context *ctx, void *mem_ctx);
+
+void
+validate_first_and_last_interface_explicit_locations(struct gl_context *ctx,
+                                                     struct gl_shader_program *prog,
+                                                     gl_shader_stage first,
+                                                     gl_shader_stage last);
+
+void
+cross_validate_outputs_to_inputs(struct gl_context *ctx,
+                                 struct gl_shader_program *prog,
+                                 gl_linked_shader *producer,
+                                 gl_linked_shader *consumer);
+
+#endif /* GLSL_LINK_VARYINGS_H */

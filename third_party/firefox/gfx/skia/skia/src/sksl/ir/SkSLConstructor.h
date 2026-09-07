@@ -1,0 +1,118 @@
+/*
+ * Copyright 2016 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SKSL_CONSTRUCTOR)
+#define SKSL_CONSTRUCTOR
+
+#include "include/core/SkSpan.h"
+#include "src/sksl/SkSLDefines.h"
+#include "src/sksl/SkSLPosition.h"
+#include "src/sksl/ir/SkSLExpression.h"
+#include "src/sksl/ir/SkSLType.h"
+
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <string>
+#include <utility>
+
+namespace SkSL {
+
+class Context;
+enum class OperatorPrecedence : uint8_t;
+
+class AnyConstructor : public Expression {
+public:
+    AnyConstructor(Position pos, Kind kind, const Type* type)
+            : INHERITED(pos, kind, type) {}
+
+    virtual SkSpan<std::unique_ptr<Expression>> argumentSpan() = 0;
+    virtual SkSpan<const std::unique_ptr<Expression>> argumentSpan() const = 0;
+
+    std::string description(OperatorPrecedence) const override;
+
+    const Type& componentType() const {
+        return this->type().componentType();
+    }
+
+    bool supportsConstantValues() const override { return true; }
+    std::optional<double> getConstantValue(int n) const override;
+
+    ComparisonResult compareConstant(const Expression& other) const override;
+
+private:
+    using INHERITED = Expression;
+};
+
+class SingleArgumentConstructor : public AnyConstructor {
+public:
+    SingleArgumentConstructor(Position pos, Kind kind, const Type* type,
+                              std::unique_ptr<Expression> argument)
+            : INHERITED(pos, kind, type)
+            , fArgument(std::move(argument)) {}
+
+    std::unique_ptr<Expression>& argument() {
+        return fArgument;
+    }
+
+    const std::unique_ptr<Expression>& argument() const {
+        return fArgument;
+    }
+
+    SkSpan<std::unique_ptr<Expression>> argumentSpan() final {
+        return {&fArgument, 1};
+    }
+
+    SkSpan<const std::unique_ptr<Expression>> argumentSpan() const final {
+        return {&fArgument, 1};
+    }
+
+private:
+    std::unique_ptr<Expression> fArgument;
+
+    using INHERITED = AnyConstructor;
+};
+
+class MultiArgumentConstructor : public AnyConstructor {
+public:
+    MultiArgumentConstructor(Position pos, Kind kind, const Type* type,
+            ExpressionArray arguments)
+        : INHERITED(pos, kind, type)
+        , fArguments(std::move(arguments)) {}
+
+    ExpressionArray& arguments() {
+        return fArguments;
+    }
+
+    const ExpressionArray& arguments() const {
+        return fArguments;
+    }
+
+    SkSpan<std::unique_ptr<Expression>> argumentSpan() final {
+        return {&fArguments.front(), (size_t)fArguments.size()};
+    }
+
+    SkSpan<const std::unique_ptr<Expression>> argumentSpan() const final {
+        return {&fArguments.front(), (size_t)fArguments.size()};
+    }
+
+private:
+    ExpressionArray fArguments;
+
+    using INHERITED = AnyConstructor;
+};
+
+namespace Constructor {
+    std::unique_ptr<Expression> Convert(const Context& context,
+                                        Position pos,
+                                        const Type& type,
+                                        ExpressionArray args);
+}
+
+}  
+
+#endif

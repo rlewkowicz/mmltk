@@ -1,0 +1,1784 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
+
+const lazy = {};
+
+ChromeUtils.defineESModuleGetters(lazy, {
+  AboutReaderParent: "resource:///actors/AboutReaderParent.sys.mjs",
+  AppProvidedConfigEngine:
+    "moz-src:///toolkit/components/search/ConfigSearchEngine.sys.mjs",
+  CustomizableUI:
+    "moz-src:///browser/components/customizableui/CustomizableUI.sys.mjs",
+  FxAccounts: "resource://gre/modules/FxAccounts.sys.mjs",
+  PanelMultiView:
+    "moz-src:///browser/components/customizableui/PanelMultiView.sys.mjs",
+  ProfileAge: "resource://gre/modules/ProfileAge.sys.mjs",
+  ResetProfile: "resource://gre/modules/ResetProfile.sys.mjs",
+  SearchService: "moz-src:///toolkit/components/search/SearchService.sys.mjs",
+  UIState: "resource://services-sync/UIState.sys.mjs",
+  UpdateUtils: "resource://gre/modules/UpdateUtils.sys.mjs",
+});
+
+ChromeUtils.defineLazyGetter(lazy, "fxAccounts", () => {
+  return ChromeUtils.importESModule(
+    "resource://gre/modules/FxAccounts.sys.mjs"
+  ).getFxAccountsSingleton();
+});
+
+const PREF_LOG_LEVEL = "browser.uitour.loglevel";
+
+const BACKGROUND_PAGE_ACTIONS_ALLOWED = new Set([
+  "forceShowReaderIcon",
+  "getConfiguration",
+  "getTreatmentTag",
+  "hideHighlight",
+  "hideInfo",
+  "hideMenu",
+  "ping",
+  "registerPageID",
+  "setConfiguration",
+  "setTreatmentTag",
+]);
+const MAX_BUTTONS = 4;
+
+const TARGET_SEARCHENGINE_PREFIX = "searchEngine-";
+
+ChromeUtils.defineLazyGetter(lazy, "log", () => {
+  let { ConsoleAPI } = ChromeUtils.importESModule(
+    "resource://gre/modules/Console.sys.mjs"
+  );
+  let consoleOptions = {
+    maxLogLevelPref: PREF_LOG_LEVEL,
+    prefix: "UITour",
+  };
+  return new ConsoleAPI(consoleOptions);
+});
+
+export var UITour = {
+  url: null,
+  tourBrowsersByWindow: new WeakMap(),
+  noautohideMenus: new Set(),
+  availableTargetsCache: new WeakMap(),
+  clearAvailableTargetsCache() {
+    this.availableTargetsCache = new WeakMap();
+  },
+
+  _annotationPanelMutationObservers: new WeakMap(),
+
+  _initForBrowserObserverAdded: false,
+
+  highlightEffects: ["random", "wobble", "zoom", "color", "focus-outline"],
+  targets: new Map([
+    [
+      "accountStatus",
+      {
+        query: "#appMenu-fxa-label2",
+        widgetName: "appMenu-fxa-label2",
+      },
+    ],
+    [
+      "addons",
+      {
+        query: "#appMenu-extensions-themes-button",
+      },
+    ],
+    [
+      "appMenu",
+      {
+        addTargetListener: (aDocument, aCallback) => {
+          let panelPopup = aDocument.defaultView.PanelUI.panel;
+          panelPopup.addEventListener("popupshown", aCallback);
+        },
+        query: "#PanelUI-button",
+        removeTargetListener: (aDocument, aCallback) => {
+          let panelPopup = aDocument.defaultView.PanelUI.panel;
+          panelPopup.removeEventListener("popupshown", aCallback);
+        },
+      },
+    ],
+    ["backForward", { query: "#back-button" }],
+    ["bookmarks", { query: "#bookmarks-menu-button" }],
+    [
+      "forget",
+      {
+        allowAdd: true,
+        query: "#panic-button",
+        widgetName: "panic-button",
+      },
+    ],
+    ["help", { query: "#appMenu-help-button2" }],
+    ["home", { query: "#home-button" }],
+    [
+      "logins",
+      {
+        query: "#appMenu-passwords-button",
+      },
+    ],
+    [
+      "privateWindow",
+      {
+        query: "#appMenu-new-private-window-button2",
+      },
+    ],
+    [
+      "quit",
+      {
+        query: "#appMenu-quit-button2",
+      },
+    ],
+    ["readerMode-urlBar", { query: "#reader-mode-button" }],
+    [
+      "search",
+      {
+        infoPanelOffsetX: 18,
+        infoPanelPosition: "after_start",
+        query: Services.prefs.getBoolPref("browser.search.widget.new")
+          ? "#searchbar-new"
+          : "#searchbar",
+        widgetName: "search-container",
+      },
+    ],
+    [
+      "searchIcon",
+      {
+        query: aDocument => {
+          if (!Services.prefs.getBoolPref("browser.search.widget.new")) {
+            let searchbar = aDocument.getElementById("searchbar");
+            return searchbar.querySelector(".searchbar-search-button");
+          }
+          let searchbar = aDocument.getElementById("searchbar-new");
+          return searchbar.querySelector(".searchmode-switcher");
+        },
+        widgetName: "search-container",
+      },
+    ],
+    [
+      "selectedTabIcon",
+      {
+        query: aDocument => {
+          let selectedtab = aDocument.defaultView.gBrowser.selectedTab;
+          let element = selectedtab.iconImage;
+          if (!element || !UITour.isElementVisible(element)) {
+            return null;
+          }
+          return element;
+        },
+      },
+    ],
+    [
+      "urlbar",
+      {
+        query: "#urlbar-container",
+        widgetName: "urlbar-container",
+      },
+    ],
+    [
+      "pageAction-bookmark",
+      {
+        query: aDocument => {
+          let node = aDocument.getElementById("star-button-box");
+          return node && !node.hidden ? node : null;
+        },
+      },
+    ],
+    [
+      "profilesAppMenuButton",
+      {
+        query: "#appMenu-profiles-button",
+      },
+    ],
+  ]),
+
+  init() {
+    lazy.log.debug("Initializing UITour");
+    delete this.url;
+    ChromeUtils.defineLazyGetter(this, "url", function () {
+      return Services.urlFormatter.formatURLPref("browser.uitour.url");
+    });
+
+    let listenerMethods = [
+      "onWidgetAdded",
+      "onWidgetMoved",
+      "onWidgetRemoved",
+      "onWidgetReset",
+      "onAreaReset",
+    ];
+    lazy.CustomizableUI.addListener(
+      listenerMethods.reduce((listener, method) => {
+        listener[method] = () => this.clearAvailableTargetsCache();
+        return listener;
+      }, {})
+    );
+
+    Services.obs.addObserver(this, lazy.UIState.ON_UPDATE);
+  },
+
+  getNodeFromDocument(aDocument, aQuery) {
+    let viewCacheTemplate = aDocument.getElementById("appMenu-viewCache");
+    return (
+      aDocument.querySelector(aQuery) ||
+      viewCacheTemplate.content.querySelector(aQuery)
+    );
+  },
+
+  onPageEvent(aEvent, aBrowser) {
+    let browser = aBrowser;
+    let window = browser.documentGlobal;
+
+    if (!window.gBrowser) {
+      window = Services.wm.getMostRecentWindow("navigator:browser");
+    }
+
+    lazy.log.debug("onPageEvent:", aEvent.detail);
+
+    if (typeof aEvent.detail != "object") {
+      lazy.log.warn("Malformed event - detail not an object");
+      return false;
+    }
+
+    let action = aEvent.detail.action;
+    if (typeof action != "string" || !action) {
+      lazy.log.warn("Action not defined");
+      return false;
+    }
+
+    let data = aEvent.detail.data;
+    if (typeof data != "object") {
+      lazy.log.warn("Malformed event - data not an object");
+      return false;
+    }
+
+    if (
+      (aEvent.pageVisibilityState == "hidden" ||
+        aEvent.pageVisibilityState == "unloaded") &&
+      !BACKGROUND_PAGE_ACTIONS_ALLOWED.has(action)
+    ) {
+      lazy.log.warn(
+        "Ignoring disallowed action from a hidden page:",
+        action,
+        aEvent.pageVisibilityState
+      );
+      return false;
+    }
+
+    switch (action) {
+      case "registerPageID": {
+        break;
+      }
+
+      case "showHighlight": {
+        let targetPromise = this.getTarget(window, data.target);
+        targetPromise
+          .then(target => {
+            if (!target.node) {
+              lazy.log.error(
+                "UITour: Target could not be resolved: " + data.target
+              );
+              return;
+            }
+            let effect = undefined;
+            if (this.highlightEffects.includes(data.effect)) {
+              effect = data.effect;
+            }
+            this.showHighlight(window, target, effect);
+          })
+          .catch(lazy.log.error);
+        break;
+      }
+
+      case "hideHighlight": {
+        this.hideHighlight(window);
+        break;
+      }
+
+      case "showInfo": {
+        let targetPromise = this.getTarget(window, data.target, true);
+        targetPromise
+          .then(target => {
+            if (!target.node) {
+              lazy.log.error(
+                "UITour: Target could not be resolved: " + data.target
+              );
+              return;
+            }
+
+            let iconURL = null;
+            if (typeof data.icon == "string") {
+              iconURL = this.resolveURL(browser, data.icon);
+            }
+
+            let buttons = [];
+            if (Array.isArray(data.buttons) && data.buttons.length) {
+              for (let buttonData of data.buttons) {
+                if (
+                  typeof buttonData == "object" &&
+                  typeof buttonData.label == "string" &&
+                  typeof buttonData.callbackID == "string"
+                ) {
+                  let callback = buttonData.callbackID;
+                  let button = {
+                    label: buttonData.label,
+                    callback: () => {
+                      this.sendPageCallback(browser, callback);
+                    },
+                  };
+
+                  if (typeof buttonData.icon == "string") {
+                    button.iconURL = this.resolveURL(browser, buttonData.icon);
+                  }
+
+                  if (typeof buttonData.style == "string") {
+                    button.style = buttonData.style;
+                  }
+
+                  buttons.push(button);
+
+                  if (buttons.length == MAX_BUTTONS) {
+                    lazy.log.warn(
+                      "showInfo: Reached limit of allowed number of buttons"
+                    );
+                    break;
+                  }
+                }
+              }
+            }
+
+            let infoOptions = {};
+            if (typeof data.closeButtonCallbackID == "string") {
+              infoOptions.closeButtonCallback = () => {
+                this.sendPageCallback(browser, data.closeButtonCallbackID);
+              };
+            }
+            if (typeof data.targetCallbackID == "string") {
+              infoOptions.targetCallback = details => {
+                this.sendPageCallback(browser, data.targetCallbackID, details);
+              };
+            }
+
+            this.showInfo(
+              window,
+              target,
+              data.title,
+              data.text,
+              iconURL,
+              buttons,
+              infoOptions
+            );
+          })
+          .catch(lazy.log.error);
+        break;
+      }
+
+      case "hideInfo": {
+        this.hideInfo(window);
+        break;
+      }
+
+      case "showMenu": {
+        this.noautohideMenus.add(data.name);
+        this.showMenu(window, data.name, () => {
+          if (typeof data.showCallbackID == "string") {
+            this.sendPageCallback(browser, data.showCallbackID);
+          }
+        });
+        break;
+      }
+
+      case "hideMenu": {
+        this.noautohideMenus.delete(data.name);
+        this.hideMenu(window, data.name);
+        break;
+      }
+
+      case "showNewTab": {
+        this.showNewTab(window, browser);
+        break;
+      }
+
+      case "getConfiguration": {
+        if (typeof data.configuration != "string") {
+          lazy.log.warn("getConfiguration: No configuration option specified");
+          return false;
+        }
+
+        this.getConfiguration(
+          browser,
+          window,
+          data.configuration,
+          data.callbackID
+        );
+        break;
+      }
+
+      case "setConfiguration": {
+        if (typeof data.configuration != "string") {
+          lazy.log.warn("setConfiguration: No configuration option specified");
+          return false;
+        }
+
+        this.setConfiguration(window, data.configuration, data.value);
+        break;
+      }
+
+      case "openPreferences": {
+        if (typeof data.pane != "string" && typeof data.pane != "undefined") {
+          lazy.log.warn("openPreferences: Invalid pane specified");
+          return false;
+        }
+        window.openPreferences(data.pane);
+        break;
+      }
+
+      case "showFirefoxAccounts": {
+        Promise.resolve()
+          .then(() => {
+            return lazy.FxAccounts.canConnectAccount();
+          })
+          .then(canConnect => {
+            if (!canConnect) {
+              lazy.log.warn("showFirefoxAccounts: can't currently connect");
+              return null;
+            }
+            return data.email
+              ? lazy.FxAccounts.config.promiseEmailURI(
+                  data.email,
+                  data.entrypoint || "uitour"
+                )
+              : lazy.FxAccounts.config.promiseConnectAccountURI(
+                  data.entrypoint || "uitour"
+                );
+          })
+          .then(uri => {
+            if (!uri) {
+              return;
+            }
+            const url = new URL(uri);
+            if (!this._populateURLParams(url, data.extraURLParams)) {
+              lazy.log.warn(
+                "showFirefoxAccounts: invalid campaign args specified"
+              );
+              return;
+            }
+            browser.loadURI(url.URI, {
+              triggeringPrincipal:
+                Services.scriptSecurityManager.createNullPrincipal({}),
+            });
+          });
+        break;
+      }
+
+      case "showConnectAnotherDevice": {
+        lazy.FxAccounts.config
+          .promiseConnectDeviceURI(data.entrypoint || "uitour")
+          .then(uri => {
+            const url = new URL(uri);
+            if (!this._populateURLParams(url, data.extraURLParams)) {
+              lazy.log.warn(
+                "showConnectAnotherDevice: invalid campaign args specified"
+              );
+              return;
+            }
+
+            browser.loadURI(url.URI, {
+              triggeringPrincipal:
+                Services.scriptSecurityManager.createNullPrincipal({}),
+            });
+          });
+        break;
+      }
+
+      case "resetFirefox": {
+        if (lazy.ResetProfile.resetSupported()) {
+          lazy.ResetProfile.openConfirmationDialog(window);
+        }
+        break;
+      }
+
+      case "addNavBarWidget": {
+        let targetPromise = this.getTarget(window, data.name);
+        targetPromise
+          .then(target => {
+            this.addNavBarWidget(target, browser, data.callbackID);
+          })
+          .catch(lazy.log.error);
+        break;
+      }
+
+      case "setDefaultSearchEngine": {
+        let enginePromise = this.selectSearchEngine(data.identifier);
+        enginePromise.catch(console.error);
+        break;
+      }
+
+      case "pinToTaskbar": {
+        let shell = window.getShellService();
+        if (shell) {
+          shell.pinToTaskbar().catch(console.error);
+        }
+        break;
+      }
+
+      case "setTreatmentTag": {
+        let name = data.name;
+        let value = data.value;
+        Services.prefs.setStringPref("browser.uitour.treatment." + name, value);
+        break;
+      }
+
+      case "getTreatmentTag": {
+        let name = data.name;
+        let value;
+        try {
+          value = Services.prefs.getStringPref(
+            "browser.uitour.treatment." + name
+          );
+        } catch (ex) {}
+        this.sendPageCallback(browser, data.callbackID, { value });
+        break;
+      }
+
+      case "setSearchTerm": {
+        let targetPromise = this.getTarget(window, "search");
+        targetPromise.then(target => {
+          let searchbar = target.node;
+          searchbar.value = data.term;
+          if (!Services.prefs.getBoolPref("browser.search.widget.new")) {
+            searchbar.updateGoButtonVisibility();
+          }
+        });
+        break;
+      }
+
+      case "ping": {
+        if (typeof data.callbackID == "string") {
+          this.sendPageCallback(browser, data.callbackID);
+        }
+        break;
+      }
+
+      case "forceShowReaderIcon": {
+        lazy.AboutReaderParent.forceShowReaderIcon(browser);
+        break;
+      }
+
+      case "toggleReaderMode": {
+        let targetPromise = this.getTarget(window, "readerMode-urlBar");
+        targetPromise.then(target => {
+          lazy.AboutReaderParent.toggleReaderMode({ target: target.node });
+        });
+        break;
+      }
+
+      case "closeTab": {
+        let tabBrowser = browser.documentGlobal.gBrowser;
+        if (tabBrowser && tabBrowser.browsers.length > 1) {
+          tabBrowser.removeTab(tabBrowser.getTabForBrowser(browser));
+        }
+        break;
+      }
+
+      case "showProtectionReport": {
+        this.showProtectionReport(window, browser);
+        break;
+      }
+    }
+
+    if (action != "getConfiguration") {
+      this.initForBrowser(browser, window);
+    }
+
+    return true;
+  },
+
+  initForBrowser(aBrowser, window) {
+    let gBrowser = window.gBrowser;
+
+    if (gBrowser) {
+      gBrowser.tabContainer.addEventListener("TabSelect", this);
+    }
+
+    if (!this.tourBrowsersByWindow.has(window)) {
+      this.tourBrowsersByWindow.set(window, new Set());
+    }
+    this.tourBrowsersByWindow.get(window).add(aBrowser);
+
+    if (!this._initForBrowserObserverAdded) {
+      this._initForBrowserObserverAdded = true;
+      Services.obs.addObserver(this, "message-manager-close");
+    }
+    window.addEventListener("SSWindowClosing", this);
+  },
+
+  handleEvent(aEvent) {
+    lazy.log.debug("handleEvent: type =", aEvent.type, "event =", aEvent);
+    switch (aEvent.type) {
+      case "TabSelect": {
+        let window = aEvent.target.documentGlobal;
+
+        if (aEvent.detail && aEvent.detail.previousTab) {
+          let previousTab = aEvent.detail.previousTab;
+          let openTourWindows = this.tourBrowsersByWindow.get(window);
+          if (openTourWindows.has(previousTab.linkedBrowser)) {
+            this.teardownTourForBrowser(
+              window,
+              previousTab.linkedBrowser,
+              false
+            );
+          }
+        }
+
+        break;
+      }
+
+      case "SSWindowClosing": {
+        let window = aEvent.target;
+        this.teardownTourForWindow(window);
+        break;
+      }
+    }
+  },
+
+  observe(aSubject, aTopic) {
+    lazy.log.debug("observe: aTopic =", aTopic);
+    switch (aTopic) {
+      case "message-manager-close": {
+        for (let window of Services.wm.getEnumerator("navigator:browser")) {
+          if (window.closed) {
+            continue;
+          }
+
+          let tourBrowsers = this.tourBrowsersByWindow.get(window);
+          if (!tourBrowsers) {
+            continue;
+          }
+
+          for (let browser of tourBrowsers) {
+            let messageManager = browser.messageManager;
+            if (!messageManager || aSubject == messageManager) {
+              this.teardownTourForBrowser(window, browser, true);
+            }
+          }
+        }
+        break;
+      }
+      case lazy.UIState.ON_UPDATE: {
+        let syncState = lazy.UIState.get();
+        this.notify("FxA:SignedInStateChange", { status: syncState.status });
+        break;
+      }
+    }
+  },
+
+  _populateURLParams(url, extraURLParams) {
+    const FLOW_ID_LENGTH = 64;
+    const FLOW_BEGIN_TIME_LENGTH = 13;
+
+    if (typeof extraURLParams == "undefined") {
+      return true;
+    }
+    if (typeof extraURLParams != "string") {
+      lazy.log.warn("_populateURLParams: extraURLParams is not a string");
+      return false;
+    }
+    let urlParams;
+    try {
+      if (extraURLParams) {
+        urlParams = JSON.parse(extraURLParams);
+        if (typeof urlParams != "object") {
+          lazy.log.warn(
+            "_populateURLParams: extraURLParams is not a stringified object"
+          );
+          return false;
+        }
+      }
+    } catch (ex) {
+      lazy.log.warn("_populateURLParams: extraURLParams is not a JSON object");
+      return false;
+    }
+    if (urlParams) {
+      if (
+        (urlParams.flow_begin_time &&
+          urlParams.flow_begin_time.toString().length !==
+            FLOW_BEGIN_TIME_LENGTH) ||
+        (urlParams.flow_id && urlParams.flow_id.length !== FLOW_ID_LENGTH)
+      ) {
+        lazy.log.warn(
+          "_populateURLParams: flow parameters are not properly structured"
+        );
+        return false;
+      }
+
+      let reSimpleString = /^[-_a-zA-Z0-9]*$/;
+      for (let name in urlParams) {
+        let value = urlParams[name];
+        const validName =
+          name.startsWith("utm_") ||
+          name === "entrypoint_experiment" ||
+          name === "entrypoint_variation" ||
+          name === "flow_begin_time" ||
+          name === "flow_id" ||
+          name === "device_id";
+        if (
+          typeof name != "string" ||
+          !validName ||
+          !reSimpleString.test(name)
+        ) {
+          lazy.log.warn("_populateURLParams: invalid campaign param specified");
+          return false;
+        }
+        url.searchParams.append(name, value);
+      }
+    }
+    return true;
+  },
+  async teardownTourForBrowser(aWindow, aBrowser, aTourPageClosing = false) {
+    lazy.log.debug(
+      "teardownTourForBrowser: aBrowser = ",
+      aBrowser,
+      aTourPageClosing
+    );
+
+    let openTourBrowsers = this.tourBrowsersByWindow.get(aWindow);
+    if (aTourPageClosing && openTourBrowsers) {
+      openTourBrowsers.delete(aBrowser);
+    }
+
+    this.hideHighlight(aWindow);
+    this.hideInfo(aWindow);
+
+    await this.removePanelListeners(aWindow);
+
+    this.noautohideMenus.clear();
+
+    if (!openTourBrowsers || openTourBrowsers.size == 0) {
+      this.teardownTourForWindow(aWindow);
+    }
+  },
+
+  async removePanelListeners(aWindow) {
+    let panels = [
+      {
+        name: "appMenu",
+        node: aWindow.PanelUI.panel,
+        events: [
+          ["popuphidden", this.onPanelHidden],
+          ["popuphiding", this.onAppMenuHiding],
+          ["ViewShowing", this.onAppMenuSubviewShowing],
+        ],
+      },
+    ];
+    for (let panel of panels) {
+      if (panel.node.state != "closed") {
+        await new Promise(resolve => {
+          panel.node.addEventListener("popuphidden", resolve, { once: true });
+          this.hideMenu(aWindow, panel.name);
+        });
+      }
+      for (let [name, listener] of panel.events) {
+        panel.node.removeEventListener(name, listener);
+      }
+    }
+  },
+
+  teardownTourForWindow(aWindow) {
+    lazy.log.debug("teardownTourForWindow");
+    aWindow.gBrowser.tabContainer.removeEventListener("TabSelect", this);
+    aWindow.removeEventListener("SSWindowClosing", this);
+
+    this.tourBrowsersByWindow.delete(aWindow);
+  },
+
+  isSafeScheme(aURI) {
+    let allowedSchemes = new Set(["https", "about"]);
+    if (!allowedSchemes.has(aURI.scheme)) {
+      lazy.log.error("Unsafe scheme:", aURI.scheme);
+      return false;
+    }
+
+    return true;
+  },
+
+  resolveURL(aBrowser, aURL) {
+    try {
+      let uri = Services.io.newURI(aURL, null, aBrowser.currentURI);
+
+      if (!this.isSafeScheme(uri)) {
+        return null;
+      }
+
+      return uri.spec;
+    } catch (e) {}
+
+    return null;
+  },
+
+  sendPageCallback(aBrowser, aCallbackID, aData = {}) {
+    let detail = { data: aData, callbackID: aCallbackID };
+    lazy.log.debug("sendPageCallback", detail);
+    let contextToVisit = aBrowser.browsingContext;
+    let global = contextToVisit.currentWindowGlobal;
+    let actor = global.getActor("UITour");
+    actor.sendAsyncMessage("UITour:SendPageCallback", detail);
+  },
+
+  isElementVisible(aElement) {
+    let targetStyle = aElement.documentGlobal.getComputedStyle(aElement);
+    return (
+      !aElement.ownerDocument.hidden &&
+      targetStyle.display != "none" &&
+      targetStyle.visibility == "visible"
+    );
+  },
+
+  getTarget(aWindow, aTargetName) {
+    lazy.log.debug("getTarget:", aTargetName);
+    if (typeof aTargetName != "string" || !aTargetName) {
+      lazy.log.warn("getTarget: Invalid target name specified");
+      return Promise.reject("Invalid target name specified");
+    }
+
+    let targetObject = this.targets.get(aTargetName);
+    if (!targetObject) {
+      lazy.log.warn(
+        "getTarget: The specified target name is not in the allowed set"
+      );
+      return Promise.reject(
+        "The specified target name is not in the allowed set"
+      );
+    }
+
+    return new Promise(resolve => {
+      let targetQuery = targetObject.query;
+      aWindow.PanelUI.ensureReady()
+        .then(() => {
+          let node;
+          if (typeof targetQuery == "function") {
+            try {
+              node = targetQuery(aWindow.document);
+            } catch (ex) {
+              lazy.log.warn("getTarget: Error running target query:", ex);
+              node = null;
+            }
+          } else {
+            node = this.getNodeFromDocument(aWindow.document, targetQuery);
+          }
+
+          resolve({
+            addTargetListener: targetObject.addTargetListener,
+            infoPanelOffsetX: targetObject.infoPanelOffsetX,
+            infoPanelOffsetY: targetObject.infoPanelOffsetY,
+            infoPanelPosition: targetObject.infoPanelPosition,
+            node,
+            removeTargetListener: targetObject.removeTargetListener,
+            targetName: aTargetName,
+            widgetName: targetObject.widgetName,
+            allowAdd: targetObject.allowAdd,
+          });
+        })
+        .catch(lazy.log.error);
+    });
+  },
+
+  targetIsInAppMenu(aTarget) {
+    let targetElement = aTarget.node;
+    if (aTarget.widgetName) {
+      let doc = aTarget.node.documentGlobal.document;
+      targetElement =
+        doc.getElementById(aTarget.widgetName) ||
+        lazy.PanelMultiView.getViewNode(doc, aTarget.widgetName);
+    }
+
+    return targetElement.id.startsWith("appMenu-");
+  },
+
+  _setMenuStateForAnnotation(aWindow, aShouldOpen, aOptions = {}) {
+    lazy.log.debug(
+      "_setMenuStateForAnnotation: Menu is expected to be:",
+      aShouldOpen ? "open" : "closed"
+    );
+    let menu = aWindow.PanelUI.panel;
+
+    let panelIsOpen = menu.state != "closed";
+    if (aShouldOpen == panelIsOpen) {
+      lazy.log.debug(
+        "_setMenuStateForAnnotation: Menu already in expected state"
+      );
+      return Promise.resolve();
+    }
+
+    let promise = null;
+    if (aShouldOpen) {
+      lazy.log.debug("_setMenuStateForAnnotation: Opening the menu");
+      promise = new Promise(resolve => {
+        this.showMenu(aWindow, "appMenu", resolve, aOptions);
+      });
+    } else if (!this.noautohideMenus.has("appMenu")) {
+      lazy.log.debug("_setMenuStateForAnnotation: Closing the menu");
+      promise = new Promise(resolve => {
+        menu.addEventListener("popuphidden", resolve, { once: true });
+        this.hideMenu(aWindow, "appMenu");
+      });
+    }
+    return promise;
+  },
+
+  async _ensureTarget(aChromeWindow, aTarget, aOptions = {}) {
+    let shouldOpenAppMenu = false;
+    if (this.targetIsInAppMenu(aTarget)) {
+      shouldOpenAppMenu = true;
+    }
+
+    if (
+      !aTarget.node.closest("panelview") &&
+      !this.isElementVisible(aTarget.node)
+    ) {
+      return Promise.reject(
+        `_ensureTarget: Reject the ${
+          aTarget.name || aTarget.targetName
+        } target since it isn't visible.`
+      );
+    }
+
+    let menuClosePromises = [];
+    if (!shouldOpenAppMenu) {
+      menuClosePromises.push(
+        this._setMenuStateForAnnotation(aChromeWindow, false)
+      );
+    }
+
+    let promise = Promise.all(menuClosePromises);
+    await promise;
+    if (shouldOpenAppMenu) {
+      promise = this._setMenuStateForAnnotation(aChromeWindow, true, aOptions);
+    }
+    return promise;
+  },
+
+  async _correctAnchor(aChromeWindow, aTarget) {
+    let refreshedTarget = await this.getTarget(
+      aChromeWindow,
+      aTarget.targetName
+    );
+    let node = (aTarget.node = refreshedTarget.node);
+    if (node.closest("#widget-overflow-mainView")) {
+      return lazy.CustomizableUI.getWidget(node.id).forWindow(aChromeWindow)
+        .anchor;
+    }
+    return node;
+  },
+
+  async showHighlight(aChromeWindow, aTarget, aEffect = "none", aOptions = {}) {
+    let showHighlightElement = aAnchorEl => {
+      let highlighter = this.getHighlightAndMaybeCreate(aChromeWindow.document);
+
+      let effect = aEffect;
+      if (effect == "random") {
+        let randomEffect =
+          1 + Math.floor(Math.random() * (this.highlightEffects.length - 1));
+        if (randomEffect == this.highlightEffects.length) {
+          randomEffect--;
+        } 
+        effect = this.highlightEffects[randomEffect];
+      }
+      highlighter.setAttribute("active", "none");
+      aChromeWindow.getComputedStyle(highlighter).animationName;
+      highlighter.setAttribute("active", effect);
+      highlighter.parentElement.setAttribute("targetName", aTarget.targetName);
+      highlighter.parentElement.hidden = false;
+
+      let highlightAnchor = aAnchorEl;
+      let targetRect = highlightAnchor.getBoundingClientRect();
+      let highlightHeight = targetRect.height;
+      let highlightWidth = targetRect.width;
+
+      if (this.targetIsInAppMenu(aTarget)) {
+        highlighter.classList.remove("rounded-highlight");
+      } else {
+        highlighter.classList.add("rounded-highlight");
+      }
+      if (
+        highlightAnchor.classList.contains("toolbarbutton-1") &&
+        highlightAnchor.getAttribute("cui-areatype") === "toolbar" &&
+        highlightAnchor.getAttribute("overflowedItem") !== "true"
+      ) {
+        highlightHeight = highlightWidth;
+      }
+
+      highlighter.style.height = highlightHeight + "px";
+      highlighter.style.width = highlightWidth + "px";
+
+      if (
+        highlighter.parentElement.state == "showing" ||
+        highlighter.parentElement.state == "open"
+      ) {
+        lazy.log.debug("showHighlight: Closing previous highlight first");
+        highlighter.parentElement.hidePopup();
+      }
+      let highlightWindow = aChromeWindow;
+      let highlightStyle = highlightWindow.getComputedStyle(highlighter);
+      let highlightHeightWithMin = Math.max(
+        highlightHeight,
+        parseFloat(highlightStyle.minHeight)
+      );
+      let highlightWidthWithMin = Math.max(
+        highlightWidth,
+        parseFloat(highlightStyle.minWidth)
+      );
+      let offsetX = (targetRect.width - highlightWidthWithMin) / 2;
+      let offsetY = (targetRect.height - highlightHeightWithMin) / 2;
+      this._addAnnotationPanelMutationObserver(highlighter.parentElement);
+      highlighter.parentElement.openPopup(
+        highlightAnchor,
+        "overlap",
+        offsetX,
+        offsetY
+      );
+    };
+
+    try {
+      await this._ensureTarget(aChromeWindow, aTarget, aOptions);
+      let anchorEl = await this._correctAnchor(aChromeWindow, aTarget);
+      showHighlightElement(anchorEl);
+    } catch (e) {
+      lazy.log.warn(e);
+    }
+  },
+
+  _hideHighlightElement(aWindow) {
+    let highlighter = this.getHighlightAndMaybeCreate(aWindow.document);
+    this._removeAnnotationPanelMutationObserver(highlighter.parentElement);
+    highlighter.parentElement.hidePopup();
+    highlighter.removeAttribute("active");
+  },
+
+  hideHighlight(aWindow) {
+    this._hideHighlightElement(aWindow);
+    this._setMenuStateForAnnotation(aWindow, false);
+  },
+
+  async showInfo(
+    aChromeWindow,
+    aAnchor,
+    aTitle = "",
+    aDescription = "",
+    aIconURL = "",
+    aButtons = [],
+    aOptions = {}
+  ) {
+    let showInfoElement = aAnchorEl => {
+      aAnchorEl.focus();
+
+      let document = aChromeWindow.document;
+      let tooltip = this.getTooltipAndMaybeCreate(document);
+      let tooltipTitle = document.getElementById("UITourTooltipTitle");
+      let tooltipDesc = document.getElementById("UITourTooltipDescription");
+      let tooltipIcon = document.getElementById("UITourTooltipIcon");
+      let tooltipButtons = document.getElementById("UITourTooltipButtons");
+
+      if (tooltip.state == "showing" || tooltip.state == "open") {
+        tooltip.hidePopup();
+      }
+
+      tooltipTitle.textContent = aTitle || "";
+      tooltipDesc.textContent = aDescription || "";
+      tooltipIcon.src = aIconURL || "";
+      tooltipIcon.hidden = !aIconURL;
+
+      while (tooltipButtons.firstChild) {
+        tooltipButtons.firstChild.remove();
+      }
+
+      for (let button of aButtons) {
+        let isButton = button.style != "text";
+        let el = document.createXULElement(isButton ? "button" : "label");
+        el.setAttribute(isButton ? "label" : "value", button.label);
+
+        if (isButton) {
+          if (button.iconURL) {
+            el.setAttribute("image", button.iconURL);
+          }
+
+          if (button.style == "link") {
+            el.setAttribute("class", "button-link");
+          }
+
+          if (button.style == "primary") {
+            el.setAttribute("class", "button-primary");
+          }
+
+          let callback = button.callback;
+          el.addEventListener("command", event => {
+            tooltip.hidePopup();
+            callback(event);
+          });
+        }
+
+        tooltipButtons.appendChild(el);
+      }
+
+      tooltipButtons.hidden = !aButtons.length;
+
+      let tooltipClose = document.getElementById("UITourTooltipClose");
+      let closeButtonCallback = () => {
+        this.hideInfo(document.defaultView);
+        if (aOptions && aOptions.closeButtonCallback) {
+          aOptions.closeButtonCallback();
+        }
+      };
+      tooltipClose.addEventListener("command", closeButtonCallback);
+
+      let targetCallback = event => {
+        let details = {
+          target: aAnchor.targetName,
+          type: event.type,
+        };
+        aOptions.targetCallback(details);
+      };
+      if (aOptions.targetCallback && aAnchor.addTargetListener) {
+        aAnchor.addTargetListener(document, targetCallback);
+      }
+
+      tooltip.addEventListener(
+        "popuphiding",
+        function () {
+          tooltipClose.removeEventListener("command", closeButtonCallback);
+          if (aOptions.targetCallback && aAnchor.removeTargetListener) {
+            aAnchor.removeTargetListener(document, targetCallback);
+          }
+        },
+        { once: true }
+      );
+
+      tooltip.setAttribute("targetName", aAnchor.targetName);
+
+      let alignment = "bottomright topright";
+      if (aAnchor.infoPanelPosition) {
+        alignment = aAnchor.infoPanelPosition;
+      }
+
+      let { infoPanelOffsetX: xOffset, infoPanelOffsetY: yOffset } = aAnchor;
+
+      this._addAnnotationPanelMutationObserver(tooltip);
+      tooltip.openPopup(aAnchorEl, alignment, xOffset || 0, yOffset || 0);
+      if (tooltip.state == "closed") {
+        document.defaultView.addEventListener(
+          "endmodalstate",
+          function () {
+            tooltip.openPopup(aAnchorEl, alignment);
+          },
+          { once: true }
+        );
+      }
+    };
+
+    try {
+      await this._ensureTarget(aChromeWindow, aAnchor);
+      let anchorEl = await this._correctAnchor(aChromeWindow, aAnchor);
+      showInfoElement(anchorEl);
+    } catch (e) {
+      lazy.log.warn(e);
+    }
+  },
+
+  getHighlightContainerAndMaybeCreate(document) {
+    let highlightContainer = document.getElementById(
+      "UITourHighlightContainer"
+    );
+    if (!highlightContainer) {
+      let wrapper = document.getElementById("UITourHighlightTemplate");
+      wrapper.replaceWith(wrapper.content);
+      highlightContainer = document.getElementById("UITourHighlightContainer");
+    }
+
+    return highlightContainer;
+  },
+
+  getTooltipAndMaybeCreate(document) {
+    let tooltip = document.getElementById("UITourTooltip");
+    if (!tooltip) {
+      let wrapper = document.getElementById("UITourTooltipTemplate");
+      wrapper.replaceWith(wrapper.content);
+      tooltip = document.getElementById("UITourTooltip");
+    }
+    return tooltip;
+  },
+
+  getHighlightAndMaybeCreate(document) {
+    let highlight = document.getElementById("UITourHighlight");
+    if (!highlight) {
+      let wrapper = document.getElementById("UITourHighlightTemplate");
+      wrapper.replaceWith(wrapper.content);
+      highlight = document.getElementById("UITourHighlight");
+    }
+    return highlight;
+  },
+
+  isInfoOnTarget(aChromeWindow, aTargetName) {
+    let document = aChromeWindow.document;
+    let tooltip = this.getTooltipAndMaybeCreate(document);
+    return (
+      tooltip.getAttribute("targetName") == aTargetName &&
+      tooltip.state != "closed"
+    );
+  },
+
+  _hideInfoElement(aWindow) {
+    let document = aWindow.document;
+    let tooltip = this.getTooltipAndMaybeCreate(document);
+    this._removeAnnotationPanelMutationObserver(tooltip);
+    tooltip.hidePopup();
+    let tooltipButtons = document.getElementById("UITourTooltipButtons");
+    while (tooltipButtons.firstChild) {
+      tooltipButtons.firstChild.remove();
+    }
+  },
+
+  hideInfo(aWindow) {
+    this._hideInfoElement(aWindow);
+    this._setMenuStateForAnnotation(aWindow, false);
+  },
+
+  showMenu(aWindow, aMenuName, aOpenCallback = null, aOptions = {}) {
+    lazy.log.debug("showMenu:", aMenuName);
+    function openMenuButton(aMenuBtn) {
+      if (!aMenuBtn || !aMenuBtn.hasMenu() || aMenuBtn.open) {
+        if (aOpenCallback) {
+          aOpenCallback();
+        }
+        return;
+      }
+      if (aOpenCallback) {
+        aMenuBtn.addEventListener("popupshown", aOpenCallback, { once: true });
+      }
+      aMenuBtn.openMenu(true);
+    }
+
+    if (aMenuName == "appMenu") {
+      let menu = {
+        onPanelHidden: this.onPanelHidden,
+      };
+      menu.node = aWindow.PanelUI.panel;
+      menu.onPopupHiding = this.onAppMenuHiding;
+      menu.onViewShowing = this.onAppMenuSubviewShowing;
+      menu.show = () => aWindow.PanelUI.show();
+
+      if (!aOptions.autohide) {
+        menu.node.setAttribute("noautohide", "true");
+      }
+      if (menu.node.state != "open") {
+        this.recreatePopup(menu.node);
+      }
+      if (aOpenCallback) {
+        menu.node.addEventListener("popupshown", aOpenCallback, { once: true });
+      }
+      menu.node.addEventListener("popuphidden", menu.onPanelHidden);
+      menu.node.addEventListener("popuphiding", menu.onPopupHiding);
+      menu.node.addEventListener("ViewShowing", menu.onViewShowing);
+      menu.show();
+    } else if (aMenuName == "bookmarks") {
+      let menuBtn = aWindow.document.getElementById("bookmarks-menu-button");
+      openMenuButton(menuBtn);
+    } else if (aMenuName == "urlbar") {
+      let urlbar = aWindow.gURLBar;
+      if (aOpenCallback) {
+        urlbar.panel.addEventListener("popupshown", aOpenCallback, {
+          once: true,
+        });
+      }
+      urlbar.focus();
+      const SEARCH_STRING = "Firefox";
+      urlbar.value = SEARCH_STRING;
+      urlbar.select();
+      urlbar.startQuery({
+        searchString: SEARCH_STRING,
+        allowAutofill: false,
+      });
+    }
+  },
+
+  hideMenu(aWindow, aMenuName) {
+    lazy.log.debug("hideMenu:", aMenuName);
+    function closeMenuButton(aMenuBtn) {
+      if (aMenuBtn && aMenuBtn.hasMenu()) {
+        aMenuBtn.openMenu(false);
+      }
+    }
+
+    if (aMenuName == "appMenu") {
+      aWindow.PanelUI.hide();
+    } else if (aMenuName == "bookmarks") {
+      let menuBtn = aWindow.document.getElementById("bookmarks-menu-button");
+      closeMenuButton(menuBtn);
+    } else if (aMenuName == "urlbar") {
+      aWindow.gURLBar.view.close();
+    }
+  },
+
+  showNewTab(aWindow, aBrowser) {
+    aWindow.gURLBar.focus();
+    let url = "about:newtab";
+    aWindow.openLinkIn(url, "current", {
+      targetBrowser: aBrowser,
+      triggeringPrincipal:
+        Services.scriptSecurityManager.createContentPrincipal(
+          Services.io.newURI(url),
+          {}
+        ),
+    });
+  },
+
+  showProtectionReport(aWindow, aBrowser) {
+    let url = "about:protections";
+    aWindow.openLinkIn(url, "current", {
+      targetBrowser: aBrowser,
+      triggeringPrincipal:
+        Services.scriptSecurityManager.createContentPrincipal(
+          Services.io.newURI(url),
+          {}
+        ),
+    });
+  },
+
+  _hideAnnotationsForPanel(aEvent, aShouldClosePanel, aTargetPositionCallback) {
+    let win = aEvent.target.documentGlobal;
+    let hideHighlightMethod = null;
+    let hideInfoMethod = null;
+    if (aShouldClosePanel) {
+      hideHighlightMethod = aWin => this.hideHighlight(aWin);
+      hideInfoMethod = aWin => this.hideInfo(aWin);
+    } else {
+      hideHighlightMethod = aWin => this._hideHighlightElement(aWin);
+      hideInfoMethod = aWin => this._hideInfoElement(aWin);
+    }
+    let annotationElements = new Map([
+      [
+        this.getHighlightContainerAndMaybeCreate(win.document),
+        hideHighlightMethod,
+      ],
+      [this.getTooltipAndMaybeCreate(win.document), hideInfoMethod],
+    ]);
+    annotationElements.forEach((hideMethod, annotationElement) => {
+      if (annotationElement.state != "closed") {
+        let targetName = annotationElement.getAttribute("targetName");
+        UITour.getTarget(win, targetName)
+          .then(aTarget => {
+            if (
+              annotationElement.getAttribute("targetName") !=
+                aTarget.targetName ||
+              annotationElement.state == "closed" ||
+              !aTargetPositionCallback(aTarget)
+            ) {
+              return;
+            }
+            hideMethod(win);
+          })
+          .catch(lazy.log.error);
+      }
+    });
+  },
+
+  onAppMenuHiding(aEvent) {
+    UITour._hideAnnotationsForPanel(aEvent, true, UITour.targetIsInAppMenu);
+  },
+
+  onAppMenuSubviewShowing(aEvent) {
+    UITour._hideAnnotationsForPanel(aEvent, false, UITour.targetIsInAppMenu);
+  },
+
+  onPanelHidden(aEvent) {
+    aEvent.target.removeAttribute("noautohide");
+    UITour.recreatePopup(aEvent.target);
+    UITour.clearAvailableTargetsCache();
+  },
+
+  recreatePopup(aPanel) {
+    if (aPanel.hidden) {
+      aPanel.clientWidth; 
+      return;
+    }
+    aPanel.hidden = true;
+    aPanel.clientWidth; 
+    aPanel.hidden = false;
+  },
+
+  getConfiguration(aBrowser, aWindow, aConfiguration, aCallbackID) {
+    switch (aConfiguration) {
+      case "appinfo":
+        this.getAppInfo(aBrowser, aWindow, aCallbackID);
+        break;
+      case "availableTargets":
+        this.getAvailableTargets(aBrowser, aWindow, aCallbackID);
+        break;
+      case "search":
+      case "selectedSearchEngine":
+        lazy.SearchService.getVisibleEngines()
+          .then(engines => {
+            let { defaultEngine } = lazy.SearchService;
+            this.sendPageCallback(aBrowser, aCallbackID, {
+              searchEngineIdentifier:
+                defaultEngine instanceof lazy.AppProvidedConfigEngine
+                  ? defaultEngine.id
+                  : null,
+              engines: engines
+                .filter(
+                  engine => engine instanceof lazy.AppProvidedConfigEngine
+                )
+                .map(engine => TARGET_SEARCHENGINE_PREFIX + engine.id),
+            });
+          })
+          .catch(() => {
+            this.sendPageCallback(aBrowser, aCallbackID, {
+              engines: [],
+              searchEngineIdentifier: "",
+            });
+          });
+        break;
+      case "fxa":
+        this.getFxA(aBrowser, aCallbackID);
+        break;
+      case "fxaConnections":
+        this.getFxAConnections(aBrowser, aCallbackID);
+        break;
+
+      case "sync":
+        this.sendPageCallback(aBrowser, aCallbackID, {
+          setup: Services.prefs.prefHasUserValue("services.sync.username"),
+          desktopDevices: Services.prefs.getIntPref(
+            "services.sync.clients.devices.desktop",
+            0
+          ),
+          mobileDevices: Services.prefs.getIntPref(
+            "services.sync.clients.devices.mobile",
+            0
+          ),
+          totalDevices: Services.prefs.getIntPref(
+            "services.sync.numClients",
+            0
+          ),
+        });
+        break;
+      case "canReset":
+        this.sendPageCallback(
+          aBrowser,
+          aCallbackID,
+          lazy.ResetProfile.resetSupported()
+        );
+        break;
+      default:
+        lazy.log.error(
+          "getConfiguration: Unknown configuration requested: " + aConfiguration
+        );
+        break;
+    }
+  },
+
+  async setConfiguration(aWindow, aConfiguration, _aValue) {
+    switch (aConfiguration) {
+      case "defaultBrowser":
+        try {
+          let shell = aWindow.getShellService();
+          if (shell) {
+            await shell.setDefaultBrowser(false);
+          }
+        } catch (e) {}
+        break;
+      default:
+        lazy.log.error(
+          "setConfiguration: Unknown configuration requested: " + aConfiguration
+        );
+        break;
+    }
+  },
+
+  getFxA(aBrowser, aCallbackID) {
+    (async () => {
+      let setup = !!(await lazy.fxAccounts.getSignedInUser());
+      let result = { setup };
+      if (!setup) {
+        this.sendPageCallback(aBrowser, aCallbackID, result);
+        return;
+      }
+      result.browserServices = {};
+      let hasSync = Services.prefs.prefHasUserValue("services.sync.username");
+      if (hasSync) {
+        result.browserServices.sync = {
+          setup: true,
+          desktopDevices: Services.prefs.getIntPref(
+            "services.sync.clients.devices.desktop",
+            0
+          ),
+          mobileDevices: Services.prefs.getIntPref(
+            "services.sync.clients.devices.mobile",
+            0
+          ),
+          totalDevices: Services.prefs.getIntPref(
+            "services.sync.numClients",
+            0
+          ),
+        };
+      }
+      result.accountStateOK = await lazy.fxAccounts.hasLocalSession();
+      this.sendPageCallback(aBrowser, aCallbackID, result);
+    })().catch(err => {
+      lazy.log.error(err);
+      this.sendPageCallback(aBrowser, aCallbackID, {});
+    });
+  },
+
+  getFxAConnections(aBrowser, aCallbackID) {
+    (async () => {
+      let setup = !!(await lazy.fxAccounts.getSignedInUser());
+      let result = { setup };
+      if (!setup) {
+        this.sendPageCallback(aBrowser, aCallbackID, result);
+        return;
+      }
+      let devices = lazy.fxAccounts.device.recentDeviceList;
+      if (!devices) {
+        try {
+          await lazy.fxAccounts.device.refreshDeviceList();
+        } catch (ex) {
+          lazy.log.warn("failed to fetch device list", ex);
+        }
+        devices = lazy.fxAccounts.device.recentDeviceList;
+      }
+      if (devices) {
+        result.numOtherDevices = Math.max(0, devices.length - 1);
+        result.numDevicesByType = devices
+          .filter(d => !d.isCurrentDevice)
+          .reduce((accum, d) => {
+            let type = d.type || "unknown";
+            accum[type] = (accum[type] || 0) + 1;
+            return accum;
+          }, {});
+      }
+
+      try {
+        let attachedClients = await lazy.fxAccounts.listAttachedOAuthClients();
+        result.accountServices = attachedClients
+          .filter(c => !!c.id)
+          .reduce((accum, c) => {
+            accum[c.id] = {
+              id: c.id,
+              lastAccessedWeeksAgo: c.lastAccessedDaysAgo
+                ? Math.floor(c.lastAccessedDaysAgo / 7)
+                : null,
+            };
+            return accum;
+          }, {});
+      } catch (ex) {
+        lazy.log.warn("Failed to build the attached clients list", ex);
+      }
+      this.sendPageCallback(aBrowser, aCallbackID, result);
+    })().catch(err => {
+      lazy.log.error(err);
+      this.sendPageCallback(aBrowser, aCallbackID, {});
+    });
+  },
+
+  getAppInfo(aBrowser, aWindow, aCallbackID) {
+    (async () => {
+      let appinfo = { version: Services.appinfo.version };
+
+      let distribution = Services.prefs
+        .getDefaultBranch("distribution.")
+        .getCharPref("id", "default");
+      appinfo.distribution = distribution;
+
+      appinfo.defaultUpdateChannel = lazy.UpdateUtils.getUpdateChannel(
+        false 
+      );
+
+      let isDefaultBrowser = null;
+      try {
+        let shell = aWindow.getShellService();
+        if (shell) {
+          isDefaultBrowser = shell.isDefaultBrowser(false);
+        }
+      } catch (e) {}
+      appinfo.defaultBrowser = isDefaultBrowser;
+
+      try {
+        let shell = aWindow.getShellService();
+        if (shell) {
+          appinfo.needsPin = await shell.doesAppNeedPin();
+        }
+      } catch (e) {}
+
+      let canSetDefaultBrowserInBackground = true;
+      if (AppConstants.platform == "win" || AppConstants.platform == "macosx") {
+        canSetDefaultBrowserInBackground = false;
+      } else if (AppConstants.platform == "linux") {
+        try {
+          aWindow.getShellService();
+        } catch (e) {
+          canSetDefaultBrowserInBackground = null;
+        }
+      }
+
+      appinfo.canSetDefaultBrowserInBackground =
+        canSetDefaultBrowserInBackground;
+
+      const ONE_WEEK = 7 * 24 * 60 * 60 * 1000;
+      let profileAge = await lazy.ProfileAge();
+      let createdDate = await profileAge.created;
+      let resetDate = await profileAge.reset;
+      let createdWeeksAgo = Math.floor((Date.now() - createdDate) / ONE_WEEK);
+      let resetWeeksAgo = null;
+      if (resetDate) {
+        resetWeeksAgo = Math.floor((Date.now() - resetDate) / ONE_WEEK);
+      }
+      appinfo.profileCreatedWeeksAgo = createdWeeksAgo;
+      appinfo.profileResetWeeksAgo = resetWeeksAgo;
+
+      this.sendPageCallback(aBrowser, aCallbackID, appinfo);
+    })().catch(err => {
+      lazy.log.error(err);
+      this.sendPageCallback(aBrowser, aCallbackID, {});
+    });
+  },
+
+  getAvailableTargets(aBrowser, aChromeWindow, aCallbackID) {
+    (async () => {
+      let window = aChromeWindow;
+      let data = this.availableTargetsCache.get(window);
+      if (data) {
+        lazy.log.debug(
+          "getAvailableTargets: Using cached targets list",
+          data.targets.join(",")
+        );
+        this.sendPageCallback(aBrowser, aCallbackID, data);
+        return;
+      }
+
+      let promises = [];
+      for (let targetName of this.targets.keys()) {
+        promises.push(this.getTarget(window, targetName));
+      }
+      let targetObjects = await Promise.all(promises);
+
+      let targetNames = [];
+      for (let targetObject of targetObjects) {
+        if (targetObject.node) {
+          targetNames.push(targetObject.targetName);
+        }
+      }
+
+      data = {
+        targets: targetNames,
+      };
+      this.availableTargetsCache.set(window, data);
+      this.sendPageCallback(aBrowser, aCallbackID, data);
+    })().catch(err => {
+      lazy.log.error(err);
+      this.sendPageCallback(aBrowser, aCallbackID, {
+        targets: [],
+      });
+    });
+  },
+
+  addNavBarWidget(aTarget, aBrowser, aCallbackID) {
+    if (aTarget.node) {
+      lazy.log.error(
+        "addNavBarWidget: can't add a widget already present:",
+        aTarget
+      );
+      return;
+    }
+    if (!aTarget.allowAdd) {
+      lazy.log.error(
+        "addNavBarWidget: not allowed to add this widget:",
+        aTarget
+      );
+      return;
+    }
+    if (!aTarget.widgetName) {
+      lazy.log.error(
+        "addNavBarWidget: can't add a widget without a widgetName property:",
+        aTarget
+      );
+      return;
+    }
+
+    lazy.CustomizableUI.addWidgetToArea(
+      aTarget.widgetName,
+      lazy.CustomizableUI.AREA_NAVBAR
+    );
+    this.sendPageCallback(aBrowser, aCallbackID);
+  },
+
+  _addAnnotationPanelMutationObserver(aPanelEl) {
+    if (AppConstants.platform == "linux") {
+      let observer = this._annotationPanelMutationObservers.get(aPanelEl);
+      if (observer) {
+        return;
+      }
+      let win = aPanelEl.documentGlobal;
+      observer = new win.MutationObserver(this._annotationMutationCallback);
+      this._annotationPanelMutationObservers.set(aPanelEl, observer);
+      let observerOptions = {
+        attributeFilter: ["height", "width"],
+        attributes: true,
+      };
+      observer.observe(aPanelEl, observerOptions);
+    }
+  },
+
+  _removeAnnotationPanelMutationObserver(aPanelEl) {
+    if (AppConstants.platform == "linux") {
+      let observer = this._annotationPanelMutationObservers.get(aPanelEl);
+      if (observer) {
+        observer.disconnect();
+        this._annotationPanelMutationObservers.delete(aPanelEl);
+      }
+    }
+  },
+
+  _annotationMutationCallback(aMutations) {
+    for (let mutation of aMutations) {
+      mutation.target.removeAttribute("width");
+      mutation.target.removeAttribute("height");
+      return;
+    }
+  },
+
+  async selectSearchEngine(id) {
+    let engine = lazy.SearchService.getEngineById(id);
+    if (!engine || engine.hidden) {
+      throw new Error("selectSearchEngine could not find engine with given ID");
+    }
+    return lazy.SearchService.setDefault(
+      engine,
+      lazy.SearchService.CHANGE_REASON.UITOUR
+    );
+  },
+
+  notify(eventName, params) {
+    for (let window of Services.wm.getEnumerator("navigator:browser")) {
+      if (window.closed) {
+        continue;
+      }
+
+      let openTourBrowsers = this.tourBrowsersByWindow.get(window);
+      if (!openTourBrowsers) {
+        continue;
+      }
+
+      for (let browser of openTourBrowsers) {
+        let detail = {
+          event: eventName,
+          params,
+        };
+        let contextToVisit = browser.browsingContext;
+        let global = contextToVisit.currentWindowGlobal;
+        let actor = global.getActor("UITour");
+        actor.sendAsyncMessage("UITour:SendPageNotification", detail);
+      }
+    }
+  },
+};
+
+UITour.init();

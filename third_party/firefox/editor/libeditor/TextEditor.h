@@ -1,0 +1,349 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_TextEditor_h
+#define mozilla_TextEditor_h
+
+#include "mozilla/EditorBase.h"
+#include "mozilla/EditorForwards.h"
+#include "mozilla/TextControlState.h"
+#include "mozilla/UniquePtr.h"
+
+#include "nsCOMPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsIClipboard.h"
+#include "nsINamed.h"
+#include "nsISupportsImpl.h"
+#include "nsITimer.h"
+#include "nscore.h"
+
+class nsIContent;
+class nsIDocumentEncoder;
+class nsIOutputStream;
+class nsIPrincipal;
+class nsISelectionController;
+class nsITransferable;
+
+namespace mozilla {
+namespace dom {
+class Selection;
+}  
+
+class TextEditor final : public EditorBase,
+                         public nsITimerCallback,
+                         public nsINamed {
+ public:
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(TextEditor, EditorBase)
+
+  TextEditor();
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY nsresult
+  Init(Document& aDocument, Element& aAnonymousDivElement,
+       nsISelectionController& aSelectionController, uint32_t aFlags,
+       UniquePtr<PasswordMaskData>&& aPasswordMaskData);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY nsresult PostCreate();
+
+  MOZ_CAN_RUN_SCRIPT void ReinitializeSelection(Element& aElement);
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT_BOUNDARY UniquePtr<PasswordMaskData>
+  PreDestroy();
+
+  static TextEditor* GetFrom(nsIEditor* aEditor) {
+    return aEditor ? aEditor->GetAsTextEditor() : nullptr;
+  }
+  static const TextEditor* GetFrom(const nsIEditor* aEditor) {
+    return aEditor ? aEditor->GetAsTextEditor() : nullptr;
+  }
+
+  static void MaskString(nsString& aString, const dom::Text& aTextNode,
+                         uint32_t aStartOffsetInString,
+                         uint32_t aStartOffsetInText);
+
+  NS_DECL_NSITIMERCALLBACK
+  NS_DECL_NSINAMED
+
+  MOZ_CAN_RUN_SCRIPT NS_IMETHOD EndOfDocument() final;
+  MOZ_CAN_RUN_SCRIPT NS_IMETHOD InsertLineBreak() final;
+  NS_IMETHOD GetTextLength(uint32_t* aCount) final;
+
+  using EditorBase::CanCopy;
+  using EditorBase::CanCut;
+  using EditorBase::CanPaste;
+
+  bool IsEmpty() const final;
+
+  bool CanPaste(nsIClipboard::ClipboardType aClipboardType) const final;
+
+  bool CanPasteTransferable(nsITransferable* aTransferable) final;
+
+  MOZ_CAN_RUN_SCRIPT nsresult
+  HandleKeyPressEvent(WidgetKeyboardEvent* aKeyboardEvent) final;
+
+  dom::EventTarget* GetDOMEventTarget() const final;
+
+  MOZ_CAN_RUN_SCRIPT nsresult
+  OnFocus(const nsINode& aOriginalEventTargetNode) final;
+  MOZ_CAN_RUN_SCRIPT void PostHandleFocusEvent(
+      const nsINode& aFocusEventTargetNode) final;
+
+  nsresult OnBlur(const dom::EventTarget* aEventTarget) final;
+
+  [[nodiscard]] Result<widget::IMEState, nsresult> GetPreferredIMEState()
+      const final;
+
+  int32_t MaxTextLength() const { return mMaxTextLength; }
+  void SetMaxTextLength(int32_t aLength) { mMaxTextLength = aLength; }
+
+  void SetWrapColumn(int32_t aWrapColumn) { mWrapColumn = aWrapColumn; }
+
+  MOZ_CAN_RUN_SCRIPT nsresult SetTextAsAction(
+      const nsAString& aString,
+      AllowBeforeInputEventCancelable aAllowBeforeInputEventCancelable,
+      nsIPrincipal* aPrincipal = nullptr);
+
+  MOZ_CAN_RUN_SCRIPT nsresult
+  InsertLineBreakAsAction(nsIPrincipal* aPrincipal = nullptr) final;
+
+  nsresult ComputeTextValue(nsAString&) const;
+
+  MOZ_ALWAYS_INLINE bool IsAllMasked() const {
+    MOZ_ASSERT(IsPasswordEditor());
+    return !mPasswordMaskData || mPasswordMaskData->IsAllMasked();
+  }
+  MOZ_ALWAYS_INLINE uint32_t UnmaskedStart() const {
+    MOZ_ASSERT(IsPasswordEditor());
+    return mPasswordMaskData ? mPasswordMaskData->mUnmaskedStart : UINT32_MAX;
+  }
+  MOZ_ALWAYS_INLINE uint32_t UnmaskedLength() const {
+    MOZ_ASSERT(IsPasswordEditor());
+    return mPasswordMaskData ? mPasswordMaskData->mUnmaskedLength : 0;
+  }
+  MOZ_ALWAYS_INLINE uint32_t UnmaskedEnd() const {
+    MOZ_ASSERT(IsPasswordEditor());
+    return mPasswordMaskData ? mPasswordMaskData->UnmaskedEnd() : UINT32_MAX;
+  }
+
+  bool IsMaskingPassword() const {
+    MOZ_ASSERT(IsPasswordEditor());
+    return mPasswordMaskData && mPasswordMaskData->mIsMaskingPassword;
+  }
+
+  static char16_t PasswordMask();
+
+  bool EchoingPasswordPrevented() const {
+    return mPasswordMaskData && mPasswordMaskData->mEchoingPasswordPrevented;
+  }
+  void PreventToEchoPassword() {
+    if (mPasswordMaskData) {
+      mPasswordMaskData->mEchoingPasswordPrevented = true;
+    }
+  }
+  void AllowToEchoPassword() {
+    if (mPasswordMaskData) {
+      mPasswordMaskData->mEchoingPasswordPrevented = false;
+    }
+  }
+
+  enum class IgnoreTextNodeCache : bool { No, Yes };
+  dom::Text* GetTextNode(
+      IgnoreTextNodeCache aIgnoreTextNodeCache = IgnoreTextNodeCache::No) {
+    if (aIgnoreTextNodeCache == IgnoreTextNodeCache::No) {
+      if (Text* const cachedTextNode = GetCachedTextNode()) {
+        return cachedTextNode;
+      }
+    }
+    MOZ_DIAGNOSTIC_ASSERT(GetRoot());
+    MOZ_DIAGNOSTIC_ASSERT(GetRoot()->GetFirstChild());
+    MOZ_DIAGNOSTIC_ASSERT(GetRoot()->GetFirstChild()->IsText());
+    if (MOZ_UNLIKELY(!GetRoot() || !GetRoot()->GetFirstChild())) {
+      return nullptr;
+    }
+    return GetRoot()->GetFirstChild()->GetAsText();
+  }
+  const dom::Text* GetTextNode(IgnoreTextNodeCache aIgnoreTextNodeCache =
+                                   IgnoreTextNodeCache::No) const {
+    return const_cast<TextEditor*>(this)->GetTextNode(aIgnoreTextNodeCache);
+  }
+
+ protected:  
+
+  MOZ_CAN_RUN_SCRIPT nsresult RemoveAttributeOrEquivalent(
+      Element* aElement, nsAtom* aAttribute, bool aSuppressTransaction) final;
+  MOZ_CAN_RUN_SCRIPT nsresult SetAttributeOrEquivalent(
+      Element* aElement, nsAtom* aAttribute, const nsAString& aValue,
+      bool aSuppressTransaction) final;
+  using EditorBase::RemoveAttributeOrEquivalent;
+  using EditorBase::SetAttributeOrEquivalent;
+
+  template <typename EditorDOMPointType>
+  EditorDOMPointType FindBetterInsertionPoint(
+      const EditorDOMPointType& aPoint) const;
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult InsertLineBreakAsSubAction();
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult
+  SetTextAsSubAction(const nsAString& aString);
+
+  void MaybeDoAutoPasswordMasking() {
+    if (IsPasswordEditor() && IsMaskingPassword()) {
+      MaskAllCharacters();
+    }
+  }
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY nsresult SetUnmaskRange(
+      uint32_t aStart, uint32_t aLength = UINT32_MAX, uint32_t aTimeout = 0) {
+    return SetUnmaskRangeInternal(aStart, aLength, aTimeout, false, false);
+  }
+
+  MOZ_CAN_RUN_SCRIPT nsresult SetUnmaskRangeAndNotify(
+      uint32_t aStart, uint32_t aLength = UINT32_MAX, uint32_t aTimeout = 0) {
+    return SetUnmaskRangeInternal(aStart, aLength, aTimeout, true, false);
+  }
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY nsresult MaskAllCharacters() {
+    if (!mPasswordMaskData) {
+      return NS_OK;  
+    }
+    return SetUnmaskRangeInternal(UINT32_MAX, 0, 0, false, true);
+  }
+
+  MOZ_CAN_RUN_SCRIPT nsresult MaskAllCharactersAndNotify() {
+    return SetUnmaskRangeInternal(UINT32_MAX, 0, 0, true, true);
+  }
+
+  void WillDeleteText(uint32_t aCurrentLength, uint32_t aRemoveStartOffset,
+                      uint32_t aRemoveLength);
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult DidInsertText(
+      uint32_t aNewLength, uint32_t aInsertedOffset, uint32_t aInsertedLength);
+
+ protected:  
+  Result<EditActionResult, nsresult> MaybeTruncateInsertionStringForMaxLength(
+      nsAString& aInsertionString);
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT Result<EditActionResult, nsresult>
+  InsertLineFeedCharacterAtSelection();
+
+  void HandleNewLinesInStringForSingleLineEditor(nsString& aString) const;
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT Result<EditActionResult, nsresult>
+  HandleInsertText(const nsAString& aInsertionString,
+                   InsertTextFor aPurpose) final;
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult InsertDroppedDataTransferAsAction(
+      AutoEditActionDataSetter& aEditActionData, DataTransfer& aDataTransfer,
+      const EditorDOMPoint& aDroppedAt, nsIPrincipal* aSourcePrincipal) final;
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT Result<EditActionResult, nsresult>
+  HandleDeleteSelectionInternal(nsIEditor::EDirection aDirectionAndAmount,
+                                nsIEditor::EStripWrappers aStripWrappers);
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT Result<EditActionResult, nsresult>
+  HandleDeleteSelection(nsIEditor::EDirection aDirectionAndAmount,
+                        nsIEditor::EStripWrappers aStripWrappers) final;
+
+  Result<EditActionResult, nsresult> ComputeValueFromTextNodeAndBRElement(
+      nsAString& aValue) const;
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT Result<EditActionResult, nsresult>
+  SetTextWithoutTransaction(const nsAString& aValue);
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult EnsureCaretNotAtEndOfTextNode();
+
+ protected:  
+  MOZ_CAN_RUN_SCRIPT void OnStartToHandleTopLevelEditSubAction(
+      EditSubAction aTopLevelEditSubAction,
+      nsIEditor::EDirection aDirectionOfTopLevelEditSubAction,
+      ErrorResult& aRv) final;
+  MOZ_CAN_RUN_SCRIPT nsresult OnEndHandlingTopLevelEditSubAction() final;
+
+ protected:  
+  virtual ~TextEditor();
+
+  bool CanEchoPasswordNow() const;
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult InitEditorContentAndSelection();
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult CollapseSelectionToEndOfTextNode();
+
+  MOZ_CAN_RUN_SCRIPT nsresult SelectEntireDocument() final;
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult
+  HandlePaste(AutoEditActionDataSetter& aEditActionData,
+              nsIClipboard::ClipboardType aClipboardType,
+              DataTransfer* aDataTransfer) final;
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult
+  HandlePasteAsQuotation(AutoEditActionDataSetter& aEditActionData,
+                         nsIClipboard::ClipboardType aClipboardType,
+                         DataTransfer* aDataTransfer) final;
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult
+  HandlePasteTransferable(AutoEditActionDataSetter& aEditActionData,
+                          nsITransferable& aTransferable) final;
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult
+  InsertWithQuotationsAsSubAction(const nsAString& aQuotedText) final;
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult
+  InsertTextFromTransferable(nsITransferable* transferable);
+
+  bool IsCopyToClipboardAllowedInternal() const final;
+
+  already_AddRefed<Element> GetInputEventTargetElement() const final;
+
+  MOZ_CAN_RUN_SCRIPT nsresult SetUnmaskRangeInternal(uint32_t aStart,
+                                                     uint32_t aLength,
+                                                     uint32_t aTimeout,
+                                                     bool aNotify,
+                                                     bool aForceStartMasking);
+
+  MOZ_ALWAYS_INLINE bool HasAutoMaskingTimer() const {
+    return mPasswordMaskData && mPasswordMaskData->mTimer;
+  }
+
+  void ResetPasswordMaskData() {
+    if (mPasswordMaskData) {
+      mPasswordMaskData->CancelTimer(PasswordMaskData::ReleaseTimer::Yes);
+    }
+    if (IsPasswordEditor()) {
+      mPasswordMaskData = MakeUnique<PasswordMaskData>();
+    } else {
+      mPasswordMaskData = nullptr;
+    }
+  }
+
+ protected:
+  UniquePtr<PasswordMaskData> mPasswordMaskData;
+
+  int32_t mMaxTextLength = -1;
+
+  friend class AutoClonedSelectionRangeArray;  
+  friend class DeleteNodeTransaction;
+  friend class EditorBase;
+  friend class InsertNodeTransaction;
+};
+
+}  
+
+mozilla::TextEditor* nsIEditor::AsTextEditor() {
+  MOZ_DIAGNOSTIC_ASSERT(IsTextEditor());
+  return static_cast<mozilla::TextEditor*>(this);
+}
+
+const mozilla::TextEditor* nsIEditor::AsTextEditor() const {
+  MOZ_DIAGNOSTIC_ASSERT(IsTextEditor());
+  return static_cast<const mozilla::TextEditor*>(this);
+}
+
+mozilla::TextEditor* nsIEditor::GetAsTextEditor() {
+  return AsEditorBase()->IsTextEditor() ? AsTextEditor() : nullptr;
+}
+
+const mozilla::TextEditor* nsIEditor::GetAsTextEditor() const {
+  return AsEditorBase()->IsTextEditor() ? AsTextEditor() : nullptr;
+}
+
+#endif  // #ifndef mozilla_TextEditor_h

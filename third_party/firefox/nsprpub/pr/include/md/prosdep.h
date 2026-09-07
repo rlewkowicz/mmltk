@@ -1,0 +1,68 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(prosdep_h___)
+#define prosdep_h___
+
+#include "prtypes.h"
+
+PR_BEGIN_EXTERN_C
+
+#if defined(XP_PC)
+
+#include "md/_pcos.h"
+#if defined(WINNT)
+#include "md/_winnt.h"
+#include "md/_win32_errors.h"
+#elif defined(WIN95) || defined(WINCE)
+#include "md/_win95.h"
+#include "md/_win32_errors.h"
+#else
+#error unknown Windows platform
+#endif
+
+#elif defined(XP_UNIX)
+
+#if defined(FREEBSD)
+#include "md/_freebsd.h"
+
+#elif defined(NETBSD)
+#include "md/_netbsd.h"
+
+#elif defined(OPENBSD)
+#include "md/_openbsd.h"
+
+#elif defined(LINUX) || defined(__GNU__) || defined(__GLIBC__)
+#include "md/_linux.h"
+
+#elif defined(QNX)
+#include "md/_qnx.h"
+
+#elif defined(NTO)
+#include "md/_nto.h"
+
+#elif defined(RISCOS)
+#include "md/_riscos.h"
+
+#else
+#error unknown Unix flavor
+
+#endif
+
+#include "md/_unixos.h"
+#include "md/_unix_errors.h"
+
+#else
+
+#error "The platform is not Unix, Windows, or Mac"
+
+#endif
+
+#if defined(_PR_PTHREADS)
+#include "md/_pth.h"
+#endif
+
+PR_END_EXTERN_C
+
+#endif

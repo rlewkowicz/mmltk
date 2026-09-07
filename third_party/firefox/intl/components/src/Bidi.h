@@ -1,0 +1,71 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef intl_components_Bidi_h_
+#define intl_components_Bidi_h_
+
+#include "mozilla/intl/BidiEmbeddingLevel.h"
+#include "mozilla/intl/ICU4CGlue.h"
+
+#define USE_RUST_UNICODE_BIDI 1
+
+#if USE_RUST_UNICODE_BIDI
+#  include "mozilla/intl/unicode_bidi_ffi_generated.h"
+#else
+struct UBiDi;
+#endif
+
+namespace mozilla::intl {
+
+class Bidi final {
+ public:
+  Bidi();
+  ~Bidi();
+
+  Bidi(const Bidi&) = delete;
+  Bidi& operator=(const Bidi&) = delete;
+
+  enum class ParagraphDirection { LTR, RTL, Mixed };
+
+  ICUResult SetParagraph(Span<const char16_t> aParagraph,
+                         BidiEmbeddingLevel aLevel);
+
+  BidiEmbeddingLevel GetParagraphEmbeddingLevel() const;
+
+  ParagraphDirection GetParagraphDirection() const;
+
+  Result<int32_t, ICUError> CountRuns();
+
+  void GetLogicalRun(int32_t aLogicalStart, int32_t* aLogicalLimitOut,
+                     BidiEmbeddingLevel* aLevelOut);
+
+  static void ReorderVisual(const BidiEmbeddingLevel* aLevels, int32_t aLength,
+                            int32_t* aIndexMap);
+
+  enum class BaseDirection { LTR, RTL, Neutral };
+
+  static BaseDirection GetBaseDirection(Span<const char16_t> aText);
+
+  BidiDirection GetVisualRun(int32_t aRunIndex, int32_t* aLogicalStart,
+                             int32_t* aLength);
+
+ private:
+#if USE_RUST_UNICODE_BIDI
+  using UnicodeBidi = mozilla::intl::ffi::UnicodeBidi;
+  struct BidiFreePolicy {
+    void operator()(void* aPtr) {
+      bidi_destroy(static_cast<UnicodeBidi*>(aPtr));
+    }
+  };
+  mozilla::UniquePtr<UnicodeBidi, BidiFreePolicy> mBidi;
+#else
+  ICUPointer<UBiDi> mBidi = ICUPointer<UBiDi>(nullptr);
+
+  const BidiEmbeddingLevel* mLevels = nullptr;
+
+  int32_t mLength = 0;
+#endif
+};
+
+}  
+#endif

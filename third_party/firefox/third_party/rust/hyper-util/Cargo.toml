@@ -1,0 +1,165 @@
+
+[package]
+edition = "2021"
+rust-version = "1.64"
+name = "hyper-util"
+version = "0.1.20"
+authors = ["Sean McArthur <sean@seanmonstar.com>"]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "hyper utilities"
+homepage = "https://hyper.rs"
+documentation = "https://docs.rs/hyper-util"
+keywords = [
+    "http",
+    "hyper",
+    "hyperium",
+]
+categories = [
+    "network-programming",
+    "web-programming::http-client",
+    "web-programming::http-server",
+]
+license = "MIT"
+repository = "https://github.com/hyperium/hyper-util"
+
+[package.metadata.docs.rs]
+features = ["full"]
+rustdoc-args = [
+    "--cfg",
+    "docsrs",
+]
+
+[features]
+__internal_happy_eyeballs_tests = []
+client = [
+    "hyper/client",
+    "tokio/net",
+    "dep:tracing",
+    "dep:futures-channel",
+    "dep:tower-service",
+]
+client-legacy = [
+    "client",
+    "dep:socket2",
+    "tokio/sync",
+    "dep:libc",
+    "dep:futures-util",
+]
+client-pool = [
+    "client",
+    "dep:futures-util",
+    "dep:tower-layer",
+]
+client-proxy = [
+    "client",
+    "dep:base64",
+    "dep:ipnet",
+    "dep:percent-encoding",
+]
+default = []
+full = [
+    "client",
+    "client-legacy",
+    "client-pool",
+    "client-proxy",
+    "server",
+    "server-auto",
+    "server-graceful",
+    "service",
+    "http1",
+    "http2",
+    "tokio",
+    "tracing",
+]
+http1 = ["hyper/http1"]
+http2 = ["hyper/http2"]
+server = ["hyper/server"]
+server-auto = [
+    "server",
+    "http1",
+    "http2",
+]
+server-graceful = [
+    "server",
+    "tokio/sync",
+]
+service = ["dep:tower-service"]
+tokio = [
+    "dep:tokio",
+    "tokio/rt",
+    "tokio/time",
+]
+tracing = ["dep:tracing"]
+
+[lib]
+name = "hyper_util"
+path = "src/lib.rs"
+
+[dependencies.base64]
+version = "0.22"
+optional = true
+
+[dependencies.bytes]
+version = "1.7.1"
+
+[dependencies.futures-channel]
+version = "0.3"
+optional = true
+
+[dependencies.futures-util]
+version = "0.3.16"
+optional = true
+default-features = false
+
+[dependencies.http]
+version = "1.0"
+
+[dependencies.http-body]
+version = "1.0.0"
+
+[dependencies.hyper]
+version = "1.8.0"
+
+[dependencies.ipnet]
+version = "2.9"
+optional = true
+
+[dependencies.libc]
+version = "0.2"
+optional = true
+
+[dependencies.percent-encoding]
+version = "2.3"
+optional = true
+
+[dependencies.pin-project-lite]
+version = "0.2.4"
+
+[dependencies.socket2]
+version = ">=0.5.9, <0.7"
+features = ["all"]
+optional = true
+
+[dependencies.tokio]
+version = "1"
+optional = true
+default-features = false
+
+[dependencies.tower-layer]
+version = "0.3"
+optional = true
+
+[dependencies.tower-service]
+version = "0.3"
+optional = true
+
+[dependencies.tracing]
+version = "0.1"
+features = ["std"]
+optional = true
+default-features = false

@@ -1,0 +1,302 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/ProcInfo.h"
+#include "mozilla/ProcInfo_linux.h"
+#include "mozilla/Sprintf.h"
+#include "mozilla/Logging.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/ipc/GeckoChildProcessHost.h"
+#include "nsMemoryReporterManager.h"
+#include "nsWhitespaceTokenizer.h"
+
+#include <cstdio>
+#include <cstring>
+#include <unistd.h>
+#include <dirent.h>
+
+#define NANOPERSEC 1000000000.
+
+namespace mozilla {
+
+nsresult GetCurrentProcessMemoryUsage(uint64_t* aResult) {
+  if (!aResult) {
+    return NS_ERROR_INVALID_ARG;
+  }
+  FILE* f = fopen("/proc/self/statm", "r");
+  if (!f) {
+    return NS_ERROR_FAILURE;
+  }
+  size_t vmSize = 0, resident = 0, shared = 0;
+  const int kExpected = 3;
+  int nread = fscanf(f, "%zu %zu %zu", &vmSize, &resident, &shared);
+  fclose(f);
+
+  if (nread != kExpected) {
+    return NS_ERROR_FAILURE;
+  }
+  *aResult = uint64_t(resident - shared) * getpagesize();
+  return NS_OK;
+}
+
+int GetCycleTimeFrequencyMHz() { return 0; }
+
+class StatReader {
+ public:
+  explicit StatReader(const base::ProcessId aPid)
+      : mPid(aPid), mMaxIndex(15), mTicksPerSec(sysconf(_SC_CLK_TCK)) {}
+
+  nsresult ParseProc(ProcInfo& aInfo) {
+    nsAutoString fileContent;
+    nsresult rv = ReadFile(fileContent);
+    NS_ENSURE_SUCCESS(rv, rv);
+    int32_t startPos = fileContent.RFindChar('(');
+    if (startPos == -1) {
+      return NS_ERROR_FAILURE;
+    }
+    int32_t endPos = fileContent.RFindChar(')');
+    if (endPos == -1) {
+      return NS_ERROR_FAILURE;
+    }
+    int32_t len = endPos - (startPos + 1);
+    mName.Assign(Substring(fileContent, startPos + 1, len));
+
+    nsWhitespaceTokenizer tokenizer(Substring(fileContent, endPos + 2));
+    int32_t index = 2;  
+    while (tokenizer.hasMoreTokens() && index < mMaxIndex) {
+      const nsAString& token = tokenizer.nextToken();
+      rv = UseToken(index, token, aInfo);
+      NS_ENSURE_SUCCESS(rv, rv);
+      index++;
+    }
+    return NS_OK;
+  }
+
+ protected:
+  nsresult UseToken(int32_t aIndex, const nsAString& aToken, ProcInfo& aInfo) {
+    nsresult rv = NS_OK;
+    switch (aIndex) {
+      case 13:
+        aInfo.cpuTime += GetCPUTime(aToken, &rv);
+        NS_ENSURE_SUCCESS(rv, rv);
+        break;
+      case 14:
+        aInfo.cpuTime += GetCPUTime(aToken, &rv);
+        NS_ENSURE_SUCCESS(rv, rv);
+        break;
+    }
+    return rv;
+  }
+
+  uint64_t Get64Value(const nsAString& aToken, nsresult* aRv) {
+    nsresult rv = NS_OK;
+    uint64_t out = 0;
+    if (sscanf(NS_ConvertUTF16toUTF8(aToken).get(), "%" PRIu64, &out) == 0) {
+      rv = NS_ERROR_FAILURE;
+    }
+    *aRv = rv;
+    return out;
+  }
+
+  uint64_t GetCPUTime(const nsAString& aToken, nsresult* aRv) {
+    nsresult rv;
+    uint64_t value = Get64Value(aToken, &rv);
+    *aRv = rv;
+    if (NS_FAILED(rv)) {
+      return 0;
+    }
+    if (value) {
+      value = (value * NANOPERSEC) / mTicksPerSec;
+    }
+    return value;
+  }
+
+  base::ProcessId mPid;
+  int32_t mMaxIndex;
+  nsCString mFilepath;
+  nsString mName;
+
+ private:
+  nsresult ReadFile(nsAutoString& aFileContent) {
+    if (mFilepath.IsEmpty()) {
+      if (mPid == 0) {
+        mFilepath.AssignLiteral("/proc/self/stat");
+      } else {
+        mFilepath.AppendPrintf("/proc/%u/stat", unsigned(mPid));
+      }
+    }
+    FILE* fstat = fopen(mFilepath.get(), "r");
+    if (!fstat) {
+      return NS_ERROR_FAILURE;
+    }
+    char buffer[2048];
+    char* end;
+    char* start = fgets(buffer, 2048, fstat);
+    fclose(fstat);
+    if (start == nullptr) {
+      return NS_ERROR_FAILURE;
+    }
+    end = strchr(buffer, '\n');
+    if (!end) {
+      return NS_ERROR_FAILURE;
+    }
+    aFileContent.AssignASCII(buffer, size_t(end - start));
+    return NS_OK;
+  }
+
+  int64_t mTicksPerSec;
+};
+
+class ThreadInfoReader final : public StatReader {
+ public:
+  ThreadInfoReader(const base::ProcessId aPid, const base::ProcessId aTid)
+      : StatReader(aPid) {
+    mFilepath.AppendPrintf("/proc/%u/task/%u/stat", unsigned(aPid),
+                           unsigned(aTid));
+  }
+
+  nsresult ParseThread(ThreadInfo& aInfo) {
+    ProcInfo info;
+    nsresult rv = StatReader::ParseProc(info);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    aInfo.cpuTime = info.cpuTime;
+    aInfo.name.Assign(mName);
+    return NS_OK;
+  }
+};
+
+nsresult GetCpuTimeSinceProcessStartInMs(uint64_t* aResult) {
+  timespec t;
+  if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &t) == 0) {
+    uint64_t cpuTime =
+        uint64_t(t.tv_sec) * 1'000'000'000u + uint64_t(t.tv_nsec);
+    *aResult = cpuTime / PR_NSEC_PER_MSEC;
+    return NS_OK;
+  }
+
+  StatReader reader(0);
+  ProcInfo info;
+  nsresult rv = reader.ParseProc(info);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  *aResult = info.cpuTime / PR_NSEC_PER_MSEC;
+  return NS_OK;
+}
+
+nsresult GetGpuTimeSinceProcessStartInMs(uint64_t* aResult) {
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+ProcInfoPromise::ResolveOrRejectValue GetProcInfoSync(
+    nsTArray<ProcInfoRequest>&& aRequests) {
+  ProcInfoPromise::ResolveOrRejectValue result;
+
+  HashMap<base::ProcessId, ProcInfo> gathered;
+  if (!gathered.reserve(aRequests.Length())) {
+    result.SetReject(NS_ERROR_OUT_OF_MEMORY);
+    return result;
+  }
+  for (const auto& request : aRequests) {
+    ProcInfo info;
+
+    timespec t;
+    clockid_t clockid = MAKE_PROCESS_CPUCLOCK(request.pid, CPUCLOCK_SCHED);
+    if (clock_gettime(clockid, &t) == 0) {
+      info.cpuTime = uint64_t(t.tv_sec) * 1'000'000'000u + uint64_t(t.tv_nsec);
+    } else {
+      StatReader reader(request.pid);
+      nsresult rv = reader.ParseProc(info);
+      if (NS_FAILED(rv)) {
+        continue;
+      }
+    }
+
+    static const int MAX_FIELD = 3;
+    size_t VmSize, resident, shared;
+    info.memory = 0;
+    FILE* f = fopen(nsPrintfCString("/proc/%u/statm", request.pid).get(), "r");
+    if (f) {
+      int nread = fscanf(f, "%zu %zu %zu", &VmSize, &resident, &shared);
+      fclose(f);
+      if (nread == MAX_FIELD) {
+        info.memory = (resident - shared) * getpagesize();
+      }
+    }
+
+    info.pid = request.pid;
+    info.childId = request.childId;
+    info.type = request.processType;
+    info.origin = request.origin;
+    info.windows = std::move(request.windowInfo);
+    info.utilityActors = std::move(request.utilityInfo);
+
+    nsCString taskPath;
+    taskPath.AppendPrintf("/proc/%u/task", unsigned(request.pid));
+    DIR* dirHandle = opendir(taskPath.get());
+    if (!dirHandle) {
+      continue;
+    }
+    auto cleanup = mozilla::MakeScopeExit([&] { closedir(dirHandle); });
+
+    dirent* entry;
+    while ((entry = readdir(dirHandle)) != nullptr) {
+      if (entry->d_name[0] == '.') {
+        continue;
+      }
+      nsAutoCString entryName(entry->d_name);
+      nsresult rv;
+      int32_t tid = entryName.ToInteger(&rv);
+      if (NS_FAILED(rv)) {
+        continue;
+      }
+
+      ThreadInfo threadInfo;
+      threadInfo.tid = tid;
+
+      timespec ts;
+      if (clock_gettime(MAKE_THREAD_CPUCLOCK(tid, CPUCLOCK_SCHED), &ts) == 0) {
+        threadInfo.cpuTime =
+            uint64_t(ts.tv_sec) * 1'000'000'000u + uint64_t(ts.tv_nsec);
+
+        nsCString path;
+        path.AppendPrintf("/proc/%u/task/%u/comm", unsigned(request.pid),
+                          unsigned(tid));
+        FILE* fstat = fopen(path.get(), "r");
+        if (fstat) {
+          char buffer[32];
+          char* start = fgets(buffer, sizeof(buffer), fstat);
+          fclose(fstat);
+          if (start) {
+            char* end = strchr(buffer, '\n');
+            if (end) {
+              threadInfo.name.AssignASCII(buffer, size_t(end - start));
+              info.threads.AppendElement(threadInfo);
+              continue;
+            }
+          }
+        }
+      }
+
+      ThreadInfoReader reader(request.pid, tid);
+      rv = reader.ParseThread(threadInfo);
+      if (NS_FAILED(rv)) {
+        continue;
+      }
+      info.threads.AppendElement(threadInfo);
+    }
+
+    if (!gathered.put(request.pid, std::move(info))) {
+      result.SetReject(NS_ERROR_OUT_OF_MEMORY);
+      return result;
+    }
+  }
+
+  result.SetResolve(std::move(gathered));
+  return result;
+}
+
+}  

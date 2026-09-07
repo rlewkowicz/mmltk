@@ -1,0 +1,195 @@
+#pragma once
+
+#include <array>
+#include <cstdint>
+#include <limits>
+#ifndef NDEBUG
+#include <iostream>
+#include <stdexcept>
+#endif
+
+#include <core/BitManipulation.hpp>
+#include <core/Error.hpp>
+#include <core/common.hpp>
+#include <huffman/HuffmanCodingBase.hpp>
+#include <rapidgzip/gzip/definitions.hpp>
+#include <rapidgzip/gzip/deflate.hpp>
+
+#include "precodecheck/CountAllocatedLeaves.hpp"
+
+namespace rapidgzip::blockfinder {
+template <uint8_t bitCount>
+constexpr bool isDeflateCandidate(uint32_t bits) {
+    if constexpr (bitCount == 0) {
+        return false;
+    } else {
+        const auto isLastBlock = (bits & 1U) != 0;
+        bits >>= 1U;
+        bool matches = !isLastBlock;
+        if constexpr (bitCount <= 1U) {
+            return matches;
+        }
+
+        const auto compressionType = bits & nLowestBitsSet<uint32_t, 2U>();
+        bits >>= 2U;
+        matches &= (compressionType & 1U) == 0;
+        if constexpr (bitCount <= 2U) {
+            return matches;
+        }
+        matches &= compressionType == 0b10;
+
+        if constexpr (bitCount < 1U + 2U + 5U) {
+            return matches;
+        }
+        const auto codeCount = bits & nLowestBitsSet<uint32_t, 5U>();
+        bits >>= 5U;
+        matches &= codeCount <= 29;
+
+        if constexpr (bitCount < 1U + 2U + 5U + 5U) {
+            return matches;
+        }
+        const auto distanceCodeCount = bits & nLowestBitsSet<uint32_t, 5U>();
+        matches &= distanceCodeCount <= 29;
+        return matches;
+    }
+}
+
+constexpr uint32_t MAX_EVALUATED_BITS = 13;
+
+template <uint8_t bitCount>
+constexpr uint8_t nextDeflateCandidate(uint32_t bits) {
+    if (isDeflateCandidate<bitCount>(bits)) {
+        return 0;
+    }
+
+    if constexpr (bitCount == 0) {
+        return 0;
+    } else {
+        return 1U + nextDeflateCandidate<bitCount - 1U>(bits >> 1U);
+    }
+}
+
+template <uint8_t CACHED_BIT_COUNT>
+constexpr auto NEXT_DYNAMIC_DEFLATE_CANDIDATE_LUT = []() {
+    std::array<int8_t, 1U << CACHED_BIT_COUNT> result{};
+    for (uint32_t i = 0; i < result.size(); ++i) {
+        result[i] = nextDeflateCandidate<CACHED_BIT_COUNT>(i);
+        if (result[i] == 0) {
+            result[i] = -static_cast<uint8_t>(1U + nextDeflateCandidate<CACHED_BIT_COUNT - 1U>(i >> 1U));
+        }
+    }
+    return result;
+}();
+
+constexpr uint8_t OPTIMAL_NEXT_DEFLATE_LUT_SIZE = 15;
+
+template <>
+constexpr std::array<int8_t, 1U << 15U> NEXT_DYNAMIC_DEFLATE_CANDIDATE_LUT<15U> = {
+#include "NEXT_DYNAMIC_DEFLATE_CANDIDATE_LUT_15.csv"
+};
+
+template <uint8_t CACHED_BIT_COUNT = OPTIMAL_NEXT_DEFLATE_LUT_SIZE>
+[[nodiscard]] size_t seekToNonFinalDynamicDeflateBlock(gzip::BitReader& bitReader,
+                                                       size_t const untilOffset = std::numeric_limits<size_t>::max()) {
+    const auto oldOffset = bitReader.tell();
+
+    try {
+        using namespace rapidgzip::deflate;
+
+        auto bitBufferForLUT = bitReader.peek<CACHED_BIT_COUNT>();
+        bitReader.seekTo(oldOffset + 13);
+        constexpr auto ALL_PRECODE_BITS = PRECODE_COUNT_BITS + MAX_PRECODE_COUNT * PRECODE_BITS;
+        static_assert((ALL_PRECODE_BITS == 61) && (ALL_PRECODE_BITS >= CACHED_BIT_COUNT) &&
+                          (ALL_PRECODE_BITS <= std::numeric_limits<uint64_t>::digits) &&
+                          (ALL_PRECODE_BITS <= gzip::BitReader::MAX_BIT_BUFFER_SIZE),
+                      "It must fit into 64-bit and it also must fit the largest possible jump in the LUT.");
+        auto bitBufferPrecodeBits = bitReader.read<ALL_PRECODE_BITS>();
+
+        for (size_t offset = oldOffset; offset < untilOffset;) {
+            auto nextPosition = NEXT_DYNAMIC_DEFLATE_CANDIDATE_LUT<CACHED_BIT_COUNT>[bitBufferForLUT];
+            const auto bitsToLoad = std::abs(nextPosition);
+
+            if (nextPosition <= 0) {
+                nextPosition = -nextPosition;
+
+                const auto next4Bits = bitBufferPrecodeBits & nLowestBitsSet<uint64_t, PRECODE_COUNT_BITS>();
+                const auto next57Bits = (bitBufferPrecodeBits >> PRECODE_COUNT_BITS) &
+                                        nLowestBitsSet<uint64_t, MAX_PRECODE_COUNT * PRECODE_BITS>();
+
+                const auto precodeError = PrecodeCheck::CountAllocatedLeaves::checkPrecode(next4Bits, next57Bits);
+
+                if (UNLIKELY(precodeError == Error::NONE)) [[unlikely]] {
+#ifndef NDEBUG
+                    const auto oldTell = bitReader.tell();
+#endif
+
+                    const auto literalCodeCount = 257 + ((bitBufferForLUT >> 3U) & nLowestBitsSet<uint64_t, 5>());
+                    const auto distanceCodeCount = 1 + ((bitBufferForLUT >> 8U) & nLowestBitsSet<uint64_t, 5>());
+                    const auto codeLengthCount = 4 + next4Bits;
+                    const auto precodeBits = next57Bits & nLowestBitsSet<uint64_t>(codeLengthCount * PRECODE_BITS);
+
+                    std::array<uint8_t, MAX_PRECODE_COUNT> codeLengthCL{};
+                    for (size_t i = 0; i < codeLengthCount; ++i) {
+                        const auto codeLength =
+                            (precodeBits >> (i * PRECODE_BITS)) & nLowestBitsSet<uint64_t, PRECODE_BITS>();
+                        codeLengthCL[PRECODE_ALPHABET[i]] = codeLength;
+                    }
+
+                    PrecodeHuffmanCoding precodeHC;
+                    auto error = precodeHC.initializeFromLengths({codeLengthCL.data(), codeLengthCL.size()});
+
+                    LiteralAndDistanceCLBuffer literalCL{};
+                    if (LIKELY(error == Error::NONE)) [[likely]] {
+                        bitReader.seekTo(offset + 13 + 4 + codeLengthCount * PRECODE_BITS);
+                        error = readDistanceAndLiteralCodeLengths(literalCL, bitReader, precodeHC,
+                                                                  literalCodeCount + distanceCodeCount);
+                        bitReader.seekTo(offset + 13 + ALL_PRECODE_BITS);
+                    }
+
+                    if (UNLIKELY(literalCL[deflate::END_OF_BLOCK_SYMBOL] == 0)) [[unlikely]] {
+                        error = Error::INVALID_CODE_LENGTHS;
+                    }
+
+                    if (UNLIKELY(error == Error::NONE)) [[unlikely]] {
+                        if (!checkHuffmanCodeLengths<MAX_CODE_LENGTH>(
+                                VectorView<uint8_t>(literalCL.data() + literalCodeCount, distanceCodeCount)) ||
+                            !checkHuffmanCodeLengths<MAX_CODE_LENGTH>(
+                                VectorView<uint8_t>(literalCL.data(), literalCodeCount))) {
+                            error = Error::INVALID_CODE_LENGTHS;
+                        }
+                    }
+
+                    if (UNLIKELY(error == Error::NONE)) [[unlikely]] {
+                        return offset;
+                    }
+
+#ifndef NDEBUG
+                    if (oldTell != bitReader.tell()) {
+                        std::cerr << "Previous position: " << oldTell << " new position: " << bitReader.tell() << "\n";
+                        throw std::logic_error("Did not seek back correctly!");
+                    }
+#endif
+                }
+            }
+
+            bitBufferForLUT >>= bitsToLoad;
+            if constexpr (CACHED_BIT_COUNT > 13) {
+                constexpr uint8_t DUPLICATED_BITS = CACHED_BIT_COUNT - 13;
+                bitBufferForLUT |= ((bitBufferPrecodeBits >> DUPLICATED_BITS) & nLowestBitsSet<uint64_t>(bitsToLoad))
+                                   << static_cast<uint8_t>(CACHED_BIT_COUNT - bitsToLoad);
+            } else {
+                bitBufferForLUT |= (bitBufferPrecodeBits & nLowestBitsSet<uint64_t>(bitsToLoad))
+                                   << static_cast<uint8_t>(CACHED_BIT_COUNT - bitsToLoad);
+            }
+
+            bitBufferPrecodeBits >>= bitsToLoad;
+            bitBufferPrecodeBits |= bitReader.read(bitsToLoad) << static_cast<uint8_t>(ALL_PRECODE_BITS - bitsToLoad);
+
+            offset += bitsToLoad;
+        }
+    } catch (const gzip::BitReader::EndOfFileReached&) {
+    }
+
+    return std::numeric_limits<size_t>::max();
+}
+}

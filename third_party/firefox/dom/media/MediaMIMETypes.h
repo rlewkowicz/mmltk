@@ -1,0 +1,169 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MediaMIMETypes_h_
+#define MediaMIMETypes_h_
+
+#include "VideoUtils.h"
+#include "mozilla/Maybe.h"
+#include "nsString.h"
+
+namespace mozilla {
+
+class DependentMediaMIMEType {
+ public:
+  template <size_t N>
+  explicit DependentMediaMIMEType(const char (&aType)[N])
+      : mMIMEType(aType, N - 1) {
+    MOZ_ASSERT(IsMediaMIMEType(aType, N - 1), "Invalid media MIME type");
+  }
+
+  const nsDependentCString& AsDependentString() const { return mMIMEType; }
+
+ private:
+  nsDependentCString mMIMEType;
+};
+
+#define MEDIAMIMETYPE(LIT)                                          \
+  static_cast<const DependentMediaMIMEType&>([]() {                 \
+    static_assert(IsMediaMIMEType(LIT), "Invalid media MIME type"); \
+    return DependentMediaMIMEType(LIT);                             \
+  }())
+
+class MediaMIMEType {
+ public:
+  MOZ_IMPLICIT MediaMIMEType(const DependentMediaMIMEType& aType)
+      : mMIMEType(aType.AsDependentString()) {}
+
+  const nsCString& AsString() const { return mMIMEType; }
+
+  bool operator==(const DependentMediaMIMEType& aOther) const {
+    return mMIMEType.Equals(aOther.AsDependentString());
+  }
+  bool operator!=(const DependentMediaMIMEType& aOther) const {
+    return !mMIMEType.Equals(aOther.AsDependentString());
+  }
+
+  bool operator==(const MediaMIMEType& aOther) const {
+    return mMIMEType.Equals(aOther.mMIMEType);
+  }
+  bool operator!=(const MediaMIMEType& aOther) const {
+    return !mMIMEType.Equals(aOther.mMIMEType);
+  }
+
+  bool HasApplicationMajorType() const;
+  bool HasAudioMajorType() const;
+  bool HasVideoMajorType() const;
+
+  size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) const;
+
+ private:
+  friend Maybe<MediaMIMEType> MakeMediaMIMEType(const nsAString& aType);
+  friend class MediaExtendedMIMEType;
+  explicit MediaMIMEType(const nsACString& aType);
+
+  nsCString mMIMEType;  
+};
+
+Maybe<MediaMIMEType> MakeMediaMIMEType(const nsAString& aType);
+Maybe<MediaMIMEType> MakeMediaMIMEType(const nsACString& aType);
+Maybe<MediaMIMEType> MakeMediaMIMEType(const char* aType);
+
+class MediaCodecs {
+ public:
+  MediaCodecs() = default;
+  explicit MediaCodecs(const nsAString& aCodecs) : mCodecs(aCodecs) {}
+  template <size_t N>
+  explicit MediaCodecs(const char (&aCodecs)[N])
+      : mCodecs(NS_ConvertUTF8toUTF16(aCodecs, N - 1)) {}
+
+  bool IsEmpty() const { return mCodecs.IsEmpty(); }
+  const nsString& AsString() const { return mCodecs; }
+
+  using RangeType =
+      const StringListRange<nsString,
+                            StringListRangeEmptyItems::ProcessEmptyItems>;
+
+  RangeType Range() const { return RangeType(mCodecs); };
+
+  bool Contains(const nsAString& aCodec) const;
+  bool ContainsAll(const MediaCodecs& aCodecs) const;
+
+  bool ContainsPrefix(const nsAString& aCodecPrefix) const;
+
+  template <size_t N>
+  bool operator==(const char (&aType)[N]) const {
+    return mCodecs.EqualsASCII(aType, N - 1);
+  }
+
+  size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) const;
+
+ private:
+  nsString mCodecs;
+};
+
+class MediaExtendedMIMEType {
+ public:
+  explicit MediaExtendedMIMEType(const MediaMIMEType& aType);
+  explicit MediaExtendedMIMEType(MediaMIMEType&& aType);
+
+  const MediaMIMEType& Type() const { return mMIMEType; }
+
+  nsDependentCSubstring Subtype() const;
+
+  bool HaveCodecs() const { return mHaveCodecs; }
+  const MediaCodecs& Codecs() const { return mCodecs; }
+
+  Maybe<int32_t> GetWidth() const { return GetMaybeNumber(mWidth); }
+  Maybe<int32_t> GetHeight() const { return GetMaybeNumber(mHeight); }
+  Maybe<double> GetFramerate() const { return GetMaybeNumber(mFramerate); }
+  Maybe<int32_t> GetBitrate() const { return GetMaybeNumber(mBitrate); }
+  Maybe<int32_t> GetChannels() const { return GetMaybeNumber(mChannels); }
+  Maybe<int32_t> GetSamplerate() const { return GetMaybeNumber(mSamplerate); }
+
+  size_t GetParameterCount() const;
+
+  const nsCString& OriginalString() const { return mOriginalString; }
+
+  size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) const;
+
+ private:
+  friend Maybe<MediaExtendedMIMEType> MakeMediaExtendedMIMEType(
+      const nsAString& aType);
+
+  MediaExtendedMIMEType(const nsACString& aOriginalString,
+                        const nsACString& aMIMEType, bool aHaveCodecs,
+                        const nsAString& aCodecs, int32_t aWidth,
+                        int32_t aHeight, double aFramerate, int32_t aBitrate);
+  MediaExtendedMIMEType(const nsACString& aOriginalString,
+                        const nsACString& aMIMEType, bool aHaveCodecs,
+                        const nsAString& aCodecs, int32_t aChannels,
+                        int32_t aSamplerate, int32_t aBitrate);
+
+  template <typename T>
+  Maybe<T> GetMaybeNumber(T aNumber) const {
+    return (aNumber < 0) ? Maybe<T>(Nothing()) : Some(T(aNumber));
+  }
+
+  nsCString mOriginalString;  
+  MediaMIMEType mMIMEType;    
+  bool mHaveCodecs = false;   
+  MediaCodecs mCodecs;
+  int32_t mWidth = -1;     
+  int32_t mHeight = -1;    
+  double mFramerate = -1;  
+  int32_t mChannels = -1;    
+  int32_t mSamplerate = -1;  
+  int32_t mBitrate = -1;  
+  mutable size_t mNumParams = 0;          
+  mutable bool mNumParamsCached = false;  
+};
+
+Maybe<MediaExtendedMIMEType> MakeMediaExtendedMIMEType(const nsAString& aType);
+Maybe<MediaExtendedMIMEType> MakeMediaExtendedMIMEType(const nsACString& aType);
+Maybe<MediaExtendedMIMEType> MakeMediaExtendedMIMEType(const char* aType);
+
+}  
+
+#endif  // MediaMIMETypes_h_

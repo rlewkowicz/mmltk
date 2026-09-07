@@ -1,0 +1,161 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifdef MOZILLA_INTERNAL_API
+
+#  include "mozilla/Assertions.h"
+#  include "mozilla/UniquePtr.h"
+
+#  include "ICUUtils.h"
+#  include "mozilla/ClearOnShutdown.h"
+#  include "mozilla/StaticPrefs_dom.h"
+#  include "mozilla/intl/LocaleService.h"
+#  include "mozilla/intl/FormatBuffer.h"
+#  include "mozilla/intl/NumberFormat.h"
+#  include "mozilla/intl/NumberParser.h"
+#  include "nsIContent.h"
+#  include "mozilla/dom/Document.h"
+#  include "nsString.h"
+
+using namespace mozilla;
+using mozilla::intl::LocaleService;
+
+already_AddRefed<nsAtom> ICUUtils::LanguageTagIterForContent::GetNext() {
+  if (mCurrentFallbackIndex < 0) {
+    mCurrentFallbackIndex = 0;
+    if (auto* lang = mContent->GetLang()) {
+      return do_AddRef(lang);
+    }
+  }
+
+  if (mCurrentFallbackIndex < 1) {
+    mCurrentFallbackIndex = 1;
+    if (nsAtom* lang = mContent->OwnerDoc()->GetContentLanguage()) {
+      return do_AddRef(lang);
+    }
+  }
+
+  if (mCurrentFallbackIndex < 2) {
+    mCurrentFallbackIndex = 2;
+    if (mContent->OwnerDoc()->ShouldResistFingerprinting(RFPTarget::JSLocale)) {
+      return NS_Atomize(nsRFPService::GetSpoofedJSLocale());
+    }
+    nsAutoCString appLocale;
+    LocaleService::GetInstance()->GetAppLocaleAsBCP47(appLocale);
+    return NS_Atomize(appLocale);
+  }
+
+  return nullptr;
+}
+
+bool ICUUtils::LocalizeNumber(double aValue,
+                              LanguageTagIterForContent& aLangTags,
+                              nsAString& aLocalizedValue) {
+  MOZ_ASSERT(aLangTags.IsAtStart(), "Don't call Next() before passing");
+  MOZ_ASSERT(NS_IsMainThread());
+  using LangToFormatterCache =
+      nsTHashMap<RefPtr<nsAtom>, UniquePtr<intl::NumberFormat>>;
+
+  static StaticAutoPtr<LangToFormatterCache> sCache;
+  if (!sCache) {
+    sCache = new LangToFormatterCache();
+    ClearOnShutdown(&sCache);
+  }
+
+  intl::NumberFormatOptions options;
+  if (StaticPrefs::dom_forms_number_grouping()) {
+    options.mGrouping = intl::NumberFormatOptions::Grouping::Always;
+  } else {
+    options.mGrouping = intl::NumberFormatOptions::Grouping::Never;
+  }
+
+  options.mFractionDigits = Some(std::make_pair(0, 16));
+
+  while (RefPtr<nsAtom> langTag = aLangTags.GetNext()) {
+    auto& formatter = sCache->LookupOrInsertWith(langTag, [&] {
+      nsAutoCString tag;
+      langTag->ToUTF8String(tag);
+      if (tag.FindChar('\0') != kNotFound) {
+        return UniquePtr<intl::NumberFormat>();
+      }
+      return intl::NumberFormat::TryCreate(tag, options).unwrapOr(nullptr);
+    });
+    if (!formatter) {
+      continue;
+    }
+    intl::nsTStringToBufferAdapter adapter(aLocalizedValue);
+    if (formatter->format(aValue, adapter).isOk()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+double ICUUtils::ParseNumber(const nsAString& aValue,
+                             LanguageTagIterForContent& aLangTags) {
+  MOZ_ASSERT(aLangTags.IsAtStart(), "Don't call Next() before passing");
+  using LangToParserCache =
+      nsTHashMap<RefPtr<nsAtom>, UniquePtr<intl::NumberParser>>;
+  static StaticAutoPtr<LangToParserCache> sCache;
+  if (aValue.IsEmpty()) {
+    return std::numeric_limits<float>::quiet_NaN();
+  }
+
+  if (!sCache) {
+    sCache = new LangToParserCache();
+    ClearOnShutdown(&sCache);
+  }
+
+  const Span<const char16_t> value(aValue.BeginReading(), aValue.Length());
+
+  while (RefPtr<nsAtom> langTag = aLangTags.GetNext()) {
+    auto& parser = sCache->LookupOrInsertWith(langTag, [&] {
+      nsAutoCString tag;
+      langTag->ToUTF8String(tag);
+      if (tag.FindChar('\0') != kNotFound) {
+        return UniquePtr<intl::NumberParser>();
+      }
+      return intl::NumberParser::TryCreate(
+                 tag, StaticPrefs::dom_forms_number_grouping())
+          .unwrapOr(nullptr);
+    });
+    if (!parser) {
+      continue;
+    }
+    static_assert(sizeof(UChar) == 2 && sizeof(nsAString::char_type) == 2,
+                  "Unexpected character size - the following cast is unsafe");
+    auto parseResult = parser->ParseDouble(value);
+    if (!parseResult.isOk()) {
+      continue;
+    }
+    std::pair<double, int32_t> parsed = parseResult.unwrap();
+    if (parsed.second == static_cast<int32_t>(value.Length())) {
+      return parsed.first;
+    }
+  }
+  return std::numeric_limits<float>::quiet_NaN();
+}
+
+void ICUUtils::AssignUCharArrayToString(UChar* aICUString, int32_t aLength,
+                                        nsAString& aMozString) {
+
+  static_assert(sizeof(UChar) == 2 && sizeof(nsAString::char_type) == 2,
+                "Unexpected character size - the following cast is unsafe");
+
+  aMozString.Assign((const nsAString::char_type*)aICUString, aLength);
+
+  NS_ASSERTION((int32_t)aMozString.Length() == aLength, "Conversion failed");
+}
+
+nsresult ICUUtils::ICUErrorToNsResult(const intl::ICUError aError) {
+  switch (aError) {
+    case intl::ICUError::OutOfMemory:
+      return NS_ERROR_OUT_OF_MEMORY;
+
+    default:
+      return NS_ERROR_FAILURE;
+  }
+}
+
+#endif /* MOZILLA_INTERNAL_API */

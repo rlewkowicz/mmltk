@@ -1,0 +1,115 @@
+/*
+ * Copyright 2021 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkChromeRemoteGlyphCache_DEFINED)
+#define SkChromeRemoteGlyphCache_DEFINED
+
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkTypeface.h"
+#include "include/private/base/SkAPI.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <vector>
+
+class SkAutoDescriptor;
+class SkCanvas;
+class SkColorSpace;
+class SkStrikeCache;
+class SkStrikeClientImpl;
+class SkStrikeServerImpl;
+class SkSurfaceProps;
+namespace sktext::gpu { class Slug; }
+
+using SkDiscardableHandleId = uint32_t;
+class SkStrikeServer {
+public:
+    class DiscardableHandleManager {
+    public:
+        SK_SPI virtual ~DiscardableHandleManager() = default;
+
+        SK_SPI virtual SkDiscardableHandleId createHandle() = 0;
+
+        SK_SPI virtual bool lockHandle(SkDiscardableHandleId) = 0;
+
+        SK_SPI virtual bool isHandleDeleted(SkDiscardableHandleId) = 0;
+    };
+
+    SK_SPI explicit SkStrikeServer(DiscardableHandleManager* discardableHandleManager);
+    SK_SPI ~SkStrikeServer();
+
+    SK_API std::unique_ptr<SkCanvas> makeAnalysisCanvas(int width, int height,
+                                                        const SkSurfaceProps& props,
+                                                        sk_sp<SkColorSpace> colorSpace,
+                                                        bool DFTSupport,
+                                                        bool DFTPerspSupport = true);
+
+    SK_SPI void writeStrikeData(std::vector<uint8_t>* memory);
+
+    void setMaxEntriesInDescriptorMapForTesting(size_t count);
+    size_t remoteStrikeMapSizeForTesting() const;
+
+private:
+    SkStrikeServerImpl* impl();
+
+    std::unique_ptr<SkStrikeServerImpl> fImpl;
+};
+
+class SkStrikeClient {
+public:
+    enum CacheMissType : uint32_t {
+        kFontMetrics = 0,
+        kGlyphMetrics = 1,
+        kGlyphImage = 2,
+        kGlyphPath = 3,
+
+        kGlyphMetricsFallback = 4,
+        kGlyphPathFallback    = 5,
+
+        kGlyphDrawable = 6,
+        kLast = kGlyphDrawable
+    };
+
+    class DiscardableHandleManager : public SkRefCnt {
+    public:
+        ~DiscardableHandleManager() override = default;
+
+        virtual bool deleteHandle(SkDiscardableHandleId) = 0;
+
+        virtual void assertHandleValid(SkDiscardableHandleId) {}
+
+        virtual void notifyCacheMiss(CacheMissType type, int fontSize) = 0;
+
+        struct ReadFailureData {
+            size_t memorySize;
+            size_t bytesRead;
+            uint64_t typefaceSize;
+            uint64_t strikeCount;
+            uint64_t glyphImagesCount;
+            uint64_t glyphPathsCount;
+        };
+        virtual void notifyReadFailure(const ReadFailureData& data) {}
+    };
+
+    SK_SPI explicit SkStrikeClient(sk_sp<DiscardableHandleManager>,
+                                   bool isLogging = true,
+                                   SkStrikeCache* strikeCache = nullptr);
+    SK_SPI ~SkStrikeClient();
+
+    SK_SPI bool readStrikeData(const volatile void* memory, size_t memorySize);
+
+    SK_SPI bool translateTypefaceID(SkAutoDescriptor* descriptor) const;
+
+    sk_sp<SkTypeface> retrieveTypefaceUsingServerIDForTest(SkTypefaceID) const;
+
+    sk_sp<sktext::gpu::Slug> deserializeSlugForTest(const void* data, size_t size) const;
+
+private:
+    std::unique_ptr<SkStrikeClientImpl> fImpl;
+};
+#endif

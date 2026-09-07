@@ -1,0 +1,542 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsTHashKeys_h_
+#define nsTHashKeys_h_
+
+#include "nsID.h"
+#include "nsISupports.h"
+#include "nsCOMPtr.h"
+#include "PLDHashTable.h"
+
+#include "nsString.h"
+#include "nsUnicharUtils.h"
+#include "nsPointerHashKeys.h"
+
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <type_traits>
+#include <utility>
+
+#include "mozilla/HashFunctions.h"
+#include "mozilla/ThreadSafeWeakPtr.h"
+
+namespace mozilla {
+
+
+inline uint32_t HashString(const nsAString& aStr) {
+  return HashString(aStr.BeginReading(), aStr.Length());
+}
+
+inline uint32_t HashString(const nsACString& aStr) {
+  return HashString(aStr.BeginReading(), aStr.Length());
+}
+
+}  
+
+
+class nsStringHashKey : public PLDHashEntryHdr {
+ public:
+  typedef const nsAString& KeyType;
+  typedef const nsAString* KeyTypePointer;
+
+  explicit nsStringHashKey(KeyTypePointer aStr) : mStr(*aStr) {}
+  nsStringHashKey(const nsStringHashKey&) = delete;
+  nsStringHashKey(nsStringHashKey&& aToMove)
+      : PLDHashEntryHdr(std::move(aToMove)), mStr(std::move(aToMove.mStr)) {}
+  ~nsStringHashKey() = default;
+
+  KeyType GetKey() const { return mStr; }
+  bool KeyEquals(const KeyTypePointer aKey) const { return mStr.Equals(*aKey); }
+
+  static KeyTypePointer KeyToPointer(KeyType aKey) { return &aKey; }
+  static PLDHashNumber HashKey(const KeyTypePointer aKey) {
+    return mozilla::HashString(*aKey);
+  }
+
+#ifdef MOZILLA_INTERNAL_API
+  size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) const {
+    return GetKey().SizeOfExcludingThisIfUnshared(aMallocSizeOf);
+  }
+#endif
+
+  enum { ALLOW_MEMMOVE = true };
+
+ private:
+  nsString mStr;
+};
+
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback,
+    const nsStringHashKey& aField, const char* aName, uint32_t aFlags = 0) {}
+
+#ifdef MOZILLA_INTERNAL_API
+
+namespace mozilla::detail {
+
+template <class CharT, bool Unicode = true>
+struct comparatorTraits {};
+
+template <>
+struct comparatorTraits<char, false> {
+  static int caseInsensitiveCompare(const char* aLhs, const char* aRhs,
+                                    size_t aLhsLength, size_t aRhsLength) {
+    return nsCaseInsensitiveCStringComparator(aLhs, aRhs, aLhsLength,
+                                              aRhsLength);
+  };
+};
+
+template <>
+struct comparatorTraits<char, true> {
+  static int caseInsensitiveCompare(const char* aLhs, const char* aRhs,
+                                    size_t aLhsLength, size_t aRhsLength) {
+    return nsCaseInsensitiveUTF8StringComparator(aLhs, aRhs, aLhsLength,
+                                                 aRhsLength);
+  };
+};
+
+template <>
+struct comparatorTraits<char16_t, true> {
+  static int caseInsensitiveCompare(const char16_t* aLhs, const char16_t* aRhs,
+                                    size_t aLhsLength, size_t aRhsLength) {
+    return nsCaseInsensitiveStringComparator(aLhs, aRhs, aLhsLength,
+                                             aRhsLength);
+  };
+};
+
+}  
+
+
+template <typename T, bool Unicode>
+class nsTStringCaseInsensitiveHashKey : public PLDHashEntryHdr {
+ public:
+  typedef const nsTSubstring<T>& KeyType;
+  typedef const nsTSubstring<T>* KeyTypePointer;
+
+  explicit nsTStringCaseInsensitiveHashKey(KeyTypePointer aStr) : mStr(*aStr) {
+  }
+
+  nsTStringCaseInsensitiveHashKey(const nsTStringCaseInsensitiveHashKey&) =
+      delete;
+  nsTStringCaseInsensitiveHashKey(nsTStringCaseInsensitiveHashKey&& aToMove)
+      : PLDHashEntryHdr(std::move(aToMove)), mStr(std::move(aToMove.mStr)) {}
+  ~nsTStringCaseInsensitiveHashKey() = default;
+
+  KeyType GetKey() const { return mStr; }
+  bool KeyEquals(const KeyTypePointer aKey) const {
+    using comparator = typename mozilla::detail::comparatorTraits<T, Unicode>;
+    return mStr.Equals(*aKey, comparator::caseInsensitiveCompare);
+  }
+
+  static KeyTypePointer KeyToPointer(KeyType aKey) { return &aKey; }
+  static PLDHashNumber HashKey(const KeyTypePointer aKey) {
+    nsTAutoString<T> tmKey(*aKey);
+    ToLowerCase(tmKey);
+    return mozilla::HashString(tmKey);
+  }
+  enum { ALLOW_MEMMOVE = true };
+
+  size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) const {
+    return GetKey().SizeOfExcludingThisIfUnshared(aMallocSizeOf);
+  }
+
+ private:
+  const nsTString<T> mStr;
+};
+
+template <class T, bool Unicode>
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback,
+    const nsTStringCaseInsensitiveHashKey<T, Unicode>& aField,
+    const char* aName, uint32_t aFlags = 0) {}
+
+using nsStringCaseInsensitiveHashKey =
+    nsTStringCaseInsensitiveHashKey<char16_t, true>;
+using nsCStringASCIICaseInsensitiveHashKey =
+    nsTStringCaseInsensitiveHashKey<char, false>;
+using nsCStringUTF8CaseInsensitiveHashKey =
+    nsTStringCaseInsensitiveHashKey<char, true>;
+
+#endif  // MOZILLA_INTERNAL_API
+
+class nsCStringHashKey : public PLDHashEntryHdr {
+ public:
+  typedef const nsACString& KeyType;
+  typedef const nsACString* KeyTypePointer;
+
+  explicit nsCStringHashKey(const nsACString* aStr) : mStr(*aStr) {}
+  nsCStringHashKey(nsCStringHashKey&& aOther)
+      : PLDHashEntryHdr(std::move(aOther)), mStr(std::move(aOther.mStr)) {}
+  ~nsCStringHashKey() = default;
+
+  KeyType GetKey() const { return mStr; }
+  bool KeyEquals(KeyTypePointer aKey) const { return mStr.Equals(*aKey); }
+
+  static KeyTypePointer KeyToPointer(KeyType aKey) { return &aKey; }
+  static PLDHashNumber HashKey(KeyTypePointer aKey) {
+    return mozilla::HashString(*aKey);
+  }
+
+#ifdef MOZILLA_INTERNAL_API
+  size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) const {
+    return GetKey().SizeOfExcludingThisIfUnshared(aMallocSizeOf);
+  }
+#endif
+
+  enum { ALLOW_MEMMOVE = true };
+
+ private:
+  const nsCString mStr;
+};
+
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback,
+    const nsCStringHashKey& aField, const char* aName, uint32_t aFlags = 0) {}
+
+template <typename T,
+          std::enable_if_t<std::is_integral_v<T> || std::is_enum_v<T>, int> = 0>
+class nsIntegralHashKey : public PLDHashEntryHdr {
+ public:
+  using KeyType = const T&;
+  using KeyTypePointer = const T*;
+
+  explicit nsIntegralHashKey(KeyTypePointer aKey) : mValue(*aKey) {}
+  nsIntegralHashKey(nsIntegralHashKey&& aOther) noexcept
+      : PLDHashEntryHdr(std::move(aOther)), mValue(aOther.mValue) {}
+  ~nsIntegralHashKey() = default;
+
+  KeyType GetKey() const { return mValue; }
+  bool KeyEquals(KeyTypePointer aKey) const { return *aKey == mValue; }
+
+  static KeyTypePointer KeyToPointer(KeyType aKey) { return &aKey; }
+  static PLDHashNumber HashKey(KeyTypePointer aKey) {
+    return mozilla::HashGeneric(*aKey);
+  }
+  enum { ALLOW_MEMMOVE = true };
+
+ private:
+  const T mValue;
+};
+
+template <typename T>
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback,
+    const nsIntegralHashKey<T>& aField, const char* aName,
+    uint32_t aFlags = 0) {}
+
+using nsUint32HashKey = nsIntegralHashKey<uint32_t>;
+
+using nsUint64HashKey = nsIntegralHashKey<uint64_t>;
+
+class nsFloatHashKey : public PLDHashEntryHdr {
+ public:
+  typedef const float& KeyType;
+  typedef const float* KeyTypePointer;
+
+  explicit nsFloatHashKey(KeyTypePointer aKey) : mValue(*aKey) {}
+  nsFloatHashKey(nsFloatHashKey&& aOther)
+      : PLDHashEntryHdr(std::move(aOther)), mValue(std::move(aOther.mValue)) {}
+  ~nsFloatHashKey() = default;
+
+  KeyType GetKey() const { return mValue; }
+  bool KeyEquals(KeyTypePointer aKey) const { return *aKey == mValue; }
+
+  static KeyTypePointer KeyToPointer(KeyType aKey) { return &aKey; }
+  static PLDHashNumber HashKey(KeyTypePointer aKey) {
+    return *reinterpret_cast<const uint32_t*>(aKey);
+  }
+  enum { ALLOW_MEMMOVE = true };
+
+ private:
+  const float mValue;
+};
+
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback, const nsFloatHashKey& aField,
+    const char* aName, uint32_t aFlags = 0) {}
+
+using IntPtrHashKey = nsIntegralHashKey<intptr_t>;
+
+class nsISupportsHashKey : public PLDHashEntryHdr {
+ public:
+  using KeyType = nsISupports*;
+  using KeyTypePointer = const nsISupports*;
+
+  explicit nsISupportsHashKey(const nsISupports* aKey)
+      : mSupports(const_cast<nsISupports*>(aKey)) {}
+  nsISupportsHashKey(nsISupportsHashKey&& aOther) = default;
+  ~nsISupportsHashKey() = default;
+
+  KeyType GetKey() const { return mSupports; }
+  bool KeyEquals(KeyTypePointer aKey) const { return aKey == mSupports; }
+
+  static KeyTypePointer KeyToPointer(KeyType aKey) { return aKey; }
+  static PLDHashNumber HashKey(KeyTypePointer aKey) {
+    return mozilla::HashGeneric(aKey);
+  }
+  enum { ALLOW_MEMMOVE = true };
+
+ private:
+  nsCOMPtr<nsISupports> mSupports;
+};
+
+template <class T>
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback,
+    const nsISupportsHashKey& aField, const char* aName, uint32_t aFlags = 0) {
+  CycleCollectionNoteChild(aCallback, aField.GetKey(), aName, aFlags);
+}
+
+template <class T>
+class nsRefPtrHashKey : public PLDHashEntryHdr {
+ public:
+  using KeyType = T*;
+  using KeyTypePointer = const T*;
+
+  explicit nsRefPtrHashKey(const T* aKey) : mKey(const_cast<T*>(aKey)) {}
+  nsRefPtrHashKey(nsRefPtrHashKey&& aOther) = default;
+  ~nsRefPtrHashKey() = default;
+
+  KeyType GetKey() const { return mKey; }
+  bool KeyEquals(KeyTypePointer aKey) const { return aKey == mKey; }
+
+  static KeyTypePointer KeyToPointer(KeyType aKey) { return aKey; }
+  static PLDHashNumber HashKey(KeyTypePointer aKey) {
+    return mozilla::HashGeneric(aKey);
+  }
+  enum { ALLOW_MEMMOVE = true };
+
+ private:
+  RefPtr<T> mKey;
+};
+
+namespace mozilla {
+
+template <class T>
+class ThreadSafeWeakPtrHashKey : public PLDHashEntryHdr {
+ public:
+  typedef RefPtr<T> KeyType;
+  typedef const T* KeyTypePointer;
+
+  explicit ThreadSafeWeakPtrHashKey(KeyTypePointer aKey)
+      : mKey(do_AddRef(const_cast<T*>(aKey))) {}
+
+  KeyType GetKey() const { return do_AddRef(mKey); }
+  bool KeyEquals(KeyTypePointer aKey) const { return mKey == aKey; }
+
+  static KeyTypePointer KeyToPointer(const KeyType& aKey) { return aKey.get(); }
+  static PLDHashNumber HashKey(KeyTypePointer aKey) {
+    return HashGeneric(aKey);
+  }
+  enum { ALLOW_MEMMOVE = true };
+
+ private:
+  ThreadSafeWeakPtr<T> mKey;
+};
+
+}  
+
+template <class T>
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback,
+    const nsRefPtrHashKey<T>& aField, const char* aName, uint32_t aFlags = 0) {
+  CycleCollectionNoteChild(aCallback, aField.GetKey(), aName, aFlags);
+}
+
+template <class T>
+class nsFuncPtrHashKey : public PLDHashEntryHdr {
+ public:
+  typedef T& KeyType;
+  typedef const T* KeyTypePointer;
+
+  explicit nsFuncPtrHashKey(const T* aKey) : mKey(*const_cast<T*>(aKey)) {}
+  nsFuncPtrHashKey(const nsFuncPtrHashKey<T>& aToCopy) : mKey(aToCopy.mKey) {}
+  ~nsFuncPtrHashKey() = default;
+
+  KeyType GetKey() const { return const_cast<T&>(mKey); }
+  bool KeyEquals(KeyTypePointer aKey) const { return *aKey == mKey; }
+
+  static KeyTypePointer KeyToPointer(KeyType aKey) { return &aKey; }
+  static PLDHashNumber HashKey(KeyTypePointer aKey) {
+    return mozilla::HashGeneric(*aKey);
+  }
+  enum { ALLOW_MEMMOVE = true };
+
+ protected:
+  T mKey;
+};
+
+template <class T>
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback,
+    const nsFuncPtrHashKey<T>& aField, const char* aName, uint32_t aFlags = 0) {
+}
+
+class nsIDHashKey : public PLDHashEntryHdr {
+ public:
+  typedef const nsID& KeyType;
+  typedef const nsID* KeyTypePointer;
+
+  explicit nsIDHashKey(const nsID* aInID) : mID(*aInID) {}
+  nsIDHashKey(nsIDHashKey&& aOther)
+      : PLDHashEntryHdr(std::move(aOther)), mID(std::move(aOther.mID)) {}
+  ~nsIDHashKey() = default;
+
+  KeyType GetKey() const { return mID; }
+  bool KeyEquals(KeyTypePointer aKey) const { return aKey->Equals(mID); }
+
+  static KeyTypePointer KeyToPointer(KeyType aKey) { return &aKey; }
+  static PLDHashNumber HashKey(KeyTypePointer aKey) {
+    return mozilla::HashBytes(aKey, sizeof(KeyType));
+  }
+
+  enum { ALLOW_MEMMOVE = true };
+
+ private:
+  nsID mID;
+};
+
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback, const nsIDHashKey& aField,
+    const char* aName, uint32_t aFlags = 0) {}
+
+class nsIDPointerHashKey : public PLDHashEntryHdr {
+ public:
+  typedef const nsID* KeyType;
+  typedef const nsID* KeyTypePointer;
+
+  explicit nsIDPointerHashKey(const nsID* aInID) : mID(aInID) {}
+  nsIDPointerHashKey(nsIDPointerHashKey&& aOther)
+      : PLDHashEntryHdr(std::move(aOther)), mID(aOther.mID) {}
+  ~nsIDPointerHashKey() = default;
+
+  KeyType GetKey() const { return mID; }
+  bool KeyEquals(KeyTypePointer aKey) const { return aKey->Equals(*mID); }
+
+  static KeyTypePointer KeyToPointer(KeyType aKey) { return aKey; }
+  static PLDHashNumber HashKey(KeyTypePointer aKey) {
+    return mozilla::HashBytes(aKey, sizeof(*aKey));
+  }
+
+  enum { ALLOW_MEMMOVE = true };
+
+ private:
+  const nsID* mID;
+};
+
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback,
+    const nsIDPointerHashKey& aField, const char* aName, uint32_t aFlags = 0) {}
+
+class nsDepCharHashKey : public PLDHashEntryHdr {
+ public:
+  typedef const char* KeyType;
+  typedef const char* KeyTypePointer;
+
+  explicit nsDepCharHashKey(const char* aKey) : mKey(aKey) {}
+  nsDepCharHashKey(nsDepCharHashKey&& aOther)
+      : PLDHashEntryHdr(std::move(aOther)), mKey(std::move(aOther.mKey)) {}
+  ~nsDepCharHashKey() = default;
+
+  const char* GetKey() const { return mKey; }
+  bool KeyEquals(const char* aKey) const { return !strcmp(mKey, aKey); }
+
+  static const char* KeyToPointer(const char* aKey) { return aKey; }
+  static PLDHashNumber HashKey(const char* aKey) {
+    return mozilla::HashString(aKey, strlen(aKey));
+  }
+  enum { ALLOW_MEMMOVE = true };
+
+ private:
+  const char* mKey;
+};
+
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback,
+    const nsDepCharHashKey& aField, const char* aName, uint32_t aFlags = 0) {}
+
+class nsCharPtrHashKey : public PLDHashEntryHdr {
+ public:
+  typedef const char* KeyType;
+  typedef const char* KeyTypePointer;
+
+  explicit nsCharPtrHashKey(const char* aKey) : mKey(strdup(aKey)) {}
+
+  nsCharPtrHashKey(const nsCharPtrHashKey&) = delete;
+  nsCharPtrHashKey(nsCharPtrHashKey&& aOther)
+      : PLDHashEntryHdr(std::move(aOther)), mKey(aOther.mKey) {
+    aOther.mKey = nullptr;
+  }
+
+  ~nsCharPtrHashKey() {
+    if (mKey) {
+      free(const_cast<char*>(mKey));
+    }
+  }
+
+  const char* GetKey() const { return mKey; }
+  bool KeyEquals(KeyTypePointer aKey) const { return !strcmp(mKey, aKey); }
+
+  static KeyTypePointer KeyToPointer(KeyType aKey) { return aKey; }
+  static PLDHashNumber HashKey(KeyTypePointer aKey) {
+    return mozilla::HashString(aKey, strlen(aKey));
+  }
+
+  size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) const {
+    return aMallocSizeOf(mKey);
+  }
+
+  enum { ALLOW_MEMMOVE = true };
+
+ private:
+  const char* mKey;
+};
+
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback,
+    const nsCharPtrHashKey& aField, const char* aName, uint32_t aFlags = 0) {}
+
+namespace mozilla {
+
+template <typename T>
+PLDHashNumber Hash(const T& aValue) {
+  return aValue.Hash();
+}
+
+}  
+
+template <typename T>
+class nsGenericHashKey : public PLDHashEntryHdr {
+ public:
+  typedef const T& KeyType;
+  typedef const T* KeyTypePointer;
+
+  explicit nsGenericHashKey(KeyTypePointer aKey) : mKey(*aKey) {}
+  nsGenericHashKey(const nsGenericHashKey&) = delete;
+  nsGenericHashKey(nsGenericHashKey&& aOther)
+      : PLDHashEntryHdr(std::move(aOther)), mKey(std::move(aOther.mKey)) {}
+
+  KeyType GetKey() const { return mKey; }
+  bool KeyEquals(KeyTypePointer aKey) const { return *aKey == mKey; }
+
+  static KeyTypePointer KeyToPointer(KeyType aKey) { return &aKey; }
+  static PLDHashNumber HashKey(KeyTypePointer aKey) {
+    return ::mozilla::Hash(*aKey);
+  }
+  enum { ALLOW_MEMMOVE = true };
+
+ private:
+  T mKey;
+};
+
+template <class Key>
+class NoMemMoveKey : public Key {
+ public:
+  explicit NoMemMoveKey(typename Key::KeyTypePointer aKey) : Key(aKey) {}
+  enum { ALLOW_MEMMOVE = false };
+};
+
+#endif  // nsTHashKeys_h_

@@ -1,0 +1,221 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef CSSEditUtils_h
+#define CSSEditUtils_h
+
+#include "ChangeStyleTransaction.h"  // for ChangeStyleTransaction
+#include "EditorForwards.h"
+#include "nsCOMPtr.h"  // for already_AddRefed
+#include "nsStringFwd.h"
+#include "nsTArray.h"  // for nsTArray
+#include "nscore.h"    // for nsAString, nsresult, nullptr
+
+class nsComputedDOMStyle;
+class nsAtom;
+class nsIContent;
+class nsINode;
+class nsStaticAtom;
+class nsStyledElement;
+
+namespace mozilla {
+namespace dom {
+class Element;
+}  
+
+using nsProcessValueFunc = void (*)(const nsAString* aInputString,
+                                    nsAString& aOutputString,
+                                    const char* aDefaultValueString,
+                                    const char* aPrependString,
+                                    const char* aAppendString);
+
+class CSSEditUtils final {
+ public:
+  CSSEditUtils() = delete;
+
+  enum nsCSSEditableProperty {
+    eCSSEditableProperty_NONE = 0,
+    eCSSEditableProperty_background_color,
+    eCSSEditableProperty_background_image,
+    eCSSEditableProperty_border,
+    eCSSEditableProperty_caption_side,
+    eCSSEditableProperty_color,
+    eCSSEditableProperty_float,
+    eCSSEditableProperty_font_family,
+    eCSSEditableProperty_font_size,
+    eCSSEditableProperty_font_style,
+    eCSSEditableProperty_font_weight,
+    eCSSEditableProperty_height,
+    eCSSEditableProperty_list_style_type,
+    eCSSEditableProperty_margin_left,
+    eCSSEditableProperty_margin_right,
+    eCSSEditableProperty_text_align,
+    eCSSEditableProperty_text_decoration,
+    eCSSEditableProperty_vertical_align,
+    eCSSEditableProperty_whitespace,
+    eCSSEditableProperty_width
+  };
+
+  struct CSSEquivTable {
+    nsCSSEditableProperty cssProperty;
+    bool gettable;
+    bool caseSensitiveValue;
+    nsProcessValueFunc processValueFunctor;
+    const char* defaultValue;
+    const char* prependValue;
+    const char* appendValue;
+  };
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT static nsresult
+  SetCSSPropertyWithTransaction(HTMLEditor& aHTMLEditor,
+                                nsStyledElement& aStyledElement,
+                                nsAtom& aProperty, const nsAString& aValue) {
+    return SetCSSPropertyInternal(aHTMLEditor, aStyledElement, aProperty,
+                                  aValue, false);
+  }
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT static nsresult
+  SetCSSPropertyPixelsWithTransaction(HTMLEditor& aHTMLEditor,
+                                      nsStyledElement& aStyledElement,
+                                      nsAtom& aProperty, int32_t aIntValue);
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT static nsresult
+  SetCSSPropertyPixelsWithoutTransaction(HTMLEditor& aHTMLEditor,
+                                         nsStyledElement& aStyledElement,
+                                         const nsAtom& aProperty,
+                                         int32_t aIntValue);
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT static nsresult
+  RemoveCSSPropertyWithTransaction(HTMLEditor& aHTMLEditor,
+                                   nsStyledElement& aStyledElement,
+                                   nsAtom& aProperty,
+                                   const nsAString& aPropertyValue) {
+    return RemoveCSSPropertyInternal(aHTMLEditor, aStyledElement, aProperty,
+                                     aPropertyValue, false);
+  }
+
+  static nsresult GetSpecifiedProperty(nsIContent& aContent,
+                                       nsAtom& aCSSProperty, nsAString& aValue);
+  MOZ_CAN_RUN_SCRIPT static nsresult GetComputedProperty(nsIContent& aContent,
+                                                         nsAtom& aCSSProperty,
+                                                         nsAString& aValue);
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT static Result<EditorDOMPoint, nsresult>
+  RemoveCSSInlineStyleWithTransaction(HTMLEditor& aHTMLEditor,
+                                      nsStyledElement& aStyledElement,
+                                      nsAtom* aProperty,
+                                      const nsAString& aPropertyValue);
+
+  static void GetDefaultBackgroundColor(nsAString& aColor);
+
+  MOZ_CAN_RUN_SCRIPT static nsresult GetComputedCSSEquivalentTo(
+      dom::Element& aElement, const EditorElementStyle& aStyle,
+      nsAString& aOutValue);
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT static Result<bool, nsresult>
+  IsComputedCSSEquivalentTo(const HTMLEditor& aHTMLEditor, nsIContent& aContent,
+                            const EditorInlineStyle& aStyle,
+                            nsAString& aInOutValue);
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT_BOUNDARY static Result<bool, nsresult>
+  IsSpecifiedCSSEquivalentTo(const HTMLEditor& aHTMLEditor,
+                             nsIContent& aContent,
+                             const EditorInlineStyle& aStyle,
+                             nsAString& aInOutValue);
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT static Result<bool, nsresult>
+  HaveComputedCSSEquivalentStyles(const HTMLEditor& aHTMLEditor,
+                                  nsIContent& aContent,
+                                  const EditorInlineStyle& aStyle);
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT_BOUNDARY static Result<bool, nsresult>
+  HaveSpecifiedCSSEquivalentStyles(const HTMLEditor& aHTMLEditor,
+                                   nsIContent& aContent,
+                                   const EditorInlineStyle& aStyle);
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT static Result<size_t, nsresult>
+  SetCSSEquivalentToStyle(WithTransaction aWithTransaction,
+                          HTMLEditor& aHTMLEditor,
+                          nsStyledElement& aStyledElement,
+                          const EditorElementStyle& aStyleToSet,
+                          const nsAString* aValue);
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT static nsresult RemoveCSSEquivalentToStyle(
+      WithTransaction aWithTransaction, HTMLEditor& aHTMLEditor,
+      nsStyledElement& aStyledElement, const EditorElementStyle& aStyleToRemove,
+      const nsAString* aValue);
+
+  static void ParseLength(const nsAString& aString, float* aValue,
+                          nsAtom** aUnit);
+
+  static bool DoStyledElementsHaveSameStyle(
+      nsStyledElement& aStyledElement, nsStyledElement& aOtherStyledElement);
+
+  static already_AddRefed<nsComputedDOMStyle> GetComputedStyle(
+      dom::Element* aElement);
+
+ private:
+  enum class StyleType { Specified, Computed };
+
+  static nsStaticAtom* GetCSSPropertyAtom(nsCSSEditableProperty aProperty);
+
+  struct CSSDeclaration {
+    nsStaticAtom& mProperty;
+    nsString const mValue;
+  };
+
+  enum class HandlingFor { GettingStyle, SettingStyle, RemovingStyle };
+  static void GetCSSDeclarations(const CSSEquivTable* aEquivTable,
+                                 const nsAString* aValue,
+                                 HandlingFor aHandlingFor,
+                                 nsTArray<CSSDeclaration>& aOutCSSDeclarations);
+
+  static void GetCSSDeclarations(dom::Element& aElement,
+                                 const EditorElementStyle& aStyle,
+                                 const nsAString* aValue,
+                                 HandlingFor aHandlingFor,
+                                 nsTArray<CSSDeclaration>& aOutCSSDeclarations);
+
+  MOZ_CAN_RUN_SCRIPT static nsresult GetComputedCSSInlinePropertyBase(
+      nsIContent& aContent, nsAtom& aCSSProperty, nsAString& aValue);
+  static nsresult GetSpecifiedCSSInlinePropertyBase(nsIContent& aContent,
+                                                    nsAtom& aCSSProperty,
+                                                    nsAString& aValue);
+
+  MOZ_CAN_RUN_SCRIPT static nsresult GetCSSEquivalentTo(
+      dom::Element& aElement, const EditorElementStyle& aStyle,
+      nsAString& aOutValue, StyleType aStyleType);
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT static Result<bool, nsresult>
+  IsCSSEquivalentTo(const HTMLEditor& aHTMLEditor, nsIContent& aContent,
+                    const EditorInlineStyle& aStyle, nsAString& aInOutValue,
+                    StyleType aStyleType);
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT static Result<bool, nsresult>
+  HaveCSSEquivalentStyles(const HTMLEditor& aHTMLEditor, nsIContent& aContent,
+                          const EditorInlineStyle& aStyle,
+                          StyleType aStyleType);
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT static nsresult RemoveCSSPropertyInternal(
+      HTMLEditor& aHTMLEditor, nsStyledElement& aStyledElement,
+      nsAtom& aProperty, const nsAString& aPropertyValue,
+      bool aSuppressTxn = false);
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT static nsresult SetCSSPropertyInternal(
+      HTMLEditor& aHTMLEditor, nsStyledElement& aStyledElement,
+      nsAtom& aProperty, const nsAString& aValue, bool aSuppressTxn = false);
+
+  [[nodiscard]] static bool IsCSSEditableStyle(
+      const nsAtom& aTagName, const EditorElementStyle& aStyle);
+  [[nodiscard]] static bool IsCSSEditableStyle(
+      const dom::Element& aElement, const EditorElementStyle& aStyle);
+
+  friend class EditorElementStyle;  
+};
+
+#define NS_EDITOR_INDENT_INCREMENT_IN 0.4134f
+#define NS_EDITOR_INDENT_INCREMENT_CM 1.05f
+#define NS_EDITOR_INDENT_INCREMENT_MM 10.5f
+#define NS_EDITOR_INDENT_INCREMENT_PT 29.76f
+#define NS_EDITOR_INDENT_INCREMENT_PC 2.48f
+#define NS_EDITOR_INDENT_INCREMENT_EM 3
+#define NS_EDITOR_INDENT_INCREMENT_EX 6
+#define NS_EDITOR_INDENT_INCREMENT_PX 40
+#define NS_EDITOR_INDENT_INCREMENT_PERCENT 4
+
+}  
+
+#endif  // #ifndef CSSEditUtils_h

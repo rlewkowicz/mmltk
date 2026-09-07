@@ -1,0 +1,128 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_ipc_backgroundutils_h_
+#define mozilla_ipc_backgroundutils_h_
+
+#include "ipc/IPCMessageUtils.h"
+#include "mozilla/OriginAttributes.h"
+#include "nsCOMPtr.h"
+#include "nscore.h"
+
+class nsIContentSecurityPolicy;
+class nsILoadInfo;
+class nsINode;
+class nsIPrincipal;
+class nsIRedirectHistoryEntry;
+
+namespace IPC {
+
+namespace detail {
+template <class ParamType>
+struct OriginAttributesParamTraits {
+  typedef ParamType paramType;
+
+  static void Write(MessageWriter* aWriter, const paramType& aParam) {
+    nsAutoCString suffix;
+    aParam.CreateSuffix(suffix);
+    WriteParam(aWriter, suffix);
+  }
+
+  static bool Read(MessageReader* aReader, paramType* aResult) {
+    nsAutoCString suffix;
+    return ReadParam(aReader, &suffix) && aResult->PopulateFromSuffix(suffix);
+  }
+};
+}  
+
+template <>
+struct ParamTraits<mozilla::OriginAttributes>
+    : public detail::OriginAttributesParamTraits<mozilla::OriginAttributes> {};
+
+}  
+
+namespace mozilla {
+
+namespace dom {
+class Document;
+}
+
+namespace net {
+class ChildLoadInfoForwarderArgs;
+class LoadInfoArgs;
+class LoadInfo;
+class ParentLoadInfoForwarderArgs;
+class RedirectHistoryEntryInfo;
+}  
+
+namespace ipc {
+
+class ContentSecurityPolicy;
+class CSPInfo;
+class PrincipalInfo;
+
+Result<nsCOMPtr<nsIPrincipal>, nsresult> PrincipalInfoToPrincipal(
+    const PrincipalInfo& aPrincipalInfo);
+
+nsresult PrincipalToPrincipalInfo(nsIPrincipal* aPrincipal,
+                                  PrincipalInfo* aPrincipalInfo,
+                                  bool aSkipBaseDomain = false);
+
+bool StorageKeysEqual(const PrincipalInfo& aLeft, const PrincipalInfo& aRight);
+
+already_AddRefed<nsIContentSecurityPolicy> CSPInfoToCSP(
+    const CSPInfo& aCSPInfo, mozilla::dom::Document* aRequestingDoc,
+    nsresult* aOptionalResult = nullptr);
+
+nsresult CSPToCSPInfo(nsIContentSecurityPolicy* aCSP, CSPInfo* aCSPInfo);
+
+bool IsPrincipalInfoPrivate(const PrincipalInfo& aPrincipalInfo);
+
+
+already_AddRefed<nsIRedirectHistoryEntry> RHEntryInfoToRHEntry(
+    const mozilla::net::RedirectHistoryEntryInfo& aRHEntryInfo);
+
+
+nsresult RHEntryToRHEntryInfo(
+    nsIRedirectHistoryEntry* aRHEntry,
+    mozilla::net::RedirectHistoryEntryInfo* aRHEntryInfo);
+
+nsresult LoadInfoToLoadInfoArgs(nsILoadInfo* aLoadInfo,
+                                mozilla::net::LoadInfoArgs* outLoadInfoArgs);
+
+nsresult LoadInfoArgsToLoadInfo(const mozilla::net::LoadInfoArgs& aLoadInfoArgs,
+                                const nsACString& aOriginRemoteType,
+                                nsILoadInfo** outLoadInfo);
+nsresult LoadInfoArgsToLoadInfo(const mozilla::net::LoadInfoArgs& aLoadInfoArgs,
+                                const nsACString& aOriginRemoteType,
+                                nsINode* aCspToInheritLoadingContext,
+                                nsILoadInfo** outLoadInfo);
+nsresult LoadInfoArgsToLoadInfo(const net::LoadInfoArgs& aLoadInfoArgs,
+                                const nsACString& aOriginRemoteType,
+                                mozilla::net::LoadInfo** outLoadInfo);
+nsresult LoadInfoArgsToLoadInfo(const net::LoadInfoArgs& aLoadInfoArgs,
+                                const nsACString& aOriginRemoteType,
+                                nsINode* aCspToInheritLoadingContext,
+                                mozilla::net::LoadInfo** outLoadInfo);
+
+void LoadInfoToParentLoadInfoForwarder(
+    nsILoadInfo* aLoadInfo,
+    mozilla::net::ParentLoadInfoForwarderArgs* aForwarderArgsOut);
+
+nsresult MergeParentLoadInfoForwarder(
+    mozilla::net::ParentLoadInfoForwarderArgs const& aForwarderArgs,
+    nsILoadInfo* aLoadInfo);
+
+void LoadInfoToChildLoadInfoForwarder(
+    nsILoadInfo* aLoadInfo,
+    mozilla::net::ChildLoadInfoForwarderArgs* aForwarderArgsOut);
+
+nsresult MergeChildLoadInfoForwarder(
+    const mozilla::net::ChildLoadInfoForwarderArgs& aForwardArgs,
+    nsILoadInfo* aLoadInfo);
+
+}  
+}  
+
+#endif  // mozilla_ipc_backgroundutils_h_

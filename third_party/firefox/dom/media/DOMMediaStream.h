@@ -1,0 +1,173 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef NSDOMMEDIASTREAM_H_
+#define NSDOMMEDIASTREAM_H_
+
+#include "ImageContainer.h"
+#include "mozilla/DOMEventTargetHelper.h"
+#include "mozilla/RelativeTimeline.h"
+#include "mozilla/WeakPtr.h"
+#include "mozilla/dom/MediaStreamTrackBinding.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsIPrincipal.h"
+#include "nsWrapperCache.h"
+
+namespace mozilla {
+
+class AbstractThread;
+class DOMMediaStream;
+
+enum class BlockingMode;
+
+namespace dom {
+class HTMLCanvasElement;
+class MediaStreamTrack;
+class MediaStreamTrackSource;
+class AudioStreamTrack;
+class VideoStreamTrack;
+}  
+
+namespace layers {
+class ImageContainer;
+class OverlayImage;
+}  
+
+#define NS_DOMMEDIASTREAM_IID \
+  {0x8cb65468, 0x66c0, 0x444e, {0x89, 0x9f, 0x89, 0x1d, 0x9e, 0xd2, 0xbe, 0x7c}}
+
+class DOMMediaStream : public DOMEventTargetHelper,
+                       public RelativeTimeline,
+                       public SupportsWeakPtr {
+  typedef dom::MediaStreamTrack MediaStreamTrack;
+  typedef dom::AudioStreamTrack AudioStreamTrack;
+  typedef dom::VideoStreamTrack VideoStreamTrack;
+  typedef dom::MediaStreamTrackSource MediaStreamTrackSource;
+
+ public:
+  typedef dom::MediaTrackConstraints MediaTrackConstraints;
+
+  class TrackListener : public nsISupports {
+   public:
+    NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+    NS_DECL_CYCLE_COLLECTION_CLASS(TrackListener)
+
+    virtual void NotifyTrackAdded(const RefPtr<MediaStreamTrack>& aTrack) {};
+
+    virtual void NotifyTrackRemoved(const RefPtr<MediaStreamTrack>& aTrack) {};
+
+    virtual void NotifyActive() {};
+
+    virtual void NotifyInactive() {};
+
+    virtual void NotifyAudible() {};
+
+    virtual void NotifyInaudible() {};
+
+   protected:
+    virtual ~TrackListener() = default;
+  };
+
+  explicit DOMMediaStream(nsPIDOMWindowInner* aWindow);
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(DOMMediaStream, DOMEventTargetHelper)
+  NS_INLINE_DECL_STATIC_IID(NS_DOMMEDIASTREAM_IID)
+
+  virtual JSObject* WrapObject(JSContext* aCx,
+                               JS::Handle<JSObject*> aGivenProto) override;
+
+
+  static already_AddRefed<DOMMediaStream> Constructor(
+      const dom::GlobalObject& aGlobal, ErrorResult& aRv);
+
+  static already_AddRefed<DOMMediaStream> Constructor(
+      const dom::GlobalObject& aGlobal, const DOMMediaStream& aStream,
+      ErrorResult& aRv);
+
+  static already_AddRefed<DOMMediaStream> Constructor(
+      const dom::GlobalObject& aGlobal,
+      const dom::Sequence<OwningNonNull<MediaStreamTrack>>& aTracks,
+      ErrorResult& aRv);
+
+  static already_AddRefed<dom::Promise> CountUnderlyingStreams(
+      const dom::GlobalObject& aGlobal, ErrorResult& aRv);
+
+  void GetId(nsAString& aID) const;
+
+  void GetAudioTracks(nsTArray<RefPtr<AudioStreamTrack>>& aTracks) const;
+  void GetAudioTracks(nsTArray<RefPtr<MediaStreamTrack>>& aTracks) const;
+  void GetVideoTracks(nsTArray<RefPtr<VideoStreamTrack>>& aTracks) const;
+  void GetVideoTracks(nsTArray<RefPtr<MediaStreamTrack>>& aTracks) const;
+  void GetTracks(nsTArray<RefPtr<MediaStreamTrack>>& aTracks) const;
+  MediaStreamTrack* GetTrackById(const nsAString& aId) const;
+  void AddTrack(MediaStreamTrack& aTrack);
+  void RemoveTrack(MediaStreamTrack& aTrack);
+  already_AddRefed<DOMMediaStream> Clone();
+
+  bool Active() const;
+
+  IMPL_EVENT_HANDLER(addtrack)
+  IMPL_EVENT_HANDLER(removetrack)
+
+
+  bool Audible() const;
+
+  bool HasTrack(const MediaStreamTrack& aTrack) const;
+
+  already_AddRefed<nsIPrincipal> GetPrincipal();
+
+  void AssignId(const nsAString& aID) { mID = aID; }
+
+  void AddTrackInternal(MediaStreamTrack* aTrack);
+
+  void RemoveTrackInternal(MediaStreamTrack* aTrack);
+
+  void AddConsumerToKeepAlive(nsISupports* aConsumer) {
+    mConsumersToKeepAlive.AppendElement(aConsumer);
+  }
+
+  void RegisterTrackListener(TrackListener* aListener);
+
+  void UnregisterTrackListener(TrackListener* aListener);
+
+ protected:
+  virtual ~DOMMediaStream();
+
+  void Destroy();
+
+  void NotifyActive();
+
+  void NotifyInactive();
+
+  void NotifyAudible();
+
+  void NotifyInaudible();
+
+  void NotifyTrackAdded(const RefPtr<MediaStreamTrack>& aTrack);
+
+  void NotifyTrackRemoved(const RefPtr<MediaStreamTrack>& aTrack);
+
+  nsresult DispatchTrackEvent(const nsAString& aName,
+                              const RefPtr<MediaStreamTrack>& aTrack);
+
+  nsTArray<RefPtr<MediaStreamTrack>> mTracks;
+
+  class PlaybackTrackListener;
+  RefPtr<PlaybackTrackListener> mPlaybackTrackListener;
+
+  nsString mID;
+
+  nsTArray<nsCOMPtr<nsISupports>> mConsumersToKeepAlive;
+
+  nsTArray<RefPtr<TrackListener>> mTrackListeners;
+
+  bool mActive = false;
+
+  bool mAudible = false;
+};
+
+}  
+
+#endif /* NSDOMMEDIASTREAM_H_ */

@@ -1,0 +1,1737 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+
+
+const { Multilingual } = ChromeUtils.importESModule(
+  "chrome://browser/content/preferences/config/languages.mjs",
+  { global: "current" }
+);
+
+const { DefaultBrowserHelper } = ChromeUtils.importESModule(
+  "chrome://browser/content/preferences/DefaultBrowserHelper.mjs",
+  { global: "current" }
+);
+
+ChromeUtils.defineESModuleGetters(this, {
+  BackgroundUpdate: "resource://gre/modules/BackgroundUpdate.sys.mjs",
+  UpdateListener: "resource://gre/modules/UpdateListener.sys.mjs",
+  MigrationUtils: "resource:///modules/MigrationUtils.sys.mjs",
+  WindowsLaunchOnLogin: "resource://gre/modules/WindowsLaunchOnLogin.sys.mjs",
+  NimbusFeatures: "resource://nimbus/ExperimentAPI.sys.mjs",
+  FormAutofillPreferences:
+    "resource://autofill/FormAutofillPreferences.sys.mjs",
+});
+
+if (!AppConstants.MOZ_MINIMAL_BROWSER) {
+  ChromeUtils.importESModule(
+    "chrome://browser/content/preferences/config/accessibility.mjs",
+    { global: "current" }
+  );
+}
+ChromeUtils.importESModule(
+  "chrome://browser/content/preferences/config/about-firefox.mjs",
+  { global: "current" }
+);
+
+ChromeUtils.importESModule(
+  "chrome://browser/content/preferences/config/appearance.mjs",
+  { global: "current" }
+);
+
+ChromeUtils.importESModule(
+  "chrome://browser/content/preferences/config/tabs-browsing.mjs",
+  { global: "current" }
+);
+
+const TYPE_PDF = "application/pdf";
+
+const PREF_PDFJS_DISABLED = "pdfjs.disabled";
+
+const ICON_URL_APP =
+  AppConstants.platform == "linux"
+    ? "moz-icon://dummy.exe?size=16"
+    : "chrome://browser/skin/preferences/application.png";
+
+const APP_ICON_ATTR_NAME = "appHandlerIcon";
+
+const OPEN_EXTERNAL_LINK_NEXT_TO_ACTIVE_TAB_VALUE =
+  Ci.nsIBrowserDOMWindow.OPEN_NEWTAB_AFTER_CURRENT;
+
+Preferences.addAll([
+  { id: "browser.startup.page", type: "int" },
+  { id: "browser.startup.windowsLaunchOnLogin.enabled", type: "bool" },
+  { id: "browser.privatebrowsing.autostart", type: "bool" },
+
+  { id: "browser.preferences.advanced.selectedTabIndex", type: "int" },
+  { id: "browser.search.update", type: "bool" },
+
+  {
+    id: "privacy.userContext.newTabContainerOnLeftClick.enabled",
+    type: "bool",
+  },
+]);
+
+if (AppConstants.HAVE_SHELL_SERVICE) {
+  Preferences.addAll([
+    { id: "browser.shell.checkDefaultBrowser", type: "bool" },
+    { id: "pref.general.disable_button.default_browser", type: "bool" },
+  ]);
+}
+
+Preferences.addSetting({
+  id: "privateBrowsingAutoStart",
+  pref: "browser.privatebrowsing.autostart",
+});
+
+Preferences.addSetting(
+   ({
+    id: "launchOnLoginApproved",
+    _getLaunchOnLoginApprovedCachedValue: true,
+    get() {
+      return this._getLaunchOnLoginApprovedCachedValue;
+    },
+    setup() {
+      if (AppConstants.platform !== "win") {
+        return;
+      }
+      // @ts-ignore bug 1996860
+      WindowsLaunchOnLogin.getLaunchOnLoginApproved().then(val => {
+        this._getLaunchOnLoginApprovedCachedValue = val;
+      });
+    },
+  })
+);
+
+Preferences.addSetting({
+  id: "windowsLaunchOnLoginEnabled",
+  pref: "browser.startup.windowsLaunchOnLogin.enabled",
+});
+
+Preferences.addSetting(
+   ({
+    id: "windowsLaunchOnLogin",
+    deps: ["launchOnLoginApproved", "windowsLaunchOnLoginEnabled"],
+    _getLaunchOnLoginEnabledValue: false,
+    get startWithLastProfile() {
+      return Cc["@mozilla.org/toolkit/profile-service;1"].getService(
+        Ci.nsIToolkitProfileService
+      ).startWithLastProfile;
+    },
+    get() {
+      return this._getLaunchOnLoginEnabledValue;
+    },
+    setup(emitChange) {
+      if (AppConstants.platform !== "win") {
+        return;
+      }
+
+      let getLaunchOnLoginEnabledValue;
+      let maybeEmitChange = () => {
+        if (
+          getLaunchOnLoginEnabledValue !== this._getLaunchOnLoginEnabledValue
+        ) {
+          this._getLaunchOnLoginEnabledValue = getLaunchOnLoginEnabledValue;
+          emitChange();
+        }
+      };
+      if (!this.startWithLastProfile) {
+        getLaunchOnLoginEnabledValue = false;
+        maybeEmitChange();
+      } else {
+        // @ts-ignore bug 1996860
+        WindowsLaunchOnLogin.getLaunchOnLoginEnabled().then(val => {
+          getLaunchOnLoginEnabledValue = val;
+          maybeEmitChange();
+        });
+      }
+    },
+    visible: ({ windowsLaunchOnLoginEnabled }) => {
+      let isVisible =
+        AppConstants.platform === "win" && windowsLaunchOnLoginEnabled.value;
+      if (isVisible) {
+        // @ts-ignore bug 1996860
+        NimbusFeatures.windowsLaunchOnLogin.recordExposureEvent({
+          once: true,
+        });
+      }
+      return isVisible;
+    },
+    disabled({ launchOnLoginApproved }) {
+      return !this.startWithLastProfile || !launchOnLoginApproved.value;
+    },
+    onUserChange(checked) {
+      if (checked) {
+        // @ts-ignore bug 1996860
+        WindowsLaunchOnLogin.createLaunchOnLogin();
+        Services.prefs.setBoolPref(
+          "browser.startup.windowsLaunchOnLogin.disableLaunchOnLoginPrompt",
+          true
+        );
+      } else {
+        // @ts-ignore bug 1996860
+        WindowsLaunchOnLogin.removeLaunchOnLogin();
+      }
+    },
+  })
+);
+
+Preferences.addSetting({
+  id: "windowsLaunchOnLoginDisabledProfileBox",
+  deps: ["windowsLaunchOnLoginEnabled"],
+  visible: ({ windowsLaunchOnLoginEnabled }) => {
+    if (AppConstants.platform !== "win") {
+      return false;
+    }
+    let startWithLastProfile = Cc[
+      "@mozilla.org/toolkit/profile-service;1"
+    ].getService(Ci.nsIToolkitProfileService).startWithLastProfile;
+
+    return !startWithLastProfile && windowsLaunchOnLoginEnabled.value;
+  },
+});
+
+Preferences.addSetting({
+  id: "windowsLaunchOnLoginDisabledBox",
+  deps: ["launchOnLoginApproved", "windowsLaunchOnLoginEnabled"],
+  visible: ({ launchOnLoginApproved, windowsLaunchOnLoginEnabled }) => {
+    if (AppConstants.platform !== "win") {
+      return false;
+    }
+    let startWithLastProfile = Cc[
+      "@mozilla.org/toolkit/profile-service;1"
+    ].getService(Ci.nsIToolkitProfileService).startWithLastProfile;
+
+    return (
+      startWithLastProfile &&
+      !launchOnLoginApproved.value &&
+      windowsLaunchOnLoginEnabled.value
+    );
+  },
+});
+
+Preferences.addSetting({
+  id: "browserRestoreSession",
+  pref: "browser.startup.page",
+  deps: ["privateBrowsingAutoStart"],
+  get:
+    value => {
+      const pbAutoStartPref = Preferences.get(
+        "browser.privatebrowsing.autostart"
+      );
+      let newValue = pbAutoStartPref.value
+        ? false
+        : value === gMainPane.STARTUP_PREF_RESTORE_SESSION;
+
+      return newValue;
+    },
+  set: checked => {
+    const startupPref = Preferences.get("browser.startup.page");
+    let newValue;
+
+    if (checked) {
+      if (startupPref.value === gMainPane.STARTUP_PREF_BLANK) {
+        // @ts-ignore bug 1996860
+        HomePage.safeSet("about:blank");
+      }
+      newValue = gMainPane.STARTUP_PREF_RESTORE_SESSION;
+    } else {
+      newValue = gMainPane.STARTUP_PREF_HOMEPAGE;
+    }
+    return newValue;
+  },
+  disabled: deps => {
+    return deps.privateBrowsingAutoStart.value;
+  },
+});
+
+Preferences.addSetting({
+  id: "containersPane",
+  onUserClick(e) {
+    e.preventDefault();
+    gotoPref("paneContainers2");
+  },
+});
+Preferences.addSetting({ id: "containersPlaceholder" });
+
+Preferences.addSetting({
+  id: "connectionSettings",
+  onUserClick: () => gMainPane.showConnections(),
+});
+
+Preferences.addSetting({
+  id: "alwaysCheckDefault",
+  pref: "browser.shell.checkDefaultBrowser",
+  setup: emitChange => {
+    if (!DefaultBrowserHelper.canCheck) {
+      return undefined;
+    }
+    return DefaultBrowserHelper.pollForDefaultChanges(emitChange);
+  },
+  visible: () => DefaultBrowserHelper.canCheck,
+  disabled: (_, setting) =>
+    !DefaultBrowserHelper.canCheck ||
+    setting.locked ||
+    DefaultBrowserHelper.isBrowserDefault,
+});
+
+Preferences.addSetting({
+  id: "isDefaultPane",
+  deps: ["alwaysCheckDefault"],
+  visible: () =>
+    DefaultBrowserHelper.canCheck && DefaultBrowserHelper.isBrowserDefault,
+});
+
+Preferences.addSetting({
+  id: "isNotDefaultPane",
+  deps: ["alwaysCheckDefault"],
+  visible: () =>
+    DefaultBrowserHelper.canCheck && !DefaultBrowserHelper.isBrowserDefault,
+  onUserClick: (e, { alwaysCheckDefault }) => {
+    if (!DefaultBrowserHelper.canCheck) {
+      return;
+    }
+    const setDefaultButton =  (e.target);
+
+    if (!setDefaultButton) {
+      return;
+    }
+    if (setDefaultButton.disabled) {
+      return;
+    }
+
+    setDefaultButton.disabled = true;
+    alwaysCheckDefault.value = true;
+    DefaultBrowserHelper.setDefaultBrowser().finally(() => {
+      setDefaultButton.disabled = false;
+    });
+  },
+});
+
+function createDefaultBrowserConfig({
+  includeIsDefaultPane = true,
+  inProgress = false,
+  hiddenFromSearch = false,
+} = {}) {
+  const isDefaultPane = {
+    id: "isDefaultPane",
+    l10nId: "is-default-browser-2",
+    control: "moz-promo",
+    controlAttrs: {
+      imagesrc: "chrome://global/skin/illustrations/kit-happy.svg",
+      imagedisplay: "cover",
+    },
+  };
+
+  const isNotDefaultPane = {
+    id: "isNotDefaultPane",
+    l10nId: "is-not-default-browser-2",
+    control: "moz-promo",
+    options: [
+      {
+        control: "moz-button",
+        l10nId: "set-as-my-default-browser-2",
+        id: "setDefaultButton",
+        slot: "actions",
+
+        controlAttrs: {
+          type: "primary",
+        },
+      },
+    ],
+    controlAttrs: {
+      imagesrc: "chrome://global/skin/illustrations/kit-concerned.svg",
+      imagedisplay: "cover",
+    },
+  };
+
+  const items = includeIsDefaultPane
+    ? [isDefaultPane, isNotDefaultPane]
+    : [isNotDefaultPane];
+
+  return {
+    l10nId: "home-default-browser-title",
+    headingLevel: 2,
+    items,
+    ...(inProgress && { inProgress }),
+    ...(hiddenFromSearch && { hiddenFromSearch }),
+  };
+}
+
+function createStartupConfig(hidden = false) {
+  return {
+    l10nId: "startup-group",
+    headingLevel: 2,
+    hidden,
+    items: [
+      {
+        id: "browserRestoreSession",
+        l10nId: "startup-restore-windows-and-tabs",
+      },
+      {
+        id: "windowsLaunchOnLogin",
+        l10nId: "windows-launch-on-login",
+      },
+      {
+        id: "windowsLaunchOnLoginDisabledBox",
+        control: "moz-message-bar",
+        controlAttrs: {
+          role: "status",
+        },
+        options: [
+          {
+            control: "span",
+            l10nId: "windows-launch-on-login-disabled",
+            slot: "message",
+            options: [
+              {
+                control: "a",
+                controlAttrs: {
+                  "data-l10n-name": "startup-link",
+                  href: "ms-settings:startupapps",
+                  target: "_self",
+                },
+              },
+            ],
+          },
+        ],
+      },
+      {
+        id: "windowsLaunchOnLoginDisabledProfileBox",
+        control: "moz-message-bar",
+        l10nId: "startup-windows-launch-on-login-profile-disabled",
+        controlAttrs: {
+          role: "status",
+        },
+      },
+      {
+        id: "alwaysCheckDefault",
+        l10nId: "always-check-default",
+      },
+    ],
+  };
+}
+
+SettingGroupManager.registerGroups({
+  defaultBrowser: createDefaultBrowserConfig(),
+  startup: createStartupConfig(
+    Services.prefs.getBoolPref("browser.settings-redesign.enabled", false)
+  ),
+});
+
+function initSettingGroup(id) {
+  let groups = document.querySelectorAll(`setting-group[groupid=${id}]`);
+  const config = SettingGroupManager.get(id);
+  for (let group of groups) {
+    if (group && config) {
+      let sectionEnabled = srdSectionEnabled(id);
+
+      if (
+        (sectionEnabled && group.hasAttribute("data-srd-migrated")) ||
+        (config.inProgress && !sectionEnabled)
+      ) {
+        group.remove();
+      }
+
+      let legacySections = document.querySelectorAll(
+        `[data-srd-groupid=${id}]`
+      );
+      for (let section of legacySections) {
+        if (sectionEnabled) {
+          section.hidden = true;
+          section.removeAttribute("data-category");
+          section.setAttribute("data-hidden-from-search", "true");
+        }
+      }
+      group.config = config;
+      group.getSetting = Preferences.getSetting.bind(Preferences);
+      group.srdEnabled = srdSectionPrefs.all;
+    }
+  }
+}
+
+var promiseLoadHandlersList;
+
+function getBundleForLocales(newLocales) {
+  let locales = Array.from(
+    new Set([
+      ...newLocales,
+      ...Services.locale.requestedLocales,
+      Services.locale.lastFallbackLocale,
+    ])
+  );
+  return new Localization(
+    ["browser/preferences/preferences.ftl", "branding/brand.ftl"],
+    false,
+    undefined,
+    locales
+  );
+}
+
+var gNodeToObjectMap = new WeakMap();
+
+var gMainPane = {
+  STARTUP_PREF_BLANK: 0,
+  STARTUP_PREF_HOMEPAGE: 1,
+  STARTUP_PREF_RESTORE_SESSION: 3,
+
+  init() {
+    function setEventListener(aId, aEventType, aCallback) {
+      document
+        .getElementById(aId)
+        .addEventListener(aEventType, aCallback.bind(gMainPane));
+    }
+
+    this.displayUseSystemLocale();
+
+    if (Services.prefs.getBoolPref("intl.multilingual.enabled")) {
+      gMainPane.initPrimaryBrowserLanguageUI();
+    }
+
+    initSettingGroup("browserLayout");
+    initSettingGroup("appearance");
+    initSettingGroup("drm");
+    initSettingGroup("contrast");
+    initSettingGroup("zoom");
+    initSettingGroup("fonts");
+    initSettingGroup("browserLanguage");
+    initSettingGroup("websiteLanguage");
+    initSettingGroup("browsing");
+    initSettingGroup("keyboardAndScrolling");
+    initSettingGroup("motionAndLink");
+    initSettingGroup("updates");
+    initSettingGroup("performance");
+    initSettingGroup("defaultBrowser");
+    initSettingGroup("startup");
+    initSettingGroup("importBrowserData");
+    initSettingGroup("tabs");
+    initSettingGroup("profiles");
+    initSettingGroup("profilePane");
+
+    setEventListener("manageBrowserLanguagesButton", "command", function () {
+      gMainPane.showBrowserLanguagesSubDialog({ search: false });
+    });
+
+    setEventListener("chooseLanguage", "command", gMainPane.showLanguages);
+
+
+    if (!srdSectionEnabled("applications")) {
+      AppFileHandler._init();
+    }
+
+    window.addEventListener("unload", this);
+
+    Services.obs.notifyObservers(window, "main-pane-loaded");
+    this.setInitialized();
+  },
+
+  preInit() {
+    promiseLoadHandlersList = new Promise((resolve, reject) => {
+      window.addEventListener(
+        "pageshow",
+        async () => {
+          await this.initialized;
+          try {
+            if (!srdSectionEnabled("applications")) {
+              await AppFileHandler.preInit();
+              Services.obs.notifyObservers(window, "app-handler-loaded");
+            }
+            resolve();
+          } catch (ex) {
+            reject(ex);
+          }
+        },
+        { once: true }
+      );
+    });
+  },
+
+  handleSubcategory(subcategory) {
+    if (Services.policies && !Services.policies.isAllowed("profileImport")) {
+      return false;
+    }
+    if (subcategory == "migrate") {
+      this.showMigrationWizardDialog();
+      return true;
+    }
+
+    if (subcategory == "migrate-autoclose") {
+      this.showMigrationWizardDialog({ closeTabWhenDone: true });
+    }
+
+    return false;
+  },
+
+
+
+  async onGetStarted() {
+    if (!AppConstants.MOZ_DEV_EDITION) {
+      return;
+    }
+    const win = Services.wm.getMostRecentWindow("navigator:browser");
+    if (!win) {
+      return;
+    }
+    const user = await fxAccounts.getSignedInUser();
+    if (user) {
+      win.openTrustedLinkIn("about:preferences#sync", "current");
+      return;
+    }
+    if (!(await FxAccounts.canConnectAccount())) {
+      return;
+    }
+    let url =
+      await FxAccounts.config.promiseConnectAccountURI("dev-edition-setup");
+    let accountsTab = win.gBrowser.addWebTab(url);
+    win.gBrowser.selectedTab = accountsTab;
+  },
+
+
+  updateButtons(aButtonID, aPreferenceID) {
+    var button = document.getElementById(aButtonID);
+    var preference = Preferences.get(aPreferenceID);
+    button.disabled = !preference.value;
+    return undefined;
+  },
+
+  initPrimaryBrowserLanguageUI() {
+    let menulist = document.getElementById("primaryBrowserLocale");
+    new SelectionChangedMenulist(menulist, event => {
+      gMainPane.onPrimaryBrowserLanguageMenuChange(event);
+    });
+
+    gMainPane.updatePrimaryBrowserLanguageUI(Services.locale.appLocaleAsBCP47);
+  },
+
+  async updatePrimaryBrowserLanguageUI(selected) {
+    let available = await LangPackMatcher.getAvailableLocales();
+    let localeNames = Services.intl.getLocaleDisplayNames(
+      undefined,
+      available,
+      { preferNative: true }
+    );
+    let locales = available.map((code, i) => ({ code, name: localeNames[i] }));
+    locales.sort((a, b) => a.name > b.name);
+
+    let fragment = document.createDocumentFragment();
+    for (let { code, name } of locales) {
+      let menuitem = document.createXULElement("menuitem");
+      menuitem.setAttribute("value", code);
+      menuitem.setAttribute("label", name);
+      fragment.appendChild(menuitem);
+    }
+
+    if (Services.prefs.getBoolPref("intl.multilingual.downloadEnabled")) {
+      let menuitem = document.createXULElement("menuitem");
+      menuitem.id = "primaryBrowserLocaleSearch";
+      menuitem.setAttribute(
+        "label",
+        await document.l10n.formatValue("browser-languages-search")
+      );
+      menuitem.setAttribute("value", "search");
+      fragment.appendChild(menuitem);
+    }
+
+    let menulist = document.getElementById("primaryBrowserLocale");
+    let menupopup = menulist.querySelector("menupopup");
+    menupopup.textContent = "";
+    menupopup.appendChild(fragment);
+    menulist.value = selected;
+
+    document.getElementById("browserLanguagesBox").hidden = false;
+  },
+
+  async showConfirmLanguageChangeMessageBar(locales) {
+    let messageBar = document.getElementById("confirmBrowserLanguage");
+
+    let newBundle = getBundleForLocales(locales);
+
+    let messages = await Promise.all(
+      [newBundle, document.l10n].map(async bundle =>
+        bundle.formatValue("confirm-browser-language-change-description")
+      )
+    );
+    let buttonLabels = await Promise.all(
+      [newBundle, document.l10n].map(async bundle =>
+        bundle.formatValue("confirm-browser-language-change-button")
+      )
+    );
+
+    if (messages[0] == messages[1] && buttonLabels[0] == buttonLabels[1]) {
+      messages.pop();
+      buttonLabels.pop();
+    }
+
+    let contentContainer = messageBar.querySelector(
+      ".message-bar-content-container"
+    );
+    contentContainer.textContent = "";
+
+    for (let i = 0; i < messages.length; i++) {
+      let messageContainer = document.createXULElement("hbox");
+      messageContainer.classList.add("message-bar-content");
+      messageContainer.style.flex = "1 50%";
+      messageContainer.setAttribute("align", "center");
+
+      let description = document.createXULElement("description");
+      description.classList.add("message-bar-description");
+
+      if (i == 0 && Services.intl.getScriptDirection(locales[0]) === "rtl") {
+        description.classList.add("rtl-locale");
+      }
+      description.setAttribute("flex", "1");
+      description.textContent = messages[i];
+      messageContainer.appendChild(description);
+
+      let button = document.createXULElement("button");
+      button.addEventListener(
+        "command",
+        gMainPane.confirmBrowserLanguageChange
+      );
+      button.classList.add("message-bar-button");
+      button.setAttribute("locales", locales.join(","));
+      button.setAttribute("label", buttonLabels[i]);
+      messageContainer.appendChild(button);
+
+      contentContainer.appendChild(messageContainer);
+    }
+
+    messageBar.hidden = false;
+    gMainPane.selectedLocalesForRestart = locales;
+  },
+
+  hideConfirmLanguageChangeMessageBar() {
+    let messageBar = document.getElementById("confirmBrowserLanguage");
+    messageBar.hidden = true;
+    let contentContainer = messageBar.querySelector(
+      ".message-bar-content-container"
+    );
+    contentContainer.textContent = "";
+    gMainPane.requestingLocales = null;
+  },
+
+  confirmBrowserLanguageChange(event) {
+    let localesString = (event.target.getAttribute("locales") || "").trim();
+    if (!localesString || !localesString.length) {
+      return;
+    }
+    let locales = localesString.split(",");
+    Multilingual.applyAndRestart(locales);
+  },
+
+  onPrimaryBrowserLanguageMenuChange(event) {
+    let locale = event.target.value;
+
+    if (locale == "search") {
+      gMainPane.showBrowserLanguagesSubDialog({ search: true });
+      return;
+    } else if (locale == Services.locale.appLocaleAsBCP47) {
+      this.hideConfirmLanguageChangeMessageBar();
+      return;
+    }
+
+    let newLocales = Array.from(
+      new Set([locale, ...Services.locale.requestedLocales]).values()
+    );
+
+    Multilingual.recordTelemetry("reorder");
+
+    switch (Multilingual.getTransitionType(newLocales)) {
+      case Multilingual.TransitionType.RestartRequired:
+        gMainPane.showConfirmLanguageChangeMessageBar(newLocales);
+        gMainPane.updatePrimaryBrowserLanguageUI(newLocales[0]);
+        break;
+      case Multilingual.TransitionType.LiveReload:
+        Services.locale.requestedLocales = newLocales;
+        gMainPane.updatePrimaryBrowserLanguageUI(
+          Services.locale.appLocaleAsBCP47
+        );
+        gMainPane.hideConfirmLanguageChangeMessageBar();
+        break;
+      case Multilingual.TransitionType.LocalesMatch:
+        gMainPane.updatePrimaryBrowserLanguageUI(
+          Services.locale.appLocaleAsBCP47
+        );
+        gMainPane.hideConfirmLanguageChangeMessageBar();
+        break;
+      default:
+        throw new Error("Unhandled transition type.");
+    }
+  },
+
+  manageProfiles() {
+    const win = window.browsingContext.topChromeWindow;
+
+    win.toOpenWindowByType(
+      "about:profilemanager",
+      "about:profilemanager",
+      "chrome,extrachrome,menubar,resizable,scrollbars,status,toolbar,centerscreen"
+    );
+  },
+
+  showLanguages() {
+    gSubDialog.open(
+      "chrome://browser/content/preferences/dialogs/languages.xhtml"
+    );
+  },
+
+  showBrowserLanguagesSubDialog({ search }) {
+    let telemetryId = parseInt(
+      Services.telemetry.msSinceProcessStart(),
+      10
+    ).toString();
+    let method = search ? "search" : "manage";
+    Multilingual.recordTelemetry(method, telemetryId);
+
+    let opts = {
+      selectedLocalesForRestart: gMainPane.selectedLocalesForRestart,
+      search,
+      telemetryId,
+    };
+    gSubDialog.open(
+      "chrome://browser/content/preferences/dialogs/browserLanguages.xhtml",
+      { closingCallback: this.browserLanguagesClosed },
+      opts
+    );
+  },
+
+  browserLanguagesClosed() {
+    let { selected } = this.gBrowserLanguagesDialog;
+
+    this.gBrowserLanguagesDialog.recordTelemetry(
+      selected ? "accept" : "cancel"
+    );
+
+    if (!selected) {
+      return;
+    }
+
+    const prevLocales = Services.locale.requestedLocales.filter(
+      lc => selected.indexOf(lc) > 0
+    );
+    const newLocales = selected.filter(
+      (lc, i) => i > 0 && prevLocales.includes(lc)
+    );
+    if (prevLocales.some((lc, i) => newLocales[i] != lc)) {
+      this.gBrowserLanguagesDialog.recordTelemetry("setFallback");
+    }
+
+    switch (Multilingual.getTransitionType(selected)) {
+      case Multilingual.TransitionType.RestartRequired:
+        gMainPane.showConfirmLanguageChangeMessageBar(selected);
+        gMainPane.updatePrimaryBrowserLanguageUI(selected[0]);
+        break;
+      case Multilingual.TransitionType.LiveReload:
+        Services.locale.requestedLocales = selected;
+
+        gMainPane.updatePrimaryBrowserLanguageUI(
+          Services.locale.appLocaleAsBCP47
+        );
+        gMainPane.hideConfirmLanguageChangeMessageBar();
+        break;
+      case Multilingual.TransitionType.LocalesMatch:
+        gMainPane.updatePrimaryBrowserLanguageUI(
+          Services.locale.appLocaleAsBCP47
+        );
+        gMainPane.hideConfirmLanguageChangeMessageBar();
+        break;
+      default:
+        throw new Error("Unhandled transition type.");
+    }
+  },
+
+  displayUseSystemLocale() {
+    let appLocale = Services.locale.appLocaleAsBCP47;
+    let regionalPrefsLocales = Services.locale.regionalPrefsLocales;
+    if (!regionalPrefsLocales.length) {
+      return;
+    }
+    let systemLocale = regionalPrefsLocales[0];
+    let localeDisplayname = Services.intl.getLocaleDisplayNames(
+      undefined,
+      [systemLocale],
+      { preferNative: true }
+    );
+    if (!localeDisplayname.length) {
+      return;
+    }
+    let localeName = localeDisplayname[0];
+    if (appLocale.split("-u-")[0] != systemLocale.split("-u-")[0]) {
+      let checkbox = document.getElementById("useSystemLocale");
+      document.l10n.setAttributes(checkbox, "use-system-locale", {
+        localeName,
+      });
+      checkbox.hidden = false;
+    }
+  },
+
+  showConnections() {
+    gSubDialog.open(
+      "chrome://browser/content/preferences/dialogs/connection.xhtml"
+    );
+  },
+
+  async showMigrationWizardDialog({ closeTabWhenDone = false } = {}) {
+    let migrationWizardDialog = document.getElementById(
+      "migrationWizardDialog"
+    );
+
+    if (migrationWizardDialog.open) {
+      return;
+    }
+
+    await customElements.whenDefined("migration-wizard");
+
+    if (!migrationWizardDialog.firstElementChild) {
+      let wizard = document.createElement("migration-wizard");
+      wizard.toggleAttribute("dialog-mode", true);
+      migrationWizardDialog.appendChild(wizard);
+      migrationWizardDialog.addEventListener(
+        "MigrationWizard:Close",
+        function (e) {
+          e.currentTarget.close();
+        }
+      );
+    }
+    migrationWizardDialog.firstElementChild.requestState();
+
+    migrationWizardDialog.addEventListener(
+      "close",
+      () => {
+        Services.obs.notifyObservers(
+          migrationWizardDialog,
+          "MigrationWizard:Closed"
+        );
+        if (closeTabWhenDone) {
+          window.close();
+        }
+      },
+      { once: true }
+    );
+
+    migrationWizardDialog.showModal();
+  },
+
+  destroy() {
+    window.removeEventListener("unload", this);
+
+  },
+
+
+  QueryInterface: ChromeUtils.generateQI(["nsIObserver"]),
+
+
+  async observe(_, aTopic, aData) {
+    if (aTopic == "nsPref:changed") {
+      if (aData == PREF_CONTAINERS_EXTENSION) {
+        return;
+      }
+      if (
+        !srdSectionEnabled("applications") &&
+        !AppFileHandler._storingAction
+      ) {
+        await AppFileHandler._rebuildView();
+      }
+    }
+  },
+
+
+  handleEvent(aEvent) {
+    if (aEvent.type == "unload") {
+      this.destroy();
+      if (AppConstants.MOZ_UPDATER) {
+        onUnload();
+      }
+    }
+  },
+
+  isValidHandlerApp(aHandlerApp) {
+    return AppFileHandler.isValidHandlerApp(aHandlerApp);
+  },
+
+  _getIconURLForHandlerApp(aHandlerApp) {
+    return getIconURLForHandlerApp(aHandlerApp);
+  },
+};
+gMainPane.initialized = new Promise(res => {
+  gMainPane.setInitialized = res;
+});
+
+var {
+  InternalHandlerInfoWrapper,
+  getFileDisplayName,
+  getLocalHandlerApp,
+  HandlerServiceHelpers,
+  getIconURLForHandlerApp,
+} = ChromeUtils.importESModule(
+  "chrome://browser/content/preferences/config/downloads.mjs",
+  { global: "current" }
+);
+
+
+let gHandlerListItemFragment = window.MozXULElement.parseXULToFragment(`
+  <richlistitem>
+    <hbox class="typeContainer" flex="1" align="center">
+      <html:img class="typeIcon" width="16" height="16" />
+      <label class="typeDescription" flex="1" crop="end"/>
+    </hbox>
+    <hbox class="actionContainer" flex="1" align="center">
+      <html:img class="actionIcon" width="16" height="16"/>
+      <label class="actionDescription" flex="1" crop="end"/>
+    </hbox>
+    <hbox class="actionsMenuContainer" flex="1">
+      <menulist class="actionsMenu" flex="1" crop="end" selectedIndex="1" aria-labelledby="actionColumn">
+        <menupopup/>
+      </menulist>
+    </hbox>
+  </richlistitem>
+`);
+
+class HandlerListItem {
+  static forNode(node) {
+    return gNodeToObjectMap.get(node);
+  }
+
+  constructor(handlerInfoWrapper) {
+    this.handlerInfoWrapper = handlerInfoWrapper;
+  }
+
+  setOrRemoveAttributes(iterable) {
+    for (let [selector, name, value] of iterable) {
+      let node = selector ? this.node.querySelector(selector) : this.node;
+      if (value) {
+        node.setAttribute(name, value);
+      } else {
+        node.removeAttribute(name);
+      }
+    }
+  }
+
+  createNode(list) {
+    list.appendChild(document.importNode(gHandlerListItemFragment, true));
+    this.node = list.lastChild;
+    gNodeToObjectMap.set(this.node, this);
+  }
+
+  setupNode() {
+    this.node
+      .querySelector(".actionsMenu")
+      .addEventListener("command", event =>
+        AppFileHandler.onSelectAction(event.originalTarget)
+      );
+
+    let typeDescription = this.handlerInfoWrapper.typeDescription;
+    this.setOrRemoveAttributes([
+      [null, "type", this.handlerInfoWrapper.type],
+      [".typeIcon", "srcset", this.handlerInfoWrapper.iconSrcSet],
+    ]);
+    localizeElement(
+      this.node.querySelector(".typeDescription"),
+      typeDescription
+    );
+    this.showActionsMenu = false;
+  }
+
+  refreshAction() {
+    let { actionIconClass } = this.handlerInfoWrapper;
+    this.setOrRemoveAttributes([
+      [null, APP_ICON_ATTR_NAME, actionIconClass],
+      [
+        ".actionIcon",
+        "srcset",
+        actionIconClass ? null : this.handlerInfoWrapper.actionIconSrcset,
+      ],
+    ]);
+    const selectedItem = this.node.querySelector("[selected=true]");
+    if (!selectedItem) {
+      console.error("No selected item for " + this.handlerInfoWrapper.type);
+      return;
+    }
+    const { id, args } = document.l10n.getAttributes(selectedItem);
+    const messageIDs = {
+      "applications-action-save": "applications-action-save-label",
+      "applications-always-ask": "applications-always-ask-label",
+      "applications-open-inapp": "applications-open-inapp-label",
+      "applications-use-app-default": "applications-use-app-default-label",
+      "applications-use-app": "applications-use-app-label",
+      "applications-use-os-default": "applications-use-os-default-label",
+      "applications-use-other": "applications-use-other-label",
+    };
+    localizeElement(this.node.querySelector(".actionDescription"), {
+      id: messageIDs[id],
+      args,
+    });
+    localizeElement(this.node.querySelector(".actionsMenu"), { id, args });
+  }
+
+  set showActionsMenu(value) {
+    this.setOrRemoveAttributes([
+      [".actionContainer", "hidden", value],
+      [".actionsMenuContainer", "hidden", !value],
+    ]);
+  }
+}
+
+function localizeElement(node, l10n) {
+  if (l10n.hasOwnProperty("raw")) {
+    node.removeAttribute("data-l10n-id");
+    node.textContent = l10n.raw;
+  } else {
+    document.l10n.setAttributes(node, l10n.id, l10n.args);
+  }
+}
+
+let AppFileHandler = (function () {
+  return new (class Handler {
+    _handledTypes = {};
+
+    _visibleTypes = [];
+
+    selectedHandlerListItem = null;
+
+
+    _sortColumn = null;
+
+    items = [];
+
+    get _list() {
+      return document.getElementById("handlersView");
+    }
+
+    get _filter() {
+      return document.getElementById("filter");
+    }
+
+    initialized = false;
+
+    async preInit() {
+      this._initListEventHandlers();
+      this._loadInternalHandlers();
+      this._loadApplicationHandlers();
+
+      await this._rebuildVisibleTypes();
+      await this._rebuildView();
+      await this._sortListView();
+    }
+
+    _init() {
+      setEventListener("filter", "MozInputSearch:search", () => this.filter());
+      setEventListener("typeColumn", "click", e => this.sort(e));
+      setEventListener("actionColumn", "click", e => this.sort(e));
+
+      if (
+        document.getElementById("actionColumn").hasAttribute("sortDirection")
+      ) {
+        this._sortColumn = document.getElementById("actionColumn");
+        document.getElementById("typeColumn").removeAttribute("sortDirection");
+      } else {
+        this._sortColumn = document.getElementById("typeColumn");
+      }
+    }
+
+    async _rebuildVisibleTypes() {
+      this._visibleTypes = [];
+
+      let visibleDescriptions = new Map();
+      for (let type in this._handledTypes) {
+        await new Promise(resolve => Services.tm.dispatchToMainThread(resolve));
+
+        let handlerInfo = this._handledTypes[type];
+
+        this._visibleTypes.push(handlerInfo);
+
+        let key = JSON.stringify(handlerInfo.description);
+        let otherHandlerInfo = visibleDescriptions.get(key);
+        if (!otherHandlerInfo) {
+          handlerInfo.disambiguateDescription = false;
+          visibleDescriptions.set(key, handlerInfo);
+        } else {
+          handlerInfo.disambiguateDescription = true;
+          otherHandlerInfo.disambiguateDescription = true;
+        }
+      }
+    }
+
+    _loadApplicationHandlers() {
+      HandlerServiceHelpers.loadApplicationHandlers(this._handledTypes);
+    }
+
+    _initListEventHandlers() {
+      this._list.addEventListener("select", event => {
+        if (event.target != this._list) {
+          return;
+        }
+
+        let handlerListItem =
+          this._list.selectedItem &&
+          HandlerListItem.forNode(this._list.selectedItem);
+        if (this.selectedHandlerListItem == handlerListItem) {
+          return;
+        }
+
+        if (this.selectedHandlerListItem) {
+          this.selectedHandlerListItem.showActionsMenu = false;
+        }
+        this.selectedHandlerListItem = handlerListItem;
+        if (handlerListItem) {
+          this.rebuildActionsMenu();
+          handlerListItem.showActionsMenu = true;
+        }
+      });
+    }
+
+    _loadInternalHandlers() {
+      HandlerServiceHelpers.loadInternalHandlers(this._handledTypes);
+    }
+
+    async _rebuildView() {
+      let lastSelectedType =
+        this.selectedHandlerListItem &&
+        this.selectedHandlerListItem.handlerInfoWrapper.type;
+      this.selectedHandlerListItem = null;
+
+      this._list.textContent = "";
+
+      var visibleTypes = this._visibleTypes;
+
+      let items = visibleTypes.map(
+        visibleType => new HandlerListItem(visibleType)
+      );
+      let itemsFragment = document.createDocumentFragment();
+      let lastSelectedItem;
+      for (let item of items) {
+        item.createNode(itemsFragment);
+        if (item.handlerInfoWrapper.type == lastSelectedType) {
+          lastSelectedItem = item;
+        }
+      }
+
+      for (let item of items) {
+        item.setupNode();
+        this.rebuildActionsMenu(item.node, item.handlerInfoWrapper);
+        item.refreshAction();
+      }
+
+      if (this._filter.value) {
+        await document.l10n.translateFragment(itemsFragment);
+
+        this._filterView(itemsFragment);
+
+        document.l10n.pauseObserving();
+        this._list.appendChild(itemsFragment);
+        document.l10n.resumeObserving();
+      } else {
+        this._list.appendChild(itemsFragment);
+      }
+
+      if (lastSelectedItem) {
+        this._list.selectedItem = lastSelectedItem.node;
+      }
+    }
+
+    sort(event) {
+      if (event.button != 0) {
+        return;
+      }
+      var column = event.target;
+
+      if (this._sortColumn && this._sortColumn != column) {
+        this._sortColumn.removeAttribute("sortDirection");
+      }
+
+      this._sortColumn = column;
+
+      if (column.getAttribute("sortDirection") == "ascending") {
+        column.setAttribute("sortDirection", "descending");
+      } else {
+        column.setAttribute("sortDirection", "ascending");
+      }
+
+      this._sortListView();
+    }
+
+    async _sortListView() {
+      if (!this._sortColumn) {
+        return;
+      }
+      let comp = new Services.intl.Collator(undefined, {
+        usage: "sort",
+      });
+
+      await document.l10n.translateFragment(this._list);
+      let items = Array.from(this._list.children);
+
+      let textForNode;
+      if (this._sortColumn.getAttribute("value") === "type") {
+        textForNode = n => n.querySelector(".typeDescription").textContent;
+      } else {
+        textForNode = n =>
+          n.querySelector(".actionsMenu").getAttribute("label");
+      }
+
+      let sortDir = this._sortColumn.getAttribute("sortDirection");
+      let multiplier = sortDir == "descending" ? -1 : 1;
+      items.sort(
+        (a, b) => multiplier * comp.compare(textForNode(a), textForNode(b))
+      );
+
+      items.forEach(item => this._list.appendChild(item));
+    }
+
+    _filterView(frag = this._list) {
+      const filterValue = this._filter.value.toLowerCase();
+      for (let elem of frag.children) {
+        const typeDescription =
+          elem.querySelector(".typeDescription").textContent;
+        const actionDescription = elem
+          .querySelector(".actionDescription")
+          .getAttribute("value");
+        elem.hidden =
+          !typeDescription.toLowerCase().includes(filterValue) &&
+          !actionDescription.toLowerCase().includes(filterValue);
+      }
+    }
+
+    _buildHeader() {
+      const headerElement =  (
+        document.createElement("moz-box-item")
+      );
+      headerElement.slot = "header";
+      this.typeColumn = document.createElement("label");
+      this.typeColumn.setAttribute("data-l10n-id", "applications-type-heading");
+      headerElement.appendChild(this.typeColumn);
+
+      this.actionColumn = document.createElement("label");
+      this.actionColumn.slot = "actions";
+      this.actionColumn.setAttribute(
+        "data-l10n-id",
+        "applications-action-heading"
+      );
+      headerElement.appendChild(this.actionColumn);
+
+      return headerElement;
+    }
+
+    _sortItems(unorderedItems) {
+      let comp = new Services.intl.Collator(undefined, {
+        usage: "sort",
+      });
+      const textForNode = item => item.getAttribute("label");
+      let multiplier = 1;
+      return unorderedItems.sort(
+        (a, b) => multiplier * comp.compare(textForNode(a), textForNode(b))
+      );
+    }
+
+    filter() {
+      this._rebuildView();
+    }
+
+    focusFilterBox() {
+      this._filter.focus();
+      this._filter.select();
+    }
+
+
+    _storingAction = false;
+
+    onSelectAction(aActionItem) {
+      this._storingAction = true;
+
+      try {
+        this._storeAction(aActionItem);
+      } finally {
+        this._storingAction = false;
+      }
+    }
+
+    _storeAction(aActionItem) {
+      var handlerInfo = this.selectedHandlerListItem.handlerInfoWrapper;
+
+      let action = parseInt(aActionItem.getAttribute("action"));
+
+      if (action == Ci.nsIHandlerInfo.useHelperApp) {
+        handlerInfo.preferredApplicationHandler = aActionItem.handlerApp;
+      }
+
+      if (action == Ci.nsIHandlerInfo.alwaysAsk) {
+        handlerInfo.alwaysAskBeforeHandling = true;
+      } else {
+        handlerInfo.alwaysAskBeforeHandling = false;
+      }
+
+      handlerInfo.preferredAction = action;
+
+      handlerInfo.store();
+
+      this.selectedHandlerListItem.refreshAction();
+    }
+
+    manageApp(aEvent) {
+      aEvent.stopPropagation();
+
+      var handlerInfo = this.selectedHandlerListItem.handlerInfoWrapper;
+
+      let onComplete = () => {
+        this.rebuildActionsMenu();
+
+        this.selectedHandlerListItem.refreshAction();
+      };
+
+      gSubDialog.open(
+        "chrome://browser/content/preferences/dialogs/applicationManager.xhtml",
+        { features: "resizable=no", closingCallback: onComplete },
+        handlerInfo
+      );
+    }
+
+    async chooseApp(aEvent) {
+      aEvent.stopPropagation();
+
+      var handlerApp;
+      let chooseAppCallback = aHandlerApp => {
+        this.rebuildActionsMenu();
+
+        if (aHandlerApp) {
+          let typeItem = this._list.selectedItem;
+          let actionsMenu = typeItem.querySelector(".actionsMenu");
+          let menuItems = actionsMenu.menupopup.childNodes;
+          for (let i = 0; i < menuItems.length; i++) {
+            let menuItem = menuItems[i];
+            if (
+              menuItem.handlerApp &&
+              menuItem.handlerApp.equals(aHandlerApp)
+            ) {
+              actionsMenu.selectedIndex = i;
+              this.onSelectAction(menuItem);
+              break;
+            }
+          }
+        }
+      };
+
+      if (AppConstants.platform == "win") {
+        var params = {};
+        var handlerInfo = this.selectedHandlerListItem.handlerInfoWrapper;
+
+        params.mimeInfo = handlerInfo.wrappedHandlerInfo;
+        params.title = await document.l10n.formatValue(
+          "applications-select-helper"
+        );
+        if ("id" in handlerInfo.description) {
+          params.description = await document.l10n.formatValue(
+            handlerInfo.description.id,
+            handlerInfo.description.args
+          );
+        } else {
+          params.description = handlerInfo.typeDescription.raw;
+        }
+        params.filename = null;
+        params.handlerApp = null;
+
+        let onAppSelected = () => {
+          if (this.isValidHandlerApp(params.handlerApp)) {
+            handlerApp = params.handlerApp;
+
+            handlerInfo.addPossibleApplicationHandler(handlerApp);
+          }
+
+          chooseAppCallback(handlerApp);
+        };
+
+        gSubDialog.open(
+          "chrome://global/content/appPicker.xhtml",
+          { closingCallback: onAppSelected },
+          params
+        );
+      } else {
+        let winTitle = await document.l10n.formatValue(
+          "applications-select-helper"
+        );
+        let fp = Cc["@mozilla.org/filepicker;1"].createInstance(
+          Ci.nsIFilePicker
+        );
+        let fpCallback = aResult => {
+          if (
+            aResult == Ci.nsIFilePicker.returnOK &&
+            fp.file &&
+            this._isValidHandlerExecutable(fp.file)
+          ) {
+            handlerApp = Cc[
+              "@mozilla.org/uriloader/local-handler-app;1"
+            ].createInstance(Ci.nsILocalHandlerApp);
+            handlerApp.name = getFileDisplayName(fp.file);
+            handlerApp.executable = fp.file;
+
+            let handler = this.selectedHandlerListItem.handlerInfoWrapper;
+            handler.addPossibleApplicationHandler(handlerApp);
+
+            chooseAppCallback(handlerApp);
+          }
+        };
+
+        fp.init(window.browsingContext, winTitle, Ci.nsIFilePicker.modeOpen);
+        fp.appendFilters(Ci.nsIFilePicker.filterApps);
+        fp.open(fpCallback);
+      }
+    }
+
+    rebuildActionsMenu(
+      typeItem = this._list.selectedItem,
+      handlerInfo = this.selectedHandlerListItem.handlerInfoWrapper
+    ) {
+      var menu = typeItem.querySelector(".actionsMenu");
+      var menuPopup = menu.menupopup;
+
+      while (menuPopup.hasChildNodes()) {
+        menuPopup.removeChild(menuPopup.lastChild);
+      }
+
+      let internalMenuItem;
+      if (
+        handlerInfo instanceof InternalHandlerInfoWrapper &&
+        !handlerInfo.preventInternalViewing
+      ) {
+        internalMenuItem = document.createXULElement("menuitem");
+        internalMenuItem.setAttribute(
+          "action",
+          Ci.nsIHandlerInfo.handleInternally
+        );
+        internalMenuItem.className = "menuitem-iconic";
+        document.l10n.setAttributes(
+          internalMenuItem,
+          "applications-open-inapp"
+        );
+        internalMenuItem.setAttribute(APP_ICON_ATTR_NAME, "handleInternally");
+        menuPopup.appendChild(internalMenuItem);
+      }
+
+      var askMenuItem = document.createXULElement("menuitem");
+      askMenuItem.setAttribute("action", Ci.nsIHandlerInfo.alwaysAsk);
+      askMenuItem.className = "menuitem-iconic";
+      document.l10n.setAttributes(askMenuItem, "applications-always-ask");
+      askMenuItem.setAttribute(APP_ICON_ATTR_NAME, "ask");
+      menuPopup.appendChild(askMenuItem);
+
+      if (handlerInfo.wrappedHandlerInfo instanceof Ci.nsIMIMEInfo) {
+        var saveMenuItem = document.createXULElement("menuitem");
+        saveMenuItem.setAttribute("action", Ci.nsIHandlerInfo.saveToDisk);
+        document.l10n.setAttributes(saveMenuItem, "applications-action-save");
+        saveMenuItem.setAttribute(APP_ICON_ATTR_NAME, "save");
+        saveMenuItem.className = "menuitem-iconic";
+        menuPopup.appendChild(saveMenuItem);
+      }
+
+      let menuseparator = document.createXULElement("menuseparator");
+      menuPopup.appendChild(menuseparator);
+
+      if (handlerInfo.hasDefaultHandler) {
+        var defaultMenuItem = document.createXULElement("menuitem");
+        defaultMenuItem.setAttribute(
+          "action",
+          Ci.nsIHandlerInfo.useSystemDefault
+        );
+        if (internalMenuItem) {
+          document.l10n.setAttributes(
+            defaultMenuItem,
+            "applications-use-os-default"
+          );
+          defaultMenuItem.setAttribute("image", ICON_URL_APP);
+        } else {
+          document.l10n.setAttributes(
+            defaultMenuItem,
+            "applications-use-app-default",
+            {
+              "app-name": handlerInfo.defaultDescription,
+            }
+          );
+          let image = handlerInfo.iconURLForSystemDefault;
+          if (image) {
+            defaultMenuItem.setAttribute("image", image);
+          }
+        }
+
+        menuPopup.appendChild(defaultMenuItem);
+      }
+
+      let preferredApp = handlerInfo.preferredApplicationHandler;
+      var possibleAppMenuItems = [];
+      for (let possibleApp of handlerInfo.possibleApplicationHandlers.enumerate()) {
+        if (!this.isValidHandlerApp(possibleApp)) {
+          continue;
+        }
+
+        let menuItem = document.createXULElement("menuitem");
+        menuItem.setAttribute("action", Ci.nsIHandlerInfo.useHelperApp);
+        let label;
+        if (possibleApp instanceof Ci.nsILocalHandlerApp) {
+          label = getFileDisplayName(possibleApp.executable);
+        } else {
+          label = possibleApp.name;
+        }
+        document.l10n.setAttributes(menuItem, "applications-use-app", {
+          "app-name": label,
+        });
+        let image = getIconURLForHandlerApp(possibleApp);
+        if (image) {
+          menuItem.setAttribute("image", image);
+        }
+
+        menuItem.handlerApp = possibleApp;
+
+        menuPopup.appendChild(menuItem);
+        possibleAppMenuItems.push(menuItem);
+      }
+      if (gGIOService) {
+        var gioApps = gGIOService.getAppsForURIScheme(handlerInfo.type);
+        let possibleHandlers = handlerInfo.possibleApplicationHandlers;
+        for (let handler of gioApps.enumerate(Ci.nsIHandlerApp)) {
+          if (handler.name == handlerInfo.defaultDescription) {
+            continue;
+          }
+          let appAlreadyInHandlers = false;
+          for (let i = possibleHandlers.length - 1; i >= 0; --i) {
+            let app = possibleHandlers.queryElementAt(i, Ci.nsIHandlerApp);
+            if (handler.equals(app)) {
+              appAlreadyInHandlers = true;
+              break;
+            }
+          }
+          if (!appAlreadyInHandlers) {
+            let menuItem = document.createXULElement("menuitem");
+            menuItem.setAttribute("action", Ci.nsIHandlerInfo.useHelperApp);
+            document.l10n.setAttributes(menuItem, "applications-use-app", {
+              "app-name": handler.name,
+            });
+
+            let image = getIconURLForHandlerApp(handler);
+            if (image) {
+              menuItem.setAttribute("image", image);
+            }
+
+            menuItem.handlerApp = handler;
+
+            menuPopup.appendChild(menuItem);
+            possibleAppMenuItems.push(menuItem);
+          }
+        }
+      }
+
+      let canOpenWithOtherApp = true;
+      if (AppConstants.platform == "win") {
+        let executableType = Cc["@mozilla.org/mime;1"]
+          .getService(Ci.nsIMIMEService)
+          .getTypeFromExtension("exe");
+        canOpenWithOtherApp = handlerInfo.type != executableType;
+      }
+      if (canOpenWithOtherApp) {
+        let menuItem = document.createXULElement("menuitem");
+        menuItem.className = "choose-app-item";
+        menuItem.addEventListener("command", function (e) {
+          AppFileHandler.chooseApp(e);
+        });
+        document.l10n.setAttributes(menuItem, "applications-use-other");
+        menuPopup.appendChild(menuItem);
+      }
+
+      if (possibleAppMenuItems.length) {
+        let menuItem = document.createXULElement("menuseparator");
+        menuPopup.appendChild(menuItem);
+        menuItem = document.createXULElement("menuitem");
+        menuItem.className = "manage-app-item";
+        menuItem.addEventListener("command", function (e) {
+          AppFileHandler.manageApp(e);
+        });
+        document.l10n.setAttributes(menuItem, "applications-manage-app");
+        menuPopup.appendChild(menuItem);
+      }
+
+      if (handlerInfo.alwaysAskBeforeHandling) {
+        menu.selectedItem = askMenuItem;
+      } else {
+        const kActionUsePlugin = 5;
+
+        switch (handlerInfo.preferredAction) {
+          case Ci.nsIHandlerInfo.handleInternally:
+            if (internalMenuItem) {
+              menu.selectedItem = internalMenuItem;
+            } else {
+              console.error("No menu item defined to set!");
+            }
+            break;
+          case Ci.nsIHandlerInfo.useSystemDefault:
+            menu.selectedItem = defaultMenuItem || askMenuItem;
+            break;
+          case Ci.nsIHandlerInfo.useHelperApp:
+            if (preferredApp) {
+              let preferredItem = possibleAppMenuItems.find(v =>
+                v.handlerApp.equals(preferredApp)
+              );
+              if (preferredItem) {
+                menu.selectedItem = preferredItem;
+              } else {
+                let possible = possibleAppMenuItems
+                  .map(v => v.handlerApp && v.handlerApp.name)
+                  .join(", ");
+                console.error(
+                  new Error(
+                    `Preferred handler for ${handlerInfo.type} not in list of possible handlers!? (List: ${possible})`
+                  )
+                );
+                menu.selectedItem = askMenuItem;
+              }
+            }
+            break;
+          case kActionUsePlugin:
+            menu.selectedItem = askMenuItem;
+            break;
+          case Ci.nsIHandlerInfo.saveToDisk:
+            menu.selectedItem = saveMenuItem;
+            break;
+        }
+      }
+    }
+
+    isValidHandlerApp(aHandlerApp) {
+      if (!aHandlerApp) {
+        return false;
+      }
+
+      if (aHandlerApp instanceof Ci.nsILocalHandlerApp) {
+        return this._isValidHandlerExecutable(aHandlerApp.executable);
+      }
+
+      if (aHandlerApp instanceof Ci.nsIWebHandlerApp) {
+        return aHandlerApp.uriTemplate;
+      }
+
+      if (aHandlerApp instanceof Ci.nsIGIOMimeApp) {
+        return aHandlerApp.command;
+      }
+      if (aHandlerApp instanceof Ci.nsIGIOHandlerApp) {
+        return aHandlerApp.id;
+      }
+
+      return false;
+    }
+
+    _isValidHandlerExecutable(aExecutable) {
+      let leafName;
+      if (AppConstants.platform == "win") {
+        leafName = `${AppConstants.MOZ_APP_NAME}.exe`;
+      } else if (AppConstants.platform == "macosx") {
+        leafName = AppConstants.MOZ_MACBUNDLE_NAME;
+      } else {
+        leafName = `${AppConstants.MOZ_APP_NAME}-bin`;
+      }
+      return (
+        aExecutable &&
+        aExecutable.exists() &&
+        aExecutable.isExecutable() &&
+        aExecutable.leafName != leafName
+      );
+    }
+  })();
+})();

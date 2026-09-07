@@ -1,0 +1,145 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#if !defined(mozilla_arm_h_)
+#define mozilla_arm_h_
+
+#include "mozilla/Types.h"
+
+
+#if defined(__GNUC__) && defined(__arm__)
+
+#  define MOZILLA_ARM_ARCH 3
+
+#if defined(__ARM_ARCH_4__) || defined(__ARM_ARCH_4T__) || \
+      defined(_ARM_ARCH_4)
+#    undef MOZILLA_ARM_ARCH
+#    define MOZILLA_ARM_ARCH 4
+#endif
+
+#if defined(__ARM_ARCH_5__) || defined(__ARM_ARCH_5T__) ||   \
+      defined(__ARM_ARCH_5E__) || defined(__ARM_ARCH_5TE__) || \
+      defined(__ARM_ARCH_5TEJ__) || defined(_ARM_ARCH_5)
+#    undef MOZILLA_ARM_ARCH
+#    define MOZILLA_ARM_ARCH 5
+#endif
+
+#if defined(__ARM_ARCH_6__) || defined(__ARM_ARCH_6J__) ||    \
+      defined(__ARM_ARCH_6K__) || defined(__ARM_ARCH_6Z__) ||   \
+      defined(__ARM_ARCH_6ZK__) || defined(__ARM_ARCH_6T2__) || \
+      defined(__ARM_ARCH_6M__) || defined(_ARM_ARCH_6)
+#    undef MOZILLA_ARM_ARCH
+#    define MOZILLA_ARM_ARCH 6
+#endif
+
+#if defined(__ARM_ARCH_7__) || defined(__ARM_ARCH_7A__) ||  \
+      defined(__ARM_ARCH_7R__) || defined(__ARM_ARCH_7M__) || \
+      defined(__ARM_ARCH_7EM__) || defined(_ARM_ARCH_7)
+#    undef MOZILLA_ARM_ARCH
+#    define MOZILLA_ARM_ARCH 7
+#endif
+
+#if defined(__GNUC__)
+#    define MOZILLA_MAY_SUPPORT_EDSP 1
+
+#if defined(HAVE_ARM_SIMD)
+#      define MOZILLA_MAY_SUPPORT_ARMV6 1
+#endif
+
+#if defined(HAVE_ARM_NEON)
+#      define MOZILLA_MAY_SUPPORT_NEON 1
+#endif
+
+#if defined(HAVE_ARM_SIMD)
+#      define MOZILLA_MAY_SUPPORT_ARMV7 1
+#endif
+#endif
+
+#if defined(__linux__) || 0
+#    define MOZILLA_ARM_HAVE_CPUID_DETECTION 1
+#endif
+
+#endif
+
+#if defined(__ARM_NEON)
+#  define MOZILLA_PRESUME_NEON 1
+#endif
+
+#if defined(__ARM_FEATURE_CRYPTO)
+#  define MOZILLA_PRESUME_ARM_AES 1
+#endif
+
+namespace mozilla {
+
+namespace arm_private {
+#if defined(MOZILLA_ARM_HAVE_CPUID_DETECTION)
+#if !defined(MOZILLA_PRESUME_EDSP)
+extern bool MFBT_DATA edsp_enabled;
+#endif
+#if !defined(MOZILLA_PRESUME_ARMV6)
+extern bool MFBT_DATA armv6_enabled;
+#endif
+#if !defined(MOZILLA_PRESUME_ARMV7)
+extern bool MFBT_DATA armv7_enabled;
+#endif
+#if !defined(MOZILLA_PRESUME_NEON)
+extern bool MFBT_DATA neon_enabled;
+#endif
+#if !defined(MOZILLA_PRESUME_ARM_AES)
+extern bool MFBT_DATA aes_enabled;
+#endif
+#endif
+}  
+
+#if defined(MOZILLA_PRESUME_EDSP)
+#  define MOZILLA_MAY_SUPPORT_EDSP 1
+inline bool supports_edsp() { return true; }
+#elif defined(MOZILLA_MAY_SUPPORT_EDSP) && \
+    defined(MOZILLA_ARM_HAVE_CPUID_DETECTION)
+inline bool supports_edsp() { return arm_private::edsp_enabled; }
+#else
+inline bool supports_edsp() { return false; }
+#endif
+
+#if defined(MOZILLA_PRESUME_ARMV6)
+#  define MOZILLA_MAY_SUPPORT_ARMV6 1
+inline bool supports_armv6() { return true; }
+#elif defined(MOZILLA_MAY_SUPPORT_ARMV6) && \
+    defined(MOZILLA_ARM_HAVE_CPUID_DETECTION)
+inline bool supports_armv6() { return arm_private::armv6_enabled; }
+#else
+inline bool supports_armv6() { return false; }
+#endif
+
+#if defined(MOZILLA_PRESUME_ARMV7)
+#  define MOZILLA_MAY_SUPPORT_ARMV7 1
+inline bool supports_armv7() { return true; }
+#elif defined(MOZILLA_MAY_SUPPORT_ARMV7) && \
+    defined(MOZILLA_ARM_HAVE_CPUID_DETECTION)
+inline bool supports_armv7() { return arm_private::armv7_enabled; }
+#else
+inline bool supports_armv7() { return false; }
+#endif
+
+#if defined(MOZILLA_PRESUME_NEON)
+#  define MOZILLA_MAY_SUPPORT_NEON 1
+inline bool supports_neon() { return true; }
+#elif defined(MOZILLA_MAY_SUPPORT_NEON) && \
+    defined(MOZILLA_ARM_HAVE_CPUID_DETECTION)
+inline bool supports_neon() { return arm_private::neon_enabled; }
+#else
+inline bool supports_neon() { return false; }
+#endif
+#if defined(MOZILLA_PRESUME_ARM_AES)
+inline bool supports_arm_aes() { return true; }
+#elif defined(MOZILLA_ARM_HAVE_CPUID_DETECTION)
+inline bool supports_arm_aes() { return arm_private::aes_enabled; }
+#else
+inline bool supports_arm_aes() { return false; }
+#endif
+
+}  
+
+#endif

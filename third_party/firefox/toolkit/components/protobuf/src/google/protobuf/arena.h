@@ -1,0 +1,873 @@
+// Copyright 2008 Google Inc.  All rights reserved.
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
+
+
+#if !defined(GOOGLE_PROTOBUF_ARENA_H__)
+#define GOOGLE_PROTOBUF_ARENA_H__
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <new>  // IWYU pragma: keep for operator new().
+#include <string>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+#include "absl/base/macros.h"
+#include "google/protobuf/internal_visibility.h"
+#if defined(_MSC_VER) && !defined(_LIBCPP_STD_VER) && !_HAS_EXCEPTIONS
+#include <exception>
+#include <typeinfo>
+namespace std {
+using type_info = ::type_info;
+}
+#endif
+
+#include "absl/base/attributes.h"
+#include "absl/base/optimization.h"
+#include "absl/hash/hash.h"
+#include "absl/log/absl_check.h"
+#include "absl/strings/str_format.h"
+#include "google/protobuf/arena_align.h"
+#include "google/protobuf/arena_allocation_policy.h"
+#include "google/protobuf/port.h"
+#include "google/protobuf/serial_arena.h"
+#include "google/protobuf/thread_safe_arena.h"
+
+
+#include "google/protobuf/port_def.inc"
+
+#if defined(SWIG)
+#error "You cannot SWIG proto headers"
+#endif
+
+namespace google {
+namespace protobuf {
+
+struct ArenaOptions;  
+class Arena;          
+class Message;        
+class MessageLite;
+template <typename Key, typename T>
+class Map;
+namespace internal {
+struct RepeatedFieldBase;
+class ExtensionSet;
+}  
+
+namespace TestUtil {
+class ReflectionTester;  
+}  
+
+namespace internal {
+
+
+struct ArenaTestPeer;        
+class InternalMetadata;      
+class LazyField;             
+class EpsCopyInputStream;    
+class UntypedMapBase;        
+class RepeatedPtrFieldBase;  
+class TcParser;              
+
+SerialArena* PROTOBUF_NULLABLE GetSerialArena(Arena* PROTOBUF_NULLABLE);
+
+template <typename Type>
+class GenericTypeHandler;  
+
+template <typename T>
+struct FieldArenaRep {
+  using Type = T;
+
+  static T* PROTOBUF_NONNULL Get(Type* PROTOBUF_NONNULL arena_rep) {
+    return arena_rep;
+  }
+};
+
+template <typename T>
+constexpr bool FieldHasArenaOffset() {
+  using ArenaRepT = typename FieldArenaRep<T>::Type;
+  return !std::is_same_v<T, ArenaRepT>;
+}
+
+template <typename T>
+constexpr bool HasDeprecatedArenaConstructor() {
+  return std::is_base_of_v<internal::RepeatedPtrFieldBase, T> &&
+         !std::is_same_v<T, internal::RepeatedPtrFieldBase>;
+}
+
+template <typename T>
+void arena_delete_object(void* PROTOBUF_NONNULL object) {
+  delete reinterpret_cast<T*>(object);
+}
+
+inline bool CanUseInternalSwap(Arena* PROTOBUF_NULLABLE lhs,
+                               Arena* PROTOBUF_NULLABLE rhs) {
+  if (DebugHardenForceCopyInSwap()) {
+    return lhs != nullptr && lhs == rhs;
+  } else {
+    return lhs == rhs;
+  }
+}
+
+inline bool CanMoveWithInternalSwap(Arena* PROTOBUF_NULLABLE lhs,
+                                    Arena* PROTOBUF_NULLABLE rhs) {
+  if (DebugHardenForceCopyInMove()) {
+    return lhs != nullptr && lhs == rhs;
+  } else {
+    return lhs == rhs;
+  }
+}
+
+}  
+
+struct ABSL_ATTRIBUTE_WARN_UNUSED ArenaOptions final {
+  size_t start_block_size = internal::AllocationPolicy::kDefaultStartBlockSize;
+
+  size_t max_block_size = internal::AllocationPolicy::kDefaultMaxBlockSize;
+
+  char* PROTOBUF_NULLABLE initial_block = nullptr;
+
+  size_t initial_block_size = 0;
+
+  void* PROTOBUF_NONNULL (*PROTOBUF_NULLABLE block_alloc)(size_t) = nullptr;
+  void (*PROTOBUF_NULLABLE block_dealloc)(void* PROTOBUF_NONNULL,
+                                          size_t) = nullptr;
+
+ private:
+  internal::AllocationPolicy AllocationPolicy() const {
+    internal::AllocationPolicy res;
+    res.start_block_size = start_block_size;
+    res.max_block_size = max_block_size;
+    res.block_alloc = block_alloc;
+    res.block_dealloc = block_dealloc;
+    return res;
+  }
+
+  friend class Arena;
+  friend class ArenaOptionsTestFriend;
+};
+
+class PROTOBUF_EXPORT PROTOBUF_ALIGNAS(8)
+#if defined(__clang__)
+    ABSL_ATTRIBUTE_WARN_UNUSED
+#endif
+    Arena final {
+ public:
+  template <typename T>
+  class
+      ABSL_MUST_USE_RESULT
+          ABSL_ATTRIBUTE_TRIVIAL_ABI ABSL_NULLABILITY_COMPATIBLE UniquePtr;
+
+  template <typename T>
+  class ABSL_MUST_USE_RESULT ABSL_ATTRIBUTE_TRIVIAL_ABI Ptr;
+
+  inline Arena() : impl_() {}
+
+  inline Arena(char* PROTOBUF_NULLABLE initial_block, size_t initial_block_size)
+      : impl_(initial_block, initial_block_size) {}
+
+  explicit Arena(const ArenaOptions& options)
+      : impl_(options.initial_block, options.initial_block_size,
+              options.AllocationPolicy()) {}
+
+  static const size_t kBlockOverhead =
+      internal::ThreadSafeArena::kBlockHeaderSize +
+      internal::ThreadSafeArena::kSerialArenaSize;
+
+  inline ~Arena() = default;
+
+  template <typename T, typename... Args>
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD PROTOBUF_NDEBUG_INLINE static T*
+      PROTOBUF_NONNULL
+      Create(Arena* PROTOBUF_NULLABLE arena, Args&&... args) {
+    if constexpr (is_arena_constructable<T>::value) {
+      using Type = std::remove_const_t<T>;
+      if constexpr (is_destructor_skippable<T>::value) {
+        constexpr auto construct_type = GetConstructType<T, Args&&...>();
+        if constexpr (construct_type == ConstructType::kDefault) {
+          return static_cast<Type*>(DefaultConstruct<Type>(arena));
+        } else if constexpr (construct_type == ConstructType::kCopy) {
+          return static_cast<Type*>(CopyConstruct<Type>(arena, &args...));
+        }
+      }
+      return CreateArenaCompatible<Type>(arena, std::forward<Args>(args)...);
+    } else {
+      if (ABSL_PREDICT_FALSE(arena == nullptr)) {
+        return new T(std::forward<Args>(args)...);
+      }
+      return new (arena->AllocateInternal<T>()) T(std::forward<Args>(args)...);
+    }
+  }
+
+  template <typename T, int&..., typename... Args>
+  [[nodiscard]] PROTOBUF_NDEBUG_INLINE static UniquePtr<T> PROTOBUF_NONNULL
+  MakeUnique(Arena* PROTOBUF_NULLABLE arena, Args&&... args) {
+    // NOLINTNEXTLINE(google3-runtime-pointer-nullability)
+    return UnsafeWrapUniquePtr(arena,
+                               Create<T>(arena, std::forward<Args>(args)...));
+  }
+
+  template <typename T, int&..., typename... Args>
+  [[nodiscard]] PROTOBUF_NDEBUG_INLINE Ptr<T> Make(Args&&... args) {
+    return Ptr<T>(this, Create<T>(this, std::forward<Args>(args)...));
+  }
+
+  template <typename T>
+  [[nodiscard]] static UniquePtr<T> PROTOBUF_NULLABLE UnsafeWrapUniquePtr(
+      Arena* PROTOBUF_NULLABLE owning_arena, T* PROTOBUF_NULLABLE ptr) {
+    return UniquePtr<T>(ptr, owning_arena);
+  }
+
+  template <typename T>
+  PROTOBUF_ALWAYS_INLINE static void Destroy(T* PROTOBUF_NONNULL obj) {
+    if (InternalGetArena(obj) == nullptr) delete obj;
+  }
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD void* PROTOBUF_NONNULL
+  AllocateAligned(size_t size, size_t align = 8) {
+    if (align <= internal::ArenaAlignDefault::align) {
+      return Allocate(internal::ArenaAlignDefault::Ceil(size));
+    } else {
+      auto align_as = internal::ArenaAlignAs(align);
+      return align_as.Ceil(Allocate(align_as.Padded(size)));
+    }
+  }
+
+  template <typename T>
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD PROTOBUF_NDEBUG_INLINE static T*
+      PROTOBUF_NONNULL
+      CreateArray(Arena* PROTOBUF_NULLABLE arena, size_t num_elements) {
+    static_assert(std::is_trivially_default_constructible<T>::value,
+                  "CreateArray requires a trivially constructible type");
+    static_assert(std::is_trivially_destructible<T>::value,
+                  "CreateArray requires a trivially destructible type");
+    ABSL_CHECK_LE(num_elements,
+                  (std::numeric_limits<size_t>::max() & ~7) / sizeof(T))
+        << "Requested size is too large to fit into size_t.";
+    if (ABSL_PREDICT_FALSE(arena == nullptr)) {
+      return new T[num_elements];
+    } else {
+      return static_cast<T*>(
+          arena->AllocateAlignedForArray(sizeof(T) * num_elements, alignof(T)));
+    }
+  }
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD uint64_t SpaceAllocated() const {
+    return impl_.SpaceAllocated();
+  }
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD uint64_t SpaceUsed() const {
+    return impl_.SpaceUsed();
+  }
+
+  uint64_t Reset() { return impl_.Reset(); }
+
+  template <typename T>
+  PROTOBUF_ALWAYS_INLINE void Own(T* PROTOBUF_NULLABLE object) {
+    using TypeToUse =
+        std::conditional_t<std::is_convertible<T*, MessageLite*>::value,
+                           MessageLite, T>;
+    if (object != nullptr) {
+      impl_.AddCleanup(static_cast<TypeToUse*>(object),
+                       &internal::arena_delete_object<TypeToUse>);
+    }
+  }
+
+  template <typename T>
+  PROTOBUF_ALWAYS_INLINE void OwnDestructor(T* PROTOBUF_NULLABLE object) {
+    if (object != nullptr) {
+      impl_.AddCleanup(object, &internal::cleanup::arena_destruct_object<T>);
+    }
+  }
+
+  PROTOBUF_ALWAYS_INLINE void OwnCustomDestructor(
+      void* PROTOBUF_NONNULL object,
+      void (*PROTOBUF_NONNULL destruct)(void* PROTOBUF_NONNULL)) {
+    impl_.AddCleanup(object, destruct);
+  }
+
+  template <typename T>
+  class InternalHelper {
+   private:
+    template <typename U>
+    using EnableIfArena =
+        typename std::enable_if<std::is_same<Arena*, U>::value, Arena*>::type;
+
+    struct Rank0 {};
+    struct Rank1 : Rank0 {};
+
+    static void InternalSwap(T* PROTOBUF_NONNULL a, T* PROTOBUF_NONNULL b) {
+      a->InternalSwap(b);
+    }
+
+    static Arena* PROTOBUF_NULLABLE GetArena(T* PROTOBUF_NONNULL p) {
+      return GetArena(Rank1{}, p);
+    }
+
+    template <typename U>
+    static auto GetArena(Rank1, U* PROTOBUF_NONNULL p)
+        -> EnableIfArena<decltype(p->GetArena())> {
+      return p->GetArena();
+    }
+
+    template <typename U>
+    static Arena* PROTOBUF_NULLABLE GetArena(Rank0, U* PROTOBUF_NULLABLE) {
+      return nullptr;
+    }
+
+    template <typename U>
+    static char DestructorSkippable(
+        const typename U::DestructorSkippable_* PROTOBUF_NULLABLE);
+    template <typename U>
+    static double DestructorSkippable(...);
+
+    typedef std::integral_constant<
+        bool, sizeof(DestructorSkippable<T>(static_cast<const T*>(nullptr))) ==
+                      sizeof(char) ||
+                  std::is_trivially_destructible<T>::value>
+        is_destructor_skippable;
+
+    template <typename U>
+    static char ArenaConstructable(
+        const typename U::InternalArenaConstructable_* PROTOBUF_NULLABLE);
+    template <typename U>
+    static double ArenaConstructable(...);
+
+    typedef std::integral_constant<bool, sizeof(ArenaConstructable<T>(
+                                             static_cast<const T*>(nullptr))) ==
+                                             sizeof(char)>
+        is_arena_constructable;
+
+    template <typename... Args>
+    static T* PROTOBUF_NONNULL ConstructOnArena(void* PROTOBUF_NONNULL ptr,
+                                                Arena& arena, Args&&... args) {
+      return new (ptr) T(&arena, static_cast<Args&&>(args)...);
+    }
+
+    template <typename... Args>
+    static T* PROTOBUF_NONNULL Construct(void* PROTOBUF_NONNULL ptr,
+                                         Arena* PROTOBUF_NULLABLE arena,
+                                         Args&&... args) {
+      if (ABSL_PREDICT_FALSE(arena == nullptr)) {
+        return new (ptr) T(static_cast<Args&&>(args)...);
+      } else {
+        return ConstructOnArena(ptr, *arena, static_cast<Args&&>(args)...);
+      }
+    }
+
+    static PROTOBUF_ALWAYS_INLINE T* PROTOBUF_NONNULL New() {
+      if constexpr (internal::FieldHasArenaOffset<T>() ||
+                    internal::HasDeprecatedArenaConstructor<T>()) {
+        return new T();
+      } else {
+        return new T(nullptr);
+      }
+    }
+
+    friend class Arena;
+    friend class TestUtil::ReflectionTester;
+  };
+
+
+  template <typename T>
+  static Arena* PROTOBUF_NULLABLE InternalGetArena(T* PROTOBUF_NONNULL p) {
+    return InternalHelper<T>::GetArena(p);
+  }
+
+  template <typename T>
+  struct is_arena_constructable : InternalHelper<T>::is_arena_constructable {};
+  template <typename T>
+  struct is_destructor_skippable : InternalHelper<T>::is_destructor_skippable {
+  };
+
+ private:
+  internal::ThreadSafeArena impl_;
+
+  enum class ConstructType { kUnknown, kDefault, kCopy, kMove };
+  template <typename T>
+  static auto ProbeConstructType()
+      -> std::integral_constant<ConstructType, ConstructType::kDefault>;
+  template <typename T>
+  static auto ProbeConstructType(const T&)
+      -> std::integral_constant<ConstructType, ConstructType::kCopy>;
+  template <typename T>
+  static auto ProbeConstructType(T&)
+      -> std::integral_constant<ConstructType, ConstructType::kCopy>;
+  template <typename T>
+  static auto ProbeConstructType(const T&&)
+      -> std::integral_constant<ConstructType, ConstructType::kCopy>;
+  template <typename T>
+  static auto ProbeConstructType(T&&)
+      -> std::integral_constant<ConstructType, ConstructType::kMove>;
+  template <typename T, typename... U>
+  static auto ProbeConstructType(U&&...)
+      -> std::integral_constant<ConstructType, ConstructType::kUnknown>;
+
+  template <typename T, typename... Args>
+  static constexpr auto GetConstructType() {
+    return std::is_base_of<MessageLite, T>::value
+               ? decltype(ProbeConstructType<T>(std::declval<Args>()...))::value
+               : ConstructType::kUnknown;
+  }
+
+  void ReturnArrayMemory(void* PROTOBUF_NONNULL p, size_t size) {
+    impl_.ReturnArrayMemory(p, size);
+  }
+
+  template <typename T, typename... Args>
+  PROTOBUF_NDEBUG_INLINE static T* PROTOBUF_NONNULL
+  CreateArenaCompatible(Arena* PROTOBUF_NULLABLE arena, Args&&... args) {
+    static_assert(is_arena_constructable<T>::value,
+                  "Can only construct types that are ArenaConstructable");
+    if (ABSL_PREDICT_FALSE(arena == nullptr)) {
+      if constexpr (internal::FieldHasArenaOffset<T>() ||
+                    internal::HasDeprecatedArenaConstructor<T>()) {
+        return new T(static_cast<Args&&>(args)...);
+      } else {
+        return new T(nullptr, static_cast<Args&&>(args)...);
+      }
+    } else {
+      return arena->DoCreateMessage<T>(static_cast<Args&&>(args)...);
+    }
+  }
+
+  template <typename T>
+  PROTOBUF_NDEBUG_INLINE static T* PROTOBUF_NONNULL
+  CreateArenaCompatible(Arena* PROTOBUF_NULLABLE arena) {
+    static_assert(is_arena_constructable<T>::value,
+                  "Can only construct types that are ArenaConstructable");
+    if (ABSL_PREDICT_FALSE(arena == nullptr)) {
+      return InternalHelper<T>::New();
+    } else {
+      return arena->DoCreateMessage<T>();
+    }
+  }
+
+  template <typename T, bool trivial = std::is_trivially_destructible<T>::value>
+  PROTOBUF_NDEBUG_INLINE void* PROTOBUF_NONNULL AllocateInternal() {
+    if (trivial) {
+      return AllocateAligned(sizeof(T), alignof(T));
+    } else {
+      constexpr auto dtor = &internal::cleanup::arena_destruct_object<
+          std::conditional_t<trivial, std::string, T>>;
+      return AllocateAlignedWithCleanup(sizeof(T), alignof(T), dtor);
+    }
+  }
+
+  template <typename T>
+  static void* PROTOBUF_NONNULL
+  DefaultConstruct(Arena* PROTOBUF_NULLABLE arena);
+  template <typename T>
+  static void* PROTOBUF_NONNULL CopyConstruct(
+      Arena* PROTOBUF_NULLABLE arena, const void* PROTOBUF_NONNULL from);
+
+  template <typename T, typename... Args>
+  PROTOBUF_NDEBUG_INLINE T* PROTOBUF_NONNULL DoCreateMessage(Args&&... args) {
+    using ArenaRepT = typename internal::FieldArenaRep<T>::Type;
+    auto* arena_repr = InternalHelper<ArenaRepT>::ConstructOnArena(
+        AllocateInternal<ArenaRepT,
+                         is_destructor_skippable<ArenaRepT>::value>(),
+        *this, std::forward<Args>(args)...);
+    return internal::FieldArenaRep<T>::Get(arena_repr);
+  }
+
+  template <typename T, typename... Args>
+  static void CreateInArenaStorage(T* PROTOBUF_NONNULL ptr,
+                                   Arena* PROTOBUF_NULLABLE arena,
+                                   Args&&... args) {
+    if constexpr (is_arena_constructable<T>::value) {
+      InternalHelper<T>::Construct(ptr, arena, std::forward<Args>(args)...);
+    } else {
+      new (ptr) T(std::forward<Args>(args)...);
+    }
+
+    if constexpr (!is_destructor_skippable<T>::value) {
+      if (ABSL_PREDICT_TRUE(arena != nullptr)) {
+        arena->OwnDestructor(ptr);
+      }
+    }
+  }
+
+  template <typename T>
+  PROTOBUF_ALWAYS_INLINE static Arena* PROTOBUF_NULLABLE
+  GetArenaInternal(T* PROTOBUF_NONNULL value) {
+    return InternalHelper<T>::GetArena(value);
+  }
+
+  void* PROTOBUF_NONNULL AllocateAlignedForArray(size_t n, size_t align) {
+    if (align <= internal::ArenaAlignDefault::align) {
+      return AllocateForArray(internal::ArenaAlignDefault::Ceil(n));
+    } else {
+      auto align_as = internal::ArenaAlignAs(align);
+      return align_as.Ceil(AllocateForArray(align_as.Padded(n)));
+    }
+  }
+
+  void* PROTOBUF_NONNULL Allocate(size_t n);
+  void* PROTOBUF_NONNULL AllocateForArray(size_t n);
+  void* PROTOBUF_NONNULL AllocateAlignedWithCleanup(
+      size_t n, size_t align,
+      void (*PROTOBUF_NONNULL destructor)(void* PROTOBUF_NONNULL));
+
+  std::vector<void*> PeekCleanupListForTesting();
+
+  template <typename Type>
+  friend class internal::GenericTypeHandler;
+  friend class internal::InternalMetadata;    
+  friend class internal::LazyField;           
+  friend class internal::EpsCopyInputStream;  
+  friend class internal::TcParser;            
+  friend class MessageLite;
+  template <typename Key, typename T>
+  friend class Map;
+  template <typename>
+  friend class RepeatedField;                   
+  friend class internal::RepeatedPtrFieldBase;  
+  friend class internal::UntypedMapBase;        
+  friend class internal::ExtensionSet;          
+  friend internal::SerialArena* PROTOBUF_NULLABLE
+  internal::GetSerialArena(Arena* PROTOBUF_NULLABLE);
+
+  friend struct internal::ArenaTestPeer;
+};
+
+namespace internal {
+struct ArenaPtrCmpBase {
+  template <typename T>
+  static T* PROTOBUF_NULLABLE Unpack(T* PROTOBUF_NULLABLE ptr) {
+    return ptr;
+  }
+
+  template <typename T>
+  static auto PROTOBUF_NULLABLE
+  Unpack(const typename Arena::UniquePtr<T>& ptr) {
+    return ptr.get();
+  }
+
+  template <typename T>
+  static auto PROTOBUF_NONNULL
+  Unpack(const typename Arena::template Ptr<T>& ptr) {
+    return ptr.get();
+  }
+
+  static std::nullptr_t Unpack(std::nullptr_t) { return nullptr; }
+
+ public:
+  template <typename LHS, typename RHS>
+  friend auto operator==(const LHS& lhs, const RHS& rhs)
+      -> decltype(Unpack(lhs) == Unpack(rhs)) {
+    return Unpack(lhs) == Unpack(rhs);
+  }
+
+  template <typename LHS, typename RHS>
+  friend auto operator!=(const LHS& lhs, const RHS& rhs)
+      -> decltype(lhs == rhs) {
+    return !(lhs == rhs);
+  }
+
+};
+
+struct ArenaPtrContainerHash {
+  using is_transparent = void;
+
+  template <typename T>
+  auto operator()(const T& value) const
+      -> decltype(absl::HashOf(ArenaPtrCmpBase::Unpack(value))) {
+    return absl::HashOf(ArenaPtrCmpBase::Unpack(value));
+  }
+};
+
+struct UniquePtrDeleter {
+  template <typename T>
+  void operator()(T* PROTOBUF_NONNULL element) const {
+    if (arena == nullptr) delete element;
+  }
+
+  Arena* PROTOBUF_NULLABLE arena = nullptr;
+};
+
+}  
+
+template <typename T>
+class
+    ABSL_MUST_USE_RESULT
+        ABSL_ATTRIBUTE_TRIVIAL_ABI ABSL_NULLABILITY_COMPATIBLE
+            Arena::UniquePtr final : internal::ArenaPtrCmpBase {
+ public:
+  using pointer = T*;
+  using element_type = T;
+
+  constexpr UniquePtr() : ptr_(nullptr, Deleter{}) {}
+  // NOLINTNEXTLINE(google-explicit-constructor)
+  constexpr UniquePtr(std::nullptr_t) : ptr_(nullptr, Deleter{}) {}
+
+  // NOLINTNEXTLINE(google-explicit-constructor)
+  UniquePtr(PROTOBUF_NULLABLE std::unique_ptr<T> heap_owned)
+      : ptr_(heap_owned.release(), Deleter{}) {}
+
+  // NOLINTNEXTLINE(google-explicit-constructor)
+  UniquePtr(Ptr<T> arena_owned)
+      : UniquePtr(arena_owned.get(), arena_owned.GetOwningArena()) {}
+
+  ~UniquePtr() = default;
+
+  constexpr UniquePtr(UniquePtr&& rhs) = default;
+  template <typename U,
+            typename = std::enable_if_t<std::is_convertible_v<U*, T*>>>
+  // NOLINTNEXTLINE(google-explicit-constructor)
+  constexpr UniquePtr(UniquePtr<U>&& rhs) : ptr_(std::move(rhs.ptr_)) {}
+
+  explicit UniquePtr(T* PROTOBUF_NULLABLE ptr) = delete;
+
+  UniquePtr& operator=(UniquePtr&& rhs) = default;
+  UniquePtr& operator=(std::nullptr_t) {
+    reset();
+    return *this;
+  }
+  template <typename U,
+            typename = std::enable_if_t<std::is_convertible_v<U*, T*>>>
+  UniquePtr& operator=(UniquePtr<U>&& rhs) {
+    ptr_ = std::move(rhs.ptr_);
+    return *this;
+  }
+
+  UniquePtr(const UniquePtr& rhs) = delete;
+  UniquePtr& operator=(const UniquePtr& rhs) = delete;
+
+  absl::optional<PROTOBUF_NONNULL std::unique_ptr<T>> try_heap_release() {
+    if (GetOwningArena() != nullptr || get() == nullptr) {
+      return absl::nullopt;
+    }
+    return std::unique_ptr<T>(std::exchange(ptr_, UniquePtrType()).release());
+  }
+
+  absl::optional<Ptr<T>> try_as_arena_ptr() const {
+    Arena* arena = GetOwningArena();
+    if (arena == nullptr || get() == nullptr) {
+      return absl::nullopt;
+    }
+    return Ptr<T>(arena, get());
+  }
+
+
+  void swap(UniquePtr& other) noexcept { ptr_.swap(other.ptr_); }
+  friend void swap(UniquePtr& a, UniquePtr& b) noexcept { a.swap(b); }
+
+  ABSL_ATTRIBUTE_REINITIALIZES void reset() { ptr_.reset(); }
+  ABSL_ATTRIBUTE_REINITIALIZES void reset(std::nullptr_t) {
+    ptr_.reset(nullptr);
+  }
+  void reset(T* PROTOBUF_NULLABLE) = delete;
+
+  PROTOBUF_NULLABLE pointer get() const ABSL_ATTRIBUTE_LIFETIME_BOUND {
+    return ptr_.get();
+  }
+  PROTOBUF_NONNULL pointer operator->() const ABSL_ATTRIBUTE_LIFETIME_BOUND {
+    return get();
+  }
+  element_type& operator*() const ABSL_ATTRIBUTE_LIFETIME_BOUND {
+    ABSL_DCHECK(ptr_ != nullptr);
+    return *ptr_;
+  }
+  explicit operator bool() const { return ptr_ != nullptr; }
+
+  Arena* PROTOBUF_NULLABLE GetOwningArena() const {
+    return ptr_.get_deleter().arena;
+  }
+
+  template <typename Sink>
+  friend void AbslStringify(Sink& sink, const UniquePtr& ptr) {
+    if constexpr (std::is_base_of_v<MessageLite, T>) {
+      if (ptr != nullptr) {
+        absl::Format(&sink, "points to (%p) with value <%v>", ptr.get(), *ptr);
+        return;
+      }
+    }
+    absl::Format(&sink, "%p", ptr.get());
+  }
+
+  using absl_container_hash = internal::ArenaPtrContainerHash;
+
+  template <typename H>
+  friend H AbslHashValue(H h, const UniquePtr& u) {
+    return H::combine(std::move(h), u.ptr_);
+  }
+
+ private:
+  friend Arena;
+
+  template <typename U>
+  friend class ABSL_NULLABILITY_COMPATIBLE UniquePtr;
+
+  using Deleter = internal::UniquePtrDeleter;
+  using UniquePtrType = std::unique_ptr<T, Deleter>;
+
+  UniquePtr(T* PROTOBUF_NULLABLE t, Arena* PROTOBUF_NULLABLE owning_arena)
+      : ptr_(t, Deleter{owning_arena}) {}
+
+  PROTOBUF_NULLABLE UniquePtrType ptr_;
+};
+
+template <typename T>
+class ABSL_MUST_USE_RESULT ABSL_ATTRIBUTE_TRIVIAL_ABI Arena::Ptr final
+    : internal::ArenaPtrCmpBase {
+ public:
+  using pointer = T*;
+  using element_type = T;
+
+  constexpr Ptr(const Ptr& rhs) = default;
+  template <typename U,
+            typename = std::enable_if_t<std::is_convertible_v<U*, T*>>>
+  // NOLINTNEXTLINE(google-explicit-constructor)
+  constexpr Ptr(const Ptr<U>& rhs) : ptr_(rhs.ptr_), arena_(rhs.arena_) {}
+
+  ~Ptr() = default;
+
+  Ptr& operator=(const Ptr& rhs) = default;
+  template <typename U,
+            typename = std::enable_if_t<std::is_convertible_v<U*, T*>>>
+  Ptr& operator=(const Ptr<U>& rhs) {
+    ptr_ = rhs.ptr_;
+    arena_ = rhs.arena_;
+    return *this;
+  }
+
+  void swap(Ptr& other) noexcept {
+    std::swap(ptr_, other.ptr_);
+    std::swap(arena_, other.arena_);
+  }
+  friend void swap(Ptr& a, Ptr& b) noexcept { a.swap(b); }
+
+  PROTOBUF_NONNULL pointer get() const { return ptr_; }
+  PROTOBUF_NONNULL pointer operator->() const { return ptr_; }
+  element_type& operator*() const { return *ptr_; }
+
+  Arena* PROTOBUF_NONNULL GetOwningArena() const { return arena_; }
+
+  template <typename Sink>
+  friend void AbslStringify(Sink& sink, Ptr ptr) {
+    if constexpr (std::is_base_of_v<MessageLite, T>) {
+      absl::Format(&sink, "points to (%p) with value <%v>", ptr.get(), *ptr);
+    } else {
+      absl::Format(&sink, "%p", ptr.get());
+    }
+  }
+
+  using absl_container_hash = internal::ArenaPtrContainerHash;
+
+  template <typename H>
+  friend H AbslHashValue(H h, Ptr u) {
+    return H::combine(std::move(h), u.ptr_);
+  }
+
+ private:
+  friend Arena;
+
+  template <typename U>
+  friend class Ptr;
+
+  Ptr(Arena* PROTOBUF_NONNULL owning_arena, T* PROTOBUF_NONNULL ptr)
+      : ptr_(ptr), arena_(owning_arena) {}
+
+  T* PROTOBUF_NONNULL ptr_;
+  Arena* PROTOBUF_NONNULL arena_;
+};
+
+template <typename T>
+PROTOBUF_NOINLINE void* PROTOBUF_NONNULL
+Arena::DefaultConstruct(Arena* PROTOBUF_NULLABLE arena) {
+  if constexpr (internal::FieldHasArenaOffset<T>()) {
+    if (arena != nullptr) {
+      using ArenaRepT = typename internal::FieldArenaRep<T>::Type;
+      static_assert(is_destructor_skippable<ArenaRepT>::value);
+
+      void* mem = arena->AllocateAligned(sizeof(ArenaRepT));
+      ArenaRepT* arena_rep = new (mem) ArenaRepT(arena);
+      return internal::FieldArenaRep<T>::Get(arena_rep);
+    } else {
+      static_assert(is_destructor_skippable<T>::value);
+      return new (internal::Allocate(sizeof(T))) T();
+    }
+  } else {
+    static_assert(is_destructor_skippable<T>::value);
+    void* mem = arena != nullptr ? arena->AllocateAligned(sizeof(T))
+                                 : internal::Allocate(sizeof(T));
+    if constexpr (internal::HasDeprecatedArenaConstructor<T>()) {
+      return new (mem) T(internal::InternalVisibility(), arena);
+    } else {
+      return new (mem) T(arena);
+    }
+  }
+}
+
+template <typename T>
+PROTOBUF_NOINLINE void* PROTOBUF_NONNULL Arena::CopyConstruct(
+    Arena* PROTOBUF_NULLABLE arena, const void* PROTOBUF_NONNULL from) {
+  const auto* typed_from = static_cast<const T*>(from);
+  if constexpr (sizeof(T) > ABSL_CACHELINE_SIZE / 2) {
+    using internal::PrefetchOpts;
+    static constexpr PrefetchOpts kPrefetchOpts = {
+        {std::min(sizeof(T) / 2, sizeof(T) - ABSL_CACHELINE_SIZE / 2),
+                 PrefetchOpts::kBytes},
+        {1, PrefetchOpts::kLines},
+        PrefetchOpts::kHigh,
+    };
+    internal::Prefetch<kPrefetchOpts, T, T>(typed_from);
+  }
+  static_assert(is_destructor_skippable<T>::value, "");
+  void* mem;
+  if (arena != nullptr) {
+    mem = arena->AllocateAligned(sizeof(T));
+  } else {
+    mem = internal::Allocate(sizeof(T));
+  }
+  return new (mem) T(arena, *typed_from);
+}
+
+template <>
+inline void* PROTOBUF_NONNULL Arena::AllocateInternal<std::string, false>() {
+  return impl_.AllocateFromStringBlock();
+}
+
+namespace internal {
+
+inline SerialArena* PROTOBUF_NULLABLE
+GetSerialArena(SerialArena* PROTOBUF_NULLABLE arena) {
+  return arena;
+}
+
+inline SerialArena* PROTOBUF_NULLABLE
+GetSerialArena(Arena* PROTOBUF_NULLABLE arena) {
+  if (arena == nullptr) return nullptr;
+  SerialArena* res = arena->impl_.GetSerialArena();
+  PROTOBUF_ASSUME(res != nullptr);
+  return res;
+}
+
+template <auto... delay>
+inline SerialArena* PROTOBUF_NULLABLE
+GetSerialArena(const MessageLite* PROTOBUF_NONNULL elem) {
+  const auto* dependent_elem = (delay, ..., elem);
+  return GetSerialArena(dependent_elem->GetArena());
+}
+
+template <typename T,
+          bool kDestructorSkippable = Arena::is_destructor_skippable<T>::value>
+struct ContainerDestructorSkippableBase {};
+
+template <typename T>
+struct ContainerDestructorSkippableBase<T, true> {
+  using DestructorSkippable_ = void;
+};
+
+}  
+
+}  
+}  
+
+#include "google/protobuf/port_undef.inc"
+
+#endif

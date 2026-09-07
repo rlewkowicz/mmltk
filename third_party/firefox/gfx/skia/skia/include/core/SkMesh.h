@@ -1,0 +1,291 @@
+/*
+ * Copyright 2021 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkMesh_DEFINED)
+#define SkMesh_DEFINED
+
+#include "include/core/SkData.h"
+#include "include/core/SkRect.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkSpan.h"
+#include "include/core/SkString.h"
+#include "include/effects/SkRuntimeEffect.h"
+#include "include/private/base/SkAPI.h"
+#include "include/private/base/SkTArray.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <string_view>
+#include <tuple>
+#include <vector>
+
+class GrDirectContext;
+class SkColorSpace;
+enum SkAlphaType : int;
+
+namespace SkSL { struct Program; }
+
+class SK_API SkMeshSpecification : public SkNVRefCnt<SkMeshSpecification> {
+public:
+    static constexpr size_t kMaxStride       = 1024;
+    static constexpr size_t kMaxAttributes   = 8;
+    static constexpr size_t kStrideAlignment = 4;
+    static constexpr size_t kOffsetAlignment = 4;
+    static constexpr size_t kMaxVaryings     = 6;
+
+    struct Attribute {
+        enum class Type : uint32_t {  
+            kFloat,                   
+            kFloat2,                  
+            kFloat3,                  
+            kFloat4,                  
+            kUByte4_unorm,            
+
+            kLast = kUByte4_unorm
+        };
+        Type     type;
+        size_t   offset;
+        SkString name;
+    };
+
+    struct Varying {
+        enum class Type : uint32_t {
+            kFloat,   
+            kFloat2,  
+            kFloat3,  
+            kFloat4,  
+            kHalf,    
+            kHalf2,   
+            kHalf3,   
+            kHalf4,   
+
+            kLast = kHalf4
+        };
+        Type     type;
+        SkString name;
+    };
+
+    using Uniform = SkRuntimeEffect::Uniform;
+    using Child = SkRuntimeEffect::Child;
+
+    ~SkMeshSpecification();
+
+    struct Result {
+        sk_sp<SkMeshSpecification> specification;
+        SkString                   error;
+    };
+
+    static Result Make(SkSpan<const Attribute> attributes,
+                       size_t                  vertexStride,
+                       SkSpan<const Varying>   varyings,
+                       const SkString&         vs,
+                       const SkString&         fs);
+    static Result Make(SkSpan<const Attribute> attributes,
+                       size_t                  vertexStride,
+                       SkSpan<const Varying>   varyings,
+                       const SkString&         vs,
+                       const SkString&         fs,
+                       sk_sp<SkColorSpace>     cs);
+    static Result Make(SkSpan<const Attribute> attributes,
+                       size_t                  vertexStride,
+                       SkSpan<const Varying>   varyings,
+                       const SkString&         vs,
+                       const SkString&         fs,
+                       sk_sp<SkColorSpace>     cs,
+                       SkAlphaType             at);
+
+    SkSpan<const Attribute> attributes() const { return SkSpan(fAttributes); }
+
+    size_t uniformSize() const;
+
+    SkSpan<const Uniform> uniforms() const { return SkSpan(fUniforms); }
+
+    SkSpan<const Child> children() const { return SkSpan(fChildren); }
+
+    const Child* findChild(std::string_view name) const;
+
+    const Uniform* findUniform(std::string_view name) const;
+
+    const Attribute* findAttribute(std::string_view name) const;
+
+    const Varying* findVarying(std::string_view name) const;
+
+    size_t stride() const { return fStride; }
+
+    SkColorSpace* colorSpace() const { return fColorSpace.get(); }
+
+private:
+    friend struct SkMeshSpecificationPriv;
+
+    enum class ColorType {
+        kNone,
+        kHalf4,
+        kFloat4,
+    };
+
+    static Result MakeFromSourceWithStructs(SkSpan<const Attribute> attributes,
+                                            size_t                  stride,
+                                            SkSpan<const Varying>   varyings,
+                                            const SkString&         vs,
+                                            const SkString&         fs,
+                                            sk_sp<SkColorSpace>     cs,
+                                            SkAlphaType             at);
+
+    SkMeshSpecification(SkSpan<const Attribute>,
+                        size_t,
+                        SkSpan<const Varying>,
+                        int passthroughLocalCoordsVaryingIndex,
+                        uint32_t deadVaryingMask,
+                        std::vector<Uniform> uniforms,
+                        std::vector<Child> children,
+                        std::unique_ptr<const SkSL::Program>,
+                        std::unique_ptr<const SkSL::Program>,
+                        ColorType,
+                        sk_sp<SkColorSpace>,
+                        SkAlphaType);
+
+    SkMeshSpecification(const SkMeshSpecification&) = delete;
+    SkMeshSpecification(SkMeshSpecification&&) = delete;
+
+    SkMeshSpecification& operator=(const SkMeshSpecification&) = delete;
+    SkMeshSpecification& operator=(SkMeshSpecification&&) = delete;
+
+    const std::vector<Attribute>               fAttributes;
+    const std::vector<Varying>                 fVaryings;
+    const std::vector<Uniform>                 fUniforms;
+    const std::vector<Child>                   fChildren;
+    const std::unique_ptr<const SkSL::Program> fVS;
+    const std::unique_ptr<const SkSL::Program> fFS;
+    const size_t                               fStride;
+          uint32_t                             fHash;
+    const int                                  fPassthroughLocalCoordsVaryingIndex;
+    const uint32_t                             fDeadVaryingMask;
+    const ColorType                            fColorType;
+    const sk_sp<SkColorSpace>                  fColorSpace;
+    const SkAlphaType                          fAlphaType;
+};
+
+class SK_API SkMesh {
+public:
+    class IndexBuffer : public SkRefCnt {
+    public:
+        virtual size_t size() const = 0;
+
+        bool update(GrDirectContext*, const void* data, size_t offset, size_t size);
+
+    private:
+        virtual bool onUpdate(GrDirectContext*, const void* data, size_t offset, size_t size) = 0;
+    };
+
+    class VertexBuffer : public SkRefCnt {
+    public:
+        virtual size_t size() const = 0;
+
+        bool update(GrDirectContext*, const void* data, size_t offset, size_t size);
+
+    private:
+        virtual bool onUpdate(GrDirectContext*, const void* data, size_t offset, size_t size) = 0;
+    };
+
+    SkMesh();
+    ~SkMesh();
+
+    SkMesh(const SkMesh&);
+    SkMesh(SkMesh&&);
+
+    SkMesh& operator=(const SkMesh&);
+    SkMesh& operator=(SkMesh&&);
+
+    enum class Mode { kTriangles, kTriangleStrip };
+
+    struct Result;
+
+    using ChildPtr = SkRuntimeEffect::ChildPtr;
+
+    static Result Make(sk_sp<SkMeshSpecification>,
+                       Mode,
+                       sk_sp<VertexBuffer>,
+                       size_t vertexCount,
+                       size_t vertexOffset,
+                       sk_sp<const SkData> uniforms,
+                       SkSpan<ChildPtr> children,
+                       const SkRect& bounds);
+
+    static Result MakeIndexed(sk_sp<SkMeshSpecification>,
+                              Mode,
+                              sk_sp<VertexBuffer>,
+                              size_t vertexCount,
+                              size_t vertexOffset,
+                              sk_sp<IndexBuffer>,
+                              size_t indexCount,
+                              size_t indexOffset,
+                              sk_sp<const SkData> uniforms,
+                              SkSpan<ChildPtr> children,
+                              const SkRect& bounds);
+
+    sk_sp<SkMeshSpecification> refSpec() const { return fSpec; }
+    SkMeshSpecification* spec() const { return fSpec.get(); }
+
+    Mode mode() const { return fMode; }
+
+    sk_sp<VertexBuffer> refVertexBuffer() const { return fVB; }
+    VertexBuffer* vertexBuffer() const { return fVB.get(); }
+
+    size_t vertexOffset() const { return fVOffset; }
+    size_t vertexCount()  const { return fVCount;  }
+
+    sk_sp<IndexBuffer> refIndexBuffer() const { return fIB; }
+    IndexBuffer* indexBuffer() const { return fIB.get(); }
+
+    size_t indexOffset() const { return fIOffset; }
+    size_t indexCount()  const { return fICount;  }
+
+    sk_sp<const SkData> refUniforms() const { return fUniforms; }
+    const SkData* uniforms() const { return fUniforms.get(); }
+
+    SkSpan<const ChildPtr> children() const { return SkSpan(fChildren); }
+
+    SkRect bounds() const { return fBounds; }
+
+    bool isValid() const;
+
+private:
+    std::tuple<bool, SkString> validate() const;
+
+    sk_sp<SkMeshSpecification> fSpec;
+
+    sk_sp<VertexBuffer> fVB;
+    sk_sp<IndexBuffer>  fIB;
+
+    sk_sp<const SkData> fUniforms;
+    skia_private::STArray<2, ChildPtr> fChildren;
+
+    size_t fVOffset = 0;  
+    size_t fVCount  = 0;
+
+    size_t fIOffset = 0;  
+    size_t fICount  = 0;
+
+    Mode fMode = Mode::kTriangles;
+
+    SkRect fBounds = SkRect::MakeEmpty();
+};
+
+struct SkMesh::Result { SkMesh mesh; SkString error; };
+
+namespace SkMeshes {
+SK_API sk_sp<SkMesh::IndexBuffer> MakeIndexBuffer(const void* data, size_t size);
+
+SK_API sk_sp<SkMesh::IndexBuffer> CopyIndexBuffer(const sk_sp<SkMesh::IndexBuffer>&);
+
+SK_API sk_sp<SkMesh::VertexBuffer> MakeVertexBuffer(const void*, size_t size);
+
+SK_API sk_sp<SkMesh::VertexBuffer> CopyVertexBuffer(const sk_sp<SkMesh::VertexBuffer>&);
+}  
+
+#endif

@@ -1,0 +1,38 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsCharsetSource_h_
+#define nsCharsetSource_h_
+
+enum nsCharsetSource {
+  kCharsetUninitialized,
+  kCharsetFromFallback,
+  kCharsetFromDocTypeDefault,  
+  kCharsetFromInitialAutoDetectionASCII,
+  kCharsetFromInitialAutoDetectionWouldHaveBeenUTF8,
+  kCharsetFromInitialAutoDetectionWouldNotHaveBeenUTF8Generic,
+  kCharsetFromInitialAutoDetectionWouldNotHaveBeenUTF8Content,
+  kCharsetFromInitialAutoDetectionWouldNotHaveBeenUTF8DependedOnTLD,
+  kCharsetFromParentFrame,  
+  kCharsetFromXmlDeclaration,
+  kCharsetFromMetaTag,
+  kCharsetFromChannel,
+  kCharsetFromOtherComponent,
+  kCharsetFromInitialUserForcedAutoDetection,
+  kCharsetFromFinalAutoDetectionWouldHaveBeenUTF8InitialWasASCII,
+  kCharsetFromFinalAutoDetectionWouldNotHaveBeenUTF8Generic,
+  kCharsetFromFinalAutoDetectionWouldNotHaveBeenUTF8GenericInitialWasASCII,
+  kCharsetFromFinalAutoDetectionWouldNotHaveBeenUTF8Content,
+  kCharsetFromFinalAutoDetectionWouldNotHaveBeenUTF8ContentInitialWasASCII,
+  kCharsetFromFinalAutoDetectionWouldNotHaveBeenUTF8DependedOnTLD,
+  kCharsetFromFinalAutoDetectionWouldNotHaveBeenUTF8DependedOnTLDInitialWasASCII,
+  kCharsetFromFinalAutoDetectionFile,
+  kCharsetFromFinalUserForcedAutoDetection,
+  kCharsetFromXmlDeclarationUtf16,  
+  kCharsetFromByteOrderMark,
+  kCharsetFromUtf8OnlyMime,  
+  kCharsetFromBuiltIn,       
+};
+
+#endif /* nsCharsetSource_h_ */

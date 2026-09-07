@@ -1,0 +1,64 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef jstypes_h
+#define jstypes_h
+
+#include "mozilla/Casting.h"
+#include "mozilla/Types.h"
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include "js-config.h"
+
+#if defined(STATIC_JS_API)
+#  define JS_PUBLIC_API
+#  define JS_PUBLIC_DATA
+#elif defined(EXPORT_JS_API) || defined(STATIC_EXPORTABLE_JS_API)
+#  define JS_PUBLIC_API MOZ_EXPORT
+#  define JS_PUBLIC_DATA MOZ_EXPORT
+#else
+#  define JS_PUBLIC_API MOZ_IMPORT_API
+#  define JS_PUBLIC_DATA MOZ_IMPORT_DATA
+#endif
+
+#define JS_BEGIN_MACRO do {
+#define JS_END_MACRO \
+  }                  \
+  while (0)
+
+namespace js {
+constexpr uint32_t Bit(uint32_t n) { return uint32_t(1) << n; }
+
+constexpr uint32_t BitMask(uint32_t n) { return Bit(n) - 1; }
+}  
+
+namespace js {
+constexpr size_t HowMany(size_t x, size_t y) { return (x + y - 1) / y; }
+
+constexpr size_t RoundUp(size_t x, size_t y) { return HowMany(x, y) * y; }
+
+constexpr size_t RoundDown(size_t x, size_t y) { return (x / y) * y; }
+
+constexpr size_t Round(size_t x, size_t y) { return ((x + y / 2) / y) * y; }
+}  
+
+#if (defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ == 8) || \
+    (defined(UINTPTR_MAX) && UINTPTR_MAX == 0xFFFFFFFFFFFFFFFFu)
+#  define JS_BITS_PER_WORD 64
+#else
+#  define JS_BITS_PER_WORD 32
+#endif
+
+static_assert(sizeof(void*) == 8 ? JS_BITS_PER_WORD == 64
+                                 : JS_BITS_PER_WORD == 32,
+              "preprocessor and compiler must agree");
+
+
+#define JS_FUNC_TO_DATA_PTR(type, fun) (mozilla::BitwiseCast<type>(fun))
+#define JS_DATA_TO_FUNC_PTR(type, ptr) (mozilla::BitwiseCast<type>(ptr))
+
+#endif /* jstypes_h */

@@ -1,0 +1,76 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_SRICheck_h
+#define mozilla_dom_SRICheck_h
+
+#include "mozilla/LoadTainting.h"
+#include "nsCOMPtr.h"
+#include "nsICryptoHash.h"
+#include "nsStringFwd.h"
+#include "nsTString.h"
+
+class nsIChannel;
+class nsIConsoleReportCollector;
+
+namespace mozilla::dom {
+
+class SRIMetadata;
+
+class SRICheck final {
+ public:
+  static nsresult IntegrityMetadata(const nsAString& aMetadataList,
+                                    const nsACString& aSourceFileURI,
+                                    nsIConsoleReportCollector* aReporter,
+                                    SRIMetadata* outMetadata);
+};
+
+class SRICheckDataVerifier final {
+ public:
+  SRICheckDataVerifier(const SRIMetadata& aMetadata, nsIChannel* aChannel,
+                       nsIConsoleReportCollector* aReporter);
+
+  nsresult Update(uint32_t aStringLen, const uint8_t* aString);
+  nsresult Update(Span<const uint8_t>);
+
+  nsresult Verify(const SRIMetadata& aMetadata, nsIChannel* aChannel,
+                  LoadTainting aLoadTainting,
+                  nsIConsoleReportCollector* aReporter);
+
+  nsresult Verify(const SRIMetadata& aMetadata, nsIChannel* aChannel,
+                  nsIConsoleReportCollector* aReporter);
+
+  bool IsComplete() const { return mComplete; }
+  bool IsInvalid() const { return mInvalidMetadata; }
+
+  uint32_t DataSummaryLength();
+  static uint32_t EmptyDataSummaryLength();
+
+  nsresult ExportDataSummary(uint32_t aDataLen, uint8_t* aData);
+  static nsresult ExportEmptyDataSummary(uint32_t aDataLen, uint8_t* aData);
+
+  static nsresult DataSummaryLength(uint32_t aDataLen, const uint8_t* aData,
+                                    uint32_t* length);
+
+  nsresult ImportDataSummary(uint32_t aDataLen, const uint8_t* aData);
+
+ private:
+  nsCOMPtr<nsICryptoHash> mCryptoHash;
+  nsAutoCString mComputedHash;
+  size_t mBytesHashed;
+  uint32_t mHashLength;
+  int8_t mHashType;
+  bool mInvalidMetadata;
+  bool mComplete;
+
+  nsresult EnsureCryptoHash();
+  nsresult Finish();
+  nsresult VerifyHash(nsIChannel* aChannel, const SRIMetadata& aMetadata,
+                      uint32_t aHashIndex,
+                      nsIConsoleReportCollector* aReporter);
+};
+
+}  
+
+#endif  // mozilla_dom_SRICheck_h

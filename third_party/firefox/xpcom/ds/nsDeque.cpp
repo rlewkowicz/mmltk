@@ -1,0 +1,167 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsDeque.h"
+#include "nsISupportsImpl.h"
+#include <string.h>
+
+#include "mozilla/CheckedInt.h"
+
+#define modulus(x, y) ((x) % (y))
+
+namespace mozilla {
+namespace detail {
+
+nsDequeBase::nsDequeBase() {
+  MOZ_COUNT_CTOR(nsDequeBase);
+  mOrigin = mSize = 0;
+  mData = mBuffer;  
+  mCapacity = sizeof(mBuffer) / sizeof(mBuffer[0]);
+  memset(mData, 0, mCapacity * sizeof(mBuffer[0]));
+}
+
+nsDequeBase::~nsDequeBase() {
+  MOZ_COUNT_DTOR(nsDequeBase);
+
+  if (mData && mData != mBuffer) {
+    free(mData);
+  }
+  mData = nullptr;
+}
+
+size_t nsDequeBase::SizeOfExcludingThis(
+    mozilla::MallocSizeOf aMallocSizeOf) const {
+  size_t size = 0;
+  if (mData != mBuffer) {
+    size += aMallocSizeOf(mData);
+  }
+
+  return size;
+}
+
+void nsDequeBase::Empty() {
+  if (mSize && mData) {
+    memset(mData, 0, mCapacity * sizeof(*mData));
+  }
+  mSize = 0;
+  mOrigin = 0;
+}
+
+bool nsDequeBase::GrowCapacity() {
+  mozilla::CheckedInt<size_t> newCapacity = mCapacity;
+  newCapacity *= 4;
+
+  NS_ASSERTION(newCapacity.isValid(), "Overflow");
+  if (!newCapacity.isValid()) {
+    return false;
+  }
+
+  mozilla::CheckedInt<size_t> newByteSize = newCapacity;
+  newByteSize *= sizeof(void*);
+
+  NS_ASSERTION(newByteSize.isValid(), "Overflow");
+  if (!newByteSize.isValid()) {
+    return false;
+  }
+
+  void** temp = (void**)malloc(newByteSize.value());
+  if (!temp) {
+    return false;
+  }
+
+
+  memcpy(temp, mData + mOrigin, sizeof(void*) * (mCapacity - mOrigin));
+  memcpy(temp + (mCapacity - mOrigin), mData, sizeof(void*) * mOrigin);
+
+  if (mData != mBuffer) {
+    free(mData);
+  }
+
+  mCapacity = newCapacity.value();
+  mOrigin = 0;  
+  mData = temp;
+
+  return true;
+}
+
+bool nsDequeBase::Push(void* aItem, const fallible_t&) {
+  if (mSize == mCapacity && !GrowCapacity()) {
+    return false;
+  }
+  mData[modulus(mOrigin + mSize, mCapacity)] = aItem;
+  mSize++;
+  return true;
+}
+
+bool nsDequeBase::PushFront(void* aItem, const fallible_t&) {
+  if (mOrigin == 0) {
+    mOrigin = mCapacity - 1;
+  } else {
+    mOrigin--;
+  }
+
+  if (mSize == mCapacity) {
+    if (!GrowCapacity()) {
+      return false;
+    }
+    mData[mSize] = mData[mOrigin];
+  }
+  mData[mOrigin] = aItem;
+  mSize++;
+  return true;
+}
+
+void* nsDequeBase::Pop() {
+  void* result = nullptr;
+  if (mSize > 0) {
+    --mSize;
+    size_t offset = modulus(mSize + mOrigin, mCapacity);
+    result = mData[offset];
+    mData[offset] = nullptr;
+    if (!mSize) {
+      mOrigin = 0;
+    }
+  }
+  return result;
+}
+
+void* nsDequeBase::PopFront() {
+  void* result = nullptr;
+  if (mSize > 0) {
+    NS_ASSERTION(mOrigin < mCapacity, "Error: Bad origin");
+    result = mData[mOrigin];
+    mData[mOrigin++] = nullptr;  
+    mSize--;
+    if (mCapacity == mOrigin || !mSize) {
+      mOrigin = 0;
+    }
+  }
+  return result;
+}
+
+void* nsDequeBase::Peek() const {
+  void* result = nullptr;
+  if (mSize > 0) {
+    result = mData[modulus(mSize - 1 + mOrigin, mCapacity)];
+  }
+  return result;
+}
+
+void* nsDequeBase::PeekFront() const {
+  void* result = nullptr;
+  if (mSize > 0) {
+    result = mData[mOrigin];
+  }
+  return result;
+}
+
+void* nsDequeBase::ObjectAt(size_t aIndex) const {
+  void* result = nullptr;
+  if (aIndex < mSize) {
+    result = mData[modulus(mOrigin + aIndex, mCapacity)];
+  }
+  return result;
+}
+}  
+}  

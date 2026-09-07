@@ -1,0 +1,393 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ViewTimeline.h"
+
+#include "mozilla/Keyframe.h"
+#include "mozilla/ScrollContainerFrame.h"
+#include "mozilla/ServoCSSParser.h"
+#include "mozilla/ServoStyleSet.h"
+#include "mozilla/dom/Animation.h"
+#include "mozilla/dom/CSSUnitValue.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/DocumentInlines.h"
+#include "mozilla/dom/ElementInlines.h"
+#include "mozilla/dom/ViewTimelineBinding.h"
+#include "nsComputedDOMStyle.h"
+#include "nsLayoutUtils.h"
+#include "nsPresContext.h"
+
+namespace mozilla::dom {
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED(ViewTimeline, ScrollTimeline, mSubject)
+NS_IMPL_ISUPPORTS_CYCLE_COLLECTION_INHERITED_0(ViewTimeline, ScrollTimeline)
+
+already_AddRefed<ViewTimeline> ViewTimeline::MakeNamed(
+    Document* aDocument, Element* aSubject,
+    const PseudoStyleRequest& aPseudoRequest, StyleScrollAxis aAxis,
+    const StyleViewTimelineInset& aInset) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  auto scroller = ScrollerInfo::Anonymous(
+      StyleScroller::Nearest,
+      NonOwningAnimationTarget{aSubject, aPseudoRequest});
+
+  return MakeAndAddRef<ViewTimeline>(aDocument, scroller, aAxis, aSubject,
+                                     aPseudoRequest.mType, aInset);
+}
+
+already_AddRefed<ViewTimeline> ViewTimeline::MakeAnonymous(
+    Document* aDocument, const NonOwningAnimationTarget& aTarget,
+    StyleScrollAxis aAxis, const StyleViewTimelineInset& aInset) {
+  auto scroller = ScrollerInfo::Anonymous(StyleScroller::Nearest, aTarget);
+  return MakeAndAddRef<ViewTimeline>(aDocument, scroller, aAxis,
+                                     aTarget.mElement,
+                                     aTarget.mPseudoRequest.mType, aInset);
+}
+
+JSObject* ViewTimeline::WrapObject(JSContext* aCx,
+                                   JS::Handle<JSObject*> aGivenProto) {
+  return ViewTimeline_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+static MOZ_CAN_RUN_SCRIPT Maybe<StyleViewTimelineInset>
+ParseAndComputeInsetString(const nsACString& aInsetString, Element* aSubject,
+                           const Document* aDocument) {
+  if (!aSubject) {
+    return Some(StyleViewTimelineInset());
+  }
+
+  RefPtr<const ComputedStyle> style = nsComputedDOMStyle::GetComputedStyle(
+      aSubject, PseudoStyleRequest::NotPseudo());
+  const StylePerDocumentStyleData* rawData =
+      aDocument->EnsureStyleSet().RawData();
+  StyleViewTimelineInset inset;
+  if (!ServoCSSParser::ParseAndComputeViewTimelineInset(
+          aInsetString, aSubject, style, rawData, inset)) {
+    return Nothing();
+  }
+  return Some(std::move(inset));
+}
+
+already_AddRefed<ViewTimeline> ViewTimeline::Constructor(
+    const GlobalObject& aGlobal, const ViewTimelineOptions& aOptions,
+    ErrorResult& aRv) {
+  RefPtr<Document> doc =
+      AnimationUtils::GetCurrentRealmDocument(aGlobal.Context());
+  if (!doc) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return nullptr;
+  }
+
+  RefPtr<Element> subject =
+      aOptions.mSubject.WasPassed() ? &aOptions.mSubject.Value() : nullptr;
+
+  StyleScrollAxis axis;
+  switch (aOptions.mAxis) {
+    case dom::ScrollAxis::Block:
+      axis = StyleScrollAxis::Block;
+      break;
+    case dom::ScrollAxis::Inline:
+      axis = StyleScrollAxis::Inline;
+      break;
+    case dom::ScrollAxis::X:
+      axis = StyleScrollAxis::X;
+      break;
+    case dom::ScrollAxis::Y:
+      axis = StyleScrollAxis::Y;
+      break;
+  }
+
+  StyleViewTimelineInset inset;
+  if (aOptions.mInset.IsUTF8String()) {
+    Maybe<StyleViewTimelineInset> value = ParseAndComputeInsetString(
+        aOptions.mInset.GetAsUTF8String(), subject, doc);
+    if (!value) {
+      aRv.ThrowTypeError("Invalid inset string");
+      return nullptr;
+    }
+    inset = std::move(*value);
+  } else {
+    if (!StaticPrefs::layout_css_typed_om_enabled()) {
+      aRv.Throw(NS_ERROR_DOM_NOT_SUPPORTED_ERR);
+      return nullptr;
+    }
+    aRv.ThrowTypeError("Unsupported");
+    return nullptr;
+  }
+
+  ScrollerInfo scroller = ScrollerInfo::Anonymous(
+      subject ? ScrollerInfo::Type::Nearest : ScrollerInfo::Type::Provided,
+      subject, PseudoStyleRequest::NotPseudo());
+
+  RefPtr<ViewTimeline> result = MakeAndAddRef<ViewTimeline>(
+      doc, scroller, axis, subject, PseudoStyleType::NotPseudo, inset);
+  if (subject) {
+    result->UpdateCachedCurrentTime();
+  }
+
+  return result.forget();
+}
+
+already_AddRefed<CSSNumericValue> ViewTimeline::GetStartOffset(
+    ErrorResult& aRv) const {
+  auto data = ComputeTimelineData();
+  if (!data) {
+    return nullptr;
+  }
+
+  if (!StaticPrefs::layout_css_typed_om_enabled()) {
+    aRv.Throw(NS_ERROR_DOM_NOT_SUPPORTED_ERR);
+    return nullptr;
+  }
+  return MakeCSSUnitValue(
+      GetParentObject(), StyleNumericType::Length(),
+      nsPresContext::AppUnitsToDoubleCSSPixels(data->mStart), "px"_ns);
+}
+
+already_AddRefed<CSSNumericValue> ViewTimeline::GetEndOffset(
+    ErrorResult& aRv) const {
+  auto data = ComputeTimelineData();
+  if (!data) {
+    return nullptr;
+  }
+
+  if (!StaticPrefs::layout_css_typed_om_enabled()) {
+    aRv.Throw(NS_ERROR_DOM_NOT_SUPPORTED_ERR);
+    return nullptr;
+  }
+  return MakeCSSUnitValue(GetParentObject(), StyleNumericType::Length(),
+                          nsPresContext::AppUnitsToDoubleCSSPixels(data->mEnd),
+                          "px"_ns);
+}
+
+void ViewTimeline::ReplacePropertiesWith(
+    Element* aSubjectElement, const PseudoStyleRequest& aPseudoRequest,
+    nsAtom* aName, StyleScrollAxis aAxis,
+    const StyleViewTimelineInset& aInset) {
+  mSubject = aSubjectElement;
+  mSubjectPseudoType = aPseudoRequest.mType;
+  mAxis = aAxis;
+  mInset = aInset;
+
+  for (auto* anim = mAnimationOrder.getFirst(); anim;
+       anim = static_cast<LinkedListElement<Animation>*>(anim)->getNext()) {
+    MOZ_ASSERT(anim->GetTimeline() == this);
+    MOZ_ASSERT(anim->GetTimelineName() == aName);
+    anim->SetTimeline(this, aName, Animation::FromJS::No);
+  }
+}
+
+static std::pair<nscoord, nscoord> ComputeInsets(
+    const ScrollContainerFrame* aScrollContainerFrame,
+    const layers::ScrollDirection aOrientation, const StyleScrollAxis aAxis,
+    const StyleViewTimelineInset& aInset) {
+  const WritingMode wm =
+      aScrollContainerFrame->GetScrolledFrame()->GetWritingMode();
+  const auto& scrollPadding =
+      LogicalMargin(wm, aScrollContainerFrame->GetScrollPadding());
+  const bool isBlockAxis = aAxis == StyleScrollAxis::Block ||
+                           (aAxis == StyleScrollAxis::X && wm.IsVertical()) ||
+                           (aAxis == StyleScrollAxis::Y && !wm.IsVertical());
+
+  const nsRect scrollPort = aScrollContainerFrame->GetScrollPortRect();
+  const nscoord percentageBasis =
+      aOrientation == layers::ScrollDirection::eHorizontal ? scrollPort.width
+                                                           : scrollPort.height;
+
+  nscoord startInset =
+      aInset.start.IsAuto()
+          ? (isBlockAxis ? scrollPadding.BStart(wm) : scrollPadding.IStart(wm))
+          : aInset.start.AsLengthPercentage().Resolve(percentageBasis);
+  nscoord endInset =
+      aInset.end.IsAuto()
+          ? (isBlockAxis ? scrollPadding.BEnd(wm) : scrollPadding.IEnd(wm))
+          : aInset.end.AsLengthPercentage().Resolve(percentageBasis);
+  return {startInset, endInset};
+}
+
+bool ViewTimeline::UpdateCachedCurrentTime() {
+  const auto prevCachedCurrentTime = std::move(mCachedCurrentTime);
+
+  mCachedCurrentTime.reset();
+
+  mCachedStateSnapshot = Some(ComputeSnapshot());
+  if (!mCachedStateSnapshot->IsActive()) {
+    return prevCachedCurrentTime.isSome();
+  }
+
+  const ScrollContainerFrame* scrollContainerFrame =
+      mCachedStateSnapshot->GetScrollContainerFrame();
+  MOZ_ASSERT(scrollContainerFrame);
+
+  if (scrollContainerFrame->HasAnyStateBits(NS_FRAME_FIRST_REFLOW)) {
+    return prevCachedCurrentTime.isSome();
+  }
+
+  MOZ_ASSERT(mSubject, "We should have a subject to create this view timeline");
+  const Element* subjectElement =
+      mSubject->GetPseudoElement(PseudoStyleRequest(mSubjectPseudoType));
+  const nsIFrame* subject =
+      subjectElement ? subjectElement->GetPrimaryFrame() : nullptr;
+  if (!subject) {
+    return prevCachedCurrentTime.isSome();
+  }
+
+  const nsPoint& scrollPosition = scrollContainerFrame->GetScrollPosition();
+  const nsRect& scrollRange = scrollContainerFrame->GetScrollRange();
+
+  const nsIFrame* scrolledFrame = scrollContainerFrame->GetScrolledFrame();
+  MOZ_ASSERT(scrolledFrame);
+  const nsRect subjectRect(subject->GetOffsetTo(scrolledFrame),
+                           subject->GetSize());
+
+  const nsRect scrollPort = scrollContainerFrame->GetScrollPortRect();
+
+  const auto orientation = mCachedStateSnapshot->Axis();
+  const auto sideInsets =
+      ComputeInsets(scrollContainerFrame, orientation, mAxis, mInset);
+
+  const WritingMode wm = scrolledFrame->GetWritingMode();
+  switch (orientation) {
+    case layers::ScrollDirection::eVertical: {
+      const bool isBottomToTop = wm.IsVertical() && wm.IsInlineReversed();
+      mCachedCurrentTime.emplace(CurrentTimeData{
+          ScrollTimeline::CurrentTimeData{scrollPosition.y, scrollRange.height},
+          scrollPort.height,
+          isBottomToTop ? scrolledFrame->GetSize().height - subjectRect.YMost()
+                        : subjectRect.y,
+          subjectRect.height, sideInsets.first, sideInsets.second});
+      break;
+    }
+    case layers::ScrollDirection::eHorizontal:
+      mCachedCurrentTime.emplace(CurrentTimeData{
+          ScrollTimeline::CurrentTimeData{scrollPosition.x, scrollRange.width},
+          scrollPort.width,
+          wm.IsPhysicalRTL()
+              ? scrolledFrame->GetSize().width - subjectRect.XMost()
+              : subjectRect.x,
+          subjectRect.width, sideInsets.first, sideInsets.second});
+      break;
+  }
+
+  if (!prevCachedCurrentTime ||
+      prevCachedCurrentTime->IsChanged(*mCachedCurrentTime)) {
+    TimelineDataDidChange();
+  }
+  return mCachedCurrentTime != prevCachedCurrentTime;
+}
+
+std::pair<nscoord, nscoord> ViewTimeline::IntervalForTimelineRangeName(
+    const StyleTimelineRangeName aName,
+    const ScrollTimeline::ComputedTimelineData& aData) const {
+  MOZ_ASSERT(mCachedCurrentTime, "We should have a cached current time");
+
+
+  const nscoord alignedSubjectStartViewEnd = aData.mStart;
+  const nscoord alignedSubjectEndViewStart = aData.mEnd;
+  const nscoord alignedSubjectStartViewStart =
+      alignedSubjectEndViewStart - mCachedCurrentTime->mSubjectSize;
+  const nscoord alignedSubjectEndViewEnd =
+      alignedSubjectStartViewEnd + mCachedCurrentTime->mSubjectSize;
+
+  const nscoord containStart =
+      std::min(alignedSubjectStartViewStart, alignedSubjectEndViewEnd);
+  const nscoord containEnd =
+      std::max(alignedSubjectStartViewStart, alignedSubjectEndViewEnd);
+
+  switch (aName) {
+    case StyleTimelineRangeName::None:
+    case StyleTimelineRangeName::Normal:
+    case StyleTimelineRangeName::Cover:
+      return {alignedSubjectStartViewEnd, alignedSubjectEndViewStart};
+
+    case StyleTimelineRangeName::Contain:
+      return {containStart, containEnd};
+
+    case StyleTimelineRangeName::Entry:
+      return {alignedSubjectStartViewEnd, containStart};
+
+    case StyleTimelineRangeName::Exit:
+      return {containEnd, alignedSubjectEndViewStart};
+
+    case StyleTimelineRangeName::EntryCrossing:
+      return {alignedSubjectStartViewEnd, alignedSubjectEndViewEnd};
+
+    case StyleTimelineRangeName::ExitCrossing:
+      return {alignedSubjectStartViewStart, alignedSubjectEndViewStart};
+
+    case StyleTimelineRangeName::Scroll:
+      return {0, mCachedCurrentTime->mScrollData.mMaxScrollOffset};
+  }
+
+  MOZ_ASSERT_UNREACHABLE("All cases should be handled.");
+  return {alignedSubjectStartViewEnd, alignedSubjectEndViewStart};
+}
+
+template <typename F>
+double ViewTimeline::ComputeOffsetToTimelineRange(
+    const StyleTimelineRangeName& aName,
+    const ScrollTimeline::ComputedTimelineData& aData,
+    F&& aFuncToResolveValue) const {
+  const auto [nameStart, nameEnd] = IntervalForTimelineRangeName(aName, aData);
+  const auto timelineRange = aData.mEnd - aData.mStart;
+  const auto nameRange = nameEnd - nameStart;
+  const auto positionInNameRange = nameStart + aFuncToResolveValue(nameRange);
+  const auto positionInTimeline = positionInNameRange - aData.mStart;
+  return static_cast<double>(positionInTimeline) /
+         static_cast<double>(timelineRange);
+}
+
+Maybe<double> ViewTimeline::MapKeyframeOffsetToOffset(
+    const StyleTimelineRangeName aName, const double aPercentage) const {
+  const auto& data = ComputeTimelineData();
+  if (!data) {
+    return Nothing();
+  }
+
+  return Some(ComputeOffsetToTimelineRange(
+      aName, *data,
+      [&](const nscoord aBasis) { return aPercentage * aBasis; }));
+}
+
+std::pair<double, double> ViewTimeline::IntervalForAttachmentRange(
+    const AnimationRange& aStyleRange) const {
+  const auto& data = ComputeTimelineData();
+  if (!data) {
+    return {0, 1.0};
+  }
+
+  auto computeNamedRangeEdgeAsPercentage =
+      [&](const StyleGenericAnimationRangeValue<StyleLengthPercentage>&
+              aValue) {
+        return ComputeOffsetToTimelineRange(
+            aValue.name, *data,
+            [&](const nscoord aBasis) { return aValue.lp.Resolve(aBasis); });
+      };
+  return {computeNamedRangeEdgeAsPercentage(aStyleRange.mStart),
+          computeNamedRangeEdgeAsPercentage(aStyleRange.mEnd)};
+}
+
+Maybe<ScrollTimeline::ComputedTimelineData> ViewTimeline::ComputeTimelineData()
+    const {
+  if (!mCachedCurrentTime) {
+    return Nothing();
+  }
+
+  const CurrentTimeData& data = mCachedCurrentTime.ref();
+
+
+  const nscoord startOffset =
+      data.mSubjectPosition - data.mScrollPortSize + data.mInsetEnd;
+  const nscoord endOffset =
+      data.mSubjectPosition + data.mSubjectSize - data.mInsetStart;
+
+  return Some(ComputedTimelineData{
+      data.mScrollData.mPosition,
+      startOffset,
+      endOffset,
+  });
+}
+
+}  

@@ -1,0 +1,53 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layout_ScrollSnap_h_
+#define mozilla_layout_ScrollSnap_h_
+
+#include "mozilla/Maybe.h"
+#include "mozilla/ScrollSnapInfo.h"
+#include "mozilla/ScrollSnapTargetId.h"
+#include "mozilla/ScrollTypes.h"
+
+class nsIContent;
+class nsIFrame;
+struct nsPoint;
+struct nsRect;
+struct nsSize;
+
+namespace mozilla {
+
+struct ScrollSnapInfo;
+
+struct ScrollSnapUtils {
+  static Maybe<SnapDestination> GetSnapPointForDestination(
+      const ScrollSnapInfo& aSnapInfo, ScrollUnit aUnit,
+      ScrollSnapFlags aSnapFlags, const nsRect& aScrollRange,
+      const nsPoint& aStartPos, const nsPoint& aDestination);
+
+
+  static mozilla::Maybe<SnapDestination> GetSnapPointForResnap(
+      const ScrollSnapInfo& aSnapInfo, const nsRect& aScrollRange,
+      const nsPoint& aCurrentPosition,
+      const UniquePtr<ScrollSnapTargetIds>& aLastSnapTargetIds,
+      const nsIContent* aFocusedContent, const nsIContent* aTargetContent,
+      const WritingMode aWritingMode);
+
+  static ScrollSnapTargetId GetTargetIdFor(const nsIFrame* aFrame);
+
+  static void PostPendingResnapIfNeededFor(nsIFrame* aFrame);
+
+  static void PostPendingResnapFor(nsIFrame* aFrame);
+
+  static bool NeedsToRespectTargetWritingMode(const nsSize& aSnapAreaSize,
+                                              const nsSize& aSnapportSize);
+
+  static nsRect GetSnapAreaFor(const nsIFrame* aFrame,
+                               const nsIFrame* aScrolledFrame,
+                               const nsRect& aScrolledRect);
+};
+
+}  
+
+#endif  // mozilla_layout_ScrollSnap_h_

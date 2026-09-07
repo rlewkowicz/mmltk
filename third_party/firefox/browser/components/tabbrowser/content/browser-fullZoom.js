@@ -1,0 +1,464 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+var FullZoom = {
+  name: "browser.content.full-zoom",
+
+  _siteSpecificPref: undefined,
+
+  updateBackgroundTabs: undefined,
+
+  _browserTokenMap: new WeakMap(),
+
+  _initialLocations: new WeakMap(),
+
+  get siteSpecific() {
+    if (this._siteSpecificPref === undefined) {
+      this._siteSpecificPref = Services.prefs.getBoolPref(
+        "browser.zoom.siteSpecific"
+      );
+    }
+    return this._siteSpecificPref;
+  },
+
+
+  QueryInterface: ChromeUtils.generateQI([
+    "nsIObserver",
+    "nsIContentPrefObserver",
+    "nsISupportsWeakReference",
+  ]),
+
+
+  init: function FullZoom_init() {
+    gBrowser.addEventListener("DoZoomEnlarge", this);
+    gBrowser.addEventListener("DoZoomReduce", this);
+    window.addEventListener("MozScaleGestureComplete", this);
+
+    this._cps2 = Cc["@mozilla.org/content-pref/service;1"].getService(
+      Ci.nsIContentPrefService2
+    );
+    this._cps2.addObserverForName(this.name, this);
+
+    this.updateBackgroundTabs = Services.prefs.getBoolPref(
+      "browser.zoom.updateBackgroundTabs"
+    );
+
+    Services.prefs.addObserver("browser.zoom.", this, true);
+
+    for (let browser of gBrowser.browsers) {
+      if (this._initialLocations.has(browser)) {
+        this.onLocationChange(...this._initialLocations.get(browser), browser);
+      }
+    }
+
+    this._initialLocations = null;
+  },
+
+  destroy: function FullZoom_destroy() {
+    Services.prefs.removeObserver("browser.zoom.", this);
+    this._cps2.removeObserverForName(this.name, this);
+    gBrowser.removeEventListener("DoZoomEnlarge", this);
+    gBrowser.removeEventListener("DoZoomReduce", this);
+    window.removeEventListener("MozScaleGestureComplete", this);
+  },
+
+
+
+  handleEvent: function FullZoom_handleEvent(event) {
+    switch (event.type) {
+      case "DoZoomEnlarge":
+        this.enlarge(this._getTargetedBrowser(event));
+        break;
+      case "DoZoomReduce":
+        this.reduce(this._getTargetedBrowser(event));
+        break;
+      case "MozScaleGestureComplete": {
+        let nonDefaultScalingZoom = event.detail != 1.0;
+        this.updateCommands(nonDefaultScalingZoom);
+        break;
+      }
+    }
+  },
+
+
+  observe(aSubject, aTopic, aData) {
+    switch (aTopic) {
+      case "nsPref:changed":
+        switch (aData) {
+          case "browser.zoom.siteSpecific":
+            this._siteSpecificPref = undefined;
+            break;
+          case "browser.zoom.updateBackgroundTabs":
+            this.updateBackgroundTabs = Services.prefs.getBoolPref(
+              "browser.zoom.updateBackgroundTabs"
+            );
+            break;
+          case "browser.zoom.full": {
+            this.updateCommands();
+            break;
+          }
+        }
+        break;
+    }
+  },
+
+
+  onContentPrefSet: function FullZoom_onContentPrefSet(
+    aGroup,
+    aName,
+    aValue,
+    aIsPrivate
+  ) {
+    this._onContentPrefChanged(aGroup, aValue, aIsPrivate);
+  },
+
+  onContentPrefRemoved: function FullZoom_onContentPrefRemoved(
+    aGroup,
+    aName,
+    aIsPrivate
+  ) {
+    this._onContentPrefChanged(aGroup, undefined, aIsPrivate);
+  },
+
+  _onContentPrefChanged: function FullZoom__onContentPrefChanged(
+    aGroup,
+    aValue,
+    aIsPrivate
+  ) {
+    if (this._isNextContentPrefChangeInternal) {
+      delete this._isNextContentPrefChangeInternal;
+      return;
+    }
+
+    let browser = gBrowser.selectedBrowser;
+    if (!browser.currentURI) {
+      return;
+    }
+
+    if (this._isPDFViewer(browser)) {
+      return;
+    }
+
+    let ctxt = this._loadContextFromBrowser(browser);
+    let domain = this._cps2.extractDomain(browser.currentURI.spec);
+    if (aGroup) {
+      if (aGroup == domain && ctxt.usePrivateBrowsing == aIsPrivate) {
+        this._applyPrefToZoom(aValue, browser);
+      }
+      return;
+    }
+
+    let hasPref = false;
+    let token = this._getBrowserToken(browser);
+    this._cps2.getByDomainAndName(browser.currentURI.spec, this.name, ctxt, {
+      handleResult() {
+        hasPref = true;
+      },
+      handleCompletion: () => {
+        if (!hasPref && token.isCurrent) {
+          this._applyPrefToZoom(undefined, browser);
+        }
+      },
+    });
+  },
+
+
+  onLocationChange: function FullZoom_onLocationChange(
+    aURI,
+    aIsTabSwitch,
+    aBrowser
+  ) {
+    let browser = aBrowser || gBrowser.selectedBrowser;
+
+    if (this._initialLocations) {
+      this._initialLocations.set(browser, [aURI, aIsTabSwitch]);
+      return;
+    }
+
+    this._ignorePendingZoomAccesses(browser);
+
+    if (!aURI || (aIsTabSwitch && !this.siteSpecific)) {
+      this._notifyOnLocationChange(browser);
+      return;
+    }
+
+    if (aURI.spec == "about:blank") {
+      if (
+        !browser.contentPrincipal ||
+        browser.contentPrincipal.isNullPrincipal
+      ) {
+        this._applyPrefToZoom(
+          1,
+          browser,
+          this._notifyOnLocationChange.bind(this, browser)
+        );
+      } else {
+        this._applyPrefToZoom(
+          undefined,
+          browser,
+          this._notifyOnLocationChange.bind(this, browser)
+        );
+      }
+      return;
+    }
+
+    if (!aIsTabSwitch && browser.isSyntheticDocument) {
+      ZoomManager.setZoomForBrowser(browser, 1);
+      this._notifyOnLocationChange(browser);
+      return;
+    }
+
+    if (this._isPDFViewer(browser)) {
+      this._applyPrefToZoom(
+        1,
+        browser,
+        this._notifyOnLocationChange.bind(this, browser)
+      );
+      return;
+    }
+
+    let ctxt = this._loadContextFromBrowser(browser);
+    let pref = this._cps2.getCachedByDomainAndName(aURI.spec, this.name, ctxt);
+    if (pref) {
+      this._applyPrefToZoom(
+        pref.value,
+        browser,
+        this._notifyOnLocationChange.bind(this, browser)
+      );
+      return;
+    }
+
+    let value = undefined;
+    let token = this._getBrowserToken(browser);
+    this._cps2.getByDomainAndName(aURI.spec, this.name, ctxt, {
+      handleResult(resultPref) {
+        value = resultPref.value;
+      },
+      handleCompletion: () => {
+        if (!token.isCurrent) {
+          this._notifyOnLocationChange(browser);
+          return;
+        }
+        this._applyPrefToZoom(
+          value,
+          browser,
+          this._notifyOnLocationChange.bind(this, browser)
+        );
+      },
+    });
+  },
+
+
+  updateCommands: async function FullZoom_updateCommands(
+    forceResetEnabled = false
+  ) {
+    let zoomLevel = ZoomManager.zoom;
+    let defaultZoomLevel = await ZoomUI.getGlobalValue();
+    let reduceCmd = document.getElementById("cmd_fullZoomReduce");
+    if (zoomLevel == ZoomManager.MIN) {
+      reduceCmd.setAttribute("disabled", "true");
+    } else {
+      reduceCmd.removeAttribute("disabled");
+    }
+
+    let enlargeCmd = document.getElementById("cmd_fullZoomEnlarge");
+    if (zoomLevel == ZoomManager.MAX) {
+      enlargeCmd.setAttribute("disabled", "true");
+    } else {
+      enlargeCmd.removeAttribute("disabled");
+    }
+
+    let resetCmd = document.getElementById("cmd_fullZoomReset");
+    if (zoomLevel == defaultZoomLevel && !forceResetEnabled) {
+      resetCmd.setAttribute("disabled", "true");
+    } else {
+      resetCmd.removeAttribute("disabled");
+    }
+
+    let fullZoomCmd = document.getElementById("cmd_fullZoomToggle");
+    fullZoomCmd.toggleAttribute("checked", !ZoomManager.useFullZoom);
+  },
+
+
+  async reduce(aBrowser = gBrowser.selectedBrowser) {
+    ZoomManager.reduceForBrowser(aBrowser);
+    this._ignorePendingZoomAccesses(aBrowser);
+    await this._applyZoomToPref(aBrowser);
+  },
+
+  async enlarge(aBrowser = gBrowser.selectedBrowser) {
+    ZoomManager.enlargeForBrowser(aBrowser);
+    this._ignorePendingZoomAccesses(aBrowser);
+    await this._applyZoomToPref(aBrowser);
+  },
+
+  setZoom(value, browser = gBrowser.selectedBrowser) {
+    ZoomManager.setZoomForBrowser(browser, value);
+    this._ignorePendingZoomAccesses(browser);
+    this._applyZoomToPref(browser);
+  },
+
+  reset: function FullZoom_reset(browser = gBrowser.selectedBrowser) {
+    let token = this._getBrowserToken(browser);
+    let result = ZoomUI.getGlobalValue().then(value => {
+      if (token.isCurrent) {
+        ZoomManager.setZoomForBrowser(browser, value);
+        this._ignorePendingZoomAccesses(browser);
+      }
+    });
+    this._removePref(browser);
+    return result;
+  },
+
+  resetFromURLBar() {
+    this.reset();
+    this.resetScalingZoom();
+  },
+
+  resetScalingZoom: function FullZoom_resetScaling(
+    browser = gBrowser.selectedBrowser
+  ) {
+    browser.browsingContext?.resetScalingZoom();
+  },
+
+  _applyPrefToZoom: function FullZoom__applyPrefToZoom(
+    aValue,
+    aBrowser,
+    aCallback
+  ) {
+    if (
+      !aBrowser.mInitialized ||
+      aBrowser.isSyntheticDocument ||
+      (!this.siteSpecific && aBrowser.tabHasCustomZoom)
+    ) {
+      this._executeSoon(aCallback);
+      return;
+    }
+
+    if (aValue !== undefined && this.siteSpecific) {
+      ZoomManager.setZoomForBrowser(aBrowser, this._ensureValid(aValue));
+      this._ignorePendingZoomAccesses(aBrowser);
+      this._executeSoon(aCallback);
+      return;
+    }
+
+    let token = this._getBrowserToken(aBrowser);
+    ZoomUI.getGlobalValue().then(value => {
+      if (token.isCurrent) {
+        ZoomManager.setZoomForBrowser(aBrowser, value);
+        this._ignorePendingZoomAccesses(aBrowser);
+      }
+      this._executeSoon(aCallback);
+    });
+  },
+
+  _applyZoomToPref: function FullZoom__applyZoomToPref(browser) {
+    if (!this.siteSpecific || browser.isSyntheticDocument) {
+      browser.tabHasCustomZoom = !this.siteSpecific;
+      return null;
+    }
+
+    return new Promise(resolve => {
+      this._cps2.set(
+        browser.currentURI.spec,
+        this.name,
+        ZoomManager.getZoomForBrowser(browser),
+        this._loadContextFromBrowser(browser),
+        {
+          handleCompletion: () => {
+            this._isNextContentPrefChangeInternal = true;
+            resolve();
+          },
+        }
+      );
+    });
+  },
+
+  _removePref: function FullZoom__removePref(browser) {
+    if (browser.isSyntheticDocument) {
+      return;
+    }
+    let ctxt = this._loadContextFromBrowser(browser);
+    this._cps2.removeByDomainAndName(browser.currentURI.spec, this.name, ctxt, {
+      handleCompletion: () => {
+        this._isNextContentPrefChangeInternal = true;
+      },
+    });
+  },
+
+
+  _getBrowserToken: function FullZoom__getBrowserToken(browser) {
+    let map = this._browserTokenMap;
+    if (!map.has(browser)) {
+      map.set(browser, 0);
+    }
+    return {
+      token: map.get(browser),
+      get isCurrent() {
+        return map.get(browser) === this.token && browser.mInitialized;
+      },
+    };
+  },
+
+  _getTargetedBrowser: function FullZoom__getTargetedBrowser(event) {
+    let target = event.originalTarget;
+
+    const XUL_NS =
+      "http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul";
+    if (
+      window.XULElement.isInstance(target) &&
+      target.localName == "browser" &&
+      target.namespaceURI == XUL_NS
+    ) {
+      return target;
+    }
+
+    if (target.nodeType == Node.DOCUMENT_NODE) {
+      return target.documentGlobal.docShell.chromeEventHandler;
+    }
+
+    throw new Error("Unexpected zoom event source");
+  },
+
+  _ignorePendingZoomAccesses: function FullZoom__ignorePendingZoomAccesses(
+    browser
+  ) {
+    let map = this._browserTokenMap;
+    map.set(browser, (map.get(browser) || 0) + 1);
+  },
+
+  _ensureValid: function FullZoom__ensureValid(aValue) {
+    if (isNaN(aValue)) {
+      return 1;
+    }
+
+    if (aValue < ZoomManager.MIN) {
+      return ZoomManager.MIN;
+    }
+
+    if (aValue > ZoomManager.MAX) {
+      return ZoomManager.MAX;
+    }
+
+    return aValue;
+  },
+
+  _loadContextFromBrowser: function FullZoom__loadContextFromBrowser(browser) {
+    return browser.loadContext;
+  },
+
+  _notifyOnLocationChange: function FullZoom__notifyOnLocationChange(browser) {
+    this._executeSoon(function () {
+      Services.obs.notifyObservers(browser, "browser-fullZoom:location-change");
+    });
+  },
+
+  _executeSoon: function FullZoom__executeSoon(callback) {
+    if (!callback) {
+      return;
+    }
+    Services.tm.dispatchToMainThread(callback);
+  },
+
+};

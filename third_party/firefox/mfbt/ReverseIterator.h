@@ -1,0 +1,156 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_ReverseIterator_h
+#define mozilla_ReverseIterator_h
+
+#include <utility>
+
+namespace mozilla {
+
+template <typename IteratorT>
+class ReverseIterator {
+ public:
+  using value_type = typename IteratorT::value_type;
+  using pointer = typename IteratorT::pointer;
+  using reference = typename IteratorT::reference;
+  using difference_type = typename IteratorT::difference_type;
+  using iterator_category = typename IteratorT::iterator_category;
+
+  explicit ReverseIterator(IteratorT aIter) : mCurrent(std::move(aIter)) {}
+
+  decltype(*std::declval<IteratorT>()) operator*() const {
+    IteratorT tmp = mCurrent;
+    return *--tmp;
+  }
+
+  difference_type operator-(const ReverseIterator& aOther) const {
+    return aOther.mCurrent - mCurrent;
+  }
+
+
+  ReverseIterator& operator++() {
+    --mCurrent;
+    return *this;
+  }
+  ReverseIterator& operator--() {
+    ++mCurrent;
+    return *this;
+  }
+  ReverseIterator operator++(int) {
+    auto ret = *this;
+    mCurrent--;
+    return ret;
+  }
+  ReverseIterator operator--(int) {
+    auto ret = *this;
+    mCurrent++;
+    return ret;
+  }
+
+
+  template <typename Iterator1, typename Iterator2>
+  friend bool operator==(const ReverseIterator<Iterator1>& aIter1,
+                         const ReverseIterator<Iterator2>& aIter2);
+  template <typename Iterator1, typename Iterator2>
+  friend bool operator!=(const ReverseIterator<Iterator1>& aIter1,
+                         const ReverseIterator<Iterator2>& aIter2);
+  template <typename Iterator1, typename Iterator2>
+  friend bool operator<(const ReverseIterator<Iterator1>& aIter1,
+                        const ReverseIterator<Iterator2>& aIter2);
+  template <typename Iterator1, typename Iterator2>
+  friend bool operator<=(const ReverseIterator<Iterator1>& aIter1,
+                         const ReverseIterator<Iterator2>& aIter2);
+  template <typename Iterator1, typename Iterator2>
+  friend bool operator>(const ReverseIterator<Iterator1>& aIter1,
+                        const ReverseIterator<Iterator2>& aIter2);
+  template <typename Iterator1, typename Iterator2>
+  friend bool operator>=(const ReverseIterator<Iterator1>& aIter1,
+                         const ReverseIterator<Iterator2>& aIter2);
+
+ private:
+  IteratorT mCurrent;
+};
+
+template <typename Iterator1, typename Iterator2>
+bool operator==(const ReverseIterator<Iterator1>& aIter1,
+                const ReverseIterator<Iterator2>& aIter2) {
+  return aIter1.mCurrent == aIter2.mCurrent;
+}
+
+template <typename Iterator1, typename Iterator2>
+bool operator!=(const ReverseIterator<Iterator1>& aIter1,
+                const ReverseIterator<Iterator2>& aIter2) {
+  return aIter1.mCurrent != aIter2.mCurrent;
+}
+
+template <typename Iterator1, typename Iterator2>
+bool operator<(const ReverseIterator<Iterator1>& aIter1,
+               const ReverseIterator<Iterator2>& aIter2) {
+  return aIter1.mCurrent > aIter2.mCurrent;
+}
+
+template <typename Iterator1, typename Iterator2>
+bool operator<=(const ReverseIterator<Iterator1>& aIter1,
+                const ReverseIterator<Iterator2>& aIter2) {
+  return aIter1.mCurrent >= aIter2.mCurrent;
+}
+
+template <typename Iterator1, typename Iterator2>
+bool operator>(const ReverseIterator<Iterator1>& aIter1,
+               const ReverseIterator<Iterator2>& aIter2) {
+  return aIter1.mCurrent < aIter2.mCurrent;
+}
+
+template <typename Iterator1, typename Iterator2>
+bool operator>=(const ReverseIterator<Iterator1>& aIter1,
+                const ReverseIterator<Iterator2>& aIter2) {
+  return aIter1.mCurrent <= aIter2.mCurrent;
+}
+
+namespace detail {
+
+template <typename IteratorT,
+          typename ReverseIteratorT = ReverseIterator<IteratorT>>
+class IteratorRange {
+ public:
+  typedef IteratorT iterator;
+  typedef IteratorT const_iterator;
+  typedef ReverseIteratorT reverse_iterator;
+  typedef ReverseIteratorT const_reverse_iterator;
+
+  IteratorRange(IteratorT aIterBegin, IteratorT aIterEnd)
+      : mIterBegin(std::move(aIterBegin)), mIterEnd(std::move(aIterEnd)) {}
+
+  iterator begin() const { return mIterBegin; }
+  const_iterator cbegin() const { return begin(); }
+  iterator end() const { return mIterEnd; }
+  const_iterator cend() const { return end(); }
+  reverse_iterator rbegin() const { return reverse_iterator(mIterEnd); }
+  const_reverse_iterator crbegin() const { return rbegin(); }
+  reverse_iterator rend() const { return reverse_iterator(mIterBegin); }
+  const_reverse_iterator crend() const { return rend(); }
+
+  IteratorT mIterBegin;
+  IteratorT mIterEnd;
+};
+
+}  
+
+template <typename Range>
+detail::IteratorRange<typename Range::reverse_iterator> Reversed(
+    Range& aRange) {
+  return {aRange.rbegin(), aRange.rend()};
+}
+
+template <typename Range>
+detail::IteratorRange<typename Range::const_reverse_iterator> Reversed(
+    const Range& aRange) {
+  return {aRange.rbegin(), aRange.rend()};
+}
+
+}  
+
+#endif  // mozilla_ReverseIterator_h

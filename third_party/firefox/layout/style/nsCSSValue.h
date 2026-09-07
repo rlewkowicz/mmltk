@@ -1,0 +1,120 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsCSSValue_h_
+#define nsCSSValue_h_
+
+#include "nsCoord.h"
+
+struct RawServoCssUrlData;
+
+namespace mozilla {
+struct URLExtraData;
+class CSSStyleSheet;
+}  
+
+extern "C" {
+mozilla::URLExtraData* Servo_CssUrlData_GetExtraData(const RawServoCssUrlData*);
+bool Servo_CssUrlData_IsLocalRef(const RawServoCssUrlData* url);
+}
+
+enum nsCSSUnit : uint32_t {
+  eCSSUnit_Null = 0,  
+
+  eCSSUnit_Percent = 100,  
+  eCSSUnit_Number = 101,   
+
+  eCSSUnit_EM = 800,               
+  eCSSUnit_XHeight = 801,          
+  eCSSUnit_Char = 802,             
+  eCSSUnit_RootEM = 803,           
+  eCSSUnit_Ideographic = 804,      
+  eCSSUnit_CapHeight = 805,        
+  eCSSUnit_LineHeight = 806,       
+  eCSSUnit_RootLineHeight = 807,   
+  eCSSUnit_RootXHeight = 808,      
+  eCSSUnit_RootChar = 809,         
+  eCSSUnit_RootIdeographic = 810,  
+  eCSSUnit_RootCapHeight = 811,    
+
+  eCSSUnit_Point = 900,       
+  eCSSUnit_Inch = 901,        
+  eCSSUnit_Millimeter = 902,  
+  eCSSUnit_Centimeter = 903,  
+  eCSSUnit_Pica = 904,        
+  eCSSUnit_Quarter = 905,     
+  eCSSUnit_Pixel = 906,       
+
+  eCSSUnit_VW = 950,
+  eCSSUnit_VH = 951,
+  eCSSUnit_VMin = 952,
+  eCSSUnit_VMax = 953,
+
+  eCSSUnit_LastLength = eCSSUnit_VMax,
+};
+
+struct nsCSSValuePair;
+struct nsCSSValuePair_heap;
+struct nsCSSValueList;
+struct nsCSSValueList_heap;
+struct nsCSSValueSharedList;
+struct nsCSSValuePairList;
+struct nsCSSValuePairList_heap;
+
+class nsCSSValue {
+ public:
+  explicit nsCSSValue() : mUnit(eCSSUnit_Null) {}
+
+  nsCSSValue(float aValue, nsCSSUnit aUnit);
+  nsCSSValue(const nsCSSValue& aCopy);
+  nsCSSValue(nsCSSValue&& aOther) : mUnit(aOther.mUnit), mValue(aOther.mValue) {
+    aOther.mUnit = eCSSUnit_Null;
+  }
+
+  nsCSSValue& operator=(const nsCSSValue& aCopy);
+  nsCSSValue& operator=(nsCSSValue&& aCopy);
+
+  bool operator==(const nsCSSValue& aOther) const;
+  bool operator!=(const nsCSSValue&) const = default;
+
+  nsCSSUnit GetUnit() const { return mUnit; }
+  bool IsLengthUnit() const {
+    return eCSSUnit_EM <= mUnit && mUnit <= eCSSUnit_LastLength;
+  }
+  static bool IsPixelLengthUnit(nsCSSUnit aUnit) {
+    return eCSSUnit_Point <= aUnit && aUnit <= eCSSUnit_Pixel;
+  }
+  bool IsPixelLengthUnit() const { return IsPixelLengthUnit(mUnit); }
+  static bool IsPercentLengthUnit(nsCSSUnit aUnit) {
+    return aUnit == eCSSUnit_Percent;
+  }
+  static bool IsFloatUnit(nsCSSUnit aUnit) { return eCSSUnit_Number <= aUnit; }
+
+  float GetPercentValue() const {
+    MOZ_ASSERT(mUnit == eCSSUnit_Percent, "not a percent value");
+    return mValue;
+  }
+
+  float GetFloatValue() const {
+    MOZ_ASSERT(eCSSUnit_Number <= mUnit, "not a float value");
+    MOZ_ASSERT(!std::isnan(mValue));
+    return mValue;
+  }
+
+  nscoord GetPixelLength() const;
+
+  void Reset() { mUnit = eCSSUnit_Null; }
+  ~nsCSSValue() { Reset(); }
+
+ public:
+  void SetPercentValue(float aValue);
+  void SetFloatValue(float aValue, nsCSSUnit aUnit);
+
+ protected:
+  nsCSSUnit mUnit;
+  float mValue;
+};
+
+#endif /* nsCSSValue_h_ */

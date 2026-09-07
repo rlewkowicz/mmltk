@@ -1,0 +1,32 @@
+
+[package]
+edition = "2021"
+rust-version = "1.64"
+name = "raw-window-handle"
+version = "0.6.2"
+authors = ["Osspial <osspial@gmail.com>"]
+build = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Interoperability library for Rust Windowing applications."
+documentation = "https://docs.rs/raw-window-handle"
+keywords = ["windowing"]
+license = "MIT OR Apache-2.0 OR Zlib"
+repository = "https://github.com/rust-windowing/raw-window-handle"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = [
+    "--cfg",
+    "docsrs",
+]
+
+[lib]
+name = "raw_window_handle"
+path = "src/lib.rs"
+
+[features]
+alloc = []
+std = ["alloc"]

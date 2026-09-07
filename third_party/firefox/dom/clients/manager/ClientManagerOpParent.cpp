@@ -1,0 +1,78 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ClientManagerOpParent.h"
+
+#include "ClientManagerService.h"
+#include "mozilla/dom/PClientManagerParent.h"
+#include "mozilla/ipc/BackgroundParent.h"
+
+namespace mozilla::dom {
+
+using mozilla::ipc::BackgroundParent;
+
+template <typename Method, typename... Args>
+void ClientManagerOpParent::DoServiceOp(Method aMethod, Args&&... aArgs) {
+  ThreadsafeContentParentHandle* originContent =
+      BackgroundParent::GetContentParentHandle(Manager()->Manager());
+
+  RefPtr<ClientOpPromise> p =
+      (mService->*aMethod)(originContent, std::forward<Args>(aArgs)...);
+
+  p->Then(
+       GetCurrentSerialEventTarget(), __func__,
+       [this](const mozilla::dom::ClientOpResult& aResult) {
+         mPromiseRequestHolder.Complete();
+         (void)PClientManagerOpParent::Send__delete__(this, aResult);
+       },
+       [this](const CopyableErrorResult& aRv) {
+         mPromiseRequestHolder.Complete();
+         (void)PClientManagerOpParent::Send__delete__(this, aRv);
+       })
+      ->Track(mPromiseRequestHolder);
+}
+
+void ClientManagerOpParent::ActorDestroy(ActorDestroyReason aReason) {
+  mPromiseRequestHolder.DisconnectIfExists();
+}
+
+ClientManagerOpParent::ClientManagerOpParent(ClientManagerService* aService)
+    : mService(aService) {
+  MOZ_DIAGNOSTIC_ASSERT(mService);
+}
+
+void ClientManagerOpParent::Init(const ClientOpConstructorArgs& aArgs) {
+  switch (aArgs.type()) {
+    case ClientOpConstructorArgs::TClientNavigateArgs: {
+      DoServiceOp(&ClientManagerService::Navigate,
+                  aArgs.get_ClientNavigateArgs());
+      break;
+    }
+    case ClientOpConstructorArgs::TClientMatchAllArgs: {
+      DoServiceOp(&ClientManagerService::MatchAll,
+                  aArgs.get_ClientMatchAllArgs());
+      break;
+    }
+    case ClientOpConstructorArgs::TClientClaimArgs: {
+      DoServiceOp(&ClientManagerService::Claim, aArgs.get_ClientClaimArgs());
+      break;
+    }
+    case ClientOpConstructorArgs::TClientGetInfoAndStateArgs: {
+      DoServiceOp(&ClientManagerService::GetInfoAndState,
+                  aArgs.get_ClientGetInfoAndStateArgs());
+      break;
+    }
+    case ClientOpConstructorArgs::TClientOpenWindowArgs: {
+      DoServiceOp(&ClientManagerService::OpenWindow,
+                  aArgs.get_ClientOpenWindowArgs());
+      break;
+    }
+    default: {
+      MOZ_ASSERT_UNREACHABLE("Unknown Client operation!");
+      break;
+    }
+  }
+}
+
+}  

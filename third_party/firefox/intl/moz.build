@@ -1,0 +1,26 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+DIRS += [
+    "bidi",
+    "build",
+    "components",
+    "l10n",
+    "locale",
+    "lwbrk",
+    "strres",
+    "uconv",
+    "unicharutil",
+]
+
+EXPORTS.mozilla += [
+    "Encoding.h",
+    "EncodingDetector.h",
+]
+
+EXPORTS += [
+    "../third_party/rust/chardetng_c/include/chardetng.h",
+    "../third_party/rust/encoding_c/include/encoding_rs.h",
+    "../third_party/rust/encoding_c/include/encoding_rs_statics.h",
+]

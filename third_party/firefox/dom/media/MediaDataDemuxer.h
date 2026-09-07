@@ -1,0 +1,140 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MediaDataDemuxer_h
+#define MediaDataDemuxer_h
+
+#include "DecoderDoctorLogger.h"
+#include "MediaData.h"
+#include "MediaInfo.h"
+#include "MediaResult.h"
+#include "TimeUnits.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/UniquePtr.h"
+#include "nsISupportsImpl.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+
+class MediaTrackDemuxer;
+class TrackMetadataHolder;
+
+DDLoggedTypeDeclName(MediaDataDemuxer);
+DDLoggedTypeName(MediaTrackDemuxer);
+
+inline mozilla::LazyLogModule gMediaDemuxerLog("MediaDemuxer");
+
+class MediaDataDemuxer : public DecoderDoctorLifeLogger<MediaDataDemuxer> {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(MediaDataDemuxer)
+
+  typedef MozPromise<MediaResult, MediaResult,  false>
+      InitPromise;
+
+  virtual RefPtr<InitPromise> Init() = 0;
+
+  virtual uint32_t GetNumberTracks(TrackInfo::TrackType aType) const = 0;
+
+  virtual already_AddRefed<MediaTrackDemuxer> GetTrackDemuxer(
+      TrackInfo::TrackType aType, uint32_t aTrackNumber) = 0;
+
+  virtual bool IsSeekable() const = 0;
+
+  virtual bool IsSeekableOnlyInBufferedRanges() const { return false; }
+
+  virtual UniquePtr<EncryptionInfo> GetCrypto() { return nullptr; }
+
+  virtual void NotifyDataArrived() {}
+
+  virtual void NotifyDataRemoved() {}
+
+  virtual bool ShouldComputeStartTime() const { return true; }
+
+ protected:
+  virtual ~MediaDataDemuxer() = default;
+};
+
+class MediaTrackDemuxer : public DecoderDoctorLifeLogger<MediaTrackDemuxer> {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(MediaTrackDemuxer)
+
+  class SamplesHolder {
+   public:
+    NS_INLINE_DECL_THREADSAFE_REFCOUNTING(SamplesHolder)
+
+    void AppendSample(RefPtr<MediaRawData> aSample) {
+      MOZ_DIAGNOSTIC_ASSERT(aSample->HasValidTime());
+      mSamples.AppendElement(std::move(aSample));
+    }
+
+    const nsTArray<RefPtr<MediaRawData>>& GetSamples() const {
+      return mSamples;
+    }
+
+    nsTArray<RefPtr<MediaRawData>>&& GetMovableSamples() {
+      return std::move(mSamples);
+    }
+
+   private:
+    ~SamplesHolder() = default;
+    nsTArray<RefPtr<MediaRawData>> mSamples;
+  };
+
+  class SkipFailureHolder {
+   public:
+    SkipFailureHolder(const MediaResult& aFailure, uint32_t aSkipped)
+        : mFailure(aFailure), mSkipped(aSkipped) {}
+    MediaResult mFailure;
+    uint32_t mSkipped;
+  };
+
+  typedef MozPromise<media::TimeUnit, MediaResult,  true>
+      SeekPromise;
+  typedef MozPromise<RefPtr<SamplesHolder>, MediaResult,
+                      true>
+      SamplesPromise;
+  typedef MozPromise<uint32_t, SkipFailureHolder,  true>
+      SkipAccessPointPromise;
+
+  virtual UniquePtr<TrackInfo> GetInfo() const = 0;
+
+  virtual RefPtr<SeekPromise> Seek(const media::TimeUnit& aTime) = 0;
+
+  virtual RefPtr<SamplesPromise> GetSamples(int32_t aNumSamples = 1) = 0;
+
+  virtual bool GetSamplesMayBlock() const { return true; }
+
+  virtual void Reset() = 0;
+
+  virtual nsresult GetNextRandomAccessPoint(media::TimeUnit* aTime) {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+
+  virtual nsresult GetPreviousRandomAccessPoint(media::TimeUnit* aTime) {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+
+  virtual RefPtr<SkipAccessPointPromise> SkipToNextRandomAccessPoint(
+      const media::TimeUnit& aTimeThreshold) = 0;
+
+  virtual int64_t GetResourceOffset() const { return -1; }
+
+  virtual TrackInfo::TrackType GetType() const { return GetInfo()->GetType(); }
+
+  virtual media::TimeIntervals GetBuffered() = 0;
+
+  virtual int64_t GetEvictionOffset(const media::TimeUnit& aTime) {
+    return INT64_MAX;
+  }
+
+  virtual void BreakCycles() {}
+
+ protected:
+  virtual ~MediaTrackDemuxer() = default;
+};
+
+}  
+
+#endif  // MediaDataDemuxer_h

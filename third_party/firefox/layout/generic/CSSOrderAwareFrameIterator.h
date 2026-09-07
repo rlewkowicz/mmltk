@@ -1,0 +1,217 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_CSSOrderAwareFrameIterator_h
+#define mozilla_CSSOrderAwareFrameIterator_h
+
+#include <limits>
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Maybe.h"
+#include "nsFrameList.h"
+#include "nsIFrame.h"
+
+namespace mozilla {
+
+template <typename Iterator>
+class CSSOrderAwareFrameIteratorT {
+ public:
+  enum class OrderState { Unknown, Ordered, Unordered };
+  enum class ChildFilter { SkipPlaceholders, IncludeAll };
+  enum class OrderingProperty {
+    Order,           
+    BoxOrdinalGroup  
+  };
+  CSSOrderAwareFrameIteratorT(
+      nsIFrame* aContainer, FrameChildListID aListID,
+      ChildFilter aFilter = ChildFilter::SkipPlaceholders,
+      OrderState aState = OrderState::Unknown,
+      OrderingProperty aOrderProp = OrderingProperty::Order)
+      : mChildren(aContainer->GetChildList(aListID)),
+        mArrayIndex(0),
+        mItemIndex(0),
+        mSkipPlaceholders(aFilter == ChildFilter::SkipPlaceholders)
+#ifdef DEBUG
+        ,
+        mContainer(aContainer),
+        mListID(aListID)
+#endif
+  {
+    MOZ_ASSERT(CanUse(aContainer),
+               "Only use this iterator in a container that honors 'order'");
+
+    size_t count = 0;
+    bool isOrdered = aState != OrderState::Unordered;
+    if (aState == OrderState::Unknown) {
+      auto maxOrder = std::numeric_limits<int32_t>::min();
+      for (auto* child : mChildren) {
+        ++count;
+
+        int32_t order = aOrderProp == OrderingProperty::BoxOrdinalGroup
+                            ? child->StyleXUL()->mBoxOrdinal
+                            : child->StylePosition()->mOrder;
+
+        if (order < maxOrder) {
+          isOrdered = false;
+          break;
+        }
+        maxOrder = order;
+      }
+    }
+    if (isOrdered) {
+      mIter.emplace(begin(mChildren));
+      mIterEnd.emplace(end(mChildren));
+    } else {
+      count *= 2;  
+      mArray.emplace(count);
+      for (Iterator i(begin(mChildren)), iEnd(end(mChildren)); i != iEnd; ++i) {
+        mArray->AppendElement(*i);
+      }
+      auto comparator = aOrderProp == OrderingProperty::BoxOrdinalGroup
+                            ? CSSBoxOrdinalGroupComparator
+                            : CSSOrderComparator;
+      mArray->StableSort(comparator);
+    }
+
+    if (mSkipPlaceholders) {
+      SkipPlaceholders();
+    }
+  }
+
+  CSSOrderAwareFrameIteratorT(CSSOrderAwareFrameIteratorT&&) = default;
+
+  ~CSSOrderAwareFrameIteratorT() {
+    MOZ_ASSERT(IsForward() == mItemCount.isNothing());
+  }
+
+  bool IsForward() const;
+
+  nsIFrame* get() const {
+    MOZ_ASSERT(!AtEnd());
+    if (mIter.isSome()) {
+      return **mIter;
+    }
+    return (*mArray)[mArrayIndex];
+  }
+
+  nsIFrame* operator*() const { return get(); }
+
+  size_t ItemIndex() const {
+    MOZ_ASSERT(!AtEnd());
+    MOZ_ASSERT(!(**this)->IsPlaceholderFrame(),
+               "MUST not call this when at a placeholder");
+    MOZ_ASSERT(IsForward() || mItemIndex < *mItemCount,
+               "Returning an out-of-range mItemIndex...");
+    return mItemIndex;
+  }
+
+  void SetItemCount(size_t aItemCount) {
+    MOZ_ASSERT(mIter.isSome() || aItemCount <= mArray->Length(),
+               "item count mismatch");
+    mItemCount.emplace(aItemCount);
+    mItemIndex = IsForward() ? 0 : *mItemCount - 1;
+  }
+
+  void SkipPlaceholders() {
+    if (mIter.isSome()) {
+      for (; *mIter != *mIterEnd; ++*mIter) {
+        nsIFrame* child = **mIter;
+        if (!child->IsPlaceholderFrame()) {
+          return;
+        }
+      }
+    } else {
+      for (; mArrayIndex < mArray->Length(); ++mArrayIndex) {
+        nsIFrame* child = (*mArray)[mArrayIndex];
+        if (!child->IsPlaceholderFrame()) {
+          return;
+        }
+      }
+    }
+  }
+
+  bool AtEnd() const {
+    MOZ_ASSERT(mIter.isSome() || mArrayIndex <= mArray->Length());
+    return mIter ? (*mIter == *mIterEnd) : mArrayIndex >= mArray->Length();
+  }
+
+  void Next() {
+#ifdef DEBUG
+    MOZ_ASSERT(!AtEnd());
+    const nsFrameList& list = mContainer->GetChildList(mListID);
+    MOZ_ASSERT(list.FirstChild() == mChildren.FirstChild() &&
+                   list.LastChild() == mChildren.LastChild(),
+               "the list of child frames must not change while iterating!");
+#endif
+    if (mSkipPlaceholders || !(**this)->IsPlaceholderFrame()) {
+      IsForward() ? ++mItemIndex : --mItemIndex;
+    }
+    if (mIter.isSome()) {
+      ++*mIter;
+    } else {
+      ++mArrayIndex;
+    }
+    if (mSkipPlaceholders) {
+      SkipPlaceholders();
+    }
+  }
+
+  void Reset(ChildFilter aFilter = ChildFilter::SkipPlaceholders) {
+    if (mIter.isSome()) {
+      mIter.reset();
+      mIter.emplace(begin(mChildren));
+      mIterEnd.reset();
+      mIterEnd.emplace(end(mChildren));
+    } else {
+      mArrayIndex = 0;
+    }
+    mItemIndex = IsForward() ? 0 : *mItemCount - 1;
+    mSkipPlaceholders = aFilter == ChildFilter::SkipPlaceholders;
+    if (mSkipPlaceholders) {
+      SkipPlaceholders();
+    }
+  }
+
+  bool IsValid() const { return mIter.isSome() || mArray.isSome(); }
+
+  void Invalidate() {
+    mIter.reset();
+    mArray.reset();
+  }
+
+  bool ItemsAreAlreadyInOrder() const { return mIter.isSome(); }
+
+ private:
+  static bool CanUse(const nsIFrame*);
+
+  Iterator begin(const nsFrameList& aList);
+  Iterator end(const nsFrameList& aList);
+
+  static int CSSOrderComparator(nsIFrame* const& a, nsIFrame* const& b);
+  static int CSSBoxOrdinalGroupComparator(nsIFrame* const& a,
+                                          nsIFrame* const& b);
+
+  const nsFrameList& mChildren;
+  Maybe<Iterator> mIter;
+  Maybe<Iterator> mIterEnd;
+  Maybe<nsTArray<nsIFrame*>> mArray;
+  size_t mArrayIndex;
+  size_t mItemIndex;
+  Maybe<size_t> mItemCount;
+  bool mSkipPlaceholders;
+#ifdef DEBUG
+  nsIFrame* mContainer;
+  FrameChildListID mListID;
+#endif
+};
+
+using CSSOrderAwareFrameIterator =
+    CSSOrderAwareFrameIteratorT<nsFrameList::iterator>;
+using ReverseCSSOrderAwareFrameIterator =
+    CSSOrderAwareFrameIteratorT<nsFrameList::reverse_iterator>;
+
+}  
+
+#endif  // mozilla_CSSOrderAwareFrameIterator_h

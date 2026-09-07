@@ -1,0 +1,73 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+********************************************************************************
+*   Copyright (C) 2010-2012, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+********************************************************************************
+*
+* File attiter.h
+*
+* Modification History:
+*
+*   Date        Name        Description
+*   12/15/2009  dougfelt    Created
+********************************************************************************
+*/
+
+#ifndef FPOSITER_H
+#define FPOSITER_H
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+#include "unicode/uobject.h"
+
+
+#if UCONFIG_NO_FORMATTING
+
+U_NAMESPACE_BEGIN
+
+class FieldPositionIterator;
+
+U_NAMESPACE_END
+
+#else
+
+#include "unicode/fieldpos.h"
+#include "unicode/umisc.h"
+
+U_NAMESPACE_BEGIN
+
+class UVector32;
+
+class U_I18N_API FieldPositionIterator : public UObject {
+public:
+    ~FieldPositionIterator();
+
+    FieldPositionIterator();
+
+    FieldPositionIterator(const FieldPositionIterator&);
+
+    bool operator==(const FieldPositionIterator&) const;
+
+    bool operator!=(const FieldPositionIterator& rhs) const { return !operator==(rhs); }
+
+    UBool next(FieldPosition& fp);
+
+private:
+    void setData(UVector32 *adopt, UErrorCode& status);
+
+    friend class FieldPositionIteratorHandler;
+
+    UVector32 *data;
+    int32_t pos;
+};
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif // FPOSITER_H

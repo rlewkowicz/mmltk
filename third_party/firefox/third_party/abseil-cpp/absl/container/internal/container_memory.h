@@ -1,0 +1,455 @@
+// Copyright 2018 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef ABSL_CONTAINER_INTERNAL_CONTAINER_MEMORY_H_
+#define ABSL_CONTAINER_INTERNAL_CONTAINER_MEMORY_H_
+
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <new>
+#include <tuple>
+#include <type_traits>
+#include <utility>
+
+#include "absl/base/config.h"
+#include "absl/hash/hash.h"
+#include "absl/memory/memory.h"
+#include "absl/meta/type_traits.h"
+#include "absl/utility/utility.h"
+
+#ifdef ABSL_HAVE_ADDRESS_SANITIZER
+#include <sanitizer/asan_interface.h>
+#endif
+
+#ifdef ABSL_HAVE_MEMORY_SANITIZER
+#include <sanitizer/msan_interface.h>
+#endif
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace container_internal {
+
+template <size_t Alignment>
+struct alignas(Alignment) AlignedType {
+  std::conditional_t<(Alignment < alignof(void*)), char, void*> pointer;
+};
+
+template <size_t Alignment, class Alloc>
+void* Allocate(Alloc* alloc, size_t n) {
+  static_assert(Alignment > 0, "");
+  assert(n && "n must be positive");
+  using M = AlignedType<Alignment>;
+  using A = typename std::allocator_traits<Alloc>::template rebind_alloc<M>;
+  using AT = typename std::allocator_traits<Alloc>::template rebind_traits<M>;
+  A my_mem_alloc(*alloc);
+  void* p = AT::allocate(my_mem_alloc, (n + sizeof(M) - 1) / sizeof(M));
+  assert(reinterpret_cast<uintptr_t>(p) % Alignment == 0 &&
+         "allocator does not respect alignment");
+  return p;
+}
+
+template <class Allocator, class ValueType>
+constexpr auto IsDestructionTrivial() {
+  constexpr bool result =
+      std::is_trivially_destructible_v<ValueType> &&
+      std::is_same_v<typename std::allocator_traits<
+                         Allocator>::template rebind_alloc<char>,
+                     std::allocator<char>>;
+  return std::integral_constant<bool, result>();
+}
+
+template <size_t Alignment, class Alloc>
+void Deallocate(Alloc* alloc, void* p, size_t n) {
+  static_assert(Alignment > 0, "");
+  assert(n && "n must be positive");
+  using M = AlignedType<Alignment>;
+  using A = typename std::allocator_traits<Alloc>::template rebind_alloc<M>;
+  using AT = typename std::allocator_traits<Alloc>::template rebind_traits<M>;
+  A my_mem_alloc(*alloc);
+  AT::deallocate(my_mem_alloc, static_cast<M*>(p),
+                 (n + sizeof(M) - 1) / sizeof(M));
+}
+
+namespace memory_internal {
+
+template <class Alloc, class T, class Tuple, size_t... I>
+void ConstructFromTupleImpl(Alloc* alloc, T* ptr, Tuple&& t,
+                            std::index_sequence<I...>) {
+  std::allocator_traits<Alloc>::construct(
+      *alloc, ptr, std::get<I>(std::forward<Tuple>(t))...);
+}
+
+template <class T, class F>
+struct WithConstructedImplF {
+  template <class... Args>
+  decltype(std::declval<F>()(std::declval<T>())) operator()(
+      Args&&... args) const {
+    return std::forward<F>(f)(T(std::forward<Args>(args)...));
+  }
+  F&& f;
+};
+
+template <class T, class Tuple, size_t... Is, class F>
+decltype(std::declval<F>()(std::declval<T>())) WithConstructedImpl(
+    Tuple&& t, std::index_sequence<Is...>, F&& f) {
+  return WithConstructedImplF<T, F>{std::forward<F>(f)}(
+      std::get<Is>(std::forward<Tuple>(t))...);
+}
+
+template <class T, size_t... Is>
+auto TupleRefImpl(T&& t, std::index_sequence<Is...>)
+    -> decltype(std::forward_as_tuple(std::get<Is>(std::forward<T>(t))...)) {
+  // NOLINTNEXTLINE(bugprone-use-after-move)
+  return std::forward_as_tuple(std::get<Is>(std::forward<T>(t))...);
+}
+
+template <class T>
+auto TupleRef(T&& t) -> decltype(TupleRefImpl(
+    std::forward<T>(t),
+    std::make_index_sequence<std::tuple_size<std::decay_t<T>>::value>())) {
+  return TupleRefImpl(
+      std::forward<T>(t),
+      std::make_index_sequence<std::tuple_size<std::decay_t<T>>::value>());
+}
+
+template <class F, class K, class V>
+decltype(std::declval<F>()(std::declval<const K&>(), std::piecewise_construct,
+                           std::declval<std::tuple<K>>(), std::declval<V>()))
+DecomposePairImpl(F&& f, std::pair<std::tuple<K>, V> p) {
+  const auto& key = std::get<0>(p.first);
+  return std::forward<F>(f)(key, std::piecewise_construct, std::move(p.first),
+                            std::move(p.second));
+}
+
+}  
+
+template <class Alloc, class T, class Tuple>
+void ConstructFromTuple(Alloc* alloc, T* ptr, Tuple&& t) {
+  memory_internal::ConstructFromTupleImpl(
+      alloc, ptr, std::forward<Tuple>(t),
+      std::make_index_sequence<std::tuple_size<std::decay_t<Tuple>>::value>());
+}
+
+template <class T, class Tuple, class F>
+decltype(std::declval<F>()(std::declval<T>())) WithConstructed(Tuple&& t,
+                                                               F&& f) {
+  return memory_internal::WithConstructedImpl<T>(
+      std::forward<Tuple>(t),
+      std::make_index_sequence<std::tuple_size<std::decay_t<Tuple>>::value>(),
+      std::forward<F>(f));
+}
+
+inline std::pair<std::tuple<>, std::tuple<>> PairArgs() { return {}; }
+template <class F, class S>
+std::pair<std::tuple<F&&>, std::tuple<S&&>> PairArgs(F&& f, S&& s) {
+  return {std::piecewise_construct, std::forward_as_tuple(std::forward<F>(f)),
+          std::forward_as_tuple(std::forward<S>(s))};
+}
+template <class F, class S>
+std::pair<std::tuple<const F&>, std::tuple<const S&>> PairArgs(
+    const std::pair<F, S>& p) {
+  return PairArgs(p.first, p.second);
+}
+template <class F, class S>
+std::pair<std::tuple<F&&>, std::tuple<S&&>> PairArgs(std::pair<F, S>&& p) {
+  return PairArgs(std::forward<F>(p.first), std::forward<S>(p.second));
+}
+template <class F, class S>
+auto PairArgs(std::piecewise_construct_t, F&& f, S&& s)
+    -> decltype(std::make_pair(memory_internal::TupleRef(std::forward<F>(f)),
+                               memory_internal::TupleRef(std::forward<S>(s)))) {
+  return std::make_pair(memory_internal::TupleRef(std::forward<F>(f)),
+                        memory_internal::TupleRef(std::forward<S>(s)));
+}
+
+template <class F, class... Args>
+auto DecomposePair(F&& f, Args&&... args)
+    -> decltype(memory_internal::DecomposePairImpl(
+        std::forward<F>(f), PairArgs(std::forward<Args>(args)...))) {
+  return memory_internal::DecomposePairImpl(
+      std::forward<F>(f), PairArgs(std::forward<Args>(args)...));
+}
+
+template <class F, class Arg>
+decltype(std::declval<F>()(std::declval<const Arg&>(), std::declval<Arg>()))
+DecomposeValue(F&& f, Arg&& arg) {
+  const auto& key = arg;
+  return std::forward<F>(f)(key, std::forward<Arg>(arg));
+}
+
+inline void SanitizerPoisonMemoryRegion(const void* m, size_t s) {
+#ifdef ABSL_HAVE_ADDRESS_SANITIZER
+  ASAN_POISON_MEMORY_REGION(m, s);
+#endif
+#ifdef ABSL_HAVE_MEMORY_SANITIZER
+  __msan_poison(m, s);
+#endif
+  (void)m;
+  (void)s;
+}
+
+inline void SanitizerUnpoisonMemoryRegion(const void* m, size_t s) {
+#ifdef ABSL_HAVE_ADDRESS_SANITIZER
+  ASAN_UNPOISON_MEMORY_REGION(m, s);
+#endif
+#ifdef ABSL_HAVE_MEMORY_SANITIZER
+  __msan_unpoison(m, s);
+#endif
+  (void)m;
+  (void)s;
+}
+
+template <typename T>
+inline void SanitizerPoisonObject(const T* object) {
+  SanitizerPoisonMemoryRegion(object, sizeof(T));
+}
+
+template <typename T>
+inline void SanitizerUnpoisonObject(const T* object) {
+  SanitizerUnpoisonMemoryRegion(object, sizeof(T));
+}
+
+namespace memory_internal {
+
+template <class Pair, class = std::true_type>
+struct OffsetOf {
+  static constexpr size_t kFirst = static_cast<size_t>(-1);
+  static constexpr size_t kSecond = static_cast<size_t>(-1);
+};
+
+template <class Pair>
+struct OffsetOf<Pair, typename std::is_standard_layout<Pair>::type> {
+  static constexpr size_t kFirst = offsetof(Pair, first);
+  static constexpr size_t kSecond = offsetof(Pair, second);
+};
+
+template <class K, class V>
+struct IsLayoutCompatible {
+ private:
+  struct Pair {
+    K first;
+    V second;
+  };
+
+  template <class P>
+  static constexpr bool LayoutCompatible() {
+    return std::is_standard_layout<P>() && sizeof(P) == sizeof(Pair) &&
+           alignof(P) == alignof(Pair) &&
+           memory_internal::OffsetOf<P>::kFirst ==
+               memory_internal::OffsetOf<Pair>::kFirst &&
+           memory_internal::OffsetOf<P>::kSecond ==
+               memory_internal::OffsetOf<Pair>::kSecond;
+  }
+
+ public:
+  static constexpr bool value = std::is_standard_layout<K>() &&
+                                std::is_standard_layout<Pair>() &&
+                                memory_internal::OffsetOf<Pair>::kFirst == 0 &&
+                                LayoutCompatible<std::pair<K, V>>() &&
+                                LayoutCompatible<std::pair<const K, V>>();
+};
+
+}  
+
+template <class K, class V>
+union map_slot_type {
+  map_slot_type() {}
+  ~map_slot_type() = delete;
+  using value_type = std::pair<const K, V>;
+  using mutable_value_type =
+      std::pair<std::remove_const_t<K>, std::remove_const_t<V>>;
+
+  value_type value;
+  mutable_value_type mutable_value;
+  std::remove_const_t<K> key;
+};
+
+template <class K, class V>
+struct map_slot_policy {
+  using slot_type = map_slot_type<K, V>;
+  using value_type = std::pair<const K, V>;
+  using mutable_value_type =
+      std::pair<std::remove_const_t<K>, std::remove_const_t<V>>;
+
+ private:
+  static void emplace(slot_type* slot) {
+    new (slot) slot_type;
+  }
+  using kMutableKeys = memory_internal::IsLayoutCompatible<K, V>;
+
+ public:
+  static value_type& element(slot_type* slot) { return slot->value; }
+  static const value_type& element(const slot_type* slot) {
+    return slot->value;
+  }
+
+  static K& mutable_key(slot_type* slot) {
+    return kMutableKeys::value ? slot->key
+                               : *std::launder(const_cast<K*>(
+                                     std::addressof(slot->value.first)));
+  }
+
+  static const K& key(const slot_type* slot) {
+    return kMutableKeys::value ? slot->key : slot->value.first;
+  }
+
+  template <class Allocator, class... Args>
+  static void construct(Allocator* alloc, slot_type* slot, Args&&... args) {
+    emplace(slot);
+    if (kMutableKeys::value) {
+      std::allocator_traits<Allocator>::construct(*alloc, &slot->mutable_value,
+                                                  std::forward<Args>(args)...);
+    } else {
+      std::allocator_traits<Allocator>::construct(*alloc, &slot->value,
+                                                  std::forward<Args>(args)...);
+    }
+  }
+
+  template <class Allocator>
+  static void construct(Allocator* alloc, slot_type* slot, slot_type* other) {
+    emplace(slot);
+    if (kMutableKeys::value) {
+      std::allocator_traits<Allocator>::construct(
+          *alloc, &slot->mutable_value, std::move(other->mutable_value));
+    } else {
+      std::allocator_traits<Allocator>::construct(*alloc, &slot->value,
+                                                  std::move(other->value));
+    }
+  }
+
+  template <class Allocator>
+  static void construct(Allocator* alloc, slot_type* slot,
+                        const slot_type* other) {
+    emplace(slot);
+    std::allocator_traits<Allocator>::construct(*alloc, &slot->value,
+                                                other->value);
+  }
+
+  template <class Allocator>
+  static auto destroy(Allocator* alloc, slot_type* slot) {
+    if (kMutableKeys::value) {
+      std::allocator_traits<Allocator>::destroy(*alloc, &slot->mutable_value);
+    } else {
+      std::allocator_traits<Allocator>::destroy(*alloc, &slot->value);
+    }
+    return IsDestructionTrivial<Allocator, value_type>();
+  }
+
+  template <class Allocator>
+  static auto transfer(Allocator* alloc, slot_type* new_slot,
+                       slot_type* old_slot) {
+    auto is_relocatable = typename std::conjunction<
+        absl::is_trivially_relocatable<typename value_type::first_type>,
+        absl::is_trivially_relocatable<typename value_type::second_type>>::
+        type();
+
+    emplace(new_slot);
+    if (is_relocatable) {
+      std::memcpy(static_cast<void*>(std::launder(&new_slot->value)),
+                  static_cast<const void*>(&old_slot->value),
+                  sizeof(value_type));
+      return is_relocatable;
+    }
+
+    if (kMutableKeys::value) {
+      std::allocator_traits<Allocator>::construct(
+          *alloc, &new_slot->mutable_value, std::move(old_slot->mutable_value));
+    } else {
+      std::allocator_traits<Allocator>::construct(*alloc, &new_slot->value,
+                                                  std::move(old_slot->value));
+    }
+    destroy(alloc, old_slot);
+    return is_relocatable;
+  }
+};
+
+#if !defined(__clang__) && defined(__GNUC__)
+#define ABSL_SWISSTABLE_IGNORE_UNINITIALIZED(x)                    \
+  _Pragma("GCC diagnostic push")                                   \
+      _Pragma("GCC diagnostic ignored \"-Wmaybe-uninitialized\"")  \
+          _Pragma("GCC diagnostic ignored \"-Wuninitialized\"") x; \
+  _Pragma("GCC diagnostic pop")
+#define ABSL_SWISSTABLE_IGNORE_UNINITIALIZED_RETURN(x) \
+  ABSL_SWISSTABLE_IGNORE_UNINITIALIZED(return x)
+#else
+#define ABSL_SWISSTABLE_IGNORE_UNINITIALIZED(x) x
+#define ABSL_SWISSTABLE_IGNORE_UNINITIALIZED_RETURN(x) return x
+#endif
+
+template <class Hash, bool kIsDefault>
+struct HashElement {
+  HashElement(const Hash& h, size_t s) : hash(h), seed(s) {}
+
+  template <class K, class... Args>
+  size_t operator()(const K& key, Args&&...) const {
+    if constexpr (kIsDefault) {
+      return absl::hash_internal::HashWithSeed().hash(hash, key, seed);
+    }
+    // NOLINTNEXTLINE(clang-diagnostic-sign-conversion)
+    return hash(key) ^ seed;
+  }
+  const Hash& hash;
+  size_t seed;
+};
+
+template <class Hash, class Key, bool kIsDefault>
+struct HashKey {
+  HashKey(const Hash& h, const Key& k) : hash(h), key(k) {}
+
+  size_t operator()(size_t seed) const {
+    return HashElement<Hash, kIsDefault>{hash, seed}(key);
+  }
+  const Hash& hash;
+  const Key& key;
+};
+
+template <class K1, class KeyEqual>
+struct EqualElement {
+  template <class K2, class... Args>
+  bool operator()(const K2& lhs, Args&&...) const {
+    ABSL_SWISSTABLE_IGNORE_UNINITIALIZED_RETURN(eq(lhs, rhs));
+  }
+  const K1& rhs;
+  const KeyEqual& eq;
+};
+
+using HashSlotFn = size_t (*)(const void* hash_fn, void* slot, size_t seed);
+
+template <class Fn, class T, bool kIsDefault>
+size_t TypeErasedApplyToSlotFn(const void* fn, void* slot, size_t seed) {
+  const auto* f = static_cast<const Fn*>(fn);
+  return HashElement<Fn, kIsDefault>{*f, seed}(*static_cast<const T*>(slot));
+}
+
+template <class Fn, class T, bool kIsDefault>
+size_t TypeErasedDerefAndApplyToSlotFn(const void* fn, void* slot_ptr,
+                                       size_t seed) {
+  const auto* f = static_cast<const Fn*>(fn);
+  const T* slot = *static_cast<T**>(slot_ptr);
+  return HashElement<Fn, kIsDefault>{*f, seed}(*slot);
+}
+
+template <class Fn, class T, bool kIsDefault>
+size_t TypeErasedDerefAndApplyToSlotFirstFn(const void* fn, void* slot_ptr,
+                                            size_t seed) {
+  const auto* f = static_cast<const Fn*>(fn);
+  const T* slot = *static_cast<T**>(slot_ptr);
+  return HashElement<Fn, kIsDefault>{*f, seed}(slot->first);
+}
+
+}  
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_CONTAINER_INTERNAL_CONTAINER_MEMORY_H_

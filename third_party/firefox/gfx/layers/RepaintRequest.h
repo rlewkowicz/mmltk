@@ -1,0 +1,259 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef GFX_REPAINTREQUEST_H
+#define GFX_REPAINTREQUEST_H
+
+#include <iosfwd>
+#include <stdint.h>  // for uint8_t, uint32_t, uint64_t
+
+#include "FrameMetrics.h"                // for FrameMetrics
+#include "mozilla/DefineEnum.h"          // for MOZ_DEFINE_ENUM
+#include "mozilla/gfx/BasePoint.h"       // for BasePoint
+#include "mozilla/gfx/Rect.h"            // for RoundedIn
+#include "mozilla/gfx/ScaleFactor.h"     // for ScaleFactor
+#include "mozilla/ScrollSnapTargetId.h"  // for ScrollSnapTargetIds
+#include "mozilla/TimeStamp.h"           // for TimeStamp
+#include "Units.h"                       // for CSSRect, CSSPixel, etc
+#include "UnitTransforms.h"              // for ViewAs
+
+namespace IPC {
+template <typename T>
+struct ParamTraits;
+}  
+
+namespace mozilla {
+namespace layers {
+
+struct RepaintRequest {
+  friend struct IPC::ParamTraits<mozilla::layers::RepaintRequest>;
+
+ public:
+  // clang-format off
+  MOZ_DEFINE_ENUM_WITH_BASE_AT_CLASS_SCOPE(
+    ScrollOffsetUpdateType, uint8_t, (
+        eNone,             
+        eUserAction,       
+        eVisualUpdate      
+  ));
+  // clang-format on
+
+  RepaintRequest()
+      : mScrollId(ScrollableLayerGuid::NULL_SCROLL_ID),
+        mPresShellResolution(1),
+        mCompositionBounds(0, 0, 0, 0),
+        mDevPixelsPerCSSPixel(1),
+        mScrollOffset(0, 0),
+        mDisplayPortMargins(0, 0, 0, 0),
+        mPresShellId(-1),
+        mLayoutViewport(0, 0, 0, 0),
+        mScrollUpdateType(eNone),
+        mScrollAnimationType(APZScrollAnimationType::No),
+        mIsRootContent(false),
+        mIsScrollInfoLayer(false),
+        mIsInScrollingGesture(false) {}
+
+  RepaintRequest(const FrameMetrics& aOther,
+                 const ScreenMargin& aDisplayportMargins,
+                 const ScrollOffsetUpdateType aScrollUpdateType,
+                 APZScrollAnimationType aScrollAnimationType,
+                 const APZScrollGeneration& aScrollGenerationOnApz,
+                 const ScrollSnapTargetIds& aLastSnapTargetIds,
+                 bool aIsInScrollingGesture)
+      : mScrollId(aOther.GetScrollId()),
+        mPresShellResolution(aOther.GetPresShellResolution()),
+        mCompositionBounds(aOther.GetCompositionBounds()),
+        mCumulativeResolution(aOther.GetCumulativeResolution()),
+        mDevPixelsPerCSSPixel(aOther.GetDevPixelsPerCSSPixel()),
+        mScrollOffset(aOther.GetVisualScrollOffset()),
+        mZoom(aOther.GetZoom()),
+        mScrollGeneration(aOther.GetScrollGeneration()),
+        mScrollGenerationOnApz(aScrollGenerationOnApz),
+        mDisplayPortMargins(aDisplayportMargins),
+        mPresShellId(aOther.GetPresShellId()),
+        mLayoutViewport(aOther.GetLayoutViewport()),
+        mTransformToAncestorScale(aOther.GetTransformToAncestorScale()),
+        mPaintRequestTime(aOther.GetPaintRequestTime()),
+        mScrollUpdateType(aScrollUpdateType),
+        mScrollAnimationType(aScrollAnimationType),
+        mLastSnapTargetIds(aLastSnapTargetIds),
+        mIsRootContent(aOther.IsRootContent()),
+        mIsScrollInfoLayer(aOther.IsScrollInfoLayer()),
+        mIsInScrollingGesture(aIsInScrollingGesture) {}
+
+
+  bool operator==(const RepaintRequest& aOther) const {
+    return mScrollId == aOther.mScrollId &&
+           mPresShellResolution == aOther.mPresShellResolution &&
+           mCompositionBounds.IsEqualEdges(aOther.mCompositionBounds) &&
+           mCumulativeResolution == aOther.mCumulativeResolution &&
+           mDevPixelsPerCSSPixel == aOther.mDevPixelsPerCSSPixel &&
+           mScrollOffset == aOther.mScrollOffset &&
+           mScrollGeneration == aOther.mScrollGeneration &&
+           mDisplayPortMargins == aOther.mDisplayPortMargins &&
+           mPresShellId == aOther.mPresShellId &&
+           mLayoutViewport.IsEqualEdges(aOther.mLayoutViewport) &&
+           mTransformToAncestorScale == aOther.mTransformToAncestorScale &&
+           mPaintRequestTime == aOther.mPaintRequestTime &&
+           mScrollUpdateType == aOther.mScrollUpdateType &&
+           mScrollAnimationType == aOther.mScrollAnimationType &&
+           mLastSnapTargetIds == aOther.mLastSnapTargetIds &&
+           mIsRootContent == aOther.mIsRootContent &&
+           mIsScrollInfoLayer == aOther.mIsScrollInfoLayer &&
+           mIsInScrollingGesture == aOther.mIsInScrollingGesture;
+  }
+
+  bool operator!=(const RepaintRequest& aOther) const {
+    return !operator==(aOther);
+  }
+
+  friend std::ostream& operator<<(std::ostream& aOut,
+                                  const RepaintRequest& aRequest);
+
+  CSSToScreenScale2D DisplayportPixelsPerCSSPixel() const {
+    return mZoom * mTransformToAncestorScale;
+  }
+
+  CSSToLayerScale LayersPixelsPerCSSPixel() const {
+    return mDevPixelsPerCSSPixel * mCumulativeResolution;
+  }
+
+  LayerToParentLayerScale GetAsyncZoom() const {
+    return mZoom / LayersPixelsPerCSSPixel();
+  }
+
+  CSSSize CalculateCompositedSizeInCssPixels() const {
+    if (GetZoom() == CSSToParentLayerScale(0)) {
+      return CSSSize();  
+    }
+    return mCompositionBounds.Size() / GetZoom();
+  }
+
+  float GetPresShellResolution() const { return mPresShellResolution; }
+
+  const ParentLayerRect& GetCompositionBounds() const {
+    return mCompositionBounds;
+  }
+
+  const LayoutDeviceToLayerScale& GetCumulativeResolution() const {
+    return mCumulativeResolution;
+  }
+
+  const CSSToLayoutDeviceScale& GetDevPixelsPerCSSPixel() const {
+    return mDevPixelsPerCSSPixel;
+  }
+
+  bool IsAnimationInProgress() const {
+    return mScrollAnimationType != APZScrollAnimationType::No;
+  }
+
+  bool IsRootContent() const { return mIsRootContent; }
+
+  CSSPoint GetLayoutScrollOffset() const { return mLayoutViewport.TopLeft(); }
+
+  const CSSPoint& GetVisualScrollOffset() const { return mScrollOffset; }
+
+  const CSSToParentLayerScale& GetZoom() const { return mZoom; }
+
+  ScrollOffsetUpdateType GetScrollUpdateType() const {
+    return mScrollUpdateType;
+  }
+
+  bool GetScrollOffsetUpdated() const { return mScrollUpdateType != eNone; }
+
+  MainThreadScrollGeneration GetScrollGeneration() const {
+    return mScrollGeneration;
+  }
+
+  APZScrollGeneration GetScrollGenerationOnApz() const {
+    return mScrollGenerationOnApz;
+  }
+
+  ScrollableLayerGuid::ViewID GetScrollId() const { return mScrollId; }
+
+  const ScreenMargin& GetDisplayPortMargins() const {
+    return mDisplayPortMargins;
+  }
+
+  uint32_t GetPresShellId() const { return mPresShellId; }
+
+  const CSSRect& GetLayoutViewport() const { return mLayoutViewport; }
+
+  const ParentLayerToScreenScale2D& GetTransformToAncestorScale() const {
+    return mTransformToAncestorScale;
+  }
+
+  const TimeStamp& GetPaintRequestTime() const { return mPaintRequestTime; }
+
+  bool IsScrollInfoLayer() const { return mIsScrollInfoLayer; }
+
+  bool IsInScrollingGesture() const { return mIsInScrollingGesture; }
+
+  APZScrollAnimationType GetScrollAnimationType() const {
+    return mScrollAnimationType;
+  }
+
+  const ScrollSnapTargetIds& GetLastSnapTargetIds() const {
+    return mLastSnapTargetIds;
+  }
+
+ protected:
+  void SetIsRootContent(bool aIsRootContent) {
+    mIsRootContent = aIsRootContent;
+  }
+
+  void SetIsScrollInfoLayer(bool aIsScrollInfoLayer) {
+    mIsScrollInfoLayer = aIsScrollInfoLayer;
+  }
+
+  void SetIsInScrollingGesture(bool aIsInScrollingGesture) {
+    mIsInScrollingGesture = aIsInScrollingGesture;
+  }
+
+ private:
+  ScrollableLayerGuid::ViewID mScrollId;
+
+  float mPresShellResolution;
+
+  ParentLayerRect mCompositionBounds;
+
+  LayoutDeviceToLayerScale mCumulativeResolution;
+
+  CSSToLayoutDeviceScale mDevPixelsPerCSSPixel;
+
+  CSSPoint mScrollOffset;
+
+  CSSToParentLayerScale mZoom;
+
+  MainThreadScrollGeneration mScrollGeneration;
+
+  APZScrollGeneration mScrollGenerationOnApz;
+
+  ScreenMargin mDisplayPortMargins;
+
+  uint32_t mPresShellId;
+
+  CSSRect mLayoutViewport;
+
+  ParentLayerToScreenScale2D mTransformToAncestorScale;
+
+  TimeStamp mPaintRequestTime;
+
+  ScrollOffsetUpdateType mScrollUpdateType;
+
+  APZScrollAnimationType mScrollAnimationType;
+
+  ScrollSnapTargetIds mLastSnapTargetIds;
+
+  bool mIsRootContent : 1;
+
+  bool mIsScrollInfoLayer : 1;
+
+  bool mIsInScrollingGesture : 1;
+};
+
+}  
+}  
+
+#endif /* GFX_REPAINTREQUEST_H */

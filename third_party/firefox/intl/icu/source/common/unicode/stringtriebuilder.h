@@ -1,0 +1,243 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*******************************************************************************
+*   Copyright (C) 2010-2012,2014, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+*******************************************************************************
+*   file name:  stringtriebuilder.h
+*   encoding:   UTF-8
+*   tab size:   8 (not used)
+*   indentation:4
+*
+*   created on: 2010dec24
+*   created by: Markus W. Scherer
+*/
+
+#ifndef __STRINGTRIEBUILDER_H__
+#define __STRINGTRIEBUILDER_H__
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+#include "unicode/uobject.h"
+
+
+struct UHashtable;
+typedef struct UHashtable UHashtable;
+
+enum UStringTrieBuildOption {
+    USTRINGTRIE_BUILD_FAST,
+    USTRINGTRIE_BUILD_SMALL
+};
+
+U_NAMESPACE_BEGIN
+
+class U_COMMON_API StringTrieBuilder : public UObject {
+public:
+#ifndef U_HIDE_INTERNAL_API
+    static int32_t hashNode(const void *node);
+    static UBool equalNodes(const void *left, const void *right);
+#endif  /* U_HIDE_INTERNAL_API */
+
+protected:
+    StringTrieBuilder();
+    virtual ~StringTrieBuilder();
+
+#ifndef U_HIDE_INTERNAL_API
+    void createCompactBuilder(int32_t sizeGuess, UErrorCode &errorCode);
+    void deleteCompactBuilder();
+
+    void build(UStringTrieBuildOption buildOption, int32_t elementsLength, UErrorCode &errorCode);
+
+    int32_t writeNode(int32_t start, int32_t limit, int32_t unitIndex);
+    int32_t writeBranchSubNode(int32_t start, int32_t limit, int32_t unitIndex, int32_t length);
+#endif  /* U_HIDE_INTERNAL_API */
+
+    class Node;
+
+#ifndef U_HIDE_INTERNAL_API
+    Node *makeNode(int32_t start, int32_t limit, int32_t unitIndex, UErrorCode &errorCode);
+    Node *makeBranchSubNode(int32_t start, int32_t limit, int32_t unitIndex,
+                            int32_t length, UErrorCode &errorCode);
+#endif  /* U_HIDE_INTERNAL_API */
+
+    virtual int32_t getElementStringLength(int32_t i) const = 0;
+    virtual char16_t getElementUnit(int32_t i, int32_t unitIndex) const = 0;
+    virtual int32_t getElementValue(int32_t i) const = 0;
+
+    virtual int32_t getLimitOfLinearMatch(int32_t first, int32_t last, int32_t unitIndex) const = 0;
+
+    virtual int32_t countElementUnits(int32_t start, int32_t limit, int32_t unitIndex) const = 0;
+    virtual int32_t skipElementsBySomeUnits(int32_t i, int32_t unitIndex, int32_t count) const = 0;
+    virtual int32_t indexOfElementWithNextUnit(int32_t i, int32_t unitIndex, char16_t unit) const = 0;
+
+    virtual UBool matchNodesCanHaveValues() const = 0;
+
+    virtual int32_t getMaxBranchLinearSubNodeLength() const = 0;
+    virtual int32_t getMinLinearMatch() const = 0;
+    virtual int32_t getMaxLinearMatchLength() const = 0;
+
+#ifndef U_HIDE_INTERNAL_API
+    static const int32_t kMaxBranchLinearSubNodeLength=5;
+
+    static const int32_t kMaxSplitBranchLevels=14;
+
+    Node *registerNode(Node *newNode, UErrorCode &errorCode);
+    Node *registerFinalValue(int32_t value, UErrorCode &errorCode);
+#endif  /* U_HIDE_INTERNAL_API */
+
+
+    UHashtable *nodes;
+
+    class Node : public UObject {
+    public:
+        Node(int32_t initialHash) : hash(initialHash), offset(0) {}
+        inline int32_t hashCode() const { return hash; }
+        static inline int32_t hashCode(const Node *node) { return node==nullptr ? 0 : node->hashCode(); }
+        virtual bool operator==(const Node &other) const;
+        inline bool operator!=(const Node &other) const { return !operator==(other); }
+        virtual int32_t markRightEdgesFirst(int32_t edgeNumber);
+        virtual void write(StringTrieBuilder &builder) = 0;
+        inline void writeUnlessInsideRightEdge(int32_t firstRight, int32_t lastRight,
+                                               StringTrieBuilder &builder) {
+            if(offset<0 && (offset<lastRight || firstRight<offset)) {
+                write(builder);
+            }
+        }
+        inline int32_t getOffset() const { return offset; }
+    protected:
+        int32_t hash;
+        int32_t offset;
+    };
+
+#ifndef U_HIDE_INTERNAL_API
+    class FinalValueNode : public Node {
+    public:
+        FinalValueNode(int32_t v) : Node(0x111111u*37u+v), value(v) {}
+        virtual bool operator==(const Node &other) const override;
+        virtual void write(StringTrieBuilder &builder) override;
+    protected:
+        int32_t value;
+    };
+#endif  /* U_HIDE_INTERNAL_API */
+
+    class ValueNode : public Node {
+    public:
+        ValueNode(int32_t initialHash) : Node(initialHash), hasValue(false), value(0) {}
+        virtual bool operator==(const Node &other) const override;
+        void setValue(int32_t v) {
+            hasValue=true;
+            value=v;
+            hash=hash*37u+v;
+        }
+    protected:
+        UBool hasValue;
+        int32_t value;
+    };
+
+#ifndef U_HIDE_INTERNAL_API
+    class IntermediateValueNode : public ValueNode {
+    public:
+        IntermediateValueNode(int32_t v, Node *nextNode)
+                : ValueNode(0x222222u*37u+hashCode(nextNode)), next(nextNode) { setValue(v); }
+        virtual bool operator==(const Node &other) const override;
+        virtual int32_t markRightEdgesFirst(int32_t edgeNumber) override;
+        virtual void write(StringTrieBuilder &builder) override;
+    protected:
+        Node *next;
+    };
+#endif  /* U_HIDE_INTERNAL_API */
+
+    class LinearMatchNode : public ValueNode {
+    public:
+        LinearMatchNode(int32_t len, Node *nextNode)
+                : ValueNode((0x333333u*37u+len)*37u+hashCode(nextNode)),
+                  length(len), next(nextNode) {}
+        virtual bool operator==(const Node &other) const override;
+        virtual int32_t markRightEdgesFirst(int32_t edgeNumber) override;
+    protected:
+        int32_t length;
+        Node *next;
+    };
+
+#ifndef U_HIDE_INTERNAL_API
+    class BranchNode : public Node {
+    public:
+        BranchNode(int32_t initialHash) : Node(initialHash) {}
+    protected:
+        int32_t firstEdgeNumber;
+    };
+
+    class ListBranchNode : public BranchNode {
+    public:
+        ListBranchNode() : BranchNode(0x444444), length(0) {}
+        virtual bool operator==(const Node &other) const override;
+        virtual int32_t markRightEdgesFirst(int32_t edgeNumber) override;
+        virtual void write(StringTrieBuilder &builder) override;
+        void add(int32_t c, int32_t value) {
+            units[length] = static_cast<char16_t>(c);
+            equal[length]=nullptr;
+            values[length]=value;
+            ++length;
+            hash=(hash*37u+c)*37u+value;
+        }
+        void add(int32_t c, Node *node) {
+            units[length] = static_cast<char16_t>(c);
+            equal[length]=node;
+            values[length]=0;
+            ++length;
+            hash=(hash*37u+c)*37u+hashCode(node);
+        }
+    protected:
+        Node *equal[kMaxBranchLinearSubNodeLength];  
+        int32_t length;
+        int32_t values[kMaxBranchLinearSubNodeLength];
+        char16_t units[kMaxBranchLinearSubNodeLength];
+    };
+
+    class SplitBranchNode : public BranchNode {
+    public:
+        SplitBranchNode(char16_t middleUnit, Node *lessThanNode, Node *greaterOrEqualNode)
+                : BranchNode(((0x555555u*37u+middleUnit)*37u+
+                              hashCode(lessThanNode))*37u+hashCode(greaterOrEqualNode)),
+                  unit(middleUnit), lessThan(lessThanNode), greaterOrEqual(greaterOrEqualNode) {}
+        virtual bool operator==(const Node &other) const override;
+        virtual int32_t markRightEdgesFirst(int32_t edgeNumber) override;
+        virtual void write(StringTrieBuilder &builder) override;
+    protected:
+        char16_t unit;
+        Node *lessThan;
+        Node *greaterOrEqual;
+    };
+
+    class BranchHeadNode : public ValueNode {
+    public:
+        BranchHeadNode(int32_t len, Node *subNode)
+                : ValueNode((0x666666u*37u+len)*37u+hashCode(subNode)),
+                  length(len), next(subNode) {}
+        virtual bool operator==(const Node &other) const override;
+        virtual int32_t markRightEdgesFirst(int32_t edgeNumber) override;
+        virtual void write(StringTrieBuilder &builder) override;
+    protected:
+        int32_t length;
+        Node *next;  
+    };
+
+#endif  /* U_HIDE_INTERNAL_API */
+
+    virtual Node *createLinearMatchNode(int32_t i, int32_t unitIndex, int32_t length,
+                                        Node *nextNode) const = 0;
+
+    virtual int32_t write(int32_t unit) = 0;
+    virtual int32_t writeElementUnits(int32_t i, int32_t unitIndex, int32_t length) = 0;
+    virtual int32_t writeValueAndFinal(int32_t i, UBool isFinal) = 0;
+    virtual int32_t writeValueAndType(UBool hasValue, int32_t value, int32_t node) = 0;
+    virtual int32_t writeDeltaTo(int32_t jumpTarget) = 0;
+};
+
+U_NAMESPACE_END
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif  // __STRINGTRIEBUILDER_H__

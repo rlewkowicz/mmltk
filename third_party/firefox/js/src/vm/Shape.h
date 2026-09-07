@@ -1,0 +1,763 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef vm_Shape_h
+#define vm_Shape_h
+
+#include "js/shadow/Shape.h"  // JS::shadow::Shape, JS::shadow::BaseShape
+
+#include "mozilla/Attributes.h"
+#include "mozilla/MemoryReporting.h"
+
+#include "jstypes.h"
+#include "NamespaceImports.h"
+
+#include "gc/Barrier.h"
+#include "gc/MaybeRooted.h"
+#include "js/HashTable.h"
+#include "js/Id.h"  // JS::PropertyKey
+#include "js/MemoryMetrics.h"
+#include "js/Printer.h"  // js::GenericPrinter
+#include "js/RootingAPI.h"
+#include "js/UbiNode.h"
+#include "util/EnumFlags.h"
+#include "vm/ObjectFlags.h"
+#include "vm/PropertyInfo.h"
+#include "vm/PropMap.h"
+#include "vm/TaggedProto.h"
+
+
+MOZ_ALWAYS_INLINE size_t JSSLOT_FREE(const JSClass* clasp) {
+  MOZ_ASSERT(!clasp->isProxyObject());
+  return JSCLASS_RESERVED_SLOTS(clasp);
+}
+
+namespace js {
+
+class JSONPrinter;
+class NativeShape;
+class Shape;
+class PropertyIteratorObject;
+
+namespace gc {
+class TenuringTracer;
+template <uint32_t opts>
+class MarkingTracerT;
+}  
+
+namespace wasm {
+class RecGroup;
+}  
+
+struct ShapeForAddHasher : public DefaultHasher<Shape*> {
+  using Key = SharedShape*;
+
+  struct Lookup {
+    PropertyKey key;
+    PropertyFlags flags;
+
+    Lookup(PropertyKey key, PropertyFlags flags) : key(key), flags(flags) {}
+  };
+
+  static MOZ_ALWAYS_INLINE HashNumber hash(const Lookup& l);
+  static MOZ_ALWAYS_INLINE bool match(SharedShape* shape, const Lookup& l);
+};
+using ShapeSetForAdd =
+    HashSet<SharedShape*, ShapeForAddHasher, SystemAllocPolicy>;
+
+class ShapeCachePtr {
+  enum {
+    SINGLE_SHAPE_FOR_ADD = 0,
+    SHAPE_SET_FOR_ADD = 1,
+    SHAPE_WITH_PROTO = 2,
+    ITERATOR = 3,
+    MASK = 3
+  };
+
+  uintptr_t bits = 0;
+
+ public:
+  bool isNone() const { return !bits; }
+  void setNone() { bits = 0; }
+
+  bool isSingleShapeForAdd() const {
+    return (bits & MASK) == SINGLE_SHAPE_FOR_ADD && !isNone();
+  }
+  SharedShape* toSingleShapeForAdd() const {
+    MOZ_ASSERT(isSingleShapeForAdd());
+    return reinterpret_cast<SharedShape*>(bits & ~uintptr_t(MASK));
+  }
+  void setSingleShapeForAdd(SharedShape* shape) {
+    MOZ_ASSERT(shape);
+    MOZ_ASSERT((uintptr_t(shape) & MASK) == 0);
+    MOZ_ASSERT(!isShapeSetForAdd());  
+    bits = uintptr_t(shape) | SINGLE_SHAPE_FOR_ADD;
+  }
+
+  bool isShapeSetForAdd() const { return (bits & MASK) == SHAPE_SET_FOR_ADD; }
+  ShapeSetForAdd* toShapeSetForAdd() const {
+    MOZ_ASSERT(isShapeSetForAdd());
+    return reinterpret_cast<ShapeSetForAdd*>(bits & ~uintptr_t(MASK));
+  }
+  void setShapeSetForAdd(ShapeSetForAdd* hash) {
+    MOZ_ASSERT(hash);
+    MOZ_ASSERT((uintptr_t(hash) & MASK) == 0);
+    MOZ_ASSERT(!isShapeSetForAdd());  
+    bits = uintptr_t(hash) | SHAPE_SET_FOR_ADD;
+  }
+
+  bool isForAdd() const { return isSingleShapeForAdd() || isShapeSetForAdd(); }
+
+  bool isShapeWithProto() const { return (bits & MASK) == SHAPE_WITH_PROTO; }
+  SharedShape* toShapeWithProto() const {
+    MOZ_ASSERT(isShapeWithProto());
+    return reinterpret_cast<SharedShape*>(bits & ~uintptr_t(MASK));
+  }
+  void setShapeWithProto(SharedShape* shape) {
+    MOZ_ASSERT(shape);
+    MOZ_ASSERT((uintptr_t(shape) & MASK) == 0);
+    MOZ_ASSERT(!isShapeSetForAdd());  
+    bits = uintptr_t(shape) | SHAPE_WITH_PROTO;
+  }
+
+  bool isIterator() const { return (bits & MASK) == ITERATOR; }
+  PropertyIteratorObject* toIterator() const {
+    MOZ_ASSERT(isIterator());
+    return reinterpret_cast<PropertyIteratorObject*>(bits & ~uintptr_t(MASK));
+  }
+  void setIterator(PropertyIteratorObject* iter) {
+    MOZ_ASSERT(iter);
+    MOZ_ASSERT((uintptr_t(iter) & MASK) == 0);
+    MOZ_ASSERT(!isShapeSetForAdd());  
+    bits = uintptr_t(iter) | ITERATOR;
+  }
+  friend class js::jit::MacroAssembler;
+} JS_HAZ_GC_POINTER;
+
+class BaseShape : public gc::TenuredCellWithNonGCPointer<const JSClass> {
+ public:
+  const JSClass* clasp() const { return headerPtr(); }
+
+ private:
+  JS::Realm* const realm_;
+  const GCPtr<TaggedProto> proto_;
+  template <uint32_t opts>
+  friend class gc::MarkingTracerT;
+
+ public:
+  BaseShape(JSContext* cx, const JSClass* clasp, JS::Realm* realm,
+            TaggedProto proto);
+
+  ~BaseShape() = delete;
+
+  BaseShape(const BaseShape& base) = delete;
+  BaseShape& operator=(const BaseShape& other) = delete;
+
+  JS::Realm* realm() const { return realm_; }
+  JS::Compartment* compartment() const {
+    return JS::GetCompartmentForRealm(realm());
+  }
+  JS::Compartment* maybeCompartment() const { return compartment(); }
+
+  TaggedProto proto() const { return proto_; }
+
+  static BaseShape* get(JSContext* cx, const JSClass* clasp, JS::Realm* realm,
+                        Handle<TaggedProto> proto);
+
+  static const JS::TraceKind TraceKind = JS::TraceKind::BaseShape;
+
+  void traceChildren(JSTracer* trc);
+
+  static constexpr size_t offsetOfClasp() { return offsetOfHeaderPtr(); }
+
+  static constexpr size_t offsetOfRealm() {
+    return offsetof(BaseShape, realm_);
+  }
+
+  static constexpr size_t offsetOfProto() {
+    return offsetof(BaseShape, proto_);
+  }
+
+ private:
+  static void staticAsserts() {
+    static_assert(offsetOfClasp() == offsetof(JS::shadow::BaseShape, clasp));
+    static_assert(offsetOfRealm() == offsetof(JS::shadow::BaseShape, realm));
+    static_assert(sizeof(BaseShape) % gc::CellAlignBytes == 0,
+                  "Things inheriting from gc::Cell must have a size that's "
+                  "a multiple of gc::CellAlignBytes");
+#ifdef JS_64BIT
+    static_assert(sizeof(BaseShape) == 3 * sizeof(void*));
+#else
+    static_assert(sizeof(BaseShape) == 4 * sizeof(void*));
+#endif
+  }
+
+ public:
+#if defined(DEBUG) || defined(JS_JITSPEW)
+  void dump() const;
+  void dump(js::GenericPrinter& out) const;
+  void dump(js::JSONPrinter& json) const;
+
+  void dumpFields(js::JSONPrinter& json) const;
+#endif
+};
+
+class Shape : public gc::CellWithTenuredGCPointer<gc::TenuredCell, BaseShape> {
+  friend class ::JSObject;
+  friend class ::JSFunction;
+  friend class NativeObject;
+  friend class SharedShape;
+  friend class PropertyTree;
+  friend class gc::TenuringTracer;
+  friend class JS::ubi::Concrete<Shape>;
+  friend class gc::RelocationOverlay;
+
+ public:
+  Shape(const Shape& other) = delete;
+
+  BaseShape* base() const { return headerPtr(); }
+
+  using Kind = JS::shadow::Shape::Kind;
+
+  enum ImmutableFlags : uint32_t {
+    MAP_LENGTH_MASK = BitMask(4),
+
+    KIND_SHIFT = 4,
+    KIND_MASK = 0b11,
+    IS_NATIVE_BIT = 0x1 << KIND_SHIFT,
+
+    FIXED_SLOTS_MAX = 0x1f,
+    FIXED_SLOTS_SHIFT = 6,
+    FIXED_SLOTS_MASK = uint32_t(FIXED_SLOTS_MAX << FIXED_SLOTS_SHIFT),
+
+    SMALL_SLOTSPAN_MAX = 0x3ff,  
+    SMALL_SLOTSPAN_SHIFT = 11,
+    SMALL_SLOTSPAN_MASK = uint32_t(SMALL_SLOTSPAN_MAX << SMALL_SLOTSPAN_SHIFT),
+  };
+
+ protected:
+  GCData<uint32_t> immutableFlags;  
+  ObjectFlags objectFlags_;         
+
+  ShapeCachePtr cache_;
+
+  static bool replaceShape(JSContext* cx, HandleObject obj,
+                           ObjectFlags objectFlags, TaggedProto proto,
+                           uint32_t nfixed);
+
+ public:
+  void addSizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf,
+                              JS::ShapeInfo* info) const {
+    if (cache_.isShapeSetForAdd()) {
+      info->shapesMallocHeapCache +=
+          cache_.toShapeSetForAdd()->shallowSizeOfIncludingThis(mallocSizeOf);
+    }
+  }
+
+  ShapeCachePtr& cacheRef() { return cache_; }
+  ShapeCachePtr cache() const { return cache_; }
+
+  void maybeCacheIterator(JSContext* cx, PropertyIteratorObject* iter);
+
+  const JSClass* getObjectClass() const { return base()->clasp(); }
+  JS::Realm* realm() const { return base()->realm(); }
+
+  JS::Compartment* compartment() const { return base()->compartment(); }
+  JS::Compartment* maybeCompartment() const {
+    return base()->maybeCompartment();
+  }
+
+  TaggedProto proto() const { return base()->proto(); }
+
+  ObjectFlags objectFlags() const { return objectFlags_; }
+  bool hasObjectFlag(ObjectFlag flag) const {
+    return objectFlags_.hasFlag(flag);
+  }
+
+ protected:
+  Shape(Kind kind, BaseShape* base, ObjectFlags objectFlags)
+      : CellWithTenuredGCPointer(base),
+        immutableFlags(uint32_t(kind) << KIND_SHIFT),
+        objectFlags_(objectFlags) {
+    MOZ_ASSERT(base);
+    MOZ_ASSERT(this->kind() == kind, "kind must fit in KIND_MASK");
+    MOZ_ASSERT(isNative() == base->clasp()->isNativeObject());
+  }
+
+ public:
+  Kind kind() const { return kindFromImmutableFlags(immutableFlags); }
+  static Kind kindFromImmutableFlags(uint32_t immutableFlags) {
+    return Kind((immutableFlags >> KIND_SHIFT) & KIND_MASK);
+  }
+
+  bool isNative() const {
+    return immutableFlags & IS_NATIVE_BIT;
+  }
+
+  bool isShared() const { return kind() == Kind::Shared; }
+  bool isDictionary() const { return kind() == Kind::Dictionary; }
+  bool isProxy() const { return kind() == Kind::Proxy; }
+  bool isWasmGC() const { return kind() == Kind::WasmGC; }
+
+  inline NativeShape& asNative();
+  inline SharedShape& asShared();
+  inline DictionaryShape& asDictionary();
+  inline WasmGCShape& asWasmGC();
+
+  inline const NativeShape& asNative() const;
+  inline const SharedShape& asShared() const;
+  inline const DictionaryShape& asDictionary() const;
+  inline const WasmGCShape& asWasmGC() const;
+
+#if defined(DEBUG) || defined(JS_JITSPEW)
+  void dump() const;
+  void dump(js::GenericPrinter& out) const;
+  void dump(js::JSONPrinter& json) const;
+
+  void dumpFields(js::JSONPrinter& json) const;
+  void dumpStringContent(js::GenericPrinter& out) const;
+#endif
+
+  inline void purgeCache(JS::GCContext* gcx);
+  inline void finalize(JS::GCContext* gcx);
+
+  static const JS::TraceKind TraceKind = JS::TraceKind::Shape;
+
+  void traceChildren(JSTracer* trc);
+
+  ImmutableFlags immutableFlagsForTracing() const {
+    return ImmutableFlags(immutableFlags.getForTracing());
+  }
+
+  static constexpr size_t offsetOfBaseShape() { return offsetOfHeaderPtr(); }
+
+  static constexpr size_t offsetOfObjectFlags() {
+    return offsetof(Shape, objectFlags_);
+  }
+
+  static inline size_t offsetOfImmutableFlags() {
+    return offsetof(Shape, immutableFlags);
+  }
+
+  static constexpr uint32_t kindShift() { return KIND_SHIFT; }
+  static constexpr uint32_t kindMask() { return KIND_MASK; }
+  static constexpr uint32_t isNativeBit() { return IS_NATIVE_BIT; }
+
+  static constexpr size_t offsetOfCachePtr() { return offsetof(Shape, cache_); }
+
+ private:
+  static void staticAsserts() {
+    static_assert(offsetOfBaseShape() == offsetof(JS::shadow::Shape, base));
+    static_assert(offsetof(Shape, immutableFlags) ==
+                  offsetof(JS::shadow::Shape, immutableFlags));
+    static_assert(KIND_SHIFT == JS::shadow::Shape::KIND_SHIFT);
+    static_assert(KIND_MASK == JS::shadow::Shape::KIND_MASK);
+    static_assert(FIXED_SLOTS_SHIFT == JS::shadow::Shape::FIXED_SLOTS_SHIFT);
+    static_assert(FIXED_SLOTS_MASK == JS::shadow::Shape::FIXED_SLOTS_MASK);
+  }
+};
+
+class NativeShape : public Shape {
+ protected:
+  GCPtr<PropMap*> propMap_;
+  template <uint32_t opts>
+  friend class gc::MarkingTracerT;
+
+  NativeShape(Kind kind, BaseShape* base, ObjectFlags objectFlags,
+              uint32_t nfixed, PropMap* map, uint32_t mapLength)
+      : Shape(kind, base, objectFlags), propMap_(map) {
+    MOZ_ASSERT(base->clasp()->isNativeObject());
+    MOZ_ASSERT(mapLength <= PropMap::Capacity);
+    immutableFlags |= (nfixed << FIXED_SLOTS_SHIFT) | mapLength;
+  }
+
+ public:
+  void traceChildren(JSTracer* trc);
+
+  PropMap* propMap() const { return propMap_; }
+  uint32_t propMapLength() const { return immutableFlags & MAP_LENGTH_MASK; }
+
+  PropertyInfoWithKey lastProperty() const {
+    MOZ_ASSERT(propMapLength() > 0);
+    size_t index = propMapLength() - 1;
+    return propMap()->getPropertyInfoWithKey(index);
+  }
+
+  MOZ_ALWAYS_INLINE PropMap* lookup(JSContext* cx, PropertyKey key,
+                                    uint32_t* index);
+  MOZ_ALWAYS_INLINE PropMap* lookupPure(PropertyKey key, uint32_t* index);
+
+  uint32_t numFixedSlots() const {
+    return numFixedSlotsFromImmutableFlags(immutableFlags);
+  }
+  static uint32_t numFixedSlotsFromImmutableFlags(uint32_t immutableFlags) {
+    return (immutableFlags & FIXED_SLOTS_MASK) >> FIXED_SLOTS_SHIFT;
+  }
+
+  static constexpr uint32_t fixedSlotsMask() { return FIXED_SLOTS_MASK; }
+  static constexpr uint32_t fixedSlotsShift() { return FIXED_SLOTS_SHIFT; }
+};
+
+class SharedShape : public NativeShape {
+  friend class js::gc::CellAllocator;
+  SharedShape(BaseShape* base, ObjectFlags objectFlags, uint32_t nfixed,
+              SharedPropMap* map, uint32_t mapLength)
+      : NativeShape(Kind::Shared, base, objectFlags, nfixed, map, mapLength) {
+    initSmallSlotSpan();
+  }
+
+  static SharedShape* new_(JSContext* cx, Handle<BaseShape*> base,
+                           ObjectFlags objectFlags, uint32_t nfixed,
+                           Handle<SharedPropMap*> map, uint32_t mapLength);
+
+  void initSmallSlotSpan() {
+    MOZ_ASSERT(isShared());
+    uint32_t slotSpan = slotSpanSlow();
+    if (slotSpan > SMALL_SLOTSPAN_MAX) {
+      slotSpan = SMALL_SLOTSPAN_MAX;
+    }
+    MOZ_ASSERT((immutableFlags & SMALL_SLOTSPAN_MASK) == 0);
+    immutableFlags |= (slotSpan << SMALL_SLOTSPAN_SHIFT);
+  }
+
+ public:
+  SharedPropMap* propMap() const {
+    MOZ_ASSERT(isShared());
+    return propMap_ ? propMap_->asShared() : nullptr;
+  }
+  inline SharedPropMap* propMapMaybeForwarded() const;
+
+  bool lastPropertyMatchesForAdd(PropertyKey key, PropertyFlags flags,
+                                 uint32_t* slot) const {
+    MOZ_ASSERT(isShared());
+    MOZ_ASSERT(propMapLength() > 0);
+    uint32_t index = propMapLength() - 1;
+    SharedPropMap* map = propMap();
+    if (map->getKey(index) != key) {
+      return false;
+    }
+    PropertyInfo prop = map->getPropertyInfo(index);
+    if (prop.flags() != flags) {
+      return false;
+    }
+    *slot = prop.maybeSlot();
+    return true;
+  }
+
+  uint32_t slotSpanSlow() const {
+    MOZ_ASSERT(isShared());
+    const JSClass* clasp = getObjectClass();
+    return SharedPropMap::slotSpan(clasp, propMap(), propMapLength());
+  }
+  uint32_t slotSpan() const {
+    MOZ_ASSERT(isShared());
+    uint32_t span = smallSlotSpanFromImmutableFlags(immutableFlags);
+    if (MOZ_LIKELY(span < SMALL_SLOTSPAN_MAX)) {
+      MOZ_ASSERT(slotSpanSlow() == span);
+      return span;
+    }
+    return slotSpanSlow();
+  }
+  static uint32_t smallSlotSpanFromImmutableFlags(uint32_t immutableFlags) {
+    return (immutableFlags & SMALL_SLOTSPAN_MASK) >> SMALL_SLOTSPAN_SHIFT;
+  }
+
+  static SharedShape* getInitialShape(JSContext* cx, const JSClass* clasp,
+                                      JS::Realm* realm, TaggedProto proto,
+                                      size_t nfixed,
+                                      ObjectFlags objectFlags = {});
+  static SharedShape* getInitialShape(JSContext* cx, const JSClass* clasp,
+                                      JS::Realm* realm, TaggedProto proto,
+                                      gc::AllocKind kind,
+                                      ObjectFlags objectFlags = {});
+
+  static SharedShape* getPropMapShape(JSContext* cx, BaseShape* base,
+                                      size_t nfixed, Handle<SharedPropMap*> map,
+                                      uint32_t mapLength,
+                                      ObjectFlags objectFlags,
+                                      bool* allocatedNewShape = nullptr);
+
+  static SharedShape* getInitialOrPropMapShape(
+      JSContext* cx, const JSClass* clasp, JS::Realm* realm, TaggedProto proto,
+      size_t nfixed, Handle<SharedPropMap*> map, uint32_t mapLength,
+      ObjectFlags objectFlags);
+
+  static void insertInitialShape(JSContext* cx, Handle<SharedShape*> shape);
+
+  template <class ObjectSubclass>
+  static inline bool ensureInitialCustomShape(JSContext* cx,
+                                              Handle<ObjectSubclass*> obj);
+};
+
+class DictionaryShape : public NativeShape {
+  friend class ::JSObject;
+  friend class js::gc::CellAllocator;
+  friend class NativeObject;
+
+  DictionaryShape(BaseShape* base, ObjectFlags objectFlags, uint32_t nfixed,
+                  DictionaryPropMap* map, uint32_t mapLength)
+      : NativeShape(Kind::Dictionary, base, objectFlags, nfixed, map,
+                    mapLength) {
+    MOZ_ASSERT(map);
+  }
+  explicit DictionaryShape(NativeObject* nobj);
+
+  void updateNewShape(ObjectFlags flags, DictionaryPropMap* map,
+                      uint32_t mapLength) {
+    MOZ_ASSERT(isDictionary());
+    objectFlags_ = flags;
+    propMap_ = map;
+    immutableFlags = (immutableFlags & ~MAP_LENGTH_MASK) | mapLength;
+    MOZ_ASSERT(propMapLength() == mapLength);
+  }
+  void setObjectFlagsOfNewShape(ObjectFlags flags) {
+    MOZ_ASSERT(isDictionary());
+    objectFlags_ = flags;
+  }
+
+ public:
+  static DictionaryShape* new_(JSContext* cx, Handle<BaseShape*> base,
+                               ObjectFlags objectFlags, uint32_t nfixed,
+                               Handle<DictionaryPropMap*> map,
+                               uint32_t mapLength);
+  static DictionaryShape* new_(JSContext* cx, Handle<NativeObject*> obj);
+
+  DictionaryPropMap* propMap() const {
+    MOZ_ASSERT(isDictionary());
+    MOZ_ASSERT(propMap_);
+    return propMap_->asDictionary();
+  }
+};
+
+class ProxyShape : public Shape {
+  uintptr_t padding_ = 0;
+
+  friend class js::gc::CellAllocator;
+  ProxyShape(BaseShape* base, ObjectFlags objectFlags)
+      : Shape(Kind::Proxy, base, objectFlags) {
+    MOZ_ASSERT(base->clasp()->isProxyObject());
+  }
+
+  static ProxyShape* new_(JSContext* cx, Handle<BaseShape*> base,
+                          ObjectFlags objectFlags);
+
+ public:
+  static ProxyShape* getShape(JSContext* cx, const JSClass* clasp,
+                              JS::Realm* realm, TaggedProto proto,
+                              ObjectFlags objectFlags);
+
+ private:
+  static void staticAsserts() {
+    static_assert(sizeof(padding_) == sizeof(uintptr_t));
+  }
+};
+
+class WasmGCShape : public Shape {
+  const wasm::RecGroup* recGroup_;
+
+  friend class js::gc::CellAllocator;
+  WasmGCShape(BaseShape* base, const wasm::RecGroup* recGroup,
+              ObjectFlags objectFlags)
+      : Shape(Kind::WasmGC, base, objectFlags), recGroup_(recGroup) {
+    MOZ_ASSERT(!base->clasp()->isProxyObject());
+    MOZ_ASSERT(!base->clasp()->isNativeObject());
+  }
+
+  static WasmGCShape* new_(JSContext* cx, Handle<BaseShape*> base,
+                           const wasm::RecGroup* recGroup,
+                           ObjectFlags objectFlags);
+
+  inline void init();
+
+ public:
+  static WasmGCShape* getShape(JSContext* cx, const JSClass* clasp,
+                               JS::Realm* realm, TaggedProto proto,
+                               const wasm::RecGroup* recGroup,
+                               ObjectFlags objectFlags);
+
+  inline void finalize(JS::GCContext* gcx);
+
+  const wasm::RecGroup* recGroup() const {
+    MOZ_ASSERT(isWasmGC());
+    return recGroup_;
+  }
+};
+
+class SizedShape : public Shape {
+  uintptr_t padding_;
+
+  static void staticAsserts() {
+    static_assert(sizeof(padding_) == sizeof(uintptr_t));
+
+#ifdef JS_64BIT
+    static_assert(sizeof(SizedShape) == 4 * sizeof(void*));
+#else
+    static_assert(sizeof(SizedShape) == 6 * sizeof(void*));
+#endif
+
+    static_assert(sizeof(NativeShape) == sizeof(SizedShape));
+    static_assert(sizeof(SharedShape) == sizeof(SizedShape));
+    static_assert(sizeof(DictionaryShape) == sizeof(SizedShape));
+    static_assert(sizeof(ProxyShape) == sizeof(SizedShape));
+    static_assert(sizeof(WasmGCShape) == sizeof(SizedShape));
+  }
+};
+
+inline NativeShape& js::Shape::asNative() {
+  MOZ_ASSERT(isNative());
+  return *static_cast<NativeShape*>(this);
+}
+
+inline SharedShape& js::Shape::asShared() {
+  MOZ_ASSERT(isShared());
+  return *static_cast<SharedShape*>(this);
+}
+
+inline DictionaryShape& js::Shape::asDictionary() {
+  MOZ_ASSERT(isDictionary());
+  return *static_cast<DictionaryShape*>(this);
+}
+
+inline WasmGCShape& js::Shape::asWasmGC() {
+  MOZ_ASSERT(isWasmGC());
+  return *static_cast<WasmGCShape*>(this);
+}
+
+inline const NativeShape& js::Shape::asNative() const {
+  MOZ_ASSERT(isNative());
+  return *static_cast<const NativeShape*>(this);
+}
+
+inline const SharedShape& js::Shape::asShared() const {
+  MOZ_ASSERT(isShared());
+  return *static_cast<const SharedShape*>(this);
+}
+
+inline const DictionaryShape& js::Shape::asDictionary() const {
+  MOZ_ASSERT(isDictionary());
+  return *static_cast<const DictionaryShape*>(this);
+}
+
+inline const WasmGCShape& js::Shape::asWasmGC() const {
+  MOZ_ASSERT(isWasmGC());
+  return *static_cast<const WasmGCShape*>(this);
+}
+
+template <AllowGC allowGC>
+class MOZ_RAII ShapePropertyIter {
+  typename MaybeRooted<PropMap*, allowGC>::RootType map_;
+  uint32_t mapLength_;
+  const bool isDictionary_;
+
+ protected:
+  ShapePropertyIter(JSContext* cx, NativeShape* shape, bool isDictionary)
+      : map_(cx, shape->propMap()),
+        mapLength_(shape->propMapLength()),
+        isDictionary_(isDictionary) {
+    static_assert(allowGC == CanGC);
+    MOZ_ASSERT(shape->isDictionary() == isDictionary);
+    MOZ_ASSERT(shape->isNative());
+  }
+  ShapePropertyIter(NativeShape* shape, bool isDictionary)
+      : map_(nullptr, shape->propMap()),
+        mapLength_(shape->propMapLength()),
+        isDictionary_(isDictionary) {
+    static_assert(allowGC == NoGC);
+    MOZ_ASSERT(shape->isDictionary() == isDictionary);
+    MOZ_ASSERT(shape->isNative());
+  }
+
+ public:
+  ShapePropertyIter(JSContext* cx, NativeShape* shape)
+      : ShapePropertyIter(cx, shape, shape->isDictionary()) {}
+
+  explicit ShapePropertyIter(NativeShape* shape)
+      : ShapePropertyIter(shape, shape->isDictionary()) {}
+
+  ShapePropertyIter(JSContext* cx, SharedShape* shape) = delete;
+  explicit ShapePropertyIter(SharedShape* shape) = delete;
+
+  bool done() const { return mapLength_ == 0; }
+
+  void operator++(int) {
+    do {
+      MOZ_ASSERT(!done());
+      if (mapLength_ > 1) {
+        mapLength_--;
+      } else if (map_->hasPrevious()) {
+        map_ = map_->asLinked()->previous();
+        mapLength_ = PropMap::Capacity;
+      } else {
+        map_ = nullptr;
+        mapLength_ = 0;
+        return;
+      }
+    } while (MOZ_UNLIKELY(isDictionary_ && !map_->hasKey(mapLength_ - 1)));
+  }
+
+  PropertyInfoWithKey get() const {
+    MOZ_ASSERT(!done());
+    return map_->getPropertyInfoWithKey(mapLength_ - 1);
+  }
+
+  PropertyInfoWithKey operator*() const { return get(); }
+
+  struct FakePtr {
+    PropertyInfoWithKey val_;
+    const PropertyInfoWithKey* operator->() const { return &val_; }
+  };
+  FakePtr operator->() const { return {get()}; }
+};
+
+template <AllowGC allowGC>
+class MOZ_RAII SharedShapePropertyIter : public ShapePropertyIter<allowGC> {
+ public:
+  SharedShapePropertyIter(JSContext* cx, SharedShape* shape)
+      : ShapePropertyIter<allowGC>(cx, shape,  false) {}
+
+  explicit SharedShapePropertyIter(SharedShape* shape)
+      : ShapePropertyIter<allowGC>(shape,  false) {}
+};
+
+}  
+
+namespace JS {
+namespace ubi {
+
+template <>
+class Concrete<js::Shape> : TracerConcrete<js::Shape> {
+ protected:
+  explicit Concrete(js::Shape* ptr) : TracerConcrete<js::Shape>(ptr) {}
+
+ public:
+  static void construct(void* storage, js::Shape* ptr) {
+    new (storage) Concrete(ptr);
+  }
+
+  Size size(mozilla::MallocSizeOf mallocSizeOf) const override;
+
+  const char16_t* typeName() const override { return concreteTypeName; }
+  static const char16_t concreteTypeName[];
+};
+
+template <>
+class Concrete<js::BaseShape> : TracerConcrete<js::BaseShape> {
+ protected:
+  explicit Concrete(js::BaseShape* ptr) : TracerConcrete<js::BaseShape>(ptr) {}
+
+ public:
+  static void construct(void* storage, js::BaseShape* ptr) {
+    new (storage) Concrete(ptr);
+  }
+
+  Size size(mozilla::MallocSizeOf mallocSizeOf) const override;
+
+  const char16_t* typeName() const override { return concreteTypeName; }
+  static const char16_t concreteTypeName[];
+};
+
+}  
+}  
+
+#endif /* vm_Shape_h */

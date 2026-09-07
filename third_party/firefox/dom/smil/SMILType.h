@@ -1,0 +1,46 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SMIL_SMILTYPE_H_
+#define DOM_SMIL_SMILTYPE_H_
+
+#include "nscore.h"
+
+namespace mozilla {
+
+class SMILValue;
+
+
+class SMILType {
+  friend class SMILValue;
+
+ protected:
+  virtual void InitValue(SMILValue& aValue) const = 0;
+
+  virtual void DestroyValue(SMILValue& aValue) const = 0;
+
+  virtual nsresult Assign(SMILValue& aDest, const SMILValue& aSrc) const = 0;
+
+  virtual bool IsEqual(const SMILValue& aLeft,
+                       const SMILValue& aRight) const = 0;
+
+  virtual nsresult Add(SMILValue& aDest, const SMILValue& aValueToAdd,
+                       uint32_t aCount) const = 0;
+
+  virtual nsresult SandwichAdd(SMILValue& aDest,
+                               const SMILValue& aValueToAdd) const {
+    return Add(aDest, aValueToAdd, 1);
+  }
+
+  virtual nsresult ComputeDistance(const SMILValue& aFrom, const SMILValue& aTo,
+                                   double& aDistance) const = 0;
+
+  virtual nsresult Interpolate(const SMILValue& aStartVal,
+                               const SMILValue& aEndVal, double aUnitDistance,
+                               SMILValue& aResult) const = 0;
+};
+
+}  
+
+#endif  // DOM_SMIL_SMILTYPE_H_

@@ -1,0 +1,76 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+**********************************************************************
+* Copyright (c) 2004-2015, International Business Machines
+* Corporation and others.  All Rights Reserved.
+**********************************************************************
+* Author: Alan Liu
+* Created: April 26, 2004
+* Since: ICU 3.0
+**********************************************************************
+*/
+#ifndef __MEASURE_H__
+#define __MEASURE_H__
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+ 
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/fmtable.h"
+
+U_NAMESPACE_BEGIN
+
+class MeasureUnit;
+
+class U_I18N_API Measure: public UObject {
+ public:
+    Measure(const Formattable& number, MeasureUnit* adoptedUnit,
+            UErrorCode& ec);
+
+    Measure(const Measure& other);
+
+    Measure& operator=(const Measure& other);
+
+    virtual Measure* clone() const;
+
+    virtual ~Measure();
+    
+    bool operator==(const UObject& other) const;
+
+    inline bool operator!=(const UObject& other) const { return !operator==(other); }
+
+    inline const Formattable& getNumber() const;
+
+    inline const MeasureUnit& getUnit() const;
+
+    static UClassID U_EXPORT2 getStaticClassID();
+
+    virtual UClassID getDynamicClassID() const override;
+
+ protected:
+    Measure();
+
+ private:
+    Formattable number;
+
+    MeasureUnit* unit;
+};
+
+inline const Formattable& Measure::getNumber() const {
+    return number;
+}
+
+inline const MeasureUnit& Measure::getUnit() const {
+    return *unit;
+}
+
+U_NAMESPACE_END
+
+#endif // !UCONFIG_NO_FORMATTING
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif // __MEASURE_H__

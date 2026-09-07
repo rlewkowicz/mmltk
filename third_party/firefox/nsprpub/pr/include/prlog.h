@@ -1,0 +1,100 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef prlog_h___
+#define prlog_h___
+
+#include "prtypes.h"
+
+PR_BEGIN_EXTERN_C
+
+
+typedef enum PRLogModuleLevel {
+    PR_LOG_NONE = 0,                
+    PR_LOG_ALWAYS = 1,              
+    PR_LOG_ERROR = 2,               
+    PR_LOG_WARNING = 3,             
+    PR_LOG_DEBUG = 4,               
+
+    PR_LOG_NOTICE = PR_LOG_DEBUG,   
+    PR_LOG_WARN = PR_LOG_WARNING,   
+    PR_LOG_MIN = PR_LOG_DEBUG,      
+    PR_LOG_MAX = PR_LOG_DEBUG       
+} PRLogModuleLevel;
+
+typedef struct PRLogModuleInfo {
+    const char *name;
+    PRLogModuleLevel level;
+    struct PRLogModuleInfo *next;
+} PRLogModuleInfo;
+
+NSPR_API(PRLogModuleInfo*) PR_NewLogModule(const char *name);
+
+NSPR_API(PRBool) PR_SetLogFile(const char *name);
+
+NSPR_API(void) PR_SetLogBuffering(PRIntn buffer_size);
+
+NSPR_API(void) PR_LogPrint(const char *fmt, ...);
+
+NSPR_API(void) PR_LogFlush(void);
+
+NSPR_API(void) PR_Assert(const char *s, const char *file, PRIntn ln)
+PR_PRETEND_NORETURN;
+
+#if defined(DEBUG) || defined(FORCE_PR_LOG)
+#define PR_LOGGING 1
+
+#define PR_LOG_TEST(_module,_level) \
+    ((_module)->level >= (_level))
+
+#define PR_LOG(_module,_level,_args)     \
+    PR_BEGIN_MACRO             \
+      if (PR_LOG_TEST(_module,_level)) { \
+      PR_LogPrint _args;         \
+      }                     \
+    PR_END_MACRO
+
+#else /* defined(DEBUG) || defined(FORCE_PR_LOG) */
+
+#undef PR_LOGGING
+#define PR_LOG_TEST(module,level) 0
+#define PR_LOG(module,level,args)
+
+#endif /* defined(DEBUG) || defined(FORCE_PR_LOG) */
+
+#ifndef NO_NSPR_10_SUPPORT
+
+#ifdef PR_LOGGING
+#define PR_LOG_BEGIN    PR_LOG
+#define PR_LOG_END      PR_LOG
+#define PR_LOG_DEFINE   PR_NewLogModule
+#else
+#define PR_LOG_BEGIN(module,level,args)
+#define PR_LOG_END(module,level,args)
+#define PR_LOG_DEFINE(_name)    NULL
+#endif /* PR_LOGGING */
+
+#endif /* NO_NSPR_10_SUPPORT */
+
+#if defined(DEBUG) || defined(FORCE_PR_ASSERT)
+
+#define PR_ASSERT(_expr) \
+    ((_expr)?((void)0):PR_Assert(# _expr,__FILE__,__LINE__))
+
+#define PR_ASSERT_ARG(_expr) PR_ASSERT(_expr)
+
+#define PR_NOT_REACHED(_reasonStr) \
+    PR_Assert(_reasonStr,__FILE__,__LINE__)
+
+#else
+
+#define PR_ASSERT(expr) ((void) 0)
+#define PR_ASSERT_ARG(expr) ((void)(0 && (expr)))
+#define PR_NOT_REACHED(reasonStr)
+
+#endif /* defined(DEBUG) || defined(FORCE_PR_ASSERT) */
+
+PR_END_EXTERN_C
+
+#endif /* prlog_h___ */

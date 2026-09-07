@@ -1,0 +1,219 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef gc_FinalizationObservers_h
+#define gc_FinalizationObservers_h
+
+#include "gc/Barrier.h"
+#include "gc/WeakMap.h"  // For GetSymbolHash.
+#include "gc/ZoneAllocator.h"
+#include "js/friend/CycleCollector.h"
+#include "js/friend/Wrapper.h"
+#include "js/GCHashTable.h"
+#include "js/GCVector.h"
+#include "js/Value.h"
+#include "vm/NativeObject.h"
+
+namespace js {
+
+class FinalizationRegistryObject;
+class FinalizationRecordObject;
+class FinalizationQueueObject;
+class WeakRefObject;
+
+namespace gc {
+
+
+class ObserverListObject;
+class ObserverList;
+
+class ObserverListPtr {
+  Value value;
+
+  enum Kind : uintptr_t { ElementKind = 0, ListHeadKind = 1, KindMask = 1 };
+
+  explicit ObserverListPtr(Value value);
+  ObserverListPtr(void* ptr, Kind kind);
+
+  Kind kind() const;
+  void* ptr() const;
+
+  template <typename F>
+  auto map(F&& func) const;
+
+ public:
+  MOZ_IMPLICIT ObserverListPtr(ObserverListObject* element);
+  MOZ_IMPLICIT ObserverListPtr(ObserverList* list);
+
+  static ObserverListPtr fromValue(Value value);
+
+  bool operator==(const ObserverListPtr& other) const {
+    return value == other.value;
+  }
+  bool operator!=(const ObserverListPtr& other) const {
+    return !(*this == other);
+  }
+
+  Value asValue() const { return value; }
+
+  bool isElement() const;
+  ObserverListObject* asElement() const;
+  ObserverList* asList() const;
+
+  ObserverListPtr getNext() const;
+  ObserverListPtr getPrev() const;
+  void setNext(ObserverListPtr next);
+  void setPrev(ObserverListPtr prev);
+};
+
+class ObserverListObject : public NativeObject {
+  using Ptr = ObserverListPtr;
+
+  Ptr getNext() const;
+  Ptr getPrev() const;
+  void setNext(Ptr next);
+  void setPrev(Ptr prev);
+  friend class ObserverListPtr;
+  friend class ObserverList;
+
+  static size_t objectMoved(JSObject* obj, JSObject* old);
+  void objectMovedFrom(ObserverListObject* old);
+
+ protected:
+  enum { NextSlot, PrevSlot, SlotCount };
+
+  static const ClassExtension classExtension_;
+
+ public:
+  void unlink();
+  bool isInList() const;
+};
+
+class ObserverList {
+  using Ptr = ObserverListPtr;
+
+  Ptr next;
+  Ptr prev;
+
+  Ptr getNext() const { return next; }
+  Ptr getPrev() const { return prev; }
+  void setNext(Ptr link);
+  void setPrev(Ptr link);
+  friend class ObserverListPtr;
+
+  void makeEmpty();
+
+ public:
+  class Iter;
+
+  ObserverList();
+  ~ObserverList();
+
+  ObserverList(const ObserverList& other) = delete;
+  ObserverList& operator=(const ObserverList& other) = delete;
+  ObserverList(ObserverList&& other);
+  ObserverList& operator=(ObserverList&& other);
+
+  bool isEmpty() const;
+  ObserverListObject* getFirst() const;
+
+  Iter iter();
+
+  void insertFront(ObserverListObject* obj);
+  void append(ObserverList&& other);
+};
+
+struct WeakTargetHasher {
+  using Key = HeapPtr<Value>;
+  using Lookup = Value;
+
+  static bool maybeGetHash(const Lookup& l, HashNumber* hashOut) {
+    if (l.isSymbol()) {
+      *hashOut = GetSymbolHash(l.toSymbol());
+      return true;
+    }
+    return StableCellHasher<Cell*>::maybeGetHash(l.toGCThing(), hashOut);
+  }
+  static bool ensureHash(const Lookup& l, HashNumber* hashOut) {
+    if (l.isSymbol()) {
+      *hashOut = GetSymbolHash(l.toSymbol());
+      return true;
+    }
+    return StableCellHasher<Cell*>::ensureHash(l.toGCThing(), hashOut);
+  }
+  static HashNumber hash(const Lookup& l) {
+    if (l.isSymbol()) {
+      return GetSymbolHash(l.toSymbol());
+    }
+    return StableCellHasher<Cell*>::hash(l.toGCThing());
+  }
+  static bool match(const Key& k, const Lookup& l) {
+    if (k.type() != l.type()) {
+      return false;
+    }
+    if (l.isSymbol()) {
+      return k.toSymbol() == l.toSymbol();
+    }
+    return StableCellHasher<Cell*>::match(k.toGCThing(), l.toGCThing());
+  }
+};
+
+class FinalizationObservers {
+  using RegistrySet =
+      GCHashSet<HeapPtr<FinalizationRegistryObject*>,
+                StableCellHasher<HeapPtr<FinalizationRegistryObject*>>,
+                ZoneAllocPolicy>;
+  RegistrySet registries;
+
+  using ObserverMap = GCHashMap<HeapPtr<Value>, ObserverList, WeakTargetHasher,
+                                ZoneAllocPolicy>;
+  ObserverMap recordMap;
+
+  ObserverMap weakRefMap;
+
+ public:
+  explicit FinalizationObservers(Zone* zone);
+  ~FinalizationObservers();
+
+  bool addRegistry(Handle<FinalizationRegistryObject*> registry);
+  bool addRecord(HandleValue target, Handle<FinalizationRecordObject*> record);
+  void clearRecords();
+
+  bool addWeakRefTarget(Handle<Value> target, Handle<WeakRefObject*> weakRef);
+  void removeWeakRefTarget(Handle<Value> target,
+                           Handle<WeakRefObject*> weakRef);
+
+  void maybeClearWeakRefTargets(JS::ShouldClearWeakRefTargetCallback callback,
+                                void* data);
+
+  bool isTarget(const Value& target);
+  ObserverList extractWeakRefObservers(const Value& target);
+  bool addWeakRefObservers(const Value& target, ObserverList&& list);
+  ObserverList extractRecordObservers(const Value& target);
+  bool addRecordObservers(const Value& target, ObserverList&& list);
+
+  void clearWeakRefTargets(JS::Compartment* source, const Value& target);
+  void clearWeakRefTargets(const CompartmentFilter& sourceFilter,
+                           JS::Realm* targetFilter);
+
+  void traceWeakEdges(JSTracer* trc, JS::Zone* zone);
+
+ private:
+  void traceWeakFinalizationRegistryEdges(JSTracer* trc, JS::Zone* zone);
+  void traceWeakWeakRefEdges(JSTracer* trc);
+  void traceWeakWeakRefList(JSTracer* trc, ObserverList& weakRefs,
+                            Value target);
+  bool shouldQueueFinalizationRegistryForCleanup(FinalizationQueueObject*);
+};
+
+}  
+}  
+
+namespace mozilla {
+template <>
+struct FallibleHashMethods<js::gc::WeakTargetHasher>
+    : public js::gc::WeakTargetHasher {};
+}  
+
+#endif  // gc_FinalizationObservers_h

@@ -1,0 +1,588 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(MOZILLA_GFX_TEXTURECLIENT_H)
+#define MOZILLA_GFX_TEXTURECLIENT_H
+
+#include <stddef.h>  // for size_t
+#include <stdint.h>  // for uint32_t, uint8_t, uint64_t
+
+#include "GLTextureImage.h"  // for TextureImage
+#include "GfxTexturesReporter.h"
+#include "ImageTypes.h"          // for StereoMode
+#include "mozilla/Assertions.h"  // for MOZ_ASSERT, etc
+#include "mozilla/Atomics.h"
+#include "mozilla/Attributes.h"  // for override
+#include "mozilla/Mutex.h"
+#include "mozilla/RefPtr.h"  // for RefPtr, RefCounted
+#include "mozilla/dom/ipc/IdType.h"
+#include "mozilla/gfx/2D.h"  // for DrawTarget
+#include "mozilla/gfx/CriticalSection.h"
+#include "mozilla/gfx/Point.h"  // for IntSize
+#include "mozilla/gfx/Types.h"  // for SurfaceFormat
+#include "mozilla/ipc/Shmem.h"  // for Shmem
+#include "mozilla/layers/AtomicRefCountedWithFinalize.h"
+#include "mozilla/layers/CompositorTypes.h"  // for TextureFlags, etc
+#include "mozilla/layers/ISurfaceAllocator.h"
+#include "mozilla/layers/LayersSurfaces.h"  // for SurfaceDescriptor
+#include "mozilla/layers/LayersTypes.h"
+#include "mozilla/layers/PTextureChild.h"  // for PTextureChild
+#include "mozilla/layers/SyncObject.h"
+#include "mozilla/mozalloc.h"             // for operator delete
+#include "mozilla/UniquePtrExtensions.h"  // for UniqueFileHandle
+#include "mozilla/webrender/WebRenderTypes.h"
+#include "nsCOMPtr.h"         // for already_AddRefed
+#include "nsISupportsImpl.h"  // for TextureImage::AddRef, etc
+#include "nsThreadUtils.h"
+#include "pratom.h"
+
+class gfxImageSurface;
+struct ID3D11Device;
+
+namespace mozilla {
+
+namespace layers {
+
+class AndroidHardwareBufferTextureData;
+class BufferTextureData;
+class CompositableForwarder;
+class FwdTransactionTracker;
+class KnowsCompositor;
+class LayersIPCChannel;
+class CompositableClient;
+struct PlanarYCbCrData;
+class Image;
+class PTextureChild;
+class TextureChild;
+class TextureData;
+class GPUVideoTextureData;
+class TextureClient;
+class ITextureClientRecycleAllocator;
+class SharedSurfaceTextureData;
+class TextureForwarder;
+class ImageBridgeChild;
+class RecordedTextureData;
+struct RemoteTextureOwnerId;
+
+
+enum TextureAllocationFlags {
+  ALLOC_DEFAULT = 0,
+  ALLOC_CLEAR_BUFFER =
+      1 << 1,  
+  ALLOC_CLEAR_BUFFER_WHITE = 1 << 2,  
+  ALLOC_CLEAR_BUFFER_BLACK = 1 << 3,  
+  ALLOC_DISALLOW_BUFFERTEXTURECLIENT = 1 << 4,
+
+  ALLOC_FOR_OUT_OF_BAND_CONTENT = 1 << 5,
+
+  ALLOC_MANUAL_SYNCHRONIZATION = 1 << 6,
+
+  ALLOC_UPDATE_FROM_SURFACE = 1 << 7,
+
+  ALLOC_DO_NOT_ACCELERATE = 1 << 8,
+
+  ALLOC_FORCE_REMOTE = 1 << 9,
+
+  USE_D3D11_KEYED_MUTEX = 1 << 10,
+};
+
+enum class BackendSelector { Content, Canvas };
+
+struct MappedTextureData {
+  uint8_t* data;
+  gfx::IntSize size;
+  int32_t stride;
+  gfx::SurfaceFormat format;
+};
+
+struct MappedYCbCrChannelData {
+  uint8_t* data;
+  gfx::IntSize size;
+  int32_t stride;
+  int32_t skip;
+  uint32_t bytesPerPixel;
+
+  bool CopyInto(MappedYCbCrChannelData& aDst);
+};
+
+struct MappedYCbCrTextureData {
+  MappedYCbCrChannelData y;
+  MappedYCbCrChannelData cb;
+  MappedYCbCrChannelData cr;
+  uint8_t* metadata;
+  StereoMode stereoMode;
+
+  bool CopyInto(MappedYCbCrTextureData& aDst) {
+    return y.CopyInto(aDst.y) && cb.CopyInto(aDst.cb) && cr.CopyInto(aDst.cr);
+  }
+};
+
+class ReadLockDescriptor;
+class NonBlockingTextureReadLock;
+
+class TextureReadLock {
+ protected:
+  virtual ~TextureReadLock() = default;
+
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(TextureReadLock)
+
+  virtual bool ReadLock() = 0;
+  virtual bool TryReadLock(TimeDuration aTimeout) { return ReadLock(); }
+  virtual int32_t ReadUnlock() = 0;
+  virtual bool IsValid() const = 0;
+
+  static already_AddRefed<TextureReadLock> Deserialize(
+      ReadLockDescriptor&& aDescriptor, ISurfaceAllocator* aAllocator);
+
+  virtual bool Serialize(ReadLockDescriptor& aOutput,
+                         base::ProcessId aOther) = 0;
+
+  enum LockType {
+    TYPE_NONBLOCKING_MEMORY,
+    TYPE_NONBLOCKING_SHMEM,
+    TYPE_CROSS_PROCESS_SEMAPHORE
+  };
+  virtual LockType GetType() = 0;
+
+  virtual NonBlockingTextureReadLock* AsNonBlockingLock() { return nullptr; }
+};
+
+class NonBlockingTextureReadLock : public TextureReadLock {
+ public:
+  virtual int32_t GetReadCount() = 0;
+
+  static already_AddRefed<TextureReadLock> Create(LayersIPCChannel* aAllocator);
+
+  NonBlockingTextureReadLock* AsNonBlockingLock() override { return this; }
+};
+
+
+class TextureData {
+ public:
+  struct Info {
+    gfx::IntSize size;
+    gfx::SurfaceFormat format;
+    bool hasSynchronization;
+    bool supportsMoz2D;
+    bool canExposeMappedData;
+    bool canConcurrentlyReadLock;
+
+    Info()
+        : format(gfx::SurfaceFormat::UNKNOWN),
+          hasSynchronization(false),
+          supportsMoz2D(false),
+          canExposeMappedData(false),
+          canConcurrentlyReadLock(true) {}
+  };
+
+  static TextureData* Create(
+      TextureType aTextureType, gfx::SurfaceFormat aFormat,
+      const gfx::IntSize& aSize, TextureAllocationFlags aAllocFlags,
+      gfx::BackendType aBackendType = gfx::BackendType::NONE);
+  static TextureData* Create(TextureForwarder* aAllocator,
+                             gfx::SurfaceFormat aFormat, gfx::IntSize aSize,
+                             KnowsCompositor* aKnowsCompositor,
+                             BackendSelector aSelector,
+                             TextureFlags aTextureFlags,
+                             TextureAllocationFlags aAllocFlags);
+
+  static bool IsRemote(KnowsCompositor* aKnowsCompositor,
+                       BackendSelector aSelector,
+                       gfx::SurfaceFormat aFormat = gfx::SurfaceFormat::UNKNOWN,
+                       gfx::IntSize aSize = gfx::IntSize(1, 1));
+
+  MOZ_COUNTED_DTOR_VIRTUAL(TextureData)
+
+  virtual TextureType GetTextureType() const { return TextureType::Last; }
+
+  virtual void FillInfo(TextureData::Info& aInfo) const = 0;
+
+  virtual void InvalidateContents() {}
+
+  virtual bool Lock(OpenMode aMode) = 0;
+
+  virtual void Unlock() = 0;
+
+  virtual already_AddRefed<gfx::DrawTarget> BorrowDrawTarget() {
+    return nullptr;
+  }
+
+  virtual void ReturnDrawTarget(already_AddRefed<gfx::DrawTarget> aDT);
+
+  virtual void EndDraw() {}
+
+  virtual already_AddRefed<gfx::SourceSurface> BorrowSnapshot() {
+    return nullptr;
+  }
+
+  virtual void ReturnSnapshot(already_AddRefed<gfx::SourceSurface> aSnapshot);
+
+  virtual bool BorrowMappedData(MappedTextureData&) { return false; }
+
+  virtual bool BorrowMappedYCbCrData(MappedYCbCrTextureData&) { return false; }
+
+  virtual void Deallocate(LayersIPCChannel* aAllocator) = 0;
+
+  virtual void Forget(LayersIPCChannel* aAllocator) {}
+
+  virtual bool Serialize(SurfaceDescriptor& aDescriptor) = 0;
+  virtual void GetSubDescriptor(RemoteDecoderVideoSubDescriptor* aOutDesc) {}
+
+  virtual void OnForwardedToHost() {}
+
+  virtual TextureData* CreateSimilar(
+      LayersIPCChannel* aAllocator, LayersBackend aLayersBackend,
+      TextureFlags aFlags = TextureFlags::DEFAULT,
+      TextureAllocationFlags aAllocFlags = ALLOC_DEFAULT) const {
+    return nullptr;
+  }
+
+  virtual bool UpdateFromSurface(gfx::SourceSurface* aSurface) {
+    return false;
+  };
+
+  virtual void SyncWithObject(RefPtr<SyncObjectClient> aSyncObject) {};
+
+  virtual TextureFlags GetTextureFlags() const {
+    return TextureFlags::NO_FLAGS;
+  }
+
+
+  virtual BufferTextureData* AsBufferTextureData() { return nullptr; }
+
+  virtual GPUVideoTextureData* AsGPUVideoTextureData() { return nullptr; }
+
+  virtual AndroidHardwareBufferTextureData*
+  AsAndroidHardwareBufferTextureData() {
+    return nullptr;
+  }
+
+  virtual RecordedTextureData* AsRecordedTextureData() { return nullptr; }
+
+  virtual Maybe<uint64_t> GetBufferId() const { return Nothing(); }
+
+  virtual UniqueFileHandle GetAcquireFence() { return UniqueFileHandle(); }
+
+  virtual bool RequiresRefresh() const { return false; }
+
+  virtual already_AddRefed<FwdTransactionTracker> UseCompositableForwarder(
+      CompositableForwarder* aForwarder) {
+    return nullptr;
+  }
+
+ protected:
+  MOZ_COUNTED_DEFAULT_CTOR(TextureData)
+};
+
+class TextureClient : public AtomicRefCountedWithFinalize<TextureClient> {
+ public:
+  TextureClient(TextureData* aData, TextureFlags aFlags,
+                LayersIPCChannel* aAllocator);
+
+  virtual ~TextureClient();
+
+  static already_AddRefed<TextureClient> CreateWithData(
+      TextureData* aData, TextureFlags aFlags, LayersIPCChannel* aAllocator);
+
+  static already_AddRefed<TextureClient> CreateForDrawing(
+      KnowsCompositor* aAllocator, gfx::SurfaceFormat aFormat,
+      gfx::IntSize aSize, BackendSelector aSelector, TextureFlags aTextureFlags,
+      TextureAllocationFlags flags = ALLOC_DEFAULT);
+
+  static already_AddRefed<TextureClient> CreateFromSurface(
+      KnowsCompositor* aAllocator, gfx::SourceSurface* aSurface,
+      BackendSelector aSelector, TextureFlags aTextureFlags,
+      TextureAllocationFlags aAllocFlags);
+
+  static already_AddRefed<TextureClient> CreateForYCbCr(
+      KnowsCompositor* aAllocator, const gfx::IntRect& aDisplay,
+      const gfx::IntSize& aYSize, uint32_t aYStride,
+      const gfx::IntSize& aCbCrSize, uint32_t aCbCrStride,
+      StereoMode aStereoMode, gfx::ColorDepth aColorDepth,
+      gfx::YUVColorSpace aYUVColorSpace, gfx::ColorRange aColorRange,
+      gfx::TransferFunction aTransferFunction,
+      gfx::ChromaSubsampling aSubsampling, TextureFlags aTextureFlags,
+      const Maybe<gfx::HDRMetadata>& aHDRMetadata = Nothing());
+
+  static already_AddRefed<TextureClient> CreateForRawBufferAccess(
+      KnowsCompositor* aAllocator, gfx::SurfaceFormat aFormat,
+      gfx::IntSize aSize, gfx::BackendType aMoz2dBackend,
+      TextureFlags aTextureFlags, TextureAllocationFlags flags = ALLOC_DEFAULT);
+
+  already_AddRefed<TextureClient> CreateSimilar(
+      LayersBackend aLayersBackend = LayersBackend::LAYERS_NONE,
+      TextureFlags aFlags = TextureFlags::DEFAULT,
+      TextureAllocationFlags aAllocFlags = ALLOC_DEFAULT) const;
+
+  bool Lock(OpenMode aMode);
+
+  void Unlock();
+
+  bool IsLocked() const { return mIsLocked; }
+
+  gfx::IntSize GetSize() const { return mInfo.size; }
+
+  gfx::SurfaceFormat GetFormat() const { return mInfo.format; }
+
+  bool HasSynchronization() const { return mInfo.hasSynchronization; }
+
+  bool CanExposeDrawTarget() const { return mInfo.supportsMoz2D; }
+
+  bool CanExposeMappedData() const { return mInfo.canExposeMappedData; }
+
+  gfx::DrawTarget* BorrowDrawTarget();
+
+  void EndDraw();
+
+  already_AddRefed<gfx::SourceSurface> BorrowSnapshot();
+
+  void ReturnSnapshot(already_AddRefed<gfx::SourceSurface> aSnapshot);
+
+  bool BorrowMappedData(MappedTextureData&);
+  bool BorrowMappedYCbCrData(MappedYCbCrTextureData&);
+
+  void UpdateFromSurface(gfx::SourceSurface* aSurface);
+
+  already_AddRefed<gfx::DataSourceSurface> GetAsSurface();
+
+  bool CopyToTextureClient(TextureClient* aTarget, const gfx::IntRect* aRect,
+                           const gfx::IntPoint* aPoint);
+
+  static already_AddRefed<PTextureChild> CreateIPDLActor();
+
+  static already_AddRefed<TextureClient> AsTextureClient(PTextureChild* actor);
+
+  TextureFlags GetFlags() const { return mFlags; }
+
+  bool HasFlags(TextureFlags aFlags) const {
+    return (mFlags & aFlags) == aFlags;
+  }
+
+  void AddFlags(TextureFlags aFlags);
+
+  void RemoveFlags(TextureFlags aFlags);
+
+  void RecycleTexture(TextureFlags aFlags);
+
+  bool IsImmutable() const { return !!(mFlags & TextureFlags::IMMUTABLE); }
+
+  void MarkImmutable() { AddFlags(TextureFlags::IMMUTABLE); }
+
+  bool IsSharedWithCompositor() const;
+
+  bool IsValid() const { return !!mData; }
+
+  void SetAddedToCompositableClient();
+
+  bool IsAddedToCompositableClient() const {
+    return mAddedToCompositableClient;
+  }
+
+  bool InitIPDLActor(CompositableForwarder* aForwarder);
+
+  bool InitIPDLActor(KnowsCompositor* aKnowsCompositor,
+                     const dom::ContentParentId& aContentId);
+
+  PTextureChild* GetIPDLActor();
+
+  void Destroy();
+
+  void SetWaste(int aWasteArea) {
+    mWasteTracker.Update(aWasteArea, BytesPerPixel(GetFormat()));
+  }
+
+  void SyncWithObject(RefPtr<SyncObjectClient> aSyncObject) {
+    mData->SyncWithObject(aSyncObject);
+  }
+
+  LayersIPCChannel* GetAllocator() { return mAllocator; }
+
+  ITextureClientRecycleAllocator* GetRecycleAllocator() {
+    return mRecycleAllocator;
+  }
+  void SetRecycleAllocator(ITextureClientRecycleAllocator* aAllocator);
+
+  TextureData* GetInternalData() { return mData; }
+  const TextureData* GetInternalData() const { return mData; }
+
+  uint64_t GetSerial() const { return mSerial; }
+  void GetSurfaceDescriptorRemoteDecoder(
+      SurfaceDescriptorRemoteDecoder* aOutDesc);
+
+  void CancelWaitForNotifyNotUsed();
+
+  void SetLastFwdTransactionId(uint64_t aTransactionId) {
+    MOZ_ASSERT(mFwdTransactionId <= aTransactionId);
+    mFwdTransactionId = aTransactionId;
+  }
+
+  uint64_t GetLastFwdTransactionId() { return mFwdTransactionId; }
+
+  bool HasReadLock() const {
+    MutexAutoLock lock(mMutex);
+    return !!mReadLock;
+  }
+
+  int32_t GetNonBlockingReadLockCount() {
+    MutexAutoLock lock(mMutex);
+    if (NS_WARN_IF(!mReadLock)) {
+      MOZ_ASSERT_UNREACHABLE("No read lock created yet?");
+      return 0;
+    }
+    MOZ_ASSERT(mReadLock->AsNonBlockingLock(),
+               "Can only check locked for non-blocking locks!");
+    return mReadLock->AsNonBlockingLock()->GetReadCount();
+  }
+
+  bool IsReadLocked();
+
+  bool ShouldReadLock() const {
+    return bool(mFlags & (TextureFlags::NON_BLOCKING_READ_LOCK |
+                          TextureFlags::BLOCKING_READ_LOCK));
+  }
+
+  bool TryReadLock();
+  void ReadUnlock();
+
+  void SetUpdated() { mUpdated = true; }
+
+  void OnPrepareForwardToHost();
+  void OnAbandonForwardToHost();
+  bool OnForwardedToHost();
+
+  void AddPaintThreadRef();
+
+  void DropPaintThreadRef();
+
+  wr::MaybeExternalImageId GetExternalImageKey() { return mExternalImageId; }
+
+ private:
+  static void TextureClientRecycleCallback(TextureClient* aClient,
+                                           void* aClosure);
+
+  static already_AddRefed<TextureClient> CreateForDrawing(
+      TextureForwarder* aAllocator, gfx::SurfaceFormat aFormat,
+      gfx::IntSize aSize, KnowsCompositor* aKnowsCompositor,
+      BackendSelector aSelector, TextureFlags aTextureFlags,
+      TextureAllocationFlags aAllocFlags = ALLOC_DEFAULT);
+
+  static already_AddRefed<TextureClient> CreateForRawBufferAccess(
+      LayersIPCChannel* aAllocator, gfx::SurfaceFormat aFormat,
+      gfx::IntSize aSize, gfx::BackendType aMoz2dBackend,
+      LayersBackend aLayersBackend, TextureFlags aTextureFlags,
+      TextureAllocationFlags flags = ALLOC_DEFAULT);
+
+  void EnsureHasReadLock() MOZ_REQUIRES(mMutex);
+  void EnableReadLock() MOZ_REQUIRES(mMutex);
+  void EnableBlockingReadLock() MOZ_REQUIRES(mMutex);
+
+  void Finalize() {}
+
+  friend class AtomicRefCountedWithFinalize<TextureClient>;
+
+ protected:
+  bool ToSurfaceDescriptor(SurfaceDescriptor& aDescriptor);
+
+  void LockActor() const;
+  void UnlockActor() const;
+
+  TextureData::Info mInfo;
+  mutable Mutex mMutex;
+
+  RefPtr<LayersIPCChannel> mAllocator;
+  RefPtr<TextureChild> mActor;
+  RefPtr<ITextureClientRecycleAllocator> mRecycleAllocator;
+  RefPtr<TextureReadLock> mReadLock MOZ_GUARDED_BY(mMutex);
+
+  TextureData* mData;
+  RefPtr<gfx::DrawTarget> mBorrowedDrawTarget;
+  bool mBorrowedSnapshot = false;
+
+  TextureFlags mFlags;
+
+  gl::GfxTextureWasteTracker mWasteTracker;
+
+  OpenMode mOpenMode;
+  bool mIsLocked;
+  bool mIsReadLocked MOZ_GUARDED_BY(mMutex);
+  bool mIsPendingForwardReadLocked MOZ_GUARDED_BY(mMutex) = false;
+  bool mUpdated;
+
+  bool mAddedToCompositableClient;
+
+  uint64_t mFwdTransactionId;
+
+  const uint64_t mSerial;
+
+  mozilla::Atomic<uintptr_t> mPaintThreadRefs;
+
+  wr::MaybeExternalImageId mExternalImageId;
+
+  static mozilla::Atomic<uint64_t> sSerialCounter;
+
+  friend class TextureChild;
+  friend void TestTextureClientSurface(TextureClient*, gfxImageSurface*);
+  friend void TestTextureClientYCbCr(TextureClient*, PlanarYCbCrData&);
+  friend void TestYCbCrDescriptorTransferFunction(gfx::TransferFunction,
+                                                  Maybe<gfx::HDRMetadata>,
+                                                  RefPtr<ImageBridgeChild>);
+  friend already_AddRefed<TextureHost> CreateTextureHostWithBackend(
+      TextureClient*, ISurfaceAllocator*, LayersBackend&);
+};
+
+class TextureClientReleaseTask : public Runnable {
+ public:
+  explicit TextureClientReleaseTask(TextureClient* aClient)
+      : Runnable("layers::TextureClientReleaseTask"), mTextureClient(aClient) {}
+
+  NS_IMETHOD Run() override {
+    mTextureClient = nullptr;
+    return NS_OK;
+  }
+
+ private:
+  RefPtr<TextureClient> mTextureClient;
+};
+
+class MOZ_RAII TextureClientAutoLock {
+ public:
+  TextureClientAutoLock(TextureClient* aTexture, OpenMode aMode)
+      : mTexture(aTexture), mSucceeded(false) {
+    mSucceeded = mTexture->Lock(aMode);
+#if defined(DEBUG)
+    mChecked = false;
+#endif
+  }
+  ~TextureClientAutoLock() {
+    MOZ_ASSERT(mChecked);
+    if (mSucceeded) {
+      mTexture->Unlock();
+    }
+  }
+
+  bool Succeeded() {
+#if defined(DEBUG)
+    mChecked = true;
+#endif
+    return mSucceeded;
+  }
+
+ private:
+  TextureClient* mTexture;
+#if defined(DEBUG)
+  bool mChecked;
+#endif
+  bool mSucceeded;
+};
+
+bool UpdateYCbCrTextureClient(TextureClient* aTexture,
+                              const PlanarYCbCrData& aData);
+
+TextureType PreferredCanvasTextureType(KnowsCompositor* aKnowsCompositor);
+
+}  
+}  
+
+#endif

@@ -1,0 +1,367 @@
+// Copyright 2008 Google Inc.  All rights reserved.
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
+
+
+#if !defined(GOOGLE_PROTOBUF_GENERATED_MESSAGE_UTIL_H__)
+#define GOOGLE_PROTOBUF_GENERATED_MESSAGE_UTIL_H__
+
+#include <assert.h>
+
+#include <algorithm>
+#include <atomic>
+#include <climits>
+#include <cstddef>
+#include <cstdint>
+#include <initializer_list>
+#include <memory>
+#include <string>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+#include "google/protobuf/stubs/common.h"
+#include "absl/base/call_once.h"
+#include "absl/base/casts.h"
+#include "absl/base/optimization.h"
+#include "absl/strings/string_view.h"
+#include "absl/types/optional.h"
+#include "google/protobuf/any.h"
+#include "google/protobuf/has_bits.h"
+#include "google/protobuf/implicit_weak_message.h"
+#include "google/protobuf/internal_visibility.h"
+#include "google/protobuf/message_lite.h"
+#include "google/protobuf/port.h"
+#include "google/protobuf/repeated_field.h"
+#include "google/protobuf/repeated_ptr_field.h"
+#include "google/protobuf/wire_format_lite.h"
+
+
+#include "google/protobuf/port_def.inc"
+
+#if defined(SWIG)
+#error "You cannot SWIG proto headers"
+#endif
+
+namespace google {
+namespace protobuf {
+
+class Arena;
+class Message;
+
+namespace io {
+class CodedInputStream;
+}
+
+namespace internal {
+
+
+class ExtensionSet;
+
+PROTOBUF_EXPORT extern std::atomic<bool> init_protobuf_defaults_state;
+PROTOBUF_EXPORT void InitProtobufDefaultsSlow();
+PROTOBUF_EXPORT inline void InitProtobufDefaults() {
+  if (ABSL_PREDICT_FALSE(
+          !init_protobuf_defaults_state.load(std::memory_order_acquire))) {
+    InitProtobufDefaultsSlow();
+  }
+}
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+PROTOBUF_EXPORT inline const std::string& GetEmptyString() {
+  InitProtobufDefaults();
+  return GetEmptyStringAlreadyInited();
+}
+
+union EmptyCord {
+  constexpr EmptyCord() : value() {}
+  ~EmptyCord() {}
+  ::absl::Cord value;
+};
+PROTOBUF_EXPORT extern const EmptyCord empty_cord_;
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+constexpr const ::absl::Cord& GetEmptyCordAlreadyInited() {
+  return empty_cord_.value;
+}
+
+template <typename Msg>
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool AllAreInitialized(
+    const RepeatedPtrField<Msg>& t) {
+  for (int i = t.size(); --i >= 0;) {
+    if (!t.Get(i).IsInitialized()) return false;
+  }
+  return true;
+}
+
+template <class T>
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool AllAreInitializedWeak(
+    const RepeatedPtrField<T>& t) {
+  for (int i = t.size(); --i >= 0;) {
+    if (!reinterpret_cast<const RepeatedPtrFieldBase&>(t)
+             .Get<ImplicitWeakTypeHandler<T> >(i)
+             .IsInitialized()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+inline bool IsPresent(const void* base, uint32_t hasbit) {
+  const uint32_t* has_bits_array = static_cast<const uint32_t*>(base);
+  return (has_bits_array[hasbit / 32] & (1u << (hasbit & 31))) != 0;
+}
+
+PROTOBUF_FUTURE_ADD_EARLY_NODISCARD
+inline bool IsOneofPresent(const void* base, uint32_t offset, uint32_t tag) {
+  const uint32_t* oneof = reinterpret_cast<const uint32_t*>(
+      static_cast<const uint8_t*>(base) + offset);
+  return *oneof == tag >> 3;
+}
+
+typedef void (*SpecialSerializer)(const uint8_t* base, uint32_t offset,
+                                  uint32_t tag, uint32_t has_offset,
+                                  io::CodedOutputStream* output);
+
+PROTOBUF_EXPORT void ExtensionSerializer(const MessageLite* extendee,
+                                         const uint8_t* ptr, uint32_t offset,
+                                         uint32_t tag, uint32_t has_offset,
+                                         io::CodedOutputStream* output);
+PROTOBUF_EXPORT void UnknownFieldSerializerLite(const uint8_t* base,
+                                                uint32_t offset, uint32_t tag,
+                                                uint32_t has_offset,
+                                                io::CodedOutputStream* output);
+
+PROTOBUF_EXPORT MessageLite* DuplicateIfNonNullInternal(MessageLite* message);
+PROTOBUF_EXPORT MessageLite* GetOwnedMessageInternal(Arena* message_arena,
+                                                     MessageLite* submessage,
+                                                     Arena* submessage_arena);
+PROTOBUF_EXPORT void GenericSwap(MessageLite* lhs, MessageLite* rhs);
+PROTOBUF_EXPORT void GenericSwap(Message* lhs, Message* rhs);
+
+template <typename T>
+T* DuplicateIfNonNull(T* message) {
+  return reinterpret_cast<T*>(
+      DuplicateIfNonNullInternal(reinterpret_cast<MessageLite*>(message)));
+}
+
+template <typename T>
+T* GetOwnedMessage(Arena* message_arena, T* submessage,
+                   Arena* submessage_arena) {
+  return reinterpret_cast<T*>(GetOwnedMessageInternal(
+      message_arena, reinterpret_cast<MessageLite*>(submessage),
+      submessage_arena));
+}
+
+PROTOBUF_EXPORT void DestroyMessage(const void* message);
+PROTOBUF_EXPORT void DestroyString(const void* s);
+inline void OnShutdownDestroyMessage(const void* ptr) {
+  OnShutdownRun(DestroyMessage, ptr);
+}
+inline void OnShutdownDestroyString(const std::string* ptr) {
+  OnShutdownRun(DestroyString, ptr);
+}
+
+
+template <typename storage_type>
+struct MapSorterIt {
+  storage_type* ptr;
+  MapSorterIt(storage_type* ptr) : ptr(ptr) {}
+  bool operator==(const MapSorterIt& other) const { return ptr == other.ptr; }
+  bool operator!=(const MapSorterIt& other) const { return !(*this == other); }
+  MapSorterIt& operator++() {
+    ++ptr;
+    return *this;
+  }
+  MapSorterIt operator++(int) {
+    auto other = *this;
+    ++ptr;
+    return other;
+  }
+  MapSorterIt operator+(int v) { return MapSorterIt{ptr + v}; }
+};
+
+template <typename KeyT>
+struct MapSorterLessThan {
+  using storage_type = std::pair<KeyT, const void*>;
+  bool operator()(const storage_type& a, const storage_type& b) const {
+    return a.first < b.first;
+  }
+};
+
+template <typename MapT>
+class MapSorterFlat {
+ public:
+  using value_type = typename MapT::value_type;
+  using storage_type = std::pair<typename MapT::key_type, const void*>;
+
+  struct const_iterator : public MapSorterIt<storage_type> {
+    using pointer = const typename MapT::value_type*;
+    using reference = const typename MapT::value_type&;
+    using MapSorterIt<storage_type>::MapSorterIt;
+
+    pointer operator->() const {
+      return static_cast<const value_type*>(this->ptr->second);
+    }
+    reference operator*() const { return *this->operator->(); }
+  };
+
+  explicit MapSorterFlat(const MapT& m)
+      : size_(m.size()), items_(size_ ? new storage_type[size_] : nullptr) {
+    if (!size_) return;
+    storage_type* it = &items_[0];
+    for (const auto& entry : m) {
+      *it++ = {entry.first, &entry};
+    }
+    std::sort(&items_[0], &items_[size_],
+              MapSorterLessThan<typename MapT::key_type>{});
+  }
+  size_t size() const { return size_; }
+  const_iterator begin() const { return {items_.get()}; }
+  const_iterator end() const { return {items_.get() + size_}; }
+
+ private:
+  size_t size_;
+  std::unique_ptr<storage_type[]> items_;
+};
+
+template <typename KeyT>
+struct MapSorterPtrLessThan {
+  bool operator()(const void* a, const void* b) const {
+    return *reinterpret_cast<const KeyT*>(a) <
+           *reinterpret_cast<const KeyT*>(b);
+  }
+};
+
+template <typename MapT>
+class MapSorterPtr {
+ public:
+  using value_type = typename MapT::value_type;
+  using storage_type = const void*;
+
+  struct const_iterator : public MapSorterIt<storage_type> {
+    using pointer = const typename MapT::value_type*;
+    using reference = const typename MapT::value_type&;
+    using MapSorterIt<storage_type>::MapSorterIt;
+
+    pointer operator->() const {
+      return static_cast<const value_type*>(*this->ptr);
+    }
+    reference operator*() const { return *this->operator->(); }
+  };
+
+  explicit MapSorterPtr(const MapT& m)
+      : size_(m.size()), items_(size_ ? new storage_type[size_] : nullptr) {
+    if (!size_) return;
+    storage_type* it = &items_[0];
+    for (const auto& entry : m) {
+      *it++ = &entry;
+    }
+    static_assert(PROTOBUF_FIELD_OFFSET(typename MapT::value_type, first) == 0,
+                  "Must hold for MapSorterPtrLessThan to work.");
+    std::sort(&items_[0], &items_[size_],
+              MapSorterPtrLessThan<typename MapT::key_type>{});
+  }
+  size_t size() const { return size_; }
+  const_iterator begin() const { return {items_.get()}; }
+  const_iterator end() const { return {items_.get() + size_}; }
+
+ private:
+  size_t size_;
+  std::unique_ptr<storage_type[]> items_;
+};
+
+struct WeakDescriptorDefaultTail {
+  const MessageGlobalsBase** target;
+  size_t size;
+};
+
+struct BytesTag {
+  explicit BytesTag() = default;
+};
+
+inline void AssignToString(std::string& dest, const std::string& value,
+                           BytesTag  = BytesTag{}) {
+  dest.assign(value);
+}
+inline void AssignToString(std::string& dest, std::string&& value,
+                           BytesTag  = BytesTag{}) {
+  dest.assign(std::move(value));
+}
+inline void AssignToString(std::string& dest, const char* value,
+                           BytesTag  = BytesTag{}) {
+  dest.assign(value);
+}
+inline void AssignToString(std::string& dest, const char* value,
+                           std::size_t size) {
+  dest.assign(value, size);
+}
+inline void AssignToString(std::string& dest, const void* value,
+                           std::size_t size, BytesTag ) {
+  dest.assign(reinterpret_cast<const char*>(value), size);
+}
+inline void AssignToString(std::string& dest, absl::string_view value,
+                           BytesTag  = BytesTag{}) {
+  dest.assign(value.data(), value.size());
+}
+
+template <typename Arg, typename... Args>
+void AddToRepeatedPtrField(InternalVisibility visibility, google::protobuf::Arena* arena,
+                           google::protobuf::RepeatedPtrField<std::string>& dest,
+                           Arg&& value, Args... args) {
+  AssignToString(*dest.InternalAddWithArena(visibility, arena),
+                 std::forward<Arg>(value), args...);
+}
+inline void AddToRepeatedPtrField(InternalVisibility visibility,
+                                  google::protobuf::Arena* arena,
+                                  google::protobuf::RepeatedPtrField<std::string>& dest,
+                                  std::string&& value,
+                                  BytesTag  = BytesTag{}) {
+  dest.InternalAddWithArena(visibility, arena, std::move(value));
+}
+
+struct PrivateAccess {
+  template <typename T, int number>
+  static constexpr bool IsLazyField() {
+    constexpr auto l =
+        [](auto& msg) -> decltype(msg._lazy_internal_mutable(
+                          std::integral_constant<int, number>{})) {};
+    return std::is_invocable_v<decltype(l), T&>;
+  }
+
+  template <int number, typename T>
+  static auto& MutableLazy(T& msg) {
+    return msg._lazy_internal_mutable(std::integral_constant<int, number>{});
+  }
+
+  template <typename T>
+  static auto& GetExtensionSet(T& msg) {
+    return msg._impl_._extensions_;
+  }
+
+  template <typename T>
+  static void TrackerOnGetMetadata() {
+    T::Impl_::TrackerOnGetMetadata();
+  }
+
+  template <typename T>
+  static constexpr auto GenerateParseTable(
+      const ::google::protobuf::internal::ClassData* class_data) {
+    return T::InternalGenerateParseTable_(class_data);
+  }
+
+  static internal::ExtensionSet* GetExtensionSet(MessageLite* msg);
+  static const internal::ExtensionSet* GetExtensionSet(const MessageLite* msg);
+
+  template <typename T>
+  using ImplTForTesting = typename T::Impl_;
+};
+
+}  
+}  
+}  
+
+#include "google/protobuf/port_undef.inc"
+
+#endif

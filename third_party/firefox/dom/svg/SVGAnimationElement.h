@@ -1,0 +1,123 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SVG_SVGANIMATIONELEMENT_H_
+#define DOM_SVG_SVGANIMATIONELEMENT_H_
+
+#include "mozilla/SMILTimedElement.h"
+#include "mozilla/dom/IDTracker.h"
+#include "mozilla/dom/SVGElement.h"
+#include "mozilla/dom/SVGTests.h"
+
+namespace mozilla::dom {
+
+using SVGAnimationElementBase = SVGElement;
+
+class SVGAnimationElement : public SVGAnimationElementBase, public SVGTests {
+ protected:
+  explicit SVGAnimationElement(
+      already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo);
+  nsresult Init();
+  virtual ~SVGAnimationElement() = default;
+
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+
+  NS_IMPL_FROMNODE_HELPER(SVGAnimationElement, IsSVGAnimationElement())
+
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(SVGAnimationElement,
+                                           SVGAnimationElementBase)
+
+  bool IsSVGAnimationElement() const final { return true; }
+  bool PassesConditionalProcessingTests() const final {
+    return SVGTests::PassesConditionalProcessingTests();
+  }
+  nsresult Clone(dom::NodeInfo*, nsINode** aResult) const override = 0;
+
+  nsresult BindToTree(BindContext&, nsINode& aParent) override;
+  void UnbindFromTree(UnbindContext&) override;
+
+  bool ParseAttribute(int32_t aNamespaceID, nsAtom* aAttribute,
+                      const nsAString& aValue,
+                      nsIPrincipal* aMaybeScriptedPrincipal,
+                      nsAttrValue& aResult) override;
+  void AfterSetAttr(int32_t aNamespaceID, nsAtom* aName,
+                    const nsAttrValue* aValue, const nsAttrValue* aOldValue,
+                    nsIPrincipal* aSubjectPrincipal, bool aNotify) override;
+
+  Element* GetTargetElementContent();
+  virtual bool GetTargetAttributeName(int32_t* aNamespaceID,
+                                      nsAtom** aLocalName) const;
+  mozilla::SMILTimedElement& TimedElement();
+  mozilla::SMILTimeContainer* GetTimeContainer();
+  virtual SMILAnimationFunction& AnimationFunction() = 0;
+
+  bool IsEventAttributeNameInternal(nsAtom* aName) override;
+
+  void ActivateByHyperlink();
+
+  bool IsDisabled();
+
+  SVGElement* GetTargetElement();
+  float GetStartTime(ErrorResult& rv);
+  float GetCurrentTimeAsFloat();
+  float GetSimpleDuration(ErrorResult& aRv);
+  void BeginElement(ErrorResult& aRv) { BeginElementAt(0.f, aRv); }
+  void BeginElementAt(float offset, ErrorResult& aRv);
+  void EndElement(ErrorResult& aRv) { EndElementAt(0.f, aRv); }
+  void EndElementAt(float offset, ErrorResult& aRv);
+
+
+  EventHandlerNonNull* GetOnbegin() {
+    return GetEventHandler(nsGkAtoms::onbeginEvent);
+  }
+  void SetOnbegin(EventHandlerNonNull* handler) {
+    EventTarget::SetEventHandler(nsGkAtoms::onbeginEvent, handler);
+  }
+
+  EventHandlerNonNull* GetOnrepeat() {
+    return GetEventHandler(nsGkAtoms::onrepeatEvent);
+  }
+  void SetOnrepeat(EventHandlerNonNull* handler) {
+    EventTarget::SetEventHandler(nsGkAtoms::onrepeatEvent, handler);
+  }
+
+  EventHandlerNonNull* GetOnend() {
+    return GetEventHandler(nsGkAtoms::onendEvent);
+  }
+  void SetOnend(EventHandlerNonNull* handler) {
+    EventTarget::SetEventHandler(nsGkAtoms::onendEvent, handler);
+  }
+
+  SVGElement* AsSVGElement() final { return this; }
+
+ protected:
+
+  void UpdateHrefTarget(const nsAString& aHrefStr);
+  void AnimationTargetChanged();
+
+  class HrefTargetTracker final : public IDTracker {
+   public:
+    explicit HrefTargetTracker(SVGAnimationElement* aAnimationElement)
+        : mAnimationElement(aAnimationElement) {}
+
+   protected:
+    void ElementChanged(Element* aFrom, Element* aTo) override {
+      IDTracker::ElementChanged(aFrom, aTo);
+      mAnimationElement->AnimationTargetChanged();
+    }
+
+    bool IsPersistent() override { return true; }
+
+   private:
+    SVGAnimationElement* const mAnimationElement;
+  };
+
+  HrefTargetTracker mHrefTarget;
+  mozilla::SMILTimedElement mTimedElement;
+};
+
+}  
+
+#endif  // DOM_SVG_SVGANIMATIONELEMENT_H_

@@ -1,0 +1,50 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_BroadcastChannelChild_h
+#define mozilla_dom_BroadcastChannelChild_h
+
+#include "mozilla/dom/PBroadcastChannelChild.h"
+
+namespace mozilla {
+
+namespace ipc {
+class BackgroundChildImpl;
+}  
+
+namespace dom {
+
+class BroadcastChannel;
+
+class BroadcastChannelChild final : public PBroadcastChannelChild {
+  friend class mozilla::ipc::BackgroundChildImpl;
+
+ public:
+  NS_INLINE_DECL_REFCOUNTING(BroadcastChannelChild)
+
+  void SetParent(BroadcastChannel* aBC) { mBC = aBC; }
+
+  virtual mozilla::ipc::IPCResult RecvNotify(
+      NotNull<SharedMessageBody*> aData) override;
+
+  virtual mozilla::ipc::IPCResult RecvRefMessageDelivered(
+      const nsID& aMessageID, const uint32_t& aOtherBCs) override;
+
+  bool IsActorDestroyed() const { return mActorDestroyed; }
+
+ private:
+  BroadcastChannelChild();
+  ~BroadcastChannelChild();
+
+  virtual void ActorDestroy(ActorDestroyReason aWhy) override;
+
+  BroadcastChannel* mBC;
+
+  bool mActorDestroyed;
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_BroadcastChannelChild_h

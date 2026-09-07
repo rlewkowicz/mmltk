@@ -1,0 +1,150 @@
+// Copyright Mozilla Foundation. See the COPYRIGHT
+// file at the top-level directory of this distribution.
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// https://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+// THIS IS A GENERATED FILE. PLEASE DO NOT EDIT.
+
+#ifndef cheddar_generated_encoding_rs_h
+#define cheddar_generated_encoding_rs_h
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <stdbool.h>
+#include <stdint.h>
+#include "encoding_rs_statics.h"
+
+ENCODING_RS_ENCODING const* encoding_for_label(uint8_t const* label,
+                                               size_t label_len);
+
+ENCODING_RS_ENCODING const* encoding_for_label_no_replacement(
+    uint8_t const* label, size_t label_len);
+
+ENCODING_RS_ENCODING const* encoding_for_bom(uint8_t const* buffer,
+                                             size_t* buffer_len);
+
+size_t encoding_name(ENCODING_RS_ENCODING const* encoding, uint8_t* name_out);
+
+bool encoding_can_encode_everything(ENCODING_RS_ENCODING const* encoding);
+
+bool encoding_is_ascii_compatible(ENCODING_RS_ENCODING const* encoding);
+
+bool encoding_is_single_byte(ENCODING_RS_ENCODING const* encoding);
+
+ENCODING_RS_ENCODING const* encoding_output_encoding(
+    ENCODING_RS_ENCODING const* encoding);
+
+ENCODING_RS_DECODER* encoding_new_decoder(ENCODING_RS_ENCODING const* encoding);
+
+/// decoder for another encoding: A BOM for another encoding is treated as
+ENCODING_RS_DECODER* encoding_new_decoder_with_bom_removal(
+    ENCODING_RS_ENCODING const* encoding);
+
+ENCODING_RS_DECODER* encoding_new_decoder_without_bom_handling(
+    ENCODING_RS_ENCODING const* encoding);
+
+void encoding_new_decoder_into(ENCODING_RS_ENCODING const* encoding,
+                               ENCODING_RS_DECODER* decoder);
+
+/// decoder for another encoding: A BOM for another encoding is treated as
+void encoding_new_decoder_with_bom_removal_into(
+    ENCODING_RS_ENCODING const* encoding, ENCODING_RS_DECODER* decoder);
+
+void encoding_new_decoder_without_bom_handling_into(
+    ENCODING_RS_ENCODING const* encoding, ENCODING_RS_DECODER* decoder);
+
+ENCODING_RS_ENCODER* encoding_new_encoder(ENCODING_RS_ENCODING const* encoding);
+
+void encoding_new_encoder_into(ENCODING_RS_ENCODING const* encoding,
+                               ENCODING_RS_ENCODER* encoder);
+
+size_t encoding_utf8_valid_up_to(uint8_t const* buffer, size_t buffer_len);
+
+size_t encoding_ascii_valid_up_to(uint8_t const* buffer, size_t buffer_len);
+
+size_t encoding_iso_2022_jp_ascii_valid_up_to(uint8_t const* buffer,
+                                              size_t buffer_len);
+
+void decoder_free(ENCODING_RS_DECODER* decoder);
+
+ENCODING_RS_ENCODING const* decoder_encoding(
+    ENCODING_RS_DECODER const* decoder);
+
+size_t decoder_max_utf8_buffer_length(ENCODING_RS_DECODER const* decoder,
+                                      size_t byte_length);
+
+size_t decoder_max_utf8_buffer_length_without_replacement(
+    ENCODING_RS_DECODER const* decoder, size_t byte_length);
+
+uint32_t decoder_decode_to_utf8(ENCODING_RS_DECODER* decoder,
+                                uint8_t const* src, size_t* src_len,
+                                uint8_t* dst, size_t* dst_len, bool last,
+                                bool* had_replacements);
+
+uint32_t decoder_decode_to_utf8_without_replacement(
+    ENCODING_RS_DECODER* decoder, uint8_t const* src, size_t* src_len,
+    uint8_t* dst, size_t* dst_len, bool last);
+
+size_t decoder_max_utf16_buffer_length(ENCODING_RS_DECODER const* decoder,
+                                       size_t u16_length);
+
+uint32_t decoder_decode_to_utf16(ENCODING_RS_DECODER* decoder,
+                                 uint8_t const* src, size_t* src_len,
+                                 char16_t* dst, size_t* dst_len, bool last,
+                                 bool* had_replacements);
+
+uint32_t decoder_decode_to_utf16_without_replacement(
+    ENCODING_RS_DECODER* decoder, uint8_t const* src, size_t* src_len,
+    char16_t* dst, size_t* dst_len, bool last);
+
+size_t decoder_latin1_byte_compatible_up_to(ENCODING_RS_DECODER const* decoder,
+                                            uint8_t const* buffer,
+                                            size_t buffer_len);
+
+void encoder_free(ENCODING_RS_ENCODER* encoder);
+
+ENCODING_RS_ENCODING const* encoder_encoding(
+    ENCODING_RS_ENCODER const* encoder);
+
+bool encoder_has_pending_state(ENCODING_RS_ENCODER const* encoder);
+
+size_t encoder_max_buffer_length_from_utf8_if_no_unmappables(
+    ENCODING_RS_ENCODER const* encoder, size_t byte_length);
+
+size_t encoder_max_buffer_length_from_utf8_without_replacement(
+    ENCODING_RS_ENCODER const* encoder, size_t byte_length);
+
+uint32_t encoder_encode_from_utf8(ENCODING_RS_ENCODER* encoder,
+                                  uint8_t const* src, size_t* src_len,
+                                  uint8_t* dst, size_t* dst_len, bool last,
+                                  bool* had_replacements);
+
+uint32_t encoder_encode_from_utf8_without_replacement(
+    ENCODING_RS_ENCODER* encoder, uint8_t const* src, size_t* src_len,
+    uint8_t* dst, size_t* dst_len, bool last);
+
+size_t encoder_max_buffer_length_from_utf16_if_no_unmappables(
+    ENCODING_RS_ENCODER const* encoder, size_t u16_length);
+
+size_t encoder_max_buffer_length_from_utf16_without_replacement(
+    ENCODING_RS_ENCODER const* encoder, size_t u16_length);
+
+uint32_t encoder_encode_from_utf16(ENCODING_RS_ENCODER* encoder,
+                                   char16_t const* src, size_t* src_len,
+                                   uint8_t* dst, size_t* dst_len, bool last,
+                                   bool* had_replacements);
+
+uint32_t encoder_encode_from_utf16_without_replacement(
+    ENCODING_RS_ENCODER* encoder, char16_t const* src, size_t* src_len,
+    uint8_t* dst, size_t* dst_len, bool last);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

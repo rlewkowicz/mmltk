@@ -1,0 +1,186 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_workers_WorkerLoadInfo_h
+#define mozilla_dom_workers_WorkerLoadInfo_h
+
+#include "mozilla/OriginAttributes.h"
+#include "mozilla/OriginTrials.h"
+#include "mozilla/StorageAccess.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/dom/ChannelInfo.h"
+#include "mozilla/dom/OffThreadCSPContext.h"
+#include "mozilla/dom/ServiceWorkerRegistrationDescriptor.h"
+#include "mozilla/dom/WorkerCommon.h"
+#include "mozilla/ipc/PBackgroundSharedTypes.h"
+#include "mozilla/net/NeckoChannelParams.h"
+#include "nsIInterfaceRequestor.h"
+#include "nsILoadContext.h"
+#include "nsIRequest.h"
+#include "nsISupportsImpl.h"
+#include "nsIWeakReferenceUtils.h"
+#include "nsRFPService.h"
+#include "nsTArray.h"
+
+class nsIChannel;
+class nsIContentSecurityPolicy;
+class nsICookieJarSettings;
+class nsILoadGroup;
+class nsIPrincipal;
+class nsIReferrerInfo;
+class nsIRunnable;
+class nsIScriptContext;
+class nsIBrowserChild;
+class nsIURI;
+class nsPIDOMWindowInner;
+
+namespace mozilla {
+
+namespace ipc {
+class PrincipalInfo;
+}  
+
+namespace dom {
+
+class WorkerPrivate;
+
+struct WorkerLoadInfoData {
+  nsCOMPtr<nsIURI> mBaseURI;
+  nsCOMPtr<nsIURI> mResolvedScriptURI;
+
+  nsCOMPtr<nsIPrincipal> mLoadingPrincipal;
+  nsCOMPtr<nsIPrincipal> mPrincipal;
+  nsCOMPtr<nsIPrincipal> mPartitionedPrincipal;
+
+  nsCOMPtr<nsICookieJarSettings> mCookieJarSettings;
+
+  net::CookieJarSettingsArgs mCookieJarSettingsArgs;
+
+  nsCOMPtr<nsIScriptContext> mScriptContext;
+  nsCOMPtr<nsPIDOMWindowInner> mWindow;
+  nsCOMPtr<nsIContentSecurityPolicy> mCSP;
+  UniquePtr<OffThreadCSPContext> mCSPContext;
+
+  uint16_t mIPAddressSpace = 0;  
+
+  nsCOMPtr<nsIChannel> mChannel;
+  nsCOMPtr<nsILoadGroup> mLoadGroup;
+
+  class InterfaceRequestor final : public nsIInterfaceRequestor {
+    NS_DECL_ISUPPORTS
+
+   public:
+    InterfaceRequestor(nsIPrincipal* aPrincipal, nsILoadGroup* aLoadGroup);
+    void MaybeAddBrowserChild(nsILoadGroup* aLoadGroup);
+    NS_IMETHOD GetInterface(const nsIID& aIID, void** aSink) override;
+
+    void SetOuterRequestor(nsIInterfaceRequestor* aOuterRequestor) {
+      MOZ_ASSERT(!mOuterRequestor);
+      MOZ_ASSERT(aOuterRequestor);
+      mOuterRequestor = aOuterRequestor;
+    }
+
+   private:
+    ~InterfaceRequestor() = default;
+
+    already_AddRefed<nsIBrowserChild> GetAnyLiveBrowserChild();
+
+    nsCOMPtr<nsILoadContext> mLoadContext;
+    nsCOMPtr<nsIInterfaceRequestor> mOuterRequestor;
+
+    nsTArray<nsWeakPtr> mBrowserChildList;
+  };
+
+  RefPtr<InterfaceRequestor> mInterfaceRequestor;
+
+  UniquePtr<mozilla::ipc::PrincipalInfo> mPrincipalInfo;
+  UniquePtr<mozilla::ipc::PrincipalInfo> mPartitionedPrincipalInfo;
+  nsCString mDomain;
+
+  nsString mServiceWorkerCacheName;
+  Maybe<ServiceWorkerDescriptor> mServiceWorkerDescriptor;
+  Maybe<ServiceWorkerRegistrationDescriptor>
+      mServiceWorkerRegistrationDescriptor;
+  Maybe<ClientInfo> mSourceInfo;
+
+  Maybe<ServiceWorkerDescriptor> mParentController;
+
+  nsID mAgentClusterId;
+
+  ChannelInfo mChannelInfo;
+  nsLoadFlags mLoadFlags;
+
+  uint64_t mWindowID;
+  uint64_t mAssociatedBrowsingContextID;
+
+  nsCString mLanguageOverrideLocale;
+  nsTArray<nsString> mLanguageOverride;
+  nsString mTimezoneOverride;
+
+  nsCOMPtr<nsIReferrerInfo> mReferrerInfo;
+  OriginTrials mTrials;
+  bool mFromWindow;
+  bool mXHRParamsAllowed;
+  bool mWatchedByDevTools;
+  StorageAccess mStorageAccess;
+  bool mUseRegularPrincipal;
+  bool mUsingStorageAccess;
+  bool mSerialAllowed;
+  bool mShouldResistFingerprinting;
+  Maybe<RFPTargetSet> mOverriddenFingerprintingSettings;
+  OriginAttributes mOriginAttributes;
+  bool mIsThirdPartyContext;
+  bool mIsOn3PCBExceptionList;
+
+  nsCString mReportingEndpointsHeader;
+
+  enum {
+    eNotSet,
+    eInsecureContext,
+    eSecureContext,
+  } mSecureContext;
+
+  WorkerLoadInfoData();
+  WorkerLoadInfoData(WorkerLoadInfoData&& aOther) = default;
+
+  WorkerLoadInfoData& operator=(WorkerLoadInfoData&& aOther) = default;
+};
+
+struct WorkerLoadInfo : WorkerLoadInfoData {
+  WorkerLoadInfo();
+  WorkerLoadInfo(WorkerLoadInfo&& aOther) noexcept;
+  ~WorkerLoadInfo();
+
+  WorkerLoadInfo& operator=(WorkerLoadInfo&& aOther) = default;
+
+  nsresult SetPrincipalsAndCSPOnMainThread(nsIPrincipal* aPrincipal,
+                                           nsIPrincipal* aPartitionedPrincipal,
+                                           nsILoadGroup* aLoadGroup,
+                                           nsIContentSecurityPolicy* aCSP);
+
+  nsresult GetPrincipalsAndLoadGroupFromChannel(
+      nsIChannel* aChannel, nsIPrincipal** aPrincipalOut,
+      nsIPrincipal** aPartitionedPrincipalOut, nsILoadGroup** aLoadGroupOut);
+
+  nsresult SetPrincipalsAndCSPFromChannel(nsIChannel* aChannel);
+
+  bool FinalChannelPrincipalIsValid(nsIChannel* aChannel);
+
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+  bool PrincipalIsValid() const;
+
+  bool PrincipalURIMatchesScriptURL();
+#endif
+
+  bool ProxyReleaseMainThreadObjects(WorkerPrivate* aWorkerPrivate);
+
+  bool ProxyReleaseMainThreadObjects(
+      WorkerPrivate* aWorkerPrivate,
+      nsCOMPtr<nsILoadGroup>&& aLoadGroupToCancel);
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_workers_WorkerLoadInfo_h

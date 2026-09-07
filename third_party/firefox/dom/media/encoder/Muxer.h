@@ -1,0 +1,51 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_MEDIA_ENCODER_MUXER_H_
+#define DOM_MEDIA_ENCODER_MUXER_H_
+
+#include "MediaQueue.h"
+#include "mozilla/media/MediaUtils.h"
+
+namespace mozilla {
+
+class ContainerWriter;
+class EncodedFrame;
+class TrackMetadataBase;
+
+class Muxer {
+ public:
+  Muxer(UniquePtr<ContainerWriter> aWriter,
+        MediaQueue<EncodedFrame>& aEncodedAudioQueue,
+        MediaQueue<EncodedFrame>& aEncodedVideoQueue);
+  ~Muxer() = default;
+
+  void Disconnect();
+
+  bool IsFinished();
+
+  bool NeedsMetadata() const { return !mMetadataSet; }
+
+  nsresult SetMetadata(const nsTArray<RefPtr<TrackMetadataBase>>& aMetadata);
+
+  nsresult GetData(nsTArray<nsTArray<uint8_t>>* aOutputBuffers);
+
+ private:
+  nsresult Mux();
+
+  MediaQueue<EncodedFrame>& mEncodedAudioQueue;
+  MediaQueue<EncodedFrame>& mEncodedVideoQueue;
+  MediaEventListener mAudioPushListener;
+  MediaEventListener mAudioFinishListener;
+  MediaEventListener mVideoPushListener;
+  MediaEventListener mVideoFinishListener;
+  UniquePtr<ContainerWriter> mWriter;
+  bool mMetadataSet = false;
+  bool mMetadataEncoded = false;
+  bool mHasAudio = false;
+  bool mHasVideo = false;
+};
+}  
+
+#endif

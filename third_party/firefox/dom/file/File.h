@@ -1,0 +1,84 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_File_h
+#define mozilla_dom_File_h
+
+#include "mozilla/dom/Blob.h"
+
+class nsIFile;
+
+namespace mozilla::dom {
+
+struct ChromeFilePropertyBag;
+struct FilePropertyBag;
+class Promise;
+
+class File final : public Blob {
+  friend class Blob;
+
+ public:
+  static File* Create(nsIGlobalObject* aGlobal, BlobImpl* aImpl);
+
+  static already_AddRefed<File> CreateMemoryFileWithLastModifiedNow(
+      nsIGlobalObject* aGlobal, void* aMemoryBuffer, uint64_t aLength,
+      const nsAString& aName, const nsAString& aContentType);
+
+  static already_AddRefed<File> CreateMemoryFileWithCustomLastModified(
+      nsIGlobalObject* aGlobal, void* aMemoryBuffer, uint64_t aLength,
+      const nsAString& aName, const nsAString& aContentType,
+      int64_t aLastModifiedDate);
+
+  static already_AddRefed<File> CreateFromFile(nsIGlobalObject* aGlobal,
+                                               nsIFile* aFile);
+
+  static already_AddRefed<File> CreateFromFile(nsIGlobalObject* aGlobal,
+                                               nsIFile* aFile,
+                                               const nsAString& aName,
+                                               const nsAString& aContentType);
+
+
+  JSObject* WrapObject(JSContext* cx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  static already_AddRefed<File> Constructor(const GlobalObject& aGlobal,
+                                            const Sequence<BlobPart>& aData,
+                                            const nsAString& aName,
+                                            const FilePropertyBag& aBag,
+                                            ErrorResult& aRv);
+
+  static already_AddRefed<Promise> CreateFromFileName(
+      const GlobalObject& aGlobal, const nsAString& aPath,
+      const ChromeFilePropertyBag& aBag, SystemCallerGuarantee aGuarantee,
+      ErrorResult& aRv);
+
+  static already_AddRefed<Promise> CreateFromNsIFile(
+      const GlobalObject& aGlobal, nsIFile* aData,
+      const ChromeFilePropertyBag& aBag, SystemCallerGuarantee aGuarantee,
+      ErrorResult& aRv);
+
+  void GetName(nsAString& aFileName) const;
+
+  int64_t GetLastModified(ErrorResult& aRv);
+
+  void GetRelativePath(nsAString& aPath) const;
+
+  void SetMozRelativePath(const nsAString& aPath);
+
+  void GetMozFullPath(nsAString& aFilename, SystemCallerGuarantee aGuarantee,
+                      ErrorResult& aRv);
+
+  void GetMozFullPathInternal(nsAString& aFileName, ErrorResult& aRv);
+
+ protected:
+  bool HasFileInterface() const override { return true; }
+
+ private:
+  File(nsIGlobalObject* aGlobal, BlobImpl* aImpl);
+  ~File() override;
+};
+
+}  
+
+#endif  // mozilla_dom_File_h

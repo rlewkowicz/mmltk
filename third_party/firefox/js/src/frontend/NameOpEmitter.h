@@ -1,0 +1,116 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef frontend_NameOpEmitter_h
+#define frontend_NameOpEmitter_h
+
+#include "mozilla/Attributes.h"
+
+#include <stddef.h>
+
+#include "frontend/NameAnalysisTypes.h"
+#include "frontend/ParserAtom.h"  // TaggedParserAtomIndex
+#include "vm/SharedStencil.h"     // GCThingIndex
+
+namespace js {
+namespace frontend {
+
+struct BytecodeEmitter;
+enum class ValueUsage;
+
+class MOZ_STACK_CLASS NameOpEmitter {
+ public:
+  enum class Kind {
+    Get,
+    Call,
+    PostIncrement,
+    PreIncrement,
+    PostDecrement,
+    PreDecrement,
+    SimpleAssignment,
+    CompoundAssignment,
+    Initialize
+  };
+
+ private:
+  BytecodeEmitter* bce_;
+
+  Kind kind_;
+
+  bool emittedBindOp_ = false;
+
+  TaggedParserAtomIndex name_;
+
+  GCThingIndex atomIndex_;
+
+  NameLocation loc_;
+
+#ifdef DEBUG
+  enum class State {
+    Start,
+
+    Get,
+
+    IncDec,
+
+    Rhs,
+
+    Assignment,
+  };
+  State state_ = State::Start;
+#endif
+
+ public:
+  NameOpEmitter(BytecodeEmitter* bce, TaggedParserAtomIndex name, Kind kind);
+  NameOpEmitter(BytecodeEmitter* bce, TaggedParserAtomIndex name,
+                const NameLocation& loc, Kind kind);
+
+ private:
+  [[nodiscard]] bool isCall() const { return kind_ == Kind::Call; }
+
+  [[nodiscard]] bool isSimpleAssignment() const {
+    return kind_ == Kind::SimpleAssignment;
+  }
+
+  [[nodiscard]] bool isCompoundAssignment() const {
+    return kind_ == Kind::CompoundAssignment;
+  }
+
+  [[nodiscard]] bool isIncDec() const {
+    return isPostIncDec() || isPreIncDec();
+  }
+
+  [[nodiscard]] bool isPostIncDec() const {
+    return kind_ == Kind::PostIncrement || kind_ == Kind::PostDecrement;
+  }
+
+  [[nodiscard]] bool isPreIncDec() const {
+    return kind_ == Kind::PreIncrement || kind_ == Kind::PreDecrement;
+  }
+
+  [[nodiscard]] bool isInc() const {
+    return kind_ == Kind::PostIncrement || kind_ == Kind::PreIncrement;
+  }
+
+  [[nodiscard]] bool isInitialize() const { return kind_ == Kind::Initialize; }
+
+  JSOp strictifySetNameOp(JSOp op) const;
+
+ public:
+  [[nodiscard]] bool emittedBindOp() const { return emittedBindOp_; }
+
+  [[nodiscard]] const NameLocation& loc() const { return loc_; }
+
+  [[nodiscard]] bool emitGet();
+  [[nodiscard]] bool prepareForRhs();
+  [[nodiscard]] bool emitAssignment();
+  [[nodiscard]] bool emitIncDec(ValueUsage valueUsage);
+
+  size_t numReferenceSlots() const { return emittedBindOp(); }
+};
+
+} 
+} 
+
+#endif /* frontend_NameOpEmitter_h */

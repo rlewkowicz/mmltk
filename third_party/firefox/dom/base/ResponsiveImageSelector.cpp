@@ -1,0 +1,607 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/ResponsiveImageSelector.h"
+
+#include "mozilla/PresShell.h"
+#include "mozilla/PresShellInlines.h"
+#include "mozilla/ServoStyleSetInlines.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/DocumentInlines.h"
+#include "nsCSSProps.h"
+#include "nsContentUtils.h"
+#include "nsIURI.h"
+#include "nsPresContext.h"
+
+using namespace mozilla;
+using namespace mozilla::dom;
+
+namespace mozilla::dom {
+
+NS_IMPL_CYCLE_COLLECTION(ResponsiveImageSelector, mOwnerNode,
+                         mSelectedCandidateURL)
+
+static bool ParseInteger(const nsAString& aString, int32_t& aInt) {
+  nsContentUtils::ParseHTMLIntegerResultFlags parseResult;
+  aInt = nsContentUtils::ParseHTMLInteger(aString, &parseResult);
+  return !(parseResult &
+           (nsContentUtils::eParseHTMLInteger_Error |
+            nsContentUtils::eParseHTMLInteger_DidNotConsumeAllInput |
+            nsContentUtils::eParseHTMLInteger_NonStandard));
+}
+
+ResponsiveImageSelector::ResponsiveImageSelector(nsIContent* aContent)
+    : mOwnerNode(aContent), mSelectedCandidateIndex(-1) {}
+
+ResponsiveImageSelector::ResponsiveImageSelector(dom::Document* aDocument)
+    : mOwnerNode(aDocument), mSelectedCandidateIndex(-1) {}
+
+ResponsiveImageSelector::~ResponsiveImageSelector() = default;
+
+void ResponsiveImageSelector::ParseSourceSet(
+    const nsAString& aSrcSet,
+    FunctionRef<void(ResponsiveImageCandidate&&)> aCallback) {
+  nsAString::const_iterator iter, end;
+  aSrcSet.BeginReading(iter);
+  aSrcSet.EndReading(end);
+
+  while (iter != end) {
+    nsAString::const_iterator url, urlEnd, descriptor;
+
+    for (; iter != end &&
+           (nsContentUtils::IsHTMLWhitespace(*iter) || *iter == char16_t(','));
+         ++iter);
+
+    if (iter == end) {
+      break;
+    }
+
+    url = iter;
+
+    for (; iter != end && !nsContentUtils::IsHTMLWhitespace(*iter); ++iter);
+
+    while (iter != url) {
+      if (*(--iter) != char16_t(',')) {
+        iter++;
+        break;
+      }
+    }
+
+    const nsDependentSubstring& urlStr = Substring(url, iter);
+
+    MOZ_ASSERT(url != iter, "Shouldn't have empty URL at this point");
+
+    ResponsiveImageCandidate candidate;
+    if (candidate.ConsumeDescriptors(iter, end)) {
+      candidate.SetURLSpec(urlStr);
+      aCallback(std::move(candidate));
+    }
+  }
+}
+
+bool ResponsiveImageSelector::SetCandidatesFromSourceSet(
+    const nsAString& aSrcSet, nsIPrincipal* aTriggeringPrincipal) {
+  ClearSelectedCandidate();
+
+  if (!mOwnerNode || !mOwnerNode->GetBaseURI()) {
+    MOZ_ASSERT(false, "Should not be parsing SourceSet without a document");
+    return false;
+  }
+
+  mCandidates.Clear();
+
+  auto eachCandidate = [&](ResponsiveImageCandidate&& aCandidate) {
+    aCandidate.SetTriggeringPrincipal(
+        nsContentUtils::GetAttrTriggeringPrincipal(
+            Content(), aCandidate.URLString(), aTriggeringPrincipal));
+    AppendCandidateIfUnique(std::move(aCandidate));
+  };
+
+  ParseSourceSet(aSrcSet, eachCandidate);
+
+  bool parsedCandidates = !mCandidates.IsEmpty();
+
+  MaybeAppendDefaultCandidate();
+
+  return parsedCandidates;
+}
+
+uint32_t ResponsiveImageSelector::NumCandidates(bool aIncludeDefault) {
+  uint32_t candidates = mCandidates.Length();
+
+  if (!aIncludeDefault && candidates && mCandidates.LastElement().IsDefault()) {
+    candidates--;
+  }
+
+  return candidates;
+}
+
+nsIContent* ResponsiveImageSelector::Content() {
+  return mOwnerNode->IsContent() ? mOwnerNode->AsContent() : nullptr;
+}
+
+dom::Document* ResponsiveImageSelector::Document() {
+  return mOwnerNode->OwnerDoc();
+}
+
+void ResponsiveImageSelector::ClearDefaultSource() {
+  ClearSelectedCandidate();
+  if (!mCandidates.IsEmpty() && mCandidates.LastElement().IsDefault()) {
+    mCandidates.RemoveLastElement();
+  }
+}
+
+void ResponsiveImageSelector::SetDefaultSource(nsIURI* aURI,
+                                               nsIPrincipal* aPrincipal) {
+  ClearDefaultSource();
+  mDefaultSourceTriggeringPrincipal = aPrincipal;
+  mDefaultSourceURL = VoidString();
+  if (aURI) {
+    nsAutoCString spec;
+    aURI->GetSpec(spec);
+    CopyUTF8toUTF16(spec, mDefaultSourceURL);
+  }
+  MaybeAppendDefaultCandidate();
+}
+
+void ResponsiveImageSelector::SetDefaultSource(const nsAString& aURLString,
+                                               nsIPrincipal* aPrincipal) {
+  ClearDefaultSource();
+  mDefaultSourceTriggeringPrincipal = aPrincipal;
+  mDefaultSourceURL = aURLString;
+  MaybeAppendDefaultCandidate();
+}
+
+void ResponsiveImageSelector::ClearSelectedCandidate() {
+  mSelectedCandidateIndex = -1;
+  mSelectedCandidateURL = nullptr;
+}
+
+bool ResponsiveImageSelector::SetSizesFromDescriptor(const nsAString& aSizes) {
+  ClearSelectedCandidate();
+
+  NS_ConvertUTF16toUTF8 sizes(aSizes);
+  mServoSourceSizeList.reset(Servo_SourceSizeList_Parse(&sizes));
+  return !!mServoSourceSizeList;
+}
+
+void ResponsiveImageSelector::AppendCandidateIfUnique(
+    ResponsiveImageCandidate&& aCandidate) {
+  int numCandidates = mCandidates.Length();
+
+  if (aCandidate.IsDefault()) {
+    return;
+  }
+
+  for (int i = 0; i < numCandidates; i++) {
+    if (mCandidates[i].HasSameParameter(aCandidate)) {
+      return;
+    }
+  }
+
+  mCandidates.AppendElement(std::move(aCandidate));
+}
+
+void ResponsiveImageSelector::MaybeAppendDefaultCandidate() {
+  if (mDefaultSourceURL.IsEmpty()) {
+    return;
+  }
+
+  int numCandidates = mCandidates.Length();
+
+  for (int i = 0; i < numCandidates; i++) {
+    if (mCandidates[i].IsComputedFromWidth()) {
+      return;
+    } else if (mCandidates[i].Density(this) == 1.0) {
+      return;
+    }
+  }
+
+  ResponsiveImageCandidate defaultCandidate;
+  defaultCandidate.SetParameterDefault();
+  defaultCandidate.SetURLSpec(mDefaultSourceURL);
+  defaultCandidate.SetTriggeringPrincipal(mDefaultSourceTriggeringPrincipal);
+  mCandidates.AppendElement(std::move(defaultCandidate));
+}
+
+already_AddRefed<nsIURI> ResponsiveImageSelector::GetSelectedImageURL() {
+  SelectImage();
+
+  nsCOMPtr<nsIURI> url = mSelectedCandidateURL;
+  return url.forget();
+}
+
+bool ResponsiveImageSelector::GetSelectedImageURLSpec(nsAString& aResult) {
+  SelectImage();
+
+  if (mSelectedCandidateIndex == -1) {
+    return false;
+  }
+
+  aResult.Assign(mCandidates[mSelectedCandidateIndex].URLString());
+  return true;
+}
+
+double ResponsiveImageSelector::GetSelectedImageDensity() {
+  int bestIndex = GetSelectedCandidateIndex();
+  if (bestIndex < 0) {
+    return 1.0;
+  }
+
+  return mCandidates[bestIndex].Density(this);
+}
+
+nsIPrincipal* ResponsiveImageSelector::GetSelectedImageTriggeringPrincipal() {
+  int bestIndex = GetSelectedCandidateIndex();
+  if (bestIndex < 0) {
+    return nullptr;
+  }
+
+  return mCandidates[bestIndex].TriggeringPrincipal();
+}
+
+bool ResponsiveImageSelector::SelectImage(bool aReselect) {
+  if (!aReselect && mSelectedCandidateIndex != -1) {
+    return false;
+  }
+
+  int oldBest = mSelectedCandidateIndex;
+  ClearSelectedCandidate();
+
+  int numCandidates = mCandidates.Length();
+  if (!numCandidates) {
+    return oldBest != -1;
+  }
+
+  dom::Document* doc = Document();
+  nsPresContext* pctx = doc->GetPresContext();
+  nsCOMPtr<nsIURI> baseURI = mOwnerNode->GetBaseURI();
+
+  if (!pctx || !baseURI) {
+    return oldBest != -1;
+  }
+
+  double displayDensity = pctx->CSSPixelsToDevPixels(1.0f);
+  double overrideDPPX = pctx->GetOverrideDPPX();
+
+  if (overrideDPPX > 0) {
+    displayDensity = overrideDPPX;
+  }
+  if (doc->ShouldResistFingerprinting(RFPTarget::WindowDevicePixelRatio)) {
+    displayDensity =
+        nsRFPService::GetDevicePixelRatioAtZoom(pctx->GetFullZoom());
+  }
+
+
+  double computedWidth = -1;
+  for (int i = 0; i < numCandidates; i++) {
+    if (mCandidates[i].IsComputedFromWidth()) {
+      DebugOnly<bool> computeResult =
+          ComputeFinalWidthForCurrentViewport(&computedWidth);
+      MOZ_ASSERT(computeResult,
+                 "Computed candidates not allowed without sizes data");
+      break;
+    }
+  }
+
+  int bestIndex = -1;
+  double bestDensity = -1.0;
+  for (int i = 0; i < numCandidates; i++) {
+    double candidateDensity = (computedWidth == -1)
+                                  ? mCandidates[i].Density(this)
+                                  : mCandidates[i].Density(computedWidth);
+    if (bestIndex == -1 ||
+        (bestDensity < displayDensity && candidateDensity > bestDensity) ||
+        (candidateDensity >= displayDensity &&
+         candidateDensity < bestDensity)) {
+      bestIndex = i;
+      bestDensity = candidateDensity;
+    }
+  }
+
+  MOZ_ASSERT(bestIndex >= 0 && bestIndex < numCandidates);
+
+  nsresult rv;
+  const nsAString& urlStr = mCandidates[bestIndex].URLString();
+  nsCOMPtr<nsIURI> candidateURL;
+  rv = nsContentUtils::NewURIWithDocumentCharset(getter_AddRefs(candidateURL),
+                                                 urlStr, doc, baseURI);
+
+  mSelectedCandidateURL = NS_SUCCEEDED(rv) ? candidateURL : nullptr;
+  mSelectedCandidateIndex = bestIndex;
+
+  return mSelectedCandidateIndex != oldBest;
+}
+
+int ResponsiveImageSelector::GetSelectedCandidateIndex() {
+  SelectImage();
+
+  return mSelectedCandidateIndex;
+}
+
+bool ResponsiveImageSelector::ComputeFinalWidthForCurrentViewport(
+    double* aWidth) {
+  dom::Document* doc = Document();
+  PresShell* presShell = doc->GetPresShell();
+  nsPresContext* pctx = presShell ? presShell->GetPresContext() : nullptr;
+
+  if (!pctx) {
+    return false;
+  }
+  nscoord effectiveWidth =
+      presShell->StyleSet()->EvaluateSourceSizeList(mServoSourceSizeList.get());
+  if (mAutoWidth != -1) {
+    effectiveWidth = mAutoWidth;
+  }
+
+  *aWidth =
+      nsPresContext::AppUnitsToDoubleCSSPixels(std::max(effectiveWidth, 0));
+  return true;
+}
+
+ResponsiveImageCandidate::ResponsiveImageCandidate() {
+  mType = CandidateType::Invalid;
+  mValue.mDensity = 1.0;
+}
+
+void ResponsiveImageCandidate::SetURLSpec(const nsAString& aURLString) {
+  mURLString = aURLString;
+}
+
+void ResponsiveImageCandidate::SetTriggeringPrincipal(
+    nsIPrincipal* aPrincipal) {
+  mTriggeringPrincipal = aPrincipal;
+}
+
+void ResponsiveImageCandidate::SetParameterAsComputedWidth(int32_t aWidth) {
+  mType = CandidateType::ComputedFromWidth;
+  mValue.mWidth = aWidth;
+}
+
+void ResponsiveImageCandidate::SetParameterDefault() {
+  MOZ_ASSERT(!IsValid(), "double setting candidate type");
+
+  mType = CandidateType::Default;
+  mValue.mDensity = 1.0;
+}
+
+void ResponsiveImageCandidate::SetParameterInvalid() {
+  mType = CandidateType::Invalid;
+  mValue.mDensity = 1.0;
+}
+
+void ResponsiveImageCandidate::SetParameterAsDensity(double aDensity) {
+  MOZ_ASSERT(!IsValid(), "double setting candidate type");
+
+  mType = CandidateType::Density;
+  mValue.mDensity = aDensity;
+}
+
+struct ResponsiveImageDescriptors {
+  ResponsiveImageDescriptors() : mInvalid(false) {};
+
+  Maybe<double> mDensity;
+  Maybe<int32_t> mWidth;
+  Maybe<int32_t> mFutureCompatHeight;
+  bool mInvalid;
+
+  void AddDescriptor(const nsAString& aDescriptor);
+  bool Valid();
+  void FillCandidate(ResponsiveImageCandidate& aCandidate);
+};
+
+void ResponsiveImageDescriptors::AddDescriptor(const nsAString& aDescriptor) {
+  if (aDescriptor.IsEmpty()) {
+    return;
+  }
+
+  nsAString::const_iterator descStart, descType;
+  aDescriptor.BeginReading(descStart);
+  aDescriptor.EndReading(descType);
+  descType--;
+  const nsDependentSubstring& valueStr = Substring(descStart, descType);
+  if (*descType == char16_t('w')) {
+    int32_t possibleWidth;
+    // descriptor, fall through.
+    if (ParseInteger(valueStr, possibleWidth) && possibleWidth >= 0) {
+      if (possibleWidth != 0 && mWidth.isNothing() && mDensity.isNothing()) {
+        mWidth.emplace(possibleWidth);
+      } else {
+        mInvalid = true;
+      }
+
+      return;
+    }
+  } else if (*descType == char16_t('h')) {
+    int32_t possibleHeight;
+    // descriptor, fall through.
+    if (ParseInteger(valueStr, possibleHeight) && possibleHeight >= 0) {
+      if (possibleHeight != 0 && mFutureCompatHeight.isNothing() &&
+          mDensity.isNothing()) {
+        mFutureCompatHeight.emplace(possibleHeight);
+      } else {
+        mInvalid = true;
+      }
+
+      return;
+    }
+  } else if (*descType == char16_t('x')) {
+    // descriptor, fall through.
+    if (auto possibleDensity =
+            nsContentUtils::ParseHTMLFloatingPointNumber(valueStr)) {
+      if (*possibleDensity >= 0.0 && mWidth.isNothing() &&
+          mDensity.isNothing() && mFutureCompatHeight.isNothing()) {
+        mDensity = std::move(possibleDensity);
+      } else {
+        mInvalid = true;
+      }
+
+      return;
+    }
+  }
+
+  mInvalid = true;
+}
+
+bool ResponsiveImageDescriptors::Valid() {
+  return !mInvalid && !(mFutureCompatHeight.isSome() && mWidth.isNothing());
+}
+
+void ResponsiveImageDescriptors::FillCandidate(
+    ResponsiveImageCandidate& aCandidate) {
+  if (!Valid()) {
+    aCandidate.SetParameterInvalid();
+  } else if (mWidth.isSome()) {
+    MOZ_ASSERT(mDensity.isNothing());  
+
+    aCandidate.SetParameterAsComputedWidth(*mWidth);
+  } else if (mDensity.isSome()) {
+    MOZ_ASSERT(mWidth.isNothing());  
+
+    aCandidate.SetParameterAsDensity(*mDensity);
+  } else {
+    aCandidate.SetParameterAsDensity(1.0);
+  }
+}
+
+bool ResponsiveImageCandidate::ConsumeDescriptors(
+    nsAString::const_iterator& aIter,
+    const nsAString::const_iterator& aIterEnd) {
+  nsAString::const_iterator& iter = aIter;
+  const nsAString::const_iterator& end = aIterEnd;
+
+  bool inParens = false;
+
+  ResponsiveImageDescriptors descriptors;
+
+
+  for (; iter != end && nsContentUtils::IsHTMLWhitespace(*iter); ++iter);
+
+  nsAString::const_iterator currentDescriptor = iter;
+
+  for (;; iter++) {
+    if (iter == end) {
+      descriptors.AddDescriptor(Substring(currentDescriptor, iter));
+      break;
+    } else if (inParens) {
+      if (*iter == char16_t(')')) {
+        inParens = false;
+      }
+    } else {
+      if (*iter == char16_t(',')) {
+        descriptors.AddDescriptor(Substring(currentDescriptor, iter));
+        iter++;
+        break;
+      }
+      if (nsContentUtils::IsHTMLWhitespace(*iter)) {
+        descriptors.AddDescriptor(Substring(currentDescriptor, iter));
+        for (; iter != end && nsContentUtils::IsHTMLWhitespace(*iter); ++iter);
+        if (iter == end) {
+          break;
+        }
+        currentDescriptor = iter;
+        iter--;
+      } else if (*iter == char16_t('(')) {
+        inParens = true;
+      }
+    }
+  }
+
+  descriptors.FillCandidate(*this);
+
+  return IsValid();
+}
+
+bool ResponsiveImageCandidate::HasSameParameter(
+    const ResponsiveImageCandidate& aOther) const {
+  if (aOther.mType != mType) {
+    return false;
+  }
+
+  if (mType == CandidateType::Default) {
+    return true;
+  }
+
+  if (mType == CandidateType::Density) {
+    return aOther.mValue.mDensity == mValue.mDensity;
+  }
+
+  if (mType == CandidateType::Invalid) {
+    MOZ_ASSERT_UNREACHABLE("Comparing invalid candidates?");
+    return true;
+  }
+
+  if (mType == CandidateType::ComputedFromWidth) {
+    return aOther.mValue.mWidth == mValue.mWidth;
+  }
+
+  MOZ_ASSERT(false, "Somebody forgot to check for all uses of this enum");
+  return false;
+}
+
+double ResponsiveImageCandidate::Density(
+    ResponsiveImageSelector* aSelector) const {
+  if (mType == CandidateType::ComputedFromWidth) {
+    double width;
+    if (!aSelector->ComputeFinalWidthForCurrentViewport(&width)) {
+      return 1.0;
+    }
+    return Density(width);
+  }
+
+  MOZ_ASSERT(mType == CandidateType::Default || mType == CandidateType::Density,
+             "unhandled candidate type");
+  return Density(-1);
+}
+
+void ResponsiveImageCandidate::AppendDescriptors(
+    nsAString& aDescriptors) const {
+  MOZ_ASSERT(IsValid());
+  switch (mType) {
+    case CandidateType::Default:
+    case CandidateType::Invalid:
+      return;
+    case CandidateType::ComputedFromWidth:
+      aDescriptors.Append(' ');
+      aDescriptors.AppendInt(mValue.mWidth);
+      aDescriptors.Append('w');
+      return;
+    case CandidateType::Density:
+      aDescriptors.Append(' ');
+      aDescriptors.AppendFloat(mValue.mDensity);
+      aDescriptors.Append('x');
+      return;
+  }
+}
+
+double ResponsiveImageCandidate::Density(double aMatchingWidth) const {
+  if (mType == CandidateType::Invalid) {
+    MOZ_ASSERT(false, "Getting density for uninitialized candidate");
+    return 1.0;
+  }
+
+  if (mType == CandidateType::Default) {
+    return 1.0;
+  }
+
+  if (mType == CandidateType::Density) {
+    return mValue.mDensity;
+  }
+  if (mType == CandidateType::ComputedFromWidth) {
+    if (aMatchingWidth < 0) {
+      MOZ_ASSERT(
+          false,
+          "Don't expect to have a negative matching width at this point");
+      return 1.0;
+    }
+    double density = double(mValue.mWidth) / aMatchingWidth;
+    MOZ_ASSERT(density > 0.0);
+    return density;
+  }
+
+  MOZ_ASSERT(false, "Unknown candidate type");
+  return 1.0;
+}
+
+}  

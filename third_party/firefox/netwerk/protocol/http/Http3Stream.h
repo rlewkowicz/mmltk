@@ -1,0 +1,114 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_net_Http3Stream_h
+#define mozilla_net_Http3Stream_h
+
+#include "nsAHttpTransaction.h"
+#include "ARefBase.h"
+#include "Http3StreamBase.h"
+#include "nsIClassOfService.h"
+
+namespace mozilla {
+namespace net {
+
+class Http3Session;
+
+class Http3Stream : public nsAHttpSegmentReader,
+                    public nsAHttpSegmentWriter,
+                    public Http3StreamBase {
+ public:
+  NS_DECL_NSAHTTPSEGMENTREADER
+  NS_DECL_NSAHTTPSEGMENTWRITER
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(Http3Stream, override)
+
+  Http3Stream(nsAHttpTransaction*, Http3Session*, const ClassOfService&,
+              uint64_t);
+
+  Http3WebTransportSession* GetHttp3WebTransportSession() override {
+    return nullptr;
+  }
+  Http3WebTransportStream* GetHttp3WebTransportStream() override {
+    return nullptr;
+  }
+  Http3Stream* GetHttp3Stream() override { return this; }
+  Http3ConnectUDPStream* GetHttp3ConnectUDPStream() override { return nullptr; }
+  Http3StreamTunnel* GetHttp3StreamTunnel() override { return nullptr; }
+
+  virtual nsresult TryActivating();
+
+  void CurrentBrowserIdChanged(uint64_t id);
+
+  [[nodiscard]] nsresult ReadSegments() override;
+  [[nodiscard]] nsresult WriteSegments() override;
+
+  bool Done() const override { return mRecvState == RECV_DONE; }
+
+  void Close(nsresult aResult) override;
+  bool RecvdData() const { return mDataReceived; }
+
+  void StopSending();
+
+  void SetResponseHeaders(nsTArray<uint8_t>& aResponseHeaders, bool fin,
+                          bool interim) override;
+
+  bool Do0RTT() override;
+  nsresult Finish0RTT(bool aRestart) override;
+
+  uint8_t PriorityUrgency();
+  bool PriorityIncremental();
+
+ protected:
+  ~Http3Stream() = default;
+
+  bool GetHeadersString(const char* buf, uint32_t avail, uint32_t* countUsed);
+  nsresult StartRequest();
+
+  void SetIncremental(bool incremental);
+
+  enum SendStreamState {
+    PREPARING_HEADERS,
+    WAITING_TO_ACTIVATE,
+    SENDING_BODY,
+    EARLY_RESPONSE,
+    SEND_DONE
+  } mSendState{PREPARING_HEADERS};
+
+  enum RecvStreamState {
+    BEFORE_HEADERS,
+    READING_HEADERS,
+    READING_INTERIM_HEADERS,
+    READING_DATA,
+    RECEIVED_FIN,
+    RECV_DONE
+  } mRecvState{BEFORE_HEADERS};
+
+  nsCString mFlatHttpRequestHeaders;
+  bool mDataReceived{false};
+  nsTArray<uint8_t> mFlatResponseHeaders;
+  uint64_t mTransactionBrowserId{0};
+  uint64_t mCurrentBrowserId;
+  uint8_t mPriorityUrgency{3};  
+  bool mPriorityIncremental{false};
+
+  uint64_t mTotalSent{0};
+  uint64_t mTotalRead{0};
+
+  bool mAttempting0RTT = false;
+
+  uint32_t mSendingBlockedByFlowControlCount = 0;
+
+  nsresult mSocketInCondition = NS_ERROR_NOT_INITIALIZED;
+  nsresult mSocketOutCondition = NS_ERROR_NOT_INITIALIZED;
+
+#ifdef DEBUG
+  uint32_t mRequestBodyLenExpected{0};
+  uint32_t mRequestBodyLenSent{0};
+#endif
+};
+
+}  
+}  
+
+#endif  // mozilla_net_Http3Stream_h

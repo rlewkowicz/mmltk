@@ -1,0 +1,86 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsXULTooltipListener_h_
+#define nsXULTooltipListener_h_
+
+#include "Units.h"
+#include "nsCOMPtr.h"
+#include "nsIDOMEventListener.h"
+#include "nsITimer.h"
+#include "nsIWeakReferenceUtils.h"
+#include "nsString.h"
+
+class nsIContent;
+class nsTreeColumn;
+
+namespace mozilla {
+namespace dom {
+class Event;
+class MouseEvent;
+class XULTreeElement;
+}  
+class WidgetKeyboardEvent;
+}  
+
+class nsXULTooltipListener final : public nsIDOMEventListener {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIDOMEVENTLISTENER
+
+  void MouseOut(mozilla::dom::Event* aEvent);
+  void MouseMove(mozilla::dom::Event* aEvent);
+
+  void AddTooltipSupport(nsIContent* aNode);
+  void RemoveTooltipSupport(nsIContent* aNode);
+  static nsXULTooltipListener* GetInstance() {
+    if (!sInstance) {
+      sInstance = new nsXULTooltipListener();
+    }
+    return sInstance;
+  }
+
+  static bool KeyEventHidesTooltip(const mozilla::WidgetKeyboardEvent&);
+  static bool ShowTooltips();
+
+ protected:
+  nsXULTooltipListener();
+  ~nsXULTooltipListener();
+
+  void KillTooltipTimer();
+
+  void CheckTreeBodyMove(mozilla::dom::MouseEvent* aMouseEvent);
+  mozilla::dom::XULTreeElement* GetSourceTree();
+
+  nsresult ShowTooltip();
+  void LaunchTooltip();
+  nsresult HideTooltip();
+  nsresult DestroyTooltip();
+  nsresult FindTooltip(nsIContent* aTarget, nsIContent** aTooltip);
+  nsresult GetTooltipFor(nsIContent* aTarget, nsIContent** aTooltip);
+
+  static nsXULTooltipListener* sInstance;
+
+  nsWeakPtr mSourceNode;
+  nsWeakPtr mTargetNode;
+  nsWeakPtr mCurrentTooltip;
+  nsWeakPtr mPreviousMouseMoveTarget;
+  nsWeakPtr mTooltipSourceDoc;
+
+  nsCOMPtr<nsITimer> mTooltipTimer;
+  static void sTooltipCallback(nsITimer* aTimer, void* aListener);
+
+  mozilla::LayoutDeviceIntPoint mMouseScreenPoint;
+
+  static constexpr mozilla::LayoutDeviceIntCoord kTooltipMouseMoveTolerance = 7;
+
+  bool mTooltipShownOnce;
+
+  bool mIsSourceTree;
+  bool mNeedTitletip;
+  int32_t mLastTreeRow;
+  RefPtr<nsTreeColumn> mLastTreeCol;
+};
+
+#endif  // nsXULTooltipListener

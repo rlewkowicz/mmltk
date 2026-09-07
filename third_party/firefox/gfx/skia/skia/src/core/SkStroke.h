@@ -1,0 +1,69 @@
+/*
+ * Copyright 2006 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkStroke_DEFINED)
+#define SkStroke_DEFINED
+
+#include "include/core/SkPaint.h"
+#include "include/core/SkPathTypes.h"
+#include "include/core/SkScalar.h"
+#include "include/private/base/SkAssert.h"
+#include "include/private/base/SkDebug.h"
+#include "include/private/base/SkTo.h"
+
+#include <cmath>
+#include <cstdint>
+
+class SkPath;
+class SkPathBuilder;
+struct SkRect;
+
+#if defined(SK_DEBUG)
+extern bool gDebugStrokerErrorSet;
+extern SkScalar gDebugStrokerError;
+extern int gMaxRecursion[];
+#endif
+
+class SkStroke {
+public:
+    SkStroke();
+    explicit SkStroke(const SkPaint&);
+    SkStroke(const SkPaint&, SkScalar width);   
+
+    SkPaint::Cap getCap() const { return (SkPaint::Cap)fCap; }
+    void         setCap(SkPaint::Cap);
+
+    SkPaint::Join getJoin() const { return (SkPaint::Join)fJoin; }
+    void          setJoin(SkPaint::Join);
+
+    void    setMiterLimit(SkScalar);
+    void    setWidth(SkScalar);
+
+    bool    getDoFill() const { return SkToBool(fDoFill); }
+    void    setDoFill(bool doFill) { fDoFill = SkToU8(doFill); }
+
+    SkScalar getResScale() const { return fResScale; }
+    void setResScale(SkScalar rs) {
+        SkASSERT(rs > 0 && std::isfinite(rs));
+        fResScale = rs;
+    }
+
+    void    strokeRect(const SkRect& rect, SkPathBuilder* result,
+                       SkPathDirection = SkPathDirection::kCW) const;
+    void    strokePath(const SkPath& path, SkPathBuilder*) const;
+
+
+private:
+    SkScalar    fWidth, fMiterLimit;
+    SkScalar    fResScale;
+    uint8_t     fCap, fJoin;
+    bool        fDoFill;
+
+    friend class SkPaint;
+};
+
+#endif

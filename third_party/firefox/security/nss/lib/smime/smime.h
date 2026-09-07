@@ -1,0 +1,56 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef _SMIME_H_
+#define _SMIME_H_ 1
+
+#include "cms.h"
+
+SEC_BEGIN_PROTOS
+
+extern SECStatus NSS_SMIMEUtil_EnableCipher(long which, int on);
+
+PRBool NSS_SMIMEUtil_EncryptionEnabled(int which);
+
+extern SECStatus NSS_SMIMEUtils_AllowCipher(long which, int on);
+
+extern PRBool NSS_SMIMEUtil_DecryptionAllowed(SECAlgorithmID *algid, PK11SymKey *key);
+
+extern PRBool NSS_SMIMEUtil_EncryptionAllowed(SECAlgorithmID *algid, PK11SymKey *key);
+
+extern PRBool NSS_SMIMEUtil_EncryptionPossible(void);
+
+extern PRBool NSS_SMIMEUtil_SigningAllowed(SECAlgorithmID *algid);
+
+extern PRBool NSS_SMIMEUtil_KeyEncodingAllowed(SECAlgorithmID *algtag,
+                                               CERTCertificate *cert, SECKEYPublicKey *key);
+
+extern PRBool NSS_SMIMEUtil_KeyDecodingAllowed(SECAlgorithmID *algtag,
+                                               SECKEYPrivateKey *key);
+
+extern PRBool NSS_SMIMEUtil_EncryptionPossible(void);
+
+extern SECStatus NSS_SMIMEUtil_CreateSMIMECapabilities(PLArenaPool *poolp, SECItem *dest);
+
+extern SECStatus NSS_SMIMEUtil_CreateSMIMEEncKeyPrefs(PLArenaPool *poolp,
+                                                      SECItem *dest, CERTCertificate *cert);
+
+extern SECStatus NSS_SMIMEUtil_CreateMSSMIMEEncKeyPrefs(PLArenaPool *poolp,
+                                                        SECItem *dest, CERTCertificate *cert);
+
+extern CERTCertificate *NSS_SMIMEUtil_GetCertFromEncryptionKeyPreference(CERTCertDBHandle *certdb,
+                                                                         SECItem *DERekp);
+
+extern SECStatus
+NSS_SMIMEUtil_FindBulkAlgForRecipients(CERTCertificate **rcerts,
+                                       SECOidTag *bulkalgtag, int *keysize);
+
+extern PRBool NSSSMIME_VersionCheck(const char *importedVersion);
+
+extern const char *NSSSMIME_GetVersion(void);
+
+SEC_END_PROTOS
+
+#endif /* _SECMIME_H_ */

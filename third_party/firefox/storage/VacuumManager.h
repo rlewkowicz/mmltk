@@ -1,0 +1,36 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_storage_VacuumManager_h_
+#define mozilla_storage_VacuumManager_h_
+
+#include "nsCOMPtr.h"
+#include "nsIObserver.h"
+#include "mozIStorageVacuumParticipant.h"
+#include "nsCategoryCache.h"
+
+namespace mozilla {
+namespace storage {
+
+class VacuumManager final : public nsIObserver {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+
+  VacuumManager();
+
+  static already_AddRefed<VacuumManager> getSingleton();
+
+ private:
+  ~VacuumManager();
+
+  static VacuumManager* gVacuumManager;
+
+  nsCategoryCache<mozIStorageVacuumParticipant> mParticipants;
+};
+
+}  
+}  
+
+#endif

@@ -1,0 +1,502 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ClientOpenWindowUtils.h"
+#include "mozilla/ScopeExit.h"
+
+#include "ClientInfo.h"
+#include "ClientManager.h"
+#include "ClientState.h"
+#include "mozilla/NullPrincipal.h"
+#include "mozilla/dom/BrowserParent.h"
+#include "mozilla/dom/BrowsingContext.h"
+#include "mozilla/dom/CanonicalBrowsingContext.h"
+#include "mozilla/dom/ContentParent.h"
+#include "mozilla/dom/PolicyContainer.h"
+#include "mozilla/dom/WindowGlobalParent.h"
+#include "mozilla/dom/nsCSPContext.h"
+#include "nsContentUtils.h"
+#include "nsDocShell.h"
+#include "nsDocShellLoadState.h"
+#include "nsFocusManager.h"
+#include "nsGlobalWindowOuter.h"
+#include "nsIBrowser.h"
+#include "nsIBrowserDOMWindow.h"
+#include "nsIDocShell.h"
+#include "nsIDocShellTreeOwner.h"
+#include "nsIMutableArray.h"
+#include "nsISupportsPrimitives.h"
+#include "nsIURI.h"
+#include "nsIWebProgress.h"
+#include "nsIWebProgressListener.h"
+#include "nsIWindowMediator.h"
+#include "nsIWindowWatcher.h"
+#include "nsIXPConnect.h"
+#include "nsNetUtil.h"
+#include "nsOpenWindowInfo.h"
+#include "nsPIDOMWindow.h"
+#include "nsPIWindowWatcher.h"
+#include "nsPrintfCString.h"
+#include "nsWindowWatcher.h"
+
+#ifdef MOZ_GECKOVIEW
+#  include "mozilla/dom/Promise-inl.h"
+#  include "nsIGeckoViewServiceWorker.h"
+#  include "nsImportModule.h"
+#endif
+
+namespace mozilla::dom {
+
+namespace {
+
+class WebProgressListener final : public nsIWebProgressListener,
+                                  public nsSupportsWeakReference {
+ public:
+  NS_DECL_ISUPPORTS
+
+  WebProgressListener(BrowsingContext* aBrowsingContext, nsIURI* aBaseURI,
+                      already_AddRefed<ClientOpPromise::Private> aPromise)
+      : mPromise(aPromise),
+        mBaseURI(aBaseURI),
+        mBrowserId(aBrowsingContext->GetBrowserId()) {
+    MOZ_ASSERT(mBrowserId != 0);
+    MOZ_ASSERT(aBaseURI);
+    MOZ_ASSERT(NS_IsMainThread());
+  }
+
+  NS_IMETHOD
+  OnStateChange(nsIWebProgress* aWebProgress, nsIRequest* aRequest,
+                uint32_t aStateFlags, nsresult aStatus) override {
+    if (!(aStateFlags & STATE_IS_WINDOW) ||
+        !(aStateFlags & (STATE_STOP | STATE_TRANSFERRING))) {
+      return NS_OK;
+    }
+
+    RefPtr<CanonicalBrowsingContext> browsingContext =
+        CanonicalBrowsingContext::Cast(
+            BrowsingContext::GetCurrentTopByBrowserId(mBrowserId));
+    if (!browsingContext || browsingContext->IsDiscarded()) {
+      CopyableErrorResult rv;
+      rv.ThrowInvalidStateError("Unable to open window");
+      mPromise->Reject(rv, __func__);
+      mPromise = nullptr;
+      return NS_OK;
+    }
+
+    auto RemoveListener = [&] {
+      nsCOMPtr<nsIWebProgress> webProgress = browsingContext->GetWebProgress();
+      webProgress->RemoveProgressListener(this);
+    };
+
+    RefPtr<dom::WindowGlobalParent> wgp =
+        browsingContext->GetCurrentWindowGlobal();
+    if (NS_WARN_IF(!wgp)) {
+      CopyableErrorResult rv;
+      rv.ThrowInvalidStateError("Unable to open window");
+      mPromise->Reject(rv, __func__);
+      mPromise = nullptr;
+      RemoveListener();
+      return NS_OK;
+    }
+
+    if (NS_WARN_IF(wgp->IsInitialDocument())) {
+      return NS_OK;
+    }
+
+    RemoveListener();
+
+    nsCOMPtr<nsIScriptSecurityManager> securityManager =
+        nsContentUtils::GetSecurityManager();
+    bool isPrivateWin =
+        wgp->DocumentPrincipal()->OriginAttributesRef().IsPrivateBrowsing();
+    nsresult rv = securityManager->CheckSameOriginURI(
+        wgp->GetDocumentURI(), mBaseURI, false, isPrivateWin);
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      mPromise->Resolve(CopyableErrorResult(), __func__);
+      mPromise = nullptr;
+      return NS_OK;
+    }
+
+    Maybe<ClientInfo> info = wgp->GetClientInfo();
+    if (info.isNothing()) {
+      CopyableErrorResult rv;
+      rv.ThrowInvalidStateError("Unable to open window");
+      mPromise->Reject(rv, __func__);
+      mPromise = nullptr;
+      return NS_OK;
+    }
+
+    const nsID& id = info.ref().Id();
+    const mozilla::ipc::PrincipalInfo& principal = info.ref().PrincipalInfo();
+    ClientManager::GetInfoAndState(ClientGetInfoAndStateArgs(id, principal),
+                                   GetCurrentSerialEventTarget())
+        ->ChainTo(mPromise.forget(), __func__);
+
+    return NS_OK;
+  }
+
+  NS_IMETHOD
+  OnProgressChange(nsIWebProgress* aWebProgress, nsIRequest* aRequest,
+                   int32_t aCurSelfProgress, int32_t aMaxSelfProgress,
+                   int32_t aCurTotalProgress,
+                   int32_t aMaxTotalProgress) override {
+    MOZ_ASSERT(false, "Unexpected notification.");
+    return NS_OK;
+  }
+
+  NS_IMETHOD
+  OnLocationChange(nsIWebProgress* aWebProgress, nsIRequest* aRequest,
+                   nsIURI* aLocation, uint32_t aFlags) override {
+    MOZ_ASSERT(false, "Unexpected notification.");
+    return NS_OK;
+  }
+
+  NS_IMETHOD
+  OnStatusChange(nsIWebProgress* aWebProgress, nsIRequest* aRequest,
+                 nsresult aStatus, const char16_t* aMessage) override {
+    MOZ_ASSERT(false, "Unexpected notification.");
+    return NS_OK;
+  }
+
+  NS_IMETHOD
+  OnSecurityChange(nsIWebProgress* aWebProgress, nsIRequest* aRequest,
+                   uint32_t aState) override {
+    MOZ_ASSERT(false, "Unexpected notification.");
+    return NS_OK;
+  }
+
+  NS_IMETHOD
+  OnContentBlockingEvent(nsIWebProgress* aWebProgress, nsIRequest* aRequest,
+                         uint32_t aEvent) override {
+    MOZ_ASSERT(false, "Unexpected notification.");
+    return NS_OK;
+  }
+
+ private:
+  ~WebProgressListener() {
+    if (mPromise) {
+      CopyableErrorResult rv;
+      rv.ThrowAbortError("openWindow aborted");
+      mPromise->Reject(rv, __func__);
+      mPromise = nullptr;
+    }
+  }
+
+  RefPtr<ClientOpPromise::Private> mPromise;
+  nsCOMPtr<nsIURI> mBaseURI;
+  uint64_t mBrowserId;
+};
+
+NS_IMPL_ISUPPORTS(WebProgressListener, nsIWebProgressListener,
+                  nsISupportsWeakReference);
+
+struct ClientOpenWindowArgsParsed {
+  nsCOMPtr<nsIURI> uri;
+  nsCOMPtr<nsIURI> baseURI;
+  nsCOMPtr<nsIPrincipal> principal;
+  nsCOMPtr<nsIPolicyContainer> policyContainer;
+  RefPtr<ThreadsafeContentParentHandle> originContent;
+};
+
+#ifndef MOZ_GECKOVIEW
+
+static Result<Ok, nsresult> OpenNewWindow(
+    const ClientOpenWindowArgsParsed& aArgsValidated,
+    nsOpenWindowInfo* aOpenWindowInfo) {
+  nsresult rv;
+
+  nsAutoCString uriToLoad;
+  MOZ_TRY(aArgsValidated.uri->GetSpec(uriToLoad));
+
+  nsCOMPtr<nsISupportsCString> nsUriToLoad =
+      do_CreateInstance(NS_SUPPORTS_CSTRING_CONTRACTID, &rv);
+  MOZ_TRY(rv);
+  MOZ_TRY(nsUriToLoad->SetData(uriToLoad));
+
+  nsCOMPtr<nsISupportsPRBool> nsFalse =
+      do_CreateInstance(NS_SUPPORTS_PRBOOL_CONTRACTID, &rv);
+  MOZ_TRY(rv);
+  MOZ_TRY(nsFalse->SetData(false));
+
+  nsCOMPtr<nsISupportsPRUint32> userContextId =
+      do_CreateInstance(NS_SUPPORTS_PRUINT32_CONTRACTID, &rv);
+  MOZ_TRY(rv);
+  MOZ_TRY(userContextId->SetData(aArgsValidated.principal->GetUserContextId()));
+
+  nsCOMPtr<nsIMutableArray> args = do_CreateInstance(NS_ARRAY_CONTRACTID);
+  args->AppendElement(nsUriToLoad);               
+  args->AppendElement(nullptr);                   
+  args->AppendElement(nullptr);                   
+  args->AppendElement(nullptr);                   
+  args->AppendElement(nsFalse);                   
+  args->AppendElement(userContextId);             
+  args->AppendElement(nullptr);                   
+  args->AppendElement(nullptr);                   
+  args->AppendElement(aArgsValidated.principal);  
+  args->AppendElement(nsFalse);                   
+  args->AppendElement(aArgsValidated.policyContainer);  
+  args->AppendElement(aOpenWindowInfo);                 
+
+  nsCOMPtr<nsIWindowWatcher> ww = do_GetService(NS_WINDOWWATCHER_CONTRACTID);
+  nsCString features = "chrome,all,dialog=no"_ns;
+
+  if (aArgsValidated.principal->GetIsInPrivateBrowsing()) {
+    features += ",private";
+  }
+
+  nsCOMPtr<mozIDOMWindowProxy> win;
+  MOZ_TRY(ww->OpenWindow(nullptr, nsDependentCString(BROWSER_CHROME_URL_QUOTED),
+                         "_blank"_ns, features, args, getter_AddRefs(win)));
+  return Ok();
+}
+
+bool OpenWindow(const ClientOpenWindowArgsParsed& aArgsValidated,
+                nsOpenWindowInfo* aOpenInfo, BrowsingContext** aBC,
+                ErrorResult& aRv) {
+  MOZ_DIAGNOSTIC_ASSERT(aBC);
+
+
+  WindowMediatorFilter filter = WindowMediatorFilter::SkipClosed;
+  if (aArgsValidated.principal->GetIsInPrivateBrowsing()) {
+    filter |= WindowMediatorFilter::SkipNonPrivateBrowsing;
+  } else {
+    filter |= WindowMediatorFilter::SkipPrivateBrowsing;
+  }
+  nsCOMPtr<nsPIDOMWindowOuter> browserWindow =
+      nsContentUtils::GetMostRecentWindowBy(filter);
+  if (!browserWindow) {
+    auto result = OpenNewWindow(aArgsValidated, aOpenInfo);
+    if (NS_WARN_IF(result.isErr())) {
+      aRv.ThrowTypeError("Unable to open window");
+      return false;
+    }
+    return false;
+  }
+
+  if (NS_WARN_IF(!nsGlobalWindowOuter::Cast(browserWindow)->IsChromeWindow())) {
+    aRv.ThrowTypeError("Unable to open window");
+    return false;
+  }
+
+  nsCOMPtr<nsIBrowserDOMWindow> bwin =
+      nsGlobalWindowOuter::Cast(browserWindow)->GetBrowserDOMWindow();
+
+  if (NS_WARN_IF(!bwin)) {
+    aRv.ThrowTypeError("Unable to open window");
+    return false;
+  }
+  nsresult rv = bwin->CreateContentWindow(
+      nullptr, aOpenInfo, nsIBrowserDOMWindow::OPEN_DEFAULTWINDOW,
+      nsIBrowserDOMWindow::OPEN_NEW, aArgsValidated.principal,
+      aArgsValidated.policyContainer, aBC);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    aRv.ThrowTypeError("Unable to open window");
+    return false;
+  }
+  return true;
+}
+#endif
+
+void WaitForLoad(const ClientOpenWindowArgsParsed& aArgsValidated,
+                 BrowsingContext* aBrowsingContext,
+                 ClientOpPromise::Private* aPromise, bool aShouldLoadURI) {
+  MOZ_DIAGNOSTIC_ASSERT(aBrowsingContext);
+
+  RefPtr<ClientOpPromise::Private> promise = aPromise;
+  nsCOMPtr<nsIWebProgress> webProgress =
+      aBrowsingContext->Canonical()->GetWebProgress();
+  if (NS_WARN_IF(!webProgress)) {
+    CopyableErrorResult result;
+    result.ThrowInvalidStateError("Unable to watch window for navigation");
+    promise->Reject(result, __func__);
+    return;
+  }
+
+  RefPtr<WebProgressListener> listener = new WebProgressListener(
+      aBrowsingContext, aArgsValidated.baseURI, do_AddRef(promise));
+
+  nsresult rv = webProgress->AddProgressListener(
+      listener, nsIWebProgress::NOTIFY_STATE_WINDOW);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    CopyableErrorResult result;
+    result.Throw(rv);
+    promise->Reject(result, __func__);
+    return;
+  }
+
+  if (aShouldLoadURI) {
+    RefPtr<nsDocShellLoadState> loadState =
+        new nsDocShellLoadState(aArgsValidated.uri);
+    loadState->SetTriggeringPrincipal(aArgsValidated.principal);
+    loadState->SetFirstParty(true);
+    loadState->SetLoadFlags(
+        nsIWebNavigation::LOAD_FLAGS_DISALLOW_INHERIT_PRINCIPAL);
+    loadState->SetTriggeringRemoteType(
+        aArgsValidated.originContent
+            ? aArgsValidated.originContent->GetRemoteType()
+            : NOT_REMOTE_TYPE);
+
+    rv = aBrowsingContext->LoadURI(loadState, true);
+    if (NS_FAILED(rv)) {
+      CopyableErrorResult result;
+      result.ThrowInvalidStateError(
+          "Unable to start the load of the actual URI");
+      promise->Reject(result, __func__);
+      return;
+    }
+  }
+
+  promise->Then(
+      GetMainThreadSerialEventTarget(), __func__,
+      [listener](const ClientOpResult& aResult) {},
+      [listener](const CopyableErrorResult& aResult) {});
+}
+
+#ifdef MOZ_GECKOVIEW
+void GeckoViewOpenWindow(const ClientOpenWindowArgsParsed& aArgsValidated,
+                         nsOpenWindowInfo* aOpenInfo, ErrorResult& aRv) {
+  MOZ_ASSERT(aOpenInfo);
+
+  nsCOMPtr<nsIGeckoViewServiceWorker> sw = do_ImportESModule(
+      "resource://gre/modules/GeckoViewServiceWorker.sys.mjs");
+  MOZ_ASSERT(sw);
+
+  RefPtr<dom::Promise> promise;
+  nsresult rv =
+      sw->OpenWindow(aArgsValidated.uri, aOpenInfo, getter_AddRefs(promise));
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    aRv.Throw(rv);
+    return;
+  }
+
+  promise->AddCallbacksWithCycleCollectedArgs(
+      [](JSContext* aCx, JS::Handle<JS::Value> aValue, ErrorResult& aRv,
+         nsOpenWindowInfo* aOpenWindowInfo) {
+        if (aValue.isNull()) {
+          return;
+        }
+
+        auto cancelOpen =
+            MakeScopeExit([&aOpenWindowInfo] { aOpenWindowInfo->Cancel(); });
+
+        RefPtr<BrowsingContext> browsingContext;
+        if (NS_WARN_IF(!aValue.isObject()) ||
+            NS_WARN_IF(NS_FAILED(
+                UNWRAP_OBJECT(BrowsingContext, aValue, browsingContext)))) {
+          return;
+        }
+
+        if (nsIBrowsingContextReadyCallback* callback =
+                aOpenWindowInfo->BrowsingContextReadyCallback()) {
+          callback->BrowsingContextReady(browsingContext);
+        }
+        cancelOpen.release();
+      },
+      [](JSContext* aContext, JS::Handle<JS::Value> aValue, ErrorResult& aRv,
+         nsOpenWindowInfo* aOpenWindowInfo) { aOpenWindowInfo->Cancel(); },
+      RefPtr(aOpenInfo));
+}
+#endif  // MOZ_GECKOVIEW
+
+}  
+
+RefPtr<ClientOpPromise> ClientOpenWindow(
+    ThreadsafeContentParentHandle* aOriginContent,
+    const ClientOpenWindowArgs& aArgs) {
+  MOZ_DIAGNOSTIC_ASSERT(XRE_IsParentProcess());
+
+  RefPtr<ClientOpPromise::Private> promise =
+      new ClientOpPromise::Private(__func__);
+
+  nsCOMPtr<nsIURI> baseURI;
+  nsresult rv = NS_NewURI(getter_AddRefs(baseURI), aArgs.baseURL());
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    nsPrintfCString err("Invalid base URL \"%s\"", aArgs.baseURL().get());
+    CopyableErrorResult errResult;
+    errResult.ThrowTypeError(err);
+    promise->Reject(errResult, __func__);
+    return promise;
+  }
+
+  nsCOMPtr<nsIURI> uri;
+  rv = NS_NewURI(getter_AddRefs(uri), aArgs.url(), nullptr, baseURI);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    nsPrintfCString err("Invalid URL \"%s\"", aArgs.url().get());
+    CopyableErrorResult errResult;
+    errResult.ThrowTypeError(err);
+    promise->Reject(errResult, __func__);
+    return promise;
+  }
+
+  auto principalOrErr = PrincipalInfoToPrincipal(aArgs.principalInfo());
+  if (NS_WARN_IF(principalOrErr.isErr())) {
+    CopyableErrorResult errResult;
+    errResult.ThrowTypeError("Failed to obtain principal");
+    promise->Reject(errResult, __func__);
+    return promise;
+  }
+  nsCOMPtr<nsIPrincipal> principal = principalOrErr.unwrap();
+  MOZ_DIAGNOSTIC_ASSERT(principal);
+
+  nsCOMPtr<nsIContentSecurityPolicy> csp;
+  nsCOMPtr<PolicyContainer> policyContainer;
+  if (aArgs.cspInfo().isSome()) {
+    csp = CSPInfoToCSP(aArgs.cspInfo().ref(), nullptr);
+    policyContainer = new PolicyContainer();
+    PolicyContainer::Cast(policyContainer)->SetCSP(csp);
+  }
+  ClientOpenWindowArgsParsed argsValidated{
+      .uri = uri,
+      .baseURI = baseURI,
+      .principal = principal,
+      .policyContainer = policyContainer,
+      .originContent = aOriginContent,
+  };
+
+  RefPtr<BrowsingContextCallbackReceivedPromise::Private>
+      browsingContextReadyPromise =
+          new BrowsingContextCallbackReceivedPromise::Private(__func__);
+  RefPtr<nsIBrowsingContextReadyCallback> callback =
+      new nsBrowsingContextReadyCallback(browsingContextReadyPromise);
+
+  RefPtr<nsOpenWindowInfo> openInfo = new nsOpenWindowInfo();
+  openInfo->mBrowsingContextReadyCallback = callback;
+  nsCOMPtr<nsIURI> nullPrincipalURI = NullPrincipal::CreateURI(nullptr);
+  nsCOMPtr<nsIPrincipal> initialPrincipal =
+      NullPrincipal::Create(principal->OriginAttributesRef(), nullPrincipalURI);
+  openInfo->mPrincipalToInheritForAboutBlank = std::move(initialPrincipal);
+  openInfo->mIsRemote = true;
+
+  RefPtr<BrowsingContext> bc;
+  IgnoredErrorResult errResult;
+  bool shouldLoadURI = true;
+#ifdef MOZ_GECKOVIEW
+  GeckoViewOpenWindow(argsValidated, openInfo, errResult);
+#else
+  shouldLoadURI =
+      OpenWindow(argsValidated, openInfo, getter_AddRefs(bc), errResult);
+#endif
+  if (NS_WARN_IF(errResult.Failed())) {
+    promise->Reject(errResult, __func__);
+    return promise;
+  }
+
+  browsingContextReadyPromise->Then(
+      GetCurrentSerialEventTarget(), __func__,
+      [argsValidated, promise,
+       shouldLoadURI](const RefPtr<BrowsingContext>& aBC) {
+        WaitForLoad(argsValidated, aBC, promise, shouldLoadURI);
+      },
+      [promise]() {
+        CopyableErrorResult result;
+        result.ThrowTypeError("Unable to open window");
+        promise->Reject(result, __func__);
+      });
+  if (bc) {
+    browsingContextReadyPromise->Resolve(bc, __func__);
+  }
+  return promise;
+}
+
+}  

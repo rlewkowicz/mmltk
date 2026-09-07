@@ -1,0 +1,283 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+import { PageDataSchema } from "moz-src:///browser/components/pagedata/PageDataSchema.sys.mjs";
+
+class Item {
+  type;
+
+  properties = new Map();
+
+  constructor(type) {
+    this.type = type;
+  }
+
+  has(prop) {
+    return this.properties.has(prop);
+  }
+
+  all(prop) {
+    return this.properties.get(prop) ?? [];
+  }
+
+  get(prop) {
+    return this.properties.get(prop)?.[0];
+  }
+
+  set(prop, value) {
+    let props = this.properties.get(prop);
+    if (props === undefined) {
+      props = [];
+      this.properties.set(prop, props);
+    }
+
+    props.push(value);
+  }
+
+  toJsonLD() {
+    function toLD(val) {
+      if (val instanceof Item) {
+        return val.toJsonLD();
+      }
+      return val;
+    }
+
+    let props = Array.from(this.properties, ([key, value]) => {
+      if (value.length == 1) {
+        return [key, toLD(value[0])];
+      }
+
+      return [key, value.map(toLD)];
+    });
+
+    return {
+      "@type": this.type,
+      ...Object.fromEntries(props),
+    };
+  }
+}
+
+function parseMicrodataProp(propElement) {
+  if (propElement.hasAttribute("itemscope")) {
+    throw new Error(
+      "Cannot parse a simple property value from an itemscope element."
+    );
+  }
+
+  const parseUrl = (urlElement, attr) => {
+    if (!urlElement.hasAttribute(attr)) {
+      return "";
+    }
+
+    let url = URL.parse(
+      urlElement.getAttribute(attr),
+      urlElement.ownerDocument.documentURI
+    );
+    return url ? url.toString() : "";
+  };
+
+  switch (propElement.localName) {
+    case "meta":
+      return propElement.getAttribute("content") ?? "";
+    case "audio":
+    case "embed":
+    case "iframe":
+    case "source":
+    case "track":
+    case "video":
+      return parseUrl(propElement, "src");
+    case "img":
+      return (
+        parseUrl(propElement, "content") ||
+        parseUrl(propElement, "data-src") ||
+        parseUrl(propElement, "src")
+      );
+    case "object":
+      return parseUrl(propElement, "data");
+    case "a":
+    case "area":
+    case "link":
+      return parseUrl(propElement, "href");
+    case "data":
+    case "meter":
+      return propElement.getAttribute("value");
+    case "time":
+      if (propElement.hasAtribute("datetime")) {
+        return propElement.getAttribute("datetime");
+      }
+      return propElement.textContent;
+    default:
+      if (propElement.hasAttribute("content")) {
+        return propElement.getAttribute("content");
+      }
+      return propElement.textContent;
+  }
+}
+
+function collectProduct(document, pageData, item) {
+  if (item.has("image")) {
+    let url = new URL(item.get("image"), document.documentURI);
+    pageData.image = url.toString();
+  }
+
+  if (item.has("description")) {
+    pageData.description = item.get("description");
+  }
+
+  pageData.data[PageDataSchema.DATA_TYPE.PRODUCT] = {
+    name: item.get("name"),
+  };
+
+  for (let offer of item.all("offers")) {
+    if (!(offer instanceof Item) || offer.type != "Offer") {
+      continue;
+    }
+
+    let price = parseFloat(offer.get("price"));
+    if (!isNaN(price)) {
+      pageData.data[PageDataSchema.DATA_TYPE.PRODUCT].price = {
+        value: price,
+        currency: offer.get("priceCurrency"),
+      };
+
+      break;
+    }
+  }
+}
+
+function collectMicrodataItems(document) {
+  let itemElements = document.querySelectorAll(
+    "[itemscope][itemtype^='https://schema.org/'], [itemscope][itemtype^='http://schema.org/']"
+  );
+
+  let items = new Map();
+
+  function itemFor(element) {
+    let item = items.get(element);
+    if (item) {
+      return item;
+    }
+
+    if (!element.parentElement) {
+      throw new Error("Element has no parent item.");
+    }
+
+    item = itemFor(element.parentElement);
+    items.set(element, item);
+    return item;
+  }
+
+  for (let element of itemElements) {
+    let itemType = element.getAttribute("itemtype");
+    if (itemType.startsWith("https://")) {
+      itemType = itemType.substring(19);
+    } else {
+      itemType = itemType.substring(18);
+    }
+
+    items.set(element, new Item(itemType));
+  }
+
+  let roots = new Set(items.values());
+
+  let itemProps = document.querySelectorAll(
+    "[itemscope][itemtype^='https://schema.org/'] [itemprop], [itemscope][itemtype^='http://schema.org/'] [itemprop]"
+  );
+
+  for (let element of itemProps) {
+    let item = itemFor(element.parentElement);
+
+    let propValue = items.get(element) ?? parseMicrodataProp(element);
+    item.set(element.getAttribute("itemprop"), propValue);
+
+    if (propValue instanceof Item) {
+      roots.delete(propValue);
+    }
+  }
+
+  return [...roots];
+}
+
+function collectJsonLDItems(document) {
+  let items = [];
+
+  function fromLD(val) {
+    if (typeof val == "object" && "@type" in val) {
+      let item = new Item(val["@type"]);
+
+      for (let [prop, value] of Object.entries(val)) {
+        if (prop.startsWith("@")) {
+          continue;
+        }
+
+        if (!Array.isArray(value)) {
+          value = [value];
+        }
+
+        item.properties.set(prop, value.map(fromLD));
+      }
+
+      return item;
+    }
+
+    return val;
+  }
+
+  let scripts = document.querySelectorAll("script[type='application/ld+json'");
+  for (let script of scripts) {
+    try {
+      let content = JSON.parse(script.textContent);
+
+      if (typeof content != "object") {
+        continue;
+      }
+
+      if (!("@context" in content)) {
+        continue;
+      }
+
+      if (
+        content["@context"] != "http://schema.org" &&
+        content["@context"] != "https://schema.org"
+      ) {
+        continue;
+      }
+
+      let item = fromLD(content);
+      if (item instanceof Item) {
+        items.push(item);
+      }
+    } catch (e) {
+    }
+  }
+
+  return items;
+}
+
+export const SchemaOrgPageData = {
+  collectItems(document) {
+    return collectMicrodataItems(document).concat(collectJsonLDItems(document));
+  },
+
+  collect(document) {
+    let pageData = { data: {} };
+
+    let items = this.collectItems(document);
+
+    for (let item of items) {
+      switch (item.type) {
+        case "Product":
+          if (!(PageDataSchema.DATA_TYPE.PRODUCT in pageData.data)) {
+            collectProduct(document, pageData, item);
+          }
+          break;
+        case "Organization":
+          pageData.siteName = item.get("name");
+          break;
+      }
+    }
+
+    return pageData;
+  },
+};

@@ -1,0 +1,2736 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "mozilla/ArrayUtils.h"
+#include "mozilla/AutoRestore.h"
+#include "mozilla/AppShutdown.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/UniquePtr.h"
+
+#include "xpcprivate.h"
+#include "xpcpublic.h"
+#include "XPCMaps.h"
+#include "XPCJSMemoryReporter.h"
+#include "XrayWrapper.h"
+#include "WrapperFactory.h"
+#include "mozJSModuleLoader.h"
+#include "nsNetUtil.h"
+#include "nsContentSecurityUtils.h"
+
+#include "nsIMemoryInfoDumper.h"
+#include "nsIMemoryReporter.h"
+#include "nsIObserverService.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/NodeBinding.h"
+#include "nsIRunnable.h"
+#include "nsPIDOMWindow.h"
+#include "nsPrintfCString.h"
+#include "nsScriptSecurityManager.h"
+#include "nsWindowSizes.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/Services.h"
+#include "mozilla/dom/ScriptLoader.h"
+#include "mozilla/dom/ScriptSettings.h"
+
+#include "nsContentUtils.h"
+#include "nsCCUncollectableMarker.h"
+#include "nsCycleCollectionNoteRootCallback.h"
+#include "nsCycleCollector.h"
+#include "jsapi.h"
+#include "js/BuildId.h"  // JS::BuildIdCharVector, JS::SetProcessBuildIdOp
+#include "js/experimental/SourceHook.h"  // js::{,Set}SourceHook
+#include "js/GCAPI.h"
+#include "js/MemoryFunctions.h"
+#include "js/MemoryMetrics.h"
+#include "js/Object.h"  // JS::GetClass
+#include "js/RealmIterators.h"
+#include "js/SliceBudget.h"
+#include "js/UbiNode.h"
+#include "js/UbiNodeUtils.h"
+#include "js/friend/WindowProxy.h"  // js::SetWindowProxyClass
+#include "js/friend/Wrapper.h"      // js::NukeCrossCompartmentWrappers
+#include "js/friend/XrayJitInfo.h"  // JS::SetXrayJitInfo
+#include "js/Utility.h"             // JS::UniqueTwoByteChars
+#include "mozilla/dom/AbortSignalBinding.h"
+#include "mozilla/dom/GeneratedAtomList.h"
+#include "mozilla/dom/BindingUtils.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/FetchUtil.h"
+#include "mozilla/dom/WindowBinding.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/ProcessHangMonitor.h"
+#include "mozilla/Sprintf.h"
+#include "AccessCheck.h"
+#include "nsGlobalWindowInner.h"
+#include "nsAboutProtocolUtils.h"
+
+#include "NodeUbiReporting.h"
+#include "ExpandedPrincipal.h"
+#include "nsIInputStream.h"
+#include "nsJSPrincipals.h"
+#include "nsJSEnvironment.h"
+#include "XPCInlines.h"
+
+
+using namespace mozilla;
+using namespace mozilla::dom;
+using namespace xpc;
+using namespace JS;
+using namespace js;
+using mozilla::dom::PerThreadAtomCache;
+
+
+const char* const XPCJSRuntime::mStrings[] = {
+    "constructor",      
+    "toString",         
+    "toSource",         
+    "value",            
+    "QueryInterface",   
+    "Components",       
+    "Cc",               
+    "Ci",               
+    "Cr",               
+    "Cu",               
+    "Services",         
+    "wrappedJSObject",  
+    "prototype",        
+    "eval",             
+    "controllers",      
+    "Controllers",      
+    "length",           
+    "name",             
+    "undefined",        
+    "",                 
+    "fileName",         
+    "lineNumber",       
+    "columnNumber",     
+    "stack",            
+    "message",          
+    "cause",            
+    "errors",           
+    "lastIndex",        
+    "then",             
+    "isInstance",       
+    "Infinity",         
+    "NaN",              
+    "classId",          
+    "interfaceId",      
+    "initializer",      
+    "print",            
+    "fetch",            
+    "crypto",           
+    "indexedDB",        
+    "structuredClone",  
+    "locks",            
+#if defined(ENABLE_EXPLICIT_RESOURCE_MANAGEMENT)
+    "suppressed",  
+    "error",       
+#endif
+};
+
+
+
+class AsyncFreeSnowWhite : public Runnable {
+ public:
+  NS_IMETHOD Run() override {
+
+    SliceBudget budget = SliceBudget(TimeBudget(2));
+    bool hadSnowWhiteObjects =
+        nsCycleCollector_doDeferredDeletionWithBudget(budget);
+    if (hadSnowWhiteObjects && !mContinuation) {
+      mContinuation = true;
+      if (NS_FAILED(Dispatch())) {
+        mActive = false;
+      }
+    } else {
+      mActive = false;
+    }
+    return NS_OK;
+  }
+
+  nsresult Dispatch() {
+    nsCOMPtr<nsIRunnable> self(this);
+    return NS_DispatchToCurrentThreadQueue(self.forget(), 1000,
+                                           EventQueuePriority::Idle);
+  }
+
+  void Start(bool aContinuation = false, bool aPurge = false) {
+    if (mContinuation) {
+      mContinuation = aContinuation;
+    }
+    mPurge = aPurge;
+    if (!mActive && NS_SUCCEEDED(Dispatch())) {
+      mActive = true;
+    }
+  }
+
+  AsyncFreeSnowWhite()
+      : Runnable("AsyncFreeSnowWhite"),
+        mContinuation(false),
+        mActive(false),
+        mPurge(false) {}
+
+ public:
+  bool mContinuation;
+  bool mActive;
+  bool mPurge;
+};
+
+namespace xpc {
+
+CompartmentPrivate::CompartmentPrivate(
+    JS::Compartment* c, mozilla::UniquePtr<XPCWrappedNativeScope> scope,
+    mozilla::BasePrincipal* origin, const SiteIdentifier& site)
+    : originInfo(origin, site),
+      wantXrays(false),
+      allowWaivers(true),
+      isUAWidgetCompartment(false),
+      hasExclusiveExpandos(false),
+      wasShutdown(false),
+      mWrappedJSMap(mozilla::MakeUnique<JSObject2WrappedJSMap>()),
+      mScope(std::move(scope)) {
+  MOZ_COUNT_CTOR(xpc::CompartmentPrivate);
+}
+
+CompartmentPrivate::~CompartmentPrivate() {
+  MOZ_COUNT_DTOR(xpc::CompartmentPrivate);
+}
+
+void CompartmentPrivate::SystemIsBeingShutDown() {
+  if (!wasShutdown) {
+    mWrappedJSMap->ShutdownMarker();
+    wasShutdown = true;
+  }
+}
+
+RealmPrivate::RealmPrivate(JS::Realm* realm) : scriptability(realm) {
+  mozilla::PodArrayZero(wrapperDenialWarnings);
+}
+
+void RealmPrivate::Init(HandleObject aGlobal, const SiteIdentifier& aSite) {
+  MOZ_ASSERT(aGlobal);
+  DebugOnly<const JSClass*> clasp = JS::GetClass(aGlobal);
+  MOZ_ASSERT(clasp->slot0IsISupports() || dom::IsDOMClass(clasp));
+
+  Realm* realm = GetObjectRealmOrNull(aGlobal);
+
+  RealmPrivate* realmPriv = new RealmPrivate(realm);
+  MOZ_ASSERT(!GetRealmPrivate(realm));
+  SetRealmPrivate(realm, realmPriv);
+
+  nsIPrincipal* principal = GetRealmPrincipal(realm);
+  Compartment* c = JS::GetCompartment(aGlobal);
+
+  if (CompartmentPrivate* priv = CompartmentPrivate::Get(c)) {
+    MOZ_ASSERT(priv->originInfo.IsSameOrigin(principal));
+  } else {
+    auto scope = mozilla::MakeUnique<XPCWrappedNativeScope>(c, aGlobal);
+    priv = new CompartmentPrivate(c, std::move(scope),
+                                  BasePrincipal::Cast(principal), aSite);
+    JS_SetCompartmentPrivate(c, priv);
+  }
+}
+
+static nsCOMPtr<nsIObserverService> GetObserverService() {
+  if (AppShutdown::IsInOrBeyond(ShutdownPhase::XPCOMShutdownFinal)) {
+    return nullptr;
+  }
+  return mozilla::services::GetObserverService();
+}
+
+static bool TryParseLocationURICandidate(
+    const nsACString& uristr, RealmPrivate::LocationHint aLocationHint,
+    nsIURI** aURI) {
+  static constexpr auto kGRE = "resource://gre/"_ns;
+  static constexpr auto kToolkit = "chrome://global/"_ns;
+  static constexpr auto kBrowser = "chrome://browser/"_ns;
+
+  if (aLocationHint == RealmPrivate::LocationHintAddon) {
+    if (StringBeginsWith(uristr, kGRE) || StringBeginsWith(uristr, kToolkit) ||
+        StringBeginsWith(uristr, kBrowser)) {
+      return false;
+    }
+
+    if (StringBeginsWith(uristr, "xb"_ns)) {
+      return false;
+    }
+  }
+
+  nsCOMPtr<nsIURI> uri;
+  if (NS_FAILED(NS_NewURI(getter_AddRefs(uri), uristr))) {
+    return false;
+  }
+
+  nsAutoCString scheme;
+  if (NS_FAILED(uri->GetScheme(scheme))) {
+    return false;
+  }
+
+  if (scheme.EqualsLiteral("data") || scheme.EqualsLiteral("blob")) {
+    return false;
+  }
+
+  uri.forget(aURI);
+  return true;
+}
+
+bool RealmPrivate::TryParseLocationURI(RealmPrivate::LocationHint aLocationHint,
+                                       nsIURI** aURI) {
+  if (!aURI) {
+    return false;
+  }
+
+  if (location.IsEmpty()) {
+    return false;
+  }
+
+
+  static const nsDependentCString from("(from: ");
+  static const nsDependentCString arrow(" -> ");
+  static const size_t fromLength = from.Length();
+  static const size_t arrowLength = arrow.Length();
+
+  int32_t idx = location.Find(from);
+  if (idx < 0) {
+    return TryParseLocationURICandidate(location, aLocationHint, aURI);
+  }
+
+  if (TryParseLocationURICandidate(Substring(location, 0, idx), aLocationHint,
+                                   aURI)) {
+    return true;
+  }
+
+
+  int32_t ridx = location.RFind(":"_ns);
+  nsAutoCString chain(
+      Substring(location, idx + fromLength, ridx - idx - fromLength));
+
+  for (;;) {
+    idx = chain.RFind(arrow);
+    if (idx < 0) {
+      return TryParseLocationURICandidate(chain, aLocationHint, aURI);
+    }
+
+    if (TryParseLocationURICandidate(Substring(chain, idx + arrowLength),
+                                     aLocationHint, aURI)) {
+      return true;
+    }
+
+    chain = Substring(chain, 0, idx);
+  }
+
+  MOZ_CRASH("Chain parser loop does not terminate");
+}
+
+static bool PrincipalImmuneToScriptPolicy(nsIPrincipal* aPrincipal) {
+  if (aPrincipal->IsSystemPrincipal()) {
+    return true;
+  }
+
+  auto* principal = BasePrincipal::Cast(aPrincipal);
+
+  if (principal->Is<ExpandedPrincipal>()) {
+    return true;
+  }
+
+  if (nsContentUtils::IsPDFJS(principal)) {
+    return true;
+  }
+
+  if (aPrincipal->SchemeIs("about")) {
+    uint32_t flags;
+    nsresult rv = aPrincipal->GetAboutModuleFlags(&flags);
+    if (NS_SUCCEEDED(rv) && (flags & nsIAboutModule::ALLOW_SCRIPT)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+void RealmPrivate::RegisterStackFrame(JSStackFrameBase* aFrame) {
+  mJSStackFrames.PutEntry(aFrame);
+}
+
+void RealmPrivate::UnregisterStackFrame(JSStackFrameBase* aFrame) {
+  mJSStackFrames.RemoveEntry(aFrame);
+}
+
+void RealmPrivate::NukeJSStackFrames() {
+  for (const auto& key : mJSStackFrames.Keys()) {
+    key->Clear();
+  }
+
+  mJSStackFrames.Clear();
+}
+
+void RegisterJSStackFrame(JS::Realm* aRealm, JSStackFrameBase* aStackFrame) {
+  RealmPrivate* realmPrivate = RealmPrivate::Get(aRealm);
+  if (!realmPrivate) {
+    return;
+  }
+
+  realmPrivate->RegisterStackFrame(aStackFrame);
+}
+
+void UnregisterJSStackFrame(JS::Realm* aRealm, JSStackFrameBase* aStackFrame) {
+  RealmPrivate* realmPrivate = RealmPrivate::Get(aRealm);
+  if (!realmPrivate) {
+    return;
+  }
+
+  realmPrivate->UnregisterStackFrame(aStackFrame);
+}
+
+void NukeJSStackFrames(JS::Realm* aRealm) {
+  RealmPrivate* realmPrivate = RealmPrivate::Get(aRealm);
+  if (!realmPrivate) {
+    return;
+  }
+
+  realmPrivate->NukeJSStackFrames();
+}
+
+Scriptability::Scriptability(JS::Realm* realm)
+    : mScriptBlocks(0),
+      mWindowAllowsScript(true),
+      mScriptBlockedByPolicy(false) {
+  nsIPrincipal* prin = nsJSPrincipals::get(JS::GetRealmPrincipals(realm));
+
+  mImmuneToScriptPolicy = PrincipalImmuneToScriptPolicy(prin);
+  if (mImmuneToScriptPolicy) {
+    return;
+  }
+  bool policyAllows;
+  nsresult rv = prin->GetIsScriptAllowedByPolicy(&policyAllows);
+  if (NS_SUCCEEDED(rv)) {
+    mScriptBlockedByPolicy = !policyAllows;
+    return;
+  }
+  mScriptBlockedByPolicy = true;
+}
+
+bool Scriptability::Allowed() {
+  return mWindowAllowsScript && !mScriptBlockedByPolicy && mScriptBlocks == 0;
+}
+
+bool Scriptability::IsImmuneToScriptPolicy() { return mImmuneToScriptPolicy; }
+
+void Scriptability::Block() { ++mScriptBlocks; }
+
+void Scriptability::Unblock() {
+  MOZ_ASSERT(mScriptBlocks > 0);
+  --mScriptBlocks;
+}
+
+void Scriptability::SetWindowAllowsScript(bool aAllowed) {
+  mWindowAllowsScript = aAllowed || mImmuneToScriptPolicy;
+}
+
+bool Scriptability::AllowedIfExists(JSObject* aScope) {
+  RealmPrivate* realmPrivate = RealmPrivate::Get(aScope);
+  return realmPrivate ? realmPrivate->scriptability.Allowed() : true;
+}
+
+Scriptability& Scriptability::Get(JSObject* aScope) {
+  return RealmPrivate::Get(aScope)->scriptability;
+}
+
+bool IsUAWidgetCompartment(JS::Compartment* compartment) {
+  CompartmentPrivate* priv = CompartmentPrivate::Get(compartment);
+  return priv && priv->isUAWidgetCompartment;
+}
+
+bool IsUAWidgetScope(JS::Realm* realm) {
+  return IsUAWidgetCompartment(JS::GetCompartmentForRealm(realm));
+}
+
+bool IsInUAWidgetScope(JSObject* obj) {
+  return IsUAWidgetCompartment(JS::GetCompartment(obj));
+}
+
+bool CompartmentOriginInfo::MightBeWebContent() const {
+  return !nsContentUtils::IsSystemOrExpandedPrincipal(mOrigin);
+}
+
+bool MightBeWebContentCompartment(JS::Compartment* compartment) {
+  if (CompartmentPrivate* priv = CompartmentPrivate::Get(compartment)) {
+    return priv->originInfo.MightBeWebContent();
+  }
+
+  return !js::IsSystemCompartment(compartment);
+}
+
+bool CompartmentOriginInfo::IsSameOrigin(nsIPrincipal* aOther) const {
+  return mOrigin->FastEquals(aOther);
+}
+
+bool CompartmentOriginInfo::Subsumes(JS::Compartment* aCompA,
+                                     JS::Compartment* aCompB) {
+  CompartmentPrivate* apriv = CompartmentPrivate::Get(aCompA);
+  CompartmentPrivate* bpriv = CompartmentPrivate::Get(aCompB);
+  MOZ_ASSERT(apriv);
+  MOZ_ASSERT(bpriv);
+  return apriv->originInfo.mOrigin->FastSubsumes(bpriv->originInfo.mOrigin);
+}
+
+bool CompartmentOriginInfo::SubsumesIgnoringFPD(JS::Compartment* aCompA,
+                                                JS::Compartment* aCompB) {
+  CompartmentPrivate* apriv = CompartmentPrivate::Get(aCompA);
+  CompartmentPrivate* bpriv = CompartmentPrivate::Get(aCompB);
+  MOZ_ASSERT(apriv);
+  MOZ_ASSERT(bpriv);
+  return apriv->originInfo.mOrigin->FastSubsumesIgnoringFPD(
+      bpriv->originInfo.mOrigin);
+}
+
+void SetCompartmentChangedDocumentDomain(JS::Compartment* compartment) {
+  if (CompartmentPrivate* priv = CompartmentPrivate::Get(compartment)) {
+    priv->originInfo.SetChangedDocumentDomain();
+  }
+}
+
+JSObject* UnprivilegedJunkScope() {
+  return XPCJSRuntime::Get()->UnprivilegedJunkScope();
+}
+
+JSObject* UnprivilegedJunkScope(const fallible_t&) {
+  return XPCJSRuntime::Get()->UnprivilegedJunkScope(fallible);
+}
+
+bool IsUnprivilegedJunkScope(JSObject* obj) {
+  return XPCJSRuntime::Get()->IsUnprivilegedJunkScope(obj);
+}
+
+JSObject* NACScope(JSObject* global) {
+  if (AccessCheck::isChrome(global)) {
+    return global;
+  }
+
+  JSObject* scope = UnprivilegedJunkScope();
+  JS::ExposeObjectToActiveJS(scope);
+  return scope;
+}
+
+JSObject* PrivilegedJunkScope() {
+  return mozJSModuleLoader::Get()->GetSharedGlobal();
+}
+
+JSObject* CompilationScope() {
+  return mozJSModuleLoader::Get()->GetSharedGlobal();
+}
+
+nsGlobalWindowInner* WindowOrNull(JSObject* aObj) {
+  MOZ_ASSERT(aObj);
+  MOZ_ASSERT(!js::IsWrapper(aObj));
+
+  nsGlobalWindowInner* win = nullptr;
+  UNWRAP_NON_WRAPPER_OBJECT(Window, aObj, win);
+  return win;
+}
+
+nsGlobalWindowInner* WindowGlobalOrNull(JSObject* aObj) {
+  MOZ_ASSERT(aObj);
+  JSObject* glob = JS::GetNonCCWObjectGlobal(aObj);
+
+  return WindowOrNull(glob);
+}
+
+JSObject* SandboxPrototypeOrNull(JSContext* aCx, JSObject* aObj) {
+  MOZ_ASSERT(aObj);
+
+  if (!IsSandbox(aObj)) {
+    return nullptr;
+  }
+
+  JSObject* proto = GetStaticPrototype(aObj);
+  if (!proto || !IsSandboxPrototypeProxy(proto)) {
+    return nullptr;
+  }
+
+  return js::CheckedUnwrapDynamic(proto, aCx,  false);
+}
+
+nsGlobalWindowInner* CurrentWindowOrNull(JSContext* cx) {
+  JSObject* glob = JS::CurrentGlobalOrNull(cx);
+  return glob ? WindowOrNull(glob) : nullptr;
+}
+
+void NukeAllWrappersForRealm(
+    JSContext* cx, JS::Realm* realm,
+    js::NukeReferencesToWindow nukeReferencesToWindow) {
+  js::NukeCrossCompartmentWrappers(cx, js::AllCompartments(), realm,
+                                   nukeReferencesToWindow,
+                                   js::NukeAllReferences);
+
+  xpc::RealmPrivate::Get(realm)->scriptability.Block();
+}
+
+}  
+
+static void CompartmentDestroyedCallback(JS::GCContext* gcx,
+                                         JS::Compartment* compartment) {
+
+  mozilla::UniquePtr<CompartmentPrivate> priv(
+      CompartmentPrivate::Get(compartment));
+  JS_SetCompartmentPrivate(compartment, nullptr);
+}
+
+static size_t CompartmentSizeOfIncludingThisCallback(
+    MallocSizeOf mallocSizeOf, JS::Compartment* compartment) {
+  CompartmentPrivate* priv = CompartmentPrivate::Get(compartment);
+  return priv ? priv->SizeOfIncludingThis(mallocSizeOf) : 0;
+}
+
+bool XPCJSRuntime::UsefulToMergeZones() const {
+  MOZ_ASSERT(NS_IsMainThread());
+
+
+  return false;
+}
+
+void XPCJSRuntime::TraceAdditionalNativeBlackRoots(JSTracer* trc) {
+  if (CycleCollectedJSContext* ccx = GetContext()) {
+    const auto* cx = static_cast<const XPCJSContext*>(ccx);
+    if (AutoMarkingPtr* roots = cx->mAutoRoots) {
+      roots->TraceJSAll(trc);
+    }
+  }
+
+  if (mIID2NativeInterfaceMap) {
+    mIID2NativeInterfaceMap->Trace(trc);
+  }
+
+  dom::TraceBlackJS(trc);
+}
+
+void XPCJSRuntime::TraceAdditionalNativeGrayRoots(JSTracer* trc) {
+  XPCWrappedNativeScope::TraceWrappedNativesInAllScopes(this, trc);
+}
+
+void XPCJSRuntime::TraverseAdditionalNativeRoots(
+    nsCycleCollectionNoteRootCallback& cb) {
+  XPCWrappedNativeScope::SuspectAllWrappers(cb);
+
+  auto* parti = NS_CYCLE_COLLECTION_PARTICIPANT(nsXPCWrappedJS);
+  for (auto* wjs : mSubjectToFinalizationWJS) {
+    MOZ_DIAGNOSTIC_ASSERT(wjs->IsSubjectToFinalization());
+    cb.NoteXPCOMRoot(ToSupports(wjs), parti);
+  }
+}
+
+void XPCJSRuntime::UnmarkSkippableJSHolders() {
+  CycleCollectedJSRuntime::UnmarkSkippableJSHolders();
+}
+
+void XPCJSRuntime::PrepareForForgetSkippable() {
+  nsCCUncollectableMarker::CleanupForForgetSkippable();
+}
+
+void XPCJSRuntime::BeginCycleCollectionCallback(CCReason aReason) {
+  nsJSContext::BeginCycleCollectionCallback(aReason);
+
+  nsCOMPtr<nsIObserverService> obs = xpc::GetObserverService();
+  if (obs) {
+    obs->NotifyObservers(nullptr, "cycle-collector-begin", nullptr);
+  }
+}
+
+void XPCJSRuntime::EndCycleCollectionCallback(CycleCollectorResults& aResults) {
+  nsJSContext::EndCycleCollectionCallback(aResults);
+
+  nsCOMPtr<nsIObserverService> obs = xpc::GetObserverService();
+  if (obs) {
+    obs->NotifyObservers(nullptr, "cycle-collector-end", nullptr);
+  }
+}
+
+void XPCJSRuntime::DispatchDeferredDeletion(bool aContinuation, bool aPurge) {
+  mAsyncSnowWhiteFreer->Start(aContinuation, aPurge);
+}
+
+void xpc_UnmarkSkippableJSHolders() {
+  if (nsXPConnect::GetRuntimeInstance()) {
+    nsXPConnect::GetRuntimeInstance()->UnmarkSkippableJSHolders();
+  }
+}
+
+void XPCJSRuntime::GCSliceCallback(JSContext* cx, JS::GCProgress progress,
+                                   const JS::GCDescription& desc) {
+  XPCJSRuntime* self = nsXPConnect::GetRuntimeInstance();
+  if (!self) {
+    return;
+  }
+
+  nsCOMPtr<nsIObserverService> obs = xpc::GetObserverService();
+  if (obs) {
+    switch (progress) {
+      case JS::GC_CYCLE_BEGIN:
+        obs->NotifyObservers(nullptr, "garbage-collector-begin", nullptr);
+        break;
+      case JS::GC_CYCLE_END:
+        obs->NotifyObservers(nullptr, "garbage-collector-end", nullptr);
+        break;
+      default:
+        break;
+    }
+  }
+
+  if (self->mPrevGCSliceCallback) {
+    (*self->mPrevGCSliceCallback)(cx, progress, desc);
+  }
+}
+
+void XPCJSRuntime::DoCycleCollectionCallback(JSContext* cx) {
+  NS_DispatchToCurrentThread(NS_NewRunnableFunction(
+      "XPCJSRuntime::DoCycleCollectionCallback",
+      []() { nsJSContext::CycleCollectNow(CCReason::GC_WAITING, nullptr); }));
+
+  XPCJSRuntime* self = nsXPConnect::GetRuntimeInstance();
+  if (!self) {
+    return;
+  }
+
+  if (self->mPrevDoCycleCollectionCallback) {
+    (*self->mPrevDoCycleCollectionCallback)(cx);
+  }
+}
+
+void XPCJSRuntime::FinalizeCallback(JS::GCContext* gcx, JSFinalizeStatus status,
+                                    void* data) {
+  XPCJSRuntime* self = nsXPConnect::GetRuntimeInstance();
+  if (!self) {
+    return;
+  }
+
+  switch (status) {
+    case JSFINALIZE_GROUP_PREPARE: {
+      MOZ_ASSERT(!self->mDoingFinalization, "bad state");
+
+      MOZ_ASSERT(!self->mGCIsRunning, "bad state");
+      self->mGCIsRunning = true;
+
+      self->mDoingFinalization = true;
+
+      break;
+    }
+    case JSFINALIZE_GROUP_START: {
+      MOZ_ASSERT(self->mDoingFinalization, "bad state");
+
+      MOZ_ASSERT(self->mGCIsRunning, "bad state");
+      self->mGCIsRunning = false;
+
+      break;
+    }
+    case JSFINALIZE_GROUP_END: {
+      MOZ_ASSERT(self->mDoingFinalization, "bad state");
+      self->mDoingFinalization = false;
+
+      break;
+    }
+    case JSFINALIZE_COLLECTION_END: {
+      MOZ_ASSERT(!self->mGCIsRunning, "bad state");
+      self->mGCIsRunning = true;
+
+      if (CycleCollectedJSContext* ccx = self->GetContext()) {
+        const auto* cx = static_cast<const XPCJSContext*>(ccx);
+        if (AutoMarkingPtr* roots = cx->mAutoRoots) {
+          roots->MarkAfterJSFinalizeAll();
+        }
+
+
+        XPCCallContext* ccxp = cx->GetCallContext();
+        while (ccxp) {
+          if (ccxp->CanGetTearOff()) {
+            XPCWrappedNativeTearOff* to = ccxp->GetTearOff();
+            if (to) {
+              to->Mark();
+            }
+          }
+          ccxp = ccxp->GetPrevCallContext();
+        }
+      }
+
+      XPCWrappedNativeScope::SweepAllWrappedNativeTearOffs();
+
+      self->mDyingWrappedNativeProtos.clear();
+
+      MOZ_ASSERT(self->mGCIsRunning, "bad state");
+      self->mGCIsRunning = false;
+
+      break;
+    }
+  }
+}
+
+void XPCJSRuntime::WeakPointerZonesCallback(JSTracer* trc, void* data) {
+  XPCJSRuntime* self = static_cast<XPCJSRuntime*>(data);
+
+  AutoRestore<bool> restoreState(self->mGCIsRunning);
+  self->mGCIsRunning = true;
+
+  self->mWrappedJSMap->UpdateWeakPointersAfterGC(trc);
+  self->mUAWidgetScopeMap.traceWeak(trc);
+
+  BrowsingContext::SweepWindowProxies(trc);
+}
+
+void XPCJSRuntime::WeakPointerCompartmentCallback(JSTracer* trc,
+                                                  JS::Compartment* comp,
+                                                  void* data) {
+  CompartmentPrivate* xpcComp = CompartmentPrivate::Get(comp);
+  if (xpcComp) {
+    xpcComp->UpdateWeakPointersAfterGC(trc);
+  }
+}
+
+void CompartmentPrivate::UpdateWeakPointersAfterGC(JSTracer* trc) {
+  mRemoteProxies.traceWeak(trc);
+  mWrappedJSMap->UpdateWeakPointersAfterGC(trc);
+  mScope->UpdateWeakPointersAfterGC(trc);
+}
+
+void XPCJSRuntime::CustomOutOfMemoryCallback() {
+  if (!Preferences::GetBool("memory.dump_reports_on_oom")) {
+    return;
+  }
+
+  nsCOMPtr<nsIMemoryInfoDumper> dumper =
+      do_GetService("@mozilla.org/memory-info-dumper;1");
+  if (!dumper) {
+    return;
+  }
+
+  dumper->DumpMemoryInfoToTempDir(u"due-to-JS-OOM"_ns,
+                                   false,
+                                   false);
+}
+
+void XPCJSRuntime::OnLargeAllocationFailure() {
+  CycleCollectedJSRuntime::SetLargeAllocationFailure(OOMState::Reporting);
+
+  nsCOMPtr<nsIObserverService> os = xpc::GetObserverService();
+  if (os) {
+    os->NotifyObservers(nullptr, "memory-pressure", u"heap-minimize");
+  }
+
+  CycleCollectedJSRuntime::SetLargeAllocationFailure(OOMState::Reported);
+}
+
+class LargeAllocationFailureRunnable final : public Runnable {
+  Mutex mMutex MOZ_UNANNOTATED;
+  CondVar mCondVar;
+  bool mWaiting;
+
+  virtual ~LargeAllocationFailureRunnable() { MOZ_ASSERT(!mWaiting); }
+
+ protected:
+  NS_IMETHOD Run() override {
+    MOZ_ASSERT(NS_IsMainThread());
+
+    XPCJSRuntime::Get()->OnLargeAllocationFailure();
+
+    MutexAutoLock lock(mMutex);
+    MOZ_ASSERT(mWaiting);
+
+    mWaiting = false;
+    mCondVar.Notify();
+    return NS_OK;
+  }
+
+ public:
+  LargeAllocationFailureRunnable()
+      : mozilla::Runnable("LargeAllocationFailureRunnable"),
+        mMutex("LargeAllocationFailureRunnable::mMutex"),
+        mCondVar(mMutex, "LargeAllocationFailureRunnable::mCondVar"),
+        mWaiting(true) {
+    MOZ_ASSERT(!NS_IsMainThread());
+  }
+
+  void BlockUntilDone() {
+    MOZ_ASSERT(!NS_IsMainThread());
+
+    MutexAutoLock lock(mMutex);
+    while (mWaiting) {
+      mCondVar.Wait();
+    }
+  }
+};
+
+static void OnLargeAllocationFailureCallback() {
+
+  if (NS_IsMainThread()) {
+    XPCJSRuntime::Get()->OnLargeAllocationFailure();
+    return;
+  }
+
+  RefPtr<LargeAllocationFailureRunnable> r = new LargeAllocationFailureRunnable;
+  if (NS_WARN_IF(NS_FAILED(NS_DispatchToMainThread(r)))) {
+    return;
+  }
+
+  r->BlockUntilDone();
+}
+
+extern const char gToolkitBuildID[];
+
+bool mozilla::GetBuildId(JS::BuildIdCharVector* aBuildID) {
+  size_t length = std::char_traits<char>::length(gToolkitBuildID);
+  return aBuildID->append(gToolkitBuildID, length);
+}
+
+size_t XPCJSRuntime::SizeOfIncludingThis(MallocSizeOf mallocSizeOf) {
+  size_t n = 0;
+  n += mallocSizeOf(this);
+  n += mWrappedJSMap->SizeOfIncludingThis(mallocSizeOf);
+  n += mIID2NativeInterfaceMap->SizeOfIncludingThis(mallocSizeOf);
+  n += mClassInfo2NativeSetMap->ShallowSizeOfIncludingThis(mallocSizeOf);
+  n += mNativeSetMap->SizeOfIncludingThis(mallocSizeOf);
+
+  n += CycleCollectedJSRuntime::SizeOfExcludingThis(mallocSizeOf);
+
+
+  return n;
+}
+
+size_t CompartmentPrivate::SizeOfIncludingThis(MallocSizeOf mallocSizeOf) {
+  size_t n = mallocSizeOf(this);
+  n += mWrappedJSMap->SizeOfIncludingThis(mallocSizeOf);
+  n += mWrappedJSMap->SizeOfWrappedJS(mallocSizeOf);
+  return n;
+}
+
+
+void XPCJSRuntime::Shutdown(JSContext* cx) {
+  JS_RemoveFinalizeCallback(cx, FinalizeCallback);
+  xpc_DelocalizeRuntime(JS_GetRuntime(cx));
+
+  JS::SetGCSliceCallback(cx, mPrevGCSliceCallback);
+
+  nsScriptSecurityManager::ClearJSCallbacks(cx);
+
+  mIID2NativeInterfaceMap = nullptr;
+
+  mClassInfo2NativeSetMap = nullptr;
+
+  mNativeSetMap = nullptr;
+
+  mWrappedNativeScopes.clear();
+
+  mSubjectToFinalizationWJS.clear();
+
+  CycleCollectedJSRuntime::Shutdown(cx);
+}
+
+XPCJSRuntime::~XPCJSRuntime() {
+  MOZ_COUNT_DTOR_INHERITED(XPCJSRuntime, CycleCollectedJSRuntime);
+}
+
+static void GetRealmName(JS::Realm* realm, nsCString& name, int* anonymizeID,
+                         bool replaceSlashes) {
+  if (*anonymizeID && !js::IsSystemRealm(realm)) {
+    name.AppendPrintf("<anonymized-%d>", *anonymizeID);
+    *anonymizeID += 1;
+  } else if (JSPrincipals* principals = JS::GetRealmPrincipals(realm)) {
+    nsresult rv = nsJSPrincipals::get(principals)->GetScriptLocation(name);
+    if (NS_FAILED(rv)) {
+      name.AssignLiteral("(unknown)");
+    }
+
+    RealmPrivate* realmPrivate = RealmPrivate::Get(realm);
+    if (realmPrivate) {
+      const nsACString& location = realmPrivate->GetLocation();
+      if (!location.IsEmpty() && !location.Equals(name)) {
+        name.AppendLiteral(", ");
+        name.Append(location);
+      }
+    }
+
+    if (*anonymizeID) {
+      static const char* filePrefix = "file://";
+      int filePos = name.Find(filePrefix);
+      if (filePos >= 0) {
+        int pathPos = filePos + strlen(filePrefix);
+        int lastSlashPos = -1;
+        for (int i = pathPos; i < int(name.Length()); i++) {
+          if (name[i] == '/' || name[i] == '\\') {
+            lastSlashPos = i;
+          }
+        }
+        if (lastSlashPos != -1) {
+          name.ReplaceLiteral(pathPos, lastSlashPos - pathPos, "<anonymized>");
+        } else {
+          name.Truncate(pathPos);
+          name += "<anonymized?!>";
+        }
+      }
+
+      static const char* ownedByPrefix = "inProcessBrowserChildGlobal?ownedBy=";
+      int ownedByPos = name.Find(ownedByPrefix);
+      if (ownedByPos >= 0) {
+        const char* chrome = "chrome:";
+        int ownerPos = ownedByPos + strlen(ownedByPrefix);
+        const nsDependentCSubstring& ownerFirstPart =
+            Substring(name, ownerPos, strlen(chrome));
+        if (!ownerFirstPart.EqualsASCII(chrome)) {
+          name.Truncate(ownerPos);
+          name += "<anonymized>";
+        }
+      }
+    }
+
+    if (replaceSlashes) {
+      name.ReplaceChar('/', '\\');
+    }
+  } else {
+    name.AssignLiteral("null-principal");
+  }
+}
+
+extern void xpc::GetCurrentRealmName(JSContext* cx, nsCString& name) {
+  RootedObject global(cx, JS::CurrentGlobalOrNull(cx));
+  if (!global) {
+    name.AssignLiteral("no global");
+    return;
+  }
+
+  JS::Realm* realm = GetNonCCWObjectRealm(global);
+  int anonymizeID = 0;
+  GetRealmName(realm, name, &anonymizeID, false);
+}
+
+static int64_t JSMainRuntimeGCHeapDistinguishedAmount() {
+  JSContext* cx = danger::GetJSContext();
+  return int64_t(JS_GetGCParameter(cx, JSGC_TOTAL_CHUNKS)) * js::gc::ChunkSize;
+}
+
+static int64_t JSMainRuntimeTemporaryPeakDistinguishedAmount() {
+  JSContext* cx = danger::GetJSContext();
+  return JS::PeakSizeOfTemporary(cx);
+}
+
+static int64_t JSMainRuntimeCompartmentsSystemDistinguishedAmount() {
+  JSContext* cx = danger::GetJSContext();
+  return JS::SystemCompartmentCount(cx);
+}
+
+static int64_t JSMainRuntimeCompartmentsUserDistinguishedAmount() {
+  JSContext* cx = XPCJSContext::Get()->Context();
+  return JS::UserCompartmentCount(cx);
+}
+
+static int64_t JSMainRuntimeRealmsSystemDistinguishedAmount() {
+  JSContext* cx = danger::GetJSContext();
+  return JS::SystemRealmCount(cx);
+}
+
+static int64_t JSMainRuntimeRealmsUserDistinguishedAmount() {
+  JSContext* cx = XPCJSContext::Get()->Context();
+  return JS::UserRealmCount(cx);
+}
+
+class JSMainRuntimeTemporaryPeakReporter final : public nsIMemoryReporter {
+  ~JSMainRuntimeTemporaryPeakReporter() = default;
+
+ public:
+  NS_DECL_ISUPPORTS
+
+  NS_IMETHOD CollectReports(nsIHandleReportCallback* aHandleReport,
+                            nsISupports* aData, bool aAnonymize) override {
+    MOZ_COLLECT_REPORT(
+        "js-main-runtime-temporary-peak", KIND_OTHER, UNITS_BYTES,
+        JSMainRuntimeTemporaryPeakDistinguishedAmount(),
+        "Peak transient data size in the main JSRuntime (the current size "
+        "of which is reported as "
+        "'explicit/js-non-window/runtime/temporary').");
+
+    return NS_OK;
+  }
+};
+
+NS_IMPL_ISUPPORTS(JSMainRuntimeTemporaryPeakReporter, nsIMemoryReporter)
+
+
+#define SUNDRIES_THRESHOLD js::MemoryReportingSundriesThreshold()
+
+#define REPORT(_path, _kind, _units, _amount, _desc)             \
+  handleReport->Callback(""_ns, _path, nsIMemoryReporter::_kind, \
+                         nsIMemoryReporter::_units, _amount,     \
+                         nsLiteralCString(_desc), data);
+
+#define REPORT_BYTES(_path, _kind, _amount, _desc) \
+  REPORT(_path, _kind, UNITS_BYTES, _amount, _desc);
+
+#define REPORT_GC_BYTES(_path, _amount, _desc)                            \
+  do {                                                                    \
+    size_t amount = _amount;              \
+    handleReport->Callback(""_ns, _path, nsIMemoryReporter::KIND_NONHEAP, \
+                           nsIMemoryReporter::UNITS_BYTES, amount,        \
+                           nsLiteralCString(_desc), data);                \
+    gcTotal += amount;                                                    \
+  } while (0)
+
+#define ZRREPORT_BYTES(_path, _amount, _desc)                            \
+  do {                                                                   \
+        \
+                                                \
+    size_t amount = _amount;             \
+    if (amount >= SUNDRIES_THRESHOLD) {                                  \
+      handleReport->Callback(""_ns, _path, nsIMemoryReporter::KIND_HEAP, \
+                             nsIMemoryReporter::UNITS_BYTES, amount,     \
+                             nsLiteralCString(_desc), data);             \
+    } else {                                                             \
+      sundriesMallocHeap += amount;                                      \
+    }                                                                    \
+  } while (0)
+
+#define ZRREPORT_GC_BYTES(_path, _amount, _desc)                            \
+  do {                                                                      \
+    size_t amount = _amount;                \
+    if (amount >= SUNDRIES_THRESHOLD) {                                     \
+      handleReport->Callback(""_ns, _path, nsIMemoryReporter::KIND_NONHEAP, \
+                             nsIMemoryReporter::UNITS_BYTES, amount,        \
+                             nsLiteralCString(_desc), data);                \
+      gcTotal += amount;                                                    \
+    } else {                                                                \
+      sundriesGCHeap += amount;                                             \
+    }                                                                       \
+  } while (0)
+
+#define ZRREPORT_NONHEAP_BYTES(_path, _amount, _desc)                       \
+  do {                                                                      \
+    size_t amount = _amount;                \
+    if (amount >= SUNDRIES_THRESHOLD) {                                     \
+      handleReport->Callback(""_ns, _path, nsIMemoryReporter::KIND_NONHEAP, \
+                             nsIMemoryReporter::UNITS_BYTES, amount,        \
+                             nsLiteralCString(_desc), data);                \
+    } else {                                                                \
+      sundriesNonHeap += amount;                                            \
+    }                                                                       \
+  } while (0)
+
+#define RREPORT_BYTES(_path, _kind, _amount, _desc)                \
+  do {                                                             \
+    size_t amount = _amount;       \
+    handleReport->Callback(""_ns, _path, nsIMemoryReporter::_kind, \
+                           nsIMemoryReporter::UNITS_BYTES, amount, \
+                           nsLiteralCString(_desc), data);         \
+    rtTotal += amount;                                             \
+  } while (0)
+
+#define MREPORT_BYTES(_path, _kind, _amount, _desc)                \
+  do {                                                             \
+    size_t amount = _amount;       \
+    handleReport->Callback(""_ns, _path, nsIMemoryReporter::_kind, \
+                           nsIMemoryReporter::UNITS_BYTES, amount, \
+                           nsLiteralCString(_desc), data);         \
+    gcThingTotal += amount;                                        \
+  } while (0)
+
+MOZ_DEFINE_MALLOC_SIZE_OF(JSMallocSizeOf)
+
+namespace xpc {
+
+static void ReportZoneStats(const JS::ZoneStats& zStats,
+                            const xpc::ZoneStatsExtras& extras,
+                            nsIHandleReportCallback* handleReport,
+                            nsISupports* data, bool anonymize,
+                            size_t* gcTotalOut = nullptr) {
+  const nsCString& pathPrefix = extras.pathPrefix;
+  size_t gcTotal = 0;
+  size_t sundriesGCHeap = 0;
+  size_t sundriesMallocHeap = 0;
+  size_t sundriesNonHeap = 0;
+
+  MOZ_ASSERT(!gcTotalOut == zStats.isTotals);
+
+  ZRREPORT_GC_BYTES(pathPrefix + "symbols/gc-heap"_ns, zStats.symbolsGCHeap,
+                    "Symbols.");
+
+  ZRREPORT_GC_BYTES(
+      pathPrefix + "gc-heap-arena-admin"_ns, zStats.gcHeapArenaAdmin,
+      "Bookkeeping information and alignment padding within GC arenas.");
+
+  ZRREPORT_GC_BYTES(pathPrefix + "unused-gc-things"_ns,
+                    zStats.unusedGCThings.totalSize(),
+                    "Unused GC thing cells within non-empty arenas.");
+
+  ZRREPORT_BYTES(pathPrefix + "unique-id-map"_ns, zStats.uniqueIdMap,
+                 "Address-independent cell identities.");
+
+  ZRREPORT_BYTES(pathPrefix + "propmap-tables"_ns, zStats.initialPropMapTable,
+                 "Tables storing property map information.");
+
+  ZRREPORT_BYTES(pathPrefix + "shape-tables"_ns, zStats.shapeTables,
+                 "Tables storing shape information.");
+
+  ZRREPORT_BYTES(pathPrefix + "compartments/compartment-objects"_ns,
+                 zStats.compartmentObjects,
+                 "The JS::Compartment objects in this zone.");
+
+  ZRREPORT_BYTES(
+      pathPrefix + "compartments/cross-compartment-wrapper-tables"_ns,
+      zStats.crossCompartmentWrappersTables,
+      "The cross-compartment wrapper tables.");
+
+  ZRREPORT_BYTES(
+      pathPrefix + "compartments/private-data"_ns,
+      zStats.compartmentsPrivateData,
+      "Extra data attached to each compartment by XPConnect, including "
+      "its wrapped-js.");
+
+  ZRREPORT_GC_BYTES(pathPrefix + "bigints/gc-heap"_ns, zStats.bigIntsGCHeap,
+                    "BigInt values.");
+
+  ZRREPORT_NONHEAP_BYTES(pathPrefix + "bigints/gc-buffers"_ns,
+                         zStats.bigIntsGCBuffers, "BigInt values.");
+
+  ZRREPORT_GC_BYTES(pathPrefix + "jit-codes-gc-heap"_ns, zStats.jitCodesGCHeap,
+                    "References to executable code pools used by the JITs.");
+
+  ZRREPORT_GC_BYTES(pathPrefix + "getter-setters-gc-heap"_ns,
+                    zStats.getterSettersGCHeap,
+                    "Information for getter/setter properties.");
+
+  ZRREPORT_GC_BYTES(pathPrefix + "property-maps/gc-heap/compact"_ns,
+                    zStats.compactPropMapsGCHeap,
+                    "Information about object properties.");
+
+  ZRREPORT_GC_BYTES(pathPrefix + "property-maps/gc-heap/normal"_ns,
+                    zStats.normalPropMapsGCHeap,
+                    "Information about object properties.");
+
+  ZRREPORT_GC_BYTES(pathPrefix + "property-maps/gc-heap/dict"_ns,
+                    zStats.dictPropMapsGCHeap,
+                    "Information about dictionary mode object properties.");
+
+  ZRREPORT_BYTES(pathPrefix + "property-maps/malloc-heap/children"_ns,
+                 zStats.propMapChildren, "Tables for PropMap children.");
+
+  ZRREPORT_BYTES(pathPrefix + "property-maps/malloc-heap/tables"_ns,
+                 zStats.propMapTables, "HashTables for PropMaps.");
+
+  ZRREPORT_GC_BYTES(pathPrefix + "scopes/gc-heap"_ns, zStats.scopesGCHeap,
+                    "Scope information for scripts.");
+
+  ZRREPORT_NONHEAP_BYTES(
+      pathPrefix + "scopes/gc-buffers"_ns, zStats.scopesGCBuffers,
+      "Arrays of binding names and other binding-related data.");
+
+  ZRREPORT_GC_BYTES(pathPrefix + "regexp-shareds/gc-heap"_ns,
+                    zStats.regExpSharedsGCHeap, "Shared compiled regexp data.");
+
+  ZRREPORT_BYTES(pathPrefix + "regexp-shareds/malloc-heap"_ns,
+                 zStats.regExpSharedsMallocHeap,
+                 "Shared compiled regexp data.");
+
+  ZRREPORT_BYTES(pathPrefix + "zone-object"_ns, zStats.zoneObject,
+                 "The JS::Zone object itself.");
+
+  ZRREPORT_BYTES(pathPrefix + "regexp-zone"_ns, zStats.regexpZone,
+                 "The regexp zone and regexp data.");
+
+  ZRREPORT_BYTES(pathPrefix + "jit-zone"_ns, zStats.jitZone, "The JIT zone.");
+
+  ZRREPORT_BYTES(pathPrefix + "cacheir-stubs"_ns, zStats.cacheIRStubs,
+                 "The JIT's IC stubs (excluding code).");
+
+  ZRREPORT_BYTES(pathPrefix + "object-fuses"_ns, zStats.objectFuses,
+                 "Information about constant object properties.");
+
+  ZRREPORT_BYTES(pathPrefix + "script-counts-map"_ns, zStats.scriptCountsMap,
+                 "Profiling-related information for scripts.");
+
+  ZRREPORT_NONHEAP_BYTES(pathPrefix + "code/ion"_ns, zStats.code.ion,
+                         "Code generated by the IonMonkey JIT.");
+
+  ZRREPORT_NONHEAP_BYTES(pathPrefix + "code/baseline"_ns, zStats.code.baseline,
+                         "Code generated by the Baseline JIT.");
+
+  ZRREPORT_NONHEAP_BYTES(pathPrefix + "code/regexp"_ns, zStats.code.regexp,
+                         "Code generated by the regexp JIT.");
+
+  ZRREPORT_NONHEAP_BYTES(
+      pathPrefix + "code/other"_ns, zStats.code.other,
+      "Code generated by the JITs for wrappers and trampolines.");
+
+  ZRREPORT_NONHEAP_BYTES(pathPrefix + "code/unused"_ns, zStats.code.unused,
+                         "Memory allocated by one of the JITs to hold code, "
+                         "but which is currently unused.");
+
+  size_t stringsNotableAboutMemoryGCHeap = 0;
+  size_t stringsNotableAboutMemoryMallocHeap = 0;
+
+#define MAYBE_INLINE "The characters may be inline or on the malloc heap."
+#define MAYBE_OVERALLOCATED \
+  "Sometimes over-allocated to simplify string concatenation."
+
+  for (size_t i = 0; i < zStats.notableStrings.length(); i++) {
+    const JS::NotableStringInfo& info = zStats.notableStrings[i];
+
+    MOZ_ASSERT(!zStats.isTotals);
+
+    MOZ_ASSERT(!anonymize);
+
+    nsDependentCString notableString(info.buffer.get());
+
+#define STRING_LENGTH "string(length="
+    if (FindInReadable(nsLiteralCString(STRING_LENGTH), notableString)) {
+      stringsNotableAboutMemoryGCHeap += info.gcHeapLatin1;
+      stringsNotableAboutMemoryGCHeap += info.gcHeapTwoByte;
+      stringsNotableAboutMemoryMallocHeap += info.mallocHeapLatin1;
+      stringsNotableAboutMemoryMallocHeap += info.mallocHeapTwoByte;
+      continue;
+    }
+
+    nsCString escapedString(notableString);
+    escapedString.ReplaceSubstring("/", "\\");
+
+    bool truncated = notableString.Length() < info.length;
+
+    nsCString path =
+        pathPrefix +
+        nsPrintfCString("strings/" STRING_LENGTH "%zu, copies=%d, \"%s\"%s)/",
+                        info.length, info.numCopies, escapedString.get(),
+                        truncated ? " (truncated)" : "");
+
+    if (info.gcHeapLatin1 > 0) {
+      REPORT_GC_BYTES(path + "gc-heap/latin1"_ns, info.gcHeapLatin1,
+                      "Latin1 strings. " MAYBE_INLINE);
+    }
+
+    if (info.gcHeapTwoByte > 0) {
+      REPORT_GC_BYTES(path + "gc-heap/two-byte"_ns, info.gcHeapTwoByte,
+                      "TwoByte strings. " MAYBE_INLINE);
+    }
+
+    if (info.mallocHeapLatin1 > 0) {
+      REPORT_BYTES(path + "malloc-heap/latin1"_ns, KIND_HEAP,
+                   info.mallocHeapLatin1,
+                   "Non-inline Latin1 string characters. " MAYBE_OVERALLOCATED);
+    }
+
+    if (info.mallocHeapTwoByte > 0) {
+      REPORT_BYTES(
+          path + "malloc-heap/two-byte"_ns, KIND_HEAP, info.mallocHeapTwoByte,
+          "Non-inline TwoByte string characters. " MAYBE_OVERALLOCATED);
+    }
+  }
+
+  nsCString nonNotablePath = pathPrefix;
+  nonNotablePath += (zStats.isTotals || anonymize)
+                        ? "strings/"_ns
+                        : "strings/string(<non-notable strings>)/"_ns;
+
+  if (zStats.stringInfo.gcHeapLatin1 > 0) {
+    REPORT_GC_BYTES(nonNotablePath + "gc-heap/latin1"_ns,
+                    zStats.stringInfo.gcHeapLatin1,
+                    "Latin1 strings. " MAYBE_INLINE);
+  }
+
+  if (zStats.stringInfo.gcHeapTwoByte > 0) {
+    REPORT_GC_BYTES(nonNotablePath + "gc-heap/two-byte"_ns,
+                    zStats.stringInfo.gcHeapTwoByte,
+                    "TwoByte strings. " MAYBE_INLINE);
+  }
+
+  if (zStats.stringInfo.mallocHeapLatin1 > 0) {
+    REPORT_BYTES(nonNotablePath + "malloc-heap/latin1"_ns, KIND_HEAP,
+                 zStats.stringInfo.mallocHeapLatin1,
+                 "Non-inline Latin1 string characters. " MAYBE_OVERALLOCATED);
+  }
+
+  if (zStats.stringInfo.mallocHeapTwoByte > 0) {
+    REPORT_BYTES(nonNotablePath + "malloc-heap/two-byte"_ns, KIND_HEAP,
+                 zStats.stringInfo.mallocHeapTwoByte,
+                 "Non-inline TwoByte string characters. " MAYBE_OVERALLOCATED);
+  }
+
+  if (stringsNotableAboutMemoryGCHeap > 0) {
+    MOZ_ASSERT(!zStats.isTotals);
+    REPORT_GC_BYTES(
+        pathPrefix + "strings/string(<about-memory>)/gc-heap"_ns,
+        stringsNotableAboutMemoryGCHeap,
+        "Strings that contain the characters '" STRING_LENGTH
+        "', which "
+        "are probably from about:memory itself." MAYBE_INLINE
+        " We filter them out rather than display them, because displaying "
+        "them would create even more such strings every time about:memory "
+        "is refreshed.");
+  }
+
+  if (stringsNotableAboutMemoryMallocHeap > 0) {
+    MOZ_ASSERT(!zStats.isTotals);
+    REPORT_BYTES(
+        pathPrefix + "strings/string(<about-memory>)/malloc-heap"_ns, KIND_HEAP,
+        stringsNotableAboutMemoryMallocHeap,
+        "Non-inline string characters of strings that contain the "
+        "characters '" STRING_LENGTH
+        "', which are probably from "
+        "about:memory itself. " MAYBE_OVERALLOCATED
+        " We filter them out rather than display them, because displaying "
+        "them would create even more such strings every time about:memory "
+        "is refreshed.");
+  }
+
+  if (zStats.stringsDeduplicationTruncated) {
+    MOZ_ASSERT(!zStats.isTotals);
+    nsAutoCString desc;
+    desc.AppendPrintf(
+        "Number of JS strings seen in zones where notable string detection was "
+        "cut off before it could finish.");
+    handleReport->Callback(""_ns, "js-notable-truncated-strings-count"_ns,
+                           nsIMemoryReporter::KIND_OTHER,
+                           nsIMemoryReporter::UNITS_COUNT,
+                           zStats.stringsTotalCount, desc, data);
+  }
+
+  const JS::ShapeInfo& shapeInfo = zStats.shapeInfo;
+  if (shapeInfo.shapesGCHeapShared > 0) {
+    REPORT_GC_BYTES(pathPrefix + "shapes/gc-heap/shared"_ns,
+                    shapeInfo.shapesGCHeapShared, "Shared shapes.");
+  }
+
+  if (shapeInfo.shapesGCHeapDict > 0) {
+    REPORT_GC_BYTES(pathPrefix + "shapes/gc-heap/dict"_ns,
+                    shapeInfo.shapesGCHeapDict, "Shapes in dictionary mode.");
+  }
+
+  if (shapeInfo.shapesGCHeapBase > 0) {
+    REPORT_GC_BYTES(pathPrefix + "shapes/gc-heap/base"_ns,
+                    shapeInfo.shapesGCHeapBase,
+                    "Base shapes, which collate data common to many shapes.");
+  }
+
+  if (shapeInfo.shapesMallocHeapCache > 0) {
+    REPORT_BYTES(pathPrefix + "shapes/malloc-heap/shape-cache"_ns, KIND_HEAP,
+                 shapeInfo.shapesMallocHeapCache,
+                 "Shape cache hash set for adding properties.");
+  }
+
+  if (sundriesGCHeap > 0) {
+    REPORT_GC_BYTES(
+        pathPrefix + "sundries/gc-heap"_ns, sundriesGCHeap,
+        "The sum of all 'gc-heap' measurements that are too small to be "
+        "worth showing individually.");
+  }
+
+  if (sundriesMallocHeap > 0) {
+    REPORT_BYTES(
+        pathPrefix + "sundries/malloc-heap"_ns, KIND_HEAP, sundriesMallocHeap,
+        "The sum of all 'malloc-heap' measurements that are too small to "
+        "be worth showing individually.");
+  }
+
+  if (sundriesNonHeap > 0) {
+    REPORT_BYTES(pathPrefix + "sundries/other-heap"_ns, KIND_NONHEAP,
+                 sundriesNonHeap,
+                 "The sum of non-malloc/gc measurements that are too small to "
+                 "be worth showing individually.");
+  }
+
+  if (gcTotalOut) {
+    *gcTotalOut += gcTotal;
+  }
+
+#undef STRING_LENGTH
+}
+
+static void ReportClassStats(const ClassInfo& classInfo, const nsACString& path,
+                             nsIHandleReportCallback* handleReport,
+                             nsISupports* data, size_t& gcTotal) {
+
+  if (classInfo.objectsGCHeap > 0) {
+    REPORT_GC_BYTES(path + "objects/gc-heap"_ns, classInfo.objectsGCHeap,
+                    "Objects, including fixed slots.");
+  }
+
+  if (classInfo.objectsGCBufferSlots > 0) {
+    REPORT_BYTES(path + "objects/gc-buffers/slots"_ns, KIND_NONHEAP,
+                 classInfo.objectsGCBufferSlots, "Non-fixed object slots.");
+  }
+
+  if (classInfo.objectsGCBufferElementsNormal > 0) {
+    REPORT_BYTES(path + "objects/gc-buffers/elements/normal"_ns, KIND_NONHEAP,
+                 classInfo.objectsGCBufferElementsNormal,
+                 "Normal (non-wasm) indexed elements.");
+  }
+
+  if (classInfo.objectsMallocHeapElementsArrayBuffer > 0) {
+    REPORT_BYTES(path + "objects/malloc-heap/elements/array-buffer"_ns,
+                 KIND_HEAP, classInfo.objectsMallocHeapElementsArrayBuffer,
+                 "JS array buffer elements allocated in the malloc heap.");
+  }
+
+  if (classInfo.objectsMallocHeapGlobalData > 0) {
+    REPORT_BYTES(path + "objects/malloc-heap/global-data"_ns, KIND_HEAP,
+                 classInfo.objectsMallocHeapGlobalData,
+                 "Data for global objects.");
+  }
+
+  if (classInfo.objectsMallocHeapMisc > 0) {
+    REPORT_BYTES(path + "objects/malloc-heap/misc"_ns, KIND_HEAP,
+                 classInfo.objectsMallocHeapMisc, "Miscellaneous object data.");
+  }
+
+  if (classInfo.objectsNonHeapElementsNormal > 0) {
+    REPORT_BYTES(path + "objects/non-heap/elements/normal"_ns, KIND_NONHEAP,
+                 classInfo.objectsNonHeapElementsNormal,
+                 "Memory-mapped non-shared array buffer elements.");
+  }
+
+  if (classInfo.objectsNonHeapElementsShared > 0) {
+    REPORT_BYTES(
+        path + "objects/non-heap/elements/shared"_ns, KIND_NONHEAP,
+        classInfo.objectsNonHeapElementsShared,
+        "Memory-mapped shared array buffer elements. These elements are "
+        "shared between one or more runtimes; the reported size is divided "
+        "by the buffer's refcount.");
+  }
+
+  if (classInfo.objectsNonHeapElementsWasm > 0) {
+    REPORT_BYTES(path + "objects/non-heap/elements/wasm"_ns, KIND_NONHEAP,
+                 classInfo.objectsNonHeapElementsWasm,
+                 "wasm array buffer elements allocated outside both the "
+                 "malloc heap and the GC heap.");
+  }
+  if (classInfo.objectsNonHeapElementsWasmShared > 0) {
+    REPORT_BYTES(
+        path + "objects/non-heap/elements/wasm-shared"_ns, KIND_NONHEAP,
+        classInfo.objectsNonHeapElementsWasmShared,
+        "wasm array buffer elements allocated outside both the "
+        "malloc heap and the GC heap. These elements are shared between "
+        "one or more runtimes; the reported size is divided by the "
+        "buffer's refcount.");
+  }
+
+  if (classInfo.objectsNonHeapCodeWasm > 0) {
+    REPORT_BYTES(path + "objects/non-heap/code/wasm"_ns, KIND_NONHEAP,
+                 classInfo.objectsNonHeapCodeWasm, "AOT-compiled wasm code.");
+  }
+
+  if (classInfo.objectsGCBufferMisc > 0) {
+    REPORT_BYTES(path + "objects/non-heap/misc"_ns, KIND_NONHEAP,
+                 classInfo.objectsGCBufferMisc, "Miscellaneous object data.");
+  }
+}
+
+static void ReportRealmStats(const JS::RealmStats& realmStats,
+                             const xpc::RealmStatsExtras& extras,
+                             nsIHandleReportCallback* handleReport,
+                             nsISupports* data, size_t* gcTotalOut = nullptr) {
+  static const nsDependentCString addonPrefix("explicit/add-ons/");
+
+  size_t gcTotal = 0, sundriesGCHeap = 0, sundriesMallocHeap = 0;
+  nsAutoCString realmJSPathPrefix(extras.jsPathPrefix);
+  nsAutoCString realmDOMPathPrefix(extras.domPathPrefix);
+
+  MOZ_ASSERT(!gcTotalOut == realmStats.isTotals);
+
+  nsCString nonNotablePath = realmJSPathPrefix;
+  nonNotablePath += realmStats.isTotals
+                        ? "classes/"_ns
+                        : "classes/class(<non-notable classes>)/"_ns;
+
+  ReportClassStats(realmStats.classInfo, nonNotablePath, handleReport, data,
+                   gcTotal);
+
+  for (size_t i = 0; i < realmStats.notableClasses.length(); i++) {
+    MOZ_ASSERT(!realmStats.isTotals);
+    const JS::NotableClassInfo& classInfo = realmStats.notableClasses[i];
+
+    nsCString classPath =
+        realmJSPathPrefix +
+        nsPrintfCString("classes/class(%s)/", classInfo.className_.get());
+
+    ReportClassStats(classInfo, classPath, handleReport, data, gcTotal);
+  }
+
+  ZRREPORT_BYTES(
+      realmDOMPathPrefix + "orphan-nodes"_ns, realmStats.objectsPrivate,
+      "Orphan DOM nodes, i.e. those that are only reachable from JavaScript "
+      "objects.");
+
+  ZRREPORT_GC_BYTES(
+      realmJSPathPrefix + "scripts/gc-heap"_ns, realmStats.scriptsGCHeap,
+      "JSScript instances. There is one per user-defined function in a "
+      "script, and one for the top-level code in a script.");
+
+  ZRREPORT_BYTES(realmJSPathPrefix + "scripts/gc-buffers"_ns,
+                 realmStats.scriptsGCBuffers,
+                 "Various variable-length tables in JSScripts.");
+
+  ZRREPORT_BYTES(realmJSPathPrefix + "baseline/data"_ns,
+                 realmStats.baselineData,
+                 "The Baseline JIT's compilation data (BaselineScripts).");
+
+  ZRREPORT_BYTES(realmJSPathPrefix + "alloc-sites"_ns, realmStats.allocSites,
+                 "GC allocation site data associated with IC stubs.");
+
+  ZRREPORT_BYTES(realmJSPathPrefix + "ion-data"_ns, realmStats.ionData,
+                 "The IonMonkey JIT's compilation data (IonScripts).");
+
+  ZRREPORT_BYTES(realmJSPathPrefix + "jit-scripts"_ns, realmStats.jitScripts,
+                 "JIT data associated with scripts.");
+
+  ZRREPORT_BYTES(realmJSPathPrefix + "realm-object"_ns, realmStats.realmObject,
+                 "The JS::Realm object itself.");
+
+  ZRREPORT_BYTES(realmJSPathPrefix + "realm-tables"_ns, realmStats.realmTables,
+                 "Realm-wide tables storing wasm instances.");
+
+  ZRREPORT_BYTES(realmJSPathPrefix + "inner-views"_ns,
+                 realmStats.innerViewsTable,
+                 "The table for array buffer inner views.");
+
+  ZRREPORT_BYTES(
+      realmJSPathPrefix + "object-metadata"_ns, realmStats.objectMetadataTable,
+      "The table used by debugging tools for tracking object metadata");
+
+  ZRREPORT_BYTES(realmJSPathPrefix + "saved-stacks-set"_ns,
+                 realmStats.savedStacksSet, "The saved stacks set.");
+
+  ZRREPORT_BYTES(realmJSPathPrefix + "non-syntactic-lexical-scopes-table"_ns,
+                 realmStats.nonSyntacticLexicalScopesTable,
+                 "The non-syntactic lexical scopes table.");
+
+  if (sundriesGCHeap > 0) {
+    REPORT_GC_BYTES(
+        realmJSPathPrefix + "sundries/gc-heap"_ns, sundriesGCHeap,
+        "The sum of all 'gc-heap' measurements that are too small to be "
+        "worth showing individually.");
+  }
+
+  if (sundriesMallocHeap > 0) {
+    REPORT_BYTES(
+        realmJSPathPrefix + "sundries/malloc-heap"_ns, KIND_HEAP,
+        sundriesMallocHeap,
+        "The sum of all 'malloc-heap' measurements that are too small to "
+        "be worth showing individually.");
+  }
+
+  if (gcTotalOut) {
+    *gcTotalOut += gcTotal;
+  }
+}
+
+static void ReportScriptSourceStats(const ScriptSourceInfo& scriptSourceInfo,
+                                    const nsACString& path,
+                                    nsIHandleReportCallback* handleReport,
+                                    nsISupports* data, size_t& rtTotal) {
+  if (scriptSourceInfo.misc > 0) {
+    RREPORT_BYTES(path + "misc"_ns, KIND_HEAP, scriptSourceInfo.misc,
+                  "Miscellaneous data relating to JavaScript source code.");
+  }
+}
+
+void ReportJSRuntimeExplicitTreeStats(const JS::RuntimeStats& rtStats,
+                                      const nsACString& rtPath,
+                                      nsIHandleReportCallback* handleReport,
+                                      nsISupports* data, bool anonymize,
+                                      size_t* rtTotalOut) {
+  size_t gcTotal = 0;
+
+  for (const auto& zStats : rtStats.zoneStatsVector) {
+    const xpc::ZoneStatsExtras* extras =
+        static_cast<const xpc::ZoneStatsExtras*>(zStats.extra);
+    ReportZoneStats(zStats, *extras, handleReport, data, anonymize, &gcTotal);
+  }
+
+  for (const auto& realmStats : rtStats.realmStatsVector) {
+    const xpc::RealmStatsExtras* extras =
+        static_cast<const xpc::RealmStatsExtras*>(realmStats.extra);
+
+    ReportRealmStats(realmStats, *extras, handleReport, data, &gcTotal);
+  }
+
+
+  size_t rtTotal = 0;
+
+  RREPORT_BYTES(rtPath + "runtime/runtime-object"_ns, KIND_HEAP,
+                rtStats.runtime.object, "The JSRuntime object.");
+
+  RREPORT_BYTES(rtPath + "runtime/atoms-table"_ns, KIND_HEAP,
+                rtStats.runtime.atomsTable, "The atoms table.");
+
+  RREPORT_BYTES(rtPath + "runtime/atoms-mark-bitmaps"_ns, KIND_HEAP,
+                rtStats.runtime.atomsMarkBitmaps,
+                "Mark bitmaps for atoms held by each zone.");
+
+  RREPORT_BYTES(rtPath + "runtime/self-host-stencil"_ns, KIND_HEAP,
+                rtStats.runtime.selfHostStencil,
+                "The self-hosting CompilationStencil.");
+
+  RREPORT_BYTES(rtPath + "runtime/contexts"_ns, KIND_HEAP,
+                rtStats.runtime.contexts,
+                "JSContext objects and structures that belong to them.");
+
+  RREPORT_BYTES(
+      rtPath + "runtime/temporary"_ns, KIND_HEAP, rtStats.runtime.temporary,
+      "Transient data (mostly parse nodes) held by the JSRuntime during "
+      "compilation.");
+
+  RREPORT_BYTES(rtPath + "runtime/interpreter-stack"_ns, KIND_HEAP,
+                rtStats.runtime.interpreterStack, "JS interpreter frames.");
+
+  RREPORT_BYTES(
+      rtPath + "runtime/shared-immutable-strings-cache"_ns, KIND_HEAP,
+      rtStats.runtime.sharedImmutableStringsCache,
+      "Immutable strings (such as JS scripts' source text) shared across all "
+      "JSRuntimes.");
+
+  RREPORT_BYTES(rtPath + "runtime/shared-intl-data"_ns, KIND_HEAP,
+                rtStats.runtime.sharedIntlData,
+                "Shared internationalization data.");
+
+  RREPORT_BYTES(rtPath + "runtime/uncompressed-source-cache"_ns, KIND_HEAP,
+                rtStats.runtime.uncompressedSourceCache,
+                "The uncompressed source code cache.");
+
+  RREPORT_BYTES(rtPath + "runtime/script-data"_ns, KIND_HEAP,
+                rtStats.runtime.scriptData,
+                "The table holding script data shared in the runtime.");
+
+  nsCString nonNotablePath =
+      rtPath +
+      nsPrintfCString(
+          "runtime/script-sources/source(scripts=%d, <non-notable files>)/",
+          rtStats.runtime.scriptSourceInfo.numScripts);
+
+  ReportScriptSourceStats(rtStats.runtime.scriptSourceInfo, nonNotablePath,
+                          handleReport, data, rtTotal);
+
+  for (size_t i = 0; i < rtStats.runtime.notableScriptSources.length(); i++) {
+    const JS::NotableScriptSourceInfo& scriptSourceInfo =
+        rtStats.runtime.notableScriptSources[i];
+
+    nsCString escapedFilename;
+    if (anonymize) {
+      escapedFilename.AppendPrintf("<anonymized-source-%d>", int(i));
+    } else {
+      nsDependentCString filename(scriptSourceInfo.filename_.get());
+      escapedFilename.Append(filename);
+      escapedFilename.ReplaceSubstring("/", "\\");
+    }
+
+    nsCString notablePath =
+        rtPath +
+        nsPrintfCString("runtime/script-sources/source(scripts=%d, %s)/",
+                        scriptSourceInfo.numScripts, escapedFilename.get());
+
+    ReportScriptSourceStats(scriptSourceInfo, notablePath, handleReport, data,
+                            rtTotal);
+  }
+
+  RREPORT_BYTES(rtPath + "runtime/gc/marker"_ns, KIND_HEAP,
+                rtStats.runtime.gc.marker, "The GC mark stack and gray roots.");
+
+  RREPORT_BYTES(rtPath + "runtime/gc/nursery-committed"_ns, KIND_NONHEAP,
+                rtStats.runtime.gc.nurseryCommitted,
+                "Memory being used by the GC's nursery.");
+
+  RREPORT_BYTES(
+      rtPath + "runtime/gc/nursery-malloced-buffers"_ns, KIND_HEAP,
+      rtStats.runtime.gc.nurseryMallocedBuffers,
+      "Out-of-line slots and elements belonging to objects in the nursery.");
+
+  RREPORT_BYTES(rtPath + "runtime/gc/store-buffer/vals"_ns, KIND_HEAP,
+                rtStats.runtime.gc.storeBufferVals,
+                "Values in the store buffer.");
+
+  RREPORT_BYTES(rtPath + "runtime/gc/store-buffer/cells"_ns, KIND_HEAP,
+                rtStats.runtime.gc.storeBufferCells,
+                "Cells in the store buffer.");
+
+  RREPORT_BYTES(rtPath + "runtime/gc/store-buffer/slots"_ns, KIND_HEAP,
+                rtStats.runtime.gc.storeBufferSlots,
+                "Slots in the store buffer.");
+
+  RREPORT_BYTES(rtPath + "runtime/gc/store-buffer/whole-cells"_ns, KIND_HEAP,
+                rtStats.runtime.gc.storeBufferWholeCells,
+                "Whole cells in the store buffer.");
+
+  RREPORT_BYTES(rtPath + "runtime/gc/store-buffer/generics"_ns, KIND_HEAP,
+                rtStats.runtime.gc.storeBufferGenerics,
+                "Generic things in the store buffer.");
+
+  RREPORT_BYTES(rtPath + "runtime/jit-lazylink"_ns, KIND_HEAP,
+                rtStats.runtime.jitLazyLink,
+                "IonMonkey compilations waiting for lazy linking.");
+
+  if (rtTotalOut) {
+    *rtTotalOut = rtTotal;
+  }
+
+
+  nsCString rtPath2(rtPath);
+  rtPath2.ReplaceLiteral(0, strlen("explicit"), "decommitted");
+
+  REPORT_GC_BYTES(
+      rtPath2 + "gc-heap/decommitted-pages"_ns, rtStats.gcHeapDecommittedPages,
+      "GC arenas in non-empty chunks that is decommitted, i.e. it takes up "
+      "address space but no physical memory or swap space.");
+
+  REPORT_GC_BYTES(
+      rtPath + "gc-heap/unused-chunks"_ns, rtStats.gcHeapUnusedChunks,
+      "Empty GC chunks which will soon be released unless claimed for new "
+      "allocations.");
+
+  REPORT_GC_BYTES(rtPath + "gc-heap/unused-arenas"_ns,
+                  rtStats.gcHeapUnusedArenas,
+                  "Empty GC arenas within non-empty chunks.");
+
+  REPORT_GC_BYTES(rtPath + "gc-heap/chunk-admin"_ns, rtStats.gcHeapChunkAdmin,
+                  "Bookkeeping information within GC chunks.");
+
+  MOZ_ASSERT(gcTotal == rtStats.gcHeapChunkTotal);
+}
+
+}  
+
+class JSMainRuntimeRealmsReporter final : public nsIMemoryReporter {
+  ~JSMainRuntimeRealmsReporter() = default;
+
+ public:
+  NS_DECL_ISUPPORTS
+
+  struct Data {
+    int anonymizeID;
+    js::Vector<nsCString, 0, js::SystemAllocPolicy> paths;
+  };
+
+  static void RealmCallback(JSContext* cx, void* vdata, Realm* realm,
+                            const JS::AutoRequireNoGC& nogc) {
+    Data* data = static_cast<Data*>(vdata);
+    nsCString path;
+    GetRealmName(realm, path, &data->anonymizeID,  true);
+    path.Insert(js::IsSystemRealm(realm) ? "js-main-runtime-realms/system/"_ns
+                                         : "js-main-runtime-realms/user/"_ns,
+                0);
+    (void)data->paths.append(path);
+  }
+
+  NS_IMETHOD CollectReports(nsIHandleReportCallback* handleReport,
+                            nsISupports* data, bool anonymize) override {
+
+    Data d;
+    d.anonymizeID = anonymize ? 1 : 0;
+    JS::IterateRealms(XPCJSContext::Get()->Context(), &d, RealmCallback);
+
+    for (auto& path : d.paths) {
+      REPORT(nsCString(path), KIND_OTHER, UNITS_COUNT, 1,
+             "A live realm in the main JSRuntime.");
+    }
+
+    return NS_OK;
+  }
+};
+
+NS_IMPL_ISUPPORTS(JSMainRuntimeRealmsReporter, nsIMemoryReporter)
+
+MOZ_DEFINE_MALLOC_SIZE_OF(OrphanMallocSizeOf)
+
+namespace xpc {
+
+class OrphanReporter : public JS::ObjectPrivateVisitor {
+ public:
+  explicit OrphanReporter(GetISupportsFun aGetISupports)
+      : JS::ObjectPrivateVisitor(aGetISupports), mState(OrphanMallocSizeOf) {}
+
+  virtual size_t sizeOfIncludingThis(nsISupports* aSupports) override {
+    nsCOMPtr<nsINode> node = do_QueryInterface(aSupports);
+    if (!node || node->IsInComposedDoc()) {
+      return 0;
+    }
+
+    nsCOMPtr<nsINode> orphanTree = node->SubtreeRoot();
+    if (!orphanTree || mState.HaveSeenPtr(orphanTree.get())) {
+      return 0;
+    }
+
+    nsWindowSizes sizes(mState);
+    mozilla::dom::Document::AddSizeOfNodeTree(*orphanTree, sizes);
+
+    return sizes.getTotalSize();
+  }
+
+ private:
+  SizeOfState mState;
+};
+
+#if defined(DEBUG)
+static bool StartsWithExplicit(nsACString& s) {
+  return StringBeginsWith(s, "explicit/"_ns);
+}
+#endif
+
+class XPCJSRuntimeStats : public JS::RuntimeStats {
+  WindowPaths* mWindowPaths;
+  WindowPaths* mTopWindowPaths;
+  int mAnonymizeID;
+
+ public:
+  XPCJSRuntimeStats(WindowPaths* windowPaths, WindowPaths* topWindowPaths,
+                    bool anonymize)
+      : JS::RuntimeStats(JSMallocSizeOf),
+        mWindowPaths(windowPaths),
+        mTopWindowPaths(topWindowPaths),
+        mAnonymizeID(anonymize ? 1 : 0) {}
+
+  ~XPCJSRuntimeStats() {
+    for (size_t i = 0; i != realmStatsVector.length(); ++i) {
+      delete static_cast<xpc::RealmStatsExtras*>(realmStatsVector[i].extra);
+    }
+
+    for (size_t i = 0; i != zoneStatsVector.length(); ++i) {
+      delete static_cast<xpc::ZoneStatsExtras*>(zoneStatsVector[i].extra);
+    }
+  }
+
+  virtual void initExtraZoneStats(JS::Zone* zone, JS::ZoneStats* zStats,
+                                  const JS::AutoRequireNoGC& nogc) override {
+    xpc::ZoneStatsExtras* extras = new xpc::ZoneStatsExtras;
+    extras->pathPrefix.AssignLiteral("explicit/js-non-window/zones/");
+    extras->zoneName = nsPrintfCString("zone(0x%p)/", (void*)zone);
+
+    Rooted<Realm*> realm(dom::RootingCx(), js::GetAnyRealmInZone(zone));
+    if (realm) {
+      RootedObject global(dom::RootingCx(), JS::GetRealmGlobalOrNull(realm));
+      if (global) {
+        RefPtr<nsGlobalWindowInner> window;
+        if (NS_SUCCEEDED(UNWRAP_NON_WRAPPER_OBJECT(Window, global, window))) {
+          if (mTopWindowPaths->Get(window->WindowID(), &extras->pathPrefix)) {
+            extras->pathPrefix.AppendLiteral("/js-");
+          }
+        }
+      }
+    }
+
+    extras->pathPrefix += extras->zoneName;
+
+    MOZ_ASSERT(StartsWithExplicit(extras->pathPrefix));
+
+    zStats->extra = extras;
+  }
+
+  virtual void initExtraRealmStats(Realm* realm, JS::RealmStats* realmStats,
+                                   const JS::AutoRequireNoGC& nogc) override {
+    xpc::RealmStatsExtras* extras = new xpc::RealmStatsExtras;
+    nsCString rName;
+    GetRealmName(realm, rName, &mAnonymizeID,  true);
+
+    bool needZone = true;
+    RootedObject global(dom::RootingCx(), JS::GetRealmGlobalOrNull(realm));
+    if (global) {
+      RefPtr<nsGlobalWindowInner> window;
+      if (NS_SUCCEEDED(UNWRAP_NON_WRAPPER_OBJECT(Window, global, window))) {
+        if (mWindowPaths->Get(window->WindowID(), &extras->jsPathPrefix)) {
+          extras->domPathPrefix.Assign(extras->jsPathPrefix);
+          extras->domPathPrefix.AppendLiteral("/dom/");
+          extras->jsPathPrefix.AppendLiteral("/js-");
+          needZone = false;
+        } else {
+          extras->jsPathPrefix.AssignLiteral("explicit/js-non-window/zones/");
+          extras->domPathPrefix.AssignLiteral(
+              "explicit/dom/unknown-window-global?!/");
+        }
+      } else {
+        extras->jsPathPrefix.AssignLiteral("explicit/js-non-window/zones/");
+        extras->domPathPrefix.AssignLiteral(
+            "explicit/dom/non-window-global?!/");
+      }
+    } else {
+      extras->jsPathPrefix.AssignLiteral("explicit/js-non-window/zones/");
+      extras->domPathPrefix.AssignLiteral("explicit/dom/no-global?!/");
+    }
+
+    if (needZone) {
+      extras->jsPathPrefix +=
+          nsPrintfCString("zone(0x%p)/", (void*)js::GetRealmZone(realm));
+    }
+
+    extras->jsPathPrefix += "realm("_ns + rName + ")/"_ns;
+
+
+    MOZ_ASSERT(StartsWithExplicit(extras->jsPathPrefix));
+    MOZ_ASSERT(StartsWithExplicit(extras->domPathPrefix));
+
+    realmStats->extra = extras;
+  }
+};
+
+void JSReporter::CollectReports(WindowPaths* windowPaths,
+                                WindowPaths* topWindowPaths,
+                                nsIHandleReportCallback* handleReport,
+                                nsISupports* data, bool anonymize) {
+  XPCJSRuntime* xpcrt = nsXPConnect::GetRuntimeInstance();
+
+
+  XPCJSRuntimeStats rtStats(windowPaths, topWindowPaths, anonymize);
+  OrphanReporter orphanReporter(XPCConvert::GetISupportsFromJSObject);
+  JSContext* cx = XPCJSContext::Get()->Context();
+  if (!JS::CollectRuntimeStats(cx, &rtStats, &orphanReporter, anonymize)) {
+    return;
+  }
+
+  JS::GlobalStats gStats(JSMallocSizeOf);
+  if (!JS::CollectGlobalStats(&gStats)) {
+    return;
+  }
+
+  size_t xpcJSRuntimeSize = xpcrt->SizeOfIncludingThis(JSMallocSizeOf);
+
+  size_t wrappedJSSize =
+      xpcrt->GetMultiCompartmentWrappedJSMap()->SizeOfWrappedJS(JSMallocSizeOf);
+
+  XPCWrappedNativeScope::ScopeSizeInfo sizeInfo(JSMallocSizeOf);
+  XPCWrappedNativeScope::AddSizeOfAllScopesIncludingThis(cx, &sizeInfo);
+
+  mozJSModuleLoader* loader = mozJSModuleLoader::Get();
+  size_t jsModuleLoaderSize =
+      loader ? loader->SizeOfIncludingThis(JSMallocSizeOf) : 0;
+  mozJSModuleLoader* devToolsLoader = mozJSModuleLoader::GetDevToolsLoader();
+  size_t jsDevToolsModuleLoaderSize =
+      devToolsLoader ? devToolsLoader->SizeOfIncludingThis(JSMallocSizeOf) : 0;
+
+
+  size_t rtTotal = 0;
+  xpc::ReportJSRuntimeExplicitTreeStats(rtStats, "explicit/js-non-window/"_ns,
+                                        handleReport, data, anonymize,
+                                        &rtTotal);
+
+  xpc::RealmStatsExtras realmExtrasTotal;
+  realmExtrasTotal.jsPathPrefix.AssignLiteral("js-main-runtime/realms/");
+  realmExtrasTotal.domPathPrefix.AssignLiteral("window-objects/dom/");
+  ReportRealmStats(rtStats.realmTotals, realmExtrasTotal, handleReport, data);
+
+  xpc::ZoneStatsExtras zExtrasTotal;
+  zExtrasTotal.pathPrefix.AssignLiteral("js-main-runtime/zones/");
+  ReportZoneStats(rtStats.zTotals, zExtrasTotal, handleReport, data, anonymize);
+
+  REPORT_BYTES(
+      "js-main-runtime/runtime"_ns, KIND_OTHER, rtTotal,
+      "The sum of all measurements under 'explicit/js-non-window/runtime/'.");
+
+
+  REPORT("js-helper-threads/idle"_ns, KIND_OTHER, UNITS_COUNT,
+         gStats.helperThread.idleThreadCount,
+         "The current number of idle JS HelperThreads.");
+
+  REPORT(
+      "js-helper-threads/active"_ns, KIND_OTHER, UNITS_COUNT,
+      gStats.helperThread.activeThreadCount,
+      "The current number of active JS HelperThreads. Memory held by these is"
+      " not reported.");
+
+  REPORT_BYTES("wasm-runtime"_ns, KIND_OTHER, rtStats.runtime.wasmRuntime,
+               "The memory used for wasm runtime bookkeeping.");
+
+  if (rtStats.runtime.wasmGuardPages > 0) {
+    REPORT_BYTES(
+        "wasm-guard-pages"_ns, KIND_OTHER, rtStats.runtime.wasmGuardPages,
+        "Guard pages mapped after the end of wasm memories, reserved for "
+        "optimization tricks, but not committed and thus never contributing"
+        " to RSS, only vsize.");
+  }
+
+  if (rtStats.runtime.wasmContStacks > 0) {
+    REPORT_BYTES(
+        "wasm-cont-stacks"_ns, KIND_OTHER, rtStats.runtime.wasmContStacks,
+        "Memory mapped for wasm continuation stacks (JS Promise Integration "
+        "and stack-switching), including guard pages.");
+  }
+
+
+  REPORT_BYTES("js-main-runtime/gc-heap/unused-chunks"_ns, KIND_OTHER,
+               rtStats.gcHeapUnusedChunks,
+               "The same as 'explicit/js-non-window/gc-heap/unused-chunks'.");
+
+  REPORT_BYTES("js-main-runtime/gc-heap/unused-arenas"_ns, KIND_OTHER,
+               rtStats.gcHeapUnusedArenas,
+               "The same as 'explicit/js-non-window/gc-heap/unused-arenas'.");
+
+  REPORT_BYTES("js-main-runtime/gc-heap/chunk-admin"_ns, KIND_OTHER,
+               rtStats.gcHeapChunkAdmin,
+               "The same as 'explicit/js-non-window/gc-heap/chunk-admin'.");
+
+
+  REPORT_BYTES("js-main-runtime-gc-heap-committed/unused/chunks"_ns, KIND_OTHER,
+               rtStats.gcHeapUnusedChunks,
+               "The same as 'explicit/js-non-window/gc-heap/unused-chunks'.");
+
+  REPORT_BYTES("js-main-runtime-gc-heap-committed/unused/arenas"_ns, KIND_OTHER,
+               rtStats.gcHeapUnusedArenas,
+               "The same as 'explicit/js-non-window/gc-heap/unused-arenas'.");
+
+  REPORT_BYTES("js-main-runtime-gc-heap-committed/unused/gc-things/objects"_ns,
+               KIND_OTHER, rtStats.zTotals.unusedGCThings.object,
+               "Unused object cells within non-empty arenas.");
+
+  REPORT_BYTES("js-main-runtime-gc-heap-committed/unused/gc-things/strings"_ns,
+               KIND_OTHER, rtStats.zTotals.unusedGCThings.string,
+               "Unused string cells within non-empty arenas.");
+
+  REPORT_BYTES("js-main-runtime-gc-heap-committed/unused/gc-things/symbols"_ns,
+               KIND_OTHER, rtStats.zTotals.unusedGCThings.symbol,
+               "Unused symbol cells within non-empty arenas.");
+
+  REPORT_BYTES("js-main-runtime-gc-heap-committed/unused/gc-things/shapes"_ns,
+               KIND_OTHER, rtStats.zTotals.unusedGCThings.shape,
+               "Unused shape cells within non-empty arenas.");
+
+  REPORT_BYTES(
+      "js-main-runtime-gc-heap-committed/unused/gc-things/base-shapes"_ns,
+      KIND_OTHER, rtStats.zTotals.unusedGCThings.baseShape,
+      "Unused base shape cells within non-empty arenas.");
+
+  REPORT_BYTES("js-main-runtime-gc-heap-committed/unused/gc-things/bigints"_ns,
+               KIND_OTHER, rtStats.zTotals.unusedGCThings.bigInt,
+               "Unused BigInt cells within non-empty arenas.");
+
+  REPORT_BYTES(
+      "js-main-runtime-gc-heap-committed/unused/gc-things/getter-setters"_ns,
+      KIND_OTHER, rtStats.zTotals.unusedGCThings.getterSetter,
+      "Unused getter-setter cells within non-empty arenas.");
+
+  REPORT_BYTES(
+      "js-main-runtime-gc-heap-committed/unused/gc-things/property-maps"_ns,
+      KIND_OTHER, rtStats.zTotals.unusedGCThings.propMap,
+      "Unused property map cells within non-empty arenas.");
+
+  REPORT_BYTES("js-main-runtime-gc-heap-committed/unused/gc-things/scopes"_ns,
+               KIND_OTHER, rtStats.zTotals.unusedGCThings.scope,
+               "Unused scope cells within non-empty arenas.");
+
+  REPORT_BYTES("js-main-runtime-gc-heap-committed/unused/gc-things/scripts"_ns,
+               KIND_OTHER, rtStats.zTotals.unusedGCThings.script,
+               "Unused script cells within non-empty arenas.");
+
+  REPORT_BYTES("js-main-runtime-gc-heap-committed/unused/gc-things/jitcode"_ns,
+               KIND_OTHER, rtStats.zTotals.unusedGCThings.jitcode,
+               "Unused jitcode cells within non-empty arenas.");
+
+  REPORT_BYTES(
+      "js-main-runtime-gc-heap-committed/unused/gc-things/regexp-shareds"_ns,
+      KIND_OTHER, rtStats.zTotals.unusedGCThings.regExpShared,
+      "Unused regexpshared cells within non-empty arenas.");
+
+  REPORT_BYTES("js-main-runtime-gc-heap-committed/used/chunk-admin"_ns,
+               KIND_OTHER, rtStats.gcHeapChunkAdmin,
+               "The same as 'explicit/js-non-window/gc-heap/chunk-admin'.");
+
+  REPORT_BYTES("js-main-runtime-gc-heap-committed/used/arena-admin"_ns,
+               KIND_OTHER, rtStats.zTotals.gcHeapArenaAdmin,
+               "The same as 'js-main-runtime/zones/gc-heap-arena-admin'.");
+
+  size_t gcThingTotal = 0;
+
+  MREPORT_BYTES("js-main-runtime-gc-heap-committed/used/gc-things/objects"_ns,
+                KIND_OTHER, rtStats.realmTotals.classInfo.objectsGCHeap,
+                "Used object cells.");
+
+  MREPORT_BYTES("js-main-runtime-gc-heap-committed/used/gc-things/strings"_ns,
+                KIND_OTHER, rtStats.zTotals.stringInfo.sizeOfLiveGCThings(),
+                "Used string cells.");
+
+  MREPORT_BYTES("js-main-runtime-gc-heap-committed/used/gc-things/symbols"_ns,
+                KIND_OTHER, rtStats.zTotals.symbolsGCHeap,
+                "Used symbol cells.");
+
+  MREPORT_BYTES("js-main-runtime-gc-heap-committed/used/gc-things/shapes"_ns,
+                KIND_OTHER,
+                rtStats.zTotals.shapeInfo.shapesGCHeapShared +
+                    rtStats.zTotals.shapeInfo.shapesGCHeapDict,
+                "Used shape cells.");
+
+  MREPORT_BYTES(
+      "js-main-runtime-gc-heap-committed/used/gc-things/base-shapes"_ns,
+      KIND_OTHER, rtStats.zTotals.shapeInfo.shapesGCHeapBase,
+      "Used base shape cells.");
+
+  MREPORT_BYTES("js-main-runtime-gc-heap-committed/used/gc-things/bigints"_ns,
+                KIND_OTHER, rtStats.zTotals.bigIntsGCHeap,
+                "Used BigInt cells.");
+
+  MREPORT_BYTES(
+      "js-main-runtime-gc-heap-committed/used/gc-things/getter-setters"_ns,
+      KIND_OTHER, rtStats.zTotals.getterSettersGCHeap,
+      "Used getter/setter cells.");
+
+  MREPORT_BYTES(
+      "js-main-runtime-gc-heap-committed/used/gc-things/property-maps"_ns,
+      KIND_OTHER,
+      rtStats.zTotals.dictPropMapsGCHeap +
+          rtStats.zTotals.compactPropMapsGCHeap +
+          rtStats.zTotals.normalPropMapsGCHeap,
+      "Used property map cells.");
+
+  MREPORT_BYTES("js-main-runtime-gc-heap-committed/used/gc-things/scopes"_ns,
+                KIND_OTHER, rtStats.zTotals.scopesGCHeap, "Used scope cells.");
+
+  MREPORT_BYTES("js-main-runtime-gc-heap-committed/used/gc-things/scripts"_ns,
+                KIND_OTHER, rtStats.realmTotals.scriptsGCHeap,
+                "Used script cells.");
+
+  MREPORT_BYTES("js-main-runtime-gc-heap-committed/used/gc-things/jitcode"_ns,
+                KIND_OTHER, rtStats.zTotals.jitCodesGCHeap,
+                "Used jitcode cells.");
+
+  MREPORT_BYTES(
+      "js-main-runtime-gc-heap-committed/used/gc-things/regexp-shareds"_ns,
+      KIND_OTHER, rtStats.zTotals.regExpSharedsGCHeap,
+      "Used regexpshared cells.");
+
+  MOZ_ASSERT(gcThingTotal == rtStats.gcHeapGCThings);
+  (void)gcThingTotal;
+
+
+  for (const auto& zStats : rtStats.zoneStatsVector) {
+    const xpc::ZoneStatsExtras* extras =
+        static_cast<const xpc::ZoneStatsExtras*>(zStats.extra);
+
+    nsCString pathPrefix;
+    pathPrefix.AssignLiteral("js-main-runtime-gc-buffers/");
+    pathPrefix += extras->zoneName;
+
+    nsCString usedPath =
+        pathPrefix +
+        nsPrintfCString("used (in %zu chunks and %zu large allocs)",
+                        zStats.gcBuffers.totalChunks,
+                        zStats.gcBuffers.largeAllocs);
+    MREPORT_BYTES(usedPath, KIND_OTHER, zStats.gcBuffers.usedBytes,
+                  "Allocated memory within GC buffer memeory.");
+
+    nsCString freePath =
+        pathPrefix +
+        nsPrintfCString("free (in %zu regions)", zStats.gcBuffers.freeRegions);
+    MREPORT_BYTES(freePath, KIND_OTHER, zStats.gcBuffers.freeBytes,
+                  "Free space within GC buffer memeory.");
+
+    MREPORT_BYTES(
+        pathPrefix + "admin"_ns, KIND_OTHER, zStats.gcBuffers.adminBytes,
+        "Bookeeping information and padding within GC buffer memeory.");
+  }
+
+  REPORT("js-main-runtime-zone-count"_ns, KIND_OTHER, UNITS_COUNT,
+         rtStats.zoneStatsVector.length(), "Count of GC zones in the runtime.");
+
+
+  REPORT_BYTES("explicit/xpconnect/runtime"_ns, KIND_HEAP, xpcJSRuntimeSize,
+               "The XPConnect runtime.");
+
+  REPORT_BYTES("explicit/xpconnect/wrappedjs"_ns, KIND_HEAP, wrappedJSSize,
+               "Wrappers used to implement XPIDL interfaces with JS.");
+
+  REPORT_BYTES("explicit/xpconnect/scopes"_ns, KIND_HEAP,
+               sizeInfo.mScopeAndMapSize, "XPConnect scopes.");
+
+  REPORT_BYTES("explicit/xpconnect/proto-iface-cache"_ns, KIND_HEAP,
+               sizeInfo.mProtoAndIfaceCacheSize,
+               "Prototype and interface binding caches.");
+
+  REPORT_BYTES("explicit/xpconnect/js-module-loader"_ns, KIND_HEAP,
+               jsModuleLoaderSize, "XPConnect's JS module loader.");
+  REPORT_BYTES("explicit/xpconnect/js-devtools-module-loader"_ns, KIND_HEAP,
+               jsDevToolsModuleLoaderSize, "DevTools's JS module loader.");
+
+
+  REPORT_BYTES("explicit/js-non-window/helper-thread/heap-other"_ns, KIND_HEAP,
+               gStats.helperThread.stateData,
+               "Memory used by HelperThreadState.");
+
+  REPORT_BYTES(
+      "explicit/js-non-window/helper-thread/ion-compile-task"_ns, KIND_HEAP,
+      gStats.helperThread.ionCompileTask,
+      "The memory used by IonCompileTasks waiting in HelperThreadState.");
+
+  REPORT_BYTES(
+      "explicit/js-non-window/helper-thread/wasm-compile"_ns, KIND_HEAP,
+      gStats.helperThread.wasmCompile,
+      "The memory used by Wasm compilations waiting in HelperThreadState.");
+
+  REPORT_BYTES("explicit/js-non-window/helper-thread/contexts"_ns, KIND_HEAP,
+               gStats.helperThread.contexts,
+               "The memory used by the JSContexts in HelperThreadState.");
+}
+
+static nsresult JSSizeOfTab(JSObject* obj, size_t* jsObjectsSize,
+                            size_t* jsStringsSize, size_t* jsPrivateSize,
+                            size_t* jsOtherSize) {
+  JSContext* cx = XPCJSContext::Get()->Context();
+  JS::Zone* zone = JS::GetObjectZone(obj);
+  if (JS::IsIncrementalGCInProgress(cx)) {
+    JS::FinishIncrementalGC(cx, JS::GCReason::PREPARE_FOR_TRACING);
+  }
+  JS::AutoCheckCannotGC nogc(cx);
+
+  TabSizes sizes;
+  OrphanReporter orphanReporter(XPCConvert::GetISupportsFromJSObject);
+  NS_ENSURE_TRUE(JS::AddSizeOfTab(cx, zone, moz_malloc_size_of, &orphanReporter,
+                                  &sizes, nogc),
+                 NS_ERROR_OUT_OF_MEMORY);
+
+  *jsObjectsSize = sizes.objects_;
+  *jsStringsSize = sizes.strings_;
+  *jsPrivateSize = sizes.private_;
+  *jsOtherSize = sizes.other_;
+  return NS_OK;
+}
+
+}  
+
+static void GetRealmNameCallback(JSContext* cx, Realm* realm, char* buf,
+                                 size_t bufsize,
+                                 const JS::AutoRequireNoGC& nogc) {
+  nsCString name;
+  int anonymizeID = 0;
+  GetRealmName(realm, name, &anonymizeID,  false);
+  if (name.Length() >= bufsize) {
+    name.Truncate(bufsize - 1);
+  }
+  memcpy(buf, name.get(), name.Length() + 1);
+}
+
+static void DestroyRealm(JS::GCContext* gcx, JS::Realm* realm) {
+  mozilla::UniquePtr<RealmPrivate> priv(RealmPrivate::Get(realm));
+  JS::SetRealmPrivate(realm, nullptr);
+}
+
+static void PreserveWrapper(JSContext* cx, JS::Handle<JSObject*> obj) {
+  MOZ_ASSERT(cx);
+  MOZ_ASSERT(obj);
+  MOZ_ASSERT(mozilla::dom::IsDOMObject(obj));
+
+  mozilla::dom::TryPreserveWrapper(obj);
+
+  MOZ_ASSERT(!mozilla::dom::HasReleasedWrapper(obj),
+             "There should be no released wrapper since we just preserved it");
+}
+
+static nsresult ReadSourceFromFilename(JSContext* cx, const char* filename,
+                                       char16_t** twoByteSource,
+                                       char** utf8Source, size_t* len) {
+  MOZ_ASSERT(*len == 0);
+  MOZ_ASSERT((twoByteSource != nullptr) != (utf8Source != nullptr),
+             "must be called requesting only one of UTF-8 or UTF-16 source");
+  MOZ_ASSERT_IF(twoByteSource, !*twoByteSource);
+  MOZ_ASSERT_IF(utf8Source, !*utf8Source);
+
+  nsresult rv;
+
+  const char* arrow;
+  while ((arrow = strstr(filename, " -> "))) {
+    filename = arrow + strlen(" -> ");
+  }
+
+  nsCOMPtr<nsIURI> uri;
+  rv = NS_NewURI(getter_AddRefs(uri), filename);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsIChannel> scriptChannel;
+  rv = NS_NewChannel(getter_AddRefs(scriptChannel), uri,
+                     nsContentUtils::GetSystemPrincipal(),
+                     nsILoadInfo::SEC_ALLOW_CROSS_ORIGIN_SEC_CONTEXT_IS_NULL,
+                     nsIContentPolicy::TYPE_OTHER);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsIURI> actualUri;
+  rv = scriptChannel->GetURI(getter_AddRefs(actualUri));
+  NS_ENSURE_SUCCESS(rv, rv);
+  nsCString scheme;
+  rv = actualUri->GetScheme(scheme);
+  NS_ENSURE_SUCCESS(rv, rv);
+  if (!scheme.EqualsLiteral("file") && !scheme.EqualsLiteral("jar")) {
+    return NS_OK;
+  }
+
+  scriptChannel->SetContentType("text/plain"_ns);
+
+  nsCOMPtr<nsIInputStream> scriptStream;
+  rv = scriptChannel->Open(getter_AddRefs(scriptStream));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  uint64_t rawLen;
+  rv = scriptStream->Available(&rawLen);
+  NS_ENSURE_SUCCESS(rv, rv);
+  if (!rawLen) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (rawLen > UINT32_MAX) {
+    return NS_ERROR_FILE_TOO_BIG;
+  }
+
+  JS::UniqueChars buf(js_pod_malloc<char>(static_cast<size_t>(rawLen)));
+  if (!buf) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+
+  char* ptr = buf.get();
+  char* end = ptr + rawLen;
+  while (ptr < end) {
+    uint32_t bytesRead;
+    rv = scriptStream->Read(ptr, PointerRangeSize(ptr, end), &bytesRead);
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+    MOZ_ASSERT(bytesRead > 0, "stream promised more bytes before EOF");
+    ptr += bytesRead;
+  }
+
+  if (utf8Source) {
+    *len = rawLen;
+    *utf8Source = buf.release();
+  } else {
+    MOZ_ASSERT(twoByteSource != nullptr);
+
+
+    JS::UniqueTwoByteChars chars;
+    rv = ScriptLoader::ConvertToUTF16(
+        scriptChannel, reinterpret_cast<const unsigned char*>(buf.get()),
+        rawLen, u"UTF-8"_ns, nullptr, chars, *len);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    if (!chars) {
+      return NS_ERROR_FAILURE;
+    }
+
+    *twoByteSource = chars.release();
+  }
+
+  return NS_OK;
+}
+
+class XPCJSSourceHook : public js::SourceHook {
+  bool load(JSContext* cx, const char* filename, char16_t** twoByteSource,
+            char** utf8Source, size_t* length) override {
+    MOZ_ASSERT((twoByteSource != nullptr) != (utf8Source != nullptr),
+               "must be called requesting only one of UTF-8 or UTF-16 source");
+
+    *length = 0;
+    if (twoByteSource) {
+      *twoByteSource = nullptr;
+    } else {
+      *utf8Source = nullptr;
+    }
+
+    if (!nsContentUtils::IsSystemCaller(cx)) {
+      return true;
+    }
+
+    if (!filename) {
+      return true;
+    }
+
+    nsresult rv =
+        ReadSourceFromFilename(cx, filename, twoByteSource, utf8Source, length);
+    if (NS_FAILED(rv)) {
+      xpc::Throw(cx, rv);
+      return false;
+    }
+
+    return true;
+  }
+};
+
+static const JSWrapObjectCallbacks WrapObjectCallbacks = {
+    xpc::WrapperFactory::Rewrap, xpc::WrapperFactory::PrepareForWrapping};
+
+XPCJSRuntime::XPCJSRuntime(JSContext* aCx)
+    : CycleCollectedJSRuntime(aCx),
+      mWrappedJSMap(mozilla::MakeUnique<JSObject2WrappedJSMap>()),
+      mIID2NativeInterfaceMap(mozilla::MakeUnique<IID2NativeInterfaceMap>()),
+      mClassInfo2NativeSetMap(mozilla::MakeUnique<ClassInfo2NativeSetMap>()),
+      mNativeSetMap(mozilla::MakeUnique<NativeSetMap>()),
+      mGCIsRunning(false),
+      mDoingFinalization(false),
+      mAsyncSnowWhiteFreer(new AsyncFreeSnowWhite()) {
+  MOZ_COUNT_CTOR_INHERITED(XPCJSRuntime, CycleCollectedJSRuntime);
+}
+
+XPCJSRuntime* XPCJSRuntime::Get() { return nsXPConnect::GetRuntimeInstance(); }
+
+namespace JS {
+namespace ubi {
+class ReflectorNode : public Concrete<JSObject> {
+ protected:
+  explicit ReflectorNode(JSObject* ptr) : Concrete<JSObject>(ptr) {}
+
+ public:
+  static void construct(void* storage, JSObject* ptr) {
+    new (storage) ReflectorNode(ptr);
+  }
+  js::UniquePtr<JS::ubi::EdgeRange> edges(JSContext* cx,
+                                          bool wantNames) const override;
+};
+
+js::UniquePtr<EdgeRange> ReflectorNode::edges(JSContext* cx,
+                                              bool wantNames) const {
+  js::UniquePtr<SimpleEdgeRange> range(static_cast<SimpleEdgeRange*>(
+      Concrete<JSObject>::edges(cx, wantNames).release()));
+  if (!range) {
+    return nullptr;
+  }
+  nsISupports* supp = UnwrapDOMObjectToISupports(&get());
+  if (supp) {
+    JS::AutoSuppressGCAnalysis nogc;  
+
+    nsINode* node;
+    if (NS_SUCCEEDED(UNWRAP_NON_WRAPPER_OBJECT(Node, &get(), node))) {
+      char16_t* edgeName = nullptr;
+      if (wantNames) {
+        edgeName = NS_xstrdup(u"Reflected Node");
+      }
+      if (!range->addEdge(Edge(edgeName, node))) {
+        return nullptr;
+      }
+    }
+  }
+  return js::UniquePtr<EdgeRange>(range.release());
+}
+
+}  
+}  
+
+void ConstructUbiNode(void* storage, JSObject* ptr) {
+  JS::ubi::ReflectorNode::construct(storage, ptr);
+}
+
+void XPCJSRuntime::Initialize(JSContext* cx) {
+  mStrIDs[0] = JS::PropertyKey::Void();
+
+  nsScriptSecurityManager::GetScriptSecurityManager()->InitJSCallbacks(cx);
+
+  JS_SetGCParameter(cx, JSGC_MAX_BYTES, 0xffffffff);
+
+  JS_SetDestroyCompartmentCallback(cx, CompartmentDestroyedCallback);
+  JS_SetSizeOfIncludingThisCompartmentCallback(
+      cx, CompartmentSizeOfIncludingThisCallback);
+  JS::SetDestroyRealmCallback(cx, DestroyRealm);
+  JS::SetRealmNameCallback(cx, GetRealmNameCallback);
+  mPrevGCSliceCallback = JS::SetGCSliceCallback(cx, GCSliceCallback);
+  mPrevDoCycleCollectionCallback =
+      JS::SetDoCycleCollectionCallback(cx, DoCycleCollectionCallback);
+  JS_AddFinalizeCallback(cx, FinalizeCallback, nullptr);
+  JS_AddWeakPointerZonesCallback(cx, WeakPointerZonesCallback, this);
+  JS_AddWeakPointerCompartmentCallback(cx, WeakPointerCompartmentCallback,
+                                       this);
+  JS_SetWrapObjectCallbacks(cx, &WrapObjectCallbacks);
+  if (XRE_IsE10sParentProcess()) {
+    JS::SetFilenameValidationCallback(
+        nsContentSecurityUtils::ValidateScriptFilename);
+  }
+  js::SetPreserveWrapperCallbacks(cx, PreserveWrapper, HasReleasedWrapper);
+  JS_InitReadPrincipalsCallback(cx, nsJSPrincipals::ReadPrincipals);
+  js::SetWindowProxyClass(cx, &OuterWindowProxyClass);
+
+  JS::SetXrayJitInfo(&gXrayJitInfo);
+  JS::SetProcessLargeAllocationFailureCallback(
+      OnLargeAllocationFailureCallback);
+
+  JS::SetProcessBuildIdOp(GetBuildId);
+  FetchUtil::InitWasmAltDataType();
+
+  mozilla::UniquePtr<XPCJSSourceHook> hook(new XPCJSSourceHook);
+  js::SetSourceHook(cx, std::move(hook));
+
+  RegisterStrongMemoryReporter(MakeAndAddRef<JSMainRuntimeRealmsReporter>());
+  RegisterStrongMemoryReporter(
+      MakeAndAddRef<JSMainRuntimeTemporaryPeakReporter>());
+  RegisterJSMainRuntimeGCHeapDistinguishedAmount(
+      JSMainRuntimeGCHeapDistinguishedAmount);
+  RegisterJSMainRuntimeTemporaryPeakDistinguishedAmount(
+      JSMainRuntimeTemporaryPeakDistinguishedAmount);
+  RegisterJSMainRuntimeCompartmentsSystemDistinguishedAmount(
+      JSMainRuntimeCompartmentsSystemDistinguishedAmount);
+  RegisterJSMainRuntimeCompartmentsUserDistinguishedAmount(
+      JSMainRuntimeCompartmentsUserDistinguishedAmount);
+  RegisterJSMainRuntimeRealmsSystemDistinguishedAmount(
+      JSMainRuntimeRealmsSystemDistinguishedAmount);
+  RegisterJSMainRuntimeRealmsUserDistinguishedAmount(
+      JSMainRuntimeRealmsUserDistinguishedAmount);
+  mozilla::RegisterJSSizeOfTab(JSSizeOfTab);
+
+  JS::ubi::SetConstructUbiNodeForDOMObjectCallback(cx, &ConstructUbiNode);
+
+  xpc_LocalizeRuntime(JS_GetRuntime(cx));
+}
+
+bool XPCJSRuntime::InitializeStrings(JSContext* cx) {
+  if (mStrIDs[0].isVoid()) {
+    RootedString str(cx);
+    for (unsigned i = 0; i < XPCJSContext::IDX_TOTAL_COUNT; i++) {
+      str = JS_AtomizeAndPinString(cx, mStrings[i]);
+      if (!str) {
+        mStrIDs[0] = JS::PropertyKey::Void();
+        return false;
+      }
+      mStrIDs[i] = PropertyKey::fromPinnedString(str);
+    }
+
+    if (!mozilla::dom::DefineStaticJSVals(cx)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool XPCJSRuntime::DescribeCustomObjects(JSObject* obj, const JSClass* clasp,
+                                         char (&name)[512]) const {
+  if (clasp != &XPC_WN_Proto_JSClass) {
+    return false;
+  }
+
+  XPCWrappedNativeProto* p = XPCWrappedNativeProto::Get(obj);
+  JS::AutoSuppressGCAnalysis nogc;
+  nsCOMPtr<nsIXPCScriptable> scr = p->GetScriptable();
+  if (!scr) {
+    return false;
+  }
+
+  SprintfLiteral(name, "JS Object (%s - %s)", clasp->name,
+                 scr->GetJSClass()->name);
+  return true;
+}
+
+bool XPCJSRuntime::NoteCustomGCThingXPCOMChildren(
+    const JSClass* clasp, JSObject* obj,
+    nsCycleCollectionTraversalCallback& cb) const {
+  if (clasp != &XPC_WN_Tearoff_JSClass) {
+    return false;
+  }
+
+  XPCWrappedNativeTearOff* to = XPCWrappedNativeTearOff::Get(obj);
+  NS_CYCLE_COLLECTION_NOTE_EDGE_NAME(
+      cb, "XPCWrappedNativeTearOff::Get(obj)->mNative");
+  cb.NoteXPCOMChild(to->GetNative());
+  return true;
+}
+
+
+void XPCJSRuntime::DebugDump(int16_t depth) {
+#if defined(DEBUG)
+  depth--;
+  XPC_LOG_ALWAYS(("XPCJSRuntime @ %p", this));
+  XPC_LOG_INDENT();
+
+  XPC_LOG_ALWAYS(("mWrappedJSMap @ %p with %d wrappers(s)", mWrappedJSMap.get(),
+                  mWrappedJSMap->Count()));
+  if (depth && mWrappedJSMap->Count()) {
+    XPC_LOG_INDENT();
+    mWrappedJSMap->Dump(depth);
+    XPC_LOG_OUTDENT();
+  }
+
+  XPC_LOG_ALWAYS(("mIID2NativeInterfaceMap @ %p with %d interface(s)",
+                  mIID2NativeInterfaceMap.get(),
+                  mIID2NativeInterfaceMap->Count()));
+
+  XPC_LOG_ALWAYS(("mClassInfo2NativeSetMap @ %p with %d sets(s)",
+                  mClassInfo2NativeSetMap.get(),
+                  mClassInfo2NativeSetMap->Count()));
+
+  XPC_LOG_ALWAYS(("mNativeSetMap @ %p with %d sets(s)", mNativeSetMap.get(),
+                  mNativeSetMap->Count()));
+
+  if (depth && mNativeSetMap->Count()) {
+    XPC_LOG_INDENT();
+    for (auto i = mNativeSetMap->Iter(); !i.done(); i.next()) {
+      i.get()->DebugDump(depth);
+    }
+    XPC_LOG_OUTDENT();
+  }
+
+  XPC_LOG_OUTDENT();
+#endif
+}
+
+
+JSObject* XPCJSRuntime::GetUAWidgetScope(JSContext* cx,
+                                         nsIPrincipal* principal) {
+  MOZ_ASSERT(!principal->IsSystemPrincipal(), "Running UA Widget in chrome");
+
+  RootedObject scope(cx);
+  do {
+    RefPtr<BasePrincipal> key = BasePrincipal::Cast(principal);
+    if (Principal2JSObjectMap::Ptr p = mUAWidgetScopeMap.lookup(key)) {
+      scope = p->value();
+      break;  
+    }
+
+    SandboxOptions options;
+    options.sandboxName.AssignLiteral("UA Widget Scope");
+    options.wantXrays = false;
+    options.wantComponents = false;
+    options.isUAWidgetScope = true;
+
+    MOZ_ASSERT(!nsContentUtils::IsExpandedPrincipal(principal));
+    nsTArray<nsCOMPtr<nsIPrincipal>> principalAsArray{principal};
+    RefPtr<ExpandedPrincipal> ep = ExpandedPrincipal::Create(
+        principalAsArray, principal->OriginAttributesRef());
+
+    RootedValue v(cx);
+    nsresult rv = CreateSandboxObject(
+        cx, &v, static_cast<nsIExpandedPrincipal*>(ep), options);
+    NS_ENSURE_SUCCESS(rv, nullptr);
+    scope = &v.toObject();
+
+    JSObject* unwrapped = js::UncheckedUnwrap(scope);
+    MOZ_ASSERT(xpc::IsInUAWidgetScope(unwrapped));
+
+    MOZ_ALWAYS_TRUE(mUAWidgetScopeMap.putNew(key, unwrapped));
+  } while (false);
+
+  return scope;
+}
+
+JSObject* XPCJSRuntime::UnprivilegedJunkScope(const mozilla::fallible_t&) {
+  if (!mUnprivilegedJunkScope) {
+    dom::AutoJSAPI jsapi;
+    jsapi.Init();
+    JSContext* cx = jsapi.cx();
+
+    SandboxOptions options;
+    options.sandboxName.AssignLiteral("XPConnect Junk Compartment");
+    options.invisibleToDebugger = true;
+
+    RootedValue sandbox(cx);
+    nsresult rv = CreateSandboxObject(cx, &sandbox, nullptr, options);
+    NS_ENSURE_SUCCESS(rv, nullptr);
+
+    mUnprivilegedJunkScope =
+        SandboxPrivate::GetPrivate(sandbox.toObjectOrNull());
+  }
+  MOZ_ASSERT(mUnprivilegedJunkScope->GetWrapper(),
+             "Wrapper should have same lifetime as weak reference");
+  return mUnprivilegedJunkScope->GetWrapper();
+}
+
+JSObject* XPCJSRuntime::UnprivilegedJunkScope() {
+  JSObject* scope = UnprivilegedJunkScope(fallible);
+  MOZ_RELEASE_ASSERT(scope);
+  return scope;
+}
+
+bool XPCJSRuntime::IsUnprivilegedJunkScope(JSObject* obj) {
+  return mUnprivilegedJunkScope && obj == mUnprivilegedJunkScope->GetWrapper();
+}
+
+void XPCJSRuntime::DeleteSingletonScopes() {
+  if (RefPtr<SandboxPrivate> sandbox = mUnprivilegedJunkScope.get()) {
+    sandbox->ReleaseWrapper(sandbox);
+    mUnprivilegedJunkScope = nullptr;
+  }
+}
+
+uint32_t GetAndClampCPUCount() {
+  int32_t proc = GetNumberOfProcessors();
+  if (proc < 2) {
+    return 2;
+  }
+  return std::min(proc, 8);
+}

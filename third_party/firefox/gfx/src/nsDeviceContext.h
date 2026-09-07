@@ -1,0 +1,158 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef NS_DEVICECONTEXT_H_
+#define NS_DEVICECONTEXT_H_
+
+#include <stdint.h>                    // for uint32_t
+#include "gfxTypes.h"                  // for gfxFloat
+#include "mozilla/RefPtr.h"            // for RefPtr
+#include "nsCOMPtr.h"                  // for nsCOMPtr
+#include "nsCoord.h"                   // for nscoord
+#include "nsError.h"                   // for nsresult
+#include "nsISupports.h"               // for NS_INLINE_DECL_REFCOUNTING
+#include "nsMathUtils.h"               // for NS_round
+#include "nscore.h"                    // for char16_t, nsAString
+#include "mozilla/AppUnits.h"          // for AppUnits
+#include "nsFontMetrics.h"             // for nsFontMetrics::Params
+#include "mozilla/gfx/Point.h"         // for IntSize
+#include "mozilla/gfx/PrintPromise.h"  // for PrintEndDocumentPromise
+
+class gfxContext;
+class gfxTextPerfMetrics;
+class gfxUserFontSet;
+struct nsFont;
+class nsAtom;
+class nsIDeviceContextSpec;
+class nsIScreen;
+class nsIScreenManager;
+class nsIWidget;
+struct nsRect;
+
+namespace mozilla {
+namespace dom {
+enum class ScreenColorGamut : uint8_t;
+}  
+namespace hal {
+enum class ScreenOrientation : uint32_t;
+}  
+namespace widget {
+class Screen;
+}  
+namespace gfx {
+class PrintTarget;
+}
+}  
+
+class nsDeviceContext final {
+ public:
+  using IntSize = mozilla::gfx::IntSize;
+  using PrintTarget = mozilla::gfx::PrintTarget;
+
+  nsDeviceContext();
+
+  NS_INLINE_DECL_REFCOUNTING(nsDeviceContext)
+
+  void Init(nsIWidget* aWidget);
+
+  nsresult InitForPrinting(nsIDeviceContextSpec* aDevSpec);
+
+  mozilla::UniquePtr<gfxContext> CreateRenderingContext();
+
+  mozilla::UniquePtr<gfxContext> CreateReferenceRenderingContext();
+
+  int32_t AppUnitsPerDevPixel() const { return mAppUnitsPerDevPixel; }
+
+  static int32_t ComputeAppUnitsPerDevPixelForWidgetScale(
+      mozilla::CSSToLayoutDeviceScale);
+  static int32_t ApplyFullZoomToAPD(int32_t aAppUnitsPerPixel, float aFullZoom);
+
+  nscoord GfxUnitsToAppUnits(gfxFloat aGfxUnits) const {
+    return nscoord(NS_round(aGfxUnits * AppUnitsPerDevPixel()));
+  }
+
+  gfxFloat AppUnitsToGfxUnits(nscoord aAppUnits) const {
+    return gfxFloat(aAppUnits) / AppUnitsPerDevPixel();
+  }
+
+  int32_t AppUnitsPerPhysicalInch() const { return mAppUnitsPerPhysicalInch; }
+
+  int32_t AppUnitsPerDevPixelAtUnitFullZoom() const {
+    return mAppUnitsPerDevPixelAtUnitFullZoom;
+  }
+
+  int32_t AppUnitsPerDevPixelInTopLevelChromePage() const;
+
+  uint32_t GetDepth();
+
+  mozilla::dom::ScreenColorGamut GetColorGamut();
+
+  mozilla::hal::ScreenOrientation GetScreenOrientationType();
+
+  uint16_t GetScreenOrientationAngle();
+
+  bool GetScreenIsHDR();
+
+  nsSize GetDeviceSurfaceDimensions();
+
+  nsRect GetRect();
+
+  nsRect GetClientRect();
+
+  bool IsCurrentlyPrintingDocument() const { return mIsCurrentlyPrintingDoc; }
+
+  nsresult BeginDocument(const nsAString& aTitle,
+                         const nsAString& aPrintToFileName,
+                         uint64_t aBrowsingContextId, int32_t aStartPage,
+                         int32_t aEndPage);
+
+  RefPtr<mozilla::gfx::PrintEndDocumentPromise> EndDocument();
+
+  nsresult AbortDocument();
+
+  nsresult BeginPage(const IntSize& aSizeInPoints);
+
+  nsresult EndPage();
+
+  bool CheckDPIChange();
+
+  bool SetFullZoom(float aScale);
+
+  float GetFullZoom() const { return mFullZoom; }
+
+  bool IsPrinterContext() const { return !!mPrintTarget; }
+
+  mozilla::DesktopToLayoutDeviceScale GetDesktopToDeviceScale();
+
+ private:
+  ~nsDeviceContext();
+
+  mozilla::UniquePtr<gfxContext> CreateRenderingContextCommon(
+      bool aWantReferenceContext);
+
+  void SetDPI();
+
+  already_AddRefed<mozilla::widget::Screen> FindScreen();
+
+  bool CalcPrintingSize();
+  void UpdateAppUnitsForFullZoom();
+
+  nscoord mWidth;
+  nscoord mHeight;
+  int32_t mAppUnitsPerDevPixel;
+  int32_t mAppUnitsPerDevPixelAtUnitFullZoom;
+  int32_t mAppUnitsPerPhysicalInch;
+  float mFullZoom;
+  float mPrintingScale;
+  gfxPoint mPrintingTranslate;
+
+  nsCOMPtr<nsIWidget> mWidget;
+  nsCOMPtr<nsIDeviceContextSpec> mDeviceContextSpec;
+  RefPtr<PrintTarget> mPrintTarget;
+  bool mIsCurrentlyPrintingDoc;
+  bool mIsInitialized = false;
+  uint64_t mBrowsingContextId = 0;
+};
+
+#endif /* NS_DEVICECONTEXT_H_ */

@@ -1,0 +1,49 @@
+/*
+ * Copyright (c) 2016, Alliance for Open Media. All rights reserved.
+ *
+ * This source code is subject to the terms of the BSD 2 Clause License and
+ * the Alliance for Open Media Patent License 1.0. If the BSD 2 Clause License
+ * was not distributed with this source code in the LICENSE file, you can
+ * obtain it at www.aomedia.org/license/software. If the Alliance for Open
+ * Media Patent License 1.0 was not distributed with this source code in the
+ * PATENTS file, you can obtain it at www.aomedia.org/license/patent.
+ */
+#if !defined(AOM_AOM_AOM_INTEGER_H_)
+#define AOM_AOM_AOM_INTEGER_H_
+
+#include <stddef.h>  // IWYU pragma: export
+
+
+#if defined(__cplusplus)
+#if !defined(__STDC_FORMAT_MACROS)
+#define __STDC_FORMAT_MACROS
+#endif
+#if !defined(__STDC_LIMIT_MACROS)
+#define __STDC_LIMIT_MACROS
+#endif
+#endif
+
+#include <stdint.h>    // IWYU pragma: export
+#include <inttypes.h>  // IWYU pragma: export
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+size_t aom_uleb_size_in_bytes(uint64_t value);
+
+int aom_uleb_decode(const uint8_t *buffer, size_t available, uint64_t *value,
+                    size_t *length);
+
+int aom_uleb_encode(uint64_t value, size_t available, uint8_t *coded_value,
+                    size_t *coded_size);
+
+int aom_uleb_encode_fixed_size(uint64_t value, size_t available,
+                               size_t pad_to_size, uint8_t *coded_value,
+                               size_t *coded_size);
+
+#if defined(__cplusplus)
+}  
+#endif
+
+#endif

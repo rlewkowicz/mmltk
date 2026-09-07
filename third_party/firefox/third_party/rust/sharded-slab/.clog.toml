@@ -1,0 +1,10 @@
+[clog]
+repository = "https://github.com/hawkw/sharded-slab"
+
+link-style = "github"
+
+changelog = "CHANGELOG.md"
+
+output-format = "markdown"
+
+from-latest-tag = true

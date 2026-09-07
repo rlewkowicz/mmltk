@@ -1,0 +1,100 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(CubebUtils_h_)
+#  define CubebUtils_h_
+
+#  include "AudioSampleFormat.h"
+#  include "cubeb/cubeb.h"
+#  include "nsISupportsImpl.h"
+#  include "nsString.h"
+
+#if defined(ENABLE_SET_CUBEB_BACKEND)
+#    include "MockCubeb.h"
+#endif
+
+class AudioDeviceInfo;
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(cubeb_stream_prefs)
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(cubeb_input_processing_params)
+
+namespace mozilla {
+
+class SharedThreadPool;
+
+namespace CubebUtils {
+
+typedef cubeb_devid AudioDeviceID;
+
+template <AudioSampleFormat N>
+struct ToCubebFormat {
+  static const cubeb_sample_format value = CUBEB_SAMPLE_FLOAT32NE;
+};
+
+template <>
+struct ToCubebFormat<AUDIO_FORMAT_S16> {
+  static const cubeb_sample_format value = CUBEB_SAMPLE_S16NE;
+};
+
+nsCString ProcessingParamsToString(cubeb_input_processing_params aParams);
+
+class CubebHandle {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(CubebHandle)
+  explicit CubebHandle(cubeb* aCubeb) : mCubeb(aCubeb) {
+    MOZ_RELEASE_ASSERT(mCubeb);
+  };
+  CubebHandle(const CubebHandle&) = delete;
+  cubeb* Context() const { return mCubeb.get(); }
+
+ private:
+  struct CubebDeletePolicy {
+    void operator()(cubeb* aCubeb) { cubeb_destroy(aCubeb); }
+  };
+  const UniquePtr<cubeb, CubebDeletePolicy> mCubeb;
+  ~CubebHandle() = default;
+};
+
+void InitLibrary();
+
+void ShutdownLibrary();
+
+bool SandboxEnabled();
+
+already_AddRefed<SharedThreadPool> GetCubebOperationThread();
+
+uint32_t MaxNumberOfChannels();
+
+uint32_t PreferredSampleRate(bool aShouldResistFingerprinting);
+
+int CubebStreamInit(cubeb* context, cubeb_stream** stream,
+                    char const* stream_name, cubeb_devid input_device,
+                    cubeb_stream_params* input_stream_params,
+                    cubeb_devid output_device,
+                    cubeb_stream_params* output_stream_params,
+                    uint32_t latency_frames, cubeb_data_callback data_callback,
+                    cubeb_state_callback state_callback, void* user_ptr);
+
+enum Side { Input = 1 << 0, Output = 1 << 1 };
+
+double GetVolumeScale();
+bool GetFirstStream();
+RefPtr<CubebHandle> GetCubeb();
+uint32_t GetCubebPlaybackLatencyInMilliseconds();
+uint32_t GetCubebMTGLatencyInFrames(cubeb_stream_params* params);
+bool CubebLatencyPrefSet();
+void GetCurrentBackend(nsAString& aBackend);
+cubeb_stream_prefs GetDefaultStreamPrefs(cubeb_device_type aType);
+char* GetForcedOutputDevice();
+void SetInCommunication(bool aInCommunication);
+bool RouteOutputAsVoice();
+bool EstimatedLatencyDefaultDevices(
+    double* aMean, double* aStdDev,
+    Side aSide = static_cast<Side>(Side::Input | Side::Output));
+
+
+}  
+}  
+
+#endif

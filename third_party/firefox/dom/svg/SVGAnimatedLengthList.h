@@ -1,0 +1,92 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SVG_SVGANIMATEDLENGTHLIST_H_
+#define DOM_SVG_SVGANIMATEDLENGTHLIST_H_
+
+#include <memory>
+
+#include "SVGLengthList.h"
+#include "mozilla/SMILAttr.h"
+
+namespace mozilla {
+
+class SMILValue;
+
+namespace dom {
+class SVGAnimationElement;
+class SVGElement;
+}  
+
+class SVGAnimatedLengthList {
+  friend class dom::DOMSVGLength;
+  friend class dom::DOMSVGLengthList;
+
+ public:
+  SVGAnimatedLengthList() = default;
+
+  SVGAnimatedLengthList& operator=(const SVGAnimatedLengthList& aOther) {
+    mBaseVal = aOther.mBaseVal;
+    if (aOther.mAnimVal) {
+      mAnimVal = std::make_unique<SVGLengthList>(*aOther.mAnimVal);
+    }
+    return *this;
+  }
+
+  const SVGLengthList& GetBaseValue() const { return mBaseVal; }
+
+  nsresult SetBaseValueString(const nsAString& aValue);
+
+  void ClearBaseValue(uint32_t aAttrEnum);
+
+  const SVGLengthList& GetAnimValue() const {
+    return mAnimVal ? *mAnimVal : mBaseVal;
+  }
+
+  nsresult SetAnimValue(const SVGLengthList& aNewAnimValue,
+                        dom::SVGElement* aElement, uint32_t aAttrEnum);
+
+  void ClearAnimValue(dom::SVGElement* aElement, uint32_t aAttrEnum);
+
+  bool IsAnimating() const { return !!mAnimVal; }
+
+  std::unique_ptr<SMILAttr> ToSMILAttr(dom::SVGElement* aSVGElement,
+                                       uint8_t aAttrEnum, SVGLength::Axis aAxis,
+                                       bool aCanZeroPadList);
+
+ private:
+
+  SVGLengthList mBaseVal;
+  std::unique_ptr<SVGLengthList> mAnimVal;
+
+  struct SMILAnimatedLengthList : public SMILAttr {
+   public:
+    SMILAnimatedLengthList(SVGAnimatedLengthList* aVal,
+                           dom::SVGElement* aSVGElement, uint8_t aAttrEnum,
+                           SVGLength::Axis aAxis, bool aCanZeroPadList)
+        : mVal(aVal),
+          mElement(aSVGElement),
+          mAttrEnum(aAttrEnum),
+          mAxis(aAxis),
+          mCanZeroPadList(aCanZeroPadList) {}
+
+    SVGAnimatedLengthList* mVal;
+    dom::SVGElement* mElement;
+    uint8_t mAttrEnum;
+    SVGLength::Axis mAxis;
+    bool mCanZeroPadList;  
+
+    nsresult ValueFromString(const nsAString& aStr,
+                             const dom::SVGAnimationElement* aSrcElement,
+                             SMILValue& aValue,
+                             bool& aPreventCachingOfSandwich) const override;
+    SMILValue GetBaseValue() const override;
+    void ClearAnimValue() override;
+    nsresult SetAnimValue(const SMILValue& aValue) override;
+  };
+};
+
+}  
+
+#endif  // DOM_SVG_SVGANIMATEDLENGTHLIST_H_

@@ -1,0 +1,196 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef gc_GCContext_h
+#define gc_GCContext_h
+
+#include "mozilla/Assertions.h"  // MOZ_ASSERT
+#include "mozilla/ThreadLocal.h"
+
+#include "jspubtd.h"
+#include "jstypes.h"                  // JS_PUBLIC_API
+#include "gc/GCEnum.h"                // js::MemoryUse
+#include "jit/ExecutableAllocator.h"  // jit::JitPoisonRangeVector
+#include "js/Utility.h"               // js_free
+
+struct JS_PUBLIC_API JSRuntime;
+
+namespace js {
+
+class AutoTouchingGrayThings;
+
+namespace gc {
+
+class AutoSetThreadGCUse;
+class AutoSetThreadIsSweeping;
+class AutoDisallowPreWriteBarrier;
+class GCRuntime;
+
+enum class GCUse {
+  None,
+
+  Unspecified,
+
+  Marking,
+
+  Sweeping,
+
+  Finalizing
+};
+
+}  
+}  
+
+namespace JS {
+
+class GCContext {
+  using Cell = js::gc::Cell;
+  using MemoryUse = js::MemoryUse;
+
+  js::gc::GCRuntime* const gc_;
+
+  js::jit::JitPoisonRangeVector jitPoisonRanges;
+
+  js::gc::GCUse gcUse_ = js::gc::GCUse::None;
+  friend class js::gc::AutoSetThreadGCUse;
+  friend class js::gc::AutoSetThreadIsSweeping;
+  friend class js::gc::AutoDisallowPreWriteBarrier;
+
+#ifdef DEBUG
+  Zone* gcSweepZone_ = nullptr;
+
+  size_t isTouchingGrayThings_ = false;
+  friend class js::AutoTouchingGrayThings;
+
+  bool preWriteBarrierAllowed_ = true;
+#endif
+
+ public:
+  explicit GCContext(js::gc::GCRuntime* maybeGc);
+  ~GCContext();
+
+  js::gc::GCRuntime* gcRuntime() const {
+    MOZ_ASSERT(onMainThread());
+    return gcRuntimeFromAnyThread();
+  }
+  js::gc::GCRuntime* gcRuntimeFromAnyThread() const {
+    MOZ_ASSERT(gc_);
+    return gc_;
+  }
+  JSRuntime* runtime() const;
+  JSRuntime* runtimeFromAnyThread() const;
+
+  js::gc::GCUse gcUse() const { return gcUse_; }
+  bool isCollecting() const { return gcUse() != js::gc::GCUse::None; }
+  bool isFinalizing() const { return gcUse_ == js::gc::GCUse::Finalizing; }
+
+#ifdef DEBUG
+  bool onMainThread() const;
+
+  Zone* gcSweepZone() const { return gcSweepZone_; }
+  bool isTouchingGrayThings() const { return isTouchingGrayThings_; }
+  bool isPreWriteBarrierAllowed() const { return preWriteBarrierAllowed_; }
+#endif
+
+  void freeUntracked(void* p) { js_free(p); }
+
+  void free_(Cell* cell, void* p, size_t nbytes, MemoryUse use);
+
+  bool appendJitPoisonRange(const js::jit::JitPoisonRange& range) {
+    return jitPoisonRanges.append(range);
+  }
+  bool hasJitCodeToPoison() const { return !jitPoisonRanges.empty(); }
+  void poisonJitCode();
+
+  template <class T>
+  void deleteUntracked(T* p) {
+    if (p) {
+      p->~T();
+      js_free(p);
+    }
+  }
+
+  template <class T>
+  void delete_(Cell* cell, T* p, MemoryUse use) {
+    delete_(cell, p, sizeof(T), use);
+  }
+
+  template <class T>
+  void delete_(Cell* cell, T* p, size_t nbytes, MemoryUse use) {
+    if (p) {
+      p->~T();
+      free_(cell, p, nbytes, use);
+    }
+  }
+
+  template <class T>
+  void release(Cell* cell, T* p, MemoryUse use) {
+    release(cell, p, sizeof(T), use);
+  }
+
+  template <class T>
+  void release(Cell* cell, T* p, size_t nbytes, MemoryUse use);
+
+  void removeCellMemory(Cell* cell, size_t nbytes, MemoryUse use);
+};
+
+}  
+
+namespace js {
+
+extern MOZ_THREAD_LOCAL(JS::GCContext*) TlsGCContext;
+
+inline JS::GCContext* MaybeGetGCContext() {
+  if (!TlsGCContext.init()) {
+    return nullptr;
+  }
+  return TlsGCContext.get();
+}
+
+class MOZ_RAII AutoTouchingGrayThings {
+ public:
+#ifdef DEBUG
+  AutoTouchingGrayThings() { TlsGCContext.get()->isTouchingGrayThings_++; }
+  ~AutoTouchingGrayThings() {
+    JS::GCContext* gcx = TlsGCContext.get();
+    MOZ_ASSERT(gcx->isTouchingGrayThings_);
+    gcx->isTouchingGrayThings_--;
+  }
+#else
+  AutoTouchingGrayThings() {}
+#endif
+};
+
+#ifdef DEBUG
+
+inline bool CurrentThreadIsGCMarking() {
+  JS::GCContext* gcx = MaybeGetGCContext();
+  return gcx && gcx->gcUse() == gc::GCUse::Marking;
+}
+
+inline bool CurrentThreadIsGCSweeping() {
+  JS::GCContext* gcx = MaybeGetGCContext();
+  return gcx && gcx->gcUse() == gc::GCUse::Sweeping;
+}
+
+inline bool CurrentThreadIsGCFinalizing() {
+  JS::GCContext* gcx = MaybeGetGCContext();
+  return gcx && gcx->gcUse() == gc::GCUse::Finalizing;
+}
+
+inline bool CurrentThreadIsTouchingGrayThings() {
+  JS::GCContext* gcx = MaybeGetGCContext();
+  return gcx && gcx->isTouchingGrayThings();
+}
+
+inline bool CurrentThreadIsPerformingGC() {
+  JS::GCContext* gcx = MaybeGetGCContext();
+  return gcx && gcx->isCollecting();
+}
+
+#endif
+
+}  
+
+#endif  // gc_GCContext_h

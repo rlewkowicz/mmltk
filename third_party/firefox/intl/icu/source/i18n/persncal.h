@@ -1,0 +1,115 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+ ******************************************************************************
+ * Copyright (C) 2003-2013, International Business Machines Corporation
+ * and others. All Rights Reserved.
+ ******************************************************************************
+ *
+ * File PERSNCAL.H
+ *
+ * Modification History:
+ *
+ *   Date        Name        Description
+ *   9/23/2003 mehran        posted to icu-design
+ *****************************************************************************
+ */
+
+#ifndef PERSNCAL_H
+#define PERSNCAL_H
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/calendar.h"
+
+U_NAMESPACE_BEGIN
+
+class PersianCalendar : public Calendar {
+ public:
+  enum EMonths {
+    FARVARDIN = 0,
+
+    ORDIBEHESHT = 1,
+
+    KHORDAD = 2,
+
+    TIR = 3,
+
+    MORDAD = 4,
+
+    SHAHRIVAR = 5,
+
+    MEHR = 6,
+
+    ABAN = 7,
+
+    AZAR = 8,
+
+    DEI = 9,
+
+    BAHMAN = 10,
+
+    ESFAND = 11,
+    
+    PERSIAN_MONTH_MAX
+  }; 
+
+
+
+
+  PersianCalendar(const Locale& aLocale, UErrorCode &success);
+
+  PersianCalendar(const PersianCalendar& other);
+
+  virtual ~PersianCalendar();
+
+
+  virtual PersianCalendar* clone() const override;
+
+ private:
+  static UBool isLeapYear(int32_t year);
+    
+  int32_t yearStart(int32_t year, UErrorCode& status);
+
+  int32_t monthStart(int32_t year, int32_t month, UErrorCode& status) const;
+    
+ protected:
+  virtual int32_t handleGetLimit(UCalendarDateFields field, ELimitType limitType) const override;
+  
+  virtual int32_t handleGetMonthLength(int32_t extendedYear, int32_t month, UErrorCode& status) const override;
+  
+  virtual int32_t handleGetYearLength(int32_t extendedYear, UErrorCode& status) const override;
+    
+
+  virtual int64_t handleComputeMonthStart(int32_t eyear, int32_t month, UBool useMonth, UErrorCode& status) const override;
+
+
+  virtual int32_t handleGetExtendedYear(UErrorCode& status) override;
+
+  virtual void handleComputeFields(int32_t julianDay, UErrorCode &status) override;
+
+ public: 
+  virtual UClassID getDynamicClassID() const override;
+
+  U_I18N_API static UClassID U_EXPORT2 getStaticClassID();
+
+  virtual const char * getType() const override;
+
+ protected:
+  int32_t getRelatedYearDifference() const override;
+
+ private:
+  PersianCalendar(); 
+
+ protected:
+  DECLARE_OVERRIDE_SYSTEM_DEFAULT_CENTURY
+};
+
+U_NAMESPACE_END
+
+#endif
+#endif
+
+
+

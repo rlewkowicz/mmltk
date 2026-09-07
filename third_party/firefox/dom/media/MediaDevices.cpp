@@ -1,0 +1,723 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/MediaDevices.h"
+
+#include "AudioDeviceInfo.h"
+#include "MediaEngine.h"
+#include "MediaEngineFake.h"
+#include "MediaTrackConstraints.h"
+#include "mozilla/MediaManager.h"
+#include "mozilla/StaticPrefs_media.h"
+#include "mozilla/dom/BrowsingContext.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/FeaturePolicyUtils.h"
+#include "mozilla/dom/MediaDeviceInfo.h"
+#include "mozilla/dom/MediaDevicesBinding.h"
+#include "mozilla/dom/MediaStreamBinding.h"
+#include "mozilla/dom/MediaTrackSupportedConstraintsBinding.h"
+#include "mozilla/dom/NavigatorBinding.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/WindowContext.h"
+#include "mozilla/intl/Localization.h"
+#include "nsContentUtils.h"
+#include "nsGlobalWindowInner.h"
+#include "nsINamed.h"
+#include "nsIScriptGlobalObject.h"
+#include "nsPIDOMWindow.h"
+#include "nsPIDOMWindowInlines.h"
+#include "nsQueryObject.h"
+
+namespace mozilla::dom {
+
+using ConstDeviceSetPromise = MediaManager::ConstDeviceSetPromise;
+using LocalDeviceSetPromise = MediaManager::LocalDeviceSetPromise;
+using LocalMediaDeviceSetRefCnt = MediaManager::LocalMediaDeviceSetRefCnt;
+using MediaDeviceSetRefCnt = MediaManager::MediaDeviceSetRefCnt;
+using mozilla::intl::Localization;
+
+MediaDevices::MediaDevices(nsPIDOMWindowInner* aWindow)
+    : DOMEventTargetHelper(aWindow), mDefaultOutputLabel(VoidString()) {}
+
+MediaDevices::~MediaDevices() {
+  MOZ_ASSERT(NS_IsMainThread());
+  mDeviceChangeListener.DisconnectIfExists();
+}
+
+void MediaDevices::GetSupportedConstraints(
+    MediaTrackSupportedConstraints& aResult) {
+  if (Preferences::GetBool("media.navigator.video.resize_mode.enabled")) {
+    aResult.mResizeMode.Construct(true);
+  }
+}
+
+already_AddRefed<Promise> MediaDevices::GetUserMedia(
+    const MediaStreamConstraints& aConstraints, CallerType aCallerType,
+    ErrorResult& aRv) {
+  MOZ_ASSERT(NS_IsMainThread());
+  nsCOMPtr<nsIGlobalObject> global = xpc::NativeGlobal(GetWrapper());
+  nsCOMPtr<nsPIDOMWindowInner> owner = do_QueryInterface(global);
+  RefPtr<Promise> p = Promise::Create(global, aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+  if (!MediaManager::IsOn(aConstraints.mVideo) &&
+      !MediaManager::IsOn(aConstraints.mAudio)) {
+    p->MaybeRejectWithTypeError("audio and/or video is required");
+    return p.forget();
+  }
+  if (!owner->IsFullyActive()) {
+    p->MaybeRejectWithInvalidStateError("The document is not fully active.");
+    return p.forget();
+  }
+  const OwningBooleanOrMediaTrackConstraints& video = aConstraints.mVideo;
+  if (aCallerType != CallerType::System && video.IsMediaTrackConstraints()) {
+    const Optional<nsString>& mediaSource =
+        video.GetAsMediaTrackConstraints().mMediaSource;
+    if (mediaSource.WasPassed() &&
+        !mediaSource.Value().EqualsLiteral("camera")) {
+      WindowContext* wc = owner->GetWindowContext();
+      if (!wc || !wc->HasValidTransientUserGestureActivation()) {
+        p->MaybeRejectWithInvalidStateError(
+            "Display capture requires transient activation "
+            "from a user gesture.");
+        return p.forget();
+      }
+    }
+  }
+  RefPtr<MediaDevices> self(this);
+  GetUserMedia(owner, aConstraints, aCallerType)
+      ->Then(
+          GetCurrentSerialEventTarget(), __func__,
+          [this, self, p](RefPtr<DOMMediaStream>&& aStream) {
+            if (!GetWindowIfCurrent()) {
+              return;  
+            }
+            p->MaybeResolve(std::move(aStream));
+          },
+          [this, self, p](const RefPtr<MediaMgrError>& error) {
+            nsPIDOMWindowInner* window = GetWindowIfCurrent();
+            if (!window) {
+              return;  
+            }
+            error->Reject(p);
+          });
+  return p.forget();
+}
+
+RefPtr<MediaDevices::StreamPromise> MediaDevices::GetUserMedia(
+    nsPIDOMWindowInner* aWindow, const MediaStreamConstraints& aConstraints,
+    CallerType aCallerType) {
+  MOZ_ASSERT(NS_IsMainThread());
+  bool haveFake = aConstraints.mFake.WasPassed() && aConstraints.mFake.Value();
+  const OwningBooleanOrMediaTrackConstraints& video = aConstraints.mVideo;
+  const OwningBooleanOrMediaTrackConstraints& audio = aConstraints.mAudio;
+  bool isMicrophone =
+      !haveFake &&
+      (audio.IsBoolean()
+           ? audio.GetAsBoolean()
+           : !audio.GetAsMediaTrackConstraints().mMediaSource.WasPassed());
+  bool isCamera =
+      !haveFake &&
+      (video.IsBoolean()
+           ? video.GetAsBoolean()
+           : !video.GetAsMediaTrackConstraints().mMediaSource.WasPassed());
+
+  RefPtr<MediaDevices> self(this);
+  return MediaManager::Get()
+      ->GetUserMedia(aWindow, aConstraints, aCallerType)
+      ->Then(
+          GetCurrentSerialEventTarget(), __func__,
+          [this, self, isMicrophone,
+           isCamera](RefPtr<DOMMediaStream>&& aStream) {
+            if (isMicrophone) {
+              mCanExposeMicrophoneInfo = true;
+            }
+            if (isCamera) {
+              mCanExposeCameraInfo = true;
+            }
+            return StreamPromise::CreateAndResolve(std::move(aStream),
+                                                   __func__);
+          },
+          [](RefPtr<MediaMgrError>&& aError) {
+            return StreamPromise::CreateAndReject(std::move(aError), __func__);
+          });
+}
+
+already_AddRefed<Promise> MediaDevices::EnumerateDevices(ErrorResult& aRv) {
+  MOZ_ASSERT(NS_IsMainThread());
+  nsCOMPtr<nsIGlobalObject> global = xpc::NativeGlobal(GetWrapper());
+  RefPtr<Promise> p = Promise::Create(global, aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+  mPendingEnumerateDevicesPromises.AppendElement(p);
+  MaybeResumeDeviceExposure();
+  return p.forget();
+}
+
+void MediaDevices::MaybeResumeDeviceExposure() {
+  if (mPendingEnumerateDevicesPromises.IsEmpty() &&
+      !mHaveUnprocessedDeviceListChange) {
+    return;
+  }
+  nsPIDOMWindowInner* window = GetOwnerWindow();
+  if (!window || !window->IsFullyActive()) {
+    return;
+  }
+  if (!StaticPrefs::media_devices_unfocused_enabled()) {
+    BrowsingContext* bc = window->GetBrowsingContext();
+    if (!bc->IsActive() ||  
+        !bc->GetIsActiveBrowserWindow()) {  
+      return;
+    }
+  }
+  bool shouldResistFingerprinting =
+      window->AsGlobal()->ShouldResistFingerprinting(RFPTarget::MediaDevices);
+  MediaManager::Get()->GetPhysicalDevices()->Then(
+      GetCurrentSerialEventTarget(), __func__,
+      [self = RefPtr(this), this,
+       haveDeviceListChange = mHaveUnprocessedDeviceListChange,
+       enumerateDevicesPromises = std::move(mPendingEnumerateDevicesPromises),
+       shouldResistFingerprinting](
+          RefPtr<const MediaDeviceSetRefCnt> aAllDevices) mutable {
+        RefPtr<MediaDeviceSetRefCnt> exposedDevices =
+            FilterExposedDevices(*aAllDevices);
+        if (haveDeviceListChange && !shouldResistFingerprinting) {
+          if (ShouldQueueDeviceChange(*exposedDevices)) {
+            NS_DispatchToCurrentThread(NS_NewRunnableFunction(
+                "devicechange", [self = RefPtr(this), this] {
+                  DispatchTrustedEvent(u"devicechange"_ns);
+                }));
+          }
+          mLastPhysicalDevices = std::move(aAllDevices);
+        }
+        if (!enumerateDevicesPromises.IsEmpty()) {
+          ResumeEnumerateDevices(std::move(enumerateDevicesPromises),
+                                 std::move(exposedDevices));
+        }
+      },
+      [](RefPtr<MediaMgrError>&&) {
+        MOZ_ASSERT_UNREACHABLE("GetPhysicalDevices does not reject");
+      });
+  mHaveUnprocessedDeviceListChange = false;
+}
+
+static bool IsLegacyMode(nsPIDOMWindowInner* window) {
+  if (StaticPrefs::media_devices_enumerate_legacy_enabled()) {
+    return true;
+  }
+  if (window->GetDocumentURI()) {
+    nsAutoCString host;
+    window->GetDocumentURI()->GetAsciiHost(host);
+    if (media::HostnameInPref("media.devices.enumerate.legacy.allowlist",
+                              host)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+RefPtr<MediaDeviceSetRefCnt> MediaDevices::FilterExposedDevices(
+    const MediaDeviceSet& aDevices) const {
+  nsPIDOMWindowInner* window = GetOwnerWindow();
+  RefPtr exposed = new MediaDeviceSetRefCnt();
+  if (!window) {
+    return exposed;  
+  }
+  Document* doc = window->GetExtantDoc();
+  if (!doc) {
+    return exposed;
+  }
+  bool dropMics = !FeaturePolicyUtils::IsFeatureAllowed(doc, u"microphone"_ns);
+  bool dropCams = !FeaturePolicyUtils::IsFeatureAllowed(doc, u"camera"_ns);
+  bool dropSpeakers =
+      !Preferences::GetBool("media.setsinkid.enabled") ||
+      !FeaturePolicyUtils::IsFeatureAllowed(doc, u"speaker-selection"_ns);
+  bool shouldResistFingerprinting =
+      window->AsGlobal()->ShouldResistFingerprinting(RFPTarget::MediaDevices);
+  bool legacy = IsLegacyMode(window);
+  bool outputIsDefault = true;  
+  bool haveDefaultOutput = false;
+  nsTHashSet<nsString> exposedMicrophoneGroupIds;
+  for (const auto& device : aDevices) {
+    switch (device->mKind) {
+      case MediaDeviceKind::Audioinput:
+        if (dropMics) {
+          continue;
+        }
+        if (mCanExposeMicrophoneInfo) {
+          exposedMicrophoneGroupIds.Insert(device->mRawGroupID);
+        }
+        if (!mCanExposeMicrophoneInfo && !legacy) {
+          dropMics = true;
+        }
+        break;
+      case MediaDeviceKind::Videoinput:
+        if (dropCams) {
+          continue;
+        }
+        if (!mCanExposeCameraInfo && !legacy) {
+          dropCams = true;
+        }
+        break;
+      case MediaDeviceKind::Audiooutput:
+        if (dropSpeakers ||
+            (!mExplicitlyGrantedAudioOutputRawIds.Contains(device->mRawID) &&
+             (!mCanExposeMicrophoneInfo ||
+              (shouldResistFingerprinting &&
+               !exposedMicrophoneGroupIds.Contains(device->mRawGroupID))))) {
+          outputIsDefault = false;
+          continue;
+        }
+        if (!haveDefaultOutput && !outputIsDefault) {
+          if (mDefaultOutputLabel.IsVoid()) {
+            mDefaultOutputLabel.SetIsVoid(false);
+            AutoTArray<nsCString, 1> resourceIds{"dom/media.ftl"_ns};
+            RefPtr l10n = Localization::Create(resourceIds,  true);
+            nsAutoCString translation;
+            IgnoredErrorResult rv;
+            l10n->FormatValueSync("default-audio-output-device-label"_ns, {},
+                                  translation, rv);
+            if (!rv.Failed()) {
+              AppendUTF8toUTF16(translation, mDefaultOutputLabel);
+            }
+          }
+          RefPtr info = new AudioDeviceInfo(
+              nullptr, mDefaultOutputLabel, u""_ns, u""_ns,
+              CUBEB_DEVICE_TYPE_OUTPUT, CUBEB_DEVICE_STATE_ENABLED,
+              CUBEB_DEVICE_PREF_ALL, CUBEB_DEVICE_FMT_ALL,
+              CUBEB_DEVICE_FMT_S16NE, 2, 44100, 44100, 44100, 128, 128);
+          exposed->AppendElement(
+              new MediaDevice(new MediaEngineFake(), info, u""_ns));
+        }
+        haveDefaultOutput = true;
+        break;
+    }
+    exposed->AppendElement(device);
+  }
+
+  if (doc->ShouldResistFingerprinting(RFPTarget::MediaDevices)) {
+    nsTHashSet<MediaDeviceKind> seenKinds;
+
+    for (uint32_t i = 0; i < exposed->Length(); i++) {
+      RefPtr<mozilla::MediaDevice> device = exposed->ElementAt(i);
+      if (seenKinds.Contains(device->mKind)) {
+        exposed->RemoveElementAt(i);
+        i--;
+        continue;
+      }
+      seenKinds.Insert(device->mKind);
+    }
+
+    if (seenKinds.Count() != 3) {
+      RefPtr fakeEngine = new MediaEngineFake();
+      RefPtr fakeDevices = new MediaDeviceSetRefCnt();
+      if (!seenKinds.Contains(MediaDeviceKind::Audioinput)) {
+        fakeEngine->EnumerateDevices(MediaSourceEnum::Microphone,
+                                     MediaSinkEnum::Other, fakeDevices);
+        exposed->InsertElementAt(0, fakeDevices->LastElement());
+      }
+      if (!seenKinds.Contains(MediaDeviceKind::Videoinput)) {
+        fakeEngine->EnumerateDevices(MediaSourceEnum::Camera,
+                                     MediaSinkEnum::Other, fakeDevices);
+        exposed->InsertElementAt(1, fakeDevices->LastElement());
+      }
+      if (!seenKinds.Contains(MediaDeviceKind::Audiooutput) &&
+          mCanExposeMicrophoneInfo) {
+        RefPtr info = new AudioDeviceInfo(
+            nullptr, u""_ns, u""_ns, u""_ns, CUBEB_DEVICE_TYPE_OUTPUT,
+            CUBEB_DEVICE_STATE_ENABLED, CUBEB_DEVICE_PREF_ALL,
+            CUBEB_DEVICE_FMT_ALL, CUBEB_DEVICE_FMT_S16NE, 2, 44100, 44100,
+            44100, 128, 128);
+        exposed->AppendElement(
+            new MediaDevice(new MediaEngineFake(), info, u""_ns));
+      }
+    }
+  }
+
+  return exposed;
+}
+
+bool MediaDevices::CanExposeInfo(MediaDeviceKind aKind) const {
+  switch (aKind) {
+    case MediaDeviceKind::Audioinput:
+      return mCanExposeMicrophoneInfo;
+    case MediaDeviceKind::Videoinput:
+      return mCanExposeCameraInfo;
+    case MediaDeviceKind::Audiooutput:
+      return true;
+  }
+  MOZ_ASSERT_UNREACHABLE("unexpected MediaDeviceKind");
+  return false;
+}
+
+bool MediaDevices::ShouldQueueDeviceChange(
+    const MediaDeviceSet& aExposedDevices) const {
+  if (!mLastPhysicalDevices) {  
+    return false;
+  }
+  RefPtr<MediaDeviceSetRefCnt> lastExposedDevices =
+      FilterExposedDevices(*mLastPhysicalDevices);
+  auto exposed = aExposedDevices.begin();
+  auto exposedEnd = aExposedDevices.end();
+  auto last = lastExposedDevices->begin();
+  auto lastEnd = lastExposedDevices->end();
+  while (exposed < exposedEnd && last < lastEnd) {
+    MediaDeviceKind kind = (*exposed)->mKind;
+    if (kind != (*last)->mKind) {
+      return true;
+    }
+    if (CanExposeInfo(kind)) {
+      if ((*exposed)->mRawID != (*last)->mRawID) {
+        return true;
+      }
+      ++exposed;
+      ++last;
+      continue;
+    }
+    do {
+      ++exposed;
+    } while (exposed != exposedEnd && (*exposed)->mKind == kind);
+    do {
+      ++last;
+    } while (last != lastEnd && (*last)->mKind == kind);
+  }
+  return exposed < exposedEnd || last < lastEnd;
+}
+
+void MediaDevices::ResumeEnumerateDevices(
+    nsTArray<RefPtr<Promise>>&& aPromises,
+    RefPtr<const MediaDeviceSetRefCnt> aExposedDevices) const {
+  nsCOMPtr<nsPIDOMWindowInner> window = GetOwnerWindow();
+  if (!window) {
+    return;  
+  }
+  MediaManager::Get()
+      ->AnonymizeDevices(window, std::move(aExposedDevices))
+      ->Then(GetCurrentSerialEventTarget(), __func__,
+             [self = RefPtr(this), this, promises = std::move(aPromises)](
+                 const LocalDeviceSetPromise::ResolveOrRejectValue&
+                     aLocalDevices) {
+               nsPIDOMWindowInner* window = GetWindowIfCurrent();
+               if (!window) {
+                 return;  
+               }
+               for (const RefPtr<Promise>& promise : promises) {
+                 if (aLocalDevices.IsReject()) {
+                   aLocalDevices.RejectValue()->Reject(promise);
+                 } else {
+                   ResolveEnumerateDevicesPromise(
+                       promise, *aLocalDevices.ResolveValue());
+                 }
+               }
+             });
+}
+
+void MediaDevices::ResolveEnumerateDevicesPromise(
+    Promise* aPromise, const LocalMediaDeviceSet& aDevices) const {
+  nsCOMPtr<nsPIDOMWindowInner> window = GetOwnerWindow();
+  auto windowId = window->WindowID();
+  nsTArray<RefPtr<MediaDeviceInfo>> infos;
+  bool legacy = IsLegacyMode(window);
+  bool capturePermitted =
+      legacy &&
+      MediaManager::Get()->IsActivelyCapturingOrHasAPermission(windowId);
+
+  for (const RefPtr<LocalMediaDevice>& device : aDevices) {
+    bool exposeInfo = CanExposeInfo(device->Kind()) || legacy;
+    bool exposeLabel = legacy ? capturePermitted : exposeInfo;
+    infos.AppendElement(MakeRefPtr<MediaDeviceInfo>(
+        exposeInfo ? device->mID : u""_ns, device->Kind(),
+        exposeLabel ? device->mName : u""_ns,
+        exposeInfo ? device->mGroupID : u""_ns));
+  }
+  aPromise->MaybeResolve(std::move(infos));
+}
+
+already_AddRefed<Promise> MediaDevices::GetDisplayMedia(
+    const DisplayMediaStreamConstraints& aConstraints, CallerType aCallerType,
+    ErrorResult& aRv) {
+  nsCOMPtr<nsIGlobalObject> global = xpc::NativeGlobal(GetWrapper());
+  RefPtr<Promise> p = Promise::Create(global, aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+  nsCOMPtr<nsPIDOMWindowInner> owner = do_QueryInterface(global);
+  WindowContext* wc = owner->GetWindowContext();
+  if (!wc || !wc->HasValidTransientUserGestureActivation()) {
+    p->MaybeRejectWithInvalidStateError(
+        "getDisplayMedia requires transient activation from a user gesture.");
+    return p.forget();
+  }
+  if (!MediaManager::IsOn(aConstraints.mVideo)) {
+    p->MaybeRejectWithTypeError("video is required");
+    return p.forget();
+  }
+  MediaStreamConstraints c;
+  auto& vc = c.mVideo.SetAsMediaTrackConstraints();
+
+  if (aConstraints.mVideo.IsMediaTrackConstraints()) {
+    vc = aConstraints.mVideo.GetAsMediaTrackConstraints();
+    if (vc.mAdvanced.WasPassed()) {
+      p->MaybeRejectWithTypeError("advanced not allowed");
+      return p.forget();
+    }
+    auto getCLR = [](const auto& aCon) -> const ConstrainLongRange& {
+      static ConstrainLongRange empty;
+      return (aCon.WasPassed() && !aCon.Value().IsLong())
+                 ? aCon.Value().GetAsConstrainLongRange()
+                 : empty;
+    };
+    auto getCDR = [](auto&& aCon) -> const ConstrainDoubleRange& {
+      static ConstrainDoubleRange empty;
+      return (aCon.WasPassed() && !aCon.Value().IsDouble())
+                 ? aCon.Value().GetAsConstrainDoubleRange()
+                 : empty;
+    };
+    const auto& w = getCLR(vc.mWidth);
+    const auto& h = getCLR(vc.mHeight);
+    const auto& f = getCDR(vc.mFrameRate);
+    if (w.mMin.WasPassed() || h.mMin.WasPassed() || f.mMin.WasPassed()) {
+      p->MaybeRejectWithTypeError("min not allowed");
+      return p.forget();
+    }
+    if (w.mExact.WasPassed() || h.mExact.WasPassed() || f.mExact.WasPassed()) {
+      p->MaybeRejectWithTypeError("exact not allowed");
+      return p.forget();
+    }
+    const char* badConstraint = nullptr;
+    if (w.mMax.WasPassed() && w.mMax.Value() < 1) {
+      badConstraint = "width";
+    }
+    if (h.mMax.WasPassed() && h.mMax.Value() < 1) {
+      badConstraint = "height";
+    }
+    if (f.mMax.WasPassed() && f.mMax.Value() < 1) {
+      badConstraint = "frameRate";
+    }
+    if (badConstraint) {
+      p->MaybeReject(MakeRefPtr<dom::MediaStreamError>(
+          owner, *MakeRefPtr<MediaMgrError>(
+                     MediaMgrError::Name::OverconstrainedError, "",
+                     NS_ConvertASCIItoUTF16(badConstraint))));
+      return p.forget();
+    }
+  }
+  if (!owner->IsFullyActive()) {
+    p->MaybeRejectWithInvalidStateError("The document is not fully active.");
+    return p.forget();
+  }
+  vc.mMediaSource.Reset();
+  vc.mMediaSource.Construct().AssignASCII(
+      dom::GetEnumString(MediaSourceEnum::Screen));
+
+  RefPtr<MediaDevices> self(this);
+  MediaManager::Get()
+      ->GetUserMedia(owner, c, aCallerType)
+      ->Then(
+          GetCurrentSerialEventTarget(), __func__,
+          [this, self, p](RefPtr<DOMMediaStream>&& aStream) {
+            if (!GetWindowIfCurrent()) {
+              return;  
+            }
+            p->MaybeResolve(std::move(aStream));
+          },
+          [this, self, p](RefPtr<MediaMgrError>&& error) {
+            nsPIDOMWindowInner* window = GetWindowIfCurrent();
+            if (!window) {
+              return;  
+            }
+            error->Reject(p);
+          });
+  return p.forget();
+}
+
+already_AddRefed<Promise> MediaDevices::SelectAudioOutput(
+    const AudioOutputOptions& aOptions, CallerType aCallerType,
+    ErrorResult& aRv) {
+  nsCOMPtr<nsIGlobalObject> global = xpc::NativeGlobal(GetWrapper());
+  RefPtr<Promise> p = Promise::Create(global, aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+  nsCOMPtr<nsPIDOMWindowInner> owner = do_QueryInterface(global);
+  WindowContext* wc = owner->GetWindowContext();
+  if (!wc || !wc->HasValidTransientUserGestureActivation()) {
+    p->MaybeRejectWithInvalidStateError(
+        "selectAudioOutput requires transient user activation.");
+    return p.forget();
+  }
+  RefPtr<MediaDevices> self(this);
+  MediaManager::Get()
+      ->SelectAudioOutput(owner, aOptions, aCallerType)
+      ->Then(
+          GetCurrentSerialEventTarget(), __func__,
+          [this, self, p](RefPtr<LocalMediaDevice> aDevice) {
+            nsPIDOMWindowInner* window = GetWindowIfCurrent();
+            if (!window) {
+              return;  
+            }
+            MOZ_ASSERT(aDevice->Kind() == dom::MediaDeviceKind::Audiooutput);
+            mExplicitlyGrantedAudioOutputRawIds.Insert(aDevice->RawID());
+            p->MaybeResolve(
+                MakeRefPtr<MediaDeviceInfo>(aDevice->mID, aDevice->Kind(),
+                                            aDevice->mName, aDevice->mGroupID));
+          },
+          [this, self, p](const RefPtr<MediaMgrError>& error) {
+            nsPIDOMWindowInner* window = GetWindowIfCurrent();
+            if (!window) {
+              return;  
+            }
+            error->Reject(p);
+          });
+  return p.forget();
+}
+
+static RefPtr<AudioDeviceInfo> CopyWithNullDeviceId(
+    AudioDeviceInfo* aDeviceInfo) {
+  MOZ_ASSERT(aDeviceInfo->Preferred());
+
+  nsString vendor;
+  aDeviceInfo->GetVendor(vendor);
+  uint16_t type;
+  aDeviceInfo->GetType(&type);
+  uint16_t state;
+  aDeviceInfo->GetState(&state);
+  uint16_t pref;
+  aDeviceInfo->GetPreferred(&pref);
+  uint16_t supportedFormat;
+  aDeviceInfo->GetSupportedFormat(&supportedFormat);
+  uint16_t defaultFormat;
+  aDeviceInfo->GetDefaultFormat(&defaultFormat);
+  uint32_t maxChannels;
+  aDeviceInfo->GetMaxChannels(&maxChannels);
+  uint32_t defaultRate;
+  aDeviceInfo->GetDefaultRate(&defaultRate);
+  uint32_t maxRate;
+  aDeviceInfo->GetMaxRate(&maxRate);
+  uint32_t minRate;
+  aDeviceInfo->GetMinRate(&minRate);
+  uint32_t maxLatency;
+  aDeviceInfo->GetMaxLatency(&maxLatency);
+  uint32_t minLatency;
+  aDeviceInfo->GetMinLatency(&minLatency);
+
+  return MakeRefPtr<AudioDeviceInfo>(
+      nullptr, aDeviceInfo->Name(), aDeviceInfo->GroupID(), vendor, type, state,
+      pref, supportedFormat, defaultFormat, maxChannels, defaultRate, maxRate,
+      minRate, maxLatency, minLatency);
+}
+
+RefPtr<MediaDevices::SinkInfoPromise> MediaDevices::GetSinkDevice(
+    const nsString& aDeviceId) {
+  MOZ_ASSERT(NS_IsMainThread());
+  return MediaManager::Get()
+      ->GetPhysicalDevices()
+      ->Then(
+          GetCurrentSerialEventTarget(), __func__,
+          [self = RefPtr(this), this,
+           aDeviceId](RefPtr<const MediaDeviceSetRefCnt> aRawDevices) {
+            nsCOMPtr<nsPIDOMWindowInner> window = GetOwnerWindow();
+            if (!window) {
+              return LocalDeviceSetPromise::CreateAndReject(
+                  new MediaMgrError(MediaMgrError::Name::AbortError), __func__);
+            }
+            RefPtr devices = aDeviceId.IsEmpty()
+                                 ? std::move(aRawDevices)
+                                 : FilterExposedDevices(*aRawDevices);
+            return MediaManager::Get()->AnonymizeDevices(window,
+                                                         std::move(devices));
+          },
+          [](RefPtr<MediaMgrError>&& reason) {
+            MOZ_ASSERT_UNREACHABLE("GetPhysicalDevices does not reject");
+            return RefPtr<LocalDeviceSetPromise>();
+          })
+      ->Then(
+          GetCurrentSerialEventTarget(), __func__,
+          [aDeviceId](RefPtr<LocalMediaDeviceSetRefCnt> aDevices) {
+            RefPtr<AudioDeviceInfo> outputInfo;
+            for (const RefPtr<LocalMediaDevice>& device : *aDevices) {
+              if (device->Kind() != dom::MediaDeviceKind::Audiooutput) {
+                continue;
+              }
+              if (aDeviceId.IsEmpty()) {
+                MOZ_ASSERT(device->GetAudioDeviceInfo()->Preferred(),
+                           "First Audiooutput should be preferred");
+                return SinkInfoPromise::CreateAndResolve(
+                    CopyWithNullDeviceId(device->GetAudioDeviceInfo()),
+                    __func__);
+              } else if (aDeviceId.Equals(device->mID)) {
+                return SinkInfoPromise::CreateAndResolve(
+                    device->GetAudioDeviceInfo(), __func__);
+              }
+            }
+            return SinkInfoPromise::CreateAndReject(NS_ERROR_NOT_AVAILABLE,
+                                                    __func__);
+          },
+          [](RefPtr<MediaMgrError>&& aError) {
+            return SinkInfoPromise::CreateAndReject(NS_ERROR_NOT_AVAILABLE,
+                                                    __func__);
+          });
+}
+
+NS_IMPL_ISUPPORTS_CYCLE_COLLECTION_INHERITED_0(MediaDevices,
+                                               DOMEventTargetHelper)
+NS_IMPL_CYCLE_COLLECTION_INHERITED(MediaDevices, DOMEventTargetHelper,
+                                   mPendingEnumerateDevicesPromises)
+
+void MediaDevices::OnDeviceChange() {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (NS_FAILED(CheckCurrentGlobalCorrectness())) {
+    return;
+  }
+
+  mHaveUnprocessedDeviceListChange = true;
+  MaybeResumeDeviceExposure();
+}
+
+mozilla::dom::EventHandlerNonNull* MediaDevices::GetOndevicechange() {
+  return GetEventHandler(nsGkAtoms::ondevicechange);
+}
+
+void MediaDevices::SetupDeviceChangeListener() {
+  if (mIsDeviceChangeListenerSetUp) {
+    return;
+  }
+
+  nsPIDOMWindowInner* window = GetOwnerWindow();
+  if (!window) {
+    return;
+  }
+
+  mDeviceChangeListener = MediaManager::Get()->DeviceListChangeEvent().Connect(
+      GetMainThreadSerialEventTarget(), this, &MediaDevices::OnDeviceChange);
+  mIsDeviceChangeListenerSetUp = true;
+
+  MediaManager::Get()->GetPhysicalDevices()->Then(
+      GetCurrentSerialEventTarget(), __func__,
+      [self = RefPtr(this), this](RefPtr<const MediaDeviceSetRefCnt> aDevices) {
+        mLastPhysicalDevices = std::move(aDevices);
+      },
+      [](RefPtr<MediaMgrError>&& reason) {
+        MOZ_ASSERT_UNREACHABLE("GetPhysicalDevices does not reject");
+      });
+}
+
+void MediaDevices::SetOndevicechange(
+    mozilla::dom::EventHandlerNonNull* aCallback) {
+  SetEventHandler(nsGkAtoms::ondevicechange, aCallback);
+}
+
+void MediaDevices::EventListenerAdded(nsAtom* aType) {
+  DOMEventTargetHelper::EventListenerAdded(aType);
+  SetupDeviceChangeListener();
+}
+
+JSObject* MediaDevices::WrapObject(JSContext* aCx,
+                                   JS::Handle<JSObject*> aGivenProto) {
+  return MediaDevices_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+}  

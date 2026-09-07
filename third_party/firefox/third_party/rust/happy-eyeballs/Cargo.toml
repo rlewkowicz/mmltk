@@ -1,0 +1,29 @@
+
+[package]
+edition = "2024"
+rust-version = "1.85.0"
+name = "happy-eyeballs"
+version = "0.10.0"
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "happy_eyeballs"
+path = "src/lib.rs"
+
+[dependencies.log]
+version = "0.4"
+default-features = false
+
+[dependencies.thiserror]
+version = "2.0.12"
+default-features = false
+
+[dependencies.url]
+version = "2.5.7"
+default-features = false

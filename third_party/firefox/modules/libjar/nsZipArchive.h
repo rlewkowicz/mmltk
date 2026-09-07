@@ -1,0 +1,238 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(nsZipArchive_h_)
+#define nsZipArchive_h_
+
+#define ZIP_TABSIZE 256
+#define ZIP_BUFLEN \
+  (4 * 1024) 
+
+#include "zlib.h"
+#include "zipstruct.h"
+#include "nsIFile.h"
+#include "nsISupportsImpl.h"  // For mozilla::ThreadSafeAutoRefCnt
+#include "mozilla/ArenaAllocator.h"
+#include "mozilla/FileUtils.h"
+#include "mozilla/FileLocation.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/UniquePtr.h"
+
+class nsZipFind;
+struct PRFileDesc;
+
+
+class nsZipItem final {
+ public:
+  nsZipItem();
+
+  const char* Name() { return ((const char*)central) + ZIPCENTRAL_SIZE; }
+
+  uint32_t LocalOffset();
+  uint32_t Size();
+  uint32_t RealSize();
+  uint32_t CRC32();
+  uint16_t Date();
+  uint16_t Time();
+  uint16_t Compression();
+  bool IsDirectory();
+  uint16_t Mode();
+  const uint8_t* GetExtraField(uint16_t aTag, uint16_t* aBlockSize);
+  PRTime LastModTime();
+
+  nsZipItem* next;
+  const ZipCentral* central;
+  uint16_t nameLength;
+  bool isSynthetic;
+};
+
+class nsZipHandle;
+
+class nsZipArchive final {
+  friend class nsZipFind;
+
+  ~nsZipArchive();
+
+ public:
+  nsZipArchive& operator=(const nsZipArchive& rhs) = delete;
+  nsZipArchive(const nsZipArchive& rhs) = delete;
+
+  static const char* sFileCorruptedReason;
+
+  static already_AddRefed<nsZipArchive> OpenArchive(nsZipHandle* aZipHandle,
+                                                    PRFileDesc* aFd = nullptr);
+
+  static already_AddRefed<nsZipArchive> OpenArchive(nsIFile* aFile);
+
+  nsresult Test(const nsACString& aEntryName);
+
+  nsZipItem* GetItem(const nsACString& aEntryName);
+
+  nsresult ExtractFile(nsZipItem* zipEntry, nsIFile* outFile,
+                       PRFileDesc* outFD);
+
+  nsresult FindInit(const char* aPattern, nsZipFind** aFind);
+
+  nsZipHandle* GetFD() const;
+
+  uint32_t GetDataOffset(nsZipItem* aItem);
+
+  const uint8_t* GetData(nsZipItem* aItem);
+
+  int64_t SizeOfMapping();
+
+  NS_METHOD_(MozExternalRefCountType) AddRef(void);
+  NS_METHOD_(MozExternalRefCountType) Release(void);
+
+ private:
+  nsZipArchive(nsZipHandle* aZipHandle, PRFileDesc* aFd, nsresult& aRv);
+
+  mozilla::ThreadSafeAutoRefCnt mRefCnt; 
+  NS_DECL_OWNINGTHREAD
+
+  const RefPtr<nsZipHandle> mFd;
+  nsCString mURI;
+  bool mUseZipLog;
+
+  mozilla::Mutex mLock{"nsZipArchive"};
+  nsZipItem* mFiles[ZIP_TABSIZE] MOZ_GUARDED_BY(mLock);
+  mozilla::ArenaAllocator<1024, sizeof(void*)> mArena MOZ_GUARDED_BY(mLock);
+  bool mBuiltSynthetics MOZ_GUARDED_BY(mLock);
+
+ private:
+  nsZipItem* CreateZipItem() MOZ_REQUIRES(mLock);
+  nsresult BuildFileList(PRFileDesc* aFd = nullptr);
+  nsresult BuildSynthetics();
+};
+
+class nsZipFind final {
+ public:
+  nsZipFind(nsZipArchive* aZip, char* aPattern, bool regExp);
+  ~nsZipFind();
+
+  nsZipFind& operator=(const nsZipFind& rhs) = delete;
+  nsZipFind(const nsZipFind& rhs) = delete;
+
+  nsresult FindNext(const char** aResult, uint16_t* aNameLen);
+
+ private:
+  RefPtr<nsZipArchive> mArchive;
+  char* mPattern;
+  nsZipItem* mItem;
+  uint16_t mSlot;
+  bool mRegExp;
+};
+
+class nsZipCursor final {
+ public:
+  nsZipCursor(nsZipItem* aItem, nsZipArchive* aZip, uint8_t* aBuf = nullptr,
+              uint32_t aBufSize = 0, bool doCRC = false);
+
+  ~nsZipCursor();
+
+  uint8_t* Read(uint32_t* aBytesRead) { return ReadOrCopy(aBytesRead, false); }
+
+  uint8_t* Copy(uint32_t* aBytesRead) { return ReadOrCopy(aBytesRead, true); }
+
+ private:
+  uint8_t* ReadOrCopy(uint32_t* aBytesRead, bool aCopy);
+
+  nsZipItem* mItem;
+  uint8_t* mBuf;
+  uint32_t mBufSize;
+  z_stream mZs;
+  uint32_t mCRC;
+  bool mDoCRC;
+};
+
+class nsZipItemPtr_base {
+ public:
+  nsZipItemPtr_base(nsZipArchive* aZip, const nsACString& aEntryName,
+                    bool doCRC);
+
+  uint32_t Length() const { return mReadlen; }
+
+ protected:
+  RefPtr<nsZipHandle> mZipHandle;
+  mozilla::UniquePtr<uint8_t[]> mAutoBuf;
+  uint8_t* mReturnBuf;
+  uint32_t mReadlen;
+};
+
+template <class T>
+class nsZipItemPtr final : public nsZipItemPtr_base {
+  static_assert(sizeof(T) == sizeof(char),
+                "This class cannot be used with larger T without re-examining"
+                " a number of assumptions.");
+
+ public:
+  nsZipItemPtr(nsZipArchive* aZip, const nsACString& aEntryName,
+               bool doCRC = false)
+      : nsZipItemPtr_base(aZip, aEntryName, doCRC) {}
+  const T* Buffer() const { return (const T*)mReturnBuf; }
+
+  operator const T*() const { return Buffer(); }
+
+  mozilla::UniquePtr<T[]> Forget() {
+    if (!mReturnBuf) return nullptr;
+    if (mAutoBuf.get() == mReturnBuf) {
+      mReturnBuf = nullptr;
+      return mozilla::UniquePtr<T[]>(reinterpret_cast<T*>(mAutoBuf.release()));
+    }
+    auto ret = mozilla::MakeUnique<T[]>(Length());
+    memcpy(ret.get(), mReturnBuf, Length());
+    mReturnBuf = nullptr;
+    return ret;
+  }
+};
+
+class nsZipHandle final {
+  friend class nsZipArchive;
+  friend class nsZipFind;
+  friend class mozilla::FileLocation;
+  friend class nsJARInputStream;
+#if defined(XP_UNIX) && !0
+  friend class MmapAccessScope;
+#endif
+
+ public:
+  static nsresult Init(nsIFile* file, nsZipHandle** ret,
+                       PRFileDesc** aFd = nullptr);
+  static nsresult Init(nsZipArchive* zip, const nsACString& entry,
+                       nsZipHandle** ret);
+  static nsresult Init(const uint8_t* aData, uint32_t aLen, nsZipHandle** aRet);
+
+  NS_METHOD_(MozExternalRefCountType) AddRef(void);
+  NS_METHOD_(MozExternalRefCountType) Release(void);
+
+  int64_t SizeOfMapping();
+
+  nsresult GetNSPRFileDesc(PRFileDesc** aNSPRFileDesc);
+
+ protected:
+  const uint8_t* mFileData;    
+  uint32_t mLen;               
+  mozilla::FileLocation mFile; 
+
+ private:
+  nsZipHandle();
+  ~nsZipHandle();
+
+  nsresult findDataStart();
+
+  PRFileMap* mMap; 
+  mozilla::AutoFDClose mNSPRFileDesc;
+  mozilla::UniquePtr<nsZipItemPtr<uint8_t> > mBuf;
+  mozilla::ThreadSafeAutoRefCnt mRefCnt; 
+  NS_DECL_OWNINGTHREAD
+
+  const uint8_t* mFileStart; 
+  uint32_t mTotalLen;        
+
+  static const uint32_t kCRXMagic = 0x34327243;
+};
+
+nsresult gZlibInit(z_stream* zs);
+
+#endif

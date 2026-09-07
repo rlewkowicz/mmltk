@@ -1,0 +1,46 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_QUOTA_DATE_H_
+#define DOM_QUOTA_DATE_H_
+
+#include "mozilla/CheckedInt.h"
+#include "mozilla/dom/quota/Constants.h"
+#include "prtime.h"
+
+namespace mozilla::dom::quota {
+
+class Date final {
+ public:
+  static Date FromDays(int32_t aValue) { return Date(aValue); }
+
+  static Date FromTimestamp(int64_t aTimestamp) {
+    CheckedInt32 value =
+        (CheckedInt64(aTimestamp) / PR_USEC_PER_SEC / kSecPerDay)
+            .toChecked<int32_t>();
+    MOZ_ASSERT(value.isValid());
+
+    return Date(value.value());
+  }
+
+  static Date Today() { return Date(FromTimestamp(PR_Now())); }
+
+  int32_t ToDays() const { return mValue; }
+
+  bool operator==(const Date& aOther) const { return mValue == aOther.mValue; }
+  bool operator!=(const Date& aOther) const { return mValue != aOther.mValue; }
+  bool operator<(const Date& aOther) const { return mValue < aOther.mValue; }
+  bool operator<=(const Date& aOther) const { return mValue <= aOther.mValue; }
+  bool operator>(const Date& aOther) const { return mValue > aOther.mValue; }
+  bool operator>=(const Date& aOther) const { return mValue >= aOther.mValue; }
+
+ private:
+  explicit Date(int32_t aValue) : mValue(aValue) {}
+
+  int32_t mValue;
+};
+
+}  
+
+#endif  // DOM_QUOTA_DATE_H_

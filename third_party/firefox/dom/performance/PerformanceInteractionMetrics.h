@@ -1,0 +1,71 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_PerformanceInteractionMetrics_h_
+#define mozilla_dom_PerformanceInteractionMetrics_h_
+
+#include "PerformanceEventTiming.h"
+#include "nsHashtablesFwd.h"
+
+namespace mozilla::dom {
+
+class PerformanceInteractionMetrics final {
+ public:
+  PerformanceInteractionMetrics();
+
+  PerformanceInteractionMetrics(const PerformanceInteractionMetrics& aCopy) =
+      delete;
+  PerformanceInteractionMetrics& operator=(
+      const PerformanceInteractionMetrics& aCopy) = delete;
+
+  Maybe<uint64_t> ComputeInteractionId(PerformanceEventTiming* aEventTiming,
+                                       const WidgetEvent* aEvent);
+
+  nsTHashMap<uint32_t, RefPtr<PerformanceEventTiming>>& PendingKeyDowns() {
+    return mPendingKeyDowns;
+  }
+  nsTHashMap<uint32_t, RefPtr<PerformanceEventTiming>>& PendingPointerDowns() {
+    return mPendingPointerDowns;
+  }
+
+  uint64_t InteractionCount() { return mInteractionCount; }
+
+  uint64_t IncreaseInteractionValueAndCount();
+
+  virtual ~PerformanceInteractionMetrics() = default;
+
+ private:
+  nsTHashMap<uint32_t, RefPtr<PerformanceEventTiming>> mPendingKeyDowns;
+
+  nsTHashMap<uint32_t, RefPtr<PerformanceEventTiming>> mPendingPointerDowns;
+
+  nsTHashMap<uint32_t, uint32_t> mPointerInteractionValueMap;
+
+  uint64_t mInteractionCount = 0;
+
+  uint64_t mCurrentInteractionValue;
+
+  Maybe<uint64_t> mLastKeydownInteractionValue;
+
+  bool mContextMenuTriggered = false;
+};
+
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback,
+    PerformanceInteractionMetrics& aMetrics, const char* aName,
+    uint32_t aFlags = 0) {
+  ImplCycleCollectionTraverse(aCallback, aMetrics.PendingKeyDowns(), aName,
+                              aFlags);
+  ImplCycleCollectionTraverse(aCallback, aMetrics.PendingPointerDowns(), aName,
+                              aFlags);
+}
+
+inline void ImplCycleCollectionUnlink(PerformanceInteractionMetrics& aMetrics) {
+  aMetrics.PendingKeyDowns().Clear();
+  aMetrics.PendingPointerDowns().Clear();
+}
+
+}  
+
+#endif  // mozilla_dom_PerformanceInteractionMetrics_h_

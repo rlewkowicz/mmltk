@@ -1,0 +1,101 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(MAR_H_)
+#define MAR_H_
+
+#include <assert.h>  // for C11 static_assert
+#include <stdint.h>
+#include <stdio.h>
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+#define MAX_SIGNATURES 8
+static_assert(MAX_SIGNATURES <= 9, "too many signatures");
+
+struct ProductInformationBlock {
+  const char* MARChannelID;
+  const char* productVersion;
+};
+
+typedef struct MarItem_ {
+  struct MarItem_* next; 
+  uint32_t offset;       
+  uint32_t length;       
+  uint32_t flags;        
+  char name[1];          
+} MarItem;
+
+typedef struct SeenIndex_ {
+  struct SeenIndex_* next; 
+  uint32_t offset;         
+  uint32_t length;         
+} SeenIndex;
+
+#define TABLESIZE 256
+
+struct MarFile_ {
+  unsigned char* buffer;          
+  size_t data_len;                
+  MarItem* item_table[TABLESIZE]; 
+  SeenIndex* index_list;          
+  int item_table_is_valid;        
+};
+
+typedef struct MarFile_ MarFile;
+
+typedef int (*MarItemCallback)(MarFile* mar, const MarItem* item, void* data);
+
+enum MarReadResult_ {
+  MAR_READ_SUCCESS,
+  MAR_IO_ERROR,
+  MAR_MEM_ERROR,
+  MAR_FILE_TOO_BIG_ERROR,
+};
+
+typedef enum MarReadResult_ MarReadResult;
+
+MarReadResult mar_open(const char* path, MarFile** out_mar);
+
+
+void mar_close(MarFile* mar);
+
+int mar_read_buffer(MarFile* mar, void* dest, size_t* position, size_t size);
+
+int mar_read_buffer_max(MarFile* mar, void* dest, size_t* position,
+                        size_t size);
+
+int mar_buffer_seek(MarFile* mar, size_t* position, size_t distance);
+
+const MarItem* mar_find_item(MarFile* mar, const char* item);
+
+int mar_enum_items(MarFile* mar, MarItemCallback callback, void* data);
+
+int mar_read(MarFile* mar, const MarItem* item, int offset, uint8_t* buf,
+             int bufsize);
+
+int mar_create(const char* dest, int numfiles, char** files,
+               struct ProductInformationBlock* infoBlock);
+
+int mar_extract(const char* path);
+
+#define MAR_MAX_CERT_SIZE (16 * 1024)  // Way larger than necessary
+
+int mar_read_entire_file(const char* filePath, uint32_t maxSize,
+                          const uint8_t** data,
+                          uint32_t* size);
+
+int mar_verify_signatures(MarFile* mar, const uint8_t* const* certData,
+                          const uint32_t* certDataSizes, uint32_t certCount);
+
+int mar_read_product_info_block(MarFile* mar,
+                                struct ProductInformationBlock* infoBlock);
+
+#if defined(__cplusplus)
+}
+#endif
+
+#endif

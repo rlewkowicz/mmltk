@@ -1,0 +1,12 @@
+
+[package]
+name = "ioctl-sys"
+version = "0.7.1"
+authors = ["Cody P Schafer <dev@codyps.com>", "Corey Richardson <corey@octayn.net>"]
+include = ["Cargo.toml", "**/*.rs"]
+description = "IO Control for POSIX-and-beyond systems (core fn & macros, see `ioctls` for many ioctl definitions)"
+documentation = "https://docs.rs/ioctl-sys"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/jmesmon/ioctl"
+
+[dependencies]

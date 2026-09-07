@@ -1,0 +1,206 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef AudioNode_h_
+#define AudioNode_h_
+
+#include "AudioContext.h"
+#include "MediaTrackGraph.h"
+#include "SelfRef.h"
+#include "WebAudioUtils.h"
+#include "mozilla/DOMEventTargetHelper.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/dom/AudioNodeBinding.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsPrintfCString.h"
+#include "nsTArray.h"
+#include "nsWeakReference.h"
+
+namespace mozilla {
+
+class AbstractThread;
+
+namespace dom {
+
+class AudioContext;
+class AudioBufferSourceNode;
+class AudioParam;
+class AudioParamTimeline;
+struct ThreeDPoint;
+
+class AudioNode : public DOMEventTargetHelper, public nsSupportsWeakReference {
+ protected:
+  virtual ~AudioNode();
+
+ public:
+  AudioNode(AudioContext* aContext, uint32_t aChannelCount,
+            ChannelCountMode aChannelCountMode,
+            ChannelInterpretation aChannelInterpretation);
+
+  virtual void DestroyMediaTrack();
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(AudioNode, DOMEventTargetHelper)
+
+  virtual AudioBufferSourceNode* AsAudioBufferSourceNode() { return nullptr; }
+
+  AudioContext* GetParentObject() const { return mContext; }
+
+  AudioContext* Context() const { return mContext; }
+
+  virtual AudioNode* Connect(AudioNode& aDestination, uint32_t aOutput,
+                             uint32_t aInput, ErrorResult& aRv);
+
+  virtual void Connect(AudioParam& aDestination, uint32_t aOutput,
+                       ErrorResult& aRv);
+
+  virtual void Disconnect(ErrorResult& aRv);
+  virtual void Disconnect(uint32_t aOutput, ErrorResult& aRv);
+  virtual void Disconnect(AudioNode& aDestination, ErrorResult& aRv);
+  virtual void Disconnect(AudioNode& aDestination, uint32_t aOutput,
+                          ErrorResult& aRv);
+  virtual void Disconnect(AudioNode& aDestination, uint32_t aOutput,
+                          uint32_t aInput, ErrorResult& aRv);
+  virtual void Disconnect(AudioParam& aDestination, ErrorResult& aRv);
+  virtual void Disconnect(AudioParam& aDestination, uint32_t aOutput,
+                          ErrorResult& aRv);
+
+  virtual void NotifyInputsChanged() {}
+  virtual void NotifyHasPhantomInput() {}
+
+  virtual uint16_t NumberOfInputs() const { return 1; }
+  virtual uint16_t NumberOfOutputs() const { return 1; }
+
+  uint32_t Id() const { return mId; }
+
+  bool PassThrough() const;
+  void SetPassThrough(bool aPassThrough);
+
+  uint32_t ChannelCount() const { return mChannelCount; }
+  virtual void SetChannelCount(uint32_t aChannelCount, ErrorResult& aRv) {
+    if (aChannelCount == 0 || aChannelCount > WebAudioUtils::MaxChannelCount) {
+      aRv.ThrowNotSupportedError(
+          nsPrintfCString("Channel count (%u) must be in the range [1, max "
+                          "supported channel count]",
+                          aChannelCount));
+      return;
+    }
+    mChannelCount = aChannelCount;
+    SendChannelMixingParametersToTrack();
+  }
+  ChannelCountMode ChannelCountModeValue() const { return mChannelCountMode; }
+  virtual void SetChannelCountModeValue(ChannelCountMode aMode,
+                                        ErrorResult& aRv) {
+    mChannelCountMode = aMode;
+    SendChannelMixingParametersToTrack();
+  }
+  ChannelInterpretation ChannelInterpretationValue() const {
+    return mChannelInterpretation;
+  }
+  virtual void SetChannelInterpretationValue(ChannelInterpretation aMode,
+                                             ErrorResult& aRv) {
+    mChannelInterpretation = aMode;
+    SendChannelMixingParametersToTrack();
+  }
+
+  struct InputNode final {
+    InputNode() = default;
+    InputNode(const InputNode&) = delete;
+    InputNode(InputNode&&) = default;
+
+    ~InputNode() {
+      if (mTrackPort) {
+        mTrackPort->Destroy();
+      }
+    }
+
+    size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const {
+      size_t amount = 0;
+      if (mTrackPort) {
+        amount += mTrackPort->SizeOfIncludingThis(aMallocSizeOf);
+      }
+
+      return amount;
+    }
+
+    AudioNode* MOZ_NON_OWNING_REF mInputNode;
+    RefPtr<MediaInputPort> mTrackPort;
+    uint32_t mInputPort;
+    uint32_t mOutputPort;
+  };
+
+  AudioNodeTrack* GetTrack() const { return mTrack; }
+
+  const nsTArray<InputNode>& InputNodes() const { return mInputNodes; }
+  const nsTArray<RefPtr<AudioNode>>& OutputNodes() const {
+    return mOutputNodes;
+  }
+  const nsTArray<RefPtr<AudioParam>>& OutputParams() const {
+    return mOutputParams;
+  }
+
+  template <typename T>
+  const nsTArray<InputNode>& InputsForDestination(uint32_t aOutputIndex) const;
+
+  void RemoveOutputParam(AudioParam* aParam);
+
+  void MarkActive() { Context()->RegisterActiveNode(this); }
+  void MarkInactive() { Context()->UnregisterActiveNode(this); }
+
+  virtual size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const;
+  virtual size_t SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const;
+
+  virtual const char* NodeType() const = 0;
+
+  const nsTArray<RefPtr<AudioParam>>& GetAudioParams() const { return mParams; }
+
+ private:
+  template <typename DestinationType, typename Predicate>
+  bool DisconnectMatchingDestinationInputs(uint32_t aDestinationIndex,
+                                           Predicate aPredicate);
+
+  virtual void LastRelease() override {
+    DisconnectFromGraph();
+  }
+  void DisconnectFromGraph();
+
+  template <typename DestinationType>
+  bool DisconnectFromOutputIfConnected(uint32_t aOutputIndex,
+                                       uint32_t aInputIndex);
+
+ protected:
+  void Initialize(const AudioNodeOptions& aOptions, ErrorResult& aRv);
+
+  void SendDoubleParameterToTrack(uint32_t aIndex, double aValue);
+  void SendInt32ParameterToTrack(uint32_t aIndex, int32_t aValue);
+  void SendChannelMixingParametersToTrack();
+
+ private:
+  RefPtr<AudioContext> mContext;
+
+ protected:
+  RefPtr<AudioNodeTrack> mTrack;
+
+  nsTArray<RefPtr<AudioParam>> mParams;
+  AudioParam* CreateAudioParam(
+      uint32_t aIndex, const nsAString& aName, float aDefaultValue,
+      float aMinValue = std::numeric_limits<float>::lowest(),
+      float aMaxValue = std::numeric_limits<float>::max());
+
+ private:
+  nsTArray<InputNode> mInputNodes;
+  nsTArray<RefPtr<AudioNode>> mOutputNodes;
+  nsTArray<RefPtr<AudioParam>> mOutputParams;
+  uint32_t mChannelCount;
+  ChannelCountMode mChannelCountMode;
+  ChannelInterpretation mChannelInterpretation;
+  const uint32_t mId;
+  bool mPassThrough;
+};
+
+}  
+}  
+
+#endif

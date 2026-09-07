@@ -1,0 +1,113 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef IPC_GLUE_ENUMSERIALIZER_H_
+#define IPC_GLUE_ENUMSERIALIZER_H_
+
+#include "chrome/common/ipc_message_utils.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/IntegerTypeTraits.h"
+#include "nsLiteralString.h"
+#include "nsString.h"
+#include "nsTLiteralString.h"
+
+class PickleIterator;
+
+namespace IPC {
+class Message;
+class MessageReader;
+class MessageWriter;
+}  
+
+#ifdef _MSC_VER
+#  pragma warning(disable : 4800)
+#endif
+
+namespace IPC {
+
+template <typename E, typename EnumValidator>
+struct EnumSerializer {
+  typedef E paramType;
+
+  typedef typename mozilla::UnsignedStdintTypeForSize<sizeof(paramType)>::Type
+      uintParamType;
+
+  static void Write(MessageWriter* aWriter, const paramType& aValue) {
+    MOZ_RELEASE_ASSERT(EnumValidator::IsLegalValue(
+        static_cast<std::underlying_type_t<paramType>>(aValue)));
+    WriteParam(aWriter, uintParamType(aValue));
+  }
+
+  static bool Read(MessageReader* aReader, paramType* aResult) {
+    uintParamType value;
+    if (!ReadParam(aReader, &value)) {
+      return false;
+    }
+    if (!EnumValidator::IsLegalValue(value)) {
+      return false;
+    }
+    *aResult = paramType(value);
+    return true;
+  }
+};
+
+template <typename E, E MinLegal, E HighBound>
+class ContiguousEnumValidator {
+  template <typename T>
+  static bool IsLessThanOrEqual(T a, T b) {
+    return a <= b;
+  }
+
+ public:
+  using IntegralType = std::underlying_type_t<E>;
+  static constexpr auto kMinLegalIntegral = static_cast<IntegralType>(MinLegal);
+  static constexpr auto kHighBoundIntegral =
+      static_cast<IntegralType>(HighBound);
+
+  static bool IsLegalValue(const IntegralType e) {
+    return IsLessThanOrEqual(kMinLegalIntegral, e) && e < kHighBoundIntegral;
+  }
+};
+
+template <typename E, E MinLegal, E MaxLegal>
+class ContiguousEnumValidatorInclusive {
+  template <typename T>
+  static bool IsLessThanOrEqual(T a, T b) {
+    return a <= b;
+  }
+
+ public:
+  using IntegralType = std::underlying_type_t<E>;
+  static constexpr auto kMinLegalIntegral = static_cast<IntegralType>(MinLegal);
+  static constexpr auto kMaxLegalIntegral = static_cast<IntegralType>(MaxLegal);
+
+  static bool IsLegalValue(const IntegralType e) {
+    return IsLessThanOrEqual(kMinLegalIntegral, e) && e <= kMaxLegalIntegral;
+  }
+};
+
+template <typename E, E AllBits>
+struct BitFlagsEnumValidator {
+  static bool IsLegalValue(const std::underlying_type_t<E> e) {
+    return (e & static_cast<std::underlying_type_t<E>>(AllBits)) == e;
+  }
+};
+
+template <typename E, E MinLegal, E HighBound>
+struct ContiguousEnumSerializer
+    : EnumSerializer<E, ContiguousEnumValidator<E, MinLegal, HighBound>> {};
+
+template <typename E, E MinLegal, E MaxLegal>
+struct ContiguousEnumSerializerInclusive
+    : EnumSerializer<E,
+                     ContiguousEnumValidatorInclusive<E, MinLegal, MaxLegal>> {
+};
+
+template <typename E, E AllBits>
+struct BitFlagsEnumSerializer
+    : EnumSerializer<E, BitFlagsEnumValidator<E, AllBits>> {};
+
+} 
+
+#endif /* IPC_GLUE_ENUMSERIALIZER_H_ */

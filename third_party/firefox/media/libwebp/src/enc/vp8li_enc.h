@@ -1,0 +1,101 @@
+// Copyright 2012 Google Inc. All Rights Reserved.
+// Use of this source code is governed by a BSD-style license
+
+#if !defined(WEBP_ENC_VP8LI_ENC_H_)
+#define WEBP_ENC_VP8LI_ENC_H_
+
+#if defined(HAVE_CONFIG_H)
+#include "src/webp/config.h"
+#endif
+
+#include <stddef.h>
+
+#if !defined(WEBP_NEAR_LOSSLESS)
+#define WEBP_NEAR_LOSSLESS 1
+#endif
+
+#include "src/webp/types.h"
+#include "src/enc/backward_references_enc.h"
+#include "src/enc/histogram_enc.h"
+#include "src/utils/bit_writer_utils.h"
+#include "src/webp/encode.h"
+#include "src/webp/format_constants.h"
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+#define MAX_TRANSFORM_BITS (MIN_TRANSFORM_BITS + (1 << NUM_TRANSFORM_BITS) - 1)
+
+typedef enum {
+  kEncoderNone = 0,
+  kEncoderARGB,
+  kEncoderNearLossless,
+  kEncoderPalette
+} VP8LEncoderARGBContent;
+
+typedef struct {
+  const WebPConfig* config;      
+  const WebPPicture* pic;        
+
+  uint32_t* argb;                       
+  VP8LEncoderARGBContent argb_content;  
+  uint32_t* argb_scratch;               
+  uint32_t* transform_data;             
+  uint32_t* transform_mem;              
+  size_t    transform_mem_size;         
+
+  int       current_width;       
+
+  int histo_bits;
+  int predictor_transform_bits;    
+  int cross_color_transform_bits;  
+  int cache_bits;        
+
+  int use_cross_color;
+  int use_subtract_green;
+  int use_predict;
+  int use_palette;
+  int palette_size;
+  uint32_t palette[MAX_PALETTE_SIZE];
+  uint32_t palette_sorted[MAX_PALETTE_SIZE];
+
+  struct VP8LBackwardRefs refs[4];  
+  VP8LHashChain hash_chain;         
+} VP8LEncoder;
+
+
+int VP8LEncodeImage(const WebPConfig* const config,
+                    const WebPPicture* const picture);
+
+int VP8LEncodeStream(const WebPConfig* const config,
+                     const WebPPicture* const picture, VP8LBitWriter* const bw);
+
+#if (WEBP_NEAR_LOSSLESS == 1)
+int VP8ApplyNearLossless(const WebPPicture* const picture, int quality,
+                         uint32_t* const argb_dst);
+#endif
+
+
+int VP8LResidualImage(int width, int height, int min_bits, int max_bits,
+                      int low_effort, uint32_t* const argb,
+                      uint32_t* const argb_scratch, uint32_t* const image,
+                      int near_lossless, int exact, int used_subtract_green,
+                      const WebPPicture* const pic, int percent_range,
+                      int* const percent, int* const best_bits);
+
+int VP8LColorSpaceTransform(int width, int height, int bits, int quality,
+                            uint32_t* const argb, uint32_t* image,
+                            const WebPPicture* const pic, int percent_range,
+                            int* const percent, int* const best_bits);
+
+void VP8LOptimizeSampling(uint32_t* const image, int full_width,
+                          int full_height, int bits, int max_bits,
+                          int* best_bits_out);
+
+
+#if defined(__cplusplus)
+}    
+#endif
+
+#endif

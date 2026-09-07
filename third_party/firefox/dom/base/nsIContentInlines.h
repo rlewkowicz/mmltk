@@ -1,0 +1,345 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsIContentInlines_h
+#define nsIContentInlines_h
+
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/dom/ChildIterator.h"
+#include "mozilla/dom/CustomElementRegistry.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/HTMLSlotElement.h"
+#include "mozilla/dom/ShadowRoot.h"
+#include "nsAtom.h"
+#include "nsContentUtils.h"
+#include "nsIContent.h"
+#include "nsIFrame.h"
+#include "nsINode.h"
+
+inline bool nsINode::HasScopedRegistry() const {
+  if (!mozilla::StaticPrefs::dom_scoped_custom_element_registries_enabled()) {
+    return false;
+  }
+  bool isScoped = false;
+  if (IsElement()) {
+    isScoped = AsElement()->GetCustomElementRegistryState() ==
+               CustomElementRegistryState::Scoped;
+  } else if (const auto* shadowRoot =
+                 mozilla::dom::ShadowRoot::FromNode(this)) {
+    isScoped = shadowRoot->GetCustomElementRegistryState() ==
+               CustomElementRegistryState::Scoped;
+  } else if (IsDocument()) {
+    isScoped = AsDocument()->HasScopedCustomElementRegistry();
+  }
+  MOZ_ASSERT(
+      isScoped == mozilla::dom::CustomElementRegistry::IsInScopedRegistryMap(
+                      const_cast<nsINode&>(*this)),
+      "scoped-registry check disagrees with the registry map");
+  return isScoped;
+}
+
+inline bool nsIContent::IsInHTMLDocument() const {
+  return OwnerDoc()->IsHTMLDocument();
+}
+
+inline bool nsIContent::IsInChromeDocument() const {
+  return nsContentUtils::IsChromeDoc(OwnerDoc());
+}
+
+inline void nsIContent::SetPrimaryFrame(nsIFrame* aFrame) {
+  MOZ_ASSERT(!aFrame || IsInUncomposedDoc() || IsInShadowTree(),
+             "This will end badly!");
+  MOZ_ASSERT(!aFrame || IsInComposedDoc(), "This will end badly!");
+
+  MOZ_ASSERT(IsHTMLElement(nsGkAtoms::area) || !aFrame || !mPrimaryFrame ||
+                 aFrame == mPrimaryFrame,
+             "Losing track of existing primary frame");
+
+  if (aFrame) {
+    MOZ_ASSERT(!aFrame->IsPlaceholderFrame());
+    if (MOZ_LIKELY(!IsHTMLElement(nsGkAtoms::area)) ||
+        aFrame->GetContent() == this) {
+      aFrame->SetIsPrimaryFrame(true);
+    }
+  } else if (nsIFrame* currentPrimaryFrame = GetPrimaryFrame()) {
+    if (MOZ_LIKELY(!IsHTMLElement(nsGkAtoms::area)) ||
+        currentPrimaryFrame->GetContent() == this) {
+      currentPrimaryFrame->SetIsPrimaryFrame(false);
+    }
+  }
+
+  mPrimaryFrame = aFrame;
+}
+
+template <nsINode::FlattenedParentType aType>
+static inline nsINode* GetFlattenedTreeParentNode(const nsINode* aNode) {
+  if (!aNode->IsContent()) {
+    return nullptr;
+  }
+
+  nsINode* parent = aNode->GetParentNode();
+  if (!parent || !parent->IsContent()) {
+    return parent;
+  }
+
+  const nsIContent* content = aNode->AsContent();
+  nsIContent* parentAsContent = parent->AsContent();
+
+  if (aType == nsINode::eForStyle &&
+      content->IsRootOfNativeAnonymousSubtree() &&
+      parentAsContent == content->OwnerDoc()->GetRootElement()) {
+    const bool docLevel =
+        content->GetProperty(nsGkAtoms::docLevelNativeAnonymousContent);
+    return docLevel ? content->OwnerDocAsNode() : parent;
+  }
+
+  if (content->IsRootOfNativeAnonymousSubtree()) {
+    return parent;
+  }
+
+  const nsINode* shadowRootForParent =
+      aType == nsINode::eForSelection
+          ? parentAsContent->GetShadowRootForSelection()
+          : parentAsContent->GetShadowRoot();
+
+  if (shadowRootForParent) {
+    auto* assignedSlot = content->GetAssignedSlot();
+    if (assignedSlot || aType != nsINode::eForSelection) {
+      return assignedSlot;
+    }
+
+    MOZ_ASSERT(aType == nsINode::eForSelection);
+    return parent;
+  }
+
+  if (parentAsContent->IsInShadowTree()) {
+    if (auto* slot = mozilla::dom::HTMLSlotElement::FromNode(parentAsContent)) {
+      if constexpr (aType == nsINode::eForSelection) {
+        return slot;
+      } else {
+        return slot->AssignedNodes().IsEmpty() ? slot : nullptr;
+      }
+    }
+
+    if (auto* const shadowRoot =
+            mozilla::dom::ShadowRoot::FromNode(parentAsContent)) {
+      if constexpr (aType != nsINode::eForSelection) {
+        return shadowRoot->GetHost();
+      } else {
+        if (shadowRoot->IsUAWidget()) {
+          return shadowRoot;
+        }
+        MOZ_ASSERT_IF(shadowRoot->GetHost() &&
+                          !shadowRoot->GetHost()->CanAttachShadowDOM(),
+                      shadowRoot->GetHost()->IsSVGElement(nsGkAtoms::use));
+        return shadowRoot->GetHost();
+      }
+    }
+  }
+
+  return parent;
+}
+
+inline nsINode* nsINode::GetFlattenedTreeParentNode() const {
+  return ::GetFlattenedTreeParentNode<nsINode::eNormal>(this);
+}
+
+inline nsIContent* nsIContent::GetFlattenedTreeParent() const {
+  nsINode* parent = GetFlattenedTreeParentNode();
+  return (parent && parent->IsContent()) ? parent->AsContent() : nullptr;
+}
+
+inline bool nsIContent::IsEventAttributeName(nsAtom* aName) {
+  const char16_t* name = aName->GetUTF16String();
+  if (name[0] != 'o' || name[1] != 'n') {
+    return false;
+  }
+
+  return IsEventAttributeNameInternal(aName);
+}
+
+inline nsINode* nsINode::GetFlattenedTreeParentNodeForStyle() const {
+  return ::GetFlattenedTreeParentNode<nsINode::eForStyle>(this);
+}
+
+inline nsIContent* nsINode::GetFlattenedTreeParentForStyle() const {
+  return nsIContent::FromNodeOrNull(GetFlattenedTreeParentNodeForStyle());
+}
+
+inline nsINode* nsINode::GetFlattenedTreeParentNodeForSelection() const {
+  return ::GetFlattenedTreeParentNode<nsINode::eForSelection>(this);
+}
+
+inline nsIContent* nsINode::GetFlattenedTreeFirstChild() const {
+  return mozilla::dom::FlattenedChildIterator::GetFirstChild(this);
+}
+
+inline nsIContent* nsINode::GetFlattenedTreeFirstChildForSelection() const {
+  return mozilla::dom::FlattenedChildIteratorForSelection::GetFirstChild(this);
+}
+
+inline nsIContent* nsINode::GetFlattenedTreeLastChild() const {
+  return mozilla::dom::FlattenedChildIterator::GetLastChild(this);
+}
+
+inline nsIContent* nsINode::GetFlattenedTreeLastChildForSelection() const {
+  return mozilla::dom::FlattenedChildIteratorForSelection::GetLastChild(this);
+}
+
+inline uint32_t nsINode::GetFlatTreeChildCount() const {
+  if (!IsContainerNode()) {
+    return 0;
+  }
+  MOZ_ASSERT(!IsCharacterData());
+  return mozilla::dom::FlattenedChildIterator::GetLength(this);
+}
+
+inline uint32_t nsINode::GetFlatTreeForSelectionChildCount() const {
+  if (!IsContainerNode()) {
+    return 0;
+  }
+  MOZ_ASSERT(!IsCharacterData());
+  return mozilla::dom::FlattenedChildIteratorForSelection::GetLength(this);
+}
+
+inline mozilla::Maybe<uint32_t> nsINode::ComputeFlatTreeIndexOf(
+    const nsINode* aPossibleChild) const {
+  return mozilla::dom::FlattenedChildIterator::GetIndexOf(this, aPossibleChild);
+}
+
+inline mozilla::Maybe<uint32_t> nsINode::ComputeFlatTreeForSelectionIndexOf(
+    const nsINode* aPossibleChild) const {
+  return mozilla::dom::FlattenedChildIteratorForSelection::GetIndexOf(
+      this, aPossibleChild);
+}
+
+inline nsIContent* nsINode::GetChildAtInFlatTree(uint32_t aIndex) const {
+  return mozilla::dom::FlattenedChildIterator::GetChildAt(this, aIndex);
+}
+
+inline nsIContent* nsINode::GetChildAtInFlatTreeForSelection(
+    uint32_t aIndex) const {
+  return mozilla::dom::FlattenedChildIteratorForSelection::GetChildAt(this,
+                                                                      aIndex);
+}
+
+inline mozilla::dom::ShadowRoot* nsINode::GetContainingShadowForSelection()
+    const {
+  if (!IsInShadowTree()) {
+    return nullptr;
+  }
+  mozilla::dom::ShadowRoot* const shadowRoot =
+      AsContent()->GetContainingShadow();
+  return shadowRoot && !shadowRoot->IsUAWidget() ? shadowRoot : nullptr;
+}
+
+inline mozilla::dom::ShadowRoot* nsINode::GetClosestShadowRootInFlattenedTree()
+    const {
+  for (nsINode* node = const_cast<nsINode*>(this); node && node->IsContent();
+       node = node->GetParentNode()) {
+    if (auto* const shadowRoot = mozilla::dom::ShadowRoot::FromNode(node)) {
+      return shadowRoot;
+    }
+    if (auto* const slot = node->AsContent()->GetAssignedSlot()) {
+      return slot->GetContainingShadow();
+    }
+  }
+  return nullptr;
+}
+
+inline mozilla::dom::ShadowRoot*
+nsINode::GetClosestShadowRootInFlattenedTreeForSelection() const {
+  for (nsINode* node = const_cast<nsINode*>(this); node && node->IsContent();
+       node = node->GetParentNode()) {
+    if (auto* const shadowRoot = mozilla::dom::ShadowRoot::FromNode(node)) {
+      if (!shadowRoot->IsUAWidget()) {
+        return shadowRoot;
+      }
+    }
+    if (auto* const slot = node->AsContent()->GetAssignedSlotForSelection()) {
+      return slot->GetContainingShadow();
+    }
+  }
+  return nullptr;
+}
+
+inline bool nsINode::NodeOrAncestorHasDirAuto() const {
+  return AncestorHasDirAuto() || (IsElement() && AsElement()->HasDirAuto());
+}
+
+inline bool nsINode::IsEditingHost() const {
+  if (!IsEditable() || !IsInComposedDoc() || IsInDesignMode() ||
+      IsInNativeAnonymousSubtree()) {
+    return false;
+  }
+  nsIContent* const parent = GetParent();
+  return !parent ||  
+         !parent->IsEditable();  
+}
+
+inline bool nsINode::IsInDesignMode() const {
+  if (!OwnerDoc()->HasFlag(NODE_IS_EDITABLE)) {
+    return false;
+  }
+
+  if (IsInUncomposedDoc()) {
+    return true;
+  }
+
+
+  if (IsInNativeAnonymousSubtree()) {
+    nsIContent* host = GetClosestNativeAnonymousSubtreeRootParentOrHost();
+    MOZ_DIAGNOSTIC_ASSERT(host != this);
+    return host && host->IsInDesignMode();
+  }
+
+  return false;
+}
+
+inline void nsIContent::HandleInsertionToOrRemovalFromSlot() {
+  using mozilla::dom::HTMLSlotElement;
+
+  MOZ_ASSERT(GetParentElement());
+  if (!IsInShadowTree() || IsRootOfNativeAnonymousSubtree()) {
+    return;
+  }
+  HTMLSlotElement* slot = HTMLSlotElement::FromNode(mParent);
+  if (!slot) {
+    return;
+  }
+  if (slot->AssignedNodes().IsEmpty()) {
+    slot->EnqueueSlotChangeEvent();
+  }
+}
+
+inline void nsIContent::HandleShadowDOMRelatedInsertionSteps(bool aHadParent) {
+  using mozilla::dom::Element;
+  using mozilla::dom::ShadowRoot;
+
+  if (!aHadParent) {
+    if (Element* parentElement = Element::FromNode(mParent)) {
+      if (ShadowRoot* shadow = parentElement->GetShadowRoot()) {
+        shadow->MaybeSlotHostChild(*this);
+      }
+      HandleInsertionToOrRemovalFromSlot();
+    }
+  }
+}
+
+inline void nsIContent::HandleShadowDOMRelatedRemovalSteps(bool aNullParent) {
+  using mozilla::dom::Element;
+  using mozilla::dom::ShadowRoot;
+
+  if (aNullParent) {
+    if (Element* parentElement = Element::FromNodeOrNull(mParent)) {
+      if (ShadowRoot* shadow = parentElement->GetShadowRoot()) {
+        shadow->MaybeUnslotHostChild(*this);
+      }
+      HandleInsertionToOrRemovalFromSlot();
+    }
+  }
+}
+
+#endif  // nsIContentInlines_h

@@ -1,0 +1,340 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsMathMLmpaddedFrame.h"
+
+#include <algorithm>
+
+#include "mozilla/PresShell.h"
+#include "mozilla/TextUtils.h"
+#include "mozilla/dom/MathMLElement.h"
+#include "mozilla/gfx/2D.h"
+#include "nsLayoutUtils.h"
+
+using namespace mozilla;
+
+
+nsIFrame* NS_NewMathMLmpaddedFrame(PresShell* aPresShell,
+                                   ComputedStyle* aStyle) {
+  return new (aPresShell)
+      nsMathMLmpaddedFrame(aStyle, aPresShell->GetPresContext());
+}
+
+NS_IMPL_FRAMEARENA_HELPERS(nsMathMLmpaddedFrame)
+
+nsMathMLmpaddedFrame::~nsMathMLmpaddedFrame() = default;
+
+NS_IMETHODIMP
+nsMathMLmpaddedFrame::InheritAutomaticData(nsIFrame* aParent) {
+  nsMathMLContainerFrame::InheritAutomaticData(aParent);
+
+  mPresentationData.flags +=
+      MathMLPresentationFlag::StretchAllChildrenVertically;
+
+  return NS_OK;
+}
+
+nsresult nsMathMLmpaddedFrame::AttributeChanged(int32_t aNameSpaceID,
+                                                nsAtom* aAttribute,
+                                                AttrModType aModType) {
+  if (aNameSpaceID == kNameSpaceID_None) {
+    bool hasDirtyAttributes = false;
+    IntrinsicDirty intrinsicDirty = IntrinsicDirty::None;
+    if (aAttribute == nsGkAtoms::width) {
+      mWidth.mState = Attribute::ParsingState::Dirty;
+      hasDirtyAttributes = true;
+      intrinsicDirty = IntrinsicDirty::FrameAndAncestors;
+    } else if (aAttribute == nsGkAtoms::height) {
+      mHeight.mState = Attribute::ParsingState::Dirty;
+      hasDirtyAttributes = true;
+    } else if (aAttribute == nsGkAtoms::depth) {
+      mDepth.mState = Attribute::ParsingState::Dirty;
+      hasDirtyAttributes = true;
+    } else if (aAttribute == nsGkAtoms::lspace) {
+      mLeadingSpace.mState = Attribute::ParsingState::Dirty;
+      hasDirtyAttributes = true;
+      intrinsicDirty = IntrinsicDirty::FrameAndAncestors;
+    } else if (aAttribute == nsGkAtoms::voffset) {
+      mVerticalOffset.mState = Attribute::ParsingState::Dirty;
+      hasDirtyAttributes = true;
+    }
+    if (hasDirtyAttributes) {
+      PresShell()->FrameNeedsReflow(this, intrinsicDirty, NS_FRAME_IS_DIRTY);
+    }
+    return NS_OK;
+  }
+  return nsMathMLContainerFrame::AttributeChanged(aNameSpaceID, aAttribute,
+                                                  aModType);
+}
+
+void nsMathMLmpaddedFrame::ParseAttribute(nsAtom* aAtom,
+                                          Attribute& aAttribute) {
+  if (aAttribute.mState != Attribute::ParsingState::Dirty) {
+    return;
+  }
+  nsAutoString value;
+  aAttribute.mState = Attribute::ParsingState::Invalid;
+  mContent->AsElement()->GetAttr(aAtom, value);
+  if (!value.IsEmpty()) {
+    if (!ParseAttribute(value, aAttribute)) {
+      ReportParseError(aAtom->GetUTF16String(), value.get());
+    }
+  }
+}
+
+bool nsMathMLmpaddedFrame::ParseAttribute(nsString& aString,
+                                          Attribute& aAttribute) {
+  aAttribute.Reset();
+  aAttribute.mState = Attribute::ParsingState::Invalid;
+
+  aString.CompressWhitespace();  
+
+  int32_t stringLength = aString.Length();
+  if (!stringLength) {
+    return false;
+  }
+
+  nsAutoString number, unit;
+
+
+  int32_t i = 0;
+
+  if (aString[0] == '+') {
+    aAttribute.mSign = Attribute::Sign::Plus;
+    i++;
+  } else if (aString[0] == '-') {
+    aAttribute.mSign = Attribute::Sign::Minus;
+    i++;
+  } else {
+    aAttribute.mSign = Attribute::Sign::Unspecified;
+  }
+
+  bool gotDot = false, gotPercent = false;
+  for (; i < stringLength; i++) {
+    char16_t c = aString[i];
+    if (gotDot && c == '.') {
+      return false;
+    }
+
+    if (c == '.') {
+      gotDot = true;
+    } else if (!IsAsciiDigit(c)) {
+      break;
+    }
+    number.Append(c);
+  }
+
+  if (number.IsEmpty()) {
+    return false;
+  }
+
+  nsresult errorCode;
+  float floatValue = number.ToFloat(&errorCode);
+  if (NS_FAILED(errorCode)) {
+    return false;
+  }
+
+  if (i < stringLength && aString[i] == '%') {
+    i++;
+    gotPercent = true;
+  }
+
+  aString.Right(unit, stringLength - i);
+
+  if (unit.IsEmpty()) {
+    if (gotPercent) {
+      aAttribute.mValue.SetPercentValue(floatValue / 100.0f);
+      aAttribute.mPseudoUnit = Attribute::PseudoUnit::ItSelf;
+      aAttribute.mState = Attribute::ParsingState::Valid;
+      return true;
+    } else {
+      if (!floatValue) {
+        aAttribute.mValue.SetFloatValue(floatValue, eCSSUnit_Number);
+        aAttribute.mPseudoUnit = Attribute::PseudoUnit::ItSelf;
+        aAttribute.mState = Attribute::ParsingState::Valid;
+        return true;
+      }
+    }
+  } else if (unit.EqualsLiteral("width")) {
+    aAttribute.mPseudoUnit = Attribute::PseudoUnit::Width;
+  } else if (unit.EqualsLiteral("height")) {
+    aAttribute.mPseudoUnit = Attribute::PseudoUnit::Height;
+  } else if (unit.EqualsLiteral("depth")) {
+    aAttribute.mPseudoUnit = Attribute::PseudoUnit::Depth;
+  } else if (!gotPercent) {  
+
+    if (dom::MathMLElement::ParseNamedSpaceValue(
+            unit, aAttribute.mValue, *mContent->OwnerDoc(),
+            dom::MathMLElement::ParseFlag::AllowNegative)) {
+      floatValue *= aAttribute.mValue.GetFloatValue();
+      aAttribute.mValue.SetFloatValue(floatValue, eCSSUnit_EM);
+      aAttribute.mPseudoUnit = Attribute::PseudoUnit::NamedSpace;
+      aAttribute.mState = Attribute::ParsingState::Valid;
+      return true;
+    }
+
+    number.Append(unit);  
+    if (dom::MathMLElement::ParseNumericValue(
+            number, aAttribute.mValue, nullptr,
+            dom::MathMLElement::ParseFlag::SuppressWarnings)) {
+      aAttribute.mState = Attribute::ParsingState::Valid;
+      return true;
+    }
+  }
+
+  if (aAttribute.mPseudoUnit != Attribute::PseudoUnit::Unspecified) {
+    if (gotPercent) {
+      aAttribute.mValue.SetPercentValue(floatValue / 100.0f);
+    } else {
+      aAttribute.mValue.SetFloatValue(floatValue, eCSSUnit_Number);
+    }
+
+    aAttribute.mState = Attribute::ParsingState::Valid;
+    return true;
+  }
+
+#ifdef DEBUG
+  printf("mpadded: attribute with bad numeric value: %s\n",
+         NS_LossyConvertUTF16toASCII(aString).get());
+#endif
+  return false;
+}
+
+void nsMathMLmpaddedFrame::UpdateValue(const Attribute& aAttribute,
+                                       Attribute::PseudoUnit aSelfUnit,
+                                       const ReflowOutput& aDesiredSize,
+                                       nscoord& aValueToUpdate,
+                                       float aFontSizeInflation) {
+  nsCSSUnit unit = aAttribute.mValue.GetUnit();
+  if (aAttribute.IsValid() && eCSSUnit_Null != unit) {
+    nscoord scaler = 0, amount = 0;
+
+    if (eCSSUnit_Percent == unit || eCSSUnit_Number == unit) {
+      auto pseudoUnit = aAttribute.mPseudoUnit;
+      if (pseudoUnit == Attribute::PseudoUnit::ItSelf) {
+        pseudoUnit = aSelfUnit;
+      }
+      switch (pseudoUnit) {
+        case Attribute::PseudoUnit::Width:
+          scaler = aDesiredSize.Width();
+          break;
+
+        case Attribute::PseudoUnit::Height:
+          scaler = aDesiredSize.BlockStartAscent();
+          break;
+
+        case Attribute::PseudoUnit::Depth:
+          scaler = aDesiredSize.Height() - aDesiredSize.BlockStartAscent();
+          break;
+
+        default:
+          NS_ERROR("Unexpected Pseudo Unit");
+          return;
+      }
+    }
+
+    if (eCSSUnit_Number == unit) {
+      amount =
+          NSToCoordRound(float(scaler) * aAttribute.mValue.GetFloatValue());
+    } else if (eCSSUnit_Percent == unit) {
+      amount =
+          NSToCoordRound(float(scaler) * aAttribute.mValue.GetPercentValue());
+    } else {
+      amount = CalcLength(aAttribute.mValue, aFontSizeInflation, this);
+    }
+
+    switch (aAttribute.mSign) {
+      case Attribute::Sign::Plus:
+        aValueToUpdate += amount;
+        break;
+      case Attribute::Sign::Minus:
+        aValueToUpdate -= amount;
+        break;
+      case Attribute::Sign::Unspecified:
+        aValueToUpdate = amount;
+        break;
+    }
+  }
+}
+
+void nsMathMLmpaddedFrame::Place(DrawTarget* aDrawTarget,
+                                 const PlaceFlags& aFlags,
+                                 ReflowOutput& aDesiredSize) {
+  PlaceFlags flags = aFlags + PlaceFlag::MeasureOnly +
+                     PlaceFlag::IgnoreBorderPadding +
+                     PlaceFlag::DoNotAdjustForWidthAndHeight;
+  nsMathMLContainerFrame::Place(aDrawTarget, flags, aDesiredSize);
+
+  nscoord height = aDesiredSize.BlockStartAscent();
+  nscoord depth = aDesiredSize.Height() - aDesiredSize.BlockStartAscent();
+  nscoord lspace = 0;
+  nscoord width = aDesiredSize.Width();
+  nscoord voffset = 0;
+
+  nscoord initialWidth = width;
+  float fontSizeInflation = nsLayoutUtils::FontSizeInflationFor(this);
+
+  ParseAttribute(nsGkAtoms::width, mWidth);
+  UpdateValue(mWidth, Attribute::PseudoUnit::Width, aDesiredSize, width,
+              fontSizeInflation);
+  width = std::max(0, width);
+
+  ParseAttribute(nsGkAtoms::height, mHeight);
+  UpdateValue(mHeight, Attribute::PseudoUnit::Height, aDesiredSize, height,
+              fontSizeInflation);
+  height = std::max(0, height);
+
+  ParseAttribute(nsGkAtoms::depth, mDepth);
+  UpdateValue(mDepth, Attribute::PseudoUnit::Depth, aDesiredSize, depth,
+              fontSizeInflation);
+  depth = std::max(0, depth);
+
+  ParseAttribute(nsGkAtoms::lspace, mLeadingSpace);
+  if (mLeadingSpace.mPseudoUnit != Attribute::PseudoUnit::ItSelf) {
+    UpdateValue(mLeadingSpace, Attribute::PseudoUnit::Unspecified, aDesiredSize,
+                lspace, fontSizeInflation);
+  }
+
+  ParseAttribute(nsGkAtoms::voffset, mVerticalOffset);
+  if (mVerticalOffset.mPseudoUnit != Attribute::PseudoUnit::ItSelf) {
+    UpdateValue(mVerticalOffset, Attribute::PseudoUnit::Unspecified,
+                aDesiredSize, voffset, fontSizeInflation);
+  }
+
+
+  const bool isRTL = GetWritingMode().IsBidiRTL();
+  if (isRTL ? mWidth.IsValid() : mLeadingSpace.IsValid()) {
+    mBoundingMetrics.leftBearing = 0;
+  }
+
+  if (isRTL ? mLeadingSpace.IsValid() : mWidth.IsValid()) {
+    mBoundingMetrics.width = width;
+    mBoundingMetrics.rightBearing = mBoundingMetrics.width;
+  }
+
+  nscoord dx = (isRTL ? width - initialWidth - lspace : lspace);
+
+  aDesiredSize.SetBlockStartAscent(height);
+  aDesiredSize.Width() = mBoundingMetrics.width;
+  aDesiredSize.Height() = depth + aDesiredSize.BlockStartAscent();
+  mBoundingMetrics.ascent = height;
+  mBoundingMetrics.descent = depth;
+  aDesiredSize.mBoundingMetrics = mBoundingMetrics;
+
+  auto sizes = GetWidthAndHeightForPlaceAdjustment(aFlags);
+  dx += ApplyAdjustmentForWidthAndHeight(aFlags, sizes, aDesiredSize,
+                                         mBoundingMetrics);
+
+  auto borderPadding = GetBorderPaddingForPlace(aFlags);
+  InflateReflowAndBoundingMetrics(borderPadding, aDesiredSize,
+                                  mBoundingMetrics);
+  dx += borderPadding.left;
+
+  mReference.x = 0;
+  mReference.y = aDesiredSize.BlockStartAscent();
+
+  if (!aFlags.contains(PlaceFlag::MeasureOnly)) {
+    PositionRowChildFrames(dx, aDesiredSize.BlockStartAscent() - voffset);
+  }
+}

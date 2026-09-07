@@ -1,0 +1,297 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ClientNavigateOpChild.h"
+
+#include "ClientSource.h"
+#include "ClientSourceChild.h"
+#include "ClientState.h"
+#include "ReferrerInfo.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/PolicyContainer.h"
+#include "nsDocShellLoadState.h"
+#include "nsIDocShell.h"
+#include "nsIWebNavigation.h"
+#include "nsIWebProgress.h"
+#include "nsIWebProgressListener.h"
+#include "nsNetUtil.h"
+#include "nsPIDOMWindow.h"
+#include "nsPIDOMWindowInlines.h"
+#include "nsURLHelper.h"
+
+namespace mozilla::dom {
+
+namespace {
+
+class NavigateLoadListener final : public nsIWebProgressListener,
+                                   public nsSupportsWeakReference {
+  RefPtr<ClientOpPromise::Private> mPromise;
+  RefPtr<nsPIDOMWindowOuter> mOuterWindow;
+  nsCOMPtr<nsIURI> mBaseURL;
+
+  ~NavigateLoadListener() = default;
+
+ public:
+  NavigateLoadListener(ClientOpPromise::Private* aPromise,
+                       nsPIDOMWindowOuter* aOuterWindow, nsIURI* aBaseURL)
+      : mPromise(aPromise), mOuterWindow(aOuterWindow), mBaseURL(aBaseURL) {
+    MOZ_DIAGNOSTIC_ASSERT(mPromise);
+    MOZ_DIAGNOSTIC_ASSERT(mOuterWindow);
+    MOZ_DIAGNOSTIC_ASSERT(mBaseURL);
+  }
+
+  NS_IMETHOD
+  OnStateChange(nsIWebProgress* aWebProgress, nsIRequest* aRequest,
+                uint32_t aStateFlags, nsresult aResult) override {
+    if (!(aStateFlags & STATE_IS_DOCUMENT) ||
+        !(aStateFlags & (STATE_STOP | STATE_TRANSFERRING))) {
+      return NS_OK;
+    }
+
+    aWebProgress->RemoveProgressListener(this);
+
+    nsCOMPtr<nsIChannel> channel = do_QueryInterface(aRequest);
+    if (!channel) {
+      CopyableErrorResult result;
+      result.ThrowInvalidStateError("Bad request");
+      mPromise->Reject(result, __func__);
+      return NS_OK;
+    }
+
+    nsCOMPtr<nsIURI> channelURL;
+    nsresult rv = NS_GetFinalChannelURI(channel, getter_AddRefs(channelURL));
+    if (NS_FAILED(rv)) {
+      CopyableErrorResult result;
+      result.Throw(rv);
+      mPromise->Reject(result, __func__);
+      return NS_OK;
+    }
+
+    nsIScriptSecurityManager* ssm = nsContentUtils::GetSecurityManager();
+    MOZ_DIAGNOSTIC_ASSERT(ssm);
+
+    rv = ssm->CheckSameOriginURI(mBaseURL, channelURL, false, false);
+    if (NS_FAILED(rv)) {
+      mPromise->Resolve(CopyableErrorResult(), __func__);
+      return NS_OK;
+    }
+
+    nsPIDOMWindowInner* innerWindow = mOuterWindow->GetCurrentInnerWindow();
+    MOZ_DIAGNOSTIC_ASSERT(innerWindow);
+
+    Maybe<ClientInfo> clientInfo = innerWindow->GetClientInfo();
+    MOZ_DIAGNOSTIC_ASSERT(clientInfo.isSome());
+
+    Maybe<ClientState> clientState = innerWindow->GetClientState();
+    MOZ_DIAGNOSTIC_ASSERT(clientState.isSome());
+
+    mPromise->Resolve(
+        ClientInfoAndState(clientInfo.ref().ToIPC(), clientState.ref().ToIPC()),
+        __func__);
+
+    return NS_OK;
+  }
+
+  NS_IMETHOD
+  OnProgressChange(nsIWebProgress* aWebProgress, nsIRequest* aRequest,
+                   int32_t aCurSelfProgress, int32_t aMaxSelfProgress,
+                   int32_t aCurTotalProgress,
+                   int32_t aMaxTotalProgress) override {
+    MOZ_CRASH("Unexpected notification.");
+    return NS_OK;
+  }
+
+  NS_IMETHOD
+  OnLocationChange(nsIWebProgress* aWebProgress, nsIRequest* aRequest,
+                   nsIURI* aLocation, uint32_t aFlags) override {
+    MOZ_CRASH("Unexpected notification.");
+    return NS_OK;
+  }
+
+  NS_IMETHOD
+  OnStatusChange(nsIWebProgress* aWebProgress, nsIRequest* aRequest,
+                 nsresult aStatus, const char16_t* aMessage) override {
+    MOZ_CRASH("Unexpected notification.");
+    return NS_OK;
+  }
+
+  NS_IMETHOD
+  OnSecurityChange(nsIWebProgress* aWebProgress, nsIRequest* aRequest,
+                   uint32_t aState) override {
+    MOZ_CRASH("Unexpected notification.");
+    return NS_OK;
+  }
+
+  NS_IMETHOD
+  OnContentBlockingEvent(nsIWebProgress* aWebProgress, nsIRequest* aRequest,
+                         uint32_t aEvent) override {
+    MOZ_CRASH("Unexpected notification.");
+    return NS_OK;
+  }
+
+  NS_DECL_ISUPPORTS
+};
+
+NS_IMPL_ISUPPORTS(NavigateLoadListener, nsIWebProgressListener,
+                  nsISupportsWeakReference);
+
+}  
+
+RefPtr<ClientOpPromise> ClientNavigateOpChild::DoNavigate(
+    const ClientNavigateOpConstructorArgs& aArgs,
+    mozilla::ipc::ActorLifecycleProxy* aProxy) {
+  nsCOMPtr<nsPIDOMWindowInner> window;
+
+  {
+    ClientSourceChild* targetActor =
+        static_cast<ClientSourceChild*>(aArgs.target().AsChild().get());
+    MOZ_DIAGNOSTIC_ASSERT(targetActor);
+
+    ClientSource* target = targetActor->GetSource();
+    if (!target) {
+      CopyableErrorResult rv;
+      rv.ThrowInvalidStateError("Unknown Client");
+      return ClientOpPromise::CreateAndReject(rv, __func__);
+    }
+
+    window = target->GetInnerWindow();
+    if (!window) {
+      CopyableErrorResult rv;
+      rv.ThrowInvalidStateError("Client load for a destroyed Window");
+      return ClientOpPromise::CreateAndReject(rv, __func__);
+    }
+  }
+
+  MOZ_ASSERT(NS_IsMainThread());
+
+  mSerialEventTarget = GetMainThreadSerialEventTarget();
+
+  nsCOMPtr<nsIURI> baseURL;
+  nsresult rv = NS_NewURI(getter_AddRefs(baseURL), aArgs.baseURL());
+  if (NS_FAILED(rv)) {
+    CopyableErrorResult result;
+    result.ThrowInvalidStateError("Invalid worker URL");
+    return ClientOpPromise::CreateAndReject(result, __func__);
+  }
+
+  bool shouldUseBaseURL = true;
+  nsAutoCString scheme;
+  if (NS_SUCCEEDED(net_ExtractURLScheme(aArgs.url(), scheme)) &&
+      scheme.LowerCaseEqualsLiteral("view-source")) {
+    shouldUseBaseURL = false;
+  }
+
+  nsCOMPtr<nsIURI> url;
+  rv = NS_NewURI(getter_AddRefs(url), aArgs.url(), nullptr,
+                 shouldUseBaseURL ? baseURL.get() : nullptr);
+  if (NS_FAILED(rv)) {
+    nsPrintfCString err("Invalid URL \"%s\"", aArgs.url().get());
+    CopyableErrorResult result;
+    result.ThrowTypeError(err);
+    return ClientOpPromise::CreateAndReject(result, __func__);
+  }
+
+  if (NS_IsAboutBlankAllowQueryAndFragment(url)) {
+    CopyableErrorResult result;
+    result.ThrowTypeError("Navigation to \"about:blank\" is not allowed");
+    return ClientOpPromise::CreateAndReject(result, __func__);
+  }
+
+  RefPtr<Document> doc = window->GetExtantDoc();
+  if (!doc || !doc->IsActive()) {
+    CopyableErrorResult result;
+    result.ThrowInvalidStateError("Document is not active.");
+    return ClientOpPromise::CreateAndReject(result, __func__);
+  }
+
+  nsCOMPtr<nsIPrincipal> principal = doc->NodePrincipal();
+
+  nsCOMPtr<nsIDocShell> docShell = window->GetDocShell();
+  nsCOMPtr<nsIWebProgress> webProgress = do_GetInterface(docShell);
+  if (!docShell || !webProgress) {
+    CopyableErrorResult result;
+    result.ThrowInvalidStateError(
+        "Document's browsing context has been discarded");
+    return ClientOpPromise::CreateAndReject(result, __func__);
+  }
+
+  RefPtr<nsDocShellLoadState> loadState = new nsDocShellLoadState(url);
+  loadState->SetTriggeringPrincipal(principal);
+  loadState->SetTriggeringSandboxFlags(doc->GetSandboxFlags());
+  loadState->SetPolicyContainer(doc->GetPolicyContainer());
+
+  auto referrerInfo = MakeRefPtr<ReferrerInfo>(*doc);
+  loadState->SetReferrerInfo(referrerInfo);
+  loadState->SetLoadType(LOAD_STOP_CONTENT);
+  loadState->SetSourceBrowsingContext(docShell->GetBrowsingContext());
+  loadState->SetLoadFlags(nsIWebNavigation::LOAD_FLAGS_NONE);
+  loadState->SetFirstParty(true);
+  loadState->SetHasValidUserGestureActivation(
+      doc->HasValidTransientUserGestureActivation());
+  rv = docShell->LoadURI(loadState, false);
+  if (NS_FAILED(rv)) {
+    nsPrintfCString err("Invalid URL \"%s\"", aArgs.url().get());
+    CopyableErrorResult result;
+    result.ThrowTypeError(err);
+    return ClientOpPromise::CreateAndReject(result, __func__);
+  }
+
+  if (!aProxy->Get() || !CanSend()) {
+    CopyableErrorResult result;
+    result.ThrowInvalidStateError("Unknown Client");
+    return ClientOpPromise::CreateAndReject(result, __func__);
+  }
+
+  RefPtr<ClientOpPromise::Private> promise =
+      new ClientOpPromise::Private(__func__);
+
+  nsCOMPtr<nsIWebProgressListener> listener =
+      new NavigateLoadListener(promise, window->GetOuterWindow(), baseURL);
+
+  rv = webProgress->AddProgressListener(listener,
+                                        nsIWebProgress::NOTIFY_STATE_DOCUMENT);
+  if (NS_FAILED(rv)) {
+    CopyableErrorResult result;
+    result.Throw(rv);
+    promise->Reject(result, __func__);
+    return promise;
+  }
+
+  return promise->Then(
+      mSerialEventTarget, __func__,
+      [listener](const ClientOpPromise::ResolveOrRejectValue& aValue) {
+        return ClientOpPromise::CreateAndResolveOrReject(aValue, __func__);
+      });
+}
+
+void ClientNavigateOpChild::ActorDestroy(ActorDestroyReason aReason) {
+  mPromiseRequestHolder.DisconnectIfExists();
+}
+
+void ClientNavigateOpChild::Init(const ClientNavigateOpConstructorArgs& aArgs,
+                                 mozilla::ipc::ActorLifecycleProxy* aProxy) {
+  RefPtr<ClientOpPromise> promise = DoNavigate(aArgs, aProxy);
+  if (!aProxy->Get() || !CanSend()) {
+    return;
+  }
+
+  if (!mSerialEventTarget) {
+    mSerialEventTarget = GetCurrentSerialEventTarget();
+  }
+
+  promise
+      ->Then(
+          mSerialEventTarget, __func__,
+          [this](const ClientOpResult& aResult) {
+            mPromiseRequestHolder.Complete();
+            PClientNavigateOpChild::Send__delete__(this, aResult);
+          },
+          [this](const CopyableErrorResult& aResult) {
+            mPromiseRequestHolder.Complete();
+            PClientNavigateOpChild::Send__delete__(this, aResult);
+          })
+      ->Track(mPromiseRequestHolder);
+}
+
+}  

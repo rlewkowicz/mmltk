@@ -1,0 +1,64 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+EXPORTS.mozilla += [
+    "Hal.h",
+    "HalBatteryInformation.h",
+    "HalImpl.h",
+    "HalIPCUtils.h",
+    "HalNetworkInformation.h",
+    "HalProxy.h",
+    "HalScreenConfiguration.h",
+    "HalSensor.h",
+    "HalTypes.h",
+    "HalWakeLock.h",
+    "HalWakeLockInformation.h",
+]
+
+EXPORTS.mozilla += [
+    "linux/UdevLib.h",
+]
+
+UNIFIED_SOURCES += [
+    "HalWakeLock.cpp",
+    "ipc/HalIPCActors.cpp",
+    "WindowIdentifier.cpp",
+]
+
+# Hal.cpp cannot be built in unified mode because it relies on HalImpl.h.
+SOURCES += [
+    "Hal.cpp",
+]
+
+UNIFIED_SOURCES += [
+    "fallback/FallbackBattery.cpp",
+    "fallback/FallbackHeterogeneousCpuInfo.cpp",
+    "fallback/FallbackScreenConfiguration.cpp",
+    "fallback/FallbackSensor.cpp",
+    "fallback/FallbackVibration.cpp",
+    "linux/LinuxProcessPriority.cpp",
+]
+
+UNIFIED_SOURCES += [
+    "fallback/FallbackNetwork.cpp",
+    "fallback/FallbackPerformanceHintManager.cpp",
+]
+
+
+IPDL_SOURCES = [
+    "ipc/PHal.ipdl",
+]
+
+include("/ipc/chromium/chromium-config.mozbuild")
+
+FINAL_LIBRARY = "xul"
+
+LOCAL_INCLUDES += [
+    "/dom/base",
+]
+
+CFLAGS += CONFIG["GLIB_CFLAGS"]
+CFLAGS += CONFIG["MOZ_GTK3_CFLAGS"]
+CXXFLAGS += CONFIG["GLIB_CFLAGS"]
+CXXFLAGS += CONFIG["MOZ_GTK3_CFLAGS"]

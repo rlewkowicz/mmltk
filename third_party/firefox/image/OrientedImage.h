@@ -1,0 +1,76 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_image_OrientedImage_h
+#define mozilla_image_OrientedImage_h
+
+#include "ImageWrapper.h"
+#include "Orientation.h"
+#include "mozilla/gfx/2D.h"
+
+namespace mozilla {
+namespace image {
+
+class OrientedImage : public ImageWrapper {
+  typedef gfx::SourceSurface SourceSurface;
+
+ public:
+  NS_INLINE_DECL_REFCOUNTING_INHERITED(OrientedImage, ImageWrapper)
+
+  NS_IMETHOD GetWidth(int32_t* aWidth) override;
+  NS_IMETHOD GetHeight(int32_t* aHeight) override;
+  nsresult GetNativeSizes(nsTArray<gfx::IntSize>& aNativeSizes) override;
+  NS_IMETHOD GetIntrinsicSizeInAppUnits(nsSize* aSize) override;
+  AspectRatio GetIntrinsicRatio() override;
+  NS_IMETHOD_(already_AddRefed<SourceSurface>)
+  GetFrame(uint32_t aWhichFrame, uint32_t aFlags) override;
+  NS_IMETHOD_(already_AddRefed<SourceSurface>)
+  GetFrameAtSize(const gfx::IntSize& aSize, uint32_t aWhichFrame,
+                 uint32_t aFlags) override;
+  NS_IMETHOD_(bool)
+  IsImageContainerAvailable(WindowRenderer* aRenderer,
+                            uint32_t aFlags) override;
+  NS_IMETHOD_(ImgDrawResult)
+  GetImageProvider(WindowRenderer* aRenderer, const gfx::IntSize& aSize,
+                   const SVGImageContext& aSVGContext,
+                   const Maybe<ImageIntRegion>& aRegion, uint32_t aFlags,
+                   WebRenderImageProvider** aProvider) override;
+  NS_IMETHOD_(ImgDrawResult)
+  Draw(gfxContext* aContext, const nsIntSize& aSize, const ImageRegion& aRegion,
+       uint32_t aWhichFrame, gfx::SamplingFilter aSamplingFilter,
+       const SVGImageContext& aSVGContext, uint32_t aFlags,
+       float aOpacity) override;
+  NS_IMETHOD_(nsIntRect)
+  GetImageSpaceInvalidationRect(const nsIntRect& aRect) override;
+  nsIntSize OptimalImageSizeForDest(const gfxSize& aDest, uint32_t aWhichFrame,
+                                    gfx::SamplingFilter aSamplingFilter,
+                                    uint32_t aFlags) override;
+
+  static gfxMatrix OrientationMatrix(Orientation aOrientation,
+                                     const nsIntSize& aSize,
+                                     bool aInvert = false);
+
+  static already_AddRefed<SourceSurface> OrientSurface(Orientation aOrientation,
+                                                       SourceSurface* aSurface);
+
+ protected:
+  OrientedImage(Image* aImage, Orientation aOrientation)
+      : ImageWrapper(aImage), mOrientation(aOrientation) {}
+
+  virtual ~OrientedImage() = default;
+
+  gfxMatrix OrientationMatrix(const nsIntSize& aSize, bool aInvert = false) {
+    return OrientationMatrix(mOrientation, aSize, aInvert);
+  }
+
+ private:
+  Orientation mOrientation;
+
+  friend class ImageOps;
+};
+
+}  
+}  
+
+#endif  // mozilla_image_OrientedImage_h

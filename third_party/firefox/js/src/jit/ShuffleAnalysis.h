@@ -1,0 +1,110 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_ShuffleAnalysis_h
+#define jit_ShuffleAnalysis_h
+
+#include "jit/IonTypes.h"
+
+namespace js {
+namespace jit {
+
+class MDefinition;
+
+enum class SimdPermuteOp {
+  BROADCAST_8x16,
+
+  BROADCAST_16x8,
+
+  MOVE,
+
+  PERMUTE_8x16,
+
+  PERMUTE_16x8,
+
+  PERMUTE_32x4,
+
+  ROTATE_RIGHT_8x16,
+
+  SHIFT_RIGHT_8x16,
+
+  SHIFT_LEFT_8x16,
+
+  REVERSE_16x8,
+
+  REVERSE_32x4,
+
+  REVERSE_64x2,
+
+  ZERO_EXTEND_8x16_TO_16x8,
+  ZERO_EXTEND_8x16_TO_32x4,
+  ZERO_EXTEND_8x16_TO_64x2,
+  ZERO_EXTEND_16x8_TO_32x4,
+  ZERO_EXTEND_16x8_TO_64x2,
+  ZERO_EXTEND_32x4_TO_64x2,
+};
+
+enum class SimdShuffleOp {
+  BLEND_8x16,
+
+  BLEND_16x8,
+
+  CONCAT_RIGHT_SHIFT_8x16,
+
+  INTERLEAVE_HIGH_8x16,
+  INTERLEAVE_HIGH_16x8,
+  INTERLEAVE_HIGH_32x4,
+  INTERLEAVE_HIGH_64x2,
+  INTERLEAVE_LOW_8x16,
+  INTERLEAVE_LOW_16x8,
+  INTERLEAVE_LOW_32x4,
+  INTERLEAVE_LOW_64x2,
+
+  SHUFFLE_BLEND_8x16,
+};
+
+struct SimdShuffle {
+  enum class Operand {
+    BOTH,
+    BOTH_SWAPPED,
+    LEFT,
+    RIGHT,
+  };
+
+  Operand opd;
+  SimdConstant control;
+  mozilla::Maybe<SimdPermuteOp> permuteOp;  
+  mozilla::Maybe<SimdShuffleOp> shuffleOp;  
+
+  static SimdShuffle permute(Operand opd, SimdConstant control,
+                             SimdPermuteOp op) {
+    MOZ_ASSERT(opd == Operand::LEFT || opd == Operand::RIGHT);
+    SimdShuffle s{opd, control, mozilla::Some(op), mozilla::Nothing()};
+    return s;
+  }
+
+  static SimdShuffle shuffle(Operand opd, SimdConstant control,
+                             SimdShuffleOp op) {
+    MOZ_ASSERT(opd == Operand::BOTH || opd == Operand::BOTH_SWAPPED);
+    SimdShuffle s{opd, control, mozilla::Nothing(), mozilla::Some(op)};
+    return s;
+  }
+
+  bool equals(const SimdShuffle* other) const {
+    return permuteOp == other->permuteOp && shuffleOp == other->shuffleOp &&
+           opd == other->opd && control.bitwiseEqual(other->control);
+  }
+};
+
+#ifdef ENABLE_WASM_SIMD
+
+SimdShuffle AnalyzeSimdShuffle(SimdConstant control, MDefinition* lhs,
+                               MDefinition* rhs);
+
+#endif
+
+}  
+}  
+
+#endif  // jit_ShuffleAnalysis_h

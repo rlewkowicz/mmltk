@@ -1,0 +1,283 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsBidiPresUtils_h_
+#define nsBidiPresUtils_h_
+
+#include "gfxContext.h"
+#include "mozilla/intl/BidiClass.h"
+#include "mozilla/intl/BidiEmbeddingLevel.h"
+#include "nsBidiUtils.h"
+#include "nsCoord.h"
+#include "nsHashKeys.h"
+#include "nsLineBox.h"
+#include "nsTArray.h"
+
+#ifdef DrawText
+#  undef DrawText
+#endif
+
+struct BidiParagraphData;
+class BidiLineData;
+class gfxContext;
+class nsFontMetrics;
+class nsIFrame;
+class nsBlockFrame;
+class nsPresContext;
+struct nsSize;
+template <class T>
+class nsTHashtable;
+namespace mozilla {
+namespace intl {
+class Bidi;
+}
+class ComputedStyle;
+class LogicalMargin;
+class WritingMode;
+}  
+
+struct nsFrameContinuationState : public nsVoidPtrHashKey {
+  explicit nsFrameContinuationState(const void* aFrame)
+      : nsVoidPtrHashKey(aFrame) {}
+
+  nsIFrame* mFirstVisualFrame{nullptr};
+
+  uint32_t mFrameCount{0};
+
+  bool mHasContOnPrevLines{false};
+
+  bool mHasContOnNextLines{false};
+};
+
+struct nsContinuationStates {
+  static constexpr size_t kArrayMax = 32;
+
+  bool mUseTable = false;
+  AutoTArray<nsFrameContinuationState, kArrayMax> mValues;
+  nsTHashtable<nsFrameContinuationState> mTable;
+
+  void Insert(nsIFrame* aFrame) {
+    if (MOZ_UNLIKELY(mUseTable)) {
+      mTable.PutEntry(aFrame);
+      return;
+    }
+    if (MOZ_LIKELY(mValues.Length() < kArrayMax)) {
+      mValues.AppendElement(aFrame);
+      return;
+    }
+    for (const auto& entry : mValues) {
+      mTable.PutEntry(entry.GetKey());
+    }
+    mTable.PutEntry(aFrame);
+    mValues.Clear();
+    mUseTable = true;
+  }
+
+  nsFrameContinuationState* Get(nsIFrame* aFrame) {
+    MOZ_ASSERT(mValues.IsEmpty() != mTable.IsEmpty(),
+               "expect entries to either be in mValues or in mTable");
+    if (mUseTable) {
+      return mTable.GetEntry(aFrame);
+    }
+    for (size_t i = 0, len = mValues.Length(); i != len; ++i) {
+      if (mValues[i].GetKey() == aFrame) {
+        return &mValues[i];
+      }
+    }
+    return nullptr;
+  }
+};
+
+struct nsBidiPositionResolve {
+  int32_t logicalIndex;
+  int32_t visualIndex;
+  int32_t visualLeftTwips;
+  int32_t visualWidth;
+};
+
+class nsBidiPresUtils {
+ public:
+  typedef mozilla::gfx::DrawTarget DrawTarget;
+
+  nsBidiPresUtils();
+  ~nsBidiPresUtils();
+
+  class BidiProcessor {
+   public:
+    virtual ~BidiProcessor() = default;
+
+    virtual void SetText(const char16_t* aText, int32_t aLength,
+                         mozilla::intl::BidiDirection aDirection) = 0;
+
+    virtual nscoord GetWidth() = 0;
+
+    virtual void DrawText(nscoord aXOffset) = 0;
+  };
+
+  static nsresult Resolve(nsBlockFrame* aBlockFrame);
+  static nsresult ResolveParagraph(BidiParagraphData* aBpd);
+  static void ResolveParagraphWithinBlock(BidiParagraphData* aBpd);
+
+  static nscoord ReorderFrames(nsIFrame* aFirstFrameOnLine,
+                               int32_t aNumFramesOnLine,
+                               mozilla::WritingMode aLineWM,
+                               const nsSize& aContainerSize, nscoord aStart);
+
+  static nsresult FormatUnicodeText(nsPresContext* aPresContext,
+                                    char16_t* aText, int32_t& aTextLength,
+                                    mozilla::intl::BidiClass aBidiClass);
+
+  static nsresult RenderText(const char16_t* aText, int32_t aLength,
+                             mozilla::intl::BidiEmbeddingLevel aBaseLevel,
+                             nsPresContext* aPresContext,
+                             gfxContext& aRenderingContext,
+                             DrawTarget* aTextRunConstructionDrawTarget,
+                             nsFontMetrics& aFontMetrics, nscoord aX,
+                             nscoord aY,
+                             nsBidiPositionResolve* aPosResolve = nullptr,
+                             int32_t aPosResolveCount = 0) {
+    return ProcessTextForRenderingContext(
+        aText, aLength, aBaseLevel, aPresContext, aRenderingContext,
+        aTextRunConstructionDrawTarget, aFontMetrics, MODE_DRAW, aX, aY,
+        aPosResolve, aPosResolveCount, nullptr);
+  }
+
+  static nscoord MeasureTextWidth(const char16_t* aText, int32_t aLength,
+                                  mozilla::intl::BidiEmbeddingLevel aBaseLevel,
+                                  nsPresContext* aPresContext,
+                                  gfxContext& aRenderingContext,
+                                  nsFontMetrics& aFontMetrics) {
+    nscoord length;
+    nsresult rv = ProcessTextForRenderingContext(
+        aText, aLength, aBaseLevel, aPresContext, aRenderingContext,
+        aRenderingContext.GetDrawTarget(), aFontMetrics, MODE_MEASURE, 0, 0,
+        nullptr, 0, &length);
+    return NS_SUCCEEDED(rv) ? length : 0;
+  }
+
+  static bool CheckLineOrder(nsIFrame* aFirstFrameOnLine,
+                             int32_t aNumFramesOnLine, nsIFrame** aLeftmost,
+                             nsIFrame** aRightmost);
+
+  static nsIFrame* GetFrameToRightOf(const nsIFrame* aFrame,
+                                     nsIFrame* aFirstFrameOnLine,
+                                     int32_t aNumFramesOnLine);
+
+  static nsIFrame* GetFrameToLeftOf(const nsIFrame* aFrame,
+                                    nsIFrame* aFirstFrameOnLine,
+                                    int32_t aNumFramesOnLine);
+
+  static nsIFrame* GetFirstLeaf(nsIFrame* aFrame);
+
+  static mozilla::FrameBidiData GetFrameBidiData(nsIFrame* aFrame);
+
+  static mozilla::intl::BidiEmbeddingLevel GetFrameEmbeddingLevel(
+      nsIFrame* aFrame);
+
+  static mozilla::intl::BidiEmbeddingLevel GetFrameBaseLevel(
+      const nsIFrame* aFrame);
+
+  static mozilla::intl::BidiDirection ParagraphDirection(
+      const nsIFrame* aFrame) {
+    return GetFrameBaseLevel(aFrame).Direction();
+  }
+
+  static mozilla::intl::BidiDirection FrameDirection(nsIFrame* aFrame) {
+    return GetFrameEmbeddingLevel(aFrame).Direction();
+  }
+
+  static bool IsFrameInParagraphDirection(nsIFrame* aFrame) {
+    return ParagraphDirection(aFrame) == FrameDirection(aFrame);
+  }
+
+  static bool IsReversedDirectionFrame(const nsIFrame* aFrame) {
+    mozilla::FrameBidiData bidiData = aFrame->GetBidiData();
+    return !bidiData.embeddingLevel.IsSameDirection(bidiData.baseLevel);
+  }
+
+  enum Mode { MODE_DRAW, MODE_MEASURE };
+
+  static nsresult ProcessText(const char16_t* aText, size_t aLength,
+                              mozilla::intl::BidiEmbeddingLevel aBaseLevel,
+                              nsPresContext* aPresContext,
+                              BidiProcessor& aprocessor, Mode aMode,
+                              nsBidiPositionResolve* aPosResolve,
+                              int32_t aPosResolveCount, nscoord* aWidth,
+                              mozilla::intl::Bidi& aBidiEngine);
+
+  static mozilla::intl::BidiEmbeddingLevel BidiLevelFromStyle(
+      mozilla::ComputedStyle* aComputedStyle);
+
+ private:
+  friend class BidiLineData;
+
+  static nsresult ProcessTextForRenderingContext(
+      const char16_t* aText, int32_t aLength,
+      mozilla::intl::BidiEmbeddingLevel aBaseLevel, nsPresContext* aPresContext,
+      gfxContext& aRenderingContext, DrawTarget* aTextRunConstructionDrawTarget,
+      nsFontMetrics& aFontMetrics, Mode aMode,
+      nscoord aX,                         
+      nscoord aY,                         
+      nsBidiPositionResolve* aPosResolve, 
+      int32_t aPosResolveCount, nscoord* aWidth );
+
+  static void ProcessSimpleRun(const char16_t* aText, size_t aLength,
+                               mozilla::intl::BidiEmbeddingLevel aBaseLevel,
+                               nsPresContext* aPresContext,
+                               BidiProcessor& aprocessor, Mode aMode,
+                               nsBidiPositionResolve* aPosResolve,
+                               int32_t aPosResolveCount, nscoord* aWidth);
+
+  static void TraverseFrames(nsIFrame* aCurrentFrame, BidiParagraphData* aBpd);
+
+  static bool ChildListMayRequireBidi(nsIFrame* aFirstChild,
+                                      nsIContent** aCurrContent);
+
+  static void RepositionRubyContentFrame(
+      nsIFrame* aFrame, mozilla::WritingMode aFrameWM,
+      const mozilla::LogicalMargin& aBorderPadding);
+
+  static nscoord RepositionRubyFrame(
+      nsIFrame* aFrame, nsContinuationStates* aContinuationStates,
+      const mozilla::WritingMode aContainerWM,
+      const mozilla::LogicalMargin& aBorderPadding);
+
+  static nscoord RepositionFrame(nsIFrame* aFrame, bool aIsEvenLevel,
+                                 nscoord aStartOrEnd,
+                                 nsContinuationStates* aContinuationStates,
+                                 mozilla::WritingMode aContainerWM,
+                                 bool aContainerReverseOrder,
+                                 const nsSize& aContainerSize);
+
+  static void InitContinuationStates(nsIFrame* aFrame,
+                                     nsContinuationStates* aContinuationStates);
+
+  static void IsFirstOrLast(nsIFrame* aFrame,
+                            nsContinuationStates* aContinuationStates,
+                            bool aSpanInLineOrder ,
+                            bool& aIsFirst , bool& aIsLast );
+
+  static nscoord RepositionInlineFrames(const BidiLineData& aBld,
+                                        mozilla::WritingMode aLineWM,
+                                        const nsSize& aContainerSize,
+                                        nscoord aStart);
+
+  static inline void EnsureBidiContinuation(nsIFrame* aFrame,
+                                            const nsLineList::iterator aLine,
+                                            nsIFrame** aNewFrame,
+                                            int32_t aStart, int32_t aEnd);
+
+  static void RemoveBidiContinuation(BidiParagraphData* aBpd, nsIFrame* aFrame,
+                                     int32_t aFirstIndex, int32_t aLastIndex);
+
+  static void CalculateBidiClass(const char16_t* aText, int32_t& aOffset,
+                                 int32_t aBidiClassLimit, int32_t& aRunLimit,
+                                 int32_t& aRunLength, int32_t& aRunCount,
+                                 mozilla::intl::BidiClass& aBidiClass,
+                                 mozilla::intl::BidiClass& aPrevBidiClass);
+
+  static void StripBidiControlCharacters(char16_t* aText, int32_t& aTextLength);
+};
+
+#endif /* nsBidiPresUtils_h_ */

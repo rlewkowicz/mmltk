@@ -1,0 +1,160 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+export class PageStyleChild extends JSWindowActorChild {
+  actorCreated() {
+    if (!this.browsingContext || !this.browsingContext.associatedWindow) {
+      return;
+    }
+    let { document } = this.browsingContext.associatedWindow;
+    if (document.readyState != "complete") {
+      return;
+    }
+    this.#collectAndSendSheets();
+  }
+
+  handleEvent(event) {
+    if (event?.type != "pageshow") {
+      throw new Error("Unexpected event!");
+    }
+
+    if (this.browsingContext.top === this.browsingContext) {
+      this.sendAsyncMessage("PageStyle:Clear");
+    }
+
+    this.#collectAndSendSheets();
+  }
+
+  receiveMessage(msg) {
+    switch (msg.name) {
+      case "PageStyle:Switch":
+        if (this.browsingContext.top == this.browsingContext) {
+          this.browsingContext.authorStyleDisabledDefault = false;
+        }
+        this.docShell.docViewer.authorStyleDisabled = false;
+        this._switchStylesheet(msg.data.title);
+        break;
+      case "PageStyle:Disable":
+        if (this.browsingContext.top == this.browsingContext) {
+          this.browsingContext.authorStyleDisabledDefault = true;
+        }
+        this.docShell.docViewer.authorStyleDisabled = true;
+        break;
+    }
+  }
+
+  _collectLinks(document) {
+    let result = [];
+    for (let link of document.querySelectorAll("link")) {
+      if (link.namespaceURI !== "http://www.w3.org/1999/xhtml") {
+        continue;
+      }
+      let isStyleSheet = Array.from(link.relList).some(
+        r => r.toLowerCase() == "stylesheet"
+      );
+      if (!isStyleSheet) {
+        continue;
+      }
+      if (!link.href) {
+        continue;
+      }
+      result.push(link);
+    }
+    return result;
+  }
+
+  _switchStylesheet(title) {
+    let document = this.document;
+    let docStyleSheets = Array.from(document.styleSheets);
+    let links;
+
+    let docContainsStyleSheet = !title;
+    if (title) {
+      links = this._collectLinks(document);
+      docContainsStyleSheet =
+        docStyleSheets.some(sheet => sheet.title == title) ||
+        links.some(link => link.title == title);
+    }
+
+    for (let sheet of docStyleSheets) {
+      if (sheet.title) {
+        if (docContainsStyleSheet) {
+          sheet.disabled = sheet.title !== title;
+        }
+      } else if (sheet.disabled) {
+        sheet.disabled = false;
+      }
+    }
+
+    if (title) {
+      for (let link of links) {
+        if (link.title == title && link.disabled) {
+          link.disabled = false;
+        }
+      }
+    }
+  }
+
+  #collectAndSendSheets() {
+    let window = this.browsingContext.associatedWindow;
+    window.requestIdleCallback(() => {
+      if (!window || window.closed) {
+        return;
+      }
+      let filteredStyleSheets = this.#collectStyleSheets(window);
+      this.sendAsyncMessage("PageStyle:Add", {
+        filteredStyleSheets,
+        preferredStyleSheetSet: this.document.preferredStyleSheetSet,
+      });
+    });
+  }
+
+  #collectStyleSheets(content) {
+    let result = [];
+    let document = content.document;
+
+    for (let sheet of document.styleSheets) {
+      let title = sheet.title;
+      if (!title) {
+        continue;
+      }
+
+      let media = sheet.media.mediaText;
+      if (media && !content.matchMedia(media).matches) {
+        continue;
+      }
+
+      if (
+        sheet.href &&
+        sheet.ownerNode &&
+        sheet.ownerNode.nodeName.toLowerCase() == "link"
+      ) {
+        continue;
+      }
+
+      let disabled = sheet.disabled;
+      result.push({ title, disabled });
+    }
+
+    for (let link of this._collectLinks(document)) {
+      let title = link.title;
+      if (!title) {
+        continue;
+      }
+
+      let media = link.media;
+      if (media && !content.matchMedia(media).matches) {
+        continue;
+      }
+
+      let disabled =
+        link.disabled ||
+        !!link.sheet?.disabled ||
+        document.preferredStyleSheetSet != title;
+      result.push({ title, disabled });
+    }
+
+    return result;
+  }
+}

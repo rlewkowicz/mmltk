@@ -1,0 +1,32 @@
+
+[package]
+edition = "2021"
+name = "libcrux-sha2"
+version = "0.0.3"
+authors = ["Cryspen"]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Formally verified SHA2 hash library"
+homepage = "https://github.com/cryspen/libcrux"
+license = "Apache-2.0"
+repository = "https://github.com/cryspen/libcrux"
+
+[features]
+expose-hacl = []
+
+[lib]
+name = "libcrux_sha2"
+path = "src/lib.rs"
+
+[dependencies.libcrux-hacl-rs]
+version = "=0.0.3"
+
+[dependencies.libcrux-macros]
+version = "=0.0.3"
+
+[dependencies.libcrux-traits]
+version = "=0.0.3"

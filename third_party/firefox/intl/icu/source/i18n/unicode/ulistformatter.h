@@ -1,0 +1,103 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*****************************************************************************************
+* Copyright (C) 2015-2016, International Business Machines
+* Corporation and others. All Rights Reserved.
+*****************************************************************************************
+*/
+
+#ifndef ULISTFORMATTER_H
+#define ULISTFORMATTER_H
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/uformattedvalue.h"
+
+#if U_SHOW_CPLUSPLUS_API
+#include "unicode/localpointer.h"
+#endif   // U_SHOW_CPLUSPLUS_API
+
+
+struct UListFormatter;
+typedef struct UListFormatter UListFormatter;  
+
+struct UFormattedList;
+typedef struct UFormattedList UFormattedList;
+
+typedef enum UListFormatterField {
+    ULISTFMT_LITERAL_FIELD,
+    ULISTFMT_ELEMENT_FIELD
+} UListFormatterField;
+
+typedef enum UListFormatterType {
+    ULISTFMT_TYPE_AND,
+
+    ULISTFMT_TYPE_OR,
+
+    ULISTFMT_TYPE_UNITS
+} UListFormatterType;
+
+typedef enum UListFormatterWidth {
+    ULISTFMT_WIDTH_WIDE,
+
+    ULISTFMT_WIDTH_SHORT,
+
+    ULISTFMT_WIDTH_NARROW,
+} UListFormatterWidth;
+
+U_CAPI UListFormatter* U_EXPORT2
+ulistfmt_open(const char*  locale,
+              UErrorCode*  status);
+
+U_CAPI UListFormatter* U_EXPORT2
+ulistfmt_openForType(const char*  locale, UListFormatterType type,
+                     UListFormatterWidth width, UErrorCode*  status);
+
+U_CAPI void U_EXPORT2
+ulistfmt_close(UListFormatter *listfmt);
+
+U_CAPI UFormattedList* U_EXPORT2
+ulistfmt_openResult(UErrorCode* ec);
+
+U_CAPI const UFormattedValue* U_EXPORT2
+ulistfmt_resultAsValue(const UFormattedList* uresult, UErrorCode* ec);
+
+U_CAPI void U_EXPORT2
+ulistfmt_closeResult(UFormattedList* uresult);
+
+
+#if U_SHOW_CPLUSPLUS_API
+
+U_NAMESPACE_BEGIN
+
+U_DEFINE_LOCAL_OPEN_POINTER(LocalUListFormatterPointer, UListFormatter, ulistfmt_close);
+
+U_DEFINE_LOCAL_OPEN_POINTER(LocalUFormattedListPointer, UFormattedList, ulistfmt_closeResult);
+
+U_NAMESPACE_END
+
+#endif
+
+U_CAPI int32_t U_EXPORT2
+ulistfmt_format(const UListFormatter* listfmt,
+                const UChar* const strings[],
+                const int32_t *    stringLengths,
+                int32_t            stringCount,
+                UChar*             result,
+                int32_t            resultCapacity,
+                UErrorCode*        status);
+
+U_CAPI void U_EXPORT2
+ulistfmt_formatStringsToResult(
+                const UListFormatter* listfmt,
+                const UChar* const strings[],
+                const int32_t *    stringLengths,
+                int32_t            stringCount,
+                UFormattedList*    uresult,
+                UErrorCode*        status);
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+
+#endif

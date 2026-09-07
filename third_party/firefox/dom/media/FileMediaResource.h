@@ -1,0 +1,104 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_media_FileMediaResource_h
+#define mozilla_dom_media_FileMediaResource_h
+
+#include "BaseMediaResource.h"
+#include "mozilla/Mutex.h"
+
+namespace mozilla {
+
+class FileMediaResource : public BaseMediaResource {
+ public:
+  FileMediaResource(MediaResourceCallback* aCallback, nsIChannel* aChannel,
+                    nsIURI* aURI, int64_t aSize = -1 )
+      : BaseMediaResource(aCallback, aChannel, aURI),
+        mSize(aSize),
+        mLock("FileMediaResource.mLock"),
+        mSizeInitialized(aSize != -1) {}
+  ~FileMediaResource() = default;
+
+  nsresult Open(nsIStreamListener** aStreamListener) override;
+  RefPtr<GenericPromise> Close() override;
+  void Suspend(bool aCloseImmediately) override {}
+  void Resume() override {}
+  already_AddRefed<nsIPrincipal> GetCurrentPrincipal() override;
+  bool HadCrossOriginRedirects() override;
+  nsresult ReadFromCache(char* aBuffer, int64_t aOffset,
+                         uint32_t aCount) override;
+
+
+  void SetReadMode(MediaCacheStream::ReadMode aMode) override {}
+  void SetPlaybackRate(uint32_t aBytesPerSecond) override {}
+  nsresult ReadAt(int64_t aOffset, char* aBuffer, uint32_t aCount,
+                  uint32_t* aBytes) override;
+  bool ShouldCacheReads() override { return true; }
+
+  void Pin() override {}
+  void Unpin() override {}
+  double GetDownloadRate(bool* aIsReliable) override {
+    *aIsReliable = true;
+    return 100 * 1024 * 1024;  
+  }
+
+  int64_t GetLength() override {
+    MutexAutoLock lock(mLock);
+
+    EnsureSizeInitialized();
+    return mSizeInitialized ? mSize : 0;
+  }
+
+  int64_t GetNextCachedData(int64_t aOffset) override {
+    MutexAutoLock lock(mLock);
+
+    EnsureSizeInitialized();
+    return (aOffset < mSize) ? aOffset : -1;
+  }
+
+  int64_t GetCachedDataEnd(int64_t aOffset) override {
+    MutexAutoLock lock(mLock);
+
+    EnsureSizeInitialized();
+    return std::max(aOffset, mSize);
+  }
+  bool IsDataCachedToEndOfResource(int64_t aOffset) override { return true; }
+  bool IsTransportSeekable() override { return true; }
+
+  nsresult GetCachedRanges(MediaByteRangeSet& aRanges) override;
+
+  size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const override {
+    return BaseMediaResource::SizeOfExcludingThis(aMallocSizeOf);
+  }
+
+  size_t SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const override {
+    return aMallocSizeOf(this) + SizeOfExcludingThis(aMallocSizeOf);
+  }
+
+ protected:
+  nsresult UnsafeRead(char* aBuffer, uint32_t aCount, uint32_t* aBytes)
+      MOZ_REQUIRES(mLock);
+  nsresult UnsafeSeek(int32_t aWhence, int64_t aOffset) MOZ_REQUIRES(mLock);
+
+ private:
+  void EnsureSizeInitialized() MOZ_REQUIRES(mLock);
+  already_AddRefed<MediaByteBuffer> UnsafeMediaReadAt(int64_t aOffset,
+                                                      uint32_t aCount)
+      MOZ_REQUIRES(mLock);
+
+  int64_t mSize MOZ_GUARDED_BY(mLock);
+
+  Mutex mLock;
+
+  nsCOMPtr<nsISeekableStream> mSeekable MOZ_GUARDED_BY(mLock);
+
+  nsCOMPtr<nsIInputStream> mInput MOZ_GUARDED_BY(mLock);
+
+  bool mSizeInitialized MOZ_GUARDED_BY(mLock);
+  bool mNotifyDataEndedProcessed = false;
+};
+
+}  
+
+#endif  // mozilla_dom_media_FileMediaResource_h

@@ -1,0 +1,368 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#include "nsPageContentFrame.h"
+
+#include "mozilla/AbsoluteContainingBlock.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/PresShellInlines.h"
+#include "mozilla/ReflowInput.h"
+#include "mozilla/ServoStyleSet.h"
+#include "mozilla/StaticPrefs_layout.h"
+#include "mozilla/dom/Document.h"
+#include "nsCSSFrameConstructor.h"
+#include "nsContentUtils.h"
+#include "nsLayoutUtils.h"
+#include "nsPageFrame.h"
+#include "nsPageSequenceFrame.h"
+#include "nsPresContext.h"
+
+using namespace mozilla;
+
+nsPageContentFrame* NS_NewPageContentFrame(
+    PresShell* aPresShell, ComputedStyle* aStyle,
+    already_AddRefed<const nsAtom> aPageName) {
+  return new (aPresShell) nsPageContentFrame(
+      aStyle, aPresShell->GetPresContext(), std::move(aPageName));
+}
+
+NS_IMPL_FRAMEARENA_HELPERS(nsPageContentFrame)
+
+void nsPageContentFrame::Reflow(nsPresContext* aPresContext,
+                                ReflowOutput& aReflowOutput,
+                                const ReflowInput& aReflowInput,
+                                nsReflowStatus& aStatus) {
+  MarkInReflow();
+  DO_GLOBAL_REFLOW_COUNT("nsPageContentFrame");
+  MOZ_ASSERT(aStatus.IsEmpty(), "Caller should pass a fresh reflow status!");
+  MOZ_ASSERT(mPD, "Need a pointer to nsSharedPageData before reflow starts");
+
+  if (GetPrevInFlow() && HasAnyStateBits(NS_FRAME_FIRST_REFLOW)) {
+    nsresult rv =
+        aPresContext->PresShell()->FrameConstructor()->ReplicateFixedFrames(
+            this);
+    if (NS_FAILED(rv)) {
+      return;
+    }
+  }
+
+  const nsSize maxSize = aReflowInput.ComputedPhysicalSize();
+  SetSize(maxSize);
+
+  const WritingMode pcfWM = aReflowInput.GetWritingMode();
+  aReflowOutput.ISize(pcfWM) = aReflowInput.ComputedISize();
+  if (aReflowInput.ComputedBSize() != NS_UNCONSTRAINEDSIZE) {
+    aReflowOutput.BSize(pcfWM) = aReflowInput.ComputedBSize();
+  }
+  aReflowOutput.SetOverflowAreasToDesiredBounds();
+
+  if (mFrames.NotEmpty()) {
+    nsIFrame* const frame = mFrames.FirstChild();
+    const WritingMode frameWM = frame->GetWritingMode();
+    const LogicalSize logicalSize(frameWM, maxSize);
+    LogicalSize availSize = logicalSize;
+    if (aReflowInput.mFlags.mIsInFragmentainerMeasuringReflow) {
+      availSize.BSize(frameWM) = NS_UNCONSTRAINEDSIZE;
+    }
+    ReflowInput kidReflowInput(aPresContext, aReflowInput, frame, availSize);
+    kidReflowInput.SetComputedBSize(logicalSize.BSize(frameWM));
+    ReflowOutput kidReflowOutput(kidReflowInput);
+    ReflowChild(frame, aPresContext, kidReflowOutput, kidReflowInput, 0, 0,
+                ReflowChildFlags::Default, aStatus);
+
+    nsMargin padding(0, 0, 0, 0);
+
+    frame->StylePadding()->GetPadding(padding);
+
+    if (frame->HasOverflowAreas()) {
+      nscoord xmost = kidReflowOutput.ScrollableOverflow().XMost();
+      if (xmost > kidReflowOutput.Width()) {
+        const nscoord widthToFit =
+            xmost + padding.right +
+            kidReflowInput.mStyleBorder->GetComputedBorderWidth(eSideRight);
+        const float ratio = float(maxSize.width) / float(widthToFit);
+        NS_ASSERTION(ratio >= 0.0 && ratio < 1.0,
+                     "invalid shrink-to-fit ratio");
+        mPD->mShrinkToFitRatio = std::min(mPD->mShrinkToFitRatio, ratio);
+      }
+      if (nsContentUtils::IsPDFJS(PresContext()->Document()->GetPrincipal())) {
+        nscoord ymost = kidReflowOutput.ScrollableOverflow().YMost();
+        if (ymost > kidReflowOutput.Height()) {
+          const nscoord heightToFit =
+              ymost + padding.bottom +
+              kidReflowInput.mStyleBorder->GetComputedBorderWidth(eSideBottom);
+          const float ratio = float(maxSize.height) / float(heightToFit);
+          MOZ_ASSERT(ratio >= 0.0 && ratio < 1.0);
+          mPD->mShrinkToFitRatio = std::min(mPD->mShrinkToFitRatio, ratio);
+        }
+
+        frame->ClearOverflowRects();
+        kidReflowOutput.mOverflowAreas = aReflowOutput.mOverflowAreas;
+      }
+    }
+
+    FinishReflowChild(frame, aPresContext, kidReflowOutput, &kidReflowInput, 0,
+                      0, ReflowChildFlags::Default);
+
+    NS_ASSERTION(aPresContext->IsDynamic() || !aStatus.IsFullyComplete() ||
+                     !frame->GetNextInFlow(),
+                 "bad child flow list");
+
+    aReflowOutput.mOverflowAreas.UnionWith(kidReflowOutput.mOverflowAreas);
+  }
+
+  FinishAndStoreOverflow(&aReflowOutput);
+
+  nsReflowStatus fixedStatus;
+  if (auto* absCB = GetAbsoluteContainingBlock();
+      absCB && absCB->HasAbsoluteFrames()) {
+    const auto wm = GetWritingMode();
+    LogicalRect cbRect(wm, LogicalPoint(wm), aReflowOutput.Size(wm));
+    cbRect.Deflate(wm, GetLogicalUsedBorder(wm).ApplySkipSides(
+                           PreReflowBlockLevelLogicalSkipSides()));
+
+    AbsPosReflowFlags flags{AbsPosReflowFlag::CBWidthChanged,
+                            AbsPosReflowFlag::CBHeightChanged};
+
+    absCB->Reflow(this, aPresContext, aReflowInput, fixedStatus,
+                  cbRect.GetPhysicalRect(wm, aReflowOutput.PhysicalSize()),
+                  flags,
+                   nullptr);
+  }
+  NS_ASSERTION(fixedStatus.IsComplete(),
+               "fixed frames can be truncated, but not incomplete");
+
+  if (StaticPrefs::layout_display_list_improve_fragmentation() &&
+      mFrames.NotEmpty() &&
+      !aReflowInput.mFlags.mIsInFragmentainerMeasuringReflow) {
+    auto* const previous =
+        static_cast<nsPageContentFrame*>(GetPrevContinuation());
+    const nscoord previousPageOverflow =
+        previous ? previous->mRemainingOverflow : 0;
+    const nsSize containerSize(aReflowInput.AvailableWidth(),
+                               aReflowInput.AvailableHeight());
+    const nscoord pageBSize = GetLogicalRect(containerSize).BSize(pcfWM);
+    const nscoord overflowBSize =
+        LogicalRect(pcfWM, ScrollableOverflowRect(), GetSize()).BEnd(pcfWM);
+    const nscoord currentPageOverflow = overflowBSize - pageBSize;
+    nscoord remainingOverflow =
+        std::max(currentPageOverflow, previousPageOverflow - pageBSize);
+
+    if (aStatus.IsFullyComplete() && remainingOverflow > 0) {
+      aStatus.SetOverflowIncomplete();
+    }
+
+    mRemainingOverflow = std::max(remainingOverflow, 0);
+  }
+}
+
+using PageAndOffset = std::pair<nsPageContentFrame*, nscoord>;
+
+static nsTArray<PageAndOffset> GetPreviousPagesWithOverflow(
+    nsPageContentFrame* aPage) {
+  nsTArray<PageAndOffset> pages(8);
+
+  auto GetPreviousPageContentFrame = [](nsPageContentFrame* aPageCF) {
+    nsIFrame* prevCont = aPageCF->GetPrevContinuation();
+    MOZ_ASSERT(!prevCont || prevCont->IsPageContentFrame(),
+               "Expected nsPageContentFrame or nullptr");
+
+    return static_cast<nsPageContentFrame*>(prevCont);
+  };
+
+  nsPageContentFrame* pageCF = aPage;
+  nscoord offsetToCurrentPageBStart = 0;
+  const auto wm = pageCF->GetWritingMode();
+  while ((pageCF = GetPreviousPageContentFrame(pageCF))) {
+    offsetToCurrentPageBStart += pageCF->BSize(wm);
+
+    if (pageCF->HasOverflowAreas()) {
+      pages.EmplaceBack(pageCF, offsetToCurrentPageBStart);
+    }
+  }
+
+  return pages;
+}
+
+static void BuildPreviousPageOverflow(nsDisplayListBuilder* aBuilder,
+                                      nsPageFrame* aPageFrame,
+                                      nsPageContentFrame* aCurrentPageCF,
+                                      const nsDisplayListSet& aLists) {
+  const auto previousPagesAndOffsets =
+      GetPreviousPagesWithOverflow(aCurrentPageCF);
+
+  const auto wm = aCurrentPageCF->GetWritingMode();
+  for (const PageAndOffset& pair : Reversed(previousPagesAndOffsets)) {
+    auto* prevPageCF = pair.first;
+    const nscoord offsetToCurrentPageBStart = pair.second;
+    const LogicalRect scrollableOverflow(
+        wm, prevPageCF->ScrollableOverflowRectRelativeToSelf(),
+        prevPageCF->GetSize());
+    const auto remainingOverflow =
+        scrollableOverflow.BEnd(wm) - offsetToCurrentPageBStart;
+    if (remainingOverflow <= 0) {
+      continue;
+    }
+
+    LogicalRect overflowRect(wm, prevPageCF->InkOverflowRectRelativeToSelf(),
+                             prevPageCF->GetSize());
+    overflowRect.BStart(wm) = offsetToCurrentPageBStart;
+    overflowRect.BSize(wm) = std::min(remainingOverflow, prevPageCF->BSize(wm));
+
+    {
+      const nsRect visibleRect =
+          overflowRect.GetPhysicalRect(wm, prevPageCF->GetSize()) +
+          prevPageCF->GetOffsetTo(aPageFrame);
+      nsDisplayListBuilder::AutoBuildingDisplayList buildingForChild(
+          aBuilder, aPageFrame, visibleRect, visibleRect);
+
+      const nsSize containerSize = aPageFrame->GetSize();
+      LogicalPoint pageOffset(wm, aCurrentPageCF->GetOffsetTo(prevPageCF),
+                              containerSize);
+      pageOffset.B(wm) -= offsetToCurrentPageBStart;
+      buildingForChild.SetAdditionalOffset(
+          pageOffset.GetPhysicalPoint(wm, containerSize));
+
+      aPageFrame->BuildDisplayListForChild(aBuilder, prevPageCF, aLists);
+    }
+  }
+}
+
+static void PruneDisplayListForExtraPage(nsDisplayListBuilder* aBuilder,
+                                         nsPageFrame* aPage,
+                                         nsDisplayList* aList) {
+  for (nsDisplayItem* i : aList->TakeItems()) {
+    if (!i) {
+      break;
+    }
+    nsDisplayList* subList = i->GetSameCoordinateSystemChildren();
+    if (subList) {
+      PruneDisplayListForExtraPage(aBuilder, aPage, subList);
+      i->UpdateBounds(aBuilder);
+    } else {
+      nsIFrame* f = i->Frame();
+      if (!nsLayoutUtils::IsProperAncestorFrameCrossDocInProcess(aPage, f)) {
+        i->Destroy(aBuilder);
+        continue;
+      }
+    }
+    aList->AppendToTop(i);
+  }
+}
+
+static void BuildDisplayListForExtraPage(nsDisplayListBuilder* aBuilder,
+                                         nsPageFrame* aPage,
+                                         nsIFrame* aExtraPage,
+                                         nsDisplayList* aList) {
+  if (!aExtraPage->HasAnyStateBits(NS_FRAME_FORCE_DISPLAY_LIST_DESCEND_INTO)) {
+    return;
+  }
+  nsDisplayList list(aBuilder);
+  aExtraPage->BuildDisplayListForStackingContext(aBuilder, &list);
+  PruneDisplayListForExtraPage(aBuilder, aPage, &list);
+  aList->AppendToTop(&list);
+}
+
+static gfx::Matrix4x4 ComputePageContentTransform(const nsIFrame* aFrame,
+                                                  float aAppUnitsPerPixel) {
+  float scale = aFrame->PresContext()->GetPageScale();
+  return gfx::Matrix4x4::Scaling(scale, scale, 1);
+}
+
+nsIFrame::ComputeTransformFunction nsPageContentFrame::GetTransformGetter()
+    const {
+  return ComputePageContentTransform;
+}
+
+void nsPageContentFrame::BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                                          const nsDisplayListSet& aLists) {
+  MOZ_ASSERT(GetParent());
+  MOZ_ASSERT(GetParent()->IsPageFrame());
+  auto* pageFrame = static_cast<nsPageFrame*>(GetParent());
+
+  if (auto pageNum = aBuilder->GetBuildingPageNum()) {
+    nsDisplayListBuilder::AutoPageNumberSetter p(
+        aBuilder, pageNum,  true);
+    return mozilla::ViewportFrame::BuildDisplayList(aBuilder, aLists);
+  }
+
+  nsDisplayListCollection set(aBuilder);
+
+  nsDisplayList content(aBuilder);
+  {
+    nsDisplayListBuilder::AutoPageNumberSetter p(aBuilder,
+                                                 pageFrame->GetPageNum());
+    NS_ASSERTION(!aBuilder->AvoidBuildingDuplicateOofs(),
+                 "Too many pages to handle OOFs");
+    const nsRect clipRect(aBuilder->ToReferenceFrame(this), GetSize());
+    DisplayListClipState::AutoSaveRestore clipState(aBuilder);
+
+    clipState.Clear();
+    clipState.ClipContentDescendants(clipRect);
+
+    if (StaticPrefs::layout_display_list_improve_fragmentation() &&
+        !aBuilder->AvoidBuildingDuplicateOofs()) {
+      BuildPreviousPageOverflow(aBuilder, pageFrame, this, set);
+    }
+    mozilla::ViewportFrame::BuildDisplayList(aBuilder, set);
+
+    set.SerializeWithCorrectZOrder(&content, GetContent());
+
+    if (!aBuilder->AvoidBuildingDuplicateOofs()) {
+      const nsRect overflowRect = ScrollableOverflowRectRelativeToSelf();
+      auto* pageCF = this;
+      while ((pageCF = static_cast<nsPageContentFrame*>(
+                  pageCF->GetNextContinuation()))) {
+        nsRect childVisible = overflowRect + GetOffsetTo(pageCF);
+
+        nsDisplayListBuilder::AutoBuildingDisplayList buildingForChild(
+            aBuilder, pageCF, childVisible, childVisible);
+        BuildDisplayListForExtraPage(aBuilder, pageFrame, pageCF, &content);
+      }
+    }
+  }
+
+  content.AppendNewToTop<nsDisplayTransform>(
+      aBuilder, this, &content, content.GetBuildingRect(),
+      nsDisplayTransform::WithTransformGetter);
+
+  aLists.Content()->AppendToTop(&content);
+}
+
+void nsPageContentFrame::AppendDirectlyOwnedAnonBoxes(
+    nsTArray<OwnedAnonBox>& aResult) {
+  MOZ_ASSERT(mFrames.FirstChild(),
+             "pageContentFrame must have a canvasFrame child");
+  aResult.AppendElement(mFrames.FirstChild());
+}
+
+void nsPageContentFrame::EnsurePageName() {
+  if (mPageName) {
+    return;
+  }
+  MOZ_ASSERT(HasAnyStateBits(NS_FRAME_FIRST_REFLOW),
+             "Should only have been called on first reflow");
+
+  MOZ_ASSERT(!GetPrevInFlow(),
+             "Only the first page should initially have a null page name.");
+  mPageName = ComputePageValue();
+
+  MOZ_ASSERT(mPageName, "Page name should never be null");
+  RefPtr<ComputedStyle> pageContentPseudoStyle =
+      PresShell()->StyleSet()->ResolvePageContentStyle(
+          mPageName, StylePagePseudoClassFlags::FIRST);
+  SetComputedStyleWithoutNotification(pageContentPseudoStyle);
+}
+
+#ifdef DEBUG_FRAME_DUMP
+nsresult nsPageContentFrame::GetFrameName(nsAString& aResult) const {
+  return MakeFrameName(u"PageContent"_ns, aResult);
+}
+void nsPageContentFrame::ExtraContainerFrameInfo(nsACString& aTo, bool) const {
+  if (mPageName) {
+    aTo += " [page=";
+    aTo += nsAtomCString(mPageName);
+    aTo += "]";
+  }
+}
+#endif

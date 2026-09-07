@@ -1,0 +1,3870 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "HTMLEditUtils.h"
+
+#include "AutoClonedRangeArray.h"  // for AutoClonedRangeArray
+#include "CSSEditUtils.h"          // for CSSEditUtils
+#include "EditAction.h"            // for EditAction
+#include "EditorBase.h"            // for EditorBase, EditorType
+#include "EditorDOMPoint.h"        // for EditorDOMPoint, etc.
+#include "EditorForwards.h"        // for CollectChildrenOptions
+#include "EditorUtils.h"           // for EditorUtils
+#include "HTMLEditHelpers.h"       // for EditorInlineStyle
+#include "WSRunScanner.h"          // for WSRunScanner
+
+#include "mozilla/Assertions.h"  // for MOZ_ASSERT, etc.
+#include "mozilla/Attributes.h"
+#include "mozilla/StaticPrefs_editor.h"       // for StaticPrefs::editor_
+#include "mozilla/RangeUtils.h"               // for RangeUtils
+#include "mozilla/dom/CharacterDataBuffer.h"  // for CharacterDataBuffer
+#include "mozilla/dom/DocumentInlines.h"      // for GetBodyElement()
+#include "mozilla/dom/Element.h"              // for Element, nsINode
+#include "mozilla/dom/ElementInlines.h"  // for IsContentEditablePlainTextOnly()
+#include "mozilla/dom/HTMLAnchorElement.h"
+#include "mozilla/dom/HTMLBodyElement.h"
+#include "mozilla/dom/HTMLInputElement.h"
+#include "mozilla/ServoCSSParser.h"  // for ServoCSSParser
+#include "mozilla/dom/StaticRange.h"
+#include "mozilla/dom/Text.h"  // for Text
+
+#include "nsAString.h"    // for nsAString::IsEmpty
+#include "nsAtom.h"       // for nsAtom
+#include "nsAttrValue.h"  // nsAttrValue
+#include "nsCaseTreatment.h"
+#include "nsCOMPtr.h"            // for nsCOMPtr, operator==, etc.
+#include "nsComputedDOMStyle.h"  // for nsComputedDOMStyle
+#include "nsDebug.h"             // for NS_ASSERTION, etc.
+#include "nsElementTable.h"      // for nsHTMLElement
+#include "nsError.h"             // for NS_SUCCEEDED
+#include "nsGkAtoms.h"           // for nsGkAtoms, nsGkAtoms::a, etc.
+#include "nsHTMLTags.h"
+#include "nsIContentInlines.h"  // for nsIContent::IsInDesignMode(), etc.
+#include "nsIObjectLoadingContent.h"
+#include "nsLiteralString.h"     // for NS_LITERAL_STRING
+#include "nsNameSpaceManager.h"  // for kNameSpaceID_None
+#include "nsPrintfCString.h"     // nsPringfCString
+#include "nsString.h"            // for nsAutoString
+#include "nsStyledElement.h"
+#include "nsStyleStruct.h"  // for StyleDisplay
+#include "nsStyleUtil.h"    // for nsStyleUtil
+#include "nsTextFrame.h"    // for nsTextFrame
+
+namespace mozilla {
+
+using namespace dom;
+using EditorType = EditorBase::EditorType;
+
+template nsIContent* HTMLEditUtils::GetNextLeafContentOrNextBlockElementImpl(
+    const EditorDOMPoint&, StopAtBlockSibling, const LeafNodeOptions&,
+    BlockInlineCheck, const Element*);
+template nsIContent* HTMLEditUtils::GetNextLeafContentOrNextBlockElementImpl(
+    const EditorRawDOMPoint&, StopAtBlockSibling, const LeafNodeOptions&,
+    BlockInlineCheck, const Element*);
+template nsIContent* HTMLEditUtils::GetNextLeafContentOrNextBlockElementImpl(
+    const EditorDOMPointInText&, StopAtBlockSibling, const LeafNodeOptions&,
+    BlockInlineCheck, const Element*);
+template nsIContent* HTMLEditUtils::GetNextLeafContentOrNextBlockElementImpl(
+    const EditorRawDOMPointInText&, StopAtBlockSibling, const LeafNodeOptions&,
+    BlockInlineCheck, const Element*);
+
+template nsIContent*
+HTMLEditUtils::GetPreviousLeafContentOrPreviousBlockElementImpl(
+    const EditorDOMPoint&, StopAtBlockSibling, const LeafNodeOptions&,
+    BlockInlineCheck, const Element*);
+template nsIContent*
+HTMLEditUtils::GetPreviousLeafContentOrPreviousBlockElementImpl(
+    const EditorRawDOMPoint&, StopAtBlockSibling, const LeafNodeOptions&,
+    BlockInlineCheck, const Element*);
+template nsIContent*
+HTMLEditUtils::GetPreviousLeafContentOrPreviousBlockElementImpl(
+    const EditorDOMPointInText&, StopAtBlockSibling, const LeafNodeOptions&,
+    BlockInlineCheck, const Element*);
+template nsIContent*
+HTMLEditUtils::GetPreviousLeafContentOrPreviousBlockElementImpl(
+    const EditorRawDOMPointInText&, StopAtBlockSibling, const LeafNodeOptions&,
+    BlockInlineCheck, const Element*);
+
+template EditorDOMPoint HTMLEditUtils::GetPreviousEditablePoint(
+    nsIContent& aContent, const Element* aAncestorLimiter,
+    InvisibleWhiteSpaces aInvisibleWhiteSpaces,
+    TableBoundary aHowToTreatTableBoundary);
+template EditorRawDOMPoint HTMLEditUtils::GetPreviousEditablePoint(
+    nsIContent& aContent, const Element* aAncestorLimiter,
+    InvisibleWhiteSpaces aInvisibleWhiteSpaces,
+    TableBoundary aHowToTreatTableBoundary);
+template EditorDOMPoint HTMLEditUtils::GetNextEditablePoint(
+    nsIContent& aContent, const Element* aAncestorLimiter,
+    InvisibleWhiteSpaces aInvisibleWhiteSpaces,
+    TableBoundary aHowToTreatTableBoundary);
+template EditorRawDOMPoint HTMLEditUtils::GetNextEditablePoint(
+    nsIContent& aContent, const Element* aAncestorLimiter,
+    InvisibleWhiteSpaces aInvisibleWhiteSpaces,
+    TableBoundary aHowToTreatTableBoundary);
+
+template EditorDOMPoint HTMLEditUtils::LineRequiresPaddingLineBreakToBeVisible(
+    const EditorDOMPoint& aPoint, const Element& aEditingHost);
+template EditorDOMPoint HTMLEditUtils::LineRequiresPaddingLineBreakToBeVisible(
+    const EditorRawDOMPoint& aPoint, const Element& aEditingHost);
+template EditorDOMPoint HTMLEditUtils::LineRequiresPaddingLineBreakToBeVisible(
+    const EditorDOMPointInText& aPoint, const Element& aEditingHost);
+template EditorDOMPoint HTMLEditUtils::LineRequiresPaddingLineBreakToBeVisible(
+    const EditorRawDOMPointInText& aPoint, const Element& aEditingHost);
+
+template nsIContent* HTMLEditUtils::GetContentToPreserveInlineStyles(
+    const EditorDOMPoint& aPoint, const Element& aEditingHost);
+template nsIContent* HTMLEditUtils::GetContentToPreserveInlineStyles(
+    const EditorRawDOMPoint& aPoint, const Element& aEditingHost);
+
+template EditorDOMPoint HTMLEditUtils::GetBetterInsertionPointFor(
+    const nsIContent& aContentToInsert, const EditorDOMPoint& aPointToInsert);
+template EditorRawDOMPoint HTMLEditUtils::GetBetterInsertionPointFor(
+    const nsIContent& aContentToInsert,
+    const EditorRawDOMPoint& aPointToInsert);
+template EditorDOMPoint HTMLEditUtils::GetBetterInsertionPointFor(
+    const nsIContent& aContentToInsert,
+    const EditorRawDOMPoint& aPointToInsert);
+template EditorRawDOMPoint HTMLEditUtils::GetBetterInsertionPointFor(
+    const nsIContent& aContentToInsert, const EditorDOMPoint& aPointToInsert);
+
+template EditorDOMPoint HTMLEditUtils::GetBetterCaretPositionToInsertText(
+    const EditorDOMPoint& aPoint);
+template EditorDOMPoint HTMLEditUtils::GetBetterCaretPositionToInsertText(
+    const EditorRawDOMPoint& aPoint);
+template EditorRawDOMPoint HTMLEditUtils::GetBetterCaretPositionToInsertText(
+    const EditorDOMPoint& aPoint);
+template EditorRawDOMPoint HTMLEditUtils::GetBetterCaretPositionToInsertText(
+    const EditorRawDOMPoint& aPoint);
+
+template Result<EditorDOMPoint, nsresult>
+HTMLEditUtils::ComputePointToPutCaretInElementIfOutside(
+    const Element& aElement, const EditorDOMPoint& aCurrentPoint);
+template Result<EditorRawDOMPoint, nsresult>
+HTMLEditUtils::ComputePointToPutCaretInElementIfOutside(
+    const Element& aElement, const EditorDOMPoint& aCurrentPoint);
+template Result<EditorDOMPoint, nsresult>
+HTMLEditUtils::ComputePointToPutCaretInElementIfOutside(
+    const Element& aElement, const EditorRawDOMPoint& aCurrentPoint);
+template Result<EditorRawDOMPoint, nsresult>
+HTMLEditUtils::ComputePointToPutCaretInElementIfOutside(
+    const Element& aElement, const EditorRawDOMPoint& aCurrentPoint);
+
+template Maybe<EditorLineBreak>
+HTMLEditUtils::GetLineBreakBeforeBlockBoundaryIfPointIsBetweenThem(
+    const EditorDOMPoint&, const Element&);
+template Maybe<EditorRawLineBreak>
+HTMLEditUtils::GetLineBreakBeforeBlockBoundaryIfPointIsBetweenThem(
+    const EditorDOMPoint&, const Element&);
+template Maybe<EditorLineBreak>
+HTMLEditUtils::GetLineBreakBeforeBlockBoundaryIfPointIsBetweenThem(
+    const EditorRawDOMPoint&, const Element&);
+template Maybe<EditorRawLineBreak>
+HTMLEditUtils::GetLineBreakBeforeBlockBoundaryIfPointIsBetweenThem(
+    const EditorRawDOMPoint&, const Element&);
+template Maybe<EditorLineBreak>
+HTMLEditUtils::GetLineBreakBeforeBlockBoundaryIfPointIsBetweenThem(
+    const EditorDOMPointInText&, const Element&);
+template Maybe<EditorRawLineBreak>
+HTMLEditUtils::GetLineBreakBeforeBlockBoundaryIfPointIsBetweenThem(
+    const EditorDOMPointInText&, const Element&);
+template Maybe<EditorLineBreak>
+HTMLEditUtils::GetLineBreakBeforeBlockBoundaryIfPointIsBetweenThem(
+    const EditorRawDOMPointInText&, const Element&);
+template Maybe<EditorRawLineBreak>
+HTMLEditUtils::GetLineBreakBeforeBlockBoundaryIfPointIsBetweenThem(
+    const EditorRawDOMPointInText&, const Element&);
+
+template bool HTMLEditUtils::IsSameCSSColorValue(const nsAString& aColorA,
+                                                 const nsAString& aColorB);
+template bool HTMLEditUtils::IsSameCSSColorValue(const nsACString& aColorA,
+                                                 const nsACString& aColorB);
+
+template bool HTMLEditUtils::IsPreformattedLineBreakFollowedByBlockBoundary(
+    const EditorDOMPoint&, SkipWhiteSpaceStyleCheck, const Element*, Element**);
+template bool HTMLEditUtils::IsPreformattedLineBreakFollowedByBlockBoundary(
+    const EditorRawDOMPoint&, SkipWhiteSpaceStyleCheck, const Element*,
+    Element**);
+template bool HTMLEditUtils::IsPreformattedLineBreakFollowedByBlockBoundary(
+    const EditorDOMPointInText&, SkipWhiteSpaceStyleCheck, const Element*,
+    Element**);
+template bool HTMLEditUtils::IsPreformattedLineBreakFollowedByBlockBoundary(
+    const EditorRawDOMPointInText&, SkipWhiteSpaceStyleCheck, const Element*,
+    Element**);
+
+template bool
+HTMLEditUtils::IsPreformattedLineBreakFollowedByCurrentBlockBoundary(
+    const EditorDOMPoint&, SkipWhiteSpaceStyleCheck, const Element*, Element**);
+template bool
+HTMLEditUtils::IsPreformattedLineBreakFollowedByCurrentBlockBoundary(
+    const EditorRawDOMPoint&, SkipWhiteSpaceStyleCheck, const Element*,
+    Element**);
+template bool
+HTMLEditUtils::IsPreformattedLineBreakFollowedByCurrentBlockBoundary(
+    const EditorDOMPointInText&, SkipWhiteSpaceStyleCheck, const Element*,
+    Element**);
+template bool
+HTMLEditUtils::IsPreformattedLineBreakFollowedByCurrentBlockBoundary(
+    const EditorRawDOMPointInText&, SkipWhiteSpaceStyleCheck, const Element*,
+    Element**);
+
+template bool
+HTMLEditUtils::IsPreformattedLineBreakFollowingCurrentBlockBoundary(
+    const EditorDOMPoint&, SkipWhiteSpaceStyleCheck, const Element*, Element**);
+template bool
+HTMLEditUtils::IsPreformattedLineBreakFollowingCurrentBlockBoundary(
+    const EditorRawDOMPoint&, SkipWhiteSpaceStyleCheck, const Element*,
+    Element**);
+template bool
+HTMLEditUtils::IsPreformattedLineBreakFollowingCurrentBlockBoundary(
+    const EditorDOMPointInText&, SkipWhiteSpaceStyleCheck, const Element*,
+    Element**);
+template bool
+HTMLEditUtils::IsPreformattedLineBreakFollowingCurrentBlockBoundary(
+    const EditorRawDOMPointInText&, SkipWhiteSpaceStyleCheck, const Element*,
+    Element**);
+
+template bool
+HTMLEditUtils::IsPreformattedLineBreakFollowedByOtherBlockBoundary(
+    const EditorDOMPoint&, SkipWhiteSpaceStyleCheck, const Element*, Element**);
+template bool
+HTMLEditUtils::IsPreformattedLineBreakFollowedByOtherBlockBoundary(
+    const EditorRawDOMPoint&, SkipWhiteSpaceStyleCheck, const Element*,
+    Element**);
+template bool
+HTMLEditUtils::IsPreformattedLineBreakFollowedByOtherBlockBoundary(
+    const EditorDOMPointInText&, SkipWhiteSpaceStyleCheck, const Element*,
+    Element**);
+template bool
+HTMLEditUtils::IsPreformattedLineBreakFollowedByOtherBlockBoundary(
+    const EditorRawDOMPointInText&, SkipWhiteSpaceStyleCheck, const Element*,
+    Element**);
+
+template bool HTMLEditUtils::IsPreformattedLineBreakFollowedByLineBoundary(
+    const EditorDOMPoint&, SkipWhiteSpaceStyleCheck, const Element*, Element**);
+template bool HTMLEditUtils::IsPreformattedLineBreakFollowedByLineBoundary(
+    const EditorRawDOMPoint&, SkipWhiteSpaceStyleCheck, const Element*,
+    Element**);
+template bool HTMLEditUtils::IsPreformattedLineBreakFollowedByLineBoundary(
+    const EditorDOMPointInText&, SkipWhiteSpaceStyleCheck, const Element*,
+    Element**);
+template bool HTMLEditUtils::IsPreformattedLineBreakFollowedByLineBoundary(
+    const EditorRawDOMPointInText&, SkipWhiteSpaceStyleCheck, const Element*,
+    Element**);
+
+template bool HTMLEditUtils::IsPreformattedLineBreakFollowingLineBoundary(
+    const EditorDOMPoint&, SkipWhiteSpaceStyleCheck, const Element*, Element**);
+template bool HTMLEditUtils::IsPreformattedLineBreakFollowingLineBoundary(
+    const EditorRawDOMPoint&, SkipWhiteSpaceStyleCheck, const Element*,
+    Element**);
+template bool HTMLEditUtils::IsPreformattedLineBreakFollowingLineBoundary(
+    const EditorDOMPointInText&, SkipWhiteSpaceStyleCheck, const Element*,
+    Element**);
+template bool HTMLEditUtils::IsPreformattedLineBreakFollowingLineBoundary(
+    const EditorRawDOMPointInText&, SkipWhiteSpaceStyleCheck, const Element*,
+    Element**);
+
+template bool HTMLEditUtils::IsPreformattedLineBreakFollowingLineBreak(
+    const EditorDOMPoint&, SkipWhiteSpaceStyleCheck, const Element*);
+template bool HTMLEditUtils::IsPreformattedLineBreakFollowingLineBreak(
+    const EditorRawDOMPoint&, SkipWhiteSpaceStyleCheck, const Element*);
+template bool HTMLEditUtils::IsPreformattedLineBreakFollowingLineBreak(
+    const EditorDOMPointInText&, SkipWhiteSpaceStyleCheck, const Element*);
+template bool HTMLEditUtils::IsPreformattedLineBreakFollowingLineBreak(
+    const EditorRawDOMPointInText&, SkipWhiteSpaceStyleCheck, const Element*);
+
+template bool HTMLEditUtils::IsUnnecessaryPreformattedLineBreak(
+    const EditorDOMPoint&, PaddingForEmptyBlock, SkipWhiteSpaceStyleCheck,
+    const Element*, Element**);
+template bool HTMLEditUtils::IsUnnecessaryPreformattedLineBreak(
+    const EditorRawDOMPoint&, PaddingForEmptyBlock, SkipWhiteSpaceStyleCheck,
+    const Element*, Element**);
+template bool HTMLEditUtils::IsUnnecessaryPreformattedLineBreak(
+    const EditorDOMPointInText&, PaddingForEmptyBlock, SkipWhiteSpaceStyleCheck,
+    const Element*, Element**);
+template bool HTMLEditUtils::IsUnnecessaryPreformattedLineBreak(
+    const EditorRawDOMPointInText&, PaddingForEmptyBlock,
+    SkipWhiteSpaceStyleCheck, const Element*, Element**);
+
+template bool HTMLEditUtils::IsSignificantPreformattedLineBreak(
+    const EditorDOMPoint&, PaddingForEmptyBlock, SkipWhiteSpaceStyleCheck,
+    const Element*, Element**);
+template bool HTMLEditUtils::IsSignificantPreformattedLineBreak(
+    const EditorRawDOMPoint&, PaddingForEmptyBlock, SkipWhiteSpaceStyleCheck,
+    const Element*, Element**);
+template bool HTMLEditUtils::IsSignificantPreformattedLineBreak(
+    const EditorDOMPointInText&, PaddingForEmptyBlock, SkipWhiteSpaceStyleCheck,
+    const Element*, Element**);
+template bool HTMLEditUtils::IsSignificantPreformattedLineBreak(
+    const EditorRawDOMPointInText&, PaddingForEmptyBlock,
+    SkipWhiteSpaceStyleCheck, const Element*, Element**);
+
+template WSScanResult
+HTMLEditUtils::ScanInclusiveNextThingWithIgnoringUnnecessaryLineBreak(
+    const EditorDOMPoint&, PaddingForEmptyBlock, const Element&,
+    const Element*);
+template WSScanResult
+HTMLEditUtils::ScanInclusiveNextThingWithIgnoringUnnecessaryLineBreak(
+    const EditorRawDOMPoint&, PaddingForEmptyBlock, const Element&,
+    const Element*);
+template WSScanResult
+HTMLEditUtils::ScanInclusiveNextThingWithIgnoringUnnecessaryLineBreak(
+    const EditorDOMPointInText&, PaddingForEmptyBlock, const Element&,
+    const Element*);
+template WSScanResult
+HTMLEditUtils::ScanInclusiveNextThingWithIgnoringUnnecessaryLineBreak(
+    const EditorRawDOMPointInText&, PaddingForEmptyBlock, const Element&,
+    const Element*);
+
+template Maybe<EditorLineBreak> HTMLEditUtils::GetPrecedingUnnecessaryLineBreak(
+    const EditorDOMPoint&, const Element*);
+template Maybe<EditorLineBreak> HTMLEditUtils::GetPrecedingUnnecessaryLineBreak(
+    const EditorRawDOMPoint&, const Element*);
+template Maybe<EditorLineBreak> HTMLEditUtils::GetPrecedingUnnecessaryLineBreak(
+    const EditorDOMPointInText&, const Element*);
+template Maybe<EditorLineBreak> HTMLEditUtils::GetPrecedingUnnecessaryLineBreak(
+    const EditorRawDOMPointInText&, const Element*);
+template Maybe<EditorRawLineBreak>
+HTMLEditUtils::GetPrecedingUnnecessaryLineBreak(const EditorDOMPoint&,
+                                                const Element*);
+template Maybe<EditorRawLineBreak>
+HTMLEditUtils::GetPrecedingUnnecessaryLineBreak(const EditorRawDOMPoint&,
+                                                const Element*);
+template Maybe<EditorRawLineBreak>
+HTMLEditUtils::GetPrecedingUnnecessaryLineBreak(const EditorDOMPointInText&,
+                                                const Element*);
+template Maybe<EditorRawLineBreak>
+HTMLEditUtils::GetPrecedingUnnecessaryLineBreak(const EditorRawDOMPointInText&,
+                                                const Element*);
+
+template bool HTMLEditUtils::PointIsImmediatelyBeforeCurrentBlockBoundary(
+    const EditorDOMPoint& aPoint,
+    IgnoreInvisibleLineBreak aIgnoreInvisibleLineBreak);
+template bool HTMLEditUtils::PointIsImmediatelyBeforeCurrentBlockBoundary(
+    const EditorRawDOMPoint& aPoint,
+    IgnoreInvisibleLineBreak aIgnoreInvisibleLineBreak);
+template bool HTMLEditUtils::PointIsImmediatelyBeforeCurrentBlockBoundary(
+    const EditorDOMPointInText& aPoint,
+    IgnoreInvisibleLineBreak aIgnoreInvisibleLineBreak);
+template bool HTMLEditUtils::PointIsImmediatelyBeforeCurrentBlockBoundary(
+    const EditorRawDOMPointInText& aPoint,
+    IgnoreInvisibleLineBreak aIgnoreInvisibleLineBreak);
+
+bool HTMLEditUtils::ElementIsEditableRoot(const Element& aElement) {
+  MOZ_ASSERT(!aElement.IsInNativeAnonymousSubtree());
+  if (NS_WARN_IF(!aElement.IsEditable()) ||
+      NS_WARN_IF(!aElement.IsInComposedDoc())) {
+    return false;
+  }
+  return !aElement.GetParent() ||                      
+         !aElement.GetParent()->IsEditable() ||        
+         aElement.OwnerDoc()->GetBody() == &aElement;  
+}
+
+bool HTMLEditUtils::CanContentsBeJoined(const nsIContent& aLeftContent,
+                                        const nsIContent& aRightContent) {
+  if (aLeftContent.NodeInfo()->NameAtom() !=
+      aRightContent.NodeInfo()->NameAtom()) {
+    return false;
+  }
+
+  if (!aLeftContent.IsElement()) {
+    return true;  
+  }
+  MOZ_ASSERT(aRightContent.IsElement());
+
+  if (aLeftContent.NodeInfo()->NameAtom() == nsGkAtoms::font) {
+    const nsAttrValue* const leftSize =
+        aLeftContent.AsElement()->GetParsedAttr(nsGkAtoms::size);
+    const nsAttrValue* const rightSize =
+        aRightContent.AsElement()->GetParsedAttr(nsGkAtoms::size);
+    if (!leftSize ^ !rightSize || (leftSize && !leftSize->Equals(*rightSize))) {
+      return false;
+    }
+
+    const nsAttrValue* const leftColor =
+        aLeftContent.AsElement()->GetParsedAttr(nsGkAtoms::color);
+    const nsAttrValue* const rightColor =
+        aRightContent.AsElement()->GetParsedAttr(nsGkAtoms::color);
+    if (!leftColor ^ !rightColor ||
+        (leftColor && !leftColor->Equals(*rightColor))) {
+      return false;
+    }
+
+    const nsAttrValue* const leftFace =
+        aLeftContent.AsElement()->GetParsedAttr(nsGkAtoms::face);
+    const nsAttrValue* const rightFace =
+        aRightContent.AsElement()->GetParsedAttr(nsGkAtoms::face);
+    if (!leftFace ^ !rightFace || (leftFace && !leftFace->Equals(*rightFace))) {
+      return false;
+    }
+  }
+  nsStyledElement* leftStyledElement =
+      nsStyledElement::FromNode(const_cast<nsIContent*>(&aLeftContent));
+  if (!leftStyledElement) {
+    return false;
+  }
+  nsStyledElement* rightStyledElement =
+      nsStyledElement::FromNode(const_cast<nsIContent*>(&aRightContent));
+  if (!rightStyledElement) {
+    return false;
+  }
+  return CSSEditUtils::DoStyledElementsHaveSameStyle(*leftStyledElement,
+                                                     *rightStyledElement);
+}
+
+static bool IsHTMLBlockElementByDefault(const nsIContent& aContent) {
+  if (!aContent.IsHTMLElement()) {
+    return false;
+  }
+  if (aContent.IsHTMLElement(nsGkAtoms::br)) {  
+    MOZ_ASSERT(!nsHTMLElement::IsBlock(
+        aContent.NodeInfo()->HTMLTag().valueOr(eHTMLTag_userdefined)));
+    return false;
+  }
+  if (aContent.IsAnyOfHTMLElements(
+          nsGkAtoms::body, nsGkAtoms::head, nsGkAtoms::tbody, nsGkAtoms::thead,
+          nsGkAtoms::tfoot, nsGkAtoms::tr, nsGkAtoms::th, nsGkAtoms::td,
+          nsGkAtoms::dt, nsGkAtoms::dd)) {
+    return true;
+  }
+
+  return nsHTMLElement::IsBlock(
+      aContent.NodeInfo()->HTMLTag().valueOr(eHTMLTag_userdefined));
+}
+
+bool HTMLEditUtils::IsBlockElement(const nsIContent& aContent,
+                                   BlockInlineCheck aBlockInlineCheck) {
+  MOZ_ASSERT(aBlockInlineCheck != BlockInlineCheck::Unused);
+  MOZ_ASSERT(aBlockInlineCheck != BlockInlineCheck::Auto);
+
+  if (MOZ_UNLIKELY(!aContent.IsElement())) {
+    return false;
+  }
+  if (aContent.IsHTMLElement(nsGkAtoms::br)) {
+    return false;
+  }
+  if (aBlockInlineCheck == BlockInlineCheck::UseHTMLDefaultStyle) {
+    return IsHTMLBlockElementByDefault(aContent);
+  }
+  if (aContent.OwnerDoc()->GetDocumentElement() == &aContent ||
+      (aContent.IsHTMLElement(nsGkAtoms::body) &&
+       aContent.OwnerDoc()->GetBodyElement() == &aContent)) {
+    return true;
+  }
+  RefPtr<const ComputedStyle> elementStyle =
+      nsComputedDOMStyle::GetComputedStyleNoFlush(aContent.AsElement());
+  if (MOZ_UNLIKELY(!elementStyle)) {  
+    return IsHTMLBlockElementByDefault(aContent);
+  }
+  const nsStyleDisplay* styleDisplay = elementStyle->StyleDisplay();
+  if (MOZ_UNLIKELY(styleDisplay->mDisplay == StyleDisplay::None)) {
+    return IsHTMLBlockElementByDefault(aContent);
+  }
+  if (!styleDisplay->IsInlineOutsideStyle()) {
+    return true;
+  }
+  if (HTMLEditUtils::ParentElementIsGridOrFlexContainer(aContent)) {
+    return true;
+  }
+  return aBlockInlineCheck == BlockInlineCheck::UseComputedDisplayStyle &&
+         styleDisplay->DisplayInside() == StyleDisplayInside::FlowRoot &&
+         styleDisplay->EffectiveAppearance() == StyleAppearance::None;
+}
+
+bool HTMLEditUtils::IsInlineContent(const nsIContent& aContent,
+                                    BlockInlineCheck aBlockInlineCheck) {
+  MOZ_ASSERT(aBlockInlineCheck != BlockInlineCheck::Unused);
+  MOZ_ASSERT(aBlockInlineCheck != BlockInlineCheck::Auto);
+
+  if (!aContent.IsElement()) {
+    return true;
+  }
+  if (aContent.IsHTMLElement(nsGkAtoms::br)) {
+    return true;
+  }
+  if (aBlockInlineCheck == BlockInlineCheck::UseHTMLDefaultStyle) {
+    return !IsHTMLBlockElementByDefault(aContent);
+  }
+  if (aContent.OwnerDoc()->GetDocumentElement() == &aContent ||
+      (aContent.IsHTMLElement(nsGkAtoms::body) &&
+       aContent.OwnerDoc()->GetBodyElement() == &aContent)) {
+    return false;
+  }
+  RefPtr<const ComputedStyle> elementStyle =
+      nsComputedDOMStyle::GetComputedStyleNoFlush(aContent.AsElement());
+  if (MOZ_UNLIKELY(!elementStyle)) {  
+    return !IsHTMLBlockElementByDefault(aContent);
+  }
+  const nsStyleDisplay* styleDisplay = elementStyle->StyleDisplay();
+  if (MOZ_UNLIKELY(styleDisplay->mDisplay == StyleDisplay::None)) {
+    return !IsHTMLBlockElementByDefault(aContent);
+  }
+  if (HTMLEditUtils::ParentElementIsGridOrFlexContainer(aContent)) {
+    return false;
+  }
+  return styleDisplay->IsInlineOutsideStyle();
+}
+
+bool HTMLEditUtils::ParentElementIsGridOrFlexContainer(
+    const nsIContent& aMaybeFlexOrGridItemContent) {
+  if (!aMaybeFlexOrGridItemContent.IsElement()) {
+    if (!aMaybeFlexOrGridItemContent.IsText() ||
+        !aMaybeFlexOrGridItemContent.AsText()->TextDataLength()) {
+      return false;
+    }
+  }
+  Element* const parentElement = aMaybeFlexOrGridItemContent.GetParentElement();
+  if (MOZ_UNLIKELY(!parentElement)) {
+    return false;
+  }
+  const RefPtr<const ComputedStyle> elementStyle =
+      nsComputedDOMStyle::GetComputedStyleNoFlush(
+          aMaybeFlexOrGridItemContent.IsElement()
+              ? aMaybeFlexOrGridItemContent.AsElement()
+              : parentElement);
+  if (MOZ_UNLIKELY(!elementStyle)) {
+    return false;
+  }
+  const nsStyleDisplay* styleDisplay = elementStyle->StyleDisplay();
+  if (MOZ_UNLIKELY(styleDisplay->mDisplay == StyleDisplay::None)) {
+    return false;
+  }
+  const RefPtr<const ComputedStyle> parentElementStyle =
+      aMaybeFlexOrGridItemContent.IsElement()
+          ? nsComputedDOMStyle::GetComputedStyleNoFlush(parentElement)
+          : elementStyle;
+  if (MOZ_UNLIKELY(!parentElementStyle)) {
+    return false;
+  }
+  const auto parentDisplayInside =
+      parentElementStyle->StyleDisplay()->DisplayInside();
+  return parentDisplayInside == StyleDisplayInside::Flex ||
+         parentDisplayInside == StyleDisplayInside::Grid;
+}
+
+bool HTMLEditUtils::IsFlexOrGridItem(const nsIContent& aContent) {
+  if (!HTMLEditUtils::ParentElementIsGridOrFlexContainer(aContent)) {
+    return false;
+  }
+  MOZ_ASSERT_IF(aContent.IsElement(),
+                HTMLEditUtils::IsBlockElement(
+                    *aContent.AsElement(),
+                    BlockInlineCheck::UseComputedDisplayOutsideStyle));
+  return true;
+}
+
+bool HTMLEditUtils::IsInclusiveAncestorCSSDisplayNone(
+    const nsIContent& aContent,
+    const nsIContent* aAncestorLimiter ) {
+  if (NS_WARN_IF(!aContent.IsInComposedDoc())) {
+    return true;
+  }
+  for (const Element* element :
+       aContent.InclusiveFlatTreeAncestorsOfType<Element>()) {
+    RefPtr<const ComputedStyle> elementStyle =
+        nsComputedDOMStyle::GetComputedStyleNoFlush(element);
+    if (MOZ_LIKELY(elementStyle)) {
+      const nsStyleDisplay* styleDisplay = elementStyle->StyleDisplay();
+      if (MOZ_UNLIKELY(styleDisplay->mDisplay == StyleDisplay::None)) {
+        return true;
+      }
+    }
+    if (element == aAncestorLimiter) {
+      break;
+    }
+  }
+  return false;
+}
+
+bool HTMLEditUtils::IsVisibleElementEvenIfLeafNode(const nsIContent& aContent) {
+  if (!aContent.IsElement()) {
+    return false;
+  }
+  if (!aContent.IsHTMLElement()) {
+    return true;
+  }
+  if (HTMLEditUtils::IsBlockElement(
+          aContent, BlockInlineCheck::UseComputedDisplayStyle)) {
+    return true;
+  }
+  if (aContent.IsAnyOfHTMLElements(nsGkAtoms::applet, nsGkAtoms::br,
+                                   nsGkAtoms::iframe, nsGkAtoms::img,
+                                   nsGkAtoms::meter, nsGkAtoms::progress,
+                                   nsGkAtoms::select, nsGkAtoms::textarea)) {
+    return true;
+  }
+  if (const auto* inputElement = HTMLInputElement::FromNode(aContent)) {
+    return inputElement->ControlType() != FormControlType::InputHidden;
+  }
+  if (nsIFrame* const primaryFrame = aContent.GetPrimaryFrame()) {
+    if (!primaryFrame->IsSubtreeDirty() || !primaryFrame->IsInlineFrame()) {
+      return !primaryFrame->GetSize().IsEmpty();
+    }
+    return !primaryFrame->IsSelfEmpty();
+  }
+  return false;
+}
+
+bool HTMLEditUtils::IsInlineStyleElement(const nsIContent& aContent) {
+  return aContent.IsAnyOfHTMLElements(
+      nsGkAtoms::b, nsGkAtoms::i, nsGkAtoms::u, nsGkAtoms::tt, nsGkAtoms::s,
+      nsGkAtoms::strike, nsGkAtoms::big, nsGkAtoms::small, nsGkAtoms::sub,
+      nsGkAtoms::sup, nsGkAtoms::font);
+}
+
+bool HTMLEditUtils::IsDisplayOutsideInline(const Element& aElement) {
+  RefPtr<const ComputedStyle> elementStyle =
+      nsComputedDOMStyle::GetComputedStyleNoFlush(&aElement);
+  if (!elementStyle) {
+    return false;
+  }
+  return elementStyle->StyleDisplay()->DisplayOutside() ==
+         StyleDisplayOutside::Inline;
+}
+
+bool HTMLEditUtils::IsDisplayInsideFlowRoot(const Element& aElement) {
+  RefPtr<const ComputedStyle> elementStyle =
+      nsComputedDOMStyle::GetComputedStyleNoFlush(&aElement);
+  if (!elementStyle) {
+    return false;
+  }
+  return elementStyle->StyleDisplay()->DisplayInside() ==
+         StyleDisplayInside::FlowRoot;
+}
+
+bool HTMLEditUtils::IsRemovableInlineStyleElement(Element& aElement) {
+  if (!aElement.IsHTMLElement()) {
+    return false;
+  }
+  if (aElement.IsAnyOfHTMLElements(
+          nsGkAtoms::abbr,  
+          nsGkAtoms::acronym, nsGkAtoms::b,
+          nsGkAtoms::bdi,  
+          nsGkAtoms::bdo, nsGkAtoms::big, nsGkAtoms::cite, nsGkAtoms::code,
+          nsGkAtoms::dfn, nsGkAtoms::em, nsGkAtoms::font, nsGkAtoms::i,
+          nsGkAtoms::ins, nsGkAtoms::kbd,
+          nsGkAtoms::mark,  
+          nsGkAtoms::nobr, nsGkAtoms::q, nsGkAtoms::s, nsGkAtoms::samp,
+          nsGkAtoms::small, nsGkAtoms::span, nsGkAtoms::strike,
+          nsGkAtoms::strong, nsGkAtoms::sub, nsGkAtoms::sup, nsGkAtoms::tt,
+          nsGkAtoms::u, nsGkAtoms::var)) {
+    return true;
+  }
+  nsAutoString tagName;
+  aElement.GetTagName(tagName);
+  return tagName.LowerCaseEqualsASCII("blink");
+}
+
+bool HTMLEditUtils::IsOutdentable(const nsIContent& aContent) {
+  return aContent.IsAnyOfHTMLElements(
+      nsGkAtoms::ul, nsGkAtoms::ol, nsGkAtoms::dl, nsGkAtoms::li, nsGkAtoms::dd,
+      nsGkAtoms::dt, nsGkAtoms::blockquote);
+}
+
+bool HTMLEditUtils::IsHeadingElement(const nsIContent& aContent) {
+  return aContent.IsAnyOfHTMLElements(nsGkAtoms::h1, nsGkAtoms::h2,
+                                      nsGkAtoms::h3, nsGkAtoms::h4,
+                                      nsGkAtoms::h5, nsGkAtoms::h6);
+}
+
+bool HTMLEditUtils::IsListItemElement(const nsIContent& aContent) {
+  return aContent.IsAnyOfHTMLElements(nsGkAtoms::li, nsGkAtoms::dd,
+                                      nsGkAtoms::dt);
+}
+
+bool HTMLEditUtils::IsAnyTableElementExceptColumnElement(
+    const nsIContent& aContent) {
+  return aContent.IsAnyOfHTMLElements(
+      nsGkAtoms::table, nsGkAtoms::tr, nsGkAtoms::td, nsGkAtoms::th,
+      nsGkAtoms::thead, nsGkAtoms::tfoot, nsGkAtoms::tbody, nsGkAtoms::caption);
+}
+
+bool HTMLEditUtils::IsAnyTableElementExceptTableElementAndColumElement(
+    const nsIContent& aContent) {
+  return aContent.IsAnyOfHTMLElements(
+      nsGkAtoms::tr, nsGkAtoms::td, nsGkAtoms::th, nsGkAtoms::thead,
+      nsGkAtoms::tfoot, nsGkAtoms::tbody, nsGkAtoms::caption);
+}
+
+bool HTMLEditUtils::IsTableRowElement(const nsIContent& aContent) {
+  return aContent.IsHTMLElement(nsGkAtoms::tr);
+}
+
+bool HTMLEditUtils::IsTableCellElement(const nsIContent& aContent) {
+  return aContent.IsAnyOfHTMLElements(nsGkAtoms::td, nsGkAtoms::th);
+}
+
+bool HTMLEditUtils::IsTableCellOrCaptionElement(const nsIContent& aContent) {
+  return aContent.IsAnyOfHTMLElements(nsGkAtoms::td, nsGkAtoms::th,
+                                      nsGkAtoms::caption);
+}
+
+bool HTMLEditUtils::IsListElement(const nsIContent& aContent) {
+  return aContent.IsAnyOfHTMLElements(nsGkAtoms::ul, nsGkAtoms::ol,
+                                      nsGkAtoms::dl);
+}
+
+bool HTMLEditUtils::IsImageElement(const nsIContent& aContent) {
+  return aContent.IsHTMLElement(nsGkAtoms::img);
+}
+
+bool HTMLEditUtils::IsHyperlinkElement(const nsIContent& aContent) {
+  const dom::HTMLAnchorElement* const anchor =
+      dom::HTMLAnchorElement::FromNode(aContent);
+  if (!anchor) {
+    return false;
+  }
+  nsAutoCString tmpText;
+  anchor->GetHref(tmpText);
+  return !tmpText.IsEmpty();
+}
+
+bool HTMLEditUtils::IsNamedAnchorElement(const nsIContent& aContent) {
+  const dom::HTMLAnchorElement* const anchor =
+      dom::HTMLAnchorElement::FromNode(aContent);
+  if (!anchor) {
+    return false;
+  }
+  return anchor->HasName();
+}
+
+bool HTMLEditUtils::IsMozDivElement(const nsIContent& aContent) {
+  return aContent.IsHTMLElement(nsGkAtoms::div) &&
+         aContent.AsElement()->AttrValueIs(kNameSpaceID_None, nsGkAtoms::type,
+                                           u"_moz"_ns, eIgnoreCase);
+}
+
+bool HTMLEditUtils::IsMailCiteElement(const Element& aElement) {
+  if (aElement.AttrValueIs(kNameSpaceID_None, nsGkAtoms::type, u"cite"_ns,
+                           eIgnoreCase)) {
+    return true;
+  }
+
+  if (aElement.AttrValueIs(kNameSpaceID_None, nsGkAtoms::mozquote, u"true"_ns,
+                           eIgnoreCase)) {
+    return true;
+  }
+
+  return false;
+}
+
+bool HTMLEditUtils::IsReplacedElement(const Element& aElement) {
+  if (!aElement.IsHTMLElement()) {
+    return false;
+  }
+  if (aElement.IsHTMLElement(nsGkAtoms::input)) {
+    return !aElement.AttrValueIs(kNameSpaceID_None, nsGkAtoms::type,
+                                 nsGkAtoms::hidden, eIgnoreCase);
+  }
+  if (aElement.IsHTMLElement(nsGkAtoms::object)) {
+    const nsCOMPtr<nsIObjectLoadingContent> objectLoadingContent =
+        do_QueryInterface(const_cast<Element*>(&aElement));
+    uint32_t displayedType = nsIObjectLoadingContent::TYPE_FALLBACK;
+    if (MOZ_LIKELY(objectLoadingContent)) {
+      objectLoadingContent->GetDisplayedType(&displayedType);
+    }
+    return displayedType != nsIObjectLoadingContent::TYPE_FALLBACK;
+  }
+  return aElement.IsAnyOfHTMLElements(
+      nsGkAtoms::audio,
+      nsGkAtoms::br, nsGkAtoms::button, nsGkAtoms::canvas, nsGkAtoms::embed,
+      nsGkAtoms::iframe, nsGkAtoms::img, nsGkAtoms::meter,
+      nsGkAtoms::optgroup, nsGkAtoms::option, nsGkAtoms::progress,
+      nsGkAtoms::select, nsGkAtoms::textarea, nsGkAtoms::video);
+}
+
+bool HTMLEditUtils::IsAlignAttrSupported(const nsIContent& aContent) {
+  return aContent.IsAnyOfHTMLElements(
+      nsGkAtoms::hr, nsGkAtoms::table, nsGkAtoms::tbody, nsGkAtoms::tfoot,
+      nsGkAtoms::thead, nsGkAtoms::tr, nsGkAtoms::td, nsGkAtoms::th,
+      nsGkAtoms::div, nsGkAtoms::p, nsGkAtoms::h1, nsGkAtoms::h2, nsGkAtoms::h3,
+      nsGkAtoms::h4, nsGkAtoms::h5, nsGkAtoms::h6);
+}
+
+bool HTMLEditUtils::IsVisibleTextNode(
+    const Text& aText, TreatInvisibleLineBreakAs aTreatInvisibleLineBreakAs) {
+  if (!aText.TextDataLength()) {
+    return false;
+  }
+
+  EditorRawDOMPointInText atPreformattedLineBreak;
+  const Maybe<uint32_t> visibleCharOffset =
+      HTMLEditUtils::GetInclusiveNextNonCollapsibleCharOffset(
+          EditorDOMPointInText(&aText, 0));
+  if (visibleCharOffset.isSome()) {
+    atPreformattedLineBreak.Set(&aText, *visibleCharOffset);
+    if (aTreatInvisibleLineBreakAs == TreatInvisibleLineBreakAs::Visible ||
+        !atPreformattedLineBreak.IsCharNewLine()) {
+      return true;
+    }
+    Maybe<EditorRawLineBreak> preformattedLineBreak =
+        EditorRawLineBreak::CreateIfTextHasOnlyOneAndNoOtherVisibleCharacters(
+            aText);
+    if (!preformattedLineBreak) {
+      return true;  
+    }
+    if (!preformattedLineBreak->IsFollowedByBlockBoundary()) {
+      return true;  
+    }
+    return preformattedLineBreak->IsFollowingLineBoundary();
+  }
+
+  const WSScanResult followingThing =
+      WSRunScanner::ScanInclusiveNextVisibleNodeOrBlockBoundary(
+          {}, EditorRawDOMPoint::After(aText));
+  if (followingThing.ReachedBlockBoundary()) {
+    return false;
+  }
+  const WSScanResult precedingThing =
+      WSRunScanner::ScanPreviousVisibleNodeOrBlockBoundary(
+          {}, EditorRawDOMPoint(&aText));
+  if (precedingThing.ReachedBlockBoundary()) {
+    return false;
+  }
+  if (followingThing.ReachedBRElement() &&
+      !precedingThing.ReachedLineBoundary()) {
+    return true;
+  }
+  if (followingThing.ReachedLineBoundary() &&
+      precedingThing.ReachedLineBoundary()) {
+    return false;
+  }
+  return true;
+}
+
+bool HTMLEditUtils::IsInVisibleTextFrames(nsPresContext* aPresContext,
+                                          const Text& aText) {
+  MOZ_ASSERT(aPresContext);
+
+  if (!aText.TextDataLength()) {
+    return false;
+  }
+
+  nsTextFrame* textFrame = do_QueryFrame(aText.GetPrimaryFrame());
+  if (!textFrame) {
+    return false;
+  }
+
+  return textFrame->HasVisibleText();
+}
+
+bool HTMLEditUtils::IsBRElementFollowedByBlockBoundary(
+    const dom::HTMLBRElement& aBRElement,
+    const Element* aAncestorLimiter ,
+    Element** aFollowingBlockBoundaryElement ) {
+  if (aFollowingBlockBoundaryElement) {
+    *aFollowingBlockBoundaryElement = nullptr;
+  }
+  const WSScanResult followingThing =
+      WSRunScanner::ScanInclusiveNextVisibleNodeOrBlockBoundary(
+          {WSRunScanner::Option::StopAtVisibleEmptyInlineContainers},
+          EditorRawDOMPoint::After(aBRElement), aAncestorLimiter);
+  if (!followingThing.ReachedBlockBoundary()) {
+    return false;
+  }
+  if (aFollowingBlockBoundaryElement) {
+    *aFollowingBlockBoundaryElement = followingThing.ElementPtr();
+  }
+  return true;
+}
+
+template <typename EditorDOMPointType>
+bool HTMLEditUtils::IsPreformattedLineBreakFollowedByBlockBoundary(
+    const EditorDOMPointType& aPoint,
+    SkipWhiteSpaceStyleCheck
+        aSkipWhiteSpaceStyleCheck ,
+    const Element* aAncestorLimiter ,
+    Element** aFollowingBlockBoundaryElement ) {
+  if (aFollowingBlockBoundaryElement) {
+    *aFollowingBlockBoundaryElement = nullptr;
+  }
+  if (!aPoint.IsInTextNode() || aPoint.IsEndOfContainer() ||
+      !aPoint.IsCharNewLine()) {
+    return false;
+  }
+  if (aSkipWhiteSpaceStyleCheck == SkipWhiteSpaceStyleCheck::No &&
+      !EditorUtils::IsNewLinePreformatted(
+          *aPoint.template ContainerAs<Text>())) {
+    return false;
+  }
+  const WSScanResult followingThing =
+      WSRunScanner::ScanInclusiveNextVisibleNodeOrBlockBoundary(
+          {WSRunScanner::Option::StopAtVisibleEmptyInlineContainers},
+          aPoint.template NextPoint<EditorRawDOMPoint>(), aAncestorLimiter);
+  if (!followingThing.ReachedBlockBoundary()) {
+    return false;
+  }
+  if (aFollowingBlockBoundaryElement) {
+    *aFollowingBlockBoundaryElement = followingThing.ElementPtr();
+  }
+  return true;
+}
+
+bool HTMLEditUtils::IsBRElementFollowedByCurrentBlockBoundary(
+    const dom::HTMLBRElement& aBRElement,
+    const Element* aAncestorLimiter ,
+    Element** aFollowingBlockBoundaryElement ) {
+  if (aFollowingBlockBoundaryElement) {
+    *aFollowingBlockBoundaryElement = nullptr;
+  }
+  const WSScanResult followingThing =
+      WSRunScanner::ScanInclusiveNextVisibleNodeOrBlockBoundary(
+          {WSRunScanner::Option::StopAtVisibleEmptyInlineContainers},
+          EditorRawDOMPoint::After(aBRElement), aAncestorLimiter);
+  if (!followingThing.ReachedCurrentBlockBoundary()) {
+    return false;
+  }
+  if (aFollowingBlockBoundaryElement) {
+    *aFollowingBlockBoundaryElement = followingThing.ElementPtr();
+  }
+  return true;
+}
+
+bool HTMLEditUtils::IsBRElementFollowedByOtherBlockBoundary(
+    const dom::HTMLBRElement& aBRElement,
+    const Element* aAncestorLimiter ,
+    Element** aFollowingBlockBoundaryElement ) {
+  if (aFollowingBlockBoundaryElement) {
+    *aFollowingBlockBoundaryElement = nullptr;
+  }
+  const WSScanResult followingThing =
+      WSRunScanner::ScanInclusiveNextVisibleNodeOrBlockBoundary(
+          {WSRunScanner::Option::StopAtVisibleEmptyInlineContainers},
+          EditorRawDOMPoint::After(aBRElement), aAncestorLimiter);
+  if (!followingThing.ReachedOtherBlockElement()) {
+    return false;
+  }
+  if (aFollowingBlockBoundaryElement) {
+    *aFollowingBlockBoundaryElement = followingThing.ElementPtr();
+  }
+  return true;
+}
+
+template <typename EditorDOMPointType>
+bool HTMLEditUtils::IsPreformattedLineBreakFollowedByCurrentBlockBoundary(
+    const EditorDOMPointType& aPoint,
+    SkipWhiteSpaceStyleCheck
+        aSkipWhiteSpaceStyleCheck ,
+    const Element* aAncestorLimiter ,
+    Element** aFollowingBlockBoundaryElement ) {
+  if (aFollowingBlockBoundaryElement) {
+    *aFollowingBlockBoundaryElement = nullptr;
+  }
+  if (!aPoint.IsInTextNode() || aPoint.IsEndOfContainer() ||
+      !aPoint.IsCharNewLine()) {
+    return false;
+  }
+  if (aSkipWhiteSpaceStyleCheck == SkipWhiteSpaceStyleCheck::No &&
+      !EditorUtils::IsNewLinePreformatted(
+          *aPoint.template ContainerAs<Text>())) {
+    return false;
+  }
+  const WSScanResult followingThing =
+      WSRunScanner::ScanInclusiveNextVisibleNodeOrBlockBoundary(
+          {WSRunScanner::Option::StopAtVisibleEmptyInlineContainers},
+          aPoint.template NextPoint<EditorRawDOMPoint>(), aAncestorLimiter);
+  if (!followingThing.ReachedCurrentBlockBoundary()) {
+    return false;
+  }
+  if (aFollowingBlockBoundaryElement) {
+    *aFollowingBlockBoundaryElement = followingThing.ElementPtr();
+  }
+  return true;
+}
+
+template <typename EditorDOMPointType>
+bool HTMLEditUtils::IsPreformattedLineBreakFollowedByOtherBlockBoundary(
+    const EditorDOMPointType& aPoint,
+    SkipWhiteSpaceStyleCheck
+        aSkipWhiteSpaceStyleCheck ,
+    const Element* aAncestorLimiter ,
+    Element** aFollowingBlockBoundaryElement ) {
+  if (aFollowingBlockBoundaryElement) {
+    *aFollowingBlockBoundaryElement = nullptr;
+  }
+  if (!aPoint.IsInTextNode() || aPoint.IsEndOfContainer() ||
+      !aPoint.IsCharNewLine()) {
+    return false;
+  }
+  if (aSkipWhiteSpaceStyleCheck == SkipWhiteSpaceStyleCheck::No &&
+      !EditorUtils::IsNewLinePreformatted(
+          *aPoint.template ContainerAs<Text>())) {
+    return false;
+  }
+  const WSScanResult followingThing =
+      WSRunScanner::ScanInclusiveNextVisibleNodeOrBlockBoundary(
+          {WSRunScanner::Option::StopAtVisibleEmptyInlineContainers},
+          aPoint.template NextPoint<EditorRawDOMPoint>(), aAncestorLimiter);
+  if (!followingThing.ReachedOtherBlockElement()) {
+    return false;
+  }
+  if (aFollowingBlockBoundaryElement) {
+    *aFollowingBlockBoundaryElement = followingThing.ElementPtr();
+  }
+  return true;
+}
+
+bool HTMLEditUtils::IsBRElementFollowedByLineBoundary(
+    const dom::HTMLBRElement& aBRElement,
+    const Element* aAncestorLimiter ,
+    Element** aFollowingBlockBoundaryElement ) {
+  if (aFollowingBlockBoundaryElement) {
+    *aFollowingBlockBoundaryElement = nullptr;
+  }
+  const WSScanResult followingThing =
+      WSRunScanner::ScanInclusiveNextVisibleNodeOrBlockBoundary(
+          {WSRunScanner::Option::StopAtVisibleEmptyInlineContainers},
+          EditorRawDOMPoint::After(aBRElement), aAncestorLimiter);
+  if (!followingThing.ReachedLineBoundary()) {
+    return false;
+  }
+  if (aFollowingBlockBoundaryElement) {
+    *aFollowingBlockBoundaryElement = followingThing.ReachedBlockBoundary()
+                                          ? followingThing.ElementPtr()
+                                          : nullptr;
+  }
+  return true;
+}
+
+bool HTMLEditUtils::IsBRElementFollowingCurrentBlockBoundary(
+    const dom::HTMLBRElement& aBRElement,
+    const Element* aAncestorLimiter ,
+    Element** aPrecedingBlockBoundaryElement ) {
+  if (aPrecedingBlockBoundaryElement) {
+    *aPrecedingBlockBoundaryElement = nullptr;
+  }
+  const WSScanResult precedingThing =
+      WSRunScanner::ScanPreviousVisibleNodeOrBlockBoundary(
+          {}, EditorRawDOMPoint(&aBRElement), aAncestorLimiter);
+  if (!precedingThing.ReachedCurrentBlockBoundary()) {
+    return false;
+  }
+  if (aPrecedingBlockBoundaryElement) {
+    *aPrecedingBlockBoundaryElement = precedingThing.ElementPtr();
+  }
+  return true;
+}
+
+template <typename EditorDOMPointType>
+bool HTMLEditUtils::IsPreformattedLineBreakFollowingCurrentBlockBoundary(
+    const EditorDOMPointType& aPoint,
+    SkipWhiteSpaceStyleCheck
+        aSkipWhiteSpaceStyleCheck ,
+    const Element* aAncestorLimiter ,
+    Element** aPrecedingBlockBoundaryElement ) {
+  if (aPrecedingBlockBoundaryElement) {
+    *aPrecedingBlockBoundaryElement = nullptr;
+  }
+  if (!aPoint.IsInTextNode() || aPoint.IsEndOfContainer() ||
+      !aPoint.IsCharNewLine()) {
+    return false;
+  }
+  if (aSkipWhiteSpaceStyleCheck == SkipWhiteSpaceStyleCheck::No &&
+      !EditorUtils::IsNewLinePreformatted(
+          *aPoint.template ContainerAs<Text>())) {
+    return false;
+  }
+  const WSScanResult precedingThing =
+      WSRunScanner::ScanPreviousVisibleNodeOrBlockBoundary(
+          {}, aPoint, aAncestorLimiter);
+  if (!precedingThing.ReachedCurrentBlockBoundary()) {
+    return false;
+  }
+  if (aPrecedingBlockBoundaryElement) {
+    *aPrecedingBlockBoundaryElement = precedingThing.ElementPtr();
+  }
+  return true;
+}
+
+bool HTMLEditUtils::IsBRElementFollowingLineBreak(
+    const dom::HTMLBRElement& aBRElement,
+    const Element* aAncestorLimiter ) {
+  const WSScanResult precedingThing =
+      WSRunScanner::ScanPreviousVisibleNodeOrBlockBoundary(
+          {}, EditorRawDOMPoint(&aBRElement), aAncestorLimiter);
+  return precedingThing.ReachedLineBreak();
+}
+
+template <typename EditorDOMPointType>
+bool HTMLEditUtils::IsPreformattedLineBreakFollowedByLineBoundary(
+    const EditorDOMPointType& aPoint,
+    SkipWhiteSpaceStyleCheck
+        aSkipWhiteSpaceStyleCheck ,
+    const Element* aAncestorLimiter ,
+    Element** aFollowingBlockBoundaryElement ) {
+  if (aFollowingBlockBoundaryElement) {
+    *aFollowingBlockBoundaryElement = nullptr;
+  }
+  if (!aPoint.IsInTextNode() || aPoint.IsEndOfContainer() ||
+      !aPoint.IsCharNewLine()) {
+    return false;
+  }
+  if (aSkipWhiteSpaceStyleCheck == SkipWhiteSpaceStyleCheck::No &&
+      !EditorUtils::IsNewLinePreformatted(
+          *aPoint.template ContainerAs<Text>())) {
+    return false;
+  }
+  const WSScanResult followingThing =
+      WSRunScanner::ScanInclusiveNextVisibleNodeOrBlockBoundary(
+          {WSRunScanner::Option::StopAtVisibleEmptyInlineContainers},
+          aPoint.template NextPoint<EditorRawDOMPoint>(), aAncestorLimiter);
+  if (!followingThing.ReachedLineBoundary()) {
+    return false;
+  }
+  if (aFollowingBlockBoundaryElement) {
+    *aFollowingBlockBoundaryElement = followingThing.ReachedBlockBoundary()
+                                          ? followingThing.ElementPtr()
+                                          : nullptr;
+  }
+  return true;
+}
+
+bool HTMLEditUtils::IsBRElementFollowingLineBoundary(
+    const dom::HTMLBRElement& aBRElement,
+    const Element* aAncestorLimiter ,
+    Element** aPrecedingBlockBoundaryElement ) {
+  const WSScanResult precedingThing =
+      WSRunScanner::ScanPreviousVisibleNodeOrBlockBoundary(
+          {}, EditorRawDOMPoint(&aBRElement), aAncestorLimiter);
+  if (!precedingThing.ReachedLineBoundary()) {
+    return false;
+  }
+  if (aPrecedingBlockBoundaryElement) {
+    *aPrecedingBlockBoundaryElement = precedingThing.ReachedBlockBoundary()
+                                          ? precedingThing.ElementPtr()
+                                          : nullptr;
+  }
+  return true;
+}
+
+template <typename EditorDOMPointType>
+bool HTMLEditUtils::IsPreformattedLineBreakFollowingLineBoundary(
+    const EditorDOMPointType& aPoint,
+    SkipWhiteSpaceStyleCheck
+        aSkipWhiteSpaceStyleCheck ,
+    const Element* aAncestorLimiter ,
+    Element** aPrecedingBlockBoundaryElement ) {
+  if (!aPoint.IsInTextNode() || aPoint.IsEndOfContainer() ||
+      !aPoint.IsCharNewLine()) {
+    return false;
+  }
+  if (aSkipWhiteSpaceStyleCheck == SkipWhiteSpaceStyleCheck::No &&
+      !EditorUtils::IsNewLinePreformatted(
+          *aPoint.template ContainerAs<Text>())) {
+    return false;
+  }
+  const WSScanResult precedingThing =
+      WSRunScanner::ScanPreviousVisibleNodeOrBlockBoundary(
+          {}, aPoint, aAncestorLimiter);
+  if (!precedingThing.ReachedLineBoundary()) {
+    return false;
+  }
+  if (aPrecedingBlockBoundaryElement) {
+    *aPrecedingBlockBoundaryElement = precedingThing.ReachedBlockBoundary()
+                                          ? precedingThing.ElementPtr()
+                                          : nullptr;
+  }
+  return true;
+}
+
+template <typename EditorDOMPointType>
+bool HTMLEditUtils::IsPreformattedLineBreakFollowingLineBreak(
+    const EditorDOMPointType& aPoint,
+    SkipWhiteSpaceStyleCheck
+        aSkipWhiteSpaceStyleCheck ,
+    const Element* aAncestorLimiter ) {
+  if (!aPoint.IsInTextNode() || aPoint.IsEndOfContainer() ||
+      !aPoint.IsCharNewLine()) {
+    return false;
+  }
+  if (aSkipWhiteSpaceStyleCheck == SkipWhiteSpaceStyleCheck::No &&
+      !EditorUtils::IsNewLinePreformatted(
+          *aPoint.template ContainerAs<Text>())) {
+    return false;
+  }
+  const WSScanResult precedingThing =
+      WSRunScanner::ScanPreviousVisibleNodeOrBlockBoundary(
+          {}, aPoint, aAncestorLimiter);
+  return precedingThing.ReachedLineBreak();
+}
+
+bool HTMLEditUtils::IsUnnecessaryBRElement(
+    const dom::HTMLBRElement& aBRElement,
+    PaddingForEmptyBlock aPaddingForEmptyBlock,
+    const Element* aAncestorLimiter ,
+    Element** aFollowingBlockBoundaryElement ) {
+  if (aFollowingBlockBoundaryElement) {
+    *aFollowingBlockBoundaryElement = nullptr;
+  }
+  Element* followingBlockBoundaryElement = nullptr;
+  if (!HTMLEditUtils::IsBRElementFollowedByBlockBoundary(
+          aBRElement, aAncestorLimiter, &followingBlockBoundaryElement)) {
+    return false;
+  }
+  if (aFollowingBlockBoundaryElement) {
+    *aFollowingBlockBoundaryElement = followingBlockBoundaryElement;
+  }
+  Element* precedingBlockBoundaryElement = nullptr;
+  if (HTMLEditUtils::IsBRElementFollowingLineBoundary(
+          aBRElement, aAncestorLimiter, &precedingBlockBoundaryElement)) {
+    if (followingBlockBoundaryElement == precedingBlockBoundaryElement) {
+      return aPaddingForEmptyBlock == PaddingForEmptyBlock::Unnecessary;
+    }
+    return false;
+  }
+  return true;
+}
+
+template <typename EditorDOMPointType>
+bool HTMLEditUtils::IsUnnecessaryPreformattedLineBreak(
+    const EditorDOMPointType& aPoint,
+    PaddingForEmptyBlock aPaddingForEmptyBlock,
+    SkipWhiteSpaceStyleCheck
+        aSkipWhiteSpaceStyleCheck ,
+    const Element* aAncestorLimiter ,
+    Element** aFollowingBlockBoundaryElement ) {
+  if (aFollowingBlockBoundaryElement) {
+    *aFollowingBlockBoundaryElement = nullptr;
+  }
+  Element* followingBlockBoundaryElement = nullptr;
+  if (!HTMLEditUtils::IsPreformattedLineBreakFollowedByBlockBoundary(
+          aPoint, aSkipWhiteSpaceStyleCheck, aAncestorLimiter,
+          &followingBlockBoundaryElement)) {
+    return false;
+  }
+  if (aFollowingBlockBoundaryElement) {
+    *aFollowingBlockBoundaryElement = followingBlockBoundaryElement;
+  }
+  MOZ_ASSERT(aPoint.IsInTextNode());
+  MOZ_ASSERT(aPoint.IsCharNewLine());
+  const WSScanResult precedingThing =
+      WSRunScanner::ScanPreviousVisibleNodeOrBlockBoundary(
+          {}, aPoint, aAncestorLimiter);
+  if (precedingThing.ReachedCurrentBlockBoundary() &&
+      followingBlockBoundaryElement == precedingThing.ElementPtr()) {
+    return aPaddingForEmptyBlock == PaddingForEmptyBlock::Unnecessary;
+  }
+  return !precedingThing.ReachedLineBoundary();
+}
+
+template <typename EditorDOMPointType>
+bool HTMLEditUtils::IsSignificantPreformattedLineBreak(
+    const EditorDOMPointType& aPoint,
+    PaddingForEmptyBlock aPaddingForEmptyBlock,
+    SkipWhiteSpaceStyleCheck
+        aSkipWhiteSpaceStyleCheck ,
+    const Element* aAncestorLimiter ,
+    Element** aFollowingBlockBoundaryElement ) {
+  if (aFollowingBlockBoundaryElement) {
+    *aFollowingBlockBoundaryElement = nullptr;
+  }
+  if (!aPoint.IsInTextNode() || aPoint.IsEndOfContainer() ||
+      !aPoint.IsCharNewLine()) {
+    return false;
+  }
+  if (aSkipWhiteSpaceStyleCheck == SkipWhiteSpaceStyleCheck::No &&
+      !EditorUtils::IsNewLinePreformatted(
+          *aPoint.template ContainerAs<Text>())) {
+    return false;
+  }
+  const WSScanResult followingThing =
+      WSRunScanner::ScanInclusiveNextVisibleNodeOrBlockBoundary(
+          {WSRunScanner::Option::StopAtVisibleEmptyInlineContainers},
+          aPoint.template NextPoint<EditorRawDOMPoint>(), aAncestorLimiter);
+  if (!followingThing.ReachedBlockBoundary()) {
+    return true;
+  }
+  if (aFollowingBlockBoundaryElement) {
+    *aFollowingBlockBoundaryElement = followingThing.ElementPtr();
+  }
+  MOZ_ASSERT(aPoint.IsInTextNode());
+  MOZ_ASSERT(aPoint.IsCharNewLine());
+  const WSScanResult precedingThing =
+      WSRunScanner::ScanPreviousVisibleNodeOrBlockBoundary(
+          {}, aPoint, aAncestorLimiter);
+  if (followingThing.ReachedCurrentBlockBoundary() &&
+      precedingThing.ReachedCurrentBlockBoundary()) {
+    return aPaddingForEmptyBlock == PaddingForEmptyBlock::Significant;
+  }
+  return precedingThing.ReachedLineBoundary();
+}
+
+template <typename EditorDOMPointType>
+WSScanResult
+HTMLEditUtils::ScanInclusiveNextThingWithIgnoringUnnecessaryLineBreak(
+    const EditorDOMPointType& aPoint,
+    PaddingForEmptyBlock aPaddingForEmptyBlock, const Element& aEditingHost,
+    const Element* aAncestorLimiter) {
+  MOZ_ASSERT(aPoint.IsSetAndValid());
+
+  WSScanResult nextThing =
+      WSRunScanner::ScanInclusiveNextVisibleNodeOrBlockBoundary(
+          {}, aPoint, aAncestorLimiter);
+  if (!nextThing.ReachedLineBreak()) {
+    return nextThing;
+  }
+  WSScanResult nextThingOfLineBreak =
+      WSRunScanner::ScanInclusiveNextVisibleNodeOrBlockBoundary(
+          {WSRunScanner::Option::StopAtVisibleEmptyInlineContainers},
+          nextThing.PointAfterReachedContent<EditorRawDOMPoint>(),
+          aAncestorLimiter);
+  if (!nextThingOfLineBreak.ReachedBlockBoundary()) {
+    MOZ_ASSERT(
+        nextThing.CreateEditorLineBreak<EditorRawLineBreak>().IsSignificant(
+            aPaddingForEmptyBlock));
+    return nextThing;
+  }
+  const WSScanResult previousThingOfLineBreak =
+      WSRunScanner::ScanPreviousVisibleNodeOrBlockBoundary(
+          {}, nextThing.PointAtReachedContent<EditorRawDOMPoint>(),
+          aAncestorLimiter);
+  if (previousThingOfLineBreak.ReachedLineBoundary()) {
+    if (aPaddingForEmptyBlock == PaddingForEmptyBlock::Significant ||
+        !nextThingOfLineBreak.ReachedCurrentBlockBoundary() ||
+        !previousThingOfLineBreak.ReachedCurrentBlockBoundary()) {
+      MOZ_ASSERT(
+          nextThing.CreateEditorLineBreak<EditorRawLineBreak>().IsSignificant(
+              aPaddingForEmptyBlock));
+      return nextThing;
+    }
+  }
+  EditorLineBreak unnecessaryLineBreak =
+      nextThing.CreateEditorLineBreak<EditorLineBreak>();
+  MOZ_ASSERT(unnecessaryLineBreak.IsUnnecessary(aPaddingForEmptyBlock,
+                                                aAncestorLimiter));
+  return WSScanResult(std::move(nextThingOfLineBreak),
+                      std::move(unnecessaryLineBreak), aEditingHost);
+}
+
+template <typename EditorLineBreakType, typename EditorDOMPointType>
+Maybe<EditorLineBreakType> HTMLEditUtils::GetPrecedingUnnecessaryLineBreak(
+    const EditorDOMPointType& aPoint,
+    const Element* aAncestorLimiter ) {
+  MOZ_ASSERT(aPoint.IsSetAndValid());
+  MOZ_ASSERT(aPoint.IsInContentNode());
+
+  const WSScanResult previousThing =
+      WSRunScanner::ScanPreviousVisibleNodeOrBlockBoundary(
+          {WSRunScanner::Option::StopAtVisibleEmptyInlineContainers}, aPoint,
+          aAncestorLimiter);
+  if (!previousThing.ReachedLineBreak()) {
+    return Nothing{};
+  }
+  auto lineBreak = previousThing.CreateEditorLineBreak<EditorLineBreakType>();
+  if (lineBreak.IsUnnecessary(PaddingForEmptyBlock::Significant)) {
+    return Some(lineBreak);
+  }
+  return Nothing{};
+}
+
+template <typename PT, typename CT>
+EditorDOMPoint HTMLEditUtils::LineRequiresPaddingLineBreakToBeVisible(
+    const EditorDOMPointBase<PT, CT>& aPoint, const Element& aEditingHost) {
+  if (MOZ_UNLIKELY(!aPoint.IsInContentNode())) {
+    return EditorDOMPoint();
+  }
+  MOZ_ASSERT(HTMLEditUtils::NodeIsEditableOrNotInComposedDoc(
+      *aPoint.template ContainerAs<nsIContent>()));
+  EditorRawDOMPoint point = aPoint.template To<EditorRawDOMPoint>();
+  if (point.IsContainerElement()) {
+    for (nsIContent* child = point.GetChild(); child;
+         child = child->GetFirstChild()) {
+      if (child->IsHTMLElement(nsGkAtoms::br)) {
+        return EditorDOMPoint();
+      }
+      if (!HTMLEditUtils::NodeIsEditableOrNotInComposedDoc(*child) ||
+          HTMLEditUtils::IsBlockElement(
+              *child, BlockInlineCheck::UseComputedDisplayOutsideStyle) ||
+          (child->IsElement() && !HTMLEditUtils::IsContainerNode(*child))) {
+        break;
+      }
+      point.Set(child, 0);
+    }
+  }
+  if (point.IsInTextNode() && !point.IsContainerEmpty()) {
+    if (!point.IsStartOfContainer() &&
+        !point.IsPreviousCharCollapsibleASCIISpace()) {
+      return EditorDOMPoint();  
+    }
+    if (!point.IsEndOfContainer()) {
+      if (EditorUtils::IsWhiteSpacePreformatted(*point.ContainerAs<Text>())) {
+        return EditorDOMPoint();  
+      }
+      const CharacterDataBuffer& characterDataBuffer =
+          point.template ContainerAs<Text>()->DataBuffer();
+      const uint32_t inclusiveNextVisibleCharOffset =
+          characterDataBuffer.FindNonWhitespaceChar(
+              EditorUtils::IsNewLinePreformatted(*point.ContainerAs<Text>())
+                  ? WhitespaceOptions{WhitespaceOption::FormFeedIsSignificant,
+                                      WhitespaceOption::NewLineIsSignificant}
+                  : WhitespaceOptions{WhitespaceOption::FormFeedIsSignificant},
+              point.Offset());
+      if (inclusiveNextVisibleCharOffset != CharacterDataBuffer::kNotFound) {
+        return EditorDOMPoint();  
+      }
+    }
+  }
+
+  const auto AdjustPointToInsertPaddingLineBreak =
+      [](EditorDOMPoint& aPointToInsertLineBreak,
+         const Element* aParentBlockElement, const Element& aEditingHost) {
+        if (MOZ_UNLIKELY(!aPointToInsertLineBreak.IsInContentNode())) {
+          aPointToInsertLineBreak.Clear();
+          return;
+        }
+        while (MOZ_UNLIKELY(
+            !HTMLEditUtils::CanNodeContain(
+                *aPointToInsertLineBreak.GetContainer(), *nsGkAtoms::br) ||
+            !HTMLEditUtils::NodeIsEditableOrNotInComposedDoc(
+                *aPointToInsertLineBreak.GetContainer()))) {
+          if (MOZ_UNLIKELY(aPointToInsertLineBreak.GetContainer() ==
+                               aParentBlockElement ||
+                           aPointToInsertLineBreak.GetContainer() ==
+                               &aEditingHost)) {
+            aPointToInsertLineBreak.Clear();
+            return;
+          }
+          aPointToInsertLineBreak.SetAfterContainer();
+          if (MOZ_UNLIKELY(!aPointToInsertLineBreak.IsInContentNode())) {
+            aPointToInsertLineBreak.Clear();
+            return;
+          }
+        }
+      };
+
+  const Element* maybeNonEditableBlock =
+      HTMLEditUtils::GetInclusiveAncestorElement(
+          *point.ContainerAs<nsIContent>(), ClosestBlockElement,
+          BlockInlineCheck::UseComputedDisplayStyle);
+  if (maybeNonEditableBlock &&
+      HTMLEditUtils::IsEmptyNode(
+          *maybeNonEditableBlock,
+          {EmptyCheckOption::TreatSingleBRElementAsVisible})) {
+    EditorDOMPoint pointToInsertLineBreak =
+        HTMLEditUtils::GetDeepestEditableEndPointOf<EditorDOMPoint>(
+            *maybeNonEditableBlock,
+            {EditablePointOption::RecognizeInvisibleWhiteSpaces,
+             EditablePointOption::StopAtComment});
+    if (pointToInsertLineBreak.IsInTextNode()) {
+      pointToInsertLineBreak.SetAfterContainer();
+    }
+    AdjustPointToInsertPaddingLineBreak(pointToInsertLineBreak,
+                                        maybeNonEditableBlock, aEditingHost);
+    return pointToInsertLineBreak;
+  }
+
+  EditorDOMPoint preferredPaddingLineBreakPoint;
+  const bool followedByBlockBoundary = [&]() {
+    if (point.GetContainer() == maybeNonEditableBlock &&
+        point.IsEndOfContainer()) {
+      preferredPaddingLineBreakPoint = point.To<EditorDOMPoint>();
+      return true;
+    }
+    if (point.GetContainer() == &aEditingHost && point.IsEndOfContainer()) {
+      return false;
+    }
+    const WSScanResult nextThing =
+        WSRunScanner::ScanInclusiveNextVisibleNodeOrBlockBoundary({}, point);
+    if (nextThing.ReachedBlockBoundary()) {
+      if (nextThing.ReachedCurrentBlockBoundary()) {
+        preferredPaddingLineBreakPoint = point.AfterContainer<EditorDOMPoint>();
+      } else {
+        preferredPaddingLineBreakPoint = point.To<EditorDOMPoint>();
+      }
+      if (NS_WARN_IF(!HTMLEditUtils::NodeIsEditableOrNotInComposedDoc(
+              *preferredPaddingLineBreakPoint.GetContainer()))) {
+        return false;
+      }
+      return true;
+    }
+    return false;
+  }();
+  if (!followedByBlockBoundary) {
+    return EditorDOMPoint();
+  }
+  const bool isFollowingBlockBoundary = [&]() {
+    if (point.GetContainer() == maybeNonEditableBlock &&
+        point.IsStartOfContainer()) {
+      return true;
+    }
+    nsIContent* const previousVisibleLeafOrChildBlock =
+        HTMLEditUtils::GetPreviousLeafContentOrPreviousBlockElement(
+            preferredPaddingLineBreakPoint,
+            {LeafNodeOption::TreatChildBlockAsLeafNode,
+             LeafNodeOption::IgnoreInvisibleEmptyInlineContainers,
+             LeafNodeOption::IgnoreEmptyText},
+            BlockInlineCheck::Auto);
+    if (!previousVisibleLeafOrChildBlock) {
+      return true;
+    }
+    return HTMLEditUtils::IsBlockElement(
+        *previousVisibleLeafOrChildBlock,
+        BlockInlineCheck::UseComputedDisplayOutsideStyle);
+  }();
+  if (!isFollowingBlockBoundary) {
+    return EditorDOMPoint();
+  }
+  AdjustPointToInsertPaddingLineBreak(preferredPaddingLineBreakPoint,
+                                      maybeNonEditableBlock, aEditingHost);
+  return preferredPaddingLineBreakPoint;
+}
+
+template <typename PT, typename CT>
+bool HTMLEditUtils::PointIsImmediatelyBeforeCurrentBlockBoundary(
+    const EditorDOMPointBase<PT, CT>& aPoint,
+    IgnoreInvisibleLineBreak aIgnoreInvisibleLineBreak) {
+  MOZ_ASSERT(aPoint.IsSetAndValidInComposedDoc());
+
+  if (MOZ_UNLIKELY(!aPoint.IsInContentNode())) {
+    return false;
+  }
+  const WSScanResult nextThing =
+      WSRunScanner::ScanInclusiveNextVisibleNodeOrBlockBoundary(
+          {WSRunScanner::Option::OnlyEditableNodes}, aPoint);
+  if (nextThing.ReachedCurrentBlockBoundary()) {
+    return true;
+  }
+  if (aIgnoreInvisibleLineBreak == IgnoreInvisibleLineBreak::No ||
+      !nextThing.ReachedLineBreak()) {
+    return false;
+  }
+  const EditorRawLineBreak lineBreak =
+      nextThing.CreateEditorLineBreak<EditorRawLineBreak>();
+  return lineBreak.IsFollowedByCurrentBlockBoundary();
+}
+
+HTMLEditUtils::LeafNodeType HTMLEditUtils::GetLeafNodeType(
+    const nsIContent& aContent, const LeafNodeOptions& aOptions,
+    BlockInlineCheck aBlockInlineCheck, IgnoreChildren aIgnoreChildren) {
+  if (!HTMLEditUtils::IsSimplyEditableNode(aContent)) {
+    if (aOptions.contains(LeafNodeOption::TreatNonEditableNodeAsLeafNode)) {
+      return LeafNodeType::Leaf;
+    }
+    if (aOptions.contains(LeafNodeOption::IgnoreNonEditableNode)) {
+      return LeafNodeType::Ignore;
+    }
+  }
+  if (const Element* const element = Element::FromNode(&aContent)) {
+    if (HTMLEditUtils::IsReplacedElement(*element)) {
+      return LeafNodeType::Leaf;
+    }
+    if (element->GetShadowRootForSelection()) {
+      return LeafNodeType::Leaf;
+    }
+    if (aOptions.contains(LeafNodeOption::TreatChildBlockAsLeafNode) &&
+        HTMLEditUtils::IsBlockElement(
+            *element,
+            UseComputedDisplayOutsideStyleIfAuto(aBlockInlineCheck))) {
+      return LeafNodeType::Leaf;
+    }
+    if (!HTMLEditUtils::IsContainerNode(*element)) {
+      return aOptions.contains(
+                 LeafNodeOption::IgnoreInvisibleInlineVoidElements) &&
+                     (!HTMLEditUtils::IsVisibleElementEvenIfLeafNode(
+                          *element) ||
+                      HTMLEditUtils::IsInclusiveAncestorCSSDisplayNone(
+                          *element))
+                 ? LeafNodeType::Ignore
+                 : LeafNodeType::Leaf;
+    }
+    if (aIgnoreChildren == IgnoreChildren::No && aContent.HasChildNodes()) {
+      return LeafNodeType::NonEmptyContainer;
+    }
+    if (HTMLEditUtils::IsBlockElement(
+            *element, aBlockInlineCheck == BlockInlineCheck::UseHTMLDefaultStyle
+                          ? BlockInlineCheck::UseHTMLDefaultStyle
+                          : BlockInlineCheck::UseComputedDisplayStyle)) {
+      return LeafNodeType::Leaf;
+    }
+    if (aOptions.contains(LeafNodeOption::IgnoreAnyEmptyInlineContainers)) {
+      return LeafNodeType::Ignore;
+    }
+    if (aOptions.contains(
+            LeafNodeOption::IgnoreInvisibleEmptyInlineContainers) &&
+        (!HTMLEditUtils::IsVisibleElementEvenIfLeafNode(*element) ||
+         HTMLEditUtils::IsInclusiveAncestorCSSDisplayNone(*element))) {
+      return LeafNodeType::Ignore;
+    }
+    return LeafNodeType::Leaf;
+  }
+  if (const Text* const text = Text::FromNode(aContent)) {
+    if (!text->TextDataLength()) {
+      return aOptions.contains(LeafNodeOption::IgnoreEmptyText) ||
+                     aOptions.contains(LeafNodeOption::IgnoreInvisibleText)
+                 ? LeafNodeType::Ignore
+                 : LeafNodeType::Leaf;
+    }
+    return !aOptions.contains(LeafNodeOption::IgnoreInvisibleText) ||
+                   (HTMLEditUtils::IsVisibleTextNode(
+                        *text, TreatInvisibleLineBreakAs::Visible) &&
+                    !HTMLEditUtils::IsInclusiveAncestorCSSDisplayNone(*text))
+               ? LeafNodeType::Leaf
+               : LeafNodeType::Ignore;
+  }
+  if (aContent.IsComment()) {
+    return aOptions.contains(LeafNodeOption::TreatCommentAsLeafNode)
+               ? LeafNodeType::Leaf
+               : LeafNodeType::Ignore;
+  }
+  return LeafNodeType::Ignore;
+}
+
+nsIContent* HTMLEditUtils::GetLastLeafContent(
+    const nsINode& aNode, const LeafNodeOptions& aOptions,
+    BlockInlineCheck aBlockInlineCheck ) {
+  MOZ_ASSERT_IF(
+      aOptions.contains(LeafNodeOption::IgnoreNonEditableNode),
+      !aOptions.contains(LeafNodeOption::TreatNonEditableNodeAsLeafNode));
+  MOZ_ASSERT_IF(aOptions.contains(LeafNodeOption::TreatChildBlockAsLeafNode),
+                aBlockInlineCheck != BlockInlineCheck::Unused);
+  if (aNode.IsElement() &&
+      HTMLEditUtils::IsNeverElementContentsEditableByUser(*aNode.AsElement())) {
+    return nullptr;
+  }
+  for (nsIContent* content = aNode.GetLastChild(); content;) {
+    const LeafNodeType type = HTMLEditUtils::GetLeafNodeType(
+        *content, aOptions, aBlockInlineCheck, IgnoreChildren::No);
+    if (type == LeafNodeType::Leaf) {
+      return content;
+    }
+    if (type == LeafNodeType::NonEmptyContainer) {
+      content = content->GetLastChild();
+      MOZ_ASSERT(content);
+      continue;
+    }
+    MOZ_ASSERT(type == LeafNodeType::Ignore);
+    nsIContent* const prevSibling = content->GetPreviousSibling();
+    if (prevSibling) {
+      content = prevSibling;
+      continue;
+    }
+    nsIContent* const parent = content->GetParent();
+    if (!parent || parent == &aNode) {
+      return nullptr;
+    }
+    content = nullptr;
+    for (nsIContent* const ancestor :
+         parent->InclusiveAncestorsOfType<nsIContent>()) {
+      if (ancestor == &aNode) {
+        return nullptr;  
+      }
+      const LeafNodeType type = HTMLEditUtils::GetLeafNodeType(
+          *ancestor, aOptions, aBlockInlineCheck, IgnoreChildren::Yes);
+      if (type == LeafNodeType::Leaf) {
+        return ancestor;
+      }
+      MOZ_ASSERT(type == LeafNodeType::Ignore);
+      if ((content = ancestor->GetPreviousSibling())) {
+        break;
+      }
+    }
+  }
+  return nullptr;
+}
+
+nsIContent* HTMLEditUtils::GetFirstLeafContent(
+    const nsINode& aNode, const LeafNodeOptions& aOptions,
+    BlockInlineCheck aBlockInlineCheck ) {
+  MOZ_ASSERT_IF(
+      aOptions.contains(LeafNodeOption::IgnoreNonEditableNode),
+      !aOptions.contains(LeafNodeOption::TreatNonEditableNodeAsLeafNode));
+  MOZ_ASSERT_IF(aOptions.contains(LeafNodeOption::TreatChildBlockAsLeafNode),
+                aBlockInlineCheck != BlockInlineCheck::Unused);
+  if (aNode.IsElement() &&
+      HTMLEditUtils::IsNeverElementContentsEditableByUser(*aNode.AsElement())) {
+    return nullptr;
+  }
+  for (nsIContent* content = aNode.GetFirstChild(); content;) {
+    const LeafNodeType type = HTMLEditUtils::GetLeafNodeType(
+        *content, aOptions, aBlockInlineCheck, IgnoreChildren::No);
+    if (type == LeafNodeType::Leaf) {
+      return content;
+    }
+    if (type == LeafNodeType::NonEmptyContainer) {
+      content = content->GetFirstChild();
+      MOZ_ASSERT(content);
+      continue;
+    }
+    MOZ_ASSERT(type == LeafNodeType::Ignore);
+    nsIContent* const nextSibling = content->GetNextSibling();
+    if (nextSibling) {
+      content = nextSibling;
+      continue;
+    }
+    nsIContent* const parent = content->GetParent();
+    if (!parent || parent == &aNode) {
+      return nullptr;  
+    }
+    content = nullptr;
+    for (nsIContent* const ancestor :
+         parent->InclusiveAncestorsOfType<nsIContent>()) {
+      if (ancestor == &aNode) {
+        return nullptr;
+      }
+      const LeafNodeType type = HTMLEditUtils::GetLeafNodeType(
+          *ancestor, aOptions, aBlockInlineCheck, IgnoreChildren::Yes);
+      if (type == LeafNodeType::Leaf) {
+        return ancestor;
+      }
+      MOZ_ASSERT(type == LeafNodeType::Ignore);
+      if ((content = ancestor->GetNextSibling())) {
+        break;
+      }
+    }
+  }
+  return nullptr;
+}
+
+nsIContent* HTMLEditUtils::GetNextLeafContentOrNextBlockElementImpl(
+    const nsIContent& aStartContent, StopAtBlockSibling aStopAtBlockSibling,
+    const LeafNodeOptions& aOptions, BlockInlineCheck aBlockInlineCheck,
+    const Element* aAncestorLimiter ) {
+  MOZ_ASSERT_IF(
+      aOptions.contains(LeafNodeOption::IgnoreNonEditableNode),
+      !aOptions.contains(LeafNodeOption::TreatNonEditableNodeAsLeafNode));
+
+  if (&aStartContent == aAncestorLimiter) {
+    return nullptr;
+  }
+
+  Element* container = aStartContent.GetParentElement();
+  for (nsIContent* nextContent = aStartContent.GetNextSibling();;) {
+    if (!nextContent) {
+      if (!container) {
+        NS_WARNING("Reached orphan node while climbing up the DOM tree");
+        return nullptr;
+      }
+      for (Element* const parentElement :
+           container->InclusiveAncestorsOfType<Element>()) {
+        if (parentElement == aAncestorLimiter ||
+            (static_cast<bool>(aStopAtBlockSibling) &&
+             HTMLEditUtils::IsBlockElement(
+                 *parentElement,
+                 UseComputedDisplayStyleIfAuto(aBlockInlineCheck)))) {
+          return nullptr;
+        }
+        if (aOptions.contains(LeafNodeOption::TreatNonEditableNodeAsLeafNode) &&
+            !parentElement->IsEditable()) {
+          return nullptr;
+        }
+        nextContent = parentElement->GetNextSibling();
+        if (nextContent) {
+          container = nextContent->GetParentElement();
+          break;
+        }
+        if (!parentElement->GetParentElement()) {
+          NS_WARNING("Reached orphan node while climbing up the DOM tree");
+          return nullptr;
+        }
+      }
+      MOZ_ASSERT(nextContent);
+    }
+
+    if (static_cast<bool>(aStopAtBlockSibling) &&
+        HTMLEditUtils::IsBlockElement(
+            *nextContent,
+            PreferDisplayOutsideIfUsingDisplay(
+                UseComputedDisplayStyleIfAuto(aBlockInlineCheck)))) {
+      return nextContent;
+    }
+    LeafNodeType type = HTMLEditUtils::GetLeafNodeType(
+        *nextContent, aOptions, aBlockInlineCheck, IgnoreChildren::No);
+    if (type == LeafNodeType::Leaf) {
+      return nextContent;
+    }
+    if (type == LeafNodeType::Ignore) {
+      nextContent = nextContent->GetNextSibling();
+      MOZ_ASSERT_IF(nextContent, container == nextContent->GetParentElement());
+      continue;
+    }
+    MOZ_ASSERT(type == LeafNodeType::NonEmptyContainer);
+    if (nsIContent* const lastLeaf = HTMLEditUtils::GetFirstLeafContent(
+            *nextContent, aOptions,
+            PreferDisplayOutsideIfUsingDisplay(aBlockInlineCheck))) {
+      return lastLeaf;
+    }
+    type = HTMLEditUtils::GetLeafNodeType(
+        *nextContent, aOptions, aBlockInlineCheck, IgnoreChildren::Yes);
+    if (type == LeafNodeType::Leaf) {
+      return nextContent;
+    }
+    MOZ_ASSERT(type == LeafNodeType::Ignore);
+    nextContent = nextContent->GetNextSibling();
+    MOZ_ASSERT_IF(nextContent, container == nextContent->GetParentElement());
+  }
+  MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE(
+      "Must return from the preceding for-loop");
+}
+
+template <typename PT, typename CT>
+nsIContent* HTMLEditUtils::GetNextLeafContentOrNextBlockElementImpl(
+    const EditorDOMPointBase<PT, CT>& aStartPoint,
+    StopAtBlockSibling aStopAtBlockSibling, const LeafNodeOptions& aOptions,
+    BlockInlineCheck aBlockInlineCheck,
+    const Element* aAncestorLimiter ) {
+  MOZ_ASSERT(aStartPoint.IsSet());
+  MOZ_ASSERT_IF(
+      aOptions.contains(LeafNodeOption::IgnoreNonEditableNode),
+      !aOptions.contains(LeafNodeOption::TreatNonEditableNodeAsLeafNode));
+
+  if (!aStartPoint.IsInContentNode()) {
+    return nullptr;
+  }
+  if (!aStartPoint.GetContainer()->IsElement()) {
+    return HTMLEditUtils::GetNextLeafContentOrNextBlockElementImpl(
+        *aStartPoint.template ContainerAs<nsIContent>(), aStopAtBlockSibling,
+        aOptions, aBlockInlineCheck, aAncestorLimiter);
+  }
+  if (!HTMLEditUtils::IsContainerNode(
+          *aStartPoint.template ContainerAs<Element>()) ||
+      HTMLEditUtils::IsReplacedElement(
+          *aStartPoint.template ContainerAs<Element>())) {
+    return HTMLEditUtils::GetNextLeafContentOrNextBlockElementImpl(
+        *aStartPoint.template ContainerAs<nsIContent>(), aStopAtBlockSibling,
+        aOptions, aBlockInlineCheck, aAncestorLimiter);
+  }
+
+  for (nsIContent* nextContent = aStartPoint.GetChild();;) {
+    if (!nextContent) {
+      if (aStartPoint.GetContainer() == aAncestorLimiter ||
+          (static_cast<bool>(aStopAtBlockSibling) &&
+           HTMLEditUtils::IsBlockElement(
+               *aStartPoint.template ContainerAs<Element>(),
+               UseComputedDisplayStyleIfAuto(aBlockInlineCheck)))) {
+        return nullptr;
+      }
+
+      return HTMLEditUtils::GetNextLeafContentOrNextBlockElementImpl(
+          *aStartPoint.template ContainerAs<Element>(), aStopAtBlockSibling,
+          aOptions, PreferDisplayOutsideIfUsingDisplay(aBlockInlineCheck),
+          aAncestorLimiter);
+    }
+
+    if (static_cast<bool>(aStopAtBlockSibling) &&
+        HTMLEditUtils::IsBlockElement(
+            *nextContent,
+            UseComputedDisplayOutsideStyleIfAuto(aBlockInlineCheck))) {
+      return nextContent;
+    }
+    LeafNodeType type = HTMLEditUtils::GetLeafNodeType(
+        *nextContent, aOptions, aBlockInlineCheck, IgnoreChildren::No);
+    if (type == LeafNodeType::Leaf) {
+      return nextContent;
+    }
+    if (type == LeafNodeType::Ignore) {
+      nextContent = nextContent->GetNextSibling();
+      continue;
+    }
+    MOZ_ASSERT(type == LeafNodeType::NonEmptyContainer);
+    if (nsIContent* const firstLeaf = HTMLEditUtils::GetFirstLeafContent(
+            *nextContent, aOptions,
+            PreferDisplayOutsideIfUsingDisplay(aBlockInlineCheck))) {
+      return firstLeaf;
+    }
+    type = HTMLEditUtils::GetLeafNodeType(
+        *nextContent, aOptions, aBlockInlineCheck, IgnoreChildren::Yes);
+    if (type == LeafNodeType::Leaf) {
+      return nextContent;
+    }
+    MOZ_ASSERT(type == LeafNodeType::Ignore);
+    nextContent = nextContent->GetNextSibling();
+  }
+  MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE(
+      "Must return from the preceding for-loop");
+}
+
+nsIContent* HTMLEditUtils::GetPreviousLeafContentOrPreviousBlockElementImpl(
+    const nsIContent& aStartContent, StopAtBlockSibling aStopAtBlockSibling,
+    const LeafNodeOptions& aOptions, BlockInlineCheck aBlockInlineCheck,
+    const Element* aAncestorLimiter ) {
+  MOZ_ASSERT_IF(
+      aOptions.contains(LeafNodeOption::IgnoreNonEditableNode),
+      !aOptions.contains(LeafNodeOption::TreatNonEditableNodeAsLeafNode));
+
+  if (&aStartContent == aAncestorLimiter) {
+    return nullptr;
+  }
+
+  Element* container = aStartContent.GetParentElement();
+  for (nsIContent* previousContent = aStartContent.GetPreviousSibling();;) {
+    if (!previousContent) {
+      if (!container) {
+        NS_WARNING("Reached orphan node while climbing up the DOM tree");
+        return nullptr;
+      }
+      for (Element* parentElement :
+           container->InclusiveAncestorsOfType<Element>()) {
+        if (parentElement == aAncestorLimiter ||
+            (static_cast<bool>(aStopAtBlockSibling) &&
+             HTMLEditUtils::IsBlockElement(
+                 *parentElement,
+                 UseComputedDisplayStyleIfAuto(aBlockInlineCheck)))) {
+          return nullptr;
+        }
+        if (aOptions.contains(LeafNodeOption::TreatNonEditableNodeAsLeafNode) &&
+            !parentElement->IsEditable()) {
+          return nullptr;
+        }
+        previousContent = parentElement->GetPreviousSibling();
+        if (previousContent) {
+          container = previousContent->GetParentElement();
+          break;
+        }
+        if (!parentElement->GetParentElement()) {
+          NS_WARNING("Reached orphan node while climbing up the DOM tree");
+          return nullptr;
+        }
+      }
+      MOZ_ASSERT(previousContent);
+    }
+    if (static_cast<bool>(aStopAtBlockSibling) &&
+        HTMLEditUtils::IsBlockElement(
+            *previousContent,
+            PreferDisplayOutsideIfUsingDisplay(
+                UseComputedDisplayOutsideStyleIfAuto(aBlockInlineCheck)))) {
+      return previousContent;
+    }
+    LeafNodeType type = HTMLEditUtils::GetLeafNodeType(
+        *previousContent, aOptions, aBlockInlineCheck, IgnoreChildren::No);
+    if (type == LeafNodeType::Leaf) {
+      return previousContent;
+    }
+    if (type == LeafNodeType::Ignore) {
+      previousContent = previousContent->GetPreviousSibling();
+      MOZ_ASSERT_IF(previousContent,
+                    container == previousContent->GetParentElement());
+      continue;
+    }
+    if (nsIContent* const lastLeaf = HTMLEditUtils::GetLastLeafContent(
+            *previousContent, aOptions,
+            PreferDisplayOutsideIfUsingDisplay(aBlockInlineCheck))) {
+      return lastLeaf;
+    }
+    type = HTMLEditUtils::GetLeafNodeType(
+        *previousContent, aOptions, aBlockInlineCheck, IgnoreChildren::Yes);
+    if (type == LeafNodeType::Leaf) {
+      return previousContent;
+    }
+    MOZ_ASSERT(type == LeafNodeType::Ignore);
+    previousContent = previousContent->GetPreviousSibling();
+    MOZ_ASSERT_IF(previousContent,
+                  container == previousContent->GetParentElement());
+    return previousContent;
+  }
+  MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE(
+      "Must return from the preceding for-loop");
+}
+
+template <typename PT, typename CT>
+nsIContent* HTMLEditUtils::GetPreviousLeafContentOrPreviousBlockElementImpl(
+    const EditorDOMPointBase<PT, CT>& aStartPoint,
+    StopAtBlockSibling aStopAtBlockSibling, const LeafNodeOptions& aOptions,
+    BlockInlineCheck aBlockInlineCheck,
+    const Element* aAncestorLimiter ) {
+  MOZ_ASSERT(aStartPoint.IsSet());
+  MOZ_ASSERT_IF(
+      aOptions.contains(LeafNodeOption::IgnoreNonEditableNode),
+      !aOptions.contains(LeafNodeOption::TreatNonEditableNodeAsLeafNode));
+
+  if (!aStartPoint.IsInContentNode()) {
+    return nullptr;
+  }
+  if (!aStartPoint.GetContainer()->IsElement()) {
+    return HTMLEditUtils::GetPreviousLeafContentOrPreviousBlockElementImpl(
+        *aStartPoint.template ContainerAs<nsIContent>(), aStopAtBlockSibling,
+        aOptions, aBlockInlineCheck, aAncestorLimiter);
+  }
+  if (!HTMLEditUtils::IsContainerNode(
+          *aStartPoint.template ContainerAs<Element>()) ||
+      HTMLEditUtils::IsReplacedElement(
+          *aStartPoint.template ContainerAs<Element>())) {
+    return HTMLEditUtils::GetPreviousLeafContentOrPreviousBlockElementImpl(
+        *aStartPoint.template ContainerAs<Element>(), aStopAtBlockSibling,
+        aOptions, aBlockInlineCheck, aAncestorLimiter);
+  }
+
+  if (aStartPoint.IsStartOfContainer()) {
+    if (aStartPoint.GetContainer() == aAncestorLimiter ||
+        (static_cast<bool>(aStopAtBlockSibling) &&
+         HTMLEditUtils::IsBlockElement(
+             *aStartPoint.template ContainerAs<Element>(),
+             UseComputedDisplayStyleIfAuto(aBlockInlineCheck)))) {
+      return nullptr;
+    }
+
+    return HTMLEditUtils::GetPreviousLeafContentOrPreviousBlockElementImpl(
+        *aStartPoint.template ContainerAs<Element>(), aStopAtBlockSibling,
+        aOptions, PreferDisplayOutsideIfUsingDisplay(aBlockInlineCheck),
+        aAncestorLimiter);
+  }
+
+  for (nsIContent* previousContent = aStartPoint.GetPreviousSiblingOfChild();
+       previousContent;
+       previousContent = previousContent->GetPreviousSibling()) {
+    if (static_cast<bool>(aStopAtBlockSibling) &&
+        HTMLEditUtils::IsBlockElement(
+            *previousContent,
+            UseComputedDisplayOutsideStyleIfAuto(aBlockInlineCheck))) {
+      return previousContent;
+    }
+    LeafNodeType type = HTMLEditUtils::GetLeafNodeType(
+        *previousContent, aOptions, aBlockInlineCheck, IgnoreChildren::No);
+    if (type == LeafNodeType::Leaf) {
+      return previousContent;
+    }
+    if (type == LeafNodeType::Ignore) {
+      continue;
+    }
+    if (nsIContent* const lastLeaf = HTMLEditUtils::GetLastLeafContent(
+            *previousContent, aOptions,
+            PreferDisplayOutsideIfUsingDisplay(aBlockInlineCheck))) {
+      return lastLeaf;
+    }
+    type = HTMLEditUtils::GetLeafNodeType(
+        *previousContent, aOptions, aBlockInlineCheck, IgnoreChildren::Yes);
+    if (type == LeafNodeType::Leaf) {
+      return previousContent;
+    }
+    MOZ_ASSERT(type == LeafNodeType::Ignore);
+  }
+  return nullptr;
+}
+
+nsIContent* HTMLEditUtils::GetSibling(const nsIContent& aContent,
+                                      WalkTreeDirection aDirection,
+                                      const LeafNodeOptions& aOptions,
+                                      BlockInlineCheck aBlockInlineCheck) {
+  MOZ_ASSERT(aBlockInlineCheck != BlockInlineCheck::Unused);
+  aBlockInlineCheck = UseComputedDisplayOutsideStyleIfAuto(aBlockInlineCheck);
+  for (nsIContent* sibling = aDirection == WalkTreeDirection::Backward
+                                 ? aContent.GetPreviousSibling()
+                                 : aContent.GetNextSibling();
+       sibling; sibling = aDirection == WalkTreeDirection::Backward
+                              ? sibling->GetPreviousSibling()
+                              : sibling->GetNextSibling()) {
+    const LeafNodeType leafNodeType = HTMLEditUtils::GetLeafNodeType(
+        *sibling, aOptions, aBlockInlineCheck, IgnoreChildren::No);
+    if (leafNodeType == LeafNodeType::Ignore) {
+      continue;
+    }
+    if (HTMLEditUtils::IsBlockElement(*sibling, aBlockInlineCheck)) {
+      return sibling;
+    }
+    if (leafNodeType == LeafNodeType::NonEmptyContainer) {
+      if (HTMLEditUtils::GetFirstLeafContent(*sibling, aOptions,
+                                             aBlockInlineCheck)) {
+        return sibling;  
+      }
+      if (HTMLEditUtils::GetLeafNodeType(*sibling, aOptions, aBlockInlineCheck,
+                                         IgnoreChildren::Yes) ==
+          LeafNodeType::Ignore) {
+        continue;  
+      }
+    }
+    return sibling;
+  }
+  return nullptr;
+}
+
+nsIContent* HTMLEditUtils::GetFirstOrLastChild(
+    const nsINode& aNode, FirstOrLastChild aFirstOrLastChild,
+    const LeafNodeOptions& aOptions, BlockInlineCheck aBlockInlineCheck) {
+  MOZ_ASSERT(aBlockInlineCheck != BlockInlineCheck::Unused);
+  aBlockInlineCheck = UseComputedDisplayOutsideStyleIfAuto(aBlockInlineCheck);
+  for (nsIContent* child = aFirstOrLastChild == FirstOrLastChild::First
+                               ? aNode.GetFirstChild()
+                               : aNode.GetLastChild();
+       child; child = aFirstOrLastChild == FirstOrLastChild::First
+                          ? child->GetNextSibling()
+                          : child->GetPreviousSibling()) {
+    const LeafNodeType leafNodeType = HTMLEditUtils::GetLeafNodeType(
+        *child, aOptions, aBlockInlineCheck, IgnoreChildren::No);
+    if (leafNodeType == LeafNodeType::Ignore) {
+      continue;
+    }
+    if (HTMLEditUtils::IsBlockElement(*child, aBlockInlineCheck)) {
+      return child;
+    }
+    if (leafNodeType == LeafNodeType::NonEmptyContainer) {
+      if (HTMLEditUtils::GetFirstLeafContent(*child, aOptions,
+                                             aBlockInlineCheck)) {
+        return child;  
+      }
+      if (HTMLEditUtils::GetLeafNodeType(*child, aOptions, aBlockInlineCheck,
+                                         IgnoreChildren::Yes) ==
+          LeafNodeType::Ignore) {
+        continue;  
+      }
+    }
+    return child;
+  }
+  return nullptr;
+}
+
+uint32_t HTMLEditUtils::GetFirstVisibleCharOffset(const Text& aText) {
+  const CharacterDataBuffer& characterDataBuffer = aText.DataBuffer();
+  if (!characterDataBuffer.GetLength() ||
+      !EditorRawDOMPointInText(&aText, 0u)
+           .IsCharCollapsibleASCIISpaceOrNBSP()) {
+    return 0u;
+  }
+  const WSScanResult previousThingOfText =
+      WSRunScanner::ScanPreviousVisibleNodeOrBlockBoundary(
+          {}, EditorRawDOMPoint(&aText));
+  if (!previousThingOfText.ReachedLineBoundary()) {
+    return 0u;
+  }
+  return HTMLEditUtils::GetInclusiveNextNonCollapsibleCharOffset(aText, 0u)
+      .valueOr(characterDataBuffer.GetLength());
+}
+
+uint32_t HTMLEditUtils::GetOffsetAfterLastVisibleChar(const Text& aText) {
+  const CharacterDataBuffer& characterDataBuffer = aText.DataBuffer();
+  if (!characterDataBuffer.GetLength()) {
+    return 0u;
+  }
+  if (!EditorRawDOMPointInText::AtLastContentOf(aText)
+           .IsCharCollapsibleASCIISpaceOrNBSP()) {
+    return characterDataBuffer.GetLength();
+  }
+  const WSScanResult nextThingOfText =
+      WSRunScanner::ScanInclusiveNextVisibleNodeOrBlockBoundary(
+          {}, EditorRawDOMPoint::After(aText));
+  if (!nextThingOfText.ReachedLineBoundary()) {
+    return characterDataBuffer.GetLength();
+  }
+  const Maybe<uint32_t> lastNonCollapsibleCharOffset =
+      HTMLEditUtils::GetPreviousNonCollapsibleCharOffset(
+          aText, characterDataBuffer.GetLength());
+  if (lastNonCollapsibleCharOffset.isNothing()) {
+    return 0u;
+  }
+  if (*lastNonCollapsibleCharOffset == characterDataBuffer.GetLength() - 1u) {
+    return characterDataBuffer.GetLength();
+  }
+  const uint32_t firstTrailingWhiteSpaceOffset =
+      *lastNonCollapsibleCharOffset + 1u;
+  MOZ_ASSERT(firstTrailingWhiteSpaceOffset < characterDataBuffer.GetLength());
+  if (nextThingOfText.ReachedBlockBoundary()) {
+    return firstTrailingWhiteSpaceOffset;
+  }
+  return firstTrailingWhiteSpaceOffset + 1u;
+}
+
+uint32_t HTMLEditUtils::GetInvisibleWhiteSpaceCount(
+    const Text& aText, uint32_t aOffset ,
+    uint32_t aLength ) {
+  const CharacterDataBuffer& characterDataBuffer = aText.DataBuffer();
+  if (!aLength || characterDataBuffer.GetLength() <= aOffset) {
+    return 0u;
+  }
+  const uint32_t endOffset = static_cast<uint32_t>(
+      std::min(static_cast<uint64_t>(aOffset) + aLength,
+               static_cast<uint64_t>(characterDataBuffer.GetLength())));
+  const auto firstVisibleOffset = [&]() -> uint32_t {
+    if (aOffset &&
+        characterDataBuffer.CharAt(aOffset - 1u) == HTMLEditUtils::kNewLine &&
+        EditorUtils::IsNewLinePreformatted(aText)) {
+      for (const uint32_t offset : IntegerRange(aOffset, endOffset)) {
+        if (characterDataBuffer.CharAt(offset) == HTMLEditUtils::kNBSP) {
+          return offset;
+        }
+      }
+      return endOffset;  
+    }
+    if (aOffset) {
+      return aOffset - 1u;
+    }
+    return HTMLEditUtils::GetFirstVisibleCharOffset(aText);
+  }();
+  if (firstVisibleOffset >= endOffset) {
+    return endOffset - aOffset;  
+  }
+  const auto afterLastVisibleOffset = [&]() -> uint32_t {
+    if (endOffset < characterDataBuffer.GetLength() &&
+        characterDataBuffer.CharAt(endOffset) == HTMLEditUtils::kNewLine &&
+        EditorUtils::IsNewLinePreformatted(aText)) {
+      for (const uint32_t offset : Reversed(IntegerRange(aOffset, endOffset))) {
+        if (characterDataBuffer.CharAt(offset) == HTMLEditUtils::kNBSP) {
+          return offset + 1u;
+        }
+      }
+      return aOffset;  
+    }
+    if (endOffset < characterDataBuffer.GetLength() - 1u) {
+      return endOffset;
+    }
+    return HTMLEditUtils::GetOffsetAfterLastVisibleChar(aText);
+  }();
+  if (aOffset >= afterLastVisibleOffset) {
+    return endOffset - aOffset;  
+  }
+  enum class PrevChar { NotChar, Space, NBSP };
+  PrevChar prevChar = PrevChar::NotChar;
+  uint32_t invisibleChars = 0u;
+  for (const uint32_t offset : IntegerRange(aOffset, endOffset)) {
+    if (characterDataBuffer.CharAt(offset) == HTMLEditUtils::kNBSP) {
+      prevChar = PrevChar::NBSP;
+      continue;
+    }
+    MOZ_ASSERT(
+        EditorRawDOMPointInText(&aText, offset).IsCharCollapsibleASCIISpace());
+    if (offset < firstVisibleOffset || offset >= afterLastVisibleOffset ||
+        prevChar == PrevChar::Space) {
+      invisibleChars++;
+    }
+    prevChar = PrevChar::Space;
+  }
+  return invisibleChars;
+}
+
+bool HTMLEditUtils::IsEmptyNode(nsPresContext* aPresContext,
+                                const nsINode& aNode,
+                                const EmptyCheckOptions& aOptions ,
+                                bool* aSeenBR ) {
+  MOZ_ASSERT_IF(aOptions.contains(EmptyCheckOption::SafeToAskLayout),
+                aPresContext);
+
+  if (aSeenBR) {
+    *aSeenBR = false;
+  }
+
+  if (const Text* text = Text::FromNode(&aNode)) {
+    return aOptions.contains(EmptyCheckOption::SafeToAskLayout)
+               ? !IsInVisibleTextFrames(aPresContext, *text)
+               : !IsVisibleTextNode(
+                     *text, aOptions.contains(
+                                EmptyCheckOption::TreatSingleBRElementAsVisible)
+                                ? TreatInvisibleLineBreakAs::Visible
+                                : TreatInvisibleLineBreakAs::Invisible);
+  }
+
+  const bool treatCommentAsVisible =
+      aOptions.contains(EmptyCheckOption::TreatCommentAsVisible);
+  if (aNode.IsComment()) {
+    return !treatCommentAsVisible;
+  }
+
+  if (!aNode.IsElement()) {
+    return false;
+  }
+
+  if (
+      !IsContainerNode(*aNode.AsContent()) ||
+      IsNamedAnchorElement(*aNode.AsContent()) ||
+      IsReplacedElement(*aNode.AsElement())) {
+    return false;
+  }
+
+  const auto [isListItem, isTableCell, hasAppearance] =
+      [&]() MOZ_NEVER_INLINE_DEBUG -> std::tuple<bool, bool, bool> {
+    if (aNode.OwnerDoc()->GetDocumentElement() == &aNode ||
+        (aNode.IsHTMLElement(nsGkAtoms::body) &&
+         aNode.OwnerDoc()->GetBodyElement() == &aNode)) {
+      return {false, false, false};
+    }
+
+    RefPtr<const ComputedStyle> elementStyle =
+        nsComputedDOMStyle::GetComputedStyleNoFlush(aNode.AsElement());
+    if (MOZ_UNLIKELY(!elementStyle)) {
+      return {IsListItemElement(*aNode.AsContent()),
+              IsTableCellElement(*aNode.AsContent()), false};
+    }
+    const nsStyleDisplay* styleDisplay = elementStyle->StyleDisplay();
+    if (NS_WARN_IF(!styleDisplay)) {
+      return {IsListItemElement(*aNode.AsContent()),
+              IsTableCellElement(*aNode.AsContent()), false};
+    }
+    if (styleDisplay->mDisplay != StyleDisplay::None &&
+        styleDisplay->HasNativeAppearance()) {
+      return {false, false, true};
+    }
+    if (styleDisplay->IsListItem()) {
+      return {true, false, false};
+    }
+    if (styleDisplay->mDisplay == StyleDisplay::TableCell) {
+      return {false, true, false};
+    }
+    return {styleDisplay->mDisplay == StyleDisplay::Block &&
+                aNode.IsAnyOfHTMLElements(nsGkAtoms::dd, nsGkAtoms::dt),
+            false, false};
+  }();
+
+  if (hasAppearance) {
+    return false;
+  }
+
+  if (isListItem &&
+      aOptions.contains(EmptyCheckOption::TreatListItemAsVisible)) {
+    return false;
+  }
+  if (isTableCell &&
+      aOptions.contains(EmptyCheckOption::TreatTableCellAsVisible)) {
+    return false;
+  }
+
+  const bool treatNonEditableContentAsInvisible =
+      aOptions.contains(EmptyCheckOption::TreatNonEditableContentAsInvisible);
+  bool seenBR = aSeenBR && *aSeenBR;
+  for (nsIContent* childContent = aNode.GetFirstChild(); childContent;
+       childContent = childContent->GetNextSibling()) {
+    if (childContent->IsComment()) {
+      if (treatCommentAsVisible) {
+        return false;
+      }
+      continue;
+    }
+    if (treatNonEditableContentAsInvisible &&
+        !HTMLEditUtils::IsSimplyEditableNode(*childContent)) {
+      continue;
+    }
+    if (Text* text = Text::FromNode(childContent)) {
+      if (aOptions.contains(EmptyCheckOption::SafeToAskLayout)
+              ? IsInVisibleTextFrames(aPresContext, *text)
+              : IsVisibleTextNode(
+                    *text, aOptions.contains(
+                               EmptyCheckOption::TreatSingleBRElementAsVisible)
+                               ? TreatInvisibleLineBreakAs::Visible
+                               : TreatInvisibleLineBreakAs::Invisible)) {
+        return false;
+      }
+      continue;
+    }
+
+    if (childContent->IsComment()) {
+      continue;
+    }
+
+    MOZ_ASSERT(childContent != &aNode);
+
+    if (!aOptions.contains(EmptyCheckOption::TreatSingleBRElementAsVisible) &&
+        !seenBR && childContent->IsHTMLElement(nsGkAtoms::br)) {
+      seenBR = true;
+      if (aSeenBR) {
+        *aSeenBR = true;
+      }
+      continue;
+    }
+
+    if (aOptions.contains(EmptyCheckOption::TreatBlockAsVisible) &&
+        HTMLEditUtils::IsBlockElement(
+            *childContent, BlockInlineCheck::UseComputedDisplayOutsideStyle)) {
+      return false;
+    }
+
+    EmptyCheckOptions options(aOptions);
+    if (childContent->IsElement() && (isListItem || isTableCell)) {
+      options += {EmptyCheckOption::TreatListItemAsVisible,
+                  EmptyCheckOption::TreatTableCellAsVisible};
+    }
+    if (!IsEmptyNode(aPresContext, *childContent, options, &seenBR)) {
+      if (aSeenBR) {
+        *aSeenBR = seenBR;
+      }
+      return false;
+    }
+  }
+
+  if (aSeenBR) {
+    *aSeenBR = seenBR;
+  }
+  return true;
+}
+
+bool HTMLEditUtils::ShouldInsertLinefeedCharacter(
+    const EditorDOMPoint& aPointToInsert, const Element& aEditingHost) {
+  MOZ_ASSERT(aPointToInsert.IsSetAndValid());
+
+  if (!aPointToInsert.IsInContentNode()) {
+    return false;
+  }
+
+  if (aEditingHost.IsContentEditablePlainTextOnly()) {
+    return EditorUtils::IsNewLinePreformatted(
+        *aPointToInsert.ContainerAs<nsIContent>());
+  }
+
+  Element* closestEditableBlockElement =
+      HTMLEditUtils::GetInclusiveAncestorElement(
+          *aPointToInsert.ContainerAs<nsIContent>(),
+          HTMLEditUtils::ClosestEditableBlockElement,
+          BlockInlineCheck::UseComputedDisplayOutsideStyle);
+
+  return (!closestEditableBlockElement ||
+          closestEditableBlockElement == &aEditingHost) &&
+         EditorUtils::IsNewLinePreformatted(
+             *aPointToInsert.ContainerAs<nsIContent>());
+}
+
+
+#define GROUP_NONE 0
+
+#define GROUP_TOPLEVEL (1 << 1)
+
+#define GROUP_HEAD_CONTENT (1 << 2)
+
+#define GROUP_FONTSTYLE (1 << 3)
+
+#define GROUP_PHRASE (1 << 4)
+
+#define GROUP_SPECIAL (1 << 5)
+
+#define GROUP_FORMCONTROL (1 << 6)
+
+#define GROUP_BLOCK (1 << 7)
+
+#define GROUP_FRAME (1 << 8)
+
+#define GROUP_TABLE_CONTENT (1 << 9)
+
+#define GROUP_TBODY_CONTENT (1 << 10)
+
+#define GROUP_TR_CONTENT (1 << 11)
+
+#define GROUP_COLGROUP_CONTENT (1 << 12)
+
+#define GROUP_OBJECT_CONTENT (1 << 13)
+
+#define GROUP_LI (1 << 14)
+
+#define GROUP_MAP_CONTENT (1 << 15)
+
+#define GROUP_SELECT_CONTENT (1 << 16)
+
+#define GROUP_OPTIONS (1 << 17)
+
+#define GROUP_DL_CONTENT (1 << 18)
+
+#define GROUP_P (1 << 19)
+
+#define GROUP_LEAF (1 << 20)
+
+#define GROUP_OL_UL (1 << 21)
+
+#define GROUP_HEADING (1 << 22)
+
+#define GROUP_FIGCAPTION (1 << 23)
+
+#define GROUP_PICTURE_CONTENT (1 << 24)
+
+#define GROUP_INLINE_ELEMENT                                            \
+  (GROUP_FONTSTYLE | GROUP_PHRASE | GROUP_SPECIAL | GROUP_FORMCONTROL | \
+   GROUP_LEAF)
+
+#define GROUP_FLOW_ELEMENT (GROUP_INLINE_ELEMENT | GROUP_BLOCK)
+
+struct ElementInfo final {
+#ifdef DEBUG
+  nsHTMLTag mTag;
+#endif
+  uint32_t mGroup;
+  uint32_t mCanContainGroups;
+  bool mIsContainer;
+  bool mCanContainSelf;
+};
+
+#ifdef DEBUG
+#  define ELEM(_tag, _isContainer, _canContainSelf, _group, _canContainGroups) \
+    {eHTMLTag_##_tag, _group, _canContainGroups, _isContainer, _canContainSelf}
+#else
+#  define ELEM(_tag, _isContainer, _canContainSelf, _group, _canContainGroups) \
+    {_group, _canContainGroups, _isContainer, _canContainSelf}
+#endif
+
+static const ElementInfo kElements[eHTMLTag_userdefined] = {
+    ELEM(a, true, false, GROUP_SPECIAL, GROUP_INLINE_ELEMENT),
+    ELEM(abbr, true, true, GROUP_PHRASE, GROUP_INLINE_ELEMENT),
+    ELEM(acronym, true, true, GROUP_PHRASE, GROUP_INLINE_ELEMENT),
+    ELEM(address, true, true, GROUP_BLOCK, GROUP_INLINE_ELEMENT | GROUP_P),
+    ELEM(applet, true, true, GROUP_SPECIAL | GROUP_BLOCK,
+         GROUP_FLOW_ELEMENT | GROUP_OBJECT_CONTENT),
+    ELEM(area, false, false, GROUP_MAP_CONTENT, GROUP_NONE),
+    ELEM(article, true, true, GROUP_BLOCK, GROUP_FLOW_ELEMENT),
+    ELEM(aside, true, true, GROUP_BLOCK, GROUP_FLOW_ELEMENT),
+    ELEM(audio, false, false, GROUP_NONE, GROUP_NONE),
+    ELEM(b, true, true, GROUP_FONTSTYLE, GROUP_INLINE_ELEMENT),
+    ELEM(base, false, false, GROUP_HEAD_CONTENT, GROUP_NONE),
+    ELEM(basefont, false, false, GROUP_SPECIAL, GROUP_NONE),
+    ELEM(bdi, true, true, GROUP_SPECIAL, GROUP_INLINE_ELEMENT),
+    ELEM(bdo, true, true, GROUP_SPECIAL, GROUP_INLINE_ELEMENT),
+    ELEM(bgsound, false, false, GROUP_NONE, GROUP_NONE),
+    ELEM(big, true, true, GROUP_FONTSTYLE, GROUP_INLINE_ELEMENT),
+    ELEM(blockquote, true, true, GROUP_BLOCK, GROUP_FLOW_ELEMENT),
+    ELEM(body, true, true, GROUP_TOPLEVEL, GROUP_FLOW_ELEMENT),
+    ELEM(br, false, false, GROUP_SPECIAL, GROUP_NONE),
+    ELEM(button, true, true, GROUP_FORMCONTROL | GROUP_BLOCK,
+         GROUP_FLOW_ELEMENT),
+    ELEM(canvas, false, false, GROUP_NONE, GROUP_NONE),
+    ELEM(caption, true, true, GROUP_NONE, GROUP_INLINE_ELEMENT),
+    ELEM(center, true, true, GROUP_BLOCK, GROUP_FLOW_ELEMENT),
+    ELEM(cite, true, true, GROUP_PHRASE, GROUP_INLINE_ELEMENT),
+    ELEM(code, true, true, GROUP_PHRASE, GROUP_INLINE_ELEMENT),
+    ELEM(col, false, false, GROUP_TABLE_CONTENT | GROUP_COLGROUP_CONTENT,
+         GROUP_NONE),
+    ELEM(colgroup, true, false, GROUP_NONE, GROUP_COLGROUP_CONTENT),
+    ELEM(data, true, false, GROUP_PHRASE, GROUP_INLINE_ELEMENT),
+    ELEM(datalist, true, false, GROUP_PHRASE,
+         GROUP_OPTIONS | GROUP_INLINE_ELEMENT),
+    ELEM(dd, true, false, GROUP_DL_CONTENT, GROUP_FLOW_ELEMENT),
+    ELEM(del, true, true, GROUP_PHRASE | GROUP_BLOCK, GROUP_FLOW_ELEMENT),
+    ELEM(details, true, true, GROUP_BLOCK, GROUP_FLOW_ELEMENT),
+    ELEM(dfn, true, true, GROUP_PHRASE, GROUP_INLINE_ELEMENT),
+    ELEM(dialog, true, true, GROUP_BLOCK, GROUP_FLOW_ELEMENT),
+    ELEM(dir, true, false, GROUP_BLOCK, GROUP_LI),
+    ELEM(div, true, true, GROUP_BLOCK, GROUP_FLOW_ELEMENT),
+    ELEM(dl, true, false, GROUP_BLOCK, GROUP_DL_CONTENT),
+    ELEM(dt, true, true, GROUP_DL_CONTENT, GROUP_INLINE_ELEMENT),
+    ELEM(em, true, true, GROUP_PHRASE, GROUP_INLINE_ELEMENT),
+    ELEM(embed, false, false, GROUP_NONE, GROUP_NONE),
+    ELEM(fieldset, true, true, GROUP_BLOCK, GROUP_FLOW_ELEMENT),
+    ELEM(figcaption, true, false, GROUP_FIGCAPTION, GROUP_FLOW_ELEMENT),
+    ELEM(figure, true, true, GROUP_BLOCK,
+         GROUP_FLOW_ELEMENT | GROUP_FIGCAPTION),
+    ELEM(font, true, true, GROUP_SPECIAL, GROUP_INLINE_ELEMENT),
+    ELEM(footer, true, true, GROUP_BLOCK, GROUP_FLOW_ELEMENT),
+    ELEM(form, true, true, GROUP_BLOCK, GROUP_FLOW_ELEMENT),
+    ELEM(frame, false, false, GROUP_FRAME, GROUP_NONE),
+    ELEM(frameset, true, true, GROUP_FRAME, GROUP_FRAME),
+    ELEM(h1, true, false, GROUP_BLOCK | GROUP_HEADING, GROUP_INLINE_ELEMENT),
+    ELEM(h2, true, false, GROUP_BLOCK | GROUP_HEADING, GROUP_INLINE_ELEMENT),
+    ELEM(h3, true, false, GROUP_BLOCK | GROUP_HEADING, GROUP_INLINE_ELEMENT),
+    ELEM(h4, true, false, GROUP_BLOCK | GROUP_HEADING, GROUP_INLINE_ELEMENT),
+    ELEM(h5, true, false, GROUP_BLOCK | GROUP_HEADING, GROUP_INLINE_ELEMENT),
+    ELEM(h6, true, false, GROUP_BLOCK | GROUP_HEADING, GROUP_INLINE_ELEMENT),
+    ELEM(head, true, false, GROUP_TOPLEVEL, GROUP_HEAD_CONTENT),
+    ELEM(header, true, true, GROUP_BLOCK, GROUP_FLOW_ELEMENT),
+    ELEM(hgroup, true, false, GROUP_BLOCK, GROUP_HEADING),
+    ELEM(hr, false, false, GROUP_BLOCK, GROUP_NONE),
+    ELEM(html, true, false, GROUP_TOPLEVEL, GROUP_TOPLEVEL),
+    ELEM(i, true, true, GROUP_FONTSTYLE, GROUP_INLINE_ELEMENT),
+    ELEM(iframe, true, true, GROUP_SPECIAL | GROUP_BLOCK, GROUP_FLOW_ELEMENT),
+    ELEM(image, false, false, GROUP_NONE, GROUP_NONE),
+    ELEM(img, false, false, GROUP_SPECIAL | GROUP_PICTURE_CONTENT, GROUP_NONE),
+    ELEM(input, false, false, GROUP_FORMCONTROL, GROUP_NONE),
+    ELEM(ins, true, true, GROUP_PHRASE | GROUP_BLOCK, GROUP_FLOW_ELEMENT),
+    ELEM(kbd, true, true, GROUP_PHRASE, GROUP_INLINE_ELEMENT),
+    ELEM(keygen, false, false, GROUP_NONE, GROUP_NONE),
+    ELEM(label, true, false, GROUP_FORMCONTROL, GROUP_INLINE_ELEMENT),
+    ELEM(legend, true, true, GROUP_NONE, GROUP_INLINE_ELEMENT),
+    ELEM(li, true, false, GROUP_LI, GROUP_FLOW_ELEMENT),
+    ELEM(link, false, false, GROUP_HEAD_CONTENT, GROUP_NONE),
+    ELEM(listing, true, true, GROUP_BLOCK, GROUP_INLINE_ELEMENT),
+    ELEM(main, true, true, GROUP_BLOCK, GROUP_FLOW_ELEMENT),
+    ELEM(map, true, true, GROUP_SPECIAL, GROUP_BLOCK | GROUP_MAP_CONTENT),
+    ELEM(mark, true, true, GROUP_PHRASE, GROUP_INLINE_ELEMENT),
+    ELEM(marquee, true, false, GROUP_NONE, GROUP_NONE),
+    ELEM(menu, true, true, GROUP_BLOCK, GROUP_LI | GROUP_FLOW_ELEMENT),
+    ELEM(meta, false, false, GROUP_HEAD_CONTENT, GROUP_NONE),
+    ELEM(meter, true, false, GROUP_SPECIAL, GROUP_FLOW_ELEMENT),
+    ELEM(multicol, false, false, GROUP_NONE, GROUP_NONE),
+    ELEM(nav, true, true, GROUP_BLOCK, GROUP_FLOW_ELEMENT),
+    ELEM(nobr, true, false, GROUP_NONE, GROUP_NONE),
+    ELEM(noembed, false, false, GROUP_NONE, GROUP_NONE),
+    ELEM(noframes, true, true, GROUP_BLOCK, GROUP_FLOW_ELEMENT),
+    ELEM(noscript, true, true, GROUP_BLOCK, GROUP_FLOW_ELEMENT),
+    ELEM(object, true, true, GROUP_SPECIAL | GROUP_BLOCK,
+         GROUP_FLOW_ELEMENT | GROUP_OBJECT_CONTENT),
+    ELEM(ol, true, true, GROUP_BLOCK | GROUP_OL_UL, GROUP_LI | GROUP_OL_UL),
+    ELEM(optgroup, true, false, GROUP_SELECT_CONTENT, GROUP_OPTIONS),
+    ELEM(option, true, false, GROUP_SELECT_CONTENT | GROUP_OPTIONS, GROUP_LEAF),
+    ELEM(output, true, true, GROUP_SPECIAL, GROUP_INLINE_ELEMENT),
+    ELEM(p, true, false, GROUP_BLOCK | GROUP_P, GROUP_INLINE_ELEMENT),
+    ELEM(param, false, false, GROUP_OBJECT_CONTENT, GROUP_NONE),
+    ELEM(picture, true, false, GROUP_SPECIAL, GROUP_PICTURE_CONTENT),
+    ELEM(plaintext, false, false, GROUP_NONE, GROUP_NONE),
+    ELEM(pre, true, true, GROUP_BLOCK, GROUP_INLINE_ELEMENT),
+    ELEM(progress, true, false, GROUP_SPECIAL, GROUP_FLOW_ELEMENT),
+    ELEM(q, true, true, GROUP_SPECIAL, GROUP_INLINE_ELEMENT),
+    ELEM(rb, true, true, GROUP_PHRASE, GROUP_INLINE_ELEMENT),
+    ELEM(rp, true, true, GROUP_PHRASE, GROUP_INLINE_ELEMENT),
+    ELEM(rt, true, true, GROUP_PHRASE, GROUP_INLINE_ELEMENT),
+    ELEM(rtc, true, true, GROUP_PHRASE, GROUP_INLINE_ELEMENT),
+    ELEM(ruby, true, true, GROUP_PHRASE, GROUP_INLINE_ELEMENT),
+    ELEM(s, true, true, GROUP_FONTSTYLE, GROUP_INLINE_ELEMENT),
+    ELEM(samp, true, true, GROUP_PHRASE, GROUP_INLINE_ELEMENT),
+    ELEM(script, true, false, GROUP_HEAD_CONTENT | GROUP_SPECIAL, GROUP_LEAF),
+    ELEM(search, true, true, GROUP_BLOCK, GROUP_FLOW_ELEMENT),
+    ELEM(section, true, true, GROUP_BLOCK, GROUP_FLOW_ELEMENT),
+    ELEM(select, true, false, GROUP_FORMCONTROL, GROUP_SELECT_CONTENT),
+    ELEM(selectedcontent, true, false, GROUP_NONE, GROUP_INLINE_ELEMENT),
+    ELEM(small, true, true, GROUP_FONTSTYLE, GROUP_INLINE_ELEMENT),
+    ELEM(slot, true, false, GROUP_NONE, GROUP_FLOW_ELEMENT),
+    ELEM(source, false, false, GROUP_PICTURE_CONTENT, GROUP_NONE),
+    ELEM(span, true, true, GROUP_SPECIAL, GROUP_INLINE_ELEMENT),
+    ELEM(strike, true, true, GROUP_FONTSTYLE, GROUP_INLINE_ELEMENT),
+    ELEM(strong, true, true, GROUP_PHRASE, GROUP_INLINE_ELEMENT),
+    ELEM(style, true, false, GROUP_HEAD_CONTENT, GROUP_LEAF),
+    ELEM(sub, true, true, GROUP_SPECIAL, GROUP_INLINE_ELEMENT),
+    ELEM(summary, true, true, GROUP_BLOCK, GROUP_FLOW_ELEMENT),
+    ELEM(sup, true, true, GROUP_SPECIAL, GROUP_INLINE_ELEMENT),
+    ELEM(table, true, false, GROUP_BLOCK, GROUP_TABLE_CONTENT),
+    ELEM(tbody, true, false, GROUP_TABLE_CONTENT, GROUP_TBODY_CONTENT),
+    ELEM(td, true, false, GROUP_TR_CONTENT, GROUP_FLOW_ELEMENT),
+    ELEM(textarea, true, false, GROUP_FORMCONTROL, GROUP_LEAF),
+    ELEM(tfoot, true, false, GROUP_NONE, GROUP_TBODY_CONTENT),
+    ELEM(th, true, false, GROUP_TR_CONTENT, GROUP_FLOW_ELEMENT),
+    ELEM(thead, true, false, GROUP_NONE, GROUP_TBODY_CONTENT),
+    ELEM(template, false, false, GROUP_NONE, GROUP_NONE),
+    ELEM(time, true, false, GROUP_PHRASE, GROUP_INLINE_ELEMENT),
+    ELEM(title, true, false, GROUP_HEAD_CONTENT, GROUP_LEAF),
+    ELEM(tr, true, false, GROUP_TBODY_CONTENT, GROUP_TR_CONTENT),
+    ELEM(track, false, false, GROUP_NONE, GROUP_NONE),
+    ELEM(tt, true, true, GROUP_FONTSTYLE, GROUP_INLINE_ELEMENT),
+    ELEM(u, true, true, GROUP_FONTSTYLE, GROUP_INLINE_ELEMENT),
+    ELEM(ul, true, true, GROUP_BLOCK | GROUP_OL_UL, GROUP_LI | GROUP_OL_UL),
+    ELEM(var, true, true, GROUP_PHRASE, GROUP_INLINE_ELEMENT),
+    ELEM(video, false, false, GROUP_NONE, GROUP_NONE),
+    ELEM(wbr, false, false, GROUP_NONE, GROUP_NONE),
+    ELEM(xmp, true, false, GROUP_BLOCK, GROUP_NONE),
+
+    ELEM(text, false, false, GROUP_LEAF, GROUP_NONE),
+    ELEM(whitespace, false, false, GROUP_LEAF, GROUP_NONE),
+    ELEM(newline, false, false, GROUP_LEAF, GROUP_NONE),
+    ELEM(comment, false, false, GROUP_LEAF, GROUP_NONE),
+    ELEM(entity, false, false, GROUP_NONE, GROUP_NONE),
+    ELEM(doctypeDecl, false, false, GROUP_NONE, GROUP_NONE),
+    ELEM(markupDecl, false, false, GROUP_NONE, GROUP_NONE),
+    ELEM(instruction, false, false, GROUP_NONE, GROUP_NONE),
+
+    ELEM(userdefined, true, false, GROUP_NONE, GROUP_FLOW_ELEMENT)};
+
+bool HTMLEditUtils::CanNodeContain(nsHTMLTag aParentTagId,
+                                   nsHTMLTag aChildTagId) {
+  NS_ASSERTION(
+      aParentTagId > eHTMLTag_unknown && aParentTagId <= eHTMLTag_userdefined,
+      "aParentTagId out of range!");
+  NS_ASSERTION(
+      aChildTagId > eHTMLTag_unknown && aChildTagId <= eHTMLTag_userdefined,
+      "aChildTagId out of range!");
+
+#ifdef DEBUG
+  static bool checked = false;
+  if (!checked) {
+    checked = true;
+    int32_t i;
+    for (i = 1; i <= eHTMLTag_userdefined; ++i) {
+      NS_ASSERTION(kElements[i - 1].mTag == i,
+                   "You need to update kElements (missing tags).");
+    }
+  }
+#endif
+
+  if (aParentTagId == eHTMLTag_button) {
+    static const nsHTMLTag kButtonExcludeKids[] = {
+        eHTMLTag_a,     eHTMLTag_fieldset, eHTMLTag_form,    eHTMLTag_iframe,
+        eHTMLTag_input, eHTMLTag_select,   eHTMLTag_textarea};
+
+    uint32_t j;
+    for (j = 0; j < std::size(kButtonExcludeKids); ++j) {
+      if (kButtonExcludeKids[j] == aChildTagId) {
+        return false;
+      }
+    }
+  }
+
+  if (aChildTagId == eHTMLTag_bgsound) {
+    return false;
+  }
+
+  if (aChildTagId == eHTMLTag_userdefined) {
+    return true;
+  }
+
+  const ElementInfo& parent = kElements[aParentTagId - 1];
+  if (aParentTagId == aChildTagId) {
+    return parent.mCanContainSelf;
+  }
+
+  const ElementInfo& child = kElements[aChildTagId - 1];
+  return !!(parent.mCanContainGroups & child.mGroup);
+}
+
+bool HTMLEditUtils::ContentIsInert(const nsIContent& aContent) {
+  for (nsIContent* content :
+       aContent.InclusiveFlatTreeAncestorsOfType<nsIContent>()) {
+    if (nsIFrame* frame = content->GetPrimaryFrame()) {
+      return frame->StyleUI()->IsInert();
+    }
+    if (!content->IsElement()) {
+      continue;
+    }
+    if (content->AsElement()->State().HasState(dom::ElementState::INERT)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool HTMLEditUtils::IsContainerNode(nsHTMLTag aTagId) {
+  NS_ASSERTION(aTagId > eHTMLTag_unknown && aTagId <= eHTMLTag_userdefined,
+               "aTagId out of range!");
+
+  return kElements[aTagId - 1].mIsContainer;
+}
+
+bool HTMLEditUtils::IsNonListSingleLineContainer(const nsIContent& aContent) {
+  return aContent.IsAnyOfHTMLElements(
+      nsGkAtoms::address, nsGkAtoms::div, nsGkAtoms::h1, nsGkAtoms::h2,
+      nsGkAtoms::h3, nsGkAtoms::h4, nsGkAtoms::h5, nsGkAtoms::h6,
+      nsGkAtoms::listing, nsGkAtoms::p, nsGkAtoms::pre, nsGkAtoms::xmp);
+}
+
+bool HTMLEditUtils::IsSingleLineContainer(const nsIContent& aContent) {
+  return IsNonListSingleLineContainer(aContent) ||
+         aContent.IsAnyOfHTMLElements(nsGkAtoms::li, nsGkAtoms::dt,
+                                      nsGkAtoms::dd);
+}
+
+template <typename EditorDOMPointType>
+EditorDOMPointType HTMLEditUtils::GetPreviousEditablePoint(
+    nsIContent& aContent, const Element* aAncestorLimiter,
+    InvisibleWhiteSpaces aInvisibleWhiteSpaces,
+    TableBoundary aHowToTreatTableBoundary) {
+  MOZ_ASSERT(HTMLEditUtils::IsSimplyEditableNode(aContent));
+  NS_ASSERTION(!HTMLEditUtils::IsAnyTableElementExceptColumnElement(aContent) ||
+                   HTMLEditUtils::IsTableCellOrCaptionElement(aContent),
+               "HTMLEditUtils::GetPreviousEditablePoint() may return a point "
+               "between table structure elements");
+
+  if (&aContent == aAncestorLimiter) {
+    return EditorDOMPointType();
+  }
+
+  nsIContent* previousContent = aContent.GetPreviousSibling();
+  if (!previousContent) {
+    if (!aContent.GetParentElement()) {
+      return EditorDOMPointType();
+    }
+    nsIContent* inclusiveAncestor = &aContent;
+    for (Element* const parentElement : aContent.AncestorsOfType<Element>()) {
+      if (parentElement == aAncestorLimiter ||
+          !HTMLEditUtils::IsSimplyEditableNode(*parentElement) ||
+          !HTMLEditUtils::CanCrossContentBoundary(*parentElement,
+                                                  aHowToTreatTableBoundary)) {
+        return EditorDOMPointType(inclusiveAncestor);
+      }
+
+      if (!HTMLEditUtils::IsAnyTableElementExceptColumnElement(
+              *parentElement) ||
+          HTMLEditUtils::IsTableCellOrCaptionElement(*parentElement)) {
+        inclusiveAncestor = parentElement;
+      }
+
+      previousContent = parentElement->GetPreviousSibling();
+      if (!previousContent) {
+        continue;  
+      }
+
+
+      if (!HTMLEditUtils::IsSimplyEditableNode(*previousContent)) {
+        return EditorDOMPointType::After(*previousContent);
+      }
+
+      if (!HTMLEditUtils::CanCrossContentBoundary(*previousContent,
+                                                  aHowToTreatTableBoundary)) {
+        return inclusiveAncestor == &aContent
+                   ? EditorDOMPointType(inclusiveAncestor)
+                   : EditorDOMPointType(inclusiveAncestor, 0);
+      }
+      break;
+    }
+    if (!previousContent) {
+      return EditorDOMPointType(inclusiveAncestor);
+    }
+  } else if (!HTMLEditUtils::IsSimplyEditableNode(*previousContent)) {
+    return EditorDOMPointType::After(*previousContent);
+  } else if (!HTMLEditUtils::CanCrossContentBoundary(
+                 *previousContent, aHowToTreatTableBoundary)) {
+    return EditorDOMPointType(&aContent);
+  }
+
+  nsIContent* leafContent = previousContent;
+  if (previousContent->GetChildCount() &&
+      HTMLEditUtils::IsContainerNode(*previousContent)) {
+    for (nsIContent* maybeLeafContent = previousContent->GetLastChild();
+         maybeLeafContent;
+         maybeLeafContent = maybeLeafContent->GetLastChild()) {
+      if (!HTMLEditUtils::IsSimplyEditableNode(*maybeLeafContent) ||
+          !HTMLEditUtils::CanCrossContentBoundary(*maybeLeafContent,
+                                                  aHowToTreatTableBoundary)) {
+        return EditorDOMPointType::After(*maybeLeafContent);
+      }
+      leafContent = maybeLeafContent;
+      if (!HTMLEditUtils::IsContainerNode(*leafContent)) {
+        break;
+      }
+    }
+  }
+
+  if (leafContent->IsText()) {
+    Text* textNode = leafContent->AsText();
+    if (aInvisibleWhiteSpaces == InvisibleWhiteSpaces::Preserve) {
+      return EditorDOMPointType::AtEndOf(*textNode);
+    }
+    return WSRunScanner::GetAfterLastVisiblePoint<EditorDOMPointType>(
+        {WSRunScanner::Option::OnlyEditableNodes}, *textNode);
+  }
+
+  return HTMLEditUtils::IsContainerNode(*leafContent)
+             ? EditorDOMPointType::AtEndOf(*leafContent)
+             : EditorDOMPointType::After(*leafContent);
+}
+
+template <typename EditorDOMPointType>
+EditorDOMPointType HTMLEditUtils::GetNextEditablePoint(
+    nsIContent& aContent, const Element* aAncestorLimiter,
+    InvisibleWhiteSpaces aInvisibleWhiteSpaces,
+    TableBoundary aHowToTreatTableBoundary) {
+  MOZ_ASSERT(HTMLEditUtils::IsSimplyEditableNode(aContent));
+  NS_ASSERTION(!HTMLEditUtils::IsAnyTableElementExceptColumnElement(aContent) ||
+                   HTMLEditUtils::IsTableCellOrCaptionElement(aContent),
+               "HTMLEditUtils::GetPreviousEditablePoint() may return a point "
+               "between table structure elements");
+
+  if (&aContent == aAncestorLimiter) {
+    return EditorDOMPointType();
+  }
+
+  nsIContent* nextContent = aContent.GetNextSibling();
+  if (!nextContent) {
+    if (!aContent.GetParentElement()) {
+      return EditorDOMPointType();
+    }
+    nsIContent* inclusiveAncestor = &aContent;
+    for (Element* const parentElement : aContent.AncestorsOfType<Element>()) {
+      if (parentElement == aAncestorLimiter ||
+          !HTMLEditUtils::IsSimplyEditableNode(*parentElement) ||
+          !HTMLEditUtils::CanCrossContentBoundary(*parentElement,
+                                                  aHowToTreatTableBoundary)) {
+        return EditorDOMPointType(inclusiveAncestor);
+      }
+
+      if (!HTMLEditUtils::IsAnyTableElementExceptColumnElement(
+              *parentElement) ||
+          HTMLEditUtils::IsTableCellOrCaptionElement(*parentElement)) {
+        inclusiveAncestor = parentElement;
+      }
+
+      nextContent = parentElement->GetNextSibling();
+      if (!nextContent) {
+        continue;  
+      }
+
+
+      if (!HTMLEditUtils::IsSimplyEditableNode(*nextContent)) {
+        return EditorDOMPointType::After(*parentElement);
+      }
+
+      if (!HTMLEditUtils::CanCrossContentBoundary(*nextContent,
+                                                  aHowToTreatTableBoundary)) {
+        return EditorDOMPointType::After(*inclusiveAncestor);
+      }
+      break;
+    }
+    if (!nextContent) {
+      return EditorDOMPointType::After(*inclusiveAncestor);
+    }
+  } else if (!HTMLEditUtils::IsSimplyEditableNode(*nextContent)) {
+    return EditorDOMPointType::After(aContent);
+  } else if (!HTMLEditUtils::CanCrossContentBoundary(
+                 *nextContent, aHowToTreatTableBoundary)) {
+    return EditorDOMPointType::After(aContent);
+  }
+
+  nsIContent* leafContent = nextContent;
+  if (nextContent->GetChildCount() &&
+      HTMLEditUtils::IsContainerNode(*nextContent)) {
+    for (nsIContent* maybeLeafContent = nextContent->GetFirstChild();
+         maybeLeafContent;
+         maybeLeafContent = maybeLeafContent->GetFirstChild()) {
+      if (!HTMLEditUtils::IsSimplyEditableNode(*maybeLeafContent) ||
+          !HTMLEditUtils::CanCrossContentBoundary(*maybeLeafContent,
+                                                  aHowToTreatTableBoundary)) {
+        return EditorDOMPointType(maybeLeafContent);
+      }
+      leafContent = maybeLeafContent;
+      if (!HTMLEditUtils::IsContainerNode(*leafContent)) {
+        break;
+      }
+    }
+  }
+
+  if (leafContent->IsText()) {
+    Text* textNode = leafContent->AsText();
+    if (aInvisibleWhiteSpaces == InvisibleWhiteSpaces::Preserve) {
+      return EditorDOMPointType(textNode, 0);
+    }
+    return WSRunScanner::GetFirstVisiblePoint<EditorDOMPointType>(
+        {WSRunScanner::Option::OnlyEditableNodes}, *textNode);
+  }
+
+  return HTMLEditUtils::IsContainerNode(*leafContent)
+             ? EditorDOMPointType(leafContent, 0)
+             : EditorDOMPointType(leafContent);
+}
+
+Element* HTMLEditUtils::GetAncestorElement(
+    const nsIContent& aContent, const AncestorTypes& aAncestorTypes,
+    BlockInlineCheck aBlockInlineCheck,
+    const Element* aAncestorLimiter ) {
+  MOZ_ASSERT(
+      aAncestorTypes.contains(AncestorType::ClosestBlockElement) ||
+      aAncestorTypes.contains(AncestorType::ClosestContainerElement) ||
+      aAncestorTypes.contains(AncestorType::MostDistantInlineElementInBlock) ||
+      aAncestorTypes.contains(AncestorType::ClosestButtonElement) ||
+      aAncestorTypes.contains(
+          AncestorType::ReturnAncestorLimiterIfNoProperAncestor));
+  MOZ_ASSERT_IF(
+      aAncestorTypes.contains(AncestorType::ClosestBlockElement),
+      !aAncestorTypes.contains(AncestorType::MostDistantInlineElementInBlock));
+  MOZ_ASSERT_IF(
+      aAncestorTypes.contains(AncestorType::ClosestContainerElement),
+      !aAncestorTypes.contains(AncestorType::MostDistantInlineElementInBlock));
+  MOZ_ASSERT_IF(
+      aAncestorTypes.contains(AncestorType::StopAtClosestButtonElement),
+      !aAncestorTypes.contains(AncestorType::ClosestButtonElement));
+  MOZ_ASSERT_IF(
+      aAncestorTypes.contains(AncestorType::ClosestButtonElement),
+      !aAncestorTypes.contains(AncestorType::StopAtClosestButtonElement));
+
+  aBlockInlineCheck = UseComputedDisplayStyleIfAuto(aBlockInlineCheck);
+
+  const Element* theBodyElement = aContent.OwnerDoc()->GetBody();
+  const Element* theDocumentElement = aContent.OwnerDoc()->GetDocumentElement();
+  Element* lastAncestorElement = nullptr;
+  const bool editableElementOnly =
+      aAncestorTypes.contains(AncestorType::EditableElement);
+  const bool lookingForClosestBlockElement =
+      aAncestorTypes.contains(AncestorType::ClosestBlockElement);
+  const bool lookingForClosestContainerElement =
+      aAncestorTypes.contains(AncestorType::ClosestContainerElement);
+  const bool lookingForMostDistantInlineElementInBlock =
+      aAncestorTypes.contains(AncestorType::MostDistantInlineElementInBlock);
+  const bool stopAtClosestBlockElement =
+      lookingForClosestBlockElement ||
+      lookingForMostDistantInlineElementInBlock;
+  const bool fallbackToLimiter = aAncestorTypes.contains(
+      AncestorType::ReturnAncestorLimiterIfNoProperAncestor);
+  const bool stopAtButton =
+      aAncestorTypes.contains(AncestorType::StopAtClosestButtonElement);
+  const bool lookingForButtonElement =
+      aAncestorTypes.contains(AncestorType::ClosestButtonElement);
+  const bool ignoreHRElement =
+      aAncestorTypes.contains(AncestorType::IgnoreHRElement);
+  const auto IsLimiter = [&](const nsIContent& aContent) -> bool {
+    return &aContent == aAncestorLimiter ||
+           (editableElementOnly &&
+            (&aContent == theBodyElement || &aContent == theDocumentElement ||
+             aContent.IsEditingHost()));
+  };
+  const auto IsSearchingElementTypeExceptFallbackToRoot =
+      [&](const nsIContent& aContent) -> bool {
+    if (!aContent.IsElement() ||
+        (ignoreHRElement && aContent.IsHTMLElement(nsGkAtoms::hr))) {
+      return false;
+    }
+    if (editableElementOnly &&
+        !EditorUtils::IsEditableContent(aContent, EditorType::HTML)) {
+      return false;
+    }
+    return (lookingForClosestBlockElement &&
+            HTMLEditUtils::IsBlockElement(aContent, aBlockInlineCheck)) ||
+           (lookingForClosestContainerElement && aContent.IsElement() &&
+            HTMLEditUtils::IsContainerNode(aContent)) ||
+           (lookingForMostDistantInlineElementInBlock &&
+            HTMLEditUtils::IsInlineContent(aContent, aBlockInlineCheck)) ||
+           (lookingForButtonElement &&
+            aContent.IsHTMLElement(nsGkAtoms::button));
+  };
+  if (IsLimiter(aContent)) {
+    return nullptr;
+  }
+  for (Element* element : aContent.AncestorsOfType<Element>()) {
+    if (editableElementOnly &&
+        !EditorUtils::IsEditableContent(*element, EditorType::HTML)) {
+      return lastAncestorElement;  
+    }
+    if (ignoreHRElement && element->IsHTMLElement(nsGkAtoms::hr)) {
+      if (IsLimiter(*element)) {
+        if (fallbackToLimiter && !lastAncestorElement) {
+          lastAncestorElement = element;
+        }
+        return lastAncestorElement;
+      }
+      continue;
+    }
+    if (stopAtButton && element->IsHTMLElement(nsGkAtoms::button)) {
+      return lastAncestorElement;
+    }
+    if (lookingForButtonElement && element->IsHTMLElement(nsGkAtoms::button)) {
+      return element;  
+    }
+    if (lookingForClosestContainerElement &&
+        HTMLEditUtils::IsContainerNode(*element)) {
+      return element;  
+    }
+    if (stopAtClosestBlockElement &&
+        HTMLEditUtils::IsBlockElement(*element, aBlockInlineCheck)) {
+      if (lookingForClosestBlockElement) {
+        return element;  
+      }
+      MOZ_ASSERT_IF(lastAncestorElement,
+                    HTMLEditUtils::IsInlineContent(*lastAncestorElement,
+                                                   aBlockInlineCheck));
+      if (!lastAncestorElement && fallbackToLimiter && IsLimiter(*element)) {
+        return element;  
+      }
+      return lastAncestorElement;  
+    }
+    if (IsSearchingElementTypeExceptFallbackToRoot(*element)) {
+      lastAncestorElement = element;
+    }
+    if (IsLimiter(*element)) {
+      if (fallbackToLimiter && !lastAncestorElement) {
+        lastAncestorElement = element;
+      }
+      return lastAncestorElement;
+    }
+  }
+  return lastAncestorElement;
+}
+
+Element* HTMLEditUtils::GetInclusiveAncestorElement(
+    const nsIContent& aContent, const AncestorTypes& aAncestorTypes,
+    BlockInlineCheck aBlockInlineCheck,
+    const Element* aAncestorLimiter ) {
+  MOZ_ASSERT(
+      aAncestorTypes.contains(AncestorType::ClosestBlockElement) ||
+      aAncestorTypes.contains(AncestorType::ClosestContainerElement) ||
+      aAncestorTypes.contains(AncestorType::MostDistantInlineElementInBlock) ||
+      aAncestorTypes.contains(AncestorType::ClosestButtonElement) ||
+      aAncestorTypes.contains(
+          AncestorType::ReturnAncestorLimiterIfNoProperAncestor));
+  MOZ_ASSERT_IF(
+      aAncestorTypes.contains(AncestorType::ClosestBlockElement),
+      !aAncestorTypes.contains(AncestorType::MostDistantInlineElementInBlock));
+  MOZ_ASSERT_IF(
+      aAncestorTypes.contains(AncestorType::ClosestContainerElement),
+      !aAncestorTypes.contains(AncestorType::MostDistantInlineElementInBlock));
+  MOZ_ASSERT_IF(
+      aAncestorTypes.contains(AncestorType::StopAtClosestButtonElement),
+      !aAncestorTypes.contains(AncestorType::ClosestButtonElement));
+  MOZ_ASSERT_IF(
+      aAncestorTypes.contains(AncestorType::ClosestButtonElement),
+      !aAncestorTypes.contains(AncestorType::StopAtClosestButtonElement));
+
+  aBlockInlineCheck = UseComputedDisplayStyleIfAuto(aBlockInlineCheck);
+
+  const Element* theBodyElement = aContent.OwnerDoc()->GetBody();
+  const Element* theDocumentElement = aContent.OwnerDoc()->GetDocumentElement();
+  const bool editableElementOnly =
+      aAncestorTypes.contains(AncestorType::EditableElement);
+  const bool lookingForClosestBlockElement =
+      aAncestorTypes.contains(AncestorType::ClosestBlockElement);
+  const bool lookingForClosestContainerElement =
+      aAncestorTypes.contains(AncestorType::ClosestContainerElement);
+  const bool lookingForMostDistantInlineElementInBlock =
+      aAncestorTypes.contains(AncestorType::MostDistantInlineElementInBlock);
+  const bool stopAtClosestBlockElement =
+      lookingForClosestBlockElement ||
+      lookingForMostDistantInlineElementInBlock;
+  const bool stopAtButton =
+      aAncestorTypes.contains(AncestorType::StopAtClosestButtonElement);
+  const bool lookingForButtonElement =
+      aAncestorTypes.contains(AncestorType::ClosestButtonElement);
+  const bool ignoreHRElement =
+      aAncestorTypes.contains(AncestorType::IgnoreHRElement);
+  const bool fallbackToLimiter = aAncestorTypes.contains(
+      AncestorType::ReturnAncestorLimiterIfNoProperAncestor);
+  const bool lookingForMostDistantElement =
+      lookingForMostDistantInlineElementInBlock;
+  const auto IsLimiter = [&](const nsIContent& aContent) -> bool {
+    return &aContent == aAncestorLimiter || !aContent.GetParent() ||
+           (editableElementOnly &&
+            (&aContent == theBodyElement || &aContent == theDocumentElement ||
+             aContent.IsEditingHost()));
+  };
+  const auto IsSearchingElementTypeExceptFallbackToRoot =
+      [&](const nsIContent& aContent) -> bool {
+    if (!aContent.IsElement() ||
+        (ignoreHRElement && aContent.IsHTMLElement(nsGkAtoms::hr))) {
+      return false;
+    }
+    if (editableElementOnly &&
+        !EditorUtils::IsEditableContent(aContent, EditorType::HTML)) {
+      return false;
+    }
+    return (lookingForClosestBlockElement &&
+            HTMLEditUtils::IsBlockElement(aContent, aBlockInlineCheck)) ||
+           (lookingForClosestContainerElement && aContent.IsElement() &&
+            HTMLEditUtils::IsContainerNode(aContent)) ||
+           (lookingForMostDistantInlineElementInBlock &&
+            HTMLEditUtils::IsInlineContent(aContent, aBlockInlineCheck)) ||
+           (lookingForButtonElement &&
+            aContent.IsHTMLElement(nsGkAtoms::button));
+  };
+
+  if (IsLimiter(aContent)) {
+    return fallbackToLimiter ||
+                   IsSearchingElementTypeExceptFallbackToRoot(aContent)
+               ? const_cast<Element*>(aContent.AsElement())
+               : nullptr;
+  }
+
+  if (stopAtButton && aContent.IsHTMLElement(nsGkAtoms::button)) {
+    return IsSearchingElementTypeExceptFallbackToRoot(aContent)
+               ? const_cast<Element*>(aContent.AsElement())
+               : nullptr;
+  }
+
+  if (lookingForButtonElement && aContent.IsHTMLElement(nsGkAtoms::button)) {
+    return const_cast<Element*>(aContent.AsElement());
+  }
+
+  if (lookingForClosestContainerElement && aContent.IsElement() &&
+      HTMLEditUtils::IsContainerNode(aContent)) {
+    return IsSearchingElementTypeExceptFallbackToRoot(aContent)
+               ? const_cast<Element*>(aContent.AsElement())
+               : nullptr;
+  }
+
+  if (stopAtClosestBlockElement &&
+      HTMLEditUtils::IsBlockElement(aContent, aBlockInlineCheck) &&
+      !(ignoreHRElement && aContent.IsHTMLElement(nsGkAtoms::hr))) {
+    return IsSearchingElementTypeExceptFallbackToRoot(aContent)
+               ? const_cast<Element*>(aContent.AsElement())
+               : nullptr;
+  }
+
+  Element* const result = HTMLEditUtils::GetAncestorElement(
+      aContent, aAncestorTypes, aBlockInlineCheck, aAncestorLimiter);
+  if (lookingForMostDistantElement &&
+      (!result || (result != &aContent && IsLimiter(*result) &&
+                   !IsSearchingElementTypeExceptFallbackToRoot(*result))) &&
+      IsSearchingElementTypeExceptFallbackToRoot(aContent)) {
+    return const_cast<Element*>(aContent.AsElement());
+  }
+  return result;
+}
+
+Element* HTMLEditUtils::GetClosestAncestorAnyListElement(
+    const nsIContent& aContent) {
+  for (Element* const element : aContent.AncestorsOfType<Element>()) {
+    if (HTMLEditUtils::IsListElement(*element)) {
+      return element;
+    }
+  }
+  return nullptr;
+}
+
+Element* HTMLEditUtils::GetClosestInclusiveAncestorAnyListElement(
+    const nsIContent& aContent) {
+  for (Element* const element : aContent.InclusiveAncestorsOfType<Element>()) {
+    if (HTMLEditUtils::IsListElement(*element)) {
+      return element;
+    }
+  }
+  return nullptr;
+}
+
+EditAction HTMLEditUtils::GetEditActionForInsert(const nsAtom& aTagName) {
+  if (&aTagName == nsGkAtoms::ul) {
+    return EditAction::eInsertUnorderedListElement;
+  }
+  if (&aTagName == nsGkAtoms::ol) {
+    return EditAction::eInsertOrderedListElement;
+  }
+  if (&aTagName == nsGkAtoms::hr) {
+    return EditAction::eInsertHorizontalRuleElement;
+  }
+  return EditAction::eInsertNode;
+}
+
+EditAction HTMLEditUtils::GetEditActionForRemoveList(const nsAtom& aTagName) {
+  if (&aTagName == nsGkAtoms::ul) {
+    return EditAction::eRemoveUnorderedListElement;
+  }
+  if (&aTagName == nsGkAtoms::ol) {
+    return EditAction::eRemoveOrderedListElement;
+  }
+  return EditAction::eRemoveListElement;
+}
+
+EditAction HTMLEditUtils::GetEditActionForInsert(const Element& aElement) {
+  return GetEditActionForInsert(*aElement.NodeInfo()->NameAtom());
+}
+
+EditAction HTMLEditUtils::GetEditActionForFormatText(const nsAtom& aProperty,
+                                                     const nsAtom* aAttribute,
+                                                     bool aToSetStyle) {
+  if (&aProperty == nsGkAtoms::b) {
+    return aToSetStyle ? EditAction::eSetFontWeightProperty
+                       : EditAction::eRemoveFontWeightProperty;
+  }
+  if (&aProperty == nsGkAtoms::i) {
+    return aToSetStyle ? EditAction::eSetTextStyleProperty
+                       : EditAction::eRemoveTextStyleProperty;
+  }
+  if (&aProperty == nsGkAtoms::u) {
+    return aToSetStyle ? EditAction::eSetTextDecorationPropertyUnderline
+                       : EditAction::eRemoveTextDecorationPropertyUnderline;
+  }
+  if (&aProperty == nsGkAtoms::strike) {
+    return aToSetStyle ? EditAction::eSetTextDecorationPropertyLineThrough
+                       : EditAction::eRemoveTextDecorationPropertyLineThrough;
+  }
+  if (&aProperty == nsGkAtoms::sup) {
+    return aToSetStyle ? EditAction::eSetVerticalAlignPropertySuper
+                       : EditAction::eRemoveVerticalAlignPropertySuper;
+  }
+  if (&aProperty == nsGkAtoms::sub) {
+    return aToSetStyle ? EditAction::eSetVerticalAlignPropertySub
+                       : EditAction::eRemoveVerticalAlignPropertySub;
+  }
+  if (&aProperty == nsGkAtoms::font) {
+    if (aAttribute == nsGkAtoms::face) {
+      return aToSetStyle ? EditAction::eSetFontFamilyProperty
+                         : EditAction::eRemoveFontFamilyProperty;
+    }
+    if (aAttribute == nsGkAtoms::color) {
+      return aToSetStyle ? EditAction::eSetColorProperty
+                         : EditAction::eRemoveColorProperty;
+    }
+    if (aAttribute == nsGkAtoms::bgcolor) {
+      return aToSetStyle ? EditAction::eSetBackgroundColorPropertyInline
+                         : EditAction::eRemoveBackgroundColorPropertyInline;
+    }
+  }
+  return aToSetStyle ? EditAction::eSetInlineStyleProperty
+                     : EditAction::eRemoveInlineStyleProperty;
+}
+
+EditAction HTMLEditUtils::GetEditActionForAlignment(
+    const nsAString& aAlignType) {
+  if (aAlignType.EqualsLiteral("left")) {
+    return EditAction::eAlignLeft;
+  }
+  if (aAlignType.EqualsLiteral("right")) {
+    return EditAction::eAlignRight;
+  }
+  if (aAlignType.EqualsLiteral("center")) {
+    return EditAction::eAlignCenter;
+  }
+  if (aAlignType.EqualsLiteral("justify")) {
+    return EditAction::eJustify;
+  }
+  return EditAction::eSetAlignment;
+}
+
+template <typename EditorDOMPointType>
+nsIContent* HTMLEditUtils::GetContentToPreserveInlineStyles(
+    const EditorDOMPointType& aPoint, const Element& aEditingHost) {
+  MOZ_ASSERT(aPoint.IsSetAndValid());
+  if (MOZ_UNLIKELY(!aPoint.IsInContentNode())) {
+    return nullptr;
+  }
+  if (aPoint.IsInTextNode() && !aPoint.IsEndOfContainer()) {
+    return aPoint.template ContainerAs<nsIContent>();
+  }
+  for (auto point = aPoint.template To<EditorRawDOMPoint>(); point.IsSet();) {
+    const WSScanResult nextVisibleThing =
+        WSRunScanner::ScanInclusiveNextVisibleNodeOrBlockBoundary(
+            {WSRunScanner::Option::OnlyEditableNodes}, point);
+    if (nextVisibleThing.InVisibleOrCollapsibleCharacters()) {
+      return nextVisibleThing.TextPtr();
+    }
+    if (nextVisibleThing.ContentIsEditableRoot()) {
+      break;
+    }
+    if (nextVisibleThing.ReachedEditableInvisibleEmptyInlineContainerElement(
+            &aEditingHost)) {
+      point.SetAfter(nextVisibleThing.ElementPtr());
+      continue;
+    }
+    break;
+  }
+  return aPoint.template ContainerAs<nsIContent>();
+}
+
+template <typename EditorDOMPointType, typename EditorDOMPointTypeInput>
+EditorDOMPointType HTMLEditUtils::GetBetterInsertionPointFor(
+    const nsIContent& aContentToInsert,
+    const EditorDOMPointTypeInput& aPointToInsert) {
+  if (NS_WARN_IF(!aPointToInsert.IsSet())) {
+    return EditorDOMPointType();
+  }
+
+  auto pointToInsert =
+      aPointToInsert.template GetNonAnonymousSubtreePoint<EditorDOMPointType>();
+  if (NS_WARN_IF(!pointToInsert.IsSet()) ||
+      NS_WARN_IF(!HTMLEditUtils::IsSimplyEditableNode(
+          *pointToInsert.GetContainer()))) {
+    return EditorDOMPointType();
+  }
+
+  if (!HTMLEditUtils::IsBlockElement(
+          aContentToInsert, BlockInlineCheck::UseComputedDisplayStyle)) {
+    return pointToInsert;
+  }
+
+  const WSRunScanner wsScannerForPointToInsert(
+      {WSRunScanner::Option::OnlyEditableNodes}, pointToInsert);
+
+  const WSScanResult forwardScanFromPointToInsertResult =
+      wsScannerForPointToInsert.ScanInclusiveNextVisibleNodeOrBlockBoundaryFrom(
+          pointToInsert);
+  if (!forwardScanFromPointToInsertResult.ReachedBRElement()) {
+    return pointToInsert;
+  }
+
+  const WSScanResult backwardScanFromPointToInsertResult =
+      wsScannerForPointToInsert.ScanPreviousVisibleNodeOrBlockBoundaryFrom(
+          pointToInsert);
+  if (NS_WARN_IF(backwardScanFromPointToInsertResult.Failed()) ||
+      backwardScanFromPointToInsertResult.ReachedInlineEditingHostBoundary() ||
+      backwardScanFromPointToInsertResult.ReachedBRElement() ||
+      backwardScanFromPointToInsertResult.ReachedCurrentBlockBoundary()) {
+    return pointToInsert;
+  }
+
+  return forwardScanFromPointToInsertResult
+      .template PointAfterReachedContent<EditorDOMPointType>();
+}
+
+template <typename EditorDOMPointType, typename EditorDOMPointTypeInput>
+EditorDOMPointType HTMLEditUtils::GetBetterCaretPositionToInsertText(
+    const EditorDOMPointTypeInput& aPoint) {
+  MOZ_ASSERT(aPoint.IsSetAndValid());
+  MOZ_ASSERT(HTMLEditUtils::IsSimplyEditableNode(*aPoint.GetContainer()));
+
+  if (aPoint.IsInTextNode()) {
+    return aPoint.template To<EditorDOMPointType>();
+  }
+  if (!aPoint.IsEndOfContainer() && aPoint.GetChild() &&
+      aPoint.GetChild()->IsText()) {
+    return EditorDOMPointType(aPoint.GetChild(), 0u);
+  }
+  if (aPoint.IsEndOfContainer()) {
+    const WSScanResult previousThing =
+        WSRunScanner::ScanPreviousVisibleNodeOrBlockBoundary(
+            {WSRunScanner::Option::OnlyEditableNodes}, aPoint);
+    if (previousThing.InVisibleOrCollapsibleCharacters()) {
+      return EditorDOMPointType::AtEndOf(*previousThing.TextPtr());
+    }
+  }
+  if (HTMLEditUtils::CanNodeContain(*aPoint.GetContainer(),
+                                    *nsGkAtoms::textTagName)) {
+    return aPoint.template To<EditorDOMPointType>();
+  }
+  if (MOZ_UNLIKELY(aPoint.GetContainer()->IsEditingHost() ||
+                   !aPoint.template GetContainerParentAs<nsIContent>() ||
+                   !HTMLEditUtils::CanNodeContain(
+                       *aPoint.template ContainerParentAs<nsIContent>(),
+                       *nsGkAtoms::textTagName))) {
+    return EditorDOMPointType();
+  }
+  return aPoint.ParentPoint().template To<EditorDOMPointType>();
+}
+
+template <typename EditorDOMPointType, typename EditorDOMPointTypeInput>
+Result<EditorDOMPointType, nsresult>
+HTMLEditUtils::ComputePointToPutCaretInElementIfOutside(
+    const Element& aElement, const EditorDOMPointTypeInput& aCurrentPoint) {
+  MOZ_ASSERT(aCurrentPoint.IsSet());
+
+
+  bool nodeBefore, nodeAfter;
+  nsresult rv =
+      RangeUtils::CompareNodeToRangeBoundaries<TreeKind::ShadowIncludingDOM>(
+          const_cast<Element*>(&aElement), aCurrentPoint.ToRawRangeBoundary(),
+          aCurrentPoint.ToRawRangeBoundary(), &nodeBefore, &nodeAfter);
+  if (NS_FAILED(rv)) {
+    NS_WARNING("RangeUtils::CompareNodeToRange() failed");
+    return Err(rv);
+  }
+
+  if (nodeBefore && nodeAfter) {
+    return EditorDOMPointType();  
+  }
+
+  if (nodeBefore) {
+    const nsIContent* lastEditableContent = HTMLEditUtils::GetLastChild(
+        aElement, {LeafNodeOption::IgnoreNonEditableNode},
+        BlockInlineCheck::UseComputedDisplayOutsideStyle);
+    if (!lastEditableContent) {
+      lastEditableContent = &aElement;
+    }
+    if (lastEditableContent->IsText() ||
+        HTMLEditUtils::IsContainerNode(*lastEditableContent)) {
+      return EditorDOMPointType::AtEndOf(*lastEditableContent);
+    }
+    MOZ_ASSERT(lastEditableContent->GetParentNode());
+    return EditorDOMPointType::After(*lastEditableContent);
+  }
+
+  const nsIContent* firstEditableContent = HTMLEditUtils::GetFirstChild(
+      aElement, {LeafNodeOption::IgnoreNonEditableNode},
+      BlockInlineCheck::UseComputedDisplayOutsideStyle);
+  if (!firstEditableContent) {
+    firstEditableContent = &aElement;
+  }
+  if (firstEditableContent->IsText() ||
+      HTMLEditUtils::IsContainerNode(*firstEditableContent)) {
+    MOZ_ASSERT(firstEditableContent->GetParentNode());
+    return EditorDOMPointType(firstEditableContent);
+  }
+  return EditorDOMPointType(firstEditableContent, 0u);
+}
+
+template <typename EditorLineBreakType, typename EditorDOMPointType>
+Maybe<EditorLineBreakType>
+HTMLEditUtils::GetLineBreakBeforeBlockBoundaryIfPointIsBetweenThem(
+    const EditorDOMPointType& aPoint, const Element& aEditingHost) {
+  MOZ_ASSERT(aPoint.IsSet());
+  if (MOZ_UNLIKELY(!aPoint.IsInContentNode())) {
+    return Nothing{};
+  }
+  const WSScanResult previousThing =
+      WSRunScanner::ScanPreviousVisibleNodeOrBlockBoundary({}, aPoint,
+                                                           &aEditingHost);
+  if (!previousThing.ReachedLineBreak()) {
+    return Nothing{};  
+  }
+  const WSScanResult nextThing =
+      WSRunScanner::ScanInclusiveNextVisibleNodeOrBlockBoundary({}, aPoint,
+                                                                &aEditingHost);
+  if (!nextThing.ReachedBlockBoundary()) {
+    return Nothing{};  
+  }
+  return Some(previousThing.CreateEditorLineBreak<EditorLineBreakType>());
+}
+
+bool HTMLEditUtils::IsInlineStyleSetByElement(
+    const nsIContent& aContent, const EditorInlineStyle& aStyle,
+    const nsAString* aValue, nsAString* aOutValue ) {
+  for (Element* element : aContent.InclusiveAncestorsOfType<Element>()) {
+    if (aStyle.mHTMLProperty != element->NodeInfo()->NameAtom()) {
+      continue;
+    }
+    if (!aStyle.mAttribute) {
+      return true;
+    }
+    nsAutoString value;
+    element->GetAttr(aStyle.mAttribute, value);
+    if (aOutValue) {
+      *aOutValue = value;
+    }
+    if (!value.IsEmpty()) {
+      if (!aValue) {
+        return true;
+      }
+      if (aValue->Equals(value, nsCaseInsensitiveStringComparator)) {
+        return true;
+      }
+      return false;
+    }
+  }
+  return false;
+}
+
+size_t HTMLEditUtils::CollectChildren(
+    const nsINode& aNode,
+    nsTArray<OwningNonNull<nsIContent>>& aOutArrayOfContents,
+    size_t aIndexToInsertChildren, const CollectChildrenOptions& aOptions) {
+
+  size_t numberOfFoundChildren = 0;
+  for (nsIContent* content =
+           GetFirstChild(aNode, {LeafNodeOption::IgnoreNonEditableNode},
+                         BlockInlineCheck::UseComputedDisplayOutsideStyle);
+       content; content = content->GetNextSibling()) {
+    if ((aOptions.contains(CollectChildrenOption::CollectListChildren) &&
+         (HTMLEditUtils::IsListElement(*content) ||
+          HTMLEditUtils::IsListItemElement(*content))) ||
+        (aOptions.contains(CollectChildrenOption::CollectTableChildren) &&
+         HTMLEditUtils::IsAnyTableElementExceptColumnElement(*content))) {
+      numberOfFoundChildren += HTMLEditUtils::CollectChildren(
+          *content, aOutArrayOfContents,
+          aIndexToInsertChildren + numberOfFoundChildren, aOptions);
+      continue;
+    }
+
+    if (aOptions.contains(CollectChildrenOption::IgnoreNonEditableChildren) &&
+        !EditorUtils::IsEditableContent(*content, EditorType::HTML)) {
+      continue;
+    }
+    if (aOptions.contains(CollectChildrenOption::IgnoreInvisibleTextNodes) &&
+        content->IsText() &&
+        !HTMLEditUtils::IsVisibleTextNode(*content->AsText(),
+                                          TreatInvisibleLineBreakAs::Visible)) {
+      continue;
+    }
+    aOutArrayOfContents.InsertElementAt(
+        aIndexToInsertChildren + numberOfFoundChildren++, *content);
+  }
+  return numberOfFoundChildren;
+}
+
+size_t HTMLEditUtils::CollectEmptyInlineContainerDescendants(
+    const nsINode& aNode,
+    nsTArray<OwningNonNull<nsIContent>>& aOutArrayOfContents,
+    const EmptyCheckOptions& aOptions, BlockInlineCheck aBlockInlineCheck) {
+  size_t numberOfFoundElements = 0;
+  for (Element* element = aNode.GetFirstElementChild(); element;) {
+    if (HTMLEditUtils::IsEmptyInlineContainer(
+            *element, aOptions,
+            UseComputedDisplayOutsideStyleIfAuto(aBlockInlineCheck))) {
+      aOutArrayOfContents.AppendElement(*element);
+      numberOfFoundElements++;
+      nsIContent* nextContent = element->GetNextNonChildNode(&aNode);
+      element = nullptr;
+      for (; nextContent; nextContent = nextContent->GetNextNode(&aNode)) {
+        if (nextContent->IsElement()) {
+          element = nextContent->AsElement();
+          break;
+        }
+      }
+      continue;
+    }
+
+    nsIContent* nextContent = element->GetNextNode(&aNode);
+    element = nullptr;
+    for (; nextContent; nextContent = nextContent->GetNextNode(&aNode)) {
+      if (nextContent->IsElement()) {
+        element = nextContent->AsElement();
+        break;
+      }
+    }
+  }
+  return numberOfFoundElements;
+}
+
+bool HTMLEditUtils::ElementHasAttributeExcept(const Element& aElement,
+                                              const nsAtom& aAttribute1,
+                                              const nsAtom& aAttribute2,
+                                              const nsAtom& aAttribute3) {
+  for (auto i : IntegerRange<uint32_t>(aElement.GetAttrCount())) {
+    const nsAttrName* name = aElement.GetAttrNameAt(i);
+    if (!name->NamespaceEquals(kNameSpaceID_None)) {
+      return true;
+    }
+
+    if (name->LocalName() == &aAttribute1 ||
+        name->LocalName() == &aAttribute2 ||
+        name->LocalName() == &aAttribute3) {
+      continue;  
+    }
+
+    if (name->LocalName() == nsGkAtoms::style ||
+        name->LocalName() == nsGkAtoms::_class ||
+        name->LocalName() == nsGkAtoms::id) {
+      if (aElement.HasNonEmptyAttr(name->LocalName())) {
+        return true;
+      }
+      continue;
+    }
+
+    nsAutoString attrString;
+    name->LocalName()->ToString(attrString);
+    if (!StringBeginsWith(attrString, u"_moz"_ns)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool HTMLEditUtils::GetNormalizedHTMLColorValue(const nsAString& aColorValue,
+                                                nsAString& aNormalizedValue) {
+  nsAttrValue value;
+  if (!value.ParseColor(aColorValue)) {
+    aNormalizedValue = aColorValue;
+    return false;
+  }
+  nscolor color = NS_RGB(0, 0, 0);
+  MOZ_ALWAYS_TRUE(value.GetColorValue(color));
+  aNormalizedValue = NS_ConvertASCIItoUTF16(nsPrintfCString(
+      "#%02x%02x%02x", NS_GET_R(color), NS_GET_G(color), NS_GET_B(color)));
+  return true;
+}
+
+bool HTMLEditUtils::IsSameHTMLColorValue(
+    const nsAString& aColorA, const nsAString& aColorB,
+    TransparentKeyword aTransparentKeyword) {
+  if (aTransparentKeyword == TransparentKeyword::Allowed) {
+    const bool isATransparent = aColorA.LowerCaseEqualsLiteral("transparent");
+    const bool isBTransparent = aColorB.LowerCaseEqualsLiteral("transparent");
+    if (isATransparent || isBTransparent) {
+      return isATransparent && isBTransparent;
+    }
+  }
+  nsAttrValue valueA, valueB;
+  if (!valueA.ParseColor(aColorA) || !valueB.ParseColor(aColorB)) {
+    return false;
+  }
+  nscolor colorA = NS_RGB(0, 0, 0), colorB = NS_RGB(0, 0, 0);
+  MOZ_ALWAYS_TRUE(valueA.GetColorValue(colorA));
+  MOZ_ALWAYS_TRUE(valueB.GetColorValue(colorB));
+  return colorA == colorB;
+}
+
+bool HTMLEditUtils::MaybeCSSSpecificColorValue(const nsAString& aColorValue) {
+  if (aColorValue.IsEmpty() || aColorValue.First() == '#') {
+    return false;  
+  }
+
+  nsAutoString colorValue(aColorValue);
+  colorValue.CompressWhitespace(true, true);
+  if (colorValue.LowerCaseEqualsASCII("transparent")) {
+    return true;
+  }
+  nscolor color = NS_RGB(0, 0, 0);
+  if (colorValue.IsEmpty() || colorValue.First() == '#') {
+    return false;
+  }
+  const NS_ConvertUTF16toUTF8 colorU8(colorValue);
+  if (Servo_ColorNameToRgb(&colorU8, &color)) {
+    return false;
+  }
+  if (colorValue.LowerCaseEqualsASCII("initial") ||
+      colorValue.LowerCaseEqualsASCII("inherit") ||
+      colorValue.LowerCaseEqualsASCII("unset") ||
+      colorValue.LowerCaseEqualsASCII("revert") ||
+      colorValue.LowerCaseEqualsASCII("currentcolor")) {
+    return true;
+  }
+  return ServoCSSParser::IsValidCSSColor(colorU8);
+}
+
+static bool ComputeColor(const nsAString& aColorValue, nscolor* aColor,
+                         bool* aIsCurrentColor) {
+  return ServoCSSParser::ComputeColor(nullptr, NS_RGB(0, 0, 0),
+                                      NS_ConvertUTF16toUTF8(aColorValue),
+                                      aColor, aIsCurrentColor);
+}
+
+static bool ComputeColor(const nsACString& aColorValue, nscolor* aColor,
+                         bool* aIsCurrentColor) {
+  return ServoCSSParser::ComputeColor(nullptr, NS_RGB(0, 0, 0), aColorValue,
+                                      aColor, aIsCurrentColor);
+}
+
+bool HTMLEditUtils::CanConvertToHTMLColorValue(const nsAString& aColorValue) {
+  bool isCurrentColor = false;
+  nscolor color = NS_RGB(0, 0, 0);
+  return ComputeColor(aColorValue, &color, &isCurrentColor) &&
+         !isCurrentColor && NS_GET_A(color) == 0xFF;
+}
+
+bool HTMLEditUtils::ConvertToNormalizedHTMLColorValue(
+    const nsAString& aColorValue, nsAString& aNormalizedValue) {
+  bool isCurrentColor = false;
+  nscolor color = NS_RGB(0, 0, 0);
+  if (!ComputeColor(aColorValue, &color, &isCurrentColor) || isCurrentColor ||
+      NS_GET_A(color) != 0xFF) {
+    aNormalizedValue = aColorValue;
+    return false;
+  }
+  aNormalizedValue.Truncate();
+  aNormalizedValue.AppendPrintf("#%02x%02x%02x", NS_GET_R(color),
+                                NS_GET_G(color), NS_GET_B(color));
+  return true;
+}
+
+bool HTMLEditUtils::GetNormalizedCSSColorValue(const nsAString& aColorValue,
+                                               ZeroAlphaColor aZeroAlphaColor,
+                                               nsAString& aNormalizedValue) {
+  bool isCurrentColor = false;
+  nscolor color = NS_RGB(0, 0, 0);
+  if (!ComputeColor(aColorValue, &color, &isCurrentColor)) {
+    aNormalizedValue = aColorValue;
+    return false;
+  }
+
+  if (isCurrentColor) {
+    aNormalizedValue = aColorValue;
+    return true;
+  }
+
+  if (aZeroAlphaColor == ZeroAlphaColor::TransparentKeyword &&
+      NS_GET_A(color) == 0) {
+    aNormalizedValue.AssignLiteral("transparent");
+    return true;
+  }
+
+  aNormalizedValue.Truncate();
+  nsStyleUtil::GetSerializedColorValue(color, aNormalizedValue);
+  return true;
+}
+
+template <typename CharType>
+bool HTMLEditUtils::IsSameCSSColorValue(const nsTSubstring<CharType>& aColorA,
+                                        const nsTSubstring<CharType>& aColorB) {
+  bool isACurrentColor = false;
+  nscolor colorA = NS_RGB(0, 0, 0);
+  if (!ComputeColor(aColorA, &colorA, &isACurrentColor)) {
+    return false;
+  }
+  bool isBCurrentColor = false;
+  nscolor colorB = NS_RGB(0, 0, 0);
+  if (!ComputeColor(aColorB, &colorB, &isBCurrentColor)) {
+    return false;
+  }
+  if (isACurrentColor || isBCurrentColor) {
+    return isACurrentColor && isBCurrentColor;
+  }
+  return colorA == colorB;
+}
+
+bool HTMLEditUtils::IsTransparentCSSColor(const nsAString& aColor) {
+  nsAutoString normalizedCSSColorValue;
+  return GetNormalizedCSSColorValue(aColor, ZeroAlphaColor::TransparentKeyword,
+                                    normalizedCSSColorValue) &&
+         normalizedCSSColorValue.EqualsASCII("transparent");
+}
+
+
+std::ostream& operator<<(std::ostream& aStream,
+                         const HTMLEditUtils::AncestorType& aType) {
+  constexpr static const char* names[] = {
+      "ClosestBlockElement",
+      "ClosestContainerElement",
+      "MostDistantInlineElementInBlock",
+      "IgnoreHRElement",
+      "ClosestButtonElement",
+      "StopAtClosestButtonElement",
+      "ReturnAncestorLimiterIfNoProperAncestor",
+      "EditableElement",
+  };
+  MOZ_ASSERT(static_cast<uint32_t>(aType) < std::size(names));
+  return aStream << names[static_cast<uint32_t>(aType)];
+}
+
+std::ostream& operator<<(std::ostream& aStream,
+                         const HTMLEditUtils::AncestorTypes& aTypes) {
+  aStream << "{";
+  bool first = true;
+  for (const auto t : aTypes) {
+    if (!first) {
+      aStream << ", ";
+    }
+    aStream << ToString(t).c_str();
+    first = false;
+  }
+  return aStream << "}";
+}
+
+std::ostream& operator<<(std::ostream& aStream,
+                         const HTMLEditUtils::EditablePointOption& aOption) {
+  constexpr static const char* names[] = {
+      "RecognizeInvisibleWhiteSpaces",
+      "StopAtComment",
+      "StopAtListElement",
+      "StopAtListItemElement",
+      "StopAtTableElement",
+      "StopAtAnyTableElement",
+  };
+  MOZ_ASSERT(static_cast<uint32_t>(aOption) < std::size(names));
+  return aStream << names[static_cast<uint32_t>(aOption)];
+}
+
+std::ostream& operator<<(std::ostream& aStream,
+                         const HTMLEditUtils::EditablePointOptions& aOptions) {
+  aStream << "{";
+  bool first = true;
+  for (const auto option : aOptions) {
+    if (!first) {
+      aStream << ", ";
+    }
+    aStream << ToString(option).c_str();
+    first = false;
+  }
+  return aStream << "}";
+}
+
+std::ostream& operator<<(std::ostream& aStream,
+                         const HTMLEditUtils::EmptyCheckOption& aOption) {
+  constexpr static const char* names[] = {
+      "TreatSingleBRElementAsVisible",
+      "TreatBlockAsVisible",
+      "TreatListItemAsVisible",
+      "TreatTableCellAsVisible",
+      "TreatNonEditableContentAsInvisible",
+      "TreatCommentAsVisible",
+      "SafeToAskLayout",
+  };
+  MOZ_ASSERT(static_cast<uint32_t>(aOption) < std::size(names));
+  return aStream << names[static_cast<uint32_t>(aOption)];
+}
+
+std::ostream& operator<<(std::ostream& aStream,
+                         const HTMLEditUtils::EmptyCheckOptions& aOptions) {
+  aStream << "{";
+  bool first = true;
+  for (const auto t : aOptions) {
+    if (!first) {
+      aStream << ", ";
+    }
+    aStream << ToString(t).c_str();
+    first = false;
+  }
+  return aStream << "}";
+}
+
+std::ostream& operator<<(std::ostream& aStream,
+                         const HTMLEditUtils::LeafNodeOption& aOption) {
+  constexpr static const char* names[] = {
+      "TreatChildBlockAsLeafNode",
+      "TreatNonEditableNodeAsLeafNode",
+      "IgnoreNonEditableNode",
+      "TreatCommentAsLeafNode",
+      "IgnoreEmptyText",
+      "IgnoreInvisibleText",
+      "IgnoreInvisibleInlineVoidElements",
+      "IgnoreAnyEmptyInlineContainers",
+      "IgnoreInvisibleEmptyInlineContainers",
+  };
+  MOZ_ASSERT(static_cast<uint32_t>(aOption) < std::size(names));
+  return aStream << names[static_cast<uint32_t>(aOption)];
+}
+
+std::ostream& operator<<(std::ostream& aStream,
+                         const HTMLEditUtils::LeafNodeOptions& aOptions) {
+  aStream << "{";
+  bool first = true;
+  for (const auto t : aOptions) {
+    if (!first) {
+      aStream << ", ";
+    }
+    aStream << ToString(t).c_str();
+    first = false;
+  }
+  return aStream << "}";
+}
+
+
+SelectedTableCellScanner::SelectedTableCellScanner(
+    const AutoClonedRangeArray& aRanges) {
+  if (aRanges.Ranges().IsEmpty()) {
+    return;
+  }
+  Element* firstSelectedCellElement =
+      HTMLEditUtils::GetTableCellElementIfOnlyOneSelected(
+          aRanges.FirstRangeRef());
+  if (!firstSelectedCellElement) {
+    return;  
+  }
+  mSelectedCellElements.SetCapacity(aRanges.Ranges().Length());
+  mSelectedCellElements.AppendElement(*firstSelectedCellElement);
+  for (uint32_t i = 1; i < aRanges.Ranges().Length(); i++) {
+    nsRange* range = aRanges.Ranges()[i];
+    if (NS_WARN_IF(!range) || NS_WARN_IF(!range->IsPositioned())) {
+      continue;  
+    }
+    if (Element* selectedCellElement =
+            HTMLEditUtils::GetTableCellElementIfOnlyOneSelected(*range)) {
+      mSelectedCellElements.AppendElement(*selectedCellElement);
+    }
+  }
+}
+
+}  

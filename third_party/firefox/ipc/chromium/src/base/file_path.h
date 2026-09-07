@@ -1,0 +1,90 @@
+// Copyright (c) 2008 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+
+#if !defined(BASE_FILE_PATH_H_)
+#define BASE_FILE_PATH_H_
+
+#include <string>
+
+#include "base/basictypes.h"
+
+
+class FilePath {
+ public:
+#if defined(XP_UNIX)
+  typedef std::string StringType;
+#else
+  typedef std::wstring StringType;
+#endif
+
+  typedef StringType::value_type CharType;
+
+  static const CharType kSeparators[];
+
+  static const CharType kCurrentDirectory[];
+
+  static const CharType kParentDirectory[];
+
+  static const CharType kExtensionSeparator;
+
+  FilePath() = default;
+  FilePath(const FilePath& that) = default;
+  explicit FilePath(const StringType& path) : path_(path) {}
+
+
+  FilePath& operator=(const FilePath& that) = default;
+
+  bool operator==(const FilePath& that) const { return path_ == that.path_; }
+
+  bool operator!=(const FilePath& that) const { return path_ != that.path_; }
+
+  bool operator<(const FilePath& that) const { return path_ < that.path_; }
+
+  const StringType& value() const { return path_; }
+
+  bool empty() const { return path_.empty(); }
+
+  static bool IsSeparator(CharType character);
+
+  FilePath DirName() const;
+
+  FilePath BaseName() const;
+
+  StringType Extension() const;
+
+  FilePath RemoveExtension() const;
+
+  FilePath InsertBeforeExtension(const StringType& suffix) const;
+
+  FilePath ReplaceExtension(const StringType& extension) const;
+
+  [[nodiscard]] FilePath Append(const StringType& component) const;
+  [[nodiscard]] FilePath Append(const FilePath& component) const;
+
+  [[nodiscard]] FilePath AppendASCII(const std::string& component) const;
+
+  bool IsAbsolute() const;
+
+  FilePath StripTrailingSeparators() const;
+
+  void OpenInputStream(std::ifstream& stream) const;
+
+  static FilePath FromWStringHack(const std::wstring& wstring);
+
+  std::wstring ToWStringHack() const;
+
+ private:
+  void StripTrailingSeparatorsInternal();
+
+  StringType path_;
+};
+
+#if defined(XP_UNIX)
+#  define FILE_PATH_LITERAL(x) x
+#else
+#  define FILE_PATH_LITERAL(x) L##x
+#endif
+
+#endif

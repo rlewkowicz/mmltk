@@ -1,0 +1,300 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*******************************************************************************
+* Copyright (C) 2003-2009,2012,2016 International Business Machines Corporation and
+* others. All Rights Reserved.
+*******************************************************************************
+*
+* File JAPANCAL.CPP
+*
+* Modification History:
+*  05/16/2003    srl     copied from buddhcal.cpp
+*
+*/
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+#if U_PLATFORM_HAS_WINUWP_API == 0
+#include <stdlib.h> // getenv() is not available in UWP env
+#else
+#ifndef WIN32_LEAN_AND_MEAN
+#   define WIN32_LEAN_AND_MEAN
+#endif
+#   define VC_EXTRALEAN
+#   define NOUSER
+#   define NOSERVICE
+#   define NOIME
+#   define NOMCX
+#include <windows.h>
+#endif
+#include "cmemory.h"
+#include "erarules.h"
+#include "japancal.h"
+#include "unicode/gregocal.h"
+#include "umutex.h"
+#include "uassert.h"
+#include "ucln_in.h"
+#include "cstring.h"
+
+static icu::EraRules * gJapaneseEraRules = nullptr;
+static icu::UInitOnce gJapaneseEraRulesInitOnce {};
+static int32_t gCurrentEra = 0;
+
+U_CDECL_BEGIN
+static UBool japanese_calendar_cleanup() {
+    if (gJapaneseEraRules) {
+        delete gJapaneseEraRules;
+        gJapaneseEraRules = nullptr;
+    }
+    gCurrentEra = 0;
+    gJapaneseEraRulesInitOnce.reset();
+    return true;
+}
+U_CDECL_END
+
+U_NAMESPACE_BEGIN
+
+UOBJECT_DEFINE_RTTI_IMPLEMENTATION(JapaneseCalendar)
+
+static const int32_t kGregorianEpoch = 1970;    
+static const char* TENTATIVE_ERA_VAR_NAME = "ICU_ENABLE_TENTATIVE_ERA";
+
+
+UBool JapaneseCalendar::enableTentativeEra() {
+
+
+    UBool includeTentativeEra = false;
+
+#if U_PLATFORM_HAS_WINUWP_API == 1
+    char16_t varName[26] = {};
+    u_charsToUChars(TENTATIVE_ERA_VAR_NAME, varName, static_cast<int32_t>(uprv_strlen(TENTATIVE_ERA_VAR_NAME)));
+    WCHAR varValue[5] = {};
+    DWORD ret = GetEnvironmentVariableW(reinterpret_cast<WCHAR*>(varName), varValue, UPRV_LENGTHOF(varValue));
+    if ((ret == 4) && (_wcsicmp(varValue, L"true") == 0)) {
+        includeTentativeEra = true;
+    }
+#else
+    char *envVarVal = getenv(TENTATIVE_ERA_VAR_NAME);
+    if (envVarVal != nullptr && uprv_stricmp(envVarVal, "true") == 0) {
+        includeTentativeEra = true;
+    }
+#endif
+    return includeTentativeEra;
+}
+
+
+static void U_CALLCONV initializeEras(UErrorCode &status) {
+    gJapaneseEraRules = EraRules::createInstance("japanese", JapaneseCalendar::enableTentativeEra(), status);
+    if (U_FAILURE(status)) {
+        return;
+    }
+    gCurrentEra = gJapaneseEraRules->getCurrentEraCode();
+}
+
+static void init(UErrorCode &status) {
+    umtx_initOnce(gJapaneseEraRulesInitOnce, &initializeEras, status);
+    ucln_i18n_registerCleanup(UCLN_I18N_JAPANESE_CALENDAR, japanese_calendar_cleanup);
+}
+
+uint32_t JapaneseCalendar::getCurrentEra() {
+    return gCurrentEra;
+}
+
+JapaneseCalendar::JapaneseCalendar(const Locale& aLocale, UErrorCode& success)
+:   GregorianCalendar(aLocale, success)
+{
+    init(success);
+}
+
+JapaneseCalendar::~JapaneseCalendar()
+{
+}
+
+JapaneseCalendar::JapaneseCalendar(const JapaneseCalendar& source)
+: GregorianCalendar(source)
+{
+    UErrorCode status = U_ZERO_ERROR;
+    init(status);
+    U_ASSERT(U_SUCCESS(status));
+}
+
+JapaneseCalendar* JapaneseCalendar::clone() const
+{
+    return new JapaneseCalendar(*this);
+}
+
+const char *JapaneseCalendar::getType() const
+{
+    return "japanese";
+}
+
+int32_t JapaneseCalendar::getDefaultMonthInYear(int32_t eyear, UErrorCode& status) 
+{
+    if (U_FAILURE(status)) {
+      return 0;
+    }
+    int32_t era = internalGetEra();
+
+    int32_t month = 0;
+
+    int32_t eraStart[3] = { 0,0,0 };
+    gJapaneseEraRules->getStartDate(era, eraStart, status);
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+    if(eyear == eraStart[0]) {
+        return eraStart[1]  
+                -1;         
+    }
+
+    return month;
+}
+
+int32_t JapaneseCalendar::getDefaultDayInMonth(int32_t eyear, int32_t month, UErrorCode& status) 
+{
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+    int32_t era = internalGetEra();
+    int32_t day = 1;
+
+    int32_t eraStart[3] = { 0,0,0 };
+    gJapaneseEraRules->getStartDate(era, eraStart, status);
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+    if (eyear == eraStart[0] && (month == eraStart[1] - 1)) {
+        return eraStart[2];
+    }
+    return day;
+}
+
+
+int32_t JapaneseCalendar::internalGetEra() const
+{
+    return internalGet(UCAL_ERA, gCurrentEra);
+}
+
+int32_t JapaneseCalendar::handleGetExtendedYear(UErrorCode& status)
+{
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+
+    if (newerField(UCAL_EXTENDED_YEAR, UCAL_YEAR) == UCAL_EXTENDED_YEAR &&
+        newerField(UCAL_EXTENDED_YEAR, UCAL_ERA) == UCAL_EXTENDED_YEAR) {
+        return internalGet(UCAL_EXTENDED_YEAR, kGregorianEpoch);
+    }
+    int32_t eraStartYear = gJapaneseEraRules->getStartYear(internalGet(UCAL_ERA, gCurrentEra), status);
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+
+    int32_t year = internalGet(UCAL_YEAR, 1);   
+    if (uprv_add32_overflow(year, eraStartYear - 1,  &year)) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return 0;
+    }
+    return year;
+}
+
+
+void JapaneseCalendar::handleComputeFields(int32_t julianDay, UErrorCode& status)
+{
+    GregorianCalendar::handleComputeFields(julianDay, status);
+    int32_t year = internalGet(UCAL_EXTENDED_YEAR); 
+    int32_t eraCode = gJapaneseEraRules->getEraCode(year, internalGetMonth(status) + 1, internalGet(UCAL_DAY_OF_MONTH), status);
+
+    if (eraCode == EEras::BC || eraCode == EEras::AD) {
+        return;
+    }
+
+    int32_t startYear = gJapaneseEraRules->getStartYear(eraCode, status) - 1;
+    if (U_FAILURE(status)) {
+        return;
+    }
+    if (uprv_add32_overflow(year, -startYear,  &year)) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return;
+    }
+    internalSet(UCAL_ERA, eraCode);
+    internalSet(UCAL_YEAR, year);
+}
+
+UBool JapaneseCalendar::haveDefaultCentury() const
+{
+    return false;
+}
+
+UDate JapaneseCalendar::defaultCenturyStart() const
+{
+    return 0;
+}
+
+int32_t JapaneseCalendar::defaultCenturyStartYear() const
+{
+    return 0;
+}
+
+int32_t JapaneseCalendar::handleGetLimit(UCalendarDateFields field, ELimitType limitType) const
+{
+    switch(field) {
+    case UCAL_ERA:
+        if (limitType == UCAL_LIMIT_MINIMUM || limitType == UCAL_LIMIT_GREATEST_MINIMUM) {
+            return 0;
+        }
+        return gJapaneseEraRules->getMaxEraCode(); 
+    case UCAL_YEAR:
+        {
+            switch (limitType) {
+            case UCAL_LIMIT_MINIMUM:
+            case UCAL_LIMIT_GREATEST_MINIMUM:
+                return 1;
+            case UCAL_LIMIT_LEAST_MAXIMUM:
+                return 1;
+            case  UCAL_LIMIT_COUNT: 
+            case UCAL_LIMIT_MAXIMUM:
+            {
+                UErrorCode status = U_ZERO_ERROR;
+                int32_t eraStartYear = gJapaneseEraRules->getStartYear(gCurrentEra, status);
+                U_ASSERT(U_SUCCESS(status));
+                return GregorianCalendar::handleGetLimit(UCAL_YEAR, UCAL_LIMIT_MAXIMUM) - eraStartYear;
+            }
+            default:
+                return 1;    
+            }
+        }
+    default:
+        return GregorianCalendar::handleGetLimit(field,limitType);
+    }
+}
+
+int32_t JapaneseCalendar::getActualMaximum(UCalendarDateFields field, UErrorCode& status) const {
+    if (field != UCAL_YEAR) {
+        return GregorianCalendar::getActualMaximum(field, status);
+    }
+    int32_t era = get(UCAL_ERA, status);
+    if (U_FAILURE(status)) {
+        return 0; 
+    }
+    if (era == gJapaneseEraRules->getMaxEraCode()) { 
+        return handleGetLimit(UCAL_YEAR, UCAL_LIMIT_MAXIMUM);
+    }
+    int32_t nextEraStart[3] = { 0,0,0 };
+    gJapaneseEraRules->getStartDate(era + 1, nextEraStart, status);
+    int32_t nextEraYear = nextEraStart[0];
+    int32_t nextEraMonth = nextEraStart[1]; 
+    int32_t nextEraDate = nextEraStart[2];
+
+    int32_t eraStartYear = gJapaneseEraRules->getStartYear(era, status);
+    int32_t maxYear = nextEraYear - eraStartYear + 1;   
+    if (nextEraMonth == 1 && nextEraDate == 1) {
+        maxYear--;
+    }
+    return maxYear;
+}
+
+U_NAMESPACE_END
+
+#endif

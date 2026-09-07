@@ -1,0 +1,212 @@
+// Copyright 2008 Google Inc.  All rights reserved.
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
+
+
+#if !defined(GOOGLE_PROTOBUF_IO_ZERO_COPY_STREAM_IMPL_H__)
+#define GOOGLE_PROTOBUF_IO_ZERO_COPY_STREAM_IMPL_H__
+
+#include <cstdint>
+#include <iosfwd>
+
+#include "absl/strings/cord.h"
+#include "google/protobuf/io/zero_copy_stream.h"
+#include "google/protobuf/io/zero_copy_stream_impl_lite.h"
+
+#include "google/protobuf/port_def.inc"
+
+namespace google {
+namespace protobuf {
+namespace io {
+
+
+class PROTOBUF_EXPORT FileInputStream final : public ZeroCopyInputStream {
+ public:
+  explicit FileInputStream(int file_descriptor, int block_size = -1);
+  FileInputStream(const FileInputStream&) = delete;
+  FileInputStream& operator=(const FileInputStream&) = delete;
+
+  bool Close();
+
+  void SetCloseOnDelete(bool value) { copying_input_.SetCloseOnDelete(value); }
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD int GetErrno() const {
+    return copying_input_.GetErrno();
+  }
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool Next(const void** data,
+                                                int* size) override;
+  void BackUp(int count) override;
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool Skip(int count) override;
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD int64_t ByteCount() const override;
+
+ private:
+  class PROTOBUF_EXPORT CopyingFileInputStream final
+      : public CopyingInputStream {
+   public:
+    explicit CopyingFileInputStream(int file_descriptor);
+    CopyingFileInputStream(const CopyingFileInputStream&) = delete;
+    CopyingFileInputStream& operator=(const CopyingFileInputStream&) = delete;
+    ~CopyingFileInputStream() override;
+
+    bool Close();
+    void SetCloseOnDelete(bool value) { close_on_delete_ = value; }
+    int GetErrno() const { return errno_; }
+
+    int Read(void* buffer, int size) override;
+    int Skip(int count) override;
+
+   private:
+    const int file_;
+    bool close_on_delete_;
+    bool is_closed_;
+
+    int errno_;
+
+    bool previous_seek_failed_;
+  };
+
+  CopyingFileInputStream copying_input_;
+  CopyingInputStreamAdaptor impl_;
+};
+
+
+class PROTOBUF_EXPORT FileOutputStream final
+    : public CopyingOutputStreamAdaptor {
+ public:
+  explicit FileOutputStream(int file_descriptor, int block_size = -1);
+  FileOutputStream(const FileOutputStream&) = delete;
+  FileOutputStream& operator=(const FileOutputStream&) = delete;
+
+  ~FileOutputStream() override;
+
+  bool Close();
+
+  void SetCloseOnDelete(bool value) { copying_output_.SetCloseOnDelete(value); }
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD int GetErrno() const {
+    return copying_output_.GetErrno();
+  }
+
+ private:
+  class PROTOBUF_EXPORT CopyingFileOutputStream final
+      : public CopyingOutputStream {
+   public:
+    explicit CopyingFileOutputStream(int file_descriptor);
+    CopyingFileOutputStream(const CopyingFileOutputStream&) = delete;
+    CopyingFileOutputStream& operator=(const CopyingFileOutputStream&) = delete;
+    ~CopyingFileOutputStream() override;
+
+    bool Close();
+    void SetCloseOnDelete(bool value) { close_on_delete_ = value; }
+    int GetErrno() const { return errno_; }
+
+    bool Write(const void* buffer, int size) override;
+
+   private:
+    const int file_;
+    bool close_on_delete_;
+    bool is_closed_;
+
+    int errno_;
+  };
+
+  CopyingFileOutputStream copying_output_;
+};
+
+
+class PROTOBUF_EXPORT IstreamInputStream final : public ZeroCopyInputStream {
+ public:
+  explicit IstreamInputStream(std::istream* stream, int block_size = -1);
+  IstreamInputStream(const IstreamInputStream&) = delete;
+  IstreamInputStream& operator=(const IstreamInputStream&) = delete;
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool Next(const void** data,
+                                                int* size) override;
+  void BackUp(int count) override;
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool Skip(int count) override;
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD int64_t ByteCount() const override;
+
+ private:
+  class PROTOBUF_EXPORT CopyingIstreamInputStream final
+      : public CopyingInputStream {
+   public:
+    explicit CopyingIstreamInputStream(std::istream* input);
+    CopyingIstreamInputStream(const CopyingIstreamInputStream&) = delete;
+    CopyingIstreamInputStream& operator=(const CopyingIstreamInputStream&) =
+        delete;
+    ~CopyingIstreamInputStream() override;
+
+    int Read(void* buffer, int size) override;
+
+   private:
+    std::istream* input_;
+  };
+
+  CopyingIstreamInputStream copying_input_;
+  CopyingInputStreamAdaptor impl_;
+};
+
+
+class PROTOBUF_EXPORT OstreamOutputStream final : public ZeroCopyOutputStream {
+ public:
+  explicit OstreamOutputStream(std::ostream* stream, int block_size = -1);
+  OstreamOutputStream(const OstreamOutputStream&) = delete;
+  OstreamOutputStream& operator=(const OstreamOutputStream&) = delete;
+  ~OstreamOutputStream() override;
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool Next(void** data,
+                                                int* size) override;
+  void BackUp(int count) override;
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD int64_t ByteCount() const override;
+
+ private:
+  class PROTOBUF_EXPORT CopyingOstreamOutputStream final
+      : public CopyingOutputStream {
+   public:
+    explicit CopyingOstreamOutputStream(std::ostream* output);
+    CopyingOstreamOutputStream(const CopyingOstreamOutputStream&) = delete;
+    CopyingOstreamOutputStream& operator=(const CopyingOstreamOutputStream&) =
+        delete;
+    ~CopyingOstreamOutputStream() override;
+
+    bool Write(const void* buffer, int size) override;
+
+   private:
+    std::ostream* output_;
+  };
+
+  CopyingOstreamOutputStream copying_output_;
+  CopyingOutputStreamAdaptor impl_;
+};
+
+
+class PROTOBUF_EXPORT ConcatenatingInputStream final
+    : public ZeroCopyInputStream {
+ public:
+  ConcatenatingInputStream(ZeroCopyInputStream* const streams[], int count);
+  ConcatenatingInputStream(const ConcatenatingInputStream&) = delete;
+  ConcatenatingInputStream& operator=(const ConcatenatingInputStream&) = delete;
+  ~ConcatenatingInputStream() override = default;
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool Next(const void** data,
+                                                int* size) override;
+  void BackUp(int count) override;
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD bool Skip(int count) override;
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD int64_t ByteCount() const override;
+
+
+ private:
+  ZeroCopyInputStream* const* streams_;
+  int stream_count_;
+  int64_t bytes_retired_;  
+};
+
+
+}  
+}  
+}  
+
+#include "google/protobuf/port_undef.inc"
+
+#endif

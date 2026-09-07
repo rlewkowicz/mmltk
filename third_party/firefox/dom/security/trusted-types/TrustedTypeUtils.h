@@ -1,0 +1,240 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SECURITY_TRUSTED_TYPES_TRUSTEDTYPEUTILS_H_
+#define DOM_SECURITY_TRUSTED_TYPES_TRUSTEDTYPEUTILS_H_
+
+#include "js/TypeDecls.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/dom/DOMString.h"
+#include "mozilla/dom/SessionStoreUtils.h"
+#include "mozilla/dom/TrustedTypesBinding.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsISupportsImpl.h"
+#include "nsString.h"
+
+class nsIContentSecurityPolicy;
+class nsIPrincipal;
+
+namespace mozilla {
+
+class ErrorResult;
+
+template <typename T>
+class Maybe;
+
+namespace dom {
+
+class TrustedHTMLOrString;
+class TrustedScript;
+class TrustedScriptOrString;
+class TrustedScriptOrNullIsEmptyString;
+class FunctionOrTrustedScriptOrString;
+class TrustedScriptURL;
+class TrustedScriptURLOrString;
+class TrustedScriptURLOrUSVString;
+class OwningTrustedScriptURLOrString;
+class TrustedHTMLOrTrustedScriptOrTrustedScriptURLOrString;
+
+namespace TrustedTypeUtils {
+
+template <typename T>
+nsString GetTrustedTypeName() {
+  if constexpr (std::is_same_v<T, TrustedHTML>) {
+    return u"TrustedHTML"_ns;
+  }
+  if constexpr (std::is_same_v<T, TrustedScript>) {
+    return u"TrustedScript"_ns;
+  }
+  MOZ_ASSERT((std::is_same_v<T, TrustedScriptURL>));
+  return u"TrustedScriptURL"_ns;
+}
+
+enum class TrustedType : int8_t {
+  TrustedHTML,
+  TrustedScript,
+  TrustedScriptURL,
+};
+nsString GetTrustedTypeName(TrustedType aTrustedType);
+
+void ReportSinkTypeMismatchViolations(nsIContentSecurityPolicy* aCSP,
+                                      nsICSPEventListener* aCSPEventListener,
+                                      const nsCString& aFileName,
+                                      uint32_t aLine, uint32_t aColumn,
+                                      const nsAString& aSink,
+                                      const nsAString& aSinkGroup,
+                                      const nsAString& aSource);
+
+bool CanSkipTrustedTypesEnforcement(const nsINode& aNode);
+
+MOZ_CAN_RUN_SCRIPT const nsAString* GetTrustedTypesCompliantString(
+    const TrustedHTMLOrString& aInput, const nsAString& aSink,
+    const nsAString& aSinkGroup, const nsINode& aNode,
+    nsIPrincipal* aPrincipalOrNull, Maybe<nsAutoString>& aResultHolder,
+    ErrorResult& aError);
+MOZ_CAN_RUN_SCRIPT const nsAString* GetTrustedTypesCompliantString(
+    const TrustedHTMLOrNullIsEmptyString& aInput, const nsAString& aSink,
+    const nsAString& aSinkGroup, const nsINode& aNode,
+    nsIPrincipal* aPrincipalOrNull, Maybe<nsAutoString>& aResultHolder,
+    ErrorResult& aError);
+MOZ_CAN_RUN_SCRIPT const nsAString* GetTrustedTypesCompliantString(
+    const TrustedHTMLOrString& aInput, const nsAString& aSink,
+    const nsAString& aSinkGroup, nsIGlobalObject& aGlobalObject,
+    nsIPrincipal* aPrincipalOrNull, Maybe<nsAutoString>& aResultHolder,
+    ErrorResult& aError);
+MOZ_CAN_RUN_SCRIPT const nsAString* GetTrustedTypesCompliantString(
+    const TrustedScriptOrString& aInput, const nsAString& aSink,
+    const nsAString& aSinkGroup, const nsINode& aNode,
+    nsIPrincipal* aPrincipalOrNull, Maybe<nsAutoString>& aResultHolder,
+    ErrorResult& aError);
+MOZ_CAN_RUN_SCRIPT const nsAString* GetTrustedTypesCompliantString(
+    const TrustedScriptOrNullIsEmptyString& aInput, const nsAString& aSink,
+    const nsAString& aSinkGroup, const nsINode& aNode,
+    nsIPrincipal* aPrincipalOrNull, Maybe<nsAutoString>& aResultHolder,
+    ErrorResult& aError);
+MOZ_CAN_RUN_SCRIPT const nsAString* GetTrustedTypesCompliantString(
+    const FunctionOrTrustedScriptOrString& aInput, const nsAString& aSink,
+    const nsAString& aSinkGroup, nsIGlobalObject& aGlobalObject,
+    nsIPrincipal* aPrincipalOrNull, Maybe<nsAutoString>& aResultHolder,
+    ErrorResult& aError);
+MOZ_CAN_RUN_SCRIPT const nsAString* GetTrustedTypesCompliantString(
+    const TrustedScriptURLOrString& aInput, const nsAString& aSink,
+    const nsAString& aSinkGroup, const nsINode& aNode,
+    nsIPrincipal* aPrincipalOrNull, Maybe<nsAutoString>& aResultHolder,
+    ErrorResult& aError);
+MOZ_CAN_RUN_SCRIPT const nsAString* GetTrustedTypesCompliantString(
+    const TrustedScriptURLOrUSVString& aInput, const nsAString& aSink,
+    const nsAString& aSinkGroup, nsIGlobalObject& aGlobalObject,
+    nsIPrincipal* aPrincipalOrNull, Maybe<nsAutoString>& aResultHolder,
+    ErrorResult& aError);
+MOZ_CAN_RUN_SCRIPT const nsAString* GetTrustedTypesCompliantString(
+    const TrustedScriptURLOrUSVString& aInput, const nsAString& aSink,
+    const nsAString& aSinkGroup, const nsINode& aNode,
+    nsIPrincipal* aPrincipalOrNull, Maybe<nsAutoString>& aResultHolder,
+    ErrorResult& aError);
+MOZ_CAN_RUN_SCRIPT const nsAString* GetTrustedTypesCompliantString(
+    const OwningTrustedScriptURLOrString& aInput, const nsAString& aSink,
+    const nsAString& aSinkGroup, nsIGlobalObject& aGlobalObject,
+    nsIPrincipal* aPrincipalOrNull, Maybe<nsAutoString>& aResultHolder,
+    ErrorResult& aError);
+MOZ_CAN_RUN_SCRIPT const nsAString*
+GetTrustedTypesCompliantStringForTrustedHTML(const nsAString& aInput,
+                                             const nsAString& aSink,
+                                             const nsAString& aSinkGroup,
+                                             const nsINode& aNode,
+                                             nsIPrincipal* aPrincipalOrNull,
+                                             Maybe<nsAutoString>& aResultHolder,
+                                             ErrorResult& aError);
+MOZ_CAN_RUN_SCRIPT const nsAString*
+GetTrustedTypesCompliantStringForTrustedScript(
+    const nsAString& aInput, const nsAString& aSink,
+    const nsAString& aSinkGroup, nsIGlobalObject& aGlobalObject,
+    nsIPrincipal* aPrincipalOrNull, Maybe<nsAutoString>& aResultHolder,
+    ErrorResult& aError);
+
+MOZ_CAN_RUN_SCRIPT const nsAString*
+GetTrustedTypesCompliantStringForTrustedScript(
+    const nsAString& aInput, const nsAString& aSink,
+    const nsAString& aSinkGroup, const nsINode& aNode,
+    Maybe<nsAutoString>& aResultHolder, ErrorResult& aError);
+
+template <typename ExpectedType>
+MOZ_CAN_RUN_SCRIPT void ProcessValueWithADefaultPolicy(
+    nsIGlobalObject& aGlobalObject, const nsAString& aInput,
+    const nsAString& aSink, ExpectedType** aResult, ErrorResult& aError);
+
+bool GetTrustedTypeDataForAttribute(const nsAtom* aElementName,
+                                    int32_t aElementNamespaceID,
+                                    nsAtom* aAttributeName,
+                                    int32_t aAttributeNamespaceID,
+                                    TrustedType& aTrustedType,
+                                    nsAString& aSink);
+
+MOZ_CAN_RUN_SCRIPT const nsAString* GetTrustedTypesCompliantAttributeValue(
+    const nsINode& aElement, nsAtom* aAttributeName,
+    int32_t aAttributeNamespaceID,
+    const TrustedHTMLOrTrustedScriptOrTrustedScriptURLOrString& aNewValue,
+    nsIPrincipal* aPrincipalOrNull, Maybe<nsAutoString>& aResultHolder,
+    ErrorResult& aError);
+MOZ_CAN_RUN_SCRIPT const nsAString* GetTrustedTypesCompliantAttributeValue(
+    const nsINode& aElement, nsAtom* aAttributeName,
+    int32_t aAttributeNamespaceID, const nsAString& aNewValue,
+    nsIPrincipal* aPrincipalOrNull, Maybe<nsAutoString>& aResultHolder,
+    ErrorResult& aError);
+
+bool HostGetCodeForEval(JSContext* aCx, JS::Handle<JSObject*> aCode,
+                        JS::MutableHandle<JSString*> aOutCode);
+
+MOZ_CAN_RUN_SCRIPT bool
+AreArgumentsTrustedForEnsureCSPDoesNotBlockStringCompilation(
+    JSContext* aCx, JS::Handle<JSString*> aCodeString,
+    JS::CompilationType aCompilationType,
+    JS::Handle<JS::StackGCVector<JSString*>> aParameterStrings,
+    JS::Handle<JSString*> aBodyString,
+    JS::Handle<JS::StackGCVector<JS::Value>> aParameterArgs,
+    JS::Handle<JS::Value> aBodyArg, nsIPrincipal* aPrincipalOrNull,
+    ErrorResult& aError);
+
+MOZ_CAN_RUN_SCRIPT const nsAString*
+GetConvertedScriptSourceForPreNavigationCheck(
+    nsIGlobalObject& aGlobalObject, const nsAString& aEncodedScriptSource,
+    const nsAString& aSink, Maybe<nsAutoString>& aResultHolder,
+    ErrorResult& aError);
+
+}  
+
+}  
+
+}  
+
+#define DECL_TRUSTED_TYPE_CLASS(_class)                                     \
+  class _class {                                                            \
+   public:                                                                  \
+    NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(_class)              \
+    NS_DECL_CYCLE_COLLECTION_NATIVE_CLASS(_class)                           \
+                                                                            \
+                                         \
+    bool WrapObject(JSContext* aCx, JS::Handle<JSObject*> aGivenProto,      \
+                    JS::MutableHandle<JSObject*> aObject);                  \
+                                                                            \
+    void Stringify(DOMString& aResult) const {                              \
+      aResult.SetKnownLiveString(mData);                                    \
+    }                                                                       \
+                                                                            \
+    void ToJSON(DOMString& aResult) const {                                 \
+      aResult.SetKnownLiveString(mData);                                    \
+    }                                                                       \
+                                                                            \
+                                                           \
+    const nsString mData;                                                   \
+                                                                            \
+   private:                                                                 \
+    template <typename T, typename... Args>                                 \
+    friend RefPtr<T> mozilla::MakeRefPtr(Args&&... aArgs);                  \
+    friend mozilla::dom::TrustedTypePolicy;                                 \
+    friend mozilla::dom::TrustedTypePolicyFactory;                          \
+    template <typename ExpectedType>                                        \
+    friend void                                                             \
+    mozilla::dom::TrustedTypeUtils::ProcessValueWithADefaultPolicy(         \
+        nsIGlobalObject& aGlobalObject, const nsAString&, const nsAString&, \
+        ExpectedType**, ErrorResult&);                                      \
+                                                                            \
+    explicit _class(const nsAString& aData) : mData{aData} {                \
+      MOZ_ASSERT(!aData.IsVoid());                                          \
+    }                                                                       \
+                                                                            \
+                       \
+    ~_class() = default;                                                    \
+  };
+
+#define IMPL_TRUSTED_TYPE_CLASS(_class)                                      \
+  NS_IMPL_CYCLE_COLLECTION(_class)                                           \
+                                                                             \
+  bool _class::WrapObject(JSContext* aCx, JS::Handle<JSObject*> aGivenProto, \
+                          JS::MutableHandle<JSObject*> aObject) {            \
+    return _class##_Binding::Wrap(aCx, this, aGivenProto, aObject);          \
+  }
+
+#endif  // DOM_SECURITY_TRUSTED_TYPES_TRUSTEDTYPEUTILS_H_

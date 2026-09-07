@@ -1,0 +1,74 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SVG_DOMSVGSTRINGLIST_H_
+#define DOM_SVG_DOMSVGSTRINGLIST_H_
+
+#include "SVGElement.h"
+#include "mozilla/RefPtr.h"
+#include "nsCycleCollectionParticipant.h"
+
+namespace mozilla {
+
+class ErrorResult;
+class SVGStringList;
+
+namespace dom {
+
+class DOMSVGStringList final : public nsISupports, public nsWrapperCache {
+  friend class AutoChangeStringListNotifier;
+
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_CLASS(DOMSVGStringList)
+
+  dom::SVGElement* GetParentObject() const { return mElement; }
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  uint32_t NumberOfItems() const;
+  uint32_t Length() const;
+  void Clear();
+  void Initialize(const nsAString& aNewItem, nsAString& aRetval,
+                  ErrorResult& aRv);
+  void GetItem(uint32_t aIndex, nsAString& aRetval, ErrorResult& aRv);
+  void IndexedGetter(uint32_t aIndex, bool& aFound, nsAString& aRetval);
+  void InsertItemBefore(const nsAString& aNewItem, uint32_t aIndex,
+                        nsAString& aRetval, ErrorResult& aRv);
+  void ReplaceItem(const nsAString& aNewItem, uint32_t aIndex,
+                   nsAString& aRetval, ErrorResult& aRv);
+  void RemoveItem(uint32_t aIndex, nsAString& aRetval, ErrorResult& aRv);
+  void AppendItem(const nsAString& aNewItem, nsAString& aRetval,
+                  ErrorResult& aRv);
+
+  static already_AddRefed<DOMSVGStringList> GetDOMWrapper(
+      SVGStringList* aList, dom::SVGElement* aElement,
+      bool aIsConditionalProcessingAttribute, uint8_t aAttrEnum);
+
+ private:
+  DOMSVGStringList(dom::SVGElement* aElement,
+                   bool aIsConditionalProcessingAttribute, uint8_t aAttrEnum)
+      : mElement(aElement),
+        mAttrEnum(aAttrEnum),
+        mIsConditionalProcessingAttribute(aIsConditionalProcessingAttribute) {}
+
+  ~DOMSVGStringList();
+
+  SVGStringList& InternalList() const;
+
+  void RemoveFromTearoffTable();
+
+  RefPtr<dom::SVGElement> mElement;
+
+  uint8_t mAttrEnum;
+
+  bool mIsConditionalProcessingAttribute;
+
+  bool mIsInTearoffTable = true;
+};
+
+}  
+}  
+
+#endif  // DOM_SVG_DOMSVGSTRINGLIST_H_

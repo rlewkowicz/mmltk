@@ -1,0 +1,180 @@
+/*
+ * Copyright 2021 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "include/effects/SkImageFilters.h"
+
+#include "include/core/SkFlattenable.h"
+#include "include/core/SkImageFilter.h"
+#include "include/core/SkRect.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkTileMode.h"
+#include "include/private/base/SkAssert.h"
+#include "src/core/SkImageFilterTypes.h"
+#include "src/core/SkImageFilter_Base.h"
+#include "src/core/SkPicturePriv.h"
+#include "src/core/SkReadBuffer.h"
+#include "src/core/SkRectPriv.h"
+#include "src/core/SkValidationUtils.h"
+#include "src/core/SkWriteBuffer.h"
+
+
+#include <cstdint>
+#include <optional>
+#include <utility>
+
+namespace {
+
+class SkCropImageFilter final : public SkImageFilter_Base {
+public:
+    SkCropImageFilter(const SkRect& cropRect, SkTileMode tileMode, sk_sp<SkImageFilter> input)
+            : SkImageFilter_Base(&input, 1)
+            , fCropRect(cropRect)
+            , fTileMode(tileMode) {
+        SkASSERT(cropRect.isFinite());
+        SkASSERT(cropRect.isSorted());
+    }
+
+    SkRect computeFastBounds(const SkRect& bounds) const override;
+
+protected:
+    void flatten(SkWriteBuffer&) const override;
+
+private:
+    friend void ::SkRegisterCropImageFilterFlattenable();
+    SK_FLATTENABLE_HOOKS(SkCropImageFilter)
+    static sk_sp<SkFlattenable> LegacyTileCreateProc(SkReadBuffer&);
+
+    bool onAffectsTransparentBlack() const override { return fTileMode != SkTileMode::kDecal; }
+
+    bool ignoreInputsAffectsTransparentBlack() const override { return true; }
+
+    skif::FilterResult onFilterImage(const skif::Context& context) const override;
+
+    skif::LayerSpace<SkIRect> onGetInputLayerBounds(
+            const skif::Mapping& mapping,
+            const skif::LayerSpace<SkIRect>& desiredOutput,
+            std::optional<skif::LayerSpace<SkIRect>> contentBounds) const override;
+
+    std::optional<skif::LayerSpace<SkIRect>> onGetOutputLayerBounds(
+            const skif::Mapping& mapping,
+            std::optional<skif::LayerSpace<SkIRect>> contentBounds) const override;
+
+    skif::LayerSpace<SkIRect> cropRect(const skif::Mapping& mapping) const {
+        skif::LayerSpace<SkRect> crop = mapping.paramToLayer(fCropRect);
+        return fTileMode == SkTileMode::kDecal ? crop.roundOut() : crop.roundIn();
+    }
+
+    skif::LayerSpace<SkIRect> requiredInput(const skif::Mapping& mapping,
+                                            const skif::LayerSpace<SkIRect>& outputBounds) const {
+        return  this->cropRect(mapping).relevantSubset(outputBounds, fTileMode);
+    }
+
+    skif::ParameterSpace<SkRect> fCropRect;
+    SkTileMode fTileMode;
+};
+
+} 
+
+sk_sp<SkImageFilter> SkImageFilters::Crop(const SkRect& rect,
+                                          SkTileMode tileMode,
+                                          sk_sp<SkImageFilter> input) {
+    if (!SkIsValidRect(rect)) {
+        return nullptr;
+    }
+    return sk_sp<SkImageFilter>(new SkCropImageFilter(rect, tileMode, std::move(input)));
+}
+
+sk_sp<SkImageFilter> SkImageFilters::Empty() {
+    return SkImageFilters::Crop(SkRect::MakeEmpty(), SkTileMode::kDecal, nullptr);
+}
+
+sk_sp<SkImageFilter> SkImageFilters::Tile(const SkRect& src,
+                                          const SkRect& dst,
+                                          sk_sp<SkImageFilter> input) {
+    sk_sp<SkImageFilter> filter = SkImageFilters::Crop(src, SkTileMode::kRepeat, std::move(input));
+    filter = SkImageFilters::Crop(dst, SkTileMode::kDecal, std::move(filter));
+    return filter;
+}
+
+void SkRegisterCropImageFilterFlattenable() {
+    SK_REGISTER_FLATTENABLE(SkCropImageFilter);
+    SkFlattenable::Register("SkTileImageFilter", SkCropImageFilter::LegacyTileCreateProc);
+    SkFlattenable::Register("SkTileImageFilterImpl", SkCropImageFilter::LegacyTileCreateProc);
+}
+
+sk_sp<SkFlattenable> SkCropImageFilter::LegacyTileCreateProc(SkReadBuffer& buffer) {
+    SK_IMAGEFILTER_UNFLATTEN_COMMON(common, 1);
+    SkRect src, dst;
+    buffer.readRect(&src);
+    buffer.readRect(&dst);
+    return SkImageFilters::Tile(src, dst, common.getInput(0));
+}
+
+sk_sp<SkFlattenable> SkCropImageFilter::CreateProc(SkReadBuffer& buffer) {
+    SK_IMAGEFILTER_UNFLATTEN_COMMON(common, 1);
+    SkRect cropRect = buffer.readRect();
+    if (!buffer.isValid() || !buffer.validate(SkIsValidRect(cropRect))) {
+        return nullptr;
+    }
+
+    SkTileMode tileMode = SkTileMode::kDecal;
+    if (!buffer.isVersionLT(SkPicturePriv::kCropImageFilterSupportsTiling)) {
+        tileMode = buffer.read32LE(SkTileMode::kLastTileMode);
+    }
+
+    return SkImageFilters::Crop(cropRect, tileMode, common.getInput(0));
+}
+
+void SkCropImageFilter::flatten(SkWriteBuffer& buffer) const {
+    this->SkImageFilter_Base::flatten(buffer);
+    buffer.writeRect(SkRect(fCropRect));
+    buffer.writeInt(static_cast<int32_t>(fTileMode));
+}
+
+
+skif::FilterResult SkCropImageFilter::onFilterImage(const skif::Context& context) const {
+    skif::LayerSpace<SkIRect> cropInput = this->requiredInput(context.mapping(),
+                                                              context.desiredOutput());
+    skif::FilterResult childOutput =
+            this->getChildOutput(0, context.withNewDesiredOutput(cropInput));
+
+    return childOutput.applyCrop(context, this->cropRect(context.mapping()), fTileMode);
+}
+
+skif::LayerSpace<SkIRect> SkCropImageFilter::onGetInputLayerBounds(
+        const skif::Mapping& mapping,
+        const skif::LayerSpace<SkIRect>& desiredOutput,
+        std::optional<skif::LayerSpace<SkIRect>> contentBounds) const {
+    skif::LayerSpace<SkIRect> requiredInput = this->requiredInput(mapping, desiredOutput);
+
+    return this->getChildInputLayerBounds(0, mapping, requiredInput, contentBounds);
+}
+
+std::optional<skif::LayerSpace<SkIRect>> SkCropImageFilter::onGetOutputLayerBounds(
+        const skif::Mapping& mapping,
+        std::optional<skif::LayerSpace<SkIRect>> contentBounds) const {
+    auto childOutput = this->getChildOutputLayerBounds(0, mapping, contentBounds);
+
+    skif::LayerSpace<SkIRect> crop = this->cropRect(mapping);
+    if (childOutput && !crop.intersect(*childOutput)) {
+        return skif::LayerSpace<SkIRect>::Empty();
+    } else {
+        if (fTileMode == SkTileMode::kDecal) {
+            return crop;
+        } else {
+            return skif::LayerSpace<SkIRect>::Unbounded();
+        }
+    }
+}
+
+SkRect SkCropImageFilter::computeFastBounds(const SkRect& bounds) const {
+    SkRect inputBounds = this->getInput(0) ? this->getInput(0)->computeFastBounds(bounds) : bounds;
+    if (!inputBounds.intersect(SkRect(fCropRect))) {
+        return SkRect::MakeEmpty();
+    }
+    return fTileMode == SkTileMode::kDecal ? inputBounds : SkRectPriv::MakeLargeS32();
+}

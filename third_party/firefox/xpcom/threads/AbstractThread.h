@@ -1,0 +1,80 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef XPCOM_THREADS_ABSTRACTTHREAD_H_
+#define XPCOM_THREADS_ABSTRACTTHREAD_H_
+
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/ThreadLocal.h"
+#include "nscore.h"
+#include "nsISerialEventTarget.h"
+#include "nsISupports.h"
+
+class nsIEventTarget;
+class nsIRunnable;
+class nsIThread;
+
+namespace mozilla {
+
+class TaskDispatcher;
+
+class AbstractThread : public nsISerialEventTarget {
+ public:
+  static AbstractThread* GetCurrent() { return sCurrentThreadTLS.get(); }
+
+  AbstractThread(bool aSupportsTailDispatch)
+      : mSupportsTailDispatch(aSupportsTailDispatch) {}
+
+  using nsISerialEventTarget::IsOnCurrentThread;
+  NS_IMETHOD_(bool) IsOnCurrentThreadInfallible(void) override;
+  NS_IMETHOD IsOnCurrentThread(bool* _retval) override;
+  NS_IMETHOD Dispatch(already_AddRefed<nsIRunnable> event,
+                      DispatchFlags flags) override;
+  NS_IMETHOD DispatchFromScript(nsIRunnable* event,
+                                DispatchFlags flags) override;
+  NS_IMETHOD DelayedDispatch(already_AddRefed<nsIRunnable> event,
+                             uint32_t delay) override;
+
+  enum DispatchReason { NormalDispatch, TailDispatch };
+  virtual nsresult Dispatch(already_AddRefed<nsIRunnable> aRunnable,
+                            DispatchReason aReason = NormalDispatch) = 0;
+
+  virtual bool IsCurrentThreadIn() const = 0;
+
+  virtual TaskDispatcher& TailDispatcher() = 0;
+
+  virtual bool MightHaveTailTasks() { return true; }
+
+  virtual bool IsTailDispatcherAvailable() { return true; }
+
+  nsresult TailDispatchTasksFor(AbstractThread* aThread);
+  bool HasTailTasksFor(AbstractThread* aThread);
+
+  bool SupportsTailDispatch() const { return mSupportsTailDispatch; }
+
+  bool RequiresTailDispatch(AbstractThread* aThread) const;
+  bool RequiresTailDispatchFromCurrentThread() const;
+
+  virtual nsIEventTarget* AsEventTarget() { MOZ_CRASH("Not an event target!"); }
+
+  static AbstractThread* MainThread();
+
+  static void InitTLS();
+  static void InitMainThread();
+  static void ShutdownMainThread();
+
+  void DispatchStateChange(already_AddRefed<nsIRunnable> aRunnable);
+
+  static void DispatchDirectTask(already_AddRefed<nsIRunnable> aRunnable);
+
+ protected:
+  virtual ~AbstractThread() = default;
+  static MOZ_THREAD_LOCAL(AbstractThread*) sCurrentThreadTLS;
+
+  const bool mSupportsTailDispatch;
+};
+
+}  
+
+#endif

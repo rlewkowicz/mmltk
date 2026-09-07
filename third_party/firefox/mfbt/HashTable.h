@@ -1,0 +1,1753 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_HashTable_h
+#define mozilla_HashTable_h
+
+#include <bit>
+#include <utility>
+#include <type_traits>
+
+#include "mozilla/AllocPolicy.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/Casting.h"
+#include "mozilla/HashFunctions.h"
+#include "mozilla/MathAlgorithms.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/MemoryChecking.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/Opaque.h"
+#include "mozilla/OperatorNewExtensions.h"
+#include "mozilla/ReentrancyGuard.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/WrappingOperations.h"
+
+namespace mozilla {
+
+template <class, class = void>
+struct DefaultHasher;
+
+template <class, class>
+class HashMapEntry;
+
+namespace detail {
+
+template <typename T>
+class HashTableEntry;
+
+template <class T, class HashPolicy, class AllocPolicy>
+class HashTable;
+
+}  
+
+using Generation = Opaque<uint64_t>;
+
+
+template <class Key, class Value, class HashPolicy = DefaultHasher<Key>,
+          class AllocPolicy = MallocAllocPolicy>
+class MOZ_STANDALONE_DEBUG HashMap {
+
+  HashMap(const HashMap& hm) = delete;
+  HashMap& operator=(const HashMap& hm) = delete;
+
+  using TableEntry = HashMapEntry<Key, Value>;
+
+  struct MapHashPolicy : HashPolicy {
+    using Base = HashPolicy;
+    using KeyType = Key;
+
+    static const Key& getKey(TableEntry& aEntry) { return aEntry.key(); }
+
+    template <typename KeyInput>
+    static void setKey(TableEntry& aEntry, KeyInput&& aKey) {
+      HashPolicy::rekey(aEntry.mutableKey(), std::forward<KeyInput>(aKey));
+    }
+  };
+
+  using Impl = detail::HashTable<TableEntry, MapHashPolicy, AllocPolicy>;
+  Impl mImpl;
+
+ public:
+  using Lookup = typename HashPolicy::Lookup;
+  using Entry = TableEntry;
+
+
+  constexpr explicit HashMap(AllocPolicy aAllocPolicy = AllocPolicy(),
+                             uint32_t aLen = Impl::sDefaultLen)
+      : mImpl(std::move(aAllocPolicy), aLen) {}
+
+  explicit HashMap(uint32_t aLen) : mImpl(AllocPolicy(), aLen) {}
+
+  HashMap(HashMap&& aRhs) = default;
+  HashMap& operator=(HashMap&& aRhs) = default;
+
+  void swap(HashMap& aOther) { mImpl.swap(aOther.mImpl); }
+
+
+  Generation generation() const { return mImpl.generation(); }
+
+  bool empty() const { return mImpl.empty(); }
+
+  uint32_t count() const { return mImpl.count(); }
+
+  uint32_t capacity() const { return mImpl.capacity(); }
+
+  size_t shallowSizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const {
+    return mImpl.shallowSizeOfExcludingThis(aMallocSizeOf);
+  }
+  size_t shallowSizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const {
+    return aMallocSizeOf(this) +
+           mImpl.shallowSizeOfExcludingThis(aMallocSizeOf);
+  }
+
+  void compact() { mImpl.compact(); }
+
+  [[nodiscard]] bool reserve(uint32_t aLen) { return mImpl.reserve(aLen); }
+
+
+  bool has(const Lookup& aLookup) const {
+    return mImpl.lookup(aLookup).found();
+  }
+
+  using Ptr = typename Impl::Ptr;
+  MOZ_ALWAYS_INLINE Ptr lookup(const Lookup& aLookup) const {
+    return mImpl.lookup(aLookup);
+  }
+
+  MOZ_ALWAYS_INLINE Ptr readonlyThreadsafeLookup(const Lookup& aLookup) const {
+    return mImpl.readonlyThreadsafeLookup(aLookup);
+  }
+
+
+  template <typename KeyInput, typename ValueInput>
+  [[nodiscard]] bool put(KeyInput&& aKey, ValueInput&& aValue) {
+    return put(aKey, std::forward<KeyInput>(aKey),
+               std::forward<ValueInput>(aValue));
+  }
+
+  template <typename KeyInput, typename ValueInput>
+  [[nodiscard]] bool put(const Lookup& aLookup, KeyInput&& aKey,
+                         ValueInput&& aValue) {
+    AddPtr p = lookupForAdd(aLookup);
+    if (p) {
+      p->value() = std::forward<ValueInput>(aValue);
+      return true;
+    }
+    return add(p, std::forward<KeyInput>(aKey),
+               std::forward<ValueInput>(aValue));
+  }
+
+  template <typename KeyInput, typename ValueInput>
+  [[nodiscard]] bool putNew(KeyInput&& aKey, ValueInput&& aValue) {
+    return mImpl.putNew(aKey, std::forward<KeyInput>(aKey),
+                        std::forward<ValueInput>(aValue));
+  }
+
+  template <typename KeyInput, typename ValueInput>
+  [[nodiscard]] bool putNew(const Lookup& aLookup, KeyInput&& aKey,
+                            ValueInput&& aValue) {
+    return mImpl.putNew(aLookup, std::forward<KeyInput>(aKey),
+                        std::forward<ValueInput>(aValue));
+  }
+
+  template <typename KeyInput, typename ValueInput>
+  void putNewInfallible(KeyInput&& aKey, ValueInput&& aValue) {
+    mImpl.putNewInfallible(aKey, std::forward<KeyInput>(aKey),
+                           std::forward<ValueInput>(aValue));
+  }
+
+  using AddPtr = typename Impl::AddPtr;
+  MOZ_ALWAYS_INLINE AddPtr lookupForAdd(const Lookup& aLookup) {
+    return mImpl.lookupForAdd(aLookup);
+  }
+
+  template <typename KeyInput, typename ValueInput>
+  [[nodiscard]] bool add(AddPtr& aPtr, KeyInput&& aKey, ValueInput&& aValue) {
+    return mImpl.add(aPtr, std::forward<KeyInput>(aKey),
+                     std::forward<ValueInput>(aValue));
+  }
+
+  template <typename KeyInput, typename ValueInput>
+  [[nodiscard]] bool relookupOrAdd(AddPtr& aPtr, KeyInput&& aKey,
+                                   ValueInput&& aValue) {
+    return mImpl.relookupOrAdd(aPtr, aKey, std::forward<KeyInput>(aKey),
+                               std::forward<ValueInput>(aValue));
+  }
+
+
+  void remove(const Lookup& aLookup) {
+    if (Ptr p = lookup(aLookup)) {
+      remove(p);
+    }
+  }
+
+  void remove(Ptr aPtr) { mImpl.remove(aPtr); }
+
+  void clear() { mImpl.clear(); }
+
+  void clearAndCompact() { mImpl.clearAndCompact(); }
+
+
+  void rekeyIfMoved(const Lookup& aOldKey, const Lookup& aNewKeyInput) {
+    if (aOldKey != aNewKeyInput) {
+      rekeyAs(aOldKey, aNewKeyInput, aNewKeyInput);
+    }
+  }
+
+  template <typename KeyInput>
+  bool rekeyAs(const Lookup& aOldLookup, const Lookup& aNewLookup,
+               KeyInput&& aNewKey) {
+    if (Ptr p = lookup(aOldLookup)) {
+      mImpl.rekeyAndMaybeRehash(p, aNewLookup, std::forward<KeyInput>(aNewKey));
+      return true;
+    }
+    return false;
+  }
+
+
+  using Iterator = typename Impl::Iterator;
+  Iterator iter() const { return mImpl.iter(); }
+
+  using ModIterator = typename Impl::ModIterator;
+  ModIterator modIter() { return mImpl.modIter(); }
+
+
+  const AllocPolicy& allocPolicy() const { return mImpl.allocPolicy(); }
+  AllocPolicy& allocPolicy() { return mImpl.allocPolicy(); }
+
+  template <typename F>
+  void traceOwnedAllocs(F&& aTraceFunc) {
+    mImpl.traceOwnedAllocs(std::forward<F>(aTraceFunc));
+  }
+
+
+  static size_t offsetOfHashShift() {
+    return offsetof(HashMap, mImpl) + Impl::offsetOfHashShift();
+  }
+  static size_t offsetOfTable() {
+    return offsetof(HashMap, mImpl) + Impl::offsetOfTable();
+  }
+  static size_t offsetOfEntryCount() {
+    return offsetof(HashMap, mImpl) + Impl::offsetOfEntryCount();
+  }
+};
+
+
+template <class T, class HashPolicy = DefaultHasher<T>,
+          class AllocPolicy = MallocAllocPolicy>
+class HashSet {
+
+  HashSet(const HashSet& hs) = delete;
+  HashSet& operator=(const HashSet& hs) = delete;
+
+  struct SetHashPolicy : HashPolicy {
+    using Base = HashPolicy;
+    using KeyType = T;
+
+    static const KeyType& getKey(const T& aT) { return aT; }
+
+    template <typename KeyInput>
+    static void setKey(T& aT, KeyInput&& aKey) {
+      HashPolicy::rekey(aT, std::forward<KeyInput>(aKey));
+    }
+  };
+
+  using Impl = detail::HashTable<const T, SetHashPolicy, AllocPolicy>;
+  Impl mImpl;
+
+ public:
+  using Lookup = typename HashPolicy::Lookup;
+  using Entry = T;
+
+
+  explicit HashSet(AllocPolicy aAllocPolicy = AllocPolicy(),
+                   uint32_t aLen = Impl::sDefaultLen)
+      : mImpl(std::move(aAllocPolicy), aLen) {}
+
+  explicit HashSet(uint32_t aLen) : mImpl(AllocPolicy(), aLen) {}
+
+  HashSet(HashSet&& aRhs) = default;
+  HashSet& operator=(HashSet&& aRhs) = default;
+
+  void swap(HashSet& aOther) { mImpl.swap(aOther.mImpl); }
+
+
+  Generation generation() const { return mImpl.generation(); }
+
+  bool empty() const { return mImpl.empty(); }
+
+  uint32_t count() const { return mImpl.count(); }
+
+  uint32_t capacity() const { return mImpl.capacity(); }
+
+  size_t shallowSizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const {
+    return mImpl.shallowSizeOfExcludingThis(aMallocSizeOf);
+  }
+  size_t shallowSizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const {
+    return aMallocSizeOf(this) +
+           mImpl.shallowSizeOfExcludingThis(aMallocSizeOf);
+  }
+
+  void compact() { mImpl.compact(); }
+
+  [[nodiscard]] bool reserve(uint32_t aLen) { return mImpl.reserve(aLen); }
+
+
+  bool has(const Lookup& aLookup) const {
+    return mImpl.lookup(aLookup).found();
+  }
+
+  using Ptr = typename Impl::Ptr;
+  MOZ_ALWAYS_INLINE Ptr lookup(const Lookup& aLookup) const {
+    return mImpl.lookup(aLookup);
+  }
+
+  MOZ_ALWAYS_INLINE Ptr readonlyThreadsafeLookup(const Lookup& aLookup) const {
+    return mImpl.readonlyThreadsafeLookup(aLookup);
+  }
+
+
+  template <typename U>
+  [[nodiscard]] bool put(U&& aU) {
+    AddPtr p = lookupForAdd(aU);
+    return p ? true : add(p, std::forward<U>(aU));
+  }
+
+  template <typename U>
+  [[nodiscard]] bool putNew(U&& aU) {
+    return mImpl.putNew(aU, std::forward<U>(aU));
+  }
+
+  template <typename U>
+  [[nodiscard]] bool putNew(const Lookup& aLookup, U&& aU) {
+    return mImpl.putNew(aLookup, std::forward<U>(aU));
+  }
+
+  template <typename U>
+  void putNewInfallible(const Lookup& aLookup, U&& aU) {
+    mImpl.putNewInfallible(aLookup, std::forward<U>(aU));
+  }
+
+  using AddPtr = typename Impl::AddPtr;
+  MOZ_ALWAYS_INLINE AddPtr lookupForAdd(const Lookup& aLookup) {
+    return mImpl.lookupForAdd(aLookup);
+  }
+
+  template <typename U>
+  [[nodiscard]] bool add(AddPtr& aPtr, U&& aU) {
+    return mImpl.add(aPtr, std::forward<U>(aU));
+  }
+
+  template <typename U>
+  [[nodiscard]] bool relookupOrAdd(AddPtr& aPtr, const Lookup& aLookup,
+                                   U&& aU) {
+    return mImpl.relookupOrAdd(aPtr, aLookup, std::forward<U>(aU));
+  }
+
+
+  void remove(const Lookup& aLookup) {
+    if (Ptr p = lookup(aLookup)) {
+      remove(p);
+    }
+  }
+
+  void remove(Ptr aPtr) { mImpl.remove(aPtr); }
+
+  void clear() { mImpl.clear(); }
+
+  void clearAndCompact() { mImpl.clearAndCompact(); }
+
+
+  void rekeyIfMoved(const Lookup& aOldValue, const Lookup& aNewValue) {
+    if (aOldValue != aNewValue) {
+      rekeyAs(aOldValue, aNewValue, aNewValue);
+    }
+  }
+
+  template <typename U>
+  bool rekeyAs(const Lookup& aOldLookup, const Lookup& aNewLookup,
+               U&& aNewValue) {
+    if (Ptr p = lookup(aOldLookup)) {
+      mImpl.rekeyAndMaybeRehash(p, aNewLookup, std::forward<U>(aNewValue));
+      return true;
+    }
+    return false;
+  }
+
+  template <typename U>
+  void replaceKey(Ptr aPtr, const Lookup& aLookup, U&& aNewValue) {
+    MOZ_ASSERT(aPtr.found());
+    MOZ_ASSERT(HashPolicy::match(*aPtr, aLookup));
+    MOZ_ASSERT(*aPtr != aNewValue);
+    const_cast<T&>(*aPtr) = std::forward<U>(aNewValue);
+    MOZ_ASSERT(*lookup(aLookup) == aNewValue);
+  }
+  void replaceKey(Ptr aPtr, const T& aNewValue) {
+    replaceKey(aPtr, aNewValue, aNewValue);
+  }
+
+
+  using Iterator = typename Impl::Iterator;
+  Iterator iter() const { return mImpl.iter(); }
+
+  using ModIterator = typename Impl::ModIterator;
+  ModIterator modIter() { return mImpl.modIter(); }
+
+
+  const AllocPolicy& allocPolicy() const { return mImpl.allocPolicy(); }
+  AllocPolicy& allocPolicy() { return mImpl.allocPolicy(); }
+
+  template <typename F>
+  void traceOwnedAllocs(F&& aTraceFunc) {
+    mImpl.traceOwnedAllocs(std::forward<F>(aTraceFunc));
+  }
+};
+
+
+
+template <typename Key>
+struct PointerHasher {
+  static_assert(std::is_pointer_v<Key>);
+
+  using Lookup = Key;
+
+  static HashNumber hash(const Lookup& aLookup) { return HashGeneric(aLookup); }
+
+  static bool match(const Key& aKey, const Lookup& aLookup) {
+    return aKey == aLookup;
+  }
+
+  static void rekey(Key& aKey, const Key& aNewKey) { aKey = aNewKey; }
+};
+
+template <class Key, typename>
+struct DefaultHasher {
+  using Lookup = Key;
+
+  static HashNumber hash(const Lookup& aLookup) {
+    return aLookup;
+  }
+
+  static bool match(const Key& aKey, const Lookup& aLookup) {
+    return aKey == aLookup;
+  }
+
+  static void rekey(Key& aKey, const Key& aNewKey) { aKey = aNewKey; }
+};
+
+template <class T>
+struct DefaultHasher<T, std::enable_if_t<std::is_enum_v<T>>> {
+  using Key = T;
+  using Lookup = Key;
+
+  static HashNumber hash(const Lookup& aLookup) { return HashGeneric(aLookup); }
+
+  static bool match(const Key& aKey, const Lookup& aLookup) {
+    return aKey == static_cast<Key>(aLookup);
+  }
+
+  static void rekey(Key& aKey, const Key& aNewKey) { aKey = aNewKey; }
+};
+
+template <class T>
+struct DefaultHasher<T*> : PointerHasher<T*> {};
+
+template <class T, class D>
+struct DefaultHasher<UniquePtr<T, D>> {
+  using Key = UniquePtr<T, D>;
+  using Lookup = Key;
+  using PtrHasher = PointerHasher<T*>;
+
+  static HashNumber hash(const Lookup& aLookup) {
+    return PtrHasher::hash(aLookup.get());
+  }
+
+  static bool match(const Key& aKey, const Lookup& aLookup) {
+    return PtrHasher::match(aKey.get(), aLookup.get());
+  }
+
+  static void rekey(Key& aKey, Key&& aNewKey) { aKey = std::move(aNewKey); }
+};
+
+template <>
+struct DefaultHasher<double> {
+  using Key = double;
+  using Lookup = Key;
+
+  static HashNumber hash(const Lookup& aLookup) {
+    static_assert(sizeof(HashNumber) == 4,
+                  "subsequent code assumes a four-byte hash");
+    uint64_t u = BitwiseCast<uint64_t>(aLookup);
+    return HashNumber(u ^ (u >> 32));
+  }
+
+  static bool match(const Key& aKey, const Lookup& aLookup) {
+    return BitwiseCast<uint64_t>(aKey) == BitwiseCast<uint64_t>(aLookup);
+  }
+};
+
+template <>
+struct DefaultHasher<float> {
+  using Key = float;
+  using Lookup = Key;
+
+  static HashNumber hash(const Lookup& aLookup) {
+    static_assert(sizeof(HashNumber) == 4,
+                  "subsequent code assumes a four-byte hash");
+    return HashNumber(BitwiseCast<uint32_t>(aLookup));
+  }
+
+  static bool match(const Key& aKey, const Lookup& aLookup) {
+    return BitwiseCast<uint32_t>(aKey) == BitwiseCast<uint32_t>(aLookup);
+  }
+};
+
+struct CStringHasher {
+  using Key = const char*;
+  using Lookup = const char*;
+
+  static HashNumber hash(const Lookup& aLookup) {
+    return HashString(aLookup, strlen(aLookup));
+  }
+
+  static bool match(const Key& aKey, const Lookup& aLookup) {
+    return strcmp(aKey, aLookup) == 0;
+  }
+};
+
+
+template <typename HashPolicy>
+struct FallibleHashMethods {
+  template <typename Lookup>
+  static bool maybeGetHash(Lookup&& aLookup, HashNumber* aHashOut) {
+    *aHashOut = HashPolicy::hash(aLookup);
+    return true;
+  }
+
+  template <typename Lookup>
+  static bool ensureHash(Lookup&& aLookup, HashNumber* aHashOut) {
+    *aHashOut = HashPolicy::hash(aLookup);
+    return true;
+  }
+};
+
+template <typename HashPolicy, typename Lookup>
+static bool MaybeGetHash(Lookup&& aLookup, HashNumber* aHashOut) {
+  return FallibleHashMethods<typename HashPolicy::Base>::maybeGetHash(
+      std::forward<Lookup>(aLookup), aHashOut);
+}
+
+template <typename HashPolicy, typename Lookup>
+static bool EnsureHash(Lookup&& aLookup, HashNumber* aHashOut) {
+  return FallibleHashMethods<typename HashPolicy::Base>::ensureHash(
+      std::forward<Lookup>(aLookup), aHashOut);
+}
+
+
+
+template <class Key, class Value>
+class HashMapEntry {
+  Key key_;
+  Value value_;
+
+  template <class, class, class>
+  friend class detail::HashTable;
+  template <class>
+  friend class detail::HashTableEntry;
+  template <class, class, class, class>
+  friend class HashMap;
+
+ public:
+  template <typename KeyInput, typename ValueInput>
+  HashMapEntry(KeyInput&& aKey, ValueInput&& aValue)
+      : key_(std::forward<KeyInput>(aKey)),
+        value_(std::forward<ValueInput>(aValue)) {}
+
+  HashMapEntry(HashMapEntry&& aRhs) = default;
+  HashMapEntry& operator=(HashMapEntry&& aRhs) = default;
+
+  using KeyType = Key;
+  using ValueType = Value;
+
+  const Key& key() const { return key_; }
+
+  Key& mutableKey() { return key_; }
+
+  const Value& value() const { return value_; }
+  Value& value() { return value_; }
+
+  static size_t offsetOfKey() { return offsetof(HashMapEntry, key_); }
+  static size_t offsetOfValue() { return offsetof(HashMapEntry, value_); }
+
+ private:
+  HashMapEntry(const HashMapEntry&) = delete;
+  void operator=(const HashMapEntry&) = delete;
+};
+
+namespace detail {
+
+static const HashNumber kHashTableFreeKey = 0;
+static const HashNumber kHashTableRemovedKey = 1;
+static const HashNumber kHashTableCollisionBit = 1;
+
+template <class T, class HashPolicy, class AllocPolicy>
+class HashTable;
+
+template <typename T>
+class EntrySlot;
+
+template <typename T>
+class HashTableEntry {
+ private:
+  using NonConstT = std::remove_const_t<T>;
+
+
+  static constexpr size_t kMinimumAlignment = 8;
+
+  static_assert(alignof(HashNumber) <= kMinimumAlignment,
+                "[N*2 hashes, N*2 T values] allocation's alignment must be "
+                "enough to align each hash");
+  static_assert(alignof(NonConstT) <= 2 * sizeof(HashNumber),
+                "subsequent N*2 T values must not require more than an even "
+                "number of HashNumbers provides");
+
+  static const HashNumber sFreeKey = kHashTableFreeKey;
+  static const HashNumber sRemovedKey = kHashTableRemovedKey;
+  static const HashNumber sCollisionBit = kHashTableCollisionBit;
+
+  alignas(NonConstT) unsigned char mValueData[sizeof(NonConstT)];
+
+ private:
+  template <class, class, class>
+  friend class HashTable;
+  template <typename>
+  friend class EntrySlot;
+
+  void* rawValuePtr() { return mValueData; }
+
+  static bool isLiveHash(HashNumber hash) { return hash > sRemovedKey; }
+
+  HashTableEntry(const HashTableEntry&) = delete;
+  void operator=(const HashTableEntry&) = delete;
+
+  NonConstT* valuePtr() { return reinterpret_cast<NonConstT*>(rawValuePtr()); }
+
+  void destroyStoredT() {
+    NonConstT* ptr = valuePtr();
+    ptr->~T();
+    MOZ_MAKE_MEM_UNDEFINED(ptr, sizeof(*ptr));
+  }
+
+ public:
+  HashTableEntry() = default;
+
+  ~HashTableEntry() { MOZ_MAKE_MEM_UNDEFINED(this, sizeof(*this)); }
+
+  void destroy() { destroyStoredT(); }
+
+  void swap(HashTableEntry* aOther, bool aOtherIsLive) {
+    using std::swap;
+
+    if (this == aOther) {
+      return;
+    }
+    if (aOtherIsLive) {
+      swap(*valuePtr(), *aOther->valuePtr());
+    } else {
+      new (KnownNotNull, aOther->valuePtr()) NonConstT(std::move(*valuePtr()));
+      destroy();
+    }
+  }
+
+  T& get() { return *valuePtr(); }
+
+  NonConstT& getMutable() { return *valuePtr(); }
+};
+
+template <class T>
+class EntrySlot {
+  using NonConstT = std::remove_const_t<T>;
+
+  using Entry = HashTableEntry<T>;
+
+  Entry* mEntry;
+  HashNumber* mKeyHash;
+
+  template <class, class, class>
+  friend class HashTable;
+
+  EntrySlot(Entry* aEntry, HashNumber* aKeyHash)
+      : mEntry(aEntry), mKeyHash(aKeyHash) {}
+
+ public:
+  static bool isLiveHash(HashNumber hash) { return hash > Entry::sRemovedKey; }
+
+  EntrySlot(const EntrySlot&) = default;
+  EntrySlot(EntrySlot&& aOther) = default;
+
+  EntrySlot& operator=(const EntrySlot&) = default;
+  EntrySlot& operator=(EntrySlot&&) = default;
+
+  bool operator==(const EntrySlot& aRhs) const { return mEntry == aRhs.mEntry; }
+
+  bool operator<(const EntrySlot& aRhs) const { return mEntry < aRhs.mEntry; }
+
+  EntrySlot& operator++() {
+    ++mEntry;
+    ++mKeyHash;
+    return *this;
+  }
+
+  void destroy() { mEntry->destroy(); }
+
+  void swap(EntrySlot& aOther) {
+    mEntry->swap(aOther.mEntry, aOther.isLive());
+    std::swap(*mKeyHash, *aOther.mKeyHash);
+  }
+
+  T& get() const { return mEntry->get(); }
+
+  NonConstT& getMutable() { return mEntry->getMutable(); }
+
+  bool isFree() const { return *mKeyHash == Entry::sFreeKey; }
+
+  void clearLive() {
+    MOZ_ASSERT(isLive());
+    *mKeyHash = Entry::sFreeKey;
+    mEntry->destroyStoredT();
+  }
+
+  void clear() {
+    if (isLive()) {
+      mEntry->destroyStoredT();
+    }
+    MOZ_MAKE_MEM_UNDEFINED(mEntry, sizeof(*mEntry));
+    *mKeyHash = Entry::sFreeKey;
+  }
+
+  bool isRemoved() const { return *mKeyHash == Entry::sRemovedKey; }
+
+  void removeLive() {
+    MOZ_ASSERT(isLive());
+    *mKeyHash = Entry::sRemovedKey;
+    mEntry->destroyStoredT();
+  }
+
+  bool isLive() const { return isLiveHash(*mKeyHash); }
+
+  void setCollision() {
+    MOZ_ASSERT(isLive());
+    *mKeyHash |= Entry::sCollisionBit;
+  }
+  void unsetCollision() { *mKeyHash &= ~Entry::sCollisionBit; }
+  bool hasCollision() const { return *mKeyHash & Entry::sCollisionBit; }
+  bool matchHash(HashNumber hn) {
+    return (*mKeyHash & ~Entry::sCollisionBit) == hn;
+  }
+  HashNumber getKeyHash() const { return *mKeyHash & ~Entry::sCollisionBit; }
+
+  template <typename... Args>
+  void setLive(HashNumber aHashNumber, Args&&... aArgs) {
+    MOZ_ASSERT(!isLive());
+    *mKeyHash = aHashNumber;
+    new (KnownNotNull, mEntry->valuePtr()) T(std::forward<Args>(aArgs)...);
+    MOZ_ASSERT(isLive());
+  }
+
+  Entry* toEntry() const { return mEntry; }
+};
+
+template <class T, class HashPolicy, class AllocPolicy>
+class MOZ_STANDALONE_DEBUG HashTable : private AllocPolicy {
+  friend class mozilla::ReentrancyGuard;
+
+  using NonConstT = std::remove_const_t<T>;
+  using Key = typename HashPolicy::KeyType;
+  using Lookup = typename HashPolicy::Lookup;
+
+ public:
+  using Entry = HashTableEntry<T>;
+  using Slot = EntrySlot<T>;
+
+  template <typename F>
+  static void forEachSlot(char* aTable, uint32_t aCapacity, F&& f) {
+    auto hashes = reinterpret_cast<HashNumber*>(aTable);
+    auto entries = reinterpret_cast<Entry*>(&hashes[aCapacity]);
+    Slot slot(entries, hashes);
+    for (size_t i = 0; i < size_t(aCapacity); ++i) {
+      f(slot);
+      ++slot;
+    }
+  }
+
+  class Ptr {
+    friend class HashTable;
+
+    Slot mSlot;
+#ifdef DEBUG
+    const HashTable* mTable;
+    Generation mGeneration;
+#endif
+
+   protected:
+    Ptr(Slot aSlot, const HashTable& aTable)
+        : mSlot(aSlot)
+#ifdef DEBUG
+          ,
+          mTable(&aTable),
+          mGeneration(aTable.generation())
+#endif
+    {
+    }
+
+    explicit Ptr(const HashTable& aTable)
+        : mSlot(nullptr, nullptr)
+#ifdef DEBUG
+          ,
+          mTable(&aTable),
+          mGeneration(aTable.generation())
+#endif
+    {
+    }
+
+    bool isValid() const { return !!mSlot.toEntry(); }
+
+   public:
+    Ptr()
+        : mSlot(nullptr, nullptr)
+#ifdef DEBUG
+          ,
+          mTable(nullptr),
+          mGeneration(0)
+#endif
+    {
+    }
+
+    bool found() const {
+      if (!isValid()) {
+        return false;
+      }
+#ifdef DEBUG
+      MOZ_ASSERT(mGeneration == mTable->generation());
+#endif
+      return mSlot.isLive();
+    }
+
+    explicit operator bool() const { return found(); }
+
+    bool operator==(const Ptr& aRhs) const {
+      MOZ_ASSERT(found() && aRhs.found());
+      return mSlot == aRhs.mSlot;
+    }
+
+    bool operator!=(const Ptr& aRhs) const {
+#ifdef DEBUG
+      MOZ_ASSERT(mGeneration == mTable->generation());
+#endif
+      return !(*this == aRhs);
+    }
+
+    T& operator*() const {
+#ifdef DEBUG
+      MOZ_ASSERT(found());
+      MOZ_ASSERT(mGeneration == mTable->generation());
+#endif
+      return mSlot.get();
+    }
+
+    T* operator->() const {
+#ifdef DEBUG
+      MOZ_ASSERT(found());
+      MOZ_ASSERT(mGeneration == mTable->generation());
+#endif
+      return &mSlot.get();
+    }
+  };
+
+  class AddPtr : public Ptr {
+    friend class HashTable;
+
+    HashNumber mKeyHash;
+#ifdef DEBUG
+    uint64_t mMutationCount;
+#endif
+
+    AddPtr(Slot aSlot, const HashTable& aTable, HashNumber aHashNumber)
+        : Ptr(aSlot, aTable),
+          mKeyHash(aHashNumber)
+#ifdef DEBUG
+          ,
+          mMutationCount(aTable.mMutationCount)
+#endif
+    {
+    }
+
+    AddPtr(const HashTable& aTable, HashNumber aHashNumber)
+        : Ptr(aTable),
+          mKeyHash(aHashNumber)
+#ifdef DEBUG
+          ,
+          mMutationCount(aTable.mMutationCount)
+#endif
+    {
+      MOZ_ASSERT(isLive());
+    }
+
+    bool isLive() const { return isLiveHash(mKeyHash); }
+
+   public:
+    AddPtr() : mKeyHash(0) {}
+  };
+
+  class Iterator {
+    void moveToNextLiveEntry() {
+      while (++mCur < mEnd && !mCur.isLive()) {
+        continue;
+      }
+    }
+
+   protected:
+    friend class HashTable;
+
+    explicit Iterator(const HashTable& aTable)
+        : mCur(aTable.slotForIndex(0)),
+          mEnd(aTable.slotForIndex(aTable.capacity()))
+#ifdef DEBUG
+          ,
+          mTable(aTable),
+          mMutationCount(aTable.mMutationCount),
+          mGeneration(aTable.generation()),
+          mValidEntry(true)
+#endif
+    {
+      if (!done() && !mCur.isLive()) {
+        moveToNextLiveEntry();
+      }
+    }
+
+    Slot mCur;
+    Slot mEnd;
+#ifdef DEBUG
+    const HashTable& mTable;
+    uint64_t mMutationCount;
+    Generation mGeneration;
+    bool mValidEntry;
+#endif
+
+   public:
+    bool done() const {
+      MOZ_ASSERT(mGeneration == mTable.generation());
+      MOZ_ASSERT(mMutationCount == mTable.mMutationCount);
+      return mCur == mEnd;
+    }
+
+    T& get() const {
+      MOZ_ASSERT(!done());
+      MOZ_ASSERT(mValidEntry);
+      MOZ_ASSERT(mGeneration == mTable.generation());
+      MOZ_ASSERT(mMutationCount == mTable.mMutationCount);
+      return mCur.get();
+    }
+
+    void next() {
+      MOZ_ASSERT(!done());
+      MOZ_ASSERT(mGeneration == mTable.generation());
+      MOZ_ASSERT(mMutationCount == mTable.mMutationCount);
+      moveToNextLiveEntry();
+#ifdef DEBUG
+      mValidEntry = true;
+#endif
+    }
+  };
+
+  class ModIterator : public Iterator {
+    friend class HashTable;
+
+    HashTable& mTable;
+    bool mRekeyed;
+    bool mRemoved;
+
+    ModIterator(const ModIterator&) = delete;
+    void operator=(const ModIterator&) = delete;
+
+   protected:
+    explicit ModIterator(HashTable& aTable)
+        : Iterator(aTable), mTable(aTable), mRekeyed(false), mRemoved(false) {}
+
+   public:
+    MOZ_IMPLICIT ModIterator(ModIterator&& aOther)
+        : Iterator(aOther),
+          mTable(aOther.mTable),
+          mRekeyed(aOther.mRekeyed),
+          mRemoved(aOther.mRemoved) {
+      aOther.mRekeyed = false;
+      aOther.mRemoved = false;
+    }
+
+    void remove() {
+      mTable.remove(this->mCur);
+      mRemoved = true;
+#ifdef DEBUG
+      this->mValidEntry = false;
+      this->mMutationCount = mTable.mMutationCount;
+#endif
+    }
+
+    NonConstT& getMutable() {
+      MOZ_ASSERT(!this->done());
+      MOZ_ASSERT(this->mValidEntry);
+      MOZ_ASSERT(this->mGeneration == this->Iterator::mTable.generation());
+      MOZ_ASSERT(this->mMutationCount == this->Iterator::mTable.mMutationCount);
+      return this->mCur.getMutable();
+    }
+
+    template <typename KeyInput>
+    void rekey(const Lookup& l, KeyInput&& k) {
+      MOZ_ASSERT(
+          static_cast<const void*>(&k) !=
+              static_cast<const void*>(&HashPolicy::getKey(this->mCur.get())),
+          "Don't pass a reference into the table here");
+      Ptr p(this->mCur, mTable);
+      mTable.rekeyWithoutRehash(p, l, std::forward<KeyInput>(k));
+      mRekeyed = true;
+#ifdef DEBUG
+      this->mValidEntry = false;
+      this->mMutationCount = mTable.mMutationCount;
+#endif
+    }
+
+    void rekey(const Lookup& l) { rekey(l, l); }
+
+    ~ModIterator() {
+      if (mRekeyed) {
+        mTable.incrementGeneration();
+        mTable.infallibleRehashIfOverloaded();
+      }
+
+      if (mRemoved) {
+        mTable.shrinkToBestCapacity();
+      }
+    }
+  };
+
+  HashTable(HashTable&& aRhs) : AllocPolicy(std::move(aRhs)) { moveFrom(aRhs); }
+  HashTable& operator=(HashTable&& aRhs) {
+    MOZ_ASSERT(this != &aRhs, "self-move assignment is prohibited");
+    if (mTable) {
+      destroyTable(*this, mTable, capacity());
+    }
+    AllocPolicy::operator=(std::move(aRhs));
+    moveFrom(aRhs);
+    return *this;
+  }
+
+  void swap(HashTable& aOther) {
+    ReentrancyGuard g1(*this);
+    ReentrancyGuard g2(aOther);
+
+    std::swap(mGenAndHashShift, aOther.mGenAndHashShift);
+    std::swap(mTable, aOther.mTable);
+    std::swap(mEntryCount, aOther.mEntryCount);
+    std::swap(mRemovedCount, aOther.mRemovedCount);
+#ifdef DEBUG
+    std::swap(mMutationCount, aOther.mMutationCount);
+    std::swap(mEntered, aOther.mEntered);
+#endif
+  }
+
+  AllocPolicy& allocPolicy() { return *this; }
+  const AllocPolicy& allocPolicy() const { return *this; }
+
+  template <typename F>
+  void traceOwnedAllocs(F&& aTraceFunc) {
+    if (mTable) {
+      aTraceFunc(&mTable);
+    }
+  }
+
+ private:
+  void moveFrom(HashTable& aRhs) {
+    mGenAndHashShift = aRhs.mGenAndHashShift;
+    mTable = aRhs.mTable;
+    mEntryCount = aRhs.mEntryCount;
+    mRemovedCount = aRhs.mRemovedCount;
+#ifdef DEBUG
+    mMutationCount = aRhs.mMutationCount;
+    mEntered = aRhs.mEntered;
+#endif
+    aRhs.mTable = nullptr;
+    aRhs.clearAndCompact();
+  }
+
+  HashTable(const HashTable&) = delete;
+  void operator=(const HashTable&) = delete;
+
+  static const uint32_t CAP_BITS = 30;
+
+ public:
+  uint64_t mGenAndHashShift;  
+  char* mTable;               
+  uint32_t mEntryCount;       
+  uint32_t mRemovedCount;     
+
+#ifdef DEBUG
+  uint64_t mMutationCount;
+  mutable bool mEntered;
+#endif
+
+  static const uint32_t sDefaultLen = 16;
+  static const uint32_t sMinCapacity = 4;
+  static_assert(sMinCapacity >= 4, "too-small sMinCapacity breaks assumptions");
+  static const uint32_t sMaxInit = 1u << (CAP_BITS - 1);
+  static const uint32_t sMaxCapacity = 1u << CAP_BITS;
+
+  static const uint8_t sAlphaDenominator = 4;
+  static const uint8_t sMinAlphaNumerator = 1;  
+  static const uint8_t sMaxAlphaNumerator = 3;  
+
+  static const HashNumber sFreeKey = Entry::sFreeKey;
+  static const HashNumber sRemovedKey = Entry::sRemovedKey;
+  static const HashNumber sCollisionBit = Entry::sCollisionBit;
+
+  static const uint64_t sHashShiftBits = 8;
+  static const uint64_t sHashShiftMask = (1 << sHashShiftBits) - 1;
+  static const uint64_t sGenerationShift = sHashShiftBits;
+
+  MOZ_ALWAYS_INLINE uint8_t hashShift() const {
+    return uint8_t(mGenAndHashShift & sHashShiftMask);
+  }
+  MOZ_ALWAYS_INLINE uint64_t gen() const {
+    return mGenAndHashShift >> sGenerationShift;
+  }
+
+ private:
+  void setGenAndHashShift(uint64_t aGeneration, uint8_t aHashShift) {
+    mGenAndHashShift = aGeneration << sGenerationShift | aHashShift;
+  }
+
+ public:
+  void incrementGeneration() { setGenAndHashShift(gen() + 1, hashShift()); }
+  void setHashShift(uint32_t aHashShift) {
+    MOZ_ASSERT((aHashShift & sHashShiftMask) == aHashShift);
+    mGenAndHashShift = (mGenAndHashShift & ~sHashShiftMask) | aHashShift;
+  }
+
+  constexpr static uint32_t bestCapacity(uint32_t aLen) {
+    static_assert(
+        (sMaxInit * sAlphaDenominator) / sAlphaDenominator == sMaxInit,
+        "multiplication in numerator below could overflow");
+    static_assert(
+        sMaxInit * sAlphaDenominator <= UINT32_MAX - sMaxAlphaNumerator,
+        "numerator calculation below could potentially overflow");
+
+    MOZ_ASSERT(aLen <= sMaxInit);
+
+    uint32_t capacity = (aLen * sAlphaDenominator + sMaxAlphaNumerator - 1) /
+                        sMaxAlphaNumerator;
+    capacity = (capacity < sMinCapacity) ? sMinCapacity : RoundUpPow2(capacity);
+
+    MOZ_ASSERT(capacity >= aLen);
+    MOZ_ASSERT(capacity <= sMaxCapacity);
+
+    return capacity;
+  }
+
+  constexpr static uint32_t hashShiftForLength(uint32_t aLen) {
+    if (MOZ_UNLIKELY(aLen > sMaxInit)) {
+      MOZ_CRASH("initial length is too large");
+    }
+
+    return kHashNumberBits - mozilla::CeilingLog2(bestCapacity(aLen));
+  }
+
+  static bool isLiveHash(HashNumber aHash) { return Entry::isLiveHash(aHash); }
+
+  static HashNumber prepareHash(HashNumber aInputHash) {
+    HashNumber keyHash = ScrambleHashCode(aInputHash);
+
+    if (!isLiveHash(keyHash)) {
+      keyHash -= (sRemovedKey + 1);
+    }
+    return keyHash & ~sCollisionBit;
+  }
+
+  enum FailureBehavior { DontReportFailure = false, ReportFailure = true };
+
+  struct FakeSlot {
+    unsigned char c[sizeof(HashNumber) + sizeof(typename Entry::NonConstT)];
+  };
+
+  static char* createTable(AllocPolicy& aAllocPolicy, uint32_t aCapacity,
+                           FailureBehavior aReportFailure = ReportFailure) {
+    FakeSlot* fake =
+        aReportFailure
+            ? aAllocPolicy.template pod_malloc<FakeSlot>(aCapacity)
+            : aAllocPolicy.template maybe_pod_malloc<FakeSlot>(aCapacity);
+
+    MOZ_ASSERT((reinterpret_cast<uintptr_t>(fake) % Entry::kMinimumAlignment) ==
+               0);
+
+    char* table = reinterpret_cast<char*>(fake);
+    if (table) {
+      forEachSlot(table, aCapacity, [&](Slot& slot) {
+        *slot.mKeyHash = sFreeKey;
+        new (KnownNotNull, slot.toEntry()) Entry();
+      });
+    }
+    return table;
+  }
+
+  static void destroyTable(AllocPolicy& aAllocPolicy, char* aOldTable,
+                           uint32_t aCapacity) {
+    forEachSlot(aOldTable, aCapacity, [&](const Slot& slot) {
+      if (slot.isLive()) {
+        slot.toEntry()->destroyStoredT();
+      }
+    });
+    freeTable(aAllocPolicy, aOldTable, aCapacity);
+  }
+
+  static void freeTable(AllocPolicy& aAllocPolicy, char* aOldTable,
+                        uint32_t aCapacity) {
+    FakeSlot* fake = reinterpret_cast<FakeSlot*>(aOldTable);
+    aAllocPolicy.free_(fake, aCapacity);
+  }
+
+ public:
+  constexpr HashTable(AllocPolicy aAllocPolicy, uint32_t aLen)
+      : AllocPolicy(std::move(aAllocPolicy)),
+        mGenAndHashShift(hashShiftForLength(aLen)),
+        mTable(nullptr),
+        mEntryCount(0),
+        mRemovedCount(0)
+#ifdef DEBUG
+        ,
+        mMutationCount(0),
+        mEntered(false)
+#endif
+  {
+  }
+
+  explicit HashTable(AllocPolicy aAllocPolicy)
+      : HashTable(aAllocPolicy, sDefaultLen) {}
+
+  ~HashTable() {
+    if (mTable) {
+      destroyTable(*this, mTable, capacity());
+    }
+  }
+
+ private:
+  HashNumber hash1(HashNumber aHash0) const { return aHash0 >> hashShift(); }
+
+  struct DoubleHash {
+    HashNumber mHash2;
+    HashNumber mSizeMask;
+  };
+
+  DoubleHash hash2(HashNumber aCurKeyHash) const {
+    uint32_t sizeLog2 = kHashNumberBits - hashShift();
+    DoubleHash dh = {((aCurKeyHash << sizeLog2) >> hashShift()) | 1,
+                     (HashNumber(1) << sizeLog2) - 1};
+    return dh;
+  }
+
+  static HashNumber applyDoubleHash(HashNumber aHash1,
+                                    const DoubleHash& aDoubleHash) {
+    return WrappingSubtract(aHash1, aDoubleHash.mHash2) & aDoubleHash.mSizeMask;
+  }
+
+  static MOZ_ALWAYS_INLINE bool match(T& aEntry, const Lookup& aLookup) {
+    return HashPolicy::match(HashPolicy::getKey(aEntry), aLookup);
+  }
+
+  enum LookupReason { ForNonAdd, ForAdd };
+
+  Slot slotForIndex(HashNumber aIndex) const {
+    auto hashes = reinterpret_cast<HashNumber*>(mTable);
+    auto entries = reinterpret_cast<Entry*>(&hashes[capacity()]);
+    return Slot(&entries[aIndex], &hashes[aIndex]);
+  }
+
+  template <LookupReason Reason>
+  MOZ_ALWAYS_INLINE Slot lookup(const Lookup& aLookup,
+                                HashNumber aKeyHash) const {
+    MOZ_ASSERT(isLiveHash(aKeyHash));
+    MOZ_ASSERT(!(aKeyHash & sCollisionBit));
+    MOZ_ASSERT(mTable);
+
+    HashNumber h1 = hash1(aKeyHash);
+    Slot slot = slotForIndex(h1);
+
+    if (slot.isFree()) {
+      return slot;
+    }
+
+    if (slot.matchHash(aKeyHash) && match(slot.get(), aLookup)) {
+      return slot;
+    }
+
+    DoubleHash dh = hash2(aKeyHash);
+
+    Maybe<Slot> firstRemoved;
+
+    while (true) {
+      if (Reason == ForAdd && !firstRemoved) {
+        if (MOZ_UNLIKELY(slot.isRemoved())) {
+          firstRemoved.emplace(slot);
+        } else {
+          slot.setCollision();
+        }
+      }
+
+      h1 = applyDoubleHash(h1, dh);
+
+      slot = slotForIndex(h1);
+      if (slot.isFree()) {
+        return firstRemoved.refOr(slot);
+      }
+
+      if (slot.matchHash(aKeyHash) && match(slot.get(), aLookup)) {
+        return slot;
+      }
+    }
+  }
+
+  Slot findNonLiveSlot(HashNumber aKeyHash) {
+    MOZ_ASSERT(!(aKeyHash & sCollisionBit));
+    MOZ_ASSERT(mTable);
+
+
+    HashNumber h1 = hash1(aKeyHash);
+    Slot slot = slotForIndex(h1);
+
+    if (!slot.isLive()) {
+      return slot;
+    }
+
+    DoubleHash dh = hash2(aKeyHash);
+
+    while (true) {
+      slot.setCollision();
+
+      h1 = applyDoubleHash(h1, dh);
+
+      slot = slotForIndex(h1);
+      if (!slot.isLive()) {
+        return slot;
+      }
+    }
+  }
+
+  enum RebuildStatus { NotOverloaded, Rehashed, RehashFailed };
+
+  RebuildStatus changeTableSize(
+      uint32_t newCapacity, FailureBehavior aReportFailure = ReportFailure) {
+    MOZ_ASSERT(std::has_single_bit(newCapacity));
+    MOZ_ASSERT(!!mTable == !!capacity());
+
+    char* oldTable = mTable;
+    uint32_t oldCapacity = capacity();
+    uint32_t newLog2 = mozilla::CeilingLog2(newCapacity);
+
+    if (MOZ_UNLIKELY(newCapacity > sMaxCapacity)) {
+      if (aReportFailure) {
+        this->reportAllocOverflow();
+      }
+      return RehashFailed;
+    }
+
+    char* newTable = createTable(*this, newCapacity, aReportFailure);
+    if (!newTable) {
+      return RehashFailed;
+    }
+
+    mRemovedCount = 0;
+    incrementGeneration();
+    setHashShift(kHashNumberBits - newLog2);
+    mTable = newTable;
+
+    forEachSlot(oldTable, oldCapacity, [&](Slot& slot) {
+      if (slot.isLive()) {
+        HashNumber hn = slot.getKeyHash();
+        findNonLiveSlot(hn).setLive(
+            hn, std::move(const_cast<typename Entry::NonConstT&>(slot.get())));
+      }
+
+      slot.clear();
+    });
+
+    freeTable(*this, oldTable, oldCapacity);
+    return Rehashed;
+  }
+
+  RebuildStatus rehashIfOverloaded(
+      FailureBehavior aReportFailure = ReportFailure) {
+    static_assert(sMaxCapacity <= UINT32_MAX / sMaxAlphaNumerator,
+                  "multiplication below could overflow");
+
+    bool overloaded = mEntryCount + mRemovedCount >=
+                      capacity() * sMaxAlphaNumerator / sAlphaDenominator;
+
+    if (!overloaded) {
+      return NotOverloaded;
+    }
+
+    bool manyRemoved = mRemovedCount >= (capacity() >> 2);
+    uint32_t newCapacity = manyRemoved ? rawCapacity() : rawCapacity() * 2;
+    return changeTableSize(newCapacity, aReportFailure);
+  }
+
+  void infallibleRehashIfOverloaded() {
+    if (rehashIfOverloaded(DontReportFailure) == RehashFailed) {
+      rehashTableInPlace();
+    }
+  }
+
+  void remove(Slot& aSlot) {
+    MOZ_ASSERT(mTable);
+
+    if (aSlot.hasCollision()) {
+      aSlot.removeLive();
+      mRemovedCount++;
+    } else {
+      aSlot.clearLive();
+    }
+    mEntryCount--;
+#ifdef DEBUG
+    mMutationCount++;
+#endif
+  }
+
+  void shrinkIfUnderloaded() {
+    static_assert(sMaxCapacity <= UINT32_MAX / sMinAlphaNumerator,
+                  "multiplication below could overflow");
+    bool underloaded =
+        capacity() > sMinCapacity &&
+        mEntryCount <= capacity() * sMinAlphaNumerator / sAlphaDenominator;
+
+    if (underloaded) {
+      (void)changeTableSize(capacity() / 2, DontReportFailure);
+    }
+  }
+
+  void rehashTableInPlace() {
+    mRemovedCount = 0;
+    incrementGeneration();
+    forEachSlot(mTable, capacity(), [&](Slot& slot) { slot.unsetCollision(); });
+    for (uint32_t i = 0; i < capacity();) {
+      Slot src = slotForIndex(i);
+
+      if (!src.isLive() || src.hasCollision()) {
+        ++i;
+        continue;
+      }
+
+      HashNumber keyHash = src.getKeyHash();
+      HashNumber h1 = hash1(keyHash);
+      DoubleHash dh = hash2(keyHash);
+      Slot tgt = slotForIndex(h1);
+      while (true) {
+        if (!tgt.hasCollision()) {
+          src.swap(tgt);
+          tgt.setCollision();
+          break;
+        }
+
+        h1 = applyDoubleHash(h1, dh);
+        tgt = slotForIndex(h1);
+      }
+    }
+
+  }
+
+  template <typename... Args>
+  void putNewInfallibleInternal(HashNumber aKeyHash, Args&&... aArgs) {
+    MOZ_ASSERT(mTable);
+
+    Slot slot = findNonLiveSlot(aKeyHash);
+
+    if (slot.isRemoved()) {
+      mRemovedCount--;
+      aKeyHash |= sCollisionBit;
+    }
+
+    slot.setLive(aKeyHash, std::forward<Args>(aArgs)...);
+    mEntryCount++;
+#ifdef DEBUG
+    mMutationCount++;
+#endif
+  }
+
+ public:
+  void clear() {
+    forEachSlot(mTable, capacity(), [&](Slot& slot) { slot.clear(); });
+    mRemovedCount = 0;
+    mEntryCount = 0;
+#ifdef DEBUG
+    mMutationCount++;
+#endif
+  }
+
+  void compact() {
+    if (empty()) {
+      freeTable(*this, mTable, capacity());
+      incrementGeneration();
+      setHashShift(
+          hashShiftForLength(0));  
+      mTable = nullptr;
+      mRemovedCount = 0;
+      return;
+    }
+
+    shrinkToBestCapacity();
+  }
+
+  void shrinkToBestCapacity() {
+    uint32_t bestCapacity = this->bestCapacity(mEntryCount);
+    if (bestCapacity < capacity()) {
+      (void)changeTableSize(bestCapacity, DontReportFailure);
+    }
+  }
+
+  void clearAndCompact() {
+    clear();
+    compact();
+  }
+
+  [[nodiscard]] bool reserve(uint32_t aLen) {
+    if (aLen == 0) {
+      return true;
+    }
+
+    if (MOZ_UNLIKELY(aLen > sMaxInit)) {
+      this->reportAllocOverflow();
+      return false;
+    }
+
+    uint32_t bestCapacity = this->bestCapacity(aLen);
+    if (bestCapacity <= capacity()) {
+      return true;  
+    }
+
+    RebuildStatus status = changeTableSize(bestCapacity, ReportFailure);
+    MOZ_ASSERT(status != NotOverloaded);
+    return status != RehashFailed;
+  }
+
+  Iterator iter() const { return Iterator(*this); }
+
+  ModIterator modIter() { return ModIterator(*this); }
+
+  bool empty() const { return mEntryCount == 0; }
+
+  uint32_t count() const { return mEntryCount; }
+
+  uint32_t rawCapacity() const { return 1u << (kHashNumberBits - hashShift()); }
+
+  uint32_t capacity() const { return mTable ? rawCapacity() : 0; }
+
+  Generation generation() const { return Generation(gen()); }
+
+  size_t shallowSizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const {
+    return aMallocSizeOf(mTable);
+  }
+
+  size_t shallowSizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const {
+    return aMallocSizeOf(this) + shallowSizeOfExcludingThis(aMallocSizeOf);
+  }
+
+  MOZ_ALWAYS_INLINE Ptr readonlyThreadsafeLookup(const Lookup& aLookup) const {
+    if (empty()) {
+      return Ptr();
+    }
+
+    HashNumber inputHash;
+    if (!MaybeGetHash<HashPolicy>(aLookup, &inputHash)) {
+      return Ptr();
+    }
+
+    HashNumber keyHash = prepareHash(inputHash);
+    return Ptr(lookup<ForNonAdd>(aLookup, keyHash), *this);
+  }
+
+  MOZ_ALWAYS_INLINE Ptr lookup(const Lookup& aLookup) const {
+    ReentrancyGuard g(*this);
+    return readonlyThreadsafeLookup(aLookup);
+  }
+
+  MOZ_ALWAYS_INLINE AddPtr lookupForAdd(const Lookup& aLookup) {
+    ReentrancyGuard g(*this);
+
+    HashNumber inputHash;
+    if (!EnsureHash<HashPolicy>(aLookup, &inputHash)) {
+      return AddPtr();
+    }
+
+    HashNumber keyHash = prepareHash(inputHash);
+
+    if (!mTable) {
+      return AddPtr(*this, keyHash);
+    }
+
+    return AddPtr(lookup<ForAdd>(aLookup, keyHash), *this, keyHash);
+  }
+
+  template <typename... Args>
+  [[nodiscard]] bool add(AddPtr& aPtr, Args&&... aArgs) {
+    ReentrancyGuard g(*this);
+    MOZ_ASSERT_IF(aPtr.isValid(), mTable);
+    MOZ_ASSERT_IF(aPtr.isValid(), aPtr.mTable == this);
+    MOZ_ASSERT(!aPtr.found());
+    MOZ_ASSERT(!(aPtr.mKeyHash & sCollisionBit));
+
+    if (!aPtr.isLive()) {
+      return false;
+    }
+
+    MOZ_ASSERT(aPtr.mGeneration == generation());
+#ifdef DEBUG
+    MOZ_ASSERT(aPtr.mMutationCount == mMutationCount);
+#endif
+
+    if (!aPtr.isValid()) {
+      MOZ_ASSERT(!mTable && mEntryCount == 0);
+      uint32_t newCapacity = rawCapacity();
+      RebuildStatus status = changeTableSize(newCapacity, ReportFailure);
+      MOZ_ASSERT(status != NotOverloaded);
+      if (status == RehashFailed) {
+        return false;
+      }
+      aPtr.mSlot = findNonLiveSlot(aPtr.mKeyHash);
+
+    } else if (aPtr.mSlot.isRemoved()) {
+      if (!this->checkSimulatedOOM()) {
+        return false;
+      }
+      mRemovedCount--;
+      aPtr.mKeyHash |= sCollisionBit;
+
+    } else {
+      RebuildStatus status = rehashIfOverloaded();
+      if (status == RehashFailed) {
+        return false;
+      }
+      if (status == NotOverloaded && !this->checkSimulatedOOM()) {
+        return false;
+      }
+      if (status == Rehashed) {
+        aPtr.mSlot = findNonLiveSlot(aPtr.mKeyHash);
+      }
+    }
+
+    aPtr.mSlot.setLive(aPtr.mKeyHash, std::forward<Args>(aArgs)...);
+    mEntryCount++;
+#ifdef DEBUG
+    mMutationCount++;
+    aPtr.mGeneration = generation();
+    aPtr.mMutationCount = mMutationCount;
+#endif
+    return true;
+  }
+
+  template <typename... Args>
+  void putNewInfallible(const Lookup& aLookup, Args&&... aArgs) {
+    MOZ_ASSERT(!lookup(aLookup).found());
+    ReentrancyGuard g(*this);
+    HashNumber keyHash = prepareHash(HashPolicy::hash(aLookup));
+    putNewInfallibleInternal(keyHash, std::forward<Args>(aArgs)...);
+  }
+
+  template <typename... Args>
+  [[nodiscard]] bool putNew(const Lookup& aLookup, Args&&... aArgs) {
+    MOZ_ASSERT(!lookup(aLookup).found());
+    ReentrancyGuard g(*this);
+    if (!this->checkSimulatedOOM()) {
+      return false;
+    }
+    HashNumber inputHash;
+    if (!EnsureHash<HashPolicy>(aLookup, &inputHash)) {
+      return false;
+    }
+    HashNumber keyHash = prepareHash(inputHash);
+    if (rehashIfOverloaded() == RehashFailed) {
+      return false;
+    }
+    putNewInfallibleInternal(keyHash, std::forward<Args>(aArgs)...);
+    return true;
+  }
+
+  template <typename... Args>
+  [[nodiscard]] bool relookupOrAdd(AddPtr& aPtr, const Lookup& aLookup,
+                                   Args&&... aArgs) {
+    if (!aPtr.isLive()) {
+      return false;
+    }
+#ifdef DEBUG
+    aPtr.mGeneration = generation();
+    aPtr.mMutationCount = mMutationCount;
+#endif
+    if (mTable) {
+      ReentrancyGuard g(*this);
+      MOZ_ASSERT(prepareHash(HashPolicy::hash(aLookup)) == aPtr.mKeyHash);
+      aPtr.mSlot = lookup<ForAdd>(aLookup, aPtr.mKeyHash);
+      if (aPtr.found()) {
+        return true;
+      }
+    } else {
+      aPtr.mSlot = Slot(nullptr, nullptr);
+    }
+    return add(aPtr, std::forward<Args>(aArgs)...);
+  }
+
+  void remove(Ptr aPtr) {
+    MOZ_ASSERT(mTable);
+    ReentrancyGuard g(*this);
+    MOZ_ASSERT(aPtr.found());
+    MOZ_ASSERT(aPtr.mGeneration == generation());
+    remove(aPtr.mSlot);
+    shrinkIfUnderloaded();
+  }
+
+  template <typename KeyInput>
+  void rekeyWithoutRehash(Ptr aPtr, const Lookup& aLookup, KeyInput&& aKey) {
+    MOZ_ASSERT(mTable);
+    ReentrancyGuard g(*this);
+    MOZ_ASSERT(aPtr.found());
+    MOZ_ASSERT(aPtr.mGeneration == generation());
+    typename HashTableEntry<T>::NonConstT t(std::move(*aPtr));
+    HashPolicy::setKey(t, std::forward<KeyInput>(aKey));
+    remove(aPtr.mSlot);
+    HashNumber keyHash = prepareHash(HashPolicy::hash(aLookup));
+    putNewInfallibleInternal(keyHash, std::move(t));
+  }
+
+  template <typename KeyInput>
+  void rekeyAndMaybeRehash(Ptr aPtr, const Lookup& aLookup, KeyInput&& aKey) {
+    rekeyWithoutRehash(aPtr, aLookup, std::forward<KeyInput>(aKey));
+    infallibleRehashIfOverloaded();
+  }
+
+  static size_t offsetOfHashShift() {
+    static_assert(sHashShiftBits == 8,
+                  "callers assume hash shift is stored in a byte");
+    if constexpr (std::endian::native == std::endian::big) {
+      return offsetof(HashTable, mGenAndHashShift) + sizeof(mGenAndHashShift) -
+             sizeof(uint8_t);
+    } else {
+      return offsetof(HashTable, mGenAndHashShift);
+    }
+  }
+  static size_t offsetOfTable() { return offsetof(HashTable, mTable); }
+  static size_t offsetOfEntryCount() {
+    return offsetof(HashTable, mEntryCount);
+  }
+};
+
+}  
+}  
+
+#endif /* mozilla_HashTable_h */

@@ -1,0 +1,298 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+#ifndef __NUMBERRANGEFORMATTER_H__
+#define __NUMBERRANGEFORMATTER_H__
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/appendable.h"
+#include "unicode/fieldpos.h"
+#include "unicode/formattedvalue.h"
+#include "unicode/fpositer.h"
+#include "unicode/numberformatter.h"
+#include "unicode/unumberrangeformatter.h"
+
+#ifndef __wasi__
+#include <atomic>
+#endif
+
+
+
+U_NAMESPACE_BEGIN
+
+class PluralRules;
+
+namespace number {  
+
+class UnlocalizedNumberRangeFormatter;
+class LocalizedNumberRangeFormatter;
+class FormattedNumberRange;
+
+namespace impl {
+
+struct RangeMacroProps;
+class DecimalQuantity;
+class UFormattedNumberRangeData;
+class NumberRangeFormatterImpl;
+struct UFormattedNumberRangeImpl;
+
+} 
+
+
+namespace impl {  
+
+struct RangeMacroProps : public UMemory {
+    UnlocalizedNumberFormatter formatter1; 
+
+    UnlocalizedNumberFormatter formatter2; 
+
+    bool singleFormatter = true;
+
+    UNumberRangeCollapse collapse = UNUM_RANGE_COLLAPSE_AUTO;
+
+    UNumberRangeIdentityFallback identityFallback = UNUM_IDENTITY_FALLBACK_APPROXIMATELY;
+
+    Locale locale;
+
+
+    bool copyErrorTo(UErrorCode &status) const {
+        return formatter1.copyErrorTo(status) || formatter2.copyErrorTo(status);
+    }
+};
+
+} 
+
+template<typename Derived>
+class U_I18N_API NumberRangeFormatterSettings {
+  public:
+    Derived numberFormatterBoth(const UnlocalizedNumberFormatter &formatter) const &;
+
+    Derived numberFormatterBoth(const UnlocalizedNumberFormatter &formatter) &&;
+
+    Derived numberFormatterBoth(UnlocalizedNumberFormatter &&formatter) const &;
+
+    Derived numberFormatterBoth(UnlocalizedNumberFormatter &&formatter) &&;
+
+    Derived numberFormatterFirst(const UnlocalizedNumberFormatter &formatterFirst) const &;
+
+    Derived numberFormatterFirst(const UnlocalizedNumberFormatter &formatterFirst) &&;
+
+    Derived numberFormatterFirst(UnlocalizedNumberFormatter &&formatterFirst) const &;
+
+    Derived numberFormatterFirst(UnlocalizedNumberFormatter &&formatterFirst) &&;
+
+    Derived numberFormatterSecond(const UnlocalizedNumberFormatter &formatterSecond) const &;
+
+    Derived numberFormatterSecond(const UnlocalizedNumberFormatter &formatterSecond) &&;
+
+    Derived numberFormatterSecond(UnlocalizedNumberFormatter &&formatterSecond) const &;
+
+    Derived numberFormatterSecond(UnlocalizedNumberFormatter &&formatterSecond) &&;
+
+    Derived collapse(UNumberRangeCollapse collapse) const &;
+
+    Derived collapse(UNumberRangeCollapse collapse) &&;
+
+    Derived identityFallback(UNumberRangeIdentityFallback identityFallback) const &;
+
+    Derived identityFallback(UNumberRangeIdentityFallback identityFallback) &&;
+
+    LocalPointer<Derived> clone() const &;
+
+    LocalPointer<Derived> clone() &&;
+
+    UBool copyErrorTo(UErrorCode &outErrorCode) const {
+        if (U_FAILURE(outErrorCode)) {
+            return true;
+        }
+        fMacros.copyErrorTo(outErrorCode);
+        return U_FAILURE(outErrorCode);
+    }
+
+
+  private:
+    impl::RangeMacroProps fMacros;
+
+    NumberRangeFormatterSettings() = default;
+
+    friend class LocalizedNumberRangeFormatter;
+    friend class UnlocalizedNumberRangeFormatter;
+};
+
+#ifndef _MSC_VER
+extern template class NumberRangeFormatterSettings<UnlocalizedNumberRangeFormatter>;
+extern template class NumberRangeFormatterSettings<LocalizedNumberRangeFormatter>;
+#endif
+
+class U_I18N_API UnlocalizedNumberRangeFormatter
+        : public NumberRangeFormatterSettings<UnlocalizedNumberRangeFormatter>, public UMemory {
+
+  public:
+    LocalizedNumberRangeFormatter locale(const icu::Locale &locale) const &;
+
+    LocalizedNumberRangeFormatter locale(const icu::Locale &locale) &&;
+
+    UnlocalizedNumberRangeFormatter() = default;
+
+    UnlocalizedNumberRangeFormatter(const UnlocalizedNumberRangeFormatter &other);
+
+    UnlocalizedNumberRangeFormatter(UnlocalizedNumberRangeFormatter&& src) noexcept;
+
+    UnlocalizedNumberRangeFormatter& operator=(const UnlocalizedNumberRangeFormatter& other);
+
+    UnlocalizedNumberRangeFormatter& operator=(UnlocalizedNumberRangeFormatter&& src) noexcept;
+
+  private:
+    explicit UnlocalizedNumberRangeFormatter(
+            const NumberRangeFormatterSettings<UnlocalizedNumberRangeFormatter>& other);
+
+    explicit UnlocalizedNumberRangeFormatter(
+            NumberRangeFormatterSettings<UnlocalizedNumberRangeFormatter>&& src) noexcept;
+
+    explicit UnlocalizedNumberRangeFormatter(const impl::RangeMacroProps &macros);
+
+    explicit UnlocalizedNumberRangeFormatter(impl::RangeMacroProps &&macros);
+
+    friend class NumberRangeFormatterSettings<UnlocalizedNumberRangeFormatter>;
+
+    friend class NumberRangeFormatter;
+
+    friend class LocalizedNumberRangeFormatter;
+};
+
+class U_I18N_API_CLASS LocalizedNumberRangeFormatter
+        : public NumberRangeFormatterSettings<LocalizedNumberRangeFormatter>, public UMemory {
+  public:
+    U_I18N_API FormattedNumberRange formatFormattableRange(
+        const Formattable& first, const Formattable& second, UErrorCode& status) const;
+
+    U_I18N_API UnlocalizedNumberRangeFormatter withoutLocale() const &;
+
+    U_I18N_API UnlocalizedNumberRangeFormatter withoutLocale() &&;
+
+    U_I18N_API LocalizedNumberRangeFormatter() = default;
+
+    U_I18N_API LocalizedNumberRangeFormatter(const LocalizedNumberRangeFormatter &other);
+
+    U_I18N_API LocalizedNumberRangeFormatter(LocalizedNumberRangeFormatter&& src) noexcept;
+
+    U_I18N_API LocalizedNumberRangeFormatter& operator=(const LocalizedNumberRangeFormatter& other);
+
+    U_I18N_API LocalizedNumberRangeFormatter& operator=(LocalizedNumberRangeFormatter&& src) noexcept;
+
+#ifndef U_HIDE_INTERNAL_API
+
+    U_I18N_API void formatImpl(impl::UFormattedNumberRangeData &results, bool equalBeforeRounding,
+                               UErrorCode &status) const;
+
+#endif  /* U_HIDE_INTERNAL_API */
+
+    U_I18N_API ~LocalizedNumberRangeFormatter();
+
+  private:
+#ifndef __wasi__
+    std::atomic<impl::NumberRangeFormatterImpl*> fAtomicFormatter = {};
+#else
+    impl::NumberRangeFormatterImpl* fAtomicFormatter = nullptr;
+#endif
+
+    const impl::NumberRangeFormatterImpl* getFormatter(UErrorCode& stauts) const;
+
+    explicit LocalizedNumberRangeFormatter(
+        const NumberRangeFormatterSettings<LocalizedNumberRangeFormatter>& other);
+
+    explicit LocalizedNumberRangeFormatter(
+        NumberRangeFormatterSettings<LocalizedNumberRangeFormatter>&& src) noexcept;
+
+    LocalizedNumberRangeFormatter(const impl::RangeMacroProps &macros, const Locale &locale);
+
+    LocalizedNumberRangeFormatter(impl::RangeMacroProps &&macros, const Locale &locale);
+
+    friend class NumberRangeFormatterSettings<UnlocalizedNumberRangeFormatter>;
+    friend class NumberRangeFormatterSettings<LocalizedNumberRangeFormatter>;
+
+    friend class UnlocalizedNumberRangeFormatter;
+};
+
+class U_I18N_API FormattedNumberRange : public UMemory, public FormattedValue {
+  public:
+    UnicodeString toString(UErrorCode& status) const override;
+
+    UnicodeString toTempString(UErrorCode& status) const override;
+
+    Appendable &appendTo(Appendable &appendable, UErrorCode& status) const override;
+
+    UBool nextPosition(ConstrainedFieldPosition& cfpos, UErrorCode& status) const override;
+
+    template<typename StringClass>
+    inline std::pair<StringClass, StringClass> getDecimalNumbers(UErrorCode& status) const;
+
+    UNumberRangeIdentityResult getIdentityResult(UErrorCode& status) const;
+
+    FormattedNumberRange()
+        : fData(nullptr), fErrorCode(U_INVALID_STATE_ERROR) {}
+
+    FormattedNumberRange(const FormattedNumberRange&) = delete;
+
+    FormattedNumberRange& operator=(const FormattedNumberRange&) = delete;
+
+    FormattedNumberRange(FormattedNumberRange&& src) noexcept;
+
+    FormattedNumberRange& operator=(FormattedNumberRange&& src) noexcept;
+
+    ~FormattedNumberRange();
+
+  private:
+    const impl::UFormattedNumberRangeData *fData;
+
+    UErrorCode fErrorCode;
+
+    explicit FormattedNumberRange(impl::UFormattedNumberRangeData *results)
+        : fData(results), fErrorCode(U_ZERO_ERROR) {}
+
+    explicit FormattedNumberRange(UErrorCode errorCode)
+        : fData(nullptr), fErrorCode(errorCode) {}
+
+    void getDecimalNumbers(ByteSink& sink1, ByteSink& sink2, UErrorCode& status) const;
+
+    const impl::UFormattedNumberRangeData* getData(UErrorCode& status) const;
+
+    friend class ::icu::PluralRules;
+
+    friend class LocalizedNumberRangeFormatter;
+
+    friend struct impl::UFormattedNumberRangeImpl;
+};
+
+template<typename StringClass>
+std::pair<StringClass, StringClass> FormattedNumberRange::getDecimalNumbers(UErrorCode& status) const {
+    StringClass str1;
+    StringClass str2;
+    StringByteSink<StringClass> sink1(&str1);
+    StringByteSink<StringClass> sink2(&str2);
+    getDecimalNumbers(sink1, sink2, status);
+    return std::make_pair(str1, str2);
+}
+
+class U_I18N_API NumberRangeFormatter final {
+  public:
+    static UnlocalizedNumberRangeFormatter with();
+
+    static LocalizedNumberRangeFormatter withLocale(const Locale &locale);
+
+    NumberRangeFormatter() = delete;
+};
+
+}  
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif // __NUMBERRANGEFORMATTER_H__
+

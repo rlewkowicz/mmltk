@@ -1,0 +1,355 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_image_sourcebuffer_h
+#define mozilla_image_sourcebuffer_h
+
+#include <algorithm>
+#include <utility>
+
+#include "mozilla/Maybe.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/RefCounted.h"
+#include "mozilla/RefPtr.h"
+#include "nsTArray.h"
+
+class nsIInputStream;
+
+namespace mozilla {
+namespace image {
+
+class SourceBuffer;
+
+struct IResumable {
+  MOZ_DECLARE_REFCOUNTED_TYPENAME(IResumable)
+
+  NS_INLINE_DECL_PURE_VIRTUAL_REFCOUNTING
+
+  virtual void Resume() = 0;
+
+ protected:
+  virtual ~IResumable() = default;
+};
+
+class SourceBufferIterator final {
+ public:
+  enum State {
+    START,    
+    READY,    
+    WAITING,  
+    COMPLETE  
+  };
+
+  explicit SourceBufferIterator(SourceBuffer* aOwner, size_t aReadLimit)
+      : mOwner(aOwner),
+        mState(START),
+        mChunkCount(0),
+        mByteCount(0),
+        mRemainderToRead(aReadLimit) {
+    MOZ_ASSERT(aOwner);
+    mData.mIterating.mChunk = 0;
+    mData.mIterating.mData = nullptr;
+    mData.mIterating.mOffset = 0;
+    mData.mIterating.mAvailableLength = 0;
+    mData.mIterating.mNextReadLength = 0;
+  }
+
+  SourceBufferIterator(SourceBufferIterator&& aOther)
+      : mOwner(std::move(aOther.mOwner)),
+        mState(aOther.mState),
+        mData(aOther.mData),
+        mChunkCount(aOther.mChunkCount),
+        mByteCount(aOther.mByteCount),
+        mRemainderToRead(aOther.mRemainderToRead) {}
+
+  ~SourceBufferIterator();
+
+  SourceBufferIterator& operator=(SourceBufferIterator&& aOther);
+
+  SourceBufferIterator(const SourceBufferIterator&) = delete;
+  SourceBufferIterator& operator=(const SourceBufferIterator&) = delete;
+
+  bool RemainingBytesIsNoMoreThan(size_t aBytes) const;
+
+  State Advance(size_t aRequestedBytes) {
+    return AdvanceOrScheduleResume(aRequestedBytes, nullptr);
+  }
+
+  State AdvanceOrScheduleResume(size_t aRequestedBytes, IResumable* aConsumer);
+
+  void MarkConsumed(size_t aConsumed);
+
+  bool IsReady() const { return mState == READY; }
+
+  nsresult CompletionStatus() const {
+    MOZ_ASSERT(mState == COMPLETE,
+               "Calling CompletionStatus() in the wrong state");
+    return mState == COMPLETE ? mData.mAtEnd.mStatus : NS_OK;
+  }
+
+  const char* Data() const {
+    MOZ_ASSERT(mState == READY, "Calling Data() in the wrong state");
+    return mState == READY ? mData.mIterating.mData + mData.mIterating.mOffset
+                           : nullptr;
+  }
+
+  size_t Length() const {
+    MOZ_ASSERT(mState == READY, "Calling Length() in the wrong state");
+    return mState == READY ? mData.mIterating.mNextReadLength : 0;
+  }
+
+  bool IsContiguous() const {
+    MOZ_ASSERT(mState == READY, "Calling IsContiguous() in the wrong state");
+    return mState == READY ? mData.mIterating.mChunk == 0 : false;
+  }
+
+  uint32_t ChunkCount() const { return mChunkCount; }
+
+  size_t ByteCount() const { return mByteCount; }
+
+  SourceBuffer* Owner() const {
+    MOZ_ASSERT(mOwner);
+    return mOwner;
+  }
+
+  size_t Position() const {
+    return mByteCount - mData.mIterating.mAvailableLength;
+  }
+
+ private:
+  friend class SourceBuffer;
+
+  bool HasMore() const { return mState != COMPLETE; }
+
+  State AdvanceFromLocalBuffer(size_t aRequestedBytes) {
+    MOZ_ASSERT(mState == READY, "Advancing in the wrong state");
+    MOZ_ASSERT(mData.mIterating.mAvailableLength > 0,
+               "The local buffer shouldn't be empty");
+    MOZ_ASSERT(mData.mIterating.mNextReadLength == 0,
+               "Advancing without consuming previous data");
+
+    mData.mIterating.mNextReadLength =
+        std::min(mData.mIterating.mAvailableLength, aRequestedBytes);
+
+    return READY;
+  }
+
+  State SetReady(uint32_t aChunk, const char* aData, size_t aOffset,
+                 size_t aAvailableLength, size_t aRequestedBytes) {
+    MOZ_ASSERT(mState != COMPLETE);
+    mState = READY;
+
+    if (aAvailableLength > mRemainderToRead) {
+      aAvailableLength = mRemainderToRead;
+    }
+
+    mData.mIterating.mChunk = aChunk;
+    mData.mIterating.mData = aData;
+    mData.mIterating.mOffset = aOffset;
+    mData.mIterating.mAvailableLength = aAvailableLength;
+
+    mChunkCount++;
+    mByteCount += aAvailableLength;
+
+    return AdvanceFromLocalBuffer(aRequestedBytes);
+  }
+
+  State SetWaiting(bool aHasConsumer) {
+    MOZ_ASSERT(mState != COMPLETE);
+    MOZ_ASSERT(mState != WAITING || !aHasConsumer,
+               "Did we get a spurious wakeup somehow?");
+    return mState = WAITING;
+  }
+
+  State SetComplete(nsresult aStatus) {
+    mData.mAtEnd.mStatus = aStatus;
+    return mState = COMPLETE;
+  }
+
+  RefPtr<SourceBuffer> mOwner;
+
+  State mState;
+
+  union {
+    struct {
+      uint32_t mChunk;    
+      const char* mData;  
+      size_t mOffset;     
+      size_t mAvailableLength;  
+      size_t
+          mNextReadLength;  
+    } mIterating;  
+    struct {
+      nsresult mStatus;  
+    } mAtEnd;            
+  } mData;
+
+  uint32_t mChunkCount;  
+  size_t mByteCount;     
+  size_t mRemainderToRead;  
+};
+
+class SourceBuffer final {
+ public:
+  MOZ_DECLARE_REFCOUNTED_TYPENAME(image::SourceBuffer)
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(image::SourceBuffer)
+
+  SourceBuffer();
+
+
+  nsresult ExpectLength(size_t aExpectedLength);
+
+  nsresult Append(const char* aData, size_t aLength);
+
+  nsresult AppendFromInputStream(nsIInputStream* aInputStream, uint32_t aCount);
+
+  nsresult AdoptData(char* aData, size_t aLength,
+                     void* (*aRealloc)(void*, size_t), void (*aFree)(void*));
+
+  void Complete(nsresult aStatus);
+
+  bool IsComplete();
+
+  size_t SizeOfIncludingThisWithComputedFallback(MallocSizeOf) const;
+
+
+  SourceBufferIterator Iterator(size_t aReadLength = SIZE_MAX);
+
+
+  static const size_t MIN_CHUNK_CAPACITY = 4096;
+
+  static const size_t MAX_CHUNK_CAPACITY = 20 * 1024 * 1024;
+
+ private:
+  friend class SourceBufferIterator;
+
+  ~SourceBuffer();
+
+
+  class Chunk final {
+   public:
+    explicit Chunk(size_t aCapacity) : mCapacity(aCapacity), mLength(0) {
+      MOZ_ASSERT(aCapacity > 0, "Creating zero-capacity chunk");
+      mData = static_cast<char*>(malloc(mCapacity));
+    }
+
+    Chunk(char* aData, size_t aLength, void* (*aRealloc)(void*, size_t),
+          void (*aFree)(void*))
+        : mCapacity(aLength),
+          mLength(aLength),
+          mData(aData),
+          mRealloc(aRealloc),
+          mFree(aFree) {}
+
+    ~Chunk() { mFree(mData); }
+
+    Chunk(Chunk&& aOther)
+        : mCapacity(aOther.mCapacity),
+          mLength(aOther.mLength),
+          mData(aOther.mData),
+          mRealloc(aOther.mRealloc),
+          mFree(aOther.mFree) {
+      aOther.mCapacity = aOther.mLength = 0;
+      aOther.mData = nullptr;
+    }
+
+    Chunk& operator=(Chunk&& aOther) {
+      mFree(mData);
+      mCapacity = aOther.mCapacity;
+      mLength = aOther.mLength;
+      mData = aOther.mData;
+      mRealloc = aOther.mRealloc;
+      mFree = aOther.mFree;
+      aOther.mCapacity = aOther.mLength = 0;
+      aOther.mData = nullptr;
+      return *this;
+    }
+
+    bool AllocationFailed() const { return !mData; }
+    size_t Capacity() const { return mCapacity; }
+    size_t Length() const { return mLength; }
+
+    char* Data() const {
+      MOZ_ASSERT(mData, "Allocation failed but nobody checked for it");
+      return mData;
+    }
+
+    void AddLength(size_t aAdditionalLength) {
+      MOZ_ASSERT(mLength + aAdditionalLength <= mCapacity);
+      mLength += aAdditionalLength;
+    }
+
+    bool SetCapacity(size_t aCapacity) {
+      MOZ_ASSERT(mData, "Allocation failed but nobody checked for it");
+      MOZ_ASSERT(aCapacity > 0, "zero sized resize");
+      if (aCapacity == 0) {
+        return false;
+      }
+      char* data = static_cast<char*>(mRealloc(mData, aCapacity));
+      if (!data) {
+        return false;
+      }
+
+      mData = data;
+      mCapacity = aCapacity;
+      return true;
+    }
+
+    Chunk(const Chunk&) = delete;
+    Chunk& operator=(const Chunk&) = delete;
+
+   private:
+    size_t mCapacity;
+    size_t mLength;
+    char* mData;
+    void* (*mRealloc)(void*, size_t) = realloc;
+    void (*mFree)(void*) = free;
+  };
+
+  nsresult AppendChunk(Maybe<Chunk>&& aChunk) MOZ_REQUIRES(mMutex);
+  Maybe<Chunk> CreateChunk(size_t aCapacity, size_t aExistingCapacity = 0,
+                           bool aRoundUp = true);
+  nsresult Compact() MOZ_REQUIRES(mMutex);
+  static size_t RoundedUpCapacity(size_t aCapacity);
+  size_t FibonacciCapacityWithMinimum(size_t aMinCapacity) MOZ_REQUIRES(mMutex);
+
+
+  void AddWaitingConsumer(IResumable* aConsumer) MOZ_REQUIRES(mMutex);
+  void ResumeWaitingConsumers() MOZ_REQUIRES(mMutex);
+
+  typedef SourceBufferIterator::State State;
+
+  State AdvanceIteratorOrScheduleResume(SourceBufferIterator& aIterator,
+                                        size_t aRequestedBytes,
+                                        IResumable* aConsumer);
+  bool RemainingBytesIsNoMoreThan(const SourceBufferIterator& aIterator,
+                                  size_t aBytes) const;
+
+  void OnIteratorRelease();
+
+
+  nsresult HandleError(nsresult aError) MOZ_REQUIRES(mMutex);
+  bool IsEmpty() MOZ_REQUIRES(mMutex);
+  bool IsLastChunk(uint32_t aChunk) MOZ_REQUIRES(mMutex);
+
+
+  mutable Mutex mMutex;
+
+  AutoTArray<Chunk, 1> mChunks MOZ_GUARDED_BY(mMutex);
+
+  nsTArray<RefPtr<IResumable>> mWaitingConsumers MOZ_GUARDED_BY(mMutex);
+
+  Maybe<nsresult> mStatus MOZ_GUARDED_BY(mMutex);
+
+  uint32_t mConsumerCount MOZ_GUARDED_BY(mMutex);
+
+  bool mCompacted MOZ_GUARDED_BY(mMutex);
+};
+
+}  
+}  
+
+#endif  // mozilla_image_sourcebuffer_h

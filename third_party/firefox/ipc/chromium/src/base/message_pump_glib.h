@@ -1,0 +1,64 @@
+// Copyright (c) 2008 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(BASE_MESSAGE_PUMP_GLIB_H_)
+#define BASE_MESSAGE_PUMP_GLIB_H_
+
+#include "base/message_pump.h"
+#include "base/observer_list.h"
+#include "base/time.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/Atomics.h"
+
+typedef struct _GMainContext GMainContext;
+typedef struct _GPollFD GPollFD;
+typedef struct _GSource GSource;
+
+namespace base {
+
+class MessagePumpForUI : public MessagePump {
+ public:
+  MessagePumpForUI();
+  virtual ~MessagePumpForUI();
+
+  void Run(Delegate* delegate) override;
+  void Quit() override;
+  void ScheduleWork() override;
+  void ScheduleDelayedWork(const TimeTicks& delayed_work_time) override;
+
+  int HandlePrepare();
+  bool HandleCheck();
+  void HandleDispatch();
+
+ private:
+  struct RunState {
+    Delegate* delegate;
+
+    bool should_quit;
+
+    int run_depth;
+
+    bool has_work;
+  };
+
+  RunState* state_;
+
+  GMainContext* context_;
+
+  TimeTicks delayed_work_time_;
+
+  GSource* work_source_;
+
+  int wakeup_pipe_read_;
+  int wakeup_pipe_write_;
+  mozilla::UniquePtr<GPollFD> wakeup_gpollfd_;
+
+  mozilla::Atomic<bool> pipe_full_;
+
+  DISALLOW_COPY_AND_ASSIGN(MessagePumpForUI);
+};
+
+}  
+
+#endif

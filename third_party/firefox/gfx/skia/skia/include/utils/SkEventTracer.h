@@ -1,0 +1,63 @@
+/*
+ * Copyright (C) 2014 Google Inc. All rights reserved.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkEventTracer_DEFINED)
+#define SkEventTracer_DEFINED
+
+
+
+#include "include/core/SkTypes.h"
+
+#include <cstdint>
+
+class SK_API SkEventTracer {
+public:
+
+    typedef uint64_t Handle;
+
+    static bool SetInstance(SkEventTracer*);
+
+    static SkEventTracer* GetInstance();
+
+    virtual ~SkEventTracer() = default;
+
+    enum CategoryGroupEnabledFlags {
+        kEnabledForRecording_CategoryGroupEnabledFlags = 1 << 0,
+        kEnabledForMonitoring_CategoryGroupEnabledFlags = 1 << 1,
+        kEnabledForEventCallback_CategoryGroupEnabledFlags = 1 << 2,
+    };
+
+    virtual const uint8_t* getCategoryGroupEnabled(const char* name) = 0;
+    virtual const char* getCategoryGroupName(const uint8_t* categoryEnabledFlag) = 0;
+
+    virtual SkEventTracer::Handle
+        addTraceEvent(char phase,
+                      const uint8_t* categoryEnabledFlag,
+                      const char* name,
+                      uint64_t id,
+                      int32_t numArgs,
+                      const char** argNames,
+                      const uint8_t* argTypes,
+                      const uint64_t* argValues,
+                      uint8_t flags) = 0;
+
+    virtual void
+        updateTraceEventDuration(const uint8_t* categoryEnabledFlag,
+                                 const char* name,
+                                 SkEventTracer::Handle handle) = 0;
+
+    virtual void newTracingSection(const char*) {}
+
+protected:
+    SkEventTracer() = default;
+    SkEventTracer(const SkEventTracer&) = delete;
+    SkEventTracer& operator=(const SkEventTracer&) = delete;
+
+    virtual void onExit() {}
+};
+
+#endif

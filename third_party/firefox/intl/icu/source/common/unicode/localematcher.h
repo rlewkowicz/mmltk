@@ -1,0 +1,223 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+
+#ifndef __LOCALEMATCHER_H__
+#define __LOCALEMATCHER_H__
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+#include <optional>
+
+#include "unicode/locid.h"
+#include "unicode/stringpiece.h"
+#include "unicode/uobject.h"
+
+
+enum ULocMatchFavorSubtag {
+    ULOCMATCH_FAVOR_LANGUAGE,
+    ULOCMATCH_FAVOR_SCRIPT
+};
+#ifndef U_IN_DOXYGEN
+typedef enum ULocMatchFavorSubtag ULocMatchFavorSubtag;
+#endif
+
+enum ULocMatchDemotion {
+    ULOCMATCH_DEMOTION_NONE,
+    ULOCMATCH_DEMOTION_REGION
+};
+#ifndef U_IN_DOXYGEN
+typedef enum ULocMatchDemotion ULocMatchDemotion;
+#endif
+
+enum ULocMatchDirection {
+    ULOCMATCH_DIRECTION_WITH_ONE_WAY,
+    ULOCMATCH_DIRECTION_ONLY_TWO_WAY
+};
+#ifndef U_IN_DOXYGEN
+typedef enum ULocMatchDirection ULocMatchDirection;
+#endif
+
+struct UHashtable;
+
+U_NAMESPACE_BEGIN
+
+struct LSR;
+
+class LikelySubtags;
+class LocaleDistance;
+class LocaleLsrIterator;
+class UVector;
+
+class U_COMMON_API LocaleMatcher : public UMemory {
+public:
+    class U_COMMON_API Result : public UMemory {
+    public:
+        Result(Result &&src) noexcept;
+
+        ~Result();
+
+        Result &operator=(Result &&src) noexcept;
+
+        inline const Locale *getDesiredLocale() const { return desiredLocale; }
+
+        inline const Locale *getSupportedLocale() const { return supportedLocale; }
+
+        inline int32_t getDesiredIndex() const { return desiredIndex; }
+
+        inline int32_t getSupportedIndex() const { return supportedIndex; }
+
+        Locale makeResolvedLocale(UErrorCode &errorCode) const;
+
+    private:
+        Result(const Locale *desired, const Locale *supported,
+               int32_t desIndex, int32_t suppIndex, UBool owned) :
+                desiredLocale(desired), supportedLocale(supported),
+                desiredIndex(desIndex), supportedIndex(suppIndex),
+                desiredIsOwned(owned) {}
+
+        Result(const Result &other) = delete;
+        Result &operator=(const Result &other) = delete;
+
+        const Locale *desiredLocale;
+        const Locale *supportedLocale;
+        int32_t desiredIndex;
+        int32_t supportedIndex;
+        UBool desiredIsOwned;
+
+        friend class LocaleMatcher;
+    };
+
+    class U_COMMON_API Builder : public UMemory {
+    public:
+        Builder() {}
+
+        Builder(Builder &&src) noexcept;
+
+        ~Builder();
+
+        Builder &operator=(Builder &&src) noexcept;
+
+        Builder &setSupportedLocalesFromListString(StringPiece locales);
+
+        Builder &setSupportedLocales(Locale::Iterator &locales);
+
+        template<typename Iter>
+        Builder &setSupportedLocales(Iter begin, Iter end) {
+            if (U_FAILURE(errorCode_)) { return *this; }
+            clearSupportedLocales();
+            while (begin != end) {
+                addSupportedLocale(*begin++);
+            }
+            return *this;
+        }
+
+        template<typename Iter, typename Conv>
+        Builder &setSupportedLocalesViaConverter(Iter begin, Iter end, Conv converter) {
+            if (U_FAILURE(errorCode_)) { return *this; }
+            clearSupportedLocales();
+            while (begin != end) {
+                addSupportedLocale(converter(*begin++));
+            }
+            return *this;
+        }
+
+        Builder &addSupportedLocale(const Locale &locale);
+
+        Builder &setNoDefaultLocale();
+
+        Builder &setDefaultLocale(const Locale *defaultLocale);
+
+        Builder &setFavorSubtag(ULocMatchFavorSubtag subtag);
+
+        Builder &setDemotionPerDesiredLocale(ULocMatchDemotion demotion);
+
+        Builder &setDirection(ULocMatchDirection matchDirection) {
+            if (U_SUCCESS(errorCode_)) {
+                direction_ = matchDirection;
+            }
+            return *this;
+        }
+
+        Builder &setMaxDistance(const Locale &desired, const Locale &supported);
+
+        UBool copyErrorTo(UErrorCode &outErrorCode) const;
+
+        LocaleMatcher build(UErrorCode &errorCode) const;
+
+    private:
+        friend class LocaleMatcher;
+
+        Builder(const Builder &other) = delete;
+        Builder &operator=(const Builder &other) = delete;
+
+        void clearSupportedLocales();
+        bool ensureSupportedLocaleVector();
+
+        UErrorCode errorCode_ = U_ZERO_ERROR;
+        UVector *supportedLocales_ = nullptr;
+        int32_t thresholdDistance_ = -1;
+        ULocMatchDemotion demotion_ = ULOCMATCH_DEMOTION_REGION;
+        Locale *defaultLocale_ = nullptr;
+        bool withDefault_ = true;
+        ULocMatchFavorSubtag favor_ = ULOCMATCH_FAVOR_LANGUAGE;
+        ULocMatchDirection direction_ = ULOCMATCH_DIRECTION_WITH_ONE_WAY;
+        Locale *maxDistanceDesired_ = nullptr;
+        Locale *maxDistanceSupported_ = nullptr;
+    };
+
+
+    LocaleMatcher(LocaleMatcher &&src) noexcept;
+
+    ~LocaleMatcher();
+
+    LocaleMatcher &operator=(LocaleMatcher &&src) noexcept;
+
+    const Locale *getBestMatch(const Locale &desiredLocale, UErrorCode &errorCode) const;
+
+    const Locale *getBestMatch(Locale::Iterator &desiredLocales, UErrorCode &errorCode) const;
+
+    const Locale *getBestMatchForListString(StringPiece desiredLocaleList, UErrorCode &errorCode) const;
+
+    Result getBestMatchResult(const Locale &desiredLocale, UErrorCode &errorCode) const;
+
+    Result getBestMatchResult(Locale::Iterator &desiredLocales, UErrorCode &errorCode) const;
+
+    UBool isMatch(const Locale &desired, const Locale &supported, UErrorCode &errorCode) const;
+
+#ifndef U_HIDE_INTERNAL_API
+    double internalMatch(const Locale &desired, const Locale &supported, UErrorCode &errorCode) const;
+#endif  // U_HIDE_INTERNAL_API
+
+private:
+    LocaleMatcher(const Builder &builder, UErrorCode &errorCode);
+    LocaleMatcher(const LocaleMatcher &other) = delete;
+    LocaleMatcher &operator=(const LocaleMatcher &other) = delete;
+
+    int32_t putIfAbsent(const LSR &lsr, int32_t i, int32_t suppLength, UErrorCode &errorCode);
+
+    std::optional<int32_t> getBestSuppIndex(LSR desiredLSR, LocaleLsrIterator *remainingIter, UErrorCode &errorCode) const;
+
+    const LikelySubtags &likelySubtags;
+    const LocaleDistance &localeDistance;
+    int32_t thresholdDistance;
+    int32_t demotionPerDesiredLocale;
+    ULocMatchFavorSubtag favorSubtag;
+    ULocMatchDirection direction;
+
+    const Locale ** supportedLocales;
+    LSR *lsrs;
+    int32_t supportedLocalesLength;
+    UHashtable *supportedLsrToIndex;  
+    const LSR **supportedLSRs;
+    int32_t *supportedIndexes;
+    int32_t supportedLSRsLength;
+    Locale *ownedDefaultLocale;
+    const Locale *defaultLocale;
+};
+
+U_NAMESPACE_END
+
+#endif  // U_SHOW_CPLUSPLUS_API
+#endif  // __LOCALEMATCHER_H__

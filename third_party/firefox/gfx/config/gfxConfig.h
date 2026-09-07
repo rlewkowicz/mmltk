@@ -1,0 +1,153 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef mozilla_gfx_config_gfxConfig_h
+#define mozilla_gfx_config_gfxConfig_h
+
+#include <functional>
+#include "gfxFeature.h"
+#include "gfxFallback.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/EnumSet.h"
+#include "mozilla/Maybe.h"
+
+namespace mozilla {
+namespace gfx {
+
+class DevicePrefs;
+class FeatureFailure;
+
+class gfxConfig {
+ public:
+  static FeatureState& GetFeature(Feature aFeature);
+
+  static bool IsEnabled(Feature aFeature);
+
+  static bool IsForcedOnByUser(Feature aFeature);
+
+  static bool IsDisabledByDefault(Feature aFeature);
+
+  static FeatureStatus GetValue(Feature aFeature);
+
+  static void Reset(Feature aFeature);
+
+  static bool SetDefault(Feature aFeature, bool aEnable,
+                         FeatureStatus aDisableStatus,
+                         const char* aDisableMessage);
+  static void DisableByDefault(Feature aFeature, FeatureStatus aDisableStatus,
+                               const char* aDisableMessage,
+                               const nsACString& aFailureId = ""_ns);
+  static void EnableByDefault(Feature aFeature);
+
+  static void Inherit(Feature aFeature, FeatureStatus aStatus);
+
+  static void Inherit(EnumSet<Feature> aFeatures,
+                      const DevicePrefs& aDevicePrefs);
+
+  static void Disable(Feature aFeature, FeatureStatus aStatus,
+                      const char* aMessage,
+                      const nsACString& aFailureId = ""_ns);
+
+  static void SetDefaultFromPref(Feature aFeature, const char* aPrefName,
+                                 bool aIsEnablePref, bool aDefaultValue);
+
+  static void SetFailed(Feature aFeature, FeatureStatus aStatus,
+                        const char* aMessage,
+                        const nsACString& aFailureId = ""_ns);
+
+  static void ForceDisable(Feature aFeature, FeatureStatus aStatus,
+                           const char* aMessage,
+                           const nsACString& aFailureId = ""_ns) {
+    SetFailed(aFeature, aStatus, aMessage, aFailureId);
+  }
+
+  static bool MaybeSetFailed(Feature aFeature, bool aEnable,
+                             FeatureStatus aDisableStatus,
+                             const char* aDisableMessage,
+                             const nsACString& aFailureId = ""_ns) {
+    if (!aEnable) {
+      SetFailed(aFeature, aDisableStatus, aDisableMessage, aFailureId);
+      return false;
+    }
+    return true;
+  }
+
+  static bool MaybeSetFailed(Feature aFeature, FeatureStatus aStatus,
+                             const char* aDisableMessage,
+                             const nsACString& aFailureId = ""_ns) {
+    return MaybeSetFailed(aFeature,
+                          (aStatus != FeatureStatus::Available &&
+                           aStatus != FeatureStatus::ForceEnabled),
+                          aStatus, aDisableMessage, aFailureId);
+  }
+
+  static void Reenable(Feature aFeature, Fallback aFallback);
+
+  static bool InitOrUpdate(Feature aFeature, bool aEnable,
+                           FeatureStatus aDisableStatus,
+                           const char* aDisableMessage);
+
+  static void UserEnable(Feature aFeature, const char* aMessage);
+  static void UserForceEnable(Feature aFeature, const char* aMessage);
+  static void UserDisable(Feature aFeature, const char* aMessage,
+                          const nsACString& aFailureId = ""_ns);
+
+  static bool UseFallback(Fallback aFallback);
+
+  static void EnableFallback(Fallback aFallback, const char* aMessage);
+
+  typedef std::function<void(const char* aName, const char* aDescription,
+                             FeatureState& aFeature)>
+      FeatureIterCallback;
+  static void ForEachFeature(const FeatureIterCallback& aCallback);
+
+  typedef std::function<void(const char* aName, const char* aMsg)>
+      FallbackIterCallback;
+  static void ForEachFallback(const FallbackIterCallback& aCallback);
+
+  static const nsCString& GetFailureId(Feature aFeature);
+
+  static void ImportChange(Feature aFeature,
+                           const Maybe<FeatureFailure>& aChange);
+
+  static void Init();
+  static void Shutdown();
+
+ private:
+  void ForEachFallbackImpl(const FallbackIterCallback& aCallback);
+
+ private:
+  FeatureState& GetState(Feature aFeature) {
+    MOZ_ASSERT(size_t(aFeature) < kNumFeatures);
+    return mFeatures[size_t(aFeature)];
+  }
+  const FeatureState& GetState(Feature aFeature) const {
+    MOZ_ASSERT(size_t(aFeature) < kNumFeatures);
+    return mFeatures[size_t(aFeature)];
+  }
+
+  bool UseFallbackImpl(Fallback aFallback) const;
+  void EnableFallbackImpl(Fallback aFallback, const char* aMessage);
+
+ private:
+  static const size_t kNumFeatures = size_t(Feature::NumValues);
+  static const size_t kNumFallbacks = size_t(Fallback::NumValues);
+
+ private:
+  FeatureState mFeatures[kNumFeatures];
+  uint64_t mFallbackBits;
+
+ private:
+  struct FallbackLogEntry {
+    Fallback mFallback;
+    char mMessage[80];
+  };
+
+  FallbackLogEntry mFallbackLog[kNumFallbacks];
+  size_t mNumFallbackLogEntries;
+};
+
+}  
+}  
+
+#endif  // mozilla_gfx_config_gfxConfig_h

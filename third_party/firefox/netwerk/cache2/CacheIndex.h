@@ -1,0 +1,1008 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef CacheIndex_h_
+#define CacheIndex_h_
+
+#include "CacheLog.h"
+#include "CacheFileIOManager.h"
+#include "nsIRunnable.h"
+#include "CacheHashUtils.h"
+#include "nsICacheStorageService.h"
+#include "nsICacheEntry.h"
+#include "nsILoadContextInfo.h"
+#include "nsIWeakReferenceUtils.h"
+#include "nsTHashtable.h"
+#include "nsThreadUtils.h"
+#include "mozilla/IntegerPrintfMacros.h"
+#include "mozilla/SHA1.h"
+#include "mozilla/StaticMutex.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/EndianUtils.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/UniquePtr.h"
+
+class nsIFile;
+class nsIDirectoryEnumerator;
+class nsITimer;
+
+#ifdef DEBUG
+#  define DEBUG_STATS 1
+#endif
+
+namespace mozilla {
+namespace net {
+
+class CacheFileMetadata;
+class FileOpenHelper;
+class CacheIndexIterator;
+
+using CacheIndexHeader = struct {
+  uint32_t mVersion;
+
+  uint32_t mTimeStamp;
+
+  uint32_t mIsDirty;
+
+  uint32_t mKBWritten;
+
+  uint32_t mIsEncrypted;
+};
+
+static_assert(sizeof(CacheIndexHeader::mVersion) +
+                      sizeof(CacheIndexHeader::mTimeStamp) +
+                      sizeof(CacheIndexHeader::mIsDirty) +
+                      sizeof(CacheIndexHeader::mKBWritten) +
+                      sizeof(CacheIndexHeader::mIsEncrypted) ==
+                  sizeof(CacheIndexHeader),
+              "Unexpected sizeof(CacheIndexHeader)!");
+
+#pragma pack(push, 1)
+struct CacheIndexRecord {
+  SHA1Sum::Hash mHash{};
+  uint32_t mFrecency{0};
+  OriginAttrsHash mOriginAttrsHash{0};
+  uint32_t mLastFetched{0};
+  uint32_t mFetchCount{0};
+  uint8_t mContentType{nsICacheEntry::CONTENT_TYPE_UNKNOWN};
+
+  uint32_t mFlags{0};
+
+  CacheIndexRecord() = default;
+};
+#pragma pack(pop)
+
+
+
+static_assert(sizeof(CacheIndexRecord::mHash) +
+                      sizeof(CacheIndexRecord::mFrecency) +
+                      sizeof(CacheIndexRecord::mOriginAttrsHash) +
+                      sizeof(CacheIndexRecord::mLastFetched) +
+                      sizeof(CacheIndexRecord::mFetchCount) +
+                      sizeof(CacheIndexRecord::mContentType) +
+                      sizeof(CacheIndexRecord::mFlags) ==
+                  sizeof(CacheIndexRecord),
+              "Unexpected sizeof(CacheIndexRecord)!");
+
+class CacheIndexRecordWrapper final {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING_WITH_DESTROY(
+      CacheIndexRecordWrapper, DispatchDeleteSelfToCurrentThread());
+
+  CacheIndexRecordWrapper() : mRec(MakeUnique<CacheIndexRecord>()) {}
+  CacheIndexRecord* Get() { return mRec.get(); }
+
+ private:
+  ~CacheIndexRecordWrapper();
+  void DispatchDeleteSelfToCurrentThread();
+  UniquePtr<CacheIndexRecord> mRec;
+  friend class DeleteCacheIndexRecordWrapper;
+};
+
+class CacheIndexEntry : public PLDHashEntryHdr {
+ public:
+  using KeyType = const SHA1Sum::Hash&;
+  using KeyTypePointer = const SHA1Sum::Hash*;
+
+  explicit CacheIndexEntry(KeyTypePointer aKey) {
+    MOZ_COUNT_CTOR(CacheIndexEntry);
+    mRec = new CacheIndexRecordWrapper();
+    LOG(("CacheIndexEntry::CacheIndexEntry() - Created record [rec=%p]",
+         mRec->Get()));
+    memcpy(&mRec->Get()->mHash, aKey, sizeof(SHA1Sum::Hash));
+  }
+  CacheIndexEntry(const CacheIndexEntry& aOther) {
+    MOZ_ASSERT_UNREACHABLE("CacheIndexEntry copy constructor is forbidden!");
+  }
+  ~CacheIndexEntry() {
+    MOZ_COUNT_DTOR(CacheIndexEntry);
+    LOG(("CacheIndexEntry::~CacheIndexEntry() - Deleting record [rec=%p]",
+         mRec->Get()));
+  }
+
+  bool KeyEquals(KeyTypePointer aKey) const {
+    return memcmp(&mRec->Get()->mHash, aKey, sizeof(SHA1Sum::Hash)) == 0;
+  }
+
+  static KeyTypePointer KeyToPointer(KeyType aKey) { return &aKey; }
+
+  static PLDHashNumber HashKey(KeyTypePointer aKey) {
+    return (reinterpret_cast<const uint32_t*>(aKey))[0];
+  }
+
+  enum { ALLOW_MEMMOVE = true };
+
+  bool operator==(const CacheIndexEntry& aOther) const {
+    return KeyEquals(&aOther.mRec->Get()->mHash);
+  }
+
+  CacheIndexEntry& operator=(const CacheIndexEntry& aOther) {
+    MOZ_ASSERT(memcmp(&mRec->Get()->mHash, &aOther.mRec->Get()->mHash,
+                      sizeof(SHA1Sum::Hash)) == 0);
+    mRec->Get()->mFrecency = aOther.mRec->Get()->mFrecency;
+    mRec->Get()->mOriginAttrsHash = aOther.mRec->Get()->mOriginAttrsHash;
+    mRec->Get()->mLastFetched = aOther.mRec->Get()->mLastFetched;
+    mRec->Get()->mFetchCount = aOther.mRec->Get()->mFetchCount;
+    mRec->Get()->mContentType = aOther.mRec->Get()->mContentType;
+    mRec->Get()->mFlags = aOther.mRec->Get()->mFlags;
+    return *this;
+  }
+
+  void InitNew() {
+    mRec->Get()->mFrecency = 0;
+    mRec->Get()->mOriginAttrsHash = 0;
+    mRec->Get()->mLastFetched = 0;
+    mRec->Get()->mFetchCount = 0;
+    mRec->Get()->mContentType = nsICacheEntry::CONTENT_TYPE_UNKNOWN;
+    mRec->Get()->mFlags = 0;
+  }
+
+  void Init(OriginAttrsHash aOriginAttrsHash, bool aAnonymous, bool aPinned) {
+    MOZ_ASSERT(mRec->Get()->mFrecency == 0);
+    MOZ_ASSERT(mRec->Get()->mOriginAttrsHash == 0);
+    MOZ_ASSERT(mRec->Get()->mLastFetched == 0);
+    MOZ_ASSERT(mRec->Get()->mFetchCount == 0);
+    MOZ_ASSERT(mRec->Get()->mContentType ==
+               nsICacheEntry::CONTENT_TYPE_UNKNOWN);
+    MOZ_ASSERT((mRec->Get()->mFlags & ~kDirtyMask) == kFreshMask);
+
+    mRec->Get()->mOriginAttrsHash = aOriginAttrsHash;
+    mRec->Get()->mFlags |= kInitializedMask;
+    if (aAnonymous) {
+      mRec->Get()->mFlags |= kAnonymousMask;
+    }
+    if (aPinned) {
+      mRec->Get()->mFlags |= kPinnedMask;
+    }
+  }
+
+  const SHA1Sum::Hash* Hash() const { return &mRec->Get()->mHash; }
+
+  bool IsInitialized() const {
+    return !!(mRec->Get()->mFlags & kInitializedMask);
+  }
+
+  mozilla::net::OriginAttrsHash OriginAttrsHash() const {
+    return mRec->Get()->mOriginAttrsHash;
+  }
+
+  bool Anonymous() const { return !!(mRec->Get()->mFlags & kAnonymousMask); }
+
+  bool IsRemoved() const { return !!(mRec->Get()->mFlags & kRemovedMask); }
+  void MarkRemoved() { mRec->Get()->mFlags |= kRemovedMask; }
+
+  bool IsDirty() const { return !!(mRec->Get()->mFlags & kDirtyMask); }
+  void MarkDirty() { mRec->Get()->mFlags |= kDirtyMask; }
+  void ClearDirty() { mRec->Get()->mFlags &= ~kDirtyMask; }
+
+  bool IsFresh() const { return !!(mRec->Get()->mFlags & kFreshMask); }
+  void MarkFresh() { mRec->Get()->mFlags |= kFreshMask; }
+
+  bool IsPinned() const { return !!(mRec->Get()->mFlags & kPinnedMask); }
+
+  void SetFrecency(uint32_t aFrecency) { mRec->Get()->mFrecency = aFrecency; }
+  uint32_t GetFrecency() const { return mRec->Get()->mFrecency; }
+
+  void SetHasAltData(bool aHasAltData) {
+    aHasAltData ? mRec->Get()->mFlags |= kHasAltDataMask
+                : mRec->Get()->mFlags &= ~kHasAltDataMask;
+  }
+  bool GetHasAltData() const {
+    return !!(mRec->Get()->mFlags & kHasAltDataMask);
+  }
+
+  void SetHasNoVarySearch(bool aVal) {
+    aVal ? mRec->Get()->mFlags |= kHasNoVarySearchMask
+         : mRec->Get()->mFlags &= ~kHasNoVarySearchMask;
+  }
+  bool HasNoVarySearch() const {
+    return !!(mRec->Get()->mFlags & kHasNoVarySearchMask);
+  }
+
+  void SetLastFetched(uint32_t aLastFetched) {
+    mRec->Get()->mLastFetched = aLastFetched;
+  }
+  uint32_t GetLastFetched() const { return mRec->Get()->mLastFetched; }
+
+  void SetFetchCount(uint32_t aFetchCount) {
+    mRec->Get()->mFetchCount = aFetchCount;
+  }
+  uint32_t GetFetchCount() const { return mRec->Get()->mFetchCount; }
+
+  void SetContentType(uint8_t aType) { mRec->Get()->mContentType = aType; }
+  uint8_t GetContentType() const { return GetContentType(mRec->Get()); }
+  static uint8_t GetContentType(CacheIndexRecord* aRec) {
+    if (aRec->mContentType >= nsICacheEntry::CONTENT_TYPE_LAST) {
+      LOG(
+          ("CacheIndexEntry::GetContentType() - Found invalid content type "
+           "[hash=%08x%08x%08x%08x%08x, contentType=%u]",
+           LOGSHA1(aRec->mHash), aRec->mContentType));
+      return nsICacheEntry::CONTENT_TYPE_UNKNOWN;
+    }
+    return aRec->mContentType;
+  }
+
+  void SetFileSize(uint32_t aFileSize) {
+    if (aFileSize > kFileSizeMask) {
+      LOG(
+          ("CacheIndexEntry::SetFileSize() - FileSize is too large, "
+           "truncating to %u",
+           kFileSizeMask));
+      aFileSize = kFileSizeMask;
+    }
+    mRec->Get()->mFlags &= ~kFileSizeMask;
+    mRec->Get()->mFlags |= aFileSize;
+  }
+  uint32_t GetFileSize() const { return GetFileSize(*(mRec->Get())); }
+  static uint32_t GetFileSize(const CacheIndexRecord& aRec) {
+    return aRec.mFlags & kFileSizeMask;
+  }
+  static uint32_t IsPinned(CacheIndexRecord* aRec) {
+    return aRec->mFlags & kPinnedMask;
+  }
+  bool IsFileEmpty() const { return GetFileSize() == 0; }
+
+  void WriteToBuf(void* aBuf) {
+    uint8_t* ptr = static_cast<uint8_t*>(aBuf);
+    memcpy(ptr, mRec->Get()->mHash, sizeof(SHA1Sum::Hash));
+    ptr += sizeof(SHA1Sum::Hash);
+    NetworkEndian::writeUint32(ptr, mRec->Get()->mFrecency);
+    ptr += sizeof(uint32_t);
+    NetworkEndian::writeUint64(ptr, mRec->Get()->mOriginAttrsHash);
+    ptr += sizeof(uint64_t);
+    NetworkEndian::writeUint32(ptr, mRec->Get()->mLastFetched);
+    ptr += sizeof(uint32_t);
+    NetworkEndian::writeUint32(ptr, mRec->Get()->mFetchCount);
+    ptr += sizeof(uint32_t);
+    *ptr = mRec->Get()->mContentType;
+    ptr += sizeof(uint8_t);
+    NetworkEndian::writeUint32(
+        ptr, mRec->Get()->mFlags & ~(kDirtyMask | kFreshMask));
+  }
+
+  void ReadFromBuf(void* aBuf) {
+    const uint8_t* ptr = static_cast<const uint8_t*>(aBuf);
+    MOZ_ASSERT(memcmp(&mRec->Get()->mHash, ptr, sizeof(SHA1Sum::Hash)) == 0);
+    ptr += sizeof(SHA1Sum::Hash);
+    mRec->Get()->mFrecency = NetworkEndian::readUint32(ptr);
+    ptr += sizeof(uint32_t);
+    mRec->Get()->mOriginAttrsHash = NetworkEndian::readUint64(ptr);
+    ptr += sizeof(uint64_t);
+    mRec->Get()->mLastFetched = NetworkEndian::readUint32(ptr);
+    ptr += sizeof(uint32_t);
+    mRec->Get()->mFetchCount = NetworkEndian::readUint32(ptr);
+    ptr += sizeof(uint32_t);
+    mRec->Get()->mContentType = *ptr;
+    ptr += sizeof(uint8_t);
+    mRec->Get()->mFlags = NetworkEndian::readUint32(ptr);
+  }
+
+  void Log() const {
+    LOG(
+        ("CacheIndexEntry::Log() [this=%p, hash=%08x%08x%08x%08x%08x, fresh=%u,"
+         " initialized=%u, removed=%u, dirty=%u, anonymous=%u, "
+         "originAttrsHash=%" PRIx64 ", frecency=%u, hasAltData=%u, "
+         "lastFetched=%u, fetchCount=%u, contentType=%u, size=%u]",
+         this, LOGSHA1(mRec->Get()->mHash), IsFresh(), IsInitialized(),
+         IsRemoved(), IsDirty(), Anonymous(), OriginAttrsHash(), GetFrecency(),
+         GetHasAltData(), GetLastFetched(), GetFetchCount(), GetContentType(),
+         GetFileSize()));
+  }
+
+  static bool RecordMatchesLoadContextInfo(CacheIndexRecordWrapper* aRec,
+                                           nsILoadContextInfo* aInfo) {
+    MOZ_ASSERT(aInfo);
+
+    return !aInfo->IsPrivate() &&
+           GetOriginAttrsHash(*aInfo->OriginAttributesPtr()) ==
+               aRec->Get()->mOriginAttrsHash &&
+           aInfo->IsAnonymous() == !!(aRec->Get()->mFlags & kAnonymousMask);
+  }
+
+  size_t SizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+    return mallocSizeOf(mRec->Get());
+  }
+
+  size_t SizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+    return mallocSizeOf(this) + SizeOfExcludingThis(mallocSizeOf);
+  }
+
+ private:
+  friend class CacheIndexEntryUpdate;
+  friend class CacheIndex;
+  friend class CacheIndexEntryAutoManage;
+  friend struct CacheIndexRecord;
+
+  static const uint32_t kInitializedMask = 0x80000000;
+  static const uint32_t kAnonymousMask = 0x40000000;
+
+  static const uint32_t kRemovedMask = 0x20000000;
+
+  static const uint32_t kDirtyMask = 0x10000000;
+
+  static const uint32_t kFreshMask = 0x08000000;
+
+  static const uint32_t kPinnedMask = 0x04000000;
+
+  static const uint32_t kHasAltDataMask = 0x02000000;
+
+  static const uint32_t kDictionaryMask = 0x01000000;
+
+  static const uint32_t kHasNoVarySearchMask = 0x00800000;
+
+  static const uint32_t kFileSizeMask = 0x007FFFFF;
+
+  RefPtr<CacheIndexRecordWrapper> mRec;
+};
+
+class CacheIndexEntryUpdate : public CacheIndexEntry {
+ public:
+  explicit CacheIndexEntryUpdate(CacheIndexEntry::KeyTypePointer aKey)
+      : CacheIndexEntry(aKey), mUpdateFlags(0) {
+    MOZ_COUNT_CTOR(CacheIndexEntryUpdate);
+    LOG(("CacheIndexEntryUpdate::CacheIndexEntryUpdate()"));
+  }
+  ~CacheIndexEntryUpdate() {
+    MOZ_COUNT_DTOR(CacheIndexEntryUpdate);
+    LOG(("CacheIndexEntryUpdate::~CacheIndexEntryUpdate()"));
+  }
+
+  CacheIndexEntryUpdate& operator=(const CacheIndexEntry& aOther) {
+    MOZ_ASSERT(memcmp(&mRec->Get()->mHash, &aOther.mRec->Get()->mHash,
+                      sizeof(SHA1Sum::Hash)) == 0);
+    mUpdateFlags = 0;
+    *(static_cast<CacheIndexEntry*>(this)) = aOther;
+    return *this;
+  }
+
+  void InitNew() {
+    mUpdateFlags = kFrecencyUpdatedMask | kHasAltDataUpdatedMask |
+                   kLastFetchedUpdatedMask | kFetchCountUpdatedMask |
+                   kContentTypeUpdatedMask | kFileSizeUpdatedMask;
+    CacheIndexEntry::InitNew();
+  }
+
+  void SetFrecency(uint32_t aFrecency) {
+    mUpdateFlags |= kFrecencyUpdatedMask;
+    CacheIndexEntry::SetFrecency(aFrecency);
+  }
+
+  void SetHasAltData(bool aHasAltData) {
+    mUpdateFlags |= kHasAltDataUpdatedMask;
+    CacheIndexEntry::SetHasAltData(aHasAltData);
+  }
+
+  void SetLastFetched(uint32_t aLastFetched) {
+    mUpdateFlags |= kLastFetchedUpdatedMask;
+    CacheIndexEntry::SetLastFetched(aLastFetched);
+  }
+
+  void SetFetchCount(uint32_t aFetchCount) {
+    mUpdateFlags |= kFetchCountUpdatedMask;
+    CacheIndexEntry::SetFetchCount(aFetchCount);
+  }
+
+  void SetContentType(uint8_t aType) {
+    mUpdateFlags |= kContentTypeUpdatedMask;
+    CacheIndexEntry::SetContentType(aType);
+  }
+
+  void SetFileSize(uint32_t aFileSize) {
+    mUpdateFlags |= kFileSizeUpdatedMask;
+    CacheIndexEntry::SetFileSize(aFileSize);
+  }
+
+  void ApplyUpdate(CacheIndexEntry* aDst) {
+    MOZ_ASSERT(memcmp(&mRec->Get()->mHash, &aDst->mRec->Get()->mHash,
+                      sizeof(SHA1Sum::Hash)) == 0);
+    if (mUpdateFlags & kFrecencyUpdatedMask) {
+      aDst->mRec->Get()->mFrecency = mRec->Get()->mFrecency;
+    }
+    aDst->mRec->Get()->mOriginAttrsHash = mRec->Get()->mOriginAttrsHash;
+    if (mUpdateFlags & kLastFetchedUpdatedMask) {
+      aDst->mRec->Get()->mLastFetched = mRec->Get()->mLastFetched;
+    }
+    if (mUpdateFlags & kFetchCountUpdatedMask) {
+      aDst->mRec->Get()->mFetchCount = mRec->Get()->mFetchCount;
+    }
+    if (mUpdateFlags & kContentTypeUpdatedMask) {
+      aDst->mRec->Get()->mContentType = mRec->Get()->mContentType;
+    }
+    if (mUpdateFlags & kHasAltDataUpdatedMask &&
+        ((aDst->mRec->Get()->mFlags ^ mRec->Get()->mFlags) & kHasAltDataMask)) {
+      aDst->mRec->Get()->mFlags ^= kHasAltDataMask;
+    }
+
+    if (mUpdateFlags & kFileSizeUpdatedMask) {
+      aDst->mRec->Get()->mFlags |= (mRec->Get()->mFlags & ~kHasAltDataMask);
+    } else {
+      aDst->mRec->Get()->mFlags &= kFileSizeMask;
+      aDst->mRec->Get()->mFlags |=
+          (mRec->Get()->mFlags & ~kHasAltDataMask & ~kFileSizeMask);
+    }
+  }
+
+ private:
+  static const uint32_t kFrecencyUpdatedMask = 0x00000001;
+  static const uint32_t kContentTypeUpdatedMask = 0x00000002;
+  static const uint32_t kFileSizeUpdatedMask = 0x00000004;
+  static const uint32_t kHasAltDataUpdatedMask = 0x00000008;
+  static const uint32_t kLastFetchedUpdatedMask = 0x00000010;
+  static const uint32_t kFetchCountUpdatedMask = 0x00000020;
+
+  uint32_t mUpdateFlags;
+};
+
+class CacheIndexStats {
+ public:
+  CacheIndexStats() {
+    for (uint32_t i = 0; i < nsICacheEntry::CONTENT_TYPE_LAST; ++i) {
+      mCountByType[i] = 0;
+      mSizeByType[i] = 0;
+    }
+  }
+
+  bool operator==(const CacheIndexStats& aOther) const {
+    for (uint32_t i = 0; i < nsICacheEntry::CONTENT_TYPE_LAST; ++i) {
+      if (mCountByType[i] != aOther.mCountByType[i] ||
+          mSizeByType[i] != aOther.mSizeByType[i]) {
+        return false;
+      }
+    }
+
+    return
+#ifdef DEBUG
+        aOther.mStateLogged == mStateLogged &&
+#endif
+        aOther.mCount == mCount && aOther.mNotInitialized == mNotInitialized &&
+        aOther.mRemoved == mRemoved && aOther.mDirty == mDirty &&
+        aOther.mFresh == mFresh && aOther.mEmpty == mEmpty &&
+        aOther.mSize == mSize;
+  }
+
+#ifdef DEBUG
+  void DisableLogging() { mDisableLogging = true; }
+#endif
+
+  void Log() {
+    LOG(
+        ("CacheIndexStats::Log() [count=%u, notInitialized=%u, removed=%u, "
+         "dirty=%u, fresh=%u, empty=%u, size=%u]",
+         mCount, mNotInitialized, mRemoved, mDirty, mFresh, mEmpty, mSize));
+  }
+
+  void Clear() {
+    MOZ_ASSERT(!mStateLogged, "CacheIndexStats::Clear() - state logged!");
+
+    mCount = 0;
+    mNotInitialized = 0;
+    mRemoved = 0;
+    mDirty = 0;
+    mFresh = 0;
+    mEmpty = 0;
+    mSize = 0;
+    for (uint32_t i = 0; i < nsICacheEntry::CONTENT_TYPE_LAST; ++i) {
+      mCountByType[i] = 0;
+      mSizeByType[i] = 0;
+    }
+  }
+
+#ifdef DEBUG
+  bool StateLogged() { return mStateLogged; }
+#endif
+
+  uint32_t Count() {
+    MOZ_ASSERT(!mStateLogged, "CacheIndexStats::Count() - state logged!");
+    return mCount;
+  }
+
+  uint32_t CountByType(uint8_t aContentType) {
+    MOZ_ASSERT(!mStateLogged, "CacheIndexStats::CountByType() - state logged!");
+    MOZ_RELEASE_ASSERT(aContentType < nsICacheEntry::CONTENT_TYPE_LAST);
+    return mCountByType[aContentType];
+  }
+
+  uint32_t Dirty() {
+    MOZ_ASSERT(!mStateLogged, "CacheIndexStats::Dirty() - state logged!");
+    return mDirty;
+  }
+
+  uint32_t Fresh() {
+    MOZ_ASSERT(!mStateLogged, "CacheIndexStats::Fresh() - state logged!");
+    return mFresh;
+  }
+
+  uint32_t ActiveEntriesCount() {
+    MOZ_ASSERT(!mStateLogged,
+               "CacheIndexStats::ActiveEntriesCount() - state "
+               "logged!");
+    return mCount - mRemoved - mNotInitialized - mEmpty;
+  }
+
+  uint32_t Size() {
+    MOZ_ASSERT(!mStateLogged, "CacheIndexStats::Size() - state logged!");
+    return mSize;
+  }
+
+  uint32_t SizeByType(uint8_t aContentType) {
+    MOZ_ASSERT(!mStateLogged, "CacheIndexStats::SizeByType() - state logged!");
+    MOZ_RELEASE_ASSERT(aContentType < nsICacheEntry::CONTENT_TYPE_LAST);
+    return mSizeByType[aContentType];
+  }
+
+  void BeforeChange(const CacheIndexEntry* aEntry) {
+#ifdef DEBUG_STATS
+    if (!mDisableLogging) {
+      LOG(("CacheIndexStats::BeforeChange()"));
+      Log();
+    }
+#endif
+
+    MOZ_ASSERT(!mStateLogged,
+               "CacheIndexStats::BeforeChange() - state "
+               "logged!");
+#ifdef DEBUG
+    mStateLogged = true;
+#endif
+    if (aEntry) {
+      MOZ_ASSERT(mCount);
+      uint8_t contentType = aEntry->GetContentType();
+      mCount--;
+      mCountByType[contentType]--;
+      if (aEntry->IsDirty()) {
+        MOZ_ASSERT(mDirty);
+        mDirty--;
+      }
+      if (aEntry->IsFresh()) {
+        MOZ_ASSERT(mFresh);
+        mFresh--;
+      }
+      if (aEntry->IsRemoved()) {
+        MOZ_ASSERT(mRemoved);
+        mRemoved--;
+      } else {
+        if (!aEntry->IsInitialized()) {
+          MOZ_ASSERT(mNotInitialized);
+          mNotInitialized--;
+        } else {
+          if (aEntry->IsFileEmpty()) {
+            MOZ_ASSERT(mEmpty);
+            mEmpty--;
+          } else {
+            MOZ_ASSERT(mSize >= aEntry->GetFileSize());
+            mSize -= aEntry->GetFileSize();
+            mSizeByType[contentType] -= aEntry->GetFileSize();
+          }
+        }
+      }
+    }
+  }
+
+  void AfterChange(const CacheIndexEntry* aEntry) {
+    MOZ_ASSERT(mStateLogged,
+               "CacheIndexStats::AfterChange() - state not "
+               "logged!");
+#ifdef DEBUG
+    mStateLogged = false;
+#endif
+    if (aEntry) {
+      uint8_t contentType = aEntry->GetContentType();
+      ++mCount;
+      ++mCountByType[contentType];
+      if (aEntry->IsDirty()) {
+        mDirty++;
+      }
+      if (aEntry->IsFresh()) {
+        mFresh++;
+      }
+      if (aEntry->IsRemoved()) {
+        mRemoved++;
+      } else {
+        if (!aEntry->IsInitialized()) {
+          mNotInitialized++;
+        } else {
+          if (aEntry->IsFileEmpty()) {
+            mEmpty++;
+          } else {
+            mSize += aEntry->GetFileSize();
+            mSizeByType[contentType] += aEntry->GetFileSize();
+          }
+        }
+      }
+    }
+
+#ifdef DEBUG_STATS
+    if (!mDisableLogging) {
+      LOG(("CacheIndexStats::AfterChange()"));
+      Log();
+    }
+#endif
+  }
+
+ private:
+  uint32_t mCount{0};
+  uint32_t mCountByType[nsICacheEntry::CONTENT_TYPE_LAST]{0};
+  uint32_t mNotInitialized{0};
+  uint32_t mRemoved{0};
+  uint32_t mDirty{0};
+  uint32_t mFresh{0};
+  uint32_t mEmpty{0};
+  uint32_t mSize{0};
+  uint32_t mSizeByType[nsICacheEntry::CONTENT_TYPE_LAST]{0};
+#ifdef DEBUG
+  bool mStateLogged{false};
+
+  bool mDisableLogging{false};
+#endif
+};
+
+class CacheIndex final : public CacheFileIOListener, public nsIRunnable {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIRUNNABLE
+
+  CacheIndex();
+  static nsresult Init(nsIFile* aCacheDirectory);
+  static nsresult PreShutdown();
+  static nsresult Shutdown();
+
+  static void WriteIndexToDiskNow();
+
+
+  static nsresult AddEntry(const SHA1Sum::Hash* aHash);
+
+  static nsresult EnsureEntryExists(const SHA1Sum::Hash* aHash);
+
+  static nsresult InitEntry(const SHA1Sum::Hash* aHash,
+                            OriginAttrsHash aOriginAttrsHash, bool aAnonymous,
+                            bool aPinned);
+
+  static nsresult RemoveEntry(const SHA1Sum::Hash* aHash,
+                              const nsACString& aKey,
+                              bool aClearDictionary = true);
+
+  static nsresult UpdateEntry(const SHA1Sum::Hash* aHash,
+                              const uint32_t* aFrecency,
+                              const bool* aHasAltData,
+                              const uint32_t* aLastFetched,
+                              const uint32_t* aFetchCount,
+                              const uint8_t* aContentType,
+                              const uint32_t* aSize);
+
+  static void EvictByContext(const nsAString& aOrigin,
+                             const nsAString& aBaseDomain);
+
+  static nsresult RemoveAll();
+
+  enum EntryStatus { EXISTS = 0, DOES_NOT_EXIST = 1, DO_NOT_KNOW = 2 };
+
+  using EvictionSortedSnapshot = nsTArray<RefPtr<CacheIndexRecordWrapper>>;
+
+  static nsresult HasEntry(
+      const nsACString& aKey, EntryStatus* _retval,
+      const std::function<void(const CacheIndexEntry*)>& aCB = nullptr);
+  static nsresult HasEntry(
+      const SHA1Sum::Hash& hash, EntryStatus* _retval,
+      const std::function<void(const CacheIndexEntry*)>& aCB = nullptr);
+
+  static nsresult GetEntryForEviction(EvictionSortedSnapshot& aSnapshot,
+                                      bool aIgnoreEmptyEntries,
+                                      SHA1Sum::Hash* aHash, uint32_t* aCnt);
+
+  static EvictionSortedSnapshot GetSortedSnapshotForEviction();
+
+  static bool IsForcedValidEntry(const SHA1Sum::Hash* aHash);
+
+  static nsresult GetCacheSize(uint32_t* _retval);
+
+  static nsresult GetEntryFileCount(uint32_t* _retval);
+
+  static nsresult GetCacheStats(nsILoadContextInfo* aInfo, uint32_t* aSize,
+                                uint32_t* aCount);
+
+  static nsresult AsyncGetDiskConsumption(
+      nsICacheStorageConsumptionObserver* aObserver);
+
+  static nsresult GetIterator(nsILoadContextInfo* aInfo, bool aAddNew,
+                              CacheIndexIterator** _retval);
+
+  static nsresult IsUpToDate(bool* _retval);
+
+  static void OnAsyncEviction(bool aEvicting);
+
+  static size_t SizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf);
+  static size_t SizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf);
+
+ private:
+  friend class CacheIndexEntryAutoManage;
+  friend class FileOpenHelper;
+  friend class CacheIndexIterator;
+  friend class CacheIndexRecordWrapper;
+  friend class DeleteCacheIndexRecordWrapper;
+
+  virtual ~CacheIndex();
+
+  NS_IMETHOD OnFileOpened(CacheFileHandle* aHandle, nsresult aResult) override;
+  void OnFileOpenedInternal(FileOpenHelper* aOpener, CacheFileHandle* aHandle,
+                            nsresult aResult,
+                            const StaticMutexAutoLock& aProofOfLock)
+      MOZ_REQUIRES(sLock);
+  NS_IMETHOD OnDataWritten(CacheFileHandle* aHandle, const char* aBuf,
+                           nsresult aResult) override;
+  NS_IMETHOD OnDataRead(CacheFileHandle* aHandle, char* aBuf,
+                        nsresult aResult) override;
+  NS_IMETHOD OnFileDoomed(CacheFileHandle* aHandle, nsresult aResult) override;
+  NS_IMETHOD OnEOFSet(CacheFileHandle* aHandle, nsresult aResult) override;
+  NS_IMETHOD OnFileRenamed(CacheFileHandle* aHandle, nsresult aResult) override;
+
+  nsresult InitInternal(nsIFile* aCacheDirectory,
+                        const StaticMutexAutoLock& aProofOfLock);
+  void PreShutdownInternal();
+
+  bool IsIndexUsable() MOZ_REQUIRES(sLock);
+
+  static bool IsCollision(CacheIndexEntry* aEntry,
+                          OriginAttrsHash aOriginAttrsHash, bool aAnonymous);
+
+  static bool HasEntryChanged(CacheIndexEntry* aEntry,
+                              const uint32_t* aFrecency,
+                              const bool* aHasAltData,
+                              const uint32_t* aLastFetched,
+                              const uint32_t* aFetchCount,
+                              const uint8_t* aContentType,
+                              const uint32_t* aSize);
+
+  void ProcessPendingOperations(const StaticMutexAutoLock& aProofOfLock)
+      MOZ_REQUIRES(sLock);
+
+  bool WriteIndexToDiskIfNeeded(const StaticMutexAutoLock& aProofOfLock)
+      MOZ_REQUIRES(sLock);
+  void WriteIndexToDiskNowInternal();
+  void WriteIndexToDisk(const StaticMutexAutoLock& aProofOfLock)
+      MOZ_REQUIRES(sLock);
+  void WriteRecords(const StaticMutexAutoLock& aProofOfLock)
+      MOZ_REQUIRES(sLock);
+  void FinishWrite(bool aSucceeded, const StaticMutexAutoLock& aProofOfLock)
+      MOZ_REQUIRES(sLock);
+
+  nsresult GetFile(const nsACString& aName, nsIFile** _retval);
+  void RemoveFile(const nsACString& aName) MOZ_REQUIRES(sLock);
+  void RemoveAllIndexFiles() MOZ_REQUIRES(sLock);
+  void RemoveJournalAndTempFile() MOZ_REQUIRES(sLock);
+  nsresult WriteLogToDisk() MOZ_REQUIRES(sLock);
+
+  void ReadIndexFromDisk(const StaticMutexAutoLock& aProofOfLock)
+      MOZ_REQUIRES(sLock);
+  void StartReadingIndex(const StaticMutexAutoLock& aProofOfLock)
+      MOZ_REQUIRES(sLock);
+  void ParseRecords(const StaticMutexAutoLock& aProofOfLock)
+      MOZ_REQUIRES(sLock);
+  void StartReadingJournal(const StaticMutexAutoLock& aProofOfLock)
+      MOZ_REQUIRES(sLock);
+  void ParseJournal(const StaticMutexAutoLock& aProofOfLock)
+      MOZ_REQUIRES(sLock);
+  void MergeJournal(const StaticMutexAutoLock& aProofOfLock)
+      MOZ_REQUIRES(sLock);
+  void EnsureNoFreshEntry() MOZ_REQUIRES(sLock);
+  void EnsureCorrectStats() MOZ_REQUIRES(sLock);
+
+  void FinishRead(bool aSucceeded, const StaticMutexAutoLock& aProofOfLock)
+      MOZ_REQUIRES(sLock);
+
+  static void DelayedUpdate(nsITimer* aTimer, void* aClosure);
+  void DelayedUpdateLocked(const StaticMutexAutoLock& aProofOfLock)
+      MOZ_REQUIRES(sLock);
+  nsresult ScheduleUpdateTimer(uint32_t aDelay) MOZ_REQUIRES(sLock);
+  nsresult SetupDirectoryEnumerator() MOZ_REQUIRES(sLock);
+  nsresult InitEntryFromDiskData(CacheIndexEntry* aEntry,
+                                 CacheFileMetadata* aMetaData,
+                                 int64_t aFileSize);
+  bool IsUpdatePending() MOZ_REQUIRES(sLock);
+  void BuildIndex(const StaticMutexAutoLock& aProofOfLock) MOZ_REQUIRES(sLock);
+
+  bool StartUpdatingIndexIfNeeded(const StaticMutexAutoLock& aProofOfLock,
+                                  bool aSwitchingToReadyState = false);
+  void StartUpdatingIndex(bool aRebuild,
+                          const StaticMutexAutoLock& aProofOfLock)
+      MOZ_REQUIRES(sLock);
+  void UpdateIndex(const StaticMutexAutoLock& aProofOfLock) MOZ_REQUIRES(sLock);
+  void FinishUpdate(bool aSucceeded, const StaticMutexAutoLock& aProofOfLock)
+      MOZ_REQUIRES(sLock);
+
+  void RemoveNonFreshEntries(const StaticMutexAutoLock& aProofOfLock)
+      MOZ_REQUIRES(sLock);
+
+  enum EState {
+    INITIAL = 0,
+
+    READING = 1,
+
+    WRITING = 2,
+
+    BUILDING = 3,
+
+    UPDATING = 4,
+
+    READY = 5,
+
+    SHUTDOWN = 6
+  };
+
+  static char const* StateString(EState aState);
+  void ChangeState(EState aNewState, const StaticMutexAutoLock& aProofOfLock);
+  void NotifyAsyncGetDiskConsumptionCallbacks() MOZ_REQUIRES(sLock);
+
+  void AllocBuffer() MOZ_REQUIRES(sLock);
+  void ReleaseBuffer() MOZ_REQUIRES(sLock);
+
+  void AddRecordToIterators(CacheIndexRecordWrapper* aRecord,
+                            const StaticMutexAutoLock& aProofOfLock)
+      MOZ_REQUIRES(sLock);
+  void RemoveRecordFromIterators(CacheIndexRecordWrapper* aRecord,
+                                 const StaticMutexAutoLock& aProofOfLock)
+      MOZ_REQUIRES(sLock);
+  void ReplaceRecordInIterators(CacheIndexRecordWrapper* aOldRecord,
+                                CacheIndexRecordWrapper* aNewRecord,
+                                const StaticMutexAutoLock& aProofOfLock)
+      MOZ_REQUIRES(sLock);
+
+  size_t SizeOfExcludingThisInternal(mozilla::MallocSizeOf mallocSizeOf) const
+      MOZ_REQUIRES(sLock);
+
+  static mozilla::StaticRefPtr<CacheIndex> gInstance MOZ_GUARDED_BY(sLock);
+
+  static StaticMutex sLock;
+
+  nsCOMPtr<nsIFile> mCacheDirectory;
+
+  EState mState MOZ_GUARDED_BY(sLock){INITIAL};
+  TimeStamp mStartTime MOZ_GUARDED_BY(sLock);
+  bool mShuttingDown MOZ_GUARDED_BY(sLock){false};
+  bool mIndexNeedsUpdate MOZ_GUARDED_BY(sLock){false};
+  bool mRemovingAll MOZ_GUARDED_BY(sLock){false};
+  bool mIndexOnDiskIsValid MOZ_GUARDED_BY(sLock){false};
+  bool mDontMarkIndexClean MOZ_GUARDED_BY(sLock){false};
+  uint32_t mIndexTimeStamp MOZ_GUARDED_BY(sLock){0};
+  TimeStamp mLastDumpTime MOZ_GUARDED_BY(sLock);
+
+  nsCOMPtr<nsITimer> mUpdateTimer MOZ_GUARDED_BY(sLock);
+  bool mUpdateEventPending MOZ_GUARDED_BY(sLock){false};
+
+  uint32_t mSkipEntries MOZ_GUARDED_BY(sLock){0};
+  uint32_t mProcessEntries MOZ_GUARDED_BY(sLock){0};
+  char* mRWBuf MOZ_GUARDED_BY(sLock){nullptr};
+  uint32_t mRWBufSize MOZ_GUARDED_BY(sLock){0};
+  uint32_t mRWBufPos MOZ_GUARDED_BY(sLock){0};
+  RefPtr<CacheHash> mRWHash MOZ_GUARDED_BY(sLock);
+
+  bool mRWPending MOZ_GUARDED_BY(sLock){false};
+
+  bool mJournalReadSuccessfully MOZ_GUARDED_BY(sLock){false};
+
+  RefPtr<CacheFileHandle> mIndexHandle MOZ_GUARDED_BY(sLock);
+  RefPtr<CacheFileHandle> mJournalHandle MOZ_GUARDED_BY(sLock);
+  RefPtr<CacheFileHandle> mTmpHandle MOZ_GUARDED_BY(sLock);
+
+  RefPtr<FileOpenHelper> mIndexFileOpener MOZ_GUARDED_BY(sLock);
+  RefPtr<FileOpenHelper> mJournalFileOpener MOZ_GUARDED_BY(sLock);
+  RefPtr<FileOpenHelper> mTmpFileOpener MOZ_GUARDED_BY(sLock);
+
+  nsCOMPtr<nsIDirectoryEnumerator> mDirEnumerator MOZ_GUARDED_BY(sLock);
+
+  nsTHashtable<CacheIndexEntry> mIndex MOZ_GUARDED_BY(sLock);
+
+  nsTHashtable<CacheIndexEntryUpdate> mPendingUpdates MOZ_GUARDED_BY(sLock);
+
+  CacheIndexStats mIndexStats MOZ_GUARDED_BY(sLock);
+
+  nsTHashtable<CacheIndexEntry> mTmpJournal MOZ_GUARDED_BY(sLock);
+
+  class FrecencyStorage final {
+   public:
+    FrecencyStorage() = default;
+
+    void AppendRecord(CacheIndexRecordWrapper* aRecord,
+                      const StaticMutexAutoLock& aProofOfLock);
+
+    void RemoveRecord(CacheIndexRecordWrapper* aRecord,
+                      const StaticMutexAutoLock& aProofOfLock);
+
+    void ReplaceRecord(CacheIndexRecordWrapper* aOldRecord,
+                       CacheIndexRecordWrapper* aNewRecord,
+                       const StaticMutexAutoLock& aProofOfLock);
+
+    bool RecordExistedUnlocked(CacheIndexRecordWrapper* aRecord);
+
+    EvictionSortedSnapshot GetSortedSnapshotForEviction();
+
+    size_t Length() const { return mRecs.Count(); }
+
+    void Clear(const StaticMutexAutoLock& aProofOfLock) { mRecs.Clear(); }
+
+   private:
+    friend class CacheIndex;
+    nsTHashtable<nsRefPtrHashKey<CacheIndexRecordWrapper>> mRecs;
+  };
+
+  FrecencyStorage mFrecencyStorage MOZ_GUARDED_BY(sLock);
+
+  nsTArray<CacheIndexIterator*> mIterators MOZ_GUARDED_BY(sLock);
+
+  bool mAsyncGetDiskConsumptionBlocked MOZ_GUARDED_BY(sLock){false};
+
+  class DiskConsumptionObserver : public Runnable {
+   public:
+    static DiskConsumptionObserver* Init(
+        nsICacheStorageConsumptionObserver* aObserver) {
+      nsWeakPtr observer = do_GetWeakReference(aObserver);
+      if (!observer) return nullptr;
+
+      return new DiskConsumptionObserver(observer);
+    }
+
+    void OnDiskConsumption(int64_t aSize) {
+      mSize = aSize;
+      NS_DispatchToMainThread(this);
+    }
+
+   private:
+    explicit DiskConsumptionObserver(nsWeakPtr const& aWeakObserver)
+        : Runnable("net::CacheIndex::DiskConsumptionObserver"),
+          mObserver(aWeakObserver),
+          mSize(0) {}
+    virtual ~DiskConsumptionObserver() {
+      if (mObserver && !NS_IsMainThread()) {
+        NS_ReleaseOnMainThread("DiskConsumptionObserver::mObserver",
+                               mObserver.forget());
+      }
+    }
+
+    NS_IMETHOD Run() override {
+      MOZ_ASSERT(NS_IsMainThread());
+
+      nsCOMPtr<nsICacheStorageConsumptionObserver> observer =
+          do_QueryReferent(mObserver);
+
+      mObserver = nullptr;
+
+      if (observer) {
+        observer->OnNetworkCacheDiskConsumption(mSize);
+      }
+
+      return NS_OK;
+    }
+
+    nsWeakPtr mObserver;
+    int64_t mSize;
+  };
+
+  nsTArray<RefPtr<DiskConsumptionObserver>> mDiskConsumptionObservers
+      MOZ_GUARDED_BY(sLock);
+
+};
+
+}  
+}  
+
+#endif

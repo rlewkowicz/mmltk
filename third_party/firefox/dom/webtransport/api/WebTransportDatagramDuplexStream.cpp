@@ -1,0 +1,276 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "WebTransportDatagramDuplexStream.h"
+
+#include "mozilla/dom/AutoEntryScript.h"
+#include "mozilla/dom/Promise-inl.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/WebTransportLog.h"
+
+namespace mozilla::dom {
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(WebTransportDatagramDuplexStream, mGlobal,
+                                      mReadable, mWritable, mWebTransport,
+                                      mIncomingAlgorithms, mOutgoingAlgorithms)
+NS_IMPL_CYCLE_COLLECTING_ADDREF(WebTransportDatagramDuplexStream)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(WebTransportDatagramDuplexStream)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(WebTransportDatagramDuplexStream)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+WebTransportDatagramDuplexStream::WebTransportDatagramDuplexStream(
+    nsIGlobalObject* aGlobal, WebTransport* aWebTransport)
+    : mGlobal(aGlobal), mWebTransport(aWebTransport) {}
+
+void WebTransportDatagramDuplexStream::Init(ErrorResult& aError) {
+  AutoEntryScript aes(mGlobal, "WebTransportDatagrams");
+  JSContext* cx = aes.cx();
+
+  mIncomingAlgorithms = new IncomingDatagramStreamAlgorithms(this);
+  nsCOMPtr<nsIGlobalObject> global(mGlobal);
+  RefPtr<IncomingDatagramStreamAlgorithms> incomingAlgorithms =
+      mIncomingAlgorithms;
+  mReadable = ReadableStream::CreateNative(cx, global, *incomingAlgorithms,
+                                           Some(0.0), nullptr, aError);
+  if (aError.Failed()) {
+    return;
+  }
+
+  mOutgoingAlgorithms = new OutgoingDatagramStreamAlgorithms(this);
+  RefPtr<OutgoingDatagramStreamAlgorithms> outgoingAlgorithms =
+      mOutgoingAlgorithms;
+  mWritable = WritableStream::CreateNative(cx, *global, *outgoingAlgorithms,
+                                           Nothing(), nullptr, aError);
+  if (aError.Failed()) {
+    return;
+  }
+  LOG(("Created datagram streams"));
+}
+
+void WebTransportDatagramDuplexStream::SetIncomingMaxAge(double aMaxAge,
+                                                         ErrorResult& aRv) {
+  if (isnan(aMaxAge) || aMaxAge < 0.) {
+    aRv.ThrowRangeError("Invalid IncomingMaxAge");
+    return;
+  }
+  if (aMaxAge == 0) {
+    aMaxAge = INFINITY;
+  }
+  mIncomingMaxAge = aMaxAge;
+}
+
+void WebTransportDatagramDuplexStream::SetOutgoingMaxAge(double aMaxAge,
+                                                         ErrorResult& aRv) {
+  if (isnan(aMaxAge) || aMaxAge < 0.) {
+    aRv.ThrowRangeError("Invalid OutgoingMaxAge");
+    return;
+  }
+  if (aMaxAge == 0.) {
+    aMaxAge = INFINITY;
+  }
+  mOutgoingMaxAge = aMaxAge;
+}
+
+void WebTransportDatagramDuplexStream::SetIncomingHighWaterMark(
+    double aWaterMark, ErrorResult& aRv) {
+  if (isnan(aWaterMark) || aWaterMark < 0.) {
+    aRv.ThrowRangeError("Invalid OutgoingMaxAge");
+    return;
+  }
+  if (aWaterMark < 1.0) {
+    aWaterMark = 1.0;
+  }
+  mIncomingHighWaterMark = aWaterMark;
+}
+
+void WebTransportDatagramDuplexStream::SetOutgoingHighWaterMark(
+    double aWaterMark, ErrorResult& aRv) {
+  if (isnan(aWaterMark) || aWaterMark < 0.) {
+    aRv.ThrowRangeError("Invalid OutgoingHighWaterMark");
+    return;
+  }
+  if (aWaterMark < 1.0) {
+    aWaterMark = 1.0;
+  }
+  mOutgoingHighWaterMark = aWaterMark;
+}
+
+void WebTransportDatagramDuplexStream::NewDatagramReceived(
+    nsTArray<uint8_t>&& aData, const mozilla::TimeStamp& aTimeStamp) {
+  LOG(("received Datagram, size = %zu", aData.Length()));
+  mIncomingDatagramsQueue.Push(UniquePtr<DatagramEntry>(
+      new DatagramEntry(std::move(aData), aTimeStamp)));
+  mIncomingAlgorithms->NotifyDatagramAvailable();
+}
+
+
+nsIGlobalObject* WebTransportDatagramDuplexStream::GetParentObject() const {
+  return mGlobal;
+}
+
+JSObject* WebTransportDatagramDuplexStream::WrapObject(
+    JSContext* aCx, JS::Handle<JSObject*> aGivenProto) {
+  return WebTransportDatagramDuplexStream_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+
+using namespace mozilla::ipc;
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED(IncomingDatagramStreamAlgorithms,
+                                   UnderlyingSourceAlgorithmsWrapper,
+                                   mDatagrams, mIncomingDatagramsPullPromise)
+NS_IMPL_ADDREF_INHERITED(IncomingDatagramStreamAlgorithms,
+                         UnderlyingSourceAlgorithmsWrapper)
+NS_IMPL_RELEASE_INHERITED(IncomingDatagramStreamAlgorithms,
+                          UnderlyingSourceAlgorithmsWrapper)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(IncomingDatagramStreamAlgorithms)
+NS_INTERFACE_MAP_END_INHERITING(UnderlyingSourceAlgorithmsWrapper)
+
+IncomingDatagramStreamAlgorithms::IncomingDatagramStreamAlgorithms(
+    WebTransportDatagramDuplexStream* aDatagrams)
+    : mDatagrams(aDatagrams) {}
+
+IncomingDatagramStreamAlgorithms::~IncomingDatagramStreamAlgorithms() = default;
+
+already_AddRefed<Promise> IncomingDatagramStreamAlgorithms::PullCallbackImpl(
+    JSContext* aCx, ReadableStreamControllerBase& aController,
+    ErrorResult& aRv) {
+
+  RefPtr<Promise> promise =
+      Promise::CreateInfallible(mDatagrams->GetParentObject());
+  MOZ_ASSERT(!mIncomingDatagramsPullPromise);
+
+  RefPtr<IncomingDatagramStreamAlgorithms> self(this);
+  if (mDatagrams->mIncomingDatagramsQueue.IsEmpty()) {
+    mIncomingDatagramsPullPromise = promise;
+
+    LOG(("Datagrams Pull waiting for a datagram"));
+    Result<RefPtr<Promise>, nsresult> returnResult =
+        promise->ThenWithCycleCollectedArgs(
+            [](JSContext* aCx, JS::Handle<JS::Value>, ErrorResult& aRv,
+               RefPtr<IncomingDatagramStreamAlgorithms> self,
+               RefPtr<Promise> aPromise)
+                MOZ_CAN_RUN_SCRIPT_FOR_DEFINITION -> already_AddRefed<Promise> {
+                  self->ReturnDatagram(aCx, aRv);
+                  return nullptr;
+                },
+            self, promise);
+    if (returnResult.isErr()) {
+      aRv.Throw(returnResult.unwrapErr());
+      return nullptr;
+    }
+    return returnResult.unwrap().forget();
+  }
+  self->ReturnDatagram(aCx, aRv);
+  promise->MaybeResolveWithUndefined();
+  return promise.forget();
+}
+
+void IncomingDatagramStreamAlgorithms::ReturnDatagram(JSContext* aCx,
+                                                      ErrorResult& aRv) {
+  LOG(("Returning a Datagram"));
+
+  MOZ_ASSERT(!mDatagrams->mIncomingDatagramsQueue.IsEmpty());
+  UniquePtr<DatagramEntry> entry = mDatagrams->mIncomingDatagramsQueue.Pop();
+
+  JSObject* outView = Uint8Array::Create(aCx, entry->mBuffer, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+  JS::Rooted<JSObject*> chunk(aCx, outView);
+
+  JS::Rooted<JS::Value> jsDatagram(aCx, JS::ObjectValue(*chunk));
+  RefPtr<ReadableStream> stream = mDatagrams->mReadable;
+  stream->EnqueueNative(aCx, jsDatagram, aRv);
+  if (MOZ_UNLIKELY(aRv.Failed())) {
+    return;
+  }
+}
+
+void IncomingDatagramStreamAlgorithms::NotifyDatagramAvailable() {
+  if (RefPtr<Promise> promise = mIncomingDatagramsPullPromise.forget()) {
+    promise->MaybeResolveWithUndefined();
+  }
+}
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED(OutgoingDatagramStreamAlgorithms,
+                                   UnderlyingSinkAlgorithmsWrapper, mDatagrams,
+                                   mWaitConnectPromise)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(OutgoingDatagramStreamAlgorithms)
+NS_INTERFACE_MAP_END_INHERITING(UnderlyingSinkAlgorithmsWrapper)
+NS_IMPL_ADDREF_INHERITED(OutgoingDatagramStreamAlgorithms,
+                         UnderlyingSinkAlgorithmsWrapper)
+NS_IMPL_RELEASE_INHERITED(OutgoingDatagramStreamAlgorithms,
+                          UnderlyingSinkAlgorithmsWrapper)
+
+already_AddRefed<Promise> OutgoingDatagramStreamAlgorithms::WriteCallbackImpl(
+    JSContext* aCx, JS::Handle<JS::Value> aChunk,
+    WritableStreamDefaultController& aController, ErrorResult& aError) {
+  TimeStamp now = TimeStamp::Now();
+
+  ArrayBufferViewOrArrayBuffer arrayBuffer;
+  if (!arrayBuffer.Init(aCx, aChunk)) {
+    JS_ClearPendingException(aCx);
+    aError.ThrowTypeError("Wrong type for Datagram stream write"_ns);
+    return nullptr;
+  }
+
+
+  nsTArray<uint8_t> data;
+  (void)AppendTypedArrayDataTo(arrayBuffer, data);
+
+  if (mDatagrams->mOutgoingMaxDataSize < static_cast<uint64_t>(data.Length())) {
+    return Promise::CreateResolvedWithUndefined(mDatagrams->GetParentObject(),
+                                                aError);
+  }
+
+  RefPtr<Promise> promise =
+      Promise::CreateInfallible(mDatagrams->GetParentObject());
+
+  if (mChild) {
+    LOG(("Sending Datagram, size = %zu", data.Length()));
+    mChild->SendOutgoingDatagram(
+        std::move(data), now,
+        [promise](nsresult&&) {
+          LOG(("Datagram was sent"));
+          promise->MaybeResolveWithUndefined();
+        },
+        [promise](mozilla::ipc::ResponseRejectReason&&) {
+          LOG(("Datagram failed"));
+          promise->MaybeResolveWithUndefined();
+        });
+  } else {
+    LOG(("Queuing datagram for connect"));
+    MOZ_ASSERT(mWaitConnect == nullptr);
+    mWaitConnect.reset(new DatagramEntry(std::move(data), now));
+    mWaitConnectPromise = promise;
+  }
+
+  return promise.forget();
+}
+
+void OutgoingDatagramStreamAlgorithms::SetChild(WebTransportChild* aChild) {
+  LOG(("Setting child in datagrams"));
+  mChild = aChild;
+  if (mWaitConnect) {
+    LOG(("Sending queued datagram"));
+    mChild->SendOutgoingDatagram(
+        mWaitConnect->mBuffer, mWaitConnect->mTimeStamp,
+        [promise = mWaitConnectPromise](nsresult&&) {
+          LOG_VERBOSE(("Early Datagram was sent"));
+          promise->MaybeResolveWithUndefined();
+        },
+        [promise = mWaitConnectPromise](mozilla::ipc::ResponseRejectReason&&) {
+          LOG(("Early Datagram failed"));
+          promise->MaybeResolveWithUndefined();
+        });
+    mWaitConnectPromise = nullptr;
+    mWaitConnect.reset(nullptr);
+  }
+}
+
+}  

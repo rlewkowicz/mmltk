@@ -1,0 +1,815 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef js_MemoryMetrics_h
+#define js_MemoryMetrics_h
+
+
+#include "mozilla/Maybe.h"
+#include "mozilla/MemoryReporting.h"
+
+#include <type_traits>
+
+#include "jstypes.h"
+
+#include "js/AllocPolicy.h"
+#include "js/HashTable.h"
+#include "js/TraceKind.h"
+#include "js/TypeDecls.h"
+#include "js/Utility.h"
+#include "js/Vector.h"
+
+class nsISupports;  
+
+namespace js {
+class SystemAllocPolicy;
+}
+
+namespace mozilla {
+struct CStringHasher;
+}
+
+namespace JS {
+class JS_PUBLIC_API AutoRequireNoGC;
+
+struct TabSizes {
+  TabSizes() = default;
+
+  enum Kind { Objects, Strings, Private, Other };
+
+  void add(Kind kind, size_t n) {
+    switch (kind) {
+      case Objects:
+        objects_ += n;
+        break;
+      case Strings:
+        strings_ += n;
+        break;
+      case Private:
+        private_ += n;
+        break;
+      case Other:
+        other_ += n;
+        break;
+      default:
+        MOZ_CRASH("bad TabSizes kind");
+    }
+  }
+
+  size_t objects_ = 0;
+  size_t strings_ = 0;
+  size_t private_ = 0;
+  size_t other_ = 0;
+};
+
+struct ServoSizes {
+  ServoSizes() = default;
+
+  enum Kind {
+    GCHeapUsed,
+    GCHeapUnused,
+    GCHeapAdmin,
+    GCHeapDecommitted,
+    MallocHeap,
+    NonHeap,
+    Ignore
+  };
+
+  void add(Kind kind, size_t n) {
+    switch (kind) {
+      case GCHeapUsed:
+        gcHeapUsed += n;
+        break;
+      case GCHeapUnused:
+        gcHeapUnused += n;
+        break;
+      case GCHeapAdmin:
+        gcHeapAdmin += n;
+        break;
+      case GCHeapDecommitted:
+        gcHeapDecommitted += n;
+        break;
+      case MallocHeap:
+        mallocHeap += n;
+        break;
+      case NonHeap:
+        nonHeap += n;
+        break;
+      case Ignore: 
+        break;
+      default:
+        MOZ_CRASH("bad ServoSizes kind");
+    }
+  }
+
+  size_t gcHeapUsed = 0;
+  size_t gcHeapUnused = 0;
+  size_t gcHeapAdmin = 0;
+  size_t gcHeapDecommitted = 0;
+  size_t mallocHeap = 0;
+  size_t nonHeap = 0;
+};
+
+}  
+
+namespace js {
+
+JS_PUBLIC_API size_t MemoryReportingSundriesThreshold();
+
+struct InefficientNonFlatteningStringHashPolicy {
+  typedef JSString* Lookup;
+  static HashNumber hash(const Lookup& l);
+  static bool match(const JSString* const& k, const Lookup& l);
+};
+
+#define DECL_SIZE_ZERO(tabKind, servoKind, mSize) size_t mSize = 0;
+#define ADD_OTHER_SIZE(tabKind, servoKind, mSize) mSize += other.mSize;
+#define SUB_OTHER_SIZE(tabKind, servoKind, mSize) \
+  MOZ_ASSERT(mSize >= other.mSize);               \
+  mSize -= other.mSize;
+#define ADD_SIZE_TO_N(tabKind, servoKind, mSize) n += mSize;
+#define ADD_SIZE_TO_N_IF_LIVE_GC_THING(tabKind, servoKind, mSize)     \
+   \
+  n += (std::is_same_v<int[ServoSizes::servoKind],                    \
+                       int[ServoSizes::GCHeapUsed]>)                  \
+           ? mSize                                                    \
+           : 0;
+#define ADD_TO_TAB_SIZES(tabKind, servoKind, mSize) \
+  sizes->add(JS::TabSizes::tabKind, mSize);
+#define ADD_TO_SERVO_SIZES(tabKind, servoKind, mSize) \
+  sizes->add(JS::ServoSizes::servoKind, mSize);
+
+}  
+
+namespace JS {
+
+struct ClassInfo {
+#define FOR_EACH_SIZE(MACRO)                                       \
+  MACRO(Objects, GCHeapUsed, objectsGCHeap)                        \
+  MACRO(Objects, NonHeap, objectsGCBufferSlots)                    \
+  MACRO(Objects, NonHeap, objectsGCBufferElementsNormal)           \
+  MACRO(Objects, MallocHeap, objectsMallocHeapElementsArrayBuffer) \
+  MACRO(Objects, MallocHeap, objectsMallocHeapGlobalData)          \
+  MACRO(Objects, MallocHeap, objectsMallocHeapMisc)                \
+  MACRO(Objects, NonHeap, objectsNonHeapElementsNormal)            \
+  MACRO(Objects, NonHeap, objectsNonHeapElementsShared)            \
+  MACRO(Objects, NonHeap, objectsNonHeapElementsWasm)              \
+  MACRO(Objects, NonHeap, objectsNonHeapElementsWasmShared)        \
+  MACRO(Objects, NonHeap, objectsNonHeapCodeWasm)                  \
+  MACRO(Objects, NonHeap, objectsGCBufferMisc)
+
+  ClassInfo() = default;
+
+  void add(const ClassInfo& other) { FOR_EACH_SIZE(ADD_OTHER_SIZE); }
+
+  void subtract(const ClassInfo& other) { FOR_EACH_SIZE(SUB_OTHER_SIZE); }
+
+  size_t sizeOfAllThings() const {
+    size_t n = 0;
+    FOR_EACH_SIZE(ADD_SIZE_TO_N);
+    return n;
+  }
+
+  bool isNotable() const {
+    static const size_t NotabilityThreshold = 16 * 1024;
+    return sizeOfAllThings() >= NotabilityThreshold;
+  }
+
+  size_t sizeOfLiveGCThings() const {
+    size_t n = 0;
+    FOR_EACH_SIZE(ADD_SIZE_TO_N_IF_LIVE_GC_THING);
+    return n;
+  }
+
+  void addToTabSizes(TabSizes* sizes) const { FOR_EACH_SIZE(ADD_TO_TAB_SIZES); }
+
+  void addToServoSizes(ServoSizes* sizes) const {
+    FOR_EACH_SIZE(ADD_TO_SERVO_SIZES);
+  }
+
+  FOR_EACH_SIZE(DECL_SIZE_ZERO);
+
+#undef FOR_EACH_SIZE
+};
+
+struct ShapeInfo {
+#define FOR_EACH_SIZE(MACRO)                   \
+  MACRO(Other, GCHeapUsed, shapesGCHeapShared) \
+  MACRO(Other, GCHeapUsed, shapesGCHeapDict)   \
+  MACRO(Other, GCHeapUsed, shapesGCHeapBase)   \
+  MACRO(Other, MallocHeap, shapesMallocHeapCache)
+
+  ShapeInfo() = default;
+
+  void add(const ShapeInfo& other) { FOR_EACH_SIZE(ADD_OTHER_SIZE); }
+
+  void subtract(const ShapeInfo& other) { FOR_EACH_SIZE(SUB_OTHER_SIZE); }
+
+  size_t sizeOfAllThings() const {
+    size_t n = 0;
+    FOR_EACH_SIZE(ADD_SIZE_TO_N);
+    return n;
+  }
+
+  size_t sizeOfLiveGCThings() const {
+    size_t n = 0;
+    FOR_EACH_SIZE(ADD_SIZE_TO_N_IF_LIVE_GC_THING);
+    return n;
+  }
+
+  void addToTabSizes(TabSizes* sizes) const { FOR_EACH_SIZE(ADD_TO_TAB_SIZES); }
+
+  void addToServoSizes(ServoSizes* sizes) const {
+    FOR_EACH_SIZE(ADD_TO_SERVO_SIZES);
+  }
+
+  FOR_EACH_SIZE(DECL_SIZE_ZERO);
+
+#undef FOR_EACH_SIZE
+};
+
+struct NotableClassInfo : public ClassInfo {
+  NotableClassInfo() = default;
+  NotableClassInfo(NotableClassInfo&&) = default;
+  NotableClassInfo(const NotableClassInfo& info) = delete;
+
+  NotableClassInfo(const char* className, const ClassInfo& info);
+
+  UniqueChars className_ = nullptr;
+};
+
+struct CodeSizes {
+#define FOR_EACH_SIZE(MACRO)  \
+  MACRO(_, NonHeap, ion)      \
+  MACRO(_, NonHeap, baseline) \
+  MACRO(_, NonHeap, regexp)   \
+  MACRO(_, NonHeap, other)    \
+  MACRO(_, NonHeap, unused)
+
+  CodeSizes() = default;
+
+  void addToServoSizes(ServoSizes* sizes) const {
+    FOR_EACH_SIZE(ADD_TO_SERVO_SIZES);
+  }
+
+  FOR_EACH_SIZE(DECL_SIZE_ZERO);
+
+#undef FOR_EACH_SIZE
+};
+
+struct GCSizes {
+#define FOR_EACH_SIZE(MACRO)                   \
+  MACRO(_, MallocHeap, marker)                 \
+  MACRO(_, NonHeap, nurseryCommitted)          \
+  MACRO(_, MallocHeap, nurseryMallocedBuffers) \
+  MACRO(_, MallocHeap, storeBufferVals)        \
+  MACRO(_, MallocHeap, storeBufferCells)       \
+  MACRO(_, MallocHeap, storeBufferSlots)       \
+  MACRO(_, MallocHeap, storeBufferWasmAnyRefs) \
+  MACRO(_, MallocHeap, storeBufferWholeCells)  \
+  MACRO(_, MallocHeap, storeBufferGenerics)
+
+  GCSizes() = default;
+
+  void addToServoSizes(ServoSizes* sizes) const {
+    FOR_EACH_SIZE(ADD_TO_SERVO_SIZES);
+  }
+
+  FOR_EACH_SIZE(DECL_SIZE_ZERO);
+
+#undef FOR_EACH_SIZE
+};
+
+struct StringInfo {
+#define FOR_EACH_SIZE(MACRO)                   \
+  MACRO(Strings, GCHeapUsed, gcHeapLatin1)     \
+  MACRO(Strings, GCHeapUsed, gcHeapTwoByte)    \
+  MACRO(Strings, MallocHeap, mallocHeapLatin1) \
+  MACRO(Strings, MallocHeap, mallocHeapTwoByte)
+
+  StringInfo() = default;
+
+  void add(const StringInfo& other) {
+    FOR_EACH_SIZE(ADD_OTHER_SIZE);
+    numCopies++;
+  }
+
+  void subtract(const StringInfo& other) {
+    FOR_EACH_SIZE(SUB_OTHER_SIZE);
+    numCopies--;
+  }
+
+  bool isNotable() const {
+    static const size_t NotabilityThreshold = 16 * 1024;
+    size_t n = 0;
+    FOR_EACH_SIZE(ADD_SIZE_TO_N);
+    return n >= NotabilityThreshold;
+  }
+
+  size_t sizeOfLiveGCThings() const {
+    size_t n = 0;
+    FOR_EACH_SIZE(ADD_SIZE_TO_N_IF_LIVE_GC_THING);
+    return n;
+  }
+
+  void addToTabSizes(TabSizes* sizes) const { FOR_EACH_SIZE(ADD_TO_TAB_SIZES); }
+
+  void addToServoSizes(ServoSizes* sizes) const {
+    FOR_EACH_SIZE(ADD_TO_SERVO_SIZES);
+  }
+
+  FOR_EACH_SIZE(DECL_SIZE_ZERO);
+
+  uint32_t numCopies = 0;  
+
+#undef FOR_EACH_SIZE
+};
+
+struct NotableStringInfo : public StringInfo {
+  static const size_t MAX_SAVED_CHARS = 1024;
+
+  NotableStringInfo() = default;
+  NotableStringInfo(NotableStringInfo&&) = default;
+  NotableStringInfo(const NotableStringInfo&) = delete;
+
+  NotableStringInfo(JSString* str, const StringInfo& info);
+
+  UniqueChars buffer = nullptr;
+  size_t length = 0;
+};
+
+struct ScriptSourceInfo {
+#define FOR_EACH_SIZE(MACRO) MACRO(_, MallocHeap, misc)
+
+  ScriptSourceInfo() = default;
+
+  void add(const ScriptSourceInfo& other) {
+    FOR_EACH_SIZE(ADD_OTHER_SIZE);
+    numScripts++;
+  }
+
+  void subtract(const ScriptSourceInfo& other) {
+    FOR_EACH_SIZE(SUB_OTHER_SIZE);
+    numScripts--;
+  }
+
+  void addToServoSizes(ServoSizes* sizes) const {
+    FOR_EACH_SIZE(ADD_TO_SERVO_SIZES);
+  }
+
+  bool isNotable() const {
+    static const size_t NotabilityThreshold = 16 * 1024;
+    size_t n = 0;
+    FOR_EACH_SIZE(ADD_SIZE_TO_N);
+    return n >= NotabilityThreshold;
+  }
+
+  FOR_EACH_SIZE(DECL_SIZE_ZERO);
+
+  uint32_t numScripts = 0;  
+#undef FOR_EACH_SIZE
+};
+
+struct NotableScriptSourceInfo : public ScriptSourceInfo {
+  NotableScriptSourceInfo() = default;
+  NotableScriptSourceInfo(NotableScriptSourceInfo&&) = default;
+  NotableScriptSourceInfo(const NotableScriptSourceInfo&) = delete;
+
+  NotableScriptSourceInfo(const char* filename, const ScriptSourceInfo& info);
+
+  UniqueChars filename_ = nullptr;
+};
+
+struct HelperThreadStats {
+#define FOR_EACH_SIZE(MACRO)           \
+  MACRO(_, MallocHeap, stateData)      \
+  MACRO(_, MallocHeap, ionCompileTask) \
+  MACRO(_, MallocHeap, wasmCompile)    \
+  MACRO(_, MallocHeap, contexts)
+
+  HelperThreadStats() = default;
+
+  FOR_EACH_SIZE(DECL_SIZE_ZERO);
+
+  unsigned idleThreadCount = 0;
+  unsigned activeThreadCount = 0;
+
+#undef FOR_EACH_SIZE
+};
+
+struct GlobalStats {
+  explicit GlobalStats(mozilla::MallocSizeOf mallocSizeOf)
+      : mallocSizeOf_(mallocSizeOf) {}
+
+  HelperThreadStats helperThread;
+
+  mozilla::MallocSizeOf mallocSizeOf_;
+};
+
+struct RuntimeSizes {
+#define FOR_EACH_SIZE(MACRO)                        \
+  MACRO(_, MallocHeap, object)                      \
+  MACRO(_, MallocHeap, atomsTable)                  \
+  MACRO(_, MallocHeap, atomsMarkBitmaps)            \
+  MACRO(_, MallocHeap, selfHostStencil)             \
+  MACRO(_, MallocHeap, contexts)                    \
+  MACRO(_, MallocHeap, temporary)                   \
+  MACRO(_, MallocHeap, interpreterStack)            \
+  MACRO(_, MallocHeap, sharedImmutableStringsCache) \
+  MACRO(_, MallocHeap, sharedIntlData)              \
+  MACRO(_, MallocHeap, uncompressedSourceCache)     \
+  MACRO(_, MallocHeap, scriptData)                  \
+  MACRO(_, MallocHeap, wasmRuntime)                 \
+  MACRO(_, Ignore, wasmGuardPages)                  \
+  MACRO(_, NonHeap, wasmContStacks)                 \
+  MACRO(_, MallocHeap, jitLazyLink)
+
+  RuntimeSizes() { allScriptSources.emplace(); }
+
+  void addToServoSizes(ServoSizes* sizes) const {
+    FOR_EACH_SIZE(ADD_TO_SERVO_SIZES);
+    scriptSourceInfo.addToServoSizes(sizes);
+    gc.addToServoSizes(sizes);
+  }
+
+  FOR_EACH_SIZE(DECL_SIZE_ZERO);
+
+  ScriptSourceInfo scriptSourceInfo;
+  GCSizes gc;
+
+  typedef js::HashMap<const char*, ScriptSourceInfo, mozilla::CStringHasher,
+                      js::SystemAllocPolicy>
+      ScriptSourcesHashMap;
+
+  mozilla::Maybe<ScriptSourcesHashMap> allScriptSources;
+  js::Vector<NotableScriptSourceInfo, 0, js::SystemAllocPolicy>
+      notableScriptSources;
+
+#undef FOR_EACH_SIZE
+};
+
+struct UnusedGCThingSizes {
+#define FOR_EACH_SIZE(MACRO)               \
+  MACRO(Other, GCHeapUnused, object)       \
+  MACRO(Other, GCHeapUnused, script)       \
+  MACRO(Other, GCHeapUnused, shape)        \
+  MACRO(Other, GCHeapUnused, baseShape)    \
+  MACRO(Other, GCHeapUnused, getterSetter) \
+  MACRO(Other, GCHeapUnused, propMap)      \
+  MACRO(Other, GCHeapUnused, string)       \
+  MACRO(Other, GCHeapUnused, symbol)       \
+  MACRO(Other, GCHeapUnused, bigInt)       \
+  MACRO(Other, GCHeapUnused, jitcode)      \
+  MACRO(Other, GCHeapUnused, scope)        \
+  MACRO(Other, GCHeapUnused, regExpShared)
+
+  UnusedGCThingSizes() = default;
+  UnusedGCThingSizes(UnusedGCThingSizes&& other) = default;
+
+  void addToKind(JS::TraceKind kind, intptr_t n) {
+    switch (kind) {
+      case JS::TraceKind::Object:
+        object += n;
+        break;
+      case JS::TraceKind::String:
+        string += n;
+        break;
+      case JS::TraceKind::Symbol:
+        symbol += n;
+        break;
+      case JS::TraceKind::BigInt:
+        bigInt += n;
+        break;
+      case JS::TraceKind::Script:
+        script += n;
+        break;
+      case JS::TraceKind::Shape:
+        shape += n;
+        break;
+      case JS::TraceKind::BaseShape:
+        baseShape += n;
+        break;
+      case JS::TraceKind::GetterSetter:
+        getterSetter += n;
+        break;
+      case JS::TraceKind::PropMap:
+        propMap += n;
+        break;
+      case JS::TraceKind::JitCode:
+        jitcode += n;
+        break;
+      case JS::TraceKind::Scope:
+        scope += n;
+        break;
+      case JS::TraceKind::RegExpShared:
+        regExpShared += n;
+        break;
+      default:
+        MOZ_CRASH("Bad trace kind for UnusedGCThingSizes");
+    }
+  }
+
+  void addSizes(const UnusedGCThingSizes& other) {
+    FOR_EACH_SIZE(ADD_OTHER_SIZE);
+  }
+
+  size_t totalSize() const {
+    size_t n = 0;
+    FOR_EACH_SIZE(ADD_SIZE_TO_N);
+    return n;
+  }
+
+  void addToTabSizes(JS::TabSizes* sizes) const {
+    FOR_EACH_SIZE(ADD_TO_TAB_SIZES);
+  }
+
+  void addToServoSizes(JS::ServoSizes* sizes) const {
+    FOR_EACH_SIZE(ADD_TO_SERVO_SIZES);
+  }
+
+  FOR_EACH_SIZE(DECL_SIZE_ZERO);
+
+#undef FOR_EACH_SIZE
+};
+
+struct GCBufferStats {
+#define FOR_EACH_SIZE(MACRO)           \
+  MACRO(Other, MallocHeap, usedBytes)  \
+  MACRO(Other, MallocHeap, freeBytes)  \
+  MACRO(Other, MallocHeap, adminBytes) \
+  MACRO(Other, Ignore, totalChunks)    \
+  MACRO(Other, Ignore, freeRegions)    \
+  MACRO(Other, Ignore, largeAllocs)
+
+  GCBufferStats() = default;
+  GCBufferStats(GCBufferStats&& other) = default;
+
+  void addSizes(const GCBufferStats& other) { FOR_EACH_SIZE(ADD_OTHER_SIZE); }
+
+  size_t totalSize() const {
+    size_t n = 0;
+    FOR_EACH_SIZE(ADD_SIZE_TO_N);
+    return n;
+  }
+
+  void addToTabSizes(JS::TabSizes* sizes) const {
+    FOR_EACH_SIZE(ADD_TO_TAB_SIZES);
+  }
+
+  void addToServoSizes(JS::ServoSizes* sizes) const {
+    FOR_EACH_SIZE(ADD_TO_SERVO_SIZES);
+  }
+
+  FOR_EACH_SIZE(DECL_SIZE_ZERO);
+
+#undef FOR_EACH_SIZE
+};
+
+struct ZoneStats {
+#define FOR_EACH_SIZE(MACRO)                               \
+  MACRO(Other, GCHeapUsed, symbolsGCHeap)                  \
+  MACRO(Other, GCHeapUsed, bigIntsGCHeap)                  \
+  MACRO(Other, NonHeap, bigIntsGCBuffers)                  \
+  MACRO(Other, GCHeapAdmin, gcHeapArenaAdmin)              \
+  MACRO(Other, GCHeapUsed, jitCodesGCHeap)                 \
+  MACRO(Other, GCHeapUsed, getterSettersGCHeap)            \
+  MACRO(Other, GCHeapUsed, compactPropMapsGCHeap)          \
+  MACRO(Other, GCHeapUsed, normalPropMapsGCHeap)           \
+  MACRO(Other, GCHeapUsed, dictPropMapsGCHeap)             \
+  MACRO(Other, MallocHeap, propMapChildren)                \
+  MACRO(Other, MallocHeap, propMapTables)                  \
+  MACRO(Other, GCHeapUsed, scopesGCHeap)                   \
+  MACRO(Other, NonHeap, scopesGCBuffers)                   \
+  MACRO(Other, GCHeapUsed, regExpSharedsGCHeap)            \
+  MACRO(Other, MallocHeap, regExpSharedsMallocHeap)        \
+  MACRO(Other, MallocHeap, zoneObject)                     \
+  MACRO(Other, MallocHeap, regexpZone)                     \
+  MACRO(Other, MallocHeap, jitZone)                        \
+  MACRO(Other, MallocHeap, cacheIRStubs)                   \
+  MACRO(Other, MallocHeap, objectFuses)                    \
+  MACRO(Other, MallocHeap, uniqueIdMap)                    \
+  MACRO(Other, MallocHeap, initialPropMapTable)            \
+  MACRO(Other, MallocHeap, shapeTables)                    \
+  MACRO(Other, MallocHeap, compartmentObjects)             \
+  MACRO(Other, MallocHeap, crossCompartmentWrappersTables) \
+  MACRO(Other, MallocHeap, compartmentsPrivateData)        \
+  MACRO(Other, MallocHeap, scriptCountsMap)
+
+  ZoneStats() = default;
+  ZoneStats(ZoneStats&& other) = default;
+
+  void initStrings();
+
+  void addSizes(const ZoneStats& other) {
+    MOZ_ASSERT(isTotals);
+    FOR_EACH_SIZE(ADD_OTHER_SIZE);
+    gcBuffers.addSizes(other.gcBuffers);
+    unusedGCThings.addSizes(other.unusedGCThings);
+    stringInfo.add(other.stringInfo);
+    shapeInfo.add(other.shapeInfo);
+  }
+
+  size_t sizeOfLiveGCThings() const {
+    MOZ_ASSERT(isTotals);
+    size_t n = 0;
+    FOR_EACH_SIZE(ADD_SIZE_TO_N_IF_LIVE_GC_THING);
+    n += stringInfo.sizeOfLiveGCThings();
+    n += shapeInfo.sizeOfLiveGCThings();
+    return n;
+  }
+
+  void addToTabSizes(JS::TabSizes* sizes) const {
+    MOZ_ASSERT(isTotals);
+    FOR_EACH_SIZE(ADD_TO_TAB_SIZES);
+    gcBuffers.addToTabSizes(sizes);
+    unusedGCThings.addToTabSizes(sizes);
+    stringInfo.addToTabSizes(sizes);
+    shapeInfo.addToTabSizes(sizes);
+  }
+
+  void addToServoSizes(JS::ServoSizes* sizes) const {
+    MOZ_ASSERT(isTotals);
+    FOR_EACH_SIZE(ADD_TO_SERVO_SIZES);
+    gcBuffers.addToServoSizes(sizes);
+    unusedGCThings.addToServoSizes(sizes);
+    stringInfo.addToServoSizes(sizes);
+    shapeInfo.addToServoSizes(sizes);
+    code.addToServoSizes(sizes);
+  }
+
+  FOR_EACH_SIZE(DECL_SIZE_ZERO);
+
+  GCBufferStats gcBuffers;
+
+  UnusedGCThingSizes unusedGCThings;
+  StringInfo stringInfo;
+  ShapeInfo shapeInfo;
+  CodeSizes code;
+  void* extra = nullptr;  
+
+  typedef js::HashMap<JSString*, StringInfo,
+                      js::InefficientNonFlatteningStringHashPolicy,
+                      js::SystemAllocPolicy>
+      StringsHashMap;
+
+  mozilla::Maybe<StringsHashMap> allStrings;
+  js::Vector<NotableStringInfo, 0, js::SystemAllocPolicy> notableStrings;
+  bool isTotals = true;
+
+  bool stringsDeduplicationTruncated = false;
+  size_t stringsTotalCount = 0;
+
+#undef FOR_EACH_SIZE
+};
+
+struct RealmStats {
+#define FOR_EACH_SIZE(MACRO)                    \
+  MACRO(Private, MallocHeap, objectsPrivate)    \
+  MACRO(Other, GCHeapUsed, scriptsGCHeap)       \
+  MACRO(Other, NonHeap, scriptsGCBuffers)       \
+  MACRO(Other, MallocHeap, baselineData)        \
+  MACRO(Other, MallocHeap, allocSites)          \
+  MACRO(Other, MallocHeap, ionData)             \
+  MACRO(Other, MallocHeap, jitScripts)          \
+  MACRO(Other, MallocHeap, realmObject)         \
+  MACRO(Other, MallocHeap, realmTables)         \
+  MACRO(Other, MallocHeap, innerViewsTable)     \
+  MACRO(Other, MallocHeap, objectMetadataTable) \
+  MACRO(Other, MallocHeap, savedStacksSet)      \
+  MACRO(Other, MallocHeap, nonSyntacticLexicalScopesTable)
+
+  RealmStats() = default;
+  RealmStats(RealmStats&& other) = default;
+
+  RealmStats(const RealmStats&) = delete;  
+
+  void initClasses();
+
+  void addSizes(const RealmStats& other) {
+    MOZ_ASSERT(isTotals);
+    FOR_EACH_SIZE(ADD_OTHER_SIZE);
+    classInfo.add(other.classInfo);
+  }
+
+  size_t sizeOfLiveGCThings() const {
+    MOZ_ASSERT(isTotals);
+    size_t n = 0;
+    FOR_EACH_SIZE(ADD_SIZE_TO_N_IF_LIVE_GC_THING);
+    n += classInfo.sizeOfLiveGCThings();
+    return n;
+  }
+
+  void addToTabSizes(TabSizes* sizes) const {
+    MOZ_ASSERT(isTotals);
+    FOR_EACH_SIZE(ADD_TO_TAB_SIZES);
+    classInfo.addToTabSizes(sizes);
+  }
+
+  void addToServoSizes(ServoSizes* sizes) const {
+    MOZ_ASSERT(isTotals);
+    FOR_EACH_SIZE(ADD_TO_SERVO_SIZES);
+    classInfo.addToServoSizes(sizes);
+  }
+
+  FOR_EACH_SIZE(DECL_SIZE_ZERO);
+
+  ClassInfo classInfo;
+  void* extra = nullptr;  
+
+  typedef js::HashMap<const char*, ClassInfo, mozilla::CStringHasher,
+                      js::SystemAllocPolicy>
+      ClassesHashMap;
+
+  mozilla::Maybe<ClassesHashMap> allClasses;
+  js::Vector<NotableClassInfo, 0, js::SystemAllocPolicy> notableClasses;
+  bool isTotals = true;
+
+#undef FOR_EACH_SIZE
+};
+
+typedef js::Vector<RealmStats, 0, js::SystemAllocPolicy> RealmStatsVector;
+typedef js::Vector<ZoneStats, 0, js::SystemAllocPolicy> ZoneStatsVector;
+
+struct RuntimeStats {
+#define FOR_EACH_SIZE(MACRO)                          \
+  MACRO(_, Ignore, gcHeapChunkTotal)                  \
+  MACRO(_, GCHeapDecommitted, gcHeapDecommittedPages) \
+  MACRO(_, GCHeapUnused, gcHeapUnusedChunks)          \
+  MACRO(_, GCHeapUnused, gcHeapUnusedArenas)          \
+  MACRO(_, GCHeapAdmin, gcHeapChunkAdmin)             \
+  MACRO(_, Ignore, gcHeapGCThings)
+
+  explicit RuntimeStats(mozilla::MallocSizeOf mallocSizeOf)
+      : mallocSizeOf_(mallocSizeOf) {}
+
+
+  void addToServoSizes(ServoSizes* sizes) const {
+    FOR_EACH_SIZE(ADD_TO_SERVO_SIZES);
+    runtime.addToServoSizes(sizes);
+  }
+
+  FOR_EACH_SIZE(DECL_SIZE_ZERO);
+
+  RuntimeSizes runtime;
+
+  RealmStats realmTotals;  
+  ZoneStats zTotals;       
+
+  RealmStatsVector realmStatsVector;
+  ZoneStatsVector zoneStatsVector;
+
+  ZoneStats* currZoneStats = nullptr;
+
+  mozilla::MallocSizeOf mallocSizeOf_;
+
+  virtual void initExtraRealmStats(JS::Realm* realm, RealmStats* rstats,
+                                   const JS::AutoRequireNoGC& nogc) = 0;
+  virtual void initExtraZoneStats(JS::Zone* zone, ZoneStats* zstats,
+                                  const JS::AutoRequireNoGC& nogc) = 0;
+
+#undef FOR_EACH_SIZE
+};
+
+class ObjectPrivateVisitor {
+ public:
+  virtual size_t sizeOfIncludingThis(nsISupports* aSupports) = 0;
+
+  typedef bool (*GetISupportsFun)(JSObject* obj, nsISupports** iface);
+  GetISupportsFun getISupports_;
+
+  explicit ObjectPrivateVisitor(GetISupportsFun getISupports)
+      : getISupports_(getISupports) {}
+};
+
+extern JS_PUBLIC_API bool CollectGlobalStats(GlobalStats* gStats);
+
+extern JS_PUBLIC_API bool CollectRuntimeStats(JSContext* cx,
+                                              RuntimeStats* rtStats,
+                                              ObjectPrivateVisitor* opv,
+                                              bool anonymize);
+
+extern JS_PUBLIC_API size_t SystemCompartmentCount(JSContext* cx);
+extern JS_PUBLIC_API size_t UserCompartmentCount(JSContext* cx);
+
+extern JS_PUBLIC_API size_t SystemRealmCount(JSContext* cx);
+extern JS_PUBLIC_API size_t UserRealmCount(JSContext* cx);
+
+extern JS_PUBLIC_API size_t PeakSizeOfTemporary(const JSContext* cx);
+
+extern JS_PUBLIC_API bool AddSizeOfTab(JSContext* cx, JS::Zone* zone,
+                                       mozilla::MallocSizeOf mallocSizeOf,
+                                       ObjectPrivateVisitor* opv,
+                                       TabSizes* sizes,
+                                       const JS::AutoRequireNoGC& nogc);
+
+}  
+
+#undef DECL_SIZE_ZERO
+#undef ADD_OTHER_SIZE
+#undef SUB_OTHER_SIZE
+#undef ADD_SIZE_TO_N
+#undef ADD_SIZE_TO_N_IF_LIVE_GC_THING
+#undef ADD_TO_TAB_SIZES
+
+#endif /* js_MemoryMetrics_h */

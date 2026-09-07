@@ -1,0 +1,60 @@
+installdir = $(libdir)/$(MOZ_APP_NAME)
+ifeq (.,$(DEPTH))
+DIST = dist
+else
+DIST = $(DEPTH)/dist
+endif
+ABS_DIST = $(topobjdir)/dist
+
+ifeq ($(HOST_OS_ARCH),WINNT)
+ifdef .PYMAKE
+$(error Pymake is no longer supported. Please upgrade to MozillaBuild 1.9 or newer and build with 'mach' or 'mozmake')
+endif
+
+ifeq (a,$(firstword a$(subst /, ,$(abspath .))))
+$(error MSYS make is not supported)
+endif
+ifneq (4.0-,$(firstword $(sort 4.0- $(MAKE_VERSION))))
+$(error Make version too old. Only versions strictly greater than 4.0 are supported.)
+endif
+
+ifdef INCLUDED_AUTOCONF_MK
+ifeq (a,$(firstword a$(subst /, ,$(srcdir))))
+$(error MSYS-style srcdir are not supported for Windows builds.)
+endif
+endif
+endif 
+
+ifndef INCLUDED_AUTOCONF_MK
+default::
+else
+
+ifeq ($(MOZ_BUILD_APP),tools/rusttests)
+ALL_TIERS := pre-export export rusttests
+else
+ALL_TIERS := artifact android-fat-aar-artifact pre-export export pre-compile rust compile misc libs android-stage-package android-archive-geckoview tools check
+endif
+
+RUNNABLE_TIERS := $(ALL_TIERS)
+ifndef MOZ_ARTIFACT_BUILDS
+RUNNABLE_TIERS := $(filter-out artifact,$(RUNNABLE_TIERS))
+endif
+ifndef MOZ_ANDROID_FAT_AAR_ARCHITECTURES
+RUNNABLE_TIERS := $(filter-out android-fat-aar-artifact,$(RUNNABLE_TIERS))
+endif
+ifneq ($(MOZ_BUILD_APP),mobile/android)
+RUNNABLE_TIERS := $(filter-out android-stage-package,$(RUNNABLE_TIERS))
+RUNNABLE_TIERS := $(filter-out android-archive-geckoview,$(RUNNABLE_TIERS))
+endif
+
+TIERS := $(filter-out pre-compile check,$(RUNNABLE_TIERS))
+ifndef COMPILE_ENVIRONMENT
+TIERS := $(filter-out rust compile,$(TIERS))
+endif
+ifndef MOZ_RUST_TIER
+TIERS := $(filter-out rust,$(TIERS))
+endif
+
+endif
+
+MOZILLA_DIR = $(topsrcdir)

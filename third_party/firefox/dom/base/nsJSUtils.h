@@ -1,0 +1,199 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsJSUtils_h_
+#define nsJSUtils_h_
+
+
+#include "js/CompileOptions.h"
+#include "js/Conversions.h"
+#include "js/String.h"  // JS::{,Lossy}CopyLinearStringChars, JS::CopyStringChars, JS::Get{,Linear}StringLength, JS::MaxStringLength, JS::StringHasLatin1Chars
+#include "js/Utility.h"  // JS::FreePolicy
+#include "jsapi.h"
+#include "mozilla/Assertions.h"
+#include "nsString.h"
+#include "xpcpublic.h"
+
+class nsIScriptContext;
+class nsIScriptElement;
+class nsIScriptGlobalObject;
+class nsXBLPrototypeBinding;
+
+namespace JS {
+class JS_PUBLIC_API EnvironmentChain;
+};
+
+namespace mozilla {
+union Utf8Unit;
+
+namespace dom {
+class AutoJSAPI;
+class Element;
+}  
+}  
+
+class nsJSUtils {
+ public:
+  static uint64_t GetCurrentlyRunningCodeInnerWindowID(JSContext* aContext);
+
+  static nsresult CompileFunction(mozilla::dom::AutoJSAPI& jsapi,
+                                  const JS::EnvironmentChain& aEnvChain,
+                                  JS::CompileOptions& aOptions,
+                                  const nsACString& aName, uint32_t aArgCount,
+                                  const char** aArgArray,
+                                  const nsAString& aBody,
+                                  JSObject** aFunctionObject);
+
+  static nsresult UpdateFunctionDebugMetadata(
+      mozilla::dom::AutoJSAPI& jsapi, JS::Handle<JSObject*> aFun,
+      JS::CompileOptions& aOptions, JS::Handle<JSString*> aElementAttributeName,
+      JS::Handle<JS::Value> aPrivateValue);
+
+  static bool IsScriptable(JS::Handle<JSObject*> aEvaluationGlobal);
+
+  static bool GetEnvironmentChainForElement(JSContext* aCx,
+                                            mozilla::dom::Element* aElement,
+                                            JS::EnvironmentChain& aEnvChain);
+
+  static void ResetTimeZone();
+
+  static bool DumpEnabled();
+
+  static JSObject* MoveBufferAsUint8Array(
+      JSContext* aCx, size_t aSize,
+      mozilla::UniquePtr<uint8_t[], JS::FreePolicy> aBuffer);
+};
+
+template <typename T, typename std::enable_if_t<std::is_same_v<
+                          typename T::char_type, char16_t>>* = nullptr>
+inline bool AssignJSString(JSContext* cx, T& dest, JSString* s) {
+  size_t len = JS::GetStringLength(s);
+  static_assert(JS::MaxStringLength < (1 << 30),
+                "Shouldn't overflow here or in SetCapacity");
+
+  if (XPCStringConvert::MaybeAssignUCStringChars(s, len, dest)) {
+    return true;
+  }
+
+
+  if (MOZ_UNLIKELY(!dest.SetLength(len, mozilla::fallible))) {
+    JS_ReportOutOfMemory(cx);
+    return false;
+  }
+  return JS::CopyStringChars(cx, dest.BeginWriting(), s, len);
+}
+
+template <typename T, typename std::enable_if_t<std::is_same_v<
+                          typename T::char_type, char>>* = nullptr>
+inline bool AssignJSString(JSContext* cx, T& dest, JSString* s) {
+  using namespace mozilla;
+  CheckedInt<size_t> bufLen(JS::GetStringLength(s));
+
+  if (XPCStringConvert::MaybeAssignUTF8StringChars(s, bufLen.value(), dest)) {
+    return true;
+  }
+
+  if (JS::StringHasLatin1Chars(s)) {
+    bufLen *= 2;
+  } else {
+    bufLen *= 3;
+  }
+
+  if (MOZ_UNLIKELY(!bufLen.isValid())) {
+    JS_ReportOutOfMemory(cx);
+    return false;
+  }
+
+  const bool kAllowShrinking = true;
+
+  auto handleOrErr = dest.BulkWrite(bufLen.value(), 0, kAllowShrinking);
+  if (MOZ_UNLIKELY(handleOrErr.isErr())) {
+    JS_ReportOutOfMemory(cx);
+    return false;
+  }
+
+  auto handle = handleOrErr.unwrap();
+
+  auto maybe = JS_EncodeStringToUTF8BufferPartial(cx, s, handle.AsSpan());
+  if (MOZ_UNLIKELY(!maybe)) {
+    JS_ReportOutOfMemory(cx);
+    return false;
+  }
+
+  size_t read;
+  size_t written;
+  std::tie(read, written) = *maybe;
+
+  MOZ_ASSERT(read == JS::GetStringLength(s));
+  handle.Finish(written, kAllowShrinking);
+  return true;
+}
+
+inline void AssignJSLinearString(nsAString& dest, JSLinearString* s) {
+  size_t len = JS::GetLinearStringLength(s);
+  static_assert(JS::MaxStringLength < (1 << 30),
+                "Shouldn't overflow here or in SetCapacity");
+  dest.SetLength(len);
+  JS::CopyLinearStringChars(dest.BeginWriting(), s, len);
+}
+
+inline void AssignJSLinearString(nsACString& dest, JSLinearString* s) {
+  size_t len = JS::GetLinearStringLength(s);
+  static_assert(JS::MaxStringLength < (1 << 30),
+                "Shouldn't overflow here or in SetCapacity");
+  dest.SetLength(len);
+  JS::LossyCopyLinearStringChars(dest.BeginWriting(), s, len);
+}
+
+template <typename T>
+class nsTAutoJSLinearString : public nsTAutoString<T> {
+ public:
+  explicit nsTAutoJSLinearString(JSLinearString* str) {
+    AssignJSLinearString(*this, str);
+  }
+};
+
+using nsAutoJSLinearString = nsTAutoJSLinearString<char16_t>;
+using nsAutoJSLinearCString = nsTAutoJSLinearString<char>;
+
+template <typename T>
+class nsTAutoJSString : public nsTAutoString<T> {
+ public:
+  nsTAutoJSString() = default;
+
+  bool init(JSContext* aContext, JSString* str) {
+    return AssignJSString(aContext, *this, str);
+  }
+
+  bool init(JSContext* aContext, const JS::Value& v) {
+    if (v.isString()) {
+      return init(aContext, v.toString());
+    }
+
+    JS::Rooted<JSString*> str(aContext);
+    if (v.isObject()) {
+      str = JS_NewStringCopyZ(aContext, "[Object]");
+    } else {
+      JS::Rooted<JS::Value> rootedVal(aContext, v);
+      str = JS::ToString(aContext, rootedVal);
+    }
+
+    return str && init(aContext, str);
+  }
+
+  bool init(JSContext* aContext, jsid id) {
+    JS::Rooted<JS::Value> v(aContext);
+    return JS_IdToValue(aContext, id, &v) && init(aContext, v);
+  }
+
+  bool init(const JS::Value& v);
+
+  ~nsTAutoJSString() = default;
+};
+
+using nsAutoJSString = nsTAutoJSString<char16_t>;
+
+using nsAutoJSCString = nsTAutoJSString<char>;
+
+#endif /* nsJSUtils_h_ */

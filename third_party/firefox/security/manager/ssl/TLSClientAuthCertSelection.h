@@ -1,0 +1,112 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef SECURITY_MANAGER_SSL_TLSCLIENTAUTHCERTSELECTION_H_
+#define SECURITY_MANAGER_SSL_TLSCLIENTAUTHCERTSELECTION_H_
+
+#include "NSSSocketControl.h"
+#include "nsIX509Cert.h"
+#include "nsNSSIOLayer.h"
+#include "nsThreadUtils.h"
+#include "ssl.h"
+
+class NSSSocketControl;
+
+SECStatus SSLGetClientAuthDataHook(void* arg, PRFileDesc* socket,
+                                   CERTDistNames* caNames,
+                                   CERTCertificate** pRetCert,
+                                   SECKEYPrivateKey** pRetKey);
+
+void DoSelectClientAuthCertificate(NSSSocketControl* info,
+                                   mozilla::UniqueCERTCertificate&& serverCert,
+                                   nsTArray<nsTArray<uint8_t>>&& caNames);
+
+class ClientAuthCertificateSelectedBase : public mozilla::Runnable {
+ public:
+  ClientAuthCertificateSelectedBase()
+      : Runnable("ClientAuthCertificateSelectedBase") {}
+
+  void SetSelectedClientAuthData(
+      nsTArray<uint8_t>&& selectedCertBytes,
+      nsTArray<nsTArray<uint8_t>>&& selectedCertChainBytes);
+
+ protected:
+  nsTArray<uint8_t> mSelectedCertBytes;
+  nsTArray<nsTArray<uint8_t>> mSelectedCertChainBytes;
+};
+
+class ClientAuthCertificateSelected : public ClientAuthCertificateSelectedBase {
+ public:
+  explicit ClientAuthCertificateSelected(NSSSocketControl* socketInfo)
+      : mSocketInfo(socketInfo) {}
+
+  NS_IMETHOD Run() override;
+
+ private:
+  RefPtr<NSSSocketControl> mSocketInfo;
+};
+
+class ClientAuthInfo final {
+ public:
+  explicit ClientAuthInfo(const nsACString& hostName,
+                          const mozilla::OriginAttributes& originAttributes,
+                          int32_t port, uint32_t providerFlags,
+                          uint32_t providerTlsFlags);
+  ~ClientAuthInfo() = default;
+  ClientAuthInfo(ClientAuthInfo&& aOther) noexcept;
+
+  const nsACString& HostName() const;
+  const mozilla::OriginAttributes& OriginAttributesRef() const;
+  int32_t Port() const;
+  uint32_t ProviderFlags() const;
+  uint32_t ProviderTlsFlags() const;
+
+  ClientAuthInfo(const ClientAuthInfo&) = delete;
+  void operator=(const ClientAuthInfo&) = delete;
+
+ private:
+  nsCString mHostName;
+  mozilla::OriginAttributes mOriginAttributes;
+  int32_t mPort;
+  uint32_t mProviderFlags;
+  uint32_t mProviderTlsFlags;
+};
+
+class SelectClientAuthCertificate : public mozilla::Runnable {
+ public:
+  SelectClientAuthCertificate(
+      ClientAuthInfo&& info, mozilla::UniqueCERTCertificate&& serverCert,
+      mozilla::UniqueCERTCertList&& potentialClientCertificates,
+      nsTArray<nsTArray<nsTArray<uint8_t>>>&& potentialClientCertificateChains,
+      nsTArray<nsTArray<uint8_t>>&& caNames,
+      ClientAuthCertificateSelectedBase* continuation, uint64_t browserId)
+      : Runnable("SelectClientAuthCertificate"),
+        mInfo(std::move(info)),
+        mServerCert(std::move(serverCert)),
+        mPotentialClientCertificates(std::move(potentialClientCertificates)),
+        mPotentialClientCertificateChains(
+            std::move(potentialClientCertificateChains)),
+        mCANames(std::move(caNames)),
+        mContinuation(continuation),
+        mBrowserId(browserId) {}
+
+  NS_IMETHOD Run() override;
+
+  const ClientAuthInfo& Info() { return mInfo; }
+  void DispatchContinuation(nsTArray<uint8_t>&& selectedCertBytes);
+
+ private:
+  ClientAuthInfo mInfo;
+  mozilla::UniqueCERTCertificate mServerCert;
+  mozilla::UniqueCERTCertList mPotentialClientCertificates;
+  nsTArray<nsTArray<nsTArray<uint8_t>>> mPotentialClientCertificateChains;
+  nsTArray<nsTArray<uint8_t>> mCANames;
+  RefPtr<ClientAuthCertificateSelectedBase> mContinuation;
+
+  uint64_t mBrowserId;
+  nsCOMPtr<nsIInterfaceRequestor> mSecurityCallbacks;
+};
+
+#endif  // SECURITY_MANAGER_SSL_TLSCLIENTAUTHCERTSELECTION_H_

@@ -1,0 +1,966 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef gc_Barrier_h
+#define gc_Barrier_h
+
+#include <type_traits>  // std::true_type
+
+#include "NamespaceImports.h"
+
+#include "gc/Cell.h"
+#include "gc/GCContext.h"
+#include "gc/StoreBuffer.h"
+#include "js/ComparisonOperators.h"     // JS::detail::DefineComparisonOps
+#include "js/experimental/TypedData.h"  // js::EnableIfABOVType
+#include "js/HeapAPI.h"
+#include "js/Id.h"
+#include "js/RootingAPI.h"
+#include "js/Value.h"
+#include "util/Poison.h"
+
+
+namespace js {
+
+class NativeObject;
+
+namespace gc {
+
+inline void ValueReadBarrier(const Value& v) {
+  MOZ_ASSERT(v.isGCThing());
+  ReadBarrierImpl(v.toGCThing());
+}
+
+inline void ValuePreWriteBarrier(const Value& v) {
+  MOZ_ASSERT(v.isGCThing());
+  PreWriteBarrierImpl(v.toGCThing());
+}
+
+inline void IdPreWriteBarrier(jsid id) {
+  MOZ_ASSERT(id.isGCThing());
+  PreWriteBarrierImpl(&id.toGCThing()->asTenured());
+}
+
+inline void CellPtrPreWriteBarrier(JS::GCCellPtr thing) {
+  MOZ_ASSERT(thing);
+  PreWriteBarrierImpl(thing.asCell());
+}
+
+inline void WasmAnyRefPreWriteBarrier(const wasm::AnyRef& v) {
+  MOZ_ASSERT(v.isGCThing());
+  PreWriteBarrierImpl(v.toGCThing());
+}
+
+}  
+
+#ifdef DEBUG
+
+bool CurrentThreadIsTouchingGrayThings();
+
+bool IsMarkedBlack(JSObject* obj);
+
+#endif
+
+template <typename T, typename Enable = void>
+struct InternalBarrierMethods {};
+
+template <typename T>
+struct InternalBarrierMethods<T*> {
+  static_assert(std::is_base_of_v<gc::Cell, T>, "Expected a GC thing type");
+
+  static bool isMarkable(const T* v) { return v != nullptr; }
+
+  static void preBarrier(T* v) { gc::PreWriteBarrier(v); }
+
+  static void postBarrier(T** vp, T* prev, T* next) {
+    gc::PostWriteBarrier(vp, prev, next);
+  }
+
+  static void readBarrier(T* v) { gc::ReadBarrier(v); }
+
+#ifdef DEBUG
+  static void assertThingIsNotGray(T* v) { return T::assertThingIsNotGray(v); }
+#endif
+};
+
+template <typename T>
+struct AtomicMethods {};
+
+template <typename T>
+struct AtomicMethods<T*> {
+  static T* atomicGet(T* const* vp) {
+    return __atomic_load_n(vp, __ATOMIC_RELAXED);
+  }
+  static void atomicSet(T** vp, T* v) {
+    __atomic_store_n(vp, v, __ATOMIC_RELAXED);
+  }
+};
+
+template <typename T>
+  requires std::integral<T> && (!std::same_as<T, bool>)
+struct AtomicMethods<T> {
+  static T atomicGet(T const* vp) {
+    return __atomic_load_n(vp, __ATOMIC_RELAXED);
+  }
+  static void atomicSet(T* vp, T v) {
+    __atomic_store_n(vp, v, __ATOMIC_RELAXED);
+  }
+};
+
+namespace gc {
+
+MOZ_ALWAYS_INLINE void ValuePostWriteBarrier(Value* vp, const Value& prev,
+                                             const Value& next) {
+  MOZ_ASSERT(!CurrentThreadIsOffThreadCompiling());
+  MOZ_ASSERT(vp);
+
+  js::gc::StoreBuffer* sb;
+  if (next.isGCThing() && (sb = next.toGCThing()->storeBuffer())) {
+    if (prev.isGCThing() && prev.toGCThing()->storeBuffer()) {
+      return;
+    }
+    sb->putValue(vp);
+    return;
+  }
+  if (prev.isGCThing() && (sb = prev.toGCThing()->storeBuffer())) {
+    sb->unputValue(vp);
+  }
+}
+
+}  
+
+template <>
+struct InternalBarrierMethods<Value> {
+  static bool isMarkable(const Value& v) { return v.isGCThing(); }
+
+  static void preBarrier(const Value& v) {
+    if (v.isGCThing()) {
+      gc::ValuePreWriteBarrier(v);
+    }
+  }
+
+  static MOZ_ALWAYS_INLINE void postBarrier(Value* vp, const Value& prev,
+                                            const Value& next) {
+    gc::ValuePostWriteBarrier(vp, prev, next);
+  }
+
+  static void readBarrier(const Value& v) {
+    if (v.isGCThing()) {
+      gc::ValueReadBarrier(v);
+    }
+  }
+
+#ifdef DEBUG
+  static void assertThingIsNotGray(const Value& v) {
+    JS::AssertValueIsNotGray(v);
+  }
+#endif
+};
+
+template <>
+struct AtomicMethods<Value> {
+#if JS_BITS_PER_WORD == 64
+  static Value atomicGet(Value const* vp) { return vp->atomicGet(); }
+  static void atomicSet(Value* vp, const Value& v) { vp->atomicSet(v); }
+#endif
+};
+
+template <>
+struct InternalBarrierMethods<jsid> {
+  static bool isMarkable(jsid id) { return id.isGCThing(); }
+  static void preBarrier(jsid id) {
+    if (id.isGCThing()) {
+      gc::IdPreWriteBarrier(id);
+    }
+  }
+  static void postBarrier(jsid* idp, jsid prev, jsid next) {}
+
+#ifdef DEBUG
+  static void assertThingIsNotGray(jsid id) { JS::AssertIdIsNotGray(id); }
+#endif
+};
+
+template <>
+struct AtomicMethods<jsid> {
+  static jsid atomicGet(jsid const* idp) { return idp->atomicGet(); }
+  static void atomicSet(jsid* idp, const jsid& id) { idp->atomicSet(id); }
+};
+
+template <typename T>
+struct InternalBarrierMethods<T, EnableIfABOVType<T>> {
+  using BM = BarrierMethods<T>;
+
+  static bool isMarkable(const T& thing) { return bool(thing); }
+  static void preBarrier(const T& thing) {
+    gc::PreWriteBarrier(thing.asObjectUnbarriered());
+  }
+  static void postBarrier(T* tp, const T& prev, const T& next) {
+    BM::postWriteBarrier(tp, prev, next);
+  }
+  static void readBarrier(const T& thing) { BM::readBarrier(thing); }
+#ifdef DEBUG
+  static void assertThingIsNotGray(const T& thing) {
+    JSObject* obj = thing.asObjectUnbarriered();
+    if (obj) {
+      JS::AssertValueIsNotGray(JS::ObjectValue(*obj));
+    }
+  }
+#endif
+};
+
+template <typename T>
+static inline void AssertTargetIsNotGray(const T& v) {
+#ifdef DEBUG
+  if (!CurrentThreadIsTouchingGrayThings()) {
+    InternalBarrierMethods<T>::assertThingIsNotGray(v);
+  }
+#endif
+}
+
+template <typename T>
+class MOZ_NON_MEMMOVABLE BarrieredBase {
+  T value;
+
+ protected:
+  explicit constexpr BarrieredBase(const T& v) : value(v) {}
+  constexpr BarrieredBase(const BarrieredBase<T>& other) = default;
+
+  constexpr const T& unbarrieredGet() const { return value; }
+  void unbarrieredSet(const T& newValue) { value = newValue; }
+
+#if JS_BITS_PER_WORD == 64
+  T unbarrieredAtomicGet() const { return AtomicMethods<T>::atomicGet(&value); }
+  void unbarrieredAtomicSet(const T& newValue) {
+    AtomicMethods<T>::atomicSet(&value, newValue);
+  }
+#endif
+
+ public:
+  using ElementType = T;
+
+#ifdef JS_GC_CONCURRENT_MARKING
+  T getForTracing() const { return unbarrieredAtomicGet(); }
+#else
+  T getForTracing() const { return unbarrieredGet(); }
+#endif
+
+  T* unbarrieredAddress() const { return const_cast<T*>(&value); }
+};
+
+template <typename T>
+class GCData : public BarrieredBase<T> {
+  using Base = BarrieredBase<T>;
+  using Self = GCData<T>;
+
+ public:
+  constexpr GCData() : Base(defaultValue()) {}
+
+  explicit constexpr GCData(const T& value) : Base(value) {}
+  Self& operator=(const T& newValue) {
+    set(newValue);
+    return *this;
+  }
+
+  void set(const T& newValue) {
+#ifdef JS_GC_CONCURRENT_MARKING
+    this->unbarrieredAtomicSet(newValue);
+#else
+    this->unbarrieredSet(newValue);
+#endif
+  }
+
+  constexpr T get() const { return this->unbarrieredGet(); }
+
+#if JS_BITS_PER_WORD == 64
+  void atomicSet(const T& newValue) { this->unbarrieredAtomicSet(newValue); }
+  T atomicGet() const { return this->unbarrieredAtomicGet(); }
+#endif
+
+  constexpr operator T() const { return get(); }
+  constexpr T operator->() const { return get(); }
+
+  template <typename U>
+  Self& operator+=(const U& rhs) {
+    set(get() + rhs);
+    return *this;
+  }
+  template <typename U>
+  Self& operator-=(const U& rhs) {
+    set(get() - rhs);
+    return *this;
+  }
+  template <typename U>
+  Self& operator&=(const U& rhs) {
+    set(get() & rhs);
+    return *this;
+  }
+  template <typename U>
+  Self& operator|=(const U& rhs) {
+    set(get() | rhs);
+    return *this;
+  }
+
+  static T defaultValue() { return JS::SafelyInitialized<T>::create(); }
+};
+
+namespace gc {
+
+enum BarrierOption : uint32_t {
+  BarrierOption_None = 0,
+
+  BarrierOption_PreWriteBarrier = Bit(0),
+
+  BarrierOption_PostWriteBarrier = Bit(1),
+
+  BarrierOption_ReadBarrier = Bit(2),
+
+  BarrierOption_HasGCLifetime = Bit(3),
+
+  BarrierOption_AtomicWrites = Bit(4),
+};
+
+template <typename T, uint32_t barrierOptions = BarrierOption_None>
+class BarrieredPtrImpl
+    : public BarrieredBase<T>,
+      public WrappedPtrOperations<T, BarrieredPtrImpl<T, barrierOptions>> {
+  using Self = BarrieredPtrImpl<T, barrierOptions>;
+  using Base = BarrieredBase<T>;
+
+ public:
+  BarrieredPtrImpl() : Base(defaultValue()) {}
+
+  explicit BarrieredPtrImpl(const T& value) : Base(value) {
+    maybePostWriteBarrier(defaultValue(), value);
+  }
+  Self& operator=(const T& newValue) {
+    set(newValue);
+    return *this;
+  }
+
+  BarrieredPtrImpl(const Self& other) : Base(other.unbarrieredGet()) {
+    maybePostWriteBarrier(defaultValue(), this->unbarrieredGet());
+  }
+  Self& operator=(const Self& other) {
+    set(other.unbarrieredGet());
+    return *this;
+  }
+
+  template <uint32_t opts = barrierOptions,
+            typename = std::enable_if_t<!(opts & BarrierOption_HasGCLifetime)>>
+  explicit BarrieredPtrImpl(Self&& other) : Base(other.release()) {
+    maybePostWriteBarrier(defaultValue(), this->unbarrieredGet());
+  }
+  template <uint32_t opts = barrierOptions,
+            typename = std::enable_if_t<!(opts & BarrierOption_HasGCLifetime)>>
+  Self& operator=(Self&& other) noexcept {
+    uncheckedSet(other.release());
+    return *this;
+  }
+
+  ~BarrieredPtrImpl() {
+    if constexpr (hasOption(BarrierOption_HasGCLifetime)) {
+#ifdef DEBUG
+      checkGCLifetime();
+      Poison(this, JS_FREED_HEAP_PTR_PATTERN, sizeof(*this),
+             MemCheckKind::MakeNoAccess);
+#endif
+    } else {
+      this->maybePreWriteBarrier();
+      this->maybePostWriteBarrier(this->unbarrieredGet(), defaultValue());
+    }
+  }
+
+  DECLARE_POINTER_CONSTREF_OPS(T);
+
+  void init(const T& newValue) {
+    checkValue(newValue);
+    this->unbarrieredSet(newValue);
+    this->maybePostWriteBarrier(defaultValue(), newValue);
+  }
+
+ public:
+  void set(const T& newValue) {
+    checkValue(newValue);
+    uncheckedSet(newValue);
+  }
+
+ private:
+  void uncheckedSet(const T& newValue) {
+    T oldValue = this->unbarrieredGet();
+    this->maybePreWriteBarrier();
+    this->unbarrieredSet(newValue);
+    this->maybePostWriteBarrier(oldValue, newValue);
+  }
+
+ public:
+  void unbarrieredSet(const T& newValue) {
+    if constexpr (hasOption(BarrierOption_AtomicWrites)) {
+      this->unbarrieredAtomicSet(newValue);
+    } else {
+      Base::unbarrieredSet(newValue);
+    }
+  }
+
+  const T& get() const {
+    this->maybeReadBarrier();
+    return this->unbarrieredGet();
+  }
+
+  explicit operator bool() const {
+    return this->unbarrieredGet() != defaultValue();
+  }
+
+  using Base::unbarrieredGet;
+
+#if JS_BITS_PER_WORD == 64
+  using Base::unbarrieredAtomicGet;
+#endif
+
+  T release() {
+    T oldValue = this->unbarrieredGet();
+    this->unbarrieredSet(defaultValue());
+    this->maybePostWriteBarrier(oldValue, defaultValue());
+    return oldValue;
+  }
+
+  static T defaultValue() { return JS::SafelyInitialized<T>::create(); }
+
+ private:
+  void checkGCLifetime() {
+    MOZ_ASSERT(CurrentThreadIsGCSweeping() || CurrentThreadIsGCFinalizing() ||
+               this->unbarrieredGet() == defaultValue());
+  }
+
+  MOZ_ALWAYS_INLINE void checkValue(const T& value) {
+    AssertTargetIsNotGray(value);
+  }
+
+  MOZ_ALWAYS_INLINE void maybeReadBarrier() const {
+    if constexpr (hasOption(BarrierOption_ReadBarrier)) {
+      InternalBarrierMethods<T>::readBarrier(this->unbarrieredGet());
+    }
+  }
+
+  MOZ_ALWAYS_INLINE void maybePreWriteBarrier() const {
+    if constexpr (hasOption(BarrierOption_PreWriteBarrier)) {
+      InternalBarrierMethods<T>::preBarrier(this->unbarrieredGet());
+    }
+  }
+
+  MOZ_ALWAYS_INLINE void maybePostWriteBarrier(const T& prev,
+                                               const T& next) const {
+    if constexpr (hasOption(BarrierOption_PostWriteBarrier)) {
+      T* ptr = this->unbarrieredAddress();
+      InternalBarrierMethods<T>::postBarrier(ptr, prev, next);
+    }
+  }
+
+ public:
+  constexpr static bool hasOption(BarrierOption option) {
+    return barrierOptions & uint32_t(option);
+  }
+};
+
+}  
+
+#define DEFINE_BARRIERED_PTR(Name, Options)              \
+  template <typename T>                                  \
+  class Name : public gc::BarrieredPtrImpl<T, Options> { \
+    using Base = gc::BarrieredPtrImpl<T, Options>;       \
+                                                         \
+   public:                                               \
+    using Base::Base;                                    \
+    using Base::operator=;                               \
+  }
+
+DEFINE_BARRIERED_PTR(PreBarriered, gc::BarrierOption_PreWriteBarrier);
+
+DEFINE_BARRIERED_PTR(GCPtr, gc::BarrierOption_PreWriteBarrier |
+                                gc::BarrierOption_PostWriteBarrier |
+#ifdef JS_GC_CONCURRENT_MARKING
+                                gc::BarrierOption_AtomicWrites |
+#endif
+                                gc::BarrierOption_HasGCLifetime);
+
+DEFINE_BARRIERED_PTR(HeapPtr, gc::BarrierOption_PreWriteBarrier |
+                                  gc::BarrierOption_PostWriteBarrier);
+
+template <class T>
+class GCStructPtr : public BarrieredBase<T> {
+ public:
+  GCStructPtr() : BarrieredBase<T>(JS::SafelyInitialized<T>::create()) {}
+
+  explicit GCStructPtr(const T& v) : BarrieredBase<T>(v) {}
+
+  GCStructPtr(const GCStructPtr<T>& other) : BarrieredBase<T>(other) {}
+
+  ~GCStructPtr() {
+    MOZ_ASSERT_IF(isTraceable(),
+                  CurrentThreadIsGCSweeping() || CurrentThreadIsGCFinalizing());
+  }
+
+  void init(const T& v) {
+    MOZ_ASSERT(this->get() == JS::SafelyInitialized<T>());
+    AssertTargetIsNotGray(v);
+    this->unbarrieredSet(v);
+  }
+
+  void set(JS::Zone* zone, const T& v) {
+    pre(zone);
+    this->unbarrieredSet(v);
+  }
+
+  T get() const { return this->unbarrieredGet(); }
+  operator T() const { return get(); }
+  T operator->() const { return get(); }
+
+#if JS_BITS_PER_WORD == 64
+  T atomicGet() const { return this->unbarrieredAtomicGet(); }
+#endif
+
+#ifdef JS_GC_CONCURRENT_MARKING
+  T getForTracing() const { return atomicGet(); }
+#else
+  T getForTracing() const { return get(); }
+#endif
+
+ protected:
+  bool isTraceable() const { return uintptr_t(get()) > MaxTaggedPointer; }
+
+  void pre(JS::Zone* zone) {
+    if (isTraceable()) {
+      PreWriteBarrier(zone, get());
+    }
+  }
+};
+
+template <class T>
+class GCBuffer : public BarrieredBase<T> {
+  static_assert(std::is_pointer_v<T>);
+
+  using Base = BarrieredBase<T>;
+
+ public:
+  GCBuffer() : Base(nullptr) {}
+
+  explicit GCBuffer(T ptr) : Base(ptr) {}
+
+  GCBuffer(const GCBuffer<T>& other) : Base(other) {}
+
+  ~GCBuffer() {
+    MOZ_ASSERT_IF(isTraceable(),
+                  CurrentThreadIsGCSweeping() || CurrentThreadIsGCFinalizing());
+  }
+
+  void init(T ptr) {
+    MOZ_ASSERT(this->get() == JS::SafelyInitialized<T>());
+    AssertTargetIsNotGray(ptr);
+    this->unbarrieredSet(ptr);
+  }
+
+  void set(JS::Zone* zone, T ptr) {
+    pre(zone);
+    this->unbarrieredSet(ptr);
+  }
+
+#ifdef JS_GC_CONCURRENT_MARKING
+  void unbarrieredSet(T ptr) { this->unbarrieredAtomicSet(ptr); }
+#else
+  using Base::unbarrieredSet;
+#endif
+
+  T get() const { return this->unbarrieredGet(); }
+  operator T() const { return get(); }
+  T operator->() const { return get(); }
+
+#if JS_BITS_PER_WORD == 64
+  T atomicGet() const { return this->unbarrieredAtomicGet(); }
+#endif
+
+ protected:
+  bool isTraceable() const { return uintptr_t(get()) > MaxTaggedPointer; }
+
+  void pre(JS::Zone* zone) {
+    if (isTraceable()) {
+      auto* shadowZone = JS::shadow::Zone::from(zone);
+      if (!shadowZone->needsMarkingBarrier()) {
+        return;
+      }
+
+      JSTracer* trc = shadowZone->barrierTracer();
+      TraceEdgeAndBuffer(trc, this, "GCBuffer::pre");
+    }
+  }
+};
+
+
+DEFINE_BARRIERED_PTR(WeakHeapPtr, gc::BarrierOption_ReadBarrier |
+                                      gc::BarrierOption_PostWriteBarrier);
+
+DEFINE_BARRIERED_PTR(UnsafeBarePtr, gc::BarrierOption_None);
+
+class HeapSlot : public BarrieredBase<Value>,
+                 public WrappedPtrOperations<Value, HeapSlot> {
+  using Base = BarrieredBase<Value>;
+
+ public:
+  enum Kind { Slot = 0, Element = 1 };
+
+  void init(NativeObject* owner, Kind kind, uint32_t slot, const Value& v) {
+    this->unbarrieredSet(v);
+    post(owner, kind, slot, v);
+  }
+
+  void unbarrieredInit(const Value& v) { this->unbarrieredSet(v); }
+
+  void initAsUndefined() { this->unbarrieredSet(UndefinedValue()); }
+
+  DECLARE_POINTER_CONSTREF_OPS(Value);
+
+  const Value& get() const { return this->unbarrieredGet(); }
+
+#if JS_BITS_PER_WORD == 64
+  using Base::unbarrieredAtomicGet;
+#endif
+
+#ifdef JS_GC_CONCURRENT_MARKING
+  Value getForTracing() const { return unbarrieredAtomicGet(); }
+#else
+  Value getForTracing() const { return unbarrieredGet(); }
+#endif
+
+#ifdef JS_GC_CONCURRENT_MARKING
+  void unbarrieredSet(const Value& newValue) {
+    this->unbarrieredAtomicSet(newValue);
+  }
+#else
+  using Base::unbarrieredSet;
+#endif
+
+  static void preWriteBarrier(const Value& v) {
+    InternalBarrierMethods<Value>::preBarrier(v);
+  }
+
+  void destroy() { pre(); }
+
+  void setUndefinedUnchecked() {
+    pre();
+    this->unbarrieredSet(UndefinedValue());
+  }
+
+#ifdef DEBUG
+  bool preconditionForSet(NativeObject* owner, Kind kind, uint32_t slot) const;
+  void assertPreconditionForPostWriteBarrier(NativeObject* obj, Kind kind,
+                                             uint32_t slot,
+                                             const Value& target) const;
+#endif
+
+  MOZ_ALWAYS_INLINE void set(NativeObject* owner, Kind kind, uint32_t slot,
+                             const Value& v) {
+    MOZ_ASSERT(preconditionForSet(owner, kind, slot));
+    pre();
+    this->unbarrieredSet(v);
+    post(owner, kind, slot, v);
+  }
+
+ private:
+  void pre() {
+    InternalBarrierMethods<Value>::preBarrier(this->unbarrieredGet());
+  }
+
+  void post(NativeObject* owner, Kind kind, uint32_t slot,
+            const Value& target) {
+#ifdef DEBUG
+    assertPreconditionForPostWriteBarrier(owner, kind, slot, target);
+#endif
+    if (this->unbarrieredGet().isGCThing()) {
+      gc::Cell* cell = this->unbarrieredGet().toGCThing();
+      if (cell->storeBuffer()) {
+        cell->storeBuffer()->putSlot(owner, kind, slot, 1);
+      }
+    }
+  }
+};
+
+class HeapSlotArray {
+  HeapSlot* array;
+
+ public:
+  explicit HeapSlotArray(HeapSlot* array) : array(array) {}
+
+  HeapSlot* begin() const { return array; }
+
+  operator const Value*() const {
+    static_assert(sizeof(GCPtr<Value>) == sizeof(Value));
+    static_assert(sizeof(HeapSlot) == sizeof(Value));
+    return reinterpret_cast<const Value*>(array);
+  }
+  operator HeapSlot*() const { return begin(); }
+
+  HeapSlotArray operator+(int offset) const {
+    return HeapSlotArray(array + offset);
+  }
+  HeapSlotArray operator+(uint32_t offset) const {
+    return HeapSlotArray(array + offset);
+  }
+};
+
+
+template <typename T>
+MOZ_ALWAYS_INLINE void BarrieredInit(bool nurseryOwned, void* dst, T value) {
+  AssertTargetIsNotGray(value);
+
+
+  T* ptr = reinterpret_cast<T*>(dst);
+  *ptr = value;
+
+  if (!nurseryOwned) {
+    T prev = JS::SafelyInitialized<T>::create();
+    InternalBarrierMethods<T>::postBarrier(ptr, prev, value);
+  }
+}
+template <typename T>
+MOZ_ALWAYS_INLINE void BarrieredInit(gc::Cell* owner, void* dst, T value) {
+  BarrieredInit(!owner->isTenured(), dst, value);
+}
+
+namespace gc {
+template <typename T, bool PreBarrier = true, bool PostBarrier = true>
+MOZ_ALWAYS_INLINE void BarrieredSetImpl(bool nurseryOwned, void* dst, T value) {
+  AssertTargetIsNotGray(value);
+
+  T* ptr = reinterpret_cast<T*>(dst);
+  T prev = *ptr;
+  if constexpr (PreBarrier) {
+    InternalBarrierMethods<T>::preBarrier(prev);
+  }
+
+  *ptr = value;
+
+  if constexpr (PostBarrier) {
+    if (!nurseryOwned) {
+      InternalBarrierMethods<T>::postBarrier(ptr, prev, value);
+    }
+  }
+}
+}  
+
+
+template <typename T>
+MOZ_ALWAYS_INLINE void BarrieredSet(bool nurseryOwned, void* dst, T value) {
+  gc::BarrieredSetImpl(nurseryOwned, dst, value);
+}
+template <typename T>
+MOZ_ALWAYS_INLINE void BarrieredSet(gc::Cell* owner, void* dst, T value) {
+  BarrieredSet(!owner->isTenured(), dst, value);
+}
+
+namespace gc {
+
+template <typename T, bool PreBarrier = true, bool PostBarrier = true>
+MOZ_ALWAYS_INLINE void BarrieredMoveRangeInner(bool nurseryOwned, void* dst,
+                                               const T* src, size_t count) {
+  T* ptr = reinterpret_cast<T*>(dst);
+  if (uintptr_t(dst) - uintptr_t(src) < count * sizeof(T)) {
+    for (size_t i = count; i != 0; i--) {
+      BarrieredSetImpl<T, PreBarrier, PostBarrier>(nurseryOwned, ptr + i - 1,
+                                                   src[i - 1]);
+    }
+    return;
+  }
+
+  for (size_t i = 0; i < count; i++) {
+    BarrieredSetImpl<T, PreBarrier, PostBarrier>(nurseryOwned, ptr + i, src[i]);
+  }
+}
+
+template <typename T>
+void BarrieredMoveRangeImpl(gc::Cell* owner, void* dst, const T* src,
+                            size_t count) {
+
+  bool nurseryOwned = !owner->isTenured();
+  if (owner->shadowZone()->needsMarkingBarrier()) {
+    BarrieredMoveRangeInner<T, true, true>(nurseryOwned, dst, src, count);
+    return;
+  }
+
+  MOZ_ASSERT(!nurseryOwned);
+  BarrieredMoveRangeInner<T, false, true>(false, dst, src, count);
+}
+
+}  
+
+
+template <typename T>
+void BarrieredMoveRange(gc::Cell* owner, void* dst, const T* src,
+                        size_t count) {
+  if (dst == src) {
+    return;
+  }
+
+  if (owner->isTenured() || owner->shadowZone()->needsMarkingBarrier()) {
+    gc::BarrieredMoveRangeImpl(owner, dst, src, count);
+    return;
+  }
+
+  memmove(dst, src, count * sizeof(T));
+}
+
+template <typename T>
+void BarrieredCopyRange(gc::Cell* owner, T* dst, T* src, size_t count) {
+  MOZ_ASSERT(uintptr_t(dst) >= uintptr_t(src) + count * sizeof(T) ||
+             uintptr_t(dst) + count * sizeof(T) <= uintptr_t(src));
+
+  bool nurseryOwned = !owner->isTenured();
+  for (size_t i = 0; i < count; i++) {
+    BarrieredSet(nurseryOwned, dst + i, src[i]);
+  }
+}
+
+template <typename T>
+class MOZ_HEAP_CLASS ImmutableTenuredPtr {
+  T value;
+
+ public:
+  operator T() const { return value; }
+  T operator->() const { return value; }
+
+  operator Handle<T>() const { return toHandle(); }
+  Handle<T> toHandle() const { return Handle<T>::fromMarkedLocation(&value); }
+
+  void init(T ptr) {
+    MOZ_ASSERT(ptr->isTenured());
+    AssertTargetIsNotGray(ptr);
+    value = ptr;
+  }
+
+  T get() const { return value; }
+  const T* address() { return &value; }
+};
+
+template <typename T>
+struct RemoveBarrier {
+  using Type = T;
+};
+
+#define DEFINE_REMOVE_BARRIER(BarrieredPtr) \
+  template <typename T>                     \
+  struct RemoveBarrier<BarrieredPtr<T>> {   \
+    using Type = T;                         \
+  }
+
+DEFINE_REMOVE_BARRIER(PreBarriered);
+DEFINE_REMOVE_BARRIER(HeapPtr);
+DEFINE_REMOVE_BARRIER(GCPtr);
+DEFINE_REMOVE_BARRIER(WeakHeapPtr);
+
+#undef DEFINE_REMOVE_BARRIER
+
+template <typename T>
+using IsBarriered =
+    std::negation<std::is_same<T, typename RemoveBarrier<T>::Type>>;
+
+#if MOZ_IS_GCC
+template struct JS_PUBLIC_API StableCellHasher<JSObject*>;
+template struct JS_PUBLIC_API StableCellHasher<JSScript*>;
+#endif
+
+#define DEFINE_STABLE_CELL_HASHER(BarrieredPtr)                      \
+  template <typename T>                                              \
+  struct StableCellHasher<BarrieredPtr<T>> {                         \
+    using Key = BarrieredPtr<T>;                                     \
+    using Lookup = T;                                                \
+                                                                     \
+    static_assert(!Key::hasOption(gc::BarrierOption_HasGCLifetime)); \
+                                                                     \
+    static bool maybeGetHash(const Lookup& l, HashNumber* hashOut) { \
+      return StableCellHasher<T>::maybeGetHash(l, hashOut);          \
+    }                                                                \
+    static bool ensureHash(const Lookup& l, HashNumber* hashOut) {   \
+      return StableCellHasher<T>::ensureHash(l, hashOut);            \
+    }                                                                \
+    static HashNumber hash(const Lookup& l) {                        \
+      return StableCellHasher<T>::hash(l);                           \
+    }                                                                \
+    static bool match(const Key& k, const Lookup& l) {               \
+      return StableCellHasher<T>::match(k.unbarrieredGet(), l);      \
+    }                                                                \
+  }
+
+DEFINE_STABLE_CELL_HASHER(PreBarriered);
+DEFINE_STABLE_CELL_HASHER(HeapPtr);
+DEFINE_STABLE_CELL_HASHER(WeakHeapPtr);
+
+#undef DEFINE_STABLE_CELL_HASHER
+
+#define DEFINE_BARRIERED_PTR_HASHER(Name, BarrieredPtr)                    \
+  template <class T>                                                       \
+  struct Name {                                                            \
+    using Key = BarrieredPtr<T>;                                           \
+    using Lookup = T;                                                      \
+                                                                           \
+    static_assert(!Key::hasOption(gc::BarrierOption_HasGCLifetime));       \
+                                                                           \
+    static HashNumber hash(Lookup l) { return DefaultHasher<T>::hash(l); } \
+    static bool match(const Key& k, Lookup l) {                            \
+      return k.unbarrieredGet() == l;                                      \
+    }                                                                      \
+    static void rekey(Key& k, T newKey) { k.unbarrieredSet(newKey); }      \
+  }
+
+DEFINE_BARRIERED_PTR_HASHER(PreBarrieredHasher, PreBarriered);
+DEFINE_BARRIERED_PTR_HASHER(HeapPtrHasher, HeapPtr);
+DEFINE_BARRIERED_PTR_HASHER(WeakHeapPtrHasher, WeakHeapPtr);
+DEFINE_BARRIERED_PTR_HASHER(UnsafeBarePtrHasher, UnsafeBarePtr);
+
+#undef DEFINE_BARRIERED_PTR_HASHER
+
+template <class T>
+using PreBarrierWrapper = PreBarriered<T>;
+template <class T>
+using PreAndPostBarrierWrapper = GCPtr<T>;
+
+}  
+
+
+namespace JS::detail {
+
+#define DEFINE_BARRIERED_PTR_COMPARISON_OPS(BarrieredPtr)        \
+  template <typename T>                                          \
+  struct DefineComparisonOps<BarrieredPtr<T>> : std::true_type { \
+    static const T& get(const BarrieredPtr<T>& v) {              \
+      return v.unbarrieredGet();                                 \
+    }                                                            \
+  }
+
+DEFINE_BARRIERED_PTR_COMPARISON_OPS(js::PreBarriered);
+DEFINE_BARRIERED_PTR_COMPARISON_OPS(js::GCPtr);
+DEFINE_BARRIERED_PTR_COMPARISON_OPS(js::HeapPtr);
+DEFINE_BARRIERED_PTR_COMPARISON_OPS(js::WeakHeapPtr);
+
+#undef DEFINE_BARRIERED_PTR_COMPARISON_OPS
+
+template <>
+struct DefineComparisonOps<js::HeapSlot> : std::true_type {
+  static const Value& get(const js::HeapSlot& v) { return v.get(); }
+};
+
+}  
+
+namespace mozilla {
+
+#define DEFINE_DEFAULT_HASHER(BarrieredPtr, Hasher) \
+  template <class T>                                \
+  struct DefaultHasher<BarrieredPtr<T>> : Hasher<T> {}
+
+DEFINE_DEFAULT_HASHER(js::HeapPtr, js::HeapPtrHasher);
+DEFINE_DEFAULT_HASHER(js::PreBarriered, js::PreBarrieredHasher);
+DEFINE_DEFAULT_HASHER(js::WeakHeapPtr, js::WeakHeapPtrHasher);
+DEFINE_DEFAULT_HASHER(js::UnsafeBarePtr, js::UnsafeBarePtrHasher);
+
+#undef DEFINE_DEFAULT_HASHER
+
+}  
+
+#endif /* gc_Barrier_h */

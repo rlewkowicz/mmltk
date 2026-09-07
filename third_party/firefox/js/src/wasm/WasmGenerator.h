@@ -1,0 +1,328 @@
+/*
+ * Copyright 2015 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#ifndef wasm_generator_h
+#define wasm_generator_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/MemoryReporting.h"
+
+#include "jit/MacroAssembler.h"
+#include "jit/PerfSpewer.h"
+#include "threading/ProtectedData.h"
+#include "vm/HelperThreadTask.h"
+#include "wasm/WasmCompile.h"
+#include "wasm/WasmConstants.h"
+#include "wasm/WasmMetadata.h"
+#include "wasm/WasmModule.h"
+
+namespace JS {
+class OptimizedEncodingListener;
+}
+
+namespace js {
+namespace wasm {
+
+struct CompileTask;
+using CompileTaskPtrVector = Vector<CompileTask*, 0, SystemAllocPolicy>;
+
+
+struct FuncCompileInput {
+  const uint8_t* begin;
+  const uint8_t* end;
+  uint32_t index;
+  uint32_t bytecodeOffset;
+
+  FuncCompileInput(uint32_t index, uint32_t bytecodeOffset,
+                   const uint8_t* begin, const uint8_t* end)
+      : begin(begin), end(end), index(index), bytecodeOffset(bytecodeOffset) {}
+
+  uint32_t bytecodeSize() const {
+    static_assert(wasm::MaxFunctionBytes <= UINT32_MAX);
+    return uint32_t(end - begin);
+  }
+};
+
+using FuncCompileInputVector = Vector<FuncCompileInput, 8, SystemAllocPolicy>;
+
+struct FuncCompileOutput {
+  FuncCompileOutput(
+      uint32_t index, FeatureUsage featureUsage,
+      CallRefMetricsRange callRefMetricsRange = CallRefMetricsRange(),
+      AllocSitesRange allocSitesRange = AllocSitesRange())
+      : index(index),
+        featureUsage(featureUsage),
+        callRefMetricsRange(callRefMetricsRange),
+        allocSitesRange(allocSitesRange) {}
+
+  uint32_t index;
+  FeatureUsage featureUsage;
+  CallRefMetricsRange callRefMetricsRange;
+  AllocSitesRange allocSitesRange;
+};
+
+using FuncCompileOutputVector = Vector<FuncCompileOutput, 8, SystemAllocPolicy>;
+
+
+struct CompiledCode {
+  CompiledCode() : featureUsage(FeatureUsage::None) {}
+
+  FuncCompileOutputVector funcs;
+  Bytes bytes;
+  CodeRangeVector codeRanges;
+  InliningContext inliningContext;
+  CallSites callSites;
+  CallSiteTargetVector callSiteTargets;
+  TrapSites trapSites;
+  SymbolicAccessVector symbolicAccesses;
+  jit::CodeLabelVector codeLabels;
+  StackMaps stackMaps;
+  TryNoteVector tryNotes;
+  CodeRangeUnwindInfoVector codeRangeUnwindInfos;
+  CallRefMetricsPatchVector callRefMetricsPatches;
+  AllocSitePatchVector allocSitesPatches;
+  FuncIonPerfSpewerVector funcIonSpewers;
+  FuncBaselinePerfSpewerVector funcBaselineSpewers;
+  FeatureUsage featureUsage;
+  CompileStats compileStats;
+
+  [[nodiscard]] bool swap(jit::MacroAssembler& masm);
+
+  void clear() {
+    funcs.clear();
+    bytes.clear();
+    codeRanges.clear();
+    inliningContext.clear();
+    callSites.clear();
+    callSiteTargets.clear();
+    trapSites.clear();
+    symbolicAccesses.clear();
+    codeLabels.clear();
+    stackMaps.clear();
+    tryNotes.clear();
+    codeRangeUnwindInfos.clear();
+    callRefMetricsPatches.clear();
+    allocSitesPatches.clear();
+    funcIonSpewers.clear();
+    funcBaselineSpewers.clear();
+    featureUsage = FeatureUsage::None;
+    compileStats.clear();
+    MOZ_ASSERT(empty());
+  }
+
+  bool empty() {
+    return funcs.empty() && bytes.empty() && codeRanges.empty() &&
+           inliningContext.empty() && callSites.empty() &&
+           callSiteTargets.empty() && trapSites.empty() &&
+           symbolicAccesses.empty() && codeLabels.empty() && tryNotes.empty() &&
+           stackMaps.empty() && codeRangeUnwindInfos.empty() &&
+           callRefMetricsPatches.empty() && allocSitesPatches.empty() &&
+           funcIonSpewers.empty() && funcBaselineSpewers.empty() &&
+           featureUsage == FeatureUsage::None && compileStats.empty();
+  }
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+};
+
+
+struct CompileTaskState {
+  HelperThreadLockData<CompileTaskPtrVector> finished_;
+  HelperThreadLockData<uint32_t> numFailed_;
+  HelperThreadLockData<UniqueChars> errorMessage_;
+  HelperThreadLockData<ConditionVariable> condVar_;
+
+  CompileTaskState() : numFailed_(0) {}
+  ~CompileTaskState() {
+    MOZ_ASSERT(finished_.refNoCheck().empty());
+    MOZ_ASSERT(!numFailed_.refNoCheck());
+  }
+
+  CompileTaskPtrVector& finished() { return finished_.ref(); }
+  uint32_t& numFailed() { return numFailed_.ref(); }
+  UniqueChars& errorMessage() { return errorMessage_.ref(); }
+  ConditionVariable& condVar() { return condVar_.ref(); }
+};
+
+
+struct CompileTask : public HelperThreadTask {
+  const CodeMetadata& codeMeta;
+  const CodeTailMetadata* codeTailMeta;
+  const CompilerEnvironment& compilerEnv;
+  const CompileState compileState;
+
+  CompileTaskState& state;
+  LifoAlloc lifo;
+  FuncCompileInputVector inputs;
+  CompiledCode output;
+
+  CompileTask(const CodeMetadata& codeMeta,
+              const CodeTailMetadata* codeTailMeta,
+              const CompilerEnvironment& compilerEnv, CompileState compileState,
+              CompileTaskState& state, size_t defaultChunkSize)
+      : codeMeta(codeMeta),
+        codeTailMeta(codeTailMeta),
+        compilerEnv(compilerEnv),
+        compileState(compileState),
+        state(state),
+        lifo(defaultChunkSize, js::MallocArena) {}
+
+  virtual ~CompileTask() = default;
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+
+  void runHelperThreadTask(AutoLockHelperThreadState& locked) override;
+  ThreadType threadType() override;
+
+  const char* getName() override { return "WasmCompileTask"; }
+};
+
+
+class MOZ_STACK_CLASS ModuleGenerator {
+  using CompileTaskVector = Vector<CompileTask, 0, SystemAllocPolicy>;
+  using CodeOffsetVector = Vector<jit::CodeOffset, 0, SystemAllocPolicy>;
+
+  struct MacroAssemblerScope {
+    jit::TempAllocator masmAlloc;
+    jit::WasmMacroAssembler masm;
+
+    explicit MacroAssemblerScope(LifoAlloc& lifo);
+    ~MacroAssemblerScope() = default;
+  };
+
+  struct CodeBlockResult {
+    UniqueCodeBlock codeBlock;
+    UniqueLinkData linkData;
+    FuncIonPerfSpewerVector funcIonSpewers;
+    FuncBaselinePerfSpewerVector funcBaselineSpewers;
+  };
+
+  SharedCompileArgs const compileArgs_;
+  const CompileState compileState_;
+  UniqueChars* const error_;
+  UniqueCharsVector* const warnings_;
+  const mozilla::Atomic<bool>* const cancelled_;
+  const CodeMetadata* const codeMeta_;
+  const CompilerEnvironment* const compilerEnv_;
+
+  SharedCode partialTieringCode_;
+
+  const CodeTailMetadata* existingCodeTailMeta_;
+
+  mozilla::TimeStamp completeTierStartTime_;
+
+  BytecodeRangeVector funcDefRanges_;
+  FeatureUsageVector funcDefFeatureUsages_;
+  CallRefMetricsRangeVector funcDefCallRefMetrics_;
+  AllocSitesRangeVector funcDefAllocSites_;
+  FuncImportVector funcImports_;
+  CodeBlockResult sharedStubs_;
+  FeatureUsage featureUsage_;
+
+  UniqueCodeBlock codeBlock_;
+  UniqueLinkData linkData_;
+  LifoAlloc lifo_;
+  mozilla::Maybe<MacroAssemblerScope> masmScope_;
+  jit::WasmMacroAssembler* masm_;
+  uint32_t debugStubCodeOffset_;
+  uint32_t requestTierUpStubCodeOffset_;
+  uint32_t updateCallRefMetricsStubCodeOffset_;
+#ifdef ENABLE_WASM_JSPI
+  uint32_t contBaseFrameOffset_;
+#endif
+  CallFarJumpVector callFarJumps_;
+  CallSiteTargetVector callSiteTargets_;
+  FuncIonPerfSpewerVector funcIonSpewers_;
+  FuncBaselinePerfSpewerVector funcBaselineSpewers_;
+  uint32_t lastPatchedCallSite_;
+  uint32_t startOfUnpatchedCallsites_;
+  uint32_t numCallRefMetrics_;
+  uint32_t numAllocSites_;
+  CompileAndLinkStats tierStats_;
+
+  bool parallel_;
+  uint32_t outstanding_;
+  CompileTaskState taskState_;
+  CompileTaskVector tasks_;
+  CompileTaskPtrVector freeTasks_;
+  CompileTask* currentTask_;
+  uint32_t batchedBytecode_;
+
+  mozilla::DebugOnly<bool> finishedFuncDefs_;
+
+  bool funcIsCompiledInBlock(uint32_t funcIndex) const;
+  const CodeRange& funcCodeRangeInBlock(uint32_t funcIndex) const;
+  bool linkCallSites();
+  void noteCodeRange(uint32_t codeRangeIndex, const CodeRange& codeRange);
+  bool linkCompiledCode(CompiledCode& code);
+  [[nodiscard]] bool initTasks();
+  bool locallyCompileCurrentTask();
+  bool finishTask(CompileTask* task);
+  bool launchBatchCompile();
+  bool finishOutstandingTask();
+
+  [[nodiscard]] bool startCodeBlock(CodeBlockKind kind);
+  [[nodiscard]] bool finishCodeBlock(CodeBlockResult* result);
+
+  [[nodiscard]] bool prepareTier1();
+
+  [[nodiscard]] bool startCompleteTier();
+  [[nodiscard]] bool startPartialTier(uint32_t funcIndex);
+  [[nodiscard]] bool finishTier(CompileAndLinkStats* tierStats,
+                                CodeBlockResult* result);
+
+  Tier tier() const { return compilerEnv_->tier(); }
+  CompileMode mode() const { return compilerEnv_->mode(); }
+  bool debugEnabled() const { return compilerEnv_->debugEnabled(); }
+  bool compilingTier1() const {
+    return compileState_ == CompileState::Once ||
+           compileState_ == CompileState::EagerTier1 ||
+           compileState_ == CompileState::LazyTier1;
+  }
+
+  void warnf(const char* msg, ...) MOZ_FORMAT_PRINTF(2, 3);
+
+ public:
+  ModuleGenerator(const CodeMetadata& codeMeta,
+                  const CompilerEnvironment& compilerEnv,
+                  CompileState compilerState,
+                  const mozilla::Atomic<bool>* cancelled, UniqueChars* error,
+                  UniqueCharsVector* warnings);
+  ~ModuleGenerator();
+  [[nodiscard]] bool initializeCompleteTier(
+      const CodeTailMetadata* existingCodeTailMeta = nullptr);
+  [[nodiscard]] bool initializePartialTier(const Code& code,
+                                           uint32_t maybeFuncIndex);
+
+
+  [[nodiscard]] bool compileFuncDef(uint32_t funcIndex, uint32_t bytecodeOffset,
+                                    const uint8_t* begin, const uint8_t* end);
+
+
+  [[nodiscard]] bool finishFuncDefs();
+
+
+  SharedModule finishModule(
+      const BytecodeBufferOrSource& bytecode, ModuleMetadata& moduleMeta,
+      JS::OptimizedEncodingListener* maybeCompleteTier2Listener);
+  [[nodiscard]] bool finishTier2(const Module& module);
+  [[nodiscard]] bool finishPartialTier2();
+};
+
+}  
+}  
+
+#endif  // wasm_generator_h

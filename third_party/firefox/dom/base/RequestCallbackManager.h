@@ -1,0 +1,118 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_RequestCallbackManager_h
+#define mozilla_dom_RequestCallbackManager_h
+
+#include <limits>
+
+#include "mozilla/RefPtr.h"
+#include "nsTArray.h"
+#include "nsThreadUtils.h"
+
+namespace mozilla::dom {
+
+template <typename RequestCallback>
+struct RequestCallbackEntry {
+  RequestCallbackEntry(RequestCallback& aCallback, uint32_t aHandle)
+      : mCallback(&aCallback), mHandle(aHandle) {
+    LogTaskBase<RequestCallback>::LogDispatch(mCallback);
+  }
+
+  ~RequestCallbackEntry() = default;
+
+  bool operator==(uint32_t aHandle) const { return mHandle == aHandle; }
+  bool operator<(uint32_t aHandle) const { return mHandle < aHandle; }
+
+  RefPtr<RequestCallback> mCallback;
+  const uint32_t mHandle;
+  bool mCancelled = false;
+};
+
+template <typename RequestCallback>
+class RequestCallbackManager {
+ public:
+  RequestCallbackManager() = default;
+  ~RequestCallbackManager() = default;
+
+  using CallbackList = nsTArray<RequestCallbackEntry<RequestCallback>>;
+
+  nsresult Schedule(RequestCallback& aCallback, uint32_t* aHandle) {
+    if (mCallbackCounter == std::numeric_limits<uint32_t>::max()) {
+      return NS_ERROR_NOT_AVAILABLE;
+    }
+    uint32_t newHandle = ++mCallbackCounter;
+
+    mCallbacks.AppendElement(RequestCallbackEntry(aCallback, newHandle));
+
+    *aHandle = newHandle;
+    return NS_OK;
+  }
+
+  bool Cancel(uint32_t aHandle) {
+    if (mCallbacks.RemoveElementSorted(aHandle)) {
+      return true;
+    }
+    for (auto* callbacks : mFiringCallbacksOnStack) {
+      auto index = callbacks->mList.BinaryIndexOf(aHandle);
+      if (index != CallbackList::NoIndex) {
+        callbacks->mList.ElementAt(index).mCancelled = true;
+      }
+    }
+    return false;
+  }
+
+  bool IsEmpty() const { return mCallbacks.IsEmpty(); }
+
+  struct MOZ_NON_MEMMOVABLE MOZ_STACK_CLASS FiringCallbacks {
+    explicit FiringCallbacks(RequestCallbackManager& aManager)
+        : mManager(aManager) {
+      mList = std::move(aManager.mCallbacks);
+      aManager.mFiringCallbacksOnStack.AppendElement(this);
+    }
+
+    ~FiringCallbacks() {
+      MOZ_ASSERT(mManager.mFiringCallbacksOnStack.LastElement() == this);
+      mManager.mFiringCallbacksOnStack.RemoveLastElement();
+    }
+
+    RequestCallbackManager& mManager;
+    CallbackList mList;
+  };
+
+  void Unlink() { mCallbacks.Clear(); }
+
+  void Traverse(nsCycleCollectionTraversalCallback& aCB) {
+    for (auto& i : mCallbacks) {
+      NS_CYCLE_COLLECTION_NOTE_EDGE_NAME(
+          aCB, "RequestCallbackManager::mCallbacks[i]");
+      aCB.NoteXPCOMChild(i.mCallback);
+    }
+  }
+
+ private:
+  CallbackList mCallbacks;
+
+  AutoTArray<FiringCallbacks*, 1> mFiringCallbacksOnStack;
+
+  uint32_t mCallbackCounter = 0;
+};
+
+template <class RequestCallback>
+inline void ImplCycleCollectionUnlink(
+    RequestCallbackManager<RequestCallback>& aField) {
+  aField.Unlink();
+}
+
+template <class RequestCallback>
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback,
+    RequestCallbackManager<RequestCallback>& aField, const char* aName,
+    uint32_t aFlags) {
+  aField.Traverse(aCallback);
+}
+
+}  
+
+#endif

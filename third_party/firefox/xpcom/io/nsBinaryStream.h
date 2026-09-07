@@ -1,0 +1,82 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsBinaryStream_h_
+#define nsBinaryStream_h_
+
+#include "nsCOMPtr.h"
+#include "nsAString.h"
+#include "nsIObjectInputStream.h"
+#include "nsIObjectOutputStream.h"
+#include "nsIStreamBufferAccess.h"
+
+#define NS_BINARYOUTPUTSTREAM_CID             \
+  { \
+   0x86c37b9a,                                \
+   0x74e7,                                    \
+   0x4672,                                    \
+   {0x84, 0x4e, 0x6e, 0x7d, 0xd8, 0x3b, 0xa4, 0x84}}
+
+#define NS_BINARYOUTPUTSTREAM_CONTRACTID "@mozilla.org/binaryoutputstream;1"
+
+class nsBinaryOutputStream final : public nsIObjectOutputStream {
+ public:
+  nsBinaryOutputStream() = default;
+
+ protected:
+  friend already_AddRefed<nsIObjectOutputStream> NS_NewObjectOutputStream(
+      nsIOutputStream*);
+
+  NS_DECL_ISUPPORTS
+
+  NS_DECL_NSIOUTPUTSTREAM
+
+  NS_DECL_NSIBINARYOUTPUTSTREAM
+
+  NS_DECL_NSIOBJECTOUTPUTSTREAM
+
+  nsresult WriteFully(const char* aBuf, uint32_t aCount);
+
+  nsCOMPtr<nsIOutputStream> mOutputStream;
+  nsCOMPtr<nsIStreamBufferAccess> mBufferAccess;
+
+ private:
+  virtual ~nsBinaryOutputStream() = default;
+};
+
+#define NS_BINARYINPUTSTREAM_CID              \
+  { \
+   0xc521a612,                                \
+   0x2aad,                                    \
+   0x46db,                                    \
+   {0xb6, 0xab, 0x3b, 0x82, 0x1f, 0xb1, 0x50, 0xb1}}
+
+#define NS_BINARYINPUTSTREAM_CONTRACTID "@mozilla.org/binaryinputstream;1"
+
+class nsBinaryInputStream final : public nsIObjectInputStream {
+ public:
+  nsBinaryInputStream() = default;
+
+ protected:
+  friend already_AddRefed<nsIObjectInputStream> NS_NewObjectInputStream(
+      nsIInputStream*);
+
+  NS_DECL_ISUPPORTS
+
+  NS_DECL_NSIINPUTSTREAM
+
+  NS_DECL_NSIBINARYINPUTSTREAM
+
+  NS_DECL_NSIOBJECTINPUTSTREAM
+
+  nsCOMPtr<nsIInputStream> mInputStream;
+  nsCOMPtr<nsIStreamBufferAccess> mBufferAccess;
+
+ private:
+  nsresult ReadBytesToBuffer(uint32_t aLength, uint8_t* aBuffer);
+
+  virtual ~nsBinaryInputStream() = default;
+};
+
+#endif  // nsBinaryStream_h_

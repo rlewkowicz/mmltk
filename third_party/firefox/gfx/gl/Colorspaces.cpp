@@ -1,0 +1,389 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "Colorspaces.h"
+
+#include "nsDebug.h"
+#include "qcms.h"
+
+namespace mozilla::color {
+
+float TfFromLinear(const TransferFunctionDesc& desc, const float linear) {
+  float sign = linear < 0.0f ? -1.0f : 1.0f;
+  float l = std::abs(linear);
+  float ret;
+  switch (desc.tfType) {
+    case TransferFunctionDescType::PiecewiseGamma:
+      ret = (l < desc.b) ? (l * desc.k)
+                         : (desc.a * powf(l, 1.0f / desc.g) - (desc.a - 1));
+      break;
+    case TransferFunctionDescType::HLG:
+      ret = l < 1.0f ? 0.5f * sqrtf(l)
+                     : (0.17883277f * logf(l - 0.28466892f) + 0.55991073f);
+      break;
+    case TransferFunctionDescType::PQ: {
+      float y = l * (Rec2100ReferenceDisplayWhite / 10000.0f);
+      const float m1 = 0.1593017578125f;  
+      const float m2 = 78.84375f;         
+      const float c1 = 0.8359375f;        
+      const float c2 = 18.8515625f;       
+      const float c3 = 18.6875f;          
+      ret = (c1 + c2 * y * m1) / (1.0f + c3 * y * m1) * m2;
+      break;
+    }
+  }
+  return ret * sign;
+}
+
+float LinearFromTf(const TransferFunctionDesc& desc, const float tf) {
+  float sign = tf < 0.0f ? -1.0f : 1.0f;
+  float t = std::abs(tf);
+  float ret;
+  switch (desc.tfType) {
+    case TransferFunctionDescType::PiecewiseGamma:
+      ret = (t / desc.k < desc.b) ? (t / desc.k)
+                                  : powf((t + (desc.a - 1)) / desc.a, desc.g);
+      break;
+    case TransferFunctionDescType::HLG:
+      ret = t < 0.5f ? 4.0f * (t * t)
+                     : (expf((t - 0.55991073f) / 0.17883277f) + 0.28466892f);
+      break;
+    case TransferFunctionDescType::PQ: {
+      const float linearHdrHeadroom = 10000.0f / Rec2100ReferenceDisplayWhite;
+      const float m1 = 0.1593017578125f;  
+      const float m2 = 78.84375f;         
+      const float c1 = 0.8359375f;        
+      const float c2 = 18.8515625f;       
+      const float c3 = 18.6875f;          
+      ret =
+          linearHdrHeadroom *
+          (std::max(0.0f, t * (1.0f / m2) - c1) / (c2 - c3 * t * (1.0f / m2))) *
+          (1.0f / m1);
+      break;
+    }
+  }
+  return ret * sign;
+}
+
+
+mat3 YuvFromRgb(const YuvLumaCoeffs& yc) {
+  const auto y = vec3({yc.r, yc.g, yc.b});
+  const auto u = vec3({0, 0, 1}) - y;
+  const auto v = vec3({1, 0, 0}) - y;
+
+  return mat3({y, u / (2 * u.z()), v / (2 * v.x())});
+}
+
+mat4 YuvFromYcbcr(const YcbcrDesc& d) {
+
+  const auto yRange = d.y1 - d.y0;
+  const auto uHalfRange = d.uPlusHalf - d.u0;
+  const auto uRange = 2 * uHalfRange;
+
+  const auto ycbcrFromYuv = mat4{{vec4{{yRange, 0, 0, d.y0}},
+                                  {{0, uRange, 0, d.u0}},
+                                  {{0, 0, uRange, d.u0}},
+                                  {{0, 0, 0, 1}}}};
+  const auto yuvFromYcbcr = inverse(ycbcrFromYuv);
+  return yuvFromYcbcr;
+}
+
+inline vec3 CIEXYZ_from_CIExyY(const vec2 xy, const float Y = 1) {
+  const auto xyz = vec3(xy, 1 - xy.x() - xy.y());
+  const auto XYZ = xyz * (Y / xy.y());
+  return XYZ;
+}
+
+mat3 XyzFromLinearRgb(const Chromaticities& c) {
+
+
+
+
+
+
+
+
+  const auto xrgb = vec3({c.rx, c.gx, c.bx});
+  const auto yrgb = vec3({c.ry, c.gy, c.by});
+
+  const auto Xrgb = xrgb / yrgb;
+  const auto Yrgb = vec3(1);
+  const auto Zrgb = (vec3(1) - xrgb - yrgb) / yrgb;
+
+  const auto XYZrgb = mat3({Xrgb, Yrgb, Zrgb});
+  const auto XYZrgb_inv = inverse(XYZrgb);
+  const auto XYZwhitepoint = vec3({c.wx, c.wy, 1 - c.wx - c.wy}) / c.wy;
+  const auto Srgb = XYZrgb_inv * XYZwhitepoint;
+
+  const auto M = mat3({Srgb * Xrgb, Srgb * Yrgb, Srgb * Zrgb});
+  return M;
+}
+
+ColorspaceTransform ColorspaceTransform::Create(const ColorspaceDesc& src,
+                                                const ColorspaceDesc& dst) {
+  auto ct = ColorspaceTransform{src, dst};
+  ct.srcTf = src.tf;
+  ct.dstTf = dst.tf;
+
+  const auto RgbTfFrom = [&](const ColorspaceDesc& cs) {
+    auto rgbFrom = mat4::Identity();
+    if (cs.yuv) {
+      const auto yuvFromYcbcr = YuvFromYcbcr(cs.yuv->ycbcr);
+      const auto yuvFromRgb = YuvFromRgb(cs.yuv->yCoeffs);
+      const auto rgbFromYuv = inverse(yuvFromRgb);
+      const auto rgbFromYuv4 = mat4(rgbFromYuv);
+
+      const auto rgbFromYcbcr = rgbFromYuv4 * yuvFromYcbcr;
+      rgbFrom = rgbFromYcbcr;
+    }
+    return rgbFrom;
+  };
+
+  ct.srcRgbTfFromSrc = RgbTfFrom(src);
+  const auto dstRgbTfFromDst = RgbTfFrom(dst);
+  ct.dstFromDstRgbTf = inverse(dstRgbTfFromDst);
+
+
+  ct.dstRgbLinFromSrcRgbLin = mat3::Identity();
+  if (!(src.chrom == dst.chrom)) {
+    const auto xyzFromSrcRgbLin = XyzFromLinearRgb(src.chrom);
+    const auto xyzFromDstRgbLin = XyzFromLinearRgb(dst.chrom);
+    const auto dstRgbLinFromXyz = inverse(xyzFromDstRgbLin);
+    ct.dstRgbLinFromSrcRgbLin = dstRgbLinFromXyz * xyzFromSrcRgbLin;
+  }
+
+  return ct;
+}
+
+vec3 ColorspaceTransform::DstFromSrc(const vec3 src) const {
+  const auto srcRgbTf = srcRgbTfFromSrc * vec4(src, 1);
+  auto srcRgbLin = srcRgbTf;
+  if (srcTf) {
+    srcRgbLin.x(LinearFromTf(*srcTf, srcRgbTf.x()));
+    srcRgbLin.y(LinearFromTf(*srcTf, srcRgbTf.y()));
+    srcRgbLin.z(LinearFromTf(*srcTf, srcRgbTf.z()));
+  }
+
+  const auto dstRgbLin = dstRgbLinFromSrcRgbLin * vec3(srcRgbLin);
+  auto dstRgbTf = dstRgbLin;
+  if (dstTf) {
+    dstRgbTf.x(TfFromLinear(*dstTf, dstRgbLin.x()));
+    dstRgbTf.y(TfFromLinear(*dstTf, dstRgbLin.y()));
+    dstRgbTf.z(TfFromLinear(*dstTf, dstRgbLin.z()));
+  }
+
+  const auto dst4 = dstFromDstRgbTf * vec4(dstRgbTf, 1);
+  return vec3(dst4);
+}
+
+
+mat3 XyzAFromXyzB_BradfordLinear(const vec2 xyA, const vec2 xyB) {
+
+
+  const auto M_BFD = mat3{{
+      vec3{{0.8951, 0.2664f, -0.1614f}},
+      vec3{{-0.7502f, 1.7135f, 0.0367f}},
+      vec3{{0.0389f, -0.0685f, 1.0296f}},
+  }};
+  const auto XYZDst = CIEXYZ_from_CIExyY(xyA);  
+  const auto XYZSrc = CIEXYZ_from_CIExyY(xyB);  
+  const auto rgbSrc = M_BFD * XYZSrc;           
+  const auto rgbDst = M_BFD * XYZDst;           
+  const auto rgbDstOverSrc = rgbDst / rgbSrc;
+  const auto M_dstOverSrc = mat3::Scale(rgbDstOverSrc);
+  const auto M_adapt = inverse(M_BFD) * M_dstOverSrc * M_BFD;
+  return M_adapt;
+}
+
+std::optional<mat4> ColorspaceTransform::ToMat4() const {
+  mat4 fromSrc = srcRgbTfFromSrc;
+  if (srcTf) return {};
+  fromSrc = mat4(dstRgbLinFromSrcRgbLin) * fromSrc;
+  if (dstTf) return {};
+  fromSrc = dstFromDstRgbTf * fromSrc;
+  return fromSrc;
+}
+
+Lut3 ColorspaceTransform::ToLut3(const ivec3 size) const {
+  auto lut = Lut3::Create(size);
+  lut.SetMap([&](const vec3& srcVal) { return DstFromSrc(srcVal); });
+  return lut;
+}
+
+vec3 Lut3::Sample(const vec3 in01) const {
+  const auto coord = vec3(size - 1) * in01;
+  const auto p0 = floor(coord);
+  const auto dp = coord - p0;
+  const auto ip0 = ivec3(p0);
+
+  const auto f000 = Fetch(ip0 + ivec3({0, 0, 0}));
+  const auto f100 = Fetch(ip0 + ivec3({1, 0, 0}));
+  const auto f010 = Fetch(ip0 + ivec3({0, 1, 0}));
+  const auto f110 = Fetch(ip0 + ivec3({1, 1, 0}));
+  const auto f001 = Fetch(ip0 + ivec3({0, 0, 1}));
+  const auto f101 = Fetch(ip0 + ivec3({1, 0, 1}));
+  const auto f011 = Fetch(ip0 + ivec3({0, 1, 1}));
+  const auto f111 = Fetch(ip0 + ivec3({1, 1, 1}));
+
+  const auto fx00 = mix(f000, f100, dp.x());
+  const auto fx10 = mix(f010, f110, dp.x());
+  const auto fx01 = mix(f001, f101, dp.x());
+  const auto fx11 = mix(f011, f111, dp.x());
+
+  const auto fxy0 = mix(fx00, fx10, dp.y());
+  const auto fxy1 = mix(fx01, fx11, dp.y());
+
+  const auto fxyz = mix(fxy0, fxy1, dp.z());
+  return fxyz;
+}
+
+
+ColorProfileDesc ColorProfileDesc::From(const ColorspaceDesc& cspace) {
+  auto ret = ColorProfileDesc{};
+
+  if (cspace.yuv) {
+    const auto yuvFromYcbcr = YuvFromYcbcr(cspace.yuv->ycbcr);
+    const auto yuvFromRgb = YuvFromRgb(cspace.yuv->yCoeffs);
+    const auto rgbFromYuv = inverse(yuvFromRgb);
+    ret.rgbFromYcbcr = mat4(rgbFromYuv) * yuvFromYcbcr;
+  }
+
+  if (cspace.tf) {
+    const size_t tableSize = 256;
+    auto& tableR = ret.linearFromTf.r;
+    tableR.resize(tableSize);
+    for (size_t i = 0; i < tableR.size(); i++) {
+      const float tfVal = i / float(tableR.size() - 1);
+      const float linearVal = LinearFromTf(*cspace.tf, tfVal);
+      tableR[i] = linearVal;
+    }
+    ret.linearFromTf.g = tableR;
+    ret.linearFromTf.b = tableR;
+  }
+
+  ret.xyzd65FromLinearRgb = XyzFromLinearRgb(cspace.chrom);
+
+  return ret;
+}
+
+
+template <class T>
+constexpr inline T NewtonEstimateX(const T x1, const T y1, const T dydx,
+                                   const T y2 = 0) {
+  return (y2 - y1) / dydx + x1;
+}
+
+float GuessGamma(const std::vector<float>& vals, float exp_guess) {
+  constexpr float d_exp = 0.001;
+  constexpr float error_tolerance = 0.001;
+  struct Samples {
+    float y1, y2;
+  };
+  const auto Sample = [&](const float exp) {
+    int i = -1;
+    auto samples = Samples{};
+    for (const auto& expected : vals) {
+      i += 1;
+      const auto in = i / float(vals.size() - 1);
+      samples.y1 += powf(in, exp) - expected;
+      samples.y2 += powf(in, exp + d_exp) - expected;
+    }
+    samples.y1 /= vals.size();  
+    samples.y2 /= vals.size();
+    return samples;
+  };
+  constexpr int MAX_ITERS = 10;
+  for (int i = 1;; i++) {
+    const auto err = Sample(exp_guess);
+    const auto derr = err.y2 - err.y1;
+    exp_guess = NewtonEstimateX(exp_guess, err.y1, derr / d_exp);
+    if (std::abs(err.y1) < error_tolerance) {
+      return exp_guess;
+    }
+    if (i >= MAX_ITERS) {
+      printf_stderr("GuessGamma() -> %f after %i iterations (avg err %f)\n",
+                    exp_guess, i, err.y1);
+      MOZ_ASSERT(false, "GuessGamma failed.");
+      return exp_guess;
+    }
+  }
+}
+
+
+ColorProfileDesc ColorProfileDesc::From(const qcms_profile& qcmsProfile) {
+  ColorProfileDesc ret;
+
+  qcms_profile_data data = {};
+  qcms_profile_get_data(&qcmsProfile, &data);
+
+  auto xyzd50FromLinearRgb = mat3{};
+  xyzd50FromLinearRgb.at(0, 0) = data.red_colorant_xyzd50[0];
+  xyzd50FromLinearRgb.at(1, 0) = data.green_colorant_xyzd50[0];
+  xyzd50FromLinearRgb.at(2, 0) = data.blue_colorant_xyzd50[0];
+  xyzd50FromLinearRgb.at(0, 1) = data.red_colorant_xyzd50[1];
+  xyzd50FromLinearRgb.at(1, 1) = data.green_colorant_xyzd50[1];
+  xyzd50FromLinearRgb.at(2, 1) = data.blue_colorant_xyzd50[1];
+  xyzd50FromLinearRgb.at(0, 2) = data.red_colorant_xyzd50[2];
+  xyzd50FromLinearRgb.at(1, 2) = data.green_colorant_xyzd50[2];
+  xyzd50FromLinearRgb.at(2, 2) = data.blue_colorant_xyzd50[2];
+
+  const auto d65FromD50 = XyzAFromXyzB_BradfordLinear(D65, D50);
+  ret.xyzd65FromLinearRgb = d65FromD50 * xyzd50FromLinearRgb;
+
+
+  const auto Fn = [&](std::vector<float>* const linearFromTf,
+                      int32_t claimed_samples,
+                      const qcms_color_channel channel) {
+    if (claimed_samples == 0) return;  
+
+    if (claimed_samples == -1) {
+      claimed_samples = 4096;  
+      claimed_samples = 256;   
+    }
+
+    linearFromTf->resize(AssertedCast<size_t>(claimed_samples));
+
+    const auto begin = linearFromTf->data();
+    qcms_profile_get_lut(&qcmsProfile, channel, begin,
+                         begin + linearFromTf->size());
+  };
+
+  Fn(&ret.linearFromTf.r, data.linear_from_trc_red_samples,
+     qcms_color_channel::Red);
+  Fn(&ret.linearFromTf.b, data.linear_from_trc_blue_samples,
+     qcms_color_channel::Blue);
+  Fn(&ret.linearFromTf.g, data.linear_from_trc_green_samples,
+     qcms_color_channel::Green);
+
+
+  return ret;
+}
+
+
+ColorProfileConversionDesc ColorProfileConversionDesc::From(
+    const FromDesc& desc) {
+  const auto dstLinearRgbFromXyzd65 = inverse(desc.dst.xyzd65FromLinearRgb);
+  auto ret = ColorProfileConversionDesc{
+      .srcRgbFromSrcYuv = desc.src.rgbFromYcbcr,
+      .srcLinearFromSrcTf = desc.src.linearFromTf,
+      .dstLinearFromSrcLinear =
+          dstLinearRgbFromXyzd65 * desc.src.xyzd65FromLinearRgb,
+      .dstTfFromDstLinear = {},
+  };
+  const auto Invert = [](const std::vector<float>& linearFromTf,
+                         std::vector<float>* const tfFromLinear) {
+    const auto size = linearFromTf.size();
+    MOZ_ASSERT(size != 1);  
+    if (size < 2) return;
+    (*tfFromLinear).resize(size);
+    InvertLut(linearFromTf, &*tfFromLinear);
+  };
+  Invert(desc.dst.linearFromTf.r, &ret.dstTfFromDstLinear.r);
+  Invert(desc.dst.linearFromTf.g, &ret.dstTfFromDstLinear.g);
+  Invert(desc.dst.linearFromTf.b, &ret.dstTfFromDstLinear.b);
+  return ret;
+}
+
+}  

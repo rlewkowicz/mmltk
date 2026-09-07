@@ -1,0 +1,86 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SVG_SVGANIMATEDPOINTLIST_H_
+#define DOM_SVG_SVGANIMATEDPOINTLIST_H_
+
+#include <memory>
+
+#include "SVGPointList.h"
+#include "mozilla/SMILAttr.h"
+
+namespace mozilla {
+
+class SMILValue;
+
+namespace dom {
+class DOMSVGPoint;
+class DOMSVGPointList;
+class SVGAnimationElement;
+class SVGElement;
+}  
+
+class SVGAnimatedPointList {
+  friend class dom::DOMSVGPoint;
+  friend class dom::DOMSVGPointList;
+
+ public:
+  SVGAnimatedPointList() = default;
+
+  SVGAnimatedPointList& operator=(const SVGAnimatedPointList& aOther) {
+    mBaseVal = aOther.mBaseVal;
+    if (aOther.mAnimVal) {
+      mAnimVal = std::make_unique<SVGPointList>(*aOther.mAnimVal);
+    }
+    return *this;
+  }
+
+  const SVGPointList& GetBaseValue() const { return mBaseVal; }
+
+  nsresult SetBaseValueString(const nsAString& aValue);
+
+  void ClearBaseValue();
+
+  const SVGPointList& GetAnimValue() const {
+    return mAnimVal ? *mAnimVal : mBaseVal;
+  }
+
+  nsresult SetAnimValue(const SVGPointList& aNewAnimValue,
+                        dom::SVGElement* aElement);
+
+  void ClearAnimValue(dom::SVGElement* aElement);
+
+  void* GetBaseValKey() const { return (void*)&mBaseVal; }
+  void* GetAnimValKey() const { return (void*)&mAnimVal; }
+
+  bool IsAnimating() const { return !!mAnimVal; }
+
+  std::unique_ptr<SMILAttr> ToSMILAttr(dom::SVGElement* aElement);
+
+ private:
+
+  SVGPointList mBaseVal;
+  std::unique_ptr<SVGPointList> mAnimVal;
+
+  struct SMILAnimatedPointList : public SMILAttr {
+   public:
+    SMILAnimatedPointList(SVGAnimatedPointList* aVal, dom::SVGElement* aElement)
+        : mVal(aVal), mElement(aElement) {}
+
+    SVGAnimatedPointList* mVal;
+    dom::SVGElement* mElement;
+
+    nsresult ValueFromString(const nsAString& aStr,
+                             const dom::SVGAnimationElement* aSrcElement,
+                             SMILValue& aValue,
+                             bool& aPreventCachingOfSandwich) const override;
+    SMILValue GetBaseValue() const override;
+    void ClearAnimValue() override;
+    nsresult SetAnimValue(const SMILValue& aValue) override;
+  };
+};
+
+}  
+
+#endif  // DOM_SVG_SVGANIMATEDPOINTLIST_H_

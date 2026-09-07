@@ -1,0 +1,419 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "frontend/NameFunctions.h"
+
+#include "mozilla/ScopeExit.h"
+#include "mozilla/Sprintf.h"
+
+#include "frontend/ParseNode.h"
+#include "frontend/ParseNodeVisitor.h"
+#include "frontend/ParserAtom.h"  // ParserAtomsTable
+#include "frontend/SharedContext.h"
+#include "util/Poison.h"
+#include "util/StringBuilder.h"
+
+using namespace js;
+using namespace js::frontend;
+
+namespace {
+
+class NameResolver : public ParseNodeVisitor<NameResolver> {
+  using Base = ParseNodeVisitor;
+
+  static const size_t MaxParents = 100;
+
+  FrontendContext* fc_;
+  ParserAtomsTable& parserAtoms_;
+  TaggedParserAtomIndex prefix_;
+
+  size_t nparents_;
+
+  MOZ_INIT_OUTSIDE_CTOR
+  ParseNode* parents_[MaxParents];
+
+  StringBuilder buf_;
+
+  bool isCall(ParseNode* pn) {
+    return pn && pn->isKind(ParseNodeKind::CallExpr);
+  }
+
+  bool appendPropertyReference(TaggedParserAtomIndex name) {
+    if (parserAtoms_.isIdentifier(name)) {
+      return buf_.append('.') && buf_.append(parserAtoms_, name);
+    }
+
+    UniqueChars source = parserAtoms_.toQuotedString(name);
+    if (!source) {
+      ReportOutOfMemory(fc_);
+      return false;
+    }
+    return buf_.append('[') &&
+           buf_.append(source.get(), strlen(source.get())) && buf_.append(']');
+  }
+
+  bool appendNumber(double n) {
+    char number[30];
+    int digits = SprintfLiteral(number, "%g", n);
+    return buf_.append(number, digits);
+  }
+
+  bool appendNumericPropertyReference(double n) {
+    return buf_.append("[") && appendNumber(n) && buf_.append(']');
+  }
+
+  bool nameExpression(ParseNode* n, bool* foundName) {
+    AutoCheckRecursionLimit recursion(fc_);
+    if (!recursion.check(fc_)) {
+      return false;
+    }
+
+    switch (n->getKind()) {
+      case ParseNodeKind::ArgumentsLength:
+      case ParseNodeKind::DotExpr: {
+        PropertyAccess* prop = &n->as<PropertyAccess>();
+        if (!nameExpression(&prop->expression(), foundName)) {
+          return false;
+        }
+        if (!*foundName) {
+          return true;
+        }
+        return appendPropertyReference(prop->right()->as<NameNode>().atom());
+      }
+
+      case ParseNodeKind::Name:
+      case ParseNodeKind::PrivateName: {
+        *foundName = true;
+        return buf_.append(parserAtoms_, n->as<NameNode>().atom());
+      }
+
+      case ParseNodeKind::ThisExpr:
+        *foundName = true;
+        return buf_.append("this");
+
+      case ParseNodeKind::ElemExpr: {
+        PropertyByValue* elem = &n->as<PropertyByValue>();
+        if (!nameExpression(&elem->expression(), foundName)) {
+          return false;
+        }
+        if (!*foundName) {
+          return true;
+        }
+        if (!buf_.append('[') || !nameExpression(elem->right(), foundName)) {
+          return false;
+        }
+        if (!*foundName) {
+          return true;
+        }
+        return buf_.append(']');
+      }
+
+      case ParseNodeKind::NumberExpr:
+        *foundName = true;
+        return appendNumber(n->as<NumericLiteral>().value());
+
+      default:
+        *foundName = false;
+        return true;
+    }
+  }
+
+  ParseNode* gatherNameable(ParseNode** nameable, size_t* size) {
+    MOZ_ASSERT(nparents_ > 0);
+    MOZ_ASSERT(parents_[nparents_ - 1]->is<FunctionNode>());
+
+    *size = 0;
+
+    for (int pos = nparents_ - 2; pos >= 0; pos--) {
+      ParseNode* cur = parents_[pos];
+      if (cur->is<AssignmentNode>()) {
+        return cur;
+      }
+
+      switch (cur->getKind()) {
+        case ParseNodeKind::PrivateName:
+        case ParseNodeKind::Name:
+          return cur;  
+        case ParseNodeKind::ThisExpr:
+          return cur;  
+        case ParseNodeKind::Function:
+          return nullptr;  
+
+        case ParseNodeKind::ReturnStmt:
+          for (int tmp = pos - 1; tmp > 0; tmp--) {
+            if (isDirectCall(tmp, cur)) {
+              pos = tmp;
+              break;
+            }
+            if (isCall(cur)) {
+              break;
+            }
+            cur = parents_[tmp];
+          }
+          break;
+
+        case ParseNodeKind::PropertyDefinition:
+        case ParseNodeKind::Shorthand:
+          pos--;
+          [[fallthrough]];
+
+        default:
+          MOZ_ASSERT(*size < MaxParents);
+          nameable[(*size)++] = cur;
+          break;
+      }
+    }
+
+    return nullptr;
+  }
+
+  [[nodiscard]] bool resolveFun(FunctionNode* funNode,
+                                TaggedParserAtomIndex* retId) {
+    MOZ_ASSERT(funNode != nullptr);
+
+    FunctionBox* funbox = funNode->funbox();
+
+    MOZ_ASSERT(buf_.empty());
+    auto resetBuf = mozilla::MakeScopeExit([&] { buf_.clear(); });
+
+    *retId = TaggedParserAtomIndex::null();
+
+    if (funbox->displayAtom()) {
+      if (!prefix_) {
+        *retId = funbox->displayAtom();
+        return true;
+      }
+      if (!buf_.append(parserAtoms_, prefix_) || !buf_.append('/') ||
+          !buf_.append(parserAtoms_, funbox->displayAtom())) {
+        return false;
+      }
+      *retId = buf_.finishParserAtom(parserAtoms_, fc_);
+      return !!*retId;
+    }
+
+    if (prefix_) {
+      if (!buf_.append(parserAtoms_, prefix_) || !buf_.append('/')) {
+        return false;
+      }
+    }
+
+    ParseNode* toName[MaxParents];
+    size_t size;
+    ParseNode* assignment = gatherNameable(toName, &size);
+
+    if (assignment) {
+      if (assignment->is<AssignmentNode>()) {
+        assignment = assignment->as<AssignmentNode>().left();
+      }
+      bool foundName = false;
+      if (!nameExpression(assignment, &foundName)) {
+        return false;
+      }
+      if (!foundName) {
+        return true;
+      }
+    }
+
+    for (int pos = size - 1; pos >= 0; pos--) {
+      ParseNode* node = toName[pos];
+
+      if (node->isKind(ParseNodeKind::PropertyDefinition) ||
+          node->isKind(ParseNodeKind::Shorthand)) {
+        ParseNode* left = node->as<BinaryNode>().left();
+        if (left->isKind(ParseNodeKind::ObjectPropertyName) ||
+            left->isKind(ParseNodeKind::StringExpr)) {
+          if (!appendPropertyReference(left->as<NameNode>().atom())) {
+            return false;
+          }
+        } else if (left->isKind(ParseNodeKind::NumberExpr)) {
+          if (!appendNumericPropertyReference(
+                  left->as<NumericLiteral>().value())) {
+            return false;
+          }
+        } else if (left->isKind(ParseNodeKind::ComputedName) &&
+                   (left->as<UnaryNode>().kid()->isKind(
+                        ParseNodeKind::StringExpr) ||
+                    left->as<UnaryNode>().kid()->isKind(
+                        ParseNodeKind::NumberExpr)) &&
+                   node->as<PropertyDefinition>().accessorType() ==
+                       AccessorType::None) {
+          ParseNode* kid = left->as<UnaryNode>().kid();
+          if (kid->isKind(ParseNodeKind::StringExpr)) {
+            if (!appendPropertyReference(kid->as<NameNode>().atom())) {
+              return false;
+            }
+          } else {
+            MOZ_ASSERT(kid->isKind(ParseNodeKind::NumberExpr));
+            if (!appendNumericPropertyReference(
+                    kid->as<NumericLiteral>().value())) {
+              return false;
+            }
+          }
+        } else {
+          MOZ_ASSERT(left->isKind(ParseNodeKind::ComputedName) ||
+                     left->isKind(ParseNodeKind::BigIntExpr));
+        }
+      } else {
+        if (!buf_.empty() && buf_.getChar(buf_.length() - 1) != '<' &&
+            !buf_.append('<')) {
+          return false;
+        }
+      }
+    }
+
+    if (!buf_.empty() && buf_.getChar(buf_.length() - 1) == '/' &&
+        !buf_.append('<')) {
+      return false;
+    }
+
+    if (buf_.empty()) {
+      return true;
+    }
+
+    *retId = buf_.finishParserAtom(parserAtoms_, fc_);
+    if (!*retId) {
+      return false;
+    }
+
+    if (!funNode->isDirectRHSAnonFunction()) {
+      funbox->setGuessedAtom(*retId);
+    }
+    return true;
+  }
+
+  bool isDirectCall(int pos, ParseNode* cur) {
+    return pos >= 0 && isCall(parents_[pos]) &&
+           parents_[pos]->as<BinaryNode>().left() == cur;
+  }
+
+ public:
+  [[nodiscard]] bool visitFunction(FunctionNode* pn) {
+    TaggedParserAtomIndex savedPrefix = prefix_;
+    TaggedParserAtomIndex newPrefix;
+    if (!resolveFun(pn, &newPrefix)) {
+      return false;
+    }
+
+    if (!isDirectCall(nparents_ - 2, pn)) {
+      prefix_ = newPrefix;
+    }
+
+    bool ok = Base::visitFunction(pn);
+
+    prefix_ = savedPrefix;
+    return ok;
+  }
+
+  [[nodiscard]] bool visitCallSiteObj(CallSiteNode* callSite) {
+    return true;
+  }
+
+  [[nodiscard]] bool visitTaggedTemplateExpr(BinaryNode* taggedTemplate) {
+    ParseNode* tag = taggedTemplate->left();
+
+    if (!visit(tag)) {
+      return false;
+    }
+
+    CallSiteNode* element =
+        &taggedTemplate->right()->as<ListNode>().head()->as<CallSiteNode>();
+#ifdef DEBUG
+    {
+      ListNode* rawNodes = &element->head()->as<ListNode>();
+      MOZ_ASSERT(rawNodes->isKind(ParseNodeKind::ArrayExpr));
+      for (ParseNode* raw : rawNodes->contents()) {
+        MOZ_ASSERT(raw->isKind(ParseNodeKind::TemplateStringExpr));
+      }
+      for (ParseNode* cooked : element->contentsFrom(rawNodes->pn_next)) {
+        MOZ_ASSERT(cooked->isKind(ParseNodeKind::TemplateStringExpr) ||
+                   cooked->isKind(ParseNodeKind::RawUndefinedExpr));
+      }
+    }
+#endif
+
+    ParseNode* interpolated = element->pn_next;
+    for (; interpolated; interpolated = interpolated->pn_next) {
+      if (!visit(interpolated)) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+ private:
+  [[nodiscard]] bool internalVisitSpecList(ListNode* pn) {
+#ifdef DEBUG
+    bool isImport = pn->isKind(ParseNodeKind::ImportSpecList);
+    ParseNode* item = pn->head();
+    if (!isImport && item && item->isKind(ParseNodeKind::ExportBatchSpecStmt)) {
+      MOZ_ASSERT(item->is<NullaryNode>());
+    } else {
+      for (ParseNode* item : pn->contents()) {
+        if (item->is<UnaryNode>()) {
+          auto* spec = &item->as<UnaryNode>();
+          MOZ_ASSERT(spec->isKind(isImport
+                                      ? ParseNodeKind::ImportNamespaceSpec
+                                      : ParseNodeKind::ExportNamespaceSpec));
+          MOZ_ASSERT(spec->kid()->isKind(ParseNodeKind::Name) ||
+                     spec->kid()->isKind(ParseNodeKind::StringExpr));
+        } else {
+          auto* spec = &item->as<BinaryNode>();
+          MOZ_ASSERT(spec->isKind(isImport ? ParseNodeKind::ImportSpec
+                                           : ParseNodeKind::ExportSpec));
+          MOZ_ASSERT(spec->left()->isKind(ParseNodeKind::Name) ||
+                     spec->left()->isKind(ParseNodeKind::StringExpr));
+          MOZ_ASSERT(spec->right()->isKind(ParseNodeKind::Name) ||
+                     spec->right()->isKind(ParseNodeKind::StringExpr));
+        }
+      }
+    }
+#endif
+    return true;
+  }
+
+ public:
+  [[nodiscard]] bool visitImportSpecList(ListNode* pn) {
+    return internalVisitSpecList(pn);
+  }
+
+  [[nodiscard]] bool visitExportSpecList(ListNode* pn) {
+    return internalVisitSpecList(pn);
+  }
+
+  NameResolver(FrontendContext* fc, ParserAtomsTable& parserAtoms)
+      : ParseNodeVisitor(fc),
+        fc_(fc),
+        parserAtoms_(parserAtoms),
+        nparents_(0),
+        buf_(fc) {}
+
+  [[nodiscard]] bool visit(ParseNode* pn) {
+    if (nparents_ >= MaxParents) {
+      return true;
+    }
+    auto initialParents = nparents_;
+    parents_[initialParents] = pn;
+    nparents_++;
+
+    bool ok = Base::visit(pn);
+
+    nparents_--;
+    MOZ_ASSERT(initialParents == nparents_, "nparents imbalance detected");
+    MOZ_ASSERT(parents_[initialParents] == pn,
+               "pushed child shouldn't change underneath us");
+    AlwaysPoison(&parents_[initialParents], JS_OOB_PARSE_NODE_PATTERN,
+                 sizeof(parents_[initialParents]), MemCheckKind::MakeUndefined);
+
+    return ok;
+  }
+};
+
+} 
+
+bool frontend::NameFunctions(FrontendContext* fc, ParserAtomsTable& parserAtoms,
+                             ParseNode* pn) {
+  NameResolver nr(fc, parserAtoms);
+  return nr.visit(pn);
+}

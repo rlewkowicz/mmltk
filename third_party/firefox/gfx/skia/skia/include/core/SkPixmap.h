@@ -1,0 +1,203 @@
+/*
+ * Copyright 2015 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkPixmap_DEFINED)
+#define SkPixmap_DEFINED
+
+#include "include/core/SkColor.h"
+#include "include/core/SkColorType.h"
+#include "include/core/SkImageInfo.h"
+#include "include/core/SkRect.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkSamplingOptions.h"
+#include "include/core/SkSize.h"
+#include "include/private/base/SkAPI.h"
+#include "include/private/base/SkAssert.h"
+
+#include <cstddef>
+#include <cstdint>
+
+class SkColorSpace;
+enum SkAlphaType : int;
+struct SkMask;
+
+class SK_API SkPixmap {
+public:
+
+    SkPixmap()
+        : fPixels(nullptr), fRowBytes(0), fInfo(SkImageInfo::MakeUnknown(0, 0))
+    {}
+
+    SkPixmap(const SkImageInfo& info, const void* addr, size_t rowBytes)
+        : fPixels(addr), fRowBytes(rowBytes), fInfo(info)
+    {}
+
+    void reset();
+
+    void reset(const SkImageInfo& info, const void* addr, size_t rowBytes);
+
+    void setColorSpace(sk_sp<SkColorSpace> colorSpace);
+
+    [[nodiscard]] bool reset(const SkMask& mask);
+
+    [[nodiscard]] bool extractSubset(SkPixmap* subset, const SkIRect& area) const;
+
+    const SkImageInfo& info() const { return fInfo; }
+
+    size_t rowBytes() const { return fRowBytes; }
+
+    const void* addr() const { return fPixels; }
+
+    int width() const { return fInfo.width(); }
+
+    int height() const { return fInfo.height(); }
+
+    SkISize dimensions() const { return fInfo.dimensions(); }
+
+    SkColorType colorType() const { return fInfo.colorType(); }
+
+    SkAlphaType alphaType() const { return fInfo.alphaType(); }
+
+    SkColorSpace* colorSpace() const;
+
+    sk_sp<SkColorSpace> refColorSpace() const;
+
+    bool isOpaque() const { return fInfo.isOpaque(); }
+
+    SkIRect bounds() const { return SkIRect::MakeWH(this->width(), this->height()); }
+
+    int rowBytesAsPixels() const { return int(fRowBytes >> this->shiftPerPixel()); }
+
+    int shiftPerPixel() const { return fInfo.shiftPerPixel(); }
+
+    size_t computeByteSize() const { return fInfo.computeByteSize(fRowBytes); }
+
+    bool computeIsOpaque() const;
+
+    SkColor getColor(int x, int y) const;
+
+    SkColor4f getColor4f(int x, int y) const;
+
+    float getAlphaf(int x, int y) const;
+
+    const void* addr(int x, int y) const {
+        return (const char*)fPixels + fInfo.computeOffset(x, y, fRowBytes);
+    }
+
+    const uint8_t* addr8() const {
+        SkASSERT(1 == fInfo.bytesPerPixel());
+        return reinterpret_cast<const uint8_t*>(fPixels);
+    }
+
+    const uint16_t* addr16() const {
+        SkASSERT(2 == fInfo.bytesPerPixel());
+        return reinterpret_cast<const uint16_t*>(fPixels);
+    }
+
+    const uint32_t* addr32() const {
+        SkASSERT(4 == fInfo.bytesPerPixel());
+        return reinterpret_cast<const uint32_t*>(fPixels);
+    }
+
+    const uint64_t* addr64() const {
+        SkASSERT(8 == fInfo.bytesPerPixel());
+        return reinterpret_cast<const uint64_t*>(fPixels);
+    }
+
+    const uint16_t* addrF16() const {
+        SkASSERT(8 == fInfo.bytesPerPixel());
+        SkASSERT(kRGBA_F16_SkColorType     == fInfo.colorType() ||
+                 kRGBA_F16Norm_SkColorType == fInfo.colorType());
+        return reinterpret_cast<const uint16_t*>(fPixels);
+    }
+
+    const uint8_t* addr8(int x, int y) const {
+        SkASSERTF(x >= 0 && x < this->width(), "x=%d; width=%d\n", x, fInfo.width());
+        SkASSERTF(y >= 0 && y < this->height(), "y=%d; height=%d\n", y, fInfo.height());
+        return (const uint8_t*)((const char*)this->addr8() + (size_t)y * fRowBytes + (x << 0));
+    }
+
+    const uint16_t* addr16(int x, int y) const {
+        SkASSERTF(x >= 0 && x < this->width(), "x=%d; width=%d\n", x, fInfo.width());
+        SkASSERTF(y >= 0 && y < this->height(), "y=%d; height=%d\n", y, fInfo.height());
+        return (const uint16_t*)((const char*)this->addr16() + (size_t)y * fRowBytes + (x << 1));
+    }
+
+    const uint32_t* addr32(int x, int y) const {
+        SkASSERTF(x >= 0 && x < this->width(), "x=%d; width=%d\n", x, fInfo.width());
+        SkASSERTF(y >= 0 && y < this->height(), "y=%d; height=%d\n", y, fInfo.height());
+        return (const uint32_t*)((const char*)this->addr32() + (size_t)y * fRowBytes + (x << 2));
+    }
+
+    const uint64_t* addr64(int x, int y) const {
+        SkASSERTF(x >= 0 && x < this->width(), "x=%d; width=%d\n", x, fInfo.width());
+        SkASSERTF(y >= 0 && y < this->height(), "y=%d; height=%d\n", y, fInfo.height());
+        return (const uint64_t*)((const char*)this->addr64() + (size_t)y * fRowBytes + (x << 3));
+    }
+
+    const uint16_t* addrF16(int x, int y) const {
+        SkASSERT(kRGBA_F16_SkColorType     == fInfo.colorType() ||
+                 kRGBA_F16Norm_SkColorType == fInfo.colorType());
+        return reinterpret_cast<const uint16_t*>(this->addr64(x, y));
+    }
+
+    void* writable_addr() const { return const_cast<void*>(fPixels); }
+
+    void* writable_addr(int x, int y) const {
+        return const_cast<void*>(this->addr(x, y));
+    }
+
+    uint8_t* writable_addr8(int x, int y) const {
+        return const_cast<uint8_t*>(this->addr8(x, y));
+    }
+
+    uint16_t* writable_addr16(int x, int y) const {
+        return const_cast<uint16_t*>(this->addr16(x, y));
+    }
+
+    uint32_t* writable_addr32(int x, int y) const {
+        return const_cast<uint32_t*>(this->addr32(x, y));
+    }
+
+    uint64_t* writable_addr64(int x, int y) const {
+        return const_cast<uint64_t*>(this->addr64(x, y));
+    }
+
+    uint16_t* writable_addrF16(int x, int y) const {
+        return reinterpret_cast<uint16_t*>(writable_addr64(x, y));
+    }
+
+    bool readPixels(const SkImageInfo& dstInfo, void* dstPixels, size_t dstRowBytes) const {
+        return this->readPixels(dstInfo, dstPixels, dstRowBytes, 0, 0);
+    }
+
+    bool readPixels(const SkImageInfo& dstInfo, void* dstPixels, size_t dstRowBytes, int srcX,
+                    int srcY) const;
+
+    bool readPixels(const SkPixmap& dst, int srcX, int srcY) const {
+        return this->readPixels(dst.info(), dst.writable_addr(), dst.rowBytes(), srcX, srcY);
+    }
+
+    bool readPixels(const SkPixmap& dst) const {
+        return this->readPixels(dst.info(), dst.writable_addr(), dst.rowBytes(), 0, 0);
+    }
+
+    bool scalePixels(const SkPixmap& dst, const SkSamplingOptions&) const;
+
+    bool erase(SkColor color, const SkIRect& subset) const;
+
+    bool erase(SkColor color) const { return this->erase(color, this->bounds()); }
+
+    bool erase(const SkColor4f& color, const SkIRect* subset = nullptr) const;
+
+private:
+    const void*     fPixels;
+    size_t          fRowBytes;
+    SkImageInfo     fInfo;
+};
+
+#endif

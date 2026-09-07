@@ -1,0 +1,34 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_intl_AppCollator_h
+#define mozilla_intl_AppCollator_h
+
+#include "sqlite3.h"
+#include "mozilla/Span.h"
+
+namespace mozilla::intl {
+
+class AppCollator {
+ public:
+  static void Initialize();
+
+  static int InstallCallbacks(sqlite3* aDB);
+
+  static int32_t Compare(mozilla::Span<const char16_t> aLeft,
+                         mozilla::Span<const char16_t> aRight);
+
+  static int32_t Compare(mozilla::Span<const char> aLeft,
+                         mozilla::Span<const char> aRight);
+
+  static int32_t CompareBase(mozilla::Span<const char16_t> aLeft,
+                             mozilla::Span<const char16_t> aRight);
+
+  static int32_t CompareBase(mozilla::Span<const char> aLeft,
+                             mozilla::Span<const char> aRight);
+};
+
+};  
+
+#endif  // mozilla_intl_AppCollator_h

@@ -1,0 +1,33 @@
+
+[package]
+edition = "2021"
+rust-version = "1.62.0"
+name = "iana-time-zone"
+version = "0.1.64"
+authors = [
+    "Andrew Straw <strawman@astraw.com>",
+    "René Kijewski <rene.kijewski@fu-berlin.de>",
+    "Ryan Lopopolo <rjl@hyperbo.la>",
+]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "get the IANA time zone for the current system"
+keywords = [
+    "IANA",
+    "time",
+]
+categories = [
+    "date-and-time",
+    "internationalization",
+    "os",
+]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/strawlab/iana-time-zone"
+
+[lib]
+name = "iana_time_zone"
+path = "src/lib.rs"

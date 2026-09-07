@@ -1,0 +1,393 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+
+var { XPCOMUtils } = ChromeUtils.importESModule(
+  "resource://gre/modules/XPCOMUtils.sys.mjs"
+);
+ChromeUtils.defineESModuleGetters(this, {
+  PrivateBrowsingUtils: "resource://gre/modules/PrivateBrowsingUtils.sys.mjs",
+});
+XPCOMUtils.defineLazyScriptGetter(
+  this,
+  "PlacesTreeView",
+  "chrome://browser/content/places/treeView.js"
+);
+XPCOMUtils.defineLazyScriptGetter(
+  this,
+  ["PlacesInsertionPoint", "PlacesController", "PlacesControllerDragHelper"],
+  "chrome://browser/content/places/controller.js"
+);
+
+const BOOKMARK_ITEM = 0;
+const BOOKMARK_FOLDER = 1;
+
+const ACTION_EDIT = 0;
+const ACTION_ADD = 1;
+
+var BookmarkPropertiesPanel = {
+  __strings: null,
+  get _strings() {
+    if (!this.__strings) {
+      this.__strings = document.getElementById("stringBundle");
+    }
+    return this.__strings;
+  },
+
+  _action: null,
+  _itemType: null,
+  _uri: null,
+  _title: "",
+  _URIs: [],
+  _keyword: "",
+  _postData: null,
+  _charSet: "",
+
+  _defaultInsertionPoint: null,
+  _hiddenRows: [],
+
+  _getAcceptLabel: function BPP__getAcceptLabel() {
+    return this._strings.getString("dialogAcceptLabelSaveItem");
+  },
+
+  _getDialogTitle: function BPP__getDialogTitle() {
+    if (this._action == ACTION_ADD) {
+      if (this._itemType == BOOKMARK_ITEM) {
+        return this._strings.getString("dialogTitleAddNewBookmark2");
+      }
+
+      if (this._itemType != BOOKMARK_FOLDER) {
+        throw new Error("Unknown item type");
+      }
+      if (this._URIs.length) {
+        return this._strings.getString("dialogTitleAddMulti");
+      }
+
+      return this._strings.getString("dialogTitleAddBookmarkFolder");
+    }
+    if (this._action == ACTION_EDIT) {
+      if (this._itemType === BOOKMARK_ITEM) {
+        return this._strings.getString("dialogTitleEditBookmark2");
+      }
+
+      return this._strings.getString("dialogTitleEditBookmarkFolder");
+    }
+    return "";
+  },
+
+  async _determineItemInfo() {
+    let dialogInfo = window.arguments[0];
+    this._action = dialogInfo.action == "add" ? ACTION_ADD : ACTION_EDIT;
+    this._hiddenRows = dialogInfo.hiddenRows ? dialogInfo.hiddenRows : [];
+    if (this._action == ACTION_ADD) {
+      if (!("type" in dialogInfo)) {
+        throw new Error("missing type property for add action");
+      }
+
+      if ("title" in dialogInfo) {
+        this._title = dialogInfo.title;
+      }
+
+      if ("defaultInsertionPoint" in dialogInfo) {
+        this._defaultInsertionPoint = dialogInfo.defaultInsertionPoint;
+      } else {
+        let parentGuid = await PlacesUIUtils.defaultParentGuid;
+        this._defaultInsertionPoint = new PlacesInsertionPoint({
+          parentGuid,
+        });
+      }
+
+      switch (dialogInfo.type) {
+        case "bookmark":
+          this._itemType = BOOKMARK_ITEM;
+          if ("uri" in dialogInfo) {
+            if (!(dialogInfo.uri instanceof Ci.nsIURI)) {
+              throw new Error("uri property should be a uri object");
+            }
+            this._uri = dialogInfo.uri;
+            if (typeof this._title != "string") {
+              this._title =
+                (await PlacesUtils.history.fetch(this._uri)) || this._uri.spec;
+            }
+          } else {
+            this._uri = Services.io.newURI("about:blank");
+            this._title = this._strings.getString("newBookmarkDefault");
+            this._dummyItem = true;
+          }
+
+          if ("keyword" in dialogInfo) {
+            this._keyword = dialogInfo.keyword;
+            this._isAddKeywordDialog = true;
+            if ("postData" in dialogInfo) {
+              this._postData = dialogInfo.postData;
+            }
+            if ("charSet" in dialogInfo) {
+              this._charSet = dialogInfo.charSet;
+            }
+          }
+          break;
+
+        case "folder":
+          this._itemType = BOOKMARK_FOLDER;
+          if (!this._title) {
+            if ("URIList" in dialogInfo) {
+              this._title = this._strings.getString("bookmarkAllTabsDefault");
+              this._URIs = dialogInfo.URIList;
+            } else {
+              this._title = this._strings.getString("newFolderDefault");
+              this._dummyItem = true;
+            }
+          }
+          break;
+      }
+    } else {
+      this._node = dialogInfo.node;
+      this._title = this._node.title;
+      if (PlacesUtils.nodeIsFolderOrShortcut(this._node)) {
+        this._itemType = BOOKMARK_FOLDER;
+      } else if (PlacesUtils.nodeIsURI(this._node)) {
+        this._itemType = BOOKMARK_ITEM;
+      }
+    }
+  },
+
+  async onDialogLoad() {
+    document.addEventListener("dialogaccept", () => this.onDialogAccept());
+    document.addEventListener("dialogcancel", () => this.onDialogCancel());
+    window.addEventListener("unload", () => this.onDialogUnload());
+
+    let acceptButton = document
+      .getElementById("bookmarkpropertiesdialog")
+      .getButton("accept");
+    acceptButton.disabled = true;
+    await this._determineItemInfo();
+    document.title = this._getDialogTitle();
+
+    let title = { raw: document.title };
+    document.documentElement.setAttribute("headertitle", JSON.stringify(title));
+
+    let iconUrl = this._getIconUrl();
+    if (iconUrl) {
+      document.documentElement.style.setProperty(
+        "--icon-url",
+        `url(${iconUrl})`
+      );
+    }
+
+    await this._initDialog();
+  },
+
+  _getIconUrl() {
+    let url = "chrome://browser/skin/bookmark-hollow.svg";
+
+    if (this._action === ACTION_EDIT && this._itemType === BOOKMARK_ITEM) {
+      url = window.arguments[0]?.node?.icon;
+    }
+
+    return url;
+  },
+
+  async _initDialog() {
+    let acceptButton = document
+      .getElementById("bookmarkpropertiesdialog")
+      .getButton("accept");
+    acceptButton.label = this._getAcceptLabel();
+    let acceptButtonDisabled = false;
+
+    this._mutationObserver = new MutationObserver(mutations => {
+      for (let { target, oldValue } of mutations) {
+        let hidden = target.hasAttribute("hidden");
+        let wasHidden = oldValue !== null;
+        if (target.classList.contains("hideable") && hidden != wasHidden) {
+          if (hidden) {
+            let diff = this._mutationObserver._heightsById.get(target.id);
+            window.resizeBy(0, -diff);
+          } else {
+            let diff = target.getBoundingClientRect().height;
+            this._mutationObserver._heightsById.set(target.id, diff);
+            window.resizeBy(0, diff);
+          }
+          window.sizeToContent();
+        }
+      }
+    });
+    this._mutationObserver._heightsById = new Map();
+    this._mutationObserver.observe(document, {
+      subtree: true,
+      attributeOldValue: true,
+      attributeFilter: ["hidden"],
+    });
+
+    switch (this._action) {
+      case ACTION_EDIT: {
+        await gEditItemOverlay.initPanel({
+          node: this._node,
+          hiddenRows: this._hiddenRows,
+          focusedElement: "first",
+        });
+        acceptButtonDisabled = gEditItemOverlay.readOnly;
+        break;
+      }
+      case ACTION_ADD: {
+        this._node = await this._promiseNewItem();
+
+        await gEditItemOverlay.initPanel({
+          node: this._node,
+          hiddenRows: this._hiddenRows,
+          postData: this._postData,
+          focusedElement: "first",
+          addedMultipleBookmarks: this._node.children?.length > 1,
+        });
+
+        let locationField = this._element("locationField");
+        if (locationField.value == "about:blank") {
+          locationField.value = "";
+        }
+
+        if (this._itemType == BOOKMARK_ITEM) {
+          acceptButtonDisabled = !this._inputIsValid();
+        }
+        break;
+      }
+    }
+
+    if (!gEditItemOverlay.readOnly) {
+      if (this._itemType == BOOKMARK_ITEM) {
+        this._element("locationField").addEventListener("input", this);
+        if (this._isAddKeywordDialog) {
+          this._element("keywordField").addEventListener("input", this);
+        }
+      }
+    }
+    acceptButton.disabled = acceptButtonDisabled;
+  },
+
+  handleEvent: function BPP_handleEvent(aEvent) {
+    var target = aEvent.target;
+    switch (aEvent.type) {
+      case "input":
+        if (
+          target.id == "editBMPanel_locationField" ||
+          target.id == "editBMPanel_keywordField"
+        ) {
+          document
+            .getElementById("bookmarkpropertiesdialog")
+            .getButton("accept").disabled = !this._inputIsValid();
+        }
+        break;
+    }
+  },
+
+  QueryInterface: ChromeUtils.generateQI([]),
+
+  _element: function BPP__element(aID) {
+    return document.getElementById("editBMPanel_" + aID);
+  },
+
+  onDialogUnload() {
+    this._mutationObserver.disconnect();
+    delete this._mutationObserver;
+
+    this._element("locationField").removeEventListener("input", this);
+    this._element("keywordField").removeEventListener("input", this);
+  },
+
+  onDialogAccept() {
+    document.commandDispatcher.focusedElement?.blur();
+
+    window.arguments[0].bookmarkState = gEditItemOverlay._bookmarkState;
+
+    gEditItemOverlay.uninitPanel(true);
+
+    window.arguments[0].bookmarkGuid = this._node.bookmarkGuid;
+  },
+
+  onDialogCancel() {
+    gEditItemOverlay.uninitPanel(true);
+  },
+
+  _inputIsValid: function BPP__inputIsValid() {
+    if (
+      this._itemType == BOOKMARK_ITEM &&
+      !this._containsValidURI("locationField")
+    ) {
+      return false;
+    }
+    if (
+      this._isAddKeywordDialog &&
+      !this._element("keywordField").value.length
+    ) {
+      return false;
+    }
+
+    return true;
+  },
+
+  _containsValidURI: function BPP__containsValidURI(aTextboxID) {
+    try {
+      var value = this._element(aTextboxID).value;
+      if (value) {
+        Services.uriFixup.getFixupURIInfo(value);
+        return true;
+      }
+    } catch (e) {}
+    return false;
+  },
+
+  async _getInsertionPointDetails() {
+    return [
+      await this._defaultInsertionPoint.getIndex(),
+      this._defaultInsertionPoint.guid,
+    ];
+  },
+
+  async _promiseNewItem() {
+    let [index, parentGuid] = await this._getInsertionPointDetails();
+
+    let info = { parentGuid, index, title: this._title };
+    if (this._itemType == BOOKMARK_ITEM) {
+      info.url = this._uri;
+      if (this._keyword) {
+        info.keyword = this._keyword;
+      }
+      if (this._postData) {
+        info.postData = this._postData;
+      }
+
+      if (this._charSet) {
+        PlacesUIUtils.setCharsetForPage(this._uri, this._charSet, window).catch(
+          console.error
+        );
+      }
+    } else if (this._itemType == BOOKMARK_FOLDER) {
+      info.children = this._URIs.map(item => {
+        return { url: item.uri, title: item.title };
+      });
+    } else {
+      throw new Error(`unexpected value for _itemType:  ${this._itemType}`);
+    }
+    return Object.freeze({
+      index,
+      bookmarkGuid: PlacesUtils.bookmarks.unsavedGuid,
+      title: this._title,
+      uri: this._uri ? this._uri.spec : "",
+      type:
+        this._itemType == BOOKMARK_ITEM
+          ? Ci.nsINavHistoryResultNode.RESULT_TYPE_URI
+          : Ci.nsINavHistoryResultNode.RESULT_TYPE_FOLDER,
+      parent: {
+        bookmarkGuid: parentGuid,
+        type: Ci.nsINavHistoryResultNode.RESULT_TYPE_FOLDER,
+      },
+      children: info.children,
+    });
+  },
+};
+
+document.addEventListener("DOMContentLoaded", function () {
+  document.mozSubdialogReady = BookmarkPropertiesPanel.onDialogLoad()
+    .catch(ex => console.error(`Failed to initialize dialog: ${ex}`))
+    .then(() => window.sizeToContent());
+});

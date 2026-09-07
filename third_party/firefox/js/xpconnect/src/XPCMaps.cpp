@@ -1,0 +1,157 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "mozilla/MemoryReporting.h"
+#include "xpcprivate.h"
+#include "XPCMaps.h"
+
+#include "js/HashTable.h"
+
+using namespace mozilla;
+
+
+void JSObject2WrappedJSMap::UpdateWeakPointersAfterGC(JSTracer* trc) {
+
+  nsTArray<RefPtr<nsXPCWrappedJS>> dying;
+  for (auto iter = mTable.modIter(); !iter.done(); iter.next()) {
+    nsXPCWrappedJS* wrapper = iter.get().value();
+    MOZ_ASSERT(wrapper, "found a null JS wrapper!");
+
+    if (wrapper && wrapper->IsSubjectToFinalization()) {
+      wrapper->UpdateObjectPointerAfterGC(trc);
+      if (!wrapper->GetJSObjectPreserveColor()) {
+        dying.AppendElement(dont_AddRef(wrapper));
+      }
+    }
+
+    if (!JS_UpdateWeakPointerAfterGC(trc, &iter.get().mutableKey())) {
+      iter.remove();
+    }
+  }
+}
+
+void JSObject2WrappedJSMap::ShutdownMarker() {
+  for (auto iter = mTable.iter(); !iter.done(); iter.next()) {
+    nsXPCWrappedJS* wrapper = iter.get().value();
+    MOZ_ASSERT(wrapper, "found a null JS wrapper!");
+    MOZ_ASSERT(wrapper->IsValid(), "found an invalid JS wrapper!");
+    wrapper->SystemIsBeingShutDown();
+  }
+}
+
+size_t JSObject2WrappedJSMap::SizeOfIncludingThis(
+    mozilla::MallocSizeOf mallocSizeOf) const {
+  size_t n = mallocSizeOf(this);
+  n += mTable.shallowSizeOfExcludingThis(mallocSizeOf);
+  return n;
+}
+
+size_t JSObject2WrappedJSMap::SizeOfWrappedJS(
+    mozilla::MallocSizeOf mallocSizeOf) const {
+  size_t n = 0;
+  for (auto iter = mTable.iter(); !iter.done(); iter.next()) {
+    n += iter.get().value()->SizeOfIncludingThis(mallocSizeOf);
+  }
+  return n;
+}
+
+
+Native2WrappedNativeMap::Native2WrappedNativeMap()
+    : mMap(XPC_NATIVE_MAP_LENGTH) {}
+
+size_t Native2WrappedNativeMap::SizeOfIncludingThis(
+    mozilla::MallocSizeOf mallocSizeOf) const {
+  size_t n = mallocSizeOf(this);
+  n += mMap.shallowSizeOfExcludingThis(mallocSizeOf);
+  for (auto iter = mMap.iter(); !iter.done(); iter.next()) {
+    n += mallocSizeOf(iter.get().value());
+  }
+  return n;
+}
+
+
+IID2NativeInterfaceMap::IID2NativeInterfaceMap()
+    : mMap(XPC_NATIVE_INTERFACE_MAP_LENGTH) {}
+
+size_t IID2NativeInterfaceMap::SizeOfIncludingThis(
+    mozilla::MallocSizeOf mallocSizeOf) const {
+  size_t n = mallocSizeOf(this);
+  n += mMap.shallowSizeOfExcludingThis(mallocSizeOf);
+  for (auto iter = mMap.iter(); !iter.done(); iter.next()) {
+    n += iter.get().value()->SizeOfIncludingThis(mallocSizeOf);
+  }
+  return n;
+}
+
+
+ClassInfo2NativeSetMap::ClassInfo2NativeSetMap()
+    : mMap(XPC_NATIVE_SET_MAP_LENGTH) {}
+
+size_t ClassInfo2NativeSetMap::ShallowSizeOfIncludingThis(
+    mozilla::MallocSizeOf mallocSizeOf) {
+  size_t n = mallocSizeOf(this);
+  n += mMap.shallowSizeOfExcludingThis(mallocSizeOf);
+  return n;
+}
+
+
+ClassInfo2WrappedNativeProtoMap::ClassInfo2WrappedNativeProtoMap()
+    : mMap(XPC_NATIVE_PROTO_MAP_LENGTH) {}
+
+size_t ClassInfo2WrappedNativeProtoMap::SizeOfIncludingThis(
+    mozilla::MallocSizeOf mallocSizeOf) const {
+  size_t n = mallocSizeOf(this);
+  n += mMap.shallowSizeOfExcludingThis(mallocSizeOf);
+  for (auto iter = mMap.iter(); !iter.done(); iter.next()) {
+    n += mallocSizeOf(iter.get().value());
+  }
+  return n;
+}
+
+
+bool NativeSetHasher::match(Key key, Lookup lookup) {
+  XPCNativeSet* SetInTable = key;
+  XPCNativeSet* Set = lookup->GetBaseSet();
+  XPCNativeInterface* Addition = lookup->GetAddition();
+
+  if (!Set) {
+
+    return (SetInTable->GetInterfaceCount() == 1 &&
+            SetInTable->GetInterfaceAt(0) == Addition) ||
+           (SetInTable->GetInterfaceCount() == 2 &&
+            SetInTable->GetInterfaceAt(1) == Addition);
+  }
+
+  if (!Addition && Set == SetInTable) {
+    return true;
+  }
+
+  uint16_t count = Set->GetInterfaceCount();
+  if (count + (Addition ? 1 : 0) != SetInTable->GetInterfaceCount()) {
+    return false;
+  }
+
+  XPCNativeInterface** CurrentInTable = SetInTable->GetInterfaceArray();
+  XPCNativeInterface** Current = Set->GetInterfaceArray();
+  for (uint16_t i = 0; i < count; i++) {
+    if (*(Current++) != *(CurrentInTable++)) {
+      return false;
+    }
+  }
+  return !Addition || Addition == *(CurrentInTable++);
+}
+
+NativeSetMap::NativeSetMap() : mSet(XPC_NATIVE_SET_MAP_LENGTH) {}
+
+size_t NativeSetMap::SizeOfIncludingThis(
+    mozilla::MallocSizeOf mallocSizeOf) const {
+  size_t n = mallocSizeOf(this);
+  n += mSet.shallowSizeOfExcludingThis(mallocSizeOf);
+  for (auto iter = mSet.iter(); !iter.done(); iter.next()) {
+    n += iter.get()->SizeOfIncludingThis(mallocSizeOf);
+  }
+  return n;
+}
+

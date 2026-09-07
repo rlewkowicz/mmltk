@@ -1,0 +1,204 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "nsScrollbarButtonFrame.h"
+
+#include "mozilla/LookAndFeel.h"
+#include "mozilla/MouseEvents.h"
+#include "mozilla/PresShell.h"
+#include "nsCOMPtr.h"
+#include "nsGkAtoms.h"
+#include "nsIContent.h"
+#include "nsIScrollbarMediator.h"
+#include "nsLayoutUtils.h"
+#include "nsNameSpaceManager.h"
+#include "nsPresContext.h"
+#include "nsRepeatService.h"
+#include "nsScrollbarFrame.h"
+#include "nsSliderFrame.h"
+
+using namespace mozilla;
+
+nsIFrame* NS_NewScrollbarButtonFrame(PresShell* aPresShell,
+                                     ComputedStyle* aStyle) {
+  return new (aPresShell)
+      nsScrollbarButtonFrame(aStyle, aPresShell->GetPresContext());
+}
+NS_IMPL_FRAMEARENA_HELPERS(nsScrollbarButtonFrame)
+
+nsresult nsScrollbarButtonFrame::HandleEvent(nsPresContext* aPresContext,
+                                             WidgetGUIEvent* aEvent,
+                                             nsEventStatus* aEventStatus) {
+  NS_ENSURE_ARG_POINTER(aEventStatus);
+
+  if (!mContent->IsInNativeAnonymousSubtree() &&
+      nsEventStatus_eConsumeNoDefault == *aEventStatus) {
+    return NS_OK;
+  }
+
+  switch (aEvent->mMessage) {
+    case eMouseDown:
+      mCursorOnThis = true;
+      if (HandleButtonPress(aPresContext, aEvent, aEventStatus)) {
+        return NS_OK;
+      }
+      break;
+    case eMouseUp:
+      HandleRelease(aPresContext, aEvent, aEventStatus);
+      break;
+    case eMouseOut:
+      mCursorOnThis = false;
+      break;
+    case eMouseMove: {
+      nsPoint cursor = nsLayoutUtils::GetEventCoordinatesRelativeTo(
+          aEvent, RelativeTo{this});
+      nsRect frameRect(nsPoint(0, 0), GetSize());
+      mCursorOnThis = frameRect.Contains(cursor);
+      break;
+    }
+    default:
+      break;
+  }
+
+  return SimpleXULLeafFrame::HandleEvent(aPresContext, aEvent, aEventStatus);
+}
+
+bool nsScrollbarButtonFrame::HandleButtonPress(nsPresContext* aPresContext,
+                                               WidgetGUIEvent* aEvent,
+                                               nsEventStatus* aEventStatus) {
+  LookAndFeel::IntID tmpAction;
+  uint16_t button = aEvent->AsMouseEvent()->mButton;
+  if (button == MouseButton::ePrimary) {
+    tmpAction = LookAndFeel::IntID::ScrollButtonLeftMouseButtonAction;
+  } else if (button == MouseButton::eMiddle) {
+    tmpAction = LookAndFeel::IntID::ScrollButtonMiddleMouseButtonAction;
+  } else if (button == MouseButton::eSecondary) {
+    tmpAction = LookAndFeel::IntID::ScrollButtonRightMouseButtonAction;
+  } else {
+    return false;
+  }
+
+  int32_t pressedButtonAction;
+  if (NS_FAILED(LookAndFeel::GetInt(tmpAction, &pressedButtonAction))) {
+    return false;
+  }
+
+  nsScrollbarFrame* scrollbar = GetScrollbar();
+  if (!scrollbar) {
+    return false;
+  }
+
+  static dom::Element::AttrValuesArray strings[] = {
+      nsGkAtoms::increment, nsGkAtoms::decrement, nullptr};
+  int32_t index = mContent->AsElement()->FindAttrValueIn(
+      kNameSpaceID_None, nsGkAtoms::type, strings, eCaseMatters);
+  int32_t direction;
+  if (index == 0) {
+    direction = 1;
+  } else if (index == 1) {
+    direction = -1;
+  } else {
+    return false;
+  }
+
+  const bool repeat = pressedButtonAction != 2;
+
+  PresShell::SetCapturingContent(mContent, CaptureFlags::IgnoreAllowedState);
+
+  AutoWeakFrame weakFrame(this);
+
+  nsIScrollbarMediator* m = scrollbar->GetScrollbarMediator();
+  switch (pressedButtonAction) {
+    case 0:
+      scrollbar->SetButtonScrollDirectionAndUnit(direction, ScrollUnit::LINES);
+      if (m) {
+        m->ScrollByLine(scrollbar, direction,
+                        ScrollSnapFlags::IntendedDirection);
+      }
+      break;
+    case 1:
+      scrollbar->SetButtonScrollDirectionAndUnit(direction, ScrollUnit::PAGES);
+      if (m) {
+        m->ScrollByPage(scrollbar, direction,
+                        ScrollSnapFlags::IntendedDirection |
+                            ScrollSnapFlags::IntendedEndPosition);
+      }
+      break;
+    case 2:
+      scrollbar->SetButtonScrollDirectionAndUnit(direction, ScrollUnit::WHOLE);
+      if (m) {
+        m->ScrollByWhole(scrollbar, direction,
+                         ScrollSnapFlags::IntendedEndPosition);
+      }
+      break;
+    case 3:
+    default:
+      return false;
+  }
+  if (!weakFrame.IsAlive()) {
+    return false;
+  }
+  if (repeat) {
+    StartRepeat();
+  }
+  return true;
+}
+
+NS_IMETHODIMP
+nsScrollbarButtonFrame::HandleRelease(nsPresContext* aPresContext,
+                                      WidgetGUIEvent* aEvent,
+                                      nsEventStatus* aEventStatus) {
+  PresShell::ReleaseCapturingContent();
+  StopRepeat();
+  if (nsScrollbarFrame* scrollbar = GetScrollbar()) {
+    if (nsIScrollbarMediator* m = scrollbar->GetScrollbarMediator()) {
+      m->ScrollbarReleased(scrollbar);
+    }
+  }
+  return NS_OK;
+}
+
+void nsScrollbarButtonFrame::Notify() {
+  if (mCursorOnThis ||
+      LookAndFeel::GetInt(LookAndFeel::IntID::ScrollbarButtonAutoRepeatBehavior,
+                          0)) {
+    if (nsScrollbarFrame* sb = GetScrollbar()) {
+      if (nsIScrollbarMediator* m = sb->GetScrollbarMediator()) {
+        m->RepeatButtonScroll(sb);
+      }
+    }
+  }
+}
+
+void nsScrollbarButtonFrame::StopRepeat() {
+  nsRepeatService::GetInstance()->Stop(Notify, this);
+
+  nsScrollbarFrame* scrollbar = GetScrollbar();
+  if (!scrollbar) {
+    return;
+  }
+  scrollbar->SetButtonScrollDirectionAndUnit(0, ScrollUnit::WHOLE);
+}
+
+nsIScrollbarMediator* nsScrollbarButtonFrame::GetMediator() {
+  if (auto* sb = GetScrollbar()) {
+    return sb->GetScrollbarMediator();
+  }
+  return nullptr;
+}
+
+nsScrollbarFrame* nsScrollbarButtonFrame::GetScrollbar() {
+  for (nsIFrame* cur = GetParent(); cur; cur = cur->GetParent()) {
+    if (cur->IsScrollbarFrame()) {
+      return static_cast<nsScrollbarFrame*>(cur);
+    }
+  }
+  return nullptr;
+}
+
+void nsScrollbarButtonFrame::Destroy(DestroyContext& aContext) {
+  StopRepeat();
+  SimpleXULLeafFrame::Destroy(aContext);
+}

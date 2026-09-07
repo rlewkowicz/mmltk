@@ -1,0 +1,63 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_ServoStyleRuleMap_h
+#define mozilla_ServoStyleRuleMap_h
+
+#include "mozilla/WeakPtr.h"
+#include "nsTHashMap.h"
+
+struct StyleLockedStyleRule;
+
+namespace mozilla {
+class ServoCSSRuleList;
+class StyleSheet;
+class ServoStyleSet;
+struct StyleLockedDeclarationBlock;
+namespace css {
+class Rule;
+}  
+namespace dom {
+class ShadowRoot;
+}
+class ServoStyleRuleMap final {
+ public:
+  ServoStyleRuleMap() = default;
+
+  void EnsureTable(ServoStyleSet&);
+  void EnsureTable(dom::ShadowRoot&);
+
+  css::Rule* Lookup(const StyleLockedDeclarationBlock* aDecls) const {
+    return mTable.Get(aDecls);
+  }
+
+  void SheetAdded(StyleSheet&);
+  void SheetRemoved(StyleSheet&);
+  void SheetCloned(StyleSheet&);
+
+  void RuleAdded(StyleSheet& aStyleSheet, css::Rule&);
+  void RuleRemoved(StyleSheet& aStyleSheet, css::Rule&);
+  void RuleDeclarationsChanged(css::Rule&,
+                               const StyleLockedDeclarationBlock* aOld,
+                               const StyleLockedDeclarationBlock* aNew);
+
+  size_t SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const;
+
+  ~ServoStyleRuleMap() = default;
+
+ private:
+  bool IsEmpty() const { return mTable.IsEmpty(); }
+
+  void FillTableFromRule(css::Rule&);
+  void FillTableFromRuleList(ServoCSSRuleList&);
+  void FillTableFromStyleSheet(StyleSheet&);
+
+  using Hashtable = nsTHashMap<nsPtrHashKey<const StyleLockedDeclarationBlock>,
+                               WeakPtr<css::Rule>>;
+  Hashtable mTable;
+};
+
+}  
+
+#endif  // mozilla_ServoStyleRuleMap_h

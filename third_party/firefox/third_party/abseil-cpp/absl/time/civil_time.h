@@ -1,0 +1,142 @@
+// Copyright 2018 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef ABSL_TIME_CIVIL_TIME_H_
+#define ABSL_TIME_CIVIL_TIME_H_
+
+#include <iosfwd>
+#include <string>
+
+#include "absl/base/config.h"
+#include "absl/strings/string_view.h"
+#include "absl/time/internal/cctz/include/cctz/civil_time.h"
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+
+namespace time_internal {
+struct second_tag : cctz::detail::second_tag {};
+struct minute_tag : second_tag, cctz::detail::minute_tag {};
+struct hour_tag : minute_tag, cctz::detail::hour_tag {};
+struct day_tag : hour_tag, cctz::detail::day_tag {};
+struct month_tag : day_tag, cctz::detail::month_tag {};
+struct year_tag : month_tag, cctz::detail::year_tag {};
+}  
+
+using CivilSecond =
+    time_internal::cctz::detail::civil_time<time_internal::second_tag>;
+using CivilMinute =
+    time_internal::cctz::detail::civil_time<time_internal::minute_tag>;
+using CivilHour =
+    time_internal::cctz::detail::civil_time<time_internal::hour_tag>;
+using CivilDay =
+    time_internal::cctz::detail::civil_time<time_internal::day_tag>;
+using CivilMonth =
+    time_internal::cctz::detail::civil_time<time_internal::month_tag>;
+using CivilYear =
+    time_internal::cctz::detail::civil_time<time_internal::year_tag>;
+
+using civil_year_t = time_internal::cctz::year_t;
+
+using civil_diff_t = time_internal::cctz::diff_t;
+
+using Weekday = time_internal::cctz::weekday;
+
+inline Weekday GetWeekday(CivilSecond cs) {
+  return time_internal::cctz::get_weekday(cs);
+}
+
+inline CivilDay NextWeekday(CivilDay cd, Weekday wd) {
+  return CivilDay(time_internal::cctz::next_weekday(cd, wd));
+}
+inline CivilDay PrevWeekday(CivilDay cd, Weekday wd) {
+  return CivilDay(time_internal::cctz::prev_weekday(cd, wd));
+}
+
+inline int GetYearDay(CivilSecond cs) {
+  return time_internal::cctz::get_yearday(cs);
+}
+
+std::string FormatCivilTime(CivilSecond c);
+std::string FormatCivilTime(CivilMinute c);
+std::string FormatCivilTime(CivilHour c);
+std::string FormatCivilTime(CivilDay c);
+std::string FormatCivilTime(CivilMonth c);
+std::string FormatCivilTime(CivilYear c);
+
+template <typename Sink>
+void AbslStringify(Sink& sink, CivilSecond c) {
+  sink.Append(FormatCivilTime(c));
+}
+template <typename Sink>
+void AbslStringify(Sink& sink, CivilMinute c) {
+  sink.Append(FormatCivilTime(c));
+}
+template <typename Sink>
+void AbslStringify(Sink& sink, CivilHour c) {
+  sink.Append(FormatCivilTime(c));
+}
+template <typename Sink>
+void AbslStringify(Sink& sink, CivilDay c) {
+  sink.Append(FormatCivilTime(c));
+}
+template <typename Sink>
+void AbslStringify(Sink& sink, CivilMonth c) {
+  sink.Append(FormatCivilTime(c));
+}
+template <typename Sink>
+void AbslStringify(Sink& sink, CivilYear c) {
+  sink.Append(FormatCivilTime(c));
+}
+
+bool ParseCivilTime(absl::string_view s, CivilSecond* c);
+bool ParseCivilTime(absl::string_view s, CivilMinute* c);
+bool ParseCivilTime(absl::string_view s, CivilHour* c);
+bool ParseCivilTime(absl::string_view s, CivilDay* c);
+bool ParseCivilTime(absl::string_view s, CivilMonth* c);
+bool ParseCivilTime(absl::string_view s, CivilYear* c);
+
+bool ParseLenientCivilTime(absl::string_view s, CivilSecond* c);
+bool ParseLenientCivilTime(absl::string_view s, CivilMinute* c);
+bool ParseLenientCivilTime(absl::string_view s, CivilHour* c);
+bool ParseLenientCivilTime(absl::string_view s, CivilDay* c);
+bool ParseLenientCivilTime(absl::string_view s, CivilMonth* c);
+bool ParseLenientCivilTime(absl::string_view s, CivilYear* c);
+
+namespace time_internal {  
+
+std::ostream& operator<<(std::ostream& os, CivilYear y);
+std::ostream& operator<<(std::ostream& os, CivilMonth m);
+std::ostream& operator<<(std::ostream& os, CivilDay d);
+std::ostream& operator<<(std::ostream& os, CivilHour h);
+std::ostream& operator<<(std::ostream& os, CivilMinute m);
+std::ostream& operator<<(std::ostream& os, CivilSecond s);
+
+bool AbslParseFlag(absl::string_view s, CivilSecond* c, std::string* error);
+bool AbslParseFlag(absl::string_view s, CivilMinute* c, std::string* error);
+bool AbslParseFlag(absl::string_view s, CivilHour* c, std::string* error);
+bool AbslParseFlag(absl::string_view s, CivilDay* c, std::string* error);
+bool AbslParseFlag(absl::string_view s, CivilMonth* c, std::string* error);
+bool AbslParseFlag(absl::string_view s, CivilYear* c, std::string* error);
+
+std::string AbslUnparseFlag(CivilSecond c);
+std::string AbslUnparseFlag(CivilMinute c);
+std::string AbslUnparseFlag(CivilHour c);
+std::string AbslUnparseFlag(CivilDay c);
+std::string AbslUnparseFlag(CivilMonth c);
+std::string AbslUnparseFlag(CivilYear c);
+
+}  
+
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_TIME_CIVIL_TIME_H_

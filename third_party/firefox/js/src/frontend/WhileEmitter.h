@@ -1,0 +1,64 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef frontend_WhileEmitter_h
+#define frontend_WhileEmitter_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/Maybe.h"
+
+#include <stdint.h>
+
+#include "frontend/BytecodeControlStructures.h"
+#include "frontend/TDZCheckCache.h"
+
+namespace js {
+namespace frontend {
+
+struct BytecodeEmitter;
+
+class MOZ_STACK_CLASS WhileEmitter {
+#if defined(ENABLE_DECORATORS) || defined(ENABLE_EXPLICIT_RESOURCE_MANAGEMENT)
+ protected:
+#endif
+  BytecodeEmitter* bce_;
+
+  mozilla::Maybe<LoopControl> loopInfo_;
+
+  mozilla::Maybe<TDZCheckCache> tdzCacheForBody_;
+
+#ifdef DEBUG
+  enum class State {
+    Start,
+
+    Cond,
+
+    Body,
+
+    End
+  };
+  State state_ = State::Start;
+#endif
+
+ public:
+  explicit WhileEmitter(BytecodeEmitter* bce);
+
+  [[nodiscard]] bool emitCond(uint32_t whilePos, uint32_t condPos,
+                              uint32_t endPos);
+  [[nodiscard]] bool emitBody();
+  [[nodiscard]] bool emitEnd();
+};
+
+#if defined(ENABLE_DECORATORS) || defined(ENABLE_EXPLICIT_RESOURCE_MANAGEMENT)
+class MOZ_STACK_CLASS InternalWhileEmitter : public WhileEmitter {
+ public:
+  explicit InternalWhileEmitter(BytecodeEmitter* bce) : WhileEmitter(bce) {}
+  [[nodiscard]] bool emitCond();
+};
+#endif
+
+} 
+} 
+
+#endif /* frontend_WhileEmitter_h */

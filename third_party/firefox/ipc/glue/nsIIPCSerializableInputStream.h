@@ -1,0 +1,64 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_ipc_nsIIPCSerializableInputStream_h
+#define mozilla_ipc_nsIIPCSerializableInputStream_h
+
+#include "nsISupports.h"
+#include "nsTArrayForwardDeclare.h"
+
+namespace mozilla {
+namespace ipc {
+
+class FileDescriptor;
+class InputStreamParams;
+
+}  
+
+}  
+
+#define NS_IIPCSERIALIZABLEINPUTSTREAM_IID \
+  {0xb0211b14, 0xea6d, 0x40d4, {0x87, 0xb5, 0x7b, 0xe3, 0xdf, 0xac, 0x09, 0xd1}}
+
+class NS_NO_VTABLE nsIIPCSerializableInputStream : public nsISupports {
+ public:
+  NS_INLINE_DECL_STATIC_IID(NS_IIPCSERIALIZABLEINPUTSTREAM_IID)
+
+  virtual void SerializedComplexity(uint32_t aMaxSize, uint32_t* aSizeUsed,
+                                    uint32_t* aPipes,
+                                    uint32_t* aTransferables) = 0;
+
+  virtual void Serialize(mozilla::ipc::InputStreamParams& aParams,
+                         uint32_t aMaxSize, uint32_t* aSizeUsed) = 0;
+
+  virtual bool Deserialize(const mozilla::ipc::InputStreamParams& aParams) = 0;
+};
+
+#define NS_DECL_NSIIPCSERIALIZABLEINPUTSTREAM                               \
+  virtual void SerializedComplexity(uint32_t aMaxSize, uint32_t* aSizeUsed, \
+                                    uint32_t* aPipes,                       \
+                                    uint32_t* aTransferrables) override;    \
+  virtual void Serialize(mozilla::ipc::InputStreamParams&, uint32_t,        \
+                         uint32_t*) override;                               \
+                                                                            \
+  virtual bool Deserialize(const mozilla::ipc::InputStreamParams&) override;
+
+#define NS_FORWARD_NSIIPCSERIALIZABLEINPUTSTREAM(_to)                       \
+  virtual void SerializedComplexity(uint32_t aMaxSize, uint32_t* aSizeUsed, \
+                                    uint32_t* aPipes,                       \
+                                    uint32_t* aTransferables) override {    \
+    _to SerializedComplexity(aMaxSize, aSizeUsed, aPipes, aTransferables);  \
+  };                                                                        \
+                                                                            \
+  virtual void Serialize(mozilla::ipc::InputStreamParams& aParams,          \
+                         uint32_t aMaxSize, uint32_t* aSizeUsed) override { \
+    _to Serialize(aParams, aMaxSize, aSizeUsed);                            \
+  }                                                                         \
+                                                                            \
+  virtual bool Deserialize(const mozilla::ipc::InputStreamParams& aParams)  \
+      override {                                                            \
+    return _to Deserialize(aParams);                                        \
+  }
+
+#endif  // mozilla_ipc_nsIIPCSerializableInputStream_h

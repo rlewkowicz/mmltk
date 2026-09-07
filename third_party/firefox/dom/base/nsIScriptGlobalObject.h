@@ -1,0 +1,48 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsIScriptGlobalObject_h_
+#define nsIScriptGlobalObject_h_
+
+#include "js/TypeDecls.h"
+#include "mozilla/EventForwards.h"
+#include "nsIGlobalObject.h"
+#include "nsISupports.h"
+
+class nsIScriptContext;
+class nsIScriptGlobalObject;
+
+namespace mozilla::dom {
+struct ErrorEventInit;
+}  
+
+MOZ_CAN_RUN_SCRIPT_BOUNDARY bool NS_HandleScriptError(
+    nsIScriptGlobalObject* aScriptGlobal,
+    const mozilla::dom::ErrorEventInit& aErrorEvent, nsEventStatus* aStatus);
+
+#define NS_ISCRIPTGLOBALOBJECT_IID \
+  {0x876f83bd, 0x6314, 0x460a, {0xa0, 0x45, 0x1c, 0x8f, 0x46, 0x2f, 0xb8, 0xe1}}
+
+
+class nsIScriptGlobalObject : public nsIGlobalObject {
+ public:
+  NS_INLINE_DECL_STATIC_IID(NS_ISCRIPTGLOBALOBJECT_IID)
+
+  virtual nsresult EnsureScriptEnvironment() = 0;
+  virtual nsIScriptContext* GetScriptContext() = 0;
+
+  nsIScriptContext* GetContext() { return GetScriptContext(); }
+
+  bool HandleScriptError(const mozilla::dom::ErrorEventInit& aErrorEventInit,
+                         nsEventStatus* aEventStatus) {
+    return NS_HandleScriptError(this, aErrorEventInit, aEventStatus);
+  }
+
+  virtual bool IsBlackForCC(bool aTracingNeeded = true) { return false; }
+
+ protected:
+  virtual ~nsIScriptGlobalObject() = default;
+};
+
+#endif

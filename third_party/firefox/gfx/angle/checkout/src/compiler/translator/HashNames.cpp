@@ -1,0 +1,92 @@
+// Copyright 2017 The ANGLE Project Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include "compiler/translator/HashNames.h"
+
+#include "compiler/translator/ImmutableString.h"
+#include "compiler/translator/ImmutableStringBuilder.h"
+#include "compiler/translator/IntermNode.h"
+#include "compiler/translator/Symbol.h"
+
+namespace sh
+{
+
+namespace
+{
+constexpr const ImmutableString kHashedNamePrefix("webgl_");
+
+ImmutableString HashName(const ImmutableString &name, ShHashFunction64 hashFunction)
+{
+    ASSERT(!name.empty());
+    ASSERT(hashFunction);
+    khronos_uint64_t number = (*hashFunction)(name.data(), name.length());
+
+    static const unsigned int kHexStrMaxLength = sizeof(number) * 2;
+    static const size_t kHashedNameMaxLength   = kHashedNamePrefix.length() + kHexStrMaxLength;
+
+    ImmutableStringBuilder hashedName(kHashedNameMaxLength);
+    hashedName << kHashedNamePrefix;
+
+    hashedName.appendHex(number);
+
+    return hashedName;
+}
+
+void AddToNameMapIfNotMapped(const ImmutableString &name,
+                             const ImmutableString &hashedName,
+                             NameMap *nameMap)
+{
+    if (nameMap)
+    {
+        NameMap::const_iterator it = nameMap->find(name.data());
+        if (it != nameMap->end())
+        {
+            return;
+        }
+        (*nameMap)[name.data()] = hashedName.data();
+    }
+}
+
+}  
+
+ImmutableString HashName(const ImmutableString &name,
+                         char prefix,
+                         ShHashFunction64 hashFunction,
+                         NameMap *nameMap)
+{
+    if (hashFunction == nullptr)
+    {
+        size_t kPrefixLength = 2;
+        if (!prefix || name.length() + kPrefixLength > kESSLMaxIdentifierLength)
+        {
+            return name;
+        }
+        ImmutableString res = BuildConcatenatedImmutableString('_', prefix, name);
+        AddToNameMapIfNotMapped(name, res, nameMap);
+        return res;
+    }
+
+    ImmutableString hashedName = HashName(name, hashFunction);
+    AddToNameMapIfNotMapped(name, hashedName, nameMap);
+    return hashedName;
+}
+
+ImmutableString HashName(const TSymbol *symbol,
+                         char prefix,
+                         ShHashFunction64 hashFunction,
+                         NameMap *nameMap)
+{
+    if (symbol->symbolType() == SymbolType::Empty)
+    {
+        return kEmptyImmutableString;
+    }
+    if (symbol->symbolType() == SymbolType::AngleInternal ||
+        symbol->symbolType() == SymbolType::BuiltIn)
+    {
+        return symbol->name();
+    }
+    return HashName(symbol->name(), prefix, hashFunction, nameMap);
+}
+
+}  

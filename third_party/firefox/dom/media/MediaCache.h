@@ -1,0 +1,217 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MediaCache_h_
+#define MediaCache_h_
+
+#include <limits>
+
+#include "DecoderDoctorLogger.h"
+#include "Intervals.h"
+#include "MediaChannelStatistics.h"
+#include "mozilla/Monitor.h"
+#include "mozilla/Result.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/dom/MediaDebugInfoBinding.h"
+#include "nsCOMPtr.h"
+#include "nsHashKeys.h"
+#include "nsTArray.h"
+#include "nsTHashtable.h"
+
+class nsIEventTarget;
+class nsIPrincipal;
+
+namespace mozilla {
+class ChannelMediaResource;
+typedef media::IntervalSet<int64_t> MediaByteRangeSet;
+class MediaResource;
+
+class MediaCache;
+
+DDLoggedTypeDeclName(MediaCacheStream);
+
+class MediaCacheStream : public DecoderDoctorLifeLogger<MediaCacheStream> {
+  using AutoLock = MonitorAutoLock;
+
+ public:
+  static constexpr int64_t BLOCK_SIZE = 32768;
+
+  static constexpr bool IsOffsetAllowed(int64_t aOffset) {
+    constexpr int64_t kMaxOffset =
+        (int64_t(std::numeric_limits<int32_t>::max()) + 1) * BLOCK_SIZE;
+    return aOffset >= 0 && aOffset < kMaxOffset;
+  }
+
+  enum ReadMode { MODE_METADATA, MODE_PLAYBACK };
+
+  MediaCacheStream(ChannelMediaResource* aClient, bool aIsPrivateBrowsing);
+  ~MediaCacheStream();
+
+  nsresult Init(int64_t aContentLength);
+
+  void InitAsClone(MediaCacheStream* aOriginal);
+
+  nsISerialEventTarget* OwnerThread() const;
+
+  RefPtr<GenericPromise> Close();
+  bool IsClosed(AutoLock&) const { return mClosed; }
+  bool IsAvailableForSharing() const { return !mIsPrivateBrowsing; }
+
+
+  void NotifyDataStarted(uint32_t aLoadID, int64_t aOffset, bool aSeekable,
+                         int64_t aLength);
+  void NotifyDataReceived(uint32_t aLoadID, uint32_t aCount,
+                          const uint8_t* aData);
+
+  void NotifyLoadID(uint32_t aLoadID);
+
+  void NotifyDataEnded(uint32_t aLoadID, nsresult aStatus);
+
+  void NotifyClientSuspended(bool aSuspended);
+
+  void NotifyResume();
+
+  void Pin();
+  void Unpin();
+  int64_t GetLength() const;
+  struct LengthAndOffset {
+    int64_t mLength;
+    int64_t mOffset;
+  };
+  LengthAndOffset GetLengthAndOffset() const;
+  int64_t GetResourceID() { return mResourceID; }
+  int64_t GetCachedDataEnd(int64_t aOffset);
+  int64_t GetNextCachedData(int64_t aOffset);
+  nsresult GetCachedRanges(MediaByteRangeSet& aRanges);
+
+  double GetDownloadRate(bool* aIsReliable);
+
+  nsresult ReadFromCache(char* aBuffer, int64_t aOffset, uint32_t aCount);
+
+  bool IsDataCachedToEndOfStream(int64_t aOffset);
+  void SetReadMode(ReadMode aMode);
+  void SetPlaybackRate(uint32_t aBytesPerSecond);
+
+  bool AreAllStreamsForResourceSuspended(AutoLock&);
+
+  nsresult Read(AutoLock&, char* aBuffer, uint32_t aCount, uint32_t* aBytes);
+  nsresult ReadAt(int64_t aOffset, char* aBuffer, uint32_t aCount,
+                  uint32_t* aBytes);
+
+  void ThrottleReadahead(bool bThrottle);
+
+  size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const;
+
+  void GetDebugInfo(dom::MediaCacheStreamDebugInfo& aInfo);
+
+ private:
+  friend class MediaCache;
+
+  class BlockList {
+   public:
+    BlockList() : mFirstBlock(-1), mCount(0) {}
+    ~BlockList() {
+      NS_ASSERTION(mFirstBlock == -1 && mCount == 0,
+                   "Destroying non-empty block list");
+    }
+    void AddFirstBlock(int32_t aBlock);
+    void AddAfter(int32_t aBlock, int32_t aBefore);
+    void RemoveBlock(int32_t aBlock);
+    int32_t GetFirstBlock() const { return mFirstBlock; }
+    int32_t GetLastBlock() const;
+    int32_t GetNextBlock(int32_t aBlock) const;
+    int32_t GetPrevBlock(int32_t aBlock) const;
+    bool IsEmpty() const { return mFirstBlock < 0; }
+    int32_t GetCount() const { return mCount; }
+    void NotifyBlockSwapped(int32_t aBlockIndex1, int32_t aBlockIndex2);
+#ifdef DEBUG
+    void Verify();
+#else
+    void Verify() {}
+#endif
+
+    size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) const;
+
+   private:
+    struct Entry : public nsUint32HashKey {
+      explicit Entry(KeyTypePointer aKey)
+          : nsUint32HashKey(aKey), mNextBlock(0), mPrevBlock(0) {}
+      Entry(const Entry& toCopy)
+          : nsUint32HashKey(&toCopy.GetKey()),
+            mNextBlock(toCopy.mNextBlock),
+            mPrevBlock(toCopy.mPrevBlock) {}
+
+      int32_t mNextBlock;
+      int32_t mPrevBlock;
+    };
+    nsTHashtable<Entry> mEntries;
+
+    int32_t mFirstBlock;
+    int32_t mCount;
+  };
+
+  uint32_t ReadPartialBlock(AutoLock&, int64_t aOffset, Span<char> aBuffer);
+
+  Result<uint32_t, nsresult> ReadBlockFromCache(AutoLock&, int64_t aOffset,
+                                                Span<char> aBuffer,
+                                                bool aNoteBlockUsage = false);
+
+  nsresult Seek(AutoLock&, int64_t aOffset);
+
+  int64_t GetCachedDataEndInternal(AutoLock&, int64_t aOffset);
+  int64_t GetNextCachedDataInternal(AutoLock&, int64_t aOffset);
+  void FlushPartialBlockInternal(AutoLock&);
+
+  void NotifyDataStartedInternal(uint32_t aLoadID, int64_t aOffset,
+                                 bool aSeekable, int64_t aLength);
+
+  void NotifyDataEndedInternal(uint32_t aLoadID, nsresult aStatus);
+
+  void UpdateDownloadStatistics(AutoLock&);
+
+  void CloseInternal(AutoLock&);
+  void InitAsCloneInternal(MediaCacheStream* aOriginal);
+
+  RefPtr<MediaCache> mMediaCache;
+
+  ChannelMediaResource* const mClient;
+
+
+  bool mClosed = false;
+  int64_t mResourceID = 0;
+  bool mIsTransportSeekable;
+  bool mCacheSuspended;
+  bool mChannelEnded;
+
+
+  int64_t mStreamLength = -1;
+  int64_t mChannelOffset = 0;
+  int64_t mStreamOffset;
+  nsTArray<int32_t> mBlocks;
+  BlockList mReadaheadBlocks;
+  BlockList mMetadataBlocks;
+  BlockList mPlayedBlocks;
+  uint32_t mPlaybackBytesPerSecond;
+  uint32_t mPinCount;
+  bool mDidNotifyDataEnded = false;
+  nsresult mNotifyDataEndedStatus;
+  ReadMode mCurrentMode = MODE_METADATA;
+  uint32_t mLoadID = 0;
+  int64_t mSeekTarget = -1;
+
+  bool mThrottleReadahead = false;
+
+  const UniquePtr<uint8_t[]> mPartialBlockBuffer =
+      MakeUnique<uint8_t[]>(BLOCK_SIZE);
+
+  const bool mIsPrivateBrowsing;
+
+  bool mClientSuspended = false;
+
+  MediaChannelStatistics mDownloadStatistics;
+};
+
+}  
+
+#endif

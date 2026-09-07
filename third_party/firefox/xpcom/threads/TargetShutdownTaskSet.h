@@ -1,0 +1,73 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef XPCOM_THREADS_TARGETSHUTDOWNTASKSET_H_
+#define XPCOM_THREADS_TARGETSHUTDOWNTASKSET_H_
+
+#include "mozilla/LinkedList.h"
+#include "nsITargetShutdownTask.h"
+
+class nsIRunnable;
+
+
+class TargetShutdownTaskSet {
+ public:
+  using TasksList = mozilla::LinkedList<RefPtr<nsITargetShutdownTask>>;
+  using TasksArray = AutoTArray<nsCOMPtr<nsITargetShutdownTask>, 8>;
+
+  TargetShutdownTaskSet() = default;
+  TargetShutdownTaskSet(TargetShutdownTaskSet&& aOther) = default;
+  TargetShutdownTaskSet(TargetShutdownTaskSet& aOther) = delete;
+
+  nsresult AddTask(nsITargetShutdownTask* aTask) {
+    MOZ_ASSERT(aTask);
+    MOZ_ASSERT(!mShutdownTasksTaken);
+    if (aTask->isInList()) {
+      MOZ_ASSERT_UNREACHABLE(
+          "A shutdown task can only be registered to one target.");
+      return NS_ERROR_UNEXPECTED;
+    }
+    mShutdownTasks.insertBack(aTask);
+    ++mShutdownTaskCount;
+    return NS_OK;
+  }
+
+  nsresult RemoveTask(nsITargetShutdownTask* aTask) {
+    MOZ_ASSERT(aTask);
+    if (!aTask->isInList()) {
+      return NS_ERROR_UNEXPECTED;
+    }
+    aTask->removeFrom(mShutdownTasks);
+    --mShutdownTaskCount;
+    return NS_OK;
+  }
+
+  inline TasksArray Extract() {
+    MOZ_ASSERT(!mShutdownTasksTaken);
+    TasksArray ret;
+    ret.SetCapacity(mShutdownTaskCount);
+    while (!mShutdownTasks.isEmpty()) {
+      auto task = mShutdownTasks.popFirst();
+      ret.AppendElement(std::move(task));
+    }
+    mShutdownTaskCount = 0;
+#ifdef DEBUG
+    mShutdownTasksTaken = true;
+#endif
+    return ret;
+  }
+
+  bool IsEmpty() { return mShutdownTasks.isEmpty(); }
+
+  ~TargetShutdownTaskSet() { MOZ_ASSERT(mShutdownTasks.isEmpty()); }
+
+ private:
+  TasksList mShutdownTasks;
+  uint32_t mShutdownTaskCount{0};
+#ifdef DEBUG
+  bool mShutdownTasksTaken{false};
+#endif
+};
+
+#endif

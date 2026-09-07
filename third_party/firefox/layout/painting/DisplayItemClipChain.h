@@ -1,0 +1,92 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DISPLAYITEMCLIPCHAIN_H_
+#define DISPLAYITEMCLIPCHAIN_H_
+
+#include "DisplayItemClip.h"
+#include "mozilla/Assertions.h"
+#include "nsString.h"
+
+namespace mozilla {
+
+struct ActiveScrolledRoot;
+
+struct DisplayItemClipChain {
+  static const DisplayItemClip* ClipForASR(
+      const DisplayItemClipChain* aClipChain, const ActiveScrolledRoot* aASR);
+
+  static bool Equal(const DisplayItemClipChain* aClip1,
+                    const DisplayItemClipChain* aClip2);
+  static uint32_t Hash(const DisplayItemClipChain* aClip);
+
+  static nsCString ToString(const DisplayItemClipChain* aClipChain);
+
+  bool HasRoundedCorners() const;
+
+  void AddRef() { mRefCount++; }
+  void Release() {
+    MOZ_ASSERT(mRefCount > 0);
+    mRefCount--;
+  }
+
+  DisplayItemClipChain(const DisplayItemClip& aClip,
+                       const ActiveScrolledRoot* aASR,
+                       const DisplayItemClipChain* aParent,
+                       DisplayItemClipChain* aNextClipChainToDestroy)
+      : mClip(aClip),
+        mASR(aASR),
+        mParent(aParent),
+        mNextClipChainToDestroy(aNextClipChainToDestroy)
+#if defined(DEBUG) || defined(MOZ_DIAGNOSTIC_ASSERT_ENABLED)
+        ,
+        mOnStack(true)
+#endif
+  {
+  }
+
+  DisplayItemClipChain()
+      : mASR(nullptr),
+        mNextClipChainToDestroy(nullptr)
+#if defined(DEBUG) || defined(MOZ_DIAGNOSTIC_ASSERT_ENABLED)
+        ,
+        mOnStack(true)
+#endif
+  {
+  }
+
+  bool IsDisplayportClip() const { return mKind == ClipKind::Displayport; }
+
+  enum class ClipKind : uint8_t { Displayport, Other };
+
+  DisplayItemClip mClip;
+  const ActiveScrolledRoot* mASR;
+  RefPtr<const DisplayItemClipChain> mParent;
+  uint32_t mRefCount = 0;
+  ClipKind mKind = ClipKind::Other;
+  DisplayItemClipChain* mNextClipChainToDestroy;
+#if defined(DEBUG) || defined(MOZ_DIAGNOSTIC_ASSERT_ENABLED)
+  bool mOnStack;
+#endif
+};
+
+struct DisplayItemClipChainHasher {
+  typedef const DisplayItemClipChain* Key;
+
+  std::size_t operator()(const Key& aKey) const {
+    return DisplayItemClipChain::Hash(aKey);
+  }
+};
+
+struct DisplayItemClipChainEqualer {
+  typedef const DisplayItemClipChain* Key;
+
+  bool operator()(const Key& lhs, const Key& rhs) const {
+    return DisplayItemClipChain::Equal(lhs, rhs);
+  }
+};
+
+}  
+
+#endif /* DISPLAYITEMCLIPCHAIN_H_ */

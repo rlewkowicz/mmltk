@@ -1,0 +1,12 @@
+
+[package]
+name = "plain"
+version = "0.2.3"
+authors = ["jzr"]
+description = "A small Rust library that allows users to reinterpret data of certain types safely."
+homepage = "https://github.com/randomites/plain"
+documentation = "https://docs.rs/plain"
+keywords = ["plain", "pod", "ffi", "memory"]
+categories = ["no-std", "data-structures", "parsing"]
+license = "MIT/Apache-2.0"
+repository = "https://github.com/randomites/plain"

@@ -1,0 +1,77 @@
+// Copyright 2008 Google Inc.  All rights reserved.
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
+
+
+#if !defined(GOOGLE_PROTOBUF_IO_ZERO_COPY_STREAM_H__)
+#define GOOGLE_PROTOBUF_IO_ZERO_COPY_STREAM_H__
+
+#include <cstdint>
+
+#include "absl/strings/cord.h"
+
+
+#include "google/protobuf/port_def.inc"
+
+namespace google {
+namespace protobuf {
+namespace io {
+
+class PROTOBUF_EXPORT PROTOBUF_FUTURE_ADD_EARLY_WARN_UNUSED
+    ZeroCopyInputStream {
+ public:
+  ZeroCopyInputStream() = default;
+  virtual ~ZeroCopyInputStream() = default;
+
+  ZeroCopyInputStream(const ZeroCopyInputStream&) = delete;
+  ZeroCopyInputStream& operator=(const ZeroCopyInputStream&) = delete;
+  ZeroCopyInputStream(ZeroCopyInputStream&&) = delete;
+  ZeroCopyInputStream& operator=(ZeroCopyInputStream&&) = delete;
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD virtual bool Next(const void** data,
+                                                        int* size) = 0;
+
+  virtual void BackUp(int count) = 0;
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD virtual bool Skip(int count) = 0;
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD virtual int64_t ByteCount() const = 0;
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD virtual bool ReadCord(absl::Cord* cord,
+                                                            int count);
+
+};
+
+class PROTOBUF_EXPORT PROTOBUF_FUTURE_ADD_EARLY_WARN_UNUSED
+    ZeroCopyOutputStream {
+ public:
+  ZeroCopyOutputStream() = default;
+  ZeroCopyOutputStream(const ZeroCopyOutputStream&) = delete;
+  ZeroCopyOutputStream& operator=(const ZeroCopyOutputStream&) = delete;
+  virtual ~ZeroCopyOutputStream() = default;
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD virtual bool Next(void** data,
+                                                        int* size) = 0;
+
+  virtual void BackUp(int count) = 0;
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD virtual int64_t ByteCount() const = 0;
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD virtual bool WriteAliasedRaw(
+      const void* data, int size);
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD virtual bool AllowsAliasing() const {
+    return false;
+  }
+
+  PROTOBUF_FUTURE_ADD_EARLY_NODISCARD virtual bool WriteCord(
+      const absl::Cord& cord);
+
+};
+
+}  
+}  
+}  
+
+#include "google/protobuf/port_undef.inc"
+
+#endif

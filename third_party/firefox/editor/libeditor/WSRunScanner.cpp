@@ -1,0 +1,979 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "WSRunScanner.h"
+
+#include "EditorDOMPoint.h"
+#include "ErrorList.h"
+#include "HTMLEditor.h"
+#include "HTMLEditUtils.h"
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Casting.h"  // for AssertedCast
+#include "mozilla/dom/Comment.h"
+
+#include "nsDebug.h"
+#include "nsError.h"
+#include "nsIContent.h"
+#include "nsIContentInlines.h"
+#include "nsRange.h"
+
+namespace mozilla {
+
+using namespace dom;
+
+
+void WSScanResult::AssertIfInvalidData(const WSRunScanner& aScanner) const {
+#ifdef DEBUG
+  MOZ_ASSERT(mReason == WSType::UnexpectedError ||
+             mReason == WSType::InUncomposedDoc ||
+             mReason == WSType::NonCollapsibleCharacters ||
+             mReason == WSType::CollapsibleWhiteSpaces ||
+             mReason == WSType::BRElement ||
+             mReason == WSType::PreformattedLineBreak ||
+             mReason == WSType::EmptyInlineContainerElement ||
+             mReason == WSType::SpecialContent ||
+             mReason == WSType::CurrentBlockBoundary ||
+             mReason == WSType::OtherBlockBoundary ||
+             mReason == WSType::InlineEditingHostBoundary);
+  MOZ_ASSERT_IF(mReason == WSType::UnexpectedError, !mContent);
+  MOZ_ASSERT_IF(mReason != WSType::UnexpectedError, mContent);
+  MOZ_ASSERT_IF(
+      mReason == WSType::InUncomposedDoc,
+      aScanner.ScanOptions().contains(WSRunScanner::Option::OnlyEditableNodes));
+  MOZ_ASSERT_IF(mReason == WSType::InUncomposedDoc,
+                !mContent->IsInComposedDoc());
+  MOZ_ASSERT_IF(mReason == WSType::NonCollapsibleCharacters ||
+                    mReason == WSType::CollapsibleWhiteSpaces ||
+                    mReason == WSType::PreformattedLineBreak,
+                mContent->IsText());
+  MOZ_ASSERT_IF(mReason == WSType::NonCollapsibleCharacters ||
+                    mReason == WSType::CollapsibleWhiteSpaces ||
+                    mReason == WSType::PreformattedLineBreak,
+                mOffset.isSome());
+  MOZ_ASSERT_IF(mReason == WSType::NonCollapsibleCharacters ||
+                    mReason == WSType::CollapsibleWhiteSpaces ||
+                    mReason == WSType::PreformattedLineBreak,
+                mContent->AsText()->TextDataLength() > 0);
+  MOZ_ASSERT_IF(mDirection == ScanDirection::Backward &&
+                    (mReason == WSType::NonCollapsibleCharacters ||
+                     mReason == WSType::CollapsibleWhiteSpaces ||
+                     mReason == WSType::PreformattedLineBreak),
+                *mOffset > 0);
+  MOZ_ASSERT_IF(mDirection == ScanDirection::Forward &&
+                    (mReason == WSType::NonCollapsibleCharacters ||
+                     mReason == WSType::CollapsibleWhiteSpaces ||
+                     mReason == WSType::PreformattedLineBreak),
+                *mOffset < mContent->AsText()->TextDataLength());
+  MOZ_ASSERT_IF(mReason == WSType::BRElement,
+                mContent->IsHTMLElement(nsGkAtoms::br));
+  MOZ_ASSERT_IF(mReason == WSType::PreformattedLineBreak,
+                EditorUtils::IsNewLinePreformatted(*mContent));
+  auto MaybeNonVoidEmptyInlineContainerElement = [&]() {
+    return HTMLEditUtils::IsInlineContent(
+               *mContent,
+               aScanner.ReferredHTMLDefaultStyle()
+                   ? BlockInlineCheck::UseHTMLDefaultStyle
+                   : BlockInlineCheck::UseComputedDisplayOutsideStyle) &&
+           HTMLEditUtils::IsContainerNode(*mContent) &&
+           !HTMLEditUtils::IsReplacedElement(*mContent->AsElement());
+  };
+  MOZ_ASSERT_IF(mReason == WSType::EmptyInlineContainerElement,
+                !mContent->GetShadowRootForSelection());
+  MOZ_ASSERT_IF(mReason == WSType::EmptyInlineContainerElement,
+                MaybeNonVoidEmptyInlineContainerElement());
+  MOZ_ASSERT_IF(
+      mReason == WSType::SpecialContent,
+      (mContent->IsComment() || mContent->IsProcessingInstruction()) ||
+          (mContent->IsText() && !mContent->IsEditable()) ||
+          mContent->GetShadowRootForSelection() ||
+          (mContent->IsElement() && !mContent->IsHTMLElement(nsGkAtoms::br) &&
+           !HTMLEditUtils::IsBlockElement(
+               *mContent,
+               aScanner.ReferredHTMLDefaultStyle()
+                   ? BlockInlineCheck::UseHTMLDefaultStyle
+                   : BlockInlineCheck::UseComputedDisplayOutsideStyle) &&
+           !(mContent->IsEditable() &&
+             MaybeNonVoidEmptyInlineContainerElement())));
+  MOZ_ASSERT_IF(mReason == WSType::OtherBlockBoundary,
+                !mContent->GetShadowRootForSelection());
+  MOZ_ASSERT_IF(
+      mReason == WSType::OtherBlockBoundary,
+      HTMLEditUtils::IsBlockElement(
+          *mContent, aScanner.ReferredHTMLDefaultStyle()
+                         ? BlockInlineCheck::UseHTMLDefaultStyle
+                         : BlockInlineCheck::UseComputedDisplayOutsideStyle));
+  MOZ_ASSERT_IF(mReason == WSType::CurrentBlockBoundary, mContent->IsElement());
+  MOZ_ASSERT_IF(mReason == WSType::CurrentBlockBoundary &&
+                    aScanner.ScanOptions().contains(
+                        WSRunScanner::Option::OnlyEditableNodes),
+                mContent->IsEditable());
+  MOZ_ASSERT_IF(
+      mReason == WSType::CurrentBlockBoundary,
+      HTMLEditUtils::IsBlockElement(
+          *mContent, aScanner.ReferredHTMLDefaultStyle()
+                         ? BlockInlineCheck::UseHTMLDefaultStyle
+                         : BlockInlineCheck::UseComputedDisplayStyle));
+  MOZ_ASSERT_IF(mReason == WSType::InlineEditingHostBoundary,
+                mContent->IsElement());
+  MOZ_ASSERT_IF(mReason == WSType::InlineEditingHostBoundary &&
+                    aScanner.ScanOptions().contains(
+                        WSRunScanner::Option::OnlyEditableNodes),
+                mContent->IsEditable());
+  MOZ_ASSERT_IF(
+      mReason == WSType::InlineEditingHostBoundary,
+      !HTMLEditUtils::IsBlockElement(
+          *mContent, aScanner.ReferredHTMLDefaultStyle()
+                         ? BlockInlineCheck::UseHTMLDefaultStyle
+                         : BlockInlineCheck::UseComputedDisplayStyle));
+  MOZ_ASSERT_IF(mReason == WSType::InlineEditingHostBoundary,
+                !mContent->GetParentElement() ||
+                    !mContent->GetParentElement()->IsEditable());
+#endif  // #ifdef DEBUG
+}
+
+
+template WSScanResult WSRunScanner::ScanPreviousVisibleNodeOrBlockBoundaryFrom(
+    const EditorDOMPoint& aPoint) const;
+template WSScanResult WSRunScanner::ScanPreviousVisibleNodeOrBlockBoundaryFrom(
+    const EditorRawDOMPoint& aPoint) const;
+template WSScanResult WSRunScanner::ScanPreviousVisibleNodeOrBlockBoundaryFrom(
+    const EditorDOMPointInText& aPoint) const;
+template WSScanResult WSRunScanner::ScanPreviousVisibleNodeOrBlockBoundaryFrom(
+    const EditorRawDOMPointInText& aPoint) const;
+template WSScanResult
+WSRunScanner::ScanInclusiveNextVisibleNodeOrBlockBoundaryFrom(
+    const EditorDOMPoint& aPoint) const;
+template WSScanResult
+WSRunScanner::ScanInclusiveNextVisibleNodeOrBlockBoundaryFrom(
+    const EditorRawDOMPoint& aPoint) const;
+template WSScanResult
+WSRunScanner::ScanInclusiveNextVisibleNodeOrBlockBoundaryFrom(
+    const EditorDOMPointInText& aPoint) const;
+template WSScanResult
+WSRunScanner::ScanInclusiveNextVisibleNodeOrBlockBoundaryFrom(
+    const EditorRawDOMPointInText& aPoint) const;
+template EditorDOMPoint WSRunScanner::GetAfterLastVisiblePoint(Options, Text&,
+                                                               const Element*);
+template EditorRawDOMPoint WSRunScanner::GetAfterLastVisiblePoint(
+    Options, Text&, const Element*);
+template EditorDOMPoint WSRunScanner::GetFirstVisiblePoint(Options, Text&,
+                                                           const Element*);
+template EditorRawDOMPoint WSRunScanner::GetFirstVisiblePoint(Options, Text&,
+                                                              const Element*);
+
+template <typename PT, typename CT>
+WSScanResult WSRunScanner::ScanPreviousVisibleNodeOrBlockBoundaryFrom(
+    const EditorDOMPointBase<PT, CT>& aPoint) const {
+  MOZ_ASSERT(aPoint.IsSet());
+  const bool onlyEditableNodes =
+      ScanOptions().contains(Option::OnlyEditableNodes);
+  MOZ_ASSERT_IF(onlyEditableNodes, aPoint.IsInComposedDoc());
+
+  if (MOZ_UNLIKELY(!aPoint.IsSet())) {
+    return WSScanResult::Error();
+  }
+
+  if (onlyEditableNodes && !aPoint.IsInComposedDoc()) [[unlikely]] {
+    return WSScanResult(*this, WSScanResult::ScanDirection::Backward,
+                        *aPoint.template ContainerAs<nsIContent>(),
+                        WSType::InUncomposedDoc);
+  }
+
+  if (!TextFragmentDataAtStartRef().IsInitialized()) {
+    return WSScanResult::Error();
+  }
+
+  const VisibleWhiteSpacesData& visibleWhiteSpaces =
+      TextFragmentDataAtStartRef().VisibleWhiteSpacesDataRef();
+  if (visibleWhiteSpaces.IsInitialized() &&
+      visibleWhiteSpaces.StartRef().IsBefore(aPoint)) {
+    if (onlyEditableNodes && aPoint.GetChild() &&
+        !HTMLEditUtils::IsSimplyEditableNode((*aPoint.GetChild()))) {
+      return WSScanResult(*this, WSScanResult::ScanDirection::Backward,
+                          *aPoint.GetChild(), WSType::SpecialContent);
+    }
+    const auto atPreviousChar =
+        GetPreviousCharPoint<EditorRawDOMPointInText>(aPoint);
+    if (atPreviousChar.IsSet() && !atPreviousChar.IsContainerEmpty()) {
+      MOZ_ASSERT(!atPreviousChar.IsEndOfContainer());
+      return WSScanResult(*this, WSScanResult::ScanDirection::Backward,
+                          atPreviousChar.template NextPoint<EditorDOMPoint>(),
+                          atPreviousChar.IsCharCollapsibleASCIISpaceOrNBSP()
+                              ? WSType::CollapsibleWhiteSpaces
+                          : atPreviousChar.IsCharPreformattedNewLine()
+                              ? WSType::PreformattedLineBreak
+                              : WSType::NonCollapsibleCharacters);
+    }
+  }
+
+  if (NS_WARN_IF(TextFragmentDataAtStartRef().StartRawReason() ==
+                 WSType::UnexpectedError)) {
+    return WSScanResult::Error();
+  }
+
+  MOZ_ASSERT_IF(!ScanOptions().contains(Option::StopAtComment),
+                !Comment::FromNodeOrNull(
+                    TextFragmentDataAtStartRef().GetStartReasonContent()));
+  switch (TextFragmentDataAtStartRef().StartRawReason()) {
+    case WSType::CollapsibleWhiteSpaces:
+    case WSType::NonCollapsibleCharacters:
+    case WSType::PreformattedLineBreak:
+      MOZ_ASSERT(TextFragmentDataAtStartRef().StartRef().IsSet());
+      return WSScanResult(*this, WSScanResult::ScanDirection::Backward,
+                          TextFragmentDataAtStartRef().StartRef(),
+                          TextFragmentDataAtStartRef().StartRawReason());
+    default:
+      break;
+  }
+
+  if (TextFragmentDataAtStartRef().GetStartReasonContent() !=
+      TextFragmentDataAtStartRef().StartRef().GetContainer()) {
+    if (NS_WARN_IF(!TextFragmentDataAtStartRef().GetStartReasonContent())) {
+      return WSScanResult::Error();
+    }
+    return WSScanResult(*this, WSScanResult::ScanDirection::Backward,
+                        *TextFragmentDataAtStartRef().GetStartReasonContent(),
+                        TextFragmentDataAtStartRef().StartRawReason());
+  }
+  if (NS_WARN_IF(!TextFragmentDataAtStartRef().StartRef().IsSet())) {
+    return WSScanResult::Error();
+  }
+  return WSScanResult(*this, WSScanResult::ScanDirection::Backward,
+                      TextFragmentDataAtStartRef().StartRef(),
+                      TextFragmentDataAtStartRef().StartRawReason());
+}
+
+template <typename PT, typename CT>
+WSScanResult WSRunScanner::ScanInclusiveNextVisibleNodeOrBlockBoundaryFrom(
+    const EditorDOMPointBase<PT, CT>& aPoint) const {
+  MOZ_ASSERT(aPoint.IsSet());
+  const bool onlyEditableNodes =
+      ScanOptions().contains(Option::OnlyEditableNodes);
+  MOZ_ASSERT_IF(onlyEditableNodes, aPoint.IsInComposedDoc());
+
+  if (MOZ_UNLIKELY(!aPoint.IsSet())) {
+    return WSScanResult::Error();
+  }
+
+  if (onlyEditableNodes && !aPoint.IsInComposedDoc()) [[unlikely]] {
+    return WSScanResult(*this, WSScanResult::ScanDirection::Forward,
+                        *aPoint.template ContainerAs<nsIContent>(),
+                        WSType::InUncomposedDoc);
+  }
+
+  if (!TextFragmentDataAtStartRef().IsInitialized()) {
+    return WSScanResult::Error();
+  }
+
+  const VisibleWhiteSpacesData& visibleWhiteSpaces =
+      TextFragmentDataAtStartRef().VisibleWhiteSpacesDataRef();
+  if (visibleWhiteSpaces.IsInitialized() &&
+      aPoint.EqualsOrIsBefore(visibleWhiteSpaces.EndRef())) {
+    if (onlyEditableNodes && aPoint.GetChild() &&
+        !HTMLEditUtils::IsSimplyEditableNode(*aPoint.GetChild())) {
+      return WSScanResult(*this, WSScanResult::ScanDirection::Forward,
+                          *aPoint.GetChild(), WSType::SpecialContent);
+    }
+    const auto atNextChar = GetInclusiveNextCharPoint<EditorDOMPoint>(aPoint);
+    if (atNextChar.IsSet() && !atNextChar.IsContainerEmpty()) {
+      return WSScanResult(*this, WSScanResult::ScanDirection::Forward,
+                          atNextChar,
+                          !atNextChar.IsEndOfContainer() &&
+                                  atNextChar.IsCharCollapsibleASCIISpaceOrNBSP()
+                              ? WSType::CollapsibleWhiteSpaces
+                          : !atNextChar.IsEndOfContainer() &&
+                                  atNextChar.IsCharPreformattedNewLine()
+                              ? WSType::PreformattedLineBreak
+                              : WSType::NonCollapsibleCharacters);
+    }
+  }
+
+  if (NS_WARN_IF(TextFragmentDataAtStartRef().EndRawReason() ==
+                 WSType::UnexpectedError)) {
+    return WSScanResult::Error();
+  }
+
+  MOZ_ASSERT_IF(!ScanOptions().contains(Option::StopAtComment),
+                !Comment::FromNodeOrNull(
+                    TextFragmentDataAtStartRef().GetEndReasonContent()));
+  switch (TextFragmentDataAtStartRef().EndRawReason()) {
+    case WSType::CollapsibleWhiteSpaces:
+    case WSType::NonCollapsibleCharacters:
+    case WSType::PreformattedLineBreak:
+      MOZ_ASSERT(TextFragmentDataAtStartRef().StartRef().IsSet());
+      return WSScanResult(*this, WSScanResult::ScanDirection::Forward,
+                          TextFragmentDataAtStartRef().EndRef(),
+                          TextFragmentDataAtStartRef().EndRawReason());
+    default:
+      break;
+  }
+
+  if (TextFragmentDataAtStartRef().GetEndReasonContent() !=
+      TextFragmentDataAtStartRef().EndRef().GetContainer()) {
+    if (NS_WARN_IF(!TextFragmentDataAtStartRef().GetEndReasonContent())) {
+      return WSScanResult::Error();
+    }
+    return WSScanResult(*this, WSScanResult::ScanDirection::Forward,
+                        *TextFragmentDataAtStartRef().GetEndReasonContent(),
+                        TextFragmentDataAtStartRef().EndRawReason());
+  }
+  if (NS_WARN_IF(!TextFragmentDataAtStartRef().EndRef().IsSet())) {
+    return WSScanResult::Error();
+  }
+  return WSScanResult(*this, WSScanResult::ScanDirection::Forward,
+                      TextFragmentDataAtStartRef().EndRef(),
+                      TextFragmentDataAtStartRef().EndRawReason());
+}
+
+template <typename EditorDOMPointType>
+EditorDOMPointType WSRunScanner::GetAfterLastVisiblePoint(
+    Options aOptions,  // NOLINT(performance-unnecessary-value-param)
+    Text& aTextNode, const Element* aAncestorLimiter ) {
+  MOZ_ASSERT(!aOptions.contains(Option::ReferHTMLDefaultStyle));
+
+  EditorDOMPoint atLastCharOfTextNode(
+      &aTextNode, AssertedCast<uint32_t>(std::max<int64_t>(
+                      static_cast<int64_t>(aTextNode.Length()) - 1, 0)));
+  if (!atLastCharOfTextNode.IsContainerEmpty() &&
+      !atLastCharOfTextNode.IsCharCollapsibleASCIISpace()) {
+    return EditorDOMPointType::AtEndOf(aTextNode);
+  }
+  const TextFragmentData textFragmentData(aOptions, atLastCharOfTextNode,
+                                          aAncestorLimiter);
+  if (NS_WARN_IF(!textFragmentData.IsInitialized())) {
+    return EditorDOMPointType();  
+  }
+  const EditorDOMRange& invisibleWhiteSpaceRange =
+      textFragmentData.InvisibleTrailingWhiteSpaceRangeRef();
+  if (!invisibleWhiteSpaceRange.IsPositioned() ||
+      invisibleWhiteSpaceRange.Collapsed()) {
+    return EditorDOMPointType::AtEndOf(aTextNode);
+  }
+  return invisibleWhiteSpaceRange.StartRef().To<EditorDOMPointType>();
+}
+
+template <typename EditorDOMPointType>
+EditorDOMPointType WSRunScanner::GetFirstVisiblePoint(
+    Options aOptions,  // NOLINT(performance-unnecessary-value-param)
+    Text& aTextNode, const Element* aAncestorLimiter ) {
+  MOZ_ASSERT(!aOptions.contains(Option::ReferHTMLDefaultStyle));
+
+  EditorDOMPoint atStartOfTextNode(&aTextNode, 0);
+  if (!atStartOfTextNode.IsContainerEmpty() &&
+      !atStartOfTextNode.IsCharCollapsibleASCIISpace()) {
+    return atStartOfTextNode.To<EditorDOMPointType>();
+  }
+  const TextFragmentData textFragmentData(aOptions, atStartOfTextNode,
+                                          aAncestorLimiter);
+  if (NS_WARN_IF(!textFragmentData.IsInitialized())) {
+    return EditorDOMPointType();  
+  }
+  const EditorDOMRange& invisibleWhiteSpaceRange =
+      textFragmentData.InvisibleLeadingWhiteSpaceRangeRef();
+  if (!invisibleWhiteSpaceRange.IsPositioned() ||
+      invisibleWhiteSpaceRange.Collapsed()) {
+    return atStartOfTextNode.To<EditorDOMPointType>();
+  }
+  return invisibleWhiteSpaceRange.EndRef().To<EditorDOMPointType>();
+}
+
+
+EditorDOMRangeInTexts
+WSRunScanner::ComputeRangeInTextNodesContainingInvisibleWhiteSpaces(
+    const TextFragmentData& aStart, const TextFragmentData& aEnd) {
+  MOZ_ASSERT(aStart.ScanOptions() == aEnd.ScanOptions());
+
+
+  MOZ_ASSERT(aStart.ScanStartRef().IsSetAndValid());
+  MOZ_ASSERT(aEnd.ScanStartRef().IsSetAndValid());
+  MOZ_ASSERT(aStart.ScanStartRef().EqualsOrIsBefore(aEnd.ScanStartRef()));
+  MOZ_ASSERT(aStart.ScanStartRef().IsInTextNode());
+  MOZ_ASSERT(aEnd.ScanStartRef().IsInTextNode());
+
+
+  const EditorDOMRange& invisibleLeadingWhiteSpaceRange =
+      aStart.InvisibleLeadingWhiteSpaceRangeRef();
+  const EditorDOMRange& invisibleTrailingWhiteSpaceRange =
+      aEnd.InvisibleTrailingWhiteSpaceRangeRef();
+  const bool hasInvisibleLeadingWhiteSpaces =
+      invisibleLeadingWhiteSpaceRange.IsPositioned() &&
+      !invisibleLeadingWhiteSpaceRange.Collapsed();
+  const bool hasInvisibleTrailingWhiteSpaces =
+      invisibleLeadingWhiteSpaceRange != invisibleTrailingWhiteSpaceRange &&
+      invisibleTrailingWhiteSpaceRange.IsPositioned() &&
+      !invisibleTrailingWhiteSpaceRange.Collapsed();
+
+  EditorDOMRangeInTexts result(aStart.ScanStartRef().AsInText(),
+                               aEnd.ScanStartRef().AsInText());
+  MOZ_ASSERT(result.IsPositionedAndValid());
+  if (!hasInvisibleLeadingWhiteSpaces && !hasInvisibleTrailingWhiteSpaces) {
+    return result;
+  }
+
+  MOZ_ASSERT_IF(
+      hasInvisibleLeadingWhiteSpaces && hasInvisibleTrailingWhiteSpaces,
+      invisibleLeadingWhiteSpaceRange.StartRef().IsBefore(
+          invisibleTrailingWhiteSpaceRange.StartRef()));
+  const EditorDOMPoint& aroundFirstInvisibleWhiteSpace =
+      hasInvisibleLeadingWhiteSpaces
+          ? invisibleLeadingWhiteSpaceRange.StartRef()
+          : invisibleTrailingWhiteSpaceRange.StartRef();
+  if (aroundFirstInvisibleWhiteSpace.IsBefore(result.StartRef())) {
+    if (aroundFirstInvisibleWhiteSpace.IsInTextNode()) {
+      result.SetStart(aroundFirstInvisibleWhiteSpace.AsInText());
+      MOZ_ASSERT(result.IsPositionedAndValid());
+    } else {
+      const auto atFirstInvisibleWhiteSpace =
+          hasInvisibleLeadingWhiteSpaces
+              ? aStart.GetInclusiveNextCharPoint<EditorDOMPointInText>(
+                    aroundFirstInvisibleWhiteSpace,
+                    ShouldIgnoreNonEditableSiblingsOrDescendants(
+                        aStart.ScanOptions()))
+              : aEnd.GetInclusiveNextCharPoint<EditorDOMPointInText>(
+                    aroundFirstInvisibleWhiteSpace,
+                    ShouldIgnoreNonEditableSiblingsOrDescendants(
+                        aEnd.ScanOptions()));
+      MOZ_ASSERT(atFirstInvisibleWhiteSpace.IsSet());
+      MOZ_ASSERT(
+          atFirstInvisibleWhiteSpace.EqualsOrIsBefore(result.StartRef()));
+      result.SetStart(atFirstInvisibleWhiteSpace);
+      MOZ_ASSERT(result.IsPositionedAndValid());
+    }
+  }
+  MOZ_ASSERT_IF(
+      hasInvisibleLeadingWhiteSpaces && hasInvisibleTrailingWhiteSpaces,
+      invisibleLeadingWhiteSpaceRange.EndRef().IsBefore(
+          invisibleTrailingWhiteSpaceRange.EndRef()));
+  const EditorDOMPoint& afterLastInvisibleWhiteSpace =
+      hasInvisibleTrailingWhiteSpaces
+          ? invisibleTrailingWhiteSpaceRange.EndRef()
+          : invisibleLeadingWhiteSpaceRange.EndRef();
+  if (afterLastInvisibleWhiteSpace.EqualsOrIsBefore(result.EndRef())) {
+    MOZ_ASSERT(result.IsPositionedAndValid());
+    return result;
+  }
+  if (afterLastInvisibleWhiteSpace.IsInTextNode()) {
+    result.SetEnd(afterLastInvisibleWhiteSpace.AsInText());
+    MOZ_ASSERT(result.IsPositionedAndValid());
+    return result;
+  }
+  const auto atLastInvisibleWhiteSpace =
+      hasInvisibleTrailingWhiteSpaces
+          ? aEnd.GetPreviousCharPoint<EditorDOMPointInText>(
+                afterLastInvisibleWhiteSpace,
+                ShouldIgnoreNonEditableSiblingsOrDescendants(
+                    aEnd.ScanOptions()))
+          : aStart.GetPreviousCharPoint<EditorDOMPointInText>(
+                afterLastInvisibleWhiteSpace,
+                ShouldIgnoreNonEditableSiblingsOrDescendants(
+                    aStart.ScanOptions()));
+  MOZ_ASSERT(atLastInvisibleWhiteSpace.IsSet());
+  MOZ_ASSERT(atLastInvisibleWhiteSpace.IsContainerEmpty() ||
+             atLastInvisibleWhiteSpace.IsAtLastContent());
+  MOZ_ASSERT(result.EndRef().EqualsOrIsBefore(atLastInvisibleWhiteSpace));
+  result.SetEnd(atLastInvisibleWhiteSpace.IsEndOfContainer()
+                    ? atLastInvisibleWhiteSpace
+                    : atLastInvisibleWhiteSpace.NextPoint());
+  MOZ_ASSERT(result.IsPositionedAndValid());
+  return result;
+}
+
+Result<EditorDOMRangeInTexts, nsresult>
+WSRunScanner::GetRangeInTextNodesToBackspaceFrom(
+    Options aOptions,  // NOLINT(performance-unnecessary-value-param)
+    const EditorDOMPoint& aPoint,
+    const Element* aAncestorLimiter ) {
+  MOZ_ASSERT(aPoint.IsSetAndValid());
+  MOZ_ASSERT(!aOptions.contains(Option::ReferHTMLDefaultStyle));
+
+  const TextFragmentData textFragmentDataAtCaret(aOptions, aPoint,
+                                                 aAncestorLimiter);
+  if (NS_WARN_IF(!textFragmentDataAtCaret.IsInitialized())) {
+    return Err(NS_ERROR_FAILURE);
+  }
+  auto atPreviousChar =
+      textFragmentDataAtCaret.GetPreviousCharPoint<EditorDOMPointInText>(
+          aPoint, ShouldIgnoreNonEditableSiblingsOrDescendants(aOptions));
+  if (!atPreviousChar.IsSet()) {
+    return EditorDOMRangeInTexts();  
+  }
+
+  if (atPreviousChar.IsEndOfContainer()) {
+    return EditorDOMRangeInTexts();
+  }
+
+  EditorDOMPointInText atNextChar = atPreviousChar.NextPoint();
+  if (!atPreviousChar.IsStartOfContainer()) {
+    if (atPreviousChar.IsCharLowSurrogateFollowingHighSurrogate()) {
+      atPreviousChar = atPreviousChar.PreviousPoint();
+    }
+    else if (atPreviousChar.IsCharHighSurrogateFollowedByLowSurrogate()) {
+      atNextChar = atNextChar.NextPoint();
+    }
+  }
+
+  EditorDOMRangeInTexts rangeToDelete;
+  if (atPreviousChar.IsCharCollapsibleASCIISpace() ||
+      atPreviousChar.IsCharPreformattedNewLineCollapsedWithWhiteSpaces()) {
+    const auto startToDelete =
+        textFragmentDataAtCaret
+            .GetFirstASCIIWhiteSpacePointCollapsedTo<EditorDOMPointInText>(
+                atPreviousChar, nsIEditor::ePrevious,
+                ShouldIgnoreNonEditableSiblingsOrDescendants(aOptions));
+    if (!startToDelete.IsSet()) {
+      NS_WARNING(
+          "WSRunScanner::GetFirstASCIIWhiteSpacePointCollapsedTo() failed");
+      return Err(NS_ERROR_FAILURE);
+    }
+    const auto endToDelete =
+        textFragmentDataAtCaret
+            .GetEndOfCollapsibleASCIIWhiteSpaces<EditorDOMPointInText>(
+                atPreviousChar, nsIEditor::ePrevious,
+                ShouldIgnoreNonEditableSiblingsOrDescendants(aOptions));
+    if (!endToDelete.IsSet()) {
+      NS_WARNING("WSRunScanner::GetEndOfCollapsibleASCIIWhiteSpaces() failed");
+      return Err(NS_ERROR_FAILURE);
+    }
+    rangeToDelete = EditorDOMRangeInTexts(startToDelete, endToDelete);
+  }
+  else {
+    rangeToDelete = EditorDOMRangeInTexts(atPreviousChar, atNextChar);
+  }
+
+  if (rangeToDelete.Collapsed()) {
+    return EditorDOMRangeInTexts();
+  }
+
+  const TextFragmentData textFragmentDataAtStart =
+      rangeToDelete.StartRef() != aPoint
+          ? TextFragmentData(aOptions, rangeToDelete.StartRef(),
+                             aAncestorLimiter)
+          : textFragmentDataAtCaret;
+  const TextFragmentData textFragmentDataAtEnd =
+      rangeToDelete.EndRef() != aPoint
+          ? TextFragmentData(aOptions, rangeToDelete.EndRef(), aAncestorLimiter)
+          : textFragmentDataAtCaret;
+  if (NS_WARN_IF(!textFragmentDataAtStart.IsInitialized()) ||
+      NS_WARN_IF(!textFragmentDataAtEnd.IsInitialized())) {
+    return Err(NS_ERROR_FAILURE);
+  }
+  EditorDOMRangeInTexts extendedRangeToDelete =
+      WSRunScanner::ComputeRangeInTextNodesContainingInvisibleWhiteSpaces(
+          textFragmentDataAtStart, textFragmentDataAtEnd);
+  MOZ_ASSERT(extendedRangeToDelete.IsPositionedAndValid());
+  return extendedRangeToDelete.IsPositioned() ? extendedRangeToDelete
+                                              : rangeToDelete;
+}
+
+Result<EditorDOMRangeInTexts, nsresult>
+WSRunScanner::GetRangeInTextNodesToForwardDeleteFrom(
+    Options aOptions,  // NOLINT(performance-unnecessary-value-param)
+    const EditorDOMPoint& aPoint,
+    const Element* aAncestorLimiter ) {
+  MOZ_ASSERT(aPoint.IsSetAndValid());
+  MOZ_ASSERT(!aOptions.contains(Option::ReferHTMLDefaultStyle));
+
+  const TextFragmentData textFragmentDataAtCaret(aOptions, aPoint,
+                                                 aAncestorLimiter);
+  if (NS_WARN_IF(!textFragmentDataAtCaret.IsInitialized())) {
+    return Err(NS_ERROR_FAILURE);
+  }
+  auto atCaret =
+      textFragmentDataAtCaret.GetInclusiveNextCharPoint<EditorDOMPointInText>(
+          aPoint, ShouldIgnoreNonEditableSiblingsOrDescendants(aOptions));
+  if (!atCaret.IsSet()) {
+    return EditorDOMRangeInTexts();  
+  }
+  if (!atCaret.IsEndOfContainer() &&
+      atCaret.IsCharLowSurrogateFollowingHighSurrogate()) {
+    atCaret = atCaret.NextPoint();
+  }
+
+  if (atCaret.IsEndOfContainer()) {
+    return EditorDOMRangeInTexts();
+  }
+
+  EditorDOMPointInText atNextChar = atCaret.NextPoint();
+  if (atCaret.IsCharHighSurrogateFollowedByLowSurrogate()) {
+    atNextChar = atNextChar.NextPoint();
+  }
+
+  EditorDOMRangeInTexts rangeToDelete;
+  if (atCaret.IsCharCollapsibleASCIISpace() ||
+      atCaret.IsCharPreformattedNewLineCollapsedWithWhiteSpaces()) {
+    const auto startToDelete =
+        textFragmentDataAtCaret
+            .GetFirstASCIIWhiteSpacePointCollapsedTo<EditorDOMPointInText>(
+                atCaret, nsIEditor::eNext,
+                ShouldIgnoreNonEditableSiblingsOrDescendants(aOptions));
+    if (!startToDelete.IsSet()) {
+      NS_WARNING(
+          "WSRunScanner::GetFirstASCIIWhiteSpacePointCollapsedTo() failed");
+      return Err(NS_ERROR_FAILURE);
+    }
+    const EditorDOMPointInText endToDelete =
+        textFragmentDataAtCaret
+            .GetEndOfCollapsibleASCIIWhiteSpaces<EditorDOMPointInText>(
+                atCaret, nsIEditor::eNext,
+                ShouldIgnoreNonEditableSiblingsOrDescendants(aOptions));
+    if (!endToDelete.IsSet()) {
+      NS_WARNING("WSRunScanner::GetEndOfCollapsibleASCIIWhiteSpaces() failed");
+      return Err(NS_ERROR_FAILURE);
+    }
+    rangeToDelete = EditorDOMRangeInTexts(startToDelete, endToDelete);
+  }
+  else {
+    rangeToDelete = EditorDOMRangeInTexts(atCaret, atNextChar);
+  }
+
+  if (rangeToDelete.Collapsed()) {
+    return EditorDOMRangeInTexts();
+  }
+
+  const TextFragmentData textFragmentDataAtStart =
+      rangeToDelete.StartRef() != aPoint
+          ? TextFragmentData(aOptions, rangeToDelete.StartRef(),
+                             aAncestorLimiter)
+          : textFragmentDataAtCaret;
+  const TextFragmentData textFragmentDataAtEnd =
+      rangeToDelete.EndRef() != aPoint
+          ? TextFragmentData(aOptions, rangeToDelete.EndRef(), aAncestorLimiter)
+          : textFragmentDataAtCaret;
+  if (NS_WARN_IF(!textFragmentDataAtStart.IsInitialized()) ||
+      NS_WARN_IF(!textFragmentDataAtEnd.IsInitialized())) {
+    return Err(NS_ERROR_FAILURE);
+  }
+  EditorDOMRangeInTexts extendedRangeToDelete =
+      WSRunScanner::ComputeRangeInTextNodesContainingInvisibleWhiteSpaces(
+          textFragmentDataAtStart, textFragmentDataAtEnd);
+  MOZ_ASSERT(extendedRangeToDelete.IsPositionedAndValid());
+  return extendedRangeToDelete.IsPositioned() ? extendedRangeToDelete
+                                              : rangeToDelete;
+}
+
+EditorDOMRange WSRunScanner::GetRangesForDeletingAtomicContent(
+    Options aOptions,  // NOLINT(performance-unnecessary-value-param)
+    const nsIContent& aAtomicContent,
+    const Element* aAncestorLimiter ) {
+  MOZ_ASSERT(!aOptions.contains(Option::ReferHTMLDefaultStyle));
+
+  if (aAtomicContent.IsHTMLElement(nsGkAtoms::br)) {
+    const TextFragmentData textFragmentDataAfterBRElement(
+        aOptions, EditorDOMPoint::After(aAtomicContent), aAncestorLimiter);
+    if (NS_WARN_IF(!textFragmentDataAfterBRElement.IsInitialized())) {
+      return EditorDOMRange();  
+    }
+    const EditorDOMRangeInTexts followingInvisibleWhiteSpaces =
+        textFragmentDataAfterBRElement.GetNonCollapsedRangeInTexts(
+            textFragmentDataAfterBRElement
+                .InvisibleLeadingWhiteSpaceRangeRef());
+    return followingInvisibleWhiteSpaces.IsPositioned() &&
+                   !followingInvisibleWhiteSpaces.Collapsed()
+               ? EditorDOMRange(
+                     EditorDOMPoint(const_cast<nsIContent*>(&aAtomicContent)),
+                     followingInvisibleWhiteSpaces.EndRef())
+               : EditorDOMRange(
+                     EditorDOMPoint(const_cast<nsIContent*>(&aAtomicContent)),
+                     EditorDOMPoint::After(aAtomicContent));
+  }
+
+  if (!HTMLEditUtils::IsBlockElement(
+          aAtomicContent, BlockInlineCheck::UseComputedDisplayOutsideStyle)) {
+    return EditorDOMRange(
+        EditorDOMPoint(const_cast<nsIContent*>(&aAtomicContent)),
+        EditorDOMPoint::After(aAtomicContent));
+  }
+
+  const TextFragmentData textFragmentDataBeforeAtomicContent(
+      aOptions, EditorDOMPoint(const_cast<nsIContent*>(&aAtomicContent)),
+      aAncestorLimiter);
+  if (NS_WARN_IF(!textFragmentDataBeforeAtomicContent.IsInitialized())) {
+    return EditorDOMRange();  
+  }
+  const EditorDOMRangeInTexts precedingInvisibleWhiteSpaces =
+      textFragmentDataBeforeAtomicContent.GetNonCollapsedRangeInTexts(
+          textFragmentDataBeforeAtomicContent
+              .InvisibleTrailingWhiteSpaceRangeRef());
+  const TextFragmentData textFragmentDataAfterAtomicContent(
+      aOptions, EditorDOMPoint::After(aAtomicContent), aAncestorLimiter);
+  if (NS_WARN_IF(!textFragmentDataAfterAtomicContent.IsInitialized())) {
+    return EditorDOMRange();  
+  }
+  const EditorDOMRangeInTexts followingInvisibleWhiteSpaces =
+      textFragmentDataAfterAtomicContent.GetNonCollapsedRangeInTexts(
+          textFragmentDataAfterAtomicContent
+              .InvisibleLeadingWhiteSpaceRangeRef());
+  if (precedingInvisibleWhiteSpaces.StartRef().IsSet() &&
+      followingInvisibleWhiteSpaces.EndRef().IsSet()) {
+    return EditorDOMRange(precedingInvisibleWhiteSpaces.StartRef(),
+                          followingInvisibleWhiteSpaces.EndRef());
+  }
+  if (precedingInvisibleWhiteSpaces.StartRef().IsSet()) {
+    return EditorDOMRange(precedingInvisibleWhiteSpaces.StartRef(),
+                          EditorDOMPoint::After(aAtomicContent));
+  }
+  if (followingInvisibleWhiteSpaces.EndRef().IsSet()) {
+    return EditorDOMRange(
+        EditorDOMPoint(const_cast<nsIContent*>(&aAtomicContent)),
+        followingInvisibleWhiteSpaces.EndRef());
+  }
+  return EditorDOMRange(
+      EditorDOMPoint(const_cast<nsIContent*>(&aAtomicContent)),
+      EditorDOMPoint::After(aAtomicContent));
+}
+
+EditorDOMRange WSRunScanner::GetRangeForDeletingBlockElementBoundaries(
+    Options aOptions,  // NOLINT(performance-unnecessary-value-param)
+    const Element& aLeftBlockElement, const Element& aRightBlockElement,
+    const EditorDOMPoint& aPointContainingTheOtherBlock,
+    const Element* aAncestorLimiter ) {
+  MOZ_ASSERT(&aLeftBlockElement != &aRightBlockElement);
+  MOZ_ASSERT_IF(
+      aPointContainingTheOtherBlock.IsSet(),
+      aPointContainingTheOtherBlock.GetContainer() == &aLeftBlockElement ||
+          aPointContainingTheOtherBlock.GetContainer() == &aRightBlockElement);
+  MOZ_ASSERT_IF(
+      aPointContainingTheOtherBlock.GetContainer() == &aLeftBlockElement,
+      aRightBlockElement.IsInclusiveDescendantOf(
+          aPointContainingTheOtherBlock.GetChild()));
+  MOZ_ASSERT_IF(
+      aPointContainingTheOtherBlock.GetContainer() == &aRightBlockElement,
+      aLeftBlockElement.IsInclusiveDescendantOf(
+          aPointContainingTheOtherBlock.GetChild()));
+  MOZ_ASSERT_IF(
+      !aPointContainingTheOtherBlock.IsSet(),
+      !aRightBlockElement.IsInclusiveDescendantOf(&aLeftBlockElement));
+  MOZ_ASSERT_IF(
+      !aPointContainingTheOtherBlock.IsSet(),
+      !aLeftBlockElement.IsInclusiveDescendantOf(&aRightBlockElement));
+  MOZ_ASSERT_IF(!aPointContainingTheOtherBlock.IsSet(),
+                EditorRawDOMPoint(const_cast<Element*>(&aLeftBlockElement))
+                    .IsBefore(EditorRawDOMPoint(
+                        const_cast<Element*>(&aRightBlockElement))));
+  MOZ_ASSERT_IF(aAncestorLimiter,
+                aLeftBlockElement.IsInclusiveDescendantOf(aAncestorLimiter));
+  MOZ_ASSERT_IF(aAncestorLimiter,
+                aRightBlockElement.IsInclusiveDescendantOf(aAncestorLimiter));
+  MOZ_ASSERT_IF(aOptions.contains(Option::OnlyEditableNodes),
+                const_cast<Element&>(aLeftBlockElement).GetEditingHost() ==
+                    const_cast<Element&>(aRightBlockElement).GetEditingHost());
+  MOZ_ASSERT(!aOptions.contains(Option::ReferHTMLDefaultStyle));
+
+  EditorDOMRange range;
+  const TextFragmentData textFragmentDataAtEndOfLeftBlockElement(
+      aOptions,
+      aPointContainingTheOtherBlock.GetContainer() == &aLeftBlockElement
+          ? aPointContainingTheOtherBlock
+          : EditorDOMPoint::AtEndOf(const_cast<Element&>(aLeftBlockElement)),
+      aAncestorLimiter);
+  if (NS_WARN_IF(!textFragmentDataAtEndOfLeftBlockElement.IsInitialized())) {
+    return EditorDOMRange();  
+  }
+  if (textFragmentDataAtEndOfLeftBlockElement
+          .StartsFromBRElementFollowedByBlockBoundary()) {
+    range.SetStart(EditorDOMPoint(
+        textFragmentDataAtEndOfLeftBlockElement.StartReasonBRElementPtr()));
+  } else {
+    const EditorDOMRange& trailingWhiteSpaceRange =
+        textFragmentDataAtEndOfLeftBlockElement
+            .InvisibleTrailingWhiteSpaceRangeRef();
+    if (trailingWhiteSpaceRange.StartRef().IsSet()) {
+      range.SetStart(trailingWhiteSpaceRange.StartRef());
+    } else {
+      range.SetStart(textFragmentDataAtEndOfLeftBlockElement.ScanStartRef());
+    }
+  }
+  const TextFragmentData textFragmentDataAtStartOfRightBlockElement(
+      aOptions,
+      aPointContainingTheOtherBlock.GetContainer() == &aRightBlockElement &&
+              !aPointContainingTheOtherBlock.IsEndOfContainer()
+          ? aPointContainingTheOtherBlock.NextPoint()
+          : EditorDOMPoint(const_cast<Element*>(&aRightBlockElement), 0u),
+      aAncestorLimiter);
+  if (NS_WARN_IF(!textFragmentDataAtStartOfRightBlockElement.IsInitialized())) {
+    return EditorDOMRange();  
+  }
+  const EditorDOMRange& leadingWhiteSpaceRange =
+      textFragmentDataAtStartOfRightBlockElement
+          .InvisibleLeadingWhiteSpaceRangeRef();
+  if (leadingWhiteSpaceRange.EndRef().IsSet()) {
+    range.SetEnd(leadingWhiteSpaceRange.EndRef());
+  } else {
+    range.SetEnd(textFragmentDataAtStartOfRightBlockElement.ScanStartRef());
+  }
+  return range;
+}
+
+EditorDOMRange
+WSRunScanner::GetRangeContainingInvisibleWhiteSpacesAtRangeBoundaries(
+    Options aOptions,  // NOLINT(performance-unnecessary-value-param)
+    const EditorDOMRange& aRange,
+    const Element* aAncestorLimiter ) {
+  MOZ_ASSERT(aRange.IsPositionedAndValid());
+  MOZ_ASSERT(aRange.EndRef().IsSetAndValid());
+  MOZ_ASSERT(aRange.StartRef().IsSetAndValid());
+  MOZ_ASSERT(!aOptions.contains(Option::ReferHTMLDefaultStyle));
+
+  EditorDOMRange result;
+  const TextFragmentData textFragmentDataAtStart(aOptions, aRange.StartRef(),
+                                                 aAncestorLimiter);
+  if (NS_WARN_IF(!textFragmentDataAtStart.IsInitialized())) {
+    return EditorDOMRange();  
+  }
+  const EditorDOMRangeInTexts invisibleLeadingWhiteSpacesAtStart =
+      textFragmentDataAtStart.GetNonCollapsedRangeInTexts(
+          textFragmentDataAtStart.InvisibleLeadingWhiteSpaceRangeRef());
+  if (invisibleLeadingWhiteSpacesAtStart.IsPositioned() &&
+      !invisibleLeadingWhiteSpacesAtStart.Collapsed()) {
+    result.SetStart(invisibleLeadingWhiteSpacesAtStart.StartRef());
+  } else {
+    const EditorDOMRangeInTexts invisibleTrailingWhiteSpacesAtStart =
+        textFragmentDataAtStart.GetNonCollapsedRangeInTexts(
+            textFragmentDataAtStart.InvisibleTrailingWhiteSpaceRangeRef());
+    if (invisibleTrailingWhiteSpacesAtStart.IsPositioned() &&
+        !invisibleTrailingWhiteSpacesAtStart.Collapsed()) {
+      MOZ_ASSERT(
+          invisibleTrailingWhiteSpacesAtStart.StartRef().EqualsOrIsBefore(
+              aRange.StartRef()));
+      result.SetStart(invisibleTrailingWhiteSpacesAtStart.StartRef());
+    }
+    else if (!aRange.StartRef().IsInTextNode() &&
+             (textFragmentDataAtStart.StartsFromBlockBoundary() ||
+              textFragmentDataAtStart.StartsFromInlineEditingHostBoundary()) &&
+             textFragmentDataAtStart.EndRef().IsInTextNode()) {
+      result.SetStart(textFragmentDataAtStart.EndRef());
+    }
+  }
+  if (!result.StartRef().IsSet()) {
+    result.SetStart(aRange.StartRef());
+  }
+
+  const TextFragmentData textFragmentDataAtEnd(aOptions, aRange.EndRef(),
+                                               aAncestorLimiter);
+  if (NS_WARN_IF(!textFragmentDataAtEnd.IsInitialized())) {
+    return EditorDOMRange();  
+  }
+  const EditorDOMRangeInTexts invisibleLeadingWhiteSpacesAtEnd =
+      textFragmentDataAtEnd.GetNonCollapsedRangeInTexts(
+          textFragmentDataAtEnd.InvisibleTrailingWhiteSpaceRangeRef());
+  if (invisibleLeadingWhiteSpacesAtEnd.IsPositioned() &&
+      !invisibleLeadingWhiteSpacesAtEnd.Collapsed()) {
+    result.SetEnd(invisibleLeadingWhiteSpacesAtEnd.EndRef());
+  } else {
+    const EditorDOMRangeInTexts invisibleLeadingWhiteSpacesAtEnd =
+        textFragmentDataAtEnd.GetNonCollapsedRangeInTexts(
+            textFragmentDataAtEnd.InvisibleLeadingWhiteSpaceRangeRef());
+    if (invisibleLeadingWhiteSpacesAtEnd.IsPositioned() &&
+        !invisibleLeadingWhiteSpacesAtEnd.Collapsed()) {
+      MOZ_ASSERT(aRange.EndRef().EqualsOrIsBefore(
+          invisibleLeadingWhiteSpacesAtEnd.EndRef()));
+      result.SetEnd(invisibleLeadingWhiteSpacesAtEnd.EndRef());
+    }
+    else if (!aRange.EndRef().IsInTextNode() &&
+             (textFragmentDataAtEnd.EndsByBlockBoundary() ||
+              textFragmentDataAtEnd.EndsByInlineEditingHostBoundary()) &&
+             textFragmentDataAtEnd.StartRef().IsInTextNode()) {
+      result.SetEnd(EditorDOMPoint::AtEndOf(
+          *textFragmentDataAtEnd.StartRef().ContainerAs<Text>()));
+    }
+  }
+  if (!result.EndRef().IsSet()) {
+    result.SetEnd(aRange.EndRef());
+  }
+  MOZ_ASSERT(result.IsPositionedAndValid());
+  return result;
+}
+
+
+Result<bool, nsresult>
+WSRunScanner::ShrinkRangeIfStartsFromOrEndsAfterAtomicContent(
+    Options aOptions,  // NOLINT(performance-unnecessary-value-param)
+    nsRange& aRange, const Element* aAncestorLimiter ) {
+  MOZ_ASSERT(aRange.IsPositioned());
+  MOZ_ASSERT(!aRange.IsInAnySelection(),
+             "Changing range in selection may cause running script");
+  MOZ_ASSERT(!aOptions.contains(Option::ReferHTMLDefaultStyle));
+
+  if (NS_WARN_IF(!aRange.GetStartContainer()) ||
+      NS_WARN_IF(!aRange.GetEndContainer())) {
+    return Err(NS_ERROR_FAILURE);
+  }
+
+  if (!aRange.GetStartContainer()->IsContent() ||
+      !aRange.GetEndContainer()->IsContent()) {
+    return false;
+  }
+
+  if (HTMLEditUtils::GetInclusiveAncestorElement(
+          *aRange.GetStartContainer()->AsContent(),
+          aOptions.contains(Option::OnlyEditableNodes)
+              ? HTMLEditUtils::ClosestEditableBlockElementExceptHRElement
+              : HTMLEditUtils::ClosestBlockElementExceptHRElement,
+          BlockInlineCheck::UseComputedDisplayStyle) !=
+      HTMLEditUtils::GetInclusiveAncestorElement(
+          *aRange.GetEndContainer()->AsContent(),
+          aOptions.contains(Option::OnlyEditableNodes)
+              ? HTMLEditUtils::ClosestEditableBlockElementExceptHRElement
+              : HTMLEditUtils::ClosestBlockElementExceptHRElement,
+          BlockInlineCheck::UseComputedDisplayStyle)) {
+    return false;
+  }
+
+  nsIContent* startContent = nullptr;
+  if (aRange.GetStartContainer() && aRange.GetStartContainer()->IsText() &&
+      aRange.GetStartContainer()->AsText()->Length() == aRange.StartOffset()) {
+    const TextFragmentData textFragmentDataAtStart(
+        aOptions, EditorRawDOMPoint(aRange.StartRef()), aAncestorLimiter);
+    if (NS_WARN_IF(!textFragmentDataAtStart.IsInitialized())) {
+      return Err(NS_ERROR_FAILURE);
+    }
+    if (textFragmentDataAtStart.EndsByBRElementNotFollowedByBlockBoundary()) {
+      startContent = textFragmentDataAtStart.EndReasonBRElementPtr();
+    } else if (textFragmentDataAtStart.EndsBySpecialContent() ||
+               textFragmentDataAtStart.EndsByEmptyInlineContainerElement() ||
+               (textFragmentDataAtStart.EndsByOtherBlockElement() &&
+                !HTMLEditUtils::IsContainerNode(
+                    *textFragmentDataAtStart
+                         .EndReasonOtherBlockElementPtr()))) {
+      startContent = textFragmentDataAtStart.GetEndReasonContent();
+    }
+  }
+
+  nsIContent* endContent = nullptr;
+  if (aRange.GetEndContainer() && aRange.GetEndContainer()->IsText() &&
+      !aRange.EndOffset()) {
+    const TextFragmentData textFragmentDataAtEnd(
+        aOptions, EditorRawDOMPoint(aRange.EndRef()), aAncestorLimiter);
+    if (NS_WARN_IF(!textFragmentDataAtEnd.IsInitialized())) {
+      return Err(NS_ERROR_FAILURE);
+    }
+    if (textFragmentDataAtEnd.StartsFromBRElementNotFollowedByBlockBoundary()) {
+      endContent = textFragmentDataAtEnd.StartReasonBRElementPtr();
+    } else if (textFragmentDataAtEnd.StartsFromSpecialContent() ||
+               textFragmentDataAtEnd.EndsByEmptyInlineContainerElement() ||
+               (textFragmentDataAtEnd.StartsFromOtherBlockElement() &&
+                !HTMLEditUtils::IsContainerNode(
+                    *textFragmentDataAtEnd
+                         .StartReasonOtherBlockElementPtr()))) {
+      endContent = textFragmentDataAtEnd.GetStartReasonContent();
+    }
+  }
+
+  if (!startContent && !endContent) {
+    return false;
+  }
+
+  nsresult rv = aRange.SetStartAndEnd(
+      startContent ? RangeBoundary::FromChild(*startContent)
+                   : aRange.StartRef(),
+      endContent ? RangeBoundary::After(*endContent) : aRange.EndRef());
+  if (NS_FAILED(rv)) {
+    NS_WARNING("nsRange::SetStartAndEnd() failed");
+    return Err(rv);
+  }
+  return true;
+}
+
+}  

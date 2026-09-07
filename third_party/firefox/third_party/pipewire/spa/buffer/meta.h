@@ -1,0 +1,139 @@
+/* SPDX-FileCopyrightText: Copyright © 2018 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
+
+#ifndef SPA_META_H
+#define SPA_META_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <spa/utils/defs.h>
+#include <spa/pod/pod.h>
+
+#ifndef SPA_API_META
+ #ifdef SPA_API_IMPL
+  #define SPA_API_META SPA_API_IMPL
+ #else
+  #define SPA_API_META static inline
+ #endif
+#endif
+
+
+enum spa_meta_type {
+	SPA_META_Invalid,
+	SPA_META_Header,		
+	SPA_META_VideoCrop,		
+	SPA_META_VideoDamage,		
+	SPA_META_Bitmap,		
+	SPA_META_Cursor,		
+	SPA_META_Control,		
+	SPA_META_Busy,			
+	SPA_META_VideoTransform,	
+	SPA_META_SyncTimeline,		
+
+	_SPA_META_LAST,			
+};
+
+struct spa_meta {
+	uint32_t type;		
+	uint32_t size;		
+	void *data;		
+};
+
+SPA_API_META void *spa_meta_first(const struct spa_meta *m) {
+	return m->data;
+}
+
+SPA_API_META void *spa_meta_end(const struct spa_meta *m) {
+	return SPA_PTROFF(m->data,m->size,void);
+}
+#define spa_meta_check(p,m)	(SPA_PTROFF(p,sizeof(*(p)),void) <= spa_meta_end(m))
+
+struct spa_meta_header {
+#define SPA_META_HEADER_FLAG_DISCONT	(1 << 0)	/**< data is not continuous with previous buffer */
+#define SPA_META_HEADER_FLAG_CORRUPTED	(1 << 1)	/**< data might be corrupted */
+#define SPA_META_HEADER_FLAG_MARKER	(1 << 2)	/**< media specific marker */
+#define SPA_META_HEADER_FLAG_HEADER	(1 << 3)	/**< data contains a codec specific header */
+#define SPA_META_HEADER_FLAG_GAP	(1 << 4)	/**< data contains media neutral data */
+#define SPA_META_HEADER_FLAG_DELTA_UNIT	(1 << 5)	/**< cannot be decoded independently */
+	uint32_t flags;				
+	uint32_t offset;			
+	int64_t pts;				
+	int64_t dts_offset;			
+	uint64_t seq;				
+};
+
+struct spa_meta_region {
+	struct spa_region region;
+};
+
+SPA_API_META bool spa_meta_region_is_valid(const struct spa_meta_region *m) {
+	return m->region.size.width != 0 && m->region.size.height != 0;
+}
+
+#define spa_meta_for_each(pos,meta)					\
+	for ((pos) = (__typeof(pos))spa_meta_first(meta);		\
+	    spa_meta_check(pos, meta);					\
+            (pos)++)
+
+struct spa_meta_bitmap {
+	uint32_t format;		
+	struct spa_rectangle size;	
+	int32_t stride;			
+	uint32_t offset;		
+};
+
+SPA_API_META bool spa_meta_bitmap_is_valid(const struct spa_meta_bitmap *m) {
+	return m->format != 0;
+}
+
+struct spa_meta_cursor {
+	uint32_t id;			
+	uint32_t flags;			
+	struct spa_point position;	
+	struct spa_point hotspot;	
+	uint32_t bitmap_offset;		
+};
+
+SPA_API_META bool spa_meta_cursor_is_valid(const struct spa_meta_cursor *m) {
+	return m->id != 0;
+}
+
+struct spa_meta_control {
+	struct spa_pod_sequence sequence;
+};
+
+struct spa_meta_busy {
+	uint32_t flags;
+	uint32_t count;			
+};
+
+enum spa_meta_videotransform_value {
+	SPA_META_TRANSFORMATION_None = 0,	
+	SPA_META_TRANSFORMATION_90,		
+	SPA_META_TRANSFORMATION_180,		
+	SPA_META_TRANSFORMATION_270,		
+	SPA_META_TRANSFORMATION_Flipped,	
+	SPA_META_TRANSFORMATION_Flipped90,	
+	SPA_META_TRANSFORMATION_Flipped180,	
+	SPA_META_TRANSFORMATION_Flipped270,	
+};
+
+struct spa_meta_videotransform {
+	uint32_t transform;			
+};
+
+struct spa_meta_sync_timeline {
+	uint32_t flags;
+	uint32_t padding;
+	uint64_t acquire_point;			
+	uint64_t release_point;			
+};
+
+
+#ifdef __cplusplus
+}  
+#endif
+
+#endif /* SPA_META_H */

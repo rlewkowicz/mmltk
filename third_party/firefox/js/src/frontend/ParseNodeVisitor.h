@@ -1,0 +1,88 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef frontend_ParseNodeVisitor_h
+#define frontend_ParseNodeVisitor_h
+
+#include "mozilla/Assertions.h"
+
+#include "frontend/ParseNode.h"
+#include "js/friend/StackLimits.h"  // js::AutoCheckRecursionLimit
+
+namespace js {
+
+class FrontendContext;
+
+namespace frontend {
+
+template <typename Derived>
+class ParseNodeVisitor {
+ public:
+  FrontendContext* fc_;
+
+  explicit ParseNodeVisitor(FrontendContext* fc) : fc_(fc) {}
+
+  [[nodiscard]] bool visit(ParseNode* pn) {
+    AutoCheckRecursionLimit recursion(fc_);
+    if (!recursion.check(fc_)) {
+      return false;
+    }
+
+    switch (pn->getKind()) {
+#define VISIT_CASE(KIND, TYPE) \
+  case ParseNodeKind::KIND:    \
+    return static_cast<Derived*>(this)->visit##KIND(&pn->as<TYPE>());
+      FOR_EACH_PARSE_NODE_KIND(VISIT_CASE)
+#undef VISIT_CASE
+      default:
+        MOZ_CRASH("invalid node kind");
+    }
+  }
+
+#define VISIT_METHOD(KIND, TYPE)                          \
+  [[nodiscard]] bool visit##KIND(TYPE* pn) { /* NOLINT */ \
+    return pn->accept(*static_cast<Derived*>(this));      \
+  }
+  FOR_EACH_PARSE_NODE_KIND(VISIT_METHOD)
+#undef VISIT_METHOD
+};
+
+template <typename Derived>
+class RewritingParseNodeVisitor {
+ public:
+  FrontendContext* fc_;
+
+  explicit RewritingParseNodeVisitor(FrontendContext* fc) : fc_(fc) {}
+
+  [[nodiscard]] bool visit(ParseNode*& pn) {
+    AutoCheckRecursionLimit recursion(fc_);
+    if (!recursion.check(fc_)) {
+      return false;
+    }
+
+    switch (pn->getKind()) {
+#define VISIT_CASE(KIND, _type) \
+  case ParseNodeKind::KIND:     \
+    return static_cast<Derived*>(this)->visit##KIND(pn);
+      FOR_EACH_PARSE_NODE_KIND(VISIT_CASE)
+#undef VISIT_CASE
+      default:
+        MOZ_CRASH("invalid node kind");
+    }
+  }
+
+#define VISIT_METHOD(KIND, TYPE)                                 \
+  [[nodiscard]] bool visit##KIND(ParseNode*& pn) {               \
+    MOZ_ASSERT(pn->is<TYPE>(),                                   \
+               "Node of kind " #KIND " was not of type " #TYPE); \
+    return pn->as<TYPE>().accept(*static_cast<Derived*>(this));  \
+  }
+  FOR_EACH_PARSE_NODE_KIND(VISIT_METHOD)
+#undef VISIT_METHOD
+};
+
+}  
+}  
+
+#endif  // frontend_ParseNodeVisitor_h

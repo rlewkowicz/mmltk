@@ -1,0 +1,898 @@
+/*
+ * Copyright 2015 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "wasm/WasmModule.h"
+
+#include "js/BuildId.h"                 // JS::BuildIdCharVector
+#include "js/experimental/TypedData.h"  // JS_NewUint8Array
+#include "js/friend/ErrorMessages.h"    // js::GetErrorMessage, JSMSG_*
+#include "js/Printf.h"                  // JS_smprintf
+#include "js/PropertyAndElement.h"  // JS_DefineProperty, JS_DefinePropertyById
+#include "js/StreamConsumer.h"
+#include "threading/LockGuard.h"
+#include "threading/Thread.h"
+#include "vm/HelperThreadState.h"  // Tier2GeneratorTask
+#include "vm/PlainObject.h"        // js::PlainObject
+#include "vm/Warnings.h"           // WarnNumberASCII
+#include "wasm/WasmBaselineCompile.h"
+#include "wasm/WasmCompile.h"
+#include "wasm/WasmDebug.h"
+#include "wasm/WasmInstance.h"
+#include "wasm/WasmIonCompile.h"
+#include "wasm/WasmJS.h"
+#include "wasm/WasmModuleTypes.h"
+#include "wasm/WasmPI.h"
+#include "wasm/WasmSerialize.h"
+#include "wasm/WasmUtility.h"
+
+#include "debugger/DebugAPI-inl.h"
+#include "vm/ArrayBufferObject-inl.h"
+#include "vm/JSAtomUtils-inl.h"  // AtomToId
+#include "wasm/WasmInstance-inl.h"
+
+using namespace js;
+using namespace js::jit;
+using namespace js::wasm;
+
+static UniqueChars Tier2ResultsContext(const ScriptedCaller& scriptedCaller) {
+  return scriptedCaller.source
+             ? JS_smprintf("%s:%d", scriptedCaller.source.get(),
+                           scriptedCaller.line)
+             : UniqueChars();
+}
+
+void js::wasm::ReportTier2ResultsOffThread(bool cancelled, bool success,
+                                           Maybe<uint32_t> maybeFuncIndex,
+                                           const ScriptedCaller& scriptedCaller,
+                                           const UniqueChars& error,
+                                           const UniqueCharsVector& warnings) {
+  UniqueChars context = Tier2ResultsContext(scriptedCaller);
+  const char* contextString = context ? context.get() : "unknown";
+
+  if (!success || cancelled) {
+    const char* errorString = error       ? error.get()
+                              : cancelled ? "compilation cancelled"
+                                          : "out of memory";
+    if (maybeFuncIndex.isSome()) {
+      LogOffThread(
+          "'%s': wasm partial tier-2 (func index %u) failed with '%s'.\n",
+          contextString, maybeFuncIndex.value(), errorString);
+    } else {
+      LogOffThread("'%s': wasm complete tier-2 failed with '%s'.\n",
+                   contextString, errorString);
+    }
+  }
+
+  size_t numWarnings = std::min<size_t>(warnings.length(), 3);
+
+  for (size_t i = 0; i < numWarnings; i++) {
+    LogOffThread("'%s': wasm complete tier-2 warning: '%s'.\n'.", contextString,
+                 warnings[i].get());
+  }
+  if (warnings.length() > numWarnings) {
+    LogOffThread("'%s': other warnings suppressed.\n", contextString);
+  }
+}
+
+class Module::CompleteTier2GeneratorTaskImpl
+    : public CompleteTier2GeneratorTask {
+  SharedBytes codeSection_;
+  SharedModule module_;
+  mozilla::Atomic<bool> cancelled_;
+
+ public:
+  CompleteTier2GeneratorTaskImpl(const ShareableBytes* codeSection,
+                                 Module& module)
+      : codeSection_(codeSection), module_(&module), cancelled_(false) {}
+
+  ~CompleteTier2GeneratorTaskImpl() override {
+    module_->completeTier2Listener_ = nullptr;
+    module_->testingTier2Active_ = false;
+  }
+
+  void cancel() override { cancelled_ = true; }
+
+  void runHelperThreadTask(AutoLockHelperThreadState& locked) override {
+    {
+      AutoUnlockHelperThreadState unlock(locked);
+
+      UniqueChars error;
+      UniqueCharsVector warnings;
+      bool success = CompileCompleteTier2(codeSection_, *module_, &error,
+                                          &warnings, &cancelled_);
+      if (!cancelled_) {
+        ReportTier2ResultsOffThread(cancelled_, success, mozilla::Nothing(),
+                                    module_->codeMeta().scriptedCaller(), error,
+                                    warnings);
+      }
+    }
+
+    HelperThreadState().incWasmCompleteTier2GeneratorsFinished(locked);
+
+    js_delete(this);
+  }
+
+  ThreadType threadType() override {
+    return ThreadType::THREAD_TYPE_WASM_GENERATOR_COMPLETE_TIER2;
+  }
+};
+
+Module::~Module() {
+  MOZ_ASSERT(!completeTier2Listener_);
+  MOZ_ASSERT(!testingTier2Active_);
+}
+
+void Module::startTier2(const ShareableBytes* codeSection,
+                        JS::OptimizedEncodingListener* listener) {
+  MOZ_ASSERT(!testingTier2Active_);
+  MOZ_ASSERT_IF(codeMeta().codeSectionRange.isSome(), codeSection);
+
+  auto task = MakeUnique<CompleteTier2GeneratorTaskImpl>(codeSection, *this);
+  if (!task) {
+    return;
+  }
+
+  completeTier2Listener_ = listener;
+  testingTier2Active_ = true;
+
+  StartOffThreadWasmCompleteTier2Generator(std::move(task));
+}
+
+bool Module::finishTier2(UniqueCodeBlock tier2CodeBlock,
+                         UniqueLinkData tier2LinkData,
+                         const CompileAndLinkStats& tier2Stats) const {
+  if (!code_->finishTier2(std::move(tier2CodeBlock), std::move(tier2LinkData),
+                          tier2Stats)) {
+    return false;
+  }
+
+
+  if (completeTier2Listener_ && canSerialize()) {
+    Bytes bytes;
+    if (serialize(&bytes)) {
+      completeTier2Listener_->storeOptimizedEncoding(bytes.begin(),
+                                                     bytes.length());
+    }
+    completeTier2Listener_ = nullptr;
+  }
+  testingTier2Active_ = false;
+
+  return true;
+}
+
+void Module::testingBlockOnTier2Complete() const {
+  while (testingTier2Active_) {
+    ThisThread::SleepMilliseconds(1);
+  }
+}
+
+JSObject* Module::createObject(JSContext* cx) const {
+  if (!GlobalObject::ensureConstructor(cx, cx->global(), JSProto_WebAssembly)) {
+    return nullptr;
+  }
+
+  JS::RootedVector<JSString*> parameterStrings(cx);
+  JS::RootedVector<Value> parameterArgs(cx);
+  bool canCompileStrings = false;
+  if (!cx->isRuntimeCodeGenEnabled(JS::RuntimeCode::WASM, nullptr,
+                                   JS::CompilationType::Undefined,
+                                   parameterStrings, nullptr, parameterArgs,
+                                   NullHandleValue, &canCompileStrings)) {
+    return nullptr;
+  }
+  if (!canCompileStrings) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_CSP_BLOCKED_WASM, "WebAssembly.Module");
+    return nullptr;
+  }
+
+  RootedObject proto(cx, &cx->global()->getPrototype(JSProto_WasmModule));
+  return WasmModuleObject::create(cx, *this, proto);
+}
+
+bool wasm::GetOptimizedEncodingBuildId(JS::BuildIdCharVector* buildId) {
+
+  if (!GetBuildId || !GetBuildId(buildId)) {
+    return false;
+  }
+
+  uint32_t cpu = ObservedCPUFeatures();
+
+  if (!buildId->reserve(buildId->length() +
+                        13 )) {
+    return false;
+  }
+
+  buildId->infallibleAppend('(');
+  while (cpu) {
+    buildId->infallibleAppend('0' + (cpu & 0xf));
+    cpu >>= 4;
+  }
+  buildId->infallibleAppend(')');
+
+  buildId->infallibleAppend('m');
+  buildId->infallibleAppend(
+      wasm::IsHugeMemoryEnabled(AddressType::I32, PageSize::Standard) ? '+'
+                                                                      : '-');
+  buildId->infallibleAppend(
+      wasm::IsHugeMemoryEnabled(AddressType::I64, PageSize::Standard) ? '+'
+                                                                      : '-');
+
+#ifdef ENABLE_WASM_CUSTOM_PAGE_SIZES
+  MOZ_RELEASE_ASSERT(
+      !wasm::IsHugeMemoryEnabled(AddressType::I32, PageSize::Tiny));
+  MOZ_RELEASE_ASSERT(
+      !wasm::IsHugeMemoryEnabled(AddressType::I64, PageSize::Tiny));
+#endif
+
+  return true;
+}
+
+void Module::addSizeOfMisc(mozilla::MallocSizeOf mallocSizeOf,
+                           CodeMetadata::SeenSet* seenCodeMeta,
+                           Code::SeenSet* seenCode, size_t* code,
+                           size_t* data) const {
+  code_->addSizeOfMiscIfNotSeen(mallocSizeOf, seenCodeMeta, seenCode, code,
+                                data);
+  *data += mallocSizeOf(this);
+}
+
+bool Module::extractCode(JSContext* cx, Tier tier,
+                         MutableHandleValue vp) const {
+  Rooted<PlainObject*> result(cx, NewPlainObject(cx));
+  if (!result) {
+    return false;
+  }
+
+  testingBlockOnTier2Complete();
+
+  if (!code_->hasCompleteTier(tier)) {
+    vp.setNull();
+    return true;
+  }
+
+  const CodeBlock& codeBlock = code_->completeTierCodeBlock(tier);
+  const CodeSegment& codeSegment = *codeBlock.segment;
+  RootedObject codeObj(cx, JS_NewUint8Array(cx, codeSegment.lengthBytes()));
+  if (!codeObj) {
+    return false;
+  }
+
+  memcpy(codeObj->as<TypedArrayObject>().dataPointerUnshared(),
+         codeSegment.base(), codeSegment.lengthBytes());
+
+  RootedValue value(cx, ObjectValue(*codeObj));
+  if (!JS_DefineProperty(cx, result, "code", value, JSPROP_ENUMERATE)) {
+    return false;
+  }
+
+  RootedObject segments(cx, NewDenseEmptyArray(cx));
+  if (!segments) {
+    return false;
+  }
+
+  for (const CodeRange& p : codeBlock.codeRanges) {
+    RootedObject segment(cx, NewPlainObjectWithProto(cx, nullptr));
+    if (!segment) {
+      return false;
+    }
+
+    value.setNumber((uint32_t)p.begin());
+    if (!JS_DefineProperty(cx, segment, "begin", value, JSPROP_ENUMERATE)) {
+      return false;
+    }
+
+    value.setNumber((uint32_t)p.end());
+    if (!JS_DefineProperty(cx, segment, "end", value, JSPROP_ENUMERATE)) {
+      return false;
+    }
+
+    value.setNumber((uint32_t)p.kind());
+    if (!JS_DefineProperty(cx, segment, "kind", value, JSPROP_ENUMERATE)) {
+      return false;
+    }
+
+    if (p.isFunction()) {
+      value.setNumber((uint32_t)p.funcIndex());
+      if (!JS_DefineProperty(cx, segment, "funcIndex", value,
+                             JSPROP_ENUMERATE)) {
+        return false;
+      }
+
+      value.setNumber((uint32_t)p.funcUncheckedCallEntry());
+      if (!JS_DefineProperty(cx, segment, "funcBodyBegin", value,
+                             JSPROP_ENUMERATE)) {
+        return false;
+      }
+
+      value.setNumber((uint32_t)p.end());
+      if (!JS_DefineProperty(cx, segment, "funcBodyEnd", value,
+                             JSPROP_ENUMERATE)) {
+        return false;
+      }
+    }
+
+    if (!NewbornArrayPush(cx, segments, ObjectValue(*segment))) {
+      return false;
+    }
+  }
+
+  value.setObject(*segments);
+  if (!JS_DefineProperty(cx, result, "segments", value, JSPROP_ENUMERATE)) {
+    return false;
+  }
+
+  vp.setObject(*result);
+  return true;
+}
+
+static const Import& FindImportFunction(const ImportVector& imports,
+                                        uint32_t funcImportIndex) {
+  for (const Import& import : imports) {
+    if (import.kind != DefinitionKind::Function) {
+      continue;
+    }
+    if (funcImportIndex == 0) {
+      return import;
+    }
+    funcImportIndex--;
+  }
+  MOZ_CRASH("ran out of imports");
+}
+
+bool Module::instantiateFunctions(JSContext* cx,
+                                  const JSObjectVector& funcImports) const {
+#ifdef DEBUG
+  MOZ_ASSERT(funcImports.length() == code().funcImports().length());
+#endif
+
+  for (size_t i = 0; i < code().funcImports().length(); i++) {
+    if (!funcImports[i]->is<JSFunction>()) {
+      continue;
+    }
+
+    JSFunction* f = &funcImports[i]->as<JSFunction>();
+    if (!f->isWasm() || codeMeta().funcImportsAreJS) {
+      continue;
+    }
+
+    const TypeDef& exportFuncType = *f->wasmTypeDef();
+    const TypeDef& importFuncType = code().codeMeta().getFuncTypeDef(i);
+
+    if (!TypeDef::isSubTypeOf(&exportFuncType, &importFuncType)) {
+      const Import& import = FindImportFunction(moduleMeta().imports, i);
+      UniqueChars importModuleName = import.module.toQuotedString(cx);
+      UniqueChars importFieldName = import.field.toQuotedString(cx);
+      if (!importFieldName || !importModuleName) {
+        ReportOutOfMemory(cx);
+        return false;
+      }
+      JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                               JSMSG_WASM_BAD_IMPORT_SIG,
+                               importModuleName.get(), importFieldName.get());
+      return false;
+    }
+  }
+
+  return true;
+}
+
+template <typename T>
+static bool CheckLimits(JSContext* cx, T declaredMin,
+                        const mozilla::Maybe<T>& declaredMax, T defaultMax,
+                        T actualLength, const mozilla::Maybe<T>& actualMax,
+                        const char* kind) {
+  if (actualLength < declaredMin ||
+      actualLength > declaredMax.valueOr(defaultMax)) {
+    JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                             JSMSG_WASM_BAD_IMP_SIZE, kind);
+    return false;
+  }
+
+  if ((actualMax && declaredMax && *actualMax > *declaredMax) ||
+      (!actualMax && declaredMax)) {
+    JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                             JSMSG_WASM_BAD_IMP_MAX, kind);
+    return false;
+  }
+
+  return true;
+}
+
+static bool CheckSharing(JSContext* cx, bool declaredShared, bool isShared) {
+  if (isShared &&
+      !cx->realm()->creationOptions().getSharedMemoryAndAtomicsEnabled()) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_WASM_NO_SHMEM_LINK);
+    return false;
+  }
+
+  if (declaredShared && !isShared) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_WASM_IMP_SHARED_REQD);
+    return false;
+  }
+
+  if (!declaredShared && isShared) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_WASM_IMP_SHARED_BANNED);
+    return false;
+  }
+
+  return true;
+}
+
+#ifdef ENABLE_WASM_CUSTOM_PAGE_SIZES
+static bool CheckPageSize(JSContext* cx, PageSize declaredPageSize,
+                          PageSize actualPageSize) {
+  if (declaredPageSize != actualPageSize) {
+    JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                             JSMSG_WASM_BAD_IMP_PAGE_SIZE);
+    return false;
+  }
+
+  return true;
+}
+#endif
+
+bool Module::instantiateMemories(
+    JSContext* cx, const WasmMemoryObjectVector& memoryImports,
+    MutableHandle<WasmMemoryObjectVector> memoryObjs) const {
+  for (uint32_t memoryIndex = 0; memoryIndex < codeMeta().memories.length();
+       memoryIndex++) {
+    const MemoryDesc& desc = codeMeta().memories[memoryIndex];
+
+    Rooted<WasmMemoryObject*> memory(cx);
+    if (memoryIndex < memoryImports.length()) {
+      memory = memoryImports[memoryIndex];
+      MOZ_ASSERT(memory->buffer().isWasm());
+
+      if (memory->addressType() != desc.addressType()) {
+        JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                                 JSMSG_WASM_BAD_IMP_ADDRESS, "memory",
+                                 ToString(memory->addressType()));
+        return false;
+      }
+
+#ifdef ENABLE_WASM_CUSTOM_PAGE_SIZES
+      if (!CheckPageSize(cx, desc.pageSize(), memory->pageSize())) {
+        return false;
+      }
+#endif
+
+      if (!CheckLimits(cx, desc.initialPages(), desc.maximumPages(),
+                       MaxMemoryPages(desc.addressType(), desc.pageSize()),
+                       memory->volatilePages(), memory->sourceMaxPages(),
+                       "Memory")) {
+        return false;
+      }
+
+      if (!CheckSharing(cx, desc.isShared(), memory->isShared())) {
+        return false;
+      }
+    } else {
+      if (desc.initialPages() >
+          MaxMemoryPages(desc.addressType(), desc.pageSize())) {
+        JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                                 JSMSG_WASM_MEM_IMP_LIMIT);
+        return false;
+      }
+
+      Rooted<ArrayBufferObjectMaybeShared*> buffer(cx,
+                                                   CreateWasmBuffer(cx, desc));
+      if (!buffer) {
+        return false;
+      }
+
+      RootedObject proto(cx, &cx->global()->getPrototype(JSProto_WasmMemory));
+      memory = WasmMemoryObject::create(
+          cx, buffer, IsHugeMemoryEnabled(desc.addressType(), desc.pageSize()),
+          proto);
+      if (!memory) {
+        return false;
+      }
+    }
+
+    MOZ_RELEASE_ASSERT(
+        memory->isHuge() ==
+        IsHugeMemoryEnabled(desc.addressType(), desc.pageSize()));
+
+    if (!memoryObjs.get().append(memory)) {
+      ReportOutOfMemory(cx);
+      return false;
+    }
+  }
+  return true;
+}
+
+bool Module::instantiateTags(JSContext* cx,
+                             WasmTagObjectVector& tagObjs) const {
+  size_t tagLength = codeMeta().tags.length();
+  if (tagLength == 0) {
+    return true;
+  }
+  size_t importedTagsLength = tagObjs.length();
+  if (tagObjs.length() <= tagLength && !tagObjs.resize(tagLength)) {
+    ReportOutOfMemory(cx);
+    return false;
+  }
+
+  uint32_t tagIndex = 0;
+  RootedObject proto(cx, &cx->global()->getPrototype(JSProto_WasmTag));
+  for (const TagDesc& desc : codeMeta().tags) {
+    if (tagIndex >= importedTagsLength) {
+      Rooted<WasmTagObject*> tagObj(
+          cx, WasmTagObject::create(cx, desc.type, proto));
+      if (!tagObj) {
+        return false;
+      }
+      tagObjs[tagIndex] = tagObj;
+    }
+    tagIndex++;
+  }
+  return true;
+}
+
+bool Module::instantiateImportedTable(JSContext* cx, const TableDesc& td,
+                                      Handle<WasmTableObject*> tableObj,
+                                      WasmTableObjectVector* tableObjs,
+                                      SharedTableVector* tables) const {
+  MOZ_ASSERT(tableObj);
+
+  Table& table = tableObj->table();
+  if (table.addressType() != td.addressType()) {
+    JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                             JSMSG_WASM_BAD_IMP_ADDRESS, "table",
+                             ToString(tableObj->table().addressType()));
+    return false;
+  }
+  if (!CheckLimits(cx, td.initialLength(),
+                   td.maximumLength(),
+                   MaxTableElemsValidation(td.addressType()),
+                   uint64_t(table.length()),
+                   table.maximum(), "Table")) {
+    return false;
+  }
+
+  if (!tables->append(&table)) {
+    ReportOutOfMemory(cx);
+    return false;
+  }
+
+  if (!tableObjs->append(tableObj)) {
+    ReportOutOfMemory(cx);
+    return false;
+  }
+
+  return true;
+}
+
+bool Module::instantiateLocalTable(JSContext* cx, const TableDesc& td,
+                                   WasmTableObjectVector* tableObjs,
+                                   SharedTableVector* tables) const {
+  if (td.initialLength() > MaxTableElemsRuntime) {
+    JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                             JSMSG_WASM_TABLE_IMP_LIMIT);
+    return false;
+  }
+
+  SharedTable table;
+  Rooted<WasmTableObject*> tableObj(cx);
+  if (td.isExported) {
+    RootedObject proto(cx, &cx->global()->getPrototype(JSProto_WasmTable));
+    tableObj.set(WasmTableObject::create(cx, td.type, proto));
+    if (!tableObj) {
+      return false;
+    }
+    table = &tableObj->table();
+  } else {
+    table = Table::create(cx, td,  nullptr);
+    if (!table) {
+      return false;
+    }
+  }
+
+  if (!tableObjs->append(tableObj.get())) {
+    ReportOutOfMemory(cx);
+    return false;
+  }
+
+  if (!tables->emplaceBack(table)) {
+    ReportOutOfMemory(cx);
+    return false;
+  }
+
+  return true;
+}
+
+bool Module::instantiateTables(JSContext* cx,
+                               const WasmTableObjectVector& tableImports,
+                               MutableHandle<WasmTableObjectVector> tableObjs,
+                               SharedTableVector* tables) const {
+  uint32_t tableIndex = 0;
+  for (const TableDesc& td : codeMeta().tables) {
+    if (tableIndex < tableImports.length()) {
+      Rooted<WasmTableObject*> tableObj(cx, tableImports[tableIndex]);
+
+      if (!instantiateImportedTable(cx, td, tableObj, &tableObjs.get(),
+                                    tables)) {
+        return false;
+      }
+    } else {
+      if (!instantiateLocalTable(cx, td, &tableObjs.get(), tables)) {
+        return false;
+      }
+    }
+    tableIndex++;
+  }
+  return true;
+}
+
+static bool EnsureExportedGlobalObject(JSContext* cx,
+                                       const ValVector& globalImportValues,
+                                       size_t globalIndex,
+                                       const GlobalDesc& global,
+                                       WasmGlobalObjectVector& globalObjs) {
+  if (globalIndex < globalObjs.length() && globalObjs[globalIndex]) {
+    return true;
+  }
+
+  RootedVal val(cx);
+  if (global.kind() == GlobalKind::Import) {
+    MOZ_ASSERT(!global.isMutable());
+    val.set(Val(globalImportValues[globalIndex]));
+  } else {
+    val.set(Val(global.type()));
+  }
+
+  RootedObject proto(cx, &cx->global()->getPrototype(JSProto_WasmGlobal));
+  Rooted<WasmGlobalObject*> go(
+      cx, WasmGlobalObject::create(cx, val, global.isMutable(), proto));
+  if (!go) {
+    return false;
+  }
+
+  if (globalObjs.length() <= globalIndex &&
+      !globalObjs.resize(globalIndex + 1)) {
+    ReportOutOfMemory(cx);
+    return false;
+  }
+
+  globalObjs[globalIndex] = go;
+  return true;
+}
+
+bool Module::instantiateGlobals(JSContext* cx,
+                                const ValVector& globalImportValues,
+                                WasmGlobalObjectVector& globalObjs) const {
+
+  const GlobalDescVector& globals = codeMeta().globals;
+
+  for (const Export& exp : moduleMeta().exports) {
+    if (exp.kind() != DefinitionKind::Global) {
+      continue;
+    }
+    unsigned globalIndex = exp.globalIndex();
+    const GlobalDesc& global = globals[globalIndex];
+    if (!EnsureExportedGlobalObject(cx, globalImportValues, globalIndex, global,
+                                    globalObjs)) {
+      return false;
+    }
+  }
+
+
+#ifdef DEBUG
+  size_t numGlobalImports = 0;
+  for (const Import& import : moduleMeta().imports) {
+    if (import.kind != DefinitionKind::Global) {
+      continue;
+    }
+    size_t globalIndex = numGlobalImports++;
+    const GlobalDesc& global = globals[globalIndex];
+    MOZ_ASSERT(global.importIndex() == globalIndex);
+    MOZ_ASSERT_IF(global.isIndirect(),
+                  globalIndex < globalObjs.length() || globalObjs[globalIndex]);
+  }
+  MOZ_ASSERT(numGlobalImports == globals.length() ||
+             !globals[numGlobalImports].isImport());
+#endif
+  return true;
+}
+
+static bool GetGlobalExport(JSContext* cx,
+                            Handle<WasmInstanceObject*> instanceObj,
+                            const JSObjectVector& funcImports,
+                            const GlobalDesc& global, uint32_t globalIndex,
+                            const ValVector& globalImportValues,
+                            const WasmGlobalObjectVector& globalObjs,
+                            MutableHandleValue val) {
+  Rooted<WasmGlobalObject*> globalObj(cx, globalObjs[globalIndex]);
+  val.setObject(*globalObj);
+
+  if (global.isIndirect() || global.isImport()) {
+    return true;
+  }
+
+  MOZ_ASSERT(!global.isMutable());
+  MOZ_RELEASE_ASSERT(!global.isImport());
+  RootedVal globalVal(cx);
+  instanceObj->instance().constantGlobalGet(globalIndex, &globalVal);
+  globalObj->setVal(globalVal);
+  return true;
+}
+
+static bool CreateExportObject(
+    JSContext* cx, Handle<WasmInstanceObject*> instanceObj,
+    const JSObjectVector& funcImports, const WasmTableObjectVector& tableObjs,
+    const WasmMemoryObjectVector& memoryObjs,
+    const WasmTagObjectVector& tagObjs, const ValVector& globalImportValues,
+    const WasmGlobalObjectVector& globalObjs, const ExportVector& exports) {
+  Instance& instance = instanceObj->instance();
+  const CodeMetadata& codeMeta = instance.codeMeta();
+  const GlobalDescVector& globals = codeMeta.globals;
+
+  RootedObject exportObj(cx, NewPlainObjectWithProto(cx, nullptr));
+  if (!exportObj) {
+    return false;
+  }
+
+  uint8_t propertyAttr = JSPROP_ENUMERATE | JSPROP_READONLY | JSPROP_PERMANENT;
+
+  for (const Export& exp : exports) {
+    JSAtom* atom = exp.fieldName().toAtom(cx);
+    if (!atom) {
+      return false;
+    }
+
+    RootedId id(cx, AtomToId(atom));
+    RootedValue val(cx);
+    switch (exp.kind()) {
+      case DefinitionKind::Function: {
+        RootedFunction func(cx);
+        if (!instance.getExportedFunction(cx, exp.funcIndex(), &func)) {
+          return false;
+        }
+        val = ObjectValue(*func);
+        break;
+      }
+      case DefinitionKind::Table: {
+        val = ObjectValue(*tableObjs[exp.tableIndex()]);
+        break;
+      }
+      case DefinitionKind::Memory: {
+        val = ObjectValue(*memoryObjs[exp.memoryIndex()]);
+        break;
+      }
+      case DefinitionKind::Global: {
+        const GlobalDesc& global = globals[exp.globalIndex()];
+        if (!GetGlobalExport(cx, instanceObj, funcImports, global,
+                             exp.globalIndex(), globalImportValues, globalObjs,
+                             &val)) {
+          return false;
+        }
+        break;
+      }
+      case DefinitionKind::Tag: {
+        val = ObjectValue(*tagObjs[exp.tagIndex()]);
+        break;
+      }
+    }
+
+    if (!JS_DefinePropertyById(cx, exportObj, id, val, propertyAttr)) {
+      return false;
+    }
+  }
+
+  if (!PreventExtensions(cx, exportObj)) {
+    return false;
+  }
+
+  instanceObj->initExportsObj(*exportObj);
+  return true;
+}
+
+bool Module::instantiate(JSContext* cx, ImportValues& imports,
+                         HandleObject instanceProto,
+                         MutableHandle<WasmInstanceObject*> instance) const {
+  MOZ_RELEASE_ASSERT(cx->wasm().haveSignalHandlers);
+
+  if (!instantiateFunctions(cx, imports.funcs)) {
+    return false;
+  }
+
+  Rooted<WasmMemoryObjectVector> memories(cx);
+  if (!instantiateMemories(cx, imports.memories, &memories)) {
+    return false;
+  }
+
+
+  if (!instantiateTags(cx, imports.tagObjs)) {
+    return false;
+  }
+
+
+  Rooted<WasmTableObjectVector> tableObjs(cx);
+  SharedTableVector tables;
+  if (!instantiateTables(cx, imports.tables, &tableObjs, &tables)) {
+    return false;
+  }
+
+  if (!instantiateGlobals(cx, imports.globalValues, imports.globalObjs)) {
+    return false;
+  }
+
+  UniqueDebugState maybeDebug;
+  if (code().debugEnabled()) {
+    maybeDebug = cx->make_unique<DebugState>(*code_, *this);
+    if (!maybeDebug) {
+      ReportOutOfMemory(cx);
+      return false;
+    }
+  }
+
+  instance.set(WasmInstanceObject::create(
+      cx, code_, moduleMeta().dataSegments, moduleMeta().elemSegments,
+      codeMeta().instanceDataLength, memories, std::move(tables), imports.funcs,
+      codeMeta().globals, imports.globalValues, imports.globalObjs,
+      imports.tagObjs, instanceProto, std::move(maybeDebug)));
+  if (!instance) {
+    return false;
+  }
+
+  if (!CreateExportObject(cx, instance, imports.funcs, tableObjs.get(),
+                          memories.get(), imports.tagObjs, imports.globalValues,
+                          imports.globalObjs, moduleMeta().exports)) {
+    return false;
+  }
+
+
+  if (!cx->realm()->wasm.registerInstance(cx, instance)) {
+    ReportOutOfMemory(cx);
+    return false;
+  }
+
+
+  if (!instance->instance().initSegments(cx, moduleMeta().dataSegments,
+                                         moduleMeta().elemSegments)) {
+    return false;
+  }
+
+
+  if (codeMeta().startFuncIndex) {
+    FixedInvokeArgs<0> args(cx);
+    if (!instance->instance().callExport(cx, *codeMeta().startFuncIndex,
+                                         args)) {
+      return false;
+    }
+  }
+
+  if (!false) {
+    if (moduleMeta().featureUsage & FeatureUsage::LegacyExceptions) {
+      if (!js::WarnNumberASCII(cx, JSMSG_WASM_LEGACY_EXCEPTIONS_DEPRECATED)) {
+        if (cx->isExceptionPending()) {
+          cx->clearPendingException();
+        }
+      }
+    }
+  }
+
+  if (cx->options().testWasmAwaitTier2() &&
+      code().mode() != CompileMode::LazyTiering) {
+    testingBlockOnTier2Complete();
+  }
+
+  return true;
+}

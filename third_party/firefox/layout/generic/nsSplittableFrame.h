@@ -1,0 +1,83 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsSplittableFrame_h_
+#define nsSplittableFrame_h_
+
+#include "nsIFrame.h"
+
+class nsSplittableFrame : public nsIFrame {
+ public:
+  NS_DECL_ABSTRACT_FRAME(nsSplittableFrame)
+  NS_DECL_QUERYFRAME_TARGET(nsSplittableFrame)
+  NS_DECL_QUERYFRAME
+
+  void Init(nsIContent* aContent, nsContainerFrame* aParent,
+            nsIFrame* aPrevInFlow) override;
+
+  void Destroy(DestroyContext&) override;
+
+
+  nsIFrame* GetPrevContinuation() const final;
+  nsIFrame* GetNextContinuation() const final;
+
+  void SetPrevContinuation(nsIFrame*) final;
+
+  void SetNextContinuation(nsIFrame*) final;
+
+  nsIFrame* FirstContinuation() const final;
+  nsIFrame* LastContinuation() const final;
+
+#ifdef DEBUG
+  static bool IsInPrevContinuationChain(nsIFrame* aFrame1, nsIFrame* aFrame2);
+  static bool IsInNextContinuationChain(nsIFrame* aFrame1, nsIFrame* aFrame2);
+#endif
+
+  nsIFrame* GetPrevInFlow() const final;
+  nsIFrame* GetNextInFlow() const final;
+
+  void SetPrevInFlow(nsIFrame*) final;
+
+  void SetNextInFlow(nsIFrame*) final;
+
+  nsIFrame* FirstInFlow() const final;
+  nsIFrame* LastInFlow() const final;
+
+  static void RemoveFromFlow(nsIFrame* aFrame);
+
+  LogicalSides PreReflowBlockLevelLogicalSkipSides() const {
+    return GetBlockLevelLogicalSkipSides(false);
+  };
+
+ protected:
+  nsSplittableFrame(ComputedStyle* aStyle, nsPresContext* aPresContext,
+                    ClassID aID)
+      : nsIFrame(aStyle, aPresContext, aID) {}
+
+  void UpdateFirstContinuationAndFirstInFlowCache();
+
+  nscoord CalcAndCacheConsumedBSize();
+
+  static nscoord ConsumedBSize(nsSplittableFrame* aFrame) {
+    return aFrame->CalcAndCacheConsumedBSize();
+  }
+
+  nscoord GetEffectiveComputedBSize(const ReflowInput& aReflowInput,
+                                    nscoord aConsumed) const;
+
+  LogicalSides GetLogicalSkipSides() const override {
+    return GetBlockLevelLogicalSkipSides(true);
+  }
+
+  LogicalSides GetBlockLevelLogicalSkipSides(bool aAfterReflow) const;
+
+  nsIFrame* mPrevContinuation = nullptr;
+  nsIFrame* mNextContinuation = nullptr;
+
+  nsIFrame* mFirstContinuation = nullptr;
+  nsIFrame* mFirstInFlow = nullptr;
+};
+
+#endif /* nsSplittableFrame_h_ */

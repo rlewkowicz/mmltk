@@ -1,0 +1,239 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_BrowsingContextGroup_h
+#define mozilla_dom_BrowsingContextGroup_h
+
+#include "mozilla/PrincipalHashKey.h"
+#include "mozilla/dom/BrowsingContext.h"
+#include "nsRefPtrHashtable.h"
+#include "nsHashKeys.h"
+#include "nsTArray.h"
+#include "nsTHashSet.h"
+#include "nsWrapperCache.h"
+#include "nsXULAppAPI.h"
+
+namespace mozilla {
+class ThrottledEventQueue;
+
+namespace dom {
+
+#define DEFAULT_SUCCESSIVE_DIALOG_TIME_LIMIT 3  // 3 sec
+
+class BrowsingContext;
+class WindowContext;
+class ContentParent;
+class DocGroup;
+
+struct DocGroupKey {
+  nsCString mKey;
+  bool mOriginKeyed = false;
+
+  bool operator==(const DocGroupKey& aOther) const {
+    return mKey == aOther.mKey && mOriginKeyed == aOther.mOriginKeyed;
+  };
+  PLDHashNumber Hash() const {
+    return mozilla::HashGeneric(mozilla::HashString(mKey), mOriginKeyed);
+  }
+};
+
+class BrowsingContextGroup final : public nsWrapperCache {
+ public:
+  NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(BrowsingContextGroup)
+  NS_DECL_CYCLE_COLLECTION_NATIVE_WRAPPERCACHE_CLASS(BrowsingContextGroup)
+
+  void Register(nsISupports* aContext);
+  void Unregister(nsISupports* aContext);
+
+  void EnsureHostProcess(ContentParent* aProcess);
+
+  void RemoveHostProcess(ContentParent* aProcess);
+
+  void Subscribe(ContentParent* aProcess);
+
+  void Unsubscribe(ContentParent* aProcess);
+
+  ContentParent* GetHostProcess(const nsACString& aRemoteType);
+
+  bool IsKnownForMessageReader(IPC::MessageReader* aReader);
+
+  bool IsKnownForChildID(GeckoChildID aChildID);
+
+  void AddKeepAlive();
+  void RemoveKeepAlive();
+
+  struct KeepAliveDeleter {
+    void operator()(BrowsingContextGroup* aPtr) {
+      if (RefPtr<BrowsingContextGroup> ptr = already_AddRefed(aPtr)) {
+        ptr->RemoveKeepAlive();
+      }
+    }
+  };
+  using KeepAlivePtr = UniquePtr<BrowsingContextGroup, KeepAliveDeleter>;
+  KeepAlivePtr MakeKeepAlivePtr();
+
+  void UpdateToplevelsSuspendedIfNeeded();
+
+  nsTArray<RefPtr<BrowsingContext>>& Toplevels() { return mToplevels; }
+  void GetToplevels(nsTArray<RefPtr<BrowsingContext>>& aToplevels) {
+    aToplevels.AppendElements(mToplevels);
+  }
+
+  uint64_t Id() { return mId; }
+
+  nsISupports* GetParentObject() const;
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  static already_AddRefed<BrowsingContextGroup> GetOrCreate(uint64_t aId);
+  static already_AddRefed<BrowsingContextGroup> GetExisting(uint64_t aId);
+  static already_AddRefed<BrowsingContextGroup> Create(
+      bool aPotentiallyCrossOriginIsolated = false);
+  static already_AddRefed<BrowsingContextGroup> Select(
+      WindowContext* aParent, BrowsingContext* aOpener);
+
+  static uint64_t CreateId(bool aPotentiallyCrossOriginIsolated = false);
+
+  template <typename Func>
+  void EachOtherParent(ContentParent* aExcludedParent, Func&& aCallback) {
+    MOZ_DIAGNOSTIC_ASSERT(XRE_IsParentProcess());
+    for (const auto& key : mSubscribers) {
+      if (key != aExcludedParent) {
+        aCallback(key);
+      }
+    }
+  }
+
+  template <typename Func>
+  void EachParent(Func&& aCallback) {
+    MOZ_DIAGNOSTIC_ASSERT(XRE_IsParentProcess());
+    for (const auto& key : mSubscribers) {
+      aCallback(key);
+    }
+  }
+
+  nsresult QueuePostMessageEvent(nsIRunnable* aRunnable);
+
+  void FlushPostMessageEvents();
+
+  void UpdateInputTaskManagerIfNeeded(bool aIsActive);
+
+  static BrowsingContextGroup* GetChromeGroup();
+
+  void GetDocGroups(nsTArray<DocGroup*>& aDocGroups);
+
+  already_AddRefed<DocGroup> AddDocument(Document* aDocument);
+
+  void RemoveDocument(Document* aDocument, DocGroup* aDocGroup);
+
+  mozilla::ThrottledEventQueue* GetTimerEventQueue() const {
+    return mTimerEventQueue;
+  }
+
+  mozilla::ThrottledEventQueue* GetWorkerEventQueue() const {
+    return mWorkerEventQueue;
+  }
+
+  void SetAreDialogsEnabled(bool aAreDialogsEnabled) {
+    mAreDialogsEnabled = aAreDialogsEnabled;
+  }
+
+  bool GetAreDialogsEnabled() { return mAreDialogsEnabled; }
+
+  bool GetDialogAbuseCount() { return mDialogAbuseCount; }
+
+  void ResetDialogAbuseState();
+
+  bool DialogsAreBeingAbused();
+
+  TimeStamp GetLastDialogQuitTime() { return mLastDialogQuitTime; }
+
+  void SetLastDialogQuitTime(TimeStamp aLastDialogQuitTime) {
+    mLastDialogQuitTime = aLastDialogQuitTime;
+  }
+
+  bool IsPotentiallyCrossOriginIsolated();
+
+  void NotifyFocusedOrActiveBrowsingContextToProcess(ContentParent* aProcess);
+
+  static void GetAllGroups(nsTArray<RefPtr<BrowsingContextGroup>>& aGroups);
+
+  void IncInputEventSuspensionLevel();
+  void DecInputEventSuspensionLevel();
+
+  void SetUseOriginAgentClusterFromNetwork(nsIPrincipal* aPrincipal,
+                                           bool aUseOriginAgentCluster);
+  void SetUseOriginAgentClusterFromIPC(nsIPrincipal* aPrincipal,
+                                       bool aUseOriginAgentCluster);
+  Maybe<bool> UsesOriginAgentCluster(nsIPrincipal* aPrincipal);
+
+  void EnsureUsesOriginAgentClusterInitialized(nsIPrincipal* aPrincipal);
+
+  void ChildDestroy();
+
+ private:
+  friend class CanonicalBrowsingContext;
+
+  explicit BrowsingContextGroup(uint64_t aId);
+  ~BrowsingContextGroup();
+
+  void MaybeDestroy();
+  void Destroy();
+
+  bool ShouldSuspendAllTopLevelContexts() const;
+
+  bool HasActiveBC();
+  void DecInputTaskManagerSuspensionLevel();
+  void IncInputTaskManagerSuspensionLevel();
+
+  uint64_t mId;
+
+  uint32_t mKeepAliveCount = 0;
+
+  bool mDestroyed = false;
+
+  nsTHashSet<nsRefPtrHashKey<nsISupports>> mContexts;
+
+  nsTArray<RefPtr<BrowsingContext>> mToplevels;
+
+  bool mToplevelsSuspended = false;
+
+  nsRefPtrHashtable<nsGenericHashKey<DocGroupKey>, DocGroup> mDocGroups;
+
+  nsRefPtrHashtable<nsCStringHashKey, ContentParent> mHosts;
+
+  nsTHashMap<PrincipalHashKey, bool> mUseOriginAgentCluster;
+
+  nsTHashSet<nsRefPtrHashKey<ContentParent>> mSubscribers;
+
+  RefPtr<mozilla::ThrottledEventQueue> mPostMessageEventQueue;
+
+  RefPtr<mozilla::ThrottledEventQueue> mTimerEventQueue;
+  RefPtr<mozilla::ThrottledEventQueue> mWorkerEventQueue;
+
+  uint32_t mInputEventSuspensionLevel = 0;
+  bool mHasIncreasedInputTaskManagerSuspensionLevel = false;
+
+  bool mAreDialogsEnabled = true;
+
+  uint32_t mDialogAbuseCount = 0;
+
+  TimeStamp mLastDialogQuitTime;
+};
+}  
+}  
+
+inline void ImplCycleCollectionUnlink(
+    mozilla::dom::BrowsingContextGroup::KeepAlivePtr& aField) {
+  aField = nullptr;
+}
+
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback,
+    mozilla::dom::BrowsingContextGroup::KeepAlivePtr& aField, const char* aName,
+    uint32_t aFlags = 0) {
+  CycleCollectionNoteChild(aCallback, aField.get(), aName, aFlags);
+}
+
+#endif  // !defined(mozilla_dom_BrowsingContextGroup_h)

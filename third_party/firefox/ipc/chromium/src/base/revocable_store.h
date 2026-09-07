@@ -1,0 +1,58 @@
+// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(BASE_REVOCABLE_STORE_H_)
+#define BASE_REVOCABLE_STORE_H_
+
+#include "base/basictypes.h"
+#include "nsISupportsImpl.h"
+
+class RevocableStore {
+ public:
+  class StoreRef final {
+   public:
+    NS_INLINE_DECL_THREADSAFE_REFCOUNTING(StoreRef)
+    explicit StoreRef(RevocableStore* aStore) : store_(aStore) {}
+
+    void set_store(RevocableStore* aStore) { store_ = aStore; }
+    RevocableStore* store() const { return store_; }
+
+   protected:
+    ~StoreRef() = default;
+
+   private:
+    RevocableStore* store_;
+
+    DISALLOW_EVIL_CONSTRUCTORS(StoreRef);
+  };
+
+  class Revocable {
+   public:
+    explicit Revocable(RevocableStore* store);
+    ~Revocable() = default;
+
+    bool revoked() const { return !store_reference_->store(); }
+
+   private:
+    RefPtr<StoreRef> store_reference_;
+
+    DISALLOW_EVIL_CONSTRUCTORS(Revocable);
+  };
+
+  RevocableStore();
+  ~RevocableStore();
+
+  void RevokeAll();
+
+ private:
+  friend class Revocable;
+
+  void Add(Revocable* item);
+
+  RefPtr<StoreRef> owning_reference_;
+
+  DISALLOW_EVIL_CONSTRUCTORS(RevocableStore);
+};
+
+#endif

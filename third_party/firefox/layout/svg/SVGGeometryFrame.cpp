@@ -1,0 +1,719 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "SVGGeometryFrame.h"
+
+#include "SVGAnimatedTransformList.h"
+#include "SVGMarkerFrame.h"
+#include "gfx2DGlue.h"
+#include "gfxContext.h"
+#include "gfxPlatform.h"
+#include "gfxUtils.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/SVGContentUtils.h"
+#include "mozilla/SVGContextPaint.h"
+#include "mozilla/SVGObserverUtils.h"
+#include "mozilla/SVGUtils.h"
+#include "mozilla/StaticPrefs_svg.h"
+#include "mozilla/dom/SVGGeometryElement.h"
+#include "mozilla/dom/SVGGraphicsElement.h"
+#include "mozilla/gfx/2D.h"
+#include "mozilla/gfx/Helpers.h"
+#include "nsGkAtoms.h"
+#include "nsLayoutUtils.h"
+
+using namespace mozilla::dom;
+using namespace mozilla::gfx;
+using namespace mozilla::image;
+
+
+nsIFrame* NS_NewSVGGeometryFrame(mozilla::PresShell* aPresShell,
+                                 mozilla::ComputedStyle* aStyle) {
+  return new (aPresShell)
+      mozilla::SVGGeometryFrame(aStyle, aPresShell->GetPresContext());
+}
+
+namespace mozilla {
+
+NS_IMPL_FRAMEARENA_HELPERS(SVGGeometryFrame)
+
+
+NS_QUERYFRAME_HEAD(SVGGeometryFrame)
+  NS_QUERYFRAME_ENTRY(ISVGDisplayableFrame)
+  NS_QUERYFRAME_ENTRY(SVGGeometryFrame)
+NS_QUERYFRAME_TAIL_INHERITING(nsIFrame)
+
+
+void SVGGeometryFrame::Init(nsIContent* aContent, nsContainerFrame* aParent,
+                            nsIFrame* aPrevInFlow) {
+  AddStateBits(aParent->GetStateBits() & NS_STATE_SVG_CLIPPATH_CHILD);
+  nsIFrame::Init(aContent, aParent, aPrevInFlow);
+}
+
+nsresult SVGGeometryFrame::AttributeChanged(int32_t aNameSpaceID,
+                                            nsAtom* aAttribute, AttrModType) {
+
+  if (aNameSpaceID == kNameSpaceID_None &&
+      (static_cast<SVGGeometryElement*>(GetContent())
+           ->AttributeDefinesGeometry(aAttribute))) {
+    nsLayoutUtils::PostRestyleEvent(mContent->AsElement(), RestyleHint{0},
+                                    nsChangeHint_InvalidateRenderingObservers);
+    SVGUtils::ScheduleReflowSVG(this);
+  }
+  return NS_OK;
+}
+
+void SVGGeometryFrame::DidSetComputedStyle(ComputedStyle* aOldComputedStyle) {
+  nsIFrame::DidSetComputedStyle(aOldComputedStyle);
+  if (StyleSVGReset()->HasNonScalingStroke() &&
+      (!aOldComputedStyle ||
+       !aOldComputedStyle->StyleSVGReset()->HasNonScalingStroke())) {
+    SVGUtils::UpdateNonScalingStrokeStateBit(this);
+  }
+  auto* element = static_cast<SVGGeometryElement*>(GetContent());
+  if (!aOldComputedStyle) {
+    element->ClearAnyCachedPath();
+    return;
+  }
+
+  const auto* oldStyleSVG = aOldComputedStyle->StyleSVG();
+  if (!SVGContentUtils::ShapeTypeHasNoCorners(GetContent())) {
+    if (StyleSVG()->mStrokeLinecap != oldStyleSVG->mStrokeLinecap &&
+        element->IsSVGElement(nsGkAtoms::path)) {
+      element->ClearAnyCachedPath();
+    } else if (HasAnyStateBits(NS_STATE_SVG_CLIPPATH_CHILD)) {
+      if (StyleSVG()->mClipRule != oldStyleSVG->mClipRule) {
+        element->ClearAnyCachedPath();
+      }
+    } else if (StyleSVG()->mFillRule != oldStyleSVG->mFillRule) {
+      element->ClearAnyCachedPath();
+    }
+  }
+
+  if (StyleDisplay()->CalcTransformPropertyDifference(
+          *aOldComputedStyle->StyleDisplay())) {
+    NotifySVGChanged(ChangeFlag::TransformChanged);
+  }
+
+  if (element->IsGeometryChangedViaCSS(*Style(), *aOldComputedStyle) ||
+      aOldComputedStyle->EffectiveZoom() != Style()->EffectiveZoom()) {
+    element->ClearAnyCachedPath();
+    SVGObserverUtils::InvalidateRenderingObservers(this);
+  }
+}
+
+bool SVGGeometryFrame::DoGetParentSVGTransforms(
+    gfx::Matrix* aFromParentTransform) const {
+  return SVGUtils::GetParentSVGTransforms(this, aFromParentTransform);
+}
+
+void SVGGeometryFrame::BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                                        const nsDisplayListSet& aLists) {
+  if (!static_cast<const SVGElement*>(GetContent())->HasValidDimensions()) {
+    return;
+  }
+
+  if (aBuilder->IsForPainting()) {
+    if (!IsVisibleForPainting()) {
+      return;
+    }
+    if (StyleEffects()->IsTransparent() && SVGUtils::CanOptimizeOpacity(this)) {
+      return;
+    }
+    const auto* styleSVG = StyleSVG();
+    if (styleSVG->mFill.kind.IsNone() && styleSVG->mStroke.kind.IsNone() &&
+        !styleSVG->HasMarker()) {
+      return;
+    }
+
+    aBuilder->BuildCompositorHitTestInfoIfNeeded(this,
+                                                 aLists.BorderBackground());
+  }
+
+  DisplayOutline(aBuilder, aLists);
+  aLists.Content()->AppendNewToTop<DisplaySVGGeometry>(aBuilder, this);
+}
+
+
+void SVGGeometryFrame::PaintSVG(gfxContext& aContext,
+                                const gfxMatrix& aTransform,
+                                imgDrawingParams& aImgParams) {
+  if (!StyleVisibility()->IsVisible()) {
+    return;
+  }
+
+  gfxMatrix newMatrix =
+      aContext.CurrentMatrixDouble().PreMultiply(aTransform).NudgeToIntegers();
+  if (newMatrix.IsSingular()) {
+    return;
+  }
+
+  uint32_t paintOrder = StyleSVG()->mPaintOrder;
+  if (!paintOrder) {
+    Render(&aContext, RenderFlags(RenderFlag::Fill, RenderFlag::Stroke),
+           newMatrix, aImgParams);
+    PaintMarkers(aContext, aTransform, aImgParams);
+  } else {
+    while (paintOrder) {
+      auto component = StylePaintOrder(paintOrder & kPaintOrderMask);
+      switch (component) {
+        case StylePaintOrder::Fill:
+          Render(&aContext, RenderFlag::Fill, newMatrix, aImgParams);
+          break;
+        case StylePaintOrder::Stroke:
+          Render(&aContext, RenderFlag::Stroke, newMatrix, aImgParams);
+          break;
+        case StylePaintOrder::Markers:
+          PaintMarkers(aContext, aTransform, aImgParams);
+          break;
+        default:
+          MOZ_FALLTHROUGH_ASSERT("Unknown paint-order variant, how?");
+        case StylePaintOrder::Normal:
+          break;
+      }
+      paintOrder >>= kPaintOrderShift;
+    }
+  }
+}
+
+nsIFrame* SVGGeometryFrame::GetFrameForPoint(const gfxPoint& aPoint) {
+  FillRule fillRule;
+  SVGHitTestFlags hitTestFlags;
+  if (HasAnyStateBits(NS_STATE_SVG_CLIPPATH_CHILD)) {
+    hitTestFlags = SVGHitTestFlag::Fill;
+    fillRule = SVGUtils::ToFillRule(StyleSVG()->mClipRule);
+  } else {
+    hitTestFlags = SVGUtils::GetGeometryHitTestFlags(this);
+    if (hitTestFlags.isEmpty()) {
+      return nullptr;
+    }
+    fillRule = SVGUtils::ToFillRule(StyleSVG()->mFillRule);
+  }
+
+  bool isHit = false;
+
+  SVGGeometryElement* content = static_cast<SVGGeometryElement*>(GetContent());
+
+  RefPtr<DrawTarget> drawTarget =
+      gfxPlatform::GetPlatform()->ScreenReferenceDrawTarget();
+  RefPtr<Path> path = content->GetOrBuildPath(drawTarget, fillRule);
+  if (!path) {
+    return nullptr;  
+  }
+
+  if (hitTestFlags.contains(SVGHitTestFlag::Fill)) {
+    isHit = path->ContainsPoint(ToPoint(aPoint), {});
+  }
+  if (!isHit && hitTestFlags.contains(SVGHitTestFlag::Stroke)) {
+    Point point = ToPoint(aPoint);
+    SVGContentUtils::AutoStrokeOptions stroke;
+    SVGContentUtils::GetStrokeOptions(&stroke, content, Style(), nullptr);
+    gfxMatrix userToOuterSVG;
+    if (SVGUtils::GetNonScalingStrokeTransform(this, &userToOuterSVG)) {
+      point = ToMatrix(userToOuterSVG).TransformPoint(point);
+      Path::TransformAndSetFillRule(path, ToMatrix(userToOuterSVG), fillRule);
+    }
+    isHit = path->StrokeContainsPoint(stroke, point, {});
+  }
+
+  if (isHit && SVGUtils::HitTestClip(this, aPoint)) {
+    return this;
+  }
+
+  return nullptr;
+}
+
+void SVGGeometryFrame::ReflowSVG() {
+  NS_ASSERTION(SVGUtils::OuterSVGIsCallingReflowSVG(this),
+               "This call is probably a wasteful mistake");
+
+  MOZ_ASSERT(!HasAnyStateBits(NS_FRAME_IS_NONDISPLAY),
+             "ReflowSVG mechanism not designed for this");
+
+  if (!SVGUtils::NeedsReflowSVG(this)) {
+    return;
+  }
+
+  SVGBBoxFlags flags = {SVGBBoxFlag::IncludeFillGeometry,
+                        SVGBBoxFlag::IncludeStroke,
+                        SVGBBoxFlag::IncludeMarkers};
+
+  SVGHitTestFlags hitTestFlags = SVGUtils::GetGeometryHitTestFlags(this);
+  if (hitTestFlags.contains(SVGHitTestFlag::Fill)) {
+    flags += SVGBBoxFlag::IncludeFillGeometry;
+  }
+  if (hitTestFlags.contains(SVGHitTestFlag::Stroke)) {
+    flags += SVGBBoxFlag::IncludeStrokeGeometry;
+  }
+
+  SVGBBox extent = GetBBoxContribution({}, flags).ToThebesRect();
+  mRect = nsLayoutUtils::RoundGfxRectToAppRect((const Rect&)extent,
+                                               AppUnitsPerCSSPixel());
+
+  if (HasAnyStateBits(NS_FRAME_FIRST_REFLOW)) {
+    SVGObserverUtils::UpdateEffects(this);
+  }
+
+  nsRect overflow = nsRect(nsPoint(0, 0), mRect.Size());
+  OverflowAreas overflowAreas(overflow, overflow);
+  FinishAndStoreOverflow(overflowAreas, mRect.Size());
+
+  RemoveStateBits(NS_FRAME_FIRST_REFLOW | NS_FRAME_IS_DIRTY |
+                  NS_FRAME_HAS_DIRTY_CHILDREN);
+
+  if (!GetParent()->HasAnyStateBits(NS_FRAME_FIRST_REFLOW)) {
+    InvalidateFrame();
+  }
+}
+
+void SVGGeometryFrame::NotifySVGChanged(ChangeFlags aFlags) {
+  MOZ_ASSERT(aFlags.contains(ChangeFlag::TransformChanged) ||
+                 aFlags.contains(ChangeFlag::CoordContextChanged),
+             "Invalidation logic may need adjusting");
+
+
+
+  if (aFlags.contains(ChangeFlag::CoordContextChanged)) {
+    auto* geom = static_cast<SVGGeometryElement*>(GetContent());
+    const auto& strokeWidth = StyleSVG()->mStrokeWidth;
+    if (geom->GeometryDependsOnCoordCtx() ||
+        (strokeWidth.IsLengthPercentage() &&
+         strokeWidth.AsLengthPercentage().HasPercent())) {
+      geom->ClearAnyCachedPath();
+      SVGUtils::ScheduleReflowSVG(this);
+    }
+  }
+
+  if (aFlags.contains(ChangeFlag::TransformChanged) &&
+      StyleSVGReset()->HasNonScalingStroke()) {
+    SVGUtils::ScheduleReflowSVG(this);
+  }
+}
+
+SVGBBox SVGGeometryFrame::GetBBoxContribution(const Matrix& aToBBoxUserspace,
+                                              SVGBBoxFlags aFlags) {
+  SVGBBox bbox;
+
+  if (aToBBoxUserspace.IsSingular()) {
+    return bbox;
+  }
+
+  if (aFlags.contains(SVGBBoxFlag::ForGetClientRects) &&
+      aToBBoxUserspace.PreservesAxisAlignedRectangles()) {
+    if (!mRect.IsEmpty()) {
+      Rect rect = NSRectToRect(mRect, AppUnitsPerCSSPixel());
+      bbox = aToBBoxUserspace.TransformBounds(rect);
+    }
+    return bbox;
+  }
+
+  SVGGeometryElement* element = static_cast<SVGGeometryElement*>(GetContent());
+
+  const bool getFill = aFlags.contains(SVGBBoxFlag::IncludeFillGeometry);
+
+  const bool getStroke =
+      (aFlags.contains(SVGBBoxFlag::IncludeStrokeGeometry) ||
+       (aFlags.contains(SVGBBoxFlag::IncludeStroke) &&
+        SVGUtils::HasStroke(this))) &&
+      !(StyleSVGReset()->HasNonScalingStroke() &&
+        aFlags.contains(SVGBBoxFlag::AvoidCycleIfNonScalingStroke));
+
+  SVGContentUtils::AutoStrokeOptions strokeOptions;
+  if (getStroke) {
+    SVGContentUtils::GetStrokeOptions(
+        &strokeOptions, element, Style(), nullptr,
+        SVGContentUtils::StrokeOptionFlag::IgnoreStrokeDashing);
+  } else {
+    strokeOptions.mLineWidth = 0.f;
+  }
+
+  Rect simpleBounds;
+  bool gotSimpleBounds = false;
+  gfxMatrix userToOuterSVG;
+  if (getStroke &&
+      SVGUtils::GetNonScalingStrokeTransform(this, &userToOuterSVG)) {
+    Matrix moz2dUserToOuterSVG = ToMatrix(userToOuterSVG);
+    if (moz2dUserToOuterSVG.IsSingular()) {
+      return bbox;
+    }
+    gotSimpleBounds = element->GetGeometryBounds(
+        &simpleBounds, strokeOptions, aToBBoxUserspace, &moz2dUserToOuterSVG);
+  } else if (getFill || getStroke) {
+    gotSimpleBounds = element->GetGeometryBounds(&simpleBounds, strokeOptions,
+                                                 aToBBoxUserspace);
+  }
+
+  if (gotSimpleBounds) {
+    bbox = simpleBounds;
+  } else {
+    RefPtr<Path> pathInBBoxSpace;
+    RefPtr<Path> pathInUserSpace;
+    if (getFill || getStroke) {
+      RefPtr<DrawTarget> tmpDT;
+      tmpDT = gfxPlatform::GetPlatform()->ScreenReferenceDrawTarget();
+
+      FillRule fillRule = SVGUtils::ToFillRule(
+          HasAnyStateBits(NS_STATE_SVG_CLIPPATH_CHILD) ? StyleSVG()->mClipRule
+                                                       : StyleSVG()->mFillRule);
+      pathInUserSpace = element->GetOrBuildPath(tmpDT, fillRule);
+      if (!pathInUserSpace) {
+        return bbox;
+      }
+      if (aToBBoxUserspace.IsIdentity()) {
+        pathInBBoxSpace = pathInUserSpace;
+      } else {
+        RefPtr<PathBuilder> builder = pathInUserSpace->TransformedCopyToBuilder(
+            aToBBoxUserspace, fillRule);
+        pathInBBoxSpace = builder->Finish();
+        if (!pathInBBoxSpace) {
+          return bbox;
+        }
+      }
+    }
+
+    if (getFill && !getStroke) {
+      Rect pathBBoxExtents = pathInBBoxSpace->GetBounds();
+      if (!pathBBoxExtents.IsFinite()) {
+        return bbox;
+      }
+      bbox = pathBBoxExtents;
+    }
+
+    if (getStroke) {
+
+      Rect strokeBBoxExtents;
+      if (StaticPrefs::svg_Moz2D_strokeBounds_enabled()) {
+        gfxMatrix userToOuterSVG;
+        if (SVGUtils::GetNonScalingStrokeTransform(this, &userToOuterSVG)) {
+          Matrix outerSVGToUser = ToMatrix(userToOuterSVG);
+          outerSVGToUser.Invert();
+          Matrix outerSVGToBBox = aToBBoxUserspace * outerSVGToUser;
+          RefPtr<PathBuilder> builder =
+              pathInUserSpace->TransformedCopyToBuilder(
+                  ToMatrix(userToOuterSVG));
+          RefPtr<Path> pathInOuterSVGSpace = builder->Finish();
+          strokeBBoxExtents = pathInOuterSVGSpace->GetStrokedBounds(
+              strokeOptions, outerSVGToBBox);
+        } else {
+          strokeBBoxExtents = pathInUserSpace->GetStrokedBounds(
+              strokeOptions, aToBBoxUserspace);
+        }
+        if (strokeBBoxExtents.IsEmpty() && getFill) {
+          strokeBBoxExtents = pathInBBoxSpace->GetBounds();
+          if (!strokeBBoxExtents.IsFinite()) {
+            return bbox;
+          }
+        }
+      } else {
+        Rect pathBBoxExtents = pathInBBoxSpace->GetBounds();
+        if (!pathBBoxExtents.IsFinite()) {
+          return bbox;
+        }
+        strokeBBoxExtents = ToRect(SVGUtils::PathExtentsToMaxStrokeExtents(
+            ThebesRect(pathBBoxExtents), this, ThebesMatrix(aToBBoxUserspace)));
+      }
+      MOZ_ASSERT(strokeBBoxExtents.IsFinite(), "bbox is about to go bad");
+      bbox.UnionEdges(strokeBBoxExtents);
+    }
+  }
+
+  if (aFlags.contains(SVGBBoxFlag::IncludeMarkers) && element->IsMarkable()) {
+    SVGMarkerFrames markerFrames;
+    if (SVGObserverUtils::GetAndObserveMarkers(this, &markerFrames)) {
+      nsTArray<SVGMark> marks;
+      element->GetMarkPoints(&marks);
+      if (uint32_t num = marks.Length()) {
+        float strokeWidth = SVGUtils::GetStrokeWidth(this);
+        for (uint32_t i = 0; i < num; i++) {
+          const SVGMark& mark = marks[i];
+          SVGMarkerFrame* frame = markerFrames[mark.type];
+          if (frame) {
+            SVGBBox mbbox = frame->GetMarkBBoxContribution(
+                aToBBoxUserspace, aFlags, this, mark, strokeWidth);
+            MOZ_ASSERT(mbbox.IsFinite(), "bbox is about to go bad");
+            bbox.UnionEdges(mbbox);
+          }
+        }
+      }
+    }
+  }
+
+  if (aFlags.contains(SVGBBoxFlag::DisregardCSSZoom)) {
+    bbox.Scale(1 / Style()->EffectiveZoom().ToFloat());
+  }
+
+  return bbox;
+}
+
+
+gfxMatrix SVGGeometryFrame::GetCanvasTM() {
+  NS_ASSERTION(GetParent(), "null parent");
+
+  auto* parent = static_cast<SVGContainerFrame*>(GetParent());
+  auto* content = static_cast<SVGGraphicsElement*>(GetContent());
+  return content->ChildToUserSpaceTransform() * parent->GetCanvasTM();
+}
+
+void SVGGeometryFrame::Render(gfxContext* aContext,
+                              RenderFlags aRenderComponents,
+                              const gfxMatrix& aTransform,
+                              imgDrawingParams& aImgParams) {
+  MOZ_ASSERT(!aTransform.IsSingular());
+
+  DrawTarget* drawTarget = aContext->GetDrawTarget();
+
+  MOZ_ASSERT(drawTarget);
+  if (!drawTarget->IsValid()) {
+    return;
+  }
+
+  FillRule fillRule = SVGUtils::ToFillRule(
+      HasAnyStateBits(NS_STATE_SVG_CLIPPATH_CHILD) ? StyleSVG()->mClipRule
+                                                   : StyleSVG()->mFillRule);
+
+  SVGGeometryElement* element = static_cast<SVGGeometryElement*>(GetContent());
+
+  AntialiasMode aaMode = SVGUtils::ToAntialiasMode(StyleSVG()->mShapeRendering);
+
+  gfxContextMatrixAutoSaveRestore autoRestoreTransform(aContext);
+  aContext->SetMatrixDouble(aTransform);
+
+  if (HasAnyStateBits(NS_STATE_SVG_CLIPPATH_CHILD)) {
+    RefPtr<Path> path = element->GetOrBuildPath(drawTarget, fillRule);
+    if (path) {
+      ColorPattern white(ToDeviceColor(sRGBColor(1.0f, 1.0f, 1.0f, 1.0f)));
+      drawTarget->Fill(path, white,
+                       DrawOptions(1.0f, CompositionOp::OP_OVER, aaMode));
+    }
+    return;
+  }
+
+  SVGGeometryElement::SimplePath simplePath;
+  RefPtr<Path> path;
+
+  element->GetAsSimplePath(&simplePath);
+  if (!simplePath.IsPath()) {
+    path = element->GetOrBuildPath(drawTarget, fillRule);
+    if (!path) {
+      return;
+    }
+  }
+
+  SVGContextPaint* contextPaint =
+      SVGContextPaint::GetContextPaint(GetContent());
+
+  if (aRenderComponents.contains(RenderFlag::Fill)) {
+    GeneralPattern fillPattern;
+    SVGUtils::MakeFillPatternFor(this, aContext, &fillPattern, aImgParams,
+                                 contextPaint);
+
+    if (fillPattern.GetPattern()) {
+      DrawOptions drawOptions(1.0f, CompositionOp::OP_OVER, aaMode);
+      if (simplePath.IsRect()) {
+        drawTarget->FillRect(simplePath.AsRect(), fillPattern, drawOptions);
+      } else if (path) {
+        drawTarget->Fill(path, fillPattern, drawOptions);
+      }
+    }
+  }
+
+  if (aRenderComponents.contains(RenderFlag::Stroke) &&
+      SVGUtils::HasStroke(this, contextPaint)) {
+    gfxMatrix userToOuterSVG;
+    if (SVGUtils::GetNonScalingStrokeTransform(this, &userToOuterSVG)) {
+      if (!path) {
+        path = element->GetOrBuildPath(drawTarget, fillRule);
+        if (!path) {
+          return;
+        }
+        simplePath.Reset();
+      }
+      gfxMatrix outerSVGToUser = userToOuterSVG;
+      outerSVGToUser.Invert();
+      aContext->Multiply(outerSVGToUser);
+      Path::TransformAndSetFillRule(path, ToMatrix(userToOuterSVG), fillRule);
+    }
+    GeneralPattern strokePattern;
+    SVGUtils::MakeStrokePatternFor(this, aContext, &strokePattern, aImgParams,
+                                   contextPaint);
+
+    if (strokePattern.GetPattern()) {
+      SVGContentUtils::AutoStrokeOptions strokeOptions;
+      SVGContentUtils::GetStrokeOptions(&strokeOptions,
+                                        static_cast<SVGElement*>(GetContent()),
+                                        Style(), contextPaint);
+      if (strokeOptions.mLineWidth <= 0) {
+        return;
+      }
+      DrawOptions drawOptions(1.0f, CompositionOp::OP_OVER, aaMode);
+      if (simplePath.IsRect()) {
+        drawTarget->StrokeRect(simplePath.AsRect(), strokePattern,
+                               strokeOptions, drawOptions);
+      } else if (simplePath.IsLine()) {
+        drawTarget->StrokeLine(simplePath.Point1(), simplePath.Point2(),
+                               strokePattern, strokeOptions, drawOptions);
+      } else {
+        drawTarget->Stroke(path, strokePattern, strokeOptions, drawOptions);
+      }
+    }
+  }
+}
+
+bool SVGGeometryFrame::IsInvisible() const {
+  if (!StyleVisibility()->IsVisible()) {
+    return true;
+  }
+
+  constexpr float opacity_threshold = 1.0 / 128.0;
+
+  if (StyleEffects()->mOpacity <= opacity_threshold &&
+      SVGUtils::CanOptimizeOpacity(this)) {
+    return true;
+  }
+
+  const nsStyleSVG* style = StyleSVG();
+  SVGContextPaint* contextPaint =
+      SVGContextPaint::GetContextPaint(GetContent());
+
+  if (!style->mFill.kind.IsNone()) {
+    float opacity = SVGUtils::GetOpacity(style->mFillOpacity, contextPaint);
+    if (opacity > opacity_threshold) {
+      return false;
+    }
+  }
+
+  if (!style->mStroke.kind.IsNone()) {
+    float opacity = SVGUtils::GetOpacity(style->mStrokeOpacity, contextPaint);
+    if (opacity > opacity_threshold) {
+      return false;
+    }
+  }
+
+  if (style->HasMarker()) {
+    return false;
+  }
+
+  return true;
+}
+
+bool SVGGeometryFrame::CreateWebRenderCommands(
+    mozilla::wr::DisplayListBuilder& aBuilder,
+    mozilla::wr::IpcResourceUpdateQueue& aResources,
+    const mozilla::layers::StackingContextHelper& aSc,
+    mozilla::layers::RenderRootStateManager* aManager,
+    nsDisplayListBuilder* aDisplayListBuilder, DisplaySVGGeometry* aItem,
+    bool aDryRun) {
+  MOZ_ASSERT(StyleVisibility()->IsVisible());
+
+  SVGGeometryElement* element = static_cast<SVGGeometryElement*>(GetContent());
+
+  SVGGeometryElement::SimplePath simplePath;
+  element->GetAsSimplePath(&simplePath);
+
+  if (!simplePath.IsRect()) {
+    return false;
+  }
+
+  const nsStyleSVG* style = StyleSVG();
+  MOZ_ASSERT(style);
+
+  if (!style->mFill.kind.IsColor()) {
+    return false;
+  }
+
+  switch (style->mFill.kind.tag) {
+    case StyleSVGPaintKind::Tag::Color:
+      break;
+    default:
+      return false;
+  }
+
+  if (!style->mStroke.kind.IsNone()) {
+    return false;
+  }
+
+  if (StyleEffects()->HasMixBlendMode()) {
+    return false;
+  }
+
+  if (style->HasMarker() && element->IsMarkable()) {
+    return false;
+  }
+
+  if (!aDryRun) {
+    auto appUnitsPerDevPx = PresContext()->AppUnitsPerDevPixel();
+    float scale = (float)AppUnitsPerCSSPixel() / (float)appUnitsPerDevPx;
+
+    auto rect = simplePath.AsRect();
+    rect.Scale(scale);
+
+    auto offset = LayoutDevicePoint::FromAppUnits(
+        aItem->ToReferenceFrame() - GetPosition(), appUnitsPerDevPx);
+    rect.MoveBy(offset.x, offset.y);
+
+    auto wrRect = wr::ToLayoutRect(rect);
+
+    SVGContextPaint* contextPaint =
+        SVGContextPaint::GetContextPaint(GetContent());
+
+    float elemOpacity = 1.0f;
+    if (SVGUtils::CanOptimizeOpacity(this)) {
+      elemOpacity = StyleEffects()->mOpacity;
+    }
+
+    float fillOpacity = SVGUtils::GetOpacity(style->mFillOpacity, contextPaint);
+    float opacity = elemOpacity * fillOpacity;
+
+    auto color = wr::ToColorF(
+        ToDeviceColor(StyleSVG()->mFill.kind.AsColor().CalcColor(this)));
+    color.a *= opacity;
+    aBuilder.PushRect(wrRect, wrRect, !aItem->BackfaceIsHidden(), true, false,
+                      color);
+  }
+
+  return true;
+}
+
+void SVGGeometryFrame::PaintMarkers(gfxContext& aContext,
+                                    const gfxMatrix& aTransform,
+                                    imgDrawingParams& aImgParams) {
+  auto* element = static_cast<SVGGeometryElement*>(GetContent());
+  if (!element->IsMarkable()) {
+    return;
+  }
+  SVGMarkerFrames markerFrames;
+  if (!SVGObserverUtils::GetAndObserveMarkers(this, &markerFrames)) {
+    return;
+  }
+  nsTArray<SVGMark> marks;
+  element->GetMarkPoints(&marks);
+  if (marks.IsEmpty()) {
+    return;
+  }
+  float strokeWidth = GetStrokeWidthForMarkers();
+  for (const SVGMark& mark : marks) {
+    if (auto* frame = markerFrames[mark.type]) {
+      frame->PaintMark(aContext, aTransform, this, mark, strokeWidth,
+                       aImgParams);
+    }
+  }
+}
+
+float SVGGeometryFrame::GetStrokeWidthForMarkers() {
+  float strokeWidth = SVGUtils::GetStrokeWidth(
+      this, SVGContextPaint::GetContextPaint(GetContent()));
+  gfxMatrix userToOuterSVG;
+  if (SVGUtils::GetNonScalingStrokeTransform(this, &userToOuterSVG)) {
+
+    strokeWidth /= float(sqrt(userToOuterSVG._11 * userToOuterSVG._11 +
+                              userToOuterSVG._12 * userToOuterSVG._12 +
+                              userToOuterSVG._21 * userToOuterSVG._21 +
+                              userToOuterSVG._22 * userToOuterSVG._22) /
+                         M_SQRT2);
+  }
+  return strokeWidth;
+}
+
+}  

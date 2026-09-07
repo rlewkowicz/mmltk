@@ -1,0 +1,509 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ReadableStreamAbstract.h"
+#include "ReadableStreamDefaultControllerAbstract.h"
+#include "js/Exception.h"
+#include "js/TypeDecls.h"
+#include "js/Value.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/HoldDropJSObjects.h"
+#include "mozilla/dom/Promise-inl.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/ReadableStreamControllerBase.h"
+#include "mozilla/dom/ReadableStreamDefaultControllerBinding.h"
+#include "mozilla/dom/ReadableStreamDefaultReaderBinding.h"
+#include "mozilla/dom/UnderlyingSourceBinding.h"
+#include "mozilla/dom/UnderlyingSourceCallbackHelpers.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsISupports.h"
+
+namespace mozilla::dom {
+
+using namespace streams_abstract;
+
+NS_IMPL_CYCLE_COLLECTION(ReadableStreamControllerBase, mGlobal, mAlgorithms,
+                         mStream)
+NS_IMPL_CYCLE_COLLECTING_ADDREF(ReadableStreamControllerBase)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(ReadableStreamControllerBase)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(ReadableStreamControllerBase)
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+ReadableStreamControllerBase::ReadableStreamControllerBase(
+    nsIGlobalObject* aGlobal)
+    : mGlobal(aGlobal) {}
+
+void ReadableStreamControllerBase::SetStream(ReadableStream* aStream) {
+  mStream = aStream;
+}
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(ReadableStreamDefaultController)
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_INHERITED(ReadableStreamDefaultController,
+                                                ReadableStreamControllerBase)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mStrategySizeAlgorithm)
+  tmp->mQueue.clear();
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_PRESERVED_WRAPPER
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(
+    ReadableStreamDefaultController, ReadableStreamControllerBase)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mStrategySizeAlgorithm)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTION_TRACE_BEGIN_INHERITED(ReadableStreamDefaultController,
+                                               ReadableStreamControllerBase)
+  NS_IMPL_CYCLE_COLLECTION_TRACE_PRESERVED_WRAPPER
+  for (const auto& queueEntry : tmp->mQueue) {
+    aCallbacks.Trace(&queueEntry->mValue, "mQueue.mValue", aClosure);
+  }
+NS_IMPL_CYCLE_COLLECTION_TRACE_END
+
+NS_IMPL_ADDREF_INHERITED(ReadableStreamDefaultController,
+                         ReadableStreamControllerBase)
+NS_IMPL_RELEASE_INHERITED(ReadableStreamDefaultController,
+                          ReadableStreamControllerBase)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(ReadableStreamDefaultController)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+NS_INTERFACE_MAP_END_INHERITING(ReadableStreamControllerBase)
+
+ReadableStreamDefaultController::ReadableStreamDefaultController(
+    nsIGlobalObject* aGlobal)
+    : ReadableStreamControllerBase(aGlobal) {
+  mozilla::HoldJSObjects(this);
+}
+
+ReadableStreamDefaultController::~ReadableStreamDefaultController() {
+  mozilla::DropJSObjects(this);
+  mQueue.clear();
+}
+
+JSObject* ReadableStreamDefaultController::WrapObject(
+    JSContext* aCx, JS::Handle<JSObject*> aGivenProto) {
+  return ReadableStreamDefaultController_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+namespace streams_abstract {
+
+static bool ReadableStreamDefaultControllerCanCloseOrEnqueue(
+    ReadableStreamDefaultController* aController) {
+  ReadableStream::ReaderState state = aController->Stream()->State();
+
+  return !aController->CloseRequested() &&
+         state == ReadableStream::ReaderState::Readable;
+}
+
+bool ReadableStreamDefaultControllerCanCloseOrEnqueueAndThrow(
+    ReadableStreamDefaultController* aController,
+    CloseOrEnqueue aCloseOrEnqueue, ErrorResult& aRv) {
+  ReadableStream::ReaderState state = aController->Stream()->State();
+
+  nsCString prefix;
+  if (aCloseOrEnqueue == CloseOrEnqueue::Close) {
+    prefix = "Cannot close a stream that "_ns;
+  } else {
+    prefix = "Cannot enqueue into a stream that "_ns;
+  }
+
+  switch (state) {
+    case ReadableStream::ReaderState::Readable:
+      if (!aController->CloseRequested()) {
+        return true;
+      }
+
+      aRv.ThrowTypeError(prefix + "has already been requested to close."_ns);
+      return false;
+
+    case ReadableStream::ReaderState::Closed:
+      aRv.ThrowTypeError(prefix + "is already closed."_ns);
+      return false;
+
+    case ReadableStream::ReaderState::Errored:
+      aRv.ThrowTypeError(prefix + "has errored."_ns);
+      return false;
+
+    default:
+      MOZ_ASSERT_UNREACHABLE("Unknown ReaderState");
+      return false;
+  }
+}
+
+Nullable<double> ReadableStreamDefaultControllerGetDesiredSize(
+    ReadableStreamDefaultController* aController) {
+  ReadableStream::ReaderState state = aController->Stream()->State();
+  if (state == ReadableStream::ReaderState::Errored) {
+    return nullptr;
+  }
+
+  if (state == ReadableStream::ReaderState::Closed) {
+    return 0.0;
+  }
+
+  return aController->StrategyHWM() - aController->QueueTotalSize();
+}
+
+}  
+
+Nullable<double> ReadableStreamDefaultController::GetDesiredSize() {
+  return ReadableStreamDefaultControllerGetDesiredSize(this);
+}
+
+namespace streams_abstract {
+
+void ReadableStreamDefaultControllerClearAlgorithms(
+    ReadableStreamDefaultController* aController) {
+  aController->ClearAlgorithms();
+
+  aController->setStrategySizeAlgorithm(nullptr);
+}
+
+void ReadableStreamDefaultControllerClose(
+    JSContext* aCx, ReadableStreamDefaultController* aController,
+    ErrorResult& aRv) {
+  if (!ReadableStreamDefaultControllerCanCloseOrEnqueue(aController)) {
+    return;
+  }
+
+  RefPtr<ReadableStream> stream = aController->Stream();
+
+  aController->SetCloseRequested(true);
+
+  if (aController->Queue().isEmpty()) {
+    ReadableStreamDefaultControllerClearAlgorithms(aController);
+
+    ReadableStreamClose(aCx, stream, aRv);
+  }
+}
+
+}  
+
+void ReadableStreamDefaultController::Close(JSContext* aCx, ErrorResult& aRv) {
+  if (!ReadableStreamDefaultControllerCanCloseOrEnqueueAndThrow(
+          this, CloseOrEnqueue::Close, aRv)) {
+    return;
+  }
+
+  ReadableStreamDefaultControllerClose(aCx, this, aRv);
+}
+
+namespace streams_abstract {
+
+MOZ_CAN_RUN_SCRIPT static void ReadableStreamDefaultControllerCallPullIfNeeded(
+    JSContext* aCx, ReadableStreamDefaultController* aController,
+    ErrorResult& aRv);
+
+void ReadableStreamDefaultControllerEnqueue(
+    JSContext* aCx, ReadableStreamDefaultController* aController,
+    JS::Handle<JS::Value> aChunk, ErrorResult& aRv) {
+  if (!ReadableStreamDefaultControllerCanCloseOrEnqueue(aController)) {
+    return;
+  }
+
+  RefPtr<ReadableStream> stream = aController->Stream();
+
+  if (IsReadableStreamLocked(stream) &&
+      ReadableStreamGetNumReadRequests(stream) > 0) {
+    ReadableStreamFulfillReadRequest(aCx, stream, aChunk, false, aRv);
+  } else {
+    Optional<JS::Handle<JS::Value>> optionalChunk(aCx, aChunk);
+
+    RefPtr<QueuingStrategySize> sizeAlgorithm(
+        aController->StrategySizeAlgorithm());
+
+    double chunkSize =
+        sizeAlgorithm
+            ? sizeAlgorithm->Call(
+                  optionalChunk, aRv,
+                  "ReadableStreamDefaultController.[[strategySizeAlgorithm]]",
+                  CallbackObject::eRethrowExceptions)
+            : 1.0;
+
+    if (aRv.IsUncatchableException()) {
+      return;
+    }
+
+    if (aRv.MaybeSetPendingException(
+            aCx, "ReadableStreamDefaultController.enqueue")) {
+      JS::Rooted<JS::Value> errorValue(aCx);
+
+      JS_GetPendingException(aCx, &errorValue);
+
+      JS_ClearPendingException(aCx);
+
+
+      ReadableStreamDefaultControllerError(aCx, aController, errorValue, aRv);
+      if (aRv.Failed()) {
+        return;
+      }
+
+      aRv.MightThrowJSException();
+      aRv.ThrowJSException(aCx, errorValue);
+      return;
+    }
+
+    EnqueueValueWithSize(aController, aChunk, chunkSize, aRv);
+
+    if (aRv.MaybeSetPendingException(
+            aCx, "ReadableStreamDefaultController.enqueue")) {
+      JS::Rooted<JS::Value> errorValue(aCx);
+
+      if (!JS_GetPendingException(aCx, &errorValue)) {
+        aRv.StealExceptionFromJSContext(aCx);
+        return;
+      }
+      JS_ClearPendingException(aCx);
+
+      ReadableStreamDefaultControllerError(aCx, aController, errorValue, aRv);
+      if (aRv.Failed()) {
+        return;
+      }
+
+      aRv.MightThrowJSException();
+      aRv.ThrowJSException(aCx, errorValue);
+      return;
+    }
+  }
+
+  ReadableStreamDefaultControllerCallPullIfNeeded(aCx, aController, aRv);
+}
+
+}  
+
+void ReadableStreamDefaultController::Enqueue(JSContext* aCx,
+                                              JS::Handle<JS::Value> aChunk,
+                                              ErrorResult& aRv) {
+  if (!ReadableStreamDefaultControllerCanCloseOrEnqueueAndThrow(
+          this, CloseOrEnqueue::Enqueue, aRv)) {
+    return;
+  }
+
+  ReadableStreamDefaultControllerEnqueue(aCx, this, aChunk, aRv);
+}
+
+void ReadableStreamDefaultController::Error(JSContext* aCx,
+                                            JS::Handle<JS::Value> aError,
+                                            ErrorResult& aRv) {
+  ReadableStreamDefaultControllerError(aCx, this, aError, aRv);
+}
+
+namespace streams_abstract {
+
+bool ReadableStreamDefaultControllerShouldCallPull(
+    ReadableStreamDefaultController* aController) {
+  ReadableStream* stream = aController->Stream();
+
+  if (!ReadableStreamDefaultControllerCanCloseOrEnqueue(aController)) {
+    return false;
+  }
+
+  if (!aController->Started()) {
+    return false;
+  }
+
+  if (IsReadableStreamLocked(stream) &&
+      ReadableStreamGetNumReadRequests(stream) > 0) {
+    return true;
+  }
+
+  Nullable<double> desiredSize =
+      ReadableStreamDefaultControllerGetDesiredSize(aController);
+
+  MOZ_ASSERT(!desiredSize.IsNull());
+
+  return desiredSize.Value() > 0;
+}
+
+void ReadableStreamDefaultControllerError(
+    JSContext* aCx, ReadableStreamDefaultController* aController,
+    JS::Handle<JS::Value> aValue, ErrorResult& aRv) {
+  ReadableStream* stream = aController->Stream();
+
+  if (stream->State() != ReadableStream::ReaderState::Readable) {
+    return;
+  }
+
+  ResetQueue(aController);
+
+  ReadableStreamDefaultControllerClearAlgorithms(aController);
+
+  ReadableStreamError(aCx, stream, aValue, aRv);
+}
+
+static void ReadableStreamDefaultControllerCallPullIfNeeded(
+    JSContext* aCx, ReadableStreamDefaultController* aController,
+    ErrorResult& aRv) {
+  bool shouldPull = ReadableStreamDefaultControllerShouldCallPull(aController);
+
+  if (!shouldPull) {
+    return;
+  }
+
+  if (aController->Pulling()) {
+    aController->SetPullAgain(true);
+    return;
+  }
+
+  MOZ_ASSERT(!aController->PullAgain());
+
+  aController->SetPulling(true);
+
+  RefPtr<UnderlyingSourceAlgorithmsBase> algorithms =
+      aController->GetAlgorithms();
+  RefPtr<Promise> pullPromise =
+      algorithms->PullCallback(aCx, *aController, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  pullPromise->AddCallbacksWithCycleCollectedArgs(
+      [](JSContext* aCx, JS::Handle<JS::Value> aValue, ErrorResult& aRv,
+         ReadableStreamDefaultController* mController)
+          MOZ_CAN_RUN_SCRIPT_BOUNDARY {
+            mController->SetPulling(false);
+            if (mController->PullAgain()) {
+              mController->SetPullAgain(false);
+
+              ErrorResult rv;
+              ReadableStreamDefaultControllerCallPullIfNeeded(
+                  aCx, MOZ_KnownLive(mController), aRv);
+            }
+          },
+      [](JSContext* aCx, JS::Handle<JS::Value> aValue, ErrorResult& aRv,
+         ReadableStreamDefaultController* mController) {
+        ReadableStreamDefaultControllerError(aCx, mController, aValue, aRv);
+      },
+      RefPtr(aController));
+}
+
+void SetUpReadableStreamDefaultController(
+    JSContext* aCx, ReadableStream* aStream,
+    ReadableStreamDefaultController* aController,
+    UnderlyingSourceAlgorithmsBase* aAlgorithms, double aHighWaterMark,
+    QueuingStrategySize* aSizeAlgorithm, ErrorResult& aRv) {
+  MOZ_ASSERT(!aStream->Controller());
+
+  aController->SetStream(aStream);
+
+  ResetQueue(aController);
+
+  aController->SetStarted(false);
+  aController->SetCloseRequested(false);
+  aController->SetPullAgain(false);
+  aController->SetPulling(false);
+
+  aController->setStrategySizeAlgorithm(aSizeAlgorithm);
+  aController->SetStrategyHWM(aHighWaterMark);
+
+  aController->SetAlgorithms(*aAlgorithms);
+
+  aStream->SetController(*aController);
+
+  JS::Rooted<JS::Value> startResult(aCx, JS::UndefinedValue());
+  RefPtr<ReadableStreamDefaultController> controller = aController;
+  aAlgorithms->StartCallback(aCx, *controller, &startResult, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  RefPtr<Promise> startPromise =
+      Promise::CreateInfallible(aStream->GetParentObject());
+  startPromise->MaybeResolve(startResult);
+
+  startPromise->AddCallbacksWithCycleCollectedArgs(
+      [](JSContext* aCx, JS::Handle<JS::Value> aValue, ErrorResult& aRv,
+         ReadableStreamDefaultController* aController)
+          MOZ_CAN_RUN_SCRIPT_BOUNDARY {
+            MOZ_ASSERT(aController);
+
+            aController->SetStarted(true);
+
+            aController->SetPulling(false);
+
+            aController->SetPullAgain(false);
+
+            ReadableStreamDefaultControllerCallPullIfNeeded(
+                aCx, MOZ_KnownLive(aController), aRv);
+          },
+
+      [](JSContext* aCx, JS::Handle<JS::Value> aValue, ErrorResult& aRv,
+         ReadableStreamDefaultController* aController) {
+        ReadableStreamDefaultControllerError(aCx, aController, aValue, aRv);
+      },
+      RefPtr(aController));
+}
+
+void SetupReadableStreamDefaultControllerFromUnderlyingSource(
+    JSContext* aCx, ReadableStream* aStream,
+    JS::Handle<JSObject*> aUnderlyingSource,
+    UnderlyingSource& aUnderlyingSourceDict, double aHighWaterMark,
+    QueuingStrategySize* aSizeAlgorithm, ErrorResult& aRv) {
+  RefPtr<ReadableStreamDefaultController> controller =
+      new ReadableStreamDefaultController(aStream->GetParentObject());
+
+  RefPtr<UnderlyingSourceAlgorithms> algorithms =
+      new UnderlyingSourceAlgorithms(aStream->GetParentObject(),
+                                     aUnderlyingSource, aUnderlyingSourceDict);
+
+  SetUpReadableStreamDefaultController(aCx, aStream, controller, algorithms,
+                                       aHighWaterMark, aSizeAlgorithm, aRv);
+}
+
+}  
+
+already_AddRefed<Promise> ReadableStreamDefaultController::CancelSteps(
+    JSContext* aCx, JS::Handle<JS::Value> aReason, ErrorResult& aRv) {
+  ResetQueue(this);
+
+  Optional<JS::Handle<JS::Value>> errorOption(aCx, aReason);
+  RefPtr<UnderlyingSourceAlgorithmsBase> algorithms = mAlgorithms;
+  RefPtr<Promise> result = algorithms->CancelCallback(aCx, errorOption, aRv);
+  if (aRv.Failed()) {
+    return nullptr;
+  }
+
+  ReadableStreamDefaultControllerClearAlgorithms(this);
+
+  return result.forget();
+}
+
+void ReadableStreamDefaultController::PullSteps(JSContext* aCx,
+                                                ReadRequest* aReadRequest,
+                                                ErrorResult& aRv) {
+  RefPtr<ReadableStream> stream = mStream;
+
+  if (!mQueue.isEmpty()) {
+    JS::Rooted<JS::Value> chunk(aCx);
+    DequeueValue(aCx, this, &chunk, aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+
+    if (CloseRequested() && mQueue.isEmpty()) {
+      ReadableStreamDefaultControllerClearAlgorithms(this);
+      ReadableStreamClose(aCx, stream, aRv);
+      if (aRv.Failed()) {
+        return;
+      }
+    } else {
+      ReadableStreamDefaultControllerCallPullIfNeeded(aCx, this, aRv);
+      if (aRv.Failed()) {
+        return;
+      }
+    }
+
+    aReadRequest->ChunkSteps(aCx, chunk, aRv);
+  } else {
+    ReadableStreamAddReadRequest(stream, aReadRequest);
+    ReadableStreamDefaultControllerCallPullIfNeeded(aCx, this, aRv);
+  }
+}
+
+void ReadableStreamDefaultController::ReleaseSteps() {
+}
+
+}  

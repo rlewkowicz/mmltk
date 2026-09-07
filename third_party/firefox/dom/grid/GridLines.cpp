@@ -1,0 +1,301 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "GridLines.h"
+
+#include "GridDimension.h"
+#include "GridLine.h"
+#include "mozilla/dom/GridArea.h"
+#include "mozilla/dom/GridBinding.h"
+#include "nsGridContainerFrame.h"
+
+namespace mozilla::dom {
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(GridLines, mParent, mLines)
+NS_IMPL_CYCLE_COLLECTING_ADDREF(GridLines)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(GridLines)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(GridLines)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+GridLines::GridLines(GridDimension* aParent) : mParent(aParent) {
+  MOZ_ASSERT(aParent, "Should never be instantiated with a null GridDimension");
+}
+
+GridLines::~GridLines() = default;
+
+JSObject* GridLines::WrapObject(JSContext* aCx,
+                                JS::Handle<JSObject*> aGivenProto) {
+  return GridLines_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+uint32_t GridLines::Length() const { return mLines.Length(); }
+
+GridLine* GridLines::Item(uint32_t aIndex) {
+  return mLines.SafeElementAt(aIndex);
+}
+
+GridLine* GridLines::IndexedGetter(uint32_t aIndex, bool& aFound) {
+  aFound = aIndex < mLines.Length();
+  if (!aFound) {
+    return nullptr;
+  }
+  return mLines[aIndex];
+}
+
+static void AddLineNameIfNotPresent(nsTArray<RefPtr<nsAtom>>& aLineNames,
+                                    nsAtom* aName) {
+  if (!aLineNames.Contains(aName)) {
+    aLineNames.AppendElement(aName);
+  }
+}
+
+static void AddLineNamesIfNotPresent(nsTArray<RefPtr<nsAtom>>& aLineNames,
+                                     const nsTArray<RefPtr<nsAtom>>& aNames) {
+  for (const auto& name : aNames) {
+    AddLineNameIfNotPresent(aLineNames, name);
+  }
+}
+
+void GridLines::SetLineInfo(const ComputedGridTrackInfo* aTrackInfo,
+                            const ComputedGridLineInfo* aLineInfo,
+                            const nsTArray<RefPtr<GridArea>>& aAreas,
+                            bool aIsRow) {
+  MOZ_ASSERT(aLineInfo);
+  mLines.Clear();
+
+  if (!aTrackInfo) {
+    return;
+  }
+
+  uint32_t lineCount =
+      aTrackInfo->mEndFragmentTrack - aTrackInfo->mStartFragmentTrack + 1;
+
+  if (lineCount > 0) {
+    nscoord lastTrackEdge = 0;
+    nscoord startOfNextTrack;
+    uint32_t repeatIndex = 0;
+    uint32_t numRepeatTracks = aTrackInfo->mRemovedRepeatTracks.Length();
+    uint32_t numAddedLines = 0;
+
+    uint32_t leadingTrackCount =
+        aTrackInfo->mNumLeadingImplicitTracks + aTrackInfo->mNumExplicitTracks;
+    if (numRepeatTracks > 0) {
+      for (auto& removedTrack : aTrackInfo->mRemovedRepeatTracks) {
+        if (removedTrack) {
+          ++leadingTrackCount;
+        }
+      }
+    }
+
+    for (uint32_t i = aTrackInfo->mStartFragmentTrack;
+         i < aTrackInfo->mEndFragmentTrack + 1; i++) {
+      const uint32_t line1Index = i + 1;
+
+      startOfNextTrack = (i < aTrackInfo->mEndFragmentTrack)
+                             ? aTrackInfo->mPositions[i]
+                             : lastTrackEdge;
+
+      nsTArray<RefPtr<nsAtom>> empty{};
+      const nsTArray<RefPtr<nsAtom>>& possiblyDuplicateLineNames(
+          aLineInfo->mNames.SafeElementAt(i, empty));
+
+      nsTArray<RefPtr<nsAtom>> lineNames;
+      AddLineNamesIfNotPresent(lineNames, possiblyDuplicateLineNames);
+
+      for (auto area : aAreas) {
+        if (area->Type() == GridDeclaration::Implicit) {
+          continue;
+        }
+
+        bool haveNameToAdd = false;
+        nsAutoString nameToAdd;
+        area->GetName(nameToAdd);
+        if (aIsRow) {
+          if (area->RowStart() == line1Index) {
+            haveNameToAdd = true;
+            nameToAdd.AppendLiteral("-start");
+          } else if (area->RowEnd() == line1Index) {
+            haveNameToAdd = true;
+            nameToAdd.AppendLiteral("-end");
+          }
+        } else {
+          if (area->ColumnStart() == line1Index) {
+            haveNameToAdd = true;
+            nameToAdd.AppendLiteral("-start");
+          } else if (area->ColumnEnd() == line1Index) {
+            haveNameToAdd = true;
+            nameToAdd.AppendLiteral("-end");
+          }
+        }
+
+        if (haveNameToAdd) {
+          RefPtr<nsAtom> name = NS_Atomize(nameToAdd);
+          AddLineNameIfNotPresent(lineNames, name);
+        }
+      }
+
+      if (i >= (aTrackInfo->mRepeatFirstTrack +
+                aTrackInfo->mNumLeadingImplicitTracks) &&
+          repeatIndex < numRepeatTracks) {
+        numAddedLines += AppendRemovedAutoFits(
+            aTrackInfo, aLineInfo, lastTrackEdge, repeatIndex, numRepeatTracks,
+            leadingTrackCount, lineNames);
+      }
+
+      if (numRepeatTracks > 0 && i == (aTrackInfo->mRepeatFirstTrack +
+                                       aTrackInfo->mNumLeadingImplicitTracks +
+                                       numRepeatTracks - numAddedLines)) {
+        AddLineNamesIfNotPresent(lineNames, aLineInfo->mNamesFollowingRepeat);
+      }
+
+      RefPtr<GridLine> line = new GridLine(this);
+      mLines.AppendElement(line);
+      MOZ_ASSERT(line1Index > 0, "line1Index must be positive.");
+      bool isBeforeFirstExplicit =
+          (line1Index <= aTrackInfo->mNumLeadingImplicitTracks);
+      bool isAfterLastExplicit = line1Index > (leadingTrackCount + 1);
+      uint32_t lineNumber = isBeforeFirstExplicit
+                                ? 0
+                                : (line1Index + numAddedLines -
+                                   aTrackInfo->mNumLeadingImplicitTracks);
+
+      int32_t lineNegativeNumber =
+          isAfterLastExplicit
+              ? 0
+              : (line1Index + numAddedLines - (leadingTrackCount + 2));
+      GridDeclaration lineType = (isBeforeFirstExplicit || isAfterLastExplicit)
+                                     ? GridDeclaration::Implicit
+                                     : GridDeclaration::Explicit;
+      line->SetLineValues(
+          lineNames, nsPresContext::AppUnitsToDoubleCSSPixels(lastTrackEdge),
+          nsPresContext::AppUnitsToDoubleCSSPixels(startOfNextTrack -
+                                                   lastTrackEdge),
+          lineNumber, lineNegativeNumber, lineType);
+
+      if (i < aTrackInfo->mEndFragmentTrack) {
+        lastTrackEdge = aTrackInfo->mPositions[i] + aTrackInfo->mSizes[i];
+      }
+    }
+
+    const int32_t lineCount = mLines.Length();
+    const uint32_t lastLineNumber = mLines[lineCount - 1]->Number();
+    auto IndexForLineNumber =
+        [lineCount, lastLineNumber](uint32_t aLineNumber) -> int32_t {
+      if (lastLineNumber == 0) {
+        return -1;
+      }
+
+      int32_t possibleIndex = (int32_t)aLineNumber - 1;
+      if (possibleIndex < 0 || possibleIndex > lineCount - 1) {
+        return -1;
+      }
+
+      return possibleIndex;
+    };
+
+    for (const auto& area : aAreas) {
+      if (area->Type() == GridDeclaration::Implicit) {
+        int32_t startIndex =
+            IndexForLineNumber(aIsRow ? area->RowStart() : area->ColumnStart());
+        int32_t endIndex =
+            IndexForLineNumber(aIsRow ? area->RowEnd() : area->ColumnEnd());
+
+        if (startIndex < 0 && endIndex < 0) {
+          break;
+        }
+
+        nsAutoString startLineName;
+        area->GetName(startLineName);
+        startLineName.AppendLiteral("-start");
+        nsAutoString endLineName;
+        area->GetName(endLineName);
+        endLineName.AppendLiteral("-end");
+
+        RefPtr<GridLine> dummyLine = new GridLine(this);
+        RefPtr<GridLine> areaStartLine =
+            startIndex > -1 ? mLines[startIndex] : dummyLine;
+        nsTArray<RefPtr<nsAtom>> startLineNames(areaStartLine->Names().Clone());
+
+        RefPtr<GridLine> areaEndLine =
+            endIndex > -1 ? mLines[endIndex] : dummyLine;
+        nsTArray<RefPtr<nsAtom>> endLineNames(areaEndLine->Names().Clone());
+
+        RefPtr<nsAtom> start = NS_Atomize(startLineName);
+        RefPtr<nsAtom> end = NS_Atomize(endLineName);
+        if (startLineNames.Contains(end) || endLineNames.Contains(start)) {
+          AddLineNameIfNotPresent(startLineNames, end);
+          AddLineNameIfNotPresent(endLineNames, start);
+        } else {
+          AddLineNameIfNotPresent(startLineNames, start);
+          AddLineNameIfNotPresent(endLineNames, end);
+        }
+
+        areaStartLine->SetLineNames(startLineNames);
+        areaEndLine->SetLineNames(endLineNames);
+      }
+    }
+  }
+}
+
+uint32_t GridLines::AppendRemovedAutoFits(
+    const ComputedGridTrackInfo* aTrackInfo,
+    const ComputedGridLineInfo* aLineInfo, nscoord aLastTrackEdge,
+    uint32_t& aRepeatIndex, uint32_t aNumRepeatTracks,
+    uint32_t aNumLeadingTracks, nsTArray<RefPtr<nsAtom>>& aLineNames) {
+  bool extractedExplicitLineNames = false;
+  nsTArray<RefPtr<nsAtom>> explicitLineNames;
+  uint32_t linesAdded = 0;
+  while (aRepeatIndex < aNumRepeatTracks &&
+         aTrackInfo->mRemovedRepeatTracks[aRepeatIndex]) {
+    if (aRepeatIndex > 0 && linesAdded == 0) {
+      for (const auto& name : aLineNames) {
+        if (!aLineInfo->mNamesBefore.Contains(name) &&
+            !aLineInfo->mNamesAfter.Contains(name)) {
+          explicitLineNames.AppendElement(name);
+        }
+      }
+      for (const auto& extractedName : explicitLineNames) {
+        aLineNames.RemoveElement(extractedName);
+      }
+      extractedExplicitLineNames = true;
+    }
+
+    AddLineNamesIfNotPresent(aLineNames, aLineInfo->mNamesBefore);
+
+    RefPtr<GridLine> line = new GridLine(this);
+    mLines.AppendElement(line);
+
+    uint32_t lineNumber = aTrackInfo->mRepeatFirstTrack + aRepeatIndex + 1;
+
+    int32_t lineNegativeNumber =
+        (aTrackInfo->mNumLeadingImplicitTracks + aTrackInfo->mRepeatFirstTrack +
+         aRepeatIndex) -
+        (aNumLeadingTracks + 1);
+    line->SetLineValues(
+        aLineNames, nsPresContext::AppUnitsToDoubleCSSPixels(aLastTrackEdge),
+        nsPresContext::AppUnitsToDoubleCSSPixels(0), lineNumber,
+        lineNegativeNumber, GridDeclaration::Explicit);
+
+    aLineNames = aLineInfo->mNamesAfter.Clone();
+    aRepeatIndex++;
+
+    linesAdded++;
+  }
+
+  aRepeatIndex++;
+
+  if (extractedExplicitLineNames) {
+    AddLineNamesIfNotPresent(aLineNames, explicitLineNames);
+  }
+
+  if (aRepeatIndex < aNumRepeatTracks) {
+    AddLineNamesIfNotPresent(aLineNames, aLineInfo->mNamesBefore);
+  }
+
+  return linesAdded;
+}
+
+}  

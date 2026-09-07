@@ -1,0 +1,228 @@
+// Copyright 2016 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(MOJO_CORE_PORTS_NODE_H_)
+#define MOJO_CORE_PORTS_NODE_H_
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include <unordered_map>
+
+#include "mojo/core/ports/event.h"
+#include "mojo/core/ports/name.h"
+#include "mojo/core/ports/port.h"
+#include "mojo/core/ports/port_ref.h"
+#include "mojo/core/ports/user_data.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/RefPtr.h"
+
+namespace mojo {
+namespace core {
+namespace ports {
+
+enum : int {
+  OK = 0,
+  ERROR_PORT_UNKNOWN = -10,
+  ERROR_PORT_EXISTS = -11,
+  ERROR_PORT_STATE_UNEXPECTED = -12,
+  ERROR_PORT_CANNOT_SEND_SELF = -13,
+  ERROR_PORT_PEER_CLOSED = -14,
+  ERROR_PORT_CANNOT_SEND_PEER = -15,
+  ERROR_NOT_IMPLEMENTED = -100,
+};
+
+struct PortStatus {
+  bool has_messages;
+  bool receiving_messages;
+  bool peer_closed;
+  bool peer_remote;
+  size_t queued_message_count;
+  size_t queued_num_bytes;
+  size_t unacknowledged_message_count;
+};
+
+struct PendingUpdatePreviousPeer {
+  NodeName receiver;
+  PortName port;
+  PortName from_port;
+  uint64_t sequence_num;
+  NodeName new_prev_node;
+  PortName new_prev_port;
+};
+
+class MessageFilter;
+class NodeDelegate;
+
+class Node {
+ public:
+  enum class ShutdownPolicy {
+    DONT_ALLOW_LOCAL_PORTS,
+    ALLOW_LOCAL_PORTS,
+  };
+
+  Node(const NodeName& name, NodeDelegate* delegate);
+  ~Node();
+
+  Node(const Node&) = delete;
+  void operator=(const Node&) = delete;
+
+  bool CanShutdownCleanly(
+      ShutdownPolicy policy = ShutdownPolicy::DONT_ALLOW_LOCAL_PORTS);
+
+  int GetPort(const PortName& port_name, PortRef* port_ref);
+
+  int CreateUninitializedPort(PortRef* port_ref);
+
+  int InitializePort(const PortRef& port_ref, const NodeName& peer_node_name,
+                     const PortName& peer_port_name,
+                     const NodeName& prev_node_name,
+                     const PortName& prev_port_name);
+
+  int CreatePortPair(PortRef* port0_ref, PortRef* port1_ref);
+
+  int SetUserData(const PortRef& port_ref, RefPtr<UserData> user_data);
+  int GetUserData(const PortRef& port_ref, RefPtr<UserData>* user_data);
+
+  int ClosePort(const PortRef& port_ref);
+
+  int GetStatus(const PortRef& port_ref, PortStatus* port_status);
+
+  int GetMessage(const PortRef& port_ref,
+                 mozilla::UniquePtr<UserMessageEvent>* message,
+                 MessageFilter* filter);
+
+  int SendUserMessage(const PortRef& port_ref,
+                      mozilla::UniquePtr<UserMessageEvent> message);
+
+  int SetAcknowledgeRequestInterval(const PortRef& port_ref,
+                                    uint64_t sequence_num_acknowledge_interval);
+
+  int AcceptEvent(const NodeName& from_node, ScopedEvent event);
+
+  int MergePorts(const PortRef& port_ref, const NodeName& destination_node_name,
+                 const PortName& destination_port_name);
+
+  int MergeLocalPorts(const PortRef& port0_ref, const PortRef& port1_ref);
+
+  int LostConnectionToNode(const NodeName& node_name);
+
+ private:
+  class DelegateHolder {
+   public:
+    DelegateHolder(Node* node, NodeDelegate* delegate);
+    ~DelegateHolder() = default;
+
+    DelegateHolder(const DelegateHolder&) = delete;
+    void operator=(const DelegateHolder&) = delete;
+
+    NodeDelegate* operator->() const {
+      EnsureSafeDelegateAccess();
+      return delegate_;
+    }
+
+   private:
+#if defined(DEBUG)
+    void EnsureSafeDelegateAccess() const;
+#else
+    void EnsureSafeDelegateAccess() const {}
+#endif
+
+    Node* const node_;
+    NodeDelegate* const delegate_;
+  };
+
+  int OnUserMessage(const PortRef& port_ref, const NodeName& from_node,
+                    mozilla::UniquePtr<UserMessageEvent> message);
+  int OnPortAccepted(const PortRef& port_ref,
+                     mozilla::UniquePtr<PortAcceptedEvent> event);
+  int OnObserveProxy(const PortRef& port_ref,
+                     mozilla::UniquePtr<ObserveProxyEvent> event);
+  int OnObserveProxyAck(const PortRef& port_ref,
+                        mozilla::UniquePtr<ObserveProxyAckEvent> event);
+  int OnObserveClosure(const PortRef& port_ref,
+                       mozilla::UniquePtr<ObserveClosureEvent> event);
+  int OnMergePort(const PortRef& port_ref,
+                  mozilla::UniquePtr<MergePortEvent> event);
+  int OnUserMessageReadAckRequest(
+      const PortRef& port_ref,
+      mozilla::UniquePtr<UserMessageReadAckRequestEvent> event);
+  int OnUserMessageReadAck(const PortRef& port_ref,
+                           mozilla::UniquePtr<UserMessageReadAckEvent> event);
+  int OnUpdatePreviousPeer(const PortRef& port_ref,
+                           mozilla::UniquePtr<UpdatePreviousPeerEvent> event);
+
+  int AddPortWithName(const PortName& port_name, RefPtr<Port> port);
+  void ErasePort(const PortName& port_name);
+
+  bool IsEventFromPreviousPeer(const Event& event);
+
+  int AcceptEventInternal(const PortRef& port_ref, const NodeName& from_node,
+                          ScopedEvent event);
+
+  int SendUserMessageInternal(const PortRef& port_ref,
+                              mozilla::UniquePtr<UserMessageEvent>* message);
+  int MergePortsInternal(const PortRef& port0_ref, const PortRef& port1_ref,
+                         bool allow_close_on_bad_state);
+  void ConvertToProxy(Port* port, const NodeName& to_node_name,
+                      PortName* port_name,
+                      Event::PortDescriptor* port_descriptor,
+                      PendingUpdatePreviousPeer* pending_update)
+      MOZ_REQUIRES(ports_lock_);
+  int AcceptPort(const PortName& port_name,
+                 const Event::PortDescriptor& port_descriptor);
+
+  int PrepareToForwardUserMessage(const PortRef& forwarding_port_ref,
+                                  Port::State expected_port_state,
+                                  bool ignore_closed_peer,
+                                  UserMessageEvent* message,
+                                  NodeName* forward_to_node);
+  int BeginProxying(const PortRef& port_ref);
+  int ForwardUserMessagesFromProxy(const PortRef& port_ref);
+  void InitiateProxyRemoval(const PortRef& port_ref);
+  void TryRemoveProxy(const PortRef& port_ref);
+  void DestroyAllPortsWithPeer(const NodeName& node_name,
+                               const PortName& port_name);
+
+  void UpdatePortPeerAddress(const PortName& local_port_name, Port* local_port,
+                             const NodeName& new_peer_node,
+                             const PortName& new_peer_port)
+      MOZ_REQUIRES(ports_lock_);
+
+  void RemoveFromPeerPortMap(const PortName& local_port_name, Port* local_port)
+      MOZ_REQUIRES(ports_lock_);
+
+  void SwapPortPeers(const PortName& port0_name, Port* port0,
+                     const PortName& port1_name, Port* port1)
+      MOZ_REQUIRES(ports_lock_);
+
+  void MaybeResendAckRequest(const PortRef& port_ref);
+
+  void MaybeForwardAckRequest(const PortRef& port_ref);
+
+  void MaybeResendAck(const PortRef& port_ref);
+
+  const NodeName name_;
+  const DelegateHolder delegate_;
+
+  using LocalPortName = PortName;
+  using PeerPortName = PortName;
+
+  mozilla::Mutex ports_lock_{"Ports Lock"};
+  std::unordered_map<LocalPortName, RefPtr<Port>> ports_
+      MOZ_GUARDED_BY(ports_lock_);
+
+  using PeerPortMap =
+      std::unordered_map<PeerPortName,
+                         std::unordered_map<LocalPortName, PortRef>>;
+
+  std::unordered_map<NodeName, PeerPortMap> peer_port_maps_
+      MOZ_GUARDED_BY(ports_lock_);
+};
+
+}  
+}  
+}  
+
+#endif

@@ -1,0 +1,149 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef intl_components_ListFormat_h_
+#define intl_components_ListFormat_h_
+
+#include "mozilla/CheckedInt.h"
+#include "mozilla/intl/ICU4CGlue.h"
+#include "mozilla/Try.h"
+#include "mozilla/Vector.h"
+#include "unicode/ulistformatter.h"
+
+struct UListFormatter;
+
+namespace mozilla::intl {
+
+static constexpr size_t DEFAULT_LIST_LENGTH = 8;
+
+class ListFormat final {
+ public:
+  enum class Type { Conjunction, Disjunction, Unit };
+  enum class Style { Long, Short, Narrow };
+
+  struct Options {
+    Type mType = Type::Conjunction;
+
+    Style mStyle = Style::Long;
+  };
+
+  static Result<UniquePtr<ListFormat>, ICUError> TryCreate(
+      mozilla::Span<const char> aLocale, const Options& aOptions);
+
+  ~ListFormat();
+
+  using StringList =
+      mozilla::Vector<mozilla::Span<const char16_t>, DEFAULT_LIST_LENGTH>;
+
+  template <typename Buffer>
+  ICUResult Format(const StringList& list, Buffer& buffer) const {
+    static_assert(std::is_same_v<typename Buffer::CharType, char16_t>,
+                  "Currently only UTF-16 buffers are supported.");
+
+    mozilla::Vector<const char16_t*, DEFAULT_LIST_LENGTH> u16strings;
+    mozilla::Vector<int32_t, DEFAULT_LIST_LENGTH> u16stringLens;
+    MOZ_TRY(ConvertStringListToVectors(list, u16strings, u16stringLens));
+
+    int32_t u16stringCount = mozilla::AssertedCast<int32_t>(list.length());
+    MOZ_TRY(FillBufferWithICUCall(
+        buffer, [this, &u16strings, &u16stringLens, u16stringCount](
+                    char16_t* chars, int32_t size, UErrorCode* status) {
+          return ulistfmt_format(mListFormatter.GetConst(), u16strings.begin(),
+                                 u16stringLens.begin(), u16stringCount, chars,
+                                 size, status);
+        }));
+
+    return Ok{};
+  }
+
+  enum class PartType {
+    Element,
+    Literal,
+  };
+  using Part = std::pair<PartType, size_t>;
+  using PartVector = mozilla::Vector<Part, DEFAULT_LIST_LENGTH>;
+
+  template <typename Buffer>
+  ICUResult FormatToParts(const StringList& list, Buffer& buffer,
+                          PartVector& parts) {
+    static_assert(std::is_same_v<typename Buffer::CharType, char16_t>,
+                  "Currently only UTF-16 buffers are supported.");
+
+    mozilla::Vector<const char16_t*, DEFAULT_LIST_LENGTH> u16strings;
+    mozilla::Vector<int32_t, DEFAULT_LIST_LENGTH> u16stringLens;
+    MOZ_TRY(ConvertStringListToVectors(list, u16strings, u16stringLens));
+
+    AutoFormattedList formatted;
+    UErrorCode status = U_ZERO_ERROR;
+    ulistfmt_formatStringsToResult(
+        mListFormatter.GetConst(), u16strings.begin(), u16stringLens.begin(),
+        int32_t(list.length()), formatted.GetFormatted(), &status);
+    if (U_FAILURE(status)) {
+      return Err(ToICUError(status));
+    }
+
+    auto spanResult = formatted.ToSpan();
+    if (spanResult.isErr()) {
+      return spanResult.propagateErr();
+    }
+    auto formattedSpan = spanResult.unwrap();
+    if (!FillBuffer(formattedSpan, buffer)) {
+      return Err(ICUError::OutOfMemory);
+    }
+
+    const UFormattedValue* value = formatted.Value();
+    if (!value) {
+      return Err(ICUError::InternalError);
+    }
+    return FormattedToParts(value, buffer.length(), parts);
+  }
+
+ private:
+  ListFormat() = delete;
+  explicit ListFormat(UListFormatter* fmt) : mListFormatter(fmt) {}
+  ListFormat(const ListFormat&) = delete;
+  ListFormat& operator=(const ListFormat&) = delete;
+
+  ICUPointer<UListFormatter> mListFormatter =
+      ICUPointer<UListFormatter>(nullptr);
+
+  ICUResult ConvertStringListToVectors(
+      const StringList& list,
+      mozilla::Vector<const char16_t*, DEFAULT_LIST_LENGTH>& u16strings,
+      mozilla::Vector<int32_t, DEFAULT_LIST_LENGTH>& u16stringLens) const {
+    mozilla::CheckedInt<int32_t> stringLengthTotal(0);
+    for (const auto& string : list) {
+      if (!u16strings.append(string.data())) {
+        return Err(ICUError::InternalError);
+      }
+
+      int32_t len = mozilla::AssertedCast<int32_t>(string.size());
+      if (!u16stringLens.append(len)) {
+        return Err(ICUError::InternalError);
+      }
+
+      stringLengthTotal += len;
+    }
+
+    constexpr int32_t MaxConjunctionLen = 100;
+    stringLengthTotal += CheckedInt<int32_t>(list.length()) * MaxConjunctionLen;
+    if (!stringLengthTotal.isValid()) {
+      return Err(ICUError::OverflowError);
+    }
+
+    return Ok{};
+  }
+
+  using AutoFormattedList =
+      AutoFormattedResult<UFormattedList, ulistfmt_openResult,
+                          ulistfmt_resultAsValue, ulistfmt_closeResult>;
+
+  ICUResult FormattedToParts(const UFormattedValue* formattedValue,
+                             size_t formattedSize, PartVector& parts);
+
+  static UListFormatterType ToUListFormatterType(Type type);
+  static UListFormatterWidth ToUListFormatterWidth(Style style);
+};
+
+}  
+#endif  // intl_components_ListFormat_h_

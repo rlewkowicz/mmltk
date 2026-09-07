@@ -1,0 +1,71 @@
+/*
+ * Copyright 2020 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SKSL_POOL)
+#define SKSL_POOL
+
+#include <cstddef>
+#include <memory>
+
+namespace SkSL {
+
+class MemoryPool;
+
+
+class Pool {
+public:
+    ~Pool();
+
+    static std::unique_ptr<Pool> Create();
+
+    void attachToThread();
+
+    void detachFromThread();
+
+    static void* AllocMemory(size_t size);
+
+    static void FreeMemory(void* ptr);
+
+    static bool IsAttached();
+
+private:
+    Pool();  
+    std::unique_ptr<SkSL::MemoryPool> fMemPool;
+};
+
+class Poolable {
+public:
+    static void* operator new(const size_t size) {
+        return Pool::AllocMemory(size);
+    }
+
+    static void operator delete(void* ptr) {
+        Pool::FreeMemory(ptr);
+    }
+};
+
+class AutoAttachPoolToThread {
+public:
+    AutoAttachPoolToThread(Pool* p) : fPool(p) {
+        if (fPool) {
+            fPool->attachToThread();
+        }
+    }
+    ~AutoAttachPoolToThread() {
+        if (fPool) {
+            fPool->detachFromThread();
+        }
+    }
+
+private:
+    Pool* fPool = nullptr;
+};
+
+
+}  
+
+#endif

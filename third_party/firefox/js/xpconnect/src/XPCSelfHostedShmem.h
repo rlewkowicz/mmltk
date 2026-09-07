@@ -1,0 +1,59 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef xpcselfhostedshmem_h_
+#define xpcselfhostedshmem_h_
+
+#include "mozilla/Span.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/ipc/SharedMemoryHandle.h"
+#include "mozilla/ipc/SharedMemoryMapping.h"
+#include "nsIMemoryReporter.h"
+#include "nsIObserver.h"
+#include "nsIThread.h"
+
+namespace xpc {
+
+class SelfHostedShmem final : public nsIMemoryReporter {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIMEMORYREPORTER
+
+  using ContentType = mozilla::Span<const uint8_t>;
+
+  static SelfHostedShmem& GetSingleton();
+
+  static void SetSelfHostedUseSharedMemory(bool aSelfHostedUseSharedMemory) {
+    sSelfHostedUseSharedMemory = aSelfHostedUseSharedMemory;
+  }
+
+  static bool SelfHostedUseSharedMemory() { return sSelfHostedUseSharedMemory; }
+
+  void InitFromParent(ContentType aXdr);
+
+  [[nodiscard]] bool InitFromChild(
+      mozilla::ipc::ReadOnlySharedMemoryHandle aHandle);
+
+  ContentType Content() const;
+
+  const mozilla::ipc::ReadOnlySharedMemoryHandle& Handle() const;
+
+  void InitMemoryReporter();
+
+  static void Shutdown();
+
+ private:
+  SelfHostedShmem() = default;
+  ~SelfHostedShmem() = default;
+
+  static bool sSelfHostedUseSharedMemory;
+  static mozilla::StaticRefPtr<SelfHostedShmem> sSelfHostedXdr;
+
+  mozilla::ipc::ReadOnlySharedMemoryHandle mHandle;
+  mozilla::ipc::ReadOnlySharedMemoryMapping mMem;
+};
+
+}  
+
+#endif  // !xpcselfhostedshmem_h_

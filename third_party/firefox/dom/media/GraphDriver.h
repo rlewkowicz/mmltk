@@ -1,0 +1,503 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(GRAPHDRIVER_H_)
+#define GRAPHDRIVER_H_
+
+#include <thread>
+
+#include "AudioBufferUtils.h"
+#include "AudioMixer.h"
+#include "AudioSegment.h"
+#include "SelfRef.h"
+#include "WavDumper.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/DataMutex.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/TaskQueue.h"
+#include "mozilla/dom/AudioContext.h"
+#include "nsAutoRef.h"
+#include "nsIThread.h"
+
+struct cubeb_stream;
+
+template <>
+class nsAutoRefTraits<cubeb_stream> : public nsPointerRefTraits<cubeb_stream> {
+ public:
+  static void Release(cubeb_stream* aStream) { cubeb_stream_destroy(aStream); }
+};
+
+namespace mozilla {
+static const int MEDIA_GRAPH_TARGET_PERIOD_MS = 10;
+static const int SYSTEM_CLOCK_BANKRUPTCY_THRESHOLD_MS = 30;
+static const int AUDIO_INITIAL_FALLBACK_BACKOFF_STEP_MS = 10;
+
+static const int AUDIO_MAX_FALLBACK_BACKOFF_STEP_MS = 1000;
+
+class AudioCallbackDriver;
+class GraphDriver;
+class MediaTrack;
+class OfflineClockDriver;
+class SystemClockDriver;
+
+namespace dom {
+enum class AudioContextOperation : uint8_t;
+}
+
+struct GraphInterface : public nsISupports {
+  class IterationResult final {
+    struct Undefined {};
+    struct StillProcessing {};
+    struct Stop {
+      explicit Stop(RefPtr<Runnable> aStoppedRunnable)
+          : mStoppedRunnable(std::move(aStoppedRunnable)) {}
+      Stop(const Stop&) = delete;
+      Stop(Stop&& aOther) noexcept
+          : mStoppedRunnable(std::move(aOther.mStoppedRunnable)) {}
+      ~Stop() { MOZ_ASSERT(!mStoppedRunnable); }
+      RefPtr<Runnable> mStoppedRunnable;
+      void Stopped() {
+        mStoppedRunnable->Run();
+        mStoppedRunnable = nullptr;
+      }
+    };
+    struct SwitchDriver {
+      SwitchDriver(RefPtr<GraphDriver> aDriver,
+                   RefPtr<Runnable> aSwitchedRunnable)
+          : mDriver(std::move(aDriver)),
+            mSwitchedRunnable(std::move(aSwitchedRunnable)) {}
+      SwitchDriver(const SwitchDriver&) = delete;
+      SwitchDriver(SwitchDriver&& aOther) noexcept
+          : mDriver(std::move(aOther.mDriver)),
+            mSwitchedRunnable(std::move(aOther.mSwitchedRunnable)) {}
+      ~SwitchDriver() { MOZ_ASSERT(!mSwitchedRunnable); }
+      RefPtr<GraphDriver> mDriver;
+      RefPtr<Runnable> mSwitchedRunnable;
+      void Switched() {
+        mSwitchedRunnable->Run();
+        mSwitchedRunnable = nullptr;
+      }
+    };
+    Variant<Undefined, StillProcessing, Stop, SwitchDriver> mResult;
+
+    explicit IterationResult(StillProcessing&& aArg)
+        : mResult(std::move(aArg)) {}
+    explicit IterationResult(Stop&& aArg) : mResult(std::move(aArg)) {}
+    explicit IterationResult(SwitchDriver&& aArg) : mResult(std::move(aArg)) {}
+
+   public:
+    IterationResult() : mResult(Undefined()) {}
+    IterationResult(const IterationResult&) = delete;
+    IterationResult(IterationResult&&) = default;
+
+    IterationResult& operator=(const IterationResult&) = delete;
+    IterationResult& operator=(IterationResult&&) = default;
+
+    static IterationResult CreateStillProcessing() {
+      return IterationResult(StillProcessing());
+    }
+    static IterationResult CreateStop(RefPtr<Runnable> aStoppedRunnable) {
+      return IterationResult(Stop(std::move(aStoppedRunnable)));
+    }
+    static IterationResult CreateSwitchDriver(
+        RefPtr<GraphDriver> aDriver, RefPtr<Runnable> aSwitchedRunnable) {
+      return IterationResult(
+          SwitchDriver(std::move(aDriver), std::move(aSwitchedRunnable)));
+    }
+
+    bool IsStillProcessing() const { return mResult.is<StillProcessing>(); }
+    bool IsStop() const { return mResult.is<Stop>(); }
+    bool IsSwitchDriver() const { return mResult.is<SwitchDriver>(); }
+
+    void Stopped() {
+      MOZ_ASSERT(IsStop());
+      mResult.as<Stop>().Stopped();
+    }
+
+    GraphDriver* NextDriver() const {
+      if (!IsSwitchDriver()) {
+        return nullptr;
+      }
+      return mResult.as<SwitchDriver>().mDriver;
+    }
+
+    void Switched() {
+      MOZ_ASSERT(IsSwitchDriver());
+      mResult.as<SwitchDriver>().Switched();
+    }
+  };
+
+  virtual void NotifyInputStopped() = 0;
+  virtual void NotifyInputData(const AudioDataValue* aBuffer, size_t aFrames,
+                               TrackRate aRate, uint32_t aChannels,
+                               uint32_t aAlreadyBuffered) = 0;
+  virtual void NotifySetRequestedInputProcessingParamsResult(
+      AudioCallbackDriver* aDriver, int aGeneration,
+      Result<cubeb_input_processing_params, int>&& aResult) = 0;
+  virtual void DeviceChanged() = 0;
+  virtual IterationResult OneIteration(
+      GraphTime aStateComputedEnd, MixerCallbackReceiver* aMixerReceiver) = 0;
+#if defined(DEBUG)
+  virtual bool InDriverIteration(const GraphDriver* aDriver) const = 0;
+#endif
+};
+
+class GraphDriver {
+ public:
+  using IterationResult = GraphInterface::IterationResult;
+
+  GraphDriver(GraphInterface* aGraphInterface, GraphDriver* aPreviousDriver,
+              uint32_t aSampleRate);
+
+  NS_INLINE_DECL_PURE_VIRTUAL_REFCOUNTING
+
+  virtual void Start() = 0;
+  MOZ_CAN_RUN_SCRIPT virtual void Shutdown() = 0;
+  virtual void SetStreamName(const nsACString& aStreamName);
+  virtual TimeDuration IterationDuration() = 0;
+  virtual void EnsureNextIteration() = 0;
+
+  GraphDriver* PreviousDriver();
+  void SetPreviousDriver(GraphDriver* aPreviousDriver);
+
+  virtual AudioCallbackDriver* AsAudioCallbackDriver() { return nullptr; }
+  virtual const AudioCallbackDriver* AsAudioCallbackDriver() const {
+    return nullptr;
+  }
+
+  virtual OfflineClockDriver* AsOfflineClockDriver() { return nullptr; }
+  virtual const OfflineClockDriver* AsOfflineClockDriver() const {
+    return nullptr;
+  }
+
+  virtual SystemClockDriver* AsSystemClockDriver() { return nullptr; }
+  virtual const SystemClockDriver* AsSystemClockDriver() const {
+    return nullptr;
+  }
+
+  void SetState(const nsACString& aStreamName, GraphTime aStateComputedTime,
+                TimeStamp aIterationTimeStamp);
+
+  GraphInterface* Graph() const { return mGraphInterface; }
+
+#if defined(DEBUG)
+  bool InIteration() const;
+#endif
+  virtual bool OnThread() const = 0;
+  virtual bool ThreadRunning() const = 0;
+
+  double MediaTimeToSeconds(MediaTime aTime) const {
+    NS_ASSERTION(aTime > -TRACK_TIME_MAX && aTime <= TRACK_TIME_MAX,
+                 "Bad time");
+    return static_cast<double>(aTime) / mSampleRate;
+  }
+
+  TimeDuration MediaTimeToTimeDuration(MediaTime aTime) const {
+    return TimeDuration::FromSeconds(MediaTimeToSeconds(aTime));
+  }
+
+  GraphTime SecondsToMediaTime(double aS) const {
+    NS_ASSERTION(0 <= aS && aS <= TRACK_TICKS_MAX / TRACK_RATE_MAX,
+                 "Bad seconds");
+    return mSampleRate * aS;
+  }
+
+  GraphTime MillisecondsToMediaTime(int32_t aMS) const {
+    return RateConvertTicksRoundDown(mSampleRate, 1000, aMS);
+  }
+
+ protected:
+  nsCString mStreamName;
+  GraphTime mStateComputedTime = 0;
+  TimeStamp mTargetIterationTimeStamp;
+  const RefPtr<GraphInterface> mGraphInterface;
+  const uint32_t mSampleRate;
+
+  RefPtr<GraphDriver> mPreviousDriver;
+
+  virtual ~GraphDriver() = default;
+};
+
+class MediaTrackGraphInitThreadRunnable;
+
+class ThreadedDriver : public GraphDriver {
+  class IterationWaitHelper {
+    Monitor mMonitor MOZ_UNANNOTATED;
+
+    bool mNeedAnotherIteration = true;
+    TimeStamp mWakeTime;
+
+   public:
+    IterationWaitHelper() : mMonitor("IterationWaitHelper::mMonitor") {}
+
+    void WaitForNextIterationAtLeast(TimeDuration aDuration) {
+      MonitorAutoLock lock(mMonitor);
+      TimeStamp now = TimeStamp::Now();
+      mWakeTime = now + aDuration;
+      while (true) {
+        if (mNeedAnotherIteration && now >= mWakeTime) {
+          break;
+        }
+        if (mNeedAnotherIteration) {
+          lock.Wait(mWakeTime - now);
+        } else {
+          lock.Wait(TimeDuration::Forever());
+        }
+        now = TimeStamp::Now();
+      }
+      mWakeTime = TimeStamp();
+      mNeedAnotherIteration = false;
+    }
+
+    void EnsureNextIteration() {
+      MonitorAutoLock lock(mMonitor);
+      mNeedAnotherIteration = true;
+      lock.Notify();
+    }
+  };
+
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(ThreadedDriver, override);
+
+  ThreadedDriver(GraphInterface* aGraphInterface, GraphDriver* aPreviousDriver,
+                 uint32_t aSampleRate);
+
+  void EnsureNextIteration() override;
+  void Start() override;
+  MOZ_CAN_RUN_SCRIPT void Shutdown() override;
+  virtual void RunThread();
+  friend class MediaTrackGraphInitThreadRunnable;
+  TimeDuration IterationDuration() override;
+
+  nsIThread* Thread() const { return mThread; }
+
+  bool OnThread() const override {
+    return !mThread || mThread->IsOnCurrentThread();
+  }
+
+  bool ThreadRunning() const override { return mThreadRunning; }
+
+ protected:
+  void WaitForNextIteration();
+  virtual TimeDuration NextIterationWaitDuration() = 0;
+  virtual MediaTime GetIntervalForIteration() = 0;
+
+  virtual ~ThreadedDriver();
+
+  nsCOMPtr<nsIThread> mThread;
+
+ private:
+  Atomic<bool> mThreadRunning;
+
+  IterationWaitHelper mWaitHelper;
+};
+
+class SystemClockDriver final : public ThreadedDriver {
+ public:
+  SystemClockDriver(GraphInterface* aGraphInterface,
+                    GraphDriver* aPreviousDriver, uint32_t aSampleRate);
+  virtual ~SystemClockDriver();
+  SystemClockDriver* AsSystemClockDriver() override { return this; }
+  const SystemClockDriver* AsSystemClockDriver() const override { return this; }
+  const TimeStamp& IterationTimeStamp() const {
+    return mTargetIterationTimeStamp;
+  }
+
+ protected:
+  TimeDuration NextIterationWaitDuration() override;
+  MediaTime GetIntervalForIteration() override;
+
+ private:
+  TimeStamp mInitialTimeStamp;
+};
+
+class OfflineClockDriver final : public ThreadedDriver {
+ public:
+  OfflineClockDriver(GraphInterface* aGraphInterface, uint32_t aSampleRate);
+  virtual ~OfflineClockDriver();
+  OfflineClockDriver* AsOfflineClockDriver() override { return this; }
+  const OfflineClockDriver* AsOfflineClockDriver() const override {
+    return this;
+  }
+
+  void RunThread() override;
+
+  void SetTickCountToRender(uint32_t aTicksToProcess) {
+    MOZ_ASSERT(InIteration());
+    MOZ_ASSERT(mEndTime == 0);
+    mEndTime = aTicksToProcess;
+  }
+
+ protected:
+  TimeDuration NextIterationWaitDuration() override { return TimeDuration(); }
+  MediaTime GetIntervalForIteration() override;
+
+ private:
+  GraphTime mEndTime = 0;
+};
+
+enum class AudioInputType { Unknown, Voice };
+
+struct AudioInputProcessingParamsRequest {
+  int mGeneration{};
+  cubeb_input_processing_params mParams{};
+};
+
+class AudioCallbackDriver final : public GraphDriver,
+                                  public MixerCallbackReceiver {
+  using IterationResult = GraphInterface::IterationResult;
+  enum class FallbackDriverState;
+  class FallbackWrapper;
+
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING_WITH_DELETE_ON_EVENT_TARGET(
+      AudioCallbackDriver, mCubebOperationThread, override);
+
+  AudioCallbackDriver(
+      GraphInterface* aGraphInterface, GraphDriver* aPreviousDriver,
+      uint32_t aSampleRate, uint32_t aOutputChannelCount,
+      uint32_t aInputChannelCount, CubebUtils::AudioDeviceID aOutputDeviceID,
+      CubebUtils::AudioDeviceID aInputDeviceID, AudioInputType aAudioInputType,
+      Maybe<AudioInputProcessingParamsRequest> aRequestedInputProcessingParams);
+
+  void Start() override;
+  MOZ_CAN_RUN_SCRIPT void Shutdown() override;
+  void SetStreamName(const nsACString& aStreamName) override;
+
+  static long DataCallback_s(cubeb_stream* aStream, void* aUser,
+                             const void* aInputBuffer, void* aOutputBuffer,
+                             long aFrames);
+  static void StateCallback_s(cubeb_stream* aStream, void* aUser,
+                              cubeb_state aState);
+  static void DeviceChangedCallback_s(void* aUser);
+
+  long DataCallback(const AudioDataValue* aInputBuffer,
+                    AudioDataValue* aOutputBuffer, long aFrames);
+  void StateCallback(cubeb_state aState);
+  TimeDuration IterationDuration() override;
+  void EnsureNextIteration() override;
+
+  void MixerCallback(AudioChunk* aMixedBuffer, uint32_t aSampleRate) override;
+
+  AudioCallbackDriver* AsAudioCallbackDriver() override { return this; }
+  const AudioCallbackDriver* AsAudioCallbackDriver() const override {
+    return this;
+  }
+
+  uint32_t OutputChannelCount() const { return mOutputChannelCount; }
+
+  uint32_t InputChannelCount() const { return mInputChannelCount; }
+
+  CubebUtils::AudioDeviceID InputDeviceID() const { return mInputDeviceID; }
+
+  AudioInputType InputDevicePreference() const {
+    if (mInputDevicePreference == CUBEB_DEVICE_PREF_VOICE) {
+      return AudioInputType::Voice;
+    }
+    return AudioInputType::Unknown;
+  }
+
+  const AudioInputProcessingParamsRequest& RequestedInputProcessingParams()
+      const;
+
+  void RequestInputProcessingParams(AudioInputProcessingParamsRequest);
+
+  std::thread::id ThreadId() const { return mAudioThreadIdInCb.load(); }
+
+  bool CheckThreadIdChanged();
+
+  bool OnThread() const override {
+    return mAudioThreadIdInCb.load() == std::this_thread::get_id();
+  }
+
+  bool ThreadRunning() const override {
+    return mAudioStreamState == AudioStreamState::Running ||
+           mFallbackDriverState == FallbackDriverState::Running;
+  }
+
+  bool IsStarted() { return mAudioStreamState > AudioStreamState::Starting; };
+
+  TimeDuration AudioOutputLatency();
+
+  bool HasFallback() const;
+  bool OnFallback() const;
+
+ private:
+  void PanOutputIfNeeded(bool aMicrophoneActive);
+  void DeviceChangedCallback();
+  bool StartStream();
+  friend class MediaTrackGraphInitThreadRunnable;
+  void QueueInitOp();
+  void Init(const nsCString& aStreamName);
+  void SetCubebStreamName(const nsCString& aStreamName);
+  void Stop();
+  void SetInputProcessingParams(AudioInputProcessingParamsRequest aRequest);
+  Result<bool, FallbackDriverState> TryStartingFallbackDriver();
+  [[nodiscard]] RefPtr<FallbackWrapper> CreateFallbackSystemClockDriver();
+  void FallbackToSystemClockDriver();
+  void FallbackDriverStopped(GraphTime aStateComputedTime,
+                             TimeStamp aIterationTimeStamp,
+                             FallbackDriverState aState);
+
+  void MaybeStartAudioStream();
+
+  bool OnCubebOperationThread() {
+    return mCubebOperationThread->IsOnCurrentThreadInfallible();
+  }
+
+  const uint32_t mOutputChannelCount;
+  SpillBuffer<AudioDataValue, WEBAUDIO_BLOCK_SIZE * 2> mScratchBuffer;
+  AudioCallbackBufferWrapper<AudioDataValue> mBuffer;
+  RefPtr<CubebUtils::CubebHandle> mCubeb;
+  nsAutoRef<cubeb_stream> mAudioStream;
+  const uint32_t mInputChannelCount;
+  const CubebUtils::AudioDeviceID mOutputDeviceID;
+  const CubebUtils::AudioDeviceID mInputDeviceID;
+  MOZ_INIT_OUTSIDE_CTOR bool mFirstCallbackIteration;
+  uint32_t mIterationDurationMS;
+
+  struct AutoInCallback {
+    explicit AutoInCallback(AudioCallbackDriver* aDriver);
+    ~AutoInCallback();
+    AudioCallbackDriver* mDriver;
+  };
+
+  static already_AddRefed<TaskQueue> CreateTaskQueue();
+
+  const RefPtr<TaskQueue> mCubebOperationThread;
+  cubeb_device_pref mInputDevicePreference = CUBEB_DEVICE_PREF_NONE;
+  cubeb_input_processing_params mConfiguredInputProcessingParams =
+      CUBEB_INPUT_PROCESSING_PARAM_NONE;
+  AudioInputProcessingParamsRequest mInputProcessingRequest;
+  std::atomic<std::thread::id> mAudioThreadId;
+  std::atomic<std::thread::id> mAudioThreadIdInCb;
+  enum class AudioStreamState {
+    None,
+    Pending,
+    Starting,
+    ChangingDevice,
+    Running,
+    Stopping
+  };
+  Atomic<AudioStreamState> mAudioStreamState{AudioStreamState::None};
+  enum class FallbackDriverState {
+    None,
+    Running,
+    Stopped,
+  };
+  Atomic<FallbackDriverState> mFallbackDriverState{FallbackDriverState::None};
+  DataMutex<RefPtr<FallbackWrapper>> mFallback;
+  TimeDuration mNextReInitBackoffStep;
+  TimeStamp mNextReInitAttempt;
+  TimeStamp mChangingDeviceStartTime;
+
+  WavDumper mInputStreamFile;
+  WavDumper mOutputStreamFile;
+
+  virtual ~AudioCallbackDriver();
+};
+
+}  
+
+#endif

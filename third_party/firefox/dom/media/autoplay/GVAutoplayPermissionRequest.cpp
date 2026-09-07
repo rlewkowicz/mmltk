@@ -1,0 +1,186 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "GVAutoplayPermissionRequest.h"
+
+#include "mozilla/Logging.h"
+#include "mozilla/StaticPrefs_media.h"
+#include "mozilla/dom/HTMLMediaElement.h"
+#include "nsGlobalWindowInner.h"
+#include "nsPIDOMWindowInlines.h"
+
+mozilla::LazyLogModule gGVAutoplayRequestLog("GVAutoplay");
+
+namespace mozilla::dom {
+
+using RType = GVAutoplayRequestType;
+using RStatus = GVAutoplayRequestStatus;
+
+#undef REQUEST_LOG
+#define REQUEST_LOG(msg, ...)                                          \
+  if (MOZ_LOG_TEST(gGVAutoplayRequestLog, mozilla::LogLevel::Debug)) { \
+    MOZ_LOG_FMT(gGVAutoplayRequestLog, LogLevel::Debug,                \
+                "Request={}, Type={}, " msg, fmt::ptr(this),           \
+                EnumValueToString(this->mType), ##__VA_ARGS__);        \
+  }
+
+#undef LOG
+#define LOG(msg, ...) \
+  MOZ_LOG_FMT(gGVAutoplayRequestLog, LogLevel::Debug, msg, ##__VA_ARGS__)
+
+static RStatus GetRequestStatus(BrowsingContext* aContext, RType aType) {
+  MOZ_ASSERT(aContext);
+  AssertIsOnMainThread();
+  return aType == RType::eAUDIBLE
+             ? aContext->GetGVAudibleAutoplayRequestStatus()
+             : aContext->GetGVInaudibleAutoplayRequestStatus();
+}
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED(GVAutoplayPermissionRequest,
+                                   ContentPermissionRequestBase, mContext)
+
+NS_IMPL_ISUPPORTS_CYCLE_COLLECTION_INHERITED_0(GVAutoplayPermissionRequest,
+                                               ContentPermissionRequestBase)
+
+static void NotifyRequestStatusChanged(nsPIDOMWindowInner* aWindow) {
+  if (!aWindow) {
+    return;
+  }
+  nsCOMPtr<nsIObserverService> obs = mozilla::services::GetObserverService();
+  if (obs) {
+    obs->NotifyObservers(ToSupports(aWindow),
+                         kGVAutoplayRequestStatusChangedTopic,
+                          nullptr);
+  }
+}
+
+void GVAutoplayPermissionRequest::CreateRequest(nsGlobalWindowInner* aWindow,
+                                                BrowsingContext* aContext,
+                                                GVAutoplayRequestType aType) {
+  RefPtr<GVAutoplayPermissionRequest> request =
+      new GVAutoplayPermissionRequest(aWindow, aContext, aType);
+  request->SetRequestStatus(RStatus::ePENDING);
+  request->RequestDelayedTask(
+      aWindow->SerialEventTarget(),
+      GVAutoplayPermissionRequest::DelayedTaskType::Request);
+}
+
+GVAutoplayPermissionRequest::GVAutoplayPermissionRequest(
+    nsGlobalWindowInner* aWindow, BrowsingContext* aContext, RType aType)
+    : ContentPermissionRequestBase(aWindow->GetPrincipal(), aWindow,
+                                   ""_ns,  
+                                   aType == RType::eAUDIBLE
+                                       ? "autoplay-media-audible"_ns
+                                       : "autoplay-media-inaudible"_ns),
+      mType(aType),
+      mContext(aContext) {
+  MOZ_ASSERT(mContext);
+  REQUEST_LOG("Request created");
+}
+
+GVAutoplayPermissionRequest::~GVAutoplayPermissionRequest() {
+  REQUEST_LOG("Request destroyed");
+  if (mContext) {
+    Cancel();
+  }
+}
+
+void GVAutoplayPermissionRequest::SetRequestStatus(RStatus aStatus) {
+  REQUEST_LOG("SetRequestStatus, new status={}", EnumValueToString(aStatus));
+  MOZ_ASSERT(mContext);
+  AssertIsOnMainThread();
+  if (mType == RType::eAUDIBLE) {
+    (void)mContext->SetGVAudibleAutoplayRequestStatus(aStatus);
+  } else {
+    (void)mContext->SetGVInaudibleAutoplayRequestStatus(aStatus);
+  }
+}
+
+NS_IMETHODIMP
+GVAutoplayPermissionRequest::Cancel() {
+  MOZ_ASSERT(mContext, "Do not call 'Cancel()' twice!");
+  const RStatus status = GetRequestStatus(mContext, mType);
+  REQUEST_LOG("Cancel, current status={}", EnumValueToString(status));
+  MOZ_ASSERT(status == RStatus::ePENDING || status == RStatus::eDENIED ||
+             status == RStatus::eUNKNOWN);
+  if ((status == RStatus::ePENDING) && !mContext->IsDiscarded()) {
+    SetRequestStatus(RStatus::eDENIED);
+    NotifyRequestStatusChanged(mWindow);
+  }
+  mContext = nullptr;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+GVAutoplayPermissionRequest::Allow(JS::Handle<JS::Value> aChoices) {
+  MOZ_ASSERT(mContext, "Do not call 'Allow()' twice!");
+  const RStatus status = GetRequestStatus(mContext, mType);
+  REQUEST_LOG("Allow, current status={}", EnumValueToString(status));
+  MOZ_ASSERT(status == RStatus::ePENDING || status == RStatus::eALLOWED ||
+             status == RStatus::eUNKNOWN);
+  if (status == RStatus::ePENDING) {
+    SetRequestStatus(RStatus::eALLOWED);
+    NotifyRequestStatusChanged(mWindow);
+  }
+  mContext = nullptr;
+  return NS_OK;
+}
+
+void GVAutoplayPermissionRequestor::AskForPermissionIfNeeded(
+    nsPIDOMWindowInner* aWindow) {
+  LOG("Requestor, AskForPermissionIfNeeded");
+  if (!aWindow) {
+    return;
+  }
+
+  if (XRE_IsE10sParentProcess()) {
+    return;
+  }
+
+  if (!StaticPrefs::media_geckoview_autoplay_request()) {
+    return;
+  }
+
+  LOG("Requestor, check status to decide if we need to create the new request");
+  RefPtr<BrowsingContext> context = aWindow->GetBrowsingContext()->Top();
+  if (!HasEverAskForRequest(context, RType::eAUDIBLE)) {
+    CreateAsyncRequest(aWindow, context, RType::eAUDIBLE);
+  }
+  if (!HasEverAskForRequest(context, RType::eINAUDIBLE)) {
+    CreateAsyncRequest(aWindow, context, RType::eINAUDIBLE);
+  }
+}
+
+bool GVAutoplayPermissionRequestor::HasEverAskForRequest(
+    BrowsingContext* aContext, RType aType) {
+  return GetRequestStatus(aContext, aType) != RStatus::eUNKNOWN;
+}
+
+bool GVAutoplayPermissionRequestor::HasUnresolvedRequest(
+    nsPIDOMWindowInner* aWindow) {
+  if (!aWindow) {
+    return false;
+  }
+
+  RefPtr<BrowsingContext> context = aWindow->GetBrowsingContext()->Top();
+  auto gvAudible = context->GetGVAudibleAutoplayRequestStatus();
+  auto gvInaudible = context->GetGVInaudibleAutoplayRequestStatus();
+  return (gvAudible == GVAutoplayRequestStatus::eUNKNOWN) ||
+         (gvAudible == GVAutoplayRequestStatus::ePENDING) ||
+         (gvInaudible == GVAutoplayRequestStatus::eUNKNOWN) ||
+         (gvInaudible == GVAutoplayRequestStatus::ePENDING);
+}
+
+void GVAutoplayPermissionRequestor::CreateAsyncRequest(
+    nsPIDOMWindowInner* aWindow, BrowsingContext* aContext,
+    GVAutoplayRequestType aType) {
+  nsGlobalWindowInner* innerWindow = nsGlobalWindowInner::Cast(aWindow);
+  if (!innerWindow || !innerWindow->GetPrincipal()) {
+    return;
+  }
+
+  GVAutoplayPermissionRequest::CreateRequest(innerWindow, aContext, aType);
+}
+
+}  

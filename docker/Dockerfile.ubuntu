@@ -1,0 +1,23 @@
+# syntax=docker/dockerfile:1
+
+FROM mmltk_ubuntu AS ubuntu
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && sed -i \
+        -e 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+        -e 's|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' \
+        /etc/apt/sources.list.d/ubuntu.sources \
+    && printf '%s\n' \
+        'Acquire::Retries "5";' \
+        'Acquire::http::Timeout "30";' \
+        'Acquire::https::Timeout "30";' \
+        'APT::Update::Error-Mode "any";' \
+        >/etc/apt/apt.conf.d/99mmltk-network \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG MMLTK_IMAGE_FINGERPRINT=unlabeled
+ARG MMLTK_UBUNTU_IDENTITY=unknown
+LABEL com.mmltk.input-fingerprint="${MMLTK_IMAGE_FINGERPRINT}" \
+      com.mmltk.ubuntu-source-identity="${MMLTK_UBUNTU_IDENTITY}" \
+      com.mmltk.ubuntu-identity="${MMLTK_UBUNTU_IDENTITY}"

@@ -1,0 +1,1019 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef nsGenericHTMLElement_h_
+#define nsGenericHTMLElement_h_
+
+#include <algorithm>
+#include <cstdint>
+
+#include "mozilla/Attributes.h"
+#include "mozilla/EventForwards.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/DOMRect.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/PopoverData.h"
+#include "mozilla/dom/ToggleEvent.h"
+#include "mozilla/dom/ValidityState.h"
+#include "nsContentCreatorFunctions.h"
+#include "nsGkAtoms.h"
+#include "nsIFormControl.h"
+#include "nsNameSpaceManager.h"  // for kNameSpaceID_None
+#include "nsStyledElement.h"
+
+class nsDOMTokenList;
+class nsIFrame;
+class nsILayoutHistoryState;
+class nsIURI;
+struct nsSize;
+
+enum NonCustomCSSPropertyId : uint16_t;
+
+namespace mozilla {
+class EditorBase;
+class ErrorResult;
+class EventChainPostVisitor;
+class EventChainPreVisitor;
+class EventChainVisitor;
+class EventListenerManager;
+class PresState;
+namespace dom {
+class BooleanOrUnrestrictedDoubleOrString;
+class EditContext;
+class ElementInternals;
+class HTMLFormElement;
+class NodeList;
+class OwningBooleanOrUnrestrictedDoubleOrString;
+class TogglePopoverOptionsOrBoolean;
+enum class FetchPriority : uint8_t;
+struct ShowPopoverOptions;
+}  
+}  
+
+using nsGenericHTMLElementBase = nsStyledElement;
+
+class nsGenericHTMLElement : public nsGenericHTMLElementBase {
+ public:
+  using ContentEditableState = mozilla::ContentEditableState;
+  using Element::Command;
+  using Element::Focus;
+  using Element::SetTabIndex;
+
+  explicit nsGenericHTMLElement(
+      already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo)
+      : nsGenericHTMLElementBase(std::move(aNodeInfo)) {
+    NS_ASSERTION(mNodeInfo->NamespaceID() == kNameSpaceID_XHTML,
+                 "Unexpected namespace");
+  }
+
+  NS_INLINE_DECL_REFCOUNTING_INHERITED(nsGenericHTMLElement,
+                                       nsGenericHTMLElementBase)
+
+  NS_IMPL_FROMNODE(nsGenericHTMLElement, kNameSpaceID_XHTML)
+
+  nsresult CopyInnerTo(mozilla::dom::Element* aDest);
+
+  void GetTitle(mozilla::dom::DOMString& aTitle) {
+    GetHTMLAttr(nsGkAtoms::title, aTitle);
+  }
+  void SetTitle(const nsAString& aTitle) {
+    SetHTMLAttr(nsGkAtoms::title, aTitle);
+  }
+  void GetLang(mozilla::dom::DOMString& aLang) {
+    GetHTMLAttr(nsGkAtoms::lang, aLang);
+  }
+  void SetLang(const nsAString& aLang) { SetHTMLAttr(nsGkAtoms::lang, aLang); }
+  bool Translate() const override;
+  void SetTranslate(bool aTranslate, mozilla::ErrorResult& aError) {
+    SetHTMLAttr(nsGkAtoms::translate, aTranslate ? u"yes"_ns : u"no"_ns,
+                aError);
+  }
+  void GetDir(nsAString& aDir) { GetHTMLEnumAttr(nsGkAtoms::dir, aDir); }
+  void SetDir(const nsAString& aDir, mozilla::ErrorResult& aError) {
+    SetHTMLAttr(nsGkAtoms::dir, aDir, aError);
+  }
+  void GetPopover(nsString& aPopover) const;
+  void SetPopover(const nsAString& aPopover, mozilla::ErrorResult& aError) {
+    SetOrRemoveNullableStringAttr(nsGkAtoms::popover, aPopover, aError);
+  }
+
+  void GetHidden(mozilla::dom::Nullable<
+                 mozilla::dom::OwningBooleanOrUnrestrictedDoubleOrString>&
+                     aHidden) const;
+
+  void SetHidden(
+      const mozilla::dom::Nullable<
+          mozilla::dom::BooleanOrUnrestrictedDoubleOrString>& aHidden,
+      mozilla::ErrorResult& aRv);
+
+  bool Inert() const { return GetBoolAttr(nsGkAtoms::inert); }
+  void SetInert(bool aInert, mozilla::ErrorResult& aError) {
+    SetHTMLBoolAttr(nsGkAtoms::inert, aInert, aError);
+  }
+  MOZ_CAN_RUN_SCRIPT void Click(mozilla::dom::CallerType aCallerType);
+  void GetAccessKey(nsString& aAccessKey) {
+    GetHTMLAttr(nsGkAtoms::accesskey, aAccessKey);
+  }
+  void SetAccessKey(const nsAString& aAccessKey, mozilla::ErrorResult& aError) {
+    SetHTMLAttr(nsGkAtoms::accesskey, aAccessKey, aError);
+  }
+  void GetAccessKeyLabel(nsString& aAccessKeyLabel);
+  virtual bool Draggable() const {
+    return AttrValueIs(kNameSpaceID_None, nsGkAtoms::draggable,
+                       nsGkAtoms::_true, eIgnoreCase);
+  }
+  void SetDraggable(bool aDraggable, mozilla::ErrorResult& aError) {
+    SetHTMLAttr(nsGkAtoms::draggable, aDraggable ? u"true"_ns : u"false"_ns,
+                aError);
+  }
+  void GetContentEditable(nsString& aContentEditable) const {
+    switch (GetContentEditableState()) {
+      case ContentEditableState::True:
+        aContentEditable.AssignLiteral("true");
+        return;
+      case ContentEditableState::False:
+        aContentEditable.AssignLiteral("false");
+        return;
+      case ContentEditableState::PlainTextOnly:
+        aContentEditable.AssignLiteral("plaintext-only");
+        return;
+      case ContentEditableState::Inherit:
+        aContentEditable.AssignLiteral("inherit");
+        return;
+    }
+  }
+  void SetContentEditable(const nsAString& aContentEditable,
+                          mozilla::ErrorResult& aError) {
+    if (aContentEditable.LowerCaseEqualsLiteral("inherit")) {
+      UnsetHTMLAttr(nsGkAtoms::contenteditable, aError);
+    } else if (aContentEditable.LowerCaseEqualsLiteral("true")) {
+      SetHTMLAttr(nsGkAtoms::contenteditable, u"true"_ns, aError);
+    } else if (aContentEditable.LowerCaseEqualsLiteral("false")) {
+      SetHTMLAttr(nsGkAtoms::contenteditable, u"false"_ns, aError);
+    } else if (aContentEditable.LowerCaseEqualsLiteral("plaintext-only")) {
+      SetHTMLAttr(nsGkAtoms::contenteditable, u"plaintext-only"_ns, aError);
+    } else {
+      aError.Throw(NS_ERROR_DOM_SYNTAX_ERR);
+    }
+  }
+
+  [[nodiscard]] bool IsContentEditable() const;
+
+  [[nodiscard]] inline ContentEditableState GetContentEditableState() const {
+    if (!MayHaveContentEditableAttr()) {
+      return ContentEditableState::Inherit;
+    }
+    static constexpr AttrValuesArray kValidValuesExceptInherit[] = {
+        nsGkAtoms::_empty, nsGkAtoms::_true, nsGkAtoms::plaintextOnly,
+        nsGkAtoms::_false, nullptr};
+    switch (mAttrs.FindAttrValueIn(kNameSpaceID_None,
+                                   nsGkAtoms::contenteditable,
+                                   kValidValuesExceptInherit, eIgnoreCase)) {
+      case 0:
+      case 1:
+        return ContentEditableState::True;
+      case 2:
+        return ContentEditableState::PlainTextOnly;
+      case 3:
+        return ContentEditableState::False;
+      default:
+        return ContentEditableState::Inherit;
+    }
+  }
+
+  mozilla::dom::PopoverAttributeState GetPopoverAttributeState() const;
+  void PopoverPseudoStateUpdate(bool aOpen, bool aNotify);
+  bool PopoverOpen() const;
+  bool CheckPopoverValidity(mozilla::dom::PopoverVisibilityState aExpectedState,
+                            Document* aExpectedDocument, ErrorResult& aRv);
+  already_AddRefed<mozilla::dom::ToggleEvent> CreateToggleEvent(
+      const nsAString& aEventType, const nsAString& aOldState,
+      const nsAString& aNewState, mozilla::Cancelable, Element* aSource);
+  MOZ_CAN_RUN_SCRIPT bool FireToggleEvent(const nsAString& aOldState,
+                                          const nsAString& aNewState,
+                                          const nsAString& aType,
+                                          Element* aSource);
+  MOZ_CAN_RUN_SCRIPT void QueuePopoverEventTask(
+      mozilla::dom::PopoverVisibilityState aOldState, Element* aSource);
+  MOZ_CAN_RUN_SCRIPT void RunPopoverToggleEventTask(
+      mozilla::dom::PopoverToggleEventTask* aTask,
+      mozilla::dom::Element* aSource);
+  MOZ_CAN_RUN_SCRIPT void ShowPopover(
+      const mozilla::dom::ShowPopoverOptions& aOptions, ErrorResult& aRv);
+  MOZ_CAN_RUN_SCRIPT void ShowPopoverInternal(Element* aInvoker,
+                                              ErrorResult& aRv);
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void HidePopoverWithoutRunningScript();
+  MOZ_CAN_RUN_SCRIPT void HidePopoverInternal(bool aFocusPreviousElement,
+                                              bool aFireEvents,
+                                              mozilla::dom::Element* aSource,
+                                              ErrorResult& aRv);
+  MOZ_CAN_RUN_SCRIPT void HidePopover(ErrorResult& aRv);
+  MOZ_CAN_RUN_SCRIPT bool TogglePopover(
+      const mozilla::dom::TogglePopoverOptionsOrBoolean& aOptions,
+      ErrorResult& aRv);
+  MOZ_CAN_RUN_SCRIPT void FocusPopover();
+  void ForgetPreviouslyFocusedElementAfterHidingPopover();
+  MOZ_CAN_RUN_SCRIPT void FocusPreviousElementAfterHidingPopover();
+
+  bool IsValidCommandAction(Command aCommand) const override;
+
+  MOZ_CAN_RUN_SCRIPT bool HandleCommandInternal(Element* aSource,
+                                                Command aCommand,
+                                                ErrorResult& aRv) override;
+
+  MOZ_CAN_RUN_SCRIPT void FocusCandidate(Element*, bool aClearUpFocus);
+
+  void SetNonce(const nsAString& aNonce) {
+    SetProperty(nsGkAtoms::nonce, new nsString(aNonce),
+                nsINode::DeleteProperty<nsString>,  true);
+  }
+  void RemoveNonce() { RemoveProperty(nsGkAtoms::nonce); }
+  void GetNonce(nsAString& aNonce) const {
+    nsString* cspNonce = static_cast<nsString*>(GetProperty(nsGkAtoms::nonce));
+    if (cspNonce) {
+      aNonce = *cspNonce;
+    }
+  }
+
+  bool IsFormControlDefaultFocusable(mozilla::IsFocusableFlags) const;
+
+  uint32_t EditableInclusiveDescendantCount();
+
+  MOZ_CAN_RUN_SCRIPT
+  void GetInnerText(mozilla::dom::DOMString& aValue, ErrorResult& aError);
+  MOZ_CAN_RUN_SCRIPT
+  void GetOuterText(mozilla::dom::DOMString& aValue, ErrorResult& aError) {
+    return GetInnerText(aValue, aError);
+  }
+  MOZ_CAN_RUN_SCRIPT void SetInnerText(const nsAString& aValue) {
+    SetInnerTextInternal(aValue, MutationEffectOnScript::DropTrustWorthiness);
+  }
+  MOZ_CAN_RUN_SCRIPT void SetInnerTextInternal(
+      const nsAString& aValue, MutationEffectOnScript aMutationEffectOnScript);
+  MOZ_CAN_RUN_SCRIPT void SetOuterText(const nsAString& aValue,
+                                       ErrorResult& aRv);
+
+  void GetInputMode(nsAString& aValue) {
+    GetEnumAttr(nsGkAtoms::inputmode, nullptr, aValue);
+  }
+  void SetInputMode(const nsAString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::inputmode, aValue, aRv);
+  }
+  virtual void GetAutocapitalize(nsAString& aValue) const;
+  void SetAutocapitalize(const nsAString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::autocapitalize, aValue, aRv);
+  }
+
+  void GetEnterKeyHint(nsAString& aValue) const {
+    GetEnumAttr(nsGkAtoms::enterkeyhint, nullptr, aValue);
+  }
+  void SetEnterKeyHint(const nsAString& aValue, ErrorResult& aRv) {
+    SetHTMLAttr(nsGkAtoms::enterkeyhint, aValue, aRv);
+  }
+
+  virtual bool Autocorrect() const;
+  void SetAutocorrect(bool aAutocorrect, mozilla::ErrorResult& aError) {
+    SetHTMLAttr(nsGkAtoms::autocorrect, aAutocorrect ? u"on"_ns : u"off"_ns,
+                aError);
+  }
+
+  mozilla::dom::EditContext* GetEditContext() const;
+  MOZ_CAN_RUN_SCRIPT void SetEditContext(mozilla::dom::EditContext* aContext,
+                                         mozilla::ErrorResult& aRv);
+
+  bool IsEventAttributeNameInternal(nsAtom* aName) override;
+
+#define EVENT(name_, id_, type_, struct_) /* nothing; handled by nsINode */
+#define FORWARDED_EVENT(name_, id_, type_, struct_)  \
+  using nsINode::GetOn##name_;                       \
+  using nsINode::SetOn##name_;                       \
+  mozilla::dom::EventHandlerNonNull* GetOn##name_(); \
+  void SetOn##name_(mozilla::dom::EventHandlerNonNull* handler);
+#define ERROR_EVENT(name_, id_, type_, struct_)                       \
+  using nsINode::GetOn##name_;                                        \
+  using nsINode::SetOn##name_;                                        \
+  already_AddRefed<mozilla::dom::EventHandlerNonNull> GetOn##name_(); \
+  void SetOn##name_(mozilla::dom::EventHandlerNonNull* handler);
+#include "mozilla/EventNameList.inc"  // IWYU pragma: keep
+#undef ERROR_EVENT
+#undef FORWARDED_EVENT
+#undef EVENT
+  inline bool IsHTMLElement() const { return true; }
+
+  inline bool IsHTMLElement(nsAtom* aTag) const {
+    return mNodeInfo->Equals(aTag);
+  }
+
+  template <typename First, typename... Args>
+  inline bool IsAnyOfHTMLElements(First aFirst, Args... aArgs) const {
+    return IsNodeInternal(aFirst, aArgs...);
+  }
+
+  virtual already_AddRefed<mozilla::dom::ElementInternals> AttachInternals(
+      ErrorResult& aRv);
+
+  mozilla::dom::ElementInternals* GetInternals() const;
+
+  bool IsFormAssociatedCustomElement() const;
+
+  virtual bool IsDisabledForEvents(mozilla::WidgetEvent* aEvent) {
+    return false;
+  }
+
+  bool Autofocus() const { return GetBoolAttr(nsGkAtoms::autofocus); }
+  void SetAutofocus(bool aVal, ErrorResult& aRv) {
+    SetHTMLBoolAttr(nsGkAtoms::autofocus, aVal, aRv);
+  }
+
+  uint32_t HeadingOffset() const {
+    return std::min(GetUnsignedIntAttr(nsGkAtoms::headingoffset, 0), 8u);
+  }
+  void SetHeadingOffset(uint32_t aValue, ErrorResult& aError) {
+    SetUnsignedIntAttr(nsGkAtoms::headingoffset, aValue, 0, aError);
+  }
+
+  bool HeadingReset() const { return GetBoolAttr(nsGkAtoms::headingreset); }
+  void SetHeadingReset(bool aValue) {
+    SetBoolAttr(nsGkAtoms::headingreset, aValue);
+  }
+
+ protected:
+  virtual ~nsGenericHTMLElement() = default;
+
+ public:
+  nsresult BindToTree(BindContext&, nsINode& aParent) override;
+  void UnbindFromTree(UnbindContext&) override;
+
+  Focusable IsFocusableWithoutStyle(mozilla::IsFocusableFlags aFlags =
+                                        mozilla::IsFocusableFlags(0)) override {
+    Focusable result;
+    IsHTMLFocusable(aFlags, &result.mFocusable, &result.mTabIndex);
+    return result;
+  }
+  virtual bool IsHTMLFocusable(mozilla::IsFocusableFlags, bool* aIsFocusable,
+                               int32_t* aTabIndex);
+  MOZ_CAN_RUN_SCRIPT
+  mozilla::Result<bool, nsresult> PerformAccesskey(
+      bool aKeyCausesActivation, bool aIsTrustedEvent) override;
+
+  bool CheckHandleEventForAnchorsPreconditions(
+      mozilla::EventChainVisitor& aVisitor);
+  void GetEventTargetParentForAnchors(mozilla::EventChainPreVisitor& aVisitor);
+  MOZ_CAN_RUN_SCRIPT
+  nsresult PostHandleEventForAnchors(mozilla::EventChainPostVisitor& aVisitor);
+  bool IsHTMLLink(nsIURI** aURI) const;
+
+  void Compact() { mAttrs.Compact(); }
+
+  void UpdateEditableState(bool aNotify) override;
+
+  bool ParseAttribute(int32_t aNamespaceID, nsAtom* aAttribute,
+                      const nsAString& aValue,
+                      nsIPrincipal* aMaybeScriptedPrincipal,
+                      nsAttrValue& aResult) override;
+
+  bool ParseBackgroundAttribute(int32_t aNamespaceID, nsAtom* aAttribute,
+                                const nsAString& aValue, nsAttrValue& aResult);
+
+  NS_IMETHOD_(bool) IsAttributeMapped(const nsAtom* aAttribute) const override;
+  nsMapRuleToAttributesFunc GetAttributeMappingFunction() const override;
+
+  void GetBaseTarget(nsAString& aBaseTarget) const;
+
+  static bool ParseAlignValue(const nsAString& aString, nsAttrValue& aResult);
+
+  static bool ParseDivAlignValue(const nsAString& aString,
+                                 nsAttrValue& aResult);
+
+  static bool ParseTableHAlignValue(const nsAString& aString,
+                                    nsAttrValue& aResult);
+
+  static bool ParseTableCellHAlignValue(const nsAString& aString,
+                                        nsAttrValue& aResult);
+
+  static bool ParseTableVAlignValue(const nsAString& aString,
+                                    nsAttrValue& aResult);
+
+  static bool ParseImageAttribute(nsAtom* aAttribute, const nsAString& aString,
+                                  nsAttrValue& aResult);
+
+  static bool ParseReferrerAttribute(const nsAString& aString,
+                                     nsAttrValue& aResult);
+
+  static bool ParseFrameborderValue(const nsAString& aString,
+                                    nsAttrValue& aResult);
+
+  static bool ParseScrollingValue(const nsAString& aString,
+                                  nsAttrValue& aResult);
+
+
+  static void MapCommonAttributesInto(mozilla::MappedDeclarationsBuilder&);
+  static void MapCommonAttributesIntoExceptHidden(
+      mozilla::MappedDeclarationsBuilder&);
+
+  static const MappedAttributeEntry sCommonAttributeMap[];
+  static const MappedAttributeEntry sImageMarginSizeAttributeMap[];
+  static const MappedAttributeEntry sImageBorderAttributeMap[];
+  static const MappedAttributeEntry sImageAlignAttributeMap[];
+  static const MappedAttributeEntry sDivAlignAttributeMap[];
+  static const MappedAttributeEntry sBackgroundAttributeMap[];
+  static const MappedAttributeEntry sBackgroundColorAttributeMap[];
+
+  static void MapImageAlignAttributeInto(mozilla::MappedDeclarationsBuilder&);
+
+  static void MapDivAlignAttributeInto(mozilla::MappedDeclarationsBuilder&);
+
+  static void MapTableVAlignAttributeInto(mozilla::MappedDeclarationsBuilder&);
+
+  static void MapTableHAlignAttributeInto(mozilla::MappedDeclarationsBuilder&);
+
+  static void MapTableCellHAlignAttributeInto(
+      mozilla::MappedDeclarationsBuilder&);
+
+  static void MapImageBorderAttributeInto(mozilla::MappedDeclarationsBuilder&);
+  static void MapImageMarginAttributeInto(mozilla::MappedDeclarationsBuilder&);
+
+  static void MapDimensionAttributeInto(mozilla::MappedDeclarationsBuilder&,
+                                        NonCustomCSSPropertyId,
+                                        const nsAttrValue&);
+
+  static void DoMapAspectRatio(const nsAttrValue& aWidth,
+                               const nsAttrValue& aHeight,
+                               mozilla::MappedDeclarationsBuilder&);
+
+  enum class MapAspectRatio { No, Yes };
+
+  static void MapImageSizeAttributesInto(mozilla::MappedDeclarationsBuilder&,
+                                         MapAspectRatio = MapAspectRatio::No);
+
+  static void MapAspectRatioInto(mozilla::MappedDeclarationsBuilder&);
+
+  static void MapWidthAttributeInto(mozilla::MappedDeclarationsBuilder&);
+
+  static void MapHeightAttributeInto(mozilla::MappedDeclarationsBuilder&);
+  static void MapBackgroundInto(mozilla::MappedDeclarationsBuilder&);
+  static void MapBGColorInto(mozilla::MappedDeclarationsBuilder&);
+  static void MapBackgroundAttributesInto(mozilla::MappedDeclarationsBuilder&);
+  static void MapScrollingAttributeInto(mozilla::MappedDeclarationsBuilder&);
+
+  mozilla::dom::HTMLFormElement* FindAncestorForm(
+      mozilla::dom::HTMLFormElement* aCurrentForm = nullptr);
+
+  static bool InNavQuirksMode(Document*);
+
+  void GetURIAttr(nsAtom* aAttr, nsAtom* aBaseAttr, nsAString& aResult) const;
+  void GetURIAttr(nsAtom* aAttr, nsAtom* aBaseAttr, nsACString& aResult) const;
+
+  const nsAttrValue* GetURIAttr(nsAtom* aAttr, nsAtom* aBaseAttr,
+                                nsIURI** aURI) const;
+
+  bool IsHidden() const { return HasAttr(nsGkAtoms::hidden); }
+
+  bool IsLabelable() const override;
+
+  static bool MatchLabelsElement(Element* aElement, int32_t aNamespaceID,
+                                 nsAtom* aAtom, void* aData);
+
+  already_AddRefed<mozilla::dom::NodeList> LabelsForBindings();
+  already_AddRefed<mozilla::dom::NodeList> LabelsInternal();
+
+  static bool LegacyTouchAPIEnabled(JSContext* aCx, JSObject* aObj);
+
+  static inline bool CanHaveName(nsAtom* aTag) {
+    return aTag == nsGkAtoms::img || aTag == nsGkAtoms::form ||
+           aTag == nsGkAtoms::embed || aTag == nsGkAtoms::object ||
+           aTag == nsGkAtoms::iframe;
+  }
+  static inline bool ShouldExposeNameAsWindowProperty(Element* aElement) {
+    if (!aElement->IsHTMLElement()) {
+      return false;
+    }
+    auto* nodeName = aElement->NodeInfo()->NameAtom();
+    return CanHaveName(nodeName) && nodeName != nsGkAtoms::iframe;
+  }
+  static inline bool ShouldExposeIdAsHTMLDocumentProperty(Element* aElement) {
+    if (!aElement->HasID() || aElement->IsInNativeAnonymousSubtree()) {
+      return false;
+    }
+    if (aElement->IsHTMLElement(nsGkAtoms::object)) {
+      return true;
+    }
+
+    return aElement->IsHTMLElement(nsGkAtoms::img) && aElement->HasName();
+  }
+  static inline bool ShouldExposeNameAsHTMLDocumentProperty(Element* aElement) {
+    if (!aElement->HasName() || aElement->IsInNativeAnonymousSubtree()) {
+      return false;
+    }
+    return aElement->IsHTMLElement() &&
+           CanHaveName(aElement->NodeInfo()->NameAtom());
+  }
+
+  virtual inline void ResultForDialogSubmit(nsAString& aResult) {
+    GetAttr(nsGkAtoms::value, aResult);
+  }
+
+  static mozilla::dom::FetchPriority ToFetchPriority(const nsAString& aValue);
+
+  void GetFetchPriority(nsAString& aFetchPriority) const;
+
+  void SetFetchPriority(const nsAString& aFetchPriority) {
+    SetHTMLAttr(nsGkAtoms::fetchpriority, aFetchPriority);
+  }
+
+ private:
+  void AddToNameTable(nsAtom* aName);
+  void RemoveFromNameTable();
+
+  void RegUnRegAccessKey(bool aDoReg) override {
+    if (!HasFlag(NODE_HAS_ACCESSKEY)) {
+      return;
+    }
+
+    nsStyledElement::RegUnRegAccessKey(aDoReg);
+  }
+
+ protected:
+  void BeforeSetAttr(int32_t aNamespaceID, nsAtom* aName,
+                     const nsAttrValue* aValue, bool aNotify) override;
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void AfterSetAttr(
+      int32_t aNamespaceID, nsAtom* aName, const nsAttrValue* aValue,
+      const nsAttrValue* aOldValue, nsIPrincipal* aMaybeScriptedPrincipal,
+      bool aNotify) override;
+
+  void OnAttrSetButNotChanged(int32_t aNamespaceID, nsAtom* aName,
+                              const nsAttrValueOrString& aValue,
+                              bool aNotify) override;
+
+  MOZ_CAN_RUN_SCRIPT void AfterSetPopoverAttr();
+
+  mozilla::EventListenerManager* GetEventListenerManagerForAttr(
+      nsAtom* aAttrName, bool* aDefer) override;
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void HandleKeyboardActivation(
+      mozilla::EventChainPostVisitor&);
+
+  MOZ_CAN_RUN_SCRIPT static nsresult DispatchSimulatedClick(
+      nsGenericHTMLElement* aElement, bool aIsTrusted,
+      nsPresContext* aPresContext);
+
+  nsresult NewURIFromString(const nsAString& aURISpec, nsIURI** aURI);
+
+  void GetHTMLAttr(nsAtom* aName, nsAString& aResult) const {
+    GetAttr(aName, aResult);
+  }
+  void GetHTMLAttr(nsAtom* aName, mozilla::dom::DOMString& aResult) const {
+    GetAttr(aName, aResult);
+  }
+  void GetHTMLEnumAttr(nsAtom* aName, nsAString& aResult) const {
+    GetEnumAttr(aName, nullptr, aResult);
+  }
+  void GetHTMLURIAttr(nsAtom* aName, nsAString& aResult) const {
+    GetURIAttr(aName, nullptr, aResult);
+  }
+  void GetHTMLURIAttr(nsAtom* aName, nsACString& aResult) const {
+    GetURIAttr(aName, nullptr, aResult);
+  }
+
+  void SetHTMLAttr(nsAtom* aName, const nsAString& aValue) {
+    SetAttr(kNameSpaceID_None, aName, aValue, true);
+  }
+  void SetHTMLAttr(nsAtom* aName, const nsAString& aValue,
+                   mozilla::ErrorResult& aError) {
+    SetAttr(aName, aValue, aError);
+  }
+  void SetHTMLAttr(nsAtom* aName, const nsAString& aValue,
+                   nsIPrincipal* aTriggeringPrincipal,
+                   mozilla::ErrorResult& aError) {
+    SetAttr(aName, aValue, aTriggeringPrincipal, aError);
+  }
+  void UnsetHTMLAttr(nsAtom* aName, mozilla::ErrorResult& aError) {
+    UnsetAttr(aName, aError);
+  }
+  void SetHTMLBoolAttr(nsAtom* aName, bool aValue,
+                       mozilla::ErrorResult& aError) {
+    if (aValue) {
+      SetHTMLAttr(aName, u""_ns, aError);
+    } else {
+      UnsetHTMLAttr(aName, aError);
+    }
+  }
+  template <typename T>
+  void SetHTMLIntAttr(nsAtom* aName, T aValue, mozilla::ErrorResult& aError) {
+    nsAutoString value;
+    value.AppendInt(aValue);
+
+    SetHTMLAttr(aName, value, aError);
+  }
+
+  int32_t GetIntAttr(nsAtom* aAttr, int32_t aDefault) const;
+
+  nsresult SetIntAttr(nsAtom* aAttr, int32_t aValue);
+
+  uint32_t GetUnsignedIntAttr(nsAtom* aAttr, uint32_t aDefault) const;
+
+  void SetUnsignedIntAttr(nsAtom* aName, uint32_t aValue, uint32_t aDefault,
+                          mozilla::ErrorResult& aError) {
+    nsAutoString value;
+    if (aValue > INT32_MAX) {
+      value.AppendInt(aDefault);
+    } else {
+      value.AppendInt(aValue);
+    }
+
+    SetHTMLAttr(aName, value, aError);
+  }
+
+  uint32_t GetDimensionAttrAsUnsignedInt(nsAtom* aAttr,
+                                         uint32_t aDefault) const;
+
+  enum class Reflection {
+    Unlimited,
+    OnlyPositive,
+  };
+
+  template <Reflection Limited = Reflection::Unlimited>
+  void SetDoubleAttr(nsAtom* aAttr, double aValue, mozilla::ErrorResult& aRv) {
+    if (Limited == Reflection::OnlyPositive && aValue <= 0) {
+      return;
+    }
+
+    nsAutoString value;
+    value.AppendFloat(aValue);
+
+    SetHTMLAttr(aAttr, value, aRv);
+  }
+
+  virtual already_AddRefed<mozilla::EditorBase> GetAssociatedEditor();
+
+  static void SyncEditorsOnSubtree(nsIContent* content);
+
+  [[nodiscard]] inline static bool IsEditableState(
+      ContentEditableState aState) {
+    return aState == ContentEditableState::True ||
+           aState == ContentEditableState::PlainTextOnly;
+  }
+
+  already_AddRefed<nsIURI> GetHrefURIForAnchors() const;
+
+ private:
+  MOZ_CAN_RUN_SCRIPT void ChangeEditableState(int32_t aChange);
+};
+
+namespace mozilla::dom {
+class HTMLFieldSetElement;
+}  
+
+#define HTML_ELEMENT_FLAG_BIT(n_) \
+  NODE_FLAG_BIT(ELEMENT_TYPE_SPECIFIC_BITS_OFFSET + (n_))
+
+enum {
+  HTML_ELEMENT_ACTIVE_FOR_KEYBOARD = HTML_ELEMENT_FLAG_BIT(0),
+  HTML_ELEMENT_INHIBIT_RESTORATION = HTML_ELEMENT_FLAG_BIT(1),
+
+  HTML_ELEMENT_TYPE_SPECIFIC_BITS_OFFSET =
+      ELEMENT_TYPE_SPECIFIC_BITS_OFFSET + 2,
+};
+
+ASSERT_NODE_FLAGS_SPACE(HTML_ELEMENT_TYPE_SPECIFIC_BITS_OFFSET);
+
+#define FORM_ELEMENT_FLAG_BIT(n_) \
+  NODE_FLAG_BIT(HTML_ELEMENT_TYPE_SPECIFIC_BITS_OFFSET + (n_))
+
+enum {
+  ADDED_TO_FORM = FORM_ELEMENT_FLAG_BIT(0),
+
+  MAYBE_ORPHAN_FORM_ELEMENT = FORM_ELEMENT_FLAG_BIT(1),
+
+  MAY_BE_IN_PAST_NAMES_MAP = FORM_ELEMENT_FLAG_BIT(2)
+};
+
+
+ASSERT_NODE_FLAGS_SPACE(HTML_ELEMENT_TYPE_SPECIFIC_BITS_OFFSET + 3);
+
+#undef FORM_ELEMENT_FLAG_BIT
+
+class nsGenericHTMLFormElement : public nsGenericHTMLElement {
+ public:
+  nsGenericHTMLFormElement(already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo);
+
+  void SaveSubtreeState() override;
+  nsresult BindToTree(BindContext&, nsINode& aParent) override;
+  void UnbindFromTree(UnbindContext&) override;
+
+  virtual void FieldSetDisabledChanged(bool aNotify);
+
+  void FieldSetFirstLegendChanged(bool aNotify) { UpdateFieldSet(aNotify); }
+
+  void ForgetFieldSet(nsIContent* aFieldset);
+
+  void ClearForm(bool aRemoveFromForm, bool aUnbindOrDelete);
+
+  already_AddRefed<nsILayoutHistoryState> GetLayoutHistory(bool aRead);
+
+  virtual void SetUserInteracted(bool aNotify) {}
+
+ protected:
+  virtual ~nsGenericHTMLFormElement() = default;
+
+  void BeforeSetAttr(int32_t aNamespaceID, nsAtom* aName,
+                     const nsAttrValue* aValue, bool aNotify) override;
+
+  void AfterSetAttr(int32_t aNameSpaceID, nsAtom* aName,
+                    const nsAttrValue* aValue, const nsAttrValue* aOldValue,
+                    nsIPrincipal* aMaybeScriptedPrincipal,
+                    bool aNotify) override;
+
+  virtual void BeforeSetForm(mozilla::dom::HTMLFormElement* aForm,
+                             bool aBindToTree) {}
+
+  virtual void AfterClearForm(bool aUnbindOrDelete) {}
+
+  virtual void UpdateDisabledState(bool aNotify);
+  bool IsReadOnlyInternal() const final;
+
+  virtual void SetFormInternal(mozilla::dom::HTMLFormElement* aForm,
+                               bool aBindToTree) {}
+
+  virtual mozilla::dom::HTMLFormElement* GetFormInternal() const {
+    return nullptr;
+  }
+
+  virtual mozilla::dom::HTMLFieldSetElement* GetFieldSetInternal() const {
+    return nullptr;
+  }
+
+  virtual void SetFieldSetInternal(
+      mozilla::dom::HTMLFieldSetElement* aFieldset) {}
+
+  virtual void UpdateFormOwner(bool aBindToTree, Element* aFormIdElement);
+
+  void UpdateFieldSet(bool aNotify);
+
+  Element* AddFormAttributeObserver();
+
+  void RemoveFormAttributeObserver();
+
+  static bool FormAttributeUpdated(Element* aOldElement, Element* aNewElement,
+                                   Element* thisElement);
+
+  bool IsElementDisabledForEvents(mozilla::WidgetEvent* aEvent,
+                                  nsIFrame* aFrame);
+
+  virtual bool CanBeDisabled() const { return false; }
+
+  virtual bool DoesReadWriteApply() const { return false; }
+
+  virtual bool IsFormAssociatedElement() const { return false; }
+
+  virtual void SaveState() {}
+};
+
+class nsGenericHTMLFormControlElement : public nsGenericHTMLFormElement,
+                                        public nsIFormControl {
+ public:
+  nsGenericHTMLFormControlElement(
+      already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo, FormControlType);
+
+  NS_DECL_ISUPPORTS_INHERITED
+
+  NS_IMPL_FROMNODE_HELPER(nsGenericHTMLFormControlElement,
+                          IsHTMLFormControlElement())
+
+  [[nodiscard]] nsIFormControl* GetAsFormControl() final { return this; }
+  [[nodiscard]] const nsIFormControl* GetAsFormControl() const final {
+    return this;
+  }
+
+  nsINode* GetScopeChainParent() const override;
+  bool IsHTMLFormControlElement() const final { return true; }
+
+  IMEState GetDesiredIMEState() override;
+
+  void GetAutocapitalize(nsAString& aValue) const override;
+  bool Autocorrect() const override;
+  bool IsHTMLFocusable(mozilla::IsFocusableFlags, bool* aIsFocusable,
+                       int32_t* aTabIndex) override;
+
+  mozilla::dom::HTMLFieldSetElement* GetFieldSet() override;
+  mozilla::dom::Element* GetFormForBindings() const override;
+  mozilla::dom::HTMLFormElement* GetFormInternal() const override;
+  void SetForm(mozilla::dom::HTMLFormElement* aForm) override;
+  void ClearForm(bool aRemoveFromForm, bool aUnbindOrDelete) override;
+
+ protected:
+  virtual ~nsGenericHTMLFormControlElement();
+
+  bool IsLabelable() const override;
+
+  bool CanBeDisabled() const override;
+  bool DoesReadWriteApply() const override;
+  void SetFormInternal(mozilla::dom::HTMLFormElement* aForm,
+                       bool aBindToTree) override;
+  mozilla::dom::HTMLFieldSetElement* GetFieldSetInternal() const override;
+  void SetFieldSetInternal(
+      mozilla::dom::HTMLFieldSetElement* aFieldset) override;
+  bool IsFormAssociatedElement() const override { return true; }
+
+  void UpdateRequiredState(bool aIsRequired, bool aNotify);
+
+  bool IsAutocapitalizeOrAutocorrectInheriting() const;
+
+  nsresult SubmitDirnameDir(mozilla::dom::FormData* aFormData);
+
+  void GetFormAutofillState(nsAString& aState) const;
+  void SetFormAutofillState(const nsAString& aState);
+
+  mozilla::dom::HTMLFormElement* mForm;
+
+  mozilla::dom::HTMLFieldSetElement* mFieldSet;
+};
+
+enum class PopoverTargetAction : uint8_t {
+  Toggle,
+  Show,
+  Hide,
+};
+
+class nsGenericHTMLFormControlElementWithState
+    : public nsGenericHTMLFormControlElement {
+ public:
+  nsGenericHTMLFormControlElementWithState(
+      already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo,
+      mozilla::dom::FromParser aFromParser, FormControlType);
+
+  bool IsGenericHTMLFormControlElementWithState() const final { return true; }
+  NS_IMPL_FROMNODE_HELPER(nsGenericHTMLFormControlElementWithState,
+                          IsGenericHTMLFormControlElementWithState())
+
+  bool ParseAttribute(int32_t aNamespaceID, nsAtom* aAttribute,
+                      const nsAString& aValue,
+                      nsIPrincipal* aMaybeScriptedPrincipal,
+                      nsAttrValue& aResult) override;
+
+  mozilla::dom::Element* GetPopoverTargetElementForBindings() const;
+  mozilla::dom::Element* GetPopoverTargetElementInternal() const;
+  void SetPopoverTargetElementForBindings(mozilla::dom::Element*);
+  void GetPopoverTargetAction(nsAString& aValue) const {
+    GetHTMLEnumAttr(nsGkAtoms::popovertargetaction, aValue);
+  }
+  void SetPopoverTargetAction(const nsAString& aValue) {
+    SetHTMLAttr(nsGkAtoms::popovertargetaction, aValue);
+  }
+
+  MOZ_CAN_RUN_SCRIPT void HandlePopoverTargetAction(mozilla::dom::Element*);
+
+  mozilla::PresState* GetPrimaryPresState();
+
+  void NodeInfoChanged(Document* aOldDoc) override;
+
+  void GetFormAction(nsString& aValue);
+
+ protected:
+  virtual bool RestoreState(mozilla::PresState* aState) { return false; }
+
+  bool RestoreFormControlState();
+
+  void GenerateStateKey();
+
+  int32_t GetParserInsertedControlNumberForStateKey() const override {
+    return mControlNumber;
+  }
+
+  nsCString mStateKey;
+
+  int32_t mControlNumber;
+};
+
+#define NS_INTERFACE_MAP_ENTRY_IF_TAG(_interface, _tag) \
+  NS_INTERFACE_MAP_ENTRY_CONDITIONAL(_interface,        \
+                                     mNodeInfo->Equals(nsGkAtoms::_tag))
+
+namespace mozilla::dom {
+
+using HTMLContentCreatorFunction =
+    nsGenericHTMLElement* (*)(already_AddRefed<mozilla::dom::NodeInfo>,
+                              mozilla::dom::FromParser);
+
+}  
+
+#define NS_DECLARE_NS_NEW_HTML_ELEMENT(_elementName)       \
+  namespace mozilla {                                      \
+  namespace dom {                                          \
+  class HTML##_elementName##Element;                       \
+  }                                                        \
+  }                                                        \
+  nsGenericHTMLElement* NS_NewHTML##_elementName##Element( \
+      already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo,  \
+      mozilla::dom::FromParser aFromParser = mozilla::dom::NOT_FROM_PARSER);
+
+#define NS_DECLARE_NS_NEW_HTML_ELEMENT_AS_SHARED(_elementName)                \
+  inline nsGenericHTMLElement* NS_NewHTML##_elementName##Element(             \
+      already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo,                     \
+      mozilla::dom::FromParser aFromParser = mozilla::dom::NOT_FROM_PARSER) { \
+    return NS_NewHTMLSharedElement(std::move(aNodeInfo), aFromParser);        \
+  }
+
+#define NS_IMPL_NS_NEW_HTML_ELEMENT(_elementName)                     \
+  nsGenericHTMLElement* NS_NewHTML##_elementName##Element(            \
+      already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo,             \
+      mozilla::dom::FromParser aFromParser) {                         \
+    RefPtr<mozilla::dom::NodeInfo> nodeInfo(aNodeInfo);               \
+    auto* nim = nodeInfo->NodeInfoManager();                          \
+    MOZ_ASSERT(nim);                                                  \
+    return new (nim)                                                  \
+        mozilla::dom::HTML##_elementName##Element(nodeInfo.forget()); \
+  }
+
+#define NS_IMPL_NS_NEW_HTML_ELEMENT_CHECK_PARSER(_elementName)  \
+  nsGenericHTMLElement* NS_NewHTML##_elementName##Element(      \
+      already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo,       \
+      mozilla::dom::FromParser aFromParser) {                   \
+    RefPtr<mozilla::dom::NodeInfo> nodeInfo(aNodeInfo);         \
+    auto* nim = nodeInfo->NodeInfoManager();                    \
+    MOZ_ASSERT(nim);                                            \
+    return new (nim) mozilla::dom::HTML##_elementName##Element( \
+        nodeInfo.forget(), aFromParser);                        \
+  }
+
+nsGenericHTMLElement* NS_NewHTMLElement(
+    already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo,
+    mozilla::dom::FromParser aFromParser = mozilla::dom::NOT_FROM_PARSER);
+
+nsGenericHTMLElement* NS_NewCustomElement(
+    already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo,
+    mozilla::dom::FromParser aFromParser = mozilla::dom::NOT_FROM_PARSER);
+
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Shared)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(SharedList)
+
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Anchor)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Area)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Audio)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(BR)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Body)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Button)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Canvas)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Content)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Mod)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Data)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(DataList)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Details)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Dialog)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Div)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Embed)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(FieldSet)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Font)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Form)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Frame)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(FrameSet)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(HR)
+NS_DECLARE_NS_NEW_HTML_ELEMENT_AS_SHARED(Head)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Heading)
+NS_DECLARE_NS_NEW_HTML_ELEMENT_AS_SHARED(Html)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(IFrame)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Image)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Input)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(LI)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Label)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Legend)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Link)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Marquee)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Map)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Menu)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Meta)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Meter)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Object)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(OptGroup)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Option)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Output)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Paragraph)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Picture)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Pre)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Progress)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Script)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Select)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(SelectedContent)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Slot)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Source)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Span)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Style)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Summary)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(TableCaption)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(TableCell)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(TableCol)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Table)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(TableRow)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(TableSection)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Tbody)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Template)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(TextArea)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Tfoot)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Thead)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Time)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Title)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Track)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Unknown)
+NS_DECLARE_NS_NEW_HTML_ELEMENT(Video)
+
+#endif /* nsGenericHTMLElement_h_ */

@@ -1,0 +1,113 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_InputTaskManager_h
+#define mozilla_InputTaskManager_h
+
+#include "nsTArray.h"
+#include "nsXULAppAPI.h"
+#include "TaskController.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/StaticPrefs_dom.h"
+
+namespace mozilla {
+
+class InputTaskManager : public TaskManager {
+ public:
+  int32_t GetPriorityModifierForEventLoopTurn(
+      const MutexAutoLock& aProofOfLock) final;
+  void WillRunTask() final;
+
+  enum InputEventQueueState {
+    STATE_DISABLED,
+    STATE_FLUSHING,
+    STATE_SUSPEND,
+    STATE_ENABLED
+  };
+
+  void EnableInputEventPrioritization();
+  void FlushInputEventPrioritization();
+  void SuspendInputEventPrioritization();
+  void ResumeInputEventPrioritization();
+
+  InputEventQueueState State() { return mInputQueueState; }
+
+  void SetState(InputEventQueueState aState) { mInputQueueState = aState; }
+
+  static InputTaskManager* Get() { return gInputTaskManager.get(); }
+  static void Cleanup() { gInputTaskManager = nullptr; }
+  static void Init();
+
+  bool IsSuspended(const MutexAutoLock& aProofOfLock) override {
+    MOZ_ASSERT(NS_IsMainThread());
+    return mInputQueueState == STATE_SUSPEND || mSuspensionLevel > 0;
+  }
+
+  bool IsSuspended() {
+    MOZ_ASSERT(NS_IsMainThread());
+    return mSuspensionLevel > 0;
+  }
+
+  void IncSuspensionLevel() {
+    MOZ_ASSERT(NS_IsMainThread());
+    ++mSuspensionLevel;
+  }
+
+  void DecSuspensionLevel() {
+    MOZ_ASSERT(NS_IsMainThread());
+    --mSuspensionLevel;
+  }
+
+  static bool CanSuspendInputEvent() {
+    return XRE_IsContentProcess() &&
+           StaticPrefs::dom_input_events_canSuspendInBCG_enabled() &&
+           InputTaskManager::Get()->State() !=
+               InputEventQueueState::STATE_DISABLED;
+  }
+
+  void NotifyVsync() { mInputPriorityController.WillRunVsync(); }
+
+ private:
+  InputTaskManager() : mInputQueueState(STATE_DISABLED) {}
+
+  class InputPriorityController {
+   public:
+    InputPriorityController();
+    bool ShouldUseHighestPriority(InputTaskManager*);
+
+    void WillRunVsync();
+
+    void WillRunTask();
+
+   private:
+    enum class InputVsyncState {
+      HasPendingVsync,
+      NoPendingVsync,
+      RunVsync,
+    };
+
+    void EnterPendingVsyncState(uint32_t aNumPendingTasks);
+    void LeavePendingVsyncState(bool aRunVsync);
+
+    uint32_t mMaxInputTasksToRun = 0;
+
+    InputVsyncState mInputVsyncState;
+
+    TimeStamp mRunInputStartTime;
+  };
+
+  int32_t GetPriorityModifierForEventLoopTurnForStrictVsyncAlignment();
+
+  Atomic<InputEventQueueState> mInputQueueState;
+
+  static StaticRefPtr<InputTaskManager> gInputTaskManager;
+
+  uint32_t mSuspensionLevel = 0;
+
+  InputPriorityController mInputPriorityController;
+};
+
+}  
+
+#endif  // mozilla_InputTaskManager_h

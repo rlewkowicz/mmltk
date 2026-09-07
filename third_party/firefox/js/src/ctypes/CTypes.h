@@ -1,0 +1,524 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef ctypes_CTypes_h
+#define ctypes_CTypes_h
+
+#include "mozilla/Sprintf.h"
+#include "mozilla/Vector.h"
+
+#include "ffi.h"
+#include "prlink.h"
+
+#include "ctypes/typedefs.h"
+#include "gc/ZoneAllocator.h"
+#include "js/AllocPolicy.h"
+#include "js/GCHashTable.h"
+#include "js/UniquePtr.h"
+#include "js/Vector.h"
+#include "vm/JSObject.h"
+#include "vm/StringType.h"
+
+namespace JS {
+struct CTypesCallbacks;
+}  
+
+namespace js {
+namespace ctypes {
+
+
+
+template <class CharT, size_t N>
+class StringBuilder {
+  Vector<CharT, N, SystemAllocPolicy> v;
+
+  bool errored{false};
+
+#ifdef DEBUG
+  bool finished{false};
+
+  mutable bool checked{false};
+#endif
+
+ public:
+  explicit operator bool() const {
+#ifdef DEBUG
+    checked = true;
+#endif
+    return !errored;
+  }
+
+  bool handle(bool result) {
+    MOZ_ASSERT(!finished);
+    if (!result) {
+      errored = true;
+    }
+    return result;
+  }
+
+  bool resize(size_t n) { return handle(v.resize(n)); }
+
+  CharT& operator[](size_t index) { return v[index]; }
+  const CharT& operator[](size_t index) const { return v[index]; }
+  size_t length() const { return v.length(); }
+
+  template <typename U>
+  [[nodiscard]] bool append(U&& u) {
+    return handle(v.append(u));
+  }
+
+  template <typename U>
+  [[nodiscard]] bool append(const U* begin, const U* end) {
+    return handle(v.append(begin, end));
+  }
+
+  template <typename U>
+  [[nodiscard]] bool append(const U* begin, size_t len) {
+    return handle(v.append(begin, len));
+  }
+
+  CharT* begin() {
+    MOZ_ASSERT(!finished);
+    return v.begin();
+  }
+
+  Vector<CharT, N, SystemAllocPolicy>&& finish() {
+    MOZ_ASSERT(!errored);
+    MOZ_ASSERT(!finished);
+    MOZ_ASSERT(checked);
+#ifdef DEBUG
+    finished = true;
+#endif
+    return std::move(v);
+  }
+};
+
+typedef StringBuilder<char16_t, 0> AutoString;
+typedef StringBuilder<char, 0> AutoCString;
+
+typedef Vector<char16_t, 0, SystemAllocPolicy> AutoStringChars;
+typedef Vector<char, 0, SystemAllocPolicy> AutoCStringChars;
+
+template <class T, size_t N, size_t ArrayLength>
+void AppendString(JSContext* cx, StringBuilder<T, N>& v,
+                  const char (&array)[ArrayLength]) {
+  size_t alen = ArrayLength - 1;
+  size_t vlen = v.length();
+  if (!v.resize(vlen + alen)) {
+    return;
+  }
+
+  for (size_t i = 0; i < alen; ++i) {
+    v[i + vlen] = array[i];
+  }
+}
+
+template <class T, size_t N>
+void AppendChars(StringBuilder<T, N>& v, const char c, size_t count) {
+  size_t vlen = v.length();
+  if (!v.resize(vlen + count)) {
+    return;
+  }
+
+  for (size_t i = 0; i < count; ++i) {
+    v[i + vlen] = c;
+  }
+}
+
+template <class T, size_t N>
+void AppendUInt(StringBuilder<T, N>& v, unsigned n) {
+  char array[16];
+  size_t alen = SprintfLiteral(array, "%u", n);
+  size_t vlen = v.length();
+  if (!v.resize(vlen + alen)) {
+    return;
+  }
+
+  for (size_t i = 0; i < alen; ++i) {
+    v[i + vlen] = array[i];
+  }
+}
+
+template <class T, size_t N, size_t M, class AP>
+void AppendString(JSContext* cx, StringBuilder<T, N>& v,
+                  mozilla::Vector<T, M, AP>& w) {
+  if (!v.append(w.begin(), w.length())) {
+    return;
+  }
+}
+
+template <size_t N>
+void AppendString(JSContext* cx, StringBuilder<char16_t, N>& v, JSString* str) {
+  MOZ_ASSERT(str);
+  JSLinearString* linear = str->ensureLinear(cx);
+  if (!linear) {
+    return;
+  }
+  JS::AutoCheckCannotGC nogc;
+  if (linear->hasLatin1Chars()) {
+    if (!v.append(linear->latin1Chars(nogc), linear->length())) {
+      return;
+    }
+  } else {
+    if (!v.append(linear->twoByteChars(nogc), linear->length())) {
+      return;
+    }
+  }
+}
+
+template <size_t N>
+void AppendString(JSContext* cx, StringBuilder<char, N>& v, JSString* str) {
+  MOZ_ASSERT(str);
+  size_t vlen = v.length();
+  size_t alen = str->length();
+  if (!v.resize(vlen + alen)) {
+    return;
+  }
+
+  JSLinearString* linear = str->ensureLinear(cx);
+  if (!linear) {
+    return;
+  }
+
+  JS::AutoCheckCannotGC nogc;
+  if (linear->hasLatin1Chars()) {
+    const Latin1Char* chars = linear->latin1Chars(nogc);
+    for (size_t i = 0; i < alen; ++i) {
+      v[i + vlen] = char(chars[i]);
+    }
+  } else {
+    const char16_t* chars = linear->twoByteChars(nogc);
+    for (size_t i = 0; i < alen; ++i) {
+      v[i + vlen] = char(chars[i]);
+    }
+  }
+}
+
+template <class T, size_t N, size_t ArrayLength>
+void PrependString(JSContext* cx, StringBuilder<T, N>& v,
+                   const char (&array)[ArrayLength]) {
+  size_t alen = ArrayLength - 1;
+  size_t vlen = v.length();
+  if (!v.resize(vlen + alen)) {
+    return;
+  }
+
+  memmove(v.begin() + alen, v.begin(), vlen * sizeof(T));
+
+  for (size_t i = 0; i < alen; ++i) {
+    v[i] = array[i];
+  }
+}
+
+template <size_t N>
+void PrependString(JSContext* cx, StringBuilder<char16_t, N>& v,
+                   JSString* str) {
+  MOZ_ASSERT(str);
+  size_t vlen = v.length();
+  size_t alen = str->length();
+  if (!v.resize(vlen + alen)) {
+    return;
+  }
+
+  JSLinearString* linear = str->ensureLinear(cx);
+  if (!linear) {
+    return;
+  }
+
+  memmove(v.begin() + alen, v.begin(), vlen * sizeof(char16_t));
+
+  CopyChars(v.begin(), *linear);
+}
+
+[[nodiscard]] bool ReportErrorIfUnpairedSurrogatePresent(JSContext* cx,
+                                                         JSLinearString* str);
+
+[[nodiscard]] JSObject* GetThisObject(JSContext* cx, const CallArgs& args,
+                                      const char* msg);
+
+
+enum ErrorNum {
+#define MSG_DEF(name, count, exception, format) name,
+#include "ctypes/ctypes.msg"
+#undef MSG_DEF
+  CTYPESERR_LIMIT
+};
+
+enum ABICode {
+  ABI_DEFAULT,
+  ABI_STDCALL,
+  ABI_THISCALL,
+  ABI_WINAPI,
+  INVALID_ABI
+};
+
+enum TypeCode {
+  TYPE_void_t,
+#define DEFINE_TYPE(name, type, ffiType) TYPE_##name,
+  CTYPES_FOR_EACH_TYPE(DEFINE_TYPE)
+#undef DEFINE_TYPE
+      TYPE_pointer,
+  TYPE_function,
+  TYPE_array,
+  TYPE_struct
+};
+
+struct FieldInfo {
+  HeapPtr<JSObject*> mType;  
+  size_t mIndex;             
+  size_t mOffset;            
+
+  void trace(JSTracer* trc) { TraceEdge(trc, &mType, "fieldType"); }
+};
+
+struct UnbarrieredFieldInfo {
+  JSObject* mType;  
+  size_t mIndex;    
+  size_t mOffset;   
+};
+static_assert(sizeof(UnbarrieredFieldInfo) == sizeof(FieldInfo),
+              "UnbarrieredFieldInfo should be the same as FieldInfo but with "
+              "unbarriered mType");
+
+struct FieldHashPolicy {
+  using Key = JSLinearString*;
+  using Lookup = Key;
+
+  static HashNumber hash(const Lookup& l) { return js::HashStringChars(l); }
+
+  static bool match(const Key& k, const Lookup& l) {
+    return js::EqualStrings(k, l);
+  }
+};
+
+using FieldInfoHash = GCHashMap<js::HeapPtr<JSLinearString*>, FieldInfo,
+                                FieldHashPolicy, CellAllocPolicy>;
+
+struct FunctionInfo {
+  explicit FunctionInfo(JS::Zone* zone) : mArgTypes(zone), mFFITypes(zone) {}
+
+  ffi_cif mCIF;
+
+  HeapPtr<JSObject*> mABI;
+
+  HeapPtr<JSObject*> mReturnType;
+
+  GCVector<HeapPtr<JSObject*>, 0, CellAllocPolicy> mArgTypes;
+
+  Vector<ffi_type*, 0, CellAllocPolicy> mFFITypes;
+
+  bool mIsVariadic;
+};
+
+struct ClosureInfo {
+  JSContext* cx;
+  HeapPtr<JSObject*> closureObj;  
+  HeapPtr<JSObject*> typeObj;     
+  HeapPtr<JSObject*> thisObj;  
+  HeapPtr<JSObject*> jsfnObj;  
+  void* errResult;       
+  ffi_closure* closure;  
+
+  explicit ClosureInfo(JSContext* context)
+      : cx(context), errResult(nullptr), closure(nullptr) {}
+
+  ~ClosureInfo() {
+    if (closure) {
+      ffi_closure_free(closure);
+    }
+    js_free(errResult);
+  }
+};
+
+bool IsCTypesGlobal(HandleValue v);
+bool IsCTypesGlobal(JSObject* obj);
+
+const JS::CTypesCallbacks* GetCallbacks(JSObject* obj);
+
+
+enum CTypesGlobalSlot {
+  SLOT_CALLBACKS = 0,  
+  SLOT_ERRNO = 1,      
+  SLOT_LASTERROR =
+      2,  
+  CTYPESGLOBAL_SLOTS
+};
+
+enum CABISlot {
+  SLOT_ABICODE = 0,  
+  CABI_SLOTS
+};
+
+enum CTypeProtoSlot {
+  SLOT_POINTERPROTO = 0,   
+  SLOT_ARRAYPROTO = 1,     
+  SLOT_STRUCTPROTO = 2,    
+  SLOT_FUNCTIONPROTO = 3,  
+  SLOT_CDATAPROTO = 4,     
+  SLOT_POINTERDATAPROTO =
+      5,  
+  SLOT_ARRAYDATAPROTO = 6,  
+  SLOT_STRUCTDATAPROTO =
+      7,  
+  SLOT_FUNCTIONDATAPROTO =
+      8,                
+  SLOT_INT64PROTO = 9,  
+  SLOT_UINT64PROTO = 10,   
+  SLOT_CTYPES = 11,        
+  SLOT_OURDATAPROTO = 12,  
+  CTYPEPROTO_SLOTS
+};
+
+enum CTypeSlot {
+  SLOT_PROTO = 0,     
+  SLOT_TYPECODE = 1,  
+  SLOT_FFITYPE = 2,   
+  SLOT_NAME = 3,      
+  SLOT_SIZE = 4,      
+  SLOT_ALIGN = 5,     
+  SLOT_PTR = 6,       
+  SLOT_TARGET_T = 7,   
+  SLOT_ELEMENT_T = 7,  
+  SLOT_LENGTH = 8,     
+  SLOT_FIELDS = 7,     
+  SLOT_FIELDINFO = 8,  
+  SLOT_FNINFO = 7,     
+  SLOT_ARGS_T = 8,     
+  CTYPE_SLOTS
+};
+
+enum CDataSlot {
+  SLOT_CTYPE = 0,     
+  SLOT_REFERENT = 1,  
+  SLOT_DATA = 2,      
+  SLOT_OWNS = 3,      
+  SLOT_FUNNAME = 4,   
+  CDATA_SLOTS
+};
+
+enum CClosureSlot {
+  SLOT_CLOSUREINFO = 0,  
+  CCLOSURE_SLOTS
+};
+
+enum CDataFinalizerSlot {
+  SLOT_DATAFINALIZER_PRIVATE = 0,
+  SLOT_DATAFINALIZER_VALTYPE = 1,
+  SLOT_DATAFINALIZER_CODETYPE = 2,
+  CDATAFINALIZER_SLOTS
+};
+
+enum TypeCtorSlot {
+  SLOT_FN_CTORPROTO = 0  
+};
+
+enum Int64Slot {
+  SLOT_INT64 = 0,  
+  INT64_SLOTS
+};
+
+enum Int64FunctionSlot {
+  SLOT_FN_INT64PROTO = 0  
+};
+
+
+namespace CType {
+JSObject* Create(JSContext* cx, HandleObject typeProto, HandleObject dataProto,
+                 TypeCode type, JSString* name, HandleValue size,
+                 HandleValue align, ffi_type* ffiType);
+
+JSObject* DefineBuiltin(JSContext* cx, HandleObject ctypesObj,
+                        const char* propName, JSObject* typeProto,
+                        JSObject* dataProto, const char* name, TypeCode type,
+                        HandleValue size, HandleValue align, ffi_type* ffiType);
+
+bool IsCType(JSObject* obj);
+bool IsCTypeProto(JSObject* obj);
+TypeCode GetTypeCode(JSObject* typeObj);
+bool TypesEqual(JSObject* t1, JSObject* t2);
+size_t GetSize(JSObject* obj);
+[[nodiscard]] bool GetSafeSize(JSObject* obj, size_t* result);
+bool IsSizeDefined(JSObject* obj);
+size_t GetAlignment(JSObject* obj);
+ffi_type* GetFFIType(JSContext* cx, JSObject* obj);
+JSString* GetName(JSContext* cx, HandleObject obj);
+JSObject* GetProtoFromCtor(JSObject* obj, CTypeProtoSlot slot);
+JSObject* GetProtoFromType(JSContext* cx, JSObject* obj, CTypeProtoSlot slot);
+const JS::CTypesCallbacks* GetCallbacksFromType(JSObject* obj);
+}  
+
+namespace PointerType {
+JSObject* CreateInternal(JSContext* cx, HandleObject baseType);
+
+JSObject* GetBaseType(JSObject* obj);
+}  
+
+using UniquePtrFFIType = UniquePtr<ffi_type>;
+
+namespace ArrayType {
+JSObject* CreateInternal(JSContext* cx, HandleObject baseType, size_t length,
+                         bool lengthDefined);
+
+JSObject* GetBaseType(JSObject* obj);
+size_t GetLength(JSObject* obj);
+[[nodiscard]] bool GetSafeLength(JSObject* obj, size_t* result);
+UniquePtrFFIType BuildFFIType(JSContext* cx, JSObject* obj);
+}  
+
+namespace StructType {
+[[nodiscard]] bool DefineInternal(JSContext* cx, JSObject* typeObj,
+                                  JSObject* fieldsObj);
+
+const FieldInfoHash* GetFieldInfo(JSObject* obj);
+const FieldInfo* LookupField(JSContext* cx, JSObject* obj,
+                             JSLinearString* name);
+JSObject* BuildFieldsArray(JSContext* cx, JSObject* obj);
+UniquePtrFFIType BuildFFIType(JSContext* cx, JSObject* obj);
+}  
+
+namespace FunctionType {
+JSObject* CreateInternal(JSContext* cx, HandleValue abi, HandleValue rtype,
+                         const HandleValueArray& args);
+
+JSObject* ConstructWithObject(JSContext* cx, JSObject* typeObj,
+                              JSObject* refObj, PRFuncPtr fnptr,
+                              JSObject* result);
+
+FunctionInfo* GetFunctionInfo(JSObject* obj);
+void BuildSymbolName(JSContext* cx, JSString* name, JSObject* typeObj,
+                     AutoCString& result);
+}  
+
+namespace CClosure {
+JSObject* Create(JSContext* cx, HandleObject typeObj, HandleObject fnObj,
+                 HandleObject thisObj, HandleValue errVal, PRFuncPtr* fnptr);
+}  
+
+namespace CData {
+JSObject* Create(JSContext* cx, HandleObject typeObj, HandleObject refObj,
+                 void* data, bool ownResult);
+
+JSObject* GetCType(JSObject* dataObj);
+void* GetData(JSObject* dataObj);
+bool IsCData(JSObject* obj);
+bool IsCDataMaybeUnwrap(MutableHandleObject obj);
+bool IsCData(HandleValue v);
+bool IsCDataProto(JSObject* obj);
+
+[[nodiscard]] bool Cast(JSContext* cx, unsigned argc, Value* vp);
+[[nodiscard]] bool GetRuntime(JSContext* cx, unsigned argc, Value* vp);
+}  
+
+namespace Int64 {
+bool IsInt64(JSObject* obj);
+}  
+
+namespace UInt64 {
+bool IsUInt64(JSObject* obj);
+}  
+
+}  
+}  
+
+#endif /* ctypes_CTypes_h */

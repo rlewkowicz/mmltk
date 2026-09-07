@@ -1,0 +1,112 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_cache_FileUtils_h
+#define mozilla_dom_cache_FileUtils_h
+
+#include "CacheCipherKeyManager.h"
+#include "CacheCommon.h"
+#include "mozIStorageConnection.h"
+#include "mozilla/dom/cache/Types.h"
+#include "nsStreamUtils.h"
+#include "nsTArrayForwardDeclare.h"
+
+struct nsID;
+class nsIFile;
+
+namespace mozilla::dom::cache {
+
+#define PADDING_FILE_NAME u".padding"
+#define PADDING_TMP_FILE_NAME u".padding-tmp"
+
+enum class DirPaddingFile { FILE, TMP_FILE };
+
+nsresult BodyCreateDir(nsIFile& aBaseDir);
+
+nsresult BodyDeleteDir(const CacheDirectoryMetadata& aDirectoryMetadata,
+                       nsIFile& aBaseDir);
+
+Result<nsCOMPtr<nsISupports>, nsresult> BodyStartWriteStream(
+    const CacheDirectoryMetadata& aDirectoryMetadata, nsIFile& aBaseDir,
+    const nsID& aBodyId, Maybe<CipherKey> aMaybeCipherKey,
+    nsIInputStream& aSource, void* aClosure, nsAsyncCopyCallbackFun aCallback);
+
+void BodyCancelWrite(nsISupports& aCopyContext);
+
+Result<int64_t, nsresult> BodyFinalizeWrite(nsIFile& aBaseDir, const nsID& aId);
+
+Result<int64_t, nsresult> GetBodyDiskSize(nsIFile& aBaseDir, const nsID& aId);
+
+Result<MovingNotNull<nsCOMPtr<nsIInputStream>>, nsresult> BodyOpen(
+    const CacheDirectoryMetadata& aDirectoryMetadata, nsIFile& aBaseDir,
+    const nsID& aId, Maybe<CipherKey> aMaybeCipherKey);
+
+nsresult BodyMaybeUpdatePaddingSize(
+    const CacheDirectoryMetadata& aDirectoryMetadata, nsIFile& aBaseDir,
+    const nsID& aId, uint32_t aPaddingInfo, int64_t* aPaddingSizeInOut);
+
+nsresult BodyDeleteFiles(const CacheDirectoryMetadata& aDirectoryMetadata,
+                         nsIFile& aBaseDir, const nsTArray<nsID>& aIdList);
+
+nsresult BodyDeleteOrphanedFiles(
+    const CacheDirectoryMetadata& aDirectoryMetadata, nsIFile& aBaseDir,
+    nsTHashSet<nsID>& aKnownBodyIds);
+
+template <typename Func>
+nsresult BodyTraverseFilesForCleanup(
+    const Maybe<CacheDirectoryMetadata>& aDirectoryMetadata, nsIFile& aBodyDir,
+    const Func& aHandleFileFunc);
+
+nsresult CreateMarkerFile(const CacheDirectoryMetadata& aDirectoryMetadata);
+
+nsresult DeleteMarkerFile(const CacheDirectoryMetadata& aDirectoryMetadata);
+
+bool MarkerFileExists(const CacheDirectoryMetadata& aDirectoryMetadata);
+
+nsresult RemoveNsIFileRecursively(
+    const Maybe<CacheDirectoryMetadata>& aDirectoryMetadata, nsIFile& aFile,
+    bool aTrackQuota = true);
+
+inline nsresult RemoveNsIFileRecursively(
+    const CacheDirectoryMetadata& aDirectoryMetadata, nsIFile& aFile,
+    bool aTrackQuota = true) {
+  return RemoveNsIFileRecursively(Some(aDirectoryMetadata), aFile, aTrackQuota);
+}
+
+nsresult RemoveNsIFile(const Maybe<CacheDirectoryMetadata>& aDirectoryMetadata,
+                       nsIFile& aFile, bool aTrackQuota = true);
+
+inline nsresult RemoveNsIFile(const CacheDirectoryMetadata& aDirectoryMetadata,
+                              nsIFile& aFile, bool aTrackQuota = true) {
+  return RemoveNsIFile(Some(aDirectoryMetadata), aFile, aTrackQuota);
+}
+
+void DecreaseUsageForDirectoryMetadata(
+    const CacheDirectoryMetadata& aDirectoryMetadata, int64_t aUpdatingSize);
+
+bool DirectoryPaddingFileExists(nsIFile& aBaseDir,
+                                DirPaddingFile aPaddingFileType);
+
+
+Result<int64_t, nsresult> DirectoryPaddingGet(nsIFile& aBaseDir);
+
+nsresult DirectoryPaddingInit(nsIFile& aBaseDir);
+
+nsresult UpdateDirectoryPaddingFile(nsIFile& aBaseDir,
+                                    mozIStorageConnection& aConn,
+                                    int64_t aIncreaseSize,
+                                    int64_t aDecreaseSize,
+                                    bool aTemporaryFileExist);
+
+nsresult DirectoryPaddingFinalizeWrite(nsIFile& aBaseDir);
+
+Result<int64_t, nsresult> DirectoryPaddingRestore(nsIFile& aBaseDir,
+                                                  mozIStorageConnection& aConn,
+                                                  bool aMustRestore);
+
+nsresult DirectoryPaddingDeleteFile(nsIFile& aBaseDir,
+                                    DirPaddingFile aPaddingFileType);
+}  
+
+#endif  // mozilla_dom_cache_FileUtils_h

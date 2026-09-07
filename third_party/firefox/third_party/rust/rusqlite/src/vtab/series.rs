@@ -1,0 +1,271 @@
+//! Generate series virtual table.
+//!
+//! Port of C [generate series
+//! "function"](http://www.sqlite.org/cgi/src/finfo?name=ext/misc/series.c):
+//! `https://www.sqlite.org/series.html`
+use std::ffi::c_int;
+use std::marker::PhantomData;
+
+use crate::ffi;
+use crate::types::Type;
+use crate::vtab::{
+    eponymous_only_module, Context, Filters, IndexConstraintOp, IndexInfo, VTab, VTabConfig,
+    VTabConnection, VTabCursor,
+};
+use crate::{error::error_from_sqlite_code, Connection, Result};
+
+/// Register the `generate_series` module.
+pub fn load_module(conn: &Connection) -> Result<()> {
+    let aux: Option<()> = None;
+    conn.create_module(
+        c"generate_series",
+        eponymous_only_module::<SeriesTab>(),
+        aux,
+    )
+}
+
+const SERIES_COLUMN_START: c_int = 1;
+const SERIES_COLUMN_STOP: c_int = 2;
+const SERIES_COLUMN_STEP: c_int = 3;
+
+bitflags::bitflags! {
+    #[derive(Clone, Copy)]
+    #[repr(C)]
+    struct QueryPlanFlags: c_int {
+        const START = 1;
+        const STOP  = 2;
+        const STEP  = 4;
+        const DESC  = 8;
+        const ASC  = 16;
+        const BOTH  = QueryPlanFlags::START.bits() | QueryPlanFlags::STOP.bits();
+    }
+}
+
+/// An instance of the Series virtual table
+#[repr(C)]
+struct SeriesTab {
+    /// Base class. Must be first
+    base: ffi::sqlite3_vtab,
+}
+
+unsafe impl<'vtab> VTab<'vtab> for SeriesTab {
+    type Aux = ();
+    type Cursor = SeriesTabCursor<'vtab>;
+
+    fn connect(
+        db: &mut VTabConnection,
+        _aux: Option<&()>,
+        _args: &[&[u8]],
+    ) -> Result<(String, Self)> {
+        let vtab = Self {
+            base: ffi::sqlite3_vtab::default(),
+        };
+        db.config(VTabConfig::Innocuous)?;
+        Ok((
+            "CREATE TABLE x(value,start hidden,stop hidden,step hidden)".to_owned(),
+            vtab,
+        ))
+    }
+
+    fn best_index(&self, info: &mut IndexInfo) -> Result<()> {
+        let mut idx_num: QueryPlanFlags = QueryPlanFlags::empty();
+        let mut unusable_mask: QueryPlanFlags = QueryPlanFlags::empty();
+        let mut a_idx: [Option<usize>; 3] = [None, None, None];
+        for (i, constraint) in info.constraints().enumerate() {
+            if constraint.column() < SERIES_COLUMN_START {
+                continue;
+            }
+            let (i_col, i_mask) = match constraint.column() {
+                SERIES_COLUMN_START => (0, QueryPlanFlags::START),
+                SERIES_COLUMN_STOP => (1, QueryPlanFlags::STOP),
+                SERIES_COLUMN_STEP => (2, QueryPlanFlags::STEP),
+                _ => {
+                    unreachable!()
+                }
+            };
+            if !constraint.is_usable() {
+                unusable_mask |= i_mask;
+            } else if constraint.operator() == IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_EQ {
+                idx_num |= i_mask;
+                a_idx[i_col] = Some(i);
+            }
+        }
+        let mut n_arg = 0;
+        for j in a_idx.iter().flatten() {
+            n_arg += 1;
+            let mut constraint_usage = info.constraint_usage(*j);
+            constraint_usage.set_argv_index(n_arg);
+            constraint_usage.set_omit(true);
+#[cfg(any())]
+
+
+
+
+
+
+
+
+
+            debug_assert_eq!(Ok("BINARY"), info.collation(*j));
+        }
+        if !(unusable_mask & !idx_num).is_empty() {
+            return Err(error_from_sqlite_code(ffi::SQLITE_CONSTRAINT, None));
+        }
+        if idx_num.contains(QueryPlanFlags::BOTH) {
+            #[expect(clippy::bool_to_int_with_if)]
+            info.set_estimated_cost(f64::from(
+                2 - if idx_num.contains(QueryPlanFlags::STEP) {
+                    1
+                } else {
+                    0
+                },
+            ));
+            info.set_estimated_rows(1000);
+            let order_by_consumed = {
+                let mut order_bys = info.order_bys();
+                if let Some(order_by) = order_bys.next() {
+                    if order_by.column() == 0 {
+                        if order_by.is_order_by_desc() {
+                            idx_num |= QueryPlanFlags::DESC;
+                        } else {
+                            idx_num |= QueryPlanFlags::ASC;
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+            if order_by_consumed {
+                info.set_order_by_consumed(true);
+            }
+        } else {
+            info.set_estimated_rows(2_147_483_647);
+        }
+        info.set_idx_num(idx_num.bits());
+        Ok(())
+    }
+
+    fn open(&mut self) -> Result<SeriesTabCursor<'_>> {
+        Ok(SeriesTabCursor::new())
+    }
+}
+
+/// A cursor for the Series virtual table
+#[repr(C)]
+struct SeriesTabCursor<'vtab> {
+    /// Base class. Must be first
+    base: ffi::sqlite3_vtab_cursor,
+    /// True to count down rather than up
+    is_desc: bool,
+    /// The rowid
+    row_id: i64,
+    /// Current value ("value")
+    value: i64,
+    /// Minimum value ("start")
+    min_value: i64,
+    /// Maximum value ("stop")
+    max_value: i64,
+    /// Increment ("step")
+    step: i64,
+    phantom: PhantomData<&'vtab SeriesTab>,
+}
+
+impl SeriesTabCursor<'_> {
+    fn new<'vtab>() -> SeriesTabCursor<'vtab> {
+        SeriesTabCursor {
+            base: ffi::sqlite3_vtab_cursor::default(),
+            is_desc: false,
+            row_id: 0,
+            value: 0,
+            min_value: 0,
+            max_value: 0,
+            step: 0,
+            phantom: PhantomData,
+        }
+    }
+}
+#[expect(clippy::comparison_chain)]
+unsafe impl VTabCursor for SeriesTabCursor<'_> {
+    fn filter(&mut self, idx_num: c_int, _idx_str: Option<&str>, args: &Filters<'_>) -> Result<()> {
+        let mut idx_num = QueryPlanFlags::from_bits_truncate(idx_num);
+        let mut i = 0;
+        if idx_num.contains(QueryPlanFlags::START) {
+            self.min_value = args.get::<Option<_>>(i)?.unwrap_or_default();
+            i += 1;
+        } else {
+            self.min_value = 0;
+        }
+        if idx_num.contains(QueryPlanFlags::STOP) {
+            self.max_value = args.get::<Option<_>>(i)?.unwrap_or_default();
+            i += 1;
+        } else {
+            self.max_value = 0xffff_ffff;
+        }
+        if idx_num.contains(QueryPlanFlags::STEP) {
+            self.step = args.get::<Option<_>>(i)?.unwrap_or_default();
+            if self.step == 0 {
+                self.step = 1;
+            } else if self.step < 0 {
+                self.step = -self.step;
+                if !idx_num.contains(QueryPlanFlags::ASC) {
+                    idx_num |= QueryPlanFlags::DESC;
+                }
+            }
+        } else {
+            self.step = 1;
+        };
+        for arg in args.iter() {
+            if arg.data_type() == Type::Null {
+                self.min_value = 1;
+                self.max_value = 0;
+                break;
+            }
+        }
+        self.is_desc = idx_num.contains(QueryPlanFlags::DESC);
+        if self.is_desc {
+            self.value = self.max_value;
+            if self.step > 0 {
+                self.value -= (self.max_value - self.min_value) % self.step;
+            }
+        } else {
+            self.value = self.min_value;
+        }
+        self.row_id = 1;
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<()> {
+        if self.is_desc {
+            self.value -= self.step;
+        } else {
+            self.value += self.step;
+        }
+        self.row_id += 1;
+        Ok(())
+    }
+
+    fn eof(&self) -> bool {
+        if self.is_desc {
+            self.value < self.min_value
+        } else {
+            self.value > self.max_value
+        }
+    }
+
+    fn column(&self, ctx: &mut Context, i: c_int) -> Result<()> {
+        let x = match i {
+            SERIES_COLUMN_START => self.min_value,
+            SERIES_COLUMN_STOP => self.max_value,
+            SERIES_COLUMN_STEP => self.step,
+            _ => self.value,
+        };
+        ctx.set_result(&x)
+    }
+
+    fn rowid(&self) -> Result<i64> {
+        Ok(self.row_id)
+    }
+}

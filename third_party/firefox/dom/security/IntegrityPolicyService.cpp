@@ -1,0 +1,279 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "IntegrityPolicyService.h"
+
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/Logging.h"
+#include "mozilla/StaticPrefs_security.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/IntegrityPolicy.h"
+#include "mozilla/dom/IntegrityViolationReportBody.h"
+#include "mozilla/dom/PolicyContainer.h"
+#include "mozilla/dom/ReportingUtils.h"
+#include "mozilla/dom/RequestBinding.h"
+#include "mozilla/dom/SRIMetadata.h"
+#include "mozilla/net/SFVService.h"
+#include "nsContentSecurityManager.h"
+#include "nsContentSecurityUtils.h"
+#include "nsContentUtils.h"
+#include "nsILoadInfo.h"
+#include "nsString.h"
+
+using namespace mozilla;
+
+static LazyLogModule sIntegrityPolicyServiceLogModule("IntegrityPolicy");
+#define LOG(fmt, ...)                                                 \
+  MOZ_LOG_FMT(sIntegrityPolicyServiceLogModule, LogLevel::Debug, fmt, \
+              ##__VA_ARGS__)
+
+namespace mozilla::dom {
+
+IntegrityPolicyService::~IntegrityPolicyService() = default;
+
+NS_IMETHODIMP
+IntegrityPolicyService::ShouldLoad(nsIURI* aContentLocation,
+                                   nsILoadInfo* aLoadInfo, int16_t* aDecision) {
+  LOG("ShouldLoad: [{}] Entered ShouldLoad", static_cast<void*>(aLoadInfo));
+
+  *aDecision = nsIContentPolicy::ACCEPT;
+
+  if (!StaticPrefs::security_integrity_policy_enabled()) {
+    LOG("ShouldLoad: [{}] Integrity policy is disabled",
+        static_cast<void*>(aLoadInfo));
+    return NS_OK;
+  }
+
+  if (!aContentLocation) {
+    LOG("ShouldLoad: [{}] No content location", static_cast<void*>(aLoadInfo));
+    return NS_ERROR_FAILURE;
+  }
+
+  bool block = ShouldRequestBeBlocked(aContentLocation, aLoadInfo);
+  *aDecision =
+      block ? nsIContentPolicy::REJECT_SERVER : nsIContentPolicy::ACCEPT;
+  return NS_OK;
+}
+
+NS_IMETHODIMP IntegrityPolicyService::ShouldProcess(nsIURI* aContentLocation,
+                                                    nsILoadInfo* aLoadInfo,
+                                                    int16_t* aDecision) {
+  *aDecision = nsIContentPolicy::ACCEPT;
+  return NS_OK;
+}
+
+bool IntegrityPolicyService::ShouldRequestBeBlocked(nsIURI* aContentLocation,
+                                                    nsILoadInfo* aLoadInfo) {
+  auto destination = IntegrityPolicy::ContentTypeToDestinationType(
+      aLoadInfo->InternalContentPolicyType());
+  if (destination.isNothing()) {
+    LOG("ShouldLoad: [{}] Integrity policy doesn't handle this type={}",
+        static_cast<void*>(aLoadInfo),
+        static_cast<uint8_t>(aLoadInfo->InternalContentPolicyType()));
+    return false;
+  }
+
+  Maybe<RequestMode> maybeRequestMode;
+  aLoadInfo->GetRequestMode(&maybeRequestMode);
+  if (maybeRequestMode.isNothing()) {
+    MOZ_ASSERT(aLoadInfo->GetSecurityFlags() !=
+               nsILoadInfo::SEC_ONLY_FOR_EXPLICIT_CONTENTSEC_CHECK);
+
+    maybeRequestMode = Some(nsContentSecurityManager::SecurityModeToRequestMode(
+        aLoadInfo->GetSecurityMode()));
+  }
+
+  RequestMode requestMode = *maybeRequestMode;
+
+  if (MOZ_LOG_TEST(sIntegrityPolicyServiceLogModule, LogLevel::Debug)) {
+    nsAutoString integrityMetadata;
+    aLoadInfo->GetIntegrityMetadata(integrityMetadata);
+
+    LOG("ShouldLoad: [{}] uri={} destination={} "
+        "requestMode={} integrityMetadata={}",
+        static_cast<void*>(aLoadInfo), aContentLocation->GetSpecOrDefault(),
+        static_cast<uint8_t>(*destination), static_cast<uint8_t>(requestMode),
+        NS_ConvertUTF16toUTF8(integrityMetadata).get());
+  }
+
+  if (requestMode == RequestMode::Cors ||
+      requestMode == RequestMode::Same_origin) {
+    nsAutoString integrityMetadata;
+    aLoadInfo->GetIntegrityMetadata(integrityMetadata);
+
+    SRIMetadata outMetadata;
+    dom::SRICheck::IntegrityMetadata(integrityMetadata,
+                                     aContentLocation->GetSpecOrDefault(),
+                                     nullptr, &outMetadata);
+
+    if (outMetadata.IsValid()) {
+      LOG("ShouldLoad: [{}] Allowed because we have valid a integrity.",
+          static_cast<void*>(aLoadInfo));
+      return false;
+    }
+  }
+
+  if (aContentLocation->SchemeIs("data") ||
+      aContentLocation->SchemeIs("blob") ||
+      aContentLocation->SchemeIs("about")) {
+    LOG("ShouldLoad: [{}] Allowed because we have data or blob.",
+        static_cast<void*>(aLoadInfo));
+    return false;
+  }
+
+  nsCOMPtr<nsIPolicyContainer> policyContainer =
+      aLoadInfo->GetPolicyContainer();
+  if (!policyContainer) {
+    LOG("ShouldLoad: [{}] No policy container", static_cast<void*>(aLoadInfo));
+    return false;
+  }
+
+  RefPtr<IntegrityPolicy> policy = IntegrityPolicy::Cast(
+      PolicyContainer::Cast(policyContainer)->GetIntegrityPolicy());
+  if (!policy) {
+    LOG("ShouldLoad: [{}] No integrity policy", static_cast<void*>(aLoadInfo));
+    return false;
+  }
+
+
+  bool contains = false;
+  bool roContains = false;
+  policy->PolicyContains(*destination, &contains, &roContains);
+
+  if (contains || roContains) {
+    ReportToConsole(aContentLocation, aLoadInfo, *destination, contains,
+                    roContains);
+    ReportViolation(aContentLocation, aLoadInfo, *destination, policy, contains,
+                    roContains);
+  }
+
+  return contains;
+}
+
+const char* GetReportMessageKey(bool aEnforcing,
+                                IntegrityPolicy::DestinationType aDestination) {
+  switch (aDestination) {
+    case IntegrityPolicy::DestinationType::Script:
+      return aEnforcing ? "IntegrityPolicyEnforceBlockedScript"
+                        : "IntegrityPolicyReportOnlyBlockedScript";
+    case IntegrityPolicy::DestinationType::Style:
+      return aEnforcing ? "IntegrityPolicyEnforceBlockedStylesheet"
+                        : "IntegrityPolicyReportOnlyBlockedStylesheet";
+    default:
+      MOZ_ASSERT_UNREACHABLE("Unhandled destination type");
+      return nullptr;
+  }
+}
+
+void IntegrityPolicyService::ReportToConsole(
+    nsIURI* aContentLocation, nsILoadInfo* aLoadInfo,
+    IntegrityPolicy::DestinationType aDestination, bool aEnforce,
+    bool aReportOnly) const {
+  if (nsContentUtils::IsPreloadType(aLoadInfo->InternalContentPolicyType())) {
+    return;  
+  }
+
+  const char* messageKey = GetReportMessageKey(aEnforce, aDestination);
+  NS_ENSURE_TRUE_VOID(messageKey);
+
+  AutoTArray<nsString, 1> params = {
+      NS_ConvertUTF8toUTF16(aContentLocation->GetSpecOrDefault())};
+  nsAutoString localizedMsg;
+  nsresult rv = nsContentUtils::FormatLocalizedString(
+      PropertiesFile::SECURITY_PROPERTIES, messageKey, params, localizedMsg);
+  NS_ENSURE_SUCCESS_VOID(rv);
+
+  uint64_t windowID = aLoadInfo->GetInnerWindowID();
+
+  nsContentUtils::ReportToConsoleByWindowID(
+      localizedMsg,
+      aEnforce ? nsIScriptError::errorFlag : nsIScriptError::warningFlag,
+      "Security"_ns, windowID);
+}
+
+void dom::IntegrityPolicyService::ReportViolation(
+    nsIURI* aContentLocation, nsILoadInfo* aLoadInfo,
+    IntegrityPolicy::DestinationType aDestination,
+    const IntegrityPolicy* aPolicy, bool aEnforce, bool aReportOnly) const {
+  nsCOMPtr<nsISupports> loadingContext = aLoadInfo->GetLoadingContext();
+  RefPtr<Document> doc;
+  if (nsCOMPtr<nsINode> node = do_QueryInterface(loadingContext)) {
+    doc = node->OwnerDoc();
+  } else if (nsCOMPtr<nsPIDOMWindowOuter> window =
+                 do_QueryInterface(loadingContext)) {
+    doc = window->GetDoc();
+  }
+
+  if (NS_WARN_IF(!doc)) {
+    return;
+  }
+
+  nsPIDOMWindowInner* window = doc->GetInnerWindow();
+  if (NS_WARN_IF(!window)) {
+    return;
+  }
+  nsCOMPtr<nsIGlobalObject> global = window->AsGlobal();
+
+
+  nsCOMPtr<nsIURI> uri = doc->GetDocumentURI();  
+
+
+  if (NS_WARN_IF(!uri)) {
+    return;
+  }
+
+  nsAutoCString documentURL;
+  ReportingUtils::StripURL(uri, documentURL);
+  NS_ConvertUTF8toUTF16 documentURLUTF16(documentURL);
+
+  nsAutoCString blockedURL;
+  ReportingUtils::StripURL(aContentLocation, blockedURL);
+
+  nsAutoCString destination;
+  switch (aDestination) {
+    case IntegrityPolicy::DestinationType::Script:
+      destination = "script"_ns;
+      break;
+    case IntegrityPolicy::DestinationType::Style:
+      destination = "style"_ns;
+      break;
+    case IntegrityPolicy::DestinationType::Image:
+      destination = "image"_ns;
+      break;
+  }
+
+  nsTArray<nsCString> enforcementEndpoints;
+  nsTArray<nsCString> reportOnlyEndpoints;
+  aPolicy->Endpoints(enforcementEndpoints, reportOnlyEndpoints);
+
+  if (aEnforce) {
+    for (const nsCString& endpoint : enforcementEndpoints) {
+      RefPtr<IntegrityViolationReportBody> body =
+          new IntegrityViolationReportBody(global, documentURL, blockedURL,
+                                           destination, false);
+
+      ReportingUtils::Report(global, nsGkAtoms::integrity_violation,
+                             NS_ConvertUTF8toUTF16(endpoint), documentURLUTF16,
+                             body);
+    }
+  }
+
+  if (aReportOnly) {
+    for (const nsCString& endpoint : reportOnlyEndpoints) {
+      RefPtr<IntegrityViolationReportBody> reportBody =
+          new IntegrityViolationReportBody(global, documentURL, blockedURL,
+                                           destination, true);
+
+      ReportingUtils::Report(global, nsGkAtoms::integrity_violation,
+                             NS_ConvertUTF8toUTF16(endpoint), documentURLUTF16,
+                             reportBody);
+    }
+  }
+}
+
+NS_IMPL_ISUPPORTS(IntegrityPolicyService, nsIContentPolicy)
+
+}  
+
+#undef LOG

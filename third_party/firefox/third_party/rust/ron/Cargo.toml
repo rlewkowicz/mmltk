@@ -1,0 +1,81 @@
+
+[package]
+edition = "2021"
+rust-version = "1.64.0"
+name = "ron"
+version = "0.12.0"
+authors = [
+    "Christopher Durham <cad97@cad97.com>",
+    "Dzmitry Malyshau <kvarkus@gmail.com>",
+    "Thomas Schaller <torkleyy@gmail.com>",
+    "Juniper Tyree <juniper.tyree@helsinki.fi>",
+]
+description = "Rusty Object Notation"
+homepage = "https://github.com/ron-rs/ron"
+documentation = "https://docs.rs/ron/"
+keywords = [
+    "parser",
+    "serde",
+    "serialization",
+]
+categories = ["encoding"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ron-rs/ron"
+
+[package.metadata.docs.rs]
+features = [
+    "integer128",
+    "indexmap",
+]
+rustdoc-args = ["--generate-link-to-definition"]
+
+[dependencies.bitflags]
+version = "2.1"
+features = ["serde"]
+default-features = false
+
+[dependencies.indexmap]
+version = "2.0"
+features = ["serde"]
+optional = true
+default-features = false
+
+[dependencies.once_cell]
+version = "1.20"
+features = [
+    "alloc",
+    "race",
+]
+default-features = false
+
+[dependencies.serde]
+version = "1.0.181"
+features = ["alloc"]
+default-features = false
+
+[dependencies.serde_derive]
+version = "1.0.181"
+default-features = false
+
+[dependencies.typeid]
+version = "1.0.1"
+default-features = false
+
+[dependencies.unicode-ident]
+version = "1.0"
+default-features = false
+
+[dependencies.unicode-segmentation]
+version = "1.12.0"
+optional = true
+default-features = false
+
+[features]
+default = ["std"]
+indexmap = [
+    "std",
+    "dep:indexmap",
+]
+integer128 = []
+internal-span-substring-test = ["unicode-segmentation"]
+std = ["serde/std"]

@@ -1,0 +1,65 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_MEDIA_MEDIACAPABILITIES_MEDIACAPABILITIESVALIDATION_H_
+#define DOM_MEDIA_MEDIACAPABILITIES_MEDIACAPABILITIESVALIDATION_H_
+#include "mozilla/DefineEnum.h"
+#include "mozilla/Result.h"
+#include "mozilla/Variant.h"
+#include "nsStringFwd.h"
+namespace mozilla {
+class ErrorResult;
+class MediaExtendedMIMEType;
+template <typename T>
+class Maybe;
+
+namespace dom {
+class Promise;
+struct MediaDecodingConfiguration;
+struct MediaEncodingConfiguration;
+enum class MediaEncodingType : uint8_t;
+enum class MediaDecodingType : uint8_t;
+enum class ColorGamut : uint8_t;
+enum class TransferFunction : uint8_t;
+}  
+
+namespace mediacaps {
+enum class AVType { AUDIO, VIDEO };
+MOZ_DEFINE_ENUM_CLASS_WITH_TOSTRING(
+    ValidationError,
+    (MissingType, InvalidAudioConfiguration, InvalidVideoConfiguration,
+     InvalidMIMEType, InvalidAudioType, InvalidVideoType, SingleCodecHasParams,
+     ContainerMissingCodecsParam, ContainerCodecsNotSingle, FramerateInvalid,
+     InapplicableMember, KeySystemWrongType, KeySystemAudioMissing,
+     KeySystemVideoMissing, SENTINEL));
+
+using MediaType = Variant<dom::MediaEncodingType, dom::MediaDecodingType>;
+using ValidationResult = mozilla::Result<mozilla::Ok, ValidationError>;
+
+struct BehaviorConfig;
+
+ValidationResult CheckMIMETypeSupport(
+    const MediaExtendedMIMEType& aMime,
+    const MediaType& aEncodingOrDecodingType,
+    const Maybe<dom::ColorGamut>& aColorGamut,
+    const Maybe<dom::TransferFunction>& aTransferFunction,
+    const BehaviorConfig& aBehavior);
+
+ValidationResult IsValidMediaDecodingConfiguration(
+    const dom::MediaDecodingConfiguration& aConfig,
+    const BehaviorConfig& aBehavior);
+
+ValidationResult IsValidMediaEncodingConfiguration(
+    const dom::MediaEncodingConfiguration& aConfig,
+    const BehaviorConfig& aBehavior);
+
+void RejectWithValidationResult(dom::Promise* aPromise,
+                                const ValidationError aErr);
+void ThrowWithValidationResult(ErrorResult& aRv, const ValidationError aErr);
+
+bool IsMediaTypeWebRTC(const MediaType& aType);
+}  
+}  
+
+#endif

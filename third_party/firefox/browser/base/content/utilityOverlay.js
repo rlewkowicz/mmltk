@@ -1,0 +1,431 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+var { AppConstants } = ChromeUtils.importESModule(
+  "resource://gre/modules/AppConstants.sys.mjs"
+);
+var { XPCOMUtils } = ChromeUtils.importESModule(
+  "resource://gre/modules/XPCOMUtils.sys.mjs"
+);
+
+ChromeUtils.defineESModuleGetters(this, {
+  BrowserUtils: "resource://gre/modules/BrowserUtils.sys.mjs",
+  BrowserWindowTracker: "resource:///modules/BrowserWindowTracker.sys.mjs",
+  ContextualIdentityService:
+    "moz-src:///toolkit/components/contextualidentity/ContextualIdentityService.sys.mjs",
+  PrivateBrowsingUtils: "resource://gre/modules/PrivateBrowsingUtils.sys.mjs",
+  URILoadingHelper: "resource:///modules/URILoadingHelper.sys.mjs",
+});
+
+ChromeUtils.defineLazyGetter(this, "ReferrerInfo", () =>
+  Components.Constructor(
+    "@mozilla.org/referrer-info;1",
+    "nsIReferrerInfo",
+    "init"
+  )
+);
+
+Object.defineProperty(this, "BROWSER_NEW_TAB_URL", {
+  enumerable: true,
+  get() {
+    if (PrivateBrowsingUtils.isWindowPrivate(window)) {
+      if (!PrivateBrowsingUtils.permanentPrivateBrowsing) {
+        return "about:privatebrowsing";
+      }
+    }
+    return "about:blank";
+  },
+});
+
+var TAB_DROP_TYPE = "application/x-moz-tabbrowser-tab";
+
+var gBidiUI = false;
+
+function isBlankPageURL(aURL) {
+  return (
+    aURL == "about:blank" ||
+    aURL == "about:home" ||
+    aURL == BROWSER_NEW_TAB_URL ||
+    aURL == "chrome://browser/content/blanktab.html"
+  );
+}
+
+function doGetProtocolFlags(aURI) {
+  return Services.io.getDynamicProtocolFlags(aURI);
+}
+
+function openUILink(
+  url,
+  event,
+  aIgnoreButton,
+  aIgnoreAlt,
+  aAllowThirdPartyFixup,
+  aPostData,
+  aReferrerInfo
+) {
+  return URILoadingHelper.openUILink(
+    window,
+    url,
+    event,
+    aIgnoreButton,
+    aIgnoreAlt,
+    aAllowThirdPartyFixup,
+    aPostData,
+    aReferrerInfo
+  );
+}
+
+function openTrustedLinkIn(url, where, params) {
+  URILoadingHelper.openTrustedLinkIn(window, url, where, params);
+}
+
+function openWebLinkIn(url, where, params) {
+  URILoadingHelper.openWebLinkIn(window, url, where, params);
+}
+
+function openLinkIn(url, where, params) {
+  return URILoadingHelper.openLinkIn(window, url, where, params);
+}
+
+function checkForMiddleClick(node, event) {
+  if (node.hasAttribute("disabled")) {
+    return;
+  } 
+
+  if (event.target.tagName == "menuitem") {
+    return;
+  }
+
+  if (event.button == 1) {
+
+    let cmdEvent = document.createEvent("xulcommandevent");
+    cmdEvent.initCommandEvent(
+      "command",
+      true,
+      true,
+      window,
+      0,
+      event.ctrlKey,
+      event.altKey,
+      event.shiftKey,
+      event.metaKey,
+      0,
+      event,
+      event.inputSource
+    );
+    node.dispatchEvent(cmdEvent);
+
+    event.stopPropagation();
+    event.preventDefault();
+
+    closeMenus(event.target);
+  }
+}
+
+function createUserContextMenu(
+  event,
+  {
+    isContextMenu = false,
+    excludeUserContextId = 0,
+    showDefaultTab = false,
+    useAccessKeys = true,
+    showAddContainer = true,
+    showManageContainers = true,
+  } = {}
+) {
+  while (event.target.hasChildNodes()) {
+    event.target.firstChild.remove();
+  }
+
+  MozXULElement.insertFTLIfNeeded("toolkit/global/contextual-identity.ftl");
+  let docfrag = document.createDocumentFragment();
+
+  if (excludeUserContextId || showDefaultTab) {
+    let menuitem = document.createXULElement("menuitem");
+    if (useAccessKeys) {
+      document.l10n.setAttributes(menuitem, "user-context-new-tab");
+    } else {
+      const label = ContextualIdentityService.formatContextLabel(
+        "user-context-new-tab"
+      );
+      menuitem.setAttribute("label", label);
+    }
+    menuitem.setAttribute("data-usercontextid", "0");
+    if (!isContextMenu) {
+      menuitem.setAttribute("command", "Browser:NewUserContextTab");
+    }
+
+    docfrag.appendChild(menuitem);
+
+    let menuseparator = document.createXULElement("menuseparator");
+    docfrag.appendChild(menuseparator);
+  }
+
+  ContextualIdentityService.getPublicIdentities().forEach(identity => {
+    if (identity.userContextId == excludeUserContextId) {
+      return;
+    }
+
+    let menuitem = document.createXULElement("menuitem");
+    menuitem.setAttribute("data-usercontextid", identity.userContextId);
+    if (identity.name) {
+      menuitem.setAttribute("label", identity.name);
+    } else if (useAccessKeys) {
+      document.l10n.setAttributes(menuitem, identity.l10nId);
+    } else {
+      const label = ContextualIdentityService.formatContextLabel(
+        identity.l10nId
+      );
+      menuitem.setAttribute("label", label);
+    }
+
+    menuitem.classList.add("menuitem-iconic");
+    menuitem.classList.add("identity-color-" + identity.color);
+
+    if (!isContextMenu) {
+      menuitem.setAttribute("command", "Browser:NewUserContextTab");
+    }
+
+    menuitem.classList.add("identity-icon-" + identity.icon);
+
+    docfrag.appendChild(menuitem);
+  });
+
+  if (showAddContainer || showManageContainers) {
+    docfrag.appendChild(document.createXULElement("menuseparator"));
+  }
+
+  if (showAddContainer) {
+    let menuitem = document.createXULElement("menuitem");
+    if (useAccessKeys) {
+      document.l10n.setAttributes(menuitem, "user-context-add-container");
+    } else {
+      const label = ContextualIdentityService.formatContextLabel(
+        "user-context-add-container"
+      );
+      menuitem.setAttribute("label", label);
+    }
+    menuitem.setAttribute("command", "Browser:AddContainer");
+    docfrag.appendChild(menuitem);
+  }
+
+  if (showManageContainers) {
+    let menuitem = document.createXULElement("menuitem");
+    if (useAccessKeys) {
+      document.l10n.setAttributes(menuitem, "user-context-manage-containers");
+    } else {
+      const label = ContextualIdentityService.formatContextLabel(
+        "user-context-manage-containers"
+      );
+      menuitem.setAttribute("label", label);
+    }
+    menuitem.setAttribute("command", "Browser:OpenAboutContainers");
+    docfrag.appendChild(menuitem);
+  }
+
+  event.target.appendChild(docfrag);
+  return true;
+}
+
+function closeMenus(node) {
+  if ("tagName" in node) {
+    if (
+      node.namespaceURI ==
+        "http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul" &&
+      (node.tagName == "menupopup" || node.tagName == "popup")
+    ) {
+      node.hidePopup();
+    }
+
+    closeMenus(node.parentNode);
+  }
+}
+
+function eventMatchesKey(aEvent, aKey) {
+  let keyPressed = (aKey.getAttribute("key") || "").toLowerCase();
+  let keyModifiers = aKey.getAttribute("modifiers");
+  let modifiers = ["Alt", "Control", "Meta", "Shift"];
+
+  if (aEvent.key != keyPressed) {
+    return false;
+  }
+  let eventModifiers = modifiers.filter(modifier =>
+    aEvent.getModifierState(modifier)
+  );
+  if (eventModifiers.length && !keyModifiers.length) {
+    return false;
+  }
+  if (keyModifiers) {
+    keyModifiers = keyModifiers.split(/[\s,]+/);
+    keyModifiers.forEach(function (modifier, index) {
+      if (modifier == "accel") {
+        keyModifiers[index] =
+          AppConstants.platform == "macosx" ? "Meta" : "Control";
+      } else {
+        keyModifiers[index] = modifier[0].toUpperCase() + modifier.slice(1);
+      }
+    });
+    return modifiers.every(
+      modifier =>
+        keyModifiers.includes(modifier) == aEvent.getModifierState(modifier)
+    );
+  }
+  return true;
+}
+
+function gatherTextUnder(root) {
+  const encoder = Cu.createDocumentEncoder("text/plain");
+  encoder.init(root.ownerDocument, "text/plain", 0);
+  encoder.setContainerNode(root);
+  return encoder.encodeToString().trim();
+}
+
+function isBidiEnabled() {
+  if (Services.prefs.getBoolPref("bidi.browser.ui", false)) {
+    return true;
+  }
+
+  const isRTL = Services.locale.isAppLocaleRTL;
+
+  if (isRTL) {
+    Services.prefs.setBoolPref("bidi.browser.ui", true);
+  }
+  return isRTL;
+}
+
+function openAboutDialog() {
+  for (let win of Services.wm.getEnumerator("Browser:About")) {
+    if (win.closed) {
+      continue;
+    }
+    win.focus();
+    return;
+  }
+
+  var features = "chrome,";
+  if (AppConstants.platform == "win") {
+    features += "centerscreen,dependent";
+  } else if (AppConstants.platform == "macosx") {
+    features += "centerscreen,resizable=no,minimizable=no";
+  } else {
+    features += "centerscreen,dependent,dialog=no";
+  }
+
+  var win = BrowserWindowTracker.getTopWindow() || window;
+  win.openDialog("chrome://browser/content/aboutDialog.xhtml", "", features);
+}
+
+async function openPreferences(paneID, extraArgs) {
+  function internalPrefCategoryNameToFriendlyName(aName) {
+    return (aName || "").replace(/^pane./, function (toReplace) {
+      return toReplace[4].toLowerCase();
+    });
+  }
+
+  let win = Services.wm.getMostRecentWindow("navigator:browser");
+  let friendlyCategoryName = internalPrefCategoryNameToFriendlyName(paneID);
+  let params;
+  if (extraArgs && extraArgs.urlParams) {
+    params = new URLSearchParams();
+    let urlParams = extraArgs.urlParams;
+    for (let name in urlParams) {
+      if (urlParams[name] !== undefined) {
+        params.set(name, urlParams[name]);
+      }
+    }
+  }
+  let preferencesURLSuffix =
+    (params ? "?" + params : "") +
+    (friendlyCategoryName ? "#" + friendlyCategoryName : "");
+  let newLoad = true;
+  let browser = null;
+  if (!win) {
+    let windowArguments = Cc["@mozilla.org/array;1"].createInstance(
+      Ci.nsIMutableArray
+    );
+    let supportsStringPrefURL = Cc[
+      "@mozilla.org/supports-string;1"
+    ].createInstance(Ci.nsISupportsString);
+    supportsStringPrefURL.data = "about:preferences" + preferencesURLSuffix;
+    windowArguments.appendElement(supportsStringPrefURL);
+
+    win = Services.ww.openWindow(
+      null,
+      AppConstants.BROWSER_CHROME_URL,
+      "_blank",
+      "chrome,dialog=no,all",
+      windowArguments
+    );
+  } else {
+    let shouldReplaceFragment = friendlyCategoryName
+      ? "whenComparingAndReplace"
+      : "whenComparing";
+    newLoad = !win.switchToTabHavingURI(
+      "about:settings" + preferencesURLSuffix,
+      false,
+      {
+        ignoreFragment: shouldReplaceFragment,
+        replaceQueryString: true,
+        triggeringPrincipal:
+          Services.scriptSecurityManager.getSystemPrincipal(),
+      }
+    );
+    if (newLoad) {
+      newLoad = !win.switchToTabHavingURI(
+        "about:preferences" + preferencesURLSuffix,
+        true,
+        {
+          ignoreFragment: shouldReplaceFragment,
+          replaceQueryString: true,
+          triggeringPrincipal:
+            Services.scriptSecurityManager.getSystemPrincipal(),
+        }
+      );
+    }
+    browser = win.gBrowser.selectedBrowser;
+  }
+
+  if (!newLoad && paneID) {
+    if (browser.contentDocument?.readyState != "complete") {
+      await new Promise(resolve => {
+        browser.addEventListener("load", resolve, {
+          capture: true,
+          once: true,
+        });
+      });
+    }
+    browser.contentWindow.gotoPref(paneID);
+  }
+}
+
+function openTroubleshootingPage() {
+  openTrustedLinkIn("about:support", "tab");
+}
+
+function openFeedbackPage() {
+  var url = Services.urlFormatter.formatURLPref("app.feedback.baseURL");
+  openTrustedLinkIn(url, "tab");
+}
+
+function isElementVisible(aElement) {
+  if (!aElement) {
+    return false;
+  }
+
+  var rect = aElement.getBoundingClientRect();
+  return rect.height > 0 && rect.width > 0;
+}
+
+function makeURLAbsolute(aBase, aUrl) {
+  return makeURI(aUrl, null, makeURI(aBase)).spec;
+}
+
+function getHelpLinkURL(aHelpTopic) {
+  var url = Services.urlFormatter.formatURLPref("app.support.baseURL");
+  return url + aHelpTopic;
+}
+
+function openHelpLink(aHelpTopic) {
+  openTrustedLinkIn(getHelpLinkURL(aHelpTopic), "tab");
+}

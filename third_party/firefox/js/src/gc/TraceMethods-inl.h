@@ -1,0 +1,417 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef gc_TraceMethods_inl_h
+#define gc_TraceMethods_inl_h
+
+#include "mozilla/Likely.h"
+
+#include "gc/GCMarker.h"
+#include "gc/Tracer.h"
+#include "jit/JitCode.h"
+#include "vm/BigIntType.h"
+#include "vm/GetterSetter.h"
+#include "vm/GlobalObject.h"
+#include "vm/JSScript.h"
+#include "vm/PropMap.h"
+#include "vm/Realm.h"
+#include "vm/Scope.h"
+#include "vm/Shape.h"
+#include "vm/StringType.h"
+#include "vm/SymbolType.h"
+#include "wasm/WasmJS.h"
+
+#include "gc/BufferAllocator-inl.h"
+#include "gc/Marking-inl.h"
+#include "vm/StringType-inl.h"
+
+inline void js::BaseScript::traceChildren(JSTracer* trc) {
+  TraceEdge(trc, &function_, "function");
+  TraceEdge(trc, &sourceObject_, "sourceObject");
+  TraceEdgeAndBuffer(trc, &data_, "PrivateScriptData");
+  warmUpData_.trace(trc);
+}
+
+inline void js::Shape::traceChildren(JSTracer* trc) {
+  TraceCellHeaderEdge(trc, this, "base");
+  if (isNative()) {
+    asNative().traceChildren(trc);
+  }
+}
+
+inline void js::NativeShape::traceChildren(JSTracer* trc) {
+  TraceEdge(trc, &propMap_, "propertymap");
+}
+
+template <uint32_t opts>
+void js::gc::MarkingTracerT<opts>::eagerlyMarkChildren(Shape* shape) {
+  MOZ_ASSERT(shape->isMarked(markColor()));
+
+  BaseShape* base = shape->headerPtrForTracing();
+  markAndTraverseEdge(shape, base);
+
+  if (shape->isNative()) {
+    if (PropMap* map = shape->asNative().propMap_.getForTracing()) {
+      markAndTraverseEdge(shape, map);
+    }
+  }
+}
+
+inline void js::BaseShape::traceChildren(JSTracer* trc) {
+  JSObject* global = realm()->unsafeUnbarrieredMaybeGlobal();
+  if (MOZ_LIKELY(global)) {
+    TraceManuallyBarrieredEdge(trc, &global, "baseshape_global");
+  }
+
+  TraceEdge(trc, &proto_, "baseshape_proto");
+}
+
+template <uint32_t opts>
+void js::gc::MarkingTracerT<opts>::eagerlyMarkChildren(BaseShape* base) {
+  JSObject* global = base->realm()->unsafeUnbarrieredMaybeGlobal();
+  if (MOZ_LIKELY(global)) {
+    markAndTraverseEdge(base, global);
+  }
+
+  TaggedProto proto = base->proto_.getForTracing();
+  if (proto.isObject()) {
+    markAndTraverseEdge(base, proto.toObject());
+  }
+}
+
+inline void JSString::traceChildren(JSTracer* trc) {
+  MOZ_ASSERT(!js::IsConcurrentMarkingTracer(trc));
+
+  if (hasBase()) {
+    traceBase(trc);
+  } else if (isRope()) {
+    asRope().traceChildren(trc);
+  }
+}
+template <uint32_t opts>
+void js::gc::MarkingTracerT<opts>::eagerlyMarkChildren(JSString* str) {
+  MOZ_ASSERT(str->isMarkedAtLeast(markColor()));
+
+  uint32_t flags = str->getFlagsForTracing();
+  if (StringFlags::isLinear(flags)) {
+    eagerlyMarkChildren(static_cast<JSLinearString*>(str), flags);
+  } else {
+    eagerlyMarkChildren(static_cast<JSRope*>(str));
+  }
+}
+
+inline void JSString::traceBase(JSTracer* trc) {
+  MOZ_ASSERT(hasBase());
+  js::TraceManuallyBarrieredEdge(trc, &d.s.u3.base, "base");
+}
+template <uint32_t opts>
+void js::gc::MarkingTracerT<opts>::eagerlyMarkChildren(
+    JSLinearString* linearStr, uint32_t flags) {
+  gc::AssertShouldMarkInZone(gcMarker(), linearStr);
+
+  while (StringFlags::isDependent(flags)) {
+    linearStr = linearStr->getBaseForTracing();
+    if constexpr (hasOption(gc::MarkingOptions::ConcurrentMarking)) {
+      gc::MemoryAcquireFence<opts>(this->runtime());
+    }
+    flags = linearStr->getFlagsForTracing();
+
+    if (StringFlags::isRope(flags)) {
+      MOZ_ASSERT(!JS::RuntimeHeapIsMajorCollecting());
+      break;
+    }
+
+    MOZ_ASSERT(StringFlags::isLinear(flags));
+    gc::AssertShouldMarkInZone(gcMarker(), linearStr);
+    if (!mark(static_cast<JSString*>(linearStr))) {
+      break;
+    }
+  }
+}
+
+inline void JSRope::traceChildren(JSTracer* trc) {
+  MOZ_ASSERT(!js::IsConcurrentMarkingTracer(trc));
+
+  js::TraceManuallyBarrieredEdge(trc, &d.s.u2.left, "left child");
+  js::TraceManuallyBarrieredEdge(trc, &d.s.u3.right, "right child");
+}
+template <uint32_t opts>
+void js::gc::MarkingTracerT<opts>::eagerlyMarkChildren(JSRope* rope) {
+
+  GCMarker* marker = gcMarker();
+  MarkStack& stack = marker->stack;
+
+  size_t savedPos = stack.position();
+  MOZ_DIAGNOSTIC_ASSERT(rope->getTraceKind() == JS::TraceKind::String);
+
+  while (true) {
+    MOZ_DIAGNOSTIC_ASSERT(rope->getTraceKind() == JS::TraceKind::String);
+    gc::AssertShouldMarkInZone(marker, rope);
+
+    MOZ_ASSERT(rope->isMarkedAny());
+    JSRope* next = nullptr;
+
+    JSString* left = rope->getLeftChildForTracing();
+    JSString* right = rope->getRightChildForTracing();
+
+    bool shouldMark = true;
+#ifdef JS_GC_CONCURRENT_MARKING
+    if constexpr (hasOption(gc::MarkingOptions::ConcurrentMarking)) {
+      gc::MemoryAcquireFence<opts>(this->runtime());
+      uint32_t flags = rope->getFlagsForTracing();
+      if (!StringFlags::isRope(flags)) {
+        shouldMark = false;
+      }
+    }
+#else
+    MOZ_DIAGNOSTIC_ASSERT(rope->JSString::isRope());
+#endif
+
+    if (shouldMark) {
+      if (mark(right)) {
+        uint32_t flags = right->getFlagsForTracing();
+        MOZ_ASSERT(!StringFlags::isPermanentAtom(flags));
+        if (StringFlags::isLinear(flags)) {
+          eagerlyMarkChildren(static_cast<JSLinearString*>(right), flags);
+        } else {
+          MOZ_ASSERT(StringFlags::isRope(flags));
+          next = static_cast<JSRope*>(right);
+        }
+      }
+
+      if (mark(left)) {
+        uint32_t flags = left->getFlagsForTracing();
+        MOZ_ASSERT(!StringFlags::isPermanentAtom(flags));
+        if (StringFlags::isLinear(flags)) {
+          eagerlyMarkChildren(static_cast<JSLinearString*>(left), flags);
+        } else {
+          MOZ_ASSERT(StringFlags::isRope(flags));
+          if (next && !stack.pushTempRope(next)) {
+            marker->delayMarkingChildrenOnOOM(next);
+          }
+          next = static_cast<JSRope*>(left);
+        }
+      }
+    }
+
+    if (next) {
+      rope = next;
+    } else if (savedPos != stack.position()) {
+      MOZ_ASSERT(savedPos < stack.position());
+      rope = stack.popPtr().asTempRope();
+    } else {
+      break;
+    }
+  }
+
+  MOZ_ASSERT(savedPos == stack.position());
+}
+
+inline void JS::Symbol::traceChildren(JSTracer* trc) {
+  js::TraceCellHeaderEdge(trc, this, "symbol description");
+}
+
+template <typename SlotInfo>
+void js::RuntimeScopeData<SlotInfo>::trace(JSTracer* trc) {
+  TraceBindingNames(trc, GetScopeDataTrailingNamesPointer(this), length);
+}
+
+inline void js::FunctionScope::RuntimeData::trace(JSTracer* trc) {
+  TraceEdge(trc, &canonicalFunction, "scope canonical function");
+  TraceNullableBindingNames(trc, GetScopeDataTrailingNamesPointer(this),
+                            length);
+}
+inline void js::ModuleScope::RuntimeData::trace(JSTracer* trc) {
+  TraceEdge(trc, &module, "scope module");
+  TraceBindingNames(trc, GetScopeDataTrailingNamesPointer(this), length);
+}
+inline void js::WasmInstanceScope::RuntimeData::trace(JSTracer* trc) {
+  TraceEdge(trc, &instance, "wasm instance");
+  TraceBindingNames(trc, GetScopeDataTrailingNamesPointer(this), length);
+}
+
+inline void js::Scope::traceChildren(JSTracer* trc) {
+  TraceEdge(trc, &environmentShape_, "scope env shape");
+  TraceEdge(trc, &enclosingScope_, "scope enclosing");
+  BaseScopeData* data = rawData();
+  if (data) {
+    TraceBufferEdge(trc, &data, "Scope data");
+    if (data != rawData()) {
+      setHeaderPtr(data);
+    }
+    applyScopeDataTyped([trc](auto data) { data->trace(trc); });
+  }
+}
+
+template <uint32_t opts>
+void js::gc::MarkingTracerT<opts>::eagerlyMarkChildren(Scope* scope) {
+  do {
+    if (Shape* shape = scope->environmentShape()) {
+      markAndTraverseEdge(scope, shape);
+    }
+    if (BaseScopeData* data = scope->rawData()) {
+      MarkTenuredBuffer(scope->zone(), data);
+    }
+    mozilla::Span<AbstractBindingName<JSAtom>> names;
+    switch (scope->kind()) {
+      case ScopeKind::Function: {
+        FunctionScope::RuntimeData& data = scope->as<FunctionScope>().data();
+        if (data.canonicalFunction) {
+          markAndTraverseObjectEdge(scope, data.canonicalFunction);
+        }
+        names = GetScopeDataTrailingNames(&data);
+        break;
+      }
+
+      case ScopeKind::FunctionBodyVar: {
+        VarScope::RuntimeData& data = scope->as<VarScope>().data();
+        names = GetScopeDataTrailingNames(&data);
+        break;
+      }
+
+      case ScopeKind::Lexical:
+      case ScopeKind::SimpleCatch:
+      case ScopeKind::Catch:
+      case ScopeKind::NamedLambda:
+      case ScopeKind::StrictNamedLambda:
+      case ScopeKind::FunctionLexical: {
+        LexicalScope::RuntimeData& data = scope->as<LexicalScope>().data();
+        names = GetScopeDataTrailingNames(&data);
+        break;
+      }
+
+      case ScopeKind::ClassBody: {
+        ClassBodyScope::RuntimeData& data = scope->as<ClassBodyScope>().data();
+        names = GetScopeDataTrailingNames(&data);
+        break;
+      }
+
+      case ScopeKind::Global:
+      case ScopeKind::NonSyntactic: {
+        GlobalScope::RuntimeData& data = scope->as<GlobalScope>().data();
+        names = GetScopeDataTrailingNames(&data);
+        break;
+      }
+
+      case ScopeKind::Eval:
+      case ScopeKind::StrictEval: {
+        EvalScope::RuntimeData& data = scope->as<EvalScope>().data();
+        names = GetScopeDataTrailingNames(&data);
+        break;
+      }
+
+      case ScopeKind::Module: {
+        ModuleScope::RuntimeData& data = scope->as<ModuleScope>().data();
+        if (data.module) {
+          markAndTraverseObjectEdge(scope, data.module);
+        }
+        names = GetScopeDataTrailingNames(&data);
+        break;
+      }
+
+      case ScopeKind::With:
+        break;
+
+      case ScopeKind::WasmInstance: {
+        WasmInstanceScope::RuntimeData& data =
+            scope->as<WasmInstanceScope>().data();
+        markAndTraverseObjectEdge(scope, data.instance);
+        names = GetScopeDataTrailingNames(&data);
+        break;
+      }
+
+      case ScopeKind::WasmFunction: {
+        WasmFunctionScope::RuntimeData& data =
+            scope->as<WasmFunctionScope>().data();
+        names = GetScopeDataTrailingNames(&data);
+        break;
+      }
+    }
+    if (scope->kind_ == ScopeKind::Function) {
+      for (auto& binding : names) {
+        if (JSAtom* name = binding.name()) {
+          markAndTraverseStringEdge(scope, name);
+        }
+      }
+    } else {
+      for (auto& binding : names) {
+        markAndTraverseStringEdge(scope, binding.name());
+      }
+    }
+    scope = scope->enclosing();
+  } while (scope && mark(scope));
+}
+
+inline void js::GetterSetter::traceChildren(JSTracer* trc) {
+  if (getter()) {
+    TraceCellHeaderEdge(trc, this, "gettersetter_getter");
+  }
+  if (setter()) {
+    TraceEdge(trc, &setter_, "gettersetter_setter");
+  }
+}
+
+inline void js::PropMap::traceChildren(JSTracer* trc) {
+  if (hasPrevious()) {
+    TraceEdge(trc, &asLinked()->data_.previous, "propmap_previous");
+  }
+
+  if (isShared()) {
+    SharedPropMap::TreeData& treeData = asShared()->treeDataRef();
+    if (SharedPropMap* parent = treeData.parent.maybeMap()) {
+      TraceManuallyBarrieredEdge(trc, &parent, "propmap_parent");
+      if (parent != treeData.parent.map()) {
+        treeData.setParent(parent, treeData.parent.index());
+      }
+    }
+  }
+
+  for (uint32_t i = 0; i < PropMap::Capacity; i++) {
+    if (hasKey(i)) {
+      TraceEdge(trc, &keys_[i], "propmap_key");
+    }
+  }
+
+  if (canHaveTable() && asLinked()->hasTable()) {
+    asLinked()->data_.table->trace(trc);
+  }
+}
+
+template <uint32_t opts>
+void js::gc::MarkingTracerT<opts>::eagerlyMarkChildren(PropMap* map) {
+  MOZ_ASSERT(map->isMarkedAny());
+  do {
+    for (uint32_t i = 0; i < PropMap::Capacity; i++) {
+      PropertyKey key = map->keys_[i].getForTracing();
+      if (!key.isVoid()) {
+        markAndTraverseEdge(map, key);
+      }
+    }
+
+    uint32_t flags = map->getFlagsForTracing();
+
+    if (flags & PropMap::CanHaveTableFlag) {
+      MOZ_ASSERT_IF(!gcMarker()->isConcurrentMarking(),
+                    map->asLinked()->canSkipMarkingTable());
+    }
+
+    if (flags & PropMap::IsDictionaryFlag) {
+      map = map->asDictionary()->linkedData_.previous.getForTracing();
+    } else {
+
+      SharedPropMap::TreeData& treeData = map->asShared()->treeDataRef();
+      map = treeData.parent.maybeMapForTracing();
+    }
+  } while (map && mark(map));
+}
+
+inline void JS::BigInt::traceChildren(JSTracer* trc) {
+  if (!hasInlineDigits()) {
+    js::TraceBufferEdge(trc, &heapDigits_, "BigInt::heapDigits_");
+  }
+}
+
+
+#endif  // gc_TraceMethods_inl_h

@@ -1,0 +1,46 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_Exceptions_h_
+#define mozilla_dom_Exceptions_h_
+
+
+#include <stdint.h>
+
+#include "jsapi.h"
+#include "jspubtd.h"
+#include "nsString.h"
+
+class nsIStackFrame;
+class nsPIDOMWindowInner;
+template <class T>
+struct already_AddRefed;
+
+namespace mozilla::dom {
+
+class Exception;
+
+bool Throw(JSContext* cx, nsresult rv, const nsACString& message = ""_ns);
+
+void ThrowAndReport(nsPIDOMWindowInner* aWindow, nsresult aRv);
+
+void ThrowExceptionObject(JSContext* aCx, Exception* aException);
+
+already_AddRefed<Exception> CreateException(nsresult aRv,
+                                            const nsACString& aMessage = ""_ns);
+
+already_AddRefed<nsIStackFrame> GetCurrentJSStack(int32_t aMaxDepth = -1);
+
+namespace exceptions {
+
+already_AddRefed<nsIStackFrame> CreateStack(JSContext* aCx,
+                                            JS::StackCapture&& aCaptureMode);
+
+already_AddRefed<nsIStackFrame> CreateStack(JSContext* aCx,
+                                            JS::Handle<JSObject*> aStack);
+
+}  
+}  
+
+#endif

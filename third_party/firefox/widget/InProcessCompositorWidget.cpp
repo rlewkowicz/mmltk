@@ -1,0 +1,122 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "InProcessCompositorWidget.h"
+
+#include "mozilla/VsyncDispatcher.h"
+#include "mozilla/layers/NativeLayer.h"
+#include "nsIWidget.h"
+
+namespace mozilla {
+namespace widget {
+
+#if !defined(MOZ_WIDGET_SUPPORTS_OOP_COMPOSITING) || 0
+RefPtr<CompositorWidget> CompositorWidget::CreateLocal(
+    const CompositorWidgetInitData& aInitData,
+    const layers::CompositorOptions& aOptions, nsIWidget* aWidget) {
+  nsIWidget* widget = static_cast<nsIWidget*>(aWidget);
+  MOZ_RELEASE_ASSERT(widget);
+  return new InProcessCompositorWidget(aOptions, widget);
+}
+#endif
+
+InProcessCompositorWidget::InProcessCompositorWidget(
+    const layers::CompositorOptions& aOptions, nsIWidget* aWidget)
+    : CompositorWidget(aOptions),
+      mWidget(aWidget),
+      mCanary(CANARY_VALUE),
+      mWidgetSanity(aWidget) {
+  MOZ_RELEASE_ASSERT(mWidget);
+}
+
+bool InProcessCompositorWidget::PreRender(WidgetRenderingContext* aContext) {
+  CheckWidgetSanity();
+  return mWidget->PreRender(aContext);
+}
+
+void InProcessCompositorWidget::PostRender(WidgetRenderingContext* aContext) {
+  CheckWidgetSanity();
+  mWidget->PostRender(aContext);
+}
+
+layers::NativeLayerRoot* InProcessCompositorWidget::GetNativeLayerRoot() {
+  CheckWidgetSanity();
+  return mWidget->GetNativeLayerRoot();
+}
+
+already_AddRefed<gfx::DrawTarget>
+InProcessCompositorWidget::StartRemoteDrawing() {
+  CheckWidgetSanity();
+  return mWidget->StartRemoteDrawing();
+}
+
+already_AddRefed<gfx::DrawTarget>
+InProcessCompositorWidget::StartRemoteDrawingInRegion(
+    const LayoutDeviceIntRegion& aInvalidRegion) {
+  CheckWidgetSanity();
+  return mWidget->StartRemoteDrawingInRegion(aInvalidRegion);
+}
+
+void InProcessCompositorWidget::EndRemoteDrawing() {
+  CheckWidgetSanity();
+  mWidget->EndRemoteDrawing();
+}
+
+void InProcessCompositorWidget::EndRemoteDrawingInRegion(
+    gfx::DrawTarget* aDrawTarget, const LayoutDeviceIntRegion& aInvalidRegion) {
+  CheckWidgetSanity();
+  mWidget->EndRemoteDrawingInRegion(aDrawTarget, aInvalidRegion);
+}
+
+void InProcessCompositorWidget::CleanupRemoteDrawing() {
+  CheckWidgetSanity();
+  mWidget->CleanupRemoteDrawing();
+}
+
+void InProcessCompositorWidget::CleanupWindowEffects() {
+  CheckWidgetSanity();
+  mWidget->CleanupWindowEffects();
+}
+
+bool InProcessCompositorWidget::InitCompositor(
+    layers::Compositor* aCompositor) {
+  CheckWidgetSanity();
+  return mWidget->InitCompositor(aCompositor);
+}
+
+LayoutDeviceIntSize InProcessCompositorWidget::GetClientSize() {
+  CheckWidgetSanity();
+  return mWidget->GetClientSize();
+}
+
+uint32_t InProcessCompositorWidget::GetGLFrameBufferFormat() {
+  CheckWidgetSanity();
+  return mWidget->GetGLFrameBufferFormat();
+}
+
+uintptr_t InProcessCompositorWidget::GetWidgetKey() {
+  CheckWidgetSanity();
+  return reinterpret_cast<uintptr_t>(mWidget);
+}
+
+nsIWidget* InProcessCompositorWidget::RealWidget() { return mWidget; }
+
+void InProcessCompositorWidget::ObserveVsync(VsyncObserver* aObserver) {
+  CheckWidgetSanity();
+  if (RefPtr<CompositorVsyncDispatcher> cvd =
+          mWidget->GetCompositorVsyncDispatcher()) {
+    cvd->SetCompositorVsyncObserver(aObserver);
+  }
+}
+
+const char* InProcessCompositorWidget::CANARY_VALUE =
+    reinterpret_cast<char*>(0x1a1a1a1a);
+
+void InProcessCompositorWidget::CheckWidgetSanity() {
+  MOZ_RELEASE_ASSERT(mWidgetSanity == mWidget);
+  MOZ_RELEASE_ASSERT(mCanary == CANARY_VALUE);
+}
+
+}  
+}  

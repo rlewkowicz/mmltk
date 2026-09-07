@@ -1,0 +1,30 @@
+--- a/onnxruntime/core/providers/cuda/cuda_graph.cc
++++ b/onnxruntime/core/providers/cuda/cuda_graph.cc
+@@ -60,3 +60,12 @@
+-  cudaGraph_t graph = NULL;
+-  CUDA_CALL_THROW(cudaStreamEndCapture(stream_, &graph));
+-  if (graph == NULL) {
++  // The raw graph and an unpublished executable both belong to this call.
++  // Preserve the primary CUDA/ORT exception if their best-effort cleanup fails.
++  struct PendingGraph {
++    cudaGraph_t graph = nullptr;
++    cudaGraphExec_t executable = nullptr;
++    ~PendingGraph() noexcept {
++      if (executable != nullptr) (void)cudaGraphExecDestroy(executable);
++      if (graph != nullptr) (void)cudaGraphDestroy(graph);
++    }
++  } pending;
++  CUDA_CALL_THROW(cudaStreamEndCapture(stream_, &pending.graph));
++  if (pending.graph == nullptr) {
+@@ -66,4 +75,3 @@
+-  cudaGraphExec_t graph_exec = NULL;
+-  CUDA_CALL_THROW(cudaGraphInstantiate(&graph_exec, graph, NULL, NULL, 0));
+-  CUDA_CALL_THROW(cudaGraphDestroy(graph));
+-
++  CUDA_CALL_THROW(cudaGraphInstantiate(&pending.executable, pending.graph, NULL, NULL, 0));
++  CUDA_CALL_THROW(cudaGraphDestroy(pending.graph));
++  pending.graph = nullptr;
+@@ -72 +80,2 @@
+-  cuda_graph_set_.Put(cuda_graph_annotation_id, graph_exec);
++  cuda_graph_set_.Put(cuda_graph_annotation_id, pending.executable);
++  pending.executable = nullptr;

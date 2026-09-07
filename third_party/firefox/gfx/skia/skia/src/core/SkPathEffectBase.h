@@ -1,0 +1,119 @@
+/*
+ * Copyright 2006 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkPathEffectBase_DEFINED)
+#define SkPathEffectBase_DEFINED
+
+#include "include/core/SkPath.h"
+#include "include/core/SkPathEffect.h"
+#include "include/core/SkPoint.h"
+#include "include/core/SkRect.h"
+#include "include/core/SkSpan.h"
+
+#include <optional>
+
+class SkPathBuilder;
+class SkStrokeRec;
+
+class SkPathEffectBase : public SkPathEffect {
+public:
+    SkPathEffectBase() {}
+
+    class PointData {
+    public:
+        PointData()
+            : fFlags(0)
+            , fPoints(nullptr)
+            , fNumPoints(0) {
+            fSize.set(SK_Scalar1, SK_Scalar1);
+        }
+        ~PointData() {
+            delete [] fPoints;
+        }
+
+
+        enum PointFlags {
+            kCircles_PointFlag            = 0x01,   
+            kUsePath_PointFlag            = 0x02,   
+            kUseClip_PointFlag            = 0x04,   
+        };
+
+        uint32_t           fFlags;      
+        SkPoint*           fPoints;     
+        int                fNumPoints;  
+        SkVector           fSize;       
+        SkRect             fClipRect;   
+        SkPath             fPath;       
+
+        SkPath             fFirst;      
+        SkPath             fLast;       
+
+        SkSpan<SkPoint> points() { return {fPoints, (size_t)fNumPoints}; }
+    };
+
+    bool asPoints(PointData* results, const SkPath& src,
+                          const SkStrokeRec&, const SkMatrix&,
+                          const SkRect* cullR) const;
+
+
+    SkFlattenable::Type getFlattenableType() const override {
+        return kSkPathEffect_Type;
+    }
+
+    static sk_sp<SkPathEffect> Deserialize(const void* data, size_t size,
+                                          const SkDeserialProcs* procs = nullptr) {
+        return sk_sp<SkPathEffect>(static_cast<SkPathEffect*>(
+                                  SkFlattenable::Deserialize(
+                                  kSkPathEffect_Type, data, size, procs).release()));
+    }
+
+    virtual bool onFilterPath(SkPathBuilder*, const SkPath&, SkStrokeRec*, const SkRect*,
+                              const SkMatrix& ) const = 0;
+
+    virtual bool onNeedsCTM() const { return false; }
+
+    virtual bool onAsPoints(PointData*, const SkPath&, const SkStrokeRec&, const SkMatrix&,
+                            const SkRect*) const {
+        return false;
+    }
+
+    struct DashInfo {
+        SkSpan<const SkScalar> fIntervals;
+        SkScalar               fPhase;
+    };
+
+    virtual std::optional<DashInfo> asADash() const {
+        return {};
+    }
+
+
+    virtual bool computeFastBounds(SkRect* bounds) const = 0;
+
+    static void RegisterFlattenables();
+
+private:
+    using INHERITED = SkPathEffect;
+};
+
+
+static inline SkPathEffectBase* as_PEB(SkPathEffect* effect) {
+    return static_cast<SkPathEffectBase*>(effect);
+}
+
+static inline const SkPathEffectBase* as_PEB(const SkPathEffect* effect) {
+    return static_cast<const SkPathEffectBase*>(effect);
+}
+
+static inline const SkPathEffectBase* as_PEB(const sk_sp<SkPathEffect>& effect) {
+    return static_cast<SkPathEffectBase*>(effect.get());
+}
+
+static inline sk_sp<SkPathEffectBase> as_PEB_sp(sk_sp<SkPathEffect> effect) {
+    return sk_sp<SkPathEffectBase>(static_cast<SkPathEffectBase*>(effect.release()));
+}
+
+#endif

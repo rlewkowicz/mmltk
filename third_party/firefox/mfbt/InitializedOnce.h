@@ -1,0 +1,202 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_mfbt_initializedonce_h_
+#define mozilla_mfbt_initializedonce_h_
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Maybe.h"
+
+#include <type_traits>
+
+namespace mozilla {
+
+namespace detail {
+
+enum struct InitWhen { InConstructorOnly, LazyAllowed };
+enum struct DestroyWhen { EarlyAllowed, InDestructorOnly };
+
+namespace ValueCheckPolicies {
+template <typename T>
+struct AllowAnyValue {
+  constexpr static bool Check(const T& ) { return true; }
+};
+
+template <typename T>
+struct ConvertsToTrue {
+  constexpr static bool Check(const T& aValue) {
+    return static_cast<bool>(aValue);
+  }
+};
+}  
+
+template <typename T, InitWhen InitWhenVal, DestroyWhen DestroyWhenVal,
+          template <typename> class ValueCheckPolicy =
+              ValueCheckPolicies::AllowAnyValue>
+class InitializedOnce final {
+  static_assert(std::is_const_v<T>);
+  using MaybeType = Maybe<std::remove_const_t<T>>;
+
+  template <typename Dummy>
+  using requires_lazy_init_allowed =
+      std::enable_if_t<InitWhenVal == InitWhen::LazyAllowed, Dummy>;
+
+  template <typename Dummy>
+  using requires_early_destroy_allowed =
+      std::enable_if_t<DestroyWhenVal == DestroyWhen::EarlyAllowed, Dummy>;
+
+ public:
+  using ValueType = T;
+
+  template <typename Dummy = void, typename = requires_lazy_init_allowed<Dummy>>
+  explicit constexpr InitializedOnce() {}
+
+  template <typename Arg0, typename... Args>
+  explicit constexpr InitializedOnce(Arg0&& aArg0, Args&&... aArgs)
+      : mMaybe{Some(std::remove_const_t<T>{std::forward<Arg0>(aArg0),
+                                           std::forward<Args>(aArgs)...})} {
+    MOZ_ASSERT(ValueCheckPolicy<T>::Check(*mMaybe));
+  }
+
+  InitializedOnce(const InitializedOnce&) = delete;
+  InitializedOnce(InitializedOnce&& aOther) : mMaybe{std::move(aOther.mMaybe)} {
+    static_assert(DestroyWhenVal == DestroyWhen::EarlyAllowed);
+#ifdef DEBUG
+    aOther.mWasReset = true;
+#endif
+  }
+  InitializedOnce& operator=(const InitializedOnce&) = delete;
+  InitializedOnce& operator=(InitializedOnce&& aOther) {
+    static_assert(InitWhenVal == InitWhen::LazyAllowed &&
+                  DestroyWhenVal == DestroyWhen::EarlyAllowed);
+    MOZ_ASSERT(!mWasReset);
+    MOZ_ASSERT(!mMaybe);
+    mMaybe.~MaybeType();
+    new (&mMaybe) MaybeType{std::move(aOther.mMaybe)};
+#ifdef DEBUG
+    aOther.mWasReset = true;
+#endif
+    return *this;
+  }
+
+  template <typename... Args, typename Dummy = void,
+            typename = requires_lazy_init_allowed<Dummy>>
+  constexpr void init(Args&&... aArgs) {
+    MOZ_ASSERT(mMaybe.isNothing());
+    MOZ_ASSERT(!mWasReset);
+    mMaybe.emplace(std::remove_const_t<T>{std::forward<Args>(aArgs)...});
+    MOZ_ASSERT(ValueCheckPolicy<T>::Check(*mMaybe));
+  }
+
+  constexpr explicit operator bool() const { return isSome(); }
+  constexpr bool isSome() const { return mMaybe.isSome(); }
+  constexpr bool isNothing() const { return mMaybe.isNothing(); }
+
+  constexpr T& operator*() const { return *mMaybe; }
+  constexpr T* operator->() const { return mMaybe.operator->(); }
+
+  constexpr T& ref() const { return mMaybe.ref(); }
+
+  template <typename Dummy = void,
+            typename = requires_early_destroy_allowed<Dummy>>
+  void destroy() {
+    MOZ_ASSERT(mMaybe.isSome());
+    maybeDestroy();
+  }
+
+  template <typename Dummy = void,
+            typename = requires_early_destroy_allowed<Dummy>>
+  void maybeDestroy() {
+    mMaybe.reset();
+#ifdef DEBUG
+    mWasReset = true;
+#endif
+  }
+
+  template <typename Dummy = void,
+            typename = requires_early_destroy_allowed<Dummy>>
+  T release() {
+    MOZ_ASSERT(mMaybe.isSome());
+    auto res = std::move(mMaybe.ref());
+    destroy();
+    return res;
+  }
+
+ private:
+  MaybeType mMaybe;
+#ifdef DEBUG
+  bool mWasReset = false;
+#endif
+};
+
+template <typename T, InitWhen InitWhenVal, DestroyWhen DestroyWhenVal,
+          template <typename> class ValueCheckPolicy>
+class LazyInitializer {
+ public:
+  explicit LazyInitializer(InitializedOnce<T, InitWhenVal, DestroyWhenVal,
+                                           ValueCheckPolicy>& aLazyInitialized)
+      : mLazyInitialized{aLazyInitialized} {}
+
+  template <typename U>
+  LazyInitializer& operator=(U&& aValue) {
+    mLazyInitialized.init(std::forward<U>(aValue));
+    return *this;
+  }
+
+  LazyInitializer(const LazyInitializer&) = delete;
+  LazyInitializer& operator=(const LazyInitializer&) = delete;
+
+ private:
+  InitializedOnce<T, InitWhenVal, DestroyWhenVal, ValueCheckPolicy>&
+      mLazyInitialized;
+};
+
+}  
+
+
+template <typename T>
+using InitializedOnce =
+    detail::InitializedOnce<T, detail::InitWhen::InConstructorOnly,
+                            detail::DestroyWhen::EarlyAllowed>;
+
+template <typename T>
+using InitializedOnceNotNull =
+    detail::InitializedOnce<T, detail::InitWhen::InConstructorOnly,
+                            detail::DestroyWhen::EarlyAllowed,
+                            detail::ValueCheckPolicies::ConvertsToTrue>;
+
+template <typename T>
+using LazyInitializedOnce =
+    detail::InitializedOnce<T, detail::InitWhen::LazyAllowed,
+                            detail::DestroyWhen::InDestructorOnly>;
+
+template <typename T>
+using LazyInitializedOnceNotNull =
+    detail::InitializedOnce<T, detail::InitWhen::LazyAllowed,
+                            detail::DestroyWhen::InDestructorOnly,
+                            detail::ValueCheckPolicies::ConvertsToTrue>;
+
+template <typename T>
+using LazyInitializedOnceEarlyDestructible =
+    detail::InitializedOnce<T, detail::InitWhen::LazyAllowed,
+                            detail::DestroyWhen::EarlyAllowed>;
+
+template <typename T>
+using LazyInitializedOnceNotNullEarlyDestructible =
+    detail::InitializedOnce<T, detail::InitWhen::LazyAllowed,
+                            detail::DestroyWhen::EarlyAllowed,
+                            detail::ValueCheckPolicies::ConvertsToTrue>;
+
+template <typename T, detail::InitWhen InitWhenVal,
+          detail::DestroyWhen DestroyWhenVal,
+          template <typename> class ValueCheckPolicy>
+auto do_Init(detail::InitializedOnce<T, InitWhenVal, DestroyWhenVal,
+                                     ValueCheckPolicy>& aLazyInitialized) {
+  return detail::LazyInitializer(aLazyInitialized);
+}
+
+}  
+
+#endif

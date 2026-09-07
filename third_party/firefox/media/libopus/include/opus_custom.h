@@ -1,0 +1,172 @@
+/* Copyright (c) 2007-2008 CSIRO
+   Copyright (c) 2007-2009 Xiph.Org Foundation
+   Copyright (c) 2008-2012 Gregory Maxwell
+   Written by Jean-Marc Valin and Gregory Maxwell */
+/*
+   Redistribution and use in source and binary forms, with or without
+   modification, are permitted provided that the following conditions
+   are met:
+
+   - Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+
+   - Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+
+   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+   ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+   A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER
+   OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+   EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+   PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+   PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+   LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+   NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+   SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+*/
+
+
+#ifndef OPUS_CUSTOM_H
+#define OPUS_CUSTOM_H
+
+#include "opus_defines.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#if defined(CUSTOM_MODES) || defined(ENABLE_OPUS_CUSTOM_API)
+# define OPUS_CUSTOM_EXPORT OPUS_EXPORT
+# define OPUS_CUSTOM_EXPORT_STATIC OPUS_EXPORT
+#else
+# define OPUS_CUSTOM_EXPORT
+# ifdef OPUS_BUILD
+#  define OPUS_CUSTOM_EXPORT_STATIC static OPUS_INLINE
+# else
+#  define OPUS_CUSTOM_EXPORT_STATIC
+# endif
+#endif
+
+
+typedef struct OpusCustomEncoder OpusCustomEncoder;
+
+typedef struct OpusCustomDecoder OpusCustomDecoder;
+
+typedef struct OpusCustomMode OpusCustomMode;
+
+OPUS_CUSTOM_EXPORT OPUS_WARN_UNUSED_RESULT OpusCustomMode *opus_custom_mode_create(opus_int32 Fs, int frame_size, int *error);
+
+OPUS_CUSTOM_EXPORT void opus_custom_mode_destroy(OpusCustomMode *mode);
+
+
+#if !defined(OPUS_BUILD) || defined(CELT_ENCODER_C)
+
+OPUS_CUSTOM_EXPORT_STATIC OPUS_WARN_UNUSED_RESULT int opus_custom_encoder_get_size(
+    const OpusCustomMode *mode,
+    int channels
+) OPUS_ARG_NONNULL(1);
+
+#if defined(CUSTOM_MODES) || defined(ENABLE_OPUS_CUSTOM_API)
+OPUS_CUSTOM_EXPORT int opus_custom_encoder_init(
+    OpusCustomEncoder *st,
+    const OpusCustomMode *mode,
+    int channels
+) OPUS_ARG_NONNULL(1) OPUS_ARG_NONNULL(2);
+# endif
+#endif
+
+
+OPUS_CUSTOM_EXPORT OPUS_WARN_UNUSED_RESULT OpusCustomEncoder *opus_custom_encoder_create(
+    const OpusCustomMode *mode,
+    int channels,
+    int *error
+) OPUS_ARG_NONNULL(1);
+
+
+OPUS_CUSTOM_EXPORT void opus_custom_encoder_destroy(OpusCustomEncoder *st);
+
+OPUS_CUSTOM_EXPORT OPUS_WARN_UNUSED_RESULT int opus_custom_encode_float(
+    OpusCustomEncoder *st,
+    const float *pcm,
+    int frame_size,
+    unsigned char *compressed,
+    int maxCompressedBytes
+) OPUS_ARG_NONNULL(1) OPUS_ARG_NONNULL(2) OPUS_ARG_NONNULL(4);
+
+OPUS_CUSTOM_EXPORT OPUS_WARN_UNUSED_RESULT int opus_custom_encode(
+    OpusCustomEncoder *st,
+    const opus_int16 *pcm,
+    int frame_size,
+    unsigned char *compressed,
+    int maxCompressedBytes
+) OPUS_ARG_NONNULL(1) OPUS_ARG_NONNULL(2) OPUS_ARG_NONNULL(4);
+
+OPUS_CUSTOM_EXPORT OPUS_WARN_UNUSED_RESULT int opus_custom_encode24(
+    OpusCustomEncoder *st,
+    const opus_int32 *pcm,
+    int frame_size,
+    unsigned char *compressed,
+    int maxCompressedBytes
+) OPUS_ARG_NONNULL(1) OPUS_ARG_NONNULL(2) OPUS_ARG_NONNULL(4);
+
+OPUS_CUSTOM_EXPORT int opus_custom_encoder_ctl(OpusCustomEncoder * OPUS_RESTRICT st, int request, ...) OPUS_ARG_NONNULL(1);
+
+
+#if !defined(OPUS_BUILD) || defined(CELT_DECODER_C)
+
+OPUS_CUSTOM_EXPORT_STATIC OPUS_WARN_UNUSED_RESULT int opus_custom_decoder_get_size(
+    const OpusCustomMode *mode,
+    int channels
+) OPUS_ARG_NONNULL(1);
+
+OPUS_CUSTOM_EXPORT_STATIC int opus_custom_decoder_init(
+    OpusCustomDecoder *st,
+    const OpusCustomMode *mode,
+    int channels
+) OPUS_ARG_NONNULL(1) OPUS_ARG_NONNULL(2);
+
+#endif
+
+
+OPUS_CUSTOM_EXPORT OPUS_WARN_UNUSED_RESULT OpusCustomDecoder *opus_custom_decoder_create(
+    const OpusCustomMode *mode,
+    int channels,
+    int *error
+) OPUS_ARG_NONNULL(1);
+
+OPUS_CUSTOM_EXPORT void opus_custom_decoder_destroy(OpusCustomDecoder *st);
+
+OPUS_CUSTOM_EXPORT OPUS_WARN_UNUSED_RESULT int opus_custom_decode_float(
+    OpusCustomDecoder *st,
+    const unsigned char *data,
+    int len,
+    float *pcm,
+    int frame_size
+) OPUS_ARG_NONNULL(1) OPUS_ARG_NONNULL(4);
+
+OPUS_CUSTOM_EXPORT OPUS_WARN_UNUSED_RESULT int opus_custom_decode(
+    OpusCustomDecoder *st,
+    const unsigned char *data,
+    int len,
+    opus_int16 *pcm,
+    int frame_size
+) OPUS_ARG_NONNULL(1) OPUS_ARG_NONNULL(4);
+
+OPUS_CUSTOM_EXPORT OPUS_WARN_UNUSED_RESULT int opus_custom_decode24(
+    OpusCustomDecoder *st,
+    const unsigned char *data,
+    int len,
+    opus_int32 *pcm,
+    int frame_size
+) OPUS_ARG_NONNULL(1) OPUS_ARG_NONNULL(4);
+
+OPUS_CUSTOM_EXPORT int opus_custom_decoder_ctl(OpusCustomDecoder * OPUS_RESTRICT st, int request, ...) OPUS_ARG_NONNULL(1);
+
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* OPUS_CUSTOM_H */

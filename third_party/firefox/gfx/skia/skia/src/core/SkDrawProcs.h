@@ -1,0 +1,40 @@
+/*
+ * Copyright 2011 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkDrawProcs_DEFINED)
+#define SkDrawProcs_DEFINED
+
+#include "include/core/SkPaint.h"
+#include "include/core/SkScalar.h"
+#include "include/core/SkTypes.h"
+class SkMatrix;
+
+namespace skcpu {
+bool DrawTreatAAStrokeAsHairline(SkScalar strokeWidth, const SkMatrix&, SkScalar* coverage);
+
+inline bool DrawTreatAsHairline(const SkPaint& paint,
+                                const SkMatrix& matrix,
+                                SkScalar* coverage) {
+    if (SkPaint::kStroke_Style != paint.getStyle()) {
+        return false;
+    }
+
+    SkScalar strokeWidth = paint.getStrokeWidth();
+    if (0 == strokeWidth) {
+        *coverage = SK_Scalar1;
+        return true;
+    }
+
+    if (!paint.isAntiAlias()) {
+        return false;
+    }
+
+    return DrawTreatAAStrokeAsHairline(strokeWidth, matrix, coverage);
+}
+}  
+
+#endif

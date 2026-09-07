@@ -1,0 +1,54 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef _include_gfx_ipc_CanvasRenderThread_h_
+#define _include_gfx_ipc_CanvasRenderThread_h_
+
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Mutex.h"
+#include "nsCOMPtr.h"
+#include "nsISupportsImpl.h"
+#include "nsTArray.h"
+
+class nsIRunnable;
+class nsIThread;
+
+namespace mozilla {
+
+namespace gfx {
+
+class CanvasRenderThread final {
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING_WITH_DELETE_ON_MAIN_THREAD(
+      CanvasRenderThread)
+
+ public:
+  static void Start();
+
+  static void Shutdown();
+
+  static bool IsInCanvasRenderThread();
+
+  static bool IsInCanvasWorkerThread();
+
+  static bool IsInCanvasRenderOrWorkerThread();
+
+  static already_AddRefed<nsIThread> GetCanvasRenderThread();
+
+  static void Dispatch(already_AddRefed<nsIRunnable> aRunnable);
+
+ private:
+  CanvasRenderThread(nsCOMPtr<nsIThread>&& aThread, bool aCreatedThread);
+  ~CanvasRenderThread();
+
+  Mutex mMutex;
+
+  nsCOMPtr<nsIThread> const mThread;
+
+  const bool mCreatedThread;
+};
+
+}  
+}  
+
+#endif  // _include_gfx_ipc_CanvasRenderThread_h_

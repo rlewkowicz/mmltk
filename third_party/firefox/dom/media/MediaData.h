@@ -1,0 +1,654 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef MediaData_h
+#define MediaData_h
+
+#include "AudioConfig.h"
+#include "AudioSampleFormat.h"
+#include "EncoderConfig.h"
+#include "ImageTypes.h"
+#include "MediaResult.h"
+#include "SharedBuffer.h"
+#include "TimeUnits.h"
+#include "mozilla/CheckedInt.h"
+#include "mozilla/DefineEnum.h"
+#include "mozilla/EnumSet.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/PodOperations.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/Result.h"
+#include "mozilla/ResultVariant.h"
+#include "mozilla/Span.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/UniquePtrExtensions.h"
+#include "mozilla/gfx/Rect.h"
+#include "nsString.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+
+namespace layers {
+class BufferRecycleBin;
+class Image;
+class ImageContainer;
+class KnowsCompositor;
+}  
+
+class MediaByteBuffer;
+class TrackInfoSharedPtr;
+
+class BufferStorage {
+ public:
+  explicit BufferStorage(void* aBuffer, bool aUseJsFree = false)
+      : mBuffer(aBuffer), mUseJsFree(aUseJsFree) {}
+  BufferStorage(const BufferStorage&) = delete;
+  BufferStorage& operator=(const BufferStorage&) = delete;
+  BufferStorage(BufferStorage&& aOther)
+      : mBuffer(aOther.mBuffer), mUseJsFree(aOther.mUseJsFree) {
+    aOther.mBuffer = nullptr;
+  }
+  BufferStorage& operator=(BufferStorage&& aOther) {
+    if (&aOther == this) {
+      return *this;
+    }
+    Deallocate();
+    mBuffer = aOther.mBuffer;
+    mUseJsFree = aOther.mUseJsFree;
+    aOther.mBuffer = nullptr;
+    return *this;
+  }
+  ~BufferStorage() { Deallocate(); }
+  size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const {
+    return aMallocSizeOf(mBuffer);
+  }
+
+ private:
+  void Deallocate() {
+    if (mUseJsFree) {
+      js_free(mBuffer);
+    } else {
+      free(mBuffer);
+    }
+  }
+  void* mBuffer;
+  bool mUseJsFree;
+};
+
+class InflatableShortBuffer;
+template <typename Type, int Alignment = 32>
+class AlignedBuffer {
+ public:
+  friend InflatableShortBuffer;
+  AlignedBuffer()
+      : mData(nullptr), mLength(0), mBuffer(nullptr), mCapacity(0) {}
+
+  explicit AlignedBuffer(size_t aLength)
+      : mData(nullptr), mLength(0), mBuffer(nullptr), mCapacity(0) {
+    if (EnsureCapacity(aLength)) {
+      mLength = aLength;
+    }
+  }
+
+  AlignedBuffer(const Type* aData, size_t aLength) : AlignedBuffer(aLength) {
+    if (!mData) {
+      return;
+    }
+    PodCopy(mData, aData, aLength);
+  }
+
+  AlignedBuffer(Type* aBuffer, size_t aOffset, size_t aLength, bool aUseJsFree)
+      : mData(aBuffer + aOffset),
+        mLength(aLength),
+        mBuffer(aBuffer, aUseJsFree),
+        mCapacity(aLength) {
+    const uintptr_t alignmask = AlignmentOffset();
+    if ((reinterpret_cast<uintptr_t>(mData) & alignmask) != 0) {
+      *this = AlignedBuffer(mData, mLength);
+    }
+  }
+
+  AlignedBuffer(const AlignedBuffer& aOther)
+      : AlignedBuffer(aOther.Data(), aOther.Length()) {}
+
+  AlignedBuffer(AlignedBuffer&& aOther) noexcept
+      : mData(aOther.mData),
+        mLength(aOther.mLength),
+        mBuffer(std::move(aOther.mBuffer)),
+        mCapacity(aOther.mCapacity) {
+    aOther.mData = nullptr;
+    aOther.mLength = 0;
+    aOther.mCapacity = 0;
+  }
+
+  AlignedBuffer& operator=(AlignedBuffer&& aOther) noexcept {
+    if (&aOther == this) {
+      return *this;
+    }
+    mData = aOther.mData;
+    mLength = aOther.mLength;
+    mBuffer = std::move(aOther.mBuffer);
+    mCapacity = aOther.mCapacity;
+    aOther.mData = nullptr;
+    aOther.mLength = 0;
+    aOther.mCapacity = 0;
+    return *this;
+  }
+
+  Type* Data() const { return mData; }
+  size_t Length() const { return mLength; }
+  size_t Size() const { return mLength * sizeof(Type); }
+  Type& operator[](size_t aIndex) {
+    MOZ_ASSERT(aIndex < mLength);
+    return mData[aIndex];
+  }
+  const Type& operator[](size_t aIndex) const {
+    MOZ_ASSERT(aIndex < mLength);
+    return mData[aIndex];
+  }
+  [[nodiscard]] bool SetLength(size_t aLength) {
+    if (aLength > mLength && !EnsureCapacity(aLength)) {
+      return false;
+    }
+    mLength = aLength;
+    return true;
+  }
+  bool Prepend(const Type* aData, size_t aLength) {
+    if (!EnsureCapacity(aLength + mLength)) {
+      return false;
+    }
+
+    PodMove(mData + aLength, mData, mLength);
+    PodCopy(mData, aData, aLength);
+
+    mLength += aLength;
+    return true;
+  }
+  bool Append(const Type* aData, size_t aLength) {
+    if (!EnsureCapacity(aLength + mLength)) {
+      return false;
+    }
+
+    PodCopy(mData + mLength, aData, aLength);
+
+    mLength += aLength;
+    return true;
+  }
+  bool Replace(const Type* aData, size_t aLength) {
+    if (!EnsureCapacity(aLength)) {
+      return false;
+    }
+
+    PodCopy(mData, aData, aLength);
+    mLength = aLength;
+    return true;
+  }
+  void Clear() {
+    mLength = 0;
+    mData = nullptr;
+  }
+
+  size_t SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const {
+    return aMallocSizeOf(this) + SizeOfExcludingThis(aMallocSizeOf);
+  }
+  size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const {
+    return mBuffer.SizeOfExcludingThis(aMallocSizeOf);
+  }
+  size_t ComputedSizeOfExcludingThis() const { return mCapacity; }
+
+  Type* get() const { return mData; }
+  explicit operator bool() const { return mData != nullptr; }
+
+  static size_t AlignmentPaddingSize() { return AlignmentOffset() * 2; }
+
+  void PopFront(size_t aCount) {
+    MOZ_DIAGNOSTIC_ASSERT(mLength >= aCount, "Popping too many elements.");
+    PodMove(mData, mData + aCount, mLength - aCount);
+    mLength -= aCount;
+  }
+
+  void PopBack(size_t aCount) {
+    MOZ_DIAGNOSTIC_ASSERT(mLength >= aCount, "Popping too many elements.");
+    mLength -= aCount;
+  }
+
+ private:
+  static size_t AlignmentOffset() { return Alignment ? Alignment - 1 : 0; }
+
+  bool EnsureCapacity(size_t aLength) {
+    if (!aLength) {
+      return true;
+    }
+    const CheckedInt<size_t> sizeNeeded =
+        CheckedInt<size_t>(aLength) * sizeof(Type) + AlignmentPaddingSize();
+
+    if (!sizeNeeded.isValid() || sizeNeeded.value() >= INT32_MAX) {
+      return false;
+    }
+    if (mData && mCapacity >= sizeNeeded.value()) {
+      return true;
+    }
+    auto newBuffer = MakeUniqueFallible<uint8_t[]>(sizeNeeded.value());
+    if (!newBuffer) {
+      return false;
+    }
+
+    const uintptr_t alignmask = AlignmentOffset();
+    Type* newData = reinterpret_cast<Type*>(
+        (reinterpret_cast<uintptr_t>(newBuffer.get()) + alignmask) &
+        ~alignmask);
+    MOZ_ASSERT(uintptr_t(newData) % (AlignmentOffset() + 1) == 0);
+
+    MOZ_ASSERT(!mLength || mData);
+
+    PodZero(newData + mLength, aLength - mLength);
+    if (mLength) {
+      PodCopy(newData, mData, mLength);
+    }
+
+    mBuffer = BufferStorage(newBuffer.release());
+    mCapacity = sizeNeeded.value();
+    mData = newData;
+
+    return true;
+  }
+  Type* mData;
+  size_t mLength{};  
+  BufferStorage mBuffer;
+  size_t mCapacity{};  
+};
+
+using AlignedByteBuffer = AlignedBuffer<uint8_t>;
+using AlignedFloatBuffer = AlignedBuffer<float>;
+using AlignedShortBuffer = AlignedBuffer<int16_t>;
+using AlignedAudioBuffer = AlignedBuffer<AudioDataValue>;
+
+class InflatableShortBuffer {
+ public:
+  explicit InflatableShortBuffer(size_t aElementCount)
+      : mBuffer(aElementCount * 2) {}
+  AlignedFloatBuffer Inflate() {
+    float* output = reinterpret_cast<float*>(mBuffer.mData);
+    for (size_t i = Length(); i--;) {
+      output[i] = ConvertAudioSample<float>(mBuffer.mData[i]);
+    }
+    AlignedFloatBuffer rv;
+    rv.mBuffer = std::move(mBuffer.mBuffer);
+    rv.mCapacity = mBuffer.mCapacity;
+    rv.mLength = Length();
+    rv.mData = output;
+    return rv;
+  }
+  size_t Length() const { return mBuffer.mLength / 2; }
+  int16_t* get() const { return mBuffer.get(); }
+  explicit operator bool() const { return mBuffer.mData != nullptr; }
+
+ protected:
+  AlignedShortBuffer mBuffer;
+};
+
+class MediaData {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(MediaData)
+
+  MOZ_DEFINE_ENUM_CLASS_WITH_BASE_AND_TOSTRING_AT_CLASS_SCOPE(
+      Type, uint8_t, (AUDIO_DATA, VIDEO_DATA, RAW_DATA, NULL_DATA));
+
+  MediaData(Type aType, int64_t aOffset, const media::TimeUnit& aTimestamp,
+            const media::TimeUnit& aDuration)
+      : mType(aType),
+        mOffset(aOffset),
+        mTime(aTimestamp),
+        mTimecode(aTimestamp),
+        mDuration(aDuration),
+        mKeyframe(false) {}
+
+  const Type mType;
+
+  int64_t mOffset;
+
+  media::TimeUnit mTime;
+
+  media::TimeUnit mTimecode;
+
+  media::TimeUnit mDuration;
+
+  bool mKeyframe;
+
+  media::TimeUnit GetEndTime() const { return mTime + mDuration; }
+
+  media::TimeUnit GetEndTimecode() const { return mTimecode + mDuration; }
+
+  bool HasValidTime() const {
+    return mTime.IsValid() && mTimecode.IsValid() && mDuration.IsValid() &&
+           GetEndTime().IsValid() && GetEndTimecode().IsValid();
+  }
+
+  template <typename ReturnType>
+  const ReturnType* As() const {
+    MOZ_RELEASE_ASSERT(this->mType == ReturnType::sType);
+    return static_cast<const ReturnType*>(this);
+  }
+
+  template <typename ReturnType>
+  ReturnType* As() {
+    MOZ_RELEASE_ASSERT(this->mType == ReturnType::sType);
+    return static_cast<ReturnType*>(this);
+  }
+
+ protected:
+  explicit MediaData(Type aType) : mType(aType), mOffset(0), mKeyframe(false) {}
+
+  virtual ~MediaData() = default;
+};
+
+class NullData : public MediaData {
+ public:
+  NullData(int64_t aOffset, const media::TimeUnit& aTime,
+           const media::TimeUnit& aDuration)
+      : MediaData(Type::NULL_DATA, aOffset, aTime, aDuration) {}
+
+  static const Type sType = Type::NULL_DATA;
+};
+
+class AudioData : public MediaData {
+ public:
+  AudioData(int64_t aOffset, const media::TimeUnit& aTime,
+            AlignedAudioBuffer&& aData, uint32_t aChannels, uint32_t aRate,
+            uint32_t aChannelMap = AudioConfig::ChannelLayout::UNKNOWN_MAP);
+
+  static const Type sType = Type::AUDIO_DATA;
+  static const char* sTypeName;
+
+  nsCString ToString() const;
+
+  Span<AudioDataValue> Data() const;
+
+  uint32_t Frames() const { return mFrames; }
+
+  bool SetTrimWindow(const media::TimeInterval& aTrim);
+
+  AlignedAudioBuffer MoveableData();
+
+  size_t SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const;
+
+  void EnsureAudioBuffer();
+
+  bool AdjustForStartTime(const media::TimeUnit& aStartTime);
+
+  void SetOriginalStartTime(const media::TimeUnit& aStartTime);
+
+  const uint32_t mChannels;
+  const AudioConfig::ChannelLayout::ChannelMap mChannelMap;
+  const uint32_t mRate;
+
+  RefPtr<SharedBuffer> mAudioBuffer;
+
+ protected:
+  ~AudioData() = default;
+
+ private:
+  friend class ArrayOfRemoteAudioData;
+  AudioDataValue* GetAdjustedData() const;
+  media::TimeUnit mOriginalTime;
+  AlignedAudioBuffer mAudioData;
+  Maybe<media::TimeInterval> mTrimWindow;
+  uint32_t mFrames;
+  size_t mDataOffset = 0;
+};
+
+namespace layers {
+class TextureClient;
+class PlanarYCbCrImage;
+}  
+
+class VideoInfo;
+
+class VideoData : public MediaData {
+ public:
+  using IntRect = gfx::IntRect;
+  using IntSize = gfx::IntSize;
+  using ColorDepth = gfx::ColorDepth;
+  using ColorRange = gfx::ColorRange;
+  using YUVColorSpace = gfx::YUVColorSpace;
+  using ColorSpace2 = gfx::ColorSpace2;
+  using ChromaSubsampling = gfx::ChromaSubsampling;
+  using ImageContainer = layers::ImageContainer;
+  using Image = layers::Image;
+  using PlanarYCbCrImage = layers::PlanarYCbCrImage;
+
+  static const Type sType = Type::VIDEO_DATA;
+  static const char* sTypeName;
+
+  struct YCbCrBuffer {
+    struct Plane {
+      uint8_t* mData;
+      uint32_t mWidth;
+      uint32_t mHeight;
+      uint32_t mStride;
+      uint32_t mSkip;
+    };
+
+    Plane mPlanes[3]{};
+    YUVColorSpace mYUVColorSpace = YUVColorSpace::Identity;
+    ColorSpace2 mColorPrimaries = ColorSpace2::UNKNOWN;
+    ColorDepth mColorDepth = ColorDepth::COLOR_8;
+    ColorRange mColorRange = ColorRange::LIMITED;
+    ChromaSubsampling mChromaSubsampling = ChromaSubsampling::FULL;
+  };
+
+  class QuantizableBuffer final : public YCbCrBuffer {
+   public:
+    MediaResult To8BitPerChannel(layers::BufferRecycleBin* aRecycleBin);
+    ~QuantizableBuffer();
+
+   private:
+    void AllocateRecyclableData(uint32_t aLength);
+
+    RefPtr<layers::BufferRecycleBin> mRecycleBin;
+    UniquePtr<uint8_t[]> m8bpcPlanes;
+    uint32_t mAllocatedLength;
+  };
+
+
+  static bool UseUseNV12ForSoftwareDecodedVideoIfPossible(
+      layers::KnowsCompositor* aAllocator);
+
+  static Result<already_AddRefed<VideoData>, MediaResult> CreateAndCopyData(
+      const VideoInfo& aInfo, ImageContainer* aContainer, int64_t aOffset,
+      const media::TimeUnit& aTime, const media::TimeUnit& aDuration,
+      const YCbCrBuffer& aBuffer, bool aKeyframe,
+      const media::TimeUnit& aTimecode, const IntRect& aPicture,
+      layers::KnowsCompositor* aAllocator);
+
+  static Result<already_AddRefed<VideoData>, MediaResult> CreateAndCopyData(
+      const VideoInfo& aInfo, ImageContainer* aContainer, int64_t aOffset,
+      const media::TimeUnit& aTime, const media::TimeUnit& aDuration,
+      const YCbCrBuffer& aBuffer, const YCbCrBuffer::Plane& aAlphaPlane,
+      bool aKeyframe, const media::TimeUnit& aTimecode,
+      const IntRect& aPicture);
+
+  static already_AddRefed<VideoData> CreateFromImage(
+      const IntSize& aDisplay, int64_t aOffset, const media::TimeUnit& aTime,
+      const media::TimeUnit& aDuration, const RefPtr<Image>& aImage,
+      bool aKeyframe, const media::TimeUnit& aTimecode);
+
+  static MediaResult SetVideoDataToImage(PlanarYCbCrImage* aVideoImage,
+                                         const VideoInfo& aInfo,
+                                         const YCbCrBuffer& aBuffer,
+                                         const IntRect& aPicture,
+                                         bool aCopyData);
+
+  size_t SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const;
+
+  const IntSize mDisplay;
+
+  RefPtr<Image> mImage;
+
+  ColorDepth GetColorDepth() const;
+
+  uint32_t mFrameID;
+
+  VideoData(int64_t aOffset, const media::TimeUnit& aTime,
+            const media::TimeUnit& aDuration, bool aKeyframe,
+            const media::TimeUnit& aTimecode, IntSize aDisplay,
+            uint32_t aFrameID);
+
+  nsCString ToString() const;
+
+  void MarkSentToCompositor() { mSentToCompositor = true; }
+  bool IsSentToCompositor() { return mSentToCompositor; }
+
+  void UpdateDuration(const media::TimeUnit& aDuration);
+  void UpdateTimestamp(const media::TimeUnit& aTimestamp);
+
+  bool AdjustForStartTime(const media::TimeUnit& aStartTime);
+
+  void SetNextKeyFrameTime(const media::TimeUnit& aTime) {
+    mNextKeyFrameTime = aTime;
+  }
+
+  const media::TimeUnit& NextKeyFrameTime() const { return mNextKeyFrameTime; }
+
+ protected:
+  ~VideoData();
+
+  bool mSentToCompositor;
+  media::TimeUnit mNextKeyFrameTime;
+};
+
+MOZ_DEFINE_ENUM_CLASS_WITH_BASE_AND_TOSTRING(CryptoScheme, uint8_t,
+                                             (None, Cenc, Cbcs, Cbcs_1_9));
+using CryptoSchemeSet = EnumSet<CryptoScheme, uint8_t>;
+
+nsCString CryptoSchemeSetToString(const CryptoSchemeSet& aSchemes);
+CryptoScheme StringToCryptoScheme(const nsAString& aString);
+
+class CryptoTrack {
+ public:
+  CryptoTrack()
+      : mCryptoScheme(CryptoScheme::None),
+        mIVSize(0),
+        mCryptByteBlock(0),
+        mSkipByteBlock(0) {}
+  CryptoScheme mCryptoScheme;
+  int32_t mIVSize;
+  CopyableTArray<uint8_t> mKeyId;
+  uint8_t mCryptByteBlock;
+  uint8_t mSkipByteBlock;
+  CopyableTArray<uint8_t> mConstantIV;
+
+  bool IsEncrypted() const { return mCryptoScheme != CryptoScheme::None; }
+};
+
+class CryptoSample : public CryptoTrack {
+ public:
+  CopyableTArray<uint32_t> mPlainSizes;
+  CopyableTArray<uint32_t> mEncryptedSizes;
+  CopyableTArray<uint8_t> mIV;
+  CopyableTArray<CopyableTArray<uint8_t>> mInitDatas;
+  nsString mInitDataType;
+};
+
+
+class MediaRawData;
+
+class MediaRawDataWriter {
+ public:
+  uint8_t* Data();
+  size_t Size();
+  CryptoSample& mCrypto;
+
+
+  [[nodiscard]] bool SetSize(size_t aSize);
+  [[nodiscard]] bool Prepend(const uint8_t* aData, size_t aSize);
+  [[nodiscard]] bool Append(const uint8_t* aData, size_t aSize);
+  [[nodiscard]] bool Replace(const uint8_t* aData, size_t aSize);
+  void Clear();
+  void PopFront(size_t aSize);
+
+ private:
+  friend class MediaRawData;
+  explicit MediaRawDataWriter(MediaRawData* aMediaRawData);
+  [[nodiscard]] bool EnsureSize(size_t aSize);
+  MediaRawData* mTarget;
+};
+
+class MediaRawData final : public MediaData {
+ public:
+  MediaRawData();
+  MediaRawData(const uint8_t* aData, size_t aSize);
+  MediaRawData(const uint8_t* aData, size_t aSize, const uint8_t* aAlphaData,
+               size_t aAlphaSize);
+  explicit MediaRawData(AlignedByteBuffer&& aData);
+  MediaRawData(AlignedByteBuffer&& aData, AlignedByteBuffer&& aAlphaData);
+
+  MediaRawData(const MediaRawData&) = delete;
+
+  const uint8_t* Data() const { return mBuffer.Data(); }
+  const uint8_t* AlphaData() const { return mAlphaBuffer.Data(); }
+  size_t Size() const { return mBuffer.Length(); }
+  size_t AlphaSize() const { return mAlphaBuffer.Length(); }
+  size_t ComputedSizeOfIncludingThis() const {
+    return sizeof(*this) + mBuffer.ComputedSizeOfExcludingThis() +
+           mAlphaBuffer.ComputedSizeOfExcludingThis();
+  }
+  operator Span<const uint8_t>() const { return Span{Data(), Size()}; }
+
+  const CryptoSample& mCrypto;
+  RefPtr<MediaByteBuffer> mExtraData;
+
+  bool mEOS = false;
+
+  RefPtr<TrackInfoSharedPtr> mTrackInfo;
+
+  Maybe<uint8_t> mTemporalLayerId;
+
+  Maybe<media::TimeInterval> mOriginalPresentationWindow;
+
+  bool mShouldCopyCryptoToRemoteRawData = false;
+
+  UniquePtr<const EncoderConfig> mConfig;
+
+  CryptoSample& GetWritableCrypto() { return mCryptoInternal; }
+
+  already_AddRefed<MediaRawData> Clone() const;
+  UniquePtr<MediaRawDataWriter> CreateWriter();
+  size_t SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const;
+
+ protected:
+  ~MediaRawData();
+
+ private:
+  friend class MediaRawDataWriter;
+  friend class ArrayOfRemoteMediaRawData;
+  AlignedByteBuffer mBuffer;
+  AlignedByteBuffer mAlphaBuffer;
+  CryptoSample mCryptoInternal;
+};
+
+class MediaByteBuffer : public nsTArray<uint8_t> {
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(MediaByteBuffer);
+  MediaByteBuffer() = default;
+  explicit MediaByteBuffer(size_t aCapacity) : nsTArray<uint8_t>(aCapacity) {}
+
+ private:
+  ~MediaByteBuffer() = default;
+};
+
+class MediaAlignedByteBuffer final : public AlignedByteBuffer {
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(MediaAlignedByteBuffer);
+  MediaAlignedByteBuffer() = default;
+  MediaAlignedByteBuffer(const uint8_t* aData, size_t aLength)
+      : AlignedByteBuffer(aData, aLength) {}
+  MediaAlignedByteBuffer(uint8_t* aData, size_t aOffset, size_t aLength,
+                         bool aUseJsFree)
+      : AlignedByteBuffer(aData, aOffset, aLength, aUseJsFree) {}
+
+ private:
+  ~MediaAlignedByteBuffer() = default;
+};
+
+}  
+
+#endif  // MediaData_h

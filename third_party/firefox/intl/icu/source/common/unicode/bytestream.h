@@ -1,0 +1,119 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+// Copyright (C) 2009-2012, International Business Machines
+// Copyright 2007 Google Inc. All Rights Reserved.
+
+
+#ifndef __BYTESTREAM_H__
+#define __BYTESTREAM_H__
+
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+#include <type_traits>
+
+#include "unicode/uobject.h"
+#include "unicode/std_string.h"
+
+U_NAMESPACE_BEGIN
+
+class U_COMMON_API ByteSink : public UMemory {
+public:
+  ByteSink() { }
+  virtual ~ByteSink();
+
+  virtual void Append(const char* bytes, int32_t n) = 0;
+
+  inline void AppendU8(const char* bytes, int32_t n) {
+    Append(bytes, n);
+  }
+
+#if defined(__cpp_char8_t) || defined(U_IN_DOXYGEN)
+  inline void AppendU8(const char8_t* bytes, int32_t n) {
+    Append(reinterpret_cast<const char*>(bytes), n);
+  }
+#endif
+
+  virtual char* GetAppendBuffer(int32_t min_capacity,
+                                int32_t desired_capacity_hint,
+                                char* scratch, int32_t scratch_capacity,
+                                int32_t* result_capacity);
+
+  virtual void Flush();
+
+private:
+  ByteSink(const ByteSink &) = delete;
+  ByteSink &operator=(const ByteSink &) = delete;
+};
+
+
+class U_COMMON_API CheckedArrayByteSink : public ByteSink {
+public:
+  CheckedArrayByteSink(char* outbuf, int32_t capacity);
+  virtual ~CheckedArrayByteSink();
+  virtual CheckedArrayByteSink& Reset();
+  virtual void Append(const char* bytes, int32_t n) override;
+  virtual char* GetAppendBuffer(int32_t min_capacity,
+                                int32_t desired_capacity_hint,
+                                char* scratch, int32_t scratch_capacity,
+                                int32_t* result_capacity) override;
+  int32_t NumberOfBytesWritten() const { return size_; }
+  UBool Overflowed() const { return overflowed_; }
+  int32_t NumberOfBytesAppended() const { return appended_; }
+private:
+  char* outbuf_;
+  const int32_t capacity_;
+  int32_t size_;
+  int32_t appended_;
+  UBool overflowed_;
+
+  CheckedArrayByteSink() = delete;
+  CheckedArrayByteSink(const CheckedArrayByteSink &) = delete;
+  CheckedArrayByteSink &operator=(const CheckedArrayByteSink &) = delete;
+};
+
+namespace prv {
+template<typename StringClass, typename = void>
+struct value_type_or_char {
+  using type = char;
+};
+template<typename StringClass>
+struct value_type_or_char<StringClass, std::void_t<typename StringClass::value_type>> {
+  using type = typename StringClass::value_type;
+};
+template<typename StringClass>
+using value_type_or_char_t = typename value_type_or_char<StringClass>::type;
+}
+
+template<typename StringClass>
+class StringByteSink : public ByteSink {
+  using Unit = typename prv::value_type_or_char_t<StringClass>;
+ public:
+  StringByteSink(StringClass* dest) : dest_(dest) { }
+  StringByteSink(StringClass* dest, int32_t initialAppendCapacity) : dest_(dest) {
+    if (initialAppendCapacity > 0 &&
+        static_cast<uint32_t>(initialAppendCapacity) > dest->capacity() - dest->length()) {
+      dest->reserve(dest->length() + initialAppendCapacity);
+    }
+  }
+  virtual void Append(const char* data, int32_t n) override {
+    if constexpr (std::is_same_v<Unit, char>) {
+      dest_->append(data, n);
+    } else {
+      dest_->append(reinterpret_cast<const Unit*>(data), n);
+    }
+  }
+ private:
+  StringClass* dest_;
+
+  StringByteSink() = delete;
+  StringByteSink(const StringByteSink &) = delete;
+  StringByteSink &operator=(const StringByteSink &) = delete;
+};
+
+U_NAMESPACE_END
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif  // __BYTESTREAM_H__

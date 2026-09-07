@@ -1,0 +1,162 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_CSSTransition_h
+#define mozilla_dom_CSSTransition_h
+
+#include "AnimationCommon.h"
+#include "mozilla/CSSPropertyId.h"
+#include "mozilla/ComputedTiming.h"
+#include "mozilla/StyleAnimationValue.h"
+#include "mozilla/dom/Animation.h"
+
+class nsIGlobalObject;
+
+namespace mozilla {
+namespace dom {
+
+class CSSTransition final : public Animation {
+ public:
+  explicit CSSTransition(nsIGlobalObject* aGlobal,
+                         const CSSPropertyId& aProperty)
+      : Animation(aGlobal),
+        mPreviousTransitionPhase(TransitionPhase::Idle),
+        mNeedsNewAnimationIndexWhenRun(false),
+        mTransitionProperty(aProperty) {}
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  CSSTransition* AsCSSTransition() override { return this; }
+  const CSSTransition* AsCSSTransition() const override { return this; }
+
+  void GetTransitionProperty(nsString& aRetVal) const;
+
+  AnimationPlayState PlayStateFromJS() const override;
+  bool PendingFromJS() const override;
+  void PlayFromJS(ErrorResult& aRv) override;
+
+  void PlayFromStyle() {
+    ErrorResult rv;
+    PlayNoUpdate(rv, Animation::LimitBehavior::Continue);
+    MOZ_ASSERT(!rv.Failed(), "Unexpected exception playing transition");
+  }
+
+  void CancelFromStyle(PostRestyleMode aPostRestyle) {
+    Animation::Cancel(aPostRestyle);
+
+    mAnimationIndex = sNextAnimationIndex++;
+    mNeedsNewAnimationIndexWhenRun = true;
+
+    mOwningElement = OwningElementRef();
+  }
+
+  void SetEffectFromStyle(KeyframeEffect*);
+
+  void Tick(TickState&) override;
+
+  const CSSPropertyId& TransitionProperty() const;
+  AnimationValue ToValue() const;
+
+  int32_t CompareCompositeOrder(const Maybe<EventContext>& aContext,
+                                const CSSTransition& aOther,
+                                const Maybe<EventContext>& aOtherContext,
+                                nsContentUtils::NodeIndexCache&) const;
+
+  EffectCompositor::CascadeLevel CascadeLevel() const override {
+    return IsTiedToMarkup() ? EffectCompositor::CascadeLevel::Transitions
+                            : EffectCompositor::CascadeLevel::Animations;
+  }
+
+  void SetCreationSequence(uint64_t aIndex) {
+    MOZ_ASSERT(IsTiedToMarkup());
+    mAnimationIndex = aIndex;
+  }
+
+  void SetOwningElement(const OwningElementRef& aElement) {
+    mOwningElement = aElement;
+  }
+  bool IsTiedToMarkup() const { return mOwningElement.IsSet(); }
+
+  static Nullable<TimeDuration> GetCurrentTimeAt(
+      const AnimationTimeline& aTimeline, const TimeStamp& aBaseTime,
+      const TimeDuration& aStartTime, double aPlaybackRate);
+
+  void MaybeQueueCancelEvent(const StickyTimeDuration& aActiveTime) override {
+    QueueEvents(aActiveTime);
+  }
+
+  double CurrentValuePortion() const;
+
+  const AnimationValue& StartForReversingTest() const {
+    return mStartForReversingTest;
+  }
+  double ReversePortion() const { return mReversePortion; }
+
+  void SetReverseParameters(AnimationValue&& aStartForReversingTest,
+                            double aReversePortion) {
+    mStartForReversingTest = std::move(aStartForReversingTest);
+    mReversePortion = aReversePortion;
+  }
+
+  struct ReplacedTransitionProperties {
+    TimeDuration mStartTime;
+    double mPlaybackRate;
+    TimingParams mTiming;
+    Maybe<StyleComputedTimingFunction> mTimingFunction;
+    AnimationValue mFromValue, mToValue;
+  };
+  void SetReplacedTransition(
+      ReplacedTransitionProperties&& aReplacedTransition) {
+    mReplacedTransition.emplace(std::move(aReplacedTransition));
+  }
+
+  bool UpdateStartValueFromReplacedTransition();
+
+  static Maybe<double> ComputeTransformedProgress(
+      const AnimationTimeline& aTimeline,
+      const CSSTransition::ReplacedTransitionProperties& aProperties);
+
+ protected:
+  virtual ~CSSTransition() {
+    MOZ_ASSERT(!mOwningElement.IsSet(),
+               "Owning element should be cleared "
+               "before a CSS transition is destroyed");
+  }
+
+  void UpdateTiming(SeekFlag aSeekFlag,
+                    SyncNotifyFlag aSyncNotifyFlag) override;
+
+  void QueueEvents(const StickyTimeDuration& activeTime = StickyTimeDuration());
+
+  enum class TransitionPhase;
+
+  OwningElementRef mOwningElement;
+
+  enum class TransitionPhase {
+    Idle = static_cast<int>(ComputedTiming::AnimationPhase::Idle),
+    Before = static_cast<int>(ComputedTiming::AnimationPhase::Before),
+    Active = static_cast<int>(ComputedTiming::AnimationPhase::Active),
+    After = static_cast<int>(ComputedTiming::AnimationPhase::After),
+    Pending
+  };
+  TransitionPhase mPreviousTransitionPhase;
+
+  bool mNeedsNewAnimationIndexWhenRun;
+
+  CSSPropertyId mTransitionProperty;
+  AnimationValue mTransitionToValue;
+
+  AnimationValue mStartForReversingTest;
+
+  double mReversePortion = 1.0;
+
+  Maybe<ReplacedTransitionProperties> mReplacedTransition;
+};
+
+}  
+
+}  
+
+#endif  // mozilla_dom_CSSTransition_h

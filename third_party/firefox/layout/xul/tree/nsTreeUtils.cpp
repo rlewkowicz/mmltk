@@ -1,0 +1,135 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsTreeUtils.h"
+
+#include "ChildIterator.h"
+#include "mozilla/dom/Element.h"
+#include "nsAtom.h"
+#include "nsCRT.h"
+#include "nsGkAtoms.h"
+#include "nsIContent.h"
+#include "nsNameSpaceManager.h"
+#include "nsReadableUtils.h"
+
+using namespace mozilla;
+
+nsresult nsTreeUtils::TokenizeProperties(const nsAString& aProperties,
+                                         AtomArray& aPropertiesArray) {
+  nsAString::const_iterator end;
+  aProperties.EndReading(end);
+
+  nsAString::const_iterator iter;
+  aProperties.BeginReading(iter);
+
+  do {
+    while (iter != end && nsCRT::IsAsciiSpace(*iter)) {
+      ++iter;
+    }
+
+    if (iter == end) {
+      break;
+    }
+
+    nsAString::const_iterator first = iter;
+
+    while (iter != end && !nsCRT::IsAsciiSpace(*iter)) {
+      ++iter;
+    }
+
+    NS_ASSERTION(iter != first, "eh? something's wrong here");
+    if (iter == first) {
+      break;
+    }
+
+    RefPtr<nsAtom> atom = NS_Atomize(Substring(first, iter));
+    aPropertiesArray.AppendElement(atom);
+  } while (iter != end);
+
+  return NS_OK;
+}
+
+nsIContent* nsTreeUtils::GetImmediateChild(nsIContent* aContainer,
+                                           nsAtom* aTag) {
+  dom::FlattenedChildIterator iter(aContainer);
+  for (nsIContent* child = iter.GetNextChild(); child;
+       child = iter.GetNextChild()) {
+    if (child->IsXULElement(aTag)) {
+      return child;
+    }
+    if (child->IsHTMLElement(nsGkAtoms::slot)) {
+      if (nsIContent* c = GetImmediateChild(child, aTag)) {
+        return c;
+      }
+    }
+  }
+
+  return nullptr;
+}
+
+nsIContent* nsTreeUtils::GetDescendantChild(nsIContent* aContainer,
+                                            nsAtom* aTag) {
+  dom::FlattenedChildIterator iter(aContainer);
+  for (nsIContent* child = iter.GetNextChild(); child;
+       child = iter.GetNextChild()) {
+    if (child->IsXULElement(aTag)) {
+      return child;
+    }
+
+    child = GetDescendantChild(child, aTag);
+    if (child) {
+      return child;
+    }
+  }
+
+  return nullptr;
+}
+
+nsresult nsTreeUtils::UpdateSortIndicators(dom::Element* aColumn,
+                                           const nsAString& aDirection) {
+  aColumn->SetAttr(kNameSpaceID_None, nsGkAtoms::sortDirection, aDirection,
+                   true);
+  aColumn->SetAttr(kNameSpaceID_None, nsGkAtoms::sortActive, u"true"_ns, true);
+
+  nsCOMPtr<nsIContent> parentContent = aColumn->GetParent();
+  if (parentContent && parentContent->NodeInfo()->Equals(nsGkAtoms::treecols,
+                                                         kNameSpaceID_XUL)) {
+    for (nsINode* childContent = parentContent->GetFirstChild(); childContent;
+         childContent = childContent->GetNextSibling()) {
+      if (childContent != aColumn &&
+          childContent->NodeInfo()->Equals(nsGkAtoms::treecol,
+                                           kNameSpaceID_XUL)) {
+        childContent->AsElement()->UnsetAttr(kNameSpaceID_None,
+                                             nsGkAtoms::sortDirection, true);
+        childContent->AsElement()->UnsetAttr(kNameSpaceID_None,
+                                             nsGkAtoms::sortActive, true);
+      }
+    }
+  }
+
+  return NS_OK;
+}
+
+nsresult nsTreeUtils::GetColumnIndex(dom::Element* aColumn, int32_t* aResult) {
+  nsIContent* parentContent = aColumn->GetParent();
+  if (parentContent && parentContent->NodeInfo()->Equals(nsGkAtoms::treecols,
+                                                         kNameSpaceID_XUL)) {
+    int32_t colIndex = 0;
+
+    for (nsINode* childContent = parentContent->GetFirstChild(); childContent;
+         childContent = childContent->GetNextSibling()) {
+      if (childContent->NodeInfo()->Equals(nsGkAtoms::treecol,
+                                           kNameSpaceID_XUL)) {
+        if (childContent == aColumn) {
+          *aResult = colIndex;
+          return NS_OK;
+        }
+        ++colIndex;
+      }
+    }
+  }
+
+  *aResult = -1;
+  return NS_OK;
+}

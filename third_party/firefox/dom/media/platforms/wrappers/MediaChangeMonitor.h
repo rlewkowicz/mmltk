@@ -1,0 +1,153 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_H264Converter_h
+#define mozilla_H264Converter_h
+
+#include "PDMFactory.h"
+#include "PlatformDecoderModule.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/UniquePtr.h"
+
+namespace mozilla {
+
+DDLoggedTypeDeclNameAndBase(MediaChangeMonitor, MediaDataDecoder);
+
+
+class MediaChangeMonitor final
+    : public MediaDataDecoder,
+      public DecoderDoctorLifeLogger<MediaChangeMonitor> {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(MediaChangeMonitor, final);
+
+  static RefPtr<PlatformDecoderModule::CreateDecoderPromise> Create(
+      PDMFactory* aPDMFactory, const CreateDecoderParams& aParams);
+
+  RefPtr<InitPromise> Init() override;
+  RefPtr<DecodePromise> Decode(MediaRawData* aSample) override;
+  RefPtr<DecodePromise> Drain() override;
+  RefPtr<FlushPromise> Flush() override;
+  RefPtr<ShutdownPromise> Shutdown() override;
+  bool IsHardwareAccelerated(nsACString& aFailureReason) const override;
+  nsCString GetDescriptionName() const override {
+    if (RefPtr<MediaDataDecoder> decoder = GetDecoderOnNonOwnerThread()) {
+      return decoder->GetDescriptionName();
+    }
+    return "MediaChangeMonitor decoder (pending)"_ns;
+  }
+  nsCString GetProcessName() const override {
+    if (RefPtr<MediaDataDecoder> decoder = GetDecoderOnNonOwnerThread()) {
+      return decoder->GetProcessName();
+    }
+    return "MediaChangeMonitor"_ns;
+  }
+  nsCString GetCodecName() const override {
+    if (RefPtr<MediaDataDecoder> decoder = GetDecoderOnNonOwnerThread()) {
+      return decoder->GetCodecName();
+    }
+    return "MediaChangeMonitor"_ns;
+  }
+  void SetSeekThreshold(const media::TimeUnit& aTime) override;
+  bool SupportDecoderRecycling() const override {
+    if (RefPtr<MediaDataDecoder> decoder = GetDecoderOnNonOwnerThread()) {
+      return decoder->SupportDecoderRecycling();
+    }
+    return false;
+  }
+  bool ShouldDecoderAlwaysBeRecycled() const override {
+    if (RefPtr<MediaDataDecoder> decoder = GetDecoderOnNonOwnerThread()) {
+      return decoder->ShouldDecoderAlwaysBeRecycled();
+    }
+    return false;
+  }
+
+  ConversionRequired NeedsConversion() const override {
+    if (RefPtr<MediaDataDecoder> decoder = GetDecoderOnNonOwnerThread()) {
+      return decoder->NeedsConversion();
+    }
+    return ConversionRequired::kNeedNone;
+  }
+
+  Maybe<PropertyValue> GetDecodeProperty(PropertyName aName) const override {
+    if (RefPtr<MediaDataDecoder> decoder = GetDecoderOnNonOwnerThread()) {
+      return decoder->GetDecodeProperty(aName);
+    }
+    return MediaDataDecoder::GetDecodeProperty(aName);
+  }
+
+  class CodecChangeMonitor {
+   public:
+    virtual bool CanBeInstantiated() const = 0;
+    virtual MediaResult CheckForChange(MediaRawData* aSample) = 0;
+    virtual const TrackInfo& Config() const = 0;
+    virtual MediaResult PrepareSample(
+        MediaDataDecoder::ConversionRequired aConversion, MediaRawData* aSample,
+        bool aNeedKeyFrame) = 0;
+    virtual bool IsHardwareAccelerated(nsACString& aFailureReason) const {
+      return false;
+    }
+    virtual void Flush() {};
+    virtual ~CodecChangeMonitor() = default;
+  };
+
+ private:
+  MediaChangeMonitor(PDMFactory* aPDMFactory,
+                     UniquePtr<CodecChangeMonitor>&& aCodecChangeMonitor,
+                     MediaDataDecoder* aDecoder,
+                     const CreateDecoderParams& aParams);
+  virtual ~MediaChangeMonitor();
+
+  void AssertOnThread() const {
+    MOZ_ASSERT(!mThread || mThread->IsOnCurrentThread());
+  }
+
+  MediaDataDecoder* GetDecoderOnNonOwnerThread() const;
+
+  bool CanRecycleDecoder() const;
+
+  typedef MozPromise<bool, MediaResult, true >
+      CreateDecoderPromise;
+  RefPtr<CreateDecoderPromise> CreateDecoder();
+  MediaResult CreateDecoderAndInit(MediaRawData* aSample);
+  MediaResult CheckForChange(MediaRawData* aSample);
+
+  void DecodeFirstSample(MediaRawData* aSample);
+  void DrainThenFlushDecoder(MediaRawData* aPendingSample);
+  void FlushThenShutdownDecoder(MediaRawData* aPendingSample);
+  RefPtr<ShutdownPromise> ShutdownDecoder();
+
+  UniquePtr<CodecChangeMonitor> mChangeMonitor;
+  RefPtr<PDMFactory> mPDMFactory;
+  UniquePtr<TrackInfo> mCurrentConfig;
+  nsCOMPtr<nsISerialEventTarget> mThread;
+  RefPtr<MediaDataDecoder> mDecoder;
+  MozPromiseRequestHolder<CreateDecoderPromise> mCreateAndInitRequest;
+  MozPromiseRequestHolder<PlatformDecoderModule::CreateDecoderPromise>
+      mCreateDecoderRequest;
+  MozPromiseHolder<CreateDecoderPromise> mCreateDecoderHolder;
+  MozPromiseHolder<ShutdownPromise> mShutdownWhileCreationPromise;
+  MozPromiseRequestHolder<InitPromise> mInitPromiseRequest;
+  MozPromiseHolder<InitPromise> mInitPromise;
+  MozPromiseRequestHolder<DecodePromise> mDecodePromiseRequest;
+  MozPromiseHolder<DecodePromise> mDecodePromise;
+  MozPromiseRequestHolder<FlushPromise> mFlushRequest;
+  MediaDataDecoder::DecodedData mPendingFrames;
+  MozPromiseRequestHolder<DecodePromise> mDrainRequest;
+  MozPromiseRequestHolder<ShutdownPromise> mShutdownRequest;
+  RefPtr<ShutdownPromise> mShutdownPromise;
+  MozPromiseHolder<FlushPromise> mFlushPromise;
+
+  bool mNeedKeyframe = true;
+  Maybe<bool> mCanRecycleDecoder;
+  Maybe<MediaDataDecoder::ConversionRequired> mConversionRequired;
+  bool mDecoderInitialized = false;
+  const CreateDecoderParamsForAsync mParams;
+  Maybe<media::TimeUnit> mPendingSeekThreshold;
+
+  mutable Mutex MOZ_ANNOTATED mMutex{"MediaChangeMonitor"};
+};
+
+}  
+
+#endif  // mozilla_H264Converter_h

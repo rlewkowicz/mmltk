@@ -1,0 +1,58 @@
+/*
+ * Copyright 2016 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkSwizzlePriv_DEFINED)
+#define SkSwizzlePriv_DEFINED
+
+#include "src/base/SkVx.h"
+#include "src/core/SkColorData.h"
+
+#include <cstdint>
+
+namespace SkOpts {
+    using Swizzle_8888_u32 = void (*)(uint32_t*, const uint32_t*, int);
+    extern Swizzle_8888_u32 RGBA_to_BGRA,          
+                            RGBA_to_rgbA,          
+                            RGBA_to_bgrA,          
+                            rgbA_to_RGBA,          
+                            rgbA_to_BGRA,          
+                            inverted_CMYK_to_RGB1, 
+                            inverted_CMYK_to_BGR1; 
+
+    using Swizzle_8888_u8 = void (*)(uint32_t*, const uint8_t*, int);
+    extern Swizzle_8888_u8 RGB_to_RGB1,     
+                           RGB_to_BGR1,     
+                           gray_to_RGB1,    
+                           grayA_to_RGBA,   
+                           grayA_to_rgbA;   
+
+    void Init_Swizzler();
+}  
+
+static inline skvx::float4 swizzle_rb(const skvx::float4& x) {
+    return skvx::shuffle<2, 1, 0, 3>(x);
+}
+
+static inline skvx::float4 swizzle_rb_if_bgra(const skvx::float4& x) {
+#if defined(SK_PMCOLOR_IS_BGRA)
+    return swizzle_rb(x);
+#else
+    return x;
+#endif
+}
+
+static inline skvx::float4 Sk4f_fromL32(uint32_t px) {
+    return skvx::cast<float>(skvx::byte4::Load(&px)) * (1 / 255.0f);
+}
+
+static inline uint32_t Sk4f_toL32(const skvx::float4& px) {
+    uint32_t l32;
+    skvx::cast<uint8_t>(skvx::pin(px * 255.f + 0.5f, skvx::float4(0.f), skvx::float4(255.f)))
+                       .store(&l32);
+    return l32;
+}
+#endif

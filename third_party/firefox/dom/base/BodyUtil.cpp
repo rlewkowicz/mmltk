@@ -1,0 +1,441 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "BodyUtil.h"
+
+#include "js/ArrayBuffer.h"  // JS::NewArrayBufferWithContents
+#include "js/JSON.h"
+#include "mozilla/Encoding.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/dom/Exceptions.h"
+#include "mozilla/dom/FetchUtil.h"
+#include "mozilla/dom/File.h"
+#include "mozilla/dom/FormData.h"
+#include "mozilla/dom/Headers.h"
+#include "mozilla/dom/MimeType.h"
+#include "mozilla/dom/Promise.h"
+#include "nsCRT.h"
+#include "nsCharSeparatedTokenizer.h"
+#include "nsDOMString.h"
+#include "nsError.h"
+#include "nsIGlobalObject.h"
+#include "nsNetUtil.h"
+#include "nsReadableUtils.h"
+#include "nsStreamUtils.h"
+#include "nsString.h"
+#include "nsStringStream.h"
+#include "nsURLHelper.h"
+
+namespace mozilla::dom {
+
+namespace {
+
+static bool PushOverLine(nsACString::const_iterator& aStart,
+                         const nsACString::const_iterator& aEnd) {
+  if (*aStart == nsCRT::CR && (aEnd - aStart > 1) && *(++aStart) == nsCRT::LF) {
+    ++aStart;  
+    return true;
+  }
+
+  return false;
+}
+
+class MOZ_STACK_CLASS FormDataParser {
+ private:
+  RefPtr<FormData> mFormData;
+  nsCString mMimeType;
+  nsCString mMixedCaseMimeType;
+  nsCString mData;
+
+  nsCString mName;
+  nsCString mFilename;
+  nsCString mContentType;
+
+  enum {
+    START_PART,
+    PARSE_HEADER,
+    PARSE_BODY,
+  } mState;
+
+  nsIGlobalObject* mParentObject;
+
+  bool PushOverBoundary(const nsACString& aBoundaryString,
+                        nsACString::const_iterator& aStart,
+                        nsACString::const_iterator& aEnd) {
+    nsACString::const_iterator end(aEnd);
+    const char* beginning = aStart.get();
+    if (FindInReadable(aBoundaryString, aStart, end)) {
+      if ((aStart.get() - beginning) == 0) {
+        aStart.advance(aBoundaryString.Length());
+        return true;
+      }
+
+      if ((aStart.get() - beginning) == 2) {
+        if (*(--aStart) == '-' && *(--aStart) == '-') {
+          aStart.advance(aBoundaryString.Length() + 2);
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  bool ParseHeader(nsACString::const_iterator& aStart,
+                   nsACString::const_iterator& aEnd, bool* aWasEmptyHeader) {
+    nsAutoCString headerName, headerValue;
+    if (!FetchUtil::ExtractHeader(aStart, aEnd, headerName, headerValue,
+                                  aWasEmptyHeader)) {
+      return false;
+    }
+    if (*aWasEmptyHeader) {
+      return true;
+    }
+
+    if (headerName.LowerCaseEqualsLiteral("content-disposition")) {
+      bool seenFormData = false;
+      for (const nsACString& token :
+           nsCCharSeparatedTokenizer(headerValue, ';').ToRange()) {
+        if (token.IsEmpty()) {
+          continue;
+        }
+
+        if (token.EqualsLiteral("form-data")) {
+          seenFormData = true;
+          continue;
+        }
+
+        if (seenFormData && StringBeginsWith(token, "name="_ns)) {
+          mName = StringTail(token, token.Length() - 5);
+          mName.Trim(" \"");
+          continue;
+        }
+
+        if (seenFormData && StringBeginsWith(token, "filename="_ns)) {
+          mFilename = StringTail(token, token.Length() - 9);
+          mFilename.Trim(" \"");
+          continue;
+        }
+      }
+
+      if (mName.IsVoid()) {
+        return false;
+      }
+    } else if (headerName.LowerCaseEqualsLiteral("content-type")) {
+      mContentType = std::move(headerValue);
+    }
+
+    return true;
+  }
+
+  bool ParseBody(const nsACString& aBoundaryString,
+                 nsACString::const_iterator& aStart,
+                 nsACString::const_iterator& aEnd) {
+    const char* beginning = aStart.get();
+
+    nsACString::const_iterator end(aEnd);
+    if (!FindInReadable(aBoundaryString, aStart, end)) {
+      return false;
+    }
+
+    if (aStart.get() - beginning < 2) {
+      return false;
+    }
+
+    aStart.advance(-2);
+
+    if (*aStart == '-' && *(aStart.get() + 1) == '-') {
+      if (aStart.get() - beginning < 2) {
+        return false;
+      }
+
+      aStart.advance(-2);
+    }
+
+    if (*aStart != nsCRT::CR || *(aStart.get() + 1) != nsCRT::LF) {
+      return false;
+    }
+
+    nsAutoCString body(beginning, aStart.get() - beginning);
+
+    aStart.advance(2);
+
+    if (!mFormData) {
+      mFormData = new FormData();
+    }
+
+    NS_ConvertUTF8toUTF16 name(mName);
+
+    if (mFilename.IsVoid()) {
+      ErrorResult rv;
+      mFormData->Append(name, NS_ConvertUTF8toUTF16(body), rv);
+      MOZ_ASSERT(!rv.Failed());
+    } else {
+      char* copy = static_cast<char*>(moz_xmalloc(body.Length()));
+      nsCString::const_iterator bodyIter, bodyEnd;
+      body.BeginReading(bodyIter);
+      body.EndReading(bodyEnd);
+      char* p = copy;
+      while (bodyIter != bodyEnd) {
+        *p++ = *bodyIter++;
+      }
+      p = nullptr;
+
+      RefPtr<Blob> file = File::CreateMemoryFileWithCustomLastModified(
+          mParentObject, reinterpret_cast<void*>(copy), body.Length(),
+          NS_ConvertUTF8toUTF16(mFilename), NS_ConvertUTF8toUTF16(mContentType),
+           0);
+      if (NS_WARN_IF(!file)) {
+        return false;
+      }
+
+      Optional<nsAString> dummy;
+      ErrorResult rv;
+      mFormData->Append(name, *file, dummy, rv);
+      if (NS_WARN_IF(rv.Failed())) {
+        rv.SuppressException();
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+ public:
+  FormDataParser(const nsACString& aMimeType,
+                 const nsACString& aMixedCaseMimeType, const nsACString& aData,
+                 nsIGlobalObject* aParent)
+      : mMimeType(aMimeType),
+        mMixedCaseMimeType(aMixedCaseMimeType),
+        mData(aData),
+        mState(START_PART),
+        mParentObject(aParent) {}
+
+  bool Parse() {
+    if (mData.IsEmpty()) {
+      return false;
+    }
+
+    RefPtr<CMimeType> parsed = CMimeType::Parse(mMixedCaseMimeType);
+    if (!parsed) {
+      return false;
+    }
+
+    nsAutoCString boundaryString;
+    if (!parsed->GetParameterValue("boundary"_ns, boundaryString)) {
+      return false;
+    }
+
+    nsACString::const_iterator start, end;
+    mData.BeginReading(start);
+    mData.EndReading(end);
+
+    while (start != end) {
+      switch (mState) {
+        case START_PART:
+          mName.SetIsVoid(true);
+          mFilename.SetIsVoid(true);
+          mContentType = "text/plain"_ns;
+
+          while (start != end && NS_IsHTTPWhitespace(*start)) {
+            ++start;
+          }
+
+          if (!PushOverBoundary(boundaryString, start, end)) {
+            return false;
+          }
+
+          if (start != end && *start == '-') {
+            if (!mFormData) {
+              mFormData = new FormData();
+            }
+            return true;
+          }
+
+          if (!PushOverLine(start, end)) {
+            return false;
+          }
+          mState = PARSE_HEADER;
+          break;
+
+        case PARSE_HEADER:
+          bool emptyHeader;
+          if (!ParseHeader(start, end, &emptyHeader)) {
+            return false;
+          }
+
+          if (emptyHeader && !PushOverLine(start, end)) {
+            return false;
+          }
+
+          mState = emptyHeader ? PARSE_BODY : PARSE_HEADER;
+          break;
+
+        case PARSE_BODY:
+          if (mName.IsVoid()) {
+            NS_WARNING(
+                "No content-disposition header with a valid name was "
+                "found. Failing at body parse.");
+            return false;
+          }
+
+          if (!ParseBody(boundaryString, start, end)) {
+            return false;
+          }
+
+          mState = START_PART;
+          break;
+
+        default:
+          MOZ_CRASH("Invalid case");
+      }
+    }
+
+    NS_WARNING("Body parse failed.");
+    return false;
+  }
+
+  already_AddRefed<FormData> GetFormData() { return mFormData.forget(); }
+};
+}  
+
+void BodyUtil::ConsumeArrayBuffer(JSContext* aCx,
+                                  JS::MutableHandle<JSObject*> aValue,
+                                  uint32_t aInputLength,
+                                  UniquePtr<uint8_t[], JS::FreePolicy> aInput,
+                                  ErrorResult& aRv) {
+  aRv.MightThrowJSException();
+
+  JS::Rooted<JSObject*> arrayBuffer(aCx);
+  arrayBuffer =
+      JS::NewArrayBufferWithContents(aCx, aInputLength, std::move(aInput));
+  if (!arrayBuffer) {
+    aRv.StealExceptionFromJSContext(aCx);
+    return;
+  }
+  aValue.set(arrayBuffer);
+}
+
+already_AddRefed<Blob> BodyUtil::ConsumeBlob(nsIGlobalObject* aParent,
+                                             const nsString& aMimeType,
+                                             uint32_t aInputLength,
+                                             uint8_t* aInput,
+                                             ErrorResult& aRv) {
+  RefPtr<Blob> blob = Blob::CreateMemoryBlob(
+      aParent, reinterpret_cast<void*>(aInput), aInputLength, aMimeType);
+
+  if (!blob) {
+    aRv.Throw(NS_ERROR_DOM_UNKNOWN_ERR);
+    return nullptr;
+  }
+  return blob.forget();
+}
+
+void BodyUtil::ConsumeBytes(JSContext* aCx, JS::MutableHandle<JSObject*> aValue,
+                            uint32_t aInputLength,
+                            UniquePtr<uint8_t[], JS::FreePolicy> aInput,
+                            ErrorResult& aRv) {
+  aRv.MightThrowJSException();
+
+  JS::Rooted<JSObject*> arrayBuffer(aCx);
+  ConsumeArrayBuffer(aCx, &arrayBuffer, aInputLength, std::move(aInput), aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  JS::Rooted<JSObject*> bytes(
+      aCx, JS_NewUint8ArrayWithBuffer(aCx, arrayBuffer, 0, aInputLength));
+  if (!bytes) {
+    aRv.StealExceptionFromJSContext(aCx);
+    return;
+  }
+  aValue.set(bytes);
+}
+
+already_AddRefed<FormData> BodyUtil::ConsumeFormData(
+    nsIGlobalObject* aParent, const nsCString& aMimeType,
+    const nsACString& aMixedCaseMimeType, const nsCString& aStr,
+    ErrorResult& aRv) {
+  constexpr auto formDataMimeType = "multipart/form-data"_ns;
+
+  bool isValidFormDataMimeType = StringBeginsWith(aMimeType, formDataMimeType);
+
+  if (isValidFormDataMimeType &&
+      aMimeType.Length() > formDataMimeType.Length()) {
+    isValidFormDataMimeType = aMimeType[formDataMimeType.Length()] == ';';
+  }
+
+  if (isValidFormDataMimeType) {
+    FormDataParser parser(aMimeType, aMixedCaseMimeType, aStr, aParent);
+    if (!parser.Parse()) {
+      aRv.ThrowTypeError<MSG_BAD_FORMDATA>();
+      return nullptr;
+    }
+
+    RefPtr<FormData> fd = parser.GetFormData();
+    MOZ_ASSERT(fd);
+    return fd.forget();
+  }
+
+  constexpr auto urlDataMimeType = "application/x-www-form-urlencoded"_ns;
+  bool isValidUrlEncodedMimeType = StringBeginsWith(aMimeType, urlDataMimeType);
+
+  if (isValidUrlEncodedMimeType &&
+      aMimeType.Length() > urlDataMimeType.Length()) {
+    isValidUrlEncodedMimeType = aMimeType[urlDataMimeType.Length()] == ';';
+  }
+
+  if (isValidUrlEncodedMimeType) {
+    RefPtr<FormData> fd = new FormData(aParent);
+    DebugOnly<bool> status = URLParams::Parse(
+        aStr, true, [&fd](const nsACString& aName, const nsACString& aValue) {
+          IgnoredErrorResult rv;
+          fd->Append(NS_ConvertUTF8toUTF16(aName),
+                     NS_ConvertUTF8toUTF16(aValue), rv);
+          MOZ_ASSERT(!rv.Failed());
+          return true;
+        });
+    MOZ_ASSERT(status);
+
+    return fd.forget();
+  }
+
+  aRv.ThrowTypeError<MSG_BAD_FORMDATA>();
+  return nullptr;
+}
+
+nsresult BodyUtil::ConsumeText(uint32_t aInputLength, uint8_t* aInput,
+                               nsString& aText) {
+  nsresult rv =
+      UTF_8_ENCODING->DecodeWithBOMRemoval(Span(aInput, aInputLength), aText);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+  return NS_OK;
+}
+
+void BodyUtil::ConsumeJson(JSContext* aCx, JS::MutableHandle<JS::Value> aValue,
+                           const nsString& aStr, ErrorResult& aRv) {
+  aRv.MightThrowJSException();
+
+  JS::Rooted<JS::Value> json(aCx);
+  if (!JS_ParseJSON(aCx, aStr.get(), aStr.Length(), &json)) {
+    if (!JS_IsExceptionPending(aCx)) {
+      aRv.Throw(NS_ERROR_DOM_UNKNOWN_ERR);
+      return;
+    }
+
+    JS::Rooted<JS::Value> exn(aCx);
+    DebugOnly<bool> gotException = JS_GetPendingException(aCx, &exn);
+    MOZ_ASSERT(gotException);
+
+    JS_ClearPendingException(aCx);
+    aRv.ThrowJSException(aCx, exn);
+    return;
+  }
+
+  aValue.set(json);
+}
+
+}  

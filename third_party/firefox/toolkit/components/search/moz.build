@@ -1,0 +1,23 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+MOZ_SRC_FILES += [
+    "ConfigSearchEngine.sys.mjs",
+    "OpenSearchEngine.sys.mjs",
+    "OpenSearchLoader.sys.mjs",
+    "OpenSearchLoaderChild.sys.mjs",
+    "OpenSearchParser.sys.mjs",
+    "SearchEngine.sys.mjs",
+    "SearchEngineSelector.sys.mjs",
+    "SearchService.sys.mjs",
+    "SearchSettings.sys.mjs",
+    "SearchShortcuts.sys.mjs",
+    "SearchStaticData.sys.mjs",
+    "SearchUtils.sys.mjs",
+    "UserSearchEngine.sys.mjs",
+]
+
+XPCOM_MANIFESTS += [
+    "components.conf",
+]

@@ -1,0 +1,96 @@
+/*
+ * Copyright 2021 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "include/core/SkTypes.h"
+#include "src/core/SkTHash.h"
+#include "src/sksl/SkSLConstantFolder.h"
+#include "src/sksl/SkSLModule.h"
+#include "src/sksl/analysis/SkSLProgramUsage.h"
+#include "src/sksl/ir/SkSLExpression.h"
+#include "src/sksl/ir/SkSLFunctionDefinition.h"
+#include "src/sksl/ir/SkSLModifierFlags.h"
+#include "src/sksl/ir/SkSLProgramElement.h"
+#include "src/sksl/ir/SkSLVariable.h"
+#include "src/sksl/ir/SkSLVariableReference.h"
+#include "src/sksl/transform/SkSLProgramWriter.h"
+#include "src/sksl/transform/SkSLTransform.h"
+
+#include <cstddef>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <vector>
+
+using namespace skia_private;
+
+namespace SkSL {
+
+void Transform::ReplaceConstVarsWithLiterals(Module& module, ProgramUsage* usage) {
+    class ConstVarReplacer : public ProgramWriter {
+    public:
+        ConstVarReplacer(ProgramUsage* usage) : fUsage(usage) {}
+
+        using ProgramWriter::visitProgramElement;
+
+        bool visitExpressionPtr(std::unique_ptr<Expression>& expr) override {
+            if (expr->is<VariableReference>()) {
+                VariableReference& var = expr->as<VariableReference>();
+                if (fCandidates.contains(var.variable())) {
+                    if (const Expression* value = ConstantFolder::GetConstantValueOrNull(var)) {
+                        fUsage->remove(expr.get());
+                        expr = value->clone();
+                        fUsage->add(expr.get());
+                        return false;
+                    }
+                }
+            }
+            return INHERITED::visitExpressionPtr(expr);
+        }
+
+        ProgramUsage* fUsage;
+        THashSet<const Variable*> fCandidates;
+
+        using INHERITED = ProgramWriter;
+    };
+
+    ConstVarReplacer visitor{usage};
+
+    for (const auto& [var, count] : usage->fVariableCounts) {
+        if (!count.fVarExists || count.fWrite != 1) {
+            continue;
+        }
+        if (!var->modifierFlags().isConst()) {
+            continue;
+        }
+        if (!var->initialValue()) {
+            continue;
+        }
+        size_t initialvalueSize = ConstantFolder::GetConstantValueForVariable(*var->initialValue())
+                                          ->description()
+                                          .size();
+        size_t totalOldSize = var->description().size() +        
+                              1 +                                
+                              initialvalueSize +                 
+                              1 +                                
+                              count.fRead * var->name().size();  
+        size_t totalNewSize = count.fRead * initialvalueSize;    
+
+        if (totalNewSize <= totalOldSize) {
+            visitor.fCandidates.add(var);
+        }
+    }
+
+    if (!visitor.fCandidates.empty()) {
+        for (std::unique_ptr<ProgramElement>& pe : module.fElements) {
+            if (pe->is<FunctionDefinition>()) {
+                visitor.visitProgramElement(*pe);
+            }
+        }
+    }
+}
+
+}  

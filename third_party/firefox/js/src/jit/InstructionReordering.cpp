@@ -1,0 +1,215 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "jit/InstructionReordering.h"
+
+#include "jit/MIRGenerator.h"
+#include "jit/MIRGraph.h"
+
+using namespace js;
+using namespace js::jit;
+
+static void MoveBefore(MBasicBlock* block, MInstruction* at,
+                       MInstruction* ins) {
+  if (at == ins) {
+    return;
+  }
+
+  for (MInstructionIterator iter(block->begin(at)); *iter != ins; iter++) {
+    MOZ_ASSERT(iter->id() < ins->id());
+    iter->setId(iter->id() + 1);
+  }
+  ins->setId(at->id() - 1);
+  block->moveBefore(at, ins);
+}
+
+static bool IsLastUse(MDefinition* ins, MDefinition* input,
+                      MBasicBlock* loopHeader) {
+  if (loopHeader && input->block()->id() < loopHeader->id()) {
+    return false;
+  }
+  for (MUseDefIterator iter(input); iter; iter++) {
+    if (iter.def()->block()->id() > ins->block()->id()) {
+      return false;
+    }
+    if (iter.def()->id() > ins->id()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static void MoveConstantsToStart(MBasicBlock* block,
+                                 MInstruction* insertionPoint) {
+
+  MInstructionIterator iter(block->begin(insertionPoint));
+  while (iter != block->end()) {
+    MInstruction* ins = *iter;
+    iter++;
+
+    if (!ins->isConstant() || !ins->hasOneUse() ||
+        ins->usesBegin()->consumer()->block() != block ||
+        IsFloatingPointType(ins->type())) {
+      continue;
+    }
+
+    MOZ_ASSERT(ins->isMovable());
+    MOZ_ASSERT(insertionPoint != ins);
+
+    block->moveBefore(insertionPoint, ins);
+  }
+}
+
+bool jit::ReorderInstructions(MIRGenerator* mir, MIRGraph& graph) {
+  size_t nextId = 0;
+
+  Vector<MBasicBlock*, 4, SystemAllocPolicy> loopHeaders;
+
+  for (ReversePostorderIterator block(graph.rpoBegin());
+       block != graph.rpoEnd(); block++) {
+    if (mir->shouldCancel("ReorderInstructions (block loop)")) {
+      return false;
+    }
+
+    bool isEntryBlock =
+        *block == graph.entryBlock() || *block == graph.osrBlock();
+
+    MInstruction* insertionPoint = nullptr;
+    if (!isEntryBlock) {
+      insertionPoint = block->safeInsertTop();
+      MoveConstantsToStart(*block, insertionPoint);
+    }
+
+    for (MPhiIterator iter(block->phisBegin()); iter != block->phisEnd();
+         iter++) {
+      iter->setId(nextId++);
+    }
+
+    for (MInstructionIterator iter(block->begin()); iter != block->end();
+         iter++) {
+      iter->setId(nextId++);
+    }
+
+    if (isEntryBlock) {
+      continue;
+    }
+
+    if (block->isLoopHeader()) {
+      if (!loopHeaders.append(*block)) {
+        return false;
+      }
+    }
+
+    MBasicBlock* innerLoop = loopHeaders.empty() ? nullptr : loopHeaders.back();
+
+    MInstructionReverseIterator rtop = ++block->rbegin(insertionPoint);
+    for (MInstructionIterator iter(block->begin(insertionPoint));
+         iter != block->end();) {
+      if (mir->shouldCancel("ReorderInstructions (instruction loop)")) {
+        return false;
+      }
+
+      MInstruction* ins = *iter;
+
+      if (ins->isEffectful() || !ins->isMovable() || ins->resumePoint() ||
+          ins == block->lastIns()) {
+        iter++;
+        continue;
+      }
+
+      Vector<MDefinition*, 4, SystemAllocPolicy> lastUsedInputs;
+      for (size_t i = 0; i < ins->numOperands(); i++) {
+        MDefinition* input = ins->getOperand(i);
+        if (!input->isConstant() && IsLastUse(ins, input, innerLoop)) {
+          if (!lastUsedInputs.append(input)) {
+            return false;
+          }
+        }
+      }
+
+      if (lastUsedInputs.length() < 2) {
+        iter++;
+        continue;
+      }
+
+      MInstruction* target = ins;
+      MInstruction* postCallTarget = nullptr;
+      for (MInstructionReverseIterator riter = ++block->rbegin(ins);
+           riter != rtop; riter++) {
+        MInstruction* prev = *riter;
+        if (prev->isInterruptCheck()) {
+          break;
+        }
+        if (prev->isSetInitializedLength()) {
+          break;
+        }
+
+        bool isUse = false;
+        for (size_t i = 0; i < ins->numOperands(); i++) {
+          if (ins->getOperand(i) == prev) {
+            isUse = true;
+            break;
+          }
+        }
+        if (isUse) {
+          break;
+        }
+
+        if (prev->isEffectful() &&
+            (ins->getAliasSet().flags() & prev->getAliasSet().flags()) &&
+            ins->mightAlias(prev) != MDefinition::AliasType::NoAlias) {
+          break;
+        }
+
+        for (size_t i = 0; i < lastUsedInputs.length();) {
+          bool found = false;
+          for (size_t j = 0; j < prev->numOperands(); j++) {
+            if (prev->getOperand(j) == lastUsedInputs[i]) {
+              found = true;
+              break;
+            }
+          }
+          if (found) {
+            lastUsedInputs[i] = lastUsedInputs.back();
+            lastUsedInputs.popBack();
+          } else {
+            i++;
+          }
+        }
+        if (lastUsedInputs.length() < 2) {
+          break;
+        }
+
+        if (prev->isCallResultCapture()) {
+          if (!postCallTarget) {
+            postCallTarget = target;
+          }
+        } else if (postCallTarget) {
+          MOZ_ASSERT(MWasmCallBase::IsWasmCall(prev) ||
+                     prev->isIonToWasmCall());
+          postCallTarget = nullptr;
+        }
+
+        target = prev;
+      }
+
+      if (postCallTarget) {
+        target = postCallTarget;
+      }
+
+      iter++;
+      MoveBefore(*block, target, ins);
+
+      if (ins->bailoutKind() == BailoutKind::TranspiledCacheIR) {
+        ins->setBailoutKind(BailoutKind::InstructionReordering);
+      }
+    }
+
+    if (block->isLoopBackedge()) {
+      loopHeaders.popBack();
+    }
+  }
+
+  return true;
+}

@@ -1,0 +1,116 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/Assertions.h"
+
+#include "js/LocaleSensitive.h"
+
+#include "nsIObserver.h"
+#include "nsIObserverService.h"
+#include "nsComponentManagerUtils.h"
+#include "nsIPrefService.h"
+#include "nsServiceManagerUtils.h"
+#include "mozilla/Services.h"
+#include "mozilla/CycleCollectedJSRuntime.h"
+#include "mozilla/CycleCollectedJSContext.h"
+#include "mozilla/intl/LocaleService.h"
+#include "mozilla/Preferences.h"
+
+#include "xpcpublic.h"
+#include "xpcprivate.h"
+
+using namespace mozilla;
+using mozilla::intl::LocaleService;
+
+class XPCLocaleObserver : public nsIObserver {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+
+  void Init();
+
+ private:
+  virtual ~XPCLocaleObserver() = default;
+};
+
+NS_IMPL_ISUPPORTS(XPCLocaleObserver, nsIObserver);
+
+void XPCLocaleObserver::Init() {
+  nsCOMPtr<nsIObserverService> observerService =
+      mozilla::services::GetObserverService();
+
+  observerService->AddObserver(this, "intl:app-locales-changed", false);
+}
+
+NS_IMETHODIMP
+XPCLocaleObserver::Observe(nsISupports* aSubject, const char* aTopic,
+                           const char16_t* aData) {
+  if (!strcmp(aTopic, "intl:app-locales-changed")) {
+    JSRuntime* rt = CycleCollectedJSRuntime::Get()->Runtime();
+    if (!xpc_LocalizeRuntime(rt)) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+    return NS_OK;
+  }
+
+  return NS_ERROR_UNEXPECTED;
+}
+
+struct XPCLocaleCallbacks : public JSLocaleCallbacks {
+  XPCLocaleCallbacks() {
+    MOZ_COUNT_CTOR(XPCLocaleCallbacks);
+
+    localeToUpperCase = nullptr;
+    localeToLowerCase = nullptr;
+    localeCompare = nullptr;
+    localeToUnicode = nullptr;
+
+    RefPtr<XPCLocaleObserver> locObs = new XPCLocaleObserver();
+    locObs->Init();
+  }
+
+  ~XPCLocaleCallbacks() {
+    AssertThreadSafety();
+    MOZ_COUNT_DTOR(XPCLocaleCallbacks);
+  }
+
+  static XPCLocaleCallbacks* This(JSRuntime* rt) {
+    const JSLocaleCallbacks* lc = JS_GetLocaleCallbacks(rt);
+    MOZ_ASSERT(lc);
+    MOZ_ASSERT(lc->localeToUpperCase == nullptr);
+    MOZ_ASSERT(lc->localeToLowerCase == nullptr);
+    MOZ_ASSERT(lc->localeCompare == nullptr);
+    MOZ_ASSERT(lc->localeToUnicode == nullptr);
+
+    const XPCLocaleCallbacks* ths = static_cast<const XPCLocaleCallbacks*>(lc);
+    ths->AssertThreadSafety();
+    return const_cast<XPCLocaleCallbacks*>(ths);
+  }
+
+ private:
+  void AssertThreadSafety() const {
+    NS_ASSERT_OWNINGTHREAD(XPCLocaleCallbacks);
+  }
+
+  NS_DECL_OWNINGTHREAD
+};
+
+bool xpc_LocalizeRuntime(JSRuntime* rt) {
+  const JSLocaleCallbacks* lc = JS_GetLocaleCallbacks(rt);
+  if (!lc) {
+    JS_SetLocaleCallbacks(rt, new XPCLocaleCallbacks());
+  }
+
+  AutoTArray<nsCString, 10> rpLocales;
+  LocaleService::GetInstance()->GetRegionalPrefsLocales(rpLocales);
+
+  MOZ_ASSERT(rpLocales.Length() > 0);
+  return JS_SetDefaultLocale(rt, rpLocales[0].get());
+}
+
+void xpc_DelocalizeRuntime(JSRuntime* rt) {
+  const XPCLocaleCallbacks* lc = XPCLocaleCallbacks::This(rt);
+  JS_SetLocaleCallbacks(rt, nullptr);
+  delete lc;
+}

@@ -1,0 +1,204 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_DisplayPortUtils_h_
+#define mozilla_DisplayPortUtils_h_
+
+#include <cstdint>
+#include <iosfwd>
+
+#include "Units.h"
+#include "nsDisplayList.h"
+#include "nsRect.h"
+
+class nsIContent;
+class nsIFrame;
+class nsPresContext;
+
+namespace mozilla {
+
+class nsDisplayListBuilder;
+class PresShell;
+class ScrollContainerFrame;
+
+enum class DisplayportRelativeTo { ScrollPort, ScrollFrame };
+
+enum class ContentGeometryType { Scrolled, Fixed };
+
+struct DisplayPortOptions {
+  DisplayportRelativeTo mRelativeTo = DisplayportRelativeTo::ScrollPort;
+  ContentGeometryType mGeometryType = ContentGeometryType::Scrolled;
+
+  DisplayPortOptions With(DisplayportRelativeTo aRelativeTo) const {
+    DisplayPortOptions result = *this;
+    result.mRelativeTo = aRelativeTo;
+    return result;
+  }
+  DisplayPortOptions With(ContentGeometryType aGeometryType) const {
+    DisplayPortOptions result = *this;
+    result.mGeometryType = aGeometryType;
+    return result;
+  }
+};
+
+struct DisplayPortPropertyData {
+  DisplayPortPropertyData(const nsRect& aRect, uint32_t aPriority,
+                          bool aPainted)
+      : mRect(aRect), mPriority(aPriority), mPainted(aPainted) {}
+  nsRect mRect;
+  uint32_t mPriority;
+  bool mPainted;
+};
+
+struct DisplayPortMargins {
+  ScreenMargin mMargins;
+
+
+  CSSPoint mVisualOffset;
+
+  CSSPoint mLayoutOffset;
+
+  static DisplayPortMargins FromAPZ(const ScreenMargin& aMargins,
+                                    const CSSPoint& aVisualOffset,
+                                    const CSSPoint& aLayoutOffset);
+
+  static DisplayPortMargins ForScrollContainerFrame(
+      ScrollContainerFrame* aScrollContainerFrame,
+      const ScreenMargin& aMargins);
+
+  static DisplayPortMargins ForContent(nsIContent* aContent,
+                                       const ScreenMargin& aMargins);
+
+  static DisplayPortMargins Empty(nsIContent* aContent) {
+    return ForContent(aContent, ScreenMargin());
+  }
+
+  ScreenMargin GetRelativeToLayoutViewport(
+      ContentGeometryType aGeometryType,
+      ScrollContainerFrame* aScrollContainerFrame,
+      const CSSToScreenScale2D& aDisplayportScale) const;
+
+  friend std::ostream& operator<<(std::ostream& aOs,
+                                  const DisplayPortMargins& aMargins);
+
+ private:
+  CSSPoint ComputeAsyncTranslation(
+      ContentGeometryType aGeometryType,
+      ScrollContainerFrame* aScrollContainerFrame) const;
+};
+
+struct DisplayPortMarginsPropertyData {
+  DisplayPortMarginsPropertyData(const DisplayPortMargins& aMargins,
+                                 uint32_t aPriority, bool aPainted)
+      : mMargins(aMargins), mPriority(aPriority), mPainted(aPainted) {}
+  DisplayPortMargins mMargins;
+  uint32_t mPriority;
+  bool mPainted;
+};
+
+struct FrameAndASRKind {
+  nsIFrame* mFrame;
+  ActiveScrolledRoot::ASRKind mASRKind;
+  bool operator==(const FrameAndASRKind&) const = default;
+  static FrameAndASRKind default_value() {
+    return {nullptr, ActiveScrolledRoot::ASRKind::Scroll};
+  }
+};
+
+class DisplayPortUtils {
+ public:
+  static bool GetDisplayPort(
+      nsIContent* aContent, nsRect* aResult,
+      const DisplayPortOptions& aOptions = DisplayPortOptions());
+
+  static bool HasDisplayPort(nsIContent* aContent);
+
+  static bool HasPaintedDisplayPort(nsIContent* aContent);
+
+  static void MarkDisplayPortAsPainted(nsIContent* aContent);
+
+  static bool FrameHasDisplayPort(nsIFrame* aFrame,
+                                  const nsIFrame* aScrolledFrame = nullptr);
+
+  static bool HasNonMinimalDisplayPort(nsIContent* aContent);
+
+  static bool HasNonMinimalNonZeroDisplayPort(nsIContent* aContent);
+
+  static bool IsMissingDisplayPortBaseRect(nsIContent* aContent);
+
+  static bool GetDisplayPortForVisibilityTesting(nsIContent* aContent,
+                                                 nsRect* aResult);
+
+  enum class RepaintMode : uint8_t { Repaint, DoNotRepaint };
+
+  static void InvalidateForDisplayPortChange(
+      nsIContent* aContent, bool aHadDisplayPort, const nsRect& aOldDisplayPort,
+      const nsRect& aNewDisplayPort,
+      RepaintMode aRepaintMode = RepaintMode::Repaint);
+
+  enum class ClearMinimalDisplayPortProperty { No, Yes };
+
+  static bool SetDisplayPortMargins(
+      nsIContent* aContent, PresShell* aPresShell,
+      const DisplayPortMargins& aMargins,
+      ClearMinimalDisplayPortProperty aClearMinimalDisplayPortProperty,
+      uint32_t aPriority = 0, RepaintMode aRepaintMode = RepaintMode::Repaint);
+
+  static void SetDisplayPortBase(nsIContent* aContent, const nsRect& aBase);
+  static void SetDisplayPortBaseIfNotSet(nsIContent* aContent,
+                                         const nsRect& aBase);
+
+  static void RemoveDisplayPort(nsIContent* aContent);
+
+  static void SetMinimalDisplayPortDuringPainting(nsIContent* aContent,
+                                                  PresShell* aPresShell);
+
+  static bool ViewportHasDisplayPort(nsPresContext* aPresContext);
+
+  static bool IsFixedPosFrameInDisplayPort(const nsIFrame* aFrame);
+
+  static bool MaybeCreateDisplayPortInFirstScrollFrameEncountered(
+      nsIFrame* aFrame, nsDisplayListBuilder* aBuilder);
+
+  static bool CalculateAndSetDisplayPortMargins(
+      ScrollContainerFrame* aScrollContainerFrame, RepaintMode aRepaintMode);
+
+  static bool MaybeCreateDisplayPort(
+      nsDisplayListBuilder* aBuilder,
+      ScrollContainerFrame* aScrollContainerFrame, RepaintMode aRepaintMode);
+
+  static void SetZeroMarginDisplayPortOnAsyncScrollableAncestors(
+      nsIFrame* aFrame);
+
+  static void ExpireDisplayPortOnAsyncScrollableAncestor(nsIFrame* aFrame);
+
+  static Maybe<nsRect> GetRootDisplayportBase(PresShell* aPresShell);
+
+  static nsRect GetDisplayportBase(nsIFrame* aFrame);
+
+  static bool WillUseEmptyDisplayPortMargins(nsIContent* aContent);
+
+  static nsIFrame* OneStepInAsyncScrollableAncestorChain(nsIFrame* aFrame);
+
+
+  static FrameAndASRKind GetASRAncestorFrame(FrameAndASRKind aFrameAndASRKind,
+                                             nsDisplayListBuilder* aBuilder);
+
+  static FrameAndASRKind OneStepInASRChain(FrameAndASRKind aFrameAndASRKind,
+                                           nsDisplayListBuilder* aBuilder,
+                                           nsIFrame* aLimitAncestor = nullptr);
+
+  static const ActiveScrolledRoot* ActivateDisplayportOnASRAncestors(
+      nsIFrame* aAnchor, nsIFrame* aLimitAncestor,
+      const ActiveScrolledRoot* aASRofLimitAncestor,
+      nsDisplayListBuilder* aBuilder);
+
+  static bool ShouldAsyncScrollWithAnchor(nsIFrame* aFrame, nsIFrame* aAnchor,
+                                          nsDisplayListBuilder* aBuilder,
+                                          PhysicalAxes aAxes);
+};
+
+}  
+
+#endif  // mozilla_DisplayPortUtils_h_

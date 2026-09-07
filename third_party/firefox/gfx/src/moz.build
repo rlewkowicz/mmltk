@@ -1,0 +1,96 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+XPIDL_SOURCES += [
+    "nsIFontEnumerator.idl",
+]
+
+XPIDL_MODULE = "gfx"
+
+DEFINES["MOZ_APP_VERSION"] = '"%s"' % CONFIG["MOZ_APP_VERSION"]
+
+EXPORTS += [
+    "DriverCrashGuard.h",
+    "FilterDescription.h",
+    "FilterSupport.h",
+    "gfxFeatureStatus.h",
+    "nsBoundingMetrics.h",
+    "nsColor.h",
+    "nsCoord.h",
+    "nsDeviceContext.h",
+    "nsFont.h",
+    "nsFontCache.h",
+    "nsFontMetrics.h",
+    "nsGfxCIID.h",
+    "nsITheme.h",
+    "nsMargin.h",
+    "nsPoint.h",
+    "nsRect.h",
+    "nsRectAbsolute.h",
+    "nsRectIntersectGeneric.h",
+    "nsRegion.h",
+    "nsRegionFwd.h",
+    "nsSize.h",
+    "nsTransform2D.h",
+    "RegionBuilder.h",
+]
+
+EXPORTS.mozilla += [
+    "AppUnits.h",
+    "ArrayView.h",
+    "FontPropertyTypes.h",
+    "RelativeLuminanceUtils.h",
+]
+
+EXPORTS.mozilla.gfx += [
+    "AAStroke.h",
+    "CompositorHitTestInfo.h",
+    "Etagere.h",
+    "WPFGpuRaster.h",
+]
+
+
+UNIFIED_SOURCES += [
+    "DriverCrashGuard.cpp",
+    "FilterSupport.cpp",
+    "gfxFeatureStatus.cpp",
+    "nsColor.cpp",
+    "nsFont.cpp",
+    "nsFontCache.cpp",
+    "nsFontMetrics.cpp",
+    "nsRect.cpp",
+    "nsRegion.cpp",
+    "nsThebesFontEnumerator.cpp",
+    "nsTransform2D.cpp",
+]
+
+# nsDeviceContext.cpp cannot be built in unified mode because it pulls in OS X system headers.
+SOURCES += [
+    "nsDeviceContext.cpp",
+]
+
+XPCOM_MANIFESTS += [
+    "components.conf",
+]
+
+include("/ipc/chromium/chromium-config.mozbuild")
+
+LOCAL_INCLUDES += [
+    "/dom/ipc",  # for ContentChild.h
+    "/gfx/cairo/cairo/src",
+    "/widget",
+]
+
+FINAL_LIBRARY = "xul"
+
+CXXFLAGS += CONFIG["MOZ_GTK3_CFLAGS"]
+CXXFLAGS += CONFIG["MOZ_PANGO_CFLAGS"]
+
+
+if CONFIG["INTEL_ARCHITECTURE"]:
+    if CONFIG["SSE4_2_FLAGS"]:
+        DEFINES["USE_SSE4_2"] = True
+        LOCAL_INCLUDES += ["/third_party/xsimd/include"]
+        SOURCES += ["nsRectIntersectGenericSSE42.cpp"]
+        SOURCES["nsRectIntersectGenericSSE42.cpp"].flags += CONFIG["SSE4_2_FLAGS"]

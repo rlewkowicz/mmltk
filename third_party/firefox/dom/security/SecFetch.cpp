@@ -1,0 +1,343 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "SecFetch.h"
+
+#include "mozIThirdPartyUtil.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/dom/RequestBinding.h"
+#include "nsContentSecurityManager.h"
+#include "nsContentUtils.h"
+#include "nsIHttpChannel.h"
+#include "nsIRedirectHistoryEntry.h"
+#include "nsIReferrerInfo.h"
+#include "nsMixedContentBlocker.h"
+#include "nsNetUtil.h"
+
+nsCString MapInternalContentPolicyTypeToDest(nsContentPolicyType aType) {
+  switch (aType) {
+    case nsIContentPolicy::TYPE_OTHER:
+      return "empty"_ns;
+    case nsIContentPolicy::TYPE_INTERNAL_SCRIPT:
+    case nsIContentPolicy::TYPE_INTERNAL_SCRIPT_PRELOAD:
+    case nsIContentPolicy::TYPE_INTERNAL_MODULE:
+    case nsIContentPolicy::TYPE_INTERNAL_MODULE_PRELOAD:
+    case nsIContentPolicy::TYPE_INTERNAL_WORKER_IMPORT_SCRIPTS:
+    case nsIContentPolicy::TYPE_INTERNAL_CHROMEUTILS_COMPILED_SCRIPT:
+    case nsIContentPolicy::TYPE_INTERNAL_FRAME_MESSAGEMANAGER_SCRIPT:
+    case nsIContentPolicy::TYPE_SCRIPT:
+      return "script"_ns;
+    case nsIContentPolicy::TYPE_JSON:
+    case nsIContentPolicy::TYPE_INTERNAL_JSON_PRELOAD:
+      return "json"_ns;
+    case nsIContentPolicy::TYPE_TEXT:
+    case nsIContentPolicy::TYPE_INTERNAL_TEXT_PRELOAD:
+      return "text"_ns;
+    case nsIContentPolicy::TYPE_INTERNAL_WORKER:
+    case nsIContentPolicy::TYPE_INTERNAL_WORKER_STATIC_MODULE:
+      return "worker"_ns;
+    case nsIContentPolicy::TYPE_INTERNAL_SHARED_WORKER:
+      return "sharedworker"_ns;
+    case nsIContentPolicy::TYPE_INTERNAL_SERVICE_WORKER:
+      return "serviceworker"_ns;
+    case nsIContentPolicy::TYPE_INTERNAL_AUDIOWORKLET:
+      return "audioworklet"_ns;
+    case nsIContentPolicy::TYPE_INTERNAL_PAINTWORKLET:
+      return "paintworklet"_ns;
+    case nsIContentPolicy::TYPE_IMAGESET:
+    case nsIContentPolicy::TYPE_INTERNAL_IMAGE:
+    case nsIContentPolicy::TYPE_INTERNAL_IMAGE_PRELOAD:
+    case nsIContentPolicy::TYPE_INTERNAL_IMAGE_FAVICON:
+    case nsIContentPolicy::TYPE_INTERNAL_IMAGE_NOTIFICATION:
+    case nsIContentPolicy::TYPE_IMAGE:
+      return "image"_ns;
+    case nsIContentPolicy::TYPE_STYLESHEET:
+    case nsIContentPolicy::TYPE_INTERNAL_STYLESHEET:
+    case nsIContentPolicy::TYPE_INTERNAL_STYLESHEET_PRELOAD:
+      return "style"_ns;
+    case nsIContentPolicy::TYPE_OBJECT:
+    case nsIContentPolicy::TYPE_INTERNAL_OBJECT:
+      return "object"_ns;
+    case nsIContentPolicy::TYPE_INTERNAL_EMBED:
+      return "embed"_ns;
+    case nsIContentPolicy::TYPE_DOCUMENT:
+      return "document"_ns;
+    case nsIContentPolicy::TYPE_SUBDOCUMENT:
+    case nsIContentPolicy::TYPE_INTERNAL_IFRAME:
+      return "iframe"_ns;
+    case nsIContentPolicy::TYPE_INTERNAL_FRAME:
+      return "frame"_ns;
+    case nsIContentPolicy::TYPE_PING:
+      return "empty"_ns;
+    case nsIContentPolicy::TYPE_XMLHTTPREQUEST:
+    case nsIContentPolicy::TYPE_INTERNAL_XMLHTTPREQUEST_ASYNC:
+    case nsIContentPolicy::TYPE_INTERNAL_XMLHTTPREQUEST_SYNC:
+      return "empty"_ns;
+    case nsIContentPolicy::TYPE_INTERNAL_EVENTSOURCE:
+      return "empty"_ns;
+    case nsIContentPolicy::TYPE_DTD:
+    case nsIContentPolicy::TYPE_INTERNAL_DTD:
+    case nsIContentPolicy::TYPE_INTERNAL_FORCE_ALLOWED_DTD:
+      return "empty"_ns;
+    case nsIContentPolicy::TYPE_FONT:
+    case nsIContentPolicy::TYPE_INTERNAL_FONT_PRELOAD:
+    case nsIContentPolicy::TYPE_UA_FONT:
+      return "font"_ns;
+    case nsIContentPolicy::TYPE_MEDIA:
+      return "empty"_ns;
+    case nsIContentPolicy::TYPE_INTERNAL_AUDIO:
+      return "audio"_ns;
+    case nsIContentPolicy::TYPE_INTERNAL_VIDEO:
+      return "video"_ns;
+    case nsIContentPolicy::TYPE_INTERNAL_TRACK:
+      return "track"_ns;
+    case nsIContentPolicy::TYPE_WEBSOCKET:
+      return "empty"_ns;
+    case nsIContentPolicy::TYPE_CSP_REPORT:
+      return "report"_ns;
+    case nsIContentPolicy::TYPE_XSLT:
+      return "xslt"_ns;
+    case nsIContentPolicy::TYPE_BEACON:
+      return "empty"_ns;
+    case nsIContentPolicy::TYPE_FETCH:
+    case nsIContentPolicy::TYPE_INTERNAL_FETCH_PRELOAD:
+      return "empty"_ns;
+    case nsIContentPolicy::TYPE_WEB_MANIFEST:
+      return "manifest"_ns;
+    case nsIContentPolicy::TYPE_SAVEAS_DOWNLOAD:
+      return "empty"_ns;
+    case nsIContentPolicy::TYPE_SPECULATIVE:
+      return "empty"_ns;
+    case nsIContentPolicy::TYPE_PROXIED_WEBRTC_MEDIA:
+      return "empty"_ns;
+    case nsIContentPolicy::TYPE_WEB_IDENTITY:
+      return "webidentity"_ns;
+    case nsIContentPolicy::TYPE_WEB_TRANSPORT:
+      return "webtransport"_ns;
+    case nsIContentPolicy::TYPE_INTERNAL_EXTERNAL_RESOURCE:
+      return "image"_ns;
+    case nsIContentPolicy::TYPE_INVALID:
+      break;
+  }
+
+  MOZ_CRASH("Unhandled nsContentPolicyType value");
+}
+
+void IsExpandedPrincipalSameOrigin(
+    nsCOMPtr<nsIExpandedPrincipal> aExpandedPrincipal, nsIURI* aURI,
+    bool* aRes) {
+  *aRes = false;
+  for (const auto& principal : aExpandedPrincipal->AllowList()) {
+    mozilla::BasePrincipal::Cast(principal)->IsSameOrigin(aURI, aRes);
+    return;
+  }
+}
+
+bool IsSameOrigin(nsIHttpChannel* aHTTPChannel) {
+  nsCOMPtr<nsIURI> channelURI;
+  NS_GetFinalChannelURI(aHTTPChannel, getter_AddRefs(channelURI));
+
+  nsCOMPtr<nsILoadInfo> loadInfo = aHTTPChannel->LoadInfo();
+
+  bool isSameOrigin = false;
+  if (nsContentUtils::IsExpandedPrincipal(loadInfo->TriggeringPrincipal())) {
+    nsCOMPtr<nsIExpandedPrincipal> ep =
+        do_QueryInterface(loadInfo->TriggeringPrincipal());
+    IsExpandedPrincipalSameOrigin(ep, channelURI, &isSameOrigin);
+  } else {
+    isSameOrigin = loadInfo->TriggeringPrincipal()->IsSameOrigin(channelURI);
+  }
+
+  if (!isSameOrigin) {
+    return false;
+  }
+
+  nsCOMPtr<nsIPrincipal> redirectPrincipal;
+  for (nsIRedirectHistoryEntry* entry : loadInfo->RedirectChain()) {
+    entry->GetPrincipal(getter_AddRefs(redirectPrincipal));
+    if (redirectPrincipal && !redirectPrincipal->IsSameOrigin(channelURI)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool IsSameSite(nsIChannel* aHTTPChannel) {
+  nsCOMPtr<mozIThirdPartyUtil> thirdPartyUtil =
+      do_GetService(THIRDPARTYUTIL_CONTRACTID);
+  if (!thirdPartyUtil) {
+    return false;
+  }
+
+  nsAutoCString hostDomain;
+  nsCOMPtr<nsILoadInfo> loadInfo = aHTTPChannel->LoadInfo();
+  nsresult rv = loadInfo->TriggeringPrincipal()->GetBaseDomain(hostDomain);
+  (void)NS_WARN_IF(NS_FAILED(rv));
+
+  nsAutoCString channelDomain;
+  nsCOMPtr<nsIURI> channelURI;
+  NS_GetFinalChannelURI(aHTTPChannel, getter_AddRefs(channelURI));
+  rv = thirdPartyUtil->GetBaseDomain(channelURI, channelDomain);
+  (void)NS_WARN_IF(NS_FAILED(rv));
+
+  if (!hostDomain.Equals(channelDomain) ||
+      (!loadInfo->TriggeringPrincipal()->SchemeIs("https") &&
+       !nsMixedContentBlocker::IsPotentiallyTrustworthyLoopbackHost(
+           hostDomain))) {
+    return false;
+  }
+
+  nsCOMPtr<nsIPrincipal> redirectPrincipal;
+  for (nsIRedirectHistoryEntry* entry : loadInfo->RedirectChain()) {
+    entry->GetPrincipal(getter_AddRefs(redirectPrincipal));
+    if (redirectPrincipal) {
+      redirectPrincipal->GetBaseDomain(hostDomain);
+      if (!hostDomain.Equals(channelDomain) ||
+          !redirectPrincipal->SchemeIs("https")) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+bool IsUserTriggeredForSecFetchSite(nsIHttpChannel* aHTTPChannel) {
+  nsCOMPtr<nsILoadInfo> loadInfo = aHTTPChannel->LoadInfo();
+  ExtContentPolicyType contentType = loadInfo->GetExternalContentPolicyType();
+
+  if (loadInfo->TriggeringPrincipal()->IsSystemPrincipal()) {
+    return true;
+  }
+
+  if (contentType != ExtContentPolicy::TYPE_DOCUMENT &&
+      contentType != ExtContentPolicy::TYPE_SUBDOCUMENT) {
+    return false;
+  }
+
+  if (loadInfo->GetLoadTriggeredFromExternal()) {
+    return true;
+  }
+
+  if (!loadInfo->GetHasValidUserGestureActivation()) {
+    return false;
+  }
+
+  if (loadInfo->GetIsMetaRefresh()) {
+    return false;
+  }
+
+  nsCOMPtr<nsIReferrerInfo> referrerInfo = aHTTPChannel->GetReferrerInfo();
+  if (referrerInfo) {
+    nsCOMPtr<nsIURI> originalReferrer;
+    referrerInfo->GetOriginalReferrer(getter_AddRefs(originalReferrer));
+    if (!originalReferrer) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+void mozilla::dom::SecFetch::AddSecFetchDest(nsIHttpChannel* aHTTPChannel) {
+  nsCOMPtr<nsILoadInfo> loadInfo = aHTTPChannel->LoadInfo();
+  nsContentPolicyType contentType = loadInfo->InternalContentPolicyType();
+  nsCString dest = MapInternalContentPolicyTypeToDest(contentType);
+
+  nsresult rv =
+      aHTTPChannel->SetRequestHeader("Sec-Fetch-Dest"_ns, dest, false);
+  (void)NS_WARN_IF(NS_FAILED(rv));
+}
+
+void mozilla::dom::SecFetch::AddSecFetchMode(nsIHttpChannel* aHTTPChannel) {
+  nsCOMPtr<nsILoadInfo> loadInfo = aHTTPChannel->LoadInfo();
+  uint32_t securityMode = loadInfo->GetSecurityMode();
+  ExtContentPolicyType externalType = loadInfo->GetExternalContentPolicyType();
+
+  nsAutoCString mode;
+  if (externalType == ExtContentPolicy::TYPE_DOCUMENT ||
+      externalType == ExtContentPolicy::TYPE_SUBDOCUMENT ||
+      externalType == ExtContentPolicy::TYPE_OBJECT) {
+    mode = "navigate"_ns;
+  } else if (externalType == ExtContentPolicy::TYPE_WEBSOCKET) {
+    mode = "websocket"_ns;
+  } else {
+    mode = GetEnumString(
+        nsContentSecurityManager::SecurityModeToRequestMode(securityMode));
+  }
+
+  nsresult rv =
+      aHTTPChannel->SetRequestHeader("Sec-Fetch-Mode"_ns, mode, false);
+  (void)NS_WARN_IF(NS_FAILED(rv));
+}
+
+void mozilla::dom::SecFetch::AddSecFetchSite(nsIHttpChannel* aHTTPChannel) {
+  nsAutoCString site("same-origin");
+
+  bool isSameOrigin = IsSameOrigin(aHTTPChannel);
+  if (!isSameOrigin) {
+    bool isSameSite = IsSameSite(aHTTPChannel);
+    if (isSameSite) {
+      site = "same-site"_ns;
+    } else {
+      site = "cross-site"_ns;
+    }
+  }
+
+  if (IsUserTriggeredForSecFetchSite(aHTTPChannel)) {
+    site = "none"_ns;
+  }
+
+  nsresult rv =
+      aHTTPChannel->SetRequestHeader("Sec-Fetch-Site"_ns, site, false);
+  (void)NS_WARN_IF(NS_FAILED(rv));
+}
+
+void mozilla::dom::SecFetch::AddSecFetchUser(nsIHttpChannel* aHTTPChannel) {
+  nsCOMPtr<nsILoadInfo> loadInfo = aHTTPChannel->LoadInfo();
+  ExtContentPolicyType externalType = loadInfo->GetExternalContentPolicyType();
+
+  if (externalType != ExtContentPolicy::TYPE_DOCUMENT &&
+      externalType != ExtContentPolicy::TYPE_SUBDOCUMENT) {
+    return;
+  }
+
+  if (!loadInfo->GetLoadTriggeredFromExternal() &&
+      !loadInfo->GetHasValidUserGestureActivation()) {
+    return;
+  }
+
+  nsAutoCString user("?1");
+  nsresult rv =
+      aHTTPChannel->SetRequestHeader("Sec-Fetch-User"_ns, user, false);
+  (void)NS_WARN_IF(NS_FAILED(rv));
+}
+
+void mozilla::dom::SecFetch::AddSecFetchHeader(nsIHttpChannel* aHTTPChannel) {
+  nsCOMPtr<nsIURI> uri;
+  nsresult rv = aHTTPChannel->GetURI(getter_AddRefs(uri));
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return;
+  }
+
+  if (!nsMixedContentBlocker::IsPotentiallyTrustworthyOrigin(uri)) {
+    return;
+  }
+
+  nsCOMPtr<nsILoadInfo> loadInfo = aHTTPChannel->LoadInfo();
+  if (loadInfo->TriggeringPrincipal()->IsSystemPrincipal()) {
+    ExtContentPolicy extType = loadInfo->GetExternalContentPolicyType();
+    if (extType == ExtContentPolicy::TYPE_FETCH ||
+        extType == ExtContentPolicy::TYPE_XMLHTTPREQUEST) {
+      return;
+    }
+  }
+
+  AddSecFetchDest(aHTTPChannel);
+  AddSecFetchMode(aHTTPChannel);
+  AddSecFetchSite(aHTTPChannel);
+  AddSecFetchUser(aHTTPChannel);
+}

@@ -1,0 +1,39 @@
+/*
+ * Copyright 2017 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkShadowTessellator_DEFINED)
+#define SkShadowTessellator_DEFINED
+
+#if !defined(SK_ENABLE_OPTIMIZE_SIZE)
+
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkScalar.h"
+
+#include <functional>
+
+class SkMatrix;
+class SkPath;
+class SkVertices;
+struct SkPoint3;
+
+namespace SkShadowTessellator {
+
+typedef std::function<SkScalar(SkScalar, SkScalar)> HeightFunc;
+
+sk_sp<SkVertices> MakeAmbient(const SkPath& path, const SkMatrix& ctm,
+                              const SkPoint3& zPlane, bool transparent);
+
+sk_sp<SkVertices> MakeSpot(const SkPath& path, const SkMatrix& ctm, const SkPoint3& zPlane,
+                           const SkPoint3& lightPos, SkScalar lightRadius, bool transparent,
+                           bool directional);
+
+
+}  
+
+#endif
+
+#endif

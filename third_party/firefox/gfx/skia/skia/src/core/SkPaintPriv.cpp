@@ -1,0 +1,298 @@
+/*
+ * Copyright 2013 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "src/core/SkPaintPriv.h"
+
+#include "include/core/SkBlendMode.h"
+#include "include/core/SkBlender.h"
+#include "include/core/SkColorFilter.h"
+#include "include/core/SkColorType.h"
+#include "include/core/SkImageFilter.h"
+#include "include/core/SkMaskFilter.h"
+#include "include/core/SkPaint.h"
+#include "include/core/SkPathEffect.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkShader.h"
+#include "include/private/base/SkAssert.h"
+#include "include/private/base/SkDebug.h"
+#include "src/core/SkColorSpacePriv.h"
+#include "src/core/SkPicturePriv.h"
+#include "src/core/SkReadBuffer.h"
+#include "src/core/SkSafeRange.h"
+#include "src/core/SkWriteBuffer.h"
+#include "src/effects/colorfilters/SkColorFilterBase.h"
+#include "src/shaders/SkColorFilterShader.h"
+#include "src/shaders/SkShaderBase.h"
+
+#include <cstdint>
+#include <optional>
+
+class SkColorSpace;
+
+static bool changes_alpha(const SkPaint& paint) {
+    SkColorFilter* cf = paint.getColorFilter();
+    return cf && !as_CFB(cf)->isAlphaUnchanged();
+}
+
+enum SrcColorOpacity {
+    kOpaque_SrcColorOpacity = 0,
+    kTransparentBlack_SrcColorOpacity = 1,
+    kTransparentAlpha_SrcColorOpacity = 2,
+    kUnknown_SrcColorOpacity = 3
+};
+
+static bool blend_mode_is_opaque(SkBlendMode mode, SrcColorOpacity opacityType) {
+    SkBlendModeCoeff src, dst;
+    if (!SkBlendMode_AsCoeff(mode, &src, &dst)) {
+        return false;
+    }
+
+    switch (src) {
+        case SkBlendModeCoeff::kDA:
+        case SkBlendModeCoeff::kDC:
+        case SkBlendModeCoeff::kIDA:
+        case SkBlendModeCoeff::kIDC:
+            return false;
+        default:
+            break;
+    }
+
+    switch (dst) {
+        case SkBlendModeCoeff::kZero:
+            return true;
+        case SkBlendModeCoeff::kISA:
+            return kOpaque_SrcColorOpacity == opacityType;
+        case SkBlendModeCoeff::kSA:
+            return kTransparentBlack_SrcColorOpacity == opacityType ||
+                   kTransparentAlpha_SrcColorOpacity == opacityType;
+        case SkBlendModeCoeff::kSC:
+            return kTransparentBlack_SrcColorOpacity == opacityType;
+        default:
+            return false;
+    }
+}
+
+bool SkPaintPriv::Overwrites(const SkPaint* paint, ShaderOverrideOpacity overrideOpacity) {
+    if (!paint) {
+        return overrideOpacity != kNotOpaque_ShaderOverrideOpacity;
+    }
+
+    SrcColorOpacity opacityType = kUnknown_SrcColorOpacity;
+
+    if (!changes_alpha(*paint)) {
+        const unsigned paintAlpha = paint->getAlpha();
+        if (0xff == paintAlpha && overrideOpacity != kNotOpaque_ShaderOverrideOpacity &&
+            (!paint->getShader() || paint->getShader()->isOpaque())) {
+            opacityType = kOpaque_SrcColorOpacity;
+        } else if (0 == paintAlpha) {
+            if (overrideOpacity == kNone_ShaderOverrideOpacity && !paint->getShader()) {
+                opacityType = kTransparentBlack_SrcColorOpacity;
+            } else {
+                opacityType = kTransparentAlpha_SrcColorOpacity;
+            }
+        }
+    }
+
+    const auto bm = paint->asBlendMode();
+    if (!bm) {
+        return false;   
+    }
+    return blend_mode_is_opaque(bm.value(), opacityType);
+}
+
+bool SkPaintPriv::ShouldDither(const SkPaint& p, SkColorType dstCT) {
+    if (!p.isDither()) {
+        return false;
+    }
+
+    if (dstCT == kUnknown_SkColorType) {
+        return false;
+    }
+
+    if (dstCT == kRGB_565_SkColorType || dstCT == kARGB_4444_SkColorType) {
+        return true;
+    }
+
+    return p.getImageFilter() || p.getMaskFilter() ||
+           (p.getShader() && !as_SB(p.getShader())->isConstant());
+}
+
+static bool just_a_color(const SkPaint& paint, SkColor4f* color) {
+    SkColor4f c = paint.getColor4f();
+
+    const auto* shader = as_SB(paint.getShader());
+    if (shader && !shader->asLuminanceColor(&c)) {
+        return false;
+    }
+    if (paint.getColorFilter()) {
+        SkColorSpace* cs = nullptr;
+        c = paint.getColorFilter()->filterColor4f(c, cs, cs);
+    }
+    if (color) {
+        *color = c;
+    }
+    return true;
+}
+
+SkColor SkPaintPriv::ComputeLuminanceColor(const SkPaint& paint) {
+    SkColor4f c;
+    if (!just_a_color(paint, &c)) {
+        c = { 0.5f, 0.5f, 0.5f, 1.0f};
+    }
+    return c.toSkColor();
+}
+
+void SkPaintPriv::RemoveColorFilter(SkPaint* p, SkColorSpace* dstCS) {
+    if (SkColorFilter* filter = p->getColorFilter()) {
+        if (SkShader* shader = p->getShader()) {
+            p->setShader(SkColorFilterShader::Make(sk_ref_sp(shader),
+                                                   p->getAlphaf(),
+                                                   sk_ref_sp(filter)));
+            p->setAlphaf(1.0f);
+        } else {
+            p->setColor(filter->filterColor4f(p->getColor4f(), sk_srgb_singleton(), dstCS), dstCS);
+        }
+        p->setColorFilter(nullptr);
+    }
+}
+
+#if defined(SK_DEBUG)
+    static void ASSERT_FITS_IN(uint32_t value, int bitCount) {
+        SkASSERT(bitCount > 0 && bitCount <= 32);
+        uint32_t mask = ~0U;
+        mask >>= (32 - bitCount);
+        SkASSERT(0 == (value & ~mask));
+    }
+#else
+    #define ASSERT_FITS_IN(value, bitcount)
+#endif
+
+enum FlatFlags {
+    kHasTypeface_FlatFlag = 0x1,
+    kHasEffects_FlatFlag  = 0x2,
+
+    kFlatFlagMask         = 0x3,
+};
+
+
+template <typename T> uint32_t shift_bits(T value, unsigned shift, unsigned bits) {
+    SkASSERT(shift + bits <= 32);
+    uint32_t v = static_cast<uint32_t>(value);
+    ASSERT_FITS_IN(v, bits);
+    return v << shift;
+}
+
+constexpr uint8_t CUSTOM_BLEND_MODE_SENTINEL = 0xFF;
+
+static uint32_t pack_v68(const SkPaint& paint, unsigned flatFlags) {
+    uint32_t packed = 0;
+    const auto bm = paint.asBlendMode();
+    const unsigned mode = bm ? static_cast<unsigned>(bm.value())
+                             : CUSTOM_BLEND_MODE_SENTINEL;
+
+    packed |= shift_bits(((unsigned)paint.isDither() << 1) |
+                          (unsigned)paint.isAntiAlias(), 0, 8);
+    packed |= shift_bits(mode,                      8, 8);
+    packed |= shift_bits(paint.getStrokeCap(),     16, 2);
+    packed |= shift_bits(paint.getStrokeJoin(),    18, 2);
+    packed |= shift_bits(paint.getStyle(),         20, 2);
+    packed |= shift_bits(0,                        22, 2); 
+    packed |= shift_bits(flatFlags,                24, 8);
+    return packed;
+}
+
+static uint32_t unpack_v68(SkPaint* paint, uint32_t packed, SkSafeRange& safe) {
+    paint->setAntiAlias((packed & 1) != 0);
+    paint->setDither((packed & 2) != 0);
+    packed >>= 8;
+    {
+        unsigned mode = packed & 0xFF;
+        if (mode != CUSTOM_BLEND_MODE_SENTINEL) { 
+            paint->setBlendMode(safe.checkLE(mode, SkBlendMode::kLastMode));
+        }
+    }
+    packed >>= 8;
+    paint->setStrokeCap(safe.checkLE(packed & 0x3, SkPaint::kLast_Cap));
+    packed >>= 2;
+    paint->setStrokeJoin(safe.checkLE(packed & 0x3, SkPaint::kLast_Join));
+    packed >>= 2;
+    paint->setStyle(safe.checkLE(packed & 0x3, SkPaint::kStrokeAndFill_Style));
+    packed >>= 2;
+    packed >>= 2;
+
+    return packed;
+}
+
+void SkPaintPriv::Flatten(const SkPaint& paint, SkWriteBuffer& buffer) {
+    uint8_t flatFlags = 0;
+
+    if (paint.getPathEffect() ||
+        paint.getShader() ||
+        paint.getMaskFilter() ||
+        paint.getColorFilter() ||
+        paint.getImageFilter() ||
+        !paint.asBlendMode()) {
+        flatFlags |= kHasEffects_FlatFlag;
+    }
+
+    buffer.writeScalar(paint.getStrokeWidth());
+    buffer.writeScalar(paint.getStrokeMiter());
+    buffer.writeColor4f(paint.getColor4f());
+
+    buffer.write32(pack_v68(paint, flatFlags));
+
+    if (flatFlags & kHasEffects_FlatFlag) {
+        buffer.writeFlattenable(paint.getPathEffect());
+        buffer.writeFlattenable(paint.getShader());
+        buffer.writeFlattenable(paint.getMaskFilter());
+        buffer.writeFlattenable(paint.getColorFilter());
+        buffer.writeFlattenable(paint.getImageFilter());
+        buffer.writeFlattenable(paint.getBlender());
+    }
+}
+
+SkPaint SkPaintPriv::Unflatten(SkReadBuffer& buffer) {
+    SkPaint paint;
+
+    paint.setStrokeWidth(buffer.readScalar());
+    paint.setStrokeMiter(buffer.readScalar());
+    {
+        SkColor4f color;
+        buffer.readColor4f(&color);
+        paint.setColor(color, sk_srgb_singleton());
+    }
+
+    SkSafeRange safe;
+    unsigned flatFlags = unpack_v68(&paint, buffer.readUInt(), safe);
+
+    if (!(flatFlags & kHasEffects_FlatFlag)) {
+        paint.setPathEffect(nullptr);
+        paint.setShader(nullptr);
+        paint.setMaskFilter(nullptr);
+        paint.setColorFilter(nullptr);
+        paint.setImageFilter(nullptr);
+    } else if (buffer.isVersionLT(SkPicturePriv::kSkBlenderInSkPaint)) {
+        paint.setPathEffect(buffer.readPathEffect());
+        paint.setShader(buffer.readShader());
+        paint.setMaskFilter(buffer.readMaskFilter());
+        paint.setColorFilter(buffer.readColorFilter());
+        (void)buffer.read32();  
+        paint.setImageFilter(buffer.readImageFilter());
+    } else {
+        paint.setPathEffect(buffer.readPathEffect());
+        paint.setShader(buffer.readShader());
+        paint.setMaskFilter(buffer.readMaskFilter());
+        paint.setColorFilter(buffer.readColorFilter());
+        paint.setImageFilter(buffer.readImageFilter());
+        paint.setBlender(buffer.readBlender());
+    }
+
+    if (!buffer.validate(safe.ok())) {
+        paint.reset();
+    }
+    return paint;
+}

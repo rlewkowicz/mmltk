@@ -1,0 +1,47 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_StreamUtils_h
+#define mozilla_dom_StreamUtils_h
+
+#include "mozilla/ErrorResult.h"
+#include "mozilla/dom/Promise.h"
+
+class nsIGlobalObject;
+
+namespace mozilla::dom {
+
+struct QueuingStrategy;
+
+double ExtractHighWaterMark(const QueuingStrategy& aStrategy,
+                            double aDefaultHWM, ErrorResult& aRv);
+
+template <typename T>
+MOZ_CAN_RUN_SCRIPT static already_AddRefed<Promise> PromisifyAlgorithm(
+    nsIGlobalObject* aGlobal, T aFunc, mozilla::ErrorResult& aRv) {
+  RefPtr<Promise> result;
+  if constexpr (!std::is_same_v<decltype(aFunc(aRv)), void>) {
+    result = aFunc(aRv);
+  } else {
+    aFunc(aRv);
+  }
+
+  if (aRv.IsUncatchableException()) {
+    return nullptr;
+  }
+
+  if (aRv.Failed()) {
+    return Promise::CreateRejectedWithErrorResult(aGlobal, aRv);
+  }
+
+  if (result) {
+    return result.forget();
+  }
+
+  return Promise::CreateResolvedWithUndefined(aGlobal, aRv);
+}
+
+}  
+
+#endif  // mozilla_dom_StreamUtils_h

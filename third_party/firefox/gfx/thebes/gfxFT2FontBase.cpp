@@ -1,0 +1,686 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "gfxFT2FontBase.h"
+#include "gfxFT2Utils.h"
+#include "harfbuzz/hb.h"
+#include "mozilla/Likely.h"
+#include "mozilla/StaticPrefs_gfx.h"
+#include "gfxFontConstants.h"
+#include "gfxFontUtils.h"
+#include "gfxHarfBuzzShaper.h"
+#include <algorithm>
+#include <dlfcn.h>
+#include <limits>
+
+#include FT_TRUETYPE_TAGS_H
+#include FT_TRUETYPE_TABLES_H
+#include FT_ADVANCES_H
+#include FT_MULTIPLE_MASTERS_H
+
+#ifndef FT_LOAD_COLOR
+#  define FT_LOAD_COLOR (1L << 20)
+#endif
+#ifndef FT_FACE_FLAG_COLOR
+#  define FT_FACE_FLAG_COLOR (1L << 14)
+#endif
+
+using namespace mozilla;
+using namespace mozilla::gfx;
+
+gfxFT2FontBase::gfxFT2FontBase(
+    const RefPtr<UnscaledFontFreeType>& aUnscaledFont,
+    RefPtr<mozilla::gfx::SharedFTFace>&& aFTFace, gfxFontEntry* aFontEntry,
+    const gfxFontStyle* aFontStyle, int aLoadFlags, bool aEmbolden)
+    : gfxFont(aUnscaledFont, aFontEntry, aFontStyle, kAntialiasDefault),
+      mFTFace(std::move(aFTFace)),
+      mFTLoadFlags(aLoadFlags | FT_LOAD_IGNORE_GLOBAL_ADVANCE_WIDTH |
+                   FT_LOAD_COLOR),
+      mEmbolden(aEmbolden),
+      mFTSize(0.0) {}
+
+gfxFT2FontBase::~gfxFT2FontBase() { mFTFace->ForgetLockOwner(this); }
+
+FT_Face gfxFT2FontBase::LockFTFace() const
+    MOZ_CAPABILITY_ACQUIRE(mFTFace) MOZ_NO_THREAD_SAFETY_ANALYSIS {
+  if (!mFTFace->Lock(this)) {
+    FT_Set_Transform(mFTFace->GetFace(), nullptr, nullptr);
+
+    FT_F26Dot6 charSize =
+        (int32_t)std::min(std::max(mFTSize * 64.0 + 0.5, 0.0),
+                          (double)std::numeric_limits<int32_t>::max());
+    FT_Error error =
+        FT_Set_Char_Size(mFTFace->GetFace(), charSize, charSize, 0, 0);
+    if (error) {
+      return nullptr;
+    }
+  }
+  return mFTFace->GetFace();
+}
+
+void gfxFT2FontBase::UnlockFTFace() const
+    MOZ_CAPABILITY_RELEASE(mFTFace) MOZ_NO_THREAD_SAFETY_ANALYSIS {
+  mFTFace->Unlock();
+}
+
+static FT_ULong GetTableSizeFromFTFace(SharedFTFace* aFace,
+                                       uint32_t aTableTag) {
+  if (!aFace) {
+    return 0;
+  }
+  FT_ULong len = 0;
+  if (FT_Load_Sfnt_Table(aFace->GetFace(), aTableTag, 0, nullptr, &len) != 0) {
+    return 0;
+  }
+  return len;
+}
+
+bool gfxFT2FontEntryBase::FaceHasTable(SharedFTFace* aFace,
+                                       uint32_t aTableTag) {
+  return GetTableSizeFromFTFace(aFace, aTableTag) > 0;
+}
+
+nsresult gfxFT2FontEntryBase::CopyFaceTable(SharedFTFace* aFace,
+                                            uint32_t aTableTag,
+                                            nsTArray<uint8_t>& aBuffer) {
+  FT_ULong length = GetTableSizeFromFTFace(aFace, aTableTag);
+  if (!length) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+  if (!aBuffer.SetLength(length, fallible)) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+  if (FT_Load_Sfnt_Table(aFace->GetFace(), aTableTag, 0, aBuffer.Elements(),
+                         &length) != 0) {
+    aBuffer.Clear();
+    return NS_ERROR_FAILURE;
+  }
+  return NS_OK;
+}
+
+uint32_t gfxFT2FontEntryBase::GetGlyph(uint32_t aCharCode,
+                                       gfxFT2FontBase* aFont) {
+  const uint32_t slotIndex = aCharCode % kNumCmapCacheSlots;
+  {
+    AutoReadLock lock(mLock);
+    if (mCmapCache) {
+      const auto& slot = mCmapCache[slotIndex];
+      if (slot.mCharCode == aCharCode) {
+        return slot.mGlyphIndex;
+      }
+    }
+  }
+
+  AutoWriteLock lock(mLock);
+
+  if (!mCmapCache) {
+    mCmapCache = mozilla::MakeUnique<CmapCacheSlot[]>(kNumCmapCacheSlots);
+
+    mCmapCache[0].mCharCode = 1;
+  }
+
+  auto& slot = mCmapCache[slotIndex];
+  if (slot.mCharCode != aCharCode) {
+    slot.mCharCode = aCharCode;
+    slot.mGlyphIndex = gfxFT2LockedFace(aFont).GetGlyph(aCharCode);
+  }
+  return slot.mGlyphIndex;
+}
+
+size_t gfxFT2FontEntryBase::ComputedSizeOfExcludingThis(
+    MallocSizeOf aMallocSizeOf) {
+  size_t result = gfxFontEntry::ComputedSizeOfExcludingThis(aMallocSizeOf);
+
+  if (const auto* data = GetUserFontData()) {
+    if (data->FontData()) {
+      result += aMallocSizeOf(data->FontData());
+    }
+  }
+
+  return result;
+}
+
+static inline FT_Long ScaleRoundDesignUnits(FT_Short aDesignMetric,
+                                            FT_Fixed aScale) {
+  FT_Long fixed26dot6 = FT_MulFix(aDesignMetric, aScale);
+  return ROUND_26_6_TO_INT(fixed26dot6);
+}
+
+static void SnapLineToPixels(gfxFloat& aOffset, gfxFloat& aSize) {
+  gfxFloat snappedSize = std::max(floor(aSize + 0.5), 1.0);
+  gfxFloat offset = aOffset - 0.5 * (aSize - snappedSize);
+  aOffset = floor(offset + 0.5);
+  aSize = snappedSize;
+}
+
+static inline gfxRect ScaleGlyphBounds(const IntRect& aBounds,
+                                       gfxFloat aScale) {
+  return gfxRect(FLOAT_FROM_26_6(aBounds.x) * aScale,
+                 FLOAT_FROM_26_6(aBounds.y) * aScale,
+                 FLOAT_FROM_26_6(aBounds.width) * aScale,
+                 FLOAT_FROM_26_6(aBounds.height) * aScale);
+}
+
+uint32_t gfxFT2FontBase::GetCharExtents(uint32_t aChar, gfxFloat* aWidth,
+                                        gfxRect* aBounds) {
+  FT_UInt gid = GetGlyph(aChar);
+  int32_t width;
+  IntRect bounds;
+  if (gid && GetFTGlyphExtents(gid, aWidth ? &width : nullptr,
+                               aBounds ? &bounds : nullptr)) {
+    if (aWidth) {
+      *aWidth = FLOAT_FROM_16_16(width);
+    }
+    if (aBounds) {
+      *aBounds = ScaleGlyphBounds(bounds, GetAdjustedSize() / mFTSize);
+    }
+    return gid;
+  } else {
+    return 0;
+  }
+}
+
+static double FindClosestSize(FT_Face aFace, double aSize) {
+  if (aSize < 1.0) {
+    aSize = 1.0;
+  }
+  if (FT_IS_SCALABLE(aFace)) {
+    return aSize;
+  }
+  double bestDist = DBL_MAX;
+  FT_Int bestSize = -1;
+  for (FT_Int i = 0; i < aFace->num_fixed_sizes; i++) {
+    double dist = aFace->available_sizes[i].y_ppem / 64.0 - aSize;
+    if (bestDist < 0 ? dist >= bestDist : fabs(dist) <= bestDist) {
+      bestDist = dist;
+      bestSize = i;
+    }
+  }
+  if (bestSize < 0) {
+    return aSize;
+  }
+  return aFace->available_sizes[bestSize].y_ppem / 64.0;
+}
+
+void gfxFT2FontBase::InitMetrics() {
+  mFUnitsConvFactor = 0.0;
+
+  if (MOZ_UNLIKELY(mStyle.AdjustedSizeMustBeZero())) {
+    memset(&mMetrics, 0, sizeof(mMetrics));  
+    mSpaceGlyph = GetGlyph(' ');
+    return;
+  }
+
+  if (FontSizeAdjust::Tag(mStyle.sizeAdjustBasis) !=
+          FontSizeAdjust::Tag::None &&
+      mStyle.sizeAdjust >= 0.0 && GetAdjustedSize() > 0.0 && mFTSize == 0.0) {
+    mFTSize = 1.0;
+    InitMetrics();
+    gfxFloat aspect;
+    switch (FontSizeAdjust::Tag(mStyle.sizeAdjustBasis)) {
+      default:
+        MOZ_ASSERT_UNREACHABLE("unhandled sizeAdjustBasis?");
+        aspect = 0.0;
+        break;
+      case FontSizeAdjust::Tag::ExHeight:
+        aspect = mMetrics.xHeight / mAdjustedSize;
+        break;
+      case FontSizeAdjust::Tag::CapHeight:
+        aspect = mMetrics.capHeight / mAdjustedSize;
+        break;
+      case FontSizeAdjust::Tag::ChWidth:
+        aspect =
+            mMetrics.zeroWidth > 0.0 ? mMetrics.zeroWidth / mAdjustedSize : 0.5;
+        break;
+      case FontSizeAdjust::Tag::IcWidth:
+      case FontSizeAdjust::Tag::IcHeight: {
+        bool vertical = FontSizeAdjust::Tag(mStyle.sizeAdjustBasis) ==
+                        FontSizeAdjust::Tag::IcHeight;
+        gfxFloat advance = GetCharAdvance(kWaterIdeograph, vertical);
+        aspect = advance > 0.0 ? advance / mAdjustedSize : 1.0;
+        break;
+      }
+    }
+    if (aspect > 0.0) {
+      delete mHarfBuzzShaper.exchange(nullptr);
+      mAdjustedSize = mStyle.GetAdjustedSize(aspect);
+      mFTFace->ForgetLockOwner(this);
+    }
+  }
+
+  mAdjustedSize = GetAdjustedSize();
+
+  mFTSize = FindClosestSize(mFTFace->GetFace(), GetAdjustedSize());
+
+  FT_Face face = LockFTFace();
+
+  if (MOZ_UNLIKELY(!face)) {
+    const gfxFloat emHeight = GetAdjustedSize();
+    mMetrics.emHeight = emHeight;
+    mMetrics.maxAscent = mMetrics.emAscent = 0.8 * emHeight;
+    mMetrics.maxDescent = mMetrics.emDescent = 0.2 * emHeight;
+    mMetrics.maxHeight = emHeight;
+    mMetrics.internalLeading = 0.0;
+    mMetrics.externalLeading = 0.2 * emHeight;
+    const gfxFloat spaceWidth = 0.5 * emHeight;
+    mMetrics.spaceWidth = spaceWidth;
+    mMetrics.maxAdvance = spaceWidth;
+    mMetrics.aveCharWidth = spaceWidth;
+    mMetrics.zeroWidth = spaceWidth;
+    mMetrics.ideographicWidth = emHeight;
+    const gfxFloat xHeight = 0.5 * emHeight;
+    mMetrics.xHeight = xHeight;
+    mMetrics.capHeight = mMetrics.maxAscent;
+    const gfxFloat underlineSize = emHeight / 14.0;
+    mMetrics.underlineSize = underlineSize;
+    mMetrics.underlineOffset = -underlineSize;
+    mMetrics.strikeoutOffset = 0.25 * emHeight;
+    mMetrics.strikeoutSize = underlineSize;
+
+    SanitizeMetrics(&mMetrics, false);
+    UnlockFTFace();
+    return;
+  }
+
+  const FT_Size_Metrics& ftMetrics = face->size->metrics;
+
+  mMetrics.maxAscent = FLOAT_FROM_26_6(ftMetrics.ascender);
+  mMetrics.maxDescent = -FLOAT_FROM_26_6(ftMetrics.descender);
+  mMetrics.maxAdvance = FLOAT_FROM_26_6(ftMetrics.max_advance);
+  gfxFloat lineHeight = FLOAT_FROM_26_6(ftMetrics.height);
+
+  if (mMetrics.maxDescent < 0.0) {
+    mMetrics.maxDescent = -mMetrics.maxDescent;
+  }
+
+  gfxFloat emHeight;
+  gfxFloat yScale = 0.0;
+  if (FT_IS_SCALABLE(face)) {
+    mFUnitsConvFactor = FLOAT_FROM_26_6(FLOAT_FROM_16_16(ftMetrics.x_scale));
+    yScale = FLOAT_FROM_26_6(FLOAT_FROM_16_16(ftMetrics.y_scale));
+    emHeight = face->units_per_EM * yScale;
+  } else {  
+    emHeight = ftMetrics.y_ppem;
+    if (const TT_Header* head =
+            static_cast<TT_Header*>(FT_Get_Sfnt_Table(face, ft_sfnt_head))) {
+      gfxFloat emUnit = head->Units_Per_EM;
+      mFUnitsConvFactor = ftMetrics.x_ppem / emUnit;
+      if (face->face_flags & FT_FACE_FLAG_COLOR) {
+        emHeight = GetAdjustedSize();
+        gfxFloat adjustScale = emHeight / ftMetrics.y_ppem;
+        mMetrics.maxAscent *= adjustScale;
+        mMetrics.maxDescent *= adjustScale;
+        mMetrics.maxAdvance *= adjustScale;
+        lineHeight *= adjustScale;
+        mFUnitsConvFactor *= adjustScale;
+      }
+      yScale = emHeight / emUnit;
+    }
+  }
+
+  TT_OS2* os2 = static_cast<TT_OS2*>(FT_Get_Sfnt_Table(face, ft_sfnt_os2));
+
+  if (os2 && os2->sTypoAscender && yScale > 0.0) {
+    mMetrics.emAscent = os2->sTypoAscender * yScale;
+    mMetrics.emDescent = -os2->sTypoDescender * yScale;
+    FT_Short typoHeight =
+        os2->sTypoAscender - os2->sTypoDescender + os2->sTypoLineGap;
+    lineHeight = typoHeight * yScale;
+
+    const uint16_t kUseTypoMetricsMask = 1 << 7;
+    if ((os2->fsSelection & kUseTypoMetricsMask) ||
+        (mMetrics.maxAscent == 0.0 && mMetrics.maxDescent == 0.0)) {
+      mMetrics.maxAscent = NS_round(mMetrics.emAscent);
+      mMetrics.maxDescent = NS_round(mMetrics.emDescent);
+    }
+  } else {
+    mMetrics.emAscent = mMetrics.maxAscent;
+    mMetrics.emDescent = mMetrics.maxDescent;
+  }
+
+  if (face->underline_position && face->underline_thickness && yScale > 0.0) {
+    mMetrics.underlineSize = face->underline_thickness * yScale;
+    TT_Postscript* post =
+        static_cast<TT_Postscript*>(FT_Get_Sfnt_Table(face, ft_sfnt_post));
+    if (post && post->underlinePosition) {
+      mMetrics.underlineOffset = post->underlinePosition * yScale;
+    } else {
+      mMetrics.underlineOffset =
+          face->underline_position * yScale + 0.5 * mMetrics.underlineSize;
+    }
+  } else {  
+    mMetrics.underlineSize = emHeight / 14.0;
+    mMetrics.underlineOffset = -mMetrics.underlineSize;
+  }
+
+  if (os2 && os2->yStrikeoutSize && os2->yStrikeoutPosition && yScale > 0.0) {
+    mMetrics.strikeoutSize = os2->yStrikeoutSize * yScale;
+    mMetrics.strikeoutOffset = os2->yStrikeoutPosition * yScale;
+  } else {  
+    mMetrics.strikeoutSize = mMetrics.underlineSize;
+    mMetrics.strikeoutOffset =
+        emHeight * 409.0 / 2048.0 + 0.5 * mMetrics.strikeoutSize;
+  }
+  SnapLineToPixels(mMetrics.strikeoutOffset, mMetrics.strikeoutSize);
+
+  if (os2 && os2->sxHeight && yScale > 0.0) {
+    mMetrics.xHeight = os2->sxHeight * yScale;
+  }
+
+  if (os2 && os2->xAvgCharWidth) {
+    mMetrics.aveCharWidth =
+        ScaleRoundDesignUnits(os2->xAvgCharWidth, ftMetrics.x_scale);
+  } else {
+    mMetrics.aveCharWidth = 0.0;  
+  }
+
+  if (os2 && os2->sCapHeight && yScale > 0.0) {
+    mMetrics.capHeight = os2->sCapHeight * yScale;
+  }
+
+  UnlockFTFace();
+
+  gfxFloat width;
+  mSpaceGlyph = GetCharExtents(' ', &width);
+  if (mSpaceGlyph) {
+    mMetrics.spaceWidth = width;
+  } else {
+    mMetrics.spaceWidth = mMetrics.maxAdvance;  
+  }
+
+  if (GetCharExtents('0', &width)) {
+    mMetrics.zeroWidth = width;
+  } else {
+    mMetrics.zeroWidth = -1.0;  
+  }
+
+  if (GetCharExtents(kWaterIdeograph, &width)) {
+    mMetrics.ideographicWidth = width;
+  } else {
+    mMetrics.ideographicWidth = -1.0;
+  }
+
+  gfxFloat xWidth;
+  gfxRect xBounds;
+  if (mMetrics.xHeight == 0.0) {
+    if (GetCharExtents('x', &xWidth, &xBounds) && xBounds.y < 0.0) {
+      mMetrics.xHeight = -xBounds.y;
+      mMetrics.aveCharWidth = std::max(mMetrics.aveCharWidth, xWidth);
+    } else {
+      mMetrics.xHeight = 0.5 * emHeight;
+    }
+  }
+
+  if (mMetrics.capHeight == 0.0) {
+    if (GetCharExtents('H', nullptr, &xBounds) && xBounds.y < 0.0) {
+      mMetrics.capHeight = -xBounds.y;
+    } else {
+      mMetrics.capHeight = mMetrics.maxAscent;
+    }
+  }
+
+  mMetrics.aveCharWidth = std::max(mMetrics.aveCharWidth, mMetrics.zeroWidth);
+  if (mMetrics.aveCharWidth == 0.0) {
+    mMetrics.aveCharWidth = mMetrics.spaceWidth;
+  }
+  mMetrics.maxAdvance = std::max(mMetrics.maxAdvance, mMetrics.aveCharWidth);
+
+  mMetrics.maxHeight = mMetrics.maxAscent + mMetrics.maxDescent;
+
+  mMetrics.emHeight = floor(emHeight + 0.5);
+
+  mMetrics.internalLeading =
+      floor(mMetrics.maxHeight - mMetrics.emHeight + 0.5);
+
+  lineHeight = floor(std::max(lineHeight, mMetrics.maxHeight) + 0.5);
+  mMetrics.externalLeading =
+      lineHeight - mMetrics.internalLeading - mMetrics.emHeight;
+
+  gfxFloat sum = mMetrics.emAscent + mMetrics.emDescent;
+  mMetrics.emAscent =
+      sum > 0.0 ? mMetrics.emAscent * mMetrics.emHeight / sum : 0.0;
+  mMetrics.emDescent = mMetrics.emHeight - mMetrics.emAscent;
+
+  SanitizeMetrics(&mMetrics, false);
+
+#if 0
+
+    fprintf (stderr, "Font: %s\n", GetName().get());
+    fprintf (stderr, "    emHeight: %f emAscent: %f emDescent: %f\n", mMetrics.emHeight, mMetrics.emAscent, mMetrics.emDescent);
+    fprintf (stderr, "    maxAscent: %f maxDescent: %f\n", mMetrics.maxAscent, mMetrics.maxDescent);
+    fprintf (stderr, "    internalLeading: %f externalLeading: %f\n", mMetrics.externalLeading, mMetrics.internalLeading);
+    fprintf (stderr, "    spaceWidth: %f aveCharWidth: %f xHeight: %f\n", mMetrics.spaceWidth, mMetrics.aveCharWidth, mMetrics.xHeight);
+    fprintf (stderr, "    ideographicWidth: %f\n", mMetrics.ideographicWidth);
+    fprintf (stderr, "    uOff: %f uSize: %f stOff: %f stSize: %f\n", mMetrics.underlineOffset, mMetrics.underlineSize, mMetrics.strikeoutOffset, mMetrics.strikeoutSize);
+#endif
+}
+
+uint32_t gfxFT2FontBase::GetGlyph(uint32_t unicode,
+                                  uint32_t variation_selector) {
+  if (variation_selector) {
+    uint32_t id =
+        gfxFT2LockedFace(this).GetUVSGlyph(unicode, variation_selector);
+    if (id) {
+      return id;
+    }
+    unicode = gfxFontUtils::GetUVSFallback(unicode, variation_selector);
+    if (unicode) {
+      return GetGlyph(unicode);
+    }
+    return 0;
+  }
+
+  return GetGlyph(unicode);
+}
+
+bool gfxFT2FontBase::ShouldRoundXOffset(cairo_t* aCairo) const {
+  return MOZ_UNLIKELY(
+             StaticPrefs::
+                 gfx_text_subpixel_position_force_disabled_AtStartup()) ||
+         aCairo != nullptr || !mFTFace || !FT_IS_SCALABLE(mFTFace->GetFace()) ||
+         (mFTLoadFlags & FT_LOAD_MONOCHROME) ||
+         !((mFTLoadFlags & FT_LOAD_NO_HINTING) ||
+           FT_LOAD_TARGET_MODE(mFTLoadFlags) == FT_RENDER_MODE_LIGHT ||
+           MOZ_UNLIKELY(
+               StaticPrefs::
+                   gfx_text_subpixel_position_force_enabled_AtStartup()));
+}
+
+FT_Vector gfxFT2FontBase::GetEmboldenStrength(FT_Face aFace) const {
+  FT_Vector strength = {0, 0};
+  if (!mEmbolden) {
+    return strength;
+  }
+
+  if (aFace->glyph->format == FT_GLYPH_FORMAT_OUTLINE) {
+    strength.x =
+        FT_MulFix(aFace->units_per_EM, aFace->size->metrics.y_scale) / 48;
+    strength.y = strength.x;
+    return strength;
+  }
+
+  strength.x =
+      FT_MulFix(aFace->units_per_EM, aFace->size->metrics.y_scale) / 24;
+  strength.y = strength.x;
+  if (aFace->glyph->format == FT_GLYPH_FORMAT_BITMAP) {
+    strength.x &= -64;
+    if (!strength.x) {
+      strength.x = 64;
+    }
+    strength.y &= -64;
+  }
+  return strength;
+}
+
+bool gfxFT2FontBase::GetFTGlyphExtents(uint16_t aGID, int32_t* aAdvance,
+                                       IntRect* aBounds) {
+  gfxFT2LockedFace face(this);
+  MOZ_ASSERT(face.get());
+  if (!face.get()) {
+    NS_WARNING("failed to get FT_Face!");
+    return false;
+  }
+
+  FT_Int32 flags = mFTLoadFlags;
+  if (!aBounds) {
+    flags |= FT_LOAD_ADVANCE_ONLY;
+  }
+
+  bool roundX = ShouldRoundXOffset(nullptr);
+
+  if (!roundX &&
+      GetFontEntry()->HasFontTable(TRUETYPE_TAG('S', 'V', 'G', ' '))) {
+    flags &= ~FT_LOAD_COLOR;
+  }
+
+  if (Factory::LoadFTGlyph(face.get(), aGID, flags) != FT_Err_Ok) {
+    NS_WARNING("failed to load glyph!");
+    return false;
+  }
+
+  bool hintMetrics = ShouldHintMetrics();
+  bool unhintedY = (mFTLoadFlags & FT_LOAD_NO_HINTING) != 0;
+  bool unhintedX =
+      unhintedY || FT_LOAD_TARGET_MODE(mFTLoadFlags) == FT_RENDER_MODE_LIGHT;
+
+  gfxFloat extentsScale = GetAdjustedSize() / mFTSize;
+
+  FT_Vector bold = GetEmboldenStrength(face.get());
+
+  if (aAdvance) {
+    FT_Fixed advance;
+    if (!roundX || FT_HAS_MULTIPLE_MASTERS(face.get())) {
+      advance = face.get()->glyph->linearHoriAdvance;
+    } else {
+      advance = face.get()->glyph->advance.x << 10;  
+    }
+    if (advance) {
+      advance += bold.x << 10;  
+    }
+    if (hintMetrics && roundX && unhintedX) {
+      advance = (advance + 0x8000) & 0xffff0000u;
+    }
+    *aAdvance = NS_lround(advance * extentsScale);
+  }
+
+  if (aBounds) {
+    const FT_Glyph_Metrics& metrics = face.get()->glyph->metrics;
+    FT_F26Dot6 x = metrics.horiBearingX;
+    FT_F26Dot6 y = -metrics.horiBearingY;
+    FT_F26Dot6 x2 = x + metrics.width;
+    FT_F26Dot6 y2 = y + metrics.height;
+    y -= bold.y;
+    x2 += bold.x;
+    if (hintMetrics) {
+      if (roundX && unhintedX) {
+        x &= -64;
+        x2 = (x2 + 63) & -64;
+      }
+      if (unhintedY) {
+        y &= -64;
+        y2 = (y2 + 63) & -64;
+      }
+    }
+    *aBounds = IntRect(x, y, x2 - x, y2 - y);
+
+    if (aBounds->IsEmpty() &&
+        GetFontEntry()->HasFontTable(TRUETYPE_TAG('C', 'O', 'L', 'R'))) {
+      const auto& fm = GetMetrics(nsFontMetrics::eHorizontal);
+      aBounds->y = int32_t(-NS_round(fm.maxAscent * 64.0));
+      aBounds->height =
+          int32_t(NS_round((fm.maxAscent + fm.maxDescent) * 64.0));
+      aBounds->x = 0;
+      aBounds->width =
+          int32_t(aAdvance ? *aAdvance : NS_round(fm.maxAdvance * 64.0));
+    }
+  }
+
+  return true;
+}
+
+gfxFT2FontBase::GlyphMetrics gfxFT2FontBase::GetCachedGlyphMetrics(
+    uint16_t aGID, IntRect* aBounds) {
+  {
+    AutoReadLock lock(mLock);
+    if (mGlyphMetrics) {
+      if (auto metrics = mGlyphMetrics->Lookup(aGID)) {
+        return metrics.Data();
+      }
+    }
+  }
+
+  AutoWriteLock lock(mLock);
+  if (!mGlyphMetrics) {
+    mGlyphMetrics =
+        mozilla::MakeUnique<nsTHashMap<nsUint32HashKey, GlyphMetrics>>(128);
+  }
+
+  return mGlyphMetrics->LookupOrInsertWith(aGID, [&] {
+    GlyphMetrics metrics;
+    IntRect bounds;
+    if (GetFTGlyphExtents(aGID, &metrics.mAdvance, &bounds)) {
+      metrics.SetBounds(bounds);
+      if (aBounds) {
+        *aBounds = bounds;
+      }
+    }
+    return metrics;
+  });
+}
+
+bool gfxFT2FontBase::GetGlyphBounds(uint16_t aGID, gfxRect* aBounds,
+                                    bool aTight) {
+  IntRect bounds;
+  const GlyphMetrics metrics = GetCachedGlyphMetrics(aGID, &bounds);
+  if (!metrics.HasValidBounds()) {
+    return false;
+  }
+  if (metrics.HasCachedBounds()) {
+    bounds = metrics.GetBounds();
+  } else if (bounds.IsEmpty() && !GetFTGlyphExtents(aGID, nullptr, &bounds)) {
+    return false;
+  }
+  *aBounds = ScaleGlyphBounds(bounds, GetAdjustedSize() / mFTSize);
+  return true;
+}
+
+void gfxFT2FontBase::SetupVarCoords(
+    FT_MM_Var* aMMVar, const nsTArray<gfxFontVariation>& aVariations,
+    FT_Face aFTFace) {
+  if (!aMMVar) {
+    return;
+  }
+
+  nsTArray<FT_Fixed> coords;
+  for (unsigned i = 0; i < aMMVar->num_axis; ++i) {
+    coords.AppendElement(aMMVar->axis[i].def);
+    for (const auto& v : aVariations) {
+      if (aMMVar->axis[i].tag == v.mTag) {
+        FT_Fixed val = v.mValue * 0x10000;
+        val = std::min(val, aMMVar->axis[i].maximum);
+        val = std::max(val, aMMVar->axis[i].minimum);
+        coords[i] = val;
+        break;
+      }
+    }
+  }
+
+  if (!coords.IsEmpty()) {
+#if MOZ_TREE_FREETYPE
+    FT_Set_Var_Design_Coordinates(aFTFace, coords.Length(), coords.Elements());
+#else
+    typedef FT_Error (*SetCoordsFunc)(FT_Face, FT_UInt, FT_Fixed*);
+    static SetCoordsFunc setCoords;
+    static bool firstTime = true;
+    if (firstTime) {
+      firstTime = false;
+      setCoords =
+          (SetCoordsFunc)dlsym(RTLD_DEFAULT, "FT_Set_Var_Design_Coordinates");
+    }
+    if (setCoords) {
+      (*setCoords)(aFTFace, coords.Length(), coords.Elements());
+    }
+#endif
+  }
+}

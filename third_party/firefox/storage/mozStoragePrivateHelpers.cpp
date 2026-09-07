@@ -1,0 +1,260 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "sqlite3.h"
+
+#include "jsfriendapi.h"
+
+#include "nsPrintfCString.h"
+#include "nsString.h"
+#include "nsError.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/CondVar.h"
+#include "nsThreadUtils.h"
+#include "nsJSUtils.h"
+#include "nsIInterfaceRequestorUtils.h"
+
+#include "Variant.h"
+#include "mozStoragePrivateHelpers.h"
+#include "mozIStorageCompletionCallback.h"
+
+#include "mozilla/Logging.h"
+extern mozilla::LazyLogModule gStorageLog;
+
+namespace mozilla {
+namespace storage {
+
+bool isErrorCode(int aSQLiteResultCode) {
+  int rc = aSQLiteResultCode & 0xFF;
+
+  return rc != SQLITE_OK && rc != SQLITE_ROW && rc != SQLITE_DONE;
+}
+
+nsresult convertResultCode(int aSQLiteResultCode) {
+  int rc = aSQLiteResultCode & 0xFF;
+
+  switch (rc) {
+    case SQLITE_OK:
+    case SQLITE_ROW:
+    case SQLITE_DONE:
+      return NS_OK;
+    case SQLITE_CORRUPT:
+    case SQLITE_NOTADB:
+      return NS_ERROR_FILE_CORRUPTED;
+    case SQLITE_PERM:
+    case SQLITE_CANTOPEN:
+      return NS_ERROR_FILE_ACCESS_DENIED;
+    case SQLITE_PROTOCOL:  
+    case SQLITE_BUSY:
+      return NS_ERROR_STORAGE_BUSY;
+    case SQLITE_LOCKED:
+      return NS_ERROR_FILE_IS_LOCKED;
+    case SQLITE_READONLY:
+      return NS_ERROR_FILE_READ_ONLY;
+    case SQLITE_IOERR:
+      return NS_ERROR_STORAGE_IOERR;
+    case SQLITE_FULL:
+    case SQLITE_NOLFS:
+    case SQLITE_TOOBIG:
+      return NS_ERROR_FILE_NO_DEVICE_SPACE;
+    case SQLITE_NOMEM:
+      return NS_ERROR_OUT_OF_MEMORY;
+    case SQLITE_MISMATCH:
+    case SQLITE_MISUSE:
+    case SQLITE_RANGE:
+      return NS_ERROR_UNEXPECTED;
+    case SQLITE_ABORT:
+    case SQLITE_INTERRUPT:
+      return NS_ERROR_ABORT;
+    case SQLITE_CONSTRAINT:
+      return NS_ERROR_STORAGE_CONSTRAINT;
+  }
+
+#ifdef DEBUG
+  nsAutoCString message;
+  message.AppendLiteral("SQLite returned error code ");
+  message.AppendInt(rc);
+  message.AppendLiteral(" , Storage will convert it to NS_ERROR_FAILURE");
+  NS_WARNING_ASSERTION(rc == SQLITE_ERROR, message.get());
+#endif
+  return NS_ERROR_FAILURE;
+}
+
+void checkAndLogStatementPerformance(sqlite3_stmt* aStatement) {
+  int count = ::sqlite3_stmt_status(aStatement, SQLITE_STMTSTATUS_SORT, 1);
+  if (count <= 0) return;
+
+  const char* sql = ::sqlite3_sql(aStatement);
+
+  if (::strstr(sql, "/* do not warn (bug ")) return;
+
+  if (::strstr(sql, "CREATE INDEX") || ::strstr(sql, "CREATE UNIQUE INDEX")) {
+    return;
+  }
+
+#define STORAGE_WARNINGS_URL \
+  "https://firefox-source-docs.mozilla.org/storage/warnings.html"
+  NS_WARNING(nsPrintfCString("Suboptimal indexes for the SQL statement `%s` "
+                             "[%d sort operation(s)] (" STORAGE_WARNINGS_URL
+                             ").",
+                             sql, count)
+                 .get());
+#undef STORAGE_WARNINGS_URL
+}
+
+already_AddRefed<nsIVariant> convertJSValToVariant(JSContext* aCtx,
+                                                   const JS::Value& aValue) {
+  if (aValue.isInt32()) {
+    return MakeAndAddRef<IntegerVariant>(aValue.toInt32());
+  }
+
+  if (aValue.isDouble()) {
+    return MakeAndAddRef<FloatVariant>(aValue.toDouble());
+  }
+
+  if (aValue.isString()) {
+    nsAutoJSString value;
+    if (!value.init(aCtx, aValue.toString())) {
+      return nullptr;
+    }
+    return MakeAndAddRef<TextVariant>(value);
+  }
+
+  if (aValue.isBoolean()) {
+    return MakeAndAddRef<IntegerVariant>(aValue.isTrue() ? 1 : 0);
+  }
+
+  if (aValue.isNull()) {
+    return MakeAndAddRef<NullVariant>();
+  }
+
+  if (aValue.isObject()) {
+    JS::Rooted<JSObject*> obj(aCtx, &aValue.toObject());
+    bool valid;
+    if (!js::DateIsValid(aCtx, obj, &valid) || !valid) {
+      return nullptr;
+    }
+
+    double msecd;
+    if (!js::DateGetMsecSinceEpoch(aCtx, obj, &msecd)) {
+      return nullptr;
+    }
+
+    msecd *= 1000.0;
+    int64_t msec = msecd;
+
+    return MakeAndAddRef<IntegerVariant>(msec);
+  }
+
+  return nullptr;
+}
+
+already_AddRefed<Variant_base> convertVariantToStorageVariant(
+    nsIVariant* aVariant) {
+  nsCOMPtr<nsIInterfaceRequestor> variant = do_QueryInterface(aVariant);
+  if (variant) {
+    RefPtr<Variant_base> variantObj = do_GetInterface(variant);
+    if (variantObj) {
+      return variantObj.forget();
+    }
+  }
+
+  if (!aVariant) {
+    return MakeAndAddRef<NullVariant>();
+  }
+
+  uint16_t dataType = aVariant->GetDataType();
+
+  switch (dataType) {
+    case nsIDataType::VTYPE_BOOL:
+    case nsIDataType::VTYPE_INT8:
+    case nsIDataType::VTYPE_INT16:
+    case nsIDataType::VTYPE_INT32:
+    case nsIDataType::VTYPE_UINT8:
+    case nsIDataType::VTYPE_UINT16:
+    case nsIDataType::VTYPE_UINT32:
+    case nsIDataType::VTYPE_INT64:
+    case nsIDataType::VTYPE_UINT64: {
+      int64_t v;
+      nsresult rv = aVariant->GetAsInt64(&v);
+      NS_ENSURE_SUCCESS(rv, nullptr);
+      return MakeAndAddRef<IntegerVariant>(v);
+    }
+    case nsIDataType::VTYPE_FLOAT:
+    case nsIDataType::VTYPE_DOUBLE: {
+      double v;
+      nsresult rv = aVariant->GetAsDouble(&v);
+      NS_ENSURE_SUCCESS(rv, nullptr);
+      return MakeAndAddRef<FloatVariant>(v);
+    }
+    case nsIDataType::VTYPE_CHAR:
+    case nsIDataType::VTYPE_CHAR_STR:
+    case nsIDataType::VTYPE_STRING_SIZE_IS:
+    case nsIDataType::VTYPE_UTF8STRING:
+    case nsIDataType::VTYPE_CSTRING: {
+      nsCString v;
+      nsresult rv = aVariant->GetAsAUTF8String(v);
+      NS_ENSURE_SUCCESS(rv, nullptr);
+      return MakeAndAddRef<UTF8TextVariant>(v);
+    }
+    case nsIDataType::VTYPE_WCHAR:
+    case nsIDataType::VTYPE_WCHAR_STR:
+    case nsIDataType::VTYPE_WSTRING_SIZE_IS:
+    case nsIDataType::VTYPE_ASTRING: {
+      nsString v;
+      nsresult rv = aVariant->GetAsAString(v);
+      NS_ENSURE_SUCCESS(rv, nullptr);
+      return MakeAndAddRef<TextVariant>(v);
+    }
+    case nsIDataType::VTYPE_EMPTY:
+    case nsIDataType::VTYPE_EMPTY_ARRAY:
+    case nsIDataType::VTYPE_VOID:
+      return MakeAndAddRef<NullVariant>();
+    case nsIDataType::VTYPE_ARRAY: {
+      uint16_t type;
+      nsIID iid;
+      uint32_t len;
+      void* rawArray;
+      nsresult rv = aVariant->GetAsArray(&type, &iid, &len, &rawArray);
+      NS_ENSURE_SUCCESS(rv, nullptr);
+      if (type == nsIDataType::VTYPE_UINT8) {
+        std::pair<uint8_t*, int> v(static_cast<uint8_t*>(rawArray), len);
+        return MakeAndAddRef<AdoptedBlobVariant>(v);
+      }
+      [[fallthrough]];
+    }
+    case nsIDataType::VTYPE_ID:
+    case nsIDataType::VTYPE_INTERFACE:
+    case nsIDataType::VTYPE_INTERFACE_IS:
+    default:
+      NS_WARNING(
+          nsPrintfCString("Unsupported variant type: %d", dataType).get());
+      MOZ_ASSERT_UNREACHABLE("Tried to bind an unsupported Variant type");
+      return nullptr;
+  }
+}
+
+namespace {
+class CallbackEvent : public Runnable {
+ public:
+  explicit CallbackEvent(mozIStorageCompletionCallback* aCallback)
+      : Runnable("storage::CallbackEvent"), mCallback(aCallback) {}
+
+  NS_IMETHOD Run() override {
+    (void)mCallback->Complete(NS_OK, nullptr);
+    return NS_OK;
+  }
+
+ private:
+  nsCOMPtr<mozIStorageCompletionCallback> mCallback;
+};
+}  
+already_AddRefed<nsIRunnable> newCompletionEvent(
+    mozIStorageCompletionCallback* aCallback) {
+  NS_ASSERTION(aCallback, "Passing a null callback is a no-no!");
+  return MakeAndAddRef<CallbackEvent>(aCallback);
+}
+
+}  
+}  

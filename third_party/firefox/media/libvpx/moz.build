@@ -1,0 +1,69 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+include('sources.mozbuild')
+
+if CONFIG['VPX_USE_NASM']:
+    USE_NASM = True
+
+# Linux, Mac and Win share file lists for x86* but not configurations.
+EXPORTS.vpx += files['LINUX_X64_EXPORTS']
+SOURCES += files['LINUX_X64_SOURCES']
+ASFLAGS += [ '-I%s/media/libvpx/config/linux/x64/' % TOPSRCDIR ]
+LOCAL_INCLUDES += [ '/media/libvpx/config/linux/x64/' ]
+
+# We allow warnings for third-party code that can be updated from upstream.
+AllowCompilerWarnings()
+
+FINAL_LIBRARY = 'gkcodecs'
+NoVisibilityFlags()
+
+DEFINES['HAVE_CONFIG_H'] = 'vpx_config.h'
+
+
+for f in SOURCES:
+    if f.endswith('.c'):
+        if 'mmx.c' in f:
+            SOURCES[f].flags += ['-mmmx']
+        if 'sse2.c' in f:
+            SOURCES[f].flags += CONFIG['SSE2_FLAGS']
+        if 'ssse3.c' in f:
+            SOURCES[f].flags += ['-mssse3']
+        if 'sse4.c' in f:
+            SOURCES[f].flags += ['-msse4.1']
+        if 'avx.c' in f:
+            SOURCES[f].flags += ['-mavx']
+        if 'avx2.c' in f:
+            SOURCES[f].flags += ['-mavx2']
+        if 'neon_dotprod.c' in f:
+            SOURCES[f].flags += ['-march=armv8.2-a+dotprod']
+        if 'neon_i8mm.c' in f:
+            SOURCES[f].flags += ['-march=armv8.2-a+dotprod+i8mm']
+        if 'sve.c' in f:
+            SOURCES[f].flags += ['-march=armv8.2-a+dotprod+i8mm+sve']
+        if 'sve2.c' in f:
+            SOURCES[f].flags += ['-march=armv9-a+sve2']
+        if 'lsx.c' in f:
+            SOURCES[f].flags += ['-mlsx']
+
+# Suppress warnings in third-party code.
+CFLAGS += [
+    '-Wno-sign-compare',
+    '-Wno-unused-function', # so many of these warnings; just ignore them
+]
+CFLAGS += [
+    '-Wno-unreachable-code',
+    '-Wno-unneeded-internal-declaration',
+]
+
+ASFLAGS += CONFIG['VPX_ASFLAGS']
+ASFLAGS += [
+    '-I./',
+    '-I%s/media/libvpx/libvpx/' % TOPSRCDIR,
+]
+
+LOCAL_INCLUDES += [
+    '/media/libvpx/config', # vpx_version.h
+    '/media/libvpx/libvpx',
+]

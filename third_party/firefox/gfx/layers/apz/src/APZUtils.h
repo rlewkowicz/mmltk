@@ -1,0 +1,196 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_APZUtils_h
+#define mozilla_layers_APZUtils_h
+
+
+#include <stdint.h>  // for uint32_t
+#include "gfxTypes.h"
+#include "FrameMetrics.h"
+#include "LayersTypes.h"
+#include "UnitTransforms.h"
+#include "mozilla/gfx/CompositorHitTestInfo.h"
+#include "mozilla/gfx/Point.h"
+#include "mozilla/layers/APZPublicUtils.h"  // for DispatchToContent
+#include "mozilla/EnumSet.h"
+#include "mozilla/FloatingPoint.h"
+
+namespace mozilla {
+
+namespace layers {
+
+enum CancelAnimationFlags : uint32_t {
+  Default = 0,                    
+  ExcludeOverscroll = (1 << 0),   
+  ScrollSnap = (1 << 1),          
+  TriggeredExternally = (1 << 2), 
+  ExcludeAutoscroll = (1 << 3)    
+};
+
+inline CancelAnimationFlags operator|(CancelAnimationFlags a,
+                                      CancelAnimationFlags b) {
+  return static_cast<CancelAnimationFlags>(static_cast<int>(a) |
+                                           static_cast<int>(b));
+}
+
+// clang-format off
+enum class ScrollSource {
+  Touchscreen,
+
+  Touchpad,
+
+  Wheel,
+
+  Keyboard,
+};
+// clang-format on
+
+inline bool ScrollSourceRespectsDisregardedDirections(ScrollSource aSource) {
+  return aSource == ScrollSource::Wheel || aSource == ScrollSource::Touchpad;
+}
+
+inline bool ScrollSourceAllowsOverscroll(ScrollSource aSource) {
+  return aSource == ScrollSource::Touchpad ||
+         aSource == ScrollSource::Touchscreen;
+}
+
+const CSSCoord COORDINATE_EPSILON = 0.01f;
+
+inline bool IsZero(const CSSPoint& aPoint) {
+  return FuzzyEqualsAdditive(aPoint.x, CSSCoord(), COORDINATE_EPSILON) &&
+         FuzzyEqualsAdditive(aPoint.y, CSSCoord(), COORDINATE_EPSILON);
+}
+
+struct AsyncTransform {
+  explicit AsyncTransform(
+      LayerToParentLayerScale aScale = LayerToParentLayerScale(),
+      ParentLayerPoint aTranslation = ParentLayerPoint())
+      : mScale(aScale), mTranslation(aTranslation) {}
+
+  operator AsyncTransformComponentMatrix() const {
+    return AsyncTransformComponentMatrix::Scaling(mScale.scale, mScale.scale, 1)
+        .PostTranslate(mTranslation.x, mTranslation.y, 0);
+  }
+
+  bool operator==(const AsyncTransform& rhs) const {
+    return mTranslation == rhs.mTranslation && mScale == rhs.mScale;
+  }
+
+  bool operator!=(const AsyncTransform& rhs) const { return !(*this == rhs); }
+
+  LayerToParentLayerScale mScale;
+  ParentLayerPoint mTranslation;
+};
+
+inline AsyncTransformMatrix CompleteAsyncTransform(
+    const AsyncTransformComponentMatrix& aMatrix) {
+  return ViewAs<AsyncTransformMatrix>(
+      aMatrix, PixelCastJustification::MultipleAsyncTransforms);
+}
+
+enum class FastPathApzAwareListener : bool { No, Yes };
+
+struct TargetConfirmationFlags final {
+  explicit TargetConfirmationFlags(bool aTargetConfirmed)
+      : mTargetConfirmed(aTargetConfirmed),
+        mRequiresTargetConfirmation(false),
+        mHitScrollbar(false),
+        mHitScrollThumb(false),
+        mDispatchToContent(false),
+        mFastPathApzAwareListener(false) {}
+
+  explicit TargetConfirmationFlags(
+      const gfx::CompositorHitTestInfo& aHitTestInfo,
+      FastPathApzAwareListener aFastPathApzAwareListener =
+          FastPathApzAwareListener::No)
+      : mTargetConfirmed(
+            (aHitTestInfo != gfx::CompositorHitTestInvisibleToHit) &&
+            (aHitTestInfo & gfx::CompositorHitTestDispatchToContent).isEmpty()),
+        mRequiresTargetConfirmation(aHitTestInfo.contains(
+            gfx::CompositorHitTestFlags::eRequiresTargetConfirmation)),
+        mHitScrollbar(
+            aHitTestInfo.contains(gfx::CompositorHitTestFlags::eScrollbar)),
+        mHitScrollThumb(aHitTestInfo.contains(
+            gfx::CompositorHitTestFlags::eScrollbarThumb)),
+        mDispatchToContent(
+            !(aHitTestInfo & gfx::CompositorHitTestDispatchToContent)
+                 .isEmpty()),
+        mFastPathApzAwareListener(aFastPathApzAwareListener ==
+                                  FastPathApzAwareListener::Yes) {}
+
+  DispatchToContent NeedDispatchToContent() const {
+    return mDispatchToContent ? DispatchToContent::Yes : DispatchToContent::No;
+  }
+
+  bool IsFastPathApzAwareDispatchToContent() const {
+    return mDispatchToContent && mFastPathApzAwareListener;
+  }
+
+  bool mTargetConfirmed : 1;
+  bool mRequiresTargetConfirmation : 1;
+  bool mHitScrollbar : 1;
+  bool mHitScrollThumb : 1;
+  bool mDispatchToContent : 1;
+  bool mFastPathApzAwareListener : 1;
+};
+
+enum class AsyncTransformComponent { eLayout, eVisual };
+
+using AsyncTransformComponents = EnumSet<AsyncTransformComponent>;
+
+constexpr AsyncTransformComponents LayoutAndVisual(
+    AsyncTransformComponent::eLayout, AsyncTransformComponent::eVisual);
+
+enum class AsyncTransformConsumer {
+  eForEventHandling,
+  eForCompositing,
+};
+
+enum class HandoffConsumer { Scrolling, PullToRefresh };
+
+namespace apz {
+
+inline bool IsCloseToHorizontal(const ParentLayerPoint& aVector,
+                                float aThreshold) {
+  if (aVector == ParentLayerPoint()) {
+    return false;
+  }
+  float angle = float(fabs(atan2(aVector.y, aVector.x)));
+  return angle < aThreshold || angle > (M_PI - aThreshold);
+}
+
+inline bool IsCloseToVertical(const ParentLayerPoint& aVector,
+                              float aThreshold) {
+  if (aVector == ParentLayerPoint()) {
+    return false;
+  }
+  float angle = float(fabs(atan2(aVector.y, aVector.x)));
+  return fabs(angle - float(M_PI / 2)) < aThreshold;
+}
+
+bool IsStuckAtBottom(gfxFloat aTranslation,
+                     const LayerRectAbsolute& aInnerRange,
+                     const LayerRectAbsolute& aOuterRange);
+
+bool IsStuckAtTop(gfxFloat aTranslation, const LayerRectAbsolute& aInnerRange,
+                  const LayerRectAbsolute& aOuterRange);
+
+bool AboutToCheckerboard(const FrameMetrics& aPaintedMetrics,
+                         const FrameMetrics& aCompositorMetrics);
+
+SideBits GetOverscrollSideBits(const ParentLayerPoint& aOverscrollAmount);
+
+enum class SingleTapState : uint8_t {
+  NotClick,          
+  WasClick,          
+  NotYetDetermined,  
+};
+
+}  
+
+}  
+}  
+
+#endif  // mozilla_layers_APZUtils_h

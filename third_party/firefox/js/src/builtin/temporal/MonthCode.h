@@ -1,0 +1,381 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef builtin_temporal_MonthCode_h
+#define builtin_temporal_MonthCode_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/EnumSet.h"
+
+#include <compare>
+#include <initializer_list>
+#include <stddef.h>
+#include <stdint.h>
+#include <string_view>
+#include <utility>
+
+#include "jstypes.h"
+
+#include "builtin/temporal/Calendar.h"
+
+namespace js::temporal {
+
+class MonthCode final {
+ public:
+  enum class Code {
+    Invalid = 0,
+
+    M01 = 1,
+    M02,
+    M03,
+    M04,
+    M05,
+    M06,
+    M07,
+    M08,
+    M09,
+    M10,
+    M11,
+    M12,
+
+    M13,
+
+    M01L,
+    M02L,
+    M03L,
+    M04L,
+    M05L,
+    M06L,
+    M07L,
+    M08L,
+    M09L,
+    M10L,
+    M11L,
+    M12L,
+  };
+
+ private:
+  static constexpr int32_t toLeapMonth =
+      static_cast<int32_t>(Code::M01L) - static_cast<int32_t>(Code::M01);
+
+  Code code_ = Code::Invalid;
+
+ public:
+  constexpr MonthCode() = default;
+
+  constexpr explicit MonthCode(Code code) : code_(code) {}
+
+  constexpr explicit MonthCode(int32_t month, bool isLeapMonth = false) {
+    MOZ_ASSERT(1 <= month && month <= 13);
+    MOZ_ASSERT_IF(isLeapMonth, 1 <= month && month <= 12);
+
+    code_ = static_cast<Code>(month + (isLeapMonth ? toLeapMonth : 0));
+  }
+
+  constexpr auto code() const { return code_; }
+
+  constexpr int32_t ordinal() const {
+    int32_t ordinal = static_cast<int32_t>(code_);
+    if (isLeapMonth()) {
+      ordinal -= toLeapMonth;
+    }
+    return ordinal;
+  }
+
+  constexpr bool isLeapMonth() const { return code_ >= Code::M01L; }
+
+  constexpr auto operator<=>(const MonthCode& other) const {
+    if (ordinal() != other.ordinal()) {
+      return ordinal() <=> other.ordinal();
+    }
+    return code_ <=> other.code_;
+  }
+
+  constexpr bool operator==(const MonthCode&) const = default;
+
+  constexpr explicit operator std::string_view() const {
+    constexpr const char* name =
+        "M01L"
+        "M02L"
+        "M03L"
+        "M04L"
+        "M05L"
+        "M06L"
+        "M07L"
+        "M08L"
+        "M09L"
+        "M10L"
+        "M11L"
+        "M12L"
+        "M13";
+    size_t index = (ordinal() - 1) * 4;
+    size_t length = 3 + isLeapMonth();
+    return {name + index, length};
+  }
+
+  constexpr static auto maxNonLeapMonth() { return MonthCode{Code::M13}; }
+
+  constexpr static auto maxLeapMonth() { return MonthCode{Code::M12L}; }
+};
+
+class MonthCodes final {
+  mozilla::EnumSet<MonthCode::Code> monthCodes_{
+      MonthCode::Code::M01, MonthCode::Code::M02, MonthCode::Code::M03,
+      MonthCode::Code::M04, MonthCode::Code::M05, MonthCode::Code::M06,
+      MonthCode::Code::M07, MonthCode::Code::M08, MonthCode::Code::M09,
+      MonthCode::Code::M10, MonthCode::Code::M11, MonthCode::Code::M12,
+  };
+
+ public:
+  constexpr MOZ_IMPLICIT MonthCodes(std::initializer_list<MonthCode> list) {
+    for (auto value : list) {
+      monthCodes_ += value.code();
+    }
+  }
+
+  constexpr bool contains(MonthCode monthCode) const {
+    return monthCodes_.contains(monthCode.code());
+  }
+
+  constexpr bool contains(const MonthCodes& monthCodes) const {
+    return monthCodes_.contains(monthCodes.monthCodes_);
+  }
+};
+
+namespace monthcodes {
+inline constexpr MonthCodes ISO8601 = {};
+
+inline constexpr MonthCodes ChineseOrDangi = {
+    MonthCode{1,  true},
+    MonthCode{2,  true},
+    MonthCode{3,  true},
+    MonthCode{4,  true},
+    MonthCode{5,  true},
+    MonthCode{6,  true},
+    MonthCode{7,  true},
+    MonthCode{8,  true},
+    MonthCode{9,  true},
+    MonthCode{10,  true},
+    MonthCode{11,  true},
+    MonthCode{12,  true},
+};
+
+inline constexpr MonthCodes CopticOrEthiopian = {
+    MonthCode{13},
+};
+
+inline constexpr MonthCodes Hebrew = {
+    MonthCode{5,  true},
+};
+}  
+
+constexpr auto& CalendarMonthCodes(CalendarId id) {
+  switch (id) {
+    case CalendarId::ISO8601:
+    case CalendarId::Buddhist:
+    case CalendarId::Gregorian:
+    case CalendarId::Indian:
+    case CalendarId::IslamicCivil:
+    case CalendarId::IslamicTabular:
+    case CalendarId::IslamicUmmAlQura:
+    case CalendarId::Persian:
+    case CalendarId::Japanese:
+    case CalendarId::ROC:
+      return monthcodes::ISO8601;
+
+    case CalendarId::Chinese:
+    case CalendarId::Dangi:
+      return monthcodes::ChineseOrDangi;
+
+    case CalendarId::Coptic:
+    case CalendarId::Ethiopian:
+    case CalendarId::EthiopianAmeteAlem:
+      return monthcodes::CopticOrEthiopian;
+
+    case CalendarId::Hebrew:
+      return monthcodes::Hebrew;
+  }
+  MOZ_CRASH("invalid calendar id");
+}
+
+constexpr bool IsValidMonthCodeForCalendar(CalendarId id, MonthCode monthCode) {
+  return CalendarMonthCodes(id).contains(monthCode);
+}
+
+constexpr bool CalendarHasLeapMonths(CalendarId id) {
+  switch (id) {
+    case CalendarId::ISO8601:
+    case CalendarId::Buddhist:
+    case CalendarId::Coptic:
+    case CalendarId::Ethiopian:
+    case CalendarId::EthiopianAmeteAlem:
+    case CalendarId::Gregorian:
+    case CalendarId::Indian:
+    case CalendarId::IslamicCivil:
+    case CalendarId::IslamicTabular:
+    case CalendarId::IslamicUmmAlQura:
+    case CalendarId::Japanese:
+    case CalendarId::Persian:
+    case CalendarId::ROC:
+      return false;
+
+    case CalendarId::Chinese:
+    case CalendarId::Dangi:
+    case CalendarId::Hebrew:
+      return true;
+  }
+  MOZ_CRASH("invalid calendar id");
+}
+
+constexpr bool CalendarHasEpagomenalMonths(CalendarId id) {
+  switch (id) {
+    case CalendarId::ISO8601:
+    case CalendarId::Buddhist:
+    case CalendarId::Chinese:
+    case CalendarId::Dangi:
+    case CalendarId::Gregorian:
+    case CalendarId::Hebrew:
+    case CalendarId::Indian:
+    case CalendarId::IslamicCivil:
+    case CalendarId::IslamicTabular:
+    case CalendarId::IslamicUmmAlQura:
+    case CalendarId::Japanese:
+    case CalendarId::Persian:
+    case CalendarId::ROC:
+      return false;
+
+    case CalendarId::Coptic:
+    case CalendarId::Ethiopian:
+    case CalendarId::EthiopianAmeteAlem:
+      return true;
+  }
+  MOZ_CRASH("invalid calendar id");
+}
+
+constexpr int32_t CalendarMonthsPerYear(CalendarId id) {
+  if (CalendarHasLeapMonths(id) || CalendarHasEpagomenalMonths(id)) {
+    return 13;
+  }
+  return 12;
+}
+
+constexpr std::pair<int32_t, int32_t> CalendarDaysInMonth(CalendarId id) {
+  switch (id) {
+    case CalendarId::ISO8601:
+    case CalendarId::Buddhist:
+    case CalendarId::Gregorian:
+    case CalendarId::Japanese:
+    case CalendarId::ROC:
+      return {28, 31};
+
+    case CalendarId::Chinese:
+    case CalendarId::Dangi:
+    case CalendarId::Hebrew:
+    case CalendarId::IslamicCivil:
+    case CalendarId::IslamicTabular:
+    case CalendarId::IslamicUmmAlQura:
+      return {29, 30};
+
+    case CalendarId::Coptic:
+    case CalendarId::Ethiopian:
+    case CalendarId::EthiopianAmeteAlem:
+      return {5, 30};
+
+    case CalendarId::Indian:
+      return {30, 31};
+
+    case CalendarId::Persian:
+      return {29, 31};
+  }
+  MOZ_CRASH("invalid calendar id");
+}
+
+constexpr std::pair<int32_t, int32_t> ISODaysInMonth(MonthCode monthCode) {
+  int32_t ordinal = monthCode.ordinal();
+  if (ordinal == 2) {
+    return {28, 29};
+  }
+  if (ordinal == 4 || ordinal == 6 || ordinal == 9 || ordinal == 11) {
+    return {30, 30};
+  }
+  return {31, 31};
+}
+
+constexpr std::pair<int32_t, int32_t> CalendarDaysInMonth(CalendarId id,
+                                                          MonthCode monthCode) {
+  switch (id) {
+    case CalendarId::ISO8601:
+    case CalendarId::Buddhist:
+    case CalendarId::Gregorian:
+    case CalendarId::Japanese:
+    case CalendarId::ROC:
+      return ISODaysInMonth(monthCode);
+
+    case CalendarId::Chinese:
+    case CalendarId::Dangi:
+      return {29, 30};
+
+    case CalendarId::Coptic:
+    case CalendarId::Ethiopian:
+    case CalendarId::EthiopianAmeteAlem: {
+      if (monthCode.ordinal() <= 12) {
+        return {30, 30};
+      }
+      return {5, 6};
+    }
+
+    case CalendarId::Hebrew: {
+      int32_t ordinal = monthCode.ordinal();
+      if (ordinal == 2 || ordinal == 3) {
+        return {29, 30};
+      }
+      if ((ordinal & 1) == 1 || monthCode.isLeapMonth()) {
+        return {30, 30};
+      }
+      return {29, 29};
+    }
+
+    case CalendarId::Indian: {
+      int32_t ordinal = monthCode.ordinal();
+      if (ordinal == 1) {
+        return {30, 31};
+      }
+      if (ordinal <= 6) {
+        return {31, 31};
+      }
+      return {30, 30};
+    }
+
+    case CalendarId::IslamicUmmAlQura:
+      return {29, 30};
+
+    case CalendarId::IslamicCivil:
+    case CalendarId::IslamicTabular: {
+      int32_t ordinal = monthCode.ordinal();
+      if ((ordinal & 1) == 1) {
+        return {30, 30};
+      }
+      if (ordinal < 12) {
+        return {29, 29};
+      }
+      return {29, 30};
+    }
+
+    case CalendarId::Persian: {
+      int32_t ordinal = monthCode.ordinal();
+      if (ordinal <= 6) {
+        return {31, 31};
+      }
+      if (ordinal <= 11) {
+        return {30, 30};
+      }
+      return {29, 30};
+    }
+  }
+  MOZ_CRASH("invalid calendar id");
+}
+
+}  
+
+#endif /* builtin_temporal_MonthCode_h */

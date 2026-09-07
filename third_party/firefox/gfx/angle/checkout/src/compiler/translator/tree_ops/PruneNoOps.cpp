@@ -1,0 +1,285 @@
+// Copyright 2002 The ANGLE Project Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include "compiler/translator/tree_ops/PruneNoOps.h"
+
+#include "compiler/translator/Symbol.h"
+#include "compiler/translator/tree_util/IntermTraverse.h"
+
+namespace sh
+{
+
+namespace
+{
+uint32_t GetSwitchConstantAsUInt(const TConstantUnion *value)
+{
+    TConstantUnion asUInt;
+    if (value->getType() == EbtYuvCscStandardEXT)
+    {
+        asUInt.setUConst(value->getYuvCscStandardEXTConst());
+    }
+    else
+    {
+        bool valid = asUInt.cast(EbtUInt, *value);
+        ASSERT(valid);
+    }
+    return asUInt.getUConst();
+}
+
+bool IsNoOpSwitch(TIntermSwitch *node)
+{
+    if (node == nullptr)
+    {
+        return false;
+    }
+
+    TIntermConstantUnion *expr = node->getInit()->getAsConstantUnion();
+    if (expr == nullptr)
+    {
+        return false;
+    }
+
+    const uint32_t exprValue = GetSwitchConstantAsUInt(expr->getConstantValue());
+
+    const TIntermSequence &statements = *node->getStatementList()->getSequence();
+
+    for (TIntermNode *statement : statements)
+    {
+        TIntermCase *caseLabel = statement->getAsCaseNode();
+        if (caseLabel == nullptr)
+        {
+            continue;
+        }
+
+        if (!caseLabel->hasCondition())
+        {
+            return false;
+        }
+
+        TIntermConstantUnion *condition = caseLabel->getCondition()->getAsConstantUnion();
+        ASSERT(condition != nullptr);
+
+        const uint32_t caseValue = GetSwitchConstantAsUInt(condition->getConstantValue());
+        if (caseValue == exprValue)
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool IsNoOp(TIntermNode *node)
+{
+    bool isEmptyDeclaration = node->getAsDeclarationNode() != nullptr &&
+                              node->getAsDeclarationNode()->getSequence()->empty();
+    if (isEmptyDeclaration)
+    {
+        return true;
+    }
+
+    if (IsNoOpSwitch(node->getAsSwitchNode()))
+    {
+        return true;
+    }
+
+    if (node->getAsTyped() == nullptr || node->getAsFunctionPrototypeNode() != nullptr)
+    {
+        return false;
+    }
+
+    return !node->getAsTyped()->hasSideEffects();
+}
+
+class PruneNoOpsTraverser : private TIntermTraverser
+{
+  public:
+    [[nodiscard]] static bool apply(TCompiler *compiler,
+                                    TIntermBlock *root,
+                                    TSymbolTable *symbolTable);
+
+  private:
+    PruneNoOpsTraverser(TSymbolTable *symbolTable);
+    bool visitDeclaration(Visit, TIntermDeclaration *node) override;
+    bool visitBlock(Visit visit, TIntermBlock *node) override;
+    bool visitLoop(Visit visit, TIntermLoop *loop) override;
+    bool visitBranch(Visit visit, TIntermBranch *node) override;
+    TIntermTyped *pruneNoOpCommaExpressions(TIntermTyped *statement);
+
+    bool mIsBranchVisited = false;
+};
+
+bool PruneNoOpsTraverser::apply(TCompiler *compiler, TIntermBlock *root, TSymbolTable *symbolTable)
+{
+    PruneNoOpsTraverser prune(symbolTable);
+    root->traverse(&prune);
+    return prune.updateTree(compiler, root);
+}
+
+PruneNoOpsTraverser::PruneNoOpsTraverser(TSymbolTable *symbolTable)
+    : TIntermTraverser(true, true, true, symbolTable)
+{}
+
+bool PruneNoOpsTraverser::visitDeclaration(Visit visit, TIntermDeclaration *node)
+{
+    if (visit != PreVisit)
+    {
+        return true;
+    }
+
+    TIntermSequence *sequence = node->getSequence();
+    if (sequence->size() >= 1)
+    {
+        TIntermSymbol *declaratorSymbol = sequence->front()->getAsSymbolNode();
+        if (declaratorSymbol != nullptr &&
+            declaratorSymbol->variable().symbolType() == SymbolType::Empty &&
+            !declaratorSymbol->isInterfaceBlock())
+        {
+            if (sequence->size() > 1)
+            {
+                TIntermSequence emptyReplacement;
+                mMultiReplacements.emplace_back(node, declaratorSymbol,
+                                                std::move(emptyReplacement));
+            }
+            else if (declaratorSymbol->getBasicType() != EbtStruct)
+            {
+                UNREACHABLE();
+            }
+            else if (declaratorSymbol->getQualifier() != EvqGlobal &&
+                     declaratorSymbol->getQualifier() != EvqTemporary)
+            {
+
+                TType *type = new TType(declaratorSymbol->getType());
+                if (mInGlobalScope)
+                {
+                    type->setQualifier(EvqGlobal);
+                }
+                else
+                {
+                    type->setQualifier(EvqTemporary);
+                }
+                TVariable *variable =
+                    new TVariable(mSymbolTable, kEmptyImmutableString, type, SymbolType::Empty);
+                queueReplacementWithParent(node, declaratorSymbol, new TIntermSymbol(variable),
+                                           OriginalNode::IS_DROPPED);
+            }
+        }
+    }
+    return false;
+}
+
+bool PruneNoOpsTraverser::visitBlock(Visit visit, TIntermBlock *node)
+{
+    ASSERT(visit == PreVisit);
+
+    TIntermSequence &statements = *node->getSequence();
+
+    for (size_t statementIndex = 0; statementIndex < statements.size(); ++statementIndex)
+    {
+        TIntermNode *statement = statements[statementIndex];
+
+        if (statement->getAsCaseNode() != nullptr)
+        {
+            mIsBranchVisited = false;
+        }
+
+        if (mIsBranchVisited || IsNoOp(statement))
+        {
+            TIntermSequence emptyReplacement;
+            mMultiReplacements.emplace_back(node, statement, std::move(emptyReplacement));
+            continue;
+        }
+
+        if (statement->getAsBinaryNode() != nullptr)
+        {
+            statement = pruneNoOpCommaExpressions(statement->getAsBinaryNode());
+            if (statement == nullptr)
+            {
+                TIntermSequence emptyReplacement;
+                mMultiReplacements.emplace_back(node, statement, std::move(emptyReplacement));
+                continue;
+            }
+
+            statements[statementIndex] = statement;
+        }
+
+        statement->traverse(this);
+    }
+
+    if (mIsBranchVisited && getParentNode()->getAsBlock() == nullptr)
+    {
+        mIsBranchVisited = false;
+    }
+
+    return false;
+}
+
+TIntermTyped *PruneNoOpsTraverser::pruneNoOpCommaExpressions(TIntermTyped *statement)
+{
+    TIntermBinary *commaSeparatedExpressions = statement->getAsBinaryNode();
+    if (commaSeparatedExpressions == nullptr || commaSeparatedExpressions->getOp() != EOpComma)
+    {
+        return statement;
+    }
+
+    TIntermTyped *left  = commaSeparatedExpressions->getLeft();
+    TIntermTyped *right = commaSeparatedExpressions->getRight();
+
+    TIntermTyped *prunedLeft  = IsNoOp(left) ? nullptr : pruneNoOpCommaExpressions(left);
+    TIntermTyped *prunedRight = IsNoOp(right) ? nullptr : pruneNoOpCommaExpressions(right);
+
+    if (left == prunedLeft && right == prunedRight)
+    {
+        return statement;
+    }
+
+    if (prunedRight == nullptr)
+    {
+        return prunedLeft;
+    }
+    if (prunedLeft == nullptr)
+    {
+        return prunedRight;
+    }
+
+    return new TIntermBinary(EOpComma, prunedLeft, prunedRight);
+}
+
+bool PruneNoOpsTraverser::visitLoop(Visit visit, TIntermLoop *loop)
+{
+    if (visit != PreVisit)
+    {
+        return true;
+    }
+
+    TIntermTyped *expr = loop->getExpression();
+    if (expr != nullptr && IsNoOp(expr))
+    {
+        loop->setExpression(nullptr);
+    }
+    TIntermNode *init = loop->getInit();
+    if (init != nullptr && IsNoOp(init))
+    {
+        loop->setInit(nullptr);
+    }
+
+    return true;
+}
+
+bool PruneNoOpsTraverser::visitBranch(Visit visit, TIntermBranch *node)
+{
+    ASSERT(visit == PreVisit);
+
+    mIsBranchVisited = true;
+
+    return false;
+}
+}  
+
+bool PruneNoOps(TCompiler *compiler, TIntermBlock *root, TSymbolTable *symbolTable)
+{
+    return PruneNoOpsTraverser::apply(compiler, root, symbolTable);
+}
+
+}  

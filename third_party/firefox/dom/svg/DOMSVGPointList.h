@@ -1,0 +1,149 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SVG_DOMSVGPOINTLIST_H_
+#define DOM_SVG_DOMSVGPOINTLIST_H_
+
+#include "SVGPointList.h"  // IWYU pragma: keep
+#include "mozAutoDocUpdate.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/RefPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsDebug.h"
+#include "nsTArray.h"
+
+#define MOZILLA_DOMSVGPOINTLIST_IID \
+  {0x61812ad1, 0xc078, 0x4cd1, {0x87, 0xe6, 0xbc, 0x1c, 0x1b, 0x8d, 0x72, 0x84}}
+
+namespace mozilla {
+
+class ErrorResult;
+class SVGAnimatedPointList;
+
+namespace dom {
+
+class DOMSVGPoint;
+class SVGElement;
+class SVGPolyElement;
+
+template <class T>
+class MOZ_RAII AutoChangePointListNotifier {
+ public:
+  explicit AutoChangePointListNotifier(T* aValue) : mValue(aValue) {
+    MOZ_ASSERT(mValue, "Expecting non-null value");
+    if (mValue->IsInList()) {
+      mUpdateBatch.emplace(mValue->Element()->GetComposedDoc(), true);
+      mValue->Element()->WillChangePointList(mUpdateBatch.ref());
+    }
+  }
+
+  ~AutoChangePointListNotifier() {
+    if (mValue->IsInList()) {
+      mValue->Element()->DidChangePointList(mUpdateBatch.ref());
+      if (mValue->AttrIsAnimating()) {
+        mValue->Element()->AnimationNeedsResample();
+      }
+    }
+  }
+
+ private:
+  Maybe<mozAutoDocUpdate> mUpdateBatch;
+  T* const mValue;
+};
+
+class DOMSVGPointList final : public nsISupports, public nsWrapperCache {
+  template <class T>
+  friend class AutoChangePointListNotifier;
+  friend class DOMSVGPoint;
+
+ public:
+  NS_INLINE_DECL_STATIC_IID(MOZILLA_DOMSVGPOINTLIST_IID)
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_CLASS(DOMSVGPointList)
+
+  JSObject* WrapObject(JSContext* cx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  nsISupports* GetParentObject() { return static_cast<nsIContent*>(mElement); }
+
+  static already_AddRefed<DOMSVGPointList> GetDOMWrapper(
+      void* aList, dom::SVGPolyElement* aElement);
+
+  static DOMSVGPointList* GetDOMWrapperIfExists(void* aList);
+
+  uint32_t LengthNoFlush() const {
+    MOZ_ASSERT(
+        mItems.Length() == 0 || mItems.Length() == InternalList().Length(),
+        "DOM wrapper's list length is out of sync");
+    return mItems.Length();
+  }
+
+  void InternalListWillChangeTo(const SVGPointList& aNewValue);
+
+  bool IsInList() const { return true; }
+
+  bool AttrIsAnimating() const;
+
+  bool AnimListMirrorsBaseList() const;
+
+  uint32_t NumberOfItems() const {
+    if (IsAnimValList()) {
+      Element()->FlushAnimations();
+    }
+    return LengthNoFlush();
+  }
+  void Clear(ErrorResult& aRv);
+  already_AddRefed<DOMSVGPoint> Initialize(DOMSVGPoint& aNewItem,
+                                           ErrorResult& aRv);
+  already_AddRefed<DOMSVGPoint> GetItem(uint32_t index, ErrorResult& error);
+  already_AddRefed<DOMSVGPoint> IndexedGetter(uint32_t index, bool& found,
+                                              ErrorResult& error);
+  already_AddRefed<DOMSVGPoint> InsertItemBefore(DOMSVGPoint& aNewItem,
+                                                 uint32_t aIndex,
+                                                 ErrorResult& aRv);
+  already_AddRefed<DOMSVGPoint> ReplaceItem(DOMSVGPoint& aNewItem,
+                                            uint32_t aIndex, ErrorResult& aRv);
+  already_AddRefed<DOMSVGPoint> RemoveItem(uint32_t aIndex, ErrorResult& aRv);
+  already_AddRefed<DOMSVGPoint> AppendItem(DOMSVGPoint& aNewItem,
+                                           ErrorResult& aRv) {
+    return InsertItemBefore(aNewItem, LengthNoFlush(), aRv);
+  }
+  uint32_t Length() const { return NumberOfItems(); }
+
+ private:
+  DOMSVGPointList(dom::SVGElement* aElement, bool aIsAnimValList)
+      : mElement(aElement), mIsAnimValList(aIsAnimValList) {
+    InternalListWillChangeTo(InternalList());  
+  }
+
+  ~DOMSVGPointList();
+
+  dom::SVGElement* Element() const { return mElement.get(); }
+
+  bool IsAnimValList() const { return mIsAnimValList; }
+
+  SVGPointList& InternalList() const;
+
+  SVGAnimatedPointList& InternalAList() const;
+
+  already_AddRefed<DOMSVGPoint> GetItemAt(uint32_t aIndex);
+
+  void MaybeInsertNullInAnimValListAt(uint32_t aIndex);
+  void MaybeRemoveItemFromAnimValListAt(uint32_t aIndex);
+
+  void RemoveFromTearoffTable();
+
+  FallibleTArray<DOMSVGPoint*> mItems;
+
+  RefPtr<dom::SVGElement> mElement;
+
+  bool mIsAnimValList;
+
+  bool mIsInTearoffTable = true;
+};
+
+}  
+}  
+
+#endif  // DOM_SVG_DOMSVGPOINTLIST_H_

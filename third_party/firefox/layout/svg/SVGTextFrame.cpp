@@ -1,0 +1,4012 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "SVGTextFrame.h"
+
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <numbers>
+#include <numeric>
+
+#include "DOMSVGPoint.h"
+#include "SVGAnimatedNumberList.h"
+#include "SVGContentUtils.h"
+#include "SVGContextPaint.h"
+#include "SVGLengthList.h"
+#include "SVGNumberList.h"
+#include "SVGPaintServerFrame.h"
+#include "gfx2DGlue.h"
+#include "gfxContext.h"
+#include "gfxFont.h"
+#include "gfxSkipChars.h"
+#include "gfxTypes.h"
+#include "gfxUtils.h"
+#include "mozilla/CaretAssociationHint.h"
+#include "mozilla/DisplaySVGItem.h"
+#include "mozilla/Likely.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/ReflowInput.h"
+#include "mozilla/SVGObserverUtils.h"
+#include "mozilla/SVGOuterSVGFrame.h"
+#include "mozilla/SVGUtils.h"
+#include "mozilla/dom/SVGGeometryElement.h"
+#include "mozilla/dom/SVGRect.h"
+#include "mozilla/dom/SVGTextContentElementBinding.h"
+#include "mozilla/dom/SVGTextPathElement.h"
+#include "mozilla/dom/SVGTextPathElementBinding.h"
+#include "mozilla/dom/Selection.h"
+#include "mozilla/dom/Text.h"
+#include "mozilla/gfx/2D.h"
+#include "mozilla/gfx/PatternHelpers.h"
+#include "nsBidiPresUtils.h"
+#include "nsBlockFrame.h"
+#include "nsCaret.h"
+#include "nsContentUtils.h"
+#include "nsFrameSelection.h"
+#include "nsGkAtoms.h"
+#include "nsLayoutUtils.h"
+#include "nsStyleStructInlines.h"
+#include "nsTArray.h"
+#include "nsTHashSet.h"
+#include "nsTextFrame.h"
+
+using namespace mozilla::dom;
+using namespace mozilla::dom::SVGTextContentElement_Binding;
+using namespace mozilla::gfx;
+using namespace mozilla::image;
+
+namespace mozilla {
+
+
+static gfxTextRun::Range ConvertOriginalToSkipped(
+    gfxSkipCharsIterator& aIterator, uint32_t aOriginalOffset,
+    uint32_t aOriginalLength) {
+  uint32_t start = aIterator.ConvertOriginalToSkipped(aOriginalOffset);
+  aIterator.AdvanceOriginal(aOriginalLength);
+  return gfxTextRun::Range(start, aIterator.GetSkippedOffset());
+}
+
+static gfxPoint AppUnitsToGfxUnits(const nsPoint& aPoint,
+                                   const nsPresContext* aContext) {
+  return gfxPoint(aContext->AppUnitsToGfxUnits(aPoint.x),
+                  aContext->AppUnitsToGfxUnits(aPoint.y));
+}
+
+static gfxRect AppUnitsToFloatCSSPixels(const nsRect& aRect) {
+  return gfxRect(nsPresContext::AppUnitsToFloatCSSPixels(aRect.x),
+                 nsPresContext::AppUnitsToFloatCSSPixels(aRect.y),
+                 nsPresContext::AppUnitsToFloatCSSPixels(aRect.width),
+                 nsPresContext::AppUnitsToFloatCSSPixels(aRect.height));
+}
+
+static void GetAscentAndDescentInAppUnits(nsTextFrame* aFrame,
+                                          gfxFloat& aAscent,
+                                          gfxFloat& aDescent) {
+  gfxSkipCharsIterator it = aFrame->EnsureTextRun(nsTextFrame::eInflated);
+  gfxTextRun* textRun = aFrame->GetTextRun(nsTextFrame::eInflated);
+
+  gfxTextRun::Range range = ConvertOriginalToSkipped(
+      it, aFrame->GetContentOffset(), aFrame->GetContentLength());
+
+  textRun->GetLineHeightMetrics(range, aAscent, aDescent);
+}
+
+static void IntersectInterval(uint32_t& aStart, uint32_t& aLength,
+                              uint32_t aStartOther, uint32_t aLengthOther) {
+  uint32_t aEnd = aStart + aLength;
+  uint32_t aEndOther = aStartOther + aLengthOther;
+
+  if (aStartOther >= aEnd || aStart >= aEndOther) {
+    aLength = 0;
+  } else {
+    if (aStartOther >= aStart) {
+      aStart = aStartOther;
+    }
+    aLength = std::min(aEnd, aEndOther) - aStart;
+  }
+}
+
+static void TrimOffsets(uint32_t& aStart, uint32_t& aLength,
+                        const nsTextFrame::TrimmedOffsets& aTrimmedOffsets) {
+  IntersectInterval(aStart, aLength, aTrimmedOffsets.mStart,
+                    aTrimmedOffsets.mLength);
+}
+
+static nsIContent* GetFirstNonAAncestor(nsIContent* aContent) {
+  while (aContent && aContent->IsSVGElement(nsGkAtoms::a)) {
+    aContent = aContent->GetParent();
+  }
+  return aContent;
+}
+
+static bool IsTextContentElement(const nsIContent* aContent) {
+  if (aContent->IsSVGElement(nsGkAtoms::text)) {
+    const nsIContent* parent = GetFirstNonAAncestor(aContent->GetParent());
+    return !parent || !IsTextContentElement(parent);
+  }
+
+  if (aContent->IsSVGElement(nsGkAtoms::textPath)) {
+    const nsIContent* parent = GetFirstNonAAncestor(aContent->GetParent());
+    return parent && parent->IsSVGElement(nsGkAtoms::text);
+  }
+
+  return aContent->IsAnyOfSVGElements(nsGkAtoms::a, nsGkAtoms::tspan);
+}
+
+static bool IsNonEmptyTextFrame(const nsIFrame* aFrame) {
+  const nsTextFrame* textFrame = do_QueryFrame(aFrame);
+  if (!textFrame) {
+    return false;
+  }
+
+  return textFrame->GetContentLength() != 0;
+}
+
+static bool GetNonEmptyTextFrameAndNode(nsIFrame* aFrame,
+                                        nsTextFrame*& aTextFrame,
+                                        Text*& aTextNode) {
+  nsTextFrame* text = do_QueryFrame(aFrame);
+  bool isNonEmptyTextFrame = text && text->GetContentLength() != 0;
+
+  if (isNonEmptyTextFrame) {
+    nsIContent* content = text->GetContent();
+    NS_ASSERTION(content && content->IsText(),
+                 "unexpected content type for nsTextFrame");
+
+    Text* node = content->AsText();
+    MOZ_ASSERT(node->TextLength() != 0,
+               "frame's GetContentLength() should be 0 if the text node "
+               "has no content");
+
+    aTextFrame = text;
+    aTextNode = node;
+  }
+
+  MOZ_ASSERT(IsNonEmptyTextFrame(aFrame) == isNonEmptyTextFrame,
+             "our logic should agree with IsNonEmptyTextFrame");
+  return isNonEmptyTextFrame;
+}
+
+static bool IsGlyphPositioningAttribute(const nsAtom* aAttribute) {
+  return aAttribute == nsGkAtoms::x || aAttribute == nsGkAtoms::y ||
+         aAttribute == nsGkAtoms::dx || aAttribute == nsGkAtoms::dy ||
+         aAttribute == nsGkAtoms::rotate;
+}
+
+static nscoord GetBaselinePosition(nsTextFrame* aFrame,
+                                   const gfxTextRun* aTextRun,
+                                   StyleDominantBaseline aDominantBaseline,
+                                   float aFontSizeScaleFactor) {
+  WritingMode writingMode = aFrame->GetWritingMode();
+  gfxFloat ascent, descent;
+  aTextRun->GetLineHeightMetrics(ascent, descent);
+
+  auto convertIfVerticalRL = [&](gfxFloat dominantBaseline) {
+    return writingMode.IsVerticalRL() ? ascent + descent - dominantBaseline
+                                      : dominantBaseline;
+  };
+
+  switch (aDominantBaseline) {
+    case StyleDominantBaseline::Hanging:
+      return convertIfVerticalRL(ascent * 0.2);
+    case StyleDominantBaseline::TextTop:
+      return convertIfVerticalRL(0);
+
+    case StyleDominantBaseline::Alphabetic:
+      return writingMode.IsVerticalRL()
+                 ? ascent * 0.5
+                 : aFrame->GetLogicalBaseline(writingMode);
+
+    case StyleDominantBaseline::Auto:
+      return convertIfVerticalRL(aFrame->GetLogicalBaseline(writingMode));
+
+    case StyleDominantBaseline::Middle:
+      return convertIfVerticalRL(aFrame->GetLogicalBaseline(writingMode) -
+                                 SVGContentUtils::GetFontXHeight(aFrame) / 2.0 *
+                                     AppUnitsPerCSSPixel() *
+                                     aFontSizeScaleFactor);
+
+    case StyleDominantBaseline::TextBottom:
+    case StyleDominantBaseline::Ideographic:
+      return writingMode.IsVerticalLR() ? 0 : ascent + descent;
+
+    case StyleDominantBaseline::Central:
+      return (ascent + descent) / 2.0;
+    case StyleDominantBaseline::Mathematical:
+      return convertIfVerticalRL(ascent / 2.0);
+  }
+
+  MOZ_ASSERT_UNREACHABLE("unexpected dominant-baseline value");
+  return convertIfVerticalRL(aFrame->GetLogicalBaseline(writingMode));
+}
+
+template <typename T, typename U>
+static void TruncateTo(nsTArray<T>& aArrayToTruncate,
+                       const nsTArray<U>& aReferenceArray) {
+  uint32_t length = aReferenceArray.Length();
+  if (aArrayToTruncate.Length() > length) {
+    aArrayToTruncate.TruncateLength(length);
+  }
+}
+
+static SVGTextFrame* FrameIfAnonymousChildReflowed(SVGTextFrame* aFrame) {
+  MOZ_ASSERT(aFrame, "aFrame must not be null");
+  nsIFrame* kid = aFrame->PrincipalChildList().FirstChild();
+  if (kid->IsSubtreeDirty()) {
+    MOZ_ASSERT(false, "should have already reflowed the anonymous block child");
+    return nullptr;
+  }
+  return aFrame;
+}
+
+static float GetContextScale(SVGTextFrame* aFrame) {
+  if (aFrame->HasAnyStateBits(NS_FRAME_IS_NONDISPLAY)) {
+    return 1.0f;
+  }
+  auto matrix = nsLayoutUtils::GetTransformToAncestor(
+      RelativeTo{aFrame}, RelativeTo{SVGUtils::GetOuterSVGFrame(aFrame)});
+  Matrix transform2D;
+  if (!matrix.CanDraw2D(&transform2D)) {
+    return 1.0f;
+  }
+  auto scales = transform2D.ScaleFactors();
+  return std::max(0.0f, std::max(scales.xScale, scales.yScale));
+}
+
+
+
+struct TextRenderedRun {
+  using Range = gfxTextRun::Range;
+
+  TextRenderedRun() : mFrame(nullptr) {}
+
+  TextRenderedRun(nsTextFrame* aFrame, SVGTextFrame* aSVGTextFrame,
+                  const gfxPoint& aPosition, double aRotate,
+                  float aFontSizeScaleFactor, nscoord aBaseline,
+                  uint32_t aTextFrameContentOffset,
+                  uint32_t aTextFrameContentLength,
+                  uint32_t aTextElementCharIndex)
+      : mFrame(aFrame),
+        mRoot(aSVGTextFrame),
+        mPosition(aPosition),
+        mLengthAdjustScaleFactor(mRoot->mLengthAdjustScaleFactor),
+        mRotate(static_cast<float>(aRotate)),
+        mFontSizeScaleFactor(aFontSizeScaleFactor),
+        mBaseline(aBaseline),
+        mTextFrameContentOffset(aTextFrameContentOffset),
+        mTextFrameContentLength(aTextFrameContentLength),
+        mTextElementCharIndex(aTextElementCharIndex) {}
+
+  gfxTextRun* GetTextRun() const {
+    mFrame->EnsureTextRun(nsTextFrame::eInflated);
+    return mFrame->GetTextRun(nsTextFrame::eInflated);
+  }
+
+  bool IsInlineReversed() const { return GetTextRun()->IsInlineReversed(); }
+
+  bool IsVertical() const { return GetTextRun()->IsVertical(); }
+
+  gfxMatrix GetTransformFromUserSpaceForPainting(
+      nsPresContext* aContext, const nscoord aVisIStartEdge,
+      const nscoord aVisIEndEdge) const;
+
+  gfxMatrix GetTransformFromRunUserSpaceToUserSpace(
+      nsPresContext* aContext) const;
+
+  gfxMatrix GetTransformFromRunUserSpaceToFrameUserSpace(
+      nsPresContext* aContext) const;
+
+  enum class GeometryFlag {
+    IncludeFill,
+    IncludeStroke,
+    NoHorizontalOverflow
+  };
+  using GeometryFlags = EnumSet<GeometryFlag>;
+
+  SVGBBox GetRunUserSpaceRect(GeometryFlags aFlags) const;
+
+  SVGBBox GetFrameUserSpaceRect(nsPresContext* aContext,
+                                GeometryFlags aFlags) const;
+
+  SVGBBox GetUserSpaceRect(
+      nsPresContext* aContext, GeometryFlags aFlags,
+      const gfxMatrix* aAdditionalTransform = nullptr) const;
+
+  void GetClipEdges(nscoord& aVisIStartEdge, nscoord& aVisIEndEdge) const;
+
+  nscoord GetAdvanceWidth() const;
+
+  int32_t GetCharNumAtPosition(nsPresContext* aContext,
+                               const gfxPoint& aPoint) const;
+
+  nsTextFrame* mFrame;
+
+  SVGTextFrame* mRoot;
+
+  gfxPoint mPosition;
+
+  float mLengthAdjustScaleFactor;
+
+  float mRotate;
+
+  double mFontSizeScaleFactor;
+
+  nscoord mBaseline;
+
+  uint32_t mTextFrameContentOffset;
+  uint32_t mTextFrameContentLength;
+
+  uint32_t mTextElementCharIndex;
+};
+
+gfxMatrix TextRenderedRun::GetTransformFromUserSpaceForPainting(
+    nsPresContext* aContext, const nscoord aVisIStartEdge,
+    const nscoord aVisIEndEdge) const {
+
+  gfxMatrix m;
+  if (!mFrame) {
+    return m;
+  }
+
+  float cssPxPerDevPx =
+      nsPresContext::AppUnitsToFloatCSSPixels(aContext->AppUnitsPerDevPixel());
+
+  m.PreTranslate(mPosition / cssPxPerDevPx);
+
+  m.PreScale(1.0 / mFontSizeScaleFactor, 1.0 / mFontSizeScaleFactor);
+
+  m.PreRotate(mRotate);
+
+  nsPoint t;
+  if (IsVertical()) {
+    m.PreScale(1.0, mLengthAdjustScaleFactor);
+    t = nsPoint(-mBaseline, IsInlineReversed()
+                                ? -mFrame->GetRect().height + aVisIEndEdge
+                                : -aVisIStartEdge);
+  } else {
+    m.PreScale(mLengthAdjustScaleFactor, 1.0);
+    t = nsPoint(IsInlineReversed() ? -mFrame->GetRect().width + aVisIEndEdge
+                                   : -aVisIStartEdge,
+                -mBaseline);
+  }
+  m.PreTranslate(AppUnitsToGfxUnits(t, aContext));
+
+  return m;
+}
+
+gfxMatrix TextRenderedRun::GetTransformFromRunUserSpaceToUserSpace(
+    nsPresContext* aContext) const {
+  gfxMatrix m;
+  if (!mFrame) {
+    return m;
+  }
+
+  float cssPxPerDevPx =
+      nsPresContext::AppUnitsToFloatCSSPixels(aContext->AppUnitsPerDevPixel());
+
+  nscoord start, end;
+  GetClipEdges(start, end);
+
+  m.PreTranslate(mPosition);
+
+  m.PreRotate(mRotate);
+
+
+  nsPoint t;
+  if (IsVertical()) {
+    m.PreScale(1.0, mLengthAdjustScaleFactor);
+    t = nsPoint(-mBaseline, IsInlineReversed()
+                                ? -mFrame->GetRect().height + start + end
+                                : 0);
+  } else {
+    m.PreScale(mLengthAdjustScaleFactor, 1.0);
+    t = nsPoint(IsInlineReversed() ? -mFrame->GetRect().width + start + end : 0,
+                -mBaseline);
+  }
+  m.PreTranslate(AppUnitsToGfxUnits(t, aContext) * cssPxPerDevPx /
+                 mFontSizeScaleFactor);
+
+  return m;
+}
+
+gfxMatrix TextRenderedRun::GetTransformFromRunUserSpaceToFrameUserSpace(
+    nsPresContext* aContext) const {
+  gfxMatrix m;
+  if (!mFrame) {
+    return m;
+  }
+
+  nscoord start, end;
+  GetClipEdges(start, end);
+
+  gfxFloat appPerCssPx = AppUnitsPerCSSPixel();
+  gfxPoint t = IsVertical() ? gfxPoint(0, start / appPerCssPx)
+                            : gfxPoint(start / appPerCssPx, 0);
+  return m.PreTranslate(t);
+}
+
+SVGBBox TextRenderedRun::GetRunUserSpaceRect(GeometryFlags aFlags) const {
+  SVGBBox r;
+  if (!mFrame) {
+    return r;
+  }
+
+  nsRect self = mFrame->InkOverflowRectRelativeToSelf();
+  nsRect rect = mFrame->GetRect();
+  bool vertical = IsVertical();
+  nsMargin inkOverflow(
+      vertical ? -self.x : -self.y,
+      vertical ? self.YMost() - rect.height : self.XMost() - rect.width,
+      vertical ? self.XMost() - rect.width : self.YMost() - rect.height,
+      vertical ? -self.y : -self.x);
+
+  gfxSkipCharsIterator it = mFrame->EnsureTextRun(nsTextFrame::eInflated);
+  gfxTextRun* textRun = mFrame->GetTextRun(nsTextFrame::eInflated);
+
+  Range range = ConvertOriginalToSkipped(it, mTextFrameContentOffset,
+                                         mTextFrameContentLength);
+  if (range.Length() == 0) {
+    return r;
+  }
+
+  auto& provider = mRoot->PropertyProviderFor(mFrame);
+
+  gfxTextRun::Metrics metrics = textRun->MeasureText(
+      range, gfxFont::LOOSE_INK_EXTENTS, nullptr, &provider);
+  gfxRect fontBox(0, -metrics.mAscent, metrics.mAdvanceWidth,
+                  metrics.mAscent + metrics.mDescent);
+  metrics.mBoundingBox.UnionRect(metrics.mBoundingBox, fontBox);
+
+  nscoord baseline =
+      NSToCoordRoundWithClamp(metrics.mBoundingBox.y + metrics.mAscent);
+  gfxFloat x, width;
+  if (aFlags.contains(GeometryFlag::NoHorizontalOverflow)) {
+    x = 0.0;
+    width = textRun->GetAdvanceWidth(range, &provider);
+    if (width < 0.0) {
+      x = width;
+      width = -width;
+    }
+  } else {
+    x = metrics.mBoundingBox.x;
+    width = metrics.mBoundingBox.width;
+  }
+  nsRect fillInAppUnits(NSToCoordRoundWithClamp(x), baseline,
+                        NSToCoordRoundWithClamp(width),
+                        NSToCoordRoundWithClamp(metrics.mBoundingBox.height));
+  fillInAppUnits.Inflate(inkOverflow);
+  if (textRun->IsVertical()) {
+    std::swap(fillInAppUnits.x, fillInAppUnits.y);
+    std::swap(fillInAppUnits.width, fillInAppUnits.height);
+  }
+
+  gfxRect fill = AppUnitsToFloatCSSPixels(fillInAppUnits);
+
+  fill.Scale(1.0 / mFontSizeScaleFactor);
+
+  if (aFlags.contains(GeometryFlag::IncludeFill)) {
+    r = fill;
+  }
+
+  if (aFlags.contains(GeometryFlag::IncludeStroke) && !fill.IsEmpty() &&
+      SVGUtils::GetStrokeWidth(mFrame) > 0) {
+    r.UnionEdges(
+        SVGUtils::PathExtentsToMaxStrokeExtents(fill, mFrame, gfxMatrix()));
+  }
+
+  return r;
+}
+
+SVGBBox TextRenderedRun::GetFrameUserSpaceRect(nsPresContext* aContext,
+                                               GeometryFlags aFlags) const {
+  SVGBBox r = GetRunUserSpaceRect(aFlags);
+  if (r.IsEmpty()) {
+    return r;
+  }
+  gfxMatrix m = GetTransformFromRunUserSpaceToFrameUserSpace(aContext);
+  return m.TransformBounds(r.ToThebesRect());
+}
+
+SVGBBox TextRenderedRun::GetUserSpaceRect(
+    nsPresContext* aContext, GeometryFlags aFlags,
+    const gfxMatrix* aAdditionalTransform) const {
+  SVGBBox r = GetRunUserSpaceRect(aFlags);
+  if (r.IsEmpty()) {
+    return r;
+  }
+  gfxMatrix m = GetTransformFromRunUserSpaceToUserSpace(aContext);
+  if (aAdditionalTransform) {
+    m *= *aAdditionalTransform;
+  }
+  return m.TransformBounds(r.ToThebesRect());
+}
+
+void TextRenderedRun::GetClipEdges(nscoord& aVisIStartEdge,
+                                   nscoord& aVisIEndEdge) const {
+  uint32_t contentLength = mFrame->GetContentLength();
+  if (mTextFrameContentOffset == 0 &&
+      mTextFrameContentLength == contentLength) {
+    aVisIStartEdge = 0;
+    aVisIEndEdge = 0;
+    return;
+  }
+
+  gfxSkipCharsIterator it = mFrame->EnsureTextRun(nsTextFrame::eInflated);
+  gfxTextRun* textRun = mFrame->GetTextRun(nsTextFrame::eInflated);
+  auto& provider = mRoot->PropertyProviderFor(mFrame);
+
+  Range runRange = ConvertOriginalToSkipped(it, mTextFrameContentOffset,
+                                            mTextFrameContentLength);
+
+  uint32_t frameOffset = mFrame->GetContentOffset();
+  uint32_t frameLength = mFrame->GetContentLength();
+
+  nsTextFrame::TrimmedOffsets trimmedOffsets =
+      mFrame->GetTrimmedOffsets(mFrame->CharacterDataBuffer());
+  TrimOffsets(frameOffset, frameLength, trimmedOffsets);
+
+  Range frameRange = ConvertOriginalToSkipped(it, frameOffset, frameLength);
+
+  auto MeasureUsingCache = [&](SVGTextFrame::CachedMeasuredRange& aCachedRange,
+                               const Range& aRange) -> nscoord {
+    if (aRange.Intersects(aCachedRange.mRange)) {
+      Range startDelta, endDelta;
+      int startSign = 0, endSign = 0;
+      if (aRange.start < aCachedRange.mRange.start) {
+        startSign = 1;
+        startDelta = Range(aRange.start, aCachedRange.mRange.start);
+      } else if (aRange.start > aCachedRange.mRange.start) {
+        startSign = -1;
+        startDelta = Range(aCachedRange.mRange.start, aRange.start);
+      }
+      if (aRange.end > aCachedRange.mRange.end) {
+        endSign = 1;
+        endDelta = Range(aCachedRange.mRange.end, aRange.end);
+      } else if (aRange.end < aCachedRange.mRange.end) {
+        endSign = -1;
+        endDelta = Range(aRange.end, aCachedRange.mRange.end);
+      }
+      if (startDelta.Length() + endDelta.Length() < aRange.Length()) {
+        if (startSign) {
+          aCachedRange.mAdvance +=
+              startSign * textRun->GetAdvanceWidth(startDelta, &provider);
+        }
+        if (endSign) {
+          aCachedRange.mAdvance +=
+              endSign * textRun->GetAdvanceWidth(endDelta, &provider);
+        }
+      } else {
+        aCachedRange.mAdvance = textRun->GetAdvanceWidth(aRange, &provider);
+      }
+    } else {
+      aCachedRange.mAdvance = textRun->GetAdvanceWidth(aRange, &provider);
+    }
+    aCachedRange.mRange = aRange;
+    return aCachedRange.mAdvance;
+  };
+
+  mRoot->SetCurrentFrameForCaching(mFrame);
+  nscoord startEdge =
+      MeasureUsingCache(mRoot->CachedRange(SVGTextFrame::WhichRange::Before),
+                        Range(frameRange.start, runRange.start));
+  nscoord endEdge =
+      MeasureUsingCache(mRoot->CachedRange(SVGTextFrame::WhichRange::After),
+                        Range(runRange.end, frameRange.end));
+
+  if (textRun->IsInlineReversed()) {
+    aVisIStartEdge = endEdge;
+    aVisIEndEdge = startEdge;
+  } else {
+    aVisIStartEdge = startEdge;
+    aVisIEndEdge = endEdge;
+  }
+}
+
+nscoord TextRenderedRun::GetAdvanceWidth() const {
+  gfxSkipCharsIterator it = mFrame->EnsureTextRun(nsTextFrame::eInflated);
+  gfxTextRun* textRun = mFrame->GetTextRun(nsTextFrame::eInflated);
+  auto& provider = mRoot->PropertyProviderFor(mFrame);
+
+  Range range = ConvertOriginalToSkipped(it, mTextFrameContentOffset,
+                                         mTextFrameContentLength);
+
+  return textRun->GetAdvanceWidth(range, &provider);
+}
+
+int32_t TextRenderedRun::GetCharNumAtPosition(nsPresContext* aContext,
+                                              const gfxPoint& aPoint) const {
+  if (mTextFrameContentLength == 0) {
+    return -1;
+  }
+
+  float cssPxPerDevPx =
+      nsPresContext::AppUnitsToFloatCSSPixels(aContext->AppUnitsPerDevPixel());
+
+  gfxMatrix m = GetTransformFromRunUserSpaceToUserSpace(aContext);
+  if (!m.Invert()) {
+    return -1;
+  }
+  gfxPoint p = m.TransformPoint(aPoint) / cssPxPerDevPx * mFontSizeScaleFactor;
+
+  gfxFloat ascent, descent;
+  GetAscentAndDescentInAppUnits(mFrame, ascent, descent);
+
+  WritingMode writingMode = mFrame->GetWritingMode();
+  if (writingMode.IsVertical()) {
+    gfxFloat leftEdge = mFrame->GetLogicalBaseline(writingMode) -
+                        (writingMode.IsVerticalRL() ? ascent : descent);
+    gfxFloat rightEdge = leftEdge + ascent + descent;
+    if (p.x < aContext->AppUnitsToGfxUnits(leftEdge) ||
+        p.x > aContext->AppUnitsToGfxUnits(rightEdge)) {
+      return -1;
+    }
+  } else {
+    gfxFloat topEdge = mFrame->GetLogicalBaseline(writingMode) - ascent;
+    gfxFloat bottomEdge = topEdge + ascent + descent;
+    if (p.y < aContext->AppUnitsToGfxUnits(topEdge) ||
+        p.y > aContext->AppUnitsToGfxUnits(bottomEdge)) {
+      return -1;
+    }
+  }
+
+  gfxSkipCharsIterator it = mFrame->EnsureTextRun(nsTextFrame::eInflated);
+  gfxTextRun* textRun = mFrame->GetTextRun(nsTextFrame::eInflated);
+  auto& provider = mRoot->PropertyProviderFor(mFrame);
+
+  Range range = ConvertOriginalToSkipped(it, mTextFrameContentOffset,
+                                         mTextFrameContentLength);
+  gfxFloat runAdvance =
+      aContext->AppUnitsToGfxUnits(textRun->GetAdvanceWidth(range, &provider));
+
+  gfxFloat pos = writingMode.IsVertical() ? p.y : p.x;
+  if (pos < 0 || pos >= runAdvance) {
+    return -1;
+  }
+
+  bool ir = textRun->IsInlineReversed();
+  for (int32_t i = mTextFrameContentLength - 1; i >= 0; i--) {
+    range = ConvertOriginalToSkipped(it, mTextFrameContentOffset, i);
+    gfxFloat advance = aContext->AppUnitsToGfxUnits(
+        textRun->GetAdvanceWidth(range, &provider));
+    if ((ir && pos < runAdvance - advance) || (!ir && pos >= advance)) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+
+enum class SubtreePosition { Before, Within, After };
+
+class TextNodeIterator {
+ public:
+  explicit TextNodeIterator(nsIContent* aRoot, nsIContent* aSubtree = nullptr)
+      : mRoot(aRoot),
+        mSubtree(aSubtree == aRoot ? nullptr : aSubtree),
+        mCurrent(aRoot),
+        mSubtreePosition(mSubtree ? SubtreePosition::Before
+                                  : SubtreePosition::Within) {
+    NS_ASSERTION(aRoot, "expected non-null root");
+    if (!aRoot->IsText()) {
+      GetNext();
+    }
+  }
+
+  Text* GetCurrent() const { return mCurrent ? mCurrent->AsText() : nullptr; }
+
+  Text* GetNext();
+
+  bool IsWithinSubtree() const {
+    return mSubtreePosition == SubtreePosition::Within;
+  }
+
+  bool IsAfterSubtree() const {
+    return mSubtreePosition == SubtreePosition::After;
+  }
+
+ private:
+  nsIContent* const mRoot;
+
+  nsIContent* const mSubtree;
+
+  nsIContent* mCurrent;
+
+  SubtreePosition mSubtreePosition;
+};
+
+Text* TextNodeIterator::GetNext() {
+  if (mCurrent) {
+    do {
+      nsIContent* next =
+          IsTextContentElement(mCurrent) ? mCurrent->GetFirstChild() : nullptr;
+      if (next) {
+        mCurrent = next;
+        if (mCurrent == mSubtree) {
+          mSubtreePosition = SubtreePosition::Within;
+        }
+      } else {
+        for (;;) {
+          if (mCurrent == mRoot) {
+            mCurrent = nullptr;
+            break;
+          }
+          if (mCurrent == mSubtree) {
+            mSubtreePosition = SubtreePosition::After;
+          }
+          next = mCurrent->GetNextSibling();
+          if (next) {
+            mCurrent = next;
+            if (mCurrent == mSubtree) {
+              mSubtreePosition = SubtreePosition::Within;
+            }
+            break;
+          }
+          if (mCurrent == mSubtree) {
+            mSubtreePosition = SubtreePosition::After;
+          }
+          mCurrent = mCurrent->GetParent();
+        }
+      }
+    } while (mCurrent && !mCurrent->IsText());
+  }
+
+  return mCurrent ? mCurrent->AsText() : nullptr;
+}
+
+
+struct TextNodeCorrespondence {
+  explicit TextNodeCorrespondence(uint32_t aUndisplayedCharacters)
+      : mUndisplayedCharacters(aUndisplayedCharacters) {}
+
+  uint32_t mUndisplayedCharacters;
+};
+
+NS_DECLARE_FRAME_PROPERTY_DELETABLE(TextNodeCorrespondenceProperty,
+                                    TextNodeCorrespondence)
+
+static uint32_t GetUndisplayedCharactersBeforeFrame(nsTextFrame* aFrame) {
+  void* value = aFrame->GetProperty(TextNodeCorrespondenceProperty());
+  TextNodeCorrespondence* correspondence =
+      static_cast<TextNodeCorrespondence*>(value);
+  if (!correspondence) {
+    NS_ERROR(
+        "expected a TextNodeCorrespondenceProperty on nsTextFrame "
+        "used for SVG text");
+    return 0;
+  }
+  return correspondence->mUndisplayedCharacters;
+}
+
+class TextNodeCorrespondenceRecorder {
+ public:
+  static void RecordCorrespondence(SVGTextFrame* aRoot);
+
+ private:
+  explicit TextNodeCorrespondenceRecorder(SVGTextFrame* aRoot)
+      : mNodeIterator(aRoot->GetContent()),
+        mPreviousNode(nullptr),
+        mNodeCharIndex(0) {}
+
+  void Record(SVGTextFrame* aRoot);
+  void TraverseAndRecord(nsIFrame* aFrame);
+
+  Text* NextNode();
+
+  TextNodeIterator mNodeIterator;
+
+  Text* mPreviousNode;
+
+  uint32_t mNodeCharIndex;
+};
+
+void TextNodeCorrespondenceRecorder::RecordCorrespondence(SVGTextFrame* aRoot) {
+  if (aRoot->HasAnyStateBits(NS_STATE_SVG_TEXT_CORRESPONDENCE_DIRTY)) {
+    aRoot->MaybeResolveBidiForAnonymousBlockChild();
+    TextNodeCorrespondenceRecorder recorder(aRoot);
+    recorder.Record(aRoot);
+    aRoot->RemoveStateBits(NS_STATE_SVG_TEXT_CORRESPONDENCE_DIRTY);
+  }
+}
+
+void TextNodeCorrespondenceRecorder::Record(SVGTextFrame* aRoot) {
+  if (!mNodeIterator.GetCurrent()) {
+    return;
+  }
+
+  TraverseAndRecord(aRoot);
+
+  uint32_t undisplayed = 0;
+  if (mNodeIterator.GetCurrent()) {
+    if (mPreviousNode && mPreviousNode->TextLength() != mNodeCharIndex) {
+      NS_ASSERTION(mNodeCharIndex < mPreviousNode->TextLength(),
+                   "incorrect tracking of undisplayed characters in "
+                   "text nodes");
+      undisplayed += mPreviousNode->TextLength() - mNodeCharIndex;
+    }
+    for (Text* textNode = mNodeIterator.GetCurrent(); textNode;
+         textNode = NextNode()) {
+      undisplayed += textNode->TextLength();
+    }
+  }
+
+  aRoot->mTrailingUndisplayedCharacters = undisplayed;
+}
+
+Text* TextNodeCorrespondenceRecorder::NextNode() {
+  mPreviousNode = mNodeIterator.GetCurrent();
+  Text* next;
+  do {
+    next = mNodeIterator.GetNext();
+  } while (next && next->TextLength() == 0);
+  return next;
+}
+
+void TextNodeCorrespondenceRecorder::TraverseAndRecord(nsIFrame* aFrame) {
+  if (IsTextContentElement(aFrame->GetContent())) {
+    for (nsIFrame* f : aFrame->PrincipalChildList()) {
+      TraverseAndRecord(f);
+    }
+    return;
+  }
+
+  nsTextFrame* frame;  
+  Text* node;          
+  if (!GetNonEmptyTextFrameAndNode(aFrame, frame, node)) {
+    return;
+  }
+
+  NS_ASSERTION(frame->GetContentOffset() >= 0,
+               "don't know how to handle negative content indexes");
+
+  uint32_t undisplayed = 0;
+  if (!mPreviousNode) {
+    NS_ASSERTION(mNodeCharIndex == 0,
+                 "incorrect tracking of undisplayed "
+                 "characters in text nodes");
+    if (!mNodeIterator.GetCurrent()) {
+      MOZ_ASSERT_UNREACHABLE(
+          "incorrect tracking of correspondence between "
+          "text frames and text nodes");
+    } else {
+      while (mNodeIterator.GetCurrent() != node) {
+        undisplayed += mNodeIterator.GetCurrent()->TextLength();
+        NextNode();
+      }
+      undisplayed += frame->GetContentOffset();
+      NextNode();
+    }
+  } else if (mPreviousNode == node) {
+    if (static_cast<uint32_t>(frame->GetContentOffset()) != mNodeCharIndex) {
+      NS_ASSERTION(
+          mNodeCharIndex < static_cast<uint32_t>(frame->GetContentOffset()),
+          "incorrect tracking of undisplayed characters in "
+          "text nodes");
+      undisplayed = frame->GetContentOffset() - mNodeCharIndex;
+    }
+  } else {
+    if (mPreviousNode->TextLength() != mNodeCharIndex) {
+      NS_ASSERTION(mNodeCharIndex < mPreviousNode->TextLength(),
+                   "incorrect tracking of undisplayed characters in "
+                   "text nodes");
+      undisplayed = mPreviousNode->TextLength() - mNodeCharIndex;
+    }
+    while (mNodeIterator.GetCurrent() && mNodeIterator.GetCurrent() != node) {
+      undisplayed += mNodeIterator.GetCurrent()->TextLength();
+      NextNode();
+    }
+    undisplayed += frame->GetContentOffset();
+    NextNode();
+  }
+
+  frame->SetProperty(TextNodeCorrespondenceProperty(),
+                     new TextNodeCorrespondence(undisplayed));
+
+  mNodeCharIndex = frame->GetContentEnd();
+}
+
+
+class MOZ_STACK_CLASS TextFrameIterator {
+ public:
+  explicit TextFrameIterator(SVGTextFrame* aRoot,
+                             const nsIFrame* aSubtree = nullptr)
+      : mRootFrame(aRoot), mCurrentFrame(aRoot) {
+    Init(aSubtree);
+  }
+
+  TextFrameIterator(SVGTextFrame* aRoot, const nsIContent* aSubtree)
+      : mRootFrame(aRoot), mCurrentFrame(aRoot) {
+    Init(aRoot && aSubtree && aSubtree != aRoot->GetContent()
+             ? aSubtree->GetPrimaryFrame()
+             : nullptr);
+  }
+
+  SVGTextFrame* GetRoot() const { return mRootFrame; }
+
+  nsTextFrame* GetCurrent() const { return do_QueryFrame(mCurrentFrame); }
+
+  uint32_t UndisplayedCharacters() const;
+
+  nsPoint Position() const { return mCurrentPosition; }
+
+  nsTextFrame* GetNext();
+
+  bool IsWithinSubtree() const {
+    return mSubtreePosition == SubtreePosition::Within;
+  }
+
+  bool IsAfterSubtree() const {
+    return mSubtreePosition == SubtreePosition::After;
+  }
+
+  nsIFrame* TextPathFrame() const {
+    return mTextPathFrames.IsEmpty() ? nullptr : mTextPathFrames.LastElement();
+  }
+
+  StyleDominantBaseline DominantBaseline() const {
+    return mBaselines.LastElement();
+  }
+
+  void Close() { mCurrentFrame = nullptr; }
+
+ private:
+  void Init(const nsIFrame* aSubtree) {
+    for (const nsIFrame* f = aSubtree; f; f = f->GetNextContinuation()) {
+      mSubtreeRoot.Insert(f);
+    }
+    mSubtreePosition =
+        aSubtree ? SubtreePosition::Before : SubtreePosition::Within;
+    if (!mRootFrame) {
+      return;
+    }
+
+    mBaselines.AppendElement(mRootFrame->StyleVisibility()->mDominantBaseline);
+    GetNext();
+  }
+
+  void PushBaseline(nsIFrame* aNextFrame);
+
+  void PopBaseline();
+
+  SVGTextFrame* const mRootFrame;
+
+  nsTHashSet<const nsIFrame*> mSubtreeRoot;
+
+  nsIFrame* mCurrentFrame;
+
+  nsPoint mCurrentPosition;
+
+  AutoTArray<nsIFrame*, 1> mTextPathFrames;
+
+  AutoTArray<StyleDominantBaseline, 8> mBaselines;
+
+  SubtreePosition mSubtreePosition;
+};
+
+uint32_t TextFrameIterator::UndisplayedCharacters() const {
+  MOZ_ASSERT(
+      !mRootFrame->HasAnyStateBits(NS_STATE_SVG_TEXT_CORRESPONDENCE_DIRTY),
+      "Text correspondence must be up to date");
+
+  if (!mCurrentFrame) {
+    return mRootFrame->mTrailingUndisplayedCharacters;
+  }
+
+  nsTextFrame* frame = do_QueryFrame(mCurrentFrame);
+  return GetUndisplayedCharactersBeforeFrame(frame);
+}
+
+nsTextFrame* TextFrameIterator::GetNext() {
+  if (mCurrentFrame) {
+    do {
+      nsIFrame* next = IsTextContentElement(mCurrentFrame->GetContent())
+                           ? mCurrentFrame->PrincipalChildList().FirstChild()
+                           : nullptr;
+      if (next) {
+        mCurrentPosition += next->GetPosition();
+        if (next->GetContent()->IsSVGElement(nsGkAtoms::textPath)) {
+          mTextPathFrames.AppendElement(next);
+        }
+        PushBaseline(next);
+        mCurrentFrame = next;
+        if (mSubtreeRoot.Contains(mCurrentFrame)) {
+          mSubtreePosition = SubtreePosition::Within;
+        }
+      } else {
+        for (;;) {
+          if (mCurrentFrame == mRootFrame) {
+            mCurrentFrame = nullptr;
+            break;
+          }
+          mCurrentPosition -= mCurrentFrame->GetPosition();
+          if (mCurrentFrame->GetContent()->IsSVGElement(nsGkAtoms::textPath)) {
+            mTextPathFrames.RemoveLastElement();
+          }
+          PopBaseline();
+          if (mSubtreeRoot.Contains(mCurrentFrame)) {
+            mSubtreePosition = SubtreePosition::After;
+          }
+          next = mCurrentFrame->GetNextSibling();
+          if (next) {
+            mCurrentPosition += next->GetPosition();
+            if (next->GetContent()->IsSVGElement(nsGkAtoms::textPath)) {
+              mTextPathFrames.AppendElement(next);
+            }
+            PushBaseline(next);
+            mCurrentFrame = next;
+            if (mSubtreeRoot.Contains(mCurrentFrame)) {
+              mSubtreePosition = SubtreePosition::Within;
+            }
+            break;
+          }
+          if (mSubtreeRoot.Contains(mCurrentFrame)) {
+            mSubtreePosition = SubtreePosition::After;
+          }
+          mCurrentFrame = mCurrentFrame->GetParent();
+        }
+      }
+    } while (mCurrentFrame && !IsNonEmptyTextFrame(mCurrentFrame));
+  }
+
+  return GetCurrent();
+}
+
+void TextFrameIterator::PushBaseline(nsIFrame* aNextFrame) {
+  StyleDominantBaseline baseline =
+      aNextFrame->StyleVisibility()->mDominantBaseline;
+  mBaselines.AppendElement(baseline);
+}
+
+void TextFrameIterator::PopBaseline() {
+  NS_ASSERTION(!mBaselines.IsEmpty(), "popped too many baselines");
+  mBaselines.RemoveLastElement();
+}
+
+
+class TextRenderedRunIterator {
+ public:
+  enum class RenderedRunFilter {
+    AllFrames,
+    VisibleFrames
+  };
+
+  explicit TextRenderedRunIterator(
+      SVGTextFrame* aSVGTextFrame,
+      RenderedRunFilter aFilter = RenderedRunFilter::AllFrames,
+      const nsIFrame* aSubtree = nullptr)
+      : mFrameIterator(FrameIfAnonymousChildReflowed(aSVGTextFrame), aSubtree),
+        mFilter(aFilter),
+        mTextElementCharIndex(0),
+        mFrameStartTextElementCharIndex(0),
+        mFontSizeScaleFactor(aSVGTextFrame->mFontSizeScaleFactor),
+        mCurrent(First()) {}
+
+  TextRenderedRunIterator(SVGTextFrame* aSVGTextFrame,
+                          RenderedRunFilter aFilter, nsIContent* aSubtree)
+      : mFrameIterator(FrameIfAnonymousChildReflowed(aSVGTextFrame), aSubtree),
+        mFilter(aFilter),
+        mTextElementCharIndex(0),
+        mFrameStartTextElementCharIndex(0),
+        mFontSizeScaleFactor(aSVGTextFrame->mFontSizeScaleFactor),
+        mCurrent(First()) {}
+
+  ~TextRenderedRunIterator() {
+    if (auto* root = mFrameIterator.GetRoot()) {
+      root->ForgetCachedProvider();
+    }
+  }
+
+  TextRenderedRun Current() const { return mCurrent; }
+
+  TextRenderedRun Next();
+
+ private:
+  SVGTextFrame* GetRoot() const { return mFrameIterator.GetRoot(); }
+
+  TextRenderedRun First();
+
+  TextFrameIterator mFrameIterator;
+
+  RenderedRunFilter mFilter;
+
+  uint32_t mTextElementCharIndex;
+
+  uint32_t mFrameStartTextElementCharIndex;
+
+  double mFontSizeScaleFactor;
+
+  TextRenderedRun mCurrent;
+};
+
+TextRenderedRun TextRenderedRunIterator::Next() {
+  if (!mFrameIterator.GetCurrent()) {
+    mCurrent = TextRenderedRun();
+    return mCurrent;
+  }
+
+  nsTextFrame* frame;
+  gfxPoint pt;
+  double rotate;
+  nscoord baseline;
+  uint32_t offset, length;
+  uint32_t charIndex;
+
+  for (;;) {
+    if (mFrameIterator.IsAfterSubtree()) {
+      mCurrent = TextRenderedRun();
+      return mCurrent;
+    }
+
+    frame = mFrameIterator.GetCurrent();
+
+    charIndex = mTextElementCharIndex;
+
+    uint32_t runStart,
+        runEnd;  
+    runStart = mTextElementCharIndex;
+    runEnd = runStart + 1;
+    while (runEnd < GetRoot()->mPositions.Length() &&
+           !GetRoot()->mPositions[runEnd].mRunBoundary) {
+      runEnd++;
+    }
+
+    offset =
+        frame->GetContentOffset() + runStart - mFrameStartTextElementCharIndex;
+    length = runEnd - runStart;
+
+    uint32_t contentEnd = frame->GetContentEnd();
+    if (offset + length > contentEnd) {
+      length = contentEnd - offset;
+    }
+
+    NS_ASSERTION(offset >= uint32_t(frame->GetContentOffset()),
+                 "invalid offset");
+    NS_ASSERTION(offset + length <= contentEnd, "invalid offset or length");
+
+    frame->EnsureTextRun(nsTextFrame::eInflated);
+    baseline = GetBaselinePosition(
+        frame, frame->GetTextRun(nsTextFrame::eInflated),
+        mFrameIterator.DominantBaseline(), mFontSizeScaleFactor);
+
+    uint32_t untrimmedOffset = offset;
+    uint32_t untrimmedLength = length;
+    nsTextFrame::TrimmedOffsets trimmedOffsets =
+        frame->GetTrimmedOffsets(frame->CharacterDataBuffer());
+    TrimOffsets(offset, length, trimmedOffsets);
+    charIndex += offset - untrimmedOffset;
+
+    pt = GetRoot()->mPositions[charIndex].mPosition;
+    rotate = GetRoot()->mPositions[charIndex].mAngle;
+
+    bool skip = !mFrameIterator.IsWithinSubtree() ||
+                GetRoot()->mPositions[mTextElementCharIndex].mHidden;
+    if (mFilter == RenderedRunFilter::VisibleFrames) {
+      skip = skip || !frame->StyleVisibility()->IsVisible();
+    }
+
+    mTextElementCharIndex += untrimmedLength;
+
+    if (offset + untrimmedLength >= contentEnd) {
+      mFrameIterator.GetNext();
+      mTextElementCharIndex += mFrameIterator.UndisplayedCharacters();
+      mFrameStartTextElementCharIndex = mTextElementCharIndex;
+    }
+
+    if (!mFrameIterator.GetCurrent()) {
+      if (skip) {
+        mCurrent = TextRenderedRun();
+        return mCurrent;
+      }
+      break;
+    }
+
+    if (length && !skip) {
+      break;
+    }
+  }
+
+  mCurrent = TextRenderedRun(frame, GetRoot(), pt, rotate, mFontSizeScaleFactor,
+                             baseline, offset, length, charIndex);
+  return mCurrent;
+}
+
+TextRenderedRun TextRenderedRunIterator::First() {
+  if (!mFrameIterator.GetCurrent()) {
+    return TextRenderedRun();
+  }
+
+  if (GetRoot()->mPositions.IsEmpty()) {
+    mFrameIterator.Close();
+    return TextRenderedRun();
+  }
+
+  mTextElementCharIndex = mFrameIterator.UndisplayedCharacters();
+  mFrameStartTextElementCharIndex = mTextElementCharIndex;
+
+  return Next();
+}
+
+
+class MOZ_STACK_CLASS CharIterator {
+  using Range = gfxTextRun::Range;
+
+ public:
+  enum class CharacterFilter {
+    Original,
+    Unskipped,
+    Addressable,
+  };
+
+  CharIterator(SVGTextFrame* aSVGTextFrame, CharacterFilter aFilter,
+               nsIContent* aSubtree, bool aPostReflow = true);
+
+  ~CharIterator() {
+    if (auto* root = mFrameIterator.GetRoot()) {
+      root->ForgetCachedProvider();
+    }
+  }
+
+  bool AtEnd() const { return !mFrameIterator.GetCurrent(); }
+
+  bool Next();
+
+  bool Next(uint32_t aCount);
+
+  void NextWithinSubtree(uint32_t aCount);
+
+  bool AdvanceToCharacter(uint32_t aTextElementCharIndex);
+
+  bool AdvancePastCurrentFrame();
+
+  bool AdvancePastCurrentTextPathFrame();
+
+  bool AdvanceToSubtree();
+
+  nsTextFrame* GetTextFrame() const { return mFrameIterator.GetCurrent(); }
+
+  bool IsWithinSubtree() const { return mFrameIterator.IsWithinSubtree(); }
+
+  bool IsAfterSubtree() const { return mFrameIterator.IsAfterSubtree(); }
+
+  StyleDominantBaseline DominantBaseline() const {
+    return mFrameIterator.DominantBaseline();
+  }
+
+  bool IsOriginalCharSkipped() const {
+    return mSkipCharsIterator.IsOriginalCharSkipped();
+  }
+
+  bool IsClusterAndLigatureGroupStart() const {
+    return mTextRun->IsLigatureGroupStart(
+               mSkipCharsIterator.GetSkippedOffset()) &&
+           mTextRun->IsClusterStart(mSkipCharsIterator.GetSkippedOffset());
+  }
+
+  const gfxTextRun::GlyphRun& GlyphRun() const {
+    return *mTextRun->FindFirstGlyphRunContaining(
+        mSkipCharsIterator.GetSkippedOffset());
+  }
+
+  bool IsOriginalCharTrimmed() const;
+
+  bool IsOriginalCharUnaddressable() const {
+    return IsOriginalCharSkipped() || IsOriginalCharTrimmed();
+  }
+
+  gfxTextRun* TextRun() const { return mTextRun; }
+
+  uint32_t TextElementCharIndex() const { return mTextElementCharIndex; }
+
+  uint32_t GlyphStartTextElementCharIndex() const {
+    return mGlyphStartTextElementCharIndex;
+  }
+
+  gfxFloat GetAdvance(nsPresContext* aContext) const;
+
+  nsIFrame* TextPathFrame() const { return mFrameIterator.TextPathFrame(); }
+
+#ifdef DEBUG
+  nsIContent* GetSubtree() const { return mSubtree; }
+
+  CharacterFilter Filter() const { return mFilter; }
+#endif
+
+ private:
+  bool NextCharacter();
+
+  bool MatchesFilter() const;
+
+  void UpdateGlyphStartTextElementCharIndex() {
+    if (!IsOriginalCharSkipped() && IsClusterAndLigatureGroupStart()) {
+      mGlyphStartTextElementCharIndex = mTextElementCharIndex;
+    }
+  }
+
+  CharacterFilter mFilter;
+
+  TextFrameIterator mFrameIterator;
+
+#ifdef DEBUG
+  nsIContent* const mSubtree;
+#endif
+
+  gfxSkipCharsIterator mSkipCharsIterator;
+
+  mutable nsTextFrame* mFrameForTrimCheck;
+  mutable uint32_t mTrimmedOffset;
+  mutable uint32_t mTrimmedLength;
+
+  gfxTextRun* mTextRun;
+
+  uint32_t mTextElementCharIndex;
+
+  uint32_t mGlyphStartTextElementCharIndex;
+
+  float mLengthAdjustScaleFactor;
+
+  bool mPostReflow;
+};
+
+CharIterator::CharIterator(SVGTextFrame* aSVGTextFrame,
+                           CharIterator::CharacterFilter aFilter,
+                           nsIContent* aSubtree, bool aPostReflow)
+    : mFilter(aFilter),
+      mFrameIterator(aSVGTextFrame, aSubtree),
+#ifdef DEBUG
+      mSubtree(aSubtree),
+#endif
+      mFrameForTrimCheck(nullptr),
+      mTrimmedOffset(0),
+      mTrimmedLength(0),
+      mTextRun(nullptr),
+      mTextElementCharIndex(0),
+      mGlyphStartTextElementCharIndex(0),
+      mLengthAdjustScaleFactor(aSVGTextFrame->mLengthAdjustScaleFactor),
+      mPostReflow(aPostReflow) {
+  if (!AtEnd()) {
+    mSkipCharsIterator = GetTextFrame()->EnsureTextRun(nsTextFrame::eInflated);
+    mTextRun = GetTextFrame()->GetTextRun(nsTextFrame::eInflated);
+    mTextElementCharIndex = mFrameIterator.UndisplayedCharacters();
+    UpdateGlyphStartTextElementCharIndex();
+    if (!MatchesFilter()) {
+      Next();
+    }
+  }
+}
+
+bool CharIterator::Next() {
+  while (NextCharacter()) {
+    if (MatchesFilter()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool CharIterator::Next(uint32_t aCount) {
+  if (aCount == 0 && AtEnd()) {
+    return false;
+  }
+  while (aCount) {
+    if (!Next()) {
+      return false;
+    }
+    aCount--;
+  }
+  return true;
+}
+
+void CharIterator::NextWithinSubtree(uint32_t aCount) {
+  while (IsWithinSubtree() && aCount) {
+    --aCount;
+    if (!Next()) {
+      return;
+    }
+  }
+}
+
+bool CharIterator::AdvanceToCharacter(uint32_t aTextElementCharIndex) {
+  while (mTextElementCharIndex < aTextElementCharIndex) {
+    if (!Next()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool CharIterator::AdvancePastCurrentFrame() {
+  nsTextFrame* currentFrame = GetTextFrame();
+  do {
+    if (!Next()) {
+      return false;
+    }
+  } while (GetTextFrame() == currentFrame);
+  return true;
+}
+
+bool CharIterator::AdvancePastCurrentTextPathFrame() {
+  nsIFrame* currentTextPathFrame = TextPathFrame();
+  NS_ASSERTION(currentTextPathFrame,
+               "expected AdvancePastCurrentTextPathFrame to be called only "
+               "within a text path frame");
+  do {
+    if (!AdvancePastCurrentFrame()) {
+      return false;
+    }
+  } while (TextPathFrame() == currentTextPathFrame);
+  return true;
+}
+
+bool CharIterator::AdvanceToSubtree() {
+  while (!IsWithinSubtree()) {
+    if (IsAfterSubtree()) {
+      return false;
+    }
+    if (!AdvancePastCurrentFrame()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool CharIterator::IsOriginalCharTrimmed() const {
+  if (mFrameForTrimCheck != GetTextFrame()) {
+    mFrameForTrimCheck = GetTextFrame();
+    uint32_t offset = mFrameForTrimCheck->GetContentOffset();
+    uint32_t length = mFrameForTrimCheck->GetContentLength();
+    nsTextFrame::TrimmedOffsets trim = mFrameForTrimCheck->GetTrimmedOffsets(
+        mFrameForTrimCheck->CharacterDataBuffer(),
+        (mPostReflow ? nsTextFrame::TrimmedOffsetFlags::Default
+                     : nsTextFrame::TrimmedOffsetFlags::NotPostReflow));
+    TrimOffsets(offset, length, trim);
+    mTrimmedOffset = offset;
+    mTrimmedLength = length;
+  }
+
+  uint32_t index = mSkipCharsIterator.GetOriginalOffset();
+  return !(
+      (index >= mTrimmedOffset && index < mTrimmedOffset + mTrimmedLength) ||
+      (index >= mTrimmedOffset + mTrimmedLength &&
+       mFrameForTrimCheck->StyleText()->NewlineIsSignificant(
+           mFrameForTrimCheck) &&
+       mFrameForTrimCheck->CharacterDataBuffer().CharAt(index) == '\n'));
+}
+
+gfxFloat CharIterator::GetAdvance(nsPresContext* aContext) const {
+  float cssPxPerDevPx =
+      nsPresContext::AppUnitsToFloatCSSPixels(aContext->AppUnitsPerDevPixel());
+
+  auto& provider =
+      mFrameIterator.GetRoot()->PropertyProviderFor(GetTextFrame());
+  uint32_t offset = mSkipCharsIterator.GetSkippedOffset();
+  gfxFloat advance =
+      mTextRun->GetAdvanceWidth(Range(offset, offset + 1), &provider);
+  return aContext->AppUnitsToGfxUnits(advance) * mLengthAdjustScaleFactor *
+         cssPxPerDevPx;
+}
+
+bool CharIterator::NextCharacter() {
+  if (AtEnd()) {
+    return false;
+  }
+
+  mTextElementCharIndex++;
+
+  mSkipCharsIterator.AdvanceOriginal(1);
+  if (mSkipCharsIterator.GetOriginalOffset() <
+      GetTextFrame()->GetContentEnd()) {
+    UpdateGlyphStartTextElementCharIndex();
+    return true;
+  }
+
+  mFrameIterator.GetNext();
+
+  uint32_t undisplayed = mFrameIterator.UndisplayedCharacters();
+  mTextElementCharIndex += undisplayed;
+  if (!GetTextFrame()) {
+    mSkipCharsIterator = gfxSkipCharsIterator();
+    return false;
+  }
+
+  mSkipCharsIterator = GetTextFrame()->EnsureTextRun(nsTextFrame::eInflated);
+  mTextRun = GetTextFrame()->GetTextRun(nsTextFrame::eInflated);
+  UpdateGlyphStartTextElementCharIndex();
+  return true;
+}
+
+bool CharIterator::MatchesFilter() const {
+  switch (mFilter) {
+    case CharacterFilter::Original:
+      return true;
+    case CharacterFilter::Unskipped:
+      return !IsOriginalCharSkipped();
+    case CharacterFilter::Addressable:
+      return !IsOriginalCharSkipped() && !IsOriginalCharUnaddressable();
+  }
+  MOZ_ASSERT_UNREACHABLE("Invalid mFilter value");
+  return true;
+}
+
+
+class SVGTextDrawPathCallbacks final : public nsTextFrame::DrawPathCallbacks {
+  using imgDrawingParams = image::imgDrawingParams;
+
+ public:
+  SVGTextDrawPathCallbacks(SVGTextFrame* aSVGTextFrame,
+                           SVGContextPaint* aContextPaint, gfxContext& aContext,
+                           nsTextFrame* aFrame, const gfxMatrix& aCanvasTM,
+                           imgDrawingParams& aImgParams,
+                           bool aShouldPaintSVGGlyphs)
+      : DrawPathCallbacks(aShouldPaintSVGGlyphs),
+        mSVGTextFrame(aSVGTextFrame),
+        mContextPaint(aContextPaint),
+        mContext(aContext),
+        mFrame(aFrame),
+        mCanvasTM(aCanvasTM),
+        mImgParams(aImgParams) {}
+
+  void NotifySelectionBackgroundNeedsFill(const Rect& aBackgroundRect,
+                                          nscolor aColor,
+                                          DrawTarget& aDrawTarget) override;
+  void PaintDecorationLine(Rect aPath, bool aPaintingShadows,
+                           nscolor aColor) override;
+  void PaintSelectionDecorationLine(Rect aPath, bool aPaintingShadows,
+                                    nscolor aColor) override;
+  void NotifyBeforeText(bool aPaintingShadows, nscolor aColor) override;
+  void NotifyGlyphPathEmitted() override;
+  void NotifyAfterText() override;
+
+ private:
+  void SetupContext();
+
+  bool IsClipPathChild() const {
+    return mSVGTextFrame->HasAnyStateBits(NS_STATE_SVG_CLIPPATH_CHILD);
+  }
+
+  void HandleTextGeometry();
+
+  void MakeFillPattern(GeneralPattern* aOutPattern);
+
+  void FillAndStrokeGeometry();
+
+  void FillGeometry();
+
+  void StrokeGeometry();
+
+  void ApplyOpacity(sRGBColor& aColor, const StyleSVGPaint& aPaint,
+                    const StyleSVGOpacity& aOpacity) const;
+
+  SVGTextFrame* const mSVGTextFrame;
+  SVGContextPaint* const mContextPaint;
+  gfxContext& mContext;
+  nsTextFrame* const mFrame;
+  const gfxMatrix& mCanvasTM;
+  imgDrawingParams& mImgParams;
+
+  nscolor mColor = NS_RGBA(0, 0, 0, 0);
+
+  bool mPaintingShadows = false;
+};
+
+void SVGTextDrawPathCallbacks::NotifySelectionBackgroundNeedsFill(
+    const Rect& aBackgroundRect, nscolor aColor, DrawTarget& aDrawTarget) {
+  if (IsClipPathChild()) {
+    return;
+  }
+
+  mColor = aColor;  
+  mPaintingShadows = false;
+
+  GeneralPattern fillPattern;
+  MakeFillPattern(&fillPattern);
+  if (fillPattern.GetPattern()) {
+    DrawOptions drawOptions(aColor == NS_40PERCENT_FOREGROUND_COLOR ? 0.4
+                                                                    : 1.0);
+    aDrawTarget.FillRect(aBackgroundRect, fillPattern, drawOptions);
+  }
+}
+
+void SVGTextDrawPathCallbacks::NotifyBeforeText(bool aPaintingShadows,
+                                                nscolor aColor) {
+  mColor = aColor;
+  mPaintingShadows = aPaintingShadows;
+  SetupContext();
+  mContext.NewPath();
+}
+
+void SVGTextDrawPathCallbacks::NotifyGlyphPathEmitted() {
+  HandleTextGeometry();
+  mContext.NewPath();
+}
+
+void SVGTextDrawPathCallbacks::NotifyAfterText() { mContext.Restore(); }
+
+void SVGTextDrawPathCallbacks::PaintDecorationLine(Rect aPath,
+                                                   bool aPaintingShadows,
+                                                   nscolor aColor) {
+  mColor = aColor;
+  mPaintingShadows = aPaintingShadows;
+  AntialiasMode aaMode =
+      SVGUtils::ToAntialiasMode(mFrame->StyleText()->mTextRendering);
+
+  mContext.Save();
+  mContext.NewPath();
+  mContext.SetAntialiasMode(aaMode);
+  mContext.Rectangle(ThebesRect(aPath));
+  HandleTextGeometry();
+  mContext.NewPath();
+  mContext.Restore();
+}
+
+void SVGTextDrawPathCallbacks::PaintSelectionDecorationLine(
+    Rect aPath, bool aPaintingShadows, nscolor aColor) {
+  if (IsClipPathChild()) {
+    return;
+  }
+
+  mColor = aColor;
+  mPaintingShadows = aPaintingShadows;
+
+  mContext.Save();
+  mContext.NewPath();
+  mContext.Rectangle(ThebesRect(aPath));
+  FillAndStrokeGeometry();
+  mContext.Restore();
+}
+
+void SVGTextDrawPathCallbacks::SetupContext() {
+  mContext.Save();
+
+  mContext.SetAntialiasMode(
+      SVGUtils::ToAntialiasMode(mFrame->StyleText()->mTextRendering));
+}
+
+void SVGTextDrawPathCallbacks::HandleTextGeometry() {
+  if (IsClipPathChild()) {
+    RefPtr<Path> path = mContext.GetPath();
+    ColorPattern white(
+        DeviceColor(1.f, 1.f, 1.f, 1.f));  
+    mContext.GetDrawTarget()->Fill(path, white);
+  } else {
+    gfxContextMatrixAutoSaveRestore saveMatrix(&mContext);
+    mContext.SetMatrixDouble(mCanvasTM);
+
+    FillAndStrokeGeometry();
+  }
+}
+
+void SVGTextDrawPathCallbacks::ApplyOpacity(
+    sRGBColor& aColor, const StyleSVGPaint& aPaint,
+    const StyleSVGOpacity& aOpacity) const {
+  if (aPaint.kind.tag == StyleSVGPaintKind::Tag::Color) {
+    aColor.a *=
+        sRGBColor::FromABGR(aPaint.kind.AsColor().CalcColor(*mFrame->Style()))
+            .a;
+  }
+  aColor.a *= SVGUtils::GetOpacity(aOpacity, mContextPaint);
+}
+
+void SVGTextDrawPathCallbacks::MakeFillPattern(GeneralPattern* aOutPattern) {
+  if (mColor == NS_SAME_AS_FOREGROUND_COLOR ||
+      mColor == NS_40PERCENT_FOREGROUND_COLOR) {
+    SVGUtils::MakeFillPatternFor(mFrame, &mContext, aOutPattern, mImgParams,
+                                 mContextPaint);
+    return;
+  }
+
+  if (mColor == NS_TRANSPARENT) {
+    return;
+  }
+
+  sRGBColor color(sRGBColor::FromABGR(mColor));
+  if (mPaintingShadows) {
+    ApplyOpacity(color, mFrame->StyleSVG()->mFill,
+                 mFrame->StyleSVG()->mFillOpacity);
+  }
+  aOutPattern->InitColorPattern(ToDeviceColor(color));
+}
+
+void SVGTextDrawPathCallbacks::FillAndStrokeGeometry() {
+  gfxGroupForBlendAutoSaveRestore autoGroupForBlend(&mContext);
+  if (mColor == NS_40PERCENT_FOREGROUND_COLOR) {
+    autoGroupForBlend.PushGroupForBlendBack(gfxContentType::COLOR_ALPHA, 0.4f);
+  }
+
+  uint32_t paintOrder = mFrame->StyleSVG()->mPaintOrder;
+  if (!paintOrder) {
+    FillGeometry();
+    StrokeGeometry();
+  } else {
+    while (paintOrder) {
+      auto component = StylePaintOrder(paintOrder & kPaintOrderMask);
+      switch (component) {
+        case StylePaintOrder::Fill:
+          FillGeometry();
+          break;
+        case StylePaintOrder::Stroke:
+          StrokeGeometry();
+          break;
+        default:
+          MOZ_FALLTHROUGH_ASSERT("Unknown paint-order value");
+        case StylePaintOrder::Markers:
+        case StylePaintOrder::Normal:
+          break;
+      }
+      paintOrder >>= kPaintOrderShift;
+    }
+  }
+}
+
+void SVGTextDrawPathCallbacks::FillGeometry() {
+  if (mFrame->StyleSVG()->mFill.kind.IsNone()) {
+    return;
+  }
+  GeneralPattern fillPattern;
+  MakeFillPattern(&fillPattern);
+  if (fillPattern.GetPattern()) {
+    RefPtr<Path> path = mContext.GetPath();
+    FillRule fillRule = SVGUtils::ToFillRule(mFrame->StyleSVG()->mFillRule);
+    if (fillRule != path->GetFillRule()) {
+      Path::SetFillRule(path, fillRule);
+    }
+    mContext.GetDrawTarget()->Fill(path, fillPattern);
+  }
+}
+
+void SVGTextDrawPathCallbacks::StrokeGeometry() {
+  if (!(mColor == NS_SAME_AS_FOREGROUND_COLOR ||
+        mColor == NS_40PERCENT_FOREGROUND_COLOR || mPaintingShadows)) {
+    return;
+  }
+
+  if (!SVGUtils::HasStroke(mFrame, mContextPaint)) {
+    return;
+  }
+
+  GeneralPattern strokePattern;
+  if (mPaintingShadows) {
+    sRGBColor color(sRGBColor::FromABGR(mColor));
+    ApplyOpacity(color, mFrame->StyleSVG()->mStroke,
+                 mFrame->StyleSVG()->mStrokeOpacity);
+    strokePattern.InitColorPattern(ToDeviceColor(color));
+  } else {
+    SVGUtils::MakeStrokePatternFor(mFrame, &mContext, &strokePattern,
+                                   mImgParams, mContextPaint);
+  }
+  if (strokePattern.GetPattern()) {
+    SVGElement* svgOwner =
+        SVGElement::FromNode(mFrame->GetParent()->GetContent());
+
+    gfxMatrix outerSVGToUser;
+    if (SVGUtils::GetNonScalingStrokeTransform(mFrame, &outerSVGToUser) &&
+        outerSVGToUser.Invert()) {
+      mContext.Multiply(outerSVGToUser);
+    }
+
+    RefPtr<Path> path = mContext.GetPath();
+    SVGContentUtils::AutoStrokeOptions strokeOptions;
+    SVGContentUtils::GetStrokeOptions(&strokeOptions, svgOwner, mFrame->Style(),
+                                      mContextPaint);
+    DrawOptions drawOptions;
+    drawOptions.mAntialiasMode =
+        SVGUtils::ToAntialiasMode(mFrame->StyleText()->mTextRendering);
+    mContext.GetDrawTarget()->Stroke(path, strokePattern, strokeOptions);
+  }
+}
+
+
+
+class DisplaySVGText final : public DisplaySVGItem {
+ public:
+  DisplaySVGText(nsDisplayListBuilder* aBuilder, SVGTextFrame* aFrame)
+      : DisplaySVGItem(aBuilder, aFrame) {
+    MOZ_COUNT_CTOR(DisplaySVGText);
+  }
+
+  MOZ_COUNTED_DTOR_FINAL(DisplaySVGText)
+
+  NS_DISPLAY_DECL_NAME("DisplaySVGText", TYPE_SVG_TEXT)
+
+  nsDisplayItemGeometry* AllocateGeometry(
+      nsDisplayListBuilder* aBuilder) override {
+    return new nsDisplayItemGenericGeometry(this, aBuilder);
+  }
+
+  nsRect GetComponentAlphaBounds(
+      nsDisplayListBuilder* aBuilder) const override {
+    bool snap;
+    return GetBounds(aBuilder, &snap);
+  }
+};
+
+
+NS_QUERYFRAME_HEAD(SVGTextFrame)
+  NS_QUERYFRAME_ENTRY(SVGTextFrame)
+NS_QUERYFRAME_TAIL_INHERITING(SVGDisplayContainerFrame)
+
+}  
+
+
+nsIFrame* NS_NewSVGTextFrame(mozilla::PresShell* aPresShell,
+                             mozilla::ComputedStyle* aStyle) {
+  return new (aPresShell)
+      mozilla::SVGTextFrame(aStyle, aPresShell->GetPresContext());
+}
+
+namespace mozilla {
+
+NS_IMPL_FRAMEARENA_HELPERS(SVGTextFrame)
+
+
+void SVGTextFrame::Init(nsIContent* aContent, nsContainerFrame* aParent,
+                        nsIFrame* aPrevInFlow) {
+  NS_ASSERTION(aContent->IsSVGElement(nsGkAtoms::text),
+               "Content is not an SVG text");
+
+  SVGDisplayContainerFrame::Init(aContent, aParent, aPrevInFlow);
+  AddStateBits(aParent->GetStateBits() & NS_STATE_SVG_CLIPPATH_CHILD);
+
+  mMutationObserver = new MutationObserver(this);
+
+  if (HasAnyStateBits(NS_FRAME_IS_NONDISPLAY)) {
+    ScheduleReflowSVGNonDisplayText(
+        IntrinsicDirty::FrameAncestorsAndDescendants);
+  }
+}
+
+void SVGTextFrame::BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                                    const nsDisplayListSet& aLists) {
+  if (IsSubtreeDirty()) {
+    return;
+  }
+  if (!IsVisibleForPainting() && aBuilder->IsForPainting()) {
+    return;
+  }
+  DisplayOutline(aBuilder, aLists);
+  aLists.Content()->AppendNewToTop<DisplaySVGText>(aBuilder, this);
+}
+
+void SVGTextFrame::DidSetComputedStyle(ComputedStyle* aOldComputedStyle) {
+  SVGDisplayContainerFrame::DidSetComputedStyle(aOldComputedStyle);
+  if (StyleSVGReset()->HasNonScalingStroke() &&
+      (!aOldComputedStyle ||
+       !aOldComputedStyle->StyleSVGReset()->HasNonScalingStroke())) {
+    SVGUtils::UpdateNonScalingStrokeStateBit(this);
+  }
+}
+
+nsresult SVGTextFrame::AttributeChanged(int32_t aNameSpaceID,
+                                        nsAtom* aAttribute, AttrModType) {
+  if (aNameSpaceID != kNameSpaceID_None) {
+    return NS_OK;
+  }
+
+  if (aAttribute == nsGkAtoms::transform) {
+
+    if (!HasAnyStateBits(NS_FRAME_FIRST_REFLOW) && mCanvasTM &&
+        mCanvasTM->IsSingular()) {
+      NotifyGlyphMetricsChange(false);
+    }
+    mCanvasTM = nullptr;
+  } else if (IsGlyphPositioningAttribute(aAttribute) ||
+             aAttribute == nsGkAtoms::textLength ||
+             aAttribute == nsGkAtoms::lengthAdjust) {
+    NotifyGlyphMetricsChange(false);
+  }
+
+  return NS_OK;
+}
+
+void SVGTextFrame::ReflowSVGNonDisplayText() {
+  MOZ_ASSERT(SVGUtils::AnyOuterSVGIsCallingReflowSVG(this),
+             "only call ReflowSVGNonDisplayText when an outer SVG frame is "
+             "under ReflowSVG");
+  MOZ_ASSERT(HasAnyStateBits(NS_FRAME_IS_NONDISPLAY),
+             "only call ReflowSVGNonDisplayText if the frame is "
+             "NS_FRAME_IS_NONDISPLAY");
+
+  this->MarkSubtreeDirty();
+
+  MaybeReflowAnonymousBlockChild();
+  UpdateGlyphPositioning();
+}
+
+void SVGTextFrame::ScheduleReflowSVGNonDisplayText(IntrinsicDirty aReason) {
+  MOZ_ASSERT(!SVGUtils::OuterSVGIsCallingReflowSVG(this),
+             "do not call ScheduleReflowSVGNonDisplayText when the outer SVG "
+             "frame is under ReflowSVG");
+  MOZ_ASSERT(!HasAnyStateBits(NS_STATE_SVG_TEXT_IN_REFLOW),
+             "do not call ScheduleReflowSVGNonDisplayText while reflowing the "
+             "anonymous block child");
+
+
+  nsIFrame* f = this;
+  while (f) {
+    if (!f->HasAnyStateBits(NS_FRAME_IS_NONDISPLAY)) {
+      if (f->IsSubtreeDirty()) {
+        return;
+      }
+      if (!f->HasAnyStateBits(NS_FRAME_SVG_LAYOUT)) {
+        break;
+      }
+      f->AddStateBits(NS_FRAME_HAS_DIRTY_CHILDREN);
+    }
+    f = f->GetParent();
+  }
+
+  MOZ_ASSERT(f, "should have found an ancestor frame to reflow");
+
+  PresShell()->FrameNeedsReflow(f, aReason, NS_FRAME_IS_DIRTY);
+}
+
+NS_IMPL_ISUPPORTS(SVGTextFrame::MutationObserver, nsIMutationObserver)
+
+void SVGTextFrame::MutationObserver::ContentAppended(
+    nsIContent* aFirstNewContent, const ContentAppendInfo&) {
+  mFrame->NotifyGlyphMetricsChange(true);
+}
+
+void SVGTextFrame::MutationObserver::ContentInserted(nsIContent* aChild,
+                                                     const ContentInsertInfo&) {
+  mFrame->NotifyGlyphMetricsChange(true);
+}
+
+void SVGTextFrame::MutationObserver::ContentWillBeRemoved(
+    nsIContent* aChild, const ContentRemoveInfo& aInfo) {
+  if (aInfo.mBatchRemovalState && !aInfo.mBatchRemovalState->mIsFirst) {
+    return;
+  }
+  mFrame->NotifyGlyphMetricsChange(true);
+}
+
+void SVGTextFrame::MutationObserver::CharacterDataChanged(
+    nsIContent* aContent, const CharacterDataChangeInfo&) {
+  mFrame->NotifyGlyphMetricsChange(true);
+}
+
+void SVGTextFrame::MutationObserver::AttributeChanged(
+    Element* aElement, int32_t aNameSpaceID, nsAtom* aAttribute, AttrModType,
+    const nsAttrValue* aOldValue) {
+  if (!aElement->IsSVGElement()) {
+    return;
+  }
+
+  if (aElement == mFrame->GetContent()) {
+    return;
+  }
+
+  mFrame->HandleAttributeChangeInDescendant(aElement, aNameSpaceID, aAttribute);
+}
+
+void SVGTextFrame::HandleAttributeChangeInDescendant(Element* aElement,
+                                                     int32_t aNameSpaceID,
+                                                     nsAtom* aAttribute) {
+  if (aElement->IsSVGElement(nsGkAtoms::textPath)) {
+    if (aNameSpaceID == kNameSpaceID_None &&
+        (aAttribute == nsGkAtoms::startOffset ||
+         aAttribute == nsGkAtoms::path || aAttribute == nsGkAtoms::side)) {
+      NotifyGlyphMetricsChange(false);
+    } else if ((aNameSpaceID == kNameSpaceID_XLink ||
+                aNameSpaceID == kNameSpaceID_None) &&
+               aAttribute == nsGkAtoms::href) {
+      nsIFrame* childElementFrame = aElement->GetPrimaryFrame();
+      if (childElementFrame) {
+        SVGObserverUtils::RemoveTextPathObserver(childElementFrame);
+        NotifyGlyphMetricsChange(false);
+      }
+    }
+  } else {
+    if (aNameSpaceID == kNameSpaceID_None &&
+        IsGlyphPositioningAttribute(aAttribute)) {
+      NotifyGlyphMetricsChange(false);
+    }
+  }
+}
+
+void SVGTextFrame::FindCloserFrameForSelection(
+    const nsPoint& aPoint, FrameWithDistance* aCurrentBestFrame) {
+  if (HasAnyStateBits(NS_FRAME_IS_NONDISPLAY)) {
+    return;
+  }
+
+  UpdateGlyphPositioning();
+
+  nsPresContext* presContext = PresContext();
+
+  TextRenderedRunIterator it(this);
+  for (TextRenderedRun run = it.Current(); run.mFrame; run = it.Next()) {
+    TextRenderedRun::GeometryFlags flags(
+        TextRenderedRun::GeometryFlag::IncludeFill,
+        TextRenderedRun::GeometryFlag::IncludeStroke,
+        TextRenderedRun::GeometryFlag::NoHorizontalOverflow);
+    SVGBBox userRect = run.GetUserSpaceRect(presContext, flags);
+    float devPxPerCSSPx = presContext->CSSPixelsToDevPixels(1.f);
+    userRect.Scale(devPxPerCSSPx);
+
+    if (!userRect.IsEmpty()) {
+      gfxMatrix m;
+      nsRect rect =
+          SVGUtils::ToCanvasBounds(userRect.ToThebesRect(), m, presContext);
+
+      if (nsLayoutUtils::PointIsCloserToRect(aPoint, rect,
+                                             aCurrentBestFrame->mXDistance,
+                                             aCurrentBestFrame->mYDistance)) {
+        aCurrentBestFrame->mFrame = run.mFrame;
+      }
+    }
+  }
+}
+
+
+void SVGTextFrame::NotifySVGChanged(ChangeFlags aFlags) {
+  MOZ_ASSERT(aFlags.contains(ChangeFlag::TransformChanged) ||
+                 aFlags.contains(ChangeFlag::CoordContextChanged),
+             "Invalidation logic may need adjusting");
+
+  bool needNewBounds = false;
+  bool needGlyphMetricsUpdate = false;
+  if (aFlags.contains(ChangeFlag::CoordContextChanged) &&
+      HasAnyStateBits(NS_STATE_SVG_POSITIONING_MAY_USE_PERCENTAGES)) {
+    needGlyphMetricsUpdate = true;
+  }
+
+  if (aFlags.contains(ChangeFlag::TransformChanged)) {
+    if (mCanvasTM && mCanvasTM->IsSingular()) {
+      needNewBounds = true;
+      needGlyphMetricsUpdate = true;
+    }
+    mCanvasTM = nullptr;
+    if (StyleSVGReset()->HasNonScalingStroke()) {
+      needNewBounds = true;
+    }
+
+    const float scale = GetContextScale(this);
+    if (scale != mLastContextScale) {
+      if (mLastContextScale == 0.0f) {
+        needNewBounds = true;
+        needGlyphMetricsUpdate = true;
+      } else {
+        float change = scale / mLastContextScale;
+        if (change >= 2.0f || change <= 0.5f) {
+          needNewBounds = true;
+          needGlyphMetricsUpdate = true;
+        }
+      }
+    }
+  }
+
+  if (needNewBounds) {
+    ScheduleReflowSVG();
+  }
+
+  if (needGlyphMetricsUpdate) {
+    if (!HasAnyStateBits(NS_FRAME_FIRST_REFLOW)) {
+      NotifyGlyphMetricsChange(false);
+    }
+  }
+}
+
+static int32_t GetCaretOffset(nsCaret* aCaret) {
+  RefPtr<Selection> selection = aCaret->GetSelection();
+  if (!selection) {
+    return -1;
+  }
+
+  return selection->AnchorOffset();
+}
+
+static bool ShouldPaintCaret(const TextRenderedRun& aThisRun, nsCaret* aCaret) {
+  int32_t caretOffset = GetCaretOffset(aCaret);
+
+  if (caretOffset < 0) {
+    return false;
+  }
+
+  return uint32_t(caretOffset) >= aThisRun.mTextFrameContentOffset &&
+         uint32_t(caretOffset) < aThisRun.mTextFrameContentOffset +
+                                     aThisRun.mTextFrameContentLength;
+}
+
+void SVGTextFrame::PaintSVG(gfxContext& aContext, const gfxMatrix& aTransform,
+                            imgDrawingParams& aImgParams) {
+  DrawTarget& aDrawTarget = *aContext.GetDrawTarget();
+  nsIFrame* kid = PrincipalChildList().FirstChild();
+  if (!kid) {
+    return;
+  }
+
+  if (IsSubtreeDirty()) {
+    return;
+  }
+
+  if (HasAnyStateBits(NS_FRAME_IS_NONDISPLAY)) {
+    UpdateGlyphPositioning();
+  }
+
+  const float epsilon = 0.0001;
+  if (std::abs(mLengthAdjustScaleFactor) < epsilon) {
+    return;
+  }
+
+  if (aTransform.IsSingular()) {
+    NS_WARNING("Can't render text element!");
+    return;
+  }
+
+  gfxMatrix initialMatrix = aContext.CurrentMatrixDouble();
+
+  gfxMatrix matrixForPaintServers = aTransform * initialMatrix;
+
+  nsPresContext* presContext = PresContext();
+  auto auPerDevPx = presContext->AppUnitsPerDevPixel();
+  float cssPxPerDevPx = nsPresContext::AppUnitsToFloatCSSPixels(auPerDevPx);
+  gfxMatrix canvasTMForChildren = aTransform;
+  canvasTMForChildren.PreScale(cssPxPerDevPx, cssPxPerDevPx);
+  initialMatrix.PreScale(1 / cssPxPerDevPx, 1 / cssPxPerDevPx);
+
+  gfxContextMatrixAutoSaveRestore matSR(&aContext);
+  aContext.NewPath();
+  aContext.Multiply(canvasTMForChildren);
+  gfxMatrix currentMatrix = aContext.CurrentMatrixDouble();
+
+  RefPtr<nsCaret> caret = presContext->PresShell()->GetActiveCaret();
+  nsIFrame* caretFrame = caret->GetPaintGeometry();
+
+  gfxContextAutoSaveRestore ctxSR;
+  TextRenderedRunIterator it(
+      this, TextRenderedRunIterator::RenderedRunFilter::VisibleFrames);
+  TextRenderedRun run = it.Current();
+
+  SVGContextPaint* outerContextPaint =
+      SVGContextPaint::GetContextPaint(GetContent());
+
+  while (run.mFrame) {
+    nsTextFrame* frame = run.mFrame;
+
+    auto contextPaint = MakeRefPtr<SVGContextPaint>(
+        &aDrawTarget, initialMatrix, frame, outerContextPaint, aImgParams);
+    DrawMode drawMode = contextPaint->GetDrawMode();
+    if (drawMode & DrawMode::GLYPH_STROKE) {
+      ctxSR.EnsureSaved(&aContext);
+      SVGUtils::SetupStrokeGeometry(frame->GetParent(), &aContext,
+                                    outerContextPaint);
+    }
+
+    nscoord startEdge, endEdge;
+    run.GetClipEdges(startEdge, endEdge);
+
+    gfxMatrix runTransform = run.GetTransformFromUserSpaceForPainting(
+                                 presContext, startEdge, endEdge) *
+                             currentMatrix;
+    aContext.SetMatrixDouble(runTransform);
+
+    if (drawMode != DrawMode(0)) {
+      bool paintSVGGlyphs;
+      nsTextFrame::PaintTextParams params(&aContext);
+      params.framePt = Point();
+      params.dirtyRect =
+          LayoutDevicePixel::FromAppUnits(frame->InkOverflowRect(), auPerDevPx);
+      params.contextPaint = contextPaint;
+      bool isSelected;
+      if (HasAnyStateBits(NS_STATE_SVG_CLIPPATH_CHILD)) {
+        params.state = nsTextFrame::PaintTextParams::GenerateTextMask;
+        isSelected = false;
+      } else {
+        isSelected = frame->IsSelected();
+      }
+      gfxGroupForBlendAutoSaveRestore autoGroupForBlend(&aContext);
+      float opacity = 1.0f;
+      nsIFrame* ancestor = frame->GetParent();
+      while (ancestor != this) {
+        opacity *= ancestor->StyleEffects()->mOpacity;
+        ancestor = ancestor->GetParent();
+      }
+      if (opacity < 1.0f) {
+        autoGroupForBlend.PushGroupForBlendBack(gfxContentType::COLOR_ALPHA,
+                                                opacity);
+      }
+
+      if (ShouldRenderAsPath(frame, outerContextPaint, paintSVGGlyphs)) {
+        SVGTextDrawPathCallbacks callbacks(this, outerContextPaint, aContext,
+                                           frame, matrixForPaintServers,
+                                           aImgParams, paintSVGGlyphs);
+        params.callbacks = &callbacks;
+        frame->PaintText(params, startEdge, endEdge, nsPoint(), isSelected,
+                         aImgParams);
+      } else {
+        frame->PaintText(params, startEdge, endEdge, nsPoint(), isSelected,
+                         aImgParams);
+      }
+    }
+
+    if (frame == caretFrame && ShouldPaintCaret(run, caret)) {
+      caret->PaintCaret(aDrawTarget, frame, nsPoint());
+      aContext.NewPath();
+    }
+
+    run = it.Next();
+  }
+}
+
+nsIFrame* SVGTextFrame::GetFrameForPoint(const gfxPoint& aPoint) {
+  NS_ASSERTION(PrincipalChildList().FirstChild(), "must have a child frame");
+
+  if (HasAnyStateBits(NS_FRAME_IS_NONDISPLAY)) {
+    UpdateGlyphPositioning();
+  } else {
+    NS_ASSERTION(!IsSubtreeDirty(), "reflow should have happened");
+  }
+
+  if (!SVGUtils::HitTestClip(this, aPoint)) {
+    return nullptr;
+  }
+
+  nsPresContext* presContext = PresContext();
+
+
+  TextRenderedRunIterator it(this);
+  nsIFrame* hit = nullptr;
+  for (TextRenderedRun run = it.Current(); run.mFrame; run = it.Next()) {
+    if (SVGUtils::GetGeometryHitTestFlags(run.mFrame).isEmpty()) {
+      continue;
+    }
+
+    gfxMatrix m = run.GetTransformFromRunUserSpaceToUserSpace(presContext);
+    if (!m.Invert()) {
+      return nullptr;
+    }
+
+    gfxPoint pointInRunUserSpace = m.TransformPoint(aPoint);
+    gfxRect frameRect =
+        run.GetRunUserSpaceRect({TextRenderedRun::GeometryFlag::IncludeFill,
+                                 TextRenderedRun::GeometryFlag::IncludeStroke})
+            .ToThebesRect();
+
+    if (frameRect.Contains(pointInRunUserSpace)) {
+      hit = run.mFrame;
+    }
+  }
+  return hit;
+}
+
+void SVGTextFrame::ReflowSVG() {
+  MOZ_ASSERT(SVGUtils::AnyOuterSVGIsCallingReflowSVG(this),
+             "This call is probaby a wasteful mistake");
+
+  MOZ_ASSERT(!HasAnyStateBits(NS_FRAME_IS_NONDISPLAY),
+             "ReflowSVG mechanism not designed for this");
+
+  if (!SVGUtils::NeedsReflowSVG(this)) {
+    MOZ_ASSERT(!HasAnyStateBits(NS_STATE_SVG_TEXT_CORRESPONDENCE_DIRTY |
+                                NS_STATE_SVG_POSITIONING_DIRTY),
+               "How did this happen?");
+    return;
+  }
+
+  MaybeReflowAnonymousBlockChild();
+  UpdateGlyphPositioning();
+
+  nsPresContext* presContext = PresContext();
+
+  SVGBBox r;
+  TextRenderedRunIterator it(
+      this, TextRenderedRunIterator::RenderedRunFilter::AllFrames);
+  for (TextRenderedRun run = it.Current(); run.mFrame; run = it.Next()) {
+    TextRenderedRun::GeometryFlags runFlags;
+    if (!run.mFrame->StyleSVG()->mFill.kind.IsNone()) {
+      runFlags += TextRenderedRun::GeometryFlag::IncludeFill;
+    }
+    if (SVGUtils::HasStroke(run.mFrame)) {
+      runFlags += TextRenderedRun::GeometryFlag::IncludeStroke;
+    }
+    SVGHitTestFlags hitTestFlags =
+        SVGUtils::GetGeometryHitTestFlags(run.mFrame);
+    if (hitTestFlags.contains(SVGHitTestFlag::Fill)) {
+      runFlags += TextRenderedRun::GeometryFlag::IncludeFill;
+    }
+    if (hitTestFlags.contains(SVGHitTestFlag::Stroke)) {
+      runFlags += TextRenderedRun::GeometryFlag::IncludeStroke;
+    }
+
+    if (!runFlags.isEmpty()) {
+      r.UnionEdges(run.GetUserSpaceRect(presContext, runFlags));
+    }
+  }
+
+  if (r.IsEmpty()) {
+    mRect.SetEmpty();
+  } else {
+    mRect = nsLayoutUtils::RoundGfxRectToAppRect((const Rect&)r,
+                                                 AppUnitsPerCSSPixel());
+
+    if (mLastContextScale != 0.0f) {
+      mRect.Inflate(
+          ceil(presContext->AppUnitsPerDevPixel() / mLastContextScale));
+    }
+  }
+
+  if (HasAnyStateBits(NS_FRAME_FIRST_REFLOW)) {
+    SVGObserverUtils::UpdateEffects(this);
+  }
+
+  RemoveStateBits(NS_FRAME_FIRST_REFLOW | NS_FRAME_IS_DIRTY |
+                  NS_FRAME_HAS_DIRTY_CHILDREN);
+
+  nsRect overflow = nsRect(nsPoint(0, 0), mRect.Size());
+  OverflowAreas overflowAreas(overflow, overflow);
+  FinishAndStoreOverflow(overflowAreas, mRect.Size());
+}
+
+static TextRenderedRun::GeometryFlags TextRenderedRunFlagsForBBoxContribution(
+    const TextRenderedRun& aRun, SVGBBoxFlags aBBoxFlags) {
+  TextRenderedRun::GeometryFlags flags;
+  if (aBBoxFlags.contains(SVGBBoxFlag::IncludeFillGeometry)) {
+    flags += TextRenderedRun::GeometryFlag::IncludeFill;
+  }
+  if (aBBoxFlags.contains(SVGBBoxFlag::IncludeStrokeGeometry) ||
+      (aBBoxFlags.contains(SVGBBoxFlag::IncludeStroke) &&
+       SVGUtils::HasStroke(aRun.mFrame))) {
+    flags += TextRenderedRun::GeometryFlag::IncludeStroke;
+  }
+  return flags;
+}
+
+SVGBBox SVGTextFrame::GetBBoxContribution(const Matrix& aToBBoxUserspace,
+                                          SVGBBoxFlags aFlags) {
+  NS_ASSERTION(PrincipalChildList().FirstChild(), "must have a child frame");
+  SVGBBox bbox;
+
+  if (aFlags.contains(SVGBBoxFlag::ForGetClientRects)) {
+    if (!mRect.IsEmpty()) {
+      Rect rect = NSRectToRect(mRect, AppUnitsPerCSSPixel());
+      bbox = aToBBoxUserspace.TransformBounds(rect);
+    }
+    return bbox;
+  }
+
+  nsIFrame* kid = PrincipalChildList().FirstChild();
+  if (kid && kid->IsSubtreeDirty()) {
+    return bbox;
+  }
+
+  UpdateGlyphPositioning();
+
+  nsPresContext* presContext = PresContext();
+
+  TextRenderedRunIterator it(this);
+  for (TextRenderedRun run = it.Current(); run.mFrame; run = it.Next()) {
+    TextRenderedRun::GeometryFlags flags =
+        TextRenderedRunFlagsForBBoxContribution(run, aFlags);
+    gfxMatrix m = ThebesMatrix(aToBBoxUserspace);
+    SVGBBox bboxForRun = run.GetUserSpaceRect(presContext, flags, &m);
+    if (aFlags.contains(SVGBBoxFlag::DisregardCSSZoom)) {
+      bboxForRun.Scale(1 / run.mFrame->Style()->EffectiveZoom().ToFloat());
+    }
+
+    bbox.UnionEdges(bboxForRun);
+  }
+
+  return bbox;
+}
+
+
+static bool HasTextContent(nsIContent* aContent) {
+  NS_ASSERTION(aContent, "expected non-null aContent");
+
+  TextNodeIterator it(aContent);
+  for (Text* text = it.GetCurrent(); text; text = it.GetNext()) {
+    if (text->TextLength() != 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static uint32_t GetTextContentLength(nsIContent* aContent) {
+  NS_ASSERTION(aContent, "expected non-null aContent");
+
+  uint32_t length = 0;
+  TextNodeIterator it(aContent);
+  for (Text* text = it.GetCurrent(); text; text = it.GetNext()) {
+    length += text->TextLength();
+  }
+  return length;
+}
+
+int32_t SVGTextFrame::ConvertTextElementCharIndexToAddressableIndex(
+    int32_t aIndex, dom::SVGTextContentElement* aElement) {
+  CharIterator it(this, CharIterator::CharacterFilter::Original, aElement);
+  if (!it.AdvanceToSubtree()) {
+    return -1;
+  }
+  int32_t result = 0;
+  int32_t textElementCharIndex;
+  while (!it.AtEnd() && it.IsWithinSubtree()) {
+    bool addressable = !it.IsOriginalCharUnaddressable();
+    textElementCharIndex = it.TextElementCharIndex();
+    it.Next();
+    uint32_t delta = it.TextElementCharIndex() - textElementCharIndex;
+    aIndex -= delta;
+    if (addressable) {
+      if (aIndex < 0) {
+        return result;
+      }
+      result += delta;
+    }
+  }
+  return -1;
+}
+
+uint32_t SVGTextFrame::GetNumberOfChars(dom::SVGTextContentElement* aElement) {
+  nsIFrame* kid = PrincipalChildList().FirstChild();
+  if (kid->IsSubtreeDirty()) {
+    return 0;
+  }
+
+  UpdateGlyphPositioning();
+
+  uint32_t n = 0;
+  CharIterator it(this, CharIterator::CharacterFilter::Addressable, aElement);
+  if (it.AdvanceToSubtree()) {
+    while (!it.AtEnd() && it.IsWithinSubtree()) {
+      n++;
+      it.Next();
+    }
+  }
+  return n;
+}
+
+float SVGTextFrame::GetComputedTextLength(
+    dom::SVGTextContentElement* aElement) {
+  nsIFrame* kid = PrincipalChildList().FirstChild();
+  if (kid->IsSubtreeDirty()) {
+    return 0;
+  }
+
+  UpdateGlyphPositioning();
+
+  float cssPxPerDevPx = nsPresContext::AppUnitsToFloatCSSPixels(
+      PresContext()->AppUnitsPerDevPixel());
+
+  nscoord length = 0;
+  TextRenderedRunIterator it(
+      this, TextRenderedRunIterator::RenderedRunFilter::AllFrames, aElement);
+  for (TextRenderedRun run = it.Current(); run.mFrame; run = it.Next()) {
+    length +=
+        run.GetAdvanceWidth() / run.mFrame->Style()->EffectiveZoom().ToFloat();
+  }
+
+  return PresContext()->AppUnitsToGfxUnits(length) * cssPxPerDevPx *
+         mLengthAdjustScaleFactor / mFontSizeScaleFactor;
+}
+
+void SVGTextFrame::SelectSubString(dom::SVGTextContentElement* aElement,
+                                   uint32_t charnum, uint32_t nchars,
+                                   ErrorResult& aRv) {
+  nsIFrame* kid = PrincipalChildList().FirstChild();
+  if (kid->IsSubtreeDirty()) {
+    aRv.ThrowInvalidStateError("No layout information available for SVG text");
+    return;
+  }
+
+  UpdateGlyphPositioning();
+
+  RefPtr<nsIContent> content;
+
+  {
+    CharIterator chit(this, CharIterator::CharacterFilter::Addressable,
+                      aElement);
+    if (!chit.AdvanceToSubtree() || !chit.Next(charnum) ||
+        chit.IsAfterSubtree()) {
+      aRv.ThrowIndexSizeError("Character index out of range");
+      return;
+    }
+    charnum = chit.TextElementCharIndex();
+    content = chit.GetTextFrame()->GetContent();
+    chit.NextWithinSubtree(nchars);
+    nchars = chit.TextElementCharIndex() - charnum;
+  }
+
+  RefPtr<nsFrameSelection> frameSelection = GetFrameSelection();
+
+  frameSelection->HandleClick(content, charnum, charnum + nchars,
+                              nsFrameSelection::FocusMode::kCollapseToNewPoint,
+                              CaretAssociationHint::Before);
+}
+
+bool SVGTextFrame::RequiresSlowFallbackForSubStringLength() {
+  TextFrameIterator frameIter(this);
+  for (nsTextFrame* frame = frameIter.GetCurrent(); frame;
+       frame = frameIter.GetNext()) {
+    if (frameIter.TextPathFrame() || frame->GetNextContinuation()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+float SVGTextFrame::GetSubStringLengthFastPath(
+    dom::SVGTextContentElement* aElement, uint32_t charnum, uint32_t nchars,
+    ErrorResult& aRv) {
+  MOZ_ASSERT(!RequiresSlowFallbackForSubStringLength());
+
+  TextNodeCorrespondenceRecorder::RecordCorrespondence(this);
+
+  CharIterator chit(this, CharIterator::CharacterFilter::Addressable, aElement,
+                     false);
+  if (!chit.AdvanceToSubtree() || !chit.Next(charnum) ||
+      chit.IsAfterSubtree()) {
+    aRv.ThrowIndexSizeError("Character index out of range");
+    return 0;
+  }
+
+  if (nchars == 0) {
+    return 0.0f;
+  }
+
+  charnum = chit.TextElementCharIndex();
+  chit.NextWithinSubtree(nchars);
+  nchars = chit.TextElementCharIndex() - charnum;
+
+  nscoord textLength = 0;
+
+  TextFrameIterator frit(this);  
+
+  uint32_t frameStartTextElementCharIndex = 0;
+  uint32_t textElementCharIndex;
+
+  for (nsTextFrame* frame = frit.GetCurrent(); frame; frame = frit.GetNext()) {
+    frameStartTextElementCharIndex += frit.UndisplayedCharacters();
+    textElementCharIndex = frameStartTextElementCharIndex;
+
+    const uint32_t untrimmedOffset = frame->GetContentOffset();
+    const uint32_t untrimmedLength = frame->GetContentEnd() - untrimmedOffset;
+
+    uint32_t trimmedOffset = untrimmedOffset;
+    uint32_t trimmedLength = untrimmedLength;
+    nsTextFrame::TrimmedOffsets trimmedOffsets = frame->GetTrimmedOffsets(
+        frame->CharacterDataBuffer(),
+        nsTextFrame::TrimmedOffsetFlags::NotPostReflow);
+    TrimOffsets(trimmedOffset, trimmedLength, trimmedOffsets);
+
+    textElementCharIndex += trimmedOffset - untrimmedOffset;
+
+    if (textElementCharIndex >= charnum + nchars) {
+      break;  
+    }
+
+    uint32_t offset = textElementCharIndex;
+
+    IntersectInterval(offset, trimmedLength, charnum, nchars);
+
+    if (trimmedLength != 0) {
+      offset += trimmedOffset - textElementCharIndex;
+
+      gfxSkipCharsIterator it = frame->EnsureTextRun(nsTextFrame::eInflated);
+      gfxTextRun* textRun = frame->GetTextRun(nsTextFrame::eInflated);
+      auto& provider = PropertyProviderFor(frame);
+
+      Range range = ConvertOriginalToSkipped(it, offset, trimmedLength);
+
+      textLength += textRun->GetAdvanceWidth(range, &provider) /
+                    frame->Style()->EffectiveZoom().ToFloat();
+    }
+
+    frameStartTextElementCharIndex += untrimmedLength;
+  }
+
+  nsPresContext* presContext = PresContext();
+  float cssPxPerDevPx = nsPresContext::AppUnitsToFloatCSSPixels(
+      presContext->AppUnitsPerDevPixel());
+
+  return presContext->AppUnitsToGfxUnits(textLength) * cssPxPerDevPx /
+         mFontSizeScaleFactor;
+}
+
+float SVGTextFrame::GetSubStringLengthSlowFallback(
+    dom::SVGTextContentElement* aElement, uint32_t charnum, uint32_t nchars,
+    ErrorResult& aRv) {
+  UpdateGlyphPositioning();
+
+  CharIterator chit(this, CharIterator::CharacterFilter::Addressable, aElement);
+  if (!chit.AdvanceToSubtree() || !chit.Next(charnum) ||
+      chit.IsAfterSubtree()) {
+    aRv.ThrowIndexSizeError("Character index out of range");
+    return 0;
+  }
+
+  if (nchars == 0) {
+    return 0.0f;
+  }
+
+  charnum = chit.TextElementCharIndex();
+  chit.NextWithinSubtree(nchars);
+  nchars = chit.TextElementCharIndex() - charnum;
+
+  nscoord textLength = 0;
+  TextRenderedRunIterator runIter(
+      this, TextRenderedRunIterator::RenderedRunFilter::AllFrames);
+  TextRenderedRun run = runIter.Current();
+  while (run.mFrame) {
+    uint32_t offset = run.mTextElementCharIndex;
+    if (offset >= charnum + nchars) {
+      break;
+    }
+
+    uint32_t length = run.mTextFrameContentLength;
+    IntersectInterval(offset, length, charnum, nchars);
+
+    if (length != 0) {
+      offset += run.mTextFrameContentOffset - run.mTextElementCharIndex;
+
+      gfxSkipCharsIterator it =
+          run.mFrame->EnsureTextRun(nsTextFrame::eInflated);
+      gfxTextRun* textRun = run.mFrame->GetTextRun(nsTextFrame::eInflated);
+      auto& provider = PropertyProviderFor(run.mFrame);
+
+      Range range = ConvertOriginalToSkipped(it, offset, length);
+
+      textLength += textRun->GetAdvanceWidth(range, &provider) /
+                    run.mFrame->Style()->EffectiveZoom().ToFloat();
+    }
+
+    run = runIter.Next();
+  }
+
+  nsPresContext* presContext = PresContext();
+  float cssPxPerDevPx = nsPresContext::AppUnitsToFloatCSSPixels(
+      presContext->AppUnitsPerDevPixel());
+
+  return presContext->AppUnitsToGfxUnits(textLength) * cssPxPerDevPx /
+         mFontSizeScaleFactor;
+}
+
+int32_t SVGTextFrame::GetCharNumAtPosition(dom::SVGTextContentElement* aElement,
+                                           const gfx::Point& aPoint) {
+  nsIFrame* kid = PrincipalChildList().FirstChild();
+  if (kid->IsSubtreeDirty()) {
+    return -1;
+  }
+
+  UpdateGlyphPositioning();
+
+  nsPresContext* context = PresContext();
+
+  gfxPoint p = ThebesPoint(aPoint) * dom::UserSpaceMetrics::GetZoom(aElement);
+
+  int32_t result = -1;
+
+  TextRenderedRunIterator it(
+      this, TextRenderedRunIterator::RenderedRunFilter::AllFrames, aElement);
+  for (TextRenderedRun run = it.Current(); run.mFrame; run = it.Next()) {
+    int32_t index = run.GetCharNumAtPosition(context, p);
+    if (index != -1) {
+      result = index + run.mTextElementCharIndex;
+    }
+  }
+
+  if (result == -1) {
+    return result;
+  }
+
+  return ConvertTextElementCharIndexToAddressableIndex(result, aElement);
+}
+
+already_AddRefed<DOMSVGPoint> SVGTextFrame::GetStartPositionOfChar(
+    dom::SVGTextContentElement* aElement, uint32_t aCharNum, ErrorResult& aRv) {
+  nsIFrame* kid = PrincipalChildList().FirstChild();
+  if (kid->IsSubtreeDirty()) {
+    aRv.ThrowInvalidStateError("No layout information available for SVG text");
+    return nullptr;
+  }
+
+  UpdateGlyphPositioning();
+
+  CharIterator it(this, CharIterator::CharacterFilter::Addressable, aElement);
+  if (!it.AdvanceToSubtree() || !it.Next(aCharNum) || it.IsAfterSubtree()) {
+    aRv.ThrowIndexSizeError("Character index out of range");
+    return nullptr;
+  }
+
+  uint32_t startIndex = it.GlyphStartTextElementCharIndex();
+
+  return MakeAndAddRef<DOMSVGPoint>(
+      ToPoint(mPositions[startIndex].mPosition) /
+      it.GetTextFrame()->Style()->EffectiveZoom().ToFloat());
+}
+
+static gfxFloat GetGlyphAdvance(SVGTextFrame* aFrame,
+                                dom::SVGTextContentElement* aElement,
+                                uint32_t aTextElementCharIndex,
+                                CharIterator* aIterator) {
+  MOZ_ASSERT(!aIterator || (aIterator->Filter() ==
+                                CharIterator::CharacterFilter::Addressable &&
+                            aIterator->GetSubtree() == aElement &&
+                            aIterator->GlyphStartTextElementCharIndex() ==
+                                aTextElementCharIndex),
+             "Invalid aIterator");
+
+  Maybe<CharIterator> newIterator;
+  CharIterator* it = aIterator;
+  if (!it) {
+    newIterator.emplace(aFrame, CharIterator::CharacterFilter::Addressable,
+                        aElement);
+    if (!newIterator->AdvanceToSubtree()) {
+      MOZ_ASSERT_UNREACHABLE("Invalid aElement");
+      return 0.0;
+    }
+    it = newIterator.ptr();
+  }
+
+  while (it->GlyphStartTextElementCharIndex() != aTextElementCharIndex) {
+    if (!it->Next()) {
+      MOZ_ASSERT_UNREACHABLE("Invalid aTextElementCharIndex");
+      return 0.0;
+    }
+  }
+
+  if (it->AtEnd()) {
+    MOZ_ASSERT_UNREACHABLE("Invalid aTextElementCharIndex");
+    return 0.0;
+  }
+
+  nsPresContext* presContext = aFrame->PresContext();
+  gfxFloat advance = 0.0;
+
+  for (;;) {
+    advance += it->GetAdvance(presContext);
+    if (!it->Next() ||
+        it->GlyphStartTextElementCharIndex() != aTextElementCharIndex) {
+      break;
+    }
+  }
+
+  return advance;
+}
+
+already_AddRefed<DOMSVGPoint> SVGTextFrame::GetEndPositionOfChar(
+    dom::SVGTextContentElement* aElement, uint32_t aCharNum, ErrorResult& aRv) {
+  nsIFrame* kid = PrincipalChildList().FirstChild();
+  if (kid->IsSubtreeDirty()) {
+    aRv.ThrowInvalidStateError("No layout information available for SVG text");
+    return nullptr;
+  }
+
+  UpdateGlyphPositioning();
+
+  CharIterator it(this, CharIterator::CharacterFilter::Addressable, aElement);
+  if (!it.AdvanceToSubtree() || !it.Next(aCharNum) || it.IsAfterSubtree()) {
+    aRv.ThrowIndexSizeError("Character index out of range");
+    return nullptr;
+  }
+
+  uint32_t startIndex = it.GlyphStartTextElementCharIndex();
+  float zoom = it.GetTextFrame()->Style()->EffectiveZoom().ToFloat();
+
+  gfxFloat advance =
+      GetGlyphAdvance(this, aElement, startIndex,
+                      it.IsClusterAndLigatureGroupStart() ? &it : nullptr) /
+      mFontSizeScaleFactor;
+  const gfxTextRun* textRun = it.TextRun();
+  if (textRun->IsInlineReversed()) {
+    advance = -advance;
+  }
+  Point p = textRun->IsVertical() ? Point(0, advance) : Point(advance, 0);
+
+  Matrix m = Matrix::Rotation(mPositions[startIndex].mAngle) *
+             Matrix::Translation(ToPoint(mPositions[startIndex].mPosition));
+
+  return MakeAndAddRef<DOMSVGPoint>(m.TransformPoint(p) / zoom);
+}
+
+already_AddRefed<SVGRect> SVGTextFrame::GetExtentOfChar(
+    dom::SVGTextContentElement* aElement, uint32_t aCharNum, ErrorResult& aRv) {
+  nsIFrame* kid = PrincipalChildList().FirstChild();
+  if (kid->IsSubtreeDirty()) {
+    aRv.ThrowInvalidStateError("No layout information available for SVG text");
+    return nullptr;
+  }
+
+  UpdateGlyphPositioning();
+
+  CharIterator it(this, CharIterator::CharacterFilter::Addressable, aElement);
+  if (!it.AdvanceToSubtree() || !it.Next(aCharNum) || it.IsAfterSubtree()) {
+    aRv.ThrowIndexSizeError("Character index out of range");
+    return nullptr;
+  }
+
+  nsPresContext* presContext = PresContext();
+  float cssPxPerDevPx = nsPresContext::AppUnitsToFloatCSSPixels(
+      presContext->AppUnitsPerDevPixel());
+
+  nsTextFrame* textFrame = it.GetTextFrame();
+  uint32_t startIndex = it.GlyphStartTextElementCharIndex();
+  const gfxTextRun* textRun = it.TextRun();
+
+  gfxFloat advance =
+      GetGlyphAdvance(this, aElement, startIndex,
+                      it.IsClusterAndLigatureGroupStart() ? &it : nullptr);
+  gfxFloat x = textRun->IsInlineReversed() ? -advance : 0.0;
+
+  gfxFloat ascent, descent;
+  GetAscentAndDescentInAppUnits(textFrame, ascent, descent);
+
+  gfxMatrix m;
+  m.PreTranslate(mPositions[startIndex].mPosition);
+  m.PreRotate(mPositions[startIndex].mAngle);
+  m.PreScale(1 / mFontSizeScaleFactor, 1 / mFontSizeScaleFactor);
+
+  nscoord baseline = GetBaselinePosition(
+      textFrame, textRun, it.DominantBaseline(), mFontSizeScaleFactor);
+
+  gfxRect glyphRect;
+  if (textRun->IsVertical()) {
+    glyphRect = gfxRect(
+        -presContext->AppUnitsToGfxUnits(baseline) * cssPxPerDevPx, x,
+        presContext->AppUnitsToGfxUnits(ascent + descent) * cssPxPerDevPx,
+        advance);
+  } else {
+    glyphRect = gfxRect(
+        x, -presContext->AppUnitsToGfxUnits(baseline) * cssPxPerDevPx, advance,
+        presContext->AppUnitsToGfxUnits(ascent + descent) * cssPxPerDevPx);
+  }
+
+  gfxRect r = m.TransformBounds(glyphRect);
+  r.Scale(1 / textFrame->Style()->EffectiveZoom().ToFloat());
+
+  return MakeAndAddRef<SVGRect>(aElement, ToRect(r));
+}
+
+float SVGTextFrame::GetRotationOfChar(dom::SVGTextContentElement* aElement,
+                                      uint32_t aCharNum, ErrorResult& aRv) {
+  nsIFrame* kid = PrincipalChildList().FirstChild();
+  if (kid->IsSubtreeDirty()) {
+    aRv.ThrowInvalidStateError("No layout information available for SVG text");
+    return 0;
+  }
+
+  UpdateGlyphPositioning();
+
+  CharIterator it(this, CharIterator::CharacterFilter::Addressable, aElement);
+  if (!it.AdvanceToSubtree() || !it.Next(aCharNum) || it.IsAfterSubtree()) {
+    aRv.ThrowIndexSizeError("Character index out of range");
+    return 0;
+  }
+
+  const gfxTextRun::GlyphRun& glyphRun = it.GlyphRun();
+  int32_t glyphOrientation =
+      90 * (glyphRun.IsSidewaysRight() - glyphRun.IsSidewaysLeft());
+
+  return mPositions[it.TextElementCharIndex()].mAngle * 180.0 /
+             std::numbers::pi +
+         glyphOrientation;
+}
+
+
+static bool ShouldStartRunAtIndex(const nsTArray<CharPosition>& aPositions,
+                                  const nsTArray<gfxPoint>& aDeltas,
+                                  uint32_t aIndex) {
+  if (aIndex == 0) {
+    return true;
+  }
+
+  if (aIndex < aPositions.Length()) {
+    if (aPositions[aIndex].IsXSpecified() ||
+        aPositions[aIndex].IsYSpecified()) {
+      return true;
+    }
+
+    if ((aPositions[aIndex].IsAngleSpecified() &&
+         aPositions[aIndex].mAngle != 0.0f) ||
+        (aPositions[aIndex - 1].IsAngleSpecified() &&
+         (aPositions[aIndex - 1].mAngle != 0.0f))) {
+      return true;
+    }
+  }
+
+  if (aIndex < aDeltas.Length()) {
+    if (aDeltas[aIndex].x != 0.0 || aDeltas[aIndex].y != 0.0) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool SVGTextFrame::ResolvePositionsForNode(nsIContent* aContent,
+                                           uint32_t& aIndex, bool aInTextPath,
+                                           bool& aForceStartOfChunk,
+                                           nsTArray<gfxPoint>& aDeltas) {
+  if (aContent->IsText()) {
+    uint32_t length = aContent->AsText()->TextLength();
+    if (length) {
+      uint32_t end = aIndex + length;
+      if (MOZ_UNLIKELY(end > mPositions.Length())) {
+        MOZ_ASSERT_UNREACHABLE(
+            "length of mPositions does not match characters "
+            "found by iterating content");
+        return false;
+      }
+      if (aForceStartOfChunk) {
+        mPositions[aIndex].mStartOfChunk = true;
+        aForceStartOfChunk = false;
+      }
+      while (aIndex < end) {
+        if (aInTextPath || ShouldStartRunAtIndex(mPositions, aDeltas, aIndex)) {
+          mPositions[aIndex].mRunBoundary = true;
+        }
+        aIndex++;
+      }
+    }
+    return true;
+  }
+
+  if (!IsTextContentElement(aContent)) {
+    return true;
+  }
+
+  if (aContent->IsSVGElement(nsGkAtoms::textPath)) {
+    if (HasTextContent(aContent)) {
+      if (MOZ_UNLIKELY(aIndex >= mPositions.Length())) {
+        MOZ_ASSERT_UNREACHABLE(
+            "length of mPositions does not match characters "
+            "found by iterating content");
+        return false;
+      }
+      bool vertical = GetWritingMode().IsVertical();
+      if (vertical || !mPositions[aIndex].IsXSpecified()) {
+        mPositions[aIndex].mPosition.x = 0.0;
+      }
+      if (!vertical || !mPositions[aIndex].IsYSpecified()) {
+        mPositions[aIndex].mPosition.y = 0.0;
+      }
+      mPositions[aIndex].mStartOfChunk = true;
+    }
+  } else if (!aContent->IsSVGElement(nsGkAtoms::a)) {
+    MOZ_ASSERT(aContent->IsSVGElement());
+
+    SVGElement* element = static_cast<SVGElement*>(aContent);
+
+    SVGUserUnitList x, y, dx, dy;
+    element->GetAnimatedLengthListValues(&x, &y, &dx, &dy, nullptr);
+
+    const SVGNumberList* rotate = nullptr;
+    SVGAnimatedNumberList* animatedRotate =
+        element->GetAnimatedNumberList(nsGkAtoms::rotate);
+    if (animatedRotate) {
+      rotate = &animatedRotate->GetAnimValue();
+    }
+
+    bool percentages = false;
+    uint32_t count = GetTextContentLength(aContent);
+
+    if (MOZ_UNLIKELY(aIndex + count > mPositions.Length())) {
+      MOZ_ASSERT_UNREACHABLE(
+          "length of mPositions does not match characters "
+          "found by iterating content");
+      return false;
+    }
+
+    uint32_t newChunkCount = std::max(x.Length(), y.Length());
+    if (!newChunkCount && aForceStartOfChunk) {
+      newChunkCount = 1;
+    }
+    for (uint32_t i = 0, j = 0; i < newChunkCount && j < count; j++) {
+      if (!mPositions[aIndex + j].mUnaddressable) {
+        mPositions[aIndex + j].mStartOfChunk = true;
+        i++;
+      }
+    }
+
+    if (!dx.IsEmpty() || !dy.IsEmpty()) {
+      aDeltas.EnsureLengthAtLeast(aIndex + count);
+      for (uint32_t i = 0, j = 0; i < dx.Length() && j < count; j++) {
+        if (!mPositions[aIndex + j].mUnaddressable) {
+          aDeltas[aIndex + j].x = dx[i];
+          percentages = percentages || dx.HasPercentageValueAt(i);
+          i++;
+        }
+      }
+      for (uint32_t i = 0, j = 0; i < dy.Length() && j < count; j++) {
+        if (!mPositions[aIndex + j].mUnaddressable) {
+          aDeltas[aIndex + j].y = dy[i];
+          percentages = percentages || dy.HasPercentageValueAt(i);
+          i++;
+        }
+      }
+    }
+
+    for (uint32_t i = 0, j = 0; i < x.Length() && j < count; j++) {
+      if (!mPositions[aIndex + j].mUnaddressable) {
+        mPositions[aIndex + j].mPosition.x = x[i];
+        percentages = percentages || x.HasPercentageValueAt(i);
+        i++;
+      }
+    }
+    for (uint32_t i = 0, j = 0; i < y.Length() && j < count; j++) {
+      if (!mPositions[aIndex + j].mUnaddressable) {
+        mPositions[aIndex + j].mPosition.y = y[i];
+        percentages = percentages || y.HasPercentageValueAt(i);
+        i++;
+      }
+    }
+
+    if (rotate && !rotate->IsEmpty()) {
+      uint32_t i = 0, j = 0;
+      while (i < rotate->Length() && j < count) {
+        if (!mPositions[aIndex + j].mUnaddressable) {
+          mPositions[aIndex + j].mAngle =
+              std::numbers::pi * (*rotate)[i] / 180.0;
+          i++;
+        }
+        j++;
+      }
+      while (j < count) {
+        mPositions[aIndex + j].mAngle = mPositions[aIndex + j - 1].mAngle;
+        j++;
+      }
+    }
+
+    if (percentages) {
+      AddStateBits(NS_STATE_SVG_POSITIONING_MAY_USE_PERCENTAGES);
+    }
+  }
+
+  bool inTextPath = aInTextPath || aContent->IsSVGElement(nsGkAtoms::textPath);
+  for (nsIContent* child = aContent->GetFirstChild(); child;
+       child = child->GetNextSibling()) {
+    bool ok = ResolvePositionsForNode(child, aIndex, inTextPath,
+                                      aForceStartOfChunk, aDeltas);
+    if (!ok) {
+      return false;
+    }
+  }
+
+  if (aContent->IsSVGElement(nsGkAtoms::textPath)) {
+    aForceStartOfChunk = true;
+  }
+
+  return true;
+}
+
+bool SVGTextFrame::ResolvePositions(nsTArray<gfxPoint>& aDeltas,
+                                    bool aRunPerGlyph) {
+  NS_ASSERTION(mPositions.IsEmpty(), "expected mPositions to be empty");
+  RemoveStateBits(NS_STATE_SVG_POSITIONING_MAY_USE_PERCENTAGES);
+
+  CharIterator it(this, CharIterator::CharacterFilter::Original,
+                   nullptr);
+  if (it.AtEnd()) {
+    return false;
+  }
+
+  bool firstCharUnaddressable = it.IsOriginalCharUnaddressable();
+  mPositions.AppendElement(CharPosition::Unspecified(firstCharUnaddressable));
+
+  uint32_t index = 0;
+  while (it.Next()) {
+    while (++index < it.TextElementCharIndex()) {
+      mPositions.AppendElement(CharPosition::Unspecified(false));
+    }
+    mPositions.AppendElement(
+        CharPosition::Unspecified(it.IsOriginalCharUnaddressable()));
+  }
+  while (++index < it.TextElementCharIndex()) {
+    mPositions.AppendElement(CharPosition::Unspecified(false));
+  }
+
+  bool forceStartOfChunk = false;
+  index = 0;
+  bool ok = ResolvePositionsForNode(mContent, index, aRunPerGlyph,
+                                    forceStartOfChunk, aDeltas);
+  return ok && index > 0;
+}
+
+void SVGTextFrame::DetermineCharPositions(nsTArray<nsPoint>& aPositions) {
+  NS_ASSERTION(aPositions.IsEmpty(), "expected aPositions to be empty");
+
+  nsPoint position;
+
+  TextFrameIterator frit(this);
+  for (nsTextFrame* frame = frit.GetCurrent(); frame; frame = frit.GetNext()) {
+    gfxSkipCharsIterator it = frame->EnsureTextRun(nsTextFrame::eInflated);
+    gfxTextRun* textRun = frame->GetTextRun(nsTextFrame::eInflated);
+    auto& provider = PropertyProviderFor(frame);
+
+    position = frit.Position();
+    if (textRun->IsVertical()) {
+      if (textRun->IsInlineReversed()) {
+        position.y += frame->GetRect().height;
+      }
+      position.x += GetBaselinePosition(frame, textRun, frit.DominantBaseline(),
+                                        mFontSizeScaleFactor);
+    } else {
+      if (textRun->IsInlineReversed()) {
+        position.x += frame->GetRect().width;
+      }
+      position.y += GetBaselinePosition(frame, textRun, frit.DominantBaseline(),
+                                        mFontSizeScaleFactor);
+    }
+
+    for (uint32_t i = 0; i < frit.UndisplayedCharacters(); i++) {
+      aPositions.AppendElement(position);
+    }
+
+    nsTextFrame::TrimmedOffsets trimmedOffsets =
+        frame->GetTrimmedOffsets(frame->CharacterDataBuffer());
+    while (it.GetOriginalOffset() < trimmedOffsets.mStart) {
+      aPositions.AppendElement(position);
+      it.AdvanceOriginal(1);
+    }
+
+    while (it.GetOriginalOffset() < frame->GetContentEnd()) {
+      aPositions.AppendElement(position);
+      if (!it.IsOriginalCharSkipped()) {
+        uint32_t offset = it.GetSkippedOffset();
+        nscoord advance =
+            textRun->GetAdvanceWidth(Range(offset, offset + 1), &provider);
+        (textRun->IsVertical() ? position.y : position.x) +=
+            textRun->IsInlineReversed() ? -advance : advance;
+      }
+      it.AdvanceOriginal(1);
+    }
+  }
+
+  for (uint32_t i = 0; i < frit.UndisplayedCharacters(); i++) {
+    aPositions.AppendElement(position);
+  }
+
+  ForgetCachedProvider();
+}
+
+enum class TextAnchorSide { Left, Middle, Right };
+
+static TextAnchorSide ConvertLogicalTextAnchorToPhysical(
+    StyleTextAnchor aTextAnchor, bool aIsRightToLeft) {
+  NS_ASSERTION(uint8_t(aTextAnchor) <= 3, "unexpected value for aTextAnchor");
+  if (!aIsRightToLeft) {
+    return TextAnchorSide(uint8_t(aTextAnchor));
+  }
+  return TextAnchorSide(2 - uint8_t(aTextAnchor));
+}
+
+static void ShiftAnchoredChunk(nsTArray<CharPosition>& aCharPositions,
+                               uint32_t aChunkStart, uint32_t aChunkEnd,
+                               gfxFloat aVisIStartEdge, gfxFloat aVisIEndEdge,
+                               TextAnchorSide aAnchorSide, bool aVertical) {
+  NS_ASSERTION(aVisIStartEdge <= aVisIEndEdge,
+               "unexpected anchored chunk edges");
+  NS_ASSERTION(aChunkStart < aChunkEnd,
+               "unexpected values for aChunkStart and aChunkEnd");
+
+  gfxFloat shift = aVertical ? aCharPositions[aChunkStart].mPosition.y
+                             : aCharPositions[aChunkStart].mPosition.x;
+  switch (aAnchorSide) {
+    case TextAnchorSide::Left:
+      shift -= aVisIStartEdge;
+      break;
+    case TextAnchorSide::Middle:
+      shift -= std::midpoint(aVisIStartEdge, aVisIEndEdge);
+      break;
+    case TextAnchorSide::Right:
+      shift -= aVisIEndEdge;
+      break;
+  }
+
+  if (shift != 0.0) {
+    if (aVertical) {
+      for (uint32_t i = aChunkStart; i < aChunkEnd; i++) {
+        aCharPositions[i].mPosition.y += shift;
+      }
+    } else {
+      for (uint32_t i = aChunkStart; i < aChunkEnd; i++) {
+        aCharPositions[i].mPosition.x += shift;
+      }
+    }
+  }
+}
+
+void SVGTextFrame::AdjustChunksForLineBreaks() {
+  nsBlockFrame* block = do_QueryFrame(PrincipalChildList().FirstChild());
+  NS_ASSERTION(block, "expected block frame");
+
+  nsBlockFrame::LineIterator line = block->LinesBegin();
+
+  CharIterator it(this, CharIterator::CharacterFilter::Original,
+                   nullptr);
+  while (!it.AtEnd() && line != block->LinesEnd()) {
+    if (it.GetTextFrame() == line->mFirstChild) {
+      mPositions[it.TextElementCharIndex()].mStartOfChunk = true;
+      line++;
+    }
+    it.AdvancePastCurrentFrame();
+  }
+}
+
+void SVGTextFrame::AdjustPositionsForClusters() {
+  nsPresContext* presContext = PresContext();
+
+
+  gfxFloat partialAdvance = 0.0;
+
+  CharIterator it(this, CharIterator::CharacterFilter::Unskipped,
+                   nullptr);
+  bool isFirst = true;
+  while (!it.AtEnd()) {
+    if (it.IsClusterAndLigatureGroupStart() || isFirst) {
+      partialAdvance = 0.0;
+      isFirst = false;
+    } else {
+
+      uint32_t charIndex = it.TextElementCharIndex();
+      uint32_t startIndex = it.GlyphStartTextElementCharIndex();
+      MOZ_ASSERT(charIndex != startIndex,
+                 "If the current character is in the middle of a cluster or "
+                 "ligature group, then charIndex must be different from "
+                 "startIndex");
+
+      mPositions[charIndex].mClusterOrLigatureGroupMiddle = true;
+
+      bool rotationAdjusted = false;
+      double angle = mPositions[startIndex].mAngle;
+      if (mPositions[charIndex].mAngle != angle) {
+        mPositions[charIndex].mAngle = angle;
+        rotationAdjusted = true;
+      }
+
+      gfxFloat advance = partialAdvance / mFontSizeScaleFactor;
+      const gfxTextRun* textRun = it.TextRun();
+      gfxPoint direction = gfxPoint(cos(angle), sin(angle)) *
+                           (textRun->IsInlineReversed() ? -1.0 : 1.0);
+      if (textRun->IsVertical()) {
+        std::swap(direction.x, direction.y);
+      }
+      mPositions[charIndex].mPosition =
+          mPositions[startIndex].mPosition + direction * advance;
+
+      if (mPositions[charIndex].mRunBoundary) {
+        mPositions[charIndex].mRunBoundary = false;
+        if (charIndex + 1 < mPositions.Length()) {
+          mPositions[charIndex + 1].mRunBoundary = true;
+        }
+      } else if (rotationAdjusted) {
+        if (charIndex + 1 < mPositions.Length()) {
+          mPositions[charIndex + 1].mRunBoundary = true;
+        }
+      }
+
+      if (mPositions[charIndex].mStartOfChunk) {
+        mPositions[charIndex].mStartOfChunk = false;
+        if (charIndex + 1 < mPositions.Length()) {
+          mPositions[charIndex + 1].mStartOfChunk = true;
+        }
+      }
+    }
+
+    partialAdvance += it.GetAdvance(presContext);
+
+    it.Next();
+  }
+}
+
+already_AddRefed<Path> SVGTextFrame::GetTextPath(nsIFrame* aTextPathFrame) {
+  nsIContent* content = aTextPathFrame->GetContent();
+  SVGTextPathElement* tp = static_cast<SVGTextPathElement*>(content);
+  if (tp->mPath.IsRendered()) {
+    return tp->mPath.GetAnimValue().BuildPathForMeasuring(
+        aTextPathFrame->Style()->EffectiveZoom().ToFloat());
+  }
+
+  SVGGeometryElement* geomElement =
+      SVGObserverUtils::GetAndObserveTextPathsPath(aTextPathFrame);
+  if (!geomElement) {
+    return nullptr;
+  }
+
+  RefPtr<Path> path = geomElement->GetOrBuildPathForMeasuring();
+  if (!path) {
+    return nullptr;
+  }
+
+  auto matrix = geomElement->LocalTransform();
+  if (!matrix.IsIdentity()) {
+    Path::Transform(path, matrix);
+  }
+
+  return path.forget();
+}
+
+gfxFloat SVGTextFrame::GetOffsetScale(nsIFrame* aTextPathFrame) {
+  nsIContent* content = aTextPathFrame->GetContent();
+  SVGTextPathElement* tp = static_cast<SVGTextPathElement*>(content);
+  if (tp->mPath.IsRendered()) {
+    return 1.0;
+  }
+
+  SVGGeometryElement* geomElement =
+      SVGObserverUtils::GetAndObserveTextPathsPath(aTextPathFrame);
+  if (!geomElement) {
+    return 1.0;
+  }
+  return geomElement->GetPathLengthScale(
+      SVGGeometryElement::PathLengthScaleUsageType::TextPath);
+}
+
+gfxFloat SVGTextFrame::GetStartOffset(nsIFrame* aTextPathFrame) {
+  SVGTextPathElement* tp =
+      static_cast<SVGTextPathElement*>(aTextPathFrame->GetContent());
+  SVGAnimatedLength* length =
+      &tp->mLengthAttributes[SVGTextPathElement::STARTOFFSET];
+
+  if (length->IsPercentage()) {
+    if (!std::isfinite(GetOffsetScale(aTextPathFrame))) {
+      return 0.0;
+    }
+    RefPtr<Path> data = GetTextPath(aTextPathFrame);
+    return data ? length->GetAnimValInSpecifiedUnits() * data->ComputeLength() /
+                      100.0
+                : 0.0;
+  }
+  float lengthValue = length->GetAnimValueWithZoom(tp);
+  return lengthValue == 0 ? 0.0 : lengthValue * GetOffsetScale(aTextPathFrame);
+}
+
+void SVGTextFrame::DoTextPathLayout() {
+  nsPresContext* context = PresContext();
+
+  CharIterator it(this, CharIterator::CharacterFilter::Original,
+                   nullptr);
+  while (!it.AtEnd()) {
+    nsIFrame* textPathFrame = it.TextPathFrame();
+    if (!textPathFrame) {
+      it.AdvancePastCurrentFrame();
+      continue;
+    }
+
+    RefPtr<Path> path = GetTextPath(textPathFrame);
+    if (!path) {
+      uint32_t start = it.TextElementCharIndex();
+      it.AdvancePastCurrentTextPathFrame();
+      uint32_t end = it.TextElementCharIndex();
+      for (uint32_t i = start; i < end; i++) {
+        mPositions[i].mHidden = true;
+      }
+      continue;
+    }
+
+    SVGTextPathElement* textPath =
+        static_cast<SVGTextPathElement*>(textPathFrame->GetContent());
+    uint16_t side =
+        textPath->EnumAttributes()[SVGTextPathElement::SIDE].GetAnimValue();
+
+    gfxFloat offset = GetStartOffset(textPathFrame);
+    Float pathLength = path->ComputeLength();
+
+    while (!it.AtEnd()) {
+      if (it.IsOriginalCharSkipped()) {
+        it.Next();
+        continue;
+      }
+      if (it.IsClusterAndLigatureGroupStart()) {
+        break;
+      }
+      it.Next();
+    }
+
+    bool skippedEndOfTextPath = false;
+
+    while (!it.AtEnd() && it.TextPathFrame() &&
+           it.TextPathFrame()->GetContent() == textPath) {
+      uint32_t i = it.TextElementCharIndex();
+
+      uint32_t j = i + 1;
+
+      MOZ_ASSERT(!mPositions[i].mClusterOrLigatureGroupMiddle);
+
+      const gfxTextRun* textRun = it.TextRun();
+      bool vertical = textRun->IsVertical();
+
+      AutoTArray<gfxFloat, 4> partialAdvances;
+      gfxFloat partialAdvance = it.GetAdvance(context);
+      partialAdvances.AppendElement(partialAdvance);
+      while (it.Next()) {
+        MOZ_ASSERT(j <= it.TextElementCharIndex());
+        while (j < it.TextElementCharIndex()) {
+          partialAdvances.AppendElement(partialAdvance);
+          ++j;
+        }
+        if (it.IsOriginalCharSkipped()) {
+          if (!it.TextPathFrame()) {
+            skippedEndOfTextPath = true;
+            break;
+          }
+        } else if (it.IsClusterAndLigatureGroupStart()) {
+          break;
+        } else {
+          partialAdvance += it.GetAdvance(context);
+        }
+        partialAdvances.AppendElement(partialAdvance);
+      }
+
+      if (!skippedEndOfTextPath) {
+        MOZ_ASSERT(j <= it.TextElementCharIndex());
+        while (j < it.TextElementCharIndex()) {
+          partialAdvances.AppendElement(partialAdvance);
+          ++j;
+        }
+      }
+
+      gfxFloat halfAdvance =
+          partialAdvances.LastElement() / mFontSizeScaleFactor / 2.0;
+      if (textRun->IsInlineReversed()) {
+        halfAdvance = -halfAdvance;
+      }
+      gfxFloat midx =
+          (vertical ? mPositions[i].mPosition.y : mPositions[i].mPosition.x) +
+          halfAdvance + offset;
+
+      mPositions[i].mHidden = midx < 0 || midx > pathLength;
+
+      Point tangent;  
+      Point pt;
+      if (side == dom::SVGTextPathElement_Binding::TEXTPATH_SIDETYPE_RIGHT) {
+        pt = path->ComputePointAtLength(Float(pathLength - midx), &tangent);
+        tangent = -tangent;
+      } else {
+        pt = path->ComputePointAtLength(Float(midx), &tangent);
+      }
+      Float rotation = vertical ? atan2f(-tangent.x, tangent.y)
+                                : atan2f(tangent.y, tangent.x);
+      Point normal(-tangent.y, tangent.x);  
+      Point offsetFromPath = normal * (vertical ? -mPositions[i].mPosition.x
+                                                : mPositions[i].mPosition.y);
+      pt += offsetFromPath;
+      mPositions[i].mPosition =
+          ThebesPoint(pt) - ThebesPoint(tangent) * halfAdvance;
+      mPositions[i].mAngle += rotation;
+      Point direction = textRun->IsInlineReversed() ? -tangent : tangent;
+
+      for (uint32_t k = i + 1; k < j; k++) {
+        gfxPoint partialAdvance = ThebesPoint(direction) *
+                                  partialAdvances[k - i] / mFontSizeScaleFactor;
+        mPositions[k].mPosition = mPositions[i].mPosition + partialAdvance;
+        mPositions[k].mAngle = mPositions[i].mAngle;
+        mPositions[k].mHidden = mPositions[i].mHidden;
+      }
+    }
+  }
+}
+
+void SVGTextFrame::DoAnchoring() {
+  nsPresContext* presContext = PresContext();
+
+  CharIterator it(this, CharIterator::CharacterFilter::Original,
+                   nullptr);
+
+  while (!it.AtEnd() &&
+         (it.IsOriginalCharSkipped() || it.IsOriginalCharTrimmed())) {
+    it.Next();
+  }
+
+  bool vertical = GetWritingMode().IsVertical();
+  for (uint32_t start = it.TextElementCharIndex(); start < mPositions.Length();
+       start = it.TextElementCharIndex()) {
+    it.AdvanceToCharacter(start);
+    nsTextFrame* chunkFrame = it.GetTextFrame();
+
+    uint32_t index = it.TextElementCharIndex();
+    uint32_t end = start;
+    gfxFloat left = std::numeric_limits<gfxFloat>::infinity();
+    gfxFloat right = -std::numeric_limits<gfxFloat>::infinity();
+    do {
+      if (!it.IsOriginalCharSkipped() && !it.IsOriginalCharTrimmed()) {
+        gfxFloat advance = it.GetAdvance(presContext) / mFontSizeScaleFactor;
+        const gfxTextRun* textRun = it.TextRun();
+        gfxFloat pos = textRun->IsVertical() ? mPositions[index].mPosition.y
+                                             : mPositions[index].mPosition.x;
+        if (textRun->IsInlineReversed()) {
+          left = std::min(left, pos - advance);
+          right = std::max(right, pos);
+        } else {
+          left = std::min(left, pos);
+          right = std::max(right, pos + advance);
+        }
+      }
+      it.Next();
+      index = end = it.TextElementCharIndex();
+    } while (!it.AtEnd() && !mPositions[end].mStartOfChunk);
+
+    if (left != std::numeric_limits<gfxFloat>::infinity()) {
+      bool isRTL =
+          chunkFrame->StyleVisibility()->mDirection == StyleDirection::Rtl;
+      TextAnchorSide anchor = ConvertLogicalTextAnchorToPhysical(
+          chunkFrame->StyleSVG()->mTextAnchor, isRTL);
+
+      ShiftAnchoredChunk(mPositions, start, end, left, right, anchor, vertical);
+    }
+  }
+}
+
+void SVGTextFrame::DoGlyphPositioning() {
+  mPositions.Clear();
+  RemoveStateBits(NS_STATE_SVG_POSITIONING_DIRTY);
+
+  nsIFrame* kid = PrincipalChildList().FirstChild();
+  if (kid && kid->IsSubtreeDirty()) {
+    MOZ_ASSERT(false, "should have already reflowed the kid");
+    return;
+  }
+
+  TextNodeCorrespondenceRecorder::RecordCorrespondence(this);
+
+  AutoTArray<nsPoint, 64> charPositions;
+  DetermineCharPositions(charPositions);
+
+  if (charPositions.IsEmpty()) {
+    return;
+  }
+
+  SVGTextContentElement* element =
+      static_cast<SVGTextContentElement*>(GetContent());
+  SVGAnimatedLength* textLengthAttr =
+      element->GetAnimatedLength(nsGkAtoms::textLength);
+  uint16_t lengthAdjust =
+      element->EnumAttributes()[SVGTextContentElement::LENGTHADJUST]
+          .GetAnimValue();
+  bool adjustingTextLength = textLengthAttr->IsExplicitlySet();
+  float expectedTextLength = textLengthAttr->GetAnimValueWithZoom(element);
+
+  if (adjustingTextLength &&
+      (expectedTextLength < 0.0f || lengthAdjust == LENGTHADJUST_UNKNOWN)) {
+    adjustingTextLength = false;
+  }
+
+  AutoTArray<gfxPoint, 16> deltas;
+  if (!ResolvePositions(deltas, adjustingTextLength)) {
+    mPositions.Clear();
+    return;
+  }
+
+
+  TruncateTo(deltas, charPositions);
+  TruncateTo(mPositions, charPositions);
+
+  uint32_t first = 0;
+  while (first + 1 < mPositions.Length() && mPositions[first].mUnaddressable) {
+    ++first;
+  }
+  if (!mPositions[first].IsXSpecified()) {
+    mPositions[first].mPosition.x = 0.0;
+  }
+  if (!mPositions[first].IsYSpecified()) {
+    mPositions[first].mPosition.y = 0.0;
+  }
+  if (!mPositions[first].IsAngleSpecified()) {
+    mPositions[first].mAngle = 0.0;
+  }
+
+  nsPresContext* presContext = PresContext();
+  bool vertical = GetWritingMode().IsVertical();
+
+  float cssPxPerDevPx = nsPresContext::AppUnitsToFloatCSSPixels(
+      presContext->AppUnitsPerDevPixel());
+  double factor = cssPxPerDevPx / mFontSizeScaleFactor;
+
+  double adjustment = 0.0;
+  mLengthAdjustScaleFactor = 1.0f;
+  if (adjustingTextLength) {
+    nscoord frameLength =
+        vertical ? PrincipalChildList().FirstChild()->GetRect().height
+                 : PrincipalChildList().FirstChild()->GetRect().width;
+    float actualTextLength = static_cast<float>(
+        presContext->AppUnitsToGfxUnits(frameLength) * factor);
+
+    switch (lengthAdjust) {
+      case LENGTHADJUST_SPACINGANDGLYPHS:
+        if (actualTextLength > 0) {
+          mLengthAdjustScaleFactor = expectedTextLength / actualTextLength;
+        }
+        break;
+
+      default:
+        MOZ_ASSERT(lengthAdjust == LENGTHADJUST_SPACING);
+        int32_t adjustableSpaces = 0;
+        for (uint32_t i = 1; i < mPositions.Length(); i++) {
+          if (!mPositions[i].mUnaddressable) {
+            adjustableSpaces++;
+          }
+        }
+        if (adjustableSpaces) {
+          adjustment =
+              (expectedTextLength - actualTextLength) / adjustableSpaces;
+        }
+        break;
+    }
+  }
+
+  if (!deltas.IsEmpty()) {
+    mPositions[0].mPosition += deltas[0];
+  }
+
+  gfxFloat xLengthAdjustFactor = vertical ? 1.0 : mLengthAdjustScaleFactor;
+  gfxFloat yLengthAdjustFactor = vertical ? mLengthAdjustScaleFactor : 1.0;
+  for (uint32_t i = 1; i < mPositions.Length(); i++) {
+    if (!mPositions[i].IsXSpecified()) {
+      nscoord d = charPositions[i].x - charPositions[i - 1].x;
+      mPositions[i].mPosition.x =
+          mPositions[i - 1].mPosition.x +
+          presContext->AppUnitsToGfxUnits(d) * factor * xLengthAdjustFactor;
+      if (!vertical && !mPositions[i].mUnaddressable) {
+        mPositions[i].mPosition.x += adjustment;
+      }
+    }
+    if (!mPositions[i].IsYSpecified()) {
+      nscoord d = charPositions[i].y - charPositions[i - 1].y;
+      mPositions[i].mPosition.y =
+          mPositions[i - 1].mPosition.y +
+          presContext->AppUnitsToGfxUnits(d) * factor * yLengthAdjustFactor;
+      if (vertical && !mPositions[i].mUnaddressable) {
+        mPositions[i].mPosition.y += adjustment;
+      }
+    }
+    if (i < deltas.Length()) {
+      mPositions[i].mPosition += deltas[i];
+    }
+    if (!mPositions[i].IsAngleSpecified()) {
+      mPositions[i].mAngle = 0.0f;
+    }
+  }
+
+  MOZ_ASSERT(mPositions.Length() == charPositions.Length());
+
+  AdjustChunksForLineBreaks();
+  AdjustPositionsForClusters();
+  DoAnchoring();
+  DoTextPathLayout();
+}
+
+bool SVGTextFrame::ShouldRenderAsPath(nsTextFrame* aFrame,
+                                      SVGContextPaint* aContextPaint,
+                                      bool& aShouldPaintSVGGlyphs) {
+  if (HasAnyStateBits(NS_STATE_SVG_CLIPPATH_CHILD)) {
+    aShouldPaintSVGGlyphs = false;
+    return true;
+  }
+
+  aShouldPaintSVGGlyphs = true;
+
+  const nsStyleSVG* style = aFrame->StyleSVG();
+
+  if (!(style->mFill.kind.IsNone() ||
+        (style->mFill.kind.IsColor() &&
+         SVGUtils::GetOpacity(style->mFillOpacity, aContextPaint) == 1.0f))) {
+    return true;
+  }
+
+  if (style->mFill.kind.IsColor() && aFrame->StyleText()->HasTextShadow() &&
+      NS_GET_A(style->mFill.kind.AsColor().CalcColor(*aFrame->Style())) !=
+          0xFF) {
+    return true;
+  }
+
+  if (style->HasStroke()) {
+    if (style->mStrokeWidth.IsContextValue()) {
+      return true;
+    }
+    if (SVGContentUtils::CoordToFloat(
+            static_cast<SVGElement*>(GetContent()),
+            style->mStrokeWidth.AsLengthPercentage()) > 0) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+void SVGTextFrame::ScheduleReflowSVG() {
+  if (HasAnyStateBits(NS_FRAME_IS_NONDISPLAY)) {
+    ScheduleReflowSVGNonDisplayText(
+        IntrinsicDirty::FrameAncestorsAndDescendants);
+  } else {
+    SVGUtils::ScheduleReflowSVG(this);
+  }
+}
+
+void SVGTextFrame::NotifyGlyphMetricsChange(bool aUpdateTextCorrespondence) {
+  if (aUpdateTextCorrespondence) {
+    AddStateBits(NS_STATE_SVG_TEXT_CORRESPONDENCE_DIRTY);
+  }
+  AddStateBits(NS_STATE_SVG_POSITIONING_DIRTY);
+  nsLayoutUtils::PostRestyleEvent(mContent->AsElement(), RestyleHint{0},
+                                  nsChangeHint_InvalidateRenderingObservers);
+  ScheduleReflowSVG();
+}
+
+void SVGTextFrame::UpdateGlyphPositioning() {
+  nsIFrame* kid = PrincipalChildList().FirstChild();
+  if (!kid) {
+    return;
+  }
+
+  if (HasAnyStateBits(NS_STATE_SVG_POSITIONING_DIRTY)) {
+    DoGlyphPositioning();
+  }
+}
+
+void SVGTextFrame::MaybeResolveBidiForAnonymousBlockChild() {
+  nsIFrame* kid = PrincipalChildList().FirstChild();
+
+  if (kid && kid->HasAnyStateBits(NS_BLOCK_NEEDS_BIDI_RESOLUTION) &&
+      PresContext()->BidiEnabled()) {
+    MOZ_ASSERT(static_cast<nsBlockFrame*>(do_QueryFrame(kid)),
+               "Expect anonymous child to be an nsBlockFrame");
+    nsBidiPresUtils::Resolve(static_cast<nsBlockFrame*>(kid));
+  }
+}
+
+void SVGTextFrame::MaybeReflowAnonymousBlockChild() {
+  nsIFrame* kid = PrincipalChildList().FirstChild();
+  if (!kid) {
+    return;
+  }
+
+  NS_ASSERTION(!kid->HasAnyStateBits(NS_FRAME_IN_REFLOW),
+               "should not be in reflow when about to reflow again");
+
+  if (IsSubtreeDirty()) {
+    if (HasAnyStateBits(NS_FRAME_IS_DIRTY)) {
+      kid->MarkSubtreeDirty();
+    }
+
+    AddStateBits(NS_STATE_SVG_TEXT_IN_REFLOW);
+
+    TextNodeCorrespondenceRecorder::RecordCorrespondence(this);
+
+    MOZ_ASSERT(SVGUtils::AnyOuterSVGIsCallingReflowSVG(this),
+               "should be under ReflowSVG");
+    nsPresContext::InterruptPreventer noInterrupts(PresContext());
+    DoReflow();
+
+    RemoveStateBits(NS_STATE_SVG_TEXT_IN_REFLOW);
+  }
+}
+
+void SVGTextFrame::DoReflow() {
+  MOZ_ASSERT(HasAnyStateBits(NS_STATE_SVG_TEXT_IN_REFLOW));
+
+  AddStateBits(NS_STATE_SVG_TEXT_CORRESPONDENCE_DIRTY |
+               NS_STATE_SVG_POSITIONING_DIRTY);
+
+  if (HasAnyStateBits(NS_FRAME_IS_NONDISPLAY)) {
+    RemoveStateBits(NS_FRAME_IS_DIRTY | NS_FRAME_HAS_DIRTY_CHILDREN);
+  }
+
+  mFrameForCachedRanges = nullptr;
+
+  nsPresContext* presContext = PresContext();
+  nsIFrame* kid = PrincipalChildList().FirstChild();
+  if (!kid) {
+    return;
+  }
+
+  std::unique_ptr<gfxContext> renderingContext =
+      presContext->PresShell()->CreateReferenceRenderingContext();
+
+  if (UpdateFontSizeScaleFactor()) {
+    kid->MarkIntrinsicISizesDirty();
+  }
+
+  const IntrinsicSizeInput input(renderingContext.get(), Nothing(), Nothing());
+  nscoord inlineSize = kid->GetPrefISize(input);
+  WritingMode wm = kid->GetWritingMode();
+  ReflowInput reflowInput(presContext, kid, renderingContext.get(),
+                          LogicalSize(wm, inlineSize, NS_UNCONSTRAINEDSIZE));
+  ReflowOutput desiredSize(reflowInput);
+  nsReflowStatus status;
+
+  NS_ASSERTION(
+      reflowInput.ComputedPhysicalBorderPadding() == nsMargin(0, 0, 0, 0) &&
+          reflowInput.ComputedPhysicalMargin() == nsMargin(0, 0, 0, 0),
+      "style system should ensure that :-moz-svg-text "
+      "does not get styled");
+
+  kid->Reflow(presContext, desiredSize, reflowInput, status);
+  kid->DidReflow(presContext, &reflowInput);
+  kid->SetSize(wm, desiredSize.Size(wm));
+}
+
+#define CLAMP_MIN_SIZE 8.0
+#define CLAMP_MAX_SIZE 200.0
+#define PRECISE_SIZE 200.0
+
+bool SVGTextFrame::UpdateFontSizeScaleFactor() {
+  float contextScale = GetContextScale(this);
+  mLastContextScale = contextScale;
+
+  double oldFontSizeScaleFactor = mFontSizeScaleFactor;
+
+  bool geometricPrecision = false;
+  CSSCoord min = std::sqrt(std::numeric_limits<float>::max());
+  CSSCoord max = std::sqrt(std::numeric_limits<float>::min());
+  bool anyText = false;
+
+  TextFrameIterator it(this);
+  nsTextFrame* f = it.GetCurrent();
+  while (f) {
+    if (!geometricPrecision) {
+      geometricPrecision = f->StyleText()->mTextRendering ==
+                           StyleTextRendering::Geometricprecision;
+    }
+    const auto& fontSize = f->StyleFont()->mFont.size;
+    if (!fontSize.IsZero()) {
+      min = std::min(min, fontSize.ToCSSPixels());
+      max = std::max(max, fontSize.ToCSSPixels());
+      anyText = true;
+    }
+    f = it.GetNext();
+  }
+
+  if (!anyText) {
+    mFontSizeScaleFactor = 1.0;
+    return mFontSizeScaleFactor != oldFontSizeScaleFactor;
+  }
+
+  if (geometricPrecision) {
+    mFontSizeScaleFactor = PRECISE_SIZE / min;
+    return mFontSizeScaleFactor != oldFontSizeScaleFactor;
+  }
+
+  double minTextRunSize = min * contextScale;
+  double maxTextRunSize = max * contextScale;
+
+  if (minTextRunSize >= CLAMP_MIN_SIZE && maxTextRunSize <= CLAMP_MAX_SIZE) {
+    mFontSizeScaleFactor = contextScale;
+  } else if (max / min > CLAMP_MAX_SIZE / CLAMP_MIN_SIZE) {
+    if (maxTextRunSize <= CLAMP_MAX_SIZE) {
+      mFontSizeScaleFactor = CLAMP_MAX_SIZE / max;
+    } else if (minTextRunSize >= CLAMP_MIN_SIZE) {
+      mFontSizeScaleFactor = CLAMP_MIN_SIZE / min;
+    } else {
+      mFontSizeScaleFactor = contextScale;
+    }
+  } else if (minTextRunSize < CLAMP_MIN_SIZE) {
+    mFontSizeScaleFactor = CLAMP_MIN_SIZE / min;
+  } else {
+    mFontSizeScaleFactor = CLAMP_MAX_SIZE / max;
+  }
+
+  return mFontSizeScaleFactor != oldFontSizeScaleFactor;
+}
+
+double SVGTextFrame::GetFontSizeScaleFactor() const {
+  return mFontSizeScaleFactor;
+}
+
+Point SVGTextFrame::TransformFramePointToTextChild(
+    const Point& aPoint, const nsIFrame* aChildFrame) {
+  NS_ASSERTION(aChildFrame && nsLayoutUtils::GetClosestFrameOfType(
+                                  aChildFrame->GetParent(),
+                                  LayoutFrameType::SVGText) == this,
+               "aChildFrame must be a descendant of this frame");
+
+  UpdateGlyphPositioning();
+
+  nsPresContext* presContext = PresContext();
+
+  float cssPxPerDevPx = nsPresContext::AppUnitsToFloatCSSPixels(
+      presContext->AppUnitsPerDevPixel());
+  float factor = AppUnitsPerCSSPixel();
+  Point framePosition(NSAppUnitsToFloatPixels(mRect.x, factor),
+                      NSAppUnitsToFloatPixels(mRect.y, factor));
+  Point pointInUserSpace = aPoint * cssPxPerDevPx + framePosition;
+
+  TextRenderedRunIterator it(
+      this, TextRenderedRunIterator::RenderedRunFilter::AllFrames, aChildFrame);
+  TextRenderedRun hit;
+  gfxPoint pointInRun;
+  nscoord dx = nscoord_MAX;
+  nscoord dy = nscoord_MAX;
+  for (TextRenderedRun run = it.Current(); run.mFrame; run = it.Next()) {
+    TextRenderedRun::GeometryFlags flags(
+        TextRenderedRun::GeometryFlag::IncludeFill,
+        TextRenderedRun::GeometryFlag::IncludeStroke,
+        TextRenderedRun::GeometryFlag::NoHorizontalOverflow);
+    gfxRect runRect = run.GetRunUserSpaceRect(flags).ToThebesRect();
+
+    gfxMatrix m = run.GetTransformFromRunUserSpaceToUserSpace(presContext);
+    if (!m.Invert()) {
+      return aPoint;
+    }
+    gfxPoint pointInRunUserSpace =
+        m.TransformPoint(ThebesPoint(pointInUserSpace));
+
+    if (runRect.Contains(pointInRunUserSpace)) {
+      dx = 0;
+      dy = 0;
+      pointInRun = pointInRunUserSpace;
+      hit = run;
+    } else if (nsLayoutUtils::PointIsCloserToRect(pointInRunUserSpace, runRect,
+                                                  dx, dy)) {
+      pointInRun.x =
+          std::clamp(pointInRunUserSpace.x.value, runRect.X(), runRect.XMost());
+      pointInRun.y =
+          std::clamp(pointInRunUserSpace.y.value, runRect.Y(), runRect.YMost());
+      hit = run;
+    }
+  }
+
+  if (!hit.mFrame) {
+    return aPoint;
+  }
+
+  gfxMatrix m = hit.GetTransformFromRunUserSpaceToFrameUserSpace(presContext);
+  m.PreScale(mFontSizeScaleFactor, mFontSizeScaleFactor);
+  return ToPoint(m.TransformPoint(pointInRun) / cssPxPerDevPx);
+}
+
+gfxRect SVGTextFrame::TransformFrameRectFromTextChild(
+    const nsRect& aRect, const nsIFrame* aChildFrame) {
+  NS_ASSERTION(aChildFrame && nsLayoutUtils::GetClosestFrameOfType(
+                                  aChildFrame->GetParent(),
+                                  LayoutFrameType::SVGText) == this,
+               "aChildFrame must be a descendant of this frame");
+
+  UpdateGlyphPositioning();
+
+  nsPresContext* presContext = PresContext();
+
+  gfxRect result;
+  TextRenderedRunIterator it(
+      this, TextRenderedRunIterator::RenderedRunFilter::AllFrames, aChildFrame);
+  for (TextRenderedRun run = it.Current(); run.mFrame; run = it.Next()) {
+    nsRect rectInTextFrame = aRect + aChildFrame->GetOffsetTo(run.mFrame);
+
+    gfxRect rectInFrameUserSpace = AppUnitsToFloatCSSPixels(rectInTextFrame);
+
+    TextRenderedRun::GeometryFlags flags(
+        TextRenderedRun::GeometryFlag::IncludeFill,
+        TextRenderedRun::GeometryFlag::IncludeStroke);
+
+    if (rectInFrameUserSpace.IntersectRect(
+            rectInFrameUserSpace,
+            run.GetFrameUserSpaceRect(presContext, flags).ToThebesRect())) {
+      gfxMatrix m = run.GetTransformFromRunUserSpaceToUserSpace(presContext);
+      gfxRect rectInUserSpace = m.TransformRect(rectInFrameUserSpace);
+
+      result.UnionRect(result, rectInUserSpace);
+    }
+  }
+
+  float factor = AppUnitsPerCSSPixel();
+  gfxPoint framePosition(NSAppUnitsToFloatPixels(mRect.x, factor),
+                         NSAppUnitsToFloatPixels(mRect.y, factor));
+
+  return result - framePosition;
+}
+
+Rect SVGTextFrame::TransformFrameRectFromTextChild(
+    const Rect& aRect, const nsIFrame* aChildFrame) {
+  nscoord appUnitsPerDevPixel = PresContext()->AppUnitsPerDevPixel();
+  nsRect r = LayoutDevicePixel::ToAppUnits(
+      LayoutDeviceRect::FromUnknownRect(aRect), appUnitsPerDevPixel);
+  gfxRect resultCssUnits = TransformFrameRectFromTextChild(r, aChildFrame);
+  float devPixelPerCSSPixel =
+      float(AppUnitsPerCSSPixel()) / appUnitsPerDevPixel;
+  resultCssUnits.Scale(devPixelPerCSSPixel);
+  return ToRect(resultCssUnits);
+}
+
+Point SVGTextFrame::TransformFramePointFromTextChild(
+    const Point& aPoint, const nsIFrame* aChildFrame) {
+  return TransformFrameRectFromTextChild(Rect(aPoint, Size(1, 1)), aChildFrame)
+      .TopLeft();
+}
+
+void SVGTextFrame::AppendDirectlyOwnedAnonBoxes(
+    nsTArray<OwnedAnonBox>& aResult) {
+  MOZ_ASSERT(PrincipalChildList().FirstChild(), "Must have our anon box");
+  aResult.AppendElement(OwnedAnonBox(PrincipalChildList().FirstChild()));
+}
+
+}  

@@ -1,0 +1,81 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+
+IPDL_SOURCES += [
+    "PMediaDecoderParams.ipdlh",
+    "PRemoteDecoder.ipdl",
+    "PRemoteEncoder.ipdl",
+    "PRemoteMediaManager.ipdl",
+]
+
+IPDL_SOURCES += [
+    "PRDD.ipdl",
+]
+
+EXPORTS.mozilla += [
+    "/dom/media/systemservices/ShmemPool.h",
+    "RDDChild.h",
+    "RDDParent.h",
+    "RDDProcessHost.h",
+    "RDDProcessImpl.h",
+    "RDDProcessManager.h",
+    "RemoteDecoderChild.h",
+    "RemoteDecoderModule.h",
+    "RemoteDecoderParent.h",
+    "RemoteDecodeUtils.h",
+    "RemoteEncoderModule.h",
+    "RemoteImageHolder.h",
+    "RemoteMediaData.h",
+    "RemoteMediaDataDecoder.h",
+    "RemoteMediaDataEncoder.h",
+    "RemoteMediaDataEncoderChild.h",
+    "RemoteMediaDataEncoderParent.h",
+    "RemoteMediaManagerChild.h",
+    "RemoteMediaManagerParent.h",
+    "ShmemRecycleAllocator.h",
+]
+
+EXPORTS.mozilla.dom += [
+    "MediaIPCUtils.h",
+]
+
+SOURCES += [
+    "/dom/media/systemservices/ShmemPool.cpp",
+    "RDDChild.cpp",
+    "RDDParent.cpp",
+    "RDDProcessHost.cpp",
+    "RDDProcessImpl.cpp",
+    "RDDProcessManager.cpp",
+    "RemoteAudioDecoder.cpp",
+    "RemoteDecoderChild.cpp",
+    "RemoteDecoderModule.cpp",
+    "RemoteDecoderParent.cpp",
+    "RemoteDecodeUtils.cpp",
+    "RemoteEncoderModule.cpp",
+    "RemoteImageHolder.cpp",
+    "RemoteMediaData.cpp",
+    "RemoteMediaDataDecoder.cpp",
+    "RemoteMediaDataEncoder.cpp",
+    "RemoteMediaDataEncoderChild.cpp",
+    "RemoteMediaDataEncoderParent.cpp",
+    "RemoteMediaManagerChild.cpp",
+    "RemoteMediaManagerParent.cpp",
+    "RemoteVideoDecoder.cpp",
+]
+
+# so we can include nsMacUtilsImpl.h in RDDParent.cpp for sandboxing
+LOCAL_INCLUDES += [
+    "/xpcom/base",
+]
+
+if CONFIG["MOZ_SYSTEM_AV1"]:
+    CXXFLAGS += CONFIG["MOZ_SYSTEM_LIBAOM_CFLAGS"]
+
+include("/ipc/chromium/chromium-config.mozbuild")
+
+# Add libFuzzer configuration directives
+
+
+FINAL_LIBRARY = "xul"

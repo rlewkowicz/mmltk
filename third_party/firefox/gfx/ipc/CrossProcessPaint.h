@@ -1,0 +1,145 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef _include_mozilla_gfx_ipc_CrossProcessPaint_h_
+#define _include_mozilla_gfx_ipc_CrossProcessPaint_h_
+
+#include "nsISupportsImpl.h"
+
+#include "mozilla/dom/ipc/IdType.h"
+#include "mozilla/gfx/Point.h"
+#include "mozilla/gfx/Rect.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/ipc/ByteBuf.h"
+#include "nsColor.h"
+#include "nsTHashMap.h"
+#include "nsHashKeys.h"
+#include "nsRefPtrHashtable.h"
+#include "nsTHashSet.h"
+
+class nsIDocShell;
+
+namespace IPC {
+template <typename T>
+struct ParamTraits;
+}  
+
+namespace mozilla {
+
+namespace dom {
+class CanonicalBrowsingContext;
+class DOMRect;
+class Promise;
+class WindowGlobalParent;
+}  
+
+namespace gfx {
+
+class CrossProcessPaint;
+
+enum class CrossProcessPaintFlags {
+  None = 0,
+  DrawView = 1 << 1,
+  ResetScrollPosition = 1 << 2,
+  UseHighQualityScaling = 1 << 3,
+  ForPrinting = 1 << 4,
+};
+constexpr auto kAllCrossProcessPaintFlags =
+    CrossProcessPaintFlags((1 << 5) - 1);
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(CrossProcessPaintFlags)
+
+class PaintFragment final {
+ public:
+  PaintFragment() = default;
+
+  static PaintFragment Record(dom::BrowsingContext* aBc,
+                              const Maybe<IntRect>& aRect, float aScale,
+                              nscolor aBackgroundColor,
+                              CrossProcessPaintFlags aFlags);
+
+  bool IsEmpty() const;
+
+  PaintFragment(PaintFragment&&) = default;
+  PaintFragment& operator=(PaintFragment&&) = default;
+
+ protected:
+  friend struct IPC::ParamTraits<PaintFragment>;
+  friend CrossProcessPaint;
+
+  typedef mozilla::ipc::ByteBuf ByteBuf;
+
+  PaintFragment(IntSize, ByteBuf&&, nsTHashSet<uint64_t>&&);
+
+  IntSize mSize;
+  ByteBuf mRecording;
+  nsTHashSet<uint64_t> mDependencies;
+};
+
+struct RecordedDependentSurface;
+
+class CrossProcessPaint final {
+  NS_INLINE_DECL_REFCOUNTING(CrossProcessPaint);
+
+ public:
+  typedef nsRefPtrHashtable<nsUint64HashKey, RecordedDependentSurface>
+      ResolvedFragmentMap;
+  typedef MozPromise<ResolvedFragmentMap, nsresult, true> ResolvePromise;
+  static bool Start(dom::WindowGlobalParent* aRoot, const dom::DOMRect* aRect,
+                    float aScale, nscolor aBackgroundColor,
+                    CrossProcessPaintFlags aFlags, dom::Promise* aPromise);
+
+  static RefPtr<ResolvePromise> Start(
+      nsTHashSet<uint64_t>&& aDependencies,
+      CrossProcessPaintFlags aFlags = CrossProcessPaintFlags::None);
+
+  void ReceiveFragment(dom::WindowGlobalParent* aWGP,
+                       PaintFragment&& aFragment);
+  void LostFragment(dom::WindowGlobalParent* aWGP);
+
+ private:
+  typedef nsTHashMap<nsUint64HashKey, PaintFragment> ReceivedFragmentMap;
+
+  CrossProcessPaint(float aScale, dom::TabId aRoot,
+                    CrossProcessPaintFlags aFlags);
+  ~CrossProcessPaint();
+
+  void QueueDependencies(const nsTHashSet<uint64_t>& aDependencies);
+
+  void QueuePaint(
+      dom::WindowGlobalParent* aWGP, const Maybe<IntRect>& aRect,
+      nscolor aBackgroundColor = NS_RGBA(0, 0, 0, 0),
+      CrossProcessPaintFlags aFlags = CrossProcessPaintFlags::DrawView);
+
+  void QueuePaint(dom::CanonicalBrowsingContext* aBc);
+
+  void Clear(nsresult aStatus);
+
+  bool IsCleared() const;
+
+  void MaybeResolve();
+  nsresult ResolveInternal(dom::TabId aTabId, ResolvedFragmentMap* aResolved);
+
+  RefPtr<ResolvePromise> Init() {
+    MOZ_ASSERT(mPromise.IsEmpty());
+    return mPromise.Ensure(__func__);
+  }
+
+  CrossProcessPaintFlags GetFlagsForDependencies() const {
+    return (mFlags & (CrossProcessPaintFlags::UseHighQualityScaling |
+                      CrossProcessPaintFlags::ForPrinting)) |
+           CrossProcessPaintFlags::DrawView;
+  }
+
+  MozPromiseHolder<ResolvePromise> mPromise;
+  dom::TabId mRoot;
+  float mScale;
+  uint32_t mPendingFragments;
+  ReceivedFragmentMap mReceivedFragments;
+  CrossProcessPaintFlags mFlags;
+};
+
+}  
+}  
+
+#endif  // _include_mozilla_gfx_ipc_CrossProcessPaint_h_

@@ -1,0 +1,67 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef InputStreamLengthWrapper_h
+#define InputStreamLengthWrapper_h
+
+#include "mozilla/Mutex.h"
+#include "nsCOMPtr.h"
+#include "nsIAsyncInputStream.h"
+#include "nsICloneableInputStream.h"
+#include "nsIIPCSerializableInputStream.h"
+#include "nsISeekableStream.h"
+#include "nsIInputStreamLength.h"
+
+namespace mozilla {
+
+
+class InputStreamLengthWrapper final : public nsIAsyncInputStream,
+                                       public nsICloneableInputStream,
+                                       public nsIIPCSerializableInputStream,
+                                       public nsISeekableStream,
+                                       public nsIInputStreamCallback,
+                                       public nsIInputStreamLength {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIINPUTSTREAM
+  NS_DECL_NSIASYNCINPUTSTREAM
+  NS_DECL_NSICLONEABLEINPUTSTREAM
+  NS_DECL_NSIIPCSERIALIZABLEINPUTSTREAM
+  NS_DECL_NSISEEKABLESTREAM
+  NS_DECL_NSITELLABLESTREAM
+  NS_DECL_NSIINPUTSTREAMCALLBACK
+  NS_DECL_NSIINPUTSTREAMLENGTH
+
+  static already_AddRefed<nsIInputStream> MaybeWrap(
+      already_AddRefed<nsIInputStream> aInputStream, int64_t aLength);
+
+  InputStreamLengthWrapper(already_AddRefed<nsIInputStream> aInputStream,
+                           int64_t aLength);
+
+  InputStreamLengthWrapper();
+
+ private:
+  ~InputStreamLengthWrapper();
+
+  void SetSourceStream(already_AddRefed<nsIInputStream> aInputStream);
+
+  nsCOMPtr<nsIInputStream> mInputStream;
+
+  nsICloneableInputStream* mWeakCloneableInputStream;
+  nsIIPCSerializableInputStream* mWeakIPCSerializableInputStream;
+  nsISeekableStream* mWeakSeekableInputStream;
+  nsITellableStream* mWeakTellableInputStream;
+  nsIAsyncInputStream* mWeakAsyncInputStream;
+
+  int64_t mLength;
+  bool mConsumed;
+
+  mozilla::Mutex mMutex;
+
+  nsCOMPtr<nsIInputStreamCallback> mAsyncWaitCallback MOZ_GUARDED_BY(mMutex);
+};
+
+}  
+
+#endif  // InputStreamLengthWrapper_h

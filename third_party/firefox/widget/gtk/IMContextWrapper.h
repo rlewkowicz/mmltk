@@ -1,0 +1,392 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef IMContextWrapper_h_
+#define IMContextWrapper_h_
+
+#include <gdk/gdk.h>
+#include <gtk/gtk.h>
+
+#include "nsString.h"
+#include "nsCOMPtr.h"
+#include "nsTArray.h"
+#include "nsIWidget.h"
+#include "mozilla/ContentData.h"
+#include "mozilla/EventForwards.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/TextEventDispatcherListener.h"
+#include "mozilla/WritingModes.h"
+#include "mozilla/GUniquePtr.h"
+#include "mozilla/widget/IMEData.h"
+
+class nsWindow;
+
+namespace mozilla {
+namespace widget {
+
+enum class KeyHandlingState {
+  eNotHandled,
+  eHandled,
+  eNotHandledButEventDispatched,
+  eNotHandledButEventConsumed,
+};
+
+class IMContextWrapper final : public TextEventDispatcherListener {
+ public:
+  NS_DECL_ISUPPORTS
+
+  NS_IMETHOD NotifyIME(TextEventDispatcher* aTextEventDispatcher,
+                       const IMENotification& aNotification) override;
+  NS_IMETHOD_(IMENotificationRequests) GetIMENotificationRequests() override;
+  NS_IMETHOD_(void)
+  OnRemovedFrom(TextEventDispatcher* aTextEventDispatcher) override;
+  NS_IMETHOD_(void)
+  WillDispatchKeyboardEvent(TextEventDispatcher* aTextEventDispatcher,
+                            WidgetKeyboardEvent& aKeyboardEvent,
+                            uint32_t aIndexOfKeypress, void* aData) override;
+
+ public:
+  explicit IMContextWrapper(nsWindow* aOwnerWindow);
+
+  static void Shutdown();
+
+  bool IsEnabled() const;
+
+  bool IsEditable() const { return mInputContext.mIMEState.IsEditable(); }
+
+  void OnFocusWindow(nsWindow* aWindow);
+  void OnBlurWindow(nsWindow* aWindow);
+  void OnDestroyWindow(nsWindow* aWindow);
+  void OnFocusChangeInGecko(bool aFocus);
+  void OnSelectionChange(nsWindow* aCaller,
+                         const IMENotification& aIMENotification);
+  static void OnThemeChanged();
+
+  KeyHandlingState OnKeyEvent(nsWindow* aWindow, GdkEventKey* aEvent,
+                              bool aKeyboardEventWasDispatched = false);
+
+  nsresult EndIMEComposition(nsWindow* aCaller);
+  void SetInputContext(nsWindow* aCaller, const InputContext* aContext,
+                       const InputContextAction* aAction);
+  InputContext GetInputContext();
+  void OnUpdateComposition();
+  void OnLayoutChange();
+
+  TextEventDispatcher* GetTextEventDispatcher();
+
+  enum class IMContextID : uint8_t {
+    Fcitx,  
+    Fcitx5,
+    IBus,
+    IIIMF,
+    Scim,
+    Uim,
+    Wayland,
+    Unknown,
+  };
+
+  friend std::ostream& operator<<(std::ostream& aStream,
+                                  const IMContextID& aIMContextID) {
+    switch (aIMContextID) {
+      case IMContextID::Fcitx:
+        return aStream << "Fcitx";
+      case IMContextID::Fcitx5:
+        return aStream << "Fcitx5";
+      case IMContextID::IBus:
+        return aStream << "IBus";
+      case IMContextID::IIIMF:
+        return aStream << "IIIMF";
+      case IMContextID::Scim:
+        return aStream << "Scim";
+      case IMContextID::Uim:
+        return aStream << "Uim";
+      case IMContextID::Wayland:
+        return aStream << "Wayland";
+      case IMContextID::Unknown:
+        return aStream << "Unknown";
+    }
+    MOZ_ASSERT_UNREACHABLE("Add new case for the new IM support");
+    return aStream << "Unknown";
+  }
+
+  nsDependentCSubstring GetIMName() const;
+
+  static guint16 GetWaitingSynthesizedKeyPressHardwareKeyCode() {
+    return sWaitingSynthesizedKeyPressHardwareKeyCode;
+  }
+
+ protected:
+  ~IMContextWrapper();
+
+  void SetInputPurposeAndInputHints();
+
+  nsWindow* mOwnerWindow;
+
+  nsWindow* mLastFocusedWindow;
+
+  GtkIMContext* mContext;
+
+  GtkIMContext* mSimpleContext;
+
+  GtkIMContext* mDummyContext;
+
+  GtkIMContext* mComposingContext;
+
+  InputContext mInputContext;
+
+  uint32_t mCompositionStart;
+
+  nsString mDispatchedCompositionString;
+
+  nsString mSelectedStringRemovedByComposition;
+
+  GdkEventKey* mProcessingKeyEvent;
+
+  class GdkEventKeyQueue final {
+   public:
+    ~GdkEventKeyQueue() { Clear(); }
+
+    void Clear() { mEvents.Clear(); }
+
+    void PutEvent(const GdkEventKey* aEvent) {
+      GdkEventKey* newEvent = reinterpret_cast<GdkEventKey*>(
+          gdk_event_copy(reinterpret_cast<const GdkEvent*>(aEvent)));
+      newEvent->state &= GDK_MODIFIER_MASK;
+      mEvents.AppendElement(newEvent);
+    }
+
+    void RemoveEvent(const GdkEventKey* aEvent) {
+      size_t index = IndexOf(aEvent);
+      if (NS_WARN_IF(index == GdkEventKeyQueue::NoIndex())) {
+        return;
+      }
+      mEvents.RemoveElementAt(index);
+    }
+
+    const GdkEventKey* GetCorrespondingKeyPressEvent(
+        const GdkEventKey* aEvent) const {
+      MOZ_ASSERT(aEvent->type == GDK_KEY_RELEASE);
+      for (const GUniquePtr<GdkEventKey>& pendingKeyEvent : mEvents) {
+        if (pendingKeyEvent->type == GDK_KEY_PRESS &&
+            aEvent->hardware_keycode == pendingKeyEvent->hardware_keycode) {
+          return pendingKeyEvent.get();
+        }
+      }
+      return nullptr;
+    }
+
+    GdkEventKey* GetFirstEvent() const {
+      if (mEvents.IsEmpty()) {
+        return nullptr;
+      }
+      return mEvents[0].get();
+    }
+
+    bool IsEmpty() const { return mEvents.IsEmpty(); }
+
+    static size_t NoIndex() { return nsTArray<GdkEventKey*>::NoIndex; }
+    size_t Length() const { return mEvents.Length(); }
+    size_t IndexOf(const GdkEventKey* aEvent) const {
+      static_assert(!(GDK_MODIFIER_MASK & (1 << 24)),
+                    "We assumes 25th bit is used by some IM, but used by GDK");
+      static_assert(!(GDK_MODIFIER_MASK & (1 << 25)),
+                    "We assumes 26th bit is used by some IM, but used by GDK");
+      for (size_t i = 0; i < mEvents.Length(); i++) {
+        GdkEventKey* event = mEvents[i].get();
+        if (event->time == aEvent->time) {
+          if (NS_WARN_IF(event->type != aEvent->type) ||
+              NS_WARN_IF(event->keyval != aEvent->keyval) ||
+              NS_WARN_IF(event->state != (aEvent->state & GDK_MODIFIER_MASK))) {
+            continue;
+          }
+        }
+        return i;
+      }
+      return GdkEventKeyQueue::NoIndex();
+    }
+
+   private:
+    nsTArray<GUniquePtr<GdkEventKey>> mEvents;
+  };
+  GdkEventKeyQueue mPostingKeyEvents;
+
+  static guint16 sWaitingSynthesizedKeyPressHardwareKeyCode;
+
+  struct Range {
+    uint32_t mOffset;
+    uint32_t mLength;
+
+    Range() : mOffset(UINT32_MAX), mLength(UINT32_MAX) {}
+
+    bool IsValid() const { return mOffset != UINT32_MAX; }
+    void Clear() {
+      mOffset = UINT32_MAX;
+      mLength = UINT32_MAX;
+    }
+  };
+
+  Range mCompositionTargetRange;
+
+  enum eCompositionState : uint8_t {
+    eCompositionState_NotComposing,
+    eCompositionState_CompositionStartDispatched,
+    eCompositionState_CompositionChangeEventDispatched
+  };
+  eCompositionState mCompositionState;
+
+  bool IsComposing() const {
+    return (mCompositionState != eCompositionState_NotComposing);
+  }
+
+  bool IsComposingOn(GtkIMContext* aContext) const {
+    return IsComposing() && mComposingContext == aContext;
+  }
+
+  bool IsComposingOnCurrentContext() const {
+    return IsComposingOn(GetCurrentContext());
+  }
+
+  bool EditorHasCompositionString() {
+    return (mCompositionState ==
+            eCompositionState_CompositionChangeEventDispatched);
+  }
+
+  bool IsValidContext(GtkIMContext* aContext) const;
+
+  const char* GetCompositionStateName() {
+    switch (mCompositionState) {
+      case eCompositionState_NotComposing:
+        return "NotComposing";
+      case eCompositionState_CompositionStartDispatched:
+        return "CompositionStartDispatched";
+      case eCompositionState_CompositionChangeEventDispatched:
+        return "CompositionChangeEventDispatched";
+      default:
+        return "InvaildState";
+    }
+  }
+
+  IMContextID mIMContextID;
+
+  Maybe<ContentSelection> mContentSelection;
+
+  bool EnsureToCacheContentSelection(nsAString* aSelectedString = nullptr);
+
+  enum class IMEFocusState : uint8_t {
+    Focused,
+    Blurred,
+    BlurredWithoutFocusChange,
+  };
+  friend std::ostream& operator<<(std::ostream& aStream, IMEFocusState aState) {
+    switch (aState) {
+      case IMEFocusState::Focused:
+        return aStream << "IMEFocusState::Focused";
+      case IMEFocusState::Blurred:
+        return aStream << "IMEFocusState::Blurred";
+      case IMEFocusState::BlurredWithoutFocusChange:
+        return aStream << "IMEFocusState::BlurredWithoutFocusChange";
+      default:
+        MOZ_ASSERT_UNREACHABLE("Invalid value");
+        return aStream << "<illegal value>";
+    }
+  }
+  IMEFocusState mIMEFocusState = IMEFocusState::Blurred;
+
+  bool mFallbackToKeyEvent;
+  bool mKeyboardEventWasDispatched;
+  bool mKeyboardEventWasConsumed;
+  bool mIsDeletingSurrounding;
+  bool mLayoutChanged;
+  bool mSetCursorPositionOnKeyEvent;
+  bool mPendingResettingIMContext;
+  bool mRetrieveSurroundingSignalReceived;
+  bool mMaybeInDeadKeySequence;
+  bool mIsIMInAsyncKeyHandlingMode;
+  bool mIsKeySnooped;
+  bool mSetInputPurposeAndInputHints;
+  bool mPendingSetSurrounding = false;
+
+  static IMContextWrapper* sLastFocusedContext;
+
+  static bool sUseSimpleContext;
+
+  static gboolean OnRetrieveSurroundingCallback(GtkIMContext* aContext,
+                                                IMContextWrapper* aModule);
+  static gboolean OnDeleteSurroundingCallback(GtkIMContext* aContext,
+                                              gint aOffset, gint aNChars,
+                                              IMContextWrapper* aModule);
+  static void OnCommitCompositionCallback(GtkIMContext* aContext,
+                                          const gchar* aString,
+                                          IMContextWrapper* aModule);
+  static void OnChangeCompositionCallback(GtkIMContext* aContext,
+                                          IMContextWrapper* aModule);
+  static void OnStartCompositionCallback(GtkIMContext* aContext,
+                                         IMContextWrapper* aModule);
+  static void OnEndCompositionCallback(GtkIMContext* aContext,
+                                       IMContextWrapper* aModule);
+
+  gboolean OnRetrieveSurroundingNative(GtkIMContext* aContext);
+  gboolean OnDeleteSurroundingNative(GtkIMContext* aContext, gint aOffset,
+                                     gint aNChars);
+  void OnCommitCompositionNative(GtkIMContext* aContext, const gchar* aString);
+  void OnChangeCompositionNative(GtkIMContext* aContext);
+  void OnStartCompositionNative(GtkIMContext* aContext);
+  void OnEndCompositionNative(GtkIMContext* aContext);
+
+  GtkIMContext* GetCurrentContext() const;
+
+  GtkIMContext* GetActiveContext() const {
+    return mComposingContext ? mComposingContext : GetCurrentContext();
+  }
+
+  bool IsDestroyed() { return !mOwnerWindow; }
+
+  void NotifyIMEOfFocusChange(IMEFocusState aIMEFocusState);
+
+  void Init();
+
+  void ResetIME();
+
+  void GetCompositionString(GtkIMContext* aContext,
+                            nsAString& aCompositionString);
+
+  already_AddRefed<TextRangeArray> CreateTextRangeArray(
+      GtkIMContext* aContext, const nsAString& aCompositionString);
+
+  bool SetTextRange(PangoAttrIterator* aPangoAttrIter,
+                    const gchar* aUTF8CompositionString,
+                    uint32_t aUTF16CaretOffset, TextRange& aTextRange) const;
+
+  static nscolor ToNscolor(PangoAttrColor* aPangoAttrColor);
+
+  void SetCursorPosition(GtkIMContext* aContext);
+
+  uint32_t GetSelectionOffset(nsWindow* aWindow);
+
+  nsresult GetCurrentParagraph(nsAString& aText, uint32_t& aCursorPos);
+
+  nsresult DeleteText(GtkIMContext* aContext, int32_t aOffset,
+                      uint32_t aNChars);
+
+  void PrepareToDestroyContext(GtkIMContext* aContext);
+
+
+  bool MaybeDispatchKeyEventAsProcessedByIME(EventMessage aFollowingEvent);
+
+  bool DispatchKeyEventsForCommittedCharacter(WidgetKeyboardEvent& aKeyEvent,
+                                              bool aDispatchKeyUp);
+
+  bool DispatchCompositionStart(GtkIMContext* aContext);
+
+  bool DispatchCompositionChangeEvent(GtkIMContext* aContext,
+                                      const nsAString& aCompositionString);
+
+  bool DispatchCompositionCommitEvent(GtkIMContext* aContext,
+                                      const nsAString* aCommitString = nullptr);
+};
+
+}  
+}  
+
+#endif  // #ifndef IMContextWrapper_h_

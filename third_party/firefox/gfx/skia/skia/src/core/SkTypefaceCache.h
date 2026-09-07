@@ -1,0 +1,46 @@
+/*
+ * Copyright 2011 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+
+
+#if !defined(SkTypefaceCache_DEFINED)
+#define SkTypefaceCache_DEFINED
+
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkTypeface.h"
+#include "include/private/base/SkTArray.h"
+
+class SkTypefaceCache {
+public:
+    SkTypefaceCache();
+
+    typedef bool(*FindProc)(SkTypeface*, void* context);
+
+    void add(sk_sp<SkTypeface>);
+
+    sk_sp<SkTypeface> findByProcAndRef(FindProc proc, void* ctx) const;
+
+    void purgeAll();
+
+    static SkTypefaceID NewTypefaceID();
+
+
+    static void Add(sk_sp<SkTypeface>);
+    static sk_sp<SkTypeface> FindByProcAndRef(FindProc proc, void* ctx);
+    static void PurgeAll();
+
+    static void Dump();
+
+private:
+    static SkTypefaceCache& Get();
+
+    void purge(int count);
+
+    skia_private::TArray<sk_sp<SkTypeface>> fTypefaces;
+};
+
+#endif

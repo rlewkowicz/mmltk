@@ -1,0 +1,81 @@
+/*
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifdef FREEBL_NO_DEPEND
+#include "stubs.h"
+#endif
+
+#include "prerror.h"
+#include "secerr.h"
+
+#include "prtypes.h"
+#include "prinit.h"
+#include "blapi.h"
+#include "secitem.h"
+#include "blapit.h"
+#include "secport.h"
+#include "secrng.h"
+#include "ml_dsat.h"
+
+
+struct MLDSAContextStr {
+    PLArenaPool *arena;
+    MLDSAPrivateKey *privKey;
+    MLDSAPublicKey *pubKey;
+    CK_HEDGE_TYPE hedgeType;
+    CK_ML_DSA_PARAMETER_SET_TYPE paramSet;
+};
+
+SECStatus
+MLDSA_NewKey(CK_ML_DSA_PARAMETER_SET_TYPE paramSet, SECItem *seed,
+             MLDSAPrivateKey *privKey, MLDSAPublicKey *pubKey)
+{
+    PORT_SetError(SEC_ERROR_INVALID_ARGS);
+    return SECFailure;
+}
+
+SECStatus
+MLDSA_SignInit(MLDSAPrivateKey *key, CK_HEDGE_TYPE hedgeType,
+               const SECItem *sgnCtx, MLDSAContext **ctx)
+{
+    PORT_SetError(SEC_ERROR_INVALID_ARGS);
+    return SECFailure;
+}
+
+SECStatus
+MLDSA_SignUpdate(MLDSAContext *ctx, const SECItem *data)
+{
+    PORT_SetError(SEC_ERROR_INVALID_ARGS);
+    return SECFailure;
+}
+
+SECStatus
+MLDSA_SignFinal(MLDSAContext *ctx, SECItem *signature)
+{
+    PORT_SetError(SEC_ERROR_INVALID_ARGS);
+    return SECFailure;
+}
+
+SECStatus
+MLDSA_VerifyInit(MLDSAPublicKey *key, const SECItem *sgnCtx, MLDSAContext **ctx)
+{
+    PORT_SetError(SEC_ERROR_INVALID_ARGS);
+    return SECFailure;
+}
+
+SECStatus
+MLDSA_VerifyUpdate(MLDSAContext *ctx, const SECItem *data)
+{
+    PORT_SetError(SEC_ERROR_INVALID_ARGS);
+    return SECFailure;
+}
+
+SECStatus
+MLDSA_VerifyFinal(MLDSAContext *ctx, const SECItem *signature)
+{
+    PORT_SetError(SEC_ERROR_INVALID_ARGS);
+    return SECFailure;
+}

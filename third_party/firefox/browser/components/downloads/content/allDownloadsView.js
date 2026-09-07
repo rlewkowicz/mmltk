@@ -1,0 +1,767 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+var { XPCOMUtils } = ChromeUtils.importESModule(
+  "resource://gre/modules/XPCOMUtils.sys.mjs"
+);
+var { AppConstants } = ChromeUtils.importESModule(
+  "resource://gre/modules/AppConstants.sys.mjs"
+);
+
+ChromeUtils.defineESModuleGetters(this, {
+  BrowserWindowTracker: "resource:///modules/BrowserWindowTracker.sys.mjs",
+  Downloads: "resource://gre/modules/Downloads.sys.mjs",
+  DownloadsCommon:
+    "moz-src:///browser/components/downloads/DownloadsCommon.sys.mjs",
+  DownloadsViewUI:
+    "moz-src:///browser/components/downloads/DownloadsViewUI.sys.mjs",
+  FileUtils: "resource://gre/modules/FileUtils.sys.mjs",
+  NetUtil: "resource://gre/modules/NetUtil.sys.mjs",
+  PlacesUtils: "resource://gre/modules/PlacesUtils.sys.mjs",
+});
+
+const CLIPBOARD_URL_FLAVORS = ["text/x-moz-url", "text/plain"];
+
+function HistoryDownloadElementShell(download) {
+  this._download = download;
+
+  this.element = document.createXULElement("richlistitem");
+  this.element._shell = this;
+
+  this.element.classList.add("download");
+  this.element.classList.add("download-state");
+}
+
+HistoryDownloadElementShell.prototype = {
+  get download() {
+    return this._download;
+  },
+
+  onStateChanged() {
+    this._targetFileChecked = false;
+
+    this._updateState();
+
+    if (this.element.selected) {
+      goUpdateDownloadCommands();
+    } else {
+      goUpdateCommand("downloadsCmd_clearDownloads");
+    }
+  },
+
+  onChanged() {
+    if (!this.active) {
+      return;
+    }
+
+    let newState = DownloadsCommon.stateOfDownload(this.download);
+    if (this._downloadState !== newState) {
+      this._downloadState = newState;
+      this.onStateChanged();
+    } else {
+      this._updateStateInner();
+    }
+  },
+  _downloadState: null,
+
+  isCommandEnabled(aCommand) {
+    if (!this.active && aCommand != "cmd_delete") {
+      return false;
+    }
+    return DownloadsViewUI.DownloadElementShell.prototype.isCommandEnabled.call(
+      this,
+      aCommand
+    );
+  },
+
+  matchesSearchTerm(aTerm) {
+    if (!aTerm) {
+      return true;
+    }
+    aTerm = aTerm.toLowerCase();
+    let displayName = DownloadsViewUI.getDisplayName(this.download);
+    return (
+      displayName.toLowerCase().includes(aTerm) ||
+      (this.download.source.originalUrl || this.download.source.url)
+        .toLowerCase()
+        .includes(aTerm)
+    );
+  },
+
+  doDefaultCommand(event) {
+    let command = this.currentDefaultCommandName;
+    if (
+      command == "downloadsCmd_open" &&
+      event &&
+      (event.shiftKey || event.ctrlKey || event.metaKey || event.button == 1)
+    ) {
+      let browserWin = BrowserWindowTracker.getTopWindow();
+      let openWhere = browserWin
+        ? BrowserUtils.whereToOpenLink(event, false, true)
+        : "window";
+      if (["window", "tabshifted", "tab"].includes(openWhere)) {
+        command += ":" + openWhere;
+      }
+    }
+
+    if (command && this.isCommandEnabled(command)) {
+      this.doCommand(command);
+    }
+  },
+
+  onSelect() {
+    if (!this.active) {
+      return;
+    }
+
+    if (!this.download.target.path) {
+      return;
+    }
+
+    if (!this._targetFileChecked) {
+      this.download
+        .refresh()
+        .catch(console.error)
+        .then(() => {
+          this._targetFileChecked = true;
+        });
+    }
+  },
+};
+Object.setPrototypeOf(
+  HistoryDownloadElementShell.prototype,
+  DownloadsViewUI.DownloadElementShell.prototype
+);
+
+var DownloadsView = {
+  onDownloadButton(event) {
+    event.target.closest("richlistitem")._shell.onButton();
+  },
+
+  onDownloadClick() {},
+};
+
+function DownloadsPlacesView(
+  aRichListBox,
+  aActive = true,
+  aSuppressionFlag = DownloadsCommon.SUPPRESS_ALL_DOWNLOADS_OPEN
+) {
+  this._richlistbox = aRichListBox;
+  this._richlistbox._placesView = this;
+  window.controllers.insertControllerAt(0, this);
+
+  this._viewItemsForDownloads = new WeakMap();
+
+  this._searchTerm = "";
+
+  this._active = aActive;
+
+  this._initiallySelectedElement = null;
+  this._downloadsData = DownloadsCommon.getData(window.opener || window, true);
+  this._waitingForInitialData = true;
+  this._downloadsData.addView(this);
+
+  if (aSuppressionFlag === DownloadsCommon.SUPPRESS_ALL_DOWNLOADS_OPEN) {
+    DownloadsCommon.getIndicatorData(window).attentionSuppressed |=
+      aSuppressionFlag;
+  }
+
+  window.addEventListener(
+    "unload",
+    () => {
+      window.controllers.removeController(this);
+      DownloadsCommon.getIndicatorData(window).attentionSuppressed &=
+        ~aSuppressionFlag;
+      this._downloadsData.removeView(this);
+      this.result = null;
+    },
+    true
+  );
+  window.addEventListener(
+    "resize",
+    () => {
+      this._ensureVisibleElementsAreActive(true);
+    },
+    true
+  );
+}
+
+DownloadsPlacesView.prototype = {
+  get associatedElement() {
+    return this._richlistbox;
+  },
+
+  get active() {
+    return this._active;
+  },
+  set active(val) {
+    this._active = val;
+    if (this._active) {
+      this._ensureVisibleElementsAreActive(true);
+    }
+  },
+
+  _ensureVisibleElementsAreActive(debounce = false) {
+    if (
+      !this.active ||
+      (debounce && this._ensureVisibleTimer) ||
+      !this._richlistbox.firstChild
+    ) {
+      return;
+    }
+
+    if (debounce) {
+      this._ensureVisibleTimer = setTimeout(() => {
+        this._internalEnsureVisibleElementsAreActive();
+      }, 10);
+    } else {
+      this._internalEnsureVisibleElementsAreActive();
+    }
+  },
+
+  _internalEnsureVisibleElementsAreActive() {
+    if (!this._richlistbox.firstChild) {
+      delete this._ensureVisibleTimer;
+      return;
+    }
+
+    if (this._ensureVisibleTimer) {
+      clearTimeout(this._ensureVisibleTimer);
+      delete this._ensureVisibleTimer;
+    }
+
+    let rlbRect = this._richlistbox.getBoundingClientRect();
+    let winUtils = window.windowUtils;
+    let nodes = winUtils.nodesFromRect(
+      rlbRect.left,
+      rlbRect.top,
+      0,
+      rlbRect.width,
+      rlbRect.height,
+      0,
+      true,
+      false,
+      false
+    );
+    let firstVisibleNode, lastVisibleNode;
+    for (let node of nodes) {
+      if (node.localName === "richlistitem" && node._shell) {
+        node._shell.ensureActive();
+        firstVisibleNode = node;
+        if (!lastVisibleNode) {
+          lastVisibleNode = node;
+        }
+      }
+    }
+
+    let nodeBelowVisibleArea = lastVisibleNode && lastVisibleNode.nextSibling;
+    if (nodeBelowVisibleArea && nodeBelowVisibleArea._shell) {
+      nodeBelowVisibleArea._shell.ensureActive();
+    }
+
+    let nodeAboveVisibleArea =
+      firstVisibleNode && firstVisibleNode.previousSibling;
+    if (nodeAboveVisibleArea && nodeAboveVisibleArea._shell) {
+      nodeAboveVisibleArea._shell.ensureActive();
+    }
+  },
+
+  _place: "",
+  get place() {
+    return this._place;
+  },
+  set place(val) {
+    if (this._place == val) {
+      this.searchTerm = "";
+    } else {
+      this._place = val;
+    }
+  },
+
+  get selectedNodes() {
+    return Array.prototype.filter.call(
+      this._richlistbox.selectedItems,
+      element => element._shell.download.placesNode
+    );
+  },
+
+  get selectedNode() {
+    let selectedNodes = this.selectedNodes;
+    return selectedNodes.length == 1 ? selectedNodes[0] : null;
+  },
+
+  get hasSelection() {
+    return !!this.selectedNodes.length;
+  },
+
+  get controller() {
+    return this._richlistbox.controller;
+  },
+
+  get searchTerm() {
+    return this._searchTerm;
+  },
+  set searchTerm(aValue) {
+    if (this._searchTerm != aValue) {
+      this._richlistbox.clearSelection();
+      for (let element of this._richlistbox.childNodes) {
+        element.hidden = !element._shell.matchesSearchTerm(aValue);
+      }
+      this._ensureVisibleElementsAreActive();
+    }
+    this._searchTerm = aValue;
+  },
+
+  _ensureInitialSelection() {
+    if (this._richlistbox.selectedItem == this._initiallySelectedElement) {
+      let firstDownloadElement = this._richlistbox.firstChild;
+      if (firstDownloadElement != this._initiallySelectedElement) {
+        firstDownloadElement._shell.ensureActive();
+        this._richlistbox.selectedItem = firstDownloadElement;
+        this._richlistbox.currentItem = firstDownloadElement;
+        this._initiallySelectedElement = firstDownloadElement;
+      }
+    }
+  },
+
+  batchFragment: null,
+
+  onDownloadBatchStarting() {
+    this.batchFragment = document.createDocumentFragment();
+
+    this.oldSuppressOnSelect = this._richlistbox.suppressOnSelect;
+    this._richlistbox.suppressOnSelect = true;
+  },
+
+  onDownloadBatchEnded() {
+    this._richlistbox.suppressOnSelect = this.oldSuppressOnSelect;
+    delete this.oldSuppressOnSelect;
+
+    if (this.batchFragment.childElementCount) {
+      this._prependBatchFragment();
+    }
+    this.batchFragment = null;
+
+    this._ensureInitialSelection();
+    this._ensureVisibleElementsAreActive();
+    goUpdateDownloadCommands();
+    if (this._waitingForInitialData) {
+      this._waitingForInitialData = false;
+      this._richlistbox.dispatchEvent(
+        new CustomEvent("InitialDownloadsLoaded")
+      );
+    }
+  },
+
+  _prependBatchFragment() {
+
+    let xblFields = new Map();
+    for (let key of Object.getOwnPropertyNames(this._richlistbox)) {
+      let value = this._richlistbox[key];
+      xblFields.set(key, value);
+    }
+
+    let oldActiveElement = document.activeElement;
+    let parentNode = this._richlistbox.parentNode;
+    let nextSibling = this._richlistbox.nextSibling;
+    parentNode.removeChild(this._richlistbox);
+    this._richlistbox.prepend(this.batchFragment);
+    parentNode.insertBefore(this._richlistbox, nextSibling);
+    if (oldActiveElement && oldActiveElement != document.activeElement) {
+      oldActiveElement.focus();
+    }
+
+    for (let [key, value] of xblFields) {
+      this._richlistbox[key] = value;
+    }
+  },
+
+  onDownloadAdded(download, { insertBefore } = {}) {
+    let shell = new HistoryDownloadElementShell(download);
+    this._viewItemsForDownloads.set(download, shell);
+
+    if (insertBefore) {
+      this._viewItemsForDownloads
+        .get(insertBefore)
+        .element.insertAdjacentElement("afterend", shell.element);
+    } else {
+      (this.batchFragment || this._richlistbox).prepend(shell.element);
+    }
+
+    if (this.searchTerm) {
+      shell.element.hidden = !shell.matchesSearchTerm(this.searchTerm);
+    }
+
+    if (!this.batchFragment) {
+      this._ensureVisibleElementsAreActive();
+      goUpdateCommand("downloadsCmd_clearDownloads");
+    }
+  },
+
+  onDownloadChanged(download) {
+    this._viewItemsForDownloads.get(download).onChanged();
+  },
+
+  onDownloadRemoved(download) {
+    let element = this._viewItemsForDownloads.get(download).element;
+
+    if (
+      (element.nextSibling || element.previousSibling) &&
+      this._richlistbox.selectedItems &&
+      this._richlistbox.selectedItems.length == 1 &&
+      this._richlistbox.selectedItems[0] == element
+    ) {
+      this._richlistbox.selectItem(
+        element.nextSibling || element.previousSibling
+      );
+    }
+
+    this._richlistbox.removeItemFromSelection(element);
+    element.remove();
+
+    if (!this.batchFragment) {
+      this._ensureVisibleElementsAreActive();
+      goUpdateCommand("downloadsCmd_clearDownloads");
+    }
+  },
+
+  supportsCommand(aCommand) {
+    if (!DownloadsViewUI.isCommandName(aCommand)) {
+      return false;
+    }
+    if (
+      !(aCommand in this) &&
+      !(aCommand in HistoryDownloadElementShell.prototype)
+    ) {
+      return false;
+    }
+    return (
+      aCommand == "downloadsCmd_clearDownloads" ||
+      document.activeElement == this._richlistbox
+    );
+  },
+
+  isCommandEnabled(aCommand) {
+    switch (aCommand) {
+      case "cmd_copy":
+        return Array.prototype.some.call(
+          this._richlistbox.selectedItems,
+          element => {
+            const { source } = element._shell.download;
+            return !!(source?.originalUrl || source?.url);
+          }
+        );
+      case "downloadsCmd_openReferrer":
+      case "downloadShowMenuItem":
+        return this._richlistbox.selectedItems.length == 1;
+      case "cmd_selectAll":
+        return true;
+      case "cmd_paste":
+        return Services.clipboard.hasDataMatchingFlavors(
+          CLIPBOARD_URL_FLAVORS,
+          Ci.nsIClipboard.kGlobalClipboard
+        );
+      case "downloadsCmd_clearDownloads":
+        return this.canClearDownloads(this._richlistbox);
+      default:
+        return Array.prototype.every.call(
+          this._richlistbox.selectedItems,
+          element => element._shell.isCommandEnabled(aCommand)
+        );
+    }
+  },
+
+  _copySelectedDownloadsToClipboard() {
+    let urls = Array.from(this._richlistbox.selectedItems, element => {
+      const { source } = element._shell.download;
+      return source?.originalUrl || source?.url;
+    }).filter(Boolean);
+
+    Cc["@mozilla.org/widget/clipboardhelper;1"]
+      .getService(Ci.nsIClipboardHelper)
+      .copyString(urls.join("\n"));
+  },
+
+  _getURLFromClipboardData() {
+    let trans = Cc["@mozilla.org/widget/transferable;1"].createInstance(
+      Ci.nsITransferable
+    );
+    trans.init(null);
+
+    CLIPBOARD_URL_FLAVORS.forEach(trans.addDataFlavor);
+
+    Services.clipboard.getData(trans, Services.clipboard.kGlobalClipboard);
+
+    try {
+      let data = {};
+      trans.getAnyTransferData({}, data);
+      let [url, name] = data.value
+        .QueryInterface(Ci.nsISupportsString)
+        .data.split("\n");
+      if (url) {
+        return [NetUtil.newURI(url).spec, name];
+      }
+    } catch (ex) {}
+
+    return ["", ""];
+  },
+
+  doCommand(aCommand) {
+    if (!this.isCommandEnabled(aCommand)) {
+      return;
+    }
+
+    if (aCommand in this) {
+      this[aCommand]();
+      return;
+    }
+
+    let selectedElements = [...this._richlistbox.selectedItems];
+    for (let element of selectedElements) {
+      element._shell.doCommand(aCommand);
+    }
+  },
+
+  onEvent() {},
+
+  cmd_copy() {
+    this._copySelectedDownloadsToClipboard();
+  },
+
+  cmd_selectAll() {
+    if (!this.searchTerm) {
+      this._richlistbox.selectAll();
+      return;
+    }
+    let oldSuppressOnSelect = this._richlistbox.suppressOnSelect;
+    this._richlistbox.suppressOnSelect = true;
+    this._richlistbox.clearSelection();
+    var item = this._richlistbox.getItemAtIndex(0);
+    while (item) {
+      if (!item.hidden) {
+        this._richlistbox.addItemToSelection(item);
+      }
+      item = this._richlistbox.getNextItem(item, 1);
+    }
+    this._richlistbox.suppressOnSelect = oldSuppressOnSelect;
+  },
+
+  cmd_paste() {
+    let [url, name] = this._getURLFromClipboardData();
+    if (url) {
+      let browserWin = BrowserWindowTracker.getTopWindow();
+      let initiatingDoc = browserWin ? browserWin.document : document;
+      DownloadURL(url, name, initiatingDoc);
+    }
+  },
+
+  downloadsCmd_clearDownloads() {
+    this._downloadsData.removeFinished();
+    if (AppConstants.MOZ_PLACES && this._place) {
+      PlacesUtils.history
+        .removeVisitsByFilter({
+          transition: PlacesUtils.history.TRANSITIONS.DOWNLOAD,
+        })
+        .catch(console.error);
+    }
+    goUpdateCommand("downloadsCmd_clearDownloads");
+  },
+
+  onContextMenu() {
+    let element = this._richlistbox.selectedItem;
+    if (!element || !element._shell) {
+      return false;
+    }
+
+    let contextMenu = document.getElementById("downloadsContextMenu");
+    DownloadsViewUI.updateContextMenuForElement(contextMenu, element);
+    contextMenu.querySelector(".downloadCopyLocationMenuItem").hidden =
+      !Array.prototype.some.call(
+        this._richlistbox.selectedItems,
+        el =>
+          !!el._shell.download.source?.url &&
+          !el._shell.download.source?.isDataURICleared
+      );
+    contextMenu.querySelector(".downloadLinksSeparator").hidden =
+      contextMenu.querySelector(".downloadCopyLocationMenuItem").hidden &&
+      contextMenu.querySelector(".downloadOpenReferrerMenuItem").hidden;
+
+    let download = element._shell.download;
+    if (!download.stopped) {
+      goUpdateCommand("downloadsCmd_pauseResume");
+    }
+
+    return true;
+  },
+
+  onKeyPress(aEvent) {
+    let selectedElements = this._richlistbox.selectedItems;
+    if (aEvent.keyCode == KeyEvent.DOM_VK_RETURN) {
+      if (selectedElements.length == 1) {
+        let element = selectedElements[0];
+        if (element._shell) {
+          element._shell.doDefaultCommand(aEvent);
+        }
+      }
+    } else if (aEvent.charCode == " ".charCodeAt(0)) {
+      let atLeastOneDownloadToggled = false;
+      for (let element of selectedElements) {
+        if (element._shell.isCommandEnabled("downloadsCmd_pauseResume")) {
+          element._shell.doCommand("downloadsCmd_pauseResume");
+          atLeastOneDownloadToggled = true;
+        }
+      }
+
+      if (atLeastOneDownloadToggled) {
+        aEvent.preventDefault();
+      }
+    }
+  },
+
+  onDoubleClick(aEvent) {
+    if (aEvent.button != 0) {
+      return;
+    }
+
+    let selectedElements = this._richlistbox.selectedItems;
+    if (selectedElements.length != 1) {
+      return;
+    }
+
+    let element = selectedElements[0];
+    if (element._shell) {
+      element._shell.doDefaultCommand(aEvent);
+    }
+  },
+
+  onScroll() {
+    this._ensureVisibleElementsAreActive(true);
+  },
+
+  onSelect() {
+    goUpdateDownloadCommands();
+
+    let selectedElements = this._richlistbox.selectedItems;
+    for (let elt of selectedElements) {
+      if (elt._shell) {
+        elt._shell.onSelect();
+      }
+    }
+  },
+
+  onDragStart(aEvent) {
+    let selectedItem = this._richlistbox.selectedItem;
+    if (!selectedItem) {
+      return;
+    }
+
+    let targetPath = selectedItem._shell.download.target.path;
+    if (!targetPath) {
+      return;
+    }
+
+    let file = new FileUtils.File(targetPath);
+    if (!file.exists()) {
+      return;
+    }
+
+    let dt = aEvent.dataTransfer;
+    dt.mozSetDataAt("application/x-moz-file", file, 0);
+    let url = Services.io.newFileURI(file).spec;
+    dt.setData("text/uri-list", url);
+    dt.effectAllowed = "copyMove";
+    dt.addElement(selectedItem);
+  },
+
+  onDragOver(aEvent) {
+    let types = aEvent.dataTransfer.types;
+    if (
+      types.includes("text/uri-list") ||
+      types.includes("text/x-moz-url") ||
+      types.includes("text/plain")
+    ) {
+      aEvent.preventDefault();
+    }
+  },
+
+  onDrop(aEvent) {
+    let dt = aEvent.dataTransfer;
+    if (dt.mozGetDataAt("application/x-moz-file", 0)) {
+      return;
+    }
+
+    let links = Services.droppedLinkHandler.dropLinks(aEvent);
+    if (!links.length) {
+      return;
+    }
+    aEvent.preventDefault();
+    let browserWin = BrowserWindowTracker.getTopWindow();
+    let initiatingDoc = browserWin ? browserWin.document : document;
+    for (let link of links) {
+      if (link.url.startsWith("about:")) {
+        continue;
+      }
+      DownloadURL(link.url, link.name, initiatingDoc);
+    }
+  },
+};
+Object.setPrototypeOf(
+  DownloadsPlacesView.prototype,
+  DownloadsViewUI.BaseView.prototype
+);
+
+for (let methodName of ["load", "applyFilter", "selectNode", "selectItems"]) {
+  DownloadsPlacesView.prototype[methodName] = function () {
+    throw new Error(
+      "|" + methodName + "| is not implemented by the downloads view."
+    );
+  };
+}
+
+function goUpdateDownloadCommands() {
+  function updateCommandsForObject(object) {
+    for (let name in object) {
+      if (DownloadsViewUI.isCommandName(name)) {
+        goUpdateCommand(name);
+      }
+    }
+  }
+  updateCommandsForObject(DownloadsPlacesView.prototype);
+  updateCommandsForObject(HistoryDownloadElementShell.prototype);
+}
+
+document.addEventListener("DOMContentLoaded", function () {
+  let richListBox = document.getElementById("downloadsListBox");
+  richListBox.addEventListener("scroll", function () {
+    return this._placesView.onScroll();
+  });
+  richListBox.addEventListener("keypress", function (event) {
+    return this._placesView.onKeyPress(event);
+  });
+  richListBox.addEventListener("dblclick", function (event) {
+    return this._placesView.onDoubleClick(event);
+  });
+  richListBox.addEventListener("contextmenu", function (event) {
+    return this._placesView.onContextMenu(event);
+  });
+  richListBox.addEventListener("dragstart", function (event) {
+    this._placesView.onDragStart(event);
+  });
+  let dropNode = richListBox;
+  if (document.documentElement.id == "contentAreaDownloadsView") {
+    dropNode = richListBox.parentNode;
+  }
+  dropNode.addEventListener("dragover", function (event) {
+    richListBox._placesView.onDragOver(event);
+  });
+  dropNode.addEventListener("drop", function (event) {
+    richListBox._placesView.onDrop(event);
+  });
+  richListBox.addEventListener("select", function () {
+    this._placesView.onSelect();
+  });
+  richListBox.addEventListener("focus", goUpdateDownloadCommands);
+  richListBox.addEventListener("blur", goUpdateDownloadCommands);
+});

@@ -1,0 +1,67 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#if !defined(nsCRT_h_)
+#define nsCRT_h_
+
+#include <stdlib.h>
+#include <ctype.h>
+#include "plstr.h"
+#include "nscore.h"
+#include "nsCRTGlue.h"
+
+#if defined(XP_UNIX)
+#    define NS_LINEBREAK "\012"
+#    define NS_ULINEBREAK u"\012"
+#    define NS_LINEBREAK_LEN 1
+#endif
+
+
+class nsCRT {
+ public:
+  enum {
+    LF = '\n' ,
+    VTAB = '\v' ,
+    CR = '\r' 
+  };
+
+  static int32_t strcmp(const char* aStr1, const char* aStr2) {
+    return int32_t(PL_strcmp(aStr1, aStr2));
+  }
+
+  static int32_t strcasecmp(const char* aStr1, const char* aStr2) {
+    return int32_t(PL_strcasecmp(aStr1, aStr2));
+  }
+
+  static int32_t strncasecmp(const char* aStr1, const char* aStr2,
+                             uint32_t aMaxLen) {
+    int32_t result = int32_t(PL_strncasecmp(aStr1, aStr2, aMaxLen));
+    if (result < 0) {
+      result = -1;
+    }
+    return result;
+  }
+
+  static char* strcasestr(const char* aStr1, const char* aStr2) {
+    return PL_strcasestr(aStr1, aStr2);
+  }
+
+  static char* strtok(char* aStr, const char* aDelims, char** aNewStr);
+
+  static int32_t strcmp(const char16_t* aStr1, const char16_t* aStr2);
+
+  static int64_t atoll(const char* aStr);
+
+  static char ToUpper(char aChar) { return NS_ToUpper(aChar); }
+  static char ToLower(char aChar) { return NS_ToLower(aChar); }
+
+  static bool IsAsciiSpace(char16_t aChar) {
+    return NS_IsAsciiWhitespace(aChar);
+  }
+};
+
+inline bool NS_IS_SPACE(char16_t aChar) {
+  return ((int(aChar) & 0x7f) == int(aChar)) && isspace(int(aChar));
+}
+
+#endif

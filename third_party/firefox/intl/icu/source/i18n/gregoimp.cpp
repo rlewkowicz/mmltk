@@ -1,0 +1,202 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+ **********************************************************************
+ * Copyright (c) 2003-2008, International Business Machines
+ * Corporation and others.  All Rights Reserved.
+ **********************************************************************
+ * Author: Alan Liu
+ * Created: September 2 2003
+ * Since: ICU 2.8
+ **********************************************************************
+ */
+
+#include "gregoimp.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/ucal.h"
+#include "uresimp.h"
+#include "cstring.h"
+#include "uassert.h"
+
+U_NAMESPACE_BEGIN
+
+int32_t ClockMath::floorDivide(int32_t numerator, int32_t denominator) {
+    return (numerator >= 0) ?
+        numerator / denominator : ((numerator + 1) / denominator) - 1;
+}
+
+int64_t ClockMath::floorDivideInt64(int64_t numerator, int64_t denominator) {
+    return (numerator >= 0) ?
+        numerator / denominator : ((numerator + 1) / denominator) - 1;
+}
+
+int32_t ClockMath::floorDivide(int32_t numerator, int32_t denominator,
+                          int32_t* remainder) {
+    int64_t quotient = floorDivide(numerator, denominator);
+    if (remainder != nullptr) {
+      *remainder = numerator - (quotient * denominator);
+    }
+    return quotient;
+}
+
+double ClockMath::floorDivide(double numerator, int32_t denominator,
+                          int32_t* remainder) {
+    double quotient = uprv_floor(numerator / denominator);
+    if (remainder != nullptr) {
+      *remainder = static_cast<int32_t>(uprv_floor(numerator) - (quotient * denominator));
+    }
+    return quotient;
+}
+
+double ClockMath::floorDivide(double dividend, double divisor,
+                         double* remainder) {
+    U_ASSERT(divisor > 0);
+    double quotient = floorDivide(dividend, divisor);
+    double r = dividend - (quotient * divisor);
+    if (r < 0 || r >= divisor) {
+        double q = quotient;
+        quotient += (r < 0) ? -1 : +1;
+        if (q == quotient) {
+            r = 0;
+        } else {
+            r = dividend - (quotient * divisor);
+        }
+    }
+    U_ASSERT(0 <= r && r < divisor);
+    if (remainder != nullptr) {
+        *remainder = r;
+    }
+    return quotient;
+}
+
+const int32_t JULIAN_1_CE    = 1721426; 
+const int32_t JULIAN_1970_CE = 2440588; 
+
+const int16_t Grego::DAYS_BEFORE[24] =
+    {0,31,59,90,120,151,181,212,243,273,304,334,
+     0,31,60,91,121,152,182,213,244,274,305,335};
+
+const int8_t Grego::MONTH_LENGTH[24] =
+    {31,28,31,30,31,30,31,31,30,31,30,31,
+     31,29,31,30,31,30,31,31,30,31,30,31};
+
+int64_t Grego::fieldsToDay(int32_t year, int32_t month, int32_t dom) {
+
+    int64_t y = year;
+    y--;
+
+    int64_t julian = 365LL * y +
+        ClockMath::floorDivideInt64(y, 4LL) + (JULIAN_1_CE - 3) + 
+        ClockMath::floorDivideInt64(y, 400LL) -
+        ClockMath::floorDivideInt64(y, 100LL) + 2 + 
+        DAYS_BEFORE[month + (isLeapYear(year) ? 12 : 0)] + dom; 
+
+    return julian - JULIAN_1970_CE; 
+}
+
+void Grego::dayToFields(int32_t day, int32_t& year, int8_t& month,
+                        int8_t& dom, int8_t& dow, int16_t& doy, UErrorCode& status) {
+    year = dayToYear(day, doy, status); 
+    if (U_FAILURE(status)) return;
+
+    if (uprv_add32_overflow(day, JULIAN_1970_CE - JULIAN_1_CE, &day)) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return;
+    }
+
+    dow = (day + 1) % 7;
+    dow += (dow < 0) ? (UCAL_SUNDAY + 7) : UCAL_SUNDAY;
+
+    int32_t correction = 0;
+    bool isLeap = isLeapYear(year);
+    int32_t march1 = isLeap ? 60 : 59; 
+    if (doy > march1) {
+        correction = isLeap ? 1 : 2;
+    }
+    month = (12 * (doy - 1 + correction) + 6) / 367; 
+    dom = doy - DAYS_BEFORE[month + (isLeap ? 12 : 0)]; 
+}
+
+int32_t Grego::dayToYear(int32_t day, UErrorCode& status) {
+    int16_t unusedDOY;
+    return dayToYear(day, unusedDOY, status);
+}
+
+int32_t Grego::dayToYear(int32_t day, int16_t& doy, UErrorCode& status) {
+    if (U_FAILURE(status)) return 0;
+    if (uprv_add32_overflow(day, JULIAN_1970_CE - JULIAN_1_CE, &day)) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return 0;
+    }
+
+    int32_t doy32;
+    int32_t n400 = ClockMath::floorDivide(day, 146097, &doy32); 
+    int32_t n100 = ClockMath::floorDivide(doy32, 36524, &doy32); 
+    int32_t n4   = ClockMath::floorDivide(doy32, 1461, &doy32); 
+    int32_t n1   = ClockMath::floorDivide(doy32, 365, &doy32);
+    int32_t year = 400*n400 + 100*n100 + 4*n4 + n1;
+    if (n100 == 4 || n1 == 4) {
+        doy = 365; 
+    } else {
+        doy = doy32;
+        ++year;
+    }
+    doy++; 
+    return year;
+}
+
+void Grego::timeToFields(UDate time, int32_t& year, int8_t& month,
+                        int8_t& dom, int32_t& mid, UErrorCode& status) {
+    int8_t unusedDOW;
+    timeToFields(time, year, month, dom, unusedDOW, mid, status);
+}
+
+void Grego::timeToFields(UDate time, int32_t& year, int8_t& month,
+                        int8_t& dom, int8_t& dow, int32_t& mid, UErrorCode& status) {
+    int16_t unusedDOY;
+    timeToFields(time, year, month, dom, dow, unusedDOY, mid, status);
+}
+
+void Grego::timeToFields(UDate time, int32_t& year, int8_t& month,
+                        int8_t& dom, int8_t& dow, int16_t& doy, int32_t& mid, UErrorCode& status) {
+    if (U_FAILURE(status)) return;
+    double day = ClockMath::floorDivide(time, U_MILLIS_PER_DAY, &mid);
+    if (day > INT32_MAX || day < INT32_MIN) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return;
+    }
+    dayToFields(day, year, month, dom, dow, doy, status);
+}
+
+int32_t Grego::timeToYear(UDate time, UErrorCode& status) {
+    if (U_FAILURE(status)) return 0;
+    double day = ClockMath::floorDivide(time, double(U_MILLIS_PER_DAY));
+    if (day > INT32_MAX || day < INT32_MIN) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return 0;
+    }
+    return Grego::dayToYear(day, status);
+}
+
+int32_t Grego::dayOfWeek(int32_t day) {
+    int32_t dow;
+    ClockMath::floorDivide(day + int{UCAL_THURSDAY}, 7, &dow);
+    return (dow == 0) ? UCAL_SATURDAY : dow;
+}
+
+int32_t Grego::dayOfWeekInMonth(int32_t year, int32_t month, int32_t dom) {
+    int32_t weekInMonth = (dom + 6)/7;
+    if (weekInMonth == 4) {
+        if (dom + 7 > monthLength(year, month)) {
+            weekInMonth = -1;
+        }
+    } else if (weekInMonth == 5) {
+        weekInMonth = -1;
+    }
+    return weekInMonth;
+}
+
+U_NAMESPACE_END
+
+#endif

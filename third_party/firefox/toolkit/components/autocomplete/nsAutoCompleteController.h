@@ -1,0 +1,141 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef _nsAutoCompleteController_
+#define _nsAutoCompleteController_
+
+#include "nsIAutoCompleteController.h"
+
+#include "nsCOMPtr.h"
+#include "nsIAutoCompleteInput.h"
+#include "nsIAutoCompletePopup.h"
+#include "nsIAutoCompleteResult.h"
+#include "nsIAutoCompleteSearch.h"
+#include "nsINamed.h"
+#include "nsString.h"
+#include "nsITimer.h"
+#include "nsTArray.h"
+#include "nsCOMArray.h"
+#include "nsCycleCollectionParticipant.h"
+#include "mozilla/dom/Element.h"
+
+class nsAutoCompleteController final : public nsIAutoCompleteController,
+                                       public nsIAutoCompleteObserver,
+                                       public nsITimerCallback,
+                                       public nsINamed {
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(nsAutoCompleteController,
+                                           nsIAutoCompleteController)
+  NS_DECL_NSIAUTOCOMPLETECONTROLLER
+  NS_DECL_NSIAUTOCOMPLETEOBSERVER
+  NS_DECL_NSITIMERCALLBACK
+  NS_DECL_NSINAMED
+
+  nsAutoCompleteController();
+
+ protected:
+  MOZ_CAN_RUN_SCRIPT virtual ~nsAutoCompleteController();
+
+  void SetValueOfInputTo(const nsString& aValue);
+
+  void SetSearchStringInternal(const nsAString& aSearchString) {
+    mSearchString = mSetValue = aSearchString;
+  }
+
+  MOZ_CAN_RUN_SCRIPT nsresult OpenPopup();
+  MOZ_CAN_RUN_SCRIPT nsresult ClosePopup();
+
+  nsresult StartSearch();
+
+  MOZ_CAN_RUN_SCRIPT nsresult DoSearches();
+  nsresult BeforeSearches();
+  MOZ_CAN_RUN_SCRIPT nsresult StartSearches();
+  MOZ_CAN_RUN_SCRIPT void AfterSearches();
+  nsresult ClearSearchTimer();
+  void MaybeCompletePlaceholder();
+
+  MOZ_CAN_RUN_SCRIPT nsresult ProcessResult(int32_t aSearchIndex,
+                                            nsIAutoCompleteResult* aResult);
+  MOZ_CAN_RUN_SCRIPT nsresult PostSearchCleanup();
+
+  MOZ_CAN_RUN_SCRIPT nsresult EnterMatch(bool aIsPopupSelection,
+                                         mozilla::dom::Event* aEvent);
+  nsresult RevertTextValue();
+
+  nsresult CompleteDefaultIndex(int32_t aResultIndex);
+  nsresult CompleteValue(nsString& aValue);
+
+  nsresult GetResultAt(int32_t aIndex, nsIAutoCompleteResult** aResult,
+                       int32_t* aMatchIndex);
+  nsresult GetResultValueAt(int32_t aIndex, bool aGetFinalValue,
+                            nsAString& _retval);
+  nsresult GetResultLabelAt(int32_t aIndex, nsAString& _retval);
+
+  already_AddRefed<nsIAutoCompletePopup> GetPopup() {
+    nsCOMPtr<nsIAutoCompletePopup> popup;
+    mInput->GetPopup(getter_AddRefs(popup));
+    if (popup) {
+      return popup.forget();
+    }
+
+    nsCOMPtr<mozilla::dom::Element> popupEl;
+    mInput->GetPopupElement(getter_AddRefs(popupEl));
+    if (popupEl) {
+      return popupEl->AsAutoCompletePopup();
+    }
+    return nullptr;
+  }
+
+ private:
+  nsresult GetResultValueLabelAt(int32_t aIndex, bool aGetFinalValue,
+                                 bool aGetValue, nsAString& _retval);
+
+  nsresult GetDefaultCompleteResult(int32_t aResultIndex,
+                                    nsIAutoCompleteResult** _result,
+                                    int32_t* _defaultIndex);
+
+  nsresult GetDefaultCompleteValue(int32_t aResultIndex, bool aPreserveCasing,
+                                   nsAString& _retval);
+
+  nsresult GetFinalDefaultCompleteValue(nsAString& _retval);
+
+  nsresult ClearResults(bool aIsSearching = false);
+
+  nsresult MatchIndexToSearch(int32_t aMatchIndex, int32_t* aSearchIndex,
+                              int32_t* aItemIndex);
+
+
+  nsCOMPtr<nsIAutoCompleteInput> mInput;
+
+  nsCOMArray<nsIAutoCompleteSearch> mSearches;
+  nsCOMArray<nsIAutoCompleteResult> mResults;
+  nsCOMArray<nsIAutoCompleteResult> mResultCache;
+
+  nsCOMPtr<nsITimer> mTimer;
+
+  nsString mSearchString;
+  nsString mPlaceholderCompletionString;
+  nsString mSetValue;
+  bool mDefaultIndexCompleted;
+  bool mPopupClosedByCompositionStart;
+
+  bool mProhibitAutoFill;
+
+  bool mUserClearedAutoFill;
+
+  enum CompositionState {
+    eCompositionState_None,
+    eCompositionState_Composing,
+    eCompositionState_Committing
+  };
+  CompositionState mCompositionState;
+  uint16_t mSearchStatus;
+  uint32_t mMatchCount;
+  uint32_t mSearchesOngoing;
+  uint32_t mSearchesFailed;
+  int32_t mCompletedSelectionIndex;
+};
+
+#endif /* _nsAutoCompleteController_ */

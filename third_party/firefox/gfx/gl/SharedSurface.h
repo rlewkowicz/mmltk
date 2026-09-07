@@ -1,0 +1,204 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef SHARED_SURFACE_H_
+#define SHARED_SURFACE_H_
+
+#include <stdint.h>
+
+#include "GLContext.h"  // Bug 1635644
+#include "GLContextTypes.h"
+#include "GLDefs.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/gfx/Point.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/WeakPtr.h"
+#include "SurfaceTypes.h"
+
+class nsIThread;
+
+namespace mozilla {
+namespace gfx {
+class DataSourceSurface;
+class DrawTarget;
+}  
+
+namespace layers {
+class KnowsCompositor;
+enum class LayersBackend : int8_t;
+class LayersIPCChannel;
+class SharedSurfaceTextureClient;
+class SurfaceDescriptor;
+class TextureClient;
+enum class TextureFlags : uint32_t;
+enum class TextureType : int8_t;
+}  
+
+namespace gl {
+
+class MozFramebuffer;
+struct ScopedBindFramebuffer;
+class SurfaceFactory;
+
+struct PartialSharedSurfaceDesc {
+  const WeakPtr<GLContext> gl;
+  const SharedSurfaceType type;
+  const layers::TextureType consumerType;
+  const bool canRecycle;
+
+  bool operator==(const PartialSharedSurfaceDesc& rhs) const {
+    return gl == rhs.gl && type == rhs.type &&
+           consumerType == rhs.consumerType && canRecycle == rhs.canRecycle;
+  }
+};
+struct SharedSurfaceDesc : public PartialSharedSurfaceDesc {
+  gfx::IntSize size = {};
+  gfx::ColorSpace2 colorSpace = gfx::ColorSpace2::UNKNOWN;
+  gfx::TransferFunction transferFunction = gfx::TransferFunction::SRGB;
+
+  bool operator==(const SharedSurfaceDesc& rhs) const {
+    return PartialSharedSurfaceDesc::operator==(rhs) && size == rhs.size &&
+           colorSpace == rhs.colorSpace &&
+           transferFunction == rhs.transferFunction;
+  }
+  bool operator!=(const SharedSurfaceDesc& rhs) const {
+    return !(*this == rhs);
+  }
+};
+
+class SharedSurface {
+ public:
+  const SharedSurfaceDesc mDesc;
+  const UniquePtr<MozFramebuffer> mFb;  
+
+ protected:
+  bool mIsLocked = false;
+  bool mIsProducerAcquired = false;
+
+  SharedSurface(const SharedSurfaceDesc&, UniquePtr<MozFramebuffer>);
+
+ public:
+  virtual ~SharedSurface();
+
+  bool IsLocked() const { return mIsLocked; }
+  bool IsProducerAcquired() const { return mIsProducerAcquired; }
+
+  void LockProd();
+
+  void UnlockProd();
+
+  virtual void Commit() {}
+
+ protected:
+  virtual void LockProdImpl() {};
+  virtual void UnlockProdImpl() {};
+
+  virtual void ProducerAcquireImpl() {};
+  virtual void ProducerReleaseImpl() {};
+
+  virtual void ProducerReadAcquireImpl() { ProducerAcquireImpl(); }
+  virtual void ProducerReadReleaseImpl() { ProducerReleaseImpl(); }
+
+ public:
+  void ProducerAcquire() {
+    MOZ_ASSERT(!mIsProducerAcquired);
+    ProducerAcquireImpl();
+    mIsProducerAcquired = true;
+  }
+  void ProducerRelease() {
+    MOZ_ASSERT(mIsProducerAcquired);
+    ProducerReleaseImpl();
+    mIsProducerAcquired = false;
+  }
+  void ProducerReadAcquire() {
+    MOZ_ASSERT(!mIsProducerAcquired);
+    ProducerReadAcquireImpl();
+    mIsProducerAcquired = true;
+  }
+  void ProducerReadRelease() {
+    MOZ_ASSERT(mIsProducerAcquired);
+    ProducerReadReleaseImpl();
+    mIsProducerAcquired = false;
+  }
+
+  virtual void WaitForBufferOwnership() {}
+
+  virtual bool IsBufferAvailable() const { return true; }
+
+  virtual bool NeedsIndirectReads() const { return false; }
+
+  virtual bool IsValid() const { return true; };
+
+  virtual Maybe<layers::SurfaceDescriptor> ToSurfaceDescriptor() = 0;
+
+  void BeginWrite() {
+    WaitForBufferOwnership();
+    ProducerAcquire();
+    LockProd();
+  }
+
+  void EndWrite() {
+    UnlockProd();
+    ProducerRelease();
+    Commit();
+  }
+
+  void BeginRead() {
+    WaitForBufferOwnership();
+    LockProd();
+    ProducerReadAcquire();
+  }
+
+  void EndRead() {
+    ProducerReadRelease();
+    UnlockProd();
+  }
+};
+
+
+class SurfaceFactory {
+ public:
+  const PartialSharedSurfaceDesc mDesc;
+
+  layers::TextureType GetConsumerType() const { return mDesc.consumerType; }
+
+ protected:
+  Mutex mMutex MOZ_UNANNOTATED;
+
+ public:
+  static UniquePtr<SurfaceFactory> Create(GLContext*, layers::TextureType);
+
+ protected:
+  explicit SurfaceFactory(const PartialSharedSurfaceDesc&);
+
+ public:
+  virtual ~SurfaceFactory();
+
+ protected:
+  virtual UniquePtr<SharedSurface> CreateSharedImpl(
+      const SharedSurfaceDesc&) = 0;
+
+ public:
+  virtual bool SupportsCspaces() const { return false; }
+
+  UniquePtr<SharedSurface> CreateShared(const gfx::IntSize& size,
+                                        gfx::ColorSpace2 cs) {
+    if (!SupportsCspaces()) {
+      cs = gfx::ColorSpace2::Display;
+    }
+    return CreateSharedImpl({mDesc, size, cs});
+  }
+};
+
+template <typename T>
+inline UniquePtr<T> AsUnique(T* const p) {
+  return UniquePtr<T>(p);
+}
+
+}  
+}  
+
+#endif  // SHARED_SURFACE_H_

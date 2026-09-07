@@ -1,0 +1,68 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*******************************************************************************
+* Copyright (C) 2007-2013, International Business Machines Corporation and    *
+* others. All Rights Reserved.                                                *
+*******************************************************************************
+*/
+#ifndef ZONEMETA_H
+#define ZONEMETA_H
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/unistr.h"
+#include "hash.h"
+
+U_NAMESPACE_BEGIN
+
+struct OlsonToMetaMappingEntry : public UMemory {
+    const char16_t *mzid; 
+    UDate from;
+    UDate to;
+};
+
+class UVector;
+class TimeZone;
+
+class U_I18N_API ZoneMeta {
+public:
+    static UnicodeString& U_EXPORT2 getCanonicalCLDRID(const UnicodeString &tzid, UnicodeString &systemID, UErrorCode& status);
+
+    static const char16_t* U_EXPORT2 getCanonicalCLDRID(const UnicodeString &tzid, UErrorCode& status);
+
+    static const char16_t* U_EXPORT2 getCanonicalCLDRID(const TimeZone& tz);
+
+    static UnicodeString& U_EXPORT2 getIanaID(const UnicodeString& tzid, UnicodeString& ianaID, UErrorCode& status);
+
+    static UnicodeString& U_EXPORT2 getCanonicalCountry(const UnicodeString &tzid, UnicodeString &country, UBool *isPrimary = nullptr);
+
+    static UnicodeString& U_EXPORT2 getMetazoneID(const UnicodeString &tzid, UDate date, UnicodeString &result);
+    static UnicodeString& U_EXPORT2 getZoneIdByMetazone(const UnicodeString &mzid, const UnicodeString &region, UnicodeString &result);
+
+    static const UVector* U_EXPORT2 getMetazoneMappings(const UnicodeString &tzid);
+
+    static const UVector* U_EXPORT2 getAvailableMetazoneIDs();
+
+    static const char16_t* U_EXPORT2 findTimeZoneID(const UnicodeString& tzid);
+
+    static const char16_t* U_EXPORT2 findMetaZoneID(const UnicodeString& mzid);
+
+    static TimeZone* createCustomTimeZone(int32_t offset);
+
+    static const char16_t* U_EXPORT2 getShortID(const TimeZone& tz);
+
+    static const char16_t* U_EXPORT2 getShortID(const UnicodeString& id);
+
+private:
+    ZoneMeta() = delete; 
+    static UVector* createMetazoneMappings(const UnicodeString &tzid);
+    static UnicodeString& formatCustomID(uint8_t hour, uint8_t min, uint8_t sec, UBool negative, UnicodeString& id);
+    static const char16_t* getShortIDFromCanonical(const char16_t* canonicalID);
+};
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+#endif // ZONEMETA_H

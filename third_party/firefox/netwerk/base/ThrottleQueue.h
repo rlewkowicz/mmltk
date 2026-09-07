@@ -1,0 +1,56 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_net_ThrottleQueue_h
+#define mozilla_net_ThrottleQueue_h
+
+#include "mozilla/TimeStamp.h"
+#include "nsINamed.h"
+#include "nsIThrottledInputChannel.h"
+#include "nsITimer.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+namespace net {
+
+class ThrottleInputStream;
+
+
+class ThrottleQueue : public nsIInputChannelThrottleQueue,
+                      public nsITimerCallback,
+                      public nsINamed {
+ public:
+  static already_AddRefed<nsIInputChannelThrottleQueue> Create();
+
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIINPUTCHANNELTHROTTLEQUEUE
+  NS_DECL_NSITIMERCALLBACK
+  NS_DECL_NSINAMED
+
+  void QueueStream(ThrottleInputStream* aStream);
+  void DequeueStream(ThrottleInputStream* aStream);
+
+ protected:
+  ThrottleQueue();
+  virtual ~ThrottleQueue();
+
+  struct ThrottleEntry {
+    TimeStamp mTime;
+    uint32_t mBytesRead = 0;
+  };
+
+  nsTArray<ThrottleEntry> mReadEvents;
+  uint32_t mMeanBytesPerSecond{0};
+  uint32_t mMaxBytesPerSecond{0};
+  uint64_t mBytesProcessed{0};
+
+  nsTArray<RefPtr<ThrottleInputStream>> mAsyncEvents;
+  nsCOMPtr<nsITimer> mTimer;
+  bool mTimerArmed{false};
+};
+
+}  
+}  
+
+#endif  //  mozilla_net_ThrottleQueue_h

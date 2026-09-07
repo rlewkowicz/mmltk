@@ -1,0 +1,56 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsAttrValueOrString_h_
+#define nsAttrValueOrString_h_
+
+#include "nsAttrValue.h"
+#include "nsString.h"
+
+class MOZ_STACK_CLASS nsAttrValueOrString {
+ public:
+  explicit nsAttrValueOrString(const nsAString& aValue)
+      : mAttrValue(nullptr), mStringPtr(&aValue), mCheapString(nullptr) {}
+
+  explicit nsAttrValueOrString(const nsAString* aValue)
+      : mAttrValue(nullptr), mStringPtr(aValue), mCheapString(nullptr) {}
+
+  explicit nsAttrValueOrString(const nsAttrValue& aValue)
+      : mAttrValue(&aValue), mStringPtr(nullptr), mCheapString(nullptr) {}
+
+  explicit nsAttrValueOrString(const nsAttrValue* aValue)
+      : mAttrValue(aValue), mStringPtr(nullptr), mCheapString(nullptr) {}
+
+  void ResetToAttrValue(const nsAttrValue& aValue) {
+    mAttrValue = &aValue;
+    mStringPtr = nullptr;
+  }
+
+  const nsAString& String() const;
+
+  bool EqualsAsStrings(const nsAttrValue& aOther) const {
+    if (mStringPtr) {
+      return aOther.Equals(*mStringPtr, eCaseMatters);
+    }
+    return aOther.EqualsAsStrings(*mAttrValue);
+  }
+
+  bool IsEmpty() const {
+    if (mStringPtr) {
+      return mStringPtr->IsEmpty();
+    }
+    if (mAttrValue) {
+      return mAttrValue->IsEmptyString();
+    }
+    return true;
+  }
+
+ protected:
+  const nsAttrValue* mAttrValue;
+  mutable const nsAString* mStringPtr;
+  mutable nsCheapString mCheapString;
+};
+
+#endif  // nsAttrValueOrString_h_

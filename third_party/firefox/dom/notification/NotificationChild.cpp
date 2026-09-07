@@ -1,0 +1,93 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "NotificationChild.h"
+
+#include "WindowGlobalChild.h"
+#include "mozilla/dom/Event.h"
+#include "mozilla/dom/Notification.h"
+#include "mozilla/dom/WorkerRunnable.h"
+#include "nsFocusManager.h"
+#include "nsGlobalWindowInner.h"
+
+namespace mozilla::dom::notification {
+
+using IPCResult = mozilla::ipc::IPCResult;
+
+NS_IMPL_ISUPPORTS(NotificationChild, nsISupports);
+
+NotificationChild::NotificationChild(Notification* aNonPersistentNotification,
+                                     WindowGlobalChild* aWindow)
+    : mNonPersistentNotification(aNonPersistentNotification), mWindow(aWindow) {
+  if (mWindow) {
+    BindToGlobal(mWindow->GetWindowGlobal()->AsGlobal());
+    return;
+  }
+}
+
+class FocusWindowRunnable : public WorkerMainThreadRunnable {
+ public:
+  explicit FocusWindowRunnable(WorkerPrivate* aWorkerPrivate)
+      : WorkerMainThreadRunnable(aWorkerPrivate,
+                                 "Notification :: FocusWindowRunnable"_ns) {}
+
+ protected:
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY bool MainThreadRun() override {
+    RefPtr<nsPIDOMWindowInner> inner = mWorkerRef->Private()->GetWindow();
+    if (inner->IsCurrentInnerWindow()) {
+      nsCOMPtr<nsPIDOMWindowOuter> outer = inner->GetOuterWindow();
+      nsFocusManager::FocusWindow(outer, CallerType::System);
+    }
+    return true;
+  }
+};
+
+MOZ_CAN_RUN_SCRIPT_BOUNDARY IPCResult NotificationChild::RecvNotifyClick() {
+  bool intoFocus = true;
+  if (mNonPersistentNotification) {
+    RefPtr<Event> event =
+        NS_NewDOMEvent(mNonPersistentNotification, nullptr, nullptr);
+    event->InitEvent(u"click"_ns,  false,  true);
+    event->SetTrusted(true);
+    WantsPopupControlCheck popupControlCheck(event);
+    intoFocus = mNonPersistentNotification->DispatchEvent(
+        *event, CallerType::System, IgnoreErrors());
+  }
+
+  if (!intoFocus) {
+    return IPC_OK();
+  }
+
+  if (mWindow) {
+    if (RefPtr<nsGlobalWindowInner> inner = mWindow->GetWindowGlobal()) {
+      if (inner->IsCurrentInnerWindow()) {
+        nsCOMPtr<nsPIDOMWindowOuter> outer = inner->GetOuterWindow();
+        nsFocusManager::FocusWindow(outer, CallerType::System);
+      }
+    }
+  } else if (WorkerPrivate* wp = GetCurrentThreadWorkerPrivate()) {
+    if (!wp->IsDedicatedWorker()) {
+      return IPC_OK();
+    }
+
+    RefPtr<FocusWindowRunnable> runnable =
+        new FocusWindowRunnable(wp->GetTopLevelWorker());
+    runnable->Dispatch(wp, Canceling, IgnoreErrors());
+  }
+  return IPC_OK();
+}
+
+void NotificationChild::ActorDestroy(ActorDestroyReason aWhy) {
+  if (RefPtr<Notification> notification = mNonPersistentNotification.get()) {
+    notification->MaybeNotifyClose();
+  }
+}
+
+void NotificationChild::FrozenCallback(nsIGlobalObject* aGlobal) {
+  mNonPersistentNotification = nullptr;
+  Close();
+  DisconnectFreezeObserver();
+}
+
+}  

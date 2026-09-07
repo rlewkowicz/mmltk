@@ -1,0 +1,556 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+const lazy = {};
+
+ChromeUtils.defineESModuleGetters(lazy, {
+  AsyncShutdown: "resource://gre/modules/AsyncShutdown.sys.mjs",
+  CommonUtils: "resource://services-common/utils.sys.mjs",
+  IDBHelpers: "resource://services-settings/IDBHelpers.sys.mjs",
+  ObjectUtils: "resource://gre/modules/ObjectUtils.sys.mjs",
+  Utils: "resource://services-settings/Utils.sys.mjs",
+});
+
+ChromeUtils.defineLazyGetter(lazy, "console", () => lazy.Utils.log);
+
+class EmptyDatabaseError extends Error {
+  constructor(cid) {
+    super(`"${cid}" has not been synced yet`);
+    this.name = "EmptyDatabaseError";
+  }
+}
+
+export class Database {
+  static get EmptyDatabaseError() {
+    return EmptyDatabaseError;
+  }
+
+  static destroy() {
+    return destroyIDB();
+  }
+
+  constructor(identifier) {
+    ensureShutdownBlocker();
+    this.identifier = identifier;
+  }
+
+  async list(options = {}) {
+    const { filters = {}, order = "" } = options;
+    let results = [];
+    let timestamp = null;
+    try {
+      await executeIDB(
+        ["timestamps", "records"],
+        (stores, rejectTransaction) => {
+          const [storeTimestamps, storeRecords] = stores;
+          storeTimestamps.get(this.identifier).onsuccess = evt =>
+            (timestamp = evt.target.result);
+
+          if (lazy.ObjectUtils.isEmpty(filters)) {
+            const range = IDBKeyRange.only(this.identifier);
+            const request = storeRecords.index("cid").getAll(range);
+            request.onsuccess = e => {
+              results = e.target.result;
+            };
+            return;
+          }
+          const request = storeRecords
+            .index("cid")
+            .openCursor(IDBKeyRange.only(this.identifier));
+          const objFilters = transformSubObjectFilters(filters);
+          request.onsuccess = event => {
+            try {
+              const cursor = event.target.result;
+              if (cursor) {
+                const { value } = cursor;
+                if (lazy.Utils.filterObject(objFilters, value)) {
+                  results.push(value);
+                }
+                cursor.continue();
+              }
+            } catch (ex) {
+              rejectTransaction(ex);
+            }
+          };
+        },
+        { mode: "readonly" }
+      );
+    } catch (e) {
+      throw new lazy.IDBHelpers.IndexedDBError(e, "list()", this.identifier);
+    }
+    if (results.length === 0 && !timestamp) {
+      throw new EmptyDatabaseError(this.identifier);
+    }
+    for (const result of results) {
+      delete result._cid;
+    }
+    return order ? lazy.Utils.sortObjects(order, results) : results;
+  }
+
+  async importChanges(metadata, timestamp, records = [], options = {}) {
+    const { clear = false } = options;
+    const _cid = this.identifier;
+    try {
+      await executeIDB(
+        ["collections", "timestamps", "records"],
+        (stores, rejectTransaction) => {
+          const [storeMetadata, storeTimestamps, storeRecords] = stores;
+
+          if (clear) {
+            storeRecords.delete(
+              IDBKeyRange.bound([_cid], [_cid, []], false, true)
+            );
+          }
+
+          if (metadata === null) {
+            storeMetadata.delete(_cid);
+          } else if (metadata) {
+            storeMetadata.put({ cid: _cid, metadata });
+          }
+          if (timestamp === null) {
+            storeTimestamps.delete(_cid);
+          } else if (timestamp) {
+            storeTimestamps.put({ cid: _cid, value: timestamp });
+          }
+
+          if (!records.length) {
+            return;
+          }
+
+          const toDelete = records.filter(r => r.deleted);
+          const toInsert = records.filter(r => !r.deleted);
+          lazy.console.debug(
+            `${_cid} ${toDelete.length} to delete, ${toInsert.length} to insert`
+          );
+          lazy.IDBHelpers.bulkOperationHelper(
+            storeRecords,
+            {
+              reject: rejectTransaction,
+              completion() {
+                lazy.IDBHelpers.bulkOperationHelper(
+                  storeRecords,
+                  {
+                    reject: rejectTransaction,
+                  },
+                  "put",
+                  toInsert.map(item => ({ ...item, _cid }))
+                );
+              },
+            },
+            "delete",
+            toDelete.map(item => [_cid, item.id])
+          );
+        },
+        { desc: "importChanges() in " + _cid }
+      );
+    } catch (e) {
+      throw new lazy.IDBHelpers.IndexedDBError(e, "importChanges()", _cid);
+    }
+  }
+
+  async getLastModified() {
+    let entry = null;
+    try {
+      await executeIDB(
+        "timestamps",
+        store => {
+          store.get(this.identifier).onsuccess = e => (entry = e.target.result);
+        },
+        { mode: "readonly" }
+      );
+    } catch (e) {
+      throw new lazy.IDBHelpers.IndexedDBError(
+        e,
+        "getLastModified()",
+        this.identifier
+      );
+    }
+    if (!entry) {
+      return null;
+    }
+    if (isNaN(entry.value)) {
+      lazy.console.warn(`Local timestamp is NaN for ${this.identifier}`);
+      return 0;
+    }
+    return entry.value;
+  }
+
+  async getMetadata() {
+    let entry = null;
+    try {
+      await executeIDB(
+        "collections",
+        store => {
+          store.get(this.identifier).onsuccess = e => (entry = e.target.result);
+        },
+        { mode: "readonly" }
+      );
+    } catch (e) {
+      throw new lazy.IDBHelpers.IndexedDBError(
+        e,
+        "getMetadata()",
+        this.identifier
+      );
+    }
+    return entry ? entry.metadata : null;
+  }
+
+  async getAttachment(attachmentId) {
+    let entry = null;
+    try {
+      await executeIDB(
+        "attachments",
+        store => {
+          store.get([this.identifier, attachmentId]).onsuccess = e => {
+            entry = e.target.result;
+          };
+        },
+        { mode: "readonly" }
+      );
+    } catch (e) {
+      throw new lazy.IDBHelpers.IndexedDBError(
+        e,
+        "getAttachment()",
+        this.identifier
+      );
+    }
+    return entry ? entry.attachment : null;
+  }
+
+  async saveAttachment(attachmentId, attachment) {
+    return await this.saveAttachments([[attachmentId, attachment]]);
+  }
+
+  async saveAttachments(idsAndBlobs) {
+    try {
+      await executeIDB(
+        "attachments",
+        store => {
+          for (const [attachmentId, attachment] of idsAndBlobs) {
+            if (attachment) {
+              store.put({ cid: this.identifier, attachmentId, attachment });
+            } else {
+              store.delete([this.identifier, attachmentId]);
+            }
+          }
+        },
+        {
+          desc:
+            "saveAttachments(<" +
+            idsAndBlobs.length +
+            " items>) in " +
+            this.identifier,
+        }
+      );
+    } catch (e) {
+      throw new lazy.IDBHelpers.IndexedDBError(
+        e,
+        "saveAttachments()",
+        this.identifier
+      );
+    }
+  }
+
+  async hasAttachments() {
+    let count = 0;
+    try {
+      const range = IDBKeyRange.bound(
+        [this.identifier],
+        [this.identifier, []],
+        false,
+        true
+      );
+      await executeIDB(
+        "attachments",
+        store => {
+          store.count(range).onsuccess = e => {
+            count = e.target.result;
+          };
+        },
+        { mode: "readonly" }
+      );
+    } catch (e) {
+      throw new lazy.IDBHelpers.IndexedDBError(
+        e,
+        "hasAttachments()",
+        this.identifier
+      );
+    }
+    return count > 0;
+  }
+
+  async pruneAttachments(excludeIds) {
+    const _cid = this.identifier;
+    let deletedCount = 0;
+    try {
+      await executeIDB(
+        ["attachments", "records"],
+        async (stores, rejectTransaction) => {
+          const [attachmentsStore, recordsStore] = stores;
+
+          const rangeAllKeys = IDBKeyRange.bound(
+            [_cid],
+            [_cid, []],
+            false,
+            true
+          );
+          const allAttachments = await new Promise((resolve, reject) => {
+            const request = attachmentsStore.getAll(rangeAllKeys);
+            request.onsuccess = e => resolve(e.target.result);
+            request.onerror = e => reject(e);
+          });
+          if (!allAttachments.length) {
+            lazy.console.debug(
+              `${this.identifier} No attachments in IDB cache. Nothing to do.`
+            );
+            return;
+          }
+
+          const allRecords = await new Promise((resolve, reject) => {
+            const rangeAllIndexed = IDBKeyRange.only(_cid);
+            const request = recordsStore.index("cid").getAll(rangeAllIndexed);
+            request.onsuccess = e => resolve(e.target.result);
+            request.onerror = e => reject(e);
+          });
+
+          const currentRecordsIDs = new Set(allRecords.map(r => r.id));
+          const attachmentsToDelete = allAttachments.reduce((acc, entry) => {
+            if (excludeIds.includes(entry.attachmentId)) {
+              return acc;
+            }
+            if (!currentRecordsIDs.has(entry.attachment.record.id)) {
+              acc.push([_cid, entry.attachmentId]);
+            }
+            return acc;
+          }, []);
+
+          lazy.console.debug(
+            `${this.identifier} Bulk delete ${attachmentsToDelete.length} obsolete attachments`
+          );
+          lazy.IDBHelpers.bulkOperationHelper(
+            attachmentsStore,
+            {
+              reject: rejectTransaction,
+            },
+            "delete",
+            attachmentsToDelete
+          );
+          deletedCount = attachmentsToDelete.length;
+        },
+        { desc: "pruneAttachments() in " + this.identifier }
+      );
+    } catch (e) {
+      throw new lazy.IDBHelpers.IndexedDBError(
+        e,
+        "pruneAttachments()",
+        this.identifier
+      );
+    }
+    return deletedCount;
+  }
+
+  async clear() {
+    try {
+      await this.importChanges(null, null, [], { clear: true });
+    } catch (e) {
+      throw new lazy.IDBHelpers.IndexedDBError(e, "clear()", this.identifier);
+    }
+  }
+
+
+  async create(record) {
+    if (!("id" in record)) {
+      record = { ...record, id: lazy.CommonUtils.generateUUID() };
+    }
+    try {
+      await executeIDB(
+        "records",
+        store => {
+          store.add({ ...record, _cid: this.identifier });
+        },
+        { desc: "create() in " + this.identifier }
+      );
+    } catch (e) {
+      throw new lazy.IDBHelpers.IndexedDBError(e, "create()", this.identifier);
+    }
+    return record;
+  }
+
+  async update(record) {
+    try {
+      await executeIDB(
+        "records",
+        store => {
+          store.put({ ...record, _cid: this.identifier });
+        },
+        { desc: "update() in " + this.identifier }
+      );
+    } catch (e) {
+      throw new lazy.IDBHelpers.IndexedDBError(e, "update()", this.identifier);
+    }
+  }
+
+  async delete(recordId) {
+    try {
+      await executeIDB(
+        "records",
+        store => {
+          store.delete([this.identifier, recordId]); 
+        },
+        { desc: "delete() in " + this.identifier }
+      );
+    } catch (e) {
+      throw new lazy.IDBHelpers.IndexedDBError(e, "delete()", this.identifier);
+    }
+  }
+}
+
+let gDB = null;
+let gDBPromise = null;
+
+async function openIDB() {
+  if (!gDBPromise) {
+    gDBPromise = lazy.IDBHelpers.openIDB();
+  }
+  let db = await gDBPromise;
+  if (!gDB) {
+    gDB = db;
+  }
+}
+
+const gPendingReadOnlyTransactions = new Set();
+const gPendingWriteOperations = new Set();
+async function executeIDB(storeNames, callback, options = {}) {
+  if (!gDB) {
+    if (gShutdownStarted || Services.startup.shuttingDown) {
+      throw new lazy.IDBHelpers.ShutdownError(
+        "The application is shutting down",
+        "execute()"
+      );
+    }
+    await openIDB();
+  } else {
+    await Promise.resolve();
+  }
+
+  if (!gDB && (gShutdownStarted || Services.startup.shuttingDown)) {
+    throw new lazy.IDBHelpers.ShutdownError(
+      "The application is shutting down",
+      "execute()"
+    );
+  }
+
+  const { mode = "readwrite", desc = "" } = options;
+  let { promise, transaction } = lazy.IDBHelpers.executeIDB(
+    gDB,
+    storeNames,
+    mode,
+    callback,
+    desc
+  );
+
+  let finishedFn;
+  if (mode == "readonly") {
+    gPendingReadOnlyTransactions.add(transaction);
+    finishedFn = () => gPendingReadOnlyTransactions.delete(transaction);
+  } else {
+    let obj = { promise, desc };
+    gPendingWriteOperations.add(obj);
+    finishedFn = () => gPendingWriteOperations.delete(obj);
+  }
+  return promise.finally(finishedFn);
+}
+
+async function destroyIDB() {
+  if (gDB) {
+    if (gShutdownStarted || Services.startup.shuttingDown) {
+      throw new lazy.IDBHelpers.ShutdownError(
+        "The application is shutting down",
+        "destroyIDB()"
+      );
+    }
+
+    gDB.close();
+    const allTransactions = new Set([
+      ...gPendingWriteOperations,
+      ...gPendingReadOnlyTransactions,
+    ]);
+    for (let transaction of Array.from(allTransactions)) {
+      try {
+        transaction.abort();
+      } catch (ex) {
+      }
+    }
+  }
+  gDB = null;
+  gDBPromise = null;
+  return lazy.IDBHelpers.destroyIDB();
+}
+
+function makeNestedObjectFromArr(arr, val, nestedFiltersObj) {
+  const last = arr.length - 1;
+  return arr.reduce((acc, cv, i) => {
+    if (i === last) {
+      return (acc[cv] = val);
+    } else if (Object.prototype.hasOwnProperty.call(acc, cv)) {
+      return acc[cv];
+    }
+    return (acc[cv] = {});
+  }, nestedFiltersObj);
+}
+
+function transformSubObjectFilters(filtersObj) {
+  const transformedFilters = {};
+  for (const [key, val] of Object.entries(filtersObj)) {
+    const keysArr = key.split(".");
+    makeNestedObjectFromArr(keysArr, val, transformedFilters);
+  }
+  return transformedFilters;
+}
+
+Database._executeIDB = executeIDB;
+
+let gShutdownStarted = false;
+Database._cancelShutdown = () => {
+  gShutdownStarted = false;
+};
+
+let gShutdownBlocker = false;
+Database._shutdownHandler = () => {
+  gShutdownStarted = true;
+  for (let transaction of Array.from(gPendingReadOnlyTransactions)) {
+    try {
+      transaction.abort();
+    } catch (ex) {
+
+      if (ex.result != Cr.NS_ERROR_DOM_INDEXEDDB_NOT_ALLOWED_ERR) {
+        console.error(ex);
+      }
+    }
+  }
+  if (gDB) {
+    gDB.close();
+    gDB = null;
+  }
+  gDBPromise = null;
+  return Promise.allSettled(
+    Array.from(gPendingWriteOperations).map(op => op.promise)
+  );
+};
+
+function ensureShutdownBlocker() {
+  if (gShutdownBlocker) {
+    return;
+  }
+  gShutdownBlocker = true;
+  lazy.AsyncShutdown.profileBeforeChange.addBlocker(
+    "RemoteSettingsClient - finish IDB access.",
+    Database._shutdownHandler,
+    {
+      fetchState() {
+        return Array.from(gPendingWriteOperations).map(op => op.desc);
+      },
+    }
+  );
+}

@@ -1,0 +1,31 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+UNIFIED_SOURCES += [
+    'json_reader.cpp',
+    'json_value.cpp',
+    'json_writer.cpp'
+]
+
+LOCAL_INCLUDES += [
+    '/toolkit/components/jsoncpp/include',
+]
+
+# Required because JsonCpp is linked outside libxul.
+DisableStlWrapping()
+
+Library('jsoncpp')
+
+# Suppress warnings in third-party code.
+CXXFLAGS += [
+    '-Wno-unused-local-typedefs',
+]
+
+CXXFLAGS += [
+    '-Wno-c++11-narrowing',
+]
+
+CXXFLAGS += [
+    '-Wno-implicit-fallthrough',
+]

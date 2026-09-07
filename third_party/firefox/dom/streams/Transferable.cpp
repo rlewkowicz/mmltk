@@ -1,0 +1,840 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ErrorList.h"
+#include "mozilla/ScopeExit.h"
+#include "ReadableStreamAbstract.h"
+#include "ReadableStreamDefaultControllerAbstract.h"
+#include "ReadableStreamPipeTo.h"
+#include "WritableStreamAbstract.h"
+#include "WritableStreamDefaultControllerAbstract.h"
+#include "js/RootingAPI.h"
+#include "js/String.h"
+#include "js/TypeDecls.h"
+#include "js/Value.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/dom/DOMException.h"
+#include "mozilla/dom/DOMExceptionBinding.h"
+#include "mozilla/dom/MessageChannel.h"
+#include "mozilla/dom/MessageEvent.h"
+#include "mozilla/dom/MessagePort.h"
+#include "mozilla/dom/Promise-inl.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/TransformStream.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsIDOMEventListener.h"
+#include "nsIGlobalObject.h"
+#include "nsISupportsImpl.h"
+
+namespace mozilla::dom {
+
+using namespace streams_abstract;
+
+static void PackAndPostMessage(JSContext* aCx, MessagePort* aPort,
+                               const nsAString& aType,
+                               JS::Handle<JS::Value> aValue, ErrorResult& aRv) {
+  JS::Rooted<JSObject*> obj(aCx,
+                            JS_NewObjectWithGivenProto(aCx, nullptr, nullptr));
+  if (!obj) {
+    JS_ClearPendingException(aCx);
+    aRv.Throw(NS_ERROR_UNEXPECTED);
+    return;
+  }
+
+  JS::Rooted<JS::Value> type(aCx);
+  if (!xpc::NonVoidStringToJsval(aCx, aType, &type)) {
+    JS_ClearPendingException(aCx);
+    aRv.Throw(NS_ERROR_UNEXPECTED);
+    return;
+  }
+  if (!JS_DefineProperty(aCx, obj, "type", type, JSPROP_ENUMERATE)) {
+    JS_ClearPendingException(aCx);
+    aRv.Throw(NS_ERROR_UNEXPECTED);
+    return;
+  }
+  JS::Rooted<JS::Value> value(aCx, aValue);
+  if (!JS_WrapValue(aCx, &value)) {
+    JS_ClearPendingException(aCx);
+    aRv.Throw(NS_ERROR_UNEXPECTED);
+    return;
+  }
+  if (!JS_DefineProperty(aCx, obj, "value", value, JSPROP_ENUMERATE)) {
+    JS_ClearPendingException(aCx);
+    aRv.Throw(NS_ERROR_UNEXPECTED);
+    return;
+  }
+
+  Sequence<JSObject*> transferables;  
+  JS::Rooted<JS::Value> objValue(aCx, JS::ObjectValue(*obj));
+  aPort->PostMessage(aCx, objValue, transferables, aRv);
+}
+
+static void CrossRealmTransformSendError(JSContext* aCx, MessagePort* aPort,
+                                         JS::Handle<JS::Value> aError) {
+  PackAndPostMessage(aCx, aPort, u"error"_ns, aError, IgnoreErrors());
+}
+
+class SetUpTransformWritableMessageEventListener final
+    : public nsIDOMEventListener {
+ public:
+  SetUpTransformWritableMessageEventListener(
+      WritableStreamDefaultController* aController, Promise* aPromise)
+      : mController(aController), mBackpressurePromise(aPromise) {}
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_CLASS(SetUpTransformWritableMessageEventListener)
+
+  MOZ_CAN_RUN_SCRIPT NS_IMETHOD HandleEvent(Event* aEvent) override {
+    AutoJSAPI jsapi;
+    if (!jsapi.Init(mController->GetParentObject())) {
+      return NS_OK;
+    }
+    JSContext* cx = jsapi.cx();
+    MessageEvent* messageEvent = aEvent->AsMessageEvent();
+    if (NS_WARN_IF(!messageEvent || !messageEvent->IsTrusted())) {
+      return NS_OK;
+    }
+
+    JS::Rooted<JS::Value> dataValue(cx);
+    IgnoredErrorResult rv;
+    messageEvent->GetData(cx, &dataValue, rv);
+    if (rv.Failed()) {
+      return NS_OK;
+    }
+
+    if (NS_WARN_IF(!dataValue.isObject())) {
+      return NS_OK;
+    }
+    JS::Rooted<JSObject*> data(cx, &dataValue.toObject());
+
+    JS::Rooted<JS::Value> type(cx);
+    if (!JS_GetProperty(cx, data, "type", &type)) {
+      JS_ClearPendingException(cx);
+      return NS_OK;
+    }
+
+    JS::Rooted<JS::Value> value(cx);
+    if (!JS_GetProperty(cx, data, "value", &value)) {
+      JS_ClearPendingException(cx);
+      return NS_OK;
+    }
+
+    if (NS_WARN_IF(!type.isString())) {
+      return NS_OK;
+    }
+
+    bool equals = false;
+    if (!JS_StringEqualsLiteral(cx, type.toString(), "pull", &equals)) {
+      JS_ClearPendingException(cx);
+      return NS_OK;
+    }
+    if (equals) {
+      MaybeResolveAndClearBackpressurePromise();
+      return NS_OK;  
+    }
+
+    if (!JS_StringEqualsLiteral(cx, type.toString(), "error", &equals)) {
+      JS_ClearPendingException(cx);
+      return NS_OK;
+    }
+    if (equals) {
+      WritableStreamDefaultControllerErrorIfNeeded(cx, mController, value, rv);
+      if (rv.Failed()) {
+        return NS_OK;
+      }
+
+      MaybeResolveAndClearBackpressurePromise();
+      return NS_OK;  
+    }
+
+    NS_WARNING("Got an unexpected type other than pull/error.");
+    return NS_OK;
+  }
+
+  void MaybeResolveAndClearBackpressurePromise() {
+    if (mBackpressurePromise) {
+      mBackpressurePromise->MaybeResolveWithUndefined();
+      mBackpressurePromise = nullptr;
+    }
+  }
+
+  Promise* BackpressurePromise() { return mBackpressurePromise; }
+
+  void CreateBackpressurePromise() {
+    mBackpressurePromise =
+        Promise::CreateInfallible(mController->GetParentObject());
+  }
+
+ private:
+  ~SetUpTransformWritableMessageEventListener() = default;
+
+  MOZ_KNOWN_LIVE RefPtr<WritableStreamDefaultController> mController;
+  RefPtr<Promise> mBackpressurePromise;
+};
+
+NS_IMPL_CYCLE_COLLECTION(SetUpTransformWritableMessageEventListener,
+                         mController, mBackpressurePromise)
+NS_IMPL_CYCLE_COLLECTING_ADDREF(SetUpTransformWritableMessageEventListener)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(SetUpTransformWritableMessageEventListener)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(
+    SetUpTransformWritableMessageEventListener)
+  NS_INTERFACE_MAP_ENTRY(nsIDOMEventListener)
+NS_INTERFACE_MAP_END
+
+class SetUpTransformWritableMessageErrorEventListener final
+    : public nsIDOMEventListener {
+ public:
+  SetUpTransformWritableMessageErrorEventListener(
+      WritableStreamDefaultController* aController, MessagePort* aPort)
+      : mController(aController), mPort(aPort) {}
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_CLASS(
+      SetUpTransformWritableMessageErrorEventListener)
+
+  MOZ_CAN_RUN_SCRIPT NS_IMETHOD HandleEvent(Event* aEvent) override {
+    auto cleanupPort =
+        MakeScopeExit([port = RefPtr<MessagePort>(mPort)]() { port->Close(); });
+
+    if (NS_WARN_IF(!aEvent->AsMessageEvent() || !aEvent->IsTrusted())) {
+      return NS_OK;
+    }
+
+    RefPtr<DOMException> exception =
+        DOMException::Create(NS_ERROR_DOM_DATA_CLONE_ERR);
+
+    AutoJSAPI jsapi;
+    if (!jsapi.Init(mPort->GetParentObject())) {
+      return NS_OK;
+    }
+    JSContext* cx = jsapi.cx();
+    JS::Rooted<JS::Value> error(cx);
+    if (!ToJSValue(cx, *exception, &error)) {
+      return NS_OK;
+    }
+
+    CrossRealmTransformSendError(cx, mPort, error);
+
+    WritableStreamDefaultControllerErrorIfNeeded(cx, mController, error,
+                                                 IgnoreErrors());
+
+    mPort->Close();
+    cleanupPort.release();
+
+    return NS_OK;
+  }
+
+ private:
+  ~SetUpTransformWritableMessageErrorEventListener() = default;
+
+  MOZ_KNOWN_LIVE RefPtr<WritableStreamDefaultController> mController;
+  RefPtr<MessagePort> mPort;
+};
+
+NS_IMPL_CYCLE_COLLECTION(SetUpTransformWritableMessageErrorEventListener,
+                         mController, mPort)
+NS_IMPL_CYCLE_COLLECTING_ADDREF(SetUpTransformWritableMessageErrorEventListener)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(
+    SetUpTransformWritableMessageErrorEventListener)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(
+    SetUpTransformWritableMessageErrorEventListener)
+  NS_INTERFACE_MAP_ENTRY(nsIDOMEventListener)
+NS_INTERFACE_MAP_END
+
+static bool PackAndPostMessageHandlingError(
+    JSContext* aCx, mozilla::dom::MessagePort* aPort, const nsAString& aType,
+    JS::Handle<JS::Value> aValue, JS::MutableHandle<JS::Value> aError) {
+  ErrorResult rv;
+  PackAndPostMessage(aCx, aPort, aType, aValue, rv);
+
+  rv.WouldReportJSException();
+  if (rv.Failed()) {
+    MOZ_ALWAYS_TRUE(ToJSValue(aCx, std::move(rv), aError));
+    CrossRealmTransformSendError(aCx, aPort, aError);
+    return false;
+  }
+
+  return true;
+}
+
+class CrossRealmWritableUnderlyingSinkAlgorithms final
+    : public UnderlyingSinkAlgorithmsBase {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(
+      CrossRealmWritableUnderlyingSinkAlgorithms, UnderlyingSinkAlgorithmsBase)
+
+  CrossRealmWritableUnderlyingSinkAlgorithms(
+      SetUpTransformWritableMessageEventListener* aListener, MessagePort* aPort)
+      : mListener(aListener), mPort(aPort) {}
+
+  void StartCallback(JSContext* aCx,
+                     WritableStreamDefaultController& aController,
+                     JS::MutableHandle<JS::Value> aRetVal,
+                     ErrorResult& aRv) override {
+    aRetVal.setUndefined();
+  }
+
+  already_AddRefed<Promise> WriteCallback(
+      JSContext* aCx, JS::Handle<JS::Value> aChunk,
+      WritableStreamDefaultController& aController, ErrorResult& aRv) override {
+    if (!mListener->BackpressurePromise()) {
+      mListener->CreateBackpressurePromise();
+      mListener->BackpressurePromise()->MaybeResolveWithUndefined();
+    }
+
+    auto result =
+        mListener->BackpressurePromise()->ThenWithCycleCollectedArgsJS(
+            [](JSContext* aCx, JS::Handle<JS::Value>, ErrorResult& aRv,
+               SetUpTransformWritableMessageEventListener* aListener,
+               MessagePort* aPort,
+               JS::Handle<JS::Value> aChunk) -> already_AddRefed<Promise> {
+              aListener->CreateBackpressurePromise();
+
+              JS::Rooted<JS::Value> error(aCx);
+              bool result = PackAndPostMessageHandlingError(
+                  aCx, aPort, u"chunk"_ns, aChunk, &error);
+
+              if (!result) {
+                aPort->Close();
+
+                return Promise::CreateRejected(aPort->GetParentObject(), error,
+                                               aRv);
+              }
+
+              return Promise::CreateResolvedWithUndefined(
+                  aPort->GetParentObject(), aRv);
+            },
+            std::make_tuple(mListener, mPort), std::make_tuple(aChunk));
+    if (result.isErr()) {
+      aRv.Throw(result.unwrapErr());
+      return nullptr;
+    }
+    return result.unwrap().forget();
+  }
+
+  already_AddRefed<Promise> CloseCallback(JSContext* aCx,
+                                          ErrorResult& aRv) override {
+    PackAndPostMessage(aCx, mPort, u"close"_ns, JS::UndefinedHandleValue, aRv);
+
+    mPort->Close();
+
+    if (aRv.Failed()) {
+      return nullptr;
+    }
+
+    return Promise::CreateResolvedWithUndefined(mPort->GetParentObject(), aRv);
+  }
+
+  already_AddRefed<Promise> AbortCallback(
+      JSContext* aCx, const Optional<JS::Handle<JS::Value>>& aReason,
+      ErrorResult& aRv) override {
+    JS::Rooted<JS::Value> error(aCx);
+    bool result = PackAndPostMessageHandlingError(
+        aCx, mPort, u"error"_ns,
+        aReason.WasPassed() ? aReason.Value() : JS::UndefinedHandleValue,
+        &error);
+
+    mPort->Close();
+
+    if (!result) {
+      return Promise::CreateRejected(mPort->GetParentObject(), error, aRv);
+    }
+
+    return Promise::CreateResolvedWithUndefined(mPort->GetParentObject(), aRv);
+  }
+
+ protected:
+  ~CrossRealmWritableUnderlyingSinkAlgorithms() override = default;
+
+ private:
+  RefPtr<SetUpTransformWritableMessageEventListener> mListener;
+  RefPtr<MessagePort> mPort;
+};
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED(CrossRealmWritableUnderlyingSinkAlgorithms,
+                                   UnderlyingSinkAlgorithmsBase, mListener,
+                                   mPort)
+NS_IMPL_ADDREF_INHERITED(CrossRealmWritableUnderlyingSinkAlgorithms,
+                         UnderlyingSinkAlgorithmsBase)
+NS_IMPL_RELEASE_INHERITED(CrossRealmWritableUnderlyingSinkAlgorithms,
+                          UnderlyingSinkAlgorithmsBase)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(
+    CrossRealmWritableUnderlyingSinkAlgorithms)
+NS_INTERFACE_MAP_END_INHERITING(UnderlyingSinkAlgorithmsBase)
+
+MOZ_CAN_RUN_SCRIPT static void SetUpCrossRealmTransformWritable(
+    WritableStream* aWritable, MessagePort* aPort, ErrorResult& aRv) {
+  AutoJSAPI jsapi;
+  if (!jsapi.Init(aWritable->GetParentObject())) {
+    return;
+  }
+  JSContext* cx = jsapi.cx();
+
+
+  auto controller = MakeRefPtr<WritableStreamDefaultController>(
+      aWritable->GetParentObject(), *aWritable);
+
+  RefPtr<Promise> backpressurePromise =
+      Promise::CreateInfallible(aWritable->GetParentObject());
+
+  auto listener = MakeRefPtr<SetUpTransformWritableMessageEventListener>(
+      controller, backpressurePromise);
+  aPort->AddEventListener(u"message"_ns, listener, false);
+
+  auto errorListener =
+      MakeRefPtr<SetUpTransformWritableMessageErrorEventListener>(controller,
+                                                                  aPort);
+  aPort->AddEventListener(u"messageerror"_ns, errorListener, false);
+
+  aPort->Start();
+
+  auto algorithms =
+      MakeRefPtr<CrossRealmWritableUnderlyingSinkAlgorithms>(listener, aPort);
+
+
+  SetUpWritableStreamDefaultController(cx, aWritable, controller, algorithms, 1,
+                                        nullptr, aRv);
+}
+
+class SetUpTransformReadableMessageEventListener final
+    : public nsIDOMEventListener {
+ public:
+  SetUpTransformReadableMessageEventListener(
+      ReadableStreamDefaultController* aController, MessagePort* aPort)
+      : mController(aController), mPort(aPort) {}
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_CLASS(SetUpTransformReadableMessageEventListener)
+
+  MOZ_CAN_RUN_SCRIPT NS_IMETHOD HandleEvent(Event* aEvent) override {
+    auto cleanupPort =
+        MakeScopeExit([port = RefPtr<MessagePort>(mPort)]() { port->Close(); });
+
+    AutoJSAPI jsapi;
+    if (!jsapi.Init(mPort->GetParentObject())) {
+      return NS_OK;
+    }
+    JSContext* cx = jsapi.cx();
+    MessageEvent* messageEvent = aEvent->AsMessageEvent();
+    if (NS_WARN_IF(!messageEvent || !messageEvent->IsTrusted())) {
+      return NS_OK;
+    }
+
+    JS::Rooted<JS::Value> dataValue(cx);
+    IgnoredErrorResult rv;
+    messageEvent->GetData(cx, &dataValue, rv);
+    if (rv.Failed()) {
+      return NS_OK;
+    }
+
+    if (NS_WARN_IF(!dataValue.isObject())) {
+      return NS_OK;
+    }
+    JS::Rooted<JSObject*> data(cx, JS::ToObject(cx, dataValue));
+
+    JS::Rooted<JS::Value> type(cx);
+    if (!JS_GetProperty(cx, data, "type", &type)) {
+      JS_ClearPendingException(cx);
+      return NS_OK;
+    }
+
+    JS::Rooted<JS::Value> value(cx);
+    if (!JS_GetProperty(cx, data, "value", &value)) {
+      JS_ClearPendingException(cx);
+      return NS_OK;
+    }
+
+    if (NS_WARN_IF(!type.isString())) {
+      return NS_OK;
+    }
+
+    bool equals = false;
+    if (!JS_StringEqualsLiteral(cx, type.toString(), "chunk", &equals)) {
+      JS_ClearPendingException(cx);
+      return NS_OK;
+    }
+    if (equals) {
+      ReadableStreamDefaultControllerEnqueue(cx, mController, value,
+                                             IgnoreErrors());
+      cleanupPort.release();
+      return NS_OK;  
+    }
+
+    if (!JS_StringEqualsLiteral(cx, type.toString(), "close", &equals)) {
+      JS_ClearPendingException(cx);
+      return NS_OK;
+    }
+    if (equals) {
+      ReadableStreamDefaultControllerClose(cx, mController, IgnoreErrors());
+      mPort->Close();
+      cleanupPort.release();
+      return NS_OK;  
+    }
+
+    if (!JS_StringEqualsLiteral(cx, type.toString(), "error", &equals)) {
+      JS_ClearPendingException(cx);
+      return NS_OK;
+    }
+    if (equals) {
+      ReadableStreamDefaultControllerError(cx, mController, value,
+                                           IgnoreErrors());
+
+      mPort->Close();
+      cleanupPort.release();
+      return NS_OK;  
+    }
+
+    NS_WARNING("Got an unexpected type other than chunk/close/error.");
+    return NS_OK;
+  }
+
+ private:
+  ~SetUpTransformReadableMessageEventListener() = default;
+
+  MOZ_KNOWN_LIVE RefPtr<ReadableStreamDefaultController> mController;
+  RefPtr<MessagePort> mPort;
+};
+
+NS_IMPL_CYCLE_COLLECTION(SetUpTransformReadableMessageEventListener,
+                         mController, mPort)
+NS_IMPL_CYCLE_COLLECTING_ADDREF(SetUpTransformReadableMessageEventListener)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(SetUpTransformReadableMessageEventListener)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(
+    SetUpTransformReadableMessageEventListener)
+  NS_INTERFACE_MAP_ENTRY(nsIDOMEventListener)
+NS_INTERFACE_MAP_END
+
+class SetUpTransformReadableMessageErrorEventListener final
+    : public nsIDOMEventListener {
+ public:
+  SetUpTransformReadableMessageErrorEventListener(
+      ReadableStreamDefaultController* aController, MessagePort* aPort)
+      : mController(aController), mPort(aPort) {}
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_CLASS(
+      SetUpTransformReadableMessageErrorEventListener)
+
+  MOZ_CAN_RUN_SCRIPT NS_IMETHOD HandleEvent(Event* aEvent) override {
+    auto cleanupPort =
+        MakeScopeExit([port = RefPtr<MessagePort>(mPort)]() { port->Close(); });
+
+    if (NS_WARN_IF(!aEvent->AsMessageEvent() || !aEvent->IsTrusted())) {
+      return NS_OK;
+    }
+
+    RefPtr<DOMException> exception =
+        DOMException::Create(NS_ERROR_DOM_DATA_CLONE_ERR);
+
+    AutoJSAPI jsapi;
+    if (!jsapi.Init(mPort->GetParentObject())) {
+      return NS_OK;
+    }
+    JSContext* cx = jsapi.cx();
+    JS::Rooted<JS::Value> error(cx);
+    if (!ToJSValue(cx, *exception, &error)) {
+      return NS_OK;
+    }
+
+    CrossRealmTransformSendError(cx, mPort, error);
+
+    ReadableStreamDefaultControllerError(cx, mController, error,
+                                         IgnoreErrors());
+
+    mPort->Close();
+    cleanupPort.release();
+
+    return NS_OK;
+  }
+
+ private:
+  ~SetUpTransformReadableMessageErrorEventListener() = default;
+
+  RefPtr<ReadableStreamDefaultController> mController;
+  RefPtr<MessagePort> mPort;
+};
+
+NS_IMPL_CYCLE_COLLECTION(SetUpTransformReadableMessageErrorEventListener,
+                         mController, mPort)
+NS_IMPL_CYCLE_COLLECTING_ADDREF(SetUpTransformReadableMessageErrorEventListener)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(
+    SetUpTransformReadableMessageErrorEventListener)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(
+    SetUpTransformReadableMessageErrorEventListener)
+  NS_INTERFACE_MAP_ENTRY(nsIDOMEventListener)
+NS_INTERFACE_MAP_END
+
+class CrossRealmReadableUnderlyingSourceAlgorithms final
+    : public UnderlyingSourceAlgorithmsBase {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(
+      CrossRealmReadableUnderlyingSourceAlgorithms,
+      UnderlyingSourceAlgorithmsBase)
+
+  explicit CrossRealmReadableUnderlyingSourceAlgorithms(MessagePort* aPort)
+      : mPort(aPort) {}
+
+  void StartCallback(JSContext* aCx, ReadableStreamControllerBase& aController,
+                     JS::MutableHandle<JS::Value> aRetVal,
+                     ErrorResult& aRv) override {
+    aRetVal.setUndefined();
+  }
+
+  already_AddRefed<Promise> PullCallback(
+      JSContext* aCx, ReadableStreamControllerBase& aController,
+      ErrorResult& aRv) override {
+
+    PackAndPostMessage(aCx, mPort, u"pull"_ns, JS::UndefinedHandleValue, aRv);
+    if (aRv.Failed()) {
+      return nullptr;
+    }
+
+    return Promise::CreateResolvedWithUndefined(mPort->GetParentObject(), aRv);
+  }
+
+  already_AddRefed<Promise> CancelCallback(
+      JSContext* aCx, const Optional<JS::Handle<JS::Value>>& aReason,
+      ErrorResult& aRv) override {
+
+    JS::Rooted<JS::Value> error(aCx);
+    bool result = PackAndPostMessageHandlingError(
+        aCx, mPort, u"error"_ns,
+        aReason.WasPassed() ? aReason.Value() : JS::UndefinedHandleValue,
+        &error);
+
+    mPort->Close();
+
+    if (!result) {
+      return Promise::CreateRejected(mPort->GetParentObject(), error, aRv);
+    }
+
+    return Promise::CreateResolvedWithUndefined(mPort->GetParentObject(), aRv);
+  }
+
+ protected:
+  ~CrossRealmReadableUnderlyingSourceAlgorithms() override = default;
+
+ private:
+  RefPtr<MessagePort> mPort;
+};
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED(CrossRealmReadableUnderlyingSourceAlgorithms,
+                                   UnderlyingSourceAlgorithmsBase, mPort)
+NS_IMPL_ADDREF_INHERITED(CrossRealmReadableUnderlyingSourceAlgorithms,
+                         UnderlyingSourceAlgorithmsBase)
+NS_IMPL_RELEASE_INHERITED(CrossRealmReadableUnderlyingSourceAlgorithms,
+                          UnderlyingSourceAlgorithmsBase)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(
+    CrossRealmReadableUnderlyingSourceAlgorithms)
+NS_INTERFACE_MAP_END_INHERITING(UnderlyingSourceAlgorithmsBase)
+
+MOZ_CAN_RUN_SCRIPT static void SetUpCrossRealmTransformReadable(
+    ReadableStream* aReadable, MessagePort* aPort, ErrorResult& aRv) {
+  AutoJSAPI jsapi;
+  if (!jsapi.Init(aReadable->GetParentObject())) {
+    return;
+  }
+  JSContext* cx = jsapi.cx();
+
+
+  auto controller =
+      MakeRefPtr<ReadableStreamDefaultController>(aReadable->GetParentObject());
+
+  auto listener =
+      MakeRefPtr<SetUpTransformReadableMessageEventListener>(controller, aPort);
+  aPort->AddEventListener(u"message"_ns, listener, false);
+
+  auto errorListener =
+      MakeRefPtr<SetUpTransformReadableMessageErrorEventListener>(controller,
+                                                                  aPort);
+  aPort->AddEventListener(u"messageerror"_ns, errorListener, false);
+
+  aPort->Start();
+
+  auto algorithms =
+      MakeRefPtr<CrossRealmReadableUnderlyingSourceAlgorithms>(aPort);
+
+
+  SetUpReadableStreamDefaultController(cx, aReadable, controller, algorithms, 0,
+                                        nullptr, aRv);
+}
+
+bool ReadableStream::Transfer(JSContext* aCx, UniqueMessagePortId& aPortId) {
+  if (IsReadableStreamLocked(this)) {
+    return false;
+  }
+
+  ErrorResult rv;
+  RefPtr<dom::MessageChannel> channel =
+      dom::MessageChannel::Constructor(mGlobal, rv);
+  if (rv.MaybeSetPendingException(aCx)) {
+    return false;
+  }
+
+  RefPtr<WritableStream> writable = new WritableStream(
+      mGlobal, WritableStream::HoldDropJSObjectsCaller::Implicit);
+
+  SetUpCrossRealmTransformWritable(writable, MOZ_KnownLive(channel->Port1()),
+                                   rv);
+  if (rv.MaybeSetPendingException(aCx)) {
+    return false;
+  }
+
+  RefPtr<Promise> promise =
+      ReadableStreamPipeTo(this, writable, false, false, false, nullptr, rv);
+  if (rv.MaybeSetPendingException(aCx)) {
+    return false;
+  }
+
+  MOZ_ALWAYS_TRUE(promise->SetAnyPromiseIsHandled());
+
+  channel->Port2()->CloneAndDisentangle(aPortId);
+
+  return true;
+}
+
+MOZ_CAN_RUN_SCRIPT already_AddRefed<ReadableStream>
+ReadableStream::ReceiveTransferImpl(JSContext* aCx, nsIGlobalObject* aGlobal,
+                                    MessagePort& aPort) {
+
+  RefPtr<ReadableStream> readable =
+      new ReadableStream(aGlobal, HoldDropJSObjectsCaller::Implicit);
+  ErrorResult rv;
+  SetUpCrossRealmTransformReadable(readable, &aPort, rv);
+  if (rv.MaybeSetPendingException(aCx)) {
+    return nullptr;
+  }
+  return readable.forget();
+}
+
+bool ReadableStream::ReceiveTransfer(
+    JSContext* aCx, nsIGlobalObject* aGlobal, MessagePort& aPort,
+    JS::MutableHandle<JSObject*> aReturnObject) {
+  RefPtr<ReadableStream> readable =
+      ReadableStream::ReceiveTransferImpl(aCx, aGlobal, aPort);
+  if (!readable) {
+    return false;
+  }
+
+  JS::Rooted<JS::Value> value(aCx);
+  if (!GetOrCreateDOMReflector(aCx, readable, &value)) {
+    JS_ClearPendingException(aCx);
+    return false;
+  }
+  aReturnObject.set(&value.toObject());
+
+  return true;
+}
+
+bool WritableStream::Transfer(JSContext* aCx, UniqueMessagePortId& aPortId) {
+  if (IsWritableStreamLocked(this)) {
+    return false;
+  }
+
+  ErrorResult rv;
+  RefPtr<dom::MessageChannel> channel =
+      dom::MessageChannel::Constructor(mGlobal, rv);
+  if (rv.MaybeSetPendingException(aCx)) {
+    return false;
+  }
+
+  RefPtr<ReadableStream> readable = new ReadableStream(
+      mGlobal, ReadableStream::HoldDropJSObjectsCaller::Implicit);
+
+  SetUpCrossRealmTransformReadable(readable, MOZ_KnownLive(channel->Port1()),
+                                   rv);
+  if (rv.MaybeSetPendingException(aCx)) {
+    return false;
+  }
+
+  RefPtr<Promise> promise =
+      ReadableStreamPipeTo(readable, this, false, false, false, nullptr, rv);
+  if (rv.Failed()) {
+    return false;
+  }
+
+  MOZ_ALWAYS_TRUE(promise->SetAnyPromiseIsHandled());
+
+  channel->Port2()->CloneAndDisentangle(aPortId);
+
+  return true;
+}
+
+MOZ_CAN_RUN_SCRIPT already_AddRefed<WritableStream>
+WritableStream::ReceiveTransferImpl(JSContext* aCx, nsIGlobalObject* aGlobal,
+                                    MessagePort& aPort) {
+
+  RefPtr<WritableStream> writable = new WritableStream(
+      aGlobal, WritableStream::HoldDropJSObjectsCaller::Implicit);
+  ErrorResult rv;
+  SetUpCrossRealmTransformWritable(writable, &aPort, rv);
+  if (rv.MaybeSetPendingException(aCx)) {
+    return nullptr;
+  }
+  return writable.forget();
+}
+
+bool WritableStream::ReceiveTransfer(
+    JSContext* aCx, nsIGlobalObject* aGlobal, MessagePort& aPort,
+    JS::MutableHandle<JSObject*> aReturnObject) {
+  RefPtr<WritableStream> writable =
+      WritableStream::ReceiveTransferImpl(aCx, aGlobal, aPort);
+  if (!writable) {
+    return false;
+  }
+
+  JS::Rooted<JS::Value> value(aCx);
+  if (!GetOrCreateDOMReflector(aCx, writable, &value)) {
+    JS_ClearPendingException(aCx);
+    return false;
+  }
+  aReturnObject.set(&value.toObject());
+
+  return true;
+}
+
+bool TransformStream::Transfer(JSContext* aCx, UniqueMessagePortId& aPortId1,
+                               UniqueMessagePortId& aPortId2) {
+  if (IsReadableStreamLocked(mReadable) || IsWritableStreamLocked(mWritable)) {
+    return false;
+  }
+
+  if (!MOZ_KnownLive(mReadable)->Transfer(aCx, aPortId1)) {
+    return false;
+  }
+
+  return MOZ_KnownLive(mWritable)->Transfer(aCx, aPortId2);
+}
+
+bool TransformStream::ReceiveTransfer(
+    JSContext* aCx, nsIGlobalObject* aGlobal, MessagePort& aPort1,
+    MessagePort& aPort2, JS::MutableHandle<JSObject*> aReturnObject) {
+  RefPtr<ReadableStream> readable =
+      ReadableStream::ReceiveTransferImpl(aCx, aGlobal, aPort1);
+  if (!readable) {
+    return false;
+  }
+
+  RefPtr<WritableStream> writable =
+      WritableStream::ReceiveTransferImpl(aCx, aGlobal, aPort2);
+  if (!writable) {
+    return false;
+  }
+
+  RefPtr<TransformStream> stream =
+      new TransformStream(aGlobal, readable, writable);
+  JS::Rooted<JS::Value> value(aCx);
+  if (!GetOrCreateDOMReflector(aCx, stream, &value)) {
+    JS_ClearPendingException(aCx);
+    return false;
+  }
+  aReturnObject.set(&value.toObject());
+
+  return true;
+}
+
+}  

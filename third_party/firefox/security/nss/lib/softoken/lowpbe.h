@@ -1,0 +1,80 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef _SECPKCS5_H_
+#define _SECPKCS5_H_
+
+#include "plarena.h"
+#include "secitem.h"
+#include "seccomon.h"
+#include "secoidt.h"
+#include "hasht.h"
+
+typedef SECItem *(*SEC_PKCS5GetPBEPassword)(void *arg);
+
+typedef enum {
+    pbeBitGenIDNull = 0,
+    pbeBitGenCipherKey = 0x01,
+    pbeBitGenCipherIV = 0x02,
+    pbeBitGenIntegrityKey = 0x03
+} PBEBitGenID;
+
+typedef enum {
+    NSSPKCS5_PBKDF1 = 0,
+    NSSPKCS5_PBKDF2 = 1,
+    NSSPKCS5_PKCS12_V2 = 2
+} NSSPKCS5PBEType;
+
+typedef struct NSSPKCS5PBEParameterStr NSSPKCS5PBEParameter;
+
+struct NSSPKCS5PBEParameterStr {
+    PLArenaPool *poolp;
+    SECItem salt;      
+    SECItem iteration; 
+    SECItem keyLength; 
+
+    int iter;
+    int keyLen;
+    int ivLen;
+    unsigned char *ivData;
+    HASH_HashType hashType;
+    NSSPKCS5PBEType pbeType;
+    SECAlgorithmID prfAlg;
+    PBEBitGenID keyID;
+    SECOidTag encAlg;
+    PRBool is2KeyDES;
+};
+
+SEC_BEGIN_PROTOS
+extern SECAlgorithmID *
+nsspkcs5_CreateAlgorithmID(PLArenaPool *arena, SECOidTag algorithm,
+                           NSSPKCS5PBEParameter *pbe);
+
+NSSPKCS5PBEParameter *
+nsspkcs5_AlgidToParam(SECAlgorithmID *algid);
+
+NSSPKCS5PBEParameter *
+nsspkcs5_NewParam(SECOidTag alg, HASH_HashType hashType, SECItem *salt,
+                  int iterationCount);
+
+extern SECItem *
+nsspkcs5_CipherData(NSSPKCS5PBEParameter *, SECItem *pwitem,
+                    SECItem *src, PRBool encrypt, PRBool *update);
+
+extern SECItem *
+nsspkcs5_ComputeKeyAndIV(NSSPKCS5PBEParameter *, SECItem *pwitem,
+                         SECItem *iv, PRBool faulty3DES);
+
+extern void
+nsspkcs5_DestroyPBEParameter(NSSPKCS5PBEParameter *param);
+
+HASH_HashType HASH_FromHMACOid(SECOidTag oid);
+SECOidTag HASH_HMACOidFromHash(HASH_HashType);
+
+extern SECStatus
+sftk_fips_pbkdf_PowerUpSelfTests(void);
+
+SEC_END_PROTOS
+
+#endif

@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+exec /opt/binaryen/bin/wasm-opt \
+    --enable-sign-ext \
+    --enable-nontrapping-float-to-int \
+    --enable-bulk-memory \
+    --enable-bulk-memory-opt \
+    "$@"

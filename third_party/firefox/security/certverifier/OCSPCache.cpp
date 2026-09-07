@@ -1,0 +1,284 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+/* Copyright 2013 Mozilla Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "OCSPCache.h"
+
+#include "NSSCertDBTrustDomain.h"
+#include "pk11pub.h"
+#include "mozilla/Logging.h"
+#include "mozpkix/pkixnss.h"
+#include "ScopedNSSTypes.h"
+#include "secerr.h"
+
+extern mozilla::LazyLogModule gCertVerifierLog;
+
+using namespace mozilla::pkix;
+
+namespace mozilla {
+namespace psm {
+
+typedef mozilla::pkix::Result Result;
+
+static SECStatus DigestLength(UniquePK11Context& context, uint32_t length) {
+  if (length >= 65536) {
+    return SECFailure;
+  }
+  unsigned char array[2];
+  array[0] = length & 255;
+  array[1] = (length >> 8) & 255;
+
+  return PK11_DigestOp(context.get(), array, std::size(array));
+}
+
+static SECStatus CertIDHash(SHA384Buffer& buf, const CertID& certID,
+                            const OriginAttributes& originAttributes) {
+  UniquePK11Context context(PK11_CreateDigestContext(SEC_OID_SHA384));
+  if (!context) {
+    return SECFailure;
+  }
+  SECStatus rv = PK11_DigestBegin(context.get());
+  if (rv != SECSuccess) {
+    return rv;
+  }
+  SECItem certIDIssuer = UnsafeMapInputToSECItem(certID.issuer);
+  rv = PK11_DigestOp(context.get(), certIDIssuer.data, certIDIssuer.len);
+  if (rv != SECSuccess) {
+    return rv;
+  }
+  SECItem certIDIssuerSubjectPublicKeyInfo =
+      UnsafeMapInputToSECItem(certID.issuerSubjectPublicKeyInfo);
+  rv = PK11_DigestOp(context.get(), certIDIssuerSubjectPublicKeyInfo.data,
+                     certIDIssuerSubjectPublicKeyInfo.len);
+  if (rv != SECSuccess) {
+    return rv;
+  }
+  SECItem certIDSerialNumber = UnsafeMapInputToSECItem(certID.serialNumber);
+  rv = DigestLength(context, certIDSerialNumber.len);
+  if (rv != SECSuccess) {
+    return rv;
+  }
+  rv = PK11_DigestOp(context.get(), certIDSerialNumber.data,
+                     certIDSerialNumber.len);
+  if (rv != SECSuccess) {
+    return rv;
+  }
+
+  nsAutoCString suffix;
+  originAttributes.CreateSuffix(suffix);
+  rv = DigestLength(context, suffix.Length());
+  if (rv != SECSuccess) {
+    return rv;
+  }
+  if (!suffix.IsEmpty()) {
+    rv = PK11_DigestOp(context.get(),
+                       BitwiseCast<const unsigned char*>(suffix.get()),
+                       suffix.Length());
+    if (rv != SECSuccess) {
+      return rv;
+    }
+  }
+
+  uint32_t outLen = 0;
+  rv = PK11_DigestFinal(context.get(), buf, &outLen, SHA384_LENGTH);
+  if (outLen != SHA384_LENGTH) {
+    return SECFailure;
+  }
+  return rv;
+}
+
+Result OCSPCache::Entry::Init(const CertID& aCertID,
+                              const OriginAttributes& aOriginAttributes) {
+  mIsPrivateBrowsing = aOriginAttributes.IsPrivateBrowsing();
+  SECStatus srv = CertIDHash(mIDHash, aCertID, aOriginAttributes);
+  if (srv != SECSuccess) {
+    return MapPRErrorCodeToResult(PR_GetError());
+  }
+  return Success;
+}
+
+OCSPCache::OCSPCache() : mMutex("OCSPCache-mutex") {}
+
+OCSPCache::~OCSPCache() { Clear(); }
+
+bool OCSPCache::FindInternal(const CertID& aCertID,
+                             const OriginAttributes& aOriginAttributes,
+                              size_t& index,
+                             const MutexAutoLock& ) {
+  mMutex.AssertCurrentThreadOwns();
+  if (mEntries.length() == 0) {
+    return false;
+  }
+
+  SHA384Buffer idHash;
+  SECStatus rv = CertIDHash(idHash, aCertID, aOriginAttributes);
+  if (rv != SECSuccess) {
+    return false;
+  }
+
+  index = mEntries.length();
+  while (index > 0) {
+    --index;
+    if (memcmp(mEntries[index]->mIDHash, idHash, SHA384_LENGTH) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static inline void LogWithCertID(const char* aMessage, const CertID& aCertID,
+                                 const OriginAttributes& aOriginAttributes) {
+  nsAutoCString originAttributesSuffix;
+  aOriginAttributes.CreateSuffix(originAttributesSuffix);
+  MOZ_LOG(gCertVerifierLog, LogLevel::Debug,
+          (aMessage, &aCertID, originAttributesSuffix.get()));
+}
+
+void OCSPCache::MakeMostRecentlyUsed(size_t aIndex,
+                                     const MutexAutoLock& ) {
+  mMutex.AssertCurrentThreadOwns();
+  Entry* entry = mEntries[aIndex];
+  mEntries.erase(mEntries.begin() + aIndex);
+  MOZ_RELEASE_ASSERT(mEntries.append(entry));
+}
+
+bool OCSPCache::Get(const CertID& aCertID,
+                    const OriginAttributes& aOriginAttributes, Result& aResult,
+                    Time& aValidThrough) {
+  MutexAutoLock lock(mMutex);
+
+  size_t index;
+  if (!FindInternal(aCertID, aOriginAttributes, index, lock)) {
+    LogWithCertID("OCSPCache::Get(%p,\"%s\") not in cache", aCertID,
+                  aOriginAttributes);
+    return false;
+  }
+  LogWithCertID("OCSPCache::Get(%p,\"%s\") in cache", aCertID,
+                aOriginAttributes);
+  aResult = mEntries[index]->mResult;
+  aValidThrough = mEntries[index]->mValidThrough;
+  MakeMostRecentlyUsed(index, lock);
+  return true;
+}
+
+Result OCSPCache::Put(const CertID& aCertID,
+                      const OriginAttributes& aOriginAttributes, Result aResult,
+                      Time aThisUpdate, Time aValidThrough) {
+  MutexAutoLock lock(mMutex);
+
+  size_t index;
+  if (FindInternal(aCertID, aOriginAttributes, index, lock)) {
+    if (mEntries[index]->mResult == Result::ERROR_REVOKED_CERTIFICATE) {
+      LogWithCertID(
+          "OCSPCache::Put(%p, \"%s\") already in cache as revoked - "
+          "not replacing",
+          aCertID, aOriginAttributes);
+      MakeMostRecentlyUsed(index, lock);
+      return Success;
+    }
+
+    if (mEntries[index]->mThisUpdate > aThisUpdate &&
+        aResult != Result::ERROR_REVOKED_CERTIFICATE) {
+      LogWithCertID(
+          "OCSPCache::Put(%p, \"%s\") already in cache with more "
+          "recent validity - not replacing",
+          aCertID, aOriginAttributes);
+      MakeMostRecentlyUsed(index, lock);
+      return Success;
+    }
+
+    if (aResult != Success && aResult != Result::ERROR_OCSP_UNKNOWN_CERT &&
+        aResult != Result::ERROR_REVOKED_CERTIFICATE) {
+      LogWithCertID(
+          "OCSPCache::Put(%p, \"%s\") already in cache - not "
+          "replacing with less important status",
+          aCertID, aOriginAttributes);
+      MakeMostRecentlyUsed(index, lock);
+      return Success;
+    }
+
+    LogWithCertID("OCSPCache::Put(%p, \"%s\") already in cache - replacing",
+                  aCertID, aOriginAttributes);
+    mEntries[index]->mResult = aResult;
+    mEntries[index]->mThisUpdate = aThisUpdate;
+    mEntries[index]->mValidThrough = aValidThrough;
+    MakeMostRecentlyUsed(index, lock);
+    return Success;
+  }
+
+  if (mEntries.length() == MaxEntries) {
+    LogWithCertID("OCSPCache::Put(%p, \"%s\") too full - evicting an entry",
+                  aCertID, aOriginAttributes);
+    for (Entry** toEvict = mEntries.begin(); toEvict != mEntries.end();
+         toEvict++) {
+      if ((*toEvict)->mResult != Result::ERROR_REVOKED_CERTIFICATE &&
+          (*toEvict)->mResult != Result::ERROR_OCSP_UNKNOWN_CERT) {
+        delete *toEvict;
+        mEntries.erase(toEvict);
+        break;
+      }
+    }
+    if (mEntries.length() == MaxEntries) {
+      return aResult;
+    }
+  }
+
+  Entry* newEntry =
+      new (std::nothrow) Entry(aResult, aThisUpdate, aValidThrough);
+  if (!newEntry) {
+    return Result::FATAL_ERROR_NO_MEMORY;
+  }
+  Result rv = newEntry->Init(aCertID, aOriginAttributes);
+  if (rv != Success) {
+    delete newEntry;
+    return rv;
+  }
+  if (!mEntries.append(newEntry)) {
+    delete newEntry;
+    return Result::FATAL_ERROR_NO_MEMORY;
+  }
+  LogWithCertID("OCSPCache::Put(%p, \"%s\") added to cache", aCertID,
+                aOriginAttributes);
+  return Success;
+}
+
+void OCSPCache::Clear() {
+  MutexAutoLock lock(mMutex);
+  MOZ_LOG(gCertVerifierLog, LogLevel::Debug,
+          ("OCSPCache::Clear: clearing cache"));
+  for (Entry** entry = mEntries.begin(); entry < mEntries.end(); entry++) {
+    delete *entry;
+  }
+  mEntries.clearAndFree();
+}
+
+void OCSPCache::ClearPrivateBrowsing() {
+  MutexAutoLock lock(mMutex);
+  MOZ_LOG(gCertVerifierLog, LogLevel::Debug,
+          ("OCSPCache::ClearPrivateBrowsing: clearing private entries"));
+  mEntries.eraseIf([](Entry* aEntry) {
+    if (aEntry->mIsPrivateBrowsing) {
+      delete aEntry;
+      return true;
+    }
+    return false;
+  });
+}
+
+}  
+}  

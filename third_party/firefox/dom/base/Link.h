@@ -1,0 +1,112 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_dom_Link_h_
+#define mozilla_dom_Link_h_
+
+#include "mozilla/dom/RustTypes.h"
+#include "nsCOMPtr.h"
+#include "nsWrapperCache.h"  // For nsWrapperCache::FlagsType
+
+class nsIURI;
+
+namespace mozilla {
+
+class SizeOfState;
+
+namespace dom {
+
+class Document;
+class Element;
+struct BindContext;
+
+#define MOZILLA_DOM_LINK_IMPLEMENTATION_IID \
+  {0xb25edee6, 0xdd35, 0x4f8b, {0xab, 0x90, 0x66, 0xd0, 0xbd, 0x3c, 0x22, 0xd5}}
+
+class Link : public nsISupports {
+ public:
+  NS_INLINE_DECL_STATIC_IID(MOZILLA_DOM_LINK_IMPLEMENTATION_IID)
+
+  enum class State : uint8_t {
+    Unvisited = 0,
+    Visited,
+    NotLink,
+  };
+
+  explicit Link(Element* aElement);
+
+  explicit Link();
+
+  virtual void VisitedQueryFinished(bool aVisited);
+
+  nsIURI* GetURI() const;
+
+  void SetProtocol(const nsACString& aProtocol);
+  void SetUsername(const nsACString& aUsername);
+  void SetPassword(const nsACString& aPassword);
+  void SetHost(const nsACString& aHost);
+  void SetHostname(const nsACString& aHostname);
+  void SetPathname(const nsACString& aPathname);
+  void SetSearch(const nsACString& aSearch);
+  void SetPort(const nsACString& aPort);
+  void SetHash(const nsACString& aHash);
+  void GetOrigin(nsACString& aOrigin);
+  void GetProtocol(nsACString& aProtocol);
+  void GetUsername(nsACString& aUsername);
+  void GetPassword(nsACString& aPassword);
+  void GetHost(nsACString& aHost);
+  void GetHostname(nsACString& aHostname);
+  void GetPathname(nsACString& aPathname);
+  void GetSearch(nsACString& aSearch);
+  void GetPort(nsACString& aPort);
+  void GetHash(nsACString& aHash);
+
+  void ResetLinkState(bool aNotify, bool aHasHref);
+  void ResetLinkState(bool aNotify) {
+    ResetLinkState(aNotify, ElementHasHref());
+  }
+  void BindToTree(const BindContext&);
+  void UnbindFromTree() { ResetLinkState(false); }
+
+  Element* GetElement() const { return mElement; }
+
+  virtual size_t SizeOfExcludingThis(mozilla::SizeOfState& aState) const;
+
+  virtual bool ElementHasHref() const;
+
+  bool HasPendingLinkUpdate() const { return mHasPendingLinkUpdate; }
+  void SetHasPendingLinkUpdate() { mHasPendingLinkUpdate = true; }
+  void ClearHasPendingLinkUpdate() { mHasPendingLinkUpdate = false; }
+  void TriggerLinkUpdate(bool aNotify);
+
+  virtual void NodeInfoChanged(Document* aOldDoc) = 0;
+
+ protected:
+  virtual ~Link();
+
+  nsIURI* GetCachedURI() const { return mCachedURI; }
+  bool HasCachedURI() const { return !!mCachedURI; }
+
+ private:
+  void Unregister();
+  void SetLinkState(State, bool aNotify);
+  void SetHrefAttribute(nsIURI* aURI);
+
+  mutable nsCOMPtr<nsIURI> mCachedURI;
+
+  Element* const mElement;
+
+  bool mNeedsRegistration : 1;
+  bool mRegistered : 1;
+  bool mHasPendingLinkUpdate : 1;
+#if defined(MOZ_PLACES) || defined(MOZ_GECKOVIEW_HISTORY)
+  const bool mHistory : 1;
+#endif
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_Link_h_

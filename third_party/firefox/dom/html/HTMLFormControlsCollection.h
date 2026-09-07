@@ -1,0 +1,93 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_HTMLFormControlsCollection_h
+#define mozilla_dom_HTMLFormControlsCollection_h
+
+#include "mozilla/dom/ContentList.h"
+#include "mozilla/dom/TreeOrderedArray.h"
+#include "nsInterfaceHashtable.h"
+#include "nsTArray.h"
+
+class nsGenericHTMLFormElement;
+class nsIContent;
+class nsIFormControl;
+template <class T>
+class RefPtr;
+
+namespace mozilla::dom {
+class Element;
+class HTMLFormElement;
+class HTMLImageElement;
+class OwningRadioNodeListOrElement;
+template <typename>
+struct Nullable;
+
+class HTMLFormControlsCollection final : public HTMLCollection {
+ public:
+  explicit HTMLFormControlsCollection(HTMLFormElement* aForm);
+
+  void DropFormReference();
+
+  NS_DECL_ISUPPORTS_INHERITED
+
+  uint32_t Length() override;
+  Element* Item(uint32_t aIndex) override;
+  nsINode* GetParentObject() override;
+
+  Element* GetFirstNamedElement(const nsAString& aName, bool& aFound) override;
+
+  using HTMLCollection::NamedItem;
+  void NamedGetter(const nsAString& aName, bool& aFound,
+                   Nullable<OwningRadioNodeListOrElement>& aResult);
+  void NamedItem(const nsAString& aName,
+                 Nullable<OwningRadioNodeListOrElement>& aResult) {
+    bool dummy;
+    NamedGetter(aName, dummy, aResult);
+  }
+  void GetSupportedNames(nsTArray<nsString>& aNames) override;
+
+  nsresult AddElementToTable(nsGenericHTMLFormElement* aChild,
+                             const nsAString& aName);
+  nsresult AddImageElementToTable(HTMLImageElement* aChild,
+                                  const nsAString& aName);
+  nsresult RemoveElementFromTable(nsGenericHTMLFormElement* aChild,
+                                  const nsAString& aName);
+  nsresult IndexOfContent(nsIContent* aContent, int32_t* aIndex);
+
+  nsISupports* NamedItemInternal(const nsAString& aName);
+
+  nsresult GetSortedControls(
+      nsTArray<RefPtr<nsGenericHTMLFormElement>>& aControls) const;
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+ protected:
+  virtual ~HTMLFormControlsCollection();
+
+ public:
+  static bool ShouldBeInElements(const nsIFormControl* aFormControl);
+
+  HTMLFormElement* mForm;  
+
+  TreeOrderedArray<nsGenericHTMLFormElement*, TreeKind::ShadowIncludingDOM>
+      mElements;
+
+  TreeOrderedArray<nsGenericHTMLFormElement*, TreeKind::ShadowIncludingDOM>
+      mNotInElements;
+
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_CLASS_INHERITED(
+      HTMLFormControlsCollection, HTMLCollection)
+
+ protected:
+  void Clear();
+
+
+  nsInterfaceHashtable<nsStringHashKey, nsISupports> mNameLookupTable;
+};
+
+}  
+
+#endif  // mozilla_dom_HTMLFormControlsCollection_h

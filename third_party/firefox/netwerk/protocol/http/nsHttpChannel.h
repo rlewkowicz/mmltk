@@ -1,0 +1,715 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsHttpChannel_h_
+#define nsHttpChannel_h_
+
+#include "AlternateServices.h"
+#include "AutoClose.h"
+#include "HttpBaseChannel.h"
+#include "HttpTransactionShell.h"
+#include "nsHttpResponseHead.h"
+#include "nsIReplacedHttpResponse.h"
+#include "TimingStruct.h"
+#include "mozilla/AtomicBitfields.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/net/DocumentLoadListener.h"
+#include "nsIAsyncVerifyRedirectCallback.h"
+#include "nsICacheEntry.h"
+#include "nsICacheEntryOpenCallback.h"
+#include "nsICachingChannel.h"
+#include "nsICorsPreflightCallback.h"
+#include "nsIDNSListener.h"
+#include "nsIEarlyHintObserver.h"
+#include "nsIHttpAuthenticableChannel.h"
+#include "nsIProtocolProxyCallback.h"
+#include "nsIRequestContext.h"
+#include "nsIStreamListener.h"
+#include "nsIThreadRetargetableRequest.h"
+#include "nsIThreadRetargetableStreamListener.h"
+#include "nsITransport.h"
+#include "nsITransportSecurityInfo.h"
+#include "nsTArray.h"
+#include "nsWeakReference.h"
+
+class nsDNSPrefetch;
+class nsICancelable;
+class nsIDNSRecord;
+class nsIDNSHTTPSSVCRecord;
+class nsIHttpChannelAuthProvider;
+class nsInputStreamPump;
+class nsITransportSecurityInfo;
+
+namespace mozilla {
+namespace net {
+
+class HttpChannelSecurityWarningReporter;
+
+using DNSPromise = MozPromise<nsCOMPtr<nsIDNSRecord>, nsresult, false>;
+
+
+#define NS_HTTPCHANNEL_IID \
+  {0x301bf95b, 0x7bb3, 0x4ae1, {0xa9, 0x71, 0x40, 0xbc, 0xfa, 0x81, 0xde, 0x12}}
+
+class nsHttpChannel final : public HttpBaseChannel,
+                            public HttpAsyncAborter<nsHttpChannel>,
+                            public nsICachingChannel,
+                            public nsICacheEntryOpenCallback,
+                            public nsITransportEventSink,
+                            public nsIProtocolProxyCallback,
+                            public nsIHttpAuthenticableChannel,
+                            public nsIAsyncVerifyRedirectCallback,
+                            public nsIThreadRetargetableRequest,
+                            public nsIThreadRetargetableStreamListener,
+                            public nsIDNSListener,
+                            public nsSupportsWeakReference,
+                            public nsICorsPreflightCallback,
+                            public nsIRequestTailUnblockCallback,
+                            public nsIEarlyHintObserver {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_NSIREQUESTOBSERVER
+  NS_DECL_NSISTREAMLISTENER
+  NS_DECL_NSITHREADRETARGETABLESTREAMLISTENER
+  NS_DECL_NSICACHEINFOCHANNEL
+  NS_DECL_NSICACHINGCHANNEL
+  NS_DECL_NSICACHEENTRYOPENCALLBACK
+  NS_DECL_NSITRANSPORTEVENTSINK
+  NS_DECL_NSIPROTOCOLPROXYCALLBACK
+  NS_DECL_NSIPROXIEDCHANNEL
+  NS_DECL_NSIASYNCVERIFYREDIRECTCALLBACK
+  NS_DECL_NSITHREADRETARGETABLEREQUEST
+  NS_DECL_NSIDNSLISTENER
+  NS_INLINE_DECL_STATIC_IID(NS_HTTPCHANNEL_IID)
+  NS_DECL_NSIREQUESTTAILUNBLOCKCALLBACK
+  NS_DECL_NSIEARLYHINTOBSERVER
+
+  NS_IMETHOD GetIsSSL(bool* aIsSSL) override;
+  NS_IMETHOD GetProxyMethodIsConnect(bool* aProxyMethodIsConnect) override;
+  NS_IMETHOD GetServerResponseHeader(
+      nsACString& aServerResponseHeader) override;
+  NS_IMETHOD GetProxyChallenges(nsACString& aChallenges) override;
+  NS_IMETHOD GetWWWChallenges(nsACString& aChallenges) override;
+  NS_IMETHOD SetProxyCredentials(const nsACString& aCredentials) override;
+  NS_IMETHOD SetWWWCredentials(const nsACString& aCredentials) override;
+  NS_IMETHOD OnAuthAvailable() override;
+  NS_IMETHOD OnAuthCancelled(bool userCancel) override;
+  NS_IMETHOD CloseStickyConnection() override;
+  NS_IMETHOD ConnectionRestartable(bool) override;
+  NS_IMETHOD GetLoadFlags(nsLoadFlags* aLoadFlags) override;
+  NS_IMETHOD GetURI(nsIURI** aURI) override;
+  NS_IMETHOD GetNotificationCallbacks(
+      nsIInterfaceRequestor** aCallbacks) override;
+  NS_IMETHOD GetLoadGroup(nsILoadGroup** aLoadGroup) override;
+  NS_IMETHOD GetRequestMethod(nsACString& aMethod) override;
+
+  nsHttpChannel();
+
+  [[nodiscard]] virtual nsresult Init(nsIURI* aURI, uint32_t aCaps,
+                                      nsProxyInfo* aProxyInfo,
+                                      uint32_t aProxyResolveFlags,
+                                      nsIURI* aProxyURI, uint64_t aChannelId,
+                                      nsILoadInfo* aLoadInfo) override;
+
+  static bool IsRedirectStatus(uint32_t status);
+  static bool WillRedirect(const nsHttpResponseHead& response);
+
+  NS_IMETHOD SetCanceledReason(const nsACString& aReason) override;
+  NS_IMETHOD GetCanceledReason(nsACString& aReason) override;
+  NS_IMETHOD CancelWithReason(nsresult status,
+                              const nsACString& reason) override;
+  NS_IMETHOD Cancel(nsresult status) override;
+  NS_IMETHOD Suspend() override;
+  static void StaticSuspend(nsHttpChannel* aChan);
+  NS_IMETHOD Resume() override;
+  NS_IMETHOD
+  GetSecurityInfo(nsITransportSecurityInfo** aSecurityInfo) override;
+  NS_IMETHOD AsyncOpen(nsIStreamListener* aListener) override;
+  NS_IMETHOD GetEncodedBodySize(uint64_t* aEncodedBodySize) override;
+  NS_IMETHOD GetIsAuthChannel(bool* aIsAuthChannel) override;
+  NS_IMETHOD SetChannelIsForDownload(bool aChannelIsForDownload) override;
+  NS_IMETHOD GetNavigationStartTimeStamp(TimeStamp* aTimeStamp) override;
+  NS_IMETHOD SetNavigationStartTimeStamp(TimeStamp aTimeStamp) override;
+  NS_IMETHOD GetLastTransportStatus(nsresult* aLastTransportStatus) override;
+  NS_IMETHOD SetPriority(int32_t value) override;
+  NS_IMETHOD SetClassFlags(uint32_t inFlags) override;
+  NS_IMETHOD AddClassFlags(uint32_t inFlags) override;
+  NS_IMETHOD ClearClassFlags(uint32_t inFlags) override;
+  NS_IMETHOD SetClassOfService(ClassOfService cos) override;
+  NS_IMETHOD SetIncremental(bool incremental) override;
+
+  NS_IMETHOD ResumeAt(uint64_t startPos, const nsACString& entityID) override;
+
+  NS_IMETHOD SetNotificationCallbacks(
+      nsIInterfaceRequestor* aCallbacks) override;
+  NS_IMETHOD SetLoadGroup(nsILoadGroup* aLoadGroup) override;
+  NS_IMETHOD GetDomainLookupStart(
+      mozilla::TimeStamp* aDomainLookupStart) override;
+  NS_IMETHOD GetDomainLookupEnd(mozilla::TimeStamp* aDomainLookupEnd) override;
+  NS_IMETHOD GetConnectStart(mozilla::TimeStamp* aConnectStart) override;
+  NS_IMETHOD GetTcpConnectEnd(mozilla::TimeStamp* aTcpConnectEnd) override;
+  NS_IMETHOD GetSecureConnectionStart(
+      mozilla::TimeStamp* aSecureConnectionStart) override;
+  NS_IMETHOD GetConnectEnd(mozilla::TimeStamp* aConnectEnd) override;
+  NS_IMETHOD GetRequestStart(mozilla::TimeStamp* aRequestStart) override;
+  NS_IMETHOD GetResponseStart(mozilla::TimeStamp* aResponseStart) override;
+  NS_IMETHOD GetFirstInterimResponseStart(
+      mozilla::TimeStamp* aFirstInterimResponseStart) override;
+  NS_IMETHOD GetFinalResponseHeadersStart(
+      mozilla::TimeStamp* aFinalResponseHeadersStart) override;
+  NS_IMETHOD GetResponseEnd(mozilla::TimeStamp* aResponseEnd) override;
+
+  NS_IMETHOD GetTransactionPending(
+      mozilla::TimeStamp* aTransactionPending) override;
+
+  NS_IMETHOD OnPreflightSucceeded() override;
+  NS_IMETHOD OnPreflightFailed(nsresult aError) override;
+
+  [[nodiscard]] nsresult AddSecurityMessage(
+      const nsAString& aMessageTag, const nsAString& aMessageCategory) override;
+  NS_IMETHOD LogBlockedCORSRequest(const nsAString& aMessage,
+                                   const nsACString& aCategory,
+                                   bool aIsWarning) override;
+  NS_IMETHOD LogMimeTypeMismatch(const nsACString& aMessageName, bool aWarning,
+                                 const nsAString& aURL,
+                                 const nsAString& aContentType) override;
+
+  NS_IMETHOD SetEarlyHintObserver(nsIEarlyHintObserver* aObserver) override;
+  NS_IMETHOD SetWebTransportSessionEventListener(
+      WebTransportSessionEventListener* aListener) override;
+  NS_IMETHOD SetResponseOverride(
+      nsIReplacedHttpResponse* aReplacedHttpResponse) override;
+  NS_IMETHOD SetResponseStatus(uint32_t aStatus,
+                               const nsACString& aStatusText) override;
+
+  NS_IMETHOD GetDecompressDictionary(
+      DictionaryCacheEntry** aDictionary) override;
+  NS_IMETHOD SetDecompressDictionary(
+      DictionaryCacheEntry* aDictionary) override;
+
+  void SetWarningReporter(HttpChannelSecurityWarningReporter* aReporter);
+  HttpChannelSecurityWarningReporter* GetWarningReporter();
+
+  bool DataSentToChildProcess() { return LoadDataSentToChildProcess(); }
+
+  enum class SnifferType { Media, Image };
+  void DisableIsOpaqueResponseAllowedAfterSniffCheck(SnifferType aType);
+
+  void OnOpaqueResponseAllowed() override;
+
+ public: 
+  uint32_t GetRequestTime() const { return mRequestTime; }
+  const nsACString& GetLNAPromptAction() const { return mLNAPromptAction; }
+
+  void AsyncOpenFinal(TimeStamp aTimeStamp);
+
+  [[nodiscard]] nsresult OpenCacheEntry(bool isHttps);
+  [[nodiscard]] nsresult OpenCacheEntryInternal(bool isHttps);
+  [[nodiscard]] nsresult ContinueConnect();
+
+  [[nodiscard]] nsresult StartRedirectChannelToURI(nsIURI*, uint32_t);
+  [[nodiscard]] nsresult StartRedirectChannelToURI(
+      nsIURI*, uint32_t, std::function<void(nsIChannel*)>&&);
+
+  SnifferCategoryType GetSnifferCategoryType() const {
+    return mSnifferCategoryType;
+  }
+
+  class AutoCacheWaitFlags {
+   public:
+    explicit AutoCacheWaitFlags(nsHttpChannel* channel)
+        : mChannel(channel), mKeep(0) {
+      mChannel->StoreWaitForCacheEntry(nsHttpChannel::WAIT_FOR_CACHE_ENTRY);
+    }
+
+    void Keep(uint32_t flags) {
+      mKeep |= flags;
+    }
+
+    ~AutoCacheWaitFlags() {
+      mChannel->StoreWaitForCacheEntry(mChannel->LoadWaitForCacheEntry() &
+                                       mKeep);
+    }
+
+   private:
+    nsHttpChannel* mChannel;
+    uint32_t mKeep : 1;
+  };
+
+  bool AwaitingCacheCallbacks();
+  void SetCouldBeSynthesized();
+
+  bool IsReadingFromCache() const { return mIsReadingFromCache; }
+
+  already_AddRefed<WebTransportSessionEventListener>
+  GetWebTransportSessionEventListener();
+
+ public:
+  CacheDisposition mCacheDisposition{kCacheUnresolved};
+
+ protected:
+  virtual ~nsHttpChannel();
+
+ private:
+  using nsContinueRedirectionFunc = nsresult (nsHttpChannel::*)(nsresult);
+
+  nsresult CallOrWaitForResume(
+      const std::function<nsresult(nsHttpChannel*)>& aFunc);
+
+  bool RequestIsConditional();
+  nsresult CancelInternal(nsresult status);
+
+  void MaybeResolveProxyAndBeginConnect();
+  void MaybeStartDNSPrefetch();
+
+  nsIHttpChannelInternal::ProxyDNSStrategy ComputeProxyDNSStrategy();
+
+ public:
+  NS_IMETHOD GetProxyDNSStrategy(
+      nsIHttpChannelInternal::ProxyDNSStrategy* aStrategy) override;
+
+ private:
+  void AddStorageAccessHeadersToRequest();
+  bool DispatchRelease();
+
+ public:
+  bool StorageAccessReloadedChannel();
+
+  void PrimeSuspendAfterExamineResponse();
+  void CancelSuspendOrResumeAfterExamineResponse();
+  void MaybeSuspendAfterExamineResponse();
+
+ private:
+  nsresult BeginConnect();
+  [[nodiscard]] nsresult PrepareToConnect();
+  [[nodiscard]] nsresult ContinuePrepareToConnect();
+  [[nodiscard]] nsresult OnBeforeConnect();
+  [[nodiscard]] nsresult ContinueOnBeforeConnect(
+      bool aShouldUpgrade, nsresult aStatus, bool aUpgradeWithHTTPSRR = false);
+  nsresult MaybeUseHTTPSRRForUpgrade(bool aShouldUpgrade, nsresult aStatus);
+  void OnHTTPSRRAvailable(nsIDNSHTTPSSVCRecord* aRecord);
+  [[nodiscard]] nsresult Connect();
+  void SpeculativeConnect();
+  [[nodiscard]] nsresult SetupChannelForTransaction();
+  [[nodiscard]] nsresult InitTransaction();
+  [[nodiscard]] nsresult DispatchTransaction(
+      HttpTransactionShell* aTransWithStickyConn);
+  [[nodiscard]] nsresult CallOnStartRequest();
+  [[nodiscard]] nsresult ProcessResponse(nsHttpConnectionInfo* aConnInfo);
+  void AsyncContinueProcessResponse(nsHttpConnectionInfo* aConnInfo);
+  [[nodiscard]] nsresult ContinueProcessResponse1(
+      nsHttpConnectionInfo* aConnInfo);
+  [[nodiscard]] nsresult ContinueProcessResponse2(nsresult);
+  nsresult HandleOverrideResponse();
+  nsresult OnPermissionPromptResult(bool aGranted, const nsACString& aType);
+  LNAPermission UpdateLocalNetworkAccessPermissions(
+      const nsACString& aPermissionType);
+  void MaybeUpdateDocumentIPAddressSpaceFromCache();
+  nsresult ProcessLNAActions();
+  void UpdateCurrentIpAddressSpace();
+
+ public:
+  void UpdateCacheDisposition(bool aSuccessfulReval, bool aPartialContentUsed);
+  [[nodiscard]] nsresult ContinueProcessResponse3(nsresult);
+  [[nodiscard]] nsresult ContinueProcessResponse4(nsresult);
+  [[nodiscard]] nsresult ProcessNormal();
+  [[nodiscard]] nsresult ContinueProcessNormal(nsresult);
+  [[nodiscard]] nsresult ContinueProcessNormal2(nsresult);
+  [[nodiscard]] nsresult ContinueProcessNormal3();
+  void ProcessAltService(nsHttpConnectionInfo* aTransConnInfo = nullptr);
+  bool ShouldBypassProcessNotModified();
+  [[nodiscard]] nsresult ProcessNotModified(
+      const std::function<nsresult(nsHttpChannel*, nsresult)>&
+          aContinueProcessResponseFunc);
+  [[nodiscard]] nsresult ContinueProcessResponseAfterNotModified(nsresult aRv);
+
+  [[nodiscard]] nsresult AsyncProcessRedirection(uint32_t redirectType);
+  [[nodiscard]] nsresult ContinueProcessRedirection(nsresult);
+  [[nodiscard]] nsresult ContinueProcessRedirectionAfterFallback(nsresult);
+  [[nodiscard]] nsresult ProcessFailedProxyConnect(uint32_t httpStatus);
+  void HandleAsyncAbort();
+  [[nodiscard]] nsresult EnsureAssocReq();
+  void ProcessSSLInformation();
+  bool IsHTTPS();
+
+  [[nodiscard]] nsresult ContinueOnStartRequest1(nsresult);
+  [[nodiscard]] nsresult ContinueOnStartRequest2(nsresult);
+  [[nodiscard]] nsresult ContinueOnStartRequest3(nsresult);
+
+  void OnClassOfServiceUpdated();
+
+  void HandleAsyncRedirect();
+  void HandleAsyncAPIRedirect();
+  [[nodiscard]] nsresult ContinueHandleAsyncRedirect(nsresult);
+  void HandleAsyncNotModified();
+  [[nodiscard]] nsresult PromptTempRedirect();
+  [[nodiscard]] virtual nsresult SetupReplacementChannel(
+      nsIURI*, nsIChannel*, bool preserveMethod,
+      uint32_t redirectFlags) override;
+  void HandleAsyncRedirectToUnstrippedURI();
+
+  [[nodiscard]] nsresult ProxyFailover();
+  [[nodiscard]] nsresult AsyncDoReplaceWithProxy(nsIProxyInfo*);
+  [[nodiscard]] nsresult ResolveProxy();
+
+  [[nodiscard]] nsresult OnNormalCacheEntryAvailable(nsICacheEntry* aEntry,
+                                                     bool aNew,
+                                                     nsresult aEntryStatus);
+  [[nodiscard]] nsresult OnCacheEntryAvailableInternal(nsICacheEntry* entry,
+                                                       bool aNew,
+                                                       nsresult status);
+  [[nodiscard]] nsresult GenerateCacheKey(uint32_t postID, nsACString& key);
+  [[nodiscard]] nsresult UpdateExpirationTime();
+  [[nodiscard]] nsresult CheckPartial(nsICacheEntry* aEntry, int64_t* aSize,
+                                      int64_t* aContentLength);
+  [[nodiscard]] nsresult ReadFromCache(void);
+  void CloseCacheEntry(bool doomOnFailure);
+  [[nodiscard]] nsresult InitCacheEntry();
+  void UpdateInhibitPersistentCachingFlag();
+  bool ParseDictionary(nsICacheEntry* aEntry, nsHttpResponseHead* aResponseHead,
+                       bool aModified);
+  [[nodiscard]] nsresult AddCacheEntryHeaders(nsICacheEntry* entry,
+                                              bool aModified);
+  [[nodiscard]] nsresult UpdateCacheEntryHeaders(nsICacheEntry* entry,
+                                                 const nsHttpAtom* aAtom);
+  [[nodiscard]] nsresult FinalizeCacheEntry();
+  [[nodiscard]] nsresult InstallCacheListener(int64_t offset = 0);
+  [[nodiscard]] nsresult DoInstallCacheListener(bool aSaveDecompressed,
+                                                int64_t offset = 0);
+  void MaybeInvalidateCacheEntryForSubsequentGet();
+  void AsyncOnExamineCachedResponse();
+
+  [[nodiscard]] nsresult ProcessPartialContent(
+      const std::function<nsresult(nsHttpChannel*, nsresult)>&
+          aContinueProcessResponseFunc);
+  [[nodiscard]] nsresult ContinueProcessResponseAfterPartialContent(
+      nsresult aRv);
+  [[nodiscard]] nsresult OnDoneReadingPartialCacheEntry(bool* streamDone);
+
+  [[nodiscard]] nsresult DoAuthRetry(
+      HttpTransactionShell* aTransWithStickyConn,
+      const std::function<nsresult(nsHttpChannel*, nsresult)>&
+          aContinueOnStopRequestFunc);
+  [[nodiscard]] nsresult ContinueDoAuthRetry(
+      HttpTransactionShell* aTransWithStickyConn,
+      const std::function<nsresult(nsHttpChannel*, nsresult)>&
+          aContinueOnStopRequestFunc);
+  [[nodiscard]] MOZ_NEVER_INLINE nsresult
+  DoConnect(HttpTransactionShell* aTransWithStickyConn = nullptr);
+  [[nodiscard]] nsresult DoConnectActual(
+      HttpTransactionShell* aTransWithStickyConn);
+  [[nodiscard]] nsresult ContinueOnStopRequestAfterAuthRetry(
+      nsresult aStatus, bool aAuthRetry, bool aIsFromNet, bool aContentComplete,
+      HttpTransactionShell* aTransWithStickyConn);
+  [[nodiscard]] nsresult ContinueOnStopRequest(nsresult status, bool aIsFromNet,
+                                               bool aContentComplete);
+
+  void HandleAsyncRedirectChannelToHttps();
+  [[nodiscard]] nsresult StartRedirectChannelToHttps();
+  [[nodiscard]] nsresult ContinueAsyncRedirectChannelToURI(nsresult rv);
+  [[nodiscard]] nsresult OpenRedirectChannel(nsresult rv);
+
+  HttpTrafficCategory CreateTrafficCategory();
+
+  [[nodiscard]] nsresult ProcessSecurityHeaders();
+
+  [[nodiscard]] nsresult ProcessContentSignatureHeader(
+      nsHttpResponseHead* aResponseHead);
+
+  [[nodiscard]] nsresult ProcessHSTSHeader(nsITransportSecurityInfo* aSecInfo);
+
+  [[nodiscard]] nsresult ProcessWAICTHeader();
+
+  void InvalidateCacheEntryForLocation(const char* location);
+  void AssembleCacheKey(const char* spec, uint32_t postID, nsACString& key);
+  [[nodiscard]] nsresult CreateNewURI(const char* loc, nsIURI** newURI);
+  void DoInvalidateCacheEntry(nsIURI* aURI);
+
+  inline bool HostPartIsTheSame(nsIURI* uri) {
+    nsAutoCString tmpHost1, tmpHost2;
+    return (NS_SUCCEEDED(mURI->GetAsciiHost(tmpHost1)) &&
+            NS_SUCCEEDED(uri->GetAsciiHost(tmpHost2)) &&
+            (tmpHost1 == tmpHost2));
+  }
+
+  inline static bool DoNotRender3xxBody(nsresult rv) {
+    return rv == NS_ERROR_REDIRECT_LOOP || rv == NS_ERROR_CORRUPTED_CONTENT ||
+           rv == NS_ERROR_UNKNOWN_PROTOCOL || rv == NS_ERROR_MALFORMED_URI ||
+           rv == NS_ERROR_PORT_ACCESS_NOT_ALLOWED;
+  }
+
+  void ReportSystemChannelTelemetry(nsresult status);
+
+  void UpdateAggregateCallbacks();
+
+  static bool HasQueryString(nsHttpRequestHead::ParsedMethodType method,
+                             nsIURI* uri);
+  bool ResponseWouldVary(nsICacheEntry* entry);
+  bool IsResumable(int64_t partialLen, int64_t contentLength,
+                   bool ignoreMissingPartialLen = false) const;
+  [[nodiscard]] nsresult MaybeSetupByteRangeRequest(
+      int64_t partialLen, int64_t contentLength,
+      bool ignoreMissingPartialLen = false);
+  [[nodiscard]] nsresult SetupByteRangeRequest(int64_t partialLen);
+  void UntieByteRangeRequest();
+  void UntieValidationRequest();
+  [[nodiscard]] nsresult OpenCacheInputStream(nsICacheEntry* cacheEntry,
+                                              bool startBuffering);
+
+  void SetOriginHeader();
+  void SetDoNotTrack();
+  void SetGlobalPrivacyControl();
+
+  [[nodiscard]] nsresult RedirectToInterceptedChannel();
+
+  [[nodiscard]] nsresult RedirectToNewChannelForAuthRetry();
+
+  void SetCachedContentType();
+
+  bool IsAuthRedirectedChannel() { return !!LoadAuthRedirectedChannel(); }
+
+ private:
+  nsCOMPtr<nsIHttpChannelAuthProvider> mAuthProvider;
+  nsCOMPtr<nsIURI> mRedirectURI;
+  nsCOMPtr<nsIURI> mUnstrippedRedirectURI;
+  nsCOMPtr<nsIChannel> mRedirectChannel;
+  nsCOMPtr<nsIChannel> mPreflightChannel;
+
+  RefPtr<DictionaryCacheEntry> mDictDecompress;
+  RefPtr<DictionaryCacheEntry> mDictSaving;
+
+
+  void ReEvaluateReferrerAfterTrackingStatusIsKnown();
+
+  void PerformBackgroundCacheRevalidation();
+  void PerformBackgroundCacheRevalidationNow();
+
+  void SetPriorityHeader();
+
+ private:
+  nsCOMPtr<nsICancelable> mProxyRequest;
+
+  nsCOMPtr<nsIRequest> mTransactionPump;
+  RefPtr<HttpTransactionShell> mTransaction;
+  RefPtr<HttpTransactionShell> mTransactionSticky;
+
+  uint64_t mLogicalOffset{0};
+
+  nsCOMPtr<nsICacheEntry> mCacheEntry;
+  nsCOMPtr<nsICacheEntry> mAltDataCacheEntry;
+  nsCOMPtr<nsICacheEntry> mORBValidationCacheEntry;
+
+  nsCOMPtr<nsIURI> mCacheEntryURI;
+  nsCString mCacheIdExtension;
+
+  AutoClose<nsIInputStream> mCacheInputStream;
+  RefPtr<nsInputStreamPump> mCachePump;
+  UniquePtr<nsHttpResponseHead> mCachedResponseHead;
+  nsCOMPtr<nsITransportSecurityInfo> mCachedSecurityInfo;
+  uint32_t mPostID{0};
+  uint32_t mRequestTime{0};
+  nsresult mLastTransportStatus{NS_OK};
+
+  mozilla::TimeStamp mOnStartRequestTimestamp;
+  mozilla::TimeStamp mSuspendTimestamp;
+
+  mozilla::TimeStamp mLastStatusReported;
+  bool mReportedNEL = false;
+
+  TimeDuration mSuspendTotalTime{nullptr};
+
+  friend class AutoRedirectVetoNotifier;
+  friend class HttpAsyncAborter<nsHttpChannel>;
+
+  uint32_t mRedirectType{0};
+
+  static const uint32_t WAIT_FOR_CACHE_ENTRY = 1;
+
+  bool mCacheOpenWithPriority{false};
+  uint32_t mCacheQueueSizeWhenOpen{0};
+
+  Atomic<bool> mIsAuthChannel{false};
+  Atomic<bool> mAuthRetryPending{false};
+
+  // clang-format off
+  MOZ_ATOMIC_BITFIELDS(mAtomicBitfields5, 32, (
+    (uint32_t, CachedContentIsPartial, 1),
+    (uint32_t, CacheOnlyMetadata, 1),
+    (uint32_t, TransactionReplaced, 1),
+    (uint32_t, ProxyAuthPending, 1),
+    (uint32_t, CustomAuthHeader, 1),
+    (uint32_t, Resuming, 1),
+    (uint32_t, InitedCacheEntry, 1),
+    (uint32_t, CustomConditionalRequest, 1),
+    (uint32_t, WaitingForRedirectCallback, 1),
+    (uint32_t, RequestTimeInitialized, 1),
+    (uint32_t, CacheEntryIsReadOnly, 1),
+    (uint32_t, CacheEntryIsWriteOnly, 1),
+    (uint32_t, WaitForCacheEntry, 1),
+    (uint32_t, ConcurrentCacheAccess, 1),
+    (uint32_t, IsPartialRequest, 1),
+    (uint32_t, HasAutoRedirectVetoNotifier, 1),
+    (uint32_t, PinCacheContent, 1),
+    (uint32_t, IsCorsPreflightDone, 1),
+
+    (uint32_t, StronglyFramed, 1),
+
+    (uint32_t, UsedNetwork, 1),
+
+    (uint32_t, AuthConnectionRestartable, 1),
+
+    (uint32_t, AsyncResumePending, 1),
+
+    (uint32_t, DataSentToChildProcess, 1),
+
+    (uint32_t, UseHTTPSSVC, 1),
+    (uint32_t, WaitHTTPSSVCRecord, 1)
+  ))
+
+  MOZ_ATOMIC_BITFIELDS(mAtomicBitfields6, 32, (
+    (uint32_t, NetworkWonRace, 1),
+    (uint32_t, CachedContentIsValid, 2),
+    (uint32_t, HTTPSSVCTelemetryReported, 1),
+    (uint32_t, EchConfigUsed, 1),
+    (uint32_t, AuthRedirectedChannel, 1),
+    (uint32_t, StorageAccessReloadChannel, 1)
+  ))
+  // clang-format on
+  enum CachedContentValidity : uint8_t { Unset = 0, Invalid = 1, Valid = 2 };
+
+  bool CachedContentIsValid() {
+    return LoadCachedContentIsValid() == CachedContentValidity::Valid;
+  }
+
+  nsTArray<nsContinueRedirectionFunc> mRedirectFuncStack;
+
+  RefPtr<nsDNSPrefetch> mDNSPrefetch;
+
+  bool mLocalBlocklist{false};
+
+  [[nodiscard]] nsresult WaitForRedirectCallback();
+  void PushRedirectAsyncFunc(nsContinueRedirectionFunc func);
+  void PopRedirectAsyncFunc(nsContinueRedirectionFunc func);
+
+  bool EligibleForTailing();
+
+  bool WaitingForTailUnblock();
+
+  using TailUnblockCallback = nsresult (nsHttpChannel::*)();
+  TailUnblockCallback mOnTailUnblock{nullptr};
+  nsresult AsyncOpenOnTailUnblock();
+  nsresult ConnectOnTailUnblock();
+
+  nsCString mUsername;
+
+  RefPtr<HttpChannelSecurityWarningReporter> mWarningReporter;
+
+  Atomic<bool> mIsReadingFromCache{false};
+
+  class TimerCallback final : public nsITimerCallback, public nsINamed {
+   public:
+    NS_DECL_ISUPPORTS
+    NS_DECL_NSITIMERCALLBACK
+    NS_DECL_NSINAMED
+
+    explicit TimerCallback(nsHttpChannel* aChannel);
+
+   private:
+    ~TimerCallback() = default;
+
+    RefPtr<nsHttpChannel> mChannel;
+  };
+
+  enum ResponseSource {
+    RESPONSE_PENDING = 0,      
+    RESPONSE_FROM_CACHE = 1,   
+    RESPONSE_FROM_NETWORK = 2  
+  };
+  Atomic<ResponseSource, Relaxed> mFirstResponseSource{RESPONSE_PENDING};
+
+  nsresult TriggerNetwork();
+  nsresult OnSuspendTimeout();
+  void CancelNetworkRequest(nsresult aStatus);
+
+  void MaybeStartCacheWaitTimer();
+  void CancelCacheWaitTimer();
+  nsresult OnCacheWaitTimeout();
+
+  nsresult LogConsoleError(const char* aTag);
+
+  void SetHTTPSSVCRecord(already_AddRefed<nsIDNSHTTPSSVCRecord> aRecord);
+
+  void RecordOnStartTiming();
+
+  void MaybeGenerateNELReport();
+
+  bool mNetworkTriggered = false;
+
+  nsCOMPtr<nsITimer> mSuspendTimer;
+  nsCOMPtr<nsITimer> mCacheWaitTimer;
+  bool mCacheWaitTimedOut{false};
+  Maybe<Atomic<bool>> mSuspendAfterExamineResponse;
+  Atomic<bool> mSuspendedForExamineResponse{false};
+  bool mWritingToCache = false;
+  bool mWaitingForProxy = false;
+  bool mStaleRevalidation = false;
+  bool mIsDictionaryCompressed = false;
+
+  bool mBypassCacheWriterSet{false};
+
+  TimeStamp mNavigationStartTimeStamp;
+
+  MozPromiseHolder<DNSPromise> mDNSBlockingPromise;
+  RefPtr<DNSPromise> mDNSBlockingThenable;
+
+  RefPtr<ProxyConnectResponseHead> mProxyConnectResponseHead;
+
+  Maybe<nsCOMPtr<nsIDNSHTTPSSVCRecord>> mHTTPSSVCRecord;
+
+  enum class EssentialDomainCategory {
+    SubAddonsMozillaOrg,
+    AddonsMozillaOrg,
+    Aus5MozillaOrg,
+    RemoteSettings,
+    Telemetry,
+    Other,
+  };
+
+  Maybe<EssentialDomainCategory> mEssentialDomainCategory;
+  static EssentialDomainCategory GetEssentialDomainCategory(nsCString& domain);
+
+  LNAPerms mLNAPermission{};
+
+  bool mWaitingForLNAPermission{false};
+
+  bool mUsingDictionary{false};  
+  bool mShouldSuspendForDictionary{false};
+  bool mSuspendedForDictionary{false};
+
+ protected:
+  virtual void DoNotifyListenerCleanup() override;
+
+  virtual void ReleaseListeners() override;
+
+  virtual void DoAsyncAbort(nsresult aStatus) override;
+
+ private:  
+  bool mDidReval{false};
+
+  nsCOMPtr<nsIEarlyHintObserver> mEarlyHintObserver;
+  Maybe<nsCString> mOpenerCallingScriptLocation;
+  RefPtr<WebTransportSessionEventListener> mWebTransportSessionEventListener;
+  nsMainThreadPtrHandle<nsIReplacedHttpResponse> mOverrideResponse;
+  nsCString mLNAPromptAction;
+};
+
+}  
+}  
+
+inline nsISupports* ToSupports(mozilla::net::nsHttpChannel* aChannel) {
+  return static_cast<nsIHttpChannel*>(aChannel);
+}
+
+#endif  // nsHttpChannel_h_

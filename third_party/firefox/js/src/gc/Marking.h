@@ -1,0 +1,111 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef gc_Marking_h
+#define gc_Marking_h
+
+#include "gc/Barrier.h"
+#include "gc/Tracer.h"
+#include "js/TypeDecls.h"
+
+class JSTracer;
+struct JSClass;
+
+namespace js {
+class GCMarker;
+class Shape;
+class WeakMapBase;
+
+namespace gc {
+
+class Cell;
+
+
+
+template <typename T>
+bool IsMarkedInternal(JSRuntime* rt, T* thing);
+
+template <typename T>
+bool IsAboutToBeFinalizedInternal(T* thing);
+template <typename T>
+bool IsAboutToBeFinalizedInternal(const T& thing);
+
+template <typename T>
+inline bool IsMarked(JSRuntime* rt, const BarrieredBase<T>& thing) {
+  return IsMarkedInternal(rt, *ConvertToBase(thing.unbarrieredAddress()));
+}
+template <typename T>
+inline bool IsMarkedUnbarriered(JSRuntime* rt, T thing) {
+  return IsMarkedInternal(rt, *ConvertToBase(&thing));
+}
+
+template <typename T>
+inline bool IsAboutToBeFinalized(const BarrieredBase<T>& thing) {
+  return IsAboutToBeFinalizedInternal(
+      *ConvertToBase(thing.unbarrieredAddress()));
+}
+template <typename T>
+inline bool IsAboutToBeFinalizedUnbarriered(T* thing) {
+  return IsAboutToBeFinalizedInternal(*ConvertToBase(&thing));
+}
+template <typename T>
+inline bool IsAboutToBeFinalizedUnbarriered(const T& thing) {
+  return IsAboutToBeFinalizedInternal(thing);
+}
+
+inline Cell* ToMarkable(const Value& v) {
+  if (v.isGCThing()) {
+    return (Cell*)v.toGCThing();
+  }
+  return nullptr;
+}
+
+inline Cell* ToMarkable(Cell* cell) { return cell; }
+
+bool UnmarkGrayGCThingUnchecked(GCMarker* marker, JS::GCCellPtr thing);
+
+} 
+
+namespace gc {
+
+
+template <typename T>
+inline bool IsForwarded(const T* t);
+inline bool IsForwarded(const JS::Value& value);
+
+template <typename T>
+inline T* Forwarded(const T* t);
+inline Value Forwarded(const JS::Value& value);
+
+template <typename T>
+inline T MaybeForwarded(const T& t);
+
+
+inline const JSClass* MaybeForwardedObjectClass(const JSObject* obj);
+
+template <typename T>
+inline bool MaybeForwardedObjectIs(const JSObject* obj);
+
+template <typename T>
+inline T& MaybeForwardedObjectAs(JSObject* obj);
+
+#ifdef JSGC_HASH_TABLE_CHECKS
+
+template <typename T>
+inline bool IsGCThingValidAfterMovingGC(T* t);
+
+template <typename T>
+inline void CheckGCThingAfterMovingGC(T* t);
+
+template <typename T>
+inline void CheckGCThingAfterMovingGC(const WeakHeapPtr<T*>& t);
+
+#endif  // JSGC_HASH_TABLE_CHECKS
+
+} 
+
+} 
+
+#endif /* gc_Marking_h */

@@ -1,0 +1,109 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+"use strict";
+
+
+
+
+var LIBC = ChromeUtils.getLibcConstants();
+
+const LIBC_CHOICES = ["a.out"];
+
+const unix = {
+  pid_t: ctypes.int32_t,
+
+  pollfd: new ctypes.StructType("pollfd", [
+    { fd: ctypes.int },
+    { events: ctypes.short },
+    { revents: ctypes.short },
+  ]),
+
+  WEXITSTATUS(status) {
+    return (status >> 8) & 0xff;
+  },
+
+  WTERMSIG(status) {
+    return status & 0x7f;
+  },
+};
+
+var libc = new Library("libc", LIBC_CHOICES, {
+  environ: [ctypes.char.ptr.ptr],
+
+  _NSGetEnviron: [ctypes.default_abi, ctypes.char.ptr.ptr.ptr],
+
+  setenv: [
+    ctypes.default_abi,
+    ctypes.int,
+    ctypes.char.ptr,
+    ctypes.char.ptr,
+    ctypes.int,
+  ],
+
+  chdir: [ctypes.default_abi, ctypes.int, ctypes.char.ptr ],
+
+  close: [ctypes.default_abi, ctypes.int, ctypes.int ],
+
+  dup: [ctypes.default_abi, ctypes.int, ctypes.int],
+
+  fcntl: [
+    ctypes.default_abi,
+    ctypes.int,
+    ctypes.int ,
+    ctypes.int ,
+    ctypes.int ,
+  ],
+
+  getcwd: [
+    ctypes.default_abi,
+    ctypes.char.ptr,
+    ctypes.char.ptr ,
+    ctypes.size_t ,
+  ],
+
+  kill: [
+    ctypes.default_abi,
+    ctypes.int,
+    unix.pid_t ,
+    ctypes.int ,
+  ],
+
+  pipe: [ctypes.default_abi, ctypes.int, ctypes.int.array(2) ],
+
+  poll: [
+    ctypes.default_abi,
+    ctypes.int,
+    unix.pollfd.array() ,
+    ctypes.unsigned_int ,
+    ctypes.int ,
+  ],
+
+  read: [
+    ctypes.default_abi,
+    ctypes.ssize_t,
+    ctypes.int ,
+    ctypes.char.ptr ,
+    ctypes.size_t ,
+  ],
+
+  waitpid: [
+    ctypes.default_abi,
+    unix.pid_t,
+    unix.pid_t ,
+    ctypes.int.ptr ,
+    ctypes.int ,
+  ],
+
+  write: [
+    ctypes.default_abi,
+    ctypes.ssize_t,
+    ctypes.int ,
+    ctypes.char.ptr ,
+    ctypes.size_t ,
+  ],
+});
+
+unix.Fd = function (fd) {
+  return ctypes.CDataFinalizer(ctypes.int(fd), libc.close);
+};

@@ -1,0 +1,43 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef _nsIRollupListener_h_
+#define _nsIRollupListener_h_
+
+#include "nsTArray.h"
+#include "nsPoint.h"
+#include "Units.h"
+
+class nsIContent;
+class nsIWidget;
+
+class nsIRollupListener {
+ public:
+  enum class AllowAnimations : bool { No, Yes };
+  struct RollupOptions {
+    uint32_t mCount = 0;
+    const mozilla::LayoutDeviceIntPoint* mPoint = nullptr;
+    AllowAnimations mAllowAnimations = AllowAnimations::Yes;
+  };
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  virtual bool Rollup(const RollupOptions&,
+                      nsIContent** aLastRolledUp = nullptr) = 0;
+
+  virtual bool ShouldRollupOnMouseWheelEvent() = 0;
+
+  virtual bool ShouldConsumeOnMouseWheelEvent() = 0;
+
+  virtual bool ShouldRollupOnMouseActivate() = 0;
+
+  virtual uint32_t GetSubmenuWidgetChain(
+      nsTArray<nsIWidget*>* aWidgetChain) = 0;
+
+  virtual nsIWidget* GetRollupWidget() = 0;
+
+  virtual bool RollupNativeMenu() { return false; }
+};
+
+#endif /* _nsIRollupListener_h_ */

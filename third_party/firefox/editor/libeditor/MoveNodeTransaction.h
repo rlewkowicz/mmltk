@@ -1,0 +1,191 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MoveNodeTransaction_h
+#define MoveNodeTransaction_h
+
+#include "EditTransactionBase.h"  // for EditTransactionBase, etc.
+
+#include "EditorDOMPoint.h"
+#include "EditorForwards.h"
+#include "SelectionState.h"
+
+#include "nsCOMPtr.h"  // for nsCOMPtr
+#include "nsCycleCollectionParticipant.h"
+#include "nsIContent.h"       // for nsIContent
+#include "nsISupportsImpl.h"  // for NS_DECL_ISUPPORTS_INHERITED
+
+namespace mozilla {
+
+class MoveNodeTransactionBase : public EditTransactionBase {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(MoveNodeTransactionBase,
+                                           EditTransactionBase)
+  NS_DECL_EDITTRANSACTIONBASE_GETASMETHODS_OVERRIDE(MoveNodeTransactionBase)
+
+  virtual EditorRawDOMPoint SuggestPointToPutCaret() const = 0;
+  virtual EditorRawDOMPoint SuggestNextInsertionPoint() const = 0;
+
+ protected:
+  MoveNodeTransactionBase(HTMLEditor& aHTMLEditor,
+                          nsIContent& aLastContentToMove,
+                          const EditorRawDOMPoint& aPointToInsert);
+
+  virtual ~MoveNodeTransactionBase() = default;
+
+  [[nodiscard]] EditorRawDOMPoint SuggestPointToPutCaret(
+      nsIContent* aLastMoveContent) const {
+    if (MOZ_UNLIKELY(!mContainer || !aLastMoveContent)) {
+      return EditorRawDOMPoint();
+    }
+    return EditorRawDOMPoint::After(*aLastMoveContent);
+  }
+
+  [[nodiscard]] EditorRawDOMPoint SuggestNextInsertionPoint(
+      nsIContent* aLastMoveContent) const {
+    if (MOZ_UNLIKELY(!mContainer)) {
+      return EditorRawDOMPoint();
+    }
+    if (!mReference) {
+      return EditorRawDOMPoint::AtEndOf(*aLastMoveContent);
+    }
+    if (MOZ_UNLIKELY(mReference->GetParentNode() != mContainer)) {
+      if (MOZ_LIKELY(aLastMoveContent->GetParentNode() == mContainer)) {
+        return EditorRawDOMPoint(aLastMoveContent).NextPoint();
+      }
+      return EditorRawDOMPoint::AtEndOf(mContainer);
+    }
+    return EditorRawDOMPoint(mReference);
+  }
+
+  nsCOMPtr<nsINode> mContainer;
+
+  nsCOMPtr<nsIContent> mReference;
+
+  nsCOMPtr<nsINode> mOldContainer;
+
+  nsCOMPtr<nsIContent> mOldNextSibling;
+
+  RefPtr<HTMLEditor> mHTMLEditor;
+};
+
+class MoveNodeTransaction final : public MoveNodeTransactionBase {
+ protected:
+  template <typename PT, typename CT>
+  MoveNodeTransaction(HTMLEditor& aHTMLEditor, nsIContent& aContentToMove,
+                      const EditorDOMPointBase<PT, CT>& aPointToInsert);
+
+ public:
+  template <typename PT, typename CT>
+  static already_AddRefed<MoveNodeTransaction> MaybeCreate(
+      HTMLEditor& aHTMLEditor, nsIContent& aContentToMove,
+      const EditorDOMPointBase<PT, CT>& aPointToInsert);
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(MoveNodeTransaction,
+                                           MoveNodeTransactionBase)
+
+  NS_DECL_EDITTRANSACTIONBASE
+  NS_DECL_EDITTRANSACTIONBASE_GETASMETHODS_OVERRIDE(MoveNodeTransaction)
+
+  MOZ_CAN_RUN_SCRIPT NS_IMETHOD RedoTransaction() final;
+
+  EditorRawDOMPoint SuggestPointToPutCaret() const final {
+    return MoveNodeTransactionBase::SuggestPointToPutCaret(mContentToMove);
+  }
+
+  EditorRawDOMPoint SuggestNextInsertionPoint() const final {
+    return MoveNodeTransactionBase::SuggestNextInsertionPoint(mContentToMove);
+  }
+
+  friend std::ostream& operator<<(std::ostream& aStream,
+                                  const MoveNodeTransaction& aTransaction);
+
+ protected:
+  virtual ~MoveNodeTransaction() = default;
+
+  MOZ_CAN_RUN_SCRIPT nsresult DoTransactionInternal();
+
+  nsCOMPtr<nsIContent> mContentToMove;
+};
+
+class MoveSiblingsTransaction final : public MoveNodeTransactionBase {
+ protected:
+  template <typename PT, typename CT>
+  MoveSiblingsTransaction(HTMLEditor& aHTMLEditor,
+                          nsIContent& aFirstContentToMove,
+                          nsIContent& aLastContentToMove,
+                          uint32_t aNumberOfSiblings,
+                          const EditorDOMPointBase<PT, CT>& aPointToInsert);
+
+ public:
+  template <typename PT, typename CT>
+  static already_AddRefed<MoveSiblingsTransaction> MaybeCreate(
+      HTMLEditor& aHTMLEditor, nsIContent& aFirstContentToMove,
+      nsIContent& aLastContentToMove,
+      const EditorDOMPointBase<PT, CT>& aPointToInsert);
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(MoveSiblingsTransaction,
+                                           MoveNodeTransactionBase)
+
+  NS_DECL_EDITTRANSACTIONBASE
+  NS_DECL_EDITTRANSACTIONBASE_GETASMETHODS_OVERRIDE(MoveSiblingsTransaction)
+
+  MOZ_CAN_RUN_SCRIPT NS_IMETHOD RedoTransaction() override;
+
+  EditorRawDOMPoint SuggestPointToPutCaret() const final {
+    return MoveNodeTransactionBase::SuggestPointToPutCaret(
+        GetLastMovedContent());
+  }
+
+  EditorRawDOMPoint SuggestNextInsertionPoint() const final {
+    return MoveNodeTransactionBase::SuggestNextInsertionPoint(
+        GetLastMovedContent());
+  }
+
+  const nsTArray<OwningNonNull<nsIContent>>& TargetSiblings() const {
+    return mSiblingsToMove;
+  }
+
+  [[nodiscard]] nsIContent* GetFirstMovedContent() const;
+  [[nodiscard]] nsIContent* GetLastMovedContent() const;
+
+  friend std::ostream& operator<<(std::ostream& aStream,
+                                  const MoveSiblingsTransaction& aTransaction);
+
+ protected:
+  virtual ~MoveSiblingsTransaction() = default;
+
+  MOZ_CAN_RUN_SCRIPT nsresult DoTransactionInternal();
+
+  [[nodiscard]] bool IsSiblingsToMoveValid() const {
+    for (const auto& content : mSiblingsToMove) {
+      if (MOZ_UNLIKELY(!content.isInitialized())) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  MOZ_CAN_RUN_SCRIPT void RemoveAllSiblingsToMove(
+      HTMLEditor& aHTMLEditor,
+      const nsTArray<OwningNonNull<nsIContent>>& aClonedSiblingsToMove,
+      AutoMoveNodeSelNotify& aNotifier) const;
+
+  MOZ_CAN_RUN_SCRIPT nsresult InsertAllSiblingsToMove(
+      HTMLEditor& aHTMLEditor,
+      const nsTArray<OwningNonNull<nsIContent>>& aClonedSiblingsToMove,
+      nsINode& aParentNode, nsIContent* aReferenceNode,
+      AutoMoveNodeSelNotify& aNotifier) const;
+
+  AutoTArray<OwningNonNull<nsIContent>, 2> mSiblingsToMove;
+
+  bool mDone = false;
+};
+
+}  
+
+#endif  // #ifndef MoveNodeTransaction_h

@@ -1,0 +1,118 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "CloseWatcher.h"
+
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/CloseWatcherBinding.h"
+#include "mozilla/dom/CloseWatcherManager.h"
+#include "mozilla/dom/Event.h"
+#include "mozilla/dom/EventBinding.h"
+#include "mozilla/dom/ToJSValue.h"
+#include "mozilla/dom/WindowContext.h"
+#include "nsGlobalWindowInner.h"
+
+namespace mozilla::dom {
+
+NS_IMPL_ISUPPORTS_INHERITED0(CloseWatcher, DOMEventTargetHelper)
+
+already_AddRefed<CloseWatcher> CloseWatcher::Constructor(
+    const GlobalObject& aGlobal, const CloseWatcherOptions& aOptions,
+    ErrorResult& aRv) {
+  nsCOMPtr<nsIGlobalObject> global = do_QueryInterface(aGlobal.GetAsSupports());
+  RefPtr<nsPIDOMWindowInner> window = global->GetAsInnerWindow();
+  if (!window || !window->IsFullyActive()) {
+    aRv.ThrowInvalidStateError("The document is not fully active.");
+    return nullptr;
+  }
+
+  RefPtr<CloseWatcher> watcher = new CloseWatcher(window);
+
+  AbortSignal* signal = nullptr;
+  if (aOptions.mSignal.WasPassed()) {
+    signal = &aOptions.mSignal.Value();
+  }
+  if (signal && signal->Aborted()) {
+    return watcher.forget();
+  }
+  if (signal) {
+    watcher->Follow(signal);
+  }
+
+  watcher->AddToWindowsCloseWatcherManager();
+  return watcher.forget();
+}
+
+JSObject* CloseWatcher::WrapObject(JSContext* aCx,
+                                   JS::Handle<JSObject*> aGivenProto) {
+  return CloseWatcher_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+bool CloseWatcher::RequestToClose(bool aRequireHistoryActionActivation) {
+  if (!IsActive() || mIsRunningCancelAction) {
+    return true;
+  }
+  MOZ_ASSERT(GetOwnerWindow());
+  RefPtr<WindowContext> winCtx = GetOwnerWindow()->GetWindowContext();
+  RefPtr<CloseWatcherManager> manager =
+      GetOwnerWindow()->EnsureCloseWatcherManager();
+  EventInit init;
+  init.mBubbles = false;
+  init.mCancelable =
+      !aRequireHistoryActionActivation ||
+      (manager->CanGrow() && winCtx->HasValidHistoryActivation());
+  RefPtr<Event> event = Event::Constructor(this, u"cancel"_ns, init);
+  event->SetTrusted(true);
+  mIsRunningCancelAction = true;
+  DispatchEvent(*event);
+  mIsRunningCancelAction = false;
+  if (event->DefaultPrevented()) {
+    winCtx->ConsumeHistoryActivation();
+    return false;
+  }
+  Close();
+  return true;
+}
+
+void CloseWatcher::Close() {
+  if (!IsActive()) {
+    return;
+  }
+  Destroy();
+  EventInit init;
+  init.mBubbles = false;
+  init.mCancelable = false;
+  RefPtr<Event> event = Event::Constructor(this, u"close"_ns, init);
+  event->SetTrusted(true);
+  DispatchEvent(*event);
+}
+
+void CloseWatcher::AddToWindowsCloseWatcherManager() {
+  if (auto* window = GetOwnerWindow()) {
+    window->EnsureCloseWatcherManager()->Add(*this);
+    window->NotifyCloseWatcherAdded();
+  }
+}
+
+void CloseWatcher::Destroy() {
+  if (auto* window = GetOwnerWindow()) {
+    window->EnsureCloseWatcherManager()->Remove(*this);
+    window->NotifyCloseWatcherRemoved();
+  }
+}
+
+bool CloseWatcher::IsActive() const {
+  if (!mEnabled) {
+    return false;
+  }
+  if (auto* window = GetOwnerWindow()) {
+    return window->IsFullyActive() &&
+           window->EnsureCloseWatcherManager()->Contains(*this);
+  }
+  return false;
+}
+
+void CloseWatcher::RunAbortAlgorithm() { Destroy(); }
+
+}  

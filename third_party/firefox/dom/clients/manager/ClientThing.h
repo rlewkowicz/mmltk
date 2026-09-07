@@ -1,0 +1,117 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef _mozilla_dom_ClientThing_h
+#define _mozilla_dom_ClientThing_h
+
+#include "nsTArray.h"
+
+namespace mozilla::dom {
+
+template <typename ActorType>
+class ClientThing {
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+  static const uint32_t kMagic1 = 0xC9FE2C9C;
+  static const uint32_t kMagic2 = 0x832072D4;
+#endif
+
+  ActorType* mActor;
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+  uint32_t mMagic1;
+  uint32_t mMagic2;
+#endif
+  bool mShutdown;
+
+ protected:
+  ClientThing()
+      : mActor(nullptr)
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+        ,
+        mMagic1(kMagic1),
+        mMagic2(kMagic2)
+#endif
+        ,
+        mShutdown(false) {
+  }
+
+  ~ClientThing() {
+    AssertIsValid();
+    ShutdownThing();
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+    mMagic1 = 0;
+    mMagic2 = 0;
+#endif
+  }
+
+  void AssertIsValid() const {
+    MOZ_DIAGNOSTIC_ASSERT(mMagic1 == kMagic1);
+    MOZ_DIAGNOSTIC_ASSERT(mMagic2 == kMagic2);
+  }
+
+  ActorType* GetActor() const {
+    AssertIsValid();
+    return mActor;
+  }
+
+  bool IsShutdown() const {
+    AssertIsValid();
+    return mShutdown;
+  }
+
+  template <typename Callable>
+  void MaybeExecute(
+      const Callable& aSuccess, const std::function<void()>& aFailure = [] {}) {
+    AssertIsValid();
+    if (mShutdown) {
+      aFailure();
+      return;
+    }
+    MOZ_DIAGNOSTIC_ASSERT(mActor);
+    aSuccess(mActor);
+  }
+
+  void ActivateThing(ActorType* aActor) {
+    AssertIsValid();
+    MOZ_DIAGNOSTIC_ASSERT(aActor);
+    MOZ_DIAGNOSTIC_ASSERT(!mActor);
+    MOZ_DIAGNOSTIC_ASSERT(!mShutdown);
+    mActor = aActor;
+    mActor->SetOwner(this);
+  }
+
+  void ShutdownThing() {
+    AssertIsValid();
+    if (mShutdown) {
+      return;
+    }
+    mShutdown = true;
+
+    if (mActor) {
+      mActor->RevokeOwner(this);
+      mActor->MaybeStartTeardown();
+      mActor = nullptr;
+    }
+
+    OnShutdownThing();
+  }
+
+  virtual void OnShutdownThing() {
+  }
+
+ public:
+  void RevokeActor(ActorType* aActor) {
+    AssertIsValid();
+    MOZ_DIAGNOSTIC_ASSERT(mActor);
+    MOZ_DIAGNOSTIC_ASSERT(mActor == aActor);
+    mActor->RevokeOwner(this);
+    mActor = nullptr;
+
+    mShutdown = true;
+
+    OnShutdownThing();
+  }
+};
+
+}  
+
+#endif  // _mozilla_dom_ClientThing_h

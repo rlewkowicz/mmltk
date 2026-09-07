@@ -1,0 +1,102 @@
+# syntax=docker/dockerfile:1
+
+FROM mmltk_nvidia_payload AS nvidia_payload
+FROM mmltk_onnxruntime AS onnxruntime
+FROM mmltk_ubuntu AS runtime-base
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        curl \
+        gdb \
+        python3 \
+        libpython3.12t64 \
+        procps \
+        libnuma1 \
+        numactl \
+        libgomp1 \
+        libibverbs1 \
+        librdmacm1 \
+        libarchive13t64 \
+        libcurl4t64 \
+        libdrm2 \
+        libegl1 \
+        libgbm1 \
+        libgl1 \
+        libgfortran5 \
+        libgtk-3-0t64 \
+        libssl3t64 \
+        libturbojpeg \
+        libdbus-1-3 \
+        libopenblas0-pthread \
+        libomp5-18 \
+        libopengl0 \
+        libprotobuf32t64 \
+        libva2 \
+        libvulkan1 \
+        vulkan-validationlayers \
+        zenity \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --link --from=onnxruntime /runtime/ /
+
+RUN mkdir -p /usr/lib/x86_64-linux-gnu/gbm \
+    && ln -sf /usr/lib64/gbm/nvidia-drm_gbm.so /usr/lib/x86_64-linux-gnu/gbm/nvidia-drm_gbm.so
+
+COPY --link --from=nvidia_payload /runtime/ /
+COPY docker/verify_nvidia_payload.py docker/nvidia_payload.py /usr/local/libexec/mmltk/
+
+RUN cat <<'EOF' >/usr/local/bin/mmltk-entrypoint
+#!/usr/bin/env bash
+set -euo pipefail
+
+case "${1:-mmltk}" in
+    mmltk)
+        exec "$@"
+        ;;
+    -*)
+        exec mmltk "$@"
+        ;;
+    *)
+        exec mmltk "$@"
+        ;;
+esac
+EOF
+RUN chmod 0755 /usr/local/bin/mmltk-entrypoint
+
+ARG MMLTK_CUDA_ROOT
+ARG MMLTK_PYTHON_ROOT
+ARG MMLTK_NVIDIA_LIBRARY_PATH
+ARG MMLTK_CUDA_VERSION
+ARG MMLTK_TORCH_VERSION
+ARG MMLTK_TENSORRT_VERSION
+ENV PATH=/opt/mmltk/bin:${PATH} \
+    PYTHONPATH=${MMLTK_PYTHON_ROOT} \
+    PYTHONDONTWRITEBYTECODE=1 \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics,display,video \
+    LD_LIBRARY_PATH=/opt/gcc-16.2/lib64:/opt/mmltk/lib:/opt/onnxruntime/lib:${MMLTK_NVIDIA_LIBRARY_PATH}
+RUN ldconfig \
+    && python3 /usr/local/libexec/mmltk/verify_nvidia_payload.py --mode runtime
+
+WORKDIR /opt/mmltk
+ENTRYPOINT ["mmltk-entrypoint"]
+CMD ["mmltk"]
+
+ARG MMLTK_IMAGE_FINGERPRINT=unlabeled
+ARG MMLTK_NVIDIA_PAYLOAD_IDENTITY=unknown
+ARG MMLTK_ONNXRUNTIME_IDENTITY=unknown
+ARG MMLTK_NVIDIA_DONOR_IMAGE
+ARG MMLTK_UBUNTU_IDENTITY=unknown
+LABEL com.mmltk.input-fingerprint="${MMLTK_IMAGE_FINGERPRINT}" \
+      com.mmltk.onnxruntime-identity="${MMLTK_ONNXRUNTIME_IDENTITY}" \
+      com.mmltk.nvidia-payload-identity="${MMLTK_NVIDIA_PAYLOAD_IDENTITY}" \
+      com.mmltk.nvidia-donor="${MMLTK_NVIDIA_DONOR_IMAGE}" \
+      com.mmltk.ubuntu-identity="${MMLTK_UBUNTU_IDENTITY}" \
+      com.mmltk.payload-mode="runtime" \
+      com.mmltk.cuda-version="${MMLTK_CUDA_VERSION}" \
+      com.mmltk.torch-version="${MMLTK_TORCH_VERSION}" \
+      com.mmltk.tensorrt-version="${MMLTK_TENSORRT_VERSION}"

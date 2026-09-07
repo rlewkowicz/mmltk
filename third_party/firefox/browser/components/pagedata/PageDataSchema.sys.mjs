@@ -1,0 +1,171 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+const lazy = {};
+
+ChromeUtils.defineESModuleGetters(lazy, {
+  JsonSchemaValidator:
+    "resource://gre/modules/components-utils/JsonSchemaValidator.sys.mjs",
+  OpenGraphPageData:
+    "moz-src:///browser/components/pagedata/OpenGraphPageData.sys.mjs",
+  SchemaOrgPageData:
+    "moz-src:///browser/components/pagedata/SchemaOrgPageData.sys.mjs",
+  TwitterPageData:
+    "moz-src:///browser/components/pagedata/TwitterPageData.sys.mjs",
+});
+
+ChromeUtils.defineLazyGetter(lazy, "logConsole", function () {
+  return console.createInstance({
+    prefix: "PageData",
+    maxLogLevel: Services.prefs.getBoolPref("browser.pagedata.log", false)
+      ? "Debug"
+      : "Warn",
+  });
+});
+
+ChromeUtils.defineLazyGetter(lazy, "DATA_COLLECTORS", function () {
+  return [lazy.SchemaOrgPageData, lazy.OpenGraphPageData, lazy.TwitterPageData];
+});
+
+let SCHEMAS = new Map();
+
+async function loadSchema(schemaName) {
+  if (SCHEMAS.has(schemaName)) {
+    return SCHEMAS.get(schemaName);
+  }
+
+  let url = `chrome://browser/content/pagedata/schemas/${schemaName.toLocaleLowerCase()}.schema.json`;
+  let response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Failed to load schema: ${response.statusText}`);
+  }
+
+  let schema = await response.json();
+  SCHEMAS.set(schemaName, schema);
+  return schema;
+}
+
+async function validateData(schemaName, data) {
+  let schema = await loadSchema(schemaName.toLocaleLowerCase());
+
+  let result = lazy.JsonSchemaValidator.validate(data, schema, {
+    allowExplicitUndefinedProperties: true,
+    allowAdditionalProperties: true,
+  });
+
+  if (!result.valid) {
+    throw result.error;
+  }
+}
+
+export const PageDataSchema = {
+  DATA_TYPE: Object.freeze({
+    PRODUCT: 3,
+    DOCUMENT: 4,
+    ARTICLE: 5,
+    AUDIO: 6,
+    VIDEO: 7,
+  }),
+
+  nameForType(type) {
+    for (let [name, value] of Object.entries(this.DATA_TYPE)) {
+      if (value == type) {
+        return name;
+      }
+    }
+
+    return null;
+  },
+
+  async validateData(type, data) {
+    let name = this.nameForType(type);
+
+    if (!name) {
+      throw new Error(`Unknown data type ${type}`);
+    }
+
+    await validateData(name, data);
+  },
+
+  async validatePageData(pageData) {
+    let { data: dataMap = {}, ...general } = pageData;
+
+    await validateData("general", general);
+
+    let validData = {};
+
+    for (let [type, data] of Object.entries(dataMap)) {
+      let name = this.nameForType(type);
+      if (!name) {
+        continue;
+      }
+
+      try {
+        await validateData(name, data);
+
+        validData[type] = data;
+      } catch (e) {
+      }
+    }
+
+    return {
+      ...general,
+      data: validData,
+    };
+  },
+
+  coalescePageData(existingPageData, newPageData) {
+    let { data: existingMap = {}, ...existingGeneral } = existingPageData;
+    let { data: newMap = {}, ...newGeneral } = newPageData;
+
+    Object.assign(newGeneral, existingGeneral);
+
+    let dataMap = {};
+    for (let [type, data] of Object.entries(existingMap)) {
+      if (type in newMap) {
+        dataMap[type] = Object.assign({}, newMap[type], data);
+      } else {
+        dataMap[type] = data;
+      }
+    }
+
+    for (let [type, data] of Object.entries(newMap)) {
+      if (!(type in dataMap)) {
+        dataMap[type] = data;
+      }
+    }
+
+    return {
+      ...newGeneral,
+      data: dataMap,
+    };
+  },
+
+  async collectPageData(document) {
+    lazy.logConsole.debug("Starting collection", document.documentURI);
+
+    let pending = lazy.DATA_COLLECTORS.map(async collector => {
+      try {
+        return await collector.collect(document);
+      } catch (e) {
+        lazy.logConsole.error("Error collecting page data", e);
+        return null;
+      }
+    });
+
+    let pageDataList = await Promise.all(pending);
+
+    let pageData = pageDataList.reduce(PageDataSchema.coalescePageData, {
+      date: Date.now(),
+      url: document.documentURI,
+    });
+
+    try {
+      return this.validatePageData(pageData);
+    } catch (e) {
+      lazy.logConsole.error("Failed to collect valid page data", e);
+      return null;
+    }
+  },
+};

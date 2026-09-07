@@ -1,0 +1,211 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_AtomicOperations_h
+#define jit_AtomicOperations_h
+
+#include <string.h>
+
+#include "jit/AtomicOperationsGenerated.h"
+#include "vm/SharedMem.h"
+
+namespace js {
+namespace jit {
+
+class AtomicOperations {
+
+  template <typename T>
+  static inline T loadSeqCst(T* addr);
+
+  template <typename T>
+  static inline void storeSeqCst(T* addr, T val);
+
+  template <typename T>
+  static inline T exchangeSeqCst(T* addr, T val);
+
+  template <typename T>
+  static inline T compareExchangeSeqCst(T* addr, T oldval, T newval);
+
+  template <typename T>
+  static inline T fetchAddSeqCst(T* addr, T val);
+
+  template <typename T>
+  static inline T fetchSubSeqCst(T* addr, T val);
+
+  template <typename T>
+  static inline T fetchAndSeqCst(T* addr, T val);
+
+  template <typename T>
+  static inline T fetchOrSeqCst(T* addr, T val);
+
+  template <typename T>
+  static inline T fetchXorSeqCst(T* addr, T val);
+
+
+  template <typename T>
+  static inline T loadSafeWhenRacy(T* addr);
+
+  template <typename T>
+  static inline void storeSafeWhenRacy(T* addr, T val);
+
+  static inline void memcpySafeWhenRacy(void* dest, const void* src,
+                                        size_t nbytes);
+
+  static inline void memmoveSafeWhenRacy(void* dest, const void* src,
+                                         size_t nbytes);
+
+ public:
+  static constexpr inline bool isLockfreeJS(int32_t n);
+
+  static inline bool hasAtomic8();
+
+  static inline bool isLockfree8();
+
+  static inline void fenceSeqCst();
+
+  static inline void pause();
+
+
+  template <typename T>
+  static T loadSeqCst(SharedMem<T*> addr) {
+    return loadSeqCst(addr.unwrap());
+  }
+
+  template <typename T>
+  static void storeSeqCst(SharedMem<T*> addr, T val) {
+    return storeSeqCst(addr.unwrap(), val);
+  }
+
+  template <typename T>
+  static T exchangeSeqCst(SharedMem<T*> addr, T val) {
+    return exchangeSeqCst(addr.unwrap(), val);
+  }
+
+  template <typename T>
+  static T compareExchangeSeqCst(SharedMem<T*> addr, T oldval, T newval) {
+    return compareExchangeSeqCst(addr.unwrap(), oldval, newval);
+  }
+
+  template <typename T>
+  static T fetchAddSeqCst(SharedMem<T*> addr, T val) {
+    return fetchAddSeqCst(addr.unwrap(), val);
+  }
+
+  template <typename T>
+  static T fetchSubSeqCst(SharedMem<T*> addr, T val) {
+    return fetchSubSeqCst(addr.unwrap(), val);
+  }
+
+  template <typename T>
+  static T fetchAndSeqCst(SharedMem<T*> addr, T val) {
+    return fetchAndSeqCst(addr.unwrap(), val);
+  }
+
+  template <typename T>
+  static T fetchOrSeqCst(SharedMem<T*> addr, T val) {
+    return fetchOrSeqCst(addr.unwrap(), val);
+  }
+
+  template <typename T>
+  static T fetchXorSeqCst(SharedMem<T*> addr, T val) {
+    return fetchXorSeqCst(addr.unwrap(), val);
+  }
+
+  template <typename T>
+  static T loadSafeWhenRacy(SharedMem<T*> addr) {
+    return loadSafeWhenRacy(addr.unwrap());
+  }
+
+  template <typename T>
+  static void storeSafeWhenRacy(SharedMem<T*> addr, T val) {
+    return storeSafeWhenRacy(addr.unwrap(), val);
+  }
+
+  template <typename T>
+  static void memcpySafeWhenRacy(SharedMem<T*> dest, SharedMem<T*> src,
+                                 size_t nbytes) {
+    memcpySafeWhenRacy(dest.template cast<void*>().unwrap(),
+                       src.template cast<void*>().unwrap(), nbytes);
+  }
+
+  template <typename T>
+  static void memcpySafeWhenRacy(SharedMem<T*> dest, T* src, size_t nbytes) {
+    memcpySafeWhenRacy(dest.template cast<void*>().unwrap(),
+                       static_cast<void*>(src), nbytes);
+  }
+
+  template <typename T>
+  static void memcpySafeWhenRacy(T* dest, SharedMem<T*> src, size_t nbytes) {
+    memcpySafeWhenRacy(static_cast<void*>(dest),
+                       src.template cast<void*>().unwrap(), nbytes);
+  }
+
+  template <typename T>
+  static void memmoveSafeWhenRacy(SharedMem<T*> dest, SharedMem<T*> src,
+                                  size_t nbytes) {
+    memmoveSafeWhenRacy(dest.template cast<void*>().unwrap(),
+                        src.template cast<void*>().unwrap(), nbytes);
+  }
+
+  static void memsetSafeWhenRacy(SharedMem<uint8_t*> dest, int value,
+                                 size_t nbytes) {
+    uint8_t buf[1024];
+    size_t iterations = nbytes / sizeof(buf);
+    size_t tail = nbytes % sizeof(buf);
+    size_t offs = 0;
+    if (iterations > 0) {
+      memset(buf, value, sizeof(buf));
+      while (iterations--) {
+        memcpySafeWhenRacy(dest + offs, SharedMem<uint8_t*>::unshared(buf),
+                           sizeof(buf));
+        offs += sizeof(buf);
+      }
+    } else {
+      memset(buf, value, tail);
+    }
+    memcpySafeWhenRacy(dest + offs, SharedMem<uint8_t*>::unshared(buf), tail);
+  }
+
+  template <typename T>
+  static void podCopySafeWhenRacy(SharedMem<T*> dest, SharedMem<T*> src,
+                                  size_t nelem) {
+    memcpySafeWhenRacy(dest, src, nelem * sizeof(T));
+  }
+
+  template <typename T>
+  static void podMoveSafeWhenRacy(SharedMem<T*> dest, SharedMem<T*> src,
+                                  size_t nelem) {
+    memmoveSafeWhenRacy(dest, src, nelem * sizeof(T));
+  }
+};
+
+constexpr inline bool AtomicOperations::isLockfreeJS(int32_t size) {
+
+  switch (size) {
+    case 1:
+      return true;
+    case 2:
+      return true;
+    case 4:
+      return true;
+    case 8:
+      return true;
+    default:
+      return false;
+  }
+}
+
+}  
+}  
+
+
+#ifdef JS_HAVE_GENERATED_ATOMIC_OPS
+#  include "jit/shared/AtomicOperations-shared-jit.h"
+#elif defined(__mips__)
+#  include "jit/mips-shared/AtomicOperations-mips-shared.h"
+#else
+#  include "jit/shared/AtomicOperations-feeling-lucky.h"
+#endif
+
+#endif  // jit_AtomicOperations_h

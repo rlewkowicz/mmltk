@@ -1,0 +1,155 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+const ECDH_PARAMS = {
+  name: "ECDH",
+  namedCurve: "P-256",
+};
+const AES_PARAMS = {
+  name: "AES-GCM",
+  length: 256,
+};
+const AES_TAG_LEN = 128;
+const AES_GCM_IV_SIZE = 12;
+const UTF8_ENCODER = new TextEncoder();
+const UTF8_DECODER = new TextDecoder();
+
+class JWCrypto {
+  async generateJWE(key, data) {
+    const epk = await crypto.subtle.generateKey(ECDH_PARAMS, true, [
+      "deriveKey",
+    ]);
+    const ownPublicJWK = await crypto.subtle.exportKey("jwk", epk.publicKey);
+    delete ownPublicJWK.key_ops;
+    delete ownPublicJWK.ext;
+    let header = { alg: "ECDH-ES", enc: "A256GCM", epk: ownPublicJWK };
+    const peerPublicKey = await crypto.subtle.importKey(
+      "jwk",
+      key,
+      ECDH_PARAMS,
+      false,
+      []
+    );
+    if (key.hasOwnProperty("kid")) {
+      header.kid = key.kid;
+    }
+    const contentKey = await deriveECDHSharedAESKey(
+      epk.privateKey,
+      peerPublicKey,
+      ["encrypt"]
+    );
+    let iv = crypto.getRandomValues(new Uint8Array(AES_GCM_IV_SIZE));
+    const additionalData = UTF8_ENCODER.encode(
+      ChromeUtils.base64URLEncode(UTF8_ENCODER.encode(JSON.stringify(header)), {
+        pad: false,
+      })
+    );
+    const encrypted = await crypto.subtle.encrypt(
+      {
+        name: "AES-GCM",
+        iv,
+        additionalData,
+        tagLength: AES_TAG_LEN,
+      },
+      contentKey,
+      data
+    );
+    const tagIdx = encrypted.byteLength - ((AES_TAG_LEN + 7) >> 3);
+    let ciphertext = encrypted.slice(0, tagIdx);
+    let tag = encrypted.slice(tagIdx);
+    header = UTF8_ENCODER.encode(JSON.stringify(header));
+    header = ChromeUtils.base64URLEncode(header, { pad: false });
+    tag = ChromeUtils.base64URLEncode(tag, { pad: false });
+    ciphertext = ChromeUtils.base64URLEncode(ciphertext, { pad: false });
+    iv = ChromeUtils.base64URLEncode(iv, { pad: false });
+    return `${header}..${iv}.${ciphertext}.${tag}`; 
+  }
+
+  async decryptJWE(jwe, key) {
+    let [header, cek, iv, ciphertext, authTag] = jwe.split(".");
+    const additionalData = UTF8_ENCODER.encode(header);
+    header = JSON.parse(
+      UTF8_DECODER.decode(
+        ChromeUtils.base64URLDecode(header, { padding: "reject" })
+      )
+    );
+    if (!!cek.length || header.enc !== "A256GCM" || header.alg !== "ECDH-ES") {
+      throw new Error("Unknown algorithm.");
+    }
+    if ("apu" in header || "apv" in header) {
+      throw new Error("apu and apv header values are not supported.");
+    }
+    const peerPublicKey = await crypto.subtle.importKey(
+      "jwk",
+      header.epk,
+      ECDH_PARAMS,
+      false,
+      []
+    );
+    const contentKey = await deriveECDHSharedAESKey(key, peerPublicKey, [
+      "decrypt",
+    ]);
+    iv = ChromeUtils.base64URLDecode(iv, { padding: "reject" });
+    ciphertext = new Uint8Array(
+      ChromeUtils.base64URLDecode(ciphertext, { padding: "reject" })
+    );
+    authTag = new Uint8Array(
+      ChromeUtils.base64URLDecode(authTag, { padding: "reject" })
+    );
+    const bundle = new Uint8Array([...ciphertext, ...authTag]);
+
+    const decrypted = await crypto.subtle.decrypt(
+      {
+        name: "AES-GCM",
+        iv,
+        tagLength: AES_TAG_LEN,
+        additionalData,
+      },
+      contentKey,
+      bundle
+    );
+    return new Uint8Array(decrypted);
+  }
+}
+
+async function deriveECDHSharedAESKey(privateKey, publicKey, keyUsages) {
+  const params = { ...ECDH_PARAMS, ...{ public: publicKey } };
+  const sharedKey = await crypto.subtle.deriveKey(
+    params,
+    privateKey,
+    AES_PARAMS,
+    true,
+    keyUsages
+  );
+  let sharedKeyBytes = await crypto.subtle.exportKey("raw", sharedKey);
+  sharedKeyBytes = new Uint8Array(sharedKeyBytes);
+  const info = [
+    "\x00\x00\x00\x07A256GCM", 
+    "\x00\x00\x00\x00", 
+    "\x00\x00\x00\x00", 
+    "\x00\x00\x01\x00", 
+  ].join("");
+  const pkcs = `\x00\x00\x00\x01${String.fromCharCode.apply(
+    null,
+    sharedKeyBytes
+  )}${info}`;
+  const pkcsBuf = Uint8Array.from(
+    Array.prototype.map.call(pkcs, c => c.charCodeAt(0))
+  );
+  const derivedKeyBytes = await crypto.subtle.digest(
+    {
+      name: "SHA-256",
+    },
+    pkcsBuf
+  );
+  return crypto.subtle.importKey(
+    "raw",
+    derivedKeyBytes,
+    AES_PARAMS,
+    false,
+    keyUsages
+  );
+}
+
+export const jwcrypto = new JWCrypto();

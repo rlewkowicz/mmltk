@@ -1,0 +1,569 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+"use strict";
+
+{
+  MozElements.NotificationBox = class NotificationBox {
+    constructor(insertElementFn, securityDelayMS = 0) {
+      this._insertElementFn = insertElementFn;
+      this._securityDelayMS = securityDelayMS;
+      this._animating = false;
+      this.currentNotification = null;
+    }
+
+    get stack() {
+      if (!this._stack) {
+        let stack = document.createXULElement("vbox");
+        stack._notificationBox = this;
+        stack.className = "notificationbox-stack";
+        stack.addEventListener("transitionend", event => {
+          if (
+            event.target.localName == "notification-message" &&
+            event.propertyName == "margin-top"
+          ) {
+            this._finishAnimation();
+          }
+        });
+        this._stack = stack;
+        this._insertElementFn(stack);
+      }
+      return this._stack;
+    }
+
+    get _allowAnimation() {
+      return window.matchMedia("(prefers-reduced-motion: no-preference)")
+        .matches;
+    }
+
+    get allNotifications() {
+      if (!this._stack) {
+        return [];
+      }
+
+      var closedNotification = this._closedNotification;
+      var notifications = [
+        ...this.stack.getElementsByTagName("notification-message"),
+      ];
+      return notifications.filter(n => n != closedNotification);
+    }
+
+    getNotificationWithValue(aValue) {
+      var notifications = this.allNotifications;
+      for (var n = notifications.length - 1; n >= 0; n--) {
+        if (aValue == notifications[n].getAttribute("value")) {
+          return notifications[n];
+        }
+      }
+      return null;
+    }
+
+    async appendNotification(
+      aType,
+      aNotification,
+      aButtons,
+      aDisableClickJackingDelay = false,
+      dismissable = true
+    ) {
+      if (
+        aNotification.priority < this.PRIORITY_SYSTEM ||
+        aNotification.priority > this.PRIORITY_CRITICAL_HIGH
+      ) {
+        throw new Error(
+          "Invalid notification priority " + aNotification.priority
+        );
+      }
+
+      MozXULElement.insertFTLIfNeeded("toolkit/global/notification.ftl");
+
+      let newitem;
+      if (!customElements.get("notification-message")) {
+        try {
+          await createNotificationMessageElement(dismissable);
+        } catch (err) {
+          console.warn(err);
+          throw err;
+        }
+      }
+      newitem = document.createElement("notification-message");
+      newitem.dismissable = dismissable;
+      newitem.setAttribute("message-bar-type", "infobar");
+
+      if (this.stack.hasAttribute("prepend-notifications")) {
+        this.stack.prepend(newitem);
+      } else {
+        this.stack.append(newitem);
+      }
+
+      if (aNotification.label) {
+        newitem.label = aNotification.label;
+      } else if (newitem.messageText) {
+        if (
+          aNotification.label &&
+          typeof aNotification.label == "object" &&
+          aNotification.label.nodeType &&
+          aNotification.label.nodeType ==
+            aNotification.label.DOCUMENT_FRAGMENT_NODE
+        ) {
+          newitem.messageText.appendChild(aNotification.label);
+        } else if (
+          aNotification.label &&
+          typeof aNotification.label == "object" &&
+          "l10n-id" in aNotification.label
+        ) {
+          let message = document.createElement("span");
+          document.l10n.setAttributes(
+            message,
+            aNotification.label["l10n-id"],
+            aNotification.label["l10n-args"]
+          );
+          newitem.messageText.appendChild(message);
+        } else {
+          newitem.messageText.textContent = aNotification.label;
+        }
+      }
+      newitem.setAttribute("value", aType);
+
+      newitem.eventCallback = aNotification.eventCallback;
+
+      if (aButtons) {
+        newitem.setButtons(aButtons);
+      }
+
+      newitem.priority = aNotification.priority;
+      if (aNotification.priority == this.PRIORITY_SYSTEM) {
+        newitem.setAttribute("type", "system");
+      } else if (aNotification.priority >= this.PRIORITY_CRITICAL_LOW) {
+        newitem.setAttribute("type", "critical");
+      } else if (aNotification.priority <= this.PRIORITY_INFO_HIGH) {
+        newitem.setAttribute("type", "info");
+      } else {
+        newitem.setAttribute("type", "warning");
+      }
+
+      const CONFIGURABLE_NOTIFICATION_STYLES = [
+        "background-color",
+        "font-size",
+      ];
+
+      const CONFIGURED_STYLES = aNotification.style || {};
+      for (let prop of Object.keys(CONFIGURED_STYLES)) {
+        if (!CONFIGURABLE_NOTIFICATION_STYLES.includes(prop)) {
+          continue;
+        }
+
+        if (prop === "background-color") {
+          newitem.style.setProperty(
+            "--info-bar-background-color-configurable",
+            aNotification.style["background-color"]
+          );
+        } else {
+          newitem.style[prop] = aNotification.style[prop];
+        }
+      }
+
+      if (!aDisableClickJackingDelay && this._securityDelayMS > 0) {
+        newitem._initClickJackingProtection(this._securityDelayMS);
+      }
+
+      newitem.style.display = "block";
+      newitem.style.position = "fixed";
+      newitem.style.top = "100%";
+      newitem.style.marginTop = "-15px";
+      newitem.style.opacity = "0";
+
+      await newitem.updateComplete;
+
+      if (aNotification.label?.["l10n-id"] && newitem.shadowRoot) {
+        await document.l10n.translateFragment(newitem.shadowRoot);
+        newitem.setAlertRole();
+      }
+
+      this._showNotification(newitem, true);
+
+      var event = document.createEvent("Events");
+      event.initEvent("AlertActive", true, true);
+      newitem.dispatchEvent(event);
+
+      return newitem;
+    }
+
+    removeNotification(aItem, aSkipAnimation) {
+      if (!aItem.parentNode) {
+        return;
+      }
+      this.currentNotification = aItem;
+      this.removeCurrentNotification(aSkipAnimation);
+    }
+
+    _removeNotificationElement(aChild) {
+      let hadFocus = aChild.matches(":focus-within");
+
+      if (aChild.eventCallback) {
+        aChild.eventCallback("removed");
+      }
+      aChild.remove();
+
+      if (hadFocus) {
+        Services.focus.moveFocus(
+          window,
+          this.stack,
+          Services.focus.MOVEFOCUS_FORWARD,
+          0
+        );
+      }
+    }
+
+    removeCurrentNotification(aSkipAnimation) {
+      this._showNotification(this.currentNotification, false, aSkipAnimation);
+    }
+
+    removeAllNotifications(aImmediate) {
+      var notifications = this.allNotifications;
+      for (var n = notifications.length - 1; n >= 0; n--) {
+        if (aImmediate) {
+          this._removeNotificationElement(notifications[n]);
+        } else {
+          this.removeNotification(notifications[n]);
+        }
+      }
+      this.currentNotification = null;
+
+      if (aImmediate || !this._allowAnimation) {
+        this._finishAnimation();
+      }
+    }
+
+    removeTransientNotifications() {
+      var notifications = this.allNotifications;
+      for (var n = notifications.length - 1; n >= 0; n--) {
+        var notification = notifications[n];
+        if (notification.persistence) {
+          notification.persistence--;
+        } else if (Date.now() > notification.timeout) {
+          this.removeNotification(notification, true);
+        }
+      }
+    }
+
+    _showNotification(aNotification, aSlideIn, aSkipAnimation) {
+      this._finishAnimation();
+
+      let { marginTop, marginBottom } = getComputedStyle(aNotification);
+      let baseHeight = aNotification.getBoundingClientRect().height;
+      var height =
+        baseHeight + parseInt(marginTop, 10) + parseInt(marginBottom, 10);
+      var skipAnimation =
+        aSkipAnimation || baseHeight == 0 || !this._allowAnimation;
+      aNotification.classList.toggle("animated", !skipAnimation);
+
+      if (aSlideIn) {
+        this.currentNotification = aNotification;
+        aNotification.style.removeProperty("display");
+        aNotification.style.removeProperty("position");
+        aNotification.style.removeProperty("top");
+        aNotification.style.removeProperty("margin-top");
+        aNotification.style.removeProperty("opacity");
+
+        if (skipAnimation) {
+          return;
+        }
+      } else {
+        this._closedNotification = aNotification;
+        var notifications = this.allNotifications;
+        var idx = notifications.length - 1;
+        this.currentNotification = idx >= 0 ? notifications[idx] : null;
+
+        if (skipAnimation) {
+          this._removeNotificationElement(this._closedNotification);
+          delete this._closedNotification;
+          return;
+        }
+
+        aNotification.style.marginTop = -height + "px";
+        aNotification.style.opacity = 0;
+      }
+
+      this._animating = true;
+    }
+
+    _finishAnimation() {
+      if (this._animating) {
+        this._animating = false;
+        if (this._closedNotification) {
+          this._removeNotificationElement(this._closedNotification);
+          delete this._closedNotification;
+        }
+      }
+    }
+  };
+
+  Object.assign(MozElements.NotificationBox.prototype, {
+    PRIORITY_SYSTEM: 0,
+    PRIORITY_INFO_LOW: 1,
+    PRIORITY_INFO_MEDIUM: 2,
+    PRIORITY_INFO_HIGH: 3,
+    PRIORITY_WARNING_LOW: 4,
+    PRIORITY_WARNING_MEDIUM: 5,
+    PRIORITY_WARNING_HIGH: 6,
+    PRIORITY_CRITICAL_LOW: 7,
+    PRIORITY_CRITICAL_MEDIUM: 8,
+    PRIORITY_CRITICAL_HIGH: 9,
+  });
+
+  async function createNotificationMessageElement(dismissable) {
+    document.createElement("moz-message-bar");
+    let MozMessageBar = await customElements.whenDefined("moz-message-bar");
+    class NotificationMessage extends MozMessageBar {
+      static queries = {
+        ...MozMessageBar.queries,
+        messageText: ".message",
+        messageImage: ".icon",
+      };
+
+      constructor() {
+        super();
+        this.persistence = 0;
+        this.priority = 0;
+        this.timeout = 0;
+        this.dismissable = dismissable;
+
+        this._clickjackingDelayActive = false;
+        this._securityDelayMS = 0;
+        this._delayTimer = null;
+        this._focusHandler = null;
+        this._buttons = [];
+
+        this.addEventListener("click", this);
+        this.addEventListener("command", this);
+      }
+
+      connectedCallback() {
+        super.connectedCallback();
+        this.#setStyles();
+
+        this.classList.add("infobar");
+        this.setAlertRole();
+
+        this.buttonContainer = document.createElement("span");
+        this.buttonContainer.classList.add("notification-button-container");
+        this.buttonContainer.setAttribute("slot", "actions");
+        this.appendChild(this.buttonContainer);
+      }
+
+      disconnectedCallback() {
+        super.disconnectedCallback();
+        if (this.eventCallback) {
+          this.eventCallback("disconnected");
+        }
+        this._uninitClickJackingProtection();
+      }
+
+      closeButtonTemplate() {
+        return super.closeButtonTemplate({ size: "small" });
+      }
+
+      #setStyles() {
+        let style = document.createElement("link");
+        style.rel = "stylesheet";
+        style.href = "chrome://global/content/elements/infobar.css";
+        this.renderRoot.append(style);
+      }
+
+      get control() {
+        return this.closest(".notificationbox-stack")._notificationBox;
+      }
+
+      close() {
+        if (!this.parentNode) {
+          return;
+        }
+        this.control.removeNotification(this);
+      }
+
+      setAlertRole() {
+        this.removeAttribute("role");
+        window.requestAnimationFrame(() => {
+          window.requestAnimationFrame(() => {
+            this.setAttribute("role", "alert");
+          });
+        });
+      }
+
+      handleEvent(e) {
+        if (this._clickjackingDelayActive) {
+          if (
+            e.type === "click" &&
+            (e.target.localName === "button" ||
+              e.target.classList.contains("text-link") ||
+              e.target.classList.contains("notification-link"))
+          ) {
+            e.stopPropagation();
+            e.preventDefault();
+            this._startClickJackingDelay();
+            return;
+          }
+        }
+
+        if (e.type == "click" && e.target.localName != "label") {
+          return;
+        }
+
+        if ("buttonInfo" in e.target) {
+          let { buttonInfo } = e.target;
+          let { callback, popup } = buttonInfo;
+
+          if (popup) {
+            document
+              .getElementById(popup)
+              .openPopup(
+                e.originalTarget,
+                "after_start",
+                0,
+                0,
+                false,
+                false,
+                e
+              );
+            e.stopPropagation();
+          } else if (callback) {
+            if (!callback(this, buttonInfo, e.target, e)) {
+              this.close();
+            }
+            e.stopPropagation();
+          }
+        }
+      }
+
+      set label(value) {
+        if (value && typeof value == "object" && "l10n-id" in value) {
+          this.messageL10nId = value["l10n-id"];
+          this.messageL10nArgs = value["l10n-args"];
+        } else {
+          this.message = value;
+          this.setAlertRole();
+        }
+      }
+
+      setButtons(buttons) {
+        this._buttons = [];
+        for (let button of buttons) {
+          let link = button.link || button.supportPage;
+          let localeId = button["l10n-id"];
+
+          let buttonElem;
+          if (button.hasOwnProperty("supportPage")) {
+            buttonElem = document.createElement("a", {
+              is: "moz-support-link",
+            });
+            buttonElem.classList.add("notification-link");
+            buttonElem.setAttribute("support-page", button.supportPage);
+          } else if (link) {
+            buttonElem = document.createXULElement("label", {
+              is: "text-link",
+            });
+            buttonElem.setAttribute("href", link);
+            buttonElem.classList.add("notification-link", "text-link");
+          } else {
+            buttonElem = document.createXULElement(
+              "button",
+              button.is ? { is: button.is } : {}
+            );
+            buttonElem.classList.add(
+              "notification-button",
+              "small-button",
+              "footer-button"
+            );
+
+            if (button.primary) {
+              buttonElem.classList.add("primary");
+            }
+          }
+
+          if (localeId) {
+            document.l10n.setAttributes(buttonElem, localeId);
+          } else {
+            buttonElem.setAttribute(link ? "value" : "label", button.label);
+            if (typeof button.accessKey == "string") {
+              buttonElem.setAttribute("accesskey", button.accessKey);
+            }
+          }
+
+          if (link) {
+            buttonElem.setAttribute("slot", "support-link");
+            this.appendChild(buttonElem);
+          } else {
+            this.buttonContainer.appendChild(buttonElem);
+          }
+
+          buttonElem.buttonInfo = button;
+          this._buttons.push(buttonElem);
+        }
+      }
+
+      dismiss() {
+        if (this.eventCallback) {
+          this.eventCallback("dismissed");
+        }
+        super.dismiss();
+      }
+
+      _initClickJackingProtection(securityDelayMS) {
+        if (this._clickjackingDelayActive) {
+          return; 
+        }
+
+        this._securityDelayMS = securityDelayMS;
+        this._focusHandler = event => {
+          if (this.isConnected && event.target === window) {
+            this._startClickJackingDelay();
+          }
+        };
+
+        window.addEventListener("focus", this._focusHandler, true);
+        this._startClickJackingDelay();
+      }
+
+      _uninitClickJackingProtection() {
+        window.removeEventListener("focus", this._focusHandler, true);
+        this._focusHandler = null;
+        if (this._delayTimer) {
+          clearTimeout(this._delayTimer);
+          this._delayTimer = null;
+        }
+        this._enableAllButtons();
+        this._clickjackingDelayActive = false;
+      }
+
+      _startClickJackingDelay() {
+        this._clickjackingDelayActive = true;
+        this._disableAllButtons();
+        if (this._delayTimer) {
+          clearTimeout(this._delayTimer);
+        }
+        this._delayTimer = setTimeout(() => {
+          this._clickjackingDelayActive = false;
+          this._enableAllButtons();
+          this._delayTimer = null;
+        }, this._securityDelayMS);
+      }
+
+      _disableAllButtons() {
+        for (let button of this._buttons) {
+          button.disabled = true;
+        }
+      }
+
+      _enableAllButtons() {
+        for (let button of this._buttons) {
+          button.disabled = false;
+        }
+      }
+    }
+
+    if (!customElements.get("notification-message")) {
+      customElements.define("notification-message", NotificationMessage);
+    }
+  }
+}

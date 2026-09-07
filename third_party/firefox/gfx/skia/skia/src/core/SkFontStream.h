@@ -1,0 +1,32 @@
+/*
+ * Copyright 2013 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkFontStream_DEFINED)
+#define SkFontStream_DEFINED
+
+#include "include/core/SkSpan.h"
+#include "include/core/SkTypeface.h"
+
+#include <cstddef>
+
+class SkStream;
+
+class SkFontStream {
+public:
+    static int CountTTCEntries(SkStream*);
+
+    static int GetTableTags(SkStream*, int ttcIndex, SkSpan<SkFontTableTag> tags);
+
+    static size_t GetTableData(SkStream*, int ttcIndex, SkFontTableTag tag,
+                               size_t offset, size_t length, void* data);
+
+    static size_t GetTableSize(SkStream* stream, int ttcIndex, SkFontTableTag tag) {
+        return GetTableData(stream, ttcIndex, tag, 0, ~0U, nullptr);
+    }
+};
+
+#endif

@@ -1,0 +1,305 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#if !defined(_include_mozilla_gfx_ipc_GPUProcessManager_h_)
+#define _include_mozilla_gfx_ipc_GPUProcessManager_h_
+
+#include "base/basictypes.h"
+#include "base/process.h"
+#include "Units.h"
+#include "mozilla/dom/ipc/IdType.h"
+#include "mozilla/gfx/GPUProcessHost.h"
+#include "mozilla/gfx/PGPUChild.h"
+#include "mozilla/gfx/Point.h"
+#include "mozilla/Hal.h"
+#include "mozilla/ipc/ProtocolUtils.h"
+#include "mozilla/ipc/TaskFactory.h"
+#include "mozilla/layers/LayersTypes.h"
+#include "mozilla/webrender/WebRenderTypes.h"
+#include "nsIObserver.h"
+#include "nsThreadUtils.h"
+class nsIWidget;
+enum class DeviceResetReason;
+
+namespace mozilla {
+class MemoryReportingProcess;
+class PRemoteMediaManagerChild;
+class RDDProcessManager;
+class RDDChild;
+namespace layers {
+class IAPZCTreeManager;
+class CompositorOptions;
+class CompositorSession;
+class CompositorUpdateObserver;
+class PCompositorBridgeChild;
+class PCompositorManagerChild;
+class PImageBridgeChild;
+class PVideoBridgeParent;
+class RemoteCompositorSession;
+class InProcessCompositorSession;
+class UiCompositorControllerChild;
+}  
+namespace widget {
+class CompositorWidget;
+}  
+namespace dom {
+class ContentParent;
+class BrowserParent;
+}  
+namespace ipc {
+class GeckoChildProcessHost;
+}  
+namespace gfx {
+
+class GPUChild;
+class GPUProcessListener;
+class VsyncBridgeChild;
+class VsyncIOThreadHolder;
+
+class GPUProcessManager final : public GPUProcessHost::Listener {
+  friend class layers::RemoteCompositorSession;
+  friend class layers::InProcessCompositorSession;
+
+  typedef layers::CompositorOptions CompositorOptions;
+  typedef layers::CompositorSession CompositorSession;
+  typedef layers::CompositorUpdateObserver CompositorUpdateObserver;
+  typedef layers::IAPZCTreeManager IAPZCTreeManager;
+  typedef layers::LayersId LayersId;
+  typedef layers::PCompositorBridgeChild PCompositorBridgeChild;
+  typedef layers::PCompositorManagerChild PCompositorManagerChild;
+  typedef layers::PImageBridgeChild PImageBridgeChild;
+  typedef layers::PVideoBridgeParent PVideoBridgeParent;
+  typedef layers::RemoteCompositorSession RemoteCompositorSession;
+  typedef layers::InProcessCompositorSession InProcessCompositorSession;
+  typedef layers::UiCompositorControllerChild UiCompositorControllerChild;
+
+ public:
+  static void Initialize();
+  static void Shutdown();
+  static GPUProcessManager* Get();
+
+  ~GPUProcessManager();
+
+  nsresult LaunchGPUProcess();
+  bool IsGPUProcessLaunching();
+
+  nsresult EnsureGPUReady();
+
+  bool IsGPUReady() const;
+
+  already_AddRefed<CompositorSession> CreateTopLevelCompositor(
+      nsIWidget* aWidget, CSSToLayoutDeviceScale aScale,
+      const CompositorOptions& aOptions, bool aUseExternalSurfaceSize,
+      const gfx::IntSize& aSurfaceSize, uint64_t aInnerWindowId, bool* aRetry);
+
+  bool CreateContentBridges(
+      mozilla::ipc::EndpointProcInfo aOtherProcess,
+      mozilla::ipc::Endpoint<PCompositorManagerChild>* aOutCompositor,
+      mozilla::ipc::Endpoint<PImageBridgeChild>* aOutImageBridge,
+      mozilla::ipc::Endpoint<PRemoteMediaManagerChild>* aOutVideoManager,
+      dom::ContentParentId aChildId, nsTArray<uint32_t>* aNamespaces);
+
+  nsresult CreateRddVideoBridge(RDDProcessManager* aRDD, RDDChild* aChild);
+  void UnmapLayerTreeId(LayersId aLayersId, base::ProcessId aOwningId);
+
+  bool IsLayerTreeIdMapped(LayersId aLayersId, base::ProcessId aRequestingId);
+
+  LayersId AllocateLayerTreeId();
+
+  uint32_t AllocateNamespace();
+
+  bool AllocateAndConnectLayerTreeId(PCompositorBridgeChild* aCompositorBridge,
+                                     base::ProcessId aOtherPid,
+                                     LayersId* aOutLayersId,
+                                     CompositorOptions* aOutCompositorOptions);
+
+  void ResetCompositors();
+
+  static void RecordDeviceReset(DeviceResetReason aReason);
+
+  static void NotifyDeviceReset(DeviceResetReason aReason,
+                                DeviceResetDetectPlace aPlace);
+
+  void OnProcessLaunchComplete(GPUProcessHost* aHost) override;
+  void OnProcessUnexpectedShutdown(GPUProcessHost* aHost) override;
+  void SimulateDeviceReset();
+  void DisableWebRender(wr::WebRenderError aError, const nsCString& aMsg);
+  void NotifyWebRenderError(wr::WebRenderError aError);
+  void OnInProcessDeviceReset(DeviceResetReason aReason,
+                              DeviceResetDetectPlace aPlace);
+  void OnRemoteProcessDeviceReset(
+      GPUProcessHost* aHost, const DeviceResetReason& aReason,
+      const DeviceResetDetectPlace& aPlace) override;
+  void OnProcessDeclaredStable() override;
+  void NotifyListenersOnCompositeDeviceReset();
+
+  void NotifyRemoteActorDestroyed(const uint64_t& aProcessToken);
+
+  void AddListener(GPUProcessListener* aListener);
+  void RemoveListener(GPUProcessListener* aListener);
+
+  bool FlushActiveCheckerboardReports();
+
+  void KillProcess();
+
+  void StopBatteryObserving();
+
+  void CrashProcess();
+
+  base::ProcessId GPUProcessPid();
+
+  mozilla::ipc::EndpointProcInfo GPUEndpointProcInfo();
+
+  RefPtr<MemoryReportingProcess> GetProcessMemoryReporter();
+
+  GPUChild* GetGPUChild() { return mGPUChild; }
+
+  bool AttemptedGPUProcess() const { return mTotalProcessAttempts > 0; }
+
+  GPUProcessHost* Process() { return mProcess; }
+
+  void SetAppInForeground(bool aInForeground);
+
+ private:
+  void OnPreferenceChange(const char16_t* aData);
+  void ScreenInformationChanged();
+
+  bool CreateContentCompositorManager(
+      mozilla::ipc::EndpointProcInfo aOtherProcess,
+      dom::ContentParentId aChildId, uint32_t aNamespace,
+      mozilla::ipc::Endpoint<PCompositorManagerChild>* aOutEndpoint);
+  bool CreateContentImageBridge(
+      mozilla::ipc::EndpointProcInfo aOtherProcess,
+      dom::ContentParentId aChildId, uint32_t aNamespace,
+      mozilla::ipc::Endpoint<PImageBridgeChild>* aOutEndpoint);
+  void CreateContentRemoteMediaManager(
+      mozilla::ipc::EndpointProcInfo aOtherProcess,
+      dom::ContentParentId aChildId,
+      mozilla::ipc::Endpoint<PRemoteMediaManagerChild>* aOutEndPoint);
+
+  nsresult EnsureVideoBridge(
+      layers::VideoBridgeSource aSource,
+      mozilla::ipc::EndpointProcInfo aOtherProcess,
+      mozilla::ipc::Endpoint<layers::PVideoBridgeChild>* aOutChildPipe);
+
+  void RegisterRemoteProcessSession(RemoteCompositorSession* aSession);
+  void UnregisterRemoteProcessSession(RemoteCompositorSession* aSession);
+
+  void RegisterInProcessSession(InProcessCompositorSession* aSession);
+  void UnregisterInProcessSession(InProcessCompositorSession* aSession);
+
+  void DestroyRemoteCompositorSessions();
+  void DestroyInProcessCompositorSessions();
+
+  bool OnDeviceReset(bool aTrackThreshold);
+
+  void DisableWebRenderConfig(wr::WebRenderError aError, const nsCString& aMsg);
+
+  void FallbackToSoftware(const char* aMessage);
+
+ private:
+  GPUProcessManager();
+
+  void DisableGPUProcess(const char* aMessage);
+
+  bool MaybeDisableGPUProcess(const char* aMessage, bool aAllowRestart);
+
+  bool FallbackFromAcceleration(wr::WebRenderError aError,
+                                const nsCString& aMsg);
+
+  void MaybeCrashIfGpuProcessOnceStable();
+
+  void ResetProcessStable();
+
+  bool IsProcessStable(const TimeStamp& aNow);
+
+  void ShutdownInternal();
+  void DestroyProcess(bool aUnexpectedShutdown = false);
+
+  void HandleProcessLost();
+  void ReinitializeRendering();
+
+  void EnsureVsyncIOThread();
+  void ShutdownVsyncIOThread();
+
+  bool EnsureProtocolsReady();
+  bool EnsureCompositorManagerChild();
+  bool EnsureImageBridgeChild();
+
+
+  RefPtr<CompositorSession> CreateRemoteSession(
+      nsIWidget* aWidget, const LayersId& aRootLayerTreeId,
+      CSSToLayoutDeviceScale aScale, const CompositorOptions& aOptions,
+      bool aUseExternalSurfaceSize, const gfx::IntSize& aSurfaceSize,
+      uint64_t aInnerWindowId);
+
+  DISALLOW_COPY_AND_ASSIGN(GPUProcessManager);
+
+  void NotifyObserve(const char* aTopic, const char16_t* aData);
+  void NotifyBatteryInfo(const hal::BatteryInformation& aBatteryInfo);
+
+  class Observer final : public nsIObserver {
+   public:
+    NS_DECL_ISUPPORTS
+    NS_DECL_NSIOBSERVER
+
+    Observer();
+    void Shutdown();
+
+   protected:
+    virtual ~Observer() = default;
+  };
+  friend class Observer;
+
+  class BatteryObserver final : public hal::BatteryObserver {
+   public:
+    NS_INLINE_DECL_REFCOUNTING(BatteryObserver)
+
+    BatteryObserver();
+    void Notify(const hal::BatteryInformation& aBatteryInfo) override;
+    void Shutdown();
+
+   protected:
+    ~BatteryObserver() override = default;
+  };
+
+ private:
+  bool mDecodeVideoOnGpuProcess = true;
+
+  RefPtr<Observer> mObserver;
+  RefPtr<BatteryObserver> mBatteryObserver;
+  mozilla::ipc::TaskFactory<GPUProcessManager> mTaskFactory;
+  RefPtr<VsyncIOThreadHolder> mVsyncIOThread;
+  uint32_t mNextNamespace;
+  uint32_t mIdNamespace;
+  uint32_t mResourceId;
+
+  uint32_t mUnstableProcessAttempts;
+  uint32_t mTotalProcessAttempts;
+  uint32_t mLaunchProcessAttempts = 0;
+  TimeStamp mProcessAttemptLastTime;
+
+  nsTArray<RefPtr<RemoteCompositorSession>> mRemoteSessions;
+  nsTArray<RefPtr<InProcessCompositorSession>> mInProcessSessions;
+  nsTArray<RefPtr<GPUProcessListener>> mListeners;
+
+  uint32_t mDeviceResetCount;
+  TimeStamp mDeviceResetLastTime;
+
+  bool mAppInForeground;
+
+  GPUProcessHost* mProcess;
+  uint64_t mProcessToken;
+  bool mProcessStable = false;
+  bool mProcessStableOnce = false;
+  Maybe<wr::WebRenderError> mLastError;
+  Maybe<nsCString> mLastErrorMsg;
+  GPUChild* mGPUChild;
+  RefPtr<VsyncBridgeChild> mVsyncBridge;
+  nsTArray<mozilla::dom::Pref> mQueuedPrefs;
+};
+
+}  
+}  
+
+#endif

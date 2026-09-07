@@ -1,0 +1,71 @@
+/*
+ * Copyright 2006 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+
+
+#if !defined(SkOSFile_DEFINED)
+#define SkOSFile_DEFINED
+
+#include <stdio.h>
+
+#include "include/core/SkString.h"
+#include "include/private/base/SkTemplates.h"
+
+enum SkFILE_Flags {
+    kRead_SkFILE_Flag   = 0x01,
+    kWrite_SkFILE_Flag  = 0x02
+};
+
+FILE* sk_fopen(const char path[], SkFILE_Flags);
+void    sk_fclose(FILE*);
+
+size_t  sk_fgetsize(FILE*);
+
+size_t  sk_fwrite(const void* buffer, size_t byteCount, FILE*);
+
+void    sk_fflush(FILE*);
+void    sk_fsync(FILE*);
+
+size_t  sk_ftell(FILE*);
+
+void*   sk_fmmap(FILE* f, size_t* length);
+
+void*   sk_fdmmap(int fd, size_t* length);
+
+void    sk_fmunmap(const void* addr, size_t length);
+
+bool    sk_fidentical(FILE* a, FILE* b);
+
+int     sk_fileno(FILE* f);
+
+bool    sk_exists(const char *path, SkFILE_Flags = (SkFILE_Flags)0);
+
+bool    sk_isdir(const char *path);
+
+size_t sk_qread(FILE*, void* buffer, size_t count, size_t offset);
+
+
+bool    sk_mkdir(const char* path);
+
+class SkOSFile {
+public:
+    class Iter {
+    public:
+        SK_SPI Iter();
+        SK_SPI Iter(const char path[], const char suffix[] = nullptr);
+        SK_SPI ~Iter();
+
+        SK_SPI void reset(const char path[], const char suffix[] = nullptr);
+        SK_SPI bool next(SkString* name, bool getDir = false);
+
+        static const size_t kStorageSize = 40;
+    private:
+        alignas(void*) alignas(double) char fSelf[kStorageSize];
+    };
+};
+
+#endif

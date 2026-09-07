@@ -1,0 +1,421 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef js_String_h
+#define js_String_h
+
+#include "js/shadow/String.h"  // JS::shadow::String
+
+#include "mozilla/Assertions.h"    // MOZ_ASSERT
+#include "mozilla/Attributes.h"    // MOZ_ALWAYS_INLINE
+#include "mozilla/Likely.h"        // MOZ_LIKELY
+#include "mozilla/Maybe.h"         // mozilla::Maybe
+#include "mozilla/Range.h"         // mozilla::Range
+#include "mozilla/RefPtr.h"        // RefPtr
+#include "mozilla/Span.h"          // mozilla::Span
+#include "mozilla/StringBuffer.h"  // mozilla::StringBuffer
+
+#include <algorithm>  // std::copy_n
+#include <stddef.h>   // size_t
+#include <stdint.h>   // uint32_t, uint64_t, INT32_MAX
+
+#include "jstypes.h"  // JS_PUBLIC_API
+
+#include "js/CharacterEncoding.h"  // JS::UTF8Chars, JS::ConstUTF8CharsZ
+#include "js/RootingAPI.h"         // JS::Handle
+#include "js/TypeDecls.h"          // JS::Latin1Char
+#include "js/UniquePtr.h"          // JS::UniquePtr
+#include "js/Utility.h"            // JS::FreePolicy, JS::UniqueTwoByteChars
+#include "js/Value.h"              // JS::Value
+
+struct JS_PUBLIC_API JSContext;
+class JS_PUBLIC_API JSAtom;
+class JSLinearString;
+class JS_PUBLIC_API JSString;
+
+namespace JS {
+
+class JS_PUBLIC_API AutoRequireNoGC;
+
+}  
+
+extern JS_PUBLIC_API JSString* JS_GetEmptyString(JSContext* cx);
+
+extern JS_PUBLIC_API JS::Value JS_GetEmptyStringValue(JSContext* cx);
+
+
+extern JS_PUBLIC_API JSString* JS_NewStringCopyN(JSContext* cx, const char* s,
+                                                 size_t n);
+
+extern JS_PUBLIC_API JSString* JS_NewStringCopyZ(JSContext* cx, const char* s);
+
+extern JS_PUBLIC_API JSString* JS_NewStringCopyUTF8Z(
+    JSContext* cx, const JS::ConstUTF8CharsZ s);
+
+extern JS_PUBLIC_API JSString* JS_NewStringCopyUTF8N(JSContext* cx,
+                                                     const JS::UTF8Chars& s);
+
+extern JS_PUBLIC_API JSString* JS_AtomizeStringN(JSContext* cx, const char* s,
+                                                 size_t length);
+
+extern JS_PUBLIC_API JSString* JS_AtomizeString(JSContext* cx, const char* s);
+
+extern JS_PUBLIC_API JSString* JS_AtomizeAndPinStringN(JSContext* cx,
+                                                       const char* s,
+                                                       size_t length);
+
+extern JS_PUBLIC_API JSString* JS_AtomizeAndPinString(JSContext* cx,
+                                                      const char* s);
+
+extern JS_PUBLIC_API JSString* JS_NewLatin1String(
+    JSContext* cx, js::UniquePtr<JS::Latin1Char[], JS::FreePolicy> chars,
+    size_t length);
+
+extern JS_PUBLIC_API JSString* JS_NewUCString(JSContext* cx,
+                                              JS::UniqueTwoByteChars chars,
+                                              size_t length);
+
+extern JS_PUBLIC_API JSString* JS_NewUCStringDontDeflate(
+    JSContext* cx, JS::UniqueTwoByteChars chars, size_t length);
+
+extern JS_PUBLIC_API JSString* JS_NewUCStringCopyN(JSContext* cx,
+                                                   const char16_t* s, size_t n);
+
+extern JS_PUBLIC_API JSString* JS_NewUCStringCopyZ(JSContext* cx,
+                                                   const char16_t* s);
+
+namespace JS {
+
+extern JS_PUBLIC_API JSString* NewStringFromLatin1Buffer(
+    JSContext* cx, RefPtr<mozilla::StringBuffer> buffer, size_t length);
+
+extern JS_PUBLIC_API JSString* NewStringFromKnownLiveLatin1Buffer(
+    JSContext* cx, mozilla::StringBuffer* buffer, size_t length);
+
+extern JS_PUBLIC_API JSString* NewStringFromTwoByteBuffer(
+    JSContext* cx, RefPtr<mozilla::StringBuffer> buffer, size_t length);
+
+extern JS_PUBLIC_API JSString* NewStringFromKnownLiveTwoByteBuffer(
+    JSContext* cx, mozilla::StringBuffer* buffer, size_t length);
+
+extern JS_PUBLIC_API JSString* NewStringFromUTF8Buffer(
+    JSContext* cx, RefPtr<mozilla::StringBuffer> buffer, size_t length);
+
+extern JS_PUBLIC_API JSString* NewStringFromKnownLiveUTF8Buffer(
+    JSContext* cx, mozilla::StringBuffer* buffer, size_t length);
+
+}  
+
+extern JS_PUBLIC_API JSString* JS_AtomizeUCStringN(JSContext* cx,
+                                                   const char16_t* s,
+                                                   size_t length);
+
+extern JS_PUBLIC_API JSString* JS_AtomizeUCString(JSContext* cx,
+                                                  const char16_t* s);
+
+extern JS_PUBLIC_API bool JS_CompareStrings(JSContext* cx, JSString* str1,
+                                            JSString* str2, int32_t* result);
+
+[[nodiscard]] extern JS_PUBLIC_API bool JS_StringEqualsAscii(
+    JSContext* cx, JSString* str, const char* asciiBytes, bool* match);
+
+[[nodiscard]] extern JS_PUBLIC_API bool JS_StringEqualsAscii(
+    JSContext* cx, JSString* str, const char* asciiBytes, size_t length,
+    bool* match);
+
+template <size_t N>
+[[nodiscard]] bool JS_StringEqualsLiteral(JSContext* cx, JSString* str,
+                                          const char (&asciiBytes)[N],
+                                          bool* match) {
+  MOZ_ASSERT(asciiBytes[N - 1] == '\0');
+  return JS_StringEqualsAscii(cx, str, asciiBytes, N - 1, match);
+}
+
+extern JS_PUBLIC_API size_t JS_PutEscapedString(JSContext* cx, char* buffer,
+                                                size_t size, JSString* str,
+                                                char quote);
+
+
+extern JS_PUBLIC_API size_t JS_GetStringLength(JSString* str);
+
+extern JS_PUBLIC_API bool JS_StringIsLinear(JSString* str);
+
+extern JS_PUBLIC_API const JS::Latin1Char* JS_GetLatin1StringCharsAndLength(
+    JSContext* cx, const JS::AutoRequireNoGC& nogc, JSString* str,
+    size_t* length);
+
+extern JS_PUBLIC_API const char16_t* JS_GetTwoByteStringCharsAndLength(
+    JSContext* cx, const JS::AutoRequireNoGC& nogc, JSString* str,
+    size_t* length);
+
+extern JS_PUBLIC_API bool JS_GetStringCharAt(JSContext* cx, JSString* str,
+                                             size_t index, char16_t* res);
+
+extern JS_PUBLIC_API const char16_t* JS_GetTwoByteExternalStringChars(
+    JSString* str);
+
+extern JS_PUBLIC_API bool JS_CopyStringChars(
+    JSContext* cx, const mozilla::Range<char16_t>& dest, JSString* str);
+
+extern JS_PUBLIC_API JS::UniqueTwoByteChars JS_CopyStringCharsZ(JSContext* cx,
+                                                                JSString* str);
+
+extern JS_PUBLIC_API JSLinearString* JS_EnsureLinearString(JSContext* cx,
+                                                           JSString* str);
+
+static MOZ_ALWAYS_INLINE JSLinearString* JS_ASSERT_STRING_IS_LINEAR(
+    JSString* str) {
+  MOZ_ASSERT(JS_StringIsLinear(str));
+  return reinterpret_cast<JSLinearString*>(str);
+}
+
+static MOZ_ALWAYS_INLINE JSString* JS_FORGET_STRING_LINEARNESS(
+    JSLinearString* str) {
+  return reinterpret_cast<JSString*>(str);
+}
+
+
+extern JS_PUBLIC_API bool JS_LinearStringEqualsAscii(JSLinearString* str,
+                                                     const char* asciiBytes);
+extern JS_PUBLIC_API bool JS_LinearStringEqualsAscii(JSLinearString* str,
+                                                     const char* asciiBytes,
+                                                     size_t length);
+
+template <size_t N>
+bool JS_LinearStringEqualsLiteral(JSLinearString* str,
+                                  const char (&asciiBytes)[N]) {
+  MOZ_ASSERT(asciiBytes[N - 1] == '\0');
+  return JS_LinearStringEqualsAscii(str, asciiBytes, N - 1);
+}
+
+extern JS_PUBLIC_API size_t JS_PutEscapedLinearString(char* buffer, size_t size,
+                                                      JSLinearString* str,
+                                                      char quote);
+
+extern JS_PUBLIC_API JSString* JS_NewDependentString(JSContext* cx,
+                                                     JS::Handle<JSString*> str,
+                                                     size_t start,
+                                                     size_t length);
+
+extern JS_PUBLIC_API JSString* JS_ConcatStrings(JSContext* cx,
+                                                JS::Handle<JSString*> left,
+                                                JS::Handle<JSString*> right);
+
+JS_PUBLIC_API bool JS_DecodeBytes(JSContext* cx, const char* src, size_t srclen,
+                                  char16_t* dst, size_t* dstlenp);
+
+JS_PUBLIC_API size_t JS_GetStringEncodingLength(JSContext* cx, JSString* str);
+
+[[nodiscard]] JS_PUBLIC_API bool JS_EncodeStringToBuffer(JSContext* cx,
+                                                         JSString* str,
+                                                         char* buffer,
+                                                         size_t length);
+
+JS_PUBLIC_API mozilla::Maybe<std::tuple<size_t, size_t>>
+JS_EncodeStringToUTF8BufferPartial(JSContext* cx, JSString* str,
+                                   mozilla::Span<char> buffer);
+
+namespace JS {
+
+static constexpr uint32_t MaxStringLength = (1 << 30) - 2;
+
+static_assert((uint64_t(MaxStringLength) + 1) * sizeof(char16_t) <= INT32_MAX,
+              "size of null-terminated JSString char buffer must fit in "
+              "INT32_MAX");
+
+MOZ_ALWAYS_INLINE size_t GetStringLength(JSString* s) {
+  return shadow::AsShadowString(s)->length();
+}
+
+MOZ_ALWAYS_INLINE size_t GetLinearStringLength(JSLinearString* s) {
+  return shadow::AsShadowString(s)->length();
+}
+
+MOZ_ALWAYS_INLINE bool LinearStringHasLatin1Chars(JSLinearString* s) {
+  return shadow::AsShadowString(s)->hasLatin1Chars();
+}
+
+MOZ_ALWAYS_INLINE bool StringHasLatin1Chars(JSString* s) {
+  return shadow::AsShadowString(s)->hasLatin1Chars();
+}
+
+MOZ_ALWAYS_INLINE const Latin1Char* GetLatin1LinearStringChars(
+    const AutoRequireNoGC& nogc, JSLinearString* linear) {
+  return shadow::AsShadowString(linear)->latin1LinearChars();
+}
+
+MOZ_ALWAYS_INLINE const char16_t* GetTwoByteLinearStringChars(
+    const AutoRequireNoGC& nogc, JSLinearString* linear) {
+  return shadow::AsShadowString(linear)->twoByteLinearChars();
+}
+
+MOZ_ALWAYS_INLINE char16_t GetLinearStringCharAt(JSLinearString* linear,
+                                                 size_t index) {
+  shadow::String* s = shadow::AsShadowString(linear);
+  MOZ_ASSERT(index < s->length());
+
+  return s->hasLatin1Chars() ? s->latin1LinearChars()[index]
+                             : s->twoByteLinearChars()[index];
+}
+
+MOZ_ALWAYS_INLINE JSLinearString* AtomToLinearString(JSAtom* atom) {
+  return reinterpret_cast<JSLinearString*>(atom);
+}
+
+MOZ_ALWAYS_INLINE bool IsExternalStringLatin1(
+    JSString* str, const JSExternalStringCallbacks** callbacks,
+    const JS::Latin1Char** chars) {
+  shadow::String* s = shadow::AsShadowString(str);
+
+  if (!s->isExternal() || !s->hasLatin1Chars()) {
+    return false;
+  }
+
+  *callbacks = s->externalCallbacks;
+  *chars = s->nonInlineCharsLatin1;
+  return true;
+}
+
+MOZ_ALWAYS_INLINE bool IsExternalUCString(
+    JSString* str, const JSExternalStringCallbacks** callbacks,
+    const char16_t** chars) {
+  shadow::String* s = shadow::AsShadowString(str);
+
+  if (!s->isExternal() || s->hasLatin1Chars()) {
+    return false;
+  }
+
+  *callbacks = s->externalCallbacks;
+  *chars = s->nonInlineCharsTwoByte;
+  return true;
+}
+
+MOZ_ALWAYS_INLINE bool IsLatin1StringWithStringBuffer(
+    JSString* str, mozilla::StringBuffer** buffer) {
+  shadow::String* s = shadow::AsShadowString(str);
+
+  if (!s->hasStringBuffer() || !s->hasLatin1Chars()) {
+    return false;
+  }
+
+  void* data = const_cast<JS::Latin1Char*>(s->nonInlineCharsLatin1);
+  *buffer = mozilla::StringBuffer::FromData(data);
+  return true;
+}
+
+MOZ_ALWAYS_INLINE bool IsTwoByteStringWithStringBuffer(
+    JSString* str, mozilla::StringBuffer** buffer) {
+  shadow::String* s = shadow::AsShadowString(str);
+
+  if (!s->hasStringBuffer() || s->hasLatin1Chars()) {
+    return false;
+  }
+
+  void* data = const_cast<char16_t*>(s->nonInlineCharsTwoByte);
+  *buffer = mozilla::StringBuffer::FromData(data);
+  return true;
+}
+
+namespace detail {
+
+extern JS_PUBLIC_API JSLinearString* StringToLinearStringSlow(JSContext* cx,
+                                                              JSString* str);
+
+}  
+
+MOZ_ALWAYS_INLINE JSLinearString* StringToLinearString(JSContext* cx,
+                                                       JSString* str) {
+  if (MOZ_LIKELY(shadow::AsShadowString(str)->isLinear())) {
+    return reinterpret_cast<JSLinearString*>(str);
+  }
+
+  return detail::StringToLinearStringSlow(cx, str);
+}
+
+MOZ_ALWAYS_INLINE void CopyLinearStringChars(char16_t* dest, JSLinearString* s,
+                                             size_t len, size_t start = 0) {
+#ifdef DEBUG
+  size_t stringLen = GetLinearStringLength(s);
+  MOZ_ASSERT(start <= stringLen);
+  MOZ_ASSERT(len <= stringLen - start);
+#endif
+
+  shadow::String* str = shadow::AsShadowString(s);
+
+  if (str->hasLatin1Chars()) {
+    const Latin1Char* src = str->latin1LinearChars();
+    for (size_t i = 0; i < len; i++) {
+      dest[i] = src[start + i];
+    }
+  } else {
+    const char16_t* src = str->twoByteLinearChars();
+    std::copy_n(src + start, len, dest);
+  }
+}
+
+MOZ_ALWAYS_INLINE void LossyCopyLinearStringChars(char* dest, JSLinearString* s,
+                                                  size_t len,
+                                                  size_t start = 0) {
+#ifdef DEBUG
+  size_t stringLen = GetLinearStringLength(s);
+  MOZ_ASSERT(start <= stringLen);
+  MOZ_ASSERT(len <= stringLen - start);
+#endif
+
+  shadow::String* str = shadow::AsShadowString(s);
+
+  if (LinearStringHasLatin1Chars(s)) {
+    const Latin1Char* src = str->latin1LinearChars();
+    for (size_t i = 0; i < len; i++) {
+      dest[i] = char(src[start + i]);
+    }
+  } else {
+    const char16_t* src = str->twoByteLinearChars();
+    for (size_t i = 0; i < len; i++) {
+      dest[i] = char(src[start + i]);
+    }
+  }
+}
+
+[[nodiscard]] inline bool CopyStringChars(JSContext* cx, char16_t* dest,
+                                          JSString* s, size_t len,
+                                          size_t start = 0) {
+  JSLinearString* linear = StringToLinearString(cx, s);
+  if (!linear) {
+    return false;
+  }
+
+  CopyLinearStringChars(dest, linear, len, start);
+  return true;
+}
+
+[[nodiscard]] inline bool LossyCopyStringChars(JSContext* cx, char* dest,
+                                               JSString* s, size_t len,
+                                               size_t start = 0) {
+  JSLinearString* linear = StringToLinearString(cx, s);
+  if (!linear) {
+    return false;
+  }
+
+  LossyCopyLinearStringChars(dest, linear, len, start);
+  return true;
+}
+
+}  
+
+[[deprecated]] extern JS_PUBLIC_API bool JS_DeprecatedStringHasLatin1Chars(
+    JSString* str);
+
+
+namespace mozilla {
+namespace detail {
+template <>
+struct HasFreeLSB<JSString*> {
+  static constexpr bool value = true;
+};
+}  
+}  
+
+#endif  // js_String_h

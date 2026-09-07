@@ -1,0 +1,110 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_parser_PrototypeDocumentParser_h
+#define mozilla_parser_PrototypeDocumentParser_h
+
+#include "nsCycleCollectionParticipant.h"
+#include "nsIContentSink.h"
+#include "nsIParser.h"
+#include "nsXULPrototypeDocument.h"
+
+class nsIExpatSink;
+
+namespace mozilla {
+namespace dom {
+class PrototypeDocumentContentSink;
+}  
+}  
+
+namespace mozilla {
+namespace parser {
+
+class PrototypeDocumentParser final : public nsIParser,
+                                      public nsIStreamListener {
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+
+  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(PrototypeDocumentParser, nsIParser)
+
+  explicit PrototypeDocumentParser(nsIURI* aDocumentURI,
+                                   dom::Document* aDocument);
+
+  NS_DECL_NSIREQUESTOBSERVER
+  NS_DECL_NSISTREAMLISTENER
+
+  NS_IMETHOD_(void) SetContentSink(nsIContentSink* aSink) override;
+
+  NS_IMETHOD_(nsIContentSink*) GetContentSink() override;
+
+  NS_IMETHOD_(void) GetCommand(nsCString& aCommand) override {}
+
+  NS_IMETHOD_(void) SetCommand(const char* aCommand) override {}
+
+  NS_IMETHOD_(void) SetCommand(eParserCommands aParserCommand) override {}
+
+  virtual void SetDocumentCharset(NotNull<const Encoding*> aEncoding,
+                                  int32_t aSource,
+                                  bool aForceAutoDetection) override {}
+
+  virtual nsIStreamListener* GetStreamListener() override;
+
+  NS_IMETHOD ContinueInterruptedParsing() override {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+
+  NS_IMETHOD_(void) BlockParser() override {}
+
+  NS_IMETHOD_(void) UnblockParser() override {}
+
+  NS_IMETHOD_(void) ContinueInterruptedParsingAsync() override {}
+
+  NS_IMETHOD_(bool) IsParserEnabled() override { return true; }
+
+  NS_IMETHOD_(bool) IsComplete() override;
+
+  NS_IMETHOD Parse(nsIURI* aURL) override;
+
+  NS_IMETHOD Terminate() override { return NS_ERROR_NOT_IMPLEMENTED; }
+
+  virtual bool IsInsertionPointDefined() override { return false; }
+
+  void IncrementScriptNestingLevel() final {}
+
+  void DecrementScriptNestingLevel() final {}
+
+  bool HasNonzeroScriptNestingLevel() const final { return false; }
+
+  virtual bool IsScriptCreated() override { return false; }
+
+  virtual bool IsAboutBlankMode() override { return false; }
+
+
+ private:
+  virtual ~PrototypeDocumentParser();
+
+ protected:
+  nsresult PrepareToLoadPrototype(nsIURI* aURI,
+                                  nsIPrincipal* aDocumentPrincipal,
+                                  nsIParser** aResult);
+
+  nsresult OnPrototypeLoadDone();
+
+  nsCOMPtr<nsIURI> mDocumentURI;
+  RefPtr<dom::PrototypeDocumentContentSink> mOriginalSink;
+  RefPtr<dom::Document> mDocument;
+
+  nsCOMPtr<nsIStreamListener> mStreamListener;
+
+  RefPtr<nsXULPrototypeDocument> mCurrentPrototype;
+
+  bool mPrototypeAlreadyLoaded;
+
+  bool mIsComplete;
+};
+
+}  
+}  
+
+#endif  // mozilla_parser_PrototypeDocumentParser_h

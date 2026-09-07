@@ -1,0 +1,56 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef nsDocShellEditorData_h_
+#define nsDocShellEditorData_h_
+
+#ifndef nsCOMPtr_h_
+#  include "nsCOMPtr.h"
+#endif
+
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/WeakPtr.h"
+#include "nsDocShell.h"
+
+class nsEditingSession;
+
+namespace mozilla {
+class HTMLEditor;
+}
+
+class nsDocShellEditorData {
+ public:
+  explicit nsDocShellEditorData(nsDocShell* aOwningDocShell);
+  ~nsDocShellEditorData();
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY nsresult MakeEditable(bool aWaitForUriLoad);
+  bool GetEditable();
+  nsEditingSession* GetEditingSession();
+  mozilla::HTMLEditor* GetHTMLEditor() const { return mHTMLEditor; }
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY nsresult
+  SetHTMLEditor(mozilla::HTMLEditor* aHTMLEditor);
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void TearDownEditor();
+  nsresult DetachFromWindow();
+  nsresult ReattachToWindow(nsDocShell* aDocShell);
+  bool WaitingForLoad() const { return mMakeEditable; }
+
+ protected:
+  void EnsureEditingSession();
+
+  mozilla::WeakPtr<nsDocShell> mDocShell;
+
+  RefPtr<nsEditingSession> mEditingSession;
+
+  RefPtr<mozilla::HTMLEditor> mHTMLEditor;
+
+  mozilla::dom::Document::EditingState mDetachedEditingState;
+
+  bool mMakeEditable;
+
+  bool mIsDetached;
+
+  bool mDetachedMakeEditable;
+};
+
+#endif  // nsDocShellEditorData_h_

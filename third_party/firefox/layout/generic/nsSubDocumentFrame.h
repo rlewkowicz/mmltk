@@ -1,0 +1,222 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef NSSUBDOCUMENTFRAME_H_
+#define NSSUBDOCUMENTFRAME_H_
+
+#include "Units.h"
+#include "mozilla/gfx/Matrix.h"
+#include "nsAtomicContainerFrame.h"
+#include "nsDisplayList.h"
+#include "nsFrameLoader.h"
+#include "nsIReflowCallback.h"
+
+namespace mozilla {
+class PresShell;
+}  
+
+namespace mozilla::layers {
+class Layer;
+class RenderRootStateManager;
+class WebRenderLayerScrollData;
+class WebRenderScrollData;
+}  
+
+class nsSubDocumentFrame final : public nsAtomicContainerFrame,
+                                 public nsIReflowCallback {
+ public:
+  NS_DECL_FRAMEARENA_HELPERS(nsSubDocumentFrame)
+
+  explicit nsSubDocumentFrame(ComputedStyle* aStyle,
+                              nsPresContext* aPresContext);
+
+#ifdef DEBUG_FRAME_DUMP
+  void List(FILE* out = stderr, const char* aPrefix = "",
+            ListFlags aFlags = ListFlags()) const override;
+  nsresult GetFrameName(nsAString& aResult) const override;
+#endif
+
+  NS_DECL_QUERYFRAME
+
+  void Init(nsIContent* aContent, nsContainerFrame* aParent,
+            nsIFrame* aPrevInFlow) override;
+
+  void Destroy(DestroyContext&) override;
+
+  nscoord IntrinsicISize(const mozilla::IntrinsicSizeInput& aInput,
+                         mozilla::IntrinsicISizeType aType) override;
+
+  mozilla::IntrinsicSize GetIntrinsicSize() override;
+  mozilla::AspectRatio GetIntrinsicRatio() const override {
+    return GetIntrinsicRatio(false);
+  }
+  mozilla::AspectRatio GetIntrinsicRatio(bool aIgnoreContainment) const;
+
+  const nsPoint& GetExtraOffset() const { return mExtraOffset; }
+
+  SizeComputationResult ComputeSize(
+      const SizeComputationInput& aSizingInput, mozilla::WritingMode aWM,
+      const mozilla::LogicalSize& aCBSize, nscoord aAvailableISize,
+      const mozilla::LogicalSize& aMargin,
+      const mozilla::LogicalSize& aBorderPadding,
+      const mozilla::StyleSizeOverrides& aSizeOverrides,
+      mozilla::ComputeSizeFlags aFlags) override;
+
+  void Reflow(nsPresContext* aPresContext, ReflowOutput& aDesiredSize,
+              const ReflowInput& aReflowInput,
+              nsReflowStatus& aStatus) override;
+
+  void BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                        const nsDisplayListSet& aLists) override;
+
+  nsresult AttributeChanged(int32_t aNameSpaceID, nsAtom* aAttribute,
+                            AttrModType aModType) override;
+
+  void DidSetComputedStyle(ComputedStyle* aOldComputedStyle) override;
+
+  bool SupportsVisibilityHidden() override { return false; }
+
+#ifdef ACCESSIBILITY
+  mozilla::a11y::AccType AccessibleType() override;
+#endif
+
+  mozilla::IntrinsicSize ComputeIntrinsicSize(
+      bool aIgnoreContainment = false) const;
+
+  nsIDocShell* GetDocShell() const;
+  nsIDocShell* GetExtantDocShell() const;
+  nsresult BeginSwapDocShells(nsIFrame* aOther);
+  void EndSwapDocShells(nsIFrame* aOther);
+
+  mozilla::dom::Document* GetExtantSubdocument();
+  mozilla::PresShell* GetSubdocumentPresShell();
+  nsIFrame* GetSubdocumentRootFrame();
+  enum { IGNORE_PAINT_SUPPRESSION = 0x1 };
+  mozilla::PresShell* GetSubdocumentPresShellForPainting(uint32_t aFlags);
+  nsRect GetDestRect() const;
+  nsRect GetDestRect(const nsRect& aConstraintRect) const;
+
+  mozilla::LayoutDeviceIntSize GetInitialSubdocumentSize() const;
+  mozilla::LayoutDeviceIntSize GetSubdocumentSize() const;
+
+  bool ContentReactsToPointerEvents() const;
+
+  bool ReflowFinished() override;
+  void ReflowCallbackCanceled() override;
+
+  bool PassPointerEventsToChildren();
+
+  void MaybeShowViewer() {
+    if (!mDidCreateDoc && !mCallingShow) {
+      ShowViewer();
+    }
+  }
+
+  nsFrameLoader* FrameLoader() const;
+
+  enum class RetainPaintData : bool { No, Yes };
+  void ResetFrameLoader(RetainPaintData);
+  void ClearRetainedPaintData();
+
+  void ClearDisplayItems();
+
+  void SubdocumentIntrinsicSizeOrRatioChanged();
+
+  struct RemoteFramePaintData {
+    mozilla::layers::LayersId mLayersId;
+    mozilla::dom::TabId mTabId{0};
+  };
+
+  RemoteFramePaintData GetRemotePaintData() const;
+  bool HasRetainedPaintData() const { return mRetainedRemoteFrame.isSome(); }
+
+  const mozilla::gfx::MatrixScales& GetRasterScale() const {
+    return mRasterScale;
+  }
+  void SetRasterScale(const mozilla::gfx::MatrixScales& aScale) {
+    mRasterScale = aScale;
+  }
+  const Maybe<nsRect>& GetVisibleRect() const { return mVisibleRect; }
+  void SetVisibleRect(const Maybe<nsRect>& aRect) { mVisibleRect = aRect; }
+
+  void AddEmbeddingPresShell(mozilla::PresShell*);
+  void EnsureEmbeddingPresShell(mozilla::PresShell*);
+  void RemoveEmbeddingPresShell(mozilla::PresShell*);
+
+ protected:
+  friend class AsyncFrameInit;
+
+  void MaybeUpdateEmbedderColorScheme();
+  void MaybeUpdateEmbedderZoom();
+  void MaybeUpdateRemoteStyle(ComputedStyle* aOldComputedStyle = nullptr);
+  void PropagateIsUnderHiddenEmbedderElement(bool aValue);
+  void UpdateEmbeddedBrowsingContextDependentData();
+
+  bool FixUpInProcessPresShellsAfterAttach();
+  void PrepareInProcessPresShellsForDetach();
+
+  bool IsInline() const { return mIsInline; }
+
+  void ShowViewer();
+
+  mutable RefPtr<nsFrameLoader> mFrameLoader;
+
+  AutoTArray<nsWeakPtr, 1> mInProcessPresShells;
+  Maybe<RemoteFramePaintData> mRetainedRemoteFrame;
+  nsWeakPtr mLastPaintedPresShell;
+
+  mozilla::gfx::MatrixScales mRasterScale;
+  Maybe<nsRect> mVisibleRect;
+
+  nsPoint mExtraOffset;
+
+  bool mIsInline : 1;
+  bool mPostedReflowCallback : 1;
+  bool mDidCreateDoc : 1;
+  bool mCallingShow : 1;
+  bool mIsInObjectOrEmbed : 1;
+};
+
+namespace mozilla {
+
+class nsDisplayRemote final : public nsPaintedDisplayItem {
+  typedef mozilla::dom::TabId TabId;
+  typedef mozilla::gfx::Matrix4x4 Matrix4x4;
+  typedef mozilla::layers::EventRegionsOverride EventRegionsOverride;
+  typedef mozilla::layers::LayersId LayersId;
+  typedef mozilla::layers::StackingContextHelper StackingContextHelper;
+  typedef mozilla::LayoutDeviceRect LayoutDeviceRect;
+  typedef mozilla::LayoutDevicePoint LayoutDevicePoint;
+
+ public:
+  nsDisplayRemote(nsDisplayListBuilder* aBuilder, nsSubDocumentFrame* aFrame);
+
+  void Paint(nsDisplayListBuilder* aBuilder, gfxContext* aCtx) override;
+
+  bool CreateWebRenderCommands(
+      mozilla::wr::DisplayListBuilder& aBuilder,
+      mozilla::wr::IpcResourceUpdateQueue& aResources,
+      const StackingContextHelper& aSc,
+      mozilla::layers::RenderRootStateManager* aManager,
+      nsDisplayListBuilder* aDisplayListBuilder) override;
+  bool UpdateScrollData(
+      mozilla::layers::WebRenderScrollData* aData,
+      mozilla::layers::WebRenderLayerScrollData* aLayerData) override;
+
+  NS_DISPLAY_DECL_NAME("Remote", TYPE_REMOTE)
+
+ private:
+  friend class nsDisplayItem;
+  using RemoteFramePaintData = nsSubDocumentFrame::RemoteFramePaintData;
+
+  nsFrameLoader* GetFrameLoader() const;
+
+  RemoteFramePaintData mPaintData;
+  LayoutDevicePoint mOffset;
+  EventRegionsOverride mEventRegionsOverride;
+};
+
+}  
+
+#endif /* NSSUBDOCUMENTFRAME_H_ */

@@ -1,0 +1,95 @@
+/*
+ * Copyright 2021 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "src/sksl/ir/SkSLBlock.h"
+
+#include "src/sksl/ir/SkSLNop.h"
+
+namespace SkSL {
+
+std::unique_ptr<Statement> Block::Make(Position pos,
+                                       StatementArray statements,
+                                       Kind kind,
+                                       std::unique_ptr<SymbolTable> symbols) {
+    if (kind == Kind::kBracedScope || (symbols && symbols->count())) {
+        return std::make_unique<Block>(pos, std::move(statements), kind, std::move(symbols));
+    }
+
+    if (statements.empty()) {
+        return Nop::Make();
+    }
+
+    if (statements.size() > 1) {
+        std::unique_ptr<Statement>* foundStatement = nullptr;
+        for (std::unique_ptr<Statement>& stmt : statements) {
+            if (!stmt->isEmpty()) {
+                if (!foundStatement) {
+                    foundStatement = &stmt;
+                    continue;
+                }
+                return std::make_unique<Block>(pos, std::move(statements), kind,
+                                               nullptr);
+            }
+        }
+
+        if (foundStatement) {
+            return std::move(*foundStatement);
+        }
+
+    }
+
+    return std::move(statements.front());
+}
+
+std::unique_ptr<Block> Block::MakeBlock(Position pos,
+                                        StatementArray statements,
+                                        Kind kind,
+                                        std::unique_ptr<SymbolTable> symbols) {
+    return std::make_unique<Block>(pos, std::move(statements), kind, std::move(symbols));
+}
+
+std::unique_ptr<Statement> Block::MakeCompoundStatement(std::unique_ptr<Statement> existing,
+                                                        std::unique_ptr<Statement> additional) {
+    if (!existing || existing->isEmpty()) {
+        return additional;
+    }
+    if (!additional || additional->isEmpty()) {
+        return existing;
+    }
+
+    if (existing->is<Block>()) {
+        SkSL::Block& block = existing->as<Block>();
+        if (block.blockKind() == Block::Kind::kCompoundStatement) {
+            block.children().push_back(std::move(additional));
+            return existing;
+        }
+    }
+
+    Position pos = existing->fPosition.rangeThrough(additional->fPosition);
+    StatementArray stmts;
+    stmts.reserve_exact(2);
+    stmts.push_back(std::move(existing));
+    stmts.push_back(std::move(additional));
+    return Block::Make(pos, std::move(stmts), Block::Kind::kCompoundStatement);
+}
+
+std::string Block::description() const {
+    std::string result;
+
+    bool isScope = this->isScope() || this->isEmpty();
+    if (isScope) {
+        result += "{";
+    }
+    for (const std::unique_ptr<Statement>& stmt : this->children()) {
+        result += "\n";
+        result += stmt->description();
+    }
+    result += isScope ? "\n}\n" : "\n";
+    return result;
+}
+
+}  

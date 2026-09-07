@@ -1,0 +1,1247 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/BrowsingContext.h"
+#include "nsJAR.h"
+#include "nsJARChannel.h"
+#include "nsJARProtocolHandler.h"
+#include "nsMimeTypes.h"
+#include "nsNetUtil.h"
+#include "nsEscape.h"
+#include "nsContentUtils.h"
+#include "nsProxyRelease.h"
+#include "nsContentSecurityManager.h"
+#include "nsComponentManagerUtils.h"
+
+#include "nsIFileURL.h"
+#include "nsIURIMutator.h"
+
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/dom/ParentProcessChannelHandle.h"
+#include "mozilla/ErrorNames.h"
+#include "mozilla/IntegerPrintfMacros.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/StaticPrefs_network.h"
+#include "private/pprio.h"
+#include "nsInputStreamPump.h"
+#include "nsThreadUtils.h"
+#include "nsJARProtocolHandler.h"
+
+using namespace mozilla;
+using namespace mozilla::net;
+
+static NS_DEFINE_CID(kZipReaderCID, NS_ZIPREADER_CID);
+
+#define ENTRY_IS_DIRECTORY(_entry) \
+  ((_entry).IsEmpty() || '/' == (_entry).Last())
+
+
+static LazyLogModule gJarProtocolLog("nsJarProtocol");
+
+#if defined(LOG)
+#  undef LOG
+#endif
+#if defined(LOG_ENABLED)
+#  undef LOG_ENABLED
+#endif
+
+#define LOG(args) MOZ_LOG(gJarProtocolLog, mozilla::LogLevel::Debug, args)
+#define LOG_ENABLED() MOZ_LOG_TEST(gJarProtocolLog, mozilla::LogLevel::Debug)
+
+
+class nsJARInputThunk : public nsIInputStream {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIINPUTSTREAM
+
+  nsJARInputThunk(nsIZipReader* zipReader, const nsACString& jarEntry,
+                  bool usingJarCache)
+      : mUsingJarCache(usingJarCache),
+        mJarReader(zipReader),
+        mJarEntry(jarEntry),
+        mContentLength(-1) {
+    MOZ_DIAGNOSTIC_ASSERT(zipReader, "zipReader must not be null");
+  }
+
+  int64_t GetContentLength() { return mContentLength; }
+
+  nsresult Init();
+
+ private:
+  virtual ~nsJARInputThunk() { Close(); }
+
+  bool mUsingJarCache;
+  nsCOMPtr<nsIZipReader> mJarReader;
+  nsCOMPtr<nsIInputStream> mJarStream;
+  nsCString mJarEntry;
+  int64_t mContentLength;
+};
+
+NS_IMPL_ISUPPORTS(nsJARInputThunk, nsIInputStream)
+
+nsresult nsJARInputThunk::Init() {
+  if (!mJarReader) {
+    return NS_ERROR_INVALID_ARG;
+  }
+  nsresult rv =
+      mJarReader->GetInputStream(mJarEntry, getter_AddRefs(mJarStream));
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  uint64_t avail;
+  rv = mJarStream->Available((uint64_t*)&avail);
+  if (NS_FAILED(rv)) return rv;
+
+  mContentLength = avail < INT64_MAX ? (int64_t)avail : -1;
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsJARInputThunk::Close() {
+  nsresult rv = NS_OK;
+
+  if (mJarStream) rv = mJarStream->Close();
+
+  if (!mUsingJarCache && mJarReader) mJarReader->Close();
+
+  mJarReader = nullptr;
+
+  return rv;
+}
+
+NS_IMETHODIMP
+nsJARInputThunk::Available(uint64_t* avail) {
+  return mJarStream->Available(avail);
+}
+
+NS_IMETHODIMP
+nsJARInputThunk::StreamStatus() { return mJarStream->StreamStatus(); }
+
+NS_IMETHODIMP
+nsJARInputThunk::Read(char* buf, uint32_t count, uint32_t* countRead) {
+  return mJarStream->Read(buf, count, countRead);
+}
+
+NS_IMETHODIMP
+nsJARInputThunk::ReadSegments(nsWriteSegmentFun writer, void* closure,
+                              uint32_t count, uint32_t* countRead) {
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+NS_IMETHODIMP
+nsJARInputThunk::IsNonBlocking(bool* nonBlocking) {
+  *nonBlocking = false;
+  return NS_OK;
+}
+
+
+nsJARChannel::nsJARChannel() {
+  LOG(("nsJARChannel::nsJARChannel [this=%p]\n", this));
+  mJarHandler = gJarHandler;
+}
+
+nsJARChannel::~nsJARChannel() {
+  LOG(("nsJARChannel::~nsJARChannel [this=%p]\n", this));
+  if (NS_IsMainThread()) {
+    return;
+  }
+
+  NS_ReleaseOnMainThread("nsJARChannel::mLoadInfo", mLoadInfo.forget());
+  NS_ReleaseOnMainThread("nsJARChannel::mCallbacks", mCallbacks.forget());
+  NS_ReleaseOnMainThread("nsJARChannel::mProgressSink", mProgressSink.forget());
+  NS_ReleaseOnMainThread("nsJARChannel::mLoadGroup", mLoadGroup.forget());
+  NS_ReleaseOnMainThread("nsJARChannel::mListener", mListener.forget());
+}
+
+NS_IMPL_ISUPPORTS_INHERITED(nsJARChannel, nsHashPropertyBag, nsIRequest,
+                            nsIChannel, nsIStreamListener, nsIRequestObserver,
+                            nsIThreadRetargetableRequest,
+                            nsIThreadRetargetableStreamListener, nsIJARChannel)
+
+nsresult nsJARChannel::Init(nsIURI* uri) {
+  LOG(("nsJARChannel::Init [this=%p]\n", this));
+  nsresult rv;
+
+  mWorker = do_GetService(NS_STREAMTRANSPORTSERVICE_CONTRACTID, &rv);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  mJarURI = do_QueryInterface(uri, &rv);
+  if (NS_FAILED(rv)) return rv;
+
+  mOriginalURI = mJarURI;
+
+  nsCOMPtr<nsIURI> innerURI;
+  rv = mJarURI->GetJARFile(getter_AddRefs(innerURI));
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  if (innerURI->SchemeIs("javascript")) {
+    NS_WARNING("blocking jar:javascript:");
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  mJarURI->GetSpec(mSpec);
+  return rv;
+}
+
+nsresult nsJARChannel::CreateJarInput(nsIZipReaderCache* jarCache,
+                                      nsJARInputThunk** resultInput) {
+  LOG(("nsJARChannel::CreateJarInput [this=%p]\n", this));
+  MOZ_ASSERT(resultInput);
+  MOZ_ASSERT(mJarFile);
+
+  nsCOMPtr<nsIFile> clonedFile;
+  nsresult rv = NS_OK;
+  if (mJarFile) {
+    rv = mJarFile->Clone(getter_AddRefs(clonedFile));
+    if (NS_FAILED(rv)) return rv;
+  }
+
+  nsCOMPtr<nsIZipReader> reader;
+  if (mPreCachedJarReader) {
+    reader = mPreCachedJarReader;
+  } else if (jarCache) {
+    if (mInnerJarEntry.IsEmpty())
+      rv = jarCache->GetZip(clonedFile, getter_AddRefs(reader));
+    else
+      rv = jarCache->GetInnerZip(clonedFile, mInnerJarEntry,
+                                 getter_AddRefs(reader));
+  } else {
+    nsCOMPtr<nsIZipReader> outerReader = do_CreateInstance(kZipReaderCID, &rv);
+    if (NS_FAILED(rv)) return rv;
+
+    rv = outerReader->Open(clonedFile);
+    if (NS_FAILED(rv)) return rv;
+
+    if (mInnerJarEntry.IsEmpty())
+      reader = std::move(outerReader);
+    else {
+      reader = do_CreateInstance(kZipReaderCID, &rv);
+      if (NS_FAILED(rv)) return rv;
+
+      rv = reader->OpenInner(outerReader, mInnerJarEntry);
+    }
+  }
+  if (NS_FAILED(rv)) return rv;
+
+  RefPtr<nsJARInputThunk> input =
+      new nsJARInputThunk(reader, mJarEntry, jarCache != nullptr);
+  rv = input->Init();
+  if (NS_FAILED(rv)) {
+    if (rv == NS_ERROR_FILE_NOT_FOUND) {
+      CheckForBrokenChromeURL(mLoadInfo, mOriginalURI);
+    }
+    return rv;
+  }
+
+  mContentLength = input->GetContentLength();
+
+  input.forget(resultInput);
+  return NS_OK;
+}
+
+nsresult nsJARChannel::LookupFile() {
+  LOG(("nsJARChannel::LookupFile [this=%p %s]\n", this, mSpec.get()));
+
+  if (mJarFile) return NS_OK;
+
+  nsresult rv;
+
+  rv = mJarURI->GetJARFile(getter_AddRefs(mJarBaseURI));
+  if (NS_FAILED(rv)) return rv;
+
+  rv = mJarURI->GetJAREntry(mJarEntry);
+  if (NS_FAILED(rv)) return rv;
+
+  NS_UnescapeURL(mJarEntry);
+
+  if (mJarEntry.FindChar('\0') != -1) {
+    return NS_ERROR_MALFORMED_URI;
+  }
+
+  if (mJarFileOverride) {
+    mJarFile = mJarFileOverride;
+    LOG(("nsJARChannel::LookupFile [this=%p] Overriding mJarFile\n", this));
+    return NS_OK;
+  }
+
+  {
+    nsCOMPtr<nsIFileURL> fileURL = do_QueryInterface(mJarBaseURI);
+    if (fileURL) fileURL->GetFile(getter_AddRefs(mJarFile));
+  }
+
+  if (!mJarFile) {
+    nsCOMPtr<nsIJARURI> jarURI = do_QueryInterface(mJarBaseURI);
+    if (jarURI) {
+      nsCOMPtr<nsIFileURL> fileURL;
+      nsCOMPtr<nsIURI> innerJarURI;
+      rv = jarURI->GetJARFile(getter_AddRefs(innerJarURI));
+      if (NS_SUCCEEDED(rv)) fileURL = do_QueryInterface(innerJarURI);
+      if (fileURL) {
+        fileURL->GetFile(getter_AddRefs(mJarFile));
+        jarURI->GetJAREntry(mInnerJarEntry);
+      }
+    }
+  }
+
+  return rv;
+}
+
+nsresult CreateLocalJarInput(nsIZipReaderCache* aJarCache, nsIFile* aFile,
+                             const nsACString& aInnerJarEntry,
+                             const nsACString& aJarEntry,
+                             nsJARInputThunk** aResultInput) {
+  LOG(("nsJARChannel::CreateLocalJarInput [aJarCache=%p, %s, %s]\n", aJarCache,
+       PromiseFlatCString(aInnerJarEntry).get(),
+       PromiseFlatCString(aJarEntry).get()));
+
+  MOZ_ASSERT(!NS_IsMainThread());
+  MOZ_ASSERT(aJarCache);
+  MOZ_ASSERT(aResultInput);
+
+  nsresult rv;
+
+  nsCOMPtr<nsIZipReader> reader;
+  if (aInnerJarEntry.IsEmpty()) {
+    rv = aJarCache->GetZip(aFile, getter_AddRefs(reader));
+  } else {
+    rv = aJarCache->GetInnerZip(aFile, aInnerJarEntry, getter_AddRefs(reader));
+  }
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  RefPtr<nsJARInputThunk> input =
+      new nsJARInputThunk(reader, aJarEntry, aJarCache != nullptr);
+  rv = input->Init();
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  input.forget(aResultInput);
+  return NS_OK;
+}
+
+nsresult nsJARChannel::OpenLocalFile() {
+  LOG(("nsJARChannel::OpenLocalFile [this=%p]\n", this));
+
+  MOZ_ASSERT(NS_IsMainThread());
+
+  MOZ_ASSERT(mWorker);
+  MOZ_ASSERT(mIsPending);
+  MOZ_ASSERT(mJarFile);
+
+  nsresult rv;
+
+  if (mLoadGroup) {
+    mLoadGroup->AddRequest(this, nullptr);
+  }
+  SetOpened();
+
+  if (mPreCachedJarReader || !mEnableOMT) {
+    RefPtr<nsJARInputThunk> input;
+    rv = CreateJarInput(gJarHandler->JarCache(), getter_AddRefs(input));
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      return OnOpenLocalFileComplete(rv, true);
+    }
+    return ContinueOpenLocalFile(input, true);
+  }
+
+  nsCOMPtr<nsIZipReaderCache> jarCache = gJarHandler->JarCache();
+  if (NS_WARN_IF(!jarCache)) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  nsCOMPtr<nsIFile> clonedFile;
+  rv = mJarFile->Clone(getter_AddRefs(clonedFile));
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  nsAutoCString jarEntry(mJarEntry);
+  nsAutoCString innerJarEntry(mInnerJarEntry);
+
+  RefPtr<nsJARChannel> self = this;
+  return mWorker->Dispatch(NS_NewRunnableFunction(
+      "nsJARChannel::OpenLocalFile",
+      [self, jarCache = std::move(jarCache), clonedFile = std::move(clonedFile),
+       jarEntry = std::move(jarEntry),
+       innerJarEntry = std::move(innerJarEntry)]() mutable {
+        RefPtr<nsJARInputThunk> input;
+        nsresult rv = CreateLocalJarInput(jarCache, clonedFile, innerJarEntry,
+                                          jarEntry, getter_AddRefs(input));
+
+        nsCOMPtr<nsIRunnable> target;
+        if (NS_SUCCEEDED(rv)) {
+          target = NewRunnableMethod<RefPtr<nsJARInputThunk>, bool>(
+              "nsJARChannel::ContinueOpenLocalFile", self,
+              &nsJARChannel::ContinueOpenLocalFile, input, false);
+        } else {
+          target = NewRunnableMethod<nsresult, bool>(
+              "nsJARChannel::OnOpenLocalFileComplete", self,
+              &nsJARChannel::OnOpenLocalFileComplete, rv, false);
+        }
+
+        self = nullptr;
+
+        NS_DispatchToMainThread(target.forget());
+      }));
+}
+
+nsresult nsJARChannel::ContinueOpenLocalFile(nsJARInputThunk* aInput,
+                                             bool aIsSyncCall) {
+  LOG(("nsJARChannel::ContinueOpenLocalFile [this=%p %p]\n", this, aInput));
+
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(mIsPending);
+
+  mContentLength = aInput->GetContentLength();
+
+  nsresult rv;
+  RefPtr<nsJARInputThunk> input = aInput;
+  rv = NS_NewInputStreamPump(getter_AddRefs(mPump), input.forget());
+  if (NS_SUCCEEDED(rv)) {
+    rv = mPump->AsyncRead(this);
+  }
+
+  if (NS_SUCCEEDED(rv)) {
+    rv = CheckPendingEvents();
+  }
+
+  return OnOpenLocalFileComplete(rv, aIsSyncCall);
+}
+
+nsresult nsJARChannel::OnOpenLocalFileComplete(nsresult aResult,
+                                               bool aIsSyncCall) {
+  LOG(("nsJARChannel::OnOpenLocalFileComplete [this=%p %08x]\n", this,
+       static_cast<uint32_t>(aResult)));
+
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(mIsPending);
+
+  if (NS_FAILED(aResult)) {
+    if (aResult == NS_ERROR_FILE_NOT_FOUND) {
+      CheckForBrokenChromeURL(mLoadInfo, mOriginalURI);
+    }
+    if (!aIsSyncCall) {
+      NotifyError(aResult);
+    }
+
+    if (mLoadGroup) {
+      mLoadGroup->RemoveRequest(this, nullptr, aResult);
+    }
+
+    mOpened = false;
+    mIsPending = false;
+    mListener = nullptr;
+    mCallbacks = nullptr;
+    mProgressSink = nullptr;
+
+    return aResult;
+  }
+
+  return NS_OK;
+}
+
+nsresult nsJARChannel::CheckPendingEvents() {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(mIsPending);
+  MOZ_ASSERT(mPump);
+
+  nsresult rv;
+
+  uint32_t suspendCount = mPendingEvent.suspendCount;
+  while (suspendCount--) {
+    if (NS_WARN_IF(NS_FAILED(rv = mPump->Suspend()))) {
+      return rv;
+    }
+  }
+
+  if (mPendingEvent.isCanceled) {
+    if (NS_WARN_IF(NS_FAILED(rv = mPump->Cancel(mStatus)))) {
+      return rv;
+    }
+    mPendingEvent.isCanceled = false;
+  }
+
+  return NS_OK;
+}
+
+void nsJARChannel::NotifyError(nsresult aError) {
+  MOZ_ASSERT(NS_FAILED(aError));
+
+  mStatus = aError;
+
+  OnStartRequest(nullptr);
+  OnStopRequest(nullptr, aError);
+}
+
+void nsJARChannel::FireOnProgress(uint64_t aProgress) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(mProgressSink);
+
+  mProgressSink->OnProgress(this, aProgress, mContentLength);
+}
+
+
+NS_IMETHODIMP
+nsJARChannel::GetName(nsACString& result) { return mJarURI->GetSpec(result); }
+
+NS_IMETHODIMP
+nsJARChannel::IsPending(bool* result) {
+  *result = mIsPending;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsJARChannel::GetStatus(nsresult* status) {
+  if (mPump && NS_SUCCEEDED(mStatus))
+    mPump->GetStatus(status);
+  else
+    *status = mStatus;
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsJARChannel::SetCanceledReason(const nsACString& aReason) {
+  return SetCanceledReasonImpl(aReason);
+}
+
+NS_IMETHODIMP nsJARChannel::GetCanceledReason(nsACString& aReason) {
+  return GetCanceledReasonImpl(aReason);
+}
+
+NS_IMETHODIMP nsJARChannel::CancelWithReason(nsresult aStatus,
+                                             const nsACString& aReason) {
+  return CancelWithReasonImpl(aStatus, aReason);
+}
+
+NS_IMETHODIMP
+nsJARChannel::Cancel(nsresult status) {
+  mCanceled = true;
+  mStatus = status;
+  if (mPump) {
+    return mPump->Cancel(status);
+  }
+
+  if (mIsPending) {
+    mPendingEvent.isCanceled = true;
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsJARChannel::GetCanceled(bool* aCanceled) {
+  *aCanceled = mCanceled;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsJARChannel::Suspend() {
+  ++mPendingEvent.suspendCount;
+
+  if (mPump) {
+    return mPump->Suspend();
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsJARChannel::Resume() {
+  if (NS_WARN_IF(mPendingEvent.suspendCount == 0)) {
+    return NS_ERROR_UNEXPECTED;
+  }
+  --mPendingEvent.suspendCount;
+
+  if (mPump) {
+    return mPump->Resume();
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsJARChannel::GetLoadFlags(nsLoadFlags* aLoadFlags) {
+  *aLoadFlags = mLoadFlags;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsJARChannel::SetLoadFlags(nsLoadFlags aLoadFlags) {
+  mLoadFlags = aLoadFlags;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsJARChannel::GetTRRMode(nsIRequest::TRRMode* aTRRMode) {
+  return GetTRRModeImpl(aTRRMode);
+}
+
+NS_IMETHODIMP
+nsJARChannel::SetTRRMode(nsIRequest::TRRMode aTRRMode) {
+  return SetTRRModeImpl(aTRRMode);
+}
+
+NS_IMETHODIMP
+nsJARChannel::GetIsDocument(bool* aIsDocument) {
+  return NS_GetIsDocumentChannel(this, aIsDocument);
+}
+
+NS_IMETHODIMP
+nsJARChannel::GetLoadGroup(nsILoadGroup** aLoadGroup) {
+  NS_IF_ADDREF(*aLoadGroup = mLoadGroup);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsJARChannel::SetLoadGroup(nsILoadGroup* aLoadGroup) {
+  mLoadGroup = aLoadGroup;
+  return NS_OK;
+}
+
+
+NS_IMETHODIMP
+nsJARChannel::GetOriginalURI(nsIURI** aURI) {
+  *aURI = mOriginalURI;
+  NS_ADDREF(*aURI);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsJARChannel::SetOriginalURI(nsIURI* aURI) {
+  NS_ENSURE_ARG_POINTER(aURI);
+  mOriginalURI = aURI;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsJARChannel::GetURI(nsIURI** aURI) {
+  NS_IF_ADDREF(*aURI = mJarURI);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsJARChannel::GetOwner(nsISupports** aOwner) {
+  *aOwner = mOwner;
+  NS_IF_ADDREF(*aOwner);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsJARChannel::SetOwner(nsISupports* aOwner) {
+  mOwner = aOwner;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsJARChannel::GetLoadInfo(nsILoadInfo** aLoadInfo) {
+  NS_IF_ADDREF(*aLoadInfo = mLoadInfo);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsJARChannel::SetLoadInfo(nsILoadInfo* aLoadInfo) {
+  MOZ_RELEASE_ASSERT(aLoadInfo, "loadinfo can't be null");
+  mLoadInfo = aLoadInfo;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsJARChannel::GetParentProcessChannelHandle(
+    mozilla::dom::ParentProcessChannelHandle** aValue) {
+  NS_IF_ADDREF(*aValue = mParentProcessChannelHandle);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsJARChannel::SetParentProcessChannelHandle(
+    mozilla::dom::ParentProcessChannelHandle* aValue) {
+  if (XRE_IsParentProcess()) {
+    MOZ_ASSERT_UNREACHABLE(
+        "SetParentProcessChannelHandle in the parent process would leak");
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  mParentProcessChannelHandle = aValue;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsJARChannel::GetNotificationCallbacks(nsIInterfaceRequestor** aCallbacks) {
+  NS_IF_ADDREF(*aCallbacks = mCallbacks);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsJARChannel::SetNotificationCallbacks(nsIInterfaceRequestor* aCallbacks) {
+  mCallbacks = aCallbacks;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsJARChannel::GetSecurityInfo(nsITransportSecurityInfo** aSecurityInfo) {
+  MOZ_ASSERT(aSecurityInfo, "Null out param");
+  *aSecurityInfo = nullptr;
+  return NS_OK;
+}
+
+bool nsJARChannel::GetContentTypeGuess(nsACString& aResult) const {
+  const char *ext = nullptr, *fileName = mJarEntry.get();
+  int32_t len = mJarEntry.Length();
+
+  if (ENTRY_IS_DIRECTORY(mJarEntry)) {
+    aResult.AssignLiteral(APPLICATION_HTTP_INDEX_FORMAT);
+    return true;
+  }
+
+  for (int32_t i = len - 1; i >= 0; i--) {
+    if (fileName[i] == '.') {
+      ext = &fileName[i + 1];
+      break;
+    }
+  }
+  if (!ext) {
+    return false;
+  }
+  nsIMIMEService* mimeServ = gJarHandler->MimeService();
+  if (!mimeServ) {
+    return false;
+  }
+  mimeServ->GetTypeFromExtension(nsDependentCString(ext), aResult);
+  return !aResult.IsEmpty();
+}
+
+NS_IMETHODIMP
+nsJARChannel::GetContentType(nsACString& aResult) {
+  if (!mOpened) {
+    aResult.AssignLiteral(UNKNOWN_CONTENT_TYPE);
+    return NS_OK;
+  }
+
+  aResult = mContentType;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsJARChannel::SetContentType(const nsACString& aContentType) {
+  NS_ParseResponseContentType(aContentType, mContentType, mContentCharset);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsJARChannel::GetContentCharset(nsACString& aContentCharset) {
+  aContentCharset = mContentCharset;
+  if (mContentCharset.IsEmpty() && (mOriginalURI->SchemeIs("chrome") ||
+                                    mOriginalURI->SchemeIs("resource"))) {
+    aContentCharset.AssignLiteral("UTF-8");
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsJARChannel::SetContentCharset(const nsACString& aContentCharset) {
+  mContentCharset = aContentCharset;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsJARChannel::GetContentDisposition(uint32_t* aContentDisposition) {
+  return NS_ERROR_NOT_AVAILABLE;
+}
+
+NS_IMETHODIMP
+nsJARChannel::SetContentDisposition(uint32_t aContentDisposition) {
+  return NS_ERROR_NOT_AVAILABLE;
+}
+
+NS_IMETHODIMP
+nsJARChannel::GetContentDispositionFilename(
+    nsAString& aContentDispositionFilename) {
+  return NS_ERROR_NOT_AVAILABLE;
+}
+
+NS_IMETHODIMP
+nsJARChannel::SetContentDispositionFilename(
+    const nsAString& aContentDispositionFilename) {
+  return NS_ERROR_NOT_AVAILABLE;
+}
+
+NS_IMETHODIMP
+nsJARChannel::GetContentDispositionHeader(
+    nsACString& aContentDispositionHeader) {
+  return NS_ERROR_NOT_AVAILABLE;
+}
+
+NS_IMETHODIMP
+nsJARChannel::GetContentLength(int64_t* result) {
+  *result = mContentLength;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsJARChannel::SetContentLength(int64_t aContentLength) {
+  mContentLength = aContentLength;
+  return NS_OK;
+}
+
+static void RecordZeroLengthEvent(bool aIsSync, const nsCString& aSpec,
+                                  nsresult aStatus, bool aCanceled,
+                                  const nsCString& aCanceledReason,
+                                  nsILoadInfo* aLoadInfo) {
+  if (!StaticPrefs::network_jar_record_failure_reason()) {
+    return;
+  }
+
+  if (RefPtr<mozilla::dom::BrowsingContext> targetBC =
+          aLoadInfo->GetTargetBrowsingContext()) {
+    if (targetBC->IsDiscarded() && aCanceled) {
+      return;
+    }
+  }
+
+  auto findFilenameStart = [](const nsCString& aSpec) -> uint32_t {
+    int32_t pos = aSpec.Find("!/");
+    if (pos == kNotFound) {
+      MOZ_ASSERT(false, "This should not happen");
+      return 0;
+    }
+    int32_t from = aSpec.RFindChar('/', pos);
+    if (from == kNotFound) {
+      MOZ_ASSERT(false, "This should not happen");
+      return 0;
+    }
+    from++;
+    return from;
+  };
+
+  uint32_t from = findFilenameStart(aSpec);
+  const auto fileName = Substring(aSpec, from);
+
+  nsAutoCString errorCString;
+  mozilla::GetErrorName(aStatus, errorCString);
+
+  bool isTest = fileName.Find("test_empty_file.zip!") != -1;
+  bool isOmniJa = StringBeginsWith(fileName, "omni.ja!"_ns);
+
+  if (StringEndsWith(fileName, ".ftl"_ns)) {
+    if (!isTest && aStatus == NS_ERROR_FILE_NOT_FOUND) {
+      return;
+    }
+
+
+
+  } else if (StringEndsWith(fileName, ".dtd"_ns)) {
+    if (!isTest && StringBeginsWith(fileName, "omni.ja!/res/dtd"_ns)) {
+      return;
+    }
+
+
+
+  } else if (StringEndsWith(fileName, ".properties"_ns)) {
+
+
+  } else if (StringEndsWith(fileName, ".js"_ns) ||
+             StringEndsWith(fileName, ".mjs"_ns)) {
+    if (!isTest && !isOmniJa) {
+      return;
+    }
+
+
+
+  } else if (StringEndsWith(fileName, ".xml"_ns)) {
+
+
+  } else if (StringEndsWith(fileName, ".xhtml"_ns)) {
+    if (aStatus == NS_ERROR_PARSED_DATA_CACHED) {
+      return;
+    }
+
+    if (!isOmniJa) {
+      return;
+    }
+
+
+
+  } else if (StringEndsWith(fileName, ".css"_ns)) {
+    if (aStatus == NS_BINDING_ABORTED) {
+      return;
+    }
+
+    if (!isOmniJa && aStatus == NS_ERROR_CORRUPTED_CONTENT) {
+      return;
+    }
+
+
+
+  } else if (StringEndsWith(fileName, ".json"_ns)) {
+    if (!isTest && aStatus == NS_ERROR_FILE_NOT_FOUND) {
+      return;
+    }
+
+
+
+  } else if (StringEndsWith(fileName, ".html"_ns)) {
+    if (!isOmniJa) {
+      return;
+    }
+
+    if (fileName.EqualsLiteral("omni.ja!/chrome/browser/res/newtab/"
+                               "prerendered/activity-stream-noscripts.html") &&
+        aStatus == NS_ERROR_FAILURE) {
+      return;
+    }
+
+
+
+  } else if (StringEndsWith(fileName, ".png"_ns)) {
+    if (!isOmniJa || aStatus == NS_BINDING_ABORTED) {
+      return;
+    }
+
+
+
+  } else if (StringEndsWith(fileName, ".svg"_ns)) {
+    if (!isOmniJa || aStatus == NS_BINDING_ABORTED) {
+      return;
+    }
+
+
+  } else {  
+    if (!isTest && (!isOmniJa || (aStatus == NS_BINDING_ABORTED &&
+                                  StringEndsWith(fileName, ".ico"_ns)))) {
+      return;
+    }
+
+
+
+  }
+}
+
+NS_IMETHODIMP
+nsJARChannel::Open(nsIInputStream** aStream) {
+  LOG(("nsJARChannel::Open [this=%p]\n", this));
+  nsCOMPtr<nsIStreamListener> listener;
+  nsresult rv =
+      nsContentSecurityManager::doContentSecurityCheck(this, listener);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  auto recordEvent = MakeScopeExit([&] {
+    if (mContentLength <= 0 || NS_FAILED(rv)) {
+      RecordZeroLengthEvent(true, mSpec, rv, mCanceled, mCanceledReason,
+                            mLoadInfo);
+    }
+  });
+
+  LOG(("nsJARChannel::Open [this=%p]\n", this));
+
+  NS_ENSURE_TRUE(!mOpened, NS_ERROR_IN_PROGRESS);
+  NS_ENSURE_TRUE(!mIsPending, NS_ERROR_IN_PROGRESS);
+
+  mJarFile = nullptr;
+
+  rv = LookupFile();
+  if (NS_FAILED(rv)) return rv;
+
+  if (!mJarFile) {
+    MOZ_ASSERT_UNREACHABLE("only file-backed jars are supported");
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+
+  RefPtr<nsJARInputThunk> input;
+  rv = CreateJarInput(gJarHandler->JarCache(), getter_AddRefs(input));
+  if (NS_FAILED(rv)) return rv;
+
+  input.forget(aStream);
+  SetOpened();
+
+  return NS_OK;
+}
+
+void nsJARChannel::SetOpened() {
+  MOZ_ASSERT(!mOpened, "Opening channel twice?");
+  mOpened = true;
+  if (!GetContentTypeGuess(mContentType)) {
+    mContentType.Assign(UNKNOWN_CONTENT_TYPE);
+  }
+}
+
+NS_IMETHODIMP
+nsJARChannel::AsyncOpen(nsIStreamListener* aListener) {
+  LOG(("nsJARChannel::AsyncOpen [this=%p]\n", this));
+  nsCOMPtr<nsIStreamListener> listener = aListener;
+  nsresult rv =
+      nsContentSecurityManager::doContentSecurityCheck(this, listener);
+  if (NS_FAILED(rv)) {
+    mIsPending = false;
+    mListener = nullptr;
+    mCallbacks = nullptr;
+    mProgressSink = nullptr;
+    return rv;
+  }
+
+  LOG(("nsJARChannel::AsyncOpen [this=%p]\n", this));
+  MOZ_ASSERT(
+      mLoadInfo->GetSecurityMode() == 0 ||
+          mLoadInfo->GetInitialSecurityCheckDone() ||
+          (mLoadInfo->GetSecurityMode() ==
+               nsILoadInfo::SEC_ALLOW_CROSS_ORIGIN_SEC_CONTEXT_IS_NULL &&
+           mLoadInfo->GetLoadingPrincipal() &&
+           mLoadInfo->GetLoadingPrincipal()->IsSystemPrincipal()),
+      "security flags in loadInfo but doContentSecurityCheck() not called");
+
+  NS_ENSURE_ARG_POINTER(listener);
+  NS_ENSURE_TRUE(!mOpened, NS_ERROR_IN_PROGRESS);
+  NS_ENSURE_TRUE(!mIsPending, NS_ERROR_IN_PROGRESS);
+
+  mJarFile = nullptr;
+
+  NS_QueryNotificationCallbacks(mCallbacks, mLoadGroup, mProgressSink);
+
+  mListener = std::move(listener);
+  mIsPending = true;
+
+  rv = LookupFile();
+  if (NS_FAILED(rv) || !mJarFile) {
+    mIsPending = false;
+    mListener = nullptr;
+    mCallbacks = nullptr;
+    mProgressSink = nullptr;
+    return mJarFile ? rv : NS_ERROR_UNSAFE_CONTENT_TYPE;
+  }
+
+  rv = OpenLocalFile();
+  if (NS_FAILED(rv)) {
+    mIsPending = false;
+    mListener = nullptr;
+    mCallbacks = nullptr;
+    mProgressSink = nullptr;
+    return rv;
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsJARChannel::GetJarFile(nsIFile** aFile) {
+  NS_IF_ADDREF(*aFile = mJarFile);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsJARChannel::SetJarFile(nsIFile* aFile) {
+  if (mOpened) {
+    return NS_ERROR_IN_PROGRESS;
+  }
+  mJarFileOverride = aFile;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsJARChannel::EnsureCached(bool* aIsCached) {
+  nsresult rv;
+  *aIsCached = false;
+
+  if (mOpened) {
+    return NS_ERROR_ALREADY_OPENED;
+  }
+
+  if (mPreCachedJarReader) {
+    *aIsCached = true;
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIURI> innerFileURI;
+  rv = mJarURI->GetJARFile(getter_AddRefs(innerFileURI));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsIFileURL> innerFileURL = do_QueryInterface(innerFileURI, &rv);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsIFile> jarFile;
+  rv = innerFileURL->GetFile(getter_AddRefs(jarFile));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsIIOService> ioService = do_GetIOService(&rv);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsIProtocolHandler> handler;
+  rv = ioService->GetProtocolHandler("jar", getter_AddRefs(handler));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  auto jarHandler = static_cast<nsJARProtocolHandler*>(handler.get());
+  MOZ_ASSERT(jarHandler);
+
+  nsIZipReaderCache* jarCache = jarHandler->JarCache();
+
+  rv = jarCache->GetZipIfCached(jarFile, getter_AddRefs(mPreCachedJarReader));
+  if (rv == NS_ERROR_CACHE_KEY_NOT_FOUND) {
+    return NS_OK;
+  }
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  *aIsCached = true;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsJARChannel::GetZipEntry(nsIZipEntry** aZipEntry) {
+  nsresult rv = LookupFile();
+  if (NS_FAILED(rv)) return rv;
+
+  if (!mJarFile) return NS_ERROR_NOT_AVAILABLE;
+
+  nsCOMPtr<nsIZipReader> reader;
+  rv = gJarHandler->JarCache()->GetZip(mJarFile, getter_AddRefs(reader));
+  if (NS_FAILED(rv)) return rv;
+
+  return reader->GetEntry(mJarEntry, aZipEntry);
+}
+
+
+NS_IMETHODIMP
+nsJARChannel::OnStartRequest(nsIRequest* req) {
+  LOG(("nsJARChannel::OnStartRequest [this=%p %s]\n", this, mSpec.get()));
+
+  mRequest = req;
+  nsCOMPtr<nsIStreamListener> listener = mListener;
+  nsresult rv = listener->OnStartRequest(this);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  nsAutoCString contentType;
+  GetContentType(contentType);
+  auto contentPolicyType = mLoadInfo->GetExternalContentPolicyType();
+  if (contentType.Equals(APPLICATION_HTTP_INDEX_FORMAT) &&
+      contentPolicyType != ExtContentPolicy::TYPE_DOCUMENT &&
+      contentPolicyType != ExtContentPolicy::TYPE_FETCH) {
+    return NS_ERROR_CORRUPTED_CONTENT;
+  }
+  if (contentPolicyType == ExtContentPolicy::TYPE_STYLESHEET &&
+      !contentType.EqualsLiteral(TEXT_CSS)) {
+    return NS_ERROR_CORRUPTED_CONTENT;
+  }
+  if (contentPolicyType == ExtContentPolicy::TYPE_SCRIPT &&
+      !nsContentUtils::IsJavascriptMIMEType(
+          NS_ConvertUTF8toUTF16(contentType))) {
+    return NS_ERROR_CORRUPTED_CONTENT;
+  }
+
+  return rv;
+}
+
+NS_IMETHODIMP
+nsJARChannel::OnStopRequest(nsIRequest* req, nsresult status) {
+  LOG(("nsJARChannel::OnStopRequest [this=%p %s status=%" PRIx32 "]\n", this,
+       mSpec.get(), static_cast<uint32_t>(status)));
+
+  if (NS_SUCCEEDED(mStatus)) mStatus = status;
+
+  if (nsCOMPtr<nsIStreamListener> listener = mListener) {
+    if (!mOnDataCalled || NS_FAILED(status)) {
+      RecordZeroLengthEvent(false, mSpec, status, mCanceled, mCanceledReason,
+                            mLoadInfo);
+    }
+
+    listener->OnStopRequest(this, status);
+    mListener = nullptr;
+  }
+
+  if (mLoadGroup) mLoadGroup->RemoveRequest(this, nullptr, status);
+
+  mRequest = nullptr;
+  mPump = nullptr;
+  mIsPending = false;
+
+  mCallbacks = nullptr;
+  mProgressSink = nullptr;
+
+  mJarFile = nullptr;
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsJARChannel::OnDataAvailable(nsIRequest* req, nsIInputStream* stream,
+                              uint64_t offset, uint32_t count) {
+  LOG(("nsJARChannel::OnDataAvailable [this=%p %s]\n", this, mSpec.get()));
+
+  nsresult rv;
+
+  if (mCanceled) {
+    return mStatus;
+  }
+
+  mOnDataCalled = true;
+  nsCOMPtr<nsIStreamListener> listener = mListener;
+  rv = listener->OnDataAvailable(this, stream, offset, count);
+
+  if (mProgressSink && NS_SUCCEEDED(rv)) {
+    if (NS_IsMainThread()) {
+      FireOnProgress(offset + count);
+    } else {
+      NS_DispatchToMainThread(NewRunnableMethod<uint64_t>(
+          "nsJARChannel::FireOnProgress", this, &nsJARChannel::FireOnProgress,
+          offset + count));
+    }
+  }
+
+  return rv;  
+}
+
+NS_IMETHODIMP
+nsJARChannel::RetargetDeliveryTo(nsISerialEventTarget* aEventTarget) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  nsCOMPtr<nsIThreadRetargetableRequest> request = do_QueryInterface(mRequest);
+  if (!request) {
+    return NS_ERROR_NO_INTERFACE;
+  }
+
+  return request->RetargetDeliveryTo(aEventTarget);
+}
+
+NS_IMETHODIMP
+nsJARChannel::GetDeliveryTarget(nsISerialEventTarget** aEventTarget) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  nsCOMPtr<nsIThreadRetargetableRequest> request = do_QueryInterface(mRequest);
+  if (!request) {
+    return NS_ERROR_NO_INTERFACE;
+  }
+
+  return request->GetDeliveryTarget(aEventTarget);
+}
+
+NS_IMETHODIMP
+nsJARChannel::CheckListenerChain() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  nsCOMPtr<nsIThreadRetargetableStreamListener> listener =
+      do_QueryInterface(mListener);
+  if (!listener) {
+    return NS_ERROR_NO_INTERFACE;
+  }
+
+  return listener->CheckListenerChain();
+}
+
+NS_IMETHODIMP
+nsJARChannel::OnDataFinished(nsresult aStatus) {
+  nsCOMPtr<nsIThreadRetargetableStreamListener> listener =
+      do_QueryInterface(mListener);
+  if (listener) {
+    return listener->OnDataFinished(aStatus);
+  }
+
+  return NS_OK;
+}

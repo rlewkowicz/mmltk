@@ -1,0 +1,164 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(PlatformEncoderModule_h_)
+#  define PlatformEncoderModule_h_
+
+#  include "EncoderConfig.h"
+#  include "MP4Decoder.h"
+#  include "MediaCodecsSupport.h"
+#  include "MediaResult.h"
+#  include "VPXDecoder.h"
+#  include "VideoUtils.h"
+#  include "mozilla/Maybe.h"
+#  include "mozilla/MozPromise.h"
+#  include "mozilla/RefPtr.h"
+#  include "mozilla/TaskQueue.h"
+#  include "mozilla/dom/ImageBitmapBinding.h"
+#  include "nsISupportsImpl.h"
+
+namespace mozilla {
+
+class MediaDataEncoder;
+class MediaData;
+class EncoderConfigurationChangeList;
+
+class PlatformEncoderModule {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(PlatformEncoderModule)
+
+  virtual already_AddRefed<MediaDataEncoder> CreateVideoEncoder(
+      const EncoderConfig& aConfig, const RefPtr<TaskQueue>& aTaskQueue) const {
+    return nullptr;
+  };
+
+  virtual already_AddRefed<MediaDataEncoder> CreateAudioEncoder(
+      const EncoderConfig& aConfig, const RefPtr<TaskQueue>& aTaskQueue) const {
+    return nullptr;
+  };
+
+  using CreateEncoderPromise = MozPromise<RefPtr<MediaDataEncoder>, MediaResult,
+                                           true>;
+
+  virtual media::EncodeSupportSet Supports(
+      const EncoderConfig& aConfig) const = 0;
+  virtual media::EncodeSupportSet SupportsCodec(CodecType aCodecType) const = 0;
+
+  virtual const char* GetName() const = 0;
+
+  virtual RefPtr<PlatformEncoderModule::CreateEncoderPromise>
+  AsyncCreateEncoder(const EncoderConfig& aEncoderConfig,
+                     const RefPtr<TaskQueue>& aTaskQueue);
+
+ protected:
+  PlatformEncoderModule() = default;
+  virtual ~PlatformEncoderModule() = default;
+};
+
+class MediaDataEncoder {
+ public:
+  NS_INLINE_DECL_PURE_VIRTUAL_REFCOUNTING
+
+  using InitPromise = MozPromise<bool, MediaResult,  true>;
+  using EncodedData = nsTArray<RefPtr<MediaRawData>>;
+  using EncodePromise =
+      MozPromise<EncodedData, MediaResult,  true>;
+  using ReconfigurationPromise =
+      MozPromise<bool, MediaResult,  true>;
+
+  virtual RefPtr<InitPromise> Init() = 0;
+
+  virtual RefPtr<EncodePromise> Encode(const MediaData* aSample) = 0;
+
+  virtual RefPtr<EncodePromise> Encode(nsTArray<RefPtr<MediaData>>&& aSamples) {
+    MOZ_ASSERT_UNREACHABLE("Encode samples in a batch is not implemented");
+    return EncodePromise::CreateAndReject(
+        MediaResult(NS_ERROR_NOT_IMPLEMENTED,
+                    "Encode samples in a batch is not implemented"),
+        __func__);
+  }
+
+  virtual RefPtr<ReconfigurationPromise> Reconfigure(
+      const RefPtr<const EncoderConfigurationChangeList>&
+          aConfigurationChanges) = 0;
+
+  virtual RefPtr<EncodePromise> Drain() = 0;
+
+  virtual RefPtr<ShutdownPromise> Shutdown() = 0;
+
+  virtual RefPtr<GenericPromise> SetBitrate(uint32_t aBitsPerSec) {
+    return GenericPromise::CreateAndResolve(true, __func__);
+  }
+
+  virtual bool IsHardwareAccelerated(nsACString& aFailureReason) const {
+    return false;
+  }
+
+  virtual nsCString GetDescriptionName() const = 0;
+
+  friend class PlatformEncoderModule;
+
+ protected:
+  virtual ~MediaDataEncoder() = default;
+};
+
+template <typename T, typename Phantom>
+class StrongTypedef {
+ public:
+  StrongTypedef() = default;
+  explicit StrongTypedef(T const& value) : mValue(value) {}
+  explicit StrongTypedef(T&& value) : mValue(std::move(value)) {}
+  T& get() { return mValue; }
+  T const& get() const { return mValue; }
+
+  auto MutTiedFields() { return std::tie(mValue); }
+
+ private:
+  T mValue{};
+
+  friend struct IPC::ParamTraits<StrongTypedef<T, Phantom>>;
+};
+
+using DimensionsChange =
+    StrongTypedef<gfx::IntSize, struct DimensionsChangeType>;
+using DisplayDimensionsChange =
+    StrongTypedef<Maybe<gfx::IntSize>, struct DisplayDimensionsChangeType>;
+using BitrateChange = StrongTypedef<Maybe<uint32_t>, struct BitrateChangeType>;
+using FramerateChange =
+    StrongTypedef<Maybe<double>, struct FramerateChangeType>;
+using BitrateModeChange =
+    StrongTypedef<BitrateMode, struct BitrateModeChangeType>;
+using UsageChange = StrongTypedef<Usage, struct UsageChangeType>;
+using ContentHintChange =
+    StrongTypedef<Maybe<nsString>, struct ContentHintTypeType>;
+using SampleRateChange = StrongTypedef<uint32_t, struct SampleRateChangeType>;
+using NumberOfChannelsChange =
+    StrongTypedef<uint32_t, struct NumberOfChannelsChangeType>;
+
+using EncoderConfigurationItem =
+    Variant<DimensionsChange, DisplayDimensionsChange, BitrateModeChange,
+            BitrateChange, FramerateChange, UsageChange, ContentHintChange,
+            SampleRateChange, NumberOfChannelsChange>;
+
+class EncoderConfigurationChangeList {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(EncoderConfigurationChangeList)
+  bool Empty() const { return mChanges.IsEmpty(); }
+  template <typename T>
+  void Push(const T& aItem) {
+    mChanges.AppendElement(aItem);
+  }
+  nsString ToString() const;
+
+  nsTArray<EncoderConfigurationItem> mChanges;
+
+ private:
+  ~EncoderConfigurationChangeList() = default;
+};
+
+bool CanLikelyEncode(const EncoderConfig& aConfig);
+
+}  
+
+#endif /* PlatformEncoderModule_h_ */

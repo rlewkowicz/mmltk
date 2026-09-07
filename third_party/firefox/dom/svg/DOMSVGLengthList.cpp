@@ -1,0 +1,317 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "DOMSVGLengthList.h"
+
+#include <algorithm>
+
+#include "DOMSVGLength.h"
+#include "SVGAnimatedLengthList.h"
+#include "SVGElement.h"
+#include "mozilla/dom/SVGLengthListBinding.h"
+#include "nsError.h"
+
+
+namespace {
+
+using mozilla::dom::DOMSVGLength;
+
+void UpdateListIndicesFromIndex(FallibleTArray<DOMSVGLength*>& aItemsArray,
+                                uint32_t aStartingIndex) {
+  uint32_t length = aItemsArray.Length();
+
+  for (uint32_t i = aStartingIndex; i < length; ++i) {
+    if (aItemsArray[i]) {
+      aItemsArray[i]->UpdateListIndex(i);
+    }
+  }
+}
+
+}  
+
+namespace mozilla::dom {
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(DOMSVGLengthList)
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(DOMSVGLengthList)
+  if (tmp->mAList) {
+    if (tmp->IsAnimValList()) {
+      tmp->mAList->mAnimVal = nullptr;
+    } else {
+      tmp->mAList->mBaseVal = nullptr;
+    }
+    NS_IMPL_CYCLE_COLLECTION_UNLINK(mAList)
+  }
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_PRESERVED_WRAPPER
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(DOMSVGLengthList)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mAList)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+NS_IMPL_CYCLE_COLLECTION_TRACE_BEGIN(DOMSVGLengthList)
+  NS_IMPL_CYCLE_COLLECTION_TRACE_PRESERVED_WRAPPER
+NS_IMPL_CYCLE_COLLECTION_TRACE_END
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(DOMSVGLengthList)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(DOMSVGLengthList)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(DOMSVGLengthList)
+  NS_INTERFACE_MAP_ENTRY(DOMSVGLengthList)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+void DOMSVGLengthList::IndexedSetter(uint32_t index, DOMSVGLength& newValue,
+                                     ErrorResult& aRv) {
+  RefPtr<DOMSVGLength> ignored = ReplaceItem(newValue, index, aRv);
+  (void)ignored;
+}
+
+JSObject* DOMSVGLengthList::WrapObject(JSContext* cx,
+                                       JS::Handle<JSObject*> aGivenProto) {
+  return mozilla::dom::SVGLengthList_Binding::Wrap(cx, this, aGivenProto);
+}
+
+void DOMSVGLengthList::InternalListLengthWillChange(uint32_t aNewLength) {
+  uint32_t oldLength = mItems.Length();
+
+  if (aNewLength > DOMSVGLength::MaxListIndex()) {
+    aNewLength = DOMSVGLength::MaxListIndex();
+  }
+
+  RefPtr<DOMSVGLengthList> kungFuDeathGrip;
+  if (aNewLength < oldLength) {
+    kungFuDeathGrip = this;
+  }
+
+  for (uint32_t i = aNewLength; i < oldLength; ++i) {
+    if (mItems[i]) {
+      mItems[i]->RemovingFromList();
+    }
+  }
+
+  if (!mItems.SetLength(aNewLength, fallible)) {
+    mItems.Clear();
+    return;
+  }
+
+  for (uint32_t i = oldLength; i < aNewLength; ++i) {
+    mItems[i] = nullptr;
+  }
+}
+
+SVGLengthList& DOMSVGLengthList::InternalList() const {
+  SVGAnimatedLengthList* alist = Element()->GetAnimatedLengthList(AttrEnum());
+  return IsAnimValList() && alist->mAnimVal ? *alist->mAnimVal
+                                            : alist->mBaseVal;
+}
+
+
+void DOMSVGLengthList::Clear(ErrorResult& aRv) {
+  if (IsAnimValList()) {
+    aRv.ThrowNoModificationAllowedError("Animated values cannot be set");
+    return;
+  }
+
+  if (LengthNoFlush() > 0) {
+    AutoChangeLengthListNotifier notifier(this);
+    mAList->InternalBaseValListWillChangeTo(SVGLengthList());
+
+    mItems.Clear();
+    InternalList().Clear();
+  }
+}
+
+already_AddRefed<DOMSVGLength> DOMSVGLengthList::Initialize(
+    DOMSVGLength& newItem, ErrorResult& aRv) {
+  if (IsAnimValList()) {
+    aRv.ThrowNoModificationAllowedError("Animated values cannot be set");
+    return nullptr;
+  }
+
+
+  RefPtr<DOMSVGLength> domItem = &newItem;
+  if (domItem->HasOwner()) {
+    domItem = domItem->Copy();
+  }
+
+  ErrorResult rv;
+  Clear(rv);
+  MOZ_ASSERT(!rv.Failed());
+  return InsertItemBefore(*domItem, 0, aRv);
+}
+
+already_AddRefed<DOMSVGLength> DOMSVGLengthList::GetItem(uint32_t index,
+                                                         ErrorResult& aRv) {
+  bool found;
+  RefPtr<DOMSVGLength> item = IndexedGetter(index, found, aRv);
+  if (!found) {
+    aRv.ThrowIndexSizeError("Index out of range");
+  }
+  return item.forget();
+}
+
+already_AddRefed<DOMSVGLength> DOMSVGLengthList::IndexedGetter(
+    uint32_t index, bool& found, ErrorResult& aRv) {
+  if (IsAnimValList()) {
+    Element()->FlushAnimations();
+  }
+  found = index < LengthNoFlush();
+  if (found) {
+    return GetItemAt(index);
+  }
+  return nullptr;
+}
+
+already_AddRefed<DOMSVGLength> DOMSVGLengthList::InsertItemBefore(
+    DOMSVGLength& newItem, uint32_t index, ErrorResult& aRv) {
+  if (IsAnimValList()) {
+    aRv.ThrowNoModificationAllowedError("Animated values cannot be set");
+    return nullptr;
+  }
+
+  if (LengthNoFlush() >= DOMSVGLength::MaxListIndex()) {
+    aRv.ThrowIndexSizeError("List too long");
+    return nullptr;
+  }
+
+  RefPtr<DOMSVGLength> domItem = &newItem;
+  if (domItem->HasOwner()) {
+    domItem = domItem->Copy();  
+  }
+
+  if (!mItems.SetCapacity(mItems.Length() + 1, fallible) ||
+      !InternalList().SetCapacity(InternalList().Length() + 1)) {
+    aRv.Throw(NS_ERROR_OUT_OF_MEMORY);
+    return nullptr;
+  }
+  if (AnimListMirrorsBaseList()) {
+    if (!mAList->mAnimVal->mItems.SetCapacity(
+            mAList->mAnimVal->mItems.Length() + 1, fallible)) {
+      aRv.Throw(NS_ERROR_OUT_OF_MEMORY);
+      return nullptr;
+    }
+  }
+
+  index = std::min(index, LengthNoFlush());
+
+  AutoChangeLengthListNotifier notifier(this);
+  MaybeInsertNullInAnimValListAt(index);
+
+  InternalList().InsertItem(index, domItem->ToSVGLength());
+  MOZ_ALWAYS_TRUE(mItems.InsertElementAt(index, domItem.get(), fallible));
+
+  domItem->InsertingIntoList(this, AttrEnum(), index, IsAnimValList());
+
+  UpdateListIndicesFromIndex(mItems, index + 1);
+
+  return domItem.forget();
+}
+
+already_AddRefed<DOMSVGLength> DOMSVGLengthList::ReplaceItem(
+    DOMSVGLength& newItem, uint32_t index, ErrorResult& aRv) {
+  if (IsAnimValList()) {
+    aRv.ThrowNoModificationAllowedError("Animated values cannot be set");
+    return nullptr;
+  }
+
+  if (index >= LengthNoFlush()) {
+    aRv.ThrowIndexSizeError("Index out of range");
+    return nullptr;
+  }
+
+  RefPtr<DOMSVGLength> domItem = &newItem;
+  if (domItem->HasOwner()) {
+    domItem = domItem->Copy();  
+  }
+
+  AutoChangeLengthListNotifier notifier(this);
+  if (mItems[index]) {
+    mItems[index]->RemovingFromList();
+  }
+
+  InternalList()[index] = domItem->ToSVGLength();
+  mItems[index] = domItem;
+
+  domItem->InsertingIntoList(this, AttrEnum(), index, IsAnimValList());
+
+  return domItem.forget();
+}
+
+already_AddRefed<DOMSVGLength> DOMSVGLengthList::RemoveItem(uint32_t index,
+                                                            ErrorResult& aRv) {
+  if (IsAnimValList()) {
+    aRv.ThrowNoModificationAllowedError("Animated values cannot be set");
+    return nullptr;
+  }
+
+  if (index >= LengthNoFlush()) {
+    aRv.ThrowIndexSizeError("Index out of range");
+    return nullptr;
+  }
+
+  AutoChangeLengthListNotifier notifier(this);
+  MaybeRemoveItemFromAnimValListAt(index);
+
+  RefPtr<DOMSVGLength> result = GetItemAt(index);
+
+  mItems[index]->RemovingFromList();
+
+  InternalList().RemoveItem(index);
+  mItems.RemoveElementAt(index);
+
+  UpdateListIndicesFromIndex(mItems, index);
+
+  return result.forget();
+}
+
+already_AddRefed<DOMSVGLength> DOMSVGLengthList::GetItemAt(uint32_t aIndex) {
+  MOZ_ASSERT(aIndex < mItems.Length());
+
+  if (!mItems[aIndex]) {
+    mItems[aIndex] =
+        new DOMSVGLength(this, AttrEnum(), aIndex, IsAnimValList());
+  }
+  RefPtr<DOMSVGLength> result = mItems[aIndex];
+  return result.forget();
+}
+
+void DOMSVGLengthList::MaybeInsertNullInAnimValListAt(uint32_t aIndex) {
+  MOZ_ASSERT(!IsAnimValList(), "call from baseVal to animVal");
+
+  if (!AnimListMirrorsBaseList()) {
+    return;
+  }
+
+  DOMSVGLengthList* animVal = mAList->mAnimVal;
+
+  MOZ_ASSERT(animVal, "AnimListMirrorsBaseList() promised a non-null animVal");
+  MOZ_ASSERT(animVal->mItems.Length() == mItems.Length(),
+             "animVal list not in sync!");
+  MOZ_ALWAYS_TRUE(animVal->mItems.InsertElementAt(aIndex, nullptr, fallible));
+
+  UpdateListIndicesFromIndex(animVal->mItems, aIndex + 1);
+}
+
+void DOMSVGLengthList::MaybeRemoveItemFromAnimValListAt(uint32_t aIndex) {
+  MOZ_ASSERT(!IsAnimValList(), "call from baseVal to animVal");
+
+  if (!AnimListMirrorsBaseList()) {
+    return;
+  }
+
+  RefPtr<DOMSVGLengthList> animVal = mAList->mAnimVal;
+
+  MOZ_ASSERT(animVal, "AnimListMirrorsBaseList() promised a non-null animVal");
+  MOZ_ASSERT(animVal->mItems.Length() == mItems.Length(),
+             "animVal list not in sync!");
+
+  if (animVal->mItems[aIndex]) {
+    animVal->mItems[aIndex]->RemovingFromList();
+  }
+  animVal->mItems.RemoveElementAt(aIndex);
+
+  UpdateListIndicesFromIndex(animVal->mItems, aIndex);
+}
+
+}  

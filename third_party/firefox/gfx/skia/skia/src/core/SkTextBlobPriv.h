@@ -1,0 +1,209 @@
+/*
+ * Copyright 2018 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkTextBlobPriv_DEFINED)
+#define SkTextBlobPriv_DEFINED
+
+#include "include/core/SkColorFilter.h"
+#include "include/core/SkFont.h"
+#include "include/core/SkImageFilter.h"
+#include "include/core/SkMaskFilter.h"
+#include "include/core/SkPathEffect.h"
+#include "include/core/SkShader.h"
+#include "include/core/SkTextBlob.h"
+#include "include/core/SkTypeface.h"
+#include "src/base/SkSafeMath.h"
+#include "src/core/SkPaintPriv.h"
+
+class SkReadBuffer;
+class SkWriteBuffer;
+
+class SkTextBlobPriv {
+public:
+    static void Flatten(const SkTextBlob& , SkWriteBuffer&);
+
+    static sk_sp<SkTextBlob> MakeFromBuffer(SkReadBuffer&);
+
+    static bool HasRSXForm(const SkTextBlob& blob);
+};
+
+
+SkDEBUGCODE(static const unsigned kRunRecordMagic = 0xb10bcafe;)
+
+class SkTextBlob::RunRecord {
+public:
+    RunRecord(uint32_t count, uint32_t textSize,  const SkPoint& offset, const SkFont& font, GlyphPositioning pos)
+            : fFont(font)
+            , fCount(count)
+            , fOffset(offset)
+            , fFlags(pos) {
+        SkASSERT(static_cast<unsigned>(pos) <= Flags::kPositioning_Mask);
+
+        SkDEBUGCODE(fMagic = kRunRecordMagic);
+        if (textSize > 0) {
+            fFlags |= kExtended_Flag;
+            *this->textSizePtr() = textSize;
+        }
+    }
+
+    uint32_t glyphCount() const {
+        return fCount;
+    }
+
+    const SkPoint& offset() const {
+        return fOffset;
+    }
+
+    const SkFont& font() const {
+        return fFont;
+    }
+
+    GlyphPositioning positioning() const {
+        return static_cast<GlyphPositioning>(fFlags & kPositioning_Mask);
+    }
+
+    SkGlyphID* glyphBuffer() const {
+        static_assert(SkIsAlignPtr(sizeof(RunRecord)), "");
+        return reinterpret_cast<SkGlyphID*>(const_cast<RunRecord*>(this) + 1);
+    }
+
+    SkScalar* posBuffer() const {
+        return reinterpret_cast<SkScalar*>(reinterpret_cast<uint8_t*>(this->glyphBuffer()) +
+                                           SkAlign4(fCount * sizeof(SkGlyphID)));
+    }
+
+    SkPoint* pointBuffer() const {
+        SkASSERT(this->positioning() == (GlyphPositioning)2);
+        return reinterpret_cast<SkPoint*>(this->posBuffer());
+    }
+
+    SkRSXform* xformBuffer() const {
+        SkASSERT(this->positioning() == (GlyphPositioning)3);
+        return reinterpret_cast<SkRSXform*>(this->posBuffer());
+    }
+
+    uint32_t textSize() const { return isExtended() ? *this->textSizePtr() : 0; }
+
+    uint32_t* clusterBuffer() const {
+        return isExtended() ? 1 + this->textSizePtr() : nullptr;
+    }
+
+    char* textBuffer() const {
+        return isExtended()
+               ? reinterpret_cast<char*>(this->clusterBuffer() + fCount)
+               : nullptr;
+    }
+
+    bool isLastRun() const { return SkToBool(fFlags & kLast_Flag); }
+
+    static size_t StorageSize(uint32_t glyphCount, uint32_t textSize,
+                              SkTextBlob::GlyphPositioning positioning,
+                              SkSafeMath* safe);
+
+    static const RunRecord* First(const SkTextBlob* blob);
+
+    static const RunRecord* Next(const RunRecord* run);
+
+    void validate(const uint8_t* storageTop) const;
+
+private:
+    friend class SkTextBlobBuilder;
+
+    enum Flags {
+        kPositioning_Mask = 0x03, 
+        kLast_Flag        = 0x04, 
+        kExtended_Flag    = 0x08, 
+    };
+
+    static const RunRecord* NextUnchecked(const RunRecord* run);
+
+    static size_t PosCount(uint32_t glyphCount,
+                           SkTextBlob::GlyphPositioning positioning,
+                           SkSafeMath* safe);
+
+    uint32_t* textSizePtr() const;
+
+    void grow(uint32_t count);
+
+    bool isExtended() const {
+        return fFlags & kExtended_Flag;
+    }
+
+    SkFont           fFont;
+    uint32_t         fCount;
+    SkPoint          fOffset;
+    uint32_t         fFlags;
+
+    SkDEBUGCODE(unsigned fMagic;)
+};
+
+class SK_SPI SkTextBlobRunIterator {
+public:
+    explicit SkTextBlobRunIterator(const SkTextBlob* blob);
+
+    enum GlyphPositioning : uint8_t {
+        kDefault_Positioning      = 0, 
+        kHorizontal_Positioning   = 1, 
+        kFull_Positioning         = 2, 
+        kRSXform_Positioning      = 3, 
+    };
+
+    bool done() const {
+        return !fCurrentRun;
+    }
+    void next();
+
+    uint32_t glyphCount() const {
+        SkASSERT(!this->done());
+        return fCurrentRun->glyphCount();
+    }
+    const SkGlyphID* glyphs() const {
+        SkASSERT(!this->done());
+        return fCurrentRun->glyphBuffer();
+    }
+    const SkScalar* pos() const {
+        SkASSERT(!this->done());
+        return fCurrentRun->posBuffer();
+    }
+    const SkPoint* points() const {
+        return fCurrentRun->pointBuffer();
+    }
+    const SkRSXform* xforms() const {
+        return fCurrentRun->xformBuffer();
+    }
+    const SkPoint& offset() const {
+        SkASSERT(!this->done());
+        return fCurrentRun->offset();
+    }
+    const SkFont& font() const {
+        SkASSERT(!this->done());
+        return fCurrentRun->font();
+    }
+    GlyphPositioning positioning() const;
+    unsigned scalarsPerGlyph() const;
+    uint32_t* clusters() const {
+        SkASSERT(!this->done());
+        return fCurrentRun->clusterBuffer();
+    }
+    uint32_t textSize() const {
+        SkASSERT(!this->done());
+        return fCurrentRun->textSize();
+    }
+    char* text() const {
+        SkASSERT(!this->done());
+        return fCurrentRun->textBuffer();
+    }
+
+    bool isLCD() const;
+
+private:
+    const SkTextBlob::RunRecord* fCurrentRun;
+
+    SkDEBUGCODE(const uint8_t* fStorageTop;)
+};
+
+#endif

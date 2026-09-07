@@ -1,0 +1,274 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef vm_ArrayBufferViewObject_h
+#define vm_ArrayBufferViewObject_h
+
+#include "mozilla/Maybe.h"
+
+#include "builtin/TypedArrayConstants.h"
+#include "vm/ArrayBufferObject.h"
+#include "vm/NativeObject.h"
+#include "vm/SharedArrayObject.h"
+#include "vm/SharedMem.h"
+
+namespace js {
+
+class JS_PUBLIC_API GenericPrinter;
+class JSONPrinter;
+
+
+class ArrayBufferViewObject : public NativeObject {
+ public:
+  static constexpr size_t BUFFER_SLOT = 0;
+  static_assert(BUFFER_SLOT == JS_TYPEDARRAYLAYOUT_BUFFER_SLOT,
+                "self-hosted code with burned-in constants must get the "
+                "right buffer slot");
+
+  static constexpr size_t LENGTH_SLOT = 1;
+
+  static constexpr size_t BYTEOFFSET_SLOT = 2;
+
+  static constexpr size_t DATA_SLOT = 3;
+
+  static constexpr size_t RESERVED_SLOTS = 4;
+
+
+  static const uint8_t AUTO_LENGTH_SLOT = 4;
+  static const uint8_t INITIAL_LENGTH_SLOT = 5;
+  static const uint8_t INITIAL_BYTE_OFFSET_SLOT = 6;
+
+  static constexpr size_t RESIZABLE_RESERVED_SLOTS = 7;
+
+#ifdef DEBUG
+  static const uint8_t ZeroLengthArrayData = 0x4A;
+#endif
+
+  static constexpr int bufferOffset() {
+    return NativeObject::getFixedSlotOffset(BUFFER_SLOT);
+  }
+  static constexpr int lengthOffset() {
+    return NativeObject::getFixedSlotOffset(LENGTH_SLOT);
+  }
+  static constexpr int byteOffsetOffset() {
+    return NativeObject::getFixedSlotOffset(BYTEOFFSET_SLOT);
+  }
+  static constexpr int dataOffset() {
+    return NativeObject::getFixedSlotOffset(DATA_SLOT);
+  }
+  static constexpr int autoLengthOffset() {
+    return NativeObject::getFixedSlotOffset(AUTO_LENGTH_SLOT);
+  }
+  static constexpr int initialLengthOffset() {
+    return NativeObject::getFixedSlotOffset(INITIAL_LENGTH_SLOT);
+  }
+  static constexpr int initialByteOffsetOffset() {
+    return NativeObject::getFixedSlotOffset(INITIAL_BYTE_OFFSET_SLOT);
+  }
+
+ private:
+  void* dataPointerEither_() const {
+    return maybePtrFromReservedSlot<void>(DATA_SLOT);
+  }
+
+ public:
+  [[nodiscard]] bool init(JSContext* cx, ArrayBufferObjectMaybeShared* buffer,
+                          size_t byteOffset, size_t length,
+                          uint32_t bytesPerElement);
+
+  enum class AutoLength : bool { No, Yes };
+
+  [[nodiscard]] bool initResizable(JSContext* cx,
+                                   ArrayBufferObjectMaybeShared* buffer,
+                                   size_t byteOffset, size_t length,
+                                   uint32_t bytesPerElement,
+                                   AutoLength autoLength);
+
+  static ArrayBufferObjectMaybeShared* ensureBufferObject(
+      JSContext* cx, Handle<ArrayBufferViewObject*> obj);
+
+  void notifyBufferDetached();
+  void notifyBufferResized();
+  void notifyBufferMoved(uint8_t* srcBufStart, uint8_t* dstBufStart);
+
+  void initDataPointer(SharedMem<uint8_t*> viewData) {
+    void* data = viewData.unwrap();
+    initReservedSlot(DATA_SLOT, PrivateValue(data));
+  }
+
+  SharedMem<void*> dataPointerShared() const {
+    return SharedMem<void*>::shared(dataPointerEither_());
+  }
+  SharedMem<void*> dataPointerEither() const {
+    if (isSharedMemory()) {
+      return SharedMem<void*>::shared(dataPointerEither_());
+    }
+    return SharedMem<void*>::unshared(dataPointerEither_());
+  }
+  void* dataPointerUnshared() const {
+    MOZ_ASSERT(!isSharedMemory());
+    return dataPointerEither_();
+  }
+
+  Value bufferValue() const { return getFixedSlot(BUFFER_SLOT); }
+  bool hasBuffer() const { return bufferValue().isObject(); }
+
+  ArrayBufferObject* bufferUnshared() const {
+    MOZ_ASSERT(!isSharedMemory());
+    ArrayBufferObjectMaybeShared* obj = bufferEither();
+    if (!obj) {
+      return nullptr;
+    }
+    return &obj->as<ArrayBufferObject>();
+  }
+  SharedArrayBufferObject* bufferShared() const {
+    MOZ_ASSERT(isSharedMemory());
+    ArrayBufferObjectMaybeShared* obj = bufferEither();
+    if (!obj) {
+      return nullptr;
+    }
+    return &obj->as<SharedArrayBufferObject>();
+  }
+  ArrayBufferObjectMaybeShared* bufferEither() const {
+    JSObject* obj =
+        bufferValue().isBoolean() ? nullptr : bufferValue().toObjectOrNull();
+    if (!obj) {
+      return nullptr;
+    }
+    MOZ_ASSERT(isSharedMemory() ? obj->is<SharedArrayBufferObject>()
+                                : obj->is<ArrayBufferObject>());
+    return &obj->as<ArrayBufferObjectMaybeShared>();
+  }
+
+  bool hasDetachedBuffer() const {
+    if (isSharedMemory()) {
+      return false;
+    }
+
+    ArrayBufferObject* buffer = bufferUnshared();
+    if (!buffer) {
+      return false;
+    }
+
+    return buffer->isDetached();
+  }
+
+  bool hasResizableBuffer() const;
+
+  bool hasImmutableBuffer() const;
+
+ private:
+  bool hasDetachedBufferOrIsOutOfBounds() const {
+    if (isSharedMemory()) {
+      return false;
+    }
+
+    auto* buffer = bufferUnshared();
+    if (!buffer) {
+      return false;
+    }
+
+    return buffer->isDetached() || (buffer->isResizable() && isOutOfBounds());
+  }
+
+ public:
+  bool isLengthPinned() const {
+    Value buffer = bufferValue();
+    if (buffer.isBoolean()) {
+      return buffer.toBoolean();
+    }
+    if (isSharedMemory()) {
+      return true;
+    }
+    return bufferUnshared()->isLengthPinned();
+  }
+
+  bool pinLength(bool pin) {
+    if (isSharedMemory()) {
+      return false;
+    }
+
+    if (hasBuffer()) {
+      return bufferUnshared()->pinLength(pin);
+    }
+
+    MOZ_ASSERT(bufferValue().isBoolean());
+
+    bool wasPinned = bufferValue().toBoolean();
+    if (wasPinned == pin) {
+      return false;
+    }
+
+    setFixedSlot(BUFFER_SLOT, JS::BooleanValue(pin));
+    return true;
+  }
+
+  static bool ensureNonInline(JSContext* cx,
+                              JS::Handle<ArrayBufferViewObject*> view);
+
+ private:
+  void computeResizableLengthAndByteOffset(size_t bytesPerElement);
+
+  size_t bytesPerElement() const;
+
+ protected:
+  size_t lengthSlotValue() const {
+    return size_t(getFixedSlot(LENGTH_SLOT).toPrivate());
+  }
+
+  size_t byteOffsetSlotValue() const {
+    return size_t(getFixedSlot(BYTEOFFSET_SLOT).toPrivate());
+  }
+
+  size_t dataPointerOffset() const;
+
+  mozilla::Maybe<size_t> length() const;
+
+ public:
+  mozilla::Maybe<size_t> byteOffset() const;
+
+ private:
+  size_t initialByteOffsetValue() const {
+    return size_t(getFixedSlot(INITIAL_BYTE_OFFSET_SLOT).toPrivate());
+  }
+
+ public:
+
+  bool isAutoLength() const {
+    MOZ_ASSERT(hasResizableBuffer());
+    return getFixedSlot(AUTO_LENGTH_SLOT).toBoolean();
+  }
+
+  size_t initialLength() const {
+    MOZ_ASSERT(hasResizableBuffer());
+    return size_t(getFixedSlot(INITIAL_LENGTH_SLOT).toPrivate());
+  }
+
+  size_t initialByteOffset() const {
+    MOZ_ASSERT(hasResizableBuffer());
+    return initialByteOffsetValue();
+  }
+
+  bool isOutOfBounds() const {
+    MOZ_ASSERT(hasResizableBuffer());
+
+    return lengthSlotValue() == 0 && byteOffsetSlotValue() == 0 &&
+           (initialLength() > 0 || initialByteOffset() > 0);
+  }
+
+ public:
+  static void trace(JSTracer* trc, JSObject* obj);
+
+#if defined(DEBUG) || defined(JS_JITSPEW)
+  void dumpOwnFields(js::JSONPrinter& json) const;
+  void dumpOwnStringContent(js::GenericPrinter& out) const;
+#endif
+};
+
+}  
+
+template <>
+bool JSObject::is<js::ArrayBufferViewObject>() const;
+
+#endif  // vm_ArrayBufferViewObject_h

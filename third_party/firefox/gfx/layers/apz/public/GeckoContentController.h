@@ -1,0 +1,107 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_GeckoContentController_h
+#define mozilla_layers_GeckoContentController_h
+
+#include "GeckoContentControllerTypes.h"
+#include "InputData.h"              // for PinchGestureInput
+#include "LayersTypes.h"            // for ScrollDirection
+#include "Units.h"                  // for CSSPoint, CSSRect, etc
+#include "mozilla/Attributes.h"     // for MOZ_CAN_RUN_SCRIPT
+#include "mozilla/DefineEnum.h"     // for MOZ_DEFINE_ENUM
+#include "mozilla/EventForwards.h"  // for Modifiers
+#include "mozilla/layers/APZThreadUtils.h"
+#include "mozilla/layers/MatrixMessage.h"        // for MatrixMessage
+#include "mozilla/layers/ScrollableLayerGuid.h"  // for ScrollableLayerGuid, etc
+#include "nsISupportsImpl.h"
+
+namespace mozilla {
+
+class Runnable;
+
+namespace layers {
+
+struct DoubleTapToZoomMetrics;
+struct RepaintRequest;
+
+class GeckoContentController {
+ public:
+  using APZStateChange = GeckoContentController_APZStateChange;
+  using TapType = GeckoContentController_TapType;
+  NS_INLINE_DECL_PURE_VIRTUAL_REFCOUNTING
+
+  virtual void NotifyLayerTransforms(nsTArray<MatrixMessage>&& aTransforms) = 0;
+
+  virtual void RequestContentRepaint(const RepaintRequest& aRequest) = 0;
+
+  MOZ_CAN_RUN_SCRIPT
+  virtual void HandleTap(
+      TapType aType, const LayoutDevicePoint& aPoint, Modifiers aModifiers,
+      const ScrollableLayerGuid& aGuid, uint64_t aInputBlockId,
+      const Maybe<DoubleTapToZoomMetrics>& aDoubleTapTooZoomMetrics) = 0;
+
+  virtual void NotifyPinchGesture(PinchGestureInput::PinchGestureType aType,
+                                  const ScrollableLayerGuid& aGuid,
+                                  const LayoutDevicePoint& aFocusPoint,
+                                  LayoutDeviceCoord aSpanChange,
+                                  Modifiers aModifiers) = 0;
+
+  virtual void PostDelayedTask(already_AddRefed<Runnable> aRunnable,
+                               int aDelayMs) {
+    APZThreadUtils::DelayedDispatch(std::move(aRunnable), aDelayMs);
+  }
+
+  virtual bool IsRepaintThread() = 0;
+
+  virtual void DispatchToRepaintThread(already_AddRefed<Runnable> aTask) = 0;
+
+  virtual void NotifyAPZStateChange(const ScrollableLayerGuid& aGuid,
+                                    APZStateChange aChange, int aArg = 0,
+                                    Maybe<uint64_t> aInputBlockId = Nothing()) {
+  }
+
+  virtual void NotifyMozMouseScrollEvent(
+      const ScrollableLayerGuid::ViewID& aScrollId, const nsString& aEvent) {}
+
+  virtual void NotifyFlushComplete() = 0;
+
+  virtual void NotifyAsyncScrollbarDragInitiated(
+      uint64_t aDragBlockId, const ScrollableLayerGuid::ViewID& aScrollId,
+      ScrollDirection aDirection) = 0;
+  virtual void NotifyAsyncScrollbarDragRejected(
+      const ScrollableLayerGuid::ViewID& aScrollId) = 0;
+
+  virtual void NotifyAsyncAutoscrollRejected(
+      const ScrollableLayerGuid::ViewID& aScrollId) = 0;
+
+  virtual void CancelAutoscroll(const ScrollableLayerGuid& aGuid) = 0;
+
+  virtual void NotifyScaleGestureComplete(const ScrollableLayerGuid& aGuid,
+                                          float aScale) = 0;
+
+  virtual void UpdateOverscrollVelocity(const ScrollableLayerGuid& aGuid,
+                                        float aX, float aY,
+                                        bool aIsRootContent) {}
+  virtual void UpdateOverscrollOffset(const ScrollableLayerGuid& aGuid,
+                                      float aX, float aY, bool aIsRootContent) {
+  }
+  virtual void HideDynamicToolbar(const ScrollableLayerGuid& aGuid) {}
+
+  GeckoContentController() = default;
+
+  virtual void Destroy() {}
+
+  virtual bool IsRemote() { return false; }
+
+  virtual PresShell* GetTopLevelPresShell() const { return nullptr; };
+
+ protected:
+  virtual ~GeckoContentController() = default;
+};
+
+}  
+}  
+
+#endif  // mozilla_layers_GeckoContentController_h

@@ -1,0 +1,1688 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+const { AppConstants } = ChromeUtils.importESModule(
+  "resource://gre/modules/AppConstants.sys.mjs"
+);
+
+const { XPCOMUtils } = ChromeUtils.importESModule(
+  "resource://gre/modules/XPCOMUtils.sys.mjs"
+);
+
+let lazy = {};
+
+ChromeUtils.defineESModuleGetters(lazy, {
+  BrowserUtils: "resource://gre/modules/BrowserUtils.sys.mjs",
+  Finder: "resource://gre/modules/Finder.sys.mjs",
+  FinderParent: "resource://gre/modules/FinderParent.sys.mjs",
+  PopupAndRedirectBlocker:
+    "resource://gre/actors/PopupAndRedirectBlockingParent.sys.mjs",
+  SelectParentHelper: "resource://gre/actors/SelectParent.sys.mjs",
+  RemoteWebNavigation:
+    "moz-src:///toolkit/components/remotebrowserutils/RemoteWebNavigation.sys.mjs",
+});
+
+ChromeUtils.defineLazyGetter(lazy, "blankURI", () =>
+  Services.io.newURI("about:blank")
+);
+
+let lazyPrefs = {};
+XPCOMUtils.defineLazyPreferenceGetter(
+  lazyPrefs,
+  "unloadTimeoutMs",
+  "dom.beforeunload_timeout_ms"
+);
+
+Object.defineProperty(lazy, "ProcessHangMonitor", {
+  configurable: true,
+  get() {
+    const kURL = "resource:///modules/ProcessHangMonitor.sys.mjs";
+    if (Cu.isESModuleLoaded(kURL)) {
+      let { ProcessHangMonitor } = ChromeUtils.importESModule(kURL);
+      // eslint-disable-next-line mozilla/valid-lazy
+      Object.defineProperty(lazy, "ProcessHangMonitor", {
+        value: ProcessHangMonitor,
+      });
+      return ProcessHangMonitor;
+    }
+    return null;
+  },
+});
+
+Object.defineProperty(lazy, "SessionStore", {
+  configurable: true,
+  get() {
+    const kURL = "resource:///modules/sessionstore/SessionStore.sys.mjs";
+    if (Cu.isESModuleLoaded(kURL)) {
+      let { SessionStore } = ChromeUtils.importESModule(kURL);
+      // eslint-disable-next-line mozilla/valid-lazy
+      Object.defineProperty(lazy, "SessionStore", {
+        value: SessionStore,
+      });
+      return SessionStore;
+    }
+    return null;
+  },
+});
+
+const elementsToDestroyOnUnload = new Set();
+
+window.addEventListener(
+  "unload",
+  () => {
+    for (let element of elementsToDestroyOnUnload.values()) {
+      element.destroy();
+    }
+    elementsToDestroyOnUnload.clear();
+  },
+  { mozSystemGroup: true, once: true }
+);
+
+export class MozBrowser extends MozElements.MozElementMixin(XULFrameElement) {
+  static get observedAttributes() {
+    return ["remote"];
+  }
+
+  constructor() {
+    super();
+
+    this.onPageHide = this.onPageHide.bind(this);
+
+    this.isNavigating = false;
+
+    this._documentURI = null;
+    this._characterSet = null;
+    this._documentContentType = null;
+
+    this._inPermitUnload = new WeakSet();
+
+    this._originalURI = null;
+    this._searchTerms = "";
+    this._currentAuthPromptURI = null;
+    this.droppedLinkHandler = null;
+    this.mIconURL = null;
+    this.lastURI = null;
+
+    ChromeUtils.defineLazyGetter(this, "popupAndRedirectBlocker", () => {
+      return new lazy.PopupAndRedirectBlocker(this);
+    });
+
+    this.addEventListener(
+      "dragover",
+      event => {
+        if (!this.droppedLinkHandler || event.defaultPrevented) {
+          return;
+        }
+
+        var types = event.dataTransfer.types;
+        if (
+          types.includes("text/x-moz-text-internal") &&
+          !types.includes("text/plain")
+        ) {
+          event.dataTransfer.dropEffect = "none";
+          event.stopPropagation();
+          event.preventDefault();
+        }
+
+        if (this.isRemoteBrowser) {
+          return;
+        }
+
+        let linkHandler = Services.droppedLinkHandler;
+        if (linkHandler.canDropLink(event, false)) {
+          event.preventDefault();
+        }
+      },
+      { mozSystemGroup: true }
+    );
+
+    this.addEventListener(
+      "drop",
+      event => {
+        if (
+          !this.droppedLinkHandler ||
+          event.defaultPrevented ||
+          this.isRemoteBrowser
+        ) {
+          return;
+        }
+
+        let linkHandler = Services.droppedLinkHandler;
+        try {
+          if (!linkHandler.canDropLink(event, false)) {
+            return;
+          }
+
+          var links = linkHandler.dropLinks(event, true);
+        } catch (ex) {
+          return;
+        }
+
+        if (links.length) {
+          let triggeringPrincipal = linkHandler.getTriggeringPrincipal(event);
+          this.droppedLinkHandler(event, links, triggeringPrincipal);
+        }
+      },
+      { mozSystemGroup: true }
+    );
+
+    this.addEventListener("dragstart", event => {
+      if (this.isRemoteBrowser) {
+        event.stopPropagation();
+      }
+    });
+  }
+
+  permanentKey;
+
+  resetFields() {
+    if (this.observer) {
+      try {
+        Services.obs.removeObserver(
+          this.observer,
+          "browser:purge-session-history"
+        );
+      } catch (ex) {
+      }
+      this.observer = null;
+    }
+
+    let browser = this;
+    this.observer = {
+      observe(aSubject, aTopic, aState) {
+        if (aTopic == "browser:purge-session-history") {
+          browser.purgeSessionHistory();
+        } else if (aTopic == "apz:cancel-autoscroll") {
+          if (aState == browser._autoScrollScrollId) {
+            browser._autoScrollScrollId = null;
+            browser._autoScrollPresShellId = null;
+
+            browser._autoScrollPopup.hidePopup();
+          }
+        }
+      },
+      QueryInterface: ChromeUtils.generateQI([
+        "nsIObserver",
+        "nsISupportsWeakReference",
+      ]),
+    };
+
+    this._documentURI = null;
+
+    this._originalURI = null;
+
+    this._currentAuthPromptURI = null;
+
+    this._searchTerms = "";
+
+    this._documentContentType = null;
+
+    this._loadContext = null;
+
+    this._webBrowserFind = null;
+
+    this._finder = null;
+
+    this._remoteFinder = null;
+
+    this._fastFind = null;
+
+    this._lastSearchString = null;
+
+    this._characterSet = "";
+
+    this._mayEnableCharacterEncodingMenu = null;
+
+    this._contentPrincipal = null;
+
+    this._contentPartitionedPrincipal = null;
+
+    this._policyContainer = null;
+
+    this._referrerInfo = null;
+
+    this._contentRequestContextID = null;
+
+    this._rdmFullZoom = 1.0;
+
+    this._isSyntheticDocument = false;
+
+    this.mPrefs = Services.prefs;
+
+    this._hasAnyPlayingMediaBeenBlocked = false;
+
+    this._unselectedTabHoverMessageListenerCount = 0;
+
+    this.urlbarChangeTracker = {
+      _startedLoadSinceLastUserTyping: false,
+
+      startedLoad() {
+        this._startedLoadSinceLastUserTyping = true;
+      },
+      finishedLoad() {
+        this._startedLoadSinceLastUserTyping = false;
+      },
+      userTyped() {
+        this._startedLoadSinceLastUserTyping = false;
+      },
+    };
+
+    this._userTypedValue = null;
+
+    this._AUTOSCROLL_SNAP = 10;
+
+    this._autoScrollBrowsingContext = null;
+
+    this._startX = null;
+
+    this._startY = null;
+
+    this._autoScrollPopup = null;
+
+    this._autoScrollScrollId = null;
+
+    this._autoScrollPresShellId = null;
+  }
+
+  connectedCallback() {
+    if (this.delayConnectedCallback()) {
+      return;
+    }
+
+    this.construct();
+  }
+
+  connectedMoveCallback() {
+  }
+
+  disconnectedCallback() {
+    this.destroy();
+  }
+
+  get autoscrollEnabled() {
+    if (this.getAttribute("autoscroll") == "false") {
+      return false;
+    }
+
+    return this.mPrefs.getBoolPref("general.autoScroll", true);
+  }
+
+  get canGoBack() {
+    return this.webNavigation.canGoBack;
+  }
+
+  get canGoBackIgnoringUserInteraction() {
+    return this.webNavigation.canGoBackIgnoringUserInteraction;
+  }
+
+  get canGoForward() {
+    return this.webNavigation.canGoForward;
+  }
+
+  get currentURI() {
+    if (this.currentAuthPromptURI) {
+      return this.currentAuthPromptURI;
+    }
+    if (this.webNavigation) {
+      return this.webNavigation.currentURI;
+    }
+    return null;
+  }
+
+  get documentURI() {
+    return this.isRemoteBrowser
+      ? this._documentURI
+      : this.contentDocument?.documentURIObject;
+  }
+
+  get documentContentType() {
+    if (this.isRemoteBrowser) {
+      return this._documentContentType;
+    }
+    return this.contentDocument ? this.contentDocument.contentType : null;
+  }
+
+  set documentContentType(aContentType) {
+    if (aContentType != null) {
+      if (this.isRemoteBrowser) {
+        this._documentContentType = aContentType;
+      } else {
+        this.contentDocument.documentContentType = aContentType;
+      }
+    }
+  }
+
+  get loadContext() {
+    if (this._loadContext) {
+      return this._loadContext;
+    }
+
+    let { frameLoader } = this;
+    if (!frameLoader) {
+      return null;
+    }
+    this._loadContext = frameLoader.loadContext;
+    return this._loadContext;
+  }
+
+  get autoCompletePopup() {
+    return document.getElementById(this.getAttribute("autocompletepopup"));
+  }
+
+  set suspendMediaWhenInactive(val) {
+    this.browsingContext.suspendMediaWhenInactive = val;
+  }
+
+  get suspendMediaWhenInactive() {
+    return !!this.browsingContext?.suspendMediaWhenInactive;
+  }
+
+  set docShellIsActive(val) {
+    if (!this.browsingContext) {
+      return;
+    }
+    this.browsingContext.isActive = val;
+    if (this.isRemoteBrowser) {
+      let remoteTab = this.frameLoader?.remoteTab;
+      if (remoteTab) {
+        remoteTab.renderLayers = val;
+      }
+    }
+  }
+
+  get docShellIsActive() {
+    return !!this.browsingContext?.isActive;
+  }
+
+  set renderLayers(val) {
+    if (this.isRemoteBrowser) {
+      let remoteTab = this.frameLoader?.remoteTab;
+      if (remoteTab) {
+        remoteTab.renderLayers = val;
+      }
+    } else {
+      this.docShellIsActive = val;
+    }
+  }
+
+  get renderLayers() {
+    if (this.isRemoteBrowser) {
+      return !!this.frameLoader?.remoteTab?.renderLayers;
+    }
+    return this.docShellIsActive;
+  }
+
+  get hasLayers() {
+    if (this.isRemoteBrowser) {
+      return !!this.frameLoader?.remoteTab?.hasLayers;
+    }
+    return this.docShellIsActive;
+  }
+
+  get isRemoteBrowser() {
+    return this.hasAttribute("remote");
+  }
+
+  get remoteType() {
+    return this.browsingContext?.currentRemoteType;
+  }
+
+  get isCrashed() {
+    if (!this.isRemoteBrowser || !this.frameLoader) {
+      return false;
+    }
+
+    return !this.frameLoader.remoteTab;
+  }
+
+  get messageManager() {
+    if (this.frameLoader && !this.isCrashed) {
+      return this.frameLoader.messageManager;
+    }
+    return null;
+  }
+
+  get webBrowserFind() {
+    if (!this._webBrowserFind) {
+      this._webBrowserFind = this.docShell
+        .QueryInterface(Ci.nsIInterfaceRequestor)
+        .getInterface(Ci.nsIWebBrowserFind);
+    }
+    return this._webBrowserFind;
+  }
+
+  get finder() {
+    if (this.isRemoteBrowser) {
+      if (!this._remoteFinder) {
+        this._remoteFinder = new lazy.FinderParent(this);
+      }
+      return this._remoteFinder;
+    }
+    if (!this._finder) {
+      if (!this.docShell) {
+        return null;
+      }
+
+      this._finder = new lazy.Finder(this.docShell);
+    }
+    return this._finder;
+  }
+
+  get fastFind() {
+    if (!this._fastFind) {
+      if (!("@mozilla.org/typeaheadfind;1" in Cc)) {
+        return null;
+      }
+
+      var tabBrowser = this.getTabBrowser();
+      if (tabBrowser && "fastFind" in tabBrowser) {
+        return (this._fastFind = tabBrowser.fastFind);
+      }
+
+      if (!this.docShell) {
+        return null;
+      }
+
+      this._fastFind = Cc["@mozilla.org/typeaheadfind;1"].createInstance(
+        Ci.nsITypeAheadFind
+      );
+      this._fastFind.init(this.docShell);
+    }
+    return this._fastFind;
+  }
+
+  get outerWindowID() {
+    return this.browsingContext?.currentWindowGlobal?.outerWindowId;
+  }
+
+  get innerWindowID() {
+    return this.browsingContext?.currentWindowGlobal?.innerWindowId || null;
+  }
+
+  get browsingContext() {
+    if (this.frameLoader) {
+      return this.frameLoader.browsingContext;
+    }
+    return null;
+  }
+  get webNavigation() {
+    return this.isRemoteBrowser
+      ? this._remoteWebNavigation
+      : this.docShell && this.docShell.QueryInterface(Ci.nsIWebNavigation);
+  }
+
+  get webProgress() {
+    return this.browsingContext?.webProgress;
+  }
+
+  get sessionHistory() {
+    return this.webNavigation.sessionHistory;
+  }
+
+  get contentTitle() {
+    return (
+      (this.isRemoteBrowser
+        ? this.browsingContext?.currentWindowGlobal?.documentTitle
+        : this.contentDocument.title) ?? ""
+    );
+  }
+
+  forceEncodingDetection() {
+    if (this.isRemoteBrowser) {
+      this.sendMessageToActor("ForceEncodingDetection", {}, "BrowserTab");
+    } else {
+      this.docShell.forceEncodingDetection();
+    }
+  }
+
+  get characterSet() {
+    return this.isRemoteBrowser ? this._characterSet : this.docShell.charset;
+  }
+
+  get mayEnableCharacterEncodingMenu() {
+    return this.isRemoteBrowser
+      ? this._mayEnableCharacterEncodingMenu
+      : this.docShell.mayEnableCharacterEncodingMenu;
+  }
+
+  set mayEnableCharacterEncodingMenu(aMayEnable) {
+    if (this.isRemoteBrowser) {
+      this._mayEnableCharacterEncodingMenu = aMayEnable;
+    }
+  }
+
+  get contentPrincipal() {
+    return this.isRemoteBrowser
+      ? this._contentPrincipal
+      : this.contentDocument.nodePrincipal;
+  }
+
+  get contentPartitionedPrincipal() {
+    return this.isRemoteBrowser
+      ? this._contentPartitionedPrincipal
+      : this.contentDocument.partitionedPrincipal;
+  }
+
+  get cookieJarSettings() {
+    return this.isRemoteBrowser
+      ? this.browsingContext?.currentWindowGlobal?.cookieJarSettings
+      : this.contentDocument.cookieJarSettings;
+  }
+
+  get policyContainer() {
+    return this.isRemoteBrowser
+      ? this._policyContainer
+      : this.contentDocument.policyContainer;
+  }
+
+  get contentRequestContextID() {
+    if (this.isRemoteBrowser) {
+      return this._contentRequestContextID;
+    }
+    try {
+      return this.contentDocument.documentLoadGroup.requestContextID;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  get referrerInfo() {
+    return this.isRemoteBrowser
+      ? this._referrerInfo
+      : this.contentDocument.referrerInfo;
+  }
+
+  set fullZoom(val) {
+    if (val.toFixed(2) == this.fullZoom.toFixed(2)) {
+      return;
+    }
+    if (this.browsingContext.inRDMPane) {
+      this._rdmFullZoom = val;
+      let event = document.createEvent("Events");
+      event.initEvent("FullZoomChange", true, false);
+      this.dispatchEvent(event);
+    } else {
+      this.browsingContext.fullZoom = val;
+    }
+  }
+
+  get fullZoom() {
+    if (this.browsingContext.inRDMPane) {
+      return this._rdmFullZoom;
+    }
+    return this.browsingContext.fullZoom;
+  }
+
+  set textZoom(val) {
+    if (val.toFixed(2) == this.textZoom.toFixed(2)) {
+      return;
+    }
+    this.browsingContext.textZoom = val;
+  }
+
+  get textZoom() {
+    return this.browsingContext.textZoom;
+  }
+
+  enterResponsiveMode() {
+    if (this.browsingContext.inRDMPane) {
+      return;
+    }
+    this.browsingContext.inRDMPane = true;
+    this._rdmFullZoom = this.browsingContext.fullZoom;
+    this.browsingContext.fullZoom = 1.0;
+  }
+
+  leaveResponsiveMode() {
+    if (!this.browsingContext.inRDMPane) {
+      return;
+    }
+    this.browsingContext.inRDMPane = false;
+    this.browsingContext.fullZoom = this._rdmFullZoom;
+  }
+
+  get isSyntheticDocument() {
+    if (this.isRemoteBrowser) {
+      return this._isSyntheticDocument;
+    }
+    return this.contentDocument.mozSyntheticDocument;
+  }
+
+  get hasContentOpener() {
+    return !!this.browsingContext.opener;
+  }
+
+  get audioMuted() {
+    return this.browsingContext?.mediaController?.isMuted ?? false;
+  }
+
+  get shouldHandleUnselectedTabHover() {
+    return this._unselectedTabHoverMessageListenerCount > 0;
+  }
+
+  set shouldHandleUnselectedTabHover(value) {
+    this._unselectedTabHoverMessageListenerCount += value ? 1 : -1;
+  }
+
+  get securityUI() {
+    return this.browsingContext.secureBrowserUI;
+  }
+
+  set userTypedValue(val) {
+    this.urlbarChangeTracker.userTyped();
+    this._userTypedValue = val;
+  }
+
+  get userTypedValue() {
+    return this._userTypedValue;
+  }
+
+  get dontPromptAndDontUnload() {
+    return 1;
+  }
+
+  get dontPromptAndUnload() {
+    return 2;
+  }
+
+  set originalURI(aURI) {
+    if (aURI instanceof Ci.nsIURI) {
+      this._originalURI = aURI;
+    }
+  }
+
+  get originalURI() {
+    return this._originalURI;
+  }
+
+  set searchTerms(val) {
+    this._searchTerms = val;
+  }
+
+  get searchTerms() {
+    return this._searchTerms;
+  }
+
+  set currentAuthPromptURI(aURI) {
+    this._currentAuthPromptURI = aURI;
+  }
+
+  get currentAuthPromptURI() {
+    return this._currentAuthPromptURI;
+  }
+  _wrapURIChangeCall(fn) {
+    if (!this.isRemoteBrowser) {
+      this.isNavigating = true;
+      try {
+        fn();
+      } finally {
+        this.isNavigating = false;
+      }
+    } else {
+      fn();
+    }
+  }
+
+  processCloseRequest() {
+    this.browsingContext.currentWindowContext?.processCloseRequest();
+  }
+
+  goBack(
+    requireUserInteraction = lazy.BrowserUtils.navigationRequireUserInteraction
+  ) {
+    var webNavigation = this.webNavigation;
+    if (
+      requireUserInteraction
+        ? webNavigation.canGoBack
+        : webNavigation.canGoBackIgnoringUserInteraction
+    ) {
+      this._wrapURIChangeCall(() =>
+        webNavigation.goBack(requireUserInteraction)
+      );
+    }
+  }
+
+  goForward(
+    requireUserInteraction = lazy.BrowserUtils.navigationRequireUserInteraction
+  ) {
+    var webNavigation = this.webNavigation;
+    if (webNavigation.canGoForward) {
+      this._wrapURIChangeCall(() =>
+        webNavigation.goForward(requireUserInteraction)
+      );
+    }
+  }
+
+  reload() {
+    const nsIWebNavigation = Ci.nsIWebNavigation;
+    const flags = nsIWebNavigation.LOAD_FLAGS_NONE;
+    this.reloadWithFlags(flags);
+  }
+
+  reloadWithFlags(aFlags) {
+    this.webNavigation.reload(aFlags);
+  }
+
+  stop() {
+    const nsIWebNavigation = Ci.nsIWebNavigation;
+    const flags = nsIWebNavigation.STOP_ALL;
+    this.webNavigation.stop(flags);
+  }
+
+  loadURI(uri, params = {}) {
+    if (!uri) {
+      uri = lazy.blankURI;
+    }
+    this._wrapURIChangeCall(() => this.webNavigation.loadURI(uri, params));
+  }
+
+  fixupAndLoadURIString(uriString, params = {}) {
+    if (!uriString) {
+      this.loadURI(null, params);
+      return;
+    }
+    this._wrapURIChangeCall(() =>
+      this.webNavigation.fixupAndLoadURIString(uriString, params)
+    );
+  }
+
+  gotoIndex(aIndex) {
+    this._wrapURIChangeCall(() => this.webNavigation.gotoIndex(aIndex));
+  }
+
+  preserveLayers(preserve) {
+    if (!this.isRemoteBrowser) {
+      return;
+    }
+    let { frameLoader } = this;
+    if (frameLoader.remoteTab) {
+      frameLoader.remoteTab.preserveLayers(preserve);
+    }
+  }
+
+  deprioritize() {
+    if (!this.isRemoteBrowser) {
+      return;
+    }
+    let { remoteTab } = this.frameLoader;
+    if (remoteTab) {
+      remoteTab.priorityHint = false;
+      remoteTab.deprioritize();
+    }
+  }
+
+  getTabBrowser() {
+    if (this?.documentGlobal?.gBrowser?.getTabForBrowser(this)) {
+      return this.documentGlobal.gBrowser;
+    }
+    return null;
+  }
+
+  addProgressListener(aListener, aNotifyMask) {
+    if (!aNotifyMask) {
+      aNotifyMask = Ci.nsIWebProgress.NOTIFY_ALL;
+    }
+
+    this.webProgress.addProgressListener(aListener, aNotifyMask);
+  }
+
+  removeProgressListener(aListener) {
+    this.webProgress.removeProgressListener(aListener);
+  }
+
+  onPageHide() {
+    if (!this.docShell || !this.fastFind) {
+      return;
+    }
+    var tabBrowser = this.getTabBrowser();
+    if (
+      !tabBrowser ||
+      !("fastFind" in tabBrowser) ||
+      tabBrowser.selectedBrowser == this
+    ) {
+      this.fastFind.setDocShell(this.docShell);
+    }
+  }
+
+  activeMediaBlockStarted() {
+    this._hasAnyPlayingMediaBeenBlocked = true;
+    let event = document.createEvent("Events");
+    event.initEvent("DOMAudioPlaybackBlockStarted", true, false);
+    this.dispatchEvent(event);
+  }
+
+  activeMediaBlockStopped() {
+    if (!this._hasAnyPlayingMediaBeenBlocked) {
+      return;
+    }
+    this._hasAnyPlayingMediaBeenBlocked = false;
+    let event = document.createEvent("Events");
+    event.initEvent("DOMAudioPlaybackBlockStopped", true, false);
+    this.dispatchEvent(event);
+  }
+
+  resumeMedia() {
+    this.frameLoader.browsingContext.notifyStartDelayedAutoplayMedia();
+    if (this._hasAnyPlayingMediaBeenBlocked) {
+      this._hasAnyPlayingMediaBeenBlocked = false;
+      let event = document.createEvent("Events");
+      event.initEvent("DOMAudioPlaybackBlockStopped", true, false);
+      this.dispatchEvent(event);
+    }
+  }
+
+  unselectedTabHover(hovered) {
+    if (!this.shouldHandleUnselectedTabHover) {
+      return;
+    }
+    this.sendMessageToActor(
+      "Browser:UnselectedTabHover",
+      {
+        hovered,
+      },
+      "UnselectedTabHover",
+      "roots"
+    );
+  }
+
+  didStartLoadSinceLastUserTyping() {
+    return (
+      !this.isNavigating &&
+      this.urlbarChangeTracker._startedLoadSinceLastUserTyping
+    );
+  }
+
+  constrainPopup(popup) {
+    if (this.getAttribute("constrainpopups") != "false") {
+      let constraintRect = this.getBoundingClientRect();
+      constraintRect = new DOMRect(
+        constraintRect.left + window.mozInnerScreenX,
+        constraintRect.top + window.mozInnerScreenY,
+        constraintRect.width,
+        constraintRect.height
+      );
+      popup.setConstraintRect(constraintRect);
+    } else {
+      popup.setConstraintRect(new DOMRect(0, 0, 0, 0));
+    }
+  }
+
+  construct() {
+    elementsToDestroyOnUnload.add(this);
+    this.resetFields();
+    this.mInitialized = true;
+    if (this.isRemoteBrowser) {
+
+      this._remoteWebNavigation = new lazy.RemoteWebNavigation(this);
+
+      let aboutBlank = Services.io.newURI("about:blank");
+      let ssm = Services.scriptSecurityManager;
+      this._contentPrincipal = ssm.getLoadContextContentPrincipal(
+        aboutBlank,
+        this.loadContext
+      );
+      this._contentPartitionedPrincipal = this._contentPrincipal;
+      this._policyContainer = null;
+
+      if (!this.hasAttribute("disablehistory")) {
+        Services.obs.addObserver(
+          this.observer,
+          "browser:purge-session-history",
+          true
+        );
+      }
+    }
+
+    try {
+      if (this.docShell && this.webNavigation.sessionHistory) {
+        Services.obs.addObserver(
+          this.observer,
+          "browser:purge-session-history",
+          true
+        );
+
+        if (
+          !this.hasAttribute("disableglobalhistory") &&
+          !this.isRemoteBrowser
+        ) {
+          try {
+            this.docShell.browsingContext.useGlobalHistory = true;
+          } catch (ex) {
+            console.error("Error enabling browser global history: ", ex);
+          }
+        }
+      }
+    } catch (e) {
+      console.error(e);
+    }
+    try {
+      var securityUI = this.securityUI; // eslint-disable-line no-unused-vars
+    } catch (e) {}
+
+    if (!this.isRemoteBrowser) {
+      this._remoteWebNavigation = null;
+      this.addEventListener("pagehide", this.onPageHide, true);
+    }
+  }
+
+  destroy() {
+    elementsToDestroyOnUnload.delete(this);
+
+    let menulist = document.getElementById("ContentSelectDropdown");
+    if (menulist?.open) {
+      lazy.SelectParentHelper.hide(menulist, this);
+    }
+
+    this.resetFields();
+
+    if (!this.mInitialized) {
+      return;
+    }
+
+    this.mInitialized = false;
+    this.lastURI = null;
+
+    if (!this.isRemoteBrowser) {
+      this.removeEventListener("pagehide", this.onPageHide, true);
+    }
+  }
+
+  updateForStateChange(aCharset, aDocumentURI, aContentType) {
+    if (this.isRemoteBrowser && this.messageManager) {
+      if (aCharset != null) {
+        this._characterSet = aCharset;
+      }
+
+      if (aDocumentURI != null) {
+        this._documentURI = aDocumentURI;
+      }
+
+      if (aContentType != null) {
+        this._documentContentType = aContentType;
+      }
+    }
+  }
+
+  updateForLocationChange(
+    aLocation,
+    aCharset,
+    aMayEnableCharacterEncodingMenu,
+    aDocumentURI,
+    aTitle,
+    aContentPrincipal,
+    aContentPartitionedPrincipal,
+    aPolicyContainer,
+    aReferrerInfo,
+    aIsSynthetic,
+    aHaveRequestContextID,
+    aRequestContextID,
+    aContentType
+  ) {
+    if (this.isRemoteBrowser && this.messageManager) {
+      if (aCharset != null) {
+        this._characterSet = aCharset;
+        this._mayEnableCharacterEncodingMenu = aMayEnableCharacterEncodingMenu;
+      }
+
+      if (aContentType != null) {
+        this._documentContentType = aContentType;
+      }
+
+      this._remoteWebNavigation._currentURI = aLocation;
+      this._documentURI = aDocumentURI;
+      this._contentPrincipal = aContentPrincipal;
+      this._contentPartitionedPrincipal = aContentPartitionedPrincipal;
+      this._policyContainer = aPolicyContainer;
+      this._referrerInfo = aReferrerInfo;
+      this._isSyntheticDocument = aIsSynthetic;
+      this._contentRequestContextID = aHaveRequestContextID
+        ? aRequestContextID
+        : null;
+    }
+  }
+
+  purgeSessionHistory() {
+    try {
+      let sessionHistory = this.browsingContext?.sessionHistory;
+      if (!sessionHistory) {
+        return;
+      }
+
+      if (sessionHistory.index < sessionHistory.count - 1) {
+        let indexEntry = sessionHistory.getEntryAtIndex(sessionHistory.index);
+        sessionHistory.addEntry(indexEntry, true);
+      }
+
+      let purge = sessionHistory.count;
+      if (
+        this.browsingContext.currentWindowGlobal.documentURI != "about:blank"
+      ) {
+        --purge; 
+      }
+
+      if (purge > 0) {
+        sessionHistory.purgeHistory(purge);
+      }
+    } catch (ex) {
+      if (ex.result != Cr.NS_ERROR_NOT_INITIALIZED) {
+        throw ex;
+      }
+    }
+  }
+
+  createAboutBlankDocumentViewer(aPrincipal, aPartitionedPrincipal) {
+    let principal = lazy.BrowserUtils.principalWithMatchingOA(
+      aPrincipal,
+      this.contentPrincipal
+    );
+    let partitionedPrincipal = lazy.BrowserUtils.principalWithMatchingOA(
+      aPartitionedPrincipal,
+      this.contentPartitionedPrincipal
+    );
+
+    if (this.isRemoteBrowser) {
+      this.frameLoader.remoteTab.createAboutBlankDocumentViewer(
+        principal,
+        partitionedPrincipal
+      );
+    } else {
+      this.docShell.createAboutBlankDocumentViewer(
+        principal,
+        partitionedPrincipal
+      );
+    }
+  }
+
+  _acquireAutoScrollWakeLock() {
+    const pm = Cc["@mozilla.org/power/powermanagerservice;1"].getService(
+      Ci.nsIPowerManagerService
+    );
+    this._autoScrollWakelock = pm.newWakeLock("autoscroll", window);
+  }
+
+  _releaseAutoScrollWakeLock() {
+    if (this._autoScrollWakelock) {
+      try {
+        this._autoScrollWakelock.unlock();
+      } catch (e) {
+      }
+      this._autoScrollWakelock = null;
+    }
+  }
+
+  stopScroll() {
+    if (this._autoScrollBrowsingContext) {
+      window.removeEventListener("mousemove", this, true);
+      window.removeEventListener("mousedown", this, true);
+      window.removeEventListener("mouseup", this, true);
+      window.removeEventListener("DOMMouseScroll", this, true);
+      window.removeEventListener("contextmenu", this, true);
+      window.removeEventListener("keydown", this, true);
+      window.removeEventListener("keypress", this, true);
+      window.removeEventListener("keyup", this, true);
+
+      let autoScrollWnd = this._autoScrollBrowsingContext.currentWindowGlobal;
+      if (autoScrollWnd) {
+        autoScrollWnd
+          .getActor("AutoScroll")
+          .sendAsyncMessage("Autoscroll:Stop", {});
+      }
+
+      try {
+        Services.obs.removeObserver(this.observer, "apz:cancel-autoscroll");
+      } catch (ex) {
+      }
+
+      if (this._autoScrollScrollId != null) {
+        this._autoScrollBrowsingContext.stopApzAutoscroll(
+          this._autoScrollScrollId,
+          this._autoScrollPresShellId
+        );
+
+        this._autoScrollScrollId = null;
+        this._autoScrollPresShellId = null;
+      }
+
+      this._autoScrollBrowsingContext = null;
+      this._releaseAutoScrollWakeLock();
+    }
+  }
+
+  _getAndMaybeCreateAutoScrollPopup() {
+    let autoscrollPopup = document.getElementById("autoscroller");
+    if (!autoscrollPopup) {
+      autoscrollPopup = document.createXULElement("panel");
+      autoscrollPopup.className = "autoscroller";
+      autoscrollPopup.setAttribute("consumeoutsideclicks", "true");
+      autoscrollPopup.setAttribute("rolluponmousewheel", "true");
+      autoscrollPopup.id = "autoscroller";
+    }
+
+    return autoscrollPopup;
+  }
+
+  startScroll({
+    scrolldir,
+    screenXDevPx,
+    screenYDevPx,
+    scrollId,
+    presShellId,
+    browsingContext,
+  }) {
+    if (!this.autoscrollEnabled) {
+      return { autoscrollEnabled: false, usingApz: false };
+    }
+
+    const POPUP_SIZE = 40;
+    if (!this._autoScrollPopup) {
+      this._autoScrollPopup = this._getAndMaybeCreateAutoScrollPopup();
+      document.documentElement.appendChild(this._autoScrollPopup);
+      this._autoScrollPopup.removeAttribute("hidden");
+      this._autoScrollPopup.setAttribute("noautofocus", "true");
+      this._autoScrollPopup.style.height = POPUP_SIZE + "px";
+      this._autoScrollPopup.style.width = POPUP_SIZE + "px";
+      this._autoScrollPopup.style.margin = -POPUP_SIZE / 2 + "px";
+    }
+
+    let screenXDesktopPx = screenXDevPx / window.desktopToDeviceScale;
+    let screenYDesktopPx = screenYDevPx / window.desktopToDeviceScale;
+
+    let screenManager = Cc["@mozilla.org/gfx/screenmanager;1"].getService(
+      Ci.nsIScreenManager
+    );
+    let screen = screenManager.screenForRect(
+      screenXDesktopPx,
+      screenYDesktopPx,
+      1,
+      1
+    );
+
+    if (screen.colorDepth > 8) {
+      this._autoScrollPopup.setAttribute(
+        "transparent",
+        !/BeOS|OS\/2/.test(navigator.appVersion)
+      );
+      this._autoScrollPopup.setAttribute(
+        "translucent",
+        AppConstants.platform == "win" || AppConstants.platform == "macosx"
+      );
+    }
+
+    this._autoScrollPopup.setAttribute("scrolldir", scrolldir);
+    this._autoScrollPopup.addEventListener("popuphidden", this, true);
+
+    let popupX;
+    let popupY;
+    {
+      let cssToDesktopScale =
+        window.devicePixelRatio / window.desktopToDeviceScale;
+
+      let left = {},
+        top = {},
+        width = {},
+        height = {};
+      screen.GetAvailRectDisplayPix(left, top, width, height);
+
+      let popupSizeDesktopPx = POPUP_SIZE * cssToDesktopScale;
+      let minX = left.value + 0.5 * popupSizeDesktopPx;
+      let maxX = left.value + width.value - 0.5 * popupSizeDesktopPx;
+      let minY = top.value + 0.5 * popupSizeDesktopPx;
+      let maxY = top.value + height.value - 0.5 * popupSizeDesktopPx;
+
+      popupX =
+        Math.max(minX, Math.min(maxX, screenXDesktopPx)) / cssToDesktopScale;
+      popupY =
+        Math.max(minY, Math.min(maxY, screenYDesktopPx)) / cssToDesktopScale;
+    }
+
+    let screenX = screenXDevPx / window.devicePixelRatio;
+    let screenY = screenYDevPx / window.devicePixelRatio;
+
+    this._autoScrollPopup.openPopupAtScreen(popupX, popupY);
+    this._ignoreMouseEvents = true;
+    this._startX = screenX;
+    this._startY = screenY;
+    this._autoScrollBrowsingContext = browsingContext;
+    this._acquireAutoScrollWakeLock();
+
+    window.addEventListener("mousemove", this, true);
+    window.addEventListener("mousedown", this, true);
+    window.addEventListener("mouseup", this, true);
+    window.addEventListener("DOMMouseScroll", this, true);
+    window.addEventListener("contextmenu", this, true);
+    window.addEventListener("keydown", this, true);
+    window.addEventListener("keypress", this, true);
+    window.addEventListener("keyup", this, true);
+
+    let usingApz = false;
+
+    if (
+      scrollId != null &&
+      this.mPrefs.getBoolPref("apz.autoscroll.enabled", false)
+    ) {
+      Services.obs.addObserver(this.observer, "apz:cancel-autoscroll", true);
+
+      usingApz = browsingContext.startApzAutoscroll(
+        screenXDevPx,
+        screenYDevPx,
+        scrollId,
+        presShellId
+      );
+
+      this._autoScrollScrollId = scrollId;
+      this._autoScrollPresShellId = presShellId;
+    }
+
+    this._autoScrollStartTime = performance.now();
+    return { autoscrollEnabled: true, usingApz };
+  }
+
+  cancelScroll() {
+    this._autoScrollPopup.hidePopup();
+  }
+
+  handleEvent(aEvent) {
+    if (this._autoScrollBrowsingContext) {
+      switch (aEvent.type) {
+        case "mousemove": {
+          var x = aEvent.screenX - this._startX;
+          var y = aEvent.screenY - this._startY;
+
+          if (
+            x > this._AUTOSCROLL_SNAP ||
+            x < -this._AUTOSCROLL_SNAP ||
+            y > this._AUTOSCROLL_SNAP ||
+            y < -this._AUTOSCROLL_SNAP
+          ) {
+            this._ignoreMouseEvents = false;
+          }
+          break;
+        }
+        case "mouseup":
+        case "mousedown":
+          aEvent.preventClickEvent();
+        // fallthrough
+        case "contextmenu": {
+          if (!this._ignoreMouseEvents) {
+            setTimeout(() => this._autoScrollPopup.hidePopup(), 0);
+          }
+          this._ignoreMouseEvents = false;
+          break;
+        }
+        case "DOMMouseScroll": {
+          const scrollCooldownMs = this.mPrefs.getIntPref(
+            "apz.autoscroll.scroll_wheel_cooldown"
+          );
+          if (
+            performance.now() - this._autoScrollStartTime <
+            scrollCooldownMs
+          ) {
+            aEvent.preventDefault();
+            break;
+          }
+          this._autoScrollPopup.hidePopup();
+          aEvent.preventDefault();
+          break;
+        }
+        case "popuphidden": {
+          this._autoScrollPopup.removeEventListener("popuphidden", this, true);
+          this.stopScroll();
+          break;
+        }
+        case "keydown": {
+          if (aEvent.keyCode == aEvent.DOM_VK_ESCAPE) {
+            break;
+          }
+        }
+        // fall through
+        case "keypress":
+        case "keyup": {
+          aEvent.stopPropagation();
+          aEvent.preventDefault();
+          break;
+        }
+      }
+    }
+  }
+
+  closeBrowser() {
+    let tabbrowser = this.getTabBrowser();
+    if (tabbrowser) {
+      let tab = tabbrowser.getTabForBrowser(this);
+      if (tab) {
+        tabbrowser.removeTab(tab);
+        return;
+      }
+    }
+
+    throw new Error(
+      "Closing a browser which was not attached to a tabbrowser is unsupported."
+    );
+  }
+
+  swapBrowsers(aOtherBrowser) {
+    let ourTabBrowser = this.getTabBrowser();
+    let otherTabBrowser = aOtherBrowser.getTabBrowser();
+    if (ourTabBrowser && otherTabBrowser) {
+      let ourTab = ourTabBrowser.getTabForBrowser(this);
+      let otherTab = otherTabBrowser.getTabForBrowser(aOtherBrowser);
+      ourTabBrowser.swapBrowsers(ourTab, otherTab);
+      return;
+    }
+
+    this.swapDocShells(aOtherBrowser);
+  }
+
+  swapDocShells(aOtherBrowser) {
+    if (this.isRemoteBrowser != aOtherBrowser.isRemoteBrowser) {
+      throw new Error(
+        "Can only swap docshells between browsers in the same process."
+      );
+    }
+
+    let event = new CustomEvent("SwapDocShells", { detail: aOtherBrowser });
+    this.dispatchEvent(event);
+    event = new CustomEvent("SwapDocShells", { detail: this });
+    aOtherBrowser.dispatchEvent(event);
+
+    var fieldsToSwap = ["_webBrowserFind", "_rdmFullZoom"];
+
+    if (this.isRemoteBrowser) {
+      fieldsToSwap.push(
+        ...[
+          "_remoteWebNavigation",
+          "_remoteFinder",
+          "_documentURI",
+          "_documentContentType",
+          "_characterSet",
+          "_mayEnableCharacterEncodingMenu",
+          "_contentPrincipal",
+          "_contentPartitionedPrincipal",
+          "_isSyntheticDocument",
+          "_originalURI",
+          "_userTypedValue",
+        ]
+      );
+    }
+
+    var ourFieldValues = {};
+    var otherFieldValues = {};
+    for (let field of fieldsToSwap) {
+      ourFieldValues[field] = this[field];
+      otherFieldValues[field] = aOtherBrowser[field];
+    }
+
+    if (window.PopupNotifications) {
+      PopupNotifications._swapBrowserNotifications(aOtherBrowser, this);
+    }
+
+    try {
+      this.swapFrameLoaders(aOtherBrowser);
+    } catch (ex) {
+    }
+
+    for (let field of fieldsToSwap) {
+      this[field] = otherFieldValues[field];
+      aOtherBrowser[field] = ourFieldValues[field];
+    }
+
+    if (!this.isRemoteBrowser) {
+      this._fastFind = aOtherBrowser._fastFind = null;
+    } else {
+      this._remoteWebNavigation.swapBrowser(this);
+      aOtherBrowser._remoteWebNavigation.swapBrowser(aOtherBrowser);
+
+      if (this._remoteFinder) {
+        this._remoteFinder.swapBrowser(this);
+      }
+      if (aOtherBrowser._remoteFinder) {
+        aOtherBrowser._remoteFinder.swapBrowser(aOtherBrowser);
+      }
+    }
+
+    event = new CustomEvent("EndSwapDocShells", { detail: aOtherBrowser });
+    this.dispatchEvent(event);
+    event = new CustomEvent("EndSwapDocShells", { detail: this });
+    aOtherBrowser.dispatchEvent(event);
+  }
+
+  getInPermitUnload(aCallback) {
+    if (this.isRemoteBrowser) {
+      let { remoteTab } = this.frameLoader;
+      if (!remoteTab) {
+        aCallback(false);
+        return;
+      }
+
+      aCallback(
+        this._inPermitUnload.has(this.browsingContext.currentWindowGlobal)
+      );
+      return;
+    }
+
+    if (!this.docShell || !this.docShell.docViewer) {
+      aCallback(false);
+      return;
+    }
+    aCallback(this.docShell.docViewer.inPermitUnload);
+  }
+
+  async asyncPermitUnload(action) {
+    let wgp = this.browsingContext.currentWindowGlobal;
+    if (this._inPermitUnload.has(wgp)) {
+      throw new Error("permitUnload is already running for this tab.");
+    }
+
+    this._inPermitUnload.add(wgp);
+    try {
+      let permitUnload = await wgp.permitUnload(
+        action,
+        lazyPrefs.unloadTimeoutMs
+      );
+      return { permitUnload };
+    } finally {
+      this._inPermitUnload.delete(wgp);
+    }
+  }
+
+  get hasBeforeUnload() {
+    function hasBeforeUnload(bc) {
+      if (bc.currentWindowContext?.hasBeforeUnload) {
+        return true;
+      }
+      return bc.children.some(hasBeforeUnload);
+    }
+    return hasBeforeUnload(this.browsingContext);
+  }
+
+  get hasActiveCloseWatcher() {
+    function hasActiveCloseWatcher(bc) {
+      if (bc.currentWindowContext?.hasActiveCloseWatcher) {
+        return true;
+      }
+      return bc.children.some(hasActiveCloseWatcher);
+    }
+    return hasActiveCloseWatcher(this.browsingContext);
+  }
+
+  permitUnload(action) {
+    if (this.isRemoteBrowser) {
+      if (!this.hasBeforeUnload) {
+        return { permitUnload: true };
+      }
+
+      if (
+        lazy.ProcessHangMonitor?.findActiveReport(this) ||
+        lazy.ProcessHangMonitor?.findPausedReport(this)
+      ) {
+        return { permitUnload: true };
+      }
+
+      let result;
+      let success;
+
+      this.asyncPermitUnload(action).then(
+        val => {
+          result = val;
+          success = true;
+        },
+        err => {
+          result = err;
+          success = false;
+        }
+      );
+
+      Services.tm.spinEventLoopUntilOrQuit(
+        "browser-custom-element.js:permitUnload",
+        () => window.closed || success !== undefined
+      );
+      if (success) {
+        return result;
+      }
+      throw result;
+    }
+
+    if (!this.docShell || !this.docShell.docViewer) {
+      return { permitUnload: true };
+    }
+    return {
+      permitUnload: this.docShell.docViewer.permitUnload(),
+    };
+  }
+
+  async drawSnapshot(x, y, w, h, scale, backgroundColor, fullViewport = false) {
+    let rect = fullViewport ? null : new DOMRect(x, y, w, h);
+    try {
+      return this.browsingContext.currentWindowGlobal.drawSnapshot(
+        rect,
+        scale,
+        backgroundColor
+      );
+    } catch (e) {
+      return false;
+    }
+  }
+
+  dropLinks(aLinks, aTriggeringPrincipal) {
+    if (!this.droppedLinkHandler) {
+      return false;
+    }
+    let links = [];
+    for (let i = 0; i < aLinks.length; i += 3) {
+      links.push({
+        url: aLinks[i],
+        name: aLinks[i + 1],
+        type: aLinks[i + 2],
+      });
+    }
+    this.droppedLinkHandler(null, links, aTriggeringPrincipal);
+    return true;
+  }
+
+  getContentBlockingLog() {
+    let windowGlobal = this.browsingContext.currentWindowGlobal;
+    if (!windowGlobal) {
+      return null;
+    }
+    return windowGlobal.contentBlockingLog;
+  }
+
+  getContentBlockingEvents() {
+    let windowGlobal = this.browsingContext.currentWindowGlobal;
+    if (!windowGlobal) {
+      return 0;
+    }
+    return windowGlobal.contentBlockingEvents;
+  }
+
+  sendMessageToActor(messageName, args, actorName, scope) {
+    if (!this.frameLoader) {
+      return;
+    }
+
+    function sendToChildren(browsingContext, childScope) {
+      let windowGlobal = browsingContext.currentWindowGlobal;
+      if (
+        windowGlobal &&
+        (childScope != "roots" || windowGlobal.isProcessRoot)
+      ) {
+        windowGlobal.getActor(actorName).sendAsyncMessage(messageName, args);
+      }
+
+      if (scope) {
+        for (let context of browsingContext.children) {
+          sendToChildren(context, scope);
+        }
+      }
+    }
+
+    sendToChildren(this.browsingContext);
+  }
+
+  enterModalState() {
+    this.sendMessageToActor("EnterModalState", {}, "BrowserElement", "roots");
+  }
+
+  leaveModalState() {
+    this.sendMessageToActor(
+      "LeaveModalState",
+      { forceLeave: true },
+      "BrowserElement",
+      "roots"
+    );
+  }
+
+  maybeLeaveModalState() {
+    this.sendMessageToActor(
+      "LeaveModalState",
+      { forceLeave: false },
+      "BrowserElement",
+      "roots"
+    );
+  }
+
+  getDevicePermissionOrigins(key) {
+    if (typeof key !== "string" || key.length === 0) {
+      throw new Error("Key must be non empty string.");
+    }
+    if (!this._devicePermissionOrigins) {
+      this._devicePermissionOrigins = new Map();
+    }
+    let origins = this._devicePermissionOrigins.get(key);
+    if (!origins) {
+      origins = new Set();
+      this._devicePermissionOrigins.set(key, origins);
+    }
+    return origins;
+  }
+
+  async prepareToChangeRemoteness() {
+  }
+
+  afterChangeRemoteness() {
+    return false;
+  }
+
+  beforeChangeRemoteness() {
+    let event = document.createEvent("Events");
+    event.initEvent("WillChangeBrowserRemoteness", true, false);
+    this.dispatchEvent(event);
+
+    this.destroy();
+  }
+
+  finishChangeRemoteness(redirectLoadSwitchId) {
+    this.construct();
+
+    let event = document.createEvent("Events");
+    event.initEvent("DidChangeBrowserRemoteness", true, false);
+    this.dispatchEvent(event);
+
+    return this.afterChangeRemoteness(redirectLoadSwitchId);
+  }
+}
+
+MozXULElement.implementCustomInterface(MozBrowser, [Ci.nsIBrowser]);
+customElements.define("browser", MozBrowser);

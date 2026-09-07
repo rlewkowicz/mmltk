@@ -1,0 +1,374 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef util_Unicode_h
+#define util_Unicode_h
+
+#include "mozilla/Casting.h"  // mozilla::AssertedCast
+
+#include "jspubtd.h"
+
+#include "util/UnicodeNonBMP.h"
+
+namespace js {
+namespace unicode {
+
+extern const bool js_isidstart[];
+extern const bool js_isident[];
+extern const bool js_isspace[];
+
+
+namespace CharFlag {
+const uint8_t SPACE = 1 << 0;
+const uint8_t UNICODE_ID_START = 1 << 1;
+const uint8_t UNICODE_ID_CONTINUE_ONLY = 1 << 2;
+const uint8_t UNICODE_ID_CONTINUE = UNICODE_ID_START + UNICODE_ID_CONTINUE_ONLY;
+}  
+
+constexpr char16_t NO_BREAK_SPACE = 0x00A0;
+constexpr char16_t MICRO_SIGN = 0x00B5;
+constexpr char16_t LATIN_SMALL_LETTER_SHARP_S = 0x00DF;
+constexpr char16_t LATIN_SMALL_LETTER_A_WITH_GRAVE = 0x00E0;
+constexpr char16_t DIVISION_SIGN = 0x00F7;
+constexpr char16_t LATIN_SMALL_LETTER_Y_WITH_DIAERESIS = 0x00FF;
+constexpr char16_t LATIN_CAPITAL_LETTER_I_WITH_DOT_ABOVE = 0x0130;
+constexpr char16_t COMBINING_DOT_ABOVE = 0x0307;
+constexpr char16_t GREEK_CAPITAL_LETTER_SIGMA = 0x03A3;
+constexpr char16_t GREEK_SMALL_LETTER_FINAL_SIGMA = 0x03C2;
+constexpr char16_t GREEK_SMALL_LETTER_SIGMA = 0x03C3;
+constexpr char16_t LINE_SEPARATOR = 0x2028;
+constexpr char16_t PARA_SEPARATOR = 0x2029;
+constexpr char16_t REPLACEMENT_CHARACTER = 0xFFFD;
+
+const char16_t LeadSurrogateMin = 0xD800;
+const char16_t LeadSurrogateMax = 0xDBFF;
+const char16_t TrailSurrogateMin = 0xDC00;
+const char16_t TrailSurrogateMax = 0xDFFF;
+
+const char32_t UTF16Max = 0xFFFF;
+const char32_t NonBMPMin = 0x10000;
+const char32_t NonBMPMax = 0x10FFFF;
+
+class CharacterInfo {
+ public:
+  uint16_t upperCase;
+  uint16_t lowerCase;
+  uint8_t flags;
+
+  inline bool isSpace() const { return flags & CharFlag::SPACE; }
+
+  inline bool isUnicodeIDStart() const {
+    return flags & CharFlag::UNICODE_ID_START;
+  }
+
+  inline bool isUnicodeIDContinue() const {
+    return flags & CharFlag::UNICODE_ID_CONTINUE;
+  }
+};
+
+extern const uint8_t index1[];
+extern const uint8_t index2[];
+extern const CharacterInfo js_charinfo[];
+
+constexpr size_t CharInfoShift = 6;
+
+inline const CharacterInfo& CharInfo(char16_t code) {
+  const size_t shift = CharInfoShift;
+  size_t index = index1[code >> shift];
+  index = index2[(index << shift) + (code & ((1 << shift) - 1))];
+
+  return js_charinfo[index];
+}
+
+inline bool IsIdentifierStart(char16_t ch) {
+
+  if (ch < 128) {
+    return js_isidstart[ch];
+  }
+
+  return CharInfo(ch).isUnicodeIDStart();
+}
+
+inline bool IsIdentifierStartASCII(char ch) {
+  MOZ_ASSERT(uint8_t(ch) < 128);
+  return js_isidstart[uint8_t(ch)];
+}
+
+bool IsIdentifierStartNonBMP(char32_t codePoint);
+
+inline bool IsIdentifierStart(char32_t codePoint) {
+  if (MOZ_UNLIKELY(codePoint > UTF16Max)) {
+    return IsIdentifierStartNonBMP(codePoint);
+  }
+  return IsIdentifierStart(char16_t(codePoint));
+}
+
+inline bool IsIdentifierPart(char16_t ch) {
+
+  if (ch < 128) {
+    return js_isident[ch];
+  }
+
+  return CharInfo(ch).isUnicodeIDContinue();
+}
+
+inline bool IsIdentifierPartASCII(char ch) {
+  MOZ_ASSERT(uint8_t(ch) < 128);
+  return js_isident[uint8_t(ch)];
+}
+
+bool IsIdentifierPartNonBMP(char32_t codePoint);
+
+inline bool IsIdentifierPart(char32_t codePoint) {
+  if (MOZ_UNLIKELY(codePoint > UTF16Max)) {
+    return IsIdentifierPartNonBMP(codePoint);
+  }
+  return IsIdentifierPart(char16_t(codePoint));
+}
+
+inline bool IsUnicodeIDStart(char16_t ch) {
+  return CharInfo(ch).isUnicodeIDStart();
+}
+
+bool IsUnicodeIDStartNonBMP(char32_t codePoint);
+
+inline bool IsUnicodeIDStart(char32_t codePoint) {
+  if (MOZ_UNLIKELY(codePoint > UTF16Max)) {
+    return IsIdentifierStartNonBMP(codePoint);
+  }
+  return IsUnicodeIDStart(char16_t(codePoint));
+}
+
+inline bool IsSpace(char16_t ch) {
+  if (ch < 128) {
+    return js_isspace[ch];
+  }
+
+  if (ch == NO_BREAK_SPACE) {
+    return true;
+  }
+
+  return CharInfo(ch).isSpace();
+}
+
+inline bool IsSpace(JS::Latin1Char ch) {
+  if (ch < 128) {
+    return js_isspace[ch];
+  }
+
+  if (ch == NO_BREAK_SPACE) {
+    return true;
+  }
+
+  MOZ_ASSERT(!CharInfo(ch).isSpace());
+  return false;
+}
+
+inline bool IsSpace(char ch) {
+  return IsSpace(static_cast<JS::Latin1Char>(ch));
+}
+
+inline bool IsSpace(char32_t ch) {
+  if (ch < 128) {
+    return js_isspace[ch];
+  }
+
+  if (ch == NO_BREAK_SPACE) {
+    return true;
+  }
+
+  if (ch >= NonBMPMin) {
+    return false;
+  }
+
+  return CharInfo(mozilla::AssertedCast<char16_t>(ch)).isSpace();
+}
+
+inline char16_t ToUpperCase(char16_t ch) {
+  if (ch < 128) {
+    if (ch >= 'a' && ch <= 'z') {
+      return ch - ('a' - 'A');
+    }
+    return ch;
+  }
+
+  const CharacterInfo& info = CharInfo(ch);
+
+  return uint16_t(ch) + info.upperCase;
+}
+
+inline char16_t ToLowerCase(char16_t ch) {
+  if (ch < 128) {
+    if (ch >= 'A' && ch <= 'Z') {
+      return ch + ('a' - 'A');
+    }
+    return ch;
+  }
+
+  const CharacterInfo& info = CharInfo(ch);
+
+  return uint16_t(ch) + info.lowerCase;
+}
+
+extern const JS::Latin1Char latin1ToLowerCaseTable[];
+
+inline JS::Latin1Char ToLowerCase(JS::Latin1Char ch) {
+  return latin1ToLowerCaseTable[ch];
+}
+
+inline char ToLowerCase(char ch) {
+  MOZ_ASSERT(static_cast<unsigned char>(ch) < 128);
+  return latin1ToLowerCaseTable[uint8_t(ch)];
+}
+
+inline bool ChangesWhenUpperCased(char16_t ch) {
+  if (ch < 128) {
+    return ch >= 'a' && ch <= 'z';
+  }
+  return CharInfo(ch).upperCase != 0;
+}
+
+inline bool ChangesWhenUpperCased(JS::Latin1Char ch) {
+  if (MOZ_LIKELY(ch < 128)) {
+    return ch >= 'a' && ch <= 'z';
+  }
+
+  bool hasUpper =
+      ch == MICRO_SIGN || (((ch & ~0x1F) == LATIN_SMALL_LETTER_A_WITH_GRAVE) &&
+                           ch != DIVISION_SIGN);
+  MOZ_ASSERT(hasUpper == ChangesWhenUpperCased(char16_t(ch)));
+  return hasUpper;
+}
+
+inline bool ChangesWhenLowerCased(char16_t ch) {
+  if (ch < 128) {
+    return ch >= 'A' && ch <= 'Z';
+  }
+  return CharInfo(ch).lowerCase != 0;
+}
+
+inline bool ChangesWhenLowerCased(JS::Latin1Char ch) {
+  return latin1ToLowerCaseTable[ch] != ch;
+}
+
+#define CHECK_RANGE(FROM, TO, LEAD, TRAIL_FROM, TRAIL_TO, DIFF) \
+  if (lead == LEAD && trail >= TRAIL_FROM && trail <= TRAIL_TO) return true;
+
+inline bool ChangesWhenUpperCasedNonBMP(char16_t lead, char16_t trail) {
+  FOR_EACH_NON_BMP_UPPERCASE(CHECK_RANGE)
+  return false;
+}
+
+inline bool ChangesWhenLowerCasedNonBMP(char16_t lead, char16_t trail) {
+  FOR_EACH_NON_BMP_LOWERCASE(CHECK_RANGE)
+  return false;
+}
+
+#undef CHECK_RANGE
+
+inline char16_t ToUpperCaseNonBMPTrail(char16_t lead, char16_t trail) {
+#define CALC_TRAIL(FROM, TO, LEAD, TRAIL_FROM, TRAIL_TO, DIFF)  \
+  if (lead == LEAD && trail >= TRAIL_FROM && trail <= TRAIL_TO) \
+    return trail + DIFF;
+  FOR_EACH_NON_BMP_UPPERCASE(CALC_TRAIL)
+#undef CALL_TRAIL
+
+  return trail;
+}
+
+inline char16_t ToLowerCaseNonBMPTrail(char16_t lead, char16_t trail) {
+#define CALC_TRAIL(FROM, TO, LEAD, TRAIL_FROM, TRAIL_TO, DIFF)  \
+  if (lead == LEAD && trail >= TRAIL_FROM && trail <= TRAIL_TO) \
+    return trail + DIFF;
+  FOR_EACH_NON_BMP_LOWERCASE(CALC_TRAIL)
+#undef CALL_TRAIL
+
+  return trail;
+}
+
+bool ChangesWhenUpperCasedSpecialCasing(char16_t ch);
+
+size_t LengthUpperCaseSpecialCasing(char16_t ch);
+
+void AppendUpperCaseSpecialCasing(char16_t ch, char16_t* elements,
+                                  size_t* index);
+
+class FoldingInfo {
+ public:
+  uint16_t folding;
+};
+
+extern const uint8_t folding_index1[];
+extern const uint8_t folding_index2[];
+extern const FoldingInfo js_foldinfo[];
+
+inline const FoldingInfo& CaseFoldInfo(char16_t code) {
+  const size_t shift = 5;
+  size_t index = folding_index1[code >> shift];
+  index = folding_index2[(index << shift) + (code & ((1 << shift) - 1))];
+  return js_foldinfo[index];
+}
+
+inline char16_t FoldCase(char16_t ch) {
+  const FoldingInfo& info = CaseFoldInfo(ch);
+  return uint16_t(ch) + info.folding;
+}
+
+inline bool IsSupplementary(char32_t codePoint) {
+  return codePoint >= NonBMPMin && codePoint <= NonBMPMax;
+}
+
+inline bool IsLeadSurrogate(char32_t codePoint) {
+  return codePoint >= LeadSurrogateMin && codePoint <= LeadSurrogateMax;
+}
+
+inline bool IsTrailSurrogate(char32_t codePoint) {
+  return codePoint >= TrailSurrogateMin && codePoint <= TrailSurrogateMax;
+}
+
+inline bool IsSurrogate(char32_t codePoint) {
+  return LeadSurrogateMin <= codePoint && codePoint <= TrailSurrogateMax;
+}
+
+inline char16_t LeadSurrogate(char32_t codePoint) {
+  MOZ_ASSERT(IsSupplementary(codePoint));
+
+  return char16_t((codePoint >> 10) + (LeadSurrogateMin - (NonBMPMin >> 10)));
+}
+
+inline char16_t TrailSurrogate(char32_t codePoint) {
+  MOZ_ASSERT(IsSupplementary(codePoint));
+
+  return char16_t((codePoint & 0x3FF) | TrailSurrogateMin);
+}
+
+inline void UTF16Encode(char32_t codePoint, char16_t* lead, char16_t* trail) {
+  MOZ_ASSERT(IsSupplementary(codePoint));
+
+  *lead = LeadSurrogate(codePoint);
+  *trail = TrailSurrogate(codePoint);
+}
+
+inline void UTF16Encode(char32_t codePoint, char16_t* elements,
+                        unsigned* index) {
+  if (!IsSupplementary(codePoint)) {
+    elements[(*index)++] = char16_t(codePoint);
+  } else {
+    elements[(*index)++] = LeadSurrogate(codePoint);
+    elements[(*index)++] = TrailSurrogate(codePoint);
+  }
+}
+
+inline char32_t UTF16Decode(char16_t lead, char16_t trail) {
+  MOZ_ASSERT(IsLeadSurrogate(lead));
+  MOZ_ASSERT(IsTrailSurrogate(trail));
+
+  return (lead << 10) + trail +
+         (NonBMPMin - (LeadSurrogateMin << 10) - TrailSurrogateMin);
+}
+
+} 
+} 
+
+#endif /* util_Unicode_h */

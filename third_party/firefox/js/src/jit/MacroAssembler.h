@@ -1,0 +1,4931 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(jit_MacroAssembler_h)
+#define jit_MacroAssembler_h
+
+#include "mozilla/MacroForEach.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/Variant.h"
+
+#if defined(JS_CODEGEN_X86)
+#  include "jit/x86/MacroAssembler-x86.h"
+#elif defined(JS_CODEGEN_X64)
+#  include "jit/x64/MacroAssembler-x64.h"
+#elif defined(JS_CODEGEN_ARM)
+#  include "jit/arm/MacroAssembler-arm.h"
+#elif defined(JS_CODEGEN_ARM64)
+#  include "jit/arm64/MacroAssembler-arm64.h"
+#elif defined(JS_CODEGEN_MIPS64)
+#  include "jit/mips64/MacroAssembler-mips64.h"
+#elif defined(JS_CODEGEN_LOONG64)
+#  include "jit/loong64/MacroAssembler-loong64.h"
+#elif defined(JS_CODEGEN_RISCV64)
+#  include "jit/riscv64/MacroAssembler-riscv64.h"
+#elif defined(JS_CODEGEN_WASM32)
+#  include "jit/wasm32/MacroAssembler-wasm32.h"
+#elif defined(JS_CODEGEN_NONE)
+#  include "jit/none/MacroAssembler-none.h"
+#else
+#  error "Unknown architecture!"
+#endif
+#include "jit/ABIArgGenerator.h"
+#include "jit/ABIFunctions.h"
+#include "jit/AtomicOp.h"
+#include "jit/IonTypes.h"
+#include "jit/MoveResolver.h"
+#include "jit/VMFunctions.h"
+#include "js/ScalarType.h"  // js::Scalar::Type
+#include "util/Memory.h"
+#include "vm/FunctionFlags.h"
+#include "vm/Opcodes.h"
+#include "vm/RealmFuses.h"
+#include "vm/RuntimeFuses.h"
+#include "vm/StringFlags.h"
+#include "wasm/WasmAnyRef.h"
+
+
+#define ALL_ARCH mips64, arm, arm64, x86, x64, loong64, riscv64, wasm32
+#define ALL_SHARED_ARCH arm, arm64, loong64, mips64, riscv64, x86_shared, wasm32
+
+
+#define DEFINED_ON_x86
+#define DEFINED_ON_x64
+#define DEFINED_ON_x86_shared
+#define DEFINED_ON_arm
+#define DEFINED_ON_arm64
+#define DEFINED_ON_mips64
+#define DEFINED_ON_loong64
+#define DEFINED_ON_riscv64
+#define DEFINED_ON_wasm32
+#define DEFINED_ON_none
+
+#if defined(JS_CODEGEN_X86)
+#  undef DEFINED_ON_x86
+#  define DEFINED_ON_x86 define
+#  undef DEFINED_ON_x86_shared
+#  define DEFINED_ON_x86_shared define
+#elif defined(JS_CODEGEN_X64)
+#  undef DEFINED_ON_x64
+#  define DEFINED_ON_x64 define
+#  undef DEFINED_ON_x86_shared
+#  define DEFINED_ON_x86_shared define
+#elif defined(JS_CODEGEN_ARM)
+#  undef DEFINED_ON_arm
+#  define DEFINED_ON_arm define
+#elif defined(JS_CODEGEN_ARM64)
+#  undef DEFINED_ON_arm64
+#  define DEFINED_ON_arm64 define
+#elif defined(JS_CODEGEN_MIPS64)
+#  undef DEFINED_ON_mips64
+#  define DEFINED_ON_mips64 define
+#elif defined(JS_CODEGEN_LOONG64)
+#  undef DEFINED_ON_loong64
+#  define DEFINED_ON_loong64 define
+#elif defined(JS_CODEGEN_RISCV64)
+#  undef DEFINED_ON_riscv64
+#  define DEFINED_ON_riscv64 define
+#elif defined(JS_CODEGEN_WASM32)
+#  undef DEFINED_ON_wasm32
+#  define DEFINED_ON_wasm32 define
+#elif defined(JS_CODEGEN_NONE)
+#  undef DEFINED_ON_none
+#  define DEFINED_ON_none crash
+#else
+#  error "Unknown architecture!"
+#endif
+
+#define DEFINED_ON_RESULT_crash \
+  {                             \
+    MOZ_CRASH();                \
+  }
+#define DEFINED_ON_RESULT_define
+#define DEFINED_ON_RESULT_ = delete
+
+#define DEFINED_ON_DISPATCH_RESULT_2(Macro, Result) Macro##Result
+#define DEFINED_ON_DISPATCH_RESULT(...) \
+  DEFINED_ON_DISPATCH_RESULT_2(DEFINED_ON_RESULT_, __VA_ARGS__)
+
+#define DEFINED_ON_EXPAND_ARCH_RESULTS_3(ParenResult) \
+  DEFINED_ON_DISPATCH_RESULT ParenResult
+#define DEFINED_ON_EXPAND_ARCH_RESULTS_2(ParenResult) \
+  DEFINED_ON_EXPAND_ARCH_RESULTS_3(ParenResult)
+#define DEFINED_ON_EXPAND_ARCH_RESULTS(ParenResult) \
+  DEFINED_ON_EXPAND_ARCH_RESULTS_2(ParenResult)
+
+#define DEFINED_ON_FWDARCH(Arch) DEFINED_ON_##Arch
+#define DEFINED_ON_MAP_ON_ARCHS(ArchList) \
+  DEFINED_ON_EXPAND_ARCH_RESULTS(         \
+      (MOZ_FOR_EACH(DEFINED_ON_FWDARCH, (), ArchList)))
+
+#define DEFINED_ON(...) DEFINED_ON_MAP_ON_ARCHS((none, __VA_ARGS__))
+
+#define PER_ARCH DEFINED_ON(ALL_ARCH)
+#define PER_SHARED_ARCH DEFINED_ON(ALL_SHARED_ARCH)
+#define OOL_IN_HEADER
+
+namespace JS {
+struct ExpandoAndGeneration;
+}
+
+namespace js {
+
+class StaticStrings;
+class FixedLengthTypedArrayObject;
+
+namespace wasm {
+class CalleeDesc;
+class CallSiteDesc;
+class BytecodeOffset;
+class MemoryAccessDesc;
+
+enum class FailureMode : uint8_t;
+enum class SimdOp;
+enum class SymbolicAddress;
+enum class Trap;
+}  
+
+namespace jit {
+
+class FrameDescriptor;
+enum class ExitFrameType : uint8_t;
+
+class AutoSaveLiveRegisters;
+class CompileZone;
+class TemplateNativeObject;
+class TemplateObject;
+
+enum class CheckUnsafeCallWithABI {
+  Check,
+
+  DontCheckHasExitFrame,
+
+  DontCheckOther,
+};
+
+template <typename Sig>
+static inline DynFn DynamicFunction(Sig fun);
+
+constexpr uint32_t WasmCallerInstanceOffsetBeforeCall =
+    wasm::FrameWithInstances::callerInstanceOffsetWithoutFrame();
+constexpr uint32_t WasmCalleeInstanceOffsetBeforeCall =
+    wasm::FrameWithInstances::calleeInstanceOffsetWithoutFrame();
+
+struct AllocSiteInput
+    : public mozilla::Variant<Register, gc::CatchAllAllocSite> {
+  using Base = mozilla::Variant<Register, gc::CatchAllAllocSite>;
+  AllocSiteInput() : Base(gc::CatchAllAllocSite::Unknown) {}
+  explicit AllocSiteInput(gc::CatchAllAllocSite catchAll) : Base(catchAll) {}
+  explicit AllocSiteInput(Register reg) : Base(reg) {}
+};
+
+struct ReturnCallAdjustmentInfo {
+  uint32_t newSlotsAndStackArgBytes;
+  uint32_t oldSlotsAndStackArgBytes;
+
+  ReturnCallAdjustmentInfo(uint32_t newSlotsAndStackArgBytes,
+                           uint32_t oldSlotsAndStackArgBytes)
+      : newSlotsAndStackArgBytes(newSlotsAndStackArgBytes),
+        oldSlotsAndStackArgBytes(oldSlotsAndStackArgBytes) {}
+};
+
+struct BranchWasmRefIsSubtypeRegisters {
+  bool needSuperSTV;
+  bool needScratch1;
+  bool needScratch2;
+};
+
+
+class MacroAssembler : public MacroAssemblerSpecific {
+ private:
+  CompileRuntime* maybeRuntime_ = nullptr;
+
+  CompileRealm* maybeRealm_ = nullptr;
+
+  NonAssertingLabel failureLabel_;
+
+ protected:
+  explicit MacroAssembler(TempAllocator& alloc,
+                          CompileRuntime* maybeRuntime = nullptr,
+                          CompileRealm* maybeRealm = nullptr);
+
+ public:
+  MoveResolver& moveResolver() {
+    MOZ_ASSERT(moveResolver_.hasNoPendingMoves());
+    return moveResolver_;
+  }
+
+  size_t instructionsSize() const { return size(); }
+
+  CompileRealm* realm() const {
+    MOZ_ASSERT(maybeRealm());
+    return maybeRealm();
+  }
+  CompileRealm* maybeRealm() const { return maybeRealm_; }
+  CompileRuntime* runtime() const {
+    MOZ_ASSERT(maybeRuntime_);
+    return maybeRuntime_;
+  }
+
+#if defined(JS_HAS_HIDDEN_SP)
+  void Push(RegisterOrSP reg);
+#endif
+
+#if defined(ENABLE_WASM_SIMD)
+  static bool MustMaskShiftCountSimd128(wasm::SimdOp op, int32_t* mask);
+#endif
+
+ public:
+
+  void flush() PER_SHARED_ARCH;
+
+  void comment(const char* msg) PER_SHARED_ARCH;
+
+
+  inline uint32_t framePushed() const OOL_IN_HEADER;
+  inline void setFramePushed(uint32_t framePushed) OOL_IN_HEADER;
+  inline void adjustFrame(int32_t value) OOL_IN_HEADER;
+
+  inline void implicitPop(uint32_t bytes) OOL_IN_HEADER;
+
+ private:
+  uint32_t framePushed_;
+
+ public:
+
+
+  static size_t PushRegsInMaskSizeInBytes(LiveRegisterSet set) PER_SHARED_ARCH;
+
+  void PushRegsInMask(LiveRegisterSet set) PER_SHARED_ARCH;
+  void PushRegsInMask(LiveGeneralRegisterSet set);
+
+  void storeRegsInMask(LiveRegisterSet set, Address dest,
+                       Register scratch) PER_SHARED_ARCH;
+
+  void PopRegsInMask(LiveRegisterSet set);
+  void PopRegsInMask(LiveGeneralRegisterSet set);
+  void PopRegsInMaskIgnore(LiveRegisterSet set,
+                           LiveRegisterSet ignore) PER_SHARED_ARCH;
+
+
+  void Push(const Operand op) DEFINED_ON(x86_shared);
+  void Push(Register reg) PER_SHARED_ARCH;
+  void Push(Register reg1, Register reg2, Register reg3, Register reg4)
+      DEFINED_ON(arm64);
+  void Push(const Imm32 imm) PER_SHARED_ARCH;
+  void Push(const ImmWord imm) PER_SHARED_ARCH;
+  void Push(const ImmPtr imm) PER_SHARED_ARCH;
+  void Push(const ImmGCPtr ptr) PER_SHARED_ARCH;
+  void Push(FloatRegister reg) PER_SHARED_ARCH;
+  void PushBoxed(FloatRegister reg) PER_ARCH;
+  void PushFlags() DEFINED_ON(x86_shared);
+  void Push(PropertyKey key, Register scratchReg);
+  void Push(const Address& addr);
+  void Push(TypedOrValueRegister v);
+  void Push(const ConstantOrRegister& v);
+  void Push(const ValueOperand& val);
+  void Push(const Value& val);
+  void Push(JSValueType type, Register reg);
+  void Push(const Register64 reg);
+  void PushEmptyRooted(VMFunctionData::RootType rootType);
+  inline CodeOffset PushWithPatch(ImmWord word);
+  inline CodeOffset PushWithPatch(ImmPtr imm);
+
+  using MacroAssemblerSpecific::push;
+
+  void Pop(const Operand op) DEFINED_ON(x86_shared);
+  void Pop(Register reg) PER_SHARED_ARCH;
+  void Pop(FloatRegister t) PER_SHARED_ARCH;
+  void Pop(const ValueOperand& val) PER_SHARED_ARCH;
+  void Pop(const Register64 reg);
+  void PopFlags() DEFINED_ON(x86_shared);
+  void PopStackPtr()
+      DEFINED_ON(arm, mips64, x86_shared, loong64, riscv64, wasm32);
+
+  void adjustStack(int amount);
+  void freeStack(uint32_t amount);
+
+  void freeStackTo(uint32_t framePushed) PER_SHARED_ARCH;
+
+ private:
+#if defined(DEBUG)
+  friend AutoRegisterScope;
+  friend AutoFloatRegisterScope;
+  AllocatableRegisterSet debugTrackedRegisters_;
+#endif
+
+ public:
+
+  CodeOffset call(Register reg) PER_SHARED_ARCH;
+  CodeOffset call(Label* label) PER_SHARED_ARCH;
+  CodeOffset call(const Address& addr) PER_SHARED_ARCH;
+
+  void call(ImmWord imm) PER_SHARED_ARCH;
+  void call(ImmPtr imm) PER_SHARED_ARCH;
+  CodeOffset call(wasm::SymbolicAddress imm) PER_SHARED_ARCH;
+  inline CodeOffset call(const wasm::CallSiteDesc& desc,
+                         wasm::SymbolicAddress imm);
+
+  void call(JitCode* c) PER_SHARED_ARCH;
+
+  inline void call(TrampolinePtr code);
+
+  inline CodeOffset call(const wasm::CallSiteDesc& desc, const Register reg);
+  inline CodeOffset call(const wasm::CallSiteDesc& desc, uint32_t funcDefIndex);
+  inline void call(const wasm::CallSiteDesc& desc, wasm::Trap trap);
+
+  CodeOffset callWithPatch() PER_SHARED_ARCH;
+  void patchCall(uint32_t callerOffset, uint32_t calleeOffset) PER_SHARED_ARCH;
+
+  void callAndPushReturnAddress(Register reg) DEFINED_ON(x86_shared);
+  void callAndPushReturnAddress(Label* label) DEFINED_ON(x86_shared);
+
+  void pushReturnAddress()
+      DEFINED_ON(mips64, arm, arm64, loong64, riscv64, wasm32);
+  void popReturnAddress()
+      DEFINED_ON(mips64, arm, arm64, loong64, riscv64, wasm32);
+
+  void moveRegPair(Register src0, Register src1, Register dst0, Register dst1,
+                   MoveOp::Type type = MoveOp::GENERAL);
+
+  void reserveVMFunctionOutParamSpace(const VMFunctionData& f);
+  void loadVMFunctionOutParam(const VMFunctionData& f, const Address& addr);
+
+ public:
+
+  CodeOffset farJumpWithPatch() PER_SHARED_ARCH;
+  void patchFarJump(CodeOffset farJump, uint32_t targetOffset) PER_SHARED_ARCH;
+  static void patchFarJump(uint8_t* farJump, uint8_t* target)
+      DEFINED_ON(arm, arm64, x86_shared, loong64, mips64, riscv64);
+
+  CodeOffset nopPatchableToCall() PER_SHARED_ARCH;
+  void nopPatchableToCall(const wasm::CallSiteDesc& desc);
+  static void patchNopToCall(uint8_t* callsite,
+                             uint8_t* target) PER_SHARED_ARCH;
+  static void patchCallToNop(uint8_t* callsite) PER_SHARED_ARCH;
+
+  CodeOffset moveNearAddressWithPatch(Register dest) PER_ARCH;
+  static void patchNearAddressMove(CodeLocationLabel loc,
+                                   CodeLocationLabel target) PER_ARCH;
+
+  CodeOffset move32WithPatch(Register dest)
+      DEFINED_ON(x86_shared, arm, arm64, loong64, mips64, riscv64);
+  void patchMove32(CodeOffset offset, Imm32 n)
+      DEFINED_ON(x86_shared, arm, arm64, loong64, mips64, riscv64);
+
+ public:
+
+  void setupAlignedABICall();
+
+  void setupWasmABICall(wasm::SymbolicAddress builtin);
+
+  void setupUnalignedABICall(Register scratch) PER_ARCH;
+
+  void setupUnalignedABICallDontSaveRestoreSP();
+
+  void passABIArg(const MoveOperand& from, ABIType type);
+  inline void passABIArg(Register reg);
+  void passABIArg(Register64 reg);
+  inline void passABIArg(FloatRegister reg, ABIType type);
+
+  inline void callWithABI(
+      DynFn fun, ABIType result = ABIType::General,
+      CheckUnsafeCallWithABI check = CheckUnsafeCallWithABI::Check);
+  template <typename Sig, Sig fun>
+  inline void callWithABI(
+      ABIType result = ABIType::General,
+      CheckUnsafeCallWithABI check = CheckUnsafeCallWithABI::Check);
+  inline void callWithABI(Register fun, ABIType result = ABIType::General);
+  inline void callWithABI(const Address& fun,
+                          ABIType result = ABIType::General);
+
+  CodeOffset callWithABI(wasm::BytecodeOffset offset, wasm::SymbolicAddress fun,
+                         mozilla::Maybe<int32_t> instanceOffset,
+                         ABIType result = ABIType::General);
+  void callDebugWithABI(wasm::SymbolicAddress fun,
+                        ABIType result = ABIType::General);
+
+ private:
+  void setupABICallHelper(ABIKind kind);
+
+  void setupNativeABICall();
+
+  void callWithABIPre(uint32_t* stackAdjust,
+                      bool callFromWasm = false) PER_ARCH;
+
+  void callWithABINoProfiler(void* fun, ABIType result,
+                             CheckUnsafeCallWithABI check);
+  void callWithABINoProfiler(Register fun, ABIType result) PER_ARCH;
+  void callWithABINoProfiler(const Address& fun, ABIType result) PER_ARCH;
+
+  void callWithABIPost(uint32_t stackAdjust, ABIType result) PER_ARCH;
+
+#if defined(JS_CHECK_UNSAFE_CALL_WITH_ABI)
+  void wasmCheckUnsafeCallWithABIPre();
+  void wasmCheckUnsafeCallWithABIPost();
+#endif
+
+  inline void appendSignatureType(ABIType type);
+  inline ABIFunctionType signature() const;
+
+  MoveResolver moveResolver_;
+
+  ABIArgGenerator abiArgs_;
+
+#if defined(DEBUG)
+  bool inCall_;
+#endif
+
+  bool dynamicAlignment_;
+
+#if defined(JS_SIMULATOR)
+  uint32_t signature_;
+#endif
+
+ public:
+
+  inline uint32_t callJitNoProfiler(Register callee);
+  inline uint32_t callJit(Register callee);
+  inline uint32_t callJit(JitCode* code);
+  inline uint32_t callJit(TrampolinePtr code);
+  inline uint32_t callJit(ImmPtr callee);
+
+  inline void push(FrameDescriptor descriptor);
+  inline void Push(FrameDescriptor descriptor);
+
+  inline void pushFrameDescriptorForJitCall(FrameType type, Register argc,
+                                            Register scratch,
+                                            bool hasInlineICScript = false);
+  inline void PushFrameDescriptorForJitCall(FrameType type, Register argc,
+                                            Register scratch,
+                                            bool hasInlineICScript = false);
+  inline void makeFrameDescriptorForJitCall(FrameType type, Register argc,
+                                            Register dest,
+                                            bool hasInlineICScript = false);
+
+  inline void loadNumActualArgs(Register framePtr, Register dest);
+
+  inline void PushCalleeToken(Register callee, bool constructing);
+
+  inline void loadFunctionFromCalleeToken(Address token, Register dest);
+
+  inline uint32_t buildFakeExitFrame(Register scratch);
+
+ private:
+  uint32_t pushFakeReturnAddress(Register scratch) PER_SHARED_ARCH;
+
+ public:
+
+  inline void enterExitFrame(Register cxreg, Register scratch, VMFunctionId f);
+
+  inline void enterFakeExitFrame(Register cxreg, Register scratch,
+                                 ExitFrameType type);
+
+  inline void enterFakeExitFrameForNative(Register cxreg, Register scratch,
+                                          bool isConstructing);
+
+  inline void leaveExitFrame(size_t extraFrame = 0);
+
+ private:
+  void linkExitFrame(Register cxreg, Register scratch);
+
+ public:
+
+  inline void move64(Imm64 imm, Register64 dest) PER_ARCH;
+  inline void move64(Register64 src, Register64 dest) PER_ARCH;
+
+  inline void moveFloat16ToGPR(FloatRegister src,
+                               Register dest) PER_SHARED_ARCH;
+  inline void moveGPRToFloat16(Register src,
+                               FloatRegister dest) PER_SHARED_ARCH;
+
+  inline void moveFloat32ToGPR(FloatRegister src,
+                               Register dest) PER_SHARED_ARCH;
+  inline void moveGPRToFloat32(Register src,
+                               FloatRegister dest) PER_SHARED_ARCH;
+
+  inline void moveDoubleToGPR64(FloatRegister src, Register64 dest) PER_ARCH;
+  inline void moveGPR64ToDouble(Register64 src, FloatRegister dest) PER_ARCH;
+
+  inline void moveLowDoubleToGPR(FloatRegister src,
+                                 Register dest) PER_SHARED_ARCH;
+
+  inline void move8ZeroExtend(Register src, Register dest) PER_SHARED_ARCH;
+
+  inline void move8SignExtend(Register src, Register dest) PER_SHARED_ARCH;
+  inline void move16SignExtend(Register src, Register dest) PER_SHARED_ARCH;
+
+  inline void move64To32(Register64 src, Register dest) PER_ARCH;
+
+  inline void move32To64ZeroExtend(Register src, Register64 dest) PER_ARCH;
+
+  inline void move8To64SignExtend(Register src, Register64 dest) PER_ARCH;
+  inline void move16To64SignExtend(Register src, Register64 dest) PER_ARCH;
+  inline void move32To64SignExtend(Register src, Register64 dest) PER_ARCH;
+
+  inline void move8SignExtendToPtr(Register src, Register dest) PER_ARCH;
+  inline void move16SignExtendToPtr(Register src, Register dest) PER_ARCH;
+  inline void move32SignExtendToPtr(Register src, Register dest) PER_ARCH;
+
+  inline void move32ZeroExtendToPtr(Register src, Register dest) PER_ARCH;
+
+  inline void moveValue(const ConstantOrRegister& src,
+                        const ValueOperand& dest);
+  void moveValue(const TypedOrValueRegister& src, const ValueOperand& dest);
+  void moveValue(const ValueOperand& src, const ValueOperand& dest) PER_ARCH;
+  void moveValue(const Value& src, const ValueOperand& dest) PER_ARCH;
+
+  void movePropertyKey(PropertyKey key, Register dest);
+
+
+  inline void load32SignExtendToPtr(const Address& src, Register dest) PER_ARCH;
+
+  inline void loadAbiReturnAddress(Register dest) PER_SHARED_ARCH;
+
+
+  inline void copy64(const Address& src, const Address& dest, Register scratch);
+
+ public:
+
+  inline void not32(Register reg) PER_SHARED_ARCH;
+  inline void notPtr(Register reg) PER_ARCH;
+
+  inline void and32(Register src, Register dest) PER_SHARED_ARCH;
+  inline void and32(Imm32 imm, Register dest) PER_SHARED_ARCH;
+  inline void and32(Imm32 imm, Register src, Register dest) PER_SHARED_ARCH;
+  inline void and32(Imm32 imm, const Address& dest) PER_SHARED_ARCH;
+  inline void and32(const Address& src, Register dest) PER_SHARED_ARCH;
+
+  inline void andPtr(Register src, Register dest) PER_ARCH;
+  inline void andPtr(Imm32 imm, Register dest) PER_ARCH;
+  inline void andPtr(Imm32 imm, Register src, Register dest) PER_ARCH;
+
+  inline void and64(Imm64 imm, Register64 dest) PER_ARCH;
+  inline void or64(Imm64 imm, Register64 dest) PER_ARCH;
+  inline void xor64(Imm64 imm, Register64 dest) PER_ARCH;
+
+  inline void or32(Register src, Register dest) PER_SHARED_ARCH;
+  inline void or32(Imm32 imm, Register dest) PER_SHARED_ARCH;
+  inline void or32(Imm32 imm, Register src, Register dest) PER_SHARED_ARCH;
+  inline void or32(Imm32 imm, const Address& dest) PER_SHARED_ARCH;
+
+  inline void orPtr(Register src, Register dest) PER_ARCH;
+  inline void orPtr(Imm32 imm, Register dest) PER_ARCH;
+  inline void orPtr(Imm32 imm, Register src, Register dest) PER_ARCH;
+
+  inline void and64(Register64 src, Register64 dest) PER_ARCH;
+  inline void or64(Register64 src, Register64 dest) PER_ARCH;
+  inline void xor64(Register64 src, Register64 dest) PER_ARCH;
+
+  inline void xor32(Register src, Register dest) PER_SHARED_ARCH;
+  inline void xor32(Imm32 imm, Register dest) PER_SHARED_ARCH;
+  inline void xor32(Imm32 imm, Register src, Register dest) PER_SHARED_ARCH;
+  inline void xor32(Imm32 imm, const Address& dest) PER_SHARED_ARCH;
+  inline void xor32(const Address& src, Register dest) PER_SHARED_ARCH;
+
+  inline void xorPtr(Register src, Register dest) PER_ARCH;
+  inline void xorPtr(Imm32 imm, Register dest) PER_ARCH;
+  inline void xorPtr(Imm32 imm, Register src, Register dest) PER_ARCH;
+
+  inline void and64(const Operand& src, Register64 dest) DEFINED_ON(x64);
+  inline void or64(const Operand& src, Register64 dest) DEFINED_ON(x64);
+  inline void xor64(const Operand& src, Register64 dest) DEFINED_ON(x64);
+
+
+  inline void byteSwap16SignExtend(Register reg) PER_SHARED_ARCH;
+
+  inline void byteSwap16ZeroExtend(Register reg) PER_SHARED_ARCH;
+
+  inline void byteSwap32(Register reg) PER_SHARED_ARCH;
+
+  inline void byteSwap64(Register64 reg) PER_ARCH;
+
+
+
+  inline void add32(const Address& src, Register dest) PER_SHARED_ARCH;
+  inline void add32(Register src, Register dest) PER_SHARED_ARCH;
+  inline void add32(Imm32 imm, Register dest) PER_SHARED_ARCH;
+  inline void add32(Imm32 imm, Register src, Register dest) PER_SHARED_ARCH;
+  inline void add32(Imm32 imm, const Address& dest) PER_SHARED_ARCH;
+  inline void add32(Imm32 imm, const AbsoluteAddress& dest)
+      DEFINED_ON(x86_shared);
+
+  inline void addPtr(Register src, Register dest) PER_ARCH;
+  inline void addPtr(Register src1, Register src2, Register dest)
+      DEFINED_ON(arm64);
+  inline void addPtr(Imm32 imm, Register dest) PER_ARCH;
+  inline void addPtr(Imm32 imm, Register src, Register dest) DEFINED_ON(arm64);
+  inline void addPtr(ImmWord imm, Register dest) PER_ARCH;
+  inline void addPtr(ImmPtr imm, Register dest);
+  inline void addPtr(Imm32 imm, const Address& dest) PER_ARCH;
+  inline void addPtr(Imm32 imm, const AbsoluteAddress& dest)
+      DEFINED_ON(x86, x64);
+  inline void addPtr(const Address& src, Register dest) PER_ARCH;
+
+  inline void add64(Register64 src, Register64 dest) PER_ARCH;
+  inline void add64(Imm32 imm, Register64 dest) PER_ARCH;
+  inline void add64(Imm64 imm, Register64 dest) PER_ARCH;
+  inline void add64(const Operand& src, Register64 dest) DEFINED_ON(x64);
+
+  inline void addFloat32(FloatRegister src, FloatRegister dest) PER_SHARED_ARCH;
+
+  inline CodeOffset sub32FromStackPtrWithPatch(Register dest) PER_ARCH;
+  inline void patchSub32FromStackPtr(CodeOffset offset, Imm32 imm) PER_ARCH;
+
+  inline void addDouble(FloatRegister src, FloatRegister dest) PER_SHARED_ARCH;
+  inline void addConstantDouble(double d, FloatRegister dest) DEFINED_ON(x86);
+
+  inline void sub32(const Address& src, Register dest) PER_SHARED_ARCH;
+  inline void sub32(Register src, Register dest) PER_SHARED_ARCH;
+  inline void sub32(Imm32 imm, Register dest) PER_SHARED_ARCH;
+
+  inline void subPtr(Register src, Register dest) PER_ARCH;
+  inline void subPtr(Register src, const Address& dest) PER_ARCH;
+  inline void subPtr(Imm32 imm, Register dest) PER_ARCH;
+  inline void subPtr(ImmWord imm, Register dest) DEFINED_ON(x86, x64);
+  inline void subPtr(const Address& addr, Register dest) PER_ARCH;
+
+  inline void sub64(Register64 src, Register64 dest) PER_ARCH;
+  inline void sub64(Imm64 imm, Register64 dest) PER_ARCH;
+  inline void sub64(const Operand& src, Register64 dest) DEFINED_ON(x64);
+
+  inline void subFloat32(FloatRegister src, FloatRegister dest) PER_SHARED_ARCH;
+
+  inline void subDouble(FloatRegister src, FloatRegister dest) PER_SHARED_ARCH;
+
+  inline void mul32(Register rhs, Register srcDest) PER_SHARED_ARCH;
+  inline void mul32(Imm32 imm, Register srcDest) PER_SHARED_ARCH;
+
+  inline void mul32(Register src1, Register src2, Register dest, Label* onOver)
+      DEFINED_ON(arm64);
+
+  inline void mulHighUnsigned32(Imm32 imm, Register src,
+                                Register dest) PER_ARCH;
+
+  inline void mulPtr(Register rhs, Register srcDest) PER_ARCH;
+  inline void mulPtr(ImmWord rhs, Register srcDest) PER_ARCH;
+
+  inline void mul64(const Register64& rhs, const Register64& srcDest)
+      DEFINED_ON(x64, arm64, mips64, loong64, riscv64);
+  inline void mul64(const Operand& src, const Register64& dest) DEFINED_ON(x64);
+  inline void mul64(const Operand& src, const Register64& dest,
+                    const Register temp) DEFINED_ON(x64);
+  inline void mul64(Imm64 imm, const Register64& dest) PER_ARCH;
+  inline void mul64(Imm64 imm, const Register64& dest, const Register temp)
+      DEFINED_ON(x86, x64, arm, mips64, loong64, riscv64);
+  inline void mul64(const Register64& src, const Register64& dest,
+                    const Register temp) PER_ARCH;
+  inline void mul64(const Register64& src1, const Register64& src2,
+                    const Register64& dest) DEFINED_ON(arm64);
+  inline void mul64(Imm64 src1, const Register64& src2, const Register64& dest)
+      DEFINED_ON(arm64);
+
+  inline void mulBy3(Register src, Register dest) PER_ARCH;
+
+  inline void mulFloat32(FloatRegister src, FloatRegister dest) PER_SHARED_ARCH;
+  inline void mulDouble(FloatRegister src, FloatRegister dest) PER_SHARED_ARCH;
+
+  inline void mulDoublePtr(ImmPtr imm, Register temp,
+                           FloatRegister dest) PER_ARCH;
+
+  inline void quotient32(Register lhs, Register rhs, Register dest,
+                         bool isUnsigned)
+      DEFINED_ON(mips64, arm, arm64, loong64, riscv64, wasm32);
+
+  inline void quotient64(Register lhs, Register rhs, Register dest,
+                         bool isUnsigned)
+      DEFINED_ON(arm64, loong64, mips64, riscv64);
+
+  inline void quotient32(Register lhs, Register rhs, Register dest,
+                         Register tempEdx, bool isUnsigned)
+      DEFINED_ON(x86_shared);
+
+  inline void remainder32(Register lhs, Register rhs, Register dest,
+                          bool isUnsigned)
+      DEFINED_ON(mips64, arm, arm64, loong64, riscv64, wasm32);
+
+  inline void remainder64(Register lhs, Register rhs, Register dest,
+                          bool isUnsigned)
+      DEFINED_ON(arm64, loong64, mips64, riscv64);
+
+  inline void remainder32(Register lhs, Register rhs, Register dest,
+                          Register tempEdx, bool isUnsigned)
+      DEFINED_ON(x86_shared);
+
+  void flexibleRemainder32(
+      Register lhs, Register rhs, Register dest, bool isUnsigned,
+      const LiveRegisterSet& volatileLiveRegs) PER_SHARED_ARCH;
+  void flexibleRemainderPtr(Register lhs, Register rhs, Register dest,
+                            bool isUnsigned,
+                            const LiveRegisterSet& volatileLiveRegs) PER_ARCH;
+
+  void flexibleQuotient32(
+      Register lhs, Register rhs, Register dest, bool isUnsigned,
+      const LiveRegisterSet& volatileLiveRegs) PER_SHARED_ARCH;
+  void flexibleQuotientPtr(Register lhs, Register rhs, Register dest,
+                           bool isUnsigned,
+                           const LiveRegisterSet& volatileLiveRegs) PER_ARCH;
+
+  void flexibleDivMod32(
+      Register lhs, Register rhs, Register divOutput, Register remOutput,
+      bool isUnsigned, const LiveRegisterSet& volatileLiveRegs) PER_SHARED_ARCH;
+
+  inline void divFloat32(FloatRegister src, FloatRegister dest) PER_SHARED_ARCH;
+  inline void divDouble(FloatRegister src, FloatRegister dest) PER_SHARED_ARCH;
+
+  inline void inc64(AbsoluteAddress dest) PER_ARCH;
+
+  inline void neg32(Register reg) PER_SHARED_ARCH;
+  inline void neg64(Register64 reg) PER_ARCH;
+  inline void negPtr(Register reg) PER_ARCH;
+
+  inline void negateFloat(FloatRegister reg) PER_SHARED_ARCH;
+
+  inline void negateDouble(FloatRegister reg) PER_SHARED_ARCH;
+
+  inline void abs32(Register src, Register dest) PER_SHARED_ARCH;
+  inline void absFloat32(FloatRegister src, FloatRegister dest) PER_SHARED_ARCH;
+  inline void absDouble(FloatRegister src, FloatRegister dest) PER_SHARED_ARCH;
+
+  inline void sqrtFloat32(FloatRegister src,
+                          FloatRegister dest) PER_SHARED_ARCH;
+  inline void sqrtDouble(FloatRegister src, FloatRegister dest) PER_SHARED_ARCH;
+
+  void floorFloat32ToInt32(FloatRegister src, Register dest,
+                           Label* fail) PER_SHARED_ARCH;
+  void floorDoubleToInt32(FloatRegister src, Register dest,
+                          Label* fail) PER_SHARED_ARCH;
+
+  void ceilFloat32ToInt32(FloatRegister src, Register dest,
+                          Label* fail) PER_SHARED_ARCH;
+  void ceilDoubleToInt32(FloatRegister src, Register dest,
+                         Label* fail) PER_SHARED_ARCH;
+
+  void roundFloat32ToInt32(FloatRegister src, Register dest, FloatRegister temp,
+                           Label* fail) PER_SHARED_ARCH;
+  void roundDoubleToInt32(FloatRegister src, Register dest, FloatRegister temp,
+                          Label* fail) PER_SHARED_ARCH;
+
+  void truncFloat32ToInt32(FloatRegister src, Register dest,
+                           Label* fail) PER_SHARED_ARCH;
+  void truncDoubleToInt32(FloatRegister src, Register dest,
+                          Label* fail) PER_SHARED_ARCH;
+
+  void nearbyIntDouble(RoundingMode mode, FloatRegister src,
+                       FloatRegister dest) PER_SHARED_ARCH;
+  void nearbyIntFloat32(RoundingMode mode, FloatRegister src,
+                        FloatRegister dest) PER_SHARED_ARCH;
+
+  void signInt32(Register input, Register output);
+  void signDouble(FloatRegister input, FloatRegister output);
+  void signDoubleToInt32(FloatRegister input, Register output,
+                         FloatRegister temp, Label* fail);
+
+  void copySignDouble(FloatRegister lhs, FloatRegister rhs,
+                      FloatRegister output) PER_SHARED_ARCH;
+  void copySignFloat32(FloatRegister lhs, FloatRegister rhs,
+                       FloatRegister output) PER_SHARED_ARCH;
+
+  void randomDouble(Register rng, FloatRegister dest, Register64 temp0,
+                    Register64 temp1);
+
+  inline void min32(Register lhs, Register rhs, Register result) PER_ARCH;
+  inline void min32(Register lhs, Imm32 rhs, Register result) PER_ARCH;
+
+  inline void max32(Register lhs, Register rhs, Register result) PER_ARCH;
+  inline void max32(Register lhs, Imm32 rhs, Register result) PER_ARCH;
+
+  inline void minPtr(Register lhs, Register rhs, Register result) PER_ARCH;
+  inline void minPtr(Register lhs, ImmWord rhs, Register result) PER_ARCH;
+
+  inline void maxPtr(Register lhs, Register rhs, Register result) PER_ARCH;
+  inline void maxPtr(Register lhs, ImmWord rhs, Register result) PER_ARCH;
+
+
+  inline void minFloat32(FloatRegister other, FloatRegister srcDest,
+                         bool handleNaN) PER_SHARED_ARCH;
+  inline void minDouble(FloatRegister other, FloatRegister srcDest,
+                        bool handleNaN) PER_SHARED_ARCH;
+
+  inline void maxFloat32(FloatRegister other, FloatRegister srcDest,
+                         bool handleNaN) PER_SHARED_ARCH;
+  inline void maxDouble(FloatRegister other, FloatRegister srcDest,
+                        bool handleNaN) PER_SHARED_ARCH;
+
+  void minMaxArrayInt32(Register array, Register result, Register temp1,
+                        Register temp2, Register temp3, bool isMax,
+                        Label* fail);
+  void minMaxArrayNumber(Register array, FloatRegister result,
+                         FloatRegister floatTemp, Register temp1,
+                         Register temp2, bool isMax, Label* fail);
+
+  void pow32(Register base, Register power, Register dest, Register temp1,
+             Register temp2, Label* onOver);
+  void powPtr(Register base, Register power, Register dest, Register temp1,
+              Register temp2, Label* onOver);
+
+  void roundFloat32(FloatRegister src, FloatRegister dest);
+  void roundDouble(FloatRegister src, FloatRegister dest);
+
+  void sameValueDouble(FloatRegister left, FloatRegister right,
+                       FloatRegister temp, Register dest);
+
+  void loadRegExpLastIndex(Register regexp, Register string, Register lastIndex,
+                           Label* notFoundZeroLastIndex);
+
+  void loadAndClearRegExpSearcherLastLimit(Register result, Register scratch);
+
+  void loadParsedRegExpShared(Register regexp, Register result,
+                              Label* unparsed);
+
+
+
+  inline void lshift32(Imm32 shift, Register srcDest) PER_SHARED_ARCH;
+  inline void lshift32(Imm32 shift, Register src,
+                       Register dest) PER_SHARED_ARCH;
+  inline void rshift32(Imm32 shift, Register srcDest) PER_SHARED_ARCH;
+  inline void rshift32(Imm32 shift, Register src,
+                       Register dest) PER_SHARED_ARCH;
+  inline void rshift32Arithmetic(Imm32 shift, Register srcDest) PER_SHARED_ARCH;
+  inline void rshift32Arithmetic(Imm32 shift, Register src,
+                                 Register dest) PER_SHARED_ARCH;
+
+  inline void lshiftPtr(Imm32 imm, Register dest) PER_ARCH;
+  inline void lshiftPtr(Imm32 imm, Register src, Register dest) PER_ARCH;
+  inline void rshiftPtr(Imm32 imm, Register dest) PER_ARCH;
+  inline void rshiftPtr(Imm32 imm, Register src, Register dest) PER_ARCH;
+  inline void rshiftPtrArithmetic(Imm32 imm, Register dest) PER_ARCH;
+  inline void rshiftPtrArithmetic(Imm32 imm, Register src,
+                                  Register dest) PER_ARCH;
+
+  inline void lshift64(Imm32 imm, Register64 dest) PER_ARCH;
+  inline void rshift64(Imm32 imm, Register64 dest) PER_ARCH;
+  inline void rshift64Arithmetic(Imm32 imm, Register64 dest) PER_ARCH;
+
+  inline void lshift32(Register shift, Register srcDest) PER_SHARED_ARCH;
+  inline void rshift32(Register shift, Register srcDest) PER_SHARED_ARCH;
+  inline void rshift32Arithmetic(Register shift,
+                                 Register srcDest) PER_SHARED_ARCH;
+  inline void lshiftPtr(Register shift, Register srcDest) PER_ARCH;
+  inline void rshiftPtr(Register shift, Register srcDest) PER_ARCH;
+  inline void rshiftPtrArithmetic(Register shift, Register srcDest) PER_ARCH;
+
+  inline void flexibleLshift32(Register shift,
+                               Register srcDest) PER_SHARED_ARCH;
+  inline void flexibleRshift32(Register shift,
+                               Register srcDest) PER_SHARED_ARCH;
+  inline void flexibleRshift32Arithmetic(Register shift,
+                                         Register srcDest) PER_SHARED_ARCH;
+  inline void flexibleLshiftPtr(Register shift, Register srcDest) PER_ARCH;
+  inline void flexibleRshiftPtr(Register shift, Register srcDest) PER_ARCH;
+  inline void flexibleRshiftPtrArithmetic(Register shift,
+                                          Register srcDest) PER_ARCH;
+
+  inline void lshift64(Register shift, Register64 srcDest) PER_ARCH;
+  inline void rshift64(Register shift, Register64 srcDest) PER_ARCH;
+  inline void rshift64Arithmetic(Register shift, Register64 srcDest) PER_ARCH;
+
+
+  inline void rotateLeft(Imm32 count, Register input,
+                         Register dest) PER_SHARED_ARCH;
+  inline void rotateLeft(Register count, Register input,
+                         Register dest) PER_SHARED_ARCH;
+  inline void rotateLeft64(Imm32 count, Register64 input, Register64 dest)
+      DEFINED_ON(x64);
+  inline void rotateLeft64(Register count, Register64 input, Register64 dest)
+      DEFINED_ON(x64);
+  inline void rotateLeft64(Imm32 count, Register64 input, Register64 dest,
+                           Register temp) PER_ARCH;
+  inline void rotateLeft64(Register count, Register64 input, Register64 dest,
+                           Register temp) PER_ARCH;
+
+  inline void rotateRight(Imm32 count, Register input,
+                          Register dest) PER_SHARED_ARCH;
+  inline void rotateRight(Register count, Register input,
+                          Register dest) PER_SHARED_ARCH;
+  inline void rotateRight64(Imm32 count, Register64 input, Register64 dest)
+      DEFINED_ON(x64);
+  inline void rotateRight64(Register count, Register64 input, Register64 dest)
+      DEFINED_ON(x64);
+  inline void rotateRight64(Imm32 count, Register64 input, Register64 dest,
+                            Register temp) PER_ARCH;
+  inline void rotateRight64(Register count, Register64 input, Register64 dest,
+                            Register temp) PER_ARCH;
+
+
+  inline void clz32(Register src, Register dest,
+                    bool knownNotZero) PER_SHARED_ARCH;
+  inline void ctz32(Register src, Register dest,
+                    bool knownNotZero) PER_SHARED_ARCH;
+
+  inline void clz64(Register64 src, Register64 dest) PER_ARCH;
+  inline void ctz64(Register64 src, Register64 dest) PER_ARCH;
+
+  inline void popcnt32(Register src, Register dest,
+                       Register temp) PER_SHARED_ARCH;
+
+  inline void popcnt64(Register64 src, Register64 dest, Register temp) PER_ARCH;
+
+
+  inline void cmp8Set(Condition cond, Address lhs, Imm32 rhs,
+                      Register dest) PER_SHARED_ARCH;
+
+  inline void cmp16Set(Condition cond, Address lhs, Imm32 rhs,
+                       Register dest) PER_SHARED_ARCH;
+
+  template <typename T1, typename T2>
+  inline void cmp32Set(Condition cond, T1 lhs, T2 rhs,
+                       Register dest) PER_SHARED_ARCH;
+
+  inline void cmp64Set(Condition cond, Register64 lhs, Register64 rhs,
+                       Register dest) PER_ARCH;
+
+  inline void cmp64Set(Condition cond, Register64 lhs, Imm64 rhs,
+                       Register dest) PER_ARCH;
+
+  inline void cmp64Set(Condition cond, Address lhs, Register64 rhs,
+                       Register dest) PER_ARCH;
+
+  inline void cmp64Set(Condition cond, Address lhs, Imm64 rhs,
+                       Register dest) PER_ARCH;
+
+  template <typename T1, typename T2>
+  inline void cmpPtrSet(Condition cond, T1 lhs, T2 rhs, Register dest) PER_ARCH;
+
+
+  inline void branch8(Condition cond, const Address& lhs, Imm32 rhs,
+                      Label* label) PER_SHARED_ARCH;
+
+  inline void branch8(Condition cond, const BaseIndex& lhs, Register rhs,
+                      Label* label) PER_SHARED_ARCH;
+
+  inline void branch16(Condition cond, const Address& lhs, Imm32 rhs,
+                       Label* label) PER_SHARED_ARCH;
+
+  inline void branch32(Condition cond, Register lhs, Register rhs,
+                       Label* label) PER_SHARED_ARCH;
+  inline void branch32(Condition cond, Register lhs, Imm32 rhs,
+                       Label* label) PER_SHARED_ARCH;
+
+  inline void branch32(Condition cond, Register lhs, const Address& rhs,
+                       Label* label) DEFINED_ON(arm64);
+
+  inline void branch32(Condition cond, const Address& lhs, Register rhs,
+                       Label* label) PER_SHARED_ARCH;
+  inline void branch32(Condition cond, const Address& lhs, Imm32 rhs,
+                       Label* label) PER_SHARED_ARCH;
+
+  inline void branch32(Condition cond, const AbsoluteAddress& lhs, Register rhs,
+                       Label* label) PER_ARCH;
+  inline void branch32(Condition cond, const AbsoluteAddress& lhs, Imm32 rhs,
+                       Label* label) PER_ARCH;
+
+  inline void branch32(Condition cond, const BaseIndex& lhs, Register rhs,
+                       Label* label) DEFINED_ON(arm, x86_shared);
+  inline void branch32(Condition cond, const BaseIndex& lhs, Imm32 rhs,
+                       Label* label) PER_SHARED_ARCH;
+
+  inline void branch32(Condition cond, const Operand& lhs, Register rhs,
+                       Label* label) DEFINED_ON(x86_shared);
+  inline void branch32(Condition cond, const Operand& lhs, Imm32 rhs,
+                       Label* label) DEFINED_ON(x86_shared);
+
+  inline void branch32(Condition cond, wasm::SymbolicAddress lhs, Imm32 rhs,
+                       Label* label) PER_ARCH;
+
+  // is not defined it will fall through to next instruction, else jump to the
+  inline void branch64(Condition cond, Register64 lhs, Imm64 val,
+                       Label* success, Label* fail = nullptr) PER_ARCH;
+  inline void branch64(Condition cond, Register64 lhs, Register64 rhs,
+                       Label* success, Label* fail = nullptr) PER_ARCH;
+  inline void branch64(Condition cond, const Address& lhs, Imm64 val,
+                       Label* success, Label* fail = nullptr) PER_ARCH;
+  inline void branch64(Condition cond, const Address& lhs, Register64 rhs,
+                       Label* success, Label* fail = nullptr) PER_ARCH;
+
+  inline void branch64(Condition cond, const Address& lhs, const Address& rhs,
+                       Register scratch, Label* label) PER_ARCH;
+
+  inline void branchPtr(Condition cond, Register lhs, Register rhs,
+                        Label* label) PER_SHARED_ARCH;
+  inline void branchPtr(Condition cond, Register lhs, Imm32 rhs,
+                        Label* label) PER_SHARED_ARCH;
+  inline void branchPtr(Condition cond, Register lhs, ImmPtr rhs,
+                        Label* label) PER_SHARED_ARCH;
+  inline void branchPtr(Condition cond, Register lhs, ImmGCPtr rhs,
+                        Label* label) PER_SHARED_ARCH;
+  inline void branchPtr(Condition cond, Register lhs, ImmWord rhs,
+                        Label* label) PER_SHARED_ARCH;
+
+  inline void branchPtr(Condition cond, const Address& lhs, Register rhs,
+                        Label* label) PER_SHARED_ARCH;
+  inline void branchPtr(Condition cond, const Address& lhs, ImmPtr rhs,
+                        Label* label) PER_SHARED_ARCH;
+  inline void branchPtr(Condition cond, const Address& lhs, ImmGCPtr rhs,
+                        Label* label) PER_SHARED_ARCH;
+  inline void branchPtr(Condition cond, const Address& lhs, ImmWord rhs,
+                        Label* label) PER_SHARED_ARCH;
+
+  inline void branchPtr(Condition cond, const BaseIndex& lhs, ImmWord rhs,
+                        Label* label) PER_SHARED_ARCH;
+  inline void branchPtr(Condition cond, const BaseIndex& lhs, Register rhs,
+                        Label* label) PER_SHARED_ARCH;
+
+  inline void branchPtr(Condition cond, const AbsoluteAddress& lhs,
+                        Register rhs, Label* label) PER_ARCH;
+  inline void branchPtr(Condition cond, const AbsoluteAddress& lhs, ImmWord rhs,
+                        Label* label) PER_ARCH;
+
+  inline void branchPtr(Condition cond, wasm::SymbolicAddress lhs, Register rhs,
+                        Label* label) PER_ARCH;
+
+  void loadStoreBuffer(Register ptr, Register buffer) PER_ARCH;
+
+  void branchPtrInNurseryChunk(Condition cond, Register ptr, Register temp,
+                               Label* label) PER_ARCH;
+  void branchPtrInNurseryChunk(Condition cond, const Address& address,
+                               Register temp, Label* label) DEFINED_ON(x86);
+  void branchValueIsNurseryCell(Condition cond, const Address& address,
+                                Register temp, Label* label) PER_ARCH;
+  void branchValueIsNurseryCell(Condition cond, ValueOperand value,
+                                Register temp, Label* label) PER_ARCH;
+
+  inline void branchPrivatePtr(Condition cond, const Address& lhs, Register rhs,
+                               Label* label) PER_ARCH;
+
+  inline void branchFloat(DoubleCondition cond, FloatRegister lhs,
+                          FloatRegister rhs, Label* label) PER_SHARED_ARCH;
+
+  inline void branchTruncateFloat32MaybeModUint32(FloatRegister src,
+                                                  Register dest,
+                                                  Label* fail) PER_ARCH;
+  inline void branchTruncateDoubleMaybeModUint32(FloatRegister src,
+                                                 Register dest,
+                                                 Label* fail) PER_ARCH;
+
+  inline void branchTruncateFloat32ToPtr(FloatRegister src, Register dest,
+                                         Label* fail) DEFINED_ON(x86, x64);
+  inline void branchTruncateDoubleToPtr(FloatRegister src, Register dest,
+                                        Label* fail) DEFINED_ON(x86, x64);
+
+  inline void branchTruncateFloat32ToInt32(FloatRegister src, Register dest,
+                                           Label* fail) PER_ARCH;
+  inline void branchTruncateDoubleToInt32(FloatRegister src, Register dest,
+                                          Label* fail) PER_ARCH;
+
+  inline void branchDouble(DoubleCondition cond, FloatRegister lhs,
+                           FloatRegister rhs, Label* label) PER_SHARED_ARCH;
+
+  inline void branchDoubleNotInInt64Range(Address src, Register temp,
+                                          Label* fail);
+  inline void branchDoubleNotInUInt64Range(Address src, Register temp,
+                                           Label* fail);
+  inline void branchFloat32NotInInt64Range(Address src, Register temp,
+                                           Label* fail);
+  inline void branchFloat32NotInUInt64Range(Address src, Register temp,
+                                            Label* fail);
+
+  inline void branchInt64NotInPtrRange(Register64 src, Label* label) PER_ARCH;
+  inline void branchUInt64NotInPtrRange(Register64 src, Label* label) PER_ARCH;
+
+  template <typename T>
+  inline void branchAdd32(Condition cond, T src, Register dest,
+                          Label* label) PER_SHARED_ARCH;
+  template <typename T>
+  inline void branchSub32(Condition cond, T src, Register dest,
+                          Label* label) PER_SHARED_ARCH;
+  template <typename T>
+  inline void branchMul32(Condition cond, T src, Register dest,
+                          Label* label) PER_SHARED_ARCH;
+  template <typename T>
+  inline void branchRshift32(Condition cond, T src, Register dest,
+                             Label* label) PER_SHARED_ARCH;
+
+  inline void branchNeg32(Condition cond, Register reg,
+                          Label* label) PER_SHARED_ARCH;
+
+  inline void branchAdd64(Condition cond, Imm64 imm, Register64 dest,
+                          Label* label) DEFINED_ON(x86, arm, wasm32);
+
+  template <typename T>
+  inline void branchAddPtr(Condition cond, T src, Register dest,
+                           Label* label) PER_SHARED_ARCH;
+
+  template <typename T>
+  inline void branchSubPtr(Condition cond, T src, Register dest,
+                           Label* label) PER_SHARED_ARCH;
+
+  inline void branchMulPtr(Condition cond, Register src, Register dest,
+                           Label* label) PER_SHARED_ARCH;
+
+  inline void branchNegPtr(Condition cond, Register reg,
+                           Label* label) PER_SHARED_ARCH;
+
+  inline void decBranchPtr(Condition cond, Register lhs, Imm32 rhs,
+                           Label* label) PER_SHARED_ARCH;
+
+  inline void branchTest32(Condition cond, Register lhs, Register rhs,
+                           Label* label) PER_SHARED_ARCH;
+  inline void branchTest32(Condition cond, Register lhs, Imm32 rhs,
+                           Label* label) PER_SHARED_ARCH;
+  inline void branchTest32(Condition cond, const Address& lhs, Imm32 rhh,
+                           Label* label) PER_SHARED_ARCH;
+  inline void branchTest32(Condition cond, const AbsoluteAddress& lhs,
+                           Imm32 rhs, Label* label) PER_ARCH;
+
+  inline void branchTestPtr(Condition cond, Register lhs, Register rhs,
+                            Label* label) PER_SHARED_ARCH;
+  inline void branchTestPtr(Condition cond, Register lhs, Imm32 rhs,
+                            Label* label) PER_SHARED_ARCH;
+  inline void branchTestPtr(Condition cond, Register lhs, ImmWord rhs,
+                            Label* label) PER_ARCH;
+  inline void branchTestPtr(Condition cond, const Address& lhs, Imm32 rhs,
+                            Label* label) PER_SHARED_ARCH;
+
+  // When a fail label is not defined it will fall through to next instruction,
+  inline void branchTest64(Condition cond, Register64 lhs, Register64 rhs,
+                           Register temp, Label* success,
+                           Label* fail = nullptr) PER_ARCH;
+  inline void branchTest64(Condition cond, Register64 lhs, Register64 rhs,
+                           Label* success, Label* fail = nullptr);
+  inline void branchTest64(Condition cond, Register64 lhs, Imm64 rhs,
+                           Label* success, Label* fail = nullptr) PER_ARCH;
+
+  inline void branchIfFalseBool(Register reg, Label* label);
+
+  inline void branchIfTrueBool(Register reg, Label* label);
+
+  inline void branchIfNotNullOrUndefined(ValueOperand val, Label* label);
+
+  inline void branchIfRope(Register str, Label* label);
+  inline void branchIfNotRope(Register str, Label* label);
+
+  inline void branchLatin1String(Register string, Label* label);
+  inline void branchTwoByteString(Register string, Label* label);
+
+  inline void branchIfBigIntIsNegative(Register bigInt, Label* label);
+  inline void branchIfBigIntIsNonNegative(Register bigInt, Label* label);
+  inline void branchIfBigIntIsZero(Register bigInt, Label* label);
+  inline void branchIfBigIntIsNonZero(Register bigInt, Label* label);
+
+  inline void branchTestFunctionFlags(Register fun, uint32_t flags,
+                                      Condition cond, Label* label);
+
+  inline void branchIfNotFunctionIsNonBuiltinCtor(Register fun,
+                                                  Register scratch,
+                                                  Label* label);
+
+  inline void branchIfFunctionHasNoJitEntry(Register fun, Label* label);
+  inline void branchIfFunctionHasJitEntry(Register fun, Label* label);
+
+  inline void branchIfScriptHasJitScript(Register script, Label* label);
+  inline void branchIfScriptHasNoJitScript(Register script, Label* label);
+  inline void loadJitScript(Register script, Register dest);
+
+  inline void loadFunctionArgCount(Register func, Register output);
+
+  void loadFunctionLength(Register func, Register funFlagsAndArgCount,
+                          Register output, Label* slowPath);
+
+  void loadFunctionName(Register func, Register output, ImmGCPtr emptyString,
+                        Label* slowPath);
+
+  void assertFunctionIsExtended(Register func);
+
+  inline void branchFunctionKind(Condition cond,
+                                 FunctionFlags::FunctionKind kind, Register fun,
+                                 Register scratch, Label* label);
+
+  inline void branchIfObjectEmulatesUndefined(Register objReg, Register scratch,
+                                              Label* slowCheck, Label* label);
+
+
+  inline void branchTestObjClass(Condition cond, Register obj,
+                                 const JSClass* clasp, Register scratch,
+                                 Register spectreRegToZero, Label* label);
+  inline void branchTestObjClassNoSpectreMitigations(Condition cond,
+                                                     Register obj,
+                                                     const JSClass* clasp,
+                                                     Register scratch,
+                                                     Label* label);
+
+  inline void branchTestObjClass(Condition cond, Register obj,
+                                 const Address& clasp, Register scratch,
+                                 Register spectreRegToZero, Label* label);
+  inline void branchTestObjClassNoSpectreMitigations(Condition cond,
+                                                     Register obj,
+                                                     const Address& clasp,
+                                                     Register scratch,
+                                                     Label* label);
+
+  inline void branchTestObjClass(Condition cond, Register obj, Register clasp,
+                                 Register scratch, Register spectreRegToZero,
+                                 Label* label);
+
+  inline void branchTestObjShape(Condition cond, Register obj,
+                                 const Shape* shape, Register scratch,
+                                 Register spectreRegToZero, Label* label);
+  inline void branchTestObjShapeNoSpectreMitigations(Condition cond,
+                                                     Register obj,
+                                                     const Shape* shape,
+                                                     Label* label);
+
+ private:
+  void branchTestObjShapeListImpl(Register obj, Register shapeElements,
+                                  size_t itemSize, Register shapeScratch,
+                                  Register endScratch, Register spectreScratch,
+                                  Label* fail);
+
+ public:
+  void branchTestObjShapeList(Register obj, Register shapeElements,
+                              Register shapeScratch, Register endScratch,
+                              Register spectreScratch, Label* fail);
+
+  void branchTestObjShapeListSetOffset(Register obj, Register shapeElements,
+                                       Register offset, Register shapeScratch,
+                                       Register endScratch,
+                                       Register spectreScratch, Label* fail);
+
+  inline void branchTestClassIsFunction(Condition cond, Register clasp,
+                                        Label* label);
+  inline void branchTestObjIsFunction(Condition cond, Register obj,
+                                      Register scratch,
+                                      Register spectreRegToZero, Label* label);
+  inline void branchTestObjIsFunctionNoSpectreMitigations(Condition cond,
+                                                          Register obj,
+                                                          Register scratch,
+                                                          Label* label);
+
+  inline void branchTestObjShape(Condition cond, Register obj, Register shape,
+                                 Register scratch, Register spectreRegToZero,
+                                 Label* label);
+  inline void branchTestObjShapeNoSpectreMitigations(Condition cond,
+                                                     Register obj,
+                                                     Register shape,
+                                                     Label* label);
+
+  inline void branchTestObjShapeUnsafe(Condition cond, Register obj,
+                                       Register shape, Label* label);
+
+  void branchTestObjCompartment(Condition cond, Register obj,
+                                const Address& compartment, Register scratch,
+                                Label* label);
+  void branchTestObjCompartment(Condition cond, Register obj,
+                                const JS::Compartment* compartment,
+                                Register scratch, Label* label);
+
+  void branchIfNonNativeObj(Register obj, Register scratch, Label* label);
+
+  void branchIfObjectNotExtensible(Register obj, Register scratch,
+                                   Label* label);
+
+  void branchTestObjectNeedsProxyResultValidation(Condition condition,
+                                                  Register obj,
+                                                  Register scratch,
+                                                  Label* label);
+
+  inline void branchTestClassIsProxy(bool proxy, Register clasp, Label* label);
+
+  inline void branchTestObjectIsProxy(bool proxy, Register object,
+                                      Register scratch, Label* label);
+
+  inline void branchTestProxyHandlerFamily(Condition cond, Register proxy,
+                                           Register scratch,
+                                           const void* handlerp, Label* label);
+
+  inline void branchTestNeedsMarkingBarrier(Condition cond, Label* label);
+  inline void branchTestNeedsMarkingBarrierAnyZone(Condition cond, Label* label,
+                                                   Register scratch);
+
+  inline void branchTestUndefined(Condition cond, Register tag,
+                                  Label* label) PER_SHARED_ARCH;
+  inline void branchTestInt32(Condition cond, Register tag,
+                              Label* label) PER_SHARED_ARCH;
+  inline void branchTestDouble(Condition cond, Register tag,
+                               Label* label) PER_SHARED_ARCH;
+  inline void branchTestNumber(Condition cond, Register tag,
+                               Label* label) PER_SHARED_ARCH;
+  inline void branchTestBoolean(Condition cond, Register tag,
+                                Label* label) PER_SHARED_ARCH;
+  inline void branchTestString(Condition cond, Register tag,
+                               Label* label) PER_SHARED_ARCH;
+  inline void branchTestSymbol(Condition cond, Register tag,
+                               Label* label) PER_SHARED_ARCH;
+  inline void branchTestBigInt(Condition cond, Register tag,
+                               Label* label) PER_SHARED_ARCH;
+  inline void branchTestNull(Condition cond, Register tag,
+                             Label* label) PER_SHARED_ARCH;
+  inline void branchTestObject(Condition cond, Register tag,
+                               Label* label) PER_SHARED_ARCH;
+  inline void branchTestPrimitive(Condition cond, Register tag,
+                                  Label* label) PER_SHARED_ARCH;
+  inline void branchTestMagic(Condition cond, Register tag,
+                              Label* label) PER_SHARED_ARCH;
+  void branchTestType(Condition cond, Register tag, JSValueType type,
+                      Label* label);
+
+  inline void branchTestUndefined(Condition cond, const Address& address,
+                                  Label* label) PER_SHARED_ARCH;
+  inline void branchTestUndefined(Condition cond, const BaseIndex& address,
+                                  Label* label) PER_SHARED_ARCH;
+  inline void branchTestUndefined(Condition cond, const ValueOperand& value,
+                                  Label* label) PER_SHARED_ARCH;
+
+  inline void branchTestInt32(Condition cond, const Address& address,
+                              Label* label) PER_SHARED_ARCH;
+  inline void branchTestInt32(Condition cond, const BaseIndex& address,
+                              Label* label) PER_SHARED_ARCH;
+  inline void branchTestInt32(Condition cond, const ValueOperand& value,
+                              Label* label) PER_SHARED_ARCH;
+
+  inline void branchTestDouble(Condition cond, const Address& address,
+                               Label* label) PER_SHARED_ARCH;
+  inline void branchTestDouble(Condition cond, const BaseIndex& address,
+                               Label* label) PER_SHARED_ARCH;
+  inline void branchTestDouble(Condition cond, const ValueOperand& value,
+                               Label* label) PER_SHARED_ARCH;
+
+  inline void branchTestNumber(Condition cond, const ValueOperand& value,
+                               Label* label) PER_SHARED_ARCH;
+
+  inline void branchTestBoolean(Condition cond, const Address& address,
+                                Label* label) PER_SHARED_ARCH;
+  inline void branchTestBoolean(Condition cond, const BaseIndex& address,
+                                Label* label) PER_SHARED_ARCH;
+  inline void branchTestBoolean(Condition cond, const ValueOperand& value,
+                                Label* label) PER_SHARED_ARCH;
+
+  inline void branchTestString(Condition cond, const Address& address,
+                               Label* label) PER_SHARED_ARCH;
+  inline void branchTestString(Condition cond, const BaseIndex& address,
+                               Label* label) PER_SHARED_ARCH;
+  inline void branchTestString(Condition cond, const ValueOperand& value,
+                               Label* label) PER_SHARED_ARCH;
+
+  inline void branchTestSymbol(Condition cond, const Address& address,
+                               Label* label) PER_SHARED_ARCH;
+  inline void branchTestSymbol(Condition cond, const BaseIndex& address,
+                               Label* label) PER_SHARED_ARCH;
+  inline void branchTestSymbol(Condition cond, const ValueOperand& value,
+                               Label* label) PER_SHARED_ARCH;
+
+  inline void branchTestBigInt(Condition cond, const Address& address,
+                               Label* label) PER_SHARED_ARCH;
+  inline void branchTestBigInt(Condition cond, const BaseIndex& address,
+                               Label* label) PER_SHARED_ARCH;
+  inline void branchTestBigInt(Condition cond, const ValueOperand& value,
+                               Label* label) PER_SHARED_ARCH;
+
+  inline void branchTestNull(Condition cond, const Address& address,
+                             Label* label) PER_SHARED_ARCH;
+  inline void branchTestNull(Condition cond, const BaseIndex& address,
+                             Label* label) PER_SHARED_ARCH;
+  inline void branchTestNull(Condition cond, const ValueOperand& value,
+                             Label* label) PER_SHARED_ARCH;
+
+  inline void branchTestObject(Condition cond, const Address& address,
+                               Label* label) PER_SHARED_ARCH;
+  inline void branchTestObject(Condition cond, const BaseIndex& address,
+                               Label* label) PER_SHARED_ARCH;
+  inline void branchTestObject(Condition cond, const ValueOperand& value,
+                               Label* label) PER_SHARED_ARCH;
+
+  inline void branchTestGCThing(Condition cond, const Address& address,
+                                Label* label) PER_SHARED_ARCH;
+  inline void branchTestGCThing(Condition cond, const BaseIndex& address,
+                                Label* label) PER_SHARED_ARCH;
+  inline void branchTestGCThing(Condition cond, const ValueOperand& value,
+                                Label* label) PER_SHARED_ARCH;
+
+  inline void branchTestPrimitive(Condition cond, const ValueOperand& value,
+                                  Label* label) PER_SHARED_ARCH;
+
+  inline void branchTestMagic(Condition cond, const Address& address,
+                              Label* label) PER_SHARED_ARCH;
+  inline void branchTestMagic(Condition cond, const BaseIndex& address,
+                              Label* label) PER_SHARED_ARCH;
+  inline void branchTestMagic(Condition cond, const ValueOperand& value,
+                              Label* label) PER_SHARED_ARCH;
+
+  inline void branchTestMagic(Condition cond, const Address& valaddr,
+                              JSWhyMagic why, Label* label) PER_ARCH;
+  inline void branchTestMagic(Condition cond, const BaseIndex& valaddr,
+                              JSWhyMagic why, Label* label) PER_ARCH;
+
+  inline void branchTestMagicValue(Condition cond, const ValueOperand& val,
+                                   JSWhyMagic why, Label* label);
+
+  void branchTestValue(Condition cond, const ValueOperand& lhs,
+                       const Value& rhs, Label* label) PER_ARCH;
+  void branchTestNaNValue(Condition cond, const ValueOperand& val,
+                          Register temp, Label* label) PER_ARCH;
+
+  template <typename T>
+  inline void branchTestValue(Condition cond, const T& lhs,
+                              const ValueOperand& rhs, Label* label) PER_ARCH;
+
+  inline void branchTestInt32Truthy(bool truthy, const ValueOperand& value,
+                                    Label* label) PER_SHARED_ARCH;
+  inline void branchTestDoubleTruthy(bool truthy, FloatRegister reg,
+                                     Label* label) PER_SHARED_ARCH;
+  inline void branchTestBooleanTruthy(bool truthy, const ValueOperand& value,
+                                      Label* label) PER_ARCH;
+  inline void branchTestStringTruthy(bool truthy, const ValueOperand& value,
+                                     Label* label) PER_SHARED_ARCH;
+  inline void branchTestBigIntTruthy(bool truthy, const ValueOperand& value,
+                                     Label* label) PER_SHARED_ARCH;
+
+  inline void branchToComputedAddress(const BaseIndex& address) PER_ARCH;
+
+  CodeOffset sub32FromMemAndBranchIfNegativeWithPatch(
+      Address address, Label* label) PER_SHARED_ARCH;
+
+  void patchSub32FromMemAndBranchIfNegative(CodeOffset offset,
+                                            Imm32 imm) PER_SHARED_ARCH;
+
+ private:
+  template <typename T, typename S>
+  inline void branchPtrImpl(Condition cond, const T& lhs, const S& rhs,
+                            Label* label) DEFINED_ON(x86_shared);
+
+  void branchPtrInNurseryChunkImpl(Condition cond, Register ptr, Label* label)
+      DEFINED_ON(x86);
+  template <typename T>
+  void branchValueIsNurseryCellImpl(Condition cond, const T& value,
+                                    Register temp, Label* label)
+      DEFINED_ON(arm64, x64, mips64, loong64, riscv64);
+
+  template <typename T>
+  inline void branchTestUndefinedImpl(Condition cond, const T& t, Label* label)
+      DEFINED_ON(arm, arm64, x86_shared);
+  template <typename T>
+  inline void branchTestInt32Impl(Condition cond, const T& t, Label* label)
+      DEFINED_ON(arm, arm64, x86_shared);
+  template <typename T>
+  inline void branchTestDoubleImpl(Condition cond, const T& t, Label* label)
+      DEFINED_ON(arm, arm64, x86_shared);
+  template <typename T>
+  inline void branchTestNumberImpl(Condition cond, const T& t, Label* label)
+      DEFINED_ON(arm, arm64, x86_shared);
+  template <typename T>
+  inline void branchTestBooleanImpl(Condition cond, const T& t, Label* label)
+      DEFINED_ON(arm, arm64, x86_shared);
+  template <typename T>
+  inline void branchTestStringImpl(Condition cond, const T& t, Label* label)
+      DEFINED_ON(arm, arm64, x86_shared);
+  template <typename T>
+  inline void branchTestSymbolImpl(Condition cond, const T& t, Label* label)
+      DEFINED_ON(arm, arm64, x86_shared);
+  template <typename T>
+  inline void branchTestBigIntImpl(Condition cond, const T& t, Label* label)
+      DEFINED_ON(arm, arm64, x86_shared);
+  template <typename T>
+  inline void branchTestNullImpl(Condition cond, const T& t, Label* label)
+      DEFINED_ON(arm, arm64, x86_shared);
+  template <typename T>
+  inline void branchTestObjectImpl(Condition cond, const T& t, Label* label)
+      DEFINED_ON(arm, arm64, x86_shared);
+  template <typename T>
+  inline void branchTestGCThingImpl(Condition cond, const T& t,
+                                    Label* label) PER_SHARED_ARCH;
+  template <typename T>
+  inline void branchTestPrimitiveImpl(Condition cond, const T& t, Label* label)
+      DEFINED_ON(arm, arm64, x86_shared);
+  template <typename T>
+  inline void branchTestMagicImpl(Condition cond, const T& t, Label* label)
+      DEFINED_ON(arm, arm64, x86_shared);
+
+ public:
+  template <typename T>
+  inline void testNumberSet(Condition cond, const T& src,
+                            Register dest) PER_SHARED_ARCH;
+  template <typename T>
+  inline void testBooleanSet(Condition cond, const T& src,
+                             Register dest) PER_SHARED_ARCH;
+  template <typename T>
+  inline void testStringSet(Condition cond, const T& src,
+                            Register dest) PER_SHARED_ARCH;
+  template <typename T>
+  inline void testSymbolSet(Condition cond, const T& src,
+                            Register dest) PER_SHARED_ARCH;
+  template <typename T>
+  inline void testBigIntSet(Condition cond, const T& src,
+                            Register dest) PER_SHARED_ARCH;
+
+ public:
+  inline void fallibleUnboxPtr(const ValueOperand& src, Register dest,
+                               JSValueType type, Label* fail) PER_ARCH;
+  inline void fallibleUnboxPtr(const Address& src, Register dest,
+                               JSValueType type, Label* fail) PER_ARCH;
+  inline void fallibleUnboxPtr(const BaseIndex& src, Register dest,
+                               JSValueType type, Label* fail) PER_ARCH;
+  template <typename T>
+  inline void fallibleUnboxInt32(const T& src, Register dest, Label* fail);
+  template <typename T>
+  inline void fallibleUnboxBoolean(const T& src, Register dest, Label* fail);
+  template <typename T>
+  inline void fallibleUnboxObject(const T& src, Register dest, Label* fail);
+  template <typename T>
+  inline void fallibleUnboxString(const T& src, Register dest, Label* fail);
+  template <typename T>
+  inline void fallibleUnboxSymbol(const T& src, Register dest, Label* fail);
+  template <typename T>
+  inline void fallibleUnboxBigInt(const T& src, Register dest, Label* fail);
+
+  inline void cmp32Move32(Condition cond, Register lhs, Imm32 rhs, Register src,
+                          Register dest) PER_SHARED_ARCH;
+
+  inline void cmp32Move32(Condition cond, Register lhs, Register rhs,
+                          Register src, Register dest) PER_SHARED_ARCH;
+
+  inline void cmp32Move32(Condition cond, Register lhs, const Address& rhs,
+                          Register src, Register dest) PER_SHARED_ARCH;
+
+  inline void cmpPtrMovePtr(Condition cond, Register lhs, Imm32 rhs,
+                            Register src, Register dest) PER_ARCH;
+
+  inline void cmpPtrMovePtr(Condition cond, Register lhs, Register rhs,
+                            Register src, Register dest) PER_ARCH;
+
+  inline void cmpPtrMovePtr(Condition cond, Register lhs, const Address& rhs,
+                            Register src, Register dest) PER_ARCH;
+
+  inline void cmp32Load32(Condition cond, Register lhs, const Address& rhs,
+                          const Address& src, Register dest) PER_SHARED_ARCH;
+
+  inline void cmp32Load32(Condition cond, Register lhs, Register rhs,
+                          const Address& src, Register dest) PER_SHARED_ARCH;
+
+  inline void cmp32Load32(Condition cond, Register lhs, Imm32 rhs,
+                          const Address& src, Register dest) PER_SHARED_ARCH;
+
+  inline void cmp32LoadPtr(Condition cond, const Address& lhs, Imm32 rhs,
+                           const Address& src, Register dest) PER_ARCH;
+
+  inline void cmp32MovePtr(Condition cond, Register lhs, Imm32 rhs,
+                           Register src, Register dest) PER_ARCH;
+
+  inline void test32LoadPtr(Condition cond, const Address& addr, Imm32 mask,
+                            const Address& src, Register dest) PER_ARCH;
+
+  inline void test32MovePtr(Condition cond, Register operand, Imm32 mask,
+                            Register src, Register dest) PER_ARCH;
+
+  inline void test32MovePtr(Condition cond, const Address& addr, Imm32 mask,
+                            Register src, Register dest) PER_ARCH;
+
+  inline void spectreMovePtr(Condition cond, Register src,
+                             Register dest) PER_ARCH;
+
+  inline void spectreZeroRegister(Condition cond, Register scratch,
+                                  Register dest) PER_SHARED_ARCH;
+
+ private:
+  inline void spectreBoundsCheck32(Register index, const Operand& length,
+                                   Register maybeScratch, Label* failure)
+      DEFINED_ON(x86);
+
+ public:
+  inline void spectreBoundsCheck32(Register index, Register length,
+                                   Register maybeScratch,
+                                   Label* failure) PER_ARCH;
+  inline void spectreBoundsCheck32(Register index, const Address& length,
+                                   Register maybeScratch,
+                                   Label* failure) PER_ARCH;
+
+  inline void spectreBoundsCheckPtr(Register index, Register length,
+                                    Register maybeScratch,
+                                    Label* failure) PER_ARCH;
+  inline void spectreBoundsCheckPtr(Register index, const Address& length,
+                                    Register maybeScratch,
+                                    Label* failure) PER_ARCH;
+
+
+  inline void wasmAddSubI128HI64(Register lhsLo, Register lhsHi, Register rhsLo,
+                                 Register rhsHi, Register output, bool isAdd)
+      DEFINED_ON(x64, arm64, riscv64, loong64, mips64);
+
+  inline void wasmMulI64WideHI64(Register lhs, Register rhs, Register temp0,
+                                 Register temp1, Register output, bool isSigned)
+      DEFINED_ON(x64);
+
+  inline void wasmMulI64WideHI64(Register lhs, Register rhs, Register output,
+                                 bool isSigned)
+      DEFINED_ON(arm64, riscv64, loong64, mips64);
+
+  inline void canonicalizeDoubleNaN(FloatRegister reg);
+
+  inline void canonicalizeFloatNaN(FloatRegister reg);
+
+  inline void canonicalizeDoubleZero(FloatRegister reg, FloatRegister scratch);
+
+  inline void canonicalizeValueZero(ValueOperand value, FloatRegister scratch);
+
+ public:
+  inline FaultingCodeOffset storeDouble(FloatRegister src,
+                                        const Address& dest) PER_SHARED_ARCH;
+  inline FaultingCodeOffset storeDouble(FloatRegister src,
+                                        const BaseIndex& dest) PER_SHARED_ARCH;
+  inline FaultingCodeOffset storeDouble(FloatRegister src, const Operand& dest)
+      DEFINED_ON(x86_shared);
+
+  template <class T>
+  inline void boxDouble(FloatRegister src, const T& dest);
+
+  using MacroAssemblerSpecific::boxDouble;
+
+  inline FaultingCodeOffset storeFloat32(FloatRegister src,
+                                         const Address& dest) PER_SHARED_ARCH;
+  inline FaultingCodeOffset storeFloat32(FloatRegister src,
+                                         const BaseIndex& dest) PER_SHARED_ARCH;
+  inline FaultingCodeOffset storeFloat32(FloatRegister src, const Operand& dest)
+      DEFINED_ON(x86_shared);
+
+  inline FaultingCodeOffset storeFloat16(FloatRegister src, const Address& dest,
+                                         Register scratch) PER_SHARED_ARCH;
+  inline FaultingCodeOffset storeFloat16(FloatRegister src,
+                                         const BaseIndex& dest,
+                                         Register scratch) PER_SHARED_ARCH;
+
+  template <typename T>
+  void storeUnboxedValue(const ConstantOrRegister& value, MIRType valueType,
+                         const T& dest) PER_ARCH;
+
+  inline void memoryBarrier(MemoryBarrier barrier) PER_SHARED_ARCH;
+
+ public:
+
+
+  inline void moveSimd128(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+
+  inline void loadConstantSimd128(const SimdConstant& v, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+
+  inline void splatX16(Register src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void splatX16(uint32_t srcLane, FloatRegister src, FloatRegister dest)
+      DEFINED_ON(arm64);
+
+  inline void splatX8(Register src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void splatX8(uint32_t srcLane, FloatRegister src, FloatRegister dest)
+      DEFINED_ON(arm64);
+
+  inline void splatX4(Register src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void splatX4(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void splatX2(Register64 src, FloatRegister dest)
+      DEFINED_ON(x86, x64, arm64);
+
+  inline void splatX2(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+
+  inline void extractLaneInt8x16(uint32_t lane, FloatRegister src,
+                                 Register dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedExtractLaneInt8x16(uint32_t lane, FloatRegister src,
+                                         Register dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void extractLaneInt16x8(uint32_t lane, FloatRegister src,
+                                 Register dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedExtractLaneInt16x8(uint32_t lane, FloatRegister src,
+                                         Register dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void extractLaneInt32x4(uint32_t lane, FloatRegister src,
+                                 Register dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void extractLaneInt64x2(uint32_t lane, FloatRegister src,
+                                 Register64 dest) DEFINED_ON(x86, x64, arm64);
+
+  inline void extractLaneFloat32x4(uint32_t lane, FloatRegister src,
+                                   FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void extractLaneFloat64x2(uint32_t lane, FloatRegister src,
+                                   FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+
+  inline void replaceLaneInt8x16(unsigned lane, FloatRegister lhs, Register rhs,
+                                 FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void replaceLaneInt8x16(unsigned lane, Register rhs,
+                                 FloatRegister lhsDest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void replaceLaneInt16x8(unsigned lane, FloatRegister lhs, Register rhs,
+                                 FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void replaceLaneInt16x8(unsigned lane, Register rhs,
+                                 FloatRegister lhsDest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void replaceLaneInt32x4(unsigned lane, FloatRegister lhs, Register rhs,
+                                 FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void replaceLaneInt32x4(unsigned lane, Register rhs,
+                                 FloatRegister lhsDest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void replaceLaneInt64x2(unsigned lane, FloatRegister lhs,
+                                 Register64 rhs, FloatRegister dest)
+      DEFINED_ON(x86, x64);
+
+  inline void replaceLaneInt64x2(unsigned lane, Register64 rhs,
+                                 FloatRegister lhsDest)
+      DEFINED_ON(x86, x64, arm64);
+
+  inline void replaceLaneFloat32x4(unsigned lane, FloatRegister lhs,
+                                   FloatRegister rhs, FloatRegister dest)
+      DEFINED_ON(x86_shared);
+
+  inline void replaceLaneFloat32x4(unsigned lane, FloatRegister rhs,
+                                   FloatRegister lhsDest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void replaceLaneFloat64x2(unsigned lane, FloatRegister lhs,
+                                   FloatRegister rhs, FloatRegister dest)
+      DEFINED_ON(x86_shared);
+
+  inline void replaceLaneFloat64x2(unsigned lane, FloatRegister rhs,
+                                   FloatRegister lhsDest)
+      DEFINED_ON(x86_shared, arm64);
+
+
+  inline void shuffleInt8x16(const uint8_t lanes[16], FloatRegister rhs,
+                             FloatRegister lhsDest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void shuffleInt8x16(const uint8_t lanes[16], FloatRegister lhs,
+                             FloatRegister rhs, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void blendInt8x16(const uint8_t lanes[16], FloatRegister lhs,
+                           FloatRegister rhs, FloatRegister dest,
+                           FloatRegister temp) DEFINED_ON(x86_shared);
+
+  inline void blendInt8x16(const uint8_t lanes[16], FloatRegister lhs,
+                           FloatRegister rhs, FloatRegister dest)
+      DEFINED_ON(arm64);
+
+  inline void blendInt16x8(const uint16_t lanes[8], FloatRegister lhs,
+                           FloatRegister rhs, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void laneSelectSimd128(FloatRegister mask, FloatRegister lhs,
+                                FloatRegister rhs, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void interleaveHighInt8x16(FloatRegister lhs, FloatRegister rhs,
+                                    FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void interleaveHighInt16x8(FloatRegister lhs, FloatRegister rhs,
+                                    FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void interleaveHighInt32x4(FloatRegister lhs, FloatRegister rhs,
+                                    FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void interleaveHighInt64x2(FloatRegister lhs, FloatRegister rhs,
+                                    FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void interleaveLowInt8x16(FloatRegister lhs, FloatRegister rhs,
+                                   FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void interleaveLowInt16x8(FloatRegister lhs, FloatRegister rhs,
+                                   FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void interleaveLowInt32x4(FloatRegister lhs, FloatRegister rhs,
+                                   FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void interleaveLowInt64x2(FloatRegister lhs, FloatRegister rhs,
+                                   FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+
+  inline void permuteInt8x16(const uint8_t lanes[16], FloatRegister src,
+                             FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void permuteInt16x8(const uint16_t lanes[8], FloatRegister src,
+                             FloatRegister dest) DEFINED_ON(arm64);
+
+  inline void permuteHighInt16x8(const uint16_t lanes[4], FloatRegister src,
+                                 FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void permuteLowInt16x8(const uint16_t lanes[4], FloatRegister src,
+                                FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void permuteInt32x4(const uint32_t lanes[4], FloatRegister src,
+                             FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void concatAndRightShiftSimd128(FloatRegister lhs, FloatRegister rhs,
+                                         FloatRegister dest, uint32_t shift)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void rotateRightSimd128(FloatRegister src, FloatRegister dest,
+                                 uint32_t shift) DEFINED_ON(arm64);
+
+
+  inline void leftShiftSimd128(Imm32 count, FloatRegister src,
+                               FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void rightShiftSimd128(Imm32 count, FloatRegister src,
+                                FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+
+  inline void zeroExtend8x16To16x8(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+  inline void zeroExtend8x16To32x4(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+  inline void zeroExtend8x16To64x2(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+  inline void zeroExtend16x8To32x4(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+  inline void zeroExtend16x8To64x2(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+  inline void zeroExtend32x4To64x2(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+
+  inline void reverseInt16x8(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void reverseInt32x4(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void reverseInt64x2(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+
+  inline void swizzleInt8x16(FloatRegister lhs, FloatRegister rhs,
+                             FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void swizzleInt8x16Relaxed(FloatRegister lhs, FloatRegister rhs,
+                                    FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+
+  inline void addInt8x16(FloatRegister lhs, FloatRegister rhs,
+                         FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void addInt8x16(FloatRegister lhs, const SimdConstant& rhs,
+                         FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void addInt16x8(FloatRegister lhs, FloatRegister rhs,
+                         FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void addInt16x8(FloatRegister lhs, const SimdConstant& rhs,
+                         FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void addInt32x4(FloatRegister lhs, FloatRegister rhs,
+                         FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void addInt32x4(FloatRegister lhs, const SimdConstant& rhs,
+                         FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void addInt64x2(FloatRegister lhs, FloatRegister rhs,
+                         FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void addInt64x2(FloatRegister lhs, const SimdConstant& rhs,
+                         FloatRegister dest) DEFINED_ON(x86_shared);
+
+
+  inline void subInt8x16(FloatRegister lhs, FloatRegister rhs,
+                         FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void subInt8x16(FloatRegister lhs, const SimdConstant& rhs,
+                         FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void subInt16x8(FloatRegister lhs, FloatRegister rhs,
+                         FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void subInt16x8(FloatRegister lhs, const SimdConstant& rhs,
+                         FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void subInt32x4(FloatRegister lhs, const SimdConstant& rhs,
+                         FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void subInt32x4(FloatRegister lhs, FloatRegister rhs,
+                         FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void subInt64x2(FloatRegister lhs, const SimdConstant& rhs,
+                         FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void subInt64x2(FloatRegister lhs, FloatRegister rhs,
+                         FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+
+  inline void mulInt16x8(FloatRegister lhs, FloatRegister rhs,
+                         FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void mulInt16x8(FloatRegister lhs, const SimdConstant& rhs,
+                         FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void mulInt32x4(FloatRegister lhs, FloatRegister rhs,
+                         FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void mulInt32x4(FloatRegister lhs, const SimdConstant& rhs,
+                         FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void mulInt64x2(FloatRegister lhs, FloatRegister rhs,
+                         FloatRegister dest, FloatRegister temp)
+      DEFINED_ON(x86_shared);
+
+  inline void mulInt64x2(FloatRegister lhs, const SimdConstant& rhs,
+                         FloatRegister dest, FloatRegister temp)
+      DEFINED_ON(x86_shared);
+
+  inline void mulInt64x2(FloatRegister lhs, FloatRegister rhs,
+                         FloatRegister dest, FloatRegister temp1,
+                         FloatRegister temp2) DEFINED_ON(arm64);
+
+  inline void extMulLowInt8x16(FloatRegister lhs, FloatRegister rhs,
+                               FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void extMulHighInt8x16(FloatRegister lhs, FloatRegister rhs,
+                                FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedExtMulLowInt8x16(FloatRegister lhs, FloatRegister rhs,
+                                       FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedExtMulHighInt8x16(FloatRegister lhs, FloatRegister rhs,
+                                        FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void extMulLowInt16x8(FloatRegister lhs, FloatRegister rhs,
+                               FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void extMulHighInt16x8(FloatRegister lhs, FloatRegister rhs,
+                                FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedExtMulLowInt16x8(FloatRegister lhs, FloatRegister rhs,
+                                       FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedExtMulHighInt16x8(FloatRegister lhs, FloatRegister rhs,
+                                        FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void extMulLowInt32x4(FloatRegister lhs, FloatRegister rhs,
+                               FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void extMulHighInt32x4(FloatRegister lhs, FloatRegister rhs,
+                                FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedExtMulLowInt32x4(FloatRegister lhs, FloatRegister rhs,
+                                       FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedExtMulHighInt32x4(FloatRegister lhs, FloatRegister rhs,
+                                        FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void q15MulrSatInt16x8(FloatRegister lhs, FloatRegister rhs,
+                                FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+
+  inline void negInt8x16(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void negInt16x8(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void negInt32x4(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void negInt64x2(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+
+  inline void addSatInt8x16(FloatRegister lhs, FloatRegister rhs,
+                            FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void addSatInt8x16(FloatRegister lhs, const SimdConstant& rhs,
+                            FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void unsignedAddSatInt8x16(FloatRegister lhs, FloatRegister rhs,
+                                    FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedAddSatInt8x16(FloatRegister lhs, const SimdConstant& rhs,
+                                    FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void addSatInt16x8(FloatRegister lhs, FloatRegister rhs,
+                            FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void addSatInt16x8(FloatRegister lhs, const SimdConstant& rhs,
+                            FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void unsignedAddSatInt16x8(FloatRegister lhs, FloatRegister rhs,
+                                    FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedAddSatInt16x8(FloatRegister lhs, const SimdConstant& rhs,
+                                    FloatRegister dest) DEFINED_ON(x86_shared);
+
+
+  inline void subSatInt8x16(FloatRegister lhs, FloatRegister rhs,
+                            FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void subSatInt8x16(FloatRegister lhs, const SimdConstant& rhs,
+                            FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void unsignedSubSatInt8x16(FloatRegister lhs, FloatRegister rhs,
+                                    FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedSubSatInt8x16(FloatRegister lhs, const SimdConstant& rhs,
+                                    FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void subSatInt16x8(FloatRegister lhs, FloatRegister rhs,
+                            FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void subSatInt16x8(FloatRegister lhs, const SimdConstant& rhs,
+                            FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void unsignedSubSatInt16x8(FloatRegister lhs, FloatRegister rhs,
+                                    FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedSubSatInt16x8(FloatRegister lhs, const SimdConstant& rhs,
+                                    FloatRegister dest) DEFINED_ON(x86_shared);
+
+
+  inline void minInt8x16(FloatRegister lhs, FloatRegister rhs,
+                         FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void minInt8x16(FloatRegister lhs, const SimdConstant& rhs,
+                         FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void unsignedMinInt8x16(FloatRegister lhs, FloatRegister rhs,
+                                 FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedMinInt8x16(FloatRegister lhs, const SimdConstant& rhs,
+                                 FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void minInt16x8(FloatRegister lhs, FloatRegister rhs,
+                         FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void minInt16x8(FloatRegister lhs, const SimdConstant& rhs,
+                         FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void unsignedMinInt16x8(FloatRegister lhs, FloatRegister rhs,
+                                 FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedMinInt16x8(FloatRegister lhs, const SimdConstant& rhs,
+                                 FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void minInt32x4(FloatRegister lhs, FloatRegister rhs,
+                         FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void minInt32x4(FloatRegister lhs, const SimdConstant& rhs,
+                         FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void unsignedMinInt32x4(FloatRegister lhs, FloatRegister rhs,
+                                 FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedMinInt32x4(FloatRegister lhs, const SimdConstant& rhs,
+                                 FloatRegister dest) DEFINED_ON(x86_shared);
+
+
+  inline void maxInt8x16(FloatRegister lhs, FloatRegister rhs,
+                         FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void maxInt8x16(FloatRegister lhs, const SimdConstant& rhs,
+                         FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void unsignedMaxInt8x16(FloatRegister lhs, FloatRegister rhs,
+                                 FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedMaxInt8x16(FloatRegister lhs, const SimdConstant& rhs,
+                                 FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void maxInt16x8(FloatRegister lhs, FloatRegister rhs,
+                         FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void maxInt16x8(FloatRegister lhs, const SimdConstant& rhs,
+                         FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void unsignedMaxInt16x8(FloatRegister lhs, FloatRegister rhs,
+                                 FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedMaxInt16x8(FloatRegister lhs, const SimdConstant& rhs,
+                                 FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void maxInt32x4(FloatRegister lhs, FloatRegister rhs,
+                         FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void maxInt32x4(FloatRegister lhs, const SimdConstant& rhs,
+                         FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void unsignedMaxInt32x4(FloatRegister lhs, FloatRegister rhs,
+                                 FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedMaxInt32x4(FloatRegister lhs, const SimdConstant& rhs,
+                                 FloatRegister dest) DEFINED_ON(x86_shared);
+
+
+  inline void unsignedAverageInt8x16(FloatRegister lhs, FloatRegister rhs,
+                                     FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedAverageInt16x8(FloatRegister lhs, FloatRegister rhs,
+                                     FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+
+  inline void absInt8x16(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void absInt16x8(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void absInt32x4(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void absInt64x2(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+
+  inline void leftShiftInt8x16(Register rhs, FloatRegister lhsDest,
+                               FloatRegister temp) DEFINED_ON(x86_shared);
+
+  inline void leftShiftInt8x16(FloatRegister lhs, Register rhs,
+                               FloatRegister dest) DEFINED_ON(arm64);
+
+  inline void leftShiftInt8x16(Imm32 count, FloatRegister src,
+                               FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void leftShiftInt16x8(Register rhs, FloatRegister lhsDest)
+      DEFINED_ON(x86_shared);
+
+  inline void leftShiftInt16x8(FloatRegister lhs, Register rhs,
+                               FloatRegister dest) DEFINED_ON(arm64);
+
+  inline void leftShiftInt16x8(Imm32 count, FloatRegister src,
+                               FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void leftShiftInt32x4(Register rhs, FloatRegister lhsDest)
+      DEFINED_ON(x86_shared);
+
+  inline void leftShiftInt32x4(FloatRegister lhs, Register rhs,
+                               FloatRegister dest) DEFINED_ON(arm64);
+
+  inline void leftShiftInt32x4(Imm32 count, FloatRegister src,
+                               FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void leftShiftInt64x2(Register rhs, FloatRegister lhsDest)
+      DEFINED_ON(x86_shared);
+
+  inline void leftShiftInt64x2(FloatRegister lhs, Register rhs,
+                               FloatRegister dest) DEFINED_ON(arm64);
+
+  inline void leftShiftInt64x2(Imm32 count, FloatRegister src,
+                               FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+
+  inline void rightShiftInt8x16(Register rhs, FloatRegister lhsDest,
+                                FloatRegister temp) DEFINED_ON(x86_shared);
+
+  inline void rightShiftInt8x16(FloatRegister lhs, Register rhs,
+                                FloatRegister dest) DEFINED_ON(arm64);
+
+  inline void rightShiftInt8x16(Imm32 count, FloatRegister src,
+                                FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedRightShiftInt8x16(Register rhs, FloatRegister lhsDest,
+                                        FloatRegister temp)
+      DEFINED_ON(x86_shared);
+
+  inline void unsignedRightShiftInt8x16(FloatRegister lhs, Register rhs,
+                                        FloatRegister dest) DEFINED_ON(arm64);
+
+  inline void unsignedRightShiftInt8x16(Imm32 count, FloatRegister src,
+                                        FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void rightShiftInt16x8(Register rhs, FloatRegister lhsDest)
+      DEFINED_ON(x86_shared);
+
+  inline void rightShiftInt16x8(FloatRegister lhs, Register rhs,
+                                FloatRegister dest) DEFINED_ON(arm64);
+
+  inline void rightShiftInt16x8(Imm32 count, FloatRegister src,
+                                FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedRightShiftInt16x8(Register rhs, FloatRegister lhsDest)
+      DEFINED_ON(x86_shared);
+
+  inline void unsignedRightShiftInt16x8(FloatRegister lhs, Register rhs,
+                                        FloatRegister dest) DEFINED_ON(arm64);
+
+  inline void unsignedRightShiftInt16x8(Imm32 count, FloatRegister src,
+                                        FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void rightShiftInt32x4(Register rhs, FloatRegister lhsDest)
+      DEFINED_ON(x86_shared);
+
+  inline void rightShiftInt32x4(FloatRegister lhs, Register rhs,
+                                FloatRegister dest) DEFINED_ON(arm64);
+
+  inline void rightShiftInt32x4(Imm32 count, FloatRegister src,
+                                FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedRightShiftInt32x4(Register rhs, FloatRegister lhsDest)
+      DEFINED_ON(x86_shared);
+
+  inline void unsignedRightShiftInt32x4(FloatRegister lhs, Register rhs,
+                                        FloatRegister dest) DEFINED_ON(arm64);
+
+  inline void unsignedRightShiftInt32x4(Imm32 count, FloatRegister src,
+                                        FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void rightShiftInt64x2(Register rhs, FloatRegister lhsDest,
+                                FloatRegister temp) DEFINED_ON(x86_shared);
+
+  inline void rightShiftInt64x2(Imm32 count, FloatRegister src,
+                                FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void rightShiftInt64x2(FloatRegister lhs, Register rhs,
+                                FloatRegister dest) DEFINED_ON(arm64);
+
+  inline void unsignedRightShiftInt64x2(Register rhs, FloatRegister lhsDest)
+      DEFINED_ON(x86_shared);
+
+  inline void unsignedRightShiftInt64x2(FloatRegister lhs, Register rhs,
+                                        FloatRegister dest) DEFINED_ON(arm64);
+
+  inline void unsignedRightShiftInt64x2(Imm32 count, FloatRegister src,
+                                        FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+
+  inline void signReplicationInt8x16(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared);
+
+  inline void signReplicationInt16x8(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared);
+
+  inline void signReplicationInt32x4(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared);
+
+  inline void signReplicationInt64x2(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared);
+
+
+  inline void bitwiseAndSimd128(FloatRegister rhs, FloatRegister lhsDest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void bitwiseAndSimd128(FloatRegister lhs, FloatRegister rhs,
+                                FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void bitwiseAndSimd128(FloatRegister lhs, const SimdConstant& rhs,
+                                FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void bitwiseOrSimd128(FloatRegister rhs, FloatRegister lhsDest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void bitwiseOrSimd128(FloatRegister lhs, FloatRegister rhs,
+                               FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void bitwiseOrSimd128(FloatRegister lhs, const SimdConstant& rhs,
+                               FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void bitwiseXorSimd128(FloatRegister rhs, FloatRegister lhsDest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void bitwiseXorSimd128(FloatRegister lhs, FloatRegister rhs,
+                                FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void bitwiseXorSimd128(FloatRegister lhs, const SimdConstant& rhs,
+                                FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void bitwiseNotSimd128(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void bitwiseAndNotSimd128(FloatRegister lhs, FloatRegister rhs,
+                                   FloatRegister lhsDest) DEFINED_ON(arm64);
+
+
+  inline void bitwiseNotAndSimd128(FloatRegister rhs, FloatRegister lhsDest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void bitwiseNotAndSimd128(FloatRegister lhs, FloatRegister rhs,
+                                   FloatRegister lhsDest)
+      DEFINED_ON(x86_shared);
+
+
+  inline void bitwiseSelectSimd128(FloatRegister mask, FloatRegister onTrue,
+                                   FloatRegister onFalse, FloatRegister dest,
+                                   FloatRegister temp) DEFINED_ON(x86_shared);
+
+  inline void bitwiseSelectSimd128(FloatRegister onTrue, FloatRegister onFalse,
+                                   FloatRegister maskDest) DEFINED_ON(arm64);
+
+
+  inline void popcntInt8x16(FloatRegister src, FloatRegister dest,
+                            FloatRegister temp) DEFINED_ON(x86_shared);
+
+  inline void popcntInt8x16(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(arm64);
+
+
+  inline void anyTrueSimd128(FloatRegister src, Register dest)
+      DEFINED_ON(x86_shared, arm64);
+
+
+  inline void allTrueInt8x16(FloatRegister src, Register dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void allTrueInt16x8(FloatRegister src, Register dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void allTrueInt32x4(FloatRegister src, Register dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void allTrueInt64x2(FloatRegister src, Register dest)
+      DEFINED_ON(x86_shared, arm64);
+
+
+  inline void bitmaskInt8x16(FloatRegister src, Register dest)
+      DEFINED_ON(x86_shared);
+
+  inline void bitmaskInt8x16(FloatRegister src, Register dest,
+                             FloatRegister temp) DEFINED_ON(arm64);
+
+  inline void bitmaskInt16x8(FloatRegister src, Register dest)
+      DEFINED_ON(x86_shared);
+
+  inline void bitmaskInt16x8(FloatRegister src, Register dest,
+                             FloatRegister temp) DEFINED_ON(arm64);
+
+  inline void bitmaskInt32x4(FloatRegister src, Register dest)
+      DEFINED_ON(x86_shared);
+
+  inline void bitmaskInt32x4(FloatRegister src, Register dest,
+                             FloatRegister temp) DEFINED_ON(arm64);
+
+  inline void bitmaskInt64x2(FloatRegister src, Register dest)
+      DEFINED_ON(x86_shared);
+
+  inline void bitmaskInt64x2(FloatRegister src, Register dest,
+                             FloatRegister temp) DEFINED_ON(arm64);
+
+
+  inline void compareInt8x16(Assembler::Condition cond, FloatRegister rhs,
+                             FloatRegister lhsDest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void compareInt8x16(Assembler::Condition cond, FloatRegister lhs,
+                             const SimdConstant& rhs, FloatRegister dest)
+      DEFINED_ON(x86_shared);
+
+  inline void compareInt8x16(Assembler::Condition cond, FloatRegister lhs,
+                             FloatRegister rhs, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void compareInt16x8(Assembler::Condition cond, FloatRegister rhs,
+                             FloatRegister lhsDest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void compareInt16x8(Assembler::Condition cond, FloatRegister lhs,
+                             FloatRegister rhs, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void compareInt16x8(Assembler::Condition cond, FloatRegister lhs,
+                             const SimdConstant& rhs, FloatRegister dest)
+      DEFINED_ON(x86_shared);
+
+  inline void compareInt32x4(Assembler::Condition cond, FloatRegister rhs,
+                             FloatRegister lhsDest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void compareInt32x4(Assembler::Condition cond, FloatRegister lhs,
+                             const SimdConstant& rhs, FloatRegister dest)
+      DEFINED_ON(x86_shared);
+
+  inline void compareInt32x4(Assembler::Condition cond, FloatRegister lhs,
+                             FloatRegister rhs, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void compareForEqualityInt64x2(Assembler::Condition cond,
+                                        FloatRegister lhs, FloatRegister rhs,
+                                        FloatRegister dest)
+      DEFINED_ON(x86_shared);
+
+  inline void compareForOrderingInt64x2(Assembler::Condition cond,
+                                        FloatRegister lhs, FloatRegister rhs,
+                                        FloatRegister dest, FloatRegister temp1,
+                                        FloatRegister temp2)
+      DEFINED_ON(x86_shared);
+
+  inline void compareInt64x2(Assembler::Condition cond, FloatRegister rhs,
+                             FloatRegister lhsDest) DEFINED_ON(arm64);
+
+  inline void compareInt64x2(Assembler::Condition cond, FloatRegister lhs,
+                             FloatRegister rhs, FloatRegister dest)
+      DEFINED_ON(arm64);
+
+  inline void compareFloat32x4(Assembler::Condition cond, FloatRegister rhs,
+                               FloatRegister lhsDest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void compareFloat32x4(Assembler::Condition cond, FloatRegister lhs,
+                               const SimdConstant& rhs, FloatRegister dest)
+      DEFINED_ON(x86_shared);
+
+  inline void compareFloat32x4(Assembler::Condition cond, FloatRegister lhs,
+                               FloatRegister rhs, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void compareFloat64x2(Assembler::Condition cond, FloatRegister rhs,
+                               FloatRegister lhsDest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void compareFloat64x2(Assembler::Condition cond, FloatRegister lhs,
+                               const SimdConstant& rhs, FloatRegister dest)
+      DEFINED_ON(x86_shared);
+
+  inline void compareFloat64x2(Assembler::Condition cond, FloatRegister lhs,
+                               FloatRegister rhs, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+
+  inline void loadUnalignedSimd128(const Operand& src, FloatRegister dest)
+      DEFINED_ON(x86_shared);
+
+  inline FaultingCodeOffset loadUnalignedSimd128(const Address& src,
+                                                 FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline FaultingCodeOffset loadUnalignedSimd128(const BaseIndex& src,
+                                                 FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+
+  inline FaultingCodeOffset storeUnalignedSimd128(FloatRegister src,
+                                                  const Address& dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline FaultingCodeOffset storeUnalignedSimd128(FloatRegister src,
+                                                  const BaseIndex& dest)
+      DEFINED_ON(x86_shared, arm64);
+
+
+  inline void negFloat32x4(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void negFloat64x2(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+
+  inline void absFloat32x4(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void absFloat64x2(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+
+  inline void minFloat32x4(FloatRegister lhs, FloatRegister rhs,
+                           FloatRegister dest, FloatRegister temp1,
+                           FloatRegister temp2) DEFINED_ON(x86_shared);
+
+  inline void minFloat32x4(FloatRegister rhs, FloatRegister lhsDest)
+      DEFINED_ON(arm64);
+
+  inline void minFloat32x4(FloatRegister lhs, FloatRegister rhs,
+                           FloatRegister dest) DEFINED_ON(arm64);
+
+  inline void minFloat64x2(FloatRegister lhs, FloatRegister rhs,
+                           FloatRegister dest, FloatRegister temp1,
+                           FloatRegister temp2) DEFINED_ON(x86_shared);
+
+  inline void minFloat64x2(FloatRegister rhs, FloatRegister lhsDest)
+      DEFINED_ON(arm64);
+
+  inline void minFloat64x2(FloatRegister lhs, FloatRegister rhs,
+                           FloatRegister dest) DEFINED_ON(arm64);
+
+
+  inline void maxFloat32x4(FloatRegister lhs, FloatRegister rhs,
+                           FloatRegister dest, FloatRegister temp1,
+                           FloatRegister temp2) DEFINED_ON(x86_shared);
+
+  inline void maxFloat32x4(FloatRegister rhs, FloatRegister lhsDest)
+      DEFINED_ON(arm64);
+
+  inline void maxFloat32x4(FloatRegister lhs, FloatRegister rhs,
+                           FloatRegister dest) DEFINED_ON(arm64);
+
+  inline void maxFloat64x2(FloatRegister lhs, FloatRegister rhs,
+                           FloatRegister dest, FloatRegister temp1,
+                           FloatRegister temp2) DEFINED_ON(x86_shared);
+
+  inline void maxFloat64x2(FloatRegister rhs, FloatRegister lhsDest)
+      DEFINED_ON(arm64);
+
+  inline void maxFloat64x2(FloatRegister lhs, FloatRegister rhs,
+                           FloatRegister dest) DEFINED_ON(arm64);
+
+
+  inline void addFloat32x4(FloatRegister lhs, FloatRegister rhs,
+                           FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void addFloat32x4(FloatRegister lhs, const SimdConstant& rhs,
+                           FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void addFloat64x2(FloatRegister lhs, FloatRegister rhs,
+                           FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void addFloat64x2(FloatRegister lhs, const SimdConstant& rhs,
+                           FloatRegister dest) DEFINED_ON(x86_shared);
+
+
+  inline void subFloat32x4(FloatRegister lhs, FloatRegister rhs,
+                           FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void subFloat32x4(FloatRegister lhs, const SimdConstant& rhs,
+                           FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void subFloat64x2(FloatRegister lhs, FloatRegister rhs,
+                           FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void subFloat64x2(FloatRegister lhs, const SimdConstant& rhs,
+                           FloatRegister dest) DEFINED_ON(x86_shared);
+
+
+  inline void divFloat32x4(FloatRegister lhs, FloatRegister rhs,
+                           FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void divFloat32x4(FloatRegister lhs, const SimdConstant& rhs,
+                           FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void divFloat64x2(FloatRegister lhs, FloatRegister rhs,
+                           FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void divFloat64x2(FloatRegister lhs, const SimdConstant& rhs,
+                           FloatRegister dest) DEFINED_ON(x86_shared);
+
+
+  inline void mulFloat32x4(FloatRegister lhs, FloatRegister rhs,
+                           FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void mulFloat32x4(FloatRegister lhs, const SimdConstant& rhs,
+                           FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void mulFloat64x2(FloatRegister lhs, FloatRegister rhs,
+                           FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void mulFloat64x2(FloatRegister lhs, const SimdConstant& rhs,
+                           FloatRegister dest) DEFINED_ON(x86_shared);
+
+
+  inline void extAddPairwiseInt8x16(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedExtAddPairwiseInt8x16(FloatRegister src,
+                                            FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void extAddPairwiseInt16x8(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedExtAddPairwiseInt16x8(FloatRegister src,
+                                            FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+
+  inline void sqrtFloat32x4(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void sqrtFloat64x2(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+
+  inline void convertInt32x4ToFloat32x4(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedConvertInt32x4ToFloat32x4(FloatRegister src,
+                                                FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void convertInt32x4ToFloat64x2(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedConvertInt32x4ToFloat64x2(FloatRegister src,
+                                                FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+
+  inline void truncSatFloat32x4ToInt32x4(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedTruncSatFloat32x4ToInt32x4(FloatRegister src,
+                                                 FloatRegister dest,
+                                                 FloatRegister temp)
+      DEFINED_ON(x86_shared);
+
+  inline void unsignedTruncSatFloat32x4ToInt32x4(FloatRegister src,
+                                                 FloatRegister dest)
+      DEFINED_ON(arm64);
+
+  inline void truncSatFloat64x2ToInt32x4(FloatRegister src, FloatRegister dest,
+                                         FloatRegister temp)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedTruncSatFloat64x2ToInt32x4(FloatRegister src,
+                                                 FloatRegister dest,
+                                                 FloatRegister temp)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void truncFloat32x4ToInt32x4Relaxed(FloatRegister src,
+                                             FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedTruncFloat32x4ToInt32x4Relaxed(FloatRegister src,
+                                                     FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void truncFloat64x2ToInt32x4Relaxed(FloatRegister src,
+                                             FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedTruncFloat64x2ToInt32x4Relaxed(FloatRegister src,
+                                                     FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+
+  inline void convertFloat64x2ToFloat32x4(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+
+  inline void convertFloat32x4ToFloat64x2(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+
+  inline void narrowInt16x8(FloatRegister lhs, const SimdConstant& rhs,
+                            FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void narrowInt16x8(FloatRegister lhs, FloatRegister rhs,
+                            FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedNarrowInt16x8(FloatRegister lhs, const SimdConstant& rhs,
+                                    FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void unsignedNarrowInt16x8(FloatRegister lhs, FloatRegister rhs,
+                                    FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void narrowInt32x4(FloatRegister lhs, const SimdConstant& rhs,
+                            FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void narrowInt32x4(FloatRegister lhs, FloatRegister rhs,
+                            FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedNarrowInt32x4(FloatRegister lhs, const SimdConstant& rhs,
+                                    FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void unsignedNarrowInt32x4(FloatRegister lhs, FloatRegister rhs,
+                                    FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+
+  inline void widenLowInt8x16(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void widenHighInt8x16(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedWidenLowInt8x16(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedWidenHighInt8x16(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void widenLowInt16x8(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void widenHighInt16x8(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedWidenLowInt16x8(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedWidenHighInt16x8(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void widenLowInt32x4(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedWidenLowInt32x4(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void widenHighInt32x4(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void unsignedWidenHighInt32x4(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+
+  inline void pseudoMinFloat32x4(FloatRegister rhsOrRhsDest,
+                                 FloatRegister lhsOrLhsDest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void pseudoMinFloat32x4(FloatRegister lhs, FloatRegister rhs,
+                                 FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void pseudoMinFloat64x2(FloatRegister rhsOrRhsDest,
+                                 FloatRegister lhsOrLhsDest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void pseudoMinFloat64x2(FloatRegister lhs, FloatRegister rhs,
+                                 FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void pseudoMaxFloat32x4(FloatRegister rhsOrRhsDest,
+                                 FloatRegister lhsOrLhsDest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void pseudoMaxFloat32x4(FloatRegister lhs, FloatRegister rhs,
+                                 FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void pseudoMaxFloat64x2(FloatRegister rhsOrRhsDest,
+                                 FloatRegister lhsOrLhsDest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void pseudoMaxFloat64x2(FloatRegister lhs, FloatRegister rhs,
+                                 FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+
+  inline void widenDotInt16x8(FloatRegister lhs, FloatRegister rhs,
+                              FloatRegister dest) DEFINED_ON(x86_shared, arm64);
+
+  inline void widenDotInt16x8(FloatRegister lhs, const SimdConstant& rhs,
+                              FloatRegister dest) DEFINED_ON(x86_shared);
+
+  inline void dotInt8x16Int7x16(FloatRegister lhs, FloatRegister rhs,
+                                FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void dotInt8x16Int7x16ThenAdd(FloatRegister lhs, FloatRegister rhs,
+                                       FloatRegister dest)
+      DEFINED_ON(x86_shared);
+
+  inline void dotInt8x16Int7x16ThenAdd(FloatRegister lhs, FloatRegister rhs,
+                                       FloatRegister dest, FloatRegister temp)
+      DEFINED_ON(arm64);
+
+
+  inline void ceilFloat32x4(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void ceilFloat64x2(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void floorFloat32x4(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void floorFloat64x2(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void truncFloat32x4(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void truncFloat64x2(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void nearestFloat32x4(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void nearestFloat64x2(FloatRegister src, FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+
+  inline void fmaFloat32x4(FloatRegister src1, FloatRegister src2,
+                           FloatRegister srcDest) DEFINED_ON(x86_shared, arm64);
+
+  inline void fnmaFloat32x4(FloatRegister src1, FloatRegister src2,
+                            FloatRegister srcDest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void fmaFloat64x2(FloatRegister src1, FloatRegister src2,
+                           FloatRegister srcDest) DEFINED_ON(x86_shared, arm64);
+
+  inline void fnmaFloat64x2(FloatRegister src1, FloatRegister src2,
+                            FloatRegister srcDest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void minFloat32x4Relaxed(FloatRegister src, FloatRegister srcDest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void minFloat32x4Relaxed(FloatRegister lhs, FloatRegister rhs,
+                                  FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void maxFloat32x4Relaxed(FloatRegister src, FloatRegister srcDest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void maxFloat32x4Relaxed(FloatRegister lhs, FloatRegister rhs,
+                                  FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void minFloat64x2Relaxed(FloatRegister src, FloatRegister srcDest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void minFloat64x2Relaxed(FloatRegister lhs, FloatRegister rhs,
+                                  FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void maxFloat64x2Relaxed(FloatRegister src, FloatRegister srcDest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void maxFloat64x2Relaxed(FloatRegister lhs, FloatRegister rhs,
+                                  FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+  inline void q15MulrInt16x8Relaxed(FloatRegister lhs, FloatRegister rhs,
+                                    FloatRegister dest)
+      DEFINED_ON(x86_shared, arm64);
+
+ public:
+
+  inline void truncateFloat32ToInt64(Address src, Address dest, Register temp)
+      DEFINED_ON(x86_shared);
+  inline void truncateFloat32ToUInt64(Address src, Address dest, Register temp,
+                                      FloatRegister floatTemp)
+      DEFINED_ON(x86, x64);
+  inline void truncateDoubleToInt64(Address src, Address dest, Register temp)
+      DEFINED_ON(x86_shared);
+  inline void truncateDoubleToUInt64(Address src, Address dest, Register temp,
+                                     FloatRegister floatTemp)
+      DEFINED_ON(x86, x64);
+
+ public:
+
+  void convertUInt64ToFloat32(Register64 src, FloatRegister dest, Register temp)
+      DEFINED_ON(arm64, mips64, loong64, riscv64, wasm32, x64, x86);
+
+  void convertInt64ToFloat32(Register64 src, FloatRegister dest)
+      DEFINED_ON(arm64, mips64, loong64, riscv64, wasm32, x64, x86);
+
+  bool convertUInt64ToDoubleNeedsTemp() PER_ARCH;
+
+  void convertUInt64ToDouble(Register64 src, FloatRegister dest,
+                             Register temp) PER_ARCH;
+
+  void convertInt64ToDouble(Register64 src, FloatRegister dest) PER_ARCH;
+
+  void convertIntPtrToDouble(Register src, FloatRegister dest) PER_ARCH;
+
+ public:
+
+  FaultingCodeOffset wasmTrapInstruction() PER_SHARED_ARCH;
+
+  void wasmTrap(wasm::Trap trap, const wasm::TrapSiteDesc& trapSiteDesc);
+
+  void loadWasmPinnedRegsFromInstance(
+      const wasm::MaybeTrapSiteDesc& trapSiteDesc);
+
+  uint32_t wasmReserveStackChecked(uint32_t amount, Label* fail);
+
+
+  void wasmBoundsCheck32(Condition cond, Register index,
+                         Register boundsCheckLimit,
+                         Label* label) PER_SHARED_ARCH;
+
+  void wasmBoundsCheck32(Condition cond, Register index,
+                         Address boundsCheckLimit,
+                         Label* label) PER_SHARED_ARCH;
+
+  void wasmBoundsCheck64(Condition cond, Register64 index,
+                         Register64 boundsCheckLimit, Label* label) PER_ARCH;
+
+  void wasmBoundsCheck64(Condition cond, Register64 index,
+                         Address boundsCheckLimit, Label* label) PER_ARCH;
+
+  void wasmLoad(const wasm::MemoryAccessDesc& access, Operand srcAddr,
+                AnyRegister out) DEFINED_ON(x86, x64);
+  void wasmLoadI64(const wasm::MemoryAccessDesc& access, Operand srcAddr,
+                   Register64 out) DEFINED_ON(x86, x64);
+  void wasmStore(const wasm::MemoryAccessDesc& access, AnyRegister value,
+                 Operand dstAddr) DEFINED_ON(x86, x64);
+  void wasmStoreI64(const wasm::MemoryAccessDesc& access, Register64 value,
+                    Operand dstAddr) DEFINED_ON(x86);
+
+
+  void wasmLoad(const wasm::MemoryAccessDesc& access, Register memoryBase,
+                Register ptr, Register ptrScratch, AnyRegister output)
+      DEFINED_ON(arm, loong64, mips64);
+  void wasmLoadI64(const wasm::MemoryAccessDesc& access, Register memoryBase,
+                   Register ptr, Register ptrScratch, Register64 output)
+      DEFINED_ON(arm, mips64, loong64);
+  void wasmStore(const wasm::MemoryAccessDesc& access, AnyRegister value,
+                 Register memoryBase, Register ptr, Register ptrScratch)
+      DEFINED_ON(arm, loong64, mips64);
+  void wasmStoreI64(const wasm::MemoryAccessDesc& access, Register64 value,
+                    Register memoryBase, Register ptr, Register ptrScratch)
+      DEFINED_ON(arm, mips64, loong64);
+
+  void wasmLoad(const wasm::MemoryAccessDesc& access, Register memoryBase,
+                Register ptr, AnyRegister output) DEFINED_ON(arm64, riscv64);
+  void wasmLoadI64(const wasm::MemoryAccessDesc& access, Register memoryBase,
+                   Register ptr, Register64 output) DEFINED_ON(arm64, riscv64);
+  void wasmStore(const wasm::MemoryAccessDesc& access, AnyRegister value,
+                 Register memoryBase, Register ptr) DEFINED_ON(arm64, riscv64);
+  void wasmStoreI64(const wasm::MemoryAccessDesc& access, Register64 value,
+                    Register memoryBase, Register ptr)
+      DEFINED_ON(arm64, riscv64);
+
+  void wasmUnalignedLoad(const wasm::MemoryAccessDesc& access,
+                         Register memoryBase, Register ptr, Register ptrScratch,
+                         Register output, Register tmp) DEFINED_ON(mips64);
+
+  void wasmUnalignedLoadFP(const wasm::MemoryAccessDesc& access,
+                           Register memoryBase, Register ptr,
+                           Register ptrScratch, FloatRegister output,
+                           Register tmp1) DEFINED_ON(mips64);
+
+  void wasmUnalignedLoadI64(const wasm::MemoryAccessDesc& access,
+                            Register memoryBase, Register ptr,
+                            Register ptrScratch, Register64 output,
+                            Register tmp) DEFINED_ON(mips64);
+
+  void wasmUnalignedStore(const wasm::MemoryAccessDesc& access, Register value,
+                          Register memoryBase, Register ptr,
+                          Register ptrScratch, Register tmp) DEFINED_ON(mips64);
+
+  void wasmUnalignedStoreFP(const wasm::MemoryAccessDesc& access,
+                            FloatRegister floatValue, Register memoryBase,
+                            Register ptr, Register ptrScratch, Register tmp)
+      DEFINED_ON(mips64);
+
+  void wasmUnalignedStoreI64(const wasm::MemoryAccessDesc& access,
+                             Register64 value, Register memoryBase,
+                             Register ptr, Register ptrScratch, Register tmp)
+      DEFINED_ON(mips64);
+
+
+  void wasmTruncateDoubleToUInt32(FloatRegister input, Register output,
+                                  bool isSaturating, Label* oolEntry) PER_ARCH;
+  void wasmTruncateDoubleToInt32(FloatRegister input, Register output,
+                                 bool isSaturating,
+                                 Label* oolEntry) PER_SHARED_ARCH;
+  void oolWasmTruncateCheckF64ToI32(FloatRegister input, Register output,
+                                    TruncFlags flags,
+                                    const wasm::TrapSiteDesc& trapSiteDesc,
+                                    Label* rejoin) PER_SHARED_ARCH;
+
+  void wasmTruncateFloat32ToUInt32(FloatRegister input, Register output,
+                                   bool isSaturating, Label* oolEntry) PER_ARCH;
+  void wasmTruncateFloat32ToInt32(FloatRegister input, Register output,
+                                  bool isSaturating,
+                                  Label* oolEntry) PER_SHARED_ARCH;
+  void oolWasmTruncateCheckF32ToI32(FloatRegister input, Register output,
+                                    TruncFlags flags,
+                                    const wasm::TrapSiteDesc& trapSiteDesc,
+                                    Label* rejoin) PER_SHARED_ARCH;
+
+  void wasmTruncateDoubleToInt64(FloatRegister input, Register64 output,
+                                 bool isSaturating, Label* oolEntry,
+                                 Label* oolRejoin, FloatRegister tempDouble)
+      DEFINED_ON(arm64, x86, x64, mips64, loong64, riscv64, wasm32);
+  void wasmTruncateDoubleToUInt64(FloatRegister input, Register64 output,
+                                  bool isSaturating, Label* oolEntry,
+                                  Label* oolRejoin, FloatRegister tempDouble)
+      DEFINED_ON(arm64, x86, x64, mips64, loong64, riscv64, wasm32);
+  void oolWasmTruncateCheckF64ToI64(FloatRegister input, Register64 output,
+                                    TruncFlags flags,
+                                    const wasm::TrapSiteDesc& trapSiteDesc,
+                                    Label* rejoin) PER_SHARED_ARCH;
+
+  void wasmTruncateFloat32ToInt64(FloatRegister input, Register64 output,
+                                  bool isSaturating, Label* oolEntry,
+                                  Label* oolRejoin, FloatRegister tempDouble)
+      DEFINED_ON(arm64, x86, x64, mips64, loong64, riscv64, wasm32);
+  void wasmTruncateFloat32ToUInt64(FloatRegister input, Register64 output,
+                                   bool isSaturating, Label* oolEntry,
+                                   Label* oolRejoin, FloatRegister tempDouble)
+      DEFINED_ON(arm64, x86, x64, mips64, loong64, riscv64, wasm32);
+  void oolWasmTruncateCheckF32ToI64(FloatRegister input, Register64 output,
+                                    TruncFlags flags,
+                                    const wasm::TrapSiteDesc& trapSiteDesc,
+                                    Label* rejoin) PER_SHARED_ARCH;
+
+  CodeOffset wasmCallImport(const wasm::CallSiteDesc& desc,
+                            const wasm::CalleeDesc& callee);
+
+  CodeOffset wasmReturnCallImport(const wasm::CallSiteDesc& desc,
+                                  const wasm::CalleeDesc& callee,
+                                  const ReturnCallAdjustmentInfo& retCallInfo);
+
+  CodeOffset wasmReturnCall(const wasm::CallSiteDesc& desc,
+                            uint32_t funcDefIndex,
+                            const ReturnCallAdjustmentInfo& retCallInfo);
+
+  void wasmCollapseFrameSlow(const ReturnCallAdjustmentInfo& retCallInfo,
+                             wasm::CallSiteDesc desc);
+
+  void wasmCollapseFrameFast(const ReturnCallAdjustmentInfo& retCallInfo);
+
+  void wasmCheckSlowCallsite(Register ra, Label* notSlow, Register temp1,
+                             Register temp2) PER_ARCH;
+
+  void wasmMarkCallAsSlow() PER_ARCH;
+
+  CodeOffset wasmMarkedSlowCall(const wasm::CallSiteDesc& desc,
+                                const Register reg) PER_SHARED_ARCH;
+
+  void wasmClampTable64Address(Register64 address, Register out);
+
+  void wasmCallIndirect(const wasm::CallSiteDesc& desc,
+                        const wasm::CalleeDesc& callee,
+                        Label* nullCheckFailedLabel, CodeOffset* fastCallOffset,
+                        CodeOffset* slowCallOffset);
+
+  void wasmReturnCallIndirect(const wasm::CallSiteDesc& desc,
+                              const wasm::CalleeDesc& callee,
+                              Label* nullCheckFailedLabel,
+                              const ReturnCallAdjustmentInfo& retCallInfo);
+
+  void wasmCallRef(const wasm::CallSiteDesc& desc,
+                   const wasm::CalleeDesc& callee, CodeOffset* fastCallOffset,
+                   CodeOffset* slowCallOffset);
+
+  void wasmReturnCallRef(const wasm::CallSiteDesc& desc,
+                         const wasm::CalleeDesc& callee,
+                         const ReturnCallAdjustmentInfo& retCallInfo);
+
+  void wasmCallBuiltinInstanceMethod(const wasm::CallSiteDesc& desc,
+                                     const ABIArg& instanceArg,
+                                     wasm::SymbolicAddress builtin,
+                                     wasm::FailureMode failureMode,
+                                     wasm::Trap failureTrap,
+                                     CodeOffset* callStackMapKey,
+                                     CodeOffset* trapStackMapKey);
+
+  CodeOffset wasmTrapOnFailedInstanceCall(
+      Register resultRegister, wasm::FailureMode failureMode,
+      wasm::Trap failureTrap, const wasm::TrapSiteDesc& trapSiteDesc);
+
+  void wasmBoundsCheckRange32(Register index, Register length, Register limit,
+                              Register tmp,
+                              const wasm::TrapSiteDesc& trapSiteDesc);
+
+  static BranchWasmRefIsSubtypeRegisters regsForBranchWasmRefIsSubtype(
+      wasm::RefType type);
+
+  FaultingCodeOffset branchWasmRefIsSubtype(
+      Register ref, wasm::MaybeRefType sourceType, wasm::RefType destType,
+      Label* label, bool onSuccess, bool signalNullChecks, Register superSTV,
+      Register scratch1, Register scratch2);
+
+  FaultingCodeOffset branchWasmRefIsSubtypeAny(
+      Register ref, wasm::RefType sourceType, wasm::RefType destType,
+      Label* label, bool onSuccess, bool signalNullChecks, Register superSTV,
+      Register scratch1, Register scratch2);
+
+  void branchWasmRefIsSubtypeFunc(Register ref, wasm::RefType sourceType,
+                                  wasm::RefType destType, Label* label,
+                                  bool onSuccess, Register superSTV,
+                                  Register scratch1, Register scratch2);
+
+  void branchWasmRefIsSubtypeExtern(Register ref, wasm::RefType sourceType,
+                                    wasm::RefType destType, Label* label,
+                                    bool onSuccess);
+
+  void branchWasmRefIsSubtypeExn(Register ref, wasm::RefType sourceType,
+                                 wasm::RefType destType, Label* label,
+                                 bool onSuccess);
+
+  void branchWasmSTVIsSubtype(Register subSTV, Register superSTV,
+                              Register scratch, const wasm::TypeDef* destType,
+                              Label* label, bool onSuccess);
+
+  void branchWasmSTVIsSubtypeDynamicDepth(Register subSTV, Register superSTV,
+                                          Register superDepth, Register scratch,
+                                          Label* label, bool onSuccess);
+
+  void extractWasmAnyRefTag(Register src, Register dest);
+
+  void untagWasmAnyRef(Register src, Register dest, wasm::AnyRefTag tag);
+
+  void branchWasmAnyRefIsNull(bool isNull, Register src, Label* label);
+  void branchWasmAnyRefIsI31(bool isI31, Register src, Label* label);
+  void branchWasmAnyRefIsObjectOrNull(bool isObject, Register src,
+                                      Label* label);
+  void branchWasmAnyRefIsJSString(bool isJSString, Register src, Register temp,
+                                  Label* label);
+  void branchWasmAnyRefIsGCThing(bool isGCThing, Register src, Label* label);
+  void branchWasmAnyRefIsNurseryCell(bool isNurseryCell, Register src,
+                                     Register scratch, Label* label);
+
+  void truncate32ToWasmI31Ref(Register src, Register dest);
+  void convertWasmI31RefTo32Signed(Register src, Register dest);
+  void convertWasmI31RefTo32Unsigned(Register src, Register dest);
+
+  void branchValueConvertsToWasmAnyRefInline(ValueOperand src,
+                                             Register scratchInt,
+                                             FloatRegister scratchFloat,
+                                             Label* label);
+  void convertValueToWasmAnyRef(ValueOperand src, Register dest,
+                                FloatRegister scratchFloat, Label* oolConvert);
+  void convertObjectToWasmAnyRef(Register src, Register dest);
+  void convertStringToWasmAnyRef(Register src, Register dest);
+
+  void convertWasmAnyRefToValue(Register instance, Register src,
+                                ValueOperand dst, Register scratch);
+  void convertWasmAnyRefToValue(Register instance, Register src,
+                                const Address& dst, Register scratch);
+
+  FaultingCodeOffset branchObjectIsWasmGcObject(bool isGcObject, Register src,
+                                                Register scratch, Label* label);
+
+  void wasmNewStructObject(Register instance, Register result,
+                           Register allocSite, Register temp1,
+                           size_t offsetOfTypeDefData, Label* fail,
+                           gc::AllocKind allocKind, bool zeroFields);
+  void wasmNewArrayObject(Register instance, Register result,
+                          Register numElements, Register allocSite,
+                          Register temp, size_t offsetOfTypeDefData,
+                          Label* fail, uint32_t elemSize, bool zeroFields);
+  void wasmNewArrayObjectFixed(Register instance, Register result,
+                               Register allocSite, Register temp1,
+                               Register temp2, size_t offsetOfTypeDefData,
+                               Label* fail, uint32_t numElements,
+                               uint32_t storageBytes, bool zeroFields);
+
+  void wasmBumpPointerAllocate(Register instance, Register result,
+                               Register allocSite, Register temp1, Label* fail,
+                               uint32_t size);
+  void wasmBumpPointerAllocateDynamic(Register instance, Register result,
+                                      Register allocSite, Register size,
+                                      Register temp1, Label* fail);
+
+  void shiftIndex32AndAdd(Register indexTemp32, int shift,
+                          Register pointer) PER_SHARED_ARCH;
+
+  void widenInt32(Register r) DEFINED_ON(arm64, x64, mips64, loong64, riscv64);
+
+  void enterFakeExitFrameForWasm(Register cxreg, Register scratch,
+                                 ExitFrameType type) PER_SHARED_ARCH;
+
+ public:
+
+  void emitPreBarrierFastPath(MIRType type, Register temp1, Register temp2,
+                              Register temp3, Label* noBarrier);
+  void emitWeapMapBarrierFastPath(ValueOperand value, Register cell,
+                                  Register temp1, Register temp2,
+                                  Register temp3, Register temp4,
+                                  Label* barrier);
+
+ private:
+  void loadMarkBits(Register cell, Register chunk, Register markWord,
+                    Register bitIndex, Register temp, gc::ColorBit color);
+
+ public:
+
+  inline void clampIntToUint8(Register reg) PER_SHARED_ARCH;
+
+ public:
+
+
+
+  void compareExchange(Scalar::Type type, Synchronization sync,
+                       const Address& mem, Register expected,
+                       Register replacement, Register output)
+      DEFINED_ON(arm, arm64, x86_shared);
+
+  void compareExchange(Scalar::Type type, Synchronization sync,
+                       const BaseIndex& mem, Register expected,
+                       Register replacement, Register output)
+      DEFINED_ON(arm, arm64, x86_shared);
+
+  void compareExchange(Scalar::Type type, Synchronization sync,
+                       const Address& mem, Register expected,
+                       Register replacement, Register valueTemp,
+                       Register offsetTemp, Register maskTemp, Register output)
+      DEFINED_ON(mips64, loong64, riscv64);
+
+  void compareExchange(Scalar::Type type, Synchronization sync,
+                       const BaseIndex& mem, Register expected,
+                       Register replacement, Register valueTemp,
+                       Register offsetTemp, Register maskTemp, Register output)
+      DEFINED_ON(mips64, loong64, riscv64);
+
+
+  void compareExchange64(Synchronization sync, const Address& mem,
+                         Register64 expected, Register64 replacement,
+                         Register64 output)
+      DEFINED_ON(arm, arm64, x64, x86, mips64, loong64, riscv64);
+
+  void compareExchange64(Synchronization sync, const BaseIndex& mem,
+                         Register64 expected, Register64 replacement,
+                         Register64 output)
+      DEFINED_ON(arm, arm64, x64, x86, mips64, loong64, riscv64);
+
+
+  void atomicExchange(Scalar::Type type, Synchronization sync,
+                      const Address& mem, Register value, Register output)
+      DEFINED_ON(arm, arm64, x86_shared);
+
+  void atomicExchange(Scalar::Type type, Synchronization sync,
+                      const BaseIndex& mem, Register value, Register output)
+      DEFINED_ON(arm, arm64, x86_shared);
+
+  void atomicExchange(Scalar::Type type, Synchronization sync,
+                      const Address& mem, Register value, Register valueTemp,
+                      Register offsetTemp, Register maskTemp, Register output)
+      DEFINED_ON(mips64, loong64, riscv64);
+
+  void atomicExchange(Scalar::Type type, Synchronization sync,
+                      const BaseIndex& mem, Register value, Register valueTemp,
+                      Register offsetTemp, Register maskTemp, Register output)
+      DEFINED_ON(mips64, loong64, riscv64);
+
+
+  void atomicExchange64(Synchronization sync, const Address& mem,
+                        Register64 value, Register64 output)
+      DEFINED_ON(arm, arm64, x64, x86, mips64, loong64, riscv64);
+
+  void atomicExchange64(Synchronization sync, const BaseIndex& mem,
+                        Register64 value, Register64 output)
+      DEFINED_ON(arm, arm64, x64, x86, mips64, loong64, riscv64);
+
+
+  void atomicFetchOp(Scalar::Type type, Synchronization sync, AtomicOp op,
+                     Register value, const Address& mem, Register temp,
+                     Register output) DEFINED_ON(arm, arm64, x86_shared);
+
+  void atomicFetchOp(Scalar::Type type, Synchronization sync, AtomicOp op,
+                     Imm32 value, const Address& mem, Register temp,
+                     Register output) DEFINED_ON(x86_shared);
+
+  void atomicFetchOp(Scalar::Type type, Synchronization sync, AtomicOp op,
+                     Register value, const BaseIndex& mem, Register temp,
+                     Register output) DEFINED_ON(arm, arm64, x86_shared);
+
+  void atomicFetchOp(Scalar::Type type, Synchronization sync, AtomicOp op,
+                     Imm32 value, const BaseIndex& mem, Register temp,
+                     Register output) DEFINED_ON(x86_shared);
+
+  void atomicFetchOp(Scalar::Type type, Synchronization sync, AtomicOp op,
+                     Register value, const Address& mem, Register valueTemp,
+                     Register offsetTemp, Register maskTemp, Register output)
+      DEFINED_ON(mips64, loong64, riscv64);
+
+  void atomicFetchOp(Scalar::Type type, Synchronization sync, AtomicOp op,
+                     Register value, const BaseIndex& mem, Register valueTemp,
+                     Register offsetTemp, Register maskTemp, Register output)
+      DEFINED_ON(mips64, loong64, riscv64);
+
+
+  void atomicFetchOp64(Synchronization sync, AtomicOp op, Register64 value,
+                       const Address& mem, Register64 temp, Register64 output)
+      DEFINED_ON(arm, arm64, x64, mips64, loong64, riscv64);
+
+  void atomicFetchOp64(Synchronization sync, AtomicOp op, const Address& value,
+                       const Address& mem, Register64 temp, Register64 output)
+      DEFINED_ON(x86);
+
+  void atomicFetchOp64(Synchronization sync, AtomicOp op, Register64 value,
+                       const BaseIndex& mem, Register64 temp, Register64 output)
+      DEFINED_ON(arm, arm64, x64, mips64, loong64, riscv64);
+
+  void atomicFetchOp64(Synchronization sync, AtomicOp op, const Address& value,
+                       const BaseIndex& mem, Register64 temp, Register64 output)
+      DEFINED_ON(x86);
+
+
+  void atomicEffectOp64(Synchronization sync, AtomicOp op, Register64 value,
+                        const Address& mem) DEFINED_ON(x64);
+
+  void atomicEffectOp64(Synchronization sync, AtomicOp op, Register64 value,
+                        const Address& mem, Register64 temp)
+      DEFINED_ON(arm, arm64, mips64, loong64, riscv64);
+
+  void atomicEffectOp64(Synchronization sync, AtomicOp op, Register64 value,
+                        const BaseIndex& mem) DEFINED_ON(x64);
+
+  void atomicEffectOp64(Synchronization sync, AtomicOp op, Register64 value,
+                        const BaseIndex& mem, Register64 temp)
+      DEFINED_ON(arm, arm64, mips64, loong64, riscv64);
+
+
+  void atomicLoad64(Synchronization sync, const Address& mem, Register64 temp,
+                    Register64 output) DEFINED_ON(x86);
+
+  void atomicLoad64(Synchronization sync, const BaseIndex& mem, Register64 temp,
+                    Register64 output) DEFINED_ON(x86);
+
+  void atomicLoad64(Synchronization sync, const Address& mem, Register64 output)
+      DEFINED_ON(arm);
+
+  void atomicLoad64(Synchronization sync, const BaseIndex& mem,
+                    Register64 output) DEFINED_ON(arm);
+
+
+  void atomicStore64(Synchronization sync, const Address& mem, Register64 value,
+                     Register64 temp) DEFINED_ON(x86, arm);
+
+  void atomicStore64(Synchronization sync, const BaseIndex& mem,
+                     Register64 value, Register64 temp) DEFINED_ON(x86, arm);
+
+
+  void wasmCompareExchange(const wasm::MemoryAccessDesc& access,
+                           const Address& mem, Register expected,
+                           Register replacement, Register output)
+      DEFINED_ON(arm, arm64, x86_shared);
+
+  void wasmCompareExchange(const wasm::MemoryAccessDesc& access,
+                           const BaseIndex& mem, Register expected,
+                           Register replacement, Register output)
+      DEFINED_ON(arm, arm64, x86_shared);
+
+  void wasmCompareExchange(const wasm::MemoryAccessDesc& access,
+                           const Address& mem, Register expected,
+                           Register replacement, Register valueTemp,
+                           Register offsetTemp, Register maskTemp,
+                           Register output)
+      DEFINED_ON(mips64, loong64, riscv64);
+
+  void wasmCompareExchange(const wasm::MemoryAccessDesc& access,
+                           const BaseIndex& mem, Register expected,
+                           Register replacement, Register valueTemp,
+                           Register offsetTemp, Register maskTemp,
+                           Register output)
+      DEFINED_ON(mips64, loong64, riscv64);
+
+  void wasmAtomicExchange(const wasm::MemoryAccessDesc& access,
+                          const Address& mem, Register value, Register output)
+      DEFINED_ON(arm, arm64, x86_shared);
+
+  void wasmAtomicExchange(const wasm::MemoryAccessDesc& access,
+                          const BaseIndex& mem, Register value, Register output)
+      DEFINED_ON(arm, arm64, x86_shared);
+
+  void wasmAtomicExchange(const wasm::MemoryAccessDesc& access,
+                          const Address& mem, Register value,
+                          Register valueTemp, Register offsetTemp,
+                          Register maskTemp, Register output)
+      DEFINED_ON(mips64, loong64, riscv64);
+
+  void wasmAtomicExchange(const wasm::MemoryAccessDesc& access,
+                          const BaseIndex& mem, Register value,
+                          Register valueTemp, Register offsetTemp,
+                          Register maskTemp, Register output)
+      DEFINED_ON(mips64, loong64, riscv64);
+
+  void wasmAtomicFetchOp(const wasm::MemoryAccessDesc& access, AtomicOp op,
+                         Register value, const Address& mem, Register temp,
+                         Register output) DEFINED_ON(arm, arm64, x86_shared);
+
+  void wasmAtomicFetchOp(const wasm::MemoryAccessDesc& access, AtomicOp op,
+                         Imm32 value, const Address& mem, Register temp,
+                         Register output) DEFINED_ON(x86_shared);
+
+  void wasmAtomicFetchOp(const wasm::MemoryAccessDesc& access, AtomicOp op,
+                         Register value, const BaseIndex& mem, Register temp,
+                         Register output) DEFINED_ON(arm, arm64, x86_shared);
+
+  void wasmAtomicFetchOp(const wasm::MemoryAccessDesc& access, AtomicOp op,
+                         Imm32 value, const BaseIndex& mem, Register temp,
+                         Register output) DEFINED_ON(x86_shared);
+
+  void wasmAtomicFetchOp(const wasm::MemoryAccessDesc& access, AtomicOp op,
+                         Register value, const Address& mem, Register valueTemp,
+                         Register offsetTemp, Register maskTemp,
+                         Register output) DEFINED_ON(mips64, loong64, riscv64);
+
+  void wasmAtomicFetchOp(const wasm::MemoryAccessDesc& access, AtomicOp op,
+                         Register value, const BaseIndex& mem,
+                         Register valueTemp, Register offsetTemp,
+                         Register maskTemp, Register output)
+      DEFINED_ON(mips64, loong64, riscv64);
+
+
+  void wasmAtomicEffectOp(const wasm::MemoryAccessDesc& access, AtomicOp op,
+                          Register value, const Address& mem, Register temp)
+      DEFINED_ON(arm, arm64, x86_shared);
+
+  void wasmAtomicEffectOp(const wasm::MemoryAccessDesc& access, AtomicOp op,
+                          Imm32 value, const Address& mem, Register temp)
+      DEFINED_ON(x86_shared);
+
+  void wasmAtomicEffectOp(const wasm::MemoryAccessDesc& access, AtomicOp op,
+                          Register value, const BaseIndex& mem, Register temp)
+      DEFINED_ON(arm, arm64, x86_shared);
+
+  void wasmAtomicEffectOp(const wasm::MemoryAccessDesc& access, AtomicOp op,
+                          Imm32 value, const BaseIndex& mem, Register temp)
+      DEFINED_ON(x86_shared);
+
+  void wasmAtomicEffectOp(const wasm::MemoryAccessDesc& access, AtomicOp op,
+                          Register value, const Address& mem,
+                          Register valueTemp, Register offsetTemp,
+                          Register maskTemp)
+      DEFINED_ON(mips64, loong64, riscv64);
+
+  void wasmAtomicEffectOp(const wasm::MemoryAccessDesc& access, AtomicOp op,
+                          Register value, const BaseIndex& mem,
+                          Register valueTemp, Register offsetTemp,
+                          Register maskTemp)
+      DEFINED_ON(mips64, loong64, riscv64);
+
+
+
+  void wasmAtomicLoad64(const wasm::MemoryAccessDesc& access,
+                        const Address& mem, Register64 temp, Register64 output)
+      DEFINED_ON(arm, x86, wasm32);
+
+  void wasmAtomicLoad64(const wasm::MemoryAccessDesc& access,
+                        const BaseIndex& mem, Register64 temp,
+                        Register64 output) DEFINED_ON(arm, x86, wasm32);
+
+
+  void wasmCompareExchange64(const wasm::MemoryAccessDesc& access,
+                             const Address& mem, Register64 expected,
+                             Register64 replacement,
+                             Register64 output) PER_ARCH;
+
+  void wasmCompareExchange64(const wasm::MemoryAccessDesc& access,
+                             const BaseIndex& mem, Register64 expected,
+                             Register64 replacement,
+                             Register64 output) PER_ARCH;
+
+
+  void wasmAtomicExchange64(const wasm::MemoryAccessDesc& access,
+                            const Address& mem, Register64 value,
+                            Register64 output) PER_ARCH;
+
+  void wasmAtomicExchange64(const wasm::MemoryAccessDesc& access,
+                            const BaseIndex& mem, Register64 value,
+                            Register64 output) PER_ARCH;
+
+
+  void wasmAtomicFetchOp64(const wasm::MemoryAccessDesc& access, AtomicOp op,
+                           Register64 value, const Address& mem,
+                           Register64 temp, Register64 output)
+      DEFINED_ON(arm, arm64, mips64, loong64, riscv64, x64);
+
+  void wasmAtomicFetchOp64(const wasm::MemoryAccessDesc& access, AtomicOp op,
+                           Register64 value, const BaseIndex& mem,
+                           Register64 temp, Register64 output)
+      DEFINED_ON(arm, arm64, mips64, loong64, riscv64, x64);
+
+  void wasmAtomicFetchOp64(const wasm::MemoryAccessDesc& access, AtomicOp op,
+                           const Address& value, const Address& mem,
+                           Register64 temp, Register64 output) DEFINED_ON(x86);
+
+  void wasmAtomicFetchOp64(const wasm::MemoryAccessDesc& access, AtomicOp op,
+                           const Address& value, const BaseIndex& mem,
+                           Register64 temp, Register64 output) DEFINED_ON(x86);
+
+
+  void wasmAtomicEffectOp64(const wasm::MemoryAccessDesc& access, AtomicOp op,
+                            Register64 value, const BaseIndex& mem)
+      DEFINED_ON(x64);
+
+  void wasmAtomicEffectOp64(const wasm::MemoryAccessDesc& access, AtomicOp op,
+                            Register64 value, const BaseIndex& mem,
+                            Register64 temp) DEFINED_ON(arm64);
+
+
+  void compareExchangeJS(Scalar::Type arrayType, Synchronization sync,
+                         const Address& mem, Register expected,
+                         Register replacement, Register temp,
+                         AnyRegister output) DEFINED_ON(arm, arm64, x86_shared);
+
+  void compareExchangeJS(Scalar::Type arrayType, Synchronization sync,
+                         const BaseIndex& mem, Register expected,
+                         Register replacement, Register temp,
+                         AnyRegister output) DEFINED_ON(arm, arm64, x86_shared);
+
+  void compareExchangeJS(Scalar::Type arrayType, Synchronization sync,
+                         const Address& mem, Register expected,
+                         Register replacement, Register valueTemp,
+                         Register offsetTemp, Register maskTemp, Register temp,
+                         AnyRegister output)
+      DEFINED_ON(mips64, loong64, riscv64);
+
+  void compareExchangeJS(Scalar::Type arrayType, Synchronization sync,
+                         const BaseIndex& mem, Register expected,
+                         Register replacement, Register valueTemp,
+                         Register offsetTemp, Register maskTemp, Register temp,
+                         AnyRegister output)
+      DEFINED_ON(mips64, loong64, riscv64);
+
+  void atomicExchangeJS(Scalar::Type arrayType, Synchronization sync,
+                        const Address& mem, Register value, Register temp,
+                        AnyRegister output) DEFINED_ON(arm, arm64, x86_shared);
+
+  void atomicExchangeJS(Scalar::Type arrayType, Synchronization sync,
+                        const BaseIndex& mem, Register value, Register temp,
+                        AnyRegister output) DEFINED_ON(arm, arm64, x86_shared);
+
+  void atomicExchangeJS(Scalar::Type arrayType, Synchronization sync,
+                        const Address& mem, Register value, Register valueTemp,
+                        Register offsetTemp, Register maskTemp, Register temp,
+                        AnyRegister output)
+      DEFINED_ON(mips64, loong64, riscv64);
+
+  void atomicExchangeJS(Scalar::Type arrayType, Synchronization sync,
+                        const BaseIndex& mem, Register value,
+                        Register valueTemp, Register offsetTemp,
+                        Register maskTemp, Register temp, AnyRegister output)
+      DEFINED_ON(mips64, loong64, riscv64);
+
+  void atomicFetchOpJS(Scalar::Type arrayType, Synchronization sync,
+                       AtomicOp op, Register value, const Address& mem,
+                       Register temp1, Register temp2, AnyRegister output)
+      DEFINED_ON(arm, arm64, x86_shared);
+
+  void atomicFetchOpJS(Scalar::Type arrayType, Synchronization sync,
+                       AtomicOp op, Register value, const BaseIndex& mem,
+                       Register temp1, Register temp2, AnyRegister output)
+      DEFINED_ON(arm, arm64, x86_shared);
+
+  void atomicFetchOpJS(Scalar::Type arrayType, Synchronization sync,
+                       AtomicOp op, Imm32 value, const Address& mem,
+                       Register temp1, Register temp2, AnyRegister output)
+      DEFINED_ON(x86_shared);
+
+  void atomicFetchOpJS(Scalar::Type arrayType, Synchronization sync,
+                       AtomicOp op, Imm32 value, const BaseIndex& mem,
+                       Register temp1, Register temp2, AnyRegister output)
+      DEFINED_ON(x86_shared);
+
+  void atomicFetchOpJS(Scalar::Type arrayType, Synchronization sync,
+                       AtomicOp op, Register value, const Address& mem,
+                       Register valueTemp, Register offsetTemp,
+                       Register maskTemp, Register temp, AnyRegister output)
+      DEFINED_ON(mips64, loong64, riscv64);
+
+  void atomicFetchOpJS(Scalar::Type arrayType, Synchronization sync,
+                       AtomicOp op, Register value, const BaseIndex& mem,
+                       Register valueTemp, Register offsetTemp,
+                       Register maskTemp, Register temp, AnyRegister output)
+      DEFINED_ON(mips64, loong64, riscv64);
+
+  void atomicEffectOpJS(Scalar::Type arrayType, Synchronization sync,
+                        AtomicOp op, Register value, const Address& mem,
+                        Register temp) DEFINED_ON(arm, arm64, x86_shared);
+
+  void atomicEffectOpJS(Scalar::Type arrayType, Synchronization sync,
+                        AtomicOp op, Register value, const BaseIndex& mem,
+                        Register temp) DEFINED_ON(arm, arm64, x86_shared);
+
+  void atomicEffectOpJS(Scalar::Type arrayType, Synchronization sync,
+                        AtomicOp op, Imm32 value, const Address& mem,
+                        Register temp) DEFINED_ON(x86_shared);
+
+  void atomicEffectOpJS(Scalar::Type arrayType, Synchronization sync,
+                        AtomicOp op, Imm32 value, const BaseIndex& mem,
+                        Register temp) DEFINED_ON(x86_shared);
+
+  void atomicEffectOpJS(Scalar::Type arrayType, Synchronization sync,
+                        AtomicOp op, Register value, const Address& mem,
+                        Register valueTemp, Register offsetTemp,
+                        Register maskTemp) DEFINED_ON(mips64, loong64, riscv64);
+
+  void atomicEffectOpJS(Scalar::Type arrayType, Synchronization sync,
+                        AtomicOp op, Register value, const BaseIndex& mem,
+                        Register valueTemp, Register offsetTemp,
+                        Register maskTemp) DEFINED_ON(mips64, loong64, riscv64);
+
+  void atomicIsLockFreeJS(Register value, Register output);
+
+  void atomicPause() PER_SHARED_ARCH;
+
+
+  void spectreMaskIndex32(Register index, Register length, Register output);
+  void spectreMaskIndex32(Register index, const Address& length,
+                          Register output);
+  void spectreMaskIndexPtr(Register index, Register length, Register output);
+  void spectreMaskIndexPtr(Register index, const Address& length,
+                           Register output);
+
+  void boundsCheck32PowerOfTwo(Register index, uint32_t length, Label* failure);
+
+  void speculationBarrier() PER_SHARED_ARCH;
+
+ public:
+  inline void loadObjClassUnsafe(Register obj, Register dest);
+  inline void loadObjShapeUnsafe(Register obj, Register dest);
+
+  template <typename EmitPreBarrier>
+  inline void storeObjShape(Register shape, Register obj,
+                            EmitPreBarrier emitPreBarrier);
+  template <typename EmitPreBarrier>
+  inline void storeObjShape(Shape* shape, Register obj,
+                            EmitPreBarrier emitPreBarrier);
+
+  inline void loadObjProto(Register obj, Register dest);
+
+  inline void loadStringLength(Register str, Register dest);
+
+  void loadStringChars(Register str, Register dest, CharEncoding encoding);
+
+  void loadNonInlineStringChars(Register str, Register dest,
+                                CharEncoding encoding);
+  void loadNonInlineStringCharsForStore(Register str, Register dest);
+  void storeNonInlineStringChars(Register chars, Register str);
+
+  void loadInlineStringChars(Register str, Register dest,
+                             CharEncoding encoding);
+  void loadInlineStringCharsForStore(Register str, Register dest);
+
+ private:
+  enum class CharKind { CharCode, CodePoint };
+
+  void branchIfMaybeSplitSurrogatePair(Register leftChild, Register index,
+                                       Register scratch, Label* maybeSplit,
+                                       Label* notSplit);
+
+  void loadRopeChild(CharKind kind, Register str, Register index,
+                     Register output, Register maybeScratch, Label* isLinear,
+                     Label* splitSurrogate);
+
+  void branchIfCanLoadStringChar(CharKind kind, Register str, Register index,
+                                 Register scratch, Register maybeScratch,
+                                 Label* label);
+  void branchIfNotCanLoadStringChar(CharKind kind, Register str, Register index,
+                                    Register scratch, Register maybeScratch,
+                                    Label* label);
+
+  void loadStringChar(CharKind kind, Register str, Register index,
+                      Register output, Register scratch1, Register scratch2,
+                      Label* fail);
+
+ public:
+  void branchIfCanLoadStringChar(Register str, Register index, Register scratch,
+                                 Label* label) {
+    branchIfCanLoadStringChar(CharKind::CharCode, str, index, scratch,
+                              InvalidReg, label);
+  }
+  void branchIfNotCanLoadStringChar(Register str, Register index,
+                                    Register scratch, Label* label) {
+    branchIfNotCanLoadStringChar(CharKind::CharCode, str, index, scratch,
+                                 InvalidReg, label);
+  }
+
+  void branchIfCanLoadStringCodePoint(Register str, Register index,
+                                      Register scratch1, Register scratch2,
+                                      Label* label) {
+    branchIfCanLoadStringChar(CharKind::CodePoint, str, index, scratch1,
+                              scratch2, label);
+  }
+  void branchIfNotCanLoadStringCodePoint(Register str, Register index,
+                                         Register scratch1, Register scratch2,
+                                         Label* label) {
+    branchIfNotCanLoadStringChar(CharKind::CodePoint, str, index, scratch1,
+                                 scratch2, label);
+  }
+
+  void loadStringChar(Register str, Register index, Register output,
+                      Register scratch1, Register scratch2, Label* fail) {
+    loadStringChar(CharKind::CharCode, str, index, output, scratch1, scratch2,
+                   fail);
+  }
+
+  void loadStringChar(Register str, int32_t index, Register output,
+                      Register scratch1, Register scratch2, Label* fail);
+
+  void loadStringCodePoint(Register str, Register index, Register output,
+                           Register scratch1, Register scratch2, Label* fail) {
+    loadStringChar(CharKind::CodePoint, str, index, output, scratch1, scratch2,
+                   fail);
+  }
+
+  void loadRopeLeftChild(Register str, Register dest);
+  void loadRopeRightChild(Register str, Register dest);
+  void storeRopeChildren(Register left, Register right, Register str);
+
+  void loadDependentStringBase(Register str, Register dest);
+  void storeDependentStringBase(Register base, Register str);
+
+  void loadStringIndexValue(Register str, Register dest, Label* fail);
+
+  template <typename T>
+  void storeChar(const T& src, Address dest, CharEncoding encoding) {
+    if (encoding == CharEncoding::Latin1) {
+      store8(src, dest);
+    } else {
+      store16(src, dest);
+    }
+  }
+
+  template <typename T>
+  void loadChar(const T& src, Register dest, CharEncoding encoding) {
+    if (encoding == CharEncoding::Latin1) {
+      load8ZeroExtend(src, dest);
+    } else {
+      load16ZeroExtend(src, dest);
+    }
+  }
+
+  void loadChar(Register chars, Register index, Register dest,
+                CharEncoding encoding, int32_t offset = 0);
+
+  void addToCharPtr(Register chars, Register index, CharEncoding encoding);
+
+  void branchIfNotLeadSurrogate(Register src, Label* label);
+
+ private:
+  enum class SurrogateChar { Lead, Trail };
+  void branchSurrogate(Assembler::Condition cond, Register src,
+                       Register scratch, Label* label,
+                       SurrogateChar surrogateChar);
+
+ public:
+  void branchIfLeadSurrogate(Register src, Register scratch, Label* label) {
+    branchSurrogate(Assembler::Equal, src, scratch, label, SurrogateChar::Lead);
+  }
+
+  void branchIfNotLeadSurrogate(Register src, Register scratch, Label* label) {
+    branchSurrogate(Assembler::NotEqual, src, scratch, label,
+                    SurrogateChar::Lead);
+  }
+
+  void branchIfNotTrailSurrogate(Register src, Register scratch, Label* label) {
+    branchSurrogate(Assembler::NotEqual, src, scratch, label,
+                    SurrogateChar::Trail);
+  }
+
+ private:
+  void loadStringFromUnit(Register unit, Register dest,
+                          const StaticStrings& staticStrings);
+  void loadLengthTwoString(Register c1, Register c2, Register dest,
+                           const StaticStrings& staticStrings);
+
+ public:
+  void lookupStaticString(Register ch, Register dest,
+                          const StaticStrings& staticStrings);
+
+  void lookupStaticString(Register ch, Register dest,
+                          const StaticStrings& staticStrings, Label* fail);
+
+  void lookupStaticString(Register ch1, Register ch2, Register dest,
+                          const StaticStrings& staticStrings, Label* fail);
+
+  void lookupStaticIntString(Register integer, Register dest, Register scratch,
+                             const StaticStrings& staticStrings, Label* fail);
+  void lookupStaticIntString(Register integer, Register dest,
+                             const StaticStrings& staticStrings, Label* fail) {
+    lookupStaticIntString(integer, dest, dest, staticStrings, fail);
+  }
+
+  void loadInt32ToStringWithBase(Register input, Register base, Register dest,
+                                 Register scratch1, Register scratch2,
+                                 const StaticStrings& staticStrings,
+                                 const LiveRegisterSet& volatileRegs,
+                                 bool lowerCase, Label* fail);
+  void loadInt32ToStringWithBase(Register input, int32_t base, Register dest,
+                                 Register scratch1, Register scratch2,
+                                 const StaticStrings& staticStrings,
+                                 bool lowerCase, Label* fail);
+
+  void loadBigIntDigits(Register bigInt, Register digits);
+
+  void loadBigInt64(Register bigInt, Register64 dest);
+
+  void loadBigIntDigit(Register bigInt, Register dest);
+
+  void loadBigIntDigit(Register bigInt, Register dest, Label* fail);
+
+  void loadBigIntPtr(Register bigInt, Register dest, Label* fail);
+
+  void initializeBigInt64(Scalar::Type type, Register bigInt, Register64 val,
+                          Register64 temp = Register64::Invalid());
+
+  void initializeBigIntPtr(Register bigInt, Register val);
+
+  void copyBigIntWithInlineDigits(Register src, Register dest, Register temp,
+                                  gc::Heap initialHeap, Label* fail);
+
+  void compareBigIntAndInt32(JSOp op, Register bigInt, Register int32,
+                             Register scratch1, Register scratch2,
+                             Label* ifTrue, Label* ifFalse);
+
+  void compareBigIntAndInt32(JSOp op, Register bigInt, Imm32 int32,
+                             Register scratch, Label* ifTrue, Label* ifFalse);
+
+  void equalBigInts(Register left, Register right, Register temp1,
+                    Register temp2, Register temp3, Register temp4,
+                    Label* notSameSign, Label* notSameLength,
+                    Label* notSameDigit);
+
+  void loadJSContext(Register dest);
+
+  void loadGlobalObjectData(Register dest);
+
+  void loadRealmFuse(RealmFuses::FuseIndex index, Register dest);
+
+  void loadRuntimeFuse(RuntimeFuses::FuseIndex index, Register dest);
+
+  void guardRuntimeFuse(RuntimeFuses::FuseIndex index, Label* fail);
+
+  void switchToRealm(Register realm);
+  void switchToRealm(const void* realm, Register scratch);
+  void switchToObjectRealm(Register obj, Register scratch);
+  void switchToBaselineFrameRealm(Register scratch);
+  void switchToWasmInstanceRealm(Register scratch1, Register scratch2);
+  void debugAssertContextRealm(const void* realm, Register scratch);
+
+  void guardObjectHasSameRealm(Register obj, Register scratch, Label* fail);
+
+  template <typename ValueType>
+  void storeLocalAllocSite(ValueType value, Register scratch);
+
+  void loadBaselineCompileQueue(Register dest);
+
+  void loadJitActivation(Register dest);
+
+  void guardSpecificAtom(Register str, JSOffThreadAtom* atom, Register scratch,
+                         const LiveRegisterSet& volatileRegs, Label* fail);
+
+  void guardStringToInt32(Register str, Register output, Register scratch,
+                          LiveRegisterSet volatileRegs, Label* fail);
+
+  template <typename T>
+  void loadTypedOrValue(const T& src, TypedOrValueRegister dest) {
+    if (dest.hasValue()) {
+      loadValue(src, dest.valueReg());
+    } else {
+      loadUnboxedValue(src, dest.type(), dest.typedReg());
+    }
+  }
+
+  template <typename T>
+  void storeTypedOrValue(TypedOrValueRegister src, const T& dest) {
+    if (src.hasValue()) {
+      storeValue(src.valueReg(), dest);
+    } else if (IsFloatingPointType(src.type())) {
+      FloatRegister reg = src.typedReg().fpu();
+      if (src.type() == MIRType::Float32) {
+        ScratchDoubleScope fpscratch(*this);
+        convertFloat32ToDouble(reg, fpscratch);
+        boxDouble(fpscratch, dest);
+      } else {
+        boxDouble(reg, dest);
+      }
+    } else {
+      storeValue(ValueTypeFromMIRType(src.type()), src.typedReg().gpr(), dest);
+    }
+  }
+
+  template <typename T>
+  void storeConstantOrRegister(const ConstantOrRegister& src, const T& dest) {
+    if (src.constant()) {
+      storeValue(src.value(), dest);
+    } else {
+      storeTypedOrValue(src.reg(), dest);
+    }
+  }
+
+  void storeCallPointerResult(Register reg) {
+    if (reg != ReturnReg) {
+      mov(ReturnReg, reg);
+    }
+  }
+
+  inline void storeCallBoolResult(Register reg);
+  inline void storeCallInt32Result(Register reg);
+
+  void storeCallFloatResult(FloatRegister reg) {
+    if (reg.isSingle()) {
+      if (reg != ReturnFloat32Reg) {
+        moveFloat32(ReturnFloat32Reg, reg);
+      }
+    } else {
+      if (reg != ReturnDoubleReg) {
+        moveDouble(ReturnDoubleReg, reg);
+      }
+    }
+  }
+
+  inline void storeCallResultValue(AnyRegister dest, JSValueType type);
+
+  void storeCallResultValue(ValueOperand dest) {
+#if defined(JS_NUNBOX32)
+    if (dest.typeReg() == JSReturnReg_Data) {
+      if (dest.payloadReg() == JSReturnReg_Type) {
+        mov(JSReturnReg_Type, ReturnReg);
+        mov(JSReturnReg_Data, JSReturnReg_Type);
+        mov(ReturnReg, JSReturnReg_Data);
+      } else {
+        mov(JSReturnReg_Data, dest.payloadReg());
+        mov(JSReturnReg_Type, dest.typeReg());
+      }
+    } else {
+      mov(JSReturnReg_Type, dest.typeReg());
+      mov(JSReturnReg_Data, dest.payloadReg());
+    }
+#elif defined(JS_PUNBOX64)
+    if (dest.valueReg() != JSReturnReg) {
+      mov(JSReturnReg, dest.valueReg());
+    }
+#else
+#  error "Bad architecture"
+#endif
+  }
+
+  inline void storeCallResultValue(TypedOrValueRegister dest);
+
+ private:
+  TrampolinePtr preBarrierTrampoline(MIRType type);
+
+  template <typename T>
+  void unguardedCallPreBarrier(const T& address, MIRType type) {
+    Label done;
+    if (type == MIRType::Value) {
+      branchTestGCThing(Assembler::NotEqual, address, &done);
+    } else if (type == MIRType::Object || type == MIRType::String) {
+      branchPtr(Assembler::Equal, address, ImmWord(0), &done);
+    }
+
+    Push(PreBarrierReg);
+    computeEffectiveAddress(address, PreBarrierReg);
+
+    TrampolinePtr preBarrier = preBarrierTrampoline(type);
+
+    call(preBarrier);
+    Pop(PreBarrierReg);
+    bind(&done);
+  }
+
+ public:
+  template <typename T>
+  void guardedCallPreBarrier(const T& address, MIRType type) {
+    Label done;
+    branchTestNeedsMarkingBarrier(Assembler::Zero, &done);
+    unguardedCallPreBarrier(address, type);
+    bind(&done);
+  }
+
+  template <typename T>
+  void guardedCallPreBarrierAnyZone(const T& address, MIRType type,
+                                    Register scratch) {
+    Label done;
+    branchTestNeedsMarkingBarrierAnyZone(Assembler::Zero, &done, scratch);
+    unguardedCallPreBarrier(address, type);
+    bind(&done);
+  }
+
+  enum class Uint32Mode { FailOnDouble, ForceDouble };
+
+  void boxUint32(Register source, ValueOperand dest, Uint32Mode uint32Mode,
+                 Label* fail);
+
+  static bool LoadRequiresCall(Scalar::Type type) {
+    return type == Scalar::Float16 && !MacroAssembler::SupportsFloat32To16();
+  }
+
+  static bool StoreRequiresCall(Scalar::Type type) {
+    return type == Scalar::Float16 && !MacroAssembler::SupportsFloat32To16();
+  }
+
+  template <typename T>
+  void loadFromTypedArray(Scalar::Type arrayType, const T& src,
+                          AnyRegister dest, Register temp1, Register temp2,
+                          Label* fail, LiveRegisterSet volatileLiveReg);
+
+  void loadFromTypedArray(Scalar::Type arrayType, const BaseIndex& src,
+                          const ValueOperand& dest, Uint32Mode uint32Mode,
+                          Register temp, Label* fail,
+                          LiveRegisterSet volatileLiveReg);
+
+  void loadFromTypedBigIntArray(Scalar::Type arrayType, const BaseIndex& src,
+                                const ValueOperand& dest, Register bigInt,
+                                Register64 temp);
+
+  template <typename S, typename T>
+  void storeToTypedIntArray(Scalar::Type arrayType, const S& value,
+                            const T& dest) {
+    switch (arrayType) {
+      case Scalar::Int8:
+      case Scalar::Uint8:
+      case Scalar::Uint8Clamped:
+        store8(value, dest);
+        break;
+      case Scalar::Int16:
+      case Scalar::Uint16:
+        store16(value, dest);
+        break;
+      case Scalar::Int32:
+      case Scalar::Uint32:
+        store32(value, dest);
+        break;
+      default:
+        MOZ_CRASH("Invalid typed array type");
+    }
+  }
+
+  template <typename T>
+  void storeToTypedFloatArray(Scalar::Type arrayType, FloatRegister value,
+                              const T& dest, Register temp,
+                              LiveRegisterSet volatileLiveRegs);
+
+  template <typename S, typename T>
+  void storeToTypedBigIntArray(const S& value, const T& dest) {
+    store64(value, dest);
+  }
+
+  void memoryBarrierBefore(Synchronization sync);
+  void memoryBarrierAfter(Synchronization sync);
+
+  using MacroAssemblerSpecific::convertDoubleToFloat16;
+  using MacroAssemblerSpecific::convertFloat32ToFloat16;
+  using MacroAssemblerSpecific::convertInt32ToFloat16;
+  using MacroAssemblerSpecific::loadFloat16;
+
+  void convertDoubleToFloat16(FloatRegister src, FloatRegister dest,
+                              Register temp, LiveRegisterSet volatileLiveRegs);
+
+  void convertDoubleToFloat16(FloatRegister src, FloatRegister dest,
+                              Register temp1, Register temp2);
+
+  void convertFloat32ToFloat16(FloatRegister src, FloatRegister dest,
+                               Register temp, LiveRegisterSet volatileLiveRegs);
+
+  void convertInt32ToFloat16(Register src, FloatRegister dest, Register temp,
+                             LiveRegisterSet volatileLiveRegs);
+
+  template <typename T>
+  void loadFloat16(const T& src, FloatRegister dest, Register temp1,
+                   Register temp2, LiveRegisterSet volatileLiveRegs);
+
+  template <typename T>
+  void storeFloat16(FloatRegister src, const T& dest, Register temp,
+                    LiveRegisterSet volatileLiveRegs);
+
+  void moveFloat16ToGPR(FloatRegister src, Register dest,
+                        LiveRegisterSet volatileLiveRegs);
+
+  void moveGPRToFloat16(Register src, FloatRegister dest, Register temp,
+                        LiveRegisterSet volatileLiveRegs);
+
+  void debugAssertIsObject(const ValueOperand& val);
+  void debugAssertObjHasFixedSlots(Register obj, Register scratch);
+
+  void debugAssertObjectHasClass(Register obj, Register scratch,
+                                 const JSClass* clasp);
+
+  void debugAssertGCThingIsTenured(Register ptr, Register temp);
+
+  void branchArrayIsNotPacked(Register array, Register temp1, Register temp2,
+                              Label* label);
+
+  void setIsPackedArray(Register obj, Register output, Register temp);
+
+  void packedArrayPop(Register array, ValueOperand output, Register temp1,
+                      Register temp2, Label* fail);
+  void packedArrayShift(Register array, ValueOperand output, Register temp1,
+                        Register temp2, LiveRegisterSet volatileRegs,
+                        Label* fail);
+
+  void loadArgumentsObjectElement(Register obj, Register index,
+                                  ValueOperand output, Register temp,
+                                  Label* fail);
+  void loadArgumentsObjectElementHole(Register obj, Register index,
+                                      ValueOperand output, Register temp,
+                                      Label* fail);
+  void loadArgumentsObjectElementExists(Register obj, Register index,
+                                        Register output, Register temp,
+                                        Label* fail);
+
+  void loadArgumentsObjectLength(Register obj, Register output, Label* fail);
+  void loadArgumentsObjectLength(Register obj, Register output);
+
+  void branchTestArgumentsObjectFlags(Register obj, Register temp,
+                                      uint32_t flags, Condition cond,
+                                      Label* label);
+
+  void typedArrayElementSize(Register obj, Register output);
+
+ private:
+  void resizableTypedArrayElementShiftBy(Register obj, Register output,
+                                         Register scratch);
+
+ public:
+  void branchIfClassIsNotTypedArray(Register clasp, Label* notTypedArray);
+  void branchIfClassIsNotNonResizableTypedArray(Register clasp,
+                                                Label* notTypedArray);
+  void branchIfClassIsNotResizableTypedArray(Register clasp,
+                                             Label* notTypedArray);
+
+  void branchIfIsNotArrayBuffer(Register obj, Register temp, Label* label);
+  void branchIfIsNotSharedArrayBuffer(Register obj, Register temp,
+                                      Label* label);
+  void branchIfIsArrayBufferMaybeShared(Register obj, Register temp,
+                                        Label* label);
+
+ private:
+  enum class BranchIfDetached { No, Yes };
+
+  void branchIfHasDetachedArrayBuffer(BranchIfDetached branchIf, Register obj,
+                                      Register temp, Label* label);
+
+ public:
+  void branchIfHasDetachedArrayBuffer(Register obj, Register temp,
+                                      Label* label) {
+    branchIfHasDetachedArrayBuffer(BranchIfDetached::Yes, obj, temp, label);
+  }
+
+  void branchIfHasAttachedArrayBuffer(Register obj, Register temp,
+                                      Label* label) {
+    branchIfHasDetachedArrayBuffer(BranchIfDetached::No, obj, temp, label);
+  }
+
+  void branchIfResizableArrayBufferViewOutOfBounds(Register obj, Register temp,
+                                                   Label* label);
+
+  void branchIfResizableArrayBufferViewInBounds(Register obj, Register temp,
+                                                Label* label);
+
+  void branchIfNativeIteratorNotReusable(Register ni, Label* notReusable);
+
+  void maybeLoadIteratorFromShape(Register obj, Register dest, Register temp,
+                                  Register temp2, Register temp3,
+                                  Label* failure, bool exclusive);
+
+  void iteratorMore(Register obj, ValueOperand output, Register temp);
+  void iteratorClose(Register obj, Register temp1, Register temp2,
+                     Register temp3);
+  void iteratorLength(Register obj, Register output);
+  void iteratorLoadElement(Register obj, Register index, Register output);
+  void iteratorLoadElement(Register obj, int32_t index, Register output);
+  void registerIterator(Register enumeratorsList, Register iter, Register temp);
+
+  void prepareOOBStoreElement(Register object, Register index,
+                              Register elements, Register spectreTemp,
+                              Label* failure, LiveRegisterSet volatileLiveRegs);
+
+  void toHashableNonGCThing(ValueOperand value, ValueOperand result,
+                            FloatRegister tempFloat);
+
+  void toHashableValue(ValueOperand value, ValueOperand result,
+                       FloatRegister tempFloat, Label* atomizeString,
+                       Label* tagString);
+
+ private:
+  void scrambleHashCode(Register result);
+
+ public:
+  void hashAndScrambleValue(ValueOperand value, Register result, Register temp);
+  void prepareHashNonGCThing(ValueOperand value, Register result,
+                             Register temp);
+  void prepareHashString(Register str, Register result, Register temp);
+  void prepareHashSymbol(Register sym, Register result);
+  void prepareHashBigInt(Register bigInt, Register result, Register temp1,
+                         Register temp2, Register temp3);
+  void prepareHashObject(Register setObj, ValueOperand value, Register result,
+                         Register temp1, Register temp2, Register temp3,
+                         Register temp4);
+  void prepareHashValue(Register setObj, ValueOperand value, Register result,
+                        Register temp1, Register temp2, Register temp3,
+                        Register temp4);
+
+  void prepareHashMFBT(Register hashCode, bool alreadyScrambled);
+  template <typename Table>
+  void computeHash1MFBT(Register hashTable, Register hashCode, Register hash1,
+                        Register scratch);
+  template <typename Table>
+  void computeHash2MFBT(Register hashTable, Register hashCode, Register hash2,
+                        Register sizeMask, Register scratch);
+  void applyDoubleHashMFBT(Register hash1, Register hash2, Register sizeMask);
+  template <typename Table>
+  void checkForMatchMFBT(Register hashTable, Register hashIndex,
+                         Register hashCode, Register scratch, Register scratch2,
+                         Label* missing, Label* collision);
+
+ public:
+  //              match, the generated code should fall through. If the keys
+  template <typename Table, typename Match>
+  void lookupMFBT(Register hashTable, Register hashCode, Register scratch,
+                  Register scratch2, Register scratch3, Register scratch4,
+                  Register scratch5, Label* missing, Match match);
+
+ private:
+  enum class IsBigInt { No, Yes, Maybe };
+
+  template <typename TableObject>
+  void orderedHashTableLookup(Register setOrMapObj, ValueOperand value,
+                              Register hash, Register entryTemp, Register temp1,
+                              Register temp3, Register temp4, Register temp5,
+                              Label* found, IsBigInt isBigInt);
+
+  void setObjectHas(Register setObj, ValueOperand value, Register hash,
+                    Register result, Register temp1, Register temp2,
+                    Register temp3, Register temp4, IsBigInt isBigInt);
+
+  void mapObjectHas(Register mapObj, ValueOperand value, Register hash,
+                    Register result, Register temp1, Register temp2,
+                    Register temp3, Register temp4, IsBigInt isBigInt);
+
+  void mapObjectGet(Register mapObj, ValueOperand value, Register hash,
+                    ValueOperand result, Register temp1, Register temp2,
+                    Register temp3, Register temp4, Register temp5,
+                    IsBigInt isBigInt);
+
+ public:
+  void setObjectHasNonBigInt(Register setObj, ValueOperand value, Register hash,
+                             Register result, Register temp1, Register temp2) {
+    return setObjectHas(setObj, value, hash, result, temp1, temp2, InvalidReg,
+                        InvalidReg, IsBigInt::No);
+  }
+  void setObjectHasBigInt(Register setObj, ValueOperand value, Register hash,
+                          Register result, Register temp1, Register temp2,
+                          Register temp3, Register temp4) {
+    return setObjectHas(setObj, value, hash, result, temp1, temp2, temp3, temp4,
+                        IsBigInt::Yes);
+  }
+  void setObjectHasValue(Register setObj, ValueOperand value, Register hash,
+                         Register result, Register temp1, Register temp2,
+                         Register temp3, Register temp4) {
+    return setObjectHas(setObj, value, hash, result, temp1, temp2, temp3, temp4,
+                        IsBigInt::Maybe);
+  }
+
+  void mapObjectHasNonBigInt(Register mapObj, ValueOperand value, Register hash,
+                             Register result, Register temp1, Register temp2) {
+    return mapObjectHas(mapObj, value, hash, result, temp1, temp2, InvalidReg,
+                        InvalidReg, IsBigInt::No);
+  }
+  void mapObjectHasBigInt(Register mapObj, ValueOperand value, Register hash,
+                          Register result, Register temp1, Register temp2,
+                          Register temp3, Register temp4) {
+    return mapObjectHas(mapObj, value, hash, result, temp1, temp2, temp3, temp4,
+                        IsBigInt::Yes);
+  }
+  void mapObjectHasValue(Register mapObj, ValueOperand value, Register hash,
+                         Register result, Register temp1, Register temp2,
+                         Register temp3, Register temp4) {
+    return mapObjectHas(mapObj, value, hash, result, temp1, temp2, temp3, temp4,
+                        IsBigInt::Maybe);
+  }
+
+  void mapObjectGetNonBigInt(Register mapObj, ValueOperand value, Register hash,
+                             ValueOperand result, Register temp1,
+                             Register temp2, Register temp3) {
+    return mapObjectGet(mapObj, value, hash, result, temp1, temp2, temp3,
+                        InvalidReg, InvalidReg, IsBigInt::No);
+  }
+  void mapObjectGetBigInt(Register mapObj, ValueOperand value, Register hash,
+                          ValueOperand result, Register temp1, Register temp2,
+                          Register temp3, Register temp4, Register temp5) {
+    return mapObjectGet(mapObj, value, hash, result, temp1, temp2, temp3, temp4,
+                        temp5, IsBigInt::Yes);
+  }
+  void mapObjectGetValue(Register mapObj, ValueOperand value, Register hash,
+                         ValueOperand result, Register temp1, Register temp2,
+                         Register temp3, Register temp4, Register temp5) {
+    return mapObjectGet(mapObj, value, hash, result, temp1, temp2, temp3, temp4,
+                        temp5, IsBigInt::Maybe);
+  }
+
+ private:
+  template <typename TableObject>
+  void loadOrderedHashTableCount(Register setOrMapObj, Register result);
+
+ public:
+  void loadSetObjectSize(Register setObj, Register result);
+  void loadMapObjectSize(Register mapObj, Register result);
+
+  void clampDoubleToUint8(FloatRegister input, Register output) PER_ARCH;
+
+  inline void ensureDouble(const ValueOperand& source, FloatRegister dest,
+                           Label* failure);
+
+  template <typename S>
+  void ensureDouble(const S& source, FloatRegister dest, Label* failure) {
+    Label isDouble, done;
+    branchTestDouble(Assembler::Equal, source, &isDouble);
+    branchTestInt32(Assembler::NotEqual, source, failure);
+
+    convertInt32ToDouble(source, dest);
+    jump(&done);
+
+    bind(&isDouble);
+    unboxDouble(source, dest);
+
+    bind(&done);
+  }
+
+ private:
+  void checkAllocatorState(Register temp, gc::AllocKind allocKind, Label* fail);
+  bool shouldNurseryAllocate(gc::AllocKind allocKind, gc::Heap initialHeap);
+  void nurseryAllocateObject(
+      Register result, Register temp, gc::AllocKind allocKind,
+      size_t nDynamicSlots, Label* fail,
+      const AllocSiteInput& allocSite = AllocSiteInput());
+  void bumpPointerAllocate(Register result, Register temp, Label* fail,
+                           CompileZone* zone, JS::TraceKind traceKind,
+                           uint32_t size,
+                           const AllocSiteInput& allocSite = AllocSiteInput());
+  void updateAllocSite(Register temp, Register result, CompileZone* zone,
+                       Register site);
+
+  void freeListAllocate(Register result, Register temp, gc::AllocKind allocKind,
+                        Label* fail);
+  void allocateObject(Register result, Register temp, gc::AllocKind allocKind,
+                      uint32_t nDynamicSlots, gc::Heap initialHeap, Label* fail,
+                      const AllocSiteInput& allocSite = AllocSiteInput());
+  void nurseryAllocateString(Register result, Register temp,
+                             gc::AllocKind allocKind, Label* fail);
+  void allocateString(Register result, Register temp, gc::AllocKind allocKind,
+                      gc::Heap initialHeap, Label* fail);
+  void nurseryAllocateBigInt(Register result, Register temp, Label* fail);
+  void copySlotsFromTemplate(Register obj,
+                             const TemplateNativeObject& templateObj,
+                             uint32_t start, uint32_t end);
+  void fillSlotsWithConstantValue(Address addr, Register temp, uint32_t start,
+                                  uint32_t end, const Value& v);
+  void fillSlotsWithUndefined(Address addr, Register temp, uint32_t start,
+                              uint32_t end);
+  void fillSlotsWithUninitialized(Address addr, Register temp, uint32_t start,
+                                  uint32_t end);
+
+  void initGCSlots(Register obj, Register temp,
+                   const TemplateNativeObject& templateObj);
+
+ public:
+  void createGCObject(Register result, Register temp,
+                      const TemplateObject& templateObj, gc::Heap initialHeap,
+                      Label* fail, bool initContents = true,
+                      const AllocSiteInput& allocSite = AllocSiteInput());
+
+  void createPlainGCObject(Register result, Register shape, Register temp,
+                           Register temp2, uint32_t numFixedSlots,
+                           uint32_t numDynamicSlots, gc::AllocKind allocKind,
+                           gc::Heap initialHeap, Label* fail,
+                           const AllocSiteInput& allocSite,
+                           bool initContents = true);
+
+  void createArrayWithFixedElements(
+      Register result, Register shape, Register temp, Register dynamicSlotsTemp,
+      uint32_t arrayLength, uint32_t arrayCapacity,
+      uint32_t numUsedDynamicSlots, uint32_t numDynamicSlots,
+      gc::AllocKind allocKind, gc::Heap initialHeap, Label* fail,
+      const AllocSiteInput& allocSite = AllocSiteInput());
+
+  void createFunctionClone(Register result, Register canonical,
+                           Register envChain, Register temp,
+                           gc::AllocKind allocKind, Label* fail,
+                           const AllocSiteInput& allocSite);
+
+  void initGCThing(Register obj, Register temp,
+                   const TemplateObject& templateObj, bool initContents = true);
+
+  void initTypedArraySlots(Register obj, Register length, Register temp1,
+                           Register temp2, Label* fail,
+                           const FixedLengthTypedArrayObject* templateObj);
+
+  void initTypedArraySlotsInline(
+      Register obj, Register temp,
+      const FixedLengthTypedArrayObject* templateObj);
+
+  void newGCString(Register result, Register temp, gc::Heap initialHeap,
+                   Label* fail);
+  void newGCFatInlineString(Register result, Register temp,
+                            gc::Heap initialHeap, Label* fail);
+
+  void newGCBigInt(Register result, Register temp, gc::Heap initialHeap,
+                   Label* fail);
+
+  void preserveWrapper(Register wrapper, Register temp1, Register temp2,
+                       const LiveRegisterSet& liveRegs);
+
+ private:
+  void branchIfNotStringCharsEquals(Register stringChars,
+                                    const JSOffThreadAtom* str, Label* label);
+
+ public:
+  static bool canCompareStringCharsInline(const JSOffThreadAtom* str);
+
+  void loadStringCharsForCompare(Register input, const JSOffThreadAtom* str,
+                                 Register stringChars, Label* fail);
+
+  void compareStringChars(JSOp op, Register stringChars,
+                          const JSOffThreadAtom* str, Register result);
+
+  void compareStrings(JSOp op, Register left, Register right, Register result,
+                      Label* fail);
+
+  void typeOfObject(Register objReg, Register scratch, Label* slow,
+                    Label* isObject, Label* isCallable, Label* isUndefined);
+
+  void isCallable(Register obj, Register output, Label* isProxy) {
+    isCallableOrConstructor(true, obj, output, isProxy);
+  }
+  void isConstructor(Register obj, Register output, Label* isProxy) {
+    isCallableOrConstructor(false, obj, output, isProxy);
+  }
+
+  void setIsCrossRealmArrayConstructor(Register obj, Register output);
+
+  void setIsDefinitelyTypedArrayConstructor(Register obj, Register output);
+
+  void loadMegamorphicCache(Register dest);
+  void tryFastAtomize(Register str, Register scratch, Register output,
+                      Label* fail);
+  void loadMegamorphicSetPropCache(Register dest);
+
+  void loadAtomOrSymbolAndHash(ValueOperand value, Register outId,
+                               Register outHash, Label* cacheMiss);
+
+  void loadAtomHash(Register id, Register hash, Label* done);
+
+  void emitExtractValueFromMegamorphicCacheEntry(
+      Register obj, Register entry, Register scratch1, Register scratch2,
+      ValueOperand output, Label* cacheHit, Label* cacheMissWithEntry,
+      Label* cacheHitGetter);
+
+  void emitMegamorphicCacheLookupByValueCommon(Register obj, Register scratchId,
+                                               Register scratchIdHash,
+                                               Register outEntryPtr,
+                                               Label* cacheMissWithEntry);
+
+  void emitMegamorphicCacheLookupByValue(Register obj, Register scratchId,
+                                         Register scratchIdHash,
+                                         Register outEntryPtr,
+                                         ValueOperand output, Label* cacheHit,
+                                         Label* cacheHitGetter = nullptr);
+
+  void emitMegamorphicCacheLookupExists(Register obj, Register scratchId,
+                                        Register scratchIdHash,
+                                        Register outEntryPtr, Register output,
+                                        Label* cacheHit, bool hasOwn);
+
+  void extractCurrentIndexAndKindFromIterator(Register iterator,
+                                              Register outIndex,
+                                              Register outKind);
+  void extractIndexAndKindFromIteratorByIterIndex(Register iterator,
+                                                  Register inOutIndex,
+                                                  Register outKind,
+                                                  Register scratch);
+
+  template <typename IdType>
+#if defined(JS_CODEGEN_X86)
+  void emitMegamorphicCachedSetSlot(
+      IdType id, Register obj, Register scratch1, ValueOperand value,
+      const LiveRegisterSet& liveRegs, Label* cacheHit,
+      void (*emitPreBarrier)(MacroAssembler&, const Address&, MIRType));
+#else
+  void emitMegamorphicCachedSetSlot(
+      IdType id, Register obj, Register scratch1, Register scratch2,
+      Register scratch3, ValueOperand value, const LiveRegisterSet& liveRegs,
+      Label* cacheHit,
+      void (*emitPreBarrier)(MacroAssembler&, const Address&, MIRType));
+#endif
+
+  void loadDOMExpandoValueGuardGeneration(
+      Register obj, ValueOperand output,
+      JS::ExpandoAndGeneration* expandoAndGeneration, uint64_t generation,
+      Label* fail);
+
+  void guardNonNegativeIntPtrToInt32(Register reg, Label* fail);
+
+  void loadArrayBufferByteLengthIntPtr(Register obj, Register output);
+  void loadArrayBufferViewByteOffsetIntPtr(Register obj, Register output);
+  void loadArrayBufferViewLengthIntPtr(Register obj, Register output);
+
+  void loadGrowableSharedArrayBufferByteLengthIntPtr(Synchronization sync,
+                                                     Register obj,
+                                                     Register output);
+
+ private:
+  enum class ResizableArrayBufferView { TypedArray, DataView };
+
+  void loadResizableArrayBufferViewLengthIntPtr(ResizableArrayBufferView view,
+                                                Synchronization sync,
+                                                Register obj, Register output,
+                                                Register scratch);
+
+ public:
+  void loadResizableTypedArrayLengthIntPtr(Synchronization sync, Register obj,
+                                           Register output, Register scratch) {
+    loadResizableArrayBufferViewLengthIntPtr(
+        ResizableArrayBufferView::TypedArray, sync, obj, output, scratch);
+  }
+
+  void loadResizableDataViewByteLengthIntPtr(Synchronization sync, Register obj,
+                                             Register output,
+                                             Register scratch) {
+    loadResizableArrayBufferViewLengthIntPtr(ResizableArrayBufferView::DataView,
+                                             sync, obj, output, scratch);
+  }
+
+  void dateFillLocalTimeSlots(Register obj, Register scratch,
+                              const LiveRegisterSet& volatileRegs);
+
+ private:
+  void udiv32ByConstant(Register src, uint32_t divisor, Register dest);
+
+  void umod32ByConstant(Register src, uint32_t divisor, Register dest,
+                        Register scratch);
+
+  template <typename GetTimeFn>
+  void dateTimeFromSecondsIntoYear(ValueOperand secondsIntoYear,
+                                   ValueOperand output, Register scratch1,
+                                   Register scratch2, GetTimeFn getTimeFn);
+
+ public:
+  void dateHoursFromSecondsIntoYear(ValueOperand secondsIntoYear,
+                                    ValueOperand output, Register scratch1,
+                                    Register scratch2);
+
+  void dateMinutesFromSecondsIntoYear(ValueOperand secondsIntoYear,
+                                      ValueOperand output, Register scratch1,
+                                      Register scratch2);
+
+  void dateSecondsFromSecondsIntoYear(ValueOperand secondsIntoYear,
+                                      ValueOperand output, Register scratch1,
+                                      Register scratch2);
+
+  void timeClip(FloatRegister time, FloatRegister output);
+  void timeClip(FloatRegister time, FloatRegister output, Register scratch,
+                const LiveRegisterSet& liveRegs);
+
+  void computeImplicitThis(Register env, ValueOperand output, Label* slowPath);
+
+ private:
+  void isCallableOrConstructor(bool isCallable, Register obj, Register output,
+                               Label* isProxy);
+
+ public:
+  void generateBailoutTail(Register scratch, Register bailoutInfo);
+
+ public:
+#if !defined(JS_CODEGEN_ARM64)
+  template <typename T>
+  inline void addToStackPtr(T t);
+  template <typename T>
+  inline void addStackPtrTo(T t);
+
+  void subFromStackPtr(Imm32 imm32)
+      DEFINED_ON(mips64, loong64, riscv64, wasm32, arm, x86, x64);
+  void subFromStackPtr(Register reg);
+
+  template <typename T>
+  void subStackPtrFrom(T t) {
+    subPtr(getStackPointer(), t);
+  }
+
+  template <typename T>
+  void andToStackPtr(T t) {
+    andPtr(t, getStackPointer());
+  }
+
+  template <typename T>
+  void moveToStackPtr(T t) {
+    movePtr(t, getStackPointer());
+  }
+  template <typename T>
+  void moveStackPtrTo(T t) {
+    movePtr(getStackPointer(), t);
+  }
+
+  template <typename T>
+  void loadStackPtr(T t) {
+    loadPtr(t, getStackPointer());
+  }
+  template <typename T>
+  void storeStackPtr(T t) {
+    storePtr(getStackPointer(), t);
+  }
+
+  template <typename T>
+  void loadStackPtrFromPrivateValue(T t) {
+    loadStackPtr(t);
+  }
+  template <typename T>
+  void storeStackPtrToPrivateValue(T t) {
+    storeStackPtr(t);
+  }
+
+  template <typename T>
+  inline void branchTestStackPtr(Condition cond, T t, Label* label);
+  template <typename T>
+  inline void branchStackPtr(Condition cond, T rhs, Label* label);
+  template <typename T>
+  inline void branchStackPtrRhs(Condition cond, T lhs, Label* label);
+
+  inline void reserveStack(uint32_t amount);
+#else
+  void reserveStack(uint32_t amount);
+#endif
+
+ public:
+  void enableProfilingInstrumentation() {
+    emitProfilingInstrumentation_ = true;
+  }
+
+  void instrumentProfilerCallSite();
+
+ private:
+  class MOZ_RAII AutoProfilerCallInstrumentation {
+   public:
+    explicit AutoProfilerCallInstrumentation(MacroAssembler& masm);
+    ~AutoProfilerCallInstrumentation() = default;
+  };
+  friend class AutoProfilerCallInstrumentation;
+
+  void appendProfilerCallSite(CodeOffset label) {
+    propagateOOM(profilerCallSites_.append(label));
+  }
+
+  void linkProfilerCallSites(JitCode* code);
+
+  bool emitProfilingInstrumentation_;
+
+  Vector<CodeOffset, 0, SystemAllocPolicy> profilerCallSites_;
+
+ public:
+  void loadJitCodeRaw(Register func, Register dest);
+  void loadJitCodeRawNoIon(Register func, Register dest, Register scratch);
+
+  void loadBaselineFramePtr(Register framePtr, Register dest);
+
+  void pushBaselineFramePtr(Register framePtr, Register scratch) {
+    loadBaselineFramePtr(framePtr, scratch);
+    push(scratch);
+  }
+
+  void PushBaselineFramePtr(Register framePtr, Register scratch) {
+    loadBaselineFramePtr(framePtr, scratch);
+    Push(scratch);
+  }
+
+  using MacroAssemblerSpecific::movePtr;
+
+  void movePtr(TrampolinePtr ptr, Register dest) {
+    movePtr(ImmPtr(ptr.value), dest);
+  }
+
+ private:
+  void handleFailure();
+
+ public:
+  Label* exceptionLabel() {
+    return &failureLabel_;
+  }
+
+  Label* failureLabel() { return &failureLabel_; }
+
+  void finish();
+  void link(JitCode* code);
+
+  void assertUnreachable(const char* output);
+
+  void assert32Compare(Condition condition, Register lhs, Imm32 rhs,
+                       const char* output = nullptr);
+  void assert32Compare(Condition condition, Address lhs, Imm32 rhs,
+                       const char* output = nullptr);
+  void assertPtrCompare(Condition condition, Register lhs, ImmWord rhs,
+                        const char* output = nullptr);
+  void assertPtrCompare(Condition condition, Address lhs, ImmWord rhs,
+                        const char* output = nullptr);
+
+  void assertPtrZero(Address src, const char* output = nullptr);
+  void assertPtrZero(Register src, const char* output = nullptr);
+  void assertPtrNonZero(Address src, const char* output = nullptr);
+  void assertPtrNonZero(Register src, const char* output = nullptr);
+
+  void assumeUnreachable(const char* output);
+
+  void printf(const char* output);
+  void printf(const char* output, Register value);
+
+  void outOfLineTruncateSlow(FloatRegister src, Register dest,
+                             bool widenFloatToDouble, bool compilingWasm,
+                             wasm::BytecodeOffset callOffset);
+
+  void convertInt32ValueToDouble(ValueOperand val);
+
+ private:
+  enum class FloatingPointType { Double, Float32, Float16 };
+
+  void convertValueToFloatingPoint(ValueOperand value, FloatRegister output,
+                                   Register maybeTemp,
+                                   LiveRegisterSet volatileLiveRegs,
+                                   Label* fail, FloatingPointType outputType);
+
+ public:
+  void convertValueToDouble(ValueOperand value, FloatRegister output,
+                            Label* fail) {
+    convertValueToFloatingPoint(value, output, InvalidReg, LiveRegisterSet{},
+                                fail, FloatingPointType::Double);
+  }
+
+  void convertValueToFloat32(ValueOperand value, FloatRegister output,
+                             Label* fail) {
+    convertValueToFloatingPoint(value, output, InvalidReg, LiveRegisterSet{},
+                                fail, FloatingPointType::Float32);
+  }
+
+  void convertValueToFloat16(ValueOperand value, FloatRegister output,
+                             Register maybeTemp,
+                             LiveRegisterSet volatileLiveRegs, Label* fail) {
+    convertValueToFloatingPoint(value, output, maybeTemp, volatileLiveRegs,
+                                fail, FloatingPointType::Float16);
+  }
+
+
+  void convertValueToInt32(ValueOperand value, FloatRegister temp,
+                           Register output, Label* fail, bool negativeZeroCheck,
+                           IntConversionInputKind conversion);
+
+  void truncateValueToInt32(ValueOperand value, Label* handleStringEntry,
+                            Label* handleStringRejoin,
+                            Label* truncateDoubleSlow, Register stringReg,
+                            FloatRegister temp, Register output, Label* fail);
+
+  void truncateValueToInt32(ValueOperand value, FloatRegister temp,
+                            Register output, Label* fail) {
+    truncateValueToInt32(value, nullptr, nullptr, nullptr, InvalidReg, temp,
+                         output, fail);
+  }
+
+  void clampValueToUint8(ValueOperand value, Label* handleStringEntry,
+                         Label* handleStringRejoin, Register stringReg,
+                         FloatRegister temp, Register output, Label* fail);
+
+  [[nodiscard]] bool icBuildOOLFakeExitFrame(void* fakeReturnAddr,
+                                             AutoSaveLiveRegisters& save);
+
+  void alignJitStackBasedOnNArgs(Register nargs, bool countIncludesThis);
+  void alignJitStackBasedOnNArgs(uint32_t argc, bool countIncludesThis);
+
+  inline void assertStackAlignment(uint32_t alignment, int32_t offset = 0);
+
+  void touchFrameValues(Register numStackValues, Register scratch1,
+                        Register scratch2);
+
+#if defined(JS_64BIT)
+  void debugAssertCanonicalInt32(Register r);
+#endif
+
+};
+
+class MOZ_RAII StackMacroAssembler : public MacroAssembler {
+  JS::AutoCheckCannotGC nogc;
+
+ public:
+  StackMacroAssembler(JSContext* cx, TempAllocator& alloc);
+};
+
+class MOZ_RAII WasmMacroAssembler : public MacroAssembler {
+ public:
+  explicit WasmMacroAssembler(TempAllocator& alloc, bool limitedSize = true);
+  ~WasmMacroAssembler() { assertNoGCThings(); }
+};
+
+class OffThreadMacroAssembler : public MacroAssembler {
+ public:
+  OffThreadMacroAssembler(TempAllocator& alloc, CompileRealm* realm);
+};
+
+inline uint32_t MacroAssembler::framePushed() const { return framePushed_; }
+
+inline void MacroAssembler::setFramePushed(uint32_t framePushed) {
+  framePushed_ = framePushed;
+}
+
+inline void MacroAssembler::adjustFrame(int32_t value) {
+  MOZ_ASSERT_IF(value < 0, framePushed_ >= uint32_t(-value));
+  setFramePushed(framePushed_ + value);
+}
+
+inline void MacroAssembler::implicitPop(uint32_t bytes) {
+  MOZ_ASSERT(bytes % sizeof(intptr_t) == 0);
+  MOZ_ASSERT(bytes <= INT32_MAX);
+  adjustFrame(-int32_t(bytes));
+}
+
+static inline Assembler::DoubleCondition JSOpToDoubleCondition(JSOp op) {
+  switch (op) {
+    case JSOp::Eq:
+    case JSOp::StrictEq:
+      return Assembler::DoubleEqual;
+    case JSOp::Ne:
+    case JSOp::StrictNe:
+      return Assembler::DoubleNotEqualOrUnordered;
+    case JSOp::Lt:
+      return Assembler::DoubleLessThan;
+    case JSOp::Le:
+      return Assembler::DoubleLessThanOrEqual;
+    case JSOp::Gt:
+      return Assembler::DoubleGreaterThan;
+    case JSOp::Ge:
+      return Assembler::DoubleGreaterThanOrEqual;
+    default:
+      MOZ_CRASH("Unexpected comparison operation");
+  }
+}
+
+static inline Assembler::Condition JSOpToCondition(JSOp op, bool isSigned) {
+  if (isSigned) {
+    switch (op) {
+      case JSOp::Eq:
+      case JSOp::StrictEq:
+        return Assembler::Equal;
+      case JSOp::Ne:
+      case JSOp::StrictNe:
+        return Assembler::NotEqual;
+      case JSOp::Lt:
+        return Assembler::LessThan;
+      case JSOp::Le:
+        return Assembler::LessThanOrEqual;
+      case JSOp::Gt:
+        return Assembler::GreaterThan;
+      case JSOp::Ge:
+        return Assembler::GreaterThanOrEqual;
+      default:
+        MOZ_CRASH("Unrecognized comparison operation");
+    }
+  } else {
+    switch (op) {
+      case JSOp::Eq:
+      case JSOp::StrictEq:
+        return Assembler::Equal;
+      case JSOp::Ne:
+      case JSOp::StrictNe:
+        return Assembler::NotEqual;
+      case JSOp::Lt:
+        return Assembler::Below;
+      case JSOp::Le:
+        return Assembler::BelowOrEqual;
+      case JSOp::Gt:
+        return Assembler::Above;
+      case JSOp::Ge:
+        return Assembler::AboveOrEqual;
+      default:
+        MOZ_CRASH("Unrecognized comparison operation");
+    }
+  }
+}
+
+static inline size_t StackDecrementForCall(uint32_t alignment,
+                                           size_t bytesAlreadyPushed,
+                                           size_t bytesToPush) {
+  return bytesToPush +
+         ComputeByteAlignment(bytesAlreadyPushed + bytesToPush, alignment);
+}
+
+inline DynFn JitPreWriteBarrier(MIRType type);
+}  
+
+}  
+
+#endif

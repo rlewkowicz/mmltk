@@ -1,0 +1,69 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef SplitNodeTransaction_h
+#define SplitNodeTransaction_h
+
+#include "EditorForwards.h"
+#include "EditTransactionBase.h"  // for EditorTransactionBase
+
+#include "nsCOMPtr.h"  // for nsCOMPtr
+#include "nsCycleCollectionParticipant.h"
+#include "nsIContent.h"
+#include "nsISupportsImpl.h"  // for NS_DECL_ISUPPORTS_INHERITED
+#include "nscore.h"           // for NS_IMETHOD
+
+namespace mozilla {
+
+class SplitNodeTransaction final : public EditTransactionBase {
+ private:
+  template <typename PT, typename CT>
+  SplitNodeTransaction(HTMLEditor& aHTMLEditor,
+                       const EditorDOMPointBase<PT, CT>& aStartOfRightContent);
+
+ public:
+  template <typename PT, typename CT>
+  static already_AddRefed<SplitNodeTransaction> Create(
+      HTMLEditor& aHTMLEditor,
+      const EditorDOMPointBase<PT, CT>& aStartOfRightContent);
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(SplitNodeTransaction,
+                                           EditTransactionBase)
+
+  NS_DECL_EDITTRANSACTIONBASE
+  NS_DECL_EDITTRANSACTIONBASE_GETASMETHODS_OVERRIDE(SplitNodeTransaction)
+
+  MOZ_CAN_RUN_SCRIPT NS_IMETHOD RedoTransaction() override;
+
+  nsIContent* GetSplitContent() const { return mSplitContent; }
+  nsIContent* GetNewContent() const { return mNewContent; }
+  nsINode* GetParentNode() const { return mParentNode; }
+
+  uint32_t SplitOffset() const { return mSplitOffset; }
+
+  friend std::ostream& operator<<(std::ostream& aStream,
+                                  const SplitNodeTransaction& aTransaction);
+
+ protected:
+  virtual ~SplitNodeTransaction() = default;
+
+  MOZ_CAN_RUN_SCRIPT Result<SplitNodeResult, nsresult> DoTransactionInternal(
+      HTMLEditor& aHTMLEditor, nsIContent& aSplittingContent,
+      nsIContent& aNewContent, uint32_t aSplitOffset);
+
+  RefPtr<HTMLEditor> mHTMLEditor;
+
+  nsCOMPtr<nsINode> mParentNode;
+
+  nsCOMPtr<nsIContent> mNewContent;
+
+  nsCOMPtr<nsIContent> mSplitContent;
+
+  uint32_t mSplitOffset;
+};
+
+}  
+
+#endif  // #ifndef SplitNodeTransaction_h

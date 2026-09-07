@@ -1,0 +1,121 @@
+
+[package]
+edition = "2018"
+rust-version = "1.56"
+name = "futures"
+version = "0.3.28"
+description = """
+An implementation of futures and streams featuring zero allocations,
+composability, and iterator-like interfaces.
+"""
+homepage = "https://rust-lang.github.io/futures-rs"
+keywords = [
+    "futures",
+    "async",
+    "future",
+]
+categories = ["asynchronous"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rust-lang/futures-rs"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = [
+    "--cfg",
+    "docsrs",
+]
+
+[package.metadata.playground]
+features = [
+    "std",
+    "async-await",
+    "compat",
+    "io-compat",
+    "executor",
+    "thread-pool",
+]
+
+[dependencies.futures-channel]
+version = "0.3.28"
+features = ["sink"]
+default-features = false
+
+[dependencies.futures-core]
+version = "0.3.28"
+default-features = false
+
+[dependencies.futures-executor]
+version = "0.3.28"
+optional = true
+default-features = false
+
+[dependencies.futures-io]
+version = "0.3.28"
+default-features = false
+
+[dependencies.futures-sink]
+version = "0.3.28"
+default-features = false
+
+[dependencies.futures-task]
+version = "0.3.28"
+default-features = false
+
+[dependencies.futures-util]
+version = "0.3.28"
+features = ["sink"]
+default-features = false
+
+[features]
+alloc = [
+    "futures-core/alloc",
+    "futures-task/alloc",
+    "futures-sink/alloc",
+    "futures-channel/alloc",
+    "futures-util/alloc",
+]
+async-await = [
+    "futures-util/async-await",
+    "futures-util/async-await-macro",
+]
+bilock = ["futures-util/bilock"]
+cfg-target-has-atomic = []
+compat = [
+    "std",
+    "futures-util/compat",
+]
+default = [
+    "std",
+    "async-await",
+    "executor",
+]
+executor = [
+    "std",
+    "futures-executor/std",
+]
+io-compat = [
+    "compat",
+    "futures-util/io-compat",
+]
+std = [
+    "alloc",
+    "futures-core/std",
+    "futures-task/std",
+    "futures-io/std",
+    "futures-sink/std",
+    "futures-util/std",
+    "futures-util/io",
+    "futures-util/channel",
+]
+thread-pool = [
+    "executor",
+    "futures-executor/thread-pool",
+]
+unstable = [
+    "futures-core/unstable",
+    "futures-task/unstable",
+    "futures-channel/unstable",
+    "futures-io/unstable",
+    "futures-util/unstable",
+]
+write-all-vectored = ["futures-util/write-all-vectored"]

@@ -1,0 +1,256 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_serviceworkerregistrationinfo_h
+#define mozilla_dom_serviceworkerregistrationinfo_h
+
+#include <functional>
+
+#include "mozilla/dom/IPCNavigationPreloadState.h"
+#include "mozilla/dom/ServiceWorkerInfo.h"
+#include "mozilla/dom/ServiceWorkerLifetimeExtension.h"
+#include "mozilla/dom/ServiceWorkerRegistrationBinding.h"
+#include "mozilla/dom/ServiceWorkerRegistrationDescriptor.h"
+#include "nsProxyRelease.h"
+#include "nsTObserverArray.h"
+
+namespace mozilla::dom {
+
+class ServiceWorkerRegistrationListener;
+
+class ServiceWorkerRegistrationInfo final
+    : public nsIServiceWorkerRegistrationInfo {
+  nsCOMPtr<nsIPrincipal> mPrincipal;
+  ServiceWorkerRegistrationDescriptor mDescriptor;
+  nsTArray<nsCOMPtr<nsIServiceWorkerRegistrationInfoListener>> mListeners;
+  nsTObserverArray<ServiceWorkerRegistrationListener*> mInstanceList;
+
+  struct VersionEntry {
+    const ServiceWorkerRegistrationDescriptor mDescriptor;
+    TimeStamp mTimeStamp;
+
+    explicit VersionEntry(
+        const ServiceWorkerRegistrationDescriptor& aDescriptor)
+        : mDescriptor(aDescriptor), mTimeStamp(TimeStamp::Now()) {}
+  };
+  nsTArray<UniquePtr<VersionEntry>> mVersionList;
+
+  const nsID mAgentClusterId = nsID::GenerateUUID();
+
+  uint32_t mControlledClientsCounter;
+  uint32_t mDelayMultiplier;
+
+  enum { NoUpdate, NeedTimeCheckAndUpdate, NeedUpdate } mUpdateState;
+
+  PRTime mCreationTime;
+  TimeStamp mCreationTimeStamp;
+  PRTime mLastUpdateTime;
+
+  RefPtr<ServiceWorkerInfo> mEvaluatingWorker;
+  RefPtr<ServiceWorkerInfo> mActiveWorker;
+  RefPtr<ServiceWorkerInfo> mWaitingWorker;
+  RefPtr<ServiceWorkerInfo> mInstallingWorker;
+
+  virtual ~ServiceWorkerRegistrationInfo();
+
+  bool mUnregistered;
+
+  bool mCorrupt;
+
+  IPCNavigationPreloadState mNavigationPreloadState;
+  int64_t mNumberOfAttemptedActivations{0};
+  bool mIsBroken{false};
+  int64_t mCacheAPIId{-1};
+  uint16_t mIPAddressSpace = 0;
+
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSISERVICEWORKERREGISTRATIONINFO
+
+  using TryToActivateCallback = std::function<void()>;
+
+  ServiceWorkerRegistrationInfo(
+      const nsACString& aScope, WorkerType aType, nsIPrincipal* aPrincipal,
+      ServiceWorkerUpdateViaCache aUpdateViaCache,
+      IPCNavigationPreloadState&& aNavigationPreloadState);
+
+  int64_t GetNumberOfAttemptedActivations() const {
+    return mNumberOfAttemptedActivations;
+  }
+
+  bool IsBroken() const { return mIsBroken; }
+
+  int64_t GetCacheAPIId() const { return mCacheAPIId; }
+
+  void AddInstance(ServiceWorkerRegistrationListener* aInstance,
+                   const ServiceWorkerRegistrationDescriptor& aDescriptor);
+
+  void RemoveInstance(ServiceWorkerRegistrationListener* aInstance);
+
+  const nsCString& Scope() const;
+
+  WorkerType Type() const;
+
+  nsIPrincipal* Principal() const;
+
+  bool IsUnregistered() const;
+
+  void SetUnregistered();
+
+  already_AddRefed<ServiceWorkerInfo> Newest() const {
+    RefPtr<ServiceWorkerInfo> newest;
+    if (mInstallingWorker) {
+      newest = mInstallingWorker;
+    } else if (mWaitingWorker) {
+      newest = mWaitingWorker;
+    } else {
+      newest = mActiveWorker;
+    }
+
+    return newest.forget();
+  }
+
+  already_AddRefed<ServiceWorkerInfo> NewestIncludingEvaluating() const {
+    if (mEvaluatingWorker) {
+      RefPtr<ServiceWorkerInfo> newest = mEvaluatingWorker;
+      return newest.forget();
+    }
+    return Newest();
+  }
+
+  already_AddRefed<ServiceWorkerInfo> GetServiceWorkerInfoById(uint64_t aId);
+
+  void StartControllingClient() {
+    ++mControlledClientsCounter;
+    mDelayMultiplier = 0;
+  }
+
+  void StopControllingClient() {
+    MOZ_ASSERT(mControlledClientsCounter);
+    --mControlledClientsCounter;
+  }
+
+  bool IsControllingClients() const {
+    return mActiveWorker && mControlledClientsCounter;
+  }
+
+  void ShutdownWorkers();
+
+  void Clear();
+
+  void ClearAsCorrupt();
+
+  bool IsCorrupt() const;
+
+  void TryToActivateAsync(
+      const ServiceWorkerLifetimeExtension& aLifetimeExtension,
+      TryToActivateCallback&& aCallback = nullptr);
+
+  void TryToActivate(ServiceWorkerLifetimeExtension&& aLifetimeExtension,
+                     TryToActivateCallback&& aCallback);
+
+  void Activate(const ServiceWorkerLifetimeExtension& aLifetimeExtension);
+
+  void FinishActivate(bool aSuccess);
+
+  void RefreshLastUpdateCheckTime();
+
+  bool IsLastUpdateCheckTimeOverOneDay() const;
+
+  void MaybeScheduleTimeCheckAndUpdate();
+
+  void MaybeScheduleUpdate();
+
+  bool CheckAndClearIfUpdateNeeded();
+
+  ServiceWorkerInfo* GetEvaluating() const;
+
+  ServiceWorkerInfo* GetInstalling() const;
+
+  ServiceWorkerInfo* GetWaiting() const;
+
+  ServiceWorkerInfo* GetActive() const;
+
+  ServiceWorkerInfo* GetByDescriptor(
+      const ServiceWorkerDescriptor& aDescriptor) const;
+
+  ServiceWorkerInfo* GetByClientInfo(const ClientInfo& aClientInfo) const;
+
+  void SetEvaluating(ServiceWorkerInfo* aServiceWorker);
+
+  void ClearEvaluating();
+
+  void ClearInstalling();
+
+  void TransitionEvaluatingToInstalling();
+
+  void TransitionInstallingToWaiting();
+
+  void SetActive(ServiceWorkerInfo* aServiceWorker);
+
+  void TransitionWaitingToActive();
+
+  bool IsIdle() const;
+
+  ServiceWorkerUpdateViaCache GetUpdateViaCache() const;
+
+  void SetOptions(ServiceWorkerUpdateViaCache aUpdateViaCache,
+                  WorkerType aType);
+
+  int64_t GetLastUpdateTime() const;
+
+  void SetLastUpdateTime(const int64_t aTime);
+
+  const ServiceWorkerRegistrationDescriptor& Descriptor() const;
+
+  uint64_t Id() const;
+
+  uint64_t Version() const;
+
+  uint32_t GetUpdateDelay(const bool aWithMultiplier = true);
+
+  void FireUpdateFound();
+
+  void NotifyCleared();
+
+  void ClearWhenIdle();
+
+  const nsID& AgentClusterId() const;
+
+  uint16_t GetIPAddressSpace() const { return mIPAddressSpace; }
+  void SetIPAddressSpace(uint16_t aIPAddressSpace) {
+    if (aIPAddressSpace != 0) {
+      MOZ_ASSERT(mIPAddressSpace == 0 || mIPAddressSpace == aIPAddressSpace,
+                 "Unexpected IP address space mismatch for same-origin "
+                 "service worker registration");
+      mIPAddressSpace = aIPAddressSpace;
+    }
+  }
+
+  void SetNavigationPreloadEnabled(const bool& aEnabled);
+
+  void SetNavigationPreloadHeader(const nsCString& aHeader);
+
+  IPCNavigationPreloadState GetNavigationPreloadState() const;
+
+ private:
+  void UpdateRegistrationState();
+
+  void UpdateRegistrationState(ServiceWorkerUpdateViaCache aUpdateViaCache,
+                               WorkerType aType);
+
+  void NotifyChromeRegistrationListeners();
+
+  static uint64_t GetNextId();
+
+  static uint64_t GetNextVersion();
+
+  void ForEachWorker(void (*aFunc)(RefPtr<ServiceWorkerInfo>&));
+
+  void CheckQuotaUsage();
+};
+
+}  
+
+#endif  // mozilla_dom_serviceworkerregistrationinfo_h

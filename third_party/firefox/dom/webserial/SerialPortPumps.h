@@ -1,0 +1,46 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_SerialPortPumps_h
+#define mozilla_dom_SerialPortPumps_h
+
+#include "mozilla/dom/SerialPlatformService.h"
+#include "nsIAsyncInputStream.h"
+#include "nsIAsyncOutputStream.h"
+#include "nsThreadUtils.h"
+
+namespace mozilla::dom {
+constexpr uint32_t kMinSerialPortPumpSize = 16384;
+}  
+
+namespace mozilla::dom::webserial {
+
+class SerialPortWritePump final : public nsIInputStreamCallback {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+
+  SerialPortWritePump(const nsString& aPortId, nsIAsyncInputStream* aInput);
+
+  void Start();
+  void Stop();
+
+  void OnPipeClosed(nsCOMPtr<nsIRunnable>&& aCallback);
+
+  bool IsPipeClosed() const { return mPipeClosed; }
+
+  NS_IMETHOD OnInputStreamReady(nsIAsyncInputStream* aStream) override;
+
+ private:
+  ~SerialPortWritePump() = default;
+
+  nsString mPortId;
+  nsCOMPtr<nsIAsyncInputStream> mInput;
+  Atomic<bool> mStopped{false};
+  bool mPipeClosed = false;
+  nsCOMPtr<nsIRunnable> mClosedCallback;
+};
+
+}  
+
+#endif  // mozilla_dom_SerialPortPumps_h

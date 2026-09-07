@@ -1,0 +1,457 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*******************************************************************************
+*
+*   Copyright (C) 2002-2011, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+*
+*******************************************************************************
+*   file name:  punycode.cpp
+*   encoding:   UTF-8
+*   tab size:   8 (not used)
+*   indentation:4
+*
+*   created on: 2002jan31
+*   created by: Markus W. Scherer
+*/
+
+
+/*
+punycode.c 0.4.0 (2001-Nov-17-Sat)
+http://www.cs.berkeley.edu/~amc/idn/
+Adam M. Costello
+http://www.nicemice.net/amc/
+
+Disclaimer and license
+
+    Regarding this entire document or any portion of it (including
+    the pseudocode and C code), the author makes no guarantees and
+    is not responsible for any damage resulting from its use.  The
+    author grants irrevocable permission to anyone to use, modify,
+    and distribute it in any way that does not diminish the rights
+    of anyone else to use, modify, and distribute it, provided that
+    redistributed derivative works do not contain misleading author or
+    version information.  Derivative works need not be licensed under
+    similar terms.
+*/
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_IDNA
+
+#include "unicode/ustring.h"
+#include "unicode/utf.h"
+#include "unicode/utf16.h"
+#include "ustr_imp.h"
+#include "cstring.h"
+#include "cmemory.h"
+#include "punycode.h"
+#include "uassert.h"
+
+
+
+#define BASE            36
+#define TMIN            1
+#define TMAX            26
+#define SKEW            38
+#define DAMP            700
+#define INITIAL_BIAS    72
+#define INITIAL_N       0x80
+
+#define _HYPHEN         0X2d
+#define DELIMITER       _HYPHEN
+
+#define _ZERO_          0X30
+#define _NINE           0x39
+
+#define _SMALL_A        0X61
+#define _SMALL_Z        0X7a
+
+#define _CAPITAL_A      0X41
+#define _CAPITAL_Z      0X5a
+
+#define IS_BASIC(c) ((c)<0x80)
+#define IS_BASIC_UPPERCASE(c) (_CAPITAL_A<=(c) && (c)<=_CAPITAL_Z)
+
+static inline char
+digitToBasic(int32_t digit, UBool uppercase) {
+    if(digit<26) {
+        if(uppercase) {
+            return static_cast<char>(_CAPITAL_A + digit);
+        } else {
+            return static_cast<char>(_SMALL_A + digit);
+        }
+    } else {
+        return static_cast<char>((_ZERO_ - 26) + digit);
+    }
+}
+
+static int32_t decodeDigit(int32_t cp) {
+    if(cp<=u'Z') {
+        if(cp<=u'9') {
+            if(cp<u'0') {
+                return -1;
+            } else {
+                return cp-u'0'+26;  
+            }
+        } else {
+            return cp-u'A';  
+        }
+    } else if(cp<=u'z') {
+        return cp-'a';  
+    } else {
+        return -1;
+    }
+}
+
+static inline char
+asciiCaseMap(char b, UBool uppercase) {
+    if(uppercase) {
+        if(_SMALL_A<=b && b<=_SMALL_Z) {
+            b-=(_SMALL_A-_CAPITAL_A);
+        }
+    } else {
+        if(_CAPITAL_A<=b && b<=_CAPITAL_Z) {
+            b+=(_SMALL_A-_CAPITAL_A);
+        }
+    }
+    return b;
+}
+
+
+
+static int32_t
+adaptBias(int32_t delta, int32_t length, UBool firstTime) {
+    int32_t count;
+
+    if(firstTime) {
+        delta/=DAMP;
+    } else {
+        delta/=2;
+    }
+
+    delta+=delta/length;
+    for(count=0; delta>((BASE-TMIN)*TMAX)/2; count+=BASE) {
+        delta/=(BASE-TMIN);
+    }
+
+    return count+(((BASE-TMIN+1)*delta)/(delta+SKEW));
+}
+
+namespace {
+
+constexpr int32_t ENCODE_MAX_CODE_UNITS=1000;
+constexpr int32_t DECODE_MAX_CHARS=2000;
+
+}  
+
+U_CAPI int32_t
+u_strToPunycode(const char16_t *src, int32_t srcLength,
+                char16_t *dest, int32_t destCapacity,
+                const UBool *caseFlags,
+                UErrorCode *pErrorCode) {
+
+    int32_t cpBuffer[ENCODE_MAX_CODE_UNITS];
+    int32_t n, delta, handledCPCount, basicLength, destLength, bias, j, m, q, k, t, srcCPCount;
+    char16_t c, c2;
+
+    if(pErrorCode==nullptr || U_FAILURE(*pErrorCode)) {
+        return 0;
+    }
+
+    if(src==nullptr || srcLength<-1 || destCapacity<0 || (dest==nullptr && destCapacity!=0)) {
+        *pErrorCode=U_ILLEGAL_ARGUMENT_ERROR;
+        return 0;
+    }
+    if (srcLength>ENCODE_MAX_CODE_UNITS) {
+        *pErrorCode=U_INPUT_TOO_LONG_ERROR;
+        return 0;
+    }
+
+    srcCPCount=destLength=0;
+    if(srcLength==-1) {
+        for(j=0; ; ++j) {
+            if((c=src[j])==0) {
+                break;
+            }
+            if(j>=ENCODE_MAX_CODE_UNITS) {
+                *pErrorCode=U_INPUT_TOO_LONG_ERROR;
+                return 0;
+            }
+            if(IS_BASIC(c)) {
+                cpBuffer[srcCPCount++]=0;
+                if(destLength<destCapacity) {
+                    dest[destLength]=
+                        caseFlags!=nullptr ?
+                            asciiCaseMap((char)c, caseFlags[j]) :
+                            (char)c;
+                }
+                ++destLength;
+            } else {
+                n=(caseFlags!=nullptr && caseFlags[j])<<31L;
+                if(U16_IS_SINGLE(c)) {
+                    n|=c;
+                } else if(U16_IS_LEAD(c) && U16_IS_TRAIL(c2=src[j+1])) {
+                    ++j;
+                    n|=(int32_t)U16_GET_SUPPLEMENTARY(c, c2);
+                } else {
+                    *pErrorCode=U_INVALID_CHAR_FOUND;
+                    return 0;
+                }
+                cpBuffer[srcCPCount++]=n;
+            }
+        }
+    } else {
+        for(j=0; j<srcLength; ++j) {
+            c=src[j];
+            if(IS_BASIC(c)) {
+                cpBuffer[srcCPCount++]=0;
+                if(destLength<destCapacity) {
+                    dest[destLength]=
+                        caseFlags!=nullptr ?
+                            asciiCaseMap((char)c, caseFlags[j]) :
+                            (char)c;
+                }
+                ++destLength;
+            } else {
+                n=(caseFlags!=nullptr && caseFlags[j])<<31L;
+                if(U16_IS_SINGLE(c)) {
+                    n|=c;
+                } else if(U16_IS_LEAD(c) && (j+1)<srcLength && U16_IS_TRAIL(c2=src[j+1])) {
+                    ++j;
+                    n|=(int32_t)U16_GET_SUPPLEMENTARY(c, c2);
+                } else {
+                    *pErrorCode=U_INVALID_CHAR_FOUND;
+                    return 0;
+                }
+                cpBuffer[srcCPCount++]=n;
+            }
+        }
+    }
+
+    basicLength=destLength;
+    if(basicLength>0) {
+        if(destLength<destCapacity) {
+            dest[destLength]=DELIMITER;
+        }
+        ++destLength;
+    }
+
+
+    n=INITIAL_N;
+    delta=0;
+    bias=INITIAL_BIAS;
+
+    for(handledCPCount=basicLength; handledCPCount<srcCPCount; ) {
+        for(m=0x7fffffff, j=0; j<srcCPCount; ++j) {
+            q=cpBuffer[j]&0x7fffffff; 
+            if(n<=q && q<m) {
+                m=q;
+            }
+        }
+
+        if(m-n>(0x7fffffff-handledCPCount-delta)/(handledCPCount+1)) {
+            *pErrorCode=U_INTERNAL_PROGRAM_ERROR;
+            return 0;
+        }
+        delta+=(m-n)*(handledCPCount+1);
+        n=m;
+
+        for(j=0; j<srcCPCount; ++j) {
+            q=cpBuffer[j]&0x7fffffff; 
+            if(q<n) {
+                ++delta;
+            } else if(q==n) {
+                for(q=delta, k=BASE; ; k+=BASE) {
+
+
+                    t=k-bias;
+                    if(t<TMIN) {
+                        t=TMIN;
+                    } else if(k>=(bias+TMAX)) {
+                        t=TMAX;
+                    }
+
+                    if(q<t) {
+                        break;
+                    }
+
+                    if(destLength<destCapacity) {
+                        dest[destLength]=digitToBasic(t+(q-t)%(BASE-t), 0);
+                    }
+                    ++destLength;
+                    q=(q-t)/(BASE-t);
+                }
+
+                if(destLength<destCapacity) {
+                    dest[destLength] = digitToBasic(q, cpBuffer[j] < 0);
+                }
+                ++destLength;
+                bias = adaptBias(delta, handledCPCount + 1, handledCPCount == basicLength);
+                delta=0;
+                ++handledCPCount;
+            }
+        }
+
+        ++delta;
+        ++n;
+    }
+
+    return u_terminateUChars(dest, destCapacity, destLength, pErrorCode);
+}
+
+U_CAPI int32_t
+u_strFromPunycode(const char16_t *src, int32_t srcLength,
+                  char16_t *dest, int32_t destCapacity,
+                  UBool *caseFlags,
+                  UErrorCode *pErrorCode) {
+    int32_t n, destLength, i, bias, basicLength, j, in, oldi, w, k, digit, t,
+            destCPCount, firstSupplementaryIndex, cpLength;
+    char16_t b;
+
+    if(pErrorCode==nullptr || U_FAILURE(*pErrorCode)) {
+        return 0;
+    }
+
+    if(src==nullptr || srcLength<-1 || (dest==nullptr && destCapacity!=0)) {
+        *pErrorCode=U_ILLEGAL_ARGUMENT_ERROR;
+        return 0;
+    }
+
+    if(srcLength==-1) {
+        srcLength=u_strlen(src);
+    }
+    if (srcLength>DECODE_MAX_CHARS) {
+        *pErrorCode=U_INPUT_TOO_LONG_ERROR;
+        return 0;
+    }
+
+    for(j=srcLength; j>0;) {
+        if(src[--j]==DELIMITER) {
+            break;
+        }
+    }
+    destLength=basicLength=destCPCount=j;
+    U_ASSERT(destLength>=0);
+
+    while(j>0) {
+        b=src[--j];
+        if(!IS_BASIC(b)) {
+            *pErrorCode=U_INVALID_CHAR_FOUND;
+            return 0;
+        }
+
+        if(j<destCapacity) {
+            dest[j] = b;
+
+            if(caseFlags!=nullptr) {
+                caseFlags[j]=IS_BASIC_UPPERCASE(b);
+            }
+        }
+    }
+
+    n=INITIAL_N;
+    i=0;
+    bias=INITIAL_BIAS;
+    firstSupplementaryIndex=1000000000;
+
+    for(in=basicLength>0 ? basicLength+1 : 0; in<srcLength; ) {
+        for(oldi=i, w=1, k=BASE; ; k+=BASE) {
+            if(in>=srcLength) {
+                *pErrorCode=U_ILLEGAL_CHAR_FOUND;
+                return 0;
+            }
+
+            digit=decodeDigit(src[in++]);
+            if(digit<0) {
+                *pErrorCode=U_INVALID_CHAR_FOUND;
+                return 0;
+            }
+            if(digit>(0x7fffffff-i)/w) {
+                *pErrorCode=U_ILLEGAL_CHAR_FOUND;
+                return 0;
+            }
+
+            i+=digit*w;
+            t=k-bias;
+            if(t<TMIN) {
+                t=TMIN;
+            } else if(k>=(bias+TMAX)) {
+                t=TMAX;
+            }
+            if(digit<t) {
+                break;
+            }
+
+            if(w>0x7fffffff/(BASE-t)) {
+                *pErrorCode=U_ILLEGAL_CHAR_FOUND;
+                return 0;
+            }
+            w*=BASE-t;
+        }
+
+        ++destCPCount;
+        bias = adaptBias(i - oldi, destCPCount, oldi == 0);
+
+        if(i/destCPCount>(0x7fffffff-n)) {
+            *pErrorCode=U_ILLEGAL_CHAR_FOUND;
+            return 0;
+        }
+
+        n+=i/destCPCount;
+        i%=destCPCount;
+
+        if(n>0x10ffff || U_IS_SURROGATE(n)) {
+            *pErrorCode=U_ILLEGAL_CHAR_FOUND;
+            return 0;
+        }
+
+        cpLength=U16_LENGTH(n);
+        if(dest!=nullptr && ((destLength+cpLength)<=destCapacity)) {
+            int32_t codeUnitIndex;
+
+            if(i<=firstSupplementaryIndex) {
+                codeUnitIndex=i;
+                if(cpLength>1) {
+                    firstSupplementaryIndex=codeUnitIndex;
+                } else {
+                    ++firstSupplementaryIndex;
+                }
+            } else {
+                codeUnitIndex=firstSupplementaryIndex;
+                U16_FWD_N(dest, codeUnitIndex, destLength, i-codeUnitIndex);
+            }
+
+            if(codeUnitIndex<destLength) {
+                uprv_memmove(dest+codeUnitIndex+cpLength,
+                             dest+codeUnitIndex,
+                             (destLength-codeUnitIndex)*U_SIZEOF_UCHAR);
+                if(caseFlags!=nullptr) {
+                    uprv_memmove(caseFlags+codeUnitIndex+cpLength,
+                                 caseFlags+codeUnitIndex,
+                                 destLength-codeUnitIndex);
+                }
+            }
+            if(cpLength==1) {
+                dest[codeUnitIndex]=(char16_t)n;
+            } else {
+                dest[codeUnitIndex]=U16_LEAD(n);
+                dest[codeUnitIndex+1]=U16_TRAIL(n);
+            }
+            if(caseFlags!=nullptr) {
+                caseFlags[codeUnitIndex]=IS_BASIC_UPPERCASE(src[in-1]);
+                if(cpLength==2) {
+                    caseFlags[codeUnitIndex+1]=false;
+                }
+            }
+        }
+        destLength+=cpLength;
+        U_ASSERT(destLength>=0);
+        ++i;
+    }
+
+    return u_terminateUChars(dest, destCapacity, destLength, pErrorCode);
+}
+
+
+#endif /* #if !UCONFIG_NO_IDNA */

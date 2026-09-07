@@ -1,0 +1,101 @@
+/*
+ * Copyright 2014 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkDrawable_DEFINED)
+#define SkDrawable_DEFINED
+
+#include "include/core/SkFlattenable.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkScalar.h"
+#include "include/private/base/SkAPI.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+
+class GrBackendDrawableInfo;
+class SkCanvas;
+class SkMatrix;
+class SkPicture;
+enum class GrBackendApi : unsigned int;
+struct SkDeserialProcs;
+struct SkIRect;
+struct SkImageInfo;
+struct SkRect;
+
+class SK_API SkDrawable : public SkFlattenable {
+public:
+    void draw(SkCanvas*, const SkMatrix* = nullptr);
+    void draw(SkCanvas*, SkScalar x, SkScalar y);
+
+
+    class GpuDrawHandler {
+    public:
+        virtual ~GpuDrawHandler() {}
+
+        virtual void draw(const GrBackendDrawableInfo&) {}
+    };
+
+    std::unique_ptr<GpuDrawHandler> snapGpuDrawHandler(GrBackendApi backendApi,
+                                                       const SkMatrix& matrix,
+                                                       const SkIRect& clipBounds,
+                                                       const SkImageInfo& bufferInfo) {
+        return this->onSnapGpuDrawHandler(backendApi, matrix, clipBounds, bufferInfo);
+    }
+
+    sk_sp<SkPicture> makePictureSnapshot();
+
+    uint32_t getGenerationID();
+
+    SkRect getBounds();
+
+    size_t approximateBytesUsed();
+
+    void notifyDrawingChanged();
+
+    static SkFlattenable::Type GetFlattenableType() {
+        return kSkDrawable_Type;
+    }
+
+    SkFlattenable::Type getFlattenableType() const override {
+        return kSkDrawable_Type;
+    }
+
+    static sk_sp<SkDrawable> Deserialize(const void* data, size_t size,
+                                          const SkDeserialProcs* procs = nullptr) {
+        return sk_sp<SkDrawable>(static_cast<SkDrawable*>(
+                                  SkFlattenable::Deserialize(
+                                  kSkDrawable_Type, data, size, procs).release()));
+    }
+
+    Factory getFactory() const override { return nullptr; }
+    const char* getTypeName() const override { return nullptr; }
+
+protected:
+    SkDrawable();
+
+    virtual SkRect onGetBounds() = 0;
+    virtual size_t onApproximateBytesUsed();
+    virtual void onDraw(SkCanvas*) = 0;
+
+    virtual std::unique_ptr<GpuDrawHandler> onSnapGpuDrawHandler(GrBackendApi, const SkMatrix&,
+                                                                 const SkIRect& ,
+                                                                 const SkImageInfo&) {
+        return nullptr;
+    }
+
+    virtual std::unique_ptr<GpuDrawHandler> onSnapGpuDrawHandler(GrBackendApi, const SkMatrix&) {
+        return nullptr;
+    }
+
+    virtual sk_sp<SkPicture> onMakePictureSnapshot();
+
+private:
+    int32_t fGenerationID;
+};
+
+#endif

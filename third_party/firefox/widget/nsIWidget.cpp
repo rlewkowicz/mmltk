@@ -1,0 +1,2859 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsIWidget.h"
+
+#include <utility>
+
+#include "GLConsts.h"
+#include "InputData.h"
+#include "LiveResizeListener.h"
+#include "SwipeTracker.h"
+#include "TouchEvents.h"
+#include "base/thread.h"
+#include "mozilla/GlobalKeyListener.h"
+#include "mozilla/IMEStateManager.h"
+#include "mozilla/Logging.h"
+#include "mozilla/MouseEvents.h"
+#include "mozilla/NativeKeyBindingsType.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/Sprintf.h"
+#include "mozilla/StaticPrefs_apz.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/StaticPrefs_gfx.h"
+#include "mozilla/StaticPrefs_layers.h"
+#include "mozilla/StaticPrefs_layout.h"
+#include "mozilla/TextEventDispatcher.h"
+#include "mozilla/TextEventDispatcherListener.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/VsyncDispatcher.h"
+#include "mozilla/dom/BrowserParent.h"
+#include "mozilla/dom/ContentChild.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/SimpleGestureEventBinding.h"
+#include "mozilla/gfx/2D.h"
+#include "mozilla/gfx/GPUProcessManager.h"
+#include "mozilla/gfx/gfxVars.h"
+#include "mozilla/layers/APZCCallbackHelper.h"
+#include "mozilla/layers/AsyncDragMetrics.h"
+#include "mozilla/layers/TouchActionHelper.h"
+#include "mozilla/layers/APZEventState.h"
+#include "mozilla/layers/APZInputBridge.h"
+#include "mozilla/layers/APZThreadUtils.h"
+#include "mozilla/layers/ChromeProcessController.h"
+#include "mozilla/layers/Compositor.h"
+#include "mozilla/layers/CompositorBridgeChild.h"
+#include "mozilla/layers/CompositorBridgeParent.h"
+#include "mozilla/layers/CompositorOptions.h"
+#include "mozilla/layers/IAPZCTreeManager.h"
+#include "mozilla/layers/ImageBridgeChild.h"
+#include "mozilla/layers/InputAPZContext.h"
+#include "mozilla/layers/WebRenderLayerManager.h"
+#include "mozilla/webrender/WebRenderTypes.h"
+#include "mozilla/widget/ScreenManager.h"
+#include "nsAppDirectoryServiceDefs.h"
+#include "nsBaseDragService.h"
+#include "nsCOMPtr.h"
+#include "nsContentUtils.h"
+#include "nsDeviceContext.h"
+#include "nsGfxCIID.h"
+#include "nsIAppWindow.h"
+#include "nsIBaseWindow.h"
+#include "nsIContent.h"
+#include "nsIDOMWindowUtils.h"
+#include "nsIScreenManager.h"
+#include "nsISimpleEnumerator.h"
+#include "nsIWidgetListener.h"
+#include "nsMenuPopupFrame.h"
+#include "nsRefPtrHashtable.h"
+#include "nsServiceManagerUtils.h"
+#include "nsWidgetsCID.h"
+#include "nsXULPopupManager.h"
+#include "prdtoa.h"
+#include "prenv.h"
+#if defined(ACCESSIBILITY)
+#  include "nsAccessibilityService.h"
+#endif
+#include "gfxConfig.h"
+#include "gfxUtils.h"  // for ToDeviceColor
+#include "mozilla/layers/CompositorSession.h"
+#include "gfxConfig.h"
+
+static mozilla::LazyLogModule sBaseWidgetLog("BaseWidget");
+
+#if defined(DEBUG)
+#  include "nsIObserver.h"
+
+static void debug_RegisterPrefCallbacks();
+
+#endif
+
+#if defined(NOISY_WIDGET_LEAKS)
+static int32_t gNumWidgets;
+#endif
+
+using namespace mozilla::dom;
+using namespace mozilla::layers;
+using namespace mozilla::ipc;
+using namespace mozilla::widget;
+using namespace mozilla;
+
+namespace mozilla::widget {
+
+class WidgetShutdownObserver final : public nsIObserver {
+  ~WidgetShutdownObserver() = default;
+
+ public:
+  explicit WidgetShutdownObserver(nsIWidget* aWidget);
+
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+
+  void Register();
+  void Unregister();
+
+  nsIWidget* mWidget;
+  bool mRegistered;
+};
+
+NS_IMPL_ISUPPORTS(WidgetShutdownObserver, nsIObserver)
+
+WidgetShutdownObserver::WidgetShutdownObserver(nsIWidget* aWidget)
+    : mWidget(aWidget), mRegistered(false) {
+  Register();
+}
+
+
+NS_IMETHODIMP
+WidgetShutdownObserver::Observe(nsISupports* aSubject, const char* aTopic,
+                                const char16_t* aData) {
+  if (!mWidget) {
+    return NS_OK;
+  }
+  if (!strcmp(aTopic, NS_XPCOM_SHUTDOWN_OBSERVER_ID)) {
+    RefPtr<nsIWidget> widget(mWidget);
+    widget->Shutdown();
+  } else if (!strcmp(aTopic, "quit-application")) {
+    RefPtr<nsIWidget> widget(mWidget);
+    widget->QuitIME();
+  }
+  return NS_OK;
+}
+
+void WidgetShutdownObserver::Register() {
+  if (!mRegistered) {
+    mRegistered = true;
+    nsContentUtils::RegisterShutdownObserver(this);
+
+    nsCOMPtr<nsIObserverService> observerService =
+        mozilla::services::GetObserverService();
+    if (observerService) {
+      observerService->AddObserver(this, "quit-application", false);
+    }
+  }
+}
+
+void WidgetShutdownObserver::Unregister() {
+  if (mRegistered) {
+    mWidget = nullptr;
+
+    nsCOMPtr<nsIObserverService> observerService =
+        mozilla::services::GetObserverService();
+    if (observerService) {
+      observerService->RemoveObserver(this, "quit-application");
+    }
+
+    nsContentUtils::UnregisterShutdownObserver(this);
+    mRegistered = false;
+  }
+}
+
+#define INTL_APP_LOCALES_CHANGED "intl:app-locales-changed"
+
+class LocalesChangedObserver final : public nsIObserver {
+  ~LocalesChangedObserver() = default;
+
+ public:
+  explicit LocalesChangedObserver(nsIWidget* aWidget);
+
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+
+  void Register();
+  void Unregister();
+
+  nsIWidget* mWidget;
+  bool mRegistered;
+};
+
+NS_IMPL_ISUPPORTS(LocalesChangedObserver, nsIObserver)
+
+LocalesChangedObserver::LocalesChangedObserver(nsIWidget* aWidget)
+    : mWidget(aWidget), mRegistered(false) {
+  Register();
+}
+
+NS_IMETHODIMP
+LocalesChangedObserver::Observe(nsISupports* aSubject, const char* aTopic,
+                                const char16_t* aData) {
+  if (!mWidget) {
+    return NS_OK;
+  }
+  if (!strcmp(aTopic, INTL_APP_LOCALES_CHANGED)) {
+    RefPtr<nsIWidget> widget(mWidget);
+    widget->LocalesChanged();
+  }
+  return NS_OK;
+}
+
+void LocalesChangedObserver::Register() {
+  if (mRegistered) {
+    return;
+  }
+
+  nsCOMPtr<nsIObserverService> obs = mozilla::services::GetObserverService();
+  if (obs) {
+    MOZ_ALWAYS_SUCCEEDS(
+        obs->AddObserver(this, INTL_APP_LOCALES_CHANGED, false));
+  }
+
+  RefPtr<nsIWidget> widget(mWidget);
+  widget->LocalesChanged();
+
+  mRegistered = true;
+}
+
+void LocalesChangedObserver::Unregister() {
+  if (!mRegistered) {
+    return;
+  }
+
+  nsCOMPtr<nsIObserverService> obs = mozilla::services::GetObserverService();
+  if (obs) {
+    obs->RemoveObserver(this, INTL_APP_LOCALES_CHANGED);
+  }
+
+  mWidget = nullptr;
+  mRegistered = false;
+}
+
+}  
+
+#define TOUCH_INJECT_PUMP_TIMER_MSEC 50
+#define TOUCH_INJECT_LONG_TAP_DEFAULT_MSEC 1500
+int32_t nsIWidget::sPointerIdCounter = 0;
+
+uint64_t AutoSynthesizedEventCallbackNotifier::sCallbackId = 0;
+constinit nsTHashMap<uint64_t, nsCOMPtr<nsISynthesizedEventCallback>>
+    AutoSynthesizedEventCallbackNotifier::sSavedCallbacks;
+
+const uint32_t kAsyncDragDropTimeout = 1000;
+
+NS_IMPL_ISUPPORTS(nsIWidget, nsIWidget, nsISupportsWeakReference)
+
+
+nsIWidget::nsIWidget() : nsIWidget(BorderStyle::None) {}
+
+nsIWidget::nsIWidget(BorderStyle aBorderStyle)
+    : mWidgetListener(nullptr),
+      mAttachedWidgetListener(nullptr),
+      mPreviouslyAttachedWidgetListener(nullptr),
+      mCompositorVsyncDispatcher(nullptr),
+      mBorderStyle(aBorderStyle),
+      mIsTiled(false),
+      mPopupLevel(PopupLevel::Top),
+      mPopupType(PopupType::Any),
+      mHasRemoteContent(false),
+      mUpdateCursor(true),
+      mIMEHasFocus(false),
+      mIMEHasQuit(false),
+      mIsFullyOccluded(false),
+      mNeedFastSnaphot(false),
+      mCurrentPanGestureBelongsToSwipe(false) {
+#if defined(NOISY_WIDGET_LEAKS)
+  gNumWidgets++;
+  printf("WIDGETS+ = %d\n", gNumWidgets);
+#endif
+
+#if defined(DEBUG)
+  debug_RegisterPrefCallbacks();
+#endif
+
+  mShutdownObserver = new WidgetShutdownObserver(this);
+}
+
+void nsIWidget::Shutdown() {
+  NotifyLiveResizeStopped();
+  DestroyCompositor();
+  FreeLocalesChangedObserver();
+  FreeShutdownObserver();
+}
+
+void nsIWidget::QuitIME() {
+  IMEStateManager::WidgetOnQuit(this);
+  this->mIMEHasQuit = true;
+}
+
+void nsIWidget::DestroyCompositor() {
+  RevokeTransactionIdAllocator();
+
+  if (mCompositorVsyncDispatcher) {
+    MOZ_ASSERT(mCompositorVsyncDispatcherLock.get());
+
+    MutexAutoLock lock(*mCompositorVsyncDispatcherLock.get());
+    mCompositorVsyncDispatcher->Shutdown();
+    mCompositorVsyncDispatcher = nullptr;
+  }
+
+  if (mCompositorSession) {
+    ReleaseContentController();
+    mAPZC = nullptr;
+    SetCompositorWidgetDelegate(nullptr);
+    mCompositorBridgeChild = nullptr;
+    mCompositorSession->Shutdown();
+    mCompositorSession = nullptr;
+  }
+}
+
+void nsIWidget::RevokeTransactionIdAllocator() {
+  if (!mWindowRenderer || !mWindowRenderer->AsWebRender()) {
+    return;
+  }
+  mWindowRenderer->AsWebRender()->SetTransactionIdAllocator(nullptr);
+}
+
+void nsIWidget::ReleaseContentController() {
+  if (mRootContentController) {
+    mRootContentController->Destroy();
+    mRootContentController = nullptr;
+  }
+}
+
+void nsIWidget::DestroyLayerManager() {
+  if (mWindowRenderer) {
+    mWindowRenderer->Destroy();
+    mWindowRenderer = nullptr;
+  }
+  DestroyCompositor();
+}
+
+void nsIWidget::OnRenderingDeviceReset() { DestroyLayerManager(); }
+
+void nsIWidget::FreeShutdownObserver() {
+  if (mShutdownObserver) {
+    mShutdownObserver->Unregister();
+  }
+  mShutdownObserver = nullptr;
+}
+
+void nsIWidget::EnsureLocalesChangedObserver() {
+  if (!mLocalesChangedObserver) {
+    mLocalesChangedObserver = new LocalesChangedObserver(this);
+  }
+}
+
+void nsIWidget::FreeLocalesChangedObserver() {
+  if (mLocalesChangedObserver) {
+    mLocalesChangedObserver->Unregister();
+  }
+  mLocalesChangedObserver = nullptr;
+}
+
+
+nsIWidget::~nsIWidget() {
+  if (mSwipeTracker) {
+    mSwipeTracker->Destroy();
+    mSwipeTracker = nullptr;
+  }
+
+  IMEStateManager::WidgetDestroyed(this);
+
+  FreeLocalesChangedObserver();
+  FreeShutdownObserver();
+  DestroyLayerManager();
+
+#if defined(NOISY_WIDGET_LEAKS)
+  gNumWidgets--;
+  printf("WIDGETS- = %d\n", gNumWidgets);
+#endif
+}
+
+void nsIWidget::BaseCreate(nsIWidget* aParent,
+                           const widget::InitData& aInitData) {
+  mWindowType = aInitData.mWindowType;
+  mBorderStyle = aInitData.mBorderStyle;
+  mPopupLevel = aInitData.mPopupLevel;
+  mPopupType = aInitData.mPopupHint;
+  mHasRemoteContent = aInitData.mHasRemoteContent;
+  mParent = aParent;
+  if (mParent) {
+    mParent->AddToChildList(this);
+  }
+}
+
+void nsIWidget::ClearParent() {
+  if (!mParent) {
+    return;
+  }
+  nsCOMPtr<nsIWidget> kungFuDeathGrip = this;
+  nsCOMPtr<nsIWidget> oldParent = mParent;
+  oldParent->RemoveFromChildList(this);
+  mParent = nullptr;
+  DidClearParent(oldParent);
+}
+
+void nsIWidget::RemoveAllChildren() {
+  while (nsCOMPtr<nsIWidget> kid = mLastChild) {
+    kid->ClearParent();
+    MOZ_ASSERT(kid != mLastChild);
+  }
+}
+
+nsIFrame* nsIWidget::GetFrame() const {
+  if (auto* popup = GetPopupFrame()) {
+    return popup;
+  }
+  if (auto* ps = GetPresShell()) {
+    return ps->GetRootFrame();
+  }
+  return nullptr;
+}
+
+nsMenuPopupFrame* nsIWidget::GetPopupFrame() const {
+  if (mWindowType != WindowType::Popup) {
+    return nullptr;
+  }
+  MOZ_ASSERT_IF(GetWidgetListener(),
+                GetWidgetListener()->GetAsMenuPopupFrame());
+  return static_cast<nsMenuPopupFrame*>(GetWidgetListener());
+}
+
+void nsIWidget::DynamicToolbarOffsetChanged(mozilla::ScreenIntCoord aOffset) {
+  if (mCompositorBridgeChild) {
+    mCompositorBridgeChild->SendDynamicToolbarOffsetChanged(aOffset);
+  }
+}
+
+LayoutDeviceIntRect nsIWidget::MaybeRoundToDisplayPixels(
+    const LayoutDeviceIntRect& aRect, TransparencyMode aTransparency,
+    int32_t aRound) {
+  if (aRound == 1) {
+    return aRect;
+  }
+
+  auto size = aTransparency == TransparencyMode::Opaque
+                  ? aRect.Size().TruncatedToMultiple(aRound)
+                  : aRect.Size().CeiledToMultiple(aRound);
+  (void)NS_WARN_IF(aTransparency == TransparencyMode::Opaque &&
+                   size != aRect.Size());
+  return {aRect.TopLeft().RoundedToMultiple(aRound), size};
+}
+
+
+already_AddRefed<nsIWidget> nsIWidget::CreateChild(
+    const LayoutDeviceIntRect& aRect, const widget::InitData& aInitData) {
+  MOZ_ASSERT(aInitData.mWindowType == WindowType::Popup,
+             "Creating non-popup puppet widget?");
+  nsCOMPtr<nsIWidget> widget;
+  switch (mWidgetType) {
+    case WidgetType::Native: {
+      widget = nsIWidget::CreateChildWindow();
+      break;
+    }
+    case WidgetType::Puppet: {
+      widget = nsIWidget::CreatePuppetWidget(nullptr);
+      break;
+    }
+  }
+
+  if (!widget) {
+    return nullptr;
+  }
+
+  if (mNeedFastSnaphot) {
+    widget->SetNeedFastSnaphot();
+  }
+
+  if (NS_FAILED(widget->Create(this, aRect, aInitData))) {
+    return nullptr;
+  }
+
+  return widget.forget();
+}
+
+void nsIWidget::Destroy() {
+  DestroyCompositor();
+
+  nsCOMPtr<nsIWidget> kungFuDeathGrip(this);
+  if (mParent) {
+    mParent->RemoveFromChildList(this);
+    mParent = nullptr;
+  }
+  RemoveAllChildren();
+}
+
+nsIWidget* nsIWidget::GetTopLevelWidget() {
+  auto* cur = this;
+  while (true) {
+    if (cur->IsTopLevelWidget()) {
+      break;
+    }
+    nsIWidget* parent = cur->GetParent();
+    if (!parent) {
+      break;
+    }
+    cur = parent;
+  }
+  return cur;
+}
+
+float nsIWidget::GetDPI() { return 96.0f; }
+
+void nsIWidget::NotifyAPZOfDPIChange() {
+  if (mAPZC) {
+    mAPZC->SetDPI(GetDPI());
+  }
+}
+
+CSSToLayoutDeviceScale nsIWidget::GetDefaultScale() {
+  double devPixelsPerCSSPixel = StaticPrefs::layout_css_devPixelsPerPx();
+
+  if (devPixelsPerCSSPixel <= 0.0) {
+    devPixelsPerCSSPixel = GetDefaultScaleInternal();
+  }
+
+  return CSSToLayoutDeviceScale(devPixelsPerCSSPixel);
+}
+
+nsIntSize nsIWidget::CustomCursorSize(const Cursor& aCursor) {
+  MOZ_ASSERT(aCursor.IsCustom());
+  int32_t width = 0;
+  int32_t height = 0;
+  aCursor.mContainer->GetWidth(&width);
+  aCursor.mContainer->GetHeight(&height);
+  aCursor.mResolution.ApplyTo(width, height);
+  return {width, height};
+}
+
+LayoutDeviceIntSize nsIWidget::NormalSizeModeClientToWindowSizeDifference() {
+  auto margin = NormalSizeModeClientToWindowMargin();
+  MOZ_ASSERT(margin.top >= 0, "Window should be bigger than client area");
+  MOZ_ASSERT(margin.left >= 0, "Window should be bigger than client area");
+  MOZ_ASSERT(margin.right >= 0, "Window should be bigger than client area");
+  MOZ_ASSERT(margin.bottom >= 0, "Window should be bigger than client area");
+  return {margin.LeftRight(), margin.TopBottom()};
+}
+
+nsEventStatus nsIWidget::DispatchEvent(WidgetGUIEvent* aEvent) {
+  if (mAttachedWidgetListener) {
+    return mAttachedWidgetListener->HandleEvent(aEvent);
+  }
+  if (mWidgetListener) {
+    return mWidgetListener->HandleEvent(aEvent);
+  }
+  return nsEventStatus_eIgnore;
+}
+
+RefPtr<mozilla::VsyncDispatcher> nsIWidget::GetVsyncDispatcher() {
+  return nullptr;
+}
+
+void nsIWidget::AddToChildList(nsIWidget* aChild) {
+  MOZ_ASSERT(!aChild->GetNextSibling() && !aChild->GetPrevSibling(),
+             "aChild not properly removed from its old child list");
+
+  if (!mFirstChild) {
+    mFirstChild = mLastChild = aChild;
+  } else {
+    MOZ_ASSERT(mLastChild);
+    MOZ_ASSERT(!mLastChild->GetNextSibling());
+    mLastChild->SetNextSibling(aChild);
+    aChild->SetPrevSibling(mLastChild);
+    mLastChild = aChild;
+  }
+}
+
+void nsIWidget::RemoveFromChildList(nsIWidget* aChild) {
+  MOZ_ASSERT(aChild->GetParent() == this, "Not one of our kids!");
+
+  if (mLastChild == aChild) {
+    mLastChild = mLastChild->GetPrevSibling();
+  }
+  if (mFirstChild == aChild) {
+    mFirstChild = mFirstChild->GetNextSibling();
+  }
+
+  nsIWidget* prev = aChild->GetPrevSibling();
+  nsIWidget* next = aChild->GetNextSibling();
+  if (prev) {
+    prev->SetNextSibling(next);
+  }
+  if (next) {
+    next->SetPrevSibling(prev);
+  }
+
+  aChild->SetNextSibling(nullptr);
+  aChild->SetPrevSibling(nullptr);
+}
+
+
+void nsIWidget::SetCursor(const Cursor& aCursor) { mCursor = aCursor; }
+
+void nsIWidget::SetCustomCursorAllowed(bool aIsAllowed) {
+  if (aIsAllowed != mCustomCursorAllowed) {
+    mCustomCursorAllowed = aIsAllowed;
+    mUpdateCursor = true;
+    SetCursor(mCursor);
+  }
+}
+
+
+void nsIWidget::SetTransparencyMode(TransparencyMode aMode) {}
+
+TransparencyMode nsIWidget::GetTransparencyMode() {
+  return TransparencyMode::Opaque;
+}
+
+void nsIWidget::PerformFullscreenTransition(FullscreenTransitionStage aStage,
+                                            uint16_t aDuration,
+                                            nsISupports* aData,
+                                            nsIRunnable* aCallback) {
+  MOZ_ASSERT_UNREACHABLE(
+      "Should never call PerformFullscreenTransition on nsIWidget");
+}
+
+void nsIWidget::InfallibleMakeFullScreen(bool aFullScreen) {
+#define MOZ_FORMAT_RECT(fmtstr) "[" fmtstr "," fmtstr " " fmtstr "x" fmtstr "]"
+#define MOZ_SPLAT_RECT(rect) \
+  (rect).X(), (rect).Y(), (rect).Width(), (rect).Height()
+
+  bool hasAdjustedOSChrome = false;
+  const auto adjustOSChrome = [&]() {
+    if (hasAdjustedOSChrome) {
+      MOZ_ASSERT_UNREACHABLE("window chrome should only be adjusted once");
+      return;
+    }
+    HideWindowChrome(aFullScreen);
+    hasAdjustedOSChrome = true;
+  };
+  const auto adjustChromeOnScopeExit = MakeScopeExit([&]() {
+    if (hasAdjustedOSChrome) {
+      return;
+    }
+
+    MOZ_LOG(sBaseWidgetLog, LogLevel::Warning,
+            ("window was not resized within InfallibleMakeFullScreen()"));
+
+    auto rect = GetBounds() / GetDesktopToDeviceScale();
+    adjustOSChrome();
+    Resize(rect, true);
+  });
+
+  const auto doReposition = [&](const DesktopRect& rect) -> void {
+    if (MOZ_LOG_TEST(sBaseWidgetLog, LogLevel::Debug)) {
+      const DesktopRect previousSize =
+          GetScreenBounds() / GetDesktopToDeviceScale();
+      MOZ_LOG(sBaseWidgetLog, LogLevel::Debug,
+              ("before resize: " MOZ_FORMAT_RECT("%f"),
+               MOZ_SPLAT_RECT(previousSize)));
+    }
+
+    adjustOSChrome();
+    Resize(rect, true);
+
+    if (MOZ_LOG_TEST(sBaseWidgetLog, LogLevel::Warning)) {
+      const gfx::RectTyped<DesktopPixel, float> rectAsFloat{rect};
+
+
+      const auto postResizeRectRaw = GetScreenBounds();
+      const auto postResizeRect = postResizeRectRaw / GetDesktopToDeviceScale();
+      const bool succeeded = postResizeRect.WithinEpsilonOf(rectAsFloat, 0.01);
+
+      if (succeeded) {
+        MOZ_LOG(sBaseWidgetLog, LogLevel::Debug,
+                ("resized to: " MOZ_FORMAT_RECT("%f"),
+                 MOZ_SPLAT_RECT(rectAsFloat)));
+      } else {
+        MOZ_LOG(sBaseWidgetLog, LogLevel::Warning,
+                ("attempted to resize to: " MOZ_FORMAT_RECT("%f"),
+                 MOZ_SPLAT_RECT(rectAsFloat)));
+        MOZ_LOG(sBaseWidgetLog, LogLevel::Warning,
+                ("... but ended up at: " MOZ_FORMAT_RECT("%f"),
+                 MOZ_SPLAT_RECT(postResizeRect)));
+      }
+
+      MOZ_LOG(
+          sBaseWidgetLog, LogLevel::Verbose,
+          ("(... which, before DPI adjustment, is:" MOZ_FORMAT_RECT("%d") ")",
+           MOZ_SPLAT_RECT(postResizeRectRaw)));
+    }
+  };
+
+  if (aFullScreen) {
+    if (!mSavedBounds) {
+      mSavedBounds = Some(FullscreenSavedState());
+    }
+    mSavedBounds->windowRect = GetScreenBounds() / GetDesktopToDeviceScale();
+
+    nsCOMPtr<nsIScreen> screen = GetWidgetScreen();
+    if (!screen) {
+      return;
+    }
+
+    doReposition(DesktopRect(screen->GetRectDisplayPix()));
+    mSavedBounds->screenRect = GetScreenBounds() / GetDesktopToDeviceScale();
+  } else {
+    if (!mSavedBounds) {
+      MOZ_ASSERT(false, "fullscreen window did not have saved position");
+      return;
+    }
+
+
+    const DesktopRect currentWinRect =
+        GetScreenBounds() / GetDesktopToDeviceScale();
+
+    if (currentWinRect == DesktopRect(mSavedBounds->screenRect)) {
+      MOZ_LOG(sBaseWidgetLog, LogLevel::Debug,
+              ("no location change detected; returning to saved location"));
+      doReposition(mSavedBounds->windowRect);
+      return;
+    }
+
+
+    MOZ_LOG(sBaseWidgetLog, LogLevel::Debug,
+            ("location change detected; computing new destination"));
+
+    const auto splat = [](auto rect) {
+      return std::tuple(rect.X(), rect.Y(), rect.Width(), rect.Height());
+    };
+
+    using Range = std::pair<float, float>;
+    const auto remap = [](Range dst, Range src, float val) {
+      const auto lerp = [](float lo, float hi, float t) {
+        return lo + t * (hi - lo);
+      };
+      const auto invlerp = [](float lo, float hi, float mid) {
+        return (mid - lo) / (hi - lo);
+      };
+
+      const auto [dst_a, dst_b] = dst;
+      const auto [src_a, src_b] = src;
+      return lerp(dst_a, dst_b, invlerp(src_a, src_b, val));
+    };
+
+    const auto [px, py, pw, ph] = splat(mSavedBounds->windowRect);
+    const auto [sx, sy, sw, sh] = splat(mSavedBounds->screenRect);
+    const auto [tx, ty, tw, th] = splat(currentWinRect);
+
+    const float nx = remap({tx, tx + tw}, {sx, sx + sw}, px);
+    const float ny = remap({ty, ty + th}, {sy, sy + sh}, py);
+    const float nw = remap({0, tw}, {0, sw}, pw);
+    const float nh = remap({0, th}, {0, sh}, ph);
+
+    doReposition(DesktopRect{nx, ny, nw, nh});
+  }
+
+#undef MOZ_SPLAT_RECT
+#undef MOZ_FORMAT_RECT
+}
+
+nsresult nsIWidget::MakeFullScreen(bool aFullScreen) {
+  InfallibleMakeFullScreen(aFullScreen);
+  return NS_OK;
+}
+
+nsIWidget::AutoLayerManagerSetup::AutoLayerManagerSetup(nsIWidget* aWidget,
+                                                        gfxContext* aTarget)
+    : mWidget(aWidget) {
+  WindowRenderer* renderer = mWidget->GetWindowRenderer();
+  if (auto* fallback = renderer->AsFallback()) {
+    mRenderer = fallback;
+    mRenderer->SetTarget(aTarget);
+  }
+}
+
+nsIWidget::AutoLayerManagerSetup::~AutoLayerManagerSetup() {
+  if (mRenderer) {
+    mRenderer->SetTarget(nullptr);
+  }
+}
+
+bool nsIWidget::IsSmallPopup() const {
+  return mWindowType == WindowType::Popup && mPopupType != PopupType::Panel;
+}
+
+bool nsIWidget::ComputeShouldAccelerate() {
+  return gfx::gfxConfig::IsEnabled(gfx::Feature::HW_COMPOSITING) &&
+         (WidgetTypeSupportsAcceleration() ||
+          StaticPrefs::gfx_webrender_unaccelerated_widget_force());
+}
+
+bool nsIWidget::UseAPZ() const {
+  if (!gfxPlatform::AsyncPanZoomEnabled()) {
+    return false;
+  }
+
+  if (mWindowType == WindowType::TopLevel) {
+    return true;
+  }
+
+  if (mWindowType == WindowType::Popup && mPopupType == PopupType::Tooltip) {
+    return false;
+  }
+
+  if (!StaticPrefs::apz_popups_enabled()) {
+    return false;
+  }
+
+  if (HasRemoteContent()) {
+    return mWindowType == WindowType::Dialog ||
+           mWindowType == WindowType::Popup;
+  }
+
+  if (StaticPrefs::apz_popups_without_remote_enabled()) {
+    return mWindowType == WindowType::Popup;
+  }
+
+  return false;
+}
+
+void nsIWidget::CreateCompositor() {
+  LayoutDeviceIntRect rect = GetBounds();
+  CreateCompositor(rect.Width(), rect.Height());
+}
+
+void nsIWidget::PauseOrResumeCompositor(bool aPause) {
+  auto* renderer = GetRemoteRenderer();
+  if (!renderer) {
+    return;
+  }
+  if (aPause) {
+    renderer->SendPause();
+  } else {
+    renderer->SendResume();
+  }
+}
+
+already_AddRefed<GeckoContentController>
+nsIWidget::CreateRootContentController() {
+  auto controller =
+      MakeRefPtr<ChromeProcessController>(this, mAPZEventState, mAPZC);
+  return controller.forget();
+}
+
+void nsIWidget::ConfigureAPZCTreeManager() {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(mAPZC);
+
+  mAPZC->SetDPI(GetDPI());
+
+  if (StaticPrefs::apz_keyboard_enabled_AtStartup()) {
+    KeyboardMap map = RootWindowGlobalKeyListener::CollectKeyboardShortcuts();
+    mAPZC->SetKeyboardMap(map);
+  }
+
+  ContentReceivedInputBlockCallback callback(
+      [treeManager = RefPtr{mAPZC.get()}](uint64_t aInputBlockId,
+                                          bool aPreventDefault) {
+        MOZ_ASSERT(NS_IsMainThread());
+        treeManager->ContentReceivedInputBlock(aInputBlockId, aPreventDefault);
+      });
+  mAPZEventState = new APZEventState(this, std::move(callback));
+
+  mRootContentController = CreateRootContentController();
+  if (mRootContentController) {
+    mCompositorSession->SetContentController(mRootContentController);
+  }
+
+  if (StaticPrefs::dom_w3c_touch_events_enabled()) {
+    RegisterTouchWindow();
+  }
+}
+
+void nsIWidget::ConfigureAPZControllerThread() {
+  APZThreadUtils::SetControllerThread(NS_GetCurrentThread());
+}
+
+void nsIWidget::SetConfirmedTargetAPZC(
+    uint64_t aInputBlockId,
+    const nsTArray<ScrollableLayerGuid>& aTargets) const {
+  mAPZC->SetTargetAPZC(aInputBlockId, aTargets);
+}
+
+void nsIWidget::UpdateZoomConstraints(
+    const uint32_t& aPresShellId, const ScrollableLayerGuid::ViewID& aViewId,
+    const Maybe<ZoomConstraints>& aConstraints) {
+  if (!mCompositorSession || !mAPZC) {
+    MOZ_ASSERT_IF(mInitialZoomConstraints,
+                  mInitialZoomConstraints->mViewID == aViewId);
+    if (aConstraints) {
+      mInitialZoomConstraints = Some(
+          InitialZoomConstraints(aPresShellId, aViewId, aConstraints.ref()));
+    } else {
+      mInitialZoomConstraints.reset();
+    }
+    return;
+  }
+  LayersId layersId = mCompositorSession->RootLayerTreeId();
+  mAPZC->UpdateZoomConstraints(
+      ScrollableLayerGuid(layersId, aPresShellId, aViewId), aConstraints);
+}
+
+bool nsIWidget::AsyncPanZoomEnabled() const { return !!mAPZC; }
+
+nsEventStatus nsIWidget::ProcessUntransformedAPZEvent(
+    WidgetInputEvent* aEvent, const APZEventResult& aApzResult) {
+  MOZ_ASSERT(NS_IsMainThread());
+  ScrollableLayerGuid targetGuid = aApzResult.mTargetGuid;
+  uint64_t inputBlockId = aApzResult.mInputBlockId;
+  InputAPZContext context(aApzResult.mTargetGuid, inputBlockId,
+                          aApzResult.GetStatus());
+
+  UniquePtr<WidgetEvent> original(aEvent->Duplicate());
+  nsEventStatus status = DispatchEvent(aEvent);
+
+  if (mAPZC && !InputAPZContext::WasRoutedToChildProcess() &&
+      !InputAPZContext::WasDropped() && inputBlockId) {
+    LayersId rootLayersId = mCompositorSession->RootLayerTreeId();
+
+    RefPtr<DisplayportSetListener> postLayerization;
+    if (WidgetTouchEvent* touchEvent = aEvent->AsTouchEvent()) {
+      nsTArray<TouchBehaviorFlags> allowedTouchBehaviors;
+      if (touchEvent->mMessage == eTouchStart) {
+        auto& originalEvent = *original->AsTouchEvent();
+        MOZ_ASSERT(NS_IsMainThread());
+        allowedTouchBehaviors = TouchActionHelper::GetAllowedTouchBehavior(
+            this, GetDocument(), originalEvent);
+        if (!allowedTouchBehaviors.IsEmpty()) {
+          mAPZC->SetAllowedTouchBehavior(inputBlockId, allowedTouchBehaviors);
+        }
+        postLayerization = APZCCallbackHelper::SendSetTargetAPZCNotification(
+            this, GetDocument(), originalEvent, rootLayersId, inputBlockId);
+      }
+      mAPZEventState->ProcessTouchEvent(*touchEvent, targetGuid, inputBlockId,
+                                        aApzResult.GetStatus(), status,
+                                        std::move(allowedTouchBehaviors));
+    } else if (WidgetWheelEvent* wheelEvent = aEvent->AsWheelEvent()) {
+      MOZ_ASSERT(wheelEvent->mFlags.mHandledByAPZ);
+      postLayerization = APZCCallbackHelper::SendSetTargetAPZCNotification(
+          this, GetDocument(), *original->AsWheelEvent(), rootLayersId,
+          inputBlockId);
+      if (wheelEvent->mCanTriggerSwipe) {
+        ReportSwipeStarted(inputBlockId, wheelEvent->TriggersSwipe());
+      }
+      mAPZEventState->ProcessWheelEvent(*wheelEvent, inputBlockId);
+    } else if (WidgetMouseEvent* mouseEvent = aEvent->AsMouseEvent()) {
+      MOZ_ASSERT(mouseEvent->mFlags.mHandledByAPZ);
+      postLayerization = APZCCallbackHelper::SendSetTargetAPZCNotification(
+          this, GetDocument(), *original->AsMouseEvent(), rootLayersId,
+          inputBlockId);
+      mAPZEventState->ProcessMouseEvent(*mouseEvent, inputBlockId);
+    }
+    if (postLayerization) {
+      postLayerization->Register();
+    }
+  }
+
+  return status;
+}
+
+template <class InputType, class EventType>
+class DispatchEventOnMainThread : public Runnable {
+ public:
+  DispatchEventOnMainThread(const InputType& aInput, nsIWidget* aWidget,
+                            const APZEventResult& aAPZResult)
+      : mozilla::Runnable("DispatchEventOnMainThread"),
+        mInput(aInput),
+        mWidget(aWidget),
+        mAPZResult(aAPZResult) {}
+
+  NS_IMETHOD Run() override {
+    EventType event = mInput.ToWidgetEvent(mWidget);
+    mWidget->ProcessUntransformedAPZEvent(&event, mAPZResult);
+    if (event.mCallbackId.isSome()) {
+      mozilla::widget::AutoSynthesizedEventCallbackNotifier::
+          NotifySavedCallback(event.mCallbackId.ref());
+    }
+    return NS_OK;
+  }
+
+ private:
+  InputType mInput;
+  nsIWidget* mWidget;
+  APZEventResult mAPZResult;
+};
+
+template <>
+NS_IMETHODIMP DispatchEventOnMainThread<MouseInput, WidgetMouseEvent>::Run() {
+  MOZ_ASSERT(
+      !mInput.IsPointerEventType(),
+      "Please use DispatchEventOnMainThread<MouseInput, WidgetPointerEvent>");
+  WidgetMouseEvent event = mInput.ToWidgetEvent<WidgetMouseEvent>(mWidget);
+  mWidget->ProcessUntransformedAPZEvent(&event, mAPZResult);
+  if (event.mCallbackId.isSome()) {
+    mozilla::widget::AutoSynthesizedEventCallbackNotifier::NotifySavedCallback(
+        event.mCallbackId.ref());
+  }
+  return NS_OK;
+}
+
+template <>
+NS_IMETHODIMP DispatchEventOnMainThread<MouseInput, WidgetPointerEvent>::Run() {
+  MOZ_ASSERT(
+      mInput.IsPointerEventType(),
+      "Please use DispatchEventOnMainThread<MouseInput, WidgetMouseEvent>");
+  WidgetPointerEvent event = mInput.ToWidgetEvent<WidgetPointerEvent>(mWidget);
+  mWidget->ProcessUntransformedAPZEvent(&event, mAPZResult);
+  if (event.mCallbackId.isSome()) {
+    mozilla::widget::AutoSynthesizedEventCallbackNotifier::NotifySavedCallback(
+        event.mCallbackId.ref());
+  }
+  return NS_OK;
+}
+
+template <class InputType, class EventType>
+class DispatchInputOnControllerThread : public Runnable {
+ public:
+  enum class APZOnly { Yes, No };
+  DispatchInputOnControllerThread(const EventType& aEvent,
+                                  IAPZCTreeManager* aAPZC, nsIWidget* aWidget,
+                                  APZOnly aAPZOnly = APZOnly::No)
+      : mozilla::Runnable("DispatchInputOnControllerThread"),
+        mMainMessageLoop(MessageLoop::current()),
+        mInput(aEvent),
+        mAPZC(aAPZC),
+        mWidget(aWidget),
+        mAPZOnly(aAPZOnly) {}
+
+  NS_IMETHOD Run() override {
+    APZEventResult result = mAPZC->InputBridge()->ReceiveInputEvent(mInput);
+    if (mAPZOnly == APZOnly::Yes ||
+        result.GetStatus() == nsEventStatus_eConsumeNoDefault) {
+      if (mInput.mCallbackId.isSome()) {
+        mozilla::widget::AutoSynthesizedEventCallbackNotifier::
+            NotifySavedCallback(mInput.mCallbackId.ref());
+      }
+      return NS_OK;
+    }
+    RefPtr<Runnable> r = new DispatchEventOnMainThread<InputType, EventType>(
+        mInput, mWidget, result);
+    mMainMessageLoop->PostTask(r.forget());
+    return NS_OK;
+  }
+
+ private:
+  MessageLoop* mMainMessageLoop;
+  InputType mInput;
+  RefPtr<IAPZCTreeManager> mAPZC;
+  nsIWidget* mWidget;
+  const APZOnly mAPZOnly;
+};
+
+void nsIWidget::DispatchTouchInput(MultiTouchInput& aInput) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aInput.mInputSource ==
+                 mozilla::dom::MouseEvent_Binding::MOZ_SOURCE_TOUCH ||
+             aInput.mInputSource ==
+                 mozilla::dom::MouseEvent_Binding::MOZ_SOURCE_PEN);
+  if (mAPZC) {
+    MOZ_ASSERT(APZThreadUtils::IsControllerThread());
+
+    APZEventResult result = mAPZC->InputBridge()->ReceiveInputEvent(aInput);
+    if (result.GetStatus() == nsEventStatus_eConsumeNoDefault) {
+      return;
+    }
+
+    WidgetTouchEvent event = aInput.ToWidgetEvent(this);
+    ProcessUntransformedAPZEvent(&event, result);
+  } else {
+    WidgetTouchEvent event = aInput.ToWidgetEvent(this);
+    DispatchEvent(&event);
+  }
+}
+
+void nsIWidget::DispatchPanGestureInput(PanGestureInput& aInput) {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (mAPZC) {
+    MOZ_ASSERT(APZThreadUtils::IsControllerThread());
+
+    APZEventResult result = mAPZC->InputBridge()->ReceiveInputEvent(aInput);
+    if (result.GetStatus() == nsEventStatus_eConsumeNoDefault) {
+      return;
+    }
+
+    WidgetWheelEvent event = aInput.ToWidgetEvent(this);
+    ProcessUntransformedAPZEvent(&event, result);
+  } else {
+    WidgetWheelEvent event = aInput.ToWidgetEvent(this);
+    DispatchEvent(&event);
+  }
+}
+
+void nsIWidget::DispatchPinchGestureInput(PinchGestureInput& aInput) {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (mAPZC) {
+    MOZ_ASSERT(APZThreadUtils::IsControllerThread());
+    APZEventResult result = mAPZC->InputBridge()->ReceiveInputEvent(aInput);
+
+    if (result.GetStatus() == nsEventStatus_eConsumeNoDefault) {
+      return;
+    }
+    WidgetWheelEvent event = aInput.ToWidgetEvent(this);
+    ProcessUntransformedAPZEvent(&event, result);
+  } else {
+    WidgetWheelEvent event = aInput.ToWidgetEvent(this);
+    DispatchEvent(&event);
+  }
+}
+
+nsIWidget::ContentAndAPZEventStatus nsIWidget::DispatchInputEvent(
+    WidgetInputEvent* aEvent) {
+  nsIWidget::ContentAndAPZEventStatus status;
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (mAPZC) {
+    if (APZThreadUtils::IsControllerThread()) {
+      APZEventResult result = mAPZC->InputBridge()->ReceiveInputEvent(*aEvent);
+      status.mApzStatus = result.GetStatus();
+      if (result.GetStatus() == nsEventStatus_eConsumeNoDefault) {
+        return status;
+      }
+      status.mContentStatus = ProcessUntransformedAPZEvent(aEvent, result);
+      return status;
+    }
+    const bool canDispatchToApzc =
+        !aEvent->AsDragEvent() ||
+        aEvent->AsDragEvent()->CanConvertToInputData();
+    if (canDispatchToApzc) {
+      if (WidgetWheelEvent* wheelEvent = aEvent->AsWheelEvent()) {
+        RefPtr<Runnable> r =
+            new DispatchInputOnControllerThread<ScrollWheelInput,
+                                                WidgetWheelEvent>(*wheelEvent,
+                                                                  mAPZC, this);
+        wheelEvent->mCallbackId.reset();
+        APZThreadUtils::RunOnControllerThread(std::move(r));
+        status.mContentStatus = nsEventStatus_eConsumeDoDefault;
+        return status;
+      }
+      if (WidgetPointerEvent* pointerEvent = aEvent->AsPointerEvent()) {
+        MOZ_ASSERT(aEvent->mMessage == eContextMenu);
+        RefPtr<Runnable> r =
+            new DispatchInputOnControllerThread<MouseInput, WidgetPointerEvent>(
+                *pointerEvent, mAPZC, this);
+        pointerEvent->mCallbackId.reset();
+        APZThreadUtils::RunOnControllerThread(std::move(r));
+        status.mContentStatus = nsEventStatus_eConsumeDoDefault;
+        return status;
+      }
+      if (WidgetMouseEvent* mouseEvent = aEvent->AsMouseEvent()) {
+        RefPtr<Runnable> r =
+            new DispatchInputOnControllerThread<MouseInput, WidgetMouseEvent>(
+                *mouseEvent, mAPZC, this);
+        mouseEvent->mCallbackId.reset();
+        APZThreadUtils::RunOnControllerThread(std::move(r));
+        status.mContentStatus = nsEventStatus_eConsumeDoDefault;
+        return status;
+      }
+      if (WidgetTouchEvent* touchEvent = aEvent->AsTouchEvent()) {
+        RefPtr<Runnable> r =
+            new DispatchInputOnControllerThread<MultiTouchInput,
+                                                WidgetTouchEvent>(*touchEvent,
+                                                                  mAPZC, this);
+        touchEvent->mCallbackId.reset();
+        APZThreadUtils::RunOnControllerThread(std::move(r));
+        status.mContentStatus = nsEventStatus_eConsumeDoDefault;
+        return status;
+      }
+
+      MOZ_ASSERT(aEvent->AsKeyboardEvent() || aEvent->AsDragEvent());
+    }
+  }
+
+  status.mContentStatus = DispatchEvent(aEvent);
+  return status;
+}
+
+void nsIWidget::DispatchEventToAPZOnly(mozilla::WidgetInputEvent* aEvent) {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (mAPZC) {
+    if (APZThreadUtils::IsControllerThread()) {
+      mAPZC->InputBridge()->ReceiveInputEvent(*aEvent);
+      return;
+    }
+
+    if (WidgetMouseEvent* mouseEvent = aEvent->AsMouseEvent()) {
+      RefPtr<Runnable> r =
+          new DispatchInputOnControllerThread<MouseInput, WidgetMouseEvent>(
+              *mouseEvent, mAPZC, this,
+              DispatchInputOnControllerThread<MouseInput,
+                                              WidgetMouseEvent>::APZOnly::Yes);
+      APZThreadUtils::RunOnControllerThread(std::move(r));
+      return;
+    }
+
+    MOZ_ASSERT_UNREACHABLE("Not implemented yet");
+  }
+}
+
+bool nsIWidget::DispatchWindowEvent(WidgetGUIEvent& event) {
+  return ConvertStatus(DispatchEvent(&event));
+}
+
+Document* nsIWidget::GetDocument() const {
+  if (mWidgetListener) {
+    if (PresShell* presShell = mWidgetListener->GetPresShell()) {
+      return presShell->GetDocument();
+    }
+  }
+  return nullptr;
+}
+
+void nsIWidget::CreateCompositorVsyncDispatcher() {
+  if (XRE_IsParentProcess()) {
+    if (!mCompositorVsyncDispatcherLock) {
+      mCompositorVsyncDispatcherLock =
+          MakeUnique<Mutex>("mCompositorVsyncDispatcherLock");
+    }
+    MutexAutoLock lock(*mCompositorVsyncDispatcherLock.get());
+    if (!mCompositorVsyncDispatcher) {
+      RefPtr<VsyncDispatcher> vsyncDispatcher =
+          gfxPlatform::GetPlatform()->GetGlobalVsyncDispatcher();
+      mCompositorVsyncDispatcher =
+          new CompositorVsyncDispatcher(std::move(vsyncDispatcher));
+    }
+  }
+}
+
+already_AddRefed<CompositorVsyncDispatcher>
+nsIWidget::GetCompositorVsyncDispatcher() {
+  MOZ_ASSERT(mCompositorVsyncDispatcherLock.get());
+
+  MutexAutoLock lock(*mCompositorVsyncDispatcherLock.get());
+  RefPtr<CompositorVsyncDispatcher> dispatcher = mCompositorVsyncDispatcher;
+  return dispatcher.forget();
+}
+
+already_AddRefed<WebRenderLayerManager> nsIWidget::CreateCompositorSession(
+    int aWidth, int aHeight, CompositorOptions* aOptionsOut) {
+  MOZ_ASSERT(aOptionsOut);
+
+  do {
+    CreateCompositorVsyncDispatcher();
+
+    gfx::GPUProcessManager* gpm = gfx::GPUProcessManager::Get();
+    if (NS_WARN_IF(!gpm) || NS_WARN_IF(NS_FAILED(gpm->EnsureGPUReady()))) {
+      return nullptr;
+    }
+
+    bool supportsAcceleration = WidgetTypeSupportsAcceleration();
+    MOZ_RELEASE_ASSERT(supportsAcceleration,
+                       "Hardware acceleration is required");
+    bool enableAPZ = UseAPZ();
+    CompositorOptions options(enableAPZ);
+
+#if defined(MOZ_WIDGET_GTK)
+    options.SetAllowNativeCompositor(WidgetTypeSupportsNativeCompositing());
+#endif
+
+    options.SetInitiallyPaused(CompositorInitiallyPaused());
+
+    uint64_t innerWindowId = 0;
+    if (Document* doc = GetDocument()) {
+      innerWindowId = doc->InnerWindowID();
+    }
+
+    bool retry = false;
+    mCompositorSession = gpm->CreateTopLevelCompositor(
+        this, GetDefaultScale(), options, UseExternalCompositingSurface(),
+        gfx::IntSize(aWidth, aHeight), innerWindowId, &retry);
+
+    RefPtr<WebRenderLayerManager> lm;
+    if (mCompositorSession) {
+      nsCString error;
+      TextureFactoryIdentifier textureFactoryIdentifier;
+      lm = mCompositorSession->GetCompositorBridgeChild()->CreateLayerManager(
+          this, wr::AsPipelineId(mCompositorSession->RootLayerTreeId()), error);
+      if (lm) {
+        lm->Initialize(&textureFactoryIdentifier, error);
+      }
+      if (textureFactoryIdentifier.mParentBackend != LayersBackend::LAYERS_WR) {
+        retry = true;
+        DestroyCompositor();
+        gpm->DisableWebRender(wr::WebRenderError::INITIALIZE, error);
+      }
+    }
+
+    if (mCompositorSession || !retry) {
+      *aOptionsOut = options;
+      return lm.forget();
+    }
+  } while (true);
+}
+
+void nsIWidget::CreateCompositor(int aWidth, int aHeight) {
+  gfxPlatform::GetPlatform();
+
+  MOZ_ASSERT(gfxPlatform::UsesOffMainThreadCompositing(),
+             "This function assumes OMTC");
+
+  MOZ_ASSERT(!mCompositorSession && !mCompositorBridgeChild,
+             "Should have properly cleaned up the previous PCompositor pair "
+             "beforehand");
+
+  if (mCompositorBridgeChild) {
+    mCompositorBridgeChild->Destroy();
+  }
+
+
+  if (!mShutdownObserver) {
+    return;
+  }
+
+  ConfigureAPZControllerThread();
+
+  CompositorOptions options;
+  RefPtr<WebRenderLayerManager> lm =
+      CreateCompositorSession(aWidth, aHeight, &options);
+  if (!lm) {
+    return;
+  }
+
+  MOZ_ASSERT(mCompositorSession);
+  mCompositorBridgeChild = mCompositorSession->GetCompositorBridgeChild();
+  SetCompositorWidgetDelegate(
+      mCompositorSession->GetCompositorWidgetDelegate());
+
+  if (options.UseAPZ()) {
+    mAPZC = mCompositorSession->GetAPZCTreeManager();
+    ConfigureAPZCTreeManager();
+  } else {
+    mAPZC = nullptr;
+  }
+
+  if (mInitialZoomConstraints) {
+    UpdateZoomConstraints(mInitialZoomConstraints->mPresShellID,
+                          mInitialZoomConstraints->mViewID,
+                          Some(mInitialZoomConstraints->mConstraints));
+    mInitialZoomConstraints.reset();
+  }
+
+  TextureFactoryIdentifier textureFactoryIdentifier =
+      lm->GetTextureFactoryIdentifier();
+  MOZ_ASSERT(textureFactoryIdentifier.mParentBackend ==
+             LayersBackend::LAYERS_WR);
+  ImageBridgeChild::IdentifyCompositorTextureHost(textureFactoryIdentifier);
+
+  WindowUsesOMTC();
+
+  mWindowRenderer = std::move(lm);
+
+  bool getCompositorFromThisWindow = mWindowType == WindowType::TopLevel;
+
+  if (getCompositorFromThisWindow) {
+    gfxPlatform::GetPlatform()->NotifyCompositorCreated(
+        mWindowRenderer->GetCompositorBackendType());
+  }
+}
+
+void nsIWidget::NotifyCompositorSessionLost(CompositorSession* aSession) {
+  MOZ_ASSERT(aSession == mCompositorSession);
+  DestroyLayerManager();
+}
+
+bool nsIWidget::ShouldUseOffMainThreadCompositing() {
+  return gfxPlatform::UsesOffMainThreadCompositing();
+}
+
+WindowRenderer* nsIWidget::GetWindowRenderer() {
+  if (!mWindowRenderer) {
+    if (!mShutdownObserver) {
+      return nullptr;
+    }
+    if (ShouldUseOffMainThreadCompositing()) {
+      CreateCompositor();
+    }
+
+    if (!mWindowRenderer) {
+      mWindowRenderer = CreateFallbackRenderer();
+    }
+  }
+  return mWindowRenderer;
+}
+
+already_AddRefed<WindowRenderer> nsIWidget::CreateFallbackRenderer() {
+  return MakeAndAddRef<DefaultFallbackRenderer>();
+}
+
+already_AddRefed<WindowRenderer>
+nsIWidget::CreateBackgroundedFallbackRenderer() {
+  return MakeAndAddRef<BackgroundedFallbackRenderer>(this);
+}
+
+CompositorBridgeChild* nsIWidget::GetRemoteRenderer() {
+  return mCompositorBridgeChild;
+}
+
+void nsIWidget::ClearCachedWebrenderResources() {
+  if (!mWindowRenderer || !mWindowRenderer->AsWebRender()) {
+    return;
+  }
+  mWindowRenderer->AsWebRender()->ClearCachedResources();
+}
+
+bool nsIWidget::SetNeedFastSnaphot() {
+  MOZ_ASSERT(XRE_IsParentProcess());
+  MOZ_ASSERT(!mCompositorSession);
+
+  if (!XRE_IsParentProcess() || mCompositorSession) {
+    return false;
+  }
+
+  mNeedFastSnaphot = true;
+  return true;
+}
+
+already_AddRefed<gfx::DrawTarget> nsIWidget::StartRemoteDrawing() {
+  return nullptr;
+}
+
+uint32_t nsIWidget::GetGLFrameBufferFormat() { return LOCAL_GL_RGBA; }
+
+void nsIWidget::OnDestroy() {
+  if (mTextEventDispatcher) {
+    mTextEventDispatcher->OnDestroyWidget();
+  }
+
+  ReleaseContentController();
+}
+
+DesktopIntPoint nsIWidget::ConstrainPositionToBounds(
+    const DesktopIntPoint& aPoint, const DesktopIntSize& aSize,
+    const DesktopIntRect& aScreenRect) {
+  DesktopIntPoint point = aPoint;
+
+  auto const maxX = aScreenRect.XMost() - aSize.Width();
+  auto const maxY = aScreenRect.YMost() - aSize.Height();
+
+
+  if (point.x >= maxX) {
+    point.x = maxX;
+  }
+  if (point.x < aScreenRect.x) {
+    point.x = aScreenRect.x;
+  }
+
+  if (point.y >= maxY) {
+    point.y = maxY;
+  }
+  if (point.y < aScreenRect.y) {
+    point.y = aScreenRect.y;
+  }
+
+  return point;
+}
+
+void nsIWidget::MoveClient(const DesktopPoint& aOffset) {
+  DesktopPoint desktopOffset = GetClientOffset() / GetDesktopToDeviceScale();
+  Move(aOffset - desktopOffset);
+}
+
+void nsIWidget::ResizeClient(const DesktopSize& aSize, bool aRepaint) {
+  NS_ASSERTION((aSize.width >= 0), "Negative width passed to ResizeClient");
+  NS_ASSERTION((aSize.height >= 0), "Negative height passed to ResizeClient");
+
+  LayoutDeviceIntRect clientBounds = GetClientBounds();
+
+  DesktopSize desktopDelta =
+      (GetBounds().Size() - clientBounds.Size()) / GetDesktopToDeviceScale();
+  Resize(aSize + desktopDelta, aRepaint);
+}
+
+void nsIWidget::ResizeClient(const DesktopRect& aRect, bool aRepaint) {
+  NS_ASSERTION((aRect.Width() >= 0), "Negative width passed to ResizeClient");
+  NS_ASSERTION((aRect.Height() >= 0), "Negative height passed to ResizeClient");
+
+  LayoutDeviceIntRect clientBounds = GetClientBounds();
+  LayoutDeviceIntPoint clientOffset = GetClientOffset();
+  DesktopToLayoutDeviceScale scale = GetDesktopToDeviceScale();
+
+  DesktopPoint desktopOffset = clientOffset / scale;
+  DesktopSize desktopDelta = (GetBounds().Size() - clientBounds.Size()) / scale;
+  Resize(DesktopRect(aRect.X() - desktopOffset.x, aRect.Y() - desktopOffset.y,
+                     aRect.Width() + desktopDelta.width,
+                     aRect.Height() + desktopDelta.height),
+         aRepaint);
+}
+
+
+nsresult nsIWidget::GetRestoredBounds(LayoutDeviceIntRect& aRect) {
+  if (SizeMode() != nsSizeMode_Normal) {
+    return NS_ERROR_FAILURE;
+  }
+  aRect = GetScreenBounds();
+  return NS_OK;
+}
+
+LayoutDeviceIntPoint nsIWidget::GetClientOffset() {
+  return LayoutDeviceIntPoint(0, 0);
+}
+
+uint32_t nsIWidget::GetMaxTouchPoints() const { return 0; }
+
+bool nsIWidget::HasPendingInputEvent() { return false; }
+
+bool nsIWidget::ShowsResizeIndicator(LayoutDeviceIntRect* aResizerRect) {
+  return false;
+}
+
+static bool ResolveIconNameHelper(nsIFile* aFile, const nsAString& aIconName,
+                                  const nsAString& aIconSuffix) {
+  aFile->Append(u"icons"_ns);
+  aFile->Append(u"default"_ns);
+  aFile->Append(aIconName + aIconSuffix);
+
+  bool readable;
+  return NS_SUCCEEDED(aFile->IsReadable(&readable)) && readable;
+}
+
+void nsIWidget::ResolveIconName(const nsAString& aIconName,
+                                const nsAString& aIconSuffix,
+                                nsIFile** aResult) {
+  *aResult = nullptr;
+
+  nsCOMPtr<nsIProperties> dirSvc =
+      do_GetService(NS_DIRECTORY_SERVICE_CONTRACTID);
+  if (!dirSvc) return;
+
+
+  nsCOMPtr<nsISimpleEnumerator> dirs;
+  dirSvc->Get(NS_APP_CHROME_DIR_LIST, NS_GET_IID(nsISimpleEnumerator),
+              getter_AddRefs(dirs));
+  if (dirs) {
+    bool hasMore;
+    while (NS_SUCCEEDED(dirs->HasMoreElements(&hasMore)) && hasMore) {
+      nsCOMPtr<nsISupports> element;
+      dirs->GetNext(getter_AddRefs(element));
+      if (!element) continue;
+      nsCOMPtr<nsIFile> file = do_QueryInterface(element);
+      if (!file) continue;
+      if (ResolveIconNameHelper(file, aIconName, aIconSuffix)) {
+        NS_ADDREF(*aResult = file);
+        return;
+      }
+    }
+  }
+
+
+  nsCOMPtr<nsIFile> file;
+  dirSvc->Get(NS_APP_CHROME_DIR, NS_GET_IID(nsIFile), getter_AddRefs(file));
+  if (file && ResolveIconNameHelper(file, aIconName, aIconSuffix))
+    NS_ADDREF(*aResult = file);
+}
+
+void nsIWidget::SetSizeConstraints(const SizeConstraints& aConstraints) {
+  mSizeConstraints = aConstraints;
+
+  if (mWindowType == WindowType::Popup) {
+    return;
+  }
+
+  DesktopIntSize curSize =
+      DesktopIntSize::Round(GetBounds().Size() / GetDesktopToDeviceScale());
+  DesktopIntSize clampedSize =
+      Max(aConstraints.mMinSize, Min(aConstraints.mMaxSize, curSize));
+  if (clampedSize != curSize) {
+    Resize(DesktopSize(clampedSize), true);
+  }
+}
+
+const widget::SizeConstraints nsIWidget::GetSizeConstraints() {
+  return mSizeConstraints;
+}
+
+nsIRollupListener* nsIWidget::GetActiveRollupListener() {
+  return nsXULPopupManager::GetInstance();
+}
+
+void nsIWidget::NotifyWindowDestroyed() {
+  if (!mWidgetListener) return;
+
+  nsCOMPtr<nsIAppWindow> window = mWidgetListener->GetAppWindow();
+  nsCOMPtr<nsIBaseWindow> appWindow(do_QueryInterface(window));
+  if (appWindow) {
+    appWindow->Destroy();
+  }
+}
+
+void nsIWidget::NotifyWindowMoved(const LayoutDeviceIntPoint& aPoint,
+                                  ByMoveToRect aByMoveToRect) {
+  if (mWidgetListener) {
+    mWidgetListener->WindowMoved(this, aPoint, aByMoveToRect);
+  }
+
+  if (mIMEHasFocus && IMENotificationRequestsRef().contains(
+                          IMENotificationRequest::PositionChange)) {
+    NotifyIME(IMENotification(IMEMessage::NOTIFY_IME_OF_POSITION_CHANGE));
+  }
+}
+
+void nsIWidget::NotifyWindowMoved(const DesktopIntPoint& aPoint,
+                                  ByMoveToRect aByMoveToRect) {
+  return NotifyWindowMoved(
+      LayoutDeviceIntPoint::Round(aPoint * GetDesktopToDeviceScale()));
+}
+
+void nsIWidget::NotifySizeMoveDone() {
+  if (!mWidgetListener) {
+    return;
+  }
+  if (PresShell* presShell = mWidgetListener->GetPresShell()) {
+    presShell->WindowSizeMoveDone();
+  }
+}
+
+void nsIWidget::NotifyThemeChanged(ThemeChangeKind aKind) {
+  LookAndFeel::NotifyChangedAllWindows(aKind);
+}
+
+nsresult nsIWidget::NotifyIME(const IMENotification& aIMENotification) {
+  if (mIMEHasQuit) {
+    return NS_OK;
+  }
+  switch (aIMENotification.mMessage) {
+    case REQUEST_TO_COMMIT_COMPOSITION:
+    case REQUEST_TO_CANCEL_COMPOSITION:
+      if (mTextEventDispatcher && mTextEventDispatcher->IsComposing()) {
+        return mTextEventDispatcher->NotifyIME(aIMENotification);
+      }
+      return NS_OK;
+    default: {
+      if (aIMENotification.mMessage == NOTIFY_IME_OF_FOCUS) {
+        mIMEHasFocus = true;
+      }
+      EnsureTextEventDispatcher();
+      nsresult rv = mTextEventDispatcher->NotifyIME(aIMENotification);
+      if (aIMENotification.mMessage == NOTIFY_IME_OF_BLUR) {
+        mIMEHasFocus = false;
+      }
+      return rv;
+    }
+  }
+}
+
+void nsIWidget::EnsureTextEventDispatcher() {
+  if (mTextEventDispatcher) {
+    return;
+  }
+  mTextEventDispatcher = new TextEventDispatcher(this);
+}
+
+nsIWidget::NativeIMEContext nsIWidget::GetNativeIMEContext() {
+  if (mTextEventDispatcher && mTextEventDispatcher->GetPseudoIMEContext()) {
+    NativeIMEContext pseudoIMEContext;
+    pseudoIMEContext.InitWithRawNativeIMEContext(
+        mTextEventDispatcher->GetPseudoIMEContext());
+    return pseudoIMEContext;
+  }
+  return NativeIMEContext(this);
+}
+
+nsIWidget::TextEventDispatcher* nsIWidget::GetTextEventDispatcher() {
+  EnsureTextEventDispatcher();
+  return mTextEventDispatcher;
+}
+
+PresShell* nsIWidget::GetPresShell() const {
+  if (mWidgetListener) {
+    if (auto* ps = mWidgetListener->GetPresShell()) {
+      return ps;
+    }
+  }
+  if (mAttachedWidgetListener) {
+    if (auto* ps = mAttachedWidgetListener->GetPresShell()) {
+      return ps;
+    }
+  }
+  return nullptr;
+}
+
+nsIWidgetListener* nsIWidget::GetPaintListener() const {
+  if (mPreviouslyAttachedWidgetListener && mAttachedWidgetListener &&
+      mAttachedWidgetListener->IsPaintSuppressed()) {
+    return mPreviouslyAttachedWidgetListener;
+  }
+  return mAttachedWidgetListener ? mAttachedWidgetListener : mWidgetListener;
+}
+
+void* nsIWidget::GetPseudoIMEContext() {
+  TextEventDispatcher* dispatcher = GetTextEventDispatcher();
+  if (!dispatcher) {
+    return nullptr;
+  }
+  return dispatcher->GetPseudoIMEContext();
+}
+
+TextEventDispatcherListener* nsIWidget::GetNativeTextEventDispatcherListener() {
+  return nullptr;
+}
+
+void nsIWidget::ZoomToRect(const uint32_t& aPresShellId,
+                           const ScrollableLayerGuid::ViewID& aViewId,
+                           const CSSRect& aRect, const uint32_t& aFlags) {
+  if (!mCompositorSession || !mAPZC) {
+    return;
+  }
+  LayersId layerId = mCompositorSession->RootLayerTreeId();
+  mAPZC->ZoomToRect(ScrollableLayerGuid(layerId, aPresShellId, aViewId),
+                    ZoomTarget{aRect}, aFlags);
+}
+
+#if defined(ACCESSIBILITY)
+
+a11y::LocalAccessible* nsIWidget::GetRootAccessible() {
+  NS_ENSURE_TRUE(mWidgetListener, nullptr);
+
+  PresShell* presShell = mWidgetListener->GetPresShell();
+  NS_ENSURE_TRUE(presShell, nullptr);
+
+  nsPresContext* presContext = presShell->GetPresContext();
+  NS_ENSURE_TRUE(presContext->GetContainerWeak(), nullptr);
+
+  nsAccessibilityService* accService = GetOrCreateAccService();
+  if (accService) {
+    return accService->GetRootDocumentAccessible(
+        presShell, nsContentUtils::IsSafeToRunScript());
+  }
+
+  return nullptr;
+}
+
+#endif
+
+void nsIWidget::StartAsyncScrollbarDrag(const AsyncDragMetrics& aDragMetrics) {
+  if (!AsyncPanZoomEnabled()) {
+    return;
+  }
+
+  MOZ_ASSERT(XRE_IsParentProcess() && mCompositorSession);
+
+  LayersId layersId = mCompositorSession->RootLayerTreeId();
+  ScrollableLayerGuid guid(layersId, aDragMetrics.mPresShellId,
+                           aDragMetrics.mViewId);
+
+  mAPZC->StartScrollbarDrag(guid, aDragMetrics);
+}
+
+bool nsIWidget::StartAsyncAutoscroll(const ScreenPoint& aAnchorLocation,
+                                     const ScrollableLayerGuid& aGuid) {
+  MOZ_ASSERT(XRE_IsParentProcess() && AsyncPanZoomEnabled());
+
+  return mAPZC->StartAutoscroll(aGuid, aAnchorLocation);
+}
+
+void nsIWidget::StopAsyncAutoscroll(const ScrollableLayerGuid& aGuid) {
+  MOZ_ASSERT(XRE_IsParentProcess() && AsyncPanZoomEnabled());
+
+  mAPZC->StopAutoscroll(aGuid);
+}
+
+LayersId nsIWidget::GetRootLayerTreeId() {
+  return mCompositorSession ? mCompositorSession->RootLayerTreeId()
+                            : LayersId{0};
+}
+
+already_AddRefed<widget::Screen> nsIWidget::GetWidgetScreen() {
+  ScreenManager& screenManager = ScreenManager::GetSingleton();
+  LayoutDeviceIntRect bounds = GetScreenBounds();
+  DesktopIntRect deskBounds = RoundedToInt(bounds / GetDesktopToDeviceScale());
+  return screenManager.ScreenForRect(deskBounds);
+}
+
+nsresult nsIWidget::SynthesizeNativeTouchTap(
+    LayoutDeviceIntPoint aPoint, bool aLongTap,
+    nsISynthesizedEventCallback* aCallback) {
+  AutoSynthesizedEventCallbackNotifier notifier(aCallback);
+  if (sPointerIdCounter > TOUCH_INJECT_MAX_POINTS) {
+    sPointerIdCounter = 0;
+  }
+  int pointerId = sPointerIdCounter;
+  sPointerIdCounter++;
+  nsresult rv = SynthesizeNativeTouchPoint(pointerId, TOUCH_CONTACT, aPoint,
+                                           1.0, 90, nullptr);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  if (!aLongTap) {
+    return SynthesizeNativeTouchPoint(pointerId, TOUCH_REMOVE, aPoint, 0, 0,
+                                      nullptr);
+  }
+
+  int elapse = Preferences::GetInt("ui.click_hold_context_menus.delay",
+                                   TOUCH_INJECT_LONG_TAP_DEFAULT_MSEC);
+  if (!mLongTapTimer) {
+    mLongTapTimer = NS_NewTimer();
+    if (!mLongTapTimer) {
+      SynthesizeNativeTouchPoint(pointerId, TOUCH_CANCEL, aPoint, 0, 0,
+                                 nullptr);
+      return NS_ERROR_UNEXPECTED;
+    }
+    int timeout = elapse;
+    if (timeout > TOUCH_INJECT_PUMP_TIMER_MSEC) {
+      timeout = TOUCH_INJECT_PUMP_TIMER_MSEC;
+    }
+    mLongTapTimer->InitWithNamedFuncCallback(
+        OnLongTapTimerCallback, this, timeout, nsITimer::TYPE_REPEATING_SLACK,
+        "nsIWidget::SynthesizeNativeTouchTap"_ns);
+  }
+
+  if (mLongTapTouchPoint) {
+    SynthesizeNativeTouchPoint(mLongTapTouchPoint->mPointerId, TOUCH_CANCEL,
+                               mLongTapTouchPoint->mPosition, 0, 0, nullptr);
+  }
+
+  mLongTapTouchPoint = MakeUnique<LongTapInfo>(
+      pointerId, aPoint, TimeDuration::FromMilliseconds(elapse), aCallback);
+  notifier.SkipNotification();  
+  return NS_OK;
+}
+
+void nsIWidget::OnLongTapTimerCallback(nsITimer* aTimer, void* aClosure) {
+  auto* self = static_cast<nsIWidget*>(aClosure);
+
+  if ((self->mLongTapTouchPoint->mStamp + self->mLongTapTouchPoint->mDuration) >
+      TimeStamp::Now()) {
+    return;
+  }
+
+  AutoSynthesizedEventCallbackNotifier notifier(
+      self->mLongTapTouchPoint->mCallback);
+
+  self->mLongTapTimer->Cancel();
+  self->mLongTapTimer = nullptr;
+  self->SynthesizeNativeTouchPoint(
+      self->mLongTapTouchPoint->mPointerId, TOUCH_REMOVE,
+      self->mLongTapTouchPoint->mPosition, 0, 0, nullptr);
+  self->mLongTapTouchPoint = nullptr;
+}
+
+float nsIWidget::GetFallbackDPI() {
+  RefPtr<const Screen> primaryScreen =
+      ScreenManager::GetSingleton().GetPrimaryScreen();
+  return primaryScreen->GetDPI();
+}
+
+CSSToLayoutDeviceScale nsIWidget::GetFallbackDefaultScale() {
+  RefPtr<const Screen> s = ScreenManager::GetSingleton().GetPrimaryScreen();
+  return s->GetCSSToLayoutDeviceScale(Screen::IncludeOSZoom::No);
+}
+
+void nsIWidget::NotifyLiveResizeStarted() {
+  NotifyLiveResizeStopped();
+  MOZ_ASSERT(mLiveResizeListeners.IsEmpty());
+
+  if (!mWidgetListener) {
+    return;
+  }
+  nsCOMPtr<nsIAppWindow> appWindow = mWidgetListener->GetAppWindow();
+  if (!appWindow) {
+    return;
+  }
+  mLiveResizeListeners = appWindow->GetLiveResizeListeners();
+  for (uint32_t i = 0; i < mLiveResizeListeners.Length(); i++) {
+    mLiveResizeListeners[i]->LiveResizeStarted();
+  }
+}
+
+void nsIWidget::NotifyLiveResizeStopped() {
+  if (!mLiveResizeListeners.IsEmpty()) {
+    for (uint32_t i = 0; i < mLiveResizeListeners.Length(); i++) {
+      mLiveResizeListeners[i]->LiveResizeStopped();
+    }
+    mLiveResizeListeners.Clear();
+  }
+}
+
+void nsIWidget::AsyncEnableDragDrop(bool aEnable) {
+  NS_DispatchToCurrentThreadQueue(
+      NewRunnableMethod<bool>("AsyncEnableDragDrop", this,
+                              &nsIWidget::EnableDragDrop, aEnable),
+      kAsyncDragDropTimeout, EventQueuePriority::Idle);
+}
+
+void nsIWidget::SwipeFinished() {
+  if (mSwipeTracker) {
+    mSwipeTracker->Destroy();
+    mSwipeTracker = nullptr;
+  }
+}
+
+void nsIWidget::ReportSwipeStarted(uint64_t aInputBlockId, bool aStartSwipe) {
+  if (mSwipeEventQueue && mSwipeEventQueue->inputBlockId == aInputBlockId) {
+    if (aStartSwipe) {
+      PanGestureInput& startEvent = mSwipeEventQueue->queuedEvents[0];
+      TrackScrollEventAsSwipe(startEvent, mSwipeEventQueue->allowedDirections,
+                              aInputBlockId);
+      for (size_t i = 1; i < mSwipeEventQueue->queuedEvents.Length(); i++) {
+        mSwipeTracker->ProcessEvent(mSwipeEventQueue->queuedEvents[i]);
+      }
+    } else if (mAPZC) {
+      mAPZC->SetBrowserGestureResponse(aInputBlockId,
+                                       BrowserGestureResponse::NotConsumed);
+    }
+    mSwipeEventQueue = nullptr;
+  }
+}
+
+void nsIWidget::TrackScrollEventAsSwipe(
+    const mozilla::PanGestureInput& aSwipeStartEvent,
+    uint32_t aAllowedDirections, uint64_t aInputBlockId) {
+  if (mSwipeTracker) {
+    mSwipeTracker->CancelSwipe(aSwipeStartEvent.mTimeStamp);
+    mSwipeTracker->Destroy();
+    mSwipeTracker = nullptr;
+  }
+
+  uint32_t direction =
+      (aSwipeStartEvent.mPanDisplacement.x > 0.0)
+          ? (uint32_t)dom::SimpleGestureEvent_Binding::DIRECTION_RIGHT
+          : (uint32_t)dom::SimpleGestureEvent_Binding::DIRECTION_LEFT;
+
+  mSwipeTracker =
+      new SwipeTracker(*this, aSwipeStartEvent, aAllowedDirections, direction);
+  mSwipeTracker->StartTracking(aSwipeStartEvent);
+
+  if (!mAPZC) {
+    mCurrentPanGestureBelongsToSwipe = true;
+  } else {
+    mAPZC->SetBrowserGestureResponse(aInputBlockId,
+                                     BrowserGestureResponse::Consumed);
+  }
+}
+
+nsIWidget::SwipeInfo nsIWidget::SendMayStartSwipe(
+    const mozilla::PanGestureInput& aSwipeStartEvent) {
+  nsCOMPtr<nsIWidget> kungFuDeathGrip(this);
+
+  uint32_t direction =
+      (aSwipeStartEvent.mPanDisplacement.x > 0.0)
+          ? (uint32_t)dom::SimpleGestureEvent_Binding::DIRECTION_RIGHT
+          : (uint32_t)dom::SimpleGestureEvent_Binding::DIRECTION_LEFT;
+
+  LayoutDeviceIntPoint position = RoundedToInt(aSwipeStartEvent.mPanStartPoint *
+                                               ScreenToLayoutDeviceScale(1));
+  WidgetSimpleGestureEvent geckoEvent = SwipeTracker::CreateSwipeGestureEvent(
+      eSwipeGestureMayStart, this, position, aSwipeStartEvent.mTimeStamp);
+  geckoEvent.mDirection = direction;
+  geckoEvent.mDelta = 0.0;
+  geckoEvent.mAllowedDirections = 0;
+  bool shouldStartSwipe =
+      DispatchWindowEvent(geckoEvent);  
+
+  SwipeInfo result = {shouldStartSwipe, geckoEvent.mAllowedDirections};
+  return result;
+}
+
+WidgetWheelEvent nsIWidget::MayStartSwipeForAPZ(
+    const PanGestureInput& aPanInput, const APZEventResult& aApzResult) {
+  WidgetWheelEvent event = aPanInput.ToWidgetEvent(this);
+
+  if (aPanInput.mHandledByAPZ && aPanInput.AllowsSwipe() &&
+      !aApzResult.mTargetCanScrollHorizontally) {
+    SwipeInfo swipeInfo = SendMayStartSwipe(aPanInput);
+    event.mCanTriggerSwipe = swipeInfo.wantsSwipe;
+    if (swipeInfo.wantsSwipe) {
+      if (aApzResult.GetStatus() == nsEventStatus_eIgnore) {
+        TrackScrollEventAsSwipe(aPanInput, swipeInfo.allowedDirections,
+                                aApzResult.mInputBlockId);
+      } else if (!aApzResult.GetHandledResult() ||
+                 !aApzResult.GetHandledResult()->IsHandledByRoot()) {
+        mSwipeEventQueue = MakeUnique<SwipeEventQueue>(
+            swipeInfo.allowedDirections, aApzResult.mInputBlockId);
+      }
+    } else {
+      mAPZC->SetBrowserGestureResponse(aApzResult.mInputBlockId,
+                                       BrowserGestureResponse::NotConsumed);
+    }
+  }
+
+  if (mSwipeEventQueue &&
+      mSwipeEventQueue->inputBlockId == aApzResult.mInputBlockId) {
+    mSwipeEventQueue->queuedEvents.AppendElement(aPanInput);
+  }
+
+  return event;
+}
+
+bool nsIWidget::MayStartSwipeForNonAPZ(const PanGestureInput& aPanInput) {
+  if (aPanInput.mType == PanGestureInput::PANGESTURE_MAYSTART ||
+      aPanInput.mType == PanGestureInput::PANGESTURE_START) {
+    mCurrentPanGestureBelongsToSwipe = false;
+  }
+  if (mCurrentPanGestureBelongsToSwipe) {
+    MOZ_ASSERT(aPanInput.IsMomentum(),
+               "If the fingers are still on the touchpad, we should still have "
+               "a SwipeTracker, "
+               "and it should have consumed this event.");
+    return true;
+  }
+
+  if (!aPanInput.MayTriggerSwipe()) {
+    return false;
+  }
+
+  SwipeInfo swipeInfo = SendMayStartSwipe(aPanInput);
+
+  ScrollableLayerGuid guid;
+  uint64_t blockId = 0;
+  InputAPZContext context(guid, blockId, nsEventStatus_eIgnore);
+
+  WidgetWheelEvent event = aPanInput.ToWidgetEvent(this);
+  event.mCanTriggerSwipe = swipeInfo.wantsSwipe;
+  DispatchEvent(&event);
+  if (swipeInfo.wantsSwipe) {
+    if (context.WasRoutedToChildProcess()) {
+      mSwipeEventQueue =
+          MakeUnique<SwipeEventQueue>(swipeInfo.allowedDirections, blockId);
+    } else if (event.TriggersSwipe()) {
+      TrackScrollEventAsSwipe(aPanInput, swipeInfo.allowedDirections, blockId);
+    }
+  }
+
+  if (mSwipeEventQueue && mSwipeEventQueue->inputBlockId == 0) {
+    mSwipeEventQueue->queuedEvents.AppendElement(aPanInput);
+  }
+
+  return true;
+}
+
+LayersId nsIWidget::GetLayersId() const {
+  return mCompositorSession ? mCompositorSession->RootLayerTreeId()
+                            : LayersId{0};
+}
+
+const IMENotificationRequests& nsIWidget::IMENotificationRequestsRef() {
+  TextEventDispatcher* dispatcher = GetTextEventDispatcher();
+  return dispatcher->IMENotificationRequestsRef();
+}
+
+void nsIWidget::PostHandleKeyEvent(mozilla::WidgetKeyboardEvent* aEvent) {}
+
+bool nsIWidget::GetEditCommands(NativeKeyBindingsType aType,
+                                const WidgetKeyboardEvent& aEvent,
+                                nsTArray<CommandInt>& aCommands) {
+  MOZ_ASSERT(aEvent.IsTrusted());
+  MOZ_ASSERT(aCommands.IsEmpty());
+  return true;
+}
+
+already_AddRefed<nsIBidiKeyboard> nsIWidget::CreateBidiKeyboard() {
+  if (XRE_IsContentProcess()) {
+    return CreateBidiKeyboardContentProcess();
+  }
+  return CreateBidiKeyboardInner();
+}
+
+
+namespace mozilla {
+
+MultiTouchInput UpdateSynthesizedTouchState(
+    MultiTouchInput* aState, TimeStamp aTimeStamp, uint32_t aPointerId,
+    TouchPointerState aPointerState, LayoutDeviceIntPoint aPoint,
+    double aPointerPressure, uint32_t aPointerOrientation) {
+  ScreenIntPoint pointerScreenPoint = ViewAs<ScreenPixel>(
+      aPoint, PixelCastJustification::LayoutDeviceIsScreenForBounds);
+
+  MultiTouchInput inputToDispatch;
+  inputToDispatch.mInputType = MULTITOUCH_INPUT;
+  inputToDispatch.mTimeStamp = aTimeStamp;
+
+  int32_t index = aState->IndexOfTouch((int32_t)aPointerId);
+  if (aPointerState == TOUCH_CONTACT) {
+    if (index >= 0) {
+      SingleTouchData& point = aState->mTouches[index];
+      point.mScreenPoint = pointerScreenPoint;
+      point.mRotationAngle = (float)aPointerOrientation;
+      point.mForce = (float)aPointerPressure;
+      inputToDispatch.mType = MultiTouchInput::MULTITOUCH_MOVE;
+    } else {
+      aState->mTouches.AppendElement(SingleTouchData(
+          (int32_t)aPointerId, pointerScreenPoint, ScreenSize(0, 0),
+          (float)aPointerOrientation, (float)aPointerPressure));
+      inputToDispatch.mType = MultiTouchInput::MULTITOUCH_START;
+    }
+    inputToDispatch.mTouches = aState->mTouches;
+  } else {
+    MOZ_ASSERT(aPointerState == TOUCH_REMOVE || aPointerState == TOUCH_CANCEL);
+    if (index >= 0) {
+      aState->mTouches.RemoveElementAt(index);
+    }
+    inputToDispatch.mType =
+        (aPointerState == TOUCH_REMOVE ? MultiTouchInput::MULTITOUCH_END
+                                       : MultiTouchInput::MULTITOUCH_CANCEL);
+    inputToDispatch.mTouches.AppendElement(SingleTouchData(
+        (int32_t)aPointerId, pointerScreenPoint, ScreenSize(0, 0),
+        (float)aPointerOrientation, (float)aPointerPressure));
+  }
+
+  return inputToDispatch;
+}
+
+namespace widget {
+
+const char* ToChar(InputContext::Origin aOrigin) {
+  switch (aOrigin) {
+    case InputContext::ORIGIN_MAIN:
+      return "ORIGIN_MAIN";
+    case InputContext::ORIGIN_CONTENT:
+      return "ORIGIN_CONTENT";
+    default:
+      return "Unexpected value";
+  }
+}
+
+const char* ToChar(IMEMessage aIMEMessage) {
+  switch (aIMEMessage) {
+    case NOTIFY_IME_OF_NOTHING:
+      return "NOTIFY_IME_OF_NOTHING";
+    case NOTIFY_IME_OF_FOCUS:
+      return "NOTIFY_IME_OF_FOCUS";
+    case NOTIFY_IME_OF_BLUR:
+      return "NOTIFY_IME_OF_BLUR";
+    case NOTIFY_IME_OF_SELECTION_CHANGE:
+      return "NOTIFY_IME_OF_SELECTION_CHANGE";
+    case NOTIFY_IME_OF_TEXT_CHANGE:
+      return "NOTIFY_IME_OF_TEXT_CHANGE";
+    case NOTIFY_IME_OF_COMPOSITION_EVENT_HANDLED:
+      return "NOTIFY_IME_OF_COMPOSITION_EVENT_HANDLED";
+    case NOTIFY_IME_OF_POSITION_CHANGE:
+      return "NOTIFY_IME_OF_POSITION_CHANGE";
+    case NOTIFY_IME_OF_MOUSE_BUTTON_EVENT:
+      return "NOTIFY_IME_OF_MOUSE_BUTTON_EVENT";
+    case REQUEST_TO_COMMIT_COMPOSITION:
+      return "REQUEST_TO_COMMIT_COMPOSITION";
+    case REQUEST_TO_CANCEL_COMPOSITION:
+      return "REQUEST_TO_CANCEL_COMPOSITION";
+    default:
+      return "Unexpected value";
+  }
+}
+
+void NativeIMEContext::Init(nsIWidget* aWidget) {
+  if (!aWidget) {
+    mRawNativeIMEContext = reinterpret_cast<uintptr_t>(nullptr);
+    mOriginProcessID = static_cast<uint64_t>(-1);
+    return;
+  }
+  if (!XRE_IsContentProcess()) {
+    mRawNativeIMEContext = reinterpret_cast<uintptr_t>(
+        aWidget->GetNativeData(NS_RAW_NATIVE_IME_CONTEXT));
+    mOriginProcessID = 0;
+    return;
+  }
+  *this = aWidget->GetNativeIMEContext();
+}
+
+void NativeIMEContext::InitWithRawNativeIMEContext(void* aRawNativeIMEContext) {
+  if (NS_WARN_IF(!aRawNativeIMEContext)) {
+    mRawNativeIMEContext = reinterpret_cast<uintptr_t>(nullptr);
+    mOriginProcessID = static_cast<uint64_t>(-1);
+    return;
+  }
+  mRawNativeIMEContext = reinterpret_cast<uintptr_t>(aRawNativeIMEContext);
+  mOriginProcessID =
+      XRE_IsContentProcess() ? ContentChild::GetSingleton()->GetID() : 0;
+}
+
+void IMENotification::TextChangeDataBase::MergeWith(
+    const IMENotification::TextChangeDataBase& aOther) {
+  MOZ_ASSERT(aOther.IsValid(), "Merging data must store valid data");
+  MOZ_ASSERT(aOther.mStartOffset <= aOther.mRemovedEndOffset,
+             "end of removed text must be same or larger than start");
+  MOZ_ASSERT(aOther.mStartOffset <= aOther.mAddedEndOffset,
+             "end of added text must be same or larger than start");
+
+  if (!IsValid()) {
+    *this = aOther;
+    return;
+  }
+
+
+
+
+  const TextChangeDataBase& newData = aOther;
+  const TextChangeDataBase oldData = *this;
+
+  mCausedOnlyByComposition =
+      newData.mCausedOnlyByComposition && oldData.mCausedOnlyByComposition;
+
+  mIncludingChangesWithoutComposition =
+      newData.mIncludingChangesWithoutComposition ||
+      oldData.mIncludingChangesWithoutComposition;
+
+  if (!newData.mCausedOnlyByComposition &&
+      !newData.mIncludingChangesDuringComposition) {
+    MOZ_ASSERT(newData.mIncludingChangesWithoutComposition);
+    MOZ_ASSERT(mIncludingChangesWithoutComposition);
+    mIncludingChangesDuringComposition = false;
+  } else {
+    mIncludingChangesDuringComposition =
+        newData.mIncludingChangesDuringComposition ||
+        oldData.mIncludingChangesDuringComposition;
+  }
+
+  if (newData.mStartOffset >= oldData.mAddedEndOffset) {
+    mStartOffset = oldData.mStartOffset;
+    uint32_t newRemovedEndOffsetInOldText =
+        newData.mRemovedEndOffset - oldData.Difference();
+    mRemovedEndOffset =
+        std::max(newRemovedEndOffsetInOldText, oldData.mRemovedEndOffset);
+    mAddedEndOffset = newData.mAddedEndOffset;
+    return;
+  }
+
+  if (newData.mStartOffset >= oldData.mStartOffset) {
+    mStartOffset = oldData.mStartOffset;
+    if (newData.mRemovedEndOffset >= oldData.mAddedEndOffset) {
+      uint32_t newRemovedEndOffsetInOldText =
+          newData.mRemovedEndOffset - oldData.Difference();
+      mRemovedEndOffset =
+          std::max(newRemovedEndOffsetInOldText, oldData.mRemovedEndOffset);
+      mAddedEndOffset = newData.mAddedEndOffset;
+      return;
+    }
+
+    mRemovedEndOffset = oldData.mRemovedEndOffset;
+    uint32_t oldAddedEndOffsetInNewText =
+        oldData.mAddedEndOffset + newData.Difference();
+    mAddedEndOffset =
+        std::max(newData.mAddedEndOffset, oldAddedEndOffsetInNewText);
+    return;
+  }
+
+  if (newData.mRemovedEndOffset >= oldData.mStartOffset) {
+    MOZ_ASSERT(newData.mStartOffset < oldData.mStartOffset,
+               "new start offset should be less than old one here");
+    mStartOffset = newData.mStartOffset;
+    if (newData.mRemovedEndOffset >= oldData.mAddedEndOffset) {
+      uint32_t newRemovedEndOffsetInOldText =
+          newData.mRemovedEndOffset - oldData.Difference();
+      mRemovedEndOffset =
+          std::max(newRemovedEndOffsetInOldText, oldData.mRemovedEndOffset);
+      mAddedEndOffset = newData.mAddedEndOffset;
+      return;
+    }
+
+    mRemovedEndOffset = oldData.mRemovedEndOffset;
+    uint32_t oldAddedEndOffsetInNewText =
+        oldData.mAddedEndOffset + newData.Difference();
+    mAddedEndOffset =
+        std::max(newData.mAddedEndOffset, oldAddedEndOffsetInNewText);
+    return;
+  }
+
+  MOZ_ASSERT(newData.mStartOffset < oldData.mStartOffset,
+             "new start offset should be less than old one here");
+  mStartOffset = newData.mStartOffset;
+  MOZ_ASSERT(newData.mRemovedEndOffset < oldData.mRemovedEndOffset,
+             "new removed end offset should be less than old one here");
+  mRemovedEndOffset = oldData.mRemovedEndOffset;
+  uint32_t oldAddedEndOffsetInNewText =
+      oldData.mAddedEndOffset + newData.Difference();
+  mAddedEndOffset =
+      std::max(newData.mAddedEndOffset, oldAddedEndOffsetInNewText);
+}
+
+#if defined(DEBUG)
+
+void IMENotification::TextChangeDataBase::Test() {
+  static bool gTestTextChangeEvent = true;
+  if (!gTestTextChangeEvent) {
+    return;
+  }
+  gTestTextChangeEvent = false;
+
+
+  MergeWith(TextChangeData(10, 10, 20, false, false));
+  MergeWith(TextChangeData(20, 20, 35, false, false));
+  MOZ_ASSERT(mStartOffset == 10,
+             "Test 1-1-1: mStartOffset should be the first offset");
+  MOZ_ASSERT(
+      mRemovedEndOffset == 10,  
+      "Test 1-1-2: mRemovedEndOffset should be the first end of removed text");
+  MOZ_ASSERT(
+      mAddedEndOffset == 35,
+      "Test 1-1-3: mAddedEndOffset should be the last end of added text");
+  Clear();
+
+  MergeWith(TextChangeData(10, 20, 10, false, false));
+  MergeWith(TextChangeData(10, 30, 10, false, false));
+  MOZ_ASSERT(mStartOffset == 10,
+             "Test 1-2-1: mStartOffset should be the first offset");
+  MOZ_ASSERT(mRemovedEndOffset == 40,  
+             "Test 1-2-2: mRemovedEndOffset should be the the last end of "
+             "removed text "
+             "with already removed length");
+  MOZ_ASSERT(
+      mAddedEndOffset == 10,
+      "Test 1-2-3: mAddedEndOffset should be the last end of added text");
+  Clear();
+
+  MergeWith(TextChangeData(10, 20, 10, false, false));
+  MergeWith(TextChangeData(10, 15, 10, false, false));
+  MOZ_ASSERT(mStartOffset == 10,
+             "Test 1-3-1: mStartOffset should be the first offset");
+  MOZ_ASSERT(mRemovedEndOffset == 25,  
+             "Test 1-3-2: mRemovedEndOffset should be the the last end of "
+             "removed text "
+             "with already removed length");
+  MOZ_ASSERT(
+      mAddedEndOffset == 10,
+      "Test 1-3-3: mAddedEndOffset should be the last end of added text");
+  Clear();
+
+  MergeWith(TextChangeData(10, 10, 20, false, false));
+  MergeWith(TextChangeData(55, 55, 60, false, false));
+  MOZ_ASSERT(mStartOffset == 10,
+             "Test 1-4-1: mStartOffset should be the smallest offset");
+  MOZ_ASSERT(
+      mRemovedEndOffset == 45,  
+      "Test 1-4-2: mRemovedEndOffset should be the the largest end of removed "
+      "text without already added length");
+  MOZ_ASSERT(
+      mAddedEndOffset == 60,
+      "Test 1-4-3: mAddedEndOffset should be the last end of added text");
+  Clear();
+
+  MergeWith(TextChangeData(10, 20, 10, false, false));
+  MergeWith(TextChangeData(55, 68, 55, false, false));
+  MOZ_ASSERT(mStartOffset == 10,
+             "Test 1-5-1: mStartOffset should be the smallest offset");
+  MOZ_ASSERT(
+      mRemovedEndOffset == 78,  
+      "Test 1-5-2: mRemovedEndOffset should be the the largest end of removed "
+      "text with already removed length");
+  MOZ_ASSERT(
+      mAddedEndOffset == 55,
+      "Test 1-5-3: mAddedEndOffset should be the largest end of added text");
+  Clear();
+
+  MergeWith(TextChangeData(30, 35, 32, false, false));
+  MergeWith(TextChangeData(32, 32, 40, false, false));
+  MOZ_ASSERT(mStartOffset == 30,
+             "Test 1-6-1: mStartOffset should be the smallest offset");
+  MOZ_ASSERT(
+      mRemovedEndOffset == 35,  
+      "Test 1-6-2: mRemovedEndOffset should be the the first end of removed "
+      "text");
+  MOZ_ASSERT(
+      mAddedEndOffset == 40,
+      "Test 1-6-3: mAddedEndOffset should be the last end of added text");
+  Clear();
+
+  MergeWith(TextChangeData(30, 35, 32, false, false));
+  MergeWith(TextChangeData(32, 32, 33, false, false));
+  MOZ_ASSERT(mStartOffset == 30,
+             "Test 1-7-1: mStartOffset should be the smallest offset");
+  MOZ_ASSERT(
+      mRemovedEndOffset == 35,  
+      "Test 1-7-2: mRemovedEndOffset should be the the first end of removed "
+      "text");
+  MOZ_ASSERT(
+      mAddedEndOffset == 33,
+      "Test 1-7-3: mAddedEndOffset should be the last end of added text");
+  Clear();
+
+  MergeWith(TextChangeData(30, 35, 30, false, false));
+  MergeWith(TextChangeData(32, 34, 48, false, false));
+  MOZ_ASSERT(mStartOffset == 30,
+             "Test 1-8-1: mStartOffset should be the smallest offset");
+  MOZ_ASSERT(mRemovedEndOffset == 39,  
+             "Test 1-8-2: mRemovedEndOffset should be the the first end of "
+             "removed text "
+             "without already removed text");
+  MOZ_ASSERT(
+      mAddedEndOffset == 48,
+      "Test 1-8-3: mAddedEndOffset should be the last end of added text");
+  Clear();
+
+  MergeWith(TextChangeData(30, 35, 30, false, false));
+  MergeWith(TextChangeData(32, 38, 36, false, false));
+  MOZ_ASSERT(mStartOffset == 30,
+             "Test 1-9-1: mStartOffset should be the smallest offset");
+  MOZ_ASSERT(mRemovedEndOffset == 43,  
+             "Test 1-9-2: mRemovedEndOffset should be the the first end of "
+             "removed text "
+             "without already removed text");
+  MOZ_ASSERT(
+      mAddedEndOffset == 36,
+      "Test 1-9-3: mAddedEndOffset should be the last end of added text");
+  Clear();
+
+
+  MergeWith(TextChangeData(50, 50, 55, false, false));
+  MergeWith(TextChangeData(53, 60, 54, false, false));
+  MOZ_ASSERT(mStartOffset == 50,
+             "Test 2-1-1: mStartOffset should be the smallest offset");
+  MOZ_ASSERT(mRemovedEndOffset == 55,  
+             "Test 2-1-2: mRemovedEndOffset should be the the last end of "
+             "removed text "
+             "without already added text length");
+  MOZ_ASSERT(
+      mAddedEndOffset == 54,
+      "Test 2-1-3: mAddedEndOffset should be the last end of added text");
+  Clear();
+
+  MergeWith(TextChangeData(50, 50, 55, false, false));
+  MergeWith(TextChangeData(54, 62, 68, false, false));
+  MOZ_ASSERT(mStartOffset == 50,
+             "Test 2-2-1: mStartOffset should be the smallest offset");
+  MOZ_ASSERT(mRemovedEndOffset == 57,  
+             "Test 2-2-2: mRemovedEndOffset should be the the last end of "
+             "removed text "
+             "without already added text length");
+  MOZ_ASSERT(
+      mAddedEndOffset == 68,
+      "Test 2-2-3: mAddedEndOffset should be the last end of added text");
+  Clear();
+
+  MergeWith(TextChangeData(36, 48, 45, false, false));
+  MergeWith(TextChangeData(43, 50, 49, false, false));
+  MOZ_ASSERT(mStartOffset == 36,
+             "Test 2-3-1: mStartOffset should be the smallest offset");
+  MOZ_ASSERT(mRemovedEndOffset == 53,  
+             "Test 2-3-2: mRemovedEndOffset should be the the last end of "
+             "removed text "
+             "without already removed text length");
+  MOZ_ASSERT(
+      mAddedEndOffset == 49,
+      "Test 2-3-3: mAddedEndOffset should be the last end of added text");
+  Clear();
+
+  MergeWith(TextChangeData(36, 52, 53, false, false));
+  MergeWith(TextChangeData(43, 68, 61, false, false));
+  MOZ_ASSERT(mStartOffset == 36,
+             "Test 2-4-1: mStartOffset should be the smallest offset");
+  MOZ_ASSERT(mRemovedEndOffset == 67,  
+             "Test 2-4-2: mRemovedEndOffset should be the the last end of "
+             "removed text "
+             "without already added text length");
+  MOZ_ASSERT(
+      mAddedEndOffset == 61,
+      "Test 2-4-3: mAddedEndOffset should be the last end of added text");
+  Clear();
+
+
+  MergeWith(TextChangeData(10, 10, 20, false, false));
+  MergeWith(TextChangeData(15, 15, 30, false, false));
+  MOZ_ASSERT(mStartOffset == 10,
+             "Test 3-1-1: mStartOffset should be the smallest offset");
+  MOZ_ASSERT(mRemovedEndOffset == 10,
+             "Test 3-1-2: mRemovedEndOffset should be the the first end of "
+             "removed text");
+  MOZ_ASSERT(
+      mAddedEndOffset == 35,  
+      "Test 3-1-3: mAddedEndOffset should be the first end of added text with "
+      "added text length by the new change");
+  Clear();
+
+  MergeWith(TextChangeData(50, 50, 55, false, false));
+  MergeWith(TextChangeData(52, 53, 56, false, false));
+  MOZ_ASSERT(mStartOffset == 50,
+             "Test 3-2-1: mStartOffset should be the smallest offset");
+  MOZ_ASSERT(mRemovedEndOffset == 50,
+             "Test 3-2-2: mRemovedEndOffset should be the the first end of "
+             "removed text");
+  MOZ_ASSERT(
+      mAddedEndOffset == 58,  
+      "Test 3-2-3: mAddedEndOffset should be the first end of added text with "
+      "added text length by the new change");
+  Clear();
+
+  MergeWith(TextChangeData(36, 48, 45, false, false));
+  MergeWith(TextChangeData(37, 38, 50, false, false));
+  MOZ_ASSERT(mStartOffset == 36,
+             "Test 3-3-1: mStartOffset should be the smallest offset");
+  MOZ_ASSERT(mRemovedEndOffset == 48,
+             "Test 3-3-2: mRemovedEndOffset should be the the first end of "
+             "removed text");
+  MOZ_ASSERT(
+      mAddedEndOffset == 57,  
+      "Test 3-3-3: mAddedEndOffset should be the first end of added text with "
+      "added text length by the new change");
+  Clear();
+
+  MergeWith(TextChangeData(32, 48, 53, false, false));
+  MergeWith(TextChangeData(43, 50, 52, false, false));
+  MOZ_ASSERT(mStartOffset == 32,
+             "Test 3-4-1: mStartOffset should be the smallest offset");
+  MOZ_ASSERT(mRemovedEndOffset == 48,
+             "Test 3-4-2: mRemovedEndOffset should be the the last end of "
+             "removed text "
+             "without already added text length");
+  MOZ_ASSERT(
+      mAddedEndOffset == 55,  
+      "Test 3-4-3: mAddedEndOffset should be the first end of added text with "
+      "added text length by the new change");
+  Clear();
+
+  MergeWith(TextChangeData(36, 48, 50, false, false));
+  MergeWith(TextChangeData(37, 49, 47, false, false));
+  MOZ_ASSERT(mStartOffset == 36,
+             "Test 3-5-1: mStartOffset should be the smallest offset");
+  MOZ_ASSERT(
+      mRemovedEndOffset == 48,
+      "Test 3-5-2: mRemovedEndOffset should be the the first end of removed "
+      "text");
+  MOZ_ASSERT(mAddedEndOffset == 48,  
+             "Test 3-5-3: mAddedEndOffset should be the first end of added "
+             "text without "
+             "removed text length by the new change");
+  Clear();
+
+  MergeWith(TextChangeData(32, 48, 53, false, false));
+  MergeWith(TextChangeData(43, 50, 47, false, false));
+  MOZ_ASSERT(mStartOffset == 32,
+             "Test 3-6-1: mStartOffset should be the smallest offset");
+  MOZ_ASSERT(mRemovedEndOffset == 48,
+             "Test 3-6-2: mRemovedEndOffset should be the the last end of "
+             "removed text "
+             "without already added text length");
+  MOZ_ASSERT(mAddedEndOffset == 50,  
+             "Test 3-6-3: mAddedEndOffset should be the first end of added "
+             "text without "
+             "removed text length by the new change");
+  Clear();
+
+
+  MergeWith(TextChangeData(50, 50, 55, false, false));
+  MergeWith(TextChangeData(44, 66, 68, false, false));
+  MOZ_ASSERT(mStartOffset == 44,
+             "Test 4-1-1: mStartOffset should be the smallest offset");
+  MOZ_ASSERT(mRemovedEndOffset == 61,  
+             "Test 4-1-2: mRemovedEndOffset should be the the last end of "
+             "removed text "
+             "without already added text length");
+  MOZ_ASSERT(
+      mAddedEndOffset == 68,
+      "Test 4-1-3: mAddedEndOffset should be the last end of added text");
+  Clear();
+
+  MergeWith(TextChangeData(50, 62, 50, false, false));
+  MergeWith(TextChangeData(44, 66, 68, false, false));
+  MOZ_ASSERT(mStartOffset == 44,
+             "Test 4-2-1: mStartOffset should be the smallest offset");
+  MOZ_ASSERT(mRemovedEndOffset == 78,  
+             "Test 4-2-2: mRemovedEndOffset should be the the last end of "
+             "removed text "
+             "without already removed text length");
+  MOZ_ASSERT(
+      mAddedEndOffset == 68,
+      "Test 4-2-3: mAddedEndOffset should be the last end of added text");
+  Clear();
+
+  MergeWith(TextChangeData(50, 62, 60, false, false));
+  MergeWith(TextChangeData(49, 128, 130, false, false));
+  MOZ_ASSERT(mStartOffset == 49,
+             "Test 4-3-1: mStartOffset should be the smallest offset");
+  MOZ_ASSERT(mRemovedEndOffset == 130,  
+             "Test 4-3-2: mRemovedEndOffset should be the the last end of "
+             "removed text "
+             "without already removed text length");
+  MOZ_ASSERT(
+      mAddedEndOffset == 130,
+      "Test 4-3-3: mAddedEndOffset should be the last end of added text");
+  Clear();
+
+  MergeWith(TextChangeData(50, 61, 73, false, false));
+  MergeWith(TextChangeData(44, 100, 50, false, false));
+  MOZ_ASSERT(mStartOffset == 44,
+             "Test 4-4-1: mStartOffset should be the smallest offset");
+  MOZ_ASSERT(mRemovedEndOffset == 88,  
+             "Test 4-4-2: mRemovedEndOffset should be the the last end of "
+             "removed text "
+             "with already added text length");
+  MOZ_ASSERT(
+      mAddedEndOffset == 50,
+      "Test 4-4-3: mAddedEndOffset should be the last end of added text");
+  Clear();
+
+
+  MergeWith(TextChangeData(50, 50, 55, false, false));
+  MergeWith(TextChangeData(48, 52, 49, false, false));
+  MOZ_ASSERT(mStartOffset == 48,
+             "Test 5-1-1: mStartOffset should be the smallest offset");
+  MOZ_ASSERT(
+      mRemovedEndOffset == 50,
+      "Test 5-1-2: mRemovedEndOffset should be the the first end of removed "
+      "text");
+  MOZ_ASSERT(
+      mAddedEndOffset == 52,  
+      "Test 5-1-3: mAddedEndOffset should be the first end of added text with "
+      "added text length by the new change");
+  Clear();
+
+  MergeWith(TextChangeData(50, 60, 58, false, false));
+  MergeWith(TextChangeData(43, 50, 48, false, false));
+  MOZ_ASSERT(mStartOffset == 43,
+             "Test 5-2-1: mStartOffset should be the smallest offset");
+  MOZ_ASSERT(
+      mRemovedEndOffset == 60,
+      "Test 5-2-2: mRemovedEndOffset should be the the first end of removed "
+      "text");
+  MOZ_ASSERT(mAddedEndOffset == 56,  
+             "Test 5-2-3: mAddedEndOffset should be the first end of added "
+             "text without "
+             "removed text length by the new change");
+  Clear();
+
+  MergeWith(TextChangeData(50, 60, 68, false, false));
+  MergeWith(TextChangeData(43, 55, 53, false, false));
+  MOZ_ASSERT(mStartOffset == 43,
+             "Test 5-3-1: mStartOffset should be the smallest offset");
+  MOZ_ASSERT(
+      mRemovedEndOffset == 60,
+      "Test 5-3-2: mRemovedEndOffset should be the the first end of removed "
+      "text");
+  MOZ_ASSERT(mAddedEndOffset == 66,  
+             "Test 5-3-3: mAddedEndOffset should be the first end of added "
+             "text without "
+             "removed text length by the new change");
+  Clear();
+
+  MergeWith(TextChangeData(50, 60, 58, false, false));
+  MergeWith(TextChangeData(43, 50, 128, false, false));
+  MOZ_ASSERT(mStartOffset == 43,
+             "Test 5-4-1: mStartOffset should be the smallest offset");
+  MOZ_ASSERT(
+      mRemovedEndOffset == 60,
+      "Test 5-4-2: mRemovedEndOffset should be the the first end of removed "
+      "text");
+  MOZ_ASSERT(
+      mAddedEndOffset == 136,  
+      "Test 5-4-3: mAddedEndOffset should be the first end of added text with "
+      "added text length by the new change");
+  Clear();
+
+  MergeWith(TextChangeData(50, 60, 68, false, false));
+  MergeWith(TextChangeData(43, 55, 65, false, false));
+  MOZ_ASSERT(mStartOffset == 43,
+             "Test 5-5-1: mStartOffset should be the smallest offset");
+  MOZ_ASSERT(
+      mRemovedEndOffset == 60,
+      "Test 5-5-2: mRemovedEndOffset should be the the first end of removed "
+      "text");
+  MOZ_ASSERT(
+      mAddedEndOffset == 78,  
+      "Test 5-5-3: mAddedEndOffset should be the first end of added text with "
+      "added text length by the new change");
+  Clear();
+
+
+  MergeWith(TextChangeData(30, 30, 45, false, false));
+  MergeWith(TextChangeData(10, 10, 20, false, false));
+  MOZ_ASSERT(mStartOffset == 10,
+             "Test 6-1-1: mStartOffset should be the smallest offset");
+  MOZ_ASSERT(
+      mRemovedEndOffset == 30,
+      "Test 6-1-2: mRemovedEndOffset should be the the largest end of removed "
+      "text");
+  MOZ_ASSERT(
+      mAddedEndOffset == 55,  
+      "Test 6-1-3: mAddedEndOffset should be the first end of added text with "
+      "added text length by the new change");
+  Clear();
+
+  MergeWith(TextChangeData(30, 35, 30, false, false));
+  MergeWith(TextChangeData(10, 25, 10, false, false));
+  MOZ_ASSERT(mStartOffset == 10,
+             "Test 6-2-1: mStartOffset should be the smallest offset");
+  MOZ_ASSERT(
+      mRemovedEndOffset == 35,
+      "Test 6-2-2: mRemovedEndOffset should be the the largest end of removed "
+      "text");
+  MOZ_ASSERT(
+      mAddedEndOffset == 15,  
+      "Test 6-2-3: mAddedEndOffset should be the first end of added text with "
+      "removed text length by the new change");
+  Clear();
+
+  MergeWith(TextChangeData(50, 65, 70, false, false));
+  MergeWith(TextChangeData(13, 24, 15, false, false));
+  MOZ_ASSERT(mStartOffset == 13,
+             "Test 6-3-1: mStartOffset should be the smallest offset");
+  MOZ_ASSERT(
+      mRemovedEndOffset == 65,
+      "Test 6-3-2: mRemovedEndOffset should be the the largest end of removed "
+      "text");
+  MOZ_ASSERT(mAddedEndOffset == 61,  
+             "Test 6-3-3: mAddedEndOffset should be the first end of added "
+             "text without "
+             "removed text length by the new change");
+  Clear();
+
+  MergeWith(TextChangeData(50, 65, 70, false, false));
+  MergeWith(TextChangeData(13, 24, 36, false, false));
+  MOZ_ASSERT(mStartOffset == 13,
+             "Test 6-4-1: mStartOffset should be the smallest offset");
+  MOZ_ASSERT(
+      mRemovedEndOffset == 65,
+      "Test 6-4-2: mRemovedEndOffset should be the the largest end of removed "
+      "text");
+  MOZ_ASSERT(mAddedEndOffset == 82,  
+             "Test 6-4-3: mAddedEndOffset should be the first end of added "
+             "text without "
+             "removed text length by the new change");
+  Clear();
+}
+
+#endif
+
+}  
+}  
+
+#if defined(DEBUG)
+struct PrefPair {
+  const char* name;
+  bool value;
+};
+
+static PrefPair debug_PrefValues[] = {
+    {"nglayout.debug.crossing_event_dumping", false},
+    {"nglayout.debug.event_dumping", false},
+    {"nglayout.debug.invalidate_dumping", false},
+    {"nglayout.debug.motion_event_dumping", false},
+    {"nglayout.debug.paint_dumping", false}};
+
+bool nsIWidget::debug_GetCachedBoolPref(const char* aPrefName) {
+  NS_ASSERTION(nullptr != aPrefName, "cmon, pref name is null.");
+
+  for (const auto& debug_PrefValue : debug_PrefValues) {
+    if (strcmp(debug_PrefValue.name, aPrefName) == 0) {
+      return debug_PrefValue.value;
+    }
+  }
+
+  return false;
+}
+static void debug_SetCachedBoolPref(const char* aPrefName, bool aValue) {
+  NS_ASSERTION(nullptr != aPrefName, "cmon, pref name is null.");
+
+  for (auto& debug_PrefValue : debug_PrefValues) {
+    if (strcmp(debug_PrefValue.name, aPrefName) == 0) {
+      debug_PrefValue.value = aValue;
+      return;
+    }
+  }
+
+  NS_ASSERTION(false, "cmon, this code is not reached dude.");
+}
+
+class Debug_PrefObserver final : public nsIObserver {
+  ~Debug_PrefObserver() = default;
+
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+};
+
+NS_IMPL_ISUPPORTS(Debug_PrefObserver, nsIObserver)
+
+NS_IMETHODIMP
+Debug_PrefObserver::Observe(nsISupports* subject, const char* topic,
+                            const char16_t* data) {
+  NS_ConvertUTF16toUTF8 prefName(data);
+
+  bool value = Preferences::GetBool(prefName.get(), false);
+  debug_SetCachedBoolPref(prefName.get(), value);
+  return NS_OK;
+}
+
+ void debug_RegisterPrefCallbacks() {
+  static bool once = true;
+
+  if (!once) {
+    return;
+  }
+
+  once = false;
+
+  nsCOMPtr<nsIObserver> obs(new Debug_PrefObserver());
+  for (auto& debug_PrefValue : debug_PrefValues) {
+    debug_PrefValue.value = Preferences::GetBool(debug_PrefValue.name, false);
+
+    if (obs) {
+      nsCString name;
+      name.AssignLiteral(debug_PrefValue.name, strlen(debug_PrefValue.name));
+      Preferences::AddStrongObserver(obs, name);
+    }
+  }
+}
+static int32_t _GetPrintCount() {
+  static int32_t sCount = 0;
+
+  return ++sCount;
+}
+void nsIWidget::debug_DumpEvent(FILE* aFileOut, nsIWidget* aWidget,
+                                WidgetGUIEvent* aGuiEvent,
+                                const char* aWidgetName, int32_t aWindowID) {
+  if (aGuiEvent->mMessage == eMouseMove) {
+    if (!debug_GetCachedBoolPref("nglayout.debug.motion_event_dumping")) return;
+  }
+
+  if (aGuiEvent->mMessage == eMouseEnterIntoWidget ||
+      aGuiEvent->mMessage == eMouseExitFromWidget) {
+    if (!debug_GetCachedBoolPref("nglayout.debug.crossing_event_dumping"))
+      return;
+  }
+
+  if (!debug_GetCachedBoolPref("nglayout.debug.event_dumping")) return;
+
+  fprintf(aFileOut, "%4d %-26s widget=%-8p name=%-12s id=0x%-6x refpt=%d,%d\n",
+          _GetPrintCount(), ToChar(aGuiEvent->mMessage), (void*)aWidget,
+          aWidgetName, aWindowID, aGuiEvent->mRefPoint.x.value,
+          aGuiEvent->mRefPoint.y.value);
+}
+void nsIWidget::debug_DumpPaintEvent(FILE* aFileOut, nsIWidget* aWidget,
+                                     const nsIntRegion& aRegion,
+                                     const char* aWidgetName,
+                                     int32_t aWindowID) {
+  NS_ASSERTION(nullptr != aFileOut, "cmon, null output FILE");
+  NS_ASSERTION(nullptr != aWidget, "cmon, the widget is null");
+
+  if (!debug_GetCachedBoolPref("nglayout.debug.paint_dumping")) return;
+
+  nsIntRect rect = aRegion.GetBounds();
+  fprintf(aFileOut,
+          "%4d PAINT      widget=%p name=%-12s id=0x%-6x bounds-rect=%3d,%-3d "
+          "%3d,%-3d",
+          _GetPrintCount(), (void*)aWidget, aWidgetName, aWindowID, rect.X(),
+          rect.Y(), rect.Width(), rect.Height());
+
+  fprintf(aFileOut, "\n");
+}
+void nsIWidget::debug_DumpInvalidate(FILE* aFileOut, nsIWidget* aWidget,
+                                     const LayoutDeviceIntRect* aRect,
+                                     const char* aWidgetName,
+                                     int32_t aWindowID) {
+  if (!debug_GetCachedBoolPref("nglayout.debug.invalidate_dumping")) return;
+
+  NS_ASSERTION(nullptr != aFileOut, "cmon, null output FILE");
+  NS_ASSERTION(nullptr != aWidget, "cmon, the widget is null");
+
+  fprintf(aFileOut, "%4d Invalidate widget=%p name=%-12s id=0x%-6x",
+          _GetPrintCount(), (void*)aWidget, aWidgetName, aWindowID);
+
+  if (aRect) {
+    fprintf(aFileOut, " rect=%3d,%-3d %3d,%-3d", aRect->X(), aRect->Y(),
+            aRect->Width(), aRect->Height());
+  } else {
+    fprintf(aFileOut, " rect=%-15s", "none");
+  }
+
+  fprintf(aFileOut, "\n");
+}
+
+#endif

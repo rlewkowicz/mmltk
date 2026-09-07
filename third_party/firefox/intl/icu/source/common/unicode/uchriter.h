@@ -1,0 +1,107 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+**********************************************************************
+*   Copyright (C) 1998-2005, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+**********************************************************************
+*/
+
+#ifndef UCHRITER_H
+#define UCHRITER_H
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+#include "unicode/chariter.h"
+
+ 
+U_NAMESPACE_BEGIN
+
+class U_COMMON_API UCharCharacterIterator : public CharacterIterator {
+public:
+  UCharCharacterIterator(ConstChar16Ptr textPtr, int32_t length);
+
+  UCharCharacterIterator(ConstChar16Ptr textPtr, int32_t length,
+                         int32_t position);
+
+  UCharCharacterIterator(ConstChar16Ptr textPtr, int32_t length,
+                         int32_t textBegin,
+                         int32_t textEnd,
+                         int32_t position);
+
+  UCharCharacterIterator(const UCharCharacterIterator&  that);
+
+  virtual ~UCharCharacterIterator();
+
+  UCharCharacterIterator&
+  operator=(const UCharCharacterIterator&    that);
+
+  virtual bool           operator==(const ForwardCharacterIterator& that) const override;
+
+  virtual int32_t hashCode() const override;
+
+  virtual UCharCharacterIterator* clone() const override;
+
+  virtual char16_t first() override;
+
+  virtual char16_t firstPostInc() override;
+
+  virtual UChar32 first32() override;
+
+  virtual UChar32 first32PostInc() override;
+
+  virtual char16_t last() override;
+
+  virtual UChar32 last32() override;
+
+  virtual char16_t         setIndex(int32_t position) override;
+
+  virtual UChar32       setIndex32(int32_t position) override;
+
+  virtual char16_t current() const override;
+
+  virtual UChar32 current32() const override;
+
+  virtual char16_t next() override;
+
+  virtual char16_t nextPostInc() override;
+
+  virtual UChar32 next32() override;
+
+  virtual UChar32 next32PostInc() override;
+
+  virtual UBool        hasNext() override;
+
+  virtual char16_t previous() override;
+
+  virtual UChar32 previous32() override;
+
+  virtual UBool        hasPrevious() override;
+
+  virtual int32_t      move(int32_t delta, EOrigin origin) override;
+
+#ifdef move32
+#undef move32
+#endif
+  virtual int32_t      move32(int32_t delta, EOrigin origin) override;
+
+  void setText(ConstChar16Ptr newText, int32_t newTextLength);
+
+  virtual void            getText(UnicodeString& result) override;
+
+  static UClassID U_EXPORT2 getStaticClassID();
+
+  virtual UClassID getDynamicClassID() const override;
+
+protected:
+  UCharCharacterIterator();
+  const char16_t*            text;
+
+};
+
+U_NAMESPACE_END
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif

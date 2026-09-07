@@ -1,0 +1,120 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsHTMLFormatConverter.h"
+
+#include "nsArray.h"
+#include "nsCRT.h"
+#include "nsCOMPtr.h"
+#include "nsITransferable.h"
+#include "nsLiteralString.h"
+#include "nsXPCOM.h"
+#include "nsISupportsPrimitives.h"
+
+#include "nsPrimitiveHelpers.h"
+#include "nsIDocumentEncoder.h"
+#include "nsContentUtils.h"
+
+nsHTMLFormatConverter::nsHTMLFormatConverter() = default;
+
+nsHTMLFormatConverter::~nsHTMLFormatConverter() = default;
+
+NS_IMPL_ISUPPORTS(nsHTMLFormatConverter, nsIFormatConverter)
+
+NS_IMETHODIMP
+nsHTMLFormatConverter::GetInputDataFlavors(nsTArray<nsCString>& aFlavors) {
+  aFlavors.AppendElement(nsLiteralCString(kHTMLMime));
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsHTMLFormatConverter::GetOutputDataFlavors(nsTArray<nsCString>& aFlavors) {
+  aFlavors.AppendElement(nsLiteralCString(kHTMLMime));
+  aFlavors.AppendElement(nsLiteralCString(kTextMime));
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsHTMLFormatConverter::CanConvert(const char* aFromDataFlavor,
+                                  const char* aToDataFlavor, bool* _retval) {
+  if (!_retval) return NS_ERROR_INVALID_ARG;
+
+  *_retval = false;
+  if (!nsCRT::strcmp(aFromDataFlavor, kHTMLMime)) {
+    if (!nsCRT::strcmp(aToDataFlavor, kHTMLMime)) {
+      *_retval = true;
+    } else if (!nsCRT::strcmp(aToDataFlavor, kTextMime)) {
+      *_retval = true;
+    }
+  }
+  return NS_OK;
+
+}  
+
+NS_IMETHODIMP
+nsHTMLFormatConverter::Convert(const char* aFromDataFlavor,
+                               nsISupports* aFromData,
+                               const char* aToDataFlavor,
+                               nsISupports** aToData) {
+  if (!aToData) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  *aToData = nullptr;
+
+  if (!nsCRT::strcmp(aFromDataFlavor, kHTMLMime)) {
+    nsAutoCString toFlavor(aToDataFlavor);
+
+    nsCOMPtr<nsISupportsString> dataWrapper0(do_QueryInterface(aFromData));
+    if (!dataWrapper0) {
+      return NS_ERROR_INVALID_ARG;
+    }
+
+    nsAutoString dataStr;
+    dataWrapper0->GetData(dataStr);
+    if (toFlavor.Equals(kHTMLMime) || toFlavor.Equals(kTextMime)) {
+      nsAutoString outStr = dataStr;
+
+      if (toFlavor.Equals(kTextMime)) {
+        nsresult res = ConvertFromHTMLToUnicode(dataStr, outStr);
+        if (NS_FAILED(res)) {
+          return NS_ERROR_FAILURE;
+        }
+      }
+
+      auto len = outStr.Length();
+      if (len > std::numeric_limits<size_t>::max() / 2) {
+        return NS_ERROR_FAILURE;
+      }
+      size_t dataLen = len * 2;
+      nsPrimitiveHelpers::CreatePrimitiveForData(toFlavor, outStr.get(),
+                                                 dataLen, aToData);
+      return NS_OK;
+    }
+  }
+
+  return NS_ERROR_FAILURE;
+}
+
+NS_IMETHODIMP
+nsHTMLFormatConverter::ConvertFromHTMLToUnicode(const nsAutoString& aFromStr,
+                                                nsAutoString& aToStr) {
+  return nsContentUtils::ConvertToPlainText(
+      aFromStr, aToStr,
+      nsIDocumentEncoder::OutputSelectionOnly |
+          nsIDocumentEncoder::OutputAbsoluteLinks |
+          nsIDocumentEncoder::OutputNoScriptContent |
+          nsIDocumentEncoder::OutputNoFramesContent,
+      0);
+}  
+
+NS_IMETHODIMP
+nsHTMLFormatConverter::ConvertFromHTMLToAOLMail(const nsAutoString& aFromStr,
+                                                nsAutoString& aToStr) {
+  aToStr.AssignLiteral("<HTML>");
+  aToStr.Append(aFromStr);
+  aToStr.AppendLiteral("</HTML>");
+
+  return NS_OK;
+}

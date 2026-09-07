@@ -1,0 +1,232 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef intl_components_NumberFormat_h_
+#define intl_components_NumberFormat_h_
+#include <string_view>
+#include <tuple>
+#include <utility>
+
+#include "mozilla/intl/ICU4CGlue.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/PodOperations.h"
+#include "mozilla/Result.h"
+#include "mozilla/intl/ICUError.h"
+#include "mozilla/intl/NumberPart.h"
+
+#include "unicode/ustring.h"
+#include "unicode/unum.h"
+#include "unicode/unumberformatter.h"
+
+struct UPluralRules;
+
+namespace mozilla::intl {
+
+struct PluralRulesOptions;
+
+struct MOZ_STACK_CLASS NumberFormatOptions {
+  enum class Style {
+    Decimal,
+
+    Percent,
+
+    Currency,
+
+    Unit,
+  } mStyle = Style::Decimal;
+
+  enum class CurrencyDisplay {
+    Symbol,
+    Code,
+    Name,
+    NarrowSymbol,
+  };
+  enum class CurrencySign {
+    Standard,
+    Accounting,
+  };
+  Maybe<std::tuple<std::string_view, CurrencyDisplay, CurrencySign>> mCurrency;
+
+  Maybe<std::pair<uint32_t, uint32_t>> mFractionDigits;
+
+  Maybe<uint32_t> mMinIntegerDigits;
+
+  Maybe<std::pair<uint32_t, uint32_t>> mSignificantDigits;
+
+  enum class UnitDisplay { Short, Narrow, Long };
+  Maybe<std::pair<std::string_view, UnitDisplay>> mUnit;
+
+  bool mStripTrailingZero = false;
+
+  enum class Grouping {
+    Auto,
+    Always,
+    Min2,
+    Never,
+  } mGrouping = Grouping::Auto;
+
+  enum class Notation {
+    Standard,
+    Scientific,
+    Engineering,
+    CompactShort,
+    CompactLong
+  } mNotation = Notation::Standard;
+
+  enum class SignDisplay {
+    Auto,
+    Never,
+    Always,
+    ExceptZero,
+    Negative,
+  } mSignDisplay = SignDisplay::Auto;
+
+  uint32_t mRoundingIncrement = 1;
+
+  enum class RoundingMode {
+    Ceil,
+    Floor,
+    Expand,
+    Trunc,
+    HalfCeil,
+    HalfFloor,
+    HalfExpand,
+    HalfTrunc,
+    HalfEven,
+    HalfOdd,
+  } mRoundingMode = RoundingMode::HalfExpand;
+
+  enum class RoundingPriority {
+    Auto,
+    MorePrecision,
+    LessPrecision,
+  } mRoundingPriority = RoundingPriority::Auto;
+};
+
+
+class NumberFormat final {
+ public:
+  static Result<UniquePtr<NumberFormat>, ICUError> TryCreate(
+      std::string_view aLocale, const NumberFormatOptions& aOptions);
+
+  NumberFormat() = default;
+  NumberFormat(const NumberFormat&) = delete;
+  NumberFormat& operator=(const NumberFormat&) = delete;
+  ~NumberFormat();
+
+  Result<std::u16string_view, ICUError> format(double number) const {
+    if (!formatInternal(number)) {
+      return Err(ICUError::InternalError);
+    }
+
+    return formatResult();
+  }
+
+  Result<std::u16string_view, ICUError> formatToParts(
+      double number, NumberPartVector& parts) const;
+
+  template <typename B>
+  Result<Ok, ICUError> format(double number, B& buffer) const {
+    if (!formatInternal(number)) {
+      return Err(ICUError::InternalError);
+    }
+
+    return formatResult<typename B::CharType, B>(buffer);
+  }
+
+  Result<std::u16string_view, ICUError> format(int64_t number) const {
+    if (!formatInternal(number)) {
+      return Err(ICUError::InternalError);
+    }
+
+    return formatResult();
+  }
+
+  Result<std::u16string_view, ICUError> formatToParts(
+      int64_t number, NumberPartVector& parts) const;
+
+  template <typename B>
+  Result<Ok, ICUError> format(int64_t number, B& buffer) const {
+    if (!formatInternal(number)) {
+      return Err(ICUError::InternalError);
+    }
+
+    return formatResult<typename B::CharType, B>(buffer);
+  }
+
+  Result<std::u16string_view, ICUError> format(std::string_view number) const {
+    if (!formatInternal(number)) {
+      return Err(ICUError::InternalError);
+    }
+
+    return formatResult();
+  }
+
+  Result<std::u16string_view, ICUError> formatToParts(
+      std::string_view number, NumberPartVector& parts) const;
+
+  template <typename B>
+  Result<Ok, ICUError> format(std::string_view number, B& buffer) const {
+    if (!formatInternal(number)) {
+      return Err(ICUError::InternalError);
+    }
+
+    return formatResult<typename B::CharType, B>(buffer);
+  }
+
+  Result<int32_t, ICUError> selectFormatted(double number, char16_t* keyword,
+                                            int32_t keywordSize,
+                                            UPluralRules* pluralRules) const;
+
+  Result<int32_t, ICUError> selectFormatted(std::string_view number,
+                                            char16_t* keyword,
+                                            int32_t keywordSize,
+                                            UPluralRules* pluralRules) const;
+
+  static auto GetAvailableLocales() {
+    return AvailableLocalesEnumeration<unum_countAvailable,
+                                       unum_getAvailable>();
+  }
+
+ private:
+  UNumberFormatter* mNumberFormatter = nullptr;
+  UFormattedNumber* mFormattedNumber = nullptr;
+  bool mFormatForUnit = false;
+
+  Result<Ok, ICUError> initialize(std::string_view aLocale,
+                                  const NumberFormatOptions& aOptions);
+
+  [[nodiscard]] bool formatInternal(double number) const;
+  [[nodiscard]] bool formatInternal(int64_t number) const;
+  [[nodiscard]] bool formatInternal(std::string_view number) const;
+
+  Result<std::u16string_view, ICUError> formatResult() const;
+
+  template <typename C, typename B>
+  Result<Ok, ICUError> formatResult(B& buffer) const {
+    static_assert(std::is_same_v<C, char> || std::is_same_v<C, char16_t>);
+
+    return formatResult().andThen(
+        [&buffer](std::u16string_view result) -> Result<Ok, ICUError> {
+          if constexpr (std::is_same_v<C, char>) {
+            if (!FillBuffer(Span(result.data(), result.size()), buffer)) {
+              return Err(ICUError::OutOfMemory);
+            }
+            return Ok();
+          } else {
+            if (!buffer.reserve(result.size())) {
+              return Err(ICUError::OutOfMemory);
+            }
+            PodCopy(static_cast<char16_t*>(buffer.data()), result.data(),
+                    result.size());
+            buffer.written(result.size());
+
+            return Ok();
+          }
+        });
+  }
+};
+
+}  
+
+#endif

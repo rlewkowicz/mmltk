@@ -1,0 +1,49 @@
+# syntax=docker/dockerfile:1
+
+FROM mmltk_nvidia_payload AS nvidia_payload
+FROM mmltk_onnxruntime AS onnxruntime
+FROM mmltk_dependencies
+
+COPY --link --from=onnxruntime /development/ /
+COPY --link --from=nvidia_payload /development/ /
+COPY docker/patches/gcc16-nvcc-string-substr.patch /tmp/gcc16-nvcc-string-substr.patch
+RUN patch --batch --fuzz=0 -d /opt/gcc-16.2/include/c++/16.2.0 -p1 \
+        </tmp/gcc16-nvcc-string-substr.patch \
+    && rm /tmp/gcc16-nvcc-string-substr.patch
+COPY docker/verify_nvidia_payload.py docker/nvidia_payload.py /usr/local/libexec/mmltk/
+ARG MMLTK_CUDA_ROOT
+ARG MMLTK_PYTHON_ROOT
+ARG MMLTK_NVIDIA_LIBRARY_PATH
+ARG MMLTK_CUDA_VERSION
+ARG MMLTK_TORCH_VERSION
+ARG MMLTK_TENSORRT_VERSION
+ENV CUDA_HOME=${MMLTK_CUDA_ROOT} \
+    CUDA_BIN_PATH=${MMLTK_CUDA_ROOT} \
+    CUDACXX=${MMLTK_CUDA_ROOT}/bin/nvcc \
+    PYTHONPATH=${MMLTK_PYTHON_ROOT} \
+    PYTHONDONTWRITEBYTECODE=1 \
+    LD_LIBRARY_PATH=/opt/gcc-16.2/lib64:/opt/onnxruntime/lib:${MMLTK_NVIDIA_LIBRARY_PATH} \
+    PATH=${MMLTK_CUDA_ROOT}/bin:${PATH}
+COPY tools/check_toolchain_invariants.py /usr/local/libexec/mmltk/check_toolchain_invariants.py
+RUN ldconfig \
+    && python3 /usr/local/libexec/mmltk/check_toolchain_invariants.py --dependencies-only \
+    && python3 /usr/local/libexec/mmltk/verify_nvidia_payload.py --mode development
+
+ARG MMLTK_IMAGE_FINGERPRINT=unlabeled
+ARG MMLTK_COMPILATION_IDENTITY=unknown
+ARG MMLTK_TOOLCHAIN_BASE_IDENTITY=unknown
+ARG MMLTK_DEPENDENCIES_IDENTITY=unknown
+ARG MMLTK_NVIDIA_PAYLOAD_IDENTITY=unknown
+ARG MMLTK_ONNXRUNTIME_IDENTITY=unknown
+ARG MMLTK_NVIDIA_DONOR_IMAGE
+LABEL com.mmltk.input-fingerprint="${MMLTK_IMAGE_FINGERPRINT}" \
+      com.mmltk.compilation-identity="${MMLTK_COMPILATION_IDENTITY}" \
+      com.mmltk.dependencies-identity="${MMLTK_DEPENDENCIES_IDENTITY}" \
+      com.mmltk.toolchain-base-identity="${MMLTK_TOOLCHAIN_BASE_IDENTITY}" \
+      com.mmltk.onnxruntime-identity="${MMLTK_ONNXRUNTIME_IDENTITY}" \
+      com.mmltk.nvidia-payload-identity="${MMLTK_NVIDIA_PAYLOAD_IDENTITY}" \
+      com.mmltk.nvidia-donor="${MMLTK_NVIDIA_DONOR_IMAGE}" \
+      com.mmltk.payload-mode="development" \
+      com.mmltk.cuda-version="${MMLTK_CUDA_VERSION}" \
+      com.mmltk.torch-version="${MMLTK_TORCH_VERSION}" \
+      com.mmltk.tensorrt-version="${MMLTK_TENSORRT_VERSION}"

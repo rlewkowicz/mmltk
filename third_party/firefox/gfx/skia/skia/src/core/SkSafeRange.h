@@ -1,0 +1,43 @@
+/*
+ * Copyright 2018 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkSafeRange_DEFINED)
+#define SkSafeRange_DEFINED
+
+#include "include/core/SkTypes.h"
+
+#include <cstdint>
+
+
+class SkSafeRange {
+public:
+    explicit operator bool() const { return fOK; }
+
+    bool ok() const { return fOK; }
+
+    template <typename T> T checkLE(uint64_t value, T max) {
+        SkASSERT(static_cast<int64_t>(max) >= 0);
+        if (value > static_cast<uint64_t>(max)) {
+            fOK = false;
+            value = 0;
+        }
+        return static_cast<T>(value);
+    }
+
+    int checkGE(int value, int min) {
+        if (value < min) {
+            fOK = false;
+            value = min;
+        }
+        return value;
+    }
+
+private:
+    bool fOK = true;
+};
+
+#endif

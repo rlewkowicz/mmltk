@@ -1,0 +1,177 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ReadableStreamDefaultControllerAbstract.h"
+#include "TransformStreamAbstract.h"
+#include "TransformStreamDefaultControllerAbstract.h"
+#include "TransformerCallbackHelpers.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/ReadableStream.h"
+#include "mozilla/dom/TransformStreamDefaultControllerBinding.h"
+#include "nsWrapperCache.h"
+
+namespace mozilla::dom {
+
+using namespace streams_abstract;
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(TransformStreamDefaultController, mGlobal,
+                                      mStream, mTransformerAlgorithms)
+NS_IMPL_CYCLE_COLLECTING_ADDREF(TransformStreamDefaultController)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(TransformStreamDefaultController)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(TransformStreamDefaultController)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+TransformStream* TransformStreamDefaultController::Stream() { return mStream; }
+
+void TransformStreamDefaultController::SetStream(TransformStream& aStream) {
+  MOZ_ASSERT(!mStream);
+  mStream = &aStream;
+}
+
+TransformerAlgorithmsBase* TransformStreamDefaultController::Algorithms() {
+  return mTransformerAlgorithms;
+}
+
+void TransformStreamDefaultController::SetAlgorithms(
+    TransformerAlgorithmsBase* aTransformerAlgorithms) {
+  mTransformerAlgorithms = aTransformerAlgorithms;
+}
+
+TransformStreamDefaultController::TransformStreamDefaultController(
+    nsIGlobalObject* aGlobal)
+    : mGlobal(aGlobal) {
+  mozilla::HoldJSObjects(this);
+}
+
+TransformStreamDefaultController::~TransformStreamDefaultController() {
+  mozilla::DropJSObjects(this);
+}
+
+JSObject* TransformStreamDefaultController::WrapObject(
+    JSContext* aCx, JS::Handle<JSObject*> aGivenProto) {
+  return TransformStreamDefaultController_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+Nullable<double> TransformStreamDefaultController::GetDesiredSize() const {
+  RefPtr<ReadableStreamDefaultController> readableController =
+      mStream->Readable()->Controller()->AsDefault();
+
+  return ReadableStreamDefaultControllerGetDesiredSize(readableController);
+}
+
+static bool ReadableStreamDefaultControllerHasBackpressure(
+    ReadableStreamDefaultController* aController) {
+  return !ReadableStreamDefaultControllerShouldCallPull(aController);
+}
+
+void TransformStreamDefaultController::Enqueue(JSContext* aCx,
+                                               JS::Handle<JS::Value> aChunk,
+                                               ErrorResult& aRv) {
+
+
+  RefPtr<TransformStream> stream = mStream;
+
+  RefPtr<ReadableStreamDefaultController> readableController =
+      stream->Readable()->Controller()->AsDefault();
+
+  if (!ReadableStreamDefaultControllerCanCloseOrEnqueueAndThrow(
+          readableController, CloseOrEnqueue::Enqueue, aRv)) {
+    return;
+  }
+
+  ErrorResult rv;
+  ReadableStreamDefaultControllerEnqueue(aCx, readableController, aChunk, rv);
+
+  if (rv.MaybeSetPendingException(aCx)) {
+    JS::Rooted<JS::Value> error(aCx);
+    if (!JS_GetPendingException(aCx, &error)) {
+      aRv.StealExceptionFromJSContext(aCx);
+      return;
+    }
+    JS_ClearPendingException(aCx);
+
+    TransformStreamErrorWritableAndUnblockWrite(aCx, stream, error, aRv);
+
+    JS::Rooted<JS::Value> storedError(aCx);
+    stream->Readable()->GetStoredError(aCx, &storedError, aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+
+    aRv.MightThrowJSException();
+    aRv.ThrowJSException(aCx, storedError);
+    return;
+  }
+
+  bool backpressure =
+      ReadableStreamDefaultControllerHasBackpressure(readableController);
+
+  if (backpressure != stream->Backpressure()) {
+    MOZ_ASSERT(backpressure);
+
+    stream->SetBackpressure(true);
+  }
+}
+
+void TransformStreamDefaultController::Error(JSContext* aCx,
+                                             JS::Handle<JS::Value> aError,
+                                             ErrorResult& aRv) {
+
+
+  TransformStreamError(aCx, MOZ_KnownLive(mStream), aError, aRv);
+}
+
+
+void TransformStreamDefaultController::Terminate(JSContext* aCx,
+                                                 ErrorResult& aRv) {
+
+
+  RefPtr<TransformStream> stream = mStream;
+
+  RefPtr<ReadableStreamDefaultController> readableController =
+      stream->Readable()->Controller()->AsDefault();
+
+  ReadableStreamDefaultControllerClose(aCx, readableController, aRv);
+
+  ErrorResult rv;
+  rv.ThrowTypeError("Terminating the stream");
+  JS::Rooted<JS::Value> error(aCx);
+  MOZ_ALWAYS_TRUE(ToJSValue(aCx, std::move(rv), &error));
+
+  TransformStreamErrorWritableAndUnblockWrite(aCx, stream, error, aRv);
+}
+
+namespace streams_abstract {
+
+void SetUpTransformStreamDefaultController(
+    JSContext* aCx, TransformStream& aStream,
+    TransformStreamDefaultController& aController,
+    TransformerAlgorithmsBase& aTransformerAlgorithms) {
+  MOZ_ASSERT(!aStream.Controller());
+
+  aController.SetStream(aStream);
+
+  aStream.SetController(aController);
+
+  aController.SetAlgorithms(&aTransformerAlgorithms);
+}
+
+void SetUpTransformStreamDefaultControllerFromTransformer(
+    JSContext* aCx, TransformStream& aStream,
+    JS::Handle<JSObject*> aTransformer, Transformer& aTransformerDict) {
+  auto controller =
+      MakeRefPtr<TransformStreamDefaultController>(aStream.GetParentObject());
+
+  auto algorithms = MakeRefPtr<TransformerAlgorithms>(
+      aStream.GetParentObject(), aTransformer, aTransformerDict);
+
+  SetUpTransformStreamDefaultController(aCx, aStream, *controller, *algorithms);
+}
+
+}  
+
+}  

@@ -1,0 +1,204 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_DocumentOrShadowRoot_h_
+#define mozilla_dom_DocumentOrShadowRoot_h_
+
+#include "mozilla/IdentifierMapEntry.h"
+#include "mozilla/RelativeTo.h"
+#include "mozilla/ReverseIterator.h"
+#include "mozilla/dom/NameSpaceConstants.h"
+#include "nsClassHashtable.h"
+#include "nsContentListDeclarations.h"
+#include "nsTArray.h"
+#include "nsTHashSet.h"
+
+class nsCycleCollectionTraversalCallback;
+class nsINode;
+class nsWindowSizes;
+
+namespace mozilla {
+class ErrorResult;
+class StyleSheet;
+class ErrorResult;
+
+namespace dom {
+
+class Animation;
+class Element;
+class ContentList;
+class CustomElementRegistry;
+class Document;
+class DocumentOrShadowRoot;
+class HTMLInputElement;
+class NodeList;
+class StyleSheetList;
+class ShadowRoot;
+template <typename T>
+class Sequence;
+
+class DocumentOrShadowRoot {
+  enum class Kind {
+    Document,
+    ShadowRoot,
+  };
+
+ public:
+  explicit DocumentOrShadowRoot(Document*);
+  explicit DocumentOrShadowRoot(ShadowRoot*);
+
+  static void Traverse(DocumentOrShadowRoot* tmp,
+                       nsCycleCollectionTraversalCallback& cb);
+  static void Unlink(DocumentOrShadowRoot* tmp);
+
+  nsINode& AsNode() { return *mAsNode; }
+
+  const nsINode& AsNode() const { return *mAsNode; }
+
+  StyleSheet* SheetAt(size_t aIndex) const {
+    return mStyleSheets.SafeElementAt(aIndex);
+  }
+
+  size_t SheetCount() const { return mStyleSheets.Length(); }
+
+  const nsTArray<RefPtr<StyleSheet>>& AdoptedStyleSheets() const {
+    return mAdoptedStyleSheets;
+  }
+
+  size_t FindSheetInsertionPointInTree(const StyleSheet&) const;
+
+  size_t StyleOrderIndexOfSheet(const StyleSheet& aSheet) const;
+
+  StyleSheetList* StyleSheets();
+
+  void RemoveStyleSheet(StyleSheet&);
+
+  Element* GetElementById(const nsAString& aElementId) const;
+  Element* GetElementById(nsAtom* aElementId) const;
+
+  Span<Element* const> GetAllElementsForId(
+      const IdentifierMapEntry::DependentAtomOrString& aElementId) const {
+    if (IdentifierMapEntry* entry = LookupIdentifierInMap(aElementId)) {
+      return entry->GetIdElements();
+    }
+    return {};
+  }
+
+  IdentifierMapEntry* LookupIdentifierInMap(
+      const IdentifierMapEntry::DependentAtomOrString& aIdentifier) const {
+    return mIdentifierMap.GetEntry(aIdentifier);
+  }
+
+  already_AddRefed<ContentList> GetElementsByTagName(
+      const nsAString& aTagName) {
+    return NS_GetContentList(&AsNode(), kNameSpaceID_Unknown, aTagName);
+  }
+  already_AddRefed<ContentList> GetElementsByTagNameNS(
+      const nsAString& aNamespaceURI, const nsAString& aLocalName);
+  already_AddRefed<ContentList> GetElementsByTagNameNS(
+      const nsAString& aNamespaceURI, const nsAString& aLocalName,
+      mozilla::ErrorResult&);
+  already_AddRefed<ContentList> GetElementsByClassName(
+      const nsAString& aClasses);
+
+  ~DocumentOrShadowRoot();
+
+  Element* GetPointerLockElement();
+  Element* GetFullscreenElement() const;
+  Element* ElementFromPoint(float aX, float aY);
+  nsINode* NodeFromPoint(float aX, float aY);
+
+  void ElementsFromPoint(float aX, float aY, nsTArray<RefPtr<Element>>&);
+  void NodesFromPoint(float aX, float aY, nsTArray<RefPtr<nsINode>>&);
+
+  Element* ElementFromPointHelper(float aX, float aY,
+                                  bool aIgnoreRootScrollFrame,
+                                  bool aFlushLayout, ViewportType aViewportType,
+                                  bool aPerformRetargeting = true);
+
+  void NodesFromRect(float aX, float aY, float aTopSize, float aRightSize,
+                     float aBottomSize, float aLeftSize,
+                     bool aIgnoreRootScrollFrame, bool aFlushLayout,
+                     bool aOnlyVisible, float aVisibleThreshold,
+                     nsTArray<RefPtr<nsINode>>&);
+
+  typedef bool (*IDTargetObserver)(Element* aOldElement, Element* aNewelement,
+                                   void* aData);
+
+  Element* AddIDTargetObserver(nsAtom* aID, IDTargetObserver aObserver,
+                               void* aData, bool aForImage);
+
+  void RemoveIDTargetObserver(nsAtom* aID, IDTargetObserver aObserver,
+                              void* aData, bool aForImage);
+
+  Element* LookupImageElement(nsAtom* aId);
+
+  inline bool CheckGetElementByIdArg(const nsAString& aId) {
+    if (aId.IsEmpty()) {
+      ReportEmptyGetElementByIdArg();
+      return false;
+    }
+    return true;
+  }
+
+  void ReportEmptyGetElementByIdArg() const;
+
+  MOZ_CAN_RUN_SCRIPT
+  void GetAnimations(nsTArray<RefPtr<Animation>>& aAnimations);
+
+  nsINode* Retarget(nsINode*) const;
+
+  void OnSetAdoptedStyleSheets(StyleSheet&, uint32_t aIndex, ErrorResult&);
+  void OnDeleteAdoptedStyleSheets(StyleSheet&, uint32_t aIndex, ErrorResult&);
+
+  template <typename Callback>
+  void EnumerateUniqueAdoptedStyleSheetsBackToFront(Callback aCallback) {
+    StyleSheetSet set(mAdoptedStyleSheets.Length());
+    for (StyleSheet* sheet : Reversed(mAdoptedStyleSheets)) {
+      if (MOZ_UNLIKELY(!set.EnsureInserted(sheet))) {
+        continue;
+      }
+      aCallback(*sheet);
+    }
+  }
+
+  CustomElementRegistry* GetCustomElementRegistry();
+
+ protected:
+  void TraverseSheetRefInStylesIfApplicable(
+      StyleSheet&, nsCycleCollectionTraversalCallback&);
+  void TraverseStyleSheets(nsTArray<RefPtr<StyleSheet>>&, const char*,
+                           nsCycleCollectionTraversalCallback&);
+  void UnlinkStyleSheets(nsTArray<RefPtr<StyleSheet>>&);
+
+  using StyleSheetSet = nsTHashSet<const StyleSheet*>;
+  void RemoveSheetFromStylesIfApplicable(StyleSheet&);
+  void ClearAdoptedStyleSheets();
+
+  void CloneAdoptedSheetsFrom(const DocumentOrShadowRoot&);
+
+  void InsertSheetAt(size_t aIndex, StyleSheet& aSheet);
+
+  void AddSizeOfExcludingThis(nsWindowSizes&) const;
+  void AddSizeOfOwnedSheetArrayExcludingThis(
+      nsWindowSizes&, const nsTArray<RefPtr<StyleSheet>>&) const;
+
+  Element* GetRetargetedFocusedElement();
+
+  nsTArray<RefPtr<StyleSheet>> mStyleSheets;
+  RefPtr<StyleSheetList> mDOMStyleSheets;
+
+  nsTArray<RefPtr<StyleSheet>> mAdoptedStyleSheets;
+
+  nsTHashtable<IdentifierMapEntry> mIdentifierMap;
+
+  nsINode* mAsNode;
+  const Kind mKind;
+};
+
+}  
+
+}  
+
+#endif

@@ -1,0 +1,184 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "MemoryBlockCache.h"
+
+#include "mozilla/Atomics.h"
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/Logging.h"
+#include "mozilla/Services.h"
+#include "mozilla/StaticPrefs_media.h"
+#include "nsWeakReference.h"
+#include "prsystem.h"
+
+namespace mozilla {
+
+#undef LOG
+LazyLogModule gMemoryBlockCacheLog("MemoryBlockCache");
+#define LOG(x, ...)                                                           \
+  MOZ_LOG_FMT(gMemoryBlockCacheLog, LogLevel::Debug, "{} " x, fmt::ptr(this), \
+              ##__VA_ARGS__)
+
+static Atomic<size_t> gCombinedSizes;
+
+static int32_t CalculateMaxBlocks(int64_t aContentLength) {
+  int64_t maxSize = int64_t(StaticPrefs::media_memory_cache_max_size()) * 1024;
+  MOZ_ASSERT(aContentLength <= maxSize);
+  MOZ_ASSERT(maxSize % MediaBlockCacheBase::BLOCK_SIZE == 0);
+  const int32_t requiredBlocks = maxSize / MediaBlockCacheBase::BLOCK_SIZE;
+  const int32_t workableBlocks =
+      25 * 1024 * 1024 / 8 / MediaBlockCacheBase::BLOCK_SIZE;
+  return std::max(requiredBlocks, workableBlocks);
+}
+
+MemoryBlockCache::MemoryBlockCache(int64_t aContentLength)
+    : mInitialContentLength((aContentLength >= 0) ? size_t(aContentLength) : 0),
+      mMaxBlocks(CalculateMaxBlocks(aContentLength)),
+      mMutex("MemoryBlockCache"),
+      mHasGrown(false) {
+  if (aContentLength <= 0) {
+    LOG("MemoryBlockCache() MEMORYBLOCKCACHE_ERRORS='InitUnderuse'");
+  }
+}
+
+MemoryBlockCache::~MemoryBlockCache() {
+  MOZ_ASSERT(gCombinedSizes >= mBuffer.Length());
+  size_t sizes = static_cast<size_t>(gCombinedSizes -= mBuffer.Length());
+  LOG("~MemoryBlockCache() - destroying buffer of size {}; combined sizes now "
+      "{}",
+      mBuffer.Length(), sizes);
+}
+
+bool MemoryBlockCache::EnsureBufferCanContain(size_t aContentLength) {
+  mMutex.AssertCurrentThreadOwns();
+  if (aContentLength == 0) {
+    return true;
+  }
+  const size_t initialLength = mBuffer.Length();
+  const size_t desiredLength =
+      ((aContentLength - 1) / BLOCK_SIZE + 1) * BLOCK_SIZE;
+  if (initialLength >= desiredLength) {
+    return true;
+  }
+  const size_t extra = desiredLength - initialLength;
+  if (initialLength == 0) {
+    static const size_t sysmem =
+        std::max<size_t>(PR_GetPhysicalMemorySize(), 32 * 1024 * 1024);
+    const size_t limit = std::min(
+        size_t(StaticPrefs::media_memory_caches_combined_limit_kb()) * 1024,
+        sysmem * StaticPrefs::media_memory_caches_combined_limit_pc_sysmem() /
+            100);
+    const size_t currentSizes = static_cast<size_t>(gCombinedSizes);
+    if (currentSizes + extra > limit) {
+      LOG("EnsureBufferCanContain({}) - buffer size {}, wanted + {} = {};"
+          " combined sizes {} + {} > limit {}",
+          aContentLength, initialLength, extra, desiredLength, currentSizes,
+          extra, limit);
+      return false;
+    }
+  }
+  if (!mBuffer.SetLength(desiredLength, mozilla::fallible)) {
+    LOG("EnsureBufferCanContain({}) - buffer size {}, wanted + {} = {}, "
+        "allocation failed",
+        aContentLength, initialLength, extra, desiredLength);
+    return false;
+  }
+  MOZ_ASSERT(mBuffer.Length() == desiredLength);
+  const size_t capacity = mBuffer.Capacity();
+  const size_t extraCapacity = capacity - desiredLength;
+  if (extraCapacity != 0) {
+    mBuffer.SetLength(capacity);
+  }
+  const size_t newSizes = gCombinedSizes += (extra + extraCapacity);
+  LOG("EnsureBufferCanContain({}) - buffer size {} + requested {} + bonus "
+      "{} = {}; combined sizes {}",
+      aContentLength, initialLength, extra, extraCapacity, capacity, newSizes);
+  mHasGrown = true;
+  return true;
+}
+
+nsresult MemoryBlockCache::Init() {
+  LOG("Init()");
+  MutexAutoLock lock(mMutex);
+  MOZ_ASSERT(mBuffer.IsEmpty());
+  if (!EnsureBufferCanContain(mInitialContentLength)) {
+    LOG("Init() MEMORYBLOCKCACHE_ERRORS='InitAllocation'");
+    return NS_ERROR_FAILURE;
+  }
+  return NS_OK;
+}
+
+void MemoryBlockCache::Flush() {
+  LOG("Flush()");
+  MutexAutoLock lock(mMutex);
+  MOZ_ASSERT(mBuffer.Length() >= mInitialContentLength);
+  memset(mBuffer.Elements(), 0, mBuffer.Length());
+  mHasGrown = false;
+}
+
+nsresult MemoryBlockCache::WriteBlock(uint32_t aBlockIndex,
+                                      Span<const uint8_t> aData1,
+                                      Span<const uint8_t> aData2) {
+  MutexAutoLock lock(mMutex);
+
+  size_t offset = BlockIndexToOffset(aBlockIndex);
+  if (offset + aData1.Length() + aData2.Length() > mBuffer.Length() &&
+      !mHasGrown) {
+    LOG("WriteBlock() MEMORYBLOCKCACHE_ERRORS='WriteBlockOverflow'");
+  }
+  if (!EnsureBufferCanContain(offset + aData1.Length() + aData2.Length())) {
+    LOG("WriteBlock() MEMORYBLOCKCACHE_ERRORS='WriteBlockCannotGrow'");
+    return NS_ERROR_FAILURE;
+  }
+
+  memcpy(mBuffer.Elements() + offset, aData1.Elements(), aData1.Length());
+  if (aData2.Length() > 0) {
+    memcpy(mBuffer.Elements() + offset + aData1.Length(), aData2.Elements(),
+           aData2.Length());
+  }
+
+  return NS_OK;
+}
+
+nsresult MemoryBlockCache::Read(int64_t aOffset, uint8_t* aData,
+                                int32_t aLength) {
+  MutexAutoLock lock(mMutex);
+
+  MOZ_ASSERT(aOffset >= 0);
+  if (aOffset + aLength > int64_t(mBuffer.Length())) {
+    LOG("Read() MEMORYBLOCKCACHE_ERRORS='ReadOverrun'");
+    return NS_ERROR_FAILURE;
+  }
+
+  memcpy(aData, mBuffer.Elements() + aOffset, aLength);
+  return NS_OK;
+}
+
+nsresult MemoryBlockCache::MoveBlock(int32_t aSourceBlockIndex,
+                                     int32_t aDestBlockIndex) {
+  MutexAutoLock lock(mMutex);
+
+  size_t sourceOffset = BlockIndexToOffset(aSourceBlockIndex);
+  size_t destOffset = BlockIndexToOffset(aDestBlockIndex);
+  if (sourceOffset + BLOCK_SIZE > mBuffer.Length()) {
+    LOG("MoveBlock() MEMORYBLOCKCACHE_ERRORS='MoveBlockSourceOverrun'");
+    return NS_ERROR_FAILURE;
+  }
+  if (destOffset + BLOCK_SIZE > mBuffer.Length() && !mHasGrown) {
+    LOG("MoveBlock() MEMORYBLOCKCACHE_ERRORS='MoveBlockDestOverflow'");
+  }
+  if (!EnsureBufferCanContain(destOffset + BLOCK_SIZE)) {
+    LOG("MoveBlock() MEMORYBLOCKCACHE_ERRORS='MoveBlockCannotGrow'");
+    return NS_ERROR_FAILURE;
+  }
+
+  memcpy(mBuffer.Elements() + destOffset, mBuffer.Elements() + sourceOffset,
+         BLOCK_SIZE);
+
+  return NS_OK;
+}
+
+}  
+
+#undef LOG

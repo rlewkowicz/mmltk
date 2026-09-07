@@ -1,0 +1,272 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_image_ISurfaceProvider_h
+#define mozilla_image_ISurfaceProvider_h
+
+#include "SurfaceCache.h"
+#include "imgFrame.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/NotNull.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/gfx/2D.h"
+#include "mozilla/image/WebRenderImageProvider.h"
+
+namespace mozilla {
+namespace image {
+
+class CachedSurface;
+class DrawableSurface;
+
+class ISurfaceProvider : public WebRenderImageProvider {
+ public:
+  NS_INLINE_DECL_PURE_VIRTUAL_REFCOUNTING
+
+  ImageKey GetImageKey() const { return mImageKey; }
+
+  const SurfaceKey& GetSurfaceKey() const { return mSurfaceKey; }
+
+  DrawableSurface Surface();
+
+  virtual bool IsFinished() const = 0;
+
+  virtual bool IsFullyDecoded() const { return IsFinished(); }
+
+  virtual size_t LogicalSizeInBytes() const = 0;
+
+  typedef imgFrame::AddSizeOfCbData AddSizeOfCbData;
+  typedef imgFrame::AddSizeOfCb AddSizeOfCb;
+
+  virtual void AddSizeOfExcludingThis(MallocSizeOf aMallocSizeOf,
+                                      const AddSizeOfCb& aCallback) {
+    DrawableFrameRef ref = DrawableRef( 0);
+    if (!ref) {
+      return;
+    }
+
+    ref->AddSizeOfExcludingThis(aMallocSizeOf, aCallback);
+  }
+
+  virtual void Reset() {}
+  virtual void Advance(size_t aFrame) {}
+  virtual bool MayAdvance() const { return false; }
+  virtual void MarkMayAdvance() {}
+
+  AvailabilityState& Availability() { return mAvailability; }
+  const AvailabilityState& Availability() const { return mAvailability; }
+
+ protected:
+  ISurfaceProvider(const ImageKey aImageKey, const SurfaceKey& aSurfaceKey,
+                   AvailabilityState aAvailability)
+      : WebRenderImageProvider(aImageKey),
+        mImageKey(aImageKey),
+        mSurfaceKey(aSurfaceKey),
+        mAvailability(aAvailability) {
+    MOZ_ASSERT(aImageKey, "Must have a valid image key");
+  }
+
+  virtual ~ISurfaceProvider() {}
+
+  virtual DrawableFrameRef DrawableRef(size_t aFrame) = 0;
+
+  virtual already_AddRefed<imgFrame> GetFrame(size_t aFrame) {
+    MOZ_ASSERT_UNREACHABLE("Surface provider does not support direct access!");
+    return nullptr;
+  }
+
+  virtual bool IsLocked() const = 0;
+
+  virtual void SetLocked(bool aLocked) = 0;
+
+ private:
+  friend class CachedSurface;
+  friend class DrawableSurface;
+
+  const ImageKey mImageKey;
+  const SurfaceKey mSurfaceKey;
+  AvailabilityState mAvailability;
+};
+
+class MOZ_STACK_CLASS DrawableSurface final {
+ public:
+  DrawableSurface() : mHaveSurface(false) {}
+
+  explicit DrawableSurface(NotNull<ISurfaceProvider*> aProvider)
+      : mProvider(aProvider), mHaveSurface(true) {}
+
+  DrawableSurface(DrawableSurface&& aOther)
+      : mDrawableRef(std::move(aOther.mDrawableRef)),
+        mProvider(std::move(aOther.mProvider)),
+        mHaveSurface(aOther.mHaveSurface) {
+    aOther.mHaveSurface = false;
+  }
+
+  DrawableSurface& operator=(DrawableSurface&& aOther) {
+    MOZ_ASSERT(this != &aOther, "Self-moves are prohibited");
+    mDrawableRef = std::move(aOther.mDrawableRef);
+    mProvider = std::move(aOther.mProvider);
+    mHaveSurface = aOther.mHaveSurface;
+    aOther.mHaveSurface = false;
+    return *this;
+  }
+
+  nsresult Seek(size_t aFrame) {
+    MOZ_ASSERT(mHaveSurface, "Trying to seek an empty DrawableSurface?");
+
+    if (!mProvider) {
+      MOZ_ASSERT_UNREACHABLE("Trying to seek a static DrawableSurface?");
+      return NS_ERROR_FAILURE;
+    }
+
+    mDrawableRef = mProvider->DrawableRef(aFrame);
+
+    return mDrawableRef ? NS_OK : NS_ERROR_FAILURE;
+  }
+
+  already_AddRefed<imgFrame> GetFrame(size_t aFrame) {
+    MOZ_ASSERT(mHaveSurface, "Trying to get on an empty DrawableSurface?");
+
+    if (!mProvider) {
+      MOZ_ASSERT_UNREACHABLE("Trying to get on a static DrawableSurface?");
+      return nullptr;
+    }
+
+    return mProvider->GetFrame(aFrame);
+  }
+
+  void Reset() {
+    if (!mProvider) {
+      MOZ_ASSERT_UNREACHABLE("Trying to reset a static DrawableSurface?");
+      return;
+    }
+
+    mProvider->Reset();
+  }
+
+  void Advance(size_t aFrame) {
+    if (!mProvider) {
+      MOZ_ASSERT_UNREACHABLE("Trying to advance a static DrawableSurface?");
+      return;
+    }
+
+    mProvider->Advance(aFrame);
+  }
+
+  bool MayAdvance() const {
+    if (!mProvider) {
+      MOZ_ASSERT_UNREACHABLE("Trying to advance a static DrawableSurface?");
+      return false;
+    }
+
+    return mProvider->MayAdvance();
+  }
+
+  void MarkMayAdvance() {
+    if (!mProvider) {
+      MOZ_ASSERT_UNREACHABLE("Trying to advance a static DrawableSurface?");
+      return;
+    }
+
+    mProvider->MarkMayAdvance();
+  }
+
+  bool IsFullyDecoded() const {
+    if (!mProvider) {
+      MOZ_ASSERT_UNREACHABLE(
+          "Trying to check decoding state of a static DrawableSurface?");
+      return false;
+    }
+
+    return mProvider->IsFullyDecoded();
+  }
+
+  void TakeProvider(WebRenderImageProvider** aOutProvider) {
+    mProvider.forget(aOutProvider);
+  }
+
+  explicit operator bool() const { return mHaveSurface; }
+  imgFrame* operator->() { return DrawableRef().get(); }
+
+ private:
+  DrawableSurface(const DrawableSurface& aOther) = delete;
+  DrawableSurface& operator=(const DrawableSurface& aOther) = delete;
+
+  DrawableFrameRef& DrawableRef() {
+    MOZ_ASSERT(mHaveSurface);
+
+    if (!mDrawableRef) {
+      MOZ_ASSERT(mProvider);
+      mDrawableRef = mProvider->DrawableRef( 0);
+    }
+
+    MOZ_ASSERT(mDrawableRef);
+    return mDrawableRef;
+  }
+
+  DrawableFrameRef mDrawableRef;
+  RefPtr<ISurfaceProvider> mProvider;
+  bool mHaveSurface;
+};
+
+inline DrawableSurface ISurfaceProvider::Surface() {
+  return DrawableSurface(WrapNotNull(this));
+}
+
+class SimpleSurfaceProvider final : public ISurfaceProvider {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(SimpleSurfaceProvider, override)
+
+  SimpleSurfaceProvider(const ImageKey aImageKey, const SurfaceKey& aSurfaceKey,
+                        NotNull<imgFrame*> aSurface)
+      : ISurfaceProvider(aImageKey, aSurfaceKey,
+                         AvailabilityState::StartAvailable()),
+        mSurface(aSurface) {
+    MOZ_ASSERT(aSurfaceKey.Size() == mSurface->GetSize());
+  }
+
+  bool IsFinished() const override { return mSurface->IsFinished(); }
+
+  size_t LogicalSizeInBytes() const override {
+    gfx::IntSize size = mSurface->GetSize();
+    return size.width * size.height * mSurface->GetBytesPerPixel();
+  }
+
+  nsresult UpdateKey(layers::RenderRootStateManager* aManager,
+                     wr::IpcResourceUpdateQueue& aResources,
+                     wr::ImageKey& aKey) override;
+
+  void InvalidateSurface() override;
+
+ protected:
+  DrawableFrameRef DrawableRef(size_t aFrame) override {
+    MOZ_ASSERT(aFrame == 0,
+               "Requesting an animation frame from a SimpleSurfaceProvider?");
+    return mSurface->DrawableRef();
+  }
+
+  bool IsLocked() const override { return bool(mLockRef); }
+
+  void SetLocked(bool aLocked) override {
+    if (aLocked == IsLocked()) {
+      return;  
+    }
+
+    mLockRef = aLocked ? mSurface->DrawableRef() : DrawableFrameRef();
+  }
+
+ private:
+  virtual ~SimpleSurfaceProvider() {}
+
+  NotNull<RefPtr<imgFrame>> mSurface;
+  DrawableFrameRef mLockRef;
+  bool mDirty = false;
+};
+
+}  
+}  
+
+#endif  // mozilla_image_ISurfaceProvider_h

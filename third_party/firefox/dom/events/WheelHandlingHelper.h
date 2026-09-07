@@ -1,0 +1,235 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_WheelHandlingHelper_h_
+#define mozilla_WheelHandlingHelper_h_
+
+#include "mozilla/Attributes.h"
+#include "mozilla/EventForwards.h"
+#include "nsCoord.h"
+#include "nsIFrame.h"  // for AutoWeakFrame only
+#include "nsPoint.h"
+
+class nsIFrame;
+class nsITimer;
+
+namespace mozilla {
+
+class EventStateManager;
+class ScrollContainerFrame;
+
+
+struct DeltaValues {
+  constexpr DeltaValues() : deltaX(0.0), deltaY(0.0) {}
+
+  constexpr DeltaValues(double aDeltaX, double aDeltaY)
+      : deltaX(aDeltaX), deltaY(aDeltaY) {}
+
+  explicit DeltaValues(WidgetWheelEvent* aEvent);
+
+  double deltaX;
+  double deltaY;
+};
+
+
+class WheelHandlingUtils {
+ public:
+  static bool CanScrollOn(nsIFrame* aFrame, double aDirectionX,
+                          double aDirectionY);
+  static bool CanScrollOn(ScrollContainerFrame* aScrollContainerFrame,
+                          double aDirectionX, double aDirectionY);
+
+  static Maybe<layers::ScrollDirection> GetDisregardedWheelScrollDirection(
+      const nsIFrame* aFrame);
+
+ private:
+  static bool CanScrollInRange(nscoord aMin, nscoord aValue, nscoord aMax,
+                               double aDirection);
+};
+
+
+class ScrollbarsForWheel {
+ public:
+  static void PrepareToScrollText(EventStateManager* aESM,
+                                  nsIFrame* aTargetFrame,
+                                  WidgetWheelEvent* aEvent);
+  static void SetActiveScrollTarget(ScrollContainerFrame* aScrollTarget);
+  static void MayInactivate();
+  static void Inactivate();
+  static bool IsActive();
+  static void OwnWheelTransaction(bool aOwn);
+
+ protected:
+  static const size_t kNumberOfTargets = 4;
+  static constexpr DeltaValues directions[kNumberOfTargets] = {
+      DeltaValues(-1, 0), DeltaValues(+1, 0), DeltaValues(0, -1),
+      DeltaValues(0, +1)};
+  static AutoWeakFrame sActiveOwner;
+  static AutoWeakFrame sActivatedScrollTargets[kNumberOfTargets];
+  static bool sHadWheelStart;
+  static bool sOwnWheelTransaction;
+
+  static void TemporarilyActivateAllPossibleScrollTargets(
+      EventStateManager* aESM, nsIFrame* aTargetFrame,
+      WidgetWheelEvent* aEvent);
+  static void DeactivateAllTemporarilyActivatedScrollTargets();
+};
+
+
+class WheelTransaction {
+ public:
+  static nsIFrame* GetScrollTargetFrame() { return sScrollTargetFrame; }
+  static nsIFrame* GetEventTargetFrame() { return sEventTargetFrame; }
+  static bool HandledByApz() { return sHandledByApz; }
+  static void EndTransaction();
+  static bool WillHandleDefaultAction(WidgetWheelEvent* aWheelEvent,
+                                      AutoWeakFrame& aScrollTargetWeakFrame,
+                                      AutoWeakFrame& aEventTargetWeakFrame);
+  static bool WillHandleDefaultAction(WidgetWheelEvent* aWheelEvent,
+                                      nsIFrame* aScrollTargetFrame,
+                                      nsIFrame* aEventTargetFrame) {
+    AutoWeakFrame scrollTargetWeakFrame(aScrollTargetFrame);
+    AutoWeakFrame eventTargetWeakFrame(aEventTargetFrame);
+    return WillHandleDefaultAction(aWheelEvent, scrollTargetWeakFrame,
+                                   eventTargetWeakFrame);
+  }
+  static void OnEvent(WidgetEvent* aEvent);
+  static void OnRemoveElement(nsIContent* aContent);
+  static void Shutdown();
+
+  static void OwnScrollbars(bool aOwn);
+
+  static DeltaValues AccelerateWheelDelta(WidgetWheelEvent* aEvent);
+
+ protected:
+  static void BeginTransaction(nsIFrame* aScrollTargetFrame,
+                               nsIFrame* aEventTargetFrame,
+                               const WidgetWheelEvent* aEvent);
+  static bool UpdateTransaction(const WidgetWheelEvent* aEvent);
+  static void MayEndTransaction();
+
+  static LayoutDeviceIntPoint GetScreenPoint(WidgetGUIEvent* aEvent);
+  static void OnFailToScrollTarget();
+  static void OnTimeout(nsITimer* aTimer, void* aClosure);
+  static void SetTimeout();
+  static DeltaValues OverrideSystemScrollSpeed(WidgetWheelEvent* aEvent);
+  static double ComputeAcceleratedWheelDelta(double aDelta, int32_t aFactor);
+  static bool OutOfTime(uint32_t aBaseTime, uint32_t aThreshold);
+
+  static AutoWeakFrame sScrollTargetFrame;
+  static AutoWeakFrame sEventTargetFrame;
+  static bool sHandledByApz;
+  static uint32_t sTime;        
+  static uint32_t sMouseMoved;  
+  static nsITimer* sTimer;
+  static int32_t sScrollSeriesCounter;
+  static bool sOwnScrollbars;
+};
+
+enum class WheelDeltaAdjustmentStrategy : uint8_t {
+  eNone,
+  eHorizontalize,
+  eAutoDir,
+  eAutoDirWithRootHonour,
+  eSentinel,
+};
+
+class MOZ_STACK_CLASS WheelDeltaHorizontalizer final {
+ public:
+  explicit WheelDeltaHorizontalizer(WidgetWheelEvent& aWheelEvent)
+      : mWheelEvent(aWheelEvent),
+        mOldDeltaX(0.0),
+        mOldDeltaZ(0.0),
+        mOldOverflowDeltaX(0.0),
+        mOldLineOrPageDeltaX(0),
+        mHorizontalized(false) {}
+  void Horizontalize();
+  ~WheelDeltaHorizontalizer();
+  void CancelHorizontalization();
+
+ private:
+  WidgetWheelEvent& mWheelEvent;
+  double mOldDeltaX;
+  double mOldDeltaZ;
+  double mOldOverflowDeltaX;
+  int32_t mOldLineOrPageDeltaX;
+  bool mHorizontalized;
+};
+
+class MOZ_STACK_CLASS AutoDirWheelDeltaAdjuster {
+ protected:
+  AutoDirWheelDeltaAdjuster(double& aDeltaX, double& aDeltaY)
+      : mDeltaX(aDeltaX),
+        mDeltaY(aDeltaY),
+        mCheckedIfShouldBeAdjusted(false),
+        mShouldBeAdjusted(false) {}
+
+ public:
+  bool ShouldBeAdjusted();
+  void Adjust();
+
+ private:
+  virtual void OnAdjusted() {}
+
+  virtual bool CanScrollAlongXAxis() const = 0;
+  virtual bool CanScrollAlongYAxis() const = 0;
+  virtual bool CanScrollUpwards() const = 0;
+  virtual bool CanScrollDownwards() const = 0;
+  virtual bool CanScrollLeftwards() const = 0;
+  virtual bool CanScrollRightwards() const = 0;
+
+  virtual bool IsHorizontalContentRightToLeft() const = 0;
+
+ protected:
+  double& mDeltaX;
+  double& mDeltaY;
+
+ private:
+  bool mCheckedIfShouldBeAdjusted;
+  bool mShouldBeAdjusted;
+};
+
+class MOZ_STACK_CLASS ESMAutoDirWheelDeltaAdjuster final
+    : public AutoDirWheelDeltaAdjuster {
+ public:
+  ESMAutoDirWheelDeltaAdjuster(WidgetWheelEvent& aEvent, nsIFrame& aScrollFrame,
+                               bool aHonoursRoot);
+
+ private:
+  virtual void OnAdjusted() override;
+  virtual bool CanScrollAlongXAxis() const override;
+  virtual bool CanScrollAlongYAxis() const override;
+  virtual bool CanScrollUpwards() const override;
+  virtual bool CanScrollDownwards() const override;
+  virtual bool CanScrollLeftwards() const override;
+  virtual bool CanScrollRightwards() const override;
+  virtual bool IsHorizontalContentRightToLeft() const override;
+
+  ScrollContainerFrame* mScrollTargetFrame;
+  bool mIsHorizontalContentRightToLeft;
+
+  int32_t& mLineOrPageDeltaX;
+  int32_t& mLineOrPageDeltaY;
+  double& mOverflowDeltaX;
+  double& mOverflowDeltaY;
+};
+
+class MOZ_STACK_CLASS ESMAutoDirWheelDeltaRestorer final {
+ public:
+  explicit ESMAutoDirWheelDeltaRestorer(WidgetWheelEvent& aEvent);
+  ~ESMAutoDirWheelDeltaRestorer();
+
+ private:
+  WidgetWheelEvent& mEvent;
+  double mOldDeltaX;
+  double mOldDeltaY;
+  int32_t mOldLineOrPageDeltaX;
+  int32_t mOldLineOrPageDeltaY;
+  double mOldOverflowDeltaX;
+  double mOldOverflowDeltaY;
+};
+
+}  
+
+#endif  // mozilla_WheelHandlingHelper_h_

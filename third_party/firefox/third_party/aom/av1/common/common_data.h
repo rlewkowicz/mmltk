@@ -1,0 +1,384 @@
+/*
+ * Copyright (c) 2016, Alliance for Open Media. All rights reserved.
+ *
+ * This source code is subject to the terms of the BSD 2 Clause License and
+ * the Alliance for Open Media Patent License 1.0. If the BSD 2 Clause License
+ * was not distributed with this source code in the LICENSE file, you can
+ * obtain it at www.aomedia.org/license/software. If the Alliance for Open
+ * Media Patent License 1.0 was not distributed with this source code in the
+ * PATENTS file, you can obtain it at www.aomedia.org/license/patent.
+ */
+
+#if !defined(AOM_AV1_COMMON_COMMON_DATA_H_)
+#define AOM_AV1_COMMON_COMMON_DATA_H_
+
+#include "av1/common/enums.h"
+#include "aom/aom_integer.h"
+#include "aom_dsp/aom_dsp_common.h"
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+static const uint8_t mi_size_wide_log2[BLOCK_SIZES_ALL] = {
+  0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 0, 2, 1, 3, 2, 4
+};
+static const uint8_t mi_size_high_log2[BLOCK_SIZES_ALL] = {
+  0, 1, 0, 1, 2, 1, 2, 3, 2, 3, 4, 3, 4, 5, 4, 5, 2, 0, 3, 1, 4, 2
+};
+
+static const uint8_t mi_size_wide[BLOCK_SIZES_ALL] = {
+  1, 1, 2, 2, 2, 4, 4, 4, 8, 8, 8, 16, 16, 16, 32, 32, 1, 4, 2, 8, 4, 16
+};
+
+static const uint8_t mi_size_high[BLOCK_SIZES_ALL] = {
+  1, 2, 1, 2, 4, 2, 4, 8, 4, 8, 16, 8, 16, 32, 16, 32, 4, 1, 8, 2, 16, 4
+};
+
+static const uint8_t block_size_wide[BLOCK_SIZES_ALL] = {
+  4,  4,  8,  8,   8,   16, 16, 16, 32, 32, 32,
+  64, 64, 64, 128, 128, 4,  16, 8,  32, 16, 64
+};
+
+static const uint8_t block_size_high[BLOCK_SIZES_ALL] = {
+  4,  8,  4,   8,  16,  8,  16, 32, 16, 32, 64,
+  32, 64, 128, 64, 128, 16, 4,  32, 8,  64, 16
+};
+
+static const uint8_t size_group_lookup[BLOCK_SIZES_ALL] = {
+  0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 0, 0, 1, 1, 2, 2
+};
+
+static const uint8_t num_pels_log2_lookup[BLOCK_SIZES_ALL] = {
+  4, 5, 5, 6, 7, 7, 8, 9, 9, 10, 11, 11, 12, 13, 13, 14, 6, 6, 8, 8, 10, 10
+};
+
+/* clang-format off */
+static const BLOCK_SIZE subsize_lookup[EXT_PARTITION_TYPES][SQR_BLOCK_SIZES] = {
+  {     
+    BLOCK_4X4, BLOCK_8X8, BLOCK_16X16,
+    BLOCK_32X32, BLOCK_64X64, BLOCK_128X128
+  }, {  
+    BLOCK_INVALID, BLOCK_8X4, BLOCK_16X8,
+    BLOCK_32X16, BLOCK_64X32, BLOCK_128X64
+  }, {  
+    BLOCK_INVALID, BLOCK_4X8, BLOCK_8X16,
+    BLOCK_16X32, BLOCK_32X64, BLOCK_64X128
+  }, {  
+    BLOCK_INVALID, BLOCK_4X4, BLOCK_8X8,
+    BLOCK_16X16, BLOCK_32X32, BLOCK_64X64
+  }, {  
+    BLOCK_INVALID, BLOCK_INVALID, BLOCK_16X8,
+    BLOCK_32X16, BLOCK_64X32, BLOCK_128X64
+  }, {  
+    BLOCK_INVALID, BLOCK_INVALID, BLOCK_16X8,
+    BLOCK_32X16, BLOCK_64X32, BLOCK_128X64
+  }, {  
+    BLOCK_INVALID, BLOCK_INVALID, BLOCK_8X16,
+    BLOCK_16X32, BLOCK_32X64, BLOCK_64X128
+  }, {  
+    BLOCK_INVALID, BLOCK_INVALID, BLOCK_8X16,
+    BLOCK_16X32, BLOCK_32X64, BLOCK_64X128
+  }, {  
+    BLOCK_INVALID, BLOCK_INVALID, BLOCK_16X4,
+    BLOCK_32X8, BLOCK_64X16, BLOCK_INVALID
+  }, {  
+    BLOCK_INVALID, BLOCK_INVALID, BLOCK_4X16,
+    BLOCK_8X32, BLOCK_16X64, BLOCK_INVALID
+  }
+};
+
+static const TX_SIZE max_txsize_lookup[BLOCK_SIZES_ALL] = {
+                       TX_4X4,
+  TX_4X4,    TX_4X4,   TX_8X8,
+  TX_8X8,    TX_8X8,   TX_16X16,
+  TX_16X16,  TX_16X16, TX_32X32,
+  TX_32X32,  TX_32X32,
+  TX_64X64,
+  TX_64X64,  TX_64X64, TX_64X64,
+  TX_4X4,    TX_4X4,   TX_8X8,
+  TX_8X8,    TX_16X16, TX_16X16
+};
+
+static const TX_SIZE max_txsize_rect_lookup[BLOCK_SIZES_ALL] = {
+      TX_4X4,
+      TX_4X8,    TX_8X4,   TX_8X8,
+      TX_8X16,   TX_16X8,  TX_16X16,
+      TX_16X32,  TX_32X16, TX_32X32,
+      TX_32X64,  TX_64X32,
+      TX_64X64,
+      TX_64X64,  TX_64X64, TX_64X64,
+      TX_4X16,   TX_16X4,
+      TX_8X32,   TX_32X8,
+      TX_16X64,  TX_64X16
+};
+
+static const TX_TYPE_1D vtx_tab[TX_TYPES] = {
+  DCT_1D,      ADST_1D, DCT_1D,      ADST_1D,
+  FLIPADST_1D, DCT_1D,  FLIPADST_1D, ADST_1D, FLIPADST_1D, IDTX_1D,
+  DCT_1D,      IDTX_1D, ADST_1D,     IDTX_1D, FLIPADST_1D, IDTX_1D,
+};
+
+static const TX_TYPE_1D htx_tab[TX_TYPES] = {
+  DCT_1D,  DCT_1D,      ADST_1D,     ADST_1D,
+  DCT_1D,  FLIPADST_1D, FLIPADST_1D, FLIPADST_1D, ADST_1D, IDTX_1D,
+  IDTX_1D, DCT_1D,      IDTX_1D,     ADST_1D,     IDTX_1D, FLIPADST_1D,
+};
+
+#define TXSIZE_CAT_INVALID (-1)
+
+/* clang-format on */
+
+static const TX_SIZE sub_tx_size_map[TX_SIZES_ALL] = {
+  TX_4X4,    
+  TX_4X4,    
+  TX_8X8,    
+  TX_16X16,  
+  TX_32X32,  
+  TX_4X4,    
+  TX_4X4,    
+  TX_8X8,    
+  TX_8X8,    
+  TX_16X16,  
+  TX_16X16,  
+  TX_32X32,  
+  TX_32X32,  
+  TX_4X8,    
+  TX_8X4,    
+  TX_8X16,   
+  TX_16X8,   
+  TX_16X32,  
+  TX_32X16,  
+};
+
+static const TX_SIZE txsize_horz_map[TX_SIZES_ALL] = {
+  TX_4X4,    
+  TX_8X8,    
+  TX_16X16,  
+  TX_32X32,  
+  TX_64X64,  
+  TX_4X4,    
+  TX_8X8,    
+  TX_8X8,    
+  TX_16X16,  
+  TX_16X16,  
+  TX_32X32,  
+  TX_32X32,  
+  TX_64X64,  
+  TX_4X4,    
+  TX_16X16,  
+  TX_8X8,    
+  TX_32X32,  
+  TX_16X16,  
+  TX_64X64,  
+};
+
+static const TX_SIZE txsize_vert_map[TX_SIZES_ALL] = {
+  TX_4X4,    
+  TX_8X8,    
+  TX_16X16,  
+  TX_32X32,  
+  TX_64X64,  
+  TX_8X8,    
+  TX_4X4,    
+  TX_16X16,  
+  TX_8X8,    
+  TX_32X32,  
+  TX_16X16,  
+  TX_64X64,  
+  TX_32X32,  
+  TX_16X16,  
+  TX_4X4,    
+  TX_32X32,  
+  TX_8X8,    
+  TX_64X64,  
+  TX_16X16,  
+};
+
+#define TX_SIZE_W_MIN 4
+
+static const int tx_size_wide[TX_SIZES_ALL] = {
+  4, 8, 16, 32, 64, 4, 8, 8, 16, 16, 32, 32, 64, 4, 16, 8, 32, 16, 64,
+};
+
+#define TX_SIZE_H_MIN 4
+
+static const int tx_size_high[TX_SIZES_ALL] = {
+  4, 8, 16, 32, 64, 8, 4, 16, 8, 32, 16, 64, 32, 16, 4, 32, 8, 64, 16,
+};
+
+static const int tx_size_wide_unit[TX_SIZES_ALL] = {
+  1, 2, 4, 8, 16, 1, 2, 2, 4, 4, 8, 8, 16, 1, 4, 2, 8, 4, 16,
+};
+
+static const int tx_size_high_unit[TX_SIZES_ALL] = {
+  1, 2, 4, 8, 16, 2, 1, 4, 2, 8, 4, 16, 8, 4, 1, 8, 2, 16, 4,
+};
+
+static const int tx_size_wide_log2[TX_SIZES_ALL] = {
+  2, 3, 4, 5, 6, 2, 3, 3, 4, 4, 5, 5, 6, 2, 4, 3, 5, 4, 6,
+};
+
+static const int tx_size_wide_unit_log2[TX_SIZES_ALL] = {
+  0, 1, 2, 3, 4, 0, 1, 1, 2, 2, 3, 3, 4, 0, 2, 1, 3, 2, 4,
+};
+
+static const int tx_size_high_log2[TX_SIZES_ALL] = {
+  2, 3, 4, 5, 6, 3, 2, 4, 3, 5, 4, 6, 5, 4, 2, 5, 3, 6, 4,
+};
+
+static const int tx_size_high_unit_log2[TX_SIZES_ALL] = {
+  0, 1, 2, 3, 4, 1, 0, 2, 1, 3, 2, 4, 3, 2, 0, 3, 1, 4, 2,
+};
+
+static const int tx_size_2d[TX_SIZES_ALL + 1] = {
+  16,  64,   256,  1024, 4096, 32,  32,  128,  128,  512,
+  512, 2048, 2048, 64,   64,   256, 256, 1024, 1024,
+};
+
+static const BLOCK_SIZE txsize_to_bsize[TX_SIZES_ALL] = {
+  BLOCK_4X4,    
+  BLOCK_8X8,    
+  BLOCK_16X16,  
+  BLOCK_32X32,  
+  BLOCK_64X64,  
+  BLOCK_4X8,    
+  BLOCK_8X4,    
+  BLOCK_8X16,   
+  BLOCK_16X8,   
+  BLOCK_16X32,  
+  BLOCK_32X16,  
+  BLOCK_32X64,  
+  BLOCK_64X32,  
+  BLOCK_4X16,   
+  BLOCK_16X4,   
+  BLOCK_8X32,   
+  BLOCK_32X8,   
+  BLOCK_16X64,  
+  BLOCK_64X16,  
+};
+
+static const TX_SIZE txsize_sqr_map[TX_SIZES_ALL] = {
+  TX_4X4,    
+  TX_8X8,    
+  TX_16X16,  
+  TX_32X32,  
+  TX_64X64,  
+  TX_4X4,    
+  TX_4X4,    
+  TX_8X8,    
+  TX_8X8,    
+  TX_16X16,  
+  TX_16X16,  
+  TX_32X32,  
+  TX_32X32,  
+  TX_4X4,    
+  TX_4X4,    
+  TX_8X8,    
+  TX_8X8,    
+  TX_16X16,  
+  TX_16X16,  
+};
+
+static const TX_SIZE txsize_sqr_up_map[TX_SIZES_ALL] = {
+  TX_4X4,    
+  TX_8X8,    
+  TX_16X16,  
+  TX_32X32,  
+  TX_64X64,  
+  TX_8X8,    
+  TX_8X8,    
+  TX_16X16,  
+  TX_16X16,  
+  TX_32X32,  
+  TX_32X32,  
+  TX_64X64,  
+  TX_64X64,  
+  TX_16X16,  
+  TX_16X16,  
+  TX_32X32,  
+  TX_32X32,  
+  TX_64X64,  
+  TX_64X64,  
+};
+
+static const int8_t txsize_log2_minus4[TX_SIZES_ALL] = {
+  0,  
+  2,  
+  4,  
+  6,  
+  6,  
+  1,  
+  1,  
+  3,  
+  3,  
+  5,  
+  5,  
+  6,  
+  6,  
+  2,  
+  2,  
+  4,  
+  4,  
+  5,  
+  5,  
+};
+
+static const TX_SIZE tx_mode_to_biggest_tx_size[TX_MODES] = {
+  TX_4X4,    
+  TX_64X64,  
+  TX_64X64,  
+};
+
+extern const BLOCK_SIZE av1_ss_size_lookup[BLOCK_SIZES_ALL][2][2];
+
+/* clang-format off */
+static const struct {
+  PARTITION_CONTEXT above;
+  PARTITION_CONTEXT left;
+} partition_context_lookup[BLOCK_SIZES_ALL] = {
+  { 31, 31 },  
+  { 31, 30 },  
+  { 30, 31 },  
+  { 30, 30 },  
+  { 30, 28 },  
+  { 28, 30 },  
+  { 28, 28 },  
+  { 28, 24 },  
+  { 24, 28 },  
+  { 24, 24 },  
+  { 24, 16 },  
+  { 16, 24 },  
+  { 16, 16 },  
+  { 16, 0 },   
+  { 0, 16 },   
+  { 0, 0 },    
+  { 31, 28 },  
+  { 28, 31 },  
+  { 30, 24 },  
+  { 24, 30 },  
+  { 28, 16 },  
+  { 16, 28 },  
+};
+/* clang-format on */
+
+static const int intra_mode_context[INTRA_MODES] = {
+  0, 1, 2, 3, 4, 4, 4, 4, 3, 0, 1, 2, 0,
+};
+
+static const int quant_dist_weight[4][2] = {
+  { 2, 3 }, { 2, 5 }, { 2, 7 }, { 1, MAX_FRAME_DISTANCE }
+};
+
+static const int quant_dist_lookup_table[4][2] = {
+  { 9, 7 },
+  { 11, 5 },
+  { 12, 4 },
+  { 13, 3 },
+};
+
+#if defined(__cplusplus)
+}  
+#endif
+
+#endif

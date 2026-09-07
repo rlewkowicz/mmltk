@@ -1,0 +1,268 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef TRRService_h_
+#define TRRService_h_
+
+#include "mozilla/Atomics.h"
+#include "mozilla/DataMutex.h"
+#include "nsHostResolver.h"
+#include "nsIObserver.h"
+#include "nsITimer.h"
+#include "nsWeakReference.h"
+#include "TRRServiceBase.h"
+#include "nsICaptivePortalService.h"
+#include "nsTHashSet.h"
+#include "TRR.h"
+
+class nsDNSService;
+class nsIPrefBranch;
+class nsINetworkLinkService;
+class nsIObserverService;
+
+namespace mozilla {
+namespace net {
+
+class TRRServiceChild;
+class TRRServiceParent;
+
+const nsCString& TRRProviderKey();
+
+class TRRService : public TRRServiceBase,
+                   public nsIObserver,
+                   public nsSupportsWeakReference,
+                   public AHostResolver {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_NSIOBSERVER
+  NS_DECL_NSIPROXYCONFIGCHANGEDCALLBACK
+
+  TRRService();
+  static TRRService* Get();
+
+  nsresult Init(bool aNativeHTTPSQueryEnabled);
+  nsresult Start();
+  bool Enabled(nsIRequest::TRRMode aRequestMode = nsIRequest::TRR_DEFAULT_MODE);
+  bool IsConfirmed() { return mConfirmation.State() == CONFIRM_OK; }
+  uint32_t ConfirmationState() { return mConfirmation.State(); }
+
+  void GetURI(nsACString& result) override;
+  nsresult GetCredentials(nsCString& result);
+  uint32_t GetRequestTimeout();
+  void RetryTRRConfirm();
+
+  LookupStatus CompleteLookup(nsHostRecord*, nsresult, mozilla::net::AddrInfo*,
+                              bool pb, const nsACString& aOriginSuffix,
+                              TRRSkippedReason aReason,
+                              TRR* aTrrRequest) override;
+  LookupStatus CompleteLookupByType(nsHostRecord*, nsresult,
+                                    mozilla::net::TypeRecordResultType&,
+                                    TRRSkippedReason, uint32_t,
+                                    bool pb) override;
+  void AddToBlocklist(const nsACString& host, const nsACString& originSuffix,
+                      bool privateBrowsing, bool aParentsToo);
+  bool IsTemporarilyBlocked(const nsACString& aHost,
+                            const nsACString& aOriginSuffix,
+                            bool aPrivateBrowsing, bool aParentsToo);
+  bool IsExcludedFromTRR(
+      const nsACString& aHost,
+      nsIRequest::TRRMode aRequestMode = nsIRequest::TRR_DEFAULT_MODE);
+
+  bool MaybeBootstrap(const nsACString& possible, nsACString& result);
+  void RecordTRRStatus(TRR* aTrrRequest);
+  nsresult DispatchTRRRequest(TRR* aTrrRequest);
+  already_AddRefed<nsIThread> TRRThread();
+  bool IsOnTRRThread();
+
+  bool IsUsingAutoDetectedURL() { return mURISetByDetection; }
+
+  void SetHeuristicDetectionResult(TRRSkippedReason aValue) {
+    mHeuristicDetectionValue = aValue;
+  }
+  TRRSkippedReason GetHeuristicDetectionResult() {
+    return mHeuristicDetectionValue;
+  }
+
+  nsresult LastConfirmationStatus() {
+    return mConfirmation.LastConfirmationStatus();
+  }
+  TRRSkippedReason LastConfirmationSkipReason() {
+    return mConfirmation.LastConfirmationSkipReason();
+  }
+
+  static const nsCString& ProviderKey();
+  static void SetProviderDomain(const nsACString& aTRRDomain);
+  static void SetCurrentTRRMode(nsIDNSService::ResolverMode aMode);
+
+  void InitTRRConnectionInfo(bool aForceReinit = false) override;
+
+  void DontUseTRRThread() { mDontUseTRRThread = true; }
+
+ private:
+  virtual ~TRRService();
+
+  friend class TRR;
+  friend class TRRServiceChild;
+  friend class TRRServiceParent;
+  static void AddObserver(nsIObserver* aObserver,
+                          nsIObserverService* aObserverService = nullptr);
+  static bool CheckCaptivePortalIsPassed();
+  static bool CheckPlatformDNSStatus(nsINetworkLinkService* aLinkService);
+
+  nsresult ReadPrefs(const char* name);
+  void GetPrefBranch(nsIPrefBranch** result);
+  friend class ::nsDNSService;
+  void SetDetectedTrrURI(const nsACString& aURI);
+
+  bool IsDomainBlocked(const nsACString& aHost, const nsACString& aOriginSuffix,
+                       bool aPrivateBrowsing);
+  bool IsExcludedFromTRR_unlocked(const nsACString& aHost,
+                                  nsIRequest::TRRMode aRequestMode)
+      MOZ_REQUIRES(mLock);
+
+  void RebuildSuffixList(nsTArray<nsCString>&& aSuffixList);
+
+  nsresult DispatchTRRRequestInternal(TRR* aTrrRequest, bool aWithLock);
+  already_AddRefed<nsIThread> TRRThread_locked();
+  already_AddRefed<nsIThread> MainThreadOrTRRThread(bool aWithLock = true);
+
+  bool MaybeSetPrivateURI(const nsACString& aURI) override;
+  void ClearEntireCache();
+  void MaybeSpeculativeConnectToTRR();
+
+  virtual void ReadEtcHostsFile() override;
+  void AddEtcHosts(const nsTArray<nsCString>&);
+
+  bool mInitialized{false};
+
+  nsCString mPrivateCred;  
+  nsCString mConfirmationNS MOZ_GUARDED_BY(mLock){"example.com"_ns};
+  nsCString mBootstrapAddr MOZ_GUARDED_BY(mLock);
+
+  Atomic<bool, Relaxed> mCaptiveIsPassed{
+      false};  
+  Atomic<bool, Relaxed> mShutdown{false};
+  Atomic<bool, Relaxed> mDontUseTRRThread{false};
+
+  DataMutex<nsTHashMap<nsCStringHashKey, int32_t>> mTRRBLStorage{
+      "DataMutex::TRRBlocklist"};
+
+  nsTHashSet<nsCString> mExcludedDomains MOZ_GUARDED_BY(mLock);
+  nsTHashSet<nsCString> mDNSSuffixDomains MOZ_GUARDED_BY(mLock);
+  nsTHashSet<nsCString> mEtcHostsDomains MOZ_GUARDED_BY(mLock);
+
+  TRRSkippedReason mHeuristicDetectionValue = nsITRRSkipReason::TRR_UNSET;
+
+  enum class ConfirmationEvent {
+    Init,
+    PrefChange,
+    ConfirmationRetry,
+    FailedLookups,
+    RetryTRR,
+    URIChange,
+    CaptivePortalConnectivity,
+    NetworkUp,
+    ConfirmOK,
+    ConfirmFail,
+  };
+
+  enum ConfirmationState {
+    CONFIRM_OFF = 0,
+    CONFIRM_TRYING_OK = 1,
+    CONFIRM_OK = 2,
+    CONFIRM_FAILED = 3,
+    CONFIRM_TRYING_FAILED = 4,
+    CONFIRM_DISABLED = 5,
+  };
+
+  class ConfirmationContext final : public nsITimerCallback, public nsINamed {
+    NS_DECL_ISUPPORTS_INHERITED
+    NS_DECL_NSITIMERCALLBACK
+    NS_DECL_NSINAMED
+
+   private:
+    RefPtr<TRR> mTask;
+    nsCOMPtr<nsITimer> mTimer;
+    uint32_t mRetryInterval = 125;  
+    Atomic<uint32_t, Relaxed> mTRRFailures{0};
+
+    Atomic<TRRSkippedReason, Relaxed> mLastConfirmationSkipReason{
+        nsITRRSkipReason::TRR_UNSET};
+    Atomic<nsresult, Relaxed> mLastConfirmationStatus{NS_OK};
+
+    void SetState(enum ConfirmationState aNewState);
+
+   public:
+    enum ConfirmationState State() { return mState; }
+
+    void CompleteConfirmation(nsresult aStatus, TRR* aTrrRequest);
+
+    void RecordTRRStatus(TRR* aTrrRequest);
+
+    bool HandleEvent(ConfirmationEvent aEvent);
+    bool HandleEvent(ConfirmationEvent aEvent, const MutexAutoLock&);
+
+    TRRSkippedReason LastConfirmationSkipReason() {
+      return mLastConfirmationSkipReason;
+    }
+    nsresult LastConfirmationStatus() { return mLastConfirmationStatus; }
+
+    uintptr_t TaskAddr() { return uintptr_t(mTask.get()); }
+
+   private:
+    TRRService* OwningObject() {
+      return reinterpret_cast<TRRService*>(
+          reinterpret_cast<uint8_t*>(this) -
+          offsetof(TRRService, mConfirmation) -
+          offsetof(ConfirmationWrapper, mConfirmation));
+    }
+
+    Atomic<enum ConfirmationState, Relaxed> mState{CONFIRM_OFF};
+
+    friend class TRRService;
+    ~ConfirmationContext() = default;
+  };
+
+  class ConfirmationWrapper {
+   public:
+    enum ConfirmationState State() { return mConfirmation.State(); }
+
+    void CompleteConfirmation(nsresult aStatus, TRR* aTrrRequest) {
+      mConfirmation.CompleteConfirmation(aStatus, aTrrRequest);
+    }
+
+    void RecordTRRStatus(TRR* aTrrRequest) {
+      mConfirmation.RecordTRRStatus(aTrrRequest);
+    }
+
+    bool HandleEvent(ConfirmationEvent aEvent) {
+      return mConfirmation.HandleEvent(aEvent);
+    }
+
+    bool HandleEvent(ConfirmationEvent aEvent, const MutexAutoLock& lock) {
+      return mConfirmation.HandleEvent(aEvent, lock);
+    }
+
+    TRRSkippedReason LastConfirmationSkipReason() {
+      return mConfirmation.LastConfirmationSkipReason();
+    }
+    nsresult LastConfirmationStatus() {
+      return mConfirmation.LastConfirmationStatus();
+    }
+
+   private:
+    friend TRRService* ConfirmationContext::OwningObject();
+    ConfirmationContext mConfirmation;
+  };
+
+  ConfirmationWrapper mConfirmation;
+
+  bool mConfirmationTriggered{false};
+  nsCOMPtr<nsINetworkLinkService> mLinkService;
+};
+
+}  
+}  
+
+#endif  // TRRService_h_

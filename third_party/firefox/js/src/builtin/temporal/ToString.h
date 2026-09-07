@@ -1,0 +1,60 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef builtin_temporal_ToString_h
+#define builtin_temporal_ToString_h
+
+#include "builtin/temporal/Temporal.h"
+#include "builtin/temporal/TemporalRoundingMode.h"
+#include "builtin/temporal/TemporalUnit.h"
+#include "js/TypeDecls.h"
+
+namespace js::temporal {
+
+class CalendarValue;
+class InstantObject;
+class PlainDateObject;
+class PlainMonthDayObject;
+class PlainYearMonthObject;
+class TimeZoneValue;
+class ZonedDateTime;
+
+struct EpochNanoseconds;
+struct ISODateTime;
+struct Time;
+
+JSString* TemporalInstantToString(JSContext* cx,
+                                  const EpochNanoseconds& epochNs,
+                                  JS::Handle<TimeZoneValue> timeZone,
+                                  Precision precision);
+
+JSString* TemporalDateToString(JSContext* cx,
+                               JS::Handle<PlainDateObject*> temporalDate,
+                               ShowCalendar showCalendar);
+
+JSString* ISODateTimeToString(JSContext* cx, const ISODateTime& isoDateTime,
+                              JS::Handle<CalendarValue> calendar,
+                              Precision precision, ShowCalendar showCalendar);
+
+JSString* TimeRecordToString(JSContext* cx, const Time& time,
+                             Precision precision);
+
+JSString* TemporalMonthDayToString(JSContext* cx,
+                                   JS::Handle<PlainMonthDayObject*> monthDay,
+                                   ShowCalendar showCalendar);
+
+JSString* TemporalYearMonthToString(JSContext* cx,
+                                    JS::Handle<PlainYearMonthObject*> yearMonth,
+                                    ShowCalendar showCalendar);
+
+JSString* TemporalZonedDateTimeToString(
+    JSContext* cx, JS::Handle<ZonedDateTime> zonedDateTime, Precision precision,
+    ShowCalendar showCalendar, ShowTimeZoneName showTimeZone,
+    ShowOffset showOffset, Increment increment = Increment{1},
+    TemporalUnit unit = TemporalUnit::Nanosecond,
+    TemporalRoundingMode roundingMode = TemporalRoundingMode::Trunc);
+
+} 
+
+#endif /* builtin_temporal_ToString_h */

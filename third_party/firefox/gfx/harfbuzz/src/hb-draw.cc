@@ -1,0 +1,557 @@
+/*
+ * Copyright © 2019-2020  Ebrahim Byagowi
+ *
+ *  This is part of HarfBuzz, a text shaping library.
+ *
+ * Permission is hereby granted, without written agreement and without
+ * license or royalty fees, to use, copy, modify, and distribute this
+ * software and its documentation for any purpose, provided that the
+ * above copyright notice and the following two paragraphs appear in
+ * all copies of this software.
+ *
+ * IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE TO ANY PARTY FOR
+ * DIRECT, INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES
+ * ARISING OUT OF THE USE OF THIS SOFTWARE AND ITS DOCUMENTATION, EVEN
+ * IF THE COPYRIGHT HOLDER HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH
+ * DAMAGE.
+ *
+ * THE COPYRIGHT HOLDER SPECIFICALLY DISCLAIMS ANY WARRANTIES, INCLUDING,
+ * BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
+ * FITNESS FOR A PARTICULAR PURPOSE.  THE SOFTWARE PROVIDED HEREUNDER IS
+ * ON AN "AS IS" BASIS, AND THE COPYRIGHT HOLDER HAS NO OBLIGATION TO
+ * PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
+ */
+
+#include "hb.hh"
+
+#ifndef HB_NO_DRAW
+
+#include "hb-draw.hh"
+
+#include "hb-geometry.hh"
+
+#include "hb-machinery.hh"
+
+#include <cmath>
+
+
+
+static void
+hb_draw_move_to_nil (hb_draw_funcs_t *dfuncs HB_UNUSED, void *draw_data HB_UNUSED,
+		     hb_draw_state_t *st HB_UNUSED,
+		     float to_x HB_UNUSED, float to_y HB_UNUSED,
+		     void *user_data HB_UNUSED) {}
+
+static void
+hb_draw_line_to_nil (hb_draw_funcs_t *dfuncs HB_UNUSED, void *draw_data HB_UNUSED,
+		     hb_draw_state_t *st HB_UNUSED,
+		     float to_x HB_UNUSED, float to_y HB_UNUSED,
+		     void *user_data HB_UNUSED) {}
+
+static void
+hb_draw_quadratic_to_nil (hb_draw_funcs_t *dfuncs, void *draw_data,
+			  hb_draw_state_t *st,
+			  float control_x, float control_y,
+			  float to_x, float to_y,
+			  void *user_data HB_UNUSED)
+{
+#define HB_TWO_THIRD 0.66666666666666666666666667f
+  dfuncs->emit_cubic_to (draw_data, *st,
+			 st->current_x + (control_x - st->current_x) * HB_TWO_THIRD,
+			 st->current_y + (control_y - st->current_y) * HB_TWO_THIRD,
+			 to_x + (control_x - to_x) * HB_TWO_THIRD,
+			 to_y + (control_y - to_y) * HB_TWO_THIRD,
+			 to_x, to_y);
+#undef HB_TWO_THIRD
+}
+
+static void
+hb_draw_cubic_to_nil (hb_draw_funcs_t *dfuncs HB_UNUSED, void *draw_data HB_UNUSED,
+		      hb_draw_state_t *st HB_UNUSED,
+		      float control1_x HB_UNUSED, float control1_y HB_UNUSED,
+		      float control2_x HB_UNUSED, float control2_y HB_UNUSED,
+		      float to_x HB_UNUSED, float to_y HB_UNUSED,
+		      void *user_data HB_UNUSED) {}
+
+static void
+hb_draw_close_path_nil (hb_draw_funcs_t *dfuncs HB_UNUSED, void *draw_data HB_UNUSED,
+			hb_draw_state_t *st HB_UNUSED,
+			void *user_data HB_UNUSED) {}
+
+
+static bool
+_hb_draw_funcs_set_preamble (hb_draw_funcs_t    *dfuncs,
+			     bool                func_is_null,
+			     void              **user_data,
+			     hb_destroy_func_t  *destroy)
+{
+  if (hb_object_is_immutable (dfuncs))
+  {
+    if (*destroy)
+      (*destroy) (*user_data);
+    return false;
+  }
+
+  if (func_is_null)
+  {
+    if (*destroy)
+      (*destroy) (*user_data);
+    *destroy = nullptr;
+    *user_data = nullptr;
+  }
+
+  return true;
+}
+
+static bool
+_hb_draw_funcs_set_middle (hb_draw_funcs_t   *dfuncs,
+			   void              *user_data,
+			   hb_destroy_func_t  destroy)
+{
+  auto destroy_guard = hb_make_scope_guard ([&]() {
+    if (destroy) destroy (user_data);
+  });
+
+  if (user_data && !dfuncs->user_data)
+  {
+    dfuncs->user_data = (decltype (dfuncs->user_data)) hb_calloc (1, sizeof (*dfuncs->user_data));
+    if (unlikely (!dfuncs->user_data))
+      return false;
+  }
+  if (destroy && !dfuncs->destroy)
+  {
+    dfuncs->destroy = (decltype (dfuncs->destroy)) hb_calloc (1, sizeof (*dfuncs->destroy));
+    if (unlikely (!dfuncs->destroy))
+      return false;
+  }
+
+  destroy_guard.release ();
+  return true;
+}
+
+#define HB_DRAW_FUNC_IMPLEMENT(name)						\
+										\
+void										\
+hb_draw_funcs_set_##name##_func (hb_draw_funcs_t	 *dfuncs,		\
+				 hb_draw_##name##_func_t  func,			\
+				 void			 *user_data,		\
+				 hb_destroy_func_t	  destroy)		\
+{										\
+  if (!_hb_draw_funcs_set_preamble (dfuncs, !func, &user_data, &destroy))\
+      return;                                                            \
+										\
+  if (dfuncs->destroy && dfuncs->destroy->name)					\
+    dfuncs->destroy->name (!dfuncs->user_data ? nullptr : dfuncs->user_data->name); \
+									 \
+  if (!_hb_draw_funcs_set_middle (dfuncs, user_data, destroy))           \
+      return;                                                            \
+									\
+  if (func)								\
+    dfuncs->func.name = func;						\
+  else									\
+    dfuncs->func.name = hb_draw_##name##_nil;				\
+									\
+  if (dfuncs->user_data)						\
+    dfuncs->user_data->name = user_data;				\
+  if (dfuncs->destroy)							\
+    dfuncs->destroy->name = destroy;					\
+}
+
+HB_DRAW_FUNCS_IMPLEMENT_CALLBACKS
+#undef HB_DRAW_FUNC_IMPLEMENT
+
+hb_draw_funcs_t *
+hb_draw_funcs_create ()
+{
+  hb_draw_funcs_t *dfuncs;
+  if (unlikely (!(dfuncs = hb_object_create<hb_draw_funcs_t> ())))
+    return const_cast<hb_draw_funcs_t *> (&Null (hb_draw_funcs_t));
+
+  dfuncs->func =  Null (hb_draw_funcs_t).func;
+
+  return dfuncs;
+}
+
+DEFINE_NULL_INSTANCE (hb_draw_funcs_t) =
+{
+  HB_OBJECT_HEADER_STATIC,
+
+  {
+#define HB_DRAW_FUNC_IMPLEMENT(name) hb_draw_##name##_nil,
+    HB_DRAW_FUNCS_IMPLEMENT_CALLBACKS
+#undef HB_DRAW_FUNC_IMPLEMENT
+  }
+};
+
+hb_draw_funcs_t *
+hb_draw_funcs_get_empty ()
+{
+  return const_cast<hb_draw_funcs_t *> (&Null (hb_draw_funcs_t));
+}
+
+hb_draw_funcs_t *
+hb_draw_funcs_reference (hb_draw_funcs_t *dfuncs)
+{
+  return hb_object_reference (dfuncs);
+}
+
+void
+hb_draw_funcs_destroy (hb_draw_funcs_t *dfuncs)
+{
+  if (!hb_object_destroy (dfuncs)) return;
+
+  if (dfuncs->destroy)
+  {
+#define HB_DRAW_FUNC_IMPLEMENT(name) \
+    if (dfuncs->destroy->name) dfuncs->destroy->name (!dfuncs->user_data ? nullptr : dfuncs->user_data->name);
+      HB_DRAW_FUNCS_IMPLEMENT_CALLBACKS
+#undef HB_DRAW_FUNC_IMPLEMENT
+  }
+
+  hb_free (dfuncs->destroy);
+  hb_free (dfuncs->user_data);
+
+  hb_free (dfuncs);
+}
+
+hb_bool_t
+hb_draw_funcs_set_user_data (hb_draw_funcs_t *dfuncs,
+			     hb_user_data_key_t *key,
+			     void *              data,
+			     hb_destroy_func_t   destroy,
+			     hb_bool_t           replace)
+{
+  return hb_object_set_user_data (dfuncs, key, data, destroy, replace);
+}
+
+void *
+hb_draw_funcs_get_user_data (const hb_draw_funcs_t *dfuncs,
+			     hb_user_data_key_t       *key)
+{
+  return hb_object_get_user_data (dfuncs, key);
+}
+
+void
+hb_draw_funcs_make_immutable (hb_draw_funcs_t *dfuncs)
+{
+  if (hb_object_is_immutable (dfuncs))
+    return;
+
+  hb_object_make_immutable (dfuncs);
+}
+
+hb_bool_t
+hb_draw_funcs_is_immutable (hb_draw_funcs_t *dfuncs)
+{
+  return hb_object_is_immutable (dfuncs);
+}
+
+
+void
+hb_draw_move_to (hb_draw_funcs_t *dfuncs, void *draw_data,
+		 hb_draw_state_t *st,
+		 float to_x, float to_y)
+{
+  dfuncs->move_to (draw_data, *st,
+		   to_x, to_y);
+}
+
+void
+hb_draw_line_to (hb_draw_funcs_t *dfuncs, void *draw_data,
+		 hb_draw_state_t *st,
+		 float to_x, float to_y)
+{
+  dfuncs->line_to (draw_data, *st,
+		   to_x, to_y);
+}
+
+void
+hb_draw_quadratic_to (hb_draw_funcs_t *dfuncs, void *draw_data,
+		      hb_draw_state_t *st,
+		      float control_x, float control_y,
+		      float to_x, float to_y)
+{
+  dfuncs->quadratic_to (draw_data, *st,
+			control_x, control_y,
+			to_x, to_y);
+}
+
+void
+hb_draw_cubic_to (hb_draw_funcs_t *dfuncs, void *draw_data,
+		  hb_draw_state_t *st,
+		  float control1_x, float control1_y,
+		  float control2_x, float control2_y,
+		  float to_x, float to_y)
+{
+  dfuncs->cubic_to (draw_data, *st,
+		    control1_x, control1_y,
+		    control2_x, control2_y,
+		    to_x, to_y);
+}
+
+void
+hb_draw_close_path (hb_draw_funcs_t *dfuncs, void *draw_data,
+		    hb_draw_state_t *st)
+{
+  dfuncs->close_path (draw_data, *st);
+}
+
+
+void
+hb_draw_line (hb_draw_funcs_t *dfuncs, void *draw_data,
+	      hb_draw_state_t *st,
+	      float x0, float y0, float w0,
+	      float x1, float y1, float w1,
+	      hb_draw_line_cap_t cap)
+{
+  if (std::isnan (w1)) w1 = w0;
+  float dx = x1 - x0, dy = y1 - y0;
+  float len = sqrtf (dx * dx + dy * dy);
+  if (len <= 0.f)
+    return;
+  float tx = dx / len;
+  float ty = dy / len;
+  float nx = -ty;
+  float ny =  tx;
+  float h0 = 0.5f * w0;
+  float h1 = 0.5f * w1;
+  if (cap == HB_DRAW_LINE_CAP_SQUARE)
+  {
+    x0 -= tx * h0; y0 -= ty * h0;
+    x1 += tx * h1; y1 += ty * h1;
+  }
+  float ax = x0 + nx * h0, ay = y0 + ny * h0;
+  float bx = x1 + nx * h1, by = y1 + ny * h1;
+  float cx = x1 - nx * h1, cy = y1 - ny * h1;
+  float dx_ = x0 - nx * h0, dy_ = y0 - ny * h0;
+
+  hb_draw_move_to   (dfuncs, draw_data, st, ax, ay);
+  hb_draw_line_to   (dfuncs, draw_data, st, bx, by);
+  hb_draw_line_to   (dfuncs, draw_data, st, cx, cy);
+  hb_draw_line_to   (dfuncs, draw_data, st, dx_, dy_);
+  hb_draw_close_path (dfuncs, draw_data, st);
+}
+
+static void
+_hb_draw_rect_contour (hb_draw_funcs_t *dfuncs, void *draw_data,
+		       hb_draw_state_t *st,
+		       float x, float y, float w, float h,
+		       bool ccw)
+{
+  hb_draw_move_to (dfuncs, draw_data, st, x, y);
+  if (ccw)
+  {
+    hb_draw_line_to (dfuncs, draw_data, st, x + w, y);
+    hb_draw_line_to (dfuncs, draw_data, st, x + w, y + h);
+    hb_draw_line_to (dfuncs, draw_data, st, x,     y + h);
+  }
+  else
+  {
+    hb_draw_line_to (dfuncs, draw_data, st, x,     y + h);
+    hb_draw_line_to (dfuncs, draw_data, st, x + w, y + h);
+    hb_draw_line_to (dfuncs, draw_data, st, x + w, y);
+  }
+  hb_draw_close_path (dfuncs, draw_data, st);
+}
+
+void
+hb_draw_rectangle (hb_draw_funcs_t *dfuncs, void *draw_data,
+		   hb_draw_state_t *st,
+		   float x, float y,
+		   float w, float h,
+		   float stroke_width)
+{
+  if (std::isnan (stroke_width))
+  {
+    if (w == 0.f || h == 0.f)
+      return;
+    _hb_draw_rect_contour (dfuncs, draw_data, st, x, y, w, h,  true);
+    return;
+  }
+
+  if (stroke_width <= 0.f || !std::isfinite (stroke_width))
+    return;
+
+  if (w < 0.f) { x += w; w = -w; }
+  if (h < 0.f) { y += h; h = -h; }
+
+  float s = 0.5f * stroke_width;
+  _hb_draw_rect_contour (dfuncs, draw_data, st,
+			 x - s, y - s,
+			 w + stroke_width, h + stroke_width,
+			  true);
+  float iw = w - stroke_width;
+  float ih = h - stroke_width;
+  if (iw > 0.f && ih > 0.f)
+    _hb_draw_rect_contour (dfuncs, draw_data, st,
+			   x + s, y + s, iw, ih,
+			    false);
+}
+
+static void
+_hb_draw_circle_contour (hb_draw_funcs_t *dfuncs, void *draw_data,
+			 hb_draw_state_t *st,
+			 float cx, float cy, float r,
+			 bool ccw)
+{
+  static const float k = 0.5522847498307936f;
+  float ck = r * k;
+
+  hb_draw_move_to (dfuncs, draw_data, st, cx + r, cy);
+  if (ccw)
+  {
+    hb_draw_cubic_to (dfuncs, draw_data, st,
+		      cx + r, cy + ck,
+		      cx + ck, cy + r,
+		      cx,      cy + r);
+    hb_draw_cubic_to (dfuncs, draw_data, st,
+		      cx - ck, cy + r,
+		      cx - r,  cy + ck,
+		      cx - r,  cy);
+    hb_draw_cubic_to (dfuncs, draw_data, st,
+		      cx - r,  cy - ck,
+		      cx - ck, cy - r,
+		      cx,      cy - r);
+    hb_draw_cubic_to (dfuncs, draw_data, st,
+		      cx + ck, cy - r,
+		      cx + r,  cy - ck,
+		      cx + r,  cy);
+  }
+  else
+  {
+    hb_draw_cubic_to (dfuncs, draw_data, st,
+		      cx + r, cy - ck,
+		      cx + ck, cy - r,
+		      cx,      cy - r);
+    hb_draw_cubic_to (dfuncs, draw_data, st,
+		      cx - ck, cy - r,
+		      cx - r,  cy - ck,
+		      cx - r,  cy);
+    hb_draw_cubic_to (dfuncs, draw_data, st,
+		      cx - r,  cy + ck,
+		      cx - ck, cy + r,
+		      cx,      cy + r);
+    hb_draw_cubic_to (dfuncs, draw_data, st,
+		      cx + ck, cy + r,
+		      cx + r,  cy + ck,
+		      cx + r,  cy);
+  }
+  hb_draw_close_path (dfuncs, draw_data, st);
+}
+
+void
+hb_draw_circle (hb_draw_funcs_t *dfuncs, void *draw_data,
+		hb_draw_state_t *st,
+		float cx, float cy,
+		float r,
+		float stroke_width)
+{
+  if (r <= 0.f)
+    return;
+
+  if (std::isnan (stroke_width))
+  {
+    _hb_draw_circle_contour (dfuncs, draw_data, st, cx, cy, r,  true);
+    return;
+  }
+
+  if (stroke_width <= 0.f || !std::isfinite (stroke_width))
+    return;
+
+  float s = 0.5f * stroke_width;
+  _hb_draw_circle_contour (dfuncs, draw_data, st, cx, cy, r + s,  true);
+  float ir = r - s;
+  if (ir > 0.f)
+    _hb_draw_circle_contour (dfuncs, draw_data, st, cx, cy, ir,  false);
+}
+
+
+static void
+hb_draw_extents_move_to (hb_draw_funcs_t *dfuncs HB_UNUSED,
+			 void *data,
+			 hb_draw_state_t *st,
+			 float to_x, float to_y,
+			 void *user_data HB_UNUSED)
+{
+  hb_extents_t<> *extents = (hb_extents_t<> *) data;
+
+  extents->add_point (to_x, to_y);
+}
+
+static void
+hb_draw_extents_line_to (hb_draw_funcs_t *dfuncs HB_UNUSED,
+			 void *data,
+			 hb_draw_state_t *st,
+			 float to_x, float to_y,
+			 void *user_data HB_UNUSED)
+{
+  hb_extents_t<> *extents = (hb_extents_t<> *) data;
+
+  extents->add_point (to_x, to_y);
+}
+
+static void
+hb_draw_extents_quadratic_to (hb_draw_funcs_t *dfuncs HB_UNUSED,
+			      void *data,
+			      hb_draw_state_t *st,
+			      float control_x, float control_y,
+			      float to_x, float to_y,
+			      void *user_data HB_UNUSED)
+{
+  hb_extents_t<> *extents = (hb_extents_t<> *) data;
+
+  extents->add_point (control_x, control_y);
+  extents->add_point (to_x, to_y);
+}
+
+static void
+hb_draw_extents_cubic_to (hb_draw_funcs_t *dfuncs HB_UNUSED,
+			  void *data,
+			  hb_draw_state_t *st,
+			  float control1_x, float control1_y,
+			  float control2_x, float control2_y,
+			  float to_x, float to_y,
+			  void *user_data HB_UNUSED)
+{
+  hb_extents_t<> *extents = (hb_extents_t<> *) data;
+
+  extents->add_point (control1_x, control1_y);
+  extents->add_point (control2_x, control2_y);
+  extents->add_point (to_x, to_y);
+}
+
+static inline void free_static_draw_extents_funcs ();
+
+static struct hb_draw_extents_funcs_lazy_loader_t : hb_draw_funcs_lazy_loader_t<hb_draw_extents_funcs_lazy_loader_t>
+{
+  static hb_draw_funcs_t *create ()
+  {
+    hb_draw_funcs_t *funcs = hb_draw_funcs_create ();
+
+    hb_draw_funcs_set_move_to_func (funcs, hb_draw_extents_move_to, nullptr, nullptr);
+    hb_draw_funcs_set_line_to_func (funcs, hb_draw_extents_line_to, nullptr, nullptr);
+    hb_draw_funcs_set_quadratic_to_func (funcs, hb_draw_extents_quadratic_to, nullptr, nullptr);
+    hb_draw_funcs_set_cubic_to_func (funcs, hb_draw_extents_cubic_to, nullptr, nullptr);
+
+    hb_draw_funcs_make_immutable (funcs);
+
+    hb_atexit (free_static_draw_extents_funcs);
+
+    return funcs;
+  }
+} static_draw_extents_funcs;
+
+static inline
+void free_static_draw_extents_funcs ()
+{
+  static_draw_extents_funcs.free_instance ();
+}
+
+hb_draw_funcs_t *
+hb_draw_extents_get_funcs ()
+{
+  return static_draw_extents_funcs.get_unconst ();
+}
+
+
+#endif

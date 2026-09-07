@@ -1,0 +1,47 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+gkrust_features = [
+    "for_xul",
+]
+
+if CONFIG["MOZ_DEBUG"]:
+    gkrust_features += [
+        "gecko_debug",
+        "gecko_refcount_logging",
+    ]
+
+if CONFIG["MOZ_TSAN"]:
+    gkrust_features += ["thread_sanitizer"]
+
+if CONFIG["MOZ_WEBRENDER_DEBUGGER"]:
+    gkrust_features += ["webrender_debugger"]
+
+if CONFIG["MOZ_PULSEAUDIO"]:
+    gkrust_features += ["cubeb_pulse_rust"]
+
+if CONFIG["MOZ_RUST_SIMD"]:
+    gkrust_features += ["simd-accel"]
+
+# This feature is not yet supported on all platforms, and this check needs to
+# match MOZ_CUBEB_REMOTING in CubebUtils.cpp.
+gkrust_features += ["cubeb-remoting"]
+
+if CONFIG["MOZ_MEMORY"]:
+    gkrust_features += ["moz_memory"]
+
+if CONFIG["MOZ_UNIFFI_FIXTURES"]:
+    gkrust_features += ["uniffi_fixtures"]
+
+if CONFIG["MOZ_ICU4X"]:
+    gkrust_features += ["icu4x"]
+
+if CONFIG["USE_LIBZ_RS"]:
+    gkrust_features += ["libz-rs-sys"]
+
+if CONFIG["MOZ_JXL"]:
+    gkrust_features += ["jxl_decoder"]
+
+# This must remain last.
+gkrust_features = ["gkrust-shared/%s" % f for f in gkrust_features]

@@ -1,0 +1,161 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+:root {
+  --search-highlight-background-color: light-dark(#ffe900, #003eaa);
+  --search-highlight-text-color: currentColor;
+
+  @media (forced-colors) {
+    --search-highlight-background-color: Highlight;
+    --search-highlight-text-color: HighlightText;
+  }
+}
+
+
+body {
+  display: grid;
+  grid-template-columns: var(--size-sidebar) 1fr;
+  padding-inline-start: calc(var(--space-xlarge) * 4);
+  padding-inline-end: calc(var(--space-xlarge) * 2);
+  gap: calc(var(--space-xlarge) * 2);
+}
+
+.main-container {
+  max-width: var(--page-main-content-width);
+  padding-block: var(--space-xxlarge);
+}
+
+@media (max-width: 950px) {
+  body {
+    display: block;
+    padding-inline: var(--space-xxlarge);
+  }
+
+  .main-container {
+    max-width: unset;
+    padding-block-start: var(--space-xxlarge);
+    padding-block-end: unset;
+    padding-inline: calc(var(--space-xlarge) * 2);
+    box-sizing: border-box;
+  }
+}
+
+@media (max-width: 600px) {
+  .main-container {
+    padding-inline: var(--space-large);
+  }
+}
+
+.search-highlight {
+  background-color: var(--search-highlight-background-color);
+  color: var(--search-highlight-text-color);
+}
+
+
+#table {
+  width: 100%;
+}
+
+.hidden {
+  display: none;
+}
+
+
+moz-card {
+  margin-block: var(--space-xlarge);
+}
+
+moz-card::part(heading) {
+  --font-size-root: var(--font-size-heading-medium);
+}
+
+moz-card::part(summary) {
+  padding: var(--space-large);
+}
+
+moz-card[expanded]::part(summary) {
+  padding-inline-start: var(--space-large);
+}
+
+moz-box-group {
+  margin-inline: var(--space-large);
+  margin-bottom: var(--space-large);
+}
+
+
+.key-content {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-medium);
+}
+
+.key-label {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+@media (max-width: 600px) {
+  .key-label {
+    flex: 1 1 100%;
+  }
+}
+
+.key-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xsmall);
+  flex: 0 0 calc(var(--input-width) * 10 + var(--button-size-icon) * 2 + var(--space-xsmall) * 2);
+}
+
+@media (max-width: 600px) {
+  .key-actions {
+    flex: 1 1 100%;
+  }
+}
+
+.key-actions .currentShortcut {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+
+.clear {
+  visibility: hidden;
+}
+
+.assigned .clear {
+  visibility: visible;
+}
+
+.customized .clear {
+  display: none;
+}
+
+
+.reset {
+  display: none;
+}
+
+.customized .reset {
+  display: revert;
+}
+
+
+.newKey {
+  display: none;
+}
+
+.editing {
+  .change,
+  .currentShortcut {
+    display: none;
+  }
+
+  .newKey {
+    display: revert;
+    text-wrap: nowrap;
+    flex: 1 1 auto;
+  }
+}

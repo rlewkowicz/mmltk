@@ -1,0 +1,48 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_MEDIA_DRIFTCONTROL_AUDIORESAMPLER_H_
+#define DOM_MEDIA_DRIFTCONTROL_AUDIORESAMPLER_H_
+
+#include "AudioChunkList.h"
+#include "AudioSegment.h"
+#include "DynamicResampler.h"
+
+namespace mozilla {
+
+class AudioResampler final {
+ public:
+  AudioResampler(uint32_t aInRate, uint32_t aOutRate,
+                 uint32_t aInputPreBufferFrameCount,
+                 const PrincipalHandle& aPrincipalHandle);
+
+  void AppendInput(const AudioSegment& aInSegment);
+  uint32_t InputCapacityFrames() const;
+  uint32_t InputReadableFrames() const;
+
+  AudioSegment Resample(uint32_t aOutFrames, bool* aHasUnderrun);
+
+  void UpdateInRate(uint32_t aInRate) {
+    Update(aInRate, mResampler.GetChannels());
+  }
+
+  void SetInputPreBufferFrameCount(uint32_t aInputPreBufferFrameCount) {
+    mResampler.SetInputPreBufferFrameCount(aInputPreBufferFrameCount);
+  }
+
+ private:
+  void UpdateChannels(uint32_t aChannels) {
+    Update(mResampler.GetInRate(), aChannels);
+  }
+  void Update(uint32_t aInRate, uint32_t aChannels);
+
+ private:
+  DynamicResampler mResampler;
+  AudioChunkList mOutputChunks;
+  bool mIsSampleFormatSet = false;
+};
+
+}  
+
+#endif  // DOM_MEDIA_DRIFTCONTROL_AUDIORESAMPLER_H_

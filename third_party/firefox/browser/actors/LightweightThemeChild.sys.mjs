@@ -1,0 +1,68 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+export class LightweightThemeChild extends JSWindowActorChild {
+  constructor() {
+    super();
+    this._initted = false;
+    Services.cpmm.sharedData.addEventListener("change", this);
+  }
+
+  didDestroy() {
+    Services.cpmm.sharedData.removeEventListener("change", this);
+  }
+
+  _getChromeOuterWindowID() {
+    try {
+      let browserChild = this.docShell.browserChild;
+      if (browserChild) {
+        return browserChild.chromeOuterWindowID;
+      }
+    } catch (ex) {}
+
+    if (
+      Services.appinfo.processType === Services.appinfo.PROCESS_TYPE_DEFAULT
+    ) {
+      return this.browsingContext.topChromeWindow.docShell.outerWindowID;
+    }
+
+    return 0;
+  }
+
+  handleEvent(event) {
+    switch (event.type) {
+      case "pageshow":
+      case "DOMContentLoaded":
+        if (!this._initted && this._getChromeOuterWindowID()) {
+          this._initted = true;
+          this.update();
+        }
+        break;
+
+      case "change":
+        if (
+          event.changedKeys.includes(`theme/${this._getChromeOuterWindowID()}`)
+        ) {
+          this.update();
+        }
+        break;
+    }
+  }
+
+  update() {
+    const event = Cu.cloneInto(
+      {
+        detail: {
+          data: Services.cpmm.sharedData.get(
+            `theme/${this._getChromeOuterWindowID()}`
+          ),
+        },
+      },
+      this.contentWindow
+    );
+    this.contentWindow.dispatchEvent(
+      new this.contentWindow.CustomEvent("LightweightTheme:Set", event)
+    );
+  }
+}

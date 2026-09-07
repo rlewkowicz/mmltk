@@ -1,0 +1,102 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_DOMJSProxyHandler_h
+#define mozilla_dom_DOMJSProxyHandler_h
+
+#include "js/Proxy.h"
+#include "jsapi.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/Maybe.h"
+
+namespace mozilla::dom {
+
+
+class BaseDOMProxyHandler : public js::BaseProxyHandler {
+ public:
+  explicit constexpr BaseDOMProxyHandler(const void* aProxyFamily,
+                                         bool aHasPrototype = false)
+      : js::BaseProxyHandler(aProxyFamily, aHasPrototype) {}
+
+  bool getOwnPropertyDescriptor(
+      JSContext* cx, JS::Handle<JSObject*> proxy, JS::Handle<jsid> id,
+      JS::MutableHandle<Maybe<JS::PropertyDescriptor>> desc) const override;
+  virtual bool ownPropertyKeys(
+      JSContext* cx, JS::Handle<JSObject*> proxy,
+      JS::MutableHandleVector<jsid> props) const override;
+
+  virtual bool getPrototypeIfOrdinary(
+      JSContext* cx, JS::Handle<JSObject*> proxy, bool* isOrdinary,
+      JS::MutableHandle<JSObject*> proto) const override;
+
+  virtual bool getOwnEnumerablePropertyKeys(
+      JSContext* cx, JS::Handle<JSObject*> proxy,
+      JS::MutableHandleVector<jsid> props) const override;
+
+ protected:
+  virtual bool ownPropNames(JSContext* cx, JS::Handle<JSObject*> proxy,
+                            unsigned flags,
+                            JS::MutableHandleVector<jsid> props) const = 0;
+
+  virtual bool getOwnPropDescriptor(
+      JSContext* cx, JS::Handle<JSObject*> proxy, JS::Handle<jsid> id,
+      bool ignoreNamedProps,
+      JS::MutableHandle<Maybe<JS::PropertyDescriptor>> desc) const = 0;
+};
+
+class DOMProxyHandler : public BaseDOMProxyHandler {
+ public:
+  constexpr DOMProxyHandler() : BaseDOMProxyHandler(&family) {}
+
+  bool defineProperty(JSContext* cx, JS::Handle<JSObject*> proxy,
+                      JS::Handle<jsid> id,
+                      JS::Handle<JS::PropertyDescriptor> desc,
+                      JS::ObjectOpResult& result) const override {
+    bool unused;
+    return defineProperty(cx, proxy, id, desc, result, &unused);
+  }
+  virtual bool defineProperty(JSContext* cx, JS::Handle<JSObject*> proxy,
+                              JS::Handle<jsid> id,
+                              JS::Handle<JS::PropertyDescriptor> desc,
+                              JS::ObjectOpResult& result, bool* done) const;
+  bool delete_(JSContext* cx, JS::Handle<JSObject*> proxy, JS::Handle<jsid> id,
+               JS::ObjectOpResult& result) const override;
+  bool preventExtensions(JSContext* cx, JS::Handle<JSObject*> proxy,
+                         JS::ObjectOpResult& result) const override;
+  bool isExtensible(JSContext* cx, JS::Handle<JSObject*> proxy,
+                    bool* extensible) const override;
+  bool set(JSContext* cx, JS::Handle<JSObject*> proxy, JS::Handle<jsid> id,
+           JS::Handle<JS::Value> v, JS::Handle<JS::Value> receiver,
+           JS::ObjectOpResult& result) const override;
+
+  virtual bool setCustom(JSContext* cx, JS::Handle<JSObject*> proxy,
+                         JS::Handle<jsid> id, JS::Handle<JS::Value> v,
+                         bool* done) const;
+
+  static JSObject* GetExpandoObject(JSObject* obj);
+
+  static JSObject* EnsureExpandoObject(JSContext* cx,
+                                       JS::Handle<JSObject*> obj);
+
+  static const char family;
+};
+
+class ShadowingDOMProxyHandler : public DOMProxyHandler {
+ public:
+  virtual void trace(JSTracer* trc, JSObject* proxy) const override;
+};
+
+inline bool IsDOMProxy(JSObject* obj) {
+  return js::IsProxy(obj) &&
+         js::GetProxyHandler(obj)->family() == &DOMProxyHandler::family;
+}
+
+inline const DOMProxyHandler* GetDOMProxyHandler(JSObject* obj) {
+  MOZ_ASSERT(IsDOMProxy(obj));
+  return static_cast<const DOMProxyHandler*>(js::GetProxyHandler(obj));
+}
+
+}  
+
+#endif /* mozilla_dom_DOMProxyHandler_h */

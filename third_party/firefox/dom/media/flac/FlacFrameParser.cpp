@@ -1,0 +1,248 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "FlacFrameParser.h"
+
+#include "BufferReader.h"
+#include "VideoUtils.h"
+#include "mozilla/EndianUtils.h"
+#include "mozilla/Try.h"
+#include "mozilla/Utf8.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+
+static bool AddVorbisComment(MetadataTags& aTags,
+                             const nsCString& aComment) {
+  const char* separator =
+      static_cast<const char*>(memchr(aComment.Data(), '=', aComment.Length()));
+  if (!separator) {
+    return false;
+  }
+
+  nsCString key(aComment.Data(), separator - aComment.Data());
+  for (size_t index = 0; index < key.Length(); ++index) {
+    const char character = key[index];
+    if (character < 0x20 || character > 0x7d || character == '=') {
+      return false;
+    }
+  }
+
+  nsCString value(separator + 1,
+                  aComment.Length() - (separator - aComment.Data()) - 1);
+  if (!IsUtf8(value)) {
+    return false;
+  }
+  aTags.InsertOrUpdate(key, value);
+  return true;
+}
+
+#define OGG_FLAC_METADATA_TYPE_STREAMINFO 0x7F
+#define FLAC_STREAMINFO_SIZE 34
+
+#define BITMASK(x) ((1ULL << x) - 1)
+
+enum {
+  FLAC_METADATA_TYPE_STREAMINFO = 0,
+  FLAC_METADATA_TYPE_PADDING,
+  FLAC_METADATA_TYPE_APPLICATION,
+  FLAC_METADATA_TYPE_SEEKTABLE,
+  FLAC_METADATA_TYPE_VORBIS_COMMENT,
+  FLAC_METADATA_TYPE_CUESHEET,
+  FLAC_METADATA_TYPE_PICTURE,
+  FLAC_METADATA_TYPE_INVALID = 127
+};
+
+FlacFrameParser::FlacFrameParser()
+    : mMinBlockSize(0),
+      mMaxBlockSize(0),
+      mMinFrameSize(0),
+      mMaxFrameSize(0),
+      mNumFrames(0),
+      mFullMetadata(false),
+      mPacketCount(0) {};
+
+FlacFrameParser::~FlacFrameParser() = default;
+
+uint32_t FlacFrameParser::HeaderBlockLength(const uint8_t* aPacket) const {
+  uint32_t extra = 4;
+  if (aPacket[0] == 'f') {
+    aPacket += 4;
+    extra += 4;
+  }
+  return (BigEndian::readUint32(aPacket) & BITMASK(24)) + extra;
+}
+
+Result<Ok, nsresult> FlacFrameParser::DecodeHeaderBlock(const uint8_t* aPacket,
+                                                        size_t aLength) {
+  if (aLength < 4 || aPacket[0] == 0xff) {
+    return Err(NS_ERROR_FAILURE);
+  }
+  BufferReader br(aPacket, aLength);
+
+  mPacketCount++;
+
+  if (aPacket[0] == 'f') {
+    if (mPacketCount != 1 || memcmp(br.Read(4), "fLaC", 4) ||
+        br.Remaining() != FLAC_STREAMINFO_SIZE + 4) {
+      return Err(NS_ERROR_FAILURE);
+    }
+  }
+  uint8_t blockHeader = MOZ_TRY(br.ReadU8());
+  uint32_t blockType = blockHeader & 0x7f;
+  bool lastBlock = blockHeader & 0x80;
+
+  if (blockType == OGG_FLAC_METADATA_TYPE_STREAMINFO) {
+    if (mPacketCount != 1 || memcmp(br.Read(4), "FLAC", 4) ||
+        br.Remaining() != FLAC_STREAMINFO_SIZE + 12) {
+      return Err(NS_ERROR_FAILURE);
+    }
+    uint32_t major = MOZ_TRY(br.ReadU8());
+    if (major != 1) {
+      return Err(NS_ERROR_FAILURE);
+    }
+    MOZ_TRY(br.ReadU8());  
+    uint32_t header = MOZ_TRY(br.ReadU16());
+    mNumHeaders = Some(header);
+    br.Read(4);  
+    blockType = MOZ_TRY(br.ReadU8());
+    blockType &= BITMASK(7);
+    if (blockType != FLAC_METADATA_TYPE_STREAMINFO) {
+      return Err(NS_ERROR_FAILURE);
+    }
+  }
+
+  uint32_t blockDataSize = MOZ_TRY(br.ReadU24());
+  const uint8_t* blockDataStart = br.Peek(blockDataSize);
+  if (!blockDataStart) {
+    return Err(NS_ERROR_FAILURE);
+  }
+
+  switch (blockType) {
+    case FLAC_METADATA_TYPE_STREAMINFO: {
+      if (mPacketCount != 1 || blockDataSize != FLAC_STREAMINFO_SIZE) {
+        return Err(NS_ERROR_FAILURE);
+      }
+
+      mMinBlockSize = MOZ_TRY(br.ReadU16());
+      mMaxBlockSize = MOZ_TRY(br.ReadU16());
+      mMinFrameSize = MOZ_TRY(br.ReadU24());
+      mMaxFrameSize = MOZ_TRY(br.ReadU24());
+
+      uint64_t blob = MOZ_TRY(br.ReadU64());
+      uint32_t sampleRate = (blob >> 44) & BITMASK(20);
+      if (!sampleRate) {
+        return Err(NS_ERROR_FAILURE);
+      }
+      uint32_t numChannels = ((blob >> 41) & BITMASK(3)) + 1;
+      if (numChannels > FLAC_MAX_CHANNELS) {
+        return Err(NS_ERROR_FAILURE);
+      }
+      uint32_t bps = ((blob >> 36) & BITMASK(5)) + 1;
+      if (bps > 24) {
+        return Err(NS_ERROR_FAILURE);
+      }
+      mNumFrames = blob & BITMASK(36);
+
+      mInfo.mMimeType = "audio/flac";
+      mInfo.mRate = sampleRate;
+      mInfo.mChannels = numChannels;
+      mInfo.mBitDepth = bps;
+      FlacCodecSpecificData flacCodecSpecificData;
+      flacCodecSpecificData.mStreamInfoBinaryBlob->AppendElements(
+          blockDataStart, blockDataSize);
+      mInfo.mCodecSpecificConfig =
+          AudioCodecSpecificVariant{std::move(flacCodecSpecificData)};
+      auto duration = media::TimeUnit(mNumFrames, sampleRate);
+      mInfo.mDuration = duration.IsValid() ? duration : media::TimeUnit::Zero();
+      break;
+    }
+    case FLAC_METADATA_TYPE_VORBIS_COMMENT: {
+      if (!mInfo.IsValid()) {
+        return Err(NS_ERROR_FAILURE);
+      }
+      BufferReader comments(blockDataStart, blockDataSize);
+      const uint32_t vendorLength = MOZ_TRY(comments.ReadLEU32());
+      if (!comments.Read(vendorLength)) {
+        return Err(NS_ERROR_FAILURE);
+      }
+      const uint32_t commentCount = MOZ_TRY(comments.ReadLEU32());
+      for (uint32_t index = 0; index < commentCount; ++index) {
+        const uint32_t commentLength = MOZ_TRY(comments.ReadLEU32());
+        const uint8_t* commentBytes = comments.Read(commentLength);
+        if (!commentBytes) {
+          return Err(NS_ERROR_FAILURE);
+        }
+        AddVorbisComment(
+            mTags, nsCString(reinterpret_cast<const char*>(commentBytes),
+                             commentLength));
+      }
+      if (comments.Remaining()) {
+        return Err(NS_ERROR_FAILURE);
+      }
+      break;
+    }
+    default:
+      break;
+  }
+
+  if (mNumHeaders && mPacketCount > mNumHeaders.ref() + 1) {
+    return Err(NS_ERROR_FAILURE);
+  }
+
+  if (lastBlock || (mNumHeaders && mNumHeaders.ref() + 1 == mPacketCount)) {
+    mFullMetadata = true;
+  }
+
+  return Ok();
+}
+
+int64_t FlacFrameParser::BlockDuration(const uint8_t* aPacket,
+                                       size_t aLength) const {
+  if (!mInfo.IsValid()) {
+    return -1;
+  }
+  if (mMinBlockSize == mMaxBlockSize) {
+    return mMinBlockSize;
+  }
+  return 0;
+}
+
+Result<bool, nsresult> FlacFrameParser::IsHeaderBlock(const uint8_t* aPacket,
+                                                      size_t aLength) const {
+
+
+  if (aLength < 4 || aPacket[0] == 0xff) {
+    return false;
+  }
+  if (aPacket[0] == 0x7f) {
+    BufferReader br(aPacket + 1, aLength - 1);
+    const uint8_t* signature = br.Read(4);
+    return signature && !memcmp(signature, "FLAC", 4);
+  }
+  BufferReader br(aPacket, aLength - 1);
+  const uint8_t* signature = br.Read(4);
+  if (signature && !memcmp(signature, "fLaC", 4)) {
+    uint32_t blockType = MOZ_TRY(br.ReadU8());
+    blockType &= 0x7f;
+    return blockType == FLAC_METADATA_TYPE_STREAMINFO;
+  }
+  char type = aPacket[0] & 0x7f;
+  return type >= 1 && type <= 6;
+}
+
+UniquePtr<MetadataTags> FlacFrameParser::GetTags() const {
+  if (!mInfo.IsValid()) {
+    return nullptr;
+  }
+
+  auto tags = MakeUnique<MetadataTags>();
+  for (const auto& entry : mTags) {
+    tags->InsertOrUpdate(entry.GetKey(), entry.GetData());
+  }
+
+  return tags;
+}
+
+}  

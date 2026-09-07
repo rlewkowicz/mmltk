@@ -1,0 +1,68 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/CSPViolationData.h"
+
+#include <utility>
+
+#include "mozilla/Utf16.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/nsCSPContext.h"
+#include "nsCharTraits.h"
+#include "nsContentUtils.h"
+
+namespace mozilla::dom {
+
+const nsDependentSubstring CSPViolationData::MaybeTruncateSample(
+    const nsAString& aSample) {
+  uint32_t length = aSample.Length();
+  uint32_t maybeTruncatedLength = nsCSPContext::ScriptSampleMaxLength();
+  if (length > maybeTruncatedLength) {
+    if (mozilla::IsLowSurrogate(aSample[maybeTruncatedLength])) {
+      maybeTruncatedLength++;
+    }
+  }
+  return Substring(aSample, 0, maybeTruncatedLength);
+}
+
+static const nsString MaybeTruncateSampleWithEllipsis(
+    const nsAString& aSample) {
+  const nsDependentSubstring sample =
+      CSPViolationData::MaybeTruncateSample(aSample);
+  return sample.Length() < aSample.Length()
+             ? sample + nsContentUtils::GetLocalizedEllipsis()
+             : nsString(aSample);
+}
+
+CSPViolationData::CSPViolationData(uint32_t aViolatedPolicyIndex,
+                                   Resource&& aResource,
+                                   const CSPDirective aEffectiveDirective,
+                                   const nsACString& aSourceFile,
+                                   uint32_t aLineNumber, uint32_t aColumnNumber,
+                                   Element* aElement, const nsAString& aSample,
+                                   const nsACString& aHashSHA256)
+    : mViolatedPolicyIndex{aViolatedPolicyIndex},
+      mResource{std::move(aResource)},
+      mEffectiveDirective{aEffectiveDirective},
+      mSourceFile{aSourceFile},
+      mLineNumber{aLineNumber},
+      mColumnNumber{aColumnNumber},
+      mElement{aElement},
+      mSample{(BlockedContentSourceOrUnknown() ==
+                   BlockedContentSource::TrustedTypesSink ||
+               BlockedContentSourceOrUnknown() ==
+                   BlockedContentSource::TrustedTypesPolicy)
+                  ? nsString(aSample)
+                  : MaybeTruncateSampleWithEllipsis(aSample)},
+      mHashSHA256{aHashSHA256} {}
+
+CSPViolationData::~CSPViolationData() = default;
+
+auto CSPViolationData::BlockedContentSourceOrUnknown() const
+    -> BlockedContentSource {
+  return mResource.is<CSPViolationData::BlockedContentSource>()
+             ? mResource.as<CSPViolationData::BlockedContentSource>()
+             : CSPViolationData::BlockedContentSource::Unknown;
+}
+}  

@@ -1,0 +1,708 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "WheelHandlingHelper.h"
+
+#include <utility>  // for std::swap
+
+#include "DocumentInlines.h"  // for Document and HTMLBodyElement
+#include "ScrollAnimationPhysics.h"
+#include "Units.h"
+#include "mozilla/EventDispatcher.h"
+#include "mozilla/EventStateManager.h"
+#include "mozilla/MouseEvents.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/ScrollContainerFrame.h"
+#include "mozilla/StaticPrefs_mousewheel.h"
+#include "mozilla/TextControlElement.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/WheelEventBinding.h"
+#include "nsCOMPtr.h"
+#include "nsContentUtils.h"
+#include "nsIContent.h"
+#include "nsIContentInlines.h"
+#include "nsITimer.h"
+#include "nsPresContext.h"
+#include "prtime.h"
+
+static mozilla::LazyLogModule sWheelTransactionLog("dom.wheeltransaction");
+#define WTXN_LOG(...) \
+  MOZ_LOG(sWheelTransactionLog, LogLevel::Debug, (__VA_ARGS__))
+
+namespace mozilla {
+
+
+DeltaValues::DeltaValues(WidgetWheelEvent* aEvent)
+    : deltaX(aEvent->mDeltaX), deltaY(aEvent->mDeltaY) {}
+
+
+bool WheelHandlingUtils::CanScrollInRange(nscoord aMin, nscoord aValue,
+                                          nscoord aMax, double aDirection) {
+  return aDirection > 0.0 ? aValue < static_cast<double>(aMax)
+                          : static_cast<double>(aMin) < aValue;
+}
+
+bool WheelHandlingUtils::CanScrollOn(nsIFrame* aFrame, double aDirectionX,
+                                     double aDirectionY) {
+  ScrollContainerFrame* scrollContainerFrame = do_QueryFrame(aFrame);
+  if (!scrollContainerFrame) {
+    return false;
+  }
+  return CanScrollOn(scrollContainerFrame, aDirectionX, aDirectionY);
+}
+
+bool WheelHandlingUtils::CanScrollOn(
+    ScrollContainerFrame* aScrollContainerFrame, double aDirectionX,
+    double aDirectionY) {
+  MOZ_ASSERT(aScrollContainerFrame);
+  NS_ASSERTION(aDirectionX || aDirectionY,
+               "One of the delta values must be non-zero at least");
+
+  nsPoint scrollPt = aScrollContainerFrame->GetVisualViewportOffset();
+  nsRect scrollRange =
+      aScrollContainerFrame->GetScrollRangeForUserInputEvents();
+  layers::ScrollDirections directions =
+      aScrollContainerFrame
+          ->GetAvailableScrollingDirectionsForUserInputEvents();
+
+  return ((aDirectionX != 0.0) &&
+          (directions.contains(layers::ScrollDirection::eHorizontal)) &&
+          CanScrollInRange(scrollRange.x, scrollPt.x, scrollRange.XMost(),
+                           aDirectionX)) ||
+         ((aDirectionY != 0.0) &&
+          (directions.contains(layers::ScrollDirection::eVertical)) &&
+          CanScrollInRange(scrollRange.y, scrollPt.y, scrollRange.YMost(),
+                           aDirectionY));
+}
+
+ Maybe<layers::ScrollDirection>
+WheelHandlingUtils::GetDisregardedWheelScrollDirection(const nsIFrame* aFrame) {
+  nsIContent* content = aFrame->GetContent();
+  if (!content) {
+    return Nothing();
+  }
+  TextControlElement* textControlElement = TextControlElement::FromNodeOrNull(
+      content->IsInNativeAnonymousSubtree()
+          ? content->GetClosestNativeAnonymousSubtreeRootParentOrHost()
+          : content);
+  if (!textControlElement || !textControlElement->IsSingleLineTextControl()) {
+    return Nothing();
+  }
+  return Some(aFrame->GetWritingMode().IsVertical()
+                  ? layers::ScrollDirection::eHorizontal
+                  : layers::ScrollDirection::eVertical);
+}
+
+
+constinit AutoWeakFrame WheelTransaction::sScrollTargetFrame;
+constinit AutoWeakFrame WheelTransaction::sEventTargetFrame;
+
+bool WheelTransaction::sHandledByApz(false);
+uint32_t WheelTransaction::sTime = 0;
+uint32_t WheelTransaction::sMouseMoved = 0;
+nsITimer* WheelTransaction::sTimer = nullptr;
+int32_t WheelTransaction::sScrollSeriesCounter = 0;
+bool WheelTransaction::sOwnScrollbars = false;
+
+bool WheelTransaction::OutOfTime(uint32_t aBaseTime, uint32_t aThreshold) {
+  uint32_t now = PR_IntervalToMilliseconds(PR_IntervalNow());
+  return (now - aBaseTime > aThreshold);
+}
+
+void WheelTransaction::OwnScrollbars(bool aOwn) { sOwnScrollbars = aOwn; }
+
+void WheelTransaction::BeginTransaction(nsIFrame* aScrollTargetFrame,
+                                        nsIFrame* aEventTargetFrame,
+                                        const WidgetWheelEvent* aEvent) {
+  NS_ASSERTION(!sScrollTargetFrame && !sEventTargetFrame,
+               "previous transaction is not finished!");
+  MOZ_ASSERT(aEvent->mMessage == eWheel,
+             "Transaction must be started with a wheel event");
+
+  ScrollbarsForWheel::OwnWheelTransaction(false);
+  sScrollTargetFrame = aScrollTargetFrame;
+
+  WTXN_LOG("WheelTransaction start for frame=0x%p handled-by-apz=%s",
+           aEventTargetFrame, aEvent->mFlags.mHandledByAPZ ? "true" : "false");
+  sEventTargetFrame = aEventTargetFrame;
+  sHandledByApz = aEvent->mFlags.mHandledByAPZ;
+
+  sScrollSeriesCounter = 0;
+  if (!UpdateTransaction(aEvent)) {
+    NS_ERROR("BeginTransaction is called even cannot scroll the frame");
+    EndTransaction();
+  }
+}
+
+bool WheelTransaction::UpdateTransaction(const WidgetWheelEvent* aEvent) {
+  nsIFrame* scrollToFrame = GetScrollTargetFrame();
+  ScrollContainerFrame* scrollContainerFrame =
+      scrollToFrame->GetScrollTargetFrame();
+  if (scrollContainerFrame) {
+    scrollToFrame = scrollContainerFrame;
+  }
+
+  if (!WheelHandlingUtils::CanScrollOn(scrollToFrame, aEvent->mDeltaX,
+                                       aEvent->mDeltaY)) {
+    OnFailToScrollTarget();
+    return false;
+  }
+
+  SetTimeout();
+
+  if (sScrollSeriesCounter != 0 &&
+      OutOfTime(sTime, StaticPrefs::mousewheel_scroll_series_timeout())) {
+    sScrollSeriesCounter = 0;
+  }
+  sScrollSeriesCounter++;
+
+  sTime = PR_IntervalToMilliseconds(PR_IntervalNow());
+  sMouseMoved = 0;
+  return true;
+}
+
+void WheelTransaction::MayEndTransaction() {
+  if (!sOwnScrollbars && ScrollbarsForWheel::IsActive()) {
+    ScrollbarsForWheel::OwnWheelTransaction(true);
+  } else {
+    EndTransaction();
+  }
+}
+
+void WheelTransaction::EndTransaction() {
+  if (sTimer) {
+    sTimer->Cancel();
+  }
+  sScrollTargetFrame = nullptr;
+  sEventTargetFrame = nullptr;
+  sScrollSeriesCounter = 0;
+  sHandledByApz = false;
+  if (sOwnScrollbars) {
+    sOwnScrollbars = false;
+    ScrollbarsForWheel::OwnWheelTransaction(false);
+    ScrollbarsForWheel::Inactivate();
+  }
+}
+
+bool WheelTransaction::WillHandleDefaultAction(
+    WidgetWheelEvent* aWheelEvent, AutoWeakFrame& aScrollTargetWeakFrame,
+    AutoWeakFrame& aEventTargetWeakFrame) {
+  nsIFrame* lastTargetFrame = GetScrollTargetFrame();
+  if (!lastTargetFrame) {
+    BeginTransaction(aScrollTargetWeakFrame.GetFrame(),
+                     aEventTargetWeakFrame.GetFrame(), aWheelEvent);
+  } else if (lastTargetFrame != aScrollTargetWeakFrame.GetFrame()) {
+    WTXN_LOG("Wheel transaction ending due to new target frame");
+    EndTransaction();
+    BeginTransaction(aScrollTargetWeakFrame.GetFrame(),
+                     aEventTargetWeakFrame.GetFrame(), aWheelEvent);
+  } else {
+    UpdateTransaction(aWheelEvent);
+  }
+
+  if (!aScrollTargetWeakFrame.IsAlive()) {
+    WTXN_LOG("Wheel transaction ending due to target frame removal");
+    EndTransaction();
+    return false;
+  }
+
+  return true;
+}
+
+void WheelTransaction::OnEvent(WidgetEvent* aEvent) {
+  if (!sScrollTargetFrame) {
+    return;
+  }
+
+  if (OutOfTime(sTime, StaticPrefs::mousewheel_transaction_timeout())) {
+    OnTimeout(nullptr, nullptr);
+    return;
+  }
+
+  switch (aEvent->mMessage) {
+    case eWheel:
+      if (sMouseMoved != 0 &&
+          OutOfTime(sMouseMoved,
+                    StaticPrefs::mousewheel_transaction_ignoremovedelay())) {
+        WTXN_LOG("Wheel transaction ending due to transaction timeout");
+        EndTransaction();
+      }
+      return;
+    case eMouseMove:
+    case eDragOver: {
+      WidgetMouseEvent* mouseEvent = aEvent->AsMouseEvent();
+      if (mouseEvent->IsReal()) {
+        LayoutDeviceIntPoint pt = GetScreenPoint(mouseEvent);
+        auto r = LayoutDeviceIntRect::FromAppUnitsToNearest(
+            sScrollTargetFrame->GetScreenRectInAppUnits(),
+            sScrollTargetFrame->PresContext()->AppUnitsPerDevPixel());
+        if (!r.Contains(pt)) {
+          WTXN_LOG("Wheel transaction ending due to mousemove");
+          EndTransaction();
+          return;
+        }
+
+        sEventTargetFrame = nullptr;
+
+        if (!sMouseMoved &&
+            OutOfTime(sTime,
+                      StaticPrefs::mousewheel_transaction_ignoremovedelay())) {
+          sMouseMoved = PR_IntervalToMilliseconds(PR_IntervalNow());
+        }
+      }
+      return;
+    }
+    case eKeyPress:
+    case eKeyUp:
+    case eKeyDown:
+    case eMouseUp:
+    case eMouseDown:
+    case eMouseDoubleClick:
+    case ePointerAuxClick:
+    case ePointerClick:
+    case eContextMenu:
+    case eDrop:
+      WTXN_LOG("Wheel transaction ending due to keyboard event");
+      EndTransaction();
+      return;
+    default:
+      break;
+  }
+}
+
+void WheelTransaction::OnRemoveElement(nsIContent* aContent) {
+  if (!sEventTargetFrame) {
+    return;
+  }
+
+  if (sEventTargetFrame->GetContent() == aContent) {
+    sEventTargetFrame = nullptr;
+  }
+}
+
+void WheelTransaction::Shutdown() { NS_IF_RELEASE(sTimer); }
+
+void WheelTransaction::OnFailToScrollTarget() {
+  MOZ_ASSERT(sScrollTargetFrame, "We don't have mouse scrolling transaction");
+
+  if (!sScrollTargetFrame) {
+    WTXN_LOG("Wheel transaction ending due to failed scroll");
+    EndTransaction();
+  }
+}
+
+void WheelTransaction::OnTimeout(nsITimer* aTimer, void* aClosure) {
+  if (!sScrollTargetFrame) {
+    WTXN_LOG("Wheel transaction ending due to target removal");
+    EndTransaction();
+    return;
+  }
+  WTXN_LOG("Wheel transaction may end due to timeout");
+  MayEndTransaction();
+
+}
+
+void WheelTransaction::SetTimeout() {
+  if (!sTimer) {
+    sTimer = NS_NewTimer().take();
+    if (!sTimer) {
+      return;
+    }
+  }
+  sTimer->Cancel();
+  DebugOnly<nsresult> rv = sTimer->InitWithNamedFuncCallback(
+      OnTimeout, nullptr, StaticPrefs::mousewheel_transaction_timeout(),
+      nsITimer::TYPE_ONE_SHOT, "WheelTransaction::SetTimeout"_ns);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "nsITimer::InitWithNamedFuncCallback failed");
+}
+
+LayoutDeviceIntPoint WheelTransaction::GetScreenPoint(WidgetGUIEvent* aEvent) {
+  NS_ASSERTION(aEvent, "aEvent is null");
+  NS_ASSERTION(aEvent->mWidget, "aEvent-mWidget is null");
+  return aEvent->mRefPoint + aEvent->mWidget->WidgetToScreenOffset();
+}
+
+DeltaValues WheelTransaction::AccelerateWheelDelta(WidgetWheelEvent* aEvent) {
+  DeltaValues result = OverrideSystemScrollSpeed(aEvent);
+
+  if (aEvent->mDeltaMode != dom::WheelEvent_Binding::DOM_DELTA_LINE) {
+    return result;
+  }
+
+  int32_t start = StaticPrefs::mousewheel_acceleration_start();
+  if (start >= 0 && sScrollSeriesCounter >= start) {
+    int32_t factor = StaticPrefs::mousewheel_acceleration_factor();
+    if (factor > 0) {
+      result.deltaX = ComputeAcceleratedWheelDelta(result.deltaX, factor);
+      result.deltaY = ComputeAcceleratedWheelDelta(result.deltaY, factor);
+    }
+  }
+
+  return result;
+}
+
+double WheelTransaction::ComputeAcceleratedWheelDelta(double aDelta,
+                                                      int32_t aFactor) {
+  return mozilla::ComputeAcceleratedWheelDelta(aDelta, sScrollSeriesCounter,
+                                               aFactor);
+}
+
+DeltaValues WheelTransaction::OverrideSystemScrollSpeed(
+    WidgetWheelEvent* aEvent) {
+  MOZ_ASSERT(sScrollTargetFrame, "We don't have mouse scrolling transaction");
+
+  if (!aEvent->mDeltaX && !aEvent->mDeltaY) {
+    return DeltaValues(aEvent);
+  }
+
+  return DeltaValues(aEvent->OverriddenDeltaX(), aEvent->OverriddenDeltaY());
+}
+
+
+constinit AutoWeakFrame ScrollbarsForWheel::sActiveOwner;
+constinit AutoWeakFrame
+    ScrollbarsForWheel::sActivatedScrollTargets[kNumberOfTargets];
+
+bool ScrollbarsForWheel::sHadWheelStart = false;
+bool ScrollbarsForWheel::sOwnWheelTransaction = false;
+
+void ScrollbarsForWheel::PrepareToScrollText(EventStateManager* aESM,
+                                             nsIFrame* aTargetFrame,
+                                             WidgetWheelEvent* aEvent) {
+  if (aEvent->mMessage == eWheelOperationStart) {
+    WheelTransaction::OwnScrollbars(false);
+    if (!IsActive()) {
+      TemporarilyActivateAllPossibleScrollTargets(aESM, aTargetFrame, aEvent);
+      sHadWheelStart = true;
+    }
+  } else {
+    DeactivateAllTemporarilyActivatedScrollTargets();
+  }
+}
+
+void ScrollbarsForWheel::SetActiveScrollTarget(
+    ScrollContainerFrame* aScrollTarget) {
+  if (!sHadWheelStart) {
+    return;
+  }
+  if (!aScrollTarget) {
+    return;
+  }
+  sHadWheelStart = false;
+  sActiveOwner = aScrollTarget;
+  aScrollTarget->ScrollbarActivityStarted();
+}
+
+void ScrollbarsForWheel::MayInactivate() {
+  if (!sOwnWheelTransaction && WheelTransaction::GetScrollTargetFrame()) {
+    WheelTransaction::OwnScrollbars(true);
+  } else {
+    Inactivate();
+  }
+}
+
+void ScrollbarsForWheel::Inactivate() {
+  nsIScrollbarMediator* scrollbarMediator = do_QueryFrame(sActiveOwner);
+  if (scrollbarMediator) {
+    scrollbarMediator->ScrollbarActivityStopped();
+  }
+  sActiveOwner = nullptr;
+  DeactivateAllTemporarilyActivatedScrollTargets();
+  if (sOwnWheelTransaction) {
+    WTXN_LOG("Wheel transaction ending due to inactive scrollbar");
+    sOwnWheelTransaction = false;
+    WheelTransaction::OwnScrollbars(false);
+    WheelTransaction::EndTransaction();
+  }
+}
+
+bool ScrollbarsForWheel::IsActive() {
+  if (sActiveOwner) {
+    return true;
+  }
+  for (auto& sActivatedScrollTarget : sActivatedScrollTargets) {
+    if (sActivatedScrollTarget) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void ScrollbarsForWheel::OwnWheelTransaction(bool aOwn) {
+  sOwnWheelTransaction = aOwn;
+}
+
+void ScrollbarsForWheel::TemporarilyActivateAllPossibleScrollTargets(
+    EventStateManager* aESM, nsIFrame* aTargetFrame, WidgetWheelEvent* aEvent) {
+  for (size_t i = 0; i < kNumberOfTargets; i++) {
+    const DeltaValues* dir = &directions[i];
+    AutoWeakFrame* scrollTarget = &sActivatedScrollTargets[i];
+    MOZ_ASSERT(!*scrollTarget, "scroll target still temporarily activated!");
+    ScrollContainerFrame* target = aESM->ComputeScrollTarget(
+        aTargetFrame, dir->deltaX, dir->deltaY, aEvent,
+        EventStateManager::COMPUTE_DEFAULT_ACTION_TARGET);
+    if (target) {
+      *scrollTarget = target;
+      target->ScrollbarActivityStarted();
+    }
+  }
+}
+
+void ScrollbarsForWheel::DeactivateAllTemporarilyActivatedScrollTargets() {
+  for (auto& sActivatedScrollTarget : sActivatedScrollTargets) {
+    AutoWeakFrame* scrollTarget = &sActivatedScrollTarget;
+    if (*scrollTarget) {
+      nsIScrollbarMediator* scrollbarMediator = do_QueryFrame(*scrollTarget);
+      if (scrollbarMediator) {
+        scrollbarMediator->ScrollbarActivityStopped();
+      }
+      *scrollTarget = nullptr;
+    }
+  }
+}
+
+
+void WheelDeltaHorizontalizer::Horizontalize() {
+  MOZ_ASSERT(!mWheelEvent.mDeltaValuesHorizontalizedForDefaultHandler,
+             "Wheel delta values in one wheel scroll event are being adjusted "
+             "a second time");
+
+  mOldDeltaX = mWheelEvent.mDeltaX;
+  mOldDeltaZ = mWheelEvent.mDeltaZ;
+  mOldOverflowDeltaX = mWheelEvent.mOverflowDeltaX;
+  mOldLineOrPageDeltaX = mWheelEvent.mLineOrPageDeltaX;
+
+  mWheelEvent.mDeltaX = mWheelEvent.mDeltaY;
+  mWheelEvent.mDeltaY = 0.0;
+  mWheelEvent.mDeltaZ = 0.0;
+  mWheelEvent.mOverflowDeltaX = mWheelEvent.mOverflowDeltaY;
+  mWheelEvent.mOverflowDeltaY = 0.0;
+  mWheelEvent.mLineOrPageDeltaX = mWheelEvent.mLineOrPageDeltaY;
+  mWheelEvent.mLineOrPageDeltaY = 0;
+
+  mWheelEvent.mDeltaValuesHorizontalizedForDefaultHandler = true;
+  mHorizontalized = true;
+}
+
+void WheelDeltaHorizontalizer::CancelHorizontalization() {
+  if (mHorizontalized &&
+      mWheelEvent.mDeltaValuesHorizontalizedForDefaultHandler) {
+    mWheelEvent.mDeltaY = mWheelEvent.mDeltaX;
+    mWheelEvent.mDeltaX = mOldDeltaX;
+    mWheelEvent.mDeltaZ = mOldDeltaZ;
+    mWheelEvent.mOverflowDeltaY = mWheelEvent.mOverflowDeltaX;
+    mWheelEvent.mOverflowDeltaX = mOldOverflowDeltaX;
+    mWheelEvent.mLineOrPageDeltaY = mWheelEvent.mLineOrPageDeltaX;
+    mWheelEvent.mLineOrPageDeltaX = mOldLineOrPageDeltaX;
+    mWheelEvent.mDeltaValuesHorizontalizedForDefaultHandler = false;
+    mHorizontalized = false;
+  }
+}
+
+WheelDeltaHorizontalizer::~WheelDeltaHorizontalizer() {
+  CancelHorizontalization();
+}
+
+
+bool AutoDirWheelDeltaAdjuster::ShouldBeAdjusted() {
+  if (mCheckedIfShouldBeAdjusted) {
+    return mShouldBeAdjusted;
+  }
+  mCheckedIfShouldBeAdjusted = true;
+
+  if ((mDeltaX && mDeltaY) || (!mDeltaX && !mDeltaY)) {
+    return false;
+  }
+  if (mDeltaX) {
+    if (CanScrollAlongXAxis()) {
+      return false;
+    }
+    if (IsHorizontalContentRightToLeft()) {
+      mShouldBeAdjusted =
+          mDeltaX > 0 ? CanScrollUpwards() : CanScrollDownwards();
+    } else {
+      mShouldBeAdjusted =
+          mDeltaX < 0 ? CanScrollUpwards() : CanScrollDownwards();
+    }
+    return mShouldBeAdjusted;
+  }
+  MOZ_ASSERT(0 != mDeltaY);
+  if (CanScrollAlongYAxis()) {
+    return false;
+  }
+  if (IsHorizontalContentRightToLeft()) {
+    mShouldBeAdjusted =
+        mDeltaY > 0 ? CanScrollLeftwards() : CanScrollRightwards();
+  } else {
+    mShouldBeAdjusted =
+        mDeltaY < 0 ? CanScrollLeftwards() : CanScrollRightwards();
+  }
+  return mShouldBeAdjusted;
+}
+
+void AutoDirWheelDeltaAdjuster::Adjust() {
+  if (!ShouldBeAdjusted()) {
+    return;
+  }
+  std::swap(mDeltaX, mDeltaY);
+  if (IsHorizontalContentRightToLeft()) {
+    mDeltaX *= -1;
+    mDeltaY *= -1;
+  }
+  mShouldBeAdjusted = false;
+  OnAdjusted();
+}
+
+
+ESMAutoDirWheelDeltaAdjuster::ESMAutoDirWheelDeltaAdjuster(
+    WidgetWheelEvent& aEvent, nsIFrame& aScrollFrame, bool aHonoursRoot)
+    : AutoDirWheelDeltaAdjuster(aEvent.mDeltaX, aEvent.mDeltaY),
+      mLineOrPageDeltaX(aEvent.mLineOrPageDeltaX),
+      mLineOrPageDeltaY(aEvent.mLineOrPageDeltaY),
+      mOverflowDeltaX(aEvent.mOverflowDeltaX),
+      mOverflowDeltaY(aEvent.mOverflowDeltaY) {
+  mScrollTargetFrame = aScrollFrame.GetScrollTargetFrame();
+  MOZ_ASSERT(mScrollTargetFrame);
+
+  nsIFrame* honouredFrame = nullptr;
+  if (aHonoursRoot) {
+    dom::Document* document = aScrollFrame.PresShell()->GetDocument();
+    if (document) {
+      dom::Element* bodyElement = document->GetBodyElement();
+      if (bodyElement) {
+        honouredFrame = bodyElement->GetPrimaryFrame();
+      }
+    }
+
+    if (!honouredFrame) {
+      honouredFrame = aScrollFrame.PresShell()->GetRootScrollContainerFrame();
+    }
+
+    if (!honouredFrame) {
+      honouredFrame = &aScrollFrame;
+    }
+  } else {
+    honouredFrame = &aScrollFrame;
+  }
+
+  WritingMode writingMode = honouredFrame->GetWritingMode();
+  mIsHorizontalContentRightToLeft = writingMode.IsPhysicalRTL();
+}
+
+void ESMAutoDirWheelDeltaAdjuster::OnAdjusted() {
+  if (mDeltaX) {
+    MOZ_ASSERT(0 == mDeltaY);
+
+    mLineOrPageDeltaX = mLineOrPageDeltaY;
+    mLineOrPageDeltaY = 0;
+    mOverflowDeltaX = mOverflowDeltaY;
+    mOverflowDeltaY = 0;
+  } else {
+    MOZ_ASSERT(0 != mDeltaY);
+
+    mLineOrPageDeltaY = mLineOrPageDeltaX;
+    mLineOrPageDeltaX = 0;
+    mOverflowDeltaY = mOverflowDeltaX;
+    mOverflowDeltaX = 0;
+  }
+  if (mIsHorizontalContentRightToLeft) {
+    mLineOrPageDeltaX *= -1;
+    mLineOrPageDeltaY *= -1;
+    mOverflowDeltaX *= -1;
+    mOverflowDeltaY *= -1;
+  }
+}
+
+bool ESMAutoDirWheelDeltaAdjuster::CanScrollAlongXAxis() const {
+  return mScrollTargetFrame->GetAvailableScrollingDirections().contains(
+      layers::ScrollDirection::eHorizontal);
+}
+
+bool ESMAutoDirWheelDeltaAdjuster::CanScrollAlongYAxis() const {
+  return mScrollTargetFrame->GetAvailableScrollingDirections().contains(
+      layers::ScrollDirection::eVertical);
+}
+
+bool ESMAutoDirWheelDeltaAdjuster::CanScrollUpwards() const {
+  nsPoint scrollPt = mScrollTargetFrame->GetScrollPosition();
+  nsRect scrollRange = mScrollTargetFrame->GetScrollRange();
+  return static_cast<double>(scrollRange.y) < scrollPt.y;
+}
+
+bool ESMAutoDirWheelDeltaAdjuster::CanScrollDownwards() const {
+  nsPoint scrollPt = mScrollTargetFrame->GetScrollPosition();
+  nsRect scrollRange = mScrollTargetFrame->GetScrollRange();
+  return static_cast<double>(scrollRange.YMost()) > scrollPt.y;
+}
+
+bool ESMAutoDirWheelDeltaAdjuster::CanScrollLeftwards() const {
+  nsPoint scrollPt = mScrollTargetFrame->GetScrollPosition();
+  nsRect scrollRange = mScrollTargetFrame->GetScrollRange();
+  return static_cast<double>(scrollRange.x) < scrollPt.x;
+}
+
+bool ESMAutoDirWheelDeltaAdjuster::CanScrollRightwards() const {
+  nsPoint scrollPt = mScrollTargetFrame->GetScrollPosition();
+  nsRect scrollRange = mScrollTargetFrame->GetScrollRange();
+  return static_cast<double>(scrollRange.XMost()) > scrollPt.x;
+}
+
+bool ESMAutoDirWheelDeltaAdjuster::IsHorizontalContentRightToLeft() const {
+  return mIsHorizontalContentRightToLeft;
+}
+
+
+ESMAutoDirWheelDeltaRestorer::ESMAutoDirWheelDeltaRestorer(
+    WidgetWheelEvent& aEvent)
+    : mEvent(aEvent),
+      mOldDeltaX(aEvent.mDeltaX),
+      mOldDeltaY(aEvent.mDeltaY),
+      mOldLineOrPageDeltaX(aEvent.mLineOrPageDeltaX),
+      mOldLineOrPageDeltaY(aEvent.mLineOrPageDeltaY),
+      mOldOverflowDeltaX(aEvent.mOverflowDeltaX),
+      mOldOverflowDeltaY(aEvent.mOverflowDeltaY) {}
+
+ESMAutoDirWheelDeltaRestorer::~ESMAutoDirWheelDeltaRestorer() {
+  if (mOldDeltaX == mEvent.mDeltaX || mOldDeltaY == mEvent.mDeltaY) {
+    return;
+  }
+
+  bool forRTL = false;
+
+  std::swap(mEvent.mDeltaX, mEvent.mDeltaY);
+  if (mOldDeltaX != mEvent.mDeltaX || mOldDeltaY != mEvent.mDeltaY) {
+    forRTL = true;
+    mEvent.mDeltaX *= -1;
+    mEvent.mDeltaY *= -1;
+    MOZ_ASSERT(mOldDeltaX == mEvent.mDeltaX && mOldDeltaY == mEvent.mDeltaY);
+  }
+
+  if (mEvent.mDeltaX) {
+    MOZ_ASSERT(0 == mEvent.mDeltaY);
+
+    mEvent.mOverflowDeltaX = mEvent.mOverflowDeltaY;
+    mEvent.mLineOrPageDeltaX = mEvent.mLineOrPageDeltaY;
+    if (forRTL) {
+      mEvent.mOverflowDeltaX *= -1;
+      mEvent.mLineOrPageDeltaX *= -1;
+    }
+    mEvent.mOverflowDeltaY = mOldOverflowDeltaY;
+    mEvent.mLineOrPageDeltaY = mOldLineOrPageDeltaY;
+  } else {
+    MOZ_ASSERT(0 != mEvent.mDeltaY);
+
+    mEvent.mOverflowDeltaY = mEvent.mOverflowDeltaX;
+    mEvent.mLineOrPageDeltaY = mEvent.mLineOrPageDeltaX;
+    if (forRTL) {
+      mEvent.mOverflowDeltaY *= -1;
+      mEvent.mLineOrPageDeltaY *= -1;
+    }
+    mEvent.mOverflowDeltaX = mOldOverflowDeltaX;
+    mEvent.mLineOrPageDeltaX = mOldLineOrPageDeltaX;
+  }
+}
+
+}  

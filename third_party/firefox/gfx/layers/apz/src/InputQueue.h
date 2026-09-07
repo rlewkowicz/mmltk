@@ -1,0 +1,198 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_InputQueue_h
+#define mozilla_layers_InputQueue_h
+
+#include "APZUtils.h"
+#include "DragTracker.h"
+#include "InputData.h"
+#include "mozilla/EventForwards.h"
+#include "mozilla/layers/TouchCounter.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/UniquePtr.h"
+#include "nsTArray.h"
+
+#include <unordered_map>
+
+namespace mozilla {
+
+class InputData;
+class MultiTouchInput;
+class ScrollWheelInput;
+
+namespace layers {
+
+class AsyncPanZoomController;
+class InputBlockState;
+class CancelableBlockState;
+class TouchBlockState;
+class WheelBlockState;
+class DragBlockState;
+class PanGestureBlockState;
+class PinchGestureBlockState;
+class KeyboardBlockState;
+class AsyncDragMetrics;
+class QueuedInput;
+struct APZEventResult;
+struct APZHandledResult;
+enum class BrowserGestureResponse : bool;
+
+enum class InitialTouchMove : bool { No, Yes };
+
+using InputBlockCallback = std::function<void(uint64_t aInputBlockId,
+                                              APZHandledResult aHandledResult)>;
+
+struct InputBlockCallbackInfo {
+  nsEventStatus mEagerStatus;
+  InputBlockCallback mCallback;
+};
+
+class InputQueueIterator {
+  using Iterator = nsTArray<UniquePtr<QueuedInput>>::iterator;
+
+ public:
+  InputQueueIterator() : mCurrent(), mEnd() {}  
+  InputQueueIterator(Iterator aCurrent, Iterator aEnd)
+      : mCurrent(aCurrent), mEnd(aEnd) {}
+
+  explicit operator bool() const { return mCurrent != mEnd; }
+  QueuedInput* operator*() const { return mCurrent->get(); }
+  QueuedInput* operator->() const { return mCurrent->get(); }
+  void operator++() { ++mCurrent; }
+
+ private:
+  Iterator mCurrent;
+  Iterator mEnd;
+};
+
+class InputQueue {
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(InputQueue)
+
+ public:
+  InputQueue();
+
+  APZEventResult ReceiveInputEvent(
+      const RefPtr<AsyncPanZoomController>& aTarget,
+      TargetConfirmationFlags aFlags, InputData& aEvent,
+      const Maybe<nsTArray<TouchBehaviorFlags>>& aTouchBehaviors = Nothing(),
+      InitialTouchMove aInitialTouchMove = InitialTouchMove::No);
+  void ContentReceivedInputBlock(uint64_t aInputBlockId, bool aPreventDefault);
+  void SetConfirmedTargetApzc(
+      uint64_t aInputBlockId,
+      const RefPtr<AsyncPanZoomController>& aTargetApzc);
+  void ConfirmDragBlock(uint64_t aInputBlockId,
+                        const RefPtr<AsyncPanZoomController>& aTargetApzc,
+                        const AsyncDragMetrics& aDragMetrics);
+  void SetAllowedTouchBehavior(uint64_t aInputBlockId,
+                               const nsTArray<TouchBehaviorFlags>& aBehaviors);
+  uint64_t InjectNewTouchBlock(AsyncPanZoomController* aTarget);
+  InputBlockState* GetCurrentBlock() const;
+  TouchBlockState* GetCurrentTouchBlock() const;
+  WheelBlockState* GetCurrentWheelBlock() const;
+  DragBlockState* GetCurrentDragBlock() const;
+  PanGestureBlockState* GetCurrentPanGestureBlock() const;
+  PinchGestureBlockState* GetCurrentPinchGestureBlock() const;
+  KeyboardBlockState* GetCurrentKeyboardBlock() const;
+  bool HasReadyTouchBlock() const;
+  WheelBlockState* GetActiveWheelTransaction() const;
+  void Clear();
+  bool AllowScrollHandoff() const;
+  bool IsDragOnScrollbar(bool aOnScrollbar);
+
+  InputBlockState* GetBlockForId(uint64_t aInputBlockId);
+
+  void AddInputBlockCallback(uint64_t aInputBlockId,
+                             InputBlockCallback&& aCallback);
+
+  void SetBrowserGestureResponse(uint64_t aInputBlockId,
+                                 BrowserGestureResponse aResponse);
+
+ private:
+  ~InputQueue();
+
+  class AutoRunImmediateTimeout final {
+   public:
+    explicit AutoRunImmediateTimeout(InputQueue* aQueue);
+    ~AutoRunImmediateTimeout();
+
+   private:
+    InputQueue* mQueue;
+  };
+
+  TouchBlockState* StartNewTouchBlock(
+      const RefPtr<AsyncPanZoomController>& aTarget,
+      TargetConfirmationFlags aFlags);
+
+  TouchBlockState* StartNewTouchBlockForLongTap(
+      const RefPtr<AsyncPanZoomController>& aTarget);
+
+  void CancelAnimationsForNewBlock(InputBlockState* aBlock,
+                                   CancelAnimationFlags aExtraFlags = Default);
+
+  bool MaybeRequestContentResponse(
+      const RefPtr<AsyncPanZoomController>& aTarget,
+      CancelableBlockState* aBlock);
+
+  APZEventResult ReceiveTouchInput(
+      const RefPtr<AsyncPanZoomController>& aTarget,
+      TargetConfirmationFlags aFlags, const MultiTouchInput& aEvent,
+      const Maybe<nsTArray<TouchBehaviorFlags>>& aTouchBehaviors,
+      InitialTouchMove aInitialTouchMove);
+  APZEventResult ReceiveMouseInput(
+      const RefPtr<AsyncPanZoomController>& aTarget,
+      TargetConfirmationFlags aFlags, MouseInput& aEvent);
+  APZEventResult ReceiveScrollWheelInput(
+      const RefPtr<AsyncPanZoomController>& aTarget,
+      TargetConfirmationFlags aFlags, const ScrollWheelInput& aEvent);
+  APZEventResult ReceivePanGestureInput(
+      const RefPtr<AsyncPanZoomController>& aTarget,
+      TargetConfirmationFlags aFlags, const PanGestureInput& aEvent);
+  APZEventResult ReceivePinchGestureInput(
+      const RefPtr<AsyncPanZoomController>& aTarget,
+      TargetConfirmationFlags aFlags, const PinchGestureInput& aEvent);
+  APZEventResult ReceiveKeyboardInput(
+      const RefPtr<AsyncPanZoomController>& aTarget,
+      TargetConfirmationFlags aFlags, const KeyboardInput& aEvent);
+
+  InputBlockState* FindBlockForId(uint64_t aInputBlockId,
+                                  InputQueueIterator* aOutFirstInput);
+  void ScheduleMainThreadTimeout(const RefPtr<AsyncPanZoomController>& aTarget,
+                                 CancelableBlockState* aBlock);
+  void MainThreadTimeout(uint64_t aInputBlockId);
+  void MaybeLongTapTimeout(uint64_t aInputBlockId);
+
+  bool ProcessQueue();
+  bool CanDiscardBlock(InputBlockState* aBlock);
+  void UpdateActiveApzc(const RefPtr<AsyncPanZoomController>& aNewActive);
+
+ private:
+  nsTArray<UniquePtr<QueuedInput>> mQueuedInputs;
+
+  RefPtr<TouchBlockState> mActiveTouchBlock;
+  RefPtr<WheelBlockState> mActiveWheelBlock;
+  RefPtr<DragBlockState> mActiveDragBlock;
+  RefPtr<PanGestureBlockState> mActivePanGestureBlock;
+  RefPtr<PinchGestureBlockState> mActivePinchGestureBlock;
+  RefPtr<KeyboardBlockState> mActiveKeyboardBlock;
+
+  RefPtr<TouchBlockState> mPrevActiveTouchBlock;
+
+  RefPtr<AsyncPanZoomController> mLastActiveApzc;
+
+  TouchCounter mTouchCounter;
+
+  DragTracker mDragTracker;
+
+  RefPtr<Runnable> mImmediateTimeout;
+
+  using InputBlockCallbackMap =
+      std::unordered_map<uint64_t, InputBlockCallback>;
+  InputBlockCallbackMap mInputBlockCallbacks;
+};
+
+}  
+}  
+
+#endif  // mozilla_layers_InputQueue_h

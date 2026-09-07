@@ -1,0 +1,106 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_ThreadBound_h
+#define mozilla_ThreadBound_h
+
+#include "mozilla/Atomics.h"
+#include "prthread.h"
+
+#include <type_traits>
+
+namespace mozilla {
+
+template <typename T>
+class ThreadBound;
+
+namespace detail {
+
+template <bool Condition, typename T>
+struct AddConstIf {
+  using type = T;
+};
+
+template <typename T>
+struct AddConstIf<true, T> {
+  using type = typename std::add_const<T>::type;
+};
+
+}  
+
+template <typename T>
+class ThreadBound final {
+ public:
+  template <typename... Args>
+  explicit ThreadBound(Args&&... aArgs)
+      : mData(std::forward<Args>(aArgs)...),
+        mThread(PR_GetCurrentThread()),
+        mAccessCount(0) {}
+
+  ~ThreadBound() { AssertIsNotCurrentlyAccessed(); }
+
+  void Transfer(const PRThread* const aDest) {
+    AssertIsCorrectThread();
+    AssertIsNotCurrentlyAccessed();
+    mThread = aDest;
+  }
+
+ private:
+  T mData;
+
+  Atomic<const PRThread*, ReleaseAcquire> mThread;
+
+  using AccessCountType = Atomic<int, ReleaseAcquire>;
+  mutable AccessCountType mAccessCount;
+
+ public:
+  template <bool IsConst>
+  class MOZ_STACK_CLASS Accessor final {
+    using DataType = typename detail::AddConstIf<IsConst, T>::type;
+
+   public:
+    explicit Accessor(
+        typename detail::AddConstIf<IsConst, ThreadBound>::type& aThreadBound)
+        : mData(aThreadBound.mData), mAccessCount(aThreadBound.mAccessCount) {
+      aThreadBound.AssertIsCorrectThread();
+
+      ++mAccessCount;
+    }
+
+    Accessor(const Accessor&) = delete;
+    Accessor(Accessor&&) = delete;
+    Accessor& operator=(const Accessor&) = delete;
+    Accessor& operator=(Accessor&&) = delete;
+
+    ~Accessor() { --mAccessCount; }
+
+    DataType* operator->() { return &mData; }
+
+   private:
+    DataType& mData;
+    AccessCountType& mAccessCount;
+  };
+
+  auto Access() { return Accessor<false>{*this}; }
+
+  auto Access() const { return Accessor<true>{*this}; }
+
+ private:
+  bool IsCorrectThread() const { return mThread == PR_GetCurrentThread(); }
+
+  bool IsNotCurrentlyAccessed() const { return mAccessCount == 0; }
+
+#define MOZ_DEFINE_THREAD_BOUND_ASSERT(predicate) \
+  void Assert##predicate() const { MOZ_DIAGNOSTIC_ASSERT(predicate()); }
+
+  MOZ_DEFINE_THREAD_BOUND_ASSERT(IsCorrectThread)
+  MOZ_DEFINE_THREAD_BOUND_ASSERT(IsNotCurrentlyAccessed)
+
+#undef MOZ_DEFINE_THREAD_BOUND_ASSERT
+};
+
+}  
+
+#endif  // mozilla_ThreadBound_h

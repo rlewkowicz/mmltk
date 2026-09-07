@@ -1,0 +1,63 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/FileSystemUtils.h"
+
+#include "nsCharSeparatedTokenizer.h"
+#include "nsIEventTarget.h"
+#include "nsThreadUtils.h"
+
+namespace mozilla::dom {
+
+bool FileSystemUtils::IsValidRelativeDOMPath(const nsAString& aPath,
+                                             nsTArray<nsString>& aParts) {
+  if (aPath.IsEmpty()) {
+    return false;
+  }
+
+  if (aPath.First() == FILESYSTEM_DOM_PATH_SEPARATOR_CHAR ||
+      aPath.Last() == FILESYSTEM_DOM_PATH_SEPARATOR_CHAR) {
+    return false;
+  }
+
+  constexpr auto kCurrentDir = u"."_ns;
+  constexpr auto kParentDir = u".."_ns;
+
+  for (const nsAString& pathComponent :
+       nsCharSeparatedTokenizerTemplate<NS_TokenizerIgnoreNothing>{
+           aPath, FILESYSTEM_DOM_PATH_SEPARATOR_CHAR}
+           .ToRange()) {
+    if (pathComponent.IsEmpty() || pathComponent.Equals(kCurrentDir) ||
+        pathComponent.Equals(kParentDir)) {
+      return false;
+    }
+
+    aParts.AppendElement(pathComponent);
+  }
+
+  return true;
+}
+
+nsresult FileSystemUtils::DispatchRunnable(
+    nsIGlobalObject* aGlobal, already_AddRefed<nsIRunnable> aRunnable) {
+  nsCOMPtr<nsIRunnable> runnable = aRunnable;
+
+  nsCOMPtr<nsIEventTarget> target;
+  if (!aGlobal) {
+    target = GetMainThreadSerialEventTarget();
+  } else {
+    target = aGlobal->SerialEventTarget();
+  }
+
+  MOZ_ASSERT(target);
+
+  nsresult rv = target->Dispatch(runnable.forget(), NS_DISPATCH_NORMAL);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  return NS_OK;
+}
+
+}  

@@ -1,0 +1,99 @@
+/*
+ * Copyright 2014 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkSurfaceProps_DEFINED)
+#define SkSurfaceProps_DEFINED
+
+#include "include/core/SkScalar.h"
+#include "include/core/SkTypes.h"
+#include "include/private/base/SkTo.h"
+
+enum SkPixelGeometry {
+    kUnknown_SkPixelGeometry,
+    kRGB_H_SkPixelGeometry,
+    kBGR_H_SkPixelGeometry,
+    kRGB_V_SkPixelGeometry,
+    kBGR_V_SkPixelGeometry,
+};
+
+static inline bool SkPixelGeometryIsRGB(SkPixelGeometry geo) {
+    return kRGB_H_SkPixelGeometry == geo || kRGB_V_SkPixelGeometry == geo;
+}
+
+static inline bool SkPixelGeometryIsBGR(SkPixelGeometry geo) {
+    return kBGR_H_SkPixelGeometry == geo || kBGR_V_SkPixelGeometry == geo;
+}
+
+static inline bool SkPixelGeometryIsH(SkPixelGeometry geo) {
+    return kRGB_H_SkPixelGeometry == geo || kBGR_H_SkPixelGeometry == geo;
+}
+
+static inline bool SkPixelGeometryIsV(SkPixelGeometry geo) {
+    return kRGB_V_SkPixelGeometry == geo || kBGR_V_SkPixelGeometry == geo;
+}
+
+class SK_API SkSurfaceProps {
+public:
+    enum Flags {
+        kDefault_Flag = 0,
+        kUseDeviceIndependentFonts_Flag = 1 << 0,
+        kDynamicMSAA_Flag = 1 << 1,
+        kAlwaysDither_Flag = 1 << 2,
+        kPreservesTransparentDraws_Flag = 1 << 3,
+    };
+
+    SkSurfaceProps();
+    SkSurfaceProps(uint32_t flags, SkPixelGeometry);
+    SkSurfaceProps(uint32_t flags, SkPixelGeometry, SkScalar textContrast, SkScalar textGamma);
+
+    SkSurfaceProps(const SkSurfaceProps&) = default;
+    SkSurfaceProps& operator=(const SkSurfaceProps&) = default;
+
+    SkSurfaceProps cloneWithPixelGeometry(SkPixelGeometry newPixelGeometry) const {
+        return SkSurfaceProps(fFlags, newPixelGeometry, fTextContrast, fTextGamma);
+    }
+
+    static constexpr SkScalar kMaxContrastInclusive = 1;
+    static constexpr SkScalar kMinContrastInclusive = 0;
+    static constexpr SkScalar kMaxGammaExclusive = 4;
+    static constexpr SkScalar kMinGammaInclusive = 0;
+
+    uint32_t flags() const { return fFlags; }
+    SkPixelGeometry pixelGeometry() const { return fPixelGeometry; }
+    SkScalar textContrast() const { return fTextContrast; }
+    SkScalar textGamma() const { return fTextGamma; }
+
+    bool isUseDeviceIndependentFonts() const {
+        return SkToBool(fFlags & kUseDeviceIndependentFonts_Flag);
+    }
+
+    bool isAlwaysDither() const {
+        return SkToBool(fFlags & kAlwaysDither_Flag);
+    }
+
+    bool preservesTransparentDraws() const {
+        return SkToBool(fFlags & kPreservesTransparentDraws_Flag);
+    }
+
+    bool operator==(const SkSurfaceProps& that) const {
+        return fFlags == that.fFlags && fPixelGeometry == that.fPixelGeometry &&
+        fTextContrast == that.fTextContrast && fTextGamma == that.fTextGamma;
+    }
+
+    bool operator!=(const SkSurfaceProps& that) const {
+        return !(*this == that);
+    }
+
+private:
+    uint32_t        fFlags;
+    SkPixelGeometry fPixelGeometry;
+
+    SkScalar fTextContrast;
+    SkScalar fTextGamma;
+};
+
+#endif

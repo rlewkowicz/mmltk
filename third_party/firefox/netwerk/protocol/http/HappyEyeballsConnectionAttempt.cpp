@@ -1,0 +1,1985 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "HttpLog.h"
+
+#include <algorithm>
+
+#include "HappyEyeballsConnectionAttempt.h"
+#include "ConnectionEntry.h"
+#include "NSSErrorsService.h"
+#include "mozilla/net/NeckoChannelParams.h"
+#include "mozilla/StaticPrefs_network.h"
+#include "nsIHttpActivityObserver.h"
+#include "PendingTransactionInfo.h"
+#include "nsHttpTransaction.h"
+#include "HttpConnectionUDP.h"
+#include "nsIDNSAdditionalInfo.h"
+#include "nsDNSService2.h"
+#include "nsHttpConnectionMgr.h"
+#include "nsHttpHandler.h"
+#include "NetworkConnectivityService.h"
+#include "nsQueryObject.h"
+#include "nsSocketTransport2.h"
+#include "nsSocketTransportService2.h"
+#include "sslerr.h"
+
+#undef LOG
+#define LOG(args) LOG5(args)
+#undef LOG_ENABLED
+#define LOG_ENABLED() LOG5_ENABLED()
+
+namespace mozilla::net {
+
+using happy_eyeballs::happy_eyeballs_process_connection_result;
+using happy_eyeballs::happy_eyeballs_process_dns_response_a;
+using happy_eyeballs::happy_eyeballs_process_dns_response_aaaa;
+using happy_eyeballs::happy_eyeballs_process_dns_response_https;
+using happy_eyeballs::happy_eyeballs_process_ech_retry;
+using happy_eyeballs::happy_eyeballs_process_output;
+
+static void NotifyConnectionActivity(nsHttpConnectionInfo* aConnInfo,
+                                     uint32_t aSubtype) {
+  HttpConnectionActivity activity(
+      aConnInfo->HashKey(), aConnInfo->GetOrigin(), aConnInfo->OriginPort(),
+      aConnInfo->EndToEndSSL(), !aConnInfo->GetEchConfig().IsEmpty(),
+      aConnInfo->IsHttp3());
+  gHttpHandler->ObserveHttpActivityWithArgs(
+      activity, NS_ACTIVITY_TYPE_HTTP_CONNECTION, aSubtype, PR_Now(), 0, ""_ns);
+}
+
+NS_IMPL_ADDREF_INHERITED(HappyEyeballsConnectionAttempt, ConnectionAttempt)
+NS_IMPL_RELEASE_INHERITED(HappyEyeballsConnectionAttempt, ConnectionAttempt)
+
+NS_INTERFACE_MAP_BEGIN(HappyEyeballsConnectionAttempt)
+  NS_INTERFACE_MAP_ENTRY(nsISupportsWeakReference)
+  NS_INTERFACE_MAP_ENTRY(nsITimerCallback)
+  NS_INTERFACE_MAP_ENTRY(nsINamed)
+  NS_INTERFACE_MAP_ENTRY(nsIDNSListener)
+  NS_INTERFACE_MAP_ENTRY_CONCRETE(HappyEyeballsConnectionAttempt)
+NS_INTERFACE_MAP_END
+
+class DefaultHappyEyeballsConnMgrDelegate final
+    : public HappyEyeballsConnMgrDelegate {
+ public:
+  already_AddRefed<PendingTransactionInfo> FindTransaction(
+      bool aRemoveWhenFound, ConnectionEntry* aEntry,
+      nsAHttpTransaction* aTrans) override {
+    return gHttpHandler->ConnMgr()->FindTransactionHelper(aRemoveWhenFound,
+                                                          aEntry, aTrans);
+  }
+  nsresult DispatchTransaction(ConnectionEntry* aEntry,
+                               nsHttpTransaction* aTrans,
+                               HttpConnectionBase* aConn) override {
+    return gHttpHandler->ConnMgr()->DispatchTransaction(aEntry, aTrans, aConn);
+  }
+  void AddTransaction(nsHttpTransaction* aTrans, int32_t aPriority) override {
+    gHttpHandler->ConnMgr()->AddTransaction(aTrans, aPriority);
+  }
+  void ReportSpdyConnection(HttpConnectionBase* aConn, bool aUsingSpdy,
+                            bool aDisallowHttp3) override {
+    if (RefPtr<nsHttpConnection> h1 = do_QueryObject(aConn)) {
+      gHttpHandler->ConnMgr()->ReportSpdyConnection(h1, aUsingSpdy,
+                                                    aDisallowHttp3);
+    }
+  }
+  void ReportHttp3Connection(HttpConnectionBase* aConn,
+                             ConnectionEntry* aEntry) override {
+    gHttpHandler->ConnMgr()->ReportHttp3Connection(aConn, aEntry);
+  }
+  void ReclaimConnection(HttpConnectionBase* aConn) override {
+    gHttpHandler->ConnMgr()->OnMsgReclaimConnection(aConn);
+  }
+  void ProcessSpdyPendingQ(ConnectionEntry* aEntry) override {
+    gHttpHandler->ConnMgr()->ProcessSpdyPendingQ(aEntry);
+  }
+  void InsertIntoActiveConns(ConnectionEntry* aEntry,
+                             HttpConnectionBase* aConn) override {
+    aEntry->InsertIntoActiveConns(aConn);
+  }
+  void RemoveConnectionAttempt(ConnectionEntry* aEntry,
+                               ConnectionAttempt* aAttempt,
+                               bool aAbandon) override {
+    aEntry->RemoveConnectionAttempt(aAttempt, aAbandon);
+  }
+  void RecordIPFamilyPreference(ConnectionEntry* aEntry,
+                                uint16_t aFamily) override {
+    aEntry->RecordIPFamilyPreference(aFamily);
+  }
+  void ResetIPFamilyPreference(ConnectionEntry* aEntry) override {
+    aEntry->ResetIPFamilyPreference();
+  }
+  bool MaybeProcessCoalescingKeys(ConnectionEntry* aEntry,
+                                  const nsTArray<NetAddr>& aAddresses,
+                                  bool aIsHttp3) override {
+    return aEntry->MaybeProcessCoalescingKeys(aAddresses, aIsHttp3);
+  }
+  bool RemoveTransFromPendingQ(ConnectionEntry* aEntry,
+                               nsHttpTransaction* aTrans) override {
+    return aEntry->RemoveTransFromPendingQ(aTrans);
+  }
+  nsresult StartRetryWithoutTRR(ConnectionEntry* aEntry,
+                                nsHttpTransaction* aTrans, uint32_t aCaps,
+                                bool aSpeculative, bool aUrgentStart,
+                                bool aAllow1918) override {
+    RefPtr<PendingTransactionInfo> pendingTransInfo =
+        new PendingTransactionInfo(aTrans);
+    return aEntry->CreateDnsAndConnectSocket(
+        aTrans, aCaps, aSpeculative, aUrgentStart, aAllow1918, pendingTransInfo,
+         true);
+  }
+};
+
+HappyEyeballsConnectionAttempt::HappyEyeballsConnectionAttempt(
+    nsHttpConnectionInfo* ci, nsAHttpTransaction* trans, uint32_t caps,
+    bool speculative, bool urgentStart, bool retryWithoutTRR)
+    : ConnectionAttempt(ci, trans, caps, speculative, urgentStart),
+      mEstablisherFactory(new DefaultConnectionEstablisherFactory()),
+      mConnMgrDelegate(new DefaultHappyEyeballsConnMgrDelegate()),
+      mRetryWithoutTRR(retryWithoutTRR),
+      mZeroRttHandle(new ZeroRttHandle(this)) {
+  LOG(("HappyEyeballsConnectionAttempt ctor %p retryWithoutTRR=%d", this,
+       retryWithoutTRR));
+  if (mConnInfo->GetRoutedHost().IsEmpty()) {
+    mHost = mConnInfo->GetOrigin();
+  } else {
+    mHost = mConnInfo->GetRoutedHost();
+  }
+
+  NotifyConnectionActivity(
+      mConnInfo, mSpeculative
+                     ? NS_HTTP_ACTIVITY_SUBTYPE_SPECULATIVE_DNSANDSOCKET_CREATED
+                     : NS_HTTP_ACTIVITY_SUBTYPE_DNSANDSOCKET_CREATED);
+}
+
+HappyEyeballsConnectionAttempt::~HappyEyeballsConnectionAttempt() {
+  LOG(("HappyEyeballsConnectionAttempt dtor %p", this));
+}
+
+static bool ShouldPreferIPv4DueToNoIPv6Connectivity() {
+  RefPtr<NetworkConnectivityService> ncs =
+      NetworkConnectivityService::GetSingleton();
+  if (!ncs) {
+    return false;
+  }
+  return ncs->GetIPv6() == nsINetworkConnectivityService::NOT_AVAILABLE &&
+         ncs->GetIPv4() == nsINetworkConnectivityService::OK;
+}
+
+nsresult HappyEyeballsConnectionAttempt::CreateHappyEyeballs(
+    ConnectionEntry* ent) {
+  happy_eyeballs::IpPreference ipPref =
+      happy_eyeballs::IpPreference::DualStackPreferV6;
+  if (mConnInfo->GetIPv6Disabled()) {
+    ipPref = happy_eyeballs::IpPreference::Ipv4Only;
+  } else if (ent->PreferenceKnown() && ent->mPreferIPv4) {
+    ipPref = happy_eyeballs::IpPreference::DualStackPreferV4;
+  } else if (!ent->PreferenceKnown() &&
+             ShouldPreferIPv4DueToNoIPv6Connectivity()) {
+    ipPref = happy_eyeballs::IpPreference::DualStackPreferV4;
+  }
+
+  happy_eyeballs::HttpVersions httpVersions{
+       true,
+       StaticPrefs::network_http_http2_enabled(),
+       nsHttpHandler::IsHttp3Enabled() &&
+          !(mCaps & NS_HTTP_DISALLOW_HTTP3),
+  };
+
+  LOG(("CreateHappyEyeballs ipPref=%d", static_cast<uint32_t>(ipPref)));
+
+  if (mConnInfo->IsHttp3()) {
+    LOG(("HappyEyeballsConnectionAttempt for HTTP/3"));
+    nsTArray<happy_eyeballs::AltSvc> altSvcArray;
+    happy_eyeballs::AltSvc altsvc{};
+    altsvc.http_version = happy_eyeballs::HttpVersion::H3;
+    altsvc.port = mConnInfo->GetRoutedHost().IsEmpty()
+                      ? static_cast<uint16_t>(mConnInfo->OriginPort())
+                      : static_cast<uint16_t>(mConnInfo->RoutedPort());
+    altSvcArray.AppendElement(altsvc);
+    return HappyEyeballs::Init(getter_AddRefs(mHappyEyeballs), mHost,
+                               static_cast<uint16_t>(mConnInfo->OriginPort()),
+                               &altSvcArray, ipPref, httpVersions);
+  }
+
+  if (mConnInfo->GetRoutedHost().IsEmpty()) {
+    nsTArray<happy_eyeballs::AltSvc> emptyAltSvc;
+    return HappyEyeballs::Init(getter_AddRefs(mHappyEyeballs), mHost,
+                               static_cast<uint16_t>(mConnInfo->OriginPort()),
+                               &emptyAltSvc, ipPref, httpVersions);
+  }
+
+  nsTArray<happy_eyeballs::AltSvc> emptyAltSvc;
+  return HappyEyeballs::Init(getter_AddRefs(mHappyEyeballs), mHost,
+                             static_cast<uint16_t>(mConnInfo->RoutedPort()),
+                             &emptyAltSvc, ipPref, httpVersions);
+}
+
+nsresult HappyEyeballsConnectionAttempt::Init(ConnectionEntry* ent) {
+  mEntry = ent;
+  nsresult rv = CreateHappyEyeballs(ent);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+  Transition(State::Connecting);
+  return ProcessHappyEyeballsOutput();
+}
+
+static Result<NetAddr, nsresult> ToNetAddr(
+    const happy_eyeballs::IpAddr& aIpAddr, uint16_t aPort) {
+  NetAddr addr;
+  memset(&addr, 0, sizeof(NetAddr));
+
+  uint16_t port = htons(aPort);
+
+  switch (aIpAddr.tag) {
+    case happy_eyeballs::IpAddr::Tag::V4:
+      addr.inet.family = AF_INET;
+      addr.inet.port = port;
+      memcpy(&addr.inet.ip, aIpAddr.v4._0, 4);
+      break;
+    case happy_eyeballs::IpAddr::Tag::V6:
+      addr.inet6.family = AF_INET6;
+      addr.inet6.port = port;
+      memcpy(&addr.inet6.ip, aIpAddr.v6._0, 16);
+      break;
+    default:
+      return Err(NS_ERROR_UNEXPECTED);
+  }
+
+  return addr;
+}
+
+HappyEyeballsConnectionAttempt::ConnResultOutcome
+HappyEyeballsConnectionAttempt::ClassifyConnectionResult(
+    nsresult aStatus) const {
+  if (PossibleZeroRTTRetryError(aStatus)) {
+    return ConnResultOutcome::RestartTransaction;
+  }
+  if (aStatus == NS_ERROR_NET_RESET && mZeroRttHandle->AnyStarted()) {
+    return ConnResultOutcome::RestartTransaction;
+  }
+  if (aStatus == NS_ERROR_LOCAL_NETWORK_ACCESS_DENIED) {
+    return ConnResultOutcome::AbortTransaction;
+  }
+  if (NS_ERROR_GET_MODULE(aStatus) == NS_ERROR_MODULE_SECURITY) {
+    return ConnResultOutcome::AbortTransaction;
+  }
+  return ConnResultOutcome::ForwardAndContinue;
+}
+
+void HappyEyeballsConnectionAttempt::ReleaseRealTransaction(
+    nsresult aCloseReason, ConnectionEntry* aEntry) {
+  if (!mTransaction) {
+    return;
+  }
+  if (mTransactionAdopted) {
+    LOG(
+        ("HappyEyeballsConnectionAttempt::ReleaseRealTransaction %p skipping "
+         "Close — real transaction already adopted",
+         this));
+    mTransaction = nullptr;
+    return;
+  }
+  if (nsHttpTransaction* trans = mTransaction->QueryHttpTransaction()) {
+    if (trans->Connection()) {
+      LOG(
+          ("HappyEyeballsConnectionAttempt::ReleaseRealTransaction %p skipping "
+           "Close — real transaction already dispatched to a connection",
+           this));
+      mTransaction = nullptr;
+      return;
+    }
+    if (aEntry) {
+      mConnMgrDelegate->RemoveTransFromPendingQ(aEntry, trans);
+    }
+  }
+  mTransaction->Close(aCloseReason);
+  mTransaction = nullptr;
+}
+
+nsresult HappyEyeballsConnectionAttempt::ProcessConnectionResult(
+    const NetAddr& aAddr, nsresult aStatus, uint64_t aId) {
+  LOG(
+      ("HappyEyeballsConnectionAttempt::ProcessConnectionResult %p addr=[%s] "
+       "id=%" PRIu64 " aStatus=%x",
+       this, aAddr.ToString().get(), aId, static_cast<uint32_t>(aStatus)));
+
+  RefPtr<HappyEyeballsConnectionAttempt> self(this);
+
+  if (IsTerminal()) {
+    return NS_OK;
+  }
+
+  if (mPausedForClientAuth && aId == mClientAuthHolderId) {
+    mPausedForClientAuth = false;
+    mClientAuthHolderId = 0;
+  }
+
+  if (mState != State::ProcessingConnectionResult) {
+    Transition(State::ProcessingConnectionResult);
+  }
+
+  ConnResultOutcome outcome = ClassifyConnectionResult(aStatus);
+  switch (outcome) {
+    case ConnResultOutcome::RestartTransaction: {
+      TransitionPayload payload;
+      payload.mCloseReason = aStatus;
+      Transition(State::RestartTransaction, std::move(payload));
+      return NS_OK;
+    }
+    case ConnResultOutcome::AbortTransaction: {
+      nsresult closeReason = aStatus;
+      if (NS_ERROR_GET_MODULE(aStatus) == NS_ERROR_MODULE_SECURITY) {
+        PRErrorCode prCode =
+            -static_cast<PRErrorCode>(NS_ERROR_GET_CODE(aStatus));
+        if (!mozilla::psm::IsNSSErrorCode(prCode)) {
+          closeReason = ErrorAccordingToNSPR(prCode);
+        }
+      }
+      TransitionPayload payload;
+      payload.mCloseReason = closeReason;
+      Transition(State::AbortTransaction, std::move(payload));
+      return NS_OK;
+    }
+    case ConnResultOutcome::ForwardAndContinue:
+      break;
+  }
+
+  if (NS_FAILED(aStatus)) {
+    mLastConnectionError = aStatus;
+  }
+
+  nsresult rv =
+      happy_eyeballs_process_connection_result(mHappyEyeballs, aId, aStatus);
+  if (NS_FAILED(rv)) {
+    LOG(("process_connection_result failed rv=%x", static_cast<uint32_t>(rv)));
+  }
+  rv = ProcessHappyEyeballsOutput();
+
+  if (mState == State::ProcessingConnectionResult) {
+    if (mZeroRttHandle->AnyStarted() && !mZeroRttHandle->HadWinner()) {
+      Transition(State::ZeroRttRacing);
+    } else {
+      Transition(State::Connecting);
+    }
+  }
+  return rv;
+}
+
+Maybe<nsCString> HappyEyeballsConnectionAttempt::MaybeExtractRetryEchConfig(
+    ConnectionEstablisher* aEstablisher, nsresult aStatus) {
+  if (aStatus == psm::GetXPCOMFromNSSError(SSL_ERROR_ECH_RETRY_WITHOUT_ECH)) {
+    LOG(
+        ("HappyEyeballsConnectionAttempt::MaybeExtractRetryEchConfig %p "
+         "SSL_ERROR_ECH_RETRY_WITHOUT_ECH",
+         this));
+    return Some(nsCString());
+  }
+
+  if (aStatus != psm::GetXPCOMFromNSSError(SSL_ERROR_ECH_RETRY_WITH_ECH)) {
+    return Nothing();
+  }
+
+  RefPtr<HttpConnectionBase> conn =
+      aEstablisher ? aEstablisher->ResultConn() : nullptr;
+  if (!conn) {
+    return Nothing();
+  }
+
+  nsAutoCString retryEchConfig;
+  if (RefPtr<nsHttpConnection> httpConn = do_QueryObject(conn)) {
+    retryEchConfig = httpConn->CachedRetryEchConfig();
+  } else {
+    nsCOMPtr<nsITLSSocketControl> tlsCtrl;
+    conn->GetTLSSocketControl(getter_AddRefs(tlsCtrl));
+    if (tlsCtrl && NS_FAILED(tlsCtrl->GetRetryEchConfig(retryEchConfig))) {
+      return Nothing();
+    }
+  }
+  if (retryEchConfig.IsEmpty()) {
+    return Nothing();
+  }
+  LOG(
+      ("HappyEyeballsConnectionAttempt::MaybeExtractRetryEchConfig %p "
+       "SSL_ERROR_ECH_RETRY_WITH_ECH retryEchConfig.len=%zu",
+       this, retryEchConfig.Length()));
+  return Some(nsCString(retryEchConfig));
+}
+
+nsresult HappyEyeballsConnectionAttempt::ProcessEchRetryConnectionResult(
+    const NetAddr& aAddr, uint64_t aId, const nsACString& aEchBytes) {
+  LOG(
+      ("HappyEyeballsConnectionAttempt::ProcessEchRetryConnectionResult %p "
+       "addr=[%s] id=%" PRIu64 " ech.len=%zu",
+       this, aAddr.ToString().get(), aId, aEchBytes.Length()));
+
+  RefPtr<HappyEyeballsConnectionAttempt> self(this);
+
+  if (IsTerminal()) {
+    return NS_OK;
+  }
+
+  if (mState != State::ProcessingConnectionResult) {
+    Transition(State::ProcessingConnectionResult);
+  }
+
+  nsTArray<uint8_t> echBytes;
+  echBytes.AppendElements(
+      reinterpret_cast<const uint8_t*>(aEchBytes.BeginReading()),
+      aEchBytes.Length());
+
+  nsresult rv =
+      happy_eyeballs_process_ech_retry(mHappyEyeballs, aId, &echBytes);
+  if (NS_FAILED(rv)) {
+    LOG(("process_ech_retry failed rv=%x", static_cast<uint32_t>(rv)));
+  }
+  rv = ProcessHappyEyeballsOutput();
+
+  if (mState == State::ProcessingConnectionResult) {
+    if (mZeroRttHandle->AnyStarted() && !mZeroRttHandle->HadWinner()) {
+      Transition(State::ZeroRttRacing);
+    } else {
+      Transition(State::Connecting);
+    }
+  }
+  return rv;
+}
+
+void HappyEyeballsConnectionAttempt::DnsLookupTimings(TimeStamp& aStart,
+                                                      TimeStamp& aEnd) const {
+  aStart = mFirstDnsLookupStart;
+  aEnd = mDnsResolutionEnd.IsNull() ? mFirstConnectionStart : mDnsResolutionEnd;
+}
+
+void HappyEyeballsConnectionAttempt::FillConnectTimings(
+    bool aIsQuic, TimingStruct& aTimings) const {
+  aTimings.connectStart = mFirstConnectionStart;
+  aTimings.connectEnd = mFirstConnectEnd;
+  if (aIsQuic) {
+    aTimings.secureConnectionStart = mFirstConnectionStart;
+  } else {
+    aTimings.tcpConnectEnd = mFirstTcpConnectEnd;
+    aTimings.secureConnectionStart = mFirstSecureConnectionStart;
+  }
+}
+
+nsresult HappyEyeballsConnectionAttempt::ProcessHappyEyeballsOutput() {
+  LOG(("HappyEyeballsConnectionAttempt::ProcessHappyEyeballsOutput %p", this));
+
+  if (IsTerminal()) {
+    return NS_OK;
+  }
+
+  if (mPausedForClientAuth) {
+    LOG(("  paused for client-auth (holder id=%" PRIu64 "); not polling",
+         mClientAuthHolderId));
+    return NS_OK;
+  }
+
+  nsresult rv = NS_OK;
+
+  while (!IsTerminal()) {
+    happy_eyeballs::Output event{};
+    nsTArray<uint8_t> echConfig;
+    nsCString dnsHostname;
+    rv = happy_eyeballs_process_output(mHappyEyeballs, &event, &echConfig,
+                                       &dnsHostname);
+    if (NS_FAILED(rv)) {
+      LOG(("process_output failed rv=%x", static_cast<uint32_t>(rv)));
+      return rv;
+    }
+
+    switch (event.tag) {
+      case happy_eyeballs::Output::Tag::SendDnsQuery: {
+        LOG(("HappyEyeballsEvent::Tag::SendDnsQuery id=%" PRIu64 " hostname=%s",
+             event.send_dns_query.id, dnsHostname.get()));
+        DNSLookup(event.send_dns_query.record_type,
+                  SetupDnsFlags(event.send_dns_query.record_type),
+                  event.send_dns_query.id, dnsHostname);
+        break;
+      }
+
+      case happy_eyeballs::Output::Tag::Timer: {
+        SetupTimer(event.timer.duration_ms);
+        return NS_OK;
+      }
+
+      case happy_eyeballs::Output::Tag::AttemptConnection: {
+        LOG(("HappyEyeballsEvent::Tag::AttemptConnection id=%" PRIu64
+             " protocol=%d port=%d ",
+             event.attempt_connection.id,
+             static_cast<uint32_t>(event.attempt_connection.http_version),
+             event.attempt_connection.port));
+
+        if (mFirstConnectionStart.IsNull()) {
+          mFirstConnectionStart = TimeStamp::Now();
+          if (mDnsResolutionEnd.IsNull()) {
+            mDnsResolutionEnd = mFirstConnectionStart;
+          }
+        }
+
+        auto res = ToNetAddr(event.attempt_connection.addr,
+                             event.attempt_connection.port);
+        if (res.isErr()) {
+          LOG(("Failed to convert to NetAddr"));
+          MOZ_ASSERT(false, "Failed to convert to NetAddr");
+          return res.unwrapErr();
+        }
+
+        LOG(("connect to:[%s] ech_config_len=%zu",
+             res.unwrap().ToString().get(), echConfig.Length()));
+        bool isEchRetry = event.attempt_connection.is_ech_retry;
+
+        if (event.attempt_connection.http_version ==
+            happy_eyeballs::ConnectionAttemptHttpVersions::H3) {
+          EstablishUDPConnection(res.unwrap(), event.attempt_connection.port,
+                                 std::move(echConfig),
+                                 event.attempt_connection.id, isEchRetry);
+        } else {
+          EstablishTCPConnection(res.unwrap(), event.attempt_connection.port,
+                                 std::move(echConfig),
+                                 event.attempt_connection.id, isEchRetry);
+        }
+        break;
+      }
+
+      case happy_eyeballs::Output::Tag::CancelConnection: {
+        LOG(("CancelConnection id=%" PRIu64, event.cancel_connection.id));
+        CancelConnection(event.cancel_connection.id);
+        break;
+      }
+
+      case happy_eyeballs::Output::Tag::Succeeded:
+        LOG(("happy_eyeballs::Output::Tag::Succeeded"));
+        Transition(State::Succeeded);
+        return NS_OK;
+
+      case happy_eyeballs::Output::Tag::Failed: {
+        LOG(("happy_eyeballs::Output::Tag::Failed reason=%d",
+             static_cast<uint32_t>(event.failed.reason)));
+        if (ShouldRetryWithoutTRR(event.failed.reason)) {
+          RetryWithoutTRR();
+          return NS_OK;
+        }
+        TransitionPayload payload;
+        payload.mFailureReason = Some(event.failed.reason);
+        Transition(State::Failed, std::move(payload));
+        return NS_OK;
+      }
+
+      case happy_eyeballs::Output::Tag::None:
+        LOG(("happy_eyeballs::Output::Tag::None"));
+        return NS_OK;
+    }
+  }
+
+  return NS_OK;
+}
+
+Result<nsIDNSService::DNSFlags, nsresult>
+HappyEyeballsConnectionAttempt::SetupDnsFlags(
+    happy_eyeballs::DnsRecordType aType) {
+  LOG(("HappyEyeballsConnectionAttempt::SetupDnsFlags [this=%p aType=%d] ",
+       this, static_cast<uint32_t>(aType)));
+
+  nsIDNSService::DNSFlags dnsFlags = nsIDNSService::RESOLVE_DEFAULT_FLAGS;
+
+  if (mCaps & NS_HTTP_REFRESH_DNS) {
+    dnsFlags = nsIDNSService::RESOLVE_BYPASS_CACHE;
+  }
+
+  if (mRetryWithoutTRR) {
+    dnsFlags |= nsIDNSService::RESOLVE_DISABLE_TRR |
+                nsIDNSService::RESOLVE_BYPASS_CACHE |
+                nsIDNSService::RESOLVE_REFRESH_CACHE;
+  }
+
+  switch (aType) {
+    case happy_eyeballs::DnsRecordType::Https:
+      if (!mRetryWithoutTRR) {
+        dnsFlags |= nsIDNSService::GetFlagsFromTRRMode(mConnInfo->GetTRRMode());
+      }
+      return dnsFlags;
+    case happy_eyeballs::DnsRecordType::Aaaa:
+      if (mCaps & NS_HTTP_DISABLE_IPV6) {
+        return Err(NS_ERROR_NOT_AVAILABLE);
+      }
+      dnsFlags |= nsIDNSService::RESOLVE_DISABLE_IPV4;
+      break;
+    case happy_eyeballs::DnsRecordType::A:
+      if (mCaps & NS_HTTP_DISABLE_IPV4) {
+        return Err(NS_ERROR_NOT_AVAILABLE);
+      }
+      dnsFlags |= nsIDNSService::RESOLVE_DISABLE_IPV6;
+      break;
+  }
+
+  if (!mRetryWithoutTRR) {
+    dnsFlags |=
+        nsIDNSService::GetFlagsFromTRRMode(NS_HTTP_TRR_MODE_FROM_FLAGS(mCaps));
+  }
+
+  dnsFlags |= nsIDNSService::RESOLVE_IGNORE_SOCKS_DNS;
+
+  NS_ASSERTION(!(dnsFlags & nsIDNSService::RESOLVE_DISABLE_IPV6) ||
+                   !(dnsFlags & nsIDNSService::RESOLVE_DISABLE_IPV4),
+               "Setting both RESOLVE_DISABLE_IPV6 and RESOLVE_DISABLE_IPV4");
+
+  LOG(("dnsFlags=%u", dnsFlags));
+  return dnsFlags;
+}
+
+void HappyEyeballsConnectionAttempt::MaybeSendTransportStatus(
+    nsresult aStatus, nsITransport* aTransport, int64_t aProgress) {
+  if (aStatus == NS_NET_STATUS_CONNECTED_TO && mFirstTcpConnectEnd.IsNull()) {
+    mFirstTcpConnectEnd = TimeStamp::Now();
+  } else if (aStatus == NS_NET_STATUS_TLS_HANDSHAKE_STARTING &&
+             mFirstSecureConnectionStart.IsNull()) {
+    mFirstSecureConnectionStart = TimeStamp::Now();
+  }
+
+  if (!mSentTransportStatuses.EnsureInserted(static_cast<uint32_t>(aStatus)) ||
+      !mTransaction) {
+    return;
+  }
+  if (mTransaction->IsNullTransaction()) {
+    return;
+  }
+  mTransaction->OnTransportStatus(aTransport, aStatus, aProgress);
+}
+
+nsresult HappyEyeballsConnectionAttempt::CheckLNA(
+    nsISocketTransport* aTransport) {
+  if (!aTransport) {
+    return NS_OK;
+  }
+
+  NetAddr peerAddr;
+  if (NS_FAILED(aTransport->GetPeerAddr(&peerAddr))) {
+    return NS_OK;
+  }
+
+  return CheckLNAForAddr(peerAddr);
+}
+
+nsresult HappyEyeballsConnectionAttempt::CheckLNAForAddr(const NetAddr& aAddr) {
+  if (!mConnInfo->FirstHopSSL() || mConnInfo->UsingProxy()) {
+    return NS_OK;
+  }
+
+  auto addrSpace = aAddr.GetIpAddressSpace();
+  bool deferPrivate = addrSpace == nsILoadInfo::IPAddressSpace::Private &&
+                      StaticPrefs::network_lna_defer_https_check();
+  if (addrSpace != nsILoadInfo::IPAddressSpace::Local &&
+      (addrSpace != nsILoadInfo::IPAddressSpace::Private || deferPrivate)) {
+    return NS_OK;
+  }
+
+  if (mTransaction &&
+      !mTransaction->AllowedToConnectToIpAddressSpace(addrSpace)) {
+    LOG((
+        "HappyEyeballsConnectionAttempt::CheckLNAForAddr %p "
+        "blocking connection to %s address space",
+        this,
+        addrSpace == nsILoadInfo::IPAddressSpace::Local ? "local" : "private"));
+    return NS_ERROR_LOCAL_NETWORK_ACCESS_DENIED;
+  }
+
+  return NS_OK;
+}
+
+void HappyEyeballsConnectionAttempt::DNSLookup(
+    happy_eyeballs::DnsRecordType aType,
+    Result<nsIDNSService::DNSFlags, nsresult> aFlags, uint64_t aId,
+    const nsACString& aHostname) {
+  if ((aType == happy_eyeballs::DnsRecordType::A ||
+       aType == happy_eyeballs::DnsRecordType::Aaaa) &&
+      aHostname.Equals(mHost)) {
+    mOriginDnsLookupIds.Insert(aId);
+  }
+
+  nsCOMPtr<nsIDNSService> dns = aFlags.isOk() ? GetOrInitDNSService() : nullptr;
+
+  if (dns) {
+    if (mFirstDnsLookupStart.IsNull()) {
+      mFirstDnsLookupStart = TimeStamp::Now();
+    }
+    MaybeSendTransportStatus(NS_NET_STATUS_RESOLVING_HOST);
+  }
+
+  RefPtr<DnsRequestInfo> requestInfo = new DnsRequestInfo(aId, aType);
+  nsCOMPtr<nsICancelable> request;
+  nsresult rv = NS_ERROR_UNEXPECTED;
+  if (dns) {
+    nsIDNSService::DNSFlags flags = aFlags.unwrap();
+    switch (aType) {
+      case happy_eyeballs::DnsRecordType::Https: {
+        if (!mConnInfo->FirstHopSSL() ||
+            (!StaticPrefs::network_dns_force_use_https_rr() &&
+             (mCaps & NS_HTTP_DISALLOW_HTTPS_RR))) {
+          rv = NS_ERROR_NOT_AVAILABLE;
+        } else {
+          nsCOMPtr<nsIDNSAdditionalInfo> info;
+          if (mConnInfo->OriginPort() != NS_HTTPS_DEFAULT_PORT) {
+            dns->NewAdditionalInfo(""_ns, mConnInfo->OriginPort(),
+                                   getter_AddRefs(info));
+          }
+          rv = dns->AsyncResolveNative(
+              aHostname, nsIDNSService::RESOLVE_TYPE_HTTPSSVC,
+              flags | nsIDNSService::RESOLVE_WANT_RECORD_ON_ERROR, info, this,
+              gSocketTransportService, mConnInfo->GetOriginAttributes(),
+              getter_AddRefs(request));
+        }
+        break;
+      }
+      case happy_eyeballs::DnsRecordType::Aaaa:
+        rv = dns->AsyncResolveNative(
+            aHostname, nsIDNSService::RESOLVE_TYPE_DEFAULT,
+            flags | nsIDNSService::RESOLVE_WANT_RECORD_ON_ERROR, nullptr, this,
+            gSocketTransportService, mConnInfo->GetOriginAttributes(),
+            getter_AddRefs(request));
+        break;
+      case happy_eyeballs::DnsRecordType::A:
+        rv = dns->AsyncResolveNative(
+            aHostname, nsIDNSService::RESOLVE_TYPE_DEFAULT,
+            flags | nsIDNSService::RESOLVE_WANT_RECORD_ON_ERROR, nullptr, this,
+            gSocketTransportService, mConnInfo->GetOriginAttributes(),
+            getter_AddRefs(request));
+        break;
+    }
+  }
+
+  if (NS_SUCCEEDED(rv) && request) {
+    requestInfo->SetRequest(request);
+    mDnsRequestTable.InsertOrUpdate(request, requestInfo);
+    return;
+  }
+
+  NS_DispatchToCurrentThread(
+      NS_NewRunnableFunction("HappyEyeballsConnectionAttempt::DNSLookup",
+                             [self = RefPtr{this}, rv, aType, aId]() {
+                               switch (aType) {
+                                 case happy_eyeballs::DnsRecordType::Https:
+                                   (void)self->OnHTTPSRecord(nullptr, rv, aId);
+                                   break;
+                                 case happy_eyeballs::DnsRecordType::Aaaa:
+                                   (void)self->OnAAAARecord(nullptr, rv, aId);
+                                   break;
+                                 case happy_eyeballs::DnsRecordType::A:
+                                   (void)self->OnARecord(nullptr, rv, aId);
+                                   break;
+                               }
+                             }));
+}
+
+void HappyEyeballsConnectionAttempt::MaybeForward0RTTSecurityInfo(
+    ConnectionEstablisher* aEstablisher) {
+  if (!mZeroRttHandle->AnyStarted()) {
+    return;
+  }
+  RefPtr<HttpConnectionBase> conn = aEstablisher->ResultConn();
+  if (!conn) {
+    return;
+  }
+  nsCOMPtr<nsITLSSocketControl> tlsCtrl;
+  conn->GetTLSSocketControl(getter_AddRefs(tlsCtrl));
+  nsCOMPtr<nsITransportSecurityInfo> secInfo;
+  if (tlsCtrl) {
+    tlsCtrl->GetSecurityInfo(getter_AddRefs(secInfo));
+  }
+  if (secInfo && mTransaction) {
+    if (nsHttpTransaction* trans = mTransaction->QueryHttpTransaction()) {
+      trans->SetSecurityInfo(secInfo);
+    }
+  }
+}
+
+void HappyEyeballsConnectionAttempt::HandleConnectionResult(
+    Result<RefPtr<HttpConnectionBase>, nsresult> aResult,
+    ConnectionEstablisher* aEstablisher, uint64_t aId) {
+  RefPtr<ConnectionEstablisher> establisher = aEstablisher;
+  mConnectionEstablisherTable.Remove(aId);
+  NetAddr addr = establisher->Addr();
+
+  LOG((
+      "HappyEyeballsConnectionAttempt::HandleConnectionResult %p addr=[%s] "
+      "family=[%d] id=%" PRIu64 " isUDP=%d",
+      this, addr.ToString().get(), addr.raw.family, aId, establisher->IsUDP()));
+
+  if (aResult.isErr()) {
+    nsresult status = aResult.unwrapErr();
+    MaybeForward0RTTSecurityInfo(establisher);
+    Maybe<nsCString> retryEch = MaybeExtractRetryEchConfig(establisher, status);
+    establisher->Close(status);
+    if (retryEch) {
+      ProcessEchRetryConnectionResult(addr, aId, *retryEch);
+    } else {
+      ProcessConnectionResult(addr, status, aId);
+    }
+    return;
+  }
+
+  if (IsTerminal()) {
+    establisher->Close(NS_BASE_STREAM_CLOSED);
+    ProcessConnectionResult(addr, NS_BASE_STREAM_CLOSED, aId);
+    return;
+  }
+
+  mOutputConn = aResult.unwrap();
+  mOutputTrans = establisher->Transaction();
+  mOutputConnId = aId;
+  mAddrFamily = addr.raw.family;
+  mFirstConnectEnd = TimeStamp::Now();
+  establisher->ClearResultConnection();
+
+  ProcessConnectionResult(addr, NS_OK, aId);
+}
+
+void HappyEyeballsConnectionAttempt::AdoptWinner(
+    HappyEyeballsTransaction* aWinner) {
+  MOZ_ASSERT(OnSocketThread());
+  if (!aWinner || aWinner->IsAdopted()) {
+    return;
+  }
+
+  nsHttpTransaction* realTransaction = RealHttpTransaction();
+  if (!realTransaction) {
+    LOG(
+        ("HappyEyeballsConnectionAttempt::AdoptWinner %p no real transaction; "
+         "closing winner=%p",
+         this, aWinner));
+    aWinner->Close(NS_ERROR_ABORT);
+    return;
+  }
+
+#ifdef DEBUG
+  {
+    RefPtr<ConnectionEntry> entry(mEntry);
+    if (entry) {
+      RefPtr<PendingTransactionInfo> pendingInfo =
+          mConnMgrDelegate->FindTransaction(
+               false, entry, realTransaction);
+      MOZ_ASSERT(
+          !pendingInfo,
+          "real transaction must have been removed from the pending queue "
+          "by LockInRealTransactionFromPendingQueue");
+    }
+  }
+#endif
+  aWinner->Adopt(realTransaction);
+  mTransactionAdopted = true;
+}
+
+bool HappyEyeballsConnectionAttempt::LockInRealTransactionFromPendingQueue() {
+  nsHttpTransaction* realTransaction = RealHttpTransaction();
+  if (!realTransaction) {
+    return false;
+  }
+  RefPtr<ConnectionEntry> entry(mEntry);
+  if (!entry) {
+    return false;
+  }
+  RefPtr<PendingTransactionInfo> pendingInfo =
+      mConnMgrDelegate->FindTransaction(
+           true, entry, realTransaction);
+  LOG(
+      ("HappyEyeballsConnectionAttempt::LockInRealTransactionFromPendingQueue "
+       "%p realTransaction=%p removed=%d",
+       this, realTransaction, !!pendingInfo));
+  return !!pendingInfo;
+}
+
+already_AddRefed<HappyEyeballsTransaction>
+HappyEyeballsConnectionAttempt::CreateAttemptTransaction(
+    nsHttpConnectionInfo* aInfo, uint64_t aEstablisherId) {
+  nsCOMPtr<nsIInterfaceRequestor> callbacks;
+  uint64_t browserId = 0;
+  if (mTransaction) {
+    mTransaction->GetSecurityCallbacks(getter_AddRefs(callbacks));
+    browserId = mTransaction->BrowserId();
+  }
+  RefPtr<HappyEyeballsTransaction> trans = new HappyEyeballsTransaction(
+      aInfo, callbacks, mCaps, browserId,
+      [self = RefPtr{this}](nsITransport* t, nsresult s, int64_t p) {
+        self->MaybeSendTransportStatus(s, t, p);
+      },
+      [self = RefPtr{this}, id = aEstablisherId]() {
+        self->OnClientAuthCertificateRequested(id);
+      },
+      [self = RefPtr{this}, id = aEstablisherId]() {
+        self->OnClientAuthCertificateSelected(id);
+      },
+      mZeroRttHandle);
+  return trans.forget();
+}
+
+nsresult HappyEyeballsConnectionAttempt::EstablishTCPConnection(
+    NetAddr aAddr, uint16_t aPort, nsTArray<uint8_t>&& aEchConfig, uint64_t aId,
+    bool aIsEchRetry) {
+  RefPtr<nsHttpConnectionInfo> info = mConnInfo->CloneAndAdoptPortAndAlpn(
+      aPort, happy_eyeballs::ConnectionAttemptHttpVersions::H2OrH1);
+  if (!aEchConfig.IsEmpty()) {
+    info->SetEchConfig(
+        nsCString((const char*)aEchConfig.Elements(), aEchConfig.Length()));
+    NotifyConnectionActivity(info, NS_HTTP_ACTIVITY_SUBTYPE_ECH_SET);
+  }
+  NotifyConnectionActivity(info, NS_HTTP_ACTIVITY_SUBTYPE_CONNECTION_CREATED);
+  uint32_t caps = mCaps | (aIsEchRetry ? NS_HTTP_IS_RETRY : 0);
+  RefPtr<ConnectionEstablisher> establisher =
+      mEstablisherFactory->Create(ConnectionEstablisherType::TCP, info, aAddr,
+                                  caps, mSpeculative, mAllow1918);
+  establisher->SetDnsMetadata(mDnsMetadata);
+  nsCOMPtr<nsIInterfaceRequestor> callbacks;
+  mTransaction->GetSecurityCallbacks(getter_AddRefs(callbacks));
+  establisher->SetSecurityCallbacks(callbacks);
+  establisher->SetTransportStatusCallback(
+      [self = RefPtr{this}](nsITransport* trans, nsresult status,
+                            int64_t progress) {
+        self->MaybeSendTransportStatus(status, trans, progress);
+      });
+  establisher->SetLnaCheckCallback(
+      [self = RefPtr{this}](nsISocketTransport* aTransport) -> nsresult {
+        return self->CheckLNA(aTransport);
+      });
+
+  RefPtr<HappyEyeballsTransaction> attempt =
+      CreateAttemptTransaction(info, aId);
+  establisher->SetTransaction(attempt);
+
+  auto callback = [self = RefPtr{this}, establisher,
+                   aId](Result<RefPtr<HttpConnectionBase>, nsresult> aResult) {
+    self->HandleConnectionResult(std::move(aResult), establisher, aId);
+  };
+
+  if (establisher->Start(std::move(callback))) {
+    mConnectionEstablisherTable.InsertOrUpdate(aId, std::move(establisher));
+  } else {
+    ProcessConnectionResult(aAddr, NS_ERROR_FAILURE, aId);
+  }
+
+  return NS_OK;
+}
+
+nsresult HappyEyeballsConnectionAttempt::EstablishUDPConnection(
+    NetAddr aAddr, uint16_t aPort, nsTArray<uint8_t>&& aEchConfig, uint64_t aId,
+    bool aIsEchRetry) {
+  RefPtr<nsHttpConnectionInfo> info = mConnInfo->CloneAndAdoptPortAndAlpn(
+      aPort, happy_eyeballs::ConnectionAttemptHttpVersions::H3);
+  if (!aEchConfig.IsEmpty()) {
+    info->SetEchConfig(
+        nsCString((const char*)aEchConfig.Elements(), aEchConfig.Length()));
+    NotifyConnectionActivity(info, NS_HTTP_ACTIVITY_SUBTYPE_ECH_SET);
+  }
+  NotifyConnectionActivity(info, NS_HTTP_ACTIVITY_SUBTYPE_CONNECTION_CREATED);
+  uint32_t caps = mCaps | (aIsEchRetry ? NS_HTTP_IS_RETRY : 0);
+  RefPtr<ConnectionEstablisher> establisher =
+      mEstablisherFactory->Create(ConnectionEstablisherType::UDP, info, aAddr,
+                                  caps, mSpeculative, mAllow1918);
+  establisher->SetDnsMetadata(mDnsMetadata);
+  establisher->SetTransportStatusCallback(
+      [self = RefPtr{this}](nsITransport* trans, nsresult status,
+                            int64_t progress) {
+        self->MaybeSendTransportStatus(status, trans, progress);
+      });
+
+  RefPtr<HappyEyeballsTransaction> attempt =
+      CreateAttemptTransaction(info, aId);
+  establisher->SetTransaction(attempt);
+
+  auto callback = [self = RefPtr{this}, establisher,
+                   aId](Result<RefPtr<HttpConnectionBase>, nsresult> aResult) {
+    self->HandleConnectionResult(std::move(aResult), establisher, aId);
+  };
+
+  if (establisher->Start(std::move(callback))) {
+    mConnectionEstablisherTable.InsertOrUpdate(aId, std::move(establisher));
+  } else {
+    ProcessConnectionResult(aAddr, NS_ERROR_FAILURE, aId);
+  }
+
+  return NS_OK;
+}
+
+void HappyEyeballsConnectionAttempt::OnClientAuthCertificateRequested(
+    uint64_t aEstablisherId) {
+  LOG(
+      ("HappyEyeballsConnectionAttempt::OnClientAuthCertificateRequested %p "
+       "id=%" PRIu64,
+       this, aEstablisherId));
+
+  if (IsTerminal()) {
+    return;
+  }
+
+  if (mPausedForClientAuth) {
+    return;
+  }
+
+  mPausedForClientAuth = true;
+  mClientAuthHolderId = aEstablisherId;
+}
+
+void HappyEyeballsConnectionAttempt::OnClientAuthCertificateSelected(
+    uint64_t aEstablisherId) {
+  LOG(
+      ("HappyEyeballsConnectionAttempt::OnClientAuthCertificateSelected %p "
+       "id=%" PRIu64,
+       this, aEstablisherId));
+  if (!mPausedForClientAuth || aEstablisherId != mClientAuthHolderId) {
+    return;
+  }
+
+  mPausedForClientAuth = false;
+  mClientAuthHolderId = 0;
+}
+
+void HappyEyeballsConnectionAttempt::CancelConnection(uint64_t aId) {
+  LOG(("HappyEyeballsConnectionAttempt::CancelConnection id=%" PRIu64, aId));
+
+  RefPtr<ConnectionEstablisher> conn = mConnectionEstablisherTable.Get(aId);
+  if (conn) {
+    conn->Close(NS_ERROR_ABORT);
+    mConnectionEstablisherTable.Remove(aId);
+  } else {
+    LOG(("No matching connection found for id=%" PRIu64, aId));
+  }
+}
+
+void HappyEyeballsConnectionAttempt::CloseHttpTransaction(
+    happy_eyeballs::FailureReason aReason, ConnectionEntry* aEntry) {
+  LOG(("HappyEyeballsConnectionAttempt::CloseHttpTransaction %p reason=%d",
+       this, static_cast<uint32_t>(aReason)));
+
+  nsresult reason = NS_ERROR_ABORT;
+  switch (aReason) {
+    case happy_eyeballs::FailureReason::DnsResolution:
+      reason = NS_FAILED(mLastDnsError) ? mLastDnsError : NS_ERROR_UNKNOWN_HOST;
+      break;
+    case happy_eyeballs::FailureReason::Connection:
+      reason = (NS_FAILED(mLastConnectionError) &&
+                mLastConnectionError != NS_ERROR_NET_RESET)
+                   ? mLastConnectionError
+                   : NS_ERROR_CONNECTION_REFUSED;
+      break;
+    default:
+      MOZ_ASSERT_UNREACHABLE("Unknown FailureReason");
+      break;
+  }
+  ReleaseRealTransaction(reason, aEntry);
+}
+
+bool HappyEyeballsConnectionAttempt::ShouldRetryWithoutTRR(
+    happy_eyeballs::FailureReason aReason) const {
+  if (!StaticPrefs::network_http_happy_eyeballs_retry_without_trr()) {
+    return false;
+  }
+
+  if (aReason != happy_eyeballs::FailureReason::Connection ||
+      mRetryWithoutTRR || !mDnsMetadata.mIsTRR ||
+      mDnsMetadata.mEffectiveTRRMode == nsIRequest::TRR_ONLY_MODE ||
+      !RealHttpTransaction()) {
+    return false;
+  }
+
+  if (!StaticPrefs::network_trr_fallback_on_zero_response() &&
+      !mOriginAddresses.IsEmpty()) {
+    bool allZero = true;
+    for (const auto& addr : mOriginAddresses) {
+      bool isZero = (addr.raw.family == AF_INET && addr.inet.ip == 0) ||
+                    (addr.raw.family == AF_INET6 && addr.inet6.ip.u64[0] == 0 &&
+                     addr.inet6.ip.u64[1] == 0);
+      if (!isZero) {
+        allZero = false;
+        break;
+      }
+    }
+    if (allZero) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+void HappyEyeballsConnectionAttempt::RetryWithoutTRR() {
+  RefPtr<HappyEyeballsConnectionAttempt> self(this);
+  RefPtr<ConnectionEntry> entry(mEntry);
+  RefPtr<nsHttpTransaction> realTrans = RealHttpTransaction();
+  LOG(("HappyEyeballsConnectionAttempt::RetryWithoutTRR %p trans=%p", this,
+       realTrans.get()));
+  MOZ_ASSERT(entry && realTrans);
+
+  nsresult rv = mConnMgrDelegate->StartRetryWithoutTRR(
+      entry, realTrans, mCaps, mSpeculative, mUrgentStart, mAllow1918);
+  if (NS_FAILED(rv)) {
+    LOG(("  StartRetryWithoutTRR failed rv=%" PRIx32 "; failing normally",
+         static_cast<uint32_t>(rv)));
+    TransitionPayload payload;
+    payload.mFailureReason = Some(happy_eyeballs::FailureReason::Connection);
+    Transition(State::Failed, std::move(payload));
+    return;
+  }
+
+  ForgetRealTransaction();
+  mConnMgrDelegate->RemoveConnectionAttempt(entry, this,  true);
+}
+
+void HappyEyeballsConnectionAttempt::Abandon() {
+  LOG(("HappyEyeballsConnectionAttempt::Abandon %p", this));
+  if (mState == State::Done) {
+    return;
+  }
+  Transition(State::Done);
+}
+
+void HappyEyeballsConnectionAttempt::ProcessTCPConn(
+    HttpConnectionBase* aConn, ConnectionEntry* aEntry,
+    bool aTransactionAlreadyOnConn) {
+  RefPtr<ConnectionEntry> entry(mEntry);
+  if (!entry) {
+    return;
+  }
+
+  RefPtr<HttpConnectionBase> connTCP = aConn;
+  LOG(("Got connTCP:%p transactionAlreadyOnConn=%d", connTCP.get(),
+       aTransactionAlreadyOnConn));
+
+  mConnMgrDelegate->InsertIntoActiveConns(entry, connTCP);
+
+  bool isHttp2 = connTCP->UsingSpdy();
+
+  nsHttpTransaction* realTrans =
+      mTransaction ? mTransaction->QueryHttpTransaction() : nullptr;
+  bool deferExtendedConnect =
+      isHttp2 && realTrans &&
+      (realTrans->IsWebsocketUpgrade() || realTrans->IsForWebTransport());
+
+  if (!aTransactionAlreadyOnConn && deferExtendedConnect) {
+    LOG(
+        ("ProcessTCPConn deferring extended CONNECT upgrade trans=%p to "
+         "ProcessPendingQ\n",
+         realTrans));
+
+    if (realTrans->Connection()) {
+      LOG(
+          ("ProcessTCPConn trans=%p already dispatched to a connection; not "
+           "re-queuing\n",
+           realTrans));
+    } else {
+      RefPtr<PendingTransactionInfo> existing =
+          mConnMgrDelegate->FindTransaction(
+               false, entry, realTrans);
+      if (!existing) {
+        mConnMgrDelegate->AddTransaction(realTrans, realTrans->Priority());
+      }
+    }
+    mTransaction = nullptr;
+  } else if (!aTransactionAlreadyOnConn) {
+    RefPtr<PendingTransactionInfo> pendingTransInfo =
+        mConnMgrDelegate->FindTransaction(true, entry, mTransaction);
+    if (pendingTransInfo) {
+      MOZ_ASSERT(!mSpeculative, "Speculative HE attempt found mTransaction");
+      nsresult rv = mConnMgrDelegate->DispatchTransaction(
+          entry, pendingTransInfo->Transaction(), connTCP);
+      if (NS_FAILED(rv)) {
+        mTransaction->Close(rv);
+      } else {
+        mTransactionAdopted = true;
+      }
+    } else if (!isHttp2) {
+      if (RefPtr<nsHttpConnection> h1 = do_QueryObject(connTCP)) {
+        h1->SetIsReusedAfter(950);
+      }
+
+      LOG(
+          ("ProcessTCPConn no transaction match "
+           "returning conn %p to pool\n",
+           connTCP.get()));
+      mConnMgrDelegate->ReclaimConnection(connTCP);
+    }
+  }
+
+  connTCP->SetIsRacing(false);
+  mConnMgrDelegate->ReportSpdyConnection(
+      connTCP, isHttp2, isHttp2 && (mCaps & NS_HTTP_DISALLOW_HTTP3));
+}
+
+void HappyEyeballsConnectionAttempt::ProcessUDPConn(
+    HttpConnectionBase* aConn, ConnectionEntry* aEntry,
+    bool aTransactionAlreadyOnConn) {
+  RefPtr<ConnectionEntry> entry(mEntry);
+  if (!entry) {
+    return;
+  }
+
+  LOG(("Got connUDP:%p transactionAlreadyOnConn=%d", aConn,
+       aTransactionAlreadyOnConn));
+
+  if (!mFirstConnectionStart.IsNull()) {
+    TimingStruct connectTimings;
+    FillConnectTimings( true, connectTimings);
+    aConn->SetConnectBootstrapTimings(
+        connectTimings.connectStart, connectTimings.tcpConnectEnd,
+        connectTimings.secureConnectionStart, connectTimings.connectEnd);
+
+    if (aTransactionAlreadyOnConn) {
+      nsHttpTransaction* trans =
+          mTransaction ? mTransaction->QueryHttpTransaction() : nullptr;
+      if (trans) {
+        TimingStruct timings;
+        DnsLookupTimings(timings.domainLookupStart, timings.domainLookupEnd);
+        FillConnectTimings( true, timings);
+        trans->BootstrapTimings(timings);
+      }
+    }
+  }
+
+  mConnMgrDelegate->InsertIntoActiveConns(entry, aConn);
+
+  if (!aTransactionAlreadyOnConn) {
+    RefPtr<PendingTransactionInfo> pendingTransInfo =
+        mConnMgrDelegate->FindTransaction(true, entry, mTransaction);
+    nsresult rv = NS_OK;
+    if (pendingTransInfo) {
+      MOZ_ASSERT(!mSpeculative, "Speculative HE attempt found mTransaction");
+      rv = mConnMgrDelegate->DispatchTransaction(
+          entry, pendingTransInfo->Transaction(), aConn);
+      if (NS_FAILED(rv)) {
+        mTransaction->Close(rv);
+      } else {
+        mTransactionAdopted = true;
+      }
+    } else {
+      nsHttpTransaction* trans = mTransaction->QueryHttpTransaction();
+      if (trans && trans->IsDone()) {
+        LOG(("ProcessUDPConn transaction already done, not activating"));
+      } else if (trans && trans->Connection()) {
+        LOG(
+            ("ProcessUDPConn transaction already dispatched to a connection, "
+             "not activating"));
+      } else {
+        rv = aConn->Activate(mTransaction, mCaps, 0);
+        if (NS_SUCCEEDED(rv)) {
+          mTransactionAdopted = true;
+        }
+      }
+    }
+  }
+
+  aConn->SetIsRacing(false);
+  mConnMgrDelegate->ReportHttp3Connection(aConn, entry);
+}
+
+void HappyEyeballsConnectionAttempt::EnterSucceeded() {
+  LOG(("HappyEyeballsConnectionAttempt::EnterSucceeded %p", this));
+  MOZ_ASSERT(mState == State::Succeeded);
+
+  RefPtr<HappyEyeballsConnectionAttempt> self(this);
+  RefPtr<ConnectionEntry> entry(mEntry);
+  MOZ_ASSERT(entry);
+
+  if ((mAddrFamily == AF_INET && entry->mPreferIPv6) ||
+      (mAddrFamily == AF_INET6 && entry->mPreferIPv4)) {
+    mConnMgrDelegate->ResetIPFamilyPreference(entry);
+  }
+  mConnMgrDelegate->RecordIPFamilyPreference(entry, mAddrFamily);
+
+  TimeStamp dnsLookupStart, dnsLookupEnd;
+  DnsLookupTimings(dnsLookupStart, dnsLookupEnd);
+  if (!dnsLookupStart.IsNull()) {
+    mOutputConn->SetDnsBootstrapTimings(dnsLookupStart, dnsLookupEnd);
+  }
+
+  if (mOutputTrans && mTransaction) {
+    if (nsHttpTransaction* realTransaction =
+            mTransaction->QueryHttpTransaction()) {
+      TimingStruct timings;
+      DnsLookupTimings(timings.domainLookupStart, timings.domainLookupEnd);
+      FillConnectTimings( mOutputConn->UsingHttp3(), timings);
+      timings.transactionPending = realTransaction->GetPendingTime();
+      realTransaction->BootstrapTimings(timings);
+    }
+  }
+  mOutputTrans = nullptr;
+
+  bool restartedFallback0Rtt = false;
+  nsHttpTransaction* trans =
+      mTransaction ? mTransaction->QueryHttpTransaction() : nullptr;
+  if (mZeroRttHandle->AnyStarted() && !mZeroRttHandle->HadWinner()) {
+    if (!mTransaction) {
+    } else {
+      MOZ_ASSERT(trans,
+                 "AnyStarted implies a live real transaction; "
+                 "QueryHttpTransaction() should not be null");
+      if (trans) {
+        trans->FinishAdopted0RTT(true);
+        if (!trans->Connection()) {
+          RefPtr<PendingTransactionInfo> existing;
+          if (entry) {
+            existing = mConnMgrDelegate->FindTransaction(
+                false, entry, trans);
+          }
+          if (!existing) {
+            mConnMgrDelegate->AddTransaction(trans, trans->Priority());
+          }
+        }
+        restartedFallback0Rtt = true;
+        mTransaction = nullptr;
+      }
+    }
+  }
+
+  MOZ_DIAGNOSTIC_ASSERT(
+      !mZeroRttHandle->AnyStarted() || mZeroRttHandle->HadWinner() ||
+          !mTransaction,
+      "EnterSucceeded: 0-RTT transaction not re-queued and not adopted");
+
+  bool alreadyOnConn = mZeroRttHandle->HadWinner() || restartedFallback0Rtt;
+  if (!mOutputConn->UsingHttp3()) {
+    if (!mConnInfo->GetRoutedHost().IsEmpty()) {
+      if (trans) {
+        trans->RemoveAltSvcUsedHeader();
+      }
+    }
+
+    ProcessTCPConn(mOutputConn, entry, alreadyOnConn);
+  } else {
+    ProcessUDPConn(mOutputConn, entry, alreadyOnConn);
+  }
+
+  mOutputConn = nullptr;
+
+  Abandon();
+
+  mConnMgrDelegate->RemoveConnectionAttempt(entry, this, false);
+}
+
+double HappyEyeballsConnectionAttempt::Duration(TimeStamp epoch) {
+  if (mFirstConnectionStart.IsNull()) {
+    return 0;
+  }
+  return (epoch - mFirstConnectionStart).ToMilliseconds();
+}
+
+void HappyEyeballsConnectionAttempt::OnTimeout() {
+  LOG(("HappyEyeballsConnectionAttempt::OnTimeout %p" PRIx32, this));
+  if (IsTerminal()) {
+    return;
+  }
+  Transition(State::TimedOut);
+}
+
+void HappyEyeballsConnectionAttempt::EnterTimedOut() {
+  LOG(("HappyEyeballsConnectionAttempt::EnterTimedOut %p", this));
+  MOZ_ASSERT(mState == State::TimedOut);
+  RefPtr<ConnectionEntry> entry(mEntry);
+  ReleaseRealTransaction(NS_ERROR_NET_TIMEOUT, entry);
+  Abandon();
+}
+
+void HappyEyeballsConnectionAttempt::EnterFailed(
+    happy_eyeballs::FailureReason aReason) {
+  LOG(("HappyEyeballsConnectionAttempt::EnterFailed %p reason=%d", this,
+       static_cast<uint32_t>(aReason)));
+  MOZ_ASSERT(mState == State::Failed);
+
+  RefPtr<HappyEyeballsConnectionAttempt> self(this);
+  RefPtr<ConnectionEntry> entry(mEntry);
+
+  if (entry) {
+    mConnMgrDelegate->RemoveConnectionAttempt(entry, this, false);
+  }
+
+  CloseHttpTransaction(aReason, entry);
+  Abandon();
+}
+
+void HappyEyeballsConnectionAttempt::EnterRestartTransaction(
+    nsresult aCloseReason) {
+  LOG(("HappyEyeballsConnectionAttempt::EnterRestartTransaction %p reason=%x",
+       this, static_cast<uint32_t>(aCloseReason)));
+  MOZ_ASSERT(mState == State::RestartTransaction);
+
+  RefPtr<HappyEyeballsConnectionAttempt> self(this);
+  RefPtr<ConnectionEntry> entry(mEntry);
+
+  if (entry) {
+    mConnMgrDelegate->RemoveConnectionAttempt(entry, this, true);
+  }
+
+  if (mTransaction) {
+    if (nsHttpTransaction* trans = mTransaction->QueryHttpTransaction()) {
+      trans->DoNotRemoveAltSvc();
+      if (aCloseReason == NS_ERROR_NET_RESET && mZeroRttHandle->AnyStarted()) {
+        trans->FinishAdopted0RTT( true);
+      }
+    }
+  }
+
+  ReleaseRealTransaction(aCloseReason, entry);
+
+  if (mState != State::Done) {
+    Abandon();
+  }
+}
+
+void HappyEyeballsConnectionAttempt::EnterAbortTransaction(
+    nsresult aCloseReason) {
+  LOG(
+      ("HappyEyeballsConnectionAttempt::EnterAbortTransaction %p "
+       "reason=%x",
+       this, static_cast<uint32_t>(aCloseReason)));
+  MOZ_ASSERT(mState == State::AbortTransaction);
+
+  RefPtr<HappyEyeballsConnectionAttempt> self(this);
+  RefPtr<ConnectionEntry> entry(mEntry);
+
+  ReleaseRealTransaction(aCloseReason, entry);
+  Abandon();
+  if (entry) {
+    mConnMgrDelegate->RemoveConnectionAttempt(entry, this, false);
+  }
+}
+
+void HappyEyeballsConnectionAttempt::EnterDone() {
+  LOG(("HappyEyeballsConnectionAttempt::EnterDone %p", this));
+  MOZ_ASSERT(mState == State::Done);
+
+  for (auto iter = mDnsRequestTable.Iter(); !iter.Done(); iter.Next()) {
+    iter.Data()->Cancel();
+  }
+  mDnsRequestTable.Clear();
+
+  nsTArray<RefPtr<ConnectionEstablisher>> establishers;
+  for (auto iter = mConnectionEstablisherTable.Iter(); !iter.Done();
+       iter.Next()) {
+    establishers.AppendElement(iter.Data());
+  }
+  mConnectionEstablisherTable.Clear();
+
+  for (auto& conn : establishers) {
+    conn->Close(NS_ERROR_ABORT);
+  }
+
+  if (mTimer) {
+    mTimer->Cancel();
+  }
+  mTimer = nullptr;
+
+  if (mTransaction && mZeroRttHandle->AnyStarted() &&
+      !mZeroRttHandle->HadWinner()) {
+    if (nsHttpTransaction* realTransaction =
+            mTransaction->QueryHttpTransaction()) {
+      if (!realTransaction->Closed()) {
+        realTransaction->FinishAdopted0RTT(true);
+        if (!realTransaction->Connection()) {
+          RefPtr<ConnectionEntry> entry(mEntry);
+          RefPtr<PendingTransactionInfo> existing;
+          if (entry) {
+            existing = mConnMgrDelegate->FindTransaction(
+                false, entry, realTransaction);
+          }
+          if (!existing) {
+            mConnMgrDelegate->AddTransaction(realTransaction,
+                                             realTransaction->Priority());
+          }
+        }
+      }
+    }
+    mTransaction = nullptr;
+  }
+
+  MOZ_DIAGNOSTIC_ASSERT(!mZeroRttHandle->AnyStarted() ||
+                            mZeroRttHandle->HadWinner() || !mTransaction,
+                        "transaction not re-queued and not adopted");
+
+  mZeroRttHandle->Cleanup();
+  mEntry = nullptr;
+}
+
+void HappyEyeballsConnectionAttempt::Transition(State aNext) {
+  Transition(aNext, TransitionPayload{});
+}
+
+void HappyEyeballsConnectionAttempt::Transition(State aNext,
+                                                TransitionPayload aPayload) {
+  LOG(("HappyEyeballsConnectionAttempt::Transition %p mState=%d aNext=%d", this,
+       static_cast<int>(mState), static_cast<int>(aNext)));
+
+  if (mState == aNext &&
+      (aNext == State::Connecting || aNext == State::ZeroRttRacing ||
+       aNext == State::ProcessingConnectionResult)) {
+    return;
+  }
+
+  switch (aNext) {
+    case State::Init:
+      MOZ_ASSERT_UNREACHABLE("Init is the initial state");
+      break;
+
+    case State::Connecting:
+      MOZ_ASSERT(
+          mState == State::Init || mState == State::ProcessingConnectionResult,
+          "Connecting entered from Init or "
+          "ProcessingConnectionResult only");
+      mState = State::Connecting;
+      break;
+
+    case State::ZeroRttRacing:
+      MOZ_ASSERT(mState == State::Connecting ||
+                     mState == State::ProcessingConnectionResult,
+                 "ZeroRttRacing entered from Connecting or "
+                 "ProcessingConnectionResult only");
+      mState = State::ZeroRttRacing;
+      break;
+
+    case State::ProcessingConnectionResult:
+      MOZ_ASSERT(mState == State::Connecting || mState == State::ZeroRttRacing,
+                 "ProcessingConnectionResult entered from Connecting or "
+                 "ZeroRttRacing only");
+      mState = State::ProcessingConnectionResult;
+      break;
+
+    case State::Succeeded:
+      MOZ_ASSERT(!IsTerminal(), "Succeeded from a non-terminal state only");
+      mState = State::Succeeded;
+      EnterSucceeded();
+      break;
+
+    case State::Failed:
+      MOZ_ASSERT(!IsTerminal(), "Failed from a non-terminal state only");
+      MOZ_ASSERT(aPayload.mFailureReason.isSome(),
+                 "Failed requires a FailureReason payload");
+      mState = State::Failed;
+      EnterFailed(aPayload.mFailureReason.ref());
+      break;
+
+    case State::RestartTransaction:
+      MOZ_ASSERT(!IsTerminal(),
+                 "RestartTransaction from a non-terminal state only");
+      mState = State::RestartTransaction;
+      EnterRestartTransaction(aPayload.mCloseReason);
+      break;
+
+    case State::AbortTransaction:
+      MOZ_ASSERT(!IsTerminal(),
+                 "AbortTransaction from a non-terminal state only");
+      mState = State::AbortTransaction;
+      EnterAbortTransaction(aPayload.mCloseReason);
+      break;
+
+    case State::TimedOut:
+      MOZ_ASSERT(!IsTerminal(), "TimedOut from a non-terminal state only");
+      mState = State::TimedOut;
+      EnterTimedOut();
+      break;
+
+    case State::Done:
+      if (mState == State::Done) {
+        return;
+      }
+      mState = State::Done;
+      EnterDone();
+      break;
+  }
+}
+
+void HappyEyeballsConnectionAttempt::PrintDiagnostics(nsCString& log) {}
+
+uint32_t HappyEyeballsConnectionAttempt::UnconnectedUDPConnsLength() const {
+  uint32_t len = 0;
+  for (auto iter = mConnectionEstablisherTable.ConstIter(); !iter.Done();
+       iter.Next()) {
+    if (iter.Data()->IsUDP()) {
+      len++;
+    }
+  }
+
+  if (len == 0) {
+    if (mConnInfo->IsHttp3()) {
+      return 1;
+    }
+  }
+  return len;
+}
+
+bool HappyEyeballsConnectionAttempt::Claim(nsHttpTransaction* newTransaction) {
+  if (mSpeculative) {
+    mSpeculative = false;
+    mAllow1918 = true;
+    for (auto iter = mConnectionEstablisherTable.Iter(); !iter.Done();
+         iter.Next()) {
+      RefPtr<ConnectionEstablisher> conn = iter.Data();
+      conn->ResetSpeculativeFlags();
+    }
+  }
+
+  if (mFreeToUse) {
+    mFreeToUse = false;
+    if (newTransaction && mTransaction &&
+        mTransaction->QueryNullTransaction()) {
+      LOG(
+          ("HappyEyeballsConnectionAttempt::Claim %p replacing null "
+           "transaction %p with %p",
+           this, mTransaction.get(), newTransaction));
+      mTransaction->Close(NS_ERROR_ABORT);
+      mTransaction = newTransaction;
+      static const nsresult kStatusOrder[] = {
+          NS_NET_STATUS_RESOLVING_HOST, NS_NET_STATUS_RESOLVED_HOST,
+          NS_NET_STATUS_CONNECTING_TO, NS_NET_STATUS_CONNECTED_TO};
+      for (nsresult status : kStatusOrder) {
+        if (mSentTransportStatuses.Contains(static_cast<uint32_t>(status))) {
+          mTransaction->OnTransportStatus(nullptr, status, 0);
+        }
+      }
+    }
+    return true;
+  }
+
+  return false;
+}
+
+NS_IMETHODIMP
+HappyEyeballsConnectionAttempt::OnLookupComplete(nsICancelable* request,
+                                                 nsIDNSRecord* rec,
+                                                 nsresult status) {
+  LOG(("HappyEyeballsConnectionAttempt::OnLookupComplete"));
+
+  if (mFirstConnectionStart.IsNull()) {
+    mDnsResolutionEnd = TimeStamp::Now();
+  }
+
+  if (!request) {
+    return NS_OK;
+  }
+
+  RefPtr<DnsRequestInfo> info = mDnsRequestTable.Get(request);
+  if (!info) {
+    LOG(("OnLookupComplete: Unknown DNS request"));
+    return NS_OK;
+  }
+
+  uint64_t id = info->Id();
+  happy_eyeballs::DnsRecordType type = info->Type();
+  mDnsRequestTable.Remove(request);
+
+  switch (type) {
+    case happy_eyeballs::DnsRecordType::A:
+      return OnARecord(rec, status, id);
+    case happy_eyeballs::DnsRecordType::Aaaa:
+      return OnAAAARecord(rec, status, id);
+    case happy_eyeballs::DnsRecordType::Https:
+      return OnHTTPSRecord(rec, status, id);
+  }
+
+  return NS_OK;
+}
+
+nsresult HappyEyeballsConnectionAttempt::OnARecord(nsIDNSRecord* aRecord,
+                                                   nsresult status,
+                                                   uint64_t aId) {
+  LOG(("HappyEyeballsConnectionAttempt::OnARecord: this=%p status %" PRIx32
+       " id=%" PRIu64,
+       this, static_cast<uint32_t>(status), aId));
+  if (NS_SUCCEEDED(status)) {
+    MaybeSendTransportStatus(NS_NET_STATUS_RESOLVED_HOST);
+  } else if (NS_FAILED(status)) {
+    mLastDnsError = status;
+  }
+
+
+  nsCOMPtr<nsIDNSAddrRecord> addrRecord = do_QueryInterface(aRecord);
+  if (addrRecord) {
+    mDnsMetadata.Fill(addrRecord);
+    if (mTransaction && !mTRRInfoForwarded) {
+      mTransaction->SetTRRInfo(mDnsMetadata.mEffectiveTRRMode,
+                               mDnsMetadata.mTrrSkipReason);
+      mTRRInfoForwarded = true;
+    }
+  }
+
+  nsresult rv;
+  if (NS_FAILED(status) || !addrRecord) {
+    if (mOriginDnsLookupIds.Contains(aId)) {
+      mOriginDnsLookupIds.Remove(aId);
+      MaybeBuildOriginCoalescingKeys();
+    }
+    nsTArray<NetAddr> emptyArray;
+    rv =
+        happy_eyeballs_process_dns_response_a(mHappyEyeballs, aId, &emptyArray);
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+    return ProcessHappyEyeballsOutput();
+  }
+
+  nsTArray<NetAddr> addresses;
+  addrRecord->GetAddresses(addresses);
+
+  nsTArray<NetAddr> ipv4Addresses;
+  for (const auto& addr : addresses) {
+    if (addr.raw.family == AF_INET) {
+      LOG(("Addr=[%s]", addr.ToString().get()));
+      ipv4Addresses.AppendElement(addr);
+    }
+  }
+
+  if (mOriginDnsLookupIds.Contains(aId)) {
+    mOriginDnsLookupIds.Remove(aId);
+    mOriginAddresses.AppendElements(ipv4Addresses);
+    MaybeBuildOriginCoalescingKeys();
+  }
+
+  rv = happy_eyeballs_process_dns_response_a(mHappyEyeballs, aId,
+                                             &ipv4Addresses);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+  return ProcessHappyEyeballsOutput();
+}
+
+nsresult HappyEyeballsConnectionAttempt::OnAAAARecord(nsIDNSRecord* aRecord,
+                                                      nsresult status,
+                                                      uint64_t aId) {
+  LOG(("HappyEyeballsConnectionAttempt::OnAAAARecord: this=%p status %" PRIx32
+       " id=%" PRIu64,
+       this, static_cast<uint32_t>(status), aId));
+  if (NS_SUCCEEDED(status)) {
+    MaybeSendTransportStatus(NS_NET_STATUS_RESOLVED_HOST);
+  } else if (NS_FAILED(status)) {
+    mLastDnsError = status;
+  }
+
+
+  nsCOMPtr<nsIDNSAddrRecord> addrRecord = do_QueryInterface(aRecord);
+
+  nsresult rv;
+  if (NS_FAILED(status) || !addrRecord) {
+    if (mOriginDnsLookupIds.Contains(aId)) {
+      mOriginDnsLookupIds.Remove(aId);
+      MaybeBuildOriginCoalescingKeys();
+    }
+    nsTArray<NetAddr> emptyArray;
+    rv = happy_eyeballs_process_dns_response_aaaa(mHappyEyeballs, aId,
+                                                  &emptyArray);
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+    return ProcessHappyEyeballsOutput();
+  }
+
+  nsTArray<NetAddr> addresses;
+  addrRecord->GetAddresses(addresses);
+
+  nsTArray<NetAddr> ipv6Addresses;
+  for (const auto& addr : addresses) {
+    if (addr.raw.family == AF_INET6) {
+      LOG(("Addr=[%s]", addr.ToString().get()));
+      ipv6Addresses.AppendElement(addr);
+    }
+  }
+
+  if (mOriginDnsLookupIds.Contains(aId)) {
+    mOriginDnsLookupIds.Remove(aId);
+    mOriginAddresses.AppendElements(ipv6Addresses);
+    MaybeBuildOriginCoalescingKeys();
+  }
+
+  rv = happy_eyeballs_process_dns_response_aaaa(mHappyEyeballs, aId,
+                                                &ipv6Addresses);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+  return ProcessHappyEyeballsOutput();
+}
+
+void HappyEyeballsConnectionAttempt::MaybeBuildOriginCoalescingKeys() {
+  if (!mOriginDnsLookupIds.IsEmpty()) {
+    return;
+  }
+
+  if (mOriginAddresses.IsEmpty() ||
+      !StaticPrefs::network_http_http2_coalesce_hostnames() ||
+      (!StaticPrefs::network_http_http2_enabled() &&
+       !nsHttpHandler::IsHttp3Enabled())) {
+    return;
+  }
+
+  RefPtr<ConnectionEntry> entry(mEntry);
+  if (!entry) {
+    return;
+  }
+
+  if (mConnMgrDelegate->MaybeProcessCoalescingKeys(entry, mOriginAddresses,
+                                                   mConnInfo->IsHttp3())) {
+    mConnMgrDelegate->ProcessSpdyPendingQ(entry);
+  }
+}
+
+static Maybe<happy_eyeballs::HttpVersion> AlpnStringToProtocol(
+    const nsACString& aAlpn) {
+  if (aAlpn.EqualsLiteral("h3")) {
+    return Some(happy_eyeballs::HttpVersion::H3);
+  }
+  if (aAlpn.EqualsLiteral("h2")) {
+    return Some(happy_eyeballs::HttpVersion::H2);
+  }
+  if (aAlpn.EqualsLiteral("http/1.1")) {
+    return Some(happy_eyeballs::HttpVersion::H1);
+  }
+  return Nothing();
+}
+
+nsresult HappyEyeballsConnectionAttempt::OnHTTPSRecord(nsIDNSRecord* aRecord,
+                                                       nsresult status,
+                                                       uint64_t aId) {
+  LOG(("HappyEyeballsConnectionAttempt::OnHTTPSRecord %p status=%x id=%" PRIu64,
+       this, static_cast<uint32_t>(status), aId));
+  nsCOMPtr<nsIDNSHTTPSSVCRecord> httpsRecord = do_QueryInterface(aRecord);
+  if (!httpsRecord || NS_FAILED(status)) {
+    nsTArray<happy_eyeballs::ServiceInfo> emptyArray;
+    (void)happy_eyeballs_process_dns_response_https(
+        mHappyEyeballs, aId, &emptyArray);
+    return ProcessHappyEyeballsOutput();
+  }
+
+  bool httpsIsTRR = false;
+  (void)httpsRecord->IsTRR(&httpsIsTRR);
+  if (httpsIsTRR) {
+    mDnsMetadata.mIsTRR = true;
+    mDnsMetadata.mEffectiveTRRMode =
+        static_cast<nsIRequest::TRRMode>(StaticPrefs::network_trr_mode());
+    mDnsMetadata.mTrrSkipReason = nsITRRSkipReason::TRR_OK;
+    if (mTransaction && !mTRRInfoForwarded) {
+      mTransaction->SetTRRInfo(mDnsMetadata.mEffectiveTRRMode,
+                               mDnsMetadata.mTrrSkipReason);
+      mTRRInfoForwarded = true;
+    }
+  }
+
+  nsTArray<RefPtr<nsISVCBRecord>> svcbRecords;
+  (void)httpsRecord->GetRecords(svcbRecords);
+  if (svcbRecords.IsEmpty()) {
+    nsTArray<happy_eyeballs::ServiceInfo> emptyArray;
+    (void)happy_eyeballs_process_dns_response_https(mHappyEyeballs, aId,
+                                                    &emptyArray);
+    return ProcessHappyEyeballsOutput();
+  }
+
+  nsTArray<happy_eyeballs::ServiceInfo> serviceInfos;
+
+  for (const auto& svcbRecord : svcbRecords) {
+    happy_eyeballs::ServiceInfo svcInfo;
+    (void)svcbRecord->GetPriority(&svcInfo.priority);
+    (void)svcbRecord->GetName(svcInfo.target_name);
+    svcInfo.port = svcbRecord->GetPort().valueOr(0);
+
+    nsTArray<RefPtr<nsISVCParam>> values;
+    (void)svcbRecord->GetValues(values);
+
+    nsTArray<nsCString> alpn;
+    bool noDefaultAlpn = false;
+    nsTArray<RefPtr<nsINetAddr>> ipv4Hint;
+    nsTArray<RefPtr<nsINetAddr>> ipv6Hint;
+
+    for (const auto& value : values) {
+      uint16_t type;
+      (void)value->GetType(&type);
+      switch (type) {
+        case SvcParamKeyAlpn: {
+          nsCOMPtr<nsISVCParamAlpn> alpnParam = do_QueryInterface(value);
+          (void)alpnParam->GetAlpn(alpn);
+          break;
+        }
+        case SvcParamKeyNoDefaultAlpn:
+          noDefaultAlpn = true;
+          break;
+        case SvcParamKeyIpv4Hint: {
+          nsCOMPtr<nsISVCParamIPv4Hint> ipv4Param = do_QueryInterface(value);
+          (void)ipv4Param->GetIpv4Hint(ipv4Hint);
+          break;
+        }
+        case SvcParamKeyIpv6Hint: {
+          nsCOMPtr<nsISVCParamIPv6Hint> ipv6Param = do_QueryInterface(value);
+          (void)ipv6Param->GetIpv6Hint(ipv6Hint);
+          break;
+        }
+        case SvcParamKeyEchConfig: {
+          nsCOMPtr<nsISVCParamEchConfig> echConfigParam =
+              do_QueryInterface(value);
+          nsCString echConfig;
+          (void)echConfigParam->GetEchconfig(echConfig);
+          svcInfo.ech_config.AppendElements(
+              reinterpret_cast<const uint8_t*>(echConfig.BeginReading()),
+              echConfig.Length());
+          break;
+        }
+        default:
+          break;
+      }
+    }
+
+    for (const auto& alpnStr : alpn) {
+      auto protocol = AlpnStringToProtocol(alpnStr);
+      if (protocol) {
+        svcInfo.alpn_http_versions.AppendElement(protocol.ref());
+      }
+    }
+
+    if (!noDefaultAlpn &&
+        !svcInfo.alpn_http_versions.Contains(happy_eyeballs::HttpVersion::H1)) {
+      svcInfo.alpn_http_versions.AppendElement(happy_eyeballs::HttpVersion::H1);
+    }
+
+    for (const auto& addr : ipv4Hint) {
+      NetAddr netAddr;
+      addr->GetNetAddr(&netAddr);
+      svcInfo.ipv4_hints.AppendElement(netAddr);
+    }
+
+    for (const auto& addr : ipv6Hint) {
+      NetAddr netAddr;
+      addr->GetNetAddr(&netAddr);
+      svcInfo.ipv6_hints.AppendElement(netAddr);
+    }
+
+    serviceInfos.AppendElement(std::move(svcInfo));
+  }
+
+  (void)happy_eyeballs_process_dns_response_https(mHappyEyeballs, aId,
+                                                  &serviceInfos);
+  return ProcessHappyEyeballsOutput();
+}
+
+NS_IMETHODIMP  
+HappyEyeballsConnectionAttempt::Notify(nsITimer* timer) {
+  return ProcessHappyEyeballsOutput();
+}
+
+NS_IMETHODIMP  
+HappyEyeballsConnectionAttempt::GetName(nsACString& aName) {
+  aName.AssignLiteral("HappyEyeballsConnectionAttempt");
+  return NS_OK;
+}
+
+void HappyEyeballsConnectionAttempt::SetupTimer(uint64_t aTimeout) {
+  if (!aTimeout) {
+    MOZ_ASSERT(false, "aTimeout should not be 0");
+    return;
+  }
+
+  LOG(("HappyEyeballsConnectionAttempt::SetupTimer to %" PRIu64 "ms [this=%p].",
+       aTimeout, this));
+
+  if (!mTimer) {
+    mTimer = NS_NewTimer();
+  }
+
+  DebugOnly<nsresult> rv =
+      mTimer->InitWithCallback(this, aTimeout, nsITimer::TYPE_ONE_SHOT);
+  MOZ_ASSERT(NS_SUCCEEDED(rv));
+}
+
+}  

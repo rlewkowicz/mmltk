@@ -1,0 +1,75 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_MEDIA_DRIFTCONTROL_DRIFTCONTROLLER_H_
+#define DOM_MEDIA_DRIFTCONTROL_DRIFTCONTROLLER_H_
+
+#include <cstdint>
+
+#include "MediaSegment.h"
+#include "TimeUnits.h"
+#include "mozilla/RollingMean.h"
+
+namespace mozilla {
+
+class DriftController final {
+ public:
+  DriftController(uint32_t aSourceRate, uint32_t aTargetRate,
+                  media::TimeUnit aDesiredBuffering);
+
+  void SetDesiredBuffering(media::TimeUnit aDesiredBuffering);
+
+  void ResetAfterUnderrun();
+
+  uint32_t GetCorrectedSourceRate() const;
+
+  uint32_t NumCorrectionChanges() const { return mNumCorrectionChanges; }
+
+  media::TimeUnit DurationNearDesired() const { return mDurationNearDesired; }
+
+  media::TimeUnit DurationSinceDesiredBufferingChange() const {
+    return mTotalTargetClock - mLastDesiredBufferingChangeTime;
+  }
+
+  media::TimeUnit MeasuredSourceLatency() const {
+    return mMeasuredSourceLatency.mean();
+  }
+
+  void UpdateClock(media::TimeUnit aSourceDuration,
+                   media::TimeUnit aTargetDuration, uint32_t aBufferedFrames,
+                   uint32_t aBufferSize);
+
+ private:
+  int64_t NearThreshold() const;
+  void CalculateCorrection(uint32_t aBufferedFrames, uint32_t aBufferSize);
+
+ public:
+  const uint8_t mPlotId;
+  const uint32_t mSourceRate;
+  const uint32_t mTargetRate;
+  const media::TimeUnit mAdjustmentInterval = media::TimeUnit::FromSeconds(1);
+
+ private:
+  media::TimeUnit mDesiredBuffering;
+  float mCorrectedSourceRate;
+  media::TimeUnit mDurationNearDesired;
+  uint32_t mNumCorrectionChanges = 0;
+  double mInputDurationAvg = 0.0;
+  double mOutputDurationAvg = 0.0;
+  double mDriftEstimate = 1.0;
+  double mStage1Drift = 1.0;
+  double mAvgBufferedFramesEst = 0.0;
+  double mStage1Buffered = 0.0;
+  bool mIsHandlingUnderrun = true;
+  RollingMean<media::TimeUnit, media::TimeUnit> mMeasuredSourceLatency;
+  RollingMean<media::TimeUnit, media::TimeUnit> mMeasuredTargetLatency;
+
+  media::TimeUnit mTargetClock;
+  media::TimeUnit mTotalTargetClock;
+  media::TimeUnit mTargetClockAfterLastSourcePacket;
+  media::TimeUnit mLastDesiredBufferingChangeTime;
+};
+
+}  
+#endif  // DOM_MEDIA_DRIFTCONTROL_DRIFTCONTROLLER_H_

@@ -1,0 +1,59 @@
+/*
+ * Copyright 2006 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkBlurMask_DEFINED)
+#define SkBlurMask_DEFINED
+
+#include "include/core/SkPoint.h"
+#include "include/core/SkScalar.h"
+#include "include/core/SkTypes.h"
+#include "src/core/SkMask.h"
+
+#include <cstdint>
+
+class SkRRect;
+enum SkBlurStyle : int;
+struct SkRect;
+
+class SkBlurMask {
+public:
+    [[nodiscard]] static bool BlurRect(SkScalar sigma, SkMaskBuilder *dst, const SkRect &src,
+                                       SkBlurStyle, SkIVector *margin = nullptr,
+                                       SkMaskBuilder::CreateMode createMode =
+                                           SkMaskBuilder::kComputeBoundsAndRenderImage_CreateMode);
+    [[nodiscard]] static bool BlurRRect(SkScalar sigma, SkMaskBuilder *dst, const SkRRect &src,
+                                        SkBlurStyle, SkIVector *margin = nullptr,
+                                        SkMaskBuilder::CreateMode createMode =
+                                            SkMaskBuilder::kComputeBoundsAndRenderImage_CreateMode);
+
+
+    [[nodiscard]] static bool BoxBlur(SkMaskBuilder* dst,
+                                      const SkMask& src,
+                                      SkScalar sigma,
+                                      SkBlurStyle style,
+                                      SkIVector* margin = nullptr);
+
+    [[nodiscard]] static bool BlurGroundTruth(SkScalar sigma,
+                                              SkMaskBuilder* dst,
+                                              const SkMask& src,
+                                              SkBlurStyle,
+                                              SkIVector* margin = nullptr);
+
+    static SkScalar SK_SPI ConvertRadiusToSigma(SkScalar radius);
+    static SkScalar SK_SPI ConvertSigmaToRadius(SkScalar sigma);
+
+
+    static uint8_t ProfileLookup(const uint8_t* profile, int loc, int blurredWidth, int sharpWidth);
+
+    static void ComputeBlurProfile(uint8_t* profile, int size, SkScalar sigma);
+
+
+    static void ComputeBlurredScanline(uint8_t* pixels, const uint8_t* profile,
+                                       unsigned int width, SkScalar sigma);
+};
+
+#endif

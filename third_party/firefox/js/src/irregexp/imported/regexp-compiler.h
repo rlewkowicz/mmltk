@@ -1,0 +1,578 @@
+// Copyright 2019 the V8 project authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(V8_REGEXP_REGEXP_COMPILER_H_)
+#define V8_REGEXP_REGEXP_COMPILER_H_
+
+#include <bitset>
+
+#include "irregexp/imported/regexp-nodes.h"
+#include "irregexp/RegExpShim.h"
+
+namespace v8 {
+namespace internal {
+
+class Isolate;
+
+namespace regexp {
+
+class Diagnostics;
+class DynamicBitSet;
+class SpecialLoopState;
+
+namespace compiler_constants {
+
+constexpr base::uc32 kRangeEndMarker = 0x110000;
+constexpr int kSpaceRanges[] = {
+    '\t',   '\r' + 1, ' ',    ' ' + 1, 0x00A0, 0x00A1, 0x1680,
+    0x1681, 0x2000,   0x200B, 0x2028,  0x202A, 0x202F, 0x2030,
+    0x205F, 0x2060,   0x3000, 0x3001,  0xFEFF, 0xFF00, kRangeEndMarker};
+constexpr int kSpaceRangeCount = arraysize(kSpaceRanges);
+
+constexpr int kWordRanges[] = {'0',     '9' + 1, 'A',     'Z' + 1,        '_',
+                               '_' + 1, 'a',     'z' + 1, kRangeEndMarker};
+constexpr int kWordRangeCount = arraysize(kWordRanges);
+constexpr int kDigitRanges[] = {'0', '9' + 1, kRangeEndMarker};
+constexpr int kDigitRangeCount = arraysize(kDigitRanges);
+constexpr int kSurrogateRanges[] = {kLeadSurrogateStart,
+                                    kLeadSurrogateStart + 1, kRangeEndMarker};
+constexpr int kSurrogateRangeCount = arraysize(kSurrogateRanges);
+constexpr int kLineTerminatorRanges[] = {0x000A, 0x000B, 0x000D,         0x000E,
+                                         0x2028, 0x202A, kRangeEndMarker};
+constexpr int kLineTerminatorRangeCount = arraysize(kLineTerminatorRanges);
+
+constexpr uint32_t kMaxLookaheadForBoyerMoore = 8;
+constexpr uint32_t kPatternTooShortForBoyerMoore = 2;
+
+}  
+
+inline bool NeedsUnicodeCaseEquivalents(Flags flags) {
+  return IsEitherUnicode(flags) && IsIgnoreCase(flags);
+}
+
+class QuickCheckDetails {
+ public:
+  QuickCheckDetails() : characters_(0), mask_(0), value_(0) {}
+  explicit QuickCheckDetails(int characters)
+      : characters_(characters), mask_(0), value_(0) {
+    DCHECK_LE(characters, kMaxPositions);
+  }
+  bool Rationalize(bool one_byte);
+  void Merge(QuickCheckDetails* other, int from_index);
+  void Advance(int by, bool one_byte);
+  void Clear();
+  bool cannot_match() const {
+    for (int i = 0; i < characters(); i++) {
+      if (positions_[i].cannot_match) return true;
+    }
+    return false;
+  }
+  void set_cannot_match_from(int index) {
+    DCHECK_GE(index, 0);
+    for (int i = index; i < characters(); i++) {
+      positions_[i].cannot_match = true;
+    }
+  }
+  struct Position {
+    Position()
+        : mask(0), value(0), determines_perfectly(false), cannot_match(false) {}
+    void Clear() {
+      mask = 0;
+      value = 0;
+      determines_perfectly = false;
+      cannot_match = false;
+    }
+    base::uc32 mask;
+    base::uc32 value;
+    bool determines_perfectly;
+    bool cannot_match;
+  };
+  int characters() const { return characters_; }
+  void set_characters(int characters) {
+    DCHECK(0 <= characters && characters <= kMaxPositions);
+    characters_ = characters;
+  }
+  Position* positions(int index) {
+    DCHECK_LE(0, index);
+    DCHECK_GT(characters_, index);
+    return positions_ + index;
+  }
+  const Position* positions(int index) const {
+    DCHECK_LE(0, index);
+    DCHECK_GT(characters_, index);
+    return positions_ + index;
+  }
+  uint32_t mask() { return mask_; }
+  uint32_t value() { return value_; }
+
+ private:
+  static constexpr int kMaxPositions = 4;
+  int characters_;
+  Position positions_[kMaxPositions];
+  uint32_t mask_;
+  uint32_t value_;
+};
+
+enum ContainedInLattice {
+  kNotYet = 0,
+  kLatticeIn = 1,
+  kLatticeOut = 2,
+  kLatticeUnknown = 3  
+};
+
+inline ContainedInLattice Combine(ContainedInLattice a, ContainedInLattice b) {
+  return static_cast<ContainedInLattice>(a | b);
+}
+
+class BoyerMoorePositionInfo : public ZoneObject {
+ public:
+  bool at(int i) const { return map_[i]; }
+
+  static constexpr int kMapSize = 128;
+  static constexpr int kMask = kMapSize - 1;
+
+  int map_count() const { return map_count_; }
+
+  void Set(int character);
+  void SetInterval(const Interval& interval);
+  void SetAll();
+
+  bool is_non_word() { return w_ == kLatticeOut; }
+  bool is_word() { return w_ == kLatticeIn; }
+
+  using Bitset = std::bitset<kMapSize>;
+  Bitset raw_bitset() const { return map_; }
+
+ private:
+  Bitset map_;
+  int map_count_ = 0;               
+  ContainedInLattice w_ = kNotYet;  
+};
+
+class BoyerMooreLookahead : public ZoneObject {
+ public:
+  BoyerMooreLookahead(int length, Compiler* compiler, Zone* zone);
+
+  int length() const { return length_; }
+  int max_char() { return max_char_; }
+  Compiler* compiler() { return compiler_; }
+
+  int Count(int map_number) { return bitmaps_->at(map_number)->map_count(); }
+
+  BoyerMoorePositionInfo* at(int i) { return bitmaps_->at(i); }
+  const BoyerMoorePositionInfo* at(int i) const { return bitmaps_->at(i); }
+
+  void Set(int map_number, int character) {
+    if (character > max_char_) return;
+    BoyerMoorePositionInfo* info = bitmaps_->at(map_number);
+    info->Set(character);
+  }
+
+  void SetInterval(int map_number, const Interval& interval) {
+    if (interval.from() > max_char_) return;
+    BoyerMoorePositionInfo* info = bitmaps_->at(map_number);
+    if (interval.to() > max_char_) {
+      info->SetInterval(Interval(interval.from(), max_char_));
+    } else {
+      info->SetInterval(interval);
+    }
+  }
+
+  void SetAll(int map_number) { bitmaps_->at(map_number)->SetAll(); }
+
+  void SetRest(int from_map) {
+    for (int i = from_map; i < length_; i++) SetAll(i);
+  }
+  void EmitSkipInstructions(RegExpMacroAssembler* masm);
+
+ private:
+  int length_;
+  Compiler* compiler_;
+  int max_char_;
+  ZoneList<BoyerMoorePositionInfo*>* bitmaps_;
+
+  int GetSkipTable(
+      int min_lookahead, int max_lookahead,
+      DirectHandle<ByteArray> boolean_skip_table,
+      DirectHandle<ByteArray> nibble_table = DirectHandle<ByteArray>{});
+  bool FindWorthwhileInterval(int* from, int* to);
+  int FindBestInterval(int max_number_of_chars, int old_biggest_points,
+                       int* from, int* to);
+};
+
+class Trace {
+ public:
+  enum TriBool { FALSE_VALUE = 0, TRUE_VALUE = 1, UNKNOWN = 2 };
+
+  Trace()
+      : cp_offset_(0),
+        flush_budget_(100),  
+        flags_(AtStartField::encode(UNKNOWN) |
+               HasAnyActionsField::encode(false)),
+        action_(nullptr),
+        backtrack_(nullptr),
+        special_loop_state_(nullptr),
+        characters_preloaded_(0),
+        bound_checked_up_to_(0),
+        next_(nullptr) {}
+
+  Trace(const Trace& other) V8_NOEXCEPT
+      : cp_offset_(other.cp_offset_),
+        flush_budget_(other.flush_budget_),
+        flags_(other.flags_),
+        action_(nullptr),
+        backtrack_(other.backtrack_),
+        special_loop_state_(other.special_loop_state_),
+        characters_preloaded_(other.characters_preloaded_),
+        bound_checked_up_to_(other.bound_checked_up_to_),
+        quick_check_performed_(other.quick_check_performed_),
+        next_(&other) {}
+
+  enum FlushMode {
+    kFlushFull,
+    kFlushSuccess
+  };
+  EmitResult Flush(Compiler* compiler, Node* successor,
+                   FlushMode mode = kFlushFull);
+
+  static constexpr int kCPOffsetSlack = 1;
+  int cp_offset() const { return cp_offset_; }
+
+  bool has_any_actions() const { return HasAnyActionsField::decode(flags_); }
+  bool has_action() const { return action_ != nullptr; }
+  ActionNode* action() const { return action_; }
+  bool is_trivial() const {
+    return backtrack_ == nullptr && !has_any_actions() && cp_offset_ == 0 &&
+           characters_preloaded_ == 0 && bound_checked_up_to_ == 0 &&
+           quick_check_performed_.characters() == 0 && at_start() == UNKNOWN;
+  }
+  TriBool at_start() const { return AtStartField::decode(flags_); }
+  void set_at_start(TriBool at_start) {
+    flags_ = AtStartField::update(flags_, at_start);
+  }
+  Label* backtrack() const { return backtrack_; }
+  SpecialLoopState* special_loop_state() const { return special_loop_state_; }
+  int characters_preloaded() const { return characters_preloaded_; }
+  int bound_checked_up_to() const { return bound_checked_up_to_; }
+  int flush_budget() const { return flush_budget_; }
+  QuickCheckDetails* quick_check_performed() { return &quick_check_performed_; }
+  bool mentions_reg(int reg) const;
+  bool GetStoredPosition(int reg, int* cp_offset) const;
+  void add_action(ActionNode* new_action) {
+    DCHECK(action_ == nullptr);  
+    action_ = new_action;
+    flags_ = HasAnyActionsField::update(flags_, true);
+  }
+  void set_backtrack(Label* backtrack) { backtrack_ = backtrack; }
+  void set_special_loop_state(SpecialLoopState* state) {
+    special_loop_state_ = state;
+  }
+  void set_characters_preloaded(int count) { characters_preloaded_ = count; }
+  void set_bound_checked_up_to(int to) { bound_checked_up_to_ = to; }
+  void set_flush_budget(int to) {
+    DCHECK(to <= UINT16_MAX);  
+    flush_budget_ = to;
+  }
+  void set_quick_check_performed(QuickCheckDetails* d) {
+    quick_check_performed_ = *d;
+  }
+  void InvalidateCurrentCharacter();
+  EmitResult AdvanceCurrentPositionInTrace(int by, Compiler* compiler);
+  const Trace* next() const { return next_; }
+
+  class V8_GSL_POINTER ConstIterator final {
+   public:
+    ConstIterator& operator++() {
+      trace_ = trace_->next();
+      return *this;
+    }
+    bool operator==(const ConstIterator& other) const {
+      return trace_ == other.trace_;
+    }
+    const Trace* operator*() const { return trace_; }
+
+   private:
+    explicit ConstIterator(const Trace* trace) : trace_(trace) {}
+
+    const Trace* trace_;
+
+    friend class Trace;
+  };
+
+  ConstIterator begin() const { return ConstIterator(this); }
+  ConstIterator end() const { return ConstIterator(nullptr); }
+
+ private:
+  enum DeferredActionUndoType { IGNORE, RESTORE, CLEAR };
+  static constexpr int kNoStore = kMinInt;
+  struct RegisterFlushInfo {
+    DeferredActionUndoType undo_action = IGNORE;
+    int value = 0;
+    bool absolute = false;  
+    bool clear = false;     
+    int store_position =
+        kNoStore;  
+  };
+
+  int FindAffectedRegisters(DynamicBitSet* affected_registers, Zone* zone);
+  void PerformDeferredActions(RegExpMacroAssembler* macro, int max_register,
+                              const DynamicBitSet& affected_registers,
+                              DynamicBitSet* registers_to_pop,
+                              DynamicBitSet* registers_to_clear, Zone* zone);
+  void RestoreAffectedRegisters(RegExpMacroAssembler* macro, int max_register,
+                                const DynamicBitSet& registers_to_pop,
+                                const DynamicBitSet& registers_to_clear);
+  void ScanDeferredActions(Trace* top, int reg, RegisterFlushInfo* info);
+
+  using AtStartField = base::BitField<TriBool, 0, 2>;
+  using HasAnyActionsField = AtStartField::Next<bool, 1>;
+
+  int cp_offset_;
+  uint16_t flush_budget_;
+  uint32_t flags_;
+  ActionNode* action_;
+  Label* backtrack_;
+  SpecialLoopState* special_loop_state_;
+  int characters_preloaded_;
+  int bound_checked_up_to_;
+  QuickCheckDetails quick_check_performed_;
+  const Trace* next_;
+};
+
+class SpecialLoopState {
+ public:
+  explicit SpecialLoopState(bool not_at_start, ChoiceNode* loop_choice_node);
+
+  void BindStepLabel(RegExpMacroAssembler* macro_assembler);
+  void BindLoopTopLabel(RegExpMacroAssembler* macro_assembler);
+  void GoToLoopTopLabel(RegExpMacroAssembler* macro_assembler);
+  ChoiceNode* loop_choice_node() const { return loop_choice_node_; }
+  Trace* backtrack_trace() { return &backtrack_trace_; }
+
+ private:
+  Label step_label_;
+  Label loop_top_label_;
+  ChoiceNode* loop_choice_node_;
+  Trace backtrack_trace_;
+};
+
+struct PreloadState {
+  static constexpr int kEatsAtLeastNotYetInitialized = -1;
+  bool preload_is_current_;
+  bool preload_has_checked_bounds_;
+  int preload_characters_;
+  int eats_at_least_;
+  void init() { eats_at_least_ = kEatsAtLeastNotYetInitialized; }
+};
+
+Error AnalyzeRegExp(Isolate* isolate, bool is_one_byte, Flags flags,
+                    Node* node);
+
+class FrequencyCollator {
+ public:
+  FrequencyCollator() : total_samples_(0) {
+    for (int i = 0; i < RegExpMacroAssembler::kTableSize; i++) {
+      frequencies_[i] = CharacterFrequency(i);
+    }
+  }
+
+  void CountCharacter(int character) {
+    int index = (character & RegExpMacroAssembler::kTableMask);
+    frequencies_[index].Increment();
+    total_samples_++;
+  }
+
+  int Frequency(int in_character) {
+    DCHECK((in_character & RegExpMacroAssembler::kTableMask) == in_character);
+    if (total_samples_ < 1) return 1;  
+    int freq_in_per128 =
+        (frequencies_[in_character].counter() * 128) / total_samples_;
+    return freq_in_per128;
+  }
+
+ private:
+  class CharacterFrequency {
+   public:
+    CharacterFrequency() : counter_(0), character_(-1) {}
+    explicit CharacterFrequency(int character)
+        : counter_(0), character_(character) {}
+
+    void Increment() { counter_++; }
+    int counter() { return counter_; }
+    int character() { return character_; }
+
+   private:
+    int counter_;
+    int character_;
+  };
+
+ private:
+  CharacterFrequency frequencies_[RegExpMacroAssembler::kTableSize];
+  int total_samples_;
+};
+
+class V8_EXPORT_PRIVATE Compiler {
+ public:
+  Compiler(Isolate* isolate, Zone* zone, int capture_count, Flags flags,
+           bool is_one_byte);
+
+  int AllocateRegister() {
+    if (next_register_ >= RegExpMacroAssembler::kMaxRegister) {
+      reg_exp_too_big_ = true;
+      return next_register_;
+    }
+    return next_register_++;
+  }
+
+  int UnicodeLookaroundStackRegister() {
+    if (unicode_lookaround_stack_register_ == kNoRegister) {
+      unicode_lookaround_stack_register_ = AllocateRegister();
+    }
+    return unicode_lookaround_stack_register_;
+  }
+
+  int UnicodeLookaroundPositionRegister() {
+    if (unicode_lookaround_position_register_ == kNoRegister) {
+      unicode_lookaround_position_register_ = AllocateRegister();
+    }
+    return unicode_lookaround_position_register_;
+  }
+
+  struct CompilationResult final {
+    explicit CompilationResult(Error err) : error(err) {}
+    CompilationResult(DirectHandle<Object> code, int registers)
+        : code(code), num_registers(registers) {}
+
+    static CompilationResult RegExpTooBig() {
+      return CompilationResult(Error::kTooLarge);
+    }
+
+    bool Succeeded() const { return error == Error::kNone; }
+
+    const Error error = Error::kNone;
+    DirectHandle<Object> code;
+    int num_registers = 0;
+  };
+
+  CompilationResult Assemble(Isolate* isolate, RegExpMacroAssembler* assembler,
+                             Node* start, int capture_count,
+                             DirectHandle<RegExpData> re_data);
+
+  Node* PreprocessRegExp(CompileData* data, bool is_one_byte);
+
+  Node* OptionallyStepBackToLeadSurrogate(Node* on_success);
+
+  inline void AddWork(Node* node) {
+    if (!node->on_work_list() && !node->label()->is_bound()) {
+      node->set_on_work_list(true);
+      work_list_->push_back(node);
+    }
+  }
+
+  static const int kImplementationOffset = 0;
+  static const int kNumberOfRegistersOffset = 0;
+  static const int kCodeOffset = 1;
+
+  RegExpMacroAssembler* macro_assembler() { return macro_assembler_; }
+  EndNode* accept() { return accept_; }
+
+  static constexpr int kMaxRecursion = 100;
+  inline int recursion_depth() { return recursion_depth_; }
+  inline void IncrementRecursionDepth() { recursion_depth_++; }
+  inline void DecrementRecursionDepth() { recursion_depth_--; }
+
+  inline Flags flags() const { return flags_; }
+  inline void set_flags(Flags flags) { flags_ = flags; }
+
+  void SetRegExpTooBig() { reg_exp_too_big_ = true; }
+  bool IsRegExpTooBig() const { return reg_exp_too_big_; }
+
+  inline bool one_byte() { return one_byte_; }
+  inline bool optimize() { return optimize_; }
+  inline void set_optimize(bool value) { optimize_ = value; }
+  inline bool limiting_recursion() { return limiting_recursion_; }
+  inline void set_limiting_recursion(bool value) {
+    limiting_recursion_ = value;
+  }
+  bool read_backward() { return read_backward_; }
+  void set_read_backward(bool value) { read_backward_ = value; }
+  FrequencyCollator* frequency_collator() { return &frequency_collator_; }
+
+  int current_expansion_factor() { return current_expansion_factor_; }
+  void set_current_expansion_factor(int value) {
+    current_expansion_factor_ = value;
+  }
+
+  void ToNodeMaybeCheckForStackOverflow() {
+    if ((to_node_overflow_check_ticks_++ % 64 == 0)) {
+      ToNodeCheckForStackOverflow();
+    }
+  }
+  void ToNodeCheckForStackOverflow();
+
+#if defined(V8_ENABLE_REGEXP_DIAGNOSTICS)
+  Diagnostics* diagnostics() { return diagnostics_.get(); }
+  void set_diagnostics(std::unique_ptr<Diagnostics> diagnostics);
+#endif
+  Isolate* isolate() const { return isolate_; }
+  Zone* zone() const { return zone_; }
+
+  static const int kNoRegister = -1;
+
+ private:
+  EndNode* accept_;
+  int next_register_;
+  int unicode_lookaround_stack_register_;
+  int unicode_lookaround_position_register_;
+  ZoneVector<Node*>* work_list_;
+  int recursion_depth_;
+  Flags flags_;
+  RegExpMacroAssembler* macro_assembler_;
+  bool one_byte_;
+  bool reg_exp_too_big_;
+  bool limiting_recursion_;
+  int to_node_overflow_check_ticks_ = 0;
+  bool optimize_;
+  bool read_backward_;
+  int current_expansion_factor_;
+  FrequencyCollator frequency_collator_;
+#if defined(V8_ENABLE_REGEXP_DIAGNOSTICS)
+  std::unique_ptr<Diagnostics> diagnostics_;
+#endif
+  Isolate* isolate_;
+  Zone* zone_;
+};
+
+class UnicodeRangeSplitter {
+ public:
+  V8_EXPORT_PRIVATE UnicodeRangeSplitter(ZoneList<CharacterRange>* base);
+
+  static constexpr int kInitialSize = 8;
+  using CharacterRangeVector = base::SmallVector<CharacterRange, kInitialSize>;
+
+  const CharacterRangeVector* bmp() const { return &bmp_; }
+  const CharacterRangeVector* lead_surrogates() const {
+    return &lead_surrogates_;
+  }
+  const CharacterRangeVector* trail_surrogates() const {
+    return &trail_surrogates_;
+  }
+  const CharacterRangeVector* non_bmp() const { return &non_bmp_; }
+
+ private:
+  void AddRange(CharacterRange range);
+
+  CharacterRangeVector bmp_;
+  CharacterRangeVector lead_surrogates_;
+  CharacterRangeVector trail_surrogates_;
+  CharacterRangeVector non_bmp_;
+};
+
+bool RangeContainsLatin1Equivalents(CharacterRange range);
+
+}  
+}  
+}  
+
+#endif

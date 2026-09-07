@@ -1,0 +1,61 @@
+// Copyright 2016 The ANGLE Project Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(COMPILER_TRANSLATOR_TREEUTIL_INTERMNODEPATTERNMATCHER_H_)
+#define COMPILER_TRANSLATOR_TREEUTIL_INTERMNODEPATTERNMATCHER_H_
+
+namespace sh
+{
+
+class TIntermAggregate;
+class TIntermBinary;
+class TIntermDeclaration;
+class TIntermNode;
+class TIntermTernary;
+class TIntermUnary;
+
+class IntermNodePatternMatcher
+{
+  public:
+    static bool IsDynamicIndexingOfNonSSBOVectorOrMatrix(TIntermBinary *node);
+    static bool IsDynamicIndexingOfVectorOrMatrix(TIntermBinary *node);
+    static bool IsDynamicIndexingOfSwizzledVector(TIntermBinary *node);
+
+    enum PatternType : unsigned int
+    {
+        kUnfoldedShortCircuitExpression = 1u << 0u,
+
+        kExpressionReturningArray = 1u << 1u,
+
+        kDynamicIndexingOfVectorOrMatrixInLValue = 1u << 2u,
+
+        kMultiDeclaration = 1u << 3u,
+
+        kArrayDeclaration = 1u << 4u,
+
+        kNamelessStructDeclaration = 1u << 5u,
+
+        kArrayLengthMethod = 1u << 6u,
+    };
+    IntermNodePatternMatcher(const unsigned int mask);
+
+    bool match(TIntermUnary *node) const;
+
+    bool match(TIntermBinary *node, TIntermNode *parentNode) const;
+
+    bool match(TIntermBinary *node, TIntermNode *parentNode, bool isLValueRequiredHere) const;
+
+    bool match(TIntermAggregate *node, TIntermNode *parentNode) const;
+    bool match(TIntermTernary *node) const;
+    bool match(TIntermDeclaration *node) const;
+
+  private:
+    const unsigned int mMask;
+
+    bool matchInternal(TIntermBinary *node, TIntermNode *parentNode) const;
+};
+
+}  
+
+#endif

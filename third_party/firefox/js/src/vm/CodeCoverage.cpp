@@ -1,0 +1,586 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "vm/CodeCoverage.h"
+
+#include "mozilla/Atomics.h"
+#include "mozilla/IntegerPrintfMacros.h"
+
+#include <stdio.h>
+#include <utility>
+
+#include "frontend/SourceNotes.h"  // SrcNote, SrcNoteType, SrcNoteIterator
+#include "gc/Zone.h"
+#include "util/GetPidProvider.h"  // getpid()
+#include "util/Text.h"
+#include "vm/BytecodeUtil.h"
+#include "vm/JSScript.h"
+#include "vm/Realm.h"
+#include "vm/Runtime.h"
+#include "vm/Time.h"
+
+namespace js {
+namespace coverage {
+
+LCovSource::LCovSource(LifoAlloc* alloc, UniqueChars name)
+    : name_(std::move(name)),
+      outFN_(alloc),
+      outFNDA_(alloc),
+      numFunctionsFound_(0),
+      numFunctionsHit_(0),
+      outBRDA_(alloc),
+      numBranchesFound_(0),
+      numBranchesHit_(0),
+      numLinesInstrumented_(0),
+      numLinesHit_(0),
+      maxLineHit_(0),
+      hasTopLevelScript_(false),
+      hadOOM_(false) {}
+
+void LCovSource::exportInto(GenericPrinter& out) {
+  if (hadOutOfMemory()) {
+    out.setPendingOutOfMemory();
+  } else {
+    out.printf("SF:%s\n", name_.get());
+
+    outFN_.exportInto(out);
+    outFNDA_.exportInto(out);
+    out.printf("FNF:%zu\n", numFunctionsFound_);
+    out.printf("FNH:%zu\n", numFunctionsHit_);
+
+    outBRDA_.exportInto(out);
+    out.printf("BRF:%zu\n", numBranchesFound_);
+    out.printf("BRH:%zu\n", numBranchesHit_);
+
+    if (!linesHit_.empty()) {
+      for (size_t lineno = 1; lineno <= maxLineHit_; ++lineno) {
+        if (auto p = linesHit_.lookup(lineno)) {
+          out.printf("DA:%zu,%" PRIu64 "\n", lineno, p->value());
+        }
+      }
+    }
+
+    out.printf("LF:%zu\n", numLinesInstrumented_);
+    out.printf("LH:%zu\n", numLinesHit_);
+
+    out.put("end_of_record\n");
+  }
+
+  outFN_.clear();
+  outFNDA_.clear();
+  numFunctionsFound_ = 0;
+  numFunctionsHit_ = 0;
+  outBRDA_.clear();
+  numBranchesFound_ = 0;
+  numBranchesHit_ = 0;
+  linesHit_.clear();
+  numLinesInstrumented_ = 0;
+  numLinesHit_ = 0;
+  maxLineHit_ = 0;
+}
+
+void LCovSource::writeScript(JSScript* script, const char* scriptName) {
+  if (hadOutOfMemory()) {
+    return;
+  }
+
+  numFunctionsFound_++;
+  outFN_.printf("FN:%u,%s\n", script->lineno(), scriptName);
+
+  uint64_t hits = 0;
+  ScriptCounts* sc = nullptr;
+  if (script->hasScriptCounts()) {
+    sc = &script->getScriptCounts();
+    numFunctionsHit_++;
+    const PCCounts* counts =
+        sc->maybeGetPCCounts(script->pcToOffset(script->main()));
+    outFNDA_.printf("FNDA:%" PRIu64 ",%s\n", counts->numExec(), scriptName);
+
+    hits = 1;
+  }
+
+  jsbytecode* snpc = script->code();
+  const SrcNote* sn = script->notes();
+  const SrcNote* snEnd = script->notesEnd();
+  if (sn < snEnd) {
+    snpc += sn->delta();
+  }
+
+  size_t lineno = script->lineno();
+  jsbytecode* end = script->codeEnd();
+  size_t branchId = 0;
+  bool firstLineHasBeenWritten = false;
+  for (jsbytecode* pc = script->code(); pc != end; pc = GetNextPc(pc)) {
+    MOZ_ASSERT(script->code() <= pc && pc < end);
+    JSOp op = JSOp(*pc);
+    bool jump = IsJumpOpcode(op) || op == JSOp::TableSwitch;
+    bool fallsthrough = BytecodeFallsThrough(op);
+
+    if (sc) {
+      const PCCounts* counts = sc->maybeGetPCCounts(script->pcToOffset(pc));
+      if (counts) {
+        hits = counts->numExec();
+      }
+    }
+
+    if (snpc <= pc || !firstLineHasBeenWritten) {
+      size_t oldLine = lineno;
+      SrcNoteIterator iter(sn, snEnd);
+      while (!iter.atEnd() && snpc <= pc) {
+        sn = *iter;
+        SrcNoteType type = sn->type();
+        if (type == SrcNoteType::SetLine) {
+          lineno = SrcNote::SetLine::getLine(sn, script->lineno());
+        } else if (type == SrcNoteType::SetLineColumn) {
+          lineno = SrcNote::SetLineColumn::getLine(sn, script->lineno());
+        } else if (type == SrcNoteType::NewLine ||
+                   type == SrcNoteType::NewLineColumn) {
+          lineno++;
+        }
+        ++iter;
+        if (!iter.atEnd()) {
+          snpc += (*iter)->delta();
+        }
+      }
+      sn = *iter;
+
+      if ((oldLine != lineno || !firstLineHasBeenWritten) &&
+          pc >= script->main() && fallsthrough) {
+        auto p = linesHit_.lookupForAdd(lineno);
+        if (!p) {
+          if (!linesHit_.add(p, lineno, hits)) {
+            hadOOM_ = true;
+            return;
+          }
+          numLinesInstrumented_++;
+          if (hits != 0) {
+            numLinesHit_++;
+          }
+          maxLineHit_ = std::max(lineno, maxLineHit_);
+        } else {
+          if (p->value() == 0 && hits != 0) {
+            numLinesHit_++;
+          }
+          p->value() += hits;
+        }
+
+        firstLineHasBeenWritten = true;
+      }
+    }
+
+    if (sc) {
+      const PCCounts* counts = sc->maybeGetThrowCounts(script->pcToOffset(pc));
+      if (counts) {
+        hits -= counts->numExec();
+      }
+    }
+
+    if (jump && fallsthrough) {
+      jsbytecode* fallthroughTarget = GetNextPc(pc);
+      uint64_t fallthroughHits = 0;
+      if (sc) {
+        const PCCounts* counts =
+            sc->maybeGetPCCounts(script->pcToOffset(fallthroughTarget));
+        if (counts) {
+          fallthroughHits = counts->numExec();
+        }
+      }
+
+      uint64_t taken = hits - fallthroughHits;
+      outBRDA_.printf("BRDA:%zu,%zu,0,", lineno, branchId);
+      if (hits) {
+        outBRDA_.printf("%" PRIu64 "\n", taken);
+      } else {
+        outBRDA_.put("-\n", 2);
+      }
+
+      outBRDA_.printf("BRDA:%zu,%zu,1,", lineno, branchId);
+      if (hits) {
+        outBRDA_.printf("%" PRIu64 "\n", fallthroughHits);
+      } else {
+        outBRDA_.put("-\n", 2);
+      }
+
+      numBranchesFound_ += 2;
+      if (hits) {
+        numBranchesHit_ += !!taken + !!fallthroughHits;
+      }
+      branchId++;
+    }
+
+    if (jump && op == JSOp::TableSwitch) {
+      jsbytecode* defaultpc = pc + GET_JUMP_OFFSET(pc);
+      MOZ_ASSERT(script->code() <= defaultpc && defaultpc < end);
+      MOZ_ASSERT(defaultpc > pc);
+
+      int32_t low = GET_JUMP_OFFSET(pc + JUMP_OFFSET_LEN * 1);
+      int32_t high = GET_JUMP_OFFSET(pc + JUMP_OFFSET_LEN * 2);
+      MOZ_ASSERT(high - low + 1 >= 0);
+      size_t numCases = high - low + 1;
+
+      auto getCaseOrDefaultPc = [&](size_t index) {
+        if (index < numCases) {
+          return script->tableSwitchCasePC(pc, index);
+        }
+        MOZ_ASSERT(index == numCases);
+        return defaultpc;
+      };
+
+      jsbytecode* firstCaseOrDefaultPc = end;
+      for (size_t j = 0; j < numCases + 1; j++) {
+        jsbytecode* testpc = getCaseOrDefaultPc(j);
+        MOZ_ASSERT(script->code() <= testpc && testpc < end);
+        if (testpc < firstCaseOrDefaultPc) {
+          firstCaseOrDefaultPc = testpc;
+        }
+      }
+
+      uint64_t defaultHits = hits;
+
+      uint64_t fallsThroughHits = 0;
+
+      size_t caseId = 0;
+      for (size_t i = 0; i < numCases + 1; i++) {
+        jsbytecode* caseOrDefaultPc = getCaseOrDefaultPc(i);
+        MOZ_ASSERT(script->code() <= caseOrDefaultPc && caseOrDefaultPc < end);
+
+        jsbytecode* lastCaseOrDefaultPc = firstCaseOrDefaultPc - 1;
+        bool foundLastCaseOrDefault = false;
+        for (size_t j = 0; j < numCases + 1; j++) {
+          jsbytecode* testpc = getCaseOrDefaultPc(j);
+          MOZ_ASSERT(script->code() <= testpc && testpc < end);
+          if (lastCaseOrDefaultPc < testpc &&
+              (testpc < caseOrDefaultPc ||
+               (j < i && testpc == caseOrDefaultPc))) {
+            lastCaseOrDefaultPc = testpc;
+            foundLastCaseOrDefault = true;
+          }
+        }
+
+        if (!foundLastCaseOrDefault || caseOrDefaultPc != lastCaseOrDefaultPc) {
+          uint64_t caseOrDefaultHits = 0;
+          if (sc) {
+            if (i < numCases) {
+              const PCCounts* counts =
+                  sc->maybeGetPCCounts(script->pcToOffset(caseOrDefaultPc));
+              if (counts) {
+                caseOrDefaultHits = counts->numExec();
+              }
+
+              // Remove fallthrough.
+              fallsThroughHits = 0;
+              if (foundLastCaseOrDefault) {
+                // check if it fallthrough into the current block.
+                MOZ_ASSERT(lastCaseOrDefaultPc != firstCaseOrDefaultPc - 1);
+                jsbytecode* endpc = lastCaseOrDefaultPc;
+                while (GetNextPc(endpc) < caseOrDefaultPc) {
+                  endpc = GetNextPc(endpc);
+                  MOZ_ASSERT(script->code() <= endpc && endpc < end);
+                }
+
+                if (BytecodeFallsThrough(JSOp(*endpc))) {
+                  fallsThroughHits = script->getHitCount(endpc);
+                }
+              }
+              caseOrDefaultHits -= fallsThroughHits;
+            } else {
+              caseOrDefaultHits = defaultHits;
+            }
+          }
+
+          outBRDA_.printf("BRDA:%zu,%zu,%zu,", lineno, branchId, caseId);
+          if (hits) {
+            outBRDA_.printf("%" PRIu64 "\n", caseOrDefaultHits);
+          } else {
+            outBRDA_.put("-\n", 2);
+          }
+
+          numBranchesFound_++;
+          numBranchesHit_ += !!caseOrDefaultHits;
+          if (i < numCases) {
+            defaultHits -= caseOrDefaultHits;
+          }
+          caseId++;
+        }
+      }
+    }
+  }
+
+  if (outFN_.hadOutOfMemory() || outFNDA_.hadOutOfMemory() ||
+      outBRDA_.hadOutOfMemory()) {
+    hadOOM_ = true;
+    return;
+  }
+
+  if (script->isTopLevel()) {
+    hasTopLevelScript_ = true;
+  }
+}
+
+LCovRealm::LCovRealm(JS::Realm* realm)
+    : alloc_(4096, js::MallocArena), outTN_(&alloc_), sources_(alloc_) {
+  writeRealmName(realm);
+}
+
+LCovRealm::~LCovRealm() {
+  while (!sources_.empty()) {
+    LCovSource* source = sources_.popCopy();
+    source->~LCovSource();
+  }
+}
+
+LCovSource* LCovRealm::lookupOrAdd(const char* name) {
+  for (LCovSource* source : sources_) {
+    if (source->match(name)) {
+      return source;
+    }
+  }
+
+  UniqueChars source_name = DuplicateString(name);
+  if (!source_name) {
+    return nullptr;
+  }
+
+  LCovSource* source = alloc_.new_<LCovSource>(&alloc_, std::move(source_name));
+  if (!source) {
+    return nullptr;
+  }
+
+  if (!sources_.emplaceBack(source)) {
+    return nullptr;
+  }
+
+  return source;
+}
+
+void LCovRealm::exportInto(GenericPrinter& out, bool* isEmpty) const {
+  if (outTN_.hadOutOfMemory()) {
+    return;
+  }
+
+  bool someComplete = false;
+  for (const LCovSource* sc : sources_) {
+    if (sc->isComplete()) {
+      someComplete = true;
+      break;
+    };
+  }
+
+  if (!someComplete) {
+    return;
+  }
+
+  *isEmpty = false;
+  outTN_.exportInto(out);
+  for (LCovSource* sc : sources_) {
+    if (sc->isComplete()) {
+      sc->exportInto(out);
+    }
+  }
+}
+
+void LCovRealm::writeRealmName(JS::Realm* realm) {
+  JSContext* cx = TlsContext.get();
+
+  outTN_.put("TN:");
+  if (cx->runtime()->realmNameCallback) {
+    char name[1024];
+    {
+      JS::AutoSuppressGCAnalysis nogc;
+      (*cx->runtime()->realmNameCallback)(cx, realm, name, sizeof(name), nogc);
+    }
+    for (char* s = name; s < name + sizeof(name) && *s; s++) {
+      if (('a' <= *s && *s <= 'z') || ('A' <= *s && *s <= 'Z') ||
+          ('0' <= *s && *s <= '9')) {
+        outTN_.put(s, 1);
+        continue;
+      }
+      outTN_.printf("_%p", (void*)size_t(*s));
+    }
+    outTN_.put("\n", 1);
+  } else {
+    outTN_.printf("Realm_%p%p\n", (void*)size_t('_'), realm);
+  }
+}
+
+const char* LCovRealm::getScriptName(JSScript* script) {
+  JSFunction* fun = script->function();
+  if (fun && fun->fullDisplayAtom()) {
+    JSAtom* atom = fun->fullDisplayAtom();
+    size_t lenWithNull = js::PutEscapedString(nullptr, 0, atom, 0) + 1;
+    char* name = alloc_.newArray<char>(lenWithNull);
+    if (name) {
+      js::PutEscapedString(name, lenWithNull, atom, 0);
+    }
+    return name;
+  }
+  return "top-level";
+}
+
+bool gLCovIsEnabled = false;
+
+void InitLCov() {
+  const char* outDir = getenv("JS_CODE_COVERAGE_OUTPUT_DIR");
+  if (outDir && *outDir != 0) {
+    EnableLCov();
+  }
+}
+
+void EnableLCov() {
+  MOZ_ASSERT(!JSRuntime::hasLiveRuntimes(),
+             "EnableLCov must not be called after creating a runtime!");
+  gLCovIsEnabled = true;
+}
+
+LCovRuntime::LCovRuntime() : pid_(getpid()), isEmpty_(true) {}
+
+LCovRuntime::~LCovRuntime() {
+  if (out_.isInitialized()) {
+    finishFile();
+  }
+}
+
+bool LCovRuntime::fillWithFilename(char* name, size_t length) {
+  const char* outDir = getenv("JS_CODE_COVERAGE_OUTPUT_DIR");
+  if (!outDir || *outDir == 0) {
+    return false;
+  }
+
+  int64_t timestamp = PRMJ_Now() / PRMJ_USEC_PER_SEC;
+  static mozilla::Atomic<size_t> globalRuntimeId(0);
+  size_t rid = globalRuntimeId++;
+
+  int len = snprintf(name, length, "%s/%" PRId64 "-%" PRIu32 "-%zu.info",
+                     outDir, timestamp, pid_, rid);
+  if (len < 0 || size_t(len) >= length) {
+    fprintf(stderr,
+            "Warning: LCovRuntime::init: Cannot serialize file name.\n");
+    return false;
+  }
+
+  return true;
+}
+
+void LCovRuntime::init() {
+  char name[1024];
+  if (!fillWithFilename(name, sizeof(name))) {
+    return;
+  }
+
+  if (!out_.init(name)) {
+    fprintf(stderr,
+            "Warning: LCovRuntime::init: Cannot open file named '%s'.\n", name);
+  }
+  isEmpty_ = true;
+}
+
+void LCovRuntime::finishFile() {
+  MOZ_ASSERT(out_.isInitialized());
+  out_.finish();
+
+  if (isEmpty_) {
+    char name[1024];
+    if (!fillWithFilename(name, sizeof(name))) {
+      return;
+    }
+    remove(name);
+  }
+}
+
+void LCovRuntime::writeLCovResult(LCovRealm& realm) {
+  if (!out_.isInitialized()) {
+    init();
+    if (!out_.isInitialized()) {
+      return;
+    }
+  }
+
+  uint32_t p = getpid();
+  if (pid_ != p) {
+    pid_ = p;
+    finishFile();
+    init();
+    if (!out_.isInitialized()) {
+      return;
+    }
+  }
+
+  realm.exportInto(out_, &isEmpty_);
+  out_.flush();
+  finishFile();
+}
+
+bool InitScriptCoverage(JSContext* cx, JSScript* script) {
+  MOZ_ASSERT(IsLCovEnabled());
+  MOZ_ASSERT(script->hasBytecode(),
+             "Only initialize coverage data for fully initialized scripts.");
+
+  const char* filename = script->filename();
+  if (!filename) {
+    return true;
+  }
+
+  LCovRealm* lcovRealm = script->realm()->lcovRealm();
+  if (!lcovRealm) {
+    ReportOutOfMemory(cx);
+    return false;
+  }
+
+  LCovSource* source = lcovRealm->lookupOrAdd(filename);
+  if (!source) {
+    ReportOutOfMemory(cx);
+    return false;
+  }
+
+  const char* scriptName = lcovRealm->getScriptName(script);
+  if (!scriptName) {
+    ReportOutOfMemory(cx);
+    return false;
+  }
+
+  JS::Zone* zone = script->zone();
+  if (!zone->scriptLCovMap) {
+    zone->scriptLCovMap = cx->make_unique<JS::WeakCache<ScriptLCovMap>>(zone);
+  }
+  if (!zone->scriptLCovMap) {
+    return false;
+  }
+
+  MOZ_ASSERT(script->hasBytecode());
+
+  if (!zone->scriptLCovMap->get().putNew(script,
+                                         std::make_tuple(source, scriptName))) {
+    ReportOutOfMemory(cx);
+    return false;
+  }
+
+  return true;
+}
+
+bool CollectScriptCoverage(JSScript* script) {
+  MOZ_ASSERT(IsLCovEnabled());
+
+  auto* wc = script->zone()->scriptLCovMap.get();
+  if (!wc) {
+    return false;
+  }
+
+  auto p = wc->get().lookup(script);
+  if (!p.found()) {
+    return false;
+  }
+
+  return MaybeWriteScriptCoverage(script, p->value());
+}
+
+bool MaybeWriteScriptCoverage(JSScript* script, const ScriptLCovEntry& entry) {
+  auto [source, scriptName] = entry;
+  if (script->hasBytecode()) {
+    source->writeScript(script, scriptName);
+  }
+  return !source->hadOutOfMemory();
+}
+
+}  
+}  

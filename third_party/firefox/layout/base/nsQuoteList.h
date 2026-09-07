@@ -1,0 +1,84 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsQuoteList_h_
+#define nsQuoteList_h_
+
+#include "nsGenConList.h"
+
+namespace mozilla {
+
+class ContainStyleScope;
+
+}  
+
+struct nsQuoteNode : public nsGenConNode {
+  const StyleContentType mType;
+
+  int32_t mDepthBefore;
+
+  nsQuoteNode(StyleContentType aType, uint32_t aContentIndex)
+      : nsGenConNode(aContentIndex), mType(aType), mDepthBefore(0) {
+    NS_ASSERTION(aType == StyleContentType::OpenQuote ||
+                     aType == StyleContentType::CloseQuote ||
+                     aType == StyleContentType::NoOpenQuote ||
+                     aType == StyleContentType::NoCloseQuote,
+                 "incorrect type");
+    NS_ASSERTION(aContentIndex <= INT32_MAX, "out of range");
+  }
+
+  virtual bool InitTextFrame(nsGenConList* aList, nsIFrame* aPseudoFrame,
+                             nsIFrame* aTextFrame) override;
+
+  bool IsOpenQuote() {
+    return mType == StyleContentType::OpenQuote ||
+           mType == StyleContentType::NoOpenQuote;
+  }
+
+  bool IsCloseQuote() { return !IsOpenQuote(); }
+
+  bool IsRealQuote() {
+    return mType == StyleContentType::OpenQuote ||
+           mType == StyleContentType::CloseQuote;
+  }
+
+  int32_t Depth() { return IsOpenQuote() ? mDepthBefore : mDepthBefore - 1; }
+
+  int32_t DepthAfter() {
+    return IsOpenQuote() ? mDepthBefore + 1
+                         : (mDepthBefore == 0 ? 0 : mDepthBefore - 1);
+  }
+
+  nsString Text();
+};
+
+class nsQuoteList : public nsGenConList {
+ private:
+  nsQuoteNode* FirstNode() {
+    return static_cast<nsQuoteNode*>(mList.getFirst());
+  }
+
+ public:
+  explicit nsQuoteList(mozilla::ContainStyleScope* aScope) : mScope(aScope) {}
+
+  void Calc(nsQuoteNode* aNode);
+
+  nsQuoteNode* Next(nsQuoteNode* aNode) {
+    return static_cast<nsQuoteNode*>(nsGenConList::Next(aNode));
+  }
+  nsQuoteNode* Prev(nsQuoteNode* aNode) {
+    return static_cast<nsQuoteNode*>(nsGenConList::Prev(aNode));
+  }
+
+  void RecalcAll();
+#ifdef DEBUG
+  void PrintChain();
+#endif
+
+ private:
+  mozilla::ContainStyleScope* mScope;
+};
+
+#endif /* nsQuoteList_h_ */

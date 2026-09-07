@@ -1,0 +1,463 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_image_imgLoader_h
+#define mozilla_image_imgLoader_h
+
+#include "ImageCacheKey.h"
+#include "imgICache.h"
+#include "imgILoader.h"
+#include "imgIRequest.h"
+#include "imgRequest.h"
+#include "mozilla/CORSMode.h"
+#include "mozilla/EnumSet.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/dom/CacheExpirationTime.h"
+#include "nsExpirationTracker.h"
+#include "nsIChannel.h"
+#include "nsIContentSniffer.h"
+#include "nsIProgressEventSink.h"
+#include "nsIThreadRetargetableStreamListener.h"
+#include "nsRefPtrHashtable.h"
+#include "nsTHashSet.h"
+#include "nsWeakReference.h"
+#ifdef NIGHTLY_BUILD
+#  include "mozilla/dom/IntegrityPolicyWAICT.h"
+#  include "mozilla/dom/ResourceHasher.h"
+#endif
+
+class imgLoader;
+class imgRequestProxy;
+class imgINotificationObserver;
+class nsILoadGroup;
+class imgCacheExpirationTracker;
+class imgMemoryReporter;
+
+namespace mozilla {
+namespace dom {
+class Document;
+enum class FetchPriority : uint8_t;
+}  
+}  
+
+class imgCacheEntry {
+ public:
+  NS_INLINE_DECL_REFCOUNTING(imgCacheEntry)
+
+  imgCacheEntry(imgLoader* loader, imgRequest* request,
+                bool aForcePrincipalCheck);
+
+  imgCacheEntry(const imgCacheEntry&) = delete;
+
+  uint32_t GetDataSize() const { return mDataSize; }
+  void SetDataSize(uint32_t aDataSize) {
+    int32_t oldsize = mDataSize;
+    mDataSize = aDataSize;
+    UpdateCache(mDataSize - oldsize);
+  }
+
+  int32_t GetTouchedTime() const { return mTouchedTime; }
+  void SetTouchedTime(int32_t time) {
+    mTouchedTime = time;
+    Touch( false);
+  }
+
+  uint32_t GetLoadTime() const { return mLoadTime; }
+
+  void UpdateLoadTime();
+
+  const CacheExpirationTime& GetExpiryTime() const { return mExpiryTime; }
+
+  void AccumulateExpiryTime(const CacheExpirationTime& aExpiryTime,
+                            bool aForceTouch = false) {
+    if (aExpiryTime.IsNever()) {
+      if (aForceTouch) {
+        Touch();
+      }
+      return;
+    }
+    if (mExpiryTime.IsNever() || aExpiryTime.IsShorterThan(mExpiryTime)) {
+      mExpiryTime = aExpiryTime;
+      Touch();
+    } else {
+      if (aForceTouch) {
+        Touch();
+      }
+    }
+  }
+
+  bool GetMustValidate() const { return mMustValidate; }
+  void SetMustValidate(bool aValidate) {
+    mMustValidate = aValidate;
+    Touch();
+  }
+
+  already_AddRefed<imgRequest> GetRequest() const {
+    RefPtr<imgRequest> req = mRequest;
+    return req.forget();
+  }
+
+  bool Evicted() const { return mEvicted; }
+
+  nsExpirationState* GetExpirationState() { return &mExpirationState; }
+
+  bool HasNoProxies() const { return mHasNoProxies; }
+
+  bool ForcePrincipalCheck() const { return mForcePrincipalCheck; }
+
+  bool HasNotified() const { return mHasNotified; }
+  void SetHasNotified() {
+    MOZ_ASSERT(!mHasNotified);
+    mHasNotified = true;
+  }
+
+  imgLoader* Loader() const { return mLoader; }
+
+ private:  
+  friend class imgLoader;
+  friend class imgCacheQueue;
+  void Touch(bool updateTime = true);
+  void UpdateCache(int32_t diff = 0);
+  void SetEvicted(bool evict) { mEvicted = evict; }
+  void SetHasNoProxies(bool hasNoProxies);
+  ~imgCacheEntry();
+
+ private:  
+  imgLoader* mLoader;
+  RefPtr<imgRequest> mRequest;
+  uint32_t mDataSize;
+  int32_t mTouchedTime;
+  uint32_t mLoadTime;
+  CacheExpirationTime mExpiryTime;
+  nsExpirationState mExpirationState;
+  bool mMustValidate : 1;
+  bool mEvicted : 1;
+  bool mHasNoProxies : 1;
+  bool mForcePrincipalCheck : 1;
+  bool mHasNotified : 1;
+};
+
+#define NS_IMGLOADER_CID                      \
+  { \
+   0xc1354898,                                \
+   0xe3fe,                                    \
+   0x4602,                                    \
+   {0x88, 0xa7, 0xc4, 0x52, 0x0c, 0x21, 0xcb, 0x4e}}
+
+class imgCacheQueue {
+ public:
+  imgCacheQueue();
+  void Remove(imgCacheEntry*);
+  void Push(imgCacheEntry*);
+  void MarkDirty();
+  bool IsDirty();
+  already_AddRefed<imgCacheEntry> Pop();
+  void Refresh();
+  uint32_t GetSize() const;
+  void UpdateSize(int32_t diff);
+  uint32_t GetNumElements() const;
+  bool Contains(imgCacheEntry* aEntry) const;
+  typedef nsTArray<RefPtr<imgCacheEntry>> queueContainer;
+  typedef queueContainer::iterator iterator;
+  typedef queueContainer::const_iterator const_iterator;
+
+  iterator begin();
+  const_iterator begin() const;
+  iterator end();
+  const_iterator end() const;
+
+ private:
+  queueContainer mQueue;
+  bool mDirty;
+  uint32_t mSize;
+};
+
+enum class AcceptedMimeTypes : uint8_t {
+  IMAGES,
+  IMAGES_AND_DOCUMENTS,
+};
+
+class imgLoader final : public imgILoader,
+                        public nsIContentSniffer,
+                        public imgICache,
+                        public nsSupportsWeakReference,
+                        public nsIObserver {
+  virtual ~imgLoader();
+
+ public:
+  using ImageCacheKey = mozilla::image::ImageCacheKey;
+  using imgCacheTable =
+      nsRefPtrHashtable<nsGenericHashKey<ImageCacheKey>, imgCacheEntry>;
+  using imgSet = nsTHashSet<imgRequest*>;
+  using Mutex = mozilla::Mutex;
+
+  NS_DECL_ISUPPORTS
+  NS_DECL_IMGILOADER
+  NS_DECL_NSICONTENTSNIFFER
+  NS_DECL_IMGICACHE
+  NS_DECL_NSIOBSERVER
+
+  static imgLoader* NormalLoader();
+
+  static imgLoader* PrivateBrowsingLoader();
+
+  imgLoader();
+  nsresult Init();
+
+  static nsresult ClearCache(
+      mozilla::Maybe<bool> aPrivateLoader = mozilla::Nothing(),
+      mozilla::Maybe<bool> aChrome = mozilla::Nothing(),
+      const mozilla::Maybe<nsCOMPtr<nsIPrincipal>>& aPrincipal =
+          mozilla::Nothing(),
+      const mozilla::Maybe<nsCString>& aSchemelessSite = mozilla::Nothing(),
+      const mozilla::Maybe<mozilla::OriginAttributesPattern>& aPattern =
+          mozilla::Nothing(),
+      const mozilla::Maybe<nsCString>& aURL = mozilla::Nothing());
+
+  bool IsImageAvailable(nsIURI*, nsIPrincipal* aTriggeringPrincipal,
+                        mozilla::CORSMode, mozilla::dom::Document*);
+
+  [[nodiscard]] nsresult LoadImage(
+      nsIURI* aURI, nsIURI* aInitialDocumentURI, nsIReferrerInfo* aReferrerInfo,
+      nsIPrincipal* aLoadingPrincipal, uint64_t aRequestContextID,
+      nsILoadGroup* aLoadGroup, imgINotificationObserver* aObserver,
+      nsINode* aContext, mozilla::dom::Document* aLoadingDocument,
+      nsLoadFlags aLoadFlags, nsISupports* aCacheKey,
+      nsContentPolicyType aContentPolicyType, const nsAString& initiatorType,
+      bool aUseUrgentStartForChannel, bool aLinkPreload,
+      uint64_t aEarlyHintPreloaderId,
+      mozilla::dom::FetchPriority aFetchPriority, imgRequestProxy** _retval);
+
+  [[nodiscard]] nsresult LoadImageWithChannel(
+      nsIChannel* channel, imgINotificationObserver* aObserver,
+      mozilla::dom::Document* aLoadingDocument, nsIStreamListener** listener,
+      imgRequestProxy** _retval);
+
+  static nsresult GetMimeTypeFromContent(const char* aContents,
+                                         uint32_t aLength,
+                                         nsACString& aContentType);
+
+  static bool SupportImageWithMimeType(
+      const nsACString&, AcceptedMimeTypes aAccept = AcceptedMimeTypes::IMAGES);
+
+  static void GlobalInit();  
+  static void Shutdown();    
+  static void ShutdownMemoryReporter();
+
+  enum class ClearOption {
+    ChromeOnly,
+    ContentOnly,
+    UnusedOnly,
+  };
+  using ClearOptions = mozilla::EnumSet<ClearOption>;
+  nsresult ClearImageCache(ClearOptions = {});
+  void MinimizeCache() { ClearImageCache({ClearOption::UnusedOnly}); }
+
+  nsresult InitCache();
+
+  bool RemoveFromCache(const ImageCacheKey& aKey);
+
+  enum class QueueState { MaybeExists, AlreadyRemoved };
+
+  bool RemoveFromCache(imgCacheEntry* entry,
+                       QueueState aQueueState = QueueState::MaybeExists);
+
+  bool PutIntoCache(const ImageCacheKey& aKey, imgCacheEntry* aEntry);
+
+  void AddToUncachedImages(imgRequest* aRequest);
+  void RemoveFromUncachedImages(imgRequest* aRequest);
+
+  inline static bool CompareCacheEntries(const RefPtr<imgCacheEntry>& one,
+                                         const RefPtr<imgCacheEntry>& two) {
+    if (!one) {
+      return false;
+    }
+    if (!two) {
+      return true;
+    }
+
+    const double sizeweight = 1.0 - sCacheTimeWeight;
+
+    double oneweight = double(one->GetDataSize()) * sizeweight -
+                       double(one->GetTouchedTime()) * sCacheTimeWeight;
+    double twoweight = double(two->GetDataSize()) * sizeweight -
+                       double(two->GetTouchedTime()) * sCacheTimeWeight;
+
+    return oneweight < twoweight;
+  }
+
+  void VerifyCacheSizes();
+
+  nsresult RemoveEntriesInternal(
+      const mozilla::Maybe<nsCOMPtr<nsIPrincipal>>& aPrincipal,
+      const mozilla::Maybe<nsCString>& aSchemelessSite,
+      const mozilla::Maybe<mozilla::OriginAttributesPattern>& aPattern,
+      const mozilla::Maybe<nsCString>& aURL);
+
+  bool SetHasNoProxies(imgRequest* aRequest, imgCacheEntry* aEntry);
+  bool SetHasProxies(imgRequest* aRequest);
+
+ private:  
+  static already_AddRefed<imgLoader> CreateImageLoader();
+
+  bool ValidateEntry(imgCacheEntry* aEntry, nsIURI* aURI,
+                     nsIURI* aInitialDocumentURI,
+                     nsIReferrerInfo* aReferrerInfo, nsILoadGroup* aLoadGroup,
+                     imgINotificationObserver* aObserver,
+                     mozilla::dom::Document* aLoadingDocument,
+                     nsLoadFlags aLoadFlags,
+                     nsContentPolicyType aLoadPolicyType,
+                     bool aCanMakeNewChannel, bool* aNewChannelCreated,
+                     imgRequestProxy** aProxyRequest,
+                     nsIPrincipal* aTriggeringPrincipal, mozilla::CORSMode,
+                     bool aLinkPreload, uint64_t aEarlyHintPreloaderId,
+                     mozilla::dom::FetchPriority aFetchPriority);
+
+  bool ValidateRequestWithNewChannel(
+      imgRequest* request, nsIURI* aURI, nsIURI* aInitialDocumentURI,
+      nsIReferrerInfo* aReferrerInfo, nsILoadGroup* aLoadGroup,
+      imgINotificationObserver* aObserver,
+      mozilla::dom::Document* aLoadingDocument, uint64_t aInnerWindowId,
+      nsLoadFlags aLoadFlags, nsContentPolicyType aContentPolicyType,
+      imgRequestProxy** aProxyRequest, nsIPrincipal* aLoadingPrincipal,
+      mozilla::CORSMode, bool aLinkPreload, uint64_t aEarlyHintPreloaderId,
+      mozilla::dom::FetchPriority aFetchPriority, bool* aNewChannelCreated);
+
+  void NotifyObserversForCachedImage(
+      imgCacheEntry* aEntry, imgRequest* request, nsIURI* aURI,
+      nsIReferrerInfo* aReferrerInfo, mozilla::dom::Document* aLoadingDocument,
+      nsIPrincipal* aTriggeringPrincipal, mozilla::CORSMode,
+      uint64_t aEarlyHintPreloaderId,
+      mozilla::dom::FetchPriority aFetchPriority);
+  nsresult CreateNewProxyForRequest(imgRequest* aRequest, nsIURI* aURI,
+                                    nsILoadGroup* aLoadGroup,
+                                    mozilla::dom::Document* aLoadingDocument,
+                                    imgINotificationObserver* aObserver,
+                                    nsLoadFlags aLoadFlags,
+                                    imgRequestProxy** _retval);
+
+  nsresult EvictEntries(bool aChromeOnly);
+
+  void CacheEntriesChanged(int32_t aSizeDiff);
+  void CheckCacheLimits();
+
+ private:  
+  friend class imgCacheEntry;
+  friend class imgMemoryReporter;
+
+  imgCacheTable mCache;
+  imgCacheQueue mCacheQueue;
+
+  imgSet mUncachedImages MOZ_GUARDED_BY(mUncachedImagesMutex);
+  Mutex mUncachedImagesMutex;
+
+  static double sCacheTimeWeight;
+  static uint32_t sCacheMaxSize;
+  static imgMemoryReporter* sMemReporter;
+
+  mozilla::UniquePtr<imgCacheExpirationTracker> mCacheTracker;
+  bool mRespectPrivacy;
+};
+
+
+#include "nsCOMPtr.h"
+#include "nsIStreamListener.h"
+#include "nsIThreadRetargetableStreamListener.h"
+
+class ProxyListener : public nsIThreadRetargetableStreamListener {
+ public:
+  explicit ProxyListener(nsIStreamListener* dest);
+#ifdef NIGHTLY_BUILD
+  explicit ProxyListener(nsIStreamListener* dest, bool aIsWAICTEnabled);
+#endif
+
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSISTREAMLISTENER
+  NS_DECL_NSITHREADRETARGETABLESTREAMLISTENER
+  NS_DECL_NSIREQUESTOBSERVER
+
+ private:
+  virtual ~ProxyListener();
+
+  nsCOMPtr<nsIStreamListener> mDestListener;
+#ifdef NIGHTLY_BUILD
+  const bool mIsWAICTEnabled = false;
+  mozilla::Mutex mHasherMutex{"ProxyListener::mHasherMutex"};
+  RefPtr<mozilla::dom::ResourceHasher> mResourceHasher
+      MOZ_GUARDED_BY(mHasherMutex);
+  nsTArray<uint8_t> mBufferedImageWAICT MOZ_GUARDED_BY(mHasherMutex);
+#endif
+};
+
+class nsProgressNotificationProxy final : public nsIProgressEventSink,
+                                          public nsIChannelEventSink,
+                                          public nsIInterfaceRequestor {
+ public:
+  nsProgressNotificationProxy(nsIChannel* channel, imgIRequest* proxy)
+      : mImageRequest(proxy) {
+    channel->GetNotificationCallbacks(getter_AddRefs(mOriginalCallbacks));
+  }
+
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIPROGRESSEVENTSINK
+  NS_DECL_NSICHANNELEVENTSINK
+  NS_DECL_NSIINTERFACEREQUESTOR
+ private:
+  ~nsProgressNotificationProxy() = default;
+
+  nsCOMPtr<nsIInterfaceRequestor> mOriginalCallbacks;
+  nsCOMPtr<nsIRequest> mImageRequest;
+};
+
+
+#include "nsCOMArray.h"
+
+class imgCacheValidator : public nsIThreadRetargetableStreamListener,
+                          public nsIChannelEventSink,
+                          public nsIInterfaceRequestor,
+                          public nsIAsyncVerifyRedirectCallback {
+ public:
+  imgCacheValidator(nsProgressNotificationProxy* progress, imgLoader* loader,
+                    imgRequest* aRequest, mozilla::dom::Document* aDocument,
+                    uint64_t aInnerWindowId,
+                    bool forcePrincipalCheckForCacheEntry);
+
+  void AddProxy(imgRequestProxy* aProxy);
+  void RemoveProxy(imgRequestProxy* aProxy);
+
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSITHREADRETARGETABLESTREAMLISTENER
+  NS_DECL_NSISTREAMLISTENER
+  NS_DECL_NSIREQUESTOBSERVER
+  NS_DECL_NSICHANNELEVENTSINK
+  NS_DECL_NSIINTERFACEREQUESTOR
+  NS_DECL_NSIASYNCVERIFYREDIRECTCALLBACK
+
+ private:
+  void UpdateProxies(bool aCancelRequest, bool aSyncNotify);
+  virtual ~imgCacheValidator();
+
+  nsCOMPtr<nsIStreamListener> mDestListener;
+  RefPtr<nsProgressNotificationProxy> mProgressProxy;
+  nsCOMPtr<nsIAsyncVerifyRedirectCallback> mRedirectCallback;
+  nsCOMPtr<nsIChannel> mRedirectChannel;
+
+  RefPtr<imgRequest> mRequest;
+  AutoTArray<RefPtr<imgRequestProxy>, 4> mProxies;
+
+  RefPtr<imgRequest> mNewRequest;
+  RefPtr<imgCacheEntry> mNewEntry;
+
+  RefPtr<mozilla::dom::Document> mDocument;
+  uint64_t mInnerWindowId;
+
+  imgLoader* mImgLoader;
+
+  bool mHadInsecureRedirect;
+};
+
+#endif  // mozilla_image_imgLoader_h

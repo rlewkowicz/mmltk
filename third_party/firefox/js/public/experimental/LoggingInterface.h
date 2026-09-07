@@ -1,0 +1,60 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef _js_experimental_LoggingInterface_h_
+#define _js_experimental_LoggingInterface_h_
+
+#include "mozilla/LoggingCore.h"
+
+#include <stdarg.h>
+
+#include "jstypes.h"
+#include "fmt/format.h"
+#include "js/GCAPI.h"
+
+struct JSContext;
+
+namespace JS {
+
+using OpaqueLogger = void*;
+
+struct LoggingInterface {
+  OpaqueLogger (*getLoggerByName)(const char* loggerName) = nullptr;
+
+  void (*logPrintVA)(const OpaqueLogger aModule, mozilla::LogLevel aLevel,
+                     const char* aFmt, va_list ap)
+      MOZ_FORMAT_PRINTF(3, 0) = nullptr;
+
+  void (*logPrintFMT)(const OpaqueLogger aModule, mozilla::LogLevel aLevel,
+                      fmt::string_view, fmt::format_args);
+
+  mozilla::AtomicLogLevel& (*getLevelRef)(OpaqueLogger) = nullptr;
+
+  void logPrint(const OpaqueLogger aModule, mozilla::LogLevel aLevel,
+                const char* aFmt, ...) MOZ_FORMAT_PRINTF(4, 5) {
+    JS::AutoSuppressGCAnalysis suppress;
+    va_list ap;
+    va_start(ap, aFmt);
+    this->logPrintVA(aModule, aLevel, aFmt, ap);
+    va_end(ap);
+  }
+
+  template <typename... T>
+  void logPrintFmt(const OpaqueLogger aModule, mozilla::LogLevel aLevel,
+                   fmt::format_string<T...> aFmt, T&&... aArgs) {
+    JS::AutoSuppressGCAnalysis suppress;
+    this->logPrintFMT(aModule, aLevel, aFmt, fmt::make_format_args(aArgs...));
+  }
+
+  bool isComplete() const {
+    return getLoggerByName && logPrintVA && getLevelRef;
+  }
+};
+
+extern JS_PUBLIC_API bool SetLoggingInterface(LoggingInterface& iface);
+
+}  
+
+#endif /* _js_experimental_LoggingInterface_h_ */

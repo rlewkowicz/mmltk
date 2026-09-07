@@ -1,0 +1,1287 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "HttpLog.h"
+
+#undef LOG
+#define LOG(args) LOG5(args)
+#undef LOG_ENABLED
+#define LOG_ENABLED() LOG5_ENABLED()
+
+#include "Http2Compression.h"
+#include "Http2HuffmanIncoming.h"
+#include "Http2HuffmanOutgoing.h"
+#include "mozilla/StaticPtr.h"
+#include "nsCharSeparatedTokenizer.h"
+#include "nsIMemoryReporter.h"
+#include "nsHttpHandler.h"
+
+namespace mozilla {
+namespace net {
+
+static nsDeque<nvPair>* gStaticHeaders = nullptr;
+
+class HpackStaticTableReporter final : public nsIMemoryReporter {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+
+  HpackStaticTableReporter() = default;
+
+  NS_IMETHOD
+  CollectReports(nsIHandleReportCallback* aHandleReport, nsISupports* aData,
+                 bool aAnonymize) override {
+    MOZ_COLLECT_REPORT("explicit/network/hpack/static-table", KIND_HEAP,
+                       UNITS_BYTES,
+                       gStaticHeaders->SizeOfIncludingThis(MallocSizeOf),
+                       "Memory usage of HPACK static table.");
+
+    return NS_OK;
+  }
+
+ private:
+  MOZ_DEFINE_MALLOC_SIZE_OF(MallocSizeOf)
+
+  ~HpackStaticTableReporter() = default;
+};
+
+NS_IMPL_ISUPPORTS(HpackStaticTableReporter, nsIMemoryReporter)
+
+class HpackDynamicTableReporter final : public nsIMemoryReporter {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+
+  explicit HpackDynamicTableReporter(Http2BaseCompressor* aCompressor)
+      : mCompressor(aCompressor) {}
+
+  NS_IMETHOD
+  CollectReports(nsIHandleReportCallback* aHandleReport, nsISupports* aData,
+                 bool aAnonymize) override {
+    MutexAutoLock lock(mMutex);
+    if (mCompressor) {
+      MOZ_COLLECT_REPORT("explicit/network/hpack/dynamic-tables", KIND_HEAP,
+                         UNITS_BYTES,
+                         mCompressor->SizeOfExcludingThis(MallocSizeOf),
+                         "Aggregate memory usage of HPACK dynamic tables.");
+    }
+    return NS_OK;
+  }
+
+ private:
+  MOZ_DEFINE_MALLOC_SIZE_OF(MallocSizeOf)
+
+  ~HpackDynamicTableReporter() = default;
+
+  Mutex mMutex{"HpackDynamicTableReporter"};
+  Http2BaseCompressor* mCompressor MOZ_GUARDED_BY(mMutex);
+
+  friend class Http2BaseCompressor;
+};
+
+NS_IMPL_ISUPPORTS(HpackDynamicTableReporter, nsIMemoryReporter)
+
+StaticRefPtr<HpackStaticTableReporter> gStaticReporter;
+
+void Http2CompressionCleanup() {
+  delete gStaticHeaders;
+  gStaticHeaders = nullptr;
+  UnregisterStrongMemoryReporter(gStaticReporter);
+  gStaticReporter = nullptr;
+}
+
+static void AddStaticElement(const nsCString& name, const nsCString& value) {
+  nvPair* pair = new nvPair(name, value);
+  gStaticHeaders->Push(pair);
+}
+
+static void AddStaticElement(const nsCString& name) {
+  AddStaticElement(name, ""_ns);
+}
+
+class nvPairDeallocator : public nsDequeFunctor<nvPair> {
+ public:
+  void operator()(nvPair* aPair) override { delete aPair; }
+};
+
+static void InitializeStaticHeaders() {
+  MOZ_ASSERT(OnSocketThread(), "not on socket thread");
+  if (!gStaticHeaders) {
+    gStaticHeaders = new nsDeque<nvPair>(new nvPairDeallocator());
+    gStaticReporter = new HpackStaticTableReporter();
+    RegisterStrongMemoryReporter(do_AddRef(gStaticReporter));
+    AddStaticElement(":authority"_ns);
+    AddStaticElement(":method"_ns, "GET"_ns);
+    AddStaticElement(":method"_ns, "POST"_ns);
+    AddStaticElement(":path"_ns, "/"_ns);
+    AddStaticElement(":path"_ns, "/index.html"_ns);
+    AddStaticElement(":scheme"_ns, "http"_ns);
+    AddStaticElement(":scheme"_ns, "https"_ns);
+    AddStaticElement(":status"_ns, "200"_ns);
+    AddStaticElement(":status"_ns, "204"_ns);
+    AddStaticElement(":status"_ns, "206"_ns);
+    AddStaticElement(":status"_ns, "304"_ns);
+    AddStaticElement(":status"_ns, "400"_ns);
+    AddStaticElement(":status"_ns, "404"_ns);
+    AddStaticElement(":status"_ns, "500"_ns);
+    AddStaticElement("accept-charset"_ns);
+    AddStaticElement("accept-encoding"_ns, "gzip, deflate"_ns);
+    AddStaticElement("accept-language"_ns);
+    AddStaticElement("accept-ranges"_ns);
+    AddStaticElement("accept"_ns);
+    AddStaticElement("access-control-allow-origin"_ns);
+    AddStaticElement("age"_ns);
+    AddStaticElement("allow"_ns);
+    AddStaticElement("authorization"_ns);
+    AddStaticElement("cache-control"_ns);
+    AddStaticElement("content-disposition"_ns);
+    AddStaticElement("content-encoding"_ns);
+    AddStaticElement("content-language"_ns);
+    AddStaticElement("content-length"_ns);
+    AddStaticElement("content-location"_ns);
+    AddStaticElement("content-range"_ns);
+    AddStaticElement("content-type"_ns);
+    AddStaticElement("cookie"_ns);
+    AddStaticElement("date"_ns);
+    AddStaticElement("etag"_ns);
+    AddStaticElement("expect"_ns);
+    AddStaticElement("expires"_ns);
+    AddStaticElement("from"_ns);
+    AddStaticElement("host"_ns);
+    AddStaticElement("if-match"_ns);
+    AddStaticElement("if-modified-since"_ns);
+    AddStaticElement("if-none-match"_ns);
+    AddStaticElement("if-range"_ns);
+    AddStaticElement("if-unmodified-since"_ns);
+    AddStaticElement("last-modified"_ns);
+    AddStaticElement("link"_ns);
+    AddStaticElement("location"_ns);
+    AddStaticElement("max-forwards"_ns);
+    AddStaticElement("proxy-authenticate"_ns);
+    AddStaticElement("proxy-authorization"_ns);
+    AddStaticElement("range"_ns);
+    AddStaticElement("referer"_ns);
+    AddStaticElement("refresh"_ns);
+    AddStaticElement("retry-after"_ns);
+    AddStaticElement("server"_ns);
+    AddStaticElement("set-cookie"_ns);
+    AddStaticElement("strict-transport-security"_ns);
+    AddStaticElement("transfer-encoding"_ns);
+    AddStaticElement("user-agent"_ns);
+    AddStaticElement("vary"_ns);
+    AddStaticElement("via"_ns);
+    AddStaticElement("www-authenticate"_ns);
+  }
+}
+
+size_t nvPair::SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const {
+  return mName.SizeOfExcludingThisIfUnshared(aMallocSizeOf) +
+         mValue.SizeOfExcludingThisIfUnshared(aMallocSizeOf);
+}
+
+size_t nvPair::SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const {
+  return aMallocSizeOf(this) + SizeOfExcludingThis(aMallocSizeOf);
+}
+
+nvFIFO::nvFIFO() { InitializeStaticHeaders(); }
+
+nvFIFO::~nvFIFO() { Clear(); }
+
+void nvFIFO::AddElement(const nsCString& name, const nsCString& value) {
+  nvPair* pair = new nvPair(name, value);
+  mByteCount += pair->Size();
+  MutexAutoLock lock(mMutex);
+  mTable.PushFront(pair);
+}
+
+void nvFIFO::AddElement(const nsCString& name) { AddElement(name, ""_ns); }
+
+void nvFIFO::RemoveElement() {
+  nvPair* pair = nullptr;
+  {
+    MutexAutoLock lock(mMutex);
+    pair = mTable.Pop();
+  }
+  if (pair) {
+    mByteCount -= pair->Size();
+    delete pair;
+  }
+}
+
+uint32_t nvFIFO::ByteCount() const { return mByteCount; }
+
+uint32_t nvFIFO::Length() const {
+  return mTable.GetSize() + gStaticHeaders->GetSize();
+}
+
+uint32_t nvFIFO::VariableLength() const { return mTable.GetSize(); }
+
+size_t nvFIFO::StaticLength() const { return gStaticHeaders->GetSize(); }
+
+void nvFIFO::Clear() {
+  mByteCount = 0;
+  MutexAutoLock lock(mMutex);
+  while (mTable.GetSize()) {
+    delete mTable.Pop();
+  }
+}
+
+const nvPair* nvFIFO::operator[](size_t index) const {
+  if (index >= (mTable.GetSize() + gStaticHeaders->GetSize())) {
+    MOZ_ASSERT(false);
+    NS_WARNING("nvFIFO Table Out of Range");
+    return nullptr;
+  }
+  if (index >= gStaticHeaders->GetSize()) {
+    return mTable.ObjectAt(index - gStaticHeaders->GetSize());
+  }
+  return gStaticHeaders->ObjectAt(index);
+}
+
+Http2BaseCompressor::Http2BaseCompressor() {
+  mDynamicReporter = new HpackDynamicTableReporter(this);
+  RegisterStrongMemoryReporter(do_AddRef(mDynamicReporter));
+}
+
+Http2BaseCompressor::~Http2BaseCompressor() {
+  UnregisterStrongMemoryReporter(mDynamicReporter);
+  {
+    MutexAutoLock lock(mDynamicReporter->mMutex);
+    mDynamicReporter->mCompressor = nullptr;
+  }
+  mDynamicReporter = nullptr;
+}
+
+size_t nvFIFO::SizeOfDynamicTable(mozilla::MallocSizeOf aMallocSizeOf) const {
+  size_t size = 0;
+  MutexAutoLock lock(mMutex);
+  for (const auto elem : mTable) {
+    size += elem->SizeOfIncludingThis(aMallocSizeOf);
+  }
+  return size;
+}
+
+void Http2BaseCompressor::ClearHeaderTable() { mHeaderTable.Clear(); }
+
+size_t Http2BaseCompressor::SizeOfExcludingThis(
+    mozilla::MallocSizeOf aMallocSizeOf) const {
+  return mHeaderTable.SizeOfDynamicTable(aMallocSizeOf);
+}
+
+void Http2BaseCompressor::MakeRoom(uint32_t amount, const char* direction) {
+  while (mHeaderTable.VariableLength() &&
+         ((mHeaderTable.ByteCount() + amount) > mMaxBuffer)) {
+    uint32_t index = mHeaderTable.Length() - 1;
+    LOG(("HTTP %s header table index %u %s %s removed for size.\n", direction,
+         index, mHeaderTable[index]->mName.get(),
+         mHeaderTable[index]->mValue.get()));
+    mHeaderTable.RemoveElement();
+  }
+}
+
+void Http2BaseCompressor::DumpState(const char* preamble) {
+  if (!LOG_ENABLED()) {
+    return;
+  }
+
+  if (!mDumpTables) {
+    return;
+  }
+
+  LOG(("%s", preamble));
+
+  LOG(("Header Table"));
+  uint32_t i;
+  uint32_t length = mHeaderTable.Length();
+  uint32_t staticLength = mHeaderTable.StaticLength();
+  for (i = 0; i < length; ++i) {
+    const nvPair* pair = mHeaderTable[i];
+    LOG(("%sindex %u: %s %s", i < staticLength ? "static " : "", i,
+         pair->mName.get(), pair->mValue.get()));
+  }
+}
+
+void Http2BaseCompressor::SetMaxBufferSizeInternal(uint32_t maxBufferSize) {
+  MOZ_ASSERT(maxBufferSize <= mMaxBufferSetting);
+
+  LOG(("Http2BaseCompressor::SetMaxBufferSizeInternal %u called",
+       maxBufferSize));
+
+  while (mHeaderTable.VariableLength() &&
+         (mHeaderTable.ByteCount() > maxBufferSize)) {
+    mHeaderTable.RemoveElement();
+  }
+
+  mMaxBuffer = maxBufferSize;
+}
+
+nsresult Http2BaseCompressor::SetInitialMaxBufferSize(uint32_t maxBufferSize) {
+  MOZ_ASSERT(mSetInitialMaxBufferSizeAllowed);
+
+  if (mSetInitialMaxBufferSizeAllowed) {
+    mMaxBufferSetting = maxBufferSize;
+    return NS_OK;
+  }
+
+  return NS_ERROR_FAILURE;
+}
+
+void Http2BaseCompressor::SetDumpTables(bool dumpTables) {
+  mDumpTables = dumpTables;
+}
+
+Http2Decompressor::~Http2Decompressor() = default;
+
+nsresult Http2Decompressor::DecodeHeaderBlock(const uint8_t* data,
+                                              uint32_t datalen,
+                                              nsACString& output, bool isPush) {
+  mSetInitialMaxBufferSizeAllowed = false;
+  mOffset = 0;
+  mData = data;
+  mDataLen = datalen;
+  mOutput = &output;
+  mOutput->Truncate();
+  mOutput->SetCapacity(datalen + 512);
+  mHeaderStatus.Truncate();
+  mHeaderHost.Truncate();
+  mHeaderScheme.Truncate();
+  mHeaderPath.Truncate();
+  mHeaderMethod.Truncate();
+  mSeenNonColonHeader = false;
+  mIsPush = isPush;
+
+  nsresult rv = NS_OK;
+  nsresult softfail_rv = NS_OK;
+  while (NS_SUCCEEDED(rv) && (mOffset < mDataLen)) {
+    bool modifiesTable = true;
+    const char* preamble = "Decompressor state after ?";
+    if (mData[mOffset] & 0x80) {
+      rv = DoIndexed();
+      preamble = "Decompressor state after indexed";
+    } else if (mData[mOffset] & 0x40) {
+      rv = DoLiteralWithIncremental();
+      preamble = "Decompressor state after literal with incremental";
+    } else if (mData[mOffset] & 0x20) {
+      rv = DoContextUpdate();
+      preamble = "Decompressor state after context update";
+    } else if (mData[mOffset] & 0x10) {
+      modifiesTable = false;
+      rv = DoLiteralNeverIndexed();
+      preamble = "Decompressor state after literal never index";
+    } else {
+      modifiesTable = false;
+      rv = DoLiteralWithoutIndex();
+      preamble = "Decompressor state after literal without index";
+    }
+    DumpState(preamble);
+    if (rv == NS_ERROR_ILLEGAL_VALUE) {
+      if (modifiesTable) {
+        return NS_ERROR_FAILURE;
+      }
+
+      softfail_rv = rv;
+      rv = NS_OK;
+    } else if (rv == NS_ERROR_NET_RESET) {
+      softfail_rv = rv;
+      rv = NS_OK;
+    }
+  }
+
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  return softfail_rv;
+}
+
+nsresult Http2Decompressor::DecodeInteger(uint32_t prefixLen, uint32_t& accum) {
+  accum = 0;
+
+  if (prefixLen) {
+    uint32_t mask = (1 << prefixLen) - 1;
+
+    accum = mData[mOffset] & mask;
+    ++mOffset;
+
+    if (accum != mask) {
+      return NS_OK;
+    }
+  }
+
+  uint32_t factor = 1;  
+
+
+  if (mOffset >= mDataLen) {
+    NS_WARNING("Ran out of data to decode integer");
+    return NS_ERROR_FAILURE;
+  }
+  bool chainBit = mData[mOffset] & 0x80;
+  accum += (mData[mOffset] & 0x7f) * factor;
+
+  ++mOffset;
+  factor = factor * 128;
+
+  while (chainBit) {
+    if (accum >= 0x800000) {
+      NS_WARNING("Decoding integer >= 0x800000");
+      return NS_ERROR_FAILURE;
+    }
+
+    if (mOffset >= mDataLen) {
+      NS_WARNING("Ran out of data to decode integer");
+      return NS_ERROR_FAILURE;
+    }
+    chainBit = mData[mOffset] & 0x80;
+    accum += (mData[mOffset] & 0x7f) * factor;
+    ++mOffset;
+    factor = factor * 128;
+  }
+  return NS_OK;
+}
+
+static bool HasConnectionBasedAuth(const nsACString& headerValue) {
+  for (const nsACString& authMethod :
+       nsCCharSeparatedTokenizer(headerValue, '\n').ToRange()) {
+    if (authMethod.LowerCaseEqualsLiteral("ntlm")) {
+      return true;
+    }
+    if (authMethod.LowerCaseEqualsLiteral("negotiate")) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+nsresult Http2Decompressor::OutputHeader(const nsACString& name,
+                                         const nsACString& value) {
+  if (!mIsPush &&
+      (name.EqualsLiteral("connection") || name.EqualsLiteral("host") ||
+       name.EqualsLiteral("keep-alive") ||
+       name.EqualsLiteral("proxy-connection") || name.EqualsLiteral("te") ||
+       name.EqualsLiteral("transfer-encoding") ||
+       name.EqualsLiteral("upgrade") || name.Equals(("accept-encoding")))) {
+    nsCString toLog(name);
+    LOG(("HTTP Decompressor illegal response header found, not gatewaying: %s",
+         toLog.get()));
+    return NS_OK;
+  }
+
+  const char* cFirst = name.BeginReading();
+  if (cFirst != nullptr && *cFirst == ':') {
+    ++cFirst;
+  }
+  if (!nsHttp::IsValidToken(cFirst, name.EndReading())) {
+    nsCString toLog(name);
+    LOG(("HTTP Decompressor invalid response header found. [%s]\n",
+         toLog.get()));
+    return NS_ERROR_ILLEGAL_VALUE;
+  }
+
+  for (const char* cPtr = name.BeginReading(); cPtr && cPtr < name.EndReading();
+       ++cPtr) {
+    if (*cPtr <= 'Z' && *cPtr >= 'A') {
+      nsCString toLog(name);
+      LOG(("HTTP Decompressor upper case response header found. [%s]\n",
+           toLog.get()));
+      return NS_ERROR_ILLEGAL_VALUE;
+    }
+  }
+
+  if (!nsHttp::IsReasonableHeaderValue(value)) {
+    return NS_ERROR_ILLEGAL_VALUE;
+  }
+
+  if (name.EqualsLiteral(":status")) {
+    nsAutoCString status("HTTP/2 "_ns);
+    status.Append(value);
+    status.AppendLiteral("\r\n");
+    mOutput->Insert(status, 0);
+    mHeaderStatus = value;
+  } else if (name.EqualsLiteral(":authority")) {
+    mHeaderHost = value;
+  } else if (name.EqualsLiteral(":scheme")) {
+    mHeaderScheme = value;
+  } else if (name.EqualsLiteral(":path")) {
+    mHeaderPath = value;
+  } else if (name.EqualsLiteral(":method")) {
+    mHeaderMethod = value;
+  }
+
+  bool isColonHeader = false;
+  for (const char* cPtr = name.BeginReading(); cPtr && cPtr < name.EndReading();
+       ++cPtr) {
+    if (*cPtr == ':') {
+      isColonHeader = true;
+      break;
+    }
+    if (*cPtr != ' ' && *cPtr != '\t') {
+      isColonHeader = false;
+      break;
+    }
+  }
+
+  if (isColonHeader) {
+    if (!name.EqualsLiteral(":status") && !mIsPush) {
+      LOG(("HTTP Decompressor found illegal response pseudo-header %s",
+           PromiseFlatCString(name).get()));
+      return NS_ERROR_ILLEGAL_VALUE;
+    }
+    if (mSeenNonColonHeader) {
+      LOG(("HTTP Decompressor found illegal : header %s",
+           PromiseFlatCString(name).get()));
+      return NS_ERROR_ILLEGAL_VALUE;
+    }
+    LOG(("HTTP Decompressor not gatewaying %s into http/1",
+         PromiseFlatCString(name).get()));
+    return NS_OK;
+  }
+
+  LOG(("Http2Decompressor::OutputHeader %s %s", PromiseFlatCString(name).get(),
+       PromiseFlatCString(value).get()));
+  mSeenNonColonHeader = true;
+  mOutput->Append(name);
+  mOutput->AppendLiteral(": ");
+  mOutput->Append(value);
+  mOutput->AppendLiteral("\r\n");
+
+  if (name.EqualsLiteral("www-authenticate") ||
+      name.EqualsLiteral("proxy-authenticate")) {
+    if (HasConnectionBasedAuth(value)) {
+      LOG3(("Http2Decompressor %p connection-based auth found in %s", this,
+            PromiseFlatCString(name).get()));
+      return NS_ERROR_NET_RESET;
+    }
+  }
+  return NS_OK;
+}
+
+nsresult Http2Decompressor::OutputHeader(uint32_t index) {
+  if (mHeaderTable.Length() <= index) {
+    LOG(("Http2Decompressor::OutputHeader index too large %u", index));
+    return NS_ERROR_FAILURE;
+  }
+
+  return OutputHeader(mHeaderTable[index]->mName, mHeaderTable[index]->mValue);
+}
+
+nsresult Http2Decompressor::CopyHeaderString(uint32_t index, nsACString& name) {
+  if (mHeaderTable.Length() <= index) {
+    return NS_ERROR_FAILURE;
+  }
+
+  name = mHeaderTable[index]->mName;
+  return NS_OK;
+}
+
+nsresult Http2Decompressor::CopyStringFromInput(uint32_t bytes,
+                                                nsACString& val) {
+  if (mOffset + bytes > mDataLen) {
+    return NS_ERROR_FAILURE;
+  }
+
+  val.Assign(reinterpret_cast<const char*>(mData) + mOffset, bytes);
+  mOffset += bytes;
+  return NS_OK;
+}
+
+nsresult Http2Decompressor::DecodeFinalHuffmanCharacter(
+    const HuffmanIncomingTable* table, uint8_t& c, uint8_t& bitsLeft) {
+  MOZ_ASSERT(mOffset <= mDataLen);
+  if (mOffset > mDataLen) {
+    NS_WARNING("DecodeFinalHuffmanCharacter would read beyond end of buffer");
+    return NS_ERROR_FAILURE;
+  }
+  uint8_t mask = (1 << bitsLeft) - 1;
+  uint8_t idx = mData[mOffset - 1] & mask;
+  idx <<= (8 - bitsLeft);
+
+  if (table->IndexHasANextTable(idx)) {
+    LOG(("DecodeFinalHuffmanCharacter trying to chain when we're out of bits"));
+    return NS_ERROR_FAILURE;
+  }
+
+  const HuffmanIncomingEntry* entry = table->Entry(idx);
+
+  if (bitsLeft < entry->mPrefixLen) {
+    LOG(("DecodeFinalHuffmanCharacter does't have enough bits to match"));
+    return NS_ERROR_FAILURE;
+  }
+
+  if (entry->mValue == 256) {
+    LOG(("DecodeFinalHuffmanCharacter actually decoded an EOS"));
+    return NS_ERROR_FAILURE;
+  }
+  c = static_cast<uint8_t>(entry->mValue & 0xFF);
+  bitsLeft -= entry->mPrefixLen;
+
+  return NS_OK;
+}
+
+uint8_t Http2Decompressor::ExtractByte(uint8_t bitsLeft,
+                                       uint32_t& bytesConsumed) {
+  MOZ_DIAGNOSTIC_ASSERT(mOffset < mDataLen);
+  uint8_t rv;
+
+  if (bitsLeft) {
+    uint8_t mask = (1 << bitsLeft) - 1;
+    rv = (mData[mOffset - 1] & mask) << (8 - bitsLeft);
+    rv |= (mData[mOffset] & ~mask) >> bitsLeft;
+  } else {
+    rv = mData[mOffset];
+  }
+
+  ++mOffset;
+  ++bytesConsumed;
+
+  return rv;
+}
+
+nsresult Http2Decompressor::DecodeHuffmanCharacter(
+    const HuffmanIncomingTable* table, uint8_t& c, uint32_t& bytesConsumed,
+    uint8_t& bitsLeft) {
+  uint8_t idx = ExtractByte(bitsLeft, bytesConsumed);
+
+  if (table->IndexHasANextTable(idx)) {
+    if (mOffset >= mDataLen) {
+      if (!bitsLeft || (mOffset > mDataLen)) {
+        LOG(("DecodeHuffmanCharacter all out of bits to consume, can't chain"));
+        return NS_ERROR_FAILURE;
+      }
+
+      return DecodeFinalHuffmanCharacter(table->NextTable(idx), c, bitsLeft);
+    }
+
+    return DecodeHuffmanCharacter(table->NextTable(idx), c, bytesConsumed,
+                                  bitsLeft);
+  }
+
+  const HuffmanIncomingEntry* entry = table->Entry(idx);
+  if (entry->mValue == 256) {
+    LOG(("DecodeHuffmanCharacter found an actual EOS"));
+    return NS_ERROR_FAILURE;
+  }
+  c = static_cast<uint8_t>(entry->mValue & 0xFF);
+
+  if (entry->mPrefixLen <= bitsLeft) {
+    bitsLeft -= entry->mPrefixLen;
+    --mOffset;
+    --bytesConsumed;
+  } else {
+    bitsLeft = 8 - (entry->mPrefixLen - bitsLeft);
+  }
+  MOZ_ASSERT(bitsLeft < 8);
+
+  return NS_OK;
+}
+
+nsresult Http2Decompressor::CopyHuffmanStringFromInput(uint32_t bytes,
+                                                       nsACString& val) {
+  if (mOffset + bytes > mDataLen) {
+    LOG(("CopyHuffmanStringFromInput not enough data"));
+    return NS_ERROR_FAILURE;
+  }
+
+  uint32_t bytesRead = 0;
+  uint8_t bitsLeft = 0;
+  nsAutoCString buf;
+  nsresult rv;
+  uint8_t c;
+
+  while (bytesRead < bytes) {
+    uint32_t bytesConsumed = 0;
+    rv = DecodeHuffmanCharacter(&HuffmanIncomingRoot, c, bytesConsumed,
+                                bitsLeft);
+    if (NS_FAILED(rv)) {
+      LOG(("CopyHuffmanStringFromInput failed to decode a character"));
+      return rv;
+    }
+
+    bytesRead += bytesConsumed;
+    buf.Append(c);
+  }
+
+  if (bytesRead > bytes) {
+    LOG(("CopyHuffmanStringFromInput read more bytes than was allowed!"));
+    return NS_ERROR_FAILURE;
+  }
+
+  if (bitsLeft) {
+    rv = DecodeFinalHuffmanCharacter(&HuffmanIncomingRoot, c, bitsLeft);
+    if (NS_SUCCEEDED(rv)) {
+      buf.Append(c);
+    }
+  }
+
+  if (bitsLeft > 7) {
+    LOG(("CopyHuffmanStringFromInput more than 7 bits of padding"));
+    return NS_ERROR_FAILURE;
+  }
+
+  if (bitsLeft) {
+    uint8_t mask = (1 << bitsLeft) - 1;
+    uint8_t bits = mData[mOffset - 1] & mask;
+    if (bits != mask) {
+      LOG(
+          ("CopyHuffmanStringFromInput ran out of data but found possible "
+           "non-EOS symbol"));
+      return NS_ERROR_FAILURE;
+    }
+  }
+
+  val = buf;
+  LOG(("CopyHuffmanStringFromInput decoded a full string!"));
+  return NS_OK;
+}
+
+nsresult Http2Decompressor::DoIndexed() {
+  MOZ_ASSERT(mData[mOffset] & 0x80);
+
+
+  uint32_t index;
+  nsresult rv = DecodeInteger(7, index);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  LOG(("HTTP decompressor indexed entry %u\n", index));
+
+  if (index == 0) {
+    return NS_ERROR_FAILURE;
+  }
+  index--;  
+
+  return OutputHeader(index);
+}
+
+nsresult Http2Decompressor::DoLiteralInternal(nsACString& name,
+                                              nsACString& value,
+                                              uint32_t namePrefixLen) {
+  MOZ_ASSERT(((mData[mOffset] & 0xF0) == 0x00) ||  
+             ((mData[mOffset] & 0xF0) == 0x10) ||  
+             ((mData[mOffset] & 0xC0) == 0x40));   
+
+  uint32_t index;
+  nsresult rv = DecodeInteger(namePrefixLen, index);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  if (mOffset >= mDataLen) {
+    NS_WARNING("Http2 Decompressor ran out of data");
+    return NS_ERROR_FAILURE;
+  }
+
+  bool isHuffmanEncoded;
+
+  if (!index) {
+    uint32_t nameLen;
+    isHuffmanEncoded = mData[mOffset] & (1 << 7);
+    rv = DecodeInteger(7, nameLen);
+    if (NS_SUCCEEDED(rv)) {
+      if (isHuffmanEncoded) {
+        rv = CopyHuffmanStringFromInput(nameLen, name);
+      } else {
+        rv = CopyStringFromInput(nameLen, name);
+      }
+    }
+    LOG(("Http2Decompressor::DoLiteralInternal literal name %s",
+         PromiseFlatCString(name).get()));
+  } else {
+    rv = CopyHeaderString(index - 1, name);
+    LOG(("Http2Decompressor::DoLiteralInternal indexed name %d %s", index,
+         PromiseFlatCString(name).get()));
+  }
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  if (mOffset >= mDataLen) {
+    NS_WARNING("Http2 Decompressor ran out of data");
+    return NS_ERROR_FAILURE;
+  }
+
+  uint32_t valueLen;
+  isHuffmanEncoded = mData[mOffset] & (1 << 7);
+  rv = DecodeInteger(7, valueLen);
+  if (NS_SUCCEEDED(rv)) {
+    if (isHuffmanEncoded) {
+      rv = CopyHuffmanStringFromInput(valueLen, value);
+    } else {
+      rv = CopyStringFromInput(valueLen, value);
+    }
+  }
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  int32_t newline = 0;
+  while ((newline = value.FindChar('\n', newline)) != -1) {
+    if (value[newline + 1] == ' ' || value[newline + 1] == '\t') {
+      LOG(("Http2Decompressor::Disallowing folded header value %s",
+           PromiseFlatCString(value).get()));
+      return NS_ERROR_ILLEGAL_VALUE;
+    }
+    ++newline;
+  }
+
+  LOG(("Http2Decompressor::DoLiteralInternal value %s",
+       PromiseFlatCString(value).get()));
+  return NS_OK;
+}
+
+nsresult Http2Decompressor::DoLiteralWithoutIndex() {
+  MOZ_ASSERT((mData[mOffset] & 0xF0) == 0x00);
+
+  nsAutoCString name, value;
+  nsresult rv = DoLiteralInternal(name, value, 4);
+
+  LOG(("HTTP decompressor literal without index %s %s\n", name.get(),
+       value.get()));
+
+  if (NS_SUCCEEDED(rv)) {
+    rv = OutputHeader(name, value);
+  }
+  return rv;
+}
+
+nsresult Http2Decompressor::DoLiteralWithIncremental() {
+  MOZ_ASSERT((mData[mOffset] & 0xC0) == 0x40);
+
+  nsAutoCString name, value;
+  nsresult rv = DoLiteralInternal(name, value, 6);
+  if (NS_SUCCEEDED(rv)) {
+    rv = OutputHeader(name, value);
+  }
+  if (NS_FAILED(rv) && rv != NS_ERROR_NET_RESET) {
+    return rv;
+  }
+
+  uint32_t room = nvPair(name, value).Size();
+  if (room > mMaxBuffer) {
+    ClearHeaderTable();
+    LOG(
+        ("HTTP decompressor literal with index not inserted due to size %u %s "
+         "%s\n",
+         room, name.get(), value.get()));
+    DumpState("Decompressor state after ClearHeaderTable");
+    return rv;
+  }
+
+  MakeRoom(room, "decompressor");
+
+  mHeaderTable.AddElement(name, value);
+
+  uint32_t currentSize = mHeaderTable.ByteCount();
+  if (currentSize > mPeakSize) {
+    mPeakSize = currentSize;
+  }
+
+  uint32_t currentCount = mHeaderTable.VariableLength();
+  if (currentCount > mPeakCount) {
+    mPeakCount = currentCount;
+  }
+
+  LOG(("HTTP decompressor literal with index 0 %s %s\n", name.get(),
+       value.get()));
+
+  return rv;
+}
+
+nsresult Http2Decompressor::DoLiteralNeverIndexed() {
+  MOZ_ASSERT((mData[mOffset] & 0xF0) == 0x10);
+
+  nsAutoCString name, value;
+  nsresult rv = DoLiteralInternal(name, value, 4);
+
+  LOG(("HTTP decompressor literal never indexed %s %s\n", name.get(),
+       value.get()));
+
+  if (NS_SUCCEEDED(rv)) {
+    rv = OutputHeader(name, value);
+  }
+  return rv;
+}
+
+nsresult Http2Decompressor::DoContextUpdate() {
+  MOZ_ASSERT((mData[mOffset] & 0xE0) == 0x20);
+
+  uint32_t newMaxSize;
+  nsresult rv = DecodeInteger(5, newMaxSize);
+  LOG(("Http2Decompressor::DoContextUpdate new maximum size %u", newMaxSize));
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  if (newMaxSize > mMaxBufferSetting) {
+    return NS_ERROR_FAILURE;
+  }
+
+  SetMaxBufferSizeInternal(newMaxSize);
+
+  return NS_OK;
+}
+
+
+Http2Compressor::~Http2Compressor() = default;
+
+nsresult Http2Compressor::EncodeHeaderBlock(
+    const nsCString& nvInput, const nsACString& method, const nsACString& path,
+    const nsACString& host, const nsACString& scheme,
+    const nsACString& protocol, bool simpleConnectForm, nsACString& output,
+    bool addTEHeader) {
+  mSetInitialMaxBufferSizeAllowed = false;
+  mOutput = &output;
+  output.Truncate();
+  mParsedContentLength = -1;
+
+  bool isWebsocket = (!simpleConnectForm && !protocol.IsEmpty());
+
+  if (mBufferSizeChangeWaiting) {
+    if (mLowestBufferSizeWaiting < mMaxBufferSetting) {
+      EncodeTableSizeChange(mLowestBufferSizeWaiting);
+    }
+    EncodeTableSizeChange(mMaxBufferSetting);
+    mBufferSizeChangeWaiting = false;
+  }
+
+  if (!simpleConnectForm) {
+    ProcessHeader(nvPair(":method"_ns, method), false, false);
+    ProcessHeader(nvPair(":path"_ns, path), true, false);
+    ProcessHeader(nvPair(":authority"_ns, host), false, false);
+    ProcessHeader(nvPair(":scheme"_ns, scheme), false, false);
+    if (isWebsocket) {
+      ProcessHeader(nvPair(":protocol"_ns, protocol), false, false);
+    }
+  } else {
+    ProcessHeader(nvPair(":method"_ns, method), false, false);
+    ProcessHeader(nvPair(":authority"_ns, host), false, false);
+  }
+
+  const char* beginBuffer = nvInput.BeginReading();
+
+  int32_t crlfIndex = nvInput.Find("\r\n");
+  while (true) {
+    int32_t startIndex = crlfIndex + 2;
+
+    crlfIndex = nvInput.Find("\r\n", startIndex);
+    if (crlfIndex == -1) {
+      break;
+    }
+
+    int32_t colonIndex = Substring(nvInput, 0, crlfIndex).Find(":", startIndex);
+    if (colonIndex == -1) {
+      break;
+    }
+
+    nsDependentCSubstring name =
+        Substring(beginBuffer + startIndex, beginBuffer + colonIndex);
+    ToLowerCase(name);
+
+    if (name.EqualsLiteral("connection") || name.EqualsLiteral("host") ||
+        name.EqualsLiteral("keep-alive") ||
+        name.EqualsLiteral("proxy-connection") || name.EqualsLiteral("te") ||
+        name.EqualsLiteral("transfer-encoding") ||
+        name.EqualsLiteral("upgrade") ||
+        name.EqualsLiteral("sec-websocket-key")) {
+      continue;
+    }
+
+    bool isColonHeader = false;
+    for (const char* cPtr = name.BeginReading();
+         cPtr && cPtr < name.EndReading(); ++cPtr) {
+      if (*cPtr == ':') {
+        isColonHeader = true;
+        break;
+      }
+      if (*cPtr != ' ' && *cPtr != '\t') {
+        isColonHeader = false;
+        break;
+      }
+    }
+    if (isColonHeader) {
+      continue;
+    }
+
+    int32_t valueIndex = colonIndex + 1;
+
+    while (valueIndex < crlfIndex && beginBuffer[valueIndex] == ' ') {
+      ++valueIndex;
+    }
+
+    nsDependentCSubstring value =
+        Substring(beginBuffer + valueIndex, beginBuffer + crlfIndex);
+
+    if (name.EqualsLiteral("content-length")) {
+      int64_t len;
+      nsCString tmp(value);
+      if (nsHttp::ParseInt64(tmp.get(), nullptr, &len)) {
+        mParsedContentLength = len;
+      }
+    }
+
+    if (name.EqualsLiteral("cookie")) {
+      bool haveMoreCookies = true;
+      int32_t nextCookie = valueIndex;
+      while (haveMoreCookies) {
+        int32_t semiSpaceIndex =
+            Substring(nvInput, 0, crlfIndex).Find("; ", nextCookie);
+        if (semiSpaceIndex == -1) {
+          haveMoreCookies = false;
+          semiSpaceIndex = crlfIndex;
+        }
+        nsDependentCSubstring cookie =
+            Substring(beginBuffer + nextCookie, beginBuffer + semiSpaceIndex);
+        ProcessHeader(nvPair(name, cookie), false, cookie.Length() < 20);
+        nextCookie = semiSpaceIndex + 2;
+      }
+    } else {
+      ProcessHeader(nvPair(name, value), false,
+                    name.EqualsLiteral("authorization"));
+    }
+  }
+
+  if (addTEHeader && !simpleConnectForm && !isWebsocket) {
+    nsAutoCString te("te");
+    nsAutoCString trailers("trailers");
+    ProcessHeader(nvPair(te, trailers), false, false);
+  }
+
+  mOutput = nullptr;
+  DumpState("Compressor state after EncodeHeaderBlock");
+  return NS_OK;
+}
+
+void Http2Compressor::DoOutput(Http2Compressor::outputCode code,
+                               const class nvPair* pair, uint32_t index) {
+  uint32_t offset = mOutput->Length();
+  uint8_t* startByte;
+
+  switch (code) {
+    case kNeverIndexedLiteral:
+      LOG(
+          ("HTTP compressor %p neverindex literal with name reference %u %s "
+           "%s\n",
+           this, index, pair->mName.get(), pair->mValue.get()));
+
+      EncodeInteger(4, index);  
+      startByte =
+          reinterpret_cast<unsigned char*>(mOutput->BeginWriting()) + offset;
+      *startByte = (*startByte & 0x0f) | 0x10;
+
+      if (!index) {
+        HuffmanAppend(pair->mName);
+      }
+
+      HuffmanAppend(pair->mValue);
+      break;
+
+    case kPlainLiteral:
+      LOG(("HTTP compressor %p noindex literal with name reference %u %s %s\n",
+           this, index, pair->mName.get(), pair->mValue.get()));
+
+      EncodeInteger(4, index);  
+      startByte =
+          reinterpret_cast<unsigned char*>(mOutput->BeginWriting()) + offset;
+      *startByte = *startByte & 0x0f;
+
+      if (!index) {
+        HuffmanAppend(pair->mName);
+      }
+
+      HuffmanAppend(pair->mValue);
+      break;
+
+    case kIndexedLiteral:
+      LOG(("HTTP compressor %p literal with name reference %u %s %s\n", this,
+           index, pair->mName.get(), pair->mValue.get()));
+
+      EncodeInteger(6, index);  
+      startByte =
+          reinterpret_cast<unsigned char*>(mOutput->BeginWriting()) + offset;
+      *startByte = (*startByte & 0x3f) | 0x40;
+
+      if (!index) {
+        HuffmanAppend(pair->mName);
+      }
+
+      HuffmanAppend(pair->mValue);
+      break;
+
+    case kIndex:
+      LOG(("HTTP compressor %p index %u %s %s\n", this, index,
+           pair->mName.get(), pair->mValue.get()));
+      EncodeInteger(7, index + 1);
+      startByte =
+          reinterpret_cast<unsigned char*>(mOutput->BeginWriting()) + offset;
+      *startByte = *startByte | 0x80;  
+      break;
+  }
+}
+
+void Http2Compressor::EncodeInteger(uint32_t prefixLen, uint32_t val) {
+  uint32_t mask = (1 << prefixLen) - 1;
+  uint8_t tmp;
+
+  if (val < mask) {
+    tmp = val;
+    mOutput->Append(reinterpret_cast<char*>(&tmp), 1);
+    return;
+  }
+
+  if (mask) {
+    val -= mask;
+    tmp = mask;
+    mOutput->Append(reinterpret_cast<char*>(&tmp), 1);
+  }
+
+  uint32_t q, r;
+  do {
+    q = val / 128;
+    r = val % 128;
+    tmp = r;
+    if (q) {
+      tmp |= 0x80;  
+    }
+    val = q;
+    mOutput->Append(reinterpret_cast<char*>(&tmp), 1);
+  } while (q);
+}
+
+void Http2Compressor::HuffmanAppend(const nsCString& value) {
+  nsAutoCString buf;
+  uint8_t bitsLeft = 8;
+  uint32_t length = value.Length();
+  uint32_t offset;
+  uint8_t* startByte;
+
+  for (uint32_t i = 0; i < length; ++i) {
+    uint8_t idx = static_cast<uint8_t>(value[i]);
+    uint8_t huffLength = HuffmanOutgoing[idx].mLength;
+    uint32_t huffValue = HuffmanOutgoing[idx].mValue;
+
+    if (bitsLeft < 8) {
+      uint32_t val;
+      if (huffLength >= bitsLeft) {
+        val = huffValue & ~((1 << (huffLength - bitsLeft)) - 1);
+        val >>= (huffLength - bitsLeft);
+      } else {
+        val = huffValue << (bitsLeft - huffLength);
+      }
+      val &= ((1 << bitsLeft) - 1);
+      offset = buf.Length() - 1;
+      startByte = reinterpret_cast<unsigned char*>(buf.BeginWriting()) + offset;
+      *startByte = *startByte | static_cast<uint8_t>(val & 0xFF);
+      if (huffLength >= bitsLeft) {
+        huffLength -= bitsLeft;
+        bitsLeft = 8;
+      } else {
+        bitsLeft -= huffLength;
+        huffLength = 0;
+      }
+    }
+
+    while (huffLength >= 8) {
+      uint32_t mask = ~((1 << (huffLength - 8)) - 1);
+      uint8_t val = ((huffValue & mask) >> (huffLength - 8)) & 0xFF;
+      buf.Append(reinterpret_cast<char*>(&val), 1);
+      huffLength -= 8;
+    }
+
+    if (huffLength) {
+      bitsLeft = 8 - huffLength;
+      uint8_t val = (huffValue & ((1 << huffLength) - 1)) << bitsLeft;
+      buf.Append(reinterpret_cast<char*>(&val), 1);
+    }
+  }
+
+  if (bitsLeft != 8) {
+    uint8_t val = (1 << bitsLeft) - 1;
+    offset = buf.Length() - 1;
+    startByte = reinterpret_cast<unsigned char*>(buf.BeginWriting()) + offset;
+    *startByte = *startByte | val;
+  }
+
+  uint32_t bufLength = buf.Length();
+  offset = mOutput->Length();
+  EncodeInteger(7, bufLength);
+  startByte =
+      reinterpret_cast<unsigned char*>(mOutput->BeginWriting()) + offset;
+  *startByte = *startByte | 0x80;
+
+  mOutput->Append(buf);
+  LOG(
+      ("Http2Compressor::HuffmanAppend %p encoded %d byte original on %d "
+       "bytes.\n",
+       this, length, bufLength));
+}
+
+void Http2Compressor::ProcessHeader(const nvPair inputPair, bool noLocalIndex,
+                                    bool neverIndex) {
+  uint32_t newSize = inputPair.Size();
+  uint32_t headerTableSize = mHeaderTable.Length();
+  uint32_t matchedIndex = 0u;
+  uint32_t nameReference = 0u;
+  bool match = false;
+
+  LOG(("Http2Compressor::ProcessHeader %s %s", inputPair.mName.get(),
+       inputPair.mValue.get()));
+
+  for (uint32_t index = 0; index < headerTableSize; ++index) {
+    if (mHeaderTable[index]->mName.Equals(inputPair.mName)) {
+      nameReference = index + 1;
+      if (mHeaderTable[index]->mValue.Equals(inputPair.mValue)) {
+        match = true;
+        matchedIndex = index;
+        break;
+      }
+    }
+  }
+
+  if (!match || noLocalIndex || neverIndex) {
+    if (neverIndex) {
+      DoOutput(kNeverIndexedLiteral, &inputPair, nameReference);
+      DumpState("Compressor state after literal never index");
+      return;
+    }
+
+    if (noLocalIndex || (newSize > (mMaxBuffer / 2)) || (mMaxBuffer < 128)) {
+      DoOutput(kPlainLiteral, &inputPair, nameReference);
+      DumpState("Compressor state after literal without index");
+      return;
+    }
+
+    MakeRoom(newSize, "compressor");
+    DoOutput(kIndexedLiteral, &inputPair, nameReference);
+
+    mHeaderTable.AddElement(inputPair.mName, inputPair.mValue);
+    LOG(("HTTP compressor %p new literal placed at index 0\n", this));
+    DumpState("Compressor state after literal with index");
+    return;
+  }
+
+  DoOutput(kIndex, &inputPair, matchedIndex);
+
+  DumpState("Compressor state after index");
+}
+
+void Http2Compressor::EncodeTableSizeChange(uint32_t newMaxSize) {
+  uint32_t offset = mOutput->Length();
+  EncodeInteger(5, newMaxSize);
+  uint8_t* startByte =
+      reinterpret_cast<uint8_t*>(mOutput->BeginWriting()) + offset;
+  *startByte = *startByte | 0x20;
+}
+
+void Http2Compressor::SetMaxBufferSize(uint32_t maxBufferSize) {
+  mMaxBufferSetting = maxBufferSize;
+  SetMaxBufferSizeInternal(maxBufferSize);
+  if (!mBufferSizeChangeWaiting) {
+    mBufferSizeChangeWaiting = true;
+    mLowestBufferSizeWaiting = maxBufferSize;
+  } else if (maxBufferSize < mLowestBufferSizeWaiting) {
+    mLowestBufferSizeWaiting = maxBufferSize;
+  }
+}
+
+}  
+}  

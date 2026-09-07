@@ -1,0 +1,59 @@
+/*
+ * Copyright 2015 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkTraceMemoryDump_DEFINED)
+#define SkTraceMemoryDump_DEFINED
+
+#include "include/core/SkTypes.h"
+
+class SkDiscardableMemory;
+
+class SK_API SkTraceMemoryDump {
+public:
+    enum LevelOfDetail {
+        kLight_LevelOfDetail,
+
+        kObjectsBreakdowns_LevelOfDetail
+    };
+
+    virtual void dumpNumericValue(const char* dumpName,
+                                  const char* valueName,
+                                  const char* units,
+                                  uint64_t value) = 0;
+
+    virtual void dumpStringValue(const char* ,
+                                 const char* ,
+                                 const char* ) { }
+
+    virtual void setMemoryBacking(const char* dumpName,
+                                  const char* backingType,
+                                  const char* backingObjectId) = 0;
+
+    virtual void setDiscardableMemoryBacking(
+        const char* dumpName,
+        const SkDiscardableMemory& discardableMemoryObject) = 0;
+
+    virtual LevelOfDetail getRequestedDetails() const = 0;
+
+    virtual bool shouldDumpWrappedObjects() const { return true; }
+
+    virtual void dumpWrappedState(const char* , bool ) {}
+
+    virtual bool shouldDumpUnbudgetedObjects() const { return true; }
+
+    virtual void dumpBudgetedState(const char* , bool ) {}
+
+    virtual bool shouldDumpSizelessObjects() const { return false; }
+
+protected:
+    virtual ~SkTraceMemoryDump() = default;
+    SkTraceMemoryDump() = default;
+    SkTraceMemoryDump(const SkTraceMemoryDump&) = delete;
+    SkTraceMemoryDump& operator=(const SkTraceMemoryDump&) = delete;
+};
+
+#endif

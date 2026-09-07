@@ -1,0 +1,103 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_htmlaccel_htmlaccelNotInline_h
+#define mozilla_htmlaccel_htmlaccelNotInline_h
+
+#include "mozilla/Attributes.h"
+
+#include <cstddef>
+
+namespace mozilla::htmlaccel {
+MOZ_NEVER_INLINE bool ContainsMarkup(const char16_t* aPtr,
+                                     const char16_t* aEnd);
+
+
+
+MOZ_NEVER_INLINE std::size_t SkipNonEscapedInTextNode(const char16_t* aPtr,
+                                                      const char16_t* aEnd);
+
+MOZ_NEVER_INLINE std::size_t SkipNonEscapedInTextNode(const char* aPtr,
+                                                      const char* aEnd);
+
+MOZ_NEVER_INLINE std::size_t SkipNonEscapedInAttributeValue(
+    const char16_t* aPtr, const char16_t* aEnd);
+
+MOZ_NEVER_INLINE uint32_t CountEscapedInTextNode(const char16_t* aPtr,
+                                                 const char16_t* aEnd);
+
+MOZ_NEVER_INLINE uint32_t CountEscapedInTextNode(const char* aPtr,
+                                                 const char* aEnd);
+
+MOZ_NEVER_INLINE uint32_t CountEscapedInAttributeValue(const char16_t* aPtr,
+                                                       const char16_t* aEnd);
+
+
+
+MOZ_NEVER_INLINE int32_t AccelerateDataFastest(const char16_t* aPtr,
+                                               const char16_t* aEnd);
+
+MOZ_NEVER_INLINE int32_t AccelerateDataViewSource(const char16_t* aPtr,
+                                                  const char16_t* aEnd);
+
+MOZ_NEVER_INLINE int32_t AccelerateDataLineCol(const char16_t* aPtr,
+                                               const char16_t* aEnd);
+
+MOZ_NEVER_INLINE int32_t AccelerateRawtextFastest(const char16_t* aPtr,
+                                                  const char16_t* aEnd);
+
+MOZ_NEVER_INLINE int32_t AccelerateRawtextViewSource(const char16_t* aPtr,
+                                                     const char16_t* aEnd);
+
+MOZ_NEVER_INLINE int32_t AccelerateRawtextLineCol(const char16_t* aPtr,
+                                                  const char16_t* aEnd);
+
+MOZ_NEVER_INLINE int32_t AccelerateCommentFastest(const char16_t* aPtr,
+                                                  const char16_t* aEnd);
+
+MOZ_NEVER_INLINE int32_t AccelerateCommentViewSource(const char16_t* aPtr,
+                                                     const char16_t* aEnd);
+
+MOZ_NEVER_INLINE int32_t AccelerateCommentLineCol(const char16_t* aPtr,
+                                                  const char16_t* aEnd);
+
+MOZ_NEVER_INLINE int32_t AccelerateAttributeValueSingleQuotedFastest(
+    const char16_t* aPtr, const char16_t* aEnd);
+
+MOZ_NEVER_INLINE int32_t AccelerateAttributeValueSingleQuotedViewSource(
+    const char16_t* aPtr, const char16_t* aEnd);
+
+MOZ_NEVER_INLINE int32_t AccelerateAttributeValueSingleQuotedLineCol(
+    const char16_t* aPtr, const char16_t* aEnd);
+
+MOZ_NEVER_INLINE int32_t AccelerateAttributeValueDoubleQuotedFastest(
+    const char16_t* aPtr, const char16_t* aEnd);
+
+MOZ_NEVER_INLINE int32_t AccelerateAttributeValueDoubleQuotedViewSource(
+    const char16_t* aPtr, const char16_t* aEnd);
+
+MOZ_NEVER_INLINE int32_t AccelerateAttributeValueDoubleQuotedLineCol(
+    const char16_t* aPtr, const char16_t* aEnd);
+
+MOZ_NEVER_INLINE int32_t AccelerateCdataSectionFastest(const char16_t* aPtr,
+                                                       const char16_t* aEnd);
+
+MOZ_NEVER_INLINE int32_t AccelerateCdataSectionViewSource(const char16_t* aPtr,
+                                                          const char16_t* aEnd);
+
+MOZ_NEVER_INLINE int32_t AccelerateCdataSectionLineCol(const char16_t* aPtr,
+                                                       const char16_t* aEnd);
+
+MOZ_NEVER_INLINE int32_t AcceleratePlaintextFastest(const char16_t* aPtr,
+                                                    const char16_t* aEnd);
+
+MOZ_NEVER_INLINE int32_t AcceleratePlaintextViewSource(const char16_t* aPtr,
+                                                       const char16_t* aEnd);
+
+MOZ_NEVER_INLINE int32_t AcceleratePlaintextLineCol(const char16_t* aPtr,
+                                                    const char16_t* aEnd);
+
+}  
+
+#endif  // mozilla_htmlaccel_htmlaccelNotInline_h

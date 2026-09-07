@@ -1,0 +1,136 @@
+/*
+ * Copyright (c) 2016, Alliance for Open Media. All rights reserved.
+ *
+ * This source code is subject to the terms of the BSD 2 Clause License and
+ * the Alliance for Open Media Patent License 1.0. If the BSD 2 Clause License
+ * was not distributed with this source code in the LICENSE file, you can
+ * obtain it at www.aomedia.org/license/software. If the Alliance for Open
+ * Media Patent License 1.0 was not distributed with this source code in the
+ * PATENTS file, you can obtain it at www.aomedia.org/license/patent.
+ */
+
+#if !defined(AOM_AOM_DSP_TXFM_COMMON_H_)
+#define AOM_AOM_DSP_TXFM_COMMON_H_
+
+#include "aom_dsp/aom_dsp_common.h"
+
+#define DCT_CONST_BITS 14
+#define DCT_CONST_ROUNDING (1 << (DCT_CONST_BITS - 1))
+
+#define UNIT_QUANT_SHIFT 2
+#define UNIT_QUANT_FACTOR (1 << UNIT_QUANT_SHIFT)
+
+enum {
+  TX_4X4,             
+  TX_8X8,             
+  TX_16X16,           
+  TX_32X32,           
+  TX_64X64,           
+  TX_4X8,             
+  TX_8X4,             
+  TX_8X16,            
+  TX_16X8,            
+  TX_16X32,           
+  TX_32X16,           
+  TX_32X64,           
+  TX_64X32,           
+  TX_4X16,            
+  TX_16X4,            
+  TX_8X32,            
+  TX_32X8,            
+  TX_16X64,           
+  TX_64X16,           
+  TX_SIZES_ALL,       
+  TX_SIZES = TX_4X8,  
+  TX_SIZES_LARGEST = TX_64X64,
+  TX_INVALID = 255  
+} UENUM1BYTE(TX_SIZE);
+
+enum {
+  DCT_DCT,            
+  ADST_DCT,           
+  DCT_ADST,           
+  ADST_ADST,          
+  FLIPADST_DCT,       
+  DCT_FLIPADST,       
+  FLIPADST_FLIPADST,  
+  ADST_FLIPADST,      
+  FLIPADST_ADST,      
+  IDTX,               
+  V_DCT,              
+  H_DCT,              
+  V_ADST,             
+  H_ADST,             
+  V_FLIPADST,         
+  H_FLIPADST,         
+  TX_TYPES,
+  DCT_ADST_TX_MASK = 0x000F,  
+  TX_TYPE_INVALID = 255,      
+} UENUM1BYTE(TX_TYPE);
+
+enum {
+  EXT_TX_SET_DCTONLY,
+  EXT_TX_SET_DCT_IDTX,
+  EXT_TX_SET_DTT4_IDTX,
+  EXT_TX_SET_DTT4_IDTX_1DDCT,
+  EXT_TX_SET_DTT9_IDTX_1DDCT,
+  EXT_TX_SET_ALL16,
+  EXT_TX_SET_TYPES
+} UENUM1BYTE(TxSetType);
+
+typedef struct txfm_param {
+  TX_TYPE tx_type;
+  TX_SIZE tx_size;
+  int lossless;
+  int bd;
+  int is_hbd;
+  TxSetType tx_set_type;
+  int eob;
+} TxfmParam;
+
+static const tran_high_t cospi_1_64 = 16364;
+static const tran_high_t cospi_2_64 = 16305;
+static const tran_high_t cospi_3_64 = 16207;
+static const tran_high_t cospi_4_64 = 16069;
+static const tran_high_t cospi_5_64 = 15893;
+static const tran_high_t cospi_6_64 = 15679;
+static const tran_high_t cospi_7_64 = 15426;
+static const tran_high_t cospi_8_64 = 15137;
+static const tran_high_t cospi_9_64 = 14811;
+static const tran_high_t cospi_10_64 = 14449;
+static const tran_high_t cospi_11_64 = 14053;
+static const tran_high_t cospi_12_64 = 13623;
+static const tran_high_t cospi_13_64 = 13160;
+static const tran_high_t cospi_14_64 = 12665;
+static const tran_high_t cospi_15_64 = 12140;
+static const tran_high_t cospi_16_64 = 11585;
+static const tran_high_t cospi_17_64 = 11003;
+static const tran_high_t cospi_18_64 = 10394;
+static const tran_high_t cospi_19_64 = 9760;
+static const tran_high_t cospi_20_64 = 9102;
+static const tran_high_t cospi_21_64 = 8423;
+static const tran_high_t cospi_22_64 = 7723;
+static const tran_high_t cospi_23_64 = 7005;
+static const tran_high_t cospi_24_64 = 6270;
+static const tran_high_t cospi_25_64 = 5520;
+static const tran_high_t cospi_26_64 = 4756;
+static const tran_high_t cospi_27_64 = 3981;
+static const tran_high_t cospi_28_64 = 3196;
+static const tran_high_t cospi_29_64 = 2404;
+static const tran_high_t cospi_30_64 = 1606;
+static const tran_high_t cospi_31_64 = 804;
+
+static const tran_high_t sinpi_1_9 = 5283;
+static const tran_high_t sinpi_2_9 = 9929;
+static const tran_high_t sinpi_3_9 = 13377;
+static const tran_high_t sinpi_4_9 = 15212;
+
+static const tran_high_t Sqrt2 = 23170;
+static const tran_high_t InvSqrt2 = 11585;
+
+static inline tran_high_t fdct_round_shift(tran_high_t input) {
+  tran_high_t rv = ROUND_POWER_OF_TWO(input, DCT_CONST_BITS);
+  return rv;
+}
+
+#endif

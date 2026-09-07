@@ -1,0 +1,136 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsRangeFrame_h_
+#define nsRangeFrame_h_
+
+#include "mozilla/Decimal.h"
+#include "mozilla/EventForwards.h"
+#include "nsCOMPtr.h"
+#include "nsContainerFrame.h"
+#include "nsIAnonymousContentCreator.h"
+#include "nsTArray.h"
+
+class nsDisplayRangeFocusRing;
+
+namespace mozilla {
+class ListMutationObserver;
+class PresShell;
+namespace dom {
+class Event;
+class HTMLInputElement;
+}  
+}  
+
+class nsRangeFrame final : public nsContainerFrame,
+                           public nsIAnonymousContentCreator {
+  friend nsIFrame* NS_NewRangeFrame(mozilla::PresShell* aPresShell,
+                                    ComputedStyle* aStyle);
+
+  void Init(nsIContent* aContent, nsContainerFrame* aParent,
+            nsIFrame* aPrevInFlow) override;
+
+  friend class nsDisplayRangeFocusRing;
+
+  explicit nsRangeFrame(ComputedStyle* aStyle, nsPresContext* aPresContext);
+  virtual ~nsRangeFrame();
+
+  using Element = mozilla::dom::Element;
+
+ public:
+  NS_DECL_QUERYFRAME
+  NS_DECL_FRAMEARENA_HELPERS(nsRangeFrame)
+
+  void Destroy(DestroyContext&) override;
+
+  void BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                        const nsDisplayListSet& aLists) override;
+
+  void Reflow(nsPresContext* aPresContext, ReflowOutput& aDesiredSize,
+              const ReflowInput& aReflowInput,
+              nsReflowStatus& aStatus) override;
+
+#ifdef DEBUG_FRAME_DUMP
+  nsresult GetFrameName(nsAString& aResult) const override {
+    return MakeFrameName(u"Range"_ns, aResult);
+  }
+#endif
+
+#ifdef ACCESSIBILITY
+  mozilla::a11y::AccType AccessibleType() override;
+#endif
+
+  nsresult CreateAnonymousContent(nsTArray<ContentInfo>& aElements) override;
+  void AppendAnonymousContentTo(nsTArray<nsIContent*>& aElements,
+                                uint32_t aFilter) override;
+
+  nsresult AttributeChanged(int32_t aNameSpaceID, nsAtom* aAttribute,
+                            AttrModType aModType) override;
+
+  nscoord IntrinsicISize(const mozilla::IntrinsicSizeInput& aInput,
+                         mozilla::IntrinsicISizeType aType) override;
+
+  bool IsHorizontal() const;
+
+  bool IsInlineOriented() const {
+    return IsHorizontal() != GetWritingMode().IsVertical();
+  }
+
+  bool IsRightToLeft() const {
+    MOZ_ASSERT(IsHorizontal());
+    return GetWritingMode().IsPhysicalRTL();
+  }
+
+  bool IsUpwards() const {
+    MOZ_ASSERT(!IsHorizontal());
+    mozilla::WritingMode wm = GetWritingMode();
+    return wm.GetBlockDir() == mozilla::WritingMode::BlockDir::TB ||
+           wm.GetInlineDir() == mozilla::WritingMode::InlineDir::BTT;
+  }
+
+  double GetMin() const;
+  double GetMax() const;
+  double GetValue() const;
+
+  double GetValueAsFractionOfRange();
+
+  double GetDoubleAsFractionOfRange(const mozilla::Decimal& value);
+
+  bool ShouldUseNativeStyle() const;
+
+  mozilla::Decimal GetValueAtEventPoint(mozilla::WidgetGUIEvent* aEvent);
+
+  void UpdateForValueChange();
+
+  nsTArray<mozilla::Decimal> TickMarks();
+
+  mozilla::Decimal NearestTickMark(const mozilla::Decimal& aValue);
+
+ protected:
+  mozilla::dom::HTMLInputElement& InputElement() const;
+
+ private:
+  nscoord AutoCrossSize();
+
+  void ReflowChildFrames(nsPresContext* aPresContext,
+                         ReflowOutput& aDesiredSize,
+                         const mozilla::LogicalSize& aContentBoxSize,
+                         const ReflowInput& aReflowInput);
+
+  void DoUpdateThumbPosition(nsIFrame* aThumbFrame,
+                             const nsSize& aRangeContentBoxSize);
+
+  void DoUpdateRangeProgressFrame(nsIFrame* aProgressFrame,
+                                  const nsSize& aRangeContentBoxSize);
+
+  nsCOMPtr<Element> mTrackDiv;
+
+  nsCOMPtr<Element> mProgressDiv;
+
+  nsCOMPtr<Element> mThumbDiv;
+
+  RefPtr<mozilla::ListMutationObserver> mListMutationObserver;
+};
+
+#endif

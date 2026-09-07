@@ -1,0 +1,330 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "WorkerThread.h"
+
+#include "WorkerPrivate.h"
+#include "WorkerRunnable.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/CycleCollectedJSContext.h"
+#include "mozilla/EventQueue.h"
+#include "mozilla/Logging.h"
+#include "mozilla/NotNull.h"
+#include "mozilla/ThreadEventQueue.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/ipc/BackgroundChild.h"
+#include "nsCOMPtr.h"
+#include "nsDebug.h"
+#include "nsICancelableRunnable.h"
+#include "nsIEventTarget.h"
+#include "nsIRunnable.h"
+#include "nsIThreadInternal.h"
+#include "nsString.h"
+#include "nsThreadUtils.h"
+#include "prthread.h"
+
+static mozilla::LazyLogModule gWorkerThread("WorkerThread");
+#ifdef LOGV
+#  undef LOGV
+#endif
+#define LOGV(msg) MOZ_LOG(gWorkerThread, LogLevel::Verbose, msg);
+
+namespace mozilla {
+
+using namespace ipc;
+
+namespace dom {
+
+WorkerThreadFriendKey::WorkerThreadFriendKey() {
+  MOZ_COUNT_CTOR(WorkerThreadFriendKey);
+}
+
+WorkerThreadFriendKey::~WorkerThreadFriendKey() {
+  MOZ_COUNT_DTOR(WorkerThreadFriendKey);
+}
+
+class WorkerThread::Observer final : public nsIThreadObserver {
+  WorkerPrivate* mWorkerPrivate;
+
+ public:
+  explicit Observer(WorkerPrivate* aWorkerPrivate)
+      : mWorkerPrivate(aWorkerPrivate) {
+    MOZ_ASSERT(aWorkerPrivate);
+    aWorkerPrivate->AssertIsOnWorkerThread();
+  }
+
+  NS_DECL_THREADSAFE_ISUPPORTS
+
+ private:
+  ~Observer() { mWorkerPrivate->AssertIsOnWorkerThread(); }
+
+  NS_DECL_NSITHREADOBSERVER
+};
+
+WorkerThread::WorkerThread(ConstructorKey)
+    : nsThread(
+          MakeNotNull<ThreadEventQueue*>(MakeUnique<mozilla::EventQueue>()),
+          nsThread::NOT_MAIN_THREAD,
+          {.stackSize = nsIThreadManager::LargeStackSize()}),
+      mLock("WorkerThread::mLock"),
+      mWorkerPrivateCondVar(mLock, "WorkerThread::mWorkerPrivateCondVar"),
+      mWorkerPrivate(nullptr),
+      mOtherThreadsDispatchingViaEventTarget(0)
+#ifdef DEBUG
+      ,
+      mAcceptingNonWorkerRunnables(true)
+#endif
+{
+}
+
+WorkerThread::~WorkerThread() {
+  MOZ_ASSERT(!mWorkerPrivate);
+  MOZ_ASSERT(!mOtherThreadsDispatchingViaEventTarget);
+  MOZ_ASSERT(mAcceptingNonWorkerRunnables);
+}
+
+SafeRefPtr<WorkerThread> WorkerThread::Create(
+    const WorkerThreadFriendKey& ) {
+  SafeRefPtr<WorkerThread> thread =
+      MakeSafeRefPtr<WorkerThread>(ConstructorKey());
+  if (NS_FAILED(thread->Init("DOM Worker"_ns))) {
+    NS_WARNING("Failed to create new thread!");
+    return nullptr;
+  }
+
+  return thread;
+}
+
+void WorkerThread::SetWorker(const WorkerThreadFriendKey& ,
+                             WorkerPrivate* aWorkerPrivate) {
+  MOZ_ASSERT(PR_GetCurrentThread() == mThread);
+  MOZ_ASSERT(aWorkerPrivate);
+
+  {
+    MutexAutoLock lock(mLock);
+
+    MOZ_ASSERT(!mWorkerPrivate);
+    MOZ_ASSERT(mAcceptingNonWorkerRunnables);
+
+    mWorkerPrivate = aWorkerPrivate;
+#ifdef DEBUG
+    mAcceptingNonWorkerRunnables = false;
+#endif
+  }
+
+  mObserver = new Observer(aWorkerPrivate);
+  MOZ_ALWAYS_SUCCEEDS(AddObserver(mObserver));
+}
+
+void WorkerThread::ClearEventQueueAndWorker(
+    const WorkerThreadFriendKey& ) {
+  MOZ_ASSERT(PR_GetCurrentThread() == mThread);
+
+  MOZ_ALWAYS_SUCCEEDS(RemoveObserver(mObserver));
+  mObserver = nullptr;
+
+  {
+    MutexAutoLock lock(mLock);
+
+    MOZ_ASSERT(mWorkerPrivate);
+    MOZ_ASSERT(!mAcceptingNonWorkerRunnables);
+    while (mOtherThreadsDispatchingViaEventTarget) {
+      mWorkerPrivateCondVar.Wait();
+    }
+    if (NS_HasPendingEvents(nullptr)) {
+      NS_ProcessPendingEvents(nullptr);
+    }
+#ifdef DEBUG
+    mAcceptingNonWorkerRunnables = true;
+#endif
+    mWorkerPrivate = nullptr;
+  }
+}
+
+nsresult WorkerThread::DispatchPrimaryRunnable(
+    const WorkerThreadFriendKey& ,
+    already_AddRefed<nsIRunnable> aRunnable) {
+  nsCOMPtr<nsIRunnable> runnable(aRunnable);
+
+#ifdef DEBUG
+  MOZ_ASSERT(PR_GetCurrentThread() != mThread);
+  MOZ_ASSERT(runnable);
+  {
+    MutexAutoLock lock(mLock);
+
+    MOZ_ASSERT(!mWorkerPrivate);
+    MOZ_ASSERT(mAcceptingNonWorkerRunnables);
+  }
+#endif
+
+  nsresult rv = nsThread::Dispatch(runnable.forget(), NS_DISPATCH_FALLIBLE);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  return NS_OK;
+}
+
+nsresult WorkerThread::DispatchAnyThread(
+    const WorkerThreadFriendKey& ,
+    RefPtr<WorkerRunnable> aWorkerRunnable) {
+
+#ifdef DEBUG
+  {
+    const bool onWorkerThread = PR_GetCurrentThread() == mThread;
+    {
+      MutexAutoLock lock(mLock);
+
+      MOZ_ASSERT(mWorkerPrivate);
+      MOZ_ASSERT(!mAcceptingNonWorkerRunnables);
+
+      if (onWorkerThread) {
+        mWorkerPrivate->AssertIsOnWorkerThread();
+      }
+    }
+  }
+#endif
+
+  nsresult rv =
+      nsThread::Dispatch(aWorkerRunnable.forget(), NS_DISPATCH_FALLIBLE);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+WorkerThread::DispatchFromScript(nsIRunnable* aRunnable, DispatchFlags aFlags) {
+  return Dispatch(do_AddRef(aRunnable), aFlags);
+}
+
+NS_IMETHODIMP
+WorkerThread::Dispatch(already_AddRefed<nsIRunnable> aRunnable,
+                       DispatchFlags aFlags) {
+
+  nsCOMPtr<nsIRunnable> runnable(aRunnable);
+
+  LOGV(("WorkerThread::Dispatch [%p] runnable: %p", this, runnable.get()));
+
+  const bool onWorkerThread = PR_GetCurrentThread() == mThread;
+
+  WorkerPrivate* workerPrivate = nullptr;
+  if (onWorkerThread) {
+    if (!mWorkerPrivate) {
+      return NS_ERROR_UNEXPECTED;
+    }
+    mWorkerPrivate->AssertIsOnWorkerThread();
+
+    workerPrivate = mWorkerPrivate;
+  } else {
+    MutexAutoLock lock(mLock);
+
+    MOZ_ASSERT(mOtherThreadsDispatchingViaEventTarget < UINT32_MAX);
+
+    if (mWorkerPrivate) {
+      workerPrivate = mWorkerPrivate;
+
+      mOtherThreadsDispatchingViaEventTarget++;
+    }
+  }
+
+  nsresult rv;
+  rv = nsThread::Dispatch(runnable.forget(), aFlags);
+
+  if (!onWorkerThread && workerPrivate) {
+    if (NS_SUCCEEDED(rv)) {
+      MutexAutoLock workerLock(workerPrivate->mMutex);
+
+      workerPrivate->mCondVar.Notify();
+    }
+
+    {
+      MutexAutoLock lock(mLock);
+
+      MOZ_ASSERT(mOtherThreadsDispatchingViaEventTarget);
+
+      if (!--mOtherThreadsDispatchingViaEventTarget) {
+        mWorkerPrivateCondVar.Notify();
+      }
+    }
+  }
+
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    LOGV(("WorkerThread::Dispatch [%p] failed, runnable: %p", this,
+          runnable.get()));
+    return rv;
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+WorkerThread::DelayedDispatch(already_AddRefed<nsIRunnable>, uint32_t) {
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+uint32_t WorkerThread::RecursionDepth(
+    const WorkerThreadFriendKey& ) const {
+  MOZ_ASSERT(PR_GetCurrentThread() == mThread);
+
+  return mNestedEventLoopDepth;
+}
+
+NS_IMETHODIMP
+WorkerThread::HasPendingEvents(bool* aResult) {
+  MOZ_ASSERT(aResult);
+  const bool onWorkerThread = PR_GetCurrentThread() == mThread;
+  if (onWorkerThread) {
+    return nsThread::HasPendingEvents(aResult);
+  }
+  {
+    MutexAutoLock lock(mLock);
+    if (!mWorkerPrivate) {
+      *aResult = false;
+      return NS_OK;
+    }
+    if (!mWorkerPrivate->IsOnParentThread()) {
+      *aResult = false;
+      return NS_ERROR_UNEXPECTED;
+    }
+  }
+  *aResult = mEvents->HasPendingEvent();
+  return NS_OK;
+}
+
+NS_IMPL_ISUPPORTS(WorkerThread::Observer, nsIThreadObserver)
+
+NS_IMETHODIMP
+WorkerThread::Observer::OnDispatchedEvent() {
+  MOZ_CRASH("OnDispatchedEvent() should never be called!");
+}
+
+NS_IMETHODIMP
+WorkerThread::Observer::OnProcessNextEvent(nsIThreadInternal* ,
+                                           bool aMayWait) {
+  mWorkerPrivate->AssertIsOnWorkerThread();
+
+  if (aMayWait) {
+    MOZ_ASSERT(CycleCollectedJSContext::Get()->RecursionDepth() == 2);
+    MOZ_ASSERT(!BackgroundChild::GetForCurrentThread());
+    return NS_OK;
+  }
+
+  mWorkerPrivate->OnProcessNextEvent();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+WorkerThread::Observer::AfterProcessNextEvent(nsIThreadInternal* ,
+                                              bool ) {
+  mWorkerPrivate->AssertIsOnWorkerThread();
+
+  mWorkerPrivate->AfterProcessNextEvent();
+  return NS_OK;
+}
+
+}  
+}  

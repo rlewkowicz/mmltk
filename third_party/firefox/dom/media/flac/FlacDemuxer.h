@@ -1,0 +1,89 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef FLAC_DEMUXER_H_
+#define FLAC_DEMUXER_H_
+
+#include "MediaDataDemuxer.h"
+#include "MediaResource.h"
+namespace mozilla {
+
+namespace flac {
+class Frame;
+class FrameParser;
+}  
+class FlacTrackDemuxer;
+
+DDLoggedTypeDeclNameAndBase(FlacDemuxer, MediaDataDemuxer);
+DDLoggedTypeNameAndBase(FlacTrackDemuxer, MediaTrackDemuxer);
+
+class FlacDemuxer : public MediaDataDemuxer,
+                    public DecoderDoctorLifeLogger<FlacDemuxer> {
+ public:
+  explicit FlacDemuxer(MediaResource* aSource);
+  RefPtr<InitPromise> Init() override;
+  uint32_t GetNumberTracks(TrackInfo::TrackType aType) const override;
+  already_AddRefed<MediaTrackDemuxer> GetTrackDemuxer(
+      TrackInfo::TrackType aType, uint32_t aTrackNumber) override;
+  bool IsSeekable() const override;
+
+  static bool FlacSniffer(const uint8_t* aData, const uint32_t aLength);
+
+ private:
+  bool InitInternal();
+
+  RefPtr<MediaResource> mSource;
+  RefPtr<FlacTrackDemuxer> mTrackDemuxer;
+};
+
+class FlacTrackDemuxer : public MediaTrackDemuxer,
+                         public DecoderDoctorLifeLogger<FlacTrackDemuxer> {
+ public:
+  explicit FlacTrackDemuxer(MediaResource* aSource);
+
+  bool Init();
+
+  UniquePtr<TrackInfo> GetInfo() const override;
+  RefPtr<SeekPromise> Seek(const media::TimeUnit& aTime) override;
+  RefPtr<SamplesPromise> GetSamples(int32_t aNumSamples = 1) override;
+  void Reset() override;
+  int64_t GetResourceOffset() const override;
+  media::TimeIntervals GetBuffered() override;
+  RefPtr<SkipAccessPointPromise> SkipToNextRandomAccessPoint(
+      const media::TimeUnit& aTimeThreshold) override;
+
+  bool IsSeekable() const;
+
+ private:
+  ~FlacTrackDemuxer();
+
+  media::TimeUnit Duration() const;
+  media::TimeUnit TimeAtEnd();
+
+  media::TimeUnit FastSeek(const media::TimeUnit& aTime);
+
+  media::TimeUnit ScanUntil(const media::TimeUnit& aTime);
+
+  const flac::Frame& FindNextFrame();
+
+  already_AddRefed<MediaRawData> GetNextFrame(const flac::Frame& aFrame);
+
+  uint32_t Read(uint8_t* aBuffer, int64_t aOffset, int32_t aSize);
+
+  double AverageFrameLength() const;
+
+  MediaResourceIndex mSource;
+
+  UniquePtr<flac::FrameParser> mParser;
+
+  media::TimeUnit mParsedFramesDuration;
+
+  uint64_t mTotalFrameLen;
+
+  UniquePtr<AudioInfo> mInfo;
+};
+
+}  
+
+#endif  // !FLAC_DEMUXER_H_

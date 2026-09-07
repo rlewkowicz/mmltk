@@ -1,0 +1,47 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsBaseContentStream_h_
+#define nsBaseContentStream_h_
+
+#include "nsIAsyncInputStream.h"
+#include "nsIEventTarget.h"
+#include "nsCOMPtr.h"
+
+
+class nsBaseContentStream : public nsIAsyncInputStream {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIINPUTSTREAM
+  NS_DECL_NSIASYNCINPUTSTREAM
+
+  explicit nsBaseContentStream(bool nonBlocking)
+      : mStatus(NS_OK), mNonBlocking(nonBlocking) {}
+
+  nsresult Status() { return mStatus; }
+  bool IsNonBlocking() { return mNonBlocking; }
+  bool IsClosed() { return NS_FAILED(mStatus); }
+
+  bool HasPendingCallback() { return mCallback != nullptr; }
+
+  nsIEventTarget* CallbackTarget() { return mCallbackTarget; }
+
+  void DispatchCallback(bool async = true);
+
+  void DispatchCallbackSync() { DispatchCallback(false); }
+
+ protected:
+  virtual ~nsBaseContentStream() = default;
+
+ private:
+  virtual void OnCallbackPending() {}
+
+ private:
+  nsCOMPtr<nsIInputStreamCallback> mCallback;
+  nsCOMPtr<nsIEventTarget> mCallbackTarget;
+  nsresult mStatus;
+  bool mNonBlocking;
+};
+
+#endif  // nsBaseContentStream_h_

@@ -1,0 +1,374 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "jsapi.h"
+#include "NamespaceImports.h"
+
+#include "gc/GC.h"
+#include "js/friend/ErrorMessages.h"  // js::GetErrorMessage, JSMSG_*
+#include "js/Proxy.h"
+#include "proxy/DeadObjectProxy.h"
+#include "vm/Compartment.h"
+#include "vm/Interpreter.h"
+#include "vm/ProxyObject.h"
+#include "vm/WrapperObject.h"
+
+#include "vm/JSContext-inl.h"
+#include "vm/JSObject-inl.h"
+
+using namespace js;
+
+using JS::IsArrayAnswer;
+
+bool BaseProxyHandler::enter(JSContext* cx, HandleObject wrapper, HandleId id,
+                             Action act, bool mayThrow, bool* bp) const {
+  *bp = true;
+  return true;
+}
+
+bool BaseProxyHandler::has(JSContext* cx, HandleObject proxy, HandleId id,
+                           bool* bp) const {
+  assertEnteredPolicy(cx, proxy, id, GET);
+
+
+  if (!hasOwn(cx, proxy, id, bp)) {
+    return false;
+  }
+
+  if (*bp) {
+    return true;
+  }
+
+  RootedObject proto(cx);
+  if (!GetPrototype(cx, proxy, &proto)) {
+    return false;
+  }
+
+  if (proto) {
+    return HasProperty(cx, proto, id, bp);
+  }
+
+  *bp = false;
+  return true;
+}
+
+bool BaseProxyHandler::hasOwn(JSContext* cx, HandleObject proxy, HandleId id,
+                              bool* bp) const {
+  assertEnteredPolicy(cx, proxy, id, GET);
+  Rooted<mozilla::Maybe<PropertyDescriptor>> desc(cx);
+  if (!getOwnPropertyDescriptor(cx, proxy, id, &desc)) {
+    return false;
+  }
+  *bp = desc.isSome();
+  return true;
+}
+
+bool BaseProxyHandler::get(JSContext* cx, HandleObject proxy,
+                           HandleValue receiver, HandleId id,
+                           MutableHandleValue vp) const {
+  assertEnteredPolicy(cx, proxy, id, GET);
+
+
+  Rooted<mozilla::Maybe<PropertyDescriptor>> desc(cx);
+  if (!getOwnPropertyDescriptor(cx, proxy, id, &desc)) {
+    return false;
+  }
+  if (desc.isSome()) {
+    desc->assertComplete();
+  }
+
+  if (desc.isNothing()) {
+    RootedObject proto(cx);
+    if (!GetPrototype(cx, proxy, &proto)) {
+      return false;
+    }
+
+    if (!proto) {
+      vp.setUndefined();
+      return true;
+    }
+
+    return GetProperty(cx, proto, receiver, id, vp);
+  }
+
+  if (desc->isDataDescriptor()) {
+    vp.set(desc->value());
+    return true;
+  }
+
+  MOZ_ASSERT(desc->isAccessorDescriptor());
+  RootedObject getter(cx, desc->getter());
+
+  if (!getter) {
+    vp.setUndefined();
+    return true;
+  }
+
+  RootedValue getterFunc(cx, ObjectValue(*getter));
+  return CallGetter(cx, receiver, getterFunc, vp);
+}
+
+bool BaseProxyHandler::set(JSContext* cx, HandleObject proxy, HandleId id,
+                           HandleValue v, HandleValue receiver,
+                           ObjectOpResult& result) const {
+  assertEnteredPolicy(cx, proxy, id, SET);
+
+
+  Rooted<mozilla::Maybe<PropertyDescriptor>> ownDesc(cx);
+  if (!getOwnPropertyDescriptor(cx, proxy, id, &ownDesc)) {
+    return false;
+  }
+  if (ownDesc.isSome()) {
+    ownDesc->assertComplete();
+  }
+
+  return SetPropertyIgnoringNamedGetter(cx, proxy, id, v, receiver, ownDesc,
+                                        result);
+}
+
+bool js::SetPropertyIgnoringNamedGetter(
+    JSContext* cx, HandleObject obj, HandleId id, HandleValue v,
+    HandleValue receiver, Handle<mozilla::Maybe<PropertyDescriptor>> ownDesc_,
+    ObjectOpResult& result) {
+  Rooted<PropertyDescriptor> ownDesc(cx);
+
+  if (ownDesc_.isNothing()) {
+    RootedObject proto(cx);
+    if (!GetPrototype(cx, obj, &proto)) {
+      return false;
+    }
+    if (proto) {
+      return SetProperty(cx, proto, id, v, receiver, result);
+    }
+
+    ownDesc.set(PropertyDescriptor::Data(
+        UndefinedValue(),
+        {JS::PropertyAttribute::Configurable, JS::PropertyAttribute::Enumerable,
+         JS::PropertyAttribute::Writable}));
+  } else {
+    ownDesc.set(*ownDesc_);
+  }
+
+  if (ownDesc.isDataDescriptor()) {
+    if (!ownDesc.writable()) {
+      return result.fail(JSMSG_READ_ONLY);
+    }
+    if (!receiver.isObject()) {
+      return result.fail(JSMSG_SET_NON_OBJECT_RECEIVER);
+    }
+    RootedObject receiverObj(cx, &receiver.toObject());
+
+    Rooted<mozilla::Maybe<PropertyDescriptor>> existingDescriptor(cx);
+    if (!GetOwnPropertyDescriptor(cx, receiverObj, id, &existingDescriptor)) {
+      return false;
+    }
+
+    if (existingDescriptor.isSome()) {
+      if (existingDescriptor->isAccessorDescriptor()) {
+        return result.fail(JSMSG_OVERWRITING_ACCESSOR);
+      }
+
+      if (!existingDescriptor->writable()) {
+        return result.fail(JSMSG_READ_ONLY);
+      }
+    }
+
+    Rooted<PropertyDescriptor> desc(cx);
+    if (existingDescriptor.isSome()) {
+      desc = PropertyDescriptor::Empty();
+      desc.setValue(v);
+    } else {
+      desc = PropertyDescriptor::Data(v, {JS::PropertyAttribute::Configurable,
+                                          JS::PropertyAttribute::Enumerable,
+                                          JS::PropertyAttribute::Writable});
+    }
+    return DefineProperty(cx, receiverObj, id, desc, result);
+  }
+
+  MOZ_ASSERT(ownDesc.isAccessorDescriptor());
+  RootedObject setter(cx);
+  if (ownDesc.hasSetter()) {
+    setter = ownDesc.setter();
+  }
+  if (!setter) {
+    return result.fail(JSMSG_GETTER_ONLY);
+  }
+  RootedValue setterValue(cx, ObjectValue(*setter));
+  if (!CallSetter(cx, receiver, setterValue, v)) {
+    return false;
+  }
+  return result.succeed();
+}
+
+bool BaseProxyHandler::getOwnEnumerablePropertyKeys(
+    JSContext* cx, HandleObject proxy, MutableHandleIdVector props) const {
+  assertEnteredPolicy(cx, proxy, JS::PropertyKey::Void(), ENUMERATE);
+  MOZ_ASSERT(props.length() == 0);
+
+  if (!ownPropertyKeys(cx, proxy, props)) {
+    return false;
+  }
+
+  RootedId id(cx);
+  Rooted<mozilla::Maybe<PropertyDescriptor>> desc(cx);
+  size_t i = 0;
+  for (size_t j = 0, len = props.length(); j < len; j++) {
+    MOZ_ASSERT(i <= j);
+    id = props[j];
+    if (id.isSymbol()) {
+      continue;
+    }
+
+    AutoWaivePolicy policy(cx, proxy, id, BaseProxyHandler::GET);
+    if (!getOwnPropertyDescriptor(cx, proxy, id, &desc)) {
+      desc.reset();
+      return false;
+    }
+    if (desc.isSome()) {
+      desc->assertComplete();
+    }
+
+    if (desc.isSome() && desc->enumerable()) {
+      props[i++].set(id);
+    }
+  }
+
+  MOZ_ASSERT(i <= props.length());
+  if (!props.resize(i)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BaseProxyHandler::enumerate(JSContext* cx, HandleObject proxy,
+                                 MutableHandleIdVector props) const {
+  assertEnteredPolicy(cx, proxy, JS::PropertyKey::Void(), ENUMERATE);
+
+  MOZ_ASSERT(props.empty());
+  return GetPropertyKeys(cx, proxy, 0, props);
+}
+
+bool BaseProxyHandler::call(JSContext* cx, HandleObject proxy,
+                            const CallArgs& args) const {
+  MOZ_CRASH("callable proxies should implement call trap");
+}
+
+bool BaseProxyHandler::construct(JSContext* cx, HandleObject proxy,
+                                 const CallArgs& args) const {
+  MOZ_CRASH("callable proxies should implement construct trap");
+}
+
+const char* BaseProxyHandler::className(JSContext* cx,
+                                        HandleObject proxy) const {
+  return proxy->isCallable() ? "Function" : "Object";
+}
+
+JSString* BaseProxyHandler::fun_toString(JSContext* cx, HandleObject proxy,
+                                         bool isToSource) const {
+  if (proxy->isCallable()) {
+    return JS_NewStringCopyZ(cx, "function () {\n    [native code]\n}");
+  }
+
+  JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                            JSMSG_INCOMPATIBLE_PROTO, "Function", "toString",
+                            "object");
+  return nullptr;
+}
+
+RegExpShared* BaseProxyHandler::regexp_toShared(JSContext* cx,
+                                                HandleObject proxy) const {
+  MOZ_CRASH("This should have been a wrapped regexp");
+}
+
+bool BaseProxyHandler::boxedValue_unbox(JSContext* cx, HandleObject proxy,
+                                        MutableHandleValue vp) const {
+  vp.setUndefined();
+  return true;
+}
+
+bool BaseProxyHandler::nativeCall(JSContext* cx, IsAcceptableThis test,
+                                  NativeImpl impl, const CallArgs& args) const {
+  ReportIncompatible(cx, args);
+  return false;
+}
+
+bool BaseProxyHandler::getBuiltinClass(JSContext* cx, HandleObject proxy,
+                                       ESClass* cls) const {
+  *cls = ESClass::Other;
+  return true;
+}
+
+bool BaseProxyHandler::isArray(JSContext* cx, HandleObject proxy,
+                               IsArrayAnswer* answer) const {
+  *answer = IsArrayAnswer::NotArray;
+  return true;
+}
+
+void BaseProxyHandler::trace(JSTracer* trc, JSObject* proxy) const {}
+
+void BaseProxyHandler::finalize(JS::GCContext* gcx, JSObject* proxy) const {}
+
+size_t BaseProxyHandler::objectMoved(JSObject* proxy, JSObject* old) const {
+  return 0;
+}
+
+bool BaseProxyHandler::getPrototype(JSContext* cx, HandleObject proxy,
+                                    MutableHandleObject protop) const {
+  MOZ_CRASH("must override getPrototype with dynamic prototype");
+}
+
+bool BaseProxyHandler::setPrototype(JSContext* cx, HandleObject proxy,
+                                    HandleObject proto,
+                                    ObjectOpResult& result) const {
+  JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                            JSMSG_CANT_SET_PROTO_OF, "incompatible Proxy");
+  return false;
+}
+
+bool BaseProxyHandler::setImmutablePrototype(JSContext* cx, HandleObject proxy,
+                                             bool* succeeded) const {
+  *succeeded = false;
+  return true;
+}
+
+bool BaseProxyHandler::getElements(JSContext* cx, HandleObject proxy,
+                                   uint32_t begin, uint32_t end,
+                                   ElementAdder* adder) const {
+  assertEnteredPolicy(cx, proxy, JS::PropertyKey::Void(), GET);
+
+  return js::GetElementsWithAdder(cx, proxy, proxy, begin, end, adder);
+}
+
+bool BaseProxyHandler::isCallable(JSObject* obj) const { return false; }
+
+bool BaseProxyHandler::isConstructor(JSObject* obj) const { return false; }
+
+JS_PUBLIC_API void js::NukeNonCCWProxy(JSContext* cx, HandleObject proxy) {
+  MOZ_ASSERT(proxy->is<ProxyObject>());
+  MOZ_ASSERT(!proxy->is<CrossCompartmentWrapperObject>());
+
+
+  proxy->as<ProxyObject>().handler()->finalize(cx->gcContext(), proxy);
+
+  proxy->as<ProxyObject>().nuke();
+
+  MOZ_ASSERT(IsDeadProxyObject(proxy));
+}
+
+void js::NukeRemovedCrossCompartmentWrapper(JSContext* cx, JSObject* wrapper) {
+#ifdef DEBUG
+  MOZ_ASSERT(wrapper->is<CrossCompartmentWrapperObject>());
+  JSObject* target = UncheckedUnwrapWithoutExpose(wrapper);
+  auto ptr = wrapper->compartment()->lookupWrapper(target);
+  MOZ_ASSERT_IF(ptr, ptr->value() != wrapper);
+#endif
+
+  NotifyGCNukeWrapper(cx, wrapper);
+
+
+  wrapper->as<ProxyObject>().nuke();
+
+  MOZ_ASSERT(IsDeadProxyObject(wrapper));
+}

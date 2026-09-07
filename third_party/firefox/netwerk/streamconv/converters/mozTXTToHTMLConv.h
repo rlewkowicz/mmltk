@@ -1,0 +1,112 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef _mozTXTToHTMLConv_h_
+#define _mozTXTToHTMLConv_h_
+
+#include "mozITXTToHTMLConv.h"
+#include "nsIThreadRetargetableStreamListener.h"
+#include "nsString.h"
+#include "nsCOMPtr.h"
+
+class nsIIOService;
+
+class mozTXTToHTMLConv : public mozITXTToHTMLConv {
+  virtual ~mozTXTToHTMLConv() = default;
+
+ public:
+
+  mozTXTToHTMLConv() = default;
+  NS_DECL_ISUPPORTS
+
+  NS_DECL_MOZITXTTOHTMLCONV
+  NS_DECL_NSIREQUESTOBSERVER
+  NS_DECL_NSISTREAMLISTENER
+  NS_DECL_NSITHREADRETARGETABLESTREAMLISTENER
+  NS_DECL_NSISTREAMCONVERTER
+
+  int32_t CiteLevelTXT(const char16_t* line, uint32_t& logLineStart);
+
+ protected:
+  nsCOMPtr<nsIIOService>
+      mIOService;  
+  void CompleteAbbreviatedURL(const char16_t* aInString, int32_t aInLength,
+                              const uint32_t pos, nsString& aOutString);
+
+ private:
+
+  enum LIMTYPE {
+    LT_IGNORE,     
+    LT_DELIMITER,  
+    LT_ALPHA,      
+    LT_DIGIT
+  };
+
+  bool ItMatchesDelimited(const char16_t* aInString, int32_t aInLength,
+                          const char16_t* rep, int32_t aRepLen, LIMTYPE before,
+                          LIMTYPE after);
+
+  uint32_t NumberOfMatches(const char16_t* aInString, int32_t aInStringLength,
+                           const char16_t* rep, int32_t aRepLen, LIMTYPE before,
+                           LIMTYPE after);
+
+  void EscapeChar(const char16_t ch, nsAString& aStringToAppendto,
+                  bool inAttribute);
+
+  void EscapeStr(nsString& aInString, bool inAttribute);
+
+  void UnescapeStr(const char16_t* aInString, int32_t aStartPos,
+                   int32_t aLength, nsString& aOutString);
+
+
+  bool FindURL(const char16_t* aInString, int32_t aInLength, const uint32_t pos,
+               const uint32_t whathasbeendone, nsString& outputHTML,
+               int32_t& replaceBefore, int32_t& replaceAfter);
+
+  enum modetype {
+    unknown,
+    RFC1738,    
+    RFC2396E,   
+    freetext,   
+    abbreviated 
+  };
+
+  bool FindURLStart(const char16_t* aInString, int32_t aInLength,
+                    const uint32_t pos, const modetype check, uint32_t& start);
+
+  bool FindURLEnd(const char16_t* aInString, int32_t aInStringLength,
+                  const uint32_t pos, const modetype check,
+                  const uint32_t start, uint32_t& end);
+
+  void CalculateURLBoundaries(const char16_t* aInString,
+                              int32_t aInStringLength, const uint32_t pos,
+                              const uint32_t whathasbeendone,
+                              const modetype check, const uint32_t start,
+                              const uint32_t end, nsString& txtURL,
+                              nsString& desc, int32_t& replaceBefore,
+                              int32_t& replaceAfter);
+
+  bool CheckURLAndCreateHTML(const nsString& txtURL, const nsString& desc,
+                             const modetype mode, nsString& outputHTML);
+
+  bool StructPhraseHit(const char16_t* aInString, int32_t aInStringLength,
+                       bool col0, const char16_t* tagTXT, int32_t aTagTxtLen,
+                       const char* tagHTML, const char* attributeHTML,
+                       nsAString& aOutString, uint32_t& openTags);
+
+  bool SmilyHit(const char16_t* aInString, int32_t aLength, bool col0,
+                const char* tagTXT, const nsString& imageName,
+                nsString& outputHTML, int32_t& glyphTextLen);
+
+  bool GlyphHit(const char16_t* aInString, int32_t aInLength, bool col0,
+                nsAString& aOutputString, int32_t& glyphTextLen);
+
+  bool ShouldLinkify(const nsCString& aURL);
+};
+
+const int32_t mozTXTToHTMLConv_lastMode = 4;
+const int32_t mozTXTToHTMLConv_numberOfModes = 4;  
+
+#endif

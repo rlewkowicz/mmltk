@@ -1,0 +1,70 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsJSPrincipals_h_
+#define nsJSPrincipals_h_
+
+#include "js/Principals.h"
+#include "nsIPrincipal.h"
+
+struct JSContext;
+struct JSStructuredCloneReader;
+struct JSStructuredCloneWriter;
+
+namespace mozilla {
+namespace ipc {
+class PrincipalInfo;
+}  
+}  
+
+class nsJSPrincipals : public nsIPrincipal, public JSPrincipals {
+ public:
+  static bool Subsume(JSPrincipals* jsprin, JSPrincipals* other);
+  static void Destroy(JSPrincipals* jsprin);
+
+  static bool ReadPrincipals(JSContext* aCx, JSStructuredCloneReader* aReader,
+                             JSPrincipals** aOutPrincipals);
+
+  static bool ReadKnownPrincipalType(JSContext* aCx,
+                                     JSStructuredCloneReader* aReader,
+                                     uint32_t aTag,
+                                     JSPrincipals** aOutPrincipals);
+
+  static bool ReadPrincipalInfo(JSStructuredCloneReader* aReader,
+                                mozilla::ipc::PrincipalInfo& aInfo);
+
+  static bool WritePrincipalInfo(JSStructuredCloneWriter* aWriter,
+                                 const mozilla::ipc::PrincipalInfo& aInfo);
+
+  bool write(JSContext* aCx, JSStructuredCloneWriter* aWriter) final;
+
+  bool isSystemPrincipal() final;
+
+  static nsJSPrincipals* get(JSPrincipals* principals) {
+    nsJSPrincipals* self = static_cast<nsJSPrincipals*>(principals);
+    MOZ_ASSERT_IF(self, self->debugToken == DEBUG_TOKEN);
+    return self;
+  }
+  static nsJSPrincipals* get(nsIPrincipal* principal) {
+    nsJSPrincipals* self = static_cast<nsJSPrincipals*>(principal);
+    MOZ_ASSERT_IF(self, self->debugToken == DEBUG_TOKEN);
+    return self;
+  }
+
+  NS_IMETHOD_(MozExternalRefCountType) AddRef(void) override;
+  NS_IMETHOD_(MozExternalRefCountType) Release(void) override;
+
+  nsJSPrincipals() {
+    refcount = 0;
+    setDebugToken(DEBUG_TOKEN);
+  }
+
+  virtual nsresult GetScriptLocation(nsACString& aStr) = 0;
+  static const uint32_t DEBUG_TOKEN = 0x0bf41760;
+
+ protected:
+  virtual ~nsJSPrincipals() { setDebugToken(0); }
+};
+
+#endif /* nsJSPrincipals_h_ */

@@ -1,0 +1,450 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+import LockwiseCard from "./lockwise-card.mjs";
+import MonitorCard from "./monitor-card.mjs";
+import VPNCard from "./vpn-card.mjs";
+
+let cbCategory = RPMGetStringPref("browser.contentblocking.category");
+document.sendTelemetryEvent = (eventName, value = "") => {
+  RPMRecordGleanEvent("securityUiProtections", eventName, {
+    value,
+    category: cbCategory,
+  });
+};
+
+let { protocol, pathname, searchParams } = new URL(document.location);
+
+let searchParamsChanged = false;
+if (searchParams.has("entrypoint")) {
+  RPMSendAsyncMessage("RecordEntryPoint", {
+    entrypoint: searchParams.get("entrypoint"),
+  });
+  searchParams.delete("entrypoint");
+  searchParamsChanged = true;
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  if (searchParamsChanged) {
+    let newURL = protocol + pathname;
+    let params = searchParams.toString();
+    if (params) {
+      newURL += "?" + params;
+    }
+    window.location.replace(newURL);
+    return;
+  }
+
+  RPMSendQuery("FetchEntryPoint", {}).then(entrypoint => {
+    document.sendTelemetryEvent("showProtectionReport", entrypoint);
+  });
+
+  window.addEventListener("beforeunload", () => {
+    document.sendTelemetryEvent("closeProtectionReport");
+  });
+
+  let todayInMs = Date.now();
+  let weekAgoInMs = todayInMs - 6 * 24 * 60 * 60 * 1000;
+
+  let dataTypes = [
+    "cryptominer",
+    "fingerprinter",
+    "tracker",
+    "cookie",
+    "social",
+  ];
+
+  let manageProtectionsLink = document.getElementById("protection-settings");
+  let manageProtections = document.getElementById("manage-protections");
+  let protectionSettingsEvtHandler = evt => {
+    if (evt.keyCode == evt.DOM_VK_RETURN || evt.type == "click") {
+      RPMSendAsyncMessage("OpenContentBlockingPreferences");
+      if (evt.target.id == "protection-settings") {
+        document.sendTelemetryEvent("clickSettingsLink", "header-settings");
+      } else if (evt.target.id == "manage-protections") {
+        document.sendTelemetryEvent(
+          "clickSettingsLink",
+          "custom-card-settings"
+        );
+      }
+    }
+  };
+  manageProtectionsLink.addEventListener("click", protectionSettingsEvtHandler);
+  manageProtectionsLink.addEventListener(
+    "keypress",
+    protectionSettingsEvtHandler
+  );
+  manageProtections.addEventListener("click", protectionSettingsEvtHandler);
+  manageProtections.addEventListener("keypress", protectionSettingsEvtHandler);
+
+  let legend = document.getElementById("legend");
+  legend.style.gridTemplateAreas =
+    "'social cookie tracker fingerprinter cryptominer'";
+
+  let createGraph = data => {
+    let graph = document.getElementById("graph");
+    let summary = document.getElementById("graph-total-summary");
+    let weekSummary = document.getElementById("graph-week-summary");
+
+    if (data.isPrivate) {
+      graph.classList.add("private-window");
+    } else {
+      let earliestDate = data.earliestDate || Date.now();
+      document.l10n.setAttributes(summary, "graph-total-tracker-summary", {
+        count: data.sumEvents,
+        earliestDate,
+      });
+    }
+
+    let largest = 100;
+    if (largest < data.largest) {
+      largest = data.largest;
+    }
+    let weekCount = 0;
+    let weekTypeCounts = {
+      social: 0,
+      cookie: 0,
+      tracker: 0,
+      fingerprinter: 0,
+      cryptominer: 0,
+    };
+
+    let maxColumnCount = 0;
+    let date = new Date();
+    for (let i = 0; i <= 6; i++) {
+      let dateString = date.toISOString().split("T")[0];
+      let ariaOwnsString = ""; 
+      let currentColumnCount = 0;
+      let bar = document.createElement("div");
+      bar.className = "graph-bar";
+      bar.setAttribute("role", "row");
+      let innerBar = document.createElement("div");
+      innerBar.className = "graph-wrapper-bar";
+      if (data[dateString]) {
+        let content = data[dateString];
+        let count = document.createElement("div");
+        count.className = "bar-count";
+        count.id = "count" + i;
+        count.setAttribute("role", "cell");
+        count.textContent = content.total;
+        setTimeout(() => {
+          count.classList.add("animate");
+        }, 400);
+        bar.appendChild(count);
+        ariaOwnsString = count.id;
+        currentColumnCount += 1;
+        let barHeight = (content.total / largest) * 100;
+        weekCount += content.total;
+        setTimeout(() => {
+          bar.style.height = `${barHeight}%`;
+        }, 20);
+        for (let type of dataTypes) {
+          if (content[type]) {
+            let dataHeight = (content[type] / content.total) * 100;
+            let cellSpan = document.createElement("span");
+            cellSpan.id = type + i;
+            cellSpan.setAttribute("role", "cell");
+            let div = document.createElement("div");
+            div.className = `${type}-bar inner-bar`;
+            div.setAttribute("role", "img");
+            div.setAttribute("data-type", type);
+            div.style.height = `${dataHeight}%`;
+            const messageIDs = {
+              social: "bar-tooltip-social",
+              cookie: "bar-tooltip-cookie",
+              tracker: "bar-tooltip-tracker",
+              cryptominer: "bar-tooltip-cryptominer",
+              fingerprinter: "bar-tooltip-fingerprinter",
+            };
+            document.l10n.setAttributes(div, messageIDs[type], {
+              count: content[type],
+              percentage: dataHeight,
+            });
+            weekTypeCounts[type] += content[type];
+            cellSpan.appendChild(div);
+            innerBar.appendChild(cellSpan);
+            ariaOwnsString = ariaOwnsString + " " + cellSpan.id;
+            currentColumnCount += 1;
+          }
+        }
+        if (currentColumnCount > maxColumnCount) {
+          maxColumnCount = currentColumnCount;
+        }
+      } else {
+        bar.classList.add("empty");
+      }
+      bar.appendChild(innerBar);
+      graph.prepend(bar);
+
+      if (data.isPrivate) {
+        document.l10n.setAttributes(
+          weekSummary,
+          "graph-week-summary-private-window"
+        );
+      } else {
+        document.l10n.setAttributes(weekSummary, "graph-week-summary", {
+          count: weekCount,
+        });
+      }
+
+      let label = document.createElement("span");
+      label.className = "column-label";
+      label.id = "day" + (6 - i);
+      label.setAttribute("role", "rowheader");
+      if (i == 6) {
+        document.l10n.setAttributes(label, "graph-today");
+      } else {
+        label.textContent = data.weekdays[(i + 1 + new Date().getDay()) % 7];
+      }
+      graph.append(label);
+      bar.setAttribute("aria-owns", "day" + i + " " + ariaOwnsString);
+      date.setDate(date.getDate() - 1);
+    }
+    maxColumnCount += 1; 
+    graph.setAttribute("aria-colCount", maxColumnCount);
+    for (let type of dataTypes) {
+      document.querySelector(`label[data-type=${type}] span`).textContent =
+        weekTypeCounts[type];
+      const learnMoreLink = document.getElementById(`${type}-link`);
+      learnMoreLink.href = RPMGetFormatURLPref(
+        `browser.contentblocking.report.${type}.url`
+      );
+      learnMoreLink.addEventListener("click", () => {
+        document.sendTelemetryEvent("clickTrackersAboutLink", type);
+      });
+    }
+
+    let blockingCookies =
+      RPMGetIntPref("network.cookie.cookieBehavior", 0) != 0;
+    let cryptominingEnabled = RPMGetBoolPref(
+      "privacy.trackingprotection.cryptomining.enabled",
+      false
+    );
+    let fingerprintingEnabled =
+      RPMGetBoolPref(
+        "privacy.trackingprotection.fingerprinting.enabled",
+        false
+      ) || RPMGetBoolPref("privacy.fingerprintingProtection", false);
+    let tpEnabled = RPMGetBoolPref("privacy.trackingprotection.enabled", false);
+    let socialTracking = RPMGetBoolPref(
+      "privacy.trackingprotection.socialtracking.enabled",
+      false
+    );
+    let socialCookies = RPMGetBoolPref(
+      "privacy.socialtracking.block_cookies.enabled",
+      false
+    );
+    let socialEnabled =
+      socialCookies && (blockingCookies || (tpEnabled && socialTracking));
+    let notBlocking =
+      !blockingCookies &&
+      !cryptominingEnabled &&
+      !fingerprintingEnabled &&
+      !tpEnabled &&
+      !socialEnabled;
+
+    if (notBlocking) {
+      document.l10n.setAttributes(
+        document.getElementById("etp-card-content"),
+        "protection-report-etp-card-content-custom-not-blocking"
+      );
+      document.l10n.setAttributes(
+        document.querySelector(".etp-card .card-title"),
+        "etp-card-title-custom-not-blocking"
+      );
+      document.l10n.setAttributes(
+        document.getElementById("report-summary"),
+        "protection-report-page-summary"
+      );
+      document.querySelector(".etp-card").classList.add("custom-not-blocking");
+
+      manageProtectionsLink.style.display = "none";
+    } else {
+      if (!tpEnabled) {
+        legend.style.gridTemplateAreas = legend.style.gridTemplateAreas.replace(
+          "tracker",
+          ""
+        );
+        let radio = document.getElementById("tab-tracker");
+        radio.setAttribute("disabled", true);
+        document.querySelector("#tab-tracker ~ label").style.display = "none";
+      }
+      if (!socialEnabled) {
+        legend.style.gridTemplateAreas = legend.style.gridTemplateAreas.replace(
+          "social",
+          ""
+        );
+        let radio = document.getElementById("tab-social");
+        radio.setAttribute("disabled", true);
+        document.querySelector("#tab-social ~ label").style.display = "none";
+      }
+      if (!blockingCookies) {
+        legend.style.gridTemplateAreas = legend.style.gridTemplateAreas.replace(
+          "cookie",
+          ""
+        );
+        let radio = document.getElementById("tab-cookie");
+        radio.setAttribute("disabled", true);
+        document.querySelector("#tab-cookie ~ label").style.display = "none";
+      }
+      if (!cryptominingEnabled) {
+        legend.style.gridTemplateAreas = legend.style.gridTemplateAreas.replace(
+          "cryptominer",
+          ""
+        );
+        let radio = document.getElementById("tab-cryptominer");
+        radio.setAttribute("disabled", true);
+        document.querySelector("#tab-cryptominer ~ label").style.display =
+          "none";
+      }
+      if (!fingerprintingEnabled) {
+        legend.style.gridTemplateAreas = legend.style.gridTemplateAreas.replace(
+          "fingerprinter",
+          ""
+        );
+        let radio = document.getElementById("tab-fingerprinter");
+        radio.setAttribute("disabled", true);
+        document.querySelector("#tab-fingerprinter ~ label").style.display =
+          "none";
+      }
+
+      let firstRadio = document.querySelector("input:enabled");
+      firstRadio.checked = true;
+      document.body.setAttribute("focuseddatatype", firstRadio.dataset.type);
+
+      addListeners();
+    }
+  };
+
+  let addListeners = () => {
+    let wrapper = document.querySelector(".body-wrapper");
+    let triggerTabClick = ev => {
+      if (ev.originalTarget.dataset.type) {
+        document.getElementById(`tab-${ev.target.dataset.type}`).click();
+      }
+    };
+
+    let triggerTabFocus = ev => {
+      if (ev.originalTarget.dataset) {
+        wrapper.classList.add("hover-" + ev.originalTarget.dataset.type);
+      }
+    };
+
+    let triggerTabBlur = ev => {
+      if (ev.originalTarget.dataset) {
+        wrapper.classList.remove("hover-" + ev.originalTarget.dataset.type);
+      }
+    };
+    wrapper.addEventListener("mouseout", triggerTabBlur);
+    wrapper.addEventListener("mouseover", triggerTabFocus);
+    wrapper.addEventListener("click", triggerTabClick);
+
+    let radios = document.querySelectorAll("#legend input");
+    for (let radio of radios) {
+      radio.addEventListener("change", ev => {
+        document.body.setAttribute("focuseddatatype", ev.target.dataset.type);
+      });
+      radio.addEventListener("focus", ev => {
+        wrapper.classList.add("hover-" + ev.originalTarget.dataset.type);
+        document.body.setAttribute("focuseddatatype", ev.target.dataset.type);
+      });
+      radio.addEventListener("blur", ev => {
+        wrapper.classList.remove("hover-" + ev.originalTarget.dataset.type);
+      });
+    }
+  };
+
+  RPMSendQuery("FetchContentBlockingEvents", {
+    from: weekAgoInMs,
+    to: todayInMs,
+  }).then(createGraph);
+
+  let exitIcon = document.querySelector("#mobile-hanger .exit-icon");
+  exitIcon.addEventListener("click", () => {
+    RPMSetPref("browser.contentblocking.report.show_mobile_app", false);
+    document.getElementById("mobile-hanger").classList.add("hidden");
+  });
+
+  let androidMobileAppLink = document.getElementById(
+    "android-mobile-inline-link"
+  );
+  androidMobileAppLink.href = RPMGetStringPref(
+    "browser.contentblocking.report.mobile-android.url"
+  );
+  androidMobileAppLink.addEventListener("click", () => {
+    document.sendTelemetryEvent("clickMobileAppLink", "android");
+  });
+  let iosMobileAppLink = document.getElementById("ios-mobile-inline-link");
+  iosMobileAppLink.href = RPMGetStringPref(
+    "browser.contentblocking.report.mobile-ios.url"
+  );
+  iosMobileAppLink.addEventListener("click", () => {
+    document.sendTelemetryEvent("clickMobileAppLink", "ios");
+  });
+
+  let lockwiseEnabled = RPMGetBoolPref(
+    "browser.contentblocking.report.lockwise.enabled",
+    true
+  );
+
+  let lockwiseCard;
+  if (lockwiseEnabled) {
+    const lockwiseUI = document.querySelector(".lockwise-card");
+    lockwiseUI.classList.remove("hidden");
+    lockwiseUI.classList.add("loading");
+
+    lockwiseCard = new LockwiseCard(document);
+    lockwiseCard.init();
+  }
+
+  RPMSendQuery("FetchUserLoginsData", {}).then(data => {
+    if (lockwiseCard) {
+      lockwiseCard.buildContent(data);
+    }
+
+    if (
+      RPMGetBoolPref("browser.contentblocking.report.show_mobile_app") &&
+      !data.mobileDeviceConnected
+    ) {
+      document
+        .getElementById("mobile-hanger")
+        .classList.toggle("hidden", false);
+    }
+  });
+
+  const lockwiseUI = document.querySelector(".lockwise-card");
+  lockwiseUI.dataset.enabled = lockwiseEnabled;
+
+  let monitorEnabled = RPMGetBoolPref(
+    "browser.contentblocking.report.monitor.enabled",
+    true
+  );
+  if (monitorEnabled) {
+    const monitorUI = document.querySelector(".card.monitor-card.hidden");
+    monitorUI.classList.remove("hidden");
+    monitorUI.classList.add("loading");
+
+    const monitorCard = new MonitorCard(document);
+    monitorCard.init();
+  }
+
+  const monitorUI = document.querySelector(".monitor-card");
+  monitorUI.dataset.enabled = monitorEnabled;
+
+  const privacyMetricsEnabled = RPMGetBoolPref(
+    "browser.contentblocking.report.privacy_metrics.enabled",
+    false
+  );
+  if (privacyMetricsEnabled) {
+    document.querySelector("privacy-metrics-card").classList.remove("hidden");
+  }
+
+  const VPNEnabled = RPMGetBoolPref("browser.vpn_promo.enabled", true);
+  if (VPNEnabled) {
+    const vpnCard = new VPNCard(document);
+    vpnCard.init();
+  }
+  const vpnUI = document.querySelector(".vpn-card");
+  vpnUI.dataset.enabled = VPNEnabled;
+});

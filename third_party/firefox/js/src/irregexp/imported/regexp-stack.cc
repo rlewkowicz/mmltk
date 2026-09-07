@@ -1,0 +1,148 @@
+// Copyright 2009 the V8 project authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include "irregexp/imported/regexp-stack.h"
+
+
+namespace v8 {
+namespace internal {
+namespace regexp {
+
+StackScope::StackScope(Isolate* isolate)
+    : regexp_stack_(isolate->regexp_stack()),
+      old_sp_top_delta_(regexp_stack_->sp_top_delta()) {
+  DCHECK(regexp_stack_->IsValid());
+}
+
+StackScope::~StackScope() {
+  CHECK_EQ(old_sp_top_delta_, regexp_stack_->sp_top_delta());
+  regexp_stack_->ResetIfEmpty();
+}
+
+Stack::Stack() : thread_local_(this) {}
+
+Stack::~Stack() { thread_local_.FreeAndInvalidate(); }
+
+#if !defined(COMPILING_IRREGEXP_FOR_EXTERNAL_EMBEDDER)
+
+Stack* Stack::New() {
+#if defined(V8_ENABLE_SANDBOX_HARDWARE_SUPPORT)
+  VirtualAddressSpace* vas = GetPlatformVirtualAddressSpace();
+  CHECK_LT(sizeof(Stack), vas->allocation_granularity());
+  Address regexp_stack_memory = vas->AllocatePages(
+      VirtualAddressSpace::kNoHint, vas->allocation_granularity(),
+      vas->allocation_granularity(), PagePermissions::kReadWrite);
+  SandboxHardwareSupport::RegisterUnsafeSandboxExtensionMemory(
+      regexp_stack_memory, vas->allocation_granularity());
+  return new (reinterpret_cast<void*>(regexp_stack_memory)) Stack();
+#else
+  return new Stack();
+#endif
+}
+
+void Stack::Delete(Stack* instance) {
+#if defined(V8_ENABLE_SANDBOX_HARDWARE_SUPPORT)
+  instance->~Stack();
+  VirtualAddressSpace* vas = GetPlatformVirtualAddressSpace();
+  Address page = reinterpret_cast<Address>(instance);
+  DCHECK(IsAligned(page, vas->allocation_granularity()));
+  vas->FreePages(page, vas->allocation_granularity());
+#else
+  delete instance;
+#endif
+}
+
+#endif
+
+char* Stack::ArchiveStack(char* to) {
+  if (!thread_local_.owns_memory_) {
+    EnsureCapacity(thread_local_.memory_size_ + 1);
+    DCHECK(thread_local_.owns_memory_);
+  }
+
+  MemCopy(reinterpret_cast<void*>(to), &thread_local_, kThreadLocalSize);
+  thread_local_ = ThreadLocal(this);
+  return to + kThreadLocalSize;
+}
+
+char* Stack::RestoreStack(char* from) {
+  MemCopy(&thread_local_, reinterpret_cast<void*>(from), kThreadLocalSize);
+  return from + kThreadLocalSize;
+}
+
+void Stack::ThreadLocal::ResetToStaticStack(Stack* regexp_stack) {
+  DeleteDynamicStack();
+
+  memory_ = regexp_stack->static_stack_;
+  memory_top_ = regexp_stack->static_stack_ + kStaticStackSize;
+  memory_size_ = kStaticStackSize;
+  stack_pointer_ = memory_top_;
+  limit_ = reinterpret_cast<Address>(regexp_stack->static_stack_) +
+           kStackLimitSlackSize;
+  owns_memory_ = false;
+}
+
+void Stack::ThreadLocal::FreeAndInvalidate() {
+  DeleteDynamicStack();
+
+  memory_ = nullptr;
+  memory_top_ = nullptr;
+  memory_size_ = 0;
+  stack_pointer_ = nullptr;
+  limit_ = kMemoryTop;
+}
+
+uint8_t* Stack::ThreadLocal::NewDynamicStack(size_t size) {
+#if defined(V8_ENABLE_SANDBOX_HARDWARE_SUPPORT)
+  VirtualAddressSpace* vas = GetPlatformVirtualAddressSpace();
+  size_t allocation_size = RoundUp(size, vas->allocation_granularity());
+  uint8_t* new_memory = reinterpret_cast<uint8_t*>(vas->AllocatePages(
+      VirtualAddressSpace::kNoHint, allocation_size,
+      vas->allocation_granularity(), PagePermissions::kReadWrite));
+  SandboxHardwareSupport::RegisterUnsafeSandboxExtensionMemory(
+      reinterpret_cast<Address>(new_memory), allocation_size);
+#else
+  uint8_t* new_memory = NewArray<uint8_t>(size);
+#endif
+  return new_memory;
+}
+
+void Stack::ThreadLocal::DeleteDynamicStack() {
+  if (owns_memory_) {
+#if defined(V8_ENABLE_SANDBOX_HARDWARE_SUPPORT)
+    VirtualAddressSpace* vas = GetPlatformVirtualAddressSpace();
+    size_t allocation_size =
+        RoundUp(memory_size_, vas->allocation_granularity());
+    vas->FreePages(reinterpret_cast<Address>(memory_), allocation_size);
+#else
+    DeleteArray(memory_);
+#endif
+  }
+}
+
+Address Stack::EnsureCapacity(size_t size) {
+  if (size > kMaximumStackSize) return kNullAddress;
+  if (thread_local_.memory_size_ < size) {
+    if (size < kMinimumDynamicStackSize) size = kMinimumDynamicStackSize;
+    uint8_t* new_memory = ThreadLocal::NewDynamicStack(size);
+    if (thread_local_.memory_size_ > 0) {
+      MemCopy(new_memory + size - thread_local_.memory_size_,
+              thread_local_.memory_, thread_local_.memory_size_);
+      thread_local_.DeleteDynamicStack();
+    }
+    ptrdiff_t delta = sp_top_delta();
+    thread_local_.memory_ = new_memory;
+    thread_local_.memory_top_ = new_memory + size;
+    thread_local_.memory_size_ = size;
+    thread_local_.stack_pointer_ = thread_local_.memory_top_ + delta;
+    thread_local_.limit_ =
+        reinterpret_cast<Address>(new_memory) + kStackLimitSlackSize;
+    thread_local_.owns_memory_ = true;
+  }
+  return reinterpret_cast<Address>(thread_local_.memory_top_);
+}
+
+}  
+}  
+}  

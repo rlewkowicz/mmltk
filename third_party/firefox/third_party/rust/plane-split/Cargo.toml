@@ -1,0 +1,23 @@
+
+[package]
+edition = "2018"
+name = "plane-split"
+version = "0.18.0"
+authors = ["Dzmitry Malyshau <kvark@mozilla.com>"]
+description = "Plane splitting"
+documentation = "https://docs.rs/plane-split"
+keywords = [
+    "geometry",
+    "math",
+]
+license = "MPL-2.0"
+repository = "https://github.com/servo/plane-split"
+
+[dependencies.euclid]
+version = "0.22"
+
+[dependencies.log]
+version = "0.4"
+
+[dependencies.smallvec]
+version = "1.9"

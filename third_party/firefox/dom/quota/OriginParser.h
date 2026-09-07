@@ -1,0 +1,103 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_QUOTA_ORIGINPARSER_H_
+#define DOM_QUOTA_ORIGINPARSER_H_
+
+#include "mozilla/Attributes.h"
+#include "mozilla/dom/Nullable.h"
+#include "nsCharSeparatedTokenizer.h"
+#include "nsString.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+
+class OriginAttributes;
+class OriginAttributesPattern;
+
+namespace dom::quota {
+
+class MOZ_STACK_CLASS OriginParser final {
+ public:
+  enum ResultType { InvalidOrigin, ObsoleteOrigin, ValidOrigin };
+
+ private:
+  using Tokenizer =
+      nsCCharSeparatedTokenizerTemplate<NS_TokenizerIgnoreNothing>;
+
+  enum SchemeType { eNone, eFile, eAbout, eChrome };
+
+  enum State {
+    eExpectingAppIdOrScheme,
+    eExpectingInMozBrowser,
+    eExpectingScheme,
+    eExpectingEmptyToken1,
+    eExpectingEmptyToken2,
+    eExpectingEmptyTokenOrUniversalFileOrigin,
+    eExpectingHost,
+    eExpectingPort,
+    eExpectingEmptyTokenOrDriveLetterOrPathnameComponent,
+    eExpectingEmptyTokenOrPathnameComponent,
+    eExpectingEmptyToken1OrHost,
+
+    eExpectingIPV6Token,
+    eComplete,
+    eHandledTrailingSeparator
+  };
+
+  const nsCString mOrigin;
+  Tokenizer mTokenizer;
+
+  nsCString mScheme;
+  nsCString mHost;
+  Nullable<uint32_t> mPort;
+  nsTArray<nsCString> mPathnameComponents;
+  nsCString mHandledTokens;
+
+  SchemeType mSchemeType;
+  State mState;
+  bool mUniversalFileOrigin;
+  bool mMaybeDriveLetter;
+  bool mError;
+
+  uint8_t mIPGroup;
+
+ public:
+  explicit OriginParser(const nsACString& aOrigin)
+      : mOrigin(aOrigin),
+        mTokenizer(aOrigin, '+'),
+        mSchemeType(eNone),
+        mState(eExpectingAppIdOrScheme),
+        mUniversalFileOrigin(false),
+        mMaybeDriveLetter(false),
+        mError(false),
+        mIPGroup(0) {}
+
+  static ResultType ParseOrigin(const nsACString& aOrigin, nsCString& aSpec,
+                                OriginAttributes* aAttrs,
+                                nsCString& aOriginalSuffix);
+
+  ResultType Parse(nsACString& aSpec);
+
+ private:
+  void HandleScheme(const nsDependentCSubstring& aToken);
+
+  void HandlePathnameComponent(const nsDependentCSubstring& aToken);
+
+  void HandleToken(const nsDependentCSubstring& aToken);
+
+  void HandleTrailingSeparator();
+};
+
+bool IsUUIDOrigin(const nsCString& aOrigin);
+
+bool IsUserContextSuffix(const nsACString& aSuffix, uint32_t aUserContextId);
+
+bool IsUserContextPattern(const OriginAttributesPattern& aPattern,
+                          uint32_t aUserContextId);
+
+}  
+}  
+
+#endif  // DOM_QUOTA_ORIGINPARSER_H_

@@ -1,0 +1,83 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_security_lockstore_LockstoreService_h
+#define mozilla_security_lockstore_LockstoreService_h
+
+#include "mozilla/Mutex.h"
+#include "mozilla/Result.h"
+#include "mozilla/security/lockstore/lockstore_ffi_generated.h"
+#include "nsCOMPtr.h"
+#include "nsILockstore.h"
+#include "nsIObserver.h"
+#include "nsString.h"
+#include "nsTArray.h"
+
+namespace mozilla::security::lockstore {
+
+class LockstoreService final : public nsILockstore, public nsIObserver {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSILOCKSTORE
+  NS_DECL_NSIOBSERVER
+
+  LockstoreService();
+
+  nsresult Init();
+
+  static already_AddRefed<LockstoreService> GetSingleton();
+
+
+  nsresult DoUnlockKek(const nsACString& aKekRef, const nsACString& aSecret,
+                       uint32_t aTimeoutMs);
+  nsresult DoLockKek(const nsACString& aKekRef);
+  nsresult DoLock();
+  nsresult DoCreateDek(const nsACString& aCollection, const nsACString& aKekRef,
+                       bool aExtractable, uint32_t aKeySize);
+  nsresult DoImportDek(const nsACString& aCollection, const nsACString& aKekRef,
+                       const nsTArray<uint8_t>& aDekBytes, bool aExtractable);
+  Result<bool, nsresult> DoIsDekExtractable(const nsACString& aCollection);
+  nsresult DoDeleteDek(const nsACString& aCollection);
+  nsresult DoAddKek(const nsACString& aCollection,
+                    const nsACString& aFromKekRef, const nsACString& aToKekRef);
+  nsresult DoRemoveKek(const nsACString& aCollection,
+                       const nsACString& aKekRef);
+  nsresult DoSwitchKek(const nsACString& aCollection,
+                       const nsACString& aOldKekRef,
+                       const nsACString& aNewKekRef);
+  Result<nsTArray<nsCString>, nsresult> DoListDeks();
+  Result<nsTArray<nsCString>, nsresult> DoListKeks(const nsACString& aDekName);
+  Result<nsTArray<uint8_t>, nsresult> DoEncrypt(
+      const nsACString& aCollection, const nsACString& aKekRef,
+      const nsTArray<uint8_t>& aPlaintext);
+  Result<nsTArray<uint8_t>, nsresult> DoDecrypt(
+      const nsACString& aCollection, const nsACString& aKekRef,
+      const nsTArray<uint8_t>& aCiphertext);
+  Result<nsTArray<uint8_t>, nsresult> DoGetDek(const nsACString& aCollection,
+                                               const nsACString& aKekRef);
+  Result<nsCString, nsresult> DoCreateKek(const nsACString& aKekType,
+                                          const nsACString& aIdentifier,
+                                          const nsACString& aSecret,
+                                          uint32_t aCacheTimeoutMs);
+  nsresult DoDeleteKek(const nsACString& aKekRef);
+
+ private:
+  ~LockstoreService();
+
+  nsresult EnsureOpenLocked() MOZ_REQUIRES(mMutex);
+
+  void CacheProfilePathOnMainThread();
+
+  Mutex mMutex;
+
+  KeystoreHandle* mKeystore MOZ_GUARDED_BY(mMutex);
+
+  bool mShutdown MOZ_GUARDED_BY(mMutex);
+
+  nsCString mProfilePath MOZ_GUARDED_BY(mMutex);
+};
+
+}  
+
+#endif  // mozilla_security_lockstore_LockstoreService_h

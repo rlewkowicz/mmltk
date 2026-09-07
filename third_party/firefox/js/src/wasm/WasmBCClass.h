@@ -1,0 +1,1333 @@
+/*
+ * Copyright 2016 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+
+#ifndef wasm_wasm_baseline_object_h
+#define wasm_wasm_baseline_object_h
+
+#include "jit/PerfSpewer.h"
+#include "wasm/WasmBCDefs.h"
+#include "wasm/WasmBCFrame.h"
+#include "wasm/WasmBCRegDefs.h"
+#include "wasm/WasmBCStk.h"
+#include "wasm/WasmConstants.h"
+
+namespace js {
+namespace wasm {
+
+struct StackMap;
+
+class OutOfLineCode;
+
+struct BranchState;
+
+using Local = BaseStackFrame::Local;
+
+using BCESet = uint64_t;
+
+struct CatchInfo {
+  uint32_t tagIndex;        
+  NonAssertingLabel label;  
+
+  explicit CatchInfo(uint32_t tagIndex_) : tagIndex(tagIndex_) {}
+};
+
+using CatchInfoVector = Vector<CatchInfo, 1, SystemAllocPolicy>;
+
+struct Control {
+  NonAssertingLabel label;       
+  NonAssertingLabel otherLabel;  
+  StackHeight stackHeight;     
+  uint32_t stackSize;          
+  BCESet bceSafeOnEntry;       
+  BCESet bceSafeOnExit;        
+  bool deadOnArrival;          
+  bool deadThenBranch;         
+  size_t tryNoteIndex;         
+  CatchInfoVector catchInfos;  
+  size_t loopBytecodeStart;    
+  CodeOffset offsetOfCtrDec;   
+
+  Control()
+      : stackHeight(StackHeight::Invalid()),
+        stackSize(UINT32_MAX),
+        bceSafeOnEntry(0),
+        bceSafeOnExit(~BCESet(0)),
+        deadOnArrival(false),
+        deadThenBranch(false),
+        tryNoteIndex(0),
+        loopBytecodeStart(UINTPTR_MAX),
+        offsetOfCtrDec(CodeOffset()) {}
+
+  Control(Control&&) = default;
+  Control(const Control&) = delete;
+};
+
+class BaseNothingVector {
+  mozilla::Nothing unused_;
+
+ public:
+  bool reserve(size_t size) { return true; }
+  bool resize(size_t length) { return true; }
+  mozilla::Nothing& operator[](size_t) { return unused_; }
+  mozilla::Nothing& back() { return unused_; }
+  size_t length() const { return 0; }
+  bool append(mozilla::Nothing& nothing) { return true; }
+  void infallibleAppend(mozilla::Nothing& nothing) {}
+};
+
+struct BaseCompilePolicy {
+  using Value = mozilla::Nothing;
+  using ValueVector = BaseNothingVector;
+
+  using ControlItem = Control;
+};
+
+using BaseOpIter = OpIter<BaseCompilePolicy>;
+
+enum class LatentOp { None, Compare, Eqz };
+
+struct AccessCheck {
+  AccessCheck()
+      : omitBoundsCheck(false),
+        omitAlignmentCheck(false),
+        onlyPointerAlignment(false) {}
+
+
+  bool omitBoundsCheck;
+  bool omitAlignmentCheck;
+  bool onlyPointerAlignment;
+};
+
+struct FunctionCall {
+  FunctionCall(ABIKind abiKind, RestoreState restoreState)
+      : abi(abiKind),
+        restoreState(restoreState),
+        abiKind(abiKind),
+#ifdef JS_CODEGEN_ARM
+        hardFP(true),
+#endif
+        frameAlignAdjustment(0),
+        stackArgAreaSize(0) {
+    MOZ_ASSERT_IF(abiKind == ABIKind::System,
+                  restoreState == RestoreState::None ||
+                      restoreState == RestoreState::PinnedRegs);
+    if (abiKind == ABIKind::System) {
+#if defined(JS_CODEGEN_ARM)
+      hardFP = ARMFlags::UseHardFpABI();
+      abi.setUseHardFp(hardFP);
+#endif
+    } else {
+#if defined(JS_CODEGEN_ARM)
+      MOZ_ASSERT(hardFP, "The WASM ABI passes FP arguments in registers");
+#endif
+    }
+  }
+
+  ABIArgGenerator abi;
+  RestoreState restoreState;
+  ABIKind abiKind;
+#ifdef JS_CODEGEN_ARM
+  bool hardFP;
+#endif
+  size_t frameAlignAdjustment;
+  size_t stackArgAreaSize;
+};
+
+enum class PreBarrierKind {
+  None,
+  Normal,
+};
+
+enum class PostBarrierKind {
+  None,
+  Imprecise,
+  Precise,
+  WholeCell,
+};
+
+struct BranchIfRefSubtypeRegisters {
+  RegPtr superSTV;
+  RegI32 scratch1;
+  RegI32 scratch2;
+};
+
+
+struct BaseCompiler final {
+
+  using LabelVector = Vector<NonAssertingLabel, 8, SystemAllocPolicy>;
+
+
+  const CodeMetadata& codeMeta_;
+  const CompilerEnvironment& compilerEnv_;
+  const FuncCompileInput& func_;
+  const ValTypeVector& locals_;
+
+  BaseStackFrame::LocalVector localInfo_;
+
+  const SpecificRegs specific_;
+
+  ValTypeVector SigD_;
+  ValTypeVector SigF_;
+
+  NonAssertingLabel returnLabel_;
+
+  FuncOffsets offsets_;
+
+  NonAssertingLabel perFunctionDebugStub_;
+  uint32_t previousBreakablePoint_;
+
+  StkVector& stkSource_;
+
+
+  TempAllocator::Fallible alloc_;
+
+  MacroAssembler& masm;
+
+  WasmBaselinePerfSpewer perfSpewer_;
+
+
+  Decoder& decoder_;
+
+  BaseOpIter iter_;
+
+  BaseRegAlloc ra;
+
+  BaseStackFrame fr;
+
+  Vector<OutOfLineCode*, 8, SystemAllocPolicy> outOfLine_;
+
+  StackMaps* stackMaps_;
+
+  StackMapGenerator stackMapGenerator_;
+
+  StkVector stk_;
+
+  bool deadCode_;
+
+  size_t mostRecentFinishedTryNoteIndex_;
+
+
+  BCESet bceSafe_;
+
+
+  LatentOp latentOp_;
+
+  ValType latentType_;
+
+  Assembler::Condition latentIntCmp_;
+
+  Assembler::DoubleCondition latentDoubleCmp_;
+
+
+  BaseCompiler(const CodeMetadata& codeMetadata,
+               const CompilerEnvironment& compilerEnv,
+               const FuncCompileInput& func, const ValTypeVector& locals,
+               const RegisterOffsets& trapExitLayout,
+               size_t trapExitLayoutNumWords, Decoder& decoder,
+               StkVector& stkSource, TempAllocator* alloc, MacroAssembler* masm,
+               StackMaps* stackMaps);
+  ~BaseCompiler();
+
+  [[nodiscard]] bool init();
+  [[nodiscard]] bool emitFunction();
+  [[nodiscard]] FuncOffsets finish();
+
+
+  inline const FuncType& funcType() const;
+  inline bool usesMemory() const;
+  inline bool usesSharedMemory(uint32_t memoryIndex) const;
+  inline bool isMem32(uint32_t memoryIndex) const;
+  inline bool isMem64(uint32_t memoryIndex) const;
+  inline bool hugeMemoryEnabled(uint32_t memoryIndex) const;
+  inline uint32_t instanceOffsetOfMemoryBase(uint32_t memoryIndex) const;
+  inline uint32_t instanceOffsetOfBoundsCheckLimit(uint32_t memoryIndex,
+                                                   unsigned byteSize) const;
+
+  operator MacroAssembler&() const { return masm; }
+  operator BaseRegAlloc&() { return ra; }
+
+
+  inline const Local& localFromSlot(uint32_t slot, MIRType type);
+
+
+  [[nodiscard]] OutOfLineCode* addOutOfLineCode(OutOfLineCode* ool);
+  [[nodiscard]] bool generateOutOfLineCode();
+
+
+
+  inline bool isAvailableI32(RegI32 r);
+  inline bool isAvailableI64(RegI64 r);
+  inline bool isAvailableRef(RegRef r);
+  inline bool isAvailablePtr(RegPtr r);
+  inline bool isAvailableF32(RegF32 r);
+  inline bool isAvailableF64(RegF64 r);
+#ifdef ENABLE_WASM_SIMD
+  inline bool isAvailableV128(RegV128 r);
+#endif
+
+  [[nodiscard]] inline RegI32 needI32();
+  [[nodiscard]] inline RegI64 needI64();
+  [[nodiscard]] inline RegRef needRef();
+  [[nodiscard]] inline RegPtr needPtr();
+  [[nodiscard]] inline RegF32 needF32();
+  [[nodiscard]] inline RegF64 needF64();
+#ifdef ENABLE_WASM_SIMD
+  [[nodiscard]] inline RegV128 needV128();
+#endif
+
+  inline void needI32(RegI32 specific);
+  inline void needI64(RegI64 specific);
+  inline void needRef(RegRef specific);
+  inline void needPtr(RegPtr specific);
+  inline void needF32(RegF32 specific);
+  inline void needF64(RegF64 specific);
+#ifdef ENABLE_WASM_SIMD
+  inline void needV128(RegV128 specific);
+#endif
+
+  template <typename RegType>
+  inline RegType need();
+
+  inline void need2xI32(RegI32 r0, RegI32 r1);
+  inline void need2xI64(RegI64 r0, RegI64 r1);
+
+  inline void needI32NoSync(RegI32 r);
+
+#if defined(JS_CODEGEN_ARM)
+  [[nodiscard]] inline RegI64 needI64Pair();
+#endif
+
+  inline void freeAny(AnyReg r);
+  inline void freeI32(RegI32 r);
+  inline void freeI64(RegI64 r);
+  inline void freeRef(RegRef r);
+  inline void freePtr(RegPtr r);
+  inline void freeF32(RegF32 r);
+  inline void freeF64(RegF64 r);
+#ifdef ENABLE_WASM_SIMD
+  inline void freeV128(RegV128 r);
+#endif
+
+  template <typename RegType>
+  inline void free(RegType r);
+
+  inline void maybeFree(RegI32 r);
+  inline void maybeFree(RegI64 r);
+  inline void maybeFree(RegF32 r);
+  inline void maybeFree(RegF64 r);
+  inline void maybeFree(RegRef r);
+  inline void maybeFree(RegPtr r);
+#ifdef ENABLE_WASM_SIMD
+  inline void maybeFree(RegV128 r);
+#endif
+
+  inline void freeI64Except(RegI64 r, RegI32 except);
+
+  inline RegI32 fromI64(RegI64 r);
+
+  inline RegI32 maybeFromI64(RegI64 r);
+
+#ifdef JS_PUNBOX64
+  inline RegI64 fromI32(RegI32 r);
+#endif
+
+  inline RegI64 widenI32(RegI32 r);
+
+  inline RegI32 narrowI64(RegI64 r);
+  inline RegI32 narrowRef(RegRef r);
+
+  inline RegI32 lowPart(RegI64 r);
+
+  inline RegI32 maybeHighPart(RegI64 r);
+
+
+  inline void loadConstI32(const Stk& src, RegI32 dest);
+  inline void loadMemI32(const Stk& src, RegI32 dest);
+  inline void loadLocalI32(const Stk& src, RegI32 dest);
+  inline void loadRegisterI32(const Stk& src, RegI32 dest);
+  inline void loadConstI64(const Stk& src, RegI64 dest);
+  inline void loadMemI64(const Stk& src, RegI64 dest);
+  inline void loadLocalI64(const Stk& src, RegI64 dest);
+  inline void loadRegisterI64(const Stk& src, RegI64 dest);
+  inline void loadConstRef(const Stk& src, RegRef dest);
+  inline void loadMemRef(const Stk& src, RegRef dest);
+  inline void loadLocalRef(const Stk& src, RegRef dest);
+  inline void loadRegisterRef(const Stk& src, RegRef dest);
+  inline void loadConstF64(const Stk& src, RegF64 dest);
+  inline void loadMemF64(const Stk& src, RegF64 dest);
+  inline void loadLocalF64(const Stk& src, RegF64 dest);
+  inline void loadRegisterF64(const Stk& src, RegF64 dest);
+  inline void loadConstF32(const Stk& src, RegF32 dest);
+  inline void loadMemF32(const Stk& src, RegF32 dest);
+  inline void loadLocalF32(const Stk& src, RegF32 dest);
+  inline void loadRegisterF32(const Stk& src, RegF32 dest);
+#ifdef ENABLE_WASM_SIMD
+  inline void loadConstV128(const Stk& src, RegV128 dest);
+  inline void loadMemV128(const Stk& src, RegV128 dest);
+  inline void loadLocalV128(const Stk& src, RegV128 dest);
+  inline void loadRegisterV128(const Stk& src, RegV128 dest);
+#endif
+
+
+  inline void loadI32(const Stk& src, RegI32 dest);
+  inline void loadI64(const Stk& src, RegI64 dest);
+#if !defined(JS_PUNBOX64)
+  inline void loadI64Low(const Stk& src, RegI32 dest);
+  inline void loadI64High(const Stk& src, RegI32 dest);
+#endif
+  inline void loadF64(const Stk& src, RegF64 dest);
+  inline void loadF32(const Stk& src, RegF32 dest);
+#ifdef ENABLE_WASM_SIMD
+  inline void loadV128(const Stk& src, RegV128 dest);
+#endif
+  inline void loadRef(const Stk& src, RegRef dest);
+
+
+  inline void sync();
+
+  void saveTempPtr(const RegPtr& r);
+
+  void restoreTempPtr(const RegPtr& r);
+
+  inline bool hasLocal(uint32_t slot);
+
+  inline void syncLocal(uint32_t slot);
+
+  inline size_t stackConsumed(size_t numval);
+
+  inline void dropValue();
+
+#ifdef DEBUG
+
+  void performRegisterLeakCheck();
+
+  void assertStackInvariants() const;
+
+  inline size_t countMemRefsOnStk();
+
+  inline bool hasLiveRegsOnStk();
+
+  void showStack(const char* who) const;
+#endif
+
+
+  inline void pushAny(AnyReg r);
+  inline void pushI32(RegI32 r);
+  inline void pushI64(RegI64 r);
+  inline void pushRef(RegRef r);
+  inline void pushPtr(RegPtr r);
+  inline void pushF64(RegF64 r);
+  inline void pushF32(RegF32 r);
+#ifdef ENABLE_WASM_SIMD
+  inline void pushV128(RegV128 r);
+#endif
+
+  template <typename RegType>
+  inline void push(RegType item);
+
+  inline void pushI32(int32_t v);
+  inline void pushI64(int64_t v);
+  inline void pushRef(intptr_t v);
+  inline void pushPtr(intptr_t v);
+  inline void pushF64(double v);
+  inline void pushF32(float v);
+#ifdef ENABLE_WASM_SIMD
+  inline void pushV128(V128 v);
+#endif
+  inline void pushConstRef(intptr_t v);
+
+  inline void pushLocalI32(uint32_t slot);
+  inline void pushLocalI64(uint32_t slot);
+  inline void pushLocalRef(uint32_t slot);
+  inline void pushLocalF64(uint32_t slot);
+  inline void pushLocalF32(uint32_t slot);
+#ifdef ENABLE_WASM_SIMD
+  inline void pushLocalV128(uint32_t slot);
+#endif
+
+  inline void pushU32AsI64(RegI32 rs);
+
+
+  inline AnyReg popAny();
+  inline AnyReg popAny(AnyReg specific);
+
+  inline void popI32(const Stk& v, RegI32 dest);
+
+  [[nodiscard]] inline RegI32 popI32();
+  inline RegI32 popI32(RegI32 specific);
+
+#ifdef ENABLE_WASM_SIMD
+  inline void popV128(const Stk& v, RegV128 dest);
+
+  [[nodiscard]] inline RegV128 popV128();
+  inline RegV128 popV128(RegV128 specific);
+#endif
+
+  inline void popI64(const Stk& v, RegI64 dest);
+
+  [[nodiscard]] inline RegI64 popI64();
+  inline RegI64 popI64(RegI64 specific);
+
+  inline void popRef(const Stk& v, RegRef dest);
+
+  inline RegRef popRef(RegRef specific);
+  [[nodiscard]] inline RegRef popRef();
+
+  inline void popPtr(const Stk& v, RegPtr dest);
+
+  inline RegPtr popPtr(RegPtr specific);
+  [[nodiscard]] inline RegPtr popPtr();
+
+  inline void popF64(const Stk& v, RegF64 dest);
+
+  [[nodiscard]] inline RegF64 popF64();
+  inline RegF64 popF64(RegF64 specific);
+
+  inline void popF32(const Stk& v, RegF32 dest);
+
+  [[nodiscard]] inline RegF32 popF32();
+  inline RegF32 popF32(RegF32 specific);
+
+  template <typename RegType>
+  inline RegType pop();
+
+  [[nodiscard]] inline bool hasConst() const;
+  [[nodiscard]] inline bool popConst(int32_t* c);
+  [[nodiscard]] inline bool popConst(int64_t* c);
+  [[nodiscard]] inline bool peekConst(int32_t* c);
+  [[nodiscard]] inline bool peekConst(int64_t* c);
+  [[nodiscard]] inline bool peek2xConst(int32_t* c0, int32_t* c1);
+  [[nodiscard]] inline bool popConstPositivePowerOfTwo(int32_t* c,
+                                                       uint_fast8_t* power,
+                                                       int32_t cutoff);
+  [[nodiscard]] inline bool popConstPositivePowerOfTwo(int64_t* c,
+                                                       uint_fast8_t* power,
+                                                       int64_t cutoff);
+
+  inline void pop2xI32(RegI32* r0, RegI32* r1);
+  inline void pop2xI64(RegI64* r0, RegI64* r1);
+  inline void pop2xF32(RegF32* r0, RegF32* r1);
+  inline void pop2xF64(RegF64* r0, RegF64* r1);
+#ifdef ENABLE_WASM_SIMD
+  inline void pop2xV128(RegV128* r0, RegV128* r1);
+#endif
+  inline void pop2xRef(RegRef* r0, RegRef* r1);
+
+  inline RegI32 popI32ToSpecific(RegI32 specific);
+  inline RegI64 popI64ToSpecific(RegI64 specific);
+
+#ifdef JS_CODEGEN_ARM
+  inline RegI64 popI64Pair();
+#endif
+
+  inline RegI32 popI64ToI32();
+  inline RegI32 popI64ToSpecificI32(RegI32 specific);
+
+  inline RegI64 popAddressToInt64(AddressType addressType);
+
+  inline RegI32 popTableAddressToClampedInt32(AddressType addressType);
+
+  inline void replaceTableAddressWithClampedInt32(AddressType addressType);
+
+  inline void popValueStackTo(uint32_t stackSize);
+
+  inline void popValueStackBy(uint32_t items);
+
+  inline Stk& peek(uint32_t relativeDepth);
+
+  inline void peekRefAt(uint32_t depth, RegRef dest);
+
+  [[nodiscard]] inline bool peekLocal(uint32_t* local);
+
+
+  enum class ResultRegKind {
+    All,
+
+    OnlyGPRs
+  };
+
+  enum class ContinuationKind {
+    // Adjust the stack for a fallthrough: do nothing.
+    Fallthrough,
+
+    Jump
+  };
+
+
+  inline void needResultRegisters(ResultType type, ResultRegKind which);
+#ifdef JS_64BIT
+  inline void widenInt32ResultRegisters(ResultType type);
+#endif
+  inline void freeResultRegisters(ResultType type, ResultRegKind which);
+  inline void needIntegerResultRegisters(ResultType type);
+  inline void freeIntegerResultRegisters(ResultType type);
+  inline void needResultRegisters(ResultType type);
+  inline void freeResultRegisters(ResultType type);
+  void assertResultRegistersAvailable(ResultType type);
+  inline void captureResultRegisters(ResultType type);
+  inline void captureCallResultRegisters(ResultType type);
+
+  void popRegisterResults(ABIResultIter& iter);
+  void popStackResults(ABIResultIter& iter, StackHeight stackBase);
+
+  void popBlockResults(ResultType type, StackHeight stackBase,
+                       ContinuationKind kind);
+
+  void popCatchResults(ResultType type, StackHeight stackBase);
+
+  Stk captureStackResult(const ABIResult& result, StackHeight resultsBase,
+                         uint32_t stackResultBytes);
+
+  [[nodiscard]] bool pushResults(ResultType type, StackHeight resultsBase);
+  [[nodiscard]] bool pushBlockResults(ResultType type);
+
+  // fallthrough block parameters into the locations expected by the
+  [[nodiscard]] bool topBlockParams(ResultType type);
+
+  // that has fallthrough, the parameters for the untaken branch flow through to
+  [[nodiscard]] bool topBranchParams(ResultType type, StackHeight* height);
+
+  // Conditional branches with fallthrough are preceded by a topBranchParams, so
+  void shuffleStackResultsBeforeBranch(StackHeight srcHeight,
+                                       StackHeight destHeight, ResultType type);
+
+  bool insertDebugCollapseFrame();
+
+
+
+  [[nodiscard]] bool createStackMap(const char* who);
+
+  [[nodiscard]] bool createStackMap(const char* who,
+                                    CodeOffset assemblerOffset);
+
+  [[nodiscard]] bool createStackMap(
+      const char* who, HasDebugFrameWithLiveRefs debugFrameWithLiveRefs);
+
+  [[nodiscard]] bool createAbortingOutOfLineTrapStackMap(StackMap** result);
+
+
+  inline void initControl(Control& item, ResultType params);
+  inline Control& controlItem();
+  inline Control& controlItem(uint32_t relativeDepth);
+  inline Control& controlOutermost();
+  inline LabelKind controlKind(uint32_t relativeDepth);
+
+
+  void insertBreakablePoint(CallSiteKind kind);
+
+  void insertPerFunctionDebugStub();
+
+  void saveRegisterReturnValues(const ResultType& resultType);
+  void restoreRegisterReturnValues(const ResultType& resultType);
+
+
+  [[nodiscard]] bool beginFunction();
+  [[nodiscard]] bool endFunction();
+
+  void popStackReturnValues(const ResultType& resultType);
+
+
+  void beginCall(FunctionCall& call);
+  void endCall(FunctionCall& call, size_t stackSpace);
+
+  void startCallArgs(size_t stackArgAreaSizeUnaligned, FunctionCall* call);
+  ABIArg reservePointerArgument(FunctionCall* call);
+  void passArg(ValType type, const Stk& arg, FunctionCall* call);
+
+  enum class CalleeOnStack {
+    True,
+
+    False
+  };
+  template <typename T>
+  [[nodiscard]] bool emitCallArgs(const ValTypeVector& argTypes, T results,
+                                  FunctionCall* baselineCall,
+                                  CalleeOnStack calleeOnStack);
+
+  [[nodiscard]] bool pushStackResultsForWasmCall(const ResultType& type,
+                                                 RegPtr temp,
+                                                 StackResultsLoc* loc);
+  void popStackResultsAfterWasmCall(const StackResultsLoc& results,
+                                    uint32_t stackArgBytes);
+
+  void pushBuiltinCallResult(const FunctionCall& call, MIRType type);
+  [[nodiscard]] bool pushWasmCallResults(const FunctionCall& call,
+                                         ResultType type,
+                                         const StackResultsLoc& loc);
+
+  CodeOffset callDefinition(uint32_t funcIndex, const FunctionCall& call);
+  CodeOffset callSymbolic(SymbolicAddress callee, const FunctionCall& call);
+  bool callIndirect(uint32_t funcTypeIndex, uint32_t tableIndex,
+                    const Stk& indexVal, const FunctionCall& call,
+                    bool tailCall, CodeOffset* fastCallOffset,
+                    CodeOffset* slowCallOffset);
+  CodeOffset callImport(unsigned instanceDataOffset, const FunctionCall& call);
+  bool updateCallRefMetrics(size_t callRefIndex);
+  bool callRef(const Stk& calleeRef, const FunctionCall& call,
+               mozilla::Maybe<size_t> callRefIndex, CodeOffset* fastCallOffset,
+               CodeOffset* slowCallOffset);
+  void returnCallRef(const Stk& calleeRef, const FunctionCall& call,
+                     const FuncType& funcType);
+  CodeOffset builtinCall(SymbolicAddress builtin, const FunctionCall& call);
+  void builtinInstanceMethodCall(const SymbolicAddressSignature& builtin,
+                                 const ABIArg& instanceArg,
+                                 const FunctionCall& call,
+                                 CodeOffset* callStackMapKey,
+                                 CodeOffset* trapStackMapKey);
+
+  inline RegI32 captureReturnedI32();
+  inline RegI64 captureReturnedI64();
+  inline RegF32 captureReturnedF32(const FunctionCall& call);
+  inline RegF64 captureReturnedF64(const FunctionCall& call);
+#ifdef ENABLE_WASM_SIMD
+  inline RegV128 captureReturnedV128(const FunctionCall& call);
+#endif
+  inline RegRef captureReturnedRef();
+
+
+  inline void moveI32(RegI32 src, RegI32 dest);
+  inline void moveI64(RegI64 src, RegI64 dest);
+  inline void moveRef(RegRef src, RegRef dest);
+  inline void movePtr(RegPtr src, RegPtr dest);
+  inline void moveF64(RegF64 src, RegF64 dest);
+  inline void moveF32(RegF32 src, RegF32 dest);
+#ifdef ENABLE_WASM_SIMD
+  inline void moveV128(RegV128 src, RegV128 dest);
+#endif
+
+  template <typename RegType>
+  inline void move(RegType src, RegType dest);
+
+
+  inline void moveImm32(int32_t v, RegI32 dest);
+  inline void moveImm64(int64_t v, RegI64 dest);
+  inline void moveImmRef(intptr_t v, RegRef dest);
+
+
+  [[nodiscard]] Maybe<CodeOffset> addHotnessCheck();
+
+  void patchHotnessCheck(CodeOffset offset, uint32_t step);
+
+  [[nodiscard]] bool addInterruptCheck();
+
+  void checkDivideByZero(RegI32 rhs);
+  void checkDivideByZero(RegI64 r);
+
+  void checkDivideSignedOverflow(RegI32 rhs, RegI32 srcDest, Label* done,
+                                 bool zeroOnOverflow);
+  void checkDivideSignedOverflow(RegI64 rhs, RegI64 srcDest, Label* done,
+                                 bool zeroOnOverflow);
+
+  void jumpTable(const LabelVector& labels, Label* theTable);
+
+  void tableSwitch(Label* theTable, RegI32 switchValue, Label* dispatchCode);
+
+  inline void cmp64Set(Assembler::Condition cond, RegI64 lhs, RegI64 rhs,
+                       RegI32 dest);
+
+  [[nodiscard]] inline bool supportsRoundInstruction(RoundingMode mode);
+  inline void roundF32(RoundingMode roundingMode, RegF32 f0);
+  inline void roundF64(RoundingMode roundingMode, RegF64 f0);
+
+  inline void branchTo(Assembler::DoubleCondition c, RegF64 lhs, RegF64 rhs,
+                       Label* l);
+  inline void branchTo(Assembler::DoubleCondition c, RegF32 lhs, RegF32 rhs,
+                       Label* l);
+  inline void branchTo(Assembler::Condition c, RegI32 lhs, RegI32 rhs,
+                       Label* l);
+  inline void branchTo(Assembler::Condition c, RegI32 lhs, Imm32 rhs, Label* l);
+  inline void branchTo(Assembler::Condition c, RegI64 lhs, RegI64 rhs,
+                       Label* l);
+  inline void branchTo(Assembler::Condition c, RegI64 lhs, Imm64 rhs, Label* l);
+  inline void branchTo(Assembler::Condition c, RegRef lhs, ImmWord rhs,
+                       Label* l);
+
+
+  void stashWord(RegPtr instancePtr, size_t index, RegPtr r);
+  void unstashWord(RegPtr instancePtr, size_t index, RegPtr r);
+
+#ifdef JS_CODEGEN_X86
+  void stashI64(RegPtr regForInstance, RegI64 r);
+
+  void unstashI64(RegPtr regForInstance, RegI64 r);
+#endif
+
+
+  template <typename RegType, typename IntType>
+  void quotientOrRemainder(RegType rs, RegType rsd, RegType reserved,
+                           IsUnsigned isUnsigned, ZeroOnOverflow zeroOnOverflow,
+                           bool isConst, IntType c,
+                           void (*operate)(MacroAssembler&, RegType, RegType,
+                                           RegType, IsUnsigned));
+
+  [[nodiscard]] bool truncateF32ToI32(RegF32 src, RegI32 dest,
+                                      TruncFlags flags);
+  [[nodiscard]] bool truncateF64ToI32(RegF64 src, RegI32 dest,
+                                      TruncFlags flags);
+
+#ifndef RABALDR_FLOAT_TO_I64_CALLOUT
+  [[nodiscard]] RegF64 needTempForFloatingToI64(TruncFlags flags);
+  [[nodiscard]] bool truncateF32ToI64(RegF32 src, RegI64 dest, TruncFlags flags,
+                                      RegF64 temp);
+  [[nodiscard]] bool truncateF64ToI64(RegF64 src, RegI64 dest, TruncFlags flags,
+                                      RegF64 temp);
+#endif  // RABALDR_FLOAT_TO_I64_CALLOUT
+
+#ifndef RABALDR_I64_TO_FLOAT_CALLOUT
+  [[nodiscard]] RegI32 needConvertI64ToFloatTemp(ValType to, bool isUnsigned);
+  void convertI64ToF32(RegI64 src, bool isUnsigned, RegF32 dest, RegI32 temp);
+  void convertI64ToF64(RegI64 src, bool isUnsigned, RegF64 dest, RegI32 temp);
+#endif  // RABALDR_I64_TO_FLOAT_CALLOUT
+
+
+  Address addressOfGlobalVar(const GlobalDesc& global, RegPtr tmp);
+
+
+  Address addressOfTableField(uint32_t tableIndex, uint32_t fieldOffset,
+                              RegPtr instance);
+  void loadTableLength(uint32_t tableIndex, RegPtr instance, RegI32 length);
+  void loadTableElements(uint32_t tableIndex, RegPtr instance, RegPtr elements);
+
+
+  void bceCheckLocal(MemoryAccessDesc* access, AccessCheck* check,
+                     uint32_t local);
+  void bceLocalIsUpdated(uint32_t local);
+
+  template <typename RegAddressType>
+  void prepareMemoryAccess(MemoryAccessDesc* access, AccessCheck* check,
+                           RegPtr instance, RegAddressType ptr);
+
+  void branchAddNoOverflow(uint64_t offset, RegI32 ptr, Label* ok);
+  void branchTestLowZero(RegI32 ptr, Imm32 mask, Label* ok);
+  void boundsCheck4GBOrLargerAccess(uint32_t memoryIndex, unsigned byteSize,
+                                    RegPtr instance, RegI32 ptr, Label* ok);
+  void boundsCheckBelow4GBAccess(uint32_t memoryIndex, unsigned byteSize,
+                                 RegPtr instance, RegI32 ptr, Label* ok);
+
+  void branchAddNoOverflow(uint64_t offset, RegI64 ptr, Label* ok);
+  void branchTestLowZero(RegI64 ptr, Imm32 mask, Label* ok);
+  void boundsCheck4GBOrLargerAccess(uint32_t memoryIndex, unsigned byteSize,
+                                    RegPtr instance, RegI64 ptr, Label* ok);
+  void boundsCheckBelow4GBAccess(uint32_t memoryIndex, unsigned byteSize,
+                                 RegPtr instance, RegI64 ptr, Label* ok);
+
+  template <typename RegAddressType>
+  Address prepareAtomicMemoryAccess(MemoryAccessDesc* access,
+                                    AccessCheck* check, RegPtr instance,
+                                    RegAddressType ptr);
+
+  template <typename RegAddressType>
+  void computeEffectiveAddress(MemoryAccessDesc* access);
+
+  [[nodiscard]] bool needInstanceForAccess(const MemoryAccessDesc* access,
+                                           const AccessCheck& check);
+
+  void executeLoad(MemoryAccessDesc* access, AccessCheck* check,
+                   RegPtr instance, RegPtr memoryBase, RegI32 ptr, AnyReg dest,
+                   RegI32 temp);
+  void load(MemoryAccessDesc* access, AccessCheck* check, RegPtr instance,
+            RegPtr memoryBase, RegI32 ptr, AnyReg dest, RegI32 temp);
+  void load(MemoryAccessDesc* access, AccessCheck* check, RegPtr instance,
+            RegPtr memoryBase, RegI64 ptr, AnyReg dest, RegI64 temp);
+
+  template <typename RegType>
+  void doLoadCommon(MemoryAccessDesc* access, AccessCheck check, ValType type);
+
+  void loadCommon(MemoryAccessDesc* access, AccessCheck check, ValType type);
+
+  void executeStore(MemoryAccessDesc* access, AccessCheck* check,
+                    RegPtr instance, RegPtr memoryBase, RegI32 ptr, AnyReg src,
+                    RegI32 temp);
+  void store(MemoryAccessDesc* access, AccessCheck* check, RegPtr instance,
+             RegPtr memoryBase, RegI32 ptr, AnyReg src, RegI32 temp);
+  void store(MemoryAccessDesc* access, AccessCheck* check, RegPtr instance,
+             RegPtr memoryBase, RegI64 ptr, AnyReg src, RegI64 temp);
+
+  template <typename RegType>
+  void doStoreCommon(MemoryAccessDesc* access, AccessCheck check,
+                     ValType resultType);
+
+  void storeCommon(MemoryAccessDesc* access, AccessCheck check,
+                   ValType resultType);
+
+  void atomicLoad(MemoryAccessDesc* access, ValType type);
+#if !defined(JS_64BIT)
+  template <typename RegAddressType>
+  void atomicLoad64(MemoryAccessDesc* desc);
+#endif
+
+  void atomicStore(MemoryAccessDesc* access, ValType type);
+
+  void atomicRMW(MemoryAccessDesc* access, ValType type, AtomicOp op);
+  template <typename RegAddressType>
+  void atomicRMW32(MemoryAccessDesc* access, ValType type, AtomicOp op);
+  template <typename RegAddressType>
+  void atomicRMW64(MemoryAccessDesc* access, ValType type, AtomicOp op);
+
+  void atomicXchg(MemoryAccessDesc* access, ValType type);
+  template <typename RegAddressType>
+  void atomicXchg64(MemoryAccessDesc* access, WantResult wantResult);
+  template <typename RegAddressType>
+  void atomicXchg32(MemoryAccessDesc* access, ValType type);
+
+  void atomicCmpXchg(MemoryAccessDesc* access, ValType type);
+  template <typename RegAddressType>
+  void atomicCmpXchg32(MemoryAccessDesc* access, ValType type);
+  template <typename RegAddressType>
+  void atomicCmpXchg64(MemoryAccessDesc* access, ValType type);
+
+  template <typename RegType>
+  RegType popConstMemoryAccess(MemoryAccessDesc* access, AccessCheck* check);
+  template <typename RegType>
+  RegType popMemoryAccess(MemoryAccessDesc* access, AccessCheck* check);
+
+  void pushHeapBase(uint32_t memoryIndex);
+
+
+
+  RegI32 needRotate64Temp();
+  void popAndAllocateForDivAndRemI32(RegI32* r0, RegI32* r1, RegI32* reserved);
+  void popAndAllocateForMulI64(RegI64* r0, RegI64* r1, RegI32* temp);
+#ifndef RABALDR_INT_DIV_I64_CALLOUT
+  void popAndAllocateForDivAndRemI64(RegI64* r0, RegI64* r1, RegI64* reserved,
+                                     IsRemainder isRemainder);
+#endif
+  RegI32 popI32RhsForShift();
+  RegI32 popI32RhsForShiftI64();
+  RegI64 popI64RhsForShift();
+  RegI32 popI32RhsForRotate();
+  RegI64 popI64RhsForRotate();
+  void popI32ForSignExtendI64(RegI64* r0);
+  void popI64ForSignExtendI64(RegI64* r0);
+
+
+  inline BytecodeOffset bytecodeOffset() const;
+
+  inline TrapSiteDesc trapSiteDesc() const;
+
+  inline void trap(Trap t);
+
+  inline void trap(Trap t, const TrapSiteDesc& trapSite, StackMap* stackMap);
+
+  [[nodiscard]] bool throwFrom(RegRef exn);
+
+  void loadTag(RegPtr instance, uint32_t tagIndex, RegRef tagDst);
+
+  void consumePendingException(RegPtr instance, RegRef* exnDst, RegRef* tagDst);
+
+  [[nodiscard]] bool startTryNote(size_t* tryNoteIndex);
+  void finishTryNote(size_t tryNoteIndex);
+
+
+  void emitPreBarrier(RegPtr valueAddr);
+
+
+  [[nodiscard]] bool emitPostBarrierWholeCell(RegRef object, RegRef value,
+                                              RegPtr temp);
+
+  [[nodiscard]] bool emitPostBarrierEdgeImprecise(
+      const mozilla::Maybe<RegRef>& object, RegPtr valueAddr, RegRef value);
+
+  [[nodiscard]] bool emitPostBarrierEdgePrecise(
+      const mozilla::Maybe<RegRef>& object, RegPtr valueAddr, RegRef prevValue,
+      RegRef value);
+
+  [[nodiscard]] bool emitBarrieredStore(const mozilla::Maybe<RegRef>& object,
+                                        RegPtr valueAddr, RegRef value,
+                                        PreBarrierKind preBarrierKind,
+                                        PostBarrierKind postBarrierKind);
+
+  void emitBarrieredClear(RegPtr valueAddr);
+
+
+  void setLatentCompare(Assembler::Condition compareOp, ValType operandType);
+  void setLatentCompare(Assembler::DoubleCondition compareOp,
+                        ValType operandType);
+  void setLatentEqz(ValType operandType);
+  bool hasLatentOp() const;
+  void resetLatentOp();
+  template <typename Cond, typename Lhs, typename Rhs>
+  [[nodiscard]] bool jumpConditionalWithResults(BranchState* b, Cond cond,
+                                                Lhs lhs, Rhs rhs);
+  [[nodiscard]] bool jumpConditionalWithResults(BranchState* b, RegRef object,
+                                                MaybeRefType sourceType,
+                                                RefType destType,
+                                                bool onSuccess);
+  template <typename Cond>
+  [[nodiscard]] bool sniffConditionalControlCmp(Cond compareOp,
+                                                ValType operandType);
+  [[nodiscard]] bool sniffConditionalControlEqz(ValType operandType);
+  void emitBranchSetup(BranchState* b);
+  [[nodiscard]] bool emitBranchPerform(BranchState* b);
+
+
+  [[nodiscard]] bool emitBody();
+  [[nodiscard]] bool emitBlock();
+  [[nodiscard]] bool emitLoop();
+  [[nodiscard]] bool emitIf();
+  [[nodiscard]] bool emitElse();
+  void emitCatchSetup(LabelKind kind, Control& tryCatch,
+                      const ResultType& resultType);
+
+  [[nodiscard]] bool emitTry();
+  [[nodiscard]] bool emitTryTable();
+  [[nodiscard]] bool emitCatch();
+  [[nodiscard]] bool emitCatchAll();
+  [[nodiscard]] bool emitDelegate();
+  [[nodiscard]] bool emitThrow();
+  [[nodiscard]] bool emitThrowRef();
+  [[nodiscard]] bool emitRethrow();
+  [[nodiscard]] bool emitEnd();
+  [[nodiscard]] bool emitBr();
+  [[nodiscard]] bool emitBrIf();
+  [[nodiscard]] bool emitBrTable();
+  [[nodiscard]] bool emitDrop();
+  [[nodiscard]] bool emitReturn();
+  [[nodiscard]] bool emitCall();
+  [[nodiscard]] bool emitReturnCall();
+  [[nodiscard]] bool emitCallIndirect();
+  [[nodiscard]] bool emitReturnCallIndirect();
+  [[nodiscard]] bool emitUnaryMathBuiltinCall(SymbolicAddress callee,
+                                              ValType operandType);
+  [[nodiscard]] bool emitGetLocal();
+  [[nodiscard]] bool emitSetLocal();
+  [[nodiscard]] bool emitTeeLocal();
+  [[nodiscard]] bool emitGetGlobal();
+  [[nodiscard]] bool emitSetGlobal();
+  [[nodiscard]] RegPtr maybeLoadMemoryBaseForAccess(
+      RegPtr instance, const MemoryAccessDesc* access);
+  [[nodiscard]] RegPtr maybeLoadInstanceForAccess(
+      const MemoryAccessDesc* access, const AccessCheck& check);
+  [[nodiscard]] RegPtr maybeLoadInstanceForAccess(
+      const MemoryAccessDesc* access, const AccessCheck& check,
+      RegPtr specific);
+  [[nodiscard]] bool emitLoad(ValType type, Scalar::Type viewType);
+  [[nodiscard]] bool emitStore(ValType resultType, Scalar::Type viewType);
+  [[nodiscard]] bool emitSelect(bool typed);
+
+  template <bool isSetLocal>
+  [[nodiscard]] bool emitSetOrTeeLocal(uint32_t slot);
+
+  [[nodiscard]] bool endBlock(ResultType type);
+  [[nodiscard]] bool endIfThen(ResultType type);
+  [[nodiscard]] bool endIfThenElse(ResultType type);
+  [[nodiscard]] bool endTryCatch(ResultType type);
+  [[nodiscard]] bool endTryTable(ResultType type);
+
+  void doReturn(ContinuationKind kind);
+
+  void emitCompareI32(Assembler::Condition compareOp, ValType compareType);
+  void emitCompareI64(Assembler::Condition compareOp, ValType compareType);
+  void emitCompareF32(Assembler::DoubleCondition compareOp,
+                      ValType compareType);
+  void emitCompareF64(Assembler::DoubleCondition compareOp,
+                      ValType compareType);
+  void emitCompareRef(Assembler::Condition compareOp, ValType compareType);
+
+  template <typename CompilerType>
+  inline CompilerType& selectCompiler();
+
+  template <typename SourceType, typename DestType>
+  inline void emitUnop(void (*op)(MacroAssembler& masm, SourceType rs,
+                                  DestType rd));
+
+  template <typename SourceType, typename DestType, typename TempType>
+  inline void emitUnop(void (*op)(MacroAssembler& masm, SourceType rs,
+                                  DestType rd, TempType temp));
+
+  template <typename SourceType, typename DestType, typename ImmType>
+  inline void emitUnop(ImmType immediate, void (*op)(MacroAssembler&, ImmType,
+                                                     SourceType, DestType));
+
+  template <typename CompilerType, typename RegType>
+  inline void emitUnop(void (*op)(CompilerType& compiler, RegType rsd));
+
+  template <typename RegType, typename TempType>
+  inline void emitUnop(void (*op)(BaseCompiler& bc, RegType rsd, TempType rt),
+                       TempType (*getSpecializedTemp)(BaseCompiler& bc));
+
+  template <typename CompilerType, typename RhsType, typename LhsDestType>
+  inline void emitBinop(void (*op)(CompilerType& masm, RhsType src,
+                                   LhsDestType srcDest));
+
+  template <typename RhsDestType, typename LhsType>
+  inline void emitBinop(void (*op)(MacroAssembler& masm, RhsDestType src,
+                                   LhsType srcDest, RhsDestOp));
+
+  template <typename RhsType, typename LhsDestType, typename TempType>
+  inline void emitBinop(void (*)(MacroAssembler& masm, RhsType rs,
+                                 LhsDestType rsd, TempType temp));
+
+  template <typename RhsType, typename LhsDestType, typename TempType1,
+            typename TempType2>
+  inline void emitBinop(void (*)(MacroAssembler& masm, RhsType rs,
+                                 LhsDestType rsd, TempType1 temp1,
+                                 TempType2 temp2));
+
+  template <typename RhsType, typename LhsDestType, typename ImmType>
+  inline void emitBinop(ImmType immediate, void (*op)(MacroAssembler&, ImmType,
+                                                      RhsType, LhsDestType));
+
+  template <typename RhsType, typename LhsDestType, typename ImmType,
+            typename TempType1, typename TempType2>
+  inline void emitBinop(ImmType immediate,
+                        void (*op)(MacroAssembler&, ImmType, RhsType,
+                                   LhsDestType, TempType1 temp1,
+                                   TempType2 temp2));
+
+  template <typename CompilerType1, typename CompilerType2, typename RegType,
+            typename ImmType>
+  inline void emitBinop(void (*op)(CompilerType1& compiler1, RegType rs,
+                                   RegType rd),
+                        void (*opConst)(CompilerType2& compiler2, ImmType c,
+                                        RegType rd),
+                        RegType (BaseCompiler::*rhsPopper)() = nullptr);
+
+  template <typename CompilerType, typename ValType>
+  inline void emitTernary(void (*op)(CompilerType&, ValType src0, ValType src1,
+                                     ValType srcDest));
+
+  template <typename CompilerType, typename ValType>
+  inline void emitTernary(void (*op)(CompilerType&, ValType src0, ValType src1,
+                                     ValType srcDest, ValType temp));
+
+  template <typename CompilerType, typename ValType>
+  inline void emitTernaryResultLast(void (*op)(CompilerType&, ValType src0,
+                                               ValType src1, ValType srcDest));
+
+  template <typename R>
+  [[nodiscard]] inline bool emitInstanceCallOp(
+      const SymbolicAddressSignature& fn, R reader);
+
+  template <typename A1, typename R>
+  [[nodiscard]] inline bool emitInstanceCallOp(
+      const SymbolicAddressSignature& fn, R reader);
+
+  template <typename A1, typename A2, typename R>
+  [[nodiscard]] inline bool emitInstanceCallOp(
+      const SymbolicAddressSignature& fn, R reader);
+
+  void emitMultiplyI64();
+  void emitQuotientI32();
+  void emitQuotientU32();
+  void emitRemainderI32();
+  void emitRemainderU32();
+#ifdef RABALDR_INT_DIV_I64_CALLOUT
+  [[nodiscard]] bool emitDivOrModI64BuiltinCall(SymbolicAddress callee,
+                                                ValType operandType);
+#else
+  void emitQuotientI64();
+  void emitQuotientU64();
+  void emitRemainderI64();
+  void emitRemainderU64();
+#endif
+  void emitRotrI64();
+  void emitRotlI64();
+  void emitEqzI32();
+  void emitEqzI64();
+  template <TruncFlags flags>
+  [[nodiscard]] bool emitTruncateF32ToI32();
+  template <TruncFlags flags>
+  [[nodiscard]] bool emitTruncateF64ToI32();
+#ifdef RABALDR_FLOAT_TO_I64_CALLOUT
+  [[nodiscard]] bool emitConvertFloatingToInt64Callout(SymbolicAddress callee,
+                                                       ValType operandType,
+                                                       ValType resultType);
+#else
+  template <TruncFlags flags>
+  [[nodiscard]] bool emitTruncateF32ToI64();
+  template <TruncFlags flags>
+  [[nodiscard]] bool emitTruncateF64ToI64();
+#endif
+  void emitExtendI64_8();
+  void emitExtendI64_16();
+  void emitExtendI64_32();
+  void emitExtendI32ToI64();
+  void emitExtendU32ToI64();
+#ifdef RABALDR_I64_TO_FLOAT_CALLOUT
+  [[nodiscard]] bool emitConvertInt64ToFloatingCallout(SymbolicAddress callee,
+                                                       ValType operandType,
+                                                       ValType resultType);
+#else
+  void emitConvertU64ToF32();
+  void emitConvertU64ToF64();
+#endif
+  void emitRound(RoundingMode roundingMode, ValType operandType);
+
+  [[nodiscard]] bool emitInstanceCall(const SymbolicAddressSignature& builtin);
+
+  [[nodiscard]] bool emitMemoryGrow();
+  [[nodiscard]] bool emitMemorySize();
+
+  [[nodiscard]] bool emitRefFunc();
+  [[nodiscard]] bool emitRefNull();
+  [[nodiscard]] bool emitRefIsNull();
+  [[nodiscard]] bool emitRefAsNonNull();
+  [[nodiscard]] bool emitBrOnNull();
+  [[nodiscard]] bool emitBrOnNonNull();
+  [[nodiscard]] bool emitCallRef();
+  [[nodiscard]] bool emitReturnCallRef();
+
+  [[nodiscard]] bool emitAtomicCmpXchg(ValType type, Scalar::Type viewType);
+  [[nodiscard]] bool emitAtomicLoad(ValType type, Scalar::Type viewType);
+  [[nodiscard]] bool emitAtomicRMW(ValType type, Scalar::Type viewType,
+                                   AtomicOp op);
+  [[nodiscard]] bool emitAtomicStore(ValType type, Scalar::Type viewType);
+  [[nodiscard]] bool emitWait(ValType type, uint32_t byteSize);
+  [[nodiscard]] bool atomicWait(ValType type, MemoryAccessDesc* access);
+  [[nodiscard]] bool emitNotify();
+  [[nodiscard]] bool atomicNotify(MemoryAccessDesc* access);
+  [[nodiscard]] bool emitFence();
+  [[nodiscard]] bool emitAtomicXchg(ValType type, Scalar::Type viewType);
+  [[nodiscard]] bool emitMemInit();
+  [[nodiscard]] bool emitMemCopy();
+  [[nodiscard]] bool memCopyCall(uint32_t dstMemIndex, uint32_t srcMemIndex);
+  void memCopyInlineM32();
+  [[nodiscard]] bool emitTableCopy();
+  [[nodiscard]] bool emitDataOrElemDrop(bool isData);
+  [[nodiscard]] bool emitMemFill();
+  [[nodiscard]] bool memFillCall(uint32_t memoryIndex);
+  void memFillInlineM32();
+  [[nodiscard]] bool emitTableInit();
+  [[nodiscard]] bool emitTableFill();
+  [[nodiscard]] bool emitMemDiscard();
+  [[nodiscard]] bool emitTableGet();
+  [[nodiscard]] bool emitTableGrow();
+  [[nodiscard]] bool emitTableSet();
+  [[nodiscard]] bool emitTableSize();
+  [[nodiscard]] bool emitI64AddSub128(bool isAdd);
+  [[nodiscard]] bool emitI64MulWide(bool isSigned);
+
+  void emitTableBoundsCheck(uint32_t tableIndex, RegI32 address,
+                            RegPtr instance);
+  [[nodiscard]] bool emitTableGetAnyRef(uint32_t tableIndex);
+  [[nodiscard]] bool emitTableSetAnyRef(uint32_t tableIndex);
+
+  [[nodiscard]] bool emitStructNew();
+  [[nodiscard]] bool emitStructNewDefault();
+  [[nodiscard]] bool emitStructGet(FieldWideningOp wideningOp);
+  [[nodiscard]] bool emitStructSet();
+  [[nodiscard]] bool emitArrayNew();
+  [[nodiscard]] bool emitArrayNewFixed();
+  [[nodiscard]] bool emitArrayNewDefault();
+  [[nodiscard]] bool emitArrayNewData();
+  [[nodiscard]] bool emitArrayNewElem();
+  [[nodiscard]] bool emitArrayInitData();
+  [[nodiscard]] bool emitArrayInitElem();
+  [[nodiscard]] bool emitArrayGet(FieldWideningOp wideningOp);
+  [[nodiscard]] bool emitArraySet();
+  [[nodiscard]] bool emitArrayLen();
+  [[nodiscard]] bool emitArrayCopy();
+  [[nodiscard]] bool emitArrayFill();
+  [[nodiscard]] bool emitRefI31();
+  [[nodiscard]] bool emitI31Get(FieldWideningOp wideningOp);
+  [[nodiscard]] bool emitRefTest(bool nullable);
+  [[nodiscard]] bool emitRefCast(bool nullable);
+  [[nodiscard]] bool emitBrOnCastCommon(bool onSuccess,
+                                        uint32_t labelRelativeDepth,
+                                        const ResultType& labelType,
+                                        MaybeRefType sourceType,
+                                        RefType destType);
+  [[nodiscard]] bool emitBrOnCast(bool onSuccess);
+  [[nodiscard]] bool emitAnyConvertExtern();
+  [[nodiscard]] bool emitExternConvertAny();
+
+  struct NoNullCheck {
+    static void emitNullCheck(BaseCompiler* bc, RegRef rp) {}
+    static void emitTrapSite(BaseCompiler* bc, FaultingCodeOffset fco,
+                             TrapMachineInsn tmi) {}
+  };
+  struct SignalNullCheck {
+    static void emitNullCheck(BaseCompiler* bc, RegRef rp);
+    static void emitTrapSite(BaseCompiler* bc, FaultingCodeOffset fco,
+                             TrapMachineInsn tmi);
+  };
+
+  RegPtr loadAllocSiteInstanceData(uint32_t allocSiteIndex);
+
+  [[nodiscard]] bool readAllocSiteIndex(uint32_t* index);
+
+  RegPtr loadSuperTypeVector(uint32_t typeIndex);
+
+  template <bool ZeroFields>
+  bool emitStructAlloc(uint32_t typeIndex, RegRef* object,
+                       bool* isOutlineStruct, RegPtr* outlineBase,
+                       uint32_t allocSiteIndex);
+  template <bool ZeroFields>
+  bool emitArrayAlloc(uint32_t typeIndex, RegRef object, RegI32 numElements,
+                      uint32_t elemSize, uint32_t allocSiteIndex);
+  template <bool ZeroFields>
+  bool emitArrayAllocFixed(uint32_t typeIndex, RegRef object,
+                           uint32_t numElements, uint32_t elemSize,
+                           uint32_t allocSiteIndex);
+
+  template <typename NullCheckPolicy>
+  RegPtr emitGcArrayGetData(RegRef rp);
+  template <typename NullCheckPolicy>
+  RegI32 emitGcArrayGetNumElements(RegRef rp);
+  void emitGcArrayBoundsCheck(RegI32 index, RegI32 numElements);
+  template <typename T, typename NullCheckPolicy>
+  void emitGcGet(StorageType type, FieldWideningOp wideningOp, const T& src);
+  template <typename T, typename NullCheckPolicy>
+  void emitGcSetScalar(const T& dst, StorageType type, AnyReg value);
+
+  BranchIfRefSubtypeRegisters allocRegistersForBranchIfRefSubtype(
+      RefType destType);
+  void freeRegistersForBranchIfRefSubtype(
+      const BranchIfRefSubtypeRegisters& regs);
+
+  template <typename NullCheckPolicy>
+  [[nodiscard]] bool emitGcStructSet(RegRef object, RegPtr areaBase,
+                                     uint32_t areaOffset, StorageType type,
+                                     AnyReg value,
+                                     PreBarrierKind preBarrierKind);
+
+  [[nodiscard]] bool emitGcArraySet(RegRef object, RegPtr data, RegI32 index,
+                                    const ArrayType& array, AnyReg value,
+                                    PreBarrierKind preBarrierKind,
+                                    PostBarrierKind postBarrierKind);
+
+#ifdef ENABLE_WASM_SIMD
+  void emitVectorAndNot();
+#  ifdef ENABLE_WASM_RELAXED_SIMD
+  void emitDotI8x16I7x16AddS();
+#  endif
+
+  void loadSplat(MemoryAccessDesc* access);
+  void loadZero(MemoryAccessDesc* access);
+  void loadExtend(MemoryAccessDesc* access, Scalar::Type viewType);
+  void loadLane(MemoryAccessDesc* access, uint32_t laneIndex);
+  void storeLane(MemoryAccessDesc* access, uint32_t laneIndex);
+
+  [[nodiscard]] bool emitLoadSplat(Scalar::Type viewType);
+  [[nodiscard]] bool emitLoadZero(Scalar::Type viewType);
+  [[nodiscard]] bool emitLoadExtend(Scalar::Type viewType);
+  [[nodiscard]] bool emitLoadLane(uint32_t laneSize);
+  [[nodiscard]] bool emitStoreLane(uint32_t laneSize);
+  [[nodiscard]] bool emitVectorShuffle();
+  [[nodiscard]] bool emitVectorLaneSelect();
+#  if defined(JS_CODEGEN_X86) || defined(JS_CODEGEN_X64)
+  [[nodiscard]] bool emitVectorShiftRightI64x2();
+#  endif
+#endif
+  [[nodiscard]] bool emitCallBuiltinModuleFunc();
+};
+
+}  
+}  
+
+#endif  // wasm_wasm_baseline_object_h

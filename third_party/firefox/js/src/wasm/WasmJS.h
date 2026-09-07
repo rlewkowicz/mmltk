@@ -1,0 +1,507 @@
+/*
+ * Copyright 2016 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#ifndef wasm_js_h
+#define wasm_js_h
+
+#include "mozilla/HashTable.h"  // DefaultHasher
+#include "mozilla/Maybe.h"      // mozilla::Maybe
+
+#include <stdint.h>  // int32_t, int64_t, uint32_t
+
+#include "gc/Barrier.h"         // HeapPtr
+#include "gc/ZoneAllocator.h"   // ZoneAllocPolicy
+#include "js/AllocPolicy.h"     // SystemAllocPolicy
+#include "js/Class.h"           // JSClassOps, ClassSpec
+#include "js/CompileOptions.h"  // JS::ReadOnlyCompileOptions
+#include "js/GCHashTable.h"     // GCHashMap, GCHashSet
+#include "js/GCVector.h"        // GCVector
+#include "js/PropertySpec.h"    // JSPropertySpec, JSFunctionSpec
+#include "js/RootingAPI.h"      // StableCellHasher
+#include "js/SweepingAPI.h"     // JS::WeakCache
+#include "js/TypeDecls.h"  // HandleValue, HandleObject, MutableHandleObject, MutableHandleFunction
+#include "js/Vector.h"  // JS::Vector
+#include "js/WasmFeatures.h"
+#include "vm/JSFunction.h"    // JSFunction
+#include "vm/NativeObject.h"  // NativeObject
+#include "wasm/WasmCodegenTypes.h"
+#include "wasm/WasmConstants.h"
+#include "wasm/WasmException.h"
+#include "wasm/WasmExprType.h"
+#include "wasm/WasmMemory.h"
+#include "wasm/WasmModuleTypes.h"
+#include "wasm/WasmTypeDecls.h"
+#include "wasm/WasmValType.h"
+#include "wasm/WasmValue.h"
+
+class JSObject;
+class JSTracer;
+struct JSContext;
+
+namespace JS {
+class CallArgs;
+class Value;
+}  
+
+namespace js {
+
+class ArrayBufferObject;
+class ArrayBufferObjectMaybeShared;
+class JSStringBuilder;
+class TypedArrayObject;
+class WasmFunctionScope;
+class WasmInstanceScope;
+class WasmSharedArrayRawBuffer;
+
+namespace wasm {
+
+struct ImportValues;
+
+
+[[nodiscard]] bool Eval(JSContext* cx, Handle<TypedArrayObject*> code,
+                        HandleObject importObj,
+                        MutableHandle<WasmInstanceObject*> instanceObj);
+
+struct ImportValues;
+
+[[nodiscard]] bool GetImports(JSContext* cx, const Module& module,
+                              HandleObject importObj, ImportValues* imports);
+
+
+[[nodiscard]] bool CompileAndSerialize(JSContext* cx,
+                                       const BytecodeSource& source,
+                                       Bytes* serialized);
+
+[[nodiscard]] bool DeserializeModule(JSContext* cx, const Bytes& serialized,
+                                     MutableHandleObject module);
+
+bool IsSharedWasmMemoryObject(JSObject* obj);
+
+[[nodiscard]] bool CompileForESM(JSContext* cx,
+                                 const JS::ReadOnlyCompileOptions& options,
+                                 const BytecodeSource& source,
+                                 MutableHandleObject moduleObj);
+
+}  
+
+
+class WasmModuleObject : public NativeObject {
+  static const unsigned MODULE_SLOT = 0;
+  static const JSClassOps classOps_;
+  static const ClassSpec classSpec_;
+  static void finalize(JS::GCContext* gcx, JSObject* obj);
+  static bool imports(JSContext* cx, unsigned argc, Value* vp);
+  static bool exports(JSContext* cx, unsigned argc, Value* vp);
+  static bool customSections(JSContext* cx, unsigned argc, Value* vp);
+
+ public:
+  static const unsigned RESERVED_SLOTS = 1;
+  static const JSClass class_;
+  static const JSClass& protoClass_;
+  static const JSPropertySpec properties[];
+  static const JSFunctionSpec methods[];
+  static const JSFunctionSpec static_methods[];
+  static bool construct(JSContext*, unsigned, Value*);
+
+  static WasmModuleObject* create(JSContext* cx, const wasm::Module& module,
+                                  HandleObject proto);
+  const wasm::Module& module() const;
+};
+
+#ifdef ENABLE_WASM_COMPONENTS
+
+class WasmComponentObject : public NativeObject {
+  static const unsigned COMPONENT_SLOT = 0;
+  static const JSClassOps classOps_;
+  static const ClassSpec classSpec_;
+  static void finalize(JS::GCContext* gcx, JSObject* obj);
+
+ public:
+  static const unsigned RESERVED_SLOTS = 1;
+  static const JSClass class_;
+  static const JSClass& protoClass_;
+  static const JSPropertySpec properties[];
+  static const JSFunctionSpec methods[];
+  static const JSFunctionSpec static_methods[];
+  static bool construct(JSContext*, unsigned, Value*);
+
+  static WasmComponentObject* create(JSContext* cx,
+                                     const wasm::Component& component,
+                                     HandleObject proto);
+  const wasm::Component& component() const;
+};
+#endif
+
+
+class WasmGlobalObject : public NativeObject {
+  static const unsigned MUTABLE_SLOT = 0;
+  static const unsigned VAL_SLOT = 1;
+
+  static const JSClassOps classOps_;
+  static const ClassSpec classSpec_;
+  static void finalize(JS::GCContext* gcx, JSObject* obj);
+  static void trace(JSTracer* trc, JSObject* obj);
+
+  static bool typeImpl(JSContext* cx, const CallArgs& args);
+  static bool type(JSContext* cx, unsigned argc, Value* vp);
+
+  static bool valueGetterImpl(JSContext* cx, const CallArgs& args);
+  static bool valueGetter(JSContext* cx, unsigned argc, Value* vp);
+  static bool valueSetterImpl(JSContext* cx, const CallArgs& args);
+  static bool valueSetter(JSContext* cx, unsigned argc, Value* vp);
+
+  wasm::HeapPtrVal& mutableVal();
+
+ public:
+  static const unsigned RESERVED_SLOTS = 2;
+  static const JSClass class_;
+  static const JSClass& protoClass_;
+  static const JSPropertySpec properties[];
+  static const JSFunctionSpec methods[];
+  static const JSFunctionSpec static_methods[];
+  static bool construct(JSContext*, unsigned, Value*);
+
+  static WasmGlobalObject* create(JSContext* cx, wasm::HandleVal value,
+                                  bool isMutable, HandleObject proto);
+  bool isNewborn() { return getReservedSlot(VAL_SLOT).isUndefined(); }
+
+  bool isMutable() const;
+  wasm::ValType type() const;
+  const wasm::HeapPtrVal& val() const;
+  void setVal(wasm::HandleVal value);
+  void* addressOfCell() const;
+};
+
+
+class WasmInstanceObject : public NativeObject {
+  static const unsigned INSTANCE_SLOT = 0;
+  static const unsigned EXPORTS_OBJ_SLOT = 1;
+  static const unsigned SCOPES_SLOT = 2;
+  static const unsigned INSTANCE_SCOPE_SLOT = 3;
+  static const unsigned GLOBALS_SLOT = 4;
+
+  static const JSClassOps classOps_;
+  static const ClassSpec classSpec_;
+  static bool exportsGetterImpl(JSContext* cx, const CallArgs& args);
+  static bool exportsGetter(JSContext* cx, unsigned argc, Value* vp);
+  bool isNewborn() const;
+  static void finalize(JS::GCContext* gcx, JSObject* obj);
+  static void trace(JSTracer* trc, JSObject* obj);
+
+  class UnspecifiedScopeMap;
+  UnspecifiedScopeMap& scopes() const;
+
+ public:
+  static const unsigned RESERVED_SLOTS = 5;
+  static const JSClass class_;
+  static const JSClass& protoClass_;
+  static const JSPropertySpec properties[];
+  static const JSFunctionSpec methods[];
+  static const JSFunctionSpec static_methods[];
+  static bool construct(JSContext*, unsigned, Value*);
+
+  static WasmInstanceObject* create(
+      JSContext* cx, const RefPtr<const wasm::Code>& code,
+      const wasm::DataSegmentVector& dataSegments,
+      const wasm::ModuleElemSegmentVector& elemSegments,
+      uint32_t instanceDataLength, Handle<WasmMemoryObjectVector> memories,
+      Vector<RefPtr<wasm::Table>, 0, SystemAllocPolicy>&& tables,
+      const JSObjectVector& funcImports, const wasm::GlobalDescVector& globals,
+      const wasm::ValVector& globalImportValues,
+      const WasmGlobalObjectVector& globalObjs,
+      const WasmTagObjectVector& tagObjs, HandleObject proto,
+      UniquePtr<wasm::DebugState> maybeDebug);
+  void initExportsObj(JSObject& exportsObj);
+
+  wasm::Instance& instance() const;
+  JSObject& exportsObj() const;
+  WasmFunctionScope* getExistingFunctionScope(uint32_t funcIndex) const;
+
+  [[nodiscard]] static bool getExportedFunction(
+      JSContext* cx, Handle<WasmInstanceObject*> instanceObj,
+      uint32_t funcIndex, MutableHandleFunction fun);
+
+  static WasmInstanceScope* getScope(JSContext* cx,
+                                     Handle<WasmInstanceObject*> instanceObj);
+  static WasmFunctionScope* getFunctionScope(
+      JSContext* cx, Handle<WasmInstanceObject*> instanceObj,
+      uint32_t funcIndex);
+
+  using GlobalObjectVector =
+      GCVector<HeapPtr<WasmGlobalObject*>, 0, CellAllocPolicy>;
+  GlobalObjectVector& indirectGlobals() const;
+};
+
+
+class WasmMemoryObject : public NativeObject {
+  static const unsigned BUFFER_SLOT = 0;
+  static const unsigned OBSERVERS_SLOT = 1;
+  static const unsigned ISHUGE_SLOT = 2;
+  static const JSClassOps classOps_;
+  static const ClassSpec classSpec_;
+  static void finalize(JS::GCContext* gcx, JSObject* obj);
+  static bool bufferGetterImpl(JSContext* cx, const CallArgs& args);
+  static bool bufferGetter(JSContext* cx, unsigned argc, Value* vp);
+  static bool typeImpl(JSContext* cx, const CallArgs& args);
+  static bool type(JSContext* cx, unsigned argc, Value* vp);
+  static bool growImpl(JSContext* cx, const CallArgs& args);
+  static bool grow(JSContext* cx, unsigned argc, Value* vp);
+  static bool discardImpl(JSContext* cx, const CallArgs& args);
+  static bool discard(JSContext* cx, unsigned argc, Value* vp);
+  static uint64_t growShared(Handle<WasmMemoryObject*> memory, uint64_t delta);
+  static bool toFixedLengthBufferImpl(JSContext* cx, const CallArgs& args);
+  static bool toFixedLengthBuffer(JSContext* cx, unsigned argc, Value* vp);
+  static bool toResizableBufferImpl(JSContext* cx, const CallArgs& args);
+  static bool toResizableBuffer(JSContext* cx, unsigned argc, Value* vp);
+
+  using InstanceSet = JS::WeakCache<GCHashSet<
+      WeakHeapPtr<WasmInstanceObject*>,
+      StableCellHasher<WeakHeapPtr<WasmInstanceObject*>>, CellAllocPolicy>>;
+  bool hasObservers() const;
+  InstanceSet& observers() const;
+  InstanceSet* getOrCreateObservers(JSContext* cx);
+
+  static ArrayBufferObjectMaybeShared* refreshBuffer(
+      JSContext* cx, Handle<WasmMemoryObject*> memoryObj,
+      Handle<ArrayBufferObjectMaybeShared*> buffer);
+
+ public:
+  static const unsigned RESERVED_SLOTS = 3;
+  static const JSClass class_;
+  static const JSClass& protoClass_;
+  static const JSPropertySpec properties[];
+  static const JSFunctionSpec methods[];
+  static const JSFunctionSpec memoryControlMethods[];
+  static const JSFunctionSpec static_methods[];
+  static bool construct(JSContext*, unsigned, Value*);
+
+  static WasmMemoryObject* create(JSContext* cx,
+                                  Handle<ArrayBufferObjectMaybeShared*> buffer,
+                                  bool isHuge, HandleObject proto);
+
+  ArrayBufferObjectMaybeShared& buffer() const;
+
+  size_t volatileMemoryLength() const;
+
+  wasm::Pages volatilePages() const;
+
+  wasm::Pages clampedMaxPages() const;
+  mozilla::Maybe<wasm::Pages> sourceMaxPages() const;
+
+  wasm::AddressType addressType() const;
+  bool isShared() const;
+  bool isHuge() const;
+  bool movingGrowable() const;
+  size_t boundsCheckLimit() const;
+  wasm::PageSize pageSize() const;
+
+  WasmSharedArrayRawBuffer* sharedArrayRawBuffer() const;
+
+  bool addMovingGrowObserver(JSContext* cx, WasmInstanceObject* instance);
+  static uint64_t grow(Handle<WasmMemoryObject*> memory, uint64_t delta,
+                       JSContext* cx);
+  static void discard(Handle<WasmMemoryObject*> memory, uint64_t byteOffset,
+                      uint64_t len, JSContext* cx);
+};
+
+
+class WasmTableObject : public NativeObject {
+  static const unsigned TABLE_SLOT = 0;
+  static const JSClassOps classOps_;
+  static const ClassSpec classSpec_;
+  bool isNewborn() const;
+  static void finalize(JS::GCContext* gcx, JSObject* obj);
+  static void trace(JSTracer* trc, JSObject* obj);
+  static bool lengthGetterImpl(JSContext* cx, const CallArgs& args);
+  static bool lengthGetter(JSContext* cx, unsigned argc, Value* vp);
+  static bool typeImpl(JSContext* cx, const CallArgs& args);
+  static bool type(JSContext* cx, unsigned argc, Value* vp);
+  static bool getImpl(JSContext* cx, const CallArgs& args);
+  static bool get(JSContext* cx, unsigned argc, Value* vp);
+  static bool setImpl(JSContext* cx, const CallArgs& args);
+  static bool set(JSContext* cx, unsigned argc, Value* vp);
+  static bool growImpl(JSContext* cx, const CallArgs& args);
+  static bool grow(JSContext* cx, unsigned argc, Value* vp);
+
+ public:
+  static const unsigned RESERVED_SLOTS = 1;
+  static const JSClass class_;
+  static const JSClass& protoClass_;
+  static const JSPropertySpec properties[];
+  static const JSFunctionSpec methods[];
+  static const JSFunctionSpec static_methods[];
+  static bool construct(JSContext*, unsigned, Value*);
+
+
+  static WasmTableObject* create(JSContext* cx, const wasm::TableType& type,
+                                 HandleObject proto);
+  wasm::Table& table() const;
+
+  bool fillRange(JSContext* cx, uint32_t index, uint32_t length,
+                 HandleValue value) const;
+};
+
+
+class WasmTagObject : public NativeObject {
+  static const unsigned TYPE_SLOT = 0;
+
+  static const JSClassOps classOps_;
+  static const ClassSpec classSpec_;
+  static void finalize(JS::GCContext* gcx, JSObject* obj);
+  static bool typeImpl(JSContext* cx, const CallArgs& args);
+  static bool type(JSContext* cx, unsigned argc, Value* vp);
+
+ public:
+  static const unsigned RESERVED_SLOTS = 1;
+  static const JSClass class_;
+  static const JSClass& protoClass_;
+  static const JSPropertySpec properties[];
+  static const JSFunctionSpec methods[];
+  static const JSFunctionSpec static_methods[];
+  static bool construct(JSContext*, unsigned, Value*);
+
+  static WasmTagObject* create(JSContext* cx,
+                               const wasm::SharedTagType& tagType,
+                               HandleObject proto);
+
+  const wasm::TagType* tagType() const;
+  const wasm::ValTypeVector& valueTypes() const;
+};
+
+
+class WasmExceptionObject : public NativeObject {
+  static const unsigned TAG_SLOT = 0;
+  static const unsigned TYPE_SLOT = 1;
+  static const unsigned DATA_SLOT = 2;
+  static const unsigned STACK_SLOT = 3;
+
+  static const JSClassOps classOps_;
+  static const ClassSpec classSpec_;
+  static void trace(JSTracer* trc, JSObject* obj);
+  static void finalize(JS::GCContext* gcx, JSObject* obj);
+  static bool isMethod(JSContext* cx, unsigned argc, Value* vp);
+  static bool isImpl(JSContext* cx, const CallArgs& args);
+  static bool getArg(JSContext* cx, unsigned argc, Value* vp);
+  static bool getArgImpl(JSContext* cx, const CallArgs& args);
+  static bool getStack(JSContext* cx, unsigned argc, Value* vp);
+  static bool getStack_impl(JSContext* cx, const CallArgs& args);
+
+  uint8_t* typedMem() const;
+  [[nodiscard]] bool loadArg(JSContext* cx, size_t offset, wasm::ValType type,
+                             MutableHandleValue vp) const;
+  [[nodiscard]] bool initArg(JSContext* cx, size_t offset, wasm::ValType type,
+                             HandleValue value);
+
+  void initRefArg(size_t offset, wasm::AnyRef ref);
+  wasm::AnyRef loadRefArg(size_t offset) const;
+
+ public:
+  static const unsigned RESERVED_SLOTS = 4;
+  static const JSClass class_;
+  static const JSClass& protoClass_;
+  static const JSPropertySpec properties[];
+  static const JSFunctionSpec methods[];
+  static const JSFunctionSpec static_methods[];
+  static bool construct(JSContext*, unsigned, Value*);
+
+  static WasmExceptionObject* create(JSContext* cx, Handle<WasmTagObject*> tag,
+                                     HandleObject stack, HandleObject proto);
+  static WasmExceptionObject* wrapJSValue(JSContext* cx, HandleValue value);
+  bool isNewborn() const;
+
+  JSObject* stack() const;
+  const wasm::TagType* tagType() const;
+  WasmTagObject& tag() const;
+
+  bool isWrappedJSValue() const;
+  Value wrappedJSValue() const;
+
+  Value toJSValue() {
+    if (isWrappedJSValue()) {
+      return wrappedJSValue();
+    }
+    return JS::ObjectValue(*this);
+  }
+
+  static size_t offsetOfData() {
+    return NativeObject::getFixedSlotOffset(DATA_SLOT);
+  }
+};
+
+
+class WasmNamespaceObject : public NativeObject {
+ public:
+  static const JSClass class_;
+  static const unsigned JS_VALUE_TAG_SLOT = 0;
+#ifdef ENABLE_WASM_JSPI
+  static const unsigned JS_PROMISE_TAG_SLOT = 1;
+#endif
+  static const unsigned RESERVED_SLOTS = 2;
+
+  WasmTagObject* wrappedJSValueTag() const {
+    return &getReservedSlot(JS_VALUE_TAG_SLOT)
+                .toObjectOrNull()
+                ->as<WasmTagObject>();
+  }
+  void setWrappedJSValueTag(WasmTagObject* tag) {
+    return setReservedSlot(JS_VALUE_TAG_SLOT, ObjectValue(*tag));
+  }
+#ifdef ENABLE_WASM_JSPI
+  WasmTagObject* jsPromiseTag() const {
+    return &getReservedSlot(JS_PROMISE_TAG_SLOT)
+                .toObjectOrNull()
+                ->as<WasmTagObject>();
+  }
+  void setJSPromiseTag(WasmTagObject* tag) {
+    return setReservedSlot(JS_PROMISE_TAG_SLOT, ObjectValue(*tag));
+  }
+#endif
+
+  static WasmNamespaceObject* getOrCreate(JSContext* cx);
+
+ private:
+  static const ClassSpec classSpec_;
+};
+
+extern const JSClass WasmFunctionClass;
+
+bool IsWasmSuspendingObject(JSObject* obj);
+
+#ifdef ENABLE_WASM_JSPI
+
+class WasmSuspendingObject : public NativeObject {
+ public:
+  static const ClassSpec classSpec_;
+  static const JSClass class_;
+  static const JSClass& protoClass_;
+  static const unsigned WRAPPED_FN_SLOT = 0;
+  static const unsigned RESERVED_SLOTS = 1;
+  static bool construct(JSContext*, unsigned, Value*);
+
+  JSObject* wrappedFunction() const {
+    return getReservedSlot(WRAPPED_FN_SLOT).toObjectOrNull();
+  }
+  void setWrappedFunction(HandleObject fn) {
+    return setReservedSlot(WRAPPED_FN_SLOT, ObjectValue(*fn));
+  }
+};
+
+JSObject* MaybeUnwrapSuspendingObject(JSObject* wrapper);
+#endif
+
+}  
+
+#endif  // wasm_js_h

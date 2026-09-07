@@ -1,0 +1,481 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/HTMLTrackElement.h"
+
+#include "mozilla/LoadInfo.h"
+#include "mozilla/StaticPrefs_media.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/HTMLMediaElement.h"
+#include "mozilla/dom/HTMLTrackElementBinding.h"
+#include "mozilla/dom/UnbindContext.h"
+#include "mozilla/dom/WebVTTListener.h"
+#include "nsAttrValueInlines.h"
+#include "nsCOMPtr.h"
+#include "nsContentUtils.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsGenericHTMLElement.h"
+#include "nsGkAtoms.h"
+#include "nsIContentPolicy.h"
+#include "nsILoadGroup.h"
+#include "nsIObserver.h"
+#include "nsIObserverService.h"
+#include "nsIScriptError.h"
+#include "nsISupportsImpl.h"
+#include "nsISupportsPrimitives.h"
+#include "nsNetUtil.h"
+#include "nsStyleConsts.h"
+#include "nsThreadUtils.h"
+
+extern mozilla::LazyLogModule gTextTrackLog;
+#define LOG(msg, ...)                                                        \
+  MOZ_LOG_FMT(gTextTrackLog, LogLevel::Verbose, "TextTrackElement={}, " msg, \
+              fmt::ptr(this), ##__VA_ARGS__)
+
+nsGenericHTMLElement* NS_NewHTMLTrackElement(
+    already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo,
+    mozilla::dom::FromParser aFromParser) {
+  RefPtr<mozilla::dom::NodeInfo> nodeInfo(aNodeInfo);
+  auto* nim = nodeInfo->NodeInfoManager();
+  return new (nim) mozilla::dom::HTMLTrackElement(nodeInfo.forget());
+}
+
+namespace mozilla::dom {
+
+static constexpr nsAttrValue::EnumTableEntry kKindTable[] = {
+    {"subtitles", static_cast<int16_t>(TextTrackKind::Subtitles)},
+    {"captions", static_cast<int16_t>(TextTrackKind::Captions)},
+    {"descriptions", static_cast<int16_t>(TextTrackKind::Descriptions)},
+    {"chapters", static_cast<int16_t>(TextTrackKind::Chapters)},
+    {"metadata", static_cast<int16_t>(TextTrackKind::Metadata)},
+};
+
+static constexpr const nsAttrValue::EnumTableEntry*
+    kKindTableInvalidValueDefault = &kKindTable[4];
+
+class WindowDestroyObserver final : public nsIObserver {
+  NS_DECL_ISUPPORTS
+
+ public:
+  explicit WindowDestroyObserver(HTMLTrackElement* aElement, uint64_t aWinID)
+      : mTrackElement(aElement), mInnerID(aWinID) {
+    RegisterWindowDestroyObserver();
+  }
+  void RegisterWindowDestroyObserver() {
+    nsCOMPtr<nsIObserverService> obs = mozilla::services::GetObserverService();
+    if (obs) {
+      obs->AddObserver(this, "inner-window-destroyed", false);
+    }
+  }
+  void UnRegisterWindowDestroyObserver() {
+    nsCOMPtr<nsIObserverService> obs = mozilla::services::GetObserverService();
+    if (obs) {
+      obs->RemoveObserver(this, "inner-window-destroyed");
+    }
+    mTrackElement = nullptr;
+  }
+  NS_IMETHODIMP Observe(nsISupports* aSubject, const char* aTopic,
+                        const char16_t* aData) override {
+    MOZ_ASSERT(NS_IsMainThread());
+    if (strcmp(aTopic, "inner-window-destroyed") == 0) {
+      nsCOMPtr<nsISupportsPRUint64> wrapper = do_QueryInterface(aSubject);
+      NS_ENSURE_TRUE(wrapper, NS_ERROR_FAILURE);
+      uint64_t innerID;
+      nsresult rv = wrapper->GetData(&innerID);
+      NS_ENSURE_SUCCESS(rv, rv);
+      if (innerID == mInnerID) {
+        if (mTrackElement) {
+          mTrackElement->CancelChannelAndListener(false);
+        }
+        UnRegisterWindowDestroyObserver();
+      }
+    }
+    return NS_OK;
+  }
+
+ private:
+  ~WindowDestroyObserver() = default;
+
+  HTMLTrackElement* mTrackElement;
+  uint64_t mInnerID;
+};
+NS_IMPL_ISUPPORTS(WindowDestroyObserver, nsIObserver);
+
+HTMLTrackElement::HTMLTrackElement(
+    already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo)
+    : nsGenericHTMLElement(std::move(aNodeInfo)),
+      mLoadResourceDispatched(false),
+      mWindowDestroyObserver(nullptr) {
+  nsISupports* parentObject = OwnerDoc()->GetParentObject();
+  NS_ENSURE_TRUE_VOID(parentObject);
+  nsCOMPtr<nsPIDOMWindowInner> window = do_QueryInterface(parentObject);
+  if (window) {
+    mWindowDestroyObserver =
+        new WindowDestroyObserver(this, window->WindowID());
+  }
+}
+
+HTMLTrackElement::~HTMLTrackElement() {
+  if (mWindowDestroyObserver) {
+    mWindowDestroyObserver->UnRegisterWindowDestroyObserver();
+  }
+  CancelChannelAndListener(false);
+}
+
+NS_IMPL_ELEMENT_CLONE(HTMLTrackElement)
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED(HTMLTrackElement, nsGenericHTMLElement,
+                                   mTrack, mMediaParent, mListener)
+
+NS_IMPL_ISUPPORTS_CYCLE_COLLECTION_INHERITED_0(HTMLTrackElement,
+                                               nsGenericHTMLElement)
+
+void HTMLTrackElement::GetKind(DOMString& aKind) const {
+  GetEnumAttr(nsGkAtoms::kind, kKindTable[0].tag, aKind);
+}
+
+void HTMLTrackElement::OnChannelRedirect(nsIChannel* aChannel,
+                                         nsIChannel* aNewChannel,
+                                         uint32_t aFlags) {
+  NS_ASSERTION(aChannel == mChannel, "Channels should match!");
+  mChannel = aNewChannel;
+}
+
+JSObject* HTMLTrackElement::WrapNode(JSContext* aCx,
+                                     JS::Handle<JSObject*> aGivenProto) {
+  return HTMLTrackElement_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+TextTrack* HTMLTrackElement::GetTrack() {
+  if (!mTrack) {
+    CreateTextTrack();
+  }
+  return mTrack;
+}
+
+void HTMLTrackElement::CreateTextTrack() {
+  nsISupports* parentObject = OwnerDoc()->GetParentObject();
+  nsCOMPtr<nsPIDOMWindowInner> window = do_QueryInterface(parentObject);
+  if (!parentObject) {
+    nsContentUtils::ReportToConsole(
+        nsIScriptError::errorFlag, "Media"_ns, OwnerDoc(),
+        PropertiesFile::DOM_PROPERTIES,
+        "Using track element in non-window context");
+    return;
+  }
+
+  nsString label, srcLang;
+  GetSrclang(srcLang);
+  GetLabel(label);
+
+  TextTrackKind kind;
+  if (const nsAttrValue* value = GetParsedAttr(nsGkAtoms::kind)) {
+    kind = static_cast<TextTrackKind>(value->GetEnumValue());
+  } else {
+    kind = TextTrackKind::Subtitles;
+  }
+
+  MOZ_ASSERT(!mTrack, "No need to recreate a text track!");
+  mTrack =
+      new TextTrack(window, kind, label, srcLang, TextTrackMode::Disabled,
+                    TextTrackReadyState::NotLoaded, TextTrackSource::Track);
+  mTrack->SetTrackElement(this);
+}
+
+bool HTMLTrackElement::ParseAttribute(int32_t aNamespaceID, nsAtom* aAttribute,
+                                      const nsAString& aValue,
+                                      nsIPrincipal* aMaybeScriptedPrincipal,
+                                      nsAttrValue& aResult) {
+  if (aNamespaceID == kNameSpaceID_None && aAttribute == nsGkAtoms::kind) {
+    return aResult.ParseEnumValue(aValue, kKindTable, false,
+                                  kKindTableInvalidValueDefault);
+  }
+
+  return nsGenericHTMLElement::ParseAttribute(aNamespaceID, aAttribute, aValue,
+                                              aMaybeScriptedPrincipal, aResult);
+}
+
+void HTMLTrackElement::SetSrc(const nsAString& aSrc, ErrorResult& aError) {
+  LOG("Set src={}", NS_ConvertUTF16toUTF8(aSrc).get());
+
+  nsAutoString src;
+  if (GetAttr(nsGkAtoms::src, src) && src == aSrc) {
+    LOG("No need to reload for same src url");
+    return;
+  }
+
+  SetHTMLAttr(nsGkAtoms::src, aSrc, aError);
+  SetReadyState(TextTrackReadyState::NotLoaded);
+  if (!mMediaParent) {
+    return;
+  }
+
+  mListener = nullptr;
+  if (mChannel) {
+    mChannel->CancelWithReason(NS_BINDING_ABORTED,
+                               "HTMLTrackElement::SetSrc"_ns);
+    mChannel = nullptr;
+  }
+
+  MaybeDispatchLoadResource();
+}
+
+void HTMLTrackElement::MaybeClearAllCues() {
+  if (!mTrack) {
+    return;
+  }
+  mTrack->ClearAllCues();
+}
+
+void HTMLTrackElement::MaybeDispatchLoadResource() {
+  MOZ_ASSERT(mTrack, "Should have already created text track!");
+
+  bool resistFingerprinting = ShouldResistFingerprinting(RFPTarget::WebVTT);
+  if (mTrack->Mode() == TextTrackMode::Disabled && !resistFingerprinting) {
+    LOG("Do not load resource for disable track");
+    return;
+  }
+
+  if (resistFingerprinting && ReadyState() == TextTrackReadyState::Loading) {
+    return;
+  }
+
+  if (!mMediaParent) {
+    LOG("Do not load resource for track without media element");
+    return;
+  }
+
+  if (ReadyState() == TextTrackReadyState::Loaded) {
+    LOG("Has already loaded resource");
+    return;
+  }
+
+  if (!mLoadResourceDispatched) {
+    RefPtr<WebVTTListener> listener = new WebVTTListener(this);
+    RefPtr<Runnable> r = NewRunnableMethod<RefPtr<WebVTTListener>>(
+        "dom::HTMLTrackElement::LoadResource", this,
+        &HTMLTrackElement::LoadResource, std::move(listener));
+    nsContentUtils::RunInStableState(r.forget());
+    mLoadResourceDispatched = true;
+  }
+}
+
+void HTMLTrackElement::LoadResource(RefPtr<WebVTTListener>&& aWebVTTListener) {
+  LOG("LoadResource");
+  mLoadResourceDispatched = false;
+
+  nsAutoString src;
+  if (!GetAttr(nsGkAtoms::src, src) || src.IsEmpty()) {
+    LOG("Fail to load because no src");
+    SetReadyState(TextTrackReadyState::FailedToLoad);
+    return;
+  }
+
+  nsCOMPtr<nsIURI> uri;
+  nsresult rv = NewURIFromString(src, getter_AddRefs(uri));
+  NS_ENSURE_TRUE_VOID(NS_SUCCEEDED(rv));
+  LOG("Trying to load from src={}", NS_ConvertUTF16toUTF8(src).get());
+
+  CancelChannelAndListener(true);
+
+  CORSMode corsMode =
+      mMediaParent ? AttrValueToCORSMode(
+                         mMediaParent->GetParsedAttr(nsGkAtoms::crossorigin))
+                   : CORS_NONE;
+
+  nsSecurityFlags secFlags;
+  if (CORS_NONE == corsMode) {
+    secFlags = nsILoadInfo::SEC_REQUIRE_SAME_ORIGIN_INHERITS_SEC_CONTEXT;
+  } else {
+    secFlags = nsILoadInfo::SEC_REQUIRE_CORS_INHERITS_SEC_CONTEXT;
+    if (CORS_ANONYMOUS == corsMode) {
+      secFlags |= nsILoadInfo::SEC_COOKIES_SAME_ORIGIN;
+    } else if (CORS_USE_CREDENTIALS == corsMode) {
+      secFlags |= nsILoadInfo::SEC_COOKIES_INCLUDE;
+    } else {
+      NS_WARNING("Unknown CORS mode.");
+      secFlags = nsILoadInfo::SEC_REQUIRE_SAME_ORIGIN_INHERITS_SEC_CONTEXT;
+    }
+  }
+
+  mListener = std::move(aWebVTTListener);
+  rv = mListener->LoadResource();
+  NS_ENSURE_TRUE_VOID(NS_SUCCEEDED(rv));
+
+  Document* doc = OwnerDoc();
+  if (!doc) {
+    return;
+  }
+
+  nsCOMPtr<nsIRunnable> runnable = NS_NewRunnableFunction(
+      "dom::HTMLTrackElement::LoadResource",
+      [self = RefPtr{this}, this, listener = mListener, uri, secFlags]() {
+        if (mListener != listener) {
+          return;
+        }
+        nsCOMPtr<nsIChannel> channel;
+        nsCOMPtr<nsILoadGroup> loadGroup = OwnerDoc()->GetDocumentLoadGroup();
+        nsresult rv = NS_NewChannel(getter_AddRefs(channel), uri,
+                                    static_cast<Element*>(this), secFlags,
+                                    nsIContentPolicy::TYPE_INTERNAL_TRACK,
+                                    nullptr,  
+                                    loadGroup);
+
+        if (NS_FAILED(rv)) {
+          LOG("create channel failed.");
+          SetReadyState(TextTrackReadyState::FailedToLoad);
+          return;
+        }
+
+        channel->SetNotificationCallbacks(mListener);
+
+        LOG("opening webvtt channel");
+        rv = channel->AsyncOpen(mListener);
+
+        if (NS_FAILED(rv)) {
+          SetReadyState(TextTrackReadyState::FailedToLoad);
+          return;
+        }
+        mChannel = std::move(channel);
+      });
+  doc->Dispatch(runnable.forget());
+}
+
+nsresult HTMLTrackElement::BindToTree(BindContext& aContext, nsINode& aParent) {
+  nsresult rv = nsGenericHTMLElement::BindToTree(aContext, aParent);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  LOG("Track Element bound to tree.");
+  auto* parent = HTMLMediaElement::FromNode(aParent);
+  if (!parent) {
+    return NS_OK;
+  }
+
+  if (!mMediaParent) {
+    mMediaParent = parent;
+
+    mMediaParent->NotifyAddedSource();
+    LOG("Track element sent notification to parent.");
+
+    if (!mTrack) {
+      CreateTextTrack();
+    }
+    if (mTrack) {
+      LOG("Add text track to media parent");
+      mMediaParent->AddTextTrack(mTrack);
+    }
+    MaybeDispatchLoadResource();
+  }
+
+  return NS_OK;
+}
+
+void HTMLTrackElement::UnbindFromTree(UnbindContext& aContext) {
+  if (mMediaParent && aContext.IsUnbindRoot(this)) {
+    if (mTrack) {
+      mMediaParent->RemoveTextTrack(mTrack);
+      mMediaParent->UpdateReadyState();
+    }
+    mMediaParent = nullptr;
+  }
+
+  nsGenericHTMLElement::UnbindFromTree(aContext);
+}
+
+TextTrackReadyState HTMLTrackElement::ReadyState() const {
+  if (!mTrack) {
+    return TextTrackReadyState::NotLoaded;
+  }
+
+  return mTrack->ReadyState();
+}
+
+void HTMLTrackElement::SetReadyState(TextTrackReadyState aReadyState) {
+  if (ReadyState() == aReadyState) {
+    return;
+  }
+
+  if (mTrack) {
+    switch (aReadyState) {
+      case TextTrackReadyState::Loaded:
+        LOG("dispatch 'load' event");
+        DispatchTrackRunnable(u"load"_ns);
+        break;
+      case TextTrackReadyState::FailedToLoad:
+        LOG("dispatch 'error' event");
+        DispatchTrackRunnable(u"error"_ns);
+        break;
+      default:
+        break;
+    }
+    mTrack->SetReadyState(aReadyState);
+  }
+}
+
+void HTMLTrackElement::DispatchTrackRunnable(const nsString& aEventName) {
+  Document* doc = OwnerDoc();
+  if (!doc) {
+    return;
+  }
+  nsCOMPtr<nsIRunnable> runnable = NewRunnableMethod<const nsString>(
+      "dom::HTMLTrackElement::DispatchTrustedEvent", this,
+      &HTMLTrackElement::DispatchTrustedEvent, aEventName);
+  doc->Dispatch(runnable.forget());
+}
+
+void HTMLTrackElement::DispatchTrustedEvent(const nsAString& aName) {
+  Document* doc = OwnerDoc();
+  if (!doc) {
+    return;
+  }
+  nsContentUtils::DispatchTrustedEvent(doc, this, aName, CanBubble::eNo,
+                                       Cancelable::eNo);
+}
+
+void HTMLTrackElement::CancelChannelAndListener(bool aCheckRFP) {
+  if (aCheckRFP && ShouldResistFingerprinting(RFPTarget::WebVTT)) {
+    return;
+  }
+
+  if (mChannel) {
+    mChannel->CancelWithReason(NS_BINDING_ABORTED,
+                               "HTMLTrackElement::CancelChannelAndListener"_ns);
+    mChannel->SetNotificationCallbacks(nullptr);
+    mChannel = nullptr;
+  }
+
+  if (mListener) {
+    mListener->Cancel();
+    mListener = nullptr;
+  }
+}
+
+bool HTMLTrackElement::ShouldResistFingerprinting(RFPTarget aRfpTarget) {
+  Document* doc = OwnerDoc();
+  if (!doc) {
+    return nsContentUtils::ShouldResistFingerprinting("Null document",
+                                                      aRfpTarget);
+  }
+  return doc->ShouldResistFingerprinting(aRfpTarget);
+}
+
+void HTMLTrackElement::AfterSetAttr(int32_t aNameSpaceID, nsAtom* aName,
+                                    const nsAttrValue* aValue,
+                                    const nsAttrValue* aOldValue,
+                                    nsIPrincipal* aMaybeScriptedPrincipal,
+                                    bool aNotify) {
+  if (aNameSpaceID == kNameSpaceID_None && aName == nsGkAtoms::src) {
+    MaybeClearAllCues();
+    if (ReadyState() == TextTrackReadyState::Loading && aValue != aOldValue) {
+      SetReadyState(TextTrackReadyState::FailedToLoad);
+    }
+  }
+  return nsGenericHTMLElement::AfterSetAttr(
+      aNameSpaceID, aName, aValue, aOldValue, aMaybeScriptedPrincipal, aNotify);
+}
+
+#undef LOG
+
+}  

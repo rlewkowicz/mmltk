@@ -1,0 +1,105 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozStorageAsyncStatementExecution_h
+#define mozStorageAsyncStatementExecution_h
+
+#include "nscore.h"
+#include "nsTArray.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/TimeStamp.h"
+#include "nsThreadUtils.h"
+
+#include "SQLiteMutex.h"
+#include "mozIStoragePendingStatement.h"
+#include "mozIStorageStatementCallback.h"
+#include "mozStorageHelper.h"
+
+struct sqlite3_stmt;
+
+namespace mozilla {
+namespace storage {
+
+class Connection;
+class ResultSet;
+class StatementData;
+}  
+}  
+
+namespace mozilla::storage {
+class AsyncExecuteStatements final : public Runnable,
+                                     public mozIStoragePendingStatement {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_NSIRUNNABLE
+  NS_DECL_MOZISTORAGEPENDINGSTATEMENT
+
+  enum ExecutionState {
+    PENDING = -1,
+    COMPLETED = mozIStorageStatementCallback::REASON_FINISHED,
+    CANCELED = mozIStorageStatementCallback::REASON_CANCELED,
+    ERROR = mozIStorageStatementCallback::REASON_ERROR
+  };
+
+  typedef nsTArray<StatementData> StatementDataArray;
+
+  static nsresult execute(StatementDataArray&& aStatements,
+                          Connection* aConnection, sqlite3* aNativeConnection,
+                          mozIStorageStatementCallback* aCallback,
+                          mozIStoragePendingStatement** _stmt);
+
+  bool shouldNotify();
+
+  nsresult notifyCompleteOnCallingThread();
+  nsresult notifyErrorOnCallingThread(mozIStorageError* aError);
+  nsresult notifyResultsOnCallingThread(ResultSet* aResultSet);
+
+ private:
+  AsyncExecuteStatements(StatementDataArray&& aStatements,
+                         Connection* aConnection, sqlite3* aNativeConnection,
+                         mozIStorageStatementCallback* aCallback);
+  ~AsyncExecuteStatements();
+
+  bool bindExecuteAndProcessStatement(StatementData& aData,
+                                      bool aLastStatement);
+
+  bool executeAndProcessStatement(StatementData& aData, bool aLastStatement);
+
+  bool executeStatement(StatementData& aData);
+
+  nsresult buildAndNotifyResults(sqlite3_stmt* aStatement);
+
+  nsresult notifyComplete();
+
+  nsresult notifyError(int32_t aErrorCode, const char* aMessage);
+  nsresult notifyError(mozIStorageError* aError);
+
+  nsresult notifyResults();
+
+  bool statementsNeedTransaction();
+
+  StatementDataArray mStatements;
+  RefPtr<Connection> mConnection;
+  sqlite3* mNativeConnection;
+  bool mHasTransaction;
+  nsCOMPtr<mozIStorageStatementCallback> mCallback;
+  nsCOMPtr<nsIThread> mCallingThread;
+  RefPtr<ResultSet> mResultSet;
+
+  const TimeDuration mMaxWait;
+
+  TimeStamp mIntervalStart;
+
+  ExecutionState mState;
+
+  bool mCancelRequested;
+
+  Mutex& mMutex;
+
+  SQLiteMutex& mDBMutex;
+};
+
+}  
+
+#endif  // mozStorageAsyncStatementExecution_h

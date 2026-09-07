@@ -1,0 +1,23 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsIPercentBSizeObserver_h_
+#define nsIPercentBSizeObserver_h_
+
+#include "nsQueryFrame.h"
+
+namespace mozilla {
+struct ReflowInput;
+}  
+
+class nsIPercentBSizeObserver {
+ public:
+  NS_DECL_QUERYFRAME_TARGET(nsIPercentBSizeObserver)
+
+  virtual void NotifyPercentBSize(const mozilla::ReflowInput& aReflowInput) = 0;
+
+  virtual bool NeedsToObserve(const mozilla::ReflowInput& aReflowInput) = 0;
+};
+
+#endif  // nsIPercentBSizeObserver_h_

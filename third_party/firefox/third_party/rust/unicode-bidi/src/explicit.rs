@@ -1,0 +1,200 @@
+// Copyright 2015 The Servo Project Developers. See the
+// COPYRIGHT file at the top-level directory of this distribution.
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+//! 3.3.2 Explicit Levels and Directions
+//!
+//! <http://www.unicode.org/reports/tr9/#Explicit_Levels_and_Directions>
+
+#[cfg(feature = "smallvec")]
+use smallvec::{smallvec, SmallVec};
+
+use super::char_data::{
+    is_rtl,
+    BidiClass::{self, *},
+};
+use super::level::Level;
+use super::prepare::removed_by_x9;
+use super::LevelRunVec;
+use super::TextSource;
+
+/// Compute explicit embedding levels for one paragraph of text (X1-X8), and identify
+/// level runs (BD7) for use when determining Isolating Run Sequences (X10).
+///
+/// `processing_classes[i]` must contain the `BidiClass` of the char at byte index `i`,
+/// for each char in `text`.
+///
+/// `runs` returns the list of level runs (BD7) of the text.
+#[cfg_attr(feature = "flame_it", flamer::flame)]
+pub fn compute<'a, T: TextSource<'a> + ?Sized>(
+    text: &'a T,
+    para_level: Level,
+    original_classes: &[BidiClass],
+    levels: &mut [Level],
+    processing_classes: &mut [BidiClass],
+    runs: &mut LevelRunVec,
+) {
+    assert_eq!(text.len(), original_classes.len());
+
+    #[cfg(feature = "smallvec")]
+    let mut stack: SmallVec<[Status; 8]> = smallvec![Status {
+        level: para_level,
+        status: OverrideStatus::Neutral,
+    }];
+    #[cfg(not(feature = "smallvec"))]
+    let mut stack = vec![Status {
+        level: para_level,
+        status: OverrideStatus::Neutral,
+    }];
+
+    let mut overflow_isolate_count = 0u32;
+    let mut overflow_embedding_count = 0u32;
+    let mut valid_isolate_count = 0u32;
+
+    let mut current_run_level = Level::ltr();
+    let mut current_run_start = 0;
+
+    for (i, len) in text.indices_lengths() {
+        let last = stack.last().unwrap();
+
+        match original_classes[i] {
+            RLE | LRE | RLO | LRO | RLI | LRI | FSI => {
+                levels[i] = last.level;
+
+                let is_isolate = matches!(original_classes[i], RLI | LRI | FSI);
+                if is_isolate {
+                    match last.status {
+                        OverrideStatus::RTL => processing_classes[i] = R,
+                        OverrideStatus::LTR => processing_classes[i] = L,
+                        _ => {}
+                    }
+                }
+
+                let new_level = if is_rtl(original_classes[i]) {
+                    last.level.new_explicit_next_rtl()
+                } else {
+                    last.level.new_explicit_next_ltr()
+                };
+
+                if new_level.is_ok() && overflow_isolate_count == 0 && overflow_embedding_count == 0
+                {
+                    let new_level = new_level.unwrap();
+
+                    stack.push(Status {
+                        level: new_level,
+                        status: match original_classes[i] {
+                            RLO => OverrideStatus::RTL,
+                            LRO => OverrideStatus::LTR,
+                            RLI | LRI | FSI => OverrideStatus::Isolate,
+                            _ => OverrideStatus::Neutral,
+                        },
+                    });
+
+                    if is_isolate {
+                        valid_isolate_count += 1;
+                    } else {
+                        levels[i] = new_level;
+                    }
+                } else if is_isolate {
+                    overflow_isolate_count += 1;
+                } else if overflow_isolate_count == 0 {
+                    overflow_embedding_count += 1;
+                }
+
+                if !is_isolate {
+                    processing_classes[i] = BN;
+                }
+            }
+
+            PDI => {
+                if overflow_isolate_count > 0 {
+                    overflow_isolate_count -= 1;
+                } else if valid_isolate_count > 0 {
+                    overflow_embedding_count = 0;
+
+                    while !matches!(
+                        stack.pop(),
+                        None | Some(Status {
+                            status: OverrideStatus::Isolate,
+                            ..
+                        })
+                    ) {}
+
+                    valid_isolate_count -= 1;
+                }
+
+                let last = stack.last().unwrap();
+                levels[i] = last.level;
+
+                match last.status {
+                    OverrideStatus::RTL => processing_classes[i] = R,
+                    OverrideStatus::LTR => processing_classes[i] = L,
+                    _ => {}
+                }
+            }
+
+            PDF => {
+                if overflow_isolate_count > 0 {
+                } else if overflow_embedding_count > 0 {
+                    overflow_embedding_count -= 1;
+                } else if last.status != OverrideStatus::Isolate && stack.len() >= 2 {
+                    stack.pop();
+                }
+
+                levels[i] = stack.last().unwrap().level;
+                processing_classes[i] = BN;
+            }
+
+            B => {}
+
+            _ => {
+                levels[i] = last.level;
+
+                if original_classes[i] != BN {
+                    match last.status {
+                        OverrideStatus::RTL => processing_classes[i] = R,
+                        OverrideStatus::LTR => processing_classes[i] = L,
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        for j in 1..len {
+            levels[i + j] = levels[i];
+            processing_classes[i + j] = processing_classes[i];
+        }
+
+        if i == 0 {
+            current_run_level = levels[i];
+        } else {
+            if !removed_by_x9(original_classes[i]) && levels[i] != current_run_level {
+                runs.push(current_run_start..i);
+                current_run_level = levels[i];
+                current_run_start = i;
+            }
+        }
+    }
+
+    if levels.len() > current_run_start {
+        runs.push(current_run_start..levels.len());
+    }
+}
+
+/// Entries in the directional status stack:
+struct Status {
+    level: Level,
+    status: OverrideStatus,
+}
+
+#[derive(PartialEq)]
+enum OverrideStatus {
+    Neutral,
+    RTL,
+    LTR,
+    Isolate,
+}

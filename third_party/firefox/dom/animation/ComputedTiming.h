@@ -1,0 +1,49 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_ComputedTiming_h
+#define mozilla_ComputedTiming_h
+
+#include "mozilla/StickyTimeDuration.h"
+#include "mozilla/dom/AnimationEffectBinding.h"  // FillMode
+#include "mozilla/dom/Nullable.h"
+
+namespace mozilla {
+
+struct ComputedTiming {
+  StickyTimeDuration mActiveDuration;
+  StickyTimeDuration mActiveTime;
+  StickyTimeDuration mEndTime;
+  dom::Nullable<double> mProgress;
+  uint64_t mCurrentIteration = 0;
+  double mIterations = 1.0;
+  double mIterationStart = 0.0;
+  StickyTimeDuration mDuration;
+
+  dom::FillMode mFill = dom::FillMode::None;
+  bool FillsForwards() const {
+    MOZ_ASSERT(mFill != dom::FillMode::Auto,
+               "mFill should not be Auto in ComputedTiming.");
+    return mFill == dom::FillMode::Both || mFill == dom::FillMode::Forwards;
+  }
+  bool FillsBackwards() const {
+    MOZ_ASSERT(mFill != dom::FillMode::Auto,
+               "mFill should not be Auto in ComputedTiming.");
+    return mFill == dom::FillMode::Both || mFill == dom::FillMode::Backwards;
+  }
+
+  enum class AnimationPhase {
+    Idle,    
+    Before,  
+    Active,  
+    After    
+  };
+  AnimationPhase mPhase = AnimationPhase::Idle;
+
+  bool mBeforeFlag = false;
+};
+
+}  
+
+#endif  // mozilla_ComputedTiming_h

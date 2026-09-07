@@ -1,0 +1,727 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+******************************************************************************
+* Copyright (C) 2003-2015, International Business Machines Corporation
+* and others. All Rights Reserved.
+******************************************************************************
+*
+* File ISLAMCAL.H
+*
+* Modification History:
+*
+*   Date        Name        Description
+*   10/14/2003  srl         ported from java IslamicCalendar
+*****************************************************************************
+*/
+
+#include "islamcal.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "umutex.h"
+#include <float.h>
+#include "gregoimp.h" // Math
+#include "astro.h" // CalendarAstronomer
+#include "uhash.h"
+#include "ucln_in.h"
+#include "uassert.h"
+
+static const UDate HIJRA_MILLIS = -42521587200000.0;    
+
+#ifdef U_DEBUG_ISLAMCAL
+# include <stdio.h>
+# include <stdarg.h>
+static void debug_islamcal_loc(const char *f, int32_t l)
+{
+    fprintf(stderr, "%s:%d: ", f, l);
+}
+
+static void debug_islamcal_msg(const char *pat, ...)
+{
+    va_list ap;
+    va_start(ap, pat);
+    vfprintf(stderr, pat, ap);
+    fflush(stderr);
+}
+#define U_DEBUG_ISLAMCAL_MSG(x) {debug_islamcal_loc(__FILE__,__LINE__);debug_islamcal_msg x;}
+#else
+#define U_DEBUG_ISLAMCAL_MSG(x)
+#endif
+
+
+static icu::CalendarCache *gMonthCache = nullptr;
+
+U_CDECL_BEGIN
+static UBool calendar_islamic_cleanup() {
+    if (gMonthCache) {
+        delete gMonthCache;
+        gMonthCache = nullptr;
+    }
+    return true;
+}
+U_CDECL_END
+
+U_NAMESPACE_BEGIN
+
+
+static const int32_t CIVIL_EPOC = 1948440; 
+
+static const int32_t ASTRONOMICAL_EPOC = 1948439; 
+
+
+static const int32_t UMALQURA_YEAR_START = 1300;
+static const int32_t UMALQURA_YEAR_END = 1600;
+
+static const int UMALQURA_MONTHLENGTH[] = {
+                            0x0AAA,           0x0D54,           0x0EC9,
+                            0x06D4,           0x06EA,           0x036C,           0x0AAD,           0x0555,
+                            0x06A9,           0x0792,           0x0BA9,           0x05D4,           0x0ADA,
+                            0x055C,           0x0D2D,           0x0695,           0x074A,           0x0B54,
+                            0x0B6A,           0x05AD,           0x04AE,           0x0A4F,           0x0517,
+                            0x068B,           0x06A5,           0x0AD5,           0x02D6,           0x095B,
+                            0x049D,           0x0A4D,           0x0D26,           0x0D95,           0x05AC,
+                            0x09B6,           0x02BA,           0x0A5B,           0x052B,           0x0A95,
+                            0x06CA,           0x0AE9,           0x02F4,           0x0976,           0x02B6,
+                            0x0956,           0x0ACA,           0x0BA4,           0x0BD2,           0x05D9,
+                            0x02DC,           0x096D,           0x054D,           0x0AA5,           0x0B52,
+                            0x0BA5,           0x05B4,           0x09B6,           0x0557,           0x0297,
+                            0x054B,           0x06A3,           0x0752,           0x0B65,           0x056A,
+                            0x0AAB,           0x052B,           0x0C95,           0x0D4A,           0x0DA5,
+                            0x05CA,           0x0AD6,           0x0957,           0x04AB,           0x094B,
+                            0x0AA5,           0x0B52,           0x0B6A,           0x0575,           0x0276,
+                            0x08B7,           0x045B,           0x0555,           0x05A9,           0x05B4,
+                            0x09DA,           0x04DD,           0x026E,           0x0936,           0x0AAA,
+                            0x0D54,           0x0DB2,           0x05D5,           0x02DA,           0x095B,
+                            0x04AB,           0x0A55,           0x0B49,           0x0B64,           0x0B71,
+                            0x05B4,           0x0AB5,           0x0A55,           0x0D25,           0x0E92,
+                            0x0EC9,           0x06D4,           0x0AE9,           0x096B,           0x04AB,
+                            0x0A93,           0x0D49,         0x0DA4,           0x0DB2,           0x0AB9,
+                            0x04BA,           0x0A5B,           0x052B,           0x0A95,           0x0B2A,
+                            0x0B55,           0x055C,           0x04BD,           0x023D,           0x091D,
+                            0x0A95,           0x0B4A,           0x0B5A,           0x056D,           0x02B6,
+                            0x093B,           0x049B,           0x0655,           0x06A9,           0x0754,
+                            0x0B6A,           0x056C,           0x0AAD,           0x0555,           0x0B29,
+                            0x0B92,           0x0BA9,           0x05D4,           0x0ADA,           0x055A,
+                            0x0AAB,           0x0595,           0x0749,           0x0764,           0x0BAA,
+                            0x05B5,           0x02B6,           0x0A56,           0x0E4D,           0x0B25,
+                            0x0B52,           0x0B6A,           0x05AD,           0x02AE,           0x092F,
+                            0x0497,           0x064B,           0x06A5,           0x06AC,           0x0AD6,
+                            0x055D,           0x049D,           0x0A4D,           0x0D16,           0x0D95,
+                            0x05AA,           0x05B5,           0x02DA,           0x095B,           0x04AD,
+                            0x0595,           0x06CA,           0x06E4,           0x0AEA,           0x04F5,
+                            0x02B6,           0x0956,           0x0AAA,           0x0B54,           0x0BD2,
+                            0x05D9,           0x02EA,           0x096D,           0x04AD,           0x0A95,
+                            0x0B4A,           0x0BA5,           0x05B2,           0x09B5,           0x04D6,
+                            0x0A97,           0x0547,           0x0693,           0x0749,           0x0B55,
+                            0x056A,           0x0A6B,           0x052B,           0x0A8B,           0x0D46,           0x0DA3,           0x05CA,           0x0AD6,           0x04DB,           0x026B,           0x094B,
+                            0x0AA5,           0x0B52,           0x0B69,           0x0575,           0x0176,           0x08B7,           0x025B,           0x052B,           0x0565,           0x05B4,           0x09DA,
+                            0x04ED,           0x016D,           0x08B6,           0x0AA6,           0x0D52,           0x0DA9,           0x05D4,           0x0ADA,           0x095B,           0x04AB,           0x0653,
+                            0x0729,           0x0762,           0x0BA9,           0x05B2,           0x0AB5,           0x0555,           0x0B25,           0x0D92,           0x0EC9,           0x06D2,           0x0AE9,
+                            0x056B,           0x04AB,           0x0A55,           0x0D29,           0x0D54,           0x0DAA,           0x09B5,           0x04BA,           0x0A3B,           0x049B,           0x0A4D,
+                            0x0AAA,           0x0AD5,           0x02DA,           0x095D,           0x045E,           0x0A2E,           0x0C9A,           0x0D55,           0x06B2,           0x06B9,           0x04BA,
+                            0x0A5D,           0x052D,           0x0A95,           0x0B52,           0x0BA8,           0x0BB4,           0x05B9,           0x02DA,           0x095A,           0x0B4A,           0x0DA4,
+                            0x0ED1,           0x06E8,           0x0B6A,           0x056D,           0x0535,           0x0695,           0x0D4A,           0x0DA8,           0x0DD4,           0x06DA,           0x055B,
+                            0x029D,           0x062B,           0x0B15,           0x0B4A,           0x0B95,           0x05AA,           0x0AAE,           0x092E,           0x0C8F,           0x0527,           0x0695,
+                            0x06AA,           0x0AD6,           0x055D,           0x029D
+};
+
+
+const char *IslamicCalendar::getType() const {
+    return "islamic";
+}
+
+IslamicCalendar* IslamicCalendar::clone() const {
+    return new IslamicCalendar(*this);
+}
+
+IslamicCalendar::IslamicCalendar(const Locale& aLocale, UErrorCode& success)
+:   Calendar(TimeZone::forLocaleOrDefault(aLocale), aLocale, success)
+{
+}
+
+IslamicCalendar::~IslamicCalendar()
+{
+}
+
+
+static const int32_t LIMITS[UCAL_FIELD_COUNT][4] = {
+    {        0,        0,        0,        0}, 
+    {        1,        1,  5000000,  5000000}, 
+    {        0,        0,       11,       11}, 
+    {        1,        1,       50,       51}, 
+    {-1,-1,-1,-1}, 
+    {        1,        1,       29,       31}, 
+    {        1,        1,      354,      355}, 
+    {-1,-1,-1,-1}, 
+    {       -1,       -1,        5,        5}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    {        1,        1,  5000000,  5000000}, 
+    {-1,-1,-1,-1}, 
+    {        1,        1,  5000000,  5000000}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    {        0,        0,       11,       11}, 
+};
+
+int32_t IslamicCalendar::handleGetLimit(UCalendarDateFields field, ELimitType limitType) const {
+    return LIMITS[field][limitType];
+}
+
+
+namespace {
+
+static const int8_t umAlQuraYrStartEstimateFix[] = {
+     0,  0, -1,  0, -1,  0,  0,  0,  0,  0, 
+    -1,  0,  0,  0,  0,  0,  0,  0, -1,  0, 
+     1,  0,  1,  1,  0,  0,  0,  0,  1,  0, 
+     0,  0,  0,  0,  0,  0,  1,  0,  0,  0, 
+     0,  0,  1,  0,  0, -1, -1,  0,  0,  0, 
+     1,  0,  0, -1,  0,  0,  0,  1,  1,  0, 
+     0,  0,  0,  0,  0,  0,  0, -1,  0,  0, 
+     0,  1,  1,  0,  0, -1,  0,  1,  0,  1, 
+     1,  0,  0, -1,  0,  1,  0,  0,  0, -1, 
+     0,  1,  0,  1,  0,  0,  0, -1,  0,  0, 
+     0,  0, -1, -1,  0, -1,  0,  1,  0,  0, 
+     0, -1,  0,  0,  0,  1,  0,  0,  0,  0, 
+     0,  1,  0,  0, -1, -1,  0,  0,  0,  1, 
+     0,  0, -1, -1,  0, -1,  0,  0, -1, -1, 
+     0, -1,  0, -1,  0,  0, -1, -1,  0,  0, 
+     0,  0,  0,  0, -1,  0,  1,  0,  1,  1, 
+     0,  0, -1,  0,  1,  0,  0,  0,  0,  0, 
+     1,  0,  1,  0,  0,  0, -1,  0,  1,  0, 
+     0, -1, -1,  0,  0,  0,  1,  0,  0,  0, 
+     0,  0,  0,  0,  1,  0,  0,  0,  0,  0, 
+     1,  0,  0, -1,  0,  0,  0,  1,  1,  0, 
+     0, -1,  0,  1,  0,  1,  1,  0,  0,  0, 
+     0,  1,  0,  0,  0, -1,  0,  0,  0,  1, 
+     0,  0,  0, -1,  0,  0,  0,  0,  0, -1, 
+     0, -1,  0,  1,  0,  0,  0, -1,  0,  1, 
+     0,  1,  0,  0,  0,  0,  0,  1,  0,  0, 
+    -1,  0,  0,  0,  0,  1,  0,  0,  0, -1, 
+     0,  0,  0,  0, -1, -1,  0, -1,  0,  1, 
+     0,  0, -1, -1,  0,  0,  1,  1,  0,  0, 
+    -1,  0,  0,  0,  0,  1,  0,  0,  0,  0, 
+     1 
+};
+
+inline bool civilLeapYear(int32_t year) {
+    return (14 + 11 * year) % 30 < 11;
+}
+
+int32_t trueMonthStart(int32_t month, UErrorCode& status);
+
+} 
+
+int64_t IslamicCalendar::yearStart(int32_t year, UErrorCode& status) const {
+    return trueMonthStart(12*(year-1), status);
+}
+
+int64_t IslamicCalendar::monthStart(int32_t year, int32_t month, UErrorCode& status) const {
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+    int32_t temp;
+    if (uprv_add32_overflow(year, -1, &temp) ||
+        uprv_mul32_overflow(temp, 12, &temp) ||
+        uprv_add32_overflow(temp, month, &month)) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return 0;
+    }
+
+    return trueMonthStart(month, status);
+}
+
+namespace {
+double moonAge(UDate time);
+
+int32_t trueMonthStart(int32_t month, UErrorCode& status) {
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+    ucln_i18n_registerCleanup(UCLN_I18N_ISLAMIC_CALENDAR, calendar_islamic_cleanup);
+    int64_t start = CalendarCache::get(&gMonthCache, month, status);
+
+    if (U_SUCCESS(status) && start==0) {
+        UDate origin = HIJRA_MILLIS 
+            + uprv_floor(month * CalendarAstronomer::SYNODIC_MONTH) * kOneDay;
+
+        double age = moonAge(origin);
+
+        if (age >= 0) {
+            do {
+                origin -= kOneDay;
+                age = moonAge(origin);
+            } while (age >= 0);
+        }
+        else {
+            do {
+                origin += kOneDay;
+                age = moonAge(origin);
+            } while (age < 0);
+        }
+        start = ClockMath::floorDivideInt64(
+            static_cast<int64_t>(static_cast<int64_t>(origin) - HIJRA_MILLIS), static_cast<int64_t>(kOneDay)) + 1;
+        CalendarCache::put(&gMonthCache, month, start, status);
+    }
+    if(U_FAILURE(status)) {
+        start = 0;
+    }
+    return start;
+}
+
+double moonAge(UDate time) {
+    double age = CalendarAstronomer(time).getMoonAge() * 180 / CalendarAstronomer::PI;
+    if (age > 180) {
+        age = age - 360;
+    }
+
+    return age;
+}
+
+}  
+
+int32_t IslamicCalendar::handleGetMonthLength(int32_t extendedYear, int32_t month,
+                                              UErrorCode& status) const {
+    month = 12*(extendedYear-1) + month;
+    int32_t len = trueMonthStart(month+1, status) - trueMonthStart(month, status) ;
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+    return len;
+}
+
+namespace {
+
+int32_t yearLength(int32_t extendedYear, UErrorCode& status) {
+    int32_t month = 12*(extendedYear-1);
+    int32_t length = trueMonthStart(month + 12, status) - trueMonthStart(month, status);
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+    return length;
+}
+
+} 
+int32_t IslamicCalendar::handleGetYearLength(int32_t extendedYear, UErrorCode& status) const {
+    return yearLength(extendedYear, status);
+}
+
+
+int64_t IslamicCalendar::handleComputeMonthStart(int32_t eyear, int32_t month,
+                                                 UBool ,
+                                                 UErrorCode& status) const {
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+    if (month > 11) {
+        if (uprv_add32_overflow(eyear, (month / 12), &eyear)) {
+            status = U_ILLEGAL_ARGUMENT_ERROR;
+            return 0;
+        }
+        month %= 12;
+    } else if (month < 0) {
+        month++;
+        if (uprv_add32_overflow(eyear, (month / 12) - 1, &eyear)) {
+            status = U_ILLEGAL_ARGUMENT_ERROR;
+            return 0;
+        }
+        month = (month % 12) + 11;
+    }
+    return monthStart(eyear, month, status) + getEpoc() - 1;
+}
+
+
+int32_t IslamicCalendar::handleGetExtendedYear(UErrorCode& ) {
+    if (newerField(UCAL_EXTENDED_YEAR, UCAL_YEAR) == UCAL_EXTENDED_YEAR) {
+        return internalGet(UCAL_EXTENDED_YEAR, 1); 
+    }
+    return internalGet(UCAL_YEAR, 1); 
+}
+
+void IslamicCalendar::handleComputeFields(int32_t julianDay, UErrorCode &status) {
+    if (U_FAILURE(status)) {
+        return;
+    }
+    int32_t days = julianDay - getEpoc();
+
+    int32_t month = static_cast<int32_t>(uprv_floor(static_cast<double>(days) / CalendarAstronomer::SYNODIC_MONTH));
+
+    int32_t startDate = static_cast<int32_t>(uprv_floor(month * CalendarAstronomer::SYNODIC_MONTH));
+
+    double age = moonAge(internalGetTime());
+    if ( days - startDate >= 25 && age > 0) {
+        month++;
+    }
+
+    while ((startDate = trueMonthStart(month, status)) > days) {
+        if (U_FAILURE(status)) {
+            return;
+        }
+        month--;
+    }
+    if (U_FAILURE(status)) {
+        return;
+    }
+
+    int32_t year = month >=  0 ? ((month / 12) + 1) : ((month + 1 ) / 12);
+    month = ((month % 12) + 12 ) % 12;
+    int64_t dayOfMonth = (days - monthStart(year, month, status)) + 1;
+    if (U_FAILURE(status)) {
+        return;
+    }
+    if (dayOfMonth > INT32_MAX || dayOfMonth < INT32_MIN) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return;
+    }
+
+    int64_t dayOfYear = (days - monthStart(year, 0, status)) + 1;
+    if (U_FAILURE(status)) {
+        return;
+    }
+    if (dayOfYear > INT32_MAX || dayOfYear < INT32_MIN) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return;
+    }
+
+    internalSet(UCAL_ERA, 0);
+    internalSet(UCAL_YEAR, year);
+    internalSet(UCAL_EXTENDED_YEAR, year);
+    internalSet(UCAL_MONTH, month);
+    internalSet(UCAL_ORDINAL_MONTH, month);
+    internalSet(UCAL_DAY_OF_MONTH, dayOfMonth);
+    internalSet(UCAL_DAY_OF_YEAR, dayOfYear);
+}
+
+int32_t IslamicCalendar::getEpoc() const {
+    return CIVIL_EPOC;
+}
+
+static int32_t gregoYearFromIslamicStart(int32_t year) {
+    int cycle, offset, shift = 0;
+    if (year >= 1397) {
+        cycle = (year - 1397) / 67;
+        offset = (year - 1397) % 67;
+        shift = 2*cycle + ((offset >= 33)? 1: 0);
+    } else {
+        cycle = (year - 1396) / 67 - 1;
+        offset = -(year - 1396) % 67;
+        shift = 2*cycle + ((offset <= 33)? 1: 0);
+    }
+    return year + 579 - shift;
+}
+
+int32_t IslamicCalendar::getRelatedYear(UErrorCode &status) const
+{
+    int32_t year = get(UCAL_EXTENDED_YEAR, status);
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+    return gregoYearFromIslamicStart(year);
+}
+
+void IslamicCalendar::setRelatedYear(int32_t year)
+{
+    int cycle, offset, shift = 0;
+    if (year >= 1977) {
+        cycle = (year - 1977) / 65;
+        offset = (year - 1977) % 65;
+        shift = 2*cycle + ((offset >= 32)? 1: 0);
+    } else {
+        cycle = (year - 1976) / 65 - 1;
+        offset = -(year - 1976) % 65;
+        shift = 2*cycle + ((offset <= 32)? 1: 0);
+    }
+    year = year - 579 + shift;
+    set(UCAL_EXTENDED_YEAR, year);
+}
+
+IMPL_SYSTEM_DEFAULT_CENTURY(IslamicCalendar, "@calendar=islamic-civil")
+
+bool
+IslamicCalendar::inTemporalLeapYear(UErrorCode &status) const
+{
+    int32_t days = getActualMaximum(UCAL_DAY_OF_YEAR, status);
+    if (U_FAILURE(status)) {
+        return false;
+    }
+    return days == 355;
+}
+
+IslamicCivilCalendar::IslamicCivilCalendar(const Locale& aLocale, UErrorCode& success)
+    : IslamicCalendar(aLocale, success)
+{
+}
+
+IslamicCivilCalendar::~IslamicCivilCalendar()
+{
+}
+
+const char *IslamicCivilCalendar::getType() const {
+    return "islamic-civil";
+}
+
+IslamicCivilCalendar* IslamicCivilCalendar::clone() const {
+    return new IslamicCivilCalendar(*this);
+}
+
+int64_t IslamicCivilCalendar::yearStart(int32_t year, UErrorCode& ) const {
+    return 354LL * (year-1LL) + ClockMath::floorDivideInt64(3 + 11LL * year, 30LL);
+}
+
+int64_t IslamicCivilCalendar::monthStart(int32_t year, int32_t month, UErrorCode& ) const {
+    return static_cast<int64_t>(
+        uprv_ceil(29.5*month) + 354LL*(year-1LL) +
+        ClockMath::floorDivideInt64(
+             11LL*static_cast<int64_t>(year) + 3LL, 30LL));
+}
+
+int32_t IslamicCivilCalendar::handleGetMonthLength(int32_t extendedYear, int32_t month,
+                                                   UErrorCode& ) const {
+    int32_t length = 29 + (month+1) % 2;
+    if (month == DHU_AL_HIJJAH && civilLeapYear(extendedYear)) {
+        length++;
+    }
+    return length;
+}
+
+int32_t IslamicCivilCalendar::handleGetYearLength(int32_t extendedYear, UErrorCode& status) const {
+    if (U_FAILURE(status)) return 0;
+    return 354 + (civilLeapYear(extendedYear) ? 1 : 0);
+}
+
+void IslamicCivilCalendar::handleComputeFields(int32_t julianDay, UErrorCode &status) {
+    if (U_FAILURE(status)) {
+        return;
+    }
+    int32_t days = julianDay - getEpoc();
+
+    int64_t year  =
+        ClockMath::floorDivideInt64(30LL * days + 10646LL, 10631LL);
+    int32_t month = static_cast<int32_t>(
+        uprv_ceil((days - 29 - yearStart(year, status)) / 29.5 ));
+    if (U_FAILURE(status)) {
+        return;
+    }
+    month = month<11?month:11;
+
+    int64_t dayOfMonth = (days - monthStart(year, month, status)) + 1;
+    if (U_FAILURE(status)) {
+        return;
+    }
+    if (dayOfMonth > INT32_MAX || dayOfMonth < INT32_MIN) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return;
+    }
+
+    int64_t dayOfYear = (days - monthStart(year, 0, status)) + 1;
+    if (U_FAILURE(status)) {
+        return;
+    }
+    if (dayOfYear > INT32_MAX || dayOfYear < INT32_MIN) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return;
+    }
+
+    internalSet(UCAL_ERA, 0);
+    internalSet(UCAL_YEAR, year);
+    internalSet(UCAL_EXTENDED_YEAR, year);
+    internalSet(UCAL_MONTH, month);
+    internalSet(UCAL_ORDINAL_MONTH, month);
+    internalSet(UCAL_DAY_OF_MONTH, dayOfMonth);
+    internalSet(UCAL_DAY_OF_YEAR, dayOfYear);
+}
+IslamicTBLACalendar::IslamicTBLACalendar(const Locale& aLocale, UErrorCode& success)
+    : IslamicCivilCalendar(aLocale, success)
+{
+}
+
+IslamicTBLACalendar::~IslamicTBLACalendar()
+{
+}
+
+const char *IslamicTBLACalendar::getType() const {
+    return "islamic-tbla";
+}
+
+IslamicTBLACalendar* IslamicTBLACalendar::clone() const {
+    return new IslamicTBLACalendar(*this);
+}
+
+int32_t IslamicTBLACalendar::getEpoc() const {
+    return ASTRONOMICAL_EPOC;
+}
+
+IslamicUmalquraCalendar::IslamicUmalquraCalendar(const Locale& aLocale, UErrorCode& success)
+    : IslamicCivilCalendar(aLocale, success)
+{
+}
+
+IslamicUmalquraCalendar::~IslamicUmalquraCalendar()
+{
+}
+
+const char *IslamicUmalquraCalendar::getType() const {
+    return "islamic-umalqura";
+}
+
+IslamicUmalquraCalendar* IslamicUmalquraCalendar::clone() const {
+    return new IslamicUmalquraCalendar(*this);
+}
+
+int64_t IslamicUmalquraCalendar::yearStart(int32_t year, UErrorCode& status) const {
+    if (year < UMALQURA_YEAR_START || year > UMALQURA_YEAR_END) {
+        return IslamicCivilCalendar::yearStart(year, status);
+    }
+    year -= UMALQURA_YEAR_START;
+    int64_t yrStartLinearEstimate = static_cast<int64_t>(
+        (354.36720 * static_cast<double>(year)) + 460322.05 + 0.5);
+    return yrStartLinearEstimate + umAlQuraYrStartEstimateFix[year];
+}
+
+int64_t IslamicUmalquraCalendar::monthStart(int32_t year, int32_t month, UErrorCode& status) const {
+    int64_t ms = yearStart(year, status);
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+    for(int i=0; i< month; i++){
+        ms+= handleGetMonthLength(year, i, status);
+        if (U_FAILURE(status)) {
+            return 0;
+        }
+    }
+    return ms;
+}
+
+int32_t IslamicUmalquraCalendar::handleGetMonthLength(int32_t extendedYear, int32_t month,
+                                                      UErrorCode& status) const {
+    if (extendedYear<UMALQURA_YEAR_START || extendedYear>UMALQURA_YEAR_END) {
+        return IslamicCivilCalendar::handleGetMonthLength(extendedYear, month, status);
+    }
+    int32_t length = 29;
+    int32_t mask = static_cast<int32_t>(0x01 << (11 - month)); 
+    int32_t index = extendedYear - UMALQURA_YEAR_START;
+    if ((UMALQURA_MONTHLENGTH[index] & mask) != 0) {
+        length++;
+    }
+    return length;
+}
+
+int32_t IslamicUmalquraCalendar::yearLength(int32_t extendedYear, UErrorCode& status) const {
+    if (extendedYear<UMALQURA_YEAR_START || extendedYear>UMALQURA_YEAR_END) {
+        return IslamicCivilCalendar::handleGetYearLength(extendedYear, status);
+    }
+    int length = 0;
+    for(int i=0; i<12; i++) {
+        length += handleGetMonthLength(extendedYear, i, status);
+        if (U_FAILURE(status)) {
+            return 0;
+        }
+    }
+    return length;
+}
+
+int32_t IslamicUmalquraCalendar::handleGetYearLength(int32_t extendedYear, UErrorCode& status) const {
+    return yearLength(extendedYear, status);
+}
+
+void IslamicUmalquraCalendar::handleComputeFields(int32_t julianDay, UErrorCode &status) {
+    if (U_FAILURE(status)) {
+        return;
+    }
+    int64_t year;
+    int32_t month;
+    int32_t days = julianDay - getEpoc();
+
+    static int64_t kUmalquraStart = yearStart(UMALQURA_YEAR_START, status);
+    if (U_FAILURE(status)) {
+        return;
+    }
+    if (days < kUmalquraStart) {
+        IslamicCivilCalendar::handleComputeFields(julianDay, status);
+        return;
+    }
+    year = ((static_cast<double>(days) - (460322.05 + 0.5)) / 354.36720) + UMALQURA_YEAR_START - 1;
+    month = 0;
+    int32_t d = 1;
+    while (d > 0) {
+        d = days - yearStart(++year, status) + 1;
+        int32_t length = yearLength(year, status);
+        if (U_FAILURE(status)) {
+            return;
+        }
+        if (d == length) {
+            month = 11;
+            break;
+        }
+        if (d < length){
+            int32_t monthLen = handleGetMonthLength(year, month, status);
+            for (month = 0;
+                 d > monthLen;
+                 monthLen = handleGetMonthLength(year, ++month, status)) {
+                if (U_FAILURE(status)) {
+                    return;
+                }
+                d -= monthLen;
+            }
+            break;
+        }
+    }
+
+    int32_t dayOfMonth = monthStart(year, month, status);
+    int32_t dayOfYear = monthStart(year, 0, status);
+    if (U_FAILURE(status)) {
+        return;
+    }
+    if (uprv_mul32_overflow(dayOfMonth, -1, &dayOfMonth) ||
+        uprv_add32_overflow(dayOfMonth, days, &dayOfMonth) ||
+        uprv_add32_overflow(dayOfMonth, 1, &dayOfMonth) ||
+        uprv_mul32_overflow(dayOfYear, -1, &dayOfYear) ||
+        uprv_add32_overflow(dayOfYear, days, &dayOfYear) ||
+        uprv_add32_overflow(dayOfYear, 1, &dayOfYear)) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return;
+    }
+
+    internalSet(UCAL_ERA, 0);
+    internalSet(UCAL_YEAR, year);
+    internalSet(UCAL_EXTENDED_YEAR, year);
+    internalSet(UCAL_MONTH, month);
+    internalSet(UCAL_ORDINAL_MONTH, month);
+    internalSet(UCAL_DAY_OF_MONTH, dayOfMonth);
+    internalSet(UCAL_DAY_OF_YEAR, dayOfYear);
+}
+IslamicRGSACalendar::IslamicRGSACalendar(const Locale& aLocale, UErrorCode& success)
+    : IslamicCalendar(aLocale, success)
+{
+}
+
+IslamicRGSACalendar::~IslamicRGSACalendar()
+{
+}
+
+const char *IslamicRGSACalendar::getType() const {
+    return "islamic-rgsa";
+}
+
+IslamicRGSACalendar* IslamicRGSACalendar::clone() const {
+    return new IslamicRGSACalendar(*this);
+}
+
+UOBJECT_DEFINE_RTTI_IMPLEMENTATION(IslamicCalendar)
+UOBJECT_DEFINE_RTTI_IMPLEMENTATION(IslamicCivilCalendar)
+UOBJECT_DEFINE_RTTI_IMPLEMENTATION(IslamicUmalquraCalendar)
+UOBJECT_DEFINE_RTTI_IMPLEMENTATION(IslamicTBLACalendar)
+UOBJECT_DEFINE_RTTI_IMPLEMENTATION(IslamicRGSACalendar)
+
+U_NAMESPACE_END
+
+#endif
+

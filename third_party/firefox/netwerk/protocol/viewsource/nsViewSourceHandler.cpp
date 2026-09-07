@@ -1,0 +1,109 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsViewSourceHandler.h"
+#include "nsViewSourceChannel.h"
+#include "nsNetUtil.h"
+#include "nsSimpleNestedURI.h"
+
+#define VIEW_SOURCE "view-source"
+
+#define DEFAULT_FLAGS \
+  (URI_NORELATIVE | URI_NOAUTH | URI_DANGEROUS_TO_LOAD | URI_NON_PERSISTABLE)
+
+namespace mozilla {
+namespace net {
+
+
+NS_IMPL_ISUPPORTS(nsViewSourceHandler, nsIProtocolHandler)
+
+
+NS_IMETHODIMP
+nsViewSourceHandler::GetScheme(nsACString& result) {
+  result.AssignLiteral(VIEW_SOURCE);
+  return NS_OK;
+}
+
+nsresult nsViewSourceHandler::CreateNewURI(const nsACString& aSpec,
+                                           const char* aCharset,
+                                           nsIURI* aBaseURI, nsIURI** aResult) {
+  *aResult = nullptr;
+
+
+  int32_t colon = aSpec.FindChar(':');
+  if (colon == kNotFound) return NS_ERROR_MALFORMED_URI;
+
+  nsCOMPtr<nsIURI> innerURI;
+  nsresult rv = NS_NewURI(getter_AddRefs(innerURI), Substring(aSpec, colon + 1),
+                          aCharset, aBaseURI);
+  if (NS_FAILED(rv)) return rv;
+
+  nsAutoCString asciiSpec;
+  rv = innerURI->GetAsciiSpec(asciiSpec);
+  if (NS_FAILED(rv)) return rv;
+
+
+  asciiSpec.Insert(VIEW_SOURCE ":", 0);
+
+  nsCOMPtr<nsIURI> uri;
+  rv = NS_MutateURI(new nsSimpleNestedURI::Mutator())
+           .Apply(&nsINestedURIMutator::Init, innerURI)
+           .SetSpec(asciiSpec)
+           .Finalize(uri);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  uri.swap(*aResult);
+  return rv;
+}
+
+NS_IMETHODIMP
+nsViewSourceHandler::NewChannel(nsIURI* uri, nsILoadInfo* aLoadInfo,
+                                nsIChannel** result) {
+  NS_ENSURE_ARG_POINTER(uri);
+  RefPtr<nsViewSourceChannel> channel = new nsViewSourceChannel();
+
+  nsresult rv = channel->Init(uri, aLoadInfo);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  *result = channel.forget().downcast<nsIViewSourceChannel>().take();
+  return NS_OK;
+}
+
+nsresult nsViewSourceHandler::NewSrcdocChannel(nsIURI* aURI, nsIURI* aBaseURI,
+                                               const nsAString& aSrcdoc,
+                                               nsILoadInfo* aLoadInfo,
+                                               nsIChannel** outChannel) {
+  NS_ENSURE_ARG_POINTER(aURI);
+  RefPtr<nsViewSourceChannel> channel = new nsViewSourceChannel();
+
+  nsresult rv = channel->InitSrcdoc(aURI, aBaseURI, aSrcdoc, aLoadInfo);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  *outChannel = static_cast<nsIViewSourceChannel*>(channel.forget().take());
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsViewSourceHandler::AllowPort(int32_t port, const char* scheme,
+                               bool* _retval) {
+  *_retval = false;
+  return NS_OK;
+}
+
+nsViewSourceHandler::nsViewSourceHandler() { gInstance = this; }
+
+nsViewSourceHandler::~nsViewSourceHandler() { gInstance = nullptr; }
+
+nsViewSourceHandler* nsViewSourceHandler::gInstance = nullptr;
+
+nsViewSourceHandler* nsViewSourceHandler::GetInstance() { return gInstance; }
+
+}  
+}  

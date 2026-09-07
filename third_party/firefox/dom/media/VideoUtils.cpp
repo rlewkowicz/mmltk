@@ -1,0 +1,1128 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "VideoUtils.h"
+
+#include <stdint.h>
+
+#include "CubebUtils.h"
+#include "H264.h"
+#include "ImageContainer.h"
+#include "MediaContainerType.h"
+#include "MediaResource.h"
+#include "TimeUnits.h"
+#include "mozilla/Base64.h"
+#include "mozilla/SchedulerGroup.h"
+#include "mozilla/SharedThreadPool.h"
+#include "mozilla/StaticPrefs_media.h"
+#include "mozilla/TaskQueue.h"
+#include "mozilla/dom/ContentChild.h"
+#include "nsCharSeparatedTokenizer.h"
+#include "nsContentTypeParser.h"
+#include "nsIConsoleService.h"
+#include "nsINetworkLinkService.h"
+#include "nsIRandomGenerator.h"
+#include "nsMathUtils.h"
+#include "nsNetCID.h"
+#include "nsServiceManagerUtils.h"
+#include "nsThreadUtils.h"
+
+
+namespace mozilla {
+
+using gfx::ColorRange;
+using gfx::CICP::ColourPrimaries;
+using gfx::CICP::MatrixCoefficients;
+using gfx::CICP::TransferCharacteristics;
+using layers::PlanarYCbCrImage;
+using media::TimeUnit;
+
+double ToMicrosecondResolution(double aSeconds) {
+  double integer;
+  modf(aSeconds * USECS_PER_S, &integer);
+  return integer / USECS_PER_S;
+}
+
+CheckedInt64 SaferMultDiv(int64_t aValue, uint64_t aMul, uint64_t aDiv) {
+  if (aMul > INT64_MAX || aDiv > INT64_MAX) {
+    return CheckedInt64(INT64_MAX) + 1;  
+  }
+  int64_t mul = AssertedCast<int64_t>(aMul);
+  int64_t div = AssertedCast<int64_t>(aDiv);
+  int64_t major = aValue / div;
+  int64_t remainder = aValue % div;
+  return CheckedInt64(remainder) * mul / div + CheckedInt64(major) * mul;
+}
+
+CheckedInt64 FramesToUsecs(int64_t aFrames, uint32_t aRate) {
+  return SaferMultDiv(aFrames, USECS_PER_S, aRate);
+}
+
+CheckedInt64 UsecsToFrames(int64_t aUsecs, uint32_t aRate) {
+  return SaferMultDiv(aUsecs, aRate, USECS_PER_S);
+}
+
+CheckedInt64 TimeUnitToFrames(const TimeUnit& aTime, uint32_t aRate) {
+  return aTime.IsValid() ? UsecsToFrames(aTime.ToMicroseconds(), aRate)
+                         : CheckedInt64(INT64_MAX) + 1;
+}
+
+nsresult SecondsToUsecs(double aSeconds, int64_t& aOutUsecs) {
+  if (aSeconds * double(USECS_PER_S) >= double(INT64_MAX)) {
+    return NS_ERROR_FAILURE;
+  }
+  aOutUsecs = int64_t(aSeconds * double(USECS_PER_S));
+  return NS_OK;
+}
+
+static int32_t ConditionDimension(float aValue) {
+  if (aValue > 1.0 && aValue <= float(INT32_MAX)) {
+    return int32_t(NS_round(aValue));
+  }
+  return 0;
+}
+
+void ScaleDisplayByAspectRatio(gfx::IntSize& aDisplay, float aAspectRatio) {
+  if (aAspectRatio > 1.0) {
+    aDisplay.width =
+        ConditionDimension(aAspectRatio * AssertedCast<float>(aDisplay.width));
+  } else {
+    aDisplay.height =
+        ConditionDimension(AssertedCast<float>(aDisplay.height) / aAspectRatio);
+  }
+}
+
+static int64_t BytesToTime(int64_t offset, int64_t length, int64_t durationUs) {
+  NS_ASSERTION(length > 0, "Must have positive length");
+  double r = double(offset) / double(length);
+  if (r > 1.0) {
+    r = 1.0;
+  }
+  return int64_t(double(durationUs) * r);
+}
+
+media::TimeIntervals GetEstimatedBufferedTimeRanges(
+    mozilla::MediaResource* aStream, int64_t aDurationUsecs) {
+  media::TimeIntervals buffered;
+  if (aDurationUsecs <= 0 || !aStream) {
+    return buffered;
+  }
+
+  if (aStream->IsDataCachedToEndOfResource(0)) {
+    buffered += media::TimeInterval(TimeUnit::Zero(),
+                                    TimeUnit::FromMicroseconds(aDurationUsecs));
+    return buffered;
+  }
+
+  int64_t totalBytes = aStream->GetLength();
+
+  if (totalBytes <= 0) {
+    return buffered;
+  }
+
+  int64_t startOffset = aStream->GetNextCachedData(0);
+  while (startOffset >= 0) {
+    int64_t endOffset = aStream->GetCachedDataEnd(startOffset);
+    NS_ASSERTION(startOffset >= 0, "Integer underflow in GetBuffered");
+    NS_ASSERTION(endOffset >= 0, "Integer underflow in GetBuffered");
+
+    int64_t startUs = BytesToTime(startOffset, totalBytes, aDurationUsecs);
+    int64_t endUs = BytesToTime(endOffset, totalBytes, aDurationUsecs);
+    if (startUs != endUs) {
+      buffered += media::TimeInterval(TimeUnit::FromMicroseconds(startUs),
+                                      TimeUnit::FromMicroseconds(endUs));
+    }
+    startOffset = aStream->GetNextCachedData(endOffset);
+  }
+  return buffered;
+}
+
+void DownmixStereoToMono(mozilla::AudioDataValue* aBuffer, uint32_t aFrames) {
+  MOZ_ASSERT(aBuffer);
+  const int channels = 2;
+  for (uint32_t fIdx = 0; fIdx < aFrames; ++fIdx) {
+#if defined(MOZ_SAMPLE_TYPE_FLOAT32)
+    float sample = 0.0;
+#else
+    int sample = 0;
+#endif
+    sample = (aBuffer[fIdx * channels] + aBuffer[fIdx * channels + 1]) * 0.5f;
+    aBuffer[fIdx * channels] = aBuffer[fIdx * channels + 1] = sample;
+  }
+}
+
+uint32_t DecideAudioPlaybackChannels(const AudioInfo& info) {
+  if (StaticPrefs::media_forcestereo_enabled()) {
+    return 2;
+  }
+
+  return info.mChannels;
+}
+
+uint32_t DecideAudioPlaybackSampleRate(const AudioInfo& aInfo,
+                                       bool aShouldResistFingerprinting) {
+  bool resampling = StaticPrefs::media_resampling_enabled();
+
+  uint32_t rate = 0;
+
+  if (resampling) {
+    rate = 48000;
+  } else if (aInfo.mRate >= 44100) {
+    rate = std::min<unsigned>(aInfo.mRate, 384000u);
+  } else {
+    rate = CubebUtils::PreferredSampleRate(aShouldResistFingerprinting);
+    if (rate > 768000) {
+      rate = 48000;
+    }
+  }
+  MOZ_DIAGNOSTIC_ASSERT(rate, "output rate can't be 0.");
+
+  return rate;
+}
+
+bool IsDefaultPlaybackDeviceMono() {
+  return CubebUtils::MaxNumberOfChannels() == 1;
+}
+
+bool IsVideoContentType(const nsCString& aContentType) {
+  constexpr auto video = "video"_ns;
+  return FindInReadable(video, aContentType);
+}
+
+bool IsValidVideoRegion(const gfx::IntSize& aFrame,
+                        const gfx::IntRect& aPicture,
+                        const gfx::IntSize& aDisplay) {
+  return aFrame.width > 0 && aFrame.width <= PlanarYCbCrImage::MAX_DIMENSION &&
+         aFrame.height > 0 &&
+         aFrame.height <= PlanarYCbCrImage::MAX_DIMENSION &&
+         aFrame.width * aFrame.height <= MAX_VIDEO_WIDTH * MAX_VIDEO_HEIGHT &&
+         aPicture.width > 0 &&
+         aPicture.width <= PlanarYCbCrImage::MAX_DIMENSION && aPicture.x >= 0 &&
+         aPicture.x < PlanarYCbCrImage::MAX_DIMENSION &&
+         aPicture.x + aPicture.width < PlanarYCbCrImage::MAX_DIMENSION &&
+         aPicture.XMost() <= aFrame.width && aPicture.height > 0 &&
+         aPicture.height <= PlanarYCbCrImage::MAX_DIMENSION &&
+         aPicture.y >= 0 && aPicture.y < PlanarYCbCrImage::MAX_DIMENSION &&
+         aPicture.y + aPicture.height < PlanarYCbCrImage::MAX_DIMENSION &&
+         aPicture.YMost() <= aFrame.height &&
+         aPicture.width * aPicture.height <=
+             MAX_VIDEO_WIDTH * MAX_VIDEO_HEIGHT &&
+         aDisplay.width > 0 &&
+         aDisplay.width <= PlanarYCbCrImage::MAX_DIMENSION &&
+         aDisplay.height > 0 &&
+         aDisplay.height <= PlanarYCbCrImage::MAX_DIMENSION &&
+         aDisplay.width * aDisplay.height <= MAX_VIDEO_WIDTH * MAX_VIDEO_HEIGHT;
+}
+
+already_AddRefed<SharedThreadPool> GetMediaThreadPool(MediaThreadType aType) {
+  RefPtr<SharedThreadPool> pool;
+  switch (aType) {
+    case MediaThreadType::PLATFORM_DECODER:
+      pool = SharedThreadPool::Get("MediaPDecoder", 4);
+      break;
+    case MediaThreadType::WEBRTC_CALL_THREAD:
+      pool = SharedThreadPool::Get("WebrtcCallThread", 1);
+      break;
+    case MediaThreadType::WEBRTC_WORKER:
+      pool = SharedThreadPool::Get("WebrtcWorker", 4);
+      break;
+    case MediaThreadType::MDSM:
+      pool = SharedThreadPool::Get("MediaDecoderStateMachine", 1);
+      break;
+    case MediaThreadType::PLATFORM_ENCODER:
+      pool = SharedThreadPool::Get("MediaPEncoder", 4);
+      break;
+    default:
+      MOZ_FALLTHROUGH_ASSERT("Unexpected MediaThreadType");
+    case MediaThreadType::SUPERVISOR:
+      pool = SharedThreadPool::Get("MediaSupervisor", 4);
+      break;
+  }
+
+  bool needsLargerStacks = aType == MediaThreadType::PLATFORM_DECODER;
+  if (needsLargerStacks) {
+    const uint32_t minStackSize = 512 * 1024;
+    uint32_t stackSize;
+    MOZ_ALWAYS_SUCCEEDS(pool->GetThreadStackSize(&stackSize));
+    if (stackSize < minStackSize) {
+      MOZ_ALWAYS_SUCCEEDS(pool->SetThreadStackSize(minStackSize));
+    }
+  }
+
+  return pool.forget();
+}
+
+bool ExtractVPXCodecDetails(const nsAString& aCodec, uint8_t& aProfile,
+                            uint8_t& aLevel, uint8_t& aBitDepth) {
+  uint8_t dummyChromaSubsampling = 1;
+  VideoColorSpace dummyColorspace;
+  return ExtractVPXCodecDetails(aCodec, aProfile, aLevel, aBitDepth,
+                                dummyChromaSubsampling, dummyColorspace);
+}
+
+bool ExtractVPXCodecDetails(const nsAString& aCodec, uint8_t& aProfile,
+                            uint8_t& aLevel, uint8_t& aBitDepth,
+                            uint8_t& aChromaSubsampling,
+                            VideoColorSpace& aColorSpace) {
+  aChromaSubsampling = 1;
+  auto splitter = aCodec.Split(u'.');
+  auto fieldsItr = splitter.begin();
+  auto fourCC = *fieldsItr;
+
+  if (!fourCC.EqualsLiteral("vp09") && !fourCC.EqualsLiteral("vp08")) {
+    return false;
+  }
+  ++fieldsItr;
+  uint8_t primary, transfer, matrix, range;
+  uint8_t* fields[] = {&aProfile, &aLevel,   &aBitDepth, &aChromaSubsampling,
+                       &primary,  &transfer, &matrix,    &range};
+  int fieldsCount = 0;
+  nsresult rv;
+  for (; fieldsItr != splitter.end(); ++fieldsItr, ++fieldsCount) {
+    if (fieldsCount > 7) {
+      return false;
+    }
+    *(fields[fieldsCount]) =
+        static_cast<uint8_t>((*fieldsItr).ToInteger(&rv, 10));
+    NS_ENSURE_SUCCESS(rv, false);
+  }
+  if (fieldsCount < 3) {
+    return false;
+  }
+
+  if (aProfile > 3) {
+    return false;
+  }
+
+  switch (aLevel) {
+    case 10:
+    case 11:
+    case 20:
+    case 21:
+    case 30:
+    case 31:
+    case 40:
+    case 41:
+    case 50:
+    case 51:
+    case 52:
+    case 60:
+    case 61:
+    case 62:
+      break;
+    default:
+      return false;
+  }
+
+  if (aBitDepth != 8 && aBitDepth != 10 && aBitDepth != 12) {
+    return false;
+  }
+
+  if (fieldsCount == 3) {
+    return true;
+  }
+
+  if (aChromaSubsampling > 3) {
+    return false;
+  }
+
+  if (fieldsCount == 4) {
+    return true;
+  }
+
+  if (primary == 0 || primary == 3 || primary > 22) {
+    return false;
+  }
+  if (primary > 12 && primary < 22) {
+    return false;
+  }
+  aColorSpace.mPrimaries = static_cast<ColourPrimaries>(primary);
+
+  if (fieldsCount == 5) {
+    return true;
+  }
+
+  if (transfer == 0 || transfer == 3 || transfer > 18) {
+    return false;
+  }
+  aColorSpace.mTransfer = static_cast<TransferCharacteristics>(transfer);
+
+  if (fieldsCount == 6) {
+    return true;
+  }
+
+  if (matrix == 3 || matrix > 11) {
+    return false;
+  }
+  aColorSpace.mMatrix = static_cast<MatrixCoefficients>(matrix);
+
+  if (aColorSpace.mMatrix == MatrixCoefficients::MC_IDENTITY &&
+      aChromaSubsampling != 3) {
+    return false;
+  }
+
+  if (fieldsCount == 7) {
+    return true;
+  }
+
+  aColorSpace.mRange = static_cast<ColorRange>(range);
+  return range <= 1;
+}
+
+bool ExtractH264CodecDetails(const nsAString& aCodec, uint8_t& aProfile,
+                             uint8_t& aConstraint, H264_LEVEL& aLevel,
+                             H264CodecStringStrictness aStrictness) {
+  if (aCodec.Length() != strlen("avc1.PPCCLL")) {
+    return false;
+  }
+
+  const nsAString& sample = Substring(aCodec, 0, 5);
+  if (!sample.EqualsASCII("avc1.") && !sample.EqualsASCII("avc3.")) {
+    return false;
+  }
+
+  nsresult rv = NS_OK;
+  aProfile = Substring(aCodec, 5, 2).ToInteger(&rv, 16);
+  NS_ENSURE_SUCCESS(rv, false);
+
+  aConstraint = Substring(aCodec, 7, 2).ToInteger(&rv, 16);
+  NS_ENSURE_SUCCESS(rv, false);
+
+  uint8_t level = Substring(aCodec, 9, 2).ToInteger(&rv, 16);
+  NS_ENSURE_SUCCESS(rv, false);
+
+  if (level == 9) {
+    level = static_cast<uint8_t>(H264_LEVEL::H264_LEVEL_1_b);
+  } else if (level <= 5) {
+    level *= 10;
+  }
+
+  if (aStrictness == H264CodecStringStrictness::Lenient) {
+    aLevel = static_cast<H264_LEVEL>(level);
+    return true;
+  }
+
+  aLevel = static_cast<H264_LEVEL>(level);
+  if (aLevel < H264_LEVEL::H264_LEVEL_1 ||
+      aLevel > H264_LEVEL::H264_LEVEL_6_2) {
+    return false;
+  }
+  if ((level % 10) > 2) {
+    if (level != 13) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool IsH265ProfileRecognizable(uint8_t aProfile,
+                               int32_t aProfileCompabilityFlags) {
+  enum Profile {
+    eUnknown,
+    eHighThroughputScreenExtended,
+    eScalableRangeExtension,
+    eScreenExtended,
+    e3DMain,
+    eScalableMain,
+    eMultiviewMain,
+    eHighThroughput,
+    eRangeExtension,
+    eMain10,
+    eMain,
+    eMainStillPicture
+  };
+  Profile p = eUnknown;
+
+  if (aProfile == 11 || (aProfileCompabilityFlags & 0x800)) {
+    p = eHighThroughputScreenExtended;
+  }
+  if (aProfile == 10 || (aProfileCompabilityFlags & 0x400)) {
+    p = eScalableRangeExtension;
+  }
+  if (aProfile == 9 || (aProfileCompabilityFlags & 0x200)) {
+    p = eScreenExtended;
+  }
+  if (aProfile == 8 || (aProfileCompabilityFlags & 0x100)) {
+    p = e3DMain;
+  }
+  if (aProfile == 7 || (aProfileCompabilityFlags & 0x80)) {
+    p = eScalableMain;
+  }
+  if (aProfile == 6 || (aProfileCompabilityFlags & 0x40)) {
+    p = eMultiviewMain;
+  }
+  if (aProfile == 5 || (aProfileCompabilityFlags & 0x20)) {
+    p = eHighThroughput;
+  }
+  if (aProfile == 4 || (aProfileCompabilityFlags & 0x10)) {
+    p = eRangeExtension;
+  }
+  if (aProfile == 2 || (aProfileCompabilityFlags & 0x4)) {
+    p = eMain10;
+  }
+  if (aProfile == 1 || (aProfileCompabilityFlags & 0x2)) {
+    p = eMain;
+  }
+  if (aProfile == 3 || (aProfileCompabilityFlags & 0x8)) {
+    p = eMainStillPicture;
+  }
+
+  return p != eUnknown;
+}
+
+bool ExtractH265CodecDetails(const nsAString& aCodec, uint8_t& aProfile,
+                             uint8_t& aLevel, nsTArray<uint8_t>& aConstraints) {
+  const size_t maxHevcCodecIdLength =
+      5 +  
+      4 +  
+      9 +  
+      5 +  
+      18;  
+
+  if (aCodec.Length() > maxHevcCodecIdLength) {
+    return false;
+  }
+
+  const nsAString& sample = Substring(aCodec, 0, 5);
+  if (!sample.EqualsASCII("hev1.") && !sample.EqualsASCII("hvc1.")) {
+    return false;
+  }
+
+  nsresult rv;
+  CheckedUint8 profile;
+  int32_t compabilityFlags = 0;
+  CheckedUint8 level = 0;
+  nsTArray<uint8_t> constraints;
+
+  auto splitter = aCodec.Split(u'.');
+  size_t count = 0;
+  for (auto iter = splitter.begin(); iter != splitter.end(); ++iter, ++count) {
+    const auto& fieldStr = *iter;
+    if (fieldStr.IsEmpty()) {
+      return false;
+    }
+
+    if (count == 0) {
+      MOZ_RELEASE_ASSERT(fieldStr.EqualsASCII("hev1") ||
+                         fieldStr.EqualsASCII("hvc1"));
+      continue;
+    }
+
+    if (count == 1) {  
+      Maybe<uint8_t> validProfileSpace;
+      if (fieldStr.First() == u'A' || fieldStr.First() == u'B' ||
+          fieldStr.First() == u'C') {
+        validProfileSpace.emplace(1 + (fieldStr.First() - 'A'));
+      }
+      profile = validProfileSpace ? Substring(fieldStr, 1).ToInteger(&rv)
+                                  : fieldStr.ToInteger(&rv);
+      if (NS_FAILED(rv) || !profile.isValid() || profile.value() > 0x1F) {
+        return false;
+      }
+      continue;
+    }
+
+    if (count == 2) {  
+      compabilityFlags = fieldStr.ToInteger(&rv, 16);
+      NS_ENSURE_SUCCESS(rv, false);
+      continue;
+    }
+
+    if (count == 3) {  
+      Maybe<uint8_t> validProfileTier;
+      if (fieldStr.First() == u'L' || fieldStr.First() == u'H') {
+        validProfileTier.emplace(fieldStr.First() == u'L' ? 0 : 1);
+      }
+      level = validProfileTier ? Substring(fieldStr, 1).ToInteger(&rv)
+                               : fieldStr.ToInteger(&rv);
+      if (NS_FAILED(rv) || !level.isValid()) {
+        return false;
+      }
+      continue;
+    }
+
+    if (count > 10) {
+      return false;
+    }
+
+    CheckedUint8 byte(fieldStr.ToInteger(&rv, 16));
+    if (NS_FAILED(rv) || !byte.isValid()) {
+      return false;
+    }
+    constraints.AppendElement(byte.value());
+  }
+
+  if (count < 4  || constraints.Length() > 6 ||
+      !IsH265ProfileRecognizable(profile.value(), compabilityFlags)) {
+    return false;
+  }
+
+  aProfile = profile.value();
+  aLevel = level.value();
+  aConstraints = std::move(constraints);
+  return true;
+}
+
+bool ExtractAV1CodecDetails(const nsAString& aCodec, uint8_t& aProfile,
+                            uint8_t& aLevel, uint8_t& aTier, uint8_t& aBitDepth,
+                            bool& aMonochrome, bool& aSubsamplingX,
+                            bool& aSubsamplingY, uint8_t& aChromaSamplePosition,
+                            VideoColorSpace& aColorSpace) {
+  auto fourCC = Substring(aCodec, 0, 4);
+
+  if (!fourCC.EqualsLiteral("av01")) {
+    return false;
+  }
+
+
+  struct AV1Field {
+    uint8_t* field;
+    size_t length;
+  };
+  uint8_t monochrome;
+  uint8_t subsampling;
+  uint8_t primary;
+  uint8_t transfer;
+  uint8_t matrix;
+  uint8_t range;
+  AV1Field fields[] = {{&aProfile, 1},
+                       {&aLevel, 2},
+                       {&aBitDepth, 2},
+                       {&monochrome, 1},
+                       {&subsampling, 3},
+                       {&primary, 2},
+                       {&transfer, 2},
+                       {&matrix, 2},
+                       {&range, 1}};
+
+  auto splitter = aCodec.Split(u'.');
+  auto iter = splitter.begin();
+  ++iter;
+  size_t fieldCount = 0;
+  while (iter != splitter.end()) {
+    if (fieldCount >= 9) {
+      return false;
+    }
+
+    AV1Field& field = fields[fieldCount];
+    auto fieldStr = *iter;
+
+    if (field.field == &aLevel) {
+      if (fieldStr.Length() < 3) {
+        return false;
+      }
+      auto tier = fieldStr[2];
+      switch (tier) {
+        case 'M':
+          aTier = 0;
+          break;
+        case 'H':
+          aTier = 1;
+          break;
+        default:
+          return false;
+      }
+      fieldStr.SetLength(2);
+    }
+
+    if (fieldStr.Length() < field.length) {
+      return false;
+    }
+
+    uint8_t value = 0;
+    for (size_t i = 0; i < field.length; i++) {
+      uint8_t oldValue = value;
+      char16_t character = fieldStr[i];
+      if ('0' <= character && character <= '9') {
+        value = (value * 10) + (character - '0');
+      } else {
+        return false;
+      }
+      if (value < oldValue) {
+        return false;
+      }
+    }
+
+    *field.field = value;
+
+    ++fieldCount;
+    ++iter;
+
+    if (fieldStr.Length() > field.length) {
+      char16_t character = fieldStr[field.length];
+      if ('0' <= character && character <= '9') {
+        return false;
+      }
+      break;
+    }
+  }
+
+  if (fieldCount != 3 && fieldCount != 9) {
+    return false;
+  }
+
+  if (aProfile > 2 || (aLevel > 23 && aLevel != 31)) {
+    return false;
+  }
+
+  if (fieldCount == 3) {
+    aMonochrome = false;
+    aSubsamplingX = true;
+    aSubsamplingY = true;
+    aChromaSamplePosition = 0;
+    aColorSpace.mPrimaries = ColourPrimaries::CP_BT709;
+    aColorSpace.mTransfer = TransferCharacteristics::TC_BT709;
+    aColorSpace.mMatrix = MatrixCoefficients::MC_BT709;
+    aColorSpace.mRange = ColorRange::LIMITED;
+  } else {
+
+    if (monochrome > 1) {
+      return false;
+    }
+    aMonochrome = !!monochrome;
+
+    uint8_t subsamplingX = (subsampling / 100) % 10;
+    uint8_t subsamplingY = (subsampling / 10) % 10;
+    if (subsamplingX > 1 || subsamplingY > 1) {
+      return false;
+    }
+    aSubsamplingX = !!subsamplingX;
+    aSubsamplingY = !!subsamplingY;
+    aChromaSamplePosition = subsampling % 10;
+    if (aChromaSamplePosition > 2) {
+      return false;
+    }
+
+    aColorSpace.mPrimaries = static_cast<ColourPrimaries>(primary);
+    aColorSpace.mTransfer = static_cast<TransferCharacteristics>(transfer);
+    aColorSpace.mMatrix = static_cast<MatrixCoefficients>(matrix);
+    if (gfx::CICP::IsReserved(aColorSpace.mPrimaries) ||
+        gfx::CICP::IsReserved(aColorSpace.mTransfer) ||
+        gfx::CICP::IsReserved(aColorSpace.mMatrix)) {
+      return false;
+    }
+    if (range > 1) {
+      return false;
+    }
+    aColorSpace.mRange = static_cast<ColorRange>(range);
+  }
+
+
+  if (aLevel < 8 && aTier > 0) {
+    return false;
+  }
+
+  if (aBitDepth != 8 && aBitDepth != 10 && aBitDepth != 12) {
+    return false;
+  }
+  if (aProfile < 2 && aBitDepth == 12) {
+    return false;
+  }
+
+  bool is420or400 = aSubsamplingX && aSubsamplingY;
+  bool is422 = aSubsamplingX && !aSubsamplingY;
+  bool is444 = !aSubsamplingX && !aSubsamplingY;
+
+  if (aProfile == 0 && !is420or400) {
+    return false;
+  }
+  if (aProfile == 1 && !is444) {
+    return false;
+  }
+  if (aProfile == 2 && aBitDepth < 12 && !is422) {
+    return false;
+  }
+  if (aChromaSamplePosition != 0 && !is420or400) {
+    return false;
+  }
+
+  if (aMonochrome && (aChromaSamplePosition != 0 || !is420or400)) {
+    return false;
+  }
+  if (aMonochrome && aProfile != 0 && aProfile != 2) {
+    return false;
+  }
+
+  if (aColorSpace.mMatrix == MatrixCoefficients::MC_IDENTITY &&
+      (aSubsamplingX || aSubsamplingY ||
+       aColorSpace.mRange != gfx::ColorRange::FULL)) {
+    return false;
+  }
+
+  return true;
+}
+
+nsresult GenerateRandomName(nsCString& aOutSalt, uint32_t aLength) {
+  nsresult rv;
+  nsCOMPtr<nsIRandomGenerator> rg =
+      do_GetService("@mozilla.org/security/random-generator;1", &rv);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  const uint32_t requiredBytesLength =
+      static_cast<uint32_t>((aLength + 3) / 4 * 3);
+
+  uint8_t* buffer;
+  rv = rg->GenerateRandomBytes(requiredBytesLength, &buffer);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  nsCString temp;
+  nsDependentCSubstring randomData(reinterpret_cast<const char*>(buffer),
+                                   requiredBytesLength);
+  rv = Base64Encode(randomData, temp);
+  free(buffer);
+  buffer = nullptr;
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  aOutSalt = std::move(temp);
+  return NS_OK;
+}
+
+nsresult GenerateRandomPathName(nsCString& aOutSalt, uint32_t aLength) {
+  nsresult rv = GenerateRandomName(aOutSalt, aLength);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  aOutSalt.ReplaceChar(FILE_PATH_SEPARATOR FILE_ILLEGAL_CHARACTERS, '_');
+  return NS_OK;
+}
+
+already_AddRefed<TaskQueue> CreateMediaDecodeTaskQueue(StaticString aName) {
+  RefPtr<TaskQueue> queue = TaskQueue::Create(
+      GetMediaThreadPool(MediaThreadType::PLATFORM_DECODER), aName);
+  return queue.forget();
+}
+
+void SimpleTimer::Cancel() {
+  if (mTimer) {
+#if defined(DEBUG)
+    nsCOMPtr<nsIEventTarget> target;
+    mTimer->GetTarget(getter_AddRefs(target));
+    bool onCurrent;
+    nsresult rv = target->IsOnCurrentThread(&onCurrent);
+    MOZ_ASSERT(NS_SUCCEEDED(rv) && onCurrent);
+#endif
+    mTimer->Cancel();
+    mTimer = nullptr;
+  }
+  mTask = nullptr;
+}
+
+NS_IMETHODIMP
+SimpleTimer::Notify(nsITimer* timer) {
+  RefPtr<SimpleTimer> deathGrip(this);
+  if (mTask) {
+    mTask->Run();
+    mTask = nullptr;
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+SimpleTimer::GetName(nsACString& aName) {
+  aName.AssignLiteral("SimpleTimer");
+  return NS_OK;
+}
+
+nsresult SimpleTimer::Init(nsIRunnable* aTask, uint32_t aTimeoutMs,
+                           nsIEventTarget* aTarget) {
+  nsresult rv;
+
+  nsCOMPtr<nsIEventTarget> target;
+  if (aTarget) {
+    target = aTarget;
+  } else {
+    target = GetMainThreadSerialEventTarget();
+    if (!target) {
+      return NS_ERROR_NOT_AVAILABLE;
+    }
+  }
+
+  rv = NS_NewTimerWithCallback(getter_AddRefs(mTimer), this, aTimeoutMs,
+                               nsITimer::TYPE_ONE_SHOT, target);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  mTask = aTask;
+  return NS_OK;
+}
+
+NS_IMPL_ISUPPORTS(SimpleTimer, nsITimerCallback, nsINamed)
+
+already_AddRefed<SimpleTimer> SimpleTimer::Create(nsIRunnable* aTask,
+                                                  uint32_t aTimeoutMs,
+                                                  nsIEventTarget* aTarget) {
+  RefPtr<SimpleTimer> t(new SimpleTimer());
+  if (NS_FAILED(t->Init(aTask, aTimeoutMs, aTarget))) {
+    return nullptr;
+  }
+  return t.forget();
+}
+
+void LogToBrowserConsole(const nsAString& aMsg) {
+  if (!NS_IsMainThread()) {
+    nsString msg(aMsg);
+    nsCOMPtr<nsIRunnable> task = NS_NewRunnableFunction(
+        "LogToBrowserConsole",
+        [msg = std::move(msg)]() { LogToBrowserConsole(msg); });
+    SchedulerGroup::Dispatch(task.forget());
+    return;
+  }
+  nsCOMPtr<nsIConsoleService> console(
+      do_GetService("@mozilla.org/consoleservice;1"));
+  if (!console) {
+    NS_WARNING("Failed to log message to console.");
+    return;
+  }
+  nsAutoString msg(aMsg);
+  console->LogStringMessage(msg.get());
+}
+
+bool ParseCodecsString(const nsAString& aCodecs,
+                       nsTArray<nsString>& aOutCodecs) {
+  aOutCodecs.Clear();
+  bool expectMoreTokens = false;
+  nsCharSeparatedTokenizer tokenizer(aCodecs, ',');
+  while (tokenizer.hasMoreTokens()) {
+    const nsAString& token = tokenizer.nextToken();
+    expectMoreTokens = tokenizer.separatorAfterCurrentToken();
+    aOutCodecs.AppendElement(token);
+  }
+  return !expectMoreTokens;
+}
+
+bool ParseMIMETypeString(const nsAString& aMIMEType,
+                         nsString& aOutContainerType,
+                         nsTArray<nsString>& aOutCodecs) {
+  nsContentTypeParser parser(aMIMEType);
+  nsresult rv = parser.GetType(aOutContainerType);
+  if (NS_FAILED(rv)) {
+    return false;
+  }
+
+  nsString codecsStr;
+  parser.GetParameter("codecs", codecsStr);
+  return ParseCodecsString(codecsStr, aOutCodecs);
+}
+
+template <int N>
+static bool StartsWith(const nsACString& string, const char (&prefix)[N]) {
+  if (N - 1 > string.Length()) {
+    return false;
+  }
+  return memcmp(string.Data(), prefix, N - 1) == 0;
+}
+
+bool IsH264CodecString(const nsAString& aCodec) {
+  uint8_t profile = 0;
+  uint8_t constraint = 0;
+  H264_LEVEL level;
+  return ExtractH264CodecDetails(aCodec, profile, constraint, level,
+                                 H264CodecStringStrictness::Lenient);
+}
+
+bool IsAllowedH264Codec(const nsAString& aCodec) {
+  uint8_t profile = 0, constraint = 0;
+  H264_LEVEL level;
+
+  if (!ExtractH264CodecDetails(aCodec, profile, constraint, level,
+                               H264CodecStringStrictness::Lenient)) {
+    return false;
+  }
+
+  return level >= H264_LEVEL::H264_LEVEL_1 &&
+         level <= H264_LEVEL::H264_LEVEL_6_2 &&
+         (profile == H264_PROFILE_BASE || profile == H264_PROFILE_MAIN ||
+          profile == H264_PROFILE_EXTENDED || profile == H264_PROFILE_HIGH);
+}
+
+bool IsH265CodecString(const nsAString& aCodec) {
+  uint8_t profile = 0;
+  uint8_t level = 0;
+  nsTArray<uint8_t> constraints;
+  return ExtractH265CodecDetails(aCodec, profile, level, constraints);
+}
+
+bool IsAACCodecString(const nsAString& aCodec) {
+  return aCodec.EqualsLiteral("mp4a.40.2") ||  
+         aCodec.EqualsLiteral(
+             "mp4a.40.02") ||  
+         aCodec.EqualsLiteral("mp4a.40.5") ||  
+         aCodec.EqualsLiteral(
+             "mp4a.40.05") ||                 
+         aCodec.EqualsLiteral("mp4a.67") ||   
+         aCodec.EqualsLiteral("mp4a.40.29");  
+}
+
+bool IsVP8CodecString(const nsAString& aCodec) {
+  uint8_t profile = 0;
+  uint8_t level = 0;
+  uint8_t bitDepth = 0;
+  return aCodec.EqualsLiteral("vp8") || aCodec.EqualsLiteral("vp8.0") ||
+         (StartsWith(NS_ConvertUTF16toUTF8(aCodec), "vp08") &&
+          ExtractVPXCodecDetails(aCodec, profile, level, bitDepth));
+}
+
+bool IsVP9CodecString(const nsAString& aCodec) {
+  uint8_t profile = 0;
+  uint8_t level = 0;
+  uint8_t bitDepth = 0;
+  return aCodec.EqualsLiteral("vp9") || aCodec.EqualsLiteral("vp9.0") ||
+         (StartsWith(NS_ConvertUTF16toUTF8(aCodec), "vp09") &&
+          ExtractVPXCodecDetails(aCodec, profile, level, bitDepth));
+}
+
+bool IsAV1CodecString(const nsAString& aCodec) {
+  uint8_t profile, level, tier, bitDepth, chromaPosition;
+  bool monochrome, subsamplingX, subsamplingY;
+  VideoColorSpace colorSpace;
+  return aCodec.EqualsLiteral("av1") ||
+         (StartsWith(NS_ConvertUTF16toUTF8(aCodec), "av01") &&
+          ExtractAV1CodecDetails(aCodec, profile, level, tier, bitDepth,
+                                 monochrome, subsamplingX, subsamplingY,
+                                 chromaPosition, colorSpace));
+}
+
+UniquePtr<TrackInfo> CreateTrackInfoWithMIMEType(
+    const nsACString& aCodecMIMEType) {
+  UniquePtr<TrackInfo> trackInfo;
+  if (StartsWith(aCodecMIMEType, "audio/")) {
+    trackInfo.reset(new AudioInfo());
+    trackInfo->mMimeType = aCodecMIMEType;
+  } else if (StartsWith(aCodecMIMEType, "video/")) {
+    trackInfo.reset(new VideoInfo());
+    trackInfo->mMimeType = aCodecMIMEType;
+  }
+  return trackInfo;
+}
+
+UniquePtr<TrackInfo> CreateTrackInfoWithMIMETypeAndContainerTypeExtraParameters(
+    const nsACString& aCodecMIMEType,
+    const MediaContainerType& aContainerType) {
+  UniquePtr<TrackInfo> trackInfo = CreateTrackInfoWithMIMEType(aCodecMIMEType);
+  if (trackInfo) {
+    VideoInfo* videoInfo = trackInfo->GetAsVideoInfo();
+    if (videoInfo) {
+      Maybe<int32_t> maybeWidth = aContainerType.ExtendedType().GetWidth();
+      if (maybeWidth && *maybeWidth > 0) {
+        videoInfo->mImage.width = *maybeWidth;
+        videoInfo->mDisplay.width = *maybeWidth;
+      }
+      Maybe<int32_t> maybeHeight = aContainerType.ExtendedType().GetHeight();
+      if (maybeHeight && *maybeHeight > 0) {
+        videoInfo->mImage.height = *maybeHeight;
+        videoInfo->mDisplay.height = *maybeHeight;
+      }
+    } else if (trackInfo->GetAsAudioInfo()) {
+      AudioInfo* audioInfo = trackInfo->GetAsAudioInfo();
+      Maybe<int32_t> maybeChannels =
+          aContainerType.ExtendedType().GetChannels();
+      if (maybeChannels && *maybeChannels > 0) {
+        audioInfo->mChannels = *maybeChannels;
+      }
+      Maybe<int32_t> maybeSamplerate =
+          aContainerType.ExtendedType().GetSamplerate();
+      if (maybeSamplerate && *maybeSamplerate > 0) {
+        audioInfo->mRate = *maybeSamplerate;
+      }
+    }
+  }
+  return trackInfo;
+}
+
+bool OnCellularConnection() {
+  uint32_t linkType = nsINetworkLinkService::LINK_TYPE_UNKNOWN;
+  if (XRE_IsContentProcess()) {
+    mozilla::dom::ContentChild* cpc =
+        mozilla::dom::ContentChild::GetSingleton();
+    if (!cpc) {
+      NS_WARNING("Can't get ContentChild singleton in content process!");
+      return false;
+    }
+    linkType = cpc->NetworkLinkType();
+  } else {
+    nsresult rv;
+    nsCOMPtr<nsINetworkLinkService> nls =
+        do_GetService(NS_NETWORK_LINK_SERVICE_CONTRACTID, &rv);
+    if (NS_FAILED(rv)) {
+      NS_WARNING("Can't get nsINetworkLinkService.");
+      return false;
+    }
+
+    rv = nls->GetLinkType(&linkType);
+    if (NS_FAILED(rv)) {
+      NS_WARNING("Can't get network link type.");
+      return false;
+    }
+  }
+
+  switch (linkType) {
+    case nsINetworkLinkService::LINK_TYPE_UNKNOWN:
+    case nsINetworkLinkService::LINK_TYPE_ETHERNET:
+    case nsINetworkLinkService::LINK_TYPE_USB:
+    case nsINetworkLinkService::LINK_TYPE_WIFI:
+    default:
+      return false;
+    case nsINetworkLinkService::LINK_TYPE_WIMAX:
+    case nsINetworkLinkService::LINK_TYPE_MOBILE:
+      return true;
+  }
+}
+
+bool IsWaveMimetype(const nsACString& aMimeType) {
+  return aMimeType.EqualsLiteral("audio/x-wav") ||
+         aMimeType.EqualsLiteral("audio/wave; codecs=1") ||
+         aMimeType.EqualsLiteral("audio/wave; codecs=3") ||
+         aMimeType.EqualsLiteral("audio/wave; codecs=6") ||
+         aMimeType.EqualsLiteral("audio/wave; codecs=7") ||
+         aMimeType.EqualsLiteral("audio/wave; codecs=65534");
+}
+
+void DetermineResolutionForTelemetry(const MediaInfo& aInfo,
+                                     nsCString& aResolutionOut) {
+  if (aInfo.HasAudio()) {
+    aResolutionOut.AppendASCII("AV,");
+  } else {
+    aResolutionOut.AppendASCII("V,");
+  }
+  static const struct {
+    int32_t mH;
+    const char* mRes;
+  } sResolutions[] = {{240, "0<h<=240"},     {480, "240<h<=480"},
+                      {576, "480<h<=576"},   {720, "576<h<=720"},
+                      {1080, "720<h<=1080"}, {2160, "1080<h<=2160"}};
+  const char* resolution = "h>2160";
+  int32_t height = aInfo.mVideo.mDisplay.height;
+  for (const auto& res : sResolutions) {
+    if (height <= res.mH) {
+      resolution = res.mRes;
+      break;
+    }
+  }
+  aResolutionOut.AppendASCII(resolution);
+}
+
+bool ContainHardwareCodecsSupported(
+    const media::MediaCodecsSupported& aSupport) {
+  return aSupport.contains(
+             mozilla::media::MediaCodecsSupport::H264HardwareDecode) ||
+         aSupport.contains(
+             mozilla::media::MediaCodecsSupport::VP8HardwareDecode) ||
+         aSupport.contains(
+             mozilla::media::MediaCodecsSupport::VP9HardwareDecode) ||
+         aSupport.contains(
+             mozilla::media::MediaCodecsSupport::AV1HardwareDecode) ||
+         aSupport.contains(
+             mozilla::media::MediaCodecsSupport::HEVCHardwareDecode);
+}
+
+}  

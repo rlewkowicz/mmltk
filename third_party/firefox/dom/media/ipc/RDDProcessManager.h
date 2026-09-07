@@ -1,0 +1,98 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef _include_dom_media_ipc_RDDProcessManager_h_
+#define _include_dom_media_ipc_RDDProcessManager_h_
+#include "mozilla/MozPromise.h"
+#include "mozilla/PRDDChild.h"
+#include "mozilla/PRemoteMediaManagerChild.h"
+#include "mozilla/RDDProcessHost.h"
+#include "mozilla/dom/ipc/IdType.h"
+#include "mozilla/ipc/TaskFactory.h"
+#include "nsIObserver.h"
+
+namespace mozilla {
+
+class MemoryReportingProcess;
+class RDDChild;
+
+class RDDProcessManager final : public RDDProcessHost::Listener {
+  friend class RDDChild;
+
+ public:
+  static void Initialize();
+  static void RDDProcessShutdown();
+  static void Shutdown();
+  static RDDProcessManager* Get();
+
+  ~RDDProcessManager();
+
+  using EnsureRDDPromise =
+      MozPromise<ipc::Endpoint<PRemoteMediaManagerChild>, nsresult, true>;
+  RefPtr<GenericNonExclusivePromise> LaunchRDDProcess();
+  RefPtr<EnsureRDDPromise> EnsureRDDProcessAndCreateBridge(
+      ipc::EndpointProcInfo aOtherProcess, dom::ContentParentId aParentId);
+
+  void OnProcessUnexpectedShutdown(RDDProcessHost* aHost) override;
+
+  void NotifyRemoteActorDestroyed(const uint64_t& aProcessToken);
+
+  base::ProcessId RDDProcessPid();
+
+  ipc::EndpointProcInfo RDDEndpointProcInfo();
+
+  RefPtr<MemoryReportingProcess> GetProcessMemoryReporter();
+
+  RDDChild* GetRDDChild() { return mRDDChild; }
+
+  bool AttemptedRDDProcess() const { return mNumProcessAttempts > 0; }
+
+  RDDProcessHost* Process() { return mProcess; }
+
+ private:
+  bool IsRDDProcessLaunching() const;
+  bool IsRDDProcessAlive() const;
+
+  void OnXPCOMShutdown();
+  void OnPreferenceChange(const char16_t* aData);
+
+  RDDProcessManager();
+
+  void DestroyProcess();
+
+  bool IsShutdown() const;
+
+  DISALLOW_COPY_AND_ASSIGN(RDDProcessManager);
+
+  class Observer final : public nsIObserver {
+   public:
+    NS_DECL_ISUPPORTS
+    NS_DECL_NSIOBSERVER
+    explicit Observer(RDDProcessManager* aManager);
+
+   protected:
+    ~Observer() = default;
+
+    RDDProcessManager* mManager;
+  };
+  friend class Observer;
+
+  bool CreateContentBridge(
+      ipc::EndpointProcInfo aOtherProcess, dom::ContentParentId aParentId,
+      ipc::Endpoint<PRemoteMediaManagerChild>* aOutRemoteMediaManager);
+
+  const RefPtr<Observer> mObserver;
+  ipc::TaskFactory<RDDProcessManager> mTaskFactory;
+  uint32_t mNumProcessAttempts = 0;
+  uint32_t mNumUnexpectedCrashes = 0;
+
+  RDDProcessHost* mProcess = nullptr;
+  uint64_t mProcessToken = 0;
+  RDDChild* mRDDChild = nullptr;
+  nsTArray<dom::Pref> mQueuedPrefs;
+  RefPtr<GenericNonExclusivePromise> mLaunchRDDPromise;
+};
+
+}  
+
+#endif  // _include_dom_media_ipc_RDDProcessManager_h_

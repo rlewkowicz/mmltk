@@ -1,0 +1,284 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/HTMLFieldSetElement.h"
+
+#include "mozilla/BasicEvents.h"
+#include "mozilla/EventDispatcher.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/dom/ContentList.h"
+#include "mozilla/dom/CustomElementRegistry.h"
+#include "mozilla/dom/HTMLFieldSetElementBinding.h"
+#include "nsQueryObject.h"
+
+NS_IMPL_NS_NEW_HTML_ELEMENT(FieldSet)
+
+namespace mozilla::dom {
+
+HTMLFieldSetElement::HTMLFieldSetElement(
+    already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo)
+    : nsGenericHTMLFormControlElement(std::move(aNodeInfo),
+                                      FormControlType::Fieldset),
+      mElements(nullptr),
+      mInvalidElementsCount(0) {
+  SetBarredFromConstraintValidation(true);
+
+  AddStatesSilently(ElementState::ENABLED | ElementState::VALID);
+}
+
+HTMLFieldSetElement::~HTMLFieldSetElement() {
+  uint32_t length = mDependentElements.Length();
+  for (uint32_t i = 0; i < length; ++i) {
+    mDependentElements[i]->ForgetFieldSet(this);
+  }
+}
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED(HTMLFieldSetElement,
+                                   nsGenericHTMLFormControlElement, mValidity,
+                                   mElements, mFirstLegend)
+
+NS_IMPL_ISUPPORTS_CYCLE_COLLECTION_INHERITED(HTMLFieldSetElement,
+                                             nsGenericHTMLFormControlElement,
+                                             nsIConstraintValidation)
+
+NS_IMPL_ELEMENT_CLONE(HTMLFieldSetElement)
+
+bool HTMLFieldSetElement::IsDisabledForEvents(WidgetEvent* aEvent) {
+  if (StaticPrefs::dom_forms_fieldset_disable_only_descendants_enabled()) {
+    return false;
+  }
+  return IsElementDisabledForEvents(aEvent, nullptr);
+}
+
+void HTMLFieldSetElement::GetEventTargetParent(EventChainPreVisitor& aVisitor) {
+  aVisitor.mCanHandle = false;
+  if (IsDisabledForEvents(aVisitor.mEvent)) {
+    return;
+  }
+
+  nsGenericHTMLFormControlElement::GetEventTargetParent(aVisitor);
+}
+
+void HTMLFieldSetElement::AfterSetAttr(int32_t aNameSpaceID, nsAtom* aName,
+                                       const nsAttrValue* aValue,
+                                       const nsAttrValue* aOldValue,
+                                       nsIPrincipal* aSubjectPrincipal,
+                                       bool aNotify) {
+  if (aNameSpaceID == kNameSpaceID_None && aName == nsGkAtoms::disabled) {
+    UpdateDisabledState(aNotify);
+  }
+
+  return nsGenericHTMLFormControlElement::AfterSetAttr(
+      aNameSpaceID, aName, aValue, aOldValue, aSubjectPrincipal, aNotify);
+}
+
+void HTMLFieldSetElement::GetType(nsAString& aType) const {
+  aType.AssignLiteral("fieldset");
+}
+
+bool HTMLFieldSetElement::MatchListedElements(Element* aElement,
+                                              int32_t aNamespaceID,
+                                              nsAtom* aAtom, void* aData) {
+  return nsIFormControl::FromNodeOrNull(aElement) != nullptr;
+}
+
+HTMLCollection* HTMLFieldSetElement::Elements() {
+  if (!mElements) {
+    mElements =
+        new ContentList(this, MatchListedElements, nullptr, nullptr, true);
+  }
+
+  return mElements;
+}
+
+
+nsresult HTMLFieldSetElement::Reset() { return NS_OK; }
+
+void HTMLFieldSetElement::InsertChildBefore(
+    nsIContent* aChild, nsIContent* aBeforeThis, bool aNotify, ErrorResult& aRv,
+    nsINode* aOldParent, MutationEffectOnScript aMutationEffectOnScript) {
+  bool firstLegendHasChanged = false;
+  RefPtr<nsIContent> oldFirstLegend = mFirstLegend;
+
+  if (aChild->IsHTMLElement(nsGkAtoms::legend)) {
+    if (!mFirstLegend) {
+      mFirstLegend = aChild;
+    } else {
+      const Maybe<uint32_t> indexOfRef =
+          aBeforeThis ? ComputeIndexOf(aBeforeThis) : Some(GetChildCount());
+      const Maybe<uint32_t> indexOfFirstLegend = ComputeIndexOf(mFirstLegend);
+      if ((indexOfRef.isSome() && indexOfFirstLegend.isSome() &&
+           *indexOfRef <= *indexOfFirstLegend) ||
+          indexOfRef.isNothing()) {
+        mFirstLegend = aChild;
+        firstLegendHasChanged = true;
+      }
+    }
+  }
+
+  nsGenericHTMLFormControlElement::InsertChildBefore(
+      aChild, aBeforeThis, aNotify, aRv, aOldParent, aMutationEffectOnScript);
+  if (aRv.Failed()) {
+    mFirstLegend = oldFirstLegend;
+    return;
+  }
+
+  if (firstLegendHasChanged) {
+    NotifyElementsForFirstLegendChange(aNotify);
+  }
+}
+
+void HTMLFieldSetElement::RemoveChildNode(
+    nsIContent* aKid, bool aNotify, const BatchRemovalState* aState,
+    nsINode* aNewParent, MutationEffectOnScript aMutationEffectOnScript) {
+  bool firstLegendHasChanged = false;
+
+  if (mFirstLegend && aKid == mFirstLegend) {
+    nsIContent* child = mFirstLegend->GetNextSibling();
+    mFirstLegend = nullptr;
+    firstLegendHasChanged = true;
+
+    for (; child; child = child->GetNextSibling()) {
+      if (child->IsHTMLElement(nsGkAtoms::legend)) {
+        mFirstLegend = child;
+        break;
+      }
+    }
+  }
+
+  nsGenericHTMLFormControlElement::RemoveChildNode(
+      aKid, aNotify, aState, aNewParent, aMutationEffectOnScript);
+
+  if (firstLegendHasChanged) {
+    NotifyElementsForFirstLegendChange(aNotify);
+  }
+}
+
+void HTMLFieldSetElement::AddElement(nsGenericHTMLFormElement* aElement) {
+  mDependentElements.AppendElement(aElement);
+
+  HTMLFieldSetElement* fieldSet = FromNode(aElement);
+  if (fieldSet) {
+    for (int32_t i = 0; i < fieldSet->mInvalidElementsCount; i++) {
+      UpdateValidity(false);
+    }
+    return;
+  }
+
+  CustomElementData* data = aElement->GetCustomElementData();
+  if (data && data->IsFormAssociated() && mElements) {
+    mElements->SetDirty();
+  }
+
+  nsCOMPtr<nsIConstraintValidation> cvElmt = do_QueryObject(aElement);
+  if (cvElmt && cvElmt->IsCandidateForConstraintValidation() &&
+      !cvElmt->IsValid()) {
+    UpdateValidity(false);
+  }
+
+#if DEBUG
+  int32_t debugInvalidElementsCount = 0;
+  for (uint32_t i = 0; i < mDependentElements.Length(); i++) {
+    HTMLFieldSetElement* fieldSet = FromNode(mDependentElements[i]);
+    if (fieldSet) {
+      debugInvalidElementsCount += fieldSet->mInvalidElementsCount;
+      continue;
+    }
+    nsCOMPtr<nsIConstraintValidation> cvElmt =
+        do_QueryObject(mDependentElements[i]);
+    if (cvElmt && cvElmt->IsCandidateForConstraintValidation() &&
+        !(cvElmt->IsValid())) {
+      debugInvalidElementsCount += 1;
+    }
+  }
+  MOZ_ASSERT(debugInvalidElementsCount == mInvalidElementsCount);
+#endif
+}
+
+void HTMLFieldSetElement::RemoveElement(nsGenericHTMLFormElement* aElement) {
+  mDependentElements.RemoveElement(aElement);
+
+  HTMLFieldSetElement* fieldSet = FromNode(aElement);
+  if (fieldSet) {
+    for (int32_t i = 0; i < fieldSet->mInvalidElementsCount; i++) {
+      UpdateValidity(true);
+    }
+    return;
+  }
+
+  nsCOMPtr<nsIConstraintValidation> cvElmt = do_QueryObject(aElement);
+  if (cvElmt && cvElmt->IsCandidateForConstraintValidation() &&
+      !cvElmt->IsValid()) {
+    UpdateValidity(true);
+  }
+
+#if DEBUG
+  int32_t debugInvalidElementsCount = 0;
+  for (uint32_t i = 0; i < mDependentElements.Length(); i++) {
+    HTMLFieldSetElement* fieldSet = FromNode(mDependentElements[i]);
+    if (fieldSet) {
+      debugInvalidElementsCount += fieldSet->mInvalidElementsCount;
+      continue;
+    }
+    nsCOMPtr<nsIConstraintValidation> cvElmt =
+        do_QueryObject(mDependentElements[i]);
+    if (cvElmt && cvElmt->IsCandidateForConstraintValidation() &&
+        !(cvElmt->IsValid())) {
+      debugInvalidElementsCount += 1;
+    }
+  }
+  MOZ_ASSERT(debugInvalidElementsCount == mInvalidElementsCount);
+#endif
+}
+
+void HTMLFieldSetElement::UpdateDisabledState(bool aNotify) {
+  nsGenericHTMLFormControlElement::UpdateDisabledState(aNotify);
+
+  for (nsGenericHTMLFormElement* element : mDependentElements) {
+    element->FieldSetDisabledChanged(aNotify);
+  }
+}
+
+void HTMLFieldSetElement::NotifyElementsForFirstLegendChange(bool aNotify) {
+  if (!mElements) {
+    mElements =
+        new ContentList(this, MatchListedElements, nullptr, nullptr, true);
+  }
+
+  uint32_t length = mElements->Length(true);
+  for (uint32_t i = 0; i < length; ++i) {
+    static_cast<nsGenericHTMLFormElement*>(mElements->Item(i))
+        ->FieldSetFirstLegendChanged(aNotify);
+  }
+}
+
+void HTMLFieldSetElement::UpdateValidity(bool aElementValidity) {
+  if (aElementValidity) {
+    --mInvalidElementsCount;
+  } else {
+    ++mInvalidElementsCount;
+  }
+
+  MOZ_ASSERT(mInvalidElementsCount >= 0);
+
+  if (!mInvalidElementsCount ||
+      (mInvalidElementsCount == 1 && !aElementValidity)) {
+    AutoStateChangeNotifier notifier(*this, true);
+    RemoveStatesSilently(ElementState::VALID | ElementState::INVALID);
+    AddStatesSilently(mInvalidElementsCount ? ElementState::INVALID
+                                            : ElementState::VALID);
+  }
+
+  if (mFieldSet) {
+    mFieldSet->UpdateValidity(aElementValidity);
+  }
+}
+
+JSObject* HTMLFieldSetElement::WrapNode(JSContext* aCx,
+                                        JS::Handle<JSObject*> aGivenProto) {
+  return HTMLFieldSetElement_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+}  

@@ -1,0 +1,187 @@
+/*
+ * Copyright 2017 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "src/core/SkDrawShadowInfo.h"
+
+#include "include/core/SkMatrix.h"
+#include "include/core/SkPath.h"
+#include "include/core/SkRect.h"
+#include "include/private/base/SkTo.h"
+#include "include/utils/SkShadowUtils.h"
+
+namespace SkDrawShadowMetrics {
+
+static SkScalar compute_z(SkScalar x, SkScalar y, const SkPoint3& params) {
+    return x*params.fX + y*params.fY + params.fZ;
+}
+
+bool GetSpotShadowTransform(const SkPoint3& lightPos, SkScalar lightRadius,
+                            const SkMatrix& ctm, const SkPoint3& zPlaneParams,
+                            const SkRect& pathBounds, bool directional,
+                            SkMatrix* shadowTransform, SkScalar* radius) {
+    auto heightFunc = [zPlaneParams] (SkScalar x, SkScalar y) {
+        return zPlaneParams.fX*x + zPlaneParams.fY*y + zPlaneParams.fZ;
+    };
+    SkScalar occluderHeight = heightFunc(pathBounds.centerX(), pathBounds.centerY());
+
+    if (!ctm.hasPerspective() || directional) {
+        SkScalar scale;
+        SkVector translate;
+        if (directional) {
+            SkDrawShadowMetrics::GetDirectionalParams(occluderHeight, lightPos.fX, lightPos.fY,
+                                                      lightPos.fZ, lightRadius, radius,
+                                                      &scale, &translate);
+        } else {
+            SkDrawShadowMetrics::GetSpotParams(occluderHeight, lightPos.fX, lightPos.fY,
+                                               lightPos.fZ, lightRadius, radius,
+                                               &scale, &translate);
+        }
+        shadowTransform->setScaleTranslate(scale, scale, translate.fX, translate.fY);
+        shadowTransform->preConcat(ctm);
+    } else {
+        if (SkScalarNearlyZero(pathBounds.width()) || SkScalarNearlyZero(pathBounds.height())) {
+            return false;
+        }
+
+        SkPoint pts[4];
+        ctm.mapRectToQuad(pts, pathBounds);
+
+        SkPoint3 pts3D[4];
+        SkScalar z = heightFunc(pathBounds.fLeft, pathBounds.fTop);
+        pts3D[0].set(pts[0].fX, pts[0].fY, z);
+        z = heightFunc(pathBounds.fRight, pathBounds.fTop);
+        pts3D[1].set(pts[1].fX, pts[1].fY, z);
+        z = heightFunc(pathBounds.fRight, pathBounds.fBottom);
+        pts3D[2].set(pts[2].fX, pts[2].fY, z);
+        z = heightFunc(pathBounds.fLeft, pathBounds.fBottom);
+        pts3D[3].set(pts[3].fX, pts[3].fY, z);
+
+        for (int i = 0; i < 4; ++i) {
+            SkScalar dz = lightPos.fZ - pts3D[i].fZ;
+            if (dz <= SK_ScalarNearlyZero) {
+                return false;
+            }
+            SkScalar zRatio = pts3D[i].fZ / dz;
+            pts3D[i].fX -= (lightPos.fX - pts3D[i].fX)*zRatio;
+            pts3D[i].fY -= (lightPos.fY - pts3D[i].fY)*zRatio;
+            pts3D[i].fZ = SK_Scalar1;
+        }
+
+        SkPoint3 h0, h1, h2;
+        h0 = (pts3D[1].cross(pts3D[0])).cross(pts3D[2].cross(pts3D[3]));
+        h1 = (pts3D[0].cross(pts3D[3])).cross(pts3D[1].cross(pts3D[2]));
+        h2 = (pts3D[0].cross(pts3D[2])).cross(pts3D[1].cross(pts3D[3]));
+        if (SkScalarNearlyZero(h2.fZ)) {
+            return false;
+        }
+        SkVector3 v = pts3D[3] - pts3D[0];
+        SkVector3 w = h0 - pts3D[0];
+        SkScalar perpDot = v.fX*w.fY - v.fY*w.fX;
+        if (perpDot > 0) {
+            h0 = -h0;
+        }
+        v = pts3D[1] - pts3D[0];
+        perpDot = v.fX*w.fY - v.fY*w.fX;
+        if (perpDot < 0) {
+            h1 = -h1;
+        }
+        shadowTransform->setAll(h0.fX / h2.fZ, h1.fX / h2.fZ, h2.fX / h2.fZ,
+                               h0.fY / h2.fZ, h1.fY / h2.fZ, h2.fY / h2.fZ,
+                               h0.fZ / h2.fZ, h1.fZ / h2.fZ, 1);
+        SkMatrix toHomogeneous;
+        SkScalar xScale = 2/(pathBounds.fRight - pathBounds.fLeft);
+        SkScalar yScale = 2/(pathBounds.fBottom - pathBounds.fTop);
+        toHomogeneous.setAll(xScale, 0, -xScale*pathBounds.fLeft - 1,
+                             0, yScale, -yScale*pathBounds.fTop - 1,
+                             0, 0, 1);
+        shadowTransform->preConcat(toHomogeneous);
+
+        *radius = SkDrawShadowMetrics::SpotBlurRadius(occluderHeight, lightPos.fZ, lightRadius);
+    }
+
+    return true;
+}
+
+void GetLocalBounds(const SkPath& path, const SkDrawShadowRec& rec, const SkMatrix& ctm,
+                    SkRect* bounds) {
+    SkRect ambientBounds = path.getBounds();
+    SkScalar occluderZ;
+    if (SkScalarNearlyZero(rec.fZPlaneParams.fX) && SkScalarNearlyZero(rec.fZPlaneParams.fY)) {
+        occluderZ = rec.fZPlaneParams.fZ;
+    } else {
+        occluderZ = compute_z(ambientBounds.fLeft, ambientBounds.fTop, rec.fZPlaneParams);
+        occluderZ = std::max(occluderZ, compute_z(ambientBounds.fRight, ambientBounds.fTop,
+                                                rec.fZPlaneParams));
+        occluderZ = std::max(occluderZ, compute_z(ambientBounds.fLeft, ambientBounds.fBottom,
+                                                rec.fZPlaneParams));
+        occluderZ = std::max(occluderZ, compute_z(ambientBounds.fRight, ambientBounds.fBottom,
+                                                rec.fZPlaneParams));
+    }
+    SkScalar ambientBlur;
+    SkScalar spotBlur;
+    SkScalar spotScale;
+    SkPoint spotOffset;
+    if (ctm.hasPerspective()) {
+        ctm.mapRect(&ambientBounds);
+
+        ambientBlur = SkDrawShadowMetrics::AmbientBlurRadius(occluderZ);
+
+        if (SkToBool(rec.fFlags & SkShadowFlags::kDirectionalLight_ShadowFlag)) {
+            SkDrawShadowMetrics::GetDirectionalParams(occluderZ, rec.fLightPos.fX, rec.fLightPos.fY,
+                                                      rec.fLightPos.fZ, rec.fLightRadius,
+                                                      &spotBlur, &spotScale, &spotOffset);
+        } else {
+            SkPoint devLightPos = ctm.mapPoint({rec.fLightPos.fX, rec.fLightPos.fY});
+            SkDrawShadowMetrics::GetSpotParams(occluderZ, devLightPos.fX, devLightPos.fY,
+                                               rec.fLightPos.fZ, rec.fLightRadius,
+                                               &spotBlur, &spotScale, &spotOffset);
+        }
+    } else {
+        SkScalar devToSrcScale = SkScalarInvert(ctm.getMinScale());
+
+        SkScalar devSpaceAmbientBlur = SkDrawShadowMetrics::AmbientBlurRadius(occluderZ);
+        ambientBlur = devSpaceAmbientBlur*devToSrcScale;
+
+        if (SkToBool(rec.fFlags & SkShadowFlags::kDirectionalLight_ShadowFlag)) {
+            SkDrawShadowMetrics::GetDirectionalParams(occluderZ, rec.fLightPos.fX, rec.fLightPos.fY,
+                                                      rec.fLightPos.fZ, rec.fLightRadius,
+                                                      &spotBlur, &spotScale, &spotOffset);
+            if (auto inverse = ctm.invert()) {
+                spotOffset = inverse->mapVector(spotOffset);
+            }
+        } else {
+            SkDrawShadowMetrics::GetSpotParams(occluderZ, rec.fLightPos.fX, rec.fLightPos.fY,
+                                               rec.fLightPos.fZ, rec.fLightRadius,
+                                               &spotBlur, &spotScale, &spotOffset);
+        }
+
+        spotBlur *= devToSrcScale;
+    }
+
+    SkRect spotBounds = ambientBounds;
+    ambientBounds.outset(ambientBlur, ambientBlur);
+    spotBounds.fLeft *= spotScale;
+    spotBounds.fTop *= spotScale;
+    spotBounds.fRight *= spotScale;
+    spotBounds.fBottom *= spotScale;
+    spotBounds.offset(spotOffset.fX, spotOffset.fY);
+    spotBounds.outset(spotBlur, spotBlur);
+
+    *bounds = ambientBounds;
+    bounds->join(spotBounds);
+    bounds->outset(1, 1);
+
+    if (ctm.hasPerspective()) {
+        if (auto inverse = ctm.invert()) {
+            inverse->mapRect(bounds);
+        }
+    }
+}
+
+
+}  
+

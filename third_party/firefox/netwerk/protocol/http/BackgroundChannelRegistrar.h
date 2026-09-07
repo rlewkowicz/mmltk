@@ -1,0 +1,49 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_net_BackgroundChannelRegistrar_h_
+#define mozilla_net_BackgroundChannelRegistrar_h_
+
+#include "nsIBackgroundChannelRegistrar.h"
+#include "nsRefPtrHashtable.h"
+#include "mozilla/AlreadyAddRefed.h"
+
+namespace mozilla {
+namespace net {
+
+class HttpBackgroundChannelParent;
+class HttpChannelParent;
+
+class BackgroundChannelRegistrar final : public nsIBackgroundChannelRegistrar {
+  using ChannelHashtable =
+      nsRefPtrHashtable<nsUint64HashKey, HttpChannelParent>;
+  using BackgroundChannelHashtable =
+      nsRefPtrHashtable<nsUint64HashKey, HttpBackgroundChannelParent>;
+
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIBACKGROUNDCHANNELREGISTRAR
+
+  explicit BackgroundChannelRegistrar();
+
+  static already_AddRefed<BackgroundChannelRegistrar> GetOrCreate();
+
+ private:
+  virtual ~BackgroundChannelRegistrar();
+
+  void DeleteChannelIfMatches(uint64_t aKey, HttpChannelParent* aExpected);
+  friend class HttpChannelParent;
+
+  void NotifyChannelLinked(HttpChannelParent* aChannelParent,
+                           HttpBackgroundChannelParent* aBgParent);
+
+  ChannelHashtable mChannels;
+
+  BackgroundChannelHashtable mBgChannels;
+};
+
+}  
+}  
+
+#endif  // mozilla_net_BackgroundChannelRegistrar_h_

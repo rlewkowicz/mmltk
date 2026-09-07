@@ -1,0 +1,2685 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "IMEContentObserver.h"
+
+#include "ContentEventHandler.h"
+#include "WritingModes.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/AsyncEventDispatcher.h"
+#include "mozilla/AutoRestore.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/EventStateManager.h"
+#include "mozilla/IMEStateManager.h"
+#include "mozilla/Logging.h"
+#include "mozilla/MouseEvents.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/StaticPrefs_intl.h"
+#include "mozilla/TextComposition.h"
+#include "mozilla/TextControlElement.h"
+#include "mozilla/TextEvents.h"
+#include "mozilla/dom/AncestorIterator.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/Selection.h"
+#include "nsAtom.h"
+#include "nsContentUtils.h"
+#include "nsDocShell.h"
+#include "nsIContent.h"
+#include "nsIFrame.h"
+#include "nsINode.h"
+#include "nsISelectionController.h"
+#include "nsISupports.h"
+#include "nsIWeakReferenceUtils.h"
+#include "nsIWidget.h"
+#include "nsPresContext.h"
+#include "nsRange.h"
+#include "nsRefreshDriver.h"
+#include "nsString.h"
+
+namespace mozilla {
+
+using RawNodePosition = ContentEventHandler::RawNodePosition;
+
+using namespace dom;
+using namespace widget;
+
+LazyLogModule sIMECOLog("IMEContentObserver");
+LazyLogModule sCacheLog("IMEContentObserverCache");
+
+static const char* ToChar(bool aBool) { return aBool ? "true" : "false"; }
+
+static const char* ShortenFunctionName(const char* aFunctionName) {
+  const nsDependentCString name(aFunctionName);
+  const int32_t startIndexOfIMEContentObserverPrefix =
+      name.Find("IMEContentObserver::", 0);
+  if (startIndexOfIMEContentObserverPrefix >= 0) {
+    return aFunctionName + startIndexOfIMEContentObserverPrefix +
+           strlen("IMEContentObserver::");
+  }
+  return aFunctionName;
+}
+
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(IMEContentObserver)
+
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(IMEContentObserver)
+  nsAutoScriptBlocker scriptBlocker;
+
+  tmp->NotifyIMEOfBlur();
+  tmp->UnregisterObservers();
+
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mRootElement)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mRootEditableNodeOrTextControlElement)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mDocShell)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mEditorBase)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mDocumentObserver)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mEndOfAddedTextCache.mContainerNode)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mEndOfAddedTextCache.mContent)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mStartOfRemovingTextRangeCache.mContainerNode)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mStartOfRemovingTextRangeCache.mContent)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_WEAK_REFERENCE
+
+  tmp->mIMENotificationRequests = nullptr;
+  tmp->mESM = nullptr;
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(IMEContentObserver)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mWidget)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mFocusedWidget)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mRootElement)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mRootEditableNodeOrTextControlElement)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mDocShell)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mEditorBase)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mDocumentObserver)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mEndOfAddedTextCache.mContainerNode)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mEndOfAddedTextCache.mContent)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(
+      mStartOfRemovingTextRangeCache.mContainerNode)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mStartOfRemovingTextRangeCache.mContent)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(IMEContentObserver)
+  NS_INTERFACE_MAP_ENTRY(nsIMutationObserver)
+  NS_INTERFACE_MAP_ENTRY(nsIReflowObserver)
+  NS_INTERFACE_MAP_ENTRY(nsIScrollObserver)
+  NS_INTERFACE_MAP_ENTRY(nsISupportsWeakReference)
+  NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIReflowObserver)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(IMEContentObserver)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(IMEContentObserver)
+
+IMEContentObserver::IMEContentObserver() {
+#ifdef DEBUG
+  mTextChangeData.Test();
+#endif
+}
+
+void IMEContentObserver::Init(nsIWidget& aWidget, nsPresContext& aPresContext,
+                              Element* aElement, EditorBase& aEditorBase) {
+  State state = GetState();
+  if (NS_WARN_IF(state == eState_Observing)) {
+    return;  
+  }
+
+  bool firstInitialization = state != eState_StoppedObserving;
+  if (!firstInitialization) {
+    UnregisterObservers();
+    Clear();
+  }
+
+  mESM = aPresContext.EventStateManager();
+  mESM->OnStartToObserveContent(this);
+
+  mWidget = &aWidget;
+  mIMENotificationRequests = &mWidget->IMENotificationRequestsRef();
+
+  if (!InitWithEditor(aPresContext, aElement, aEditorBase)) {
+    MOZ_LOG(sIMECOLog, LogLevel::Error,
+            ("0x%p   Init() FAILED, due to InitWithEditor() "
+             "failure",
+             this));
+    Clear();
+    return;
+  }
+
+  if (firstInitialization) {
+    MaybeNotifyIMEOfFocusSet();
+    return;
+  }
+
+  ObserveEditableNode();
+
+  if (!NeedsToNotifyIMEOfSomething()) {
+    return;
+  }
+
+  FlushMergeableNotifications();
+}
+
+void IMEContentObserver::OnIMEReceivedFocus() {
+  if (GetState() != eState_Initializing) {
+    MOZ_LOG(sIMECOLog, LogLevel::Warning,
+            ("0x%p   OnIMEReceivedFocus(), "
+             "but the state is not \"initializing\", so does nothing",
+             this));
+    return;
+  }
+
+  if (!mRootElement) {
+    MOZ_LOG(sIMECOLog, LogLevel::Warning,
+            ("0x%p   OnIMEReceivedFocus(), "
+             "but mRootElement has already been cleared, so does nothing",
+             this));
+    return;
+  }
+
+  ObserveEditableNode();
+
+  if (!NeedsToNotifyIMEOfSomething()) {
+    return;
+  }
+
+  FlushMergeableNotifications();
+}
+
+dom::Selection* IMEContentObserver::GetSelection() const {
+  if (NS_WARN_IF(!mEditorBase) ||
+      NS_WARN_IF(!mRootEditableNodeOrTextControlElement)) {
+    return nullptr;
+  }
+  nsCOMPtr<nsISelectionController> selCon;
+  if (mRootEditableNodeOrTextControlElement->IsElement()) {
+    selCon = mEditorBase->GetSelectionController();
+  } else {
+    MOZ_ASSERT(mRootEditableNodeOrTextControlElement->IsDocument());
+    selCon =
+        mRootEditableNodeOrTextControlElement->AsDocument()->GetPresShell();
+  }
+  if (NS_WARN_IF(!selCon)) {
+    return nullptr;
+  }
+  return selCon->GetSelection(nsISelectionController::SELECTION_NORMAL);
+}
+
+bool IMEContentObserver::InitWithEditor(nsPresContext& aPresContext,
+                                        Element* aElement,
+                                        EditorBase& aEditorBase) {
+  mRootEditableNodeOrTextControlElement =
+      aEditorBase.IsTextEditor()
+          ? aEditorBase.GetExposedRoot()
+          : IMEContentObserver::GetMostDistantInclusiveEditableAncestorNode(
+                aPresContext, aElement);
+  if (NS_WARN_IF(!mRootEditableNodeOrTextControlElement)) {
+    return false;
+  }
+  MOZ_ASSERT_IF(aEditorBase.IsHTMLEditor() &&
+                    mRootEditableNodeOrTextControlElement->IsInDesignMode(),
+                IsForDesignMode());
+  MOZ_ASSERT_IF(aEditorBase.IsHTMLEditor() &&
+                    !mRootEditableNodeOrTextControlElement->IsInDesignMode(),
+                !IsForDesignMode());
+  MOZ_ASSERT_IF(aEditorBase.IsTextEditor(), !IsForDesignMode());
+
+  mEditorBase = &aEditorBase;
+
+  RefPtr<PresShell> presShell = aPresContext.GetPresShell();
+
+  RefPtr selection = GetSelection();
+  if (NS_WARN_IF(!selection)) {
+    return false;
+  }
+
+  mRootElement = ComputeRootElement(presShell);
+  if (!mRootElement && IsForDesignMode()) {
+    return false;
+  }
+  if (NS_WARN_IF(!mRootElement)) {
+    return false;
+  }
+
+  if (mEditorBase->IsTextEditor()) {
+    MOZ_ASSERT(mRootElement);
+    MOZ_ASSERT(mRootElement->GetFirstChild());
+    if (auto* text = Text::FromNodeOrNull(
+            mRootElement ? mRootElement->GetFirstChild() : nullptr)) {
+      mTextControlValueLength = ContentEventHandler::GetNativeTextLength(*text);
+    }
+    mIsTextControl = true;
+  }
+
+  mDocShell = aPresContext.GetDocShell();
+  if (NS_WARN_IF(!mDocShell)) {
+    return false;
+  }
+
+  mDocumentObserver = new DocumentObserver(*this);
+
+  return true;
+}
+
+Element* IMEContentObserver::ComputeRootElement(PresShell* aPresShell) const {
+  if (NS_WARN_IF(!aPresShell) ||
+      NS_WARN_IF(!mRootEditableNodeOrTextControlElement)) {
+    return nullptr;
+  }
+  Selection* const selection = GetSelection();
+  if (NS_WARN_IF(!selection)) {
+    return nullptr;
+  }
+
+  if (mEditorBase->IsTextEditor()) {
+    return mEditorBase->GetRoot();  
+  }
+
+  if (const nsRange* selRange = selection->GetRangeAt(0)) {
+    MOZ_ASSERT(!mIsTextControl);
+    if (NS_WARN_IF(!selRange->GetStartContainer())) {
+      return nullptr;
+    }
+
+    return Element::FromNodeOrNull(
+        selRange->GetStartContainer()->GetSelectionRootContent(
+            aPresShell, nsINode::IgnoreOwnIndependentSelection::Yes,
+            nsINode::AllowCrossShadowBoundary::No));
+  }
+
+  if (mRootEditableNodeOrTextControlElement->IsInDesignMode()) {
+    MOZ_ASSERT(mRootEditableNodeOrTextControlElement->IsDocument());
+    Element* const bodyElement =
+        mRootEditableNodeOrTextControlElement->AsDocument()->GetBody();
+    if (bodyElement && bodyElement->IsEditable()) {
+      return bodyElement;
+    }
+    return mRootEditableNodeOrTextControlElement->AsDocument()
+        ->GetRootElement();
+  }
+
+  return Element::FromNodeOrNull(
+      mRootEditableNodeOrTextControlElement->GetSelectionRootContent(
+          aPresShell, nsINode::IgnoreOwnIndependentSelection::Yes,
+          nsINode::AllowCrossShadowBoundary::No));
+}
+
+void IMEContentObserver::Clear() {
+  mEditorBase = nullptr;
+  mRootEditableNodeOrTextControlElement = nullptr;
+  mRootElement = nullptr;
+  mDocShell = nullptr;
+  mDocumentObserver = nullptr;
+}
+
+void IMEContentObserver::ObserveEditableNode() {
+  MOZ_RELEASE_ASSERT(mRootElement);
+  MOZ_RELEASE_ASSERT(GetState() != eState_Observing);
+
+  if (!mIMEHasFocus) {
+    MOZ_ASSERT(!mWidget || mNeedsToNotifyIMEOfFocusSet ||
+                   mSendingNotification == NOTIFY_IME_OF_FOCUS,
+               "Wow, OnIMEReceivedFocus() won't be called?");
+    return;
+  }
+
+  mIsObserving = true;
+  if (mEditorBase) {
+    mEditorBase->SetIMEContentObserver(this);
+  }
+
+  MOZ_LOG(sIMECOLog, LogLevel::Info,
+          ("0x%p ObserveEditableNode(), starting to observe 0x%p (%s)", this,
+           mRootElement.get(), ToString(*mRootElement).c_str()));
+
+  mRootElement->AddMutationObserver(this);
+  Document* doc = mRootElement->GetComposedDoc();
+  if (doc) {
+    RefPtr<DocumentObserver> documentObserver = mDocumentObserver;
+    documentObserver->Observe(doc);
+  }
+
+  if (mDocShell) {
+    mDocShell->AddWeakScrollObserver(this);
+    mDocShell->AddWeakReflowObserver(this);
+  }
+}
+
+void IMEContentObserver::NotifyIMEOfBlur() {
+  nsCOMPtr<nsIWidget> widget;
+  mWidget.swap(widget);
+  mIMENotificationRequests = nullptr;
+
+  if (!mIMEHasFocus) {
+    return;
+  }
+
+  MOZ_RELEASE_ASSERT(widget);
+
+  RefPtr<IMEContentObserver> kungFuDeathGrip(this);
+
+  MOZ_LOG(sIMECOLog, LogLevel::Info,
+          ("0x%p NotifyIMEOfBlur(), sending NOTIFY_IME_OF_BLUR", this));
+
+  mIMEHasFocus = false;
+  IMEStateManager::NotifyIME(IMENotification(NOTIFY_IME_OF_BLUR), widget);
+
+  MOZ_LOG(sIMECOLog, LogLevel::Debug,
+          ("0x%p   NotifyIMEOfBlur(), sent NOTIFY_IME_OF_BLUR", this));
+}
+
+void IMEContentObserver::UnregisterObservers() {
+  if (!mIsObserving) {
+    return;
+  }
+
+  MOZ_LOG(sIMECOLog, LogLevel::Info,
+          ("0x%p UnregisterObservers(), stop observing 0x%p (%s)", this,
+           mRootElement.get(),
+           mRootElement ? ToString(*mRootElement).c_str() : "nullptr"));
+
+  mIsObserving = false;
+  mSelectionData.Clear();
+  mFocusedWidget = nullptr;
+
+  if (mEditorBase) {
+    mEditorBase->SetIMEContentObserver(nullptr);
+  }
+
+  if (mRootElement) {
+    mRootElement->RemoveMutationObserver(this);
+  }
+
+  if (mDocumentObserver) {
+    RefPtr<DocumentObserver> documentObserver = mDocumentObserver;
+    documentObserver->StopObserving();
+  }
+
+  if (mDocShell) {
+    mDocShell->RemoveWeakScrollObserver(this);
+    mDocShell->RemoveWeakReflowObserver(this);
+  }
+}
+
+nsPresContext* IMEContentObserver::GetPresContext() const {
+  return mESM ? mESM->GetPresContext() : nullptr;
+}
+
+void IMEContentObserver::Destroy() {
+
+  NotifyIMEOfBlur();
+  UnregisterObservers();
+  Clear();
+
+  mWidget = nullptr;
+  mIMENotificationRequests = nullptr;
+
+  if (mESM) {
+    mESM->OnStopObservingContent(this);
+    mESM = nullptr;
+  }
+}
+
+bool IMEContentObserver::Destroyed() const { return !mWidget; }
+
+void IMEContentObserver::DisconnectFromEventStateManager() { mESM = nullptr; }
+
+bool IMEContentObserver::MaybeReinitialize(nsIWidget& aWidget,
+                                           nsPresContext& aPresContext,
+                                           Element* aElement,
+                                           EditorBase& aEditorBase) {
+  if (!IsObservingElement(aPresContext, aElement)) {
+    return false;
+  }
+
+  if (GetState() == eState_StoppedObserving) {
+    Init(aWidget, aPresContext, aElement, aEditorBase);
+  }
+  return IsObserving(aPresContext, aElement);
+}
+
+bool IMEContentObserver::IsObserving(const nsPresContext& aPresContext,
+                                     const Element* aElement) const {
+  if (GetState() != eState_Observing) {
+    return false;
+  }
+  const auto* const textControlElement =
+      TextControlElement::FromNodeOrNull(aElement);
+  if (!textControlElement ||
+      !textControlElement->IsSingleLineTextControlOrTextArea()) {
+    if (mIsTextControl) {
+      return false;
+    }
+  }
+  else if (!mIsTextControl) {
+    return false;
+  }
+  return IsObservingElement(aPresContext, aElement);
+}
+
+bool IMEContentObserver::IsBeingInitializedFor(
+    const nsPresContext& aPresContext, const Element* aElement,
+    const EditorBase& aEditorBase) const {
+  return GetState() == eState_Initializing && mEditorBase == &aEditorBase &&
+         IsObservingElement(aPresContext, aElement);
+}
+
+bool IMEContentObserver::IsObserving(
+    const TextComposition& aTextComposition) const {
+  if (GetState() != eState_Observing) {
+    return false;
+  }
+  nsPresContext* const presContext = aTextComposition.GetPresContext();
+  if (NS_WARN_IF(!presContext)) {
+    return false;
+  }
+  if (presContext != GetPresContext()) {
+    return false;  
+  }
+  auto* const elementHavingComposition =
+      Element::FromNodeOrNull(aTextComposition.GetEventTargetNode());
+  bool isObserving = IsObservingElement(*presContext, elementHavingComposition);
+#ifdef DEBUG
+  if (isObserving) {
+    if (mIsTextControl) {
+      MOZ_ASSERT(elementHavingComposition);
+      MOZ_ASSERT(elementHavingComposition->IsTextControlElement(),
+                 "Should've never started to observe non-text-control element");
+      NS_ASSERTION(static_cast<TextControlElement*>(elementHavingComposition)
+                       ->IsSingleLineTextControlOrTextArea(),
+                   "Should've stopped observing when the type is changed");
+      NS_ASSERTION(!elementHavingComposition->IsInDesignMode(),
+                   "Should've stopped observing when the design mode started");
+    } else if (elementHavingComposition) {
+      NS_ASSERTION(
+          !elementHavingComposition->IsTextControlElement() ||
+              !static_cast<TextControlElement*>(elementHavingComposition)
+                   ->IsSingleLineTextControlOrTextArea(),
+          "Should've never started to observe text-control element or "
+          "stopped observing it when the type is changed");
+    } else {
+      MOZ_ASSERT(presContext->GetPresShell());
+      MOZ_ASSERT(presContext->GetPresShell()->GetDocument());
+      NS_ASSERTION(
+          presContext->GetPresShell()->GetDocument()->IsInDesignMode(),
+          "Should be observing entire the document only in the design mode");
+    }
+  }
+#endif  // #ifdef DEBUG
+  return isObserving;
+}
+
+IMEContentObserver::State IMEContentObserver::GetState() const {
+  if (!mRootElement || !mRootEditableNodeOrTextControlElement) {
+    return eState_NotObserving;  
+  }
+  if (!mRootElement->IsInComposedDoc()) {
+    return eState_StoppedObserving;
+  }
+  return mIsObserving ? eState_Observing : eState_Initializing;
+}
+
+bool IMEContentObserver::IsObservingElement(const nsPresContext& aPresContext,
+                                            const Element* aElement) const {
+  MOZ_ASSERT_IF(aElement,
+                aElement->GetPresContext(
+                    Element::PresContextFor::eForComposedDoc) == &aPresContext);
+
+  if (GetPresContext() != &aPresContext) {
+    return false;
+  }
+  if (mIsTextControl) {
+    return !aElement->IsInDesignMode() &&
+           aElement == mRootEditableNodeOrTextControlElement;
+  }
+  if (!mRootEditableNodeOrTextControlElement) {
+    return false;
+  }
+  if (IsForDesignMode()) {
+    if (!mRootEditableNodeOrTextControlElement->IsInDesignMode()) {
+      return false;
+    }
+    return mRootElement && (!aElement || aElement->IsInDesignMode()) &&
+           mRootElement == ComputeRootElement(aPresContext.GetPresShell());
+  }
+
+  return mRootEditableNodeOrTextControlElement ==
+         IMEContentObserver::GetMostDistantInclusiveEditableAncestorNode(
+             aPresContext, aElement);
+}
+
+nsINode* IMEContentObserver::GetMostDistantInclusiveEditableAncestorNode(
+    const nsPresContext& aPresContext, const Element* aElement) {
+  if (aElement) {
+    if (aElement->IsInDesignMode()) {
+      return aElement->GetComposedDoc();
+    }
+    return aElement->GetEditingHost();
+  }
+
+  return aPresContext.Document() && aPresContext.Document()->IsInDesignMode()
+             ? aPresContext.Document()
+             : nullptr;
+}
+
+bool IMEContentObserver::IsEditorHandlingEventForComposition() const {
+  if (!mWidget) {
+    return false;
+  }
+  RefPtr<TextComposition> composition =
+      IMEStateManager::GetTextCompositionFor(mWidget);
+  if (!composition) {
+    return false;
+  }
+  return composition->EditorIsHandlingLatestChange();
+}
+
+bool IMEContentObserver::IsEditorComposing() const {
+  if (NS_WARN_IF(!mEditorBase)) {
+    return false;
+  }
+  return mEditorBase->IsIMEComposing();
+}
+
+nsresult IMEContentObserver::GetSelectionAndRoot(Selection** aSelection,
+                                                 Element** aRootElement) const {
+  auto* selection = GetSelection();
+  if (!selection || !mRootElement) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  NS_ASSERTION(mRootElement, "uninitialized content observer");
+  NS_ADDREF(*aSelection = selection);
+  NS_ADDREF(*aRootElement = mRootElement);
+  return NS_OK;
+}
+
+void IMEContentObserver::OnSelectionChange(Selection& aSelection) {
+  if (!mIsObserving) {
+    return;
+  }
+
+  if (mWidget) {
+    bool causedByComposition = IsEditorHandlingEventForComposition();
+    bool causedBySelectionEvent = TextComposition::IsHandlingSelectionEvent();
+    bool duringComposition = IsEditorComposing();
+    MaybeNotifyIMEOfSelectionChange(causedByComposition, causedBySelectionEvent,
+                                    duringComposition);
+  }
+}
+
+void IMEContentObserver::ScrollPositionChanged() {
+  if (!NeedsPositionChangeNotification()) {
+    return;
+  }
+
+  MaybeNotifyIMEOfPositionChange(Immediately::No);
+}
+
+NS_IMETHODIMP
+IMEContentObserver::Reflow(DOMHighResTimeStamp aStart,
+                           DOMHighResTimeStamp aEnd) {
+  if (!NeedsPositionChangeNotification()) {
+    return NS_OK;
+  }
+
+  MaybeNotifyIMEOfPositionChange(Immediately::Yes);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+IMEContentObserver::ReflowInterruptible(DOMHighResTimeStamp aStart,
+                                        DOMHighResTimeStamp aEnd) {
+  if (!NeedsPositionChangeNotification()) {
+    return NS_OK;
+  }
+
+  MaybeNotifyIMEOfPositionChange(Immediately::Yes);
+  return NS_OK;
+}
+
+nsresult IMEContentObserver::HandleQueryContentEvent(
+    WidgetQueryContentEvent* aEvent) {
+  const bool isSelectionCacheAvailable =
+      mSelectionData.IsInitialized() && !mNeedsToNotifyIMEOfSelectionChange;
+  if (isSelectionCacheAvailable && aEvent->mMessage == eQuerySelectedText &&
+      aEvent->mInput.mSelectionType == SelectionType::eNormal) {
+    aEvent->EmplaceReply();
+    if (mSelectionData.HasRange()) {
+      aEvent->mReply->mOffsetAndData.emplace(mSelectionData.mOffset,
+                                             mSelectionData.String(),
+                                             OffsetAndDataFor::SelectedString);
+      aEvent->mReply->mReversed = mSelectionData.mReversed;
+    }
+    aEvent->mReply->mContentsRoot = mRootElement;
+    aEvent->mReply->mWritingMode = mSelectionData.GetWritingMode();
+    aEvent->mReply->mIsEditableContent = true;
+    MOZ_LOG(sIMECOLog, LogLevel::Debug,
+            ("0x%p HandleQueryContentEvent(aEvent={ "
+             "mMessage=%s, mReply=%s })",
+             this, ToChar(aEvent->mMessage), ToString(aEvent->mReply).c_str()));
+    return NS_OK;
+  }
+
+  MOZ_LOG(sIMECOLog, LogLevel::Info,
+          ("0x%p HandleQueryContentEvent(aEvent={ mMessage=%s })", this,
+           ToChar(aEvent->mMessage)));
+
+  if (aEvent->mInput.mRelativeToInsertionPoint &&
+      aEvent->mInput.IsValidEventMessage(aEvent->mMessage)) {
+    RefPtr<TextComposition> composition =
+        IMEStateManager::GetTextCompositionFor(aEvent->mWidget);
+    if (composition) {
+      uint32_t compositionStart = composition->NativeOffsetOfStartComposition();
+      if (NS_WARN_IF(!aEvent->mInput.MakeOffsetAbsolute(compositionStart))) {
+        return NS_ERROR_FAILURE;
+      }
+    } else if (isSelectionCacheAvailable && mSelectionData.HasRange()) {
+      const uint32_t selectionStart = mSelectionData.mOffset;
+      if (NS_WARN_IF(!aEvent->mInput.MakeOffsetAbsolute(selectionStart))) {
+        return NS_ERROR_FAILURE;
+      }
+    }
+  }
+
+  AutoRestore<bool> handling(mIsHandlingQueryContentEvent);
+  mIsHandlingQueryContentEvent = true;
+  ContentEventHandler handler(GetPresContext());
+  nsresult rv = handler.HandleQueryContentEvent(aEvent);
+  if (NS_WARN_IF(Destroyed())) {
+    aEvent->mReply.reset();
+    MOZ_LOG(sIMECOLog, LogLevel::Warning,
+            ("0x%p   HandleQueryContentEvent(), WARNING, "
+             "IMEContentObserver has been destroyed during the query, "
+             "making the query fail",
+             this));
+    return rv;
+  }
+
+  if (aEvent->Succeeded() &&
+      NS_WARN_IF(aEvent->mReply->mContentsRoot != mRootElement)) {
+    aEvent->mReply.reset();
+  }
+  return rv;
+}
+
+nsresult IMEContentObserver::MaybeHandleSelectionEvent(
+    nsPresContext* aPresContext, WidgetSelectionEvent* aEvent) {
+  MOZ_ASSERT(aEvent);
+  MOZ_ASSERT(aEvent->mMessage == eSetSelection);
+  NS_ASSERTION(!mNeedsToNotifyIMEOfSelectionChange,
+               "Selection cache has not been updated yet");
+
+  MOZ_LOG(sIMECOLog, LogLevel::Debug,
+          ("0x%p MaybeHandleSelectionEvent(aEvent={ "
+           "mMessage=%s, mOffset=%u, mLength=%u, mReversed=%s, "
+           "mExpandToClusterBoundary=%s }), "
+           "mSelectionData=%s",
+           this, ToChar(aEvent->mMessage), aEvent->mOffset, aEvent->mLength,
+           ToChar(aEvent->mReversed), ToChar(aEvent->mExpandToClusterBoundary),
+           ToString(mSelectionData).c_str()));
+
+  if (!mNeedsToNotifyIMEOfSelectionChange && mSelectionData.IsInitialized() &&
+      mSelectionData.HasRange() &&
+      mSelectionData.StartOffset() == aEvent->mOffset &&
+      mSelectionData.Length() == aEvent->mLength) {
+    if (RefPtr<Selection> selection = GetSelection()) {
+      selection->ScrollIntoView(nsISelectionController::SELECTION_FOCUS_REGION);
+    }
+    aEvent->mSucceeded = true;
+    return NS_OK;
+  }
+
+  ContentEventHandler handler(aPresContext);
+  return handler.OnSelectionEvent(aEvent);
+}
+
+bool IMEContentObserver::OnMouseButtonEvent(nsPresContext& aPresContext,
+                                            WidgetMouseEvent& aMouseEvent) {
+  if (!mIMENotificationRequests ||
+      !mIMENotificationRequests->contains(
+          IMENotificationRequest::MouseEventOnChar)) {
+    return false;
+  }
+  if (!aMouseEvent.IsTrusted() || aMouseEvent.DefaultPrevented() ||
+      !aMouseEvent.mWidget) {
+    return false;
+  }
+  switch (aMouseEvent.mMessage) {
+    case eMouseUp:
+    case eMouseDown:
+      break;
+    default:
+      return false;
+  }
+  if (NS_WARN_IF(!mWidget) || NS_WARN_IF(mWidget->Destroyed())) {
+    return false;
+  }
+
+  WidgetQueryContentEvent queryCharAtPointEvent(true, eQueryCharacterAtPoint,
+                                                aMouseEvent.mWidget);
+  queryCharAtPointEvent.mRefPoint = aMouseEvent.mRefPoint;
+  ContentEventHandler handler(&aPresContext);
+  handler.OnQueryCharacterAtPoint(&queryCharAtPointEvent);
+  if (NS_WARN_IF(queryCharAtPointEvent.Failed()) ||
+      queryCharAtPointEvent.DidNotFindChar()) {
+    return false;
+  }
+
+  if (!mWidget || NS_WARN_IF(mWidget->Destroyed())) {
+    return false;
+  }
+
+  nsIWidget* topLevelWidget = mWidget->GetTopLevelWidget();
+  if (topLevelWidget && topLevelWidget != mWidget) {
+    queryCharAtPointEvent.mReply->mRect.MoveBy(
+        topLevelWidget->WidgetToScreenOffset() -
+        mWidget->WidgetToScreenOffset());
+  }
+  if (aMouseEvent.mWidget != mWidget) {
+    queryCharAtPointEvent.mRefPoint +=
+        aMouseEvent.mWidget->WidgetToScreenOffset() -
+        mWidget->WidgetToScreenOffset();
+  }
+
+  IMENotification notification(NOTIFY_IME_OF_MOUSE_BUTTON_EVENT);
+  notification.mMouseButtonEventData.mEventMessage = aMouseEvent.mMessage;
+  notification.mMouseButtonEventData.mOffset =
+      queryCharAtPointEvent.mReply->StartOffset();
+  notification.mMouseButtonEventData.mCursorPos =
+      queryCharAtPointEvent.mRefPoint;
+  notification.mMouseButtonEventData.mCharRect =
+      queryCharAtPointEvent.mReply->mRect;
+  notification.mMouseButtonEventData.mButton = aMouseEvent.mButton;
+  notification.mMouseButtonEventData.mButtons = aMouseEvent.mButtons;
+  notification.mMouseButtonEventData.mModifiers = aMouseEvent.mModifiers;
+
+  nsresult rv = IMEStateManager::NotifyIME(notification, mWidget);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return false;
+  }
+
+  bool consumed = (rv == NS_SUCCESS_EVENT_CONSUMED);
+  if (consumed) {
+    aMouseEvent.PreventDefault();
+  }
+  return consumed;
+}
+
+void IMEContentObserver::CharacterDataWillChange(
+    nsIContent* aContent, const CharacterDataChangeInfo& aInfo) {
+  if (!NeedsTextChangeNotification() || !aContent->IsText() ||
+      !nsContentUtils::IsInSameAnonymousTree(mRootElement, aContent)) {
+    return;
+  }
+  MOZ_ASSERT(mPreCharacterDataChangeLength < 0,
+             "CharacterDataChanged() should've reset "
+             "mPreCharacterDataChangeLength");
+  mEndOfAddedTextCache.Clear(__FUNCTION__);
+  mStartOfRemovingTextRangeCache.Clear(__FUNCTION__);
+
+  if (mAddedContentCache.HasCache()) {
+    NotifyIMEOfCachedConsecutiveNewNodes(__FUNCTION__);
+  }
+
+  mPreCharacterDataChangeLength = ContentEventHandler::GetNativeTextLength(
+      *aContent->AsText(), aInfo.mChangeStart, aInfo.mChangeEnd);
+  MOZ_ASSERT(
+      mPreCharacterDataChangeLength >= aInfo.mChangeEnd - aInfo.mChangeStart,
+      "The computed length must be same as or larger than XP length");
+}
+
+void IMEContentObserver::CharacterDataChanged(
+    nsIContent* aContent, const CharacterDataChangeInfo& aInfo) {
+  if (!aContent->IsText() ||
+      !nsContentUtils::IsInSameAnonymousTree(mRootElement, aContent)) {
+    return;
+  }
+
+  if (mWidget && !IsEditorHandlingEventForComposition()) {
+    if (RefPtr<TextComposition> composition =
+            IMEStateManager::GetTextCompositionFor(mWidget)) {
+      composition->OnCharacterDataChanged(*aContent->AsText(), aInfo);
+    }
+  }
+
+  if (!NeedsTextChangeNotification()) {
+    return;
+  }
+
+  if (mAddedContentCache.HasCache()) {
+    NotifyIMEOfCachedConsecutiveNewNodes(__FUNCTION__);
+  }
+  mEndOfAddedTextCache.Clear(__FUNCTION__);
+  mStartOfRemovingTextRangeCache.Clear(__FUNCTION__);
+  MOZ_ASSERT(
+      !mAddedContentCache.HasCache(),
+      "The stored range should be flushed before actually the data is changed");
+
+  int64_t removedLength = mPreCharacterDataChangeLength;
+  mPreCharacterDataChangeLength = -1;
+
+  MOZ_ASSERT(removedLength >= 0,
+             "mPreCharacterDataChangeLength should've been set by "
+             "CharacterDataWillChange()");
+
+  uint32_t offset = 0;
+  if (mIsTextControl) {
+    MOZ_ASSERT(mRootElement->GetFirstChild() == aContent);
+    if (aInfo.mChangeStart) {
+      offset = ContentEventHandler::GetNativeTextLength(*aContent->AsText(), 0,
+                                                        aInfo.mChangeStart);
+    }
+  } else {
+    Result<uint32_t, nsresult> offsetOrError =
+        ContentEventHandler::GetFlatTextLengthInRange(
+            RawNodePosition::BeforeFirstContentOf(*mRootElement),
+            RawNodePosition(aContent, aInfo.mChangeStart), mRootElement);
+    if (NS_WARN_IF(offsetOrError.isErr())) {
+      return;
+    }
+    offset = offsetOrError.unwrap();
+  }
+
+  uint32_t newLength = ContentEventHandler::GetNativeTextLength(
+      *aContent->AsText(), aInfo.mChangeStart,
+      aInfo.mChangeStart + aInfo.mReplaceLength);
+
+  uint32_t oldEnd = offset + static_cast<uint32_t>(removedLength);
+  uint32_t newEnd = offset + newLength;
+
+  TextChangeData data(offset, oldEnd, newEnd,
+                      IsEditorHandlingEventForComposition(),
+                      IsEditorComposing());
+  MaybeNotifyIMEOfTextChange(data);
+}
+
+void IMEContentObserver::EditContextTextChanged(uint32_t aRangeStart,
+                                                uint32_t aRangeEnd,
+                                                const nsAString& aText) {
+  TextChangeData data(aRangeStart, aRangeEnd, aRangeStart + aText.Length(),
+                      IsEditorHandlingEventForComposition(),
+                      IsEditorComposing());
+  MaybeNotifyIMEOfTextChange(data);
+}
+
+void IMEContentObserver::EditContextSelectionChanged() {
+  bool causedByComposition = IsEditorHandlingEventForComposition();
+  bool causedBySelectionEvent = TextComposition::IsHandlingSelectionEvent();
+  bool duringComposition = IsEditorComposing();
+  MaybeNotifyIMEOfSelectionChange(causedByComposition, causedBySelectionEvent,
+                                  duringComposition);
+}
+
+void IMEContentObserver::EditContextPositionChanged() {
+  MaybeNotifyIMEOfPositionChange(Immediately::No);
+}
+
+void IMEContentObserver::ContentAdded(nsINode* aContainer,
+                                      nsIContent* aFirstContent,
+                                      nsIContent* aLastContent) {
+  if (!NeedsTextChangeNotification() ||
+      !nsContentUtils::IsInSameAnonymousTree(mRootElement, aFirstContent)) {
+    return;
+  }
+
+  if (aFirstContent == aLastContent) {
+    if (const auto* brElement = HTMLBRElement::FromNode(aFirstContent)) {
+      if (MOZ_LIKELY(!brElement->HasChildNodes()) &&
+          (brElement->IsPaddingForEmptyEditor() ||
+           brElement->IsPaddingForEmptyLastLine())) {
+        return;
+      }
+    }
+  }
+
+  MOZ_ASSERT(IsInDocumentChange());
+  MOZ_ASSERT_IF(aFirstContent, aFirstContent->GetParentNode() == aContainer);
+  MOZ_ASSERT_IF(aLastContent, aLastContent->GetParentNode() == aContainer);
+
+  bool needToCache = true;
+  if (mAddedContentCache.HasCache()) {
+    MOZ_DIAGNOSTIC_ASSERT(aFirstContent->GetParentNode() ==
+                          aLastContent->GetParentNode());
+    if (mAddedContentCache.IsInRange(*aFirstContent, mRootElement)) {
+      needToCache = false;
+      MOZ_LOG(sCacheLog, LogLevel::Info,
+              ("ContentAdded: mAddedContentCache already caches the give "
+               "content nodes"));
+      MOZ_ASSERT(mAddedContentCache.IsInRange(*aLastContent, mRootElement));
+    }
+    else if (!mAddedContentCache.CanMergeWith(*aFirstContent, *aLastContent,
+                                              mRootElement)) {
+      MOZ_LOG(sCacheLog, LogLevel::Info,
+              ("ContentAdded: mAddedContentCache was cached not in current "
+               "document change and new content nodes cannot be merged"));
+      mEndOfAddedTextCache.Clear(__FUNCTION__);
+      mStartOfRemovingTextRangeCache.Clear(__FUNCTION__);
+      OffsetAndLengthAdjustments differences;
+      Result<std::pair<uint32_t, uint32_t>, nsresult> offsetAndLength =
+          mAddedContentCache.ComputeFlatTextRangeBeforeInsertingNewContent(
+              *aFirstContent, *aLastContent, mRootElement, differences);
+      if (NS_WARN_IF(offsetAndLength.isErr())) {
+        MOZ_LOG(sCacheLog, LogLevel::Error,
+                ("ContentAdded: "
+                 "AddedContentCache::"
+                 "ComputeFlatTextRangeExcludingInsertingNewContent() failed"));
+        mAddedContentCache.Clear(__FUNCTION__);
+        return;
+      }
+      NotifyIMEOfCachedConsecutiveNewNodes(
+          __FUNCTION__, Some(offsetAndLength.inspect().first),
+          Some(offsetAndLength.inspect().second), differences);
+      mAddedContentCache.Clear(__FUNCTION__);
+    }
+  }
+
+  mEndOfAddedTextCache.ContentAdded(__FUNCTION__, *aFirstContent, *aLastContent,
+                                    Nothing(), mRootElement);
+  mStartOfRemovingTextRangeCache.ContentAdded(
+      __FUNCTION__, *aFirstContent, *aLastContent, Nothing(), mRootElement);
+
+  if (!needToCache) {
+    return;
+  }
+
+  if (!mAddedContentCache.TryToCache(*aFirstContent, *aLastContent,
+                                     mRootElement)) {
+    MOZ_LOG(sCacheLog, LogLevel::Info,
+            ("ContentAdded: called during a document change flushed "
+             "previous added nodes (aFirstContent=%s, aLastContent=%s)",
+             ToString(RefPtr<nsINode>(aFirstContent)).c_str(),
+             ToString(RefPtr<nsINode>(aLastContent)).c_str()));
+    NotifyIMEOfCachedConsecutiveNewNodes(__FUNCTION__);
+    MOZ_ASSERT(!mAddedContentCache.HasCache());
+    MOZ_ALWAYS_TRUE(mAddedContentCache.TryToCache(*aFirstContent, *aLastContent,
+                                                  mRootElement));
+  }
+}
+
+void IMEContentObserver::NotifyIMEOfCachedConsecutiveNewNodes(
+    const char* aCallerName,
+    const Maybe<uint32_t>& aOffsetOfFirstContent ,
+    const Maybe<uint32_t>& aLengthOfContentNNodes ,
+    const OffsetAndLengthAdjustments& aAdjustments ) {
+  MOZ_ASSERT(mAddedContentCache.HasCache());
+
+  MOZ_LOG(sIMECOLog, LogLevel::Debug,
+          ("0x%p "
+           "IMEContentObserver::NotifyIMEOfCachedConsecutiveNewNodes(), "
+           "flushing stored consecutive nodes",
+           this));
+  MOZ_LOG(
+      sCacheLog, LogLevel::Info,
+      ("NotifyIMEOfCachedConsecutiveNewNodes: called by %s "
+       "(mAddedContentCache=%s)",
+       ShortenFunctionName(aCallerName), ToString(mAddedContentCache).c_str()));
+
+  Maybe<uint32_t> offset =
+      aOffsetOfFirstContent.isSome()
+          ? aOffsetOfFirstContent
+          : mEndOfAddedTextCache.GetFlatTextLengthBeforeContent(
+                *mAddedContentCache.mFirst, mRootElement);
+  if (offset.isNothing()) {
+    Result<uint32_t, nsresult> textLengthBeforeFirstContentOrError =
+        FlatTextCache::ComputeTextLengthBeforeContent(
+            *mAddedContentCache.mFirst, mRootElement);
+    if (NS_WARN_IF(textLengthBeforeFirstContentOrError.isErr())) {
+      mEndOfAddedTextCache.Clear(__FUNCTION__);
+      mStartOfRemovingTextRangeCache.Clear(__FUNCTION__);
+      MOZ_LOG(
+          sCacheLog, LogLevel::Error,
+          ("NotifyContentAdded: failed to compute text length before mFirst"));
+      mAddedContentCache.Clear(__FUNCTION__);
+      return;
+    }
+    offset = Some(textLengthBeforeFirstContentOrError.unwrap());
+  }
+  Maybe<uint32_t> length = aLengthOfContentNNodes;
+  if (aLengthOfContentNNodes.isNothing()) {
+    Result<uint32_t, nsresult> addingLengthOrError =
+        FlatTextCache::ComputeTextLengthStartOfContentToEndOfContent(
+            *mAddedContentCache.mFirst, *mAddedContentCache.mLast,
+            mRootElement);
+    if (NS_WARN_IF(addingLengthOrError.isErr())) {
+      mEndOfAddedTextCache.Clear(__FUNCTION__);
+      mStartOfRemovingTextRangeCache.Clear(__FUNCTION__);
+      MOZ_LOG(sCacheLog, LogLevel::Error,
+              ("NotifyContentAdded: failed to compute text length of added"));
+      mAddedContentCache.Clear(__FUNCTION__);
+      return;
+    }
+    length = Some(addingLengthOrError.inspect());
+  }
+
+  mEndOfAddedTextCache.CacheFlatTextLengthBeforeEndOfContent(
+      __FUNCTION__, *mAddedContentCache.mLast,
+      aAdjustments.AdjustedEndOffset(*offset + *length), mRootElement);
+  mStartOfRemovingTextRangeCache.ContentAdded(
+      __FUNCTION__, *mAddedContentCache.mFirst, *mAddedContentCache.mLast,
+      Some(aAdjustments.AdjustedEndOffset(*offset + *length)), mRootElement);
+
+  mAddedContentCache.Clear(__FUNCTION__);
+
+  if (*length == 0u) {
+    return;
+  }
+
+  TextChangeData data(*offset, *offset, *offset + *length,
+                      IsEditorHandlingEventForComposition(),
+                      IsEditorComposing());
+  MaybeNotifyIMEOfTextChange(data);
+}
+
+void IMEContentObserver::ContentAppended(nsIContent* aFirstNewContent,
+                                         const ContentAppendInfo&) {
+  nsIContent* parent = aFirstNewContent->GetParent();
+  MOZ_ASSERT(parent);
+  ContentAdded(parent, aFirstNewContent, parent->GetLastChild());
+}
+
+void IMEContentObserver::ContentInserted(nsIContent* aChild,
+                                         const ContentInsertInfo&) {
+  MOZ_ASSERT(aChild);
+  ContentAdded(aChild->GetParentNode(), aChild, aChild);
+}
+
+void IMEContentObserver::ContentWillBeRemoved(nsIContent* aChild,
+                                              const ContentRemoveInfo&) {
+  if (!NeedsTextChangeNotification() ||
+      !nsContentUtils::IsInSameAnonymousTree(mRootElement, aChild)) {
+    return;
+  }
+
+  if (const auto* brElement = HTMLBRElement::FromNode(aChild)) {
+    if (MOZ_LIKELY(!brElement->HasChildNodes()) &&
+        (brElement->IsPaddingForEmptyEditor() ||
+         brElement->IsPaddingForEmptyLastLine())) {
+      return;
+    }
+  }
+
+  const Result<uint32_t, nsresult> textLengthOrError =
+      FlatTextCache::ComputeTextLengthOfContent(*aChild, mRootElement);
+  if (NS_WARN_IF(textLengthOrError.isErr())) {
+    mEndOfAddedTextCache.Clear(__FUNCTION__);
+    mStartOfRemovingTextRangeCache.Clear(__FUNCTION__);
+    mAddedContentCache.Clear(__FUNCTION__);
+    return;
+  }
+
+  if (mAddedContentCache.HasCache()) {
+    mEndOfAddedTextCache.ContentWillBeRemoved(
+        *aChild, textLengthOrError.inspect(), mRootElement);
+    mStartOfRemovingTextRangeCache.ContentWillBeRemoved(
+        *aChild, textLengthOrError.inspect(), mRootElement);
+    NotifyIMEOfCachedConsecutiveNewNodes(__FUNCTION__);
+    MOZ_DIAGNOSTIC_ASSERT(!mAddedContentCache.HasCache());
+  }
+
+  nsINode* containerNode = aChild->GetParentNode();
+  MOZ_ASSERT(containerNode);
+
+  mEndOfAddedTextCache.ContentWillBeRemoved(
+      *aChild, textLengthOrError.inspect(), mRootElement);
+
+  Maybe<uint32_t> offset =
+      mStartOfRemovingTextRangeCache.GetFlatTextLengthBeforeContent(
+          *aChild, mRootElement);
+  nsIContent* const prevSibling = aChild->GetPreviousSibling();
+  if (offset.isSome()) {
+    if (prevSibling) {
+      mStartOfRemovingTextRangeCache.CacheFlatTextLengthBeforeEndOfContent(
+          __FUNCTION__, *prevSibling, *offset, mRootElement);
+    } else {
+      mStartOfRemovingTextRangeCache.CacheFlatTextLengthBeforeFirstContent(
+          __FUNCTION__, *containerNode, *offset, mRootElement);
+    }
+  } else {
+    if (prevSibling) {
+      if (NS_WARN_IF(
+              NS_FAILED(mStartOfRemovingTextRangeCache
+                            .ComputeAndCacheFlatTextLengthBeforeEndOfContent(
+                                __FUNCTION__, *prevSibling, mRootElement)))) {
+        return;
+      }
+    } else {
+      if (NS_WARN_IF(
+              NS_FAILED(mStartOfRemovingTextRangeCache
+                            .ComputeAndCacheFlatTextLengthBeforeFirstContent(
+                                __FUNCTION__, *containerNode, mRootElement)))) {
+        return;
+      }
+    }
+    offset = Some(mStartOfRemovingTextRangeCache.GetFlatTextLength());
+  }
+
+  if (textLengthOrError.inspect() == 0u) {
+    return;
+  }
+
+  TextChangeData data(*offset, *offset + textLengthOrError.inspect(), *offset,
+                      IsEditorHandlingEventForComposition(),
+                      IsEditorComposing());
+  MaybeNotifyIMEOfTextChange(data);
+}
+
+MOZ_CAN_RUN_SCRIPT_BOUNDARY void IMEContentObserver::ParentChainChanged(
+    nsIContent* aContent) {
+  MOZ_ASSERT(aContent);
+  MOZ_ASSERT(mIsObserving);
+  OwningNonNull<IMEContentObserver> observer(*this);
+  IMEStateManager::OnParentChainChangedOfObservingElement(observer, *aContent);
+}
+
+void IMEContentObserver::BeginDocumentUpdate() {
+  MOZ_LOG(sIMECOLog, LogLevel::Debug, ("0x%p BeginDocumentUpdate()", this));
+}
+
+void IMEContentObserver::EndDocumentUpdate() {
+  MOZ_LOG(sIMECOLog, LogLevel::Debug, ("0x%p EndDocumentUpdate()", this));
+
+  if (mAddedContentCache.HasCache() && !EditorIsHandlingEditSubAction()) {
+    NotifyIMEOfCachedConsecutiveNewNodes(__FUNCTION__);
+  }
+}
+
+void IMEContentObserver::SuppressNotifyingIME() {
+  mSuppressNotifications++;
+
+  MOZ_LOG(sIMECOLog, LogLevel::Debug,
+          ("0x%p SuppressNotifyingIME(), mSuppressNotifications=%u", this,
+           mSuppressNotifications));
+}
+
+void IMEContentObserver::UnsuppressNotifyingIME() {
+  MOZ_LOG(sIMECOLog, LogLevel::Debug,
+          ("0x%p UnsuppressNotifyingIME(), mSuppressNotifications=%u", this,
+           mSuppressNotifications));
+  if (!mSuppressNotifications || --mSuppressNotifications) {
+    return;
+  }
+  FlushMergeableNotifications();
+}
+
+void IMEContentObserver::OnEditActionHandled() {
+  MOZ_LOG(sIMECOLog, LogLevel::Debug, ("0x%p OnEditActionHandled()", this));
+
+  if (mAddedContentCache.HasCache()) {
+    NotifyIMEOfCachedConsecutiveNewNodes(__FUNCTION__);
+  }
+  mEndOfAddedTextCache.Clear(__FUNCTION__);
+  mStartOfRemovingTextRangeCache.Clear(__FUNCTION__);
+  FlushMergeableNotifications();
+}
+
+void IMEContentObserver::BeforeEditAction() {
+  MOZ_LOG(sIMECOLog, LogLevel::Debug, ("0x%p BeforeEditAction()", this));
+
+  if (mAddedContentCache.HasCache()) {
+    NotifyIMEOfCachedConsecutiveNewNodes(__FUNCTION__);
+  }
+  mEndOfAddedTextCache.Clear(__FUNCTION__);
+  mStartOfRemovingTextRangeCache.Clear(__FUNCTION__);
+}
+
+void IMEContentObserver::CancelEditAction() {
+  MOZ_LOG(sIMECOLog, LogLevel::Debug, ("0x%p CancelEditAction()", this));
+
+  if (mAddedContentCache.HasCache()) {
+    NotifyIMEOfCachedConsecutiveNewNodes(__FUNCTION__);
+  }
+  mEndOfAddedTextCache.Clear(__FUNCTION__);
+  mStartOfRemovingTextRangeCache.Clear(__FUNCTION__);
+  FlushMergeableNotifications();
+}
+
+bool IMEContentObserver::EditorIsHandlingEditSubAction() const {
+  return mEditorBase && mEditorBase->IsInEditSubAction();
+}
+
+void IMEContentObserver::PostFocusSetNotification() {
+  MOZ_LOG(sIMECOLog, LogLevel::Debug,
+          ("0x%p PostFocusSetNotification()", this));
+
+  mNeedsToNotifyIMEOfFocusSet = true;
+}
+
+void IMEContentObserver::PostTextChangeNotification() {
+  MOZ_LOG(sIMECOLog, LogLevel::Debug,
+          ("0x%p PostTextChangeNotification(mTextChangeData=%s)", this,
+           ToString(mTextChangeData).c_str()));
+
+  MOZ_ASSERT(mTextChangeData.IsValid(),
+             "mTextChangeData must have text change data");
+  mNeedsToNotifyIMEOfTextChange = true;
+  mNeedsToNotifyIMEOfSelectionChange = true;
+}
+
+void IMEContentObserver::PostSelectionChangeNotification() {
+  MOZ_LOG(sIMECOLog, LogLevel::Debug,
+          ("0x%p PostSelectionChangeNotification(), mSelectionData={ "
+           "mCausedByComposition=%s, mCausedBySelectionEvent=%s }",
+           this, ToChar(mSelectionData.mCausedByComposition),
+           ToChar(mSelectionData.mCausedBySelectionEvent)));
+
+  mNeedsToNotifyIMEOfSelectionChange = true;
+}
+
+void IMEContentObserver::MaybeNotifyIMEOfFocusSet() {
+  MOZ_LOG(sIMECOLog, LogLevel::Debug,
+          ("0x%p MaybeNotifyIMEOfFocusSet()", this));
+
+  PostFocusSetNotification();
+  FlushMergeableNotifications();
+}
+
+void IMEContentObserver::MaybeNotifyIMEOfTextChange(
+    const TextChangeDataBase& aTextChangeData) {
+  MOZ_LOG(sIMECOLog, LogLevel::Debug,
+          ("0x%p MaybeNotifyIMEOfTextChange(aTextChangeData=%s)", this,
+           ToString(aTextChangeData).c_str()));
+
+  if (mEditorBase && mEditorBase->IsTextEditor()) {
+    MOZ_DIAGNOSTIC_ASSERT(static_cast<int64_t>(mTextControlValueLength) +
+                              aTextChangeData.Difference() >=
+                          0);
+    mTextControlValueLength += aTextChangeData.Difference();
+  }
+
+  mTextChangeData += aTextChangeData;
+  PostTextChangeNotification();
+  FlushMergeableNotifications();
+}
+
+void IMEContentObserver::CancelNotifyingIMEOfTextChange() {
+  MOZ_LOG(sIMECOLog, LogLevel::Debug,
+          ("0x%p CancelNotifyingIMEOfTextChange()", this));
+  mTextChangeData.Clear();
+  mNeedsToNotifyIMEOfTextChange = false;
+}
+
+void IMEContentObserver::MaybeNotifyIMEOfSelectionChange(
+    bool aCausedByComposition, bool aCausedBySelectionEvent,
+    bool aOccurredDuringComposition) {
+  MOZ_LOG(
+      sIMECOLog, LogLevel::Debug,
+      ("0x%p MaybeNotifyIMEOfSelectionChange(aCausedByComposition=%s, "
+       "aCausedBySelectionEvent=%s, aOccurredDuringComposition)",
+       this, ToChar(aCausedByComposition), ToChar(aCausedBySelectionEvent)));
+
+  mSelectionData.AssignReason(aCausedByComposition, aCausedBySelectionEvent,
+                              aOccurredDuringComposition);
+  PostSelectionChangeNotification();
+  FlushMergeableNotifications();
+}
+
+void IMEContentObserver::MaybeNotifyIMEOfPositionChange(
+    Immediately aImmediately) {
+  MOZ_LOG(sIMECOLog, LogLevel::Verbose,
+          ("0x%p MaybeNotifyIMEOfPositionChange()", this));
+  if (mIsHandlingQueryContentEvent &&
+      mSendingNotification == NOTIFY_IME_OF_POSITION_CHANGE) {
+    MOZ_LOG(sIMECOLog, LogLevel::Verbose,
+            ("0x%p   MaybeNotifyIMEOfPositionChange(), ignored since caused by "
+             "ContentEventHandler during sending NOTIFY_IME_OF_POSITION_CHANGE",
+             this));
+    return;
+  }
+  PostPositionChangeNotification(aImmediately);
+  FlushMergeableNotifications();
+}
+
+void IMEContentObserver::CancelNotifyingIMEOfPositionChange() {
+  MOZ_LOG(sIMECOLog, LogLevel::Debug,
+          ("0x%p CancelNotifyIMEOfPositionChange()", this));
+  mTicksUntilNotifyIMEOfPositionChange = 0;
+}
+
+void IMEContentObserver::MaybeNotifyCompositionEventHandled() {
+  MOZ_LOG(sIMECOLog, LogLevel::Debug,
+          ("0x%p MaybeNotifyCompositionEventHandled()", this));
+
+  PostCompositionEventHandledNotification();
+  FlushMergeableNotifications();
+}
+
+bool IMEContentObserver::UpdateSelectionCache(bool aRequireFlush ) {
+  MOZ_ASSERT(IsSafeToNotifyIME());
+
+  mSelectionData.ClearSelectionData();
+
+  WidgetQueryContentEvent querySelectedTextEvent(true, eQuerySelectedText,
+                                                 mWidget);
+  querySelectedTextEvent.mNeedsToFlushLayout = aRequireFlush;
+  ContentEventHandler handler(GetPresContext());
+  handler.OnQuerySelectedText(&querySelectedTextEvent);
+  if (NS_WARN_IF(querySelectedTextEvent.Failed()) ||
+      NS_WARN_IF(querySelectedTextEvent.mReply->mContentsRoot !=
+                 mRootElement)) {
+    return false;
+  }
+
+  mFocusedWidget = querySelectedTextEvent.mReply->mFocusedWidget;
+  mSelectionData.Assign(querySelectedTextEvent);
+
+
+  MOZ_LOG(sIMECOLog, LogLevel::Debug,
+          ("0x%p UpdateSelectionCache(), mSelectionData=%s", this,
+           ToString(mSelectionData).c_str()));
+
+  return true;
+}
+
+void IMEContentObserver::PostPositionChangeNotification(
+    Immediately aImmediately) {
+  MOZ_LOG(sIMECOLog, LogLevel::Debug,
+          ("0x%p PostPositionChangeNotification(aImmediately=%s)", this,
+           YesOrNo(static_cast<bool>(aImmediately))));
+
+  if (aImmediately == Immediately::Yes) {
+    mTicksUntilNotifyIMEOfPositionChange = 1u;
+    return;
+  }
+
+  if (!mTicksUntilNotifyIMEOfPositionChange) {
+    mTicksUntilNotifyIMEOfPositionChange = static_cast<
+        uint8_t>(std::min<uint32_t>(
+        StaticPrefs::
+            intl_ime_content_observer_notifications_position_change_ticks_after_scrolling(),
+        UINT8_MAX));
+  }
+}
+
+void IMEContentObserver::PostCompositionEventHandledNotification() {
+  MOZ_LOG(sIMECOLog, LogLevel::Debug,
+          ("0x%p PostCompositionEventHandledNotification()", this));
+
+  mNeedsToNotifyIMEOfCompositionEventHandled = true;
+}
+
+bool IMEContentObserver::IsReflowLocked() const {
+  nsPresContext* presContext = GetPresContext();
+  if (NS_WARN_IF(!presContext)) {
+    return false;
+  }
+  PresShell* presShell = presContext->GetPresShell();
+  if (NS_WARN_IF(!presShell)) {
+    return false;
+  }
+  return presShell->IsReflowLocked();
+}
+
+bool IMEContentObserver::IsSafeToNotifyIME() const {
+  if (!mWidget) {
+    MOZ_LOG(sIMECOLog, LogLevel::Debug,
+            ("0x%p   IsSafeToNotifyIME(), it's not safe because of no widget",
+             this));
+    return false;
+  }
+
+  if (mSuppressNotifications) {
+    MOZ_LOG(sIMECOLog, LogLevel::Debug,
+            ("0x%p   IsSafeToNotifyIME(), it's not safe because of no widget",
+             this));
+    return false;
+  }
+
+  if (!mESM || NS_WARN_IF(!GetPresContext())) {
+    MOZ_LOG(sIMECOLog, LogLevel::Debug,
+            ("0x%p   IsSafeToNotifyIME(), it's not safe because of no "
+             "EventStateManager and/or PresContext",
+             this));
+    return false;
+  }
+
+  if (IsReflowLocked()) {
+    MOZ_LOG(
+        sIMECOLog, LogLevel::Debug,
+        ("0x%p   IsSafeToNotifyIME(), it's not safe because of reflow locked",
+         this));
+    return false;
+  }
+
+  if (EditorIsHandlingEditSubAction()) {
+    MOZ_LOG(sIMECOLog, LogLevel::Debug,
+            ("0x%p   IsSafeToNotifyIME(), it's not safe because of focused "
+             "editor handling somethings",
+             this));
+    return false;
+  }
+
+  return true;
+}
+
+void IMEContentObserver::FlushMergeableNotifications() {
+  if (!IsSafeToNotifyIME()) {
+    MOZ_LOG(sIMECOLog, LogLevel::Warning,
+            ("0x%p   FlushMergeableNotifications(), Warning, do nothing due to "
+             "unsafe to notify IME",
+             this));
+    return;
+  }
+
+
+  if (mQueuedSender) {
+    MOZ_LOG(sIMECOLog, LogLevel::Warning,
+            ("0x%p   FlushMergeableNotifications(), Warning, do nothing due to "
+             "already flushing pending notifications",
+             this));
+    return;
+  }
+
+  if (mNeedsToNotifyIMEOfTextChange && !NeedsTextChangeNotification()) {
+    CancelNotifyingIMEOfTextChange();
+  }
+  if (mTicksUntilNotifyIMEOfPositionChange &&
+      !NeedsPositionChangeNotification()) {
+    CancelNotifyingIMEOfPositionChange();
+  }
+
+  if (!NeedsToNotifyIMEOfSomething()) {
+    MOZ_LOG(sIMECOLog, LogLevel::Warning,
+            ("0x%p   FlushMergeableNotifications(), Warning, due to no pending "
+             "notifications",
+             this));
+    return;
+  }
+
+
+  MOZ_LOG(
+      sIMECOLog, LogLevel::Info,
+      ("0x%p FlushMergeableNotifications(), creating IMENotificationSender...",
+       this));
+
+  mQueuedSender = new IMENotificationSender(this);
+  mQueuedSender->Dispatch(mDocShell);
+  MOZ_LOG(sIMECOLog, LogLevel::Debug,
+          ("0x%p   FlushMergeableNotifications(), finished", this));
+}
+
+void IMEContentObserver::TryToFlushPendingNotifications(bool aAllowAsync) {
+  if (mSendingNotification != NOTIFY_IME_OF_NOTHING) {
+    return;
+  }
+
+  if (mQueuedSender && XRE_IsContentProcess() && aAllowAsync) {
+    return;
+  }
+
+  if (!mQueuedSender) {
+    if (!NeedsToNotifyIMEOfSomething()) {
+      return;
+    }
+    mQueuedSender = new IMENotificationSender(this);
+  }
+
+  MOZ_LOG(sIMECOLog, LogLevel::Debug,
+          ("0x%p TryToFlushPendingNotifications(), performing queued "
+           "IMENotificationSender forcibly",
+           this));
+  RefPtr<IMENotificationSender> queuedSender = mQueuedSender;
+  queuedSender->Run();
+}
+
+
+bool IMEContentObserver::AChangeEvent::CanNotifyIME(
+    ChangeEventType aChangeEventType) const {
+  RefPtr<IMEContentObserver> observer = GetObserver();
+  if (NS_WARN_IF(!observer)) {
+    return false;
+  }
+
+  const LogLevel debugOrVerbose =
+      aChangeEventType == ChangeEventType::eChangeEventType_Position
+          ? LogLevel::Verbose
+          : LogLevel::Debug;
+
+  if (aChangeEventType == eChangeEventType_CompositionEventHandled) {
+    if (observer->mWidget) {
+      return true;
+    }
+    MOZ_LOG(sIMECOLog, debugOrVerbose,
+            ("0x%p   AChangeEvent::CanNotifyIME(), Cannot notify IME of "
+             "composition event handled because of no widget",
+             this));
+    return false;
+  }
+  State state = observer->GetState();
+  if (state == eState_NotObserving) {
+    MOZ_LOG(sIMECOLog, debugOrVerbose,
+            ("0x%p   AChangeEvent::CanNotifyIME(), Cannot notify IME because "
+             "of not observing",
+             this));
+    return false;
+  }
+  if (aChangeEventType == eChangeEventType_Focus) {
+    if (!observer->mIMEHasFocus) {
+      return true;
+    }
+    MOZ_LOG(sIMECOLog, debugOrVerbose,
+            ("0x%p   AChangeEvent::CanNotifyIME(), Cannot notify IME of focus "
+             "change because of already focused",
+             this));
+    NS_WARNING("IME already has focus");
+    return false;
+  }
+  if (!observer->mIMEHasFocus) {
+    MOZ_LOG(sIMECOLog, debugOrVerbose,
+            ("0x%p   AChangeEvent::CanNotifyIME(), Cannot notify IME because "
+             "of not focused",
+             this));
+    return false;
+  }
+
+  MOZ_ASSERT(observer->mWidget);
+
+  return true;
+}
+
+bool IMEContentObserver::AChangeEvent::IsSafeToNotifyIME(
+    ChangeEventType aChangeEventType) const {
+  const LogLevel warningOrVerbose =
+      aChangeEventType == ChangeEventType::eChangeEventType_Position
+          ? LogLevel::Verbose
+          : LogLevel::Warning;
+
+  if (NS_WARN_IF(!nsContentUtils::IsSafeToRunScript())) {
+    MOZ_LOG(sIMECOLog, warningOrVerbose,
+            ("0x%p   AChangeEvent::IsSafeToNotifyIME(), Warning, Cannot notify "
+             "IME because of not safe to run script",
+             this));
+    return false;
+  }
+
+  RefPtr<IMEContentObserver> observer = GetObserver();
+  if (!observer) {
+    MOZ_LOG(sIMECOLog, warningOrVerbose,
+            ("0x%p   AChangeEvent::IsSafeToNotifyIME(), Warning, Cannot notify "
+             "IME because of no observer",
+             this));
+    return false;
+  }
+
+  if (observer->mSendingNotification != NOTIFY_IME_OF_NOTHING) {
+    MOZ_LOG(sIMECOLog, warningOrVerbose,
+            ("0x%p   AChangeEvent::IsSafeToNotifyIME(), Warning, Cannot notify "
+             "IME because of the observer sending another notification",
+             this));
+    return false;
+  }
+  State state = observer->GetState();
+  if (aChangeEventType == eChangeEventType_Focus) {
+    if (NS_WARN_IF(state != eState_Initializing && state != eState_Observing)) {
+      MOZ_LOG(sIMECOLog, warningOrVerbose,
+              ("0x%p   AChangeEvent::IsSafeToNotifyIME(), Warning, Cannot "
+               "notify IME of focus because of not observing",
+               this));
+      return false;
+    }
+  } else if (aChangeEventType == eChangeEventType_CompositionEventHandled) {
+  } else if (state != eState_Observing) {
+    MOZ_LOG(sIMECOLog, warningOrVerbose,
+            ("0x%p   AChangeEvent::IsSafeToNotifyIME(), Warning, Cannot notify "
+             "IME because of not observing",
+             this));
+    return false;
+  }
+  return observer->IsSafeToNotifyIME();
+}
+
+
+void IMEContentObserver::IMENotificationSender::Dispatch(
+    nsIDocShell* aDocShell) {
+  if (XRE_IsContentProcess() && aDocShell) {
+    if (RefPtr<nsPresContext> presContext = aDocShell->GetPresContext()) {
+      if (nsRefreshDriver* refreshDriver = presContext->RefreshDriver()) {
+        refreshDriver->AddEarlyRunner(this);
+        return;
+      }
+    }
+  }
+  NS_DispatchToCurrentThread(this);
+}
+
+NS_IMETHODIMP
+IMEContentObserver::IMENotificationSender::Run() {
+  if (NS_WARN_IF(mIsRunning)) {
+    MOZ_LOG(
+        sIMECOLog, LogLevel::Error,
+        ("0x%p IMENotificationSender::Run(), FAILED, due to called recursively",
+         this));
+    return NS_OK;
+  }
+
+  RefPtr<IMEContentObserver> observer = GetObserver();
+  if (!observer) {
+    return NS_OK;
+  }
+
+  AutoRestore<bool> running(mIsRunning);
+  mIsRunning = true;
+
+  if (observer->mQueuedSender != this) {
+    return NS_OK;
+  }
+
+
+  if (observer->mNeedsToNotifyIMEOfFocusSet) {
+    observer->mNeedsToNotifyIMEOfFocusSet = false;
+    SendFocusSet();
+    observer->mQueuedSender = nullptr;
+    if (observer->mNeedsToNotifyIMEOfFocusSet) {
+      MOZ_ASSERT(!observer->mIMEHasFocus);
+      MOZ_LOG(sIMECOLog, LogLevel::Debug,
+              ("0x%p IMENotificationSender::Run(), posting "
+               "IMENotificationSender to current thread",
+               this));
+      observer->mQueuedSender = new IMENotificationSender(observer);
+      observer->mQueuedSender->Dispatch(observer->mDocShell);
+      return NS_OK;
+    }
+    observer->ClearPendingNotifications();
+    return NS_OK;
+  }
+
+  const bool allowToNotifyIMEOfPositionChange =
+      observer->mNeedsToNotifyIMEOfTextChange ||
+      observer->mNeedsToNotifyIMEOfSelectionChange ||
+      observer->mNeedsToNotifyIMEOfCompositionEventHandled ||
+      observer->mTicksUntilNotifyIMEOfPositionChange == 1;
+  if (observer->mNeedsToNotifyIMEOfTextChange) {
+    observer->mNeedsToNotifyIMEOfTextChange = false;
+    SendTextChange();
+  }
+
+  if (!observer->mNeedsToNotifyIMEOfTextChange) {
+    if (observer->mNeedsToNotifyIMEOfSelectionChange) {
+      observer->mNeedsToNotifyIMEOfSelectionChange = false;
+      SendSelectionChange();
+    }
+  }
+
+  if (observer->mTicksUntilNotifyIMEOfPositionChange &&
+      !observer->mNeedsToNotifyIMEOfTextChange &&
+      !observer->mNeedsToNotifyIMEOfSelectionChange) {
+    observer->mTicksUntilNotifyIMEOfPositionChange--;
+    if (allowToNotifyIMEOfPositionChange) {
+      observer->mTicksUntilNotifyIMEOfPositionChange = 0;
+      SendPositionChange();
+    } else {
+      if (observer->mQueuedSender != this) {
+        observer->mQueuedSender = new IMENotificationSender(observer);
+      }
+      observer->mQueuedSender->Dispatch(observer->mDocShell);
+      return NS_OK;
+    }
+  }
+
+  if (!observer->mNeedsToNotifyIMEOfTextChange &&
+      !observer->mNeedsToNotifyIMEOfSelectionChange &&
+      !observer->mTicksUntilNotifyIMEOfPositionChange) {
+    if (observer->mNeedsToNotifyIMEOfCompositionEventHandled) {
+      observer->mNeedsToNotifyIMEOfCompositionEventHandled = false;
+      SendCompositionEventHandled();
+    }
+  }
+
+  observer->mQueuedSender = nullptr;
+
+  if (observer->NeedsToNotifyIMEOfSomething()) {
+    if (observer->GetState() == eState_StoppedObserving) {
+      MOZ_LOG(sIMECOLog, LogLevel::Debug,
+              ("0x%p IMENotificationSender::Run(), waiting "
+               "IMENotificationSender to be reinitialized",
+               this));
+    } else {
+      MOZ_LOG(sIMECOLog, LogLevel::Debug,
+              ("0x%p IMENotificationSender::Run(), posting "
+               "IMENotificationSender to current thread",
+               this));
+      observer->mQueuedSender = new IMENotificationSender(observer);
+      observer->mQueuedSender->Dispatch(observer->mDocShell);
+    }
+  }
+  return NS_OK;
+}
+
+void IMEContentObserver::IMENotificationSender::SendFocusSet() {
+  RefPtr<IMEContentObserver> observer = GetObserver();
+  if (!observer) {
+    return;
+  }
+
+  if (!CanNotifyIME(eChangeEventType_Focus)) {
+    MOZ_LOG(sIMECOLog, LogLevel::Warning,
+            ("0x%p   IMENotificationSender::SendFocusSet(), Warning, does not "
+             "send notification due to impossible to notify IME of focus",
+             this));
+    observer->ClearPendingNotifications();
+    return;
+  }
+
+  if (!IsSafeToNotifyIME(eChangeEventType_Focus)) {
+    MOZ_LOG(
+        sIMECOLog, LogLevel::Warning,
+        ("0x%p   IMENotificationSender::SendFocusSet(), Warning, does not send "
+         "notification due to unsafe, retrying to send NOTIFY_IME_OF_FOCUS...",
+         this));
+    observer->PostFocusSetNotification();
+    return;
+  }
+
+  observer->mIMEHasFocus = true;
+  observer->UpdateSelectionCache(true);
+  MOZ_LOG(sIMECOLog, LogLevel::Info,
+          ("0x%p IMENotificationSender::SendFocusSet(), sending "
+           "NOTIFY_IME_OF_FOCUS...",
+           this));
+
+  MOZ_RELEASE_ASSERT(observer->mSendingNotification == NOTIFY_IME_OF_NOTHING);
+  observer->mSendingNotification = NOTIFY_IME_OF_FOCUS;
+  IMEStateManager::NotifyIME(IMENotification(NOTIFY_IME_OF_FOCUS),
+                             observer->mWidget);
+  observer->mSendingNotification = NOTIFY_IME_OF_NOTHING;
+
+  observer->OnIMEReceivedFocus();
+
+  MOZ_LOG(
+      sIMECOLog, LogLevel::Debug,
+      ("0x%p   IMENotificationSender::SendFocusSet(), sent NOTIFY_IME_OF_FOCUS",
+       this));
+}
+
+void IMEContentObserver::IMENotificationSender::SendSelectionChange() {
+  RefPtr<IMEContentObserver> observer = GetObserver();
+  if (!observer) {
+    return;
+  }
+
+  if (!CanNotifyIME(eChangeEventType_Selection)) {
+    MOZ_LOG(sIMECOLog, LogLevel::Warning,
+            ("0x%p   IMENotificationSender::SendSelectionChange(), Warning, "
+             "does not send notification due to impossible to notify IME of "
+             "selection change",
+             this));
+    return;
+  }
+
+  if (!IsSafeToNotifyIME(eChangeEventType_Selection)) {
+    MOZ_LOG(sIMECOLog, LogLevel::Warning,
+            ("0x%p   IMENotificationSender::SendSelectionChange(), Warning, "
+             "does not send notification due to unsafe, retrying to send "
+             "NOTIFY_IME_OF_SELECTION_CHANGE...",
+             this));
+    observer->PostSelectionChangeNotification();
+    return;
+  }
+
+  SelectionChangeData lastSelChangeData = observer->mSelectionData;
+  if (NS_WARN_IF(!observer->UpdateSelectionCache())) {
+    MOZ_LOG(sIMECOLog, LogLevel::Error,
+            ("0x%p   IMENotificationSender::SendSelectionChange(), FAILED, due "
+             "to UpdateSelectionCache() failure",
+             this));
+    return;
+  }
+
+  if (!CanNotifyIME(eChangeEventType_Selection)) {
+    MOZ_LOG(sIMECOLog, LogLevel::Error,
+            ("0x%p   IMENotificationSender::SendSelectionChange(), FAILED, due "
+             "to flushing layout having changed something",
+             this));
+    return;
+  }
+
+  SelectionChangeData& newSelChangeData = observer->mSelectionData;
+  if (lastSelChangeData.IsInitialized() &&
+      lastSelChangeData.EqualsRangeAndDirectionAndWritingMode(
+          newSelChangeData)) {
+    MOZ_LOG(
+        sIMECOLog, LogLevel::Debug,
+        ("0x%p IMENotificationSender::SendSelectionChange(), not notifying IME "
+         "of NOTIFY_IME_OF_SELECTION_CHANGE due to not changed actually",
+         this));
+    return;
+  }
+
+  MOZ_LOG(sIMECOLog, LogLevel::Info,
+          ("0x%p IMENotificationSender::SendSelectionChange(), sending "
+           "NOTIFY_IME_OF_SELECTION_CHANGE... newSelChangeData=%s",
+           this, ToString(newSelChangeData).c_str()));
+
+  IMENotification notification(NOTIFY_IME_OF_SELECTION_CHANGE);
+  notification.SetData(observer->mSelectionData);
+
+  MOZ_RELEASE_ASSERT(observer->mSendingNotification == NOTIFY_IME_OF_NOTHING);
+  observer->mSendingNotification = NOTIFY_IME_OF_SELECTION_CHANGE;
+  IMEStateManager::NotifyIME(notification, observer->mWidget);
+  observer->mSendingNotification = NOTIFY_IME_OF_NOTHING;
+
+  MOZ_LOG(sIMECOLog, LogLevel::Debug,
+          ("0x%p   IMENotificationSender::SendSelectionChange(), sent "
+           "NOTIFY_IME_OF_SELECTION_CHANGE",
+           this));
+}
+
+void IMEContentObserver::IMENotificationSender::SendTextChange() {
+  RefPtr<IMEContentObserver> observer = GetObserver();
+  if (!observer) {
+    return;
+  }
+
+  if (!CanNotifyIME(eChangeEventType_Text)) {
+    MOZ_LOG(
+        sIMECOLog, LogLevel::Warning,
+        ("0x%p   IMENotificationSender::SendTextChange(), Warning, does not "
+         "send notification due to impossible to notify IME of text change",
+         this));
+    return;
+  }
+
+  if (!IsSafeToNotifyIME(eChangeEventType_Text)) {
+    MOZ_LOG(sIMECOLog, LogLevel::Warning,
+            ("0x%p   IMENotificationSender::SendTextChange(), Warning, does "
+             "not send notification due to unsafe, retrying to send "
+             "NOTIFY_IME_OF_TEXT_CHANGE...",
+             this));
+    observer->PostTextChangeNotification();
+    return;
+  }
+
+  if (!observer->NeedsTextChangeNotification()) {
+    MOZ_LOG(sIMECOLog, LogLevel::Warning,
+            ("0x%p   IMENotificationSender::SendTextChange(), Warning, "
+             "canceling sending NOTIFY_IME_OF_TEXT_CHANGE",
+             this));
+    observer->CancelNotifyingIMEOfTextChange();
+    return;
+  }
+
+  MOZ_LOG(sIMECOLog, LogLevel::Info,
+          ("0x%p IMENotificationSender::SendTextChange(), sending "
+           "NOTIFY_IME_OF_TEXT_CHANGE... mIMEContentObserver={ "
+           "mTextChangeData=%s }",
+           this, ToString(observer->mTextChangeData).c_str()));
+
+  IMENotification notification(NOTIFY_IME_OF_TEXT_CHANGE);
+  notification.SetData(observer->mTextChangeData);
+  observer->mTextChangeData.Clear();
+
+  MOZ_RELEASE_ASSERT(observer->mSendingNotification == NOTIFY_IME_OF_NOTHING);
+  observer->mSendingNotification = NOTIFY_IME_OF_TEXT_CHANGE;
+  IMEStateManager::NotifyIME(notification, observer->mWidget);
+  observer->mSendingNotification = NOTIFY_IME_OF_NOTHING;
+
+  MOZ_LOG(sIMECOLog, LogLevel::Debug,
+          ("0x%p   IMENotificationSender::SendTextChange(), sent "
+           "NOTIFY_IME_OF_TEXT_CHANGE",
+           this));
+}
+
+void IMEContentObserver::IMENotificationSender::SendPositionChange() {
+  RefPtr<IMEContentObserver> observer = GetObserver();
+  if (!observer) {
+    return;
+  }
+
+  if (!CanNotifyIME(eChangeEventType_Position)) {
+    MOZ_LOG(sIMECOLog, LogLevel::Verbose,
+            ("0x%p   IMENotificationSender::SendPositionChange(), Warning, "
+             "does not send notification due to impossible to notify IME of "
+             "position change",
+             this));
+    return;
+  }
+
+  if (!IsSafeToNotifyIME(eChangeEventType_Position)) {
+    MOZ_LOG(sIMECOLog, LogLevel::Verbose,
+            ("0x%p   IMENotificationSender::SendPositionChange(), Warning, "
+             "does not send notification due to unsafe, retrying to send "
+             "NOTIFY_IME_OF_POSITION_CHANGE...",
+             this));
+    observer->PostPositionChangeNotification(Immediately::Yes);
+    return;
+  }
+
+  if (!observer->NeedsPositionChangeNotification()) {
+    MOZ_LOG(sIMECOLog, LogLevel::Verbose,
+            ("0x%p   IMENotificationSender::SendPositionChange(), Warning, "
+             "canceling sending NOTIFY_IME_OF_POSITION_CHANGE",
+             this));
+    observer->CancelNotifyingIMEOfPositionChange();
+    return;
+  }
+
+  MOZ_LOG(sIMECOLog, LogLevel::Info,
+          ("0x%p IMENotificationSender::SendPositionChange(), sending "
+           "NOTIFY_IME_OF_POSITION_CHANGE...",
+           this));
+
+  MOZ_RELEASE_ASSERT(observer->mSendingNotification == NOTIFY_IME_OF_NOTHING);
+  observer->mSendingNotification = NOTIFY_IME_OF_POSITION_CHANGE;
+  IMEStateManager::NotifyIME(IMENotification(NOTIFY_IME_OF_POSITION_CHANGE),
+                             observer->mWidget);
+  observer->mSendingNotification = NOTIFY_IME_OF_NOTHING;
+
+  MOZ_LOG(sIMECOLog, LogLevel::Debug,
+          ("0x%p   IMENotificationSender::SendPositionChange(), sent "
+           "NOTIFY_IME_OF_POSITION_CHANGE",
+           this));
+}
+
+void IMEContentObserver::IMENotificationSender::SendCompositionEventHandled() {
+  RefPtr<IMEContentObserver> observer = GetObserver();
+  if (!observer) {
+    return;
+  }
+
+  if (!CanNotifyIME(eChangeEventType_CompositionEventHandled)) {
+    MOZ_LOG(sIMECOLog, LogLevel::Warning,
+            ("0x%p   IMENotificationSender::SendCompositionEventHandled(), "
+             "Warning, does not send notification due to impossible to notify "
+             "IME of composition event handled",
+             this));
+    return;
+  }
+
+  if (!IsSafeToNotifyIME(eChangeEventType_CompositionEventHandled)) {
+    MOZ_LOG(sIMECOLog, LogLevel::Warning,
+            ("0x%p   IMENotificationSender::SendCompositionEventHandled(), "
+             "Warning, does not send notification due to unsafe, retrying to "
+             "send NOTIFY_IME_OF_POSITION_CHANGE...",
+             this));
+    observer->PostCompositionEventHandledNotification();
+    return;
+  }
+
+  MOZ_LOG(sIMECOLog, LogLevel::Info,
+          ("0x%p IMENotificationSender::SendCompositionEventHandled(), sending "
+           "NOTIFY_IME_OF_COMPOSITION_EVENT_HANDLED...",
+           this));
+
+  MOZ_RELEASE_ASSERT(observer->mSendingNotification == NOTIFY_IME_OF_NOTHING);
+  observer->mSendingNotification = NOTIFY_IME_OF_COMPOSITION_EVENT_HANDLED;
+  IMEStateManager::NotifyIME(
+      IMENotification(NOTIFY_IME_OF_COMPOSITION_EVENT_HANDLED),
+      observer->mWidget);
+  observer->mSendingNotification = NOTIFY_IME_OF_NOTHING;
+
+  MOZ_LOG(sIMECOLog, LogLevel::Debug,
+          ("0x%p   IMENotificationSender::SendCompositionEventHandled(), sent "
+           "NOTIFY_IME_OF_COMPOSITION_EVENT_HANDLED",
+           this));
+}
+
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(IMEContentObserver::DocumentObserver)
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(IMEContentObserver::DocumentObserver)
+  tmp->StopObserving();
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(IMEContentObserver::DocumentObserver)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mIMEContentObserver)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mDocument)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(IMEContentObserver::DocumentObserver)
+  NS_INTERFACE_MAP_ENTRY(nsIDocumentObserver)
+  NS_INTERFACE_MAP_ENTRY(nsIMutationObserver)
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(IMEContentObserver::DocumentObserver)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(IMEContentObserver::DocumentObserver)
+
+void IMEContentObserver::DocumentObserver::Observe(Document* aDocument) {
+  MOZ_ASSERT(aDocument);
+
+  RefPtr<Document> newDocument = aDocument;
+
+  StopObserving();
+
+  mDocument = std::move(newDocument);
+  mDocument->AddObserver(this);
+}
+
+void IMEContentObserver::DocumentObserver::StopObserving() {
+  if (!IsObserving()) {
+    return;
+  }
+
+  RefPtr<IMEContentObserver> observer = std::move(mIMEContentObserver);
+
+  RefPtr<Document> document = std::move(mDocument);
+  document->RemoveObserver(this);
+
+  for (; IsUpdating(); --mDocumentUpdating) {
+    observer->EndDocumentUpdate();
+  }
+}
+
+void IMEContentObserver::DocumentObserver::Destroy() {
+  StopObserving();
+  mIMEContentObserver = nullptr;
+}
+
+void IMEContentObserver::DocumentObserver::BeginUpdate(Document* aDocument) {
+  if (NS_WARN_IF(Destroyed()) || NS_WARN_IF(!IsObserving())) {
+    return;
+  }
+  mIMEContentObserver->BeginDocumentUpdate();
+  mDocumentUpdating++;
+}
+
+void IMEContentObserver::DocumentObserver::EndUpdate(Document* aDocument) {
+  if (NS_WARN_IF(Destroyed()) || NS_WARN_IF(!IsObserving()) ||
+      NS_WARN_IF(!IsUpdating())) {
+    return;
+  }
+  mDocumentUpdating--;
+  mIMEContentObserver->EndDocumentUpdate();
+}
+
+
+void IMEContentObserver::FlatTextCache::Clear(const char* aCallerName) {
+  if (!HasCache()) {
+    return;
+  }
+  MOZ_LOG(sCacheLog, LogLevel::Info,
+          ("%s.Clear: called by %s", mInstanceName, aCallerName));
+  mContainerNode = nullptr;
+  mContent = nullptr;
+  mFlatTextLength = 0;
+}
+
+nsresult IMEContentObserver::FlatTextCache::
+    ComputeAndCacheFlatTextLengthBeforeEndOfContent(
+        const char* aCallerName, const nsIContent& aContent,
+        const Element* aRootElement) {
+  MOZ_ASSERT(aRootElement);
+  MOZ_ASSERT(aContent.GetParentNode());
+
+  Result<uint32_t, nsresult> lengthOrError =
+      ContentEventHandler::GetFlatTextLengthInRange(
+          RawNodePosition::BeforeFirstContentOf(*aRootElement),
+          RawNodePosition::After(aContent), aRootElement);
+  if (lengthOrError.isErr()) [[unlikely]] {
+    Clear(aCallerName);
+    return lengthOrError.unwrapErr();
+  }
+
+  CacheFlatTextLengthBeforeEndOfContent(aCallerName, aContent,
+                                        lengthOrError.inspect(), aRootElement);
+  return NS_OK;
+}
+
+void IMEContentObserver::FlatTextCache::CacheFlatTextLengthBeforeEndOfContent(
+    const char* aCallerName, const nsIContent& aContent,
+    uint32_t aFlatTextLength, const dom::Element* aRootElement) {
+  mContainerNode = aContent.GetParentNode();
+  mContent = const_cast<nsIContent*>(&aContent);
+  mFlatTextLength = aFlatTextLength;
+  MOZ_ASSERT(IsCachingToEndOfContent());
+  MOZ_LOG(sCacheLog, LogLevel::Info,
+          ("%s.%s: called by %s -> %s", mInstanceName, __func__,
+           ShortenFunctionName(aCallerName), ToString(*this).c_str()));
+  AssertValidCache(aRootElement);
+}
+
+nsresult IMEContentObserver::FlatTextCache::
+    ComputeAndCacheFlatTextLengthBeforeFirstContent(
+        const char* aCallerName, const nsINode& aContainer,
+        const Element* aRootElement) {
+  MOZ_ASSERT(aRootElement);
+
+  const Result<uint32_t, nsresult>
+      lengthIncludingLineBreakCausedByOpenTagOfContainer =
+          FlatTextCache::ComputeTextLengthBeforeFirstContentOf(aContainer,
+                                                               aRootElement);
+  if (MOZ_UNLIKELY(
+          lengthIncludingLineBreakCausedByOpenTagOfContainer.isErr())) {
+    Clear(__FUNCTION__);
+    return lengthIncludingLineBreakCausedByOpenTagOfContainer.inspectErr();
+  }
+
+  CacheFlatTextLengthBeforeFirstContent(
+      aCallerName, aContainer,
+      lengthIncludingLineBreakCausedByOpenTagOfContainer.inspect(),
+      aRootElement);
+  return NS_OK;
+}
+
+void IMEContentObserver::FlatTextCache::CacheFlatTextLengthBeforeFirstContent(
+    const char* aCallerName, const nsINode& aContainer,
+    uint32_t aFlatTextLength, const dom::Element* aRootElement) {
+  mContainerNode = const_cast<nsINode*>(&aContainer);
+  mContent = nullptr;
+  mFlatTextLength = aFlatTextLength;
+  MOZ_ASSERT(IsCachingToStartOfContainer());
+  MOZ_LOG(sCacheLog, LogLevel::Info,
+          ("%s.%s: called by %s -> %s", mInstanceName, __func__,
+           ShortenFunctionName(aCallerName), ToString(*this).c_str()));
+  AssertValidCache(aRootElement);
+}
+
+Maybe<uint32_t>
+IMEContentObserver::FlatTextCache::GetFlatTextLengthBeforeContent(
+    const nsIContent& aContent, const dom::Element* aRootElement) const {
+  MOZ_ASSERT(aRootElement);
+  if (!mContainerNode) {
+    return Nothing();
+  }
+
+  nsIContent* const prevSibling = aContent.GetPreviousSibling();
+  if (IsCachingToStartOfContainer()) {
+    MOZ_ASSERT(!mContent);
+    if (!prevSibling && mContainerNode == aContent.GetParentNode()) {
+      return Some(mFlatTextLength);
+    }
+    return Nothing();
+  }
+
+  MOZ_ASSERT(IsCachingToEndOfContent());
+  MOZ_ASSERT(mContent);
+
+  if (mContent == prevSibling) {
+    return Some(mFlatTextLength);
+  }
+
+  if (mContent == &aContent) {
+    const Result<uint32_t, nsresult> textLength =
+        FlatTextCache::ComputeTextLengthOfContent(aContent, aRootElement);
+    if (NS_WARN_IF(textLength.isErr()) ||
+        NS_WARN_IF(mFlatTextLength < textLength.inspect())) {
+      return Nothing();
+    }
+    return Some(mFlatTextLength - textLength.inspect());
+  }
+  return Nothing();
+}
+
+Maybe<uint32_t> IMEContentObserver::FlatTextCache::GetFlatTextOffsetOnInsertion(
+    const nsIContent& aFirstContent, const nsIContent& aLastContent,
+    const dom::Element* aRootElement) const {
+  MOZ_ASSERT(aRootElement);
+  MOZ_ASSERT(aFirstContent.GetParentNode() == aLastContent.GetParentNode());
+  MOZ_ASSERT(!aFirstContent.IsBeingRemoved());
+  MOZ_ASSERT(!aLastContent.IsBeingRemoved());
+
+  if (!mContainerNode || mContainerNode != aFirstContent.GetParentNode()) {
+    return Nothing();
+  }
+
+  if (IsCachingToStartOfContainer()) {
+    MOZ_ASSERT(!mContent);
+    if (mContainerNode->GetFirstChild() == &aFirstContent) {
+      return Some(mFlatTextLength);
+    }
+    return Nothing();
+  }
+
+  MOZ_ASSERT(IsCachingToEndOfContent());
+  MOZ_ASSERT(mContent);
+  MOZ_ASSERT(mContent != &aFirstContent);
+  MOZ_ASSERT(mContent != &aLastContent);
+
+  if (mContent == aFirstContent.GetPreviousSibling()) {
+    return Some(mFlatTextLength);
+  }
+  if (mContent == aLastContent.GetNextSibling() ||
+      aLastContent.ComputeIndexInParentNode().valueOr(UINT32_MAX) <
+          mContent->ComputeIndexInParentNode().valueOr(0u)) {
+    Result<uint32_t, nsresult> previouslyInsertedTextLengthOrError =
+        FlatTextCache::ComputeTextLengthStartOfContentToEndOfContent(
+            *aLastContent.GetNextSibling(), *mContent, aRootElement);
+    if (NS_WARN_IF(previouslyInsertedTextLengthOrError.isErr()) ||
+        NS_WARN_IF(mFlatTextLength <
+                   previouslyInsertedTextLengthOrError.inspect())) {
+      return Nothing();
+    }
+    return Some(mFlatTextLength - previouslyInsertedTextLengthOrError.unwrap());
+  }
+  return Nothing();
+}
+
+Result<uint32_t, nsresult>
+IMEContentObserver::FlatTextCache::ComputeTextLengthOfContent(
+    const nsIContent& aContent, const dom::Element* aRootElement) {
+  MOZ_ASSERT(aRootElement);
+
+  if (const Text* textNode = Text::FromNode(aContent)) {
+    return ContentEventHandler::GetNativeTextLength(*textNode);
+  }
+
+  return ComputeTextLengthStartOfContentToEndOfContent(aContent, aContent,
+                                                       aRootElement);
+}
+
+Result<uint32_t, nsresult>
+IMEContentObserver::FlatTextCache::ComputeTextLengthBeforeContent(
+    const nsIContent& aContent, const dom::Element* aRootElement) {
+  return ContentEventHandler::GetFlatTextLengthInRange(
+      RawNodePosition::BeforeFirstContentOf(*aRootElement),
+      RawNodePosition::Before(aContent), aRootElement);
+}
+
+Result<uint32_t, nsresult> IMEContentObserver::FlatTextCache::
+    ComputeTextLengthStartOfContentToEndOfContent(
+        const nsIContent& aStartContent, const nsIContent& aEndContent,
+        const dom::Element* aRootElement) {
+  return ContentEventHandler::GetFlatTextLengthInRange(
+      RawNodePosition::Before(aStartContent),
+      RawNodePosition::After(aEndContent), aRootElement);
+}
+
+Result<uint32_t, nsresult>
+IMEContentObserver::FlatTextCache::ComputeTextLengthBeforeFirstContentOf(
+    const nsINode& aContainer, const dom::Element* aRootElement) {
+  return ContentEventHandler::GetFlatTextLengthInRange(
+      RawNodePosition::BeforeFirstContentOf(*aRootElement),
+      RawNodePosition(const_cast<nsINode*>(&aContainer), nullptr),
+      aRootElement);
+}
+
+void IMEContentObserver::FlatTextCache::AssertValidCache(
+    const Element* aRootElement) const {
+#ifdef DEBUG
+  if (MOZ_LIKELY(
+          !false)) {
+    return;
+  }
+  MOZ_ASSERT(aRootElement);
+  if (!mContainerNode) {
+    return;
+  }
+  MOZ_ASSERT(mContainerNode->IsInclusiveDescendantOf(aRootElement));
+  MOZ_ASSERT_IF(mContent, mContent->IsInclusiveDescendantOf(aRootElement));
+
+  if (IsCachingToEndOfContent()) {
+    MOZ_ASSERT(mContent);
+    Result<uint32_t, nsresult> offset =
+        FlatTextCache::ComputeTextLengthBeforeContent(*mContent, aRootElement);
+    MOZ_ASSERT(offset.isOk());
+    Result<uint32_t, nsresult> length =
+        FlatTextCache::ComputeTextLengthStartOfContentToEndOfContent(
+            *mContent, *mContent, aRootElement);
+    MOZ_ASSERT(length.isOk());
+    if (mFlatTextLength != offset.inspect() + length.inspect()) {
+      nsAutoString innerHTMLOfEditable;
+      const_cast<Element*>(aRootElement)
+          ->GetInnerHTML(innerHTMLOfEditable, IgnoreErrors());
+      NS_WARNING(
+          nsPrintfCString(
+              "mFlatTextLength=%u, offset: %u, length: %u, mContainerNode:%s, "
+              "mContent=%s (%s)",
+              mFlatTextLength, offset.inspect(), length.inspect(),
+              ToString(mContainerNode).c_str(), ToString(*mContent).c_str(),
+              NS_ConvertUTF16toUTF8(innerHTMLOfEditable).get())
+              .get());
+    }
+    MOZ_ASSERT(mFlatTextLength == offset.inspect() + length.inspect());
+    return;
+  }
+
+  MOZ_ASSERT(!mContent);
+  MOZ_ASSERT(mContainerNode->IsContent());
+  Result<uint32_t, nsresult> offset =
+      ComputeTextLengthBeforeFirstContentOf(*mContainerNode, aRootElement);
+  MOZ_ASSERT(offset.isOk());
+  if (mFlatTextLength != offset.inspect()) {
+    nsAutoString innerHTMLOfEditable;
+    const_cast<Element*>(aRootElement)
+        ->GetInnerHTML(innerHTMLOfEditable, IgnoreErrors());
+    NS_WARNING(nsPrintfCString(
+                   "mFlatTextLength=%u, offset: %u, mContainerNode:%s (%s)",
+                   mFlatTextLength, offset.inspect(),
+                   ToString(mContainerNode).c_str(),
+                   NS_ConvertUTF16toUTF8(innerHTMLOfEditable).get())
+                   .get());
+  }
+  MOZ_ASSERT(mFlatTextLength == offset.inspect());
+#endif  // #ifdef DEBUG
+}
+
+void IMEContentObserver::FlatTextCache::ContentAdded(
+    const char* aCallerName, const nsIContent& aFirstContent,
+    const nsIContent& aLastContent, const Maybe<uint32_t>& aAddedFlatTextLength,
+    const Element* aRootElement) {
+  MOZ_ASSERT(nsContentUtils::ComparePoints<TreeKind::ShadowIncludingDOM>(
+                 ConstRawRangeBoundary::FromChild(aFirstContent),
+                 ConstRawRangeBoundary::FromChild(aLastContent))
+                 .value() <= 0);
+  if (!mContainerNode) {
+    return;  
+  }
+
+  if (mContent && &aFirstContent == mContent->GetNextSibling()) {
+    return;
+  }
+
+  if (IsCachingToStartOfContainer()) {
+    MOZ_ASSERT(!mContent);
+    if (mContainerNode == aFirstContent.GetParentNode()) {
+      AssertValidCache(aRootElement);
+      return;
+    }
+
+    Clear(aCallerName);
+    return;
+  }
+
+  MOZ_ASSERT(IsCachingToEndOfContent());
+  MOZ_ASSERT(mContent);
+  if (aAddedFlatTextLength.isSome() &&
+      aLastContent.GetNextSibling() == mContent) {
+    CacheFlatTextLengthBeforeEndOfContent(
+        aCallerName, *mContent, mFlatTextLength + *aAddedFlatTextLength,
+        aRootElement);
+    return;
+  }
+
+  const bool addingEmptyNode = [&]() {
+    if (aAddedFlatTextLength.isSome()) {
+      return !aAddedFlatTextLength.value();
+    }
+    if (&aFirstContent != &aLastContent) {
+      return false;  
+    }
+    if (aFirstContent.IsText()) {
+      return !aFirstContent.AsText()->TextDataLength();
+    }
+    if (aFirstContent.IsCharacterData()) {
+      return true;  
+    }
+    if (aFirstContent.HasChildren()) {
+      return false;  
+    }
+    Result<uint32_t, nsresult> lengthOrError =
+        ComputeTextLengthOfContent(aFirstContent, aRootElement);
+    return lengthOrError.isOk() && !lengthOrError.unwrap();
+  }();
+  if (addingEmptyNode) {
+    return;
+  }
+
+  Clear(aCallerName);
+}
+
+void IMEContentObserver::FlatTextCache::ContentWillBeRemoved(
+    const nsIContent& aContent, uint32_t aFlatTextLengthOfContent,
+    const Element* aRootElement) {
+  if (!mContainerNode) {
+    return;  
+  }
+
+  if (mContent && mContent == aContent.GetPreviousSibling()) {
+    return;
+  }
+
+  if (IsCachingToStartOfContainer()) {
+    MOZ_ASSERT(!mContent);
+    if (mContainerNode == aContent.GetParentNode()) {
+      AssertValidCache(aRootElement);
+      return;
+    }
+
+    Clear(__FUNCTION__);
+    return;
+  }
+
+  MOZ_ASSERT(IsCachingToEndOfContent());
+  if (&aContent == mContent) {
+    MOZ_ASSERT(mFlatTextLength >= aFlatTextLengthOfContent);
+    if (NS_WARN_IF(mFlatTextLength < aFlatTextLengthOfContent)) {
+      Clear(__FUNCTION__);
+      return;
+    }
+    if (nsIContent* prevSibling = aContent.GetPreviousSibling()) {
+      CacheFlatTextLengthBeforeEndOfContent(
+          __FUNCTION__, *prevSibling,
+          mFlatTextLength - aFlatTextLengthOfContent, aRootElement);
+      return;
+    }
+    CacheFlatTextLengthBeforeFirstContent(
+        __FUNCTION__, *mContainerNode,
+        mFlatTextLength - aFlatTextLengthOfContent, aRootElement);
+    return;
+  }
+
+  if (!aFlatTextLengthOfContent) {
+    return;
+  }
+
+  Clear(__FUNCTION__);
+}
+
+
+void IMEContentObserver::AddedContentCache::Clear(const char* aCallerName) {
+  mFirst = nullptr;
+  mLast = nullptr;
+  MOZ_LOG(sCacheLog, LogLevel::Info,
+          ("AddedContentCache::Clear: called by %s",
+           ShortenFunctionName(aCallerName)));
+}
+
+bool IMEContentObserver::AddedContentCache::IsInRange(
+    const nsIContent& aContent, const dom::Element* aRootElement) const {
+  MOZ_ASSERT(HasCache());
+
+  const nsIContent* sibling = [&]() -> const nsIContent* {
+    const nsIContent* maybeSibling = &aContent;
+    const nsIContent* const container = mFirst->GetParent();
+    for (const nsIContent* ancestor : aContent.AncestorsOfType<nsIContent>()) {
+      if (ancestor == container) {
+        return maybeSibling;
+      }
+      if (ancestor == aRootElement) {
+        return nullptr;
+      }
+      maybeSibling = ancestor;
+    }
+    return nullptr;
+  }();
+  if (!sibling) {
+    return false;  
+  }
+  if (mFirst == sibling || mLast == sibling ||
+      (mFirst != mLast && (mFirst->GetNextSibling() == sibling ||
+                           sibling->GetNextSibling() == mLast))) {
+    return true;
+  }
+  if (mFirst == mLast || sibling->GetNextSibling() == mFirst ||
+      mLast->GetNextSibling() == sibling || !sibling->GetPreviousSibling() ||
+      !sibling->GetNextSibling()) {
+    return false;
+  }
+  const Maybe<uint32_t> index = aContent.ComputeIndexInParentNode();
+  MOZ_ASSERT(index.isSome());
+  const Maybe<uint32_t> firstIndex = mFirst->ComputeIndexInParentNode();
+  MOZ_ASSERT(firstIndex.isSome());
+  const Maybe<uint32_t> lastIndex = mLast->ComputeIndexInParentNode();
+  MOZ_ASSERT(lastIndex.isSome());
+  return firstIndex.value() < index.value() &&
+         index.value() < lastIndex.value();
+}
+
+bool IMEContentObserver::AddedContentCache::CanMergeWith(
+    const nsIContent& aFirstContent, const nsIContent& aLastContent,
+    const dom::Element* aRootElement) const {
+  MOZ_ASSERT(HasCache());
+  if (aLastContent.GetNextSibling() == mFirst ||
+      mLast->GetNextSibling() == &aFirstContent) {
+    return true;
+  }
+  MOZ_DIAGNOSTIC_ASSERT(aFirstContent.GetParentNode() ==
+                        aLastContent.GetParentNode());
+  if (mFirst->GetParentNode() != aFirstContent.GetParentNode()) {
+    return false;
+  }
+  const Maybe<uint32_t> newFirstIndex =
+      aFirstContent.ComputeIndexInParentNode();
+  MOZ_RELEASE_ASSERT(newFirstIndex.isSome());
+  const Maybe<uint32_t> newLastIndex =
+      &aFirstContent == &aLastContent ? newFirstIndex
+                                      : aLastContent.ComputeIndexInParentNode();
+  MOZ_RELEASE_ASSERT(newLastIndex.isSome());
+  const Maybe<uint32_t> currentFirstIndex = mFirst->ComputeIndexInParentNode();
+  MOZ_RELEASE_ASSERT(currentFirstIndex.isSome());
+  const Maybe<uint32_t> currentLastIndex =
+      mFirst == mLast ? currentFirstIndex : mLast->ComputeIndexInParentNode();
+  MOZ_RELEASE_ASSERT(currentLastIndex.isSome());
+  MOZ_ASSERT(!(newFirstIndex.value() < currentFirstIndex.value() &&
+               newLastIndex.value() > currentLastIndex.value()),
+             "New content nodes shouldn't contain mFirst nor mLast");
+  MOZ_ASSERT(!(newFirstIndex.value() < currentFirstIndex.value() &&
+               newLastIndex.value() > currentFirstIndex.value()),
+             "New content nodes shouldn't contain mFirst");
+  MOZ_ASSERT(!(newFirstIndex.value() < currentLastIndex.value() &&
+               newLastIndex.value() > currentLastIndex.value()),
+             "New content nodes shouldn't contain mLast");
+  return *newFirstIndex > *currentFirstIndex &&
+         *newLastIndex < *currentLastIndex;
+}
+
+bool IMEContentObserver::AddedContentCache::TryToCache(
+    const nsIContent& aFirstContent, const nsIContent& aLastContent,
+    const dom::Element* aRootElement) {
+  if (!HasCache()) {
+    mFirst = const_cast<nsIContent*>(&aFirstContent);
+    mLast = const_cast<nsIContent*>(&aLastContent);
+    MOZ_LOG(
+        sCacheLog, LogLevel::Info,
+        ("AddedContentCache::TryToCache: Starting to cache the range: %s - %s",
+         ToString(mFirst).c_str(), ToString(mLast).c_str()));
+    return true;
+  }
+  MOZ_ASSERT(mFirst != &aFirstContent);
+  MOZ_ASSERT(mLast != &aLastContent);
+  if (aLastContent.GetNextSibling() == mFirst) {
+    MOZ_ASSERT(CanMergeWith(aFirstContent, aLastContent, aRootElement));
+    mFirst = const_cast<nsIContent*>(&aFirstContent);
+    MOZ_LOG(
+        sCacheLog, LogLevel::Info,
+        ("AddedContentCache::TryToCache: Extending the range backward (to %s)",
+         ToString(mFirst).c_str()));
+    return true;
+  }
+  if (mLast->GetNextSibling() == &aFirstContent) {
+    MOZ_ASSERT(CanMergeWith(aFirstContent, aLastContent, aRootElement));
+    mLast = const_cast<nsIContent*>(&aLastContent);
+    MOZ_LOG(
+        sCacheLog, LogLevel::Info,
+        ("AddedContentCache::TryToCache: Extending the range forward (to %s)",
+         ToString(mLast).c_str()));
+    return true;
+  }
+
+  MOZ_DIAGNOSTIC_ASSERT(aFirstContent.GetParentNode() ==
+                        aLastContent.GetParentNode());
+  if (mFirst->GetParentNode() != aFirstContent.GetParentNode()) {
+    MOZ_ASSERT(!CanMergeWith(aFirstContent, aLastContent, aRootElement));
+    return false;
+  }
+  const Maybe<uint32_t> newFirstIndex =
+      aFirstContent.ComputeIndexInParentNode();
+  MOZ_RELEASE_ASSERT(newFirstIndex.isSome());
+  const Maybe<uint32_t> newLastIndex =
+      &aFirstContent == &aLastContent ? newFirstIndex
+                                      : aLastContent.ComputeIndexInParentNode();
+  MOZ_RELEASE_ASSERT(newLastIndex.isSome());
+  const Maybe<uint32_t> currentFirstIndex = mFirst->ComputeIndexInParentNode();
+  MOZ_RELEASE_ASSERT(currentFirstIndex.isSome());
+  const Maybe<uint32_t> currentLastIndex =
+      mFirst == mLast ? currentFirstIndex : mLast->ComputeIndexInParentNode();
+  MOZ_RELEASE_ASSERT(currentLastIndex.isSome());
+  MOZ_ASSERT(!(newFirstIndex.value() < currentFirstIndex.value() &&
+               newLastIndex.value() > currentLastIndex.value()),
+             "New content nodes shouldn't contain mFirst nor mLast");
+  MOZ_ASSERT(!(newFirstIndex.value() < currentFirstIndex.value() &&
+               newLastIndex.value() > currentFirstIndex.value()),
+             "New content nodes shouldn't contain mFirst");
+  MOZ_ASSERT(!(newFirstIndex.value() < currentLastIndex.value() &&
+               newLastIndex.value() > currentLastIndex.value()),
+             "New content nodes shouldn't contain mLast");
+  if (*newFirstIndex > *currentFirstIndex &&
+      *newLastIndex < *currentLastIndex) {
+    MOZ_ASSERT(CanMergeWith(aFirstContent, aLastContent, aRootElement));
+    MOZ_LOG(sCacheLog, LogLevel::Info,
+            ("AddedContentCache::TryToCache: New nodes in the range"));
+    return true;
+  }
+  MOZ_ASSERT(!CanMergeWith(aFirstContent, aLastContent, aRootElement));
+  return false;
+}
+
+Result<std::pair<uint32_t, uint32_t>, nsresult> IMEContentObserver::
+    AddedContentCache::ComputeFlatTextRangeBeforeInsertingNewContent(
+        const nsIContent& aNewFirstContent, const nsIContent& aNewLastContent,
+        const dom::Element* aRootElement,
+        OffsetAndLengthAdjustments& aDifferences) const {
+  MOZ_ASSERT(HasCache());
+  const Maybe<int32_t> newLastContentComparedWithCachedFirstContent =
+      nsContentUtils::ComparePoints<TreeKind::ShadowIncludingDOM>(
+          ConstRawRangeBoundary::FromChild(aNewLastContent),
+          ConstRawRangeBoundary::FromChild(*mFirst));
+  MOZ_RELEASE_ASSERT(newLastContentComparedWithCachedFirstContent.isSome());
+  MOZ_ASSERT(*newLastContentComparedWithCachedFirstContent != 0);
+  MOZ_ASSERT((*nsContentUtils::ComparePoints<TreeKind::ShadowIncludingDOM>(
+                  ConstRawRangeBoundary::FromChild(aNewFirstContent),
+                  ConstRawRangeBoundary::FromChild(*mFirst)) > 0) ==
+                 (*newLastContentComparedWithCachedFirstContent > 0),
+             "New nodes shouldn't contain mFirst");
+  const Maybe<int32_t> newFirstContentComparedWithCachedLastContent =
+      mLast->GetNextSibling() == &aNewFirstContent
+          ? Some(1)
+          : nsContentUtils::ComparePoints<TreeKind::ShadowIncludingDOM>(
+                ConstRawRangeBoundary::FromChild(aNewFirstContent),
+                ConstRawRangeBoundary::After(*mLast));
+  MOZ_RELEASE_ASSERT(newFirstContentComparedWithCachedLastContent.isSome());
+  MOZ_ASSERT(*newFirstContentComparedWithCachedLastContent != 0);
+  MOZ_ASSERT((*newFirstContentComparedWithCachedLastContent > 0) ==
+                 (*nsContentUtils::ComparePoints<TreeKind::ShadowIncludingDOM>(
+                      ConstRawRangeBoundary::FromChild(aNewLastContent),
+                      ConstRawRangeBoundary::After(*mLast)) > 0),
+             "New nodes shouldn't contain mLast");
+
+  Result<uint32_t, nsresult> length =
+      FlatTextCache::ComputeTextLengthStartOfContentToEndOfContent(
+          *mFirst, *mLast, aRootElement);
+  if (NS_WARN_IF(length.isErr())) {
+    return length.propagateErr();
+  }
+  Result<uint32_t, nsresult> offset =
+      FlatTextCache::ComputeTextLengthBeforeContent(*mFirst, aRootElement);
+  if (NS_WARN_IF(offset.isErr())) {
+    return offset.propagateErr();
+  }
+
+  if (*newFirstContentComparedWithCachedLastContent == 1u) {
+    aDifferences = OffsetAndLengthAdjustments{0, 0};
+    return std::make_pair(offset.inspect(), length.inspect());
+  }
+
+  Result<uint32_t, nsresult> newLength =
+      FlatTextCache::ComputeTextLengthStartOfContentToEndOfContent(
+          aNewFirstContent, aNewLastContent, aRootElement);
+  if (NS_WARN_IF(newLength.isErr())) {
+    return newLength.propagateErr();
+  }
+
+  if (*newLastContentComparedWithCachedFirstContent == 1u) {
+    MOZ_RELEASE_ASSERT(length.inspect() >= newLength.inspect());
+    aDifferences = OffsetAndLengthAdjustments{0, newLength.inspect()};
+    return std::make_pair(offset.inspect(),
+                          length.inspect() - newLength.inspect());
+  }
+
+  MOZ_RELEASE_ASSERT(offset.inspect() >= newLength.inspect());
+  aDifferences = OffsetAndLengthAdjustments{newLength.inspect(), 0};
+  return std::make_pair(offset.inspect() - newLength.inspect(),
+                        length.inspect());
+}
+
+}  

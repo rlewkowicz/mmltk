@@ -1,0 +1,51 @@
+// Copyright Mozilla Foundation. See the COPYRIGHT
+// file at the top-level directory of this distribution.
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// https://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+#ifndef chardetng_h
+#define chardetng_h
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <stdint.h>
+#include <stdbool.h>
+#include "encoding_rs.h"
+
+#ifndef CHARDETNG_ENCODING_DETECTOR
+#define CHARDETNG_ENCODING_DETECTOR EncodingDetector
+#ifndef __cplusplus
+typedef struct Detector_ EncodingDetector;
+#endif
+#endif
+
+CHARDETNG_ENCODING_DETECTOR* chardetng_encoding_detector_new(bool allow_iso_2022_jp);
+
+void chardetng_encoding_detector_free(CHARDETNG_ENCODING_DETECTOR* detector);
+
+bool chardetng_encoding_detector_tld_may_affect_guess(char const* tld, size_t tld_len);
+
+bool chardetng_encoding_detector_feed(
+    CHARDETNG_ENCODING_DETECTOR* detector,
+    uint8_t const* buffer,
+    size_t buffer_len,
+    bool last
+);
+
+ENCODING_RS_ENCODING const* chardetng_encoding_detector_guess(
+    CHARDETNG_ENCODING_DETECTOR const* detector,
+    char const* tld,
+    size_t tld_len,
+    bool allow_utf8
+);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // chardetng_h

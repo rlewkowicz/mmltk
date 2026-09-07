@@ -1,0 +1,48 @@
+
+[package]
+edition = "2021"
+rust-version = "1.82"
+name = "ixdtf"
+version = "0.6.4"
+authors = ["The ICU4X Project Developers"]
+build = false
+include = [
+    "data/**/*",
+    "src/**/*",
+    "examples/**/*",
+    "benches/**/*",
+    "tests/**/*",
+    "Cargo.toml",
+    "LICENSE",
+    "README.md",
+    "build.rs",
+]
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Parser for Internet eXtended DateTime Format"
+homepage = "https://icu4x.unicode.org"
+categories = ["internationalization"]
+license = "Unicode-3.0"
+repository = "https://github.com/unicode-org/icu4x"
+
+[package.metadata.workspaces]
+independent = true
+
+[package.metadata.docs.rs]
+all-features = true
+
+[package.metadata.cargo-semver-checks.lints]
+workspace = true
+
+[features]
+default = ["duration"]
+duration = []
+
+[lib]
+name = "ixdtf"
+path = "src/lib.rs"
+
+[dependencies]

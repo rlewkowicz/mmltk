@@ -1,0 +1,99 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef gc_AtomMarking_h
+#define gc_AtomMarking_h
+
+#include "mozilla/Atomics.h"
+
+#include "NamespaceImports.h"
+#include "gc/Cell.h"
+#include "js/Vector.h"
+#include "threading/ProtectedData.h"
+
+namespace js {
+
+class AutoLockGC;
+class DenseBitmap;
+
+namespace gc {
+
+class Arena;
+class GCRuntime;
+
+class AtomMarkingRuntime {
+  js::MainThreadData<Vector<size_t, 0, SystemAllocPolicy>> freeArenaIndexes;
+
+  js::GCLockData<Vector<size_t, 0, SystemAllocPolicy>> pendingFreeArenaIndexes;
+  mozilla::Atomic<bool, mozilla::Relaxed> hasPendingFreeArenaIndexes;
+
+  inline void markChildren(Zone* zone, JSAtom*);
+  inline void markChildren(Zone* zone, JS::Symbol* symbol);
+
+ public:
+  mozilla::Atomic<size_t, mozilla::SequentiallyConsistent> allocatedWords;
+
+  AtomMarkingRuntime() : allocatedWords(0) {}
+
+  size_t allocateIndex(GCRuntime* gc);
+
+  void freeIndex(size_t index, const AutoLockGC& lock);
+
+  void mergePendingFreeArenaIndexes(GCRuntime* gc);
+
+  void refineZoneBitmapsForCollectedZones(GCRuntime* gc);
+
+  UniquePtr<DenseBitmap> getOrMarkAtomsUsedByUncollectedZones(GCRuntime* gc);
+
+  void markAtomsUsedByUncollectedZones(GCRuntime* gc,
+                                       UniquePtr<DenseBitmap> markedUnion);
+
+  void unmarkAllGrayReferences(GCRuntime* gc);
+
+  static size_t getAtomBit(TenuredCell* thing);
+
+ private:
+  bool computeBitmapFromChunkMarkBits(GCRuntime* gc, DenseBitmap& bitmap);
+
+  void refineZoneBitmapForCollectedZone(Zone* zone, const DenseBitmap& bitmap);
+
+  void refineZoneBitmapForCollectedZone(Zone* zone, Arena* arena);
+
+ public:
+  template <typename T>
+  void markAtom(JSContext* cx, T* thing);
+
+  template <typename T, bool Fallible>
+  MOZ_ALWAYS_INLINE bool inlinedMarkAtomInternal(Zone* zone, T* thing);
+  template <typename T>
+  MOZ_ALWAYS_INLINE void inlinedMarkAtom(Zone* zone, T* thing);
+  template <typename T>
+  [[nodiscard]] MOZ_ALWAYS_INLINE bool inlinedMarkAtomFallible(Zone* zone,
+                                                               T* thing);
+
+  void markId(JSContext* cx, jsid id);
+  void markAtomValue(JSContext* cx, const Value& value);
+
+  template <typename T>
+  CellColor getAtomMarkColor(Zone* zone, T* thing);
+
+  template <typename T>
+  bool atomIsMarked(Zone* zone, T* thing) {
+    return getAtomMarkColor(zone, thing) != CellColor::White;
+  }
+
+  CellColor getAtomMarkColorForIndex(Zone* zone, size_t bitIndex);
+
+  void maybeUnmarkGrayAtomically(Zone* zone, JS::Symbol* symbol);
+
+#ifdef DEBUG
+  bool idIsMarked(Zone* zone, jsid id);
+  bool valueIsMarked(Zone* zone, const Value& value);
+#endif
+};
+
+}  
+}  
+
+#endif  // gc_AtomMarking_h

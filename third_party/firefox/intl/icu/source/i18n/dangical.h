@@ -1,0 +1,59 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+ *****************************************************************************
+ * Copyright (C) 2013, International Business Machines Corporation
+ * and others. All Rights Reserved.
+ *****************************************************************************
+ *
+ * File DANGICAL.H
+ *****************************************************************************
+ */
+
+#ifndef DANGICAL_H
+#define DANGICAL_H
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/calendar.h"
+#include "unicode/timezone.h"
+#include "chnsecal.h"
+
+U_NAMESPACE_BEGIN
+
+class DangiCalendar : public ChineseCalendar {
+ public:
+
+  DangiCalendar(const Locale& aLocale, UErrorCode &success);
+
+  DangiCalendar(const DangiCalendar& other);
+
+  virtual ~DangiCalendar();
+
+  virtual DangiCalendar* clone() const override;
+
+ private:
+
+ public: 
+  virtual UClassID getDynamicClassID() const override;
+
+  U_I18N_API static UClassID U_EXPORT2 getStaticClassID();
+
+  const char * getType() const override;
+
+ protected:
+  virtual Setting getSetting(UErrorCode& status) const override;
+
+ private:
+ 
+  DangiCalendar(); 
+};
+
+U_NAMESPACE_END
+
+#endif
+#endif
+
+
+

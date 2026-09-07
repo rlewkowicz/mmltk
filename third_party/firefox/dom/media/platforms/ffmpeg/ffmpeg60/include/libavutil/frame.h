@@ -1,0 +1,321 @@
+/*
+ * This file is part of FFmpeg.
+ *
+ * FFmpeg is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * FFmpeg is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with FFmpeg; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ */
+
+
+#ifndef AVUTIL_FRAME_H
+#define AVUTIL_FRAME_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include "avutil.h"
+#include "buffer.h"
+#include "channel_layout.h"
+#include "dict.h"
+#include "rational.h"
+#include "samplefmt.h"
+#include "pixfmt.h"
+#include "version.h"
+
+
+enum AVFrameSideDataType {
+  AV_FRAME_DATA_PANSCAN,
+  AV_FRAME_DATA_A53_CC,
+  AV_FRAME_DATA_STEREO3D,
+  AV_FRAME_DATA_MATRIXENCODING,
+  AV_FRAME_DATA_DOWNMIX_INFO,
+  AV_FRAME_DATA_REPLAYGAIN,
+  AV_FRAME_DATA_DISPLAYMATRIX,
+  AV_FRAME_DATA_AFD,
+  AV_FRAME_DATA_MOTION_VECTORS,
+  AV_FRAME_DATA_SKIP_SAMPLES,
+  AV_FRAME_DATA_AUDIO_SERVICE_TYPE,
+  AV_FRAME_DATA_MASTERING_DISPLAY_METADATA,
+  AV_FRAME_DATA_GOP_TIMECODE,
+
+  AV_FRAME_DATA_SPHERICAL,
+
+  AV_FRAME_DATA_CONTENT_LIGHT_LEVEL,
+
+  AV_FRAME_DATA_ICC_PROFILE,
+
+  AV_FRAME_DATA_S12M_TIMECODE,
+
+  AV_FRAME_DATA_DYNAMIC_HDR_PLUS,
+
+  AV_FRAME_DATA_REGIONS_OF_INTEREST,
+
+  AV_FRAME_DATA_VIDEO_ENC_PARAMS,
+
+  AV_FRAME_DATA_SEI_UNREGISTERED,
+
+  AV_FRAME_DATA_FILM_GRAIN_PARAMS,
+
+  AV_FRAME_DATA_DETECTION_BBOXES,
+
+  AV_FRAME_DATA_DOVI_RPU_BUFFER,
+
+  AV_FRAME_DATA_DOVI_METADATA,
+
+  AV_FRAME_DATA_DYNAMIC_HDR_VIVID,
+
+  AV_FRAME_DATA_AMBIENT_VIEWING_ENVIRONMENT,
+};
+
+enum AVActiveFormatDescription {
+  AV_AFD_SAME = 8,
+  AV_AFD_4_3 = 9,
+  AV_AFD_16_9 = 10,
+  AV_AFD_14_9 = 11,
+  AV_AFD_4_3_SP_14_9 = 13,
+  AV_AFD_16_9_SP_14_9 = 14,
+  AV_AFD_SP_4_3 = 15,
+};
+
+typedef struct AVFrameSideData {
+  enum AVFrameSideDataType type;
+  uint8_t* data;
+  size_t size;
+  AVDictionary* metadata;
+  AVBufferRef* buf;
+} AVFrameSideData;
+
+typedef struct AVRegionOfInterest {
+  uint32_t self_size;
+  int top;
+  int bottom;
+  int left;
+  int right;
+  AVRational qoffset;
+} AVRegionOfInterest;
+
+typedef struct AVFrame {
+#define AV_NUM_DATA_POINTERS 8
+  uint8_t* data[AV_NUM_DATA_POINTERS];
+
+  int linesize[AV_NUM_DATA_POINTERS];
+
+  uint8_t** extended_data;
+
+  int width, height;
+
+  int nb_samples;
+
+  int format;
+
+  int key_frame;
+
+  enum AVPictureType pict_type;
+
+  AVRational sample_aspect_ratio;
+
+  int64_t pts;
+
+  int64_t pkt_dts;
+
+  AVRational time_base;
+
+#if FF_API_FRAME_PICTURE_NUMBER
+  attribute_deprecated int coded_picture_number;
+  attribute_deprecated int display_picture_number;
+#endif
+
+  int quality;
+
+  void* opaque;
+
+  int repeat_pict;
+
+  int interlaced_frame;
+
+  int top_field_first;
+
+  int palette_has_changed;
+
+#if FF_API_REORDERED_OPAQUE
+  attribute_deprecated int64_t reordered_opaque;
+#endif
+
+  int sample_rate;
+
+#if FF_API_OLD_CHANNEL_LAYOUT
+  attribute_deprecated uint64_t channel_layout;
+#endif
+
+  AVBufferRef* buf[AV_NUM_DATA_POINTERS];
+
+  AVBufferRef** extended_buf;
+  int nb_extended_buf;
+
+  AVFrameSideData** side_data;
+  int nb_side_data;
+
+
+#define AV_FRAME_FLAG_CORRUPT (1 << 0)
+#define AV_FRAME_FLAG_DISCARD (1 << 2)
+
+  int flags;
+
+  /**
+   * MPEG vs JPEG YUV range.
+   * - encoding: Set by user
+   * - decoding: Set by libavcodec
+   */
+  enum AVColorRange color_range;
+
+  enum AVColorPrimaries color_primaries;
+
+  enum AVColorTransferCharacteristic color_trc;
+
+  /**
+   * YUV colorspace type.
+   * - encoding: Set by user
+   * - decoding: Set by libavcodec
+   */
+  enum AVColorSpace colorspace;
+
+  enum AVChromaLocation chroma_location;
+
+  /**
+   * frame timestamp estimated using various heuristics, in stream time base
+   * - encoding: unused
+   * - decoding: set by libavcodec, read by user.
+   */
+  int64_t best_effort_timestamp;
+
+  /**
+   * reordered pos from the last AVPacket that has been input into the decoder
+   * - encoding: unused
+   * - decoding: Read by user.
+   */
+  int64_t pkt_pos;
+
+#if FF_API_PKT_DURATION
+  /**
+   * duration of the corresponding packet, expressed in
+   * AVStream->time_base units, 0 if unknown.
+   * - encoding: unused
+   * - decoding: Read by user.
+   *
+   * @deprecated use duration instead
+   */
+  attribute_deprecated int64_t pkt_duration;
+#endif
+
+  /**
+   * metadata.
+   * - encoding: Set by user.
+   * - decoding: Set by libavcodec.
+   */
+  AVDictionary* metadata;
+
+  /**
+   * decode error flags of the frame, set to a combination of
+   * FF_DECODE_ERROR_xxx flags if the decoder produced a frame, but there
+   * were errors during the decoding.
+   * - encoding: unused
+   * - decoding: set by libavcodec, read by user.
+   */
+  int decode_error_flags;
+#define FF_DECODE_ERROR_INVALID_BITSTREAM 1
+#define FF_DECODE_ERROR_MISSING_REFERENCE 2
+#define FF_DECODE_ERROR_CONCEALMENT_ACTIVE 4
+#define FF_DECODE_ERROR_DECODE_SLICES 8
+
+#if FF_API_OLD_CHANNEL_LAYOUT
+  /**
+   * number of audio channels, only used for audio.
+   * - encoding: unused
+   * - decoding: Read by user.
+   * @deprecated use ch_layout instead
+   */
+  attribute_deprecated int channels;
+#endif
+
+  /**
+   * size of the corresponding packet containing the compressed
+   * frame.
+   * It is set to a negative value if unknown.
+   * - encoding: unused
+   * - decoding: set by libavcodec, read by user.
+   */
+  int pkt_size;
+
+  AVBufferRef* hw_frames_ctx;
+
+  AVBufferRef* opaque_ref;
+
+  size_t crop_top;
+  size_t crop_bottom;
+  size_t crop_left;
+  size_t crop_right;
+
+  AVBufferRef* private_ref;
+
+  AVChannelLayout ch_layout;
+
+  int64_t duration;
+} AVFrame;
+
+AVFrame* av_frame_alloc(void);
+
+void av_frame_free(AVFrame** frame);
+
+int av_frame_ref(AVFrame* dst, const AVFrame* src);
+
+AVFrame* av_frame_clone(const AVFrame* src);
+
+void av_frame_unref(AVFrame* frame);
+
+void av_frame_move_ref(AVFrame* dst, AVFrame* src);
+
+int av_frame_get_buffer(AVFrame* frame, int align);
+
+int av_frame_is_writable(AVFrame* frame);
+
+int av_frame_make_writable(AVFrame* frame);
+
+int av_frame_copy(AVFrame* dst, const AVFrame* src);
+
+int av_frame_copy_props(AVFrame* dst, const AVFrame* src);
+
+AVBufferRef* av_frame_get_plane_buffer(AVFrame* frame, int plane);
+
+AVFrameSideData* av_frame_new_side_data(AVFrame* frame,
+                                        enum AVFrameSideDataType type,
+                                        size_t size);
+
+AVFrameSideData* av_frame_new_side_data_from_buf(AVFrame* frame,
+                                                 enum AVFrameSideDataType type,
+                                                 AVBufferRef* buf);
+
+AVFrameSideData* av_frame_get_side_data(const AVFrame* frame,
+                                        enum AVFrameSideDataType type);
+
+void av_frame_remove_side_data(AVFrame* frame, enum AVFrameSideDataType type);
+
+enum {
+  AV_FRAME_CROP_UNALIGNED = 1 << 0,
+};
+
+int av_frame_apply_cropping(AVFrame* frame, int flags);
+
+const char* av_frame_side_data_name(enum AVFrameSideDataType type);
+
+
+#endif /* AVUTIL_FRAME_H */

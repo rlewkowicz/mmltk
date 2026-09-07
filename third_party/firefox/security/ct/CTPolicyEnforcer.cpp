@@ -1,0 +1,128 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "CTPolicyEnforcer.h"
+
+#include "mozilla/Assertions.h"
+#include "mozpkix/Time.h"
+#include <set>
+#include <stdint.h>
+
+namespace mozilla {
+namespace ct {
+
+using namespace mozilla::pkix;
+
+MOZ_RUNINIT const Duration ONE_HUNDRED_AND_EIGHTY_DAYS =
+    Duration(180 * Time::ONE_DAY_IN_SECONDS);
+size_t GetRequiredEmbeddedSctsCount(Duration certLifetime) {
+  return ONE_HUNDRED_AND_EIGHTY_DAYS < certLifetime ? 3 : 2;
+}
+
+uint64_t GetEffectiveCertIssuanceTime(const VerifiedSCTList& verifiedScts) {
+  uint64_t result = UINT64_MAX;
+  for (const VerifiedSCT& verifiedSct : verifiedScts) {
+    if (verifiedSct.logState == CTLogState::Admissible) {
+      result = std::min(result, verifiedSct.sct.timestamp);
+    }
+  }
+  return result;
+}
+
+bool LogWasQualifiedForSct(const VerifiedSCT& verifiedSct,
+                           uint64_t certIssuanceTime) {
+  switch (verifiedSct.logState) {
+    case CTLogState::Admissible:
+      return true;
+    case CTLogState::Retired: {
+      uint64_t logRetirementTime = verifiedSct.logTimestamp;
+      return certIssuanceTime < logRetirementTime &&
+             verifiedSct.sct.timestamp < logRetirementTime;
+    }
+  }
+  MOZ_ASSERT_UNREACHABLE("verifiedSct.logState must be Admissible or Retired");
+  return false;
+}
+
+CTPolicyCompliance EmbeddedSCTsCompliant(const VerifiedSCTList& verifiedScts,
+                                         uint64_t certIssuanceTime,
+                                         Duration certLifetime) {
+  size_t admissibleCount = 0;
+  size_t admissibleOrRetiredCount = 0;
+  std::set<CTLogOperatorId> logOperators;
+  std::set<Buffer> logIds;
+  for (const auto& verifiedSct : verifiedScts) {
+    if (verifiedSct.origin != SCTOrigin::Embedded) {
+      continue;
+    }
+    if (verifiedSct.logState != CTLogState::Admissible &&
+        !LogWasQualifiedForSct(verifiedSct, certIssuanceTime)) {
+      continue;
+    }
+    if (verifiedSct.logFormat == CTLogFormat::Tiled &&
+        verifiedSct.sct.leafIndex.isNothing()) {
+      continue;
+    }
+    if (verifiedSct.logState == CTLogState::Admissible) {
+      admissibleCount++;
+    }
+    if (LogWasQualifiedForSct(verifiedSct, certIssuanceTime)) {
+      admissibleOrRetiredCount++;
+      logIds.insert(verifiedSct.sct.logId);
+    }
+    logOperators.insert(verifiedSct.logOperatorId);
+  }
+
+  size_t requiredEmbeddedScts = GetRequiredEmbeddedSctsCount(certLifetime);
+  if (admissibleCount < 1 || admissibleOrRetiredCount < requiredEmbeddedScts) {
+    return CTPolicyCompliance::NotEnoughScts;
+  }
+  if (logIds.size() < requiredEmbeddedScts || logOperators.size() < 2) {
+    return CTPolicyCompliance::NotDiverseScts;
+  }
+  return CTPolicyCompliance::Compliant;
+}
+
+CTPolicyCompliance NonEmbeddedSCTsCompliant(
+    const VerifiedSCTList& verifiedScts) {
+  size_t admissibleCount = 0;
+  std::set<CTLogOperatorId> logOperators;
+  std::set<Buffer> logIds;
+  for (const auto& verifiedSct : verifiedScts) {
+    if (verifiedSct.origin == SCTOrigin::Embedded) {
+      continue;
+    }
+    if (verifiedSct.logState != CTLogState::Admissible) {
+      continue;
+    }
+    if (verifiedSct.logFormat == CTLogFormat::Tiled &&
+        verifiedSct.sct.leafIndex.isNothing()) {
+      continue;
+    }
+    admissibleCount++;
+    logIds.insert(verifiedSct.sct.logId);
+    logOperators.insert(verifiedSct.logOperatorId);
+  }
+
+  if (admissibleCount < 2) {
+    return CTPolicyCompliance::NotEnoughScts;
+  }
+  if (logIds.size() < 2 || logOperators.size() < 2) {
+    return CTPolicyCompliance::NotDiverseScts;
+  }
+  return CTPolicyCompliance::Compliant;
+}
+
+CTPolicyCompliance CheckCTPolicyCompliance(const VerifiedSCTList& verifiedScts,
+                                           Duration certLifetime) {
+  if (NonEmbeddedSCTsCompliant(verifiedScts) == CTPolicyCompliance::Compliant) {
+    return CTPolicyCompliance::Compliant;
+  }
+
+  uint64_t certIssuanceTime = GetEffectiveCertIssuanceTime(verifiedScts);
+  return EmbeddedSCTsCompliant(verifiedScts, certIssuanceTime, certLifetime);
+}
+
+}  
+}  

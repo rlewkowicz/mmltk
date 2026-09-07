@@ -1,0 +1,164 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ClearKeyCDM.h"
+
+#include "ClearKeyUtils.h"
+
+using namespace cdm;
+
+ClearKeyCDM::ClearKeyCDM(Host_11* aHost)
+    : mSessionManager(new ClearKeySessionManager(aHost)), mHost(aHost) {}
+
+void ClearKeyCDM::Initialize(bool aAllowDistinctiveIdentifier,
+                             bool aAllowPersistentState,
+                             bool aUseHardwareSecureCodecs) {
+  mSessionManager->Init(aAllowDistinctiveIdentifier, aAllowPersistentState);
+}
+
+void ClearKeyCDM::GetStatusForPolicy(uint32_t aPromiseId,
+                                     const Policy& aPolicy) {
+  const cdm::HdcpVersion kDeviceHdcpVersion = cdm::kHdcpVersion2_1;
+  if (aPolicy.min_hdcp_version <= kDeviceHdcpVersion) {
+    mHost->OnResolveKeyStatusPromise(aPromiseId, KeyStatus::kUsable);
+  } else {
+    mHost->OnResolveKeyStatusPromise(aPromiseId, KeyStatus::kOutputRestricted);
+  }
+}
+void ClearKeyCDM::SetServerCertificate(uint32_t aPromiseId,
+                                       const uint8_t* aServerCertificateData,
+                                       uint32_t aServerCertificateDataSize) {
+  mSessionManager->SetServerCertificate(aPromiseId, aServerCertificateData,
+                                        aServerCertificateDataSize);
+}
+
+void ClearKeyCDM::CreateSessionAndGenerateRequest(uint32_t aPromiseId,
+                                                  SessionType aSessionType,
+                                                  InitDataType aInitDataType,
+                                                  const uint8_t* aInitData,
+                                                  uint32_t aInitDataSize) {
+  mSessionManager->CreateSession(aPromiseId, aInitDataType, aInitData,
+                                 aInitDataSize, aSessionType);
+}
+
+void ClearKeyCDM::LoadSession(uint32_t aPromiseId, SessionType aSessionType,
+                              const char* aSessionId, uint32_t aSessionIdSize) {
+  mSessionManager->LoadSession(aPromiseId, aSessionId, aSessionIdSize);
+}
+
+void ClearKeyCDM::UpdateSession(uint32_t aPromiseId, const char* aSessionId,
+                                uint32_t aSessionIdSize,
+                                const uint8_t* aResponse,
+                                uint32_t aResponseSize) {
+  mSessionManager->UpdateSession(aPromiseId, aSessionId, aSessionIdSize,
+                                 aResponse, aResponseSize);
+}
+
+void ClearKeyCDM::CloseSession(uint32_t aPromiseId, const char* aSessionId,
+                               uint32_t aSessionIdSize) {
+  mSessionManager->CloseSession(aPromiseId, aSessionId, aSessionIdSize);
+}
+
+void ClearKeyCDM::RemoveSession(uint32_t aPromiseId, const char* aSessionId,
+                                uint32_t aSessionIdSize) {
+  mSessionManager->RemoveSession(aPromiseId, aSessionId, aSessionIdSize);
+}
+
+void ClearKeyCDM::TimerExpired(void* aContext) {
+  assert(false);
+}
+
+Status ClearKeyCDM::Decrypt(const InputBuffer_2& aEncryptedBuffer,
+                            DecryptedBlock* aDecryptedBuffer) {
+  if (mIsProtectionQueryEnabled) {
+    mSessionManager->QueryOutputProtectionStatusIfNeeded();
+  }
+  return mSessionManager->Decrypt(aEncryptedBuffer, aDecryptedBuffer);
+}
+
+Status ClearKeyCDM::InitializeAudioDecoder(
+    const AudioDecoderConfig_2& aAudioDecoderConfig) {
+  return Status::kDecodeError;
+}
+
+Status ClearKeyCDM::InitializeVideoDecoder(
+    const VideoDecoderConfig_2& aVideoDecoderConfig) {
+#ifdef ENABLE_WMF
+  mVideoDecoder = VideoDecoder::Create(mHost, aVideoDecoderConfig);
+  if (mVideoDecoder) {
+    return Status::kSuccess;
+  }
+#endif
+  return Status::kDecodeError;
+}
+
+void ClearKeyCDM::DeinitializeDecoder(StreamType aDecoderType) {
+#ifdef ENABLE_WMF
+  if (mVideoDecoder && aDecoderType == StreamType::kStreamTypeVideo) {
+    mVideoDecoder->DecodingComplete();
+    mVideoDecoder = nullptr;
+  }
+#endif
+}
+
+void ClearKeyCDM::ResetDecoder(StreamType aDecoderType) {
+#ifdef ENABLE_WMF
+  if (mVideoDecoder && aDecoderType == StreamType::kStreamTypeVideo) {
+    mVideoDecoder->Reset();
+  }
+#endif
+}
+
+Status ClearKeyCDM::DecryptAndDecodeFrame(const InputBuffer_2& aEncryptedBuffer,
+                                          VideoFrame* aVideoFrame) {
+#ifdef ENABLE_WMF
+  if (mIsProtectionQueryEnabled) {
+    mSessionManager->QueryOutputProtectionStatusIfNeeded();
+  }
+  if (mVideoDecoder) {
+    return mVideoDecoder->Decode(aEncryptedBuffer, aVideoFrame);
+  }
+#endif
+  return Status::kDecodeError;
+}
+
+Status ClearKeyCDM::DecryptAndDecodeSamples(
+    const InputBuffer_2& aEncryptedBuffer, AudioFrames* aAudioFrame) {
+  return Status::kDecodeError;
+}
+
+void ClearKeyCDM::OnPlatformChallengeResponse(
+    const PlatformChallengeResponse& aResponse) {
+  assert(false);
+}
+
+void ClearKeyCDM::OnQueryOutputProtectionStatus(
+    QueryResult aResult, uint32_t aLinkMask, uint32_t aOutputProtectionMask) {
+  MOZ_ASSERT(mIsProtectionQueryEnabled,
+             "Should only receive a protection status "
+             "mIsProtectionQueryEnabled is true");
+  mSessionManager->OnQueryOutputProtectionStatus(aResult, aLinkMask,
+                                                 aOutputProtectionMask);
+}
+
+void ClearKeyCDM::OnStorageId(uint32_t aVersion, const uint8_t* aStorageId,
+                              uint32_t aStorageIdSize) {
+  assert(false);
+}
+
+void ClearKeyCDM::Destroy() {
+  mSessionManager->DecryptingComplete();
+#ifdef ENABLE_WMF
+  if (mVideoDecoder) {
+    mVideoDecoder->DecodingComplete();
+  }
+#endif
+  delete this;
+}
+
+void ClearKeyCDM::EnableProtectionQuery() {
+  MOZ_ASSERT(!mIsProtectionQueryEnabled,
+             "Should not be called more than once per CDM");
+  mIsProtectionQueryEnabled = true;
+}

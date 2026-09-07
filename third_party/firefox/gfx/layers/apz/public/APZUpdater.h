@@ -1,0 +1,139 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_APZUpdater_h
+#define mozilla_layers_APZUpdater_h
+
+#include <deque>
+#include <unordered_map>
+
+#include "base/platform_thread.h"  // for PlatformThreadId
+#include "LayersTypes.h"
+#include "mozilla/layers/WebRenderScrollData.h"
+#include "mozilla/StaticMutex.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/webrender/WebRenderTypes.h"
+#include "nsThreadUtils.h"
+#include "Units.h"
+
+namespace mozilla {
+
+namespace layers {
+
+class APZCTreeManager;
+class FocusTarget;
+class WebRenderScrollData;
+
+class APZUpdater {
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(APZUpdater)
+
+ public:
+  APZUpdater(const RefPtr<APZCTreeManager>& aApz, bool aConnectedToWebRender);
+
+  bool HasTreeManager(const RefPtr<APZCTreeManager>& aApz);
+  void SetWebRenderWindowId(const wr::WindowId& aWindowId);
+
+  static void SetUpdaterThread(const wr::WrWindowId& aWindowId);
+  static void PrepareForSceneSwap(const wr::WrWindowId& aWindowId);
+  static void CompleteSceneSwap(const wr::WrWindowId& aWindowId,
+                                const wr::WrPipelineInfo& aInfo);
+  static void ProcessPendingTasks(const wr::WrWindowId& aWindowId);
+
+  void ClearTree(LayersId aRootLayersId);
+  void UpdateFocusState(LayersId aRootLayerTreeId,
+                        LayersId aOriginatingLayersId,
+                        const FocusTarget& aFocusTarget);
+  void UpdateScrollDataAndTreeState(LayersId aRootLayerTreeId,
+                                    LayersId aOriginatingLayersId,
+                                    const wr::Epoch& aEpoch,
+                                    WebRenderScrollData&& aScrollData);
+  void UpdateScrollOffsets(LayersId aRootLayerTreeId,
+                           LayersId aOriginatingLayersId,
+                           ScrollUpdatesMap&& aUpdates,
+                           uint32_t aPaintSequenceNumber);
+
+  void NotifyLayerTreeAdopted(LayersId aLayersId,
+                              const RefPtr<APZUpdater>& aOldUpdater);
+  void NotifyLayerTreeRemoved(LayersId aLayersId);
+
+
+  void SetTestAsyncScrollOffset(LayersId aLayersId,
+                                const ScrollableLayerGuid::ViewID& aScrollId,
+                                const CSSPoint& aOffset);
+  void SetTestAsyncZoom(LayersId aLayersId,
+                        const ScrollableLayerGuid::ViewID& aScrollId,
+                        const LayerToParentLayerScale& aZoom);
+
+  const WebRenderScrollData* GetScrollData(LayersId aLayersId) const;
+
+  void AssertOnUpdaterThread() const;
+
+  void AssertOnUpdaterThreadOrNotInitialized() const;
+
+  enum class DuringShutdown {
+    No,
+    Yes,
+  };
+  void RunOnUpdaterThread(LayersId aLayersId, already_AddRefed<Runnable> aTask,
+                          DuringShutdown aDuringShutdown = DuringShutdown::No);
+
+  bool IsUpdaterThread() const;
+
+  void RunOnControllerThread(LayersId aLayersId,
+                             already_AddRefed<Runnable> aTask);
+
+  void MarkAsDetached(LayersId aLayersId);
+
+ protected:
+  virtual ~APZUpdater();
+
+  bool IsConnectedToWebRender() const;
+
+  static already_AddRefed<APZUpdater> GetUpdater(
+      const wr::WrWindowId& aWindowId);
+
+  void ProcessQueue();
+
+ private:
+  bool HasUpdaterThread() const;
+
+  RefPtr<APZCTreeManager> mApz;
+  bool mDestroyed;
+  bool mConnectedToWebRender;
+
+  std::unordered_map<LayersId, WebRenderScrollData, LayersId::HashFn>
+      mScrollData;
+
+  struct EpochState {
+    wr::Epoch mRequired;
+    Maybe<wr::Epoch> mBuilt;
+    bool mIsRoot;
+
+    EpochState();
+
+    bool IsBlocked() const;
+  };
+
+  std::unordered_map<LayersId, EpochState, LayersId::HashFn> mEpochData;
+
+  static StaticMutex sWindowIdLock MOZ_UNANNOTATED;
+  static StaticAutoPtr<std::unordered_map<uint64_t, APZUpdater*>> sWindowIdMap;
+  Maybe<wr::WrWindowId> mWindowId;
+
+  mutable Mutex mThreadIdLock MOZ_UNANNOTATED;
+  Maybe<PlatformThreadId> mUpdaterThreadId;
+
+  struct QueuedTask {
+    LayersId mLayersId;
+    RefPtr<Runnable> mRunnable;
+  };
+
+  Mutex mQueueLock MOZ_UNANNOTATED;
+  std::deque<QueuedTask> mUpdaterQueue;
+};
+
+}  
+}  
+
+#endif  // mozilla_layers_APZUpdater_h

@@ -1,0 +1,248 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsAtom_h
+#define nsAtom_h
+
+#include <type_traits>
+
+#include "mozilla/Atomics.h"
+#include "mozilla/Char16.h"
+#include "mozilla/TextUtils.h"
+#include "mozilla/MemoryReporting.h"
+#include "nsISupports.h"
+#include "nsString.h"
+
+namespace mozilla {
+struct AtomsSizes;
+}  
+
+class nsStaticAtom;
+class nsDynamicAtom;
+
+class nsAtom {
+ public:
+  static constexpr bool ComputeIsAsciiLowercase(const char16_t* aString,
+                                                const uint32_t aLength) {
+    return std::all_of(aString, aString + aLength, [](char16_t c) {
+      return !mozilla::IsAsciiUppercaseAlpha(c);
+    });
+  }
+
+  template <size_t N>
+  static constexpr bool ComputeIsAsciiLowercase(const char16_t (&aString)[N]) {
+    return ComputeIsAsciiLowercase(aString, N - 1);
+  }
+
+  void AddSizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf,
+                              mozilla::AtomsSizes& aSizes) const;
+
+  bool Equals(char16ptr_t aString, uint32_t aLength) const {
+    return mLength == aLength &&
+           memcmp(GetUTF16String(), aString, mLength * sizeof(char16_t)) == 0;
+  }
+
+  bool Equals(const nsAString& aString) const {
+    return Equals(aString.Data(), aString.Length());
+  }
+
+  bool IsStatic() const { return mIsStatic; }
+  bool IsDynamic() const { return !IsStatic(); }
+
+  inline const nsStaticAtom* AsStatic() const;
+  inline const nsDynamicAtom* AsDynamic() const;
+  inline nsDynamicAtom* AsDynamic();
+
+  inline char16ptr_t GetUTF16String() const;
+
+  uint32_t GetLength() const { return mLength; }
+
+  operator mozilla::Span<const char16_t>() const {
+    return mozilla::Span<const char16_t>{GetUTF16String(), GetLength()};
+  }
+
+  void ToString(nsAString& aString) const;
+  void ToUTF8String(nsACString& aString) const;
+
+  uint32_t hash() const { return mHash; }
+
+  bool IsAsciiLowercase() const { return mIsAsciiLowercase; }
+
+  inline bool IsEmpty() const;
+
+  inline MozExternalRefCountType AddRef();
+  inline MozExternalRefCountType Release();
+
+  using HasThreadSafeRefCnt = std::true_type;
+
+ protected:
+  constexpr nsAtom(uint32_t aLength, bool aIsStatic, uint32_t aHash,
+                   bool aIsAsciiLowercase)
+      : mLength(aLength),
+        mIsStatic(aIsStatic),
+        mIsAsciiLowercase(aIsAsciiLowercase),
+        mHash(aHash) {}
+
+  ~nsAtom() = default;
+
+  const uint32_t mLength : 30;
+  const uint32_t mIsStatic : 1;
+  const uint32_t mIsAsciiLowercase : 1;
+  const uint32_t mHash;
+};
+
+class nsStaticAtom : public nsAtom {
+ public:
+  MozExternalRefCountType AddRef() = delete;
+  MozExternalRefCountType Release() = delete;
+
+  constexpr nsStaticAtom(uint32_t aLength, uint32_t aHash,
+                         uint32_t aStringOffset, bool aIsAsciiLowercase)
+      : nsAtom(aLength,  true, aHash, aIsAsciiLowercase),
+        mStringOffset(aStringOffset) {}
+
+  const char16_t* String() const {
+    return reinterpret_cast<const char16_t*>(uintptr_t(this) - mStringOffset);
+  }
+
+  already_AddRefed<nsAtom> ToAddRefed() {
+    return already_AddRefed<nsAtom>(static_cast<nsAtom*>(this));
+  }
+
+ private:
+  uint32_t mStringOffset;
+};
+
+class nsDynamicAtom : public nsAtom {
+ public:
+  MozExternalRefCountType AddRef() {
+    MOZ_ASSERT(int32_t(mRefCnt) >= 0, "illegal refcnt");
+    nsrefcnt count = ++mRefCnt;
+    if (count == 1) {
+      gUnusedAtomCount--;
+    }
+    return count;
+  }
+
+  MozExternalRefCountType Release() {
+#ifdef DEBUG
+    static const int32_t kAtomGCThreshold = 20;
+#else
+    static const int32_t kAtomGCThreshold = 10000;
+#endif
+
+    MOZ_ASSERT(int32_t(mRefCnt) > 0, "dup release");
+    nsrefcnt count = --mRefCnt;
+    if (count == 0) {
+      if (++gUnusedAtomCount >= kAtomGCThreshold) {
+        ScheduleAtomTableGC();
+      }
+    }
+
+    return count;
+  }
+
+  mozilla::StringBuffer* StringBuffer() const { return mStringBuffer; }
+
+  const char16_t* String() const {
+    return reinterpret_cast<const char16_t*>(mStringBuffer->Data());
+  }
+
+ private:
+  friend class nsAtomTable;
+  friend class nsAtomSubTable;
+  friend int32_t NS_GetUnusedAtomCount();
+
+  static mozilla::Atomic<int32_t, mozilla::ReleaseAcquire> gUnusedAtomCount;
+  static void ScheduleAtomTableGC();
+
+  nsDynamicAtom(already_AddRefed<mozilla::StringBuffer>, uint32_t aLength,
+                uint32_t aHash, bool aIsAsciiLowercase);
+  ~nsDynamicAtom() = default;
+
+  static nsDynamicAtom* Create(const nsAString& aString, uint32_t aHash);
+  static void Destroy(nsDynamicAtom* aAtom);
+
+  mozilla::ThreadSafeAutoRefCnt mRefCnt;
+  RefPtr<mozilla::StringBuffer> mStringBuffer;
+};
+
+const nsStaticAtom* nsAtom::AsStatic() const {
+  MOZ_ASSERT(IsStatic());
+  return static_cast<const nsStaticAtom*>(this);
+}
+
+const nsDynamicAtom* nsAtom::AsDynamic() const {
+  MOZ_ASSERT(IsDynamic());
+  return static_cast<const nsDynamicAtom*>(this);
+}
+
+nsDynamicAtom* nsAtom::AsDynamic() {
+  MOZ_ASSERT(IsDynamic());
+  return static_cast<nsDynamicAtom*>(this);
+}
+
+MozExternalRefCountType nsAtom::AddRef() {
+  return IsStatic() ? 2 : AsDynamic()->AddRef();
+}
+
+MozExternalRefCountType nsAtom::Release() {
+  return IsStatic() ? 1 : AsDynamic()->Release();
+}
+
+char16ptr_t nsAtom::GetUTF16String() const {
+  return IsStatic() ? AsStatic()->String() : AsDynamic()->String();
+}
+
+
+already_AddRefed<nsAtom> NS_Atomize(const char* aUTF8String);
+
+already_AddRefed<nsAtom> NS_Atomize(const nsACString& aUTF8String);
+
+already_AddRefed<nsAtom> NS_Atomize(const char16_t* aUTF16String);
+
+already_AddRefed<nsAtom> NS_Atomize(const nsAString& aUTF16String);
+
+already_AddRefed<nsAtom> NS_Atomize(const nsAString& aUTF16String,
+                                    uint32_t aKnownHash);
+
+already_AddRefed<nsAtom> NS_AtomizeMainThread(const nsAString& aUTF16String);
+
+nsrefcnt NS_GetNumberOfAtoms();
+
+nsStaticAtom* NS_GetStaticAtom(const nsAString& aUTF16String);
+
+class nsAtomString : public nsString {
+ public:
+  explicit nsAtomString(const nsAtom* aAtom) { aAtom->ToString(*this); }
+};
+
+class nsAtomCString : public nsCString {
+ public:
+  explicit nsAtomCString(const nsAtom* aAtom) { aAtom->ToUTF8String(*this); }
+};
+
+class nsAutoAtomCString : public nsAutoCString {
+ public:
+  explicit nsAutoAtomCString(const nsAtom* aAtom) {
+    aAtom->ToUTF8String(*this);
+  }
+};
+
+class nsDependentAtomString : public nsDependentString {
+ public:
+  explicit nsDependentAtomString(const nsAtom* aAtom)
+      : nsDependentString(
+            aAtom->GetUTF16String(), aAtom->GetLength(),
+            aAtom->IsStatic() ? DataFlags::LITERAL : DataFlags::STRINGBUFFER) {}
+};
+
+void ToLowerCaseASCII(RefPtr<nsAtom>& aAtom);
+
+inline std::ostream& operator<<(std::ostream& aStream, const nsAtom& aAtom) {
+  return aStream << (aAtom.IsDynamic() ? "nsDynamicAtom" : "nsStaticAtom")
+                 << " { " << nsAtomCString(&aAtom) << " }";
+}
+
+#endif  // nsAtom_h

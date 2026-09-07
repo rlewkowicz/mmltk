@@ -1,0 +1,162 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+#ifndef __NUMBER_LONGNAMES_H__
+#define __NUMBER_LONGNAMES_H__
+
+#include "cmemory.h"
+#include "unicode/listformatter.h"
+#include "unicode/uversion.h"
+#include "number_utils.h"
+#include "number_modifiers.h"
+
+U_NAMESPACE_BEGIN
+namespace number::impl {
+
+class LongNameHandler : public MicroPropsGenerator, public ModifierStore, public UMemory {
+  public:
+    static UnicodeString getUnitDisplayName(
+        const Locale& loc,
+        const MeasureUnit& unit,
+        UNumberUnitWidth width,
+        UErrorCode& status);
+
+    static UnicodeString getUnitPattern(
+        const Locale& loc,
+        const MeasureUnit& unit,
+        UNumberUnitWidth width,
+        StandardPlural::Form pluralForm,
+        UErrorCode& status);
+
+    static LongNameHandler*
+    forCurrencyLongNames(const Locale &loc, const CurrencyUnit &currency, const PluralRules *rules,
+                         const MicroPropsGenerator *parent, UErrorCode &status);
+
+    static void forMeasureUnit(const Locale &loc,
+                               const MeasureUnit &unitRef,
+                               const UNumberUnitWidth &width,
+                               const char *unitDisplayCase,
+                               const PluralRules *rules,
+                               const MicroPropsGenerator *parent,
+                               LongNameHandler *fillIn,
+                               UErrorCode &status);
+
+    void
+    processQuantity(DecimalQuantity &quantity, MicroProps &micros, UErrorCode &status) const override;
+
+    const Modifier* getModifier(Signum signum, StandardPlural::Form plural) const override;
+
+  private:
+    SimpleModifier fModifiers[StandardPlural::Form::COUNT];
+    const PluralRules *rules;
+    const MicroPropsGenerator *parent;
+    const char *gender = "";
+
+    LongNameHandler(const PluralRules *rules, const MicroPropsGenerator *parent)
+        : rules(rules), parent(parent) {
+    }
+
+    LongNameHandler() : rules(nullptr), parent(nullptr) {
+    }
+
+    friend class MemoryPool<LongNameHandler>;
+
+    friend class NumberFormatterImpl;
+
+    static void forArbitraryUnit(const Locale &loc,
+                                 const MeasureUnit &unit,
+                                 const UNumberUnitWidth &width,
+                                 const char *unitDisplayCase,
+                                 LongNameHandler *fillIn,
+                                 UErrorCode &status);
+
+    static void processPatternTimes(MeasureUnitImpl &&productUnit,
+                                    Locale loc,
+                                    const UNumberUnitWidth &width,
+                                    const char *caseVariant,
+                                    UnicodeString *outArray,
+                                    UErrorCode &status);
+
+    void simpleFormatsToModifiers(const UnicodeString *simpleFormats, Field field, UErrorCode &status);
+
+    void multiSimpleFormatsToModifiers(const UnicodeString *leadFormats, UnicodeString trailFormat,
+                                       Field field, UErrorCode &status);
+};
+
+class MixedUnitLongNameHandler : public MicroPropsGenerator, public ModifierStore, public UMemory {
+  public:
+    static void forMeasureUnit(const Locale &loc,
+                               const MeasureUnit &mixedUnit,
+                               const UNumberUnitWidth &width,
+                               const char *unitDisplayCase,
+                               const PluralRules *rules,
+                               const MicroPropsGenerator *parent,
+                               MixedUnitLongNameHandler *fillIn,
+                               UErrorCode &status);
+
+    void processQuantity(DecimalQuantity &quantity, MicroProps &micros,
+                         UErrorCode &status) const override;
+
+    const Modifier *getModifier(Signum signum, StandardPlural::Form plural) const override;
+
+  private:
+    const PluralRules *rules;
+
+    const MicroPropsGenerator *parent;
+
+    int32_t fMixedUnitCount = 1;
+
+    LocalArray<UnicodeString> fMixedUnitData;
+
+    LocalizedNumberFormatter fNumberFormatter;
+
+    LocalPointer<ListFormatter> fListFormatter;
+
+    MixedUnitLongNameHandler(const PluralRules *rules, const MicroPropsGenerator *parent)
+        : rules(rules), parent(parent) {
+    }
+
+    MixedUnitLongNameHandler() : rules(nullptr), parent(nullptr) {
+    }
+
+    friend class NumberFormatterImpl;
+
+    friend class MemoryPool<MixedUnitLongNameHandler>;
+
+    const Modifier *getMixedUnitModifier(DecimalQuantity &quantity, MicroProps &micros,
+                                         UErrorCode &status) const;
+};
+
+class LongNameMultiplexer : public MicroPropsGenerator, public UMemory {
+  public:
+    static LongNameMultiplexer *forMeasureUnits(const Locale &loc,
+                                                const MaybeStackVector<MeasureUnit> &units,
+                                                const UNumberUnitWidth &width,
+                                                const char *unitDisplayCase,
+                                                const PluralRules *rules,
+                                                const MicroPropsGenerator *parent,
+                                                UErrorCode &status);
+
+    void processQuantity(DecimalQuantity &quantity, MicroProps &micros,
+                         UErrorCode &status) const override;
+
+  private:
+    MemoryPool<LongNameHandler> fLongNameHandlers;
+    MemoryPool<MixedUnitLongNameHandler> fMixedUnitHandlers;
+    MaybeStackArray<MicroPropsGenerator *, 8> fHandlers;
+    LocalArray<MeasureUnit> fMeasureUnits;
+
+    const MicroPropsGenerator *fParent;
+
+    LongNameMultiplexer(const MicroPropsGenerator *parent) : fParent(parent) {
+    }
+};
+
+} 
+U_NAMESPACE_END
+
+#endif //__NUMBER_LONGNAMES_H__
+
+#endif /* #if !UCONFIG_NO_FORMATTING */

@@ -1,0 +1,309 @@
+/*
+ * Copyright 2021 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "src/sksl/ir/SkSLFunctionDefinition.h"
+
+#include "include/core/SkSpan.h"
+#include "include/core/SkTypes.h"
+#include "src/base/SkSafeMath.h"
+#include "src/sksl/SkSLAnalysis.h"
+#include "src/sksl/SkSLCompiler.h"
+#include "src/sksl/SkSLContext.h"
+#include "src/sksl/SkSLDefines.h"
+#include "src/sksl/SkSLErrorReporter.h"
+#include "src/sksl/SkSLOperator.h"
+#include "src/sksl/SkSLProgramSettings.h"
+#include "src/sksl/ir/SkSLBinaryExpression.h"
+#include "src/sksl/ir/SkSLBlock.h"
+#include "src/sksl/ir/SkSLExpression.h"
+#include "src/sksl/ir/SkSLExpressionStatement.h"
+#include "src/sksl/ir/SkSLFieldSymbol.h"
+#include "src/sksl/ir/SkSLIRHelpers.h"
+#include "src/sksl/ir/SkSLNop.h"
+#include "src/sksl/ir/SkSLReturnStatement.h"
+#include "src/sksl/ir/SkSLSwizzle.h"
+#include "src/sksl/ir/SkSLSymbol.h"
+#include "src/sksl/ir/SkSLSymbolTable.h"  // IWYU pragma: keep
+#include "src/sksl/ir/SkSLType.h"
+#include "src/sksl/ir/SkSLVarDeclarations.h"
+#include "src/sksl/ir/SkSLVariable.h"
+#include "src/sksl/ir/SkSLVariableReference.h"
+#include "src/sksl/transform/SkSLProgramWriter.h"
+
+#include <algorithm>
+#include <cstddef>
+#include <forward_list>
+
+namespace SkSL {
+
+static void append_rtadjust_fixup_to_vertex_main(const Context& context,
+                                                 const FunctionDeclaration& decl,
+                                                 Block& body) {
+    if (const SkSL::Symbol* rtAdjust = context.fSymbolTable->find(Compiler::RTADJUST_NAME)) {
+        struct AppendRTAdjustFixupHelper : public IRHelpers {
+            AppendRTAdjustFixupHelper(const Context& ctx, const SkSL::Symbol* rtAdjust)
+                    : IRHelpers(ctx)
+                    , fRTAdjust(rtAdjust) {
+                fSkPositionField = &fContext.fSymbolTable->find(Compiler::POSITION_NAME)
+                                                         ->as<FieldSymbol>();
+            }
+
+            std::unique_ptr<Expression> Pos() const {
+                return Field(&fSkPositionField->owner(), fSkPositionField->fieldIndex());
+            }
+
+            std::unique_ptr<Expression> Adjust() const {
+                return fRTAdjust->instantiate(fContext, Position());
+            }
+
+            std::unique_ptr<Statement> makeFixupStmt() const {
+                return Assign(
+                   Pos(),
+                   CtorXYZW(Add(Mul(Swizzle(Pos(),    {SwizzleComponent::X, SwizzleComponent::Y}),
+                                    Swizzle(Adjust(), {SwizzleComponent::X, SwizzleComponent::Z})),
+                                Mul(Swizzle(Pos(),    {SwizzleComponent::W, SwizzleComponent::W}),
+                                    Swizzle(Adjust(), {SwizzleComponent::Y, SwizzleComponent::W}))),
+                            Float(0.0),
+                            Swizzle(Pos(), {SwizzleComponent::W})));
+            }
+
+            const FieldSymbol* fSkPositionField;
+            const SkSL::Symbol* fRTAdjust;
+        };
+
+        AppendRTAdjustFixupHelper helper(context, rtAdjust);
+        body.children().push_back(helper.makeFixupStmt());
+    }
+}
+
+std::unique_ptr<FunctionDefinition> FunctionDefinition::Convert(const Context& context,
+                                                                Position pos,
+                                                                const FunctionDeclaration& function,
+                                                                std::unique_ptr<Statement> body) {
+    class Finalizer : public ProgramWriter {
+    public:
+        Finalizer(const Context& context, const FunctionDeclaration& function, Position pos)
+            : fContext(context)
+            , fFunction(function) {
+            for (const Variable* var : function.parameters()) {
+                this->addLocalVariable(var, pos);
+            }
+        }
+
+        ~Finalizer() override {
+            SkASSERT(fBreakableLevel == 0);
+            SkASSERT(fContinuableLevel == std::forward_list<int>{0});
+        }
+
+        void addLocalVariable(const Variable* var, Position pos) {
+            if (var->type().isOrContainsUnsizedArray()) {
+                if (var->storage() != Variable::Storage::kParameter) {
+                    fContext.fErrors->error(pos, "unsized arrays are not permitted here");
+                }
+                return;
+            }
+            size_t prevSlotsUsed = fSlotsUsed;
+            fSlotsUsed = SkSafeMath::Add(fSlotsUsed, var->type().slotCount());
+            if (prevSlotsUsed < kVariableSlotLimit && fSlotsUsed >= kVariableSlotLimit) {
+                fContext.fErrors->error(pos, "variable '" + std::string(var->name()) +
+                                             "' exceeds the stack size limit");
+            }
+        }
+
+        void fuseVariableDeclarationsWithInitialization(std::unique_ptr<Statement>& stmt) {
+            switch (stmt->kind()) {
+                case Statement::Kind::kNop:
+                case Statement::Kind::kBlock:
+                    break;
+
+                case Statement::Kind::kVarDeclaration:
+                    if (VarDeclaration& decl = stmt->as<VarDeclaration>(); !decl.value()) {
+                        fUninitializedVarDecl = &decl;
+                        break;
+                    }
+                    [[fallthrough]];
+
+                default:
+                    fUninitializedVarDecl = nullptr;
+                    break;
+
+                case Statement::Kind::kExpression: {
+                    if (fUninitializedVarDecl) {
+                        VarDeclaration* vardecl = fUninitializedVarDecl;
+                        fUninitializedVarDecl = nullptr;
+
+                        std::unique_ptr<Expression>& nextExpr = stmt->as<ExpressionStatement>()
+                                                                     .expression();
+                        if (!nextExpr->is<BinaryExpression>()) {
+                            break;
+                        }
+                        BinaryExpression& binaryExpr = nextExpr->as<BinaryExpression>();
+                        if (binaryExpr.getOperator().kind() != OperatorKind::EQ) {
+                            break;
+                        }
+                        Expression& leftExpr = *binaryExpr.left();
+                        if (!leftExpr.is<VariableReference>()) {
+                            break;
+                        }
+                        VariableReference& varRef = leftExpr.as<VariableReference>();
+                        if (varRef.variable() != vardecl->var()) {
+                            break;
+                        }
+                        if (Analysis::ContainsVariable(*binaryExpr.right(), *varRef.variable())) {
+                            break;
+                        }
+                        vardecl->value() = std::move(binaryExpr.right());
+
+                        stmt = Nop::Make();
+                    }
+                    break;
+                }
+            }
+        }
+
+        bool functionReturnsValue() const {
+            return !fFunction.returnType().isVoid();
+        }
+
+        bool visitExpressionPtr(std::unique_ptr<Expression>& expr) override {
+            return false;
+        }
+
+        bool visitStatementPtr(std::unique_ptr<Statement>& stmt) override {
+            if (fContext.fConfig->fSettings.fOptimize) {
+                this->fuseVariableDeclarationsWithInitialization(stmt);
+            }
+
+            switch (stmt->kind()) {
+                case Statement::Kind::kVarDeclaration:
+                    this->addLocalVariable(stmt->as<VarDeclaration>().var(), stmt->fPosition);
+                    break;
+
+                case Statement::Kind::kReturn: {
+                    if (ProgramConfig::IsVertex(fContext.fConfig->fKind) && fFunction.isMain()) {
+                        fContext.fErrors->error(
+                                stmt->fPosition,
+                                "early returns from vertex programs are not supported");
+                    }
+
+                    ReturnStatement& returnStmt = stmt->as<ReturnStatement>();
+                    if (returnStmt.expression()) {
+                        if (this->functionReturnsValue()) {
+                            returnStmt.setExpression(fFunction.returnType().coerceExpression(
+                                    std::move(returnStmt.expression()), fContext));
+                        } else {
+                            fContext.fErrors->error(returnStmt.expression()->fPosition,
+                                                    "may not return a value from a void function");
+                            returnStmt.setExpression(nullptr);
+                        }
+                    } else {
+                        if (this->functionReturnsValue()) {
+                            fContext.fErrors->error(returnStmt.fPosition,
+                                                    "expected function to return '" +
+                                                    fFunction.returnType().displayName() + "'");
+                        }
+                    }
+                    break;
+                }
+                case Statement::Kind::kDo:
+                case Statement::Kind::kFor: {
+                    ++fBreakableLevel;
+                    ++fContinuableLevel.front();
+                    bool result = INHERITED::visitStatementPtr(stmt);
+                    --fContinuableLevel.front();
+                    --fBreakableLevel;
+                    return result;
+                }
+                case Statement::Kind::kSwitch: {
+                    ++fBreakableLevel;
+                    fContinuableLevel.push_front(0);
+                    bool result = INHERITED::visitStatementPtr(stmt);
+                    fContinuableLevel.pop_front();
+                    --fBreakableLevel;
+                    return result;
+                }
+                case Statement::Kind::kBreak:
+                    if (fBreakableLevel == 0) {
+                        fContext.fErrors->error(stmt->fPosition,
+                                                "break statement must be inside a loop or switch");
+                    }
+                    break;
+
+                case Statement::Kind::kContinue:
+                    if (fContinuableLevel.front() == 0) {
+                        if (std::any_of(fContinuableLevel.begin(),
+                                        fContinuableLevel.end(),
+                                        [](int level) { return level > 0; })) {
+                            fContext.fErrors->error(stmt->fPosition,
+                                                   "continue statement cannot be used in a switch");
+                        } else {
+                            fContext.fErrors->error(stmt->fPosition,
+                                                    "continue statement must be inside a loop");
+                        }
+                    }
+                    break;
+
+                default:
+                    break;
+            }
+            return INHERITED::visitStatementPtr(stmt);
+        }
+
+    private:
+        const Context& fContext;
+        const FunctionDeclaration& fFunction;
+        int fBreakableLevel = 0;
+        size_t fSlotsUsed = 0;
+        std::forward_list<int> fContinuableLevel{0};
+        VarDeclaration* fUninitializedVarDecl = nullptr;
+
+        using INHERITED = ProgramWriter;
+    };
+
+    if (function.isIntrinsic()) {
+        context.fErrors->error(pos, "intrinsic function '" + std::string(function.name()) +
+                                    "' should not have a definition");
+        return nullptr;
+    }
+
+    if (!body || !body->is<Block>() || !body->as<Block>().isScope()) {
+        context.fErrors->error(pos, "function body '" + function.description() +
+                                    "' must be a braced block");
+        return nullptr;
+    }
+
+    if (function.definition()) {
+        context.fErrors->error(pos, "function '" + function.description() +
+                                    "' was already defined");
+        return nullptr;
+    }
+
+    Finalizer(context, function, pos).visitStatementPtr(body);
+    if (function.isMain() && ProgramConfig::IsVertex(context.fConfig->fKind)) {
+        append_rtadjust_fixup_to_vertex_main(context, function, body->as<Block>());
+    }
+
+    if (Analysis::CanExitWithoutReturningValue(function, *body)) {
+        context.fErrors->error(body->fPosition, "function '" + std::string(function.name()) +
+                                                "' can exit without returning a value");
+    }
+
+    return FunctionDefinition::Make(context, pos, function, std::move(body));
+}
+
+std::unique_ptr<FunctionDefinition> FunctionDefinition::Make(const Context& context,
+                                                             Position pos,
+                                                             const FunctionDeclaration& function,
+                                                             std::unique_ptr<Statement> body) {
+    SkASSERT(!function.isIntrinsic());
+    SkASSERT(body && body->as<Block>().isScope());
+    SkASSERT(!function.definition());
+
+    return std::make_unique<FunctionDefinition>(pos, &function, std::move(body));
+}
+
+}  

@@ -1,0 +1,187 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_GFX_RENDERCOMPOSITOR_NATIVE_H
+#define MOZILLA_GFX_RENDERCOMPOSITOR_NATIVE_H
+
+#include <deque>
+#include <unordered_map>
+
+#include "GLTypes.h"
+#include "mozilla/HashFunctions.h"
+#include "mozilla/webrender/RenderCompositor.h"
+#include "mozilla/TimeStamp.h"
+
+namespace mozilla {
+
+namespace layers {
+class GpuFence;
+class NativeLayerRootSnapshotter;
+class NativeLayerRoot;
+class NativeLayer;
+class SurfacePoolHandle;
+}  
+
+namespace wr {
+
+class RenderCompositorNative : public RenderCompositor {
+ public:
+  virtual ~RenderCompositorNative();
+
+  bool BeginFrame() override;
+  RenderedFrameId EndFrame(const nsTArray<DeviceIntRect>& aDirtyRects) final;
+  void Pause() override;
+  bool Resume() override;
+
+  layers::WebRenderCompositor CompositorType() const override;
+
+  LayoutDeviceIntSize GetBufferSize() override;
+
+  bool ShouldUseNativeCompositor() override;
+  void GetCompositorCapabilities(CompositorCapabilities* aCaps) override;
+
+  bool SurfaceOriginIsTopLeft() override { return true; }
+
+  bool MaybeReadback(const gfx::IntSize& aReadbackSize,
+                     const wr::ImageFormat& aReadbackFormat,
+                     const Range<uint8_t>& aReadbackBuffer,
+                     bool* aNeedsYFlip) override;
+  bool MaybeRecordFrame(layers::CompositionRecorder& aRecorder) override;
+
+  void WaitUntilPresentationFlushed() override;
+
+  void CompositorBeginFrame() override;
+  void CompositorEndFrame() override;
+  void CreateSurface(wr::NativeSurfaceId aId, wr::DeviceIntPoint aVirtualOffset,
+                     wr::DeviceIntSize aTileSize, bool aIsOpaque) override;
+  void CreateExternalSurface(wr::NativeSurfaceId aId, bool aIsOpaque) override;
+  void CreateBackdropSurface(wr::NativeSurfaceId aId,
+                             wr::ColorF aColor) override;
+  void DestroySurface(NativeSurfaceId aId) override;
+  void CreateTile(wr::NativeSurfaceId aId, int32_t aX, int32_t aY) override;
+  void DestroyTile(wr::NativeSurfaceId aId, int32_t aX, int32_t aY) override;
+  void AttachExternalImage(wr::NativeSurfaceId aId,
+                           wr::ExternalImageId aExternalImage) override;
+  void AddSurface(wr::NativeSurfaceId aId,
+                  const wr::CompositorSurfaceTransform& aTransform,
+                  wr::DeviceIntRect aClipRect,
+                  wr::ImageRendering aImageRendering,
+                  wr::DeviceIntRect aRoundedClipRect,
+                  wr::ClipRadius aClipRadius) override;
+
+  struct TileKey {
+    TileKey(int32_t aX, int32_t aY) : mX(aX), mY(aY) {}
+
+    int32_t mX;
+    int32_t mY;
+  };
+
+ protected:
+  explicit RenderCompositorNative(
+      const RefPtr<widget::CompositorWidget>& aWidget,
+      gl::GLContext* aGL = nullptr);
+
+  virtual bool InitDefaultFramebuffer(const gfx::IntRect& aBounds) = 0;
+  virtual void DoSwap() = 0;
+  virtual void DoFlush() {}
+
+  void BindNativeLayer(wr::NativeTileId aId, const gfx::IntRect& aDirtyRect);
+  void UnbindNativeLayer();
+
+  RefPtr<layers::NativeLayerRoot> mNativeLayerRoot;
+  UniquePtr<layers::NativeLayerRootSnapshotter> mNativeLayerRootSnapshotter;
+  RefPtr<layers::NativeLayer> mNativeLayerForEntireWindow;
+  RefPtr<layers::SurfacePoolHandle> mSurfacePoolHandle;
+
+  struct TileKeyHashFn {
+    std::size_t operator()(const TileKey& aId) const {
+      return HashGeneric(aId.mX, aId.mY);
+    }
+  };
+
+  struct Surface {
+    Surface(wr::DeviceIntSize aTileSize, bool aIsOpaque);
+    ~Surface();
+
+    gfx::IntSize TileSize() const {
+      return gfx::IntSize(mTileSize.width, mTileSize.height);
+    }
+
+    wr::DeviceIntSize mTileSize;
+    bool mIsOpaque;
+    bool mIsExternal = false;
+    std::unordered_map<TileKey, RefPtr<layers::NativeLayer>, TileKeyHashFn>
+        mNativeLayers;
+  };
+
+  struct SurfaceIdHashFn {
+    std::size_t operator()(const wr::NativeSurfaceId& aId) const {
+      return HashGeneric(wr::AsUint64(aId));
+    }
+  };
+
+  RefPtr<layers::NativeLayer> mCurrentlyBoundNativeLayer;
+  nsTArray<RefPtr<layers::NativeLayer>> mAddedLayers;
+  uint64_t mTotalTilePixelCount = 0;
+  uint64_t mAddedTilePixelCount = 0;
+  uint64_t mAddedClippedPixelCount = 0;
+  uint64_t mDrawnPixelCount = 0;
+  gfx::IntRect mVisibleBounds;
+  std::unordered_map<wr::NativeSurfaceId, Surface, SurfaceIdHashFn> mSurfaces;
+  TimeStamp mBeginFrameTimeStamp;
+  std::deque<RefPtr<layers::GpuFence>> mPendingGpuFeces;
+};
+
+static inline bool operator==(const RenderCompositorNative::TileKey& a0,
+                              const RenderCompositorNative::TileKey& a1) {
+  return a0.mX == a1.mX && a0.mY == a1.mY;
+}
+
+class RenderCompositorNativeOGL : public RenderCompositorNative {
+ public:
+  static UniquePtr<RenderCompositor> Create(
+      const RefPtr<widget::CompositorWidget>& aWidget, nsACString& aError);
+
+  RenderCompositorNativeOGL(const RefPtr<widget::CompositorWidget>& aWidget,
+                            RefPtr<gl::GLContext>&& aGL);
+  virtual ~RenderCompositorNativeOGL();
+
+  bool WaitForGPU() override;
+
+  gl::GLContext* gl() const override { return mGL; }
+
+  void Bind(wr::NativeTileId aId, wr::DeviceIntPoint* aOffset, uint32_t* aFboId,
+            wr::DeviceIntRect aDirtyRect,
+            wr::DeviceIntRect aValidRect) override;
+  void Unbind() override;
+
+  void AttachExternalImage(wr::NativeSurfaceId aId,
+                           wr::ExternalImageId aExternalImage) override;
+
+ protected:
+  void InsertFrameDoneSync();
+
+  bool InitDefaultFramebuffer(const gfx::IntRect& aBounds) override;
+  void DoSwap() override;
+  void DoFlush() override;
+
+  RefPtr<gl::GLContext> mGL;
+
+  struct BackPressureFences {
+    explicit BackPressureFences(
+        std::deque<RefPtr<layers::GpuFence>>&& aGpuFeces)
+        : mGpuFeces(std::move(aGpuFeces)) {}
+
+    GLsync mSync = nullptr;
+    std::deque<RefPtr<layers::GpuFence>> mGpuFeces;
+  };
+
+  UniquePtr<BackPressureFences> mPreviousFrameDoneFences;
+  UniquePtr<BackPressureFences> mThisFrameDoneFences;
+};
+
+}  
+}  
+
+#endif

@@ -1,0 +1,33 @@
+
+#![warn(rust_2018_idioms)]
+
+use std::env;
+
+include!("no_atomic.rs");
+include!("build-common.rs");
+
+fn main() {
+    println!("cargo:rerun-if-changed=no_atomic.rs");
+    println!("cargo:rustc-check-cfg=cfg(crossbeam_no_atomic,crossbeam_sanitize_thread)");
+
+    let target = match env::var("TARGET") {
+        Ok(target) => convert_custom_linux_target(target),
+        Err(e) => {
+            println!(
+                "cargo:warning={}: unable to get TARGET environment variable: {}",
+                env!("CARGO_PKG_NAME"),
+                e
+            );
+            return;
+        }
+    };
+
+    if NO_ATOMIC.contains(&&*target) {
+        println!("cargo:rustc-cfg=crossbeam_no_atomic");
+    }
+
+    let sanitize = env::var("CARGO_CFG_SANITIZE").unwrap_or_default();
+    if sanitize.contains("thread") {
+        println!("cargo:rustc-cfg=crossbeam_sanitize_thread");
+    }
+}

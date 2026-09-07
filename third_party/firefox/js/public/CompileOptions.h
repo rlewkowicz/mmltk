@@ -1,0 +1,643 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef js_CompileOptions_h
+#define js_CompileOptions_h
+
+#include "mozilla/Assertions.h"       // MOZ_ASSERT
+#include "mozilla/MemoryReporting.h"  // mozilla::MallocSizeOf
+
+#include <stddef.h>  // size_t
+#include <stdint.h>  // uint8_t, uint32_t
+
+#include "jstypes.h"  // JS_PUBLIC_API
+
+#include "js/CharacterEncoding.h"  // JS::ConstUTF8CharsZ
+#include "js/ColumnNumber.h"       // JS::ColumnNumberOneOrigin
+#include "js/Prefs.h"              // JS::Prefs::*
+#include "js/TypeDecls.h"          // JS::MutableHandle (fwd)
+
+namespace js {
+class FrontendContext;
+}  
+
+namespace JS {
+using FrontendContext = js::FrontendContext;
+
+#define FOREACH_DELAZIFICATION_STRATEGY(_)                                     \
+                                        \
+  _(OnDemandOnly)                                                              \
+                                                                               \
+                                                                            \
+  _(CheckConcurrentWithOnDemand)                                               \
+                                                                               \
+                                                                            \
+  _(ConcurrentDepthFirst)                                                      \
+                                                                               \
+                                                                            \
+  _(ConcurrentLargeFirst)                                                      \
+                                                                               \
+                                                                            \
+  _(ParseEverythingEagerly)
+
+enum class DelazificationOption : uint8_t {
+#define _ENUM_ENTRY(Name) Name,
+  FOREACH_DELAZIFICATION_STRATEGY(_ENUM_ENTRY)
+#undef _ENUM_ENTRY
+};
+
+enum class EagerBaselineOption : uint8_t { None, JitHints, Aggressive };
+
+class JS_PUBLIC_API InstantiateOptions;
+class JS_PUBLIC_API ReadOnlyDecodeOptions;
+
+class JS_PUBLIC_API PrefableCompileOptions {
+ public:
+  PrefableCompileOptions()
+      : sourcePragmas_(true),
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+        explicitResourceManagement_(
+            JS::Prefs::experimental_explicit_resource_management()),
+#endif
+        sourcePhaseImports_(JS::Prefs::experimental_source_phase_imports()) {
+  }
+
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+  bool explicitResourceManagement() const {
+    return explicitResourceManagement_;
+  }
+  PrefableCompileOptions& setExplicitResourceManagement(bool enabled) {
+    explicitResourceManagement_ = enabled;
+    return *this;
+  }
+#endif
+
+  bool sourcePhaseImports() const { return sourcePhaseImports_; }
+  PrefableCompileOptions& setSourcePhaseImports(bool enabled) {
+    sourcePhaseImports_ = enabled;
+    return *this;
+  }
+
+  bool sourcePragmas() const { return sourcePragmas_; }
+  PrefableCompileOptions& setSourcePragmas(bool flag) {
+    sourcePragmas_ = flag;
+    return *this;
+  }
+
+#if defined(DEBUG) || defined(JS_JITSPEW)
+  template <typename Printer>
+  void dumpWith(Printer& print) const {
+#  define PrintFields_(Name) print(#Name, Name)
+    PrintFields_(sourcePragmas_);
+#  ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+    PrintFields_(explicitResourceManagement_);
+#  endif
+    PrintFields_(sourcePhaseImports_);
+#  undef PrintFields_
+  }
+#endif  // defined(DEBUG) || defined(JS_JITSPEW)
+
+ private:
+
+  bool sourcePragmas_ : 1;
+
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+  bool explicitResourceManagement_ : 1;
+#endif
+
+  bool sourcePhaseImports_ : 1;
+};
+
+class JS_PUBLIC_API TransitiveCompileOptions {
+  friend class JS_PUBLIC_API ReadOnlyDecodeOptions;
+
+ protected:
+
+  JS::ConstUTF8CharsZ filename_;
+
+  JS::ConstUTF8CharsZ introducerFilename_;
+
+  const char16_t* sourceMapURL_ = nullptr;
+
+
+  bool mutedErrors_ = false;
+
+  bool forceStrictMode_ = false;
+
+  bool alwaysUseFdlibm_ = false;
+
+  bool skipFilenameValidation_ = false;
+
+  bool hideScriptFromDebugger_ = false;
+
+  bool deferDebugMetadata_ = false;
+
+  DelazificationOption eagerDelazificationStrategy_ =
+      DelazificationOption::OnDemandOnly;
+
+  EagerBaselineOption eagerBaselineStrategy_ = EagerBaselineOption::None;
+
+  friend class JS_PUBLIC_API InstantiateOptions;
+
+ public:
+  bool selfHostingMode = false;
+  bool discardSource = false;
+  bool sourceIsLazy = false;
+  bool allowHTMLComments = true;
+  bool nonSyntacticScope = false;
+
+  bool topLevelAwait = true;
+
+  bool borrowBuffer = false;
+
+  bool usePinnedBytecode = false;
+
+  PrefableCompileOptions prefableOptions_;
+
+  const char* introductionType = nullptr;
+
+  unsigned introductionLineno = 0;
+  uint32_t introductionOffset = 0;
+  bool hasIntroductionInfo = false;
+
+
+ protected:
+  TransitiveCompileOptions() = default;
+
+  void copyPODTransitiveOptions(const TransitiveCompileOptions& rhs);
+
+  bool isEagerDelazificationEqualTo(DelazificationOption val) const {
+    return eagerDelazificationStrategy() == val;
+  }
+
+  template <DelazificationOption... Values>
+  bool eagerDelazificationIsOneOf() const {
+    return (isEagerDelazificationEqualTo(Values) || ...);
+  }
+
+ public:
+  bool mutedErrors() const { return mutedErrors_; }
+  bool alwaysUseFdlibm() const { return alwaysUseFdlibm_; }
+  bool forceFullParse() const {
+    return eagerDelazificationIsOneOf<
+        DelazificationOption::ParseEverythingEagerly>();
+  }
+  bool forceStrictMode() const { return forceStrictMode_; }
+  bool consumeDelazificationCache() const {
+    return eagerDelazificationIsOneOf<
+        DelazificationOption::ConcurrentDepthFirst,
+        DelazificationOption::ConcurrentLargeFirst>();
+  }
+  bool populateDelazificationCache() const {
+    return eagerDelazificationIsOneOf<
+        DelazificationOption::CheckConcurrentWithOnDemand,
+        DelazificationOption::ConcurrentDepthFirst,
+        DelazificationOption::ConcurrentLargeFirst>();
+  }
+  bool waitForDelazificationCache() const {
+    return eagerDelazificationIsOneOf<
+        DelazificationOption::CheckConcurrentWithOnDemand>();
+  }
+  bool checkDelazificationCache() const {
+    return eagerDelazificationIsOneOf<
+        DelazificationOption::CheckConcurrentWithOnDemand>();
+  }
+  DelazificationOption eagerDelazificationStrategy() const {
+    return eagerDelazificationStrategy_;
+  }
+  EagerBaselineOption eagerBaselineStrategy() const {
+    return eagerBaselineStrategy_;
+  }
+
+  bool sourcePragmas() const { return prefableOptions_.sourcePragmas(); }
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+  bool explicitResourceManagement() const {
+    return prefableOptions_.explicitResourceManagement();
+  }
+#endif
+  bool sourcePhaseImports() const {
+    return prefableOptions_.sourcePhaseImports();
+  }
+
+  JS::ConstUTF8CharsZ filename() const { return filename_; }
+  JS::ConstUTF8CharsZ introducerFilename() const { return introducerFilename_; }
+  const char16_t* sourceMapURL() const { return sourceMapURL_; }
+
+  const PrefableCompileOptions& prefableOptions() const {
+    return prefableOptions_;
+  }
+
+  TransitiveCompileOptions(const TransitiveCompileOptions&) = delete;
+  TransitiveCompileOptions& operator=(const TransitiveCompileOptions&) = delete;
+
+#if defined(DEBUG) || defined(JS_JITSPEW)
+  template <typename Printer>
+  void dumpWith(Printer& print) const {
+#  define PrintFields_(Name) print(#Name, Name)
+    PrintFields_(filename_);
+    PrintFields_(introducerFilename_);
+    PrintFields_(sourceMapURL_);
+    PrintFields_(mutedErrors_);
+    PrintFields_(forceStrictMode_);
+    PrintFields_(alwaysUseFdlibm_);
+    PrintFields_(skipFilenameValidation_);
+    PrintFields_(hideScriptFromDebugger_);
+    PrintFields_(deferDebugMetadata_);
+    PrintFields_(eagerDelazificationStrategy_);
+    PrintFields_(eagerBaselineStrategy_);
+    PrintFields_(selfHostingMode);
+    PrintFields_(discardSource);
+    PrintFields_(sourceIsLazy);
+    PrintFields_(allowHTMLComments);
+    PrintFields_(nonSyntacticScope);
+    PrintFields_(topLevelAwait);
+    PrintFields_(borrowBuffer);
+    PrintFields_(usePinnedBytecode);
+    PrintFields_(introductionType);
+    PrintFields_(introductionLineno);
+    PrintFields_(introductionOffset);
+    PrintFields_(hasIntroductionInfo);
+#  undef PrintFields_
+
+    prefableOptions_.dumpWith(print);
+  }
+#endif  // defined(DEBUG) || defined(JS_JITSPEW)
+};
+
+class JS_PUBLIC_API ReadOnlyCompileOptions : public TransitiveCompileOptions {
+ public:
+
+  uint32_t lineno = 1;
+  JS::ColumnNumberOneOrigin column;
+
+  unsigned scriptSourceOffset = 0;
+
+  bool isRunOnce = false;
+  bool noScriptRval = false;
+
+ protected:
+  ReadOnlyCompileOptions() = default;
+
+  void copyPODNonTransitiveOptions(const ReadOnlyCompileOptions& rhs);
+
+  ReadOnlyCompileOptions(const ReadOnlyCompileOptions&) = delete;
+  ReadOnlyCompileOptions& operator=(const ReadOnlyCompileOptions&) = delete;
+
+ public:
+#if defined(DEBUG) || defined(JS_JITSPEW)
+  template <typename Printer>
+  void dumpWith(Printer& print) const {
+    this->TransitiveCompileOptions::dumpWith(print);
+#  define PrintFields_(Name) print(#Name, Name)
+    PrintFields_(lineno);
+    print("column", column.oneOriginValue());
+    PrintFields_(scriptSourceOffset);
+    PrintFields_(isRunOnce);
+    PrintFields_(noScriptRval);
+#  undef PrintFields_
+  }
+#endif  // defined(DEBUG) || defined(JS_JITSPEW)
+};
+
+class JS_PUBLIC_API OwningDecodeOptions;
+
+class JS_PUBLIC_API OwningCompileOptions final : public ReadOnlyCompileOptions {
+ public:
+  explicit OwningCompileOptions(JSContext* cx);
+
+  struct ForFrontendContext {};
+  explicit OwningCompileOptions(const ForFrontendContext&)
+      : ReadOnlyCompileOptions() {}
+
+  ~OwningCompileOptions();
+
+ private:
+  template <typename ContextT>
+  bool copyImpl(ContextT* cx, const ReadOnlyCompileOptions& rhs);
+
+ public:
+  bool copy(JSContext* cx, const ReadOnlyCompileOptions& rhs);
+  bool copy(JS::FrontendContext* fc, const ReadOnlyCompileOptions& rhs);
+
+  void steal(OwningCompileOptions&& rhs);
+  void steal(OwningDecodeOptions&& rhs);
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+
+  OwningCompileOptions& setIsRunOnce(bool once) {
+    isRunOnce = once;
+    return *this;
+  }
+
+  OwningCompileOptions& setForceStrictMode() {
+    forceStrictMode_ = true;
+    return *this;
+  }
+
+  OwningCompileOptions& setModule() {
+    setForceStrictMode();
+    setIsRunOnce(true);
+    allowHTMLComments = false;
+    return *this;
+  }
+
+ private:
+  void release();
+
+  OwningCompileOptions(const OwningCompileOptions&) = delete;
+  OwningCompileOptions& operator=(const OwningCompileOptions&) = delete;
+};
+
+class MOZ_STACK_CLASS JS_PUBLIC_API CompileOptions final
+    : public ReadOnlyCompileOptions {
+ public:
+  explicit CompileOptions(JSContext* cx);
+
+  CompileOptions(JSContext* cx, const ReadOnlyCompileOptions& rhs)
+      : ReadOnlyCompileOptions() {
+    copyPODNonTransitiveOptions(rhs);
+    copyPODTransitiveOptions(rhs);
+
+    filename_ = rhs.filename();
+    introducerFilename_ = rhs.introducerFilename();
+    sourceMapURL_ = rhs.sourceMapURL();
+  }
+
+  explicit CompileOptions(const PrefableCompileOptions& prefableOptions)
+      : ReadOnlyCompileOptions() {
+    prefableOptions_ = prefableOptions;
+  }
+
+  CompileOptions& setFile(const char* f) {
+    filename_ = JS::ConstUTF8CharsZ(f);
+    return *this;
+  }
+
+  CompileOptions& setLine(uint32_t l) {
+    lineno = l;
+    return *this;
+  }
+
+  CompileOptions& setFileAndLine(const char* f, uint32_t l) {
+    filename_ = JS::ConstUTF8CharsZ(f);
+    lineno = l;
+    return *this;
+  }
+
+  CompileOptions& setSourceMapURL(const char16_t* s) {
+    sourceMapURL_ = s;
+    return *this;
+  }
+
+  CompileOptions& setMutedErrors(bool mute) {
+    mutedErrors_ = mute;
+    return *this;
+  }
+
+  CompileOptions& setColumn(JS::ColumnNumberOneOrigin c) {
+    column = c;
+    return *this;
+  }
+
+  CompileOptions& setScriptSourceOffset(unsigned o) {
+    scriptSourceOffset = o;
+    return *this;
+  }
+
+  CompileOptions& setIsRunOnce(bool once) {
+    isRunOnce = once;
+    return *this;
+  }
+
+  CompileOptions& setNoScriptRval(bool nsr) {
+    noScriptRval = nsr;
+    return *this;
+  }
+
+  CompileOptions& setSkipFilenameValidation(bool b) {
+    skipFilenameValidation_ = b;
+    return *this;
+  }
+
+  CompileOptions& setSelfHostingMode(bool shm) {
+    selfHostingMode = shm;
+    return *this;
+  }
+
+  CompileOptions& setSourceIsLazy(bool l) {
+    sourceIsLazy = l;
+    return *this;
+  }
+
+  CompileOptions& setNonSyntacticScope(bool n) {
+    nonSyntacticScope = n;
+    return *this;
+  }
+
+  CompileOptions& setIntroductionType(const char* t) {
+    introductionType = t;
+    return *this;
+  }
+
+  CompileOptions& setDeferDebugMetadata(bool v = true) {
+    deferDebugMetadata_ = v;
+    return *this;
+  }
+
+  CompileOptions& setHideScriptFromDebugger(bool v = true) {
+    hideScriptFromDebugger_ = v;
+    return *this;
+  }
+
+  CompileOptions& setIntroductionInfo(const char* introducerFn,
+                                      const char* intro, uint32_t line,
+                                      uint32_t offset) {
+    introducerFilename_ = JS::ConstUTF8CharsZ(introducerFn);
+    introductionType = intro;
+    introductionLineno = line;
+    introductionOffset = offset;
+    hasIntroductionInfo = true;
+    return *this;
+  }
+
+  CompileOptions& setIntroductionInfoToCaller(
+      JSContext* cx, const char* introductionType,
+      JS::MutableHandle<JSScript*> introductionScript);
+
+  CompileOptions& setDiscardSource() {
+    discardSource = true;
+    return *this;
+  }
+
+  CompileOptions& setForceFullParse() {
+    eagerDelazificationStrategy_ = DelazificationOption::ParseEverythingEagerly;
+    return *this;
+  }
+
+  void warnAboutConflictingDelazification() const;
+  CompileOptions& setEagerDelazificationStrategy(
+      DelazificationOption strategy) {
+    const auto PEE = DelazificationOption::ParseEverythingEagerly;
+    if (eagerDelazificationStrategy_ == PEE && strategy != PEE) {
+      warnAboutConflictingDelazification();
+      return *this;
+    }
+
+    eagerDelazificationStrategy_ = strategy;
+    return *this;
+  }
+
+  CompileOptions& setEagerBaselineStrategy(EagerBaselineOption strategy) {
+    eagerBaselineStrategy_ = strategy;
+    return *this;
+  }
+
+  CompileOptions& setForceStrictMode() {
+    forceStrictMode_ = true;
+    return *this;
+  }
+
+  CompileOptions& setModule() {
+    setForceStrictMode();
+    setIsRunOnce(true);
+    allowHTMLComments = false;
+    return *this;
+  }
+
+  CompileOptions(const CompileOptions& rhs) = delete;
+  CompileOptions& operator=(const CompileOptions& rhs) = delete;
+};
+
+class JS_PUBLIC_API InstantiateOptions {
+ public:
+  bool skipFilenameValidation = false;
+  bool hideScriptFromDebugger = false;
+  bool deferDebugMetadata = false;
+  DelazificationOption eagerDelazificationStrategy_ =
+      DelazificationOption::OnDemandOnly;
+
+  EagerBaselineOption eagerBaselineStrategy_ = EagerBaselineOption::None;
+
+  InstantiateOptions();
+
+  explicit InstantiateOptions(const ReadOnlyCompileOptions& options)
+      : skipFilenameValidation(options.skipFilenameValidation_),
+        hideScriptFromDebugger(options.hideScriptFromDebugger_),
+        deferDebugMetadata(options.deferDebugMetadata_),
+        eagerDelazificationStrategy_(options.eagerDelazificationStrategy()),
+        eagerBaselineStrategy_(options.eagerBaselineStrategy_) {}
+
+  void copyTo(CompileOptions& options) const {
+    options.skipFilenameValidation_ = skipFilenameValidation;
+    options.hideScriptFromDebugger_ = hideScriptFromDebugger;
+    options.deferDebugMetadata_ = deferDebugMetadata;
+    options.setEagerDelazificationStrategy(eagerDelazificationStrategy_);
+    options.setEagerBaselineStrategy(eagerBaselineStrategy_);
+  }
+
+  bool hideFromNewScriptInitial() const {
+    return deferDebugMetadata || hideScriptFromDebugger;
+  }
+
+#ifdef DEBUG
+  void assertDefault() const;
+
+  void assertCompatibleWithDefault() const {
+    MOZ_ASSERT(skipFilenameValidation == false);
+    MOZ_ASSERT(hideScriptFromDebugger == false);
+    MOZ_ASSERT(deferDebugMetadata == false);
+
+    MOZ_ASSERT(eagerDelazificationStrategy_ ==
+                   DelazificationOption::OnDemandOnly ||
+               eagerDelazificationStrategy_ ==
+                   DelazificationOption::ParseEverythingEagerly);
+
+    MOZ_ASSERT(eagerBaselineStrategy_ == EagerBaselineOption::None);
+  }
+#endif
+};
+
+class JS_PUBLIC_API ReadOnlyDecodeOptions {
+ public:
+  bool borrowBuffer = false;
+  bool usePinnedBytecode = false;
+
+ protected:
+  JS::ConstUTF8CharsZ introducerFilename_;
+
+ public:
+  const char* introductionType = nullptr;
+
+  uint32_t introductionLineno = 0;
+  uint32_t introductionOffset = 0;
+
+ protected:
+  ReadOnlyDecodeOptions() = default;
+
+  ReadOnlyDecodeOptions(const ReadOnlyDecodeOptions&) = delete;
+  ReadOnlyDecodeOptions& operator=(const ReadOnlyDecodeOptions&) = delete;
+
+  template <typename T>
+  void copyPODOptionsFrom(const T& options) {
+    borrowBuffer = options.borrowBuffer;
+    usePinnedBytecode = options.usePinnedBytecode;
+    introductionType = options.introductionType;
+    introductionLineno = options.introductionLineno;
+    introductionOffset = options.introductionOffset;
+  }
+
+  template <typename T>
+  void copyPODOptionsTo(T& options) const {
+    options.borrowBuffer = borrowBuffer;
+    options.usePinnedBytecode = usePinnedBytecode;
+    options.introductionType = introductionType;
+    options.introductionLineno = introductionLineno;
+    options.introductionOffset = introductionOffset;
+  }
+
+ public:
+  void copyTo(CompileOptions& options) const {
+    copyPODOptionsTo(options);
+    options.introducerFilename_ = introducerFilename_;
+  }
+
+  JS::ConstUTF8CharsZ introducerFilename() const { return introducerFilename_; }
+};
+
+class MOZ_STACK_CLASS JS_PUBLIC_API DecodeOptions final
+    : public ReadOnlyDecodeOptions {
+ public:
+  DecodeOptions() = default;
+
+  explicit DecodeOptions(const ReadOnlyCompileOptions& options) {
+    copyPODOptionsFrom(options);
+
+    introducerFilename_ = options.introducerFilename();
+  }
+};
+
+class JS_PUBLIC_API OwningDecodeOptions final : public ReadOnlyDecodeOptions {
+  friend class OwningCompileOptions;
+
+ public:
+  OwningDecodeOptions() = default;
+
+  ~OwningDecodeOptions();
+
+  bool copy(JS::FrontendContext* maybeFc, const ReadOnlyDecodeOptions& rhs);
+  void infallibleCopy(const ReadOnlyDecodeOptions& rhs);
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+
+ private:
+  void release();
+
+  OwningDecodeOptions(const OwningDecodeOptions&) = delete;
+  OwningDecodeOptions& operator=(const OwningDecodeOptions&) = delete;
+};
+
+}  
+
+#endif /* js_CompileOptions_h */

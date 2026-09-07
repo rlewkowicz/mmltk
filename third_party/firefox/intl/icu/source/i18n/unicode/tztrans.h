@@ -1,0 +1,76 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*******************************************************************************
+* Copyright (C) 2007-2008, International Business Machines Corporation and         *
+* others. All Rights Reserved.                                                *
+*******************************************************************************
+*/
+#ifndef TZTRANS_H
+#define TZTRANS_H
+
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/uobject.h"
+
+U_NAMESPACE_BEGIN
+
+class TimeZoneRule;
+
+class U_I18N_API TimeZoneTransition : public UObject {
+public:
+    TimeZoneTransition(UDate time, const TimeZoneRule& from, const TimeZoneRule& to);
+
+    TimeZoneTransition();
+
+    TimeZoneTransition(const TimeZoneTransition& source);
+
+    ~TimeZoneTransition();
+
+    TimeZoneTransition* clone() const;
+
+    TimeZoneTransition& operator=(const TimeZoneTransition& right);
+
+    bool operator==(const TimeZoneTransition& that) const;
+
+    bool operator!=(const TimeZoneTransition& that) const;
+
+    UDate getTime() const;
+
+    void setTime(UDate time);
+
+    const TimeZoneRule* getFrom() const;
+
+    void setFrom(const TimeZoneRule& from);
+
+    void adoptFrom(TimeZoneRule* from);
+
+    void setTo(const TimeZoneRule& to);
+
+    void adoptTo(TimeZoneRule* to);
+
+    const TimeZoneRule* getTo() const;
+
+private:
+    UDate   fTime;
+    TimeZoneRule*   fFrom;
+    TimeZoneRule*   fTo;
+
+public:
+    static UClassID U_EXPORT2 getStaticClassID();
+
+    virtual UClassID getDynamicClassID() const override;
+};
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif // TZTRANS_H
+

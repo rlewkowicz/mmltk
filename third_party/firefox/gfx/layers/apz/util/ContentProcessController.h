@@ -1,0 +1,84 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_ContentProcessController_h
+#define mozilla_layers_ContentProcessController_h
+
+#include "mozilla/layers/GeckoContentController.h"
+
+class nsIObserver;
+
+namespace mozilla {
+
+namespace dom {
+class BrowserChild;
+}  
+
+namespace layers {
+
+class APZChild;
+struct DoubleTapToZoomMetrics;
+
+class ContentProcessController final : public GeckoContentController {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(ContentProcessController, final);
+
+  explicit ContentProcessController(const RefPtr<dom::BrowserChild>& aBrowser);
+
+
+  void NotifyLayerTransforms(nsTArray<MatrixMessage>&& aTransforms) override;
+
+  void RequestContentRepaint(const RepaintRequest& aRequest) override;
+
+  void HandleTap(TapType aType, const LayoutDevicePoint& aPoint,
+                 Modifiers aModifiers, const ScrollableLayerGuid& aGuid,
+                 uint64_t aInputBlockId,
+                 const Maybe<DoubleTapToZoomMetrics>& aMetrics) override;
+
+  void NotifyPinchGesture(PinchGestureInput::PinchGestureType aType,
+                          const ScrollableLayerGuid& aGuid,
+                          const LayoutDevicePoint& aFocusPoint,
+                          LayoutDeviceCoord aSpanChange,
+                          Modifiers aModifiers) override;
+
+  void NotifyAPZStateChange(const ScrollableLayerGuid& aGuid,
+                            APZStateChange aChange, int aArg,
+                            Maybe<uint64_t> aInputBlockId) override;
+
+  void NotifyMozMouseScrollEvent(const ScrollableLayerGuid::ViewID& aScrollId,
+                                 const nsString& aEvent) override;
+
+  void NotifyFlushComplete() override;
+
+  void NotifyAsyncScrollbarDragInitiated(
+      uint64_t aDragBlockId, const ScrollableLayerGuid::ViewID& aScrollId,
+      ScrollDirection aDirection) override;
+  void NotifyAsyncScrollbarDragRejected(
+      const ScrollableLayerGuid::ViewID& aScrollId) override;
+
+  void NotifyAsyncAutoscrollRejected(
+      const ScrollableLayerGuid::ViewID& aScrollId) override;
+
+  void CancelAutoscroll(const ScrollableLayerGuid& aGuid) override;
+
+  void NotifyScaleGestureComplete(const ScrollableLayerGuid& aGuid,
+                                  float aScale) override;
+
+  bool IsRepaintThread() override;
+
+  void DispatchToRepaintThread(already_AddRefed<Runnable> aTask) override;
+
+  PresShell* GetTopLevelPresShell() const override;
+
+ private:
+  virtual ~ContentProcessController() = default;
+
+  RefPtr<dom::BrowserChild> mBrowser;
+};
+
+}  
+
+}  
+
+#endif  // mozilla_layers_ContentProcessController_h

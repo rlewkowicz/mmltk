@@ -1,0 +1,268 @@
+// Copyright 2017 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef ABSL_STRINGS_NUMBERS_H_
+#define ABSL_STRINGS_NUMBERS_H_
+
+#ifdef __SSSE3__
+#include <tmmintrin.h>
+#endif
+
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
+
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <limits>
+#include <string>
+#include <type_traits>
+
+#include "absl/base/attributes.h"
+#include "absl/base/config.h"
+#include "absl/base/internal/endian.h"
+#include "absl/base/macros.h"
+#include "absl/base/nullability.h"
+#include "absl/base/port.h"
+#include "absl/numeric/bits.h"
+#include "absl/numeric/int128.h"
+#include "absl/strings/string_view.h"
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+
+template <typename int_type>
+[[nodiscard]] bool SimpleAtoi(absl::string_view str,
+                              int_type* absl_nonnull out);
+
+[[nodiscard]] bool SimpleAtof(absl::string_view str, float* absl_nonnull out);
+
+[[nodiscard]] bool SimpleAtod(absl::string_view str, double* absl_nonnull out);
+
+[[nodiscard]] bool SimpleAtob(absl::string_view str, bool* absl_nonnull out);
+
+template <typename int_type>
+[[nodiscard]] bool SimpleHexAtoi(absl::string_view str,
+                                 int_type* absl_nonnull out);
+
+[[nodiscard]] inline bool SimpleHexAtoi(absl::string_view str,
+                                        absl::int128* absl_nonnull out);
+[[nodiscard]] inline bool SimpleHexAtoi(absl::string_view str,
+                                        absl::uint128* absl_nonnull out);
+
+ABSL_NAMESPACE_END
+}  
+
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace numbers_internal {
+
+template <typename int_type>
+constexpr bool is_signed() {
+  if constexpr (std::is_arithmetic_v<int_type>) {
+    return std::numeric_limits<int_type>::is_signed;
+  }
+  return static_cast<int_type>(1) - 2 < 0;
+}
+
+ABSL_DLL extern const char kHexChar[17];  
+ABSL_DLL extern const char
+    kHexTable[513];  
+
+void PutTwoDigits(uint32_t i, char* absl_nonnull buf);
+
+
+bool safe_strto8_base(absl::string_view text, int8_t* absl_nonnull value,
+                      int base);
+bool safe_strto16_base(absl::string_view text, int16_t* absl_nonnull value,
+                       int base);
+bool safe_strto32_base(absl::string_view text, int32_t* absl_nonnull value,
+                       int base);
+bool safe_strto64_base(absl::string_view text, int64_t* absl_nonnull value,
+                       int base);
+bool safe_strto128_base(absl::string_view text,
+                        absl::int128* absl_nonnull value, int base);
+bool safe_strtou8_base(absl::string_view text, uint8_t* absl_nonnull value,
+                       int base);
+bool safe_strtou16_base(absl::string_view text, uint16_t* absl_nonnull value,
+                        int base);
+bool safe_strtou32_base(absl::string_view text, uint32_t* absl_nonnull value,
+                        int base);
+bool safe_strtou64_base(absl::string_view text, uint64_t* absl_nonnull value,
+                        int base);
+bool safe_strtou128_base(absl::string_view text,
+                         absl::uint128* absl_nonnull value, int base);
+
+inline constexpr int kFastToBuffer128Size = 41;
+inline constexpr int kFastToBufferSize = 32;
+inline constexpr int kSixDigitsToBufferSize = 16;
+
+char* absl_nonnull RoundTripDoubleToBuffer(double d, char* absl_nonnull buffer);
+char* absl_nonnull RoundTripFloatToBuffer(float f, char* absl_nonnull buffer);
+
+size_t SixDigitsToBuffer(double d, char* absl_nonnull buffer);
+
+char* absl_nonnull FastIntToBuffer(int32_t i, char* absl_nonnull buffer)
+    ABSL_INTERNAL_NEED_MIN_SIZE(buffer, kFastToBufferSize);
+char* absl_nonnull FastIntToBuffer(uint32_t n, char* absl_nonnull out_str)
+    ABSL_INTERNAL_NEED_MIN_SIZE(out_str, kFastToBufferSize);
+char* absl_nonnull FastIntToBuffer(int64_t i, char* absl_nonnull buffer)
+    ABSL_INTERNAL_NEED_MIN_SIZE(buffer, kFastToBufferSize);
+char* absl_nonnull FastIntToBuffer(uint64_t i, char* absl_nonnull buffer)
+    ABSL_INTERNAL_NEED_MIN_SIZE(buffer, kFastToBufferSize);
+char* absl_nonnull FastIntToBuffer(int128 i, char* absl_nonnull buffer)
+    ABSL_INTERNAL_NEED_MIN_SIZE(buffer, kFastToBuffer128Size);
+char* absl_nonnull FastIntToBuffer(uint128 i, char* absl_nonnull buffer)
+    ABSL_INTERNAL_NEED_MIN_SIZE(buffer, kFastToBuffer128Size);
+
+template <typename int_type>
+char* absl_nonnull FastIntToBuffer(int_type i,
+                                          char* absl_nonnull buffer)
+    ABSL_INTERNAL_NEED_MIN_SIZE(
+        buffer, (sizeof(int_type) > 8 ? kFastToBuffer128Size
+                                      : kFastToBufferSize)) {
+  constexpr bool kIsSigned = is_signed<int_type>();
+  constexpr bool kUse64Bit = sizeof(i) > 32 / 8;
+  constexpr bool kUse128Bit = sizeof(i) > 64 / 8;
+  if (kIsSigned) {
+    if constexpr (kUse128Bit) {
+      return FastIntToBuffer(static_cast<int128>(i), buffer);
+    } else if constexpr (kUse64Bit) {
+      return FastIntToBuffer(static_cast<int64_t>(i), buffer);
+    } else {
+      return FastIntToBuffer(static_cast<int32_t>(i), buffer);
+    }
+  } else {
+    if constexpr (kUse128Bit) {
+      return FastIntToBuffer(static_cast<uint128>(i), buffer);
+    } else if constexpr (kUse64Bit) {
+      return FastIntToBuffer(static_cast<uint64_t>(i), buffer);
+    } else {
+      return FastIntToBuffer(static_cast<uint32_t>(i), buffer);
+    }
+  }
+}
+
+template <typename int_type>
+[[nodiscard]] bool safe_strtoi_base(absl::string_view s,
+                                    int_type* absl_nonnull out, int base) {
+  static_assert(sizeof(*out) == 1 || sizeof(*out) == 2 || sizeof(*out) == 4 ||
+                    sizeof(*out) == 8,
+                "SimpleAtoi works only with 8, 16, 32, or 64-bit integers.");
+  static_assert(!std::is_floating_point_v<int_type>,
+                "Use SimpleAtof or SimpleAtod instead.");
+  bool parsed;
+  constexpr bool kIsSigned = is_signed<int_type>();
+  constexpr int kIntTypeSize = sizeof(*out) * 8;
+  if (kIsSigned) {
+    if (kIntTypeSize == 64) {
+      int64_t val;
+      parsed = numbers_internal::safe_strto64_base(s, &val, base);
+      *out = static_cast<int_type>(val);
+    } else if (kIntTypeSize == 32) {
+      int32_t val;
+      parsed = numbers_internal::safe_strto32_base(s, &val, base);
+      *out = static_cast<int_type>(val);
+    } else if (kIntTypeSize == 16) {
+      int16_t val;
+      parsed = numbers_internal::safe_strto16_base(s, &val, base);
+      *out = static_cast<int_type>(val);
+    } else if (kIntTypeSize == 8) {
+      int8_t val;
+      parsed = numbers_internal::safe_strto8_base(s, &val, base);
+      *out = static_cast<int_type>(val);
+    }
+  } else {
+    if (kIntTypeSize == 64) {
+      uint64_t val;
+      parsed = numbers_internal::safe_strtou64_base(s, &val, base);
+      *out = static_cast<int_type>(val);
+    } else if (kIntTypeSize == 32) {
+      uint32_t val;
+      parsed = numbers_internal::safe_strtou32_base(s, &val, base);
+      *out = static_cast<int_type>(val);
+    } else if (kIntTypeSize == 16) {
+      uint16_t val;
+      parsed = numbers_internal::safe_strtou16_base(s, &val, base);
+      *out = static_cast<int_type>(val);
+    } else if (kIntTypeSize == 8) {
+      uint8_t val;
+      parsed = numbers_internal::safe_strtou8_base(s, &val, base);
+      *out = static_cast<int_type>(val);
+    }
+  }
+  return parsed;
+}
+
+inline size_t FastHexToBufferZeroPad16(uint64_t val, char* absl_nonnull out) {
+#ifdef ABSL_INTERNAL_HAVE_SSSE3
+  uint64_t be = absl::big_endian::FromHost64(val);
+  const auto kNibbleMask = _mm_set1_epi8(0xf);
+  const auto kHexDigits = _mm_setr_epi8('0', '1', '2', '3', '4', '5', '6', '7',
+                                        '8', '9', 'a', 'b', 'c', 'd', 'e', 'f');
+  auto v = _mm_loadl_epi64(reinterpret_cast<__m128i*>(&be));  
+  auto v4 = _mm_srli_epi64(v, 4);                            
+  auto il = _mm_unpacklo_epi8(v4, v);                        
+  auto m = _mm_and_si128(il, kNibbleMask);                   
+  auto hexchars = _mm_shuffle_epi8(kHexDigits, m);           
+  _mm_storeu_si128(reinterpret_cast<__m128i*>(out), hexchars);
+#else
+  for (int i = 0; i < 8; ++i) {
+    auto byte = (val >> (56 - 8 * i)) & 0xFF;
+    auto* hex = &absl::numbers_internal::kHexTable[byte * 2];
+    std::memcpy(out + 2 * i, hex, 2);
+  }
+#endif
+  return 16 - static_cast<size_t>(countl_zero(val | 0x1) / 4);
+}
+
+}  
+
+template <typename int_type>
+[[nodiscard]] bool SimpleAtoi(absl::string_view str,
+                              int_type* absl_nonnull out) {
+  return numbers_internal::safe_strtoi_base(str, out, 10);
+}
+
+[[nodiscard]] inline bool SimpleAtoi(absl::string_view str,
+                                     absl::int128* absl_nonnull out) {
+  return numbers_internal::safe_strto128_base(str, out, 10);
+}
+
+[[nodiscard]] inline bool SimpleAtoi(absl::string_view str,
+                                     absl::uint128* absl_nonnull out) {
+  return numbers_internal::safe_strtou128_base(str, out, 10);
+}
+
+template <typename int_type>
+[[nodiscard]] bool SimpleHexAtoi(absl::string_view str,
+                                 int_type* absl_nonnull out) {
+  return numbers_internal::safe_strtoi_base(str, out, 16);
+}
+
+[[nodiscard]] inline bool SimpleHexAtoi(absl::string_view str,
+                                        absl::int128* absl_nonnull out) {
+  return numbers_internal::safe_strto128_base(str, out, 16);
+}
+
+[[nodiscard]] inline bool SimpleHexAtoi(absl::string_view str,
+                                        absl::uint128* absl_nonnull out) {
+  return numbers_internal::safe_strtou128_base(str, out, 16);
+}
+
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_STRINGS_NUMBERS_H_

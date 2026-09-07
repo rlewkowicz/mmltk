@@ -1,0 +1,152 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_JitContext_h
+#define jit_JitContext_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Result.h"
+
+#include <stdint.h>
+
+#include "jstypes.h"
+
+struct JS_PUBLIC_API JSContext;
+
+namespace js {
+namespace jit {
+
+class CompileRealm;
+class CompileRuntime;
+class TempAllocator;
+
+enum MethodStatus {
+  Method_Error,
+  Method_CantCompile,
+  Method_Skipped,
+  Method_Compiled
+};
+
+enum class AbortReason : uint8_t {
+  NoAbort,
+  Alloc = 2,
+  Disable = 4,
+  Error = 6,
+};
+}  
+}  
+
+namespace mozilla::detail {
+
+template <>
+struct UnusedZero<js::jit::AbortReason> : UnusedZeroEnum<js::jit::AbortReason> {
+};
+
+template <>
+struct HasFreeLSB<js::jit::AbortReason> {
+  static const bool value = true;
+};
+
+}  
+
+namespace js {
+namespace jit {
+
+template <typename V>
+using AbortReasonOr = mozilla::Result<V, AbortReason>;
+using mozilla::Err;
+using mozilla::Ok;
+
+static_assert(sizeof(AbortReasonOr<Ok>) <= sizeof(uintptr_t),
+              "Unexpected size of AbortReasonOr<Ok>");
+static_assert(mozilla::detail::SelectResultImpl<bool, AbortReason>::value ==
+              mozilla::detail::PackingStrategy::NullIsOk);
+static_assert(sizeof(AbortReasonOr<bool>) <= sizeof(uintptr_t),
+              "Unexpected size of AbortReasonOr<bool>");
+static_assert(sizeof(AbortReasonOr<uint16_t*>) == sizeof(uintptr_t),
+              "Unexpected size of AbortReasonOr<uint16_t*>");
+
+
+class MOZ_RAII JitContext {
+#ifdef DEBUG
+  bool inBaselineBackend_ = false;
+
+  bool inIonBackend_ = false;
+
+  bool isCompilingWasm_ = false;
+  bool oom_ = false;
+#endif
+
+ public:
+  JSContext* cx = nullptr;
+
+  CompileRuntime* runtime = nullptr;
+
+  explicit JitContext(JSContext* cx);
+
+  explicit JitContext(CompileRuntime* rt);
+
+  JitContext();
+
+  ~JitContext();
+
+#ifdef DEBUG
+  bool isCompilingWasm() { return isCompilingWasm_; }
+  bool setIsCompilingWasm(bool flag) {
+    bool oldFlag = isCompilingWasm_;
+    isCompilingWasm_ = flag;
+    return oldFlag;
+  }
+  bool hasOOM() { return oom_; }
+  void setOOM() { oom_ = true; }
+
+  bool inBaselineBackend() const { return inBaselineBackend_; }
+  bool inIonBackend() const { return inIonBackend_; }
+
+  void enterBaselineBackend() {
+    MOZ_ASSERT(!inBaselineBackend_);
+    inBaselineBackend_ = true;
+  }
+  void leaveBaselineBackend() {
+    MOZ_ASSERT(inBaselineBackend_);
+    inBaselineBackend_ = false;
+  }
+  void enterIonBackend() {
+    MOZ_ASSERT(!inIonBackend_);
+    inIonBackend_ = true;
+  }
+  void leaveIonBackend() {
+    MOZ_ASSERT(inIonBackend_);
+    inIonBackend_ = false;
+  }
+#endif
+};
+
+[[nodiscard]] bool InitializeJit();
+void ShutdownJit();
+
+JitContext* GetJitContext();
+JitContext* MaybeGetJitContext();
+
+void SetJitContext(JitContext* ctx);
+
+enum JitExecStatus {
+  JitExec_Aborted,
+
+  JitExec_Error,
+
+  JitExec_Ok
+};
+
+static inline bool IsErrorStatus(JitExecStatus status) {
+  return status == JitExec_Error || status == JitExec_Aborted;
+}
+
+bool JitSupportsWasmSimd();
+bool JitSupportsAtomics();
+
+}  
+}  
+
+#endif /* jit_JitContext_h */

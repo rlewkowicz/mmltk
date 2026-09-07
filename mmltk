@@ -1,0 +1,3480 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${repo_root}/tools/runtime_package.sh"
+image_name="${MMLTK_IMAGE:-mmltk}"
+build_image_name="${MMLTK_BUILD_IMAGE:-mmltk-build:latest}"
+toolchain_base_image_name="${MMLTK_TOOLCHAIN_BASE_IMAGE:-mmltk-toolchain-base:latest}"
+gcc16_image_name="${MMLTK_GCC_IMAGE:-mmltk-gcc16:latest}"
+nvidia_payload_image_name="${MMLTK_NVIDIA_PAYLOAD_IMAGE:-mmltk-nvidia-payload:latest}"
+runtime_base_image_name="${MMLTK_RUNTIME_BASE_IMAGE:-mmltk-runtime-base:latest}"
+nvidia_donor_image=""
+nvidia_configuration_args=()
+ubuntu_image_name="${MMLTK_UBUNTU_IMAGE:-mmltk-ubuntu:latest}"
+onnxruntime_image_name="${MMLTK_ONNXRUNTIME_IMAGE:-mmltk-onnxruntime:latest}"
+dependencies_image_name="${MMLTK_DEPENDENCIES_IMAGE:-mmltk-dependencies:latest}"
+image_producers_prepared=0
+analysis_image_name="${MMLTK_ANALYSIS_IMAGE:-${image_name}-analysis}"
+host_workdir="${PWD}"
+requested_cache_root="${MMLTK_CACHE_ROOT:-${repo_root}/.cache}"
+if [[ "${requested_cache_root}" != /* ]]; then
+    requested_cache_root="${repo_root}/${requested_cache_root}"
+fi
+cache_root="$(realpath -m -- "${requested_cache_root}")"
+repository_cache_root="${repo_root}/.cache"
+buildkit_cache_root="${cache_root}/buildkit"
+cmake_cache_root="${cache_root}/cmake"
+cargo_cache_root="${cache_root}/cargo"
+ccache_root="${cache_root}/ccache"
+firefox_cache_root="${cache_root}/firefox"
+firefox_build_input_file="${firefox_cache_root}/build-input.sha256"
+firefox_built_input_file="${firefox_cache_root}/obj-minimal-opt/.mmltk-build-input.sha256"
+image_fingerprint_root="${cache_root}/image-fingerprints"
+lock_root="${cache_root}/locks"
+requested_release_stage_root="${MMLTK_RELEASE_STAGE_ROOT:-${repo_root}/build/release}"
+if [[ "${requested_release_stage_root}" != /* ]]; then
+    requested_release_stage_root="${repo_root}/${requested_release_stage_root}"
+fi
+release_stage_root="$(realpath -m -- "${requested_release_stage_root}")"
+gui_frontend_dist_dir="${cmake_cache_root}/gui/frontend/iced/dist"
+release_frontend_dist_dir="${cmake_cache_root}/release/frontend/iced/dist"
+uid="$(id -u)"
+gid="$(id -g)"
+
+log() {
+    printf 'mmltk: %s\n' "$*" >&2
+}
+
+die() {
+    log "$*"
+    exit 1
+}
+
+online_cpu_file="/sys/devices/system/cpu/online"
+[[ -r "${online_cpu_file}" ]] || die "Linux online CPU list is unavailable"
+build_cpu_list="$(<"${online_cpu_file}")"
+[[ "${build_cpu_list}" =~ ^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$ ]] || die \
+    "invalid Linux online CPU list: ${build_cpu_list}"
+build_jobs="$(getconf _NPROCESSORS_ONLN)"
+[[ "${build_jobs}" =~ ^[1-9][0-9]*$ ]] || die \
+    "invalid online CPU count: ${build_jobs}"
+
+case "${cache_root}" in
+    "${repository_cache_root}"|"${repository_cache_root}/"*)
+        ;;
+    *)
+        die "MMLTK_CACHE_ROOT must stay under ${repository_cache_root}"
+        ;;
+esac
+case "${release_stage_root}" in
+    "${repo_root}/build/"*)
+        ;;
+    *)
+        die "MMLTK_RELEASE_STAGE_ROOT must stay under ${repo_root}/build"
+        ;;
+esac
+container_cache_root="/workspace${cache_root#"${repo_root}"}"
+container_release_stage_root="/workspace${release_stage_root#"${repo_root}"}"
+container_firefox_sccache_basedirs="${container_cache_root}/firefox/obj-minimal-opt"
+container_firefox_sccache_basedirs+=":/workspace/third_party/firefox"
+container_firefox_sccache_basedirs+=":${container_cache_root}/firefox/mozbuild/sysroot-x86_64-linux-gnu"
+build_trace_file="${MMLTK_BUILD_TRACE_FILE:-}"
+ccache_stats_file="${MMLTK_CCACHE_STATS_FILE:-}"
+firefox_sccache_stats_file="${MMLTK_FIREFOX_SCCACHE_STATS_FILE:-}"
+container_ccache_stats_file=""
+container_firefox_sccache_stats_file=""
+container_build_trace_file=""
+firefox_stage_trace_file=""
+container_firefox_stage_trace_file=""
+build_trace_enabled=0
+
+prepare_trace_report_file() {
+    local requested_path="$1"
+    local variable_name="$2"
+    if [[ "${requested_path}" != /* ]]; then
+        requested_path="${host_workdir}/${requested_path}"
+    fi
+    requested_path="$(realpath -m -- "${requested_path}")"
+    case "${requested_path}" in
+        "${repo_root}/build/"*)
+            ;;
+        *)
+            die "${variable_name} must stay under ${repo_root}/build"
+            ;;
+    esac
+    prepare_owned_dirs "$(dirname "${requested_path}")"
+    : >"${requested_path}"
+    chown "${uid}:${gid}" "${requested_path}" 2>/dev/null || true
+    printf '%s\n' "${requested_path}"
+}
+
+initialize_build_trace() {
+    [[ -n "${build_trace_file}" ]] || return 0
+    if [[ "${build_trace_file}" != /* ]]; then
+        build_trace_file="${host_workdir}/${build_trace_file}"
+    fi
+    build_trace_file="$(realpath -m -- "${build_trace_file}")"
+    case "${build_trace_file}" in
+        "${repo_root}/"*)
+            ;;
+        *)
+            die "MMLTK_BUILD_TRACE_FILE must stay under ${repo_root}"
+            ;;
+    esac
+    prepare_owned_dirs "$(dirname "${build_trace_file}")"
+    touch "${build_trace_file}"
+    chown "${uid}:${gid}" "${build_trace_file}" 2>/dev/null || true
+    container_build_trace_file="/workspace${build_trace_file#"${repo_root}"}"
+    firefox_stage_trace_file="${build_trace_file%.jsonl}-firefox-stage.jsonl"
+    : >"${firefox_stage_trace_file}"
+    chown "${uid}:${gid}" "${firefox_stage_trace_file}" 2>/dev/null || true
+    container_firefox_stage_trace_file="/workspace${firefox_stage_trace_file#"${repo_root}"}"
+    if [[ -n "${ccache_stats_file}" ]]; then
+        ccache_stats_file="$(prepare_trace_report_file \
+            "${ccache_stats_file}" MMLTK_CCACHE_STATS_FILE)"
+        container_ccache_stats_file="/workspace${ccache_stats_file#"${repo_root}"}"
+    fi
+    if [[ -n "${firefox_sccache_stats_file}" ]]; then
+        firefox_sccache_stats_file="$(prepare_trace_report_file \
+            "${firefox_sccache_stats_file}" MMLTK_FIREFOX_SCCACHE_STATS_FILE)"
+        container_firefox_sccache_stats_file="/workspace${firefox_sccache_stats_file#"${repo_root}"}"
+    fi
+    build_trace_enabled=1
+}
+
+trace_build_event() {
+    (( build_trace_enabled )) || return 0
+    local phase="$1"
+    local event="$2"
+    local result="${3:-}"
+    printf '{"timestamp_ns":%s,"pid":%d,"phase":"%s","event":"%s","result":"%s"}\n' \
+        "$(date +%s%N)" "${BASHPID}" "${phase}" "${event}" "${result}" \
+        >>"${build_trace_file}"
+}
+
+trace_build_job_assignment() {
+    (( build_trace_enabled )) || return 0
+    printf '{"timestamp_ns":%s,"pid":%d,"phase":"jobs","event":"assigned","cpus":"%s","ninja":%d,"cargo":%d,"firefox":%d}\n' \
+        "$(date +%s%N)" "${BASHPID}" \
+        "${build_cpu_list}" "${build_jobs}" "${build_jobs}" "${build_jobs}" \
+        >>"${build_trace_file}"
+}
+
+run_traced_build_phase() (
+    local phase="$1"
+    shift
+    trace_build_event "${phase}" start
+    finish_traced_build_phase() {
+        local exit_status=$?
+        trap - EXIT
+        if (( exit_status == 0 )); then
+            trace_build_event "${phase}" finish success
+        else
+            trace_build_event "${phase}" finish "failure:${exit_status}"
+        fi
+        exit "${exit_status}"
+    }
+    trap finish_traced_build_phase EXIT
+    "$@"
+)
+
+# When running as root, resolve the first real (login-capable) user on the box
+# so the container uses that uid/gid for mounts and device access.
+resolve_real_user() {
+    if (( uid != 0 )); then
+        return 0
+    fi
+
+    local target_user="${MMLTK_USER:-}"
+    if [[ -z "${target_user}" ]]; then
+        # First UID >= 1000 with a real login shell
+        local entry
+        while IFS=: read -r entry; do
+            local u_name u_uid u_gid u_shell
+            u_name="$(echo "${entry}" | cut -d: -f1)"
+            u_uid="$(echo "${entry}" | cut -d: -f3)"
+            u_gid="$(echo "${entry}" | cut -d: -f4)"
+            u_shell="$(echo "${entry}" | cut -d: -f7)"
+            if (( u_uid >= 1000 )) && [[ "${u_shell}" != */nologin && "${u_shell}" != */false ]]; then
+                target_user="${u_name}"
+                uid="${u_uid}"
+                gid="${u_gid}"
+                break
+            fi
+        done < /etc/passwd
+    else
+        uid="$(id -u "${target_user}")"
+        gid="$(id -g "${target_user}")"
+    fi
+
+    if [[ -z "${target_user}" ]]; then
+        log "warning: running as root, no real user found (set MMLTK_USER to override)"
+        return 0
+    fi
+    log "running as root, resolved container user to ${target_user} (${uid}:${gid})"
+}
+resolve_real_user
+
+container_hash="$(printf '%s' "${repo_root}" | sha256sum | cut -c1-12)"
+container_base_name="${MMLTK_CONTAINER_NAME:-mmltk-${container_hash}}"
+container_name="${container_base_name}-${BASHPID}"
+release_build_container_name="${container_base_name}-build-release"
+package_build_container_name="${container_base_name}-build-package"
+gui_build_container_name="${container_base_name}-build-gui"
+test_build_container_name="${container_base_name}-test-build"
+test_run_container_name="${container_base_name}-test-run"
+tidy_container_name="${container_base_name}-tidy"
+cleanup_report_container_name="${container_base_name}-cleanup-report"
+buildx_builder_name="${MMLTK_BUILDX_BUILDER:-${container_base_name}-buildx}"
+buildx_builder_ready=0
+default_engine_builder_ready=0
+container_cleanup_armed=0
+mutation_locks_acquired=0
+runtime_lock_acquired=0
+runtime_lock_fd=-1
+stale_container_cleanup_done=0
+active_docker_pid=0
+shutdown_docker_pid=0
+cleanup_docker_pid=0
+shutdown_signal_count=0
+active_build_pids=()
+declare -A active_build_start_ticks=()
+active_build_container_names=()
+wrapper_pid="$$"
+wrapper_start_ticks="$(awk '{ print $22 }' "/proc/${wrapper_pid}/stat")"
+invocation_mode="initializing"
+
+build_process_start_ticks() {
+    local pid="$1" expected_parent="$2" state
+    local -a fields=()
+    [[ -r "/proc/${pid}/stat" ]] || return 1
+    state="$(<"/proc/${pid}/stat")"
+    read -r -a fields <<<"${state##*) }"
+    [[ "${fields[1]:-}" == "${expected_parent}" ]] || return 1
+    printf '%s\n' "${fields[19]}"
+}
+
+track_build_pid() {
+    local pid="$1" owner_pid="${BASHPID}"
+    active_build_pids+=("${pid}")
+    active_build_start_ticks["${pid}"]="$(build_process_start_ticks "${pid}" "${owner_pid}" || true)"
+}
+
+stop_owned_build_process() {
+    local pid="$1" expected_start="$2" expected_parent="$3" actual_start
+    [[ -n "${expected_start}" ]] || return 0
+    actual_start="$(build_process_start_ticks "${pid}" "${expected_parent}" || true)"
+    [[ "${actual_start}" == "${expected_start}" ]] || return 0
+    # Freeze this owned parent before enumerating its children. This reaches
+    # foreground Docker clients under traced shells without waiting for Bash
+    # to handle a signal after its foreground command eventually returns.
+    kill -STOP "${pid}" >/dev/null 2>&1 || return 0
+    local -a children=()
+    if [[ -r "/proc/${pid}/task/${pid}/children" ]]; then
+        read -r -a children <"/proc/${pid}/task/${pid}/children" || true
+    fi
+    local child child_start
+    for child in "${children[@]}"; do
+        child_start="$(build_process_start_ticks "${child}" "${pid}" || true)"
+        stop_owned_build_process "${child}" "${child_start}" "${pid}"
+    done
+    actual_start="$(build_process_start_ticks "${pid}" "${expected_parent}" || true)"
+    if [[ "${actual_start}" == "${expected_start}" ]]; then
+        kill -KILL "${pid}" >/dev/null 2>&1 || true
+    fi
+}
+
+terminate_active_builds() {
+    local container
+    for container in "${active_build_container_names[@]}"; do
+        docker rm -f "${container}" >/dev/null 2>&1 || true
+    done
+    active_build_container_names=()
+
+    local pid
+    for pid in "${active_build_pids[@]}"; do
+        stop_owned_build_process "${pid}" "${active_build_start_ticks[${pid}]:-}" "${BASHPID}"
+    done
+    for pid in "${active_build_pids[@]}"; do
+        wait "${pid}" >/dev/null 2>&1 || true
+    done
+    active_build_pids=()
+    active_build_start_ticks=()
+}
+
+run_owned_container_command() {
+    local owned_container_name="$1"
+    shift
+
+    active_build_container_names=("${owned_container_name}")
+    docker rm -f "${owned_container_name}" >/dev/null 2>&1 || true
+    local exit_status=0
+    if "$@"; then
+        exit_status=0
+    else
+        exit_status=$?
+    fi
+    active_build_container_names=()
+    return "${exit_status}"
+}
+
+run_owned_toolchain_command() {
+    local owned_container_name="$1"
+    local command="$2"
+    run_owned_container_command "${owned_container_name}" \
+        run_toolchain_command "${command}" "${owned_container_name}"
+}
+
+run_owned_docker_command() {
+    local owned_container_name="$1"
+    shift
+    run_owned_container_command "${owned_container_name}" docker "$@"
+}
+
+wait_for_owned_subprocess() {
+    local owned_pid="$1"
+    local wait_status=0
+    while true; do
+        if wait "${owned_pid}"; then
+            return 0
+        fi
+        wait_status=$?
+        if ! kill -0 "${owned_pid}" >/dev/null 2>&1; then
+            return "${wait_status}"
+        fi
+    done
+}
+
+kill_owned_local_process() {
+    local owned_pid="$1"
+    if (( owned_pid <= 0 )); then
+        return 0
+    fi
+    local -a children=()
+    if [[ -r "/proc/${owned_pid}/task/${owned_pid}/children" ]]; then
+        read -r -a children < "/proc/${owned_pid}/task/${owned_pid}/children" || true
+    fi
+    local child_pid
+    for child_pid in "${children[@]}"; do
+        kill -KILL "${child_pid}" >/dev/null 2>&1 || true
+    done
+    kill -KILL "${owned_pid}" >/dev/null 2>&1 || true
+}
+
+remove_owned_container_bounded() {
+    local timeout_seconds="$1"
+    timeout --foreground --signal=KILL "${timeout_seconds}s" docker rm -f "${container_name}" >/dev/null 2>&1 &
+    cleanup_docker_pid=$!
+    local removal_status=0
+    wait_for_owned_subprocess "${cleanup_docker_pid}" || removal_status=$?
+    cleanup_docker_pid=0
+    return "${removal_status}"
+}
+
+cleanup_owned_container() {
+    local exit_status="$1"
+    trap - EXIT
+    trap 'force_shutdown_from_signal' HUP INT QUIT ABRT PIPE TERM USR1 USR2
+    terminate_active_builds
+    if (( container_cleanup_armed )); then
+        container_cleanup_armed=0
+        local cleanup_status=0
+        remove_owned_container_bounded 15 || cleanup_status=$?
+        if (( cleanup_status != 0 )); then
+            cleanup_status=0
+            remove_owned_container_bounded 5 || cleanup_status=$?
+        fi
+
+        local remaining_container=""
+        if ! remaining_container="$(timeout --foreground --signal=KILL 5s docker container ls -a \
+            --filter "name=^/${container_name}$" --format '{{.Names}}' 2>/dev/null)"; then
+            cleanup_status=1
+        elif [[ -n "${remaining_container}" ]]; then
+            cleanup_status=1
+        else
+            cleanup_status=0
+        fi
+        if (( cleanup_status != 0 )); then
+            log "container cleanup did not complete within its bounded deadline"
+            if (( exit_status == 0 )); then
+                exit_status=1
+            fi
+        fi
+    fi
+    exit "${exit_status}"
+}
+
+force_shutdown_from_signal() {
+    shutdown_signal_count=$((shutdown_signal_count + 1))
+    kill_owned_local_process "${active_docker_pid}"
+    kill_owned_local_process "${shutdown_docker_pid}"
+    kill_owned_local_process "${cleanup_docker_pid}"
+    terminate_active_builds
+}
+
+milliseconds_duration() {
+    printf '%s.%03ds' "$(( $1 / 1000 ))" "$(( $1 % 1000 ))"
+}
+
+shutdown_gui_runtime_in_container() {
+    local signal_name="${1:-TERM}"
+    local grace_ticks="${2:-100}"
+    if [[ "${gui_mode:-0}" != "1" ]] || (( ! container_cleanup_armed )); then
+        return 0
+    fi
+
+    timeout --foreground --signal=KILL 15s docker exec -u 0 "${container_name}" /bin/sh -lc "$(declare -f milliseconds_duration)"'
+        signal_name="$1"
+        grace_ticks="$2"
+        runtime_pid="$(pgrep -o -f "[/]opt/mmltk/bin/mmltk-browser-host" 2>/dev/null || true)"
+        if [ -z "${runtime_pid}" ]; then
+            exit 0
+        fi
+
+        signal_runtime() {
+            signal_name="$1"
+            kill "-${signal_name}" "${runtime_pid}" 2>/dev/null || true
+        }
+
+        wait_runtime() {
+            wait_ticks="$1"
+            wait_milliseconds=$((wait_ticks * 100))
+            if ! pgrep -f "[/]opt/mmltk/bin/mmltk-browser-host" >/dev/null 2>&1; then
+                return 0
+            fi
+            if timeout --foreground --signal=KILL "$(milliseconds_duration "${wait_milliseconds}")" \
+                    pidwait -o -f "[/]opt/mmltk/bin/mmltk-browser-host"; then
+                return 0
+            fi
+            ! pgrep -f "[/]opt/mmltk/bin/mmltk-browser-host" >/dev/null 2>&1
+        }
+
+        signal_runtime "${signal_name}"
+        if wait_runtime "${grace_ticks}"; then
+            exit 0
+        fi
+        signal_runtime TERM
+        if wait_runtime 10; then
+            exit 0
+        fi
+        signal_runtime KILL
+        wait_runtime 10 || true
+        exit 1
+    ' mmltk-gui-shutdown "${signal_name}" "${grace_ticks}" >/dev/null 2>&1 &
+    shutdown_docker_pid=$!
+    local shutdown_status=0
+    wait_for_owned_subprocess "${shutdown_docker_pid}" || shutdown_status=$?
+    shutdown_docker_pid=0
+    return "${shutdown_status}"
+}
+
+wait_for_local_pid_exit() {
+    local target_pid="$1"
+    local timeout_ms="$2"
+    if ! kill -0 "${target_pid}" >/dev/null 2>&1; then
+        return 0
+    fi
+    if timeout --foreground --signal=KILL "$(milliseconds_duration "${timeout_ms}")" \
+            pidwait -p "${target_pid}"; then
+        return 0
+    fi
+    ! kill -0 "${target_pid}" >/dev/null 2>&1
+}
+
+terminate_active_docker_exec() {
+    local signal_name="$1"
+    if (( active_docker_pid <= 0 )); then
+        return 0
+    fi
+    kill -s "${signal_name}" "${active_docker_pid}" >/dev/null 2>&1 || true
+    if ! wait_for_local_pid_exit "${active_docker_pid}" 2000; then
+        kill -TERM "${active_docker_pid}" >/dev/null 2>&1 || true
+    fi
+    if ! wait_for_local_pid_exit "${active_docker_pid}" 2000; then
+        kill -KILL "${active_docker_pid}" >/dev/null 2>&1 || true
+        wait_for_local_pid_exit "${active_docker_pid}" 1000 || true
+    fi
+    wait "${active_docker_pid}" >/dev/null 2>&1 || true
+    active_docker_pid=0
+}
+
+exit_from_signal() {
+    local signal_name="$1"
+    local exit_status="$2"
+    if (( shutdown_signal_count != 0 )); then
+        force_shutdown_from_signal
+        return
+    fi
+    shutdown_signal_count=1
+    trap 'force_shutdown_from_signal' HUP INT QUIT ABRT PIPE TERM USR1 USR2
+    local runtime_signal=TERM
+    if [[ "${signal_name}" == "INT" ]]; then
+        runtime_signal=INT
+    fi
+    shutdown_gui_runtime_in_container "${runtime_signal}" 100 || true
+    terminate_active_docker_exec "${signal_name}"
+    terminate_active_builds
+    exit "${exit_status}"
+}
+
+trap 'cleanup_owned_container "$?"' EXIT
+trap 'exit_from_signal HUP 129' HUP
+trap 'exit_from_signal INT 130' INT
+trap 'exit_from_signal QUIT 131' QUIT
+trap 'exit_from_signal ABRT 134' ABRT
+trap 'exit_from_signal PIPE 141' PIPE
+trap 'exit_from_signal TERM 143' TERM
+trap 'exit_from_signal USR1 138' USR1
+trap 'exit_from_signal USR2 140' USR2
+
+docker_server_ready() {
+    docker version --format '{{.Server.Version}}' >/dev/null 2>&1
+}
+
+best_effort_start_docker() {
+    local -a attempts=(
+        "systemctl --user start docker"
+        "systemctl start docker"
+        "service docker start"
+        "sudo -n systemctl --user start docker"
+        "sudo -n systemctl start docker"
+        "sudo -n service docker start"
+    )
+    local attempt
+    for attempt in "${attempts[@]}"; do
+        if ${attempt} >/dev/null 2>&1; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+ensure_docker() {
+    command -v docker >/dev/null 2>&1 || die "docker is not installed"
+    if docker_server_ready; then
+        cleanup_stale_wrapper_containers
+        return 0
+    fi
+
+    log "docker daemon is unavailable; attempting a best-effort start"
+    best_effort_start_docker || true
+    if docker_server_ready; then
+        cleanup_stale_wrapper_containers
+        return 0
+    fi
+
+    die "docker is still unavailable. Start dockerd, then rerun this command."
+}
+
+ensure_image() {
+    docker image inspect "${image_name}" >/dev/null 2>&1 || die \
+        "image '${image_name}' is missing. Build it first with: ./mmltk --build"
+}
+
+prepare_owned_dirs() {
+    local path
+    for path in "$@"; do
+        install -d -m 0755 "${path}"
+        chown "${uid}:${gid}" "${path}" 2>/dev/null || true
+    done
+}
+
+prepare_cache_layout() {
+    prepare_owned_dirs \
+        "${cache_root}" \
+        "${cmake_cache_root}/release" \
+        "${cargo_cache_root}/home" \
+        "${cargo_cache_root}/target/browser-app" \
+        "${ccache_root}" \
+        "${firefox_cache_root}/obj-minimal-opt" \
+        "${firefox_cache_root}/mozbuild" \
+        "${firefox_cache_root}/sccache" \
+        "${buildkit_cache_root}" \
+        "${image_fingerprint_root}" \
+        "${lock_root}"
+}
+
+append_wrapper_labels() {
+    local -n target_args="$1"
+    local mode="$2"
+    target_args+=(
+        --label com.mmltk.wrapper=1
+        --label "com.mmltk.repo=${repo_root}"
+        --label "com.mmltk.owner-pid=${wrapper_pid}"
+        --label "com.mmltk.owner-start=${wrapper_start_ticks}"
+        --label "com.mmltk.mode=${mode}"
+    )
+}
+
+prepare_lock_file() {
+    local lock_file="$1"
+    prepare_owned_dirs "$(dirname "${lock_file}")"
+    touch "${lock_file}" || die "cannot create lock file '${lock_file}'"
+    chown "${uid}:${gid}" "${lock_file}" 2>/dev/null || true
+    chmod 0664 "${lock_file}" 2>/dev/null || true
+    [[ -r "${lock_file}" && -w "${lock_file}" ]] || die \
+        "lock file '${lock_file}' is not accessible to uid ${uid}"
+}
+
+acquire_mutation_locks() {
+    (( mutation_locks_acquired == 0 )) || return 0
+    command -v flock >/dev/null 2>&1 || die "flock is required"
+    local checkout_lock="${repository_cache_root}/locks/checkout.lock"
+    local cache_lock="${lock_root}/cache-root.lock"
+    local runtime_lock="${repository_cache_root}/locks/runtime.lock"
+    prepare_lock_file "${checkout_lock}"
+    prepare_lock_file "${cache_lock}"
+    prepare_lock_file "${runtime_lock}"
+    exec 8>>"${checkout_lock}"
+    flock -n -x 8 || die \
+        "another build, GUI build, test, or tidy invocation is already active in this checkout"
+    exec 9>>"${cache_lock}"
+    flock -n -x 9 || die \
+        "another invocation is already mutating cache root '${cache_root}'"
+    mutation_locks_acquired=1
+}
+
+release_mutation_locks() {
+    (( mutation_locks_acquired == 1 )) || return 0
+    flock -u 9
+    exec 9>&-
+    flock -u 8
+    exec 8>&-
+    mutation_locks_acquired=0
+}
+
+acquire_runtime_lock() {
+    (( runtime_lock_acquired == 0 )) || return 0
+    command -v flock >/dev/null 2>&1 || die "flock is required"
+    local runtime_lock="${repository_cache_root}/locks/runtime.lock"
+    prepare_lock_file "${runtime_lock}"
+    exec {runtime_lock_fd}>>"${runtime_lock}"
+    if (( gui_mode )); then
+        flock -n -x "${runtime_lock_fd}" || die \
+            "GUI cannot start while another GUI or raw mmltk invocation is active"
+    else
+        flock -n -s "${runtime_lock_fd}" || die \
+            "raw mmltk invocation cannot start while the GUI is active"
+    fi
+    runtime_lock_acquired=1
+}
+
+release_runtime_lock() {
+    (( runtime_lock_acquired == 1 )) || return 0
+    flock -u "${runtime_lock_fd}"
+    exec {runtime_lock_fd}>&-
+    runtime_lock_fd=-1
+    runtime_lock_acquired=0
+}
+
+cleanup_stale_wrapper_containers() {
+    (( stale_container_cleanup_done == 0 )) || return 0
+    stale_container_cleanup_done=1
+
+    local -a candidate_ids=()
+    mapfile -t candidate_ids < <(
+        docker ps -aq \
+            --filter label=com.mmltk.wrapper=1 \
+            --filter "label=com.mmltk.repo=${repo_root}" 2>/dev/null || true
+    )
+
+    local candidate_id owner_pid owner_start live_start
+    for candidate_id in "${candidate_ids[@]}"; do
+        [[ -n "${candidate_id}" ]] || continue
+        owner_pid="$(docker inspect \
+            --format '{{ index .Config.Labels "com.mmltk.owner-pid" }}' \
+            "${candidate_id}" 2>/dev/null || true)"
+        owner_start="$(docker inspect \
+            --format '{{ index .Config.Labels "com.mmltk.owner-start" }}' \
+            "${candidate_id}" 2>/dev/null || true)"
+        live_start=""
+        if [[ "${owner_pid}" =~ ^[1-9][0-9]*$ && -r "/proc/${owner_pid}/stat" ]]; then
+            live_start="$(awk '{ print $22 }' "/proc/${owner_pid}/stat" 2>/dev/null || true)"
+        fi
+        if [[ -n "${live_start}" && "${live_start}" == "${owner_start}" ]]; then
+            continue
+        fi
+        log "removing orphaned wrapper container ${candidate_id}"
+        docker rm -f "${candidate_id}" >/dev/null 2>&1 || true
+    done
+}
+
+ensure_buildx_builder() {
+    (( buildx_builder_ready == 0 )) || return 0
+    docker buildx version >/dev/null 2>&1 || die "docker buildx is required"
+
+    local inspect_output=""
+    if ! inspect_output="$(docker buildx inspect "${buildx_builder_name}" 2>/dev/null)"; then
+        log "creating checkout-scoped Buildx builder '${buildx_builder_name}'"
+        local create_output=""
+        if ! create_output="$(docker buildx create \
+            --name "${buildx_builder_name}" \
+            --driver docker-container 2>&1)"; then
+            inspect_output="$(docker buildx inspect "${buildx_builder_name}" 2>/dev/null)" || die \
+                "failed to create Buildx builder '${buildx_builder_name}': ${create_output}"
+        fi
+    fi
+
+    inspect_output="$(docker buildx inspect "${buildx_builder_name}")"
+    local builder_driver
+    builder_driver="$(awk '/^Driver:/ { print $2; exit }' <<<"${inspect_output}")"
+    [[ "${builder_driver}" == "docker-container" ]] || die \
+        "Buildx builder '${buildx_builder_name}' uses '${builder_driver:-unknown}', expected docker-container"
+    docker buildx inspect "${buildx_builder_name}" --bootstrap >/dev/null || die \
+        "failed to bootstrap Buildx builder '${buildx_builder_name}'"
+    buildx_builder_ready=1
+}
+
+ensure_default_engine_builder() {
+    (( default_engine_builder_ready == 0 )) || return 0
+    docker buildx version >/dev/null 2>&1 || die "docker buildx is required"
+
+    local inspect_output=""
+    if ! inspect_output="$(docker buildx inspect default 2>&1)"; then
+        die "failed to inspect Buildx builder 'default': ${inspect_output}"
+    fi
+    local builder_driver
+    builder_driver="$(awk '/^Driver:/ { print $2; exit }' <<<"${inspect_output}")"
+    [[ "${builder_driver}" == "docker" ]] || die \
+        "Buildx builder 'default' uses '${builder_driver:-unknown}', expected docker for Docker Engine image contexts"
+    default_engine_builder_ready=1
+}
+
+content_derived_local_image_alias() {
+    local component="$1"
+    local image_identity="$2"
+    [[ "${image_identity}" =~ ^sha256:[[:xdigit:]]{64}$ ]] || die \
+        "image identity for '${component}' is not a Docker image ID: '${image_identity}'"
+
+    local image_alias="mmltk-local-${component}:${image_identity#sha256:}"
+    docker tag "${image_identity}" "${image_alias}"
+    local alias_identity
+    alias_identity="$(docker image inspect "${image_alias}" --format '{{.Id}}')"
+    [[ "${alias_identity}" == "${image_identity}" ]] || die \
+        "local alias '${image_alias}' resolves to '${alias_identity:-missing}', expected '${image_identity}'"
+    printf '%s\n' "${image_alias}"
+}
+
+verify_content_derived_local_image_alias() {
+    local image_alias="$1"
+    local image_identity="$2"
+    local alias_identity
+    alias_identity="$(docker image inspect "${image_alias}" --format '{{.Id}}' 2>/dev/null || true)"
+    [[ "${alias_identity}" == "${image_identity}" ]] || die \
+        "local alias '${image_alias}' changed to '${alias_identity:-missing}', expected '${image_identity}'"
+}
+
+cached_buildx_image() {
+    local builder="$1"
+    local target="$2"
+    local tag="$3"
+    local dockerfile="$4"
+    local cache_name="$5"
+    local fingerprint="$6"
+    local context="$7"
+    shift 7
+    local trace_event="image:${cache_name}"
+    if [[ "${cache_name}" == runtime ]]; then trace_event=runtime_image; fi
+
+    local fingerprint_dir="${image_fingerprint_root}"
+    local fingerprint_file="${fingerprint_dir}/${cache_name}.sha256"
+    local image_fingerprint=""
+    if docker image inspect "${tag}" >/dev/null 2>&1; then
+        image_fingerprint="$(docker image inspect "${tag}" \
+            --format '{{ index .Config.Labels "com.mmltk.input-fingerprint" }}' 2>/dev/null || true)"
+    fi
+    if docker image inspect "${tag}" >/dev/null 2>&1 \
+        && [[ "${image_fingerprint}" == "${fingerprint}" ]]; then
+        prepare_owned_dirs "${fingerprint_dir}"
+        if [[ ! -f "${fingerprint_file}" ]] \
+            || [[ "$(<"${fingerprint_file}")" != "${fingerprint}" ]]; then
+            printf '%s\n' "${fingerprint}" >"${fingerprint_file}"
+        fi
+        if [[ "${cache_name}" == runtime ]]; then log "runtime image is current"; fi
+        trace_build_event "${trace_event}" cache_hit
+        return 0
+    fi
+    command -v docker >/dev/null 2>&1 || die "docker is not installed"
+    local build_cache="${buildkit_cache_root}/${cache_name}"
+    local -a cache_args=()
+    if [[ "${builder}" == "default" ]]; then
+        ensure_default_engine_builder
+        # The Docker driver owns its image-layer cache.  It cannot export the
+        # local cache backend used by the isolated bootstrap builder.
+        prepare_owned_dirs "${fingerprint_dir}"
+    else
+        ensure_buildx_builder
+        [[ "${builder}" == "${buildx_builder_name}" ]] || die \
+            "unsupported cached Buildx builder '${builder}'"
+        prepare_owned_dirs "${fingerprint_dir}" "${build_cache}"
+        cache_args=(--cache-to "type=local,dest=${build_cache},mode=max")
+        if [[ -f "${build_cache}/index.json" ]]; then
+            cache_args+=(--cache-from "type=local,src=${build_cache}")
+        fi
+    fi
+
+    local -a target_args=()
+    if [[ "${target}" != "-" ]]; then
+        target_args+=(--target "${target}")
+        log "building cached image '${tag}' from target '${target}'"
+    else
+        log "building cached image '${tag}'"
+    fi
+    trace_build_event "${trace_event}" cache_miss
+    local build_status=0
+    if docker buildx build \
+            --builder "${builder}" \
+            --progress=plain \
+            --load \
+            "${target_args[@]}" \
+            --tag "${tag}" \
+            --file "${dockerfile}" \
+            --build-arg "MMLTK_IMAGE_FINGERPRINT=${fingerprint}" \
+            "${cache_args[@]}" \
+            "$@" \
+            "${context}"; then
+        :
+    else
+        build_status=$?
+        log "failed to build cached image '${tag}' (exit ${build_status})"
+        return "${build_status}"
+    fi
+    docker image inspect "${tag}" >/dev/null 2>&1 || die "image '${tag}' was not loaded"
+    image_fingerprint="$(docker image inspect "${tag}" \
+        --format '{{ index .Config.Labels "com.mmltk.input-fingerprint" }}')"
+    [[ "${image_fingerprint}" == "${fingerprint}" ]] || die \
+        "image '${tag}' has fingerprint label '${image_fingerprint:-missing}', expected '${fingerprint}'"
+    printf '%s\n' "${fingerprint}" >"${fingerprint_file}"
+}
+
+manifest_value() {
+    local key="$1"
+    local value
+    value="$(sed -n "s/.*\"${key}\": \"\([^\"]*\)\".*/\1/p" \
+        "${repo_root}/docker/nvidia-payload.json")"
+    [[ -n "${value}" && "${value}" != *$'\n'* ]] || die "manifest key '${key}' is missing or ambiguous"
+    printf '%s\n' "${value}"
+}
+
+initialize_nvidia_inputs() {
+    local canonical_donor
+    canonical_donor="$(manifest_value donor)"
+    nvidia_donor_image="${MMLTK_NVIDIA_DONOR_IMAGE:-${canonical_donor}}"
+    [[ "${nvidia_donor_image}" == "${canonical_donor}" && "${nvidia_donor_image}" =~ @sha256:[[:xdigit:]]{64}$ ]] || die \
+        "MMLTK_NVIDIA_DONOR_IMAGE must match the canonical immutable donor in docker/nvidia-payload.json"
+    [[ "$(manifest_value platform)" == linux/amd64 ]] || die "NVIDIA payload requires Linux/amd64"
+    nvidia_configuration_args=(
+        --build-arg "MMLTK_CUDA_ROOT=$(manifest_value cuda_root)"
+        --build-arg "MMLTK_PYTHON_ROOT=$(manifest_value python_root)"
+        --build-arg "MMLTK_NVIDIA_LIBRARY_PATH=$(nvidia_library_path)"
+        --build-arg "MMLTK_CUDA_VERSION=$(manifest_value cuda)"
+        --build-arg "MMLTK_TORCH_VERSION=$(manifest_value torch)"
+        --build-arg "MMLTK_TENSORRT_VERSION=$(manifest_value tensorrt)"
+    )
+}
+
+nvidia_library_path() {
+    local order key root result=""
+    local -a root_keys=()
+    order="$(sed -n 's/.*"library_order": \[\(.*\)\].*/\1/p' "${repo_root}/docker/nvidia-payload.json")"
+    [[ -n "${order}" && "${order}" != *$'\n'* ]] || die "missing or ambiguous NVIDIA library order"
+    order="${order//\"/}"
+    order="${order//,/ }"
+    read -r -a root_keys <<<"${order}"
+    for key in "${root_keys[@]}"; do
+        root="$(manifest_value "${key}")"
+        if [[ "${key}" == cuda_root ]]; then root+=/lib64; else root+=/lib; fi
+        result+="${result:+:}${root}"
+    done
+    printf '%s\n' "${result}"
+}
+
+verify_image_label() {
+    local image="$1" key="$2" expected="$3"
+    local actual
+    actual="$(docker image inspect "${image}" --format "{{ index .Config.Labels \"com.mmltk.${key}\" }}")"
+    [[ "${actual}" == "${expected}" ]] || die \
+        "image '${image}' label '${key}' is '${actual:-missing}', expected '${expected}'"
+}
+
+verify_nvidia_image_labels() {
+    local image="$1" mode="$2"
+    verify_image_label "${image}" nvidia-donor "${nvidia_donor_image}"
+    verify_image_label "${image}" payload-mode "${mode}"
+    local component
+    for component in cuda torch tensorrt; do
+        verify_image_label "${image}" "${component}-version" "$(manifest_value "${component}")"
+    done
+}
+
+owned_ubuntu_identity() {
+    if ! docker image inspect ubuntu:24.04 >/dev/null 2>&1; then
+        docker pull --platform linux/amd64 ubuntu:24.04 >&2
+    fi
+    [[ "$(docker image inspect ubuntu:24.04 --format '{{.Os}}/{{.Architecture}}')" == linux/amd64 ]] || die \
+        "owned Ubuntu base requires Linux/amd64"
+    docker image inspect ubuntu:24.04 --format '{{.Id}}'
+}
+
+nvidia_payload_image_fingerprint() {
+    {
+        printf '%s\n' nvidia-payload "${nvidia_donor_image}"
+        sha256sum "${repo_root}/docker/Dockerfile.nvidia" \
+            "${repo_root}/docker/nvidia-payload.json" \
+            "${repo_root}/docker/materialize_nvidia_payload.py" \
+            "${repo_root}/docker/nvidia_payload.py"
+    } | sha256sum | cut -d' ' -f1
+}
+
+ensure_nvidia_payload_image() {
+    initialize_nvidia_inputs
+    local fingerprint
+    fingerprint="$(nvidia_payload_image_fingerprint)"
+    cached_buildx_image "${buildx_builder_name}" payload "${nvidia_payload_image_name}" \
+        "${repo_root}/docker/Dockerfile.nvidia" nvidia-payload "${fingerprint}" "${repo_root}" \
+        --platform "$(manifest_value platform)" --build-arg "MMLTK_NVIDIA_DONOR_IMAGE=${nvidia_donor_image}"
+    verify_image_label "${nvidia_payload_image_name}" nvidia-donor "${nvidia_donor_image}"
+    verify_image_label "${nvidia_payload_image_name}" payload-mode extraction
+}
+
+gcc16_image_fingerprint() {
+    {
+        printf '%s\n' gcc16 ubuntu:24.04
+        sha256sum "${repo_root}/docker/Dockerfile.gcc"
+    } | sha256sum | cut -d' ' -f1
+}
+
+ensure_gcc16_image() {
+    local fingerprint
+    fingerprint="$(gcc16_image_fingerprint)"
+    cached_buildx_image "${buildx_builder_name}" gcc16 "${gcc16_image_name}" \
+        "${repo_root}/docker/Dockerfile.gcc" gcc16 "${fingerprint}" "${repo_root}" \
+        --build-arg "MMLTK_GCC_BUILD_IMAGE=ubuntu:24.04"
+}
+
+ensure_ubuntu_image() {
+    local identity alias fingerprint
+    identity="$(owned_ubuntu_identity)"
+    alias="$(content_derived_local_image_alias ubuntu-source "${identity}")"
+    fingerprint="$({
+        printf '%s\n' ubuntu "${identity}"
+        sha256sum "${repo_root}/docker/Dockerfile.ubuntu"
+    } | sha256sum | cut -d' ' -f1)"
+    cached_buildx_image default ubuntu "${ubuntu_image_name}" \
+        "${repo_root}/docker/Dockerfile.ubuntu" ubuntu "${fingerprint}" "${repo_root}" \
+        --build-context "mmltk_ubuntu=docker-image://${alias}" \
+        --build-arg "MMLTK_UBUNTU_IDENTITY=${identity}"
+    verify_content_derived_local_image_alias "${alias}" "${identity}"
+    verify_image_label "${ubuntu_image_name}" ubuntu-identity "${identity}"
+    verify_image_label "${ubuntu_image_name}" ubuntu-source-identity "${identity}"
+}
+
+verify_onnxruntime_image_labels() {
+    verify_image_label "${onnxruntime_image_name}" ubuntu-identity \
+        "$(docker image inspect "${ubuntu_image_name}" --format '{{.Id}}')"
+    verify_image_label "${onnxruntime_image_name}" gcc-identity \
+        "$(docker image inspect "${gcc16_image_name}" --format '{{.Id}}')"
+    verify_image_label "${onnxruntime_image_name}" nvidia-payload-identity \
+        "$(docker image inspect "${nvidia_payload_image_name}" --format '{{.Id}}')"
+}
+
+ensure_onnxruntime_image() {
+    local ubuntu_identity gcc16_identity payload_identity ubuntu_alias gcc16_alias payload_alias fingerprint
+    local onnxruntime_build_jobs="${build_jobs}"
+    if (( onnxruntime_build_jobs > 12 )); then onnxruntime_build_jobs=12; fi
+    ubuntu_identity="$(docker image inspect "${ubuntu_image_name}" --format '{{.Id}}')"
+    gcc16_identity="$(docker image inspect "${gcc16_image_name}" --format '{{.Id}}')"
+    payload_identity="$(docker image inspect "${nvidia_payload_image_name}" --format '{{.Id}}')"
+    verify_image_label "${nvidia_payload_image_name}" nvidia-donor "${nvidia_donor_image}"
+    verify_image_label "${nvidia_payload_image_name}" payload-mode extraction
+    ubuntu_alias="$(content_derived_local_image_alias ubuntu "${ubuntu_identity}")"
+    gcc16_alias="$(content_derived_local_image_alias gcc16 "${gcc16_identity}")"
+    payload_alias="$(content_derived_local_image_alias nvidia-payload "${payload_identity}")"
+    fingerprint="$({
+        printf '%s\n' onnxruntime "${ubuntu_identity}" "${gcc16_identity}" "${payload_identity}"
+        sha256sum "${repo_root}/docker/Dockerfile.onnxruntime" \
+            "${repo_root}/docker/patches/onnxruntime-1.27.1-cuda-graph-capture-end.patch" \
+            "${repo_root}/docker/patches/onnxruntime-1.27.1-gcc16.patch"
+    } | sha256sum | cut -d' ' -f1)"
+    cached_buildx_image default onnxruntime "${onnxruntime_image_name}" \
+        "${repo_root}/docker/Dockerfile.onnxruntime" onnxruntime "${fingerprint}" "${repo_root}" \
+        --build-context "mmltk_ubuntu=docker-image://${ubuntu_alias}" \
+        --build-context "mmltk_gcc16=docker-image://${gcc16_alias}" \
+        --build-context "mmltk_nvidia_payload=docker-image://${payload_alias}" \
+        --build-arg "MMLTK_UBUNTU_IDENTITY=${ubuntu_identity}" \
+        --build-arg "MMLTK_GCC_IDENTITY=${gcc16_identity}" \
+        --build-arg "MMLTK_NVIDIA_PAYLOAD_IDENTITY=${payload_identity}" \
+        --build-arg "MMLTK_ONNXRUNTIME_BUILD_JOBS=${onnxruntime_build_jobs}" \
+        --build-arg "MMLTK_NVIDIA_NATIVE_ROOT=$(manifest_value native_root)" \
+        "${nvidia_configuration_args[@]}"
+    verify_content_derived_local_image_alias "${ubuntu_alias}" "${ubuntu_identity}"
+    verify_content_derived_local_image_alias "${gcc16_alias}" "${gcc16_identity}"
+    verify_content_derived_local_image_alias "${payload_alias}" "${payload_identity}"
+    verify_onnxruntime_image_labels
+}
+
+ensure_toolchain_base_image() {
+    local gcc16_identity ubuntu_identity gcc16_alias ubuntu_alias fingerprint
+    gcc16_identity="$(docker image inspect "${gcc16_image_name}" --format '{{.Id}}')"
+    ubuntu_identity="$(docker image inspect "${ubuntu_image_name}" --format '{{.Id}}')"
+    gcc16_alias="$(content_derived_local_image_alias gcc16 "${gcc16_identity}")"
+    ubuntu_alias="$(content_derived_local_image_alias ubuntu "${ubuntu_identity}")"
+    fingerprint="$({
+        printf '%s\n' toolchain-base "${gcc16_identity}" "${ubuntu_identity}"
+        sha256sum "${repo_root}/docker/Dockerfile.core" \
+            "${repo_root}/docker/patches/libdeflate-gcc16.patch" \
+            "${repo_root}/docker/install_trunk.py" \
+            "${repo_root}/docker/record_compiler_evidence.py" \
+            "${repo_root}/src/frontend/iced/wasm-opt-wrapper"
+    } | sha256sum | cut -d' ' -f1)"
+    cached_buildx_image default toolchain "${toolchain_base_image_name}" \
+        "${repo_root}/docker/Dockerfile.core" core-toolchain "${fingerprint}" "${repo_root}" \
+        --build-context "mmltk_gcc16=docker-image://${gcc16_alias}" \
+        --build-context "mmltk_ubuntu=docker-image://${ubuntu_alias}" \
+        --build-arg "MMLTK_GCC_IDENTITY=${gcc16_identity}" \
+        --build-arg "MMLTK_UBUNTU_IDENTITY=${ubuntu_identity}"
+    verify_content_derived_local_image_alias "${gcc16_alias}" "${gcc16_identity}"
+    verify_content_derived_local_image_alias "${ubuntu_alias}" "${ubuntu_identity}"
+    verify_image_label "${toolchain_base_image_name}" gcc-identity "${gcc16_identity}"
+    verify_image_label "${toolchain_base_image_name}" ubuntu-identity "${ubuntu_identity}"
+}
+
+ensure_dependencies_image() {
+    local identity alias fingerprint
+    identity="$(docker image inspect "${toolchain_base_image_name}" --format '{{.Id}}')"
+    alias="$(content_derived_local_image_alias toolchain-base "${identity}")"
+    fingerprint="$({
+        printf '%s\n' dependencies "${identity}"
+        sha256sum "${repo_root}/docker/Dockerfile.dependencies"
+    } | sha256sum | cut -d' ' -f1)"
+    cached_buildx_image default dependencies "${dependencies_image_name}" \
+        "${repo_root}/docker/Dockerfile.dependencies" dependencies "${fingerprint}" "${repo_root}" \
+        --build-context "mmltk_toolchain_base=docker-image://${alias}" \
+        --build-arg "MMLTK_TOOLCHAIN_BASE_IDENTITY=${identity}"
+    verify_content_derived_local_image_alias "${alias}" "${identity}"
+    verify_image_label "${dependencies_image_name}" toolchain-base-identity "${identity}"
+}
+
+prepare_host_dependency_images() {
+    ensure_toolchain_base_image
+    ensure_dependencies_image
+}
+
+prepare_image_producers() {
+    initialize_nvidia_inputs
+    ensure_buildx_builder
+    ensure_default_engine_builder
+    ensure_ubuntu_image
+    # Run this before the release/runtime branches so wait ownership stays local
+    # and each producer publishes one completed image for both consumers.
+    run_traced_build_phase nvidia_payload ensure_nvidia_payload_image &
+    track_build_pid "$!"
+    run_traced_build_phase gcc16 ensure_gcc16_image &
+    track_build_pid "$!"
+    wait_for_parallel_builds
+    # ONNX source compilation consumes GCC and CUDA directly; it never consumes
+    # the toolchain image that will later install its completed package.
+    run_traced_build_phase host_dependencies prepare_host_dependency_images &
+    track_build_pid "$!"
+    run_traced_build_phase onnxruntime ensure_onnxruntime_image &
+    track_build_pid "$!"
+    wait_for_parallel_builds
+}
+
+ensure_build_image() {
+    initialize_nvidia_inputs
+    if (( image_producers_prepared == 0 )); then
+        prepare_image_producers
+        image_producers_prepared=1
+    fi
+    local base_identity payload_identity dependencies_identity ort_identity
+    local dependencies_alias payload_alias ort_alias fingerprint compilation_identity
+    base_identity="$(docker image inspect "${toolchain_base_image_name}" --format '{{.Id}}')"
+    payload_identity="$(docker image inspect "${nvidia_payload_image_name}" --format '{{.Id}}')"
+    dependencies_identity="$(docker image inspect "${dependencies_image_name}" --format '{{.Id}}')"
+    ort_identity="$(docker image inspect "${onnxruntime_image_name}" --format '{{.Id}}')"
+    verify_image_label "${dependencies_image_name}" toolchain-base-identity "${base_identity}"
+    verify_image_label "${nvidia_payload_image_name}" nvidia-donor "${nvidia_donor_image}"
+    verify_image_label "${nvidia_payload_image_name}" payload-mode extraction
+    verify_onnxruntime_image_labels
+    dependencies_alias="$(content_derived_local_image_alias dependencies "${dependencies_identity}")"
+    payload_alias="$(content_derived_local_image_alias nvidia-payload "${payload_identity}")"
+    ort_alias="$(content_derived_local_image_alias onnxruntime "${ort_identity}")"
+    compilation_identity="sha256:$({
+        printf '%s\n' compilation "${dependencies_identity}" "${payload_identity}" "${ort_identity}"
+        sha256sum "${repo_root}/docker/Dockerfile.toolchain" \
+            "${repo_root}/docker/patches/gcc16-nvcc-string-substr.patch"
+    } | sha256sum | cut -d' ' -f1)"
+    fingerprint="$({
+        printf '%s\n' toolchain "${base_identity}" "${dependencies_identity}" "${payload_identity}" "${ort_identity}"
+        sha256sum "${repo_root}/docker/Dockerfile.toolchain" \
+            "${repo_root}/docker/patches/gcc16-nvcc-string-substr.patch" \
+            "${repo_root}/docker/verify_nvidia_payload.py" "${repo_root}/docker/nvidia_payload.py" \
+            "${repo_root}/tools/check_toolchain_invariants.py"
+    } | sha256sum | cut -d' ' -f1)"
+    cached_buildx_image default - "${build_image_name}" \
+        "${repo_root}/docker/Dockerfile.toolchain" toolchain "${fingerprint}" "${repo_root}" \
+        --build-context "mmltk_dependencies=docker-image://${dependencies_alias}" \
+        --build-context "mmltk_nvidia_payload=docker-image://${payload_alias}" \
+        --build-context "mmltk_onnxruntime=docker-image://${ort_alias}" \
+        --build-arg "MMLTK_COMPILATION_IDENTITY=${compilation_identity}" \
+        --build-arg "MMLTK_TOOLCHAIN_BASE_IDENTITY=${base_identity}" \
+        --build-arg "MMLTK_DEPENDENCIES_IDENTITY=${dependencies_identity}" \
+        --build-arg "MMLTK_ONNXRUNTIME_IDENTITY=${ort_identity}" \
+        --build-arg "MMLTK_NVIDIA_PAYLOAD_IDENTITY=${payload_identity}" \
+        --build-arg "MMLTK_NVIDIA_DONOR_IMAGE=${nvidia_donor_image}" \
+        "${nvidia_configuration_args[@]}"
+    verify_content_derived_local_image_alias "${dependencies_alias}" "${dependencies_identity}"
+    verify_content_derived_local_image_alias "${payload_alias}" "${payload_identity}"
+    verify_content_derived_local_image_alias "${ort_alias}" "${ort_identity}"
+    verify_image_label "${build_image_name}" toolchain-base-identity "${base_identity}"
+    verify_image_label "${build_image_name}" compilation-identity "${compilation_identity}"
+    verify_image_label "${build_image_name}" dependencies-identity "${dependencies_identity}"
+    verify_image_label "${build_image_name}" onnxruntime-identity "${ort_identity}"
+    verify_image_label "${build_image_name}" nvidia-payload-identity "${payload_identity}"
+    verify_nvidia_image_labels "${build_image_name}" development
+}
+
+ensure_runtime_base_image() {
+    initialize_nvidia_inputs
+    if (( image_producers_prepared == 0 )); then
+        ensure_ubuntu_image
+        ensure_gcc16_image
+        ensure_nvidia_payload_image
+        ensure_onnxruntime_image
+    fi
+    local payload_identity ubuntu_identity ort_identity payload_alias ubuntu_alias ort_alias fingerprint
+    payload_identity="$(docker image inspect "${nvidia_payload_image_name}" --format '{{.Id}}')"
+    ubuntu_identity="$(docker image inspect "${ubuntu_image_name}" --format '{{.Id}}')"
+    ort_identity="$(docker image inspect "${onnxruntime_image_name}" --format '{{.Id}}')"
+    verify_image_label "${nvidia_payload_image_name}" nvidia-donor "${nvidia_donor_image}"
+    verify_image_label "${nvidia_payload_image_name}" payload-mode extraction
+    verify_onnxruntime_image_labels
+    payload_alias="$(content_derived_local_image_alias nvidia-payload "${payload_identity}")"
+    ubuntu_alias="$(content_derived_local_image_alias ubuntu "${ubuntu_identity}")"
+    ort_alias="$(content_derived_local_image_alias onnxruntime "${ort_identity}")"
+    fingerprint="$({
+        printf '%s\n' runtime-base "${payload_identity}" "${ubuntu_identity}" "${ort_identity}"
+        sha256sum "${repo_root}/docker/Dockerfile.runtime-base" \
+            "${repo_root}/docker/verify_nvidia_payload.py" "${repo_root}/docker/nvidia_payload.py"
+    } | sha256sum | cut -d' ' -f1)"
+    cached_buildx_image default runtime-base "${runtime_base_image_name}" \
+        "${repo_root}/docker/Dockerfile.runtime-base" runtime-base "${fingerprint}" "${repo_root}" \
+        --build-context "mmltk_nvidia_payload=docker-image://${payload_alias}" \
+        --build-context "mmltk_ubuntu=docker-image://${ubuntu_alias}" \
+        --build-context "mmltk_onnxruntime=docker-image://${ort_alias}" \
+        --build-arg "MMLTK_NVIDIA_DONOR_IMAGE=${nvidia_donor_image}" \
+        --build-arg "MMLTK_NVIDIA_PAYLOAD_IDENTITY=${payload_identity}" \
+        --build-arg "MMLTK_UBUNTU_IDENTITY=${ubuntu_identity}" \
+        --build-arg "MMLTK_ONNXRUNTIME_IDENTITY=${ort_identity}" \
+        "${nvidia_configuration_args[@]}"
+    verify_content_derived_local_image_alias "${payload_alias}" "${payload_identity}"
+    verify_content_derived_local_image_alias "${ubuntu_alias}" "${ubuntu_identity}"
+    verify_content_derived_local_image_alias "${ort_alias}" "${ort_identity}"
+    verify_image_label "${runtime_base_image_name}" nvidia-payload-identity "${payload_identity}"
+    verify_image_label "${runtime_base_image_name}" onnxruntime-identity "${ort_identity}"
+    verify_image_label "${runtime_base_image_name}" ubuntu-identity "${ubuntu_identity}"
+    verify_nvidia_image_labels "${runtime_base_image_name}" runtime
+}
+
+ensure_analysis_image() {
+    ensure_build_image
+    local build_image_id analysis_image_id=""
+    build_image_id="$(docker image inspect "${build_image_name}" --format '{{.Id}}')"
+    if docker image inspect "${analysis_image_name}" >/dev/null 2>&1; then
+        analysis_image_id="$(docker image inspect "${analysis_image_name}" --format '{{.Id}}')"
+    fi
+    if [[ "${analysis_image_id}" != "${build_image_id}" ]]; then
+        log "tagging source-free toolchain as analysis image '${analysis_image_name}'"
+        docker tag "${build_image_name}" "${analysis_image_name}"
+    fi
+}
+
+prepare_tidy_logging() {
+    local tidy_log_file="${MMLTK_TIDY_LOG_FILE:-}"
+    if [[ -z "${tidy_log_file}" ]]; then
+        tidy_log_file="${repo_root}/build/logs/mmltk-tidy-$(date +%Y%m%d-%H%M%S).log"
+    elif [[ "${tidy_log_file}" != /* ]]; then
+        tidy_log_file="${host_workdir}/${tidy_log_file}"
+    fi
+
+    mkdir -p "$(dirname "${tidy_log_file}")"
+    touch "${tidy_log_file}"
+    chown "${uid}:${gid}" "$(dirname "${tidy_log_file}")" "${tidy_log_file}" 2>/dev/null || true
+    export MMLTK_TIDY_LOG_FILE="${tidy_log_file}"
+    export MMLTK_TIDY_TEE_STARTED=1
+    exec > >(tee -a "${tidy_log_file}") 2>&1
+    log "writing tidy log to ${tidy_log_file}"
+    log "tail with: tail -f ${tidy_log_file}"
+}
+
+container_exists() {
+    docker container inspect "${container_name}" >/dev/null 2>&1
+}
+
+container_running() {
+    [[ "$(docker inspect --format '{{.State.Running}}' "${container_name}" 2>/dev/null || true)" == "true" ]]
+}
+
+image_id() {
+    docker image inspect --format '{{.Id}}' "${image_name}"
+}
+
+container_runtime_label() {
+    docker inspect --format '{{ index .Config.Labels "com.mmltk.runtime" }}' "${container_name}" 2>/dev/null || true
+}
+
+bind_mount_specs=()
+desired_runtime_label=""
+gui_platform=""
+gui_runtime_dir_container="/tmp/mmltk-gui-runtime"
+gui_wayland_socket_host_path=""
+gui_wayland_socket_container_path=""
+gui_dbus_socket_host_path=""
+gui_dbus_socket_container_path=""
+
+gui_runtime_tmpfs_spec() {
+    printf '%s' "${gui_runtime_dir_container}:rw,mode=700,uid=${uid},gid=${gid}"
+}
+
+path_is_covered_by_bind_mount() {
+    local source_path="$1"
+    local existing_spec
+    local existing_source
+    for existing_spec in "${bind_mount_specs[@]}"; do
+        existing_source="${existing_spec%%:*}"
+        if [[ "${source_path}" == "${existing_source}" || "${source_path}" == "${existing_source}"/* ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+append_bind_mount() {
+    local source_path="$1"
+    local target_path="${2:-$1}"
+    local mode="${3:-rw}"
+    [[ -e "${source_path}" ]] || return 0
+    path_is_covered_by_bind_mount "${source_path}" && return 0
+    bind_mount_specs+=("${source_path}:${target_path}:${mode}")
+}
+
+extract_dbus_session_bus_path() {
+    local address="$1"
+    if [[ "${address}" =~ ^unix:path=([^,]+) ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+    fi
+}
+
+default_xdg_runtime_dir() {
+    local candidate="/run/user/${uid}"
+    [[ -d "${candidate}" ]] || return 1
+    printf '%s' "${candidate}"
+}
+
+env_value_from_text() {
+    local text="$1"
+    local name="$2"
+    printf '%s\n' "${text}" | sed -n "s/^${name}=//p" | head -n 1
+}
+
+infer_gui_environment_from_target_processes() {
+    local proc_env proc_dir owner env_text value
+    for proc_env in /proc/[0-9]*/environ; do
+        proc_dir="${proc_env%/environ}"
+        [[ -r "${proc_env}" ]] || continue
+        owner="$(stat -c %u "${proc_dir}" 2>/dev/null || true)"
+        [[ "${owner}" == "${uid}" ]] || continue
+        env_text="$(tr '\0' '\n' < "${proc_env}" 2>/dev/null)" || continue
+
+        if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+            value="$(env_value_from_text "${env_text}" XDG_RUNTIME_DIR)"
+            if [[ -n "${value}" ]]; then
+                XDG_RUNTIME_DIR="${value}"
+                log "assuming XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}"
+            fi
+        fi
+        if [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
+            value="$(env_value_from_text "${env_text}" WAYLAND_DISPLAY)"
+            if [[ -n "${value}" ]]; then
+                WAYLAND_DISPLAY="${value}"
+                log "assuming WAYLAND_DISPLAY=${WAYLAND_DISPLAY}"
+            fi
+        fi
+        if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+            value="$(env_value_from_text "${env_text}" DBUS_SESSION_BUS_ADDRESS)"
+            if [[ -n "${value}" ]]; then
+                DBUS_SESSION_BUS_ADDRESS="${value}"
+                log "assuming DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS}"
+            fi
+        fi
+
+        if [[ -n "${XDG_RUNTIME_DIR:-}" && -n "${WAYLAND_DISPLAY:-}" && \
+              -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+            return 0
+        fi
+    done
+}
+
+infer_gui_common_environment() {
+    infer_gui_environment_from_target_processes
+
+    if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+        local runtime_dir=""
+        runtime_dir="$(default_xdg_runtime_dir)" || true
+        if [[ -n "${runtime_dir}" ]]; then
+            XDG_RUNTIME_DIR="${runtime_dir}"
+            log "assuming XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}"
+        fi
+    fi
+
+    if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" && -n "${XDG_RUNTIME_DIR:-}" ]]; then
+        local dbus_socket_path="${XDG_RUNTIME_DIR}/bus"
+        if [[ -S "${dbus_socket_path}" || -e "${dbus_socket_path}" ]]; then
+            DBUS_SESSION_BUS_ADDRESS="unix:path=${dbus_socket_path}"
+            log "assuming DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS}"
+        fi
+    fi
+}
+
+find_wayland_display_in_runtime_dir() {
+    local runtime_dir="$1"
+    local candidate="${runtime_dir}/wayland-0"
+    if [[ -S "${candidate}" || -e "${candidate}" ]]; then
+        printf 'wayland-0'
+        return 0
+    fi
+
+    for candidate in "${runtime_dir}"/wayland-*; do
+        [[ "${candidate}" == *.lock ]] && continue
+        [[ -S "${candidate}" || -e "${candidate}" ]] || continue
+        basename "${candidate}"
+        return 0
+    done
+
+    return 1
+}
+
+infer_gui_wayland_environment() {
+    infer_gui_common_environment
+
+    if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+        local runtime_dir=""
+        runtime_dir="$(default_xdg_runtime_dir)" || true
+        if [[ -n "${runtime_dir}" ]]; then
+            XDG_RUNTIME_DIR="${runtime_dir}"
+            log "assuming XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}"
+        elif [[ "${WAYLAND_DISPLAY:-}" == /* ]]; then
+            XDG_RUNTIME_DIR="${WAYLAND_DISPLAY%/*}"
+            log "assuming XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}"
+        fi
+    fi
+
+    if [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
+        local display_name=""
+        if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+            display_name="$(find_wayland_display_in_runtime_dir "${XDG_RUNTIME_DIR}")" || true
+        fi
+
+        if [[ -n "${display_name}" ]]; then
+            WAYLAND_DISPLAY="${display_name}"
+            log "assuming WAYLAND_DISPLAY=${WAYLAND_DISPLAY} from ${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}"
+        else
+            WAYLAND_DISPLAY="wayland-0"
+            log "assuming WAYLAND_DISPLAY=${WAYLAND_DISPLAY}"
+        fi
+    fi
+}
+
+resolve_wayland_socket_host_path() {
+    [[ -n "${WAYLAND_DISPLAY:-}" ]] || return 1
+    [[ -n "${XDG_RUNTIME_DIR:-}" ]] || return 1
+
+    local candidate=""
+    if [[ "${WAYLAND_DISPLAY}" == /* ]]; then
+        candidate="${WAYLAND_DISPLAY}"
+    elif [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+        candidate="${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}"
+    else
+        return 1
+    fi
+
+    [[ -S "${candidate}" || -e "${candidate}" ]] || return 1
+    printf '%s' "${candidate}"
+}
+
+resolve_gui_dbus_forwarding() {
+    gui_dbus_socket_host_path=""
+    gui_dbus_socket_container_path=""
+    local dbus_socket_path=""
+    dbus_socket_path="$(extract_dbus_session_bus_path "${DBUS_SESSION_BUS_ADDRESS:-}")"
+    if [[ -n "${dbus_socket_path}" ]]; then
+        if [[ -S "${dbus_socket_path}" || -e "${dbus_socket_path}" ]]; then
+            gui_dbus_socket_host_path="${dbus_socket_path}"
+            gui_dbus_socket_container_path="${gui_runtime_dir_container}/$(basename "${dbus_socket_path}")"
+        else
+            log "warning: DBUS session bus socket '${dbus_socket_path}' is unavailable; skipping DBUS session bus forwarding"
+        fi
+    fi
+}
+
+resolve_wayland_gui_session() {
+    infer_gui_wayland_environment
+
+    [[ -n "${WAYLAND_DISPLAY:-}" ]] \
+        || die "--gui requires WAYLAND_DISPLAY to be set on the host"
+    [[ -n "${XDG_RUNTIME_DIR:-}" ]] \
+        || die "--gui requires XDG_RUNTIME_DIR to be set on the host"
+
+    local wayland_socket_host_path=""
+    wayland_socket_host_path="$(resolve_wayland_socket_host_path)" \
+        || die "--gui requires the Wayland socket '${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}' to exist on the host"
+
+    gui_platform="wayland"
+
+    gui_wayland_socket_host_path="${wayland_socket_host_path}"
+    gui_wayland_socket_container_path="${gui_runtime_dir_container}/$(basename "${wayland_socket_host_path}")"
+    resolve_gui_dbus_forwarding
+}
+
+resolve_gui_session() {
+    if (( ! gui_mode )); then
+        return 0
+    fi
+
+    if [[ -n "${gui_platform}" ]]; then
+        return 0
+    fi
+
+    resolve_wayland_gui_session
+}
+
+prepare_bind_mounts() {
+    bind_mount_specs=()
+    append_bind_mount /dev /dev rw
+    if (( ! gui_mode )); then
+        return 0
+    fi
+
+    resolve_gui_session
+
+    if [[ -n "${gui_wayland_socket_host_path}" ]]; then
+        append_bind_mount "${gui_wayland_socket_host_path}" "${gui_wayland_socket_container_path}" rw
+    fi
+
+    if [[ -n "${gui_dbus_socket_host_path}" ]]; then
+        append_bind_mount "${gui_dbus_socket_host_path}" "${gui_dbus_socket_container_path}" rw
+    fi
+
+    if [[ -d /run/dbus ]]; then
+        append_bind_mount /run/dbus /run/dbus rw
+    fi
+}
+
+desired_container_runtime_label() {
+    local -a spec_parts=(
+        "image=$(image_id)"
+        "privileged=1"
+        "user=${uid}:${gid}"
+        "home=/tmp/mmltk-home"
+    )
+    if (( gui_mode )); then
+        resolve_gui_session
+        spec_parts+=("gui=1")
+        spec_parts+=("gui_platform=${gui_platform}")
+        spec_parts+=("tmpfs=$(gui_runtime_tmpfs_spec)")
+    else
+        spec_parts+=("gui=0")
+    fi
+
+    local mount_spec
+    for mount_spec in "${bind_mount_specs[@]}"; do
+        spec_parts+=("mount=${mount_spec}")
+    done
+
+    local joined_spec
+    printf -v joined_spec '%s|' "${spec_parts[@]}"
+    printf '%s' "${joined_spec%|}"
+}
+
+rewrite_host_path() {
+    local value="$1"
+    if [[ "${value}" == /host/* ]]; then
+        printf '%s' "${value}"
+        return 0
+    fi
+    if [[ "${value}" == /* ]]; then
+        printf '/host%s' "${value}"
+        return 0
+    fi
+    printf '/host%s' "$(realpath -m -- "${host_workdir}/${value}")"
+}
+
+rewrite_benchmark_cache_path() {
+    local value="$1"
+    local host_value="${value}"
+    if [[ "${host_value}" == /host/* ]]; then
+        host_value="${host_value#/host}"
+    elif [[ "${host_value}" != /* ]]; then
+        host_value="${host_workdir}/${host_value}"
+    fi
+    host_value="$(realpath -m -- "${host_value}")"
+    case "${host_value}" in
+        "${repo_root}"|"${repo_root}/"*)
+            ;;
+        *)
+            die "--cache-dir must stay within ${repo_root}"
+            ;;
+    esac
+    printf '/host%s' "${host_value}"
+}
+
+is_path_option() {
+    case "$1" in
+        --source-dir|--output-dir|--cache-dir|--compiled|--weights|--resume|--onnx|--tensorrt|--output|--input|--save-engine|--report-json|--source|--train-compiled|--val-compiled|--test-compiled|--dist-store-file|--file|--start-at|--log-file|--log-dir|source_dir|output_dir|compiled)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+rewrite_passthrough_args() {
+    rewritten_args=()
+    local expect_path_value=0
+    local expect_benchmark_cache_value=0
+    local expect_tidy_file_values=0
+    local arg
+    for arg in "${passthrough_args[@]}"; do
+        if (( expect_benchmark_cache_value )); then
+            rewritten_args+=("$(rewrite_benchmark_cache_path "${arg}")")
+            expect_benchmark_cache_value=0
+            continue
+        fi
+        if (( expect_path_value )); then
+            rewritten_args+=("$(rewrite_host_path "${arg}")")
+            expect_path_value=0
+            continue
+        fi
+        if (( expect_tidy_file_values )); then
+            if [[ "${arg}" != --* ]]; then
+                rewritten_args+=("$(rewrite_host_path "${arg}")")
+                continue
+            fi
+            expect_tidy_file_values=0
+        fi
+
+        if [[ "${arg}" == --cache-dir=* ]]; then
+            local cache_option_value="${arg#*=}"
+            rewritten_args+=("--cache-dir=$(rewrite_benchmark_cache_path "${cache_option_value}")")
+            continue
+        fi
+
+        if [[ "${arg}" == --cache-dir ]]; then
+            rewritten_args+=("${arg}")
+            expect_benchmark_cache_value=1
+            continue
+        fi
+
+        if (( tidy_mode )) && [[ "${arg}" == --file ]]; then
+            rewritten_args+=("${arg}")
+            expect_tidy_file_values=1
+            continue
+        fi
+
+        if [[ "${arg}" == --*=* ]]; then
+            local option_name="${arg%%=*}"
+            local option_value="${arg#*=}"
+            if is_path_option "${option_name}"; then
+                rewritten_args+=("${option_name}=$(rewrite_host_path "${option_value}")")
+            else
+                rewritten_args+=("${arg}")
+            fi
+            continue
+        fi
+
+        if is_path_option "${arg}"; then
+            rewritten_args+=("${arg}")
+            expect_path_value=1
+            continue
+        fi
+
+        if [[ "${arg}" == /* ]]; then
+            rewritten_args+=("$(rewrite_host_path "${arg}")")
+            continue
+        fi
+
+        rewritten_args+=("${arg}")
+    done
+}
+
+append_execution_policy_args() {
+    local -n execution_args="$1"
+    execution_args+=(--cap-add SYS_NICE --cap-add IPC_LOCK
+        --ulimit memlock=-1:-1 --ulimit nice=40:40)
+    # A present legacy backend is optional. DMA-BUF requires no gdrdrv node.
+    if [[ -c /dev/gdrdrv ]]; then execution_args+=(--device /dev/gdrdrv); fi
+}
+
+append_native_environment() {
+    local -n native_args="$1"
+    local variable_name
+    for variable_name in GDRCOPY_USE_DMABUF_MMAP GDRCOPY_ENABLE_LOGGING GDRCOPY_LOG_LEVEL \
+        MMLTK_ANNOTATION_DIAGNOSTICS MMLTK_UPSCALE_ONNX_REFERENCE; do
+        if [[ -n "${!variable_name:-}" ]]; then
+            native_args+=(--env "${variable_name}=${!variable_name}")
+        fi
+    done
+    for variable_name in MMLTK_GDR_TRACE_FILE MMLTK_NUMA_TRANSFER_TRACE_FILE; do
+        if [[ -n "${!variable_name:-}" ]]; then
+            native_args+=(--env "${variable_name}=$(rewrite_host_path "${!variable_name}")")
+        fi
+    done
+}
+
+build_run_args() {
+    run_args=(
+        run
+        -d
+        --init
+        --privileged
+        --name "${container_name}"
+        --entrypoint /bin/sh
+        --gpus all
+        --network host
+        --ipc host
+        --user "${uid}:${gid}"
+        --env HOME=/tmp/mmltk-home
+        --env NVIDIA_DRIVER_CAPABILITIES=all
+        --label "com.mmltk.runtime=${desired_runtime_label}"
+        --volume /:/host:rw
+        --workdir "/host${repo_root}"
+    )
+    append_execution_policy_args run_args
+    append_wrapper_labels run_args "${invocation_mode}"
+
+    if (( gui_mode )); then
+        run_args+=(--tmpfs "$(gui_runtime_tmpfs_spec)")
+    fi
+
+    build_common_group_args
+    run_args+=("${common_group_args[@]}")
+
+    local bind_mount_spec
+    for bind_mount_spec in "${bind_mount_specs[@]}"; do
+        run_args+=(--volume "${bind_mount_spec}")
+    done
+
+    run_args+=(
+        "${image_name}"
+        -lc
+        'mkdir -p "${HOME}" && exec sleep infinity'
+    )
+}
+
+build_common_group_args() {
+    common_group_args=()
+
+    local -a host_groups=()
+    local group_lookup_user
+    group_lookup_user="${MMLTK_USER:-}"
+    if [[ -z "${group_lookup_user}" && ${uid} -ne $(id -u) ]]; then
+        group_lookup_user="$(getent passwd "${uid}" | cut -d: -f1)"
+    fi
+    if [[ -n "${group_lookup_user}" ]]; then
+        mapfile -t host_groups < <(id -G "${group_lookup_user}" | tr ' ' '\n' | sort -u)
+    else
+        mapfile -t host_groups < <(id -G | tr ' ' '\n' | sort -u)
+    fi
+    local group_id
+    for group_id in "${host_groups[@]}"; do
+        [[ -n "${group_id}" ]] || continue
+        common_group_args+=(--group-add "${group_id}")
+    done
+
+    # Add the video group for V4L2 capture device access inside the container.
+    # The host user may not be in the video group (ACLs grant access on the host
+    # but are not carried through to the container).
+    local video_gid
+    video_gid="$(getent group video 2>/dev/null | cut -d: -f3)"
+    if [[ -n "${video_gid}" ]]; then
+        common_group_args+=(--group-add "${video_gid}")
+    fi
+}
+
+ensure_gui_runtime_dir_access() {
+    if (( ! gui_mode )); then
+        return 0
+    fi
+
+    docker exec -u 0 "${container_name}" /bin/sh -lc "
+        mkdir -p '${gui_runtime_dir_container}' &&
+        chown '${uid}:${gid}' '${gui_runtime_dir_container}' &&
+        chmod 700 '${gui_runtime_dir_container}'
+    " >/dev/null
+}
+
+ensure_container() {
+    ensure_docker
+    ensure_image
+    prepare_bind_mounts
+
+    desired_runtime_label="$(desired_container_runtime_label)"
+    if container_exists && [[ "$(container_runtime_label)" != "${desired_runtime_label}" ]]; then
+        log "recreating ${container_name} for updated runtime configuration"
+        docker rm -f "${container_name}" >/dev/null 2>&1 || true
+    fi
+
+    if ! container_exists; then
+        local -a run_args=()
+        build_run_args
+        docker "${run_args[@]}" >/dev/null
+        return 0
+    fi
+
+    if ! container_running; then
+        docker start "${container_name}" >/dev/null || true
+    fi
+
+    if ! container_running; then
+        log "recreating ${container_name} because it did not stay running"
+        docker rm -f "${container_name}" >/dev/null 2>&1 || true
+        local -a run_args=()
+        build_run_args
+        docker "${run_args[@]}" >/dev/null
+    fi
+
+    ensure_gui_runtime_dir_access
+}
+
+terminate_existing_gui_instances() {
+    if (( ! gui_mode )); then
+        return 0
+    fi
+
+    if docker exec -u 0 "${container_name}" /bin/sh -lc '
+        pgrep -f "[m]mltk-browser-host" >/dev/null 2>&1
+    ' >/dev/null 2>&1; then
+        log "terminating existing GUI runtime before starting a new one"
+    fi
+
+    shutdown_gui_runtime_in_container TERM 100 || true
+}
+
+verify_gui_contract_compatibility() {
+    if (( ! gui_mode )); then
+        return 0
+    fi
+
+    local served_asset_root="/opt/mmltk/share/mmltk/browser-app"
+    docker exec "${container_name}" /bin/sh -lc '
+        test -x /opt/mmltk/bin/mmltk-browser-host &&
+        test -x /opt/mmltk/bin/mmltk-browser-bundle-contract &&
+        test -x /opt/mmltk/lib/mmltk/firefox/firefox &&
+        test -r "$1/index.html" &&
+        test -s "$1/browser_protocol.marker"
+    ' mmltk-contract-check "${served_asset_root}" \
+        || die "runtime image is missing the packaged browser host, browser-bundle verifier, Firefox runtime, GUI assets, or native protocol marker; rebuild with ./mmltk --build"
+
+    docker exec "${container_name}" \
+        /opt/mmltk/bin/mmltk-browser-bundle-contract verify \
+        "${served_asset_root}" "${served_asset_root}/browser_protocol.marker" \
+        || die "the packaged GUI browser bundle contract is invalid or incompatible with the native host; rebuild with ./mmltk --build"
+}
+
+build_exec_env_args() {
+    exec_env_args=()
+    append_native_environment exec_env_args
+    exec_env_args+=(-e "MMLTK_RFDETR_TEST_CACHE_DIR=/host${cache_root}/tests/rfdetr")
+    exec_env_args+=(-e "MMLTK_BENCHMARK_DATASET_CACHE_ROOT=/host${cache_root}/benchmark-dataset/v1")
+    if [[ -n "${MMLTK_LOG_LEVEL:-}" ]]; then
+        exec_env_args+=(-e "MMLTK_LOG_LEVEL=${MMLTK_LOG_LEVEL}")
+    fi
+    if [[ -n "${MMLTK_LOG_FILE:-}" ]]; then
+        exec_env_args+=(-e "MMLTK_LOG_FILE=$(rewrite_host_path "${MMLTK_LOG_FILE}")")
+    elif [[ -z "${MMLTK_LOG_DIR:-}" ]]; then
+        exec_env_args+=(-e "MMLTK_LOG_DIR=/host${repo_root}/.mmltk-data/logs")
+    fi
+    if [[ -n "${MMLTK_LOG_DIR:-}" ]]; then
+        exec_env_args+=(-e "MMLTK_LOG_DIR=$(rewrite_host_path "${MMLTK_LOG_DIR}")")
+    fi
+    if (( gui_mode )); then
+        resolve_gui_session
+
+        exec_env_args+=(
+            -e "XDG_SESSION_TYPE=${gui_platform}"
+            -e "XDG_RUNTIME_DIR=${gui_runtime_dir_container}"
+            -e "GDK_BACKEND=wayland"
+            # Force libglvnd to use NVIDIA's EGL ICD only; Mesa's ICD still
+            # runs probes on NVIDIA PCI IDs and emits noise ("pci id ...
+            # driver (null)") but more importantly can win the selection
+            # race on some loaders.
+            -e "__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json"
+            -e "GBM_BACKEND=nvidia-drm"
+        )
+
+        exec_env_args+=(
+            -e "WAYLAND_DISPLAY=$(basename "${gui_wayland_socket_container_path}")"
+        )
+
+        if [[ -n "${gui_dbus_socket_container_path}" && -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+            exec_env_args+=(
+                -e "DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS/unix:path=${gui_dbus_socket_host_path}/unix:path=${gui_dbus_socket_container_path}}"
+            )
+        fi
+
+        if [[ -n "${__NV_PRIME_RENDER_OFFLOAD:-}" ]]; then
+            exec_env_args+=(-e "__NV_PRIME_RENDER_OFFLOAD=${__NV_PRIME_RENDER_OFFLOAD}")
+        fi
+
+        if [[ -n "${MMLTK_GUI_TRACE_FILE:-}" ]]; then
+            exec_env_args+=(-e "MMLTK_GUI_TRACE_FILE=$(rewrite_host_path "${MMLTK_GUI_TRACE_FILE}")")
+        fi
+        if [[ -n "${MMLTK_FIREFOX_LOG_FILE:-}" ]]; then
+            exec_env_args+=(-e "MMLTK_FIREFOX_LOG_FILE=$(rewrite_host_path "${MMLTK_FIREFOX_LOG_FILE}")")
+        fi
+    fi
+}
+
+run_tidy() {
+    acquire_mutation_locks
+    prepare_tidy_logging
+    ensure_docker
+    ensure_analysis_image
+    prepare_compiler_cache_dirs
+    build_common_group_args
+
+    local -a docker_args=(
+        run --rm --init -i
+        --name "${tidy_container_name}"
+        --security-opt seccomp=unconfined
+    )
+    append_wrapper_labels docker_args "${invocation_mode}"
+    if [[ -t 0 && -t 1 ]]; then
+        docker_args+=(-t)
+    fi
+    docker_args+=(
+        --user "${uid}:${gid}"
+        --env "HOME=/host${cache_root}/container-home"
+        --env "CARGO_HOME=/host${cargo_cache_root}/home"
+        --env "CARGO_TARGET_DIR=/host${cargo_cache_root}/target/browser-app"
+        --env CARGO_BUILD_JOBS="${build_jobs}"
+        --env "CCACHE_BASEDIR=/host${repo_root}"
+        --env "CCACHE_DIR=/host${ccache_root}"
+        --env "CCACHE_TEMPDIR=/host${ccache_root}/tmp"
+        --env CCACHE_NOHASHDIR=1
+        --env CCACHE_MAXSIZE=50G
+        --env CCACHE_SLOPPINESS=pch_defines,time_macros
+        --env "MMLTK_REPO_ROOT=/host${repo_root}"
+        --env "MMLTK_TIDY_BUILD_DIR=/host${cmake_cache_root}/analysis"
+        --env "MMLTK_TIDY_LOG_FILE=/host${MMLTK_TIDY_LOG_FILE}"
+        --env "MMLTK_TIDY_TEE_STARTED=${MMLTK_TIDY_TEE_STARTED}"
+        --volume /:/host:rw
+        --workdir "/host${host_workdir}"
+    )
+    docker_args+=("${common_group_args[@]}")
+    docker_args+=(
+        "${analysis_image_name}"
+        /bin/bash
+        "/host${repo_root}/tools/run_static_analysis.sh"
+    )
+    if (( tidy_third_party )); then
+        docker_args+=(--third_party)
+    fi
+    docker_args+=("${rewritten_args[@]}")
+
+    run_owned_docker_command "${tidy_container_name}" "${docker_args[@]}"
+    release_mutation_locks
+}
+
+prepare_compiler_cache_dirs() {
+    prepare_owned_dirs \
+        "${cache_root}/container-home" \
+        "${cmake_cache_root}" \
+        "${cargo_cache_root}/home" \
+        "${cargo_cache_root}/target/browser-app" \
+        "${ccache_root}" \
+        "${ccache_root}/tmp" \
+        "${firefox_cache_root}/obj-minimal-opt" \
+        "${firefox_cache_root}/mozbuild" \
+        "${firefox_cache_root}/sccache" \
+        "$(dirname "${release_stage_root}")" \
+        "${repo_root}/build"
+}
+
+run_toolchain_command() {
+    local command="$1"
+    local owned_container_name="${2:-}"
+    prepare_compiler_cache_dirs
+    local toolchain_identity
+    toolchain_identity="$(docker image inspect "${build_image_name}" \
+        --format '{{ index .Config.Labels "com.mmltk.compilation-identity" }}')"
+    [[ "${toolchain_identity}" =~ ^sha256:[[:xdigit:]]{64}$ ]] || die \
+        "build image lacks its validated compilation identity"
+    local -a docker_args=(
+        run --rm --init
+        --security-opt seccomp=unconfined
+        --cpuset-cpus "${build_cpu_list}"
+        --user "${uid}:${gid}"
+        --env "HOME=${container_cache_root}/container-home"
+        --env "CARGO_HOME=${container_cache_root}/cargo/home"
+        --env "CARGO_TARGET_DIR=${container_cache_root}/cargo/target/browser-app"
+        --env CARGO_BUILD_JOBS="${build_jobs}"
+        --env CMAKE_BUILD_PARALLEL_LEVEL="${build_jobs}"
+        --env CCACHE_BASEDIR=/workspace
+        --env "CCACHE_DIR=${container_cache_root}/ccache"
+        --env "CCACHE_TEMPDIR=${container_cache_root}/ccache/tmp"
+        --env CCACHE_NOHASHDIR=1
+        --env CCACHE_MAXSIZE=50G
+        --env CCACHE_SLOPPINESS=pch_defines,time_macros
+        --env "MMLTK_CONTAINER_CACHE_ROOT=${container_cache_root}"
+        --env "MMLTK_CONTAINER_RELEASE_STAGE_ROOT=${container_release_stage_root}"
+        --env "MMLTK_FIREFOX_CACHE_ROOT=${container_cache_root}/firefox"
+        --env "MMLTK_JOBS=${build_jobs}"
+        --env "MMLTK_TOOLCHAIN_ID=${toolchain_identity}"
+        --env "MOZBUILD_STATE_PATH=${container_cache_root}/firefox/mozbuild"
+        --env "SCCACHE_BASEDIRS=${container_firefox_sccache_basedirs}"
+        --env "SCCACHE_DIR=${container_cache_root}/firefox/sccache"
+        --env SCCACHE_CACHE_SIZE=20G
+        --volume "${repo_root}:/workspace:rw"
+        --workdir /workspace
+        --entrypoint /bin/bash
+    )
+    append_wrapper_labels docker_args "${invocation_mode}"
+    if [[ -n "${owned_container_name}" ]]; then
+        docker_args+=(--name "${owned_container_name}")
+    fi
+    if [[ -n "${MMLTK_PACKAGE_FINGERPRINT:-}" ]]; then
+        docker_args+=(--env "MMLTK_PACKAGE_FINGERPRINT=${MMLTK_PACKAGE_FINGERPRINT}")
+    fi
+    if [[ -n "${container_ccache_stats_file}" ]]; then
+        docker_args+=(--env "MMLTK_CCACHE_STATS_FILE=${container_ccache_stats_file}")
+    fi
+    if [[ -n "${container_firefox_sccache_stats_file}" ]]; then
+        docker_args+=(--env \
+            "MMLTK_FIREFOX_SCCACHE_STATS_FILE=${container_firefox_sccache_stats_file}")
+    fi
+    if [[ -n "${container_build_trace_file}" ]]; then
+        docker_args+=(--env "MMLTK_BUILD_TRACE_FILE=${container_build_trace_file}")
+    fi
+    if [[ -n "${container_firefox_stage_trace_file}" ]]; then
+        docker_args+=(--env \
+            "MMLTK_FIREFOX_STAGE_LOG_FILE=${container_firefox_stage_trace_file}")
+    fi
+    docker_args+=("${build_image_name}" -lc "${command}")
+    docker "${docker_args[@]}"
+}
+
+firefox_source_state_fingerprint_for() {
+    local format="$1"
+    local build_definition="$2"
+    local toolchain_identity="$3"
+    {
+        printf '%s\0%s\0' "${format}" "${toolchain_identity}"
+        printf 'desktop-build-definition\0%s\0' \
+            "$(fingerprint_path "${build_definition}")"
+        printf 'firefox-build-command\0%s\0' \
+            "$(fingerprint_path \
+                "${repo_root}/src/entrypoints/desktop/build_firefox_runtime.sh")"
+        git -C "${repo_root}" rev-parse HEAD:third_party/firefox
+        git -C "${repo_root}" diff --no-ext-diff --binary \
+            HEAD -- third_party/firefox
+        local untracked_path
+        while IFS= read -r -d '' untracked_path; do
+            printf 'untracked\0%s\0%s\0' "${untracked_path}" \
+                "$(fingerprint_path "${repo_root}/${untracked_path}")"
+        done < <(git -C "${repo_root}" ls-files --others \
+            --exclude-standard -z -- third_party/firefox)
+    } | sha256sum | cut -d' ' -f1
+}
+
+firefox_source_state_fingerprint() {
+    firefox_source_state_fingerprint_for \
+        mmltk-firefox-build-input-v2 \
+        "${repo_root}/src/entrypoints/desktop/firefox_runtime_build.cmake" \
+        "$1"
+}
+
+firefox_legacy_source_state_fingerprint() {
+    firefox_source_state_fingerprint_for \
+        mmltk-firefox-build-input-v1 \
+        "${repo_root}/src/entrypoints/desktop/CMakeLists.txt" \
+        "$1"
+}
+
+firefox_toolchain_identity() {
+    local toolchain_base_identity
+    toolchain_base_identity="$(docker image inspect "${toolchain_base_image_name}" --format '{{.Id}}')"
+    local final_base_identity
+    final_base_identity="$(docker image inspect "${build_image_name}" \
+        --format '{{ index .Config.Labels "com.mmltk.toolchain-base-identity" }}' \
+        2>/dev/null || true)"
+    [[ "${final_base_identity}" == "${toolchain_base_identity}" ]] || die \
+        "final toolchain image does not identify its completed dependency image"
+    printf '%s\n' "${toolchain_base_identity}"
+}
+
+firefox_runtime_cache_complete() {
+    local runtime_root="${firefox_cache_root}/obj-minimal-opt/dist/firefox"
+    local required_path
+    for required_path in \
+        firefox \
+        firefox-bin \
+        libxul.so \
+        libmozgtk.so \
+        libmozwayland.so \
+        application.ini \
+        platform.ini \
+        omni.ja \
+        browser/omni.ja; do
+        [[ -e "${runtime_root}/${required_path}" ]] || return 1
+    done
+}
+
+prepare_firefox_build_input() {
+    local toolchain_identity
+    toolchain_identity="$(firefox_toolchain_identity)"
+    local fingerprint
+    fingerprint="$(firefox_source_state_fingerprint "${toolchain_identity}")"
+    local legacy_fingerprint
+    legacy_fingerprint="$(
+        firefox_legacy_source_state_fingerprint "${toolchain_identity}")"
+    local completed_fingerprint=
+    if [[ -f "${firefox_built_input_file}" ]]; then
+        completed_fingerprint="$(<"${firefox_built_input_file}")"
+    fi
+    local next_fingerprint="${firefox_build_input_file}.next.$$"
+    printf '%s\n' "${fingerprint}" >"${next_fingerprint}"
+    if [[ -f "${firefox_build_input_file}" ]] \
+        && cmp -s -- "${next_fingerprint}" "${firefox_build_input_file}"; then
+        rm -f -- "${next_fingerprint}"
+    else
+        mv -f -- "${next_fingerprint}" "${firefox_build_input_file}"
+        chown "${uid}:${gid}" "${firefox_build_input_file}" 2>/dev/null || true
+        log "Firefox build inputs changed"
+    fi
+
+    if [[ "${completed_fingerprint}" == "${legacy_fingerprint}" ]] \
+        && firefox_runtime_cache_complete; then
+        cp -- "${firefox_build_input_file}" "${firefox_built_input_file}"
+        chown "${uid}:${gid}" "${firefox_built_input_file}" 2>/dev/null || true
+        log "adopted the completed Firefox runtime into the isolated build definition"
+    fi
+
+    local legacy_runtime_stamp=
+    legacy_runtime_stamp="${firefox_cache_root}/obj-minimal-opt/dist/.mmltk-runtime-stage.sha256"
+    if [[ ! -f "${firefox_built_input_file}" \
+        && -f "${legacy_runtime_stamp}" ]] \
+        && firefox_runtime_cache_complete; then
+        local newer_source
+        newer_source="$(find "${repo_root}/third_party/firefox" -type f \
+            -newer "${legacy_runtime_stamp}" -print -quit)"
+        if [[ -z "${newer_source}" ]]; then
+            cp -- "${firefox_build_input_file}" "${firefox_built_input_file}"
+            chown "${uid}:${gid}" "${firefox_built_input_file}" 2>/dev/null || true
+            log "adopted the completed Firefox runtime into fingerprinted build state"
+        fi
+    fi
+}
+
+run_release_ninja() {
+    log "building the unified Release Ninja graph with ${build_jobs} workers on CPUs ${build_cpu_list}"
+    run_toolchain_command \
+        'set -euo pipefail
+         capture_compiler_cache_stats() {
+             if [[ -n "${MMLTK_CCACHE_STATS_FILE:-}" ]]; then
+                 ccache --show-stats >"${MMLTK_CCACHE_STATS_FILE}" 2>&1 || true
+             fi
+             if [[ -n "${MMLTK_FIREFOX_SCCACHE_STATS_FILE:-}" ]]; then
+                 sccache_bin="${MOZBUILD_STATE_PATH}/sccache/sccache"
+                 if [[ -x "${sccache_bin}" ]]; then
+                     "${sccache_bin}" --show-stats \
+                         >"${MMLTK_FIREFOX_SCCACHE_STATS_FILE}" 2>&1 || true
+                 fi
+             fi
+         }
+         trap capture_compiler_cache_stats EXIT
+         if [[ -n "${MMLTK_CCACHE_STATS_FILE:-}" ]]; then
+             ccache --zero-stats
+         fi
+         sccache_bin="${MOZBUILD_STATE_PATH}/sccache/sccache"
+         if [[ -x "${sccache_bin}" && -n "${MMLTK_FIREFOX_SCCACHE_STATS_FILE:-}" ]]; then
+             "${sccache_bin}" --zero-stats || true
+         fi
+         /workspace/tools/run_traced_command.sh cargo_fmt_iced_aw \
+             cargo fmt --manifest-path /workspace/third_party/iced_aw/Cargo.toml
+         /workspace/tools/run_traced_command.sh cargo_fmt_frontend_iced \
+             cargo fmt --manifest-path /workspace/src/frontend/iced/Cargo.toml
+         /workspace/tools/configure_cmake_graph.sh \
+             release "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/release" \
+             -DBUILD_MMLTK_BROWSER_HOST=ON \
+             -DBUILD_MMLTK_FIREFOX_RUNTIME=ON \
+             -DMMLTK_BUILD_JOBS="${MMLTK_JOBS}" \
+             -DMMLTK_FIREFOX_CACHE_ROOT="${MMLTK_FIREFOX_CACHE_ROOT}"
+         /workspace/tools/run_traced_command.sh ninja_build \
+             cmake --build "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/release" \
+             --parallel "${MMLTK_JOBS}"
+         python3 /workspace/tools/check_toolchain_invariants.py \
+             --repo-root /workspace --build-dir "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/release"' \
+        "${release_build_container_name}"
+}
+
+run_protocol_generation() {
+    acquire_mutation_locks
+    ensure_docker
+    prepare_cache_layout
+    ensure_build_image
+    prepare_firefox_build_input
+    log "generating Protocol-13 cross-language bindings and fixtures"
+    run_owned_toolchain_command "${release_build_container_name}-protocol-generation" \
+        'set -euo pipefail
+         cargo fetch --locked \
+             --manifest-path /workspace/src/frontend/iced/Cargo.toml \
+             --target x86_64-unknown-linux-gnu
+         /workspace/tools/configure_cmake_graph.sh \
+             release "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/release" \
+             -DBUILD_MMLTK_BROWSER_HOST=ON \
+             -DBUILD_MMLTK_FIREFOX_RUNTIME=ON \
+             -DMMLTK_BUILD_JOBS="${MMLTK_JOBS}" \
+             -DMMLTK_FIREFOX_CACHE_ROOT="${MMLTK_FIREFOX_CACHE_ROOT}"
+         cmake --build "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/release" \
+             --parallel "${MMLTK_JOBS}" \
+             --target mmltk_protocol_v13_generation
+         python3 /workspace/tools/check_toolchain_invariants.py \
+             --repo-root /workspace --build-dir "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/release"'
+    release_mutation_locks
+}
+
+run_application_bindings_generation() {
+    acquire_mutation_locks
+    ensure_docker
+    prepare_cache_layout
+    ensure_build_image
+    log "generating typed application bindings"
+    run_owned_toolchain_command "${release_build_container_name}-application-bindings-generation" \
+        'set -euo pipefail
+         /workspace/tools/configure_cmake_graph.sh \
+             release "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/application-bindings-release" \
+             -DBUILD_MMLTK_BROWSER_HOST=OFF \
+             -DBUILD_MMLTK_FIREFOX_RUNTIME=OFF \
+             -DMMLTK_BUILD_JOBS="${MMLTK_JOBS}" \
+             -DMMLTK_FIREFOX_CACHE_ROOT="${MMLTK_FIREFOX_CACHE_ROOT}"
+         cmake --build "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/application-bindings-release" \
+             --parallel "${MMLTK_JOBS}" \
+             --target mmltk_generate_application_bindings
+         python3 /workspace/tools/check_toolchain_invariants.py \
+             --repo-root /workspace --build-dir "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/application-bindings-release"'
+    release_mutation_locks
+}
+
+# Formats the vendored sources this repository owns. It must run before the
+# Firefox build input is snapshotted: reformatting afterwards lands in the next
+# run's working-tree diff, which changes the fingerprint and forces a full
+# link-time-optimized relink for whitespace this build itself produced.
+format_vendored_firefox_sources() {
+    run_toolchain_command \
+        'set -euo pipefail
+         /workspace/tools/run_traced_command.sh rustfmt_firefox_wgpu \
+             rustfmt --edition 2021 \
+             /workspace/third_party/firefox/gfx/wgpu_bindings/src/server.rs \
+             /workspace/third_party/firefox/gfx/wgpu_bindings/src/mmltk_workspace_channel.rs' \
+        "${release_build_container_name}-format"
+}
+
+run_release_branch() {
+    ensure_build_image
+    prepare_firefox_build_input
+    run_release_ninja
+}
+
+fingerprint_path() {
+    local root="$1"
+    if [[ -d "${root}" ]]; then
+        (
+            cd "${root}"
+            printf 'directory\0'
+            local relative_path
+            while IFS= read -r -d '' relative_path; do
+                printf '%s\0%s\0' "$(stat -c '%a' -- "${relative_path}")" "${relative_path}"
+                if [[ -L "${relative_path}" ]]; then
+                    printf 'link\0%s\0' "$(readlink -- "${relative_path}")"
+                else
+                    sha256sum -- "${relative_path}" | cut -d' ' -f1
+                fi
+            done < <(find . \( -type f -o -type l \) -print0 | sort -z)
+        ) | sha256sum | cut -d' ' -f1
+    elif [[ -f "${root}" || -L "${root}" ]]; then
+        {
+            printf 'file\0%s\0' "$(stat -c '%a' -- "${root}")"
+            if [[ -L "${root}" ]]; then
+                printf 'link\0%s\0' "$(readlink -- "${root}")"
+            else
+                sha256sum -- "${root}" | cut -d' ' -f1
+            fi
+        } | sha256sum | cut -d' ' -f1
+    else
+        printf 'missing\n' | sha256sum | cut -d' ' -f1
+    fi
+}
+
+release_package_hash_source() {
+    local path="$1" destination="$2" source_kind="$3" source_path="$4"
+    shift 4
+    local source_root entry fingerprint
+    case "${source_kind}" in
+        release) source_root="${cmake_cache_root}/release" ;;
+        repository) source_root="${repo_root}/${source_path}" ;;
+        firefox) source_root="${firefox_cache_root}/obj-minimal-opt/dist/firefox" ;;
+        browser) source_root="${release_frontend_dist_dir}" ;;
+        image) return ;; # The enclosing fingerprint owns the exact toolchain image.
+        *) die "unknown runtime package source '${source_kind}'" ;;
+    esac
+    if [[ "${source_kind}" == release || "${source_kind}" == repository ]]; then
+        for entry in "$@"; do
+            entry="${entry#\?}"
+            fingerprint="$(runtime_package_path_fingerprint "${source_root}/${entry}")" || return
+            printf '%s/%s %s\n' "${path}" "${entry}" \
+                "${fingerprint}"
+        done
+    else
+        fingerprint="$(runtime_package_path_fingerprint "${source_root}")" || return
+        printf '%s %s\n' "${path}" "${fingerprint}"
+        if [[ "${source_kind}" == browser ]]; then
+            fingerprint="$(runtime_package_path_fingerprint \
+                "${cmake_cache_root}/release/${source_path}")" || return
+            printf '%s %s\n' "${source_path}" "${fingerprint}"
+        fi
+    fi
+}
+
+release_package_fingerprint() {
+    local release_root="${cmake_cache_root}/release"
+    local toolchain_identity
+    toolchain_identity="$(docker image inspect "${build_image_name}" --format '{{.Id}}')"
+    {
+        printf 'mmltk-release-package-v7\n%s\n' "${toolchain_identity}"
+        sha256sum "${repo_root}/tools/runtime_package.sh"
+        runtime_package_inventory release_package_hash_source || return
+        local output_path
+        while IFS= read -r -d '' output_path; do
+            printf '%s %s\n' "${output_path#"${release_root}/"}" \
+                "$(fingerprint_path "${output_path}")"
+        done < <(find "${release_root}" -type f -name cmake_install.cmake -print0 | sort -z)
+    } | sha256sum | cut -d' ' -f1
+}
+
+browser_host_release_enabled() {
+    local ninja_graph="${cmake_cache_root}/release/build.ninja"
+    local cmake_cache="${cmake_cache_root}/release/CMakeCache.txt"
+    [[ -f "${ninja_graph}" && -f "${cmake_cache}" ]] \
+        && grep -Fq 'build mmltk_frontend_iced_bundle: phony' "${ninja_graph}" \
+        && grep -Fq 'BUILD_MMLTK_BROWSER_HOST:BOOL=ON' "${cmake_cache}" \
+        && grep -Fq 'BUILD_MMLTK_FIREFOX_RUNTIME:BOOL=ON' "${cmake_cache}"
+}
+
+runtime_image_fingerprint() {
+    local stage_root="$1"
+    local runtime_base_identity="$2"
+    {
+        printf 'mmltk-runtime-image-v5\n%s\n' "${runtime_base_identity}"
+        sha256sum "${repo_root}/docker/Dockerfile.runtime" \
+            "${repo_root}/tools/runtime_package.sh"
+        runtime_package_fingerprint "${stage_root}"
+    } | sha256sum | cut -d' ' -f1
+}
+
+build_runtime_image() {
+    local stage_root="$1"
+    runtime_package_complete "${stage_root}" || die "staged release is incomplete or contains test executables"
+    local runtime_base_identity
+    runtime_base_identity="$(docker image inspect "${runtime_base_image_name}" --format '{{.Id}}')"
+    initialize_nvidia_inputs
+    verify_nvidia_image_labels "${runtime_base_image_name}" runtime
+    local release_fingerprint
+    release_fingerprint="$(runtime_image_fingerprint \
+        "${stage_root}" "${runtime_base_identity}")"
+    local runtime_base_alias
+    runtime_base_alias="$(content_derived_local_image_alias runtime-base "${runtime_base_identity}")"
+    cached_buildx_image default - "${image_name}" \
+        "${repo_root}/docker/Dockerfile.runtime" runtime "${release_fingerprint}" "${stage_root}" \
+        --build-context "mmltk_package=${repo_root}/tools" \
+        --build-arg "MMLTK_RUNTIME_BASE_IMAGE=${runtime_base_alias}" \
+        --build-arg "MMLTK_RELEASE_FINGERPRINT=${release_fingerprint}" \
+        --build-arg "MMLTK_RUNTIME_BASE_IDENTITY=${runtime_base_identity}"
+    verify_content_derived_local_image_alias "${runtime_base_alias}" "${runtime_base_identity}"
+    local current_release_fingerprint current_runtime_base_identity
+    current_release_fingerprint="$(docker image inspect "${image_name}" \
+        --format '{{ index .Config.Labels "com.mmltk.release-fingerprint" }}')"
+    current_runtime_base_identity="$(docker image inspect "${image_name}" \
+        --format '{{ index .Config.Labels "com.mmltk.runtime-base-identity" }}')"
+    [[ "${current_release_fingerprint}" == "${release_fingerprint}" ]] || die \
+        "runtime image release fingerprint label does not match staged outputs"
+    [[ "${current_runtime_base_identity}" == "${runtime_base_identity}" ]] || die \
+        "runtime image base identity label does not match ${runtime_base_image_name}"
+    verify_nvidia_image_labels "${image_name}" runtime
+}
+
+build_configured_runtime_image() {
+    local stage_root="$1"
+    browser_host_release_enabled \
+        || die "release graph must enable the browser host, browser app, and owned Firefox runtime"
+    build_runtime_image "${stage_root}"
+}
+
+stage_release_and_runtime() {
+    local package_fingerprint
+    package_fingerprint="$(release_package_fingerprint)"
+    if runtime_package_complete "${release_stage_root}" \
+        && [[ -f "${release_stage_root}/.mmltk-package-fingerprint" ]] \
+        && [[ "$(<"${release_stage_root}/.mmltk-package-fingerprint")" == "${package_fingerprint}" ]]; then
+        log "staged release is current"
+        trace_build_event package cache_hit
+        build_configured_runtime_image "${release_stage_root}"
+        return
+    fi
+
+    trace_build_event package cache_miss
+    local next_stage="${release_stage_root}.next"
+    export MMLTK_PACKAGE_FINGERPRINT="${package_fingerprint}"
+    log "installing release into ${next_stage}"
+    run_owned_toolchain_command "${package_build_container_name}" \
+        'set -euo pipefail
+         next_stage="${MMLTK_CONTAINER_RELEASE_STAGE_ROOT}.next"
+         rm -rf -- "${next_stage}"
+         cmake --install "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/release" \
+             --prefix "${next_stage}"
+         printf "%s\n" "${MMLTK_PACKAGE_FINGERPRINT}" >"${next_stage}/.mmltk-package-fingerprint"'
+    unset MMLTK_PACKAGE_FINGERPRINT
+    runtime_package_complete "${next_stage}" || die "staged release is incomplete"
+    [[ -f "${next_stage}/.mmltk-package-fingerprint" \
+        && "$(<"${next_stage}/.mmltk-package-fingerprint")" == "${package_fingerprint}" ]] \
+        || die "staged release fingerprint is incomplete"
+
+    build_configured_runtime_image "${next_stage}"
+    local previous_stage="${release_stage_root}.previous"
+    rm -rf -- "${previous_stage}"
+    if [[ -e "${release_stage_root}" ]]; then
+        mv "${release_stage_root}" "${previous_stage}"
+    fi
+    mv "${next_stage}" "${release_stage_root}"
+    rm -rf -- "${previous_stage}"
+}
+
+wait_for_parallel_builds() {
+    local remaining="${#active_build_pids[@]}"
+    local exit_status=0
+    while (( remaining > 0 )); do
+        if wait -n; then
+            remaining=$((remaining - 1))
+        else
+            exit_status=$?
+            log "parallel build job failed with exit status ${exit_status}; stopping its peer"
+            terminate_active_builds
+            return "${exit_status}"
+        fi
+    done
+    active_build_pids=()
+    active_build_start_ticks=()
+    active_build_container_names=()
+}
+
+run_gui_build() {
+    acquire_mutation_locks
+    ensure_docker
+    prepare_cache_layout
+    ensure_build_image
+    log "building iced Release bundle into ${gui_frontend_dist_dir}"
+    run_owned_toolchain_command "${gui_build_container_name}" \
+        'set -euo pipefail
+         cargo fetch --locked \
+             --manifest-path /workspace/src/frontend/iced/Cargo.toml \
+             --target wasm32-unknown-unknown
+         /workspace/tools/configure_cmake_graph.sh \
+             gui "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui"
+         /workspace/tools/run_traced_command.sh cargo_fmt_iced_aw \
+             cargo fmt --manifest-path /workspace/third_party/iced_aw/Cargo.toml
+         /workspace/tools/run_traced_command.sh cargo_fmt_frontend_iced \
+             cargo fmt --manifest-path /workspace/src/frontend/iced/Cargo.toml
+         cmake --build "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui" \
+             --parallel "${MMLTK_JOBS}" --target mmltk_frontend_iced_check
+         cmake --build "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui" \
+             --parallel "${MMLTK_JOBS}" --target mmltk_frontend_iced_bundle
+         python3 /workspace/tools/check_toolchain_invariants.py \
+             --repo-root /workspace --build-dir "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui"'
+    release_mutation_locks
+}
+
+run_gui_lock_update() {
+    acquire_mutation_locks
+    ensure_docker
+    prepare_cache_layout
+    ensure_build_image
+    log "updating iced dependency lock for the native browser test graph"
+    run_owned_toolchain_command "${gui_build_container_name}" \
+        'set -euo pipefail
+         cargo fetch \
+             --manifest-path /workspace/src/frontend/iced/Cargo.toml \
+             --target x86_64-unknown-linux-gnu'
+    release_mutation_locks
+}
+
+print_test_suites() {
+    printf '%s\n' \
+        'Test suites' \
+        '  application-systems  Independent application system suites' \
+        '  application-contracts  Isolated application domain and service contract suite' \
+        '  transport  Isolated browser physical transport and attachment suite' \
+        '  browser-runtime  Isolated Firefox process-owner and shell shutdown suite' \
+        '  workspace-wayland  Opt-in packaged Wayland/NVIDIA browser hardware suite' \
+        '  browser-app  Iced client protocol, state, and transport unit suite' \
+        '  cleanup-tool  Cleanup profile configuration and report fixture suite' \
+        '  core    Core dataset/runtime/compiler Catch2 suite' \
+        '  gui     Unavailable in the native Catch2 suite' \
+        '  tsan    Unavailable in the native Catch2 suite' \
+        '  rfdetr  RF-DETR native/model Catch2 suite' \
+        '  rfdetr-profile  Opt-in RF-DETR training profile runner' \
+        '  build   Build every available native release test target without running tests' \
+        '  all     Build and run every available suite' \
+        '' \
+        'Use: ./mmltk --test <suite> [test options] [-- <Catch2 args...>]' \
+        'For browser-app, arguments after -- are Cargo test arguments.' \
+        'Test options:' \
+        '  --executable <target>       Build and run one executable owned by the suite' \
+        '  --config <release|dev>      Select the containerized CMake graph' \
+        '  --env <NAME[=VALUE]>        Forward an additional environment variable' \
+        '  --gdb                       Run the selected executable through containerized GDB' \
+        '  --gdb-command <command>     Add an ordered GDB command (repeatable)'
+}
+
+run_io_diagnostic() {
+    local dataset_path
+    dataset_path="$(realpath -e -- "$1")" || die "compiled file does not exist: $1"
+    [[ -f "${dataset_path}" && -r "${dataset_path}" ]] ||
+        die "--diagnose-io requires a readable regular compiled file"
+    # Docker's volume syntax reserves colon; fail instead of mounting another path.
+    [[ "${dataset_path}" != *:* ]] || die "--diagnose-io file path cannot contain ':'"
+    command -v docker >/dev/null 2>&1 || die "docker is not installed"
+    docker_server_ready || die "docker daemon is unavailable; diagnostic did not start"
+    local diagnostic_image_id
+    diagnostic_image_id="$(docker image inspect "${build_image_name}" --format '{{.Id}}' 2>/dev/null)" ||
+        die "diagnostic requires existing image '${build_image_name}'; no image was built or pulled"
+    log "read-only I/O capability report in ${build_image_name}; no dataset reads or benchmarks"
+    local -a diagnostic_args=(
+        run --rm --init
+        --read-only --cap-drop ALL --security-opt no-new-privileges
+        --network none --gpus all
+        --user "${uid}:${gid}"
+        --env NVIDIA_DRIVER_CAPABILITIES=utility
+        --env PYTHONDONTWRITEBYTECODE=1
+        --env "MMLTK_DIAGNOSTIC_IMAGE=${build_image_name}"
+        --env "MMLTK_DIAGNOSTIC_IMAGE_ID=${diagnostic_image_id}"
+        --volume "${repo_root}/tools/diagnose_dataset_io.py:/diagnostic/report.py:ro"
+        --volume "${dataset_path}:/diagnostic/dataset:ro"
+        --entrypoint python3
+    )
+    build_common_group_args
+    diagnostic_args+=("${common_group_args[@]}")
+    docker "${diagnostic_args[@]}" "${diagnostic_image_id}" \
+        /diagnostic/report.py /diagnostic/dataset --source-path "${dataset_path}"
+}
+
+run_nvidia_payload_diagnostic() {
+    local source="$1"
+    shift
+    local diagnostic_image diagnostic_image_id
+    case "${source}" in
+        donor) diagnostic_image="$(manifest_value donor)" ;;
+        development) diagnostic_image="${build_image_name}" ;;
+        *) die "--diagnose-nvidia-payload requires donor or development, followed by public header filenames" ;;
+    esac
+    local header
+    for header in "$@"; do
+        [[ "${header}" =~ ^[A-Za-z0-9_.-]+$ ]] ||
+            die "NVIDIA diagnostic headers must be public filenames, without directory paths"
+    done
+    if [[ "${source}" == donor ]]; then
+        local header_list output_directory="${repo_root}/build/diagnostics/nvidia-payload"
+        printf -v header_list '%s,' "$@"
+        acquire_mutation_locks
+        ensure_docker
+        ensure_buildx_builder
+        prepare_owned_dirs "${output_directory}"
+        docker buildx build --builder "${buildx_builder_name}" --progress=plain \
+            --file "${repo_root}/docker/Dockerfile.nvidia-diagnostic" \
+            --build-arg "MMLTK_NVIDIA_DONOR_IMAGE=${diagnostic_image}" \
+            --build-arg "MMLTK_DIAGNOSTIC_HEADERS=${header_list%,}" \
+            --output "type=local,dest=${output_directory}" "${repo_root}" >&2
+        cat "${output_directory}/headers.json"
+        release_mutation_locks
+        return 0
+    fi
+    command -v docker >/dev/null 2>&1 || die "docker is not installed"
+    docker_server_ready || die "docker daemon is unavailable; diagnostic did not start"
+    diagnostic_image_id="$(docker image inspect "${diagnostic_image}" --format '{{.Id}}' 2>/dev/null)" ||
+        die "diagnostic requires existing image '${diagnostic_image}'; no image was built or pulled"
+    log "read-only NVIDIA header inventory in ${diagnostic_image}"
+    docker run --rm --init --read-only --cap-drop ALL --security-opt no-new-privileges \
+        --network none --user "${uid}:${gid}" \
+        --env PYTHONDONTWRITEBYTECODE=1 \
+        --env "MMLTK_DIAGNOSTIC_IMAGE=${diagnostic_image}" \
+        --env "MMLTK_DIAGNOSTIC_IMAGE_ID=${diagnostic_image_id}" \
+        --volume "${repo_root}/tools/diagnose_nvidia_payload.py:/diagnostic/report.py:ro" \
+        --volume "${repo_root}/docker:/diagnostic_metadata:ro" \
+        --entrypoint python3 "${diagnostic_image_id}" /diagnostic/report.py "$@"
+}
+
+run_cleanup_report() {
+    local profile="$1"
+    local -a selectors=()
+    case "${profile}" in
+        cpp)
+            selectors=(--cpp)
+            ;;
+        frontend)
+            selectors=(--frontend)
+            ;;
+        all)
+            selectors=(--cpp --frontend)
+            ;;
+        *)
+            die "--cleanup-report requires cpp, frontend, or all"
+            ;;
+    esac
+
+    acquire_mutation_locks
+    ensure_docker
+    prepare_cache_layout
+    ensure_build_image
+    local selector
+    for selector in "${selectors[@]}"; do
+        log "generating ${selector#--} cleanup report"
+        run_owned_toolchain_command "${cleanup_report_container_name}" \
+            "set -euo pipefail
+             node /workspace/tools/generate_cleanup_json.mjs ${selector}"
+    done
+    release_mutation_locks
+}
+
+append_explicit_test_environment() {
+    local -n environment_args="$1"
+    local environment_entry
+    for environment_entry in "${test_environment[@]}"; do
+        environment_args+=(--env "${environment_entry}")
+    done
+}
+
+append_forwarded_test_environment() {
+    append_native_environment "$1"
+    local -n target_args="$1"
+    local variable_name
+    for variable_name in \
+        MMLTK_RUN_WORKSPACE_VULKAN_TEST \
+        MMLTK_RUN_EXPLORE_CUDA_TEST \
+        MMLTK_RUN_WORKSPACE_WAYLAND_INTEGRATION \
+        MMLTK_GDR_TEST_DEVICE \
+        MMLTK_GDR_TEST_BACKEND \
+        TSAN_OPTIONS \
+        MMLTK_GUI_TRACE_FILE; do
+        if [[ -n "${!variable_name:-}" ]]; then
+            if [[ "${variable_name}" == "MMLTK_GUI_TRACE_FILE" ]]; then
+                target_args+=(--env "${variable_name}=$(rewrite_host_path "${!variable_name}")")
+            else
+                target_args+=(--env "${variable_name}=${!variable_name}")
+            fi
+        fi
+    done
+}
+
+run_test_executable() {
+    local executable="$1"
+    shift
+
+    prepare_owned_dirs \
+        "${cache_root}/tests/rfdetr" \
+        "${repo_root}/.mmltk-data/logs"
+    build_common_group_args
+    local -a docker_args=(
+        run --rm --init -i
+        --name "${test_run_container_name}"
+        --security-opt seccomp=unconfined
+        --gpus all
+        --ipc host
+        --network host
+        --user "${uid}:${gid}"
+        --env "HOME=${container_cache_root}/container-home"
+        --env NVIDIA_DRIVER_CAPABILITIES=all
+        --env MMLTK_REPO_ROOT=/workspace
+        --env "MMLTK_RFDETR_TEST_CACHE_DIR=${container_cache_root}/tests/rfdetr"
+        --volume "${repo_root}:/workspace:rw"
+        --volume /:/host:rw
+        --workdir /workspace
+    )
+    append_execution_policy_args docker_args
+    append_wrapper_labels docker_args "${invocation_mode}"
+    if [[ -t 0 && -t 1 ]]; then
+        docker_args+=(-t)
+    fi
+    if [[ -n "${MMLTK_LOG_LEVEL:-}" ]]; then
+        docker_args+=(--env "MMLTK_LOG_LEVEL=${MMLTK_LOG_LEVEL}")
+    fi
+    if [[ -n "${MMLTK_LOG_FILE:-}" ]]; then
+        docker_args+=(--env "MMLTK_LOG_FILE=$(rewrite_host_path "${MMLTK_LOG_FILE}")")
+    elif [[ -z "${MMLTK_LOG_DIR:-}" ]]; then
+        docker_args+=(--env MMLTK_LOG_DIR=/workspace/.mmltk-data/logs)
+    fi
+    if [[ -n "${MMLTK_LOG_DIR:-}" ]]; then
+        docker_args+=(--env "MMLTK_LOG_DIR=$(rewrite_host_path "${MMLTK_LOG_DIR}")")
+    fi
+    append_forwarded_test_environment docker_args
+    append_explicit_test_environment docker_args
+    docker_args+=("${common_group_args[@]}")
+    if (( test_debugger )); then
+        docker_args+=(--entrypoint /usr/bin/gdb "${build_image_name}")
+        if [[ ! -t 0 || ! -t 1 ]]; then
+            docker_args+=(--batch)
+        fi
+        local debugger_command
+        for debugger_command in "${test_debugger_commands[@]}"; do
+            docker_args+=(-ex "${debugger_command}")
+        done
+        if ((${#test_debugger_commands[@]} == 0)) && [[ ! -t 0 || ! -t 1 ]]; then
+            docker_args+=(-ex run -ex bt)
+        fi
+        docker_args+=(--args "${executable}")
+        docker_args+=("$@")
+    else
+        local test_timeout_seconds="${MMLTK_TEST_TIMEOUT_SECONDS:-300}"
+        [[ "${test_timeout_seconds}" =~ ^[1-9][0-9]*$ ]] ||
+            die "MMLTK_TEST_TIMEOUT_SECONDS must be a positive integer"
+        docker_args+=(--entrypoint /usr/bin/timeout "${build_image_name}")
+        docker_args+=(--foreground --signal=TERM --kill-after=10s "${test_timeout_seconds}s" "${executable}")
+        docker_args+=("$@")
+    fi
+    run_owned_docker_command "${test_run_container_name}" "${docker_args[@]}"
+}
+
+prepare_workspace_wayland_test_mounts() {
+    bind_mount_specs=()
+    append_bind_mount /dev /dev rw
+    resolve_wayland_gui_session
+    append_bind_mount "${gui_wayland_socket_host_path}" "${gui_wayland_socket_container_path}" rw
+    if [[ -n "${gui_dbus_socket_host_path}" ]]; then
+        append_bind_mount "${gui_dbus_socket_host_path}" "${gui_dbus_socket_container_path}" rw
+    fi
+    if [[ -d /run/dbus ]]; then
+        append_bind_mount /run/dbus /run/dbus rw
+    fi
+}
+
+run_workspace_wayland_test_executable() {
+    local executable="$1"
+    shift
+
+    docker image inspect "${image_name}" >/dev/null 2>&1 || die \
+        "workspace-wayland requires the packaged runtime image; run ./mmltk --build first"
+    prepare_owned_dirs \
+        "${cache_root}/container-home" \
+        "${cache_root}/tests/rfdetr" \
+        "${repo_root}/.mmltk-data/logs"
+    prepare_workspace_wayland_test_mounts
+    build_common_group_args
+    local -a docker_args=(
+        run --rm --init -i
+        --name "${test_run_container_name}"
+        --privileged
+        --gpus all
+        --ipc host
+        --network host
+        --user "${uid}:${gid}"
+        --tmpfs "$(gui_runtime_tmpfs_spec)"
+        --env "HOME=${container_cache_root}/container-home"
+        --env NVIDIA_DRIVER_CAPABILITIES=all
+        --env MMLTK_REPO_ROOT=/workspace
+        --env "MMLTK_RFDETR_TEST_CACHE_DIR=${container_cache_root}/tests/rfdetr"
+        --env MMLTK_RUN_WORKSPACE_WAYLAND_INTEGRATION=1
+        --env "XDG_SESSION_TYPE=${gui_platform}"
+        --env "XDG_RUNTIME_DIR=${gui_runtime_dir_container}"
+        --env GDK_BACKEND=wayland
+        --env __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+        --env GBM_BACKEND=nvidia-drm
+        --env "WAYLAND_DISPLAY=$(basename "${gui_wayland_socket_container_path}")"
+        --volume "${repo_root}:/workspace:rw"
+        --volume /:/host:rw
+        --workdir /workspace
+    )
+    append_execution_policy_args docker_args
+    append_native_environment docker_args
+    append_wrapper_labels docker_args "${invocation_mode}"
+    if [[ -t 0 && -t 1 ]]; then
+        docker_args+=(-t)
+    fi
+    if [[ -n "${gui_dbus_socket_container_path}" && -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+        docker_args+=(
+            --env "DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS/unix:path=${gui_dbus_socket_host_path}/unix:path=${gui_dbus_socket_container_path}}"
+        )
+    fi
+    if [[ -n "${__NV_PRIME_RENDER_OFFLOAD:-}" ]]; then
+        docker_args+=(--env "__NV_PRIME_RENDER_OFFLOAD=${__NV_PRIME_RENDER_OFFLOAD}")
+    fi
+    if [[ -n "${MMLTK_LOG_LEVEL:-}" ]]; then
+        docker_args+=(--env "MMLTK_LOG_LEVEL=${MMLTK_LOG_LEVEL}")
+    fi
+    if [[ -n "${MMLTK_LOG_FILE:-}" ]]; then
+        docker_args+=(--env "MMLTK_LOG_FILE=$(rewrite_host_path "${MMLTK_LOG_FILE}")")
+    elif [[ -z "${MMLTK_LOG_DIR:-}" ]]; then
+        docker_args+=(--env MMLTK_LOG_DIR=/workspace/.mmltk-data/logs)
+    fi
+    if [[ -n "${MMLTK_LOG_DIR:-}" ]]; then
+        docker_args+=(--env "MMLTK_LOG_DIR=$(rewrite_host_path "${MMLTK_LOG_DIR}")")
+    fi
+    if [[ -n "${MMLTK_GUI_TRACE_FILE:-}" ]]; then
+        docker_args+=(--env "MMLTK_GUI_TRACE_FILE=$(rewrite_host_path "${MMLTK_GUI_TRACE_FILE}")")
+    fi
+    if [[ -n "${MMLTK_FIREFOX_LOG_FILE:-}" ]]; then
+        docker_args+=(--env "MMLTK_FIREFOX_LOG_FILE=$(rewrite_host_path "${MMLTK_FIREFOX_LOG_FILE}")")
+    fi
+    append_explicit_test_environment docker_args
+    docker_args+=("${common_group_args[@]}")
+    local bind_mount_spec
+    for bind_mount_spec in "${bind_mount_specs[@]}"; do
+        docker_args+=(--volume "${bind_mount_spec}")
+    done
+    docker_args+=(--entrypoint "${executable}" "${image_name}")
+    docker_args+=("$@")
+    run_owned_docker_command "${test_run_container_name}" "${docker_args[@]}"
+}
+
+run_tests() {
+    local suite="$1"
+    shift
+
+    if [[ "${suite}" == "list" || "${suite}" == "help" || "${suite}" == "-h" || "${suite}" == "--help" ]]; then
+        (($# == 0)) || die "--test ${suite} does not accept additional arguments"
+        print_test_suites
+        return 0
+    fi
+    case "${suite}" in
+        gui|tsan)
+            die "--test ${suite} is unavailable in the native Catch2 test graph"
+            ;;
+    esac
+    if [[ "${suite}" == "browser-app" ]]; then
+        [[ "${test_config}" == "release" ]] ||
+            die "--test browser-app owns its GUI graph and does not accept --config"
+        [[ -z "${test_executable}" ]] ||
+            die "--test browser-app does not accept --executable"
+        (( ! test_debugger )) ||
+            die "--test browser-app does not accept --gdb"
+        ((${#test_environment[@]} == 0)) ||
+            die "--test browser-app does not yet consume native test environments"
+        acquire_mutation_locks
+        ensure_docker
+        prepare_cache_layout
+        ensure_build_image
+        local browser_test_arguments=""
+        local browser_test_argument
+        for browser_test_argument in "$@"; do
+            browser_test_argument="${browser_test_argument//;/\\;}"
+            browser_test_arguments+="${browser_test_arguments:+;}${browser_test_argument}"
+        done
+        local browser_test_configuration
+        printf -v browser_test_configuration '%q' "-DMMLTK_ICED_TEST_ARGUMENTS=${browser_test_arguments}"
+        log "running iced browser application tests"
+        run_owned_toolchain_command "${test_run_container_name}" \
+            'set -euo pipefail
+             /workspace/tools/configure_cmake_graph.sh \
+                 gui "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui" '"${browser_test_configuration}"'
+             cmake --build "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui" \
+                 --parallel "${MMLTK_JOBS}" --target mmltk_frontend_iced_tests
+             python3 /workspace/tools/check_toolchain_invariants.py \
+                 --repo-root /workspace --build-dir "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui"'
+        release_mutation_locks
+        return 0
+    fi
+    if [[ "${suite}" == "cleanup-tool" ]]; then
+        (($# == 0)) || die "--test cleanup-tool does not accept additional arguments"
+        (( ! test_config_explicit )) ||
+            die "--test cleanup-tool does not accept --config"
+        [[ -z "${test_executable}" ]] ||
+            die "--test cleanup-tool does not accept --executable"
+        (( ! test_debugger )) ||
+            die "--test cleanup-tool does not accept --gdb or --gdb-command"
+        ((${#test_environment[@]} == 0)) ||
+            die "--test cleanup-tool does not accept --env"
+        acquire_mutation_locks
+        ensure_docker
+        prepare_cache_layout
+        ensure_build_image
+        log "running cleanup tooling fixture tests"
+        run_owned_toolchain_command "${test_run_container_name}" \
+            'set -euo pipefail
+             node --test /workspace/tools/tests/generate_cleanup_json.test.mjs'
+        release_mutation_locks
+        return 0
+    fi
+    if [[ "${suite}" == "rfdetr-profile" ]]; then
+        if (( test_config_explicit )) && [[ "${test_config}" != "dev" ]]; then
+            die "rfdetr-profile requires the instrumented dev configuration"
+        fi
+        test_config="dev"
+    fi
+    local -a targets=()
+    local -a executables=()
+    local configure_preset="${test_config}"
+    local build_directory="${test_config}"
+    local workspace_wayland_suite=0
+    local -a suite_args=("$@")
+    local -a all_native_test_targets=(
+        mmltk_acceptance
+        mmltk_backend_data_tests
+        mmltk_backend_imaging_annotation_tests
+        mmltk_backend_imaging_explore_tests
+        mmltk_backend_media_live_tests
+        mmltk_backend_ml_layers_tests
+        mmltk_backend_ml_cuda_tests
+        mmltk_backend_models_catalog_tests
+        mmltk_backend_models_rfdetr_contract_tests
+        mmltk_backend_models_rfdetr_core_tests
+        mmltk_backend_models_rfdetr_augmentation_tests
+        mmltk_backend_models_rfdetr_export_tests
+        mmltk_backend_models_rfdetr_inference_tests
+        mmltk_backend_models_rfdetr_training_tests
+        mmltk_common_system_tests
+        mmltk_common_concurrency_tests
+        mmltk_controller_annotation_tests
+        mmltk_controller_browser_tests
+        mmltk_controller_visual_systems_tests
+        mmltk_controller_services_tests
+        mmltk_controller_shell_tests
+        mmltk_controller_data_compute_systems_tests
+        mmltk_entrypoints_cli_tests
+        mmltk_entrypoints_desktop_tests
+        mmltk_entrypoints_tools_tests
+        mmltk_frameworks_gpu_tests
+        mmltk_frameworks_process_tests
+        mmltk_frameworks_serialization_tests
+        mmltk_frameworks_transport_tests
+        mmltk_workspace_wayland_integration
+    )
+    local -a all_native_test_executables=()
+    local all_target
+    for all_target in "${all_native_test_targets[@]}"; do
+        [[ "${all_target}" == "mmltk_workspace_wayland_integration" ]] ||
+            all_native_test_executables+=("${all_target}")
+    done
+    case "${suite}" in
+        application-systems)
+            targets=(
+                mmltk_controller_browser_tests
+                mmltk_controller_services_tests
+                mmltk_controller_shell_tests
+                mmltk_controller_data_compute_systems_tests
+                mmltk_controller_visual_systems_tests
+                mmltk_frameworks_gpu_tests
+                mmltk_backend_media_live_tests
+            )
+            executables=("${targets[@]}")
+            ;;
+        application-contracts)
+            targets=(
+                mmltk_controller_browser_tests
+                mmltk_controller_services_tests
+                mmltk_controller_visual_systems_tests
+                mmltk_frameworks_serialization_tests
+            )
+            executables=("${targets[@]}")
+            ;;
+        transport)
+            targets=(mmltk_frameworks_transport_tests)
+            executables=("${targets[@]}")
+            ;;
+        browser-runtime)
+            targets=(mmltk_entrypoints_desktop_tests)
+            executables=(mmltk_entrypoints_desktop_tests)
+            ;;
+        workspace-wayland)
+            targets=(mmltk_workspace_wayland_integration)
+            executables=(mmltk_workspace_wayland_integration)
+            workspace_wayland_suite=1
+            ;;
+        core)
+            targets=(
+                mmltk_acceptance
+                mmltk_backend_data_tests
+                mmltk_backend_models_catalog_tests
+                mmltk_common_system_tests
+                mmltk_common_concurrency_tests
+                mmltk_entrypoints_cli_tests
+                mmltk_entrypoints_tools_tests
+            )
+            executables=("${targets[@]}")
+            ;;
+        rfdetr)
+            targets=(
+                mmltk_backend_ml_layers_tests
+                mmltk_backend_ml_cuda_tests
+                mmltk_backend_models_rfdetr_contract_tests
+                mmltk_backend_models_rfdetr_core_tests
+                mmltk_backend_models_rfdetr_augmentation_tests
+                mmltk_backend_models_rfdetr_export_tests
+                mmltk_backend_models_rfdetr_inference_tests
+                mmltk_backend_models_rfdetr_training_tests
+            )
+            executables=("${targets[@]}")
+            ;;
+        rfdetr-profile)
+            targets=(mmltk_rfdetr_train_profile_runner)
+            executables=("${targets[@]}")
+            ;;
+        build)
+            (($# == 0)) || die "--test build does not accept Catch2 arguments"
+            targets=("${all_native_test_targets[@]}")
+            ;;
+        all)
+            targets=("${all_native_test_targets[@]}")
+            executables=("${all_native_test_executables[@]}")
+            ;;
+        *)
+            print_test_suites >&2
+            die "unknown test suite '${suite}'"
+            ;;
+    esac
+
+    if [[ -n "${test_executable}" ]]; then
+        local target_found=0
+        local candidate
+        for candidate in "${targets[@]}"; do
+            if [[ "${candidate}" == "${test_executable}" ]]; then
+                target_found=1
+                break
+            fi
+        done
+        (( target_found )) ||
+            die "test executable '${test_executable}' is not owned by suite '${suite}'"
+        targets=("${test_executable}")
+        if [[ "${suite}" != "build" ]]; then
+            local executable_found=0
+            for candidate in "${executables[@]}"; do
+                if [[ "${candidate}" == "${test_executable}" ]]; then
+                    executable_found=1
+                    break
+                fi
+            done
+            (( executable_found )) ||
+                die "target '${test_executable}' is not an executable in suite '${suite}'"
+            executables=("${test_executable}")
+        fi
+    fi
+
+    if (( workspace_wayland_suite )); then
+        [[ "${test_config}" == "release" ]] ||
+            die "workspace-wayland requires the packaged release graph"
+        (( ! test_debugger )) ||
+            die "workspace-wayland does not run through the build-image debugger"
+    fi
+    if (( test_debugger )) && ((${#executables[@]} != 1)); then
+        die "--gdb requires a suite with one executable or an explicit --executable"
+    fi
+
+    acquire_mutation_locks
+    ensure_docker
+    prepare_cache_layout
+    ensure_build_image
+    local browser_host_enabled=OFF
+    local firefox_runtime_enabled=OFF
+    if [[ "${test_config}" == "release" ]]; then
+        prepare_firefox_build_input
+        browser_host_enabled=ON
+        firefox_runtime_enabled=ON
+    fi
+    local target_list="${targets[*]}"
+    local test_inventory_audit=""
+    if [[ "${suite}" == "all" || "${suite}" == "build" ]]; then
+        local inventory_target_list="${all_native_test_targets[*]}"
+        test_inventory_audit="python3 /workspace/tools/audit_test_inventory.py --compile-database \"\${MMLTK_CONTAINER_CACHE_ROOT}/cmake/${build_directory}/compile_commands.json\" --repo-root /workspace --expected-targets \"${inventory_target_list}\""
+    fi
+    log "building cached ${suite} test graph with ${build_jobs} workers"
+    run_owned_toolchain_command "${test_build_container_name}" \
+        "set -euo pipefail
+         /workspace/tools/configure_cmake_graph.sh \
+             ${configure_preset} \"\${MMLTK_CONTAINER_CACHE_ROOT}/cmake/${build_directory}\" \
+             -DBUILD_MMLTK_BROWSER_HOST=${browser_host_enabled} \
+             -DBUILD_MMLTK_FIREFOX_RUNTIME=${firefox_runtime_enabled} \
+             -DMMLTK_BUILD_JOBS=\"\${MMLTK_JOBS}\" \
+             -DMMLTK_FIREFOX_CACHE_ROOT=\"\${MMLTK_FIREFOX_CACHE_ROOT}\"
+         ${test_inventory_audit}
+         cmake --build \"\${MMLTK_CONTAINER_CACHE_ROOT}/cmake/${build_directory}\" \
+             --parallel \"\${MMLTK_JOBS}\" --target ${target_list}
+         python3 /workspace/tools/check_toolchain_invariants.py \
+             --repo-root /workspace --build-dir \"\${MMLTK_CONTAINER_CACHE_ROOT}/cmake/${build_directory}\""
+
+    if (( workspace_wayland_suite )); then
+        local workspace_wayland_inventory=""
+        local -a workspace_wayland_expected_cases=(
+            workspace_wayland_product_sigint
+            workspace_wayland_product_window_close
+            workspace_wayland_product_peer_loss
+        )
+        log "enumerating ${executables[0]} hardware cases"
+        if ! workspace_wayland_inventory="$(
+            run_workspace_wayland_test_executable \
+                "${container_cache_root}/cmake/${build_directory}/${executables[0]}" \
+                --list-tests
+        )"; then
+            release_mutation_locks
+            die "workspace-wayland test enumeration failed"
+        fi
+        printf '%s\n' "${workspace_wayland_inventory}"
+        local workspace_wayland_case
+        for workspace_wayland_case in "${workspace_wayland_expected_cases[@]}"; do
+            [[ "${workspace_wayland_inventory}" == *"${workspace_wayland_case}"* ]] || {
+                release_mutation_locks
+                die "workspace-wayland executable is missing expected hardware case '${workspace_wayland_case}'"
+            }
+        done
+        log "running ${executables[0]}"
+        local workspace_wayland_status=0
+        if run_workspace_wayland_test_executable \
+                "${container_cache_root}/cmake/${build_directory}/${executables[0]}" \
+                "${suite_args[@]}"; then
+            :
+        else
+            workspace_wayland_status=$?
+        fi
+        release_mutation_locks
+        return "${workspace_wayland_status}"
+    fi
+
+    local first_failure=0
+    local executable
+    for executable in "${executables[@]}"; do
+        log "running ${executable}"
+        local exit_status=0
+        local -a executable_args=("${suite_args[@]}")
+        if run_test_executable "${container_cache_root}/cmake/${build_directory}/${executable}" "${executable_args[@]}"; then
+            continue
+        else
+            exit_status=$?
+        fi
+        if (( first_failure == 0 )); then
+            first_failure="${exit_status}"
+        fi
+        if [[ "${suite}" != "all" ]]; then
+            release_mutation_locks
+            return "${exit_status}"
+        fi
+    done
+    release_mutation_locks
+    return "${first_failure}"
+}
+
+prepare_release_build_environment() {
+    acquire_mutation_locks
+    ensure_docker
+    prepare_cache_layout
+}
+
+run_build() {
+    acquire_mutation_locks
+    initialize_build_trace
+    trace_build_event build start
+    trace_build_job_assignment
+    trace_failed_build() {
+        local exit_status=$?
+        trap - ERR
+        trace_build_event build finish "failure:${exit_status}"
+        return "${exit_status}"
+    }
+    trap trace_failed_build ERR
+    run_traced_build_phase bootstrap prepare_release_build_environment
+    prepare_image_producers
+    image_producers_prepared=1
+    buildx_builder_ready=1
+    default_engine_builder_ready=1
+    active_build_container_names=("${release_build_container_name}")
+    docker rm -f "${release_build_container_name}" >/dev/null 2>&1 || true
+    run_traced_build_phase release_ninja run_release_branch &
+    track_build_pid "$!"
+    run_traced_build_phase runtime_base ensure_runtime_base_image &
+    track_build_pid "$!"
+    if wait_for_parallel_builds; then
+        :
+    else
+        local exit_status=$?
+        trap - ERR
+        trace_build_event build finish "failure:${exit_status}"
+        return "${exit_status}"
+    fi
+    run_traced_build_phase package stage_release_and_runtime
+    release_mutation_locks
+    trace_build_event build finish success
+    trap - ERR
+}
+
+reset_gui_session_resolution() {
+    gui_platform=""
+    gui_wayland_socket_host_path=""
+    gui_wayland_socket_container_path=""
+    gui_dbus_socket_host_path=""
+    gui_dbus_socket_container_path=""
+    bind_mount_specs=()
+    desired_runtime_label=""
+    exec_env_args=()
+}
+
+prepare_container_invocation() {
+    container_cleanup_armed=1
+    ensure_container
+    build_exec_env_args
+    verify_gui_contract_compatibility
+    terminate_existing_gui_instances
+
+    container_workdir="/host${host_workdir}"
+
+    exec_args=(exec -i)
+    interactive_tty=0
+    if [[ -t 0 && -t 1 ]]; then
+        exec_args+=(-t)
+        interactive_tty=1
+    fi
+    exec_args+=("${exec_env_args[@]}" -w "${container_workdir}" "${container_name}")
+
+    if (( gui_mode )); then
+        container_command=(/opt/mmltk/bin/mmltk-browser-host "${rewritten_args[@]}")
+        log "using packaged browser host and GUI bundle"
+    else
+        container_command=(/opt/mmltk/bin/mmltk "${rewritten_args[@]}")
+    fi
+
+    # When the caller redirects stdout/stderr (e.g. `./mmltk --gui 2>&1 | tee
+    # log`), docker attaches the child process to pipes instead of a pty. glibc
+    # then block-buffers stderr — on a crash the last diagnostics may disappear.
+    # Line-buffer with stdbuf so
+    # every newline flushes. Skip when already on a TTY since a terminal is
+    # line-buffered natively and stdbuf would be a no-op wrapper.
+    if (( ! interactive_tty )); then
+        container_command=(stdbuf -oL -eL "${container_command[@]}")
+    fi
+}
+
+run_prepared_container_invocation() {
+    docker "${exec_args[@]}" "${container_command[@]}" <&0 &
+    active_docker_pid=$!
+    local exit_status=0
+    if wait "${active_docker_pid}"; then
+        exit_status=0
+    else
+        exit_status=$?
+    fi
+    active_docker_pid=0
+    return "${exit_status}"
+}
+
+gui_mode=0
+build_mode=0
+build_gui_mode=0
+generate_protocol_mode=0
+generate_application_bindings_mode=0
+update_gui_lock_mode=0
+tidy_mode=0
+tidy_third_party=0
+prepare_gui_container_mode=0
+test_mode=0
+cleanup_report_mode=0
+cleanup_report_profile=""
+diagnose_io_mode=0
+diagnose_io_path=""
+diagnose_nvidia_mode=0
+diagnose_nvidia_args=()
+test_suite=""
+test_args=()
+test_config="release"
+test_config_explicit=0
+test_executable=""
+test_debugger=0
+test_debugger_commands=()
+test_environment=()
+passthrough_args=()
+for arg in "$@"; do
+    if [[ "${arg}" == "--gui" ]]; then
+        gui_mode=1
+        continue
+    fi
+    if [[ "${arg}" == "--build" ]]; then
+        build_mode=1
+        continue
+    fi
+    if [[ "${arg}" == "--build-gui" ]]; then
+        build_gui_mode=1
+        continue
+    fi
+    if [[ "${arg}" == "--generate-protocol" ]]; then
+        generate_protocol_mode=1
+        continue
+    fi
+    if [[ "${arg}" == "--generate-application-bindings" ]]; then
+        generate_application_bindings_mode=1
+        continue
+    fi
+    if [[ "${arg}" == "--update-gui-lock" ]]; then
+        update_gui_lock_mode=1
+        continue
+    fi
+    if [[ "${arg}" == "--prepare-gui-container" ]]; then
+        gui_mode=1
+        prepare_gui_container_mode=1
+        continue
+    fi
+    if [[ "${arg}" == "--tidy" ]]; then
+        tidy_mode=1
+        continue
+    fi
+    if [[ "${arg}" == "--third_party" ]]; then
+        tidy_third_party=1
+        continue
+    fi
+    passthrough_args+=("${arg}")
+done
+
+if (( tidy_third_party && ! tidy_mode )); then
+    die "--third_party is only valid with --tidy"
+fi
+
+if ((${#passthrough_args[@]} > 0)); then
+    if [[ "${passthrough_args[0]}" == "--test" ]]; then
+        test_mode=1
+        ((${#passthrough_args[@]} >= 2)) || die "--test requires a suite name; use './mmltk --test list'"
+        test_suite="${passthrough_args[1]}"
+        test_args=("${passthrough_args[@]:2}")
+    elif [[ "${passthrough_args[0]}" == --test=* ]]; then
+        test_mode=1
+        test_suite="${passthrough_args[0]#--test=}"
+        [[ -n "${test_suite}" ]] || die "--test requires a suite name; use './mmltk --test list'"
+        test_args=("${passthrough_args[@]:1}")
+    elif [[ "${passthrough_args[0]}" == "--diagnose-nvidia-payload" ]]; then
+        diagnose_nvidia_mode=1
+        ((${#passthrough_args[@]} >= 3)) ||
+            die "--diagnose-nvidia-payload requires donor or development, followed by public header filenames"
+        diagnose_nvidia_args=("${passthrough_args[@]:1}")
+        passthrough_args=()
+    elif [[ "${passthrough_args[0]}" == "--diagnose-io" ]]; then
+        diagnose_io_mode=1
+        ((${#passthrough_args[@]} == 2)) ||
+            die "--diagnose-io requires exactly one compiled-file path"
+        diagnose_io_path="${passthrough_args[1]}"
+        passthrough_args=()
+    elif [[ "${passthrough_args[0]}" == "--cleanup-report" ]]; then
+        cleanup_report_mode=1
+        ((${#passthrough_args[@]} == 2)) ||
+            die "--cleanup-report requires exactly one of cpp, frontend, or all"
+        cleanup_report_profile="${passthrough_args[1]}"
+        passthrough_args=()
+    elif [[ "${passthrough_args[0]}" == --cleanup-report=* ]]; then
+        cleanup_report_mode=1
+        ((${#passthrough_args[@]} == 1)) ||
+            die "--cleanup-report does not accept additional arguments"
+        cleanup_report_profile="${passthrough_args[0]#--cleanup-report=}"
+        [[ -n "${cleanup_report_profile}" ]] ||
+            die "--cleanup-report requires cpp, frontend, or all"
+        passthrough_args=()
+    fi
+fi
+
+if (( ! diagnose_io_mode )); then
+    for arg in "${passthrough_args[@]}"; do
+        [[ "${arg}" != "--diagnose-io" ]] ||
+            die "--diagnose-io must be the standalone operation before its compiled-file path"
+    done
+fi
+
+if (( ! diagnose_nvidia_mode )); then
+    for arg in "${passthrough_args[@]}"; do
+        [[ "${arg}" != "--diagnose-nvidia-payload" ]] ||
+            die "--diagnose-nvidia-payload must be the standalone operation before its source and public header filenames"
+    done
+fi
+
+if (( ! cleanup_report_mode )); then
+    for arg in "${passthrough_args[@]}"; do
+        if [[ "${arg}" == "--cleanup-report" || "${arg}" == --cleanup-report=* ]]; then
+            die "--cleanup-report must be the standalone operation before its profile"
+        fi
+    done
+fi
+
+parse_test_invocation_args() {
+    local -a raw_args=("$@")
+    test_args=()
+    local index=0
+    while (( index < ${#raw_args[@]} )); do
+        local argument="${raw_args[index]}"
+        case "${argument}" in
+            --)
+                test_args+=("${raw_args[@]:index+1}")
+                return
+                ;;
+            --config)
+                (( index + 1 < ${#raw_args[@]} )) ||
+                    die "--config requires release or dev"
+                test_config="${raw_args[index+1]}"
+                test_config_explicit=1
+                ((index += 2))
+                ;;
+            --executable)
+                (( index + 1 < ${#raw_args[@]} )) ||
+                    die "--executable requires a target name"
+                test_executable="${raw_args[index+1]}"
+                ((index += 2))
+                ;;
+            --env)
+                (( index + 1 < ${#raw_args[@]} )) ||
+                    die "--env requires NAME or NAME=VALUE"
+                local environment_entry="${raw_args[index+1]}"
+                local environment_name="${environment_entry%%=*}"
+                [[ "${environment_name}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] ||
+                    die "invalid --env name '${environment_name}'"
+                test_environment+=("${environment_entry}")
+                ((index += 2))
+                ;;
+            --gdb)
+                test_debugger=1
+                ((index += 1))
+                ;;
+            --gdb-command)
+                (( index + 1 < ${#raw_args[@]} )) ||
+                    die "--gdb-command requires one GDB command"
+                test_debugger=1
+                test_debugger_commands+=("${raw_args[index+1]}")
+                ((index += 2))
+                ;;
+            *)
+                test_args+=("${argument}")
+                ((index += 1))
+                ;;
+        esac
+    done
+}
+
+if (( test_mode )); then
+    parse_test_invocation_args "${test_args[@]}"
+    case "${test_config}" in
+        release|dev)
+            ;;
+        *)
+            die "--config must be release or dev"
+            ;;
+    esac
+fi
+
+if (( test_mode )) && [[ "${test_suite}" == "tsan" ]] && (( build_jobs > 8 )); then
+    build_jobs=8
+fi
+
+if (( build_mode + build_gui_mode + generate_protocol_mode + generate_application_bindings_mode +
+      update_gui_lock_mode + tidy_mode + test_mode + cleanup_report_mode + diagnose_io_mode + diagnose_nvidia_mode > 1 ||
+      (build_mode || tidy_mode || test_mode || cleanup_report_mode || diagnose_io_mode || diagnose_nvidia_mode) && gui_mode )); then
+    die "--build, --build-gui, --generate-protocol, --generate-application-bindings, --update-gui-lock, --test, --tidy, --cleanup-report, --diagnose-io, and --diagnose-nvidia-payload are standalone"
+fi
+
+if (( diagnose_nvidia_mode )); then
+    invocation_mode="diagnose-nvidia-payload"
+    run_nvidia_payload_diagnostic "${diagnose_nvidia_args[@]}"
+    exit $?
+fi
+
+if (( diagnose_io_mode )); then
+    invocation_mode="diagnose-io"
+    run_io_diagnostic "${diagnose_io_path}"
+    exit $?
+fi
+
+if (( test_mode )); then
+    invocation_mode="test"
+    run_tests "${test_suite}" "${test_args[@]}"
+    exit $?
+fi
+
+if (( cleanup_report_mode )); then
+    invocation_mode="cleanup-report"
+    run_cleanup_report "${cleanup_report_profile}"
+    exit $?
+fi
+
+rewrite_passthrough_args
+
+if (( tidy_mode )); then
+    invocation_mode="tidy"
+    run_tidy
+    exit $?
+fi
+
+if (( build_mode )); then
+    if ((${#passthrough_args[@]} > 0)); then
+        die "--build does not accept application arguments"
+    fi
+    invocation_mode="build"
+    run_build
+    exit $?
+fi
+
+if (( generate_protocol_mode )); then
+    if ((${#passthrough_args[@]} > 0)); then
+        die "--generate-protocol does not accept application arguments"
+    fi
+    invocation_mode="generate-protocol"
+    run_protocol_generation
+    exit $?
+fi
+
+if (( generate_application_bindings_mode )); then
+    if ((${#passthrough_args[@]} > 0)); then
+        die "--generate-application-bindings does not accept application arguments"
+    fi
+    invocation_mode="generate-application-bindings"
+    run_application_bindings_generation
+    exit $?
+fi
+
+if (( update_gui_lock_mode )); then
+    if ((${#passthrough_args[@]} > 0)); then
+        die "--update-gui-lock does not accept application arguments"
+    fi
+    invocation_mode="update-gui-lock"
+    run_gui_lock_update
+    exit $?
+fi
+
+if (( build_gui_mode )); then
+    if (( ! gui_mode && ${#passthrough_args[@]} > 0 )); then
+        die "--build-gui without --gui does not accept application arguments"
+    fi
+    invocation_mode="build-gui"
+    run_gui_build
+    if (( ! gui_mode )); then
+        exit 0
+    fi
+fi
+
+if (( gui_mode )); then
+    invocation_mode="gui"
+else
+    invocation_mode="raw"
+fi
+acquire_runtime_lock
+prepare_container_invocation
+
+if (( prepare_gui_container_mode )); then
+    release_runtime_lock
+    exit 0
+fi
+
+invocation_exit_status=0
+if run_prepared_container_invocation; then
+    invocation_exit_status=0
+else
+    invocation_exit_status=$?
+fi
+release_runtime_lock
+exit "${invocation_exit_status}"

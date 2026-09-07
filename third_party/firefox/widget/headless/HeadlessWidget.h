@@ -1,0 +1,138 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(HEADLESSWIDGET_H)
+#define HEADLESSWIDGET_H
+
+#include "mozilla/widget/InProcessCompositorWidget.h"
+#include "nsIWidget.h"
+#include "CompositorWidget.h"
+#include "mozilla/dom/WheelEventBinding.h"
+
+#if defined(MOZ_WIDGET_GTK)
+#  define MOZ_HEADLESS_SCROLL_MULTIPLIER 3
+#  define MOZ_HEADLESS_SCROLL_DELTA_MODE \
+    mozilla::dom::WheelEvent_Binding::DOM_DELTA_LINE
+#else
+#  define MOZ_HEADLESS_SCROLL_MULTIPLIER -1
+#  define MOZ_HEADLESS_SCROLL_DELTA_MODE -1
+#endif
+
+namespace mozilla {
+enum class NativeKeyBindingsType : uint8_t;
+namespace widget {
+
+class HeadlessWidget final : public nsIWidget {
+ public:
+  HeadlessWidget();
+
+  NS_INLINE_DECL_REFCOUNTING_INHERITED(HeadlessWidget, nsIWidget)
+
+  void* GetNativeData(uint32_t aDataType) override {
+    return nullptr;
+  }
+
+  nsresult Create(nsIWidget* aParent, const LayoutDeviceIntRect& aRect,
+                  const widget::InitData&) override;
+  using nsIWidget::Create;  
+
+  void GetCompositorWidgetInitData(
+      mozilla::widget::CompositorWidgetInitData* aInitData) override;
+
+  void Destroy() override;
+  void Show(bool aState) override;
+  bool IsVisible() const override;
+  void Move(const DesktopPoint&) override;
+  void Resize(const DesktopSize&, bool aRepaint) override;
+  void Resize(const DesktopRect&, bool aRepaint) override;
+  nsSizeMode SizeMode() override { return mSizeMode; }
+  void SetSizeMode(nsSizeMode aMode) override;
+  nsresult MakeFullScreen(bool aFullScreen) override;
+  void Enable(bool aState) override;
+  bool IsEnabled() const override;
+  void SetFocus(Raise, mozilla::dom::CallerType aCallerType) override;
+  LayoutDeviceIntRect GetBounds() override { return mBounds; }
+  void Invalidate(const LayoutDeviceIntRect& aRect) override {
+  }
+  nsresult SetTitle(const nsAString& title) override {
+    return NS_OK;
+  }
+  LayoutDeviceIntPoint WidgetToScreenOffset() override;
+  void SetInputContext(const InputContext& aContext,
+                       const InputContextAction& aAction) override {
+    mInputContext = aContext;
+  }
+  InputContext GetInputContext() override { return mInputContext; }
+
+  WindowRenderer* GetWindowRenderer() override;
+
+  void SetCompositorWidgetDelegate(CompositorWidgetDelegate* delegate) override;
+
+  [[nodiscard]] nsresult AttachNativeKeyEvent(
+      WidgetKeyboardEvent& aEvent) override;
+  MOZ_CAN_RUN_SCRIPT bool GetEditCommands(
+      NativeKeyBindingsType aType, const WidgetKeyboardEvent& aEvent,
+      nsTArray<CommandInt>& aCommands) override;
+
+  nsresult SynthesizeNativeMouseEvent(
+      LayoutDeviceIntPoint aPoint, NativeMouseMessage aNativeMessage,
+      mozilla::MouseButton aButton, nsIWidget::NativeModifiers aModifierFlags,
+      nsISynthesizedEventCallback* aCallback) override;
+  nsresult SynthesizeNativeMouseMove(
+      LayoutDeviceIntPoint aPoint,
+      nsISynthesizedEventCallback* aCallback) override {
+    return SynthesizeNativeMouseEvent(
+        aPoint, NativeMouseMessage::Move, mozilla::MouseButton::eNotPressed,
+        nsIWidget::NativeModifiers::NO_MODIFIERS, aCallback);
+  };
+
+  nsresult SynthesizeNativeMouseScrollEvent(
+      LayoutDeviceIntPoint aPoint, uint32_t aNativeMessage, double aDeltaX,
+      double aDeltaY, double aDeltaZ, nsIWidget::NativeModifiers aModifierFlags,
+      uint32_t aAdditionalFlags,
+      nsISynthesizedEventCallback* aCallback) override;
+
+  nsresult SynthesizeNativeTouchPoint(
+      uint32_t aPointerId, TouchPointerState aPointerState,
+      LayoutDeviceIntPoint aPoint, double aPointerPressure,
+      uint32_t aPointerOrientation,
+      nsISynthesizedEventCallback* aCallback) override;
+
+  nsresult SynthesizeNativeTouchPadPinch(TouchpadGesturePhase aEventPhase,
+                                         float aScale,
+                                         LayoutDeviceIntPoint aPoint,
+                                         int32_t aModifierFlags) override;
+
+  nsresult SynthesizeNativeTouchpadPan(
+      TouchpadGesturePhase aEventPhase, LayoutDeviceIntPoint aPoint,
+      double aDeltaX, double aDeltaY, int32_t aModifierFlags,
+      nsISynthesizedEventCallback* aCallback) override;
+
+ private:
+  ~HeadlessWidget();
+  bool mEnabled;
+  bool mVisible;
+  bool mDestroyed;
+  bool mAlwaysOnTop;
+  HeadlessCompositorWidget* mCompositorWidget;
+  nsSizeMode mSizeMode;
+  nsSizeMode mLastSizeMode;
+  nsSizeMode mEffectiveSizeMode;
+  mozilla::ScreenCoord mLastPinchSpan;
+  InputContext mInputContext;
+  mozilla::UniquePtr<mozilla::MultiTouchInput> mSynthesizedTouchInput;
+  LayoutDeviceIntRect mRestoreBounds;
+  LayoutDeviceIntRect mBounds;
+  void ApplySizeModeSideEffects();
+  void MoveInternal(int32_t aX, int32_t aY);
+  void ResizeInternal(int32_t aWidth, int32_t aHeight, bool aRepaint);
+  void RaiseWindow();
+  static StaticAutoPtr<nsTArray<HeadlessWidget*>> sActiveWindows;
+  static already_AddRefed<HeadlessWidget> GetActiveWindow();
+};
+
+}  
+}  
+
+#endif

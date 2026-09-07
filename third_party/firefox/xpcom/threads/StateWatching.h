@@ -1,0 +1,236 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef XPCOM_THREADS_STATEWATCHING_H_
+#define XPCOM_THREADS_STATEWATCHING_H_
+
+#include <cstddef>
+#include <new>
+#include <utility>
+#include "mozilla/AbstractThread.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/Logging.h"
+#include "mozilla/RefPtr.h"
+#include "nsCycleCollectionNoteChild.h"
+#include "nsISupports.h"
+#include "nsTArray.h"
+#include "nsThreadUtils.h"
+
+
+namespace mozilla {
+
+extern LazyLogModule gStateWatchingLog;
+
+#define WATCH_LOG(x, ...) \
+  MOZ_LOG(gStateWatchingLog, LogLevel::Debug, (x, ##__VA_ARGS__))
+
+class AbstractWatcher {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(AbstractWatcher)
+  AbstractWatcher() : mDestroyed(false) {}
+  bool IsDestroyed() { return mDestroyed; }
+  virtual void Notify() = 0;
+
+ protected:
+  virtual ~AbstractWatcher() { MOZ_ASSERT(mDestroyed); }
+  bool mDestroyed;
+};
+
+class WatchTarget {
+ public:
+  explicit WatchTarget(const char* aName) : mName(aName) {}
+
+  void AddWatcher(AbstractWatcher* aWatcher) {
+    MOZ_ASSERT(!mWatchers.Contains(aWatcher));
+    mWatchers.AppendElement(aWatcher);
+  }
+
+  void RemoveWatcher(AbstractWatcher* aWatcher) {
+    MOZ_ASSERT(mWatchers.Contains(aWatcher));
+    mWatchers.RemoveElement(aWatcher);
+  }
+
+ protected:
+  void NotifyWatchers() {
+    WATCH_LOG("%s[%p] notifying watchers\n", mName, this);
+    PruneWatchers();
+    for (size_t i = 0; i < mWatchers.Length(); ++i) {
+      mWatchers[i]->Notify();
+    }
+  }
+
+ private:
+  void PruneWatchers() {
+    mWatchers.RemoveElementsBy(
+        [](const auto& watcher) { return watcher->IsDestroyed(); });
+  }
+
+  nsTArray<RefPtr<AbstractWatcher>> mWatchers;
+
+ protected:
+  const char* mName;
+};
+
+template <typename T>
+class Watchable : public WatchTarget {
+ public:
+  Watchable(const T& aInitialValue, const char* aName)
+      : WatchTarget(aName), mValue(aInitialValue) {}
+
+  const T& Ref() const { return mValue; }
+  operator const T&() const { return Ref(); }
+  template <typename U>
+  Watchable& operator=(U&& aNewValue) {
+    if (aNewValue != mValue) {
+      mValue = std::forward<U>(aNewValue);
+      NotifyWatchers();
+    }
+
+    return *this;
+  }
+
+ private:
+  Watchable(const Watchable& aOther) = delete;
+  Watchable& operator=(const Watchable& aOther) = delete;
+
+  T mValue;
+};
+
+template <typename T>
+inline void ImplCycleCollectionUnlink(Watchable<T>& aField) {
+  ImplCycleCollectionUnlink<T>(aField);
+}
+
+template <typename T>
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback, const Watchable<T>& aField,
+    const char* aName, uint32_t aFlags = 0) {
+  ImplCycleCollectionTraverse(aCallback, aField.Ref(), aName, aFlags);
+}
+
+template <typename OwnerType>
+class WatchManager {
+ public:
+  typedef void (OwnerType::*CallbackMethod)();
+  explicit WatchManager(OwnerType* aOwner, AbstractThread* aOwnerThread)
+      : mOwner(aOwner), mOwnerThread(aOwnerThread) {}
+
+  ~WatchManager() {
+    if (!IsShutdown()) {
+      Shutdown();
+    }
+  }
+
+  bool IsShutdown() const { return !mOwner; }
+
+  void Shutdown() {
+    MOZ_ASSERT(mOwnerThread->IsCurrentThreadIn());
+    for (auto& watcher : mWatchers) {
+      watcher->Destroy();
+    }
+    mWatchers.Clear();
+    mOwner = nullptr;
+  }
+
+  void Watch(WatchTarget& aTarget, CallbackMethod aMethod) {
+    MOZ_ASSERT(mOwnerThread->IsCurrentThreadIn());
+    aTarget.AddWatcher(&EnsureWatcher(aMethod));
+  }
+
+  void Unwatch(WatchTarget& aTarget, CallbackMethod aMethod) {
+    MOZ_ASSERT(mOwnerThread->IsCurrentThreadIn());
+    PerCallbackWatcher* watcher = GetWatcher(aMethod);
+    MOZ_ASSERT(watcher);
+    aTarget.RemoveWatcher(watcher);
+  }
+
+  void ManualNotify(CallbackMethod aMethod) {
+    MOZ_ASSERT(mOwnerThread->IsCurrentThreadIn());
+    PerCallbackWatcher* watcher = GetWatcher(aMethod);
+    MOZ_ASSERT(watcher);
+    watcher->Notify();
+  }
+
+ private:
+  class PerCallbackWatcher : public AbstractWatcher {
+   public:
+    PerCallbackWatcher(OwnerType* aOwner, AbstractThread* aOwnerThread,
+                       CallbackMethod aMethod)
+        : mOwner(aOwner),
+          mOwnerThread(aOwnerThread),
+          mCallbackMethod(aMethod) {}
+
+    void Destroy() {
+      MOZ_ASSERT(mOwnerThread->IsCurrentThreadIn());
+      mDestroyed = true;
+      mOwner = nullptr;
+    }
+
+    void Notify() override {
+      MOZ_ASSERT(mOwnerThread->IsCurrentThreadIn());
+      MOZ_DIAGNOSTIC_ASSERT(mOwner,
+                            "mOwner is only null after destruction, "
+                            "at which point we shouldn't be notified");
+      if (mNotificationPending) {
+        return;
+      }
+      mNotificationPending = true;
+
+      AbstractThread::DispatchDirectTask(
+          NS_NewRunnableFunction("WatchManager::PerCallbackWatcher::Notify",
+                                 [self = RefPtr<PerCallbackWatcher>(this),
+                                  owner = RefPtr<OwnerType>(mOwner)]() {
+                                   if (!self->mDestroyed) {
+                                     ((*owner).*(self->mCallbackMethod))();
+                                   }
+                                   self->mNotificationPending = false;
+                                 }));
+    }
+
+    bool CallbackMethodIs(CallbackMethod aMethod) const {
+      return mCallbackMethod == aMethod;
+    }
+
+   private:
+    ~PerCallbackWatcher() = default;
+
+    OwnerType* mOwner;  
+    bool mNotificationPending = false;
+    RefPtr<AbstractThread> mOwnerThread;
+    CallbackMethod mCallbackMethod;
+  };
+
+  PerCallbackWatcher* GetWatcher(CallbackMethod aMethod) {
+    MOZ_ASSERT(mOwnerThread->IsCurrentThreadIn());
+    for (auto& watcher : mWatchers) {
+      if (watcher->CallbackMethodIs(aMethod)) {
+        return watcher;
+      }
+    }
+    return nullptr;
+  }
+
+  PerCallbackWatcher& EnsureWatcher(CallbackMethod aMethod) {
+    MOZ_ASSERT(mOwnerThread->IsCurrentThreadIn());
+    PerCallbackWatcher* watcher = GetWatcher(aMethod);
+    if (watcher) {
+      return *watcher;
+    }
+    watcher = mWatchers
+                  .AppendElement(MakeAndAddRef<PerCallbackWatcher>(
+                      mOwner, mOwnerThread, aMethod))
+                  ->get();
+    return *watcher;
+  }
+
+  nsTArray<RefPtr<PerCallbackWatcher>> mWatchers;
+  OwnerType* mOwner;
+  RefPtr<AbstractThread> mOwnerThread;
+};
+
+#undef WATCH_LOG
+
+}  
+
+#endif

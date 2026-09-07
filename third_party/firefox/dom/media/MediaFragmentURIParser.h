@@ -1,0 +1,64 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#if !defined(MediaFragmentURIParser_h_)
+#  define MediaFragmentURIParser_h_
+
+#  include "mozilla/Maybe.h"
+#  include "nsRect.h"
+#  include "nsStringFwd.h"
+
+class nsIURI;
+
+
+namespace mozilla {
+
+enum ClipUnit {
+  eClipUnit_Pixel,
+  eClipUnit_Percent,
+};
+
+class MediaFragmentURIParser {
+ public:
+  explicit MediaFragmentURIParser(nsIURI* aURI);
+
+  explicit MediaFragmentURIParser(nsCString& aRef);
+
+  bool HasStartTime() const { return mStart.isSome(); }
+
+  double GetStartTime() const { return *mStart; }
+
+  bool HasEndTime() const { return mEnd.isSome(); }
+
+  double GetEndTime() const { return *mEnd; }
+
+  bool HasClip() const { return mClip.isSome(); }
+
+  nsIntRect GetClip() const { return *mClip; }
+
+  ClipUnit GetClipUnit() const { return mClipUnit; }
+
+ private:
+  void Parse(nsACString& aRef);
+
+  bool ParseNPT(nsDependentSubstring aString);
+  bool ParseNPTTime(nsDependentSubstring& aString, double& aTime);
+  bool ParseNPTSec(nsDependentSubstring& aString, double& aSec);
+  bool ParseNPTFraction(nsDependentSubstring& aString, double& aFraction);
+  bool ParseNPTMMSS(nsDependentSubstring& aString, double& aTime);
+  bool ParseNPTHHMMSS(nsDependentSubstring& aString, double& aTime);
+  bool ParseNPTHH(nsDependentSubstring& aString, uint32_t& aHour);
+  bool ParseNPTMM(nsDependentSubstring& aString, uint32_t& aMinute);
+  bool ParseNPTSS(nsDependentSubstring& aString, uint32_t& aSecond);
+  bool ParseXYWH(nsDependentSubstring aString);
+  bool ParseMozResolution(nsDependentSubstring aString);
+
+  Maybe<double> mStart;
+  Maybe<double> mEnd;
+  Maybe<nsIntRect> mClip;
+  ClipUnit mClipUnit;
+};
+
+}  
+
+#endif

@@ -1,0 +1,925 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*******************************************************************************
+*
+*   Copyright (C) 1999-2014, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+*
+*******************************************************************************
+*   file name:  uniset_props.cpp
+*   encoding:   UTF-8
+*   tab size:   8 (not used)
+*   indentation:4
+*
+*   created on: 2004aug25
+*   created by: Markus W. Scherer
+*
+*   Character property dependent functions moved here from uniset.cpp
+*/
+
+#include "unicode/utypes.h"
+#include "unicode/uniset.h"
+#include "unicode/parsepos.h"
+#include "unicode/uchar.h"
+#include "unicode/uscript.h"
+#include "unicode/symtable.h"
+#include "unicode/uset.h"
+#include "unicode/locid.h"
+#include "unicode/brkiter.h"
+#include "uset_imp.h"
+#include "ruleiter.h"
+#include "cmemory.h"
+#include "ucln_cmn.h"
+#include "util.h"
+#include "uvector.h"
+#include "uprops.h"
+#include "propname.h"
+#include "normalizer2impl.h"
+#include "uinvchar.h"
+#include "uprops.h"
+#include "charstr.h"
+#include "cstring.h"
+#include "mutex.h"
+#include "umutex.h"
+#include "uassert.h"
+#include "hash.h"
+
+U_NAMESPACE_USE
+
+namespace {
+
+constexpr char ANY[]   = "ANY";   
+constexpr char ASCII[] = "ASCII"; 
+constexpr char ASSIGNED[] = "Assigned"; 
+
+constexpr char16_t NAME_PROP[] = u"na";
+
+}  
+
+
+U_CDECL_BEGIN
+static UBool U_CALLCONV uset_cleanup();
+
+static UnicodeSet *uni32Singleton;
+static icu::UInitOnce uni32InitOnce {};
+
+static UBool U_CALLCONV uset_cleanup() {
+    delete uni32Singleton;
+    uni32Singleton = nullptr;
+    uni32InitOnce.reset();
+    return true;
+}
+
+U_CDECL_END
+
+U_NAMESPACE_BEGIN
+
+namespace {
+
+void U_CALLCONV createUni32Set(UErrorCode &errorCode) {
+    U_ASSERT(uni32Singleton == nullptr);
+    uni32Singleton = new UnicodeSet(UnicodeString(u"[:age=3.2:]"), errorCode);
+    if(uni32Singleton==nullptr) {
+        errorCode=U_MEMORY_ALLOCATION_ERROR;
+    } else {
+        uni32Singleton->freeze();
+    }
+    ucln_common_registerCleanup(UCLN_COMMON_USET, uset_cleanup);
+}
+
+
+U_CFUNC UnicodeSet *
+uniset_getUnicode32Instance(UErrorCode &errorCode) {
+    umtx_initOnce(uni32InitOnce, &createUni32Set, errorCode);
+    return uni32Singleton;
+}
+
+
+
+inline UBool
+isPerlOpen(const UnicodeString &pattern, int32_t pos) {
+    char16_t c;
+    return pattern.charAt(pos)==u'\\' && ((c=pattern.charAt(pos+1))==u'p' || c==u'P');
+}
+
+
+inline UBool
+isNameOpen(const UnicodeString &pattern, int32_t pos) {
+    return pattern.charAt(pos)==u'\\' && pattern.charAt(pos+1)==u'N';
+}
+
+inline UBool
+isPOSIXOpen(const UnicodeString &pattern, int32_t pos) {
+    return pattern.charAt(pos)==u'[' && pattern.charAt(pos+1)==u':';
+}
+
+
+#define _dbgct(me)
+
+}  
+
+
+UnicodeSet::UnicodeSet(const UnicodeString& pattern,
+                       UErrorCode& status) {
+    applyPattern(pattern, status);
+    _dbgct(this);
+}
+
+
+UnicodeSet& UnicodeSet::applyPattern(const UnicodeString& pattern,
+                                     UErrorCode& status) {
+    ParsePosition pos(0);
+    applyPatternIgnoreSpace(pattern, pos, nullptr, status);
+    if (U_FAILURE(status)) return *this;
+
+    int32_t i = pos.getIndex();
+    ICU_Utility::skipWhitespace(pattern, i, true);
+    if (i != pattern.length()) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+    }
+    return *this;
+}
+
+void
+UnicodeSet::applyPatternIgnoreSpace(const UnicodeString& pattern,
+                                    ParsePosition& pos,
+                                    const SymbolTable* symbols,
+                                    UErrorCode& status) {
+    if (U_FAILURE(status)) {
+        return;
+    }
+    if (isFrozen()) {
+        status = U_NO_WRITE_PERMISSION;
+        return;
+    }
+    UnicodeString rebuiltPat;
+    RuleCharacterIterator chars(pattern, symbols, pos);
+    applyPattern(chars, symbols, rebuiltPat, USET_IGNORE_SPACE, nullptr, 0, status);
+    if (U_FAILURE(status)) return;
+    if (chars.inVariable()) {
+        status = U_MALFORMED_SET;
+        return;
+    }
+    setPattern(rebuiltPat);
+}
+
+UBool UnicodeSet::resemblesPattern(const UnicodeString& pattern, int32_t pos) {
+    return ((pos+1) < pattern.length() &&
+            pattern.charAt(pos) == static_cast<char16_t>(91)) ||
+        resemblesPropertyPattern(pattern, pos);
+}
+
+
+namespace {
+
+class UnicodeSetPointer {
+    UnicodeSet* p;
+public:
+    inline UnicodeSetPointer() : p(nullptr) {}
+    inline ~UnicodeSetPointer() { delete p; }
+    inline UnicodeSet* pointer() { return p; }
+    inline UBool allocate() {
+        if (p == nullptr) {
+            p = new UnicodeSet();
+        }
+        return p != nullptr;
+    }
+};
+
+constexpr int32_t MAX_DEPTH = 100;
+
+}  
+
+void UnicodeSet::applyPattern(RuleCharacterIterator& chars,
+                              const SymbolTable* symbols,
+                              UnicodeString& rebuiltPat,
+                              uint32_t options,
+                              UnicodeSet& (UnicodeSet::*caseClosure)(int32_t attribute),
+                              int32_t depth,
+                              UErrorCode& ec) {
+    if (U_FAILURE(ec)) return;
+    if (depth > MAX_DEPTH) {
+        ec = U_ILLEGAL_ARGUMENT_ERROR;
+        return;
+    }
+
+
+
+    int32_t opts = RuleCharacterIterator::PARSE_VARIABLES |
+                   RuleCharacterIterator::PARSE_ESCAPES;
+    if ((options & USET_IGNORE_SPACE) != 0) {
+        opts |= RuleCharacterIterator::SKIP_WHITESPACE;
+    }
+
+    UnicodeString patLocal, buf;
+    UBool usePat = false;
+    UnicodeSetPointer scratch;
+    RuleCharacterIterator::Pos backup;
+
+    int8_t lastItem = 0, mode = 0;
+    UChar32 lastChar = 0;
+    char16_t op = 0;
+
+    UBool invert = false;
+
+    clear();
+
+    while (mode != 2 && !chars.atEnd()) {
+        U_ASSERT((lastItem == 0 && op == 0) ||
+                 (lastItem == 1 && (op == 0 || op == u'-')) ||
+                 (lastItem == 2 && (op == 0 || op == u'-' || op == u'&')));
+
+        UChar32 c = 0;
+        UBool literal = false;
+        UnicodeSet* nested = nullptr; 
+
+
+        int8_t setMode = 0;
+        if (resemblesPropertyPattern(chars, opts)) {
+            setMode = 2;
+        }
+
+
+        else {
+            chars.getPos(backup);
+            c = chars.next(opts, literal, ec);
+            if (U_FAILURE(ec)) return;
+
+            if (c == u'[' && !literal) {
+                if (mode == 1) {
+                    chars.setPos(backup); 
+                    setMode = 1;
+                } else {
+                    mode = 1;
+                    patLocal.append(u'[');
+                    chars.getPos(backup); 
+                    c = chars.next(opts, literal, ec); 
+                    if (U_FAILURE(ec)) return;
+                    if (c == u'^' && !literal) {
+                        invert = true;
+                        patLocal.append(u'^');
+                        chars.getPos(backup); 
+                        c = chars.next(opts, literal, ec);
+                        if (U_FAILURE(ec)) return;
+                    }
+                    if (c == u'-') {
+                        literal = true;
+                    } else {
+                        chars.setPos(backup); 
+                        continue;
+                    }
+                }
+            } else if (symbols != nullptr) {
+                const UnicodeFunctor *m = symbols->lookupMatcher(c);
+                if (m != nullptr) {
+                    const UnicodeSet *ms = dynamic_cast<const UnicodeSet *>(m);
+                    if (ms == nullptr) {
+                        ec = U_MALFORMED_SET;
+                        return;
+                    }
+                    nested = const_cast<UnicodeSet*>(ms);
+                    setMode = 3;
+                }
+            }
+        }
+
+
+        if (setMode != 0) {
+            if (lastItem == 1) {
+                if (op != 0) {
+                    ec = U_MALFORMED_SET;
+                    return;
+                }
+                add(lastChar, lastChar);
+                _appendToPat(patLocal, lastChar, false);
+                lastItem = 0;
+                op = 0;
+            }
+
+            if (op == u'-' || op == u'&') {
+                patLocal.append(op);
+            }
+
+            if (nested == nullptr) {
+                if (!scratch.allocate()) {
+                    ec = U_MEMORY_ALLOCATION_ERROR;
+                    return;
+                }
+                nested = scratch.pointer();
+            }
+            switch (setMode) {
+            case 1:
+                nested->applyPattern(chars, symbols, patLocal, options, caseClosure, depth + 1, ec);
+                break;
+            case 2:
+                chars.skipIgnored(opts);
+                nested->applyPropertyPattern(chars, patLocal, ec);
+                if (U_FAILURE(ec)) return;
+                break;
+            case 3: 
+                nested->_toPattern(patLocal, false);
+                break;
+            }
+
+            usePat = true;
+
+            if (mode == 0) {
+                *this = *nested;
+                mode = 2;
+                break;
+            }
+
+            switch (op) {
+            case u'-':
+                removeAll(*nested);
+                break;
+            case u'&':
+                retainAll(*nested);
+                break;
+            case 0:
+                addAll(*nested);
+                break;
+            }
+
+            op = 0;
+            lastItem = 2;
+
+            continue;
+        }
+
+        if (mode == 0) {
+            ec = U_MALFORMED_SET;
+            return;
+        }
+
+        // then fall through and handle it below.
+
+        if (!literal) {
+            switch (c) {
+            case u']':
+                if (lastItem == 1) {
+                    add(lastChar, lastChar);
+                    _appendToPat(patLocal, lastChar, false);
+                }
+                if (op == u'-') {
+                    add(op, op);
+                    patLocal.append(op);
+                } else if (op == u'&') {
+                    ec = U_MALFORMED_SET;
+                    return;
+                }
+                patLocal.append(u']');
+                mode = 2;
+                continue;
+            case u'-':
+                if (op == 0) {
+                    if (lastItem != 0) {
+                        op = static_cast<char16_t>(c);
+                        continue;
+                    } else {
+                        add(c, c);
+                        c = chars.next(opts, literal, ec);
+                        if (U_FAILURE(ec)) return;
+                        if (c == u']' && !literal) {
+                            patLocal.append(u"-]", 2);
+                            mode = 2;
+                            continue;
+                        }
+                    }
+                }
+                ec = U_MALFORMED_SET;
+                return;
+            case u'&':
+                if (lastItem == 2 && op == 0) {
+                    op = static_cast<char16_t>(c);
+                    continue;
+                }
+                ec = U_MALFORMED_SET;
+                return;
+            case u'^':
+                ec = U_MALFORMED_SET;
+                return;
+            case u'{':
+                if (op != 0) {
+                    ec = U_MALFORMED_SET;
+                    return;
+                }
+                if (lastItem == 1) {
+                    add(lastChar, lastChar);
+                    _appendToPat(patLocal, lastChar, false);
+                }
+                lastItem = 0;
+                buf.truncate(0);
+                {
+                    UBool ok = false;
+                    while (!chars.atEnd()) {
+                        c = chars.next(opts, literal, ec);
+                        if (U_FAILURE(ec)) return;
+                        if (c == u'}' && !literal) {
+                            ok = true;
+                            break;
+                        }
+                        buf.append(c);
+                    }
+                    if (!ok) {
+                        ec = U_MALFORMED_SET;
+                        return;
+                    }
+                }
+                add(buf);
+                patLocal.append(u'{');
+                _appendToPat(patLocal, buf, false);
+                patLocal.append(u'}');
+                continue;
+            case SymbolTable::SYMBOL_REF:
+                {
+                    chars.getPos(backup);
+                    c = chars.next(opts, literal, ec);
+                    if (U_FAILURE(ec)) return;
+                    UBool anchor = (c == u']' && !literal);
+                    if (symbols == nullptr && !anchor) {
+                        c = SymbolTable::SYMBOL_REF;
+                        chars.setPos(backup);
+                        break; 
+                    }
+                    if (anchor && op == 0) {
+                        if (lastItem == 1) {
+                            add(lastChar, lastChar);
+                            _appendToPat(patLocal, lastChar, false);
+                        }
+                        add(U_ETHER);
+                        usePat = true;
+                        patLocal.append(static_cast<char16_t>(SymbolTable::SYMBOL_REF));
+                        patLocal.append(u']');
+                        mode = 2;
+                        continue;
+                    }
+                    ec = U_MALFORMED_SET;
+                    return;
+                }
+            default:
+                break;
+            }
+        }
+
+
+        switch (lastItem) {
+        case 0:
+            lastItem = 1;
+            lastChar = c;
+            break;
+        case 1:
+            if (op == u'-') {
+                if (lastChar >= c) {
+                    ec = U_MALFORMED_SET;
+                    return;
+                }
+                add(lastChar, c);
+                _appendToPat(patLocal, lastChar, false);
+                patLocal.append(op);
+                _appendToPat(patLocal, c, false);
+                lastItem = 0;
+                op = 0;
+            } else {
+                add(lastChar, lastChar);
+                _appendToPat(patLocal, lastChar, false);
+                lastChar = c;
+            }
+            break;
+        case 2:
+            if (op != 0) {
+                ec = U_MALFORMED_SET;
+                return;
+            }
+            lastChar = c;
+            lastItem = 1;
+            break;
+        }
+    }
+
+    if (mode != 2) {
+        ec = U_MALFORMED_SET;
+        return;
+    }
+
+    chars.skipIgnored(opts);
+
+    if ((options & USET_CASE_MASK) != 0) {
+        (this->*caseClosure)(options);
+    }
+    if (invert) {
+        complement().removeAllStrings();  
+    }
+
+    if (usePat) {
+        rebuiltPat.append(patLocal);
+    } else {
+        _generatePattern(rebuiltPat, false);
+    }
+    if (isBogus() && U_SUCCESS(ec)) {
+        ec = U_MEMORY_ALLOCATION_ERROR;
+    }
+}
+
+
+namespace {
+
+UBool numericValueFilter(UChar32 ch, void* context) {
+    return u_getNumericValue(ch) == *static_cast<double*>(context);
+}
+
+UBool generalCategoryMaskFilter(UChar32 ch, void* context) {
+    int32_t value = *static_cast<int32_t*>(context);
+    return (U_GET_GC_MASK((UChar32) ch) & value) != 0;
+}
+
+UBool versionFilter(UChar32 ch, void* context) {
+    static const UVersionInfo none = { 0, 0, 0, 0 };
+    UVersionInfo v;
+    u_charAge(ch, v);
+    UVersionInfo* version = static_cast<UVersionInfo*>(context);
+    return uprv_memcmp(&v, &none, sizeof(v)) > 0 && uprv_memcmp(&v, version, sizeof(v)) <= 0;
+}
+
+typedef struct {
+    UProperty prop;
+    int32_t value;
+} IntPropertyContext;
+
+UBool intPropertyFilter(UChar32 ch, void* context) {
+    IntPropertyContext* c = static_cast<IntPropertyContext*>(context);
+    return u_getIntPropertyValue(ch, c->prop) == c->value;
+}
+
+UBool scriptExtensionsFilter(UChar32 ch, void* context) {
+    return uscript_hasScript(ch, *static_cast<UScriptCode*>(context));
+}
+
+UBool idTypeFilter(UChar32 ch, void* context) {
+    return u_hasIDType(ch, *static_cast<UIdentifierType*>(context));
+}
+
+}  
+
+void UnicodeSet::applyFilter(UnicodeSet::Filter filter,
+                             void* context,
+                             const UnicodeSet* inclusions,
+                             UErrorCode &status) {
+    if (U_FAILURE(status)) return;
+
+
+    clear();
+
+    UChar32 startHasProperty = -1;
+    int32_t limitRange = inclusions->getRangeCount();
+
+    for (int j=0; j<limitRange; ++j) {
+        UChar32 start = inclusions->getRangeStart(j);
+        UChar32 end = inclusions->getRangeEnd(j);
+
+        for (UChar32 ch = start; ch <= end; ++ch) {
+            if ((*filter)(ch, context)) {
+                if (startHasProperty < 0) {
+                    startHasProperty = ch;
+                }
+            } else if (startHasProperty >= 0) {
+                add(startHasProperty, ch-1);
+                startHasProperty = -1;
+            }
+        }
+    }
+    if (startHasProperty >= 0) {
+        add(startHasProperty, static_cast<UChar32>(0x10FFFF));
+    }
+    if (isBogus() && U_SUCCESS(status)) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+    }
+}
+
+namespace {
+
+UBool mungeCharName(char* dst, const char* src, int32_t dstCapacity) {
+    int32_t j = 0;
+    char ch;
+    --dstCapacity; 
+    while ((ch = *src++) != 0) {
+        if (ch == ' ' && (j==0 || (j>0 && dst[j-1]==' '))) {
+            continue;
+        }
+        if (j >= dstCapacity) return false;
+        dst[j++] = ch;
+    }
+    if (j > 0 && dst[j-1] == ' ') --j;
+    dst[j] = 0;
+    return true;
+}
+
+}  
+
+
+#define FAIL(ec) UPRV_BLOCK_MACRO_BEGIN { \
+    ec=U_ILLEGAL_ARGUMENT_ERROR; \
+    return *this; \
+} UPRV_BLOCK_MACRO_END
+
+UnicodeSet&
+UnicodeSet::applyIntPropertyValue(UProperty prop, int32_t value, UErrorCode& ec) {
+    if (U_FAILURE(ec) || isFrozen()) { return *this; }
+    if (prop == UCHAR_GENERAL_CATEGORY_MASK) {
+        const UnicodeSet* inclusions = CharacterProperties::getInclusionsForProperty(prop, ec);
+        applyFilter(generalCategoryMaskFilter, &value, inclusions, ec);
+    } else if (prop == UCHAR_SCRIPT_EXTENSIONS) {
+        const UnicodeSet* inclusions = CharacterProperties::getInclusionsForProperty(prop, ec);
+        UScriptCode script = static_cast<UScriptCode>(value);
+        applyFilter(scriptExtensionsFilter, &script, inclusions, ec);
+    } else if (prop == UCHAR_IDENTIFIER_TYPE) {
+        const UnicodeSet* inclusions = CharacterProperties::getInclusionsForProperty(prop, ec);
+        UIdentifierType idType = static_cast<UIdentifierType>(value);
+        applyFilter(idTypeFilter, &idType, inclusions, ec);
+    } else if (0 <= prop && prop < UCHAR_BINARY_LIMIT) {
+        if (value == 0 || value == 1) {
+            const USet *set = u_getBinaryPropertySet(prop, &ec);
+            if (U_FAILURE(ec)) { return *this; }
+            copyFrom(*UnicodeSet::fromUSet(set), true);
+            if (value == 0) {
+                complement().removeAllStrings();  
+            }
+        } else {
+            clear();
+        }
+    } else if (UCHAR_INT_START <= prop && prop < UCHAR_INT_LIMIT) {
+        const UnicodeSet* inclusions = CharacterProperties::getInclusionsForProperty(prop, ec);
+        IntPropertyContext c = {prop, value};
+        applyFilter(intPropertyFilter, &c, inclusions, ec);
+    } else {
+        ec = U_ILLEGAL_ARGUMENT_ERROR;
+    }
+    return *this;
+}
+
+UnicodeSet&
+UnicodeSet::applyPropertyAlias(const UnicodeString& prop,
+                               const UnicodeString& value,
+                               UErrorCode& ec) {
+    if (U_FAILURE(ec) || isFrozen()) return *this;
+
+    if( !uprv_isInvariantUString(prop.getBuffer(), prop.length()) ||
+        !uprv_isInvariantUString(value.getBuffer(), value.length())
+    ) {
+        FAIL(ec);
+    }
+    CharString pname, vname;
+    pname.appendInvariantChars(prop, ec);
+    vname.appendInvariantChars(value, ec);
+    if (U_FAILURE(ec)) return *this;
+
+    UProperty p;
+    int32_t v;
+    UBool invert = false;
+
+    if (value.length() > 0) {
+        p = u_getPropertyEnum(pname.data());
+        if (p == UCHAR_INVALID_CODE) FAIL(ec);
+
+        if (p == UCHAR_GENERAL_CATEGORY) {
+            p = UCHAR_GENERAL_CATEGORY_MASK;
+        }
+
+        if ((p >= UCHAR_BINARY_START && p < UCHAR_BINARY_LIMIT) ||
+            (p >= UCHAR_INT_START && p < UCHAR_INT_LIMIT) ||
+            (p >= UCHAR_MASK_START && p < UCHAR_MASK_LIMIT)) {
+            v = u_getPropertyValueEnum(p, vname.data());
+            if (v == UCHAR_INVALID_CODE) {
+                if (p == UCHAR_CANONICAL_COMBINING_CLASS ||
+                    p == UCHAR_TRAIL_CANONICAL_COMBINING_CLASS ||
+                    p == UCHAR_LEAD_CANONICAL_COMBINING_CLASS) {
+                    char* end;
+                    double val = uprv_strtod(vname.data(), &end);
+                    if (*end != 0 || !(0 <= val && val <= 255) ||
+                            (v = static_cast<int32_t>(val)) != val) {
+                        FAIL(ec);
+                    }
+                } else {
+                    FAIL(ec);
+                }
+            }
+        }
+
+        else {
+
+            switch (p) {
+            case UCHAR_NUMERIC_VALUE:
+                {
+                    char* end;
+                    double val = uprv_strtod(vname.data(), &end);
+                    if (*end != 0) {
+                        FAIL(ec);
+                    }
+                    applyFilter(numericValueFilter, &val,
+                                CharacterProperties::getInclusionsForProperty(p, ec), ec);
+                    return *this;
+                }
+            case UCHAR_NAME:
+                {
+                    char buf[128]; 
+                    if (!mungeCharName(buf, vname.data(), sizeof(buf))) FAIL(ec);
+                    UChar32 ch = u_charFromName(U_EXTENDED_CHAR_NAME, buf, &ec);
+                    if (U_SUCCESS(ec)) {
+                        clear();
+                        add(ch);
+                        return *this;
+                    } else {
+                        FAIL(ec);
+                    }
+                }
+            case UCHAR_UNICODE_1_NAME:
+                FAIL(ec);
+            case UCHAR_AGE:
+                {
+                    char buf[128];
+                    if (!mungeCharName(buf, vname.data(), sizeof(buf))) FAIL(ec);
+                    UVersionInfo version;
+                    u_versionFromString(version, buf);
+                    applyFilter(versionFilter, &version,
+                                CharacterProperties::getInclusionsForProperty(p, ec), ec);
+                    return *this;
+                }
+            case UCHAR_SCRIPT_EXTENSIONS:
+                v = u_getPropertyValueEnum(UCHAR_SCRIPT, vname.data());
+                if (v == UCHAR_INVALID_CODE) {
+                    FAIL(ec);
+                }
+                // fall through to calling applyIntPropertyValue()
+                break;
+            case UCHAR_IDENTIFIER_TYPE:
+                v = u_getPropertyValueEnum(p, vname.data());
+                if (v == UCHAR_INVALID_CODE) {
+                    FAIL(ec);
+                }
+                // fall through to calling applyIntPropertyValue()
+                break;
+            default:
+                FAIL(ec);
+            }
+        }
+    }
+
+    else {
+        p = UCHAR_GENERAL_CATEGORY_MASK;
+        v = u_getPropertyValueEnum(p, pname.data());
+        if (v == UCHAR_INVALID_CODE) {
+            p = UCHAR_SCRIPT;
+            v = u_getPropertyValueEnum(p, pname.data());
+            if (v == UCHAR_INVALID_CODE) {
+                p = u_getPropertyEnum(pname.data());
+                if (p >= UCHAR_BINARY_START && p < UCHAR_BINARY_LIMIT) {
+                    v = 1;
+                } else if (0 == uprv_comparePropertyNames(ANY, pname.data())) {
+                    set(MIN_VALUE, MAX_VALUE);
+                    return *this;
+                } else if (0 == uprv_comparePropertyNames(ASCII, pname.data())) {
+                    set(0, 0x7F);
+                    return *this;
+                } else if (0 == uprv_comparePropertyNames(ASSIGNED, pname.data())) {
+                    p = UCHAR_GENERAL_CATEGORY_MASK;
+                    v = U_GC_CN_MASK;
+                    invert = true;
+                } else {
+                    FAIL(ec);
+                }
+            }
+        }
+    }
+
+    applyIntPropertyValue(p, v, ec);
+    if(invert) {
+        complement().removeAllStrings();  
+    }
+
+    if (isBogus() && U_SUCCESS(ec)) {
+        ec = U_MEMORY_ALLOCATION_ERROR;
+    }
+    return *this;
+}
+
+
+UBool UnicodeSet::resemblesPropertyPattern(const UnicodeString& pattern,
+                                           int32_t pos) {
+    if ((pos+5) > pattern.length()) {
+        return false;
+    }
+
+    return isPOSIXOpen(pattern, pos) || isPerlOpen(pattern, pos) || isNameOpen(pattern, pos);
+}
+
+UBool UnicodeSet::resemblesPropertyPattern(RuleCharacterIterator& chars,
+                                           int32_t iterOpts) {
+    UBool result = false, literal;
+    UErrorCode ec = U_ZERO_ERROR;
+    iterOpts &= ~RuleCharacterIterator::PARSE_ESCAPES;
+    RuleCharacterIterator::Pos pos;
+    chars.getPos(pos);
+    UChar32 c = chars.next(iterOpts, literal, ec);
+    if (c == u'[' || c == u'\\') {
+        UChar32 d = chars.next(iterOpts & ~RuleCharacterIterator::SKIP_WHITESPACE,
+                               literal, ec);
+        result = (c == u'[') ? (d == u':') :
+                               (d == u'N' || d == u'p' || d == u'P');
+    }
+    chars.setPos(pos);
+    return result && U_SUCCESS(ec);
+}
+
+UnicodeSet& UnicodeSet::applyPropertyPattern(const UnicodeString& pattern,
+                                             ParsePosition& ppos,
+                                             UErrorCode &ec) {
+    int32_t pos = ppos.getIndex();
+
+    UBool posix = false; 
+    UBool isName = false; 
+    UBool invert = false;
+
+    if (U_FAILURE(ec)) return *this;
+
+    if ((pos+5) > pattern.length()) {
+        FAIL(ec);
+    }
+
+    if (isPOSIXOpen(pattern, pos)) {
+        posix = true;
+        pos += 2;
+        pos = ICU_Utility::skipWhitespace(pattern, pos);
+        if (pos < pattern.length() && pattern.charAt(pos) == u'^') {
+            ++pos;
+            invert = true;
+        }
+    } else if (isPerlOpen(pattern, pos) || isNameOpen(pattern, pos)) {
+        char16_t c = pattern.charAt(pos+1);
+        invert = (c == u'P');
+        isName = (c == u'N');
+        pos += 2;
+        pos = ICU_Utility::skipWhitespace(pattern, pos);
+        if (pos == pattern.length() || pattern.charAt(pos++) != u'{') {
+            FAIL(ec);
+        }
+    } else {
+        FAIL(ec);
+    }
+
+    int32_t close;
+    if (posix) {
+      close = pattern.indexOf(u":]", 2, pos);
+    } else {
+      close = pattern.indexOf(u'}', pos);
+    }
+    if (close < 0) {
+        FAIL(ec);
+    }
+
+    int32_t equals = pattern.indexOf(u'=', pos);
+    UnicodeString propName, valueName;
+    if (equals >= 0 && equals < close && !isName) {
+        pattern.extractBetween(pos, equals, propName);
+        pattern.extractBetween(equals+1, close, valueName);
+    }
+
+    else {
+        pattern.extractBetween(pos, close, propName);
+            
+        if (isName) {
+            valueName = propName;
+            propName = NAME_PROP;
+        }
+    }
+
+    applyPropertyAlias(propName, valueName, ec);
+
+    if (U_SUCCESS(ec)) {
+        if (invert) {
+            complement().removeAllStrings();  
+        }
+
+        ppos.setIndex(close + (posix ? 2 : 1));
+    }
+
+    return *this;
+}
+
+void UnicodeSet::applyPropertyPattern(RuleCharacterIterator& chars,
+                                      UnicodeString& rebuiltPat,
+                                      UErrorCode& ec) {
+    if (U_FAILURE(ec)) return;
+    UnicodeString pattern;
+    chars.lookahead(pattern);
+    ParsePosition pos(0);
+    applyPropertyPattern(pattern, pos, ec);
+    if (U_FAILURE(ec)) return;
+    if (pos.getIndex() == 0) {
+        ec = U_MALFORMED_SET;
+        return;
+    }
+    chars.jumpahead(pos.getIndex());
+    rebuiltPat.append(pattern, 0, pos.getIndex());
+}
+
+U_NAMESPACE_END

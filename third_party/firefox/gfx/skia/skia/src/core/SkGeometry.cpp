@@ -1,0 +1,1474 @@
+/*
+ * Copyright 2006 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "src/core/SkGeometry.h"
+
+#include "include/core/SkMatrix.h"
+#include "include/core/SkPoint3.h"
+#include "include/core/SkRect.h"
+#include "include/core/SkScalar.h"
+#include "include/private/base/SkDebug.h"
+#include "include/private/base/SkFloatingPoint.h"
+#include "include/private/base/SkTPin.h"
+#include "include/private/base/SkTo.h"
+#include "src/base/SkBezierCurves.h"
+#include "src/base/SkCubics.h"
+#include "src/base/SkUtils.h"
+#include "src/base/SkVx.h"
+#include "src/core/SkPointPriv.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+
+namespace {
+
+using float2 = skvx::float2;
+using float4 = skvx::float4;
+
+SkVector to_vector(const float2& x) {
+    SkVector vector;
+    x.store(&vector);
+    return vector;
+}
+
+
+int is_not_monotonic(SkScalar a, SkScalar b, SkScalar c) {
+    SkScalar ab = a - b;
+    SkScalar bc = b - c;
+    if (ab < 0) {
+        bc = -bc;
+    }
+    return ab == 0 || bc < 0;
+}
+
+
+int valid_unit_divide(SkScalar numer, SkScalar denom, SkScalar* ratio) {
+    SkASSERT(ratio);
+
+    if (numer < 0) {
+        numer = -numer;
+        denom = -denom;
+    }
+
+    if (denom == 0 || numer == 0 || numer >= denom) {
+        return 0;
+    }
+
+    SkScalar r = numer / denom;
+    if (SkIsNaN(r)) {
+        return 0;
+    }
+    SkASSERTF(r >= 0 && r < SK_Scalar1, "numer %f, denom %f, r %f", numer, denom, r);
+    if (r == 0) { 
+        return 0;
+    }
+    *ratio = r;
+    return 1;
+}
+
+int return_check_zero(int value) {
+    if (value == 0) {
+        return 0;
+    }
+    return value;
+}
+
+} 
+
+int SkFindUnitQuadRoots(SkScalar A, SkScalar B, SkScalar C, SkScalar roots[2]) {
+    SkASSERT(roots);
+
+    if (A == 0) {
+        return return_check_zero(valid_unit_divide(-C, B, roots));
+    }
+
+    SkScalar* r = roots;
+
+    double dr = (double)B * B - 4 * (double)A * C;
+    if (dr < 0) {
+        return return_check_zero(0);
+    }
+    dr = sqrt(dr);
+    SkScalar R = SkDoubleToScalar(dr);
+    if (!SkIsFinite(R)) {
+        return return_check_zero(0);
+    }
+
+    SkScalar Q = (B < 0) ? -(B-R)/2 : -(B+R)/2;
+    r += valid_unit_divide(Q, A, r);
+    r += valid_unit_divide(C, Q, r);
+    if (r - roots == 2) {
+        if (roots[0] > roots[1]) {
+            using std::swap;
+            swap(roots[0], roots[1]);
+        } else if (roots[0] == roots[1]) { 
+            r -= 1; 
+        }
+    }
+    return return_check_zero((int)(r - roots));
+}
+
+
+void SkEvalQuadAt(const SkPoint src[3], SkScalar t, SkPoint* pt, SkVector* tangent) {
+    SkASSERT(src);
+    SkASSERT(t >= 0 && t <= SK_Scalar1);
+
+    if (pt) {
+        *pt = SkEvalQuadAt(src, t);
+    }
+    if (tangent) {
+        *tangent = SkEvalQuadTangentAt(src, t);
+    }
+}
+
+SkPoint SkEvalQuadAt(const SkPoint src[3], SkScalar t) {
+    return to_point(SkQuadCoeff(src).eval(t));
+}
+
+SkVector SkEvalQuadTangentAt(const SkPoint src[3], SkScalar t) {
+    if ((t == 0 && src[0] == src[1]) || (t == 1 && src[1] == src[2])) {
+        return src[2] - src[0];
+    }
+    SkASSERT(src);
+    SkASSERT(t >= 0 && t <= SK_Scalar1);
+
+    float2 P0 = from_point(src[0]);
+    float2 P1 = from_point(src[1]);
+    float2 P2 = from_point(src[2]);
+
+    float2 B = P1 - P0;
+    float2 A = P2 - P1 - B;
+    float2 T = A * t + B;
+
+    return to_vector(T + T);
+}
+
+static inline float2 interp(const float2& v0,
+                            const float2& v1,
+                            const float2& t) {
+    return v0 + (v1 - v0) * t;
+}
+
+void SkChopQuadAt(const SkPoint src[3], SkPoint dst[5], SkScalar t) {
+    SkASSERT(t > 0 && t < SK_Scalar1);
+
+    float2 p0 = from_point(src[0]);
+    float2 p1 = from_point(src[1]);
+    float2 p2 = from_point(src[2]);
+    float2 tt(t);
+
+    float2 p01 = interp(p0, p1, tt);
+    float2 p12 = interp(p1, p2, tt);
+
+    dst[0] = to_point(p0);
+    dst[1] = to_point(p01);
+    dst[2] = to_point(interp(p01, p12, tt));
+    dst[3] = to_point(p12);
+    dst[4] = to_point(p2);
+}
+
+void SkChopQuadAtHalf(const SkPoint src[3], SkPoint dst[5]) {
+    SkChopQuadAt(src, dst, 0.5f);
+}
+
+float SkMeasureAngleBetweenVectors(SkVector a, SkVector b) {
+    float cosTheta = sk_ieee_float_divide(a.dot(b), sqrtf(a.dot(a) * b.dot(b)));
+    cosTheta = std::max(std::min(1.f, cosTheta), -1.f);
+    return acosf(cosTheta);
+}
+
+SkVector SkFindBisector(SkVector a, SkVector b) {
+    std::array<SkVector, 2> v;
+    if (a.dot(b) >= 0) {
+        v = {a, b};
+    } else if (a.cross(b) >= 0) {
+        v[0].set(-a.fY, +a.fX);
+        v[1].set(+b.fY, -b.fX);
+    } else {
+        v[0].set(+a.fY, -a.fX);
+        v[1].set(-b.fY, +b.fX);
+    }
+    skvx::float2 x0_x1{v[0].fX, v[1].fX};
+    skvx::float2 y0_y1{v[0].fY, v[1].fY};
+    auto invLengths = 1.0f / sqrt(x0_x1 * x0_x1 + y0_y1 * y0_y1);
+    x0_x1 *= invLengths;
+    y0_y1 *= invLengths;
+    return SkPoint{x0_x1[0] + x0_x1[1], y0_y1[0] + y0_y1[1]};
+}
+
+float SkFindQuadMidTangent(const SkPoint src[3]) {
+    SkVector tan0 = src[1] - src[0];
+    SkVector tan1 = src[2] - src[1];
+    SkVector bisector = SkFindBisector(tan0, -tan1);
+
+    float T = sk_ieee_float_divide(tan0.dot(bisector), (tan0 - tan1).dot(bisector));
+    if (!(T > 0 && T < 1)) {  
+        T = .5;  
+    }
+
+    return T;
+}
+
+int SkFindQuadExtrema(SkScalar a, SkScalar b, SkScalar c, SkScalar tValue[1]) {
+    return valid_unit_divide(a - b, a - b - b + c, tValue);
+}
+
+static inline void flatten_double_quad_extrema(SkScalar coords[14]) {
+    coords[2] = coords[6] = coords[4];
+}
+
+int SkChopQuadAtYExtrema(const SkPoint src[3], SkPoint dst[5]) {
+    SkASSERT(src);
+    SkASSERT(dst);
+
+    SkScalar a = src[0].fY;
+    SkScalar b = src[1].fY;
+    SkScalar c = src[2].fY;
+
+    if (is_not_monotonic(a, b, c)) {
+        SkScalar    tValue;
+        if (valid_unit_divide(a - b, a - b - b + c, &tValue)) {
+            SkChopQuadAt(src, dst, tValue);
+            flatten_double_quad_extrema(&dst[0].fY);
+            return 1;
+        }
+        b = SkScalarAbs(a - b) < SkScalarAbs(b - c) ? a : c;
+    }
+    dst[0].set(src[0].fX, a);
+    dst[1].set(src[1].fX, b);
+    dst[2].set(src[2].fX, c);
+    return 0;
+}
+
+int SkChopQuadAtXExtrema(const SkPoint src[3], SkPoint dst[5]) {
+    SkASSERT(src);
+    SkASSERT(dst);
+
+    SkScalar a = src[0].fX;
+    SkScalar b = src[1].fX;
+    SkScalar c = src[2].fX;
+
+    if (is_not_monotonic(a, b, c)) {
+        SkScalar tValue;
+        if (valid_unit_divide(a - b, a - b - b + c, &tValue)) {
+            SkChopQuadAt(src, dst, tValue);
+            flatten_double_quad_extrema(&dst[0].fX);
+            return 1;
+        }
+        b = SkScalarAbs(a - b) < SkScalarAbs(b - c) ? a : c;
+    }
+    dst[0].set(a, src[0].fY);
+    dst[1].set(b, src[1].fY);
+    dst[2].set(c, src[2].fY);
+    return 0;
+}
+
+SkScalar SkFindQuadMaxCurvature(const SkPoint src[3]) {
+    SkScalar    Ax = src[1].fX - src[0].fX;
+    SkScalar    Ay = src[1].fY - src[0].fY;
+    SkScalar    Bx = src[0].fX - src[1].fX - src[1].fX + src[2].fX;
+    SkScalar    By = src[0].fY - src[1].fY - src[1].fY + src[2].fY;
+
+    SkScalar numer = -(Ax * Bx + Ay * By);
+    SkScalar denom = Bx * Bx + By * By;
+    if (denom < 0) {
+        numer = -numer;
+        denom = -denom;
+    }
+    if (numer <= 0) {
+        return 0;
+    }
+    if (numer >= denom) {  
+        return 1;
+    }
+    SkScalar t = numer / denom;
+    SkASSERT((0 <= t && t < 1) || SkIsNaN(t));
+    return t;
+}
+
+int SkChopQuadAtMaxCurvature(const SkPoint src[3], SkPoint dst[5]) {
+    SkScalar t = SkFindQuadMaxCurvature(src);
+    if (t > 0 && t < 1) {
+        SkChopQuadAt(src, dst, t);
+        return 2;
+    } else {
+        memcpy(dst, src, 3 * sizeof(SkPoint));
+        return 1;
+    }
+}
+
+void SkConvertQuadToCubic(const SkPoint src[3], SkPoint dst[4]) {
+    float2 scale(SkDoubleToScalar(2.0 / 3.0));
+    float2 s0 = from_point(src[0]);
+    float2 s1 = from_point(src[1]);
+    float2 s2 = from_point(src[2]);
+
+    dst[0] = to_point(s0);
+    dst[1] = to_point(s0 + (s1 - s0) * scale);
+    dst[2] = to_point(s2 + (s1 - s2) * scale);
+    dst[3] = to_point(s2);
+}
+
+
+static SkVector eval_cubic_derivative(const SkPoint src[4], SkScalar t) {
+    SkQuadCoeff coeff;
+    float2 P0 = from_point(src[0]);
+    float2 P1 = from_point(src[1]);
+    float2 P2 = from_point(src[2]);
+    float2 P3 = from_point(src[3]);
+
+    coeff.fA = P3 + 3 * (P1 - P2) - P0;
+    coeff.fB = times_2(P2 - times_2(P1) + P0);
+    coeff.fC = P1 - P0;
+    return to_vector(coeff.eval(t));
+}
+
+static SkVector eval_cubic_2ndDerivative(const SkPoint src[4], SkScalar t) {
+    float2 P0 = from_point(src[0]);
+    float2 P1 = from_point(src[1]);
+    float2 P2 = from_point(src[2]);
+    float2 P3 = from_point(src[3]);
+    float2 A = P3 + 3 * (P1 - P2) - P0;
+    float2 B = P2 - times_2(P1) + P0;
+
+    return to_vector(A * t + B);
+}
+
+void SkEvalCubicAt(const SkPoint src[4], SkScalar t, SkPoint* loc,
+                   SkVector* tangent, SkVector* curvature) {
+    SkASSERT(src);
+    SkASSERT(t >= 0 && t <= SK_Scalar1);
+
+    if (loc) {
+        *loc = to_point(SkCubicCoeff(src).eval(t));
+    }
+    if (tangent) {
+        if ((t == 0 && src[0] == src[1]) || (t == 1 && src[2] == src[3])) {
+            if (t == 0) {
+                *tangent = src[2] - src[0];
+            } else {
+                *tangent = src[3] - src[1];
+            }
+            if (!tangent->fX && !tangent->fY) {
+                *tangent = src[3] - src[0];
+            }
+        } else {
+            *tangent = eval_cubic_derivative(src, t);
+        }
+    }
+    if (curvature) {
+        *curvature = eval_cubic_2ndDerivative(src, t);
+    }
+}
+
+int SkFindCubicExtrema(SkScalar a, SkScalar b, SkScalar c, SkScalar d,
+                       SkScalar tValues[2]) {
+    SkScalar A = d - a + 3*(b - c);
+    SkScalar B = 2*(a - b - b + c);
+    SkScalar C = b - a;
+
+    return SkFindUnitQuadRoots(A, B, C, tValues);
+}
+
+template<int N, typename T>
+inline static skvx::Vec<N,T> unchecked_mix(const skvx::Vec<N,T>& a, const skvx::Vec<N,T>& b,
+                                           const skvx::Vec<N,T>& t) {
+    return (b - a)*t + a;
+}
+
+void SkChopCubicAt(const SkPoint src[4], SkPoint dst[7], SkScalar t) {
+    SkASSERT(0 <= t && t <= 1);
+
+    if (t == 1) {
+        memcpy(dst, src, sizeof(SkPoint) * 4);
+        dst[4] = dst[5] = dst[6] = src[3];
+        return;
+    }
+
+    float2 p0 = sk_bit_cast<float2>(src[0]);
+    float2 p1 = sk_bit_cast<float2>(src[1]);
+    float2 p2 = sk_bit_cast<float2>(src[2]);
+    float2 p3 = sk_bit_cast<float2>(src[3]);
+    float2 T = t;
+
+    float2 ab = unchecked_mix(p0, p1, T);
+    float2 bc = unchecked_mix(p1, p2, T);
+    float2 cd = unchecked_mix(p2, p3, T);
+    float2 abc = unchecked_mix(ab, bc, T);
+    float2 bcd = unchecked_mix(bc, cd, T);
+    float2 abcd = unchecked_mix(abc, bcd, T);
+
+    dst[0] = sk_bit_cast<SkPoint>(p0);
+    dst[1] = sk_bit_cast<SkPoint>(ab);
+    dst[2] = sk_bit_cast<SkPoint>(abc);
+    dst[3] = sk_bit_cast<SkPoint>(abcd);
+    dst[4] = sk_bit_cast<SkPoint>(bcd);
+    dst[5] = sk_bit_cast<SkPoint>(cd);
+    dst[6] = sk_bit_cast<SkPoint>(p3);
+}
+
+void SkChopCubicAt(const SkPoint src[4], SkPoint dst[10], float t0, float t1) {
+    SkASSERT(0 <= t0 && t0 <= t1 && t1 <= 1);
+
+    if (t1 == 1) {
+        SkChopCubicAt(src, dst, t0);
+        dst[7] = dst[8] = dst[9] = src[3];
+        return;
+    }
+
+    float4 p00, p11, p22, p33, T;
+    p00.lo = p00.hi = sk_bit_cast<float2>(src[0]);
+    p11.lo = p11.hi = sk_bit_cast<float2>(src[1]);
+    p22.lo = p22.hi = sk_bit_cast<float2>(src[2]);
+    p33.lo = p33.hi = sk_bit_cast<float2>(src[3]);
+    T.lo = t0;
+    T.hi = t1;
+
+    float4 ab = unchecked_mix(p00, p11, T);
+    float4 bc = unchecked_mix(p11, p22, T);
+    float4 cd = unchecked_mix(p22, p33, T);
+    float4 abc = unchecked_mix(ab, bc, T);
+    float4 bcd = unchecked_mix(bc, cd, T);
+    float4 abcd = unchecked_mix(abc, bcd, T);
+    float4 middle = unchecked_mix(abc, bcd, skvx::shuffle<2,3,0,1>(T));
+
+    dst[0] = sk_bit_cast<SkPoint>(p00.lo);
+    dst[1] = sk_bit_cast<SkPoint>(ab.lo);
+    dst[2] = sk_bit_cast<SkPoint>(abc.lo);
+    dst[3] = sk_bit_cast<SkPoint>(abcd.lo);
+    middle.store(dst + 4);
+    dst[6] = sk_bit_cast<SkPoint>(abcd.hi);
+    dst[7] = sk_bit_cast<SkPoint>(bcd.hi);
+    dst[8] = sk_bit_cast<SkPoint>(cd.hi);
+    dst[9] = sk_bit_cast<SkPoint>(p33.hi);
+}
+
+void SkChopCubicAt(const SkPoint src[4], SkPoint dst[],
+                   const SkScalar tValues[], int tCount) {
+    SkASSERT(std::all_of(tValues, tValues + tCount, [](SkScalar t) { return t >= 0 && t <= 1; }));
+    SkASSERT(std::is_sorted(tValues, tValues + tCount));
+
+    if (dst) {
+        if (tCount == 0) { 
+            memcpy(dst, src, 4*sizeof(SkPoint));
+        } else {
+            int i = 0;
+            for (; i < tCount - 1; i += 2) {
+                float2 tt = float2::Load(tValues + i);
+                if (i != 0) {
+                    float lastT = tValues[i - 1];
+                    tt = skvx::pin((tt - lastT) / (1 - lastT), float2(0), float2(1));
+                }
+                SkChopCubicAt(src, dst, tt[0], tt[1]);
+                src = dst = dst + 6;
+            }
+            if (i < tCount) {
+                SkASSERT(i + 1 == tCount);
+                float t = tValues[i];
+                if (i != 0) {
+                    float lastT = tValues[i - 1];
+                    t = SkTPin(sk_ieee_float_divide(t - lastT, 1 - lastT), 0.f, 1.f);
+                }
+                SkChopCubicAt(src, dst, t);
+            }
+        }
+    }
+}
+
+void SkChopCubicAtHalf(const SkPoint src[4], SkPoint dst[7]) {
+    SkChopCubicAt(src, dst, 0.5f);
+}
+
+float SkMeasureNonInflectCubicRotation(const SkPoint pts[4]) {
+    SkVector a = pts[1] - pts[0];
+    SkVector b = pts[2] - pts[1];
+    SkVector c = pts[3] - pts[2];
+    if (a.isZero()) {
+        return SkMeasureAngleBetweenVectors(b, c);
+    }
+    if (b.isZero()) {
+        return SkMeasureAngleBetweenVectors(a, c);
+    }
+    if (c.isZero()) {
+        return SkMeasureAngleBetweenVectors(a, b);
+    }
+    return 2*SK_ScalarPI - SkMeasureAngleBetweenVectors(a,-b) - SkMeasureAngleBetweenVectors(b,-c);
+}
+
+static skvx::float4 fma(const skvx::float4& f, float m, const skvx::float4& a) {
+    return skvx::fma(f, skvx::float4(m), a);
+}
+
+static float solve_quadratic_equation_for_midtangent(float a, float b, float c, float discr) {
+    float q = -.5f * (b + copysignf(sqrtf(discr), b));
+    float _5qa = -.5f*q*a;
+    float T = fabsf(q*q + _5qa) < fabsf(a*c + _5qa) ? sk_ieee_float_divide(q,a)
+                                                    : sk_ieee_float_divide(c,q);
+    if (!(T > 0 && T < 1)) {  
+        T = .5;
+    }
+    return T;
+}
+
+static float solve_quadratic_equation_for_midtangent(float a, float b, float c) {
+    return solve_quadratic_equation_for_midtangent(a, b, c, b*b - 4*a*c);
+}
+
+float SkFindCubicMidTangent(const SkPoint src[4]) {
+    SkVector tan0 = (src[0] == src[1]) ? src[2] - src[0] : src[1] - src[0];
+    SkVector tan1 = (src[2] == src[3]) ? src[3] - src[1] : src[3] - src[2];
+    SkVector bisector = SkFindBisector(tan0, -tan1);
+
+    static const skvx::float4 kM[4] = {skvx::float4(-1,  2, -1,  0),
+                                       skvx::float4( 3, -4,  1,  0),
+                                       skvx::float4(-3,  2,  0,  0)};
+    auto C_x = fma(kM[0], src[0].fX,
+               fma(kM[1], src[1].fX,
+               fma(kM[2], src[2].fX, skvx::float4(src[3].fX, 0,0,0))));
+    auto C_y = fma(kM[0], src[0].fY,
+               fma(kM[1], src[1].fY,
+               fma(kM[2], src[2].fY, skvx::float4(src[3].fY, 0,0,0))));
+    auto coeffs = C_x * bisector.x() + C_y * bisector.y();
+
+    float T = 0;
+    float a=coeffs[0], b=coeffs[1], c=coeffs[2];
+    float discr = b*b - 4*a*c;
+    if (discr > 0) {  
+        return solve_quadratic_equation_for_midtangent(a, b, c, discr);
+    } else {
+        coeffs = C_x * tan0.x() + C_y * tan0.y();
+        a = coeffs[0];
+        b = coeffs[1];
+        if (a != 0) {
+            T = -b / (2*a);
+        }
+        if (!(T > 0 && T < 1)) {  
+            T = .5;
+        }
+        return T;
+    }
+}
+
+static void flatten_double_cubic_extrema(SkScalar coords[14]) {
+    coords[4] = coords[8] = coords[6];
+}
+
+int SkChopCubicAtYExtrema(const SkPoint src[4], SkPoint dst[10]) {
+    SkScalar    tValues[2];
+    int         roots = SkFindCubicExtrema(src[0].fY, src[1].fY, src[2].fY,
+                                           src[3].fY, tValues);
+
+    SkChopCubicAt(src, dst, tValues, roots);
+    if (dst && roots > 0) {
+        flatten_double_cubic_extrema(&dst[0].fY);
+        if (roots == 2) {
+            flatten_double_cubic_extrema(&dst[3].fY);
+        }
+    }
+    return roots;
+}
+
+int SkChopCubicAtXExtrema(const SkPoint src[4], SkPoint dst[10]) {
+    SkScalar    tValues[2];
+    int         roots = SkFindCubicExtrema(src[0].fX, src[1].fX, src[2].fX,
+                                           src[3].fX, tValues);
+
+    SkChopCubicAt(src, dst, tValues, roots);
+    if (dst && roots > 0) {
+        flatten_double_cubic_extrema(&dst[0].fX);
+        if (roots == 2) {
+            flatten_double_cubic_extrema(&dst[3].fX);
+        }
+    }
+    return roots;
+}
+
+int SkFindCubicInflections(const SkPoint src[4], SkScalar tValues[2]) {
+    SkScalar    Ax = src[1].fX - src[0].fX;
+    SkScalar    Ay = src[1].fY - src[0].fY;
+    SkScalar    Bx = src[2].fX - 2 * src[1].fX + src[0].fX;
+    SkScalar    By = src[2].fY - 2 * src[1].fY + src[0].fY;
+    SkScalar    Cx = src[3].fX + 3 * (src[1].fX - src[2].fX) - src[0].fX;
+    SkScalar    Cy = src[3].fY + 3 * (src[1].fY - src[2].fY) - src[0].fY;
+
+    return SkFindUnitQuadRoots(Bx*Cy - By*Cx,
+                               Ax*Cy - Ay*Cx,
+                               Ax*By - Ay*Bx,
+                               tValues);
+}
+
+int SkChopCubicAtInflections(const SkPoint src[4], SkPoint dst[10]) {
+    SkScalar    tValues[2];
+    int         count = SkFindCubicInflections(src, tValues);
+
+    if (dst) {
+        if (count == 0) {
+            memcpy(dst, src, 4 * sizeof(SkPoint));
+        } else {
+            SkChopCubicAt(src, dst, tValues, count);
+        }
+    }
+    return count + 1;
+}
+
+static double calc_dot_cross_cubic(const SkPoint& p0, const SkPoint& p1, const SkPoint& p2) {
+    const double xComp = (double) p0.fX * ((double) p1.fY - (double) p2.fY);
+    const double yComp = (double) p0.fY * ((double) p2.fX - (double) p1.fX);
+    const double wComp = (double) p1.fX * (double) p2.fY - (double) p1.fY * (double) p2.fX;
+    return (xComp + yComp + wComp);
+}
+
+inline static double previous_inverse_pow2(double n) {
+    uint64_t bits;
+    memcpy(&bits, &n, sizeof(double));
+    bits = ((1023llu*2 << 52) + ((1llu << 52) - 1)) - bits; 
+    bits &= (0x7ffllu) << 52; 
+    memcpy(&n, &bits, sizeof(double));
+    return n;
+}
+
+inline static void write_cubic_inflection_roots(double t0, double s0, double t1, double s1,
+                                                double* t, double* s) {
+    t[0] = t0;
+    s[0] = s0;
+
+    t[1] = -copysign(t1, t1 * s1);
+    s[1] = -fabs(s1);
+
+    if (copysign(s[1], s[0]) * t[0] > -fabs(s[0]) * t[1]) {
+        using std::swap;
+        swap(t[0], t[1]);
+        swap(s[0], s[1]);
+    }
+}
+
+SkCubicType SkClassifyCubic(const SkPoint P[4], double t[2], double s[2], double d[4]) {
+    double A1 = calc_dot_cross_cubic(P[0], P[3], P[2]);
+    double A2 = calc_dot_cross_cubic(P[1], P[0], P[3]);
+    double A3 = calc_dot_cross_cubic(P[2], P[1], P[0]);
+
+    double D3 = 3 * A3;
+    double D2 = D3 - A2;
+    double D1 = D2 - A2 + A1;
+
+    double Dmax = std::max(std::max(fabs(D1), fabs(D2)), fabs(D3));
+    double norm = previous_inverse_pow2(Dmax);
+    D1 *= norm;
+    D2 *= norm;
+    D3 *= norm;
+
+    if (d) {
+        d[3] = D3;
+        d[2] = D2;
+        d[1] = D1;
+        d[0] = 0;
+    }
+
+    if (0 != D1) {
+        double discr = 3*D2*D2 - 4*D1*D3;
+        if (discr > 0) { 
+            if (t && s) {
+                double q = 3*D2 + copysign(sqrt(3*discr), D2);
+                write_cubic_inflection_roots(q, 6*D1, 2*D3, q, t, s);
+            }
+            return SkCubicType::kSerpentine;
+        } else if (discr < 0) { 
+            if (t && s) {
+                double q = D2 + copysign(sqrt(-discr), D2);
+                write_cubic_inflection_roots(q, 2*D1, 2*(D2*D2 - D3*D1), D1*q, t, s);
+            }
+            return SkCubicType::kLoop;
+        } else { 
+            if (t && s) {
+                write_cubic_inflection_roots(D2, 2*D1, D2, 2*D1, t, s);
+            }
+            return SkCubicType::kLocalCusp;
+        }
+    } else {
+        if (0 != D2) { 
+            if (t && s) {
+                write_cubic_inflection_roots(D3, 3*D2, 1, 0, t, s); 
+            }
+            return SkCubicType::kCuspAtInfinity;
+        } else { 
+            if (t && s) {
+                write_cubic_inflection_roots(1, 0, 1, 0, t, s); 
+            }
+            return 0 != D3 ? SkCubicType::kQuadratic : SkCubicType::kLineOrPoint;
+        }
+    }
+}
+
+template <typename T> void bubble_sort(T array[], int count) {
+    for (int i = count - 1; i > 0; --i)
+        for (int j = i; j > 0; --j)
+            if (array[j] < array[j-1])
+            {
+                T   tmp(array[j]);
+                array[j] = array[j-1];
+                array[j-1] = tmp;
+            }
+}
+
+static int collaps_duplicates(SkScalar array[], int count) {
+    for (int n = count; n > 1; --n) {
+        if (array[0] == array[1]) {
+            for (int i = 1; i < n; ++i) {
+                array[i - 1] = array[i];
+            }
+            count -= 1;
+        } else {
+            array += 1;
+        }
+    }
+    return count;
+}
+
+#if defined(SK_DEBUG)
+
+#define TEST_COLLAPS_ENTRY(array)   array, std::size(array)
+
+static void test_collaps_duplicates() {
+    static bool gOnce;
+    if (gOnce) { return; }
+    gOnce = true;
+    const SkScalar src0[] = { 0 };
+    const SkScalar src1[] = { 0, 0 };
+    const SkScalar src2[] = { 0, 1 };
+    const SkScalar src3[] = { 0, 0, 0 };
+    const SkScalar src4[] = { 0, 0, 1 };
+    const SkScalar src5[] = { 0, 1, 1 };
+    const SkScalar src6[] = { 0, 1, 2 };
+    const struct {
+        const SkScalar* fData;
+        int fCount;
+        int fCollapsedCount;
+    } data[] = {
+        { TEST_COLLAPS_ENTRY(src0), 1 },
+        { TEST_COLLAPS_ENTRY(src1), 1 },
+        { TEST_COLLAPS_ENTRY(src2), 2 },
+        { TEST_COLLAPS_ENTRY(src3), 1 },
+        { TEST_COLLAPS_ENTRY(src4), 2 },
+        { TEST_COLLAPS_ENTRY(src5), 2 },
+        { TEST_COLLAPS_ENTRY(src6), 3 },
+    };
+    for (size_t i = 0; i < std::size(data); ++i) {
+        SkScalar dst[3];
+        memcpy(dst, data[i].fData, data[i].fCount * sizeof(dst[0]));
+        int count = collaps_duplicates(dst, data[i].fCount);
+        SkASSERT(data[i].fCollapsedCount == count);
+        for (int j = 1; j < count; ++j) {
+            SkASSERT(dst[j-1] < dst[j]);
+        }
+    }
+}
+#endif
+
+static SkScalar SkScalarCubeRoot(SkScalar x) {
+    return SkScalarPow(x, 0.3333333f);
+}
+
+static int solve_cubic_poly(const SkScalar coeff[4], SkScalar tValues[3]) {
+    if (SkScalarNearlyZero(coeff[0])) {  
+        return SkFindUnitQuadRoots(coeff[1], coeff[2], coeff[3], tValues);
+    }
+
+    SkScalar a, b, c, Q, R;
+
+    {
+        SkASSERT(coeff[0] != 0);
+
+        SkScalar inva = SkScalarInvert(coeff[0]);
+        a = coeff[1] * inva;
+        b = coeff[2] * inva;
+        c = coeff[3] * inva;
+    }
+    Q = (a*a - b*3) / 9;
+    R = (2*a*a*a - 9*a*b + 27*c) / 54;
+
+    SkScalar Q3 = Q * Q * Q;
+    SkScalar R2MinusQ3 = R * R - Q3;
+    SkScalar adiv3 = a / 3;
+
+    if (R2MinusQ3 < 0) { 
+        SkScalar theta = SkScalarACos(SkTPin(R / SkScalarSqrt(Q3), -1.0f, 1.0f));
+        SkScalar neg2RootQ = -2 * SkScalarSqrt(Q);
+
+        tValues[0] = SkTPin(neg2RootQ * SkScalarCos(theta/3) - adiv3, 0.0f, 1.0f);
+        tValues[1] = SkTPin(neg2RootQ * SkScalarCos((theta + 2*SK_ScalarPI)/3) - adiv3, 0.0f, 1.0f);
+        tValues[2] = SkTPin(neg2RootQ * SkScalarCos((theta - 2*SK_ScalarPI)/3) - adiv3, 0.0f, 1.0f);
+        SkDEBUGCODE(test_collaps_duplicates();)
+
+        bubble_sort(tValues, 3);
+        return collaps_duplicates(tValues, 3);
+    } else {              
+        SkScalar A = SkScalarAbs(R) + SkScalarSqrt(R2MinusQ3);
+        A = SkScalarCubeRoot(A);
+        if (R > 0) {
+            A = -A;
+        }
+        if (A != 0) {
+            A += Q / A;
+        }
+        tValues[0] = SkTPin(A - adiv3, 0.0f, 1.0f);
+        return 1;
+    }
+}
+
+static void formulate_F1DotF2(const SkScalar src[], SkScalar coeff[4]) {
+    SkScalar    a = src[2] - src[0];
+    SkScalar    b = src[4] - 2 * src[2] + src[0];
+    SkScalar    c = src[6] + 3 * (src[2] - src[4]) - src[0];
+
+    coeff[0] = c * c;
+    coeff[1] = 3 * b * c;
+    coeff[2] = 2 * b * b + c * a;
+    coeff[3] = a * b;
+}
+
+int SkFindCubicMaxCurvature(const SkPoint src[4], SkScalar tValues[3]) {
+    SkScalar coeffX[4], coeffY[4];
+    int      i;
+
+    formulate_F1DotF2(&src[0].fX, coeffX);
+    formulate_F1DotF2(&src[0].fY, coeffY);
+
+    for (i = 0; i < 4; i++) {
+        coeffX[i] += coeffY[i];
+    }
+
+    int numRoots = solve_cubic_poly(coeffX, tValues);
+    return numRoots;
+}
+
+int SkChopCubicAtMaxCurvature(const SkPoint src[4], SkPoint dst[13],
+                              SkScalar tValues[3]) {
+    SkScalar    t_storage[3];
+
+    if (tValues == nullptr) {
+        tValues = t_storage;
+    }
+
+    SkScalar roots[3];
+    int rootCount = SkFindCubicMaxCurvature(src, roots);
+
+    int count = 0;
+    for (int i = 0; i < rootCount; ++i) {
+        if (0 < roots[i] && roots[i] < 1) {
+            tValues[count++] = roots[i];
+        }
+    }
+
+    if (dst) {
+        if (count == 0) {
+            memcpy(dst, src, 4 * sizeof(SkPoint));
+        } else {
+            SkChopCubicAt(src, dst, tValues, count);
+        }
+    }
+    return count + 1;
+}
+
+static SkScalar calc_cubic_precision(const SkPoint src[4]) {
+    return (SkPointPriv::DistanceToSqd(src[1], src[0]) + SkPointPriv::DistanceToSqd(src[2], src[1])
+            + SkPointPriv::DistanceToSqd(src[3], src[2])) * 1e-8f;
+}
+
+static bool on_same_side(const SkPoint src[4], int testIndex, int lineIndex) {
+    SkPoint origin = src[lineIndex];
+    SkVector line = src[lineIndex + 1] - origin;
+    SkScalar crosses[2];
+    for (int index = 0; index < 2; ++index) {
+        SkVector testLine = src[testIndex + index] - origin;
+        crosses[index] = line.cross(testLine);
+    }
+    return crosses[0] * crosses[1] >= 0;
+}
+
+SkScalar SkFindCubicCusp(const SkPoint src[4]) {
+    if (src[0] == src[1]) {
+        return -1;
+    }
+    if (src[2] == src[3]) {
+        return -1;
+    }
+    if (on_same_side(src, 0, 2) || on_same_side(src, 2, 0)) {
+        return -1;
+    }
+    SkScalar maxCurvature[3];
+    int roots = SkFindCubicMaxCurvature(src, maxCurvature);
+    for (int index = 0; index < roots; ++index) {
+        SkScalar testT = maxCurvature[index];
+        if (0 >= testT || testT >= 1) {  
+            continue;
+        }
+        SkVector dPt = eval_cubic_derivative(src, testT);
+        SkScalar dPtMagnitude = SkPointPriv::LengthSqd(dPt);
+        SkScalar precision = calc_cubic_precision(src);
+        if (dPtMagnitude < precision) {
+            return testT;
+        }
+    }
+    return -1;
+}
+
+static bool close_enough_to_zero(double x) {
+    return std::fabs(x) < 0.00001;
+}
+
+static bool first_axis_intersection(const double coefficients[8], bool yDirection,
+                                    double axisIntercept, double* solution) {
+    auto [A, B, C, D] = SkBezierCubic::ConvertToPolynomial(coefficients, yDirection);
+    D -= axisIntercept;
+    double roots[3] = {0, 0, 0};
+    int count = SkCubics::RootsValidT(A, B, C, D, roots);
+    if (count == 0) {
+        return false;
+    }
+    for (int i = 0; i < count; i++) {
+        if (close_enough_to_zero(SkCubics::EvalAt(A, B, C, D, roots[i]))) {
+            *solution = roots[i];
+            return true;
+        }
+    }
+    count = SkCubics::BinarySearchRootsValidT(A, B, C, D, roots);
+    if (count == 0) {
+        return false;
+    }
+    for (int i = 0; i < count; i++) {
+        if (close_enough_to_zero(SkCubics::EvalAt(A, B, C, D, roots[i]))) {
+            *solution = roots[i];
+            return true;
+        }
+    }
+    return false;
+}
+
+bool SkChopMonoCubicAtY(const SkPoint src[4], SkScalar y, SkPoint dst[7]) {
+    double coefficients[8] = {src[0].fX, src[0].fY, src[1].fX, src[1].fY,
+                              src[2].fX, src[2].fY, src[3].fX, src[3].fY};
+    double solution = 0;
+    if (first_axis_intersection(coefficients, true, y, &solution)) {
+        double cubicPair[14];
+        SkBezierCubic::Subdivide(coefficients, solution, cubicPair);
+        for (int i = 0; i < 7; i ++) {
+            dst[i].fX = sk_double_to_float(cubicPair[i*2]);
+            dst[i].fY = sk_double_to_float(cubicPair[i*2 + 1]);
+        }
+        return true;
+    }
+    return false;
+}
+
+bool SkChopMonoCubicAtX(const SkPoint src[4], SkScalar x, SkPoint dst[7]) {
+    double coefficients[8] = {src[0].fX, src[0].fY, src[1].fX, src[1].fY,
+                                  src[2].fX, src[2].fY, src[3].fX, src[3].fY};
+    double solution = 0;
+    if (first_axis_intersection(coefficients, false, x, &solution)) {
+        double cubicPair[14];
+        SkBezierCubic::Subdivide(coefficients, solution, cubicPair);
+        for (int i = 0; i < 7; i ++) {
+            dst[i].fX = sk_double_to_float(cubicPair[i*2]);
+            dst[i].fY = sk_double_to_float(cubicPair[i*2 + 1]);
+        }
+        return true;
+    }
+    return false;
+}
+
+
+static void conic_deriv_coeff(const SkScalar src[],
+                              SkScalar w,
+                              SkScalar coeff[3]) {
+    const SkScalar P20 = src[4] - src[0];
+    const SkScalar P10 = src[2] - src[0];
+    const SkScalar wP10 = w * P10;
+    coeff[0] = w * P20 - P20;
+    coeff[1] = P20 - 2 * wP10;
+    coeff[2] = wP10;
+}
+
+static bool conic_find_extrema(const SkScalar src[], SkScalar w, SkScalar* t) {
+    SkScalar coeff[3];
+    conic_deriv_coeff(src, w, coeff);
+
+    SkScalar tValues[2];
+    int roots = SkFindUnitQuadRoots(coeff[0], coeff[1], coeff[2], tValues);
+    SkASSERT(0 == roots || 1 == roots);
+
+    if (1 == roots) {
+        *t = tValues[0];
+        return true;
+    }
+    return false;
+}
+
+static void p3d_interp(const SkScalar src[7], SkScalar dst[7], SkScalar t) {
+    SkScalar ab = SkScalarInterp(src[0], src[3], t);
+    SkScalar bc = SkScalarInterp(src[3], src[6], t);
+    dst[0] = ab;
+    dst[3] = SkScalarInterp(ab, bc, t);
+    dst[6] = bc;
+}
+
+static void ratquad_mapTo3D(const SkPoint src[3], SkScalar w, SkPoint3 dst[3]) {
+    dst[0].set(src[0].fX * 1, src[0].fY * 1, 1);
+    dst[1].set(src[1].fX * w, src[1].fY * w, w);
+    dst[2].set(src[2].fX * 1, src[2].fY * 1, 1);
+}
+
+static SkPoint project_down(const SkPoint3& src) {
+    return {src.fX / src.fZ, src.fY / src.fZ};
+}
+
+bool SkConic::chopAt(SkScalar t, SkConic dst[2]) const {
+    SkPoint3 tmp[3], tmp2[3];
+
+    ratquad_mapTo3D(fPts, fW, tmp);
+
+    p3d_interp(&tmp[0].fX, &tmp2[0].fX, t);
+    p3d_interp(&tmp[0].fY, &tmp2[0].fY, t);
+    p3d_interp(&tmp[0].fZ, &tmp2[0].fZ, t);
+
+    dst[0].fPts[0] = fPts[0];
+    dst[0].fPts[1] = project_down(tmp2[0]);
+    dst[0].fPts[2] = project_down(tmp2[1]); dst[1].fPts[0] = dst[0].fPts[2];
+    dst[1].fPts[1] = project_down(tmp2[2]);
+    dst[1].fPts[2] = fPts[2];
+
+    SkScalar root = SkScalarSqrt(tmp2[1].fZ);
+    dst[0].fW = tmp2[0].fZ / root;
+    dst[1].fW = tmp2[2].fZ / root;
+    SkASSERT(sizeof(dst[0]) == sizeof(SkScalar) * 7);
+    SkASSERT(0 == offsetof(SkConic, fPts[0].fX));
+    return SkIsFinite(&dst[0].fPts[0].fX, 7 * 2);
+}
+
+void SkConic::chopAt(SkScalar t1, SkScalar t2, SkConic* dst) const {
+    if (0 == t1 || 1 == t2) {
+        if (0 == t1 && 1 == t2) {
+            *dst = *this;
+            return;
+        } else {
+            SkConic pair[2];
+            if (this->chopAt(t1 ? t1 : t2, pair)) {
+                *dst = pair[SkToBool(t1)];
+                return;
+            }
+        }
+    }
+    SkConicCoeff coeff(*this);
+    float2 tt1(t1);
+    float2 aXY = coeff.fNumer.eval(tt1);
+    float2 aZZ = coeff.fDenom.eval(tt1);
+    float2 midTT((t1 + t2) / 2);
+    float2 dXY = coeff.fNumer.eval(midTT);
+    float2 dZZ = coeff.fDenom.eval(midTT);
+    float2 tt2(t2);
+    float2 cXY = coeff.fNumer.eval(tt2);
+    float2 cZZ = coeff.fDenom.eval(tt2);
+    float2 bXY = times_2(dXY) - (aXY + cXY) * 0.5f;
+    float2 bZZ = times_2(dZZ) - (aZZ + cZZ) * 0.5f;
+    dst->fPts[0] = to_point(aXY / aZZ);
+    dst->fPts[1] = to_point(bXY / bZZ);
+    dst->fPts[2] = to_point(cXY / cZZ);
+    float2 ww = bZZ / sqrt(aZZ * cZZ);
+    dst->fW = ww[0];
+}
+
+SkPoint SkConic::evalAt(SkScalar t) const {
+    return to_point(SkConicCoeff(*this).eval(t));
+}
+
+SkVector SkConic::evalTangentAt(SkScalar t) const {
+    if ((t == 0 && fPts[0] == fPts[1]) || (t == 1 && fPts[1] == fPts[2])) {
+        return fPts[2] - fPts[0];
+    }
+    float2 p0 = from_point(fPts[0]);
+    float2 p1 = from_point(fPts[1]);
+    float2 p2 = from_point(fPts[2]);
+    float2 ww(fW);
+
+    float2 p20 = p2 - p0;
+    float2 p10 = p1 - p0;
+
+    float2 C = ww * p10;
+    float2 A = ww * p20 - p20;
+    float2 B = p20 - C - C;
+
+    return to_vector(SkQuadCoeff(A, B, C).eval(t));
+}
+
+void SkConic::evalAt(SkScalar t, SkPoint* pt, SkVector* tangent) const {
+    SkASSERT(t >= 0 && t <= SK_Scalar1);
+
+    if (pt) {
+        *pt = this->evalAt(t);
+    }
+    if (tangent) {
+        *tangent = this->evalTangentAt(t);
+    }
+}
+
+static SkScalar subdivide_w_value(SkScalar w) {
+    return SkScalarSqrt(SK_ScalarHalf + w * SK_ScalarHalf);
+}
+
+#if defined(SK_SUPPORT_LEGACY_CONIC_CHOP)
+void SkConic::chop(SkConic * SK_RESTRICT dst) const {
+    float2 scale = SkScalarInvert(SK_Scalar1 + fW);
+    SkScalar newW = subdivide_w_value(fW);
+
+    float2 p0 = from_point(fPts[0]);
+    float2 p1 = from_point(fPts[1]);
+    float2 p2 = from_point(fPts[2]);
+    float2 ww(fW);
+
+    float2 wp1 = ww * p1;
+    float2 m = (p0 + times_2(wp1) + p2) * scale * 0.5f;
+    SkPoint mPt = to_point(m);
+    if (!mPt.isFinite()) {
+        double w_d = fW;
+        double w_2 = w_d * 2;
+        double scale_half = 1 / (1 + w_d) * 0.5;
+        mPt.fX = SkDoubleToScalar((fPts[0].fX + w_2 * fPts[1].fX + fPts[2].fX) * scale_half);
+        mPt.fY = SkDoubleToScalar((fPts[0].fY + w_2 * fPts[1].fY + fPts[2].fY) * scale_half);
+    }
+    dst[0].fPts[0] = fPts[0];
+    dst[0].fPts[1] = to_point((p0 + wp1) * scale);
+    dst[0].fPts[2] = dst[1].fPts[0] = mPt;
+    dst[1].fPts[1] = to_point((wp1 + p2) * scale);
+    dst[1].fPts[2] = fPts[2];
+
+    dst[0].fW = dst[1].fW = newW;
+}
+#else
+void SkConic::chop(SkConic * SK_RESTRICT dst) const {
+
+    const float scale = SkScalarInvert(SK_Scalar1 + fW);
+
+    float2 t0 = from_point(fPts[0]) * scale;
+    float2 t1 = from_point(fPts[1]) * (fW * scale);
+    float2 t2 = from_point(fPts[2]) * scale;
+
+    const SkPoint p1 = to_point(t0 + t1);
+    const SkPoint p3 = to_point(t1 + t2);
+
+    const SkPoint p2 = to_point(0.5f * t0 + t1 + 0.5f * t2);
+
+    SkASSERT(p1.isFinite() && p2.isFinite() && p3.isFinite());
+
+    dst[0].fPts[0] = fPts[0];
+    dst[0].fPts[1] = p1;
+    dst[0].fPts[2] = p2;
+    dst[1].fPts[0] = p2;
+    dst[1].fPts[1] = p3;
+    dst[1].fPts[2] = fPts[2];
+
+    dst[0].fW = dst[1].fW = subdivide_w_value(fW);
+}
+#endif
+
+#define AS_QUAD_ERROR_SETUP                                         \
+    SkScalar a = fW - 1;                                            \
+    SkScalar k = a / (4 * (2 + a));                                 \
+    SkScalar x = k * (fPts[0].fX - 2 * fPts[1].fX + fPts[2].fX);    \
+    SkScalar y = k * (fPts[0].fY - 2 * fPts[1].fY + fPts[2].fY);
+
+void SkConic::computeAsQuadError(SkVector* err) const {
+    AS_QUAD_ERROR_SETUP
+    err->set(x, y);
+}
+
+bool SkConic::asQuadTol(SkScalar tol) const {
+    AS_QUAD_ERROR_SETUP
+    return (x * x + y * y) <= tol * tol;
+}
+
+#define kMaxConicToQuadPOW2     5
+
+static inline bool bad_conic_w(float w) {
+    return w < 0 || !SkIsFinite(w);
+}
+
+int SkConic::computeQuadPOW2(SkScalar tol) const {
+    if (tol < 0 || !SkIsFinite(tol) || !SkPointPriv::AreFinite(fPts, 3) || bad_conic_w(fW)) {
+        return 0;
+    }
+
+    AS_QUAD_ERROR_SETUP
+
+    SkScalar error = SkScalarSqrt(x * x + y * y);
+    int pow2;
+    for (pow2 = 0; pow2 < kMaxConicToQuadPOW2; ++pow2) {
+        if (error <= tol) {
+            break;
+        }
+        error *= 0.25f;
+    }
+    if ((false)) {
+        SkScalar err = SkScalarSqrt(x * x + y * y);
+        if (err <= tol) {
+            return 0;
+        }
+        SkScalar tol2 = tol * tol;
+        if (tol2 == 0) {
+            return kMaxConicToQuadPOW2;
+        }
+        SkScalar fpow2 = SkScalarLog2((x * x + y * y) / tol2) * 0.25f;
+        int altPow2 = SkScalarCeilToInt(fpow2);
+        if (altPow2 != pow2) {
+            SkDebugf("pow2 %d altPow2 %d fbits %g err %g tol %g\n", pow2, altPow2, fpow2, err, tol);
+        }
+        pow2 = altPow2;
+    }
+    return pow2;
+}
+
+static bool between(SkScalar a, SkScalar b, SkScalar c) {
+    return (a - b) * (c - b) <= 0;
+}
+
+static SkPoint* subdivide(const SkConic& src, SkPoint pts[], int level) {
+    SkASSERT(level >= 0);
+
+    if (0 == level) {
+        memcpy(pts, &src.fPts[1], 2 * sizeof(SkPoint));
+        return pts + 2;
+    } else {
+        SkConic dst[2];
+        src.chop(dst);
+        const SkScalar startY = src.fPts[0].fY;
+        SkScalar endY = src.fPts[2].fY;
+        if (between(startY, src.fPts[1].fY, endY)) {
+            SkScalar midY = dst[0].fPts[2].fY;
+            if (!between(startY, midY, endY)) {
+                SkScalar closerY = SkTAbs(midY - startY) < SkTAbs(midY - endY) ? startY : endY;
+                dst[0].fPts[2].fY = dst[1].fPts[0].fY = closerY;
+            }
+            if (!between(startY, dst[0].fPts[1].fY, dst[0].fPts[2].fY)) {
+                dst[0].fPts[1].fY = startY;
+            }
+            if (!between(dst[1].fPts[0].fY, dst[1].fPts[1].fY, endY)) {
+                dst[1].fPts[1].fY = endY;
+            }
+            SkASSERT(between(startY, dst[0].fPts[1].fY, dst[0].fPts[2].fY));
+            SkASSERT(between(dst[0].fPts[1].fY, dst[0].fPts[2].fY, dst[1].fPts[1].fY));
+            SkASSERT(between(dst[0].fPts[2].fY, dst[1].fPts[1].fY, endY));
+        }
+        --level;
+        pts = subdivide(dst[0], pts, level);
+        return subdivide(dst[1], pts, level);
+    }
+}
+
+int SkConic::chopIntoQuadsPOW2(SkPoint pts[], int pow2) const {
+    SkASSERT(pow2 >= 0 && pow2 <= kMaxConicToQuadPOW2);
+
+    if (bad_conic_w(fW)) {
+        pow2 = 0;
+    }
+
+    *pts = fPts[0];
+    SkDEBUGCODE(SkPoint* endPts);
+    if (pow2 == kMaxConicToQuadPOW2) {  
+        SkConic dst[2];
+        this->chop(dst);
+        if (SkPointPriv::EqualsWithinTolerance(dst[0].fPts[1], dst[0].fPts[2]) &&
+                SkPointPriv::EqualsWithinTolerance(dst[1].fPts[0], dst[1].fPts[1])) {
+            pts[1] = pts[2] = pts[3] = dst[0].fPts[1];  
+            pts[4] = dst[1].fPts[2];
+            pow2 = 1;
+            SkDEBUGCODE(endPts = &pts[5]);
+            goto commonFinitePtCheck;
+        }
+    }
+    SkDEBUGCODE(endPts = ) subdivide(*this, pts + 1, pow2);
+commonFinitePtCheck:
+    const int quadCount = 1 << pow2;
+    const int ptCount = 2 * quadCount + 1;
+    SkASSERT(endPts - pts == ptCount);
+    if (!SkPointPriv::AreFinite(pts, ptCount)) {
+        for (int i = 1; i < ptCount - 1; ++i) {
+            pts[i] = fPts[1];
+        }
+    }
+    return 1 << pow2;
+}
+
+float SkConic::findMidTangent() const {
+    SkVector tan0 = fPts[1] - fPts[0];
+    SkVector tan1 = fPts[2] - fPts[1];
+    SkVector bisector = SkFindBisector(tan0, -tan1);
+
+    SkVector A = (fPts[2] - fPts[0]) * (fW - 1);
+    SkVector B = (fPts[2] - fPts[0]) - (fPts[1] - fPts[0]) * (fW*2);
+    SkVector C = (fPts[1] - fPts[0]) * fW;
+
+    float a = bisector.dot(A);
+    float b = bisector.dot(B);
+    float c = bisector.dot(C);
+    return solve_quadratic_equation_for_midtangent(a, b, c);
+}
+
+bool SkConic::findXExtrema(SkScalar* t) const {
+    return conic_find_extrema(&fPts[0].fX, fW, t);
+}
+
+bool SkConic::findYExtrema(SkScalar* t) const {
+    return conic_find_extrema(&fPts[0].fY, fW, t);
+}
+
+bool SkConic::chopAtXExtrema(SkConic dst[2]) const {
+    SkScalar t;
+    if (this->findXExtrema(&t)) {
+        if (!this->chopAt(t, dst)) {
+            return false;
+        }
+        SkScalar value = dst[0].fPts[2].fX;
+        dst[0].fPts[1].fX = value;
+        dst[1].fPts[0].fX = value;
+        dst[1].fPts[1].fX = value;
+        return true;
+    }
+    return false;
+}
+
+bool SkConic::chopAtYExtrema(SkConic dst[2]) const {
+    SkScalar t;
+    if (this->findYExtrema(&t)) {
+        if (!this->chopAt(t, dst)) {
+            return false;
+        }
+        SkScalar value = dst[0].fPts[2].fY;
+        dst[0].fPts[1].fY = value;
+        dst[1].fPts[0].fY = value;
+        dst[1].fPts[1].fY = value;
+        return true;
+    }
+    return false;
+}
+
+void SkConic::computeTightBounds(SkRect* bounds) const {
+    SkPoint pts[4];
+    pts[0] = fPts[0];
+    pts[1] = fPts[2];
+    size_t count = 2;
+
+    SkScalar t;
+    if (this->findXExtrema(&t)) {
+        this->evalAt(t, &pts[count++]);
+    }
+    if (this->findYExtrema(&t)) {
+        this->evalAt(t, &pts[count++]);
+    }
+    *bounds = SkRect::BoundsOrEmpty({pts, count});
+}
+
+void SkConic::computeFastBounds(SkRect* bounds) const {
+    *bounds = SkRect::BoundsOrEmpty(fPts);
+}
+
+#if 0  // unimplemented
+bool SkConic::findMaxCurvature(SkScalar* t) const {
+    return false;
+}
+#endif
+
+SkScalar SkConic::TransformW(const SkPoint pts[3], SkScalar w, const SkMatrix& matrix) {
+    if (!matrix.hasPerspective()) {
+        return w;
+    }
+
+    SkPoint3 src[3], dst[3];
+
+    ratquad_mapTo3D(pts, w, src);
+
+    matrix.mapHomogeneousPoints(dst, src);
+
+    double w0 = dst[0].fZ;
+    double w1 = dst[1].fZ;
+    double w2 = dst[2].fZ;
+    return sk_double_to_float(sqrt(sk_ieee_double_divide(w1 * w1, w0 * w2)));
+}
+
+int SkConic::BuildUnitArc(const SkVector& uStart, const SkVector& uStop, SkPathDirection dir,
+                          const SkMatrix* userMatrix, SkConic dst[kMaxConicsForArc]) {
+    SkScalar x = SkPoint::DotProduct(uStart, uStop);
+    SkScalar y = SkPoint::CrossProduct(uStart, uStop);
+
+    SkScalar absY = SkScalarAbs(y);
+
+    if (absY <= SK_ScalarNearlyZero && x > 0 && ((y >= 0 && SkPathDirection::kCW == dir) ||
+                                                 (y <= 0 && SkPathDirection::kCCW == dir))) {
+        return 0;
+    }
+
+    if (dir == SkPathDirection::kCCW) {
+        y = -y;
+    }
+
+    int quadrant = 0;
+    if (0 == y) {
+        quadrant = 2;        
+        SkASSERT(SkScalarAbs(x + SK_Scalar1) <= SK_ScalarNearlyZero);
+    } else if (0 == x) {
+        SkASSERT(absY - SK_Scalar1 <= SK_ScalarNearlyZero);
+        quadrant = y > 0 ? 1 : 3; 
+    } else {
+        if (y < 0) {
+            quadrant += 2;
+        }
+        if ((x < 0) != (y < 0)) {
+            quadrant += 1;
+        }
+    }
+
+    const SkPoint quadrantPts[] = {
+        { 1, 0 }, { 1, 1 }, { 0, 1 }, { -1, 1 }, { -1, 0 }, { -1, -1 }, { 0, -1 }, { 1, -1 }
+    };
+    const SkScalar quadrantWeight = SK_ScalarRoot2Over2;
+
+    int conicCount = quadrant;
+    for (int i = 0; i < conicCount; ++i) {
+        dst[i].set(&quadrantPts[i * 2], quadrantWeight);
+    }
+
+    const SkPoint finalP = { x, y };
+    const SkPoint& lastQ = quadrantPts[quadrant * 2];  
+    const SkScalar dot = SkVector::DotProduct(lastQ, finalP);
+    if (SkIsNaN(dot)) {
+        return 0;
+    }
+    SkASSERT(0 <= dot && dot <= SK_Scalar1 + SK_ScalarNearlyZero);
+
+    if (dot < 1) {
+        SkVector offCurve = { lastQ.x() + x, lastQ.y() + y };
+        const SkScalar cosThetaOver2 = SkScalarSqrt((1 + dot) / 2);
+        offCurve.setLength(SkScalarInvert(cosThetaOver2));
+        if (!SkPointPriv::EqualsWithinTolerance(lastQ, offCurve)) {
+            dst[conicCount].set(lastQ, offCurve, finalP, cosThetaOver2);
+            conicCount += 1;
+        }
+    }
+
+    SkMatrix    matrix;
+    matrix.setSinCos(uStart.fY, uStart.fX);
+    if (dir == SkPathDirection::kCCW) {
+        matrix.preScale(SK_Scalar1, -SK_Scalar1);
+    }
+    if (userMatrix) {
+        matrix.postConcat(*userMatrix);
+    }
+    for (int i = 0; i < conicCount; ++i) {
+        matrix.mapPoints(dst[i].fPts);
+    }
+    return conicCount;
+}

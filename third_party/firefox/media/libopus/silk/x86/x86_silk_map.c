@@ -1,0 +1,179 @@
+/* Copyright (c) 2014, Cisco Systems, INC
+   Written by XiangMingZhu WeiZhou MinPeng YanWang
+
+   Redistribution and use in source and binary forms, with or without
+   modification, are permitted provided that the following conditions
+   are met:
+
+   - Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+
+   - Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+
+   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+   ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+   LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+   A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER
+   OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+   EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+   PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+   PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+   LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+   NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+   SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+*/
+
+#if defined(HAVE_CONFIG_H)
+#include "config.h"
+#endif
+
+#include "celt/x86/x86cpu.h"
+#include "structs.h"
+#include "SigProc_FIX.h"
+#ifndef FIXED_POINT
+#include "SigProc_FLP.h"
+#endif
+#include "pitch.h"
+#include "main.h"
+
+#if defined(OPUS_HAVE_RTCD) && !defined(OPUS_X86_PRESUME_AVX2)
+
+#if defined(FIXED_POINT)
+
+#include "fixed/main_FIX.h"
+
+opus_int64 (*const SILK_INNER_PROD16_IMPL[ OPUS_ARCHMASK + 1 ] )(
+    const opus_int16 *inVec1,
+    const opus_int16 *inVec2,
+    const opus_int   len
+) = {
+  silk_inner_prod16_c,                  
+  silk_inner_prod16_c,
+  silk_inner_prod16_c,
+  MAY_HAVE_SSE4_1( silk_inner_prod16 ), 
+  MAY_HAVE_SSE4_1( silk_inner_prod16 )  
+};
+
+#endif
+
+opus_int (*const SILK_VAD_GETSA_Q8_IMPL[ OPUS_ARCHMASK + 1 ] )(
+    silk_encoder_state *psEncC,
+    const opus_int16   pIn[]
+) = {
+  silk_VAD_GetSA_Q8_c,                  
+  silk_VAD_GetSA_Q8_c,
+  silk_VAD_GetSA_Q8_c,
+  MAY_HAVE_SSE4_1( silk_VAD_GetSA_Q8 ), 
+  MAY_HAVE_SSE4_1( silk_VAD_GetSA_Q8 )  
+};
+
+void (*const SILK_NSQ_IMPL[ OPUS_ARCHMASK + 1 ] )(
+    const silk_encoder_state    *psEncC,                                      
+    silk_nsq_state              *NSQ,                                         
+    SideInfoIndices             *psIndices,                                   
+    const opus_int16            x16[],                                        
+    opus_int8                   pulses[],                                     
+    const opus_int16            *PredCoef_Q12,                                
+    const opus_int16            LTPCoef_Q14[ LTP_ORDER * MAX_NB_SUBFR ],      
+    const opus_int16            AR_Q13[ MAX_NB_SUBFR * MAX_SHAPE_LPC_ORDER ], 
+    const opus_int              HarmShapeGain_Q14[ MAX_NB_SUBFR ],            
+    const opus_int              Tilt_Q14[ MAX_NB_SUBFR ],                     
+    const opus_int32            LF_shp_Q14[ MAX_NB_SUBFR ],                   
+    const opus_int32            Gains_Q16[ MAX_NB_SUBFR ],                    
+    const opus_int              pitchL[ MAX_NB_SUBFR ],                       
+    const opus_int              Lambda_Q10,                                   
+    const opus_int              LTP_scale_Q14                                 
+) = {
+  silk_NSQ_c,                  
+  silk_NSQ_c,
+  silk_NSQ_c,
+  MAY_HAVE_SSE4_1( silk_NSQ ), 
+  MAY_HAVE_SSE4_1( silk_NSQ )  
+};
+
+void (*const SILK_VQ_WMAT_EC_IMPL[ OPUS_ARCHMASK + 1 ] )(
+    opus_int8                   *ind,                           
+    opus_int32                  *res_nrg_Q15,                   
+    opus_int32                  *rate_dist_Q8,                  
+    opus_int                    *gain_Q7,                       
+    const opus_int32            *XX_Q17,                        
+    const opus_int32            *xX_Q17,                        
+    const opus_int8             *cb_Q7,                         
+    const opus_uint8            *cb_gain_Q7,                    
+    const opus_uint8            *cl_Q5,                         
+    const opus_int              subfr_len,                      
+    const opus_int32            max_gain_Q7,                    
+    const opus_int              L                               
+) = {
+  silk_VQ_WMat_EC_c,                  
+  silk_VQ_WMat_EC_c,
+  silk_VQ_WMat_EC_c,
+  MAY_HAVE_SSE4_1( silk_VQ_WMat_EC ), 
+  MAY_HAVE_SSE4_1( silk_VQ_WMat_EC )  
+};
+
+void (*const SILK_NSQ_DEL_DEC_IMPL[ OPUS_ARCHMASK + 1 ] )(
+    const silk_encoder_state    *psEncC,                                      
+    silk_nsq_state              *NSQ,                                         
+    SideInfoIndices             *psIndices,                                   
+    const opus_int16            x16[],                                        
+    opus_int8                   pulses[],                                     
+    const opus_int16            *PredCoef_Q12,                                
+    const opus_int16            LTPCoef_Q14[ LTP_ORDER * MAX_NB_SUBFR ],      
+    const opus_int16            AR_Q13[ MAX_NB_SUBFR * MAX_SHAPE_LPC_ORDER ], 
+    const opus_int              HarmShapeGain_Q14[ MAX_NB_SUBFR ],            
+    const opus_int              Tilt_Q14[ MAX_NB_SUBFR ],                     
+    const opus_int32            LF_shp_Q14[ MAX_NB_SUBFR ],                   
+    const opus_int32            Gains_Q16[ MAX_NB_SUBFR ],                    
+    const opus_int              pitchL[ MAX_NB_SUBFR ],                       
+    const opus_int              Lambda_Q10,                                   
+    const opus_int              LTP_scale_Q14                                 
+) = {
+  silk_NSQ_del_dec_c,                  
+  silk_NSQ_del_dec_c,
+  silk_NSQ_del_dec_c,
+  MAY_HAVE_SSE4_1( silk_NSQ_del_dec ), 
+  MAY_HAVE_AVX2( silk_NSQ_del_dec )  
+};
+
+#if defined(FIXED_POINT)
+
+void (*const SILK_BURG_MODIFIED_IMPL[ OPUS_ARCHMASK + 1 ] )(
+    opus_int32                  *res_nrg,           
+    opus_int                    *res_nrg_Q,         
+    opus_int32                  A_Q16[],            
+    const opus_int16            x[],                
+    const opus_int32            minInvGain_Q30,     
+    const opus_int              subfr_length,       
+    const opus_int              nb_subfr,           
+    const opus_int              D,                  
+    int                         arch                
+) = {
+  silk_burg_modified_c,                  
+  silk_burg_modified_c,
+  silk_burg_modified_c,
+  MAY_HAVE_SSE4_1( silk_burg_modified ), 
+  MAY_HAVE_SSE4_1( silk_burg_modified )  
+};
+
+#endif
+
+#ifndef FIXED_POINT
+
+double (*const SILK_INNER_PRODUCT_FLP_IMPL[ OPUS_ARCHMASK + 1 ] )(
+    const silk_float    *data1,
+    const silk_float    *data2,
+    opus_int            dataSize
+) = {
+  silk_inner_product_FLP_c,                  
+  silk_inner_product_FLP_c,
+  silk_inner_product_FLP_c,
+  silk_inner_product_FLP_c, 
+  MAY_HAVE_AVX2( silk_inner_product_FLP )  
+};
+
+#endif
+
+#endif

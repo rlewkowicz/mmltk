@@ -1,0 +1,92 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "TransformerCallbackHelpers.h"
+
+#include "StreamUtils.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/TransformStreamDefaultController.h"
+
+using namespace mozilla::dom;
+
+NS_IMPL_CYCLE_COLLECTION(TransformerAlgorithmsBase)
+NS_IMPL_CYCLE_COLLECTING_ADDREF(TransformerAlgorithmsBase)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(TransformerAlgorithmsBase)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(TransformerAlgorithmsBase)
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED_WITH_JS_MEMBERS(
+    TransformerAlgorithms, TransformerAlgorithmsBase,
+    (mGlobal, mTransformCallback, mFlushCallback), (mTransformer))
+NS_IMPL_ADDREF_INHERITED(TransformerAlgorithms, TransformerAlgorithmsBase)
+NS_IMPL_RELEASE_INHERITED(TransformerAlgorithms, TransformerAlgorithmsBase)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(TransformerAlgorithms)
+NS_INTERFACE_MAP_END_INHERITING(TransformerAlgorithmsBase)
+
+already_AddRefed<Promise> TransformerAlgorithms::TransformCallback(
+    JSContext* aCx, JS::Handle<JS::Value> aChunk,
+    TransformStreamDefaultController& aController, ErrorResult& aRv) {
+  if (!mTransformCallback) {
+    aController.Enqueue(aCx, aChunk, aRv);
+
+    if (aRv.MaybeSetPendingException(aCx)) {
+      JS::Rooted<JS::Value> error(aCx);
+      if (!JS_GetPendingException(aCx, &error)) {
+        aRv.StealExceptionFromJSContext(aCx);
+        return nullptr;
+      }
+      JS_ClearPendingException(aCx);
+
+      return Promise::CreateRejected(aController.GetParentObject(), error, aRv);
+    }
+
+    return Promise::CreateResolvedWithUndefined(aController.GetParentObject(),
+                                                aRv);
+  }
+  JS::Rooted<JSObject*> thisObj(aCx, mTransformer);
+  return MOZ_KnownLive(mTransformCallback)
+      ->Call(thisObj, aChunk, aController, aRv,
+             "TransformStreamDefaultController.[[transformAlgorithm]]",
+             CallbackObject::eRethrowExceptions);
+}
+
+already_AddRefed<Promise> TransformerAlgorithms::FlushCallback(
+    JSContext* aCx, TransformStreamDefaultController& aController,
+    ErrorResult& aRv) {
+  if (!mFlushCallback) {
+    return Promise::CreateResolvedWithUndefined(aController.GetParentObject(),
+                                                aRv);
+  }
+  JS::Rooted<JSObject*> thisObj(aCx, mTransformer);
+  return MOZ_KnownLive(mFlushCallback)
+      ->Call(thisObj, aController, aRv,
+             "TransformStreamDefaultController.[[flushAlgorithm]]",
+             CallbackObject::eRethrowExceptions);
+}
+
+already_AddRefed<Promise> TransformerAlgorithmsWrapper::TransformCallback(
+    JSContext*, JS::Handle<JS::Value> aChunk,
+    TransformStreamDefaultController& aController, ErrorResult& aRv) {
+  nsCOMPtr<nsIGlobalObject> global = aController.GetParentObject();
+  return PromisifyAlgorithm(
+      global,
+      [this, &aChunk, &aController](ErrorResult& aRv)
+          MOZ_CAN_RUN_SCRIPT_FOR_DEFINITION {
+            return TransformCallbackImpl(aChunk, aController, aRv);
+          },
+      aRv);
+}
+
+already_AddRefed<Promise> TransformerAlgorithmsWrapper::FlushCallback(
+    JSContext*, TransformStreamDefaultController& aController,
+    ErrorResult& aRv) {
+  nsCOMPtr<nsIGlobalObject> global = aController.GetParentObject();
+  return PromisifyAlgorithm(
+      global,
+      [this, &aController](ErrorResult& aRv) MOZ_CAN_RUN_SCRIPT_FOR_DEFINITION {
+        return FlushCallbackImpl(aController, aRv);
+      },
+      aRv);
+}

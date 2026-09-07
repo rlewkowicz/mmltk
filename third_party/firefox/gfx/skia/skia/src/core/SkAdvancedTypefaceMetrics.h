@@ -1,0 +1,63 @@
+/*
+ * Copyright 2011 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkAdvancedTypefaceMetrics_DEFINED)
+#define SkAdvancedTypefaceMetrics_DEFINED
+
+#include "include/core/SkRect.h"
+#include "include/core/SkString.h"
+#include "src/base/SkBitmaskEnum.h"  // IWYU pragma: keep
+
+#include <cstdint>
+#include <type_traits>
+
+struct SkAdvancedTypefaceMetrics {
+    SkString fPostScriptName;
+
+    enum StyleFlags : uint32_t {
+        kFixedPitch_Style  = 0x00000001,
+        kSerif_Style       = 0x00000002,
+        kScript_Style      = 0x00000008,
+        kItalic_Style      = 0x00000040,
+        kAllCaps_Style     = 0x00010000,
+        kSmallCaps_Style   = 0x00020000,
+        kForceBold_Style   = 0x00040000
+    };
+    StyleFlags fStyle = (StyleFlags)0;        
+
+    enum FontType : uint8_t {
+        kType1_Font,
+        kType1CID_Font,
+        kCFF_Font,
+        kTrueType_Font,
+        kOther_Font,
+    };
+    FontType fType = kOther_Font;
+
+    enum FontFlags : uint8_t {
+        kVariable_FontFlag       = 1 << 0,  
+        kNotEmbeddable_FontFlag  = 1 << 1,  
+        kNotSubsettable_FontFlag = 1 << 2,  
+        kAltDataFormat_FontFlag  = 1 << 3,  
+    };
+    FontFlags fFlags = (FontFlags)0;  
+
+    int16_t fItalicAngle = 0;  
+    int16_t fAscent = 0;       
+    int16_t fDescent = 0;      
+    int16_t fStemV = 0;        
+    int16_t fCapHeight = 0;    
+
+    SkIRect fBBox = {0, 0, 0, 0};  
+};
+
+namespace sknonstd {
+template <> struct is_bitmask_enum<SkAdvancedTypefaceMetrics::FontFlags> : std::true_type {};
+template <> struct is_bitmask_enum<SkAdvancedTypefaceMetrics::StyleFlags> : std::true_type {};
+}  
+
+#endif

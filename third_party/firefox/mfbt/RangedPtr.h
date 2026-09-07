@@ -1,0 +1,234 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#if !defined(mozilla_RangedPtr_h)
+#define mozilla_RangedPtr_h
+
+#include "mozilla/ArrayUtils.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+
+#include <cstddef>
+#include <cstdint>
+
+namespace mozilla {
+
+template <typename T>
+class RangedPtr {
+  template <typename U>
+  friend class RangedPtr;
+
+  T* mPtr;
+
+#if defined(DEBUG) || 0
+  T* const mRangeStart;
+  T* const mRangeEnd;
+#endif
+
+  void checkSanity() {
+    MOZ_ASSERT(mRangeStart <= mPtr);
+    MOZ_ASSERT(mPtr <= mRangeEnd);
+  }
+
+  RangedPtr<T> create(T* aPtr) const {
+#if defined(DEBUG) || 0
+    return RangedPtr<T>(aPtr, mRangeStart, mRangeEnd);
+#else
+    return RangedPtr<T>(aPtr, nullptr, nullptr);
+#endif
+  }
+
+  uintptr_t asUintptr() const { return reinterpret_cast<uintptr_t>(mPtr); }
+
+ public:
+  RangedPtr(T* aPtr, T* aStart, T* aEnd)
+      : mPtr(aPtr)
+#if defined(DEBUG) || 0
+        ,
+        mRangeStart(aStart),
+        mRangeEnd(aEnd)
+#endif
+  {
+    MOZ_ASSERT(mRangeStart <= mRangeEnd);
+    checkSanity();
+  }
+
+  RangedPtr(T* aPtr, T* aStart, size_t aLength)
+      : RangedPtr(aPtr, aStart, aStart + aLength) {
+    MOZ_ASSERT(aLength <= size_t(-1) / sizeof(T));
+  }
+
+  RangedPtr(T* aPtr, size_t aLength) : RangedPtr(aPtr, aPtr, aLength) {}
+
+  template <size_t N>
+  explicit RangedPtr(T (&aArr)[N]) : RangedPtr(aArr, aArr, N) {}
+
+  RangedPtr(const RangedPtr& aOther)
+#if defined(DEBUG) || 0
+      : RangedPtr(aOther.mPtr, aOther.mRangeStart, aOther.mRangeEnd)
+#else
+      : RangedPtr(aOther.mPtr, nullptr, nullptr)
+#endif
+  {
+  }
+
+  template <typename U>
+  MOZ_IMPLICIT RangedPtr(const RangedPtr<U>& aOther)
+#if defined(DEBUG) || 0
+      : RangedPtr(aOther.mPtr, aOther.mRangeStart, aOther.mRangeEnd)
+#else
+      : RangedPtr(aOther.mPtr, nullptr, nullptr)
+#endif
+  {
+  }
+
+  T* get() const { return mPtr; }
+
+  explicit operator bool() const { return mPtr != nullptr; }
+
+  void checkIdenticalRange(const RangedPtr<T>& aOther) const {
+    MOZ_ASSERT(mRangeStart == aOther.mRangeStart);
+    MOZ_ASSERT(mRangeEnd == aOther.mRangeEnd);
+  }
+
+  template <typename U>
+  RangedPtr<U> ReinterpretCast() const {
+#if defined(DEBUG) || 0
+    return {reinterpret_cast<U*>(mPtr), reinterpret_cast<U*>(mRangeStart),
+            reinterpret_cast<U*>(mRangeEnd)};
+#else
+    return {reinterpret_cast<U*>(mPtr), nullptr, nullptr};
+#endif
+  }
+
+  RangedPtr<T>& operator=(const RangedPtr<T>& aOther) {
+    checkIdenticalRange(aOther);
+    mPtr = aOther.mPtr;
+    checkSanity();
+    return *this;
+  }
+
+  RangedPtr<T> operator+(size_t aInc) const {
+    MOZ_ASSERT(aInc <= size_t(-1) / sizeof(T));
+    MOZ_ASSERT(asUintptr() + aInc * sizeof(T) >= asUintptr());
+    return create(mPtr + aInc);
+  }
+
+  RangedPtr<T> operator-(size_t aDec) const {
+    MOZ_ASSERT(aDec <= size_t(-1) / sizeof(T));
+    MOZ_ASSERT(asUintptr() - aDec * sizeof(T) <= asUintptr());
+    return create(mPtr - aDec);
+  }
+
+  template <typename U>
+  RangedPtr<T>& operator=(U* aPtr) {
+    *this = create(aPtr);
+    return *this;
+  }
+
+  template <typename U>
+  RangedPtr<T>& operator=(const RangedPtr<U>& aPtr) {
+    MOZ_ASSERT(mRangeStart <= aPtr.mPtr);
+    MOZ_ASSERT(aPtr.mPtr <= mRangeEnd);
+    mPtr = aPtr.mPtr;
+    checkSanity();
+    return *this;
+  }
+
+  RangedPtr<T>& operator++() { return (*this += 1); }
+
+  RangedPtr<T> operator++(int) {
+    RangedPtr<T> rcp = *this;
+    ++*this;
+    return rcp;
+  }
+
+  RangedPtr<T>& operator--() { return (*this -= 1); }
+
+  RangedPtr<T> operator--(int) {
+    RangedPtr<T> rcp = *this;
+    --*this;
+    return rcp;
+  }
+
+  RangedPtr<T>& operator+=(size_t aInc) {
+    *this = *this + aInc;
+    return *this;
+  }
+
+  RangedPtr<T>& operator-=(size_t aDec) {
+    *this = *this - aDec;
+    return *this;
+  }
+
+  T& operator[](ptrdiff_t aIndex) const {
+    MOZ_ASSERT(size_t(aIndex > 0 ? aIndex : -aIndex) <=
+                                size_t(-1) / sizeof(T));
+    return *create(mPtr + aIndex);
+  }
+
+  T& operator*() const {
+    MOZ_ASSERT(mPtr >= mRangeStart);
+    MOZ_ASSERT(mPtr < mRangeEnd);
+    return *mPtr;
+  }
+
+  T* operator->() const {
+    MOZ_ASSERT(mPtr >= mRangeStart);
+    MOZ_ASSERT(mPtr < mRangeEnd);
+    return mPtr;
+  }
+
+  template <typename U>
+  bool operator==(const RangedPtr<U>& aOther) const {
+    return mPtr == aOther.mPtr;
+  }
+  template <typename U>
+  bool operator!=(const RangedPtr<U>& aOther) const {
+    return !(*this == aOther);
+  }
+
+  template <typename U>
+  bool operator==(const U* u) const {
+    return mPtr == u;
+  }
+  template <typename U>
+  bool operator!=(const U* u) const {
+    return !(*this == u);
+  }
+
+  bool operator==(std::nullptr_t) const { return mPtr == nullptr; }
+  bool operator!=(std::nullptr_t) const { return mPtr != nullptr; }
+
+  template <typename U>
+  bool operator<(const RangedPtr<U>& aOther) const {
+    return mPtr < aOther.mPtr;
+  }
+  template <typename U>
+  bool operator<=(const RangedPtr<U>& aOther) const {
+    return mPtr <= aOther.mPtr;
+  }
+
+  template <typename U>
+  bool operator>(const RangedPtr<U>& aOther) const {
+    return mPtr > aOther.mPtr;
+  }
+  template <typename U>
+  bool operator>=(const RangedPtr<U>& aOther) const {
+    return mPtr >= aOther.mPtr;
+  }
+
+  size_t operator-(const RangedPtr<T>& aOther) const {
+    MOZ_ASSERT(mPtr >= aOther.mPtr);
+    return PointerRangeSize(aOther.mPtr, mPtr);
+  }
+
+ private:
+  RangedPtr() = delete;
+};
+
+} 
+
+#endif

@@ -1,0 +1,60 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "WebBrowserPersistResourcesChild.h"
+
+#include "WebBrowserPersistDocumentChild.h"
+#include "mozilla/dom/PContentChild.h"
+
+namespace mozilla {
+
+NS_IMPL_ISUPPORTS(WebBrowserPersistResourcesChild,
+                  nsIWebBrowserPersistResourceVisitor)
+
+WebBrowserPersistResourcesChild::WebBrowserPersistResourcesChild() = default;
+
+WebBrowserPersistResourcesChild::~WebBrowserPersistResourcesChild() = default;
+
+NS_IMETHODIMP
+WebBrowserPersistResourcesChild::VisitResource(
+    nsIWebBrowserPersistDocument* aDocument, const nsACString& aURI,
+    nsContentPolicyType aContentPolicyType) {
+  nsCString copiedURI(aURI);  
+  SendVisitResource(copiedURI, aContentPolicyType);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+WebBrowserPersistResourcesChild::VisitDocument(
+    nsIWebBrowserPersistDocument* aDocument,
+    nsIWebBrowserPersistDocument* aSubDocument) {
+  RefPtr<WebBrowserPersistDocumentChild> subActor =
+      new WebBrowserPersistDocumentChild();
+  if (!Manager()->Manager()->SendPWebBrowserPersistDocumentConstructor(
+          subActor, nullptr, nullptr)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  SendVisitDocument(WrapNotNull(subActor));
+  subActor->Start(aSubDocument);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+WebBrowserPersistResourcesChild::VisitBrowsingContext(
+    nsIWebBrowserPersistDocument* aDocument,
+    dom::BrowsingContext* aBrowsingContext) {
+  SendVisitBrowsingContext(aBrowsingContext);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+WebBrowserPersistResourcesChild::EndVisit(
+    nsIWebBrowserPersistDocument* aDocument, nsresult aStatus) {
+  Send__delete__(this, aStatus);
+  return NS_OK;
+}
+
+}  

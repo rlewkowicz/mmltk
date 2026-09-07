@@ -1,0 +1,67 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsWindowMemoryReporter_h_
+#define nsWindowMemoryReporter_h_
+
+#include "mozilla/TimeStamp.h"
+#include "nsIMemoryReporter.h"
+#include "nsIObserver.h"
+#include "nsITimer.h"
+#include "nsTHashMap.h"
+#include "nsTHashSet.h"
+#include "nsWeakReference.h"
+
+class nsGlobalWindowInner;
+
+class nsWindowMemoryReporter final : public nsIMemoryReporter,
+                                     public nsIObserver,
+                                     public nsSupportsWeakReference {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIMEMORYREPORTER
+  NS_DECL_NSIOBSERVER
+
+  static void Init();
+
+#ifdef DEBUG
+  static void UnlinkGhostWindows();
+#endif
+
+  static nsWindowMemoryReporter* Get();
+  void ObserveDOMWindowDetached(nsGlobalWindowInner* aWindow);
+
+  static int64_t GhostWindowsDistinguishedAmount();
+
+ private:
+  ~nsWindowMemoryReporter();
+
+  nsWindowMemoryReporter();
+
+  uint32_t GetGhostTimeout();
+
+  void ObserveAfterMinimizeMemoryUsage();
+
+  void CheckForGhostWindows(nsTHashSet<uint64_t>* aOutGhostIDs = nullptr);
+
+  void AsyncCheckForGhostWindows();
+
+  void KillCheckTimer();
+
+  static void CheckTimerFired(nsITimer* aTimer, void* aClosure);
+
+  nsTHashMap<nsISupportsHashKey, mozilla::TimeStamp> mDetachedWindows;
+
+  mozilla::TimeStamp mLastCheckForGhostWindows;
+
+  nsCOMPtr<nsITimer> mCheckTimer;
+
+  bool mCycleCollectorIsRunning;
+
+  bool mCheckTimerWaitingForCCEnd;
+
+  int64_t mGhostWindowCount;
+};
+
+#endif  // nsWindowMemoryReporter_h_

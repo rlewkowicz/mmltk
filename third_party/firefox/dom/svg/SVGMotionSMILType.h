@@ -1,0 +1,55 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef DOM_SVG_SVGMOTIONSMILTYPE_H_
+#define DOM_SVG_SVGMOTIONSMILTYPE_H_
+
+#include "mozilla/SMILType.h"
+#include "mozilla/gfx/2D.h"
+
+namespace mozilla {
+
+class SMILValue;
+
+enum class RotateType : uint8_t {
+  Explicit,    
+  Auto,        
+  AutoReverse  
+};
+
+class SVGMotionSMILType : public SMILType {
+  using Path = mozilla::gfx::Path;
+
+ public:
+  static SVGMotionSMILType sSingleton;
+
+ protected:
+  void InitValue(SMILValue& aValue) const override;
+  void DestroyValue(SMILValue& aValue) const override;
+  nsresult Assign(SMILValue& aDest, const SMILValue& aSrc) const override;
+  bool IsEqual(const SMILValue& aLeft, const SMILValue& aRight) const override;
+  nsresult Add(SMILValue& aDest, const SMILValue& aValueToAdd,
+               uint32_t aCount) const override;
+  nsresult SandwichAdd(SMILValue& aDest,
+                       const SMILValue& aValueToAdd) const override;
+  nsresult ComputeDistance(const SMILValue& aFrom, const SMILValue& aTo,
+                           double& aDistance) const override;
+  nsresult Interpolate(const SMILValue& aStartVal, const SMILValue& aEndVal,
+                       double aUnitDistance, SMILValue& aResult) const override;
+
+ public:
+  static gfx::Matrix CreateMatrix(const SMILValue& aSMILVal);
+
+  static SMILValue ConstructSMILValue(Path* aPath, float aDist,
+                                      RotateType aRotateType,
+                                      float aRotateAngle);
+
+ private:
+  constexpr SVGMotionSMILType() = default;
+};
+
+}  
+
+#endif  // DOM_SVG_SVGMOTIONSMILTYPE_H_

@@ -1,0 +1,145 @@
+/*
+ * Copyright 2018 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkMaskFilterBase_DEFINED)
+#define SkMaskFilterBase_DEFINED
+
+#include "include/core/SkFlattenable.h"
+#include "include/core/SkMaskFilter.h"
+#include "include/core/SkPoint.h"
+#include "include/core/SkRect.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkScalar.h"
+#include "include/core/SkSpan.h"
+#include "include/core/SkStrokeRec.h"
+#include "include/private/base/SkNoncopyable.h"
+#include "src/core/SkMask.h"
+
+#include <optional>
+#include <utility>
+
+class SkPaint;
+class SkBlitter;
+class SkImageFilter;
+class SkCachedData;
+class SkMatrix;
+class SkResourceCache;
+struct SkPathRaw;
+class SkRRect;
+class SkRasterClip;
+enum SkBlurStyle : int;
+
+namespace skcpu {
+class Draw;
+}
+
+class SkMaskFilterBase : public SkMaskFilter {
+public:
+    virtual SkMask::Format getFormat() const = 0;
+
+    virtual bool filterMask(SkMaskBuilder* dst, const SkMask& src, const SkMatrix&,
+                            SkIPoint* margin) const = 0;
+
+    enum class Type {
+        kBlur,
+        kEmboss,
+        kSDF,
+        kShader,
+        kTable,
+    };
+
+    virtual Type type() const = 0;
+
+    virtual void computeFastBounds(const SkRect& src, SkRect* dest) const;
+
+    struct BlurRec {
+        SkScalar        fSigma;
+        SkBlurStyle     fStyle;
+    };
+    virtual bool asABlur(BlurRec*) const;
+
+    virtual std::pair<sk_sp<SkImageFilter>, bool> asImageFilter(const SkMatrix& ctm,
+                                                                const SkPaint& paint) const;
+
+    static SkFlattenable::Type GetFlattenableType() {
+        return kSkMaskFilter_Type;
+    }
+
+    SkFlattenable::Type getFlattenableType() const override {
+        return kSkMaskFilter_Type;
+    }
+
+protected:
+    SkMaskFilterBase() {}
+
+    enum class FilterReturn {
+        kFalse,
+        kTrue,
+        kUnimplemented,
+    };
+
+    class NinePatch final : ::SkNoncopyable {
+    public:
+        NinePatch(const SkMask& mask, SkIRect outerRect, SkIPoint center, SkCachedData* cache)
+            : fMask(mask), fOuterRect(outerRect), fCenter(center), fCache(cache) {}
+        NinePatch(NinePatch&&) = delete;  
+        ~NinePatch();
+
+        SkMask      fMask;      
+        SkIRect     fOuterRect; 
+        SkIPoint    fCenter;    
+        SkCachedData* fCache = nullptr;
+    };
+
+    virtual FilterReturn filterRectsToNine(SkSpan<const SkRect>,
+                                           const SkMatrix&,
+                                           const SkIRect& clipBounds,
+                                           std::optional<NinePatch>*,
+                                           SkResourceCache*) const;
+    virtual std::optional<NinePatch> filterRRectToNine(const SkRRect&,
+                                                       const SkMatrix&,
+                                                       const SkIRect& clipBounds,
+                                                       SkResourceCache*) const;
+
+private:
+    friend class skcpu::Draw;
+
+    bool filterPath(const SkPathRaw& devRaw,
+                    const SkMatrix& ctm,
+                    const SkRasterClip&,
+                    SkBlitter*,
+                    SkStrokeRec::InitStyle,
+                    SkResourceCache*) const;
+
+    bool filterRRect(const SkRRect& devRRect,
+                     const SkMatrix& ctm,
+                     const SkRasterClip&,
+                     SkBlitter*,
+                     SkResourceCache*) const;
+
+    FilterReturn filterRects(SkSpan<const SkRect> devRects,
+                     const SkMatrix& ctm,
+                     const SkRasterClip& clip,
+                     SkBlitter* blitter,
+                     SkResourceCache* cache) const;
+};
+
+inline SkMaskFilterBase* as_MFB(SkMaskFilter* mf) {
+    return static_cast<SkMaskFilterBase*>(mf);
+}
+
+inline const SkMaskFilterBase* as_MFB(const SkMaskFilter* mf) {
+    return static_cast<const SkMaskFilterBase*>(mf);
+}
+
+inline const SkMaskFilterBase* as_MFB(const sk_sp<SkMaskFilter>& mf) {
+    return static_cast<SkMaskFilterBase*>(mf.get());
+}
+
+extern void sk_register_blur_maskfilter_createproc();
+
+#endif

@@ -1,0 +1,262 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_places_SQLFunctions_h_
+#define mozilla_places_SQLFunctions_h_
+
+
+#include "mozIStorageFunction.h"
+
+class mozIStorageConnection;
+
+namespace mozilla {
+namespace places {
+
+
+class MatchAutoCompleteFunction final : public mozIStorageFunction {
+ public:
+  MatchAutoCompleteFunction();
+
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_MOZISTORAGEFUNCTION
+
+  static nsresult create(mozIStorageConnection* aDBConn);
+
+ private:
+  ~MatchAutoCompleteFunction() = default;
+
+  nsCOMPtr<nsIVariant> mCachedZero;
+  nsCOMPtr<nsIVariant> mCachedOne;
+
+  static const uint32_t kArgSearchString = 0;
+  static const uint32_t kArgIndexURL = 1;
+  static const uint32_t kArgIndexTitle = 2;
+  static const uint32_t kArgIndexTags = 3;
+  static const uint32_t kArgIndexVisitCount = 4;
+  static const uint32_t kArgIndexTyped = 5;
+  static const uint32_t kArgIndexBookmark = 6;
+  static const uint32_t kArgIndexOpenPageCount = 7;
+  static const uint32_t kArgIndexMatchBehavior = 8;
+  static const uint32_t kArgIndexSearchBehavior = 9;
+  static const uint32_t kArgIndexFallbackTitle = 10;
+  static const uint32_t kArgIndexLength = 11;
+
+  typedef bool (*searchFunctionPtr)(const nsDependentCSubstring& aToken,
+                                    const nsACString& aSourceString);
+
+  typedef nsACString::const_char_iterator const_char_iterator;
+
+  static searchFunctionPtr getSearchFunction(int32_t aBehavior);
+
+  static bool findBeginning(const nsDependentCSubstring& aToken,
+                            const nsACString& aSourceString);
+
+  static bool findBeginningCaseSensitive(const nsDependentCSubstring& aToken,
+                                         const nsACString& aSourceString);
+
+  static bool findAnywhere(const nsDependentCSubstring& aToken,
+                           const nsACString& aSourceString);
+
+  static bool findOnBoundary(const nsDependentCSubstring& aToken,
+                             const nsACString& aSourceString);
+
+  static nsDependentCSubstring fixupURISpec(const nsACString& aURISpec,
+                                            int32_t aMatchBehavior,
+                                            nsACString& aSpecBuf);
+};
+
+
+class CalculateFrecencyFunction final : public mozIStorageFunction {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_MOZISTORAGEFUNCTION
+
+  static nsresult create(mozIStorageConnection* aDBConn);
+
+ private:
+  ~CalculateFrecencyFunction() = default;
+};
+
+
+class CalculateAltFrecencyFunction final : public mozIStorageFunction {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_MOZISTORAGEFUNCTION
+
+  static nsresult create(mozIStorageConnection* aDBConn);
+
+ private:
+  ~CalculateAltFrecencyFunction() = default;
+};
+
+class GenerateGUIDFunction final : public mozIStorageFunction {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_MOZISTORAGEFUNCTION
+
+  static nsresult create(mozIStorageConnection* aDBConn);
+
+ private:
+  ~GenerateGUIDFunction() = default;
+};
+
+class IsValidGUIDFunction final : public mozIStorageFunction {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_MOZISTORAGEFUNCTION
+
+  static nsresult create(mozIStorageConnection* aDBConn);
+
+ private:
+  ~IsValidGUIDFunction() = default;
+};
+
+class GetUnreversedHostFunction final : public mozIStorageFunction {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_MOZISTORAGEFUNCTION
+
+  static nsresult create(mozIStorageConnection* aDBConn);
+
+ private:
+  ~GetUnreversedHostFunction() = default;
+};
+
+
+class FixupURLFunction final : public mozIStorageFunction {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_MOZISTORAGEFUNCTION
+
+  static nsresult create(mozIStorageConnection* aDBConn);
+
+ private:
+  ~FixupURLFunction() = default;
+};
+
+
+class StoreLastInsertedIdFunction final : public mozIStorageFunction {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_MOZISTORAGEFUNCTION
+
+  static nsresult create(mozIStorageConnection* aDBConn);
+
+ private:
+  ~StoreLastInsertedIdFunction() = default;
+};
+
+
+class HashFunction final : public mozIStorageFunction {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_MOZISTORAGEFUNCTION
+
+  static nsresult create(mozIStorageConnection* aDBConn);
+
+ private:
+  ~HashFunction() = default;
+};
+
+
+class SHA256HexFunction final : public mozIStorageFunction {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_MOZISTORAGEFUNCTION
+
+  static nsresult create(mozIStorageConnection* aDBConn);
+
+ private:
+  ~SHA256HexFunction() = default;
+};
+
+
+class GetQueryParamFunction final : public mozIStorageFunction {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_MOZISTORAGEFUNCTION
+
+  static nsresult create(mozIStorageConnection* aDBConn);
+
+ private:
+  ~GetQueryParamFunction() = default;
+};
+
+
+class GetPrefixFunction final : public mozIStorageFunction {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_MOZISTORAGEFUNCTION
+
+  static nsresult create(mozIStorageConnection* aDBConn);
+
+ private:
+  ~GetPrefixFunction() = default;
+};
+
+
+class GetHostAndPortFunction final : public mozIStorageFunction {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_MOZISTORAGEFUNCTION
+
+  static nsresult create(mozIStorageConnection* aDBConn);
+
+ private:
+  ~GetHostAndPortFunction() = default;
+};
+
+
+class StripPrefixAndUserinfoFunction final : public mozIStorageFunction {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_MOZISTORAGEFUNCTION
+
+  static nsresult create(mozIStorageConnection* aDBConn);
+
+ private:
+  ~StripPrefixAndUserinfoFunction() = default;
+};
+
+
+class SetShouldStartFrecencyRecalculationFunction final
+    : public mozIStorageFunction {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_MOZISTORAGEFUNCTION
+
+  static nsresult create(mozIStorageConnection* aDBConn);
+
+ private:
+  ~SetShouldStartFrecencyRecalculationFunction() = default;
+};
+
+
+class InvalidateDaysOfHistoryFunction final : public mozIStorageFunction {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_MOZISTORAGEFUNCTION
+
+  static nsresult create(mozIStorageConnection* aDBConn);
+
+ private:
+  ~InvalidateDaysOfHistoryFunction() = default;
+};
+
+
+class TargetFolderGuidFunction final : public mozIStorageFunction {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_MOZISTORAGEFUNCTION
+
+  static nsresult create(mozIStorageConnection* aDBConn);
+
+ private:
+  ~TargetFolderGuidFunction() = default;
+};
+
+}  
+}  
+
+#endif  // mozilla_places_SQLFunctions_h_

@@ -1,0 +1,415 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#include "DriverCrashGuard.h"
+#include "gfxEnv.h"
+#include "gfxConfig.h"
+#include "nsAppDirectoryServiceDefs.h"
+#include "nsDirectoryServiceUtils.h"
+#include "nsServiceManagerUtils.h"
+#include "nsString.h"
+#include "nsXULAppAPI.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/StaticPrefs_gfx.h"
+#include "mozilla/StaticPrefs_webgl.h"
+#include "mozilla/Components.h"
+#include "mozilla/gfx/Logging.h"
+#include "mozilla/dom/ContentChild.h"
+
+namespace mozilla {
+namespace gfx {
+
+static const size_t NUM_CRASH_GUARD_TYPES = size_t(CrashGuardType::NUM_TYPES);
+static const char* sCrashGuardNames[] = {
+    "d3d11layers",
+    "glcontext",
+    "wmfvpxvideo",
+};
+static_assert(std::size(sCrashGuardNames) == NUM_CRASH_GUARD_TYPES,
+              "CrashGuardType updated without a name string");
+
+static inline void BuildCrashGuardPrefName(CrashGuardType aType,
+                                           nsCString& aOutPrefName) {
+  MOZ_ASSERT(aType < CrashGuardType::NUM_TYPES);
+  MOZ_ASSERT(sCrashGuardNames[size_t(aType)]);
+
+  aOutPrefName.AssignLiteral("gfx.crash-guard.status.");
+  aOutPrefName.Append(sCrashGuardNames[size_t(aType)]);
+}
+
+DriverCrashGuard::DriverCrashGuard(CrashGuardType aType,
+                                   dom::ContentParent* aContentParent)
+    : mType(aType),
+      mMode(aContentParent ? Mode::Proxy : Mode::Normal),
+      mInitialized(false),
+      mGuardActivated(false),
+      mCrashDetected(false) {
+  BuildCrashGuardPrefName(aType, mStatusPref);
+}
+
+void DriverCrashGuard::InitializeIfNeeded() {
+  if (mInitialized) {
+    return;
+  }
+
+  mInitialized = true;
+  Initialize();
+}
+
+static inline bool AreCrashGuardsEnabled(CrashGuardType aType) {
+  if (XRE_IsGPUProcess() || XRE_IsRDDProcess()) {
+    return false;
+  }
+#if defined(NIGHTLY_BUILD)
+  if (aType != CrashGuardType::WMFVPXVideo) {
+    return gfxEnv::MOZ_FORCE_CRASH_GUARD_NIGHTLY();
+  }
+#endif
+  return !gfxEnv::MOZ_DISABLE_CRASH_GUARD();
+}
+
+void DriverCrashGuard::Initialize() {
+  if (!AreCrashGuardsEnabled(mType)) {
+    return;
+  }
+
+  if (!NS_IsMainThread()) {
+    return;
+  }
+
+  mGfxInfo = components::GfxInfo::Service();
+
+  if (XRE_IsContentProcess()) {
+    dom::ContentChild* cc = dom::ContentChild::GetSingleton();
+    cc->SendBeginDriverCrashGuard(mType, &mCrashDetected);
+    if (mCrashDetected) {
+      LogFeatureDisabled();
+      return;
+    }
+
+    ActivateGuard();
+    return;
+  }
+
+  if (RecoverFromCrash()) {
+    mCrashDetected = true;
+    return;
+  }
+
+  if (CheckOrRefreshEnvironment() ||
+      (mMode == Mode::Proxy && GetStatus() != DriverInitStatus::Crashed)) {
+    ActivateGuard();
+    return;
+  }
+
+  if (GetStatus() == DriverInitStatus::Crashed) {
+    mCrashDetected = true;
+    LogFeatureDisabled();
+  }
+}
+
+DriverCrashGuard::~DriverCrashGuard() {
+  if (!mGuardActivated) {
+    return;
+  }
+
+  if (XRE_IsParentProcess()) {
+    if (mGuardFile) {
+      mGuardFile->Remove(false);
+    }
+
+    if (GetStatus() != DriverInitStatus::Crashed) {
+      SetStatus(DriverInitStatus::Okay);
+    }
+  } else {
+    dom::ContentChild::GetSingleton()->SendEndDriverCrashGuard(mType);
+  }
+
+}
+
+bool DriverCrashGuard::Crashed() {
+  InitializeIfNeeded();
+
+  return mCrashDetected;
+}
+
+nsCOMPtr<nsIFile> DriverCrashGuard::GetGuardFile() {
+  MOZ_ASSERT(XRE_IsParentProcess());
+
+  nsCString filename;
+  filename.Assign(sCrashGuardNames[size_t(mType)]);
+  filename.AppendLiteral(".guard");
+
+  nsCOMPtr<nsIFile> file;
+  NS_GetSpecialDirectory(NS_APP_USER_PROFILE_LOCAL_50_DIR,
+                         getter_AddRefs(file));
+  if (!file) {
+    return nullptr;
+  }
+  if (!NS_SUCCEEDED(file->AppendNative(filename))) {
+    return nullptr;
+  }
+  return file;
+}
+
+void DriverCrashGuard::ActivateGuard() {
+  mGuardActivated = true;
+
+  if (XRE_IsContentProcess()) {
+    return;
+  }
+
+  SetStatus(DriverInitStatus::Attempting);
+
+  if (mMode != Mode::Proxy) {
+    FlushPreferences();
+
+    FILE* fp = nullptr;
+    mGuardFile = GetGuardFile();
+    if (!mGuardFile || !NS_SUCCEEDED(mGuardFile->OpenANSIFileDesc("w", &fp))) {
+      return;
+    }
+    fclose(fp);
+  }
+}
+
+void DriverCrashGuard::NotifyCrashed() {
+  SetStatus(DriverInitStatus::Crashed);
+  FlushPreferences();
+  LogCrashRecovery();
+}
+
+bool DriverCrashGuard::RecoverFromCrash() {
+  MOZ_ASSERT(XRE_IsParentProcess());
+
+  nsCOMPtr<nsIFile> file = GetGuardFile();
+  bool exists;
+  if ((file && NS_SUCCEEDED(file->Exists(&exists)) && exists) ||
+      (GetStatus() == DriverInitStatus::Attempting)) {
+    if (file) {
+      file->Remove(false);
+    }
+    NotifyCrashed();
+    return true;
+  }
+  return false;
+}
+
+bool DriverCrashGuard::CheckOrRefreshEnvironment() {
+  static bool sBaseInfoChanged[NUM_CRASH_GUARD_TYPES];
+  static bool sBaseInfoChecked[NUM_CRASH_GUARD_TYPES];
+
+  const uint32_t type = uint32_t(mType);
+  if (!sBaseInfoChecked[type]) {
+    sBaseInfoChecked[type] = true;
+    sBaseInfoChanged[type] = UpdateBaseEnvironment();
+  }
+
+  bool result = UpdateEnvironment() || sBaseInfoChanged[type] ||
+                GetStatus() == DriverInitStatus::Unknown;
+  sBaseInfoChanged[type] = false;
+  return result;
+}
+
+bool DriverCrashGuard::UpdateBaseEnvironment() {
+  bool changed = false;
+  if (mGfxInfo) {
+    nsString value;
+
+    mGfxInfo->GetAdapterDriverVersion(value);
+    changed |= CheckAndUpdatePref("driverVersion", value);
+    mGfxInfo->GetAdapterDeviceID(value);
+    changed |= CheckAndUpdatePref("deviceID", value);
+  }
+
+  changed |= CheckAndUpdatePref(
+      "appVersion", NS_LITERAL_STRING_FROM_CSTRING(MOZ_APP_VERSION));
+
+  return changed;
+}
+
+bool DriverCrashGuard::FeatureEnabled(int aFeature, bool aDefault) {
+  if (!mGfxInfo) {
+    return aDefault;
+  }
+  int32_t status;
+  nsCString discardFailureId;
+  if (!NS_SUCCEEDED(
+          mGfxInfo->GetFeatureStatus(aFeature, discardFailureId, &status))) {
+    return false;
+  }
+  return status == nsIGfxInfo::FEATURE_STATUS_OK;
+}
+
+bool DriverCrashGuard::CheckAndUpdateBoolPref(const char* aPrefName,
+                                              bool aCurrentValue) {
+  std::string pref = GetFullPrefName(aPrefName);
+
+  bool oldValue;
+  if (NS_SUCCEEDED(Preferences::GetBool(pref.c_str(), &oldValue)) &&
+      oldValue == aCurrentValue) {
+    return false;
+  }
+  Preferences::SetBool(pref.c_str(), aCurrentValue);
+  return true;
+}
+
+bool DriverCrashGuard::CheckAndUpdatePref(const char* aPrefName,
+                                          const nsAString& aCurrentValue) {
+  std::string pref = GetFullPrefName(aPrefName);
+
+  nsAutoString oldValue;
+  Preferences::GetString(pref.c_str(), oldValue);
+  if (oldValue == aCurrentValue) {
+    return false;
+  }
+  Preferences::SetString(pref.c_str(), aCurrentValue);
+  return true;
+}
+
+std::string DriverCrashGuard::GetFullPrefName(const char* aPref) {
+  return std::string("gfx.crash-guard.") +
+         std::string(sCrashGuardNames[uint32_t(mType)]) + std::string(".") +
+         std::string(aPref);
+}
+
+DriverInitStatus DriverCrashGuard::GetStatus() const {
+  return (DriverInitStatus)Preferences::GetInt(mStatusPref.get(), 0);
+}
+
+void DriverCrashGuard::SetStatus(DriverInitStatus aStatus) {
+  MOZ_ASSERT(XRE_IsParentProcess());
+
+  Preferences::SetInt(mStatusPref.get(), int32_t(aStatus));
+}
+
+void DriverCrashGuard::FlushPreferences() {
+  MOZ_ASSERT(XRE_IsParentProcess());
+
+  if (nsIPrefService* prefService = Preferences::GetService()) {
+    static_cast<Preferences*>(prefService)->SavePrefFileBlocking();
+  }
+}
+
+void DriverCrashGuard::ForEachActiveCrashGuard(
+    const CrashGuardCallback& aCallback) {
+  for (size_t i = 0; i < NUM_CRASH_GUARD_TYPES; i++) {
+    CrashGuardType type = static_cast<CrashGuardType>(i);
+
+    if (!AreCrashGuardsEnabled(type)) {
+      continue;
+    }
+
+    nsCString prefName;
+    BuildCrashGuardPrefName(type, prefName);
+
+    auto status =
+        static_cast<DriverInitStatus>(Preferences::GetInt(prefName.get(), 0));
+    if (status != DriverInitStatus::Crashed) {
+      continue;
+    }
+
+    aCallback(sCrashGuardNames[i], prefName.get());
+  }
+}
+
+D3D11LayersCrashGuard::D3D11LayersCrashGuard(dom::ContentParent* aContentParent)
+    : DriverCrashGuard(CrashGuardType::D3D11Layers, aContentParent) {}
+
+void D3D11LayersCrashGuard::Initialize() {
+  if (!XRE_IsParentProcess()) {
+    return;
+  }
+
+  DriverCrashGuard::Initialize();
+
+  RecordTelemetry(TelemetryState::Okay);
+}
+
+bool D3D11LayersCrashGuard::UpdateEnvironment() {
+  static bool checked = false;
+
+  if (checked) {
+    return false;
+  }
+
+  checked = true;
+
+  bool changed = false;
+
+  return changed;
+}
+
+void D3D11LayersCrashGuard::LogCrashRecovery() {
+  RecordTelemetry(TelemetryState::RecoveredFromCrash);
+  gfxCriticalNote << "D3D11 layers just crashed; D3D11 will be disabled.";
+}
+
+void D3D11LayersCrashGuard::LogFeatureDisabled() {
+  RecordTelemetry(TelemetryState::FeatureDisabled);
+  gfxCriticalNote << "D3D11 layers disabled due to a prior crash.";
+}
+
+void D3D11LayersCrashGuard::RecordTelemetry(TelemetryState aState) {
+  if (!XRE_IsParentProcess()) {
+    return;
+  }
+
+  static bool sTelemetryStateRecorded = false;
+  if (sTelemetryStateRecorded) {
+    return;
+  }
+
+
+  sTelemetryStateRecorded = true;
+}
+
+GLContextCrashGuard::GLContextCrashGuard(dom::ContentParent* aContentParent)
+    : DriverCrashGuard(CrashGuardType::GLContext, aContentParent) {}
+
+void GLContextCrashGuard::Initialize() {
+  if (XRE_IsContentProcess()) {
+    return;
+  }
+
+  DriverCrashGuard::Initialize();
+}
+
+bool GLContextCrashGuard::UpdateEnvironment() {
+  static bool checked = false;
+
+  if (checked) {
+    return false;
+  }
+
+  checked = true;
+
+  bool changed = false;
+
+
+  return changed;
+}
+
+void GLContextCrashGuard::LogCrashRecovery() {
+  gfxCriticalNote << "GLContext just crashed.";
+}
+
+void GLContextCrashGuard::LogFeatureDisabled() {
+  gfxCriticalNote << "GLContext remains enabled despite a previous crash.";
+}
+
+WMFVPXVideoCrashGuard::WMFVPXVideoCrashGuard(dom::ContentParent* aContentParent)
+    : DriverCrashGuard(CrashGuardType::WMFVPXVideo, aContentParent) {}
+
+void WMFVPXVideoCrashGuard::LogCrashRecovery() {
+  gfxCriticalNote
+      << "WMF VPX decoder just crashed; hardware video will be disabled.";
+}
+
+void WMFVPXVideoCrashGuard::LogFeatureDisabled() {
+  gfxCriticalNote
+      << "WMF VPX video decoding is disabled due to a previous crash.";
+}
+
+}  
+}  

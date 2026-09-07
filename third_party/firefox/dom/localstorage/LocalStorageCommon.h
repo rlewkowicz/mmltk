@@ -1,0 +1,59 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_localstorage_LocalStorageCommon_h
+#define mozilla_dom_localstorage_LocalStorageCommon_h
+
+#include "ErrorList.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/dom/quota/QuotaCommon.h"
+#include "nsLiteralString.h"
+#include "nsStringFwd.h"
+
+
+namespace mozilla {
+
+class LogModule;
+
+namespace ipc {
+
+class PrincipalInfo;
+
+}  
+
+namespace dom {
+
+extern const char16_t* kLocalStorageType;
+
+class MOZ_STACK_CLASS LSNotifyInfo {
+  bool mChanged;
+  nsString mOldValue;
+
+ public:
+  LSNotifyInfo() : mChanged(false) {}
+
+  bool changed() const { return mChanged; }
+
+  bool& changed() { return mChanged; }
+
+  const nsString& oldValue() const { return mOldValue; }
+
+  nsString& oldValue() { return mOldValue; }
+};
+
+bool NextGenLocalStorageEnabled();
+
+void RecvInitNextGenLocalStorageEnabled(const bool aEnabled);
+
+bool CachedNextGenLocalStorageEnabled();
+
+Result<std::pair<nsCString, nsCString>, nsresult> GenerateOriginKey2(
+    const mozilla::ipc::PrincipalInfo& aPrincipalInfo);
+
+LogModule* GetLocalStorageLogger();
+
+}  
+}  
+
+#endif  // mozilla_dom_localstorage_LocalStorageCommon_h

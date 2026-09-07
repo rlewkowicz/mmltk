@@ -1,0 +1,846 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+var PointerlockFsWarning = {
+  _element: null,
+  _origin: null,
+
+  Timeout: class {
+    constructor(func, delay) {
+      this._id = 0;
+      this._func = func;
+      this._delay = delay;
+    }
+    start() {
+      this.cancel();
+      this._id = setTimeout(() => this._handle(), this._delay);
+    }
+    cancel() {
+      if (this._id) {
+        clearTimeout(this._id);
+        this._id = 0;
+      }
+    }
+    _handle() {
+      this._id = 0;
+      this._func();
+    }
+    get delay() {
+      return this._delay;
+    }
+  },
+
+  showPointerLock(aOrigin) {
+    if (!document.fullscreen) {
+      let timeout = Services.prefs.getIntPref(
+        "pointer-lock-api.warning.timeout"
+      );
+      this.show(aOrigin, "pointerlock-warning", timeout, 0, false);
+    }
+  },
+
+  _getTimeout(keyboardLockEnabled) {
+    if (keyboardLockEnabled) {
+      return Services.prefs.getIntPref(
+        "full-screen-api.keyboardlock-warning.timeout"
+      );
+    }
+    return Services.prefs.getIntPref("full-screen-api.warning.timeout");
+  },
+
+  showFullScreen(browsingContext, keyboardLockEnabled) {
+    const origin =
+      browsingContext.top.currentWindowGlobal.documentPrincipal.originNoSuffix;
+    const timeout = this._getTimeout(keyboardLockEnabled);
+    let delay = Services.prefs.getIntPref("full-screen-api.warning.delay");
+    this.show(
+      origin,
+      "fullscreen-warning",
+      timeout,
+      delay,
+      keyboardLockEnabled
+    );
+  },
+
+  show(aOrigin, elementId, timeout, delay, keyboardLockEnabled) {
+    if (!this._element) {
+      this._element = document.getElementById(elementId);
+      this._element.addEventListener("transitionend", this);
+      this._element.addEventListener("transitioncancel", this);
+      window.addEventListener("mousemove", this, true);
+      if (timeout > 0) {
+        window.addEventListener("activate", this);
+        window.addEventListener("deactivate", this);
+      }
+      this._timeoutHide = new this.Timeout(() => {
+        window.removeEventListener("activate", this);
+        window.removeEventListener("deactivate", this);
+        this._state = "hidden";
+      }, timeout);
+      this._timeoutShow = new this.Timeout(() => {
+        this._state = "ontop";
+        this._timeoutHide.start();
+      }, delay);
+    }
+
+    if (aOrigin) {
+      this._origin = aOrigin;
+    }
+    let uri = Services.io.newURI(this._origin);
+    let host = null;
+    try {
+      host = uri.host;
+    } catch (e) {}
+    let textElem = this._element.querySelector(
+      ".pointerlockfswarning-domain-text"
+    );
+    if (!host) {
+      textElem.hidden = true;
+    } else {
+      textElem.removeAttribute("hidden");
+      let displayHost = BrowserUtils.formatURIForDisplay(uri, {
+        onlyBaseDomain: true,
+      });
+      let l10nString = {
+        "fullscreen-warning": "fullscreen-warning-domain",
+        "pointerlock-warning": "pointerlock-warning-domain",
+      }[elementId];
+      document.l10n.setAttributes(textElem, l10nString, {
+        domain: displayHost,
+      });
+    }
+
+    let buttonElement = this._element.querySelector("#fullscreen-exit-button");
+    if (buttonElement) {
+      if (AppConstants.platform == "macosx") {
+        document.l10n.setAttributes(
+          buttonElement,
+          keyboardLockEnabled
+            ? "fullscreen-keyboardlock-exit-mac-button"
+            : "fullscreen-exit-mac-button"
+        );
+      } else {
+        document.l10n.setAttributes(
+          buttonElement,
+          keyboardLockEnabled
+            ? "fullscreen-keyboardlock-exit-button"
+            : "fullscreen-exit-button"
+        );
+      }
+    }
+
+    this._element.dataset.identity =
+      gIdentityHandler.pointerlockFsWarningClassName;
+
+    if (this._timeoutHide.delay <= 0) {
+      return;
+    }
+
+    if (Services.focus.activeWindow == window) {
+      this._state = "onscreen";
+      this._timeoutHide.start();
+    }
+  },
+
+  close(elementId) {
+    if (!elementId) {
+      throw new Error("Must pass id of warning element to close");
+    }
+    if (!this._element || this._element.id != elementId) {
+      return;
+    }
+    this._timeoutHide.cancel();
+    this._timeoutShow.cancel();
+    this._state = "hidden";
+    this._doHide();
+    this._element
+      .querySelector(".pointerlockfswarning-domain-text")
+      .removeAttribute("data-l10n-id");
+    let buttonElement = this._element.querySelector("#fullscreen-exit-button");
+    if (buttonElement) {
+      buttonElement.removeAttribute("data-l10n-id");
+    }
+    this._element.removeEventListener("transitionend", this);
+    this._element.removeEventListener("transitioncancel", this);
+    window.removeEventListener("mousemove", this, true);
+    window.removeEventListener("activate", this);
+    window.removeEventListener("deactivate", this);
+    this._element = null;
+    this._timeoutHide = null;
+    this._timeoutShow = null;
+
+    gBrowser.selectedBrowser.focus();
+  },
+
+  _lastState: null,
+  _STATES: ["hidden", "ontop", "onscreen"],
+  get _state() {
+    for (let state of this._STATES) {
+      if (this._element.hasAttribute(state)) {
+        return state;
+      }
+    }
+    return "hiding";
+  },
+
+  _doHide() {
+    try {
+      this._element.hidePopover();
+    } catch (e) {}
+    this._element.hidden = true;
+  },
+
+  set _state(newState) {
+    let currentState = this._state;
+    if (currentState == newState) {
+      return;
+    }
+    if (currentState != "hiding") {
+      this._lastState = currentState;
+      this._element.removeAttribute(currentState);
+    }
+    if (currentState == "hidden") {
+      this._element.showPopover();
+    }
+    if (newState != "hidden") {
+      this._element.setAttribute(newState, "");
+    }
+  },
+
+  handleEvent(event) {
+    switch (event.type) {
+      case "mousemove": {
+        let state = this._state;
+        if (state == "hidden") {
+          if (event.clientY != 0) {
+            this._timeoutShow.cancel();
+          } else if (this._timeoutShow.delay >= 0) {
+            this._timeoutShow.start();
+          }
+        } else if (state != "onscreen") {
+          let elemRect = this._element.getBoundingClientRect();
+          if (state == "hiding" && this._lastState != "hidden") {
+            if (event.clientY <= elemRect.bottom + 50) {
+              this._state = this._lastState;
+              this._timeoutHide.start();
+            }
+          } else if (state == "ontop" || this._lastState != "hidden") {
+            if (event.clientY > elemRect.bottom + 50) {
+              this._state = "hidden";
+              this._timeoutHide.cancel();
+            }
+          }
+        }
+        break;
+      }
+      case "transitionend":
+      case "transitioncancel": {
+        if (this._state == "hiding") {
+          this._doHide();
+        }
+        if (this._state == "onscreen") {
+          window.dispatchEvent(new CustomEvent("FullscreenWarningOnScreen"));
+        }
+        break;
+      }
+      case "activate": {
+        this._state = "onscreen";
+        this._timeoutHide.start();
+        break;
+      }
+      case "deactivate": {
+        this._state = "hidden";
+        this._timeoutHide.cancel();
+        break;
+      }
+    }
+  },
+};
+
+var PointerLock = {
+  _isActive: false,
+
+  get isActive() {
+    return this._isActive;
+  },
+
+  entered(originNoSuffix) {
+    this._isActive = true;
+    Services.obs.notifyObservers(null, "pointer-lock-entered");
+    PointerlockFsWarning.showPointerLock(originNoSuffix);
+  },
+
+  exited() {
+    this._isActive = false;
+    PointerlockFsWarning.close("pointerlock-warning");
+  },
+};
+
+var FullScreen = {
+  init() {
+    XPCOMUtils.defineLazyPreferenceGetter(
+      this,
+      "permissionsFullScreenAllowed",
+      "permissions.fullscreen.allowed"
+    );
+
+    let notificationExitButton = document.getElementById(
+      "fullscreen-exit-button"
+    );
+    notificationExitButton.addEventListener("click", this.exitDomFullScreen);
+
+    addEventListener("fullscreen", this, true);
+
+    addEventListener("willenterfullscreen", this, true);
+    addEventListener("willexitfullscreen", this, true);
+    addEventListener("MacFullscreenMenubarRevealUpdate", this, true);
+
+    if (window.fullScreen) {
+      this.toggle();
+    }
+  },
+
+  uninit() {
+    this.cleanup();
+  },
+
+  willToggle(aWillEnterFullscreen) {
+    if (aWillEnterFullscreen) {
+      document.documentElement.setAttribute("inFullscreen", true);
+    } else {
+      document.documentElement.removeAttribute("inFullscreen");
+    }
+  },
+
+  get fullScreenToggler() {
+    delete this.fullScreenToggler;
+    return (this.fullScreenToggler =
+      document.getElementById("fullscr-toggler"));
+  },
+
+  toggle() {
+    var enterFS = window.fullScreen;
+
+    let fullscreenCommand = document.getElementById("View:FullScreen");
+    fullscreenCommand.toggleAttribute("checked", enterFS);
+
+    if (AppConstants.platform == "macosx") {
+      document.getElementById("enterFullScreenItem").hidden = enterFS;
+      document.getElementById("exitFullScreenItem").hidden = !enterFS;
+      this.shiftMacToolbarDown(0);
+    }
+
+    let fstoggler = this.fullScreenToggler;
+    fstoggler.addEventListener("mouseover", this._expandCallback);
+    fstoggler.addEventListener("dragenter", this._expandCallback);
+    fstoggler.addEventListener("touchmove", this._expandCallback, {
+      passive: true,
+    });
+
+    document.documentElement.toggleAttribute("inFullscreen", enterFS);
+    document.documentElement.toggleAttribute(
+      "macOSNativeFullscreen",
+      enterFS &&
+        AppConstants.platform == "macosx" &&
+        (Services.prefs.getBoolPref(
+          "full-screen-api.macos-native-full-screen"
+        ) ||
+          !document.fullscreenElement)
+    );
+
+    if (!document.fullscreenElement) {
+      ToolbarIconColor.inferFromText("fullscreen", enterFS);
+    }
+
+    if (enterFS) {
+      document.addEventListener("keypress", this._keyToggleCallback);
+      document.addEventListener("popupshown", this._setPopupOpen);
+      document.addEventListener("popuphidden", this._setPopupOpen);
+      gURLBar.controller.addListener(this);
+
+      if (!document.fullscreenElement) {
+        this.hideNavToolbox(true);
+      }
+
+    } else {
+      this.showNavToolbox(false);
+      this._isPopupOpen = false;
+      this.cleanup();
+    }
+    this._toggleShortcutKeys();
+  },
+
+  exitDomFullScreen() {
+    if (document.fullscreen) {
+      document.exitFullscreen();
+    }
+  },
+
+  _currentToolbarShift: 0,
+
+  shiftMacToolbarDown(shiftSize) {
+    if (typeof shiftSize !== "number") {
+      console.error("Tried to shift the toolbar by a non-numeric distance.");
+      return;
+    }
+
+    shiftSize = shiftSize.toFixed(2);
+    let translate = shiftSize > 0 ? `0 ${shiftSize}px` : "";
+    gNavToolbox.classList.toggle("fullscreen-floating-toolbox", shiftSize > 0);
+    gNavToolbox.style.translate = translate;
+    gURLBar.style.translate = gURLBar.hasAttribute("breakout") ? translate : "";
+    let searchbar = document.getElementById("searchbar-new");
+    if (searchbar) {
+      searchbar.style.translate = searchbar.hasAttribute("breakout")
+        ? translate
+        : "";
+    }
+    if (shiftSize > 0) {
+      if (!this.fullScreenToggler.hidden) {
+        this.showNavToolbox();
+      }
+    }
+
+    this._currentToolbarShift = shiftSize;
+  },
+
+  handleEvent(event) {
+    switch (event.type) {
+      case "willenterfullscreen":
+        this.willToggle(true);
+        break;
+      case "willexitfullscreen":
+        this.willToggle(false);
+        break;
+      case "fullscreen":
+        this.toggle();
+        break;
+      case "MacFullscreenMenubarRevealUpdate":
+        this.shiftMacToolbarDown(event.detail);
+        break;
+    }
+  },
+
+  _logWarningPermissionPromptFS(actionStringKey) {
+    let consoleMsg = Cc["@mozilla.org/scripterror;1"].createInstance(
+      Ci.nsIScriptError
+    );
+    let message = gBrowserBundle.GetStringFromName(
+      `permissions.fullscreen.${actionStringKey}`
+    );
+    consoleMsg.initWithWindowID(
+      message,
+      gBrowser.currentURI.spec,
+      0,
+      0,
+      Ci.nsIScriptError.warningFlag,
+      "FullScreen",
+      gBrowser.selectedBrowser.innerWindowID
+    );
+    Services.console.logMessage(consoleMsg);
+  },
+
+  _handlePermPromptShow() {
+    if (
+      !FullScreen.permissionsFullScreenAllowed &&
+      window.fullScreen &&
+      PopupNotifications.getNotification(
+        this._permissionNotificationIDs
+      ).filter(n => !n.dismissed).length
+    ) {
+      this.exitDomFullScreen();
+      this._logWarningPermissionPromptFS("fullScreenCanceled");
+    }
+  },
+
+  enterDomFullscreen(aBrowser, aActor) {
+    if (!document.fullscreenElement) {
+      aActor.requestOrigin = null;
+      return;
+    }
+
+    PointerlockFsWarning.close("pointerlock-warning");
+
+    if (this._isRemoteBrowser(aBrowser)) {
+      let [targetActor, inProcessBC] = this._getNextMsgRecipientActor(
+        aActor,
+        false 
+      );
+      if (!targetActor) {
+        this._abortEnterFullscreen(aActor);
+        return;
+      }
+      targetActor.waitingForChildEnterFullscreen = true;
+      targetActor.sendAsyncMessage("DOMFullscreen:Entered", {
+        remoteFrameBC: inProcessBC,
+      });
+
+      if (inProcessBC) {
+        return;
+      }
+    }
+
+    if (
+      !aBrowser ||
+      gBrowser.selectedBrowser != aBrowser ||
+      Services.focus.activeWindow != window
+    ) {
+      this._abortEnterFullscreen(aActor);
+      return;
+    }
+
+    if (!FullScreen.permissionsFullScreenAllowed) {
+      let notifications = PopupNotifications.getNotification(
+        this._permissionNotificationIDs
+      ).filter(n => !n.dismissed);
+      PopupNotifications.remove(
+        notifications,
+         true
+      );
+      if (notifications.length) {
+        this._logWarningPermissionPromptFS("promptCanceled");
+      }
+    }
+    document.documentElement.setAttribute("inDOMFullscreen", true);
+    document.documentElement.toggleAttribute(
+      "fullscreenNavToolboxHidden",
+      true
+    );
+
+    XULBrowserWindow.onEnterDOMFullscreen();
+
+    if (gFindBarInitialized) {
+      gFindBar.close(true);
+    }
+
+    gBrowser.tabContainer.addEventListener("TabSelect", this.exitDomFullScreen);
+
+    PopupNotifications.panel.addEventListener(
+      "popupshowing",
+      () => this._handlePermPromptShow(),
+      true
+    );
+  },
+
+  cleanup() {
+    if (!window.fullScreen) {
+      MousePosTracker.removeListener(this);
+      document.removeEventListener("keypress", this._keyToggleCallback);
+      document.removeEventListener("popupshown", this._setPopupOpen);
+      document.removeEventListener("popuphidden", this._setPopupOpen);
+      gURLBar.controller.removeListener(this);
+    }
+  },
+
+  _toggleShortcutKeys() {
+    const kEnterKeyIds = [
+      "key_enterFullScreen",
+      "key_enterFullScreen_old",
+      "key_enterFullScreen_compat",
+    ];
+    const kExitKeyIds = [
+      "key_exitFullScreen",
+      "key_exitFullScreen_old",
+      "key_exitFullScreen_compat",
+    ];
+    for (let id of window.fullScreen ? kEnterKeyIds : kExitKeyIds) {
+      document.getElementById(id)?.setAttribute("disabled", "true");
+    }
+    for (let id of window.fullScreen ? kExitKeyIds : kEnterKeyIds) {
+      document.getElementById(id)?.removeAttribute("disabled");
+    }
+  },
+
+  cleanupDomFullscreen(aActor) {
+    let needToWaitForChildExit = false;
+    let [target, inProcessBC] = this._getNextMsgRecipientActor(
+      aActor,
+      true 
+    );
+    if (target) {
+      needToWaitForChildExit = true;
+      target.waitingForChildExitFullscreen = true;
+      target.sendAsyncMessage("DOMFullscreen:CleanUp", {
+        remoteFrameBC: inProcessBC,
+      });
+      if (inProcessBC) {
+        return needToWaitForChildExit;
+      }
+    }
+
+    PopupNotifications.panel.removeEventListener(
+      "popupshowing",
+      () => this._handlePermPromptShow(),
+      true
+    );
+
+    PointerlockFsWarning.close("fullscreen-warning");
+    gBrowser.tabContainer.removeEventListener(
+      "TabSelect",
+      this.exitDomFullScreen
+    );
+
+    document.documentElement.removeAttribute("inDOMFullscreen");
+    document.documentElement.toggleAttribute(
+      "fullscreenNavToolboxHidden",
+      this._isChromeCollapsed
+    );
+
+    return needToWaitForChildExit;
+  },
+
+  _abortEnterFullscreen(aActor) {
+    setTimeout(() => document.exitFullscreen().catch(() => {}), 0);
+    if (aActor.timerId) {
+      aActor.timerId = null;
+    }
+  },
+
+  _getNextMsgRecipientActor(aActor, aUseCache) {
+    if (aUseCache && aActor.nextMsgRecipient) {
+      let nextMsgRecipient = aActor.nextMsgRecipient;
+      while (nextMsgRecipient) {
+        let [actor] = nextMsgRecipient;
+        if (
+          !actor.hasBeenDestroyed() &&
+          actor.windowContext &&
+          !actor.windowContext.isInBFCache
+        ) {
+          return nextMsgRecipient;
+        }
+        nextMsgRecipient = actor.nextMsgRecipient;
+      }
+    }
+
+    if (aActor.hasBeenDestroyed()) {
+      return [null, null];
+    }
+
+    let childBC = aActor.browsingContext;
+    let parentBC = childBC.parent;
+
+    while (parentBC) {
+      if (!childBC.currentWindowGlobal || !parentBC.currentWindowGlobal) {
+        break;
+      }
+      let childPid = childBC.currentWindowGlobal.osPid;
+      let parentPid = parentBC.currentWindowGlobal.osPid;
+
+      if (childPid == parentPid) {
+        childBC = parentBC;
+        parentBC = childBC.parent;
+      } else {
+        break;
+      }
+    }
+
+    let target = null;
+    let inProcessBC = null;
+
+    if (parentBC && parentBC.currentWindowGlobal) {
+      target = parentBC.currentWindowGlobal.getActor("DOMFullscreen");
+      inProcessBC = childBC;
+      aActor.nextMsgRecipient = [target, inProcessBC];
+    } else {
+      target = aActor.requestOrigin;
+    }
+
+    if (
+      !target ||
+      target.hasBeenDestroyed() ||
+      target.windowContext?.isInBFCache
+    ) {
+      return [null, null];
+    }
+    return [target, inProcessBC];
+  },
+
+  _isRemoteBrowser(aBrowser) {
+    return gMultiProcessBrowser && aBrowser.hasAttribute("remote");
+  },
+
+  getMouseTargetRect() {
+    return this._mouseTargetRect;
+  },
+
+  _expandCallback() {
+    FullScreen.showNavToolbox();
+  },
+
+  onMouseEnter() {
+    this.hideNavToolbox();
+  },
+
+  _keyToggleCallback(aEvent) {
+    if (aEvent.keyCode == aEvent.DOM_VK_ESCAPE) {
+      FullScreen.hideNavToolbox();
+    } else if (aEvent.keyCode == aEvent.DOM_VK_F6) {
+      FullScreen.showNavToolbox();
+    }
+  },
+
+  _isPopupOpen: false,
+  _isChromeCollapsed: false,
+
+  _setPopupOpen(aEvent) {
+    let target = aEvent.originalTarget;
+    if (target.localName == "tooltip" || target.id == "tab-preview-panel") {
+      return;
+    }
+    if (
+      aEvent.type == "popupshown" &&
+      !FullScreen._isChromeCollapsed &&
+      target.getAttribute("nopreventnavboxhide") != "true"
+    ) {
+      FullScreen._isPopupOpen = true;
+    } else if (aEvent.type == "popuphidden") {
+      FullScreen._isPopupOpen = false;
+      FullScreen.hideNavToolbox(true);
+    }
+  },
+
+  onViewOpen() {
+    if (!this._isChromeCollapsed) {
+      this._isPopupOpen = true;
+    }
+  },
+
+  onViewClose() {
+    this._isPopupOpen = false;
+    this.hideNavToolbox(true);
+  },
+
+  get navToolboxHidden() {
+    return this._isChromeCollapsed;
+  },
+
+  updateAutohideMenuitem(aItem) {
+    aItem.toggleAttribute(
+      "checked",
+      Services.prefs.getBoolPref("browser.fullscreen.autohide")
+    );
+  },
+  setAutohide() {
+    Services.prefs.setBoolPref(
+      "browser.fullscreen.autohide",
+      !Services.prefs.getBoolPref("browser.fullscreen.autohide")
+    );
+    FullScreen.hideNavToolbox(true);
+  },
+
+  showNavToolbox(trackMouse = true) {
+    if (BrowserHandler.kiosk) {
+      return;
+    }
+    this.fullScreenToggler.hidden = true;
+    gNavToolbox.removeAttribute("fullscreenShouldAnimate");
+    gNavToolbox.style.marginTop = "";
+
+    if (!this._isChromeCollapsed) {
+      return;
+    }
+
+    if (trackMouse) {
+      let rect = gBrowser.tabpanels.getBoundingClientRect();
+      this._mouseTargetRect = {
+        top: rect.top + 50,
+        bottom: rect.bottom,
+        left: rect.left,
+        right: rect.right,
+      };
+      MousePosTracker.addListener(this);
+    }
+
+    this._isChromeCollapsed = false;
+    document.documentElement.removeAttribute("fullscreenNavToolboxHidden");
+    Services.obs.notifyObservers(
+      gNavToolbox,
+      "fullscreen-nav-toolbox",
+      "shown"
+    );
+  },
+
+  hideNavToolbox(aAnimate = false) {
+    if (this._isChromeCollapsed) {
+      return;
+    }
+    if (!Services.prefs.getBoolPref("browser.fullscreen.autohide")) {
+      return;
+    }
+    if (this._isPopupOpen) {
+      return;
+    }
+
+    let focused = document.commandDispatcher.focusedElement;
+    if (
+      focused &&
+      focused.ownerDocument == document &&
+      focused.localName == "input" &&
+      !BrowserHandler.kiosk
+    ) {
+      let retryHideNavToolbox = () => {
+        requestAnimationFrame(() => {
+          setTimeout(() => {
+            if (window.fullScreen) {
+              this.hideNavToolbox(aAnimate);
+            }
+          }, 0);
+        });
+        window.removeEventListener("keydown", retryHideNavToolbox);
+        window.removeEventListener("click", retryHideNavToolbox);
+      };
+      window.addEventListener("keydown", retryHideNavToolbox);
+      window.addEventListener("click", retryHideNavToolbox);
+      return;
+    }
+
+    if (!BrowserHandler.kiosk) {
+      this.fullScreenToggler.hidden = false;
+    }
+
+    if (
+      aAnimate &&
+      window.matchMedia("(prefers-reduced-motion: no-preference)").matches &&
+      !BrowserHandler.kiosk
+    ) {
+      gNavToolbox.setAttribute("fullscreenShouldAnimate", true);
+    }
+
+    gNavToolbox.style.marginTop =
+      -gNavToolbox.getBoundingClientRect().height + "px";
+    this._isChromeCollapsed = true;
+    document.documentElement.toggleAttribute(
+      "fullscreenNavToolboxHidden",
+      true
+    );
+    Services.obs.notifyObservers(
+      gNavToolbox,
+      "fullscreen-nav-toolbox",
+      "hidden"
+    );
+
+    MousePosTracker.removeListener(this);
+  },
+};
+
+ChromeUtils.defineLazyGetter(FullScreen, "_permissionNotificationIDs", () => {
+  let { PermissionUI } = ChromeUtils.importESModule(
+    "resource:///modules/PermissionUI.sys.mjs"
+  );
+  return Object.values(PermissionUI)
+    .filter(value => {
+      let returnValue;
+      try {
+        returnValue = value.prototype.notificationID;
+      } catch (err) {
+        if (err.message === "Not implemented.") {
+          returnValue = false;
+        } else {
+          throw err;
+        }
+      }
+      return returnValue;
+    })
+    .map(value => value.prototype.notificationID);
+});

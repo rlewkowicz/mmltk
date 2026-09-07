@@ -1,0 +1,316 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ReadIntoRequest.h"
+#include "ReadableByteStreamControllerAbstract.h"
+#include "ReadableStreamAbstract.h"
+#include "ReadableStreamBYOBReaderAbstract.h"
+#include "ReadableStreamGenericReaderAbstract.h"
+#include "js/ArrayBuffer.h"
+#include "js/experimental/TypedData.h"
+#include "mozilla/dom/ReadableStreamBYOBReaderBinding.h"
+#include "mozilla/dom/RootedDictionary.h"
+#include "nsCOMPtr.h"
+#include "nsISupportsImpl.h"
+
+#include "mozilla/dom/ReadableStreamBYOBRequest.h"
+
+namespace mozilla::dom {
+
+using namespace streams_abstract;
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE_INHERITED(ReadableStreamBYOBReader,
+                                                ReadableStreamGenericReader,
+                                                mReadIntoRequests)
+NS_IMPL_ADDREF_INHERITED(ReadableStreamBYOBReader, ReadableStreamGenericReader)
+NS_IMPL_RELEASE_INHERITED(ReadableStreamBYOBReader, ReadableStreamGenericReader)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(ReadableStreamBYOBReader)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+NS_INTERFACE_MAP_END_INHERITING(ReadableStreamGenericReader)
+
+ReadableStreamBYOBReader::ReadableStreamBYOBReader(nsISupports* aGlobal)
+    : ReadableStreamGenericReader(do_QueryInterface(aGlobal)) {}
+
+JSObject* ReadableStreamBYOBReader::WrapObject(
+    JSContext* aCx, JS::Handle<JSObject*> aGivenProto) {
+  return ReadableStreamBYOBReader_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+void SetUpReadableStreamBYOBReader(ReadableStreamBYOBReader* reader,
+                                   ReadableStream& stream, ErrorResult& rv) {
+  if (IsReadableStreamLocked(&stream)) {
+    rv.ThrowTypeError("Trying to read locked stream");
+    return;
+  }
+
+  if (!stream.Controller()->IsByte()) {
+    rv.ThrowTypeError("Trying to read with incompatible controller");
+    return;
+  }
+
+  ReadableStreamReaderGenericInitialize(reader, &stream);
+
+  reader->ReadIntoRequests().clear();
+}
+
+ already_AddRefed<ReadableStreamBYOBReader>
+ReadableStreamBYOBReader::Constructor(const GlobalObject& global,
+                                      ReadableStream& stream, ErrorResult& rv) {
+  nsCOMPtr<nsIGlobalObject> globalObject =
+      do_QueryInterface(global.GetAsSupports());
+  RefPtr<ReadableStreamBYOBReader> reader =
+      new ReadableStreamBYOBReader(globalObject);
+
+  SetUpReadableStreamBYOBReader(reader, stream, rv);
+  if (rv.Failed()) {
+    return nullptr;
+  }
+
+  return reader.forget();
+}
+
+struct Read_ReadIntoRequest final : public ReadIntoRequest {
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(Read_ReadIntoRequest,
+                                           ReadIntoRequest)
+
+  RefPtr<Promise> mPromise;
+
+  explicit Read_ReadIntoRequest(Promise* aPromise) : mPromise(aPromise) {}
+
+  void ChunkSteps(JSContext* aCx, JS::Handle<JS::Value> aChunk,
+                  ErrorResult& aRv) override {
+    MOZ_ASSERT(aChunk.isObject());
+
+    JS::Rooted<JSObject*> chunk(aCx, &aChunk.toObject());
+    if (!JS_WrapObject(aCx, &chunk)) {
+      aRv.StealExceptionFromJSContext(aCx);
+      return;
+    }
+
+    RootedDictionary<ReadableStreamReadResult> result(aCx);
+    result.mValue = aChunk;
+    result.mDone.Construct(false);
+
+    mPromise->MaybeResolve(result);
+  }
+
+  void CloseSteps(JSContext* aCx, JS::Handle<JS::Value> aChunk,
+                  ErrorResult& aRv) override {
+    MOZ_ASSERT(aChunk.isObject() || aChunk.isUndefined());
+    RootedDictionary<ReadableStreamReadResult> result(aCx);
+    if (aChunk.isObject()) {
+      JS::Rooted<JSObject*> chunk(aCx, &aChunk.toObject());
+      if (!JS_WrapObject(aCx, &chunk)) {
+        aRv.StealExceptionFromJSContext(aCx);
+        return;
+      }
+
+      result.mValue = aChunk;
+    }
+    result.mDone.Construct(true);
+
+    mPromise->MaybeResolve(result);
+  }
+
+  void ErrorSteps(JSContext* aCx, JS::Handle<JS::Value> e,
+                  ErrorResult& aRv) override {
+    mPromise->MaybeReject(e);
+  }
+
+ protected:
+  ~Read_ReadIntoRequest() override = default;
+};
+
+NS_IMPL_CYCLE_COLLECTION(ReadIntoRequest)
+NS_IMPL_CYCLE_COLLECTING_ADDREF(ReadIntoRequest)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(ReadIntoRequest)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(ReadIntoRequest)
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED(Read_ReadIntoRequest, ReadIntoRequest,
+                                   mPromise)
+NS_IMPL_ADDREF_INHERITED(Read_ReadIntoRequest, ReadIntoRequest)
+NS_IMPL_RELEASE_INHERITED(Read_ReadIntoRequest, ReadIntoRequest)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(Read_ReadIntoRequest)
+NS_INTERFACE_MAP_END_INHERITING(ReadIntoRequest)
+
+namespace streams_abstract {
+void ReadableStreamBYOBReaderRead(JSContext* aCx,
+                                  ReadableStreamBYOBReader* aReader,
+                                  JS::Handle<JSObject*> aView, uint64_t aMin,
+                                  ReadIntoRequest* aReadIntoRequest,
+                                  ErrorResult& aRv) {
+  ReadableStream* stream = aReader->GetStream();
+
+  MOZ_ASSERT(stream);
+
+  stream->SetDisturbed(true);
+
+  if (stream->State() == ReadableStream::ReaderState::Errored) {
+    JS::Rooted<JS::Value> error(aCx);
+    stream->GetStoredError(aCx, &error, aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+
+    aReadIntoRequest->ErrorSteps(aCx, error, aRv);
+    return;
+  }
+
+  MOZ_ASSERT(stream->Controller()->IsByte());
+  RefPtr<ReadableByteStreamController> controller(
+      stream->Controller()->AsByte());
+  ReadableByteStreamControllerPullInto(aCx, controller, aView, aMin,
+                                       aReadIntoRequest, aRv);
+}
+}  
+
+already_AddRefed<Promise> ReadableStreamBYOBReader::Read(
+    const ArrayBufferView& aArray,
+    const ReadableStreamBYOBReaderReadOptions& aOptions, ErrorResult& aRv) {
+  AutoJSAPI jsapi;
+  if (!jsapi.Init(GetParentObject())) {
+    aRv.ThrowUnknownError("Internal error");
+    return nullptr;
+  }
+  JSContext* cx = jsapi.cx();
+
+  JS::Rooted<JSObject*> view(cx, aArray.Obj());
+
+  if (JS_GetArrayBufferViewByteLength(view) == 0) {
+    aRv.ThrowTypeError("Zero Length View");
+    return nullptr;
+  }
+
+  bool isSharedMemory;
+  JS::Rooted<JSObject*> viewedArrayBuffer(
+      cx, JS_GetArrayBufferViewBuffer(cx, view, &isSharedMemory));
+  if (!viewedArrayBuffer) {
+    aRv.StealExceptionFromJSContext(cx);
+    return nullptr;
+  }
+
+  if (JS::GetArrayBufferByteLength(viewedArrayBuffer) == 0) {
+    aRv.ThrowTypeError("zero length viewed buffer");
+    return nullptr;
+  }
+
+  if (JS::IsDetachedArrayBufferObject(viewedArrayBuffer)) {
+    aRv.ThrowTypeError("Detached Buffer");
+    return nullptr;
+  }
+
+  if (aOptions.mMin == 0) {
+    aRv.ThrowTypeError(
+        "Zero is not a valid value for 'min' member of "
+        "ReadableStreamBYOBReaderReadOptions.");
+    return nullptr;
+  }
+
+  if (JS_IsTypedArrayObject(view)) {
+    if (aOptions.mMin > JS_GetTypedArrayLength(view)) {
+      aRv.ThrowRangeError(
+          "Array length exceeded by 'min' member of "
+          "ReadableStreamBYOBReaderReadOptions.");
+      return nullptr;
+    }
+  } else {
+    if (aOptions.mMin > JS_GetArrayBufferViewByteLength(view)) {
+      aRv.ThrowRangeError(
+          "byteLength exceeded by 'min' member of "
+          "ReadableStreamBYOBReaderReadOptions.");
+      return nullptr;
+    }
+  }
+
+  if (!GetStream()) {
+    aRv.ThrowTypeError("Reader has undefined stream");
+    return nullptr;
+  }
+
+  RefPtr<Promise> promise = Promise::CreateInfallible(GetParentObject());
+
+  RefPtr<ReadIntoRequest> readIntoRequest = new Read_ReadIntoRequest(promise);
+
+  ReadableStreamBYOBReaderRead(cx, this, view, aOptions.mMin, readIntoRequest,
+                               aRv);
+  if (aRv.Failed()) {
+    return nullptr;
+  }
+
+  return promise.forget();
+}
+
+namespace streams_abstract {
+
+void ReadableStreamBYOBReaderErrorReadIntoRequests(
+    JSContext* aCx, ReadableStreamBYOBReader* aReader,
+    JS::Handle<JS::Value> aError, ErrorResult& aRv) {
+  LinkedList<RefPtr<ReadIntoRequest>> readIntoRequests =
+      std::move(aReader->ReadIntoRequests());
+
+  aReader->ReadIntoRequests().clear();
+
+  while (RefPtr<ReadIntoRequest> readIntoRequest =
+             readIntoRequests.popFirst()) {
+    readIntoRequest->ErrorSteps(aCx, aError, aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+  }
+}
+
+void ReadableStreamBYOBReaderRelease(JSContext* aCx,
+                                     ReadableStreamBYOBReader* aReader,
+                                     ErrorResult& aRv) {
+  ReadableStreamReaderGenericRelease(aReader, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  ErrorResult rv;
+  rv.ThrowTypeError("Releasing lock");
+  JS::Rooted<JS::Value> error(aCx);
+  MOZ_ALWAYS_TRUE(ToJSValue(aCx, std::move(rv), &error));
+
+  ReadableStreamBYOBReaderErrorReadIntoRequests(aCx, aReader, error, aRv);
+}
+
+}  
+
+void ReadableStreamBYOBReader::ReleaseLock(ErrorResult& aRv) {
+  if (!mStream) {
+    return;
+  }
+
+  AutoJSAPI jsapi;
+  if (!jsapi.Init(mGlobal)) {
+    return aRv.ThrowUnknownError("Internal error");
+  }
+  JSContext* cx = jsapi.cx();
+
+  RefPtr<ReadableStreamBYOBReader> thisRefPtr = this;
+  ReadableStreamBYOBReaderRelease(cx, thisRefPtr, aRv);
+}
+
+namespace streams_abstract {
+already_AddRefed<ReadableStreamBYOBReader> AcquireReadableStreamBYOBReader(
+    ReadableStream* aStream, ErrorResult& aRv) {
+  RefPtr<ReadableStreamBYOBReader> reader =
+      new ReadableStreamBYOBReader(aStream->GetParentObject());
+
+  SetUpReadableStreamBYOBReader(reader, *aStream, aRv);
+  if (aRv.Failed()) {
+    return nullptr;
+  }
+
+  return reader.forget();
+}
+}  
+
+}  

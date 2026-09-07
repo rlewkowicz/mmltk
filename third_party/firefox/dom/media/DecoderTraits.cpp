@@ -1,0 +1,267 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "DecoderTraits.h"
+
+#include "MediaContainerType.h"
+#include "WebMDecoder.h"
+#include "WebMDemuxer.h"
+#include "mozilla/Logging.h"
+#include "mozilla/Preferences.h"
+#include "nsMimeTypes.h"
+
+#ifdef MOZ_ANDROID_HLS_SUPPORT
+#  include "HLSDecoder.h"
+#endif
+#include "ADTSDecoder.h"
+#include "ADTSDemuxer.h"
+#include "FlacDecoder.h"
+#include "FlacDemuxer.h"
+#include "MP3Decoder.h"
+#include "MP3Demuxer.h"
+#include "MP4Decoder.h"
+#include "MP4Demuxer.h"
+#include "MatroskaDecoder.h"
+#include "MatroskaDemuxer.h"
+#include "MediaFormatReader.h"
+#include "WaveDecoder.h"
+#include "WaveDemuxer.h"
+
+namespace mozilla {
+
+extern LazyLogModule gMediaDecoderLog;
+#define LOGD(x, ...) \
+  MOZ_LOG_FMT(gMediaDecoderLog, LogLevel::Debug, x, ##__VA_ARGS__)
+
+bool DecoderTraits::IsHttpLiveStreamingType(const MediaContainerType& aType) {
+  const auto& mimeType = aType.Type();
+  return  
+      mimeType == MEDIAMIMETYPE("application/vnd.apple.mpegurl") ||
+      mimeType == MEDIAMIMETYPE("application/x-mpegurl") ||
+      mimeType == MEDIAMIMETYPE("audio/mpegurl") ||
+      mimeType == MEDIAMIMETYPE("audio/x-mpegurl");
+}
+
+static CanPlayStatus CanHandleCodecsType(
+    const MediaContainerType& aType, DecoderDoctorDiagnostics* aDiagnostics) {
+  MOZ_ASSERT(aType.ExtendedType().HaveCodecs());
+
+  const MediaContainerType mimeType(aType.Type());
+
+  if (WaveDecoder::IsSupportedType(MediaContainerType(mimeType))) {
+    if (WaveDecoder::IsSupportedType(aType)) {
+      return CANPLAY_YES;
+    }
+    return CANPLAY_NO;
+  }
+  if (WebMDecoder::IsSupportedType(mimeType)) {
+    if (WebMDecoder::IsSupportedType(aType)) {
+      return CANPLAY_YES;
+    }
+    return CANPLAY_NO;
+  }
+  if (MP4Decoder::IsSupportedType(mimeType,
+                                   nullptr)) {
+    if (MP4Decoder::IsSupportedType(aType, aDiagnostics)) {
+      return CANPLAY_YES;
+    }
+    return CANPLAY_NO;
+  }
+  if (MP3Decoder::IsSupportedType(mimeType)) {
+    if (MP3Decoder::IsSupportedType(aType)) {
+      return CANPLAY_YES;
+    }
+    return CANPLAY_NO;
+  }
+  if (ADTSDecoder::IsSupportedType(mimeType)) {
+    if (ADTSDecoder::IsSupportedType(aType)) {
+      return CANPLAY_YES;
+    }
+    return CANPLAY_NO;
+  }
+  if (FlacDecoder::IsSupportedType(mimeType)) {
+    if (FlacDecoder::IsSupportedType(aType)) {
+      return CANPLAY_YES;
+    }
+    return CANPLAY_NO;
+  }
+  if (MatroskaDecoder::IsSupportedType(
+          mimeType,
+           nullptr)) {
+    if (MatroskaDecoder::IsSupportedType(aType, aDiagnostics)) {
+      return CANPLAY_YES;
+    }
+    return CANPLAY_NO;
+  }
+
+  return CANPLAY_MAYBE;
+}
+
+static CanPlayStatus CanHandleMediaType(
+    const MediaContainerType& aType, DecoderDoctorDiagnostics* aDiagnostics) {
+  if (DecoderTraits::IsHttpLiveStreamingType(aType)) {
+
+  }
+  if (MatroskaDecoder::IsMatroskaType(aType)) {
+
+  }
+#ifdef MOZ_ANDROID_HLS_SUPPORT
+  if (HLSDecoder::IsSupportedType(aType)) {
+    return CANPLAY_MAYBE;
+  }
+#endif
+
+  if (aType.ExtendedType().HaveCodecs()) {
+    CanPlayStatus result = CanHandleCodecsType(aType, aDiagnostics);
+    if (result == CANPLAY_NO || result == CANPLAY_YES) {
+      return result;
+    }
+  }
+
+  const MediaContainerType mimeType(aType.Type());
+
+  if (WaveDecoder::IsSupportedType(mimeType)) {
+    return CANPLAY_MAYBE;
+  }
+  if (MP4Decoder::IsSupportedType(mimeType, aDiagnostics)) {
+    return CANPLAY_MAYBE;
+  }
+  if (WebMDecoder::IsSupportedType(mimeType)) {
+    return CANPLAY_MAYBE;
+  }
+  if (MP3Decoder::IsSupportedType(mimeType)) {
+    return CANPLAY_MAYBE;
+  }
+  if (ADTSDecoder::IsSupportedType(mimeType)) {
+    return CANPLAY_MAYBE;
+  }
+  if (FlacDecoder::IsSupportedType(mimeType)) {
+    return CANPLAY_MAYBE;
+  }
+  if (MatroskaDecoder::IsSupportedType(mimeType, aDiagnostics)) {
+    return CANPLAY_MAYBE;
+  }
+  return CANPLAY_NO;
+}
+
+CanPlayStatus DecoderTraits::CanHandleContainerType(
+    const MediaContainerType& aContainerType,
+    DecoderDoctorDiagnostics* aDiagnostics) {
+  return CanHandleMediaType(aContainerType, aDiagnostics);
+}
+
+bool DecoderTraits::ShouldHandleMediaType(
+    const nsACString& aMIMEType, DecoderDoctorDiagnostics* aDiagnostics) {
+  Maybe<MediaContainerType> containerType = MakeMediaContainerType(aMIMEType);
+  if (!containerType) {
+    return false;
+  }
+
+  if (WaveDecoder::IsSupportedType(*containerType)) {
+    return false;
+  }
+
+  return CanHandleMediaType(*containerType, aDiagnostics) != CANPLAY_NO;
+}
+
+already_AddRefed<MediaDataDemuxer> DecoderTraits::CreateDemuxer(
+    const MediaContainerType& aType, MediaResource* aResource) {
+  MOZ_ASSERT(NS_IsMainThread());
+  RefPtr<MediaDataDemuxer> demuxer;
+
+  if (MP4Decoder::IsSupportedType(aType,
+                                   nullptr)) {
+    demuxer = new MP4Demuxer(aResource);
+  } else if (MP3Decoder::IsSupportedType(aType)) {
+    demuxer = new MP3Demuxer(aResource);
+  } else if (ADTSDecoder::IsSupportedType(aType)) {
+    demuxer = new ADTSDemuxer(aResource);
+  } else if (WaveDecoder::IsSupportedType(aType)) {
+    demuxer = new WAVDemuxer(aResource);
+  } else if (FlacDecoder::IsSupportedType(aType)) {
+    demuxer = new FlacDemuxer(aResource);
+  } else if (WebMDecoder::IsSupportedType(aType)) {
+    demuxer = new WebMDemuxer(aResource);
+  } else if (MatroskaDecoder::IsSupportedType(
+                 aType,
+                  nullptr)) {
+    demuxer = new MatroskaDemuxer(aResource);
+  } else {
+    LOGD("CreateDemuxer: unsupported type {}", aType.OriginalString().get());
+  }
+
+  return demuxer.forget();
+}
+
+MediaFormatReader* DecoderTraits::CreateReader(const MediaContainerType& aType,
+                                               MediaFormatReaderInit& aInit) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  RefPtr<MediaDataDemuxer> demuxer = CreateDemuxer(aType, aInit.mResource);
+  if (!demuxer) {
+    return nullptr;
+  }
+
+  MediaFormatReader* decoderReader = new MediaFormatReader(aInit, demuxer);
+
+  return decoderReader;
+}
+
+bool DecoderTraits::IsSupportedInVideoDocument(const nsACString& aType) {
+  if (!Preferences::GetBool("media.wmf.play-stand-alone", true) ||
+      !Preferences::GetBool("media.play-stand-alone", true)) {
+    return false;
+  }
+
+  Maybe<MediaContainerType> type = MakeMediaContainerType(aType);
+  if (!type) {
+    return false;
+  }
+
+  return WebMDecoder::IsSupportedType(*type) ||
+         MP4Decoder::IsSupportedType(*type,
+                                      nullptr) ||
+         MP3Decoder::IsSupportedType(*type) ||
+         ADTSDecoder::IsSupportedType(*type) ||
+         FlacDecoder::IsSupportedType(*type) ||
+         MatroskaDecoder::IsSupportedType(
+             *type,
+              nullptr) ||
+#ifdef MOZ_ANDROID_HLS_SUPPORT
+         HLSDecoder::IsSupportedType(*type) ||
+#endif
+         false;
+}
+
+nsTArray<UniquePtr<TrackInfo>> DecoderTraits::GetTracksInfo(
+    const MediaContainerType& aType) {
+  const MediaContainerType mimeType(aType.Type());
+
+  if (WaveDecoder::IsSupportedType(mimeType)) {
+    return WaveDecoder::GetTracksInfo(aType);
+  }
+  if (MP4Decoder::IsSupportedType(mimeType, nullptr)) {
+    return MP4Decoder::GetTracksInfo(aType);
+  }
+  if (WebMDecoder::IsSupportedType(mimeType)) {
+    return WebMDecoder::GetTracksInfo(aType);
+  }
+  if (MP3Decoder::IsSupportedType(mimeType)) {
+    return MP3Decoder::GetTracksInfo(aType);
+  }
+  if (ADTSDecoder::IsSupportedType(mimeType)) {
+    return ADTSDecoder::GetTracksInfo(aType);
+  }
+  if (FlacDecoder::IsSupportedType(mimeType)) {
+    return FlacDecoder::GetTracksInfo(aType);
+  }
+  if (MatroskaDecoder::IsSupportedType(mimeType, nullptr)) {
+    return MatroskaDecoder::GetTracksInfo(aType);
+  }
+  return nsTArray<UniquePtr<TrackInfo>>();
+}
+
+}  
+
+#undef LOGD

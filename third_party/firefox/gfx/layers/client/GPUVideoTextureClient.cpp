@@ -1,0 +1,50 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "GPUVideoTextureClient.h"
+#include "GPUVideoImage.h"
+#include "mozilla/gfx/2D.h"
+
+namespace mozilla {
+namespace layers {
+
+using namespace gfx;
+
+GPUVideoTextureData::GPUVideoTextureData(IGPUVideoSurfaceManager* aManager,
+                                         const SurfaceDescriptorGPUVideo& aSD,
+                                         const gfx::IntSize& aSize)
+    : mManager(aManager), mSD(aSD), mSize(aSize) {}
+
+GPUVideoTextureData::~GPUVideoTextureData() = default;
+
+bool GPUVideoTextureData::Serialize(SurfaceDescriptor& aOutDescriptor) {
+  aOutDescriptor = mSD;
+  return true;
+}
+
+void GPUVideoTextureData::FillInfo(TextureData::Info& aInfo) const {
+  aInfo.size = mSize;
+  aInfo.format = SurfaceFormat::B8G8R8X8;
+  aInfo.hasSynchronization = false;
+  aInfo.supportsMoz2D = false;
+  aInfo.canExposeMappedData = false;
+}
+
+already_AddRefed<SourceSurface> GPUVideoTextureData::GetAsSourceSurface() {
+  return mManager->Readback(mSD);
+}
+
+void GPUVideoTextureData::OnSetCurrent() { mManager->OnSetCurrent(mSD); }
+
+void GPUVideoTextureData::Deallocate(LayersIPCChannel* aAllocator) {
+  mManager->DeallocateSurfaceDescriptor(mSD);
+  mSD = SurfaceDescriptorGPUVideo();
+}
+
+void GPUVideoTextureData::Forget(LayersIPCChannel* aAllocator) {
+  Deallocate(aAllocator);
+}
+
+}  
+}  

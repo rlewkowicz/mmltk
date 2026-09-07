@@ -1,0 +1,46 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef HAL_SENSOR_H_
+#define HAL_SENSOR_H_
+
+#include "mozilla/Observer.h"
+
+namespace mozilla {
+namespace hal {
+
+enum SensorType {
+  SENSOR_ORIENTATION = 0,
+  SENSOR_ACCELERATION = 1,
+  SENSOR_PROXIMITY = 2,
+  SENSOR_LINEAR_ACCELERATION = 3,
+  SENSOR_GYROSCOPE = 4,
+  SENSOR_LIGHT = 5,
+  SENSOR_ROTATION_VECTOR = 6,
+  SENSOR_GAME_ROTATION_VECTOR = 7,
+  NUM_SENSOR_TYPE
+};
+
+class SensorData;
+
+typedef Observer<SensorData> ISensorObserver;
+
+class SensorAccuracy;
+
+typedef Observer<SensorAccuracy> ISensorAccuracyObserver;
+
+}  
+}  
+
+#include "ipc/EnumSerializer.h"
+
+namespace IPC {
+template <>
+struct ParamTraits<mozilla::hal::SensorType>
+    : public ContiguousEnumSerializer<mozilla::hal::SensorType,
+                                      mozilla::hal::SENSOR_ORIENTATION,
+                                      mozilla::hal::NUM_SENSOR_TYPE> {};
+}  
+
+#endif /* HAL_SENSOR_H_ */

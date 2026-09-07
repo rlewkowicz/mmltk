@@ -1,0 +1,67 @@
+// Copyright (c) 2010 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+#if !defined(MEDIA_BASE_YCBCR_TO_RGB565_H_)
+#define MEDIA_BASE_YCBCR_TO_RGB565_H_
+#include "yuv_convert.h"
+#include "mozilla/arm.h"
+
+#if defined(__arm__) && defined(MOZILLA_MAY_SUPPORT_NEON)
+#define HAVE_YCBCR_TO_RGB565 1
+#endif
+
+namespace mozilla {
+
+namespace gfx {
+
+#if defined(HAVE_YCBCR_TO_RGB565)
+void ConvertYCbCrToRGB565(const uint8_t* yplane,
+                                   const uint8_t* uplane,
+                                   const uint8_t* vplane,
+                                   uint8_t* rgbframe,
+                                   int pic_x,
+                                   int pic_y,
+                                   int pic_width,
+                                   int pic_height,
+                                   int ystride,
+                                   int uvstride,
+                                   int rgbstride,
+                                   YUVType yuv_type);
+
+bool IsConvertYCbCrToRGB565Fast(int pic_x,
+                                         int pic_y,
+                                         int pic_width,
+                                         int pic_height,
+                                         YUVType yuv_type);
+
+void ScaleYCbCrToRGB565(const uint8_t *yplane,
+                                 const uint8_t *uplane,
+                                 const uint8_t *vplane,
+                                 uint8_t *rgbframe,
+                                 int source_x0,
+                                 int source_y0,
+                                 int source_width,
+                                 int source_height,
+                                 int width,
+                                 int height,
+                                 int ystride,
+                                 int uvstride,
+                                 int rgbstride,
+                                 YUVType yuv_type,
+                                 ScaleFilter filter);
+
+bool IsScaleYCbCrToRGB565Fast(int source_x0,
+                                       int source_y0,
+                                       int source_width,
+                                       int source_height,
+                                       int width,
+                                       int height,
+                                       YUVType yuv_type,
+                                       ScaleFilter filter);
+#endif
+
+} 
+
+} 
+
+#endif

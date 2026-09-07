@@ -1,0 +1,191 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef AudioDecoderInputTrack_h
+#define AudioDecoderInputTrack_h
+
+#include <memory>
+#include <thread>
+
+#include "AudioSegment.h"
+#include "MediaEventSource.h"
+#include "MediaSegment.h"
+#include "MediaTimer.h"
+#include "MediaTrackGraph.h"
+#include "TimeUnits.h"
+#include "mozilla/SPSCQueue.h"
+#include "mozilla/StateMirroring.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/Types.h"
+#include "nsISerialEventTarget.h"
+
+namespace mozilla {
+
+class AudioData;
+class AudioInfo;
+class MOZ_EXPORT SoundTouchAdapter;
+
+class AudioDecoderInputTrack final : public ProcessedMediaTrack {
+ public:
+  static AudioDecoderInputTrack* Create(MediaTrackGraph* aGraph,
+                                        nsISerialEventTarget* aDecoderThread,
+                                        const AudioInfo& aInfo,
+                                        float aPlaybackRate,
+                                        bool aPreservesPitch);
+
+  struct SPSCData final {
+    struct Empty {};
+    struct ClearFutureData {};
+    struct DecodedData {
+      DecodedData()
+          : mStartTime(media::TimeUnit::Invalid()),
+            mEndTime(media::TimeUnit::Invalid()) {}
+      DecodedData(DecodedData&& aDecodedData)
+          : mSegment(std::move(aDecodedData.mSegment)) {
+        mStartTime = aDecodedData.mStartTime;
+        mEndTime = aDecodedData.mEndTime;
+        aDecodedData.Clear();
+      }
+      DecodedData(media::TimeUnit aStartTime, media::TimeUnit aEndTime)
+          : mStartTime(aStartTime), mEndTime(aEndTime) {}
+      DecodedData(const DecodedData&) = delete;
+      DecodedData& operator=(const DecodedData&) = delete;
+      void Clear() {
+        mSegment.Clear();
+        mStartTime = media::TimeUnit::Invalid();
+        mEndTime = media::TimeUnit::Invalid();
+      }
+      AudioSegment mSegment;
+      media::TimeUnit mStartTime;
+      media::TimeUnit mEndTime;
+    };
+    struct EOS {};
+
+    SPSCData() : mData(Empty()) {};
+    explicit SPSCData(ClearFutureData&& aArg) : mData(std::move(aArg)) {};
+    explicit SPSCData(DecodedData&& aArg) : mData(std::move(aArg)) {};
+    explicit SPSCData(EOS&& aArg) : mData(std::move(aArg)) {};
+
+    bool HasData() const { return !mData.is<Empty>(); }
+    bool IsClearFutureData() const { return mData.is<ClearFutureData>(); }
+    bool IsDecodedData() const { return mData.is<DecodedData>(); }
+    bool IsEOS() const { return mData.is<EOS>(); }
+
+    DecodedData* AsDecodedData() {
+      return IsDecodedData() ? &mData.as<DecodedData>() : nullptr;
+    }
+
+    Variant<Empty, ClearFutureData, DecodedData, EOS> mData;
+  };
+
+  void AppendData(AudioData* aAudio, const PrincipalHandle& aPrincipalHandle);
+  void AppendData(nsTArray<RefPtr<AudioData>>& aAudioArray,
+                  const PrincipalHandle& aPrincipalHandle);
+  void NotifyEndOfStream();
+  void ClearFutureData();
+  void SetPlaybackRate(float aPlaybackRate);
+  void SetPreservesPitch(bool aPreservesPitch);
+  void Close();
+  bool HasBatchedData() const;
+
+  MediaEventSource<int64_t>& OnOutput() { return mOnOutput; }
+  MediaEventSource<void>& OnEnd() { return mOnEnd; }
+  MediaEventSource<void>& OnPlaybackRateFallback() {
+    return mOnPlaybackRateFallback;
+  }
+
+  void DestroyImpl() override;
+  void ProcessInput(GraphTime aFrom, GraphTime aTo, uint32_t aFlags) override;
+  uint32_t NumberOfChannels() const override;
+
+  TrackTime WrittenFrames() const {
+    AssertOnGraphThread();
+    return mWrittenFrames;
+  }
+  float PlaybackRate() const {
+    AssertOnGraphThread();
+    return mPlaybackRate;
+  }
+
+ protected:
+  ~AudioDecoderInputTrack();
+
+ private:
+  AudioDecoderInputTrack(nsISerialEventTarget* aDecoderThread,
+                         TrackRate aGraphRate, const AudioInfo& aInfo,
+                         float aPlaybackRate, bool aPreservesPitch);
+
+  bool ConvertAudioDataToSegment(AudioData* aAudio, AudioSegment& aSegment,
+                                 const PrincipalHandle& aPrincipalHandle);
+
+  void HandleSPSCData(SPSCData& aData);
+
+  TrackTime AppendBufferedDataToOutput(TrackTime aExpectedDuration);
+  TrackTime FillDataToTimeStretcher(TrackTime aExpectedDuration);
+  TrackTime AppendTimeStretchedDataToSegment(TrackTime aExpectedDuration,
+                                             AudioSegment& aOutput);
+  TrackTime AppendUnstretchedDataToSegment(TrackTime aExpectedDuration,
+                                           AudioSegment& aOutput);
+
+  TrackTime DrainStretchedDataIfNeeded(TrackTime aExpectedDuration,
+                                       AudioSegment& aOutput);
+  TrackTime GetDataFromTimeStretcher(TrackTime aExpectedDuration,
+                                     AudioSegment& aOutput);
+  void NotifyInTheEndOfProcessInput(TrackTime aFillDuration);
+
+  bool HasSentAllData() const;
+
+  bool ShouldBatchData() const;
+  void BatchData(AudioData* aAudio, const PrincipalHandle& aPrincipalHandle);
+  void DispatchPushBatchedDataIfNeeded();
+  void PushBatchedDataIfNeeded();
+  void PushDataToSPSCQueue(SPSCData& data);
+
+  void SetVolumeImpl(float aVolume);
+  void SetPlaybackRateImpl(float aPlaybackRate);
+  void SetPreservesPitchImpl(bool aPreservesPitch);
+
+  void EnsureTimeStretcher();
+  void SetTempoAndRateForTimeStretcher();
+  uint32_t GetChannelCountForTimeStretcher() const;
+
+  inline void AssertOnDecoderThread() const {
+    MOZ_ASSERT(mDecoderThread->IsOnCurrentThread());
+  }
+
+  const RefPtr<nsISerialEventTarget> mDecoderThread;
+
+  MediaEventProducer<int64_t> mOnOutput;
+  MediaEventProducer<void> mOnEnd;
+  MediaEventProducer<void> mOnPlaybackRateFallback;
+
+  nsAutoRef<SpeexResamplerState> mResampler;
+  uint32_t mResamplerChannelCount;
+  const uint32_t mInitialInputChannels;
+  TrackRate mInputSampleRate;
+  DelayedScheduler<TimeStamp> mDelayedScheduler;
+  bool mShutdownSPSCQueue = false;
+
+  bool mReceivedEOS = false;
+  TrackTime mWrittenFrames = 0;
+  float mPlaybackRate;
+  bool mPreservesPitch;
+
+  SPSCQueue<SPSCData> mSPSCQueue{40};
+  std::thread::id mProducerThreadId;
+
+  AudioSegment mBufferedData;
+
+  SPSCData::DecodedData mBatchedData;
+
+  bool mSentAllData = false;
+
+  std::unique_ptr<SoundTouchAdapter> mTimeStretcher;
+
+  AutoTArray<AudioDataValue, 2> mInterleavedBuffer;
+};
+
+}  
+
+#endif  // AudioDecoderInputTrack_h

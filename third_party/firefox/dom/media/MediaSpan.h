@@ -1,0 +1,107 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef MediaSpan_h
+#define MediaSpan_h
+
+#include "MediaData.h"
+#include "mozilla/RefPtr.h"
+
+namespace mozilla {
+
+class MediaSpan {
+ public:
+  ~MediaSpan() = default;
+
+  explicit MediaSpan(const MediaSpan& aOther) = default;
+
+  MediaSpan(MediaSpan&& aOther) = default;
+
+  explicit MediaSpan(const RefPtr<MediaByteBuffer>& aBuffer)
+      : mBuffer(aBuffer), mStart(0), mLength(aBuffer ? aBuffer->Length() : 0) {
+    MOZ_DIAGNOSTIC_ASSERT(mBuffer);
+  }
+
+  explicit MediaSpan(MediaByteBuffer* aBuffer)
+      : mBuffer(aBuffer), mStart(0), mLength(aBuffer ? aBuffer->Length() : 0) {
+    MOZ_DIAGNOSTIC_ASSERT(mBuffer);
+  }
+
+  MediaSpan& operator=(const MediaSpan& aOther) = default;
+
+  static MediaSpan WithCopyOf(const RefPtr<MediaByteBuffer>& aBuffer) {
+    RefPtr<MediaByteBuffer> buffer = new MediaByteBuffer(aBuffer->Length());
+    buffer->AppendElements(*aBuffer);
+    return MediaSpan(buffer);
+  }
+
+  bool IsEmpty() const { return Length() == 0; }
+
+  const uint8_t* Elements() const {
+    MOZ_DIAGNOSTIC_ASSERT(mStart < mBuffer->Length());
+    return mBuffer->Elements() + mStart;
+  }
+
+  size_t Length() const { return mLength; }
+
+  uint8_t operator[](size_t aIndex) const {
+    MOZ_DIAGNOSTIC_ASSERT(aIndex < Length());
+    return (*mBuffer)[mStart + aIndex];
+  }
+
+  bool Append(const MediaSpan& aBuffer) { return Append(aBuffer.Buffer()); }
+
+  bool Append(MediaByteBuffer* aBuffer) {
+    if (!aBuffer) {
+      return true;
+    }
+    if (mStart + mLength < mBuffer->Length()) {
+      RefPtr<MediaByteBuffer> buffer =
+          new MediaByteBuffer(mLength + aBuffer->Length());
+      if (!buffer->AppendElements(Elements(), Length(), fallible) ||
+          !buffer->AppendElements(*aBuffer, fallible)) {
+        return false;
+      }
+      mBuffer = buffer;
+      mLength += aBuffer->Length();
+      return true;
+    }
+    if (!mBuffer->AppendElements(*aBuffer, fallible)) {
+      return false;
+    }
+    mLength += aBuffer->Length();
+    return true;
+  }
+
+  MediaSpan To(size_t aEnd) const {
+    MOZ_DIAGNOSTIC_ASSERT(aEnd <= Length());
+    return MediaSpan(mBuffer, mStart, aEnd);
+  }
+
+  MediaSpan From(size_t aStart) const {
+    MOZ_DIAGNOSTIC_ASSERT(aStart <= Length());
+    return MediaSpan(mBuffer, mStart + aStart, Length() - aStart);
+  }
+
+  void RemoveFront(size_t aNumBytes) {
+    MOZ_DIAGNOSTIC_ASSERT(aNumBytes <= Length());
+    mStart += aNumBytes;
+    mLength -= aNumBytes;
+  }
+
+  MediaByteBuffer* Buffer() const { return mBuffer; }
+
+ private:
+  MediaSpan(MediaByteBuffer* aBuffer, size_t aStart, size_t aLength)
+      : mBuffer(aBuffer), mStart(aStart), mLength(aLength) {
+    MOZ_DIAGNOSTIC_ASSERT(mStart + mLength <= mBuffer->Length());
+  }
+
+  RefPtr<MediaByteBuffer> mBuffer;
+  size_t mStart = 0;
+  size_t mLength = 0;
+};
+
+}  
+
+#endif  // MediaSpan_h

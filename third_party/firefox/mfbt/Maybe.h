@@ -1,0 +1,1019 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_Maybe_h
+#define mozilla_Maybe_h
+
+#include <functional>
+#include <new>  // for placement new
+#include <ostream>
+#include <type_traits>
+#include <utility>
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/MaybeStorageBase.h"
+#include "mozilla/MemoryChecking.h"
+#include "mozilla/OperatorNewExtensions.h"
+#include "mozilla/Poison.h"
+#include "mozilla/ThreadSafety.h"
+
+class nsCycleCollectionTraversalCallback;
+
+template <typename T>
+inline void CycleCollectionNoteChild(
+    nsCycleCollectionTraversalCallback& aCallback, T* aChild, const char* aName,
+    uint32_t aFlags);
+
+namespace mozilla {
+
+struct Nothing {};
+
+constexpr bool operator==(const Nothing&, const Nothing&) { return true; }
+
+template <class T>
+class Maybe;
+
+namespace detail {
+
+
+template <size_t offset>
+inline void WritePoisonAtOffset(void* p, const uintptr_t poisonValue) {
+  memcpy(static_cast<char*>(p) + offset * sizeof(poisonValue), &poisonValue,
+         sizeof(poisonValue));
+}
+
+template <size_t Offset, size_t NOffsets>
+struct InlinePoisoner {
+  static void poison(void* p, const uintptr_t poisonValue) {
+    WritePoisonAtOffset<Offset>(p, poisonValue);
+    InlinePoisoner<Offset + 1, NOffsets>::poison(p, poisonValue);
+  }
+};
+
+template <size_t N>
+struct InlinePoisoner<N, N> {
+  static void poison(void*, const uintptr_t) {
+  }
+};
+
+template <size_t ObjectSize>
+struct OutOfLinePoisoner {
+  static MOZ_NEVER_INLINE void poison(void* p, const uintptr_t) {
+    mozWritePoison(p, ObjectSize);
+  }
+};
+
+template <typename T>
+inline void PoisonObject(T* p) {
+  const uintptr_t POISON = mozPoisonValue();
+  std::conditional_t<(sizeof(T) <= 8 * sizeof(POISON)),
+                     InlinePoisoner<0, sizeof(T) / sizeof(POISON)>,
+                     OutOfLinePoisoner<sizeof(T)>>::poison(p, POISON);
+}
+
+template <typename T>
+struct MaybePoisoner {
+  static const size_t N = sizeof(T);
+
+  static void poison(void* aPtr) {
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+    if (N >= sizeof(uintptr_t)) {
+      PoisonObject(static_cast<std::remove_cv_t<T>*>(aPtr));
+    }
+#endif
+    MOZ_MAKE_MEM_UNDEFINED(aPtr, N);
+  }
+};
+
+template <typename T,
+          bool TriviallyDestructibleAndCopyable =
+              IsTriviallyDestructibleAndCopyable<T>,
+          bool Copyable = std::is_copy_constructible_v<T>,
+          bool Movable = std::is_move_constructible_v<T>>
+class Maybe_CopyMove_Enabler;
+
+#define MOZ_MAYBE_COPY_OPS()                                                \
+  Maybe_CopyMove_Enabler(const Maybe_CopyMove_Enabler& aOther) {            \
+    if (downcast(aOther).isSome()) {                                        \
+      downcast(*this).emplace(*downcast(aOther));                           \
+    }                                                                       \
+  }                                                                         \
+                                                                            \
+  Maybe_CopyMove_Enabler& operator=(const Maybe_CopyMove_Enabler& aOther) { \
+    return downcast(*this).template operator= <T>(downcast(aOther));        \
+  }
+
+#define MOZ_MAYBE_MOVE_OPS()                                             \
+  constexpr Maybe_CopyMove_Enabler(Maybe_CopyMove_Enabler&& aOther) {    \
+    if (downcast(aOther).isSome()) {                                     \
+      downcast(*this).emplace(std::move(*downcast(aOther)));             \
+      downcast(aOther).reset();                                          \
+    }                                                                    \
+  }                                                                      \
+                                                                         \
+  constexpr Maybe_CopyMove_Enabler& operator=(                           \
+      Maybe_CopyMove_Enabler&& aOther) {                                 \
+    downcast(*this).template operator= <T>(std::move(downcast(aOther))); \
+                                                                         \
+    return *this;                                                        \
+  }
+
+#define MOZ_MAYBE_DOWNCAST()                                          \
+  static constexpr Maybe<T>& downcast(Maybe_CopyMove_Enabler& aObj) { \
+    return static_cast<Maybe<T>&>(aObj);                              \
+  }                                                                   \
+  static constexpr const Maybe<T>& downcast(                          \
+      const Maybe_CopyMove_Enabler& aObj) {                           \
+    return static_cast<const Maybe<T>&>(aObj);                        \
+  }
+
+template <typename T>
+class MOZ_TRIVIAL_ABI Maybe_CopyMove_Enabler<T, true, true, true> {
+ public:
+  Maybe_CopyMove_Enabler() = default;
+
+  Maybe_CopyMove_Enabler(const Maybe_CopyMove_Enabler&) = default;
+  Maybe_CopyMove_Enabler& operator=(const Maybe_CopyMove_Enabler&) = default;
+  constexpr Maybe_CopyMove_Enabler(Maybe_CopyMove_Enabler&& aOther) {
+    downcast(aOther).reset();
+  }
+  constexpr Maybe_CopyMove_Enabler& operator=(Maybe_CopyMove_Enabler&& aOther) {
+    downcast(aOther).reset();
+    return *this;
+  }
+
+ private:
+  MOZ_MAYBE_DOWNCAST()
+};
+
+template <typename T>
+class MOZ_TRIVIAL_ABI Maybe_CopyMove_Enabler<T, true, false, true> {
+ public:
+  Maybe_CopyMove_Enabler() = default;
+
+  Maybe_CopyMove_Enabler(const Maybe_CopyMove_Enabler&) = delete;
+  Maybe_CopyMove_Enabler& operator=(const Maybe_CopyMove_Enabler&) = delete;
+  constexpr Maybe_CopyMove_Enabler(Maybe_CopyMove_Enabler&& aOther) {
+    downcast(aOther).reset();
+  }
+  constexpr Maybe_CopyMove_Enabler& operator=(Maybe_CopyMove_Enabler&& aOther) {
+    downcast(aOther).reset();
+    return *this;
+  }
+
+ private:
+  MOZ_MAYBE_DOWNCAST()
+};
+
+template <typename T>
+class Maybe_CopyMove_Enabler<T, false, true, true> {
+ public:
+  Maybe_CopyMove_Enabler() = default;
+
+  MOZ_MAYBE_COPY_OPS()
+  MOZ_MAYBE_MOVE_OPS()
+
+ private:
+  MOZ_MAYBE_DOWNCAST()
+};
+
+template <typename T>
+class Maybe_CopyMove_Enabler<T, false, false, true> {
+ public:
+  Maybe_CopyMove_Enabler() = default;
+
+  Maybe_CopyMove_Enabler(const Maybe_CopyMove_Enabler&) = delete;
+  Maybe_CopyMove_Enabler& operator=(const Maybe_CopyMove_Enabler&) = delete;
+  MOZ_MAYBE_MOVE_OPS()
+
+ private:
+  MOZ_MAYBE_DOWNCAST()
+};
+
+template <typename T>
+class Maybe_CopyMove_Enabler<T, false, true, false> {
+ public:
+  Maybe_CopyMove_Enabler() = default;
+
+  MOZ_MAYBE_COPY_OPS()
+  Maybe_CopyMove_Enabler(Maybe_CopyMove_Enabler&&) = delete;
+  Maybe_CopyMove_Enabler& operator=(Maybe_CopyMove_Enabler&&) = delete;
+
+ private:
+  MOZ_MAYBE_DOWNCAST()
+};
+
+template <typename T, bool TriviallyDestructibleAndCopyable>
+class Maybe_CopyMove_Enabler<T, TriviallyDestructibleAndCopyable, false,
+                             false> {
+ public:
+  Maybe_CopyMove_Enabler() = default;
+
+  Maybe_CopyMove_Enabler(const Maybe_CopyMove_Enabler&) = delete;
+  Maybe_CopyMove_Enabler& operator=(const Maybe_CopyMove_Enabler&) = delete;
+  Maybe_CopyMove_Enabler(Maybe_CopyMove_Enabler&&) = delete;
+  Maybe_CopyMove_Enabler& operator=(Maybe_CopyMove_Enabler&&) = delete;
+};
+
+#undef MOZ_MAYBE_COPY_OPS
+#undef MOZ_MAYBE_MOVE_OPS
+#undef MOZ_MAYBE_DOWNCAST
+
+template <typename T, bool TriviallyDestructibleAndCopyable =
+                          IsTriviallyDestructibleAndCopyable<T>>
+struct MaybeStorage;
+
+template <typename T>
+struct MaybeStorage<T, false> : MaybeStorageBase<T> {
+ protected:
+  char mIsSome = false;  
+
+  constexpr MaybeStorage() = default;
+  explicit MaybeStorage(const T& aVal)
+      : MaybeStorageBase<T>{aVal}, mIsSome{true} {}
+  explicit MaybeStorage(T&& aVal)
+      : MaybeStorageBase<T>{std::move(aVal)}, mIsSome{true} {}
+
+  template <typename... Args>
+  explicit MaybeStorage(std::in_place_t, Args&&... aArgs)
+      : MaybeStorageBase<T>{std::in_place, std::forward<Args>(aArgs)...},
+        mIsSome{true} {}
+
+ public:
+
+  MaybeStorage(const MaybeStorage&) : MaybeStorageBase<T>{} {}
+  MaybeStorage& operator=(const MaybeStorage&) { return *this; }
+  MaybeStorage(MaybeStorage&&) : MaybeStorageBase<T>{} {}
+  MaybeStorage& operator=(MaybeStorage&&) { return *this; }
+
+  ~MaybeStorage() {
+    if (mIsSome) {
+      this->addr()->T::~T();
+    }
+  }
+};
+
+#ifdef __GNUC__
+#  pragma GCC diagnostic push
+#  pragma GCC diagnostic ignored "-Wunused-value"
+#endif
+template <typename T>
+struct MaybeStorage<T, true> : MaybeStorageBase<T> {
+ protected:
+  char mIsSome = false;  
+  char padding[alignof(MaybeStorageBase<T>) - sizeof(char)] = {};
+
+  constexpr MaybeStorage() = default;
+  constexpr explicit MaybeStorage(const T& aVal)
+      : MaybeStorageBase<T>{aVal}, mIsSome{true} {}
+  constexpr explicit MaybeStorage(T&& aVal)
+      : MaybeStorageBase<T>{std::move(aVal)}, mIsSome{true} {}
+
+  template <typename... Args>
+  constexpr explicit MaybeStorage(std::in_place_t, Args&&... aArgs)
+      : MaybeStorageBase<T>{std::in_place, std::forward<Args>(aArgs)...},
+        mIsSome{true} {}
+};
+#ifdef __GNUC__
+#  pragma GCC diagnostic pop
+#endif
+
+template <typename T>
+struct IsMaybeImpl : std::false_type {};
+
+template <typename T>
+struct IsMaybeImpl<Maybe<T>> : std::true_type {};
+
+template <typename T>
+using IsMaybe = IsMaybeImpl<std::decay_t<T>>;
+
+}  
+
+template <typename T, typename U = std::remove_cvref_t<T>>
+constexpr Maybe<U> Some(T&& aValue);
+
+template <class T>
+class MOZ_INHERIT_TYPE_ANNOTATIONS_FROM_TEMPLATE_ARGS
+MOZ_GSL_OWNER MOZ_EMPTY_BASES Maybe : private detail::MaybeStorage<T>,
+                                      public detail::Maybe_CopyMove_Enabler<T> {
+  template <typename, bool, bool, bool>
+  friend class detail::Maybe_CopyMove_Enabler;
+
+  template <typename U, typename V>
+  friend constexpr Maybe<V> Some(U&& aValue);
+
+  struct SomeGuard {};
+
+  template <typename U>
+  constexpr Maybe(U&& aValue, SomeGuard)
+      : detail::MaybeStorage<T>{std::forward<U>(aValue)} {}
+
+  using detail::MaybeStorage<T>::mIsSome;
+  using detail::MaybeStorage<T>::mStorage;
+
+  void poisonData() { detail::MaybePoisoner<T>::poison(&mStorage.val); }
+
+ public:
+  using ValueType = T;
+
+  MOZ_ALLOW_TEMPORARY constexpr Maybe() = default;
+
+  MOZ_ALLOW_TEMPORARY MOZ_IMPLICIT constexpr Maybe(Nothing) : Maybe{} {}
+
+  template <typename... Args>
+  constexpr explicit Maybe(std::in_place_t, Args&&... aArgs)
+      : detail::MaybeStorage<T>{std::in_place, std::forward<Args>(aArgs)...} {}
+
+  template <typename U,
+            std::enable_if_t<std::is_constructible_v<T, const U&>, bool> = true>
+  MOZ_IMPLICIT Maybe(const Maybe<U>& aOther) {
+    if (aOther.isSome()) {
+      emplace(*aOther);
+    }
+  }
+
+  template <typename U, std::enable_if_t<!std::is_constructible_v<T, const U&>,
+                                         bool> = true>
+  explicit Maybe(const Maybe<U>& aOther) = delete;
+
+  template <typename U,
+            std::enable_if_t<std::is_constructible_v<T, U&&>, bool> = true>
+  MOZ_IMPLICIT Maybe(Maybe<U>&& aOther) {
+    if (aOther.isSome()) {
+      emplace(std::move(*aOther));
+      aOther.reset();
+    }
+  }
+  template <typename U,
+            std::enable_if_t<!std::is_constructible_v<T, U&&>, bool> = true>
+  explicit Maybe(Maybe<U>&& aOther) = delete;
+
+  template <typename U,
+            std::enable_if_t<std::is_constructible_v<T, const U&>, bool> = true>
+  Maybe& operator=(const Maybe<U>& aOther) {
+    if (aOther.isSome()) {
+      if (mIsSome) {
+        ref() = aOther.ref();
+      } else {
+        emplace(*aOther);
+      }
+    } else {
+      reset();
+    }
+    return *this;
+  }
+
+  template <typename U, std::enable_if_t<!std::is_constructible_v<T, const U&>,
+                                         bool> = true>
+  Maybe& operator=(const Maybe<U>& aOther) = delete;
+
+  template <typename U,
+            std::enable_if_t<std::is_constructible_v<T, U&&>, bool> = true>
+  Maybe& operator=(Maybe<U>&& aOther) {
+    if (aOther.isSome()) {
+      if (mIsSome) {
+        ref() = std::move(aOther.ref());
+      } else {
+        emplace(std::move(*aOther));
+      }
+      aOther.reset();
+    } else {
+      reset();
+    }
+
+    return *this;
+  }
+
+  template <typename U,
+            std::enable_if_t<!std::is_constructible_v<T, U&&>, bool> = true>
+  Maybe& operator=(Maybe<U>&& aOther) = delete;
+
+  constexpr Maybe& operator=(Nothing) {
+    reset();
+    return *this;
+  }
+
+  constexpr explicit operator bool() const { return isSome(); }
+  constexpr bool isSome() const { return mIsSome; }
+  constexpr bool isNothing() const { return !mIsSome; }
+
+  constexpr T value() const&;
+  constexpr T value() &&;
+  constexpr T value() const&&;
+
+  constexpr T extract() {
+    MOZ_RELEASE_ASSERT(isSome());
+    T v = std::move(mStorage.val);
+    reset();
+    return v;
+  }
+
+  Maybe<T> take() { return std::exchange(*this, Nothing()); }
+
+  template <typename V>
+  constexpr T valueOr(V&& aDefault) const {
+    if (isSome()) {
+      return ref();
+    }
+    return std::forward<V>(aDefault);
+  }
+
+  template <typename F>
+  constexpr T valueOrFrom(F&& aFunc) const {
+    if (isSome()) {
+      return ref();
+    }
+    return aFunc();
+  }
+
+  constexpr T* ptr();
+  constexpr const T* ptr() const;
+
+  constexpr T* ptrOr(T* aDefault) {
+    if (isSome()) {
+      return ptr();
+    }
+    return aDefault;
+  }
+
+  constexpr const T* ptrOr(const T* aDefault) const {
+    if (isSome()) {
+      return ptr();
+    }
+    return aDefault;
+  }
+
+  template <typename F>
+  constexpr T* ptrOrFrom(F&& aFunc) {
+    if (isSome()) {
+      return ptr();
+    }
+    return aFunc();
+  }
+
+  template <typename F>
+  constexpr const T* ptrOrFrom(F&& aFunc) const {
+    if (isSome()) {
+      return ptr();
+    }
+    return aFunc();
+  }
+
+  constexpr T* operator->();
+  constexpr const T* operator->() const;
+
+  constexpr T& ref() & MOZ_LIFETIME_BOUND;
+  constexpr const T& ref() const& MOZ_LIFETIME_BOUND;
+  constexpr T&& ref() && MOZ_LIFETIME_BOUND;
+  constexpr const T&& ref() const&& MOZ_LIFETIME_BOUND;
+
+  constexpr T& refOr(T& aDefault MOZ_LIFETIME_BOUND) MOZ_LIFETIME_BOUND {
+    if (isSome()) {
+      return ref();
+    }
+    return aDefault;
+  }
+
+  constexpr const T& refOr(const T& aDefault MOZ_LIFETIME_BOUND) const
+      MOZ_LIFETIME_BOUND {
+    if (isSome()) {
+      return ref();
+    }
+    return aDefault;
+  }
+
+  template <typename F>
+  constexpr T& refOrFrom(F&& aFunc) {
+    if (isSome()) {
+      return ref();
+    }
+    return aFunc();
+  }
+
+  template <typename F>
+  constexpr const T& refOrFrom(F&& aFunc) const {
+    if (isSome()) {
+      return ref();
+    }
+    return aFunc();
+  }
+
+  constexpr T& operator*() & MOZ_LIFETIME_BOUND;
+  constexpr const T& operator*() const& MOZ_LIFETIME_BOUND;
+  constexpr T&& operator*() && MOZ_LIFETIME_BOUND;
+  constexpr const T&& operator*() const&& MOZ_LIFETIME_BOUND;
+
+  template <typename Func>
+  constexpr Maybe& apply(Func&& aFunc) & {
+    if (isSome()) {
+      std::forward<Func>(aFunc)(ref());
+    }
+    return *this;
+  }
+
+  template <typename Func>
+  constexpr const Maybe& apply(Func&& aFunc) const& {
+    if (isSome()) {
+      std::forward<Func>(aFunc)(ref());
+    }
+    return *this;
+  }
+
+  template <typename Func>
+  constexpr Maybe& apply(Func&& aFunc) && {
+    if (isSome()) {
+      std::forward<Func>(aFunc)(extract());
+    }
+    return *this;
+  }
+
+  template <typename Func>
+  constexpr Maybe& apply(Func&& aFunc) const&& {
+    if (isSome()) {
+      std::forward<Func>(aFunc)(extract());
+    }
+    return *this;
+  }
+
+  template <typename Func>
+  constexpr auto map(Func&& aFunc) & {
+    if (isSome()) {
+      return Some(std::forward<Func>(aFunc)(ref()));
+    }
+    return Maybe<decltype(std::forward<Func>(aFunc)(ref()))>{};
+  }
+
+  template <typename Func>
+  constexpr auto map(Func&& aFunc) const& {
+    if (isSome()) {
+      return Some(std::forward<Func>(aFunc)(ref()));
+    }
+    return Maybe<decltype(std::forward<Func>(aFunc)(ref()))>{};
+  }
+
+  template <typename Func>
+  constexpr auto map(Func&& aFunc) && {
+    if (isSome()) {
+      return Some(std::forward<Func>(aFunc)(extract()));
+    }
+    return Maybe<decltype(std::forward<Func>(aFunc)(extract()))>{};
+  }
+
+  template <typename Func>
+  constexpr auto map(Func&& aFunc) const&& {
+    if (isSome()) {
+      return Some(std::forward<Func>(aFunc)(extract()));
+    }
+    return Maybe<decltype(std::forward<Func>(aFunc)(extract()))>{};
+  }
+
+  template <typename Func>
+  constexpr auto andThen(Func&& aFunc) & {
+    static_assert(std::is_invocable_v<Func, T&>);
+    using U = std::invoke_result_t<Func, T&>;
+    static_assert(detail::IsMaybe<U>::value);
+    if (isSome()) {
+      return std::invoke(std::forward<Func>(aFunc), ref());
+    }
+    return std::remove_cvref_t<U>{};
+  }
+
+  template <typename Func>
+  constexpr auto andThen(Func&& aFunc) const& {
+    static_assert(std::is_invocable_v<Func, const T&>);
+    using U = std::invoke_result_t<Func, const T&>;
+    static_assert(detail::IsMaybe<U>::value);
+    if (isSome()) {
+      return std::invoke(std::forward<Func>(aFunc), ref());
+    }
+    return std::remove_cvref_t<U>{};
+  }
+
+  template <typename Func>
+  constexpr auto andThen(Func&& aFunc) && {
+    static_assert(std::is_invocable_v<Func, T&&>);
+    using U = std::invoke_result_t<Func, T&&>;
+    static_assert(detail::IsMaybe<U>::value);
+    if (isSome()) {
+      return std::invoke(std::forward<Func>(aFunc), extract());
+    }
+    return std::remove_cvref_t<U>{};
+  }
+
+  template <typename Func>
+  constexpr auto andThen(Func&& aFunc) const&& {
+    static_assert(std::is_invocable_v<Func, const T&&>);
+    using U = std::invoke_result_t<Func, const T&&>;
+    static_assert(detail::IsMaybe<U>::value);
+    if (isSome()) {
+      return std::invoke(std::forward<Func>(aFunc), extract());
+    }
+    return std::remove_cvref_t<U>{};
+  }
+
+  template <typename Func>
+  constexpr Maybe orElse(Func&& aFunc) & {
+    static_assert(std::is_invocable_v<Func>);
+    using U = std::invoke_result_t<Func>;
+    static_assert(std::is_same_v<Maybe, std::remove_cvref_t<U>>);
+    if (isSome()) {
+      return *this;
+    }
+    return std::invoke(std::forward<Func>(aFunc));
+  }
+
+  template <typename Func>
+  constexpr Maybe orElse(Func&& aFunc) const& {
+    static_assert(std::is_invocable_v<Func>);
+    using U = std::invoke_result_t<Func>;
+    static_assert(std::is_same_v<Maybe, std::remove_cvref_t<U>>);
+    if (isSome()) {
+      return *this;
+    }
+    return std::invoke(std::forward<Func>(aFunc));
+  }
+
+  template <typename Func>
+  constexpr Maybe orElse(Func&& aFunc) && {
+    static_assert(std::is_invocable_v<Func>);
+    using U = std::invoke_result_t<Func>;
+    static_assert(std::is_same_v<Maybe, std::remove_cvref_t<U>>);
+    if (isSome()) {
+      return std::move(*this);
+    }
+    return std::invoke(std::forward<Func>(aFunc));
+  }
+
+  template <typename Func>
+  constexpr Maybe orElse(Func&& aFunc) const&& {
+    static_assert(std::is_invocable_v<Func>);
+    using U = std::invoke_result_t<Func>;
+    static_assert(std::is_same_v<Maybe, std::remove_cvref_t<U>>);
+    if (isSome()) {
+      return std::move(*this);
+    }
+    return std::invoke(std::forward<Func>(aFunc));
+  }
+
+ private:
+  template <typename U>
+  struct Iterator {
+    using iterator_type = Iterator<U>;
+    using value_type = U;
+    using difference_type = std::ptrdiff_t;
+    using reference = value_type&;
+    using pointer = value_type*;
+    using iterator_category = std::forward_iterator_tag;
+
+    constexpr Iterator() = default;
+    constexpr explicit Iterator(pointer aValue) : mValue(aValue) {}
+
+    constexpr reference operator*() const { return *mValue; };
+
+    constexpr pointer operator->() const { return mValue; }
+
+    constexpr iterator_type& operator++() {
+      mValue = nullptr;
+      return *this;
+    }
+
+    constexpr iterator_type operator++(int) {
+      iterator_type it{mValue};
+      mValue = nullptr;
+      return it;
+    }
+
+    constexpr auto operator<=>(const Iterator&) const = default;
+
+   private:
+    pointer mValue;
+  };
+
+ public:
+  using iterator = Iterator<T>;
+  using const_iterator = Iterator<const T>;
+
+  constexpr iterator begin() { return iterator{ptrOr(nullptr)}; }
+  constexpr const_iterator begin() const {
+    return const_iterator{ptrOr(nullptr)};
+  }
+  constexpr const_iterator cbegin() const { return begin(); }
+
+  constexpr iterator end() { return iterator{nullptr}; }
+  constexpr const_iterator end() const { return const_iterator{nullptr}; }
+  constexpr const_iterator cend() const { return end(); }
+
+  constexpr void reset() {
+    if (isSome()) {
+      if constexpr (!std::is_trivially_destructible_v<T>) {
+        MOZ_PUSH_IGNORE_THREAD_SAFETY
+        ref().T::~T();
+        MOZ_POP_THREAD_SAFETY
+        poisonData();
+      }
+      mIsSome = false;
+    }
+  }
+
+  template <typename... Args>
+  constexpr void emplace(Args&&... aArgs);
+
+  template <typename U>
+  constexpr std::enable_if_t<std::is_same_v<T, U> &&
+                             std::is_copy_constructible_v<U> &&
+                             !std::is_move_constructible_v<U>>
+  emplace(U&& aArgs) {
+    emplace(aArgs);
+  }
+
+  friend std::ostream& operator<<(std::ostream& aStream,
+                                  const Maybe<T>& aMaybe) {
+    if (aMaybe) {
+      aStream << aMaybe.ref();
+    } else {
+      aStream << "<Nothing>";
+    }
+    return aStream;
+  }
+};
+
+template <typename T>
+class Maybe<T&> {
+ public:
+  constexpr Maybe() = default;
+  constexpr MOZ_IMPLICIT Maybe(Nothing) {}
+
+  void emplace(T& aRef) { mValue = &aRef; }
+
+  constexpr explicit operator bool() const { return isSome(); }
+  constexpr bool isSome() const { return mValue; }
+  constexpr bool isNothing() const { return !mValue; }
+
+  T& ref() const {
+    MOZ_RELEASE_ASSERT(isSome());
+    return *mValue;
+  }
+
+  T* operator->() const { return &ref(); }
+  T& operator*() const { return ref(); }
+
+
+
+  void reset() { mValue = nullptr; }
+
+  template <typename Func>
+  const Maybe& apply(Func&& aFunc) const {
+    if (isSome()) {
+      std::forward<Func>(aFunc)(ref());
+    }
+    return *this;
+  }
+
+  template <typename Func>
+  auto map(Func&& aFunc) const {
+    Maybe<decltype(std::forward<Func>(aFunc)(ref()))> val;
+    if (isSome()) {
+      val.emplace(std::forward<Func>(aFunc)(ref()));
+    }
+    return val;
+  }
+
+  template <typename Func>
+  constexpr auto andThen(Func&& aFunc) const {
+    static_assert(std::is_invocable_v<Func, T&>);
+    using U = std::invoke_result_t<Func, T&>;
+    static_assert(detail::IsMaybe<U>::value);
+    if (isSome()) {
+      return std::invoke(std::forward<Func>(aFunc), ref());
+    }
+    return std::remove_cvref_t<U>{};
+  }
+
+  template <typename Func>
+  constexpr Maybe orElse(Func&& aFunc) const {
+    static_assert(std::is_invocable_v<Func>);
+    using U = std::invoke_result_t<Func>;
+    static_assert(std::is_same_v<Maybe, std::remove_cvref_t<U>>);
+    if (isSome()) {
+      return *this;
+    }
+    return std::invoke(std::forward<Func>(aFunc));
+  }
+
+  bool refEquals(const Maybe<T&>& aOther) const {
+    return mValue == aOther.mValue;
+  }
+
+  bool refEquals(const T& aOther) const { return mValue == &aOther; }
+
+ private:
+  T* mValue = nullptr;
+};
+
+template <typename T>
+constexpr T Maybe<T>::value() const& {
+  MOZ_RELEASE_ASSERT(isSome());
+  return ref();
+}
+
+template <typename T>
+constexpr T Maybe<T>::value() && {
+  MOZ_RELEASE_ASSERT(isSome());
+  return std::move(ref());
+}
+
+template <typename T>
+constexpr T Maybe<T>::value() const&& {
+  MOZ_RELEASE_ASSERT(isSome());
+  return std::move(ref());
+}
+
+template <typename T>
+constexpr T* Maybe<T>::ptr() {
+  MOZ_RELEASE_ASSERT(isSome());
+  return &ref();
+}
+
+template <typename T>
+constexpr const T* Maybe<T>::ptr() const {
+  MOZ_RELEASE_ASSERT(isSome());
+  return &ref();
+}
+
+template <typename T>
+constexpr T* Maybe<T>::operator->() {
+  MOZ_RELEASE_ASSERT(isSome());
+  return ptr();
+}
+
+template <typename T>
+constexpr const T* Maybe<T>::operator->() const {
+  MOZ_RELEASE_ASSERT(isSome());
+  return ptr();
+}
+
+template <typename T>
+constexpr T& Maybe<T>::ref() & {
+  MOZ_RELEASE_ASSERT(isSome());
+  return mStorage.val;
+}
+
+template <typename T>
+constexpr const T& Maybe<T>::ref() const& {
+  MOZ_RELEASE_ASSERT(isSome());
+  return mStorage.val;
+}
+
+template <typename T>
+constexpr T&& Maybe<T>::ref() && {
+  MOZ_RELEASE_ASSERT(isSome());
+  return std::move(mStorage.val);
+}
+
+template <typename T>
+constexpr const T&& Maybe<T>::ref() const&& {
+  MOZ_RELEASE_ASSERT(isSome());
+  return std::move(mStorage.val);
+}
+
+template <typename T>
+constexpr T& Maybe<T>::operator*() & {
+  MOZ_RELEASE_ASSERT(isSome());
+  return ref();
+}
+
+template <typename T>
+constexpr const T& Maybe<T>::operator*() const& {
+  MOZ_RELEASE_ASSERT(isSome());
+  return ref();
+}
+
+template <typename T>
+constexpr T&& Maybe<T>::operator*() && {
+  MOZ_RELEASE_ASSERT(isSome());
+  return std::move(ref());
+}
+
+template <typename T>
+constexpr const T&& Maybe<T>::operator*() const&& {
+  MOZ_RELEASE_ASSERT(isSome());
+  return std::move(ref());
+}
+
+template <typename T>
+template <typename... Args>
+constexpr void Maybe<T>::emplace(Args&&... aArgs) {
+  MOZ_RELEASE_ASSERT(!isSome());
+  ::new (KnownNotNull, &mStorage.val) T(std::forward<Args>(aArgs)...);
+  mIsSome = true;
+}
+
+template <typename T, typename U>
+constexpr Maybe<U> Some(T&& aValue) {
+  return {std::forward<T>(aValue), typename Maybe<U>::SomeGuard{}};
+}
+
+template <typename T>
+constexpr Maybe<T&> SomeRef(T& aValue) {
+  Maybe<T&> value;
+  value.emplace(aValue);
+  return value;
+}
+
+template <typename T>
+constexpr Maybe<T&> ToMaybeRef(T* const aPtr) {
+  return aPtr ? SomeRef(*aPtr) : Nothing{};
+}
+
+template <typename T>
+Maybe<std::remove_cvref_t<T>> ToMaybe(T* aPtr) {
+  if (aPtr) {
+    return Some(*aPtr);
+  }
+  return Nothing();
+}
+
+template <typename T>
+constexpr bool operator==(const Maybe<T>& aLHS, const Maybe<T>& aRHS) {
+  static_assert(!std::is_reference_v<T>,
+                "operator== is not defined for Maybe<T&>, compare values or "
+                "addresses explicitly instead");
+  if (aLHS.isNothing() != aRHS.isNothing()) {
+    return false;
+  }
+  return aLHS.isNothing() || *aLHS == *aRHS;
+}
+
+template <typename T>
+constexpr bool operator!=(const Maybe<T>& aLHS, const Maybe<T>& aRHS) {
+  return !(aLHS == aRHS);
+}
+
+template <typename T>
+constexpr bool operator==(const Maybe<T>& aLHS, const Nothing& aRHS) {
+  return aLHS.isNothing();
+}
+
+template <typename T>
+constexpr bool operator!=(const Maybe<T>& aLHS, const Nothing& aRHS) {
+  return !(aLHS == aRHS);
+}
+
+template <typename T>
+constexpr bool operator==(const Nothing& aLHS, const Maybe<T>& aRHS) {
+  return aRHS.isNothing();
+}
+
+template <typename T>
+constexpr bool operator!=(const Nothing& aLHS, const Maybe<T>& aRHS) {
+  return !(aLHS == aRHS);
+}
+
+template <typename T>
+constexpr bool operator<(const Maybe<T>& aLHS, const Maybe<T>& aRHS) {
+  if (aLHS.isNothing()) {
+    return aRHS.isSome();
+  }
+  if (aRHS.isNothing()) {
+    return false;
+  }
+  return *aLHS < *aRHS;
+}
+
+template <typename T>
+constexpr bool operator>(const Maybe<T>& aLHS, const Maybe<T>& aRHS) {
+  return !(aLHS < aRHS || aLHS == aRHS);
+}
+
+template <typename T>
+constexpr bool operator<=(const Maybe<T>& aLHS, const Maybe<T>& aRHS) {
+  return aLHS < aRHS || aLHS == aRHS;
+}
+
+template <typename T>
+constexpr bool operator>=(const Maybe<T>& aLHS, const Maybe<T>& aRHS) {
+  return !(aLHS < aRHS);
+}
+
+template <typename T>
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback, mozilla::Maybe<T>& aField,
+    const char* aName, uint32_t aFlags = 0) {
+  if (aField) {
+    ImplCycleCollectionTraverse(aCallback, aField.ref(), aName, aFlags);
+  }
+}
+
+template <typename T>
+inline void ImplCycleCollectionUnlink(mozilla::Maybe<T>& aField) {
+  if (aField) {
+    ImplCycleCollectionUnlink(aField.ref());
+  }
+}
+
+}  
+
+#endif /* mozilla_Maybe_h */

@@ -1,0 +1,769 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef vm_Stack_h
+#define vm_Stack_h
+
+#include "mozilla/HashFunctions.h"
+#include "mozilla/MemoryReporting.h"
+
+#include <algorithm>
+#include <type_traits>
+
+#include "js/ErrorReport.h"
+#include "js/friend/ErrorMessages.h"  // js::GetErrorMessage, JSMSG_*
+#include "js/RootingAPI.h"
+#include "js/TypeDecls.h"
+#include "js/ValueArray.h"
+#include "vm/ArgumentsObject.h"
+#include "vm/JSFunction.h"
+#include "vm/JSScript.h"
+#include "wasm/WasmDebugFrame.h"  // js::wasm::DebugFrame
+
+namespace js {
+
+class InterpreterRegs;
+class CallObject;
+class FrameIter;
+class ClassBodyScope;
+class EnvironmentObject;
+class BlockLexicalEnvironmentObject;
+class ExtensibleLexicalEnvironmentObject;
+class GeckoProfilerRuntime;
+class InterpreterFrame;
+class EnvironmentIter;
+class EnvironmentCoordinate;
+
+namespace jit {
+class CommonFrameLayout;
+}
+namespace wasm {
+class Instance;
+}  
+
+
+
+enum MaybeCheckAliasing { CHECK_ALIASING = true, DONT_CHECK_ALIASING = false };
+
+}  
+
+
+namespace js {
+
+namespace jit {
+class BaselineFrame;
+class RematerializedFrame;
+}  
+
+class AbstractFramePtr {
+  friend class FrameIter;
+
+  uintptr_t ptr_;
+
+  enum {
+    Tag_InterpreterFrame = 0x0,
+    Tag_BaselineFrame = 0x1,
+    Tag_RematerializedFrame = 0x2,
+    Tag_WasmDebugFrame = 0x3,
+    TagMask = 0x3
+  };
+
+  explicit AbstractFramePtr(uintptr_t ptr) : ptr_(ptr) {}
+
+ public:
+  AbstractFramePtr() : ptr_(0) {}
+
+  MOZ_IMPLICIT AbstractFramePtr(InterpreterFrame* fp)
+      : ptr_(fp ? uintptr_t(fp) | Tag_InterpreterFrame : 0) {
+    MOZ_ASSERT_IF(fp, asInterpreterFrame() == fp);
+  }
+
+  MOZ_IMPLICIT AbstractFramePtr(jit::BaselineFrame* fp)
+      : ptr_(fp ? uintptr_t(fp) | Tag_BaselineFrame : 0) {
+    MOZ_ASSERT_IF(fp, asBaselineFrame() == fp);
+  }
+
+  MOZ_IMPLICIT AbstractFramePtr(jit::RematerializedFrame* fp)
+      : ptr_(fp ? uintptr_t(fp) | Tag_RematerializedFrame : 0) {
+    MOZ_ASSERT_IF(fp, asRematerializedFrame() == fp);
+  }
+
+  MOZ_IMPLICIT AbstractFramePtr(wasm::DebugFrame* fp)
+      : ptr_(fp ? uintptr_t(fp) | Tag_WasmDebugFrame : 0) {
+    static_assert(wasm::DebugFrame::Alignment >= TagMask, "aligned");
+    MOZ_ASSERT_IF(fp, asWasmDebugFrame() == fp);
+  }
+
+  bool isInterpreterFrame() const {
+    return (ptr_ & TagMask) == Tag_InterpreterFrame;
+  }
+  InterpreterFrame* asInterpreterFrame() const {
+    MOZ_ASSERT(isInterpreterFrame());
+    InterpreterFrame* res = (InterpreterFrame*)(ptr_ & ~TagMask);
+    MOZ_ASSERT(res);
+    return res;
+  }
+  bool isBaselineFrame() const { return (ptr_ & TagMask) == Tag_BaselineFrame; }
+  jit::BaselineFrame* asBaselineFrame() const {
+    MOZ_ASSERT(isBaselineFrame());
+    jit::BaselineFrame* res = (jit::BaselineFrame*)(ptr_ & ~TagMask);
+    MOZ_ASSERT(res);
+    return res;
+  }
+  bool isRematerializedFrame() const {
+    return (ptr_ & TagMask) == Tag_RematerializedFrame;
+  }
+  jit::RematerializedFrame* asRematerializedFrame() const {
+    MOZ_ASSERT(isRematerializedFrame());
+    jit::RematerializedFrame* res =
+        (jit::RematerializedFrame*)(ptr_ & ~TagMask);
+    MOZ_ASSERT(res);
+    return res;
+  }
+  bool isWasmDebugFrame() const {
+    return (ptr_ & TagMask) == Tag_WasmDebugFrame;
+  }
+  wasm::DebugFrame* asWasmDebugFrame() const {
+    MOZ_ASSERT(isWasmDebugFrame());
+    wasm::DebugFrame* res = (wasm::DebugFrame*)(ptr_ & ~TagMask);
+    MOZ_ASSERT(res);
+    return res;
+  }
+
+  void* raw() const { return reinterpret_cast<void*>(ptr_); }
+  static AbstractFramePtr fromRaw(void* raw) {
+    return AbstractFramePtr(reinterpret_cast<uintptr_t>(raw));
+  }
+
+  bool operator==(const AbstractFramePtr& other) const {
+    return ptr_ == other.ptr_;
+  }
+  bool operator!=(const AbstractFramePtr& other) const {
+    return ptr_ != other.ptr_;
+  }
+
+  explicit operator bool() const { return !!ptr_; }
+
+  inline JSObject* environmentChain() const;
+  inline CallObject& callObj() const;
+  inline bool initFunctionEnvironmentObjects(JSContext* cx);
+  inline bool pushVarEnvironment(JSContext* cx, Handle<Scope*> scope);
+  template <typename SpecificEnvironment>
+  inline void pushOnEnvironmentChain(SpecificEnvironment& env);
+  template <typename SpecificEnvironment>
+  inline void popOffEnvironmentChain();
+
+  inline JS::Realm* realm() const;
+
+  inline bool hasInitialEnvironment() const;
+  inline bool isGlobalFrame() const;
+  inline bool isModuleFrame() const;
+  inline bool isEvalFrame() const;
+  inline bool isDebuggerEvalFrame() const;
+
+  inline bool hasScript() const;
+  inline JSScript* script() const;
+  inline wasm::Instance* wasmInstance() const;
+  inline GlobalObject* global() const;
+  inline bool hasGlobal(const GlobalObject* global) const;
+  inline JSFunction* callee() const;
+  inline Value calleev() const;
+  inline Value& thisArgument() const;
+
+  inline bool isConstructing() const;
+
+  inline bool debuggerNeedsCheckPrimitiveReturn() const;
+
+  inline bool isFunctionFrame() const;
+  inline bool isGeneratorFrame() const;
+
+  inline bool saveGeneratorSlots(JSContext* cx, unsigned nslots,
+                                 ArrayObject* dest) const;
+
+  inline bool hasCachedSavedFrame() const;
+
+  inline unsigned numActualArgs() const;
+  inline unsigned numFormalArgs() const;
+
+  inline Value* argv() const;
+
+  inline bool hasArgs() const;
+  inline bool hasArgsObj() const;
+  inline ArgumentsObject& argsObj() const;
+  inline void initArgsObj(ArgumentsObject& argsobj) const;
+
+  inline Value& unaliasedLocal(uint32_t i);
+  inline Value& unaliasedFormal(
+      unsigned i, MaybeCheckAliasing checkAliasing = CHECK_ALIASING);
+  inline Value& unaliasedActual(
+      unsigned i, MaybeCheckAliasing checkAliasing = CHECK_ALIASING);
+  template <class Op>
+  inline void unaliasedForEachActual(JSContext* cx, Op op);
+
+  inline bool prevUpToDate() const;
+  inline void setPrevUpToDate() const;
+  inline void unsetPrevUpToDate() const;
+
+  inline bool isDebuggee() const;
+  inline void setIsDebuggee();
+  inline void unsetIsDebuggee();
+
+  inline HandleValue returnValue() const;
+  inline void setReturnValue(const Value& rval) const;
+
+  friend void GDBTestInitAbstractFramePtr(AbstractFramePtr&, InterpreterFrame*);
+  friend void GDBTestInitAbstractFramePtr(AbstractFramePtr&,
+                                          jit::BaselineFrame*);
+  friend void GDBTestInitAbstractFramePtr(AbstractFramePtr&,
+                                          jit::RematerializedFrame*);
+  friend void GDBTestInitAbstractFramePtr(AbstractFramePtr& frame,
+                                          wasm::DebugFrame* ptr);
+};
+
+class NullFramePtr : public AbstractFramePtr {
+ public:
+  NullFramePtr() = default;
+};
+
+enum MaybeConstruct { NO_CONSTRUCT = false, CONSTRUCT = true };
+
+
+class InterpreterFrame {
+  enum Flags : uint32_t {
+    CONSTRUCTING = 0x1, 
+
+    RESUMED_GENERATOR = 0x2, 
+
+    HAS_INITIAL_ENV =
+        0x4,            
+    HAS_ARGS_OBJ = 0x8, 
+
+    HAS_RVAL = 0x10, 
+
+    PREV_UP_TO_DATE = 0x20, 
+
+    DEBUGGEE = 0x40, 
+
+    HAS_PUSHED_PROF_FRAME = 0x80, 
+
+    RUNNING_IN_JIT = 0x100,
+
+    HAS_CACHED_SAVED_FRAME = 0x200,
+  };
+
+  mutable uint32_t flags_; 
+  uint32_t nactual_;       
+  JSScript* script_;       
+  JSObject* envChain_;     
+  Value rval_;             
+  ArgumentsObject* argsObj_; 
+
+  InterpreterFrame* prev_;
+  jsbytecode* prevpc_;
+  Value* prevsp_;
+
+  AbstractFramePtr evalInFramePrev_;
+
+  Value* argv_;          
+  LifoAlloc::Mark mark_; 
+
+  static void staticAsserts() {
+    static_assert(offsetof(InterpreterFrame, rval_) % sizeof(Value) == 0);
+    static_assert(sizeof(InterpreterFrame) % sizeof(Value) == 0);
+  }
+
+  Value* slots() const { return (Value*)(this + 1); }
+  Value* base() const { return slots() + script()->nfixed(); }
+
+  friend class FrameIter;
+  friend class InterpreterRegs;
+  friend class InterpreterStack;
+  friend class jit::BaselineFrame;
+
+
+  void initCallFrame(InterpreterFrame* prev, jsbytecode* prevpc, Value* prevsp,
+                     JSFunction& callee, JSScript* script, Value* argv,
+                     uint32_t nactual, MaybeConstruct constructing);
+
+  void initExecuteFrame(JSContext* cx, HandleScript script,
+                        AbstractFramePtr prev, HandleObject envChain);
+
+ public:
+
+  bool prologue(JSContext* cx);
+  void epilogue(JSContext* cx, jsbytecode* pc);
+
+  bool checkReturn(JSContext* cx, HandleValue thisv, MutableHandleValue result);
+
+  bool initFunctionEnvironmentObjects(JSContext* cx);
+
+  void initLocals();
+
+
+  bool isGlobalFrame() const { return script_->isGlobalCode(); }
+
+  bool isModuleFrame() const { return script_->isModule(); }
+
+  bool isEvalFrame() const { return script_->isForEval(); }
+
+  bool isFunctionFrame() const { return script_->isFunction(); }
+
+
+  InterpreterFrame* prev() const { return prev_; }
+
+  AbstractFramePtr evalInFramePrev() const {
+    MOZ_ASSERT(isEvalFrame());
+    return evalInFramePrev_;
+  }
+
+
+  inline Value& unaliasedLocal(uint32_t i);
+
+  bool hasArgs() const { return isFunctionFrame(); }
+  inline Value& unaliasedFormal(unsigned i,
+                                MaybeCheckAliasing = CHECK_ALIASING);
+  inline Value& unaliasedActual(unsigned i,
+                                MaybeCheckAliasing = CHECK_ALIASING);
+  template <class Op>
+  inline void unaliasedForEachActual(Op op);
+
+  unsigned numFormalArgs() const {
+    MOZ_ASSERT(hasArgs());
+    return callee().nargs();
+  }
+  unsigned numActualArgs() const {
+    MOZ_ASSERT(hasArgs());
+    return nactual_;
+  }
+
+  Value* argv() const {
+    MOZ_ASSERT(hasArgs());
+    return argv_;
+  }
+
+
+  ArgumentsObject& argsObj() const;
+  void initArgsObj(ArgumentsObject& argsobj);
+
+  ArrayObject* createRestParameter(JSContext* cx);
+
+
+  inline HandleObject environmentChain() const;
+
+  inline EnvironmentObject& aliasedEnvironment(EnvironmentCoordinate ec) const;
+  inline EnvironmentObject& aliasedEnvironmentMaybeDebug(
+      EnvironmentCoordinate ec) const;
+  inline GlobalObject& global() const;
+  inline CallObject& callObj() const;
+  inline ExtensibleLexicalEnvironmentObject& extensibleLexicalEnvironment()
+      const;
+
+  template <typename SpecificEnvironment>
+  inline void pushOnEnvironmentChain(SpecificEnvironment& env);
+  template <typename SpecificEnvironment>
+  inline void popOffEnvironmentChain();
+  inline void replaceInnermostEnvironment(BlockLexicalEnvironmentObject& env);
+
+  bool pushVarEnvironment(JSContext* cx, Handle<Scope*> scope);
+
+
+  bool pushLexicalEnvironment(JSContext* cx, Handle<LexicalScope*> scope);
+  bool freshenLexicalEnvironment(JSContext* cx, jsbytecode* pc);
+  bool recreateLexicalEnvironment(JSContext* cx, jsbytecode* pc);
+
+  bool pushClassBodyEnvironment(JSContext* cx, Handle<ClassBodyScope*> scope);
+
+
+  JSScript* script() const { return script_; }
+
+  jsbytecode* prevpc() {
+    MOZ_ASSERT(prev_);
+    return prevpc_;
+  }
+
+  Value* prevsp() {
+    MOZ_ASSERT(prev_);
+    return prevsp_;
+  }
+
+  Value& thisArgument() const {
+    MOZ_ASSERT(isFunctionFrame());
+    return argv()[-1];
+  }
+
+
+  JSFunction& callee() const {
+    MOZ_ASSERT(isFunctionFrame());
+    return calleev().toObject().as<JSFunction>();
+  }
+
+  const Value& calleev() const {
+    MOZ_ASSERT(isFunctionFrame());
+    return argv()[-2];
+  }
+
+  Value newTarget() const {
+    MOZ_ASSERT(isFunctionFrame());
+    MOZ_ASSERT(!callee().isArrow());
+
+    if (isConstructing()) {
+      unsigned pushedArgs = std::max(numFormalArgs(), numActualArgs());
+      return argv()[pushedArgs];
+    }
+    return UndefinedValue();
+  }
+
+
+  bool hasPushedGeckoProfilerFrame() {
+    return !!(flags_ & HAS_PUSHED_PROF_FRAME);
+  }
+
+  void setPushedGeckoProfilerFrame() { flags_ |= HAS_PUSHED_PROF_FRAME; }
+
+  void unsetPushedGeckoProfilerFrame() { flags_ &= ~HAS_PUSHED_PROF_FRAME; }
+
+
+  bool hasReturnValue() const { return flags_ & HAS_RVAL; }
+
+  MutableHandleValue returnValue() {
+    if (!hasReturnValue()) {
+      rval_.setUndefined();
+    }
+    return MutableHandleValue::fromMarkedLocation(&rval_);
+  }
+
+  void markReturnValue() { flags_ |= HAS_RVAL; }
+
+  void setReturnValue(const Value& v) {
+    rval_ = v;
+    markReturnValue();
+  }
+
+  [[nodiscard]] inline bool saveGeneratorSlots(JSContext* cx, unsigned nslots,
+                                               ArrayObject* dest) const;
+
+  inline void restoreGeneratorSlots(ArrayObject* src);
+
+  void resumeGeneratorFrame(JSObject* envChain) {
+    MOZ_ASSERT(script()->isGenerator() || script()->isAsync());
+    MOZ_ASSERT_IF(!script()->isModule(), isFunctionFrame());
+    flags_ |= HAS_INITIAL_ENV;
+    envChain_ = envChain;
+  }
+
+
+  bool isConstructing() const { return !!(flags_ & CONSTRUCTING); }
+
+  void setResumedGenerator() { flags_ |= RESUMED_GENERATOR; }
+  bool isResumedGenerator() const { return !!(flags_ & RESUMED_GENERATOR); }
+
+
+  inline bool hasInitialEnvironment() const;
+
+  bool hasInitialEnvironmentUnchecked() const {
+    return flags_ & HAS_INITIAL_ENV;
+  }
+
+  bool hasArgsObj() const {
+    MOZ_ASSERT(script()->needsArgsObj());
+    return flags_ & HAS_ARGS_OBJ;
+  }
+
+  bool isDebuggerEvalFrame() const {
+    return isEvalFrame() && !!evalInFramePrev_;
+  }
+
+  bool prevUpToDate() const { return !!(flags_ & PREV_UP_TO_DATE); }
+
+  void setPrevUpToDate() { flags_ |= PREV_UP_TO_DATE; }
+
+  void unsetPrevUpToDate() { flags_ &= ~PREV_UP_TO_DATE; }
+
+  bool isDebuggee() const { return !!(flags_ & DEBUGGEE); }
+
+  void setIsDebuggee() { flags_ |= DEBUGGEE; }
+
+  inline void unsetIsDebuggee();
+
+  bool hasCachedSavedFrame() const { return flags_ & HAS_CACHED_SAVED_FRAME; }
+  void setHasCachedSavedFrame() { flags_ |= HAS_CACHED_SAVED_FRAME; }
+  void clearHasCachedSavedFrame() { flags_ &= ~HAS_CACHED_SAVED_FRAME; }
+
+ public:
+  void trace(JSTracer* trc, Value* sp, jsbytecode* pc);
+  void traceValues(JSTracer* trc, unsigned start, unsigned end);
+
+  bool runningInJit() const { return !!(flags_ & RUNNING_IN_JIT); }
+  void setRunningInJit() { flags_ |= RUNNING_IN_JIT; }
+  void clearRunningInJit() { flags_ &= ~RUNNING_IN_JIT; }
+};
+
+
+class InterpreterRegs {
+ public:
+  Value* sp;
+  jsbytecode* pc;
+
+ private:
+  InterpreterFrame* fp_;
+
+ public:
+  InterpreterFrame* fp() const { return fp_; }
+
+  unsigned stackDepth() const {
+    MOZ_ASSERT(sp >= fp_->base());
+    return sp - fp_->base();
+  }
+
+  Value* spForStackDepth(unsigned depth) const {
+    MOZ_ASSERT(fp_->script()->nfixed() + depth <= fp_->script()->nslots());
+    return fp_->base() + depth;
+  }
+
+  void popInlineFrame() {
+    pc = fp_->prevpc();
+    unsigned spForNewTarget =
+        fp_->isResumedGenerator() ? 0 : fp_->isConstructing();
+    unsigned nActualArgs = fp_->isModuleFrame() ? 0 : fp_->numActualArgs();
+    sp = fp_->prevsp() - nActualArgs - 1 - spForNewTarget;
+    fp_ = fp_->prev();
+    MOZ_ASSERT(fp_);
+  }
+  void prepareToRun(InterpreterFrame& fp, JSScript* script) {
+    pc = script->code();
+    sp = fp.slots() + script->nfixed();
+    fp_ = &fp;
+  }
+
+  void setToEndOfScript();
+
+  MutableHandleValue stackHandleAt(int i) {
+    return MutableHandleValue::fromMarkedLocation(&sp[i]);
+  }
+
+  HandleValue stackHandleAt(int i) const {
+    return HandleValue::fromMarkedLocation(&sp[i]);
+  }
+
+  friend void GDBTestInitInterpreterRegs(InterpreterRegs&,
+                                         js::InterpreterFrame*, JS::Value*,
+                                         uint8_t*);
+};
+
+
+class InterpreterStack {
+  friend class InterpreterActivation;
+
+  static const size_t DEFAULT_CHUNK_SIZE = 4 * 1024;
+  LifoAlloc allocator_;
+
+  static const size_t MAX_FRAMES = 50 * 1000;
+  static const size_t MAX_FRAMES_TRUSTED = MAX_FRAMES + 1000;
+  size_t frameCount_;
+
+  inline uint8_t* allocateFrame(JSContext* cx, size_t size);
+
+  inline InterpreterFrame* getCallFrame(JSContext* cx, const CallArgs& args,
+                                        HandleScript script,
+                                        MaybeConstruct constructing,
+                                        Value** pargv);
+
+  void releaseFrame(InterpreterFrame* fp) {
+    frameCount_--;
+    allocator_.release(fp->mark_);
+  }
+
+ public:
+  InterpreterStack()
+      : allocator_(DEFAULT_CHUNK_SIZE, js::MallocArena), frameCount_(0) {}
+
+  ~InterpreterStack() { MOZ_ASSERT(frameCount_ == 0); }
+
+  InterpreterFrame* pushExecuteFrame(JSContext* cx, HandleScript script,
+                                     HandleObject envChain,
+                                     AbstractFramePtr evalInFrame);
+
+  InterpreterFrame* pushInvokeFrame(JSContext* cx, const CallArgs& args,
+                                    MaybeConstruct constructing);
+
+  bool pushInlineFrame(JSContext* cx, InterpreterRegs& regs,
+                       const CallArgs& args, HandleScript script,
+                       MaybeConstruct constructing);
+
+  void popInlineFrame(InterpreterRegs& regs);
+
+  bool resumeGeneratorCallFrame(JSContext* cx, InterpreterRegs& regs,
+                                HandleFunction callee, HandleObject envChain);
+
+  inline void purge(JSRuntime* rt);
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+    return allocator_.sizeOfExcludingThis(mallocSizeOf);
+  }
+};
+
+void TraceActivations(JSContext* cx, JSTracer* trc);
+
+
+class AnyInvokeArgs : public JS::CallArgs {};
+
+class AnyConstructArgs : public JS::CallArgs {
+ public:
+  void setCallee(const Value& v) = delete;
+  void setThis(const Value& v) = delete;
+  MutableHandleValue newTarget() const = delete;
+  MutableHandleValue rval() const = delete;
+};
+
+namespace detail {
+
+template <MaybeConstruct Construct>
+class GenericArgsBase
+    : public std::conditional_t<Construct, AnyConstructArgs, AnyInvokeArgs> {
+ protected:
+  RootedValueVector v_;
+
+  explicit GenericArgsBase(JSContext* cx) : v_(cx) {}
+
+ public:
+  bool init(JSContext* cx, uint64_t argc) {
+    if (argc > ARGS_LENGTH_MAX) {
+      JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                                JSMSG_TOO_MANY_ARGUMENTS);
+      return false;
+    }
+
+    size_t len = 2 + argc + uint32_t(Construct);
+    MOZ_ASSERT(len > argc);  
+    if (!v_.resize(len)) {
+      return false;
+    }
+
+    *static_cast<JS::CallArgs*>(this) = CallArgsFromVp(argc, v_.begin());
+    this->constructing_ = Construct;
+    if (Construct) {
+      this->CallArgs::setThis(MagicValue(JS_IS_CONSTRUCTING));
+    }
+    return true;
+  }
+};
+
+template <MaybeConstruct Construct, size_t N>
+class FixedArgsBase
+    : public std::conditional_t<Construct, AnyConstructArgs, AnyInvokeArgs> {
+  static_assert(N + 1 <= ARGS_LENGTH_MAX + 1, "o/~ too many args o/~");
+
+ protected:
+  JS::RootedValueArray<2 + N + uint32_t(Construct)> v_;
+
+  explicit FixedArgsBase(JSContext* cx) : v_(cx) {
+    *static_cast<JS::CallArgs*>(this) = CallArgsFromVp(N, v_.begin());
+    this->constructing_ = Construct;
+    if (Construct) {
+      this->CallArgs::setThis(MagicValue(JS_IS_CONSTRUCTING));
+    }
+  }
+};
+
+}  
+
+class InvokeArgs : public detail::GenericArgsBase<NO_CONSTRUCT> {
+  using Base = detail::GenericArgsBase<NO_CONSTRUCT>;
+
+ public:
+  explicit InvokeArgs(JSContext* cx) : Base(cx) {}
+};
+
+class InvokeArgsMaybeIgnoresReturnValue
+    : public detail::GenericArgsBase<NO_CONSTRUCT> {
+  using Base = detail::GenericArgsBase<NO_CONSTRUCT>;
+
+ public:
+  explicit InvokeArgsMaybeIgnoresReturnValue(JSContext* cx) : Base(cx) {}
+
+  bool init(JSContext* cx, unsigned argc, bool ignoresReturnValue) {
+    if (!Base::init(cx, argc)) {
+      return false;
+    }
+    this->ignoresReturnValue_ = ignoresReturnValue;
+    return true;
+  }
+};
+
+template <size_t N>
+class FixedInvokeArgs : public detail::FixedArgsBase<NO_CONSTRUCT, N> {
+  using Base = detail::FixedArgsBase<NO_CONSTRUCT, N>;
+
+ public:
+  explicit FixedInvokeArgs(JSContext* cx) : Base(cx) {}
+};
+
+class ConstructArgs : public detail::GenericArgsBase<CONSTRUCT> {
+  using Base = detail::GenericArgsBase<CONSTRUCT>;
+
+ public:
+  explicit ConstructArgs(JSContext* cx) : Base(cx) {}
+};
+
+template <size_t N>
+class FixedConstructArgs : public detail::FixedArgsBase<CONSTRUCT, N> {
+  using Base = detail::FixedArgsBase<CONSTRUCT, N>;
+
+ public:
+  explicit FixedConstructArgs(JSContext* cx) : Base(cx) {}
+};
+
+template <class Args, class Arraylike>
+inline bool FillArgumentsFromArraylike(JSContext* cx, Args& args,
+                                       const Arraylike& arraylike) {
+  uint32_t len = arraylike.length();
+  if (!args.init(cx, len)) {
+    return false;
+  }
+
+  for (uint32_t i = 0; i < len; i++) {
+    args[i].set(arraylike[i]);
+  }
+
+  return true;
+}
+
+#ifdef ENABLE_PORTABLE_BASELINE_INTERP
+struct PortableBaselineStack {
+  static const size_t DEFAULT_SIZE = 512 * 1024;
+
+  void* base;
+  void* top;
+
+  bool valid() { return base != nullptr; }
+
+  PortableBaselineStack() {
+    base = js_calloc(DEFAULT_SIZE);
+    top = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(base) +
+                                  DEFAULT_SIZE);
+  }
+  ~PortableBaselineStack() { js_free(base); }
+};
+#endif  // ENABLE_PORTABLE_BASELINE_INTERP
+
+}  
+
+namespace mozilla {
+
+template <>
+struct DefaultHasher<js::AbstractFramePtr> {
+  using Lookup = js::AbstractFramePtr;
+
+  static js::HashNumber hash(const Lookup& key) {
+    return mozilla::HashGeneric(key.raw());
+  }
+
+  static bool match(const js::AbstractFramePtr& k, const Lookup& l) {
+    return k == l;
+  }
+};
+
+}  
+
+#endif  // vm_Stack_h

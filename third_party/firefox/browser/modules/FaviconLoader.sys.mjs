@@ -1,0 +1,633 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+import {
+  TYPE_SVG,
+  TYPE_ICO,
+  TRUSTED_FAVICON_SCHEMES,
+  blobAsDataURL,
+} from "moz-src:///toolkit/modules/FaviconUtils.sys.mjs";
+
+const lazy = {};
+
+ChromeUtils.defineESModuleGetters(lazy, {
+  DeferredTask: "resource://gre/modules/DeferredTask.sys.mjs",
+});
+
+const STREAM_SEGMENT_SIZE = 4096;
+const PR_UINT32_MAX = 0xffffffff;
+
+const BinaryInputStream = Components.Constructor(
+  "@mozilla.org/binaryinputstream;1",
+  "nsIBinaryInputStream",
+  "setInputStream"
+);
+const StorageStream = Components.Constructor(
+  "@mozilla.org/storagestream;1",
+  "nsIStorageStream",
+  "init"
+);
+const BufferedOutputStream = Components.Constructor(
+  "@mozilla.org/network/buffered-output-stream;1",
+  "nsIBufferedOutputStream",
+  "init"
+);
+
+const FAVICON_PARSING_TIMEOUT = 100;
+const FAVICON_RICH_ICON_MIN_WIDTH = 96;
+const PREFERRED_WIDTH = 16;
+
+const MAX_FAVICON_EXPIRATION = 7 * 24 * 60 * 60 * 1000;
+const MAX_ICON_SIZE = 2048;
+
+async function decodeImage({
+  url,
+  type,
+  data,
+  transfer,
+  desiredWidth,
+  desiredHeight,
+}) {
+  let image;
+  try {
+    let decoder = new ImageDecoder({
+      type,
+      data,
+      desiredWidth,
+      desiredHeight,
+      transfer: transfer ? [data] : undefined,
+    });
+
+    let result = await decoder.decode({ completeFramesOnly: true });
+    image = result.image;
+  } catch {
+    throw Components.Exception(
+      `Favicon at "${url}" could not be decoded.`,
+      Cr.NS_ERROR_FAILURE
+    );
+  }
+
+  if (
+    image.displayWidth > MAX_ICON_SIZE ||
+    image.displayHeight > MAX_ICON_SIZE
+  ) {
+    throw Components.Exception(
+      `Favicon at "${url}" is too large.`,
+      Cr.NS_ERROR_FAILURE
+    );
+  }
+
+  let imageBuffer = new ArrayBuffer(image.allocationSize());
+  await image.copyTo(imageBuffer);
+  return {
+    blob: new Blob([imageBuffer]),
+    format: image.format,
+    displayWidth: image.displayWidth,
+    displayHeight: image.displayHeight,
+  };
+}
+
+async function convertImage(url, type, data) {
+  if (type == TYPE_ICO) {
+    try {
+      let decoder = new ImageDecoder({
+        type,
+        data,
+      });
+      await decoder.tracks.ready;
+      let sizes = decoder.tracks[0].getSizes();
+      if (sizes.length > 1) {
+        return Promise.all(
+          sizes.map(({ width, height }) =>
+            decodeImage({
+              url,
+              type,
+              transfer: false,
+              data,
+              desiredWidth: width,
+              desiredHeight: height,
+            })
+          )
+        );
+      }
+    } catch {}
+  }
+
+  let image = await decodeImage({
+    url,
+    type,
+    transfer: true,
+    data,
+  });
+  return [image];
+}
+
+class FaviconLoad {
+  constructor(iconInfo) {
+    this.icon = iconInfo;
+
+    let securityFlags;
+    if (iconInfo.node.crossOrigin === "anonymous") {
+      securityFlags = Ci.nsILoadInfo.SEC_REQUIRE_CORS_INHERITS_SEC_CONTEXT;
+    } else if (iconInfo.node.crossOrigin === "use-credentials") {
+      securityFlags =
+        Ci.nsILoadInfo.SEC_REQUIRE_CORS_INHERITS_SEC_CONTEXT |
+        Ci.nsILoadInfo.SEC_COOKIES_INCLUDE;
+    } else {
+      securityFlags =
+        Ci.nsILoadInfo.SEC_ALLOW_CROSS_ORIGIN_INHERITS_SEC_CONTEXT;
+    }
+
+    this.channel = Services.io.newChannelFromURI(
+      iconInfo.iconUri,
+      iconInfo.node,
+      iconInfo.node.nodePrincipal,
+      iconInfo.node.nodePrincipal,
+      securityFlags |
+        Ci.nsILoadInfo.SEC_ALLOW_CHROME |
+        Ci.nsILoadInfo.SEC_DISALLOW_SCRIPT,
+      Ci.nsIContentPolicy.TYPE_INTERNAL_IMAGE_FAVICON
+    );
+
+    if (this.channel instanceof Ci.nsIHttpChannel) {
+      this.channel.QueryInterface(Ci.nsIHttpChannel);
+      let referrerInfo = Cc["@mozilla.org/referrer-info;1"].createInstance(
+        Ci.nsIReferrerInfo
+      );
+      if (iconInfo.node.nodeType == iconInfo.node.DOCUMENT_NODE) {
+        referrerInfo.initWithDocument(iconInfo.node);
+      } else {
+        referrerInfo.initWithElement(iconInfo.node);
+      }
+      this.channel.referrerInfo = referrerInfo;
+    }
+    this.channel.loadFlags |=
+      Ci.nsIRequest.LOAD_BACKGROUND |
+      Ci.nsIRequest.VALIDATE_NEVER |
+      Ci.nsIRequest.LOAD_FROM_CACHE;
+    this.channel.loadGroup =
+      iconInfo.node.documentGlobal.document.documentLoadGroup;
+    this.channel.notificationCallbacks = this;
+
+    if (this.channel instanceof Ci.nsIHttpChannelInternal) {
+      this.channel.blockAuthPrompt = true;
+    }
+
+    if (
+      Services.prefs.getBoolPref("network.http.tailing.enabled", true) &&
+      this.channel instanceof Ci.nsIClassOfService
+    ) {
+      this.channel.addClassFlags(
+        Ci.nsIClassOfService.Tail | Ci.nsIClassOfService.Throttleable
+      );
+    }
+  }
+
+  load() {
+    this._deferred = Promise.withResolvers();
+
+    let cleanup = () => {
+      this.channel = null;
+      this.dataBuffer = null;
+      this.stream = null;
+    };
+    this._deferred.promise.then(cleanup, cleanup);
+
+    this.dataBuffer = new StorageStream(STREAM_SEGMENT_SIZE, PR_UINT32_MAX);
+
+    this.stream = new BufferedOutputStream(
+      this.dataBuffer.getOutputStream(0),
+      STREAM_SEGMENT_SIZE * 2
+    );
+
+    try {
+      this.channel.asyncOpen(this);
+    } catch (e) {
+      this._deferred.reject(e);
+    }
+
+    return this._deferred.promise;
+  }
+
+  cancel() {
+    if (!this.channel) {
+      return;
+    }
+
+    this.channel.cancel(Cr.NS_BINDING_ABORTED);
+  }
+
+  onStartRequest() {}
+
+  onDataAvailable(request, inputStream, offset, count) {
+    this.stream.writeFrom(inputStream, count);
+  }
+
+  asyncOnChannelRedirect(oldChannel, newChannel, flags, callback) {
+    if (oldChannel == this.channel) {
+      this.channel = newChannel;
+    }
+
+    callback.onRedirectVerifyCallback(Cr.NS_OK);
+  }
+
+  async onStopRequest(request, statusCode) {
+    if (request != this.channel) {
+      return;
+    }
+
+    this.stream.close();
+    this.stream = null;
+
+    if (!Components.isSuccessCode(statusCode)) {
+      if (statusCode == Cr.NS_BINDING_ABORTED) {
+        this._deferred.reject(
+          Components.Exception(
+            `Favicon load from ${this.icon.iconUri.spec} was cancelled.`,
+            statusCode
+          )
+        );
+      } else {
+        this._deferred.reject(
+          Components.Exception(
+            `Favicon at "${this.icon.iconUri.spec}" failed to load.`,
+            statusCode
+          )
+        );
+      }
+      return;
+    }
+
+    if (this.channel instanceof Ci.nsIHttpChannel) {
+      if (!this.channel.requestSucceeded) {
+        this._deferred.reject(
+          Components.Exception(
+            `Favicon at "${this.icon.iconUri.spec}" failed to load: ${this.channel.responseStatusText}.`,
+            { data: { httpStatus: this.channel.responseStatus } }
+          )
+        );
+        return;
+      }
+    }
+
+    let canStoreIcon = this.icon.beforePageShow;
+    if (this.icon.iconUri.filePath == "/favicon.ico") {
+      canStoreIcon = true;
+    } else {
+      try {
+        if (
+          this.channel instanceof Ci.nsIHttpChannel &&
+          this.channel.isNoStoreResponse()
+        ) {
+          canStoreIcon = false;
+        }
+      } catch (ex) {
+        if (ex.result != Cr.NS_ERROR_NOT_AVAILABLE) {
+          throw ex;
+        }
+      }
+    }
+
+    let expiration = Date.now() + MAX_FAVICON_EXPIRATION;
+
+    if (this.channel instanceof Ci.nsICacheInfoChannel) {
+      try {
+        expiration = Math.min(
+          this.channel.cacheTokenExpirationTime * 1000,
+          expiration
+        );
+      } catch (e) {
+      }
+    }
+
+    try {
+      let stream = new BinaryInputStream(this.dataBuffer.newInputStream(0));
+      let buffer = new ArrayBuffer(this.dataBuffer.length);
+      stream.readArrayBuffer(buffer.byteLength, buffer);
+
+      let type = this.channel.contentType;
+      let images, dataURL;
+      if (type != "image/svg+xml") {
+        let octets = new Uint8Array(buffer);
+        let sniffer = Cc["@mozilla.org/image/loader;1"].createInstance(
+          Ci.nsIContentSniffer
+        );
+        type = sniffer.getMIMETypeFromContent(
+          this.channel,
+          octets,
+          octets.length
+        );
+
+        if (!type) {
+          throw Components.Exception(
+            `Favicon at "${this.icon.iconUri.spec}" did not match a known mimetype.`,
+            Cr.NS_ERROR_FAILURE
+          );
+        }
+
+        images = await convertImage(this.icon.iconUri.spec, type, buffer);
+      } else {
+        dataURL = await blobAsDataURL(new Blob([buffer], { type }));
+      }
+
+      this._deferred.resolve({
+        expiration,
+        images,
+        dataURL,
+        canStoreIcon,
+      });
+    } catch (e) {
+      this._deferred.reject(e);
+    }
+  }
+
+  getInterface(iid) {
+    if (iid.equals(Ci.nsIChannelEventSink)) {
+      return this;
+    }
+    throw Components.Exception("", Cr.NS_ERROR_NO_INTERFACE);
+  }
+}
+
+function extractIconSize(aSizes) {
+  const re = /^([1-9][0-9]*)x[1-9][0-9]*$/i;
+  for (let size of aSizes) {
+    if (size.toLowerCase() == "any") {
+      break;
+    }
+    let values = re.exec(size);
+    if (values?.length > 1) {
+      return parseInt(values[1]);
+    }
+    break;
+  }
+  return -1;
+}
+
+function getLinkIconURI(aLink) {
+  let targetDoc = aLink.ownerDocument;
+  let uri = Services.io.newURI(aLink.href, targetDoc.characterSet);
+  try {
+    uri = uri.mutate().setUserPass("").finalize();
+  } catch (e) {
+  }
+  return uri;
+}
+
+function guessType(icon) {
+  if (!icon) {
+    return "";
+  }
+
+  if (!icon.type) {
+    let extension = icon.iconUri.filePath.split(".").pop();
+    switch (extension) {
+      case "ico":
+        return TYPE_ICO;
+      case "svg":
+        return TYPE_SVG;
+    }
+  }
+
+  return icon.type == "image/vnd.microsoft.icon" ? TYPE_ICO : icon.type || "";
+}
+
+function selectIcons(iconInfos, preferredWidth) {
+  if (!iconInfos.length) {
+    return {
+      richIcon: null,
+      tabIcon: null,
+    };
+  }
+
+  let preferredIcon;
+  let bestSizedIcon;
+  let defaultIcon;
+  let largestRichIcon;
+
+  for (let icon of iconInfos) {
+    if (!icon.isRichIcon) {
+      if (guessType(icon) == TYPE_SVG) {
+        preferredIcon = icon;
+      } else if (
+        icon.width == preferredWidth &&
+        guessType(preferredIcon) != TYPE_SVG
+      ) {
+        preferredIcon = icon;
+      } else if (
+        guessType(icon) == TYPE_ICO &&
+        (!preferredIcon || guessType(preferredIcon) == TYPE_ICO)
+      ) {
+        preferredIcon = icon;
+      }
+
+      if (
+        icon.width >= preferredWidth &&
+        (!bestSizedIcon || bestSizedIcon.width >= icon.width)
+      ) {
+        bestSizedIcon = icon;
+      }
+    }
+
+    if (icon.isRichIcon || icon.width >= FAVICON_RICH_ICON_MIN_WIDTH) {
+      if (!largestRichIcon || largestRichIcon.width < icon.width) {
+        largestRichIcon = icon;
+      }
+    } else {
+      defaultIcon = icon;
+    }
+  }
+
+
+  let tabIcon = null;
+  if (preferredIcon) {
+    tabIcon = preferredIcon;
+  } else if (bestSizedIcon) {
+    tabIcon = bestSizedIcon;
+  } else if (defaultIcon) {
+    tabIcon = defaultIcon;
+  }
+
+  return {
+    richIcon: largestRichIcon,
+    tabIcon,
+  };
+}
+
+class IconLoader {
+  constructor(actor) {
+    this.actor = actor;
+  }
+
+  async load(iconInfo) {
+    if (this._loader) {
+      if (this._loader.icon.iconUri.equals(iconInfo.iconUri)) {
+        return;
+      }
+      this._loader.cancel();
+    }
+
+    if (TRUSTED_FAVICON_SCHEMES.includes(iconInfo.iconUri.scheme)) {
+      try {
+        Services.scriptSecurityManager.checkLoadURIWithPrincipal(
+          iconInfo.node.nodePrincipal,
+          iconInfo.iconUri,
+          Services.scriptSecurityManager.ALLOW_CHROME
+        );
+      } catch (ex) {
+        return;
+      }
+      this.actor.sendAsyncMessage("Link:SetIcon", {
+        pageURL: iconInfo.pageUri.spec,
+        originalURL: iconInfo.iconUri.spec,
+        expiration: undefined,
+        iconURL: iconInfo.iconUri.spec,
+        canStoreIcon:
+          iconInfo.beforePageShow && iconInfo.iconUri.schemeIs("data"),
+        beforePageShow: iconInfo.beforePageShow,
+        isRichIcon: iconInfo.isRichIcon,
+      });
+      return;
+    }
+
+    this.actor.sendAsyncMessage("Link:LoadingIcon", {
+      originalURL: iconInfo.iconUri.spec,
+      isRichIcon: iconInfo.isRichIcon,
+    });
+
+    try {
+      this._loader = new FaviconLoad(iconInfo);
+      let { dataURL, images, expiration, canStoreIcon } =
+        await this._loader.load();
+
+      this.actor.sendAsyncMessage("Link:SetIcon", {
+        pageURL: iconInfo.pageUri.spec,
+        originalURL: iconInfo.iconUri.spec,
+        expiration,
+        iconURL: dataURL,
+        images,
+        canStoreIcon,
+        beforePageShow: iconInfo.beforePageShow,
+        isRichIcon: iconInfo.isRichIcon,
+      });
+    } catch (e) {
+      if (e.result != Cr.NS_BINDING_ABORTED) {
+        if (typeof e.data?.wrappedJSObject?.httpStatus !== "number") {
+          console.error(e);
+        }
+
+        this.actor.sendAsyncMessage("Link:SetFailedIcon", {
+          originalURL: iconInfo.iconUri.spec,
+          isRichIcon: iconInfo.isRichIcon,
+        });
+      }
+    } finally {
+      this._loader = null;
+    }
+  }
+
+  cancel() {
+    if (!this._loader) {
+      return;
+    }
+
+    this._loader.cancel();
+    this._loader = null;
+  }
+}
+
+export class FaviconLoader {
+  constructor(actor) {
+    this.actor = actor;
+    this.iconInfos = [];
+
+    this.beforePageShow = true;
+
+    this.richIconLoader = new IconLoader(actor);
+    this.tabIconLoader = new IconLoader(actor);
+
+    this.iconTask = new lazy.DeferredTask(
+      () => this.loadIcons(),
+      FAVICON_PARSING_TIMEOUT
+    );
+  }
+
+  loadIcons() {
+    if (!this.iconInfos.length) {
+      return;
+    }
+
+    let preferredWidth =
+      PREFERRED_WIDTH * Math.ceil(this.actor.contentWindow.devicePixelRatio);
+    let { richIcon, tabIcon } = selectIcons(this.iconInfos, preferredWidth);
+    this.iconInfos = [];
+
+    if (richIcon) {
+      this.richIconLoader.load(richIcon).catch(console.error);
+    }
+
+    if (tabIcon) {
+      this.tabIconLoader.load(tabIcon).catch(console.error);
+    }
+  }
+
+  addIconFromLink(aLink, aIsRichIcon) {
+    let iconInfo = makeFaviconFromLink(aLink, aIsRichIcon);
+    if (iconInfo) {
+      iconInfo.beforePageShow = this.beforePageShow;
+      this.iconInfos.push(iconInfo);
+      this.iconTask.arm();
+      return true;
+    }
+    return false;
+  }
+
+  addDefaultIcon(pageUri) {
+    this.iconInfos.push({
+      pageUri,
+      iconUri: pageUri.mutate().setPathQueryRef("/favicon.ico").finalize(),
+      width: -1,
+      isRichIcon: false,
+      type: TYPE_ICO,
+      node: this.actor.document,
+      beforePageShow: this.beforePageShow,
+    });
+    this.iconTask.arm();
+  }
+
+  onPageShow() {
+    if (this.iconTask.isArmed) {
+      this.iconTask.disarm();
+      this.loadIcons();
+    }
+    this.beforePageShow = false;
+  }
+
+  onPageHide() {
+    this.richIconLoader.cancel();
+    this.tabIconLoader.cancel();
+
+    this.iconTask.disarm();
+    this.iconInfos = [];
+  }
+}
+
+function makeFaviconFromLink(aLink, aIsRichIcon) {
+  let iconUri = getLinkIconURI(aLink);
+  if (!iconUri) {
+    return null;
+  }
+
+  let width = extractIconSize(aLink.sizes);
+
+  return {
+    pageUri: aLink.ownerDocument.documentURIObject,
+    iconUri,
+    width,
+    isRichIcon: aIsRichIcon,
+    type: aLink.type,
+    node: aLink,
+  };
+}

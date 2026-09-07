@@ -1,0 +1,45 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_dom_BindingCallContext_h
+#define mozilla_dom_BindingCallContext_h
+
+#include <utility>
+
+#include "js/TypeDecls.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/ErrorResult.h"
+
+namespace mozilla::dom {
+
+class MOZ_NON_TEMPORARY_CLASS MOZ_STACK_CLASS BindingCallContext {
+ public:
+  BindingCallContext(JSContext* aCx, const char* aMethodDescription)
+      : mCx(aCx), mDescription(aMethodDescription) {}
+
+  ~BindingCallContext() = default;
+
+  operator JSContext*() const { return mCx; }
+
+  explicit operator bool() const { return !!mCx; }
+
+  template <dom::ErrNum errorNumber, typename... Ts>
+  bool ThrowErrorMessage(Ts&&... aMessageArgs) const {
+    static_assert(ErrorFormatHasContext[errorNumber],
+                  "We plan to add a context; it better be expected!");
+    MOZ_ASSERT(mCx);
+    return dom::ThrowErrorMessage<errorNumber>(
+        mCx, mDescription, std::forward<Ts>(aMessageArgs)...);
+  }
+
+ private:
+  JSContext* const mCx;
+  const char* const mDescription;
+};
+
+}  
+
+#endif  // mozilla_dom_BindingCallContext_h

@@ -1,0 +1,121 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+#ifndef __UNUMBERFORMATTER_H__
+#define __UNUMBERFORMATTER_H__
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/parseerr.h"
+#include "unicode/unumberoptions.h"
+#include "unicode/uformattednumber.h"
+
+
+
+typedef enum UNumberRoundingPriority {
+    UNUM_ROUNDING_PRIORITY_RELAXED,
+
+    UNUM_ROUNDING_PRIORITY_STRICT,
+} UNumberRoundingPriority;
+
+typedef enum UNumberUnitWidth {
+            UNUM_UNIT_WIDTH_NARROW = 0,
+
+            UNUM_UNIT_WIDTH_SHORT = 1,
+
+            UNUM_UNIT_WIDTH_FULL_NAME = 2,
+
+            UNUM_UNIT_WIDTH_ISO_CODE = 3,
+
+            UNUM_UNIT_WIDTH_FORMAL = 4,
+
+            UNUM_UNIT_WIDTH_VARIANT = 5,
+
+            UNUM_UNIT_WIDTH_HIDDEN = 6,
+
+            UNUM_UNIT_WIDTH_COUNT = 7
+} UNumberUnitWidth;
+
+typedef enum UNumberSignDisplay {
+    UNUM_SIGN_AUTO,
+
+    UNUM_SIGN_ALWAYS,
+
+    UNUM_SIGN_NEVER,
+
+    UNUM_SIGN_ACCOUNTING,
+
+    UNUM_SIGN_ACCOUNTING_ALWAYS,
+
+    UNUM_SIGN_EXCEPT_ZERO,
+
+    UNUM_SIGN_ACCOUNTING_EXCEPT_ZERO,
+
+    UNUM_SIGN_NEGATIVE,
+
+    UNUM_SIGN_ACCOUNTING_NEGATIVE,
+
+    UNUM_SIGN_COUNT = 9,
+} UNumberSignDisplay;
+
+typedef enum UNumberDecimalSeparatorDisplay {
+            UNUM_DECIMAL_SEPARATOR_AUTO,
+
+            UNUM_DECIMAL_SEPARATOR_ALWAYS,
+
+            UNUM_DECIMAL_SEPARATOR_COUNT
+} UNumberDecimalSeparatorDisplay;
+
+typedef enum UNumberTrailingZeroDisplay {
+    UNUM_TRAILING_ZERO_AUTO,
+
+    UNUM_TRAILING_ZERO_HIDE_IF_WHOLE,
+} UNumberTrailingZeroDisplay;
+
+struct UNumberFormatter;
+typedef struct UNumberFormatter UNumberFormatter;
+
+
+U_CAPI UNumberFormatter* U_EXPORT2
+unumf_openForSkeletonAndLocale(const UChar* skeleton, int32_t skeletonLen, const char* locale,
+                               UErrorCode* ec);
+
+
+U_CAPI UNumberFormatter* U_EXPORT2
+unumf_openForSkeletonAndLocaleWithError(
+       const UChar* skeleton, int32_t skeletonLen, const char* locale, UParseError* perror, UErrorCode* ec);
+
+
+
+U_CAPI void U_EXPORT2
+unumf_formatInt(const UNumberFormatter* uformatter, int64_t value, UFormattedNumber* uresult,
+                UErrorCode* ec);
+
+
+U_CAPI void U_EXPORT2
+unumf_formatDouble(const UNumberFormatter* uformatter, double value, UFormattedNumber* uresult,
+                   UErrorCode* ec);
+
+
+U_CAPI void U_EXPORT2
+unumf_formatDecimal(const UNumberFormatter* uformatter, const char* value, int32_t valueLen,
+                    UFormattedNumber* uresult, UErrorCode* ec);
+
+
+
+U_CAPI void U_EXPORT2
+unumf_close(UNumberFormatter* uformatter);
+
+
+
+#if U_SHOW_CPLUSPLUS_API
+U_NAMESPACE_BEGIN
+
+U_DEFINE_LOCAL_OPEN_POINTER(LocalUNumberFormatterPointer, UNumberFormatter, unumf_close);
+
+U_NAMESPACE_END
+#endif // U_SHOW_CPLUSPLUS_API
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+#endif //__UNUMBERFORMATTER_H__

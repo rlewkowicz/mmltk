@@ -1,0 +1,242 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "Highlight.h"
+
+#include "AbstractRange.h"
+#include "Document.h"
+#include "HighlightRegistry.h"
+#include "Selection.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/StaticAnalysisFunctions.h"
+#include "mozilla/dom/HighlightBinding.h"
+#include "nsFrameSelection.h"
+#include "nsIContentInlines.h"
+#include "nsLayoutUtils.h"
+#include "nsPIDOMWindow.h"
+#include "nsPresContext.h"
+
+namespace mozilla::dom {
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(Highlight, mRanges, mWindow)
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(Highlight)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(Highlight)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(Highlight)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+Highlight::Highlight(
+    const Sequence<OwningNonNull<AbstractRange>>& aInitialRanges,
+    nsPIDOMWindowInner* aWindow, ErrorResult& aRv)
+    : mWindow(aWindow) {
+  for (RefPtr<AbstractRange> range : aInitialRanges) {
+    Add(*range, aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+  }
+}
+
+already_AddRefed<Highlight> Highlight::Constructor(
+    const GlobalObject& aGlobal,
+    const Sequence<OwningNonNull<AbstractRange>>& aInitialRanges,
+    ErrorResult& aRv) {
+  MOZ_ASSERT(NS_IsMainThread());
+  nsCOMPtr<nsPIDOMWindowInner> window =
+      do_QueryInterface(aGlobal.GetAsSupports());
+  if (!window) {
+    aRv.ThrowUnknownError(
+        "There is no window associated to "
+        "this highlight object!");
+    return nullptr;
+  }
+
+  RefPtr<Highlight> highlight = new Highlight(aInitialRanges, window, aRv);
+  return aRv.Failed() ? nullptr : highlight.forget();
+}
+
+void Highlight::AddToHighlightRegistry(HighlightRegistry& aHighlightRegistry,
+                                       nsAtom& aHighlightName) {
+  mHighlightRegistries.LookupOrInsert(&aHighlightRegistry)
+      .Insert(&aHighlightName);
+}
+
+void Highlight::RemoveFromHighlightRegistry(
+    HighlightRegistry& aHighlightRegistry, nsAtom& aHighlightName) {
+  if (auto entry = mHighlightRegistries.Lookup(&aHighlightRegistry)) {
+    auto& highlightNames = entry.Data();
+    highlightNames.Remove(&aHighlightName);
+    if (highlightNames.IsEmpty()) {
+      entry.Remove();
+    }
+  }
+}
+
+void Highlight::Repaint() {
+  for (const RefPtr<HighlightRegistry>& registry :
+       mHighlightRegistries.Keys()) {
+    registry->RepaintHighlightSelection(*this);
+  }
+}
+
+void Highlight::SetPriority(int32_t aPriority) {
+  if (mPriority == aPriority) {
+    return;
+  }
+  mPriority = aPriority;
+  Repaint();
+}
+
+void Highlight::SetType(HighlightType aHighlightType) {
+  if (mHighlightType == aHighlightType) {
+    return;
+  }
+  mHighlightType = aHighlightType;
+  Repaint();
+}
+
+Highlight* Highlight::Add(AbstractRange& aRange, ErrorResult& aRv) {
+  if (Highlight_Binding::SetlikeHelpers::Has(this, aRange, aRv) ||
+      aRv.Failed()) {
+    return this;
+  }
+  Highlight_Binding::SetlikeHelpers::Add(this, aRange, aRv);
+  if (aRv.Failed()) {
+    return this;
+  }
+
+  MOZ_ASSERT(!mRanges.Contains(&aRange),
+             "setlike and DOM mirror are not in sync");
+
+  mRanges.AppendElement(&aRange);
+  AutoFrameSelectionBatcher selectionBatcher(__FUNCTION__,
+                                             mHighlightRegistries.Count());
+  for (const RefPtr<HighlightRegistry>& registry :
+       mHighlightRegistries.Keys()) {
+    auto frameSelection = registry->GetFrameSelection();
+    selectionBatcher.AddFrameSelection(frameSelection);
+    MOZ_KnownLive(registry)->MaybeAddRangeToHighlightSelection(aRange, *this);
+    if (aRv.Failed()) {
+      return this;
+    }
+  }
+  return this;
+}
+
+void Highlight::Clear(ErrorResult& aRv) {
+  Highlight_Binding::SetlikeHelpers::Clear(this, aRv);
+  if (!aRv.Failed()) {
+    mRanges.Clear();
+    AutoFrameSelectionBatcher selectionBatcher(__FUNCTION__,
+                                               mHighlightRegistries.Count());
+
+    for (const RefPtr<HighlightRegistry>& registry :
+         mHighlightRegistries.Keys()) {
+      auto frameSelection = registry->GetFrameSelection();
+      selectionBatcher.AddFrameSelection(frameSelection);
+      MOZ_KnownLive(registry)->RemoveHighlightSelection(*this);
+    }
+  }
+}
+
+bool Highlight::Delete(AbstractRange& aRange, ErrorResult& aRv) {
+  if (Highlight_Binding::SetlikeHelpers::Delete(this, aRange, aRv)) {
+    mRanges.RemoveElement(&aRange);
+    AutoFrameSelectionBatcher selectionBatcher(__FUNCTION__,
+                                               mHighlightRegistries.Count());
+
+    for (const RefPtr<HighlightRegistry>& registry :
+         mHighlightRegistries.Keys()) {
+      auto frameSelection = registry->GetFrameSelection();
+      selectionBatcher.AddFrameSelection(frameSelection);
+      MOZ_KnownLive(registry)->MaybeRemoveRangeFromHighlightSelection(aRange,
+                                                                      *this);
+    }
+    return true;
+  }
+  return false;
+}
+
+struct PointHitCallback : public RectCallback {
+  const nscoord mX, mY;
+  bool mHit = false;
+  PointHitCallback(nscoord aX, nscoord aY) : mX(aX), mY(aY) {}
+  void AddRect(const nsRect& aRect) override {
+    if (!mHit) {
+      mHit = aRect.Contains(mX, mY);
+    }
+  }
+};
+
+nsTArray<RefPtr<AbstractRange>> Highlight::RangesAtPoint(
+    float aX, float aY,
+    const Sequence<OwningNonNull<mozilla::dom::ShadowRoot>>& aShadowRoots,
+    Element* aElementAtPoint) const {
+  if (!aElementAtPoint) {
+    return {};
+  }
+
+  AutoTArray<RefPtr<AbstractRange>, 4> rangesAtPoint;
+
+  const nscoord xAppUnits = nsPresContext::CSSPixelsToAppUnits(aX);
+  const nscoord yAppUnits = nsPresContext::CSSPixelsToAppUnits(aY);
+
+  ShadowRoot* const containingShadowAtPoint =
+      aElementAtPoint->GetContainingShadowForSelection();
+  ShadowRoot* const shadowRootCoveredByElementAtPoint = [&]() {
+    ShadowRoot* const closestShadowRootInFlattenedTree =
+        aElementAtPoint->GetClosestShadowRootInFlattenedTreeForSelection();
+    return containingShadowAtPoint != closestShadowRootInFlattenedTree
+               ? closestShadowRootInFlattenedTree
+               : nullptr;
+  }();
+  for (const auto& range : mRanges) {
+    if (range->IsStaticRange() && !range->AsStaticRange()->IsValid()) {
+      continue;
+    }
+    if (!range->IsPositioned()) {
+      continue;
+    }
+
+    const nsINode* const closestCommonAncestor =
+        range->GetClosestCommonInclusiveAncestor();
+    if (!closestCommonAncestor) {
+      continue;
+    }
+    const ShadowRoot* const containingShadow =
+        closestCommonAncestor->GetContainingShadow();
+    if (containingShadowAtPoint) {
+      if (containingShadow != containingShadowAtPoint) {
+        continue;
+      }
+    } else if (closestCommonAncestor->IsInShadowTree() &&
+               !aShadowRoots.Contains(containingShadow)) {
+      continue;
+    }
+
+    if (shadowRootCoveredByElementAtPoint &&
+        containingShadow == shadowRootCoveredByElementAtPoint) {
+      continue;
+    }
+
+    PointHitCallback hitTest(xAppUnits, yAppUnits);
+    range->CollectClientRects(hitTest,  true);
+    if (hitTest.mHit) {
+      rangesAtPoint.AppendElement(range);
+    }
+  }
+  return std::move(rangesAtPoint);
+}
+
+JSObject* Highlight::WrapObject(JSContext* aCx,
+                                JS::Handle<JSObject*> aGivenProto) {
+  return Highlight_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+}  

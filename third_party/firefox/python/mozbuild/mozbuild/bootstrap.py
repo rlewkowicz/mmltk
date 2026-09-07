@@ -1,0 +1,52 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this file,
+# You can obtain one at http://mozilla.org/MPL/2.0/.
+
+import functools
+import io
+import logging
+import os
+from pathlib import Path
+
+from mozbuild.configure import ConfigureSandbox
+
+
+def _raw_sandbox(extra_args=[]):
+    out = io.StringIO()
+    logger = logging.getLogger("moz.configure")
+    handler = logging.StreamHandler(out)
+    logger.addHandler(handler)
+    logger.propagate = False
+    sandbox = ConfigureSandbox(
+        {},
+        argv=["configure"]
+        + ["--enable-bootstrap", f"MOZCONFIG={os.devnull}"]
+        + extra_args,
+        logger=logger,
+    )
+    return sandbox
+
+
+@functools.cache
+def _bootstrap_sandbox():
+    sandbox = _raw_sandbox()
+    moz_configure = (
+        Path(__file__).parent.parent.parent.parent / "build" / "moz.configure"
+    )
+    sandbox.include_file(str(moz_configure / "init.configure"))
+    sandbox.include_file(str(moz_configure / "bootstrap.configure"))
+    return sandbox
+
+
+def bootstrap_toolchain(toolchain_job):
+    sandbox = _bootstrap_sandbox()
+    return sandbox._value_for(sandbox["bootstrap_path"](toolchain_job))
+
+
+def bootstrap_all_toolchains_for(configure_args=[]):
+    sandbox = _raw_sandbox(configure_args)
+    moz_configure = Path(__file__).parent.parent.parent.parent / "moz.configure"
+    sandbox.include_file(str(moz_configure))
+    for depend in sandbox._depends.values():
+        if depend.name == "bootstrap_path":
+            depend.result()

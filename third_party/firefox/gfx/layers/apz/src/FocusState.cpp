@@ -1,0 +1,196 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "FocusState.h"
+
+#include "mozilla/Logging.h"
+#include "mozilla/IntegerPrintfMacros.h"
+#include "mozilla/layers/APZThreadUtils.h"
+
+static mozilla::LazyLogModule sApzFstLog("apz.focusstate");
+#define FS_LOG(...) MOZ_LOG(sApzFstLog, LogLevel::Debug, (__VA_ARGS__))
+
+namespace mozilla {
+namespace layers {
+
+FocusState::FocusState()
+    : mMutex("FocusStateMutex"),
+      mLastAPZProcessedEvent(1),
+      mLastContentProcessedEvent(0),
+      mFocusHasKeyEventListeners(false),
+      mReceivedUpdate(false),
+      mFocusLayersId{0},
+      mFocusHorizontalTarget(ScrollableLayerGuid::NULL_SCROLL_ID),
+      mFocusVerticalTarget(ScrollableLayerGuid::NULL_SCROLL_ID) {}
+
+uint64_t FocusState::LastAPZProcessedEvent() const {
+  APZThreadUtils::AssertOnControllerThread();
+  MutexAutoLock lock(mMutex);
+
+  return mLastAPZProcessedEvent;
+}
+
+bool FocusState::IsCurrent(const MutexAutoLock& aProofOfLock) const {
+  FS_LOG("Checking IsCurrent() with cseq=%" PRIu64 ", aseq=%" PRIu64 "\n",
+         mLastContentProcessedEvent, mLastAPZProcessedEvent);
+  MOZ_ASSERT(mLastContentProcessedEvent <= mLastAPZProcessedEvent);
+  return mLastContentProcessedEvent == mLastAPZProcessedEvent;
+}
+
+void FocusState::ReceiveFocusChangingEvent() {
+  APZThreadUtils::AssertOnControllerThread();
+  MutexAutoLock lock(mMutex);
+
+  if (!mReceivedUpdate) {
+    return;
+  }
+  mLastAPZProcessedEvent += 1;
+  FS_LOG("Focus changing event incremented aseq to %" PRIu64 ", (%p)\n",
+         mLastAPZProcessedEvent, this);
+}
+
+void FocusState::Update(LayersId aRootLayerTreeId,
+                        LayersId aOriginatingLayersId,
+                        const FocusTarget& aState) {
+
+  MutexAutoLock lock(mMutex);
+
+  FS_LOG("Update with rlt=%" PRIu64 ", olt=%" PRIu64 ", ft=(%s, %" PRIu64 ")\n",
+         aRootLayerTreeId.mId, aOriginatingLayersId.mId, aState.Type(),
+         aState.mSequenceNumber);
+  mReceivedUpdate = true;
+
+  mFocusTree[aOriginatingLayersId] = aState;
+
+  mFocusHasKeyEventListeners = false;
+  mFocusLayersId = aRootLayerTreeId;
+  mFocusHorizontalTarget = ScrollableLayerGuid::NULL_SCROLL_ID;
+  mFocusVerticalTarget = ScrollableLayerGuid::NULL_SCROLL_ID;
+
+  while (true) {
+    auto currentNode = mFocusTree.find(mFocusLayersId);
+    if (currentNode == mFocusTree.end()) {
+      FS_LOG("Setting target to nil (cannot find lt=%" PRIu64 ")\n",
+             mFocusLayersId.mId);
+      return;
+    }
+
+    const FocusTarget& target = currentNode->second;
+
+    mFocusHasKeyEventListeners |= target.mFocusHasKeyEventListeners;
+
+    struct FocusTargetDataMatcher {
+      FocusState& mFocusState;
+      const uint64_t mSequenceNumber;
+
+      bool operator()(const FocusTarget::NoFocusTarget& aNoFocusTarget) {
+        FS_LOG("Setting target to nil (reached a nil target) with seq=%" PRIu64
+               ", (%p)\n",
+               mSequenceNumber, &mFocusState);
+
+        mFocusState.mLastContentProcessedEvent = mSequenceNumber;
+
+        if (mFocusState.mLastAPZProcessedEvent == 1 &&
+            mFocusState.mLastContentProcessedEvent >
+                mFocusState.mLastAPZProcessedEvent) {
+          mFocusState.mLastAPZProcessedEvent =
+              mFocusState.mLastContentProcessedEvent;
+        }
+        return true;
+      }
+
+      bool operator()(const LayersId& aRefLayerId) {
+        MOZ_ASSERT(mFocusState.mFocusLayersId != aRefLayerId);
+        if (mFocusState.mFocusLayersId == aRefLayerId) {
+          FS_LOG(
+              "Setting target to nil (bailing out of infinite loop, lt=%" PRIu64
+              ")\n",
+              mFocusState.mFocusLayersId.mId);
+          return true;
+        }
+
+        FS_LOG("Looking for target in lt=%" PRIu64 "\n", aRefLayerId.mId);
+
+        mFocusState.mFocusLayersId = aRefLayerId;
+        return false;
+      }
+
+      bool operator()(const FocusTarget::ScrollTargets& aScrollTargets) {
+        FS_LOG("Setting target to h=%" PRIu64 ", v=%" PRIu64
+               ", and seq=%" PRIu64 "(%p)\n",
+               aScrollTargets.mHorizontal, aScrollTargets.mVertical,
+               mSequenceNumber, &mFocusState);
+
+        mFocusState.mFocusHorizontalTarget = aScrollTargets.mHorizontal;
+        mFocusState.mFocusVerticalTarget = aScrollTargets.mVertical;
+
+        mFocusState.mLastContentProcessedEvent = mSequenceNumber;
+
+        if (mFocusState.mLastAPZProcessedEvent == 1 &&
+            mFocusState.mLastContentProcessedEvent >
+                mFocusState.mLastAPZProcessedEvent) {
+          mFocusState.mLastAPZProcessedEvent =
+              mFocusState.mLastContentProcessedEvent;
+        }
+        return true;
+      }
+    };  
+
+    if (target.mData.match(
+            FocusTargetDataMatcher{*this, target.mSequenceNumber})) {
+      return;
+    }
+  }
+}
+
+void FocusState::RemoveFocusTarget(LayersId aLayersId) {
+  MutexAutoLock lock(mMutex);
+
+  mFocusTree.erase(aLayersId);
+}
+
+Maybe<ScrollableLayerGuid> FocusState::GetHorizontalTarget() const {
+  APZThreadUtils::AssertOnControllerThread();
+  MutexAutoLock lock(mMutex);
+
+  if (!IsCurrent(lock) || mFocusHasKeyEventListeners ||
+      mFocusHorizontalTarget == ScrollableLayerGuid::NULL_SCROLL_ID) {
+    return Nothing();
+  }
+  return Some(ScrollableLayerGuid(mFocusLayersId, 0, mFocusHorizontalTarget));
+}
+
+Maybe<ScrollableLayerGuid> FocusState::GetVerticalTarget() const {
+  APZThreadUtils::AssertOnControllerThread();
+  MutexAutoLock lock(mMutex);
+
+  if (!IsCurrent(lock) || mFocusHasKeyEventListeners ||
+      mFocusVerticalTarget == ScrollableLayerGuid::NULL_SCROLL_ID) {
+    return Nothing();
+  }
+  return Some(ScrollableLayerGuid(mFocusLayersId, 0, mFocusVerticalTarget));
+}
+
+bool FocusState::CanIgnoreKeyboardShortcutMisses() const {
+  APZThreadUtils::AssertOnControllerThread();
+  MutexAutoLock lock(mMutex);
+
+  return IsCurrent(lock) && !mFocusHasKeyEventListeners;
+}
+
+void FocusState::Reset() {
+  MutexAutoLock lock(mMutex);
+
+  mLastAPZProcessedEvent = 1;
+  mLastContentProcessedEvent = 0;
+  mFocusHasKeyEventListeners = false;
+  mReceivedUpdate = false;
+  mFocusLayersId = {0};
+  mFocusHorizontalTarget = ScrollableLayerGuid::NULL_SCROLL_ID;
+  mFocusVerticalTarget = ScrollableLayerGuid::NULL_SCROLL_ID;
+  mFocusTree = {};
+}
+
+}  
+}  

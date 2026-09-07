@@ -1,0 +1,28 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+XPIDL_SOURCES += [
+    "nsIScopedPrefs.idl",
+]
+
+XPIDL_MODULE = "toolkit_antitracking"
+
+XPCOM_MANIFESTS += [
+    "components.conf",
+]
+
+UNIFIED_SOURCES += [
+    "ScopedPrefs.cpp",
+]
+
+EXPORTS.mozilla += [
+    "ScopedPrefs.h",
+]
+
+LOCAL_INCLUDES += [
+    "!/ipc/ipdl/_ipdlheaders",
+    "/ipc/chromium/src",
+]
+
+FINAL_LIBRARY = "xul"

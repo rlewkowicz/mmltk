@@ -1,0 +1,97 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef PendingTransactionQueue_h_
+#define PendingTransactionQueue_h_
+
+#include "nsClassHashtable.h"
+#include "nsHttpTransaction.h"
+#include "PendingTransactionInfo.h"
+
+namespace mozilla {
+namespace net {
+
+class PendingTransactionQueue {
+ public:
+  PendingTransactionQueue() = default;
+
+  void ReschedTransaction(nsHttpTransaction* aTrans);
+
+  nsTArray<RefPtr<PendingTransactionInfo>>* GetTransactionPendingQHelper(
+      nsAHttpTransaction* trans);
+
+  void InsertTransactionSorted(
+      nsTArray<RefPtr<PendingTransactionInfo>>& pendingQ,
+      PendingTransactionInfo* pendingTransInfo,
+      bool aInsertAsFirstForTheSamePriority = false);
+
+  void InsertTransaction(PendingTransactionInfo* pendingTransInfo,
+                         bool aInsertAsFirstForTheSamePriority = false);
+
+  void AppendPendingUrgentStartQ(
+      nsTArray<RefPtr<PendingTransactionInfo>>& result);
+
+  void AppendPendingQForFocusedWindow(
+      uint64_t windowId, nsTArray<RefPtr<PendingTransactionInfo>>& result,
+      uint32_t maxCount = 0);
+
+  void AppendPendingQForNonFocusedWindows(
+      uint64_t windowId, nsTArray<RefPtr<PendingTransactionInfo>>& result,
+      uint32_t maxCount = 0);
+
+  inline size_t PendingQueueLength() const {
+    MOZ_ASSERT(mPendingQueueLength == ComputePendingQueueLength());
+    return mPendingQueueLength;
+  }
+
+  size_t PendingQueueLengthForWindow(uint64_t windowId) const;
+
+  inline bool PendingQueueIsEmpty() const {
+    MOZ_ASSERT(mPendingQueueLength == ComputePendingQueueLength());
+    return mPendingQueueLength == 0;
+  }
+
+  void RemoveEmptyPendingQ();
+
+  void OnPendingTransactionRemovedFromTable();
+
+  void PrintDiagnostics(nsCString& log);
+
+  inline size_t UrgentStartQueueLength() const {
+    return mUrgentStartQ.Length();
+  }
+
+  inline bool UrgentStartQueueIsEmpty() const {
+    return mUrgentStartQ.IsEmpty();
+  }
+
+  void PrintPendingQ();
+
+  void Compact();
+
+  void CancelAllTransactions(nsresult reason);
+
+  ~PendingTransactionQueue() = default;
+
+ private:
+#ifdef DEBUG
+  size_t ComputePendingQueueLength() const;
+#endif
+
+  void InsertTransactionNormal(PendingTransactionInfo* info,
+                               bool aInsertAsFirstForTheSamePriority = false);
+
+  nsTArray<RefPtr<PendingTransactionInfo>>
+      mUrgentStartQ;  
+
+  nsClassHashtable<nsUint64HashKey, nsTArray<RefPtr<PendingTransactionInfo>>>
+      mPendingTransactionTable;
+
+  size_t mPendingQueueLength{0};
+};
+
+}  
+}  
+
+#endif  // !PendingTransactionQueue_h_

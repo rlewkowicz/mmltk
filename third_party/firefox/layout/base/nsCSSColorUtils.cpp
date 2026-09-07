@@ -1,0 +1,177 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "nsCSSColorUtils.h"
+
+#include <math.h>
+
+#include "nsDebug.h"
+
+
+#define RED_LUMINOSITY 299
+#define GREEN_LUMINOSITY 587
+#define BLUE_LUMINOSITY 114
+#define INTENSITY_FACTOR 25
+#define LUMINOSITY_FACTOR 75
+
+void NS_GetSpecial3DColors(nscolor aResult[2], nscolor aBorderColor) {
+  const float kDarkerScale = 2.0f / 3.0f;
+
+  uint8_t r = NS_GET_R(aBorderColor);
+  uint8_t g = NS_GET_G(aBorderColor);
+  uint8_t b = NS_GET_B(aBorderColor);
+  uint8_t a = NS_GET_A(aBorderColor);
+  if (r == 0 && g == 0 && b == 0) {
+    aResult[0] = NS_RGBA(76, 76, 76, a);
+    aResult[1] = NS_RGBA(178, 178, 178, a);
+    return;
+  }
+
+  aResult[0] = NS_RGBA(uint8_t(r * kDarkerScale), uint8_t(g * kDarkerScale),
+                       uint8_t(b * kDarkerScale), a);
+  aResult[1] = aBorderColor;
+}
+
+int NS_GetBrightness(uint8_t aRed, uint8_t aGreen, uint8_t aBlue) {
+  uint8_t intensity = (aRed + aGreen + aBlue) / 3;
+
+  uint8_t luminosity = NS_GetLuminosity(NS_RGB(aRed, aGreen, aBlue)) / 1000;
+
+  return ((intensity * INTENSITY_FACTOR) + (luminosity * LUMINOSITY_FACTOR)) /
+         100;
+}
+
+int32_t NS_GetLuminosity(nscolor aColor) {
+  NS_ASSERTION(NS_GET_A(aColor) == 255,
+               "impossible to compute luminosity of a non-opaque color");
+
+  return (NS_GET_R(aColor) * RED_LUMINOSITY +
+          NS_GET_G(aColor) * GREEN_LUMINOSITY +
+          NS_GET_B(aColor) * BLUE_LUMINOSITY);
+}
+
+void NS_RGB2HSV(nscolor aColor, uint16_t& aHue, uint16_t& aSat,
+                uint16_t& aValue, uint8_t& aAlpha) {
+  uint8_t r, g, b;
+  int16_t delta, min, max, r1, b1, g1;
+  float hue;
+
+  r = NS_GET_R(aColor);
+  g = NS_GET_G(aColor);
+  b = NS_GET_B(aColor);
+
+  if (r > g) {
+    max = r;
+    min = g;
+  } else {
+    max = g;
+    min = r;
+  }
+
+  if (b > max) {
+    max = b;
+  }
+  if (b < min) {
+    min = b;
+  }
+
+  aValue = max;
+  delta = max - min;
+  aSat = (max != 0) ? ((delta * 255) / max) : 0;
+  r1 = r;
+  b1 = b;
+  g1 = g;
+
+  if (aSat == 0) {
+    hue = 1000;
+  } else {
+    if (r == max) {
+      hue = (float)(g1 - b1) / (float)delta;
+    } else if (g1 == max) {
+      hue = 2.0f + (float)(b1 - r1) / (float)delta;
+    } else {
+      hue = 4.0f + (float)(r1 - g1) / (float)delta;
+    }
+  }
+
+  if (hue < 999) {
+    hue *= 60;
+    if (hue < 0) {
+      hue += 360;
+    }
+  } else {
+    hue = 0;
+  }
+
+  aHue = (uint16_t)hue;
+
+  aAlpha = NS_GET_A(aColor);
+}
+
+void NS_HSV2RGB(nscolor& aColor, uint16_t aHue, uint16_t aSat, uint16_t aValue,
+                uint8_t aAlpha) {
+  uint16_t r = 0, g = 0, b = 0;
+  uint16_t i, p, q, t;
+  double h, f, percent;
+
+  if (aSat == 0) {
+    r = aValue;
+    g = aValue;
+    b = aValue;
+  } else {
+    if (aHue >= 360) {
+      aHue = 0;
+    }
+
+    h = (double)aHue / 60.0;
+    i = (uint16_t)floor(h);
+    f = h - (double)i;
+    percent = ((double)aValue /
+               255.0);  
+    p = (uint16_t)(percent * (255 - aSat));
+    q = (uint16_t)(percent * (255 - (aSat * f)));
+    t = (uint16_t)(percent * (255 - (aSat * (1.0 - f))));
+
+    switch (i) {
+      case 0:
+        r = aValue;
+        g = t;
+        b = p;
+        break;
+      case 1:
+        r = q;
+        g = aValue;
+        b = p;
+        break;
+      case 2:
+        r = p;
+        g = aValue;
+        b = t;
+        break;
+      case 3:
+        r = p;
+        g = q;
+        b = aValue;
+        break;
+      case 4:
+        r = t;
+        g = p;
+        b = aValue;
+        break;
+      case 5:
+        r = aValue;
+        g = p;
+        b = q;
+        break;
+    }
+  }
+  aColor = NS_RGBA(r, g, b, aAlpha);
+}
+
+#undef RED_LUMINOSITY
+#undef GREEN_LUMINOSITY
+#undef BLUE_LUMINOSITY
+#undef INTENSITY_FACTOR
+#undef LUMINOSITY_FACTOR

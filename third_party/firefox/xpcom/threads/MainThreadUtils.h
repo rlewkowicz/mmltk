@@ -1,0 +1,43 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MainThreadUtils_h_
+#define MainThreadUtils_h_
+
+#include "mozilla/Assertions.h"
+#include "mozilla/ThreadSafety.h"
+#include "nscore.h"
+
+class nsIThread;
+
+extern nsresult NS_GetMainThread(nsIThread** aResult);
+
+#ifdef MOZILLA_INTERNAL_API
+bool NS_IsMainThreadTLSInitialized();
+extern "C" {
+bool NS_IsMainThread();
+}
+
+namespace mozilla {
+
+class MOZ_CAPABILITY("main thread") MainThreadCapability final {};
+constexpr MainThreadCapability sMainThreadCapability;
+
+#  ifdef DEBUG
+void AssertIsOnMainThread() MOZ_ASSERT_CAPABILITY(sMainThreadCapability);
+#  else
+inline void AssertIsOnMainThread()
+    MOZ_ASSERT_CAPABILITY(sMainThreadCapability) {}
+#  endif
+
+inline void ReleaseAssertIsOnMainThread()
+    MOZ_ASSERT_CAPABILITY(sMainThreadCapability) {
+  MOZ_RELEASE_ASSERT(NS_IsMainThread());
+}
+
+}  
+
+#endif
+
+#endif  // MainThreadUtils_h_

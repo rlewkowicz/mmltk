@@ -1,0 +1,164 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "FileSystemQuotaClient.h"
+
+#include "datamodel/FileSystemDatabaseManager.h"
+#include "datamodel/FileSystemFileManager.h"
+#include "mozilla/dom/FileSystemDataManager.h"
+#include "mozilla/dom/quota/Assertions.h"
+#include "mozilla/dom/quota/QuotaCommon.h"
+#include "mozilla/dom/quota/QuotaManager.h"
+#include "mozilla/dom/quota/ResultExtensions.h"
+#include "mozilla/dom/quota/UsageInfo.h"
+#include "mozilla/ipc/BackgroundParent.h"
+#include "nsIFile.h"
+
+namespace mozilla::dom::fs {
+
+namespace {
+
+auto toNSResult = [](const auto& aRv) { return ToNSResult(aRv); };
+
+}  
+
+FileSystemQuotaClient::FileSystemQuotaClient() {
+  ::mozilla::ipc::AssertIsOnBackgroundThread();
+}
+
+quota::Client::Type FileSystemQuotaClient::GetType() {
+  return quota::Client::Type::FILESYSTEM;
+}
+
+Result<quota::UsageInfo, nsresult> FileSystemQuotaClient::InitOrigin(
+    quota::PersistenceType aPersistenceType,
+    const quota::OriginMetadata& aOriginMetadata, const AtomicBool& aCanceled) {
+  quota::AssertIsOnIOThread();
+
+  DebugOnly<quota::QuotaManager*> quotaManager = quota::QuotaManager::Get();
+  MOZ_ASSERT(quotaManager);
+
+  MOZ_ASSERT(
+      !quotaManager->IsTemporaryOriginInitializedInternal(aOriginMetadata));
+
+  {
+    QM_TRY_INSPECT(const nsCOMPtr<nsIFile>& databaseFile,
+                   data::GetDatabaseFile(aOriginMetadata).mapErr(toNSResult));
+
+    bool exists = false;
+    QM_TRY(MOZ_TO_RESULT(databaseFile->Exists(&exists)));
+    if (!exists) {
+      return quota::UsageInfo();
+    }
+  }
+
+  QM_TRY_INSPECT(
+      const ResultConnection& conn,
+      data::GetStorageConnection(aOriginMetadata,  -1)
+          .mapErr(toNSResult));
+
+  QM_TRY(MOZ_TO_RESULT(
+      data::FileSystemDatabaseManager::RescanUsages(conn, aOriginMetadata)));
+
+  return data::FileSystemDatabaseManager::GetUsage(conn, aOriginMetadata)
+      .mapErr(toNSResult);
+}
+
+nsresult FileSystemQuotaClient::InitOriginWithoutTracking(
+    quota::PersistenceType ,
+    const quota::OriginMetadata& ,
+    const AtomicBool& ) {
+  quota::AssertIsOnIOThread();
+
+  UNKNOWN_FILE_WARNING(
+      NS_LITERAL_STRING_FROM_CSTRING(FILESYSTEM_DIRECTORY_NAME));
+
+  return NS_OK;
+}
+
+Result<quota::UsageInfo, nsresult> FileSystemQuotaClient::GetUsageForOrigin(
+    quota::PersistenceType aPersistenceType,
+    const quota::OriginMetadata& aOriginMetadata,
+    const AtomicBool& ) {
+  quota::AssertIsOnIOThread();
+
+  MOZ_ASSERT(aPersistenceType ==
+             quota::PersistenceType::PERSISTENCE_TYPE_DEFAULT);
+
+  quota::QuotaManager* quotaManager = quota::QuotaManager::Get();
+  MOZ_ASSERT(quotaManager);
+
+  MOZ_ASSERT(quotaManager->IsTemporaryStorageInitializedInternal());
+
+  return quotaManager->GetUsageForClient(aPersistenceType, aOriginMetadata,
+                                         quota::Client::FILESYSTEM);
+}
+
+void FileSystemQuotaClient::OnOriginClearCompleted(
+    const quota::OriginMetadata& aOriginMetadata) {
+  quota::AssertIsOnIOThread();
+}
+
+void FileSystemQuotaClient::OnRepositoryClearCompleted(
+    quota::PersistenceType aPersistenceType) {
+  quota::AssertIsOnIOThread();
+}
+
+void FileSystemQuotaClient::ReleaseIOThreadObjects() {
+  quota::AssertIsOnIOThread();
+}
+
+void FileSystemQuotaClient::AbortOperationsForLocks(
+    const DirectoryLockIdTable& aDirectoryLockIds) {
+  ::mozilla::ipc::AssertIsOnBackgroundThread();
+
+  data::FileSystemDataManager::AbortOperationsForLocks(aDirectoryLockIds);
+}
+
+void FileSystemQuotaClient::AbortOperationsForProcess(
+    ContentParentId aContentParentId) {
+  ::mozilla::ipc::AssertIsOnBackgroundThread();
+}
+
+void FileSystemQuotaClient::AbortAllOperations() {
+  ::mozilla::ipc::AssertIsOnBackgroundThread();
+}
+
+void FileSystemQuotaClient::StartIdleMaintenance() {
+  ::mozilla::ipc::AssertIsOnBackgroundThread();
+}
+
+void FileSystemQuotaClient::StopIdleMaintenance() {
+  ::mozilla::ipc::AssertIsOnBackgroundThread();
+}
+
+void FileSystemQuotaClient::InitiateShutdown() {
+  ::mozilla::ipc::AssertIsOnBackgroundThread();
+
+  data::FileSystemDataManager::InitiateShutdown();
+}
+
+nsCString FileSystemQuotaClient::GetShutdownStatus() const {
+  ::mozilla::ipc::AssertIsOnBackgroundThread();
+
+  return "Not implemented"_ns;
+}
+
+bool FileSystemQuotaClient::IsShutdownCompleted() const {
+  ::mozilla::ipc::AssertIsOnBackgroundThread();
+
+  return data::FileSystemDataManager::IsShutdownCompleted();
+}
+
+void FileSystemQuotaClient::ForceKillActors() {
+  ::mozilla::ipc::AssertIsOnBackgroundThread();
+
+}
+
+void FileSystemQuotaClient::FinalizeShutdown() {
+  ::mozilla::ipc::AssertIsOnBackgroundThread();
+
+}
+
+}  

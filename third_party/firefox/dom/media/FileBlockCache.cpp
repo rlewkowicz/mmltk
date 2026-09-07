@@ -1,0 +1,425 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "FileBlockCache.h"
+
+#include <algorithm>
+
+#include "MediaCache.h"
+#include "VideoUtils.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/dom/ContentChild.h"
+#include "nsAnonymousTemporaryFile.h"
+#include "nsIThreadManager.h"
+#include "nsXULAppAPI.h"
+#include "prio.h"
+
+namespace mozilla {
+
+#undef LOG
+LazyLogModule gFileBlockCacheLog("FileBlockCache");
+#define LOG(x, ...)                                                         \
+  MOZ_LOG_FMT(gFileBlockCacheLog, LogLevel::Debug, "{} " x, fmt::ptr(this), \
+              ##__VA_ARGS__)
+
+static void CloseFD(PRFileDesc* aFD) {
+  PRStatus prrc;
+  prrc = PR_Close(aFD);
+  if (prrc != PR_SUCCESS) {
+    NS_WARNING("PR_Close() failed.");
+  }
+}
+
+void FileBlockCache::SetCacheFile(PRFileDesc* aFD) {
+  LOG("SetCacheFile aFD={}", fmt::ptr(aFD));
+  if (!aFD) {
+    Close();
+    return;
+  }
+  {
+    MutexAutoLock lock(mFileMutex);
+    mFD = aFD;
+  }
+  {
+    MutexAutoLock lock(mDataMutex);
+    LOG("SetFileCache mBackgroundET={}, mIsWriteScheduled {}",
+        fmt::ptr(mBackgroundET.get()), mIsWriteScheduled);
+    if (mBackgroundET) {
+      mInitialized = true;
+      if (mIsWriteScheduled) {
+        nsCOMPtr<nsIRunnable> event = mozilla::NewRunnableMethod(
+            "FileBlockCache::SetCacheFile -> PerformBlockIOs", this,
+            &FileBlockCache::PerformBlockIOs);
+        mBackgroundET->Dispatch(event.forget(), NS_DISPATCH_EVENT_MAY_BLOCK);
+      }
+      return;
+    }
+  }
+  MutexAutoLock lock(mFileMutex);
+  if (mFD) {
+    CloseFD(mFD);
+    mFD = nullptr;
+  }
+}
+
+nsresult FileBlockCache::Init() {
+  LOG("Init()");
+  MutexAutoLock mon(mDataMutex);
+  MOZ_ASSERT(!mBackgroundET);
+  nsresult rv = NS_CreateBackgroundTaskQueue("FileBlockCache",
+                                             getter_AddRefs(mBackgroundET));
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  if (XRE_IsParentProcess()) {
+    RefPtr<FileBlockCache> self = this;
+    rv = mBackgroundET->Dispatch(
+        NS_NewRunnableFunction("FileBlockCache::Init",
+                               [self] {
+                                 PRFileDesc* fd = nullptr;
+                                 nsresult rv =
+                                     NS_OpenAnonymousTemporaryFile(&fd);
+                                 if (NS_SUCCEEDED(rv)) {
+                                   self->SetCacheFile(fd);
+                                 } else {
+                                   self->Close();
+                                 }
+                               }),
+        NS_DISPATCH_EVENT_MAY_BLOCK);
+  } else {
+    RefPtr<FileBlockCache> self = this;
+    rv = dom::ContentChild::GetSingleton()->AsyncOpenAnonymousTemporaryFile(
+        [self](PRFileDesc* aFD) { self->SetCacheFile(aFD); });
+  }
+
+  if (NS_FAILED(rv)) {
+    Close();
+  }
+
+  return rv;
+}
+
+void FileBlockCache::Flush() {
+  LOG("Flush()");
+  MutexAutoLock mon(mDataMutex);
+  MOZ_ASSERT(mBackgroundET);
+
+  RefPtr<FileBlockCache> self = this;
+  mBackgroundET->Dispatch(
+      NS_NewRunnableFunction("FileBlockCache::Flush", [self]() {
+        MutexAutoLock mon(self->mDataMutex);
+        self->mChangeIndexList.clear();
+        self->mBlockChanges.Clear();
+      }));
+}
+
+size_t FileBlockCache::GetMaxBlocks(size_t aCacheSizeInKB) const {
+  static_assert(MediaCacheStream::BLOCK_SIZE % 1024 == 0,
+                "BLOCK_SIZE should be a multiple of 1024");
+  static_assert(MediaCacheStream::BLOCK_SIZE / 1024 >= 2,
+                "BLOCK_SIZE / 1024 should be at least 2");
+  static_assert(MediaCacheStream::BLOCK_SIZE / 1024 <= int64_t(UINT32_MAX),
+                "BLOCK_SIZE / 1024 should be at most UINT32_MAX");
+  constexpr size_t blockSizeKb = size_t(MediaCacheStream::BLOCK_SIZE / 1024);
+  const size_t maxBlocks = aCacheSizeInKB / blockSizeKb;
+  return std::max(maxBlocks, size_t(1));
+}
+
+FileBlockCache::FileBlockCache()
+    : mFileMutex("MediaCache.Writer.IO.Mutex"),
+      mFD(nullptr),
+      mFDCurrentPos(0),
+      mDataMutex("MediaCache.Writer.Data.Mutex"),
+      mIsWriteScheduled(false),
+      mIsReading(false) {}
+
+FileBlockCache::~FileBlockCache() { Close(); }
+
+void FileBlockCache::Close() {
+  LOG("Close()");
+
+  nsCOMPtr<nsISerialEventTarget> thread;
+  {
+    MutexAutoLock mon(mDataMutex);
+    if (!mBackgroundET) {
+      return;
+    }
+    thread.swap(mBackgroundET);
+  }
+
+  PRFileDesc* fd;
+  {
+    MutexAutoLock lock(mFileMutex);
+    fd = mFD;
+    mFD = nullptr;
+  }
+
+  nsresult rv = thread->Dispatch(NS_NewRunnableFunction("FileBlockCache::Close",
+                                                        [fd] {
+                                                          if (fd) {
+                                                            CloseFD(fd);
+                                                          }
+                                                        }),
+                                 NS_DISPATCH_EVENT_MAY_BLOCK);
+  NS_ENSURE_SUCCESS_VOID(rv);
+}
+
+template <typename Container, typename Value>
+bool ContainerContains(const Container& aContainer, const Value& value) {
+  return std::find(aContainer.begin(), aContainer.end(), value) !=
+         aContainer.end();
+}
+
+nsresult FileBlockCache::WriteBlock(uint32_t aBlockIndex,
+                                    Span<const uint8_t> aData1,
+                                    Span<const uint8_t> aData2) {
+  MutexAutoLock mon(mDataMutex);
+
+  if (!mBackgroundET) {
+    return NS_ERROR_FAILURE;
+  }
+
+  mBlockChanges.EnsureLengthAtLeast(aBlockIndex + 1);
+  bool blockAlreadyHadPendingChange = mBlockChanges[aBlockIndex] != nullptr;
+  mBlockChanges[aBlockIndex] = new BlockChange(aData1, aData2);
+
+  if (!blockAlreadyHadPendingChange ||
+      !ContainerContains(mChangeIndexList, aBlockIndex)) {
+    mChangeIndexList.push_back(aBlockIndex);
+  }
+  NS_ASSERTION(ContainerContains(mChangeIndexList, aBlockIndex),
+               "Must have entry for new block");
+
+  EnsureWriteScheduled();
+
+  return NS_OK;
+}
+
+void FileBlockCache::EnsureWriteScheduled() {
+  mDataMutex.AssertCurrentThreadOwns();
+  MOZ_ASSERT(mBackgroundET);
+
+  if (mIsWriteScheduled || mIsReading) {
+    return;
+  }
+  mIsWriteScheduled = true;
+  if (!mInitialized) {
+    return;
+  }
+  nsCOMPtr<nsIRunnable> event = mozilla::NewRunnableMethod(
+      "FileBlockCache::EnsureWriteScheduled -> PerformBlockIOs", this,
+      &FileBlockCache::PerformBlockIOs);
+  mBackgroundET->Dispatch(event.forget(), NS_DISPATCH_EVENT_MAY_BLOCK);
+}
+
+nsresult FileBlockCache::Seek(int64_t aOffset) {
+  mFileMutex.AssertCurrentThreadOwns();
+
+  if (mFDCurrentPos != aOffset) {
+    MOZ_ASSERT(mFD);
+    int64_t result = PR_Seek64(mFD, aOffset, PR_SEEK_SET);
+    if (result != aOffset) {
+      NS_WARNING("Failed to seek media cache file");
+      return NS_ERROR_FAILURE;
+    }
+    mFDCurrentPos = result;
+  }
+  return NS_OK;
+}
+
+nsresult FileBlockCache::ReadFromFile(int64_t aOffset, uint8_t* aDest,
+                                      int32_t aBytesToRead,
+                                      int32_t& aBytesRead) {
+  LOG("ReadFromFile(offset={}, len={})", aOffset, aBytesToRead);
+  mFileMutex.AssertCurrentThreadOwns();
+  MOZ_ASSERT(mFD);
+
+  nsresult res = Seek(aOffset);
+  if (NS_FAILED(res)) return res;
+
+  aBytesRead = PR_Read(mFD, aDest, aBytesToRead);
+  if (aBytesRead <= 0) return NS_ERROR_FAILURE;
+  mFDCurrentPos += aBytesRead;
+
+  return NS_OK;
+}
+
+nsresult FileBlockCache::WriteBlockToFile(int32_t aBlockIndex,
+                                          const uint8_t* aBlockData) {
+  LOG("WriteBlockToFile(index={})", aBlockIndex);
+
+  mFileMutex.AssertCurrentThreadOwns();
+  MOZ_ASSERT(mFD);
+
+  nsresult rv = Seek(BlockIndexToOffset(aBlockIndex));
+  if (NS_FAILED(rv)) return rv;
+
+  int32_t amount = PR_Write(mFD, aBlockData, BLOCK_SIZE);
+  if (amount < BLOCK_SIZE) {
+    NS_WARNING("Failed to write media cache block!");
+    return NS_ERROR_FAILURE;
+  }
+  mFDCurrentPos += BLOCK_SIZE;
+
+  return NS_OK;
+}
+
+nsresult FileBlockCache::MoveBlockInFile(int32_t aSourceBlockIndex,
+                                         int32_t aDestBlockIndex) {
+  LOG("MoveBlockInFile(src={}, dest={})", aSourceBlockIndex, aDestBlockIndex);
+
+  mFileMutex.AssertCurrentThreadOwns();
+
+  uint8_t buf[BLOCK_SIZE];
+  int32_t bytesRead = 0;
+  if (NS_FAILED(ReadFromFile(BlockIndexToOffset(aSourceBlockIndex), buf,
+                             BLOCK_SIZE, bytesRead))) {
+    return NS_ERROR_FAILURE;
+  }
+  return WriteBlockToFile(aDestBlockIndex, buf);
+}
+
+void FileBlockCache::PerformBlockIOs() {
+  MutexAutoLock mon(mDataMutex);
+  MOZ_ASSERT(mBackgroundET->IsOnCurrentThread());
+  NS_ASSERTION(mIsWriteScheduled, "Should report write running or scheduled.");
+
+  LOG("Run() mFD={} mBackgroundET={}", fmt::ptr(mFD),
+      fmt::ptr(mBackgroundET.get()));
+
+  while (!mChangeIndexList.empty()) {
+    if (!mBackgroundET) {
+      mIsWriteScheduled = false;
+      return;
+    }
+
+    if (mIsReading) {
+      mIsWriteScheduled = false;
+      return;
+    }
+
+
+    int32_t blockIndex = mChangeIndexList.front();
+    RefPtr<BlockChange> change = mBlockChanges[blockIndex];
+    MOZ_ASSERT(change,
+               "Change index list should only contain entries for blocks "
+               "with changes");
+    {
+      MutexAutoUnlock unlock(mDataMutex);
+      MutexAutoLock lock(mFileMutex);
+      if (!mFD) {
+        return;
+      }
+      if (change->IsWrite()) {
+        WriteBlockToFile(blockIndex, change->mData.get());
+      } else if (change->IsMove()) {
+        MoveBlockInFile(change->mSourceBlockIndex, blockIndex);
+      }
+    }
+    mChangeIndexList.pop_front();  
+    if (mBlockChanges[blockIndex] == change) {  
+      mBlockChanges[blockIndex] = nullptr;      
+    }
+  }
+
+  mIsWriteScheduled = false;
+}
+
+nsresult FileBlockCache::Read(int64_t aOffset, uint8_t* aData,
+                              int32_t aLength) {
+  MutexAutoLock mon(mDataMutex);
+
+  if (!mBackgroundET || (aOffset / BLOCK_SIZE) > INT32_MAX) {
+    return NS_ERROR_FAILURE;
+  }
+
+  mIsReading = true;
+  auto exitRead = MakeScopeExit([&] {
+    mDataMutex.AssertCurrentThreadOwns();
+    mIsReading = false;
+    if (!mChangeIndexList.empty()) {
+      EnsureWriteScheduled();
+    }
+  });
+
+  int32_t bytesToRead = aLength;
+  int64_t offset = aOffset;
+  uint8_t* dst = aData;
+  while (bytesToRead > 0) {
+    int32_t blockIndex = static_cast<int32_t>(offset / BLOCK_SIZE);
+    int32_t start = offset % BLOCK_SIZE;
+    int32_t amount = std::min(BLOCK_SIZE - start, bytesToRead);
+
+    int32_t bytesRead = 0;
+    MOZ_ASSERT(!mBlockChanges.IsEmpty());
+    MOZ_ASSERT(blockIndex >= 0 &&
+               static_cast<uint32_t>(blockIndex) < mBlockChanges.Length());
+    RefPtr<BlockChange> change = mBlockChanges.SafeElementAt(blockIndex);
+    if (change && change->IsWrite()) {
+      const uint8_t* blockData = change->mData.get();
+      memcpy(dst, blockData + start, amount);
+      bytesRead = amount;
+    } else {
+      if (change && change->IsMove()) {
+        blockIndex = change->mSourceBlockIndex;
+      }
+      nsresult res;
+      {
+        MutexAutoUnlock unlock(mDataMutex);
+        MutexAutoLock lock(mFileMutex);
+        if (!mFD) {
+          return NS_ERROR_FAILURE;
+        }
+        res = ReadFromFile(BlockIndexToOffset(blockIndex) + start, dst, amount,
+                           bytesRead);
+      }
+      NS_ENSURE_SUCCESS(res, res);
+    }
+    dst += bytesRead;
+    offset += bytesRead;
+    bytesToRead -= bytesRead;
+  }
+  return NS_OK;
+}
+
+nsresult FileBlockCache::MoveBlock(int32_t aSourceBlockIndex,
+                                   int32_t aDestBlockIndex) {
+  MutexAutoLock mon(mDataMutex);
+
+  if (!mBackgroundET) {
+    return NS_ERROR_FAILURE;
+  }
+
+  mBlockChanges.EnsureLengthAtLeast(
+      std::max(aSourceBlockIndex, aDestBlockIndex) + 1);
+
+  int32_t sourceIndex = aSourceBlockIndex;
+  BlockChange* sourceBlock = nullptr;
+  while ((sourceBlock = mBlockChanges[sourceIndex]) && sourceBlock->IsMove()) {
+    sourceIndex = sourceBlock->mSourceBlockIndex;
+  }
+
+  if (mBlockChanges[aDestBlockIndex] == nullptr ||
+      !ContainerContains(mChangeIndexList, aDestBlockIndex)) {
+    mChangeIndexList.push_back(aDestBlockIndex);
+  }
+
+  if (sourceBlock && sourceBlock->IsWrite()) {
+    mBlockChanges[aDestBlockIndex] = new BlockChange(sourceBlock->mData.get());
+  } else {
+    mBlockChanges[aDestBlockIndex] = new BlockChange(sourceIndex);
+  }
+
+  EnsureWriteScheduled();
+
+  NS_ASSERTION(ContainerContains(mChangeIndexList, aDestBlockIndex),
+               "Should have scheduled block for change");
+
+  return NS_OK;
+}
+
+}  
+
+#undef LOG

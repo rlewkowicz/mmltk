@@ -1,0 +1,99 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_BrowserBridgeParent_h
+#define mozilla_dom_BrowserBridgeParent_h
+
+#include "mozilla/dom/PBrowserBridgeParent.h"
+#include "mozilla/dom/WindowGlobalTypes.h"
+#include "mozilla/dom/ipc/IdType.h"
+
+namespace mozilla {
+
+namespace a11y {
+class DocAccessibleParent;
+}
+
+
+namespace dom {
+
+class BrowserParent;
+
+class BrowserBridgeParent : public PBrowserBridgeParent {
+ public:
+  NS_INLINE_DECL_REFCOUNTING(BrowserBridgeParent, final);
+
+  BrowserBridgeParent();
+
+  nsresult InitWithProcess(BrowserParent* aParentBrowser,
+                           ContentParent* aContentParent,
+                           const WindowGlobalInit& aWindowInit,
+                           uint32_t aChromeFlags, TabId aTabId);
+
+  BrowserParent* GetBrowserParent() { return mBrowserParent; }
+
+  CanonicalBrowsingContext* GetBrowsingContext();
+
+  BrowserParent* Manager();
+
+#if defined(ACCESSIBILITY)
+  a11y::DocAccessibleParent* GetEmbedderAccessibleDoc();
+
+  uint64_t GetEmbedderAccessibleId() { return mEmbedderAccessibleID; }
+
+  a11y::DocAccessibleParent* GetDocAccessibleParent();
+#endif  // defined(ACCESSIBILITY)
+
+  void Destroy();
+
+ protected:
+  friend class PBrowserBridgeParent;
+
+  mozilla::ipc::IPCResult RecvShow(const OwnerShowInfo&);
+  mozilla::ipc::IPCResult RecvScrollbarPreferenceChanged(ScrollbarPreference);
+  mozilla::ipc::IPCResult RecvLoadURL(nsDocShellLoadState* aLoadState);
+  mozilla::ipc::IPCResult RecvResumeLoad(uint64_t aPendingSwitchID);
+  mozilla::ipc::IPCResult RecvUpdateDimensions(
+      const LayoutDeviceIntRect& aRect, const LayoutDeviceIntSize& aSize);
+  mozilla::ipc::IPCResult RecvUpdateEffects(const EffectsInfo& aEffects);
+  mozilla::ipc::IPCResult RecvRenderLayers(const bool& aEnabled);
+
+  mozilla::ipc::IPCResult RecvNavigateByKey(const bool& aForward,
+                                            const bool& aForDocumentNavigation);
+  mozilla::ipc::IPCResult RecvBeginDestroy();
+
+  mozilla::ipc::IPCResult RecvDispatchSynthesizedMouseEvent(
+      const WidgetMouseEvent& aEvent);
+
+  mozilla::ipc::IPCResult RecvWillChangeProcess();
+
+  mozilla::ipc::IPCResult RecvActivate(uint64_t aActionId);
+
+  mozilla::ipc::IPCResult RecvDeactivate(const bool& aWindowLowering,
+                                         uint64_t aActionId);
+
+  mozilla::ipc::IPCResult RecvUpdateRemoteStyle(
+      const StyleImageRendering& aImageRendering);
+
+#ifdef ACCESSIBILITY
+  mozilla::ipc::IPCResult RecvSetEmbedderAccessible(PDocAccessibleParent* aDoc,
+                                                    uint64_t aID);
+#endif
+
+  void ActorDestroy(ActorDestroyReason aWhy) override;
+
+ private:
+  ~BrowserBridgeParent();
+
+  RefPtr<BrowserParent> mBrowserParent;
+#ifdef ACCESSIBILITY
+  RefPtr<a11y::DocAccessibleParent> mEmbedderAccessibleDoc;
+  uint64_t mEmbedderAccessibleID = 0;
+#endif  // ACCESSIBILITY
+};
+
+}  
+}  
+
+#endif  // !defined(mozilla_dom_BrowserBridgeParent_h)

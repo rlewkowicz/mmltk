@@ -1,0 +1,475 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "builtin/intl/IntlObject.h"
+
+#include "mozilla/Assertions.h"
+#include "mozilla/intl/Calendar.h"
+#include "mozilla/intl/Collator.h"
+#include "mozilla/intl/Currency.h"
+#include "mozilla/intl/TimeZone.h"
+
+#include <algorithm>
+#include <array>
+#include <cstring>
+#include <iterator>
+#include <string_view>
+
+#include "builtin/Array.h"
+#include "builtin/intl/CommonFunctions.h"
+#include "builtin/intl/LocaleNegotiation.h"
+#include "builtin/intl/MeasureUnitGenerated.h"
+#include "builtin/intl/NumberingSystemsGenerated.h"
+#include "builtin/intl/SharedIntlData.h"
+#include "js/Class.h"
+#include "js/experimental/Intl.h"
+#include "js/friend/ErrorMessages.h"  // js::GetErrorMessage, JSMSG_*
+#include "js/GCAPI.h"
+#include "js/GCVector.h"
+#include "js/PropertyAndElement.h"
+#include "js/PropertySpec.h"
+#include "vm/GlobalObject.h"
+#include "vm/JSAtomUtils.h"  // ClassName
+#include "vm/JSContext.h"
+#include "vm/PlainObject.h"  // js::PlainObject
+#include "vm/StringType.h"
+
+#include "vm/JSObject-inl.h"
+#include "vm/NativeObject-inl.h"
+
+using namespace js;
+using namespace js::intl;
+
+
+static PlainObject* GetCalendarInfo(JSContext* cx,
+                                    Handle<JSLinearString*> loc) {
+  auto locale = EncodeLocale(cx, loc);
+  if (!locale) {
+    return nullptr;
+  }
+
+  auto result = mozilla::intl::Calendar::TryCreate(locale.get());
+  if (result.isErr()) {
+    ReportInternalError(cx, result.unwrapErr());
+    return nullptr;
+  }
+  auto calendar = result.unwrap();
+
+  Rooted<IdValueVector> properties(cx, cx);
+
+  if (!properties.emplaceBack(NameToId(cx->names().locale), StringValue(loc))) {
+    return nullptr;
+  }
+
+  auto type = calendar->GetBcp47Type();
+  if (type.isErr()) {
+    ReportInternalError(cx, type.unwrapErr());
+    return nullptr;
+  }
+
+  auto* calendarType = NewStringCopy<CanGC>(cx, type.unwrap());
+  if (!calendarType) {
+    return nullptr;
+  }
+
+  if (!properties.emplaceBack(NameToId(cx->names().calendar),
+                              StringValue(calendarType))) {
+    return nullptr;
+  }
+
+  if (!properties.emplaceBack(
+          NameToId(cx->names().firstDayOfWeek),
+          Int32Value(static_cast<int32_t>(calendar->GetFirstDayOfWeek())))) {
+    return nullptr;
+  }
+
+  if (!properties.emplaceBack(
+          NameToId(cx->names().minDays),
+          Int32Value(calendar->GetMinimalDaysInFirstWeek()))) {
+    return nullptr;
+  }
+
+  auto weekend = calendar->GetWeekend();
+  if (weekend.isErr()) {
+    ReportInternalError(cx, weekend.unwrapErr());
+    return nullptr;
+  }
+  auto weekendSet = weekend.unwrap();
+
+  auto* weekendArray = NewDenseFullyAllocatedArray(cx, weekendSet.size());
+  if (!weekendArray) {
+    return nullptr;
+  }
+  weekendArray->setDenseInitializedLength(weekendSet.size());
+
+  size_t index = 0;
+  for (auto day : weekendSet) {
+    weekendArray->initDenseElement(index++,
+                                   Int32Value(static_cast<int32_t>(day)));
+  }
+  MOZ_ASSERT(index == weekendSet.size());
+
+  if (!properties.emplaceBack(NameToId(cx->names().weekend),
+                              ObjectValue(*weekendArray))) {
+    return nullptr;
+  }
+
+  return NewPlainObjectWithUniqueNames(cx, properties);
+}
+
+static bool intl_getCalendarInfo(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  Rooted<ArrayObject*> requestedLocales(
+      cx, CanonicalizeLocaleList(cx, args.get(0)));
+  if (!requestedLocales) {
+    return false;
+  }
+
+  Rooted<LocaleOptions> localeOptions(cx);
+
+  auto localeData = LocaleData::Default;
+  mozilla::EnumSet<UnicodeExtensionKey> relevantExtensionKeys{
+      UnicodeExtensionKey::Calendar,
+  };
+
+  Rooted<ResolvedLocale> resolved(cx);
+  if (!ResolveLocale(cx, AvailableLocaleKind::DateTimeFormat, requestedLocales,
+                     localeOptions, relevantExtensionKeys, localeData,
+                     &resolved)) {
+    return false;
+  }
+
+  Rooted<JSLinearString*> locale(cx, resolved.toLocale(cx));
+  if (!locale) {
+    return false;
+  }
+
+  auto* result = GetCalendarInfo(cx, locale);
+  if (!result) {
+    return false;
+  }
+
+  args.rval().setObject(*result);
+  return true;
+}
+
+static const JSFunctionSpec intl_extensions[] = {
+    JS_FN("getCalendarInfo", intl_getCalendarInfo, 1, 0),
+    JS_FS_END,
+};
+
+bool JS::AddMozGetCalendarInfo(JSContext* cx, Handle<JSObject*> intl) {
+  return JS_DefineFunctions(cx, intl, intl_extensions);
+}
+
+
+template <size_t N>
+static ArrayObject* CreateArrayFromSortedList(
+    JSContext* cx, const std::array<const char*, N>& list) {
+  MOZ_ASSERT(std::adjacent_find(std::begin(list), std::end(list),
+                                [](const auto& a, const auto& b) {
+                                  return std::strcmp(a, b) >= 0;
+                                }) == std::end(list));
+
+  size_t length = std::size(list);
+
+  Rooted<ArrayObject*> array(cx, NewDenseFullyAllocatedArray(cx, length));
+  if (!array) {
+    return nullptr;
+  }
+  array->ensureDenseInitializedLength(0, length);
+
+  for (size_t i = 0; i < length; ++i) {
+    auto* str = NewStringCopyZ<CanGC>(cx, list[i]);
+    if (!str) {
+      return nullptr;
+    }
+    array->initDenseElement(i, StringValue(str));
+  }
+  return array;
+}
+
+template <const auto& unsupported>
+static bool EnumerationIntoList(JSContext* cx, auto values,
+                                MutableHandle<StringList> list) {
+  for (auto value : values) {
+    if (value.isErr()) {
+      ReportInternalError(cx);
+      return false;
+    }
+    auto span = value.unwrap();
+
+    std::string_view sv(span.data(), span.size());
+    if (std::any_of(std::begin(unsupported), std::end(unsupported),
+                    [sv](const auto& e) { return sv == e; })) {
+      continue;
+    }
+
+    auto* string = NewStringCopy<CanGC>(cx, span);
+    if (!string) {
+      return false;
+    }
+    if (!list.append(string)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static bool ICU4XEnumerationIntoList(JSContext* cx, auto& values,
+                                     MutableHandle<StringList> list) {
+  for (mozilla::Span<const char> value : values) {
+    auto* string = NewStringCopy<CanGC>(cx, value);
+    if (!string) {
+      return false;
+    }
+    if (!list.append(string)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static constexpr auto UnsupportedCalendars() {
+  return std::array{
+      "islamic",
+      "islamic-rgsa",
+  };
+}
+
+static ArrayObject* AvailableCalendars(JSContext* cx) {
+  Rooted<StringList> list(cx, StringList(cx));
+
+  {
+    auto keywords = mozilla::intl::Calendar::GetBcp47KeywordValuesForLocale("");
+    if (keywords.isErr()) {
+      ReportInternalError(cx, keywords.unwrapErr());
+      return nullptr;
+    }
+
+    static constexpr auto unsupported = UnsupportedCalendars();
+
+    if (!EnumerationIntoList<unsupported>(cx, keywords.unwrap(), &list)) {
+      return nullptr;
+    }
+  }
+
+  return CreateSortedArrayFromList(cx, &list);
+}
+
+static ArrayObject* AvailableCollations(JSContext* cx) {
+  Rooted<StringList> list(cx, StringList(cx));
+
+  auto keywords = mozilla::intl::Collator::GetBcp47KeywordValues();
+
+  if (!ICU4XEnumerationIntoList(cx, keywords, &list)) {
+    return nullptr;
+  }
+
+  return CreateSortedArrayFromList(cx, &list);
+}
+
+static constexpr auto UnsupportedCurrencies() {
+  return std::array{
+      "LSM",  
+  };
+}
+
+static ArrayObject* AvailableCurrencies(JSContext* cx) {
+  Rooted<StringList> list(cx, StringList(cx));
+
+  {
+    auto currencies = mozilla::intl::Currency::GetISOCurrencies();
+    if (currencies.isErr()) {
+      ReportInternalError(cx, currencies.unwrapErr());
+      return nullptr;
+    }
+
+    static constexpr auto unsupported = UnsupportedCurrencies();
+
+    if (!EnumerationIntoList<unsupported>(cx, currencies.unwrap(), &list)) {
+      return nullptr;
+    }
+  }
+
+  return CreateSortedArrayFromList(cx, &list);
+}
+
+static ArrayObject* AvailableNumberingSystems(JSContext* cx) {
+  static constexpr std::array numberingSystems = {
+      NUMBERING_SYSTEMS_WITH_SIMPLE_DIGIT_MAPPINGS};
+
+  return CreateArrayFromSortedList(cx, numberingSystems);
+}
+
+static ArrayObject* AvailableTimeZones(JSContext* cx) {
+  Rooted<StringList> timeZones(cx, StringList(cx));
+
+  auto& sharedIntlData = cx->runtime()->sharedIntlData.ref();
+  auto iterResult = sharedIntlData.availableTimeZonesIteration(cx);
+  if (iterResult.isErr()) {
+    return nullptr;
+  }
+  auto iter = iterResult.unwrap();
+
+  Rooted<JSAtom*> validatedTimeZone(cx);
+  for (; !iter.done(); iter.next()) {
+    validatedTimeZone = iter.get();
+
+    auto* timeZone = sharedIntlData.canonicalizeTimeZone(cx, validatedTimeZone);
+    if (!timeZone) {
+      return nullptr;
+    }
+
+    if (!timeZones.append(timeZone)) {
+      return nullptr;
+    }
+  }
+
+  return CreateSortedArrayFromList(cx, &timeZones);
+}
+
+template <size_t N>
+constexpr auto MeasurementUnitNames(const SimpleMeasureUnit (&units)[N]) {
+  std::array<const char*, N> array = {};
+  for (size_t i = 0; i < N; ++i) {
+    array[i] = units[i].name;
+  }
+  return array;
+}
+
+static ArrayObject* AvailableUnits(JSContext* cx) {
+  static constexpr auto simpleMeasureUnitNames =
+      MeasurementUnitNames(simpleMeasureUnits);
+
+  return CreateArrayFromSortedList(cx, simpleMeasureUnitNames);
+}
+
+static bool intl_getCanonicalLocales(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  auto* array = CanonicalizeLocaleList(cx, args.get(0));
+  if (!array) {
+    return false;
+  }
+  args.rval().setObject(*array);
+  return true;
+}
+
+static bool intl_supportedValuesOf(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  auto* key = ToString(cx, args.get(0));
+  if (!key) {
+    return false;
+  }
+
+  auto* linearKey = key->ensureLinear(cx);
+  if (!linearKey) {
+    return false;
+  }
+
+  ArrayObject* list;
+  if (StringEqualsLiteral(linearKey, "calendar")) {
+    list = AvailableCalendars(cx);
+  } else if (StringEqualsLiteral(linearKey, "collation")) {
+    list = AvailableCollations(cx);
+  } else if (StringEqualsLiteral(linearKey, "currency")) {
+    list = AvailableCurrencies(cx);
+  } else if (StringEqualsLiteral(linearKey, "numberingSystem")) {
+    list = AvailableNumberingSystems(cx);
+  } else if (StringEqualsLiteral(linearKey, "timeZone")) {
+    list = AvailableTimeZones(cx);
+  } else if (StringEqualsLiteral(linearKey, "unit")) {
+    list = AvailableUnits(cx);
+  } else {
+    if (UniqueChars chars = QuoteString(cx, linearKey, '"')) {
+      JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr, JSMSG_INVALID_KEY,
+                                chars.get());
+    }
+    return false;
+  }
+  if (!list) {
+    return false;
+  }
+
+  args.rval().setObject(*list);
+  return true;
+}
+
+static bool intl_toSource(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  args.rval().setString(cx->names().Intl);
+  return true;
+}
+
+static const JSFunctionSpec intl_static_methods[] = {
+    JS_FN("toSource", intl_toSource, 0, 0),
+    JS_FN("getCanonicalLocales", intl_getCanonicalLocales, 1, 0),
+    JS_FN("supportedValuesOf", intl_supportedValuesOf, 1, 0),
+    JS_FS_END,
+};
+
+static const JSPropertySpec intl_static_properties[] = {
+    JS_STRING_SYM_PS(toStringTag, "Intl", JSPROP_READONLY),
+    JS_PS_END,
+};
+
+static JSObject* CreateIntlObject(JSContext* cx, JSProtoKey key) {
+  Rooted<JSObject*> proto(cx, &cx->global()->getObjectPrototype());
+
+  return NewObjectWithGivenProto(cx, &IntlClass, proto,
+                                 {.newKind = TenuredObject});
+}
+
+static bool IntlClassFinish(JSContext* cx, Handle<JSObject*> intl,
+                            Handle<JSObject*> proto) {
+  Rooted<JS::PropertyKey> ctorId(cx);
+  Rooted<JS::Value> ctorValue(cx);
+  for (const auto& protoKey : {
+           JSProto_Collator,
+           JSProto_DateTimeFormat,
+           JSProto_DisplayNames,
+           JSProto_DurationFormat,
+           JSProto_ListFormat,
+           JSProto_Locale,
+           JSProto_NumberFormat,
+           JSProto_PluralRules,
+           JSProto_RelativeTimeFormat,
+           JSProto_Segmenter,
+       }) {
+    if (GlobalObject::skipDeselectedConstructor(cx, protoKey)) {
+      continue;
+    }
+
+    JSObject* ctor = GlobalObject::getOrCreateConstructor(cx, protoKey);
+    if (!ctor) {
+      return false;
+    }
+
+    ctorId = NameToId(ClassName(protoKey, cx));
+    ctorValue.setObject(*ctor);
+    if (!DefineDataProperty(cx, intl, ctorId, ctorValue, 0)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static const ClassSpec IntlClassSpec = {
+    CreateIntlObject, nullptr, intl_static_methods, intl_static_properties,
+    nullptr,          nullptr, IntlClassFinish,
+};
+
+const JSClass js::intl::IntlClass = {
+    "Intl",
+    JSCLASS_HAS_CACHED_PROTO(JSProto_Intl),
+    JS_NULL_CLASS_OPS,
+    &IntlClassSpec,
+};

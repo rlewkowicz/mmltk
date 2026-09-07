@@ -1,0 +1,326 @@
+/*
+ * Copyright 2015 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#ifndef wasm_stubs_h
+#define wasm_stubs_h
+
+#include "wasm/WasmFrameIter.h"  // js::wasm::ExitReason
+#include "wasm/WasmGenerator.h"
+#include "wasm/WasmOpIter.h"
+
+namespace js {
+namespace wasm {
+
+
+class ABIResult {
+  ValType type_;
+  enum class Location { Gpr, Gpr64, Fpr, Stack } loc_;
+  union {
+    jit::Register gpr_;
+    jit::Register64 gpr64_;
+    jit::FloatRegister fpr_;
+    uint32_t stackOffset_;
+  };
+
+  void validate() {
+#ifdef DEBUG
+    if (onStack()) {
+      return;
+    }
+    MOZ_ASSERT(inRegister());
+    switch (type_.kind()) {
+      case ValType::I32:
+        MOZ_ASSERT(loc_ == Location::Gpr);
+        break;
+      case ValType::I64:
+        MOZ_ASSERT(loc_ == Location::Gpr64);
+        break;
+      case ValType::F32:
+      case ValType::F64:
+        MOZ_ASSERT(loc_ == Location::Fpr);
+        break;
+      case ValType::Ref:
+        MOZ_ASSERT(loc_ == Location::Gpr);
+        break;
+      case ValType::V128:
+        MOZ_ASSERT(loc_ == Location::Fpr);
+        break;
+    }
+#endif
+  }
+
+  friend class ABIResultIter;
+  ABIResult() {}
+
+ public:
+
+  static constexpr size_t StackSizeOfPtr = sizeof(intptr_t);
+  static constexpr size_t StackSizeOfInt32 = StackSizeOfPtr;
+  static constexpr size_t StackSizeOfInt64 = sizeof(int64_t);
+#if defined(JS_CODEGEN_ARM)
+  static constexpr size_t StackSizeOfFloat = sizeof(float);
+#else
+  static constexpr size_t StackSizeOfFloat = sizeof(double);
+#endif
+  static constexpr size_t StackSizeOfDouble = sizeof(double);
+#ifdef ENABLE_WASM_SIMD
+  static constexpr size_t StackSizeOfV128 = sizeof(V128);
+#endif
+
+  ABIResult(ValType type, jit::Register gpr)
+      : type_(type), loc_(Location::Gpr), gpr_(gpr) {
+    validate();
+  }
+  ABIResult(ValType type, jit::Register64 gpr64)
+      : type_(type), loc_(Location::Gpr64), gpr64_(gpr64) {
+    validate();
+  }
+  ABIResult(ValType type, jit::FloatRegister fpr)
+      : type_(type), loc_(Location::Fpr), fpr_(fpr) {
+    validate();
+  }
+  ABIResult(ValType type, uint32_t stackOffset)
+      : type_(type), loc_(Location::Stack), stackOffset_(stackOffset) {
+    validate();
+  }
+
+  ValType type() const { return type_; }
+  bool onStack() const { return loc_ == Location::Stack; }
+  bool inRegister() const { return !onStack(); }
+  jit::Register gpr() const {
+    MOZ_ASSERT(loc_ == Location::Gpr);
+    return gpr_;
+  }
+  jit::Register64 gpr64() const {
+    MOZ_ASSERT(loc_ == Location::Gpr64);
+    return gpr64_;
+  }
+  jit::FloatRegister fpr() const {
+    MOZ_ASSERT(loc_ == Location::Fpr);
+    return fpr_;
+  }
+  uint32_t stackOffset() const {
+    MOZ_ASSERT(loc_ == Location::Stack);
+    return stackOffset_;
+  }
+  uint32_t size() const;
+};
+
+
+class ABIResultIter {
+  ResultType type_;
+  uint32_t count_;
+  uint32_t index_;
+  uint32_t nextStackOffset_;
+  enum { Next, Prev } direction_;
+  ABIResult cur_;
+
+  void settleRegister(ValType type);
+  void settleNext();
+  void settlePrev();
+
+ public:
+  explicit ABIResultIter(const ResultType& type)
+      : type_(type), count_(type.length()) {
+    reset();
+  }
+
+  void reset() {
+    index_ = nextStackOffset_ = 0;
+    direction_ = Next;
+    if (!done()) {
+      settleNext();
+    }
+  }
+  bool done() const { return index_ == count_; }
+  uint32_t index() const { return index_; }
+  uint32_t count() const { return count_; }
+  uint32_t remaining() const { return count_ - index_; }
+  void switchToNext() {
+    MOZ_ASSERT(direction_ == Prev);
+    if (!done() && cur().onStack()) {
+      nextStackOffset_ += cur().size();
+    }
+    index_ = count_ - index_;
+    direction_ = Next;
+    if (!done()) {
+      settleNext();
+    }
+  }
+  void switchToPrev() {
+    MOZ_ASSERT(direction_ == Next);
+    if (!done() && cur().onStack()) {
+      nextStackOffset_ -= cur().size();
+    }
+    index_ = count_ - index_;
+    direction_ = Prev;
+    if (!done()) settlePrev();
+  }
+  void next() {
+    MOZ_ASSERT(direction_ == Next);
+    MOZ_ASSERT(!done());
+    index_++;
+    if (!done()) {
+      settleNext();
+    }
+  }
+  void prev() {
+    MOZ_ASSERT(direction_ == Prev);
+    MOZ_ASSERT(!done());
+    index_++;
+    if (!done()) {
+      settlePrev();
+    }
+  }
+  const ABIResult& cur() const {
+    MOZ_ASSERT(!done());
+    return cur_;
+  }
+
+  uint32_t stackBytesConsumedSoFar() const { return nextStackOffset_; }
+
+  static inline bool HasStackResults(const ResultType& type) {
+    return type.length() > MaxRegisterResults;
+  }
+
+  static uint32_t MeasureStackBytes(const ResultType& type) {
+    if (!HasStackResults(type)) {
+      return 0;
+    }
+    ABIResultIter iter(type);
+    while (!iter.done()) {
+      iter.next();
+    }
+    return iter.stackBytesConsumedSoFar();
+  }
+};
+
+extern bool GenerateBuiltinThunk(jit::MacroAssembler& masm,
+                                 jit::ABIFunctionType abiType,
+                                 bool switchToMainStack, ExitReason exitReason,
+                                 void* funcPtr, CallableOffsets* offsets);
+
+extern bool GenerateStubs(const CodeMetadata& codeMeta,
+                          const FuncImportVector& imports,
+                          const FuncExportVector& exports, CompiledCode* code);
+
+extern bool GenerateEntryStubs(const CodeMetadata& codeMeta,
+                               const FuncExportVector& exports,
+                               CompiledCode* code);
+
+extern bool GenerateEntryStubs(jit::MacroAssembler& masm,
+                               size_t funcExportIndex, const FuncExport& fe,
+                               const FuncType& funcType,
+                               const mozilla::Maybe<jit::ImmPtr>& callee,
+                               CodeRangeVector* codeRanges);
+
+extern void GenerateTrapExitRegisterOffsets(jit::RegisterOffsets* offsets,
+                                            size_t* numWords);
+
+extern bool GenerateProvisionalLazyJitEntryStub(jit::MacroAssembler& masm,
+                                                Offsets* offsets);
+
+static constexpr uintptr_t TrapExitDummyValue = 1337;
+
+#ifdef JS_CODEGEN_ARM64
+static constexpr size_t TrapExitDummyValueOffsetFromTop = 1;
+#else
+static constexpr size_t TrapExitDummyValueOffsetFromTop = 0;
+#endif
+
+
+class JitCallStackArg {
+ public:
+  enum class Tag {
+    Imm32,
+    GPR,
+    FPU,
+    Address,
+    Undefined,
+  };
+
+ private:
+  Tag tag_;
+  union U {
+    int32_t imm32_;
+    jit::Register gpr_;
+    jit::FloatRegister fpu_;
+    jit::Address addr_;
+    U() {}
+  } arg;
+
+ public:
+  JitCallStackArg() : tag_(Tag::Undefined) {}
+  explicit JitCallStackArg(int32_t imm32) : tag_(Tag::Imm32) {
+    arg.imm32_ = imm32;
+  }
+  explicit JitCallStackArg(jit::Register gpr) : tag_(Tag::GPR) {
+    arg.gpr_ = gpr;
+  }
+  explicit JitCallStackArg(jit::FloatRegister fpu) : tag_(Tag::FPU) {
+    new (&arg) jit::FloatRegister(fpu);
+  }
+  explicit JitCallStackArg(const jit::Address& addr) : tag_(Tag::Address) {
+    new (&arg) jit::Address(addr);
+  }
+
+  Tag tag() const { return tag_; }
+  int32_t imm32() const {
+    MOZ_ASSERT(tag_ == Tag::Imm32);
+    return arg.imm32_;
+  }
+  jit::Register gpr() const {
+    MOZ_ASSERT(tag_ == Tag::GPR);
+    return arg.gpr_;
+  }
+  jit::FloatRegister fpu() const {
+    MOZ_ASSERT(tag_ == Tag::FPU);
+    return arg.fpu_;
+  }
+  const jit::Address& addr() const {
+    MOZ_ASSERT(tag_ == Tag::Address);
+    return arg.addr_;
+  }
+};
+
+using JitCallStackArgVector = Vector<JitCallStackArg, 4, SystemAllocPolicy>;
+
+
+extern void GenerateDirectCallFromJit(jit::MacroAssembler& masm,
+                                      const FuncExport& fe,
+                                      const Instance& inst,
+                                      const JitCallStackArgVector& stackArgs,
+                                      jit::Register scratch,
+                                      uint32_t* callOffset);
+
+#ifdef ENABLE_WASM_JSPI
+extern bool GenerateContBaseFrameStub(jit::MacroAssembler& masm,
+                                      Offsets* offsets);
+#endif
+
+extern void ClobberWasmRegsForLongJmp(jit::MacroAssembler& masm,
+                                      jit::Register jumpReg);
+
+extern void GenerateJumpToCatchHandler(jit::MacroAssembler& masm,
+                                       jit::Register rfe,
+                                       jit::Register scratch1,
+                                       jit::Register scratch2,
+                                       jit::Register scratch3);
+
+}  
+}  
+
+#endif  // wasm_stubs_h

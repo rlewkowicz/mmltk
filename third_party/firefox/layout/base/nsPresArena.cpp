@@ -1,0 +1,156 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+
+#include "nsPresArena.h"
+
+#include <inttypes.h>
+
+#include "mozilla/ComputedStyle.h"
+#include "mozilla/ComputedStyleInlines.h"
+#include "mozilla/Poison.h"
+#include "nsDebug.h"
+#include "nsDisplayList.h"
+#include "nsPrintfCString.h"
+#include "nsWindowSizes.h"
+
+using namespace mozilla;
+
+template <size_t ArenaSize, typename ObjectId, size_t ObjectIdCount>
+nsPresArena<ArenaSize, ObjectId, ObjectIdCount>::~nsPresArena() {
+#if defined(MOZ_HAVE_MEM_CHECKS)
+  for (FreeList* entry = mFreeLists; entry != std::end(mFreeLists); ++entry) {
+    for (void* result : entry->mEntries) {
+      MOZ_MAKE_MEM_UNDEFINED(result, entry->mEntrySize);
+    }
+    entry->mEntries.Clear();
+  }
+#endif
+}
+
+template <size_t ArenaSize, typename ObjectId, size_t ObjectIdCount>
+void* nsPresArena<ArenaSize, ObjectId, ObjectIdCount>::Allocate(ObjectId aCode,
+                                                                size_t aSize) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aSize > 0, "PresArena cannot allocate zero bytes");
+  MOZ_ASSERT(size_t(aCode) < std::size(mFreeLists));
+
+  aSize = mPool.AlignedSize(aSize);
+
+  FreeList* list = &mFreeLists[size_t(aCode)];
+
+  nsTArray<void*>::index_type len = list->mEntries.Length();
+  if (list->mEntrySize == 0) {
+    MOZ_ASSERT(len == 0, "list with entries but no recorded size");
+    list->mEntrySize = aSize;
+  } else {
+    MOZ_ASSERT(list->mEntrySize == aSize,
+               "different sizes for same object type code");
+  }
+
+  void* result;
+  if (len > 0) {
+    result = list->mEntries.Elements()[len - 1];
+    if (list->mEntries.Capacity() > 500) {
+      list->mEntries.RemoveElementAtUnsafe(len - 1);
+    } else {
+      list->mEntries.SetLengthAndRetainStorage(len - 1);
+    }
+#if defined(DEBUG)
+    {
+      MOZ_MAKE_MEM_DEFINED(result, list->mEntrySize);
+      char* p = reinterpret_cast<char*>(result);
+      char* limit = p + list->mEntrySize;
+      for (; p < limit; p += sizeof(uintptr_t)) {
+        uintptr_t val = *reinterpret_cast<uintptr_t*>(p);
+        if (val != mozPoisonValue()) {
+          MOZ_ReportAssertionFailure(
+              nsPrintfCString("PresArena: poison overwritten; "
+                              "wanted %.16" PRIx64 " "
+                              "found %.16" PRIx64 " "
+                              "errors in bits %.16" PRIx64 " ",
+                              uint64_t(mozPoisonValue()), uint64_t(val),
+                              uint64_t(mozPoisonValue() ^ val))
+                  .get(),
+              __FILE__, __LINE__);
+          MOZ_CRASH();
+        }
+      }
+    }
+#endif
+    MOZ_MAKE_MEM_UNDEFINED(result, list->mEntrySize);
+    return result;
+  }
+
+  list->mEntriesEverAllocated++;
+  return mPool.Allocate(aSize);
+}
+
+template <size_t ArenaSize, typename ObjectId, size_t ObjectIdCount>
+void nsPresArena<ArenaSize, ObjectId, ObjectIdCount>::Free(ObjectId aCode,
+                                                           void* aPtr) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(size_t(aCode) < std::size(mFreeLists));
+
+  FreeList* list = &mFreeLists[size_t(aCode)];
+  MOZ_ASSERT(list->mEntrySize > 0, "object of this type was never allocated");
+
+  mozWritePoison(aPtr, list->mEntrySize);
+
+  MOZ_MAKE_MEM_NOACCESS(aPtr, list->mEntrySize);
+  list->mEntries.AppendElement(aPtr);
+}
+
+template <size_t ArenaSize, typename ObjectId, size_t ObjectIdCount>
+void nsPresArena<ArenaSize, ObjectId, ObjectIdCount>::AddSizeOfExcludingThis(
+    nsWindowSizes& aSizes, ArenaKind aKind) const {
+
+  size_t mallocSize = mPool.SizeOfExcludingThis(aSizes.mState.mMallocSizeOf);
+
+  size_t totalSizeInFreeLists = 0;
+  for (const FreeList* entry = mFreeLists; entry != std::end(mFreeLists);
+       ++entry) {
+    mallocSize += entry->SizeOfExcludingThis(aSizes.mState.mMallocSizeOf);
+
+    size_t totalSize = entry->mEntrySize * entry->mEntriesEverAllocated;
+
+    if (aKind == ArenaKind::PresShell) {
+      switch (entry - mFreeLists) {
+#define PRES_ARENA_OBJECT(name_)                                 \
+  case eArenaObjectID_##name_:                                   \
+    aSizes.mArenaSizes.NS_ARENA_SIZES_FIELD(name_) += totalSize; \
+    break;
+#include "nsPresArenaObjectList.inc"
+#undef PRES_ARENA_OBJECT
+        default:
+          MOZ_ASSERT_UNREACHABLE("Unknown arena object type");
+      }
+    } else {
+      MOZ_ASSERT(aKind == ArenaKind::DisplayList);
+      switch (DisplayListArenaObjectId(entry - mFreeLists)) {
+#define DISPLAY_LIST_ARENA_OBJECT(name_)                         \
+  case DisplayListArenaObjectId::name_:                          \
+    aSizes.mArenaSizes.NS_ARENA_SIZES_FIELD(name_) += totalSize; \
+    break;
+#include "nsDisplayListArenaTypes.inc"
+#undef DISPLAY_LIST_ARENA_OBJECT
+        default:
+          MOZ_ASSERT_UNREACHABLE("Unknown display item arena type");
+      }
+    }
+
+    totalSizeInFreeLists += totalSize;
+  }
+
+  auto& field = aKind == ArenaKind::PresShell
+                    ? aSizes.mLayoutPresShellSize
+                    : aSizes.mLayoutRetainedDisplayListSize;
+
+  field += mallocSize - totalSizeInFreeLists;
+}
+
+template class nsPresArena<8192, ArenaObjectID, eArenaObjectID_COUNT>;
+template class nsPresArena<32768, DisplayListArenaObjectId,
+                           size_t(DisplayListArenaObjectId::COUNT)>;

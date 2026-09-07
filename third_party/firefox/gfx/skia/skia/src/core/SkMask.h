@@ -1,0 +1,227 @@
+/*
+ * Copyright 2006 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkMask_DEFINED)
+#define SkMask_DEFINED
+
+#include "include/core/SkRect.h"
+#include "include/private/base/SkAssert.h"
+#include "include/private/base/SkTemplates.h"
+#include "src/core/SkColorData.h"
+#include "src/core/SkColorPriv.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+
+struct SkMask {
+    enum Format : uint8_t {
+        kBW_Format, 
+        kA8_Format, 
+        k3D_Format, 
+        kARGB32_Format,         
+        kLCD16_Format,          
+        kSDF_Format,            
+    };
+
+    enum {
+        kCountMaskFormats = kSDF_Format + 1
+    };
+
+    SkMask(const uint8_t* img, const SkIRect& bounds, uint32_t rowBytes, Format format)
+        : fImage(img), fBounds(bounds), fRowBytes(rowBytes), fFormat(format) {}
+    uint8_t const * const fImage;
+    const SkIRect fBounds;
+    const uint32_t fRowBytes;
+    const Format fFormat;
+
+    static bool IsValidFormat(uint8_t format) { return format < kCountMaskFormats; }
+
+    bool isEmpty() const { return fBounds.isEmpty(); }
+
+    size_t computeImageSize() const;
+
+    size_t computeTotalImageSize() const;
+
+    const uint8_t* getAddr1(int x, int y) const {
+        SkASSERT(kBW_Format == fFormat);
+        SkASSERT(fBounds.contains(x, y));
+        SkASSERT(fImage != nullptr);
+        return fImage + ((x - fBounds.fLeft) >> 3) + (y - fBounds.fTop) * fRowBytes;
+    }
+
+    const uint8_t* getAddr8(int x, int y) const {
+        SkASSERT(kA8_Format == fFormat || kSDF_Format == fFormat);
+        SkASSERT(fBounds.contains(x, y));
+        SkASSERT(fImage != nullptr);
+        return fImage + x - fBounds.fLeft + (y - fBounds.fTop) * fRowBytes;
+    }
+
+    const uint16_t* getAddrLCD16(int x, int y) const {
+        SkASSERT(kLCD16_Format == fFormat);
+        SkASSERT(fBounds.contains(x, y));
+        SkASSERT(fImage != nullptr);
+        const uint16_t* row = (const uint16_t*)(fImage + (y - fBounds.fTop) * fRowBytes);
+        return row + (x - fBounds.fLeft);
+    }
+
+    const uint32_t* getAddr32(int x, int y) const {
+        SkASSERT(kARGB32_Format == fFormat);
+        SkASSERT(fBounds.contains(x, y));
+        SkASSERT(fImage != nullptr);
+        const uint32_t* row = (const uint32_t*)(fImage + (y - fBounds.fTop) * fRowBytes);
+        return row + (x - fBounds.fLeft);
+    }
+
+    const void* getAddr(int x, int y) const;
+
+    template <Format F> struct AlphaIter;
+};
+
+template <> struct SkMask::AlphaIter<SkMask::kBW_Format> {
+    AlphaIter(const uint8_t* ptr, int offset) : fPtr(ptr), fOffset(7 - offset) {}
+    AlphaIter(const AlphaIter& that) : fPtr(that.fPtr), fOffset(that.fOffset) {}
+    AlphaIter& operator++() {
+        if (0 < fOffset ) {
+            --fOffset;
+        } else {
+            ++fPtr;
+            fOffset = 7;
+        }
+        return *this;
+    }
+    AlphaIter& operator--() {
+        if (fOffset < 7) {
+            ++fOffset;
+        } else {
+            --fPtr;
+            fOffset = 0;
+        }
+        return *this;
+    }
+    AlphaIter& operator>>=(uint32_t rb) {
+        fPtr = SkTAddOffset<const uint8_t>(fPtr, rb);
+        return *this;
+    }
+    uint8_t operator*() const { return ((*fPtr) >> fOffset) & 1 ? 0xFF : 0; }
+    bool operator<(const AlphaIter& that) const {
+        return fPtr < that.fPtr || (fPtr == that.fPtr && fOffset > that.fOffset);
+    }
+    const uint8_t* fPtr;
+    int fOffset;
+};
+
+template <> struct SkMask::AlphaIter<SkMask::kA8_Format> {
+    AlphaIter(const uint8_t* ptr) : fPtr(ptr) {}
+    AlphaIter(const AlphaIter& that) : fPtr(that.fPtr) {}
+    AlphaIter& operator++() { ++fPtr; return *this; }
+    AlphaIter& operator--() { --fPtr; return *this; }
+    AlphaIter& operator>>=(uint32_t rb) {
+        fPtr = SkTAddOffset<const uint8_t>(fPtr, rb);
+        return *this;
+    }
+    uint8_t operator*() const { return *fPtr; }
+    bool operator<(const AlphaIter& that) const { return fPtr < that.fPtr; }
+    const uint8_t* fPtr;
+};
+
+template <> struct SkMask::AlphaIter<SkMask::kARGB32_Format> {
+    AlphaIter(const uint32_t* ptr) : fPtr(ptr) {}
+    AlphaIter(const AlphaIter& that) : fPtr(that.fPtr) {}
+    AlphaIter& operator++() { ++fPtr; return *this; }
+    AlphaIter& operator--() { --fPtr; return *this; }
+    AlphaIter& operator>>=(uint32_t rb) {
+        fPtr = SkTAddOffset<const uint32_t>(fPtr, rb);
+        return *this;
+    }
+    uint8_t operator*() const { return SkGetPackedA32(*fPtr); }
+    bool operator<(const AlphaIter& that) const { return fPtr < that.fPtr; }
+    const uint32_t* fPtr;
+};
+
+template <> struct SkMask::AlphaIter<SkMask::kLCD16_Format> {
+    AlphaIter(const uint16_t* ptr) : fPtr(ptr) {}
+    AlphaIter(const AlphaIter& that) : fPtr(that.fPtr) {}
+    AlphaIter& operator++() { ++fPtr; return *this; }
+    AlphaIter& operator--() { --fPtr; return *this; }
+    AlphaIter& operator>>=(uint32_t rb) {
+        fPtr = SkTAddOffset<const uint16_t>(fPtr, rb);
+        return *this;
+    }
+    uint8_t operator*() const {
+        unsigned packed = *fPtr;
+        unsigned r = SkPacked16ToR32(packed);
+        unsigned g = SkPacked16ToG32(packed);
+        unsigned b = SkPacked16ToB32(packed);
+        return (r + g + b) / 3;
+    }
+    bool operator<(const AlphaIter& that) const { return fPtr < that.fPtr; }
+    const uint16_t* fPtr;
+};
+
+
+struct SkMaskBuilder : public SkMask {
+    SkMaskBuilder() : SkMask(nullptr, {0}, 0, SkMask::Format::kBW_Format) {}
+    SkMaskBuilder(const SkMaskBuilder&) = delete;
+    SkMaskBuilder(SkMaskBuilder&&) = default;
+    SkMaskBuilder& operator=(const SkMaskBuilder&) = delete;
+    SkMaskBuilder& operator=(SkMaskBuilder&& that) {
+        this->image() = that.image();
+        this->bounds() = that.bounds();
+        this->rowBytes() = that.rowBytes();
+        this->format() = that.format();
+        that.image() = nullptr;
+        return *this;
+    }
+
+    SkMaskBuilder(uint8_t* img, const SkIRect& bounds, uint32_t rowBytes, Format format)
+        : SkMask(img, bounds, rowBytes, format) {}
+
+    uint8_t*& image() { return *const_cast<uint8_t**>(&fImage); }
+    SkIRect& bounds() { return *const_cast<SkIRect*>(&fBounds); }
+    uint32_t& rowBytes() { return *const_cast<uint32_t*>(&fRowBytes); }
+    Format& format() { return *const_cast<Format*>(&fFormat); }
+
+    uint8_t* getAddr1(int x, int y) {
+        return const_cast<uint8_t*>(this->SkMask::getAddr1(x, y));
+    }
+
+    uint8_t* getAddr8(int x, int y) {
+        return const_cast<uint8_t*>(this->SkMask::getAddr8(x, y));
+    }
+
+    uint16_t* getAddrLCD16(int x, int y) {
+        return const_cast<uint16_t*>(this->SkMask::getAddrLCD16(x, y));
+    }
+
+    uint32_t* getAddr32(int x, int y) {
+        return const_cast<uint32_t*>(this->SkMask::getAddr32(x, y));
+    }
+
+    void* getAddr(int x, int y) {
+        return const_cast<void*>(this->SkMask::getAddr(x, y));
+    }
+
+    enum AllocType {
+        kUninit_Alloc,
+        kZeroInit_Alloc,
+    };
+    static uint8_t* AllocImage(size_t bytes, AllocType = kUninit_Alloc);
+    static void FreeImage(void* image);
+
+    enum CreateMode {
+        kJustComputeBounds_CreateMode,      
+        kJustRenderImage_CreateMode,        
+        kComputeBoundsAndRenderImage_CreateMode  
+    };
+
+    static SkMaskBuilder PrepareDestination(int radiusX, int radiusY, const SkMask& src);
+};
+
+using SkAutoMaskFreeImage = std::unique_ptr<uint8_t, SkFunctionObject<SkMaskBuilder::FreeImage>>;
+
+#endif

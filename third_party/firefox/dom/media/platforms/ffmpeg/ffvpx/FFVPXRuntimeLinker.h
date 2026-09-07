@@ -1,0 +1,43 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef FFVPXRuntimeLinker_h_
+#define FFVPXRuntimeLinker_h_
+
+#include "PlatformDecoderModule.h"
+#include "PlatformEncoderModule.h"
+#include "ffvpx/tx.h"
+#include "mozilla/StaticMutex.h"
+#include "mozilla/ThreadSafety.h"
+
+struct FFmpegFFTFuncs {
+  decltype(av_tx_init)* init;
+  decltype(av_tx_uninit)* uninit;
+};
+
+namespace mozilla {
+
+class FFVPXRuntimeLinker {
+ public:
+  static bool Init() MOZ_EXCLUDES(sMutex);
+  static already_AddRefed<PlatformDecoderModule> CreateDecoder();
+  static already_AddRefed<PlatformEncoderModule> CreateEncoder();
+
+  static void GetFFTFuncs(FFmpegFFTFuncs* aOutFuncs);
+
+ private:
+  static void PrefCallbackLogLevel(const char* aPref, void* aData);
+
+  static StaticMutex sMutex;
+
+  static enum LinkStatus {
+    LinkStatus_INIT = 0,
+    LinkStatus_FAILED,
+    LinkStatus_SUCCEEDED
+  } sLinkStatus MOZ_GUARDED_BY(sMutex);
+};
+
+}  
+
+#endif /* FFVPXRuntimeLinker_h_ */

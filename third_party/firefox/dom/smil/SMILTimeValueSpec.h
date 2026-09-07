@@ -1,0 +1,113 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SMIL_SMILTIMEVALUESPEC_H_
+#define DOM_SMIL_SMILTIMEVALUESPEC_H_
+
+#include "mozilla/SMILTimeValueSpecParams.h"
+#include "mozilla/dom/IDTracker.h"
+#include "nsIDOMEventListener.h"
+#include "nsStringFwd.h"
+
+#include "mozilla/dom/Element.h"
+
+namespace mozilla {
+
+class EventListenerManager;
+class SMILInstanceTime;
+class SMILInterval;
+class SMILTimeContainer;
+class SMILTimedElement;
+class SMILTimeValue;
+
+namespace dom {
+class Event;
+}  
+
+
+class SMILTimeValueSpec {
+ public:
+  using Element = dom::Element;
+  using Event = dom::Event;
+  using IDTracker = dom::IDTracker;
+
+  SMILTimeValueSpec(SMILTimedElement& aOwner, bool aIsBegin);
+  ~SMILTimeValueSpec();
+
+  nsresult SetSpec(const nsAString& aStringSpec, Element& aContextElement);
+  void ResolveReferences(Element& aContextElement);
+  bool IsEventBased() const;
+
+  void HandleNewInterval(SMILInterval& aInterval,
+                         const SMILTimeContainer* aSrcContainer);
+  void HandleTargetElementChange(Element* aNewTarget);
+
+  bool DependsOnBegin() const;
+  void HandleChangedInstanceTime(const SMILInstanceTime& aBaseTime,
+                                 const SMILTimeContainer* aSrcContainer,
+                                 SMILInstanceTime& aInstanceTimeToUpdate,
+                                 bool aObjectChanged);
+  void HandleDeletedInstanceTime(SMILInstanceTime& aInstanceTime);
+
+  void Traverse(nsCycleCollectionTraversalCallback* aCallback);
+  void Unlink();
+
+ protected:
+  void UpdateReferencedElement(Element* aFrom, Element* aTo);
+  void UnregisterFromReferencedElement(Element* aElement);
+  SMILTimedElement* GetTimedElement(Element* aElement);
+  bool IsEventAllowedWhenScriptingIsDisabled();
+  void RegisterEventListener(Element* aTarget);
+  void UnregisterEventListener(Element* aTarget);
+  void HandleEvent(Event* aEvent);
+  bool CheckRepeatEventDetail(Event* aEvent);
+  SMILTimeValue ConvertBetweenTimeContainers(
+      const SMILTimeValue& aSrcTime, const SMILTimeContainer* aSrcContainer);
+  bool ApplyOffset(SMILTimeValue& aTime) const;
+
+  SMILTimedElement* mOwner;
+  bool mIsBegin;  
+  SMILTimeValueSpecParams mParams;
+
+  class TimeReferenceTracker final : public IDTracker {
+   public:
+    explicit TimeReferenceTracker(SMILTimeValueSpec* aOwner) : mSpec(aOwner) {}
+    void ResetWithElement(Element* aTo) {
+      RefPtr<Element> from = get();
+      Unlink();
+      ElementChanged(from, aTo);
+    }
+
+   protected:
+    void ElementChanged(Element* aFrom, Element* aTo) override {
+      IDTracker::ElementChanged(aFrom, aTo);
+      mSpec->UpdateReferencedElement(aFrom, aTo);
+    }
+    bool IsPersistent() override { return true; }
+
+   private:
+    SMILTimeValueSpec* mSpec;
+  };
+
+  TimeReferenceTracker mReferencedElement;
+
+  class EventListener final : public nsIDOMEventListener {
+    ~EventListener() = default;
+
+   public:
+    explicit EventListener(SMILTimeValueSpec* aOwner) : mSpec(aOwner) {}
+    void Disconnect() { mSpec = nullptr; }
+
+    NS_DECL_ISUPPORTS
+    NS_DECL_NSIDOMEVENTLISTENER
+
+   private:
+    SMILTimeValueSpec* mSpec;
+  };
+  RefPtr<EventListener> mEventListener;
+};
+
+}  
+
+#endif  // DOM_SMIL_SMILTIMEVALUESPEC_H_

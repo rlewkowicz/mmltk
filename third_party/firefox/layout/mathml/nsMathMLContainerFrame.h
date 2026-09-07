@@ -1,0 +1,325 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsMathMLContainerFrame_h_
+#define nsMathMLContainerFrame_h_
+
+#include "mozilla/Likely.h"
+#include "nsBlockFrame.h"
+#include "nsContainerFrame.h"
+#include "nsInlineFrame.h"
+#include "nsMathMLFrame.h"
+#include "nsMathMLOperators.h"
+
+namespace mozilla {
+class PresShell;
+}  
+
+
+class nsMathMLContainerFrame : public nsContainerFrame, public nsMathMLFrame {
+ public:
+  nsMathMLContainerFrame(ComputedStyle* aStyle, nsPresContext* aPresContext,
+                         ClassID aID)
+      : nsContainerFrame(aStyle, aPresContext, aID) {}
+
+  NS_DECL_QUERYFRAME_TARGET(nsMathMLContainerFrame)
+  NS_DECL_QUERYFRAME
+  NS_DECL_ABSTRACT_FRAME(nsMathMLContainerFrame)
+
+
+  NS_IMETHOD
+  Stretch(DrawTarget* aDrawTarget, StretchDirection aStretchDirection,
+          nsBoundingMetrics& aContainerSize,
+          ReflowOutput& aDesiredStretchSize) override;
+
+  NS_IMETHOD
+  UpdatePresentationDataFromChildAt(
+      int32_t aFirstIndex, int32_t aLastIndex,
+      MathMLPresentationFlags aFlagsValues,
+      MathMLPresentationFlags aFlagsToUpdate) override {
+    PropagatePresentationDataFromChildAt(this, aFirstIndex, aLastIndex,
+                                         aFlagsValues, aFlagsToUpdate);
+    return NS_OK;
+  }
+
+
+  void AppendFrames(ChildListID aListID, nsFrameList&& aFrameList) override;
+
+  void InsertFrames(ChildListID aListID, nsIFrame* aPrevFrame,
+                    const nsLineList::iterator* aPrevFrameLine,
+                    nsFrameList&& aFrameList) override;
+
+  void RemoveFrame(DestroyContext&, ChildListID aListID,
+                   nsIFrame* aOldFrame) override;
+
+  nscoord IntrinsicISize(const mozilla::IntrinsicSizeInput& aInput,
+                         mozilla::IntrinsicISizeType aType) override;
+
+  virtual void GetIntrinsicISizeMetrics(gfxContext* aRenderingContext,
+                                        ReflowOutput& aDesiredSize);
+
+  void Reflow(nsPresContext* aPresContext, ReflowOutput& aDesiredSize,
+              const ReflowInput& aReflowInput,
+              nsReflowStatus& aStatus) override;
+
+  void BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                        const nsDisplayListSet& aLists) override;
+
+  bool ComputeCustomOverflow(mozilla::OverflowAreas& aOverflowAreas) override;
+
+  void MarkIntrinsicISizesDirty() override;
+
+
+  nscoord MirrorIfRTL(nscoord aParentWidth, nscoord aChildWidth,
+                      nscoord aChildLeading) {
+    return GetWritingMode().IsBidiRTL()
+               ? aParentWidth - aChildWidth - aChildLeading
+               : aChildLeading;
+  }
+
+
+ protected:
+  enum class PlaceFlag : uint8_t {
+    MeasureOnly,
+
+    IntrinsicSize,
+
+    IgnoreBorderPadding,
+
+    DoNotAdjustForWidthAndHeight,
+  };
+  using PlaceFlags = mozilla::EnumSet<PlaceFlag>;
+
+  virtual void Place(DrawTarget* aDrawTarget, const PlaceFlags& aFlags,
+                     ReflowOutput& aDesiredSize);
+
+  virtual nsresult ChildListChanged();
+
+  enum class PreferredStretchSizeMode {
+    Embellishments,
+    EmbellishmentsIfSameStretchDirection,
+  };
+  void GetPreferredStretchSize(DrawTarget* aDrawTarget,
+                               PreferredStretchSizeMode aMode,
+                               StretchDirection aStretchDirection,
+                               nsBoundingMetrics& aPreferredStretchSize);
+
+  nsresult TransmitAutomaticDataForMrowLikeElement();
+
+ public:
+  void PlaceAsMrow(DrawTarget* aDrawTarget, const PlaceFlags& aFlags,
+                   ReflowOutput& aDesiredSize);
+
+  nsresult ReportParseError(const char16_t* aAttribute, const char16_t* aValue);
+
+  nsresult ReportChildCountError();
+
+  nsresult ReportInvalidChildError(nsAtom* aChildTag);
+
+  nsresult ReportErrorToConsole(
+      const char* aErrorMsgId,
+      const nsTArray<nsString>& aParams = nsTArray<nsString>());
+
+  void ReflowChild(nsIFrame* aKidFrame, nsPresContext* aPresContext,
+                   ReflowOutput& aDesiredSize, const ReflowInput& aReflowInput,
+                   nsReflowStatus& aStatus);
+
+  nsMargin GetBorderPaddingForPlace(const PlaceFlags& aFlags);
+
+  struct WidthAndHeightForPlaceAdjustment {
+    mozilla::Maybe<nscoord> width;
+    mozilla::Maybe<nscoord> height;
+  };
+  WidthAndHeightForPlaceAdjustment GetWidthAndHeightForPlaceAdjustment(
+      const PlaceFlags& aFlags);
+
+  virtual bool IsMathContentBoxHorizontallyCentered() const { return false; }
+  nscoord ApplyAdjustmentForWidthAndHeight(
+      const PlaceFlags& aFlags, const WidthAndHeightForPlaceAdjustment& aSizes,
+      ReflowOutput& aReflowOutput, nsBoundingMetrics& aBoundingMetrics);
+
+ protected:
+  virtual nscoord FixInterFrameSpacing(ReflowOutput& aDesiredSize);
+
+  virtual nsresult FinalizeReflow(DrawTarget* aDrawTarget,
+                                  ReflowOutput& aDesiredSize);
+
+  static void SaveReflowAndBoundingMetricsFor(
+      nsIFrame* aFrame, const ReflowOutput& aReflowOutput,
+      const nsBoundingMetrics& aBoundingMetrics);
+
+  static void GetReflowAndBoundingMetricsFor(
+      nsIFrame* aFrame, ReflowOutput& aReflowOutput,
+      nsBoundingMetrics& aBoundingMetrics,
+      MathMLFrameType* aMathMLFrameType = nullptr);
+
+  void ClearSavedChildMetrics();
+
+  static nsMargin GetMarginForPlace(const PlaceFlags& aFlags, nsIFrame* aChild);
+
+  static void InflateReflowAndBoundingMetrics(
+      const nsMargin& aBorderPadding, ReflowOutput& aReflowOutput,
+      nsBoundingMetrics& aBoundingMetrics);
+
+  static void PropagatePresentationDataFor(
+      nsIFrame* aFrame, MathMLPresentationFlags aFlagsValues,
+      MathMLPresentationFlags aFlagsToUpdate);
+
+ public:
+  static void PropagatePresentationDataFromChildAt(
+      nsIFrame* aParentFrame, int32_t aFirstChildIndex, int32_t aLastChildIndex,
+      MathMLPresentationFlags aFlagsValues,
+      MathMLPresentationFlags aFlagsToUpdate);
+
+  static void PropagateFrameFlagFor(nsIFrame* aFrame, nsFrameState aFlags);
+
+  static void RebuildAutomaticDataForChildren(nsIFrame* aParentFrame);
+
+  static nsresult ReLayoutChildren(nsIFrame* aParentFrame);
+
+ protected:
+  void PositionRowChildFrames(nscoord aOffsetX, nscoord aBaseline,
+                              bool aAddOperatorSpacing = true);
+
+  void GatherAndStoreOverflow(ReflowOutput* aMetrics);
+
+  void UpdateIntrinsicISize(gfxContext* aRenderingContext);
+
+  nscoord mIntrinsicISize = NS_INTRINSIC_ISIZE_UNKNOWN;
+
+  nscoord mBlockStartAscent = 0;
+
+ private:
+  class RowChildFrameIterator;
+  friend class RowChildFrameIterator;
+};
+
+class nsMathMLmathBlockFrame final : public nsBlockFrame {
+ public:
+  NS_DECL_QUERYFRAME
+  NS_DECL_FRAMEARENA_HELPERS(nsMathMLmathBlockFrame)
+
+  friend nsContainerFrame* NS_NewMathMLmathBlockFrame(
+      mozilla::PresShell* aPresShell, ComputedStyle* aStyle);
+
+  void SetInitialChildList(ChildListID aListID,
+                           nsFrameList&& aChildList) override {
+    MOZ_ASSERT(aListID == mozilla::FrameChildListID::Principal,
+               "unexpected frame list");
+    nsBlockFrame::SetInitialChildList(aListID, std::move(aChildList));
+    if (aListID == mozilla::FrameChildListID::Principal) {
+      nsMathMLContainerFrame::RebuildAutomaticDataForChildren(this);
+    }
+  }
+
+  void AppendFrames(ChildListID aListID, nsFrameList&& aFrameList) override {
+    NS_ASSERTION(aListID == mozilla::FrameChildListID::Principal ||
+                     aListID == mozilla::FrameChildListID::NoReflowPrincipal,
+                 "unexpected frame list");
+    nsBlockFrame::AppendFrames(aListID, std::move(aFrameList));
+    if (MOZ_LIKELY(aListID == mozilla::FrameChildListID::Principal)) {
+      nsMathMLContainerFrame::ReLayoutChildren(this);
+    }
+  }
+
+  void InsertFrames(ChildListID aListID, nsIFrame* aPrevFrame,
+                    const nsLineList::iterator* aPrevFrameLine,
+                    nsFrameList&& aFrameList) override {
+    NS_ASSERTION(aListID == mozilla::FrameChildListID::Principal ||
+                     aListID == mozilla::FrameChildListID::NoReflowPrincipal,
+                 "unexpected frame list");
+    nsBlockFrame::InsertFrames(aListID, aPrevFrame, aPrevFrameLine,
+                               std::move(aFrameList));
+    if (MOZ_LIKELY(aListID == mozilla::FrameChildListID::Principal)) {
+      nsMathMLContainerFrame::ReLayoutChildren(this);
+    }
+  }
+
+  void RemoveFrame(DestroyContext& aContext, ChildListID aListID,
+                   nsIFrame* aOldFrame) override {
+    NS_ASSERTION(aListID == mozilla::FrameChildListID::Principal ||
+                     aListID == mozilla::FrameChildListID::NoReflowPrincipal,
+                 "unexpected frame list");
+    nsBlockFrame::RemoveFrame(aContext, aListID, aOldFrame);
+    if (MOZ_LIKELY(aListID == mozilla::FrameChildListID::Principal)) {
+      nsMathMLContainerFrame::ReLayoutChildren(this);
+    }
+  }
+
+  bool IsMrowLike() {
+    return mFrames.FirstChild() != mFrames.LastChild() || !mFrames.FirstChild();
+  }
+
+ protected:
+  explicit nsMathMLmathBlockFrame(ComputedStyle* aStyle,
+                                  nsPresContext* aPresContext)
+      : nsBlockFrame(aStyle, aPresContext, kClassID) {}
+  virtual ~nsMathMLmathBlockFrame() = default;
+};
+
+
+class nsMathMLmathInlineFrame final : public nsInlineFrame,
+                                      public nsMathMLFrame {
+ public:
+  NS_DECL_QUERYFRAME
+  NS_DECL_FRAMEARENA_HELPERS(nsMathMLmathInlineFrame)
+
+  friend nsContainerFrame* NS_NewMathMLmathInlineFrame(
+      mozilla::PresShell* aPresShell, ComputedStyle* aStyle);
+
+  void SetInitialChildList(ChildListID aListID,
+                           nsFrameList&& aChildList) override {
+    NS_ASSERTION(aListID == mozilla::FrameChildListID::Principal,
+                 "unexpected frame list");
+    nsInlineFrame::SetInitialChildList(aListID, std::move(aChildList));
+    nsMathMLContainerFrame::RebuildAutomaticDataForChildren(this);
+  }
+
+  void AppendFrames(ChildListID aListID, nsFrameList&& aFrameList) override {
+    NS_ASSERTION(aListID == mozilla::FrameChildListID::Principal ||
+                     aListID == mozilla::FrameChildListID::NoReflowPrincipal,
+                 "unexpected frame list");
+    nsInlineFrame::AppendFrames(aListID, std::move(aFrameList));
+    if (MOZ_LIKELY(aListID == mozilla::FrameChildListID::Principal)) {
+      nsMathMLContainerFrame::ReLayoutChildren(this);
+    }
+  }
+
+  void InsertFrames(ChildListID aListID, nsIFrame* aPrevFrame,
+                    const nsLineList::iterator* aPrevFrameLine,
+                    nsFrameList&& aFrameList) override {
+    NS_ASSERTION(aListID == mozilla::FrameChildListID::Principal ||
+                     aListID == mozilla::FrameChildListID::NoReflowPrincipal,
+                 "unexpected frame list");
+    nsInlineFrame::InsertFrames(aListID, aPrevFrame, aPrevFrameLine,
+                                std::move(aFrameList));
+    if (MOZ_LIKELY(aListID == mozilla::FrameChildListID::Principal)) {
+      nsMathMLContainerFrame::ReLayoutChildren(this);
+    }
+  }
+
+  void RemoveFrame(DestroyContext& aContext, ChildListID aListID,
+                   nsIFrame* aOldFrame) override {
+    NS_ASSERTION(aListID == mozilla::FrameChildListID::Principal ||
+                     aListID == mozilla::FrameChildListID::NoReflowPrincipal,
+                 "unexpected frame list");
+    nsInlineFrame::RemoveFrame(aContext, aListID, aOldFrame);
+    if (MOZ_LIKELY(aListID == mozilla::FrameChildListID::Principal)) {
+      nsMathMLContainerFrame::ReLayoutChildren(this);
+    }
+  }
+
+  bool IsMrowLike() override {
+    return mFrames.FirstChild() != mFrames.LastChild() || !mFrames.FirstChild();
+  }
+
+ protected:
+  explicit nsMathMLmathInlineFrame(ComputedStyle* aStyle,
+                                   nsPresContext* aPresContext)
+      : nsInlineFrame(aStyle, aPresContext, kClassID) {}
+
+  virtual ~nsMathMLmathInlineFrame() = default;
+};
+
+#endif /* nsMathMLContainerFrame_h_ */

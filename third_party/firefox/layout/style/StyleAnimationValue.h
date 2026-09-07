@@ -1,0 +1,101 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_StyleAnimationValue_h_
+#define mozilla_StyleAnimationValue_h_
+
+#include "NonCustomCSSPropertyId.h"
+#include "mozilla/CSSPropertyId.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/ServoStyleConsts.h"
+#include "mozilla/gfx/Matrix.h"
+#include "nsColor.h"
+#include "nsStringFwd.h"
+
+class nsIFrame;
+
+namespace mozilla {
+
+namespace css {
+class StyleRule;
+}  
+
+namespace dom {
+class Element;
+}  
+
+namespace layers {
+class Animatable;
+}  
+
+enum class PseudoStyleType : uint8_t;
+struct PropertyStyleAnimationValuePair;
+struct StyleAnimationValue;
+struct StylePerDocumentStyleData;
+
+struct AnimationValue {
+  explicit AnimationValue(const RefPtr<StyleAnimationValue>& aValue)
+      : mServo(aValue) {}
+  AnimationValue() = default;
+
+  AnimationValue(const AnimationValue& aOther) = default;
+  AnimationValue(AnimationValue&& aOther) = default;
+
+  AnimationValue& operator=(const AnimationValue& aOther) = default;
+  AnimationValue& operator=(AnimationValue&& aOther) = default;
+
+  bool operator==(const AnimationValue& aOther) const;
+  bool operator!=(const AnimationValue& aOther) const;
+
+  bool IsNull() const { return !mServo; }
+
+  float GetOpacity() const;
+
+  nscolor GetColor(nscolor aForegroundColor) const;
+
+  bool IsCurrentColor() const;
+
+  const mozilla::StyleTransform& GetTransformProperty() const;
+  const mozilla::StyleScale& GetScaleProperty() const;
+  const mozilla::StyleTranslate& GetTranslateProperty() const;
+  const mozilla::StyleRotate& GetRotateProperty() const;
+
+  void GetOffsetPathProperty(StyleOffsetPath& aOffsetPath) const;
+  const mozilla::LengthPercentage& GetOffsetDistanceProperty() const;
+  const mozilla::StyleOffsetRotate& GetOffsetRotateProperty() const;
+  const mozilla::StylePositionOrAuto& GetOffsetAnchorProperty() const;
+  const mozilla::StyleOffsetPosition& GetOffsetPositionProperty() const;
+  bool IsOffsetPathUrl() const;
+
+  mozilla::gfx::MatrixScales GetScaleValue(const nsIFrame* aFrame) const;
+
+  void SerializeSpecifiedValue(const CSSPropertyId& aProperty,
+                               const StylePerDocumentStyleData* aRawData,
+                               nsACString& aString) const;
+
+  bool IsInterpolableWith(const CSSPropertyId& aProperty,
+                          const AnimationValue& aToValue) const;
+
+  double ComputeDistance(const AnimationValue& aOther) const;
+
+  static AnimationValue FromString(CSSPropertyId& aProperty,
+                                   const nsACString& aValue,
+                                   dom::Element* aElement);
+
+  static already_AddRefed<StyleAnimationValue> FromAnimatable(
+      NonCustomCSSPropertyId aProperty, const layers::Animatable& aAnimatable);
+
+  RefPtr<StyleAnimationValue> mServo;
+};
+
+std::ostream& operator<<(std::ostream& aOut, const AnimationValue& aValue);
+
+struct PropertyStyleAnimationValuePair {
+  CSSPropertyId mProperty;
+  AnimationValue mValue;
+};
+}  
+
+#endif

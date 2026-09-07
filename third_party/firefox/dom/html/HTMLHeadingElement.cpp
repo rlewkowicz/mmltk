@@ -1,0 +1,144 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/HTMLHeadingElement.h"
+
+#include "mozilla/MappedDeclarationsBuilder.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/dom/ElementInlines.h"
+#include "mozilla/dom/HTMLHeadingElementBinding.h"
+#include "nsGkAtoms.h"
+
+NS_IMPL_NS_NEW_HTML_ELEMENT(Heading)
+
+namespace mozilla::dom {
+
+HTMLHeadingElement::~HTMLHeadingElement() = default;
+
+NS_IMPL_ELEMENT_CLONE(HTMLHeadingElement)
+
+JSObject* HTMLHeadingElement::WrapNode(JSContext* aCx,
+                                       JS::Handle<JSObject*> aGivenProto) {
+  return HTMLHeadingElement_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+bool HTMLHeadingElement::ParseAttribute(int32_t aNamespaceID,
+                                        nsAtom* aAttribute,
+                                        const nsAString& aValue,
+                                        nsIPrincipal* aMaybeScriptedPrincipal,
+                                        nsAttrValue& aResult) {
+  if (aAttribute == nsGkAtoms::align && aNamespaceID == kNameSpaceID_None) {
+    return ParseDivAlignValue(aValue, aResult);
+  }
+
+  return nsGenericHTMLElement::ParseAttribute(aNamespaceID, aAttribute, aValue,
+                                              aMaybeScriptedPrincipal, aResult);
+}
+
+uint32_t HTMLHeadingElement::ComputedLevel() const {
+  nsAtom* name = NodeInfo()->NameAtom();
+
+  uint32_t level = 0;
+
+  uint32_t max = 0;
+
+  if (name == nsGkAtoms::h1) {
+    level = 1;
+    max = 8;
+  }
+
+  else if (name == nsGkAtoms::h2) {
+    level = 2;
+    max = 7;
+  }
+
+  else if (name == nsGkAtoms::h3) {
+    level = 3;
+    max = 6;
+  }
+
+  else if (name == nsGkAtoms::h4) {
+    level = 4;
+    max = 5;
+  }
+
+  else if (name == nsGkAtoms::h5) {
+    level = 5;
+    max = 4;
+  }
+
+  else if (name == nsGkAtoms::h6) {
+    level = 6;
+    max = 3;
+  }
+
+  MOZ_ASSERT(level != 0);
+  MOZ_ASSERT(max != 0);
+
+  if (StaticPrefs::dom_headingoffset_enabled()) {
+    level += GetComputedHeadingOffset(max);
+  }
+
+  return level > 9 ? 9 : level;
+}
+
+uint32_t HTMLHeadingElement::GetComputedHeadingOffset(uint32_t aMax) const {
+  uint32_t offset = 0;
+
+  const Element* inclusiveAncestor = this;
+
+  while (inclusiveAncestor) {
+    const auto* element =
+        nsGenericHTMLElement::FromNodeOrNull(inclusiveAncestor);
+
+    if (element) {
+      offset += element->HeadingOffset();
+    }
+
+    if (offset >= aMax) {
+      return aMax;
+    }
+
+    if (element && element->HeadingReset()) {
+      return offset;
+    }
+
+    inclusiveAncestor = inclusiveAncestor->GetFlattenedTreeParentElement();
+  }
+
+  return offset;
+}
+
+void HTMLHeadingElement::UpdateLevel(bool aNotify) {
+  AutoStateChangeNotifier notifier(*this, aNotify);
+  RemoveStatesSilently(ElementState::HEADING_LEVEL_BITS);
+  uint64_t level = ComputedLevel();
+
+  MOZ_ASSERT(level > 0 && level < 16, "ComputedLevel() must fit into 4 bits!");
+  uint64_t bits = (level << HEADING_LEVEL_OFFSET);
+  MOZ_ASSERT((bits & ElementState::HEADING_LEVEL_BITS.bits) == bits);
+
+  AddStatesSilently(ElementState(bits));
+}
+
+void HTMLHeadingElement::MapAttributesIntoRule(
+    MappedDeclarationsBuilder& aBuilder) {
+  nsGenericHTMLElement::MapDivAlignAttributeInto(aBuilder);
+  nsGenericHTMLElement::MapCommonAttributesInto(aBuilder);
+}
+
+NS_IMETHODIMP_(bool)
+HTMLHeadingElement::IsAttributeMapped(const nsAtom* aAttribute) const {
+  static const MappedAttributeEntry* const map[] = {sDivAlignAttributeMap,
+                                                    sCommonAttributeMap};
+
+  return FindAttributeDependence(aAttribute, map);
+}
+
+nsMapRuleToAttributesFunc HTMLHeadingElement::GetAttributeMappingFunction()
+    const {
+  return &MapAttributesIntoRule;
+}
+
+}  

@@ -1,0 +1,287 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/ThreadEventQueue.h"
+#include "mozilla/EventQueue.h"
+
+#include "MaybeLeakRefPtr.h"
+#include "nsComponentManagerUtils.h"
+#include "nsITargetShutdownTask.h"
+#include "nsIThreadInternal.h"
+#include "nsThreadUtils.h"
+#include "nsThread.h"
+#include "ThreadEventTarget.h"
+#include "mozilla/TaskController.h"
+#include "mozilla/StaticPrefs_threads.h"
+
+using namespace mozilla;
+
+class ThreadEventQueue::NestedSink : public ThreadTargetSink {
+ public:
+  NestedSink(EventQueue* aQueue, ThreadEventQueue* aOwner)
+      : mQueue(aQueue), mOwner(aOwner) {}
+
+  bool PutEvent(RefPtr<nsIRunnable>& aEvent,
+                EventQueuePriority aPriority) final {
+    return mOwner->PutEventInternal(aEvent, aPriority, this);
+  }
+
+  void Disconnect(const MutexAutoLock& aProofOfLock) final { mQueue = nullptr; }
+
+  nsresult RegisterShutdownTask(nsITargetShutdownTask* aTask) final {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+  nsresult UnregisterShutdownTask(nsITargetShutdownTask* aTask) final {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+
+  size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) {
+    if (mQueue) {
+      return mQueue->SizeOfIncludingThis(aMallocSizeOf);
+    }
+    return 0;
+  }
+
+ private:
+  friend class ThreadEventQueue;
+
+  EventQueue* mQueue;
+  RefPtr<ThreadEventQueue> mOwner;
+};
+
+ThreadEventQueue::ThreadEventQueue(UniquePtr<EventQueue> aQueue,
+                                   bool aIsMainThread)
+    : mBaseQueue(std::move(aQueue)),
+      mLock("ThreadEventQueue"),
+      mEventsAvailable(mLock, "EventsAvail"),
+      mIsMainThread(aIsMainThread) {
+  if (aIsMainThread) {
+    TaskController::Get()->SetConditionVariable(&mEventsAvailable);
+  }
+}
+
+ThreadEventQueue::~ThreadEventQueue() { MOZ_ASSERT(mNestedQueues.IsEmpty()); }
+
+bool ThreadEventQueue::PutEvent(RefPtr<nsIRunnable>& aEvent,
+                                EventQueuePriority aPriority) {
+  return PutEventInternal(aEvent, aPriority, nullptr);
+}
+
+bool ThreadEventQueue::PutEventInternal(RefPtr<nsIRunnable>& aEvent,
+                                        EventQueuePriority aPriority,
+                                        NestedSink* aSink) {
+  nsCOMPtr<nsIThreadObserver> obs;
+
+  {
+    if (mIsMainThread) {
+      if (nsCOMPtr<nsIRunnablePriority> runnablePrio =
+              do_QueryInterface(aEvent)) {
+        uint32_t prio = nsIRunnablePriority::PRIORITY_NORMAL;
+        runnablePrio->GetPriority(&prio);
+        if (prio == nsIRunnablePriority::PRIORITY_CONTROL) {
+          aPriority = EventQueuePriority::Control;
+        } else if (prio == nsIRunnablePriority::PRIORITY_RENDER_BLOCKING) {
+          aPriority = EventQueuePriority::RenderBlocking;
+        } else if (prio == nsIRunnablePriority::PRIORITY_VSYNC) {
+          aPriority = EventQueuePriority::Vsync;
+        } else if (prio == nsIRunnablePriority::PRIORITY_INPUT_HIGH) {
+          aPriority = EventQueuePriority::InputHigh;
+        } else if (prio == nsIRunnablePriority::PRIORITY_MEDIUMHIGH) {
+          aPriority = EventQueuePriority::MediumHigh;
+        } else if (prio == nsIRunnablePriority::PRIORITY_DEFERRED_TIMERS) {
+          aPriority = EventQueuePriority::DeferredTimers;
+        } else if (prio == nsIRunnablePriority::PRIORITY_IDLE) {
+          aPriority = EventQueuePriority::Idle;
+        } else if (prio == nsIRunnablePriority::PRIORITY_LOW) {
+          aPriority = EventQueuePriority::Low;
+        }
+      }
+    }
+
+    MutexAutoLock lock(mLock);
+
+    if (mEventsAreDoomed) {
+      return false;
+    }
+
+    if (aSink) {
+      if (!aSink->mQueue) {
+        return false;
+      }
+
+      aSink->mQueue->PutEvent(aEvent.forget(), aPriority, lock);
+    } else {
+      mBaseQueue->PutEvent(aEvent.forget(), aPriority, lock);
+    }
+
+    mEventsAvailable.Notify();
+
+    obs = mObserver;
+  }
+
+  if (obs) {
+    obs->OnDispatchedEvent();
+  }
+
+  return true;
+}
+
+already_AddRefed<nsIRunnable> ThreadEventQueue::GetEvent(
+    bool aMayWait, mozilla::TimeDuration* aLastEventDelay) {
+  nsCOMPtr<nsIRunnable> event;
+  {
+    MutexAutoLock lock(mLock);
+
+    for (;;) {
+      const bool noNestedQueue = mNestedQueues.IsEmpty();
+      if (noNestedQueue) {
+        event = mBaseQueue->GetEvent(lock, aLastEventDelay);
+      } else {
+        event =
+            mNestedQueues.LastElement().mQueue->GetEvent(lock, aLastEventDelay);
+      }
+
+      if (event) {
+        break;
+      }
+
+      if (!aMayWait) {
+        break;
+      }
+
+      mEventsAvailable.Wait();
+    }
+  }
+
+  return event.forget();
+}
+
+bool ThreadEventQueue::HasPendingEvent() {
+  MutexAutoLock lock(mLock);
+
+  if (mNestedQueues.IsEmpty()) {
+    return mBaseQueue->HasReadyEvent(lock);
+  } else {
+    return mNestedQueues.LastElement().mQueue->HasReadyEvent(lock);
+  }
+}
+
+bool ThreadEventQueue::ShutdownIfNoPendingEvents() {
+  MutexAutoLock lock(mLock);
+  if (mNestedQueues.IsEmpty() && mBaseQueue->IsEmpty(lock)) {
+    mEventsAreDoomed = true;
+    return true;
+  }
+  return false;
+}
+
+already_AddRefed<nsISerialEventTarget> ThreadEventQueue::PushEventQueue() {
+  auto queue = MakeUnique<EventQueue>();
+  RefPtr<NestedSink> sink = new NestedSink(queue.get(), this);
+  RefPtr eventTarget =
+      MakeRefPtr<ThreadEventTarget>(sink, NS_IsMainThread(), false);
+
+  MutexAutoLock lock(mLock);
+
+  mNestedQueues.AppendElement(NestedQueueItem(std::move(queue), eventTarget));
+  return eventTarget.forget();
+}
+
+void ThreadEventQueue::PopEventQueue(nsIEventTarget* aTarget) {
+  MutexAutoLock lock(mLock);
+
+  MOZ_ASSERT(!mNestedQueues.IsEmpty());
+
+  NestedQueueItem& item = mNestedQueues.LastElement();
+
+  MOZ_ASSERT(aTarget == item.mEventTarget);
+
+  item.mEventTarget->Disconnect(lock);
+
+  EventQueue* prevQueue =
+      mNestedQueues.Length() == 1
+          ? mBaseQueue.get()
+          : mNestedQueues[mNestedQueues.Length() - 2].mQueue.get();
+
+  nsCOMPtr<nsIRunnable> event;
+  TimeDuration delay;
+  while ((event = item.mQueue->GetEvent(lock, &delay))) {
+    prevQueue->PutEvent(event.forget(), EventQueuePriority::Normal, lock,
+                        &delay);
+  }
+
+  mNestedQueues.RemoveLastElement();
+}
+
+size_t ThreadEventQueue::SizeOfExcludingThis(
+    mozilla::MallocSizeOf aMallocSizeOf) {
+  size_t n = 0;
+
+  {
+    MutexAutoLock lock(mLock);
+    n += mBaseQueue->SizeOfIncludingThis(aMallocSizeOf);
+    n += mNestedQueues.ShallowSizeOfExcludingThis(aMallocSizeOf);
+    for (auto& queue : mNestedQueues) {
+      n += queue.mEventTarget->SizeOfIncludingThis(aMallocSizeOf);
+    }
+  }
+
+  return SynchronizedEventQueue::SizeOfExcludingThis(aMallocSizeOf) + n;
+}
+
+already_AddRefed<nsIThreadObserver> ThreadEventQueue::GetObserver() {
+  MutexAutoLock lock(mLock);
+  return do_AddRef(mObserver);
+}
+
+already_AddRefed<nsIThreadObserver> ThreadEventQueue::GetObserverOnThread()
+    MOZ_NO_THREAD_SAFETY_ANALYSIS {
+  return do_AddRef(mObserver);
+}
+
+void ThreadEventQueue::SetObserver(nsIThreadObserver* aObserver) {
+  nsCOMPtr<nsIThreadObserver> observer = aObserver;
+  {
+    MutexAutoLock lock(mLock);
+    mObserver.swap(observer);
+  }
+  if (NS_IsMainThread()) {
+    TaskController::Get()->SetThreadObserver(aObserver);
+  }
+}
+
+nsresult ThreadEventQueue::RegisterShutdownTask(nsITargetShutdownTask* aTask) {
+  NS_ENSURE_ARG(aTask);
+  MutexAutoLock lock(mLock);
+  if (mEventsAreDoomed || mShutdownTasksRun) {
+    return NS_ERROR_UNEXPECTED;
+  }
+  return mShutdownTasks.AddTask(aTask);
+}
+
+nsresult ThreadEventQueue::UnregisterShutdownTask(
+    nsITargetShutdownTask* aTask) {
+  NS_ENSURE_ARG(aTask);
+  MutexAutoLock lock(mLock);
+  if (mEventsAreDoomed || mShutdownTasksRun) {
+    return NS_ERROR_UNEXPECTED;
+  }
+  return mShutdownTasks.RemoveTask(aTask);
+}
+
+void ThreadEventQueue::RunShutdownTasks() {
+  TargetShutdownTaskSet::TasksArray shutdownTasks;
+  {
+    MutexAutoLock lock(mLock);
+    shutdownTasks = mShutdownTasks.Extract();
+    mShutdownTasksRun = true;
+  }
+  for (const auto& task : shutdownTasks) {
+    task->TargetShutdown();
+  }
+}
+
+ThreadEventQueue::NestedQueueItem::NestedQueueItem(
+    UniquePtr<EventQueue> aQueue, ThreadEventTarget* aEventTarget)
+    : mQueue(std::move(aQueue)), mEventTarget(aEventTarget) {}

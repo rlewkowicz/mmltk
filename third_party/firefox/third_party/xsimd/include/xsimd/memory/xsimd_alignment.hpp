@@ -1,0 +1,73 @@
+/***************************************************************************
+ * Copyright (c) Johan Mabille, Sylvain Corlay, Wolf Vollprecht and         *
+ * Martin Renou                                                             *
+ * Copyright (c) QuantStack                                                 *
+ * Copyright (c) Serge Guelton                                              *
+ *                                                                          *
+ * Distributed under the terms of the BSD 3-Clause License.                 *
+ *                                                                          *
+ * The full license is in the file LICENSE, distributed with this software. *
+ ****************************************************************************/
+
+#if !defined(XSIMD_ALIGNMENT_HPP)
+#define XSIMD_ALIGNMENT_HPP
+
+#include "../types/xsimd_utils.hpp"
+#include "./xsimd_aligned_allocator.hpp"
+
+namespace xsimd
+{
+    struct aligned_mode
+    {
+    };
+
+    struct unaligned_mode
+    {
+    };
+
+    struct stream_mode
+    {
+    };
+
+
+    template <class A>
+    struct allocator_alignment
+    {
+        using type = unaligned_mode;
+    };
+
+    template <class T, size_t N>
+    struct allocator_alignment<aligned_allocator<T, N>>
+    {
+        using type = aligned_mode;
+    };
+
+    template <class A>
+    using allocator_alignment_t = typename allocator_alignment<A>::type;
+
+
+    template <class C, class = void>
+    struct container_alignment
+    {
+        using type = unaligned_mode;
+    };
+
+    template <class C>
+    struct container_alignment<C, detail::void_t<typename C::allocator_type>>
+    {
+        using type = allocator_alignment_t<typename C::allocator_type>;
+    };
+
+    template <class C>
+    using container_alignment_t = typename container_alignment<C>::type;
+
+
+    template <class Arch = default_arch>
+    XSIMD_INLINE bool is_aligned(void const* ptr)
+    {
+        return (reinterpret_cast<uintptr_t>(ptr) % static_cast<uintptr_t>(Arch::alignment())) == 0;
+    }
+
+}
+
+#endif

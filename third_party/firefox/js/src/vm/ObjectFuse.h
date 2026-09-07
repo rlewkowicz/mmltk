@@ -1,0 +1,231 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef vm_ObjectFuse_h
+#define vm_ObjectFuse_h
+
+#include "mozilla/MemoryReporting.h"
+
+#include <bit>
+
+#include "gc/Barrier.h"
+#include "jit/InvalidationScriptSet.h"
+#include "jit/JitOptions.h"
+#include "js/SweepingAPI.h"
+#include "vm/PropertyInfo.h"
+
+
+namespace js {
+
+class NativeObject;
+
+class SaturatedGenerationCounter {
+  uint32_t value_ = 0;
+  static constexpr uint32_t InvalidValue = UINT32_MAX;
+
+ public:
+  bool isValid() const { return value_ != InvalidValue; }
+  bool check(uint32_t v) const {
+    MOZ_RELEASE_ASSERT(v != InvalidValue);
+    return value_ == v;
+  }
+  void bump() {
+    if (isValid()) {
+      value_++;
+    }
+  }
+  uint32_t value() const {
+    MOZ_RELEASE_ASSERT(isValid());
+    return value_;
+  }
+  uint32_t valueMaybeInvalid() const { return value_; }
+};
+
+class ObjectFuse {
+  enum class PropertyState {
+    Untracked = 0,
+
+    Constant = 1,
+
+    NotConstant = 2,
+  };
+  static constexpr size_t NumPropsPerWord = 16;
+  static constexpr size_t NumBitsPerProp = 2;
+  static constexpr size_t PropBitsMask = BitMask(NumBitsPerProp);
+  static_assert(NumPropsPerWord * NumBitsPerProp ==
+                CHAR_BIT * sizeof(uint32_t));
+
+  UniquePtr<uint32_t[], JS::FreePolicy> propertyStateBits_;
+
+  uint32_t propertyStateLength_ = 0;
+
+  uint32_t invalidatedConstantProperty_ = 0;
+
+  SaturatedGenerationCounter generation_{};
+
+  using DepMap = GCHashMap<uint32_t, js::jit::DependentIonScriptSet,
+                           DefaultHasher<uint32_t>, SystemAllocPolicy>;
+  DepMap dependencies_;
+
+  [[nodiscard]] bool ensurePropertyStateLength(uint32_t length);
+
+  void invalidateDependentIonScriptsForProperty(JSContext* cx,
+                                                PropertyInfo prop,
+                                                const char* reason);
+  void invalidateAllDependentIonScripts(JSContext* cx, const char* reason);
+
+  static constexpr uint32_t propertyStateShift(uint32_t propSlot) {
+    return (propSlot % NumPropsPerWord) * NumBitsPerProp;
+  }
+  PropertyState getPropertyState(uint32_t propSlot) const {
+    uint32_t index = propSlot / NumPropsPerWord;
+    if (index >= propertyStateLength_) {
+      return PropertyState::Untracked;
+    }
+    uint32_t shift = propertyStateShift(propSlot);
+    uint32_t bits = (propertyStateBits_[index] >> shift) & PropBitsMask;
+    MOZ_ASSERT(bits <= uint32_t(PropertyState::NotConstant));
+    return PropertyState(bits);
+  }
+  PropertyState getPropertyState(PropertyInfo prop) const {
+    return getPropertyState(prop.slot());
+  }
+  void setPropertyState(PropertyInfo prop, PropertyState state) {
+    uint32_t slot = prop.slot();
+    uint32_t index = slot / NumPropsPerWord;
+    MOZ_ASSERT(index < propertyStateLength_);
+    uint32_t shift = propertyStateShift(slot);
+    propertyStateBits_[index] &= ~(PropBitsMask << shift);
+    propertyStateBits_[index] |= uint32_t(state) << shift;
+  }
+
+  bool isUntrackedProperty(PropertyInfo prop) const {
+    return getPropertyState(prop) == PropertyState::Untracked;
+  }
+  bool isConstantProperty(PropertyInfo prop) const {
+    return getPropertyState(prop) == PropertyState::Constant;
+  }
+
+  [[nodiscard]] bool markPropertyConstant(PropertyInfo prop);
+
+  void bumpGeneration() {
+    invalidatedConstantProperty_ = 1;
+    generation_.bump();
+  }
+
+ public:
+  static bool tracksPropertyKey(PropertyKey key) { return !key.isInt(); }
+
+  uint32_t generationMaybeInvalid() const {
+    return generation_.valueMaybeInvalid();
+  }
+  bool hasInvalidatedConstantProperty() const {
+    return invalidatedConstantProperty_;
+  }
+
+  bool tryOptimizeConstantProperty(PropertyKey key, PropertyInfo prop);
+
+  struct GuardData {
+    uint32_t generation;
+    uint32_t propIndex;
+    uint32_t propMask;
+  };
+  GuardData getConstantPropertyGuardData(PropertyInfo prop) const {
+    MOZ_ASSERT(isConstantProperty(prop));
+
+    GuardData data;
+    data.generation = generation_.value();
+    data.propIndex = prop.slot() / NumPropsPerWord;
+    static_assert(size_t(PropertyState::NotConstant) == 2);
+    data.propMask = uint32_t(0b10) << propertyStateShift(prop.slot());
+
+    MOZ_ASSERT(propertySlotFromIndexAndMask(data.propIndex, data.propMask) ==
+               prop.slot());
+
+    return data;
+  }
+
+  static uint32_t propertySlotFromIndexAndMask(uint32_t propIndex,
+                                               uint32_t propMask) {
+    MOZ_ASSERT(std::has_single_bit(propMask));
+    uint32_t slot = propIndex * NumPropsPerWord;
+    slot += std::countr_zero(propMask) / NumBitsPerProp;
+    return slot;
+  }
+
+  bool canOptimizeSetSlot(PropertyInfo prop) const {
+    return getPropertyState(prop) == PropertyState::NotConstant;
+  }
+
+  void handlePropertyValueChange(JSContext* cx, PropertyInfo prop);
+  void handlePropertyRemove(JSContext* cx, PropertyInfo prop,
+                            bool* wasTrackedProp);
+  void handleTeleportingShadowedProperty(JSContext* cx, PropertyInfo prop);
+  void handleTeleportingProtoMutation(JSContext* cx);
+  void handleShadowedGlobalProperty(JSContext* cx, PropertyInfo prop);
+
+  bool addDependency(uint32_t propSlot, const jit::IonScriptKey& ionScript);
+
+  bool checkPropertyIsConstant(uint32_t generation, uint32_t propSlot) const {
+    if (!generation_.check(generation)) {
+      return false;
+    }
+    PropertyState state = getPropertyState(propSlot);
+    if (state == PropertyState::NotConstant) {
+      MOZ_ASSERT(invalidatedConstantProperty_);
+      return false;
+    }
+    MOZ_ASSERT(state == PropertyState::Constant);
+    return true;
+  }
+
+  const char* getPropertyStateString(PropertyInfo prop) const;
+
+  size_t sizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+
+  bool traceWeak(JSTracer* trc) {
+    dependencies_.traceWeak(trc);
+    return true;
+  }
+
+  static constexpr size_t offsetOfInvalidatedConstantProperty() {
+    return offsetof(ObjectFuse, invalidatedConstantProperty_);
+  }
+  static constexpr size_t offsetOfGeneration() {
+    return offsetof(ObjectFuse, generation_);
+  }
+  static constexpr size_t offsetOfPropertyStateBits() {
+    return offsetof(ObjectFuse, propertyStateBits_);
+  }
+};
+
+class ObjectFuseMap {
+  using Map =
+      GCHashMap<WeakHeapPtr<JSObject*>, UniquePtr<ObjectFuse>,
+                StableCellHasher<WeakHeapPtr<JSObject*>>, SystemAllocPolicy>;
+  JS::WeakCache<Map> objectFuses_;
+#ifdef DEBUG
+  JS::Zone* zone_;
+#endif
+
+ public:
+  explicit ObjectFuseMap(JS::Zone* zone) : objectFuses_(zone) {
+#ifdef DEBUG
+    zone_ = zone;
+#endif
+  }
+
+  ObjectFuse* getOrCreate(JSContext* cx, NativeObject* obj);
+  ObjectFuse* get(NativeObject* obj);
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+};
+
+inline bool ShouldUseObjectFuses() {
+  return jit::IsBaselineInterpreterEnabled();
+}
+
+}  
+
+#endif  // vm_ObjectFuse_h

@@ -1,0 +1,193 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DnsAndConnectSocket_h_
+#define DnsAndConnectSocket_h_
+
+#include "ConnectionAttempt.h"
+#include "nsAHttpConnection.h"
+#include "nsHttpConnection.h"
+#include "nsHttpTransaction.h"
+#include "nsIAsyncOutputStream.h"
+#include "nsICancelable.h"
+#include "nsIDNSListener.h"
+#include "nsIDNSRecord.h"
+#include "nsIDNSService.h"
+#include "nsINamed.h"
+#include "nsITransport.h"
+
+namespace mozilla {
+namespace net {
+
+#define NS_DNSANDCONNECTSOCKET_IID \
+  {0x8d411b53, 0x54bc, 0x4a99, {0x8b, 0x78, 0xff, 0x12, 0x5e, 0xab, 0x15, 0x64}}
+
+class PendingTransactionInfo;
+class ConnectionEntry;
+
+class DnsAndConnectSocket final : public ConnectionAttempt,
+                                  public nsIOutputStreamCallback,
+                                  public nsITransportEventSink,
+                                  public nsIInterfaceRequestor,
+                                  public nsITimerCallback,
+                                  public nsINamed,
+                                  public nsIDNSListener {
+  ~DnsAndConnectSocket();
+
+ public:
+  NS_INLINE_DECL_STATIC_IID(NS_DNSANDCONNECTSOCKET_IID)
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_NSIOUTPUTSTREAMCALLBACK
+  NS_DECL_NSITRANSPORTEVENTSINK
+  NS_DECL_NSIINTERFACEREQUESTOR
+  NS_DECL_NSITIMERCALLBACK
+  NS_DECL_NSINAMED
+  NS_DECL_NSIDNSLISTENER
+
+  DnsAndConnectSocket(nsHttpConnectionInfo* ci, nsAHttpTransaction* trans,
+                      uint32_t caps, bool speculative, bool urgentStart);
+
+  nsresult Init(ConnectionEntry* ent) override;
+  void Abandon() override;
+  double Duration(TimeStamp epoch) override;
+  void OnTimeout() override;
+
+  void PrintDiagnostics(nsCString& log) override;
+
+  bool AcceptsTransaction(nsHttpTransaction* trans);
+  bool Claim(nsHttpTransaction* newTransaction = nullptr) override;
+
+  DnsAndConnectSocket* ToDnsAndConnectSocket() override { return this; }
+
+ private:
+  void CheckIsDone();
+
+  enum DnsAndSocketState {
+    INIT,
+    RESOLVING,
+    CONNECTING,
+    ONE_CONNECTED,
+    DONE
+  } mState = INIT;
+
+  enum SetupEvents {
+    INIT_EVENT,
+    RESOLVED_PRIMARY_EVENT,
+    PRIMARY_DONE_EVENT,
+    BACKUP_DONE_EVENT,
+    BACKUP_TIMER_FIRED_EVENT
+  };
+
+  struct TransportSetup {
+    enum TransportSetupState {
+      INIT,
+      RESOLVING,
+      RESOLVED,
+      RETRY_RESOLVING,
+      CONNECTING,
+      CONNECTING_DONE,
+      DONE
+    } mState;
+
+    bool FirstResolving() {
+      return mState == TransportSetup::TransportSetupState::RESOLVING;
+    }
+    bool ConnectingOrRetry() {
+      return (mState == TransportSetup::TransportSetupState::CONNECTING) ||
+             (mState == TransportSetup::TransportSetupState::RETRY_RESOLVING) ||
+             (mState == TransportSetup::TransportSetupState::CONNECTING_DONE);
+    }
+    bool Resolved() {
+      return mState == TransportSetup::TransportSetupState::RESOLVED;
+    }
+    bool DoneConnecting() {
+      return (mState == TransportSetup::TransportSetupState::CONNECTING_DONE) ||
+             (mState == TransportSetup::TransportSetupState::DONE);
+    }
+
+    nsCString mHost;
+    nsCOMPtr<nsICancelable> mDNSRequest;
+    nsCOMPtr<nsIDNSAddrRecord> mDNSRecord;
+    nsIDNSService::DNSFlags mDnsFlags = nsIDNSService::RESOLVE_DEFAULT_FLAGS;
+    bool mRetryWithDifferentIPFamily = false;
+    bool mResetFamilyPreference = false;
+    bool mSkipDnsResolution = false;
+
+    nsCOMPtr<nsISocketTransport> mSocketTransport;
+    nsCOMPtr<nsIAsyncOutputStream> mStreamOut;
+    nsCOMPtr<nsIAsyncInputStream> mStreamIn;
+    TimeStamp mSynStarted;
+    bool mConnectedOK = false;
+    bool mIsBackup;
+
+    bool mWaitingForConnect = false;
+    void SetConnecting();
+    void MaybeSetConnectingDone();
+
+    nsresult Init(DnsAndConnectSocket* dnsAndSock);
+    void CancelDnsResolution();
+    void Abandon();
+    void CloseAll();
+    nsresult SetupConn(DnsAndConnectSocket* dnsAndSock,
+                       nsAHttpTransaction* transaction, ConnectionEntry* ent,
+                       nsresult status, uint32_t cap,
+                       HttpConnectionBase** connection);
+    [[nodiscard]] nsresult SetupStreams(DnsAndConnectSocket* dnsAndSock);
+    nsresult ResolveHost(DnsAndConnectSocket* dnsAndSock);
+    bool ShouldRetryDNS();
+    nsresult OnLookupComplete(DnsAndConnectSocket* dnsAndSock,
+                              nsIDNSRecord* rec, nsresult status);
+    nsresult CheckConnectedResult(DnsAndConnectSocket* dnsAndSock);
+    bool ToggleIpFamilyFlagsIfRetryEnabled();
+
+   protected:
+    explicit TransportSetup(bool isBackup);
+  };
+
+  struct PrimaryTransportSetup final : TransportSetup {
+    PrimaryTransportSetup() : TransportSetup(false) {}
+  };
+
+  struct BackupTransportSetup final : TransportSetup {
+    BackupTransportSetup() : TransportSetup(true) {}
+  };
+
+  nsresult SetupConn(bool isPrimary, nsresult status);
+  void SetupBackupTimer();
+  void CancelBackupTimer();
+
+  bool IsPrimary(nsITransport* trans);
+  bool IsPrimary(nsIAsyncOutputStream* out);
+  bool IsPrimary(nsICancelable* dnsRequest);
+  bool IsBackup(nsITransport* trans);
+  bool IsBackup(nsIAsyncOutputStream* out);
+  bool IsBackup(nsICancelable* dnsRequest);
+
+  already_AddRefed<PendingTransactionInfo> FindTransactionHelper(
+      bool removeWhenFound);
+
+  void CheckProxyConfig();
+  nsresult SetupDnsFlags(ConnectionEntry* ent);
+  nsresult SetupEvent(SetupEvents event);
+
+  bool mDispatchedMTransaction = false;
+
+  PrimaryTransportSetup mPrimaryTransport;
+
+  bool mBackupConnStatsSet = false;
+
+  nsCOMPtr<nsITimer> mSynTimer;
+  BackupTransportSetup mBackupTransport;
+
+  bool mIsHttp3 = false;
+
+  bool mSkipDnsResolution = false;
+  bool mProxyNotTransparent = false;
+  bool mProxyTransparentResolvesHost = false;
+};
+
+}  
+}  
+
+#endif  // DnsAndConnectSocket_h_

@@ -1,0 +1,55 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "NSPRLogModulesParser.h"
+
+#include "mozilla/Tokenizer.h"
+
+const char kDelimiters[] = ", ";
+const char kAdditionalWordChars[] = "_-.*";
+
+namespace mozilla {
+
+void NSPRLogModulesParser(
+    const char* aLogModules,
+    const std::function<void(const char*, LogLevel, int32_t)>& aCallback) {
+  if (!aLogModules) {
+    return;
+  }
+
+  Tokenizer parser(aLogModules, kDelimiters, kAdditionalWordChars);
+  nsAutoCString moduleName;
+
+  Tokenizer::Token rustModSep =
+      parser.AddCustomToken("::", Tokenizer::CASE_SENSITIVE);
+
+  auto readModuleName = [&](nsAutoCString& moduleName) -> bool {
+    moduleName.Truncate();
+    nsDependentCSubstring sub;
+    parser.Record();
+    if (!parser.ReadWord(sub)) {
+      return false;
+    }
+    while (parser.Check(rustModSep) && parser.ReadWord(sub)) {
+    }
+    parser.Claim(moduleName, Tokenizer::INCLUDE_LAST);
+    return true;
+  };
+
+  while (readModuleName(moduleName)) {
+    LogLevel logLevel = LogLevel::Error;
+    int32_t levelValue = 0;
+    if (parser.CheckChar(':')) {
+      if (parser.ReadSignedInteger(&levelValue)) {
+        logLevel = ToLogLevel(levelValue);
+      }
+    }
+
+    aCallback(moduleName.get(), logLevel, levelValue);
+
+    parser.SkipWhites();
+  }
+}
+
+}  

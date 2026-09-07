@@ -1,0 +1,130 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_FontFaceSet_h
+#define mozilla_dom_FontFaceSet_h
+
+#include "mozilla/DOMEventTargetHelper.h"
+#include "mozilla/dom/FontFace.h"
+#include "mozilla/dom/FontFaceSetBinding.h"
+#include "mozilla/dom/FontFaceSetImpl.h"
+#include "nsICSSLoaderObserver.h"
+#include "nsIDOMEventListener.h"
+
+class nsFontFaceLoader;
+class nsIPrincipal;
+class nsIGlobalObject;
+
+namespace mozilla {
+class PostTraversalTask;
+class SharedFontList;
+namespace dom {
+class Promise;
+class WorkerPrivate;
+}  
+}  
+
+namespace mozilla::dom {
+
+class FontFaceSet final : public DOMEventTargetHelper {
+  friend class mozilla::PostTraversalTask;
+
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(FontFaceSet, DOMEventTargetHelper)
+
+  static already_AddRefed<FontFaceSet> CreateForDocument(
+      dom::Document* aDocument);
+
+  static already_AddRefed<FontFaceSet> CreateForWorker(
+      nsIGlobalObject* aParent, WorkerPrivate* aWorkerPrivate);
+
+  virtual JSObject* WrapObject(JSContext* aCx,
+                               JS::Handle<JSObject*> aGivenProto) override;
+
+  bool UpdateRules(const nsTArray<nsFontFaceRuleContainer>& aRules);
+
+  void DidRefresh();
+
+  void FlushUserFontSet();
+
+  void RefreshStandardFontLoadPrincipal();
+
+  void CopyNonRuleFacesTo(FontFaceSet* aFontFaceSet) const;
+
+  void CacheFontLoadability() { mImpl->CacheFontLoadability(); }
+
+  FontFaceSetImpl* GetImpl() const { return mImpl; }
+
+
+  IMPL_EVENT_HANDLER(loading)
+  IMPL_EVENT_HANDLER(loadingdone)
+  IMPL_EVENT_HANDLER(loadingerror)
+  already_AddRefed<dom::Promise> Load(JSContext* aCx, const nsACString& aFont,
+                                      const nsAString& aText, ErrorResult& aRv);
+  bool Check(const nsACString& aFont, const nsAString& aText, ErrorResult& aRv);
+  dom::Promise* GetReady(ErrorResult& aRv);
+  dom::FontFaceSetLoadStatus Status();
+
+  void Add(FontFace& aFontFace, ErrorResult& aRv);
+  void Clear();
+  bool Delete(FontFace& aFontFace);
+  bool Has(FontFace& aFontFace);
+  uint32_t Size();
+  already_AddRefed<dom::FontFaceSetIterator> Entries();
+  already_AddRefed<dom::FontFaceSetIterator> Values();
+  MOZ_CAN_RUN_SCRIPT
+  void ForEach(JSContext* aCx, FontFaceSetForEachCallback& aCallback,
+               JS::Handle<JS::Value> aThisArg, ErrorResult& aRv);
+
+  uint32_t SizeIncludingNonAuthorOrigins();
+
+  void MaybeResolve();
+
+  void DispatchLoadingFinishedEvent(
+      const nsAString& aType, nsTArray<OwningNonNull<FontFace>>&& aFontFaces);
+
+  void DispatchLoadingEventAndReplaceReadyPromise();
+  void DispatchCheckLoadingFinishedAfterDelay();
+
+  bool ReadyPromiseIsPending() const;
+
+  void InsertRuleFontFace(FontFace* aFontFace, StyleOrigin aOrigin);
+
+ private:
+  friend mozilla::dom::FontFaceSetIterator;  
+
+  explicit FontFaceSet(nsIGlobalObject* aParent);
+  ~FontFaceSet();
+
+  bool HasAvailableFontFace(FontFace* aFontFace);
+
+  void Destroy();
+
+  FontFace* GetFontFaceAt(uint32_t aIndex);
+
+  struct FontFaceRecord {
+    RefPtr<FontFace> mFontFace;
+    Maybe<StyleOrigin> mOrigin;  
+
+    bool mLoadEventShouldFire;
+  };
+
+#ifdef DEBUG
+  bool HasRuleFontFace(FontFace* aFontFace);
+#endif
+
+  RefPtr<FontFaceSetImpl> mImpl;
+
+  RefPtr<dom::Promise> mReady;
+  bool mResolveLazilyCreatedReadyPromise = false;
+
+  nsTArray<FontFaceRecord> mRuleFaces;
+
+  nsTArray<FontFaceRecord> mNonRuleFaces;
+};
+
+}  
+
+#endif  // !defined(mozilla_dom_FontFaceSet_h)

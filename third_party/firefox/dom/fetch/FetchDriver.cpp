@@ -1,0 +1,1604 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/FetchDriver.h"
+
+#include "Fetch.h"
+#include "FetchLog.h"
+#include "FetchUtil.h"
+#include "InternalRequest.h"
+#include "InternalResponse.h"
+#include "js/Value.h"
+#include "mozilla/DebugOnly.h"
+#include "mozilla/PreloaderBase.h"
+#include "mozilla/StaticPrefs_browser.h"
+#include "mozilla/StaticPrefs_javascript.h"
+#include "mozilla/StaticPrefs_network.h"
+#include "mozilla/StaticPrefs_privacy.h"
+#include "mozilla/TaskQueue.h"
+#include "mozilla/dom/BlobURL.h"
+#include "mozilla/dom/BlobURLChannel.h"
+#include "mozilla/dom/BlobURLProtocolHandler.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/FetchPriority.h"
+#include "mozilla/dom/File.h"
+#include "mozilla/dom/PerformanceStorage.h"
+#include "mozilla/dom/PerformanceTiming.h"
+#include "mozilla/dom/ReferrerInfo.h"
+#include "mozilla/dom/ServiceWorkerInterceptController.h"
+#include "mozilla/dom/UserActivation.h"
+#include "mozilla/dom/WorkerCommon.h"
+#include "mozilla/ipc/PBackgroundSharedTypes.h"
+#include "mozilla/net/ContentRange.h"
+#include "mozilla/net/InterceptionInfo.h"
+#include "mozilla/net/NeckoChannelParams.h"
+#include "nsContentPolicyUtils.h"
+#include "nsDataChannel.h"
+#include "nsDataHandler.h"
+#include "nsHttpChannel.h"
+#include "nsIAsyncVerifyRedirectCallback.h"
+#include "nsIBaseChannel.h"
+#include "nsICookieJarSettings.h"
+#include "nsIFile.h"
+#include "nsIFileChannel.h"
+#include "nsIHttpChannel.h"
+#include "nsIHttpChannelInternal.h"
+#include "nsIInputStream.h"
+#include "nsIInterceptionInfo.h"
+#include "nsIInterfaceRequestorUtils.h"
+#include "nsIOutputStream.h"
+#include "nsIPipe.h"
+#include "nsIRedirectHistoryEntry.h"
+#include "nsISupportsPriority.h"
+#include "nsIThreadRetargetableRequest.h"
+#include "nsIUploadChannel2.h"
+#include "nsNetUtil.h"
+#include "nsPrintfCString.h"
+#include "nsProxyRelease.h"
+#include "nsQueryObject.h"
+#include "nsStreamUtils.h"
+#include "nsStringStream.h"
+
+namespace mozilla::dom {
+
+namespace {
+
+bool ShouldCheckSRI(const InternalRequest& aRequest,
+                    const InternalResponse& aResponse) {
+  return !aRequest.GetIntegrity().IsEmpty() &&
+         aResponse.Type() != ResponseType::Error;
+}
+
+}  
+
+class AlternativeDataStreamListener final
+    : public nsIThreadRetargetableStreamListener {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIREQUESTOBSERVER
+  NS_DECL_NSISTREAMLISTENER
+  NS_DECL_NSITHREADRETARGETABLESTREAMLISTENER
+
+  enum eStatus { LOADING = 0, COMPLETED, CANCELED, FALLBACK };
+
+  AlternativeDataStreamListener(FetchDriver* aFetchDriver, nsIChannel* aChannel,
+                                const nsACString& aAlternativeDataType);
+  eStatus Status();
+  void Cancel();
+  uint64_t GetAlternativeDataCacheEntryId();
+  const nsACString& GetAlternativeDataType() const;
+  already_AddRefed<nsICacheInfoChannel> GetCacheInfoChannel();
+  already_AddRefed<nsIInputStream> GetAlternativeInputStream();
+
+ private:
+  ~AlternativeDataStreamListener() = default;
+
+  RefPtr<FetchDriver> mFetchDriver;
+  nsCString mAlternativeDataType;
+  nsCOMPtr<nsIInputStream> mPipeAlternativeInputStream;
+  nsCOMPtr<nsIOutputStream> mPipeAlternativeOutputStream;
+  uint64_t mAlternativeDataCacheEntryId;
+  nsCOMPtr<nsICacheInfoChannel> mCacheInfoChannel;
+  nsCOMPtr<nsIChannel> mChannel;
+  Atomic<eStatus> mStatus;
+};
+
+NS_IMPL_ISUPPORTS(AlternativeDataStreamListener, nsIStreamListener,
+                  nsIThreadRetargetableStreamListener)
+
+AlternativeDataStreamListener::AlternativeDataStreamListener(
+    FetchDriver* aFetchDriver, nsIChannel* aChannel,
+    const nsACString& aAlternativeDataType)
+    : mFetchDriver(aFetchDriver),
+      mAlternativeDataType(aAlternativeDataType),
+      mAlternativeDataCacheEntryId(0),
+      mChannel(aChannel),
+      mStatus(AlternativeDataStreamListener::LOADING) {
+  MOZ_DIAGNOSTIC_ASSERT(mFetchDriver);
+  MOZ_DIAGNOSTIC_ASSERT(mChannel);
+}
+
+AlternativeDataStreamListener::eStatus AlternativeDataStreamListener::Status() {
+  return mStatus;
+}
+
+void AlternativeDataStreamListener::Cancel() {
+  mAlternativeDataCacheEntryId = 0;
+  mCacheInfoChannel = nullptr;
+  mPipeAlternativeOutputStream = nullptr;
+  mPipeAlternativeInputStream = nullptr;
+  if (mChannel && mStatus != AlternativeDataStreamListener::FALLBACK) {
+    mChannel->CancelWithReason(NS_BINDING_ABORTED,
+                               "AlternativeDataStreamListener::Cancel"_ns);
+    mChannel = nullptr;
+  }
+  mStatus = AlternativeDataStreamListener::CANCELED;
+}
+
+uint64_t AlternativeDataStreamListener::GetAlternativeDataCacheEntryId() {
+  return mAlternativeDataCacheEntryId;
+}
+
+const nsACString& AlternativeDataStreamListener::GetAlternativeDataType()
+    const {
+  return mAlternativeDataType;
+}
+
+already_AddRefed<nsIInputStream>
+AlternativeDataStreamListener::GetAlternativeInputStream() {
+  nsCOMPtr<nsIInputStream> inputStream = mPipeAlternativeInputStream;
+  return inputStream.forget();
+}
+
+already_AddRefed<nsICacheInfoChannel>
+AlternativeDataStreamListener::GetCacheInfoChannel() {
+  nsCOMPtr<nsICacheInfoChannel> channel = mCacheInfoChannel;
+  return channel.forget();
+}
+
+NS_IMETHODIMP
+AlternativeDataStreamListener::OnStartRequest(nsIRequest* aRequest) {
+  AssertIsOnMainThread();
+  MOZ_ASSERT(!mAlternativeDataType.IsEmpty());
+  nsAutoCString alternativeDataType;
+  nsCOMPtr<nsICacheInfoChannel> cic = do_QueryInterface(aRequest);
+  mStatus = AlternativeDataStreamListener::LOADING;
+  if (cic && NS_SUCCEEDED(cic->GetAlternativeDataType(alternativeDataType)) &&
+      mAlternativeDataType.Equals(alternativeDataType) &&
+      NS_SUCCEEDED(cic->GetCacheEntryId(&mAlternativeDataCacheEntryId))) {
+    MOZ_DIAGNOSTIC_ASSERT(!mPipeAlternativeInputStream);
+    MOZ_DIAGNOSTIC_ASSERT(!mPipeAlternativeOutputStream);
+    NS_NewPipe(getter_AddRefs(mPipeAlternativeInputStream),
+               getter_AddRefs(mPipeAlternativeOutputStream),
+               0 , UINT32_MAX ,
+               true ,
+               false );
+
+    MOZ_DIAGNOSTIC_ASSERT(!mCacheInfoChannel);
+    mCacheInfoChannel = cic;
+
+    MOZ_ASSERT(mFetchDriver);
+    return mFetchDriver->HttpFetch();
+  }
+  MOZ_ASSERT(alternativeDataType.IsEmpty());
+  mStatus = AlternativeDataStreamListener::FALLBACK;
+  mAlternativeDataCacheEntryId = 0;
+  MOZ_ASSERT(mFetchDriver);
+  RefPtr<FetchDriver> fetchDriver = mFetchDriver;
+  return fetchDriver->OnStartRequest(aRequest);
+}
+
+NS_IMETHODIMP
+AlternativeDataStreamListener::OnDataAvailable(nsIRequest* aRequest,
+                                               nsIInputStream* aInputStream,
+                                               uint64_t aOffset,
+                                               uint32_t aCount) {
+  FETCH_LOG(
+      ("FetchDriver::OnDataAvailable this=%p, request=%p", this, aRequest));
+  if (mStatus == AlternativeDataStreamListener::LOADING) {
+    MOZ_ASSERT(mPipeAlternativeOutputStream);
+    uint32_t read = 0;
+    return aInputStream->ReadSegments(
+        NS_CopySegmentToStream, mPipeAlternativeOutputStream, aCount, &read);
+  }
+  if (mStatus == AlternativeDataStreamListener::FALLBACK) {
+    MOZ_ASSERT(mFetchDriver);
+    RefPtr<FetchDriver> fetchDriver = mFetchDriver;
+    return fetchDriver->OnDataAvailable(aRequest, aInputStream, aOffset,
+                                        aCount);
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+AlternativeDataStreamListener::OnStopRequest(nsIRequest* aRequest,
+                                             nsresult aStatusCode) {
+  AssertIsOnMainThread();
+
+  RefPtr<FetchDriver> fetchDriver = std::move(mFetchDriver);
+
+  if (mStatus == AlternativeDataStreamListener::CANCELED) {
+    return NS_OK;
+  }
+
+  if (mStatus == AlternativeDataStreamListener::FALLBACK) {
+    MOZ_ASSERT(fetchDriver);
+    return fetchDriver->OnStopRequest(aRequest, aStatusCode);
+  }
+
+  MOZ_DIAGNOSTIC_ASSERT(mStatus == AlternativeDataStreamListener::LOADING);
+
+  MOZ_ASSERT(!mAlternativeDataType.IsEmpty() && mPipeAlternativeOutputStream &&
+             mPipeAlternativeInputStream);
+
+  mPipeAlternativeOutputStream->Close();
+  mPipeAlternativeOutputStream = nullptr;
+
+  if (NS_FAILED(aStatusCode)) {
+    mAlternativeDataCacheEntryId = 0;
+    mCacheInfoChannel = nullptr;
+    mPipeAlternativeInputStream = nullptr;
+  }
+  mStatus = AlternativeDataStreamListener::COMPLETED;
+  MOZ_ASSERT(fetchDriver);
+  fetchDriver->FinishOnStopRequest(this);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+AlternativeDataStreamListener::CheckListenerChain() { return NS_OK; }
+
+NS_IMETHODIMP
+AlternativeDataStreamListener::OnDataFinished(nsresult aStatus) {
+  return NS_OK;
+}
+
+
+NS_IMPL_ISUPPORTS(FetchDriver, nsIStreamListener, nsIChannelEventSink,
+                  nsIInterfaceRequestor, nsIThreadRetargetableStreamListener,
+                  nsINetworkInterceptController)
+
+FetchDriver::FetchDriver(SafeRefPtr<InternalRequest> aRequest,
+                         nsIPrincipal* aPrincipal, nsILoadGroup* aLoadGroup,
+                         nsIEventTarget* aMainThreadEventTarget,
+                         nsICookieJarSettings* aCookieJarSettings,
+                         PerformanceStorage* aPerformanceStorage,
+                         net::ClassificationFlags aTrackingFlags)
+    : mPrincipal(aPrincipal),
+      mLoadGroup(aLoadGroup),
+      mRequest(std::move(aRequest)),
+      mODAMutex("FetchDriver::mODAMutex"),
+      mMainThreadEventTarget(aMainThreadEventTarget),
+      mCookieJarSettings(aCookieJarSettings),
+      mPerformanceStorage(aPerformanceStorage),
+      mNeedToObserveOnDataAvailable(false),
+      mTrackingFlags(aTrackingFlags),
+      mIsOn3PCBExceptionList(false),
+      mOnStopRequestCalled(false)
+#ifdef DEBUG
+      ,
+      mResponseAvailableCalled(false),
+      mFetchCalled(false)
+#endif
+{
+  AssertIsOnMainThread();
+
+  MOZ_ASSERT(mRequest);
+  MOZ_ASSERT(aPrincipal);
+  MOZ_ASSERT(aMainThreadEventTarget);
+
+}
+
+FetchDriver::~FetchDriver() {
+  AssertIsOnMainThread();
+
+  MOZ_ASSERT(mResponseAvailableCalled);
+}
+
+already_AddRefed<PreloaderBase> FetchDriver::FindPreload(nsIURI* aURI) {
+
+  if (!mDocument) {
+    return nullptr;
+  }
+  CORSMode cors;
+  switch (mRequest->Mode()) {
+    case RequestMode::No_cors:
+      cors = CORSMode::CORS_NONE;
+      break;
+    case RequestMode::Cors:
+      cors = mRequest->GetCredentialsMode() == RequestCredentials::Include
+                 ? CORSMode::CORS_USE_CREDENTIALS
+                 : CORSMode::CORS_ANONYMOUS;
+      break;
+    default:
+      return nullptr;
+  }
+  if (!mRequest->Headers()->HasOnlySimpleHeaders()) {
+    return nullptr;
+  }
+  if (!mRequest->GetIntegrity().IsEmpty()) {
+    return nullptr;
+  }
+  if (mRequest->GetCacheMode() != RequestCache::Default) {
+    return nullptr;
+  }
+  if (mRequest->SkipServiceWorker()) {
+    return nullptr;
+  }
+  if (mRequest->GetRedirectMode() != RequestRedirect::Follow) {
+    return nullptr;
+  }
+  nsAutoCString method;
+  mRequest->GetMethod(method);
+  if (!method.EqualsLiteral("GET")) {
+    return nullptr;
+  }
+
+
+  auto preloadKey = PreloadHashKey::CreateAsFetch(aURI, cors);
+  return mDocument->Preloads().LookupPreload(preloadKey);
+}
+
+void FetchDriver::UpdateReferrerInfoFromNewChannel(nsIChannel* aChannel) {
+  nsCOMPtr<nsIHttpChannel> httpChannel = do_QueryInterface(aChannel);
+  if (!httpChannel) {
+    return;
+  }
+
+  nsCOMPtr<nsIReferrerInfo> referrerInfo = httpChannel->GetReferrerInfo();
+  if (!referrerInfo) {
+    return;
+  }
+
+  nsAutoCString computedReferrerSpec;
+  mRequest->SetReferrerPolicy(referrerInfo->ReferrerPolicy());
+  (void)referrerInfo->GetComputedReferrerSpec(computedReferrerSpec);
+  mRequest->SetReferrer(computedReferrerSpec);
+}
+
+nsresult FetchDriver::Fetch(AbortSignalImpl* aSignalImpl,
+                            FetchDriverObserver* aObserver) {
+  AssertIsOnMainThread();
+#ifdef DEBUG
+  MOZ_ASSERT(!mFetchCalled);
+  mFetchCalled = true;
+#endif
+
+  mObserver = aObserver;
+
+
+  MOZ_RELEASE_ASSERT(!mRequest->IsSynchronous(),
+                     "Synchronous fetch not supported");
+
+  UniquePtr<mozilla::ipc::PrincipalInfo> principalInfo(
+      new mozilla::ipc::PrincipalInfo());
+  nsresult rv = PrincipalToPrincipalInfo(mPrincipal, principalInfo.get());
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  mRequest->SetPrincipalInfo(std::move(principalInfo));
+
+  if (aSignalImpl) {
+    if (aSignalImpl->Aborted()) {
+      FetchDriverAbortActions(aSignalImpl);
+      return NS_OK;
+    }
+
+    Follow(aSignalImpl);
+  }
+
+  rv = HttpFetch(mRequest->GetPreferredAlternativeDataType());
+  if (NS_FAILED(rv)) {
+    FailWithNetworkError(rv);
+  }
+
+  return NS_OK;
+}
+
+nsresult FetchDriver::HttpFetch(
+    const nsACString& aPreferredAlternativeDataType) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  mResponse = nullptr;
+  mOnStopRequestCalled = false;
+  nsresult rv;
+
+  nsCOMPtr<nsIIOService> ios = do_GetIOService(&rv);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsIURI> uri = mRequest->GetURL();
+
+  if (mRequest->Mode() == RequestMode::No_cors && mRequest->UnsafeRequest() &&
+      (!mRequest->HasSimpleMethod() ||
+       !mRequest->Headers()->HasOnlySimpleHeaders())) {
+    MOZ_ASSERT(false, "The API should have caught this");
+    return NS_ERROR_DOM_BAD_URI;
+  }
+
+  if (IsBlobURI(uri)) {
+    nsAutoCString method;
+    mRequest->GetMethod(method);
+    if (!method.EqualsLiteral("GET")) {
+      return NS_ERROR_DOM_NETWORK_ERR;
+    }
+  }
+
+  RefPtr<PreloaderBase> fetchPreload = FindPreload(uri);
+  if (fetchPreload) {
+    fetchPreload->RemoveSelf(mDocument);
+    fetchPreload->NotifyUsage(mDocument, PreloaderBase::LoadBackground::Keep);
+
+    rv = fetchPreload->AsyncConsume(this);
+    if (NS_SUCCEEDED(rv)) {
+      mFromPreload = true;
+
+      mChannel = fetchPreload->Channel();
+      MOZ_ASSERT(mChannel);
+      mChannel->SetNotificationCallbacks(this);
+
+      for (const auto& redirect : fetchPreload->Redirects()) {
+        nsCOMPtr<nsIURI> uriNoFragment = redirect.URINoFragment();
+        if (redirect.Flags() & nsIChannelEventSink::REDIRECT_INTERNAL) {
+          mRequest->SetURLForInternalRedirect(redirect.Flags(),
+                                              WrapNotNull(uriNoFragment.get()),
+                                              redirect.Fragment());
+        } else {
+          mRequest->AddURL(WrapNotNull(uriNoFragment.get()),
+                           redirect.Fragment());
+        }
+      }
+
+      return NS_OK;
+    }
+
+    fetchPreload = nullptr;
+  }
+
+
+
+
+  const nsLoadFlags bypassFlag = mRequest->SkipServiceWorker()
+                                     ? nsIChannel::LOAD_BYPASS_SERVICE_WORKER
+                                     : 0;
+
+  nsSecurityFlags secFlags = 0;
+  if (mRequest->Mode() == RequestMode::Cors) {
+    secFlags |= nsILoadInfo::SEC_REQUIRE_CORS_INHERITS_SEC_CONTEXT;
+  } else if (mRequest->Mode() == RequestMode::Same_origin ||
+             mRequest->Mode() == RequestMode::Navigate) {
+    secFlags |= nsILoadInfo::SEC_REQUIRE_SAME_ORIGIN_INHERITS_SEC_CONTEXT;
+  } else if (mRequest->Mode() == RequestMode::No_cors) {
+    secFlags |= nsILoadInfo::SEC_ALLOW_CROSS_ORIGIN_INHERITS_SEC_CONTEXT;
+  } else {
+    MOZ_ASSERT_UNREACHABLE("Unexpected request mode!");
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  if (mRequest->GetRedirectMode() != RequestRedirect::Follow) {
+    secFlags |= nsILoadInfo::SEC_DONT_FOLLOW_REDIRECTS;
+  }
+
+  if (mRequest->GetCredentialsMode() == RequestCredentials::Include) {
+    secFlags |= nsILoadInfo::SEC_COOKIES_INCLUDE;
+  } else if (mRequest->GetCredentialsMode() == RequestCredentials::Omit) {
+    secFlags |= nsILoadInfo::SEC_COOKIES_OMIT;
+  } else if (mRequest->GetCredentialsMode() ==
+             RequestCredentials::Same_origin) {
+    secFlags |= nsILoadInfo::SEC_COOKIES_SAME_ORIGIN;
+  } else {
+    MOZ_ASSERT_UNREACHABLE("Unexpected credentials mode!");
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  MOZ_ASSERT(mLoadGroup);
+  nsCOMPtr<nsIChannel> chan;
+
+  nsLoadFlags loadFlags = nsIRequest::LOAD_BACKGROUND | bypassFlag;
+  if (mDocument) {
+    MOZ_ASSERT(mDocument->NodePrincipal() == mPrincipal);
+    MOZ_ASSERT(mDocument->CookieJarSettings() == mCookieJarSettings);
+    rv = NS_NewChannel(getter_AddRefs(chan), uri, mDocument, secFlags,
+                       mRequest->ContentPolicyType(),
+                       nullptr,             
+                       mLoadGroup, nullptr, 
+                       loadFlags, ios);
+  } else if (mClientInfo.isSome()) {
+    rv = NS_NewChannel(getter_AddRefs(chan), uri, mPrincipal, mClientInfo.ref(),
+                       mController, secFlags, mRequest->ContentPolicyType(),
+                       mCookieJarSettings, mPerformanceStorage, mLoadGroup,
+                       nullptr, 
+                       loadFlags, ios);
+  } else {
+    nsCOMPtr<nsIPrincipal> principal = mPrincipal;
+    if (principal->IsSystemPrincipal() &&
+        mRequest->GetTriggeringPrincipalOverride()) {
+      rv = NS_NewChannelWithTriggeringPrincipal(
+          getter_AddRefs(chan), uri, mPrincipal,
+          mRequest->GetTriggeringPrincipalOverride(), secFlags,
+          mRequest->ContentPolicyType(), mCookieJarSettings,
+          mPerformanceStorage, mLoadGroup, nullptr, 
+          loadFlags, ios);
+    } else {
+      rv = NS_NewChannel(getter_AddRefs(chan), uri, mPrincipal, secFlags,
+                         mRequest->ContentPolicyType(), mCookieJarSettings,
+                         mPerformanceStorage, mLoadGroup,
+                         nullptr, 
+                         loadFlags, ios);
+    }
+  }
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (mRequest->Mode() != RequestMode::No_cors) {
+    nsCOMPtr<nsILoadInfo> loadInfo = chan->LoadInfo();
+    loadInfo->SetSkipContentSniffing(true);
+  }
+
+  if (mCSPEventListener) {
+    nsCOMPtr<nsILoadInfo> loadInfo = chan->LoadInfo();
+    rv = loadInfo->SetCspEventListener(mCSPEventListener);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  {
+    nsCOMPtr<nsILoadInfo> loadInfo = chan->LoadInfo();
+    rv = loadInfo->SetLoadingEmbedderPolicy(mRequest->GetEmbedderPolicy());
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  if (mAssociatedBrowsingContextID) {
+    nsCOMPtr<nsILoadInfo> loadInfo = chan->LoadInfo();
+    rv = loadInfo->SetAssociatedBrowsingContextID(mAssociatedBrowsingContextID);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  if (mIsThirdPartyContext.isSome()) {
+    nsCOMPtr<nsILoadInfo> loadInfo = chan->LoadInfo();
+    rv = loadInfo->SetIsInThirdPartyContext(mIsThirdPartyContext.ref());
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  if (mIsOn3PCBExceptionList) {
+    nsCOMPtr<nsILoadInfo> loadInfo = chan->LoadInfo();
+    rv = loadInfo->SetIsOn3PCBExceptionList(mIsOn3PCBExceptionList);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  nsCOMPtr<nsILoadInfo> loadInfo = chan->LoadInfo();
+  rv = loadInfo->SetTriggeringFirstPartyClassificationFlags(
+      mTrackingFlags.firstPartyFlags);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = loadInfo->SetTriggeringThirdPartyClassificationFlags(
+      mTrackingFlags.thirdPartyFlags);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (mRequest->GetInterceptionTriggeringPrincipalInfo()) {
+    auto principalOrErr = mozilla::ipc::PrincipalInfoToPrincipal(
+        *(mRequest->GetInterceptionTriggeringPrincipalInfo().get()));
+    if (!principalOrErr.isErr()) {
+      nsCOMPtr<nsIPrincipal> principal = principalOrErr.unwrap();
+
+      nsTArray<nsCOMPtr<nsIRedirectHistoryEntry>> redirectChain;
+      if (!mRequest->InterceptionRedirectChain().IsEmpty()) {
+        for (const RedirectHistoryEntryInfo& entryInfo :
+             mRequest->InterceptionRedirectChain()) {
+          nsCOMPtr<nsIRedirectHistoryEntry> entry =
+              mozilla::ipc::RHEntryInfoToRHEntry(entryInfo);
+          redirectChain.AppendElement(entry);
+        }
+      }
+
+      nsCOMPtr<nsILoadInfo> loadInfo = chan->LoadInfo();
+      MOZ_ASSERT(loadInfo);
+      loadInfo->SetInterceptionInfo(new mozilla::net::InterceptionInfo(
+          principal, mRequest->InterceptionContentPolicyType(), redirectChain,
+          mRequest->InterceptionFromThirdParty()));
+    }
+  }
+
+  if (mDocument && mDocument->GetEmbedderElement() &&
+      mDocument->GetEmbedderElement()->IsAnyOfHTMLElements(nsGkAtoms::object,
+                                                           nsGkAtoms::embed)) {
+    nsCOMPtr<nsILoadInfo> loadInfo = chan->LoadInfo();
+    rv = loadInfo->SetIsFromObjectOrEmbed(true);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+#ifdef DEBUG
+  {
+    nsCOMPtr<nsIInterfaceRequestor> notificationCallbacks;
+    chan->GetNotificationCallbacks(getter_AddRefs(notificationCallbacks));
+    MOZ_ASSERT(!notificationCallbacks);
+  }
+#endif
+  chan->SetNotificationCallbacks(this);
+
+  nsCOMPtr<nsIClassOfService> cos(do_QueryInterface(chan));
+  if (cos && UserActivation::IsHandlingUserInput()) {
+    cos->AddClassFlags(nsIClassOfService::UrgentStart);
+  }
+
+  nsCOMPtr<nsIHttpChannel> httpChan = do_QueryInterface(chan);
+  if (httpChan) {
+    nsAutoCString method;
+    mRequest->GetMethod(method);
+    rv = httpChan->SetRequestMethod(method);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    SetRequestHeaders(httpChan, false, false);
+
+    ReferrerPolicy referrerPolicy = mRequest->GetEnvironmentReferrerPolicy();
+    if (mRequest->ReferrerPolicy_() == ReferrerPolicy::_empty) {
+      mRequest->SetReferrerPolicy(referrerPolicy);
+    }
+    if (mRequest->ReferrerPolicy_() == ReferrerPolicy::_empty) {
+      nsCOMPtr<nsILoadInfo> loadInfo = httpChan->LoadInfo();
+      bool isPrivate = loadInfo->GetOriginAttributes().IsPrivateBrowsing();
+      referrerPolicy =
+          ReferrerInfo::GetDefaultReferrerPolicy(httpChan, uri, isPrivate);
+      mRequest->SetReferrerPolicy(referrerPolicy);
+    }
+
+    rv = FetchUtil::SetRequestReferrer(mPrincipal, mDocument, httpChan,
+                                       *mRequest);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+
+    nsCOMPtr<nsIHttpChannelInternal> internalChan = do_QueryInterface(httpChan);
+
+    rv = internalChan->SetRequestMode(mRequest->Mode());
+    MOZ_ASSERT(NS_SUCCEEDED(rv));
+    rv = internalChan->SetRedirectMode(
+        static_cast<uint32_t>(mRequest->GetRedirectMode()));
+    MOZ_ASSERT(NS_SUCCEEDED(rv));
+    mRequest->MaybeSkipCacheIfPerformingRevalidation();
+    rv = internalChan->SetFetchCacheMode(
+        static_cast<uint32_t>(mRequest->GetCacheMode()));
+    MOZ_ASSERT(NS_SUCCEEDED(rv));
+    nsCOMPtr<nsILoadInfo> loadInfo = chan->LoadInfo();
+    rv = loadInfo->SetIntegrityMetadata(mRequest->GetIntegrity());
+    MOZ_ASSERT(NS_SUCCEEDED(rv));
+
+    nsCOMPtr<nsITimedChannel> timedChannel(do_QueryInterface(httpChan));
+    if (timedChannel) {
+      timedChannel->SetInitiatorType(u"fetch"_ns);
+    }
+  }
+
+
+  nsCOMPtr<nsIUploadChannel2> uploadChan = do_QueryInterface(chan);
+  if (uploadChan) {
+    nsAutoCString contentType;
+    ErrorResult result;
+    mRequest->Headers()->GetFirst("content-type"_ns, contentType, result);
+    if (result.Failed()) {
+      return result.StealNSResult();
+    }
+
+#ifdef DEBUG
+    bool hasContentTypeHeader =
+        mRequest->Headers()->Has("content-type"_ns, result);
+    MOZ_ASSERT(!result.Failed());
+    MOZ_ASSERT_IF(!hasContentTypeHeader, contentType.IsVoid());
+#endif  // DEBUG
+
+    int64_t bodyLength;
+    nsCOMPtr<nsIInputStream> bodyStream;
+    mRequest->GetBody(getter_AddRefs(bodyStream), &bodyLength);
+    if (bodyStream) {
+      nsAutoCString method;
+      mRequest->GetMethod(method);
+      rv = uploadChan->ExplicitSetUploadStream(bodyStream, contentType,
+                                               bodyLength, method);
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
+  }
+
+  if (mRequest->Mode() == RequestMode::Cors) {
+    AutoTArray<nsCString, 5> unsafeHeaders;
+    mRequest->Headers()->GetUnsafeHeaders(unsafeHeaders);
+    nsCOMPtr<nsILoadInfo> loadInfo = chan->LoadInfo();
+    loadInfo->SetCorsPreflightInfo(unsafeHeaders, false);
+  }
+
+  const auto fetchPriority = ToFetchPriority(mRequest->GetPriorityMode());
+  if (cos) {
+    cos->SetFetchPriorityDOM(fetchPriority);
+  }
+
+  if (nsCOMPtr<nsISupportsPriority> p = do_QueryInterface(chan)) {
+    if (StaticPrefs::network_fetchpriority_enabled()) {
+      const int32_t supportsPriorityDelta = [this, &fetchPriority]() {
+        auto destination = mRequest->GetInterceptionTriggeringPrincipalInfo()
+                               ? mRequest->InterceptionDestination()
+                               : mRequest->Destination();
+        switch (destination) {
+          case RequestDestination::Font:
+            return FETCH_PRIORITY_ADJUSTMENT_FOR(link_preload_font,
+                                                 fetchPriority);
+          case RequestDestination::Style:
+            return FETCH_PRIORITY_ADJUSTMENT_FOR(link_preload_style,
+                                                 fetchPriority);
+          case RequestDestination::Script:
+          case RequestDestination::Audioworklet:
+          case RequestDestination::Paintworklet:
+          case RequestDestination::Sharedworker:
+          case RequestDestination::Worker:
+          case RequestDestination::Xslt:
+          case RequestDestination::Json:
+          case RequestDestination::Text:
+            return FETCH_PRIORITY_ADJUSTMENT_FOR(link_preload_script,
+                                                 fetchPriority);
+          case RequestDestination::Image:
+            return FETCH_PRIORITY_ADJUSTMENT_FOR(images, fetchPriority);
+          case RequestDestination::Audio:
+          case RequestDestination::Track:
+          case RequestDestination::Video:
+            return FETCH_PRIORITY_ADJUSTMENT_FOR(media, fetchPriority);
+          case RequestDestination::Document:
+          case RequestDestination::Embed:
+          case RequestDestination::Frame:
+          case RequestDestination::Iframe:
+          case RequestDestination::Manifest:
+          case RequestDestination::Object:
+          case RequestDestination::Report:
+          case RequestDestination::_empty:
+            return FETCH_PRIORITY_ADJUSTMENT_FOR(global_fetch_api,
+                                                 fetchPriority);
+        };
+        MOZ_ASSERT_UNREACHABLE("Unknown destination");
+        return 0;
+      }();
+      p->SetPriority(mRequest->InternalPriority());
+      p->AdjustPriority(supportsPriorityDelta);
+    }
+  }
+
+  NotifyNetworkMonitorAlternateStack(chan, std::move(mOriginStack));
+  if (mObserver && httpChan) {
+    mObserver->OnNotifyNetworkMonitorAlternateStack(httpChan->ChannelId());
+  }
+
+  RefPtr<BlobURLChannel> blobChan = do_QueryObject(chan);
+  if (blobChan) {
+    ErrorResult result;
+    nsAutoCString range;
+    mRequest->Headers()->Get("Range"_ns, range, result);
+    MOZ_ASSERT(!result.Failed());
+    if (!range.IsVoid()) {
+      rv = blobChan->SetRequestContentRangeHeader(range);
+      if (NS_FAILED(rv)) {
+        return rv;
+      }
+    }
+  }
+
+  if (!aPreferredAlternativeDataType.IsEmpty()) {
+    nsCOMPtr<nsICacheInfoChannel> cic = do_QueryInterface(chan);
+    if (cic) {
+      cic->PreferAlternativeDataType(
+          aPreferredAlternativeDataType, ""_ns,
+          nsICacheInfoChannel::PreferredAlternativeDataDeliveryType::ASYNC);
+      MOZ_ASSERT(!mAltDataListener);
+      mAltDataListener = new AlternativeDataStreamListener(
+          this, chan, aPreferredAlternativeDataType);
+      rv = chan->AsyncOpen(mAltDataListener);
+    } else {
+      rv = chan->AsyncOpen(this);
+    }
+  } else {
+    if (mRequest->GetIntegrity().IsEmpty()) {
+      nsCOMPtr<nsICacheInfoChannel> cic = do_QueryInterface(chan);
+      if (cic && StaticPrefs::javascript_options_wasm_caching() &&
+          !mRequest->SkipWasmCaching()) {
+        cic->PreferAlternativeDataType(
+            FetchUtil::GetWasmAltDataType(),
+            nsLiteralCString(WASM_CONTENT_TYPE),
+            nsICacheInfoChannel::PreferredAlternativeDataDeliveryType::
+                SERIALIZE);
+      }
+    }
+
+    rv = chan->AsyncOpen(this);
+  }
+
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+
+  mChannel = std::move(chan);
+  return NS_OK;
+}
+
+SafeRefPtr<InternalResponse> FetchDriver::BeginAndGetFilteredResponse(
+    SafeRefPtr<InternalResponse> aResponse, bool aFoundOpaqueRedirect) {
+  MOZ_ASSERT(aResponse);
+  MOZ_ASSERT(!mRequest->GetURLListWithoutFragment().IsEmpty());
+  aResponse->SetURLList(mRequest->GetURLListWithoutFragment());
+  SafeRefPtr<InternalResponse> filteredResponse;
+  if (aFoundOpaqueRedirect) {
+    filteredResponse = aResponse->OpaqueRedirectResponse();
+  } else {
+    switch (mRequest->GetResponseTainting()) {
+      case LoadTainting::Basic:
+        filteredResponse = aResponse->BasicResponse();
+        break;
+      case LoadTainting::CORS:
+        filteredResponse = aResponse->CORSResponse();
+        break;
+      case LoadTainting::Opaque: {
+        filteredResponse = aResponse->OpaqueResponse();
+        nsresult rv = filteredResponse->GeneratePaddingInfo();
+        if (NS_WARN_IF(NS_FAILED(rv))) {
+          return nullptr;
+        }
+        break;
+      }
+      default:
+        MOZ_CRASH("Unexpected case");
+    }
+  }
+
+  MOZ_ASSERT(filteredResponse);
+  MOZ_ASSERT(mObserver);
+  MOZ_ASSERT(filteredResponse);
+  if (!ShouldCheckSRI(*mRequest, *filteredResponse)) {
+    RefPtr<FetchDriverObserver> observer = mObserver;
+    observer->OnResponseAvailable(filteredResponse.clonePtr());
+#ifdef DEBUG
+    mResponseAvailableCalled = true;
+#endif
+  }
+
+  return filteredResponse;
+}
+
+void FetchDriver::FailWithNetworkError(nsresult rv) {
+  AssertIsOnMainThread();
+  if (mObserver) {
+    RefPtr<FetchDriverObserver> observer = mObserver;
+    observer->OnResponseAvailable(InternalResponse::NetworkError(rv));
+#ifdef DEBUG
+    mResponseAvailableCalled = true;
+#endif
+  }
+
+  if (mObserver) {
+    mObserver->OnReportPerformanceTiming();
+    mObserver->OnResponseEnd(FetchDriverObserver::eByNetworking,
+                             JS::UndefinedHandleValue);
+    mObserver = nullptr;
+  }
+
+  mChannel = nullptr;
+  Unfollow();
+}
+
+NS_IMETHODIMP
+FetchDriver::OnStartRequest(nsIRequest* aRequest) {
+  FETCH_LOG(
+      ("FetchDriver::OnStartRequest this=%p, request=%p", this, aRequest));
+  AssertIsOnMainThread();
+
+
+  if (mFromPreload && mAborted) {
+    aRequest->CancelWithReason(NS_BINDING_ABORTED,
+                               "FetchDriver::OnStartRequest aborted"_ns);
+    return NS_BINDING_ABORTED;
+  }
+
+  if (!mChannel) {
+    MOZ_ASSERT(!mObserver);
+    return NS_BINDING_ABORTED;
+  }
+
+  nsresult rv;
+  aRequest->GetStatus(&rv);
+  if (NS_FAILED(rv)) {
+    FailWithNetworkError(rv);
+    return rv;
+  }
+
+  MOZ_ASSERT(!mPipeOutputStream);
+
+  if (!mObserver) {
+    MOZ_ASSERT(false, "We should have mObserver here.");
+    FailWithNetworkError(NS_ERROR_UNEXPECTED);
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  mNeedToObserveOnDataAvailable = mObserver->NeedOnDataAvailable();
+
+  SafeRefPtr<InternalResponse> response;
+  nsCOMPtr<nsIChannel> channel = do_QueryInterface(aRequest);
+  nsCOMPtr<nsIHttpChannel> httpChannel = do_QueryInterface(aRequest);
+
+
+  bool foundOpaqueRedirect = false;
+
+  nsAutoCString contentType(VoidCString());
+
+  int64_t contentLength = InternalResponse::UNKNOWN_BODY_SIZE;
+  rv = channel->GetContentLength(&contentLength);
+  MOZ_ASSERT_IF(NS_FAILED(rv),
+                contentLength == InternalResponse::UNKNOWN_BODY_SIZE);
+
+  if (httpChannel) {
+    channel->GetContentType(contentType);
+
+    uint32_t responseStatus = 0;
+    rv = httpChannel->GetResponseStatus(&responseStatus);
+    if (NS_FAILED(rv)) {
+      FailWithNetworkError(rv);
+      return rv;
+    }
+
+    if (mozilla::net::nsHttpChannel::IsRedirectStatus(responseStatus)) {
+      if (mRequest->GetRedirectMode() == RequestRedirect::Error) {
+        FailWithNetworkError(NS_BINDING_ABORTED);
+        return NS_BINDING_FAILED;
+      }
+      if (mRequest->GetRedirectMode() == RequestRedirect::Manual) {
+        foundOpaqueRedirect = true;
+      }
+    }
+
+    nsAutoCString statusText;
+    rv = httpChannel->GetResponseStatusText(statusText);
+    MOZ_ASSERT(NS_SUCCEEDED(rv));
+
+    response = MakeSafeRefPtr<InternalResponse>(responseStatus, statusText,
+                                                mRequest->GetCredentialsMode());
+
+    UniquePtr<mozilla::ipc::PrincipalInfo> principalInfo(
+        new mozilla::ipc::PrincipalInfo());
+    nsresult rv = PrincipalToPrincipalInfo(mPrincipal, principalInfo.get());
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      return rv;
+    }
+
+    response->SetPrincipalInfo(std::move(principalInfo));
+
+    response->Headers()->FillResponseHeaders(httpChannel);
+
+    ErrorResult result;
+    if (response->Headers()->Has("content-encoding"_ns, result) ||
+        response->Headers()->Has("transfer-encoding"_ns, result)) {
+      contentLength = InternalResponse::UNKNOWN_BODY_SIZE;
+    }
+    MOZ_ASSERT(!result.Failed());
+  } else {
+    nsAutoCString contentRange(VoidCString());
+    RefPtr<BlobURLChannel> blobChan = do_QueryObject(mChannel);
+    if (blobChan && blobChan->GetResponseContentRange()) {
+      blobChan->GetResponseContentRange()->AsHeader(contentRange);
+    }
+
+    response = MakeSafeRefPtr<InternalResponse>(
+        contentRange.IsVoid() ? 200 : 206,
+        contentRange.IsVoid() ? "OK"_ns : "Partial Content"_ns,
+        mRequest->GetCredentialsMode());
+
+    IgnoredErrorResult result;
+    if (!contentRange.IsVoid()) {
+      response->Headers()->Append("Content-Range"_ns, contentRange, result);
+      MOZ_ASSERT(!result.Failed());
+    }
+
+    nsCOMPtr<nsIBaseChannel> baseChan = do_QueryInterface(mChannel);
+    if (baseChan) {
+      RefPtr<CMimeType> fullMimeType(baseChan->FullMimeType());
+      if (fullMimeType) {
+        fullMimeType->Serialize(contentType);
+      }
+    }
+    if (contentType.IsVoid()) {
+      channel->GetContentType(contentType);
+      if (!contentType.IsEmpty()) {
+        nsAutoCString contentCharset;
+        channel->GetContentCharset(contentCharset);
+        if (NS_SUCCEEDED(rv) && !contentCharset.IsEmpty()) {
+          contentType += ";charset="_ns + contentCharset;
+        }
+      }
+    }
+
+    response->Headers()->Append("Content-Type"_ns, contentType, result);
+    MOZ_ASSERT(!result.Failed());
+
+    if (contentLength >= 0) {
+      nsAutoCString contentLenStr;
+      contentLenStr.AppendInt(contentLength);
+
+      IgnoredErrorResult result;
+      response->Headers()->Append("Content-Length"_ns, contentLenStr, result);
+      MOZ_ASSERT(!result.Failed());
+    }
+  }
+
+  nsCOMPtr<nsICacheInfoChannel> cic = do_QueryInterface(aRequest);
+  if (cic) {
+    if (mAltDataListener) {
+      if (mAltDataListener->Status() !=
+          AlternativeDataStreamListener::FALLBACK) {
+        uint64_t cacheEntryId = 0;
+        if (NS_SUCCEEDED(cic->GetCacheEntryId(&cacheEntryId)) &&
+            cacheEntryId !=
+                mAltDataListener->GetAlternativeDataCacheEntryId()) {
+          mAltDataListener->Cancel();
+        } else {
+          nsCOMPtr<nsICacheInfoChannel> cacheInfo =
+              mAltDataListener->GetCacheInfoChannel();
+          nsCOMPtr<nsIInputStream> altInputStream =
+              mAltDataListener->GetAlternativeInputStream();
+          MOZ_ASSERT(altInputStream && cacheInfo);
+          response->SetAlternativeBody(altInputStream);
+          nsMainThreadPtrHandle<nsICacheInfoChannel> handle(
+              new nsMainThreadPtrHolder<nsICacheInfoChannel>(
+                  "nsICacheInfoChannel", cacheInfo, false));
+          response->SetCacheInfoChannel(handle);
+        }
+      } else if (!mAltDataListener->GetAlternativeDataType().IsEmpty()) {
+        nsMainThreadPtrHandle<nsICacheInfoChannel> handle(
+            new nsMainThreadPtrHolder<nsICacheInfoChannel>(
+                "nsICacheInfoChannel", cic, false));
+        response->SetCacheInfoChannel(handle);
+      }
+    } else if (!cic->PreferredAlternativeDataTypes().IsEmpty()) {
+      MOZ_ASSERT(cic->PreferredAlternativeDataTypes().Length() == 1);
+      MOZ_ASSERT(cic->PreferredAlternativeDataTypes()[0].type().Equals(
+          FetchUtil::GetWasmAltDataType()));
+      MOZ_ASSERT(
+          cic->PreferredAlternativeDataTypes()[0].contentType().EqualsLiteral(
+              WASM_CONTENT_TYPE));
+
+      if (contentType.EqualsLiteral(WASM_CONTENT_TYPE)) {
+        nsMainThreadPtrHandle<nsICacheInfoChannel> handle(
+            new nsMainThreadPtrHolder<nsICacheInfoChannel>(
+                "nsICacheInfoChannel", cic, false));
+        response->SetCacheInfoChannel(handle);
+      }
+    }
+  }
+
+  nsAutoCString method;
+  mRequest->GetMethod(method);
+  if (!(method.EqualsLiteral("HEAD") || method.EqualsLiteral("CONNECT"))) {
+    nsCOMPtr<nsIInputStream> pipeInputStream;
+    NS_NewPipe(getter_AddRefs(pipeInputStream),
+               getter_AddRefs(mPipeOutputStream), 0, 
+               UINT32_MAX ,
+               true ,
+               false );
+    response->SetBody(pipeInputStream, contentLength);
+  }
+
+  RefPtr<mozilla::dom::BlobURLChannel> bc = do_QueryObject(aRequest);
+  if (bc) {
+    RefPtr<mozilla::dom::BlobImpl> blobImpl;
+    rv = bc->GetBackingBlob(getter_AddRefs(blobImpl));
+    if (!NS_WARN_IF(NS_FAILED(rv))) {
+      response->SetBodyBlobImpl(blobImpl);
+    }
+  }
+
+  nsCOMPtr<nsIFileChannel> fc = do_QueryInterface(aRequest);
+  if (fc) {
+    nsCOMPtr<nsIFile> file;
+    rv = fc->GetFile(getter_AddRefs(file));
+    if (!NS_WARN_IF(NS_FAILED(rv))) {
+      nsAutoString path;
+      file->GetPath(path);
+      response->SetBodyLocalPath(path);
+    }
+  }
+
+  response->InitChannelInfo(channel);
+
+  nsCOMPtr<nsILoadInfo> loadInfo = channel->LoadInfo();
+  mRequest->MaybeIncreaseResponseTainting(loadInfo->GetTainting());
+
+  mResponse =
+      BeginAndGetFilteredResponse(std::move(response), foundOpaqueRedirect);
+  if (NS_WARN_IF(!mResponse)) {
+    MOZ_DIAGNOSTIC_ASSERT(mRequest->GetResponseTainting() ==
+                              LoadTainting::Opaque &&
+                          !foundOpaqueRedirect);
+    FailWithNetworkError(NS_ERROR_UNEXPECTED);
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  if (ShouldCheckSRI(*mRequest, *mResponse) && mSRIMetadata.IsEmpty()) {
+    nsIConsoleReportCollector* reporter = nullptr;
+    if (mObserver) {
+      reporter = mObserver->GetReporter();
+    }
+
+    nsAutoCString sourceUri;
+    if (mDocument && mDocument->GetDocumentURI()) {
+      mDocument->GetDocumentURI()->GetAsciiSpec(sourceUri);
+    } else if (!mWorkerScript.IsEmpty()) {
+      sourceUri.Assign(mWorkerScript);
+    }
+    SRICheck::IntegrityMetadata(mRequest->GetIntegrity(), sourceUri, reporter,
+                                &mSRIMetadata);
+    mSRIDataVerifier =
+        MakeUnique<SRICheckDataVerifier>(mSRIMetadata, channel, reporter);
+
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsISerialEventTarget> target;
+  nsCOMPtr<nsIThreadRetargetableRequest> req = do_QueryInterface(aRequest);
+  if (req) {
+    rv = req->GetDeliveryTarget(getter_AddRefs(target));
+    if (NS_SUCCEEDED(rv) && target && !target->IsOnCurrentThread()) {
+      FETCH_LOG(
+          ("FetchDriver::OnStartRequest this=%p, request=%p already retargeted",
+           this, aRequest));
+      return NS_OK;
+    }
+  }
+
+  nsCOMPtr<nsIEventTarget> sts =
+      do_GetService(NS_STREAMTRANSPORTSERVICE_CONTRACTID, &rv);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    FailWithNetworkError(rv);
+    return rv;
+  }
+
+  FETCH_LOG(("FetchDriver retargeting: request %p", aRequest));
+  if (nsCOMPtr<nsIThreadRetargetableRequest> rr = do_QueryInterface(aRequest)) {
+    RefPtr<TaskQueue> queue =
+        TaskQueue::Create(sts.forget(), "FetchDriver STS Delivery Queue");
+    (void)NS_WARN_IF(NS_FAILED(rr->RetargetDeliveryTo(queue)));
+  }
+  return NS_OK;
+}
+
+namespace {
+
+class DataAvailableRunnable final : public Runnable {
+  RefPtr<FetchDriverObserver> mObserver;
+
+ public:
+  explicit DataAvailableRunnable(FetchDriverObserver* aObserver)
+      : Runnable("dom::DataAvailableRunnable"), mObserver(aObserver) {
+    MOZ_ASSERT(aObserver);
+  }
+
+  NS_IMETHOD
+  Run() override {
+    RefPtr<FetchDriverObserver> observer = mObserver;
+    observer->OnDataAvailable();
+    mObserver = nullptr;
+    return NS_OK;
+  }
+};
+
+struct SRIVerifierAndOutputHolder {
+  SRIVerifierAndOutputHolder(SRICheckDataVerifier* aVerifier,
+                             nsIOutputStream* aOutputStream)
+      : mVerifier(aVerifier), mOutputStream(aOutputStream) {}
+
+  SRICheckDataVerifier* mVerifier;
+  nsIOutputStream* mOutputStream;
+
+  SRIVerifierAndOutputHolder() = delete;
+};
+
+nsresult CopySegmentToStreamAndSRI(nsIInputStream* aInStr, void* aClosure,
+                                   const char* aBuffer, uint32_t aOffset,
+                                   uint32_t aCount, uint32_t* aCountWritten) {
+  auto holder = static_cast<SRIVerifierAndOutputHolder*>(aClosure);
+  MOZ_DIAGNOSTIC_ASSERT(holder && holder->mVerifier && holder->mOutputStream,
+                        "Bogus holder");
+  nsresult rv = holder->mVerifier->Update(
+      aCount, reinterpret_cast<const uint8_t*>(aBuffer));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  *aCountWritten = 0;
+  while (aCount) {
+    uint32_t n = 0;
+    rv = holder->mOutputStream->Write(aBuffer, aCount, &n);
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+    aBuffer += n;
+    aCount -= n;
+    *aCountWritten += n;
+  }
+  return NS_OK;
+}
+
+}  
+
+NS_IMETHODIMP
+FetchDriver::OnDataAvailable(nsIRequest* aRequest, nsIInputStream* aInputStream,
+                             uint64_t aOffset, uint32_t aCount) {
+
+  if (!mPipeOutputStream) {
+    uint32_t totalRead;
+    nsresult rv = aInputStream->ReadSegments(NS_DiscardSegment, nullptr, aCount,
+                                             &totalRead);
+    NS_ENSURE_SUCCESS(rv, rv);
+    return NS_OK;
+  }
+
+  if (mNeedToObserveOnDataAvailable) {
+    mNeedToObserveOnDataAvailable = false;
+    RefPtr<FetchDriverObserver> observer;
+    {
+      MutexAutoLock lock(mODAMutex);
+      observer = mObserver;
+    }
+    if (observer) {
+      if (NS_IsMainThread()) {
+        observer->OnDataAvailable();
+      } else {
+        RefPtr<Runnable> runnable = new DataAvailableRunnable(observer);
+        nsresult rv = mMainThreadEventTarget->Dispatch(runnable.forget(),
+                                                       NS_DISPATCH_NORMAL);
+        if (NS_WARN_IF(NS_FAILED(rv))) {
+          return rv;
+        }
+      }
+    }
+  }
+
+  if (!mResponse) {
+    MOZ_ASSERT(false);
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  uint32_t aRead = 0;
+  MOZ_ASSERT(mPipeOutputStream);
+
+  nsresult rv;
+  if (mResponse->Type() != ResponseType::Opaque &&
+      ShouldCheckSRI(*mRequest, *mResponse)) {
+    MOZ_ASSERT(mSRIDataVerifier);
+
+    SRIVerifierAndOutputHolder holder(mSRIDataVerifier.get(),
+                                      mPipeOutputStream);
+    rv = aInputStream->ReadSegments(CopySegmentToStreamAndSRI, &holder, aCount,
+                                    &aRead);
+  } else {
+    rv = aInputStream->ReadSegments(NS_CopySegmentToStream, mPipeOutputStream,
+                                    aCount, &aRead);
+  }
+
+  if (aRead == 0 && aCount != 0) {
+    return NS_BASE_STREAM_CLOSED;
+  }
+  return rv;
+}
+
+NS_IMETHODIMP
+FetchDriver::OnStopRequest(nsIRequest* aRequest, nsresult aStatusCode) {
+  FETCH_LOG(("FetchDriver::OnStopRequest this=%p, request=%p", this, aRequest));
+  AssertIsOnMainThread();
+
+  MOZ_DIAGNOSTIC_ASSERT(!mOnStopRequestCalled);
+  mOnStopRequestCalled = true;
+
+  RefPtr<AlternativeDataStreamListener> altDataListener =
+      std::move(mAltDataListener);
+
+  if (mObserver) {
+    mObserver->OnReportPerformanceTiming();
+  }
+
+  if (NS_FAILED(aStatusCode) || !mObserver) {
+    nsCOMPtr<nsIAsyncOutputStream> outputStream =
+        do_QueryInterface(mPipeOutputStream);
+    if (outputStream) {
+      outputStream->CloseWithStatus(NS_FAILED(aStatusCode) ? aStatusCode
+                                                           : NS_BINDING_FAILED);
+    }
+    if (altDataListener) {
+      altDataListener->Cancel();
+    }
+
+  } else {
+    MOZ_ASSERT(mResponse);
+    MOZ_ASSERT(!mResponse->IsError());
+
+    if (ShouldCheckSRI(*mRequest, *mResponse)) {
+      MOZ_ASSERT(mSRIDataVerifier);
+
+      nsCOMPtr<nsIChannel> channel = do_QueryInterface(aRequest);
+
+      nsIConsoleReportCollector* reporter = nullptr;
+      if (mObserver) {
+        reporter = mObserver->GetReporter();
+      }
+
+      nsresult rv = mSRIDataVerifier->Verify(mSRIMetadata, channel, reporter);
+      if (NS_FAILED(rv)) {
+        if (altDataListener) {
+          altDataListener->Cancel();
+        }
+        FailWithNetworkError(rv);
+        return rv;
+      }
+    }
+
+    if (mPipeOutputStream) {
+      mPipeOutputStream->Close();
+    }
+  }
+
+  FinishOnStopRequest(altDataListener);
+  return NS_OK;
+}
+
+void FetchDriver::FinishOnStopRequest(
+    AlternativeDataStreamListener* aAltDataListener) {
+  AssertIsOnMainThread();
+  if (!mOnStopRequestCalled) {
+    return;
+  }
+
+  MOZ_DIAGNOSTIC_ASSERT(!mAltDataListener);
+  if (aAltDataListener &&
+      aAltDataListener->Status() == AlternativeDataStreamListener::LOADING) {
+    return;
+  }
+
+  if (mObserver) {
+    if (ShouldCheckSRI(*mRequest, *mResponse)) {
+      MOZ_ASSERT(mResponse);
+      RefPtr<FetchDriverObserver> observer = mObserver;
+      observer->OnResponseAvailable(mResponse.clonePtr());
+#ifdef DEBUG
+      mResponseAvailableCalled = true;
+#endif
+    }
+  }
+
+  if (mObserver) {
+    mObserver->OnResponseEnd(FetchDriverObserver::eByNetworking,
+                             JS::UndefinedHandleValue);
+    mObserver = nullptr;
+  }
+
+  mChannel = nullptr;
+  Unfollow();
+}
+
+NS_IMETHODIMP
+FetchDriver::ShouldPrepareForIntercept(nsIURI* aURI, nsIChannel* aChannel,
+                                       bool* aShouldIntercept) {
+  MOZ_ASSERT(aChannel);
+
+  if (mInterceptController) {
+    MOZ_ASSERT(XRE_IsParentProcess());
+    return mInterceptController->ShouldPrepareForIntercept(aURI, aChannel,
+                                                           aShouldIntercept);
+  }
+
+  nsCOMPtr<nsINetworkInterceptController> controller;
+  NS_QueryNotificationCallbacks(nullptr, mLoadGroup,
+                                NS_GET_IID(nsINetworkInterceptController),
+                                getter_AddRefs(controller));
+  if (controller) {
+    return controller->ShouldPrepareForIntercept(aURI, aChannel,
+                                                 aShouldIntercept);
+  }
+
+  *aShouldIntercept = false;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+FetchDriver::ChannelIntercepted(nsIInterceptedChannel* aChannel) {
+  if (mInterceptController) {
+    MOZ_ASSERT(XRE_IsParentProcess());
+    return mInterceptController->ChannelIntercepted(aChannel);
+  }
+
+  nsCOMPtr<nsINetworkInterceptController> controller;
+  NS_QueryNotificationCallbacks(nullptr, mLoadGroup,
+                                NS_GET_IID(nsINetworkInterceptController),
+                                getter_AddRefs(controller));
+  if (controller) {
+    return controller->ChannelIntercepted(aChannel);
+  }
+
+  return NS_OK;
+}
+
+void FetchDriver::EnableNetworkInterceptControl() {
+  MOZ_ASSERT(XRE_IsParentProcess());
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(!mInterceptController);
+  mInterceptController = new ServiceWorkerInterceptController();
+}
+
+NS_IMETHODIMP
+FetchDriver::AsyncOnChannelRedirect(nsIChannel* aOldChannel,
+                                    nsIChannel* aNewChannel, uint32_t aFlags,
+                                    nsIAsyncVerifyRedirectCallback* aCallback) {
+  nsCOMPtr<nsIHttpChannel> oldHttpChannel = do_QueryInterface(aOldChannel);
+  nsCOMPtr<nsIHttpChannel> newHttpChannel = do_QueryInterface(aNewChannel);
+  if (oldHttpChannel && newHttpChannel) {
+    nsAutoCString method;
+    mRequest->GetMethod(method);
+
+    bool rewriteToGET = false;
+    (void)oldHttpChannel->ShouldStripRequestBodyHeader(method, &rewriteToGET);
+
+    bool skipAuthHeader =
+        NS_ShouldRemoveAuthHeaderOnRedirect(aOldChannel, aNewChannel, aFlags);
+
+    SetRequestHeaders(newHttpChannel, rewriteToGET, skipAuthHeader);
+  }
+
+  nsCOMPtr<nsIURI> uri;
+  MOZ_ALWAYS_SUCCEEDS(NS_GetFinalChannelURI(aNewChannel, getter_AddRefs(uri)));
+
+  nsCOMPtr<nsIURI> uriClone;
+  nsresult rv = NS_GetURIWithoutRef(uri, getter_AddRefs(uriClone));
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+  nsCString fragment;
+  rv = uri->GetRef(fragment);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  if (!(aFlags & nsIChannelEventSink::REDIRECT_INTERNAL)) {
+    mRequest->AddURL(WrapNotNull(uriClone.get()), fragment);
+  } else {
+    mRequest->SetURLForInternalRedirect(aFlags, WrapNotNull(uriClone.get()),
+                                        fragment);
+  }
+
+  UpdateReferrerInfoFromNewChannel(aNewChannel);
+
+  aCallback->OnRedirectVerifyCallback(NS_OK);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+FetchDriver::CheckListenerChain() { return NS_OK; }
+
+NS_IMETHODIMP
+FetchDriver::OnDataFinished(nsresult) { return NS_OK; }
+
+NS_IMETHODIMP
+FetchDriver::GetInterface(const nsIID& aIID, void** aResult) {
+  if (aIID.Equals(NS_GET_IID(nsIChannelEventSink))) {
+    *aResult = static_cast<nsIChannelEventSink*>(this);
+    NS_ADDREF_THIS();
+    return NS_OK;
+  }
+  if (aIID.Equals(NS_GET_IID(nsIStreamListener))) {
+    *aResult = static_cast<nsIStreamListener*>(this);
+    NS_ADDREF_THIS();
+    return NS_OK;
+  }
+  if (aIID.Equals(NS_GET_IID(nsIRequestObserver))) {
+    *aResult = static_cast<nsIRequestObserver*>(this);
+    NS_ADDREF_THIS();
+    return NS_OK;
+  }
+
+  return QueryInterface(aIID, aResult);
+}
+
+void FetchDriver::SetDocument(Document* aDocument) {
+  MOZ_ASSERT(!mFetchCalled);
+  mDocument = aDocument;
+}
+
+void FetchDriver::SetCSPEventListener(nsICSPEventListener* aCSPEventListener) {
+  MOZ_ASSERT(!mFetchCalled);
+  mCSPEventListener = aCSPEventListener;
+}
+
+void FetchDriver::SetClientInfo(const ClientInfo& aClientInfo) {
+  MOZ_ASSERT(!mFetchCalled);
+  mClientInfo.emplace(aClientInfo);
+}
+
+void FetchDriver::SetController(
+    const Maybe<ServiceWorkerDescriptor>& aController) {
+  MOZ_ASSERT(!mFetchCalled);
+  mController = aController;
+}
+
+UniquePtr<PerformanceTimingData> FetchDriver::GetPerformanceTimingData(
+    nsAString& aInitiatorType, nsAString& aEntryName) {
+  MOZ_ASSERT(XRE_IsParentProcess());
+  if (!mChannel) {
+    return nullptr;
+  }
+
+  nsCOMPtr<nsITimedChannel> timedChannel = do_QueryInterface(mChannel);
+  if (!timedChannel) {
+    return nullptr;
+  }
+  nsCOMPtr<nsIHttpChannel> httpChannel = do_QueryInterface(mChannel);
+  if (!httpChannel) {
+    return nullptr;
+  }
+  return dom::PerformanceTimingData::Create(timedChannel, httpChannel, 0,
+                                            aInitiatorType, aEntryName);
+}
+
+void FetchDriver::SetRequestHeaders(nsIHttpChannel* aChannel,
+                                    bool aStripRequestBodyHeader,
+                                    bool aStripAuthHeader) const {
+  MOZ_ASSERT(aChannel);
+
+  nsTArray<nsCString> headersSet;
+
+  AutoTArray<InternalHeaders::Entry, 5> headers;
+  mRequest->Headers()->GetEntries(headers);
+  for (uint32_t i = 0; i < headers.Length(); ++i) {
+    if (aStripRequestBodyHeader &&
+        (headers[i].mName.LowerCaseEqualsASCII("content-type") ||
+         headers[i].mName.LowerCaseEqualsASCII("content-encoding") ||
+         headers[i].mName.LowerCaseEqualsASCII("content-language") ||
+         headers[i].mName.LowerCaseEqualsASCII("content-location"))) {
+      continue;
+    }
+
+    if (aStripAuthHeader &&
+        headers[i].mName.LowerCaseEqualsASCII("authorization")) {
+      continue;
+    }
+
+    bool alreadySet = headersSet.Contains(headers[i].mName);
+    if (!alreadySet) {
+      headersSet.AppendElement(headers[i].mName);
+    }
+
+    if (headers[i].mValue.IsEmpty()) {
+      DebugOnly<nsresult> rv =
+          aChannel->SetEmptyRequestHeader(headers[i].mName);
+      MOZ_ASSERT(NS_SUCCEEDED(rv));
+    } else {
+      DebugOnly<nsresult> rv = aChannel->SetRequestHeader(
+          headers[i].mName, headers[i].mValue, alreadySet );
+      MOZ_ASSERT(NS_SUCCEEDED(rv));
+    }
+  }
+}
+
+void FetchDriver::RunAbortAlgorithm() { FetchDriverAbortActions(Signal()); }
+
+void FetchDriver::FetchDriverAbortActions(AbortSignalImpl* aSignalImpl) {
+  MOZ_DIAGNOSTIC_ASSERT(NS_IsMainThread());
+  RefPtr<FetchDriverObserver> observer;
+  {
+    MutexAutoLock lock(mODAMutex);
+    observer = std::move(mObserver);
+  }
+
+  if (observer) {
+#ifdef DEBUG
+    mResponseAvailableCalled = true;
+#endif
+    JS::Rooted<JS::Value> reason(RootingCx());
+    if (aSignalImpl) {
+      reason.set(aSignalImpl->RawReason());
+    }
+    observer->OnResponseEnd(FetchDriverObserver::eAborted, reason);
+  }
+
+  if (mChannel) {
+    mChannel->CancelWithReason(NS_BINDING_ABORTED,
+                               "FetchDriver::RunAbortAlgorithm"_ns);
+    mChannel = nullptr;
+  }
+
+  mAborted = true;
+}
+
+}  

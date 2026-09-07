@@ -1,0 +1,162 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "jit/BaselineFrame-inl.h"
+
+#include <algorithm>
+
+#include "debugger/DebugAPI.h"
+#include "vm/EnvironmentObject.h"
+#include "vm/JSContext.h"
+
+#include "jit/JSJitFrameIter-inl.h"
+#include "vm/Stack-inl.h"
+
+using namespace js;
+using namespace js::jit;
+
+static void TraceLocals(BaselineFrame* frame, JSTracer* trc, unsigned start,
+                        unsigned end) {
+  if (start < end) {
+    Value* last = frame->valueSlot(end - 1);
+    TraceRootRange(trc, end - start, last, "baseline-stack");
+  }
+}
+
+void BaselineFrame::trace(JSTracer* trc, const JSJitFrameIter& frameIterator) {
+  replaceCalleeToken(TraceCalleeToken(trc, calleeToken()));
+
+  if (isFunctionFrame()) {
+    TraceRoot(trc, &thisArgument(), "baseline-this");
+
+    unsigned numArgs = std::max(numActualArgs(), numFormalArgs());
+    TraceRootRange(trc, numArgs + isConstructing(), argv(), "baseline-args");
+  }
+
+  if (envChain_) {
+    TraceRoot(trc, &envChain_, "baseline-envchain");
+  }
+
+  if (hasReturnValue()) {
+    TraceRoot(trc, returnValue().address(), "baseline-rval");
+  }
+
+  if (hasArgsObj()) {
+    TraceRoot(trc, &argsObj_, "baseline-args-obj");
+  }
+
+  mozilla::DebugOnly<bool> isBaselineSelfHosted =
+      this->script()->selfHosted() && !runningInInterpreter();
+  MOZ_ASSERT_IF(
+      JS::Prefs::experimental_self_hosted_cache() && isBaselineSelfHosted,
+      isRealmIndependent());
+  if (runningInInterpreter() || isRealmIndependent()) {
+    TraceRoot(trc, &interpreterScript_, "baseline-interpreterScript");
+  }
+
+  JSScript* script = this->script();
+  size_t nfixed = script->nfixed();
+  jsbytecode* pc;
+  frameIterator.baselineScriptAndPc(nullptr, &pc);
+  size_t nlivefixed = script->calculateLiveFixed(pc);
+
+  uint32_t numValueSlots = frameIterator.baselineFrameNumValueSlots();
+
+  if (numValueSlots > 0) {
+    MOZ_ASSERT(nfixed <= numValueSlots);
+
+    if (nfixed == nlivefixed) {
+      TraceLocals(this, trc, 0, numValueSlots);
+    } else {
+      TraceLocals(this, trc, nfixed, numValueSlots);
+
+      while (nfixed > nlivefixed) {
+        unaliasedLocal(--nfixed).setUndefined();
+      }
+
+      TraceLocals(this, trc, 0, nlivefixed);
+    }
+  }
+
+  if (auto* debugEnvs = script->realm()->debugEnvs()) {
+    debugEnvs->traceLiveFrame(trc, this);
+  }
+}
+
+bool BaselineFrame::uninlineIsProfilerSamplingEnabled(JSContext* cx) {
+  return cx->isProfilerSamplingEnabled();
+}
+
+bool BaselineFrame::initFunctionEnvironmentObjects(JSContext* cx) {
+  return js::InitFunctionEnvironmentObjects(cx, this);
+}
+
+bool BaselineFrame::pushVarEnvironment(JSContext* cx, Handle<Scope*> scope) {
+  return js::PushVarEnvironmentObject(cx, scope, this);
+}
+
+void BaselineFrame::setInterpreterFields(JSScript* script, jsbytecode* pc) {
+  uint32_t pcOffset = script->pcToOffset(pc);
+  interpreterScript_ = script;
+  interpreterPC_ = pc;
+  MOZ_ASSERT(icScript_);
+  interpreterICEntry_ = icScript_->interpreterICEntryFromPCOffset(pcOffset);
+}
+
+void BaselineFrame::setInterpreterFieldsForPrologue(JSScript* script) {
+  interpreterScript_ = script;
+  interpreterPC_ = script->code();
+  if (icScript_->numICEntries() > 0) {
+    interpreterICEntry_ = &icScript_->icEntry(0);
+  } else {
+    interpreterICEntry_ = nullptr;
+  }
+}
+
+void BaselineFrame::initForOsr(InterpreterFrame* fp, uint32_t numStackValues) {
+  mozilla::PodZero(this);
+
+  envChain_ = fp->environmentChain();
+
+  if (fp->hasInitialEnvironmentUnchecked()) {
+    flags_ |= BaselineFrame::HAS_INITIAL_ENV;
+  }
+
+  if (fp->script()->needsArgsObj() && fp->hasArgsObj()) {
+    flags_ |= BaselineFrame::HAS_ARGS_OBJ;
+    argsObj_ = &fp->argsObj();
+  }
+
+  if (fp->hasReturnValue()) {
+    setReturnValue(fp->returnValue());
+  }
+
+  icScript_ = fp->script()->jitScript()->icScript();
+
+  JSContext* cx =
+      fp->script()->runtimeFromMainThread()->mainContextFromOwnThread();
+
+  Activation* interpActivation = cx->activation()->prev();
+  jsbytecode* pc = interpActivation->asInterpreter()->regs().pc;
+  MOZ_ASSERT(fp->script()->containsPC(pc));
+
+  flags_ |= BaselineFrame::RUNNING_IN_INTERPRETER;
+  setInterpreterFields(pc);
+
+#ifdef DEBUG
+  debugFrameSize_ = frameSizeForNumValueSlots(numStackValues);
+  MOZ_ASSERT(debugNumValueSlots() == numStackValues);
+#endif
+
+  for (uint32_t i = 0; i < numStackValues; i++) {
+    *valueSlot(i) = fp->slots()[i];
+  }
+
+  std::fill_n(fp->slots(), numStackValues, UndefinedValue());
+
+  if (fp->isDebuggee()) {
+    DebugAPI::handleBaselineOsr(cx, fp, this);
+    setIsDebuggee();
+  }
+}

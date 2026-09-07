@@ -1,0 +1,224 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef _nsContentSink_h_
+#define _nsContentSink_h_
+
+
+#include "mozilla/Attributes.h"
+#include "mozilla/Logging.h"
+#include "mozilla/StaticPrefs_content.h"
+#include "nsCOMPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsICSSLoaderObserver.h"
+#include "nsIContentSink.h"
+#include "nsITimer.h"
+#include "nsString.h"
+#include "nsStubDocumentObserver.h"
+#include "nsThreadUtils.h"
+#include "nsWeakReference.h"
+
+class nsIURI;
+class nsIChannel;
+class nsIDocShell;
+class nsAtom;
+class nsIChannel;
+class nsIContent;
+class nsNodeInfoManager;
+
+namespace mozilla {
+namespace css {
+class Loader;
+}  
+
+namespace dom {
+class Document;
+class ScriptLoader;
+}  
+
+namespace net {
+struct LinkHeader;
+};
+}  
+
+#ifdef DEBUG
+
+extern mozilla::LazyLogModule gContentSinkLogModuleInfo;
+
+#  define SINK_TRACE_CALLS 0x1
+#  define SINK_TRACE_REFLOW 0x2
+#  define SINK_ALWAYS_REFLOW 0x4
+
+#  define SINK_LOG_TEST(_lm, _bit) (int((_lm)->Level()) & (_bit))
+
+#  define SINK_TRACE(_lm, _bit, _args) \
+    do {                               \
+      if (SINK_LOG_TEST(_lm, _bit)) {  \
+        printf_stderr _args;           \
+      }                                \
+    } while (0)
+
+#else
+#  define SINK_TRACE(_lm, _bit, _args)
+#endif
+
+#undef SINK_NO_INCREMENTAL
+
+
+class nsContentSink : public nsICSSLoaderObserver,
+                      public nsSupportsWeakReference,
+                      public nsStubDocumentObserver,
+                      public nsITimerCallback,
+                      public nsINamed {
+ protected:
+  using Document = mozilla::dom::Document;
+
+ private:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(nsContentSink, nsICSSLoaderObserver)
+  NS_DECL_NSITIMERCALLBACK
+
+  NS_DECL_NSINAMED
+
+  NS_IMETHOD StyleSheetLoaded(mozilla::StyleSheet* aSheet, bool aWasDeferred,
+                              nsresult aStatus) override;
+
+  nsresult WillParseImpl(void);
+  nsresult WillInterruptImpl(void);
+  void WillResumeImpl();
+  nsresult DidProcessATokenImpl(void);
+  void WillBuildModelImpl(void);
+  void DidBuildModelImpl(bool aTerminated);
+  void DropParserAndPerfHint(void);
+  bool IsScriptExecutingImpl();
+  void ContinueParsingDocumentAfterCurrentScriptImpl();
+
+  void NotifyAppend(nsIContent* aContent, uint32_t aStartIndex);
+
+  NS_DECL_NSIDOCUMENTOBSERVER_BEGINUPDATE
+  NS_DECL_NSIDOCUMENTOBSERVER_ENDUPDATE
+
+  virtual void UpdateChildCounts() = 0;
+
+  bool IsTimeToNotify();
+
+ protected:
+  nsContentSink();
+  virtual ~nsContentSink();
+
+  nsresult Init(Document* aDoc, nsIURI* aURI, nsISupports* aContainer,
+                nsIChannel* aChannel);
+
+  nsresult ProcessHTTPHeaders(nsIChannel* aChannel);
+  nsresult ProcessLinkFromHeader(const mozilla::net::LinkHeader& aHeader,
+                                 uint64_t aEarlyHintPreloaderId);
+
+  virtual nsresult ProcessStyleLinkFromHeader(
+      const nsAString& aHref, bool aAlternate, const nsAString& aTitle,
+      const nsAString& aIntegrity, const nsAString& aType,
+      const nsAString& aMedia, const nsAString& aReferrerPolicy,
+      const nsAString& aFetchPriority);
+
+  void PrefetchHref(const nsAString& aHref, const nsAString& aAs,
+                    const nsAString& aType, const nsAString& aMedia);
+  void PreloadHref(const nsAString& aHref, const nsAString& aAs,
+                   const nsAString& aRel, const nsAString& aType,
+                   const nsAString& aMedia, const nsAString& aNonce,
+                   const nsAString& aIntegrity, const nsAString& aSrcset,
+                   const nsAString& aSizes, const nsAString& aCORS,
+                   const nsAString& aReferrerPolicy,
+                   uint64_t aEarlyHintPreloaderId,
+                   const nsAString& aFetchPriority);
+
+  void PreloadModule(const nsAString& aHref, const nsAString& aAs,
+                     const nsAString& aMedia, const nsAString& aNonce,
+                     const nsAString& aIntegrity, const nsAString& aCORS,
+                     const nsAString& aReferrerPolicy,
+                     uint64_t aEarlyHintPreloaderId,
+                     const nsAString& aFetchPriority);
+
+  void PrefetchDNS(const nsAString& aHref);
+
+  nsresult GetChannelCacheKey(nsIChannel* aChannel, nsACString& aCacheKey);
+
+ public:
+  void Preconnect(const nsAString& aHref, const nsAString& aCrossOrigin);
+
+ protected:
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void ScrollToRef();
+
+ public:
+  void StartLayout(bool aIgnorePendingSheets);
+
+  static void NotifyDocElementCreated(Document* aDoc);
+
+  Document* GetDocument() { return mDocument; }
+
+  bool WaitForPendingSheets() { return mPendingSheetCount > 0; }
+
+ protected:
+  inline int32_t GetNotificationInterval() {
+    if (mDynamicLowerValue) {
+      return 1000;
+    }
+
+    return mozilla::StaticPrefs::content_notify_interval();
+  }
+
+  virtual nsresult FlushTags() = 0;
+
+  void DoProcessLinkHeader();
+
+  void StopDeflecting() {
+    mDeflectedCount = mozilla::StaticPrefs::content_sink_perf_deflect_count();
+  }
+
+ protected:
+  RefPtr<Document> mDocument;
+  RefPtr<nsParserBase> mParser;
+  nsCOMPtr<nsIURI> mDocumentURI;
+  nsCOMPtr<nsIDocShell> mDocShell;
+  RefPtr<nsNodeInfoManager> mNodeInfoManager;
+  RefPtr<mozilla::dom::ScriptLoader> mScriptLoader;
+
+  int32_t mBackoffCount;
+
+  PRTime mLastNotificationTime;
+
+  nsCOMPtr<nsITimer> mNotificationTimer;
+
+  uint8_t mLayoutStarted : 1;
+  uint8_t mDynamicLowerValue : 1;
+  uint8_t mParsing : 1;
+  uint8_t mDroppedTimer : 1;
+  uint8_t mDeferredLayoutStart : 1;
+  uint8_t mDeferredFlushTags : 1;
+  uint8_t mIsDocumentObserver : 1;
+  uint8_t mRunsToCompletion : 1;
+  bool mIsBlockingOnload : 1;
+
+
+  uint32_t mDeflectedCount;
+
+  bool mHasPendingEvent;
+
+  uint32_t mCurrentParseEndTime;
+
+  int32_t mBeginLoadTime;
+
+  uint32_t mLastSampledUserEventTime;
+
+  int32_t mInMonolithicContainer;
+
+  int32_t mInNotification;
+  uint32_t mUpdatesInNotification;
+
+  uint32_t mPendingSheetCount;
+
+  nsRevocableEventPtr<nsRunnableMethod<nsContentSink, void, false> >
+      mProcessLinkHeaderEvent;
+};
+
+#endif  // _nsContentSink_h_

@@ -1,0 +1,111 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_FileSystemTaskBase_h
+#define mozilla_dom_FileSystemTaskBase_h
+
+#include "mozilla/dom/FileSystemRequestParent.h"
+#include "mozilla/dom/PFileSystemRequestChild.h"
+#include "nsIGlobalObject.h"
+#include "nsThreadUtils.h"
+
+namespace mozilla {
+class ErrorResult;
+
+namespace dom {
+
+class BlobImpl;
+class FileSystemBase;
+class FileSystemParams;
+
+class FileSystemTaskChildBase : public PFileSystemRequestChild {
+  friend class PFileSystemRequestChild;
+
+ public:
+  NS_INLINE_DECL_REFCOUNTING(FileSystemTaskChildBase, final)
+
+  void Start();
+
+  void SetError(const nsresult& aErrorCode);
+
+  FileSystemBase* GetFileSystem() const;
+
+  virtual void HandlerCallback() = 0;
+
+  bool HasError() const { return NS_FAILED(mErrorValue); }
+
+ protected:
+  FileSystemTaskChildBase(nsIGlobalObject* aGlobalObject,
+                          FileSystemBase* aFileSystem);
+
+  virtual ~FileSystemTaskChildBase();
+
+  virtual FileSystemParams GetRequestParams(const nsString& aSerializedDOMPath,
+                                            ErrorResult& aRv) const = 0;
+
+  virtual void SetSuccessRequestResult(const FileSystemResponseValue& aValue,
+                                       ErrorResult& aRv) = 0;
+
+  virtual mozilla::ipc::IPCResult Recv__delete__(
+      const FileSystemResponseValue& value) final;
+
+  nsresult mErrorValue;
+  RefPtr<FileSystemBase> mFileSystem;
+  nsCOMPtr<nsIGlobalObject> mGlobalObject;
+
+ private:
+  void SetRequestResult(const FileSystemResponseValue& aValue);
+};
+
+class FileSystemTaskParentBase : public Runnable {
+ public:
+  FileSystemTaskParentBase()
+      : Runnable("FileSystemTaskParentBase"),
+        mErrorValue(NS_ERROR_NOT_INITIALIZED) {}
+
+  void Start();
+
+  void SetError(const nsresult& aErrorCode);
+
+  virtual nsresult IOWork() = 0;
+
+  virtual nsresult MainThreadWork() {
+    MOZ_CRASH("This method should be implemented");
+    return NS_OK;
+  }
+
+  virtual bool MainThreadNeeded() const { return false; };
+
+  virtual FileSystemResponseValue GetSuccessRequestResult(
+      ErrorResult& aRv) const = 0;
+
+  void HandleResult();
+
+  bool HasError() const { return NS_FAILED(mErrorValue); }
+
+  NS_IMETHOD
+  Run() override;
+
+  virtual nsresult GetTargetPath(nsAString& aPath) const = 0;
+
+ private:
+  FileSystemResponseValue GetRequestResult() const;
+
+ protected:
+  FileSystemTaskParentBase(FileSystemBase* aFileSystem,
+                           const FileSystemParams& aParam,
+                           FileSystemRequestParent* aParent);
+
+  virtual ~FileSystemTaskParentBase();
+
+  nsresult mErrorValue;
+  RefPtr<FileSystemBase> mFileSystem;
+  RefPtr<FileSystemRequestParent> mRequestParent;
+  nsCOMPtr<nsIEventTarget> mBackgroundEventTarget;
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_FileSystemTaskBase_h

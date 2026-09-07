@@ -1,0 +1,231 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "Cookie.h"
+#include "CookieCommons.h"
+#include "mozilla/HashFunctions.h"
+#include "CookieStorage.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/Encoding.h"
+#include "mozilla/dom/ToJSValue.h"
+#include "mozilla/StaticPrefs_network.h"
+#include "nsIURLParser.h"
+#include "nsURLHelper.h"
+#include <cstdlib>
+
+namespace mozilla {
+namespace net {
+
+
+static Atomic<int64_t, SequentiallyConsistent> gLastCreationTimeInUSec;
+
+uint32_t Cookie::ComputeKeyHash(const nsACString& aName,
+                                const nsACString& aHost,
+                                const nsACString& aPath) {
+  return mozilla::AddToHash(mozilla::AddToHash(mozilla::HashString(aName),
+                                               mozilla::HashString(aHost)),
+                            mozilla::HashString(aPath));
+}
+
+Cookie::Cookie(const CookieStruct& aCookieData,
+               const OriginAttributes& aOriginAttributes)
+    : mData(aCookieData),
+      mOriginAttributes(aOriginAttributes),
+      mKeyHash(ComputeKeyHash(aCookieData.name(), aCookieData.host(),
+                              aCookieData.path())) {}
+
+int64_t Cookie::GenerateUniqueCreationTimeInUSec(int64_t aCreationTimeInUSec) {
+  int64_t old = gLastCreationTimeInUSec;
+  while (true) {
+    int64_t desired =
+        (aCreationTimeInUSec > old) ? aCreationTimeInUSec : old + 1;
+    if (gLastCreationTimeInUSec.compareExchange(old, desired)) {
+      return desired;
+    }
+    old = gLastCreationTimeInUSec;
+  }
+}
+
+already_AddRefed<Cookie> Cookie::Create(
+    const CookieStruct& aCookieData,
+    const OriginAttributes& aOriginAttributes) {
+  RefPtr<Cookie> cookie =
+      Cookie::FromCookieStruct(aCookieData, aOriginAttributes);
+
+  int64_t creation = cookie->mData.creationTimeInUSec();
+  int64_t old = gLastCreationTimeInUSec;
+  while (creation > old) {
+    if (gLastCreationTimeInUSec.compareExchange(old, creation)) break;
+    old = gLastCreationTimeInUSec;
+  }
+
+  return cookie.forget();
+}
+
+already_AddRefed<Cookie> Cookie::FromCookieStruct(
+    const CookieStruct& aCookieData,
+    const OriginAttributes& aOriginAttributes) {
+  RefPtr<Cookie> cookie = new Cookie(aCookieData, aOriginAttributes);
+
+  UTF_8_ENCODING->DecodeWithoutBOMHandling(aCookieData.value(),
+                                           cookie->mData.value());
+
+  if (cookie->mData.sameSite() != nsICookie::SAMESITE_NONE &&
+      cookie->mData.sameSite() != nsICookie::SAMESITE_LAX &&
+      cookie->mData.sameSite() != nsICookie::SAMESITE_STRICT &&
+      cookie->mData.sameSite() != nsICookie::SAMESITE_UNSET) {
+    cookie->mData.sameSite() = nsICookie::SAMESITE_UNSET;
+  }
+
+  if (CookieCommons::ShouldEnforceSessionForOriginAttributes(
+          aOriginAttributes)) {
+    cookie->mData.isSession() = true;
+  }
+
+  return cookie.forget();
+}
+
+already_AddRefed<Cookie> Cookie::CreateValidated(
+    const CookieStruct& aCookieData,
+    const OriginAttributes& aOriginAttributes) {
+  if (!StaticPrefs::network_cookie_fixup_on_db_load()) {
+    return Cookie::Create(aCookieData, aOriginAttributes);
+  }
+
+  RefPtr<Cookie> cookie =
+      Cookie::FromCookieStruct(aCookieData, aOriginAttributes);
+
+  int64_t currentTimeInUsec = PR_Now();
+  MOZ_ASSERT(gLastCreationTimeInUSec < currentTimeInUsec + 10000,
+             "Last creation time must not be higher than NOW");
+
+  if (cookie->mData.creationTimeInUSec() > currentTimeInUsec) {
+    cookie->mData.creationTimeInUSec() =
+        GenerateUniqueCreationTimeInUSec(currentTimeInUsec);
+  }
+
+  if (cookie->mData.lastAccessedInUSec() > currentTimeInUsec) {
+    cookie->mData.lastAccessedInUSec() = currentTimeInUsec;
+  }
+
+  if (cookie->mData.updateTimeInUSec() > currentTimeInUsec) {
+    cookie->mData.updateTimeInUSec() = currentTimeInUsec;
+  }
+
+  return cookie.forget();
+}
+
+size_t Cookie::SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const {
+  return aMallocSizeOf(this) +
+         mData.name().SizeOfExcludingThisIfUnshared(MallocSizeOf) +
+         mData.value().SizeOfExcludingThisIfUnshared(MallocSizeOf) +
+         mData.host().SizeOfExcludingThisIfUnshared(MallocSizeOf) +
+         mData.path().SizeOfExcludingThisIfUnshared(MallocSizeOf);
+}
+
+bool Cookie::IsStale() const {
+  int64_t currentTimeInUsec = PR_Now();
+
+  return currentTimeInUsec - LastAccessedInUSec() >
+         StaticPrefs::network_cookie_staleThreshold() * PR_USEC_PER_SEC;
+}
+
+
+NS_IMETHODIMP Cookie::GetName(nsACString& aName) {
+  aName = Name();
+  return NS_OK;
+}
+NS_IMETHODIMP Cookie::GetValue(nsACString& aValue) {
+  aValue = Value();
+  return NS_OK;
+}
+NS_IMETHODIMP Cookie::GetHost(nsACString& aHost) {
+  aHost = Host();
+  return NS_OK;
+}
+NS_IMETHODIMP Cookie::GetRawHost(nsACString& aHost) {
+  aHost = RawHost();
+  return NS_OK;
+}
+NS_IMETHODIMP Cookie::GetPath(nsACString& aPath) {
+  aPath = Path();
+  return NS_OK;
+}
+NS_IMETHODIMP Cookie::GetExpiry(int64_t* aExpiry) {
+  *aExpiry = ExpiryInMSec();
+  return NS_OK;
+}
+NS_IMETHODIMP Cookie::GetIsSession(bool* aIsSession) {
+  *aIsSession = IsSession();
+  return NS_OK;
+}
+NS_IMETHODIMP Cookie::GetIsDomain(bool* aIsDomain) {
+  *aIsDomain = IsDomain();
+  return NS_OK;
+}
+NS_IMETHODIMP Cookie::GetIsSecure(bool* aIsSecure) {
+  *aIsSecure = IsSecure();
+  return NS_OK;
+}
+NS_IMETHODIMP Cookie::GetIsHttpOnly(bool* aHttpOnly) {
+  *aHttpOnly = IsHttpOnly();
+  return NS_OK;
+}
+NS_IMETHODIMP Cookie::GetIsPartitioned(bool* aPartitioned) {
+  *aPartitioned = IsPartitioned();
+  return NS_OK;
+}
+NS_IMETHODIMP Cookie::GetCreationTime(int64_t* aCreation) {
+  *aCreation = CreationTimeInUSec();
+  return NS_OK;
+}
+NS_IMETHODIMP Cookie::GetLastAccessed(int64_t* aTime) {
+  *aTime = LastAccessedInUSec();
+  return NS_OK;
+}
+NS_IMETHODIMP Cookie::GetUpdateTime(int64_t* aTime) {
+  *aTime = UpdateTimeInUSec();
+  return NS_OK;
+}
+NS_IMETHODIMP Cookie::GetSameSite(int32_t* aSameSite) {
+  *aSameSite = SameSite();
+  return NS_OK;
+}
+NS_IMETHODIMP Cookie::GetSchemeMap(nsICookie::schemeType* aSchemeMap) {
+  *aSchemeMap = static_cast<nsICookie::schemeType>(SchemeMap());
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+Cookie::GetOriginAttributes(JSContext* aCx, JS::MutableHandle<JS::Value> aVal) {
+  if (NS_WARN_IF(!ToJSValue(aCx, mOriginAttributes, aVal))) {
+    return NS_ERROR_FAILURE;
+  }
+  return NS_OK;
+}
+
+const OriginAttributes& Cookie::OriginAttributesNative() {
+  return mOriginAttributes;
+}
+
+const Cookie& Cookie::AsCookie() { return *this; }
+
+NS_IMETHODIMP
+Cookie::GetExpires(uint64_t* aExpires) {
+  if (IsSession()) {
+    *aExpires = 0;
+  } else {
+    *aExpires = ExpiryInMSec() > 0 ? ExpiryInMSec() : 1;
+  }
+  return NS_OK;
+}
+
+already_AddRefed<Cookie> Cookie::Clone() const {
+  return Create(mData, OriginAttributesRef());
+}
+
+NS_IMPL_ISUPPORTS(Cookie, nsICookie)
+
+}  
+}  

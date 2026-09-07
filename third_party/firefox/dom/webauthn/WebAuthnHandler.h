@@ -1,0 +1,116 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_WebAuthnHandler_h
+#define mozilla_dom_WebAuthnHandler_h
+
+#include "mozilla/Maybe.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/dom/AbortSignal.h"
+#include "mozilla/dom/PWebAuthnTransaction.h"
+#include "mozilla/dom/PWebAuthnTransactionChild.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/WebAuthnTransactionChild.h"
+
+
+namespace mozilla::dom {
+
+class Credential;
+class PublicKeyCredential;
+struct PublicKeyCredentialCreationOptions;
+struct PublicKeyCredentialRequestOptions;
+
+enum class WebAuthnTransactionType { Create, Get };
+
+class WebAuthnTransaction {
+ public:
+  explicit WebAuthnTransaction(const RefPtr<Promise>& aPromise,
+                               WebAuthnTransactionType aType)
+      : mPromise(aPromise), mType(aType) {}
+
+  RefPtr<Promise> mPromise;
+
+  WebAuthnTransactionType mType;
+
+  MozPromiseRequestHolder<PWebAuthnTransactionChild::RequestRegisterPromise>
+      mRegisterHolder;
+  MozPromiseRequestHolder<PWebAuthnTransactionChild::RequestSignPromise>
+      mSignHolder;
+};
+
+class WebAuthnHandler final : public AbortFollower {
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_CLASS(WebAuthnHandler)
+
+  explicit WebAuthnHandler(nsPIDOMWindowInner* aWindow) : mWindow(aWindow) {
+    MOZ_ASSERT(NS_IsMainThread());
+    MOZ_ASSERT(aWindow);
+  }
+
+  void MakeCredential(JSContext* aCx,
+                      const PublicKeyCredentialCreationOptions& aOptions,
+                      const Optional<OwningNonNull<AbortSignal>>& aSignal,
+                      const RefPtr<Promise>& aPromise);
+
+  void GetAssertion(JSContext* aCx,
+                    const PublicKeyCredentialRequestOptions& aOptions,
+                    const bool aConditionallyMediated,
+                    const Optional<OwningNonNull<AbortSignal>>& aSignal,
+                    const RefPtr<Promise>& aPromise);
+
+  void Store(const Credential& aCredential, const RefPtr<Promise>& aPromise);
+
+  void IsUVPAA(const RefPtr<Promise>& aPromise);
+
+  void ActorDestroyed();
+
+  void RunAbortAlgorithm() override;
+
+ private:
+  virtual ~WebAuthnHandler();
+
+  bool MaybeCreateActor();
+
+  void FinishMakeCredential(const WebAuthnMakeCredentialResult& aResult);
+
+  void FinishGetAssertion(const WebAuthnGetAssertionResult& aResult);
+
+  template <typename T>
+  void CancelTransaction(const T& aReason) {
+    MOZ_ASSERT(mActor);
+    MOZ_ASSERT(mTransaction.isSome());
+
+    mTransaction.ref().mRegisterHolder.DisconnectIfExists();
+    mTransaction.ref().mSignHolder.DisconnectIfExists();
+
+    mActor->SendRequestCancel();
+    RejectTransaction(aReason);
+  }
+
+  void ResolveTransaction(const RefPtr<PublicKeyCredential>& aCredential);
+
+  template <typename T>
+  void RejectTransaction(const T& aReason);
+
+  nsCOMPtr<nsPIDOMWindowInner> mWindow;
+
+  RefPtr<WebAuthnTransactionChild> mActor;
+
+  Maybe<WebAuthnTransaction> mTransaction;
+};
+
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback,
+    WebAuthnTransaction& aTransaction, const char* aName, uint32_t aFlags = 0) {
+  ImplCycleCollectionTraverse(aCallback, aTransaction.mPromise, aName, aFlags);
+}
+
+inline void ImplCycleCollectionUnlink(WebAuthnTransaction& aTransaction) {
+  ImplCycleCollectionUnlink(aTransaction.mPromise);
+}
+
+}  
+
+#endif  // mozilla_dom_WebAuthnHandler_h

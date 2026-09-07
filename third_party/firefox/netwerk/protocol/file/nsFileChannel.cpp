@@ -1,0 +1,531 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsIOService.h"
+#include "nsFileChannel.h"
+#include "nsBaseContentStream.h"
+#include "nsDirectoryIndexStream.h"
+#include "nsThreadUtils.h"
+#include "nsTransportUtils.h"
+#include "nsStreamUtils.h"
+#include "nsMimeTypes.h"
+#include "nsNetUtil.h"
+#include "nsNetCID.h"
+#include "nsIOutputStream.h"
+#include "nsIFileStreams.h"
+#include "nsFileProtocolHandler.h"
+#include "nsProxyRelease.h"
+#include "nsIContentPolicy.h"
+#include "nsContentUtils.h"
+#include "mozilla/dom/ContentParent.h"
+#include "mozilla/net/NeckoChild.h"
+#include "../protocol/http/nsHttpHandler.h"
+
+#include "nsIFileURL.h"
+#include "nsIURIMutator.h"
+#include "nsIFile.h"
+#include "nsIMIMEService.h"
+#include "nsStringStream.h"
+#include "prio.h"
+#include <algorithm>
+
+
+#include "mozilla/Components.h"
+#include "mozilla/TaskQueue.h"
+
+using namespace mozilla;
+using namespace mozilla::net;
+
+
+class nsFileCopyEvent : public Runnable {
+ public:
+  nsFileCopyEvent(nsIOutputStream* dest, nsIInputStream* source, int64_t len)
+      : mozilla::Runnable("nsFileCopyEvent"),
+        mDest(dest),
+        mSource(source),
+        mLen(len),
+        mStatus(NS_OK),
+        mInterruptStatus(NS_OK) {}
+
+  nsresult Status() { return mStatus; }
+
+  void DoCopy();
+
+  nsresult Dispatch(nsIRunnable* callback, nsITransportEventSink* sink,
+                    nsIEventTarget* target);
+
+  void Interrupt(nsresult status) {
+    NS_ASSERTION(NS_FAILED(status), "must be a failure code");
+    mInterruptStatus = status;
+  }
+
+  NS_IMETHOD Run() override {
+    DoCopy();
+    return NS_OK;
+  }
+
+ private:
+  nsCOMPtr<nsIEventTarget> mCallbackTarget;
+  nsCOMPtr<nsIRunnable> mCallback;
+  nsCOMPtr<nsITransportEventSink> mSink;
+  nsCOMPtr<nsIOutputStream> mDest;
+  nsCOMPtr<nsIInputStream> mSource;
+  int64_t mLen;
+  nsresult mStatus;           
+  nsresult mInterruptStatus;  
+};
+
+void nsFileCopyEvent::DoCopy() {
+  const int32_t chunk =
+      nsIOService::gDefaultSegmentSize * nsIOService::gDefaultSegmentCount;
+
+  nsresult rv = NS_OK;
+
+  int64_t len = mLen, progress = 0;
+  while (len) {
+    rv = mInterruptStatus;
+    if (NS_FAILED(rv)) break;
+
+    int32_t num = std::min((int32_t)len, chunk);
+
+    uint32_t result;
+    rv = mSource->ReadSegments(NS_CopySegmentToStream, mDest, num, &result);
+    if (NS_FAILED(rv)) break;
+    if (result != (uint32_t)num) {
+      rv = NS_ERROR_FILE_NO_DEVICE_SPACE;
+      break;
+    }
+
+    if (mSink) {
+      progress += num;
+      mSink->OnTransportStatus(nullptr, NS_NET_STATUS_WRITING, progress, mLen);
+    }
+
+    len -= num;
+  }
+
+  if (NS_FAILED(rv)) mStatus = rv;
+
+  mDest->Close();
+
+  if (mCallback) {
+    mCallbackTarget->Dispatch(mCallback, NS_DISPATCH_NORMAL);
+
+    NS_ProxyRelease("nsFileCopyEvent::mCallback", mCallbackTarget,
+                    mCallback.forget());
+  }
+}
+
+nsresult nsFileCopyEvent::Dispatch(nsIRunnable* callback,
+                                   nsITransportEventSink* sink,
+                                   nsIEventTarget* target) {
+
+  mCallback = callback;
+  mCallbackTarget = target;
+
+  nsresult rv =
+      net_NewTransportEventSinkProxy(getter_AddRefs(mSink), sink, target);
+
+  if (NS_FAILED(rv)) return rv;
+
+  nsCOMPtr<nsIEventTarget> pool;
+  pool = mozilla::components::StreamTransport::Service(&rv);
+  if (NS_FAILED(rv)) return rv;
+
+  return pool->Dispatch(this, NS_DISPATCH_NORMAL);
+}
+
+
+
+class nsFileUploadContentStream : public nsBaseContentStream {
+ public:
+  NS_INLINE_DECL_REFCOUNTING_INHERITED(nsFileUploadContentStream,
+                                       nsBaseContentStream)
+
+  nsFileUploadContentStream(bool nonBlocking, nsIOutputStream* dest,
+                            nsIInputStream* source, int64_t len,
+                            nsITransportEventSink* sink)
+      : nsBaseContentStream(nonBlocking),
+        mCopyEvent(new nsFileCopyEvent(dest, source, len)),
+        mSink(sink) {}
+
+  bool IsInitialized() { return mCopyEvent != nullptr; }
+
+  NS_IMETHOD ReadSegments(nsWriteSegmentFun fun, void* closure, uint32_t count,
+                          uint32_t* result) override;
+  NS_IMETHOD AsyncWait(nsIInputStreamCallback* callback, uint32_t flags,
+                       uint32_t count, nsIEventTarget* target) override;
+
+ private:
+  virtual ~nsFileUploadContentStream() = default;
+
+  void OnCopyComplete();
+
+  RefPtr<nsFileCopyEvent> mCopyEvent;
+  nsCOMPtr<nsITransportEventSink> mSink;
+};
+
+NS_IMETHODIMP
+nsFileUploadContentStream::ReadSegments(nsWriteSegmentFun fun, void* closure,
+                                        uint32_t count, uint32_t* result) {
+  *result = 0;  
+
+  if (IsClosed()) return NS_OK;
+
+  if (IsNonBlocking()) {
+    return NS_BASE_STREAM_WOULD_BLOCK;
+  }
+
+  mCopyEvent->DoCopy();
+  nsresult status = mCopyEvent->Status();
+  CloseWithStatus(NS_FAILED(status) ? status : NS_BASE_STREAM_CLOSED);
+  return status;
+}
+
+NS_IMETHODIMP
+nsFileUploadContentStream::AsyncWait(nsIInputStreamCallback* callback,
+                                     uint32_t flags, uint32_t count,
+                                     nsIEventTarget* target) {
+  nsresult rv = nsBaseContentStream::AsyncWait(callback, flags, count, target);
+  if (NS_FAILED(rv) || IsClosed()) return rv;
+
+  if (IsNonBlocking()) {
+    nsCOMPtr<nsIRunnable> callback =
+        NewRunnableMethod("nsFileUploadContentStream::OnCopyComplete", this,
+                          &nsFileUploadContentStream::OnCopyComplete);
+    mCopyEvent->Dispatch(callback, mSink, target);
+  }
+
+  return NS_OK;
+}
+
+void nsFileUploadContentStream::OnCopyComplete() {
+  nsresult status = mCopyEvent->Status();
+
+  CloseWithStatus(NS_FAILED(status) ? status : NS_BASE_STREAM_CLOSED);
+}
+
+
+nsFileChannel::nsFileChannel(nsIURI* uri) : mUploadLength(0), mFileURI(uri) {}
+
+nsresult nsFileChannel::Init() {
+  NS_ENSURE_STATE(mLoadInfo);
+
+  RefPtr<nsHttpHandler> handler = nsHttpHandler::GetInstance();
+  mChannelId = handler->NewChannelId();
+
+  nsCOMPtr<nsIFile> file;
+  nsCOMPtr<nsIURI> targetURI;
+  AutoPathString fileTarget;
+  nsCOMPtr<nsIFile> resolvedFile;
+  bool symLink;
+  nsCOMPtr<nsIFileURL> fileURL = do_QueryInterface(mFileURI);
+  if (fileURL && NS_SUCCEEDED(fileURL->GetFile(getter_AddRefs(file))) &&
+      NS_SUCCEEDED(file->IsSymlink(&symLink)) && symLink &&
+      NS_SUCCEEDED(file->GetNativeTarget(fileTarget)) &&
+      NS_SUCCEEDED(NS_NewPathStringLocalFile(fileTarget,
+                                             getter_AddRefs(resolvedFile))) &&
+      NS_SUCCEEDED(
+          NS_NewFileURI(getter_AddRefs(targetURI), resolvedFile, nullptr))) {
+    nsCOMPtr<nsIURL> origURL = do_QueryInterface(mFileURI);
+    nsCOMPtr<nsIURL> targetURL = do_QueryInterface(targetURI);
+    nsAutoCString queryString;
+    if (origURL && targetURL && NS_SUCCEEDED(origURL->GetQuery(queryString))) {
+      (void)NS_MutateURI(targetURI).SetQuery(queryString).Finalize(targetURI);
+    }
+
+    SetURI(targetURI);
+    SetOriginalURI(mFileURI);
+    mLoadInfo->SetResultPrincipalURI(targetURI);
+  } else {
+    SetURI(mFileURI);
+  }
+
+  return NS_OK;
+}
+
+nsresult nsFileChannel::MakeFileInputStream(nsIFile* file,
+                                            nsCOMPtr<nsIInputStream>& stream,
+                                            nsCString& contentType,
+                                            bool async) {
+  bool isDir;
+  nsresult rv = file->IsDirectory(&isDir);
+  if (NS_FAILED(rv)) {
+    if (rv == NS_ERROR_FILE_NOT_FOUND) {
+      CheckForBrokenChromeURL(mLoadInfo, OriginalURI());
+    }
+
+    if (async && (NS_ERROR_FILE_NOT_FOUND == rv)) {
+      isDir = false;
+    } else {
+      return rv;
+    }
+  }
+
+  if (isDir) {
+    rv = nsDirectoryIndexStream::Create(file, getter_AddRefs(stream));
+    if (NS_SUCCEEDED(rv) && !HasContentTypeHint()) {
+      contentType.AssignLiteral(APPLICATION_HTTP_INDEX_FORMAT);
+    }
+  } else {
+    rv = NS_NewLocalFileInputStream(getter_AddRefs(stream), file, -1, -1,
+                                    async ? nsIFileInputStream::DEFER_OPEN : 0);
+    if (NS_SUCCEEDED(rv) && !HasContentTypeHint()) {
+      nsCOMPtr<nsIMIMEService> mime = do_GetService("@mozilla.org/mime;1", &rv);
+      if (NS_SUCCEEDED(rv)) {
+        mime->GetTypeFromFile(file, contentType);
+      }
+    }
+  }
+  return rv;
+}
+
+
+nsresult nsFileChannel::OpenContentStream(bool async, nsIInputStream** result,
+                                          nsIChannel** channel) {
+
+  nsCOMPtr<nsIFile> file;
+  nsresult rv = GetFile(getter_AddRefs(file));
+  if (NS_FAILED(rv)) return rv;
+
+  nsCOMPtr<nsIFileProtocolHandler> fileHandler;
+  rv = NS_GetFileProtocolHandler(getter_AddRefs(fileHandler));
+  if (NS_FAILED(rv)) return rv;
+
+  nsCOMPtr<nsIURI> newURI;
+  if (NS_SUCCEEDED(fileHandler->ReadURLFile(file, getter_AddRefs(newURI))) ||
+      NS_SUCCEEDED(fileHandler->ReadShellLink(file, getter_AddRefs(newURI)))) {
+    nsCOMPtr<nsIChannel> newChannel;
+    rv = NS_NewChannel(getter_AddRefs(newChannel), newURI,
+                       nsContentUtils::GetSystemPrincipal(),
+                       nsILoadInfo::SEC_ALLOW_CROSS_ORIGIN_SEC_CONTEXT_IS_NULL,
+                       nsIContentPolicy::TYPE_OTHER);
+
+    if (NS_FAILED(rv)) return rv;
+
+    *result = nullptr;
+    newChannel.forget(channel);
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIInputStream> stream;
+
+  if (mUploadStream) {
+
+    nsCOMPtr<nsIOutputStream> fileStream;
+    rv = NS_NewLocalFileOutputStream(getter_AddRefs(fileStream), file,
+                                     PR_WRONLY | PR_CREATE_FILE | PR_TRUNCATE,
+                                     PR_IRUSR | PR_IWUSR);
+    if (NS_FAILED(rv)) return rv;
+
+    RefPtr<nsFileUploadContentStream> uploadStream =
+        new nsFileUploadContentStream(async, fileStream, mUploadStream,
+                                      mUploadLength, this);
+    if (!uploadStream || !uploadStream->IsInitialized()) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+    stream = std::move(uploadStream);
+
+    mContentLength = 0;
+
+    if (!HasContentTypeHint()) {
+      SetContentType(nsLiteralCString(APPLICATION_OCTET_STREAM));
+    }
+  } else {
+    nsAutoCString contentType;
+    rv = MakeFileInputStream(file, stream, contentType, async);
+    if (NS_FAILED(rv)) return rv;
+
+    EnableSynthesizedProgressEvents(true);
+
+
+    if (!async && mContentLength < 0) {
+      rv = FixupContentLength(false);
+      if (NS_FAILED(rv)) {
+        return rv;
+      }
+    }
+
+    if (!contentType.IsEmpty()) {
+      SetContentType(contentType);
+    }
+  }
+
+  MaybeSendFileOpenNotification();
+
+  *result = nullptr;
+  stream.swap(*result);
+  return NS_OK;
+}
+
+nsresult nsFileChannel::ListenerBlockingPromise(BlockingPromise** aPromise) {
+  NS_ENSURE_ARG(aPromise);
+  *aPromise = nullptr;
+
+  if (mContentLength >= 0) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIEventTarget> sts(mozilla::components::StreamTransport::Service());
+  if (!sts) {
+    return FixupContentLength(true);
+  }
+
+  RefPtr<TaskQueue> taskQueue = TaskQueue::Create(sts.forget(), "FileChannel");
+  RefPtr<nsFileChannel> self = this;
+  RefPtr<BlockingPromise> promise =
+      mozilla::InvokeAsync(taskQueue, __func__, [self{std::move(self)}]() {
+        nsresult rv = self->FixupContentLength(true);
+        if (NS_FAILED(rv)) {
+          return BlockingPromise::CreateAndReject(rv, __func__);
+        }
+        return BlockingPromise::CreateAndResolve(NS_OK, __func__);
+      });
+
+  promise.forget(aPromise);
+  return NS_OK;
+}
+
+nsresult nsFileChannel::FixupContentLength(bool async) {
+  MOZ_ASSERT(mContentLength < 0);
+
+  nsCOMPtr<nsIFile> file;
+  nsresult rv = GetFile(getter_AddRefs(file));
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  int64_t size;
+  rv = file->GetFileSize(&size);
+  if (NS_FAILED(rv)) {
+    if (async && NS_ERROR_FILE_NOT_FOUND == rv) {
+      size = 0;
+    } else {
+      return rv;
+    }
+  }
+  mContentLength = size;
+
+  return NS_OK;
+}
+
+
+NS_IMPL_ISUPPORTS_INHERITED(nsFileChannel, nsBaseChannel, nsIUploadChannel,
+                            nsIFileChannel, nsIIdentChannel, nsIChildChannel)
+
+
+NS_IMETHODIMP
+nsFileChannel::GetFile(nsIFile** file) {
+  nsCOMPtr<nsIFileURL> fileURL = do_QueryInterface(URI());
+  NS_ENSURE_STATE(fileURL);
+
+  return fileURL->GetFile(file);
+}
+
+nsresult nsFileChannel::MaybeSendFileOpenNotification() {
+  if (!IsNeckoChild()) {
+    return NS_OK;
+  }
+
+  if (mLoadInfo->TriggeringPrincipal()->IsSystemPrincipal() &&
+      mLoadInfo->GetExternalContentPolicyType() !=
+          ExtContentPolicyType::TYPE_DOCUMENT) {
+    return NS_OK;
+  }
+
+  uint32_t loadFlags = 0;
+  MOZ_ALWAYS_SUCCEEDS(GetLoadFlags(&loadFlags));
+
+  LoadInfoArgs loadInfoArgs;
+  MOZ_ALWAYS_SUCCEEDS(
+      mozilla::ipc::LoadInfoToLoadInfoArgs(mLoadInfo, &loadInfoArgs));
+
+  FileChannelInfo fileChannelInfo(mURI, nsBaseChannel::OriginalURI(), loadFlags,
+                                  loadInfoArgs, mContentType, mChannelId);
+  gNeckoChild->SendNotifyFileChannelOpened(fileChannelInfo);
+  return NS_OK;
+}
+
+nsresult nsFileChannel::DoNotifyFileChannelOpened(
+    const nsACString& aRemoteType,
+    const mozilla::net::FileChannelInfo& aFileChannelInfo) {
+  nsCOMPtr<nsIObserverService> obsService = components::Observer::Service();
+  if (!obsService) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsILoadInfo> loadInfo;
+  nsresult rv = mozilla::ipc::LoadInfoArgsToLoadInfo(
+      aFileChannelInfo.loadInfo(), aRemoteType, getter_AddRefs(loadInfo));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  RefPtr<nsFileChannel> channel;
+  channel = new nsFileChannel(aFileChannelInfo.uri());
+  channel->SetURI(aFileChannelInfo.uri());
+  channel->SetOriginalURI(aFileChannelInfo.originalURI());
+  channel->SetLoadFlags(aFileChannelInfo.loadFlags());
+  channel->SetLoadInfo(loadInfo);
+  channel->SetContentType(aFileChannelInfo.contentType());
+  MOZ_ALWAYS_SUCCEEDS(channel->SetChannelId(aFileChannelInfo.channelId()));
+
+  obsService->NotifyObservers(static_cast<nsIIdentChannel*>(channel),
+                              "file-channel-opened", nullptr);
+  return NS_OK;
+}
+
+
+NS_IMETHODIMP
+nsFileChannel::SetUploadStream(nsIInputStream* stream,
+                               const nsACString& contentType,
+                               int64_t contentLength) {
+  NS_ENSURE_TRUE(!Pending(), NS_ERROR_IN_PROGRESS);
+
+  if ((mUploadStream = stream)) {
+    mUploadLength = contentLength;
+    if (mUploadLength < 0) {
+      uint64_t avail;
+      nsresult rv = mUploadStream->Available(&avail);
+      if (NS_FAILED(rv)) return rv;
+      mUploadLength = InScriptableRange(avail) ? avail : -1;
+    }
+  } else {
+    mUploadLength = -1;
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsFileChannel::GetUploadStream(nsIInputStream** result) {
+  *result = do_AddRef(mUploadStream).take();
+  return NS_OK;
+}
+
+
+NS_IMETHODIMP
+nsFileChannel::GetChannelId(uint64_t* aChannelId) {
+  *aChannelId = mChannelId;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsFileChannel::SetChannelId(uint64_t aChannelId) {
+  mChannelId = aChannelId;
+  return NS_OK;
+}
+
+
+NS_IMETHODIMP
+nsFileChannel::ConnectParent(uint32_t aId) {
+  if (!IsNeckoChild()) {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+
+  gNeckoChild->SendConnectBaseChannel(aId);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsFileChannel::CompleteRedirectSetup(nsIStreamListener* aListener) {
+  return AsyncOpen(aListener);
+}

@@ -1,0 +1,326 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "SecretDecoderRing.h"
+
+#include "ScopedNSSTypes.h"
+#include "mozilla/Base64.h"
+#include "mozilla/Casting.h"
+#include "mozilla/Logging.h"
+#include "mozilla/Services.h"
+#include "mozilla/StaticPrefs_security.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/dom/Promise.h"
+#include "nsCOMPtr.h"
+#include "nsIInterfaceRequestor.h"
+#include "nsIInterfaceRequestorUtils.h"
+#include "nsIObserverService.h"
+#include "nsNSSComponent.h"
+#include "nsNetCID.h"
+#include "pk11func.h"
+#include "pk11sdr.h"
+
+static mozilla::LazyLogModule gSDRLog("sdrlog");
+
+using namespace mozilla;
+using dom::Promise;
+
+NS_IMPL_ISUPPORTS(SecretDecoderRing, nsISecretDecoderRing)
+
+void BackgroundSdrEncryptStrings(const nsTArray<nsCString>& plaintexts,
+                                 RefPtr<Promise>& aPromise) {
+  nsCOMPtr<nsISecretDecoderRing> sdrService =
+      do_GetService(NS_SECRETDECODERRING_CONTRACTID);
+  nsTArray<nsString> cipherTexts(plaintexts.Length());
+
+  nsresult rv = NS_ERROR_FAILURE;
+  for (const auto& plaintext : plaintexts) {
+    nsCString cipherText;
+    rv = sdrService->EncryptString(plaintext, cipherText);
+
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      break;
+    }
+
+    cipherTexts.AppendElement(NS_ConvertASCIItoUTF16(cipherText));
+  }
+
+  nsCOMPtr<nsIRunnable> runnable(
+      NS_NewRunnableFunction("BackgroundSdrEncryptStringsResolve",
+                             [rv, aPromise = std::move(aPromise),
+                              cipherTexts = std::move(cipherTexts)]() {
+                               if (NS_FAILED(rv)) {
+                                 aPromise->MaybeReject(rv);
+                               } else {
+                                 aPromise->MaybeResolve(cipherTexts);
+                               }
+                             }));
+  NS_DispatchToMainThread(runnable.forget());
+}
+
+void BackgroundSdrDecryptStrings(const nsTArray<nsCString>& encryptedStrings,
+                                 RefPtr<Promise>& aPromise) {
+  nsCOMPtr<nsISecretDecoderRing> sdrService =
+      do_GetService(NS_SECRETDECODERRING_CONTRACTID);
+  nsTArray<nsString> plainTexts(encryptedStrings.Length());
+
+  nsresult rv = NS_ERROR_FAILURE;
+  for (const auto& encryptedString : encryptedStrings) {
+    nsCString plainText;
+    rv = sdrService->DecryptString(encryptedString, plainText);
+
+    if (NS_FAILED(rv)) {
+      if (rv == NS_ERROR_NOT_AVAILABLE) {
+        break;
+      }
+
+      MOZ_LOG(gSDRLog, LogLevel::Warning,
+              ("Couldn't decrypt string: %s", encryptedString.get()));
+      plainTexts.AppendElement(nullptr);
+      rv = NS_OK;
+      continue;
+    }
+
+    plainTexts.AppendElement(NS_ConvertUTF8toUTF16(plainText));
+  }
+
+  nsCOMPtr<nsIRunnable> runnable(
+      NS_NewRunnableFunction("BackgroundSdrDecryptStringsResolve",
+                             [rv, aPromise = std::move(aPromise),
+                              plainTexts = std::move(plainTexts)]() {
+                               if (NS_FAILED(rv)) {
+                                 aPromise->MaybeReject(rv);
+                               } else {
+                                 aPromise->MaybeResolve(plainTexts);
+                               }
+                             }));
+  NS_DispatchToMainThread(runnable.forget());
+}
+
+nsresult SecretDecoderRing::Encrypt(CK_MECHANISM_TYPE type,
+                                    const nsACString& data,
+                                     nsACString& result) {
+  UniquePK11SlotInfo slot(PK11_GetInternalKeySlot());
+  if (!slot) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (PK11_Authenticate(slot.get(), true, nullptr) != SECSuccess) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  SECItem keyid;
+  keyid.data = nullptr;
+  keyid.len = 0;
+  SECItem request;
+  request.data = BitwiseCast<unsigned char*, const char*>(data.BeginReading());
+  request.len = data.Length();
+  ScopedAutoSECItem reply;
+  if (PK11SDR_EncryptWithMechanism(slot.get(), &keyid, type, &request, &reply,
+                                   nullptr) != SECSuccess) {
+    return NS_ERROR_FAILURE;
+  }
+
+  result.Assign(BitwiseCast<char*, unsigned char*>(reply.data), reply.len);
+  return NS_OK;
+}
+
+nsresult SecretDecoderRing::Decrypt(const nsACString& data,
+                                     nsACString& result) {
+  UniquePK11SlotInfo slot(PK11_GetInternalKeySlot());
+  if (!slot) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (PK11_Authenticate(slot.get(), true, nullptr) != SECSuccess) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  SECItem request;
+  request.data = BitwiseCast<unsigned char*, const char*>(data.BeginReading());
+  request.len = data.Length();
+  ScopedAutoSECItem reply;
+  if (PK11SDR_Decrypt(&request, &reply, nullptr) != SECSuccess) {
+    return NS_ERROR_FAILURE;
+  }
+
+  result.Assign(BitwiseCast<char*, unsigned char*>(reply.data), reply.len);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+SecretDecoderRing::EncryptString(const nsACString& text,
+                                  nsACString& encryptedBase64Text) {
+  CK_MECHANISM_TYPE type;
+  nsCString prefix;
+  switch (StaticPrefs::security_sdr_mechanism()) {
+    case 0:
+      type = CKM_DES3_CBC;
+      break;
+    case 1:
+    default:
+      type = CKM_AES_CBC;
+      break;
+  }
+  nsAutoCString encryptedText;
+  nsresult rv = Encrypt(type, text, encryptedText);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  rv = Base64Encode(encryptedText, encryptedBase64Text);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+SecretDecoderRing::AsyncEncryptStrings(const nsTArray<nsCString>& plaintexts,
+                                       JSContext* aCx, Promise** aPromise) {
+  MOZ_RELEASE_ASSERT(NS_IsMainThread());
+  NS_ENSURE_ARG(!plaintexts.IsEmpty());
+  NS_ENSURE_ARG_POINTER(aCx);
+  NS_ENSURE_ARG_POINTER(aPromise);
+
+  nsIGlobalObject* globalObject = xpc::CurrentNativeGlobal(aCx);
+  if (NS_WARN_IF(!globalObject)) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  ErrorResult result;
+  RefPtr<Promise> promise = Promise::Create(globalObject, result);
+  if (NS_WARN_IF(result.Failed())) {
+    return result.StealNSResult();
+  }
+
+  nsCOMPtr<nsIRunnable> runnable(NS_NewRunnableFunction(
+      "BackgroundSdrEncryptStrings",
+      [promise, plaintexts = plaintexts.Clone()]() mutable {
+        BackgroundSdrEncryptStrings(plaintexts, promise);
+      }));
+
+  nsCOMPtr<nsIEventTarget> target(
+      do_GetService(NS_STREAMTRANSPORTSERVICE_CONTRACTID));
+  if (!target) {
+    return NS_ERROR_FAILURE;
+  }
+  nsresult rv = target->Dispatch(runnable, NS_DISPATCH_NORMAL);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  promise.forget(aPromise);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+SecretDecoderRing::DecryptString(const nsACString& encryptedBase64Text,
+                                  nsACString& decryptedText) {
+  nsAutoCString encryptedText;
+  nsresult rv = Base64Decode(encryptedBase64Text, encryptedText);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  rv = Decrypt(encryptedText, decryptedText);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+SecretDecoderRing::AsyncDecryptStrings(
+    const nsTArray<nsCString>& encryptedStrings, JSContext* aCx,
+    Promise** aPromise) {
+  MOZ_RELEASE_ASSERT(NS_IsMainThread());
+  NS_ENSURE_ARG(!encryptedStrings.IsEmpty());
+  NS_ENSURE_ARG_POINTER(aCx);
+  NS_ENSURE_ARG_POINTER(aPromise);
+
+  nsIGlobalObject* globalObject = xpc::CurrentNativeGlobal(aCx);
+  if (NS_WARN_IF(!globalObject)) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  ErrorResult result;
+  RefPtr<Promise> promise = Promise::Create(globalObject, result);
+  if (NS_WARN_IF(result.Failed())) {
+    return result.StealNSResult();
+  }
+
+  nsCOMPtr<nsIRunnable> runnable(NS_NewRunnableFunction(
+      "BackgroundSdrDecryptStrings",
+      [promise, encryptedStrings = encryptedStrings.Clone()]() mutable {
+        BackgroundSdrDecryptStrings(encryptedStrings, promise);
+      }));
+
+  nsCOMPtr<nsIEventTarget> target(
+      do_GetService(NS_STREAMTRANSPORTSERVICE_CONTRACTID));
+  if (!target) {
+    return NS_ERROR_FAILURE;
+  }
+  nsresult rv = target->Dispatch(runnable, NS_DISPATCH_NORMAL);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  promise.forget(aPromise);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+SecretDecoderRing::Login(const nsACString& password, bool* success) {
+  *success = false;
+  UniquePK11SlotInfo slot(PK11_GetInternalKeySlot());
+  if (!slot) {
+    return NS_ERROR_FAILURE;
+  }
+  SECStatus srv =
+      PK11_CheckUserPassword(slot.get(), PromiseFlatCString(password).get());
+  if (srv != SECSuccess) {
+    PRErrorCode error = PR_GetError();
+    if (error != SEC_ERROR_BAD_PASSWORD) {
+      return mozilla::psm::GetXPCOMFromNSSError(error);
+    }
+  } else {
+    *success = true;
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+SecretDecoderRing::Logout() {
+  PK11_LogoutAll();
+  nsCOMPtr<nsINSSComponent> nssComponent(do_GetService(NS_NSSCOMPONENT_CID));
+  if (!nssComponent) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+  return nssComponent->ClearSSLExternalAndInternalSessionCache();
+}
+
+NS_IMETHODIMP
+SecretDecoderRing::LogoutAndTeardown() {
+  PK11_LogoutAll();
+  nsCOMPtr<nsINSSComponent> nssComponent(do_GetService(NS_NSSCOMPONENT_CID));
+  if (!nssComponent) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  nsresult rv = nssComponent->ClearTLSCacheAndCancelAllConnections();
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  nsCOMPtr<nsIObserverService> os = mozilla::services::GetObserverService();
+  if (os) {
+    os->NotifyObservers(nullptr, "net:prune-dead-connections", nullptr);
+  }
+
+  return NS_OK;
+}

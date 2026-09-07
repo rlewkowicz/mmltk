@@ -1,0 +1,69 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SVG_SVGRECT_H_
+#define DOM_SVG_SVGRECT_H_
+
+#include "mozilla/dom/SVGElement.h"
+#include "mozilla/gfx/Rect.h"
+
+
+namespace mozilla::dom {
+
+class SVGSVGElement;
+
+class SVGRect final : public nsWrapperCache {
+ public:
+  enum class RectType : uint8_t { BaseValue, AnimValue, CreatedValue };
+
+  NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(SVGRect)
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_NATIVE_CLASS(SVGRect)
+
+  SVGRect(SVGAnimatedViewBox* aVal, SVGElement* aSVGElement, RectType aType)
+      : mVal(aVal), mParent(aSVGElement), mType(aType) {
+    MOZ_ASSERT(mParent);
+    MOZ_ASSERT(mType == RectType::BaseValue || mType == RectType::AnimValue);
+  }
+
+  explicit SVGRect(SVGSVGElement* aSVGElement);
+
+  SVGRect(nsIContent* aParent, const gfx::Rect& aRect)
+      : mVal(nullptr),
+        mRect(aRect),
+        mParent(aParent),
+        mType(RectType::CreatedValue) {
+    MOZ_ASSERT(mParent);
+  }
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  float X();
+  float Y();
+  float Width();
+  float Height();
+
+  void SetX(float aX, mozilla::ErrorResult& aRv);
+  void SetY(float aY, mozilla::ErrorResult& aRv);
+  void SetWidth(float aWidth, mozilla::ErrorResult& aRv);
+  void SetHeight(float aHeight, mozilla::ErrorResult& aRv);
+
+  nsIContent* GetParentObject() const {
+    MOZ_ASSERT(mParent);
+    return mParent;
+  }
+
+ private:
+  virtual ~SVGRect();
+
+  SVGAnimatedViewBox* mVal;  
+  gfx::Rect mRect;
+
+  RefPtr<nsIContent> mParent;
+  const RectType mType;
+};
+
+}  
+
+#endif  // DOM_SVG_SVGRECT_H_

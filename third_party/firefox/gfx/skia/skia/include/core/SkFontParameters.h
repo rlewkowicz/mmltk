@@ -1,0 +1,35 @@
+/*
+ * Copyright 2018 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkFontParameters_DEFINED)
+#define SkFontParameters_DEFINED
+
+#include "include/core/SkFourByteTag.h"
+
+#include <cstdint>
+
+struct SkFontParameters {
+    struct Variation {
+        struct Axis {
+            constexpr Axis() : tag(0), min(0), def(0), max(0), flags(0) {}
+            constexpr Axis(SkFourByteTag tag, float min, float def, float max, bool hidden) :
+                tag(tag), min(min), def(def), max(max), flags(hidden ? HIDDEN : 0) {}
+
+            SkFourByteTag tag;
+            float min;
+            float def;
+            float max;
+            bool isHidden() const { return flags & HIDDEN; }
+            void setHidden(bool hidden) { flags = hidden ? (flags | HIDDEN) : (flags & ~HIDDEN); }
+        private:
+            static constexpr uint16_t HIDDEN = 0x0001;
+            uint16_t flags;
+        };
+    };
+};
+
+#endif

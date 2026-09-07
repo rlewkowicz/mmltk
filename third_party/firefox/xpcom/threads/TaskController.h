@@ -1,0 +1,343 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_TaskController_h
+#define mozilla_TaskController_h
+
+#include "MainThreadUtils.h"
+#include "mozilla/CondVar.h"
+#include "mozilla/IdlePeriodState.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/StaticString.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/EventQueue.h"
+#include "mozilla/UniquePtr.h"
+#include "nsISupportsImpl.h"
+#include "nsThreadUtils.h"  // for MOZ_COLLECTING_RUNNABLE_TELEMETRY
+
+#include <atomic>
+#include <vector>
+#include <set>
+#include <stack>
+
+class nsIRunnable;
+class nsIThreadObserver;
+
+namespace mozilla {
+
+class Task;
+class TaskController;
+class PerformanceCounter;
+class PerformanceCounterState;
+struct PoolThread;
+
+const EventQueuePriority kDefaultPriorityValue = EventQueuePriority::Normal;
+
+
+class TaskManager {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(TaskManager)
+
+  TaskManager() : mTaskCount(0) {}
+
+  virtual bool IsSuspended(const MutexAutoLock& aProofOfLock) { return false; }
+
+  virtual int32_t GetPriorityModifierForEventLoopTurn(
+      const MutexAutoLock& aProofOfLock) {
+    return 0;
+  }
+
+  void DidQueueTask() { ++mTaskCount; }
+  virtual void WillRunTask() { --mTaskCount; }
+  virtual void DidRunTask() {}
+  uint32_t PendingTaskCount() { return mTaskCount; }
+
+ protected:
+  virtual ~TaskManager() = default;
+
+ private:
+  friend class TaskController;
+
+  enum class IterationType { NOT_EVENT_LOOP_TURN, EVENT_LOOP_TURN };
+  bool UpdateCachesForCurrentIterationAndReportPriorityModifierChanged(
+      const MutexAutoLock& aProofOfLock, IterationType aIterationType);
+
+  bool mCurrentSuspended = false;
+  int32_t mCurrentPriorityModifier = 0;
+
+  std::atomic<uint32_t> mTaskCount;
+};
+
+class Task {
+ public:
+  enum class Kind : uint8_t {
+    OffMainThreadOnly,
+
+    MainThreadOnly
+
+  };
+
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(Task)
+
+  Kind GetKind() { return mKind; }
+
+  uint32_t GetPriority() { return mPriority + mPriorityModifier; }
+  uint64_t GetSeqNo() { return mSeqNo; }
+
+  virtual void RequestInterrupt(uint32_t aInterruptPriority) {}
+
+  void AddDependency(Task* aTask) {
+    MOZ_ASSERT(aTask);
+    MOZ_ASSERT(!mIsInGraph);
+    mDependencies.insert(aTask);
+  }
+
+  void SetManager(TaskManager* aManager) {
+    MOZ_ASSERT(mKind == Kind::MainThreadOnly);
+    MOZ_ASSERT(!mIsInGraph);
+    mTaskManager = aManager;
+  }
+  TaskManager* GetManager() { return mTaskManager; }
+
+  struct PriorityCompare {
+    bool operator()(const RefPtr<Task>& aTaskA,
+                    const RefPtr<Task>& aTaskB) const {
+      uint32_t prioA = aTaskA->GetPriority();
+      uint32_t prioB = aTaskB->GetPriority();
+      return (prioA > prioB) ||
+             (prioA == prioB && (aTaskA->GetSeqNo() < aTaskB->GetSeqNo()));
+    }
+  };
+
+  virtual void SetIdleDeadline(TimeStamp aDeadline) {}
+
+  virtual PerformanceCounter* GetPerformanceCounter() const { return nullptr; }
+
+#ifdef MOZ_COLLECTING_RUNNABLE_TELEMETRY
+  virtual bool GetName(nsACString& aName) = 0;
+#else
+  virtual bool GetName(nsACString& aName) { return false; }
+#endif
+
+ protected:
+  Task(Kind aKind,
+       uint32_t aPriority = static_cast<uint32_t>(kDefaultPriorityValue))
+      : mKind(aKind), mSeqNo(sCurrentTaskSeqNo++), mPriority(aPriority) {}
+
+  Task(Kind aKind, EventQueuePriority aPriority = kDefaultPriorityValue)
+      : mKind(aKind),
+        mSeqNo(sCurrentTaskSeqNo++),
+        mPriority(static_cast<uint32_t>(aPriority)) {}
+
+  virtual ~Task() = default;
+
+  friend class TaskController;
+
+  enum class TaskResult {
+    Complete,
+    Incomplete,
+  };
+
+  virtual TaskResult Run() = 0;
+
+ private:
+  Task* GetHighestPriorityDependency();
+
+  std::set<RefPtr<Task>, PriorityCompare>::iterator mIterator;
+  std::set<RefPtr<Task>, PriorityCompare> mDependencies;
+
+  RefPtr<TaskManager> mTaskManager;
+
+  Kind mKind;
+  bool mCompleted = false;
+  bool mInProgress = false;
+#ifdef DEBUG
+  bool mIsInGraph = false;
+#endif
+
+  static std::atomic<uint64_t> sCurrentTaskSeqNo;
+  int64_t mSeqNo;
+  uint32_t mPriority;
+  int32_t mPriorityModifier = 0;
+  mozilla::TimeStamp mInsertionTime;
+};
+
+class IdleTaskManager : public TaskManager {
+ public:
+  explicit IdleTaskManager(already_AddRefed<nsIIdlePeriod> aIdlePeriod)
+      : mIdlePeriodState(std::move(aIdlePeriod)), mProcessedTaskCount(0) {}
+
+  IdlePeriodState& State() { return mIdlePeriodState; }
+
+  bool IsSuspended(const MutexAutoLock& aProofOfLock) override {
+    TimeStamp idleDeadline = State().GetCachedIdleDeadline();
+    return !idleDeadline;
+  }
+
+  void DidRunTask() override {
+    TaskManager::DidRunTask();
+    ++mProcessedTaskCount;
+  }
+
+  uint64_t ProcessedTaskCount() { return mProcessedTaskCount; }
+
+ private:
+  IdlePeriodState mIdlePeriodState;
+
+  std::atomic<uint64_t> mProcessedTaskCount;
+};
+
+class TaskController {
+ public:
+  explicit TaskController();
+
+  static TaskController* Get() {
+    MOZ_ASSERT(sSingleton.get());
+    return sSingleton.get();
+  }
+
+  static void Initialize();
+
+  void SetThreadObserver(nsIThreadObserver* aObserver) {
+    MutexAutoLock lock(mGraphMutex);
+    mObserver = aObserver;
+  }
+  void SetConditionVariable(CondVar* aExternalCondVar) {
+    MutexAutoLock lock(mGraphMutex);
+    mExternalCondVar = aExternalCondVar;
+  }
+
+  void SetIdleTaskManager(already_AddRefed<IdleTaskManager> aIdleTaskManager) {
+    mIdleTaskManager = aIdleTaskManager;
+  }
+  IdleTaskManager* GetIdleTaskManager() { return mIdleTaskManager.get(); }
+
+  uint64_t RunOutOfMTTasksCount() { return mRunOutOfMTTasksCounter; }
+
+  void SetPerformanceCounterState(
+      PerformanceCounterState* aPerformanceCounterState);
+
+  static void Shutdown();
+
+  static Task::TaskResult RunTask(Task*);
+
+  void AddTask(already_AddRefed<Task> aTask);
+
+  void WaitForTaskOrMessage();
+
+  void ExecuteNextTaskOnlyMainThread();
+
+  void ProcessPendingMTTask(bool aMayWait = false);
+
+  void ReprioritizeTask(Task* aTask, uint32_t aPriority);
+
+  void DispatchRunnable(already_AddRefed<nsIRunnable> aRunnable,
+                        uint32_t aPriority, TaskManager* aManager = nullptr);
+
+  nsIRunnable* GetRunnableForMTTask(bool aReallyWait);
+
+  bool HasMainThreadPendingTasks();
+
+  uint64_t PendingMainthreadTaskCountIncludingSuspended();
+
+  bool MTTaskRunnableProcessedTask() {
+    MOZ_ASSERT(NS_IsMainThread());
+    return mMTTaskRunnableProcessedTask;
+  }
+
+  static int32_t GetPoolThreadCount();
+  static size_t GetThreadStackSize();
+
+#ifdef MOZ_MEMORY
+  static void SetupIdleMemoryCleanup();
+
+  void UpdateIdleMemoryCleanupPrefs();
+
+  void MayScheduleIdleMemoryCleanup();
+
+  void RequestIdleMemoryCleanup(StaticString aReason);
+#endif
+
+ private:
+  friend void ThreadFuncPoolThread(void* aIndex);
+  static StaticAutoPtr<TaskController> sSingleton;
+
+  void InitializeThreadPool();
+
+  bool ExecuteNextTaskOnlyMainThreadInternal(const MutexAutoLock& aProofOfLock);
+
+  bool DoExecuteNextTaskOnlyMainThreadInternal(
+      const MutexAutoLock& aProofOfLock);
+
+  Task* GetFinalDependency(Task* aTask);
+  void MaybeInterruptTask(Task* aTask, const MutexAutoLock& aProofOfLock);
+  Task* GetHighestPriorityMTTask();
+
+  void DispatchThreadableTasks(const MutexAutoLock& aProofOfLock);
+  bool MaybeDispatchOneThreadableTask(const MutexAutoLock& aProofOfLock);
+  PoolThread* SelectThread(const MutexAutoLock& aProofOfLock);
+
+  struct TaskToRun {
+    RefPtr<Task> mTask;
+    uint32_t mEffectiveTaskPriority = 0;
+  };
+  TaskToRun TakeThreadableTaskToRun(const MutexAutoLock& aProofOfLock);
+
+  void EnsureMainThreadTasksScheduled();
+
+  void ProcessUpdatedPriorityModifier(TaskManager* aManager);
+
+  void ShutdownThreadPoolInternal();
+
+  void RunPoolThread(PoolThread* aThread);
+  friend struct PoolThread;
+
+  Mutex mGraphMutex MOZ_UNANNOTATED;
+
+  Mutex mPoolInitializationMutex =
+      Mutex("TaskController::mPoolInitializationMutex");
+
+  std::vector<UniquePtr<PoolThread>> mPoolThreads;
+
+  CondVar mMainThreadCV;
+
+
+  std::stack<RefPtr<Task>> mCurrentTasksMT;
+
+  using PrioritySortedTasks = std::set<RefPtr<Task>, Task::PriorityCompare>;
+  PrioritySortedTasks mThreadableTasks;
+  PrioritySortedTasks mMainThreadTasks;
+
+  std::set<TaskManager*> mTaskManagers;
+
+  size_t mIdleThreadCount = 0;
+
+  bool mMayHaveMainThreadTask = true;
+  bool mShuttingDown = false;
+
+#ifdef MOZ_MEMORY
+  bool mIsLazyPurgeEnabled;
+#endif
+
+  bool mMTTaskRunnableProcessedTask = false;
+
+  bool mThreadPoolInitialized = false;
+
+  RefPtr<nsIRunnable> mMTProcessingRunnable;
+  RefPtr<nsIRunnable> mMTBlockingProcessingRunnable;
+
+  nsIThreadObserver* mObserver = nullptr;
+  CondVar* mExternalCondVar = nullptr;
+  RefPtr<IdleTaskManager> mIdleTaskManager;
+
+  std::atomic<uint64_t> mRunOutOfMTTasksCounter;
+
+  PerformanceCounterState* mPerformanceCounterState = nullptr;
+};
+
+}  
+
+#endif  // mozilla_TaskController_h

@@ -1,0 +1,77 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_Directory_h
+#define mozilla_dom_Directory_h
+
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/File.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsWrapperCache.h"
+
+namespace mozilla {
+class ErrorResult;
+
+namespace dom {
+
+class FileSystemBase;
+class Promise;
+class StringOrFileOrDirectory;
+
+class Directory final : public nsISupports, public nsWrapperCache {
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(Directory)
+
+  static already_AddRefed<Directory> Constructor(const GlobalObject& aGlobal,
+                                                 const nsAString& aRealPath,
+                                                 ErrorResult& aRv);
+
+  static already_AddRefed<Directory> Create(nsIGlobalObject* aGlobal,
+                                            nsIFile* aDirectory,
+                                            FileSystemBase* aFileSystem = 0);
+
+
+  nsIGlobalObject* GetParentObject() const;
+
+  virtual JSObject* WrapObject(JSContext* aCx,
+                               JS::Handle<JSObject*> aGivenProto) override;
+
+  void GetName(nsAString& aRetval, ErrorResult& aRv);
+
+
+  void GetPath(nsAString& aRetval, ErrorResult& aRv);
+
+  nsresult GetFullRealPath(nsAString& aPath);
+
+  already_AddRefed<Promise> GetFilesAndDirectories(ErrorResult& aRv);
+
+  already_AddRefed<Promise> GetFiles(bool aRecursiveFlag, ErrorResult& aRv);
+
+
+  void SetContentFilters(const nsAString& aFilters);
+
+  FileSystemBase* GetFileSystem(ErrorResult& aRv);
+
+  nsIFile* GetInternalNsIFile() const { return mFile; }
+
+ private:
+  Directory(nsIGlobalObject* aGlobal, nsIFile* aFile,
+            FileSystemBase* aFileSystem = nullptr);
+  ~Directory();
+
+  nsresult DOMPathToRealPath(const nsAString& aPath, nsIFile** aFile) const;
+
+  nsCOMPtr<nsIGlobalObject> mGlobal;
+  RefPtr<FileSystemBase> mFileSystem;
+  nsCOMPtr<nsIFile> mFile;
+
+  nsString mFilters;
+  nsString mPath;
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_Directory_h

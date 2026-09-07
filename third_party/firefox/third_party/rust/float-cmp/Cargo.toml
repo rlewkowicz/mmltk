@@ -1,0 +1,23 @@
+
+[package]
+edition = "2018"
+name = "float-cmp"
+version = "0.6.0"
+authors = ["Mike Dilger <mike@mikedilger.com>"]
+description = "Floating point approximate comparison traits"
+documentation = "https://docs.rs/float-cmp"
+keywords = ["float", "comparison", "fuzzy", "approximate"]
+license = "MIT"
+repository = "https://github.com/mikedilger/float-cmp"
+
+[lib]
+name = "float_cmp"
+path = "src/lib.rs"
+doc = true
+[dependencies.num-traits]
+version = "0.2"
+optional = true
+default-features = false
+
+[features]
+default = ["num-traits"]

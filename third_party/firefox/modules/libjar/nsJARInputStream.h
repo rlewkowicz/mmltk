@@ -1,0 +1,65 @@
+/* nsJARInputStream.h
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsJARINPUTSTREAM_h_
+#define nsJARINPUTSTREAM_h_
+
+#include "nsIInputStream.h"
+#include "nsJAR.h"
+#include "nsTArray.h"
+
+class nsJARInputStream final : public nsIInputStream {
+ public:
+  nsJARInputStream()
+      : mOutSize(0),
+        mInCrc(0),
+        mOutCrc(0),
+        mNameLen(0),
+        mCurPos(0),
+        mArrPos(0),
+        mMode(MODE_NOTINITED) {
+    memset(&mZs, 0, sizeof(z_stream));
+  }
+
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIINPUTSTREAM
+
+  nsresult InitFile(nsZipHandle* aFd, const uint8_t* aData, nsZipItem* item);
+
+  nsresult InitDirectory(nsJAR* aJar, const char* aDir);
+
+ private:
+  ~nsJARInputStream() { Close(); }
+
+  RefPtr<nsZipHandle> mFd;  
+  uint32_t mOutSize;        
+  uint32_t mInCrc;          
+  uint32_t mOutCrc;         
+  z_stream mZs;             
+
+  RefPtr<nsJAR> mJar;          
+  uint32_t mNameLen;           
+  nsCString mBuffer;           
+  uint32_t mCurPos;            
+  uint32_t mArrPos;            
+  nsTArray<nsCString> mArray;  
+
+  typedef enum {
+    MODE_NOTINITED,
+    MODE_CLOSED,
+    MODE_DIRECTORY,
+    MODE_INFLATE,
+    MODE_COPY
+  } JISMode;
+
+  JISMode mMode;  
+
+  nsresult ContinueInflate(char* aBuf, uint32_t aCount, uint32_t* aBytesRead);
+  nsresult ReadDirectory(char* aBuf, uint32_t aCount, uint32_t* aBytesRead);
+  uint32_t CopyDataToBuffer(char*& aBuffer, uint32_t& aCount);
+};
+
+#endif /* nsJARINPUTSTREAM_h_ */

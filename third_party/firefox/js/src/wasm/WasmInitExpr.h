@@ -1,0 +1,92 @@
+/*
+ * Copyright 2021 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#ifndef wasm_initexpr_h
+#define wasm_initexpr_h
+
+#include "wasm/WasmConstants.h"
+#include "wasm/WasmSerialize.h"
+#include "wasm/WasmTypeDecls.h"
+#include "wasm/WasmValType.h"
+#include "wasm/WasmValue.h"
+
+namespace js {
+namespace wasm {
+
+class Decoder;
+struct CodeMetadata;
+
+[[nodiscard]] bool DecodeConstantExpression(Decoder& d, CodeMetadata* codeMeta,
+                                            ValType expected,
+                                            mozilla::Maybe<LitVal>* literal);
+
+enum class InitExprKind {
+  None,
+  Literal,
+  Variable,
+};
+
+
+class InitExpr {
+  InitExprKind kind_;
+  Bytes bytecode_;
+  LitVal literal_;
+  ValType type_;
+
+ public:
+  InitExpr() : kind_(InitExprKind::None) {}
+
+  explicit InitExpr(LitVal literal)
+      : kind_(InitExprKind::Literal),
+        literal_(literal),
+        type_(literal.type()) {}
+
+  static bool decodeAndValidate(Decoder& d, CodeMetadata* codeMeta,
+                                ValType expected, InitExpr* expr);
+
+  [[nodiscard]] static bool decodeAndEvaluate(
+      JSContext* cx, Handle<WasmInstanceObject*> instanceObj, Decoder& d,
+      ValType expectedType, MutableHandleVal result);
+
+  bool evaluate(JSContext* cx, Handle<WasmInstanceObject*> instanceObj,
+                MutableHandleVal result) const;
+
+  bool isLiteral() const { return kind_ == InitExprKind::Literal; }
+
+  LitVal literal() const {
+    MOZ_ASSERT(isLiteral());
+    return literal_;
+  }
+
+  ValType type() const { return type_; }
+
+  const Bytes& bytecode() const { return bytecode_; }
+
+  InitExpr(const InitExpr&) = delete;
+  InitExpr& operator=(const InitExpr&) = delete;
+  InitExpr(InitExpr&&) = default;
+  InitExpr& operator=(InitExpr&&) = default;
+
+  [[nodiscard]] bool clone(const InitExpr& src);
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+  WASM_DECLARE_FRIEND_SERIALIZE(InitExpr);
+};
+
+}  
+}  
+
+#endif  // wasm_initexpr_h

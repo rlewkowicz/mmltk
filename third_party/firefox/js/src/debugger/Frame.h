@@ -1,0 +1,239 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef debugger_Frame_h
+#define debugger_Frame_h
+
+#include "mozilla/Maybe.h"   // for Maybe
+#include "mozilla/Range.h"   // for Range
+#include "mozilla/Result.h"  // for Result
+
+#include <stddef.h>  // for size_t
+
+#include "NamespaceImports.h"   // for Value, MutableHandleValue, HandleObject
+#include "debugger/DebugAPI.h"  // for ResumeMode
+#include "debugger/Debugger.h"  // for ResumeMode, Handler, Debugger
+#include "gc/Barrier.h"         // for HeapPtr
+#include "vm/FrameIter.h"       // for FrameIter
+#include "vm/JSObject.h"        // for JSObject
+#include "vm/NativeObject.h"    // for NativeObject
+#include "vm/Stack.h"           // for AbstractFramePtr
+
+struct JS_PUBLIC_API JSContext;
+
+namespace js {
+
+class AbstractGeneratorObject;
+class GlobalObject;
+
+struct OnStepHandler : Handler {
+  virtual bool onStep(JSContext* cx, Handle<DebuggerFrame*> frame,
+                      ResumeMode& resumeMode, MutableHandleValue vp) = 0;
+};
+
+class ScriptedOnStepHandler final : public OnStepHandler {
+ public:
+  explicit ScriptedOnStepHandler(JSObject* object);
+  virtual JSObject* object() const override;
+  virtual void hold(JSObject* owner) override;
+  virtual void drop(JS::GCContext* gcx, JSObject* owner) override;
+  virtual void trace(JSTracer* tracer) override;
+  virtual size_t allocSize() const override;
+  virtual bool onStep(JSContext* cx, Handle<DebuggerFrame*> frame,
+                      ResumeMode& resumeMode, MutableHandleValue vp) override;
+
+ private:
+  const HeapPtr<JSObject*> object_;
+};
+
+struct OnPopHandler : Handler {
+  virtual bool onPop(JSContext* cx, Handle<DebuggerFrame*> frame,
+                     const Completion& completion, ResumeMode& resumeMode,
+                     MutableHandleValue vp) = 0;
+};
+
+class ScriptedOnPopHandler final : public OnPopHandler {
+ public:
+  explicit ScriptedOnPopHandler(JSObject* object);
+  virtual JSObject* object() const override;
+  virtual void hold(JSObject* owner) override;
+  virtual void drop(JS::GCContext* gcx, JSObject* owner) override;
+  virtual void trace(JSTracer* tracer) override;
+  virtual size_t allocSize() const override;
+  virtual bool onPop(JSContext* cx, Handle<DebuggerFrame*> frame,
+                     const Completion& completion, ResumeMode& resumeMode,
+                     MutableHandleValue vp) override;
+
+ private:
+  const HeapPtr<JSObject*> object_;
+};
+
+enum class DebuggerFrameType { Eval, Global, Call, Module, WasmCall };
+
+enum class DebuggerFrameImplementation { Interpreter, Baseline, Ion, Wasm };
+
+class DebuggerArguments : public NativeObject {
+ public:
+  static const JSClass class_;
+
+  static DebuggerArguments* create(JSContext* cx, HandleObject proto,
+                                   Handle<DebuggerFrame*> frame);
+
+ private:
+  enum { FRAME_SLOT };
+
+  static const unsigned RESERVED_SLOTS = 1;
+};
+
+class DebuggerFrame : public NativeObject {
+  friend class DebuggerArguments;
+  friend class ScriptedOnStepHandler;
+  friend class ScriptedOnPopHandler;
+
+ public:
+  static const JSClass class_;
+
+  enum {
+    FRAME_ITER_SLOT = 0,
+    OWNER_SLOT,
+    ARGUMENTS_SLOT,
+    ONSTEP_HANDLER_SLOT,
+    ONPOP_HANDLER_SLOT,
+
+    GENERATOR_INFO_SLOT,
+
+    WASM_CONT_FRAME_PTR_SLOT,
+
+    RESERVED_SLOTS,
+  };
+
+  void trace(JSTracer* trc);
+
+  static NativeObject* initClass(JSContext* cx, Handle<GlobalObject*> global,
+                                 HandleObject dbgCtor);
+  static DebuggerFrame* create(JSContext* cx, HandleObject proto,
+                               Handle<NativeObject*> debugger,
+                               const FrameIter* maybeIter,
+                               Handle<AbstractGeneratorObject*> maybeGenerator);
+
+  [[nodiscard]] static bool getArguments(
+      JSContext* cx, Handle<DebuggerFrame*> frame,
+      MutableHandle<DebuggerArguments*> result);
+  [[nodiscard]] static bool getCallee(JSContext* cx,
+                                      Handle<DebuggerFrame*> frame,
+                                      MutableHandle<DebuggerObject*> result);
+  [[nodiscard]] static bool getIsConstructing(JSContext* cx,
+                                              Handle<DebuggerFrame*> frame,
+                                              bool& result);
+  [[nodiscard]] static bool getEnvironment(
+      JSContext* cx, Handle<DebuggerFrame*> frame,
+      MutableHandle<DebuggerEnvironment*> result);
+  [[nodiscard]] static bool getOffset(JSContext* cx,
+                                      Handle<DebuggerFrame*> frame,
+                                      size_t& result);
+  [[nodiscard]] static bool getOlder(JSContext* cx,
+                                     Handle<DebuggerFrame*> frame,
+                                     MutableHandle<DebuggerFrame*> result);
+  [[nodiscard]] static bool getAsyncPromise(
+      JSContext* cx, Handle<DebuggerFrame*> frame,
+      MutableHandle<DebuggerObject*> result);
+  [[nodiscard]] static bool getOlderSavedFrame(
+      JSContext* cx, Handle<DebuggerFrame*> frame,
+      MutableHandle<SavedFrame*> result);
+  [[nodiscard]] static bool getThis(JSContext* cx, Handle<DebuggerFrame*> frame,
+                                    MutableHandleValue result);
+  static DebuggerFrameType getType(JSContext* cx, Handle<DebuggerFrame*> frame);
+  static DebuggerFrameImplementation getImplementation(
+      Handle<DebuggerFrame*> frame);
+  [[nodiscard]] static bool setOnStepHandler(JSContext* cx,
+                                             Handle<DebuggerFrame*> frame,
+                                             UniquePtr<OnStepHandler> handler);
+
+  [[nodiscard]] static JS::Result<Completion> eval(
+      JSContext* cx, Handle<DebuggerFrame*> frame,
+      mozilla::Range<const char16_t> chars, HandleObject bindings,
+      const EvalOptions& options);
+
+  [[nodiscard]] static DebuggerFrame* check(JSContext* cx, HandleValue thisv);
+
+  bool isOnStack(JSContext* cx) const;
+  bool isOnStackOrSuspendedWasmStack() const;
+
+  bool isWasmContFrame() const;
+
+  bool isSuspendedGeneratorFrame() const;
+
+  bool isSuspendedWasmFrame(JSContext* cx) const;
+
+  bool isSuspended(JSContext* cx) const;
+
+  OnStepHandler* onStepHandler() const;
+  OnPopHandler* onPopHandler() const;
+  void setOnPopHandler(JSContext* cx, OnPopHandler* handler);
+
+  inline bool hasGeneratorInfo() const;
+
+  AbstractGeneratorObject& unwrappedGenerator() const;
+
+#ifdef DEBUG
+  JSScript* generatorScript() const;
+#endif
+
+  [[nodiscard]] static bool setGeneratorInfo(
+      JSContext* cx, Handle<DebuggerFrame*> frame,
+      Handle<AbstractGeneratorObject*> genObj);
+
+  void clearGeneratorInfo(JS::GCContext* gcx);
+
+  bool resume(const FrameIter& iter);
+
+  void suspendWasmFrame(JS::GCContext* gcx);
+
+  bool hasAnyHooks() const;
+
+  Debugger* owner() const;
+
+ private:
+  static const JSClassOps classOps_;
+
+  static const JSPropertySpec properties_[];
+  static const JSFunctionSpec methods_[];
+
+  static void finalize(JS::GCContext* gcx, JSObject* obj);
+
+  static AbstractFramePtr getReferent(Handle<DebuggerFrame*> frame);
+  [[nodiscard]] static bool requireScriptReferent(JSContext* cx,
+                                                  Handle<DebuggerFrame*> frame);
+
+  [[nodiscard]] static bool construct(JSContext* cx, unsigned argc, Value* vp);
+
+  struct CallData;
+
+  [[nodiscard]] bool incrementStepperCounter(JSContext* cx,
+                                             AbstractFramePtr referent);
+  [[nodiscard]] bool incrementStepperCounter(JSContext* cx,
+                                             HandleScript script);
+  void decrementStepperCounter(JS::GCContext* gcx, JSScript* script);
+  void decrementStepperCounter(JS::GCContext* gcx, AbstractFramePtr referent);
+
+  FrameIter::Data* frameIterData() const;
+  void setFrameIterData(FrameIter::Data*);
+  void freeFrameIterData(JS::GCContext* gcx);
+
+ public:
+  FrameIter getFrameIter(JSContext* cx);
+
+  void terminate(JS::GCContext* gcx, AbstractFramePtr frame);
+  void onGeneratorClosed(JS::GCContext* gcx);
+  void suspendGeneratorFrame(JS::GCContext* gcx);
+
+  [[nodiscard]] bool replaceFrameIterData(JSContext* cx, const FrameIter&);
+
+  class GeneratorInfo;
+  inline GeneratorInfo* generatorInfo() const;
+};
+
+} 
+
+#endif /* debugger_Frame_h */

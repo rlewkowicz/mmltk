@@ -1,0 +1,354 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#if !defined(MediaDecoderStateMachine_h_)
+#  define MediaDecoderStateMachine_h_
+
+#  include "AudioDeviceInfo.h"
+#  include "ImageContainer.h"
+#  include "MediaDecoder.h"
+#  include "MediaDecoderOwner.h"
+#  include "MediaDecoderStateMachineBase.h"
+#  include "MediaFormatReader.h"
+#  include "MediaQueue.h"
+#  include "MediaSink.h"
+#  include "MediaTimer.h"
+#  include "SeekJob.h"
+#  include "mozilla/Atomics.h"
+#  include "mozilla/ReentrantMonitor.h"
+#  include "mozilla/StateMirroring.h"
+#  include "nsThreadUtils.h"
+
+namespace mozilla {
+
+class AbstractThread;
+class AudioSegment;
+class DecodedStream;
+class DOMMediaStream;
+class ReaderProxy;
+class TaskQueue;
+
+extern LazyLogModule gMediaDecoderLog;
+
+DDLoggedTypeDeclName(MediaDecoderStateMachine);
+
+class MediaDecoderStateMachine
+    : public MediaDecoderStateMachineBase,
+      public DecoderDoctorLifeLogger<MediaDecoderStateMachine> {
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(MediaDecoderStateMachine, override)
+
+  using TrackSet = MediaFormatReader::TrackSet;
+
+ public:
+  using FrameID = mozilla::layers::ImageContainer::FrameID;
+  MediaDecoderStateMachine(MediaDecoder* aDecoder, MediaFormatReader* aReader);
+
+  nsresult Init(MediaDecoder* aDecoder) override;
+
+  enum State {
+    DECODER_STATE_DECODING_METADATA,
+    DECODER_STATE_DORMANT,
+    DECODER_STATE_DECODING_FIRSTFRAME,
+    DECODER_STATE_DECODING,
+    DECODER_STATE_LOOPING_DECODING,
+    DECODER_STATE_SEEKING_ACCURATE,
+    DECODER_STATE_SEEKING_FROMDORMANT,
+    DECODER_STATE_SEEKING_NEXTFRAMESEEKING,
+    DECODER_STATE_SEEKING_VIDEOONLY,
+    DECODER_STATE_BUFFERING,
+    DECODER_STATE_COMPLETED,
+    DECODER_STATE_SHUTDOWN
+  };
+
+  RefPtr<GenericPromise> RequestDebugInfo(
+      dom::MediaDecoderStateMachineDebugInfo& aInfo) override;
+
+  size_t SizeOfVideoQueue() const override;
+
+  size_t SizeOfAudioQueue() const override;
+
+  void SetVideoDecodeMode(VideoDecodeMode aMode) override;
+
+  RefPtr<GenericPromise> InvokeSetSink(
+      const RefPtr<AudioDeviceInfo>& aSink) override;
+
+  void InvokeSuspendMediaSink() override;
+  void InvokeResumeMediaSink() override;
+
+ private:
+  class StateObject;
+  class DecodeMetadataState;
+  class DormantState;
+  class DecodingFirstFrameState;
+  class DecodingState;
+  class LoopingDecodingState;
+  class SeekingState;
+  class AccurateSeekingState;
+  class NextFrameSeekingState;
+  class NextFrameSeekingFromDormantState;
+  class VideoOnlySeekingState;
+  class BufferingState;
+  class CompletedState;
+  class ShutdownState;
+
+  static const char* ToStateStr(State aState);
+  const char* ToStateStr();
+
+  void GetDebugInfo(dom::MediaDecoderStateMachineDebugInfo& aInfo);
+
+  void InitializationTask(MediaDecoder* aDecoder) override;
+
+  RefPtr<MediaDecoder::SeekPromise> Seek(const SeekTarget& aTarget) override;
+
+  RefPtr<ShutdownPromise> Shutdown() override;
+
+  RefPtr<ShutdownPromise> FinishShutdown();
+
+  void UpdatePlaybackPosition(const media::TimeUnit& aTime);
+
+  void ScheduleStateMachine();
+
+  void ScheduleStateMachineIn(const media::TimeUnit& aTime);
+
+  bool HaveEnoughDecodedAudio() const;
+  bool HaveEnoughDecodedVideo() const;
+
+  bool IsVideoDataEnoughComparedWithAudio() const;
+
+  bool IsPlaying() const;
+
+  void SetMediaNotSeekable();
+
+  void ResetDecode(const TrackSet& aTracks = TrackSet(TrackInfo::kAudioTrack,
+                                                      TrackInfo::kVideoTrack));
+
+  void SetVideoDecodeModeInternal(VideoDecodeMode aMode);
+
+  RefPtr<GenericPromise> SetSink(RefPtr<AudioDeviceInfo> aDevice);
+
+  void SuspendMediaSink();
+  void ResumeMediaSink();
+
+ protected:
+  virtual ~MediaDecoderStateMachine();
+
+  void BufferedRangeUpdated() override;
+  void VolumeChanged() override;
+  void PreservesPitchChanged() override;
+  void PlayStateChanged() override;
+  void LoopingChanged() override;
+  void UpdateSecondaryVideoContainer() override;
+
+  void ReaderSuspendedChanged();
+
+  void PushAudio(AudioData* aSample);
+  void PushVideo(VideoData* aSample);
+
+  void OnAudioPopped(const RefPtr<AudioData>& aSample);
+  void OnVideoPopped(const RefPtr<VideoData>& aSample);
+
+  void AudioAudibleChanged(bool aAudible);
+  void OnPlaybackRateFallback();
+
+  void SetPlaybackRate(double aPlaybackRate) override;
+  void SetCanPlayThrough(bool aCanPlayThrough) override {
+    mCanPlayThrough = aCanPlayThrough;
+  }
+  void SetFragmentEndTime(const media::TimeUnit& aEndTime) override {
+    mFragmentEndTime = aEndTime >= media::TimeUnit::Zero()
+                           ? aEndTime
+                           : media::TimeUnit::Invalid();
+  }
+
+  void StreamNameChanged();
+  void UpdateOutputCaptured();
+  void OutputPrincipalChanged();
+
+  MediaQueue<AudioData>& AudioQueue() { return mAudioQueue; }
+  MediaQueue<VideoData>& VideoQueue() { return mVideoQueue; }
+
+  const MediaQueue<AudioData>& AudioQueue() const { return mAudioQueue; }
+  const MediaQueue<VideoData>& VideoQueue() const { return mVideoQueue; }
+
+  bool HasLowDecodedData();
+
+  bool HasLowDecodedAudio();
+
+  bool HasLowDecodedVideo();
+
+  bool OutOfDecodedAudio();
+
+  bool OutOfDecodedVideo() {
+    MOZ_ASSERT(OnTaskQueue());
+    return IsVideoDecoding() && VideoQueue().GetSize() <= 1;
+  }
+
+  bool HasLowBufferedData();
+
+  bool HasLowBufferedData(const media::TimeUnit& aThreshold);
+
+  media::TimeUnit GetClock(TimeStamp* aTimeStamp = nullptr) const;
+
+  void UpdatePlaybackPositionInternal(const media::TimeUnit& aTime);
+
+  void UpdatePlaybackPositionPeriodically();
+
+  already_AddRefed<MediaSink> CreateAudioSink();
+
+  already_AddRefed<MediaSink> CreateMediaSink();
+
+  void StopMediaSink();
+
+  nsresult StartMediaSink();
+
+  void VisibilityChanged();
+
+  void StopPlayback();
+
+  void MaybeStartPlayback();
+
+  void EnqueueFirstFrameLoadedEvent();
+
+  void RequestAudioData();
+
+  void RequestVideoData(const media::TimeUnit& aCurrentTime,
+                        bool aRequestNextKeyFrame = false);
+
+  void WaitForData(MediaData::Type aType);
+
+  media::TimeUnit GetMediaTime() const {
+    MOZ_ASSERT(OnTaskQueue());
+    return mCurrentPosition;
+  }
+
+  media::TimeUnit GetDecodedAudioDuration() const;
+
+  void FinishDecodeFirstFrame();
+
+  void RunStateMachine();
+
+  bool IsStateMachineScheduled() const;
+
+  bool IsAudioDecoding();
+  bool IsVideoDecoding();
+
+ private:
+  void OnMediaSinkAudioComplete();
+  void OnMediaSinkVideoComplete();
+
+  void OnMediaSinkAudioError(nsresult aResult);
+  void OnMediaSinkVideoError();
+
+  WatchManager<MediaDecoderStateMachine> mWatchManager;
+
+  bool mDispatchedStateMachine;
+
+  DelayedScheduler<TimeStamp> mDelayedScheduler;
+
+  MediaQueue<AudioData> mAudioQueue;
+  MediaQueue<VideoData> mVideoQueue;
+
+  UniquePtr<StateObject> mStateObj;
+
+  media::TimeUnit Duration() const {
+    MOZ_ASSERT(OnTaskQueue());
+    return mDuration.Ref().ref();
+  }
+
+  FrameID mCurrentFrameID;
+
+  media::TimeUnit mFragmentEndTime = media::TimeUnit::Invalid();
+
+  RefPtr<MediaSink> mMediaSink;
+
+  bool mStartSinkAfterWarmSeek = false;
+
+  media::TimeUnit AudioEndTime() const;
+
+  media::TimeUnit VideoEndTime() const;
+
+  media::TimeUnit mDecodedAudioEndTime;
+
+  media::TimeUnit mDecodedVideoEndTime;
+
+  uint32_t GetAmpleVideoFrames() const;
+
+  media::TimeUnit mAmpleAudioThreshold;
+
+  const char* AudioRequestStatus() const;
+  const char* VideoRequestStatus() const;
+
+  void OnSuspendTimerResolved();
+  void CancelSuspendTimer();
+
+  bool IsInSeamlessLooping() const;
+
+  bool mCanPlayThrough = false;
+
+  bool mAudioCompleted = false;
+
+  bool mVideoCompleted = false;
+
+  bool mVideoDecodeSuspended;
+
+  DelayedScheduler<TimeStamp> mVideoDecodeSuspendTimer;
+
+  VideoDecodeMode mVideoDecodeMode;
+
+  MozPromiseRequestHolder<MediaSink::EndedPromise> mMediaSinkAudioEndedPromise;
+  MozPromiseRequestHolder<MediaSink::EndedPromise> mMediaSinkVideoEndedPromise;
+
+  MediaEventListener mAudioQueueListener;
+  MediaEventListener mVideoQueueListener;
+  MediaEventListener mAudibleListener;
+  MediaEventListener mPlaybackRateFallbackListener;
+  MediaEventListener mOnMediaNotSeekable;
+
+  const bool mIsMSE;
+
+  const bool mShouldResistFingerprinting;
+
+  bool mSeamlessLoopingAllowed;
+
+  void AdjustByLooping(media::TimeUnit& aTime) const;
+
+  media::TimeUnit mOriginalDecodedDuration;
+  Maybe<media::TimeUnit> mAudioTrackDecodedDuration;
+  Maybe<media::TimeUnit> mVideoTrackDecodedDuration;
+
+  bool HasLastDecodedData(MediaData::Type aType);
+
+  int64_t mPlaybackOffset = 0;
+
+  bool mBypassingSkipToNextKeyFrameCheck = false;
+
+  TimeDuration mTotalBufferingDuration;
+
+ private:
+  Mirror<nsAutoString> mStreamName;
+
+  Mirror<RefPtr<AudioDeviceInfo>> mSinkDevice;
+
+  Mirror<MediaDecoder::OutputCaptureInfo> mOutputCaptureInfo;
+
+  Mirror<CopyableTArray<RefPtr<ProcessedMediaTrack>>> mOutputTracks;
+
+  Mirror<PrincipalHandle> mOutputPrincipal;
+
+  Canonical<PrincipalHandle> mCanonicalOutputPrincipal;
+
+  bool mIsMediaSinkSuspended = false;
+
+  Atomic<bool> mShuttingDown;
+
+  Atomic<bool> mInitialized;
+
+ public:
+  AbstractCanonical<PrincipalHandle>* CanonicalOutputPrincipal() {
+    return &mCanonicalOutputPrincipal;
+  }
+};
+
+}  
+
+#endif

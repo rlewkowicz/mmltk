@@ -1,0 +1,55 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(MediaShutdownManager_h_)
+#  define MediaShutdownManager_h_
+
+#  include "mozilla/Monitor.h"
+#  include "mozilla/RefPtr.h"
+#  include "mozilla/StaticPtr.h"
+#  include "nsCOMPtr.h"
+#  include "nsIAsyncShutdown.h"
+#  include "nsIThread.h"
+#  include "nsTHashSet.h"
+
+namespace mozilla {
+
+class MediaDecoder;
+
+class MediaShutdownManager : public nsIAsyncShutdownBlocker {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIASYNCSHUTDOWNBLOCKER
+
+  static void InitStatics();
+
+  static MediaShutdownManager& Instance();
+
+  nsresult Register(MediaDecoder* aDecoder);
+
+  void Unregister(MediaDecoder* aDecoder);
+
+ private:
+  enum InitPhase {
+    NotInited,
+    InitSucceeded,
+    InitFailed,
+    XPCOMShutdownStarted,
+    XPCOMShutdownEnded
+  };
+
+  static InitPhase sInitPhase;
+
+  MediaShutdownManager();
+  virtual ~MediaShutdownManager();
+  void RemoveBlocker();
+
+  static StaticRefPtr<MediaShutdownManager> sInstance;
+
+  nsTHashSet<RefPtr<MediaDecoder>> mDecoders;
+};
+
+}  
+
+#endif

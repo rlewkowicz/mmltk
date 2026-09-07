@@ -1,0 +1,66 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsFontFaceLoader_h_
+#define nsFontFaceLoader_h_
+
+#include "gfxUserFontSet.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/dom/FontFaceSetImpl.h"
+#include "nsCOMPtr.h"
+#include "nsHashKeys.h"
+#include "nsIChannel.h"
+#include "nsIFontLoadCompleteCallback.h"
+#include "nsIRequestObserver.h"
+#include "nsIStreamLoader.h"
+#include "nsTHashtable.h"
+
+class nsIPrincipal;
+class nsITimer;
+
+class nsFontFaceLoader final : public nsIStreamLoaderObserver,
+                               public nsIRequestObserver,
+                               public nsIFontLoadCompleteCallback {
+ public:
+  nsFontFaceLoader(gfxUserFontEntry* aUserFontEntry, uint32_t aSrcIndex,
+                   mozilla::dom::FontFaceSetImpl* aFontFaceSet,
+                   nsIChannel* aChannel);
+
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSISTREAMLOADEROBSERVER
+  NS_DECL_NSIREQUESTOBSERVER
+
+  void Cancel();
+
+  void DropChannel() { mChannel = nullptr; }
+
+  void StartedLoading(nsIStreamLoader* aStreamLoader);
+
+  static void LoadTimerCallback(nsITimer* aTimer, void* aClosure);
+
+  gfxUserFontEntry* GetUserFontEntry() const { return mUserFontEntry; }
+
+  NS_IMETHODIMP FontLoadComplete() final;
+
+ protected:
+  virtual ~nsFontFaceLoader();
+
+  mozilla::StyleFontDisplay GetFontDisplay();
+
+ private:
+  RefPtr<gfxUserFontEntry> mUserFontEntry;
+  nsCOMPtr<nsIURI> mFontURI;
+  mozilla::dom::FontFaceSetImpl* MOZ_NON_OWNING_REF mFontFaceSet;
+  nsCOMPtr<nsIChannel> mChannel;
+  nsCOMPtr<nsITimer> mLoadTimer;
+  mozilla::TimeStamp mStartTime;
+  nsIStreamLoader* mStreamLoader;
+  uint32_t mSrcIndex;
+  bool mInStreamComplete = false;
+  bool mInLoadTimerCallback = false;
+};
+
+#endif /* !defined(nsFontFaceLoader_h_) */

@@ -1,0 +1,203 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+EXPORTS += [
+    "JustificationUtils.h",
+    "nsAtomicContainerFrame.h",
+    "nsBlockFrame.h",
+    "nsCanvasFrame.h",
+    "nsContainerFrame.h",
+    "nsDirection.h",
+    "nsFloatManager.h",
+    "nsFrameList.h",
+    "nsFrameSelection.h",
+    "nsFrameState.h",
+    "nsFrameStateBits.h",
+    "nsGridContainerFrame.h",
+    "nsHTMLParts.h",
+    "nsIAnonymousContentCreator.h",
+    "nsIFrame.h",
+    "nsIFrameInlines.h",
+    "nsILineIterator.h",
+    "nsIntervalSet.h",
+    "nsIStatefulFrame.h",
+    "nsLineBox.h",
+    "nsPageSequenceFrame.h",
+    "nsPlaceholderFrame.h",
+    "nsQueryFrame.h",
+    "nsRubyBaseContainerFrame.h",
+    "nsRubyBaseFrame.h",
+    "nsRubyFrame.h",
+    "nsRubyTextContainerFrame.h",
+    "nsRubyTextFrame.h",
+    "nsSplittableFrame.h",
+    "nsSubDocumentFrame.h",
+    "nsTextFrame.h",
+    "nsTextFrameUtils.h",
+    "nsTextRunTransformations.h",
+    "RubyUtils.h",
+    "ScrollAnimationBezierPhysics.h",
+    "ScrollAnimationMSDPhysics.h",
+    "ScrollAnimationPhysics.h",
+    "ScrollbarActivity.h",
+    "ScrollSnap.h",
+    "ScrollVelocityQueue.h",
+    "TextDrawTarget.h",
+    "Visibility.h",
+]
+
+EXPORTS.mozilla += [
+    "!FrameIdList.h",
+    "!FrameTypeList.h",
+    "AbsoluteContainingBlock.h",
+    "AnonymousContentKey.h",
+    "AspectRatio.h",
+    "AutoCopyListener.h",
+    "ColumnUtils.h",
+    "CSSAlignUtils.h",
+    "CSSOrderAwareFrameIterator.h",
+    "IntrinsicISizesCache.h",
+    "LayoutMessageUtils.h",
+    "nsVideoFrame.h",
+    "PrintedSheetFrame.h",
+    "ReflowInput.h",
+    "ReflowOutput.h",
+    "ScrollbarPreferences.h",
+    "ScrollContainerFrame.h",
+    "ScrollGeneration.h",
+    "ScrollOrigin.h",
+    "ScrollPositionUpdate.h",
+    "ScrollSnapInfo.h",
+    "ScrollSnapTargetId.h",
+    "SelectionMovementUtils.h",
+    "ViewportFrame.h",
+    "WritingModes.h",
+]
+
+EXPORTS.mozilla.layout += [
+    "ScrollAnchorContainer.h",
+    "StickyScrollContainer.h",
+]
+
+UNIFIED_SOURCES += [
+    "AbsoluteContainingBlock.cpp",
+    "AspectRatio.cpp",
+    "BlockReflowState.cpp",
+    "BRFrame.cpp",
+    "ColumnSetWrapperFrame.cpp",
+    "ColumnUtils.cpp",
+    "CSSAlignUtils.cpp",
+    "CSSOrderAwareFrameIterator.cpp",
+    "MathMLTextRunFactory.cpp",
+    "MiddleCroppingBlockFrame.cpp",
+    "nsBlockFrame.cpp",
+    "nsBlockReflowContext.cpp",
+    "nsCanvasFrame.cpp",
+    "nsColumnSetFrame.cpp",
+    "nsFirstLetterFrame.cpp",
+    "nsFlexContainerFrame.cpp",
+    "nsFloatManager.cpp",
+    "nsFontInflationData.cpp",
+    "nsFrameList.cpp",
+    "nsFrameSelection.cpp",
+    "nsFrameSetFrame.cpp",
+    "nsFrameState.cpp",
+    "nsGridContainerFrame.cpp",
+    "nsHTMLCanvasFrame.cpp",
+    "nsILineIterator.cpp",
+    "nsImageFrame.cpp",
+    "nsImageMap.cpp",
+    "nsInlineFrame.cpp",
+    "nsIntervalSet.cpp",
+    "nsLeafFrame.cpp",
+    "nsLineBox.cpp",
+    "nsLineLayout.cpp",
+    "nsPageContentFrame.cpp",
+    "nsPageFrame.cpp",
+    "nsPageSequenceFrame.cpp",
+    "nsPlaceholderFrame.cpp",
+    "nsRubyBaseContainerFrame.cpp",
+    "nsRubyBaseFrame.cpp",
+    "nsRubyContentFrame.cpp",
+    "nsRubyFrame.cpp",
+    "nsRubyTextContainerFrame.cpp",
+    "nsRubyTextFrame.cpp",
+    "nsSplittableFrame.cpp",
+    "nsSubDocumentFrame.cpp",
+    "nsTextFrame.cpp",
+    "nsTextFrameUtils.cpp",
+    "nsTextPaintStyle.cpp",
+    "nsTextRunTransformations.cpp",
+    "nsVideoFrame.cpp",
+    "PrintedSheetFrame.cpp",
+    "ReflowInput.cpp",
+    "ReflowOutput.cpp",
+    "RubyUtils.cpp",
+    "ScrollAnchorContainer.cpp",
+    "ScrollAnimationBezierPhysics.cpp",
+    "ScrollAnimationMSDPhysics.cpp",
+    "ScrollbarActivity.cpp",
+    "ScrollContainerFrame.cpp",
+    "ScrollPositionUpdate.cpp",
+    "ScrollSnap.cpp",
+    "ScrollSnapInfo.cpp",
+    "ScrollVelocityQueue.cpp",
+    "SelectionMovementUtils.cpp",
+    "StickyScrollContainer.cpp",
+    "ViewportFrame.cpp",
+    "WBRFrame.cpp",
+]
+
+# larger stack frames for some recursive functions that cause us to hit stack
+# overflows (see bug 1827428)
+UNIFIED_SOURCES += [
+    "nsContainerFrame.cpp",
+    "nsIFrame.cpp",
+    "TextOverflow.cpp",
+]
+
+SOURCES += [
+    # If this file gets compiled with ScrollPositionUpdate.cpp, the specialized
+    # `operator<<` for ScrollGeneration<> won't be visible
+    "ScrollGeneration.cpp",
+]
+
+GeneratedFile(
+    "FrameIdList.h",
+    script="GenerateFrameLists.py",
+    entry_point="generate_frame_id_list_h",
+    inputs=["FrameClasses.py"],
+)
+GeneratedFile(
+    "FrameTypeList.h",
+    script="GenerateFrameLists.py",
+    entry_point="generate_frame_type_list_h",
+    inputs=["FrameClasses.py"],
+)
+
+include("/ipc/chromium/chromium-config.mozbuild")
+
+FINAL_LIBRARY = "xul"
+
+LOCAL_INCLUDES += [
+    "../base",
+    "../forms",
+    "../painting",
+    "../style",
+    "../tables",
+    "../xul",
+    "/docshell/base",
+    "/dom/base",
+    "/dom/html",
+    "/dom/xul",
+    "/gfx/cairo/cairo/src",
+]
+
+JAR_MANIFESTS += ["jar.mn"]
+
+CONTENT_ACCESSIBLE_FILES.html = [
+    "folder.png",
+]
+
+CXXFLAGS += CONFIG["MOZ_GTK3_CFLAGS"]

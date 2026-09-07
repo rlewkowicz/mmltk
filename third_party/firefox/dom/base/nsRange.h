@@ -1,0 +1,501 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsRange_h_
+#define nsRange_h_
+
+#include "mozilla/Attributes.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/RangeBoundary.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/AbstractRange.h"
+#include "mozilla/dom/CrossShadowBoundaryRange.h"
+#include "mozilla/dom/StaticRange.h"
+#include "nsCOMPtr.h"
+#include "nsStubMutationObserver.h"
+#include "nsWrapperCache.h"
+#include "prmon.h"
+
+class nsIPrincipal;
+
+namespace mozilla {
+class RectCallback;
+}
+namespace mozilla::dom {
+struct ClientRectsAndTexts;
+class DocGroup;
+class DocumentFragment;
+class DOMRect;
+class DOMRectList;
+class InspectorFontFace;
+class Selection;
+class TrustedHTMLOrString;
+
+enum class ResetCommonAncestorIfInAnySelection : bool { No, Yes };
+
+enum class RangeBehaviour : uint8_t {
+  KeepDefaultRangeAndCrossShadowBoundaryRanges,
+  CollapseDefaultRange,
+  CollapseDefaultRangeAndCrossShadowBoundaryRanges
+
+};
+}  
+
+class nsRange final : public mozilla::dom::AbstractRange,
+                      public nsStubMutationObserver {
+  using ErrorResult = mozilla::ErrorResult;
+  using AbstractRange = mozilla::dom::AbstractRange;
+  using DocGroup = mozilla::dom::DocGroup;
+  using RangeBoundary = mozilla::RangeBoundary;
+  using RangeBoundarySetBy = mozilla::RangeBoundarySetBy;
+  using RawRangeBoundary = mozilla::RawRangeBoundary;
+  using AllowRangeCrossShadowBoundary =
+      mozilla::dom::AllowRangeCrossShadowBoundary;
+
+  virtual ~nsRange();
+  explicit nsRange(nsINode* aNode);
+
+ public:
+  nsRange(const nsRange&) = delete;
+  nsRange& operator=(const nsRange&) = delete;
+
+  static already_AddRefed<nsRange> Create(nsINode* aNode);
+
+  static already_AddRefed<nsRange> Create(const AbstractRange* aAbstractRange,
+                                          ErrorResult& aRv) {
+    return nsRange::Create(aAbstractRange->StartRef(), aAbstractRange->EndRef(),
+                           aRv);
+  }
+  static already_AddRefed<nsRange> Create(
+      nsINode* aStartContainer, uint32_t aStartOffset, nsINode* aEndContainer,
+      uint32_t aEndOffset, ErrorResult& aRv,
+      AllowRangeCrossShadowBoundary aAllowCrossShadowBoundary =
+          AllowRangeCrossShadowBoundary::No) {
+    const RawRangeBoundary start = RawRangeBoundary::MakeIfValidOffset(
+        aStartContainer, aStartOffset, RangeBoundarySetBy::Ref, TreeKind::DOM);
+    if (MOZ_UNLIKELY(!start.IsSet())) {
+      aRv.Throw(NS_ERROR_INVALID_ARG);
+      return nullptr;
+    }
+    const RawRangeBoundary end = RawRangeBoundary::MakeIfValidOffset(
+        aEndContainer, aEndOffset, RangeBoundarySetBy::Ref, TreeKind::DOM);
+    if (MOZ_UNLIKELY(!end.IsSet())) {
+      aRv.Throw(NS_ERROR_INVALID_ARG);
+      return nullptr;
+    }
+    return nsRange::Create(start, end, aRv, aAllowCrossShadowBoundary);
+  }
+  template <typename SPT, typename SRT, typename EPT, typename ERT>
+  static already_AddRefed<nsRange> Create(
+      const mozilla::RangeBoundaryBase<SPT, SRT>& aStartBoundary,
+      const mozilla::RangeBoundaryBase<EPT, ERT>& aEndBoundary,
+      ErrorResult& aRv,
+      AllowRangeCrossShadowBoundary = AllowRangeCrossShadowBoundary::No);
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_IMETHODIMP_(void) DeleteCycleCollectable(void) override;
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_CLASS_INHERITED(nsRange, AbstractRange)
+
+  nsrefcnt GetRefCount() const { return mRefCnt; }
+
+  nsINode* GetRoot() const { return mRoot; }
+
+  bool IsGenerated() const { return mIsGenerated; }
+
+  void SetIsGenerated(bool aIsGenerated) { mIsGenerated = aIsGenerated; }
+
+  void Reset();
+
+  nsresult SetStart(nsINode* aContainer, uint32_t aOffset,
+                    AllowRangeCrossShadowBoundary aAllowCrossShadowBoundary =
+                        AllowRangeCrossShadowBoundary::No) {
+    if (NS_WARN_IF(!aContainer)) {
+      return NS_ERROR_INVALID_ARG;
+    }
+    ErrorResult error;
+    SetStart(*aContainer, aOffset, error, aAllowCrossShadowBoundary);
+    return error.StealNSResult();
+  }
+  nsresult SetEnd(nsINode* aContainer, uint32_t aOffset,
+                  AllowRangeCrossShadowBoundary aAllowCrossShadowBoundary =
+                      AllowRangeCrossShadowBoundary::No) {
+    if (NS_WARN_IF(!aContainer)) {
+      return NS_ERROR_INVALID_ARG;
+    }
+    ErrorResult error;
+    SetEnd(*aContainer, aOffset, error, aAllowCrossShadowBoundary);
+    return error.StealNSResult();
+  }
+
+  already_AddRefed<nsRange> CloneRange() const;
+
+  already_AddRefed<nsRange> GetRangeInFlatTree() const;
+
+  nsresult SetStartAndEnd(
+      nsINode* aStartContainer, uint32_t aStartOffset, nsINode* aEndContainer,
+      uint32_t aEndOffset,
+      AllowRangeCrossShadowBoundary aAllowCrossShadowBoundary =
+          AllowRangeCrossShadowBoundary::No) {
+    if (MOZ_UNLIKELY(!aStartContainer || !aEndContainer)) {
+      return NS_ERROR_INVALID_ARG;
+    }
+    ErrorResult error;
+    if (MOZ_UNLIKELY(
+            !IsValidNodeAndOffsetForBoundary(*aStartContainer, aStartOffset,
+                                             CheckNodeAccessible::No, error) ||
+            !IsValidNodeAndOffsetForBoundary(*aEndContainer, aEndOffset,
+                                             CheckNodeAccessible::No, error))) {
+      return error.StealNSResult();
+    }
+    return SetStartAndEnd(RawRangeBoundary(aStartContainer, aStartOffset),
+                          RawRangeBoundary(aEndContainer, aEndOffset),
+                          aAllowCrossShadowBoundary);
+  }
+  template <typename SPT, typename SRT, typename EPT, typename ERT>
+  nsresult SetStartAndEnd(
+      const mozilla::RangeBoundaryBase<SPT, SRT>& aStartBoundary,
+      const mozilla::RangeBoundaryBase<EPT, ERT>& aEndBoundary,
+      AllowRangeCrossShadowBoundary aAllowCrossShadowBoundary =
+          AllowRangeCrossShadowBoundary::No) {
+    if (MOZ_UNLIKELY(!aStartBoundary.IsSetAndValid() ||
+                     !aEndBoundary.IsSetAndValid())) {
+      return NS_ERROR_INVALID_ARG;
+    }
+    return AbstractRange::SetStartAndEndInternal(
+        aStartBoundary, aEndBoundary, this, aAllowCrossShadowBoundary);
+  }
+
+  void SelectNodesInContainer(nsINode* aContainer, nsIContent* aStartContent,
+                              nsIContent* aEndContent);
+
+  nsresult CollapseTo(nsINode* aContainer, uint32_t aOffset) {
+    return CollapseTo(RawRangeBoundary(aContainer, aOffset));
+  }
+  nsresult CollapseTo(const RawRangeBoundary& aPoint) {
+    return SetStartAndEnd(aPoint, aPoint);
+  }
+
+  nsresult GetUsedFontFaces(
+      nsTArray<mozilla::UniquePtr<mozilla::dom::InspectorFontFace>>& aResult,
+      uint32_t aMaxRanges, bool aSkipCollapsedWhitespace);
+
+  NS_DECL_NSIMUTATIONOBSERVER_CHARACTERDATACHANGED
+  NS_DECL_NSIMUTATIONOBSERVER_CONTENTINSERTED
+  NS_DECL_NSIMUTATIONOBSERVER_CONTENTREMOVED
+  NS_DECL_NSIMUTATIONOBSERVER_PARENTCHAINCHANGED
+  NS_DECL_NSIMUTATIONOBSERVER_CONTENTAPPENDED
+
+  static already_AddRefed<nsRange> Constructor(
+      const mozilla::dom::GlobalObject& global, mozilla::ErrorResult& aRv);
+
+  already_AddRefed<mozilla::dom::DocumentFragment> CreateContextualFragment(
+      const nsAString& aString, ErrorResult& aError) const;
+  MOZ_CAN_RUN_SCRIPT already_AddRefed<mozilla::dom::DocumentFragment>
+  CreateContextualFragment(const mozilla::dom::TrustedHTMLOrString&,
+                           nsIPrincipal* aSubjectPrincipal,
+                           ErrorResult& aError) const;
+  already_AddRefed<mozilla::dom::DocumentFragment> CloneContents(
+      ErrorResult& aErr);
+  int16_t CompareBoundaryPoints(uint16_t aHow, const nsRange& aOtherRange,
+                                ErrorResult& aRv);
+  int16_t ComparePoint(const nsINode& aContainer, uint32_t aOffset,
+                       ErrorResult& aRv,
+                       bool aAllowCrossShadowBoundary = false) const;
+  void DeleteContents(ErrorResult& aRv);
+  already_AddRefed<mozilla::dom::DocumentFragment> ExtractContents(
+      ErrorResult& aErr);
+  nsINode* GetCommonAncestorContainer(
+      ErrorResult& aRv,
+      AllowRangeCrossShadowBoundary aAllowCrossShadowBoundary =
+          AllowRangeCrossShadowBoundary::No) const {
+    if (!mIsPositioned) {
+      aRv.Throw(NS_ERROR_NOT_INITIALIZED);
+      return nullptr;
+    }
+    return GetClosestCommonInclusiveAncestor(aAllowCrossShadowBoundary);
+  }
+  void InsertNode(nsINode& aNode, ErrorResult& aErr);
+  bool IntersectsNode(nsINode& aNode, ErrorResult& aRv);
+  bool IsPointInRange(const nsINode& aContainer, uint32_t aOffset,
+                      ErrorResult& aRv,
+                      bool aAllowCrossShadowBoundary = false) const;
+  void ToString(nsAString& aReturn, ErrorResult& aErr);
+  void Detach();
+
+  void CollapseJS(bool aToStart);
+  void SelectNodeJS(nsINode& aNode, ErrorResult& aErr);
+  void SelectNodeContentsJS(nsINode& aNode, ErrorResult& aErr);
+  void SetEndJS(nsINode& aNode, uint32_t aOffset, ErrorResult& aErr);
+  void SetEndAfterJS(nsINode& aNode, ErrorResult& aErr);
+  void SetEndBeforeJS(nsINode& aNode, ErrorResult& aErr);
+  void SetStartJS(nsINode& aNode, uint32_t aOffset, ErrorResult& aErr);
+  void SetStartAfterJS(nsINode& aNode, ErrorResult& aErr);
+  void SetStartBeforeJS(nsINode& aNode, ErrorResult& aErr);
+
+  void SetStartAllowCrossShadowBoundary(nsINode& aNode, uint32_t aOffset,
+                                        ErrorResult& aErr);
+  void SetEndAllowCrossShadowBoundary(nsINode& aNode, uint32_t aOffset,
+                                      ErrorResult& aErr);
+
+  void SurroundContents(nsINode& aNode, ErrorResult& aErr);
+
+  void SelectNode(nsINode& aNode, ErrorResult& aErr);
+  void SelectNodeContents(nsINode& aNode, ErrorResult& aErr);
+  void SetEnd(nsINode& aNode, uint32_t aOffset, ErrorResult& aErr,
+              AllowRangeCrossShadowBoundary aAllowCrossShadowBoundary =
+                  AllowRangeCrossShadowBoundary::No) {
+    if (MOZ_UNLIKELY(!IsValidNodeAndOffsetForBoundary(
+            aNode, aOffset, CheckNodeAccessible::Yes, aErr))) {
+      return;
+    }
+    SetEndInternal(RawRangeBoundary(&aNode, aOffset), aAllowCrossShadowBoundary,
+                   aErr);
+  }
+  void SetEnd(const RawRangeBoundary& aPoint, ErrorResult& aErr,
+              AllowRangeCrossShadowBoundary aAllowCrossShadowBoundary =
+                  AllowRangeCrossShadowBoundary::No) {
+    if (MOZ_UNLIKELY(!aPoint.IsSetAndValid() ||
+                     !CanAccess(*aPoint.GetContainer()))) {
+      aErr.Throw(NS_ERROR_INVALID_ARG);
+      return;
+    }
+    SetEndInternal(aPoint, aAllowCrossShadowBoundary, aErr);
+  }
+  void SetEndAfter(nsINode& aNode, ErrorResult& aRv);
+  void SetEndBefore(nsINode& aNode, ErrorResult& aRv,
+                    AllowRangeCrossShadowBoundary aAllowCrossShadowBoundary =
+                        AllowRangeCrossShadowBoundary::No);
+  void SetStart(nsINode& aNode, uint32_t aOffset, ErrorResult& aErr,
+                AllowRangeCrossShadowBoundary aAllowCrossShadowBoundary =
+                    AllowRangeCrossShadowBoundary::No) {
+    if (MOZ_UNLIKELY(!IsValidNodeAndOffsetForBoundary(
+            aNode, aOffset, CheckNodeAccessible::Yes, aErr))) {
+      return;
+    }
+    SetStartInternal(RawRangeBoundary(&aNode, aOffset),
+                     aAllowCrossShadowBoundary, aErr);
+  }
+  void SetStart(const RawRangeBoundary& aPoint, ErrorResult& aErr,
+                AllowRangeCrossShadowBoundary aAllowCrossShadowBoundary =
+                    AllowRangeCrossShadowBoundary::No) {
+    if (MOZ_UNLIKELY(!aPoint.IsSetAndValid() ||
+                     !CanAccess(*aPoint.GetContainer()))) {
+      aErr.Throw(NS_ERROR_INVALID_ARG);
+      return;
+    }
+    SetStartInternal(aPoint, aAllowCrossShadowBoundary, aErr);
+  }
+  void SetStartAfter(nsINode& aNode, ErrorResult& aRv);
+  void SetStartBefore(nsINode& aNode, ErrorResult& aRv,
+                      AllowRangeCrossShadowBoundary aAllowCrossShadowBoundary =
+                          AllowRangeCrossShadowBoundary::No);
+  void Collapse(bool aToStart);
+
+  static void GetInnerTextNoFlush(nsAString& aValue,
+                                  mozilla::ErrorResult& aError,
+                                  nsIContent* aContainer);
+
+  virtual JSObject* WrapObject(JSContext* cx,
+                               JS::Handle<JSObject*> aGivenProto) final;
+  DocGroup* GetDocGroup() const;
+
+  static RawRangeBoundary ComputeNewBoundaryWhenBoundaryInsideChangedText(
+      const CharacterDataChangeInfo& aInfo, const RawRangeBoundary& aBoundary);
+
+ private:
+  void SetStartInternal(const RawRangeBoundary& aPoint,
+                        AllowRangeCrossShadowBoundary aAllowCrossShadowBoundary,
+                        ErrorResult& aRv);
+  void SetEndInternal(const RawRangeBoundary& aPoint,
+                      AllowRangeCrossShadowBoundary aAllowCrossShadowBoundary,
+                      ErrorResult& aRv);
+
+  enum class CheckNodeAccessible : bool { No, Yes };
+  [[nodiscard]] bool IsValidNodeAndOffsetForBoundary(
+      const nsINode& aContainer, uint32_t aOffset,
+      CheckNodeAccessible aCheckNodeAccessible, ErrorResult& aRv) const;
+  [[nodiscard]] bool IsValidNodeToSetBeforeOrAfterOf(
+      const nsINode& aChild, CheckNodeAccessible aCheckNodeAccessible,
+      ErrorResult& aRv) const;
+
+  template <typename SPT, typename SRT, typename EPT, typename ERT>
+  static void AssertIfMismatchRootAndRangeBoundaries(
+      const mozilla::RangeBoundaryBase<SPT, SRT>& aStartBoundary,
+      const mozilla::RangeBoundaryBase<EPT, ERT>& aEndBoundary,
+      const nsINode* aRootNode, bool aNotInsertedYet = false);
+
+  using ElementHandler = void (*)(mozilla::dom::Element*);
+  void CutContents(mozilla::dom::DocumentFragment** aFragment,
+                   ElementHandler aElementHandler, ErrorResult& aRv);
+
+  static nsresult CloneParentsBetween(nsINode* aAncestor, nsINode* aNode,
+                                      nsINode** aClosestAncestor,
+                                      nsINode** aFarthestAncestor);
+
+  bool CanAccess(const nsINode&) const;
+
+  void AdjustNextRefsOnCharacterDataSplit(const nsIContent& aContent,
+                                          const CharacterDataChangeInfo& aInfo);
+
+  struct RangeBoundariesAndRoot {
+    RawRangeBoundary mStart;
+    RawRangeBoundary mEnd;
+    nsINode* mRoot = nullptr;
+  };
+
+  RangeBoundariesAndRoot DetermineNewRangeBoundariesAndRootOnCharacterDataMerge(
+      nsIContent* aContent, const CharacterDataChangeInfo& aInfo) const;
+
+  bool IsPointComparableToRange(const nsINode& aContainer, uint32_t aOffset,
+                                bool aAllowCrossShadowBoundary,
+                                ErrorResult& aErrorResult) const;
+
+  bool IsShadowIncludingInclusiveDescendantOfCrossBoundaryRangeAncestor(
+      const nsINode& aContainer) const;
+
+  bool IsPartOfOneSelectionOnly() const { return mSelections.Length() == 1; };
+
+ public:
+  void ExcludeNonSelectableNodes(nsTArray<RefPtr<nsRange>>* aOutRanges);
+
+  MOZ_CAN_RUN_SCRIPT void NotifySelectionListenersAfterRangeSet();
+
+  nsINode* GetRegisteredClosestCommonInclusiveAncestor();
+
+  template <typename SPT, typename SRT, typename EPT, typename ERT>
+  void CreateOrUpdateCrossShadowBoundaryRangeIfNeeded(
+      const mozilla::RangeBoundaryBase<SPT, SRT>& aStartBoundary,
+      const mozilla::RangeBoundaryBase<EPT, ERT>& aEndBoundary);
+
+  void ResetCrossShadowBoundaryRange(
+      mozilla::dom::ResetCommonAncestorIfInAnySelection aResetCommonAncestor);
+
+  bool CrossShadowBoundaryRangeCollapsed() const {
+    MOZ_ASSERT(mCrossShadowBoundaryRange);
+
+    return !mCrossShadowBoundaryRange->IsPositioned() ||
+           (mCrossShadowBoundaryRange->GetStartContainer() ==
+                mCrossShadowBoundaryRange->GetEndContainer() &&
+            mCrossShadowBoundaryRange->StartOffset() ==
+                mCrossShadowBoundaryRange->EndOffset());
+  }
+
+
+  nsIContent* GetMayCrossShadowBoundaryChildAtStartOffset() const {
+    return mCrossShadowBoundaryRange
+               ? mCrossShadowBoundaryRange->GetChildAtStartOffset()
+               : mStart.GetChildAtOffset();
+  }
+
+  nsIContent* GetMayCrossShadowBoundaryChildAtEndOffset() const {
+    return mCrossShadowBoundaryRange
+               ? mCrossShadowBoundaryRange->GetChildAtEndOffset()
+               : mEnd.GetChildAtOffset();
+  }
+
+  mozilla::dom::CrossShadowBoundaryRange* GetCrossShadowBoundaryRange() const {
+    return mCrossShadowBoundaryRange;
+  }
+
+  nsINode* GetMayCrossShadowBoundaryStartContainer() const {
+    return mCrossShadowBoundaryRange
+               ? mCrossShadowBoundaryRange->GetStartContainer()
+               : mStart.GetContainer();
+  }
+
+  nsINode* GetMayCrossShadowBoundaryEndContainer() const {
+    return mCrossShadowBoundaryRange
+               ? mCrossShadowBoundaryRange->GetEndContainer()
+               : mEnd.GetContainer();
+  }
+
+  uint32_t MayCrossShadowBoundaryStartOffset() const {
+    return mCrossShadowBoundaryRange ? mCrossShadowBoundaryRange->StartOffset()
+                                     : StartOffset();
+  }
+
+  uint32_t MayCrossShadowBoundaryEndOffset() const {
+    return mCrossShadowBoundaryRange ? mCrossShadowBoundaryRange->EndOffset()
+                                     : EndOffset();
+  }
+
+  const RangeBoundary& MayCrossShadowBoundaryStartRef() const {
+    return mCrossShadowBoundaryRange ? mCrossShadowBoundaryRange->StartRef()
+                                     : StartRef();
+  }
+
+  const RangeBoundary& MayCrossShadowBoundaryEndRef() const {
+    return mCrossShadowBoundaryRange ? mCrossShadowBoundaryRange->EndRef()
+                                     : EndRef();
+  }
+
+  void SuppressContentsForPrintSelection(ErrorResult& aRv);
+
+ protected:
+  template <typename SPT, typename SRT, typename EPT, typename ERT>
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void DoSetRange(
+      const mozilla::RangeBoundaryBase<SPT, SRT>& aStartBoundary,
+      const mozilla::RangeBoundaryBase<EPT, ERT>& aEndBoundary,
+      nsINode* aRootNode, bool aNotInsertedYet = false,
+      mozilla::dom::RangeBehaviour aRangeBehaviour = mozilla::dom::
+          RangeBehaviour::CollapseDefaultRangeAndCrossShadowBoundaryRanges);
+
+  class MOZ_RAII AutoCalledByJSRestore final {
+   private:
+    nsRange& mRange;
+    bool mOldValue;
+
+   public:
+    explicit AutoCalledByJSRestore(nsRange& aRange)
+        : mRange(aRange), mOldValue(aRange.mCalledByJS) {}
+    ~AutoCalledByJSRestore() { mRange.mCalledByJS = mOldValue; }
+    bool SavedValue() const { return mOldValue; }
+  };
+
+  struct MOZ_STACK_CLASS AutoInvalidateSelection {
+    explicit AutoInvalidateSelection(nsRange* aRange) : mRange(aRange) {
+      if (!mRange->IsInAnySelection() || sIsNested) {
+        return;
+      }
+      sIsNested = true;
+      mCommonAncestor = mRange->GetRegisteredClosestCommonInclusiveAncestor();
+    }
+    ~AutoInvalidateSelection();
+    nsRange* mRange;
+    RefPtr<nsINode> mCommonAncestor;
+    static bool sIsNested;
+  };
+
+  bool MaybeInterruptLastRelease();
+
+#ifdef DEBUG
+  bool IsCleared() const {
+    return !mRoot && !mRegisteredClosestCommonInclusiveAncestor &&
+           mSelections.IsEmpty() && !mNextStartRef && !mNextEndRef;
+  }
+#endif  // #ifdef DEBUG
+
+  nsCOMPtr<nsINode> mRoot;
+
+  nsIContent* MOZ_NON_OWNING_REF mNextStartRef;
+  nsIContent* MOZ_NON_OWNING_REF mNextEndRef;
+
+  static nsTArray<RefPtr<nsRange>>* sCachedRanges;
+
+  RefPtr<mozilla::dom::CrossShadowBoundaryRange> mCrossShadowBoundaryRange;
+
+  friend class mozilla::dom::AbstractRange;
+};
+namespace mozilla::dom {
+inline nsRange* AbstractRange::AsDynamicRange() {
+  MOZ_ASSERT(IsDynamicRange());
+  return static_cast<nsRange*>(this);
+}
+inline const nsRange* AbstractRange::AsDynamicRange() const {
+  MOZ_ASSERT(IsDynamicRange());
+  return static_cast<const nsRange*>(this);
+}
+}  
+#endif /* nsRange_h_ */

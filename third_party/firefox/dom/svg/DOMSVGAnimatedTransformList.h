@@ -1,0 +1,65 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SVG_DOMSVGANIMATEDTRANSFORMLIST_H_
+#define DOM_SVG_DOMSVGANIMATEDTRANSFORMLIST_H_
+
+#include "SVGElement.h"
+#include "mozilla/RefPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsWrapperCache.h"
+
+namespace mozilla {
+
+class SVGAnimatedTransformList;
+
+namespace dom {
+
+class DOMSVGTransformList;
+
+class DOMSVGAnimatedTransformList final : public nsWrapperCache {
+  friend class DOMSVGTransformList;
+
+ public:
+  NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(
+      DOMSVGAnimatedTransformList)
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_NATIVE_CLASS(
+      DOMSVGAnimatedTransformList)
+
+  static already_AddRefed<DOMSVGAnimatedTransformList> GetDOMWrapper(
+      SVGAnimatedTransformList* aList, SVGElement* aElement);
+
+  static DOMSVGAnimatedTransformList* GetDOMWrapperIfExists(
+      SVGAnimatedTransformList* aList);
+
+  void InternalBaseValListWillChangeLengthTo(uint32_t aNewLength);
+  void InternalAnimValListWillChangeLengthTo(uint32_t aNewLength);
+
+  bool IsAnimating() const;
+
+  SVGElement* GetParentObject() const { return mElement; }
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+  already_AddRefed<DOMSVGTransformList> BaseVal();
+  already_AddRefed<DOMSVGTransformList> AnimVal();
+
+ private:
+  explicit DOMSVGAnimatedTransformList(SVGElement* aElement)
+      : mBaseVal(nullptr), mAnimVal(nullptr), mElement(aElement) {}
+
+  ~DOMSVGAnimatedTransformList();
+
+  SVGAnimatedTransformList& InternalAList();
+  const SVGAnimatedTransformList& InternalAList() const;
+
+  DOMSVGTransformList* mBaseVal;
+  DOMSVGTransformList* mAnimVal;
+
+  RefPtr<SVGElement> mElement;
+};
+
+}  
+}  
+
+#endif  // DOM_SVG_DOMSVGANIMATEDTRANSFORMLIST_H_

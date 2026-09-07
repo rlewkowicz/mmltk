@@ -1,0 +1,299 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_EventTarget_h_
+#define mozilla_dom_EventTarget_h_
+
+#include "mozilla/dom/Nullable.h"
+#include "nsAtom.h"
+#include "nsISupports.h"
+#include "nsWrapperCache.h"
+
+class nsIDOMEventListener;
+class nsIGlobalObject;
+class nsINode;
+class nsPIDOMWindowInner;
+class nsPIDOMWindowOuter;
+class nsPIWindowRoot;
+class nsScreen;
+
+namespace mozilla {
+
+class AsyncEventDispatcher;
+class ErrorResult;
+class EventChainPostVisitor;
+class EventChainPreVisitor;
+class EventChainVisitor;
+class EventListenerManager;
+
+namespace dom {
+
+class AddEventListenerOptionsOrBoolean;
+class Event;
+class EventListener;
+class EventListenerOptionsOrBoolean;
+class EventHandlerNonNull;
+class GlobalObject;
+class Navigation;
+class WindowProxyHolder;
+enum class CallerType : uint32_t;
+
+#define NS_EVENTTARGET_IID \
+  {0xde651c36, 0x0053, 0x4c67, {0xb1, 0x3d, 0x67, 0xb9, 0x40, 0xfc, 0x82, 0xe4}}
+
+class EventTarget : public nsISupports, public nsWrapperCache {
+ public:
+  NS_INLINE_DECL_STATIC_IID(NS_EVENTTARGET_IID)
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+
+  void SetIsOnMainThread() {
+    MOZ_ASSERT(NS_IsMainThread());
+    mRefCnt.SetIsOnMainThread();
+  }
+
+#ifndef NS_BUILD_REFCNT_LOGGING
+  MozExternalRefCountType NonVirtualAddRef();
+  MozExternalRefCountType NonVirtualRelease();
+#endif
+
+  static already_AddRefed<EventTarget> Constructor(const GlobalObject& aGlobal,
+                                                   ErrorResult& aRv);
+  void AddEventListener(const nsAString& aType, EventListener* aCallback,
+                        const AddEventListenerOptionsOrBoolean& aOptions,
+                        const Nullable<bool>& aWantsUntrusted);
+  void RemoveEventListener(const nsAString& aType, EventListener* aCallback,
+                           const EventListenerOptionsOrBoolean& aOptions);
+
+ protected:
+  nsresult AddEventListener(const nsAString& aType,
+                            nsIDOMEventListener* aListener, bool aUseCapture,
+                            const Nullable<bool>& aWantsUntrusted);
+
+ public:
+  nsresult AddEventListener(const nsAString& aType,
+                            nsIDOMEventListener* aListener, bool aUseCapture) {
+    return AddEventListener(aType, aListener, aUseCapture, Nullable<bool>());
+  }
+  nsresult AddEventListener(const nsAString& aType,
+                            nsIDOMEventListener* aListener, bool aUseCapture,
+                            bool aWantsUntrusted) {
+    return AddEventListener(aType, aListener, aUseCapture,
+                            Nullable<bool>(aWantsUntrusted));
+  }
+
+  void RemoveEventListener(const nsAString& aType,
+                           nsIDOMEventListener* aListener, bool aUseCapture);
+  void RemoveSystemEventListener(const nsAString& aType,
+                                 nsIDOMEventListener* aListener,
+                                 bool aUseCapture);
+
+  nsresult AddSystemEventListener(const nsAString& aType,
+                                  nsIDOMEventListener* aListener,
+                                  bool aUseCapture) {
+    return AddSystemEventListener(aType, aListener, aUseCapture,
+                                  Nullable<bool>());
+  }
+
+  nsresult AddSystemEventListener(const nsAString& aType,
+                                  nsIDOMEventListener* aListener,
+                                  bool aUseCapture, bool aWantsUntrusted) {
+    return AddSystemEventListener(aType, aListener, aUseCapture,
+                                  Nullable<bool>(aWantsUntrusted));
+  }
+
+  virtual bool IsNode() const { return false; }
+  inline nsINode* GetAsNode();
+  inline const nsINode* GetAsNode() const;
+  inline nsINode* AsNode();
+  inline const nsINode* AsNode() const;
+
+  virtual bool IsNavigation() const { return false; }
+  inline Navigation* GetAsNavigation();
+  inline const Navigation* GetAsNavigation() const;
+  inline Navigation* AsNavigation();
+  inline const Navigation* AsNavigation() const;
+
+  virtual bool IsScreen() const { return false; }
+  inline nsScreen* GetAsScreen();
+  inline const nsScreen* GetAsScreen() const;
+  inline nsScreen* AsScreen();
+  inline const nsScreen* AsScreen() const;
+
+  virtual bool IsInnerWindow() const { return false; }
+  virtual bool IsOuterWindow() const { return false; }
+  virtual bool IsRootWindow() const { return false; }
+  nsPIDOMWindowInner* GetAsInnerWindow();
+  const nsPIDOMWindowInner* GetAsInnerWindow() const;
+  nsPIDOMWindowOuter* GetAsOuterWindow();
+  const nsPIDOMWindowOuter* GetAsOuterWindow() const;
+  inline nsPIWindowRoot* GetAsWindowRoot();
+  inline const nsPIWindowRoot* GetAsWindowRoot() const;
+  nsPIDOMWindowInner* AsInnerWindow();
+  const nsPIDOMWindowInner* AsInnerWindow() const;
+  nsPIDOMWindowOuter* AsOuterWindow();
+  const nsPIDOMWindowOuter* AsOuterWindow() const;
+  inline nsPIWindowRoot* AsWindowRoot();
+  inline const nsPIWindowRoot* AsWindowRoot() const;
+
+  virtual EventTarget* GetTargetForDOMEvent() { return this; };
+
+  virtual EventTarget* GetTargetForEventTargetChain() { return this; }
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY virtual bool DispatchEvent(Event& aEvent,
+                                                         CallerType aCallerType,
+                                                         ErrorResult& aRv) = 0;
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void DispatchEvent(Event& aEvent);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void DispatchEvent(Event& aEvent,
+                                                 ErrorResult& aRv);
+
+  nsIGlobalObject* GetParentObject() const { return GetRelevantGlobal(); }
+
+  EventHandlerNonNull* GetEventHandler(const nsAString& aType) {
+    RefPtr<nsAtom> type = NS_Atomize(aType);
+    return GetEventHandler(type);
+  }
+
+  void SetEventHandler(const nsAString& aType, EventHandlerNonNull* aHandler,
+                       ErrorResult& rv);
+
+  virtual void EventListenerAdded(nsAtom* aType) {}
+
+  virtual void EventListenerRemoved(nsAtom* aType) {}
+
+  virtual nsIGlobalObject* GetRelevantGlobal() const = 0;
+
+  virtual EventListenerManager* GetOrCreateListenerManager() = 0;
+
+  virtual EventListenerManager* GetExistingListenerManager() const = 0;
+
+  virtual void AsyncEventRunning(AsyncEventDispatcher* aEvent) {}
+
+  bool HasNonSystemGroupListenersForUntrustedKeyEvents() const;
+
+  bool HasNonPassiveNonSystemGroupListenersForUntrustedKeyEvents() const;
+
+  virtual bool IsApzAware() const;
+
+  virtual void GetEventTargetParent(EventChainPreVisitor& aVisitor) = 0;
+
+  virtual void LegacyPreActivationBehavior(EventChainVisitor& aVisitor) {}
+
+  MOZ_CAN_RUN_SCRIPT
+  virtual void ActivationBehavior(EventChainPostVisitor& aVisitor) {}
+
+  virtual void LegacyCanceledActivationBehavior(
+      EventChainPostVisitor& aVisitor) {}
+
+  MOZ_CAN_RUN_SCRIPT
+  virtual nsresult PreHandleEvent(EventChainVisitor& aVisitor) { return NS_OK; }
+
+  virtual void WillHandleEvent(EventChainPostVisitor& aVisitor) {}
+
+  MOZ_CAN_RUN_SCRIPT
+  virtual nsresult PostHandleEvent(EventChainPostVisitor& aVisitor) = 0;
+
+ protected:
+  EventHandlerNonNull* GetEventHandler(nsAtom* aType);
+  void SetEventHandler(nsAtom* aType, EventHandlerNonNull* aHandler);
+
+  virtual bool ComputeDefaultWantsUntrusted(ErrorResult& aRv) = 0;
+
+  bool ComputeWantsUntrusted(const Nullable<bool>& aWantsUntrusted,
+                             const AddEventListenerOptionsOrBoolean* aOptions,
+                             ErrorResult& aRv);
+
+  nsresult AddSystemEventListener(const nsAString& aType,
+                                  nsIDOMEventListener* aListener,
+                                  bool aUseCapture,
+                                  const Nullable<bool>& aWantsUntrusted);
+};
+
+#define NS_IMPL_FROMEVENTTARGET_GENERIC(_class, _check, _const)             \
+  template <typename T>                                                     \
+  static auto FromEventTarget(_const T& aEventTarget)                       \
+      -> decltype(static_cast<_const _class*>(&aEventTarget)) {             \
+    return aEventTarget._check ? static_cast<_const _class*>(&aEventTarget) \
+                               : nullptr;                                   \
+  }                                                                         \
+  template <typename T>                                                     \
+  static _const _class* FromEventTarget(_const T* aEventTarget) {           \
+    MOZ_DIAGNOSTIC_ASSERT(aEventTarget);                                    \
+    return FromEventTarget(*aEventTarget);                                  \
+  }                                                                         \
+  template <typename T>                                                     \
+  static _const _class* FromEventTargetOrNull(_const T* aEventTarget) {     \
+    return aEventTarget ? FromEventTarget(*aEventTarget) : nullptr;         \
+  }
+
+#define NS_IMPL_FROMEVENTTARGET_HELPER(_class, _check)                         \
+  NS_IMPL_FROMEVENTTARGET_GENERIC(_class, _check, )                            \
+  NS_IMPL_FROMEVENTTARGET_GENERIC(_class, _check, const)                       \
+  template <typename T>                                                        \
+  static _class* FromEventTarget(T&& aEventTarget) {                           \
+    MOZ_DIAGNOSTIC_ASSERT(!!aEventTarget);                                     \
+       \
+               \
+                                         \
+    return aEventTarget->_check                                                \
+               ? static_cast<_class*>(static_cast<EventTarget*>(aEventTarget)) \
+               : nullptr;                                                      \
+  }                                                                            \
+  template <typename T>                                                        \
+  static _class* FromEventTargetOrNull(T&& aEventTarget) {                     \
+    return aEventTarget ? FromEventTarget(aEventTarget) : nullptr;             \
+  }
+
+#define NS_IMPL_FROMEVENTTARGET_GENERIC_WITH_GETTER(_class, _getter, _const) \
+  static _const _class* FromEventTarget(                                     \
+      _const mozilla::dom::EventTarget& aEventTarget) {                      \
+    return aEventTarget._getter;                                             \
+  }                                                                          \
+  template <typename T>                                                      \
+  static _const _class* FromEventTarget(_const T* aEventTarget) {            \
+    return aEventTarget->_getter;                                            \
+  }                                                                          \
+  template <typename T>                                                      \
+  static _const _class* FromEventTargetOrNull(_const T* aEventTarget) {      \
+    return aEventTarget ? aEventTarget->_getter : nullptr;                   \
+  }
+
+#define NS_IMPL_FROMEVENTTARGET_HELPER_WITH_GETTER_INNER(_class, _getter) \
+  template <typename T>                                                   \
+  static _class* FromEventTarget(T&& aEventTarget) {                      \
+    return aEventTarget->_getter;                                         \
+  }                                                                       \
+  template <typename T>                                                   \
+  static _class* FromEventTargetOrNull(T&& aEventTarget) {                \
+    return aEventTarget ? aEventTarget->_getter : nullptr;                \
+  }
+
+#define NS_IMPL_FROMEVENTTARGET_HELPER_WITH_GETTER(_class, _getter)   \
+  NS_IMPL_FROMEVENTTARGET_GENERIC_WITH_GETTER(_class, _getter, )      \
+  NS_IMPL_FROMEVENTTARGET_GENERIC_WITH_GETTER(_class, _getter, const) \
+  NS_IMPL_FROMEVENTTARGET_HELPER_WITH_GETTER_INNER(_class, _getter)
+
+}  
+}  
+
+#ifdef NS_BUILD_REFCNT_LOGGING
+#  define NON_VIRTUAL_ADDREF_RELEASE(class_) /* Nothing */
+#else
+#  define NON_VIRTUAL_ADDREF_RELEASE(class_)                                 \
+    namespace mozilla {                                                      \
+    template <>                                                              \
+    class RefPtrTraits<class_> {                                             \
+     public:                                                                 \
+      static void Release(class_* aObject) { aObject->NonVirtualRelease(); } \
+      static void AddRef(class_* aObject) { aObject->NonVirtualAddRef(); }   \
+    };                                                                       \
+    }
+
+#endif
+
+NON_VIRTUAL_ADDREF_RELEASE(mozilla::dom::EventTarget)
+
+#endif  // mozilla_dom_EventTarget_h_

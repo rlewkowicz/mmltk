@@ -1,0 +1,158 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "jit/JitContext.h"
+
+#include "mozilla/Assertions.h"
+#include "mozilla/ThreadLocal.h"
+
+#include <stdlib.h>
+
+#include "jit/CacheIRSpewer.h"
+#include "jit/CompileWrappers.h"
+#include "jit/Ion.h"
+#include "jit/JitCode.h"
+#include "jit/JitOptions.h"
+#include "jit/JitSpewer.h"
+#include "jit/MacroAssembler.h"
+#include "jit/PerfSpewer.h"
+#include "js/HeapAPI.h"
+#include "vm/JSContext.h"
+
+#if defined(JS_CODEGEN_ARM64)
+#  include "jit/arm64/vixl/Cpu-vixl.h"
+#endif
+
+
+using namespace js;
+using namespace js::jit;
+
+namespace js::jit {
+class TempAllocator;
+}
+
+static_assert(sizeof(JitCode) % gc::CellAlignBytes == 0);
+
+static MOZ_THREAD_LOCAL(JitContext*) TlsJitContext;
+
+static JitContext* CurrentJitContext() {
+  if (!TlsJitContext.init()) {
+    return nullptr;
+  }
+  return TlsJitContext.get();
+}
+
+void jit::SetJitContext(JitContext* ctx) {
+  MOZ_ASSERT(!TlsJitContext.get());
+  TlsJitContext.set(ctx);
+}
+
+JitContext* jit::GetJitContext() {
+  MOZ_ASSERT(CurrentJitContext());
+  return CurrentJitContext();
+}
+
+JitContext* jit::MaybeGetJitContext() { return CurrentJitContext(); }
+
+JitContext::JitContext(CompileRuntime* rt) : runtime(rt) {
+  MOZ_ASSERT(rt);
+  SetJitContext(this);
+}
+
+JitContext::JitContext(JSContext* cx)
+    : cx(cx), runtime(CompileRuntime::get(cx->runtime())) {
+  SetJitContext(this);
+}
+
+JitContext::JitContext() {
+#if defined(DEBUG)
+  isCompilingWasm_ = true;
+#endif
+  SetJitContext(this);
+}
+
+JitContext::~JitContext() {
+  MOZ_ASSERT(TlsJitContext.get() == this);
+  TlsJitContext.set(nullptr);
+}
+
+bool jit::InitializeJit() {
+  if (!TlsJitContext.init()) {
+    return false;
+  }
+
+  CheckLogging();
+
+#if defined(JS_CACHEIR_SPEW)
+  const char* env = getenv("CACHEIR_LOGS");
+  if (env && env[0] && env[0] != '0') {
+    CacheIRSpewer::singleton().init(env);
+  }
+#endif
+
+#if defined(JS_CODEGEN_X86) || defined(JS_CODEGEN_X64)
+  js::jit::CPUInfo::ComputeFlags();
+#endif
+
+#if defined(JS_CODEGEN_ARM)
+  ARMFlags::Init();
+#endif
+
+#if defined(JS_CODEGEN_ARM64)
+  vixl::CPU::SetUp();
+
+  ARM64Flags::Init();
+#endif
+
+#if defined(JS_CODEGEN_MIPS64)
+  MIPSFlags::Init();
+#endif
+
+#if defined(JS_CODEGEN_RISCV64)
+  RVFlags::Init();
+#endif
+
+#if !defined(JS_CODEGEN_NONE)
+  MOZ_ASSERT(js::jit::CPUFlagsHaveBeenComputed());
+#endif
+
+  if (!MacroAssembler::SupportsFloatingPoint()) {
+    JitOptions.disableJitBackend = true;
+  }
+
+  bool supportsUnaligned = MacroAssembler::SupportsUnalignedAccesses();
+  JitOptions.supportsUnalignedAccesses = supportsUnaligned;
+  JitOptions.enable_regexp_unaligned_accesses = supportsUnaligned;
+
+  if (HasJitBackend()) {
+    if (!InitProcessExecutableMemory()) {
+      return false;
+    }
+  }
+
+  PerfSpewer::Init();
+  return true;
+}
+
+void jit::ShutdownJit() {
+  if (HasJitBackend() && !JSRuntime::hasLiveRuntimes()) {
+    ReleaseProcessExecutableMemory();
+  }
+}
+
+bool jit::JitSupportsWasmSimd() {
+#if defined(ENABLE_WASM_SIMD)
+  return js::jit::MacroAssembler::SupportsWasmSimd();
+#else
+  return false;
+#endif
+}
+
+bool jit::JitSupportsAtomics() {
+#if defined(JS_CODEGEN_ARM)
+  return js::jit::ARMFlags::HasLDSTREXBHD();
+#else
+  return true;
+#endif
+}

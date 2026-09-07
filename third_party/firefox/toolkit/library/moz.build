@@ -1,0 +1,65 @@
+@template
+def Libxul_defines():
+    LIBRARY_DEFINES['MOZILLA_INTERNAL_API'] = True
+    LIBRARY_DEFINES['IMPL_LIBXUL'] = True
+    LIBRARY_DEFINES['MOZ_SUPPORT_LEAKCHECKING'] = True
+    if not CONFIG['JS_SHARED_LIBRARY']:
+        LIBRARY_DEFINES['STATIC_EXPORTABLE_JS_API'] = True
+
+@template
+def Libxul(name, output_category=None):
+    GeckoSharedLibrary(name, output_category=output_category)
+    SHARED_LIBRARY_NAME = 'xul'
+    DELAYLOAD_DLLS += ['avrt.dll', 'comdlg32.dll', 'credui.dll', 'crypt32.dll', 'd3d11.dll', 'D3DCompiler_47.dll', 'dhcpcsvc.dll', 'dnsapi.dll', 'dwmapi.dll', 'dxgi.dll', 'gdi32.dll', 'hid.dll', 'imm32.dll', 'iphlpapi.dll', 'msi.dll', 'msimg32.dll', 'ncrypt.dll', 'netapi32.dll', 'ole32.dll', 'oleaut32.dll', 'secur32.dll', 'setupapi.dll', 'shell32.dll', 'shlwapi.dll', 'urlmon.dll', 'user32.dll', 'userenv.dll', 'usp10.dll', 'uxtheme.dll', 'wininet.dll', 'winmm.dll', 'winspool.drv', 'wintrust.dll', 'wtsapi32.dll']
+    Libxul_defines()
+    OS_LIBS += CONFIG['LIBATOMIC_LIBS']
+    if CONFIG['RUSTC_NATVIS_LDFLAGS']:
+        LDFLAGS += CONFIG['RUSTC_NATVIS_LDFLAGS']
+    if name == 'xul-real':
+        SYMBOLS_FILE = '../libxul.symbols'
+Library('xul')
+STATIC_LIBRARY_NAME = 'xul_s'
+FINAL_LIBRARY = 'xul-real'
+LOCAL_INCLUDES += ['/config']
+DIRS += ['build', 'buildid_reader']
+USE_LIBS += ['js']
+USE_LIBS += ['abseil', 'gkcodecs', 'lgpllibs', 'nspr', 'nss', 'psshparser', 'sqlite']
+if not CONFIG['USE_LIBZ_RS']:
+    USE_LIBS += ['zlib']
+USE_LIBS += ['mozgtk']
+OS_LIBS += CONFIG['MOZ_GTK3_LIBS']
+USE_LIBS += ['mozwayland']
+USE_LIBS += ['freetype']
+OS_LIBS += ['rt']
+if CONFIG['MOZ_SYSTEM_JPEG']:
+    OS_LIBS += CONFIG['MOZ_JPEG_LIBS']
+if CONFIG['MOZ_SYSTEM_PNG']:
+    OS_LIBS += CONFIG['MOZ_PNG_LIBS']
+if CONFIG['MOZ_SYSTEM_WEBP']:
+    OS_LIBS += CONFIG['MOZ_WEBP_LIBS']
+if CONFIG['MOZ_SYSTEM_LIBEVENT']:
+    OS_LIBS += CONFIG['MOZ_LIBEVENT_LIBS']
+if CONFIG['MOZ_SYSTEM_LIBVPX']:
+    OS_LIBS += CONFIG['MOZ_LIBVPX_LIBS']
+if CONFIG['MOZ_SYSTEM_AV1']:
+    OS_LIBS += CONFIG['MOZ_SYSTEM_LIBAOM_LIBS']
+    OS_LIBS += CONFIG['MOZ_SYSTEM_LIBDAV1D_LIBS']
+if not CONFIG['MOZ_TREE_PIXMAN']:
+    OS_LIBS += CONFIG['MOZ_PIXMAN_LIBS']
+if CONFIG['HAVE_CLOCK_MONOTONIC']:
+    OS_LIBS += CONFIG['REALTIME_LIBS']
+OS_LIBS += CONFIG['ICONV_LIBS']
+if CONFIG['MOZ_ENABLE_DBUS']:
+    OS_LIBS += CONFIG['MOZ_DBUS_LIBS']
+if CONFIG['MOZ_SYSTEM_LIBDRM']:
+    OS_LIBS += CONFIG['MOZ_LIBDRM_LIBS']
+if CONFIG['MOZ_WIDGET_TOOLKIT'] == 'gtk' and CONFIG['COMPILE_ENVIRONMENT']:
+    OS_LIBS += [l for l in CONFIG['MOZ_GTK3_LIBS'] if l not in ('-lgtk-3', '-lgdk-3')]
+    OS_LIBS += CONFIG['MOZ_PANGO_LIBS']
+if CONFIG['MOZ_ENABLE_LIBPROXY']:
+    OS_LIBS += CONFIG['MOZ_LIBPROXY_LIBS']
+if CONFIG['COMPILE_ENVIRONMENT']:
+    SOURCES += ['!buildid.cpp']
+    libxul_list = '%sxul_%s' % (CONFIG['DLL_PREFIX'], CONFIG['DLL_SUFFIX'].lstrip('.').replace('.', '_'))
+    GeneratedFile('buildid.cpp', script='gen_buildid.py', inputs=['!build/%s.list' % libxul_list])
+    EXPORTS += ['buildid_section.h']

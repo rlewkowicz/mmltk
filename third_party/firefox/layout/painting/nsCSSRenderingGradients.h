@@ -1,0 +1,148 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsCSSRenderingGradients_h_
+#define nsCSSRenderingGradients_h_
+
+#include "Units.h"
+#include "gfxRect.h"
+#include "gfxUtils.h"
+#include "mozilla/gfx/2D.h"
+#include "mozilla/webrender/webrender_ffi.h"
+#include "nsStyleStruct.h"
+
+class gfxPattern;
+
+namespace mozilla {
+
+namespace layers {
+class StackingContextHelper;
+}  
+
+namespace wr {
+class DisplayListBuilder;
+}  
+
+struct ColorStop {
+  ColorStop() : mPosition(0), mIsMidpoint(false) {}
+  ColorStop(double aPosition, bool aIsMidPoint,
+            const StyleAbsoluteColor& aColor)
+      : mPosition(aPosition), mIsMidpoint(aIsMidPoint), mColor(aColor) {}
+  double mPosition;  
+  bool mIsMidpoint;
+  StyleAbsoluteColor mColor;
+};
+
+template <class T>
+class MOZ_STACK_CLASS ColorStopInterpolator {
+ public:
+  ColorStopInterpolator(
+      const nsTArray<ColorStop>& aStops,
+      const StyleColorInterpolationMethod& aStyleColorInterpolationMethod,
+      bool aExtend)
+      : mStyleColorInterpolationMethod(aStyleColorInterpolationMethod),
+        mStops(aStops),
+        mExtend(aExtend) {}
+
+  void CreateStops() {
+    const bool extend = mExtend || mStops.Length() == 1;
+    const uint32_t iterStops = mStops.Length() - 1 + (extend ? 2 : 0);
+    for (uint32_t i = 0; i < iterStops; i++) {
+      auto thisindex = extend ? (i == 0 ? 0 : i - 1) : i;
+      auto nextindex =
+          extend && (i == iterStops - 1 || i == 0) ? thisindex : thisindex + 1;
+      const auto& start = mStops[thisindex];
+      const auto& end = mStops[nextindex];
+      float startPosition = start.mPosition;
+      float endPosition = end.mPosition;
+      uint32_t extraStops = 0;
+      if (extend) {
+        if (i == 0) {
+          startPosition = std::min(startPosition, 0.0f);
+          extraStops = 1;
+        }
+        if (i == iterStops - 1) {
+          endPosition = std::max(endPosition, 1.0f);
+          extraStops = 1;
+        }
+      }
+      if (!extraStops) {
+        extraStops = (uint32_t)(floor(endPosition * kFullRangeExtraStops) -
+                                floor(startPosition * kFullRangeExtraStops));
+        extraStops = std::clamp(extraStops, 1U, kFullRangeExtraStops);
+      }
+      float step = 1.0f / (float)extraStops;
+      for (uint32_t extraStop = 0; extraStop <= extraStops; extraStop++) {
+        auto progress = (float)extraStop * step;
+        auto position =
+            startPosition + progress * (endPosition - startPosition);
+        StyleAbsoluteColor color =
+            Servo_InterpolateColor(mStyleColorInterpolationMethod,
+                                   &start.mColor, &end.mColor, progress);
+        static_cast<T*>(this)->CreateStop(float(position),
+                                          gfx::ToDeviceColor(color));
+      }
+    }
+  }
+
+ protected:
+  StyleColorInterpolationMethod mStyleColorInterpolationMethod;
+  const nsTArray<ColorStop>& mStops;
+  bool mExtend;
+
+  inline static const uint32_t kFullRangeExtraStops = 128;
+};
+
+class nsCSSGradientRenderer final {
+ public:
+  static nsCSSGradientRenderer Create(nsPresContext* aPresContext,
+                                      ComputedStyle* aComputedStyle,
+                                      const StyleGradient& aGradient,
+                                      const nsSize& aIntrinsiceSize);
+
+  void Paint(gfxContext& aContext, const nsRect& aDest, const nsRect& aFill,
+             const nsSize& aRepeatSize, const mozilla::CSSIntRect& aSrc,
+             const nsRect& aDirtyRect, float aOpacity = 1.0);
+
+  void BuildWebRenderParameters(float aOpacity, wr::ExtendMode& aMode,
+                                nsTArray<wr::GradientStop>& aStops,
+                                LayoutDevicePoint& aLineStart,
+                                LayoutDevicePoint& aLineEnd,
+                                LayoutDeviceSize& aGradientRadius,
+                                LayoutDevicePoint& aGradientCenter,
+                                float& aGradientAngle);
+
+  void BuildWebRenderDisplayItems(wr::DisplayListBuilder& aBuilder,
+                                  const layers::StackingContextHelper& aSc,
+                                  const nsRect& aDest, const nsRect& aFill,
+                                  const nsSize& aRepeatSize,
+                                  const mozilla::CSSIntRect& aSrc,
+                                  bool aIsBackfaceVisible,
+                                  float aOpacity = 1.0);
+
+ private:
+  nsCSSGradientRenderer()
+      : mPresContext(nullptr),
+        mGradient(nullptr),
+        mRadiusX(0.0),
+        mRadiusY(0.0),
+        mAngle(0.0) {}
+
+  bool TryPaintTilesWithExtendMode(
+      gfxContext& aContext, gfxPattern* aGradientPattern, nscoord aXStart,
+      nscoord aYStart, const gfxRect& aDirtyAreaToFill, const nsRect& aDest,
+      const nsSize& aRepeatSize, bool aForceRepeatToCoverTiles);
+
+  nsPresContext* mPresContext;
+  const StyleGradient* mGradient;
+  nsTArray<ColorStop> mStops;
+  gfxPoint mLineStart, mLineEnd;  
+  double mRadiusX, mRadiusY;      
+  gfxPoint mCenter;               
+  float mAngle;                   
+};
+
+}  
+
+#endif /* nsCSSRenderingGradients_h_ */

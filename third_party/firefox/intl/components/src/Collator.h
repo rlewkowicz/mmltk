@@ -1,0 +1,95 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef intl_components_Collator_h_
+#define intl_components_Collator_h_
+
+#include <type_traits>
+
+#include "mozilla/intl/collator_glue.h"
+
+#include "mozilla/intl/ICU4CGlue.h"
+#include "mozilla/intl/ICUError.h"
+#include "mozilla/Result.h"
+#include "mozilla/Span.h"
+
+namespace mozilla::intl {
+
+class Collator final {
+ public:
+  static Result<UniquePtr<Collator>, ICUError> TryCreate(
+      mozilla::Span<const char> aLocale, CollatorOptions aOptions) {
+    Collator* ptr = mozilla_collator_glue_collator_try_new(
+        aLocale.Elements(), aLocale.Length(), aOptions);
+    if (!ptr) {
+      return Err(ICUError::InternalError);
+    }
+    return UniquePtr<Collator>(ptr);
+  }
+
+  ~Collator() = default;
+  static void operator delete(void* aCollator) {
+    mozilla_collator_glue_collator_free(reinterpret_cast<Collator*>(aCollator));
+  }
+
+  CollatorOptions ResolvedOptions() {
+    return mozilla_collator_glue_collator_resolved_options(this);
+  }
+
+  int32_t CompareUTF16(Span<const char16_t> aLeft,
+                       Span<const char16_t> aRight) const {
+    return mozilla_collator_glue_collator_compare_utf16(
+        this, reinterpret_cast<const uint16_t*>(aLeft.Elements()),
+        aLeft.Length(), reinterpret_cast<const uint16_t*>(aRight.Elements()),
+        aRight.Length());
+  }
+
+  int32_t CompareLatin1(Span<const unsigned char> aLeft,
+                        Span<const unsigned char> aRight) const {
+    return mozilla_collator_glue_collator_compare_latin1(
+        this, aLeft.Elements(), aLeft.Length(), aRight.Elements(),
+        aRight.Length());
+  }
+
+  int32_t CompareLatin1UTF16(Span<const unsigned char> aLeft,
+                             Span<const char16_t> aRight) const {
+    return mozilla_collator_glue_collator_compare_latin1_utf16(
+        this, aLeft.Elements(), aLeft.Length(),
+        reinterpret_cast<const uint16_t*>(aRight.Elements()), aRight.Length());
+  }
+
+  static bool IsSupportedCollation(Span<const char> aLocale,
+                                   Span<const char> aCollation) {
+    auto locale = AsBytes(aLocale);
+    auto collation = AsBytes(aCollation);
+    return mozilla_collator_glue_is_supported_collation(
+        locale.Elements(), locale.Length(), collation.Elements(),
+        collation.Length());
+  }
+
+  static auto GetBcp47KeywordValues() {
+    return ICU4XEnumeration<mozilla::intl::CollationList,
+                            mozilla_collator_glue_collation_list_len,
+                            mozilla_collator_glue_collation_list_item,
+                            mozilla_collator_glue_collation_list_new,
+                            mozilla_collator_glue_collation_list_free>();
+  }
+
+  static auto GetAvailableLocales() {
+    return ICU4XEnumeration<mozilla::intl::CollatorLocaleList,
+                            mozilla_collator_glue_locale_list_len,
+                            mozilla_collator_glue_locale_list_item,
+                            mozilla_collator_glue_locale_list_new,
+                            mozilla_collator_glue_locale_list_free>();
+  }
+
+  Collator() = delete;
+  Collator(const Collator&) = delete;
+  Collator& operator=(const Collator&) = delete;
+};
+
+static_assert(std::is_empty_v<Collator>);
+
+}  
+
+#endif

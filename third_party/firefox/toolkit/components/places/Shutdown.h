@@ -1,0 +1,89 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_places_Shutdown_h_
+#define mozilla_places_Shutdown_h_
+
+#include "mozIStorageCompletionCallback.h"
+#include "nsIAsyncShutdown.h"
+#include "nsProxyRelease.h"
+
+namespace mozilla {
+namespace places {
+
+class Database;
+
+
+class PlacesShutdownBlocker : public nsIAsyncShutdownBlocker,
+                              public nsIAsyncShutdownCompletionCallback {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIASYNCSHUTDOWNBLOCKER
+  NS_DECL_NSIASYNCSHUTDOWNCOMPLETIONCALLBACK
+
+  explicit PlacesShutdownBlocker(const nsString& aName);
+
+  already_AddRefed<nsIAsyncShutdownClient> GetClient();
+
+  enum States {
+    NOT_STARTED,
+    RECEIVED_BLOCK_SHUTDOWN,
+
+    CALLED_WAIT_CLIENTS,
+    RECEIVED_DONE,
+
+    NOTIFIED_OBSERVERS_PLACES_WILL_CLOSE_CONNECTION,
+    CALLED_STORAGESHUTDOWN,
+    RECEIVED_STORAGESHUTDOWN_COMPLETE,
+    NOTIFIED_OBSERVERS_PLACES_CONNECTION_CLOSED,
+  };
+  States State() { return mState; }
+
+  static Atomic<bool> sIsStarted;
+
+ protected:
+  nsString mName;
+  States mState;
+  nsMainThreadPtrHandle<nsIAsyncShutdownBarrier> mBarrier;
+  nsMainThreadPtrHandle<nsIAsyncShutdownClient> mParentClient;
+
+  uint16_t mCounter;
+  static uint16_t sCounter;
+
+  virtual ~PlacesShutdownBlocker() = default;
+};
+
+class ClientsShutdownBlocker final : public PlacesShutdownBlocker {
+ public:
+  NS_INLINE_DECL_REFCOUNTING_INHERITED(ClientsShutdownBlocker,
+                                       PlacesShutdownBlocker)
+
+  explicit ClientsShutdownBlocker();
+
+  NS_IMETHOD Done() override;
+
+ private:
+  ~ClientsShutdownBlocker() = default;
+};
+
+class ConnectionShutdownBlocker final : public PlacesShutdownBlocker,
+                                        public mozIStorageCompletionCallback {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_MOZISTORAGECOMPLETIONCALLBACK
+
+  explicit ConnectionShutdownBlocker(mozilla::places::Database* aDatabase);
+
+  NS_IMETHOD Done() override;
+
+ private:
+  ~ConnectionShutdownBlocker() = default;
+
+  RefPtr<mozilla::places::Database> mDatabase;
+};
+
+}  
+}  
+
+#endif  // mozilla_places_Shutdown_h_

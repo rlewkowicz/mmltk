@@ -1,0 +1,393 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef GFX_UTILS_H
+#define GFX_UTILS_H
+
+#include "gfxMatrix.h"
+#include "gfxRect.h"
+#include "gfxTypes.h"
+#include "ImageTypes.h"
+#include "imgIContainer.h"
+#include "mozilla/gfx/2D.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/UniquePtr.h"
+#include "nsColor.h"
+#include "nsContentUtils.h"
+#include "nsPrintfCString.h"
+#include "nsRegionFwd.h"
+#include "mozilla/gfx/Rect.h"
+#include "mozilla/CheckedInt.h"
+#include "mozilla/webrender/WebRenderTypes.h"
+#include "qcms.h"
+
+class gfxASurface;
+class gfxDrawable;
+class gfxTextRun;
+struct gfxQuad;
+class nsICookieJarSettings;
+class nsIInputStream;
+class nsIGfxInfo;
+
+namespace mozilla {
+namespace dom {
+class Element;
+}  
+namespace layers {
+class WebRenderBridgeChild;
+class GlyphArray;
+struct PlanarYCbCrData;
+class WebRenderCommand;
+}  
+namespace image {
+class ImageRegion;
+}  
+namespace wr {
+class DisplayListBuilder;
+}  
+}  
+
+enum class ImageType {
+  BMP,
+  ICO,
+  JPEG,
+  PNG,
+};
+
+class gfxUtils {
+ public:
+  typedef mozilla::gfx::DataSourceSurface DataSourceSurface;
+  typedef mozilla::gfx::DrawTarget DrawTarget;
+  typedef mozilla::gfx::IntPoint IntPoint;
+  typedef mozilla::gfx::Matrix Matrix;
+  typedef mozilla::gfx::Matrix4x4 Matrix4x4;
+  typedef mozilla::gfx::SourceSurface SourceSurface;
+  typedef mozilla::gfx::SurfaceFormat SurfaceFormat;
+  typedef mozilla::image::ImageRegion ImageRegion;
+
+  static bool PremultiplyDataSurface(DataSourceSurface* srcSurf,
+                                     DataSourceSurface* destSurf);
+  static bool UnpremultiplyDataSurface(DataSourceSurface* srcSurf,
+                                       DataSourceSurface* destSurf);
+
+  static already_AddRefed<DataSourceSurface> CreatePremultipliedDataSurface(
+      DataSourceSurface* srcSurf);
+  static already_AddRefed<DataSourceSurface> CreateUnpremultipliedDataSurface(
+      DataSourceSurface* srcSurf);
+
+  static void ConvertBGRAtoRGBA(uint8_t* aData, uint32_t aLength);
+
+  static void DrawPixelSnapped(gfxContext* aContext, gfxDrawable* aDrawable,
+                               const gfxSize& aImageSize,
+                               const ImageRegion& aRegion,
+                               const mozilla::gfx::SurfaceFormat aFormat,
+                               mozilla::gfx::SamplingFilter aSamplingFilter,
+                               uint32_t aImageFlags = imgIContainer::FLAG_NONE,
+                               gfxFloat aOpacity = 1.0);
+
+  static void ClipToRegion(gfxContext* aContext, const nsIntRegion& aRegion);
+
+  static void ClipToRegion(mozilla::gfx::DrawTarget* aTarget,
+                           const nsIntRegion& aRegion);
+
+  static int ImageFormatToDepth(gfxImageFormat aFormat);
+
+  static gfxMatrix TransformRectToRect(const gfxRect& aFrom,
+                                       const gfxPoint& aToTopLeft,
+                                       const gfxPoint& aToTopRight,
+                                       const gfxPoint& aToBottomRight);
+
+  static Matrix TransformRectToRect(const gfxRect& aFrom,
+                                    const IntPoint& aToTopLeft,
+                                    const IntPoint& aToTopRight,
+                                    const IntPoint& aToBottomRight);
+
+  static bool GfxRectToIntRect(const gfxRect& aIn, mozilla::gfx::IntRect* aOut);
+
+  static void ConditionRect(gfxRect& aRect);
+
+  static gfxQuad TransformToQuad(const gfxRect& aRect,
+                                 const mozilla::gfx::Matrix4x4& aMatrix);
+
+  static float ClampToScaleFactor(float aVal, bool aRoundDown = false);
+
+  static Matrix4x4 SnapTransformTranslation(const Matrix4x4& aTransform,
+                                            Matrix* aResidualTransform);
+  static Matrix SnapTransformTranslation(const Matrix& aTransform,
+                                         Matrix* aResidualTransform);
+  static Matrix4x4 SnapTransformTranslation3D(const Matrix4x4& aTransform,
+                                              Matrix* aResidualTransform);
+  static Matrix4x4 SnapTransform(const Matrix4x4& aTransform,
+                                 const gfxRect& aSnapRect,
+                                 Matrix* aResidualTransform);
+  static Matrix SnapTransform(const Matrix& aTransform,
+                              const gfxRect& aSnapRect,
+                              Matrix* aResidualTransform);
+
+  static void ClearThebesSurface(gfxASurface* aSurface);
+
+  static const float* YuvToRgbMatrix4x3RowMajor(
+      mozilla::gfx::YUVColorSpace aYUVColorSpace);
+  static const float* YuvToRgbMatrix3x3ColumnMajor(
+      mozilla::gfx::YUVColorSpace aYUVColorSpace);
+  static const float* YuvToRgbMatrix4x4ColumnMajor(
+      mozilla::gfx::YUVColorSpace aYUVColorSpace);
+
+  static mozilla::Maybe<mozilla::gfx::YUVColorSpace> CicpToColorSpace(
+      const mozilla::gfx::CICP::MatrixCoefficients,
+      const mozilla::gfx::CICP::ColourPrimaries,
+      mozilla::LazyLogModule& aLogger);
+
+  static mozilla::Maybe<mozilla::gfx::ColorSpace2> CicpToColorPrimaries(
+      const mozilla::gfx::CICP::ColourPrimaries,
+      mozilla::LazyLogModule& aLogger);
+
+  static mozilla::Maybe<mozilla::gfx::TransferFunction> CicpToTransferFunction(
+      const mozilla::gfx::CICP::TransferCharacteristics);
+
+  static already_AddRefed<DataSourceSurface>
+  CopySurfaceToDataSourceSurfaceWithFormat(SourceSurface* aSurface,
+                                           SurfaceFormat aFormat);
+
+  static already_AddRefed<SourceSurface> ScaleSourceSurface(
+      SourceSurface& aSurface, const mozilla::gfx::IntSize& aTargetSize);
+
+  static const mozilla::gfx::DeviceColor& GetColorForFrameNumber(
+      uint64_t aFrameNumber);
+  static const uint32_t sNumFrameColors;
+
+  enum BinaryOrData { eBinaryEncode, eDataURIEncode };
+
+  static nsresult EncodeSourceSurface(SourceSurface* aSurface,
+                                      const ImageType aImageType,
+                                      const nsAString& aOutputOptions,
+                                      BinaryOrData aBinaryOrData, FILE* aFile,
+                                      nsACString* aString = nullptr);
+
+  static nsresult EncodeSourceSurfaceAsStream(SourceSurface* aSurface,
+                                              const ImageType aImageType,
+                                              const nsAString& aOutputOptions,
+                                              nsIInputStream** aOutStream);
+
+  static mozilla::Maybe<nsTArray<uint8_t>> EncodeSourceSurfaceAsBytes(
+      SourceSurface* aSurface, const ImageType aImageType,
+      const nsAString& aOutputOptions);
+
+  static void WriteAsPNG(SourceSurface* aSurface, const nsAString& aFile);
+  static void WriteAsPNG(SourceSurface* aSurface, const char* aFile);
+  static void WriteAsPNG(DrawTarget* aDT, const nsAString& aFile);
+  static void WriteAsPNG(DrawTarget* aDT, const char* aFile);
+
+  static void DumpAsDataURI(SourceSurface* aSourceSurface, FILE* aFile);
+  static inline void DumpAsDataURI(SourceSurface* aSourceSurface) {
+    DumpAsDataURI(aSourceSurface, stdout);
+  }
+  static void DumpAsDataURI(DrawTarget* aDT, FILE* aFile);
+  static inline void DumpAsDataURI(DrawTarget* aDT) {
+    DumpAsDataURI(aDT, stdout);
+  }
+  static nsCString GetAsDataURI(SourceSurface* aSourceSurface);
+  static nsCString GetAsDataURI(DrawTarget* aDT);
+  static nsCString GetAsLZ4Base64Str(DataSourceSurface* aSourceSurface);
+
+  static mozilla::UniquePtr<uint8_t[]> GetImageBuffer(
+      DataSourceSurface* aSurface, bool aIsAlphaPremultiplied,
+      int32_t* outFormat);
+
+  static mozilla::UniquePtr<uint8_t[]> GetImageBufferWithRandomNoise(
+      DataSourceSurface* aSurface, bool aIsAlphaPremultiplied,
+      nsICookieJarSettings* aCookieJarSettings, nsIPrincipal* aPrincipal,
+      int32_t* outFormat);
+
+  static nsresult GetInputStream(DataSourceSurface* aSurface,
+                                 bool aIsAlphaPremultiplied,
+                                 const char* aMimeType,
+                                 const nsAString& aEncoderOptions,
+                                 const nsACString& aRandomizationKey,
+                                 nsIInputStream** outStream);
+
+  static nsresult GetInputStreamWithRandomNoise(
+      DataSourceSurface* aSurface, bool aIsAlphaPremultiplied,
+      const char* aMimeType, const nsAString& aEncoderOptions,
+      nsICookieJarSettings* aCookieJarSettings, nsIPrincipal* aPrincipal,
+      nsIInputStream** outStream);
+
+  static void RemoveShaderCacheFromDiskIfNecessary();
+
+  static void CopyAsDataURI(SourceSurface* aSourceSurface);
+  static void CopyAsDataURI(DrawTarget* aDT);
+
+  static bool DumpDisplayList();
+
+  static FILE* sDumpPaintFile;
+};
+
+namespace mozilla {
+
+template <typename T>
+class ElementOrArray {
+  union {
+    T mElement;
+    nsTArray<T> mArray;
+  };
+  enum class Tag : uint8_t {
+    Element,
+    Array,
+  } mTag;
+
+  friend class ::gfxTextRun;
+  nsTArray<T>& Array() {
+    MOZ_DIAGNOSTIC_ASSERT(mTag == Tag::Array);
+    return mArray;
+  }
+
+ public:
+  ElementOrArray() : mTag(Tag::Array) { new (&mArray) nsTArray<T>(); }
+
+  ElementOrArray(const ElementOrArray&) = delete;
+  ElementOrArray(ElementOrArray&&) = delete;
+
+  ElementOrArray& operator=(const ElementOrArray&) = delete;
+  ElementOrArray& operator=(ElementOrArray&&) = delete;
+
+  ~ElementOrArray() {
+    switch (mTag) {
+      case Tag::Element:
+        mElement.~T();
+        break;
+      case Tag::Array:
+        mArray.~nsTArray();
+        break;
+    }
+  }
+
+  size_t Length() const { return mTag == Tag::Element ? 1 : mArray.Length(); }
+
+  T* AppendElement(const T& aElement) {
+    switch (mTag) {
+      case Tag::Element: {
+        T temp = std::move(mElement);
+        mElement.~T();
+        mTag = Tag::Array;
+        new (&mArray) nsTArray<T>();
+        mArray.AppendElement(std::move(temp));
+        return mArray.AppendElement(aElement);
+      }
+      case Tag::Array: {
+        if (mArray.IsEmpty()) {
+          mArray.~nsTArray();
+          mTag = Tag::Element;
+          new (&mElement) T(aElement);
+          return &mElement;
+        }
+        return mArray.AppendElement(aElement);
+      }
+      default:
+        MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE("invalid tag");
+    }
+  }
+
+  const T& LastElement() const {
+    return mTag == Tag::Element ? mElement : mArray.LastElement();
+  }
+
+  T& LastElement() {
+    return mTag == Tag::Element ? mElement : mArray.LastElement();
+  }
+
+  bool IsEmpty() const {
+    return mTag == Tag::Element ? false : mArray.IsEmpty();
+  }
+
+  void TruncateLength(uint32_t aLength = 0) {
+    MOZ_DIAGNOSTIC_ASSERT(aLength <= Length());
+    switch (mTag) {
+      case Tag::Element:
+        if (aLength == 0) {
+          mElement.~T();
+          mTag = Tag::Array;
+          new (&mArray) nsTArray<T>();
+        }
+        break;
+      case Tag::Array:
+        mArray.TruncateLength(aLength);
+        break;
+    }
+  }
+
+  void Clear() {
+    switch (mTag) {
+      case Tag::Element:
+        mElement.~T();
+        mTag = Tag::Array;
+        new (&mArray) nsTArray<T>();
+        break;
+      case Tag::Array:
+        mArray.Clear();
+        break;
+    }
+  }
+
+  void ConvertToElement() {
+    MOZ_DIAGNOSTIC_ASSERT(mTag == Tag::Array && mArray.Length() == 1);
+    T temp = std::move(mArray[0]);
+    mArray.~nsTArray();
+    mTag = Tag::Element;
+    new (&mElement) T(std::move(temp));
+  }
+
+  const T& operator[](uint32_t aIndex) const {
+    MOZ_DIAGNOSTIC_ASSERT(aIndex < Length());
+    return mTag == Tag::Element ? mElement : mArray[aIndex];
+  }
+  T& operator[](uint32_t aIndex) {
+    MOZ_DIAGNOSTIC_ASSERT(aIndex < Length());
+    return mTag == Tag::Element ? mElement : mArray[aIndex];
+  }
+
+  const T* begin() const {
+    return mTag == Tag::Array ? mArray.IsEmpty() ? nullptr : &*mArray.begin()
+                              : &mElement;
+  }
+  T* begin() {
+    return mTag == Tag::Array ? mArray.IsEmpty() ? nullptr : &*mArray.begin()
+                              : &mElement;
+  }
+
+  const T* end() const {
+    return mTag == Tag::Array ? begin() + mArray.Length() : &mElement + 1;
+  }
+  T* end() {
+    return mTag == Tag::Array ? begin() + mArray.Length() : &mElement + 1;
+  }
+
+  size_t ShallowSizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) {
+    return mTag == Tag::Array ? mArray.ShallowSizeOfExcludingThis(aMallocSizeOf)
+                              : 0;
+  }
+};
+
+struct StyleAbsoluteColor;
+
+namespace gfx {
+
+DeviceColor ToDeviceColor(const sRGBColor&);
+DeviceColor ToDeviceColor(const StyleAbsoluteColor&);
+DeviceColor ToDeviceColor(nscolor);
+
+sRGBColor ToSRGBColor(const StyleAbsoluteColor&);
+
+static inline CheckedInt<uint32_t> SafeBytesForBitmap(uint32_t aWidth,
+                                                      uint32_t aHeight,
+                                                      unsigned aBytesPerPixel) {
+  MOZ_ASSERT(aBytesPerPixel > 0);
+  CheckedInt<uint32_t> width = uint32_t(aWidth);
+  CheckedInt<uint32_t> height = uint32_t(aHeight);
+  return width * height * aBytesPerPixel;
+}
+
+}  
+}  
+
+#endif

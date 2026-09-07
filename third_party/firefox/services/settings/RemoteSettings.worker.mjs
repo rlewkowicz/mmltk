@@ -1,0 +1,135 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+/* eslint-disable mozilla/reject-import-system-module-from-non-system */
+import { CanonicalJSON } from "resource://gre/modules/CanonicalJSON.sys.mjs";
+import { IDBHelpers } from "resource://services-settings/IDBHelpers.sys.mjs";
+import { SharedUtils } from "resource://services-settings/SharedUtils.sys.mjs";
+import { jsesc } from "resource://gre/modules/third_party/jsesc/jsesc.mjs";
+/* eslint-enable mozilla/reject-import-system-module-from-non-system */
+
+const IDB_RECORDS_STORE = "records";
+const IDB_TIMESTAMPS_STORE = "timestamps";
+
+let gShutdown = false;
+
+const Agent = {
+  async canonicalStringify(records, timestamp) {
+    let allRecords = records.sort((a, b) => {
+      if (a.id < b.id) {
+        return -1;
+      }
+      return a.id > b.id ? 1 : 0;
+    });
+    for (let i = 0; i < allRecords.length ; ) {
+      const rec = allRecords[i];
+      const next = allRecords[i + 1];
+      if ((next && rec.id == next.id) || rec.deleted) {
+        allRecords.splice(i, 1); 
+      } else {
+        i++;
+      }
+    }
+    const toSerialize = {
+      last_modified: "" + timestamp,
+      data: allRecords,
+    };
+    return CanonicalJSON.stringify(toSerialize, jsesc);
+  },
+
+  async importJSONDump(bucket, collection) {
+    const { data: records, timestamp } = await SharedUtils.loadJSONDump(
+      bucket,
+      collection
+    );
+    if (records === null) {
+      return -1;
+    }
+    if (gShutdown) {
+      throw new Error("Can't import when we've started shutting down.");
+    }
+    await importDumpIDB(bucket, collection, records, timestamp);
+    return records.length;
+  },
+
+  async checkFileHash(fileUrl, size, hash) {
+    let resp;
+    try {
+      resp = await fetch(fileUrl);
+    } catch (e) {
+      return false;
+    }
+    const buffer = await resp.arrayBuffer();
+    return SharedUtils.checkContentHash(buffer, size, hash);
+  },
+
+  async prepareShutdown() {
+    gShutdown = true;
+    let transactions = Array.from(gPendingTransactions);
+    for (let transaction of transactions) {
+      try {
+        transaction.abort();
+      } catch (ex) {
+      }
+    }
+  },
+
+  _test_only_import(bucket, collection, records, timestamp) {
+    return importDumpIDB(bucket, collection, records, timestamp);
+  },
+};
+
+self.onmessage = event => {
+  const { callbackId, method, args = [] } = event.data;
+  Agent[method](...args)
+    .then(result => {
+      self.postMessage({ callbackId, result });
+    })
+    .catch(error => {
+      console.log(`RemoteSettingsWorker error: ${error}`);
+      self.postMessage({ callbackId, error: "" + error });
+    });
+};
+
+let gPendingTransactions = new Set();
+
+async function importDumpIDB(bucket, collection, records, timestamp) {
+  const db = await IDBHelpers.openIDB(false );
+
+  try {
+    if (gShutdown) {
+      throw new Error("Can't import when we've started shutting down.");
+    }
+
+    const cid = bucket + "/" + collection;
+    records.forEach(item => {
+      item._cid = cid;
+    });
+    let { transaction, promise } = IDBHelpers.executeIDB(
+      db,
+      [IDB_RECORDS_STORE, IDB_TIMESTAMPS_STORE],
+      "readwrite",
+      ([recordsStore, timestampStore], rejectTransaction) => {
+        recordsStore.delete(IDBKeyRange.bound([cid], [cid, []], false, true));
+        IDBHelpers.bulkOperationHelper(
+          recordsStore,
+          {
+            reject: rejectTransaction,
+            completion() {
+              timestampStore.put({ cid, value: timestamp });
+            },
+          },
+          "put",
+          records
+        );
+      }
+    );
+    gPendingTransactions.add(transaction);
+    promise = promise.finally(() => gPendingTransactions.delete(transaction));
+    await promise;
+  } finally {
+    db.close();
+  }
+}

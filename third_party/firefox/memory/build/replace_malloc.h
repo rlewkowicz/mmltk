@@ -1,0 +1,47 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef replace_malloc_h
+#define replace_malloc_h
+
+
+#ifdef replace_malloc_bridge_h
+#  error Do not include replace_malloc_bridge.h before replace_malloc.h. \
+  In fact, you only need the latter.
+#endif
+
+#define REPLACE_MALLOC_IMPL
+
+#include "replace_malloc_bridge.h"
+
+#define MOZ_NO_MOZALLOC 1
+
+#include "mozilla/MacroArgs.h"
+#include "mozilla/Types.h"
+
+MOZ_BEGIN_EXTERN_C
+
+#ifndef MOZ_REPLACE_WEAK
+#  define MOZ_REPLACE_WEAK
+#endif
+
+#ifdef MOZ_REPLACE_MALLOC_PREFIX
+#  define replace_init MOZ_CONCAT(MOZ_REPLACE_MALLOC_PREFIX, _init)
+#  define MOZ_REPLACE_PUBLIC
+#else
+#  define MOZ_REPLACE_PUBLIC MOZ_EXPORT
+#endif
+
+struct ReplaceMallocBridge;
+typedef void (*jemalloc_init_func)(malloc_table_t*,
+                                   struct ReplaceMallocBridge**);
+
+MOZ_REPLACE_PUBLIC void replace_init(
+    malloc_table_t*, struct ReplaceMallocBridge**) MOZ_REPLACE_WEAK;
+
+MFBT_API void jemalloc_replace_dynamic(jemalloc_init_func);
+
+MOZ_END_EXTERN_C
+
+#endif  // replace_malloc_h

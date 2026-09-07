@@ -1,0 +1,1575 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/WindowGlobalParent.h"
+
+#include <algorithm>
+
+#include "MMPrinter.h"
+#include "mozilla/AntiTrackingUtils.h"
+#include "mozilla/AsyncEventDispatcher.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/BounceTrackingProtection.h"
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/Components.h"
+#include "mozilla/ContentBlockingAllowList.h"
+#include "mozilla/EnumeratedRange.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/ServoCSSParser.h"
+#include "mozilla/ServoStyleSet.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/StaticPrefs_network.h"
+#include "mozilla/dom/BrowserBridgeParent.h"
+#include "mozilla/dom/BrowserHost.h"
+#include "mozilla/dom/BrowserParent.h"
+#include "mozilla/dom/BrowsingContextGroup.h"
+#include "mozilla/dom/CanonicalBrowsingContext.h"
+#include "mozilla/dom/ChromeUtils.h"
+#include "mozilla/dom/ClientIPCTypes.h"
+#include "mozilla/dom/ClientInfo.h"
+#include "mozilla/dom/ContentChild.h"
+#include "mozilla/dom/ContentParent.h"
+#include "mozilla/dom/DOMException.h"
+#include "mozilla/dom/DOMExceptionBinding.h"
+#include "mozilla/dom/ElementBinding.h"
+#include "mozilla/dom/InProcessParent.h"
+#include "mozilla/dom/JSActorService.h"
+#include "mozilla/dom/JSWindowActorBinding.h"
+#include "mozilla/dom/JSWindowActorParent.h"
+#include "mozilla/dom/MediaController.h"
+#include "mozilla/dom/Navigation.h"
+#include "mozilla/dom/PBackgroundSessionStorageCache.h"
+#include "mozilla/dom/ParentProcessChannelHandle.h"
+#include "mozilla/dom/WindowGlobalChild.h"
+#include "mozilla/dom/ipc/IdType.h"
+#include "mozilla/dom/ipc/StructuredCloneData.h"
+#include "mozilla/ipc/ProtocolUtils.h"
+#include "mozilla/net/CookieCommons.h"
+#include "mozilla/net/CookieServiceParent.h"
+#include "mozilla/net/NeckoParent.h"
+#include "mozilla/net/PCookieServiceParent.h"
+#include "nsContentUtils.h"
+#include "nsDocShell.h"
+#include "nsDocShellLoadState.h"
+#include "nsError.h"
+#include "nsFrameLoader.h"
+#include "nsFrameLoaderOwner.h"
+#include "nsIBrowser.h"
+#include "nsICertOverrideService.h"
+#include "nsICookieManager.h"
+#include "nsICookieService.h"
+#include "nsIEffectiveTLDService.h"
+#include "nsIHttpsOnlyModePermission.h"
+#include "nsIOService.h"
+#include "nsIPromptCollection.h"
+#include "nsISessionStoreFunctions.h"
+#include "nsISiteIntegrityService.h"
+#include "nsITimer.h"
+#include "nsIURIMutator.h"
+#include "nsIWebProgressListener.h"
+#include "nsIX509Cert.h"
+#include "nsIXPConnect.h"
+#include "nsIXULRuntime.h"
+#include "nsImportModule.h"
+#include "nsNetUtil.h"
+#include "nsQueryObject.h"
+#include "nsSandboxFlags.h"
+#include "nsScriptSecurityManager.h"
+
+using namespace mozilla::ipc;
+using namespace mozilla::dom::ipc;
+
+extern mozilla::LazyLogModule gSHIPBFCacheLog;
+
+namespace mozilla::dom {
+
+WindowGlobalParent::WindowGlobalParent(
+    CanonicalBrowsingContext* aBrowsingContext, uint64_t aInnerWindowId,
+    uint64_t aOuterWindowId, FieldValues&& aInit)
+    : WindowContext(aBrowsingContext, aInnerWindowId, aOuterWindowId,
+                    std::move(aInit)),
+      mIsUncommittedInitialDocument(false),
+      mSandboxFlags(0),
+      mDocumentHasLoaded(false),
+      mDocumentHasUserInteracted(false),
+      mBlockAllMixedContent(false),
+      mUpgradeInsecureRequests(false) {
+  MOZ_DIAGNOSTIC_ASSERT(XRE_IsParentProcess(), "Parent process only");
+}
+
+already_AddRefed<WindowGlobalParent> WindowGlobalParent::CreateDisconnected(
+    const WindowGlobalInit& aInit, ContentParent* aForProcess) {
+  RefPtr<CanonicalBrowsingContext> browsingContext =
+      CanonicalBrowsingContext::Get(aInit.context().mBrowsingContextId);
+  if (NS_WARN_IF(!browsingContext)) {
+    return nullptr;
+  }
+
+  MOZ_RELEASE_ASSERT(!aInit.staticCloneOf().IsDiscarded());
+
+  RefPtr<WindowGlobalParent> wgp =
+      GetByInnerWindowId(aInit.context().mInnerWindowId);
+  MOZ_RELEASE_ASSERT(!wgp, "Creating duplicate WindowGlobalParent");
+
+  FieldValues fields(aInit.context().mFields);
+  wgp =
+      new WindowGlobalParent(browsingContext, aInit.context().mInnerWindowId,
+                             aInit.context().mOuterWindowId, std::move(fields));
+  wgp->mDocumentPrincipal = aInit.principal();
+  wgp->mDocumentURI = aInit.documentURI();
+  if (aInit.isVideoDocument() && wgp->mDocumentURI) {
+    wgp->RecordSubsequentNoCorsRequestState(wgp->mDocumentURI);
+  }
+  wgp->mStaticCloneOf = aInit.staticCloneOf().get_canonical();
+  wgp->mIsInitialDocument = Some(aInit.isInitialDocument());
+  wgp->mIsUncommittedInitialDocument = aInit.isUncommittedInitialDocument();
+  wgp->mBlockAllMixedContent = aInit.blockAllMixedContent();
+  wgp->mUpgradeInsecureRequests = aInit.upgradeInsecureRequests();
+  wgp->mSandboxFlags = aInit.sandboxFlags();
+  wgp->mHttpsOnlyStatus = aInit.httpsOnlyStatus();
+  net::CookieJarSettings::Deserialize(aInit.cookieJarSettings(),
+                                      getter_AddRefs(wgp->mCookieJarSettings));
+  MOZ_RELEASE_ASSERT(wgp->mDocumentPrincipal, "Must have a valid principal");
+  MOZ_RELEASE_ASSERT(
+      !aForProcess || !wgp->mStaticCloneOf ||
+          wgp->mStaticCloneOf->GetContentParent() == aForProcess,
+      "Cannot static clone from a document in a different process!");
+
+  nsresult rv = wgp->SetDocumentStoragePrincipal(aInit.storagePrincipal());
+  MOZ_RELEASE_ASSERT(NS_SUCCEEDED(rv),
+                     "Must succeed in setting storage principal");
+
+  if (aInit.documentChannelHandle()) {
+    auto result = aInit.documentChannelHandle()->GetChannel(
+        browsingContext, wgp->mStaticCloneOf);
+    if (result.isOk()) {
+      wgp->mDocumentChannel = result.unwrap();
+    } else {
+      MOZ_CRASH_UNSAFE_PRINTF("Invalid documentChannelHandle: %s",
+                              result.unwrapErr().get());
+    }
+  }
+
+  if (aInit.failedChannelHandle()) {
+    auto result = aInit.failedChannelHandle()->GetChannel(browsingContext,
+                                                          wgp->mStaticCloneOf);
+    if (result.isOk()) {
+      wgp->mFailedChannel = result.unwrap();
+    } else {
+      MOZ_CRASH_UNSAFE_PRINTF("Invalid failedChannelHandle: %s",
+                              result.unwrapErr().get());
+    }
+  }
+
+  return wgp.forget();
+}
+
+void WindowGlobalParent::Init() {
+  MOZ_ASSERT(Manager(), "Should have a manager!");
+
+  WindowContext::Init();
+
+  dom::ContentParentId processId(0);
+  ContentParent* cp = nullptr;
+  if (!IsInProcess()) {
+    cp = static_cast<ContentParent*>(Manager()->Manager());
+    processId = cp->ChildID();
+
+    cp->TransmitPermissionsForPrincipal(mDocumentPrincipal);
+  }
+
+  MOZ_DIAGNOSTIC_ASSERT(
+      !BrowsingContext()->GetParent() ||
+          BrowsingContext()->GetEmbedderInnerWindowId(),
+      "When creating a non-root WindowGlobalParent, the WindowGlobalParent "
+      "for our embedder should've already been created.");
+
+  if (!mDocumentURI) {
+    NS_NewURI(getter_AddRefs(mDocumentURI), "about:blank");
+  }
+
+  IPCInitializer ipcinit = GetIPCInitializer();
+  Group()->EachOtherParent(cp, [&](ContentParent* otherContent) {
+    (void)otherContent->SendCreateWindowContext(ipcinit);
+  });
+
+  if (!BrowsingContext()->IsDiscarded()) {
+    MOZ_ALWAYS_SUCCEEDS(
+        BrowsingContext()->SetCurrentInnerWindowId(InnerWindowId()));
+  }
+
+  if (BrowsingContext()->IsTopContent()) {
+    if (mSandboxFlags & SANDBOXED_ORIGIN) {
+      ContentBlockingAllowList::RecomputePrincipal(
+          mDocumentURI, mDocumentPrincipal->OriginAttributesRef(),
+          getter_AddRefs(mDocContentBlockingAllowListPrincipal));
+    } else {
+      ContentBlockingAllowList::ComputePrincipal(
+          mDocumentPrincipal,
+          getter_AddRefs(mDocContentBlockingAllowListPrincipal));
+    }
+  }
+
+  if (auto* top = BrowsingContext()->Top();
+      top && top->HasCreatedMediaController()) {
+    top->GetMediaController()->ClearAudioSessionFor(BrowsingContext()->Id());
+  }
+
+  nsCOMPtr<nsIObserverService> obs = services::GetObserverService();
+  if (obs) {
+    obs->NotifyObservers(ToSupports(this), "window-global-created", nullptr);
+  }
+
+}
+
+already_AddRefed<WindowGlobalParent> WindowGlobalParent::GetByInnerWindowId(
+    uint64_t aInnerWindowId) {
+  if (!XRE_IsParentProcess()) {
+    return nullptr;
+  }
+
+  return WindowContext::GetById(aInnerWindowId).downcast<WindowGlobalParent>();
+}
+
+already_AddRefed<WindowGlobalChild> WindowGlobalParent::GetChildActor() {
+  if (!CanSend()) {
+    return nullptr;
+  }
+  IProtocol* otherSide = InProcessParent::ChildActorFor(this);
+  return do_AddRef(static_cast<WindowGlobalChild*>(otherSide));
+}
+
+BrowserParent* WindowGlobalParent::GetBrowserParent() const {
+  if (IsInProcess() || !CanSend()) {
+    return nullptr;
+  }
+  return static_cast<BrowserParent*>(Manager());
+}
+
+ContentParent* WindowGlobalParent::GetContentParent() {
+  if (IsInProcess() || !CanSend()) {
+    return nullptr;
+  }
+  return static_cast<ContentParent*>(Manager()->Manager());
+}
+
+already_AddRefed<nsFrameLoader> WindowGlobalParent::GetRootFrameLoader() {
+  dom::BrowsingContext* top = BrowsingContext()->Top();
+
+  RefPtr<nsFrameLoaderOwner> frameLoaderOwner =
+      do_QueryObject(top->GetEmbedderElement());
+  if (frameLoaderOwner) {
+    return frameLoaderOwner->GetFrameLoader();
+  }
+  return nullptr;
+}
+
+uint64_t WindowGlobalParent::ContentParentId() {
+  RefPtr<BrowserParent> browserParent = GetBrowserParent();
+  return browserParent ? browserParent->Manager()->ChildID() : 0;
+}
+
+int32_t WindowGlobalParent::OsPid() {
+  RefPtr<BrowserParent> browserParent = GetBrowserParent();
+  return browserParent ? browserParent->Manager()->Pid() : -1;
+}
+
+bool WindowGlobalParent::IsProcessRoot() {
+  if (!BrowsingContext()->GetParent()) {
+    return true;
+  }
+
+  RefPtr<WindowGlobalParent> embedder =
+      BrowsingContext()->GetEmbedderWindowGlobal();
+  if (NS_WARN_IF(!embedder)) {
+    return false;
+  }
+
+  return ContentParentId() != embedder->ContentParentId();
+}
+
+uint32_t WindowGlobalParent::ContentBlockingEvents() {
+  return GetContentBlockingLog()->GetContentBlockingEventsInLog();
+}
+
+void WindowGlobalParent::GetContentBlockingLog(nsAString& aLog) {
+  NS_ConvertUTF8toUTF16 log(GetContentBlockingLog()->Stringify());
+  aLog.Assign(std::move(log));
+}
+
+mozilla::ipc::IPCResult WindowGlobalParent::RecvLoadURI(
+    const MaybeDiscarded<dom::BrowsingContext>& aTargetBC,
+    nsDocShellLoadState* aLoadState, bool aSetNavigating) {
+  if (aTargetBC.IsNullOrDiscarded()) {
+    MOZ_LOG(
+        BrowsingContext::GetLog(), LogLevel::Debug,
+        ("ParentIPC: Trying to send a message with dead or detached context"));
+    return IPC_OK();
+  }
+
+  if (aLoadState->URI()->SchemeIs("javascript")) {
+    return IPC_FAIL(this, "Illegal cross-process javascript: load attempt");
+  }
+
+  RefPtr<CanonicalBrowsingContext> targetBC = aTargetBC.get_canonical();
+
+  if (targetBC->Group() != BrowsingContext()->Group()) {
+    return IPC_FAIL(this, "Illegal cross-group BrowsingContext load");
+  }
+
+  if (!nsContentUtils::CanNavigate(BrowsingContext(), targetBC.get(),
+                                   DocumentPrincipal(), true)) {
+    return IPC_FAIL(this,
+                    "Illegal cross-process load attempt (!CanNavigate())");
+  }
+
+
+  targetBC->LoadURI(aLoadState, aSetNavigating);
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult WindowGlobalParent::RecvInternalLoad(
+    nsDocShellLoadState* aLoadState) {
+  if (!aLoadState->Target().IsEmpty() ||
+      aLoadState->TargetBrowsingContext().IsNull()) {
+    return IPC_FAIL(this, "must already be retargeted");
+  }
+  if (aLoadState->TargetBrowsingContext().IsDiscarded()) {
+    MOZ_LOG(
+        BrowsingContext::GetLog(), LogLevel::Debug,
+        ("ParentIPC: Trying to send a message with dead or detached context"));
+    return IPC_OK();
+  }
+
+  if (aLoadState->URI()->SchemeIs("javascript")) {
+    return IPC_FAIL(this, "Illegal cross-process javascript: load attempt");
+  }
+
+  RefPtr<CanonicalBrowsingContext> targetBC =
+      aLoadState->TargetBrowsingContext().get_canonical();
+
+  if (targetBC->Group() != BrowsingContext()->Group()) {
+    return IPC_FAIL(this, "Illegal cross-group BrowsingContext load");
+  }
+
+  if (!nsContentUtils::CanNavigate(BrowsingContext(), targetBC.get(),
+                                   DocumentPrincipal(), true)) {
+    return IPC_FAIL(this,
+                    "Illegal cross-process load attempt (!CanNavigate())");
+  }
+
+
+  targetBC->InternalLoad(aLoadState);
+  return IPC_OK();
+}
+
+IPCResult WindowGlobalParent::RecvUpdateDocumentURI(NotNull<nsIURI*> aURI) {
+  nsAutoCString scheme;
+  if (NS_FAILED(aURI->GetScheme(scheme))) {
+    return IPC_FAIL(this, "Setting DocumentURI without scheme.");
+  }
+
+  nsCOMPtr<nsIIOService> ios = do_GetIOService();
+  if (!ios) {
+    return IPC_FAIL(this, "Cannot get IOService");
+  }
+  nsCOMPtr<nsIProtocolHandler> handler;
+  ios->GetProtocolHandler(scheme.get(), getter_AddRefs(handler));
+  if (!handler) {
+    return IPC_FAIL(this, "Setting DocumentURI with unknown protocol.");
+  }
+
+  nsCOMPtr<nsIURI> principalURI = mDocumentPrincipal->GetURI();
+  if (mDocumentPrincipal->GetIsNullPrincipal()) {
+    if (nsCOMPtr<nsIPrincipal> precursor =
+            mDocumentPrincipal->GetPrecursorPrincipal()) {
+      principalURI = precursor->GetURI();
+    }
+  }
+
+  if (nsScriptSecurityManager::IsHttpOrHttpsAndCrossOrigin(principalURI,
+                                                           aURI)) {
+    return IPC_FAIL(this,
+                    "Setting DocumentURI with a different Origin than "
+                    "principal URI");
+  }
+
+  mDocumentURI = std::move(aURI);
+  return IPC_OK();
+}
+
+nsresult WindowGlobalParent::SetDocumentStoragePrincipal(
+    nsIPrincipal* aNewDocumentStoragePrincipal) {
+  if (mDocumentPrincipal->Equals(aNewDocumentStoragePrincipal)) {
+    mDocumentStoragePrincipal = mDocumentPrincipal;
+    return NS_OK;
+  }
+
+  nsCString noSuffix;
+  nsresult rv = mDocumentPrincipal->GetOriginNoSuffix(noSuffix);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  nsCString storageNoSuffix;
+  rv = aNewDocumentStoragePrincipal->GetOriginNoSuffix(storageNoSuffix);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  if (noSuffix != storageNoSuffix) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (!mDocumentPrincipal->OriginAttributesRef().EqualsIgnoringPartitionKey(
+          aNewDocumentStoragePrincipal->OriginAttributesRef())) {
+    return NS_ERROR_FAILURE;
+  }
+
+  mDocumentStoragePrincipal = aNewDocumentStoragePrincipal;
+  return NS_OK;
+}
+
+IPCResult WindowGlobalParent::RecvUpdateDocumentPrincipal(
+    nsIPrincipal* aNewDocumentPrincipal,
+    nsIPrincipal* aNewDocumentStoragePrincipal) {
+  if (!mDocumentPrincipal->Equals(aNewDocumentPrincipal)) {
+    return IPC_FAIL(this,
+                    "Trying to reuse WindowGlobalParent but the principal of "
+                    "the new document does not match the old one");
+  }
+  mDocumentPrincipal = aNewDocumentPrincipal;
+
+  if (NS_FAILED(SetDocumentStoragePrincipal(aNewDocumentStoragePrincipal))) {
+    return IPC_FAIL(this,
+                    "Trying to reuse WindowGlobalParent but the principal of "
+                    "the new document does not match the storage principal");
+  }
+
+  return IPC_OK();
+}
+mozilla::ipc::IPCResult WindowGlobalParent::RecvUpdateDocumentTitle(
+    const nsString& aTitle) {
+  if (mDocumentTitle.isSome() && mDocumentTitle.value() == aTitle) {
+    return IPC_OK();
+  }
+
+  mDocumentTitle = Some(aTitle);
+
+  if (!BrowsingContext()->IsTop()) {
+    return IPC_OK();
+  }
+
+  if (BrowsingContext()->HasCreatedMediaController()) {
+    BrowsingContext()->GetMediaController()->NotifyPageTitleChanged();
+  }
+
+  Element* frameElement = BrowsingContext()->GetEmbedderElement();
+  if (!frameElement) {
+    return IPC_OK();
+  }
+
+  AsyncEventDispatcher::RunDOMEventWhenSafe(
+      *frameElement, u"pagetitlechanged"_ns, CanBubble::eYes,
+      ChromeOnlyDispatch::eYes);
+
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult WindowGlobalParent::RecvUpdateHttpsOnlyStatus(
+    uint32_t aHttpsOnlyStatus) {
+  mHttpsOnlyStatus = aHttpsOnlyStatus;
+  return IPC_OK();
+}
+
+IPCResult WindowGlobalParent::RecvUpdateDocumentHasLoaded(
+    bool aDocumentHasLoaded) {
+  mDocumentHasLoaded = aDocumentHasLoaded;
+  return IPC_OK();
+}
+
+IPCResult WindowGlobalParent::RecvUpdateDocumentHasUserInteracted(
+    bool aDocumentHasUserInteracted) {
+  mDocumentHasUserInteracted = aDocumentHasUserInteracted;
+  return IPC_OK();
+}
+
+IPCResult WindowGlobalParent::RecvUpdateSandboxFlags(uint32_t aSandboxFlags) {
+  mSandboxFlags = aSandboxFlags;
+  return IPC_OK();
+}
+
+IPCResult WindowGlobalParent::RecvUpdateDocumentCspSettings(
+    bool aBlockAllMixedContent, bool aUpgradeInsecureRequests) {
+  mBlockAllMixedContent = aBlockAllMixedContent;
+  mUpgradeInsecureRequests = aUpgradeInsecureRequests;
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult WindowGlobalParent::RecvSetClientInfo(
+    const IPCClientInfo& aIPCClientInfo) {
+  mClientInfo = Some(ClientInfo(aIPCClientInfo));
+  return IPC_OK();
+}
+
+IPCResult WindowGlobalParent::RecvDestroy() {
+  JSActorWillDestroy();
+
+  if (CanSend()) {
+    RefPtr<BrowserParent> browserParent = GetBrowserParent();
+    if (!browserParent || !browserParent->IsDestroyed()) {
+      (void)Send__delete__(this);
+    }
+  }
+  return IPC_OK();
+}
+
+IPCResult WindowGlobalParent::RecvRawMessage(const JSActorMessageMeta& aMeta,
+                                             JSIPCValue&& aData,
+                                             StructuredCloneData* aStack) {
+  ReceiveRawMessage(aMeta, std::move(aData), aStack);
+  return IPC_OK();
+}
+
+const nsACString& WindowGlobalParent::GetRemoteType() const {
+  if (RefPtr<BrowserParent> browserParent = GetBrowserParent()) {
+    return browserParent->Manager()->GetRemoteType();
+  }
+
+  return NOT_REMOTE_TYPE;
+}
+
+void WindowGlobalParent::GetRemoteType(nsACString& aRemoteType) const {
+  aRemoteType = GetRemoteType();
+}
+
+void WindowGlobalParent::NotifyContentBlockingEvent(
+    uint32_t aEvent, nsIRequest* aRequest, bool aBlocked,
+    const nsACString& aTrackingOrigin,
+    const nsTArray<nsCString>& aTrackingFullHashes,
+    const Maybe<ContentBlockingNotifier::StorageAccessPermissionGrantedReason>&
+        aReason,
+    const Maybe<CanvasFingerprintingEvent>& aCanvasFingerprintingEvent) {
+  MOZ_ASSERT(NS_IsMainThread());
+  DebugOnly<bool> isCookiesBlocked =
+      aEvent == nsIWebProgressListener::STATE_COOKIES_BLOCKED_TRACKER ||
+      aEvent == nsIWebProgressListener::STATE_COOKIES_BLOCKED_SOCIALTRACKER;
+  MOZ_ASSERT_IF(aBlocked, aReason.isNothing());
+  MOZ_ASSERT_IF(!isCookiesBlocked, aReason.isNothing());
+  MOZ_ASSERT_IF(isCookiesBlocked && !aBlocked, aReason.isSome());
+  MOZ_DIAGNOSTIC_ASSERT(XRE_IsParentProcess());
+
+  if (IsInProcess()) {
+    return;
+  }
+
+  Maybe<uint32_t> event = GetContentBlockingLog()->RecordLogParent(
+      aTrackingOrigin, aEvent, aBlocked, aReason, aTrackingFullHashes,
+      aCanvasFingerprintingEvent);
+
+  if (event) {
+    if (auto* webProgress = GetBrowsingContext()->GetWebProgress()) {
+      webProgress->OnContentBlockingEvent(webProgress, aRequest, event.value());
+    }
+  }
+}
+
+already_AddRefed<JSWindowActorParent> WindowGlobalParent::GetActor(
+    JSContext* aCx, const nsACString& aName, ErrorResult& aRv) {
+  return JSActorManager::GetActor(aCx, aName, aRv)
+      .downcast<JSWindowActorParent>();
+}
+
+already_AddRefed<JSWindowActorParent> WindowGlobalParent::GetExistingActor(
+    const nsACString& aName) {
+  return JSActorManager::GetExistingActor(aName)
+      .downcast<JSWindowActorParent>();
+}
+
+already_AddRefed<JSActor> WindowGlobalParent::InitJSActor(
+    JS::Handle<JSObject*> aMaybeActor, const nsACString& aName,
+    ErrorResult& aRv) {
+  RefPtr<JSWindowActorParent> actor;
+  if (aMaybeActor.get()) {
+    aRv = UNWRAP_OBJECT(JSWindowActorParent, aMaybeActor.get(), actor);
+    if (aRv.Failed()) {
+      return nullptr;
+    }
+  } else {
+    actor = new JSWindowActorParent();
+  }
+
+  MOZ_RELEASE_ASSERT(!actor->GetManager(),
+                     "mManager was already initialized once!");
+  actor->Init(aName, this);
+  return actor.forget();
+}
+
+bool WindowGlobalParent::IsCurrentGlobal() {
+  if (BrowsingContext() && BrowsingContext()->IsInBFCache()) {
+    return false;
+  }
+
+  return CanSend() && BrowsingContext()->GetCurrentWindowGlobal() == this;
+}
+
+bool WindowGlobalParent::IsActiveInTab() {
+  if (!CanSend()) {
+    return false;
+  }
+
+  CanonicalBrowsingContext* bc = BrowsingContext();
+  if (!bc || bc->GetCurrentWindowGlobal() != this) {
+    return false;
+  }
+
+  MOZ_ASSERT(bc->Top()->IsInBFCache() == bc->IsInBFCache(),
+             "BFCache bit out of sync?");
+  return bc->AncestorsAreCurrent() && !bc->Top()->IsInBFCache();
+}
+
+mozilla::ipc::IPCResult WindowGlobalParent::RecvGetContentBlockingEvents(
+    WindowGlobalParent::GetContentBlockingEventsResolver&& aResolver) {
+  uint32_t events = GetContentBlockingLog()->GetContentBlockingEventsInLog();
+  aResolver(events);
+
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult WindowGlobalParent::RecvUpdateCookieJarSettings(
+    const CookieJarSettingsArgs& aCookieJarSettingsArgs) {
+  net::CookieJarSettings::Deserialize(aCookieJarSettingsArgs,
+                                      getter_AddRefs(mCookieJarSettings));
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult WindowGlobalParent::RecvUpdateChannels(
+    ParentProcessChannelHandle* aDocumentHandle,
+    ParentProcessChannelHandle* aFailedHandle) {
+  nsCOMPtr<nsIChannel> documentChannel;
+  if (aDocumentHandle) {
+    auto result = aDocumentHandle->GetChannel(BrowsingContext());
+    if (result.isOk()) {
+      documentChannel = result.unwrap();
+    } else {
+      MOZ_CRASH_UNSAFE_PRINTF("Invalid aDocumentHandle: %s",
+                              result.unwrapErr().get());
+    }
+  }
+
+  nsCOMPtr<nsIChannel> failedChannel;
+  if (aFailedHandle) {
+    auto result = aFailedHandle->GetChannel(BrowsingContext());
+    if (result.isOk()) {
+      failedChannel = result.unwrap();
+    } else {
+      MOZ_CRASH_UNSAFE_PRINTF("Invalid aFailedHandle: %s",
+                              result.unwrapErr().get());
+    }
+  }
+
+  if ((mDocumentChannel || mFailedChannel) &&
+      (mDocumentChannel != documentChannel ||
+       mFailedChannel != failedChannel)) {
+    return IPC_FAIL(this,
+                    "Conflicting attempts to set ParentProcessChannelHandle on "
+                    "WindowGlobalParent");
+  }
+
+  mDocumentChannel = documentChannel;
+  mFailedChannel = failedChannel;
+
+  return IPC_OK();
+}
+
+already_AddRefed<nsIChannel> WindowGlobalParent::GetDocumentChannel() {
+  if (mDocumentChannel) {
+    return do_AddRef(mDocumentChannel);
+  }
+  if (Document* doc = GetExtantDoc()) {
+    return do_AddRef(doc->GetChannel());
+  }
+  return nullptr;
+}
+
+already_AddRefed<nsIChannel> WindowGlobalParent::GetFailedChannel() {
+  if (mFailedChannel) {
+    return do_AddRef(mFailedChannel);
+  }
+  if (Document* doc = GetExtantDoc()) {
+    return do_AddRef(doc->GetFailedChannel());
+  }
+  return nullptr;
+}
+
+dom::NoCorsMediaRequestState WindowGlobalParent::NoCorsMediaRequestState(
+    nsIURI* aURI) const {
+  nsCString uri;
+  return (NS_SUCCEEDED(aURI->GetSpecIgnoringRef(uri)) &&
+          mNoCorsMediaRequestURIs.Contains(uri))
+             ? dom::NoCorsMediaRequestState::Subsequent
+             : dom::NoCorsMediaRequestState::Initial;
+}
+
+void WindowGlobalParent::RecordSubsequentNoCorsRequestState(nsIURI* aURI) {
+  nsCString uri;
+  if (NS_SUCCEEDED(aURI->GetSpecIgnoringRef(uri)) && !uri.IsEmpty()) {
+    mNoCorsMediaRequestURIs.PutEntry(uri);
+  }
+}
+
+namespace {
+
+class CheckPermitUnloadRequest final : public PromiseNativeHandler,
+                                       public nsITimerCallback {
+ public:
+  CheckPermitUnloadRequest(
+      WindowGlobalParent* aWGP, bool aHasInProcessBlocker,
+      nsIDocumentViewer::PermitUnloadAction aAction,
+      std::function<void(nsIDocumentViewer::PermitUnloadResult)>&& aResolver)
+      : mResolver(std::move(aResolver)),
+        mWGP(aWGP),
+        mAction(aAction),
+        mFoundBlocker(aHasInProcessBlocker) {}
+
+  void RunTraversable(nsDocShellLoadState* aDocShellLoadState) {
+    MOZ_DIAGNOSTIC_ASSERT(mWGP->BrowsingContext()->IsTop());
+    Run(nullptr, 0, aDocShellLoadState);
+  }
+
+  void RunChildNavigables() {
+    MOZ_DIAGNOSTIC_ASSERT(mWGP->BrowsingContext()->IsTop());
+    Run(mWGP->BrowsingContext()->GetContentParent(), 0);
+  }
+
+  void Run(ContentParent* aIgnoreProcess = nullptr, uint32_t aTimeout = 0,
+           nsDocShellLoadState* aDocShellLoadState = nullptr) {
+    MOZ_ASSERT(mState == State::UNINITIALIZED);
+    mState = State::WAITING;
+
+    RefPtr<CheckPermitUnloadRequest> self(this);
+
+    AutoTArray<ContentParent*, 8> seen;
+    if (aIgnoreProcess) {
+      seen.AppendElement(aIgnoreProcess);
+    }
+
+    BrowsingContext* bc = mWGP->GetBrowsingContext();
+    auto resolve = [self](nsIDocumentViewer::PermitUnloadResult aResult) {
+      self->mFoundBlocker =
+          aResult == nsIDocumentViewer::eCanceledByBeforeUnload;
+      self->mReason = aResult;
+      self->ResolveRequest();
+    };
+    auto reject = [self](auto) { self->ResolveRequest(); };
+    if (aDocShellLoadState) {
+      MOZ_DIAGNOSTIC_ASSERT(Navigation::IsAPIEnabled());
+      ContentParent* cp = mWGP->GetContentParent();
+      mPendingRequests++;
+      mozilla::NotNull<RefPtr<nsDocShellLoadState>> loadState =
+          WrapNotNull(aDocShellLoadState);
+      if (mAction ==
+          nsIDocumentViewer::PermitUnloadAction::eDontPromptAndUnload) {
+        cp->SendDispatchNavigateToTraversable(bc, loadState, resolve, reject);
+      } else {
+        cp->SendDispatchBeforeUnloadToSubtree(bc, Some(loadState), resolve,
+                                              reject);
+      }
+    } else {
+      bc->PreOrderWalk([&](dom::BrowsingContext* aBC) {
+        if (WindowGlobalParent* wgp =
+                aBC->Canonical()->GetCurrentWindowGlobal()) {
+          ContentParent* cp = wgp->GetContentParent();
+          if (wgp->NeedsBeforeUnload() && !seen.ContainsSorted(cp)) {
+            seen.InsertElementSorted(cp);
+            mPendingRequests++;
+
+            if (cp) {
+              cp->SendDispatchBeforeUnloadToSubtree(bc, Nothing(), resolve,
+                                                    reject);
+            } else {
+              NS_DispatchToMainThread(NS_NewRunnableFunction(
+                  "DispatchBeforeUnloadToSubtree",
+                  [bc = RefPtr{bc}, resolve]() {
+                    ContentChild::DispatchBeforeUnloadToSubtree(bc, Nothing(),
+                                                                resolve);
+                  }));
+            }
+          }
+        }
+      });
+    }
+
+    if (mPendingRequests && aTimeout) {
+      (void)NS_NewTimerWithCallback(getter_AddRefs(mTimer), this, aTimeout,
+                                    nsITimer::TYPE_ONE_SHOT);
+    }
+
+    CheckDoneWaiting();
+  }
+
+  void ResolveRequest() {
+    mPendingRequests--;
+    CheckDoneWaiting();
+  }
+
+  NS_IMETHODIMP Notify(nsITimer* aTimer) override {
+    MOZ_ASSERT(aTimer == mTimer);
+    if (mState == State::WAITING) {
+      mState = State::TIMED_OUT;
+      CheckDoneWaiting();
+    }
+    return NS_OK;
+  }
+
+  void CheckDoneWaiting() {
+    if (mState != State::TIMED_OUT &&
+        (mState != State::WAITING || (mPendingRequests && !mFoundBlocker))) {
+      return;
+    }
+
+    mState = State::PROMPTING;
+
+    mTimer = nullptr;
+
+    if (!mFoundBlocker) {
+      SendReply();
+      return;
+    }
+
+    auto action = mAction;
+    if (StaticPrefs::dom_disable_beforeunload()) {
+      action = nsIDocumentViewer::eDontPromptAndUnload;
+    }
+    if (action != nsIDocumentViewer::ePrompt) {
+      if (action == nsIDocumentViewer::eDontPromptAndUnload) {
+        mReason = nsIDocumentViewer::eContinue;
+      } else {
+        mReason = nsIDocumentViewer::eCanceledByBeforeUnload;
+      }
+      SendReply();
+      return;
+    }
+
+    auto cleanup = MakeScopeExit([&]() {
+      mReason = nsIDocumentViewer::eCanceledByBeforeUnload;
+      SendReply();
+    });
+
+    if (nsCOMPtr<nsIPromptCollection> prompt =
+            do_GetService("@mozilla.org/embedcomp/prompt-collection;1")) {
+      RefPtr<Promise> promise;
+      prompt->AsyncBeforeUnloadCheck(mWGP->GetBrowsingContext(),
+                                     getter_AddRefs(promise));
+
+      if (!promise) {
+        return;
+      }
+
+      promise->AppendNativeHandler(this);
+      cleanup.release();
+    }
+  }
+
+  void SendReply() {
+    MOZ_ASSERT(mState != State::REPLIED);
+    mResolver(mReason);
+    mState = State::REPLIED;
+  }
+
+  void ResolvedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue,
+                        ErrorResult& aRv) override {
+    MOZ_ASSERT(mState == State::PROMPTING);
+    if (!JS::ToBoolean(aValue)) {
+      mReason = nsIDocumentViewer::eCanceledByBeforeUnload;
+    } else {
+      mReason = nsIDocumentViewer::eContinue;
+    }
+
+    SendReply();
+  }
+
+  void RejectedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue,
+                        ErrorResult& aRv) override {
+    MOZ_ASSERT(mState == State::PROMPTING);
+
+    mReason = nsIDocumentViewer::eCanceledByBeforeUnload;
+    SendReply();
+  }
+
+  NS_DECL_ISUPPORTS
+
+ private:
+  ~CheckPermitUnloadRequest() {
+    if (mState != State::REPLIED) {
+      mReason = nsIDocumentViewer::eCanceledByBeforeUnload;
+      SendReply();
+    }
+  }
+
+  enum class State : uint8_t {
+    UNINITIALIZED,
+    WAITING,
+    TIMED_OUT,
+    PROMPTING,
+    REPLIED,
+  };
+
+  std::function<void(nsIDocumentViewer::PermitUnloadResult)> mResolver;
+
+  RefPtr<WindowGlobalParent> mWGP;
+  nsCOMPtr<nsITimer> mTimer;
+
+  uint32_t mPendingRequests = 0;
+
+  nsIDocumentViewer::PermitUnloadAction mAction;
+
+  State mState = State::UNINITIALIZED;
+
+  bool mFoundBlocker = false;
+
+  nsIDocumentViewer::PermitUnloadResult mReason = nsIDocumentViewer::eContinue;
+};
+
+NS_IMPL_ISUPPORTS(CheckPermitUnloadRequest, nsITimerCallback)
+
+}  
+
+mozilla::ipc::IPCResult WindowGlobalParent::RecvCheckPermitUnload(
+    bool aHasInProcessBlocker, XPCOMPermitUnloadAction aAction,
+    CheckPermitUnloadResolver&& aResolver) {
+  if (!IsCurrentGlobal()) {
+    aResolver(false);
+    return IPC_OK();
+  }
+
+  auto request = MakeRefPtr<CheckPermitUnloadRequest>(
+      this, aHasInProcessBlocker, aAction,
+      [resolver = std::move(aResolver)](
+          nsIDocumentViewer::PermitUnloadResult aResult) {
+        resolver(aResult == nsIDocumentViewer::eContinue);
+      });
+  request->Run( GetContentParent());
+
+  return IPC_OK();
+}
+
+already_AddRefed<Promise> WindowGlobalParent::PermitUnload(
+    PermitUnloadAction aAction, uint32_t aTimeout, mozilla::ErrorResult& aRv) {
+  nsIGlobalObject* global = GetParentObject();
+  RefPtr<Promise> promise = Promise::Create(global, aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+
+  auto request = MakeRefPtr<CheckPermitUnloadRequest>(
+      this,  false,
+      nsIDocumentViewer::PermitUnloadAction(aAction),
+      [promise](nsIDocumentViewer::PermitUnloadResult aResult) {
+        promise->MaybeResolve(aResult == nsIDocumentViewer::eContinue);
+      });
+  request->Run( nullptr, aTimeout);
+
+  return promise.forget();
+}
+
+void WindowGlobalParent::PermitUnload(
+    std::function<void(nsIDocumentViewer::PermitUnloadResult)>&& aResolver) {
+  RefPtr<CheckPermitUnloadRequest> request =
+      MakeRefPtr<CheckPermitUnloadRequest>(
+          this,  false,
+          nsIDocumentViewer::PermitUnloadAction::ePrompt, std::move(aResolver));
+  request->Run();
+}
+
+void WindowGlobalParent::CheckIfUnloadingIsCanceledForTraversable(
+    nsDocShellLoadState* aDocShellLoadState,
+    nsIDocumentViewer::PermitUnloadAction aAction,
+    std::function<void(nsIDocumentViewer::PermitUnloadResult)>&& aResolver) {
+  MOZ_DIAGNOSTIC_ASSERT(BrowsingContext()->IsTop());
+  RefPtr<CheckPermitUnloadRequest> request =
+      MakeRefPtr<CheckPermitUnloadRequest>(this,
+                                            false,
+                                           aAction, std::move(aResolver));
+  request->RunTraversable(aDocShellLoadState);
+}
+
+void WindowGlobalParent::PermitUnloadChildNavigables(
+    nsIDocumentViewer::PermitUnloadAction aAction,
+    std::function<void(nsIDocumentViewer::PermitUnloadResult)>&& aResolver) {
+  RefPtr<CheckPermitUnloadRequest> request =
+      MakeRefPtr<CheckPermitUnloadRequest>(this,
+                                            false,
+                                           aAction, std::move(aResolver));
+  request->RunChildNavigables();
+}
+
+already_AddRefed<mozilla::dom::Promise> WindowGlobalParent::DrawSnapshot(
+    const DOMRect* aRect, double aScale, const nsACString& aBackgroundColor,
+    bool aResetScrollPosition, mozilla::ErrorResult& aRv) {
+  nsIGlobalObject* global = GetParentObject();
+  RefPtr<Promise> promise = Promise::Create(global, aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+
+  nscolor color;
+  if (NS_WARN_IF(!ServoCSSParser::ComputeColor(nullptr, NS_RGB(0, 0, 0),
+                                               aBackgroundColor, &color,
+                                               nullptr, nullptr))) {
+    aRv = NS_ERROR_FAILURE;
+    return nullptr;
+  }
+
+  gfx::CrossProcessPaintFlags flags =
+      gfx::CrossProcessPaintFlags::UseHighQualityScaling;
+  if (!aRect) {
+    flags |= gfx::CrossProcessPaintFlags::DrawView;
+  } else if (aResetScrollPosition) {
+    flags |= gfx::CrossProcessPaintFlags::ResetScrollPosition;
+  }
+
+  if (!gfx::CrossProcessPaint::Start(this, aRect, (float)aScale, color, flags,
+                                     promise)) {
+    aRv = NS_ERROR_FAILURE;
+    return nullptr;
+  }
+  return promise.forget();
+}
+
+void WindowGlobalParent::DrawSnapshotInternal(
+    gfx::CrossProcessPaint* aPaint, const Maybe<IntRect>& aRect, float aScale,
+    nscolor aBackgroundColor, gfx::CrossProcessPaintFlags aFlags) {
+  auto promise = SendDrawSnapshot(aRect, aScale, aBackgroundColor, aFlags);
+
+  RefPtr<gfx::CrossProcessPaint> paint(aPaint);
+  RefPtr<WindowGlobalParent> wgp(this);
+  promise->Then(
+      GetMainThreadSerialEventTarget(), __func__,
+      [paint, wgp](PaintFragment&& aFragment) {
+        paint->ReceiveFragment(wgp, std::move(aFragment));
+      },
+      [paint, wgp](ResponseRejectReason&& aReason) {
+        paint->LostFragment(wgp);
+      });
+}
+
+
+Element* WindowGlobalParent::GetRootOwnerElement() {
+  WindowGlobalParent* top = TopWindowContext();
+  if (!top) {
+    return nullptr;
+  }
+
+  if (IsInProcess()) {
+    return top->BrowsingContext()->GetEmbedderElement();
+  }
+
+  if (BrowserParent* parent = top->GetBrowserParent()) {
+    return parent->GetOwnerElement();
+  }
+
+  return nullptr;
+}
+
+void WindowGlobalParent::NotifySessionStoreUpdatesComplete(Element* aEmbedder) {
+  if (!aEmbedder) {
+    aEmbedder = GetRootOwnerElement();
+  }
+  if (aEmbedder) {
+    if (nsCOMPtr<nsIObserverService> obs = services::GetObserverService()) {
+      obs->NotifyWhenScriptSafe(ToSupports(aEmbedder),
+                                "browser-shutdown-tabstate-updated", nullptr);
+    }
+  }
+}
+
+mozilla::ipc::IPCResult WindowGlobalParent::RecvRequestRestoreTabContent() {
+  CanonicalBrowsingContext* bc = BrowsingContext();
+  if (bc && bc->AncestorsAreCurrent()) {
+    bc->Top()->RequestRestoreTabContent(this);
+  }
+  return IPC_OK();
+}
+
+nsCString BFCacheStatusToString(uint32_t aFlags) {
+  if (aFlags == 0) {
+    return "0"_ns;
+  }
+
+  nsCString flags;
+#define ADD_BFCACHESTATUS_TO_STRING(_flag) \
+  if (aFlags & BFCacheStatus::_flag) {     \
+    if (!flags.IsEmpty()) {                \
+      flags.Append('|');                   \
+    }                                      \
+    flags.AppendLiteral(#_flag);           \
+    aFlags &= ~BFCacheStatus::_flag;       \
+  }
+
+  ADD_BFCACHESTATUS_TO_STRING(NOT_ALLOWED);
+  ADD_BFCACHESTATUS_TO_STRING(EVENT_HANDLING_SUPPRESSED);
+  ADD_BFCACHESTATUS_TO_STRING(SUSPENDED);
+  ADD_BFCACHESTATUS_TO_STRING(UNLOAD_LISTENER);
+  ADD_BFCACHESTATUS_TO_STRING(REQUEST);
+  ADD_BFCACHESTATUS_TO_STRING(ACTIVE_GET_USER_MEDIA);
+  ADD_BFCACHESTATUS_TO_STRING(ACTIVE_PEER_CONNECTION);
+  ADD_BFCACHESTATUS_TO_STRING(CONTAINS_EME_CONTENT);
+  ADD_BFCACHESTATUS_TO_STRING(CONTAINS_MSE_CONTENT);
+  ADD_BFCACHESTATUS_TO_STRING(HAS_ACTIVE_SPEECH_SYNTHESIS);
+  ADD_BFCACHESTATUS_TO_STRING(HAS_USED_VR);
+  ADD_BFCACHESTATUS_TO_STRING(CONTAINS_REMOTE_SUBFRAMES);
+  ADD_BFCACHESTATUS_TO_STRING(NOT_ONLY_TOPLEVEL_IN_BCG);
+  ADD_BFCACHESTATUS_TO_STRING(ABOUT_PAGE);
+  ADD_BFCACHESTATUS_TO_STRING(RESTORING);
+  ADD_BFCACHESTATUS_TO_STRING(BEFOREUNLOAD_LISTENER);
+  ADD_BFCACHESTATUS_TO_STRING(ACTIVE_LOCK);
+  ADD_BFCACHESTATUS_TO_STRING(ACTIVE_WEBTRANSPORT);
+  ADD_BFCACHESTATUS_TO_STRING(PAGE_LOADING);
+
+#undef ADD_BFCACHESTATUS_TO_STRING
+
+  MOZ_ASSERT(aFlags == 0,
+             "Missing stringification for enum value in BFCacheStatus.");
+  return flags;
+}
+
+mozilla::ipc::IPCResult WindowGlobalParent::RecvUpdateBFCacheStatus(
+    const uint32_t& aOnFlags, const uint32_t& aOffFlags) {
+  if (MOZ_UNLIKELY(MOZ_LOG_TEST(gSHIPBFCacheLog, LogLevel::Debug))) {
+    nsAutoCString uri("[no uri]");
+    if (mDocumentURI) {
+      uri = mDocumentURI->GetSpecOrDefault();
+    }
+    MOZ_LOG(gSHIPBFCacheLog, LogLevel::Debug,
+            ("Setting BFCache flags for %s +(%s) -(%s)", uri.get(),
+             BFCacheStatusToString(aOnFlags).get(),
+             BFCacheStatusToString(aOffFlags).get()));
+  }
+  mBFCacheStatus |= aOnFlags;
+  mBFCacheStatus &= ~aOffFlags;
+  return IPC_OK();
+}
+
+void WindowGlobalParent::UpdateFullscreenKeyboardLockStatus(
+    FullscreenKeyboardLock aStatus) {
+  auto* bc = GetBrowsingContext();
+  if (auto* topChromeBc = bc ? bc->TopCrossChromeBoundary() : nullptr;
+      topChromeBc != bc) {
+    if (auto* doc = topChromeBc->GetExtantDocument()) {
+      doc->SetFullscreenKeyboardLockStatus(aStatus);
+    }
+  }
+}
+
+mozilla::ipc::IPCResult WindowGlobalParent::RecvSetSingleChannelId(
+    const Maybe<uint64_t>& aSingleChannelId) {
+  mSingleChannelId = aSingleChannelId;
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult WindowGlobalParent::RecvSetDocumentDomain(
+    NotNull<nsIURI*> aDomain) {
+  if (mSandboxFlags & SANDBOXED_DOMAIN) {
+    return IPC_FAIL(this, "Sandbox disallows domain setting.");
+  }
+
+
+  nsCOMPtr<nsIURI> uri;
+  mDocumentPrincipal->GetDomain(getter_AddRefs(uri));
+  if (!uri) {
+    uri = mDocumentPrincipal->GetURI();
+    if (!uri) {
+      return IPC_OK();
+    }
+  }
+
+  if (!Document::IsValidDomain(uri, aDomain)) {
+    return IPC_FAIL(
+        this, "Setting domain that's not a suffix of existing domain value.");
+  }
+
+  if (Group()->IsPotentiallyCrossOriginIsolated()) {
+    return IPC_FAIL(this, "Setting domain in a cross-origin isolated BC.");
+  }
+
+  mDocumentPrincipal->SetDomain(aDomain);
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult WindowGlobalParent::RecvSetSiteIntegrityProtected(
+    NotNull<nsIURI*> aSourceURI, uint64_t aMaxAge) {
+  nsCOMPtr<nsISiteIntegrityService> service =
+      do_GetService("@mozilla.org/security/integrity;1");
+  if (!service) {
+    return IPC_OK();
+  }
+
+  OriginAttributes originAttributes =
+      DocumentPrincipal()->OriginAttributesRef();
+  StoragePrincipalHelper::UpdateOriginAttributesForNetworkState(
+      aSourceURI, originAttributes);
+
+  (void)service->SetProtected(aSourceURI, originAttributes, aMaxAge);
+
+  return IPC_OK();
+}
+
+nsresult WindowGlobalParent::DoAddCertException(bool aTemporary) {
+  nsCOMPtr<nsIChannel> failedChannel(GetFailedChannel());
+  NS_ENSURE_TRUE(failedChannel, NS_ERROR_NOT_AVAILABLE);
+
+  nsCOMPtr<nsIURI> failedChannelURI;
+  nsresult rv =
+      NS_GetFinalChannelURI(failedChannel, getter_AddRefs(failedChannelURI));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsIURI> innerURI(NS_GetInnermostURI(failedChannelURI));
+  NS_ENSURE_TRUE(innerURI, NS_ERROR_DOM_INVALID_STATE_ERR);
+
+  nsAutoCString host;
+  rv = innerURI->GetAsciiHost(host);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  int32_t port;
+  rv = innerURI->GetPort(&port);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsITransportSecurityInfo> failedSecurityInfo;
+  rv = failedChannel->GetSecurityInfo(getter_AddRefs(failedSecurityInfo));
+  NS_ENSURE_SUCCESS(rv, rv);
+  NS_ENSURE_TRUE(failedSecurityInfo, NS_ERROR_NOT_AVAILABLE);
+
+  nsCOMPtr<nsIX509Cert> cert;
+  rv = failedSecurityInfo->GetServerCert(getter_AddRefs(cert));
+  NS_ENSURE_SUCCESS(rv, rv);
+  NS_ENSURE_TRUE(cert, NS_ERROR_NOT_AVAILABLE);
+
+  nsCOMPtr<nsICertOverrideService> overrideService(
+      do_GetService(NS_CERTOVERRIDE_CONTRACTID));
+  NS_ENSURE_TRUE(overrideService, NS_ERROR_FAILURE);
+
+  return overrideService->RememberValidityOverride(
+      host, port, mDocumentPrincipal->OriginAttributesRef(), cert, aTemporary);
+}
+
+IPCResult WindowGlobalParent::RecvAddCertException(
+    bool aTemporary, AddCertExceptionResolver&& aResolver) {
+  aResolver(DoAddCertException(aTemporary));
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult WindowGlobalParent::RecvReloadWithHttpsOnlyException() {
+  nsresult rv;
+  nsCOMPtr<nsIURI> currentURI = BrowsingContext()->Top()->GetCurrentURI();
+
+  if (!currentURI) {
+    return IPC_FAIL(this, "HTTPS-only mode: Failed to get current URI");
+  }
+
+  bool isViewSource = currentURI->SchemeIs("view-source");
+
+  nsCOMPtr<nsINestedURI> nestedURI = do_QueryInterface(currentURI);
+  nsCOMPtr<nsIURI> innerURI;
+  if (isViewSource) {
+    nestedURI->GetInnerURI(getter_AddRefs(innerURI));
+  } else {
+    innerURI = currentURI;
+  }
+
+  if (!net::SchemeIsHttpOrHttps(innerURI)) {
+    return IPC_FAIL(this, "HTTPS-only mode: Illegal state");
+  }
+
+  nsCOMPtr<nsIURI> newURI;
+  (void)NS_MutateURI(innerURI).SetScheme("http"_ns).Finalize(
+      getter_AddRefs(newURI));
+
+  OriginAttributes originAttributes =
+      TopWindowContext()->DocumentPrincipal()->OriginAttributesRef();
+
+  originAttributes.SetFirstPartyDomain(true, newURI);
+
+  nsCOMPtr<nsIPermissionManager> permMgr =
+      components::PermissionManager::Service();
+  if (!permMgr) {
+    return IPC_FAIL(
+        this, "HTTPS-only mode: Failed to get Permission Manager service");
+  }
+
+  nsCOMPtr<nsIPrincipal> principal =
+      BasePrincipal::CreateContentPrincipal(newURI, originAttributes);
+
+  rv = permMgr->AddFromPrincipal(
+      principal, "https-only-load-insecure"_ns,
+      nsIHttpsOnlyModePermission::LOAD_INSECURE_ALLOW_SESSION,
+      nsIPermissionManager::EXPIRE_SESSION, 0);
+
+  if (NS_FAILED(rv)) {
+    return IPC_FAIL(
+        this, "HTTPS-only mode: Failed to add permission to the principal");
+  }
+
+  nsCOMPtr<nsIURI> insecureURI = newURI;
+  if (isViewSource) {
+    nsAutoCString spec;
+    MOZ_ALWAYS_SUCCEEDS(newURI->GetSpec(spec));
+    if (NS_FAILED(
+            NS_NewURI(getter_AddRefs(insecureURI), "view-source:"_ns + spec))) {
+      return IPC_FAIL(
+          this, "HTTPS-only mode: Failed to re-construct view-source URI");
+    }
+  }
+
+  RefPtr<nsDocShellLoadState> loadState = new nsDocShellLoadState(insecureURI);
+  loadState->SetTriggeringPrincipal(nsContentUtils::GetSystemPrincipal());
+  loadState->SetLoadType(LOAD_NORMAL_REPLACE);
+  RefPtr<CanonicalBrowsingContext> topBC = BrowsingContext()->Top();
+  topBC->LoadURI(loadState,  true);
+
+  return IPC_OK();
+}
+
+IPCResult WindowGlobalParent::RecvGetStorageAccessPermission(
+    GetStorageAccessPermissionResolver&& aResolve) {
+  WindowGlobalParent* top = TopWindowContext();
+  if (!top) {
+    return IPC_FAIL_NO_REASON(this);
+  }
+  nsIPrincipal* topPrincipal = top->DocumentPrincipal();
+  nsIPrincipal* principal = DocumentPrincipal();
+  uint32_t result;
+  nsresult rv = AntiTrackingUtils::TestStoragePermissionInParent(
+      topPrincipal, principal, &result);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    aResolve(nsIPermissionManager::UNKNOWN_ACTION);
+    return IPC_OK();
+  }
+  if (result == nsIPermissionManager::ALLOW_ACTION) {
+    aResolve(nsIPermissionManager::ALLOW_ACTION);
+    return IPC_OK();
+  }
+
+  aResolve(result);
+  return IPC_OK();
+}
+
+void WindowGlobalParent::ActorDestroy(ActorDestroyReason aWhy) {
+
+  ContentParent* cp = nullptr;
+  if (!IsInProcess()) {
+    cp = static_cast<ContentParent*>(Manager()->Manager());
+  }
+
+  Group()->EachOtherParent(cp, [&](ContentParent* otherContent) {
+    Group()->AddKeepAlive();
+    auto callback = [self = RefPtr{this}](auto) {
+      self->Group()->RemoveKeepAlive();
+    };
+    otherContent->SendDiscardWindowContext(InnerWindowId(), callback, callback);
+  });
+
+
+  WindowContext::Discard();
+
+  JSActorDidDestroy();
+
+  nsCOMPtr<nsIObserverService> obs = services::GetObserverService();
+  if (obs) {
+    obs->NotifyObservers(ToSupports(this), "window-global-destroyed", nullptr);
+  }
+
+}
+
+WindowGlobalParent::~WindowGlobalParent() = default;
+
+
+JSObject* WindowGlobalParent::WrapObject(JSContext* aCx,
+                                         JS::Handle<JSObject*> aGivenProto) {
+  return WindowGlobalParent_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+nsIGlobalObject* WindowGlobalParent::GetParentObject() {
+  return xpc::NativeGlobal(xpc::PrivilegedJunkScope());
+}
+
+nsIDOMProcessParent* WindowGlobalParent::GetDomProcess() {
+  if (RefPtr<BrowserParent> browserParent = GetBrowserParent()) {
+    return browserParent->Manager();
+  }
+  return InProcessParent::Singleton();
+}
+
+void WindowGlobalParent::DidBecomeCurrentWindowGlobal(bool aCurrent) {
+  if (!aCurrent && Fullscreen()) {
+    ExitTopChromeDocumentFullscreen();
+  }
+}
+
+void WindowGlobalParent::AddSecurityState(uint32_t aStateFlags) {
+  MOZ_ASSERT(TopWindowContext() == this);
+  MOZ_ASSERT((aStateFlags &
+              (nsIWebProgressListener::STATE_LOADED_MIXED_DISPLAY_CONTENT |
+               nsIWebProgressListener::STATE_LOADED_MIXED_ACTIVE_CONTENT |
+               nsIWebProgressListener::STATE_BLOCKED_MIXED_DISPLAY_CONTENT |
+               nsIWebProgressListener::STATE_BLOCKED_MIXED_ACTIVE_CONTENT |
+               nsIWebProgressListener::STATE_HTTPS_ONLY_MODE_UPGRADED |
+               nsIWebProgressListener::STATE_HTTPS_ONLY_MODE_UPGRADE_FAILED |
+               nsIWebProgressListener::STATE_HTTPS_ONLY_MODE_UPGRADED_FIRST)) ==
+                 aStateFlags,
+             "Invalid flags specified!");
+
+  if ((mSecurityState & aStateFlags) == aStateFlags) {
+    return;
+  }
+
+  mSecurityState |= aStateFlags;
+
+  if (GetBrowsingContext()->GetCurrentWindowGlobal() == this) {
+    GetBrowsingContext()->UpdateSecurityState();
+  }
+}
+
+void WindowGlobalParent::ExitTopChromeDocumentFullscreen() {
+  RefPtr<CanonicalBrowsingContext> chromeTop =
+      BrowsingContext()->TopCrossChromeBoundary();
+  if (Document* chromeDoc = chromeTop->GetDocument()) {
+    Document::ClearPendingFullscreenRequests(chromeDoc);
+    if (chromeDoc->Fullscreen()) {
+      Document::AsyncExitFullscreen(chromeDoc);
+    }
+  }
+}
+
+void WindowGlobalParent::SetShouldReportHasBlockedOpaqueResponse(
+    nsContentPolicyType aContentPolicy) {
+  if (aContentPolicy != nsIContentPolicy::TYPE_BEACON &&
+      aContentPolicy != nsIContentPolicy::TYPE_PING &&
+      aContentPolicy != nsIContentPolicy::TYPE_CSP_REPORT) {
+    if (IsTop()) {
+      mShouldReportHasBlockedOpaqueResponse = true;
+    }
+  }
+}
+
+IPCResult WindowGlobalParent::RecvSetCookies(
+    const nsCString& aBaseDomain, const OriginAttributes& aOriginAttributes,
+    nsIURI* aHost, bool aIsThirdParty, const nsTArray<CookieStruct>& aCookies) {
+  nsIPrincipal* documentPrincipal = DocumentPrincipal();
+  if (!documentPrincipal || !documentPrincipal->GetIsContentPrincipal()) {
+    return IPC_FAIL(this,
+                    "SetCookies requires a content principal on the window");
+  }
+
+  if (!documentPrincipal->SchemeIs("file")) {
+    nsAutoCString principalBaseDomain;
+    if (NS_FAILED(net::CookieCommons::GetBaseDomain(documentPrincipal,
+                                                    principalBaseDomain)) ||
+        !principalBaseDomain.Equals(aBaseDomain)) {
+      return IPC_FAIL(
+          this, "SetCookies baseDomain does not match document principal");
+    }
+  }
+
+  ContentParent* contentParent = GetContentParent();
+  NS_ENSURE_TRUE(contentParent, IPC_OK());
+
+  net::PNeckoParent* neckoParent =
+      LoneManagedOrNullAsserts(contentParent->ManagedPNeckoParent());
+  NS_ENSURE_TRUE(neckoParent, IPC_OK());
+  net::PCookieServiceParent* csParent =
+      LoneManagedOrNullAsserts(neckoParent->ManagedPCookieServiceParent());
+  NS_ENSURE_TRUE(csParent, IPC_OK());
+  auto* cs = static_cast<net::CookieServiceParent*>(csParent);
+
+  if (!aHost) {
+    return IPC_FAIL(this, "aHost must not be null");
+  }
+
+  nsCOMPtr<nsIPrincipal> principal =
+      BasePrincipal::CreateContentPrincipal(aHost, aOriginAttributes);
+  if (!cs->ContentProcessHasCookie(aBaseDomain, aOriginAttributes) &&
+      !contentParent->ValidatePrincipal(principal)) {
+    return IPC_FAIL(this,
+                    "Content process not authorized for this cookie domain");
+  }
+
+  return cs->SetCookies(aBaseDomain, aOriginAttributes, aHost, aIsThirdParty,
+                        aCookies, GetBrowsingContext());
+}
+
+IPCResult WindowGlobalParent::RecvRecordUserActivationForBTP() {
+  WindowGlobalParent* top = TopWindowContext();
+  if (!top) {
+    return IPC_OK();
+  }
+  nsIPrincipal* principal = top->DocumentPrincipal();
+  if (!principal) {
+    return IPC_OK();
+  }
+
+  DebugOnly<nsresult> rv = BounceTrackingProtection::RecordUserActivation(
+      principal, Some(PR_Now()), top->BrowsingContext());
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "Failed to record BTP user activation.");
+
+  return IPC_OK();
+}
+
+IPCResult WindowGlobalParent::RecvRecordUserInteractionForPermissions() {
+  WindowGlobalParent* top = TopWindowContext();
+  if (!top) {
+    return IPC_OK();
+  }
+  nsIPrincipal* principal = top->DocumentPrincipal();
+  if (!principal) {
+    return IPC_OK();
+  }
+
+  nsCOMPtr<nsIPermissionManager> permMgr =
+      do_GetService(NS_PERMISSIONMANAGER_CONTRACTID);
+  if (permMgr) {
+    (void)permMgr->UpdateLastInteractionForPrincipal(principal);
+  }
+  return IPC_OK();
+}
+
+IPCResult WindowGlobalParent::RecvNotifyAudioSessionTypeOverride(
+    const dom::AudioSessionType& aType) {
+  if (auto* top = BrowsingContext()->Top()) {
+    if (RefPtr<MediaController> controller = top->GetMediaController()) {
+      controller->SetAudioSessionTypeOverride(BrowsingContext()->Id(), aType);
+    }
+  }
+  return IPC_OK();
+}
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(WindowGlobalParent)
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_INHERITED(WindowGlobalParent,
+                                                WindowContext)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mStaticCloneOf)
+  tmp->UnlinkManager();
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(WindowGlobalParent,
+                                                  WindowContext)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mStaticCloneOf)
+  if (!tmp->IsInProcess()) {
+    CycleCollectionNoteChild(cb, static_cast<BrowserParent*>(tmp->Manager()),
+                             "Manager()");
+  }
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTION_TRACE_BEGIN_INHERITED(WindowGlobalParent,
+                                               WindowContext)
+NS_IMPL_CYCLE_COLLECTION_TRACE_END
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(WindowGlobalParent)
+NS_INTERFACE_MAP_END_INHERITING(WindowContext)
+
+NS_IMPL_ADDREF_INHERITED(WindowGlobalParent, WindowContext)
+NS_IMPL_RELEASE_INHERITED(WindowGlobalParent, WindowContext)
+
+}  

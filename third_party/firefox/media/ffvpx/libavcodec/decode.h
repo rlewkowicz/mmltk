@@ -1,0 +1,114 @@
+/*
+ * generic decoding-related code
+ *
+ * This file is part of FFmpeg.
+ *
+ * FFmpeg is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * FFmpeg is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with FFmpeg; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ */
+
+#ifndef AVCODEC_DECODE_H
+#define AVCODEC_DECODE_H
+
+#include "libavutil/frame.h"
+#include "libavutil/hwcontext.h"
+
+#include "avcodec.h"
+
+typedef struct FrameDecodeData {
+    int (*post_process)(void *logctx, AVFrame *frame);
+    void *post_process_opaque;
+    void (*post_process_opaque_free)(void *opaque);
+
+    int (*hwaccel_priv_post_process)(void *logctx, AVFrame *frame);
+    void *hwaccel_priv;
+    void (*hwaccel_priv_free)(void *priv);
+} FrameDecodeData;
+
+int ff_decode_get_packet(AVCodecContext *avctx, AVPacket *pkt);
+
+int ff_decode_frame_props_from_pkt(const AVCodecContext *avctx,
+                                   AVFrame *frame, const AVPacket *pkt);
+
+int ff_decode_frame_props(AVCodecContext *avctx, AVFrame *frame);
+
+int ff_decode_get_hw_frames_ctx(AVCodecContext *avctx,
+                                enum AVHWDeviceType dev_type);
+
+int ff_attach_decode_data(AVCodecContext *avctx, AVFrame *frame);
+
+int ff_copy_palette(void *dst, const AVPacket *src, void *logctx);
+
+int ff_set_dimensions(AVCodecContext *s, int width, int height);
+
+int ff_set_sar(AVCodecContext *avctx, AVRational sar);
+
+int ff_get_format(AVCodecContext *avctx, const enum AVPixelFormat *fmt);
+
+int ff_get_buffer(AVCodecContext *avctx, AVFrame *frame, int flags);
+
+#define FF_REGET_BUFFER_FLAG_READONLY 1 ///< the returned buffer does not need to be writable
+int ff_reget_buffer(AVCodecContext *avctx, AVFrame *frame, int flags);
+
+int ff_side_data_update_matrix_encoding(AVFrame *frame,
+                                        enum AVMatrixEncoding matrix_encoding);
+
+int ff_hwaccel_frame_priv_alloc(AVCodecContext *avctx, void **hwaccel_picture_private);
+
+const AVPacketSideData *ff_get_coded_side_data(const AVCodecContext *avctx,
+                                               enum AVPacketSideDataType type);
+
+int ff_frame_new_side_data(const AVCodecContext *avctx, AVFrame *frame,
+                           enum AVFrameSideDataType type, size_t size,
+                           AVFrameSideData **sd);
+
+int ff_frame_new_side_data_from_buf(const AVCodecContext *avctx,
+                                    AVFrame *frame, enum AVFrameSideDataType type,
+                                    AVBufferRef **buf);
+
+int ff_frame_new_side_data_from_buf_ext(const AVCodecContext *avctx,
+                                        AVFrameSideData ***sd, int *nb_sd,
+                                        enum AVFrameSideDataType type,
+                                        AVBufferRef **buf);
+
+struct AVMasteringDisplayMetadata;
+struct AVContentLightMetadata;
+
+int ff_decode_mastering_display_new(const AVCodecContext *avctx, AVFrame *frame,
+                                    struct AVMasteringDisplayMetadata **mdm);
+
+int ff_decode_mastering_display_new_ext(const AVCodecContext *avctx,
+                                        AVFrameSideData ***sd, int *nb_sd,
+                                        struct AVMasteringDisplayMetadata **mdm);
+
+int ff_decode_content_light_new(const AVCodecContext *avctx, AVFrame *frame,
+                                struct AVContentLightMetadata **clm);
+
+int ff_decode_content_light_new_ext(const AVCodecContext *avctx,
+                                    AVFrameSideData ***sd, int *nb_sd,
+                                    struct AVContentLightMetadata **clm);
+
+#if CONFIG_EXIF
+enum AVExifHeaderMode;
+
+int ff_decode_exif_attach_buffer(AVCodecContext *avctx, AVFrame *frame, AVBufferRef **buf,
+                                 enum AVExifHeaderMode header_mode);
+
+struct AVExifMetadata;
+
+int ff_decode_exif_attach_ifd(AVCodecContext *avctx, AVFrame *frame,
+                              const struct AVExifMetadata *ifd);
+#endif
+
+#endif /* AVCODEC_DECODE_H */

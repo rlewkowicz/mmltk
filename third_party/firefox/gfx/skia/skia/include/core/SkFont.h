@@ -1,0 +1,252 @@
+/*
+ * Copyright 2014 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkFont_DEFINED)
+#define SkFont_DEFINED
+
+#include "include/core/SkPath.h"
+#include "include/core/SkPoint.h" // IWYU pragma: keep (for unspanned apis)
+#include "include/core/SkRect.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkScalar.h"
+#include "include/core/SkSpan.h"
+#include "include/core/SkTypeface.h"
+#include "include/core/SkTypes.h"
+#include "include/private/base/SkTo.h"
+#include "include/private/base/SkTypeTraits.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <vector>
+
+class SkMatrix;
+class SkPaint;
+enum class SkFontHinting;
+enum class SkTextEncoding;
+struct SkFontMetrics;
+
+namespace skcpu { class GlyphRunListPainter; }
+
+class SK_API SkFont {
+public:
+    enum class Edging {
+        kAlias,              
+        kAntiAlias,          
+        kSubpixelAntiAlias,  
+    };
+
+    SkFont();
+
+    SkFont(sk_sp<SkTypeface> typeface, SkScalar size);
+
+    explicit SkFont(sk_sp<SkTypeface> typeface);
+
+
+    SkFont(sk_sp<SkTypeface> typeface, SkScalar size, SkScalar scaleX, SkScalar skewX);
+
+
+    bool operator==(const SkFont& font) const;
+
+    bool operator!=(const SkFont& font) const { return !(*this == font); }
+
+    bool isForceAutoHinting() const { return SkToBool(fFlags & kForceAutoHinting_PrivFlag); }
+
+    bool isEmbeddedBitmaps() const { return SkToBool(fFlags & kEmbeddedBitmaps_PrivFlag); }
+
+    bool isSubpixel() const { return SkToBool(fFlags & kSubpixel_PrivFlag); }
+
+    bool isLinearMetrics() const { return SkToBool(fFlags & kLinearMetrics_PrivFlag); }
+
+    bool isEmbolden() const { return SkToBool(fFlags & kEmbolden_PrivFlag); }
+
+    bool isBaselineSnap() const { return SkToBool(fFlags & kBaselineSnap_PrivFlag); }
+
+    void setForceAutoHinting(bool forceAutoHinting);
+
+    void setEmbeddedBitmaps(bool embeddedBitmaps);
+
+    void setSubpixel(bool subpixel);
+
+    void setLinearMetrics(bool linearMetrics);
+
+    void setEmbolden(bool embolden);
+
+    void setBaselineSnap(bool baselineSnap);
+
+    Edging getEdging() const { return (Edging)fEdging; }
+
+    void setEdging(Edging edging);
+
+    void setHinting(SkFontHinting hintingLevel);
+
+    SkFontHinting getHinting() const { return (SkFontHinting)fHinting; }
+
+    SkFont makeWithSize(SkScalar size) const;
+
+    SkTypeface* getTypeface() const {
+        SkASSERT(fTypeface);
+        return fTypeface.get();
+    }
+
+    SkScalar    getSize() const { return fSize; }
+
+    SkScalar    getScaleX() const { return fScaleX; }
+
+    SkScalar    getSkewX() const { return fSkewX; }
+
+    sk_sp<SkTypeface> refTypeface() const {
+        SkASSERT(fTypeface);
+        return fTypeface;
+    }
+
+    void setTypeface(sk_sp<SkTypeface> tf);
+
+    void setSize(SkScalar textSize);
+
+    void setScaleX(SkScalar scaleX);
+
+    void setSkewX(SkScalar skewX);
+
+    /** Converts text into glyph indices.
+        Returns the number of glyph indices represented by text.
+        SkTextEncoding specifies how text represents characters or glyphs.
+        glyphs may be empty, to compute the glyph count.
+
+        Does not check text for valid character codes or valid glyph indices.
+
+        If byteLength equals zero, returns zero.
+        If byteLength includes a partial character, the partial character is ignored.
+
+        If encoding is SkTextEncoding::kUTF8 and text contains an invalid UTF-8 sequence,
+        zero is returned.
+
+        When encoding is SkTextEncoding::kUTF8, SkTextEncoding::kUTF16, or
+        SkTextEncoding::kUTF32; then each Unicode codepoint is mapped to a
+        single glyph.  This function uses the default character-to-glyph
+        mapping from the SkTypeface and maps characters not found in the
+        SkTypeface to zero.
+
+        If glyphs.size() is not sufficient to store all the glyphs, no glyphs are copied.
+        The total glyph count is returned for subsequent buffer reallocation.
+
+        @param text          character storage encoded with SkTextEncoding
+        @param byteLength    length of character storage in bytes
+        @param glyphs        storage for glyph indices; may be empty
+        @return number of glyphs represented by text of length byteLength
+    */
+    size_t textToGlyphs(const void* text, size_t byteLength, SkTextEncoding encoding,
+                        SkSpan<SkGlyphID> glyphs) const;
+
+    SkGlyphID unicharToGlyph(SkUnichar uni) const;
+
+    void unicharsToGlyphs(SkSpan<const SkUnichar> src, SkSpan<SkGlyphID> dst) const;
+
+    /** Returns number of glyphs represented by text.
+
+        If encoding is SkTextEncoding::kUTF8, SkTextEncoding::kUTF16, or
+        SkTextEncoding::kUTF32; then each Unicode codepoint is mapped to a
+        single glyph.
+
+        @param text          character storage encoded with SkTextEncoding
+        @param byteLength    length of character storage in bytes
+        @return              number of glyphs represented by text of length byteLength
+    */
+    size_t countText(const void* text, size_t byteLength, SkTextEncoding encoding) const {
+        return this->textToGlyphs(text, byteLength, encoding, {});
+    }
+
+    SkScalar measureText(const void* text, size_t byteLength, SkTextEncoding encoding,
+                         SkRect* bounds = nullptr) const {
+        return this->measureText(text, byteLength, encoding, bounds, nullptr);
+    }
+
+    SkScalar measureText(const void* text, size_t byteLength, SkTextEncoding encoding,
+                         SkRect* bounds, const SkPaint* paint) const;
+
+    void getWidthsBounds(SkSpan<const SkGlyphID> glyphs, SkSpan<SkScalar> widths, SkSpan<SkRect> bounds,
+                         const SkPaint* paint) const;
+
+    void getWidths(SkSpan<const SkGlyphID> glyphs, SkSpan<SkScalar> widths) const {
+        this->getWidthsBounds(glyphs, widths, {}, nullptr);
+    }
+    SkScalar getWidth(SkGlyphID glyph) const {
+        SkScalar width;
+        this->getWidthsBounds({&glyph, 1}, {&width, 1}, {}, nullptr);
+        return width;
+    }
+
+    void getBounds(SkSpan<const SkGlyphID> glyphs, SkSpan<SkRect> bounds,
+                   const SkPaint* paint) const {
+        this->getWidthsBounds(glyphs, {}, bounds, paint);
+    }
+    SkRect getBounds(SkGlyphID glyph, const SkPaint* paint) const {
+        SkRect bounds;
+        this->getBounds({&glyph, 1}, {&bounds, 1}, paint);
+        return bounds;
+    }
+
+    void getPos(SkSpan<const SkGlyphID> glyphs, SkSpan<SkPoint> pos, SkPoint origin = {0, 0}) const;
+
+    void getXPos(SkSpan<const SkGlyphID> glyphs, SkSpan<SkScalar> xpos, SkScalar origin = 0) const;
+
+    std::vector<SkScalar> getIntercepts(SkSpan<const SkGlyphID> glyphs,
+                                        SkSpan<const SkPoint> pos,
+                                        SkScalar top, SkScalar bottom,
+                                        const SkPaint* = nullptr) const;
+
+    std::optional<SkPath> getPath(SkGlyphID glyphID) const;
+
+    void getPaths(SkSpan<const SkGlyphID> glyphIDs,
+                  void (*glyphPathProc)(const SkPath* pathOrNull, const SkMatrix& mx, void* ctx),
+                  void* ctx) const;
+
+    SkScalar getMetrics(SkFontMetrics* metrics) const;
+
+    SkScalar getSpacing() const { return this->getMetrics(nullptr); }
+
+    void dump() const;
+
+    using sk_is_trivially_relocatable = std::true_type;
+
+private:
+    enum PrivFlags {
+        kForceAutoHinting_PrivFlag      = 1 << 0,
+        kEmbeddedBitmaps_PrivFlag       = 1 << 1,
+        kSubpixel_PrivFlag              = 1 << 2,
+        kLinearMetrics_PrivFlag         = 1 << 3,
+        kEmbolden_PrivFlag              = 1 << 4,
+        kBaselineSnap_PrivFlag          = 1 << 5,
+    };
+
+    static constexpr unsigned kAllFlags = kForceAutoHinting_PrivFlag
+                                        | kEmbeddedBitmaps_PrivFlag
+                                        | kSubpixel_PrivFlag
+                                        | kLinearMetrics_PrivFlag
+                                        | kEmbolden_PrivFlag
+                                        | kBaselineSnap_PrivFlag;
+
+    sk_sp<SkTypeface> fTypeface;
+    SkScalar    fSize;
+    SkScalar    fScaleX;
+    SkScalar    fSkewX;
+    uint8_t     fFlags;
+    uint8_t     fEdging;
+    uint8_t     fHinting;
+
+    static_assert(::sk_is_trivially_relocatable<decltype(fTypeface)>::value);
+
+    SkScalar setupForAsPaths(SkPaint*);
+    bool hasSomeAntiAliasing() const;
+
+    friend class SkFontPriv;
+    friend class skcpu::GlyphRunListPainter;
+    friend class SkStrikeSpec;
+    friend class SkRemoteGlyphCacheTest;
+};
+
+#endif

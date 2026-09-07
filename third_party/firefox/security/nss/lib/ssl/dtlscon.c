@@ -1,0 +1,1120 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "ssl.h"
+#include "sslimpl.h"
+#include "sslproto.h"
+#include "dtls13con.h"
+
+#if !defined(PR_ARRAY_SIZE)
+#define PR_ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#endif
+
+static SECStatus dtls_StartRetransmitTimer(sslSocket *ss);
+static void dtls_RetransmitTimerExpiredCb(sslSocket *ss);
+static SECStatus dtls_SendSavedWriteData(sslSocket *ss);
+static void dtls_FinishedTimerCb(sslSocket *ss);
+static void dtls_CancelAllTimers(sslSocket *ss);
+
+static const PRUint16 COMMON_MTU_VALUES[] = {
+    1500 - 28, 
+    1280 - 28, 
+    576 - 28,  
+    256 - 28   
+};
+
+#define DTLS_COOKIE_BYTES 32
+#define DTLS_MAX_EXPANSION (DTLS_RECORD_HEADER_LENGTH + 16 + 16 + 32)
+
+static const ssl3CipherSuite nonDTLSSuites[] = {
+    TLS_ECDHE_ECDSA_WITH_RC4_128_SHA,
+    TLS_ECDHE_RSA_WITH_RC4_128_SHA,
+    TLS_DHE_DSS_WITH_RC4_128_SHA,
+    TLS_ECDH_RSA_WITH_RC4_128_SHA,
+    TLS_ECDH_ECDSA_WITH_RC4_128_SHA,
+    TLS_RSA_WITH_RC4_128_MD5,
+    TLS_RSA_WITH_RC4_128_SHA,
+    0 
+};
+
+SSL3ProtocolVersion
+dtls_TLSVersionToDTLSVersion(SSL3ProtocolVersion tlsv)
+{
+    if (tlsv == SSL_LIBRARY_VERSION_TLS_1_1) {
+        return SSL_LIBRARY_VERSION_DTLS_1_0_WIRE;
+    }
+    if (tlsv == SSL_LIBRARY_VERSION_TLS_1_2) {
+        return SSL_LIBRARY_VERSION_DTLS_1_2_WIRE;
+    }
+    if (tlsv == SSL_LIBRARY_VERSION_TLS_1_3) {
+        return SSL_LIBRARY_VERSION_DTLS_1_3_WIRE;
+    }
+
+    return 0xffff;
+}
+
+SSL3ProtocolVersion
+dtls_DTLSVersionToTLSVersion(SSL3ProtocolVersion dtlsv)
+{
+    if (MSB(dtlsv) == 0xff) {
+        return 0;
+    }
+
+    if (dtlsv == SSL_LIBRARY_VERSION_DTLS_1_0_WIRE) {
+        return SSL_LIBRARY_VERSION_TLS_1_1;
+    }
+    if (dtlsv == ((~0x0101) & 0xffff)) {
+        return 0;
+    }
+    if (dtlsv == SSL_LIBRARY_VERSION_DTLS_1_2_WIRE) {
+        return SSL_LIBRARY_VERSION_TLS_1_2;
+    }
+    if (dtlsv == SSL_LIBRARY_VERSION_DTLS_1_3_WIRE) {
+        return SSL_LIBRARY_VERSION_TLS_1_3;
+    }
+
+    return SSL_LIBRARY_VERSION_MAX_SUPPORTED + 1;
+}
+
+SECStatus
+ssl3_DisableNonDTLSSuites(sslSocket *ss)
+{
+    const ssl3CipherSuite *suite;
+
+    for (suite = nonDTLSSuites; *suite; ++suite) {
+        PORT_CheckSuccess(ssl3_CipherPrefSet(ss, *suite, PR_FALSE));
+    }
+    return SECSuccess;
+}
+
+static DTLSQueuedMessage *
+dtls_AllocQueuedMessage(ssl3CipherSpec *cwSpec, SSLContentType ct,
+                        const unsigned char *data, PRUint32 len)
+{
+    DTLSQueuedMessage *msg;
+
+    msg = PORT_ZNew(DTLSQueuedMessage);
+    if (!msg)
+        return NULL;
+
+    msg->data = PORT_Alloc(len);
+    if (!msg->data) {
+        PORT_Free(msg);
+        return NULL;
+    }
+    PORT_Memcpy(msg->data, data, len);
+
+    msg->len = len;
+    msg->cwSpec = cwSpec;
+    msg->type = ct;
+    ssl_CipherSpecAddRef(cwSpec);
+
+    return msg;
+}
+
+void
+dtls_FreeHandshakeMessage(DTLSQueuedMessage *msg)
+{
+    if (!msg)
+        return;
+
+    ssl_CipherSpecRelease(msg->cwSpec);
+    PORT_ZFree(msg->data, msg->len);
+    PORT_Free(msg);
+}
+
+void
+dtls_FreeHandshakeMessages(PRCList *list)
+{
+    PRCList *cur_p;
+
+    while (!PR_CLIST_IS_EMPTY(list)) {
+        cur_p = PR_LIST_TAIL(list);
+        PR_REMOVE_LINK(cur_p);
+        dtls_FreeHandshakeMessage((DTLSQueuedMessage *)cur_p);
+    }
+}
+
+static SECStatus
+dtls_RetransmitDetected(sslSocket *ss)
+{
+    dtlsTimer *rtTimer = ss->ssl3.hs.rtTimer;
+    dtlsTimer *hdTimer = ss->ssl3.hs.hdTimer;
+    SECStatus rv = SECSuccess;
+
+    PORT_Assert(ss->opt.noLocks || ssl_HaveRecvBufLock(ss));
+    PORT_Assert(ss->opt.noLocks || ssl_HaveSSL3HandshakeLock(ss));
+
+    if (rtTimer->cb == dtls_RetransmitTimerExpiredCb) {
+        if ((PR_IntervalNow() - rtTimer->started) >
+            (rtTimer->timeout / 4)) {
+            SSL_TRC(30,
+                    ("%d: SSL3[%d]: Shortcutting retransmit timer",
+                     SSL_GETPID(), ss->fd));
+
+            dtls_CancelTimer(ss, ss->ssl3.hs.rtTimer);
+            dtls_RetransmitTimerExpiredCb(ss);
+        } else {
+            SSL_TRC(30,
+                    ("%d: SSL3[%d]: Ignoring retransmission: "
+                     "last retransmission %dms ago, suppressed for %dms",
+                     SSL_GETPID(), ss->fd,
+                     PR_IntervalNow() - rtTimer->started,
+                     rtTimer->timeout / 4));
+        }
+    } else if (hdTimer->cb == dtls_FinishedTimerCb) {
+        SSL_TRC(30, ("%d: SSL3[%d]: Retransmit detected in holddown",
+                     SSL_GETPID(), ss->fd));
+        dtls_CancelTimer(ss, ss->ssl3.hs.hdTimer);
+        rv = dtls_TransmitMessageFlight(ss);
+        if (rv == SECSuccess) {
+            rv = dtls_StartHolddownTimer(ss);
+        }
+    } else {
+        if (ss->version < SSL_LIBRARY_VERSION_TLS_1_3) {
+            PORT_Assert(hdTimer->cb == NULL);
+        }
+
+        PORT_Assert(rtTimer->cb == NULL);
+    }
+    return rv;
+}
+
+static SECStatus
+dtls_HandleHandshakeMessage(sslSocket *ss, PRUint8 *data, PRBool last)
+{
+    ss->ssl3.hs.recvdHighWater = -1;
+
+    return ssl3_HandleHandshakeMessage(ss, data, ss->ssl3.hs.msg_len,
+                                       last);
+}
+
+#define OFFSET_BYTE(o) (o / 8)
+#define OFFSET_MASK(o) (1 << (o % 8))
+
+SECStatus
+dtls_HandleHandshake(sslSocket *ss, DTLSEpoch epoch, sslSequenceNumber seqNum,
+                     sslBuffer *origBuf)
+{
+    sslBuffer buf = *origBuf;
+    SECStatus rv = SECSuccess;
+    PRBool discarded = PR_FALSE;
+
+    ss->ssl3.hs.endOfFlight = PR_FALSE;
+
+    PORT_Assert(ss->opt.noLocks || ssl_HaveRecvBufLock(ss));
+    PORT_Assert(ss->opt.noLocks || ssl_HaveSSL3HandshakeLock(ss));
+
+    while (buf.len > 0) {
+        PRUint8 type;
+        PRUint32 message_length;
+        PRUint16 message_seq;
+        PRUint32 fragment_offset;
+        PRUint32 fragment_length;
+        PRUint32 offset;
+
+        if (buf.len < 12) {
+            PORT_SetError(SSL_ERROR_RX_MALFORMED_HANDSHAKE);
+            rv = SECFailure;
+            goto loser;
+        }
+
+        type = buf.buf[0];
+        message_length = (buf.buf[1] << 16) | (buf.buf[2] << 8) | buf.buf[3];
+        message_seq = (buf.buf[4] << 8) | buf.buf[5];
+        fragment_offset = (buf.buf[6] << 16) | (buf.buf[7] << 8) | buf.buf[8];
+        fragment_length = (buf.buf[9] << 16) | (buf.buf[10] << 8) | buf.buf[11];
+
+#define MAX_HANDSHAKE_MSG_LEN 0x1ffff /* 128k - 1 */
+        if (message_length > MAX_HANDSHAKE_MSG_LEN) {
+            (void)ssl3_DecodeError(ss);
+            PORT_SetError(SSL_ERROR_RX_MALFORMED_HANDSHAKE);
+            rv = SECFailure;
+            goto loser;
+        }
+#undef MAX_HANDSHAKE_MSG_LEN
+
+        buf.buf += 12;
+        buf.len -= 12;
+
+        if (buf.len < fragment_length) {
+            PORT_SetError(SSL_ERROR_RX_MALFORMED_HANDSHAKE);
+            rv = SECFailure;
+            goto loser;
+        }
+
+        if ((fragment_length + fragment_offset) > message_length) {
+            PORT_SetError(SSL_ERROR_RX_MALFORMED_HANDSHAKE);
+            rv = SECFailure;
+            goto loser;
+        }
+
+        if (message_seq > ss->ssl3.hs.recvMessageSeq &&
+            message_seq == 1 &&
+            fragment_offset == 0 &&
+            ss->ssl3.hs.ws == wait_client_hello &&
+            (SSLHandshakeType)type == ssl_hs_client_hello) {
+            SSL_TRC(5, ("%d: DTLS[%d]: Received apparent 2nd ClientHello",
+                        SSL_GETPID(), ss->fd));
+            ss->ssl3.hs.recvMessageSeq = 1;
+            ss->ssl3.hs.helloRetry = PR_TRUE;
+        }
+
+        if ((message_seq == ss->ssl3.hs.recvMessageSeq) &&
+            (fragment_offset == 0) &&
+            (fragment_length == message_length)) {
+            ss->ssl3.hs.msg_type = (SSLHandshakeType)type;
+            ss->ssl3.hs.msg_len = message_length;
+
+            rv = dtls_HandleHandshakeMessage(ss, buf.buf,
+                                             buf.len == fragment_length);
+            if (rv != SECSuccess) {
+                goto loser;
+            }
+        } else {
+            if (message_seq < ss->ssl3.hs.recvMessageSeq) {
+                rv = dtls_RetransmitDetected(ss);
+                goto loser;
+            } else if (message_seq > ss->ssl3.hs.recvMessageSeq) {
+                SSL_TRC(10, ("%d: SSL3[%d]: dtls_HandleHandshake, discarding handshake message",
+                             SSL_GETPID(), ss->fd));
+                discarded = PR_TRUE;
+            } else {
+                PRInt32 end = fragment_offset + fragment_length;
+
+                if (ss->ssl3.hs.recvdHighWater == -1) {
+                    PRUint32 map_length = OFFSET_BYTE(message_length) + 1;
+
+                    rv = sslBuffer_Grow(&ss->ssl3.hs.msg_body, message_length);
+                    if (rv != SECSuccess)
+                        goto loser;
+                    rv = sslBuffer_Grow(&ss->ssl3.hs.recvdFragments,
+                                        map_length);
+                    if (rv != SECSuccess)
+                        goto loser;
+
+                    ss->ssl3.hs.recvdHighWater = 0;
+                    PORT_Memset(ss->ssl3.hs.recvdFragments.buf, 0,
+                                ss->ssl3.hs.recvdFragments.space);
+                    ss->ssl3.hs.msg_type = (SSLHandshakeType)type;
+                    ss->ssl3.hs.msg_len = message_length;
+                }
+
+                if (message_length != ss->ssl3.hs.msg_len) {
+                    ss->ssl3.hs.recvdHighWater = -1;
+                    PORT_SetError(SSL_ERROR_RX_MALFORMED_HANDSHAKE);
+                    rv = SECFailure;
+                    goto loser;
+                }
+
+                if (end > ss->ssl3.hs.recvdHighWater) {
+                    PORT_Memcpy(ss->ssl3.hs.msg_body.buf + fragment_offset,
+                                buf.buf, fragment_length);
+                }
+
+                if (fragment_offset <= (unsigned int)ss->ssl3.hs.recvdHighWater) {
+                    if (end > ss->ssl3.hs.recvdHighWater) {
+                        ss->ssl3.hs.recvdHighWater = end;
+                    }
+                } else {
+                    for (offset = fragment_offset; offset < end; offset++) {
+                        ss->ssl3.hs.recvdFragments.buf[OFFSET_BYTE(offset)] |=
+                            OFFSET_MASK(offset);
+                    }
+                }
+
+                for (offset = ss->ssl3.hs.recvdHighWater;
+                     offset < ss->ssl3.hs.msg_len; offset++) {
+                    if (ss->ssl3.hs.recvdFragments.buf[OFFSET_BYTE(offset)] &
+                        OFFSET_MASK(offset)) {
+                        ss->ssl3.hs.recvdHighWater++;
+                    } else {
+                        break;
+                    }
+                }
+
+                if (ss->ssl3.hs.recvdHighWater == ss->ssl3.hs.msg_len) {
+                    rv = dtls_HandleHandshakeMessage(ss, ss->ssl3.hs.msg_body.buf,
+                                                     buf.len == fragment_length);
+
+                    if (rv != SECSuccess) {
+                        goto loser;
+                    }
+                }
+            }
+        }
+
+        buf.buf += fragment_length;
+        buf.len -= fragment_length;
+    }
+
+    if (rv != SECSuccess) {
+        PORT_Assert(0);
+        goto loser;
+    }
+
+    if (!discarded && tls13_MaybeTls13(ss)) {
+        rv = dtls13_RememberFragment(ss, &ss->ssl3.hs.dtlsRcvdHandshake,
+                                     0, 0, 0, epoch, seqNum);
+    }
+    if (rv != SECSuccess) {
+        goto loser;
+    }
+    rv = dtls13_SetupAcks(ss);
+
+loser:
+    origBuf->len = 0; 
+    return rv;
+}
+
+SECStatus
+dtls_QueueMessage(sslSocket *ss, SSLContentType ct,
+                  const PRUint8 *pIn, PRInt32 nIn)
+{
+    SECStatus rv = SECSuccess;
+    DTLSQueuedMessage *msg = NULL;
+    ssl3CipherSpec *spec;
+
+    PORT_Assert(ss->opt.noLocks || ssl_HaveSSL3HandshakeLock(ss));
+    PORT_Assert(ss->opt.noLocks || ssl_HaveXmitBufLock(ss));
+
+    spec = ss->ssl3.cwSpec;
+    msg = dtls_AllocQueuedMessage(spec, ct, pIn, nIn);
+
+    if (!msg) {
+        PORT_SetError(SEC_ERROR_NO_MEMORY);
+        rv = SECFailure;
+    } else {
+        PR_APPEND_LINK(&msg->link, &ss->ssl3.hs.lastMessageFlight);
+    }
+
+    return rv;
+}
+
+SECStatus
+dtls_StageHandshakeMessage(sslSocket *ss)
+{
+    SECStatus rv = SECSuccess;
+
+    PORT_Assert(ss->opt.noLocks || ssl_HaveSSL3HandshakeLock(ss));
+    PORT_Assert(ss->opt.noLocks || ssl_HaveXmitBufLock(ss));
+
+    if (!ss->sec.ci.sendBuf.buf || !ss->sec.ci.sendBuf.len)
+        return rv;
+
+    rv = dtls_QueueMessage(ss, ssl_ct_handshake,
+                           ss->sec.ci.sendBuf.buf, ss->sec.ci.sendBuf.len);
+
+    ss->sec.ci.sendBuf.len = 0;
+    return rv;
+}
+
+SECStatus
+dtls_FlushHandshakeMessages(sslSocket *ss, PRInt32 flags)
+{
+    SECStatus rv = SECSuccess;
+
+    PORT_Assert(ss->opt.noLocks || ssl_HaveSSL3HandshakeLock(ss));
+    PORT_Assert(ss->opt.noLocks || ssl_HaveXmitBufLock(ss));
+
+    rv = dtls_StageHandshakeMessage(ss);
+    if (rv != SECSuccess) {
+        return rv;
+    }
+
+    if (!(flags & ssl_SEND_FLAG_FORCE_INTO_BUFFER)) {
+        rv = dtls_TransmitMessageFlight(ss);
+        if (rv != SECSuccess) {
+            return rv;
+        }
+
+        if (!(flags & ssl_SEND_FLAG_NO_RETRANSMIT)) {
+            rv = dtls_StartRetransmitTimer(ss);
+        } else {
+            PORT_Assert(ss->version < SSL_LIBRARY_VERSION_TLS_1_3);
+        }
+    }
+
+    return rv;
+}
+
+static void
+dtls_RetransmitTimerExpiredCb(sslSocket *ss)
+{
+    SECStatus rv;
+    dtlsTimer *timer = ss->ssl3.hs.rtTimer;
+    ss->ssl3.hs.rtRetries++;
+
+    if (!(ss->ssl3.hs.rtRetries % 3)) {
+        dtls_SetMTU(ss, ss->ssl3.hs.maxMessageSent - 1);
+    }
+
+    rv = dtls_TransmitMessageFlight(ss);
+    if (rv == SECSuccess) {
+        timer->timeout *= 2;
+        if (timer->timeout > DTLS_RETRANSMIT_MAX_MS) {
+            timer->timeout = DTLS_RETRANSMIT_MAX_MS;
+        }
+
+        timer->started = PR_IntervalNow();
+        timer->cb = dtls_RetransmitTimerExpiredCb;
+
+        SSL_TRC(30,
+                ("%d: SSL3[%d]: Retransmit #%d, next in %d",
+                 SSL_GETPID(), ss->fd,
+                 ss->ssl3.hs.rtRetries, timer->timeout));
+    }
+}
+
+#define DTLS_HS_HDR_LEN 12
+#define DTLS_MIN_FRAGMENT (DTLS_HS_HDR_LEN + 1 + DTLS_MAX_EXPANSION)
+
+static SECStatus
+dtls_SendFragment(sslSocket *ss, DTLSQueuedMessage *msg, PRUint8 *data,
+                  unsigned int len)
+{
+    PRInt32 sent;
+    SECStatus rv;
+
+    PRINT_BUF(40, (ss, "dtls_SendFragment", data, len));
+    sent = ssl3_SendRecord(ss, msg->cwSpec, msg->type, data, len,
+                           ssl_SEND_FLAG_FORCE_INTO_BUFFER);
+    if (sent != len) {
+        if (sent != -1) {
+            PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        }
+        return SECFailure;
+    }
+
+    if (ss->ssl3.mtu < ss->pendingBuf.len + DTLS_MIN_FRAGMENT) {
+        SSL_TRC(20, ("%d: DTLS[%d]: dtls_SendFragment: flush",
+                     SSL_GETPID(), ss->fd));
+        rv = dtls_SendSavedWriteData(ss);
+        if (rv != SECSuccess) {
+            return SECFailure;
+        }
+    }
+    return SECSuccess;
+}
+
+static SECStatus
+dtls_FragmentHandshake(sslSocket *ss, DTLSQueuedMessage *msg)
+{
+    PRBool fragmentWritten = PR_FALSE;
+    PRUint16 msgSeq;
+    PRUint8 *fragment;
+    PRUint32 fragmentOffset = 0;
+    PRUint32 fragmentLen;
+    const PRUint8 *content = msg->data + DTLS_HS_HDR_LEN;
+    PRUint32 contentLen = msg->len - DTLS_HS_HDR_LEN;
+    SECStatus rv;
+
+    PORT_Assert(msg->len >= DTLS_HS_HDR_LEN);
+
+    PORT_Assert(msg->type == ssl_ct_handshake);
+
+    msgSeq = (msg->data[4] << 8) | msg->data[5];
+
+    do {
+        PRUint8 buf[DTLS_MAX_MTU]; 
+        PRBool hasUnackedRange;
+        PRUint32 end;
+
+        hasUnackedRange = dtls_NextUnackedRange(ss, msgSeq,
+                                                fragmentOffset, contentLen,
+                                                &fragmentOffset, &end);
+        if (!hasUnackedRange) {
+            SSL_TRC(20, ("%d: SSL3[%d]: FragmentHandshake %d: all acknowledged",
+                         SSL_GETPID(), ss->fd, msgSeq));
+            break;
+        }
+
+        SSL_TRC(20, ("%d: SSL3[%d]: FragmentHandshake %d: unacked=%u-%u",
+                     SSL_GETPID(), ss->fd, msgSeq, fragmentOffset, end));
+
+        PORT_Assert(fragmentOffset <= contentLen);
+        PORT_Assert(fragmentOffset <= end);
+        PORT_Assert(end <= contentLen);
+        fragmentLen = PR_MIN(end, contentLen) - fragmentOffset;
+
+        fragmentLen = PR_MIN(fragmentLen,
+                             msg->cwSpec->recordSizeLimit - DTLS_HS_HDR_LEN);
+
+        fragmentLen = PR_MIN(fragmentLen,
+                             ss->ssl3.mtu -           
+                                 ss->pendingBuf.len - 
+                                 DTLS_MAX_EXPANSION - 
+                                 DTLS_HS_HDR_LEN);    
+        PORT_Assert(fragmentLen > 0 || fragmentOffset == 0);
+
+        if (fragmentLen >= (DTLS_MAX_MTU - DTLS_HS_HDR_LEN)) {
+            PORT_Assert(0);
+            PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+            return SECFailure;
+        }
+
+        if (fragmentLen == contentLen) {
+            fragment = msg->data;
+        } else {
+            sslBuffer tmp = SSL_BUFFER_FIXED(buf, sizeof(buf));
+
+            rv = sslBuffer_Append(&tmp, msg->data, 6);
+            if (rv != SECSuccess) {
+                return SECFailure;
+            }
+            rv = sslBuffer_AppendNumber(&tmp, fragmentOffset, 3);
+            if (rv != SECSuccess) {
+                return SECFailure;
+            }
+            rv = sslBuffer_AppendNumber(&tmp, fragmentLen, 3);
+            if (rv != SECSuccess) {
+                return SECFailure;
+            }
+            rv = sslBuffer_Append(&tmp, content + fragmentOffset, fragmentLen);
+            if (rv != SECSuccess) {
+                return SECFailure;
+            }
+
+            fragment = SSL_BUFFER_BASE(&tmp);
+        }
+
+        rv = dtls13_RememberFragment(ss, &ss->ssl3.hs.dtlsSentHandshake,
+                                     msgSeq, fragmentOffset, fragmentLen,
+                                     msg->cwSpec->epoch,
+                                     msg->cwSpec->nextSeqNum);
+        if (rv != SECSuccess) {
+            return SECFailure;
+        }
+
+        rv = dtls_SendFragment(ss, msg, fragment,
+                               fragmentLen + DTLS_HS_HDR_LEN);
+        if (rv != SECSuccess) {
+            return SECFailure;
+        }
+
+        fragmentWritten = PR_TRUE;
+        fragmentOffset += fragmentLen;
+    } while (fragmentOffset < contentLen);
+
+    if (!fragmentWritten) {
+        SSL_TRC(10, ("%d: SSL3[%d]: FragmentHandshake %d: removed",
+                     SSL_GETPID(), ss->fd, msgSeq));
+        PR_REMOVE_LINK(&msg->link);
+        dtls_FreeHandshakeMessage(msg);
+    }
+
+    return SECSuccess;
+}
+
+SECStatus
+dtls_TransmitMessageFlight(sslSocket *ss)
+{
+    SECStatus rv = SECSuccess;
+    PRCList *msg_p;
+
+    SSL_TRC(10, ("%d: SSL3[%d]: dtls_TransmitMessageFlight",
+                 SSL_GETPID(), ss->fd));
+
+    ssl_GetXmitBufLock(ss);
+    ssl_GetSpecReadLock(ss);
+
+    PORT_Assert(!ss->pendingBuf.len);
+
+    for (msg_p = PR_LIST_HEAD(&ss->ssl3.hs.lastMessageFlight);
+         msg_p != &ss->ssl3.hs.lastMessageFlight;) {
+        DTLSQueuedMessage *msg = (DTLSQueuedMessage *)msg_p;
+
+        msg_p = PR_NEXT_LINK(msg_p);
+
+        if (msg->type == ssl_ct_handshake) {
+            rv = dtls_FragmentHandshake(ss, msg);
+        } else {
+            PORT_Assert(!tls13_MaybeTls13(ss));
+            rv = dtls_SendFragment(ss, msg, msg->data, msg->len);
+        }
+        if (rv != SECSuccess) {
+            break;
+        }
+    }
+
+    if (rv == SECSuccess) {
+        rv = dtls_SendSavedWriteData(ss);
+    }
+
+    ssl_ReleaseSpecReadLock(ss);
+    ssl_ReleaseXmitBufLock(ss);
+
+    return rv;
+}
+
+static SECStatus
+dtls_SendSavedWriteData(sslSocket *ss)
+{
+    PRInt32 sent;
+
+    sent = ssl_SendSavedWriteData(ss);
+    if (sent < 0)
+        return SECFailure;
+
+    if (ss->pendingBuf.len > 0) {
+        ssl_MapLowLevelError(SSL_ERROR_SOCKET_WRITE_FAILURE);
+        return SECFailure;
+    }
+
+    if (sent > ss->ssl3.hs.maxMessageSent)
+        ss->ssl3.hs.maxMessageSent = sent;
+
+    return SECSuccess;
+}
+
+void
+dtls_InitTimers(sslSocket *ss)
+{
+    unsigned int i;
+    dtlsTimer **timers[PR_ARRAY_SIZE(ss->ssl3.hs.timers)] = {
+        &ss->ssl3.hs.rtTimer,
+        &ss->ssl3.hs.ackTimer,
+        &ss->ssl3.hs.hdTimer
+    };
+    static const char *timerLabels[] = {
+        "retransmit", "ack", "holddown"
+    };
+
+    PORT_Assert(PR_ARRAY_SIZE(timers) == PR_ARRAY_SIZE(timerLabels));
+    for (i = 0; i < PR_ARRAY_SIZE(ss->ssl3.hs.timers); ++i) {
+        *timers[i] = &ss->ssl3.hs.timers[i];
+        ss->ssl3.hs.timers[i].label = timerLabels[i];
+    }
+}
+
+SECStatus
+dtls_StartTimer(sslSocket *ss, dtlsTimer *timer, PRUint32 time, DTLSTimerCb cb)
+{
+    PORT_Assert(timer->cb == NULL);
+
+    SSL_TRC(10, ("%d: SSL3[%d]: %s dtls_StartTimer %s timeout=%d",
+                 SSL_GETPID(), ss->fd, SSL_ROLE(ss), timer->label, time));
+
+    timer->started = PR_IntervalNow();
+    timer->timeout = time;
+    timer->cb = cb;
+    return SECSuccess;
+}
+
+SECStatus
+dtls_RestartTimer(sslSocket *ss, dtlsTimer *timer)
+{
+    timer->started = PR_IntervalNow();
+    return SECSuccess;
+}
+
+PRBool
+dtls_TimerActive(sslSocket *ss, dtlsTimer *timer)
+{
+    return timer->cb != NULL;
+}
+
+static SECStatus
+dtls_StartRetransmitTimer(sslSocket *ss)
+{
+    dtlsTimer *timer = ss->ssl3.hs.rtTimer;
+    PRUint32 timeout = DTLS_RETRANSMIT_INITIAL_MS;
+
+    if (dtls_TimerActive(ss, timer)) {
+        SSL_TRC(10, ("%d: SSL3[%d]: %s dtls timer %s is already active, restarting. New timeout is %d",
+                     SSL_GETPID(), ss->fd, SSL_ROLE(ss),
+                     timer->label, timeout));
+        (void)dtls_RestartTimer(ss, timer);
+        ss->ssl3.hs.rtRetries = 0;
+        timer->timeout = timeout;
+        return SECSuccess;
+    }
+
+    ss->ssl3.hs.rtRetries = 0;
+    return dtls_StartTimer(ss, timer,
+                           timeout,
+                           dtls_RetransmitTimerExpiredCb);
+}
+
+SECStatus
+dtls_StartHolddownTimer(sslSocket *ss)
+{
+    PORT_Assert(ss->version < SSL_LIBRARY_VERSION_TLS_1_3);
+    return dtls_StartTimer(ss, ss->ssl3.hs.hdTimer,
+                           DTLS_RETRANSMIT_FINISHED_MS,
+                           dtls_FinishedTimerCb);
+}
+
+void
+dtls_CancelTimer(sslSocket *ss, dtlsTimer *timer)
+{
+    SSL_TRC(30, ("%d: SSL3[%d]: %s dtls_CancelTimer %s",
+                 SSL_GETPID(), ss->fd, SSL_ROLE(ss),
+                 timer->label));
+
+    PORT_Assert(ss->opt.noLocks || ssl_HaveRecvBufLock(ss));
+
+    timer->cb = NULL;
+}
+
+static void
+dtls_CancelAllTimers(sslSocket *ss)
+{
+    unsigned int i;
+
+    for (i = 0; i < PR_ARRAY_SIZE(ss->ssl3.hs.timers); ++i) {
+        dtls_CancelTimer(ss, &ss->ssl3.hs.timers[i]);
+    }
+}
+
+void
+dtls_CheckTimer(sslSocket *ss)
+{
+    unsigned int i;
+    SSL_TRC(30, ("%d: SSL3[%d]: dtls_CheckTimer (%s)",
+                 SSL_GETPID(), ss->fd, ss->sec.isServer ? "server" : "client"));
+
+    ssl_GetSSL3HandshakeLock(ss);
+
+    for (i = 0; i < PR_ARRAY_SIZE(ss->ssl3.hs.timers); ++i) {
+        dtlsTimer *timer = &ss->ssl3.hs.timers[i];
+        if (!timer->cb) {
+            continue;
+        }
+
+        if ((PR_IntervalNow() - timer->started) >=
+            PR_MillisecondsToInterval(timer->timeout)) {
+            DTLSTimerCb cb = timer->cb;
+
+            SSL_TRC(10, ("%d: SSL3[%d]: %s firing timer %s",
+                         SSL_GETPID(), ss->fd, SSL_ROLE(ss),
+                         timer->label));
+
+            dtls_CancelTimer(ss, timer);
+
+            cb(ss);
+        }
+    }
+    ssl_ReleaseSSL3HandshakeLock(ss);
+}
+
+static void
+dtls_FinishedTimerCb(sslSocket *ss)
+{
+    dtls_FreeHandshakeMessages(&ss->ssl3.hs.lastMessageFlight);
+}
+
+void
+dtls_RehandshakeCleanup(sslSocket *ss)
+{
+    if (ss->ssl3.hs.helloRetry) {
+        return;
+    }
+    PORT_Assert((ss->version < SSL_LIBRARY_VERSION_TLS_1_3));
+    dtls_CancelAllTimers(ss);
+    dtls_FreeHandshakeMessages(&ss->ssl3.hs.lastMessageFlight);
+    ss->ssl3.hs.sendMessageSeq = 0;
+    ss->ssl3.hs.recvMessageSeq = 0;
+}
+
+void
+dtls_SetMTU(sslSocket *ss, PRUint16 advertised)
+{
+    int i;
+
+    if (advertised == 0) {
+        ss->ssl3.mtu = COMMON_MTU_VALUES[0];
+        SSL_TRC(30, ("Resetting MTU to %d", ss->ssl3.mtu));
+        return;
+    }
+
+    for (i = 0; i < PR_ARRAY_SIZE(COMMON_MTU_VALUES); i++) {
+        if (COMMON_MTU_VALUES[i] <= advertised) {
+            ss->ssl3.mtu = COMMON_MTU_VALUES[i];
+            SSL_TRC(30, ("Resetting MTU to %d", ss->ssl3.mtu));
+            return;
+        }
+    }
+
+    ss->ssl3.mtu = COMMON_MTU_VALUES[PR_ARRAY_SIZE(COMMON_MTU_VALUES) - 1];
+    SSL_TRC(30, ("Resetting MTU to %d", ss->ssl3.mtu));
+}
+
+SECStatus
+dtls_HandleHelloVerifyRequest(sslSocket *ss, PRUint8 *b, PRUint32 length)
+{
+    int errCode = SSL_ERROR_RX_MALFORMED_HELLO_VERIFY_REQUEST;
+    SECStatus rv;
+    SSL3ProtocolVersion version;
+    SSL3AlertDescription desc = illegal_parameter;
+
+    SSL_TRC(3, ("%d: SSL3[%d]: handle hello_verify_request handshake",
+                SSL_GETPID(), ss->fd));
+    PORT_Assert(ss->opt.noLocks || ssl_HaveRecvBufLock(ss));
+    PORT_Assert(ss->opt.noLocks || ssl_HaveSSL3HandshakeLock(ss));
+
+    if (ss->ssl3.hs.ws != wait_server_hello) {
+        errCode = SSL_ERROR_RX_UNEXPECTED_HELLO_VERIFY_REQUEST;
+        desc = unexpected_message;
+        goto alert_loser;
+    }
+
+    dtls_ReceivedFirstMessageInFlight(ss);
+
+    rv = ssl_ClientReadVersion(ss, &b, &length, &version);
+    if (rv != SECSuccess) {
+        goto loser; 
+    }
+
+    SECItem cookie;
+    rv = ssl3_ConsumeHandshakeVariable(ss, &cookie, 1, &b, &length);
+    if (rv != SECSuccess) {
+        goto loser; 
+    }
+    if (cookie.len > DTLS_COOKIE_BYTES) {
+        desc = decode_error;
+        goto alert_loser; 
+    }
+    PORT_Assert(!ss->ssl3.hs.cookie.data && !ss->ssl3.hs.cookie.len);
+    SECITEM_FreeItem(&ss->ssl3.hs.cookie, PR_FALSE);
+    rv = SECITEM_CopyItem(NULL, &ss->ssl3.hs.cookie, &cookie);
+    if (rv != SECSuccess) {
+        goto loser;
+    }
+
+    ss->ssl3.hs.dtlsReceivedHVR = PR_TRUE;
+
+    ssl_GetXmitBufLock(ss); 
+
+    rv = ssl3_SendClientHello(ss, client_hello_retransmit);
+
+    ssl_ReleaseXmitBufLock(ss); 
+
+    SECITEM_FreeItem(&ss->ssl3.hs.cookie, PR_FALSE);
+
+    if (rv == SECSuccess)
+        return rv;
+
+alert_loser:
+    (void)SSL3_SendAlert(ss, alert_fatal, desc);
+
+loser:
+    ssl_MapLowLevelError(errCode);
+    return SECFailure;
+}
+
+void
+dtls_InitRecvdRecords(DTLSRecvdRecords *records)
+{
+    PORT_Memset(records->data, 0, sizeof(records->data));
+    records->left = 0;
+    records->right = DTLS_RECVD_RECORDS_WINDOW - 1;
+}
+
+int
+dtls_RecordGetRecvd(const DTLSRecvdRecords *records, sslSequenceNumber seq)
+{
+    PRUint64 offset;
+
+    if (seq < records->left) {
+        return -1;
+    }
+
+    if (seq > records->right)
+        return 0;
+
+    offset = seq % DTLS_RECVD_RECORDS_WINDOW;
+
+    return !!(records->data[offset / 8] & (1 << (offset % 8)));
+}
+
+void
+dtls_RecordSetRecvd(DTLSRecvdRecords *records, sslSequenceNumber seq)
+{
+    PRUint64 offset;
+
+    if (seq < records->left)
+        return;
+
+    if (seq > records->right) {
+        sslSequenceNumber new_left;
+        sslSequenceNumber new_right;
+        sslSequenceNumber right;
+
+        new_right = seq | 0x07;
+        new_left = (new_right - DTLS_RECVD_RECORDS_WINDOW) + 1;
+
+        if (new_right > records->right + DTLS_RECVD_RECORDS_WINDOW) {
+            PORT_Memset(records->data, 0, sizeof(records->data));
+        } else {
+            for (right = records->right + 8; right <= new_right; right += 8) {
+                offset = right % DTLS_RECVD_RECORDS_WINDOW;
+                records->data[offset / 8] = 0;
+            }
+        }
+
+        records->right = new_right;
+        records->left = new_left;
+    }
+
+    offset = seq % DTLS_RECVD_RECORDS_WINDOW;
+
+    records->data[offset / 8] |= (1 << (offset % 8));
+}
+
+SECStatus
+DTLS_GetHandshakeTimeout(PRFileDesc *socket, PRIntervalTime *timeout)
+{
+    sslSocket *ss = NULL;
+    PRBool found = PR_FALSE;
+    PRIntervalTime now = PR_IntervalNow();
+    PRIntervalTime to;
+    unsigned int i;
+
+    *timeout = PR_INTERVAL_NO_TIMEOUT;
+
+    ss = ssl_FindSocket(socket);
+
+    if (!ss) {
+        PORT_SetError(SEC_ERROR_INVALID_ARGS);
+        return SECFailure;
+    }
+
+    if (!IS_DTLS(ss)) {
+        PORT_SetError(SEC_ERROR_INVALID_ARGS);
+        return SECFailure;
+    }
+
+    for (i = 0; i < PR_ARRAY_SIZE(ss->ssl3.hs.timers); ++i) {
+        PRIntervalTime elapsed;
+        PRIntervalTime desired;
+        dtlsTimer *timer = &ss->ssl3.hs.timers[i];
+
+        if (!timer->cb) {
+            continue;
+        }
+        found = PR_TRUE;
+
+        elapsed = now - timer->started;
+        desired = PR_MillisecondsToInterval(timer->timeout);
+        if (elapsed > desired) {
+            *timeout = PR_INTERVAL_NO_WAIT;
+            return SECSuccess;
+        } else {
+            to = desired - elapsed;
+        }
+
+        if (*timeout > to) {
+            *timeout = to;
+        }
+    }
+
+    if (!found) {
+        PORT_SetError(SSL_ERROR_NO_TIMERS_FOUND);
+        return SECFailure;
+    }
+
+    return SECSuccess;
+}
+
+PRBool
+dtls_IsLongHeader(SSL3ProtocolVersion version, PRUint8 firstOctet)
+{
+    return version < SSL_LIBRARY_VERSION_TLS_1_3 ||
+           firstOctet == ssl_ct_handshake ||
+           firstOctet == ssl_ct_ack ||
+           firstOctet == ssl_ct_alert;
+}
+
+PRBool
+dtls_IsDtls13Ciphertext(SSL3ProtocolVersion version, PRUint8 firstOctet)
+{
+    return (version == 0 || version >= SSL_LIBRARY_VERSION_TLS_1_3) &&
+           (firstOctet & 0xe0) == 0x20;
+}
+
+DTLSEpoch
+dtls_ReadEpoch(const SSL3ProtocolVersion version, const DTLSEpoch specEpoch, const PRUint8 *hdr)
+{
+    if (dtls_IsLongHeader(version, hdr[0])) {
+        return ((DTLSEpoch)hdr[3] << 8) | hdr[4];
+    }
+
+    DTLSEpoch epoch = (specEpoch & ~3) | (hdr[0] & 3);
+    if (epoch > specEpoch && epoch > 4) {
+        epoch -= 4;
+    }
+
+    return epoch;
+}
+
+static sslSequenceNumber
+dtls_ReadSequenceNumber(const ssl3CipherSpec *spec, const PRUint8 *hdr)
+{
+    sslSequenceNumber cap;
+    sslSequenceNumber partial;
+    sslSequenceNumber seqNum;
+    sslSequenceNumber mask;
+
+    if (dtls_IsLongHeader(spec->version, hdr[0])) {
+        static const unsigned int seqNumOffset = 5; 
+        static const unsigned int seqNumLength = 6;
+        sslReader r = SSL_READER(hdr + seqNumOffset, seqNumLength);
+        (void)sslRead_ReadNumber(&r, seqNumLength, &seqNum);
+        return seqNum;
+    }
+
+    if (hdr[0] & 0x08) {
+        cap = spec->nextSeqNum + (1ULL << 15);
+        partial = (((sslSequenceNumber)hdr[1]) << 8) |
+                  (sslSequenceNumber)hdr[2];
+        mask = (1ULL << 16) - 1;
+    } else {
+        cap = spec->nextSeqNum + (1ULL << 7);
+        partial = (sslSequenceNumber)hdr[1];
+        mask = (1ULL << 8) - 1;
+    }
+    seqNum = (cap & ~mask) | partial;
+    if ((partial > (cap & mask)) && (seqNum > mask)) {
+        seqNum -= mask + 1;
+    }
+    return seqNum;
+}
+
+PRBool
+dtls_IsRelevant(sslSocket *ss, const ssl3CipherSpec *spec,
+                const SSL3Ciphertext *cText,
+                sslSequenceNumber *seqNumOut)
+{
+    sslSequenceNumber seqNum = dtls_ReadSequenceNumber(spec, cText->hdr);
+    if (dtls_RecordGetRecvd(&spec->recvdRecords, seqNum) != 0) {
+        SSL_TRC(10, ("%d: SSL3[%d]: dtls_IsRelevant, rejecting "
+                     "potentially replayed packet",
+                     SSL_GETPID(), ss->fd));
+        return PR_FALSE;
+    }
+
+    *seqNumOut = seqNum;
+    return PR_TRUE;
+}
+
+void
+dtls_ReceivedFirstMessageInFlight(sslSocket *ss)
+{
+    if (!IS_DTLS(ss))
+        return;
+
+    if (ss->ssl3.hs.ws != idle_handshake ||
+        ss->version >= SSL_LIBRARY_VERSION_TLS_1_3) {
+        dtls_FreeHandshakeMessages(&ss->ssl3.hs.lastMessageFlight);
+
+        dtls_CancelTimer(ss, ss->ssl3.hs.rtTimer);
+        if (ss->ssl3.hs.rtRetries == 0) {
+            ss->ssl3.hs.rtTimer->timeout = DTLS_RETRANSMIT_INITIAL_MS;
+        }
+    }
+
+    ssl_ClearPRCList(&ss->ssl3.hs.dtlsRcvdHandshake, NULL);
+}

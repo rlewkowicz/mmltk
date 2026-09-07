@@ -1,0 +1,27 @@
+
+[package]
+name = "gl_generator"
+version = "0.14.0"
+authors = ["Brendan Zabarauskas <bjzaba@yahoo.com.au>", "Corey Richardson", "Arseny Kapoulkine"]
+description = "Code generators for creating bindings to the Khronos OpenGL APIs."
+homepage = "https://github.com/brendanzab/gl-rs/"
+documentation = "https://docs.rs/gl_generator"
+keywords = ["gl", "egl", "opengl", "khronos"]
+categories = ["api-bindings", "rendering::graphics-api"]
+license = "Apache-2.0"
+repository = "https://github.com/brendanzab/gl-rs/"
+
+[lib]
+name = "gl_generator"
+path = "lib.rs"
+[dependencies.khronos_api]
+version = "3.1.0"
+
+[dependencies.log]
+version = "0.4"
+
+[dependencies.xml-rs]
+version = "0.8"
+
+[features]
+unstable_generator_utils = []

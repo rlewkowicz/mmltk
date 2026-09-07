@@ -1,0 +1,129 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+@namespace html url("http://www.w3.org/1999/xhtml");
+
+#notification-popup-box {
+  height: var(--urlbar-basic-component-size);
+  -moz-context-properties: fill, fill-opacity;
+  fill: currentColor;
+  fill-opacity: var(--urlbar-icon-fill-opacity);
+  color: inherit;
+  border-radius: var(--urlbar-inner-border-radius);
+
+  &:hover {
+    background-color: hsla(0, 0%, 70%, 0.2);
+  }
+
+  &:hover:active,
+  &[open] {
+    background-color: hsla(0, 0%, 70%, 0.3);
+  }
+}
+
+.popup-notification-icon,
+.permission-popup-permission-icon {
+  -moz-context-properties: fill, fill-opacity;
+  fill: currentColor;
+}
+
+#blocked-permissions-container > .blocked-permission-icon:not([showing]),
+.notification-anchor-icon:not([showing]) {
+  display: none;
+}
+
+.notification-anchor-icon {
+  list-style-image: url(chrome://global/skin/icons/info-filled.svg);
+  padding: var(--urlbar-icon-padding);
+
+  &:focus-visible {
+    outline: var(--focus-outline);
+    outline-offset: var(--focus-outline-inset);
+    border-radius: var(--urlbar-inner-border-radius);
+  }
+
+  #nav-bar:not([keyNav]) & {
+    -moz-user-focus: normal;
+  }
+}
+
+.blocked-permission-icon:focus-visible {
+  outline: var(--focus-outline);
+  outline-offset: calc(var(--urlbar-icon-padding) + var(--focus-outline-inset));
+  border-radius: var(--border-radius-xsmall);
+}
+
+
+.focus-tab-by-prompt-icon {
+  list-style-image: url(chrome://global/skin/icons/info.svg);
+}
+
+.storage-access-icon {
+  list-style-image: url(chrome://browser/skin/controlcenter/3rdpartycookies.svg);
+}
+
+.persistent-storage-icon {
+  list-style-image: url(chrome://browser/skin/notification-icons/persistent-storage.svg);
+
+  &.blocked-permission-icon {
+    list-style-image: url(chrome://browser/skin/notification-icons/persistent-storage-blocked.svg);
+  }
+}
+
+.persist-data-on-shutdown-icon {
+  list-style-image: url(chrome://browser/skin/controlcenter/3rdpartycookies.svg);
+}
+
+.loopback-network-icon {
+  list-style-image: url(chrome://browser/skin/notification-icons/local-host.svg);
+
+  &.blocked-permission-icon {
+    list-style-image: url(chrome://browser/skin/notification-icons/local-host-blocked.svg);
+  }
+}
+
+.local-network-icon {
+  list-style-image: url(chrome://browser/skin/notification-icons/local-network.svg);
+
+  &.blocked-permission-icon {
+    list-style-image: url(chrome://browser/skin/notification-icons/local-network-blocked.svg);
+  }
+}
+
+.open-protocol-handler-icon {
+  list-style-image: url(chrome://global/skin/icons/open-in-new.svg);
+
+  &:-moz-locale-dir(rtl) {
+    transform: scaleX(-1);
+  }
+}
+
+.autoplay-media-icon {
+  list-style-image: url(chrome://browser/skin/notification-icons/autoplay-media.svg);
+
+  &.blocked-permission-icon {
+    list-style-image: url(chrome://browser/skin/notification-icons/autoplay-media-blocked.svg);
+  }
+}
+
+.indexedDB-icon {
+  list-style-image: url(chrome://browser/skin/notification-icons/persistent-storage.svg);
+}
+
+#canvas-notification-icon,
+.canvas-icon {
+  list-style-image: url(chrome://browser/skin/canvas.svg);
+}
+
+.canvas-icon.blocked-permission-icon {
+  list-style-image: url(chrome://browser/skin/canvas-blocked.svg);
+}
+
+.popup-icon {
+  list-style-image: url("chrome://browser/skin/notification-icons/popup.svg");
+}
+
+#blocked-permissions-container > .popup-icon {
+  transform: translateY(1px);
+}

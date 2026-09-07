@@ -1,0 +1,862 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+******************************************************************************
+*   Copyright (C) 1997-2015, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+******************************************************************************
+*   file name:  nfrs.cpp
+*   encoding:   UTF-8
+*   tab size:   8 (not used)
+*   indentation:4
+*
+* Modification history
+* Date        Name      Comments
+* 10/11/2001  Doug      Ported from ICU4J
+*/
+
+#include "nfrs.h"
+
+#if U_HAVE_RBNF
+
+#include "unicode/uchar.h"
+#include "nfrule.h"
+#include "nfrlist.h"
+#include "patternprops.h"
+#include "putilimp.h"
+
+#ifdef RBNF_DEBUG
+#include "cmemory.h"
+#endif
+
+enum {
+    NEGATIVE_RULE_INDEX = 0,
+    IMPROPER_FRACTION_RULE_INDEX = 1,
+    PROPER_FRACTION_RULE_INDEX = 2,
+    DEFAULT_RULE_INDEX = 3,
+    INFINITY_RULE_INDEX = 4,
+    NAN_RULE_INDEX = 5,
+    NON_NUMERICAL_RULE_LENGTH = 6
+};
+
+U_NAMESPACE_BEGIN
+
+#if 0
+
+static int64_t
+util_lcm(int64_t x, int64_t y)
+{
+    x.abs();
+    y.abs();
+
+    if (x == 0 || y == 0) {
+        return 0;
+    } else {
+        do {
+            if (x < y) {
+                int64_t t = x; x = y; y = t;
+            }
+            x -= y * (x/y);
+        } while (x != 0);
+
+        return y;
+    }
+}
+
+#else
+static int64_t
+util_lcm(int64_t x, int64_t y)
+{
+    int64_t x1 = x;
+    int64_t y1 = y;
+
+    int p2 = 0;
+    while ((x1 & 1) == 0 && (y1 & 1) == 0) {
+        ++p2;
+        x1 >>= 1;
+        y1 >>= 1;
+    }
+
+    int64_t t;
+    if ((x1 & 1) == 1) {
+        t = -y1;
+    } else {
+        t = x1;
+    }
+
+    while (t != 0) {
+        while ((t & 1) == 0) {
+            t = t >> 1;
+        }
+        if (t > 0) {
+            x1 = t;
+        } else {
+            y1 = -t;
+        }
+        t = x1 - y1;
+    }
+
+    int64_t gcd = x1 << p2;
+
+    return x / gcd * y;
+}
+#endif
+
+static const char16_t gPercent = 0x0025;
+static const char16_t gColon = 0x003a;
+static const char16_t gSemicolon = 0x003b;
+static const char16_t gLineFeed = 0x000a;
+
+static const char16_t gPercentPercent[] =
+{
+    0x25, 0x25, 0
+}; 
+
+static const char16_t gNoparse[] =
+{
+    0x40, 0x6E, 0x6F, 0x70, 0x61, 0x72, 0x73, 0x65, 0
+}; 
+
+NFRuleSet::NFRuleSet(RuleBasedNumberFormat *_owner, UnicodeString* descriptions, int32_t index, UErrorCode& status)
+  : name()
+  , rules(0)
+  , owner(_owner)
+  , fractionRules()
+  , fIsFractionRuleSet(false)
+  , fIsPublic(false)
+  , fIsParseable(true)
+{
+    for (int32_t i = 0; i < NON_NUMERICAL_RULE_LENGTH; ++i) {
+        nonNumericalRules[i] = nullptr;
+    }
+
+    if (U_FAILURE(status)) {
+        return;
+    }
+
+    UnicodeString& description = descriptions[index]; 
+
+    if (description.isEmpty()) {
+        status = U_PARSE_ERROR;
+        return;
+    }
+
+    if (description.charAt(0) == gPercent) {
+        int32_t pos = description.indexOf(gColon);
+        if (pos < 2) {
+            status = U_PARSE_ERROR;
+            return;
+        } else {
+            name.setTo(description, 0, pos);
+            while (pos < description.length() && PatternProps::isWhiteSpace(description.charAt(++pos))) {
+            }
+            description.remove(0, pos);
+        }
+    } else {
+        name.setTo(UNICODE_STRING_SIMPLE("%default"));
+    }
+
+    if (description.isEmpty()) {
+        status = U_PARSE_ERROR;
+        return;
+    }
+
+    fIsPublic = name.indexOf(gPercentPercent, 2, 0) != 0;
+
+    if (name.endsWith(gNoparse, 8)) {
+        fIsParseable = false;
+        name.truncate(name.length() - 8); 
+    }
+
+}
+
+void
+NFRuleSet::parseRules(UnicodeString& description, UErrorCode& status)
+{
+
+    if (U_FAILURE(status)) {
+        return;
+    }
+
+    rules.deleteAll();
+
+
+    UnicodeString currentDescription;
+    int32_t oldP = 0;
+    while (oldP < description.length()) {
+        int32_t p = description.indexOf(gSemicolon, oldP);
+        if (p == -1) {
+            p = description.length();
+        }
+        currentDescription.setTo(description, oldP, p - oldP);
+        NFRule::makeRules(currentDescription, this, rules.last(), owner, rules, status);
+        if (U_FAILURE(status)) {
+            return;
+        }
+        oldP = p + 1;
+    }
+
+    int64_t defaultBaseValue = 0;
+
+    int32_t rulesSize = rules.size();
+    for (int32_t i = 0; i < rulesSize; i++) {
+        NFRule* rule = rules[i];
+        int64_t baseValue = rule->getBaseValue();
+
+        if (baseValue == 0) {
+            rule->setBaseValue(defaultBaseValue, status);
+            if (U_FAILURE(status)) {
+                return;
+            }
+        }
+        else {
+            if (baseValue < defaultBaseValue) {
+                status = U_PARSE_ERROR;
+                return;
+            }
+            defaultBaseValue = baseValue;
+        }
+        if (!fIsFractionRuleSet) {
+            ++defaultBaseValue;
+        }
+    }
+}
+
+void NFRuleSet::setNonNumericalRule(NFRule *rule) {
+    switch (rule->getBaseValue()) {
+        case NFRule::kNegativeNumberRule:
+            delete nonNumericalRules[NEGATIVE_RULE_INDEX];
+            nonNumericalRules[NEGATIVE_RULE_INDEX] = rule;
+            return;
+        case NFRule::kImproperFractionRule:
+            setBestFractionRule(IMPROPER_FRACTION_RULE_INDEX, rule, true);
+            return;
+        case NFRule::kProperFractionRule:
+            setBestFractionRule(PROPER_FRACTION_RULE_INDEX, rule, true);
+            return;
+        case NFRule::kDefaultRule:
+            setBestFractionRule(DEFAULT_RULE_INDEX, rule, true);
+            return;
+        case NFRule::kInfinityRule:
+            delete nonNumericalRules[INFINITY_RULE_INDEX];
+            nonNumericalRules[INFINITY_RULE_INDEX] = rule;
+            return;
+        case NFRule::kNaNRule:
+            delete nonNumericalRules[NAN_RULE_INDEX];
+            nonNumericalRules[NAN_RULE_INDEX] = rule;
+            return;
+        case NFRule::kNoBase:
+        case NFRule::kOtherRule:
+        default:
+            delete rule;
+            return;
+    }
+}
+
+void NFRuleSet::setBestFractionRule(int32_t originalIndex, NFRule *newRule, UBool rememberRule) {
+    if (rememberRule) {
+        fractionRules.add(newRule);
+    }
+    NFRule *bestResult = nonNumericalRules[originalIndex];
+    if (bestResult == nullptr) {
+        nonNumericalRules[originalIndex] = newRule;
+    }
+    else {
+        const DecimalFormatSymbols *decimalFormatSymbols = owner->getDecimalFormatSymbols();
+        if (decimalFormatSymbols->getSymbol(DecimalFormatSymbols::kDecimalSeparatorSymbol).charAt(0)
+            == newRule->getDecimalPoint())
+        {
+            nonNumericalRules[originalIndex] = newRule;
+        }
+    }
+}
+
+NFRuleSet::~NFRuleSet()
+{
+    for (int i = 0; i < NON_NUMERICAL_RULE_LENGTH; i++) {
+        if (i != IMPROPER_FRACTION_RULE_INDEX
+            && i != PROPER_FRACTION_RULE_INDEX
+            && i != DEFAULT_RULE_INDEX)
+        {
+            delete nonNumericalRules[i];
+        }
+    }
+}
+
+static UBool
+util_equalRules(const NFRule* rule1, const NFRule* rule2)
+{
+    if (rule1) {
+        if (rule2) {
+            return *rule1 == *rule2;
+        }
+    } else if (!rule2) {
+        return true;
+    }
+    return false;
+}
+
+bool
+NFRuleSet::operator==(const NFRuleSet& rhs) const
+{
+    if (rules.size() == rhs.rules.size() &&
+        fIsFractionRuleSet == rhs.fIsFractionRuleSet &&
+        name == rhs.name) {
+
+        for (int i = 0; i < NON_NUMERICAL_RULE_LENGTH; i++) {
+            if (!util_equalRules(nonNumericalRules[i], rhs.nonNumericalRules[i])) {
+                return false;
+            }
+        }
+
+        for (uint32_t i = 0; i < rules.size(); ++i) {
+            if (*rules[i] != *rhs.rules[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+void
+NFRuleSet::setDecimalFormatSymbols(const DecimalFormatSymbols &newSymbols, UErrorCode& status) {
+    for (uint32_t i = 0; i < rules.size(); ++i) {
+        rules[i]->setDecimalFormatSymbols(newSymbols, status);
+    }
+    for (int32_t nonNumericalIdx = IMPROPER_FRACTION_RULE_INDEX; nonNumericalIdx <= DEFAULT_RULE_INDEX; nonNumericalIdx++) {
+        if (nonNumericalRules[nonNumericalIdx]) {
+            for (uint32_t fIdx = 0; fIdx < fractionRules.size(); fIdx++) {
+                NFRule *fractionRule = fractionRules[fIdx];
+                if (nonNumericalRules[nonNumericalIdx]->getBaseValue() == fractionRule->getBaseValue()) {
+                    setBestFractionRule(nonNumericalIdx, fractionRule, false);
+                }
+            }
+        }
+    }
+
+    for (uint32_t nnrIdx = 0; nnrIdx < NON_NUMERICAL_RULE_LENGTH; nnrIdx++) {
+        NFRule *rule = nonNumericalRules[nnrIdx];
+        if (rule) {
+            rule->setDecimalFormatSymbols(newSymbols, status);
+        }
+    }
+}
+
+#define RECURSION_LIMIT 64
+
+void
+NFRuleSet::format(int64_t number, UnicodeString& toAppendTo, int32_t pos, int32_t recursionCount, UErrorCode& status) const
+{
+    if (recursionCount >= RECURSION_LIMIT) {
+        status = U_INVALID_STATE_ERROR;
+        return;
+    }
+    const NFRule *rule = findNormalRule(number);
+    if (rule) { 
+        rule->doFormat(number, toAppendTo, pos, ++recursionCount, status);
+    }
+}
+
+void
+NFRuleSet::format(double number, UnicodeString& toAppendTo, int32_t pos, int32_t recursionCount, UErrorCode& status) const
+{
+    if (recursionCount >= RECURSION_LIMIT) {
+        status = U_INVALID_STATE_ERROR;
+        return;
+    }
+    const NFRule *rule = findDoubleRule(number);
+    if (rule) { 
+        rule->doFormat(number, toAppendTo, pos, ++recursionCount, status);
+    }
+}
+
+const NFRule*
+NFRuleSet::findDoubleRule(double number) const
+{
+    if (isFractionRuleSet()) {
+        return findFractionRuleSetRule(number);
+    }
+
+    if (uprv_isNaN(number)) {
+        const NFRule *rule = nonNumericalRules[NAN_RULE_INDEX];
+        if (!rule) {
+            rule = owner->getDefaultNaNRule();
+        }
+        return rule;
+    }
+
+    if (number < 0) {
+        if (nonNumericalRules[NEGATIVE_RULE_INDEX]) {
+            return  nonNumericalRules[NEGATIVE_RULE_INDEX];
+        } else {
+            number = -number;
+        }
+    }
+
+    if (uprv_isInfinite(number)) {
+        const NFRule *rule = nonNumericalRules[INFINITY_RULE_INDEX];
+        if (!rule) {
+            rule = owner->getDefaultInfinityRule();
+        }
+        return rule;
+    }
+
+    if (number != uprv_floor(number)) {
+        if (number < 1 && nonNumericalRules[PROPER_FRACTION_RULE_INDEX]) {
+            return nonNumericalRules[PROPER_FRACTION_RULE_INDEX];
+        }
+        else if (nonNumericalRules[IMPROPER_FRACTION_RULE_INDEX]) {
+            return nonNumericalRules[IMPROPER_FRACTION_RULE_INDEX];
+        }
+    }
+
+    if (nonNumericalRules[DEFAULT_RULE_INDEX]) {
+        return nonNumericalRules[DEFAULT_RULE_INDEX];
+    }
+
+    int64_t r = util64_fromDouble(number + 0.5);
+    return findNormalRule(r);
+}
+
+const NFRule *
+NFRuleSet::findNormalRule(int64_t number) const
+{
+    if (fIsFractionRuleSet) {
+        return findFractionRuleSetRule(static_cast<double>(number));
+    }
+
+    if (number < 0) {
+        if (nonNumericalRules[NEGATIVE_RULE_INDEX]) {
+            return nonNumericalRules[NEGATIVE_RULE_INDEX];
+        } else {
+            number = -number;
+        }
+    }
+
+
+
+    int32_t hi = rules.size();
+    if (hi > 0) {
+        int32_t lo = 0;
+
+        while (lo < hi) {
+            int32_t mid = (lo + hi) / 2;
+            if (rules[mid]->getBaseValue() == number) {
+                return rules[mid];
+            }
+            else if (rules[mid]->getBaseValue() > number) {
+                hi = mid;
+            }
+            else {
+                lo = mid + 1;
+            }
+        }
+        if (hi == 0) { 
+            return nullptr; 
+        }
+
+        NFRule *result = rules[hi - 1];
+
+        if (result->shouldRollBack(number)) {
+            if (hi == 1) { 
+                return nullptr;
+            }
+            result = rules[hi - 2];
+        }
+        return result;
+    }
+    return nonNumericalRules[DEFAULT_RULE_INDEX];
+}
+
+const NFRule*
+NFRuleSet::findFractionRuleSetRule(double number) const
+{
+
+    int64_t leastCommonMultiple = rules[0]->getBaseValue();
+    int64_t numerator;
+    {
+        for (uint32_t i = 1; i < rules.size(); ++i) {
+            leastCommonMultiple = util_lcm(leastCommonMultiple, rules[i]->getBaseValue());
+        }
+        numerator = util64_fromDouble(number * static_cast<double>(leastCommonMultiple) + 0.5);
+    }
+    int64_t tempDifference;
+    int64_t difference = util64_fromDouble(uprv_maxMantissa());
+    int32_t winner = 0;
+    for (uint32_t i = 0; i < rules.size(); ++i) {
+        tempDifference = numerator * rules[i]->getBaseValue() % leastCommonMultiple;
+
+
+        if (leastCommonMultiple - tempDifference < tempDifference) {
+            tempDifference = leastCommonMultiple - tempDifference;
+        }
+
+        if (tempDifference < difference) {
+            difference = tempDifference;
+            winner = i;
+            if (difference == 0) {
+                break;
+            }
+        }
+    }
+
+    if (static_cast<unsigned>(winner + 1) < rules.size() &&
+        rules[winner + 1]->getBaseValue() == rules[winner]->getBaseValue()) {
+        double n = static_cast<double>(rules[winner]->getBaseValue()) * number;
+        if (n < 0.5 || n >= 2) {
+            ++winner;
+        }
+    }
+
+    return rules[winner];
+}
+
+#ifdef RBNF_DEBUG
+#include <stdio.h>
+
+static void dumpUS(FILE* f, const UnicodeString& us) {
+  int len = us.length();
+  char* buf = (char *)uprv_malloc((len+1)*sizeof(char)); 
+  if (buf != nullptr) {
+	  us.extract(0, len, buf);
+	  buf[len] = 0;
+	  fprintf(f, "%s", buf);
+	  uprv_free(buf); 
+  }
+}
+#endif
+
+UBool
+NFRuleSet::parse(const UnicodeString& text, ParsePosition& pos, double upperBound, uint32_t nonNumericalExecutedRuleMask, int32_t recursionCount, Formattable& result) const
+{
+
+    result.setLong(0);
+
+    if (recursionCount >= RECURSION_LIMIT) {
+        return false;
+    }
+
+    if (text.length() == 0) {
+        return 0;
+    }
+
+    ParsePosition highWaterMark;
+    ParsePosition workingPos = pos;
+
+#ifdef RBNF_DEBUG
+    fprintf(stderr, "<nfrs> %x '", this);
+    dumpUS(stderr, name);
+    fprintf(stderr, "' text '");
+    dumpUS(stderr, text);
+    fprintf(stderr, "'\n");
+    fprintf(stderr, "  parse negative: %d\n", this, negativeNumberRule != 0);
+#endif
+    for (int i = 0; i < NON_NUMERICAL_RULE_LENGTH; i++) {
+        if (nonNumericalRules[i] && ((nonNumericalExecutedRuleMask >> i) & 1) == 0) {
+            nonNumericalExecutedRuleMask |= 1 << i;
+
+            Formattable tempResult;
+            UBool success = nonNumericalRules[i]->doParse(text, workingPos, 0, upperBound, nonNumericalExecutedRuleMask, recursionCount + 1, tempResult);
+            if (success && (workingPos.getIndex() > highWaterMark.getIndex())) {
+                result = tempResult;
+                highWaterMark = workingPos;
+            }
+            workingPos = pos;
+        }
+    }
+#ifdef RBNF_DEBUG
+    fprintf(stderr, "<nfrs> continue other with text '");
+    dumpUS(stderr, text);
+    fprintf(stderr, "' hwm: %d\n", highWaterMark.getIndex());
+#endif
+
+    {
+        int64_t ub = util64_fromDouble(upperBound);
+#ifdef RBNF_DEBUG
+        {
+            char ubstr[64];
+            util64_toa(ub, ubstr, 64);
+            char ubstrhex[64];
+            util64_toa(ub, ubstrhex, 64, 16);
+            fprintf(stderr, "ub: %g, i64: %s (%s)\n", upperBound, ubstr, ubstrhex);
+        }
+#endif
+        for (int32_t i = rules.size(); --i >= 0 && highWaterMark.getIndex() < text.length();) {
+            if ((!fIsFractionRuleSet) && (rules[i]->getBaseValue() >= ub)) {
+                continue;
+            }
+            Formattable tempResult;
+            UBool success = rules[i]->doParse(text, workingPos, fIsFractionRuleSet, upperBound, nonNumericalExecutedRuleMask, recursionCount + 1, tempResult);
+            if (success && workingPos.getIndex() > highWaterMark.getIndex()) {
+                result = tempResult;
+                highWaterMark = workingPos;
+            }
+            workingPos = pos;
+        }
+    }
+#ifdef RBNF_DEBUG
+    fprintf(stderr, "<nfrs> exit\n");
+#endif
+    pos = highWaterMark;
+
+    return 1;
+}
+
+void
+NFRuleSet::appendRules(UnicodeString& result) const
+{
+    uint32_t i;
+
+    result.append(name);
+    result.append(gColon);
+    result.append(gLineFeed);
+
+    for (i = 0; i < rules.size(); i++) {
+        rules[i]->_appendRuleText(result);
+        result.append(gLineFeed);
+    }
+
+    for (i = 0; i < NON_NUMERICAL_RULE_LENGTH; ++i) {
+        NFRule *rule = nonNumericalRules[i];
+        if (nonNumericalRules[i]) {
+            if (rule->getBaseValue() == NFRule::kImproperFractionRule
+                || rule->getBaseValue() == NFRule::kProperFractionRule
+                || rule->getBaseValue() == NFRule::kDefaultRule)
+            {
+                for (uint32_t fIdx = 0; fIdx < fractionRules.size(); fIdx++) {
+                    NFRule *fractionRule = fractionRules[fIdx];
+                    if (fractionRule->getBaseValue() == rule->getBaseValue()) {
+                        fractionRule->_appendRuleText(result);
+                        result.append(gLineFeed);
+                    }
+                }
+            }
+            else {
+                rule->_appendRuleText(result);
+                result.append(gLineFeed);
+            }
+        }
+    }
+}
+
+
+int64_t util64_fromDouble(double d) {
+    int64_t result = 0;
+    if (!uprv_isNaN(d)) {
+        double mant = uprv_maxMantissa();
+        if (d < -mant) {
+            d = -mant;
+        } else if (d > mant) {
+            d = mant;
+        }
+        UBool neg = d < 0; 
+        if (neg) {
+            d = -d;
+        }
+        result = static_cast<int64_t>(uprv_floor(d));
+        if (neg) {
+            result = -result;
+        }
+    }
+    return result;
+}
+
+uint64_t util64_pow(uint32_t base, uint16_t exponent)  {
+    if (base == 0) {
+        return 0;
+    }
+    uint64_t result = 1;
+    uint64_t pow = base;
+    while (true) {
+        if ((exponent & 1) == 1) {
+            result *= pow;
+        }
+        exponent >>= 1;
+        if (exponent == 0) {
+            break;
+        }
+        pow *= pow;
+    }
+    return result;
+}
+
+static const uint8_t asciiDigits[] = { 
+    0x30u, 0x31u, 0x32u, 0x33u, 0x34u, 0x35u, 0x36u, 0x37u,
+    0x38u, 0x39u, 0x61u, 0x62u, 0x63u, 0x64u, 0x65u, 0x66u,
+    0x67u, 0x68u, 0x69u, 0x6au, 0x6bu, 0x6cu, 0x6du, 0x6eu,
+    0x6fu, 0x70u, 0x71u, 0x72u, 0x73u, 0x74u, 0x75u, 0x76u,
+    0x77u, 0x78u, 0x79u, 0x7au,  
+};
+
+static const char16_t kUMinus = static_cast<char16_t>(0x002d);
+
+#ifdef RBNF_DEBUG
+static const char kMinus = '-';
+
+static const uint8_t digitInfo[] = {
+        0,     0,     0,     0,     0,     0,     0,     0,
+        0,     0,     0,     0,     0,     0,     0,     0,
+        0,     0,     0,     0,     0,     0,     0,     0,
+        0,     0,     0,     0,     0,     0,     0,     0,
+        0,     0,     0,     0,     0,     0,     0,     0,
+        0,     0,     0,     0,     0,     0,     0,     0,
+    0x80u, 0x81u, 0x82u, 0x83u, 0x84u, 0x85u, 0x86u, 0x87u,
+    0x88u, 0x89u,     0,     0,     0,     0,     0,     0,
+        0, 0x8au, 0x8bu, 0x8cu, 0x8du, 0x8eu, 0x8fu, 0x90u,
+    0x91u, 0x92u, 0x93u, 0x94u, 0x95u, 0x96u, 0x97u, 0x98u,
+    0x99u, 0x9au, 0x9bu, 0x9cu, 0x9du, 0x9eu, 0x9fu, 0xa0u,
+    0xa1u, 0xa2u, 0xa3u,     0,     0,     0,     0,     0,
+        0, 0x8au, 0x8bu, 0x8cu, 0x8du, 0x8eu, 0x8fu, 0x90u,
+    0x91u, 0x92u, 0x93u, 0x94u, 0x95u, 0x96u, 0x97u, 0x98u,
+    0x99u, 0x9au, 0x9bu, 0x9cu, 0x9du, 0x9eu, 0x9fu, 0xa0u,
+    0xa1u, 0xa2u, 0xa3u,     0,     0,     0,     0,     0,
+};
+
+int64_t util64_atoi(const char* str, uint32_t radix)
+{
+    if (radix > 36) {
+        radix = 36;
+    } else if (radix < 2) {
+        radix = 2;
+    }
+    int64_t lradix = radix;
+
+    int neg = 0;
+    if (*str == kMinus) {
+        ++str;
+        neg = 1;
+    }
+    int64_t result = 0;
+    uint8_t b;
+    while ((b = digitInfo[*str++]) && ((b &= 0x7f) < radix)) {
+        result *= lradix;
+        result += (int32_t)b;
+    }
+    if (neg) {
+        result = -result;
+    }
+    return result;
+}
+
+int64_t util64_utoi(const char16_t* str, uint32_t radix)
+{
+    if (radix > 36) {
+        radix = 36;
+    } else if (radix < 2) {
+        radix = 2;
+    }
+    int64_t lradix = radix;
+
+    int neg = 0;
+    if (*str == kUMinus) {
+        ++str;
+        neg = 1;
+    }
+    int64_t result = 0;
+    char16_t c;
+    uint8_t b;
+    while (((c = *str++) < 0x0080) && (b = digitInfo[c]) && ((b &= 0x7f) < radix)) {
+        result *= lradix;
+        result += (int32_t)b;
+    }
+    if (neg) {
+        result = -result;
+    }
+    return result;
+}
+
+uint32_t util64_toa(int64_t w, char* buf, uint32_t len, uint32_t radix, UBool raw)
+{    
+    if (radix > 36) {
+        radix = 36;
+    } else if (radix < 2) {
+        radix = 2;
+    }
+    int64_t base = radix;
+
+    char* p = buf;
+    if (len && (w < 0) && (radix == 10) && !raw) {
+        w = -w;
+        *p++ = kMinus;
+        --len;
+    } else if (len && (w == 0)) {
+        *p++ = (char)raw ? 0 : asciiDigits[0];
+        --len;
+    }
+
+    while (len && w != 0) {
+        int64_t n = w / base;
+        int64_t m = n * base;
+        int32_t d = (int32_t)(w-m);
+        *p++ = raw ? (char)d : asciiDigits[d];
+        w = n;
+        --len;
+    }
+    if (len) {
+        *p = 0; 
+    }
+
+    len = p - buf;
+    if (*buf == kMinus) {
+        ++buf;
+    }
+    while (--p > buf) {
+        char c = *p;
+        *p = *buf;
+        *buf = c;
+        ++buf;
+    }
+
+    return len;
+}
+#endif
+
+uint32_t util64_tou(int64_t w, char16_t* buf, uint32_t len, uint32_t radix, UBool raw)
+{    
+    if (radix > 36) {
+        radix = 36;
+    } else if (radix < 2) {
+        radix = 2;
+    }
+    int64_t base = radix;
+
+    char16_t* p = buf;
+    if (len && (w < 0) && (radix == 10) && !raw) {
+        w = -w;
+        *p++ = kUMinus;
+        --len;
+    } else if (len && (w == 0)) {
+        *p++ = static_cast<char16_t>(raw) ? 0 : asciiDigits[0];
+        --len;
+    }
+
+    while (len && (w != 0)) {
+        int64_t n = w / base;
+        int64_t m = n * base;
+        int32_t d = static_cast<int32_t>(w - m);
+        *p++ = static_cast<char16_t>(raw ? d : asciiDigits[d]);
+        w = n;
+        --len;
+    }
+    if (len) {
+        *p = 0; 
+    }
+
+    len = static_cast<uint32_t>(p - buf);
+    if (*buf == kUMinus) {
+        ++buf;
+    }
+    while (--p > buf) {
+        char16_t c = *p;
+        *p = *buf;
+        *buf = c;
+        ++buf;
+    }
+
+    return len;
+}
+
+
+U_NAMESPACE_END
+
+#endif

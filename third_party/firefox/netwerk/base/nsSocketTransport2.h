@@ -1,0 +1,425 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsSocketTransport2_h_
+#define nsSocketTransport2_h_
+
+#ifdef DEBUG_darinf
+#  define ENABLE_SOCKET_TRACING
+#endif
+
+#include <functional>
+
+#include "mozilla/Atomics.h"
+#include "mozilla/Mutex.h"
+#include "nsSocketTransportService2.h"
+#include "nsString.h"
+#include "nsCOMPtr.h"
+
+#include "nsIInterfaceRequestor.h"
+#include "nsISocketTransport.h"
+#include "nsIAsyncInputStream.h"
+#include "nsIAsyncOutputStream.h"
+#include "nsIDNSListener.h"
+#include "nsIDNSRecord.h"
+#include "nsIClassInfo.h"
+#include "mozilla/net/DNS.h"
+#include "nsASocketHandler.h"
+
+#include "prerror.h"
+#include "ssl.h"
+
+class nsICancelable;
+class nsIDNSRecord;
+class nsIInterfaceRequestor;
+
+
+#define NS_SOCKET_CONNECT_TIMEOUT PR_MillisecondsToInterval(20)
+
+
+namespace mozilla {
+namespace net {
+
+nsresult ErrorAccordingToNSPR(PRErrorCode errorCode);
+
+class nsSocketInputStream;
+class nsSocketOutputStream;
+
+
+class nsSocketTransport final : public nsASocketHandler,
+                                public nsISocketTransport,
+                                public nsIDNSListener,
+                                public nsIClassInfo,
+                                public nsIInterfaceRequestor {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSITRANSPORT
+  NS_DECL_NSISOCKETTRANSPORT
+  NS_DECL_NSIDNSLISTENER
+  NS_DECL_NSICLASSINFO
+  NS_DECL_NSIINTERFACEREQUESTOR
+
+  nsSocketTransport();
+
+  nsresult Init(const nsTArray<nsCString>& socketTypes, const nsACString& host,
+                uint16_t port, const nsACString& hostRoute, uint16_t portRoute,
+                nsIProxyInfo* proxyInfo, nsIDNSRecord* dnsRecord);
+
+  nsresult InitWithConnectedSocket(PRFileDesc* socketFD, const NetAddr* addr);
+
+  nsresult InitWithConnectedSocket(PRFileDesc* aFD, const NetAddr* aAddr,
+                                   nsIInterfaceRequestor* aCallbacks);
+
+#ifdef XP_UNIX
+  nsresult InitWithFilename(const char* filename);
+
+  nsresult InitWithName(const char* name, size_t len);
+#endif
+
+  void OnSocketReady(PRFileDesc*, int16_t outFlags) override;
+  void OnSocketDetached(PRFileDesc*) override;
+  void IsLocal(bool* aIsLocal) override;
+  void OnKeepaliveEnabledPrefChange(bool aEnabled) final;
+
+  void OnSocketEvent(uint32_t type, nsresult status, nsISupports* param,
+                     std::function<void()>&& task);
+
+  uint64_t ByteCountReceived() override;
+  uint64_t ByteCountSent() override;
+  bool IsTRRConnection() override;
+  static void CloseSocket(PRFileDesc* aFd);
+
+ protected:
+  virtual ~nsSocketTransport();
+
+ private:
+  enum {
+    MSG_ENSURE_CONNECT,
+    MSG_DNS_LOOKUP_COMPLETE,
+    MSG_RETRY_INIT_SOCKET,
+    MSG_TIMEOUT_CHANGED,
+    MSG_INPUT_CLOSED,
+    MSG_INPUT_PENDING,
+    MSG_OUTPUT_CLOSED,
+    MSG_OUTPUT_PENDING
+  };
+  nsresult PostEvent(uint32_t type, nsresult status = NS_OK,
+                     nsISupports* param = nullptr,
+                     std::function<void()>&& task = nullptr);
+
+  enum {
+    STATE_CLOSED,
+    STATE_IDLE,
+    STATE_RESOLVING,
+    STATE_CONNECTING,
+    STATE_TRANSFERRING
+  };
+
+  class MOZ_STACK_CLASS PRFileDescAutoLock {
+   public:
+    explicit PRFileDescAutoLock(nsSocketTransport* aSocketTransport,
+                                nsresult* aConditionWhileLocked = nullptr)
+        : mSocketTransport(aSocketTransport), mFd(nullptr) {
+      MOZ_ASSERT(aSocketTransport);
+      MutexAutoLock lock(mSocketTransport->mLock);
+      if (aConditionWhileLocked) {
+        *aConditionWhileLocked = mSocketTransport->mCondition;
+        if (NS_FAILED(mSocketTransport->mCondition)) {
+          return;
+        }
+      }
+      mFd = mSocketTransport->GetFD_Locked();
+    }
+    ~PRFileDescAutoLock() {
+      MutexAutoLock lock(mSocketTransport->mLock);
+      if (mFd) {
+        mSocketTransport->ReleaseFD_Locked(mFd);
+      }
+    }
+    bool IsInitialized() { return mFd; }
+    operator PRFileDesc*() { return mFd; }
+    nsresult SetKeepaliveEnabled(bool aEnable);
+    nsresult SetKeepaliveVals(bool aEnabled, int aIdleTime, int aRetryInterval,
+                              int aProbeCount);
+
+   private:
+    operator PRFileDescAutoLock*() { return nullptr; }
+
+    nsSocketTransport* mSocketTransport;
+    PRFileDesc* mFd;
+  };
+  friend class PRFileDescAutoLock;
+
+  class LockedPRFileDesc {
+   public:
+    explicit LockedPRFileDesc(nsSocketTransport* aSocketTransport)
+        : mSocketTransport(aSocketTransport), mFd(nullptr) {
+      MOZ_ASSERT(aSocketTransport);
+    }
+    ~LockedPRFileDesc() = default;
+    bool IsInitialized() { return mFd; }
+    LockedPRFileDesc& operator=(PRFileDesc* aFd) {
+      mSocketTransport->mLock.AssertCurrentThreadOwns();
+      mFd = aFd;
+      return *this;
+    }
+    operator PRFileDesc*() {
+      if (mSocketTransport->mAttached) {
+        mSocketTransport->mLock.AssertCurrentThreadOwns();
+      }
+      return mFd;
+    }
+    bool operator==(PRFileDesc* aFd) {
+      mSocketTransport->mLock.AssertCurrentThreadOwns();
+      return mFd == aFd;
+    }
+
+   private:
+    operator LockedPRFileDesc*() { return nullptr; }
+    nsSocketTransport* mSocketTransport;
+    PRFileDesc* mFd;
+  };
+  friend class LockedPRFileDesc;
+
+
+  nsTArray<nsCString> mTypes;
+  nsCString mHost;
+  nsCString mProxyHost;
+  nsCString mOriginHost;
+  uint16_t mPort{0};
+  nsCOMPtr<nsIProxyInfo> mProxyInfo;
+  uint16_t mProxyPort{0};
+  uint16_t mOriginPort{0};
+  bool mProxyTransparent{false};
+  bool mProxyTransparentResolvesHost{false};
+  bool mHttpsProxy{false};
+  Atomic<uint32_t, Relaxed> mConnectionFlags{0};
+  bool mResetFamilyPreference{false};
+  uint32_t mTlsFlags{0};
+  bool mReuseAddrPort{false};
+
+  uint16_t SocketPort() {
+    return (!mProxyHost.IsEmpty() && !mProxyTransparent) ? mProxyPort : mPort;
+  }
+  const nsCString& SocketHost() {
+    return (!mProxyHost.IsEmpty() && !mProxyTransparent) ? mProxyHost : mHost;
+  }
+
+  Atomic<bool> mInputClosed{true};
+  Atomic<bool> mOutputClosed{true};
+
+
+  uint32_t mState{STATE_CLOSED};  
+  bool mAttached{false};
+
+  bool mResolving{false};
+
+  nsCOMPtr<nsICancelable> mDNSRequest;
+  nsCOMPtr<nsIDNSAddrRecord> mDNSRecord;
+
+  nsCString mEchConfig MOZ_GUARDED_BY(mLock);
+  Atomic<bool, Relaxed> mEchConfigUsed{false};
+  Atomic<bool, Relaxed> mResolvedByTRR{false};
+  Atomic<nsIRequest::TRRMode, Relaxed> mEffectiveTRRMode{
+      nsIRequest::TRR_DEFAULT_MODE};
+  Atomic<nsITRRSkipReason::value, Relaxed> mTRRSkipReason{
+      nsITRRSkipReason::TRR_UNSET};
+
+  nsCOMPtr<nsISupports> mInputCopyContext;
+  nsCOMPtr<nsISupports> mOutputCopyContext;
+
+  void SetSocketName(PRFileDesc* fd);
+  NetAddr mNetAddr;
+  NetAddr mSelfAddr;  
+  Atomic<bool, Relaxed> mNetAddrIsSet{false};
+  Atomic<bool, Relaxed> mSelfAddrIsSet{false};
+
+  UniquePtr<NetAddr> mBindAddr;  
+
+
+  void SendStatus(nsresult status);
+  nsresult ResolveHost();
+  nsresult BuildSocket(PRFileDesc*&, bool&, bool&);
+  nsresult InitiateSocket();
+  bool RecoverFromError();
+
+  void OnMsgInputPending() {
+    MOZ_ASSERT(OnSocketThread(), "not on socket thread");
+    if (mState == STATE_TRANSFERRING) {
+      mPollFlags |= (PR_POLL_READ | PR_POLL_EXCEPT);
+    }
+  }
+  void OnMsgOutputPending() {
+    MOZ_ASSERT(OnSocketThread(), "not on socket thread");
+    if (mState == STATE_TRANSFERRING) {
+      mPollFlags |= (PR_POLL_WRITE | PR_POLL_EXCEPT);
+    }
+  }
+  void OnMsgInputClosed(nsresult reason);
+  void OnMsgOutputClosed(nsresult reason);
+
+  void OnSocketConnected();
+
+
+  Mutex mLock{"nsSocketTransport.mLock"};
+  LockedPRFileDesc mFD MOZ_GUARDED_BY(mLock);
+  nsrefcnt mFDref MOZ_GUARDED_BY(mLock){0};
+  bool mFDconnected MOZ_GUARDED_BY(mLock){false};
+
+  RefPtr<nsSocketTransportService> mSocketTransportService;
+
+  nsCOMPtr<nsIInterfaceRequestor> mCallbacks MOZ_GUARDED_BY(mLock);
+  nsCOMPtr<nsITransportEventSink> mEventSink MOZ_GUARDED_BY(mLock);
+  nsCOMPtr<nsITLSSocketControl> mTLSSocketControl;
+
+  std::function<void(PRFileDesc*)> mFDDetachCallback;
+
+  UniquePtr<nsSocketInputStream> mInput;
+  UniquePtr<nsSocketOutputStream> mOutput;
+
+  friend class nsSocketInputStream;
+  friend class nsSocketOutputStream;
+  friend class TLSServerSocket;
+
+  uint16_t mTimeouts[2] MOZ_GUARDED_BY(mLock){0};
+
+  bool mLingerPolarity MOZ_GUARDED_BY(mLock){false};
+  int16_t mLingerTimeout MOZ_GUARDED_BY(mLock){0};
+
+  Atomic<uint32_t, Relaxed> mQoSBits{0};
+
+  PRFileDesc* GetFD_Locked() MOZ_REQUIRES(mLock);
+  void ReleaseFD_Locked(PRFileDesc* fd) MOZ_REQUIRES(mLock);
+
+  void OnInputClosed(nsresult reason) {
+    if (OnSocketThread()) {
+      OnMsgInputClosed(reason);
+    } else {
+      PostEvent(MSG_INPUT_CLOSED, reason);
+    }
+  }
+  void OnInputPending() {
+    if (OnSocketThread()) {
+      OnMsgInputPending();
+    } else {
+      PostEvent(MSG_INPUT_PENDING);
+    }
+  }
+  void OnOutputClosed(nsresult reason) {
+    if (OnSocketThread()) {
+      OnMsgOutputClosed(reason);  
+    } else {
+      PostEvent(MSG_OUTPUT_CLOSED, reason);
+    }
+  }
+  void OnOutputPending() {
+    if (OnSocketThread()) {
+      OnMsgOutputPending();
+    } else {
+      PostEvent(MSG_OUTPUT_PENDING);
+    }
+  }
+
+#ifdef ENABLE_SOCKET_TRACING
+  void TraceInBuf(const char* buf, int32_t n);
+  void TraceOutBuf(const char* buf, int32_t n);
+#endif
+
+  nsresult EnsureKeepaliveValsAreInitialized();
+
+  nsresult SetKeepaliveEnabledInternal(bool aEnable);
+
+  bool mKeepaliveEnabled{false};
+
+  int32_t mKeepaliveIdleTimeS{-1};
+  int32_t mKeepaliveRetryIntervalS{-1};
+  int32_t mKeepaliveProbeCount{-1};
+
+  Atomic<bool> mDoNotRetryToConnect{false};
+
+  bool mPortRemappingApplied = false;
+
+  bool mExternalDNSResolution = false;
+  bool mRetryDnsIfPossible = false;
+
+  bool mIsTRRConnection = false;
+};
+
+class nsSocketInputStream : public nsIAsyncInputStream {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_NSIINPUTSTREAM
+  NS_DECL_NSIASYNCINPUTSTREAM
+
+  explicit nsSocketInputStream(nsSocketTransport*);
+  virtual ~nsSocketInputStream() = default;
+
+  bool IsReferenced() { return mReaderRefCnt > 0; }
+  nsresult Condition() {
+    MutexAutoLock lock(mTransport->mLock);
+    return mCondition;
+  }
+  uint64_t ByteCount() {
+    MutexAutoLock lock(mTransport->mLock);
+    return mByteCount;
+  }
+  uint64_t ByteCount(MutexAutoLock&) MOZ_NO_THREAD_SAFETY_ANALYSIS {
+    return mByteCount;
+  }
+
+  void OnSocketReady(nsresult condition);
+
+ private:
+  nsSocketTransport* mTransport;
+  ThreadSafeAutoRefCnt mReaderRefCnt{0};
+
+  nsresult mCondition MOZ_GUARDED_BY(mTransport->mLock){NS_OK};
+  nsCOMPtr<nsIInputStreamCallback> mCallback MOZ_GUARDED_BY(mTransport->mLock);
+  uint32_t mCallbackFlags MOZ_GUARDED_BY(mTransport->mLock){0};
+  uint64_t mByteCount MOZ_GUARDED_BY(mTransport->mLock){0};
+};
+
+
+class nsSocketOutputStream : public nsIAsyncOutputStream {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_NSIOUTPUTSTREAM
+  NS_DECL_NSIASYNCOUTPUTSTREAM
+
+  explicit nsSocketOutputStream(nsSocketTransport*);
+  virtual ~nsSocketOutputStream() = default;
+
+  bool IsReferenced() { return mWriterRefCnt > 0; }
+  nsresult Condition() {
+    MutexAutoLock lock(mTransport->mLock);
+    return mCondition;
+  }
+  uint64_t ByteCount() {
+    MutexAutoLock lock(mTransport->mLock);
+    return mByteCount;
+  }
+  uint64_t ByteCount(MutexAutoLock&) MOZ_NO_THREAD_SAFETY_ANALYSIS {
+    return mByteCount;
+  }
+
+  void OnSocketReady(nsresult condition);
+
+ private:
+  static nsresult WriteFromSegments(nsIInputStream*, void*, const char*,
+                                    uint32_t offset, uint32_t count,
+                                    uint32_t* countRead);
+
+  nsSocketTransport* mTransport;
+  ThreadSafeAutoRefCnt mWriterRefCnt{0};
+
+  nsresult mCondition MOZ_GUARDED_BY(mTransport->mLock){NS_OK};
+  nsCOMPtr<nsIOutputStreamCallback> mCallback MOZ_GUARDED_BY(mTransport->mLock);
+  uint32_t mCallbackFlags MOZ_GUARDED_BY(mTransport->mLock){0};
+  uint64_t mByteCount MOZ_GUARDED_BY(mTransport->mLock){0};
+};
+
+}  
+}  
+
+#endif  // !nsSocketTransport_h__

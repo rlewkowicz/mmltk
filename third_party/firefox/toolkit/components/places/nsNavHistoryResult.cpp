@@ -1,0 +1,3688 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsNavHistory.h"
+#include "nsNavBookmarks.h"
+#include "nsFaviconService.h"
+#include "nsDebug.h"
+#include "nsNetUtil.h"
+#include "nsString.h"
+#include "nsReadableUtils.h"
+#include "prtime.h"
+#include "mozIStorageRow.h"
+#include "mozIStorageResultSet.h"
+#include "nsQueryObject.h"
+#include "mozilla/dom/PlacesObservers.h"
+#include "mozilla/dom/PlacesVisit.h"
+#include "mozilla/dom/PlacesVisitRemoved.h"
+#include "mozilla/dom/PlacesVisitTitle.h"
+#include "mozilla/dom/PlacesBookmarkAddition.h"
+#include "mozilla/dom/PlacesBookmarkRemoved.h"
+#include "mozilla/dom/PlacesBookmarkMoved.h"
+#include "mozilla/dom/PlacesBookmarkKeyword.h"
+#include "mozilla/dom/PlacesBookmarkTags.h"
+#include "mozilla/dom/PlacesBookmarkTime.h"
+#include "mozilla/dom/PlacesBookmarkTitle.h"
+#include "mozilla/dom/PlacesBookmarkUrl.h"
+#include "mozilla/dom/PlacesFavicon.h"
+#include "mozilla/intl/AppCollator.h"
+
+#include "nsCycleCollectionParticipant.h"
+
+#undef CompareString
+
+#define TO_ICONTAINER(_node) \
+  static_cast<nsINavHistoryContainerResultNode*>(_node)
+
+#define TO_CONTAINER(_node) static_cast<nsNavHistoryContainerResultNode*>(_node)
+
+#define NOTIFY_RESULT_OBSERVERS_RET(_result, _method, _ret)               \
+  PR_BEGIN_MACRO                                                          \
+  NS_ENSURE_TRUE(_result, _ret);                                          \
+  if (!_result->mSuppressNotifications) {                                 \
+    ENUMERATE_WEAKARRAY(_result->mObservers, nsINavHistoryResultObserver, \
+                        _method)                                          \
+  }                                                                       \
+  PR_END_MACRO
+
+#define NOTIFY_RESULT_OBSERVERS(_result, _method) \
+  NOTIFY_RESULT_OBSERVERS_RET(_result, _method, NS_ERROR_UNEXPECTED)
+
+#define NS_INTERFACE_MAP_STATIC_AMBIGUOUS(_class) \
+  if (aIID.Equals(NS_GET_IID(_class))) {          \
+    NS_ADDREF(this);                              \
+    *aInstancePtr = this;                         \
+    return NS_OK;                                 \
+  } else
+
+#define MAX_BATCH_CHANGES_BEFORE_REFRESH 5
+
+#define MAX_PAGE_REMOVES_BEFORE_REFRESH 10
+
+using namespace mozilla;
+using namespace mozilla::dom;
+using namespace mozilla::places;
+
+namespace {
+
+uint32_t getUpdateRequirements(const RefPtr<nsNavHistoryQuery>& aQuery,
+                               const RefPtr<nsNavHistoryQueryOptions>& aOptions,
+                               bool* aHasSearchTerms) {
+  bool hasSearchTerms = *aHasSearchTerms = !aQuery->SearchTerms().IsEmpty();
+
+  bool nonTimeBasedItems = false;
+  bool domainBasedItems = false;
+
+  if (aQuery->Parents().Length() > 0 || aQuery->Tags().Length() > 0 ||
+      (aOptions->QueryType() ==
+           nsINavHistoryQueryOptions::QUERY_TYPE_BOOKMARKS &&
+       hasSearchTerms)) {
+    return QUERYUPDATE_COMPLEX_WITH_BOOKMARKS;
+  }
+
+  if (hasSearchTerms || !aQuery->Domain().IsVoid() ||
+      aQuery->Uri() != nullptr) {
+    nonTimeBasedItems = true;
+  }
+
+  if (!aQuery->Domain().IsVoid()) {
+    domainBasedItems = true;
+  }
+
+  if (aOptions->ResultType() ==
+      nsINavHistoryQueryOptions::RESULTS_AS_TAGS_ROOT) {
+    return QUERYUPDATE_COMPLEX_WITH_BOOKMARKS;
+  }
+
+  if (aOptions->ResultType() ==
+      nsINavHistoryQueryOptions::RESULTS_AS_ROOTS_QUERY) {
+    return QUERYUPDATE_MOBILEPREF;
+  }
+
+  if (aOptions->ResultType() ==
+      nsINavHistoryQueryOptions::RESULTS_AS_LEFT_PANE_QUERY) {
+    return QUERYUPDATE_NONE;
+  }
+
+  uint16_t sortingMode = aOptions->SortingMode();
+  if (aOptions->MaxResults() > 0 &&
+      sortingMode != nsINavHistoryQueryOptions::SORT_BY_DATE_ASCENDING &&
+      sortingMode != nsINavHistoryQueryOptions::SORT_BY_DATE_DESCENDING) {
+    return QUERYUPDATE_COMPLEX;
+  }
+
+  if (domainBasedItems) return QUERYUPDATE_HOST;
+  if (!nonTimeBasedItems) return QUERYUPDATE_TIME;
+
+  return QUERYUPDATE_SIMPLE;
+}
+
+nsresult asciiHostNameFromHostString(const nsACString& aHostName,
+                                     nsACString& aAscii) {
+  aAscii.Truncate();
+  if (aHostName.IsEmpty()) {
+    return NS_OK;
+  }
+  nsAutoCString fakeURL("http://");
+  fakeURL.Append(aHostName);
+  nsCOMPtr<nsIURI> uri;
+  nsresult rv = NS_NewURI(getter_AddRefs(uri), fakeURL);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = uri->GetAsciiHost(aAscii);
+  NS_ENSURE_SUCCESS(rv, rv);
+  return NS_OK;
+}
+
+bool isQueryMatchingVisitDetails(
+    const RefPtr<nsNavHistoryQuery>& query,
+    const RefPtr<nsNavHistoryQueryOptions>& options, bool hidden,
+    PRTime visitTime, uint32_t transition, nsIURI* uri) {
+  if (hidden && !options->IncludeHidden()) {
+    return false;
+  }
+
+  bool hasIt;
+  if (NS_SUCCEEDED(query->GetHasBeginTime(&hasIt)) && hasIt) {
+    PRTime beginTime = nsNavHistory::NormalizeTime(query->BeginTimeReference(),
+                                                   query->BeginTime());
+    if (visitTime < beginTime) {
+      return false;
+    }
+  }
+  if (NS_SUCCEEDED(query->GetHasEndTime(&hasIt)) && hasIt) {
+    PRTime endTime = nsNavHistory::NormalizeTime(query->EndTimeReference(),
+                                                 query->EndTime());
+    if (visitTime > endTime) {
+      return false;
+    }
+  }
+
+  const nsTArray<uint32_t>& transitions = query->Transitions();
+  if (transition > 0 && transitions.Length() &&
+      !transitions.Contains(transition)) {
+    return false;
+  }
+
+  if (!query->Domain().IsVoid()) {
+    nsAutoCString asciiRequest;
+    if (NS_FAILED(asciiHostNameFromHostString(query->Domain(), asciiRequest))) {
+      return false;
+    }
+    if (query->DomainIsHost()) {
+      nsAutoCString host;
+      if (NS_FAILED(uri->GetAsciiHost(host)) || !asciiRequest.Equals(host)) {
+        return false;
+      }
+    } else {
+      nsNavHistory* history = nsNavHistory::GetHistoryService();
+      if (history) {
+        nsAutoCString domain;
+        history->DomainNameFromURI(uri, domain);
+        if (!asciiRequest.Equals(domain)) {
+          return false;
+        }
+      }
+    }
+  }
+
+  if (query->Uri()) {
+    bool equals;
+    if (NS_FAILED(query->Uri()->Equals(uri, &equals)) || !equals) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+inline bool isTimeFilteredQuery(const RefPtr<nsNavHistoryQuery>& query) {
+  bool hasIt;
+  return (NS_SUCCEEDED(query->GetHasBeginTime(&hasIt)) && hasIt) ||
+         (NS_SUCCEEDED(query->GetHasEndTime(&hasIt)) && hasIt);
+}
+
+inline bool caseInsensitiveFind(const nsACString& aSearchTerms,
+                                const nsACString& aTarget) {
+  nsACString::const_iterator start, end;
+  aTarget.BeginReading(start);
+  aTarget.EndReading(end);
+  return CaseInsensitiveFindInReadable(aSearchTerms, start, end);
+}
+
+bool isQuerySearchTermsMatching(const RefPtr<nsNavHistoryQuery>& aQuery,
+                                const nsACString& aURI,
+                                const nsACString& aTitle,
+                                const nsAString& aTags) {
+  nsAutoCString searchTerms = NS_ConvertUTF16toUTF8(aQuery->SearchTerms());
+  if ((!aTitle.IsEmpty() && caseInsensitiveFind(searchTerms, aTitle)) ||
+      (!aURI.IsEmpty() && caseInsensitiveFind(searchTerms, aURI))) {
+    return true;
+  }
+
+  if (aTags.IsEmpty()) {
+    return false;
+  }
+  for (const nsAString& tag : aTags.Split(',')) {
+    if (caseInsensitiveFind(searchTerms, NS_ConvertUTF16toUTF8(tag))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool isQuerySearchTermsMatching(const RefPtr<nsNavHistoryQuery>& aQuery,
+                                const RefPtr<nsNavHistoryResultNode>& aNode) {
+  return isQuerySearchTermsMatching(aQuery, aNode->mURI, aNode->mTitle,
+                                    aNode->mTags);
+}
+
+inline int32_t ComparePRTime(PRTime a, PRTime b) {
+  if (a == b) {
+    return 0;
+  }
+  return a < b ? -1 : 1;
+}
+inline int32_t CompareIntegers(uint32_t a, uint32_t b) {
+  return static_cast<int32_t>(a) - static_cast<int32_t>(b);
+}
+
+}  
+
+NS_IMPL_CYCLE_COLLECTION(nsNavHistoryResultNode, mParent)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(nsNavHistoryResultNode)
+  NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsINavHistoryResultNode)
+  NS_INTERFACE_MAP_ENTRY(nsINavHistoryResultNode)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(nsNavHistoryResultNode)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(nsNavHistoryResultNode)
+
+nsNavHistoryResultNode::nsNavHistoryResultNode(const nsACString& aURI,
+                                               const nsACString& aTitle,
+                                               uint32_t aAccessCount,
+                                               PRTime aTime)
+    : mParent(nullptr),
+      mURI(aURI),
+      mTitle(aTitle),
+      mAccessCount(aAccessCount),
+      mTime(aTime),
+      mBookmarkIndex(-1),
+      mItemId(-1),
+      mVisitId(-1),
+      mDateAdded(0),
+      mLastModified(0),
+      mIndentLevel(-1),
+      mFrecency(0),
+      mHidden(false),
+      mTransitionType(0) {
+  mTags.SetIsVoid(true);
+}
+
+NS_IMETHODIMP
+nsNavHistoryResultNode::GetIcon(nsACString& aIcon) {
+  if (this->IsContainer() || mURI.IsEmpty()) {
+    return NS_OK;
+  }
+
+  aIcon.AppendLiteral("page-icon:");
+  aIcon.Append(mURI);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNavHistoryResultNode::GetParent(nsINavHistoryContainerResultNode** aParent) {
+  NS_IF_ADDREF(*aParent = mParent);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNavHistoryResultNode::GetParentResult(nsINavHistoryResult** aResult) {
+  *aResult = nullptr;
+  if (IsContainer()) {
+    NS_IF_ADDREF(*aResult = GetAsContainer()->mResult);
+  } else if (mParent) {
+    NS_IF_ADDREF(*aResult = mParent->mResult);
+  }
+
+  NS_ENSURE_STATE(*aResult);
+  return NS_OK;
+}
+
+void nsNavHistoryResultNode::SetTags(const nsAString& aTags) {
+  if (aTags.IsVoid()) {
+    mTags.SetIsVoid(true);
+    return;
+  }
+
+  mTags.Assign(aTags);
+}
+
+NS_IMETHODIMP
+nsNavHistoryResultNode::GetTags(nsAString& aTags) {
+  if (mTags.IsVoid()) {
+    aTags.SetIsVoid(true);
+    return NS_OK;
+  }
+
+  aTags.Assign(mTags);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNavHistoryResultNode::GetPageGuid(nsACString& aPageGuid) {
+  aPageGuid = mPageGuid;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNavHistoryResultNode::GetBookmarkGuid(nsACString& aBookmarkGuid) {
+  aBookmarkGuid = mBookmarkGuid;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNavHistoryResultNode::GetVisitId(int64_t* aVisitId) {
+  *aVisitId = mVisitId;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNavHistoryResultNode::GetVisitType(uint32_t* aVisitType) {
+  *aVisitType = mTransitionType;
+  return NS_OK;
+}
+
+void nsNavHistoryResultNode::OnRemoving() { mParent = nullptr; }
+
+nsNavHistoryResult* nsNavHistoryResultNode::GetResult() {
+  nsNavHistoryResultNode* node = this;
+  do {
+    if (node->IsContainer()) {
+      nsNavHistoryContainerResultNode* container = TO_CONTAINER(node);
+      return container->mResult;
+    }
+    node = node->mParent;
+  } while (node);
+  MOZ_ASSERT(false, "No container node found in hierarchy!");
+  return nullptr;
+}
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED(nsNavHistoryContainerResultNode,
+                                   nsNavHistoryResultNode, mResult, mChildren)
+
+NS_IMPL_ADDREF_INHERITED(nsNavHistoryContainerResultNode,
+                         nsNavHistoryResultNode)
+NS_IMPL_RELEASE_INHERITED(nsNavHistoryContainerResultNode,
+                          nsNavHistoryResultNode)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(nsNavHistoryContainerResultNode)
+  NS_INTERFACE_MAP_STATIC_AMBIGUOUS(nsNavHistoryContainerResultNode)
+  NS_INTERFACE_MAP_ENTRY(nsINavHistoryContainerResultNode)
+NS_INTERFACE_MAP_END_INHERITING(nsNavHistoryResultNode)
+
+nsNavHistoryContainerResultNode::nsNavHistoryContainerResultNode(
+    const nsACString& aURI, const nsACString& aTitle, PRTime aTime,
+    uint32_t aContainerType, nsNavHistoryQueryOptions* aOptions)
+    : nsNavHistoryResultNode(aURI, aTitle, 0, aTime),
+      mResult(nullptr),
+      mContainerType(aContainerType),
+      mExpanded(false),
+      mOptions(aOptions),
+      mAsyncCanceledState(NOT_CANCELED) {
+  MOZ_ASSERT(mOptions);
+  MOZ_ALWAYS_SUCCEEDS(mOptions->Clone(getter_AddRefs(mOriginalOptions)));
+}
+
+nsNavHistoryContainerResultNode::~nsNavHistoryContainerResultNode() {
+  mChildren.Clear();
+}
+
+void nsNavHistoryContainerResultNode::OnRemoving() {
+  nsNavHistoryResultNode::OnRemoving();
+  for (nsNavHistoryResultNode* child : mChildren) {
+    child->OnRemoving();
+  }
+  mChildren.Clear();
+  mResult = nullptr;
+}
+
+bool nsNavHistoryContainerResultNode::AreChildrenVisible() {
+  nsNavHistoryResult* result = GetResult();
+  if (!result) {
+    MOZ_ASSERT_UNREACHABLE("Invalid result");
+    return false;
+  }
+
+  if (!mExpanded) return false;
+
+  nsNavHistoryContainerResultNode* ancestor = mParent;
+  while (ancestor) {
+    if (!ancestor->mExpanded) return false;
+
+    ancestor = ancestor->mParent;
+  }
+
+  return true;
+}
+
+nsresult nsNavHistoryContainerResultNode::OnVisitsRemoved(nsIURI* aURI) {
+  if (!AreChildrenVisible()) {
+    return NS_OK;
+  }
+
+  nsNavHistoryResult* result = GetResult();
+  NS_ENSURE_STATE(result);
+  if (result->CanSkipHistoryDetailsNotifications()) {
+    return NS_OK;
+  }
+
+  nsAutoCString spec;
+  nsresult rv = aURI->GetSpec(spec);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMArray<nsNavHistoryResultNode> nodes;
+  FindChildrenByURI(spec, &nodes);
+  for (int32_t i = 0; i < nodes.Count(); i++) {
+    nodes[i]->OnVisitsRemoved();
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNavHistoryContainerResultNode::GetContainerOpen(bool* aContainerOpen) {
+  *aContainerOpen = mExpanded;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNavHistoryContainerResultNode::SetContainerOpen(bool aContainerOpen) {
+  if (aContainerOpen) {
+    if (!mExpanded) {
+      if (mOptions->AsyncEnabled()) {
+        OpenContainerAsync();
+      } else {
+        OpenContainer();
+      }
+    }
+  } else {
+    if (mExpanded) {
+      CloseContainer();
+    } else if (mAsyncPendingStmt) {
+      CancelAsyncOpen(false);
+    }
+  }
+
+  return NS_OK;
+}
+
+nsresult nsNavHistoryContainerResultNode::NotifyOnStateChange(
+    uint16_t aOldState) {
+  nsNavHistoryResult* result = GetResult();
+  NS_ENSURE_STATE(result);
+
+  nsresult rv;
+  uint16_t currState;
+  rv = GetState(&currState);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  NOTIFY_RESULT_OBSERVERS(result,
+                          ContainerStateChanged(this, aOldState, currState));
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNavHistoryContainerResultNode::GetState(uint16_t* _state) {
+  NS_ENSURE_ARG_POINTER(_state);
+
+  *_state = mExpanded           ? (uint16_t)STATE_OPENED
+            : mAsyncPendingStmt ? (uint16_t)STATE_LOADING
+                                : (uint16_t)STATE_CLOSED;
+
+  return NS_OK;
+}
+
+nsresult nsNavHistoryContainerResultNode::OpenContainer() {
+  NS_ASSERTION(!mExpanded, "Container must not be expanded to open it");
+  mExpanded = true;
+
+  nsresult rv = NotifyOnStateChange(STATE_CLOSED);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+nsresult nsNavHistoryContainerResultNode::CloseContainer(
+    bool aSuppressNotifications) {
+  NS_ASSERTION(
+      (mExpanded && !mAsyncPendingStmt) || (!mExpanded && mAsyncPendingStmt),
+      "Container must be expanded or loading to close it");
+
+  nsresult rv;
+  uint16_t oldState;
+  rv = GetState(&oldState);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (mExpanded) {
+    for (int32_t i = 0; i < mChildren.Count(); ++i) {
+      if (mChildren[i]->IsContainer() &&
+          mChildren[i]->GetAsContainer()->mExpanded) {
+        mChildren[i]->GetAsContainer()->CloseContainer(true);
+      }
+    }
+
+    mExpanded = false;
+  }
+
+  mAsyncPendingStmt = nullptr;
+
+  if (!aSuppressNotifications) {
+    rv = NotifyOnStateChange(oldState);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  nsNavHistoryResult* result = GetResult();
+  NS_ENSURE_STATE(result);
+  if (result->mRootNode == this) {
+    result->StopObserving();
+    if (this->IsQuery()) {
+      this->GetAsQuery()->ClearChildren(true);
+    } else if (this->IsFolderOrShortcut()) {
+      this->GetAsFolder()->ClearChildren(true);
+    }
+  }
+
+  return NS_OK;
+}
+
+nsresult nsNavHistoryContainerResultNode::OpenContainerAsync() {
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+void nsNavHistoryContainerResultNode::CancelAsyncOpen(bool aRestart) {
+  NS_ASSERTION(mAsyncPendingStmt, "Async execution canceled but not pending");
+
+  mAsyncCanceledState = aRestart ? CANCELED_RESTART_NEEDED : CANCELED;
+
+  (void)mAsyncPendingStmt->Cancel();
+}
+
+void nsNavHistoryContainerResultNode::FillStats() {
+  uint32_t accessCount = 0;
+  PRTime newTime = 0;
+
+  for (nsNavHistoryResultNode* node : mChildren) {
+    SetAsParentOfNode(node);
+    accessCount += node->mAccessCount;
+    if (node->mTime > newTime) {
+      newTime = node->mTime;
+    }
+  }
+
+  if (mExpanded) {
+    mAccessCount = accessCount;
+    if (!IsQuery() || newTime > mTime) {
+      mTime = newTime;
+    }
+  }
+}
+
+void nsNavHistoryContainerResultNode::SetAsParentOfNode(
+    nsNavHistoryResultNode* aNode) {
+  aNode->mParent = this;
+  aNode->mIndentLevel = mIndentLevel + 1;
+  if (aNode->IsContainer()) {
+    nsNavHistoryContainerResultNode* container = aNode->GetAsContainer();
+    if (mOptions->ExcludeItems()) {
+      container->mOptions->SetExcludeItems(true);
+    }
+    if (mOptions->ExcludeQueries()) {
+      container->mOptions->SetExcludeQueries(true);
+    }
+    if (aNode->IsFolderOrShortcut() && mOptions->AsyncEnabled()) {
+      container->mOptions->SetAsyncEnabled(true);
+    }
+    if (!mOptions->ExpandQueries()) {
+      container->mOptions->SetExpandQueries(false);
+    }
+    container->mResult = mResult;
+    container->FillStats();
+  }
+}
+
+uint16_t nsNavHistoryContainerResultNode::GetSortType() {
+  if (mParent) return mParent->GetSortType();
+  if (mResult) return mResult->mSortingMode;
+
+  return nsINavHistoryQueryOptions::SORT_BY_NONE;
+}
+
+nsresult nsNavHistoryContainerResultNode::Refresh() {
+  NS_WARNING(
+      "Refresh() is supported by queries or folders, not generic containers.");
+  return NS_OK;
+}
+
+nsNavHistoryContainerResultNode::SortComparator
+nsNavHistoryContainerResultNode::GetSortingComparator(uint16_t aSortType) {
+  switch (aSortType) {
+    case nsINavHistoryQueryOptions::SORT_BY_NONE:
+      return &SortComparison_Bookmark;
+    case nsINavHistoryQueryOptions::SORT_BY_TITLE_ASCENDING:
+      return &SortComparison_TitleLess;
+    case nsINavHistoryQueryOptions::SORT_BY_TITLE_DESCENDING:
+      return &SortComparison_TitleGreater;
+    case nsINavHistoryQueryOptions::SORT_BY_DATE_ASCENDING:
+      return &SortComparison_DateLess;
+    case nsINavHistoryQueryOptions::SORT_BY_DATE_DESCENDING:
+      return &SortComparison_DateGreater;
+    case nsINavHistoryQueryOptions::SORT_BY_URI_ASCENDING:
+      return &SortComparison_URILess;
+    case nsINavHistoryQueryOptions::SORT_BY_URI_DESCENDING:
+      return &SortComparison_URIGreater;
+    case nsINavHistoryQueryOptions::SORT_BY_VISITCOUNT_ASCENDING:
+      return &SortComparison_VisitCountLess;
+    case nsINavHistoryQueryOptions::SORT_BY_VISITCOUNT_DESCENDING:
+      return &SortComparison_VisitCountGreater;
+    case nsINavHistoryQueryOptions::SORT_BY_DATEADDED_ASCENDING:
+      return &SortComparison_DateAddedLess;
+    case nsINavHistoryQueryOptions::SORT_BY_DATEADDED_DESCENDING:
+      return &SortComparison_DateAddedGreater;
+    case nsINavHistoryQueryOptions::SORT_BY_LASTMODIFIED_ASCENDING:
+      return &SortComparison_LastModifiedLess;
+    case nsINavHistoryQueryOptions::SORT_BY_LASTMODIFIED_DESCENDING:
+      return &SortComparison_LastModifiedGreater;
+    case nsINavHistoryQueryOptions::SORT_BY_TAGS_ASCENDING:
+      return &SortComparison_TagsLess;
+    case nsINavHistoryQueryOptions::SORT_BY_TAGS_DESCENDING:
+      return &SortComparison_TagsGreater;
+    case nsINavHistoryQueryOptions::SORT_BY_FRECENCY_ASCENDING:
+      return &SortComparison_FrecencyLess;
+    case nsINavHistoryQueryOptions::SORT_BY_FRECENCY_DESCENDING:
+      return &SortComparison_FrecencyGreater;
+    default:
+      MOZ_ASSERT_UNREACHABLE("Bad sorting type");
+      return nullptr;
+  }
+}
+
+void nsNavHistoryContainerResultNode::RecursiveSort(
+    SortComparator aComparator) {
+  mChildren.Sort(aComparator);
+  for (nsNavHistoryResultNode* child : mChildren) {
+    if (child->IsContainer()) {
+      child->GetAsContainer()->RecursiveSort(aComparator);
+    }
+  }
+}
+
+int32_t nsNavHistoryContainerResultNode::FindInsertionPoint(
+    nsNavHistoryResultNode* aNode, SortComparator aComparator,
+    bool* aItemExists) {
+  if (aItemExists) {
+    (*aItemExists) = false;
+  }
+
+  if (mChildren.Count() == 0) return 0;
+
+  int32_t res;
+  res = aComparator(aNode, mChildren[0]);
+  if (res <= 0) {
+    if (aItemExists && res == 0) {
+      (*aItemExists) = true;
+    }
+    return 0;
+  }
+  res = aComparator(aNode, mChildren[mChildren.Count() - 1]);
+  if (res >= 0) {
+    if (aItemExists && res == 0) {
+      (*aItemExists) = true;
+    }
+    return mChildren.Count();
+  }
+
+  int32_t beginRange = 0;                
+  int32_t endRange = mChildren.Count();  
+  while (beginRange < endRange) {
+    int32_t center = beginRange + (endRange - beginRange) / 2;
+    int32_t res = aComparator(aNode, mChildren[center]);
+    if (res <= 0) {
+      endRange = center;  
+      if (aItemExists && res == 0) {
+        (*aItemExists) = true;
+      }
+    } else {
+      beginRange = center + 1;  
+    }
+  }
+  return endRange;
+}
+
+bool nsNavHistoryContainerResultNode::DoesChildNeedResorting(
+    int32_t aIndex, SortComparator aComparator) {
+  MOZ_ASSERT(aIndex < mChildren.Count(), "Input index out of range");
+  MOZ_ASSERT(aIndex >= 0, "Input index out of range");
+  if (aIndex < 0 || aIndex >= mChildren.Count() || mChildren.Count() == 1) {
+    return false;
+  }
+
+  if (aIndex > 0) {
+    if (aComparator(mChildren[aIndex - 1], mChildren[aIndex]) > 0) {
+      return true;
+    }
+  }
+  if (aIndex < mChildren.Count() - 1) {
+    if (aComparator(mChildren[aIndex], mChildren[aIndex + 1]) > 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+int32_t nsNavHistoryContainerResultNode::SortComparison_Bookmark(
+    nsNavHistoryResultNode* a, nsNavHistoryResultNode* b) {
+  return a->mBookmarkIndex - b->mBookmarkIndex;
+}
+
+int32_t nsNavHistoryContainerResultNode::SortComparison_TitleLess(
+    nsNavHistoryResultNode* a, nsNavHistoryResultNode* b) {
+  uint32_t aType;
+  a->GetType(&aType);
+
+  int32_t value = mozilla::intl::AppCollator::CompareBase(a->mTitle, b->mTitle);
+  if (value == 0) {
+    if (a->IsURI()) {
+      value = Compare(a->mURI, b->mURI);
+    }
+    if (value == 0) {
+      value = ComparePRTime(a->mTime, b->mTime);
+      if (value == 0) {
+        value = nsNavHistoryContainerResultNode::SortComparison_Bookmark(a, b);
+      }
+    }
+  }
+  return value;
+}
+int32_t nsNavHistoryContainerResultNode::SortComparison_TitleGreater(
+    nsNavHistoryResultNode* a, nsNavHistoryResultNode* b) {
+  return -SortComparison_TitleLess(a, b);
+}
+
+int32_t nsNavHistoryContainerResultNode::SortComparison_DateLess(
+    nsNavHistoryResultNode* a, nsNavHistoryResultNode* b) {
+  int32_t value = ComparePRTime(a->mTime, b->mTime);
+  if (value == 0) {
+    value = mozilla::intl::AppCollator::CompareBase(a->mTitle, b->mTitle);
+    if (value == 0) {
+      value = nsNavHistoryContainerResultNode::SortComparison_Bookmark(a, b);
+    }
+  }
+  return value;
+}
+int32_t nsNavHistoryContainerResultNode::SortComparison_DateGreater(
+    nsNavHistoryResultNode* a, nsNavHistoryResultNode* b) {
+  return -nsNavHistoryContainerResultNode::SortComparison_DateLess(a, b);
+}
+
+int32_t nsNavHistoryContainerResultNode::SortComparison_DateAddedLess(
+    nsNavHistoryResultNode* a, nsNavHistoryResultNode* b) {
+  int32_t value = ComparePRTime(a->mDateAdded, b->mDateAdded);
+  if (value == 0) {
+    value = mozilla::intl::AppCollator::CompareBase(a->mTitle, b->mTitle);
+    if (value == 0) {
+      value = nsNavHistoryContainerResultNode::SortComparison_Bookmark(a, b);
+    }
+  }
+  return value;
+}
+int32_t nsNavHistoryContainerResultNode::SortComparison_DateAddedGreater(
+    nsNavHistoryResultNode* a, nsNavHistoryResultNode* b) {
+  return -nsNavHistoryContainerResultNode::SortComparison_DateAddedLess(a, b);
+}
+
+int32_t nsNavHistoryContainerResultNode::SortComparison_LastModifiedLess(
+    nsNavHistoryResultNode* a, nsNavHistoryResultNode* b) {
+  int32_t value = ComparePRTime(a->mLastModified, b->mLastModified);
+  if (value == 0) {
+    value = mozilla::intl::AppCollator::CompareBase(a->mTitle, b->mTitle);
+    if (value == 0) {
+      value = nsNavHistoryContainerResultNode::SortComparison_Bookmark(a, b);
+    }
+  }
+  return value;
+}
+int32_t nsNavHistoryContainerResultNode::SortComparison_LastModifiedGreater(
+    nsNavHistoryResultNode* a, nsNavHistoryResultNode* b) {
+  return -nsNavHistoryContainerResultNode::SortComparison_LastModifiedLess(a,
+                                                                           b);
+}
+
+int32_t nsNavHistoryContainerResultNode::SortComparison_URILess(
+    nsNavHistoryResultNode* a, nsNavHistoryResultNode* b) {
+  int32_t value;
+  if (a->IsURI() && b->IsURI()) {
+    value = Compare(a->mURI, b->mURI);
+  } else if (a->IsContainer() && !b->IsContainer()) {
+    return -1;
+  } else if (b->IsContainer() && !a->IsContainer()) {
+    return 1;
+  } else {
+    value = mozilla::intl::AppCollator::CompareBase(a->mTitle, b->mTitle);
+  }
+
+  if (value == 0) {
+    value = ComparePRTime(a->mTime, b->mTime);
+    if (value == 0) {
+      value = nsNavHistoryContainerResultNode::SortComparison_Bookmark(a, b);
+    }
+  }
+  return value;
+}
+int32_t nsNavHistoryContainerResultNode::SortComparison_URIGreater(
+    nsNavHistoryResultNode* a, nsNavHistoryResultNode* b) {
+  return -SortComparison_URILess(a, b);
+}
+
+int32_t nsNavHistoryContainerResultNode::SortComparison_VisitCountLess(
+    nsNavHistoryResultNode* a, nsNavHistoryResultNode* b) {
+  int32_t value = CompareIntegers(a->mAccessCount, b->mAccessCount);
+  if (value == 0) {
+    value = ComparePRTime(a->mTime, b->mTime);
+    if (value == 0) {
+      value = nsNavHistoryContainerResultNode::SortComparison_Bookmark(a, b);
+    }
+  }
+  return value;
+}
+int32_t nsNavHistoryContainerResultNode::SortComparison_VisitCountGreater(
+    nsNavHistoryResultNode* a, nsNavHistoryResultNode* b) {
+  return -nsNavHistoryContainerResultNode::SortComparison_VisitCountLess(a, b);
+}
+
+int32_t nsNavHistoryContainerResultNode::SortComparison_TagsLess(
+    nsNavHistoryResultNode* a, nsNavHistoryResultNode* b) {
+  int32_t value = 0;
+  nsAutoString aTags, bTags;
+
+  nsresult rv = a->GetTags(aTags);
+  NS_ENSURE_SUCCESS(rv, 0);
+
+  rv = b->GetTags(bTags);
+  NS_ENSURE_SUCCESS(rv, 0);
+
+  value = mozilla::intl::AppCollator::CompareBase(aTags, bTags);
+
+  if (value == 0) {
+    value = SortComparison_TitleLess(a, b);
+  }
+
+  return value;
+}
+
+int32_t nsNavHistoryContainerResultNode::SortComparison_TagsGreater(
+    nsNavHistoryResultNode* a, nsNavHistoryResultNode* b) {
+  return -SortComparison_TagsLess(a, b);
+}
+
+int32_t nsNavHistoryContainerResultNode::SortComparison_FrecencyLess(
+    nsNavHistoryResultNode* a, nsNavHistoryResultNode* b) {
+  int32_t value = CompareIntegers(a->mFrecency, b->mFrecency);
+  if (value == 0) {
+    value = ComparePRTime(a->mTime, b->mTime);
+    if (value == 0) {
+      value = nsNavHistoryContainerResultNode::SortComparison_Bookmark(a, b);
+    }
+  }
+  return value;
+}
+int32_t nsNavHistoryContainerResultNode::SortComparison_FrecencyGreater(
+    nsNavHistoryResultNode* a, nsNavHistoryResultNode* b) {
+  return -nsNavHistoryContainerResultNode::SortComparison_FrecencyLess(a, b);
+}
+
+nsNavHistoryResultNode* nsNavHistoryContainerResultNode::FindChildByURI(
+    const nsACString& aSpec, uint32_t* aNodeIndex) {
+  for (int32_t i = 0; i < mChildren.Count(); ++i) {
+    if (mChildren[i]->IsURI()) {
+      if (aSpec.Equals(mChildren[i]->mURI)) {
+        *aNodeIndex = i;
+        return mChildren[i];
+      }
+    }
+  }
+  return nullptr;
+}
+
+void nsNavHistoryContainerResultNode::FindChildrenByURI(
+    const nsCString& aSpec, nsCOMArray<nsNavHistoryResultNode>* aMatches) {
+  for (int32_t i = 0; i < mChildren.Count(); ++i) {
+    if (mChildren[i]->IsURI()) {
+      if (aSpec.Equals(mChildren[i]->mURI)) {
+        aMatches->AppendObject(mChildren[i]);
+      }
+    }
+  }
+}
+
+nsNavHistoryResultNode* nsNavHistoryContainerResultNode::FindChildByGuid(
+    const nsACString& guid, int32_t* nodeIndex) {
+  *nodeIndex = -1;
+  for (int32_t i = 0; i < mChildren.Count(); ++i) {
+    if (mChildren[i]->mBookmarkGuid == guid ||
+        mChildren[i]->mPageGuid == guid ||
+        (mChildren[i]->IsFolderOrShortcut() &&
+         mChildren[i]->GetAsFolder()->mTargetFolderGuid == guid)) {
+      *nodeIndex = i;
+      return mChildren[i];
+    }
+  }
+  return nullptr;
+}
+
+nsNavHistoryResultNode* nsNavHistoryContainerResultNode::FindChildById(
+    int64_t aItemId, int32_t* aNodeIndex) {
+  for (int32_t i = 0; i < mChildren.Count(); ++i) {
+    if (mChildren[i]->mItemId == aItemId ||
+        (mChildren[i]->IsFolderOrShortcut() &&
+         mChildren[i]->GetAsFolder()->mTargetFolderItemId == aItemId)) {
+      *aNodeIndex = i;
+      return mChildren[i];
+    }
+  }
+  *aNodeIndex = -1;
+  return nullptr;
+}
+
+nsresult nsNavHistoryContainerResultNode::InsertChildAt(
+    nsNavHistoryResultNode* aNode, int32_t aIndex) {
+  nsNavHistoryResult* result = GetResult();
+  NS_ENSURE_STATE(result);
+
+  SetAsParentOfNode(aNode);
+
+  if (!mChildren.InsertObjectAt(aNode, aIndex)) return NS_ERROR_OUT_OF_MEMORY;
+
+  uint32_t oldAccessCount = mAccessCount;
+  PRTime oldTime = mTime;
+
+  mAccessCount += aNode->mAccessCount;
+  if (mTime < aNode->mTime) {
+    mTime = aNode->mTime;
+  }
+  if ((!mParent || mParent->AreChildrenVisible()) &&
+      !result->CanSkipHistoryDetailsNotifications()) {
+    NOTIFY_RESULT_OBSERVERS(
+        result, NodeHistoryDetailsChanged(TO_ICONTAINER(this), oldTime,
+                                          oldAccessCount));
+  }
+
+  if (AreChildrenVisible()) {
+    NOTIFY_RESULT_OBSERVERS(result, NodeInserted(this, aNode, aIndex));
+  }
+
+  return NS_OK;
+}
+
+nsresult nsNavHistoryContainerResultNode::InsertSortedChild(
+    nsNavHistoryResultNode* aNode, bool aIgnoreDuplicates) {
+  if (mChildren.Count() == 0) return InsertChildAt(aNode, 0);
+
+  SortComparator comparator = GetSortingComparator(GetSortType());
+  if (comparator) {
+    if (aNode->IsContainer()) {
+      nsNavHistoryContainerResultNode* container = aNode->GetAsContainer();
+      container->mResult = mResult;
+      container->FillStats();
+    }
+
+    bool itemExists;
+    int32_t position = FindInsertionPoint(aNode, comparator, &itemExists);
+    if (aIgnoreDuplicates && itemExists) {
+      return NS_OK;
+    }
+
+    return InsertChildAt(aNode, position);
+  }
+  return InsertChildAt(aNode, mChildren.Count());
+}
+
+bool nsNavHistoryContainerResultNode::EnsureItemPosition(int32_t aIndex) {
+  NS_ASSERTION(aIndex < mChildren.Count(), "Invalid index");
+  if (aIndex >= mChildren.Count()) {
+    return false;
+  }
+
+  SortComparator comparator = GetSortingComparator(GetSortType());
+  if (!comparator) {
+    return false;
+  }
+
+  if (!DoesChildNeedResorting(aIndex, comparator)) {
+    return false;
+  }
+
+  RefPtr<nsNavHistoryResultNode> node(mChildren[aIndex]);
+  mChildren.RemoveObjectAt(aIndex);
+
+  int32_t newIndex = FindInsertionPoint(node, comparator, nullptr);
+  mChildren.InsertObjectAt(node.get(), newIndex);
+
+  if (AreChildrenVisible()) {
+    nsNavHistoryResult* result = GetResult();
+    NOTIFY_RESULT_OBSERVERS_RET(
+        result, NodeMoved(node, this, aIndex, this, newIndex), false);
+  }
+
+  return true;
+}
+
+nsresult nsNavHistoryContainerResultNode::RemoveChildAt(int32_t aIndex) {
+  NS_ASSERTION(aIndex >= 0 && aIndex < mChildren.Count(), "Invalid index");
+
+  RefPtr<nsNavHistoryResultNode> oldNode = mChildren[aIndex];
+
+  mAccessCount -= mChildren[aIndex]->mAccessCount;
+
+  mChildren.RemoveObjectAt(aIndex);
+  if (AreChildrenVisible()) {
+    nsNavHistoryResult* result = GetResult();
+    NOTIFY_RESULT_OBSERVERS(result, NodeRemoved(this, oldNode, aIndex));
+  }
+
+  oldNode->OnRemoving();
+  return NS_OK;
+}
+
+void nsNavHistoryContainerResultNode::RecursiveFindURIs(
+    bool aOnlyOne, nsNavHistoryContainerResultNode* aContainer,
+    const nsCString& aSpec, nsCOMArray<nsNavHistoryResultNode>* aMatches) {
+  for (int32_t i = 0; i < aContainer->mChildren.Count(); ++i) {
+    auto* node = aContainer->mChildren[i];
+    if (node->IsURI()) {
+      if (node->mURI.Equals(aSpec)) {
+        aMatches->AppendObject(node);
+        if (aOnlyOne) {
+          return;
+        }
+      }
+    } else if (node->IsContainer() && node->GetAsContainer()->mExpanded) {
+      RecursiveFindURIs(aOnlyOne, node->GetAsContainer(), aSpec, aMatches);
+    }
+  }
+}
+
+bool nsNavHistoryContainerResultNode::UpdateURIs(
+    bool aRecursive, bool aOnlyOne, bool aUpdateSort, const nsCString& aSpec,
+    nsresult (*aCallback)(nsNavHistoryResultNode*, const void*,
+                          const nsNavHistoryResult*),
+    const void* aClosure) {
+  const nsNavHistoryResult* result = GetResult();
+  if (!result) {
+    MOZ_ASSERT(false, "Should have a result");
+    return false;
+  }
+
+  nsCOMArray<nsNavHistoryResultNode> matches;
+
+  if (aRecursive) {
+    RecursiveFindURIs(aOnlyOne, this, aSpec, &matches);
+  } else if (aOnlyOne) {
+    uint32_t nodeIndex;
+    nsNavHistoryResultNode* node = FindChildByURI(aSpec, &nodeIndex);
+    if (node) {
+      matches.AppendObject(node);
+    }
+  } else {
+    MOZ_ASSERT(
+        false,
+        "UpdateURIs does not handle nonrecursive updates of multiple items.");
+    return false;
+  }
+
+  if (matches.Count() == 0) return false;
+
+  for (int32_t i = 0; i < matches.Count(); ++i) {
+    nsNavHistoryResultNode* node = matches[i];
+    nsNavHistoryContainerResultNode* parent = node->mParent;
+    if (!parent) {
+      MOZ_ASSERT(false, "All URI nodes being updated must have parents");
+      continue;
+    }
+
+    aCallback(node, aClosure, result);
+
+    if (aUpdateSort) {
+      int32_t childIndex = parent->FindChild(node);
+      MOZ_ASSERT(childIndex >= 0,
+                 "Could not find child we just got a reference to");
+      if (childIndex >= 0) {
+        parent->EnsureItemPosition(childIndex);
+      }
+    }
+  }
+
+  return true;
+}
+
+static nsresult setTitleCallback(nsNavHistoryResultNode* aNode,
+                                 const void* aClosure,
+                                 const nsNavHistoryResult* aResult) {
+  const nsACString* newTitle = static_cast<const nsACString*>(aClosure);
+  aNode->mTitle = *newTitle;
+
+  if (aResult && (!aNode->mParent || aNode->mParent->AreChildrenVisible())) {
+    NOTIFY_RESULT_OBSERVERS(aResult, NodeTitleChanged(aNode, *newTitle));
+  }
+
+  return NS_OK;
+}
+nsresult nsNavHistoryContainerResultNode::ChangeTitles(
+    nsIURI* aURI, const nsACString& aNewTitle, bool aRecursive, bool aOnlyOne) {
+  nsAutoCString uriString;
+  nsresult rv = aURI->GetSpec(uriString);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsNavHistoryResult* result = GetResult();
+  NS_ENSURE_STATE(result);
+
+  uint16_t sortType = GetSortType();
+  bool updateSorting =
+      (sortType == nsINavHistoryQueryOptions::SORT_BY_TITLE_ASCENDING ||
+       sortType == nsINavHistoryQueryOptions::SORT_BY_TITLE_DESCENDING);
+
+  UpdateURIs(aRecursive, aOnlyOne, updateSorting, uriString, setTitleCallback,
+             static_cast<const void*>(&aNewTitle));
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNavHistoryContainerResultNode::GetHasChildren(bool* aHasChildren) {
+  *aHasChildren = (mChildren.Count() > 0);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNavHistoryContainerResultNode::GetChildCount(uint32_t* aChildCount) {
+  if (!mExpanded) return NS_ERROR_NOT_AVAILABLE;
+  *aChildCount = mChildren.Count();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNavHistoryContainerResultNode::GetChild(uint32_t aIndex,
+                                          nsINavHistoryResultNode** _child) {
+  if (!mExpanded) return NS_ERROR_NOT_AVAILABLE;
+  if (aIndex >= mChildren.Length()) return NS_ERROR_INVALID_ARG;
+  nsCOMPtr<nsINavHistoryResultNode> child = mChildren.ElementAt(aIndex);
+  child.forget(_child);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNavHistoryContainerResultNode::GetChildIndex(nsINavHistoryResultNode* aNode,
+                                               uint32_t* _retval) {
+  if (!mExpanded) return NS_ERROR_NOT_AVAILABLE;
+
+  int32_t nodeIndex = FindChild(static_cast<nsNavHistoryResultNode*>(aNode));
+  if (nodeIndex == -1) return NS_ERROR_INVALID_ARG;
+
+  *_retval = nodeIndex;
+  return NS_OK;
+}
+
+NS_IMPL_ISUPPORTS_INHERITED(nsNavHistoryQueryResultNode,
+                            nsNavHistoryContainerResultNode,
+                            nsINavHistoryQueryResultNode)
+
+nsNavHistoryQueryResultNode::nsNavHistoryQueryResultNode(
+    const nsACString& aTitle, PRTime aTime, const nsACString& aQueryURI,
+    const RefPtr<nsNavHistoryQuery>& aQuery,
+    const RefPtr<nsNavHistoryQueryOptions>& aOptions)
+    : nsNavHistoryContainerResultNode(aQueryURI, aTitle, aTime,
+                                      nsNavHistoryResultNode::RESULT_TYPE_QUERY,
+                                      aOptions),
+      mQuery(aQuery),
+      mHasSearchTerms(false),
+      mLiveUpdate(getUpdateRequirements(aQuery, aOptions, &mHasSearchTerms)),
+      mContentsValid(false),
+      mBatchChanges(0),
+      mTransitions(aQuery->Transitions().Clone()) {}
+
+nsNavHistoryQueryResultNode::~nsNavHistoryQueryResultNode() {
+  if (mResult && mResult->mAllBookmarksObservers.Contains(this)) {
+    mResult->RemoveAllBookmarksObserver(this);
+  }
+  if (mResult && mResult->mHistoryObservers.Contains(this)) {
+    mResult->RemoveHistoryObserver(this);
+  }
+  if (mResult && mResult->mMobilePrefObservers.Contains(this)) {
+    mResult->RemoveMobilePrefsObserver(this);
+  }
+}
+
+bool nsNavHistoryQueryResultNode::CanExpand() {
+  if ((mResult && mResult->mRootNode == this) || IsContainersQuery()) {
+    return true;
+  }
+
+  if (mOptions->ExcludeItems()) {
+    return false;
+  }
+  if (mOptions->ExpandQueries()) {
+    return true;
+  }
+
+  return false;
+}
+
+bool nsNavHistoryQueryResultNode::IsContainersQuery() {
+  uint16_t resultType = Options()->ResultType();
+  return resultType == nsINavHistoryQueryOptions::RESULTS_AS_DATE_QUERY ||
+         resultType == nsINavHistoryQueryOptions::RESULTS_AS_DATE_SITE_QUERY ||
+         resultType == nsINavHistoryQueryOptions::RESULTS_AS_TAGS_ROOT ||
+         resultType == nsINavHistoryQueryOptions::RESULTS_AS_SITE_QUERY ||
+         resultType == nsINavHistoryQueryOptions::RESULTS_AS_ROOTS_QUERY ||
+         resultType == nsINavHistoryQueryOptions::RESULTS_AS_LEFT_PANE_QUERY;
+}
+
+void nsNavHistoryQueryResultNode::OnRemoving() {
+  nsNavHistoryResultNode::OnRemoving();
+  ClearChildren(true);
+  mResult = nullptr;
+}
+
+nsresult nsNavHistoryQueryResultNode::OpenContainer() {
+  NS_ASSERTION(!mExpanded, "Container must be closed to open it");
+  mExpanded = true;
+
+  nsresult rv;
+
+  if (!CanExpand()) return NS_OK;
+  if (!mContentsValid) {
+    rv = FillChildren();
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  rv = NotifyOnStateChange(STATE_CLOSED);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNavHistoryQueryResultNode::GetHasChildren(bool* aHasChildren) {
+  *aHasChildren = false;
+
+  if (!CanExpand()) {
+    return NS_OK;
+  }
+
+  uint16_t resultType = mOptions->ResultType();
+
+  if (mQuery->Tags().Length() == 1 && mParent &&
+      mParent->mOptions->ResultType() ==
+          nsINavHistoryQueryOptions::RESULTS_AS_TAGS_ROOT) {
+    *aHasChildren = true;
+    return NS_OK;
+  }
+
+  if (resultType == nsINavHistoryQueryOptions::RESULTS_AS_ROOTS_QUERY ||
+      resultType == nsINavHistoryQueryOptions::RESULTS_AS_LEFT_PANE_QUERY) {
+    *aHasChildren = true;
+    return NS_OK;
+  }
+
+  if (resultType == nsINavHistoryQueryOptions::RESULTS_AS_DATE_QUERY ||
+      resultType == nsINavHistoryQueryOptions::RESULTS_AS_DATE_SITE_QUERY ||
+      resultType == nsINavHistoryQueryOptions::RESULTS_AS_SITE_QUERY) {
+    nsNavHistory* history = nsNavHistory::GetHistoryService();
+    NS_ENSURE_TRUE(history, NS_ERROR_OUT_OF_MEMORY);
+    *aHasChildren = history->hasHistoryEntries();
+    return NS_OK;
+  }
+
+
+  if (mContentsValid) {
+    *aHasChildren = (mChildren.Count() > 0);
+    return NS_OK;
+  }
+
+  *aHasChildren = true;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNavHistoryQueryResultNode::GetUri(nsACString& aURI) {
+  aURI = mURI;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNavHistoryQueryResultNode::GetFolderItemId(int64_t* aItemId) {
+  *aItemId = -1;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNavHistoryQueryResultNode::GetTargetFolderGuid(nsACString& aGuid) {
+  aGuid.Truncate();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNavHistoryQueryResultNode::GetQuery(nsINavHistoryQuery** _query) {
+  RefPtr<nsNavHistoryQuery> query = mQuery;
+  query.forget(_query);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNavHistoryQueryResultNode::GetQueryOptions(
+    nsINavHistoryQueryOptions** _options) {
+  MOZ_ASSERT(mOptions, "Options should be valid");
+  RefPtr<nsNavHistoryQueryOptions> options = mOptions;
+  options.forget(_options);
+  return NS_OK;
+}
+
+nsNavHistoryQueryOptions* nsNavHistoryQueryResultNode::Options() {
+  MOZ_ASSERT(mOptions, "Options invalid, cannot generate from URI");
+  return mOptions;
+}
+
+nsresult nsNavHistoryQueryResultNode::FillChildren() {
+  MOZ_ASSERT(!mContentsValid,
+             "Don't call FillChildren when contents are valid");
+  MOZ_ASSERT(mChildren.Count() == 0,
+             "We are trying to fill children when there already are some");
+  NS_ENSURE_STATE(mQuery && mOptions);
+
+  nsNavHistory* history = nsNavHistory::GetHistoryService();
+  NS_ENSURE_TRUE(history, NS_ERROR_OUT_OF_MEMORY);
+  nsresult rv = history->GetQueryResults(this, mQuery, mOptions, &mChildren);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  FillStats();
+
+  uint16_t sortType = GetSortType();
+
+  if (mResult && mResult->mNeedsToApplySortingMode) {
+    mResult->SetSortingMode(mResult->mSortingMode);
+  } else if (mOptions->QueryType() !=
+                 nsINavHistoryQueryOptions::QUERY_TYPE_HISTORY ||
+             sortType != nsINavHistoryQueryOptions::SORT_BY_NONE) {
+    SortComparator comparator = GetSortingComparator(GetSortType());
+    if (comparator) {
+      if (IsContainersQuery() && sortType == mOptions->SortingMode() &&
+          (sortType == nsINavHistoryQueryOptions::SORT_BY_TITLE_ASCENDING ||
+           sortType == nsINavHistoryQueryOptions::SORT_BY_TITLE_DESCENDING)) {
+        nsNavHistoryContainerResultNode::RecursiveSort(comparator);
+      } else {
+        RecursiveSort(comparator);
+      }
+    }
+  }
+
+  if (!mParent && mOptions->MaxResults()) {
+    while (mChildren.Length() > mOptions->MaxResults()) {
+      mChildren.RemoveObjectAt(mChildren.Count() - 1);
+    }
+  }
+
+  if (mLiveUpdate == QUERYUPDATE_NONE) {
+    mContentsValid = true;
+    return NS_OK;
+  }
+
+  nsNavHistoryResult* result = GetResult();
+  NS_ENSURE_STATE(result);
+
+
+  if (mOptions->QueryType() == nsINavHistoryQueryOptions::QUERY_TYPE_HISTORY) {
+    if (!mParent || mParent->mOptions->ResultType() !=
+                        nsINavHistoryQueryOptions::RESULTS_AS_DATE_SITE_QUERY) {
+      result->AddHistoryObserver(this);
+    }
+  }
+
+  if (mOptions->QueryType() ==
+          nsINavHistoryQueryOptions::QUERY_TYPE_BOOKMARKS ||
+      mLiveUpdate == QUERYUPDATE_COMPLEX_WITH_BOOKMARKS || mHasSearchTerms) {
+    result->AddAllBookmarksObserver(this);
+  }
+
+  if (mLiveUpdate == QUERYUPDATE_MOBILEPREF) {
+    result->AddMobilePrefsObserver(this);
+  }
+
+  mContentsValid = true;
+  return NS_OK;
+}
+
+void nsNavHistoryQueryResultNode::ClearChildren(bool aUnregister) {
+  for (int32_t i = 0; i < mChildren.Count(); ++i) mChildren[i]->OnRemoving();
+  mChildren.Clear();
+
+  if (aUnregister && mContentsValid) {
+    nsNavHistoryResult* result = GetResult();
+    if (result) {
+      result->RemoveHistoryObserver(this);
+      result->RemoveAllBookmarksObserver(this);
+      result->RemoveMobilePrefsObserver(this);
+    }
+  }
+  mContentsValid = false;
+}
+
+nsresult nsNavHistoryQueryResultNode::Refresh() {
+  nsNavHistoryResult* result = GetResult();
+  NS_ENSURE_STATE(result);
+  if (result->IsBatching()) {
+    result->requestRefresh(this);
+    return NS_OK;
+  }
+
+  if (mIndentLevel > -1 && !mParent) return NS_OK;
+
+  if (!mExpanded) {
+    ClearChildren(true);
+    return NS_OK;
+  }
+
+  if (mParent && mParent->IsQuery()) {
+    nsNavHistoryQueryResultNode* parent = mParent->GetAsQuery();
+    if (parent->IsContainersQuery() &&
+        parent->mLiveUpdate != QUERYUPDATE_NONE) {
+      ClearChildren(true);
+      return NS_OK;  
+    }
+  }
+
+  if (mLiveUpdate == QUERYUPDATE_COMPLEX_WITH_BOOKMARKS) {
+    ClearChildren(true);
+  } else {
+    ClearChildren(false);
+  }
+
+  (void)FillChildren();
+
+  NOTIFY_RESULT_OBSERVERS(result, InvalidateContainer(TO_CONTAINER(this)));
+  return NS_OK;
+}
+
+uint16_t nsNavHistoryQueryResultNode::GetSortType() {
+  if (mParent) return mOptions->SortingMode();
+  if (mResult) return mResult->mSortingMode;
+
+  return nsINavHistoryQueryOptions::SORT_BY_NONE;
+}
+
+void nsNavHistoryQueryResultNode::RecursiveSort(SortComparator aComparator) {
+  if (!IsContainersQuery()) {
+    mChildren.Sort(aComparator);
+  }
+
+  for (int32_t i = 0; i < mChildren.Count(); ++i) {
+    if (mChildren[i]->IsContainer()) {
+      mChildren[i]->GetAsContainer()->RecursiveSort(aComparator);
+    }
+  }
+}
+
+nsresult nsNavHistoryQueryResultNode::OnBeginUpdateBatch() { return NS_OK; }
+
+nsresult nsNavHistoryQueryResultNode::OnEndUpdateBatch() {
+  if (mChildren.Count() == 0) {
+    nsresult rv = Refresh();
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  mBatchChanges = 0;
+  return NS_OK;
+}
+
+static nsresult setHistoryDetailsCallback(nsNavHistoryResultNode* aNode,
+                                          const void* aClosure,
+                                          const nsNavHistoryResult* aResult) {
+  const nsNavHistoryResultNode* updatedNode =
+      static_cast<const nsNavHistoryResultNode*>(aClosure);
+
+  aNode->mAccessCount = updatedNode->mAccessCount;
+  if (aNode->mTime < updatedNode->mTime) {
+    aNode->mTime = updatedNode->mTime;
+  }
+  aNode->mFrecency = updatedNode->mFrecency;
+  aNode->mHidden = updatedNode->mHidden;
+
+  return NS_OK;
+}
+
+nsresult nsNavHistoryQueryResultNode::OnVisit(
+    nsIURI* aURI, int64_t aVisitId, PRTime aTime, uint32_t aTransitionType,
+    const nsACString& aGUID, bool aHidden, uint32_t aVisitCount,
+    const nsAString& aLastKnownTitle, int64_t aFrecency, uint32_t* aAdded) {
+  if (!isQueryMatchingVisitDetails(mQuery, mOptions, aHidden, aTime,
+                                   aTransitionType, aURI)) {
+    return NS_OK;
+  }
+  nsNavHistoryResult* result = GetResult();
+  NS_ENSURE_STATE(result);
+  if (result->IsBatching() &&
+      ++mBatchChanges > MAX_BATCH_CHANGES_BEFORE_REFRESH) {
+    nsresult rv = Refresh();
+    NS_ENSURE_SUCCESS(rv, rv);
+    return NS_OK;
+  }
+
+  nsNavHistory* history = nsNavHistory::GetHistoryService();
+  NS_ENSURE_TRUE(history, NS_ERROR_OUT_OF_MEMORY);
+
+  switch (mLiveUpdate) {
+    case QUERYUPDATE_MOBILEPREF: {
+      return NS_OK;
+    }
+
+    case QUERYUPDATE_HOST: {
+      if (mQuery->Domain().IsVoid()) return NS_OK;
+
+      nsAutoCString host;
+      if (NS_FAILED(aURI->GetAsciiHost(host))) return NS_OK;
+
+      if (!mQuery->Domain().Equals(host)) return NS_OK;
+
+      [[fallthrough]];
+    }
+
+    case QUERYUPDATE_TIME: {
+      bool hasIt;
+      mQuery->GetHasBeginTime(&hasIt);
+      if (hasIt) {
+        PRTime beginTime = nsNavHistory::NormalizeTime(
+            mQuery->BeginTimeReference(), mQuery->BeginTime());
+        if (aTime < beginTime) return NS_OK;  
+      }
+      mQuery->GetHasEndTime(&hasIt);
+      if (hasIt) {
+        PRTime endTime = nsNavHistory::NormalizeTime(mQuery->EndTimeReference(),
+                                                     mQuery->EndTime());
+        if (aTime > endTime) return NS_OK;  
+      }
+      // Now we know that our visit satisfies the time range, fall through to
+      [[fallthrough]];
+    }
+
+    case QUERYUPDATE_SIMPLE: {
+      if (mOptions->ResultType() !=
+              nsNavHistoryQueryOptions::RESULTS_AS_VISIT &&
+          mOptions->ResultType() != nsNavHistoryQueryOptions::RESULTS_AS_URI) {
+        return NS_OK;
+      }
+
+      nsAutoCString spec;
+      nsresult rv = aURI->GetSpec(spec);
+      NS_ENSURE_SUCCESS(rv, rv);
+      RefPtr<nsNavHistoryResultNode> addition = new nsNavHistoryResultNode(
+          spec, NS_ConvertUTF16toUTF8(aLastKnownTitle), aVisitCount, aTime);
+      addition->mPageGuid.Assign(aGUID);
+      addition->mFrecency = aFrecency;
+      addition->mHidden = aHidden;
+      addition->mTransitionType = aTransitionType;
+
+      if (mOptions->ResultType() ==
+          nsNavHistoryQueryOptions::RESULTS_AS_VISIT) {
+        addition->mVisitId = aVisitId;
+      }
+
+      if (mOptions->MaxResults() &&
+          mChildren.Length() >= mOptions->MaxResults()) {
+        uint16_t sortType = GetSortType();
+        if (sortType == nsINavHistoryQueryOptions::SORT_BY_DATE_ASCENDING &&
+            aTime > std::max(mChildren[0]->mTime,
+                             mChildren[mChildren.Count() - 1]->mTime)) {
+          return NS_OK;
+        }
+        if (sortType == nsINavHistoryQueryOptions::SORT_BY_DATE_DESCENDING &&
+            aTime < std::min(mChildren[0]->mTime,
+                             mChildren[mChildren.Count() - 1]->mTime)) {
+          return NS_OK;
+        }
+      }
+
+      if (mOptions->ResultType() ==
+          nsNavHistoryQueryOptions::RESULTS_AS_VISIT) {
+        if (mHasSearchTerms && !isQuerySearchTermsMatching(mQuery, addition)) {
+          return NS_OK;
+        }
+        rv = InsertSortedChild(addition);
+        NS_ENSURE_SUCCESS(rv, rv);
+      } else {
+        uint16_t sortType = GetSortType();
+        bool updateSorting =
+            sortType ==
+                nsINavHistoryQueryOptions::SORT_BY_VISITCOUNT_ASCENDING ||
+            sortType ==
+                nsINavHistoryQueryOptions::SORT_BY_VISITCOUNT_DESCENDING ||
+            sortType == nsINavHistoryQueryOptions::SORT_BY_DATE_ASCENDING ||
+            sortType == nsINavHistoryQueryOptions::SORT_BY_DATE_DESCENDING ||
+            sortType == nsINavHistoryQueryOptions::SORT_BY_FRECENCY_ASCENDING ||
+            sortType == nsINavHistoryQueryOptions::SORT_BY_FRECENCY_DESCENDING;
+        if (!UpdateURIs(
+                false, true, updateSorting, addition->mURI,
+                setHistoryDetailsCallback,
+                const_cast<void*>(static_cast<void*>(addition.get())))) {
+          if (mHasSearchTerms &&
+              !isQuerySearchTermsMatching(mQuery, addition)) {
+            return NS_OK;
+          }
+          rv = InsertSortedChild(addition);
+          NS_ENSURE_SUCCESS(rv, rv);
+        }
+      }
+
+      if (mOptions->MaxResults() &&
+          mChildren.Length() > mOptions->MaxResults()) {
+        mChildren.RemoveObjectAt(mChildren.Count() - 1);
+      }
+
+      if (aAdded) {
+        ++(*aAdded);
+      }
+
+      break;
+    }
+
+    case QUERYUPDATE_COMPLEX:
+    case QUERYUPDATE_COMPLEX_WITH_BOOKMARKS:
+      return Refresh();
+
+    default:
+      MOZ_ASSERT(false, "Invalid value for mLiveUpdate");
+      return Refresh();
+  }
+
+  return NS_OK;
+}
+
+nsresult nsNavHistoryQueryResultNode::OnTitleChanged(
+    nsIURI* aURI, const nsAString& aPageTitle, const nsACString& aGUID) {
+  if (!mExpanded) {
+    ClearChildren(true);
+    return NS_OK;  
+  }
+
+  nsNavHistoryResult* result = GetResult();
+  NS_ENSURE_STATE(result);
+  if (result->IsBatching() &&
+      ++mBatchChanges > MAX_BATCH_CHANGES_BEFORE_REFRESH) {
+    nsresult rv = Refresh();
+    NS_ENSURE_SUCCESS(rv, rv);
+    return NS_OK;
+  }
+
+  NS_ConvertUTF16toUTF8 newTitle(aPageTitle);
+
+  bool onlyOneEntry =
+      mOptions->ResultType() == nsINavHistoryQueryOptions::RESULTS_AS_URI;
+
+  if (mHasSearchTerms) {
+    nsCOMArray<nsNavHistoryResultNode> matches;
+    nsAutoCString spec;
+    nsresult rv = aURI->GetSpec(spec);
+    NS_ENSURE_SUCCESS(rv, rv);
+    RecursiveFindURIs(onlyOneEntry, this, spec, &matches);
+
+    if (matches.Count() == 0) {
+      return isQuerySearchTermsMatching(mQuery, mURI, newTitle, mTags)
+                 ? Refresh()
+                 : NS_OK;
+    }
+    for (int32_t i = 0; i < matches.Count(); ++i) {
+      nsNavHistoryResultNode* node = matches[i];
+      node->mTitle = newTitle;
+
+      nsNavHistory* history = nsNavHistory::GetHistoryService();
+      NS_ENSURE_TRUE(history, NS_ERROR_OUT_OF_MEMORY);
+      if (!isQuerySearchTermsMatching(mQuery, node)) {
+        nsNavHistoryContainerResultNode* parent = node->mParent;
+        NS_ENSURE_TRUE(parent, NS_ERROR_UNEXPECTED);
+        int32_t childIndex = parent->FindChild(node);
+        NS_ASSERTION(childIndex >= 0, "Child not found in parent");
+        parent->RemoveChildAt(childIndex);
+      }
+    }
+  }
+
+  return ChangeTitles(aURI, newTitle, true, onlyOneEntry);
+}
+
+nsresult nsNavHistoryQueryResultNode::OnPageRemovedFromStore(
+    nsIURI* aURI, const nsACString& aGUID, uint16_t aReason) {
+  nsNavHistoryResult* result = GetResult();
+  NS_ENSURE_STATE(result);
+  if (result->IsBatching() &&
+      ++mBatchChanges > MAX_BATCH_CHANGES_BEFORE_REFRESH) {
+    nsresult rv = Refresh();
+    NS_ENSURE_SUCCESS(rv, rv);
+    return NS_OK;
+  }
+
+  if (IsContainersQuery()) {
+    nsresult rv = Refresh();
+    NS_ENSURE_SUCCESS(rv, rv);
+    return NS_OK;
+  }
+
+  bool onlyOneEntry =
+      mOptions->ResultType() == nsINavHistoryQueryOptions::RESULTS_AS_URI;
+
+  nsAutoCString spec;
+  nsresult rv = aURI->GetSpec(spec);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMArray<nsNavHistoryResultNode> matches;
+  RecursiveFindURIs(onlyOneEntry, this, spec, &matches);
+  for (int32_t i = 0; i < matches.Count(); ++i) {
+    nsNavHistoryResultNode* node = matches[i];
+    nsNavHistoryContainerResultNode* parent = node->mParent;
+    NS_ENSURE_TRUE(parent, NS_ERROR_UNEXPECTED);
+
+    int32_t childIndex = parent->FindChild(node);
+    NS_ASSERTION(childIndex >= 0, "Child not found in parent");
+    parent->RemoveChildAt(childIndex);
+    if (parent->mChildren.Count() == 0 && parent->IsQuery() &&
+        parent->mIndentLevel > -1) {
+      matches.AppendObject(parent);
+    }
+  }
+  return NS_OK;
+}
+
+nsresult nsNavHistoryQueryResultNode::OnClearHistory() {
+  nsresult rv = Refresh();
+  NS_ENSURE_SUCCESS(rv, rv);
+  return NS_OK;
+}
+
+static nsresult setFaviconCallback(nsNavHistoryResultNode* aNode,
+                                   const void* aClosure,
+                                   const nsNavHistoryResult* aResult) {
+  if (aResult && (!aNode->mParent || aNode->mParent->AreChildrenVisible())) {
+    NOTIFY_RESULT_OBSERVERS(aResult, NodeIconChanged(aNode));
+  }
+
+  return NS_OK;
+}
+
+nsresult nsNavHistoryQueryResultNode::OnPageRemovedVisits(
+    nsIURI* aURI, bool aPartialRemoval, const nsACString& aGUID,
+    uint16_t aReason, uint32_t aTransitionType) {
+  MOZ_ASSERT(
+      mOptions->QueryType() == nsINavHistoryQueryOptions::QUERY_TYPE_HISTORY,
+      "Bookmarks queries should not get a OnDeleteVisits notification");
+
+  if (!aPartialRemoval) {
+    nsresult rv = OnPageRemovedFromStore(aURI, aGUID, aReason);
+    NS_ENSURE_SUCCESS(rv, rv);
+  } else if (aReason == PlacesVisitRemoved_Binding::REASON_DELETED &&
+             isTimeFilteredQuery(mQuery)) {
+    return Refresh();
+  }
+  if (aTransitionType > 0) {
+    if (mTransitions.Length() > 0 && mTransitions.Contains(aTransitionType)) {
+      nsresult rv = OnPageRemovedFromStore(aURI, aGUID, aReason);
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
+  }
+
+  return NS_OK;
+}
+
+nsresult nsNavHistoryQueryResultNode::OnItemAdded(
+    int64_t aItemId, int64_t aParentId, int32_t aIndex, uint16_t aItemType,
+    nsIURI* aURI, PRTime aDateAdded, const nsACString& aGUID,
+    const nsACString& aParentGUID, uint16_t aSource) {
+  if (aItemType == nsINavBookmarksService::TYPE_BOOKMARK &&
+      mLiveUpdate != QUERYUPDATE_SIMPLE && mLiveUpdate != QUERYUPDATE_TIME &&
+      mLiveUpdate != QUERYUPDATE_MOBILEPREF) {
+    nsresult rv = Refresh();
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+  return NS_OK;
+}
+
+nsresult nsNavHistoryQueryResultNode::OnItemRemoved(
+    int64_t aItemId, int64_t aParentFolder, int32_t aIndex, uint16_t aItemType,
+    nsIURI* aURI, const nsACString& aGUID, const nsACString& aParentGUID,
+    uint16_t aSource) {
+  if ((aItemType == nsINavBookmarksService::TYPE_BOOKMARK ||
+       (aItemType == nsINavBookmarksService::TYPE_FOLDER &&
+        mOptions->ResultType() ==
+            nsINavHistoryQueryOptions::RESULTS_AS_TAGS_ROOT &&
+        aParentGUID.EqualsLiteral(TAGS_ROOT_GUID))) &&
+      mLiveUpdate != QUERYUPDATE_SIMPLE && mLiveUpdate != QUERYUPDATE_TIME &&
+      mLiveUpdate != QUERYUPDATE_MOBILEPREF) {
+    nsresult rv = Refresh();
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+  return NS_OK;
+}
+
+nsresult nsNavHistoryQueryResultNode::OnItemMoved(
+    int64_t aFolder, int32_t aOldIndex, int32_t aNewIndex, uint16_t aItemType,
+    const nsACString& aGUID, const nsACString& aOldParentGUID,
+    const nsACString& aNewParentGUID, uint16_t aSource,
+    const nsACString& aURI) {
+  if (mLiveUpdate == QUERYUPDATE_COMPLEX_WITH_BOOKMARKS &&
+      aItemType != nsINavBookmarksService::TYPE_SEPARATOR &&
+      !aNewParentGUID.Equals(aOldParentGUID)) {
+    return Refresh();
+  }
+  return NS_OK;
+}
+
+nsresult nsNavHistoryQueryResultNode::OnItemTagsChanged(
+    int64_t aItemId, const nsAString& aURL, const nsAString& aTags) {
+  nsresult rv = nsNavHistoryResultNode::OnItemTagsChanged(aItemId, aURL, aTags);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsNavHistoryResult* result = GetResult();
+  NS_ENSURE_STATE(result);
+
+  nsCOMPtr<nsIURI> uri;
+  rv = NS_NewURI(getter_AddRefs(uri), aURL);
+  NS_ENSURE_SUCCESS(rv, rv);
+  nsAutoCString spec;
+  rv = uri->GetSpec(spec);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  bool onlyOneEntry =
+      mOptions->ResultType() == nsINavHistoryQueryOptions::RESULTS_AS_URI;
+
+  nsCOMArray<nsNavHistoryResultNode> matches;
+  RecursiveFindURIs(onlyOneEntry, this, spec, &matches);
+
+  if (matches.Count() == 0 && mHasSearchTerms) {
+    return isQuerySearchTermsMatching(mQuery, this) ? Refresh() : NS_OK;
+  }
+
+  for (int32_t i = 0; i < matches.Count(); ++i) {
+    nsNavHistoryResultNode* node = matches[i];
+    node->SetTags(aTags);
+    if (mHasSearchTerms && !isQuerySearchTermsMatching(mQuery, node)) {
+      nsNavHistoryContainerResultNode* parent = node->mParent;
+      NS_ENSURE_TRUE(parent, NS_ERROR_UNEXPECTED);
+      int32_t childIndex = parent->FindChild(node);
+      NS_ASSERTION(childIndex >= 0, "Child not found in parent");
+      parent->RemoveChildAt(childIndex);
+    } else {
+      NOTIFY_RESULT_OBSERVERS(result, NodeTagsChanged(node));
+    }
+  }
+
+  return NS_OK;
+}
+
+nsresult nsNavHistoryQueryResultNode::OnItemTimeChanged(int64_t aItemId,
+                                                        const nsACString& aGUID,
+                                                        PRTime aDateAdded,
+                                                        PRTime aLastModified) {
+  nsresult rv = nsNavHistoryResultNode::OnItemTimeChanged(
+      aItemId, aGUID, aDateAdded, aLastModified);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (mLiveUpdate == QUERYUPDATE_COMPLEX_WITH_BOOKMARKS) {
+    return Refresh();
+  }
+
+  return NS_OK;
+}
+
+nsresult nsNavHistoryQueryResultNode::OnItemTitleChanged(
+    int64_t aItemId, const nsACString& aGUID, const nsACString& aTitle,
+    PRTime aLastModified) {
+  nsresult rv = nsNavHistoryResultNode::OnItemTitleChanged(
+      aItemId, aGUID, aTitle, aLastModified);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (mLiveUpdate == QUERYUPDATE_COMPLEX_WITH_BOOKMARKS) {
+    return Refresh();
+  }
+
+  return NS_OK;
+}
+
+nsresult nsNavHistoryQueryResultNode::OnItemUrlChanged(int64_t aItemId,
+                                                       const nsACString& aGUID,
+                                                       const nsACString& aURL,
+                                                       PRTime aLastModified) {
+  if (aItemId == mItemId) {
+    nsresult rv = nsNavHistoryResultNode::OnItemUrlChanged(aItemId, aGUID, aURL,
+                                                           aLastModified);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    nsNavHistory* history = nsNavHistory::GetHistoryService();
+    NS_ENSURE_TRUE(history, NS_ERROR_OUT_OF_MEMORY);
+    nsCOMPtr<nsINavHistoryQuery> query;
+    nsCOMPtr<nsINavHistoryQueryOptions> options;
+    rv = history->QueryStringToQuery(mURI, getter_AddRefs(query),
+                                     getter_AddRefs(options));
+    NS_ENSURE_SUCCESS(rv, rv);
+    mQuery = do_QueryObject(query);
+    NS_ENSURE_STATE(mQuery);
+    mOptions = do_QueryObject(options);
+    NS_ENSURE_STATE(mOptions);
+    rv = mOptions->Clone(getter_AddRefs(mOriginalOptions));
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    return Refresh();
+  }
+
+  if (mLiveUpdate == QUERYUPDATE_COMPLEX_WITH_BOOKMARKS) {
+    return Refresh();
+  }
+
+  int32_t index;
+  nsNavHistoryResultNode* node = FindChildById(aItemId, &index);
+  if (node) {
+    return node->OnItemUrlChanged(aItemId, aGUID, aURL, aLastModified);
+  }
+
+  return NS_OK;
+}
+
+NS_IMPL_ISUPPORTS_INHERITED(nsNavHistoryFolderResultNode,
+                            nsNavHistoryContainerResultNode,
+                            nsINavHistoryQueryResultNode,
+                            mozIStorageStatementCallback)
+
+nsNavHistoryFolderResultNode::nsNavHistoryFolderResultNode(
+    int64_t aItemId, const nsACString& aBookmarkGuid,
+    int64_t aTargetFolderItemId, const nsACString& aTargetFolderGuid,
+    const nsACString& aTitle, nsNavHistoryQueryOptions* aOptions)
+    : nsNavHistoryContainerResultNode(
+          ""_ns, aTitle, 0, nsNavHistoryResultNode::RESULT_TYPE_FOLDER,
+          aOptions),
+      mContentsValid(false),
+      mTargetFolderItemId(aTargetFolderItemId),
+      mTargetFolderGuid(aTargetFolderGuid),
+      mIsRegisteredFolderObserver(false),
+      mAsyncBookmarkIndex(-1) {
+  mItemId = aItemId;
+  mBookmarkGuid = aBookmarkGuid;
+}
+
+nsNavHistoryFolderResultNode::~nsNavHistoryFolderResultNode() {
+  if (mIsRegisteredFolderObserver && mResult) {
+    mResult->RemoveBookmarkFolderObserver(this, mTargetFolderGuid);
+  }
+}
+
+void nsNavHistoryFolderResultNode::OnRemoving() {
+  nsNavHistoryResultNode::OnRemoving();
+  ClearChildren(true);
+  mResult = nullptr;
+}
+
+nsresult nsNavHistoryFolderResultNode::OpenContainer() {
+  NS_ASSERTION(!mExpanded, "Container must be expanded to close it");
+  nsresult rv;
+
+  if (!mContentsValid) {
+    rv = FillChildren();
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+  mExpanded = true;
+
+  rv = NotifyOnStateChange(STATE_CLOSED);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+nsresult nsNavHistoryFolderResultNode::OpenContainerAsync() {
+  NS_ASSERTION(!mExpanded, "Container already expanded when opening it");
+
+  if (mContentsValid) return OpenContainer();
+
+  nsresult rv = FillChildrenAsync();
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = NotifyOnStateChange(STATE_CLOSED);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNavHistoryFolderResultNode::GetHasChildren(bool* aHasChildren) {
+  if (!mContentsValid) {
+    nsresult rv = FillChildren();
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+  *aHasChildren = (mChildren.Count() > 0);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNavHistoryFolderResultNode::GetFolderItemId(int64_t* aItemId) {
+  *aItemId = mTargetFolderItemId;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNavHistoryFolderResultNode::GetTargetFolderGuid(nsACString& aGuid) {
+  aGuid = mTargetFolderGuid;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNavHistoryFolderResultNode::GetUri(nsACString& aURI) {
+  if (!mURI.IsEmpty()) {
+    aURI = mURI;
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsINavHistoryQuery> query;
+  nsresult rv = GetQuery(getter_AddRefs(query));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsNavHistory* history = nsNavHistory::GetHistoryService();
+  NS_ENSURE_TRUE(history, NS_ERROR_OUT_OF_MEMORY);
+  rv = history->QueryToQueryString(query, mOriginalOptions, mURI);
+  NS_ENSURE_SUCCESS(rv, rv);
+  aURI = mURI;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNavHistoryFolderResultNode::GetQuery(nsINavHistoryQuery** _query) {
+  RefPtr<nsNavHistoryQuery> query = new nsNavHistoryQuery();
+
+  nsTArray<nsCString> parents;
+  parents.AppendElement(mTargetFolderGuid);
+  nsresult rv = query->SetParents(parents);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  query.forget(_query);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNavHistoryFolderResultNode::GetQueryOptions(
+    nsINavHistoryQueryOptions** _options) {
+  MOZ_ASSERT(mOptions, "Options should be valid");
+  RefPtr<nsNavHistoryQueryOptions> options = mOptions;
+  options.forget(_options);
+  return NS_OK;
+}
+
+nsresult nsNavHistoryFolderResultNode::FillChildren() {
+  nsresult rv = FillChildrenInternal();
+  NS_ENSURE_SUCCESS(rv, rv);
+
+
+  return OnChildrenFilled();
+}
+
+nsresult nsNavHistoryFolderResultNode::OnChildrenFilled() {
+  FillStats();
+
+  if (mResult && mResult->mNeedsToApplySortingMode) {
+    mResult->SetSortingMode(mResult->mSortingMode);
+  } else {
+    SortComparator comparator = GetSortingComparator(GetSortType());
+    if (comparator) {
+      RecursiveSort(comparator);
+    }
+  }
+
+  if (!mParent && mOptions->MaxResults()) {
+    while (mChildren.Length() > mOptions->MaxResults()) {
+      mChildren.RemoveObjectAt(mChildren.Count() - 1);
+    }
+  }
+
+  EnsureRegisteredAsFolderObserver();
+
+  mContentsValid = true;
+  return NS_OK;
+}
+
+void nsNavHistoryFolderResultNode::EnsureRegisteredAsFolderObserver() {
+  if (!mIsRegisteredFolderObserver && mResult) {
+    mResult->AddBookmarkFolderObserver(this, mTargetFolderGuid);
+    mIsRegisteredFolderObserver = true;
+  }
+}
+
+nsresult nsNavHistoryFolderResultNode::FillChildrenAsync() {
+  mAsyncBookmarkIndex = -1;
+
+  nsresult rv = FillChildrenInternal(getter_AddRefs(mAsyncPendingStmt));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  EnsureRegisteredAsFolderObserver();
+
+  return NS_OK;
+}
+
+nsresult nsNavHistoryFolderResultNode::FillChildrenInternal(
+    mozIStoragePendingStatement** aPendingStmt) {
+  NS_ASSERTION(!mContentsValid,
+               "Don't call FillChildrenInternal when contents are valid");
+  NS_ASSERTION(mChildren.Count() == 0,
+               "We are trying to fill children when there already are some");
+
+  bool isAsync = !!aPendingStmt;
+  nsCString sql =
+      "SELECT "
+      "  h.id, h.url, b.title, h.rev_host, h.visit_count, h.last_visit_date, "
+      "  null, b.id, b.dateAdded, b.lastModified, b.parent, "_ns +
+      nsCString(
+          isAsync
+              ? " null, "
+              : " (SELECT tags FROM tagged WHERE place_id = h.id) AS tags, ") +
+      "  h.frecency, h.hidden, h.guid, null, null, null, b.guid, b.position, "
+      "  b.type, b.fk, t.guid, t.id, t.title "
+      "FROM moz_bookmarks b "
+      "LEFT JOIN moz_places h ON b.fk = h.id "
+      "LEFT JOIN moz_bookmarks t ON t.guid = target_folder_guid(h.url) "
+      "WHERE b.parent = :parent "
+      "  AND ("
+      "    NOT :excludeItems OR "
+      "    b.type = :folder OR "
+      "    h.url_hash BETWEEN "
+      "      hash('place', 'prefix_lo') AND hash('place', 'prefix_hi')"
+      "  ) "
+      "ORDER BY b.position ASC"_ns;
+
+  RefPtr<Database> db = Database::GetDatabase();
+  NS_ENSURE_STATE(db);
+  nsCOMPtr<mozIStorageBaseStatement> stmt;
+  if (isAsync) {
+    stmt = db->GetAsyncStatement(sql);
+    NS_ENSURE_STATE(stmt);
+  } else {
+    stmt = db->GetStatement(nsNavHistory::GetTagsSqlFragment(
+                                nsINavHistoryQueryOptions::QUERY_TYPE_BOOKMARKS,
+                                mOptions->ExcludeItems()) +
+                            sql);
+    NS_ENSURE_STATE(stmt);
+  }
+
+  nsresult rv = stmt->BindInt64ByName("parent"_ns, mTargetFolderItemId);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = stmt->BindInt32ByName("folder"_ns, nsINavBookmarksService::TYPE_FOLDER);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = stmt->BindInt32ByName("excludeItems"_ns, mOptions->ExcludeItems());
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (isAsync) {
+    nsCOMPtr<mozIStorageAsyncStatement> async = do_QueryInterface(stmt, &rv);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    nsCOMPtr<mozIStoragePendingStatement> pendingStmt;
+    rv = async->ExecuteAsync(this, getter_AddRefs(pendingStmt));
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    NS_IF_ADDREF(*aPendingStmt = pendingStmt);
+  } else {
+    nsCOMPtr<mozIStorageStatement> sync = do_QueryInterface(stmt, &rv);
+    NS_ENSURE_SUCCESS(rv, rv);
+    mozStorageStatementScoper scoper(sync);
+    nsCOMPtr<mozIStorageValueArray> row = do_QueryInterface(sync, &rv);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    int32_t index = -1;
+    bool hasResult;
+    while (NS_SUCCEEDED(sync->ExecuteStep(&hasResult)) && hasResult) {
+      rv = AppendRowAsChild(row, index);
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
+  }
+
+  return NS_OK;
+}
+
+nsresult nsNavHistoryFolderResultNode::AppendRowAsChild(
+    mozIStorageValueArray* aRow, int32_t& aCurrentIndex) {
+  NS_ENSURE_ARG_POINTER(aRow);
+
+  aCurrentIndex++;
+
+  int32_t itemType;
+  nsresult rv =
+      aRow->GetInt32(nsNavBookmarks::kGetChildrenIndex_Type, &itemType);
+  NS_ENSURE_SUCCESS(rv, rv);
+  int64_t id;
+  rv = aRow->GetInt64(nsNavHistory::kGetInfoIndex_ItemId, &id);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  RefPtr<nsNavHistoryResultNode> node;
+
+  if (itemType == nsINavBookmarksService::TYPE_BOOKMARK) {
+    nsNavHistory* history = nsNavHistory::GetHistoryService();
+    NS_ENSURE_TRUE(history, NS_ERROR_OUT_OF_MEMORY);
+    rv = history->RowToResult(aRow, mOptions, getter_AddRefs(node));
+    NS_ENSURE_SUCCESS(rv, rv);
+    uint32_t nodeType;
+    node->GetType(&nodeType);
+    if (nodeType == nsINavHistoryResultNode::RESULT_TYPE_QUERY &&
+        mOptions->ExcludeQueries()) {
+      return NS_OK;
+    }
+  } else if (itemType == nsINavBookmarksService::TYPE_FOLDER) {
+    nsAutoCString title;
+    bool isNull;
+    rv = aRow->GetIsNull(nsNavHistory::kGetInfoIndex_Title, &isNull);
+    NS_ENSURE_SUCCESS(rv, rv);
+    if (!isNull) {
+      rv = aRow->GetUTF8String(nsNavHistory::kGetInfoIndex_Title, title);
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
+
+    nsAutoCString guid;
+    rv = aRow->GetUTF8String(nsNavBookmarks::kGetChildrenIndex_Guid, guid);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    node = new nsNavHistoryFolderResultNode(id, guid, id, guid, title,
+                                            new nsNavHistoryQueryOptions());
+
+    rv = aRow->GetInt64(nsNavHistory::kGetInfoIndex_ItemDateAdded,
+                        reinterpret_cast<int64_t*>(&node->mDateAdded));
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = aRow->GetInt64(nsNavHistory::kGetInfoIndex_ItemLastModified,
+                        reinterpret_cast<int64_t*>(&node->mLastModified));
+    NS_ENSURE_SUCCESS(rv, rv);
+  } else {
+    node = new nsNavHistorySeparatorResultNode();
+
+    node->mItemId = id;
+    rv = aRow->GetUTF8String(nsNavBookmarks::kGetChildrenIndex_Guid,
+                             node->mBookmarkGuid);
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = aRow->GetInt64(nsNavHistory::kGetInfoIndex_ItemDateAdded,
+                        reinterpret_cast<int64_t*>(&node->mDateAdded));
+    NS_ENSURE_SUCCESS(rv, rv);
+    rv = aRow->GetInt64(nsNavHistory::kGetInfoIndex_ItemLastModified,
+                        reinterpret_cast<int64_t*>(&node->mLastModified));
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  node->mBookmarkIndex = aCurrentIndex;
+
+  NS_ENSURE_TRUE(mChildren.AppendObject(node), NS_ERROR_OUT_OF_MEMORY);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNavHistoryFolderResultNode::HandleResult(mozIStorageResultSet* aResultSet) {
+  NS_ENSURE_ARG_POINTER(aResultSet);
+
+  nsCOMPtr<mozIStorageRow> row;
+  while (NS_SUCCEEDED(aResultSet->GetNextRow(getter_AddRefs(row))) && row) {
+    nsresult rv = AppendRowAsChild(row, mAsyncBookmarkIndex);
+    if (NS_FAILED(rv)) {
+      CancelAsyncOpen(false);
+      return rv;
+    }
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNavHistoryFolderResultNode::HandleCompletion(uint16_t aReason) {
+  if (aReason == mozIStorageStatementCallback::REASON_FINISHED &&
+      mAsyncCanceledState == NOT_CANCELED) {
+
+    nsresult rv = OnChildrenFilled();
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    mExpanded = true;
+    mAsyncPendingStmt = nullptr;
+
+    rv = NotifyOnStateChange(STATE_LOADING);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  else if (mAsyncCanceledState == CANCELED_RESTART_NEEDED) {
+    mAsyncCanceledState = NOT_CANCELED;
+    ClearChildren(false);
+    FillChildrenAsync();
+  }
+
+  else {
+    mAsyncCanceledState = NOT_CANCELED;
+    ClearChildren(true);
+    CloseContainer();
+  }
+
+  return NS_OK;
+}
+
+void nsNavHistoryFolderResultNode::ClearChildren(bool unregister) {
+  for (int32_t i = 0; i < mChildren.Count(); ++i) mChildren[i]->OnRemoving();
+  mChildren.Clear();
+
+  bool needsUnregister = unregister && (mContentsValid || mAsyncPendingStmt);
+  if (needsUnregister && mResult && mIsRegisteredFolderObserver) {
+    mResult->RemoveBookmarkFolderObserver(this, mTargetFolderGuid);
+    mIsRegisteredFolderObserver = false;
+  }
+  mContentsValid = false;
+}
+
+nsresult nsNavHistoryFolderResultNode::Refresh() {
+  nsNavHistoryResult* result = GetResult();
+  NS_ENSURE_STATE(result);
+  if (result->IsBatching()) {
+    result->requestRefresh(this);
+    return NS_OK;
+  }
+
+  ClearChildren(true);
+
+  if (!mExpanded) {
+    return NS_OK;
+  }
+
+  (void)FillChildren();
+
+  NOTIFY_RESULT_OBSERVERS(result, InvalidateContainer(TO_CONTAINER(this)));
+  return NS_OK;
+}
+
+bool nsNavHistoryFolderResultNode::StartIncrementalUpdate() {
+
+  if (!mOptions->ExcludeItems() && !mOptions->ExcludeQueries()) {
+    if (mExpanded || AreChildrenVisible()) return true;
+
+    nsNavHistoryResult* result = GetResult();
+    NS_ENSURE_TRUE(result, false);
+
+    if (mParent) return result->mObservers.Length() > 0;
+  }
+
+  (void)Refresh();
+  return false;
+}
+
+void nsNavHistoryFolderResultNode::ReindexRange(int32_t aStartIndex,
+                                                int32_t aEndIndex,
+                                                int32_t aDelta) {
+  for (int32_t i = 0; i < mChildren.Count(); ++i) {
+    nsNavHistoryResultNode* node = mChildren[i];
+    if (node->mBookmarkIndex >= aStartIndex &&
+        node->mBookmarkIndex <= aEndIndex) {
+      node->mBookmarkIndex += aDelta;
+    }
+  }
+}
+
+#define RESTART_AND_RETURN_IF_ASYNC_PENDING() \
+  if (mAsyncPendingStmt) {                    \
+    CancelAsyncOpen(true);                    \
+    return NS_OK;                             \
+  }
+
+nsresult nsNavHistoryFolderResultNode::OnBeginUpdateBatch() { return NS_OK; }
+
+nsresult nsNavHistoryFolderResultNode::OnEndUpdateBatch() { return NS_OK; }
+
+nsresult nsNavHistoryFolderResultNode::OnItemAdded(
+    int64_t aItemId, int64_t aParentFolder, int32_t aIndex, uint16_t aItemType,
+    nsIURI* aURI, PRTime aDateAdded, const nsACString& aGUID,
+    const nsACString& aParentGUID, uint16_t aSource, const nsACString& aTitle,
+    const nsAString& aTags, int64_t aFrecency, bool aHidden,
+    uint32_t aVisitCount, PRTime aLastVisitDate, int64_t aTargetFolderItemId,
+    const nsACString& aTargetFolderGuid, const nsACString& aTargetFolderTitle) {
+  MOZ_ASSERT(aParentFolder == mTargetFolderItemId, "Got wrong bookmark update");
+
+  RESTART_AND_RETURN_IF_ASYNC_PENDING();
+
+  {
+    int32_t index;
+    nsNavHistoryResultNode* node = FindChildById(aItemId, &index);
+    if (node) return NS_OK;
+  }
+
+  bool excludeItems = mOptions->ExcludeItems();
+
+  if (aIndex < 0) {
+    MOZ_ASSERT_UNREACHABLE("Invalid index for item adding: <0");
+    aIndex = 0;
+  } else if (aIndex > mChildren.Count()) {
+    if (!excludeItems) {
+      MOZ_ASSERT_UNREACHABLE(
+          "Invalid index for item adding: greater than "
+          "count");
+    }
+    aIndex = mChildren.Count();
+  }
+
+  nsresult rv;
+
+  bool isQuery = false;
+  nsAutoCString itemURISpec;
+  if (aItemType == nsINavBookmarksService::TYPE_BOOKMARK) {
+    NS_ASSERTION(aURI, "Got a null URI when we are a bookmark?!");
+    rv = aURI->GetSpec(itemURISpec);
+    NS_ENSURE_SUCCESS(rv, rv);
+    isQuery = IsQueryURI(itemURISpec);
+  }
+
+  if (aItemType != nsINavBookmarksService::TYPE_FOLDER && !isQuery &&
+      excludeItems) {
+    ReindexRange(aIndex, INT32_MAX, 1);
+    return NS_OK;
+  }
+
+  if (!StartIncrementalUpdate()) {
+    return NS_OK;  
+  }
+
+  ReindexRange(aIndex, INT32_MAX, 1);
+
+  RefPtr<nsNavHistoryResultNode> node;
+  if (aItemType == nsINavBookmarksService::TYPE_BOOKMARK) {
+    if (isQuery) {
+      nsNavHistory* history = nsNavHistory::GetHistoryService();
+      NS_ENSURE_TRUE(history, NS_ERROR_OUT_OF_MEMORY);
+      rv = history->QueryUriToResult(itemURISpec, aItemId, aGUID, aTitle,
+                                     aTargetFolderItemId, aTargetFolderGuid,
+                                     aTargetFolderTitle, aVisitCount,
+                                     aLastVisitDate, getter_AddRefs(node));
+      NS_ENSURE_SUCCESS(rv, rv);
+    } else {
+      node = new nsNavHistoryResultNode(itemURISpec, aTitle, aVisitCount,
+                                        aLastVisitDate);
+      node->mItemId = aItemId;
+      node->mBookmarkGuid = aGUID;
+    }
+
+    node->SetTags(aTags);
+    node->mDateAdded = aDateAdded;
+    node->mLastModified = aDateAdded;
+    node->mFrecency = aFrecency;
+    node->mHidden = aHidden;
+  } else if (aItemType == nsINavBookmarksService::TYPE_FOLDER) {
+    node = new nsNavHistoryFolderResultNode(
+        aItemId, aGUID, aItemId, aGUID, aTitle, new nsNavHistoryQueryOptions());
+    node->mDateAdded = aDateAdded;
+    node->mLastModified = aDateAdded;
+  } else if (aItemType == nsINavBookmarksService::TYPE_SEPARATOR) {
+    node = new nsNavHistorySeparatorResultNode();
+    node->mItemId = aItemId;
+    node->mBookmarkGuid = aGUID;
+    node->mDateAdded = aDateAdded;
+    node->mLastModified = aDateAdded;
+  }
+
+  node->mBookmarkIndex = aIndex;
+
+  if (aItemType == nsINavBookmarksService::TYPE_SEPARATOR ||
+      GetSortType() == nsINavHistoryQueryOptions::SORT_BY_NONE) {
+    return InsertChildAt(node, aIndex);
+  }
+
+  return InsertSortedChild(node);
+}
+
+nsresult nsNavHistoryQueryResultNode::OnMobilePrefChanged(bool newValue) {
+  RESTART_AND_RETURN_IF_ASYNC_PENDING();
+
+  if (newValue) {
+    return Refresh();
+  }
+
+  int32_t existingIndex;
+  FindChildByGuid(nsLiteralCString(MOBILE_BOOKMARKS_VIRTUAL_GUID),
+                  &existingIndex);
+
+  if (existingIndex == -1) {
+    return NS_OK;
+  }
+
+  return RemoveChildAt(existingIndex);
+}
+
+nsresult nsNavHistoryFolderResultNode::OnItemRemoved(
+    int64_t aItemId, int64_t aParentFolder, int32_t aIndex, uint16_t aItemType,
+    nsIURI* aURI, const nsACString& aGUID, const nsACString& aParentGUID,
+    uint16_t aSource) {
+  MOZ_ASSERT_IF(mItemId != mTargetFolderItemId, aItemId != mTargetFolderItemId);
+  MOZ_ASSERT_IF(mItemId == mTargetFolderItemId, aItemId != mItemId);
+
+  if (mTargetFolderItemId == aItemId || mItemId == aItemId) return NS_OK;
+
+  MOZ_ASSERT(aParentFolder == mTargetFolderItemId, "Got wrong bookmark update");
+
+  RESTART_AND_RETURN_IF_ASYNC_PENDING();
+
+  int32_t index;
+  nsNavHistoryResultNode* node = FindChildById(aItemId, &index);
+  if (!node) {
+    return NS_OK;
+  }
+
+  bool excludeItems = mOptions->ExcludeItems();
+
+  if ((node->IsURI() || node->IsSeparator()) && excludeItems) {
+    ReindexRange(aIndex, INT32_MAX, -1);
+    return NS_OK;
+  }
+
+  if (!StartIncrementalUpdate()) return NS_OK;  
+
+  ReindexRange(aIndex + 1, INT32_MAX, -1);
+
+  return RemoveChildAt(index);
+}
+
+nsresult nsNavHistoryResultNode::OnItemKeywordChanged(
+    int64_t aItemId, const nsACString& aKeyword) {
+  if (aItemId != mItemId) {
+    return NS_OK;
+  }
+
+  bool shouldNotify = !mParent || mParent->AreChildrenVisible();
+  if (shouldNotify) {
+    nsNavHistoryResult* result = GetResult();
+    NS_ENSURE_STATE(result);
+    NOTIFY_RESULT_OBSERVERS(result, NodeKeywordChanged(this, aKeyword));
+  }
+
+  return NS_OK;
+}
+
+nsresult nsNavHistoryResultNode::OnItemTagsChanged(int64_t aItemId,
+                                                   const nsAString& aURL,
+                                                   const nsAString& aTags) {
+  if (aItemId != mItemId) {
+    return NS_OK;
+  }
+
+  SetTags(aTags);
+
+  bool shouldNotify = !mParent || mParent->AreChildrenVisible();
+  if (shouldNotify) {
+    nsNavHistoryResult* result = GetResult();
+    NS_ENSURE_STATE(result);
+    NOTIFY_RESULT_OBSERVERS(result, NodeTagsChanged(this));
+  }
+
+  return NS_OK;
+}
+
+nsresult nsNavHistoryResultNode::OnItemTimeChanged(int64_t aItemId,
+                                                   const nsACString& aGUID,
+                                                   PRTime aDateAdded,
+                                                   PRTime aLastModified) {
+  if (aItemId != mItemId) {
+    return NS_OK;
+  }
+
+  bool isDateAddedChanged = mDateAdded != aDateAdded;
+  bool isLastModifiedChanged = mLastModified != aLastModified;
+
+  if (!isDateAddedChanged && !isLastModifiedChanged) {
+    return NS_OK;
+  }
+
+  mDateAdded = aDateAdded;
+  mLastModified = aLastModified;
+
+  bool shouldNotify = !mParent || mParent->AreChildrenVisible();
+  if (shouldNotify) {
+    nsNavHistoryResult* result = GetResult();
+    NS_ENSURE_STATE(result);
+
+    if (isDateAddedChanged) {
+      NOTIFY_RESULT_OBSERVERS(result, NodeDateAddedChanged(this, aDateAdded));
+    }
+    if (isLastModifiedChanged) {
+      NOTIFY_RESULT_OBSERVERS(result,
+                              NodeLastModifiedChanged(this, aLastModified));
+    }
+  }
+
+  return NS_OK;
+}
+
+nsresult nsNavHistoryResultNode::OnItemTitleChanged(int64_t aItemId,
+                                                    const nsACString& aGUID,
+                                                    const nsACString& aTitle,
+                                                    PRTime aLastModified) {
+  if (aItemId != mItemId) {
+    return NS_OK;
+  }
+
+  mTitle = aTitle;
+  mLastModified = aLastModified;
+
+  bool shouldNotify = !mParent || mParent->AreChildrenVisible();
+  if (shouldNotify) {
+    nsNavHistoryResult* result = GetResult();
+    NS_ENSURE_STATE(result);
+    NOTIFY_RESULT_OBSERVERS(result, NodeTitleChanged(this, mTitle));
+  }
+
+  return NS_OK;
+}
+
+nsresult nsNavHistoryResultNode::OnItemUrlChanged(int64_t aItemId,
+                                                  const nsACString& aGUID,
+                                                  const nsACString& aURL,
+                                                  PRTime aLastModified) {
+  if (aItemId != mItemId) {
+    return NS_OK;
+  }
+
+  mTags.SetIsVoid(true);
+  nsCString oldURI(mURI);
+  mURI = aURL;
+  mLastModified = aLastModified;
+
+  bool shouldNotify = !mParent || mParent->AreChildrenVisible();
+  if (shouldNotify) {
+    nsNavHistoryResult* result = GetResult();
+    NS_ENSURE_STATE(result);
+    NOTIFY_RESULT_OBSERVERS(result, NodeURIChanged(this, oldURI));
+  }
+
+  if (!mParent) return NS_OK;
+
+  int32_t ourIndex = mParent->FindChild(this);
+  NS_ASSERTION(ourIndex >= 0, "Could not find self in parent");
+  if (ourIndex >= 0) {
+    mParent->EnsureItemPosition(ourIndex);
+  }
+
+  return NS_OK;
+}
+
+nsresult nsNavHistoryResultNode::OnVisitsRemoved() {
+  PRTime oldTime = mTime;
+  mTime = 0;
+
+  nsNavHistoryResult* result = GetResult();
+  NS_ENSURE_STATE(result);
+  NOTIFY_RESULT_OBSERVERS(
+      result, NodeHistoryDetailsChanged(this, oldTime, mAccessCount));
+
+  return NS_OK;
+}
+
+nsresult nsNavHistoryFolderResultNode::OnItemVisited(nsIURI* aURI,
+                                                     int64_t aVisitId,
+                                                     PRTime aTime,
+                                                     int64_t aFrecency) {
+  if (mOptions->ExcludeItems()) {
+    return NS_OK;  
+  }
+
+  RESTART_AND_RETURN_IF_ASYNC_PENDING();
+
+  if (!StartIncrementalUpdate()) return NS_OK;
+
+  nsAutoCString spec;
+  nsresult rv = aURI->GetSpec(spec);
+  NS_ENSURE_SUCCESS(rv, rv);
+  nsCOMArray<nsNavHistoryResultNode> nodes;
+  FindChildrenByURI(spec, &nodes);
+  if (!nodes.Count()) {
+    return NS_OK;
+  }
+
+  ++mAccessCount;
+  if (aTime > mTime) {
+    mTime = aTime;
+  }
+
+  for (int32_t i = 0; i < nodes.Count(); ++i) {
+    nsNavHistoryResultNode* node = nodes[i];
+    uint32_t nodeOldAccessCount = node->mAccessCount;
+    PRTime nodeOldTime = node->mTime;
+    if (node->mTime < aTime) {
+      node->mTime = aTime;
+    }
+    ++node->mAccessCount;
+    node->mFrecency = aFrecency;
+
+    nsNavHistoryResult* result = GetResult();
+    if (AreChildrenVisible() && !result->CanSkipHistoryDetailsNotifications()) {
+      NOTIFY_RESULT_OBSERVERS(
+          result,
+          NodeHistoryDetailsChanged(node, nodeOldTime, nodeOldAccessCount));
+    }
+
+    uint32_t sortType = GetSortType();
+    if (sortType == nsINavHistoryQueryOptions::SORT_BY_VISITCOUNT_ASCENDING ||
+        sortType == nsINavHistoryQueryOptions::SORT_BY_VISITCOUNT_DESCENDING ||
+        sortType == nsINavHistoryQueryOptions::SORT_BY_DATE_ASCENDING ||
+        sortType == nsINavHistoryQueryOptions::SORT_BY_DATE_DESCENDING ||
+        sortType == nsINavHistoryQueryOptions::SORT_BY_FRECENCY_ASCENDING ||
+        sortType == nsINavHistoryQueryOptions::SORT_BY_FRECENCY_DESCENDING) {
+      int32_t childIndex = FindChild(node);
+      NS_ASSERTION(childIndex >= 0,
+                   "Could not find child we just got a reference to");
+      if (childIndex >= 0) {
+        EnsureItemPosition(childIndex);
+      }
+    }
+  }
+
+  return NS_OK;
+}
+
+nsresult nsNavHistoryFolderResultNode::OnItemMoved(
+    int64_t aItemId, int32_t aOldIndex, int32_t aNewIndex, uint16_t aItemType,
+    const nsACString& aGUID, const nsACString& aOldParentGUID,
+    const nsACString& aNewParentGUID, uint16_t aSource, const nsACString& aURI,
+    const nsACString& aTitle, const nsAString& aTags, int64_t aFrecency,
+    bool aHidden, uint32_t aVisitCount, PRTime aLastVisitDate,
+    PRTime aDateAdded) {
+  MOZ_ASSERT(aOldParentGUID.Equals(mTargetFolderGuid) ||
+                 aNewParentGUID.Equals(mTargetFolderGuid),
+             "Got a bookmark message that doesn't belong to us");
+
+  RESTART_AND_RETURN_IF_ASYNC_PENDING();
+
+  bool excludeItems = mOptions->ExcludeItems();
+  if (excludeItems && (aItemType == nsINavBookmarksService::TYPE_SEPARATOR ||
+                       (aItemType == nsINavBookmarksService::TYPE_BOOKMARK &&
+                        !StringBeginsWith(aURI, "place:"_ns)))) {
+    return NS_OK;
+  }
+
+  int32_t index;
+  nsNavHistoryResultNode* node = FindChildById(aItemId, &index);
+  if (node && aNewParentGUID.Equals(mTargetFolderGuid) && index == aNewIndex) {
+    return NS_OK;
+  }
+  if (!node && aOldParentGUID.Equals(mTargetFolderGuid)) return NS_OK;
+
+  if (!StartIncrementalUpdate()) {
+    return NS_OK;  
+  }
+
+  if (aNewParentGUID.Equals(aOldParentGUID)) {
+
+    int32_t maxIndex = std::max(node->mBookmarkIndex, aNewIndex);
+    ReindexRange(node->mBookmarkIndex + 1, maxIndex, -1);
+    ReindexRange(aNewIndex, maxIndex, 1);
+
+    MOZ_ASSERT(node, "Can't find folder that is moving!");
+    if (!node) {
+      return NS_ERROR_FAILURE;
+    }
+    MOZ_ASSERT(index < mChildren.Count(), "Invalid index!");
+    node->mBookmarkIndex = aNewIndex;
+
+    EnsureItemPosition(index);
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIURI> itemURI;
+  if (aItemType == nsINavBookmarksService::TYPE_BOOKMARK) {
+    nsresult rv = NS_NewURI(getter_AddRefs(itemURI), aURI);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+  if (aOldParentGUID.Equals(mTargetFolderGuid)) {
+    OnItemRemoved(aItemId, mTargetFolderItemId, aOldIndex, aItemType, itemURI,
+                  aGUID, aOldParentGUID, aSource);
+  }
+  if (aNewParentGUID.Equals(mTargetFolderGuid)) {
+    OnItemAdded(aItemId, mTargetFolderItemId, aNewIndex, aItemType, itemURI,
+                aDateAdded, aGUID, aNewParentGUID, aSource, aTitle, aTags,
+                aFrecency, aHidden, aVisitCount, aLastVisitDate,
+                mTargetFolderItemId, mTargetFolderGuid, aTitle);
+  }
+
+  return NS_OK;
+}
+
+nsNavHistorySeparatorResultNode::nsNavHistorySeparatorResultNode()
+    : nsNavHistoryResultNode(""_ns, ""_ns, 0, 0) {}
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(nsNavHistoryResult)
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(nsNavHistoryResult)
+  tmp->StopObservingOnUnlink();
+
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mRootNode)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mObservers)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mMobilePrefObservers)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mAllBookmarksObservers)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mHistoryObservers)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mRefreshParticipants)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_WEAK_REFERENCE
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsNavHistoryResult)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mRootNode)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mObservers)
+  for (nsNavHistoryResult::FolderObserverList* list :
+       tmp->mBookmarkFolderObservers.Values()) {
+    for (uint32_t i = 0; i < list->Length(); ++i) {
+      NS_CYCLE_COLLECTION_NOTE_EDGE_NAME(cb,
+                                         "mBookmarkFolderObservers value[i]");
+      nsNavHistoryResultNode* node = list->ElementAt(i);
+      cb.NoteXPCOMChild(node);
+    }
+  }
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mMobilePrefObservers)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mAllBookmarksObservers)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mHistoryObservers)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mRefreshParticipants)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(nsNavHistoryResult)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(nsNavHistoryResult)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(nsNavHistoryResult)
+  NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsINavHistoryResult)
+  NS_INTERFACE_MAP_STATIC_AMBIGUOUS(nsNavHistoryResult)
+  NS_INTERFACE_MAP_ENTRY(nsINavHistoryResult)
+  NS_INTERFACE_MAP_ENTRY(nsISupportsWeakReference)
+NS_INTERFACE_MAP_END
+
+nsNavHistoryResult::nsNavHistoryResult(
+    nsNavHistoryContainerResultNode* aRoot,
+    const RefPtr<nsNavHistoryQuery>& aQuery,
+    const RefPtr<nsNavHistoryQueryOptions>& aOptions)
+    : mRootNode(aRoot),
+      mQuery(aQuery),
+      mOptions(aOptions),
+      mNeedsToApplySortingMode(false),
+      mIsHistoryObserver(false),
+      mIsBookmarksObserver(false),
+      mIsMobilePrefObserver(false),
+      mBookmarkFolderObservers(64),
+      mSuppressNotifications(false),
+      mIsHistoryDetailsObserver(false),
+      mObserversWantHistoryDetails(true),
+      mBatchInProgress(0) {
+  mSortingMode = aOptions->SortingMode();
+
+  mRootNode->mResult = this;
+  MOZ_ASSERT(mRootNode->mIndentLevel == -1,
+             "Root node's indent level initialized wrong");
+  mRootNode->FillStats();
+
+  AutoTArray<PlacesEventType, 1> events;
+  events.AppendElement(PlacesEventType::Purge_caches);
+  PlacesObservers::AddListener(events, this);
+}
+
+nsNavHistoryResult::~nsNavHistoryResult() {
+  for (auto it = mBookmarkFolderObservers.Iter(); !it.Done(); it.Next()) {
+    delete it.Data();
+    it.Remove();
+  }
+}
+
+void nsNavHistoryResult::StopObserving() {
+  AutoTArray<PlacesEventType, 12> events;
+  events.AppendElement(PlacesEventType::Favicon_changed);
+  if (mIsBookmarksObserver) {
+    events.AppendElement(PlacesEventType::Bookmark_added);
+    events.AppendElement(PlacesEventType::Bookmark_removed);
+    events.AppendElement(PlacesEventType::Bookmark_moved);
+    events.AppendElement(PlacesEventType::Bookmark_keyword_changed);
+    events.AppendElement(PlacesEventType::Bookmark_tags_changed);
+    events.AppendElement(PlacesEventType::Bookmark_time_changed);
+    events.AppendElement(PlacesEventType::Bookmark_title_changed);
+    events.AppendElement(PlacesEventType::Bookmark_url_changed);
+    mIsBookmarksObserver = false;
+  }
+  if (mIsMobilePrefObserver) {
+    Preferences::UnregisterCallback(OnMobilePrefChangedCallback,
+                                    MOBILE_BOOKMARKS_PREF, this);
+    mIsMobilePrefObserver = false;
+  }
+  if (mIsHistoryObserver) {
+    mIsHistoryObserver = false;
+    events.AppendElement(PlacesEventType::History_cleared);
+    events.AppendElement(PlacesEventType::Page_removed);
+  }
+  if (mIsHistoryDetailsObserver) {
+    events.AppendElement(PlacesEventType::Page_visited);
+    events.AppendElement(PlacesEventType::Page_title_changed);
+    mIsHistoryDetailsObserver = false;
+  }
+
+  PlacesObservers::RemoveListener(events, this);
+}
+
+void nsNavHistoryResult::StopObservingOnUnlink() {
+  StopObserving();
+
+  AutoTArray<PlacesEventType, 1> events;
+  events.AppendElement(PlacesEventType::Purge_caches);
+  PlacesObservers::RemoveListener(events, this);
+
+  for (auto it = mBookmarkFolderObservers.Iter(); !it.Done(); it.Next()) {
+    delete it.Data();
+    it.Remove();
+  }
+}
+
+bool nsNavHistoryResult::CanSkipHistoryDetailsNotifications() const {
+  return !mObserversWantHistoryDetails &&
+         mOptions->QueryType() ==
+             nsINavHistoryQueryOptions::QUERY_TYPE_BOOKMARKS &&
+         mSortingMode != nsINavHistoryQueryOptions::SORT_BY_DATE_ASCENDING &&
+         mSortingMode != nsINavHistoryQueryOptions::SORT_BY_DATE_DESCENDING &&
+         mSortingMode !=
+             nsINavHistoryQueryOptions::SORT_BY_VISITCOUNT_ASCENDING &&
+         mSortingMode !=
+             nsINavHistoryQueryOptions::SORT_BY_VISITCOUNT_DESCENDING &&
+         mSortingMode !=
+             nsINavHistoryQueryOptions::SORT_BY_FRECENCY_ASCENDING &&
+         mSortingMode != nsINavHistoryQueryOptions::SORT_BY_FRECENCY_DESCENDING;
+}
+
+void nsNavHistoryResult::AddHistoryObserver(
+    nsNavHistoryQueryResultNode* aNode) {
+  if (!mIsHistoryObserver) {
+    mIsHistoryObserver = true;
+
+    AutoTArray<PlacesEventType, 3> events;
+    events.AppendElement(PlacesEventType::History_cleared);
+    events.AppendElement(PlacesEventType::Page_removed);
+    if (!mIsHistoryDetailsObserver) {
+      events.AppendElement(PlacesEventType::Page_visited);
+      events.AppendElement(PlacesEventType::Page_title_changed);
+      mIsHistoryDetailsObserver = true;
+    }
+    PlacesObservers::AddListener(events, this);
+  }
+  if (mHistoryObservers.IndexOf(aNode) == QueryObserverList::NoIndex) {
+    mHistoryObservers.AppendElement(aNode);
+  }
+}
+
+void nsNavHistoryResult::AddAllBookmarksObserver(
+    nsNavHistoryQueryResultNode* aNode) {
+  EnsureIsObservingBookmarks();
+  if (mAllBookmarksObservers.IndexOf(aNode) == QueryObserverList::NoIndex) {
+    mAllBookmarksObservers.AppendElement(aNode);
+  }
+}
+
+void nsNavHistoryResult::AddMobilePrefsObserver(
+    nsNavHistoryQueryResultNode* aNode) {
+  if (!mIsMobilePrefObserver) {
+    Preferences::RegisterCallback(OnMobilePrefChangedCallback,
+                                  MOBILE_BOOKMARKS_PREF, this);
+    mIsMobilePrefObserver = true;
+  }
+  if (mMobilePrefObservers.IndexOf(aNode) == QueryObserverList::NoIndex) {
+    mMobilePrefObservers.AppendElement(aNode);
+  }
+}
+
+void nsNavHistoryResult::AddBookmarkFolderObserver(
+    nsNavHistoryFolderResultNode* aNode, const nsACString& aFolderGUID) {
+  MOZ_ASSERT(!aFolderGUID.IsEmpty(), "aFolderGUID should not be empty");
+  EnsureIsObservingBookmarks();
+  FolderObserverList* list = BookmarkFolderObserversForGUID(aFolderGUID, true);
+  if (list->IndexOf(aNode) == FolderObserverList::NoIndex) {
+    list->AppendElement(aNode);
+  }
+}
+
+void nsNavHistoryResult::EnsureIsObservingBookmarks() {
+  if (mIsBookmarksObserver) {
+    return;
+  }
+  AutoTArray<PlacesEventType, 9> events;
+  events.AppendElement(PlacesEventType::Bookmark_added);
+  events.AppendElement(PlacesEventType::Bookmark_removed);
+  events.AppendElement(PlacesEventType::Bookmark_moved);
+  events.AppendElement(PlacesEventType::Bookmark_keyword_changed);
+  events.AppendElement(PlacesEventType::Bookmark_tags_changed);
+  events.AppendElement(PlacesEventType::Bookmark_time_changed);
+  events.AppendElement(PlacesEventType::Bookmark_title_changed);
+  events.AppendElement(PlacesEventType::Bookmark_url_changed);
+  if (!mIsHistoryObserver && !mIsHistoryDetailsObserver) {
+    events.AppendElement(PlacesEventType::Page_visited);
+    mIsHistoryDetailsObserver = true;
+  }
+  PlacesObservers::AddListener(events, this);
+  mIsBookmarksObserver = true;
+}
+
+void nsNavHistoryResult::RemoveHistoryObserver(
+    nsNavHistoryQueryResultNode* aNode) {
+  mHistoryObservers.RemoveElement(aNode);
+}
+
+void nsNavHistoryResult::RemoveAllBookmarksObserver(
+    nsNavHistoryQueryResultNode* aNode) {
+  mAllBookmarksObservers.RemoveElement(aNode);
+}
+
+void nsNavHistoryResult::RemoveMobilePrefsObserver(
+    nsNavHistoryQueryResultNode* aNode) {
+  mMobilePrefObservers.RemoveElement(aNode);
+}
+
+void nsNavHistoryResult::RemoveBookmarkFolderObserver(
+    nsNavHistoryFolderResultNode* aNode, const nsACString& aFolderGUID) {
+  MOZ_ASSERT(!aFolderGUID.IsEmpty(), "aFolderGUID should not be empty");
+  FolderObserverList* list = BookmarkFolderObserversForGUID(aFolderGUID, false);
+  if (!list) return;  
+  list->RemoveElement(aNode);
+}
+
+nsNavHistoryResult::FolderObserverList*
+nsNavHistoryResult::BookmarkFolderObserversForGUID(
+    const nsACString& aFolderGUID, bool aCreate) {
+  FolderObserverList* list;
+  if (mBookmarkFolderObservers.Get(aFolderGUID, &list)) return list;
+  if (!aCreate) return nullptr;
+
+  list = new FolderObserverList;
+  mBookmarkFolderObservers.InsertOrUpdate(aFolderGUID, list);
+  return list;
+}
+
+NS_IMETHODIMP
+nsNavHistoryResult::GetSortingMode(uint16_t* aSortingMode) {
+  *aSortingMode = mSortingMode;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNavHistoryResult::SetSortingMode(uint16_t aSortingMode) {
+  NS_ENSURE_STATE(mRootNode);
+
+  if (aSortingMode > nsINavHistoryQueryOptions::SORT_BY_FRECENCY_DESCENDING) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  NS_ASSERTION(mOptions, "Options should always be present for a root query");
+
+  mSortingMode = aSortingMode;
+
+  bool addedListener = UpdateHistoryDetailsObservers();
+
+  if (!mRootNode->mExpanded) {
+    mNeedsToApplySortingMode = true;
+    return NS_OK;
+  }
+
+  if (addedListener) {
+    if (mRootNode->IsQuery()) {
+      return mRootNode->GetAsQuery()->Refresh();
+    }
+    if (mRootNode->IsFolderOrShortcut()) {
+      return mRootNode->GetAsFolder()->Refresh();
+    }
+  }
+
+  nsNavHistoryContainerResultNode::SortComparator comparator =
+      nsNavHistoryContainerResultNode::GetSortingComparator(aSortingMode);
+  if (comparator) {
+    nsNavHistory* history = nsNavHistory::GetHistoryService();
+    NS_ENSURE_TRUE(history, NS_ERROR_OUT_OF_MEMORY);
+    mRootNode->RecursiveSort(comparator);
+  }
+
+  NOTIFY_RESULT_OBSERVERS(this, SortingChanged(aSortingMode));
+  NOTIFY_RESULT_OBSERVERS(this, InvalidateContainer(mRootNode));
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNavHistoryResult::AddObserver(nsINavHistoryResultObserver* aObserver,
+                                bool aOwnsWeak) {
+  NS_ENSURE_ARG(aObserver);
+  nsresult rv = mObservers.AppendWeakElementUnlessExists(aObserver, aOwnsWeak);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  UpdateHistoryDetailsObservers();
+
+  rv = aObserver->SetResult(this);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (IsBatching()) {
+    NOTIFY_RESULT_OBSERVERS(this, Batching(true));
+  }
+
+  if (!mRootNode->IsQuery() ||
+      mRootNode->GetAsQuery()->mLiveUpdate != QUERYUPDATE_NONE) {
+    AutoTArray<PlacesEventType, 1> events;
+    events.AppendElement(PlacesEventType::Favicon_changed);
+    PlacesObservers::AddListener(events, this);
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNavHistoryResult::RemoveObserver(nsINavHistoryResultObserver* aObserver) {
+  NS_ENSURE_ARG(aObserver);
+  nsresult rv = mObservers.RemoveWeakElement(aObserver);
+  NS_ENSURE_SUCCESS(rv, rv);
+  UpdateHistoryDetailsObservers();
+  return NS_OK;
+}
+
+bool nsNavHistoryResult::UpdateHistoryDetailsObservers() {
+  bool skipHistoryDetailsNotifications = false;
+  for (uint32_t i = 0;
+       i < mObservers.Length() && !skipHistoryDetailsNotifications; ++i) {
+    const nsCOMPtr<nsINavHistoryResultObserver>& entry =
+        mObservers.ElementAt(i).GetValue();
+    if (entry) {
+      entry->GetSkipHistoryDetailsNotifications(
+          &skipHistoryDetailsNotifications);
+    }
+  }
+
+  mObserversWantHistoryDetails = !skipHistoryDetailsNotifications;
+  if (!CanSkipHistoryDetailsNotifications()) {
+    if (!mIsHistoryDetailsObserver) {
+      AutoTArray<PlacesEventType, 3> events;
+      events.AppendElement(PlacesEventType::Page_visited);
+      events.AppendElement(PlacesEventType::Page_title_changed);
+      events.AppendElement(PlacesEventType::Page_removed);
+      PlacesObservers::AddListener(events, this);
+      mIsHistoryDetailsObserver = true;
+      return true;
+    }
+  } else {
+    AutoTArray<PlacesEventType, 3> events;
+    events.AppendElement(PlacesEventType::Page_visited);
+    events.AppendElement(PlacesEventType::Page_title_changed);
+    events.AppendElement(PlacesEventType::Page_removed);
+    PlacesObservers::RemoveListener(events, this);
+    mIsHistoryDetailsObserver = false;
+  }
+  return false;
+}
+
+NS_IMETHODIMP
+nsNavHistoryResult::GetSuppressNotifications(bool* _retval) {
+  *_retval = mSuppressNotifications;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNavHistoryResult::SetSuppressNotifications(bool aSuppressNotifications) {
+  mSuppressNotifications = aSuppressNotifications;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNavHistoryResult::GetRoot(nsINavHistoryContainerResultNode** aRoot) {
+  if (!mRootNode) {
+    MOZ_ASSERT_UNREACHABLE("Root is null");
+    *aRoot = nullptr;
+    return NS_ERROR_FAILURE;
+  }
+  RefPtr<nsNavHistoryContainerResultNode> node(mRootNode);
+  node.forget(aRoot);
+  return NS_OK;
+}
+
+void nsNavHistoryResult::requestRefresh(
+    nsNavHistoryContainerResultNode* aContainer) {
+  if (mRefreshParticipants.IndexOf(aContainer) ==
+      ContainerObserverList::NoIndex) {
+    mRefreshParticipants.AppendElement(aContainer);
+  }
+}
+
+#define ENUMERATE_BOOKMARK_FOLDER_OBSERVERS(_folderGUID, _functionCall) \
+  PR_BEGIN_MACRO                                                        \
+  FolderObserverList* _fol =                                            \
+      BookmarkFolderObserversForGUID(_folderGUID, false);               \
+  if (_fol) {                                                           \
+    FolderObserverList _listCopy(_fol->Clone());                        \
+    for (uint32_t _fol_i = 0; _fol_i < _listCopy.Length(); ++_fol_i) {  \
+      if (_listCopy[_fol_i]) _listCopy[_fol_i]->_functionCall;          \
+    }                                                                   \
+  }                                                                     \
+  PR_END_MACRO
+#define ENUMERATE_LIST_OBSERVERS(_listType, _functionCall, _observersList, \
+                                 _conditionCall)                           \
+  PR_BEGIN_MACRO                                                           \
+  _listType _listCopy((_observersList).Clone());                           \
+  for (uint32_t _obs_i = 0; _obs_i < _listCopy.Length(); ++_obs_i) {       \
+    if (_listCopy[_obs_i] && _listCopy[_obs_i]->_conditionCall)            \
+      _listCopy[_obs_i]->_functionCall;                                    \
+  }                                                                        \
+  PR_END_MACRO
+#define ENUMERATE_QUERY_OBSERVERS(_functionCall, _observersList,             \
+                                  _conditionCall)                            \
+  ENUMERATE_LIST_OBSERVERS(QueryObserverList, _functionCall, _observersList, \
+                           _conditionCall)
+#define ENUMERATE_ALL_BOOKMARKS_OBSERVERS(_functionCall) \
+  ENUMERATE_QUERY_OBSERVERS(_functionCall, mAllBookmarksObservers, IsQuery())
+#define ENUMERATE_HISTORY_OBSERVERS(_functionCall) \
+  ENUMERATE_QUERY_OBSERVERS(_functionCall, mHistoryObservers, IsQuery())
+#define ENUMERATE_MOBILE_PREF_OBSERVERS(_functionCall) \
+  ENUMERATE_QUERY_OBSERVERS(_functionCall, mMobilePrefObservers, IsQuery())
+#define ENUMERATE_BOOKMARK_CHANGED_OBSERVERS(_folderGUID, _targetId,        \
+                                             _functionCall)                 \
+  PR_BEGIN_MACRO                                                            \
+  ENUMERATE_ALL_BOOKMARKS_OBSERVERS(_functionCall);                         \
+  FolderObserverList* _fol =                                                \
+      BookmarkFolderObserversForGUID(_folderGUID, false);                   \
+                                                                            \
+                                                                         \
+                                                                            \
+  for (uint32_t _fol_i = 0; _fol && _fol_i < _fol->Length(); ++_fol_i) {    \
+    RefPtr<nsNavHistoryFolderResultNode> _folder = _fol->ElementAt(_fol_i); \
+    if (_folder) {                                                          \
+      int32_t _nodeIndex;                                                   \
+      RefPtr<nsNavHistoryResultNode> _node =                                \
+          _folder->FindChildById(_targetId, &_nodeIndex);                   \
+      bool _excludeItems = _folder->mOptions->ExcludeItems();               \
+      if (_node &&                                                          \
+          (!_excludeItems || !(_node->IsURI() || _node->IsSeparator())) &&  \
+          _folder->StartIncrementalUpdate()) {                              \
+        _node->_functionCall;                                               \
+      }                                                                     \
+    }                                                                       \
+  }                                                                         \
+                                                                            \
+  PR_END_MACRO
+
+#define NOTIFY_REFRESH_PARTICIPANTS()                            \
+  PR_BEGIN_MACRO                                                 \
+  ENUMERATE_LIST_OBSERVERS(ContainerObserverList, Refresh(),     \
+                           mRefreshParticipants, IsContainer()); \
+  mRefreshParticipants.Clear();                                  \
+  PR_END_MACRO
+
+NS_IMETHODIMP
+nsNavHistoryResult::OnBeginUpdateBatch() {
+  if (++mBatchInProgress == 1) {
+    ENUMERATE_HISTORY_OBSERVERS(OnBeginUpdateBatch());
+    ENUMERATE_ALL_BOOKMARKS_OBSERVERS(OnBeginUpdateBatch());
+
+    NOTIFY_RESULT_OBSERVERS(this, Batching(true));
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNavHistoryResult::OnEndUpdateBatch() {
+  if (--mBatchInProgress == 0) {
+    ENUMERATE_HISTORY_OBSERVERS(OnEndUpdateBatch());
+    ENUMERATE_ALL_BOOKMARKS_OBSERVERS(OnEndUpdateBatch());
+
+    NOTIFY_REFRESH_PARTICIPANTS();
+    NOTIFY_RESULT_OBSERVERS(this, Batching(false));
+  }
+
+  return NS_OK;
+}
+
+nsresult nsNavHistoryResult::OnVisit(nsIURI* aURI, int64_t aVisitId,
+                                     PRTime aTime, uint32_t aTransitionType,
+                                     const nsACString& aGUID, bool aHidden,
+                                     uint32_t aVisitCount,
+                                     const nsAString& aLastKnownTitle,
+                                     int64_t aFrecency) {
+  NS_ENSURE_ARG(aURI);
+
+  if (aTransitionType == nsINavHistoryService::TRANSITION_EMBED) {
+    return NS_OK;
+  }
+
+  uint32_t added = 0;
+
+  ENUMERATE_HISTORY_OBSERVERS(OnVisit(aURI, aVisitId, aTime, aTransitionType,
+                                      aGUID, aHidden, aVisitCount,
+                                      aLastKnownTitle, aFrecency, &added));
+
+  if (!aLastKnownTitle.IsVoid() && aVisitCount == 1) {
+    ENUMERATE_HISTORY_OBSERVERS(OnTitleChanged(aURI, aLastKnownTitle, aGUID));
+  }
+
+  if (!mRootNode->mExpanded) return NS_OK;
+
+  bool todayIsMissing = false;
+  uint32_t resultType = mRootNode->mOptions->ResultType();
+  if (resultType == nsINavHistoryQueryOptions::RESULTS_AS_DATE_QUERY ||
+      resultType == nsINavHistoryQueryOptions::RESULTS_AS_DATE_SITE_QUERY) {
+    uint32_t childCount;
+    nsresult rv = mRootNode->GetChildCount(&childCount);
+    NS_ENSURE_SUCCESS(rv, rv);
+    if (childCount) {
+      nsCOMPtr<nsINavHistoryResultNode> firstChild;
+      rv = mRootNode->GetChild(0, getter_AddRefs(firstChild));
+      NS_ENSURE_SUCCESS(rv, rv);
+      nsAutoCString title;
+      rv = firstChild->GetTitle(title);
+      NS_ENSURE_SUCCESS(rv, rv);
+      nsNavHistory* history = nsNavHistory::GetHistoryService();
+      NS_ENSURE_TRUE(history, NS_OK);
+      nsAutoCString todayLabel;
+      history->GetStringFromName("finduri-AgeInDays-is-0", todayLabel);
+      todayIsMissing = !todayLabel.Equals(title);
+    }
+  }
+
+  if (!added || todayIsMissing) {
+    if (resultType == nsINavHistoryQueryOptions::RESULTS_AS_DATE_QUERY ||
+        resultType == nsINavHistoryQueryOptions::RESULTS_AS_DATE_SITE_QUERY) {
+      int64_t beginOfToday = nsNavHistory::NormalizeTime(
+          nsINavHistoryQuery::TIME_RELATIVE_TODAY, 0);
+      if (todayIsMissing || aTime < beginOfToday) {
+        (void)mRootNode->GetAsQuery()->Refresh();
+      }
+      return NS_OK;
+    }
+
+    if (resultType == nsINavHistoryQueryOptions::RESULTS_AS_SITE_QUERY) {
+      (void)mRootNode->GetAsQuery()->Refresh();
+      return NS_OK;
+    }
+
+    ENUMERATE_QUERY_OBSERVERS(Refresh(), mHistoryObservers,
+                              IsContainersQuery());
+
+    if (!mIsHistoryObserver && mRootNode->IsFolderOrShortcut()) {
+      nsAutoCString spec;
+      nsresult rv = aURI->GetSpec(spec);
+      NS_ENSURE_SUCCESS(rv, rv);
+      nsCOMArray<nsNavHistoryResultNode> nodes;
+      mRootNode->RecursiveFindURIs(true, mRootNode, spec, &nodes);
+      for (int32_t i = 0; i < nodes.Count(); ++i) {
+        nsNavHistoryResultNode* node = nodes[i];
+        ENUMERATE_BOOKMARK_FOLDER_OBSERVERS(
+            node->mParent->mBookmarkGuid,
+            OnItemVisited(aURI, aVisitId, aTime, aFrecency));
+      }
+    }
+  }
+
+  return NS_OK;
+}
+
+void nsNavHistoryResult::OnIconChanged(nsIURI* aURI, nsIURI* aFaviconURI,
+                                       const nsACString& aGUID) {
+  if (!mRootNode->mExpanded) {
+    return;
+  }
+  nsAutoCString spec;
+  if (NS_SUCCEEDED(aURI->GetSpec(spec))) {
+    bool onlyOneEntry =
+        mOptions->QueryType() ==
+            nsINavHistoryQueryOptions::QUERY_TYPE_HISTORY &&
+        mOptions->ResultType() == nsINavHistoryQueryOptions::RESULTS_AS_URI;
+    mRootNode->UpdateURIs(true, onlyOneEntry, false, spec, setFaviconCallback,
+                          nullptr);
+  }
+}
+
+bool nsNavHistoryResult::IsBulkPageRemovedEvent(
+    const PlacesEventSequence& aEvents) {
+  if (IsBatching() || aEvents.Length() <= MAX_PAGE_REMOVES_BEFORE_REFRESH) {
+    return false;
+  }
+  for (const auto& event : aEvents) {
+    if (event->Type() != PlacesEventType::Page_removed) return false;
+  }
+  return true;
+}
+
+void nsNavHistoryResult::HandlePlacesEvent(const PlacesEventSequence& aEvents) {
+  if (IsBulkPageRemovedEvent(aEvents)) {
+    ENUMERATE_HISTORY_OBSERVERS(Refresh());
+    return;
+  }
+
+  for (const auto& event : aEvents) {
+    switch (event->Type()) {
+      case PlacesEventType::Favicon_changed: {
+        const dom::PlacesFavicon* faviconEvent = event->AsPlacesFavicon();
+        if (NS_WARN_IF(!faviconEvent)) {
+          continue;
+        }
+        nsCOMPtr<nsIURI> uri, faviconUri;
+        if (NS_WARN_IF(NS_FAILED(
+                NS_NewURI(getter_AddRefs(uri), faviconEvent->mUrl)))) {
+          continue;
+        }
+        if (NS_WARN_IF(NS_FAILED(NS_NewURI(getter_AddRefs(faviconUri),
+                                           faviconEvent->mFaviconUrl)))) {
+          continue;
+        }
+        OnIconChanged(uri, faviconUri, faviconEvent->mPageGuid);
+        break;
+      }
+      case PlacesEventType::Page_visited: {
+        const dom::PlacesVisit* visit = event->AsPlacesVisit();
+        if (NS_WARN_IF(!visit)) {
+          continue;
+        }
+
+        nsCOMPtr<nsIURI> uri;
+        if (NS_WARN_IF(
+                NS_FAILED(NS_NewURI(getter_AddRefs(uri), visit->mUrl)))) {
+          continue;
+        }
+        OnVisit(uri, static_cast<int64_t>(visit->mVisitId),
+                static_cast<PRTime>(visit->mVisitTime * 1000),
+                visit->mTransitionType, visit->mPageGuid, visit->mHidden,
+                visit->mVisitCount, visit->mLastKnownTitle, visit->mFrecency);
+        break;
+      }
+      case PlacesEventType::Bookmark_added: {
+        const dom::PlacesBookmarkAddition* item =
+            event->AsPlacesBookmarkAddition();
+        if (NS_WARN_IF(!item)) {
+          continue;
+        }
+
+        nsCOMPtr<nsIURI> uri;
+        if (item->mItemType == nsINavBookmarksService::TYPE_BOOKMARK) {
+          if (NS_WARN_IF(
+                  NS_FAILED(NS_NewURI(getter_AddRefs(uri), item->mUrl)))) {
+            continue;
+          }
+        }
+
+        ENUMERATE_BOOKMARK_FOLDER_OBSERVERS(
+            item->mParentGuid,
+            OnItemAdded(item->mId, item->mParentId, item->mIndex,
+                        item->mItemType, uri, item->mDateAdded * 1000,
+                        item->mGuid, item->mParentGuid, item->mSource,
+                        NS_ConvertUTF16toUTF8(item->mTitle), item->mTags,
+                        item->mFrecency, item->mHidden, item->mVisitCount,
+                        item->mLastVisitDate.IsNull()
+                            ? 0
+                            : item->mLastVisitDate.Value() * 1000,
+                        item->mTargetFolderItemId, item->mTargetFolderGuid,
+                        NS_ConvertUTF16toUTF8(item->mTargetFolderTitle)));
+        ENUMERATE_HISTORY_OBSERVERS(
+            OnItemAdded(item->mId, item->mParentId, item->mIndex,
+                        item->mItemType, uri, item->mDateAdded * 1000,
+                        item->mGuid, item->mParentGuid, item->mSource));
+        ENUMERATE_ALL_BOOKMARKS_OBSERVERS(
+            OnItemAdded(item->mId, item->mParentId, item->mIndex,
+                        item->mItemType, uri, item->mDateAdded * 1000,
+                        item->mGuid, item->mParentGuid, item->mSource));
+        break;
+      }
+      case PlacesEventType::Bookmark_removed: {
+        const dom::PlacesBookmarkRemoved* item =
+            event->AsPlacesBookmarkRemoved();
+        if (NS_WARN_IF(!item)) {
+          continue;
+        }
+
+        nsCOMPtr<nsIURI> uri;
+
+        if (item->mIsDescendantRemoval) {
+          continue;
+        }
+        ENUMERATE_BOOKMARK_FOLDER_OBSERVERS(
+            item->mParentGuid,
+            OnItemRemoved(item->mId, item->mParentId, item->mIndex,
+                          item->mItemType, uri, item->mGuid, item->mParentGuid,
+                          item->mSource));
+        ENUMERATE_ALL_BOOKMARKS_OBSERVERS(OnItemRemoved(
+            item->mId, item->mParentId, item->mIndex, item->mItemType, uri,
+            item->mGuid, item->mParentGuid, item->mSource));
+        ENUMERATE_HISTORY_OBSERVERS(OnItemRemoved(
+            item->mId, item->mParentId, item->mIndex, item->mItemType, uri,
+            item->mGuid, item->mParentGuid, item->mSource));
+        break;
+      }
+      case PlacesEventType::Bookmark_moved: {
+        const dom::PlacesBookmarkMoved* item = event->AsPlacesBookmarkMoved();
+        if (NS_WARN_IF(!item)) {
+          continue;
+        }
+
+        NS_ConvertUTF16toUTF8 url(item->mUrl);
+
+        ENUMERATE_BOOKMARK_FOLDER_OBSERVERS(
+            item->mOldParentGuid,
+            OnItemMoved(item->mId, item->mOldIndex, item->mIndex,
+                        item->mItemType, item->mGuid, item->mOldParentGuid,
+                        item->mParentGuid, item->mSource, url,
+                        NS_ConvertUTF16toUTF8(item->mTitle), item->mTags,
+                        item->mFrecency, item->mHidden, item->mVisitCount,
+                        item->mLastVisitDate.IsNull()
+                            ? 0
+                            : item->mLastVisitDate.Value() * 1000,
+                        item->mDateAdded * 1000));
+        if (!item->mParentGuid.Equals(item->mOldParentGuid)) {
+          ENUMERATE_BOOKMARK_FOLDER_OBSERVERS(
+              item->mParentGuid,
+              OnItemMoved(item->mId, item->mOldIndex, item->mIndex,
+                          item->mItemType, item->mGuid, item->mOldParentGuid,
+                          item->mParentGuid, item->mSource, url,
+                          NS_ConvertUTF16toUTF8(item->mTitle), item->mTags,
+                          item->mFrecency, item->mHidden, item->mVisitCount,
+                          item->mLastVisitDate.IsNull()
+                              ? 0
+                              : item->mLastVisitDate.Value() * 1000,
+                          item->mDateAdded * 1000));
+        }
+        ENUMERATE_ALL_BOOKMARKS_OBSERVERS(
+            OnItemMoved(item->mId, item->mOldIndex, item->mIndex,
+                        item->mItemType, item->mGuid, item->mOldParentGuid,
+                        item->mParentGuid, item->mSource, url));
+        ENUMERATE_HISTORY_OBSERVERS(
+            OnItemMoved(item->mId, item->mOldIndex, item->mIndex,
+                        item->mItemType, item->mGuid, item->mOldParentGuid,
+                        item->mParentGuid, item->mSource, url));
+        break;
+      }
+      case PlacesEventType::Bookmark_keyword_changed: {
+        const dom::PlacesBookmarkKeyword* keywordEvent =
+            event->AsPlacesBookmarkKeyword();
+        if (NS_WARN_IF(!keywordEvent)) {
+          continue;
+        }
+        ENUMERATE_BOOKMARK_CHANGED_OBSERVERS(
+            keywordEvent->mParentGuid, keywordEvent->mId,
+            OnItemKeywordChanged(keywordEvent->mId, keywordEvent->mKeyword));
+        break;
+      }
+      case PlacesEventType::Bookmark_tags_changed: {
+        const dom::PlacesBookmarkTags* tagsEvent =
+            event->AsPlacesBookmarkTags();
+        if (NS_WARN_IF(!tagsEvent)) {
+          continue;
+        }
+
+        nsString tags;
+        tagsEvent->mTags.Length()
+            ? tags.Assign(StringJoin(u","_ns, tagsEvent->mTags))
+            : tags.SetIsVoid(true);
+
+        ENUMERATE_BOOKMARK_CHANGED_OBSERVERS(
+            tagsEvent->mParentGuid, tagsEvent->mId,
+            OnItemTagsChanged(tagsEvent->mId, tagsEvent->mUrl, tags));
+        break;
+      }
+      case PlacesEventType::Bookmark_time_changed: {
+        const dom::PlacesBookmarkTime* timeEvent =
+            event->AsPlacesBookmarkTime();
+        if (NS_WARN_IF(!timeEvent)) {
+          continue;
+        }
+        ENUMERATE_BOOKMARK_CHANGED_OBSERVERS(
+            timeEvent->mParentGuid, timeEvent->mId,
+            OnItemTimeChanged(timeEvent->mId, timeEvent->mGuid,
+                              timeEvent->mDateAdded * 1000,
+                              timeEvent->mLastModified * 1000));
+        break;
+      }
+      case PlacesEventType::Bookmark_title_changed: {
+        const dom::PlacesBookmarkTitle* titleEvent =
+            event->AsPlacesBookmarkTitle();
+        if (NS_WARN_IF(!titleEvent)) {
+          continue;
+        }
+
+        NS_ConvertUTF16toUTF8 title(titleEvent->mTitle);
+        ENUMERATE_BOOKMARK_CHANGED_OBSERVERS(
+            titleEvent->mParentGuid, titleEvent->mId,
+            OnItemTitleChanged(titleEvent->mId, titleEvent->mGuid, title,
+                               titleEvent->mLastModified * 1000));
+        break;
+      }
+      case PlacesEventType::Bookmark_url_changed: {
+        const dom::PlacesBookmarkUrl* urlEvent = event->AsPlacesBookmarkUrl();
+        if (NS_WARN_IF(!urlEvent)) {
+          continue;
+        }
+
+        NS_ConvertUTF16toUTF8 url(urlEvent->mUrl);
+        ENUMERATE_BOOKMARK_CHANGED_OBSERVERS(
+            urlEvent->mParentGuid, urlEvent->mId,
+            OnItemUrlChanged(urlEvent->mId, urlEvent->mGuid, url,
+                             urlEvent->mLastModified * 1000));
+        break;
+      }
+      case PlacesEventType::Page_title_changed: {
+        const PlacesVisitTitle* titleEvent = event->AsPlacesVisitTitle();
+        if (NS_WARN_IF(!titleEvent)) {
+          continue;
+        }
+
+        nsCOMPtr<nsIURI> uri;
+        if (NS_WARN_IF(
+                NS_FAILED(NS_NewURI(getter_AddRefs(uri), titleEvent->mUrl)))) {
+          continue;
+        }
+
+        ENUMERATE_HISTORY_OBSERVERS(
+            OnTitleChanged(uri, titleEvent->mTitle, titleEvent->mPageGuid));
+        break;
+      }
+      case PlacesEventType::History_cleared: {
+        ENUMERATE_HISTORY_OBSERVERS(OnClearHistory());
+        break;
+      }
+      case PlacesEventType::Page_removed: {
+        const PlacesVisitRemoved* removeEvent = event->AsPlacesVisitRemoved();
+        if (NS_WARN_IF(!removeEvent)) {
+          continue;
+        }
+
+        nsCOMPtr<nsIURI> uri;
+        if (NS_WARN_IF(
+                NS_FAILED(NS_NewURI(getter_AddRefs(uri), removeEvent->mUrl)))) {
+          continue;
+        }
+
+        if (removeEvent->mIsRemovedFromStore) {
+          ENUMERATE_HISTORY_OBSERVERS(OnPageRemovedFromStore(
+              uri, removeEvent->mPageGuid, removeEvent->mReason));
+        } else {
+          ENUMERATE_HISTORY_OBSERVERS(
+              OnPageRemovedVisits(uri, removeEvent->mIsPartialVisistsRemoval,
+                                  removeEvent->mPageGuid, removeEvent->mReason,
+                                  removeEvent->mTransitionType));
+
+          if (!removeEvent->mIsPartialVisistsRemoval && mRootNode) {
+            mRootNode->OnVisitsRemoved(uri);
+          }
+        }
+
+        break;
+      }
+      case PlacesEventType::Purge_caches: {
+        mRootNode->Refresh();
+        break;
+      }
+      default: {
+        MOZ_ASSERT_UNREACHABLE(
+            "Receive notification of a type not subscribed to.");
+      }
+    }
+  }
+}
+
+void nsNavHistoryResult::OnMobilePrefChanged() {
+  ENUMERATE_MOBILE_PREF_OBSERVERS(
+      OnMobilePrefChanged(Preferences::GetBool(MOBILE_BOOKMARKS_PREF, false)));
+}
+
+void nsNavHistoryResult::OnMobilePrefChangedCallback(const char* prefName,
+                                                     void* self) {
+  MOZ_ASSERT(!strcmp(prefName, MOBILE_BOOKMARKS_PREF),
+             "We only expected Mobile Bookmarks pref change.");
+
+  static_cast<nsNavHistoryResult*>(self)->OnMobilePrefChanged();
+}

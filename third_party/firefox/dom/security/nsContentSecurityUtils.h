@@ -1,0 +1,78 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsContentSecurityUtils_h_
+#define nsContentSecurityUtils_h_
+
+#include <utility>
+
+#include "mozilla/Maybe.h"
+#include "nsLiteralString.h"
+
+struct JSContext;
+class nsIChannel;
+class nsIHttpChannel;
+class nsIPrincipal;
+class nsIURI;
+class NS_ConvertUTF8toUTF16;
+
+namespace mozilla::dom {
+class Document;
+class Element;
+}  
+
+using FilenameTypeAndDetails = std::pair<nsCString, mozilla::Maybe<nsCString>>;
+
+class nsContentSecurityUtils {
+ public:
+  static bool IsConsideredSameOriginForUIR(nsIPrincipal* aTriggeringPrincipal,
+                                           nsIPrincipal* aResultPrincipal);
+
+  static bool IsTrustedScheme(nsIURI* aURI);
+
+  static bool IsEvalAllowed(JSContext* cx, bool aIsSystemPrincipal,
+                            const nsAString& aScript);
+  static void NotifyEvalUsage(bool aIsSystemPrincipal,
+                              const nsACString& aFileName, uint64_t aWindowID,
+                              uint32_t aLineNumber, uint32_t aColumnNumber);
+
+  static void DetectJsHacks();
+  static nsresult GetHttpChannelFromPotentialMultiPart(
+      nsIChannel* aChannel, nsIHttpChannel** aHttpChannel);
+
+  static void PerformCSPFrameAncestorAndXFOCheck(nsIChannel* aChannel);
+
+  static bool CheckCSPFrameAncestorAndXFO(nsIChannel* aChannel);
+
+  static nsString GetIsElementNonceableNonce(
+      const mozilla::dom::Element& aElement);
+
+  static long ClassifyDownload(nsIChannel* aChannel);
+
+  static FilenameTypeAndDetails FilenameToFilenameType(
+      const nsACString& fileName);
+  static char* SmartFormatCrashString(const char* str);
+  static char* SmartFormatCrashString(char* str);
+  static nsCString SmartFormatCrashString(const char* part1, const char* part2,
+                                          const char* format_string);
+  static nsCString SmartFormatCrashString(char* part1, char* part2,
+                                          const char* format_string);
+
+  static constexpr nsLiteralString kBaselineSystemCSP =
+      u"script-src chrome: resource: moz-src:"_ns;
+
+  static bool IsExemptedFromBaselineSystemCSP(nsACString& aSpec);
+
+#if defined(DEBUG)
+  static void AssertAboutPageHasCSP(mozilla::dom::Document* aDocument);
+  static void AssertChromePageHasCSP(mozilla::dom::Document* aDocument);
+#endif
+
+  static bool ValidateScriptFilename(JSContext* cx, const char* aFilename);
+
+  static void LogMessageToConsole(nsIHttpChannel* aChannel, const char* aMsg);
+};
+
+#endif /* nsContentSecurityUtils_h_ */

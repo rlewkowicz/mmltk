@@ -1,0 +1,226 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef js_Promise_h
+#define js_Promise_h
+
+#include "mozilla/Attributes.h"
+
+#include "jstypes.h"
+
+#include "js/RootingAPI.h"
+#include "js/TypeDecls.h"
+#include "js/UniquePtr.h"
+
+namespace JS {
+
+class JS_PUBLIC_API AutoDebuggerJobQueueInterruption;
+
+class JS_PUBLIC_API JobQueue {
+ public:
+  virtual ~JobQueue() = default;
+
+  virtual bool getHostDefinedData(
+      JSContext* cx, JS::MutableHandle<JSObject*> incumbentGlobal,
+      JS::MutableHandle<JSObject*> optionalHostDefinedData) const = 0;
+
+  virtual bool getHostDefinedGlobal(
+      JSContext* cx, JS::MutableHandle<JSObject*> data) const = 0;
+
+  virtual void runJobs(JSContext* cx) = 0;
+
+  virtual bool isDrainingStopped() const = 0;
+
+  virtual bool useDebugQueue(JS::Handle<JSObject*> global) const {
+    return false;
+  }
+
+  virtual void traceNonGCThingMicroTask(JSTracer* trc, JS::Value* valuePtr) {}
+
+ protected:
+  friend class AutoDebuggerJobQueueInterruption;
+
+  class SavedJobQueue {
+   public:
+    virtual ~SavedJobQueue() = default;
+  };
+
+  virtual js::UniquePtr<SavedJobQueue> saveJobQueue(JSContext*) = 0;
+};
+
+extern JS_PUBLIC_API void SetJobQueue(JSContext* cx, JobQueue* queue);
+
+class MOZ_RAII JS_PUBLIC_API AutoDebuggerJobQueueInterruption {
+ public:
+  explicit AutoDebuggerJobQueueInterruption();
+  ~AutoDebuggerJobQueueInterruption();
+
+  bool init(JSContext* cx);
+  bool initialized() const { return !!saved; }
+
+  void runJobs();
+
+ private:
+  JSContext* cx;
+  js::UniquePtr<JobQueue::SavedJobQueue> saved;
+};
+
+enum class PromiseRejectionHandlingState { Unhandled, Handled };
+
+typedef void (*PromiseRejectionTrackerCallback)(
+    JSContext* cx, bool mutedErrors, JS::HandleObject promise,
+    JS::PromiseRejectionHandlingState state, void* data);
+
+extern JS_PUBLIC_API void SetPromiseRejectionTrackerCallback(
+    JSContext* cx, PromiseRejectionTrackerCallback callback,
+    void* data = nullptr);
+
+extern JS_PUBLIC_API void JobQueueIsEmpty(JSContext* cx);
+
+extern JS_PUBLIC_API void JobQueueMayNotBeEmpty(JSContext* cx);
+
+extern JS_PUBLIC_API JSObject* NewPromiseObject(JSContext* cx,
+                                                JS::HandleObject executor);
+
+extern JS_PUBLIC_API bool IsPromiseObject(JS::HandleObject obj);
+
+extern JS_PUBLIC_API JSObject* GetPromiseConstructor(JSContext* cx);
+
+extern JS_PUBLIC_API JSObject* GetPromisePrototype(JSContext* cx);
+
+enum class PromiseState { Pending, Fulfilled, Rejected };
+
+extern JS_PUBLIC_API PromiseState GetPromiseState(JS::HandleObject promise);
+
+JS_PUBLIC_API uint64_t GetPromiseID(JS::HandleObject promise);
+
+extern JS_PUBLIC_API JS::Value GetPromiseResult(JS::HandleObject promise);
+
+extern JS_PUBLIC_API bool GetPromiseIsHandled(JS::HandleObject promise);
+
+extern JS_PUBLIC_API bool SetSettledPromiseIsHandled(JSContext* cx,
+                                                     JS::HandleObject promise);
+
+[[nodiscard]] extern JS_PUBLIC_API bool SetAnyPromiseIsHandled(
+    JSContext* cx, JS::HandleObject promise);
+
+extern JS_PUBLIC_API JSObject* GetPromiseAllocationSite(
+    JS::HandleObject promise);
+
+extern JS_PUBLIC_API JSObject*
+MaybeGetPromiseAllocationSiteFromPossiblyWrappedPromise(
+    JS::HandleObject maybePromise);
+
+extern JS_PUBLIC_API JSObject* GetPromiseResolutionSite(
+    JS::HandleObject promise);
+
+#ifdef DEBUG
+extern JS_PUBLIC_API void DumpPromiseAllocationSite(JSContext* cx,
+                                                    JS::HandleObject promise);
+
+extern JS_PUBLIC_API void DumpPromiseResolutionSite(JSContext* cx,
+                                                    JS::HandleObject promise);
+#endif
+
+extern JS_PUBLIC_API JSObject* CallOriginalPromiseResolve(
+    JSContext* cx, JS::HandleValue resolutionValue);
+
+extern JS_PUBLIC_API JSObject* CallOriginalPromiseReject(
+    JSContext* cx, JS::HandleValue rejectionValue);
+
+extern JS_PUBLIC_API bool ResolvePromise(JSContext* cx,
+                                         JS::HandleObject promiseObj,
+                                         JS::HandleValue resolutionValue);
+
+extern JS_PUBLIC_API bool RejectPromise(JSContext* cx,
+                                        JS::HandleObject promiseObj,
+                                        JS::HandleValue rejectionValue);
+
+#ifdef NIGHTLY_BUILD
+extern JS_PUBLIC_API bool SafeResolve(JSContext* cx,
+                                      JS::HandleObject promiseObj,
+                                      JS::HandleValue resolutionValue);
+#endif  // NIGHTLY_BUILD
+
+extern JS_PUBLIC_API JSObject* CallOriginalPromiseThen(
+    JSContext* cx, JS::HandleObject promise, JS::HandleObject onFulfilled,
+    JS::HandleObject onRejected);
+
+extern JS_PUBLIC_API bool AddPromiseReactions(JSContext* cx,
+                                              JS::HandleObject promise,
+                                              JS::HandleObject onFulfilled,
+                                              JS::HandleObject onRejected);
+
+extern JS_PUBLIC_API bool AddPromiseReactionsIgnoringUnhandledRejection(
+    JSContext* cx, JS::HandleObject promise, JS::HandleObject onFulfilled,
+    JS::HandleObject onRejected);
+
+enum class PromiseUserInputEventHandlingState {
+  DontCare,
+  HadUserInteractionAtCreation,
+  DidntHaveUserInteractionAtCreation
+};
+
+extern JS_PUBLIC_API PromiseUserInputEventHandlingState
+GetPromiseUserInputEventHandlingState(JSObject* promise);
+
+extern JS_PUBLIC_API bool SetPromiseUserInputEventHandlingState(
+    JS::HandleObject promise, JS::PromiseUserInputEventHandlingState state);
+
+extern JS_PUBLIC_API JSObject* GetWaitForAllPromise(
+    JSContext* cx, JS::HandleObjectVector promises);
+
+class JS_PUBLIC_API Dispatchable {
+ protected:
+  bool registered_ = false;
+
+ public:
+  bool registered() const { return registered_; }
+
+  virtual ~Dispatchable() = default;
+
+  enum MaybeShuttingDown { NotShuttingDown, ShuttingDown };
+
+  static void Run(JSContext* cx, js::UniquePtr<Dispatchable>&& task,
+                  MaybeShuttingDown maybeShuttingDown);
+
+  static void ReleaseFailedTask(js::UniquePtr<Dispatchable>&& task);
+
+ protected:
+  Dispatchable() = default;
+
+
+  virtual void run(JSContext* cx, MaybeShuttingDown maybeShuttingDown) = 0;
+
+  virtual void transferToRuntime() = 0;
+};
+
+
+typedef bool (*DispatchToEventLoopCallback)(
+    void* closure, js::UniquePtr<Dispatchable>&& dispatchable);
+
+
+typedef bool (*DelayedDispatchToEventLoopCallback)(
+    void* closure, js::UniquePtr<Dispatchable>&& dispatchable, uint32_t delay);
+
+typedef void (*AsyncTaskStartedCallback)(void* closure,
+                                         Dispatchable* dispatchable);
+
+typedef void (*AsyncTaskFinishedCallback)(void* closure,
+                                          Dispatchable* dispatchable);
+
+extern JS_PUBLIC_API void InitAsyncTaskCallbacks(
+    JSContext* cx, DispatchToEventLoopCallback dispatchCallback,
+    DelayedDispatchToEventLoopCallback delayedDispatchCallback,
+    AsyncTaskStartedCallback asyncTaskStartedCallback,
+    AsyncTaskFinishedCallback asyncTaskFinishedCallback, void* closure);
+
+extern JS_PUBLIC_API void CancelAsyncTasks(JSContext* cx);
+
+
+extern JS_PUBLIC_API void ShutdownAsyncTasks(JSContext* cx);
+
+}  
+
+#endif  // js_Promise_h

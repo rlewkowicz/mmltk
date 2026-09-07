@@ -1,0 +1,627 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "HttpLog.h"
+
+#undef LOG
+#define LOG(args) LOG5(args)
+#undef LOG_ENABLED
+#define LOG_ENABLED() LOG5_ENABLED()
+
+#include "nsHttpConnectionInfo.h"
+#include "mozilla/HashFunctions.h"
+
+#include "mozilla/net/DNS.h"
+#include "mozilla/net/NeckoChannelParams.h"
+#include "nsComponentManagerUtils.h"
+#include "nsICryptoHash.h"
+#include "nsIDNSByTypeRecord.h"
+#include "nsIProtocolProxyService.h"
+#include "nsHttpHandler.h"
+#include "nsNetCID.h"
+#include "nsProxyInfo.h"
+#include "prnetdb.h"
+
+static nsresult SHA256(const char* aPlainText, nsAutoCString& aResult) {
+  nsresult rv;
+  nsCOMPtr<nsICryptoHash> hasher =
+      do_CreateInstance(NS_CRYPTO_HASH_CONTRACTID, &rv);
+  if (NS_FAILED(rv)) {
+    LOG(("nsHttpDigestAuth: no crypto hash!\n"));
+    return rv;
+  }
+  rv = hasher->Init(nsICryptoHash::SHA256);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = hasher->Update((unsigned char*)aPlainText, strlen(aPlainText));
+  NS_ENSURE_SUCCESS(rv, rv);
+  return hasher->Finish(false, aResult);
+}
+
+namespace mozilla {
+namespace net {
+
+nsHttpConnectionInfo::nsHttpConnectionInfo(
+    const nsACString& originHost, int32_t originPort,
+    const nsACString& npnToken, const nsACString& username,
+    nsProxyInfo* proxyInfo, const OriginAttributes& originAttributes,
+    bool endToEndSSL, bool aIsHttp3, bool aWebTransport)
+    : mRoutedPort(443), mLessThanTls13(false) {
+  Init(originHost, originPort, npnToken, username, proxyInfo, originAttributes,
+       endToEndSSL, aIsHttp3, aWebTransport);
+}
+
+nsHttpConnectionInfo::nsHttpConnectionInfo(
+    const nsACString& originHost, int32_t originPort,
+    const nsACString& npnToken, const nsACString& username,
+    nsProxyInfo* proxyInfo, const OriginAttributes& originAttributes,
+    const nsACString& routedHost, int32_t routedPort, bool aIsHttp3,
+    bool aWebTransport)
+    : mLessThanTls13(false) {
+  mEndToEndSSL = true;  
+  mRoutedPort = routedPort == -1 ? DefaultPort() : routedPort;
+
+  if (!originHost.Equals(routedHost) || (originPort != routedPort) ||
+      aIsHttp3) {
+    mRoutedHost = routedHost;
+  }
+  Init(originHost, originPort, npnToken, username, proxyInfo, originAttributes,
+       true, aIsHttp3, aWebTransport);
+}
+
+uint64_t nsHttpConnectionInfo::GenerateNewWebTransportId() {
+  MOZ_ASSERT(XRE_IsParentProcess());
+  static Atomic<uint64_t> id(0);
+  return ++id;
+}
+
+void nsHttpConnectionInfo::Init(const nsACString& host, int32_t port,
+                                const nsACString& npnToken,
+                                const nsACString& username,
+                                nsProxyInfo* proxyInfo,
+                                const OriginAttributes& originAttributes,
+                                bool e2eSSL, bool aIsHttp3,
+                                bool aWebTransport) {
+  LOG(("Init nsHttpConnectionInfo @%p\n", this));
+
+  mUsername = username;
+  mProxyInfo = proxyInfo;
+  mEndToEndSSL = e2eSSL;
+  mUsingConnect = false;
+  mNPNToken = npnToken;
+  mIsHttp3 = aIsHttp3;
+  mWebTransport = aWebTransport;
+  mOriginAttributes = originAttributes;
+  mTlsFlags = 0x0;
+  mIsTrrServiceChannel = false;
+  mTRRMode = nsIRequest::TRR_DEFAULT_MODE;
+  mIPv4Disabled = false;
+  mIPv6Disabled = false;
+  mHttp3Disabled = false;
+  mHasIPHintAddress = false;
+  mIsWildCard = host.Equals("*"_ns);
+
+  mUsingHttpsProxy = (proxyInfo && proxyInfo->IsHTTPS());
+  mUsingHttpProxy = mUsingHttpsProxy || (proxyInfo && proxyInfo->IsHTTP());
+
+  if (mUsingHttpProxy) {
+    mUsingConnect = mEndToEndSSL || proxyInfo->IsHttp3Proxy();
+    if (!mUsingConnect) {
+      uint32_t resolveFlags = 0;
+      if (NS_SUCCEEDED(mProxyInfo->GetResolveFlags(&resolveFlags)) &&
+          resolveFlags & nsIProtocolProxyService::RESOLVE_ALWAYS_TUNNEL) {
+        mUsingConnect = true;
+      }
+    }
+  }
+
+  if (mUsingHttpsProxy) {
+    mIsHttp3ProxyConnection = "masque"_ns.Equals(proxyInfo->Type());
+    if (mIsHttp3ProxyConnection) {
+      mProxyNPNToken = "h3"_ns;
+    }
+  }
+
+  SetOriginServer(host, port);
+}
+
+void nsHttpConnectionInfo::BuildHashKey() {
+
+  const char* keyHost;
+  int32_t keyPort;
+
+  if (mUsingHttpProxy && !mUsingConnect) {
+    keyHost = ProxyHost();
+    keyPort = ProxyPort();
+  } else {
+    keyHost = Origin();
+    keyPort = OriginPort();
+  }
+
+
+  static_assert(static_cast<uint32_t>(HashKeyIndex::End) == 11,
+                "Update dot string in BuildHashKey if HashKeyIndex changes");
+  mHashKey.AssignLiteral("...........[tlsflags0x00000000]");
+
+  mHashKey.Append(keyHost);
+  mHashKey.Append(':');
+  mHashKey.AppendInt(keyPort);
+  if (!mUsername.IsEmpty()) {
+    mHashKey.Append('[');
+    mHashKey.Append(mUsername);
+    mHashKey.Append(']');
+  }
+
+  if (mUsingHttpsProxy) {
+    SetHashCharAt('T', HashKeyIndex::Proxy);
+  } else if (mUsingHttpProxy) {
+    SetHashCharAt('P', HashKeyIndex::Proxy);
+  }
+  if (mEndToEndSSL) {
+    SetHashCharAt('S', HashKeyIndex::EndToEndSSL);
+  }
+
+  if (mWebTransport) {
+    SetHashCharAt('W', HashKeyIndex::WebTransport);
+  }
+
+
+
+  if ((!mUsingHttpProxy && ProxyHost()) || (mUsingHttpProxy && mUsingConnect)) {
+    mHashKey.AppendLiteral(" (");
+    mHashKey.Append(ProxyType());
+    mHashKey.Append(':');
+    mHashKey.Append(ProxyHost());
+    mHashKey.Append(':');
+    mHashKey.AppendInt(ProxyPort());
+    mHashKey.Append(')');
+    mHashKey.Append('[');
+    mHashKey.Append(ProxyUsername());
+    mHashKey.Append(':');
+    const char* password = ProxyPassword();
+    if (strlen(password) > 0) {
+      nsAutoCString digestedPassword;
+      nsresult rv = SHA256(password, digestedPassword);
+      if (rv == NS_OK) {
+        mHashKey.Append(digestedPassword);
+      }
+    }
+    mHashKey.Append(']');
+  }
+
+  if (!mHappyEyeballsEnabled) {
+    if (!mRoutedHost.IsEmpty()) {
+      mHashKey.AppendLiteral(" <ROUTE-via ");
+      mHashKey.Append(mRoutedHost);
+      mHashKey.Append(':');
+      mHashKey.AppendInt(mRoutedPort);
+      mHashKey.Append('>');
+    }
+
+    if (!mNPNToken.IsEmpty()) {
+      mHashKey.AppendLiteral(" {NPN-TOKEN ");
+      mHashKey.Append(mNPNToken);
+      mHashKey.AppendLiteral("}");
+    }
+  }
+
+  if (GetTRRMode() != nsIRequest::TRR_DEFAULT_MODE) {
+    mHashKey.AppendLiteral("[TRR:");
+    mHashKey.AppendInt(GetTRRMode());
+    mHashKey.AppendLiteral("]");
+  }
+
+  if (GetIPv4Disabled()) {
+    mHashKey.AppendLiteral("[!v4]");
+  }
+
+  if (GetIPv6Disabled()) {
+    mHashKey.AppendLiteral("[!v6]");
+  }
+
+  if (GetHttp3Disabled()) {
+    mHashKey.AppendLiteral("[!h3]");
+  }
+
+  if (mProxyInfo) {
+    const nsCString& connectionIsolationKey =
+        mProxyInfo->ConnectionIsolationKey();
+    if (!connectionIsolationKey.IsEmpty()) {
+      mHashKey.AppendLiteral("{CIK ");
+      mHashKey.Append(connectionIsolationKey);
+      mHashKey.AppendLiteral("}");
+    }
+    if (mProxyInfo->Flags() & nsIProxyInfo::TRANSPARENT_PROXY_RESOLVES_HOST) {
+      mHashKey.AppendLiteral("{TPRH}");
+    }
+  }
+
+  if (mWebTransportId) {
+    mHashKey.AppendLiteral("{wId");
+    mHashKey.AppendInt(mWebTransportId, 16);
+    mHashKey.AppendLiteral("}");
+  }
+
+  nsAutoCString originAttributes;
+  mOriginAttributes.CreateSuffix(originAttributes);
+  mHashKey.Append(originAttributes);
+}
+
+void nsHttpConnectionInfo::RebuildHashKey() {
+  bool isAnonymous = GetAnonymous();
+  bool isPrivate = GetPrivate();
+  bool isInsecureScheme = GetInsecureScheme();
+  bool isNoSpdy = GetNoSpdy();
+  bool isBeConservative = GetBeConservative();
+  bool isAnonymousAllowClientCert = GetAnonymousAllowClientCert();
+  bool isFallback = GetFallbackConnection();
+  bool isHappyEyeballs = GetHappyEyeballsEnabled();
+
+  BuildHashKey();
+
+  SetAnonymous(isAnonymous);
+  SetPrivate(isPrivate);
+  SetInsecureScheme(isInsecureScheme);
+  SetNoSpdy(isNoSpdy);
+  SetBeConservative(isBeConservative);
+  SetAnonymousAllowClientCert(isAnonymousAllowClientCert);
+  SetFallbackConnection(isFallback);
+  SetTlsFlags(mTlsFlags);
+  SetHappyEyeballsEnabled(isHappyEyeballs);
+}
+
+void nsHttpConnectionInfo::SetOriginServer(const nsACString& host,
+                                           int32_t port) {
+  mOrigin = host;
+  mOriginPort = port == -1 ? DefaultPort() : port;
+  MOZ_DIAGNOSTIC_ASSERT(mHashKey.IsEmpty());
+  BuildHashKey();
+}
+
+already_AddRefed<nsHttpConnectionInfo> nsHttpConnectionInfo::Clone() const {
+  RefPtr<nsHttpConnectionInfo> clone;
+  if (mRoutedHost.IsEmpty()) {
+    clone = new nsHttpConnectionInfo(mOrigin, mOriginPort, mNPNToken, mUsername,
+                                     mProxyInfo, mOriginAttributes,
+                                     mEndToEndSSL, mIsHttp3, mWebTransport);
+  } else {
+    MOZ_ASSERT(mEndToEndSSL);
+    clone = new nsHttpConnectionInfo(mOrigin, mOriginPort, mNPNToken, mUsername,
+                                     mProxyInfo, mOriginAttributes, mRoutedHost,
+                                     mRoutedPort, mIsHttp3, mWebTransport);
+  }
+
+  clone->SetAnonymous(GetAnonymous());
+  clone->SetPrivate(GetPrivate());
+  clone->SetInsecureScheme(GetInsecureScheme());
+  clone->SetNoSpdy(GetNoSpdy());
+  clone->SetBeConservative(GetBeConservative());
+  clone->SetAnonymousAllowClientCert(GetAnonymousAllowClientCert());
+  clone->SetFallbackConnection(GetFallbackConnection());
+  clone->SetTlsFlags(GetTlsFlags());
+  clone->SetIsTrrServiceChannel(GetIsTrrServiceChannel());
+  clone->SetTRRMode(GetTRRMode());
+  clone->SetIPv4Disabled(GetIPv4Disabled());
+  clone->SetIPv6Disabled(GetIPv6Disabled());
+  clone->SetHttp3Disabled(GetHttp3Disabled());
+  clone->SetHasIPHintAddress(HasIPHintAddress());
+  clone->SetEchConfig(GetEchConfig());
+  clone->SetWebTransportId(GetWebTransportId());
+  clone->SetHappyEyeballsEnabled(GetHappyEyeballsEnabled());
+
+  MOZ_ASSERT(clone->Equals(this));
+
+  return clone.forget();
+}
+
+already_AddRefed<nsHttpConnectionInfo>
+nsHttpConnectionInfo::CloneAndAdoptHTTPSSVCRecord(
+    nsISVCBRecord* aRecord) const {
+  MOZ_ASSERT(aRecord);
+
+  nsAutoCString name;
+  aRecord->GetName(name);
+
+  Maybe<uint16_t> port = aRecord->GetPort();
+  Maybe<std::tuple<nsCString, SupportedAlpnRank>> alpn = aRecord->GetAlpn();
+
+  bool isHttp3 = alpn ? mozilla::net::IsHttp3(std::get<1>(*alpn)) : false;
+
+  LOG(("HTTPSSVC: use new routed host (%s) and new npnToken (%s)", name.get(),
+       alpn ? std::get<0>(*alpn).get() : "None"));
+
+  RefPtr<nsHttpConnectionInfo> clone;
+  if (name.IsEmpty()) {
+    clone = new nsHttpConnectionInfo(mOrigin, mOriginPort,
+                                     alpn ? std::get<0>(*alpn) : EmptyCString(),
+                                     mUsername, mProxyInfo, mOriginAttributes,
+                                     mEndToEndSSL, isHttp3, mWebTransport);
+  } else {
+    MOZ_ASSERT(mEndToEndSSL);
+    clone = new nsHttpConnectionInfo(
+        mOrigin, mOriginPort, alpn ? std::get<0>(*alpn) : EmptyCString(),
+        mUsername, mProxyInfo, mOriginAttributes, name,
+        port ? *port : mOriginPort, isHttp3, mWebTransport);
+  }
+
+  clone->SetAnonymous(GetAnonymous());
+  clone->SetPrivate(GetPrivate());
+  clone->SetInsecureScheme(GetInsecureScheme());
+  clone->SetNoSpdy(GetNoSpdy());
+  clone->SetBeConservative(GetBeConservative());
+  clone->SetAnonymousAllowClientCert(GetAnonymousAllowClientCert());
+  clone->SetFallbackConnection(GetFallbackConnection());
+  clone->SetTlsFlags(GetTlsFlags());
+  clone->SetIsTrrServiceChannel(GetIsTrrServiceChannel());
+  clone->SetTRRMode(GetTRRMode());
+  clone->SetIPv4Disabled(GetIPv4Disabled());
+  clone->SetIPv6Disabled(GetIPv6Disabled());
+  clone->SetHttp3Disabled(GetHttp3Disabled());
+  clone->SetHappyEyeballsEnabled(GetHappyEyeballsEnabled());
+
+  bool hasIPHint = false;
+  (void)aRecord->GetHasIPHintAddress(&hasIPHint);
+  if (hasIPHint) {
+    clone->SetHasIPHintAddress(hasIPHint);
+  }
+
+  nsAutoCString echConfig;
+  (void)aRecord->GetEchConfig(echConfig);
+  clone->SetEchConfig(echConfig);
+
+  return clone.forget();
+}
+
+already_AddRefed<nsHttpConnectionInfo>
+nsHttpConnectionInfo::CloneAndAdoptPortAndAlpn(
+    uint16_t aPort,
+    happy_eyeballs::ConnectionAttemptHttpVersions aProtocol) const {
+  nsAutoCString alpnStr(
+      aProtocol == happy_eyeballs::ConnectionAttemptHttpVersions::H3
+          ? "h3"_ns
+          : EmptyCString());
+  bool isHttp3 = aProtocol == happy_eyeballs::ConnectionAttemptHttpVersions::H3;
+  int32_t port = aPort != 0 ? aPort : mOriginPort;
+  RefPtr<nsHttpConnectionInfo> clone;
+  if (mEndToEndSSL && port != mOriginPort) {
+    const nsACString& routedHost =
+        mRoutedHost.IsEmpty() ? mOrigin : mRoutedHost;
+    clone = new nsHttpConnectionInfo(mOrigin, mOriginPort, alpnStr, mUsername,
+                                     mProxyInfo, mOriginAttributes, routedHost,
+                                     port, isHttp3, mWebTransport);
+  } else {
+    clone = new nsHttpConnectionInfo(mOrigin, port, alpnStr, mUsername,
+                                     mProxyInfo, mOriginAttributes,
+                                     mEndToEndSSL, isHttp3, mWebTransport);
+  }
+
+  clone->SetAnonymous(GetAnonymous());
+  clone->SetPrivate(GetPrivate());
+  clone->SetInsecureScheme(GetInsecureScheme());
+  clone->SetNoSpdy(GetNoSpdy());
+  clone->SetBeConservative(GetBeConservative());
+  clone->SetAnonymousAllowClientCert(GetAnonymousAllowClientCert());
+  clone->SetFallbackConnection(GetFallbackConnection());
+  clone->SetTlsFlags(GetTlsFlags());
+  clone->SetIsTrrServiceChannel(GetIsTrrServiceChannel());
+  clone->SetTRRMode(GetTRRMode());
+  clone->SetIPv4Disabled(GetIPv4Disabled());
+  clone->SetIPv6Disabled(GetIPv6Disabled());
+  clone->SetHttp3Disabled(GetHttp3Disabled());
+  clone->SetHappyEyeballsEnabled(GetHappyEyeballsEnabled());
+  clone->SetWebTransportId(GetWebTransportId());
+
+  return clone.forget();
+}
+
+void nsHttpConnectionInfo::SerializeHttpConnectionInfo(
+    nsHttpConnectionInfo* aInfo, HttpConnectionInfoCloneArgs& aArgs) {
+  aArgs.host() = aInfo->GetOrigin();
+  aArgs.port() = aInfo->OriginPort();
+  aArgs.npnToken() = aInfo->GetNPNToken();
+  aArgs.username() = aInfo->GetUsername();
+  aArgs.originAttributes() = aInfo->GetOriginAttributes();
+  aArgs.endToEndSSL() = aInfo->EndToEndSSL();
+  aArgs.routedHost() = aInfo->GetRoutedHost();
+  aArgs.routedPort() = aInfo->RoutedPort();
+  aArgs.anonymous() = aInfo->GetAnonymous();
+  aArgs.aPrivate() = aInfo->GetPrivate();
+  aArgs.insecureScheme() = aInfo->GetInsecureScheme();
+  aArgs.noSpdy() = aInfo->GetNoSpdy();
+  aArgs.beConservative() = aInfo->GetBeConservative();
+  aArgs.anonymousAllowClientCert() = aInfo->GetAnonymousAllowClientCert();
+  aArgs.tlsFlags() = aInfo->GetTlsFlags();
+  aArgs.isTrrServiceChannel() = aInfo->GetTRRMode();
+  aArgs.trrMode() = aInfo->GetTRRMode();
+  aArgs.isIPv4Disabled() = aInfo->GetIPv4Disabled();
+  aArgs.isIPv6Disabled() = aInfo->GetIPv6Disabled();
+  aArgs.isHttp3Disabled() = aInfo->GetHttp3Disabled();
+  aArgs.isHttp3() = aInfo->IsHttp3();
+  aArgs.hasIPHintAddress() = aInfo->HasIPHintAddress();
+  aArgs.echConfig() = aInfo->GetEchConfig();
+  aArgs.webTransport() = aInfo->GetWebTransport();
+  aArgs.webTransportId() = aInfo->GetWebTransportId();
+  aArgs.happyEyeballsEnabled() = aInfo->GetHappyEyeballsEnabled();
+
+  if (!aInfo->ProxyInfo()) {
+    return;
+  }
+
+  nsTArray<ProxyInfoCloneArgs> proxyInfoArray;
+  nsProxyInfo::SerializeProxyInfo(aInfo->ProxyInfo(), proxyInfoArray);
+  aArgs.proxyInfo() = std::move(proxyInfoArray);
+}
+
+already_AddRefed<nsHttpConnectionInfo>
+nsHttpConnectionInfo::DeserializeHttpConnectionInfoCloneArgs(
+    const HttpConnectionInfoCloneArgs& aInfoArgs) {
+  RefPtr<nsProxyInfo> pi =
+      nsProxyInfo::DeserializeProxyInfo(aInfoArgs.proxyInfo());
+  RefPtr<nsHttpConnectionInfo> cinfo;
+  if (aInfoArgs.routedHost().IsEmpty()) {
+    cinfo = new nsHttpConnectionInfo(
+        aInfoArgs.host(), aInfoArgs.port(), aInfoArgs.npnToken(),
+        aInfoArgs.username(), pi, aInfoArgs.originAttributes(),
+        aInfoArgs.endToEndSSL(), aInfoArgs.isHttp3(), aInfoArgs.webTransport());
+  } else {
+    MOZ_ASSERT(aInfoArgs.endToEndSSL());
+    cinfo = new nsHttpConnectionInfo(
+        aInfoArgs.host(), aInfoArgs.port(), aInfoArgs.npnToken(),
+        aInfoArgs.username(), pi, aInfoArgs.originAttributes(),
+        aInfoArgs.routedHost(), aInfoArgs.routedPort(), aInfoArgs.isHttp3(),
+        aInfoArgs.webTransport());
+  }
+  cinfo->SetWebTransportId(aInfoArgs.webTransportId());
+
+  cinfo->SetAnonymous(aInfoArgs.anonymous());
+  cinfo->SetPrivate(aInfoArgs.aPrivate());
+  cinfo->SetInsecureScheme(aInfoArgs.insecureScheme());
+  cinfo->SetNoSpdy(aInfoArgs.noSpdy());
+  cinfo->SetBeConservative(aInfoArgs.beConservative());
+  cinfo->SetAnonymousAllowClientCert(aInfoArgs.anonymousAllowClientCert());
+  cinfo->SetFallbackConnection(aInfoArgs.fallbackConnection());
+  cinfo->SetTlsFlags(aInfoArgs.tlsFlags());
+  cinfo->SetIsTrrServiceChannel(aInfoArgs.isTrrServiceChannel());
+  cinfo->SetTRRMode(static_cast<nsIRequest::TRRMode>(aInfoArgs.trrMode()));
+  cinfo->SetIPv4Disabled(aInfoArgs.isIPv4Disabled());
+  cinfo->SetIPv6Disabled(aInfoArgs.isIPv6Disabled());
+  cinfo->SetHttp3Disabled(aInfoArgs.isHttp3Disabled());
+  cinfo->SetHasIPHintAddress(aInfoArgs.hasIPHintAddress());
+  cinfo->SetEchConfig(aInfoArgs.echConfig());
+  cinfo->SetHappyEyeballsEnabled(aInfoArgs.happyEyeballsEnabled());
+
+  return cinfo.forget();
+}
+
+void nsHttpConnectionInfo::CloneAsDirectRoute(nsHttpConnectionInfo** outCI,
+                                              nsProxyInfo* aProxyInfo) {
+  RefPtr<nsHttpConnectionInfo> clone = new nsHttpConnectionInfo(
+      mOrigin, mOriginPort,
+      (mRoutedHost.IsEmpty() && !mIsHttp3) ? mNPNToken : ""_ns, mUsername,
+      aProxyInfo ? aProxyInfo : mProxyInfo.get(), mOriginAttributes,
+      mEndToEndSSL, false, mWebTransport);
+  clone->SetAnonymous(GetAnonymous());
+  clone->SetPrivate(GetPrivate());
+  clone->SetInsecureScheme(GetInsecureScheme());
+  clone->SetNoSpdy(GetNoSpdy());
+  clone->SetBeConservative(GetBeConservative());
+  clone->SetAnonymousAllowClientCert(GetAnonymousAllowClientCert());
+  clone->SetFallbackConnection(GetFallbackConnection());
+  clone->SetTlsFlags(GetTlsFlags());
+  clone->SetIsTrrServiceChannel(GetIsTrrServiceChannel());
+  clone->SetTRRMode(GetTRRMode());
+  clone->SetIPv4Disabled(GetIPv4Disabled());
+  clone->SetIPv6Disabled(GetIPv6Disabled());
+  clone->SetHttp3Disabled(GetHttp3Disabled());
+  clone->SetHasIPHintAddress(HasIPHintAddress());
+  clone->SetEchConfig(GetEchConfig());
+  clone->SetHappyEyeballsEnabled(GetHappyEyeballsEnabled());
+
+  clone.forget(outCI);
+}
+
+already_AddRefed<nsHttpConnectionInfo>
+nsHttpConnectionInfo::CreateConnectUDPFallbackConnInfo() {
+  if (!mProxyInfo || !mProxyInfo->IsHttp3Proxy()) {
+    return nullptr;
+  }
+
+  RefPtr<nsProxyInfo> proxyInfo = mProxyInfo->CreateFallbackProxyInfo();
+  RefPtr<nsHttpConnectionInfo> clone;
+  CloneAsDirectRoute(getter_AddRefs(clone), proxyInfo);
+  return clone.forget();
+}
+
+nsresult nsHttpConnectionInfo::CreateWildCard(nsHttpConnectionInfo** outParam) {
+
+  if (!mUsingHttpsProxy) {
+    MOZ_ASSERT(false);
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+
+  RefPtr<nsHttpConnectionInfo> clone;
+  clone = new nsHttpConnectionInfo("*"_ns, 0, mNPNToken, mUsername, mProxyInfo,
+                                   mOriginAttributes, true, mIsHttp3,
+                                   mWebTransport);
+  clone->SetAnonymous(GetAnonymous());
+  clone->SetPrivate(GetPrivate());
+  clone->SetFallbackConnection(GetFallbackConnection());
+  clone.forget(outParam);
+  return NS_OK;
+}
+
+void nsHttpConnectionInfo::SetTRRMode(nsIRequest::TRRMode aTRRMode) {
+  if (mTRRMode != aTRRMode) {
+    mTRRMode = aTRRMode;
+    RebuildHashKey();
+  }
+}
+
+void nsHttpConnectionInfo::SetIPv4Disabled(bool aNoIPv4) {
+  if (mIPv4Disabled != aNoIPv4) {
+    mIPv4Disabled = aNoIPv4;
+    RebuildHashKey();
+  }
+}
+
+void nsHttpConnectionInfo::SetIPv6Disabled(bool aNoIPv6) {
+  if (mIPv6Disabled != aNoIPv6) {
+    mIPv6Disabled = aNoIPv6;
+    RebuildHashKey();
+  }
+}
+
+void nsHttpConnectionInfo::SetHttp3Disabled(bool aHttp3Disabled) {
+  if (mHttp3Disabled != aHttp3Disabled) {
+    mHttp3Disabled = aHttp3Disabled;
+    RebuildHashKey();
+  }
+}
+
+void nsHttpConnectionInfo::SetWebTransport(bool aWebTransport) {
+  if (mWebTransport != aWebTransport) {
+    mWebTransport = aWebTransport;
+    RebuildHashKey();
+  }
+}
+
+void nsHttpConnectionInfo::SetWebTransportId(uint64_t id) {
+  if (mWebTransportId != id) {
+    mWebTransportId = id;
+    RebuildHashKey();
+  }
+}
+
+void nsHttpConnectionInfo::SetTlsFlags(uint32_t aTlsFlags) {
+  mTlsFlags = aTlsFlags;
+  const uint32_t tlsFlagsLength = 8;
+  const uint32_t tlsFlagsIndex =
+      UnderlyingIndex(HashKeyIndex::End) + strlen("[tlsflags0x");
+  mHashKey.Replace(tlsFlagsIndex, tlsFlagsLength,
+                   nsPrintfCString("%08x", mTlsFlags));
+}
+
+bool nsHttpConnectionInfo::UsingProxy() {
+  if (!mProxyInfo) return false;
+  return !mProxyInfo->IsDirect();
+}
+
+bool nsHttpConnectionInfo::HostIsLocalIPLiteral() const {
+  NetAddr netAddr;
+  nsAutoCString host(ProxyHost() ? ProxyHost() : Origin());
+  if (NS_FAILED(netAddr.InitFromString(host))) {
+    return false;
+  }
+  return netAddr.IsIPAddrLocal();
+}
+
+HashNumber nsHttpConnectionInfo::BuildOriginFrameHashKey(
+    nsHttpConnectionInfo* ci, const nsACString& host, int32_t port) {
+  static const HashNumber kViaOriginFrame = HashString("viaORIGIN.FRAME"_ns);
+  return AddToHash(HashString(host), ci->GetAnonymous(),
+                   ci->GetFallbackConnection(), port,
+                   ci->GetOriginAttributes().Hash(), kViaOriginFrame);
+}
+
+}  
+}  

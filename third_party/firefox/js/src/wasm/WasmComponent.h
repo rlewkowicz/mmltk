@@ -1,0 +1,798 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+#ifndef wasm_component_h
+#define wasm_component_h
+
+#ifdef ENABLE_WASM_COMPONENTS
+
+#  include "js/WasmComponent.h"
+
+#  include "mozilla/HashTable.h"
+#  include "mozilla/Maybe.h"
+#  include "mozilla/RefPtr.h"
+#  include "mozilla/Span.h"
+#  include "mozilla/Variant.h"
+#  include "mozilla/Vector.h"
+#  include "wasm/WasmModule.h"
+
+namespace js {
+namespace wasm {
+
+#  define ComponentName_Printf(n) \
+    (int)(n).utf8Bytes().Length(), (n).utf8Bytes().data()
+
+enum class ComponentSort : uint8_t {
+  Invalid = 0,
+
+  Func = 0x80 | 0x01,
+  Type = 0x80 | 0x03,
+  Component = 0x80 | 0x04,
+  Instance = 0x80 | 0x05,
+
+  CoreFunction = 0x40 | int(DefinitionKind::Function),
+  CoreTable = 0x40 | int(DefinitionKind::Table),
+  CoreMemory = 0x40 | int(DefinitionKind::Memory),
+  CoreGlobal = 0x40 | int(DefinitionKind::Global),
+  CoreTag = 0x40 | int(DefinitionKind::Tag),
+
+  CoreType = 0x10,
+  CoreModule = 0x80 | 0x11,
+  CoreInstance = 0x12,
+};
+
+inline bool ComponentSortValidForExternDesc(ComponentSort sort) {
+  return (uint8_t(sort) & 0x80) != 0;
+}
+
+inline bool ComponentSortIsCoreSort(ComponentSort sort) {
+  return (uint8_t(sort) & 0x40) != 0;
+}
+
+inline DefinitionKind CoreSortFromComponentSort(ComponentSort sort) {
+  MOZ_ASSERT(ComponentSortIsCoreSort(sort));
+  return DefinitionKind(uint8_t(sort) & ~0xc0);
+}
+
+enum class ComponentTypeKind : uint8_t {
+  Invalid = 0,
+
+  Bool = 0x7f,
+  S8 = 0x7e,
+  U8 = 0x7d,
+  S16 = 0x7c,
+  U16 = 0x7b,
+  S32 = 0x7a,
+  U32 = 0x79,
+  S64 = 0x78,
+  U64 = 0x77,
+  F32 = 0x76,
+  F64 = 0x75,
+  Char = 0x74,
+  String = 0x73,
+
+  Record = 0x72,
+  Variant = 0x71,
+  List = 0x70,
+  Tuple = 0x6f,
+  Flags = 0x6e,
+  Enum = 0x6d,
+  Option = 0x6b,
+  Result = 0x6a,
+  Own = 0x69,
+  Borrow = 0x68,
+
+  Func = 0x40,  
+  Component = 0x41,
+  Instance = 0x42,
+  Resource = 0x3f,  
+
+  Eq = 0x20,
+  SubResource = 0x21,
+
+  FirstPrimitive = String,
+  LastPrimitive = Bool,
+};
+
+inline bool ComponentTypeKindIsPrimitive(ComponentTypeKind kind) {
+  return ComponentTypeKind::FirstPrimitive <= kind &&
+         kind <= ComponentTypeKind::LastPrimitive;
+}
+
+inline bool ComponentTypeKindIsValueType(ComponentTypeKind kind) {
+  return ComponentTypeKindIsPrimitive(kind) ||
+         (ComponentTypeKind::Borrow <= kind &&
+          kind <= ComponentTypeKind::Record &&
+          int(kind) != 0x6c  
+         );
+}
+
+class ComponentTypeDef;
+class ComponentType;
+struct ComponentRecordField;
+struct ComponentVariantCase;
+struct ComponentResultType;
+struct ComponentFuncType;
+class ComponentResourceType;
+using ComponentTypeVector =
+    mozilla::Vector<ComponentType, 0, SystemAllocPolicy>;
+using ComponentRecordFieldVector =
+    mozilla::Vector<ComponentRecordField, 0, SystemAllocPolicy>;
+using ComponentVariantCaseVector =
+    mozilla::Vector<ComponentVariantCase, 0, SystemAllocPolicy>;
+
+class ComponentType {
+  ComponentTypeKind kind_;
+
+  RefPtr<ComponentTypeDef> typeDef_;
+
+  explicit ComponentType(ComponentTypeKind kind)
+      : kind_(kind), typeDef_(nullptr) {
+    MOZ_ASSERT(ComponentTypeKindIsPrimitive(kind));
+  }
+  explicit ComponentType(ComponentTypeKind kind,
+                         RefPtr<ComponentTypeDef> typeDef)
+      : kind_(kind), typeDef_(std::move(typeDef)) {}
+
+ public:
+  ComponentType() : kind_(ComponentTypeKind::Invalid), typeDef_(nullptr) {}
+  bool isValid() const { return kind_ != ComponentTypeKind::Invalid; }
+
+  static ComponentType primitive(ComponentTypeKind kind) {
+    MOZ_RELEASE_ASSERT(ComponentTypeKindIsPrimitive(kind));
+    return ComponentType(kind);
+  }
+  static bool record(ComponentRecordFieldVector&& fields, ComponentType* type);
+  static bool variant(ComponentVariantCaseVector&& cases, ComponentType* type);
+  static bool list(ComponentType&& elemType, ComponentType* type);
+  static bool tuple(ComponentTypeVector&& items, ComponentType* type);
+  static bool flags(CacheableNameVector&& labels, ComponentType* type);
+  static bool enum_(CacheableNameVector&& cases, ComponentType* type);
+  static bool option(ComponentType&& inner, ComponentType* type);
+  static bool result(ComponentResultType&& inner, ComponentType* type);
+  static bool own(ComponentType&& inner, ComponentType* type);
+  static bool borrow(ComponentType&& inner, ComponentType* type);
+  static bool func(ComponentFuncType&& inner, ComponentType* type);
+  static bool resource(ComponentResourceType&& inner, ComponentType* type);
+  static bool subResource(ComponentType* type);
+
+  ComponentTypeKind kind() const { return kind_; }
+  RefPtr<ComponentTypeDef> typeDef() const { return typeDef_; }
+
+  const ComponentRecordFieldVector& asRecord() const;
+  const ComponentVariantCaseVector& asVariant() const;
+  ComponentType asList() const;
+  const ComponentTypeVector& asTuple() const;
+  const CacheableNameVector& asFlags() const;
+  const CacheableNameVector& asEnum() const;
+  ComponentType asOption() const;
+  ComponentResultType asResult() const;
+  ComponentType asOwn() const;
+  ComponentType asBorrow() const;
+  const ComponentFuncType& asFunc() const;
+  const ComponentResourceType& asResource() const;
+
+  bool operator==(const ComponentType& other) const {
+    return kind_ == other.kind_ && typeDef_ == other.typeDef_;
+  }
+  static bool maybeEquals(mozilla::Maybe<ComponentType> a,
+                          mozilla::Maybe<ComponentType> b) {
+    if (a.isNothing() && b.isNothing()) {
+      return true;
+    }
+    if (a.isSome() != b.isSome()) {
+      return false;
+    }
+    return *a == *b;
+  }
+
+  static bool structurallyEqual(const ComponentType& a, const ComponentType& b);
+};
+
+static_assert(std::is_default_constructible_v<ComponentType>);
+static_assert(std::is_copy_constructible_v<ComponentType>);
+
+struct ComponentTypeHasher {
+  using Key = ComponentType;
+  using Lookup = ComponentType;
+
+  static HashNumber hash(const Lookup& aLookup);
+  static bool match(const Key& aKey, const Lookup& aLookup);
+};
+
+struct ComponentCanonicalTypeSet {
+  mozilla::HashSet<ComponentType, ComponentTypeHasher, SystemAllocPolicy>
+      canonicalTypes_;
+
+  bool canonicalize(const ComponentType& type, ComponentType* canonicalized);
+};
+
+[[nodiscard]] bool CanonicalizeComponentType(const ComponentType& type,
+                                             ComponentType* canonicalized);
+
+void PurgeComponentCanonicalTypes();
+
+struct ComponentRecordField {
+  CacheableName name;
+  ComponentType type;
+
+  ComponentRecordField(CacheableName&& name_, ComponentType type_)
+      : name(std::move(name_)), type(type_) {}
+
+  bool operator==(const ComponentRecordField& other) const {
+    return name == other.name && type == other.type;
+  }
+};
+
+struct ComponentVariantCase {
+  CacheableName name;
+  mozilla::Maybe<ComponentType> type;
+
+  bool operator==(const ComponentVariantCase& other) const {
+    return name == other.name && ComponentType::maybeEquals(type, other.type);
+  }
+};
+
+struct ComponentResultType {
+  mozilla::Maybe<ComponentType> type;
+  mozilla::Maybe<ComponentType> errorType;
+
+  static bool equals(const ComponentResultType& a,
+                     const ComponentResultType& b) {
+    return ComponentType::maybeEquals(a.type, b.type) &&
+           ComponentType::maybeEquals(a.errorType, b.errorType);
+  }
+};
+
+struct ComponentFuncType {
+  ComponentTypeVector paramTypes;
+  CacheableNameVector paramNames;
+  mozilla::Maybe<ComponentType> resultType;
+
+  bool operator==(const ComponentFuncType& other) const {
+    MOZ_RELEASE_ASSERT(paramTypes.length() == paramNames.length());
+    MOZ_RELEASE_ASSERT(other.paramTypes.length() == other.paramNames.length());
+    if (paramTypes.length() != other.paramTypes.length()) {
+      return false;
+    }
+
+    for (size_t i = 0; i < paramTypes.length(); i++) {
+      if (paramTypes[i] != other.paramTypes[i] ||
+          paramNames[i] != other.paramNames[i]) {
+        return false;
+      }
+    }
+
+    if (!ComponentType::maybeEquals(resultType, other.resultType)) {
+      return false;
+    }
+
+    return true;
+  }
+};
+
+class ComponentResourceType {
+
+  mozilla::Maybe<uint32_t> dtorIndex_;
+
+ public:
+  explicit ComponentResourceType(
+      mozilla::Maybe<uint32_t> dtorIndex = mozilla::Nothing())
+      : dtorIndex_(dtorIndex) {}
+
+  mozilla::Maybe<uint32_t> dtorIndex() const { return dtorIndex_; }
+};
+
+using ComponentTypeSchema = mozilla::Variant<
+    mozilla::Nothing, ComponentType, ComponentRecordFieldVector,
+    ComponentVariantCaseVector, ComponentTypeVector, CacheableNameVector,
+    ComponentResultType, ComponentFuncType, ComponentResourceType>;
+
+class ComponentTypeDef : public AtomicRefCounted<ComponentTypeDef> {
+  ComponentTypeSchema schema_;
+
+ public:
+  explicit ComponentTypeDef(ComponentTypeSchema&& schema)
+      : schema_(std::move(schema)) {}
+
+  const ComponentTypeSchema& schema() const { return schema_; }
+
+  static bool structurallyEqual(const ComponentTypeDef& a,
+                                const ComponentTypeDef& b);
+};
+
+class Component;
+
+enum class CanonMode : uint8_t {
+  Lift,
+  Lower,
+};
+
+[[nodiscard]] bool FlattenTypes(const ComponentTypeVector& types,
+                                ValTypeVector* result, bool* hasStringsOrLists,
+                                bool* tooDeep, uint32_t depth);
+[[nodiscard]] bool FlattenType(const ComponentType& type, ValTypeVector* result,
+                               bool* hasStringsOrLists, bool* tooDeep,
+                               uint32_t depth);
+[[nodiscard]] bool FlattenRecord(const ComponentRecordFieldVector& fields,
+                                 ValTypeVector* result, bool* hasStringsOrLists,
+                                 bool* tooDeep, uint32_t depth);
+mozilla::Maybe<FuncType> FlattenFuncType(const ComponentFuncType& funcType,
+                                         CanonMode mode, bool* memoryRequired,
+                                         bool* reallocRequired, bool* tooDeep);
+
+struct StronglyUniqueNameHasher {
+  using Key = CacheableName;
+  using Lookup = mozilla::Span<const char>;
+
+  static HashNumber hash(const Lookup& aLookup);
+  static bool match(const Key& aKey, const Lookup& aLookup);
+};
+
+class StronglyUniqueNameSet {
+  mozilla::HashSet<CacheableName, StronglyUniqueNameHasher, SystemAllocPolicy>
+      data_;
+
+ public:
+  [[nodiscard]] bool add(mozilla::Span<const char> name, bool* duplicate);
+};
+
+enum class ComponentStringEncoding : uint8_t {
+  UTF8 = 0x00,
+  UTF16 = 0x01,
+  Latin1PlusUTF16 = 0x02,
+};
+
+struct ComponentCanonOpts {
+  ComponentStringEncoding stringEncoding;
+  mozilla::Maybe<uint32_t> memoryIndex;
+  mozilla::Maybe<uint32_t> reallocIndex;
+  mozilla::Maybe<uint32_t> postReturnIndex;
+};
+
+class ComponentLiftedFuncDesc {
+  uint32_t typeIndex_;
+  ComponentCanonOpts canonOpts_;
+
+ public:
+  ComponentLiftedFuncDesc(uint32_t typeIndex, ComponentCanonOpts canonOpts)
+      : typeIndex_(typeIndex), canonOpts_(canonOpts) {}
+
+  uint32_t typeIndex() const { return typeIndex_; }
+  const ComponentCanonOpts& canonOpts() const { return canonOpts_; }
+};
+
+class ComponentLoweredFuncDesc {
+  uint32_t funcIndex_;
+  SharedTypeDef flattenedType_;
+
+ public:
+  ComponentLoweredFuncDesc(uint32_t funcIndex, SharedTypeDef&& flattenedType)
+      : funcIndex_(funcIndex), flattenedType_(std::move(flattenedType)) {}
+
+  uint32_t funcIndex() const { return funcIndex_; }
+  const SharedTypeDef& flattenedType() const { return flattenedType_; }
+};
+
+enum class ComponentAliasKind : uint8_t {
+  CoreExport,
+  Export,
+  Outer,
+};
+
+class ComponentItem {
+  uint32_t whatAndWhere_;
+  uint32_t itemIndex_;
+
+  friend struct ComponentItemHasher;
+
+ public:
+  static constexpr uint32_t ItemKindShift = 29;
+  static constexpr uint32_t ItemKindMask = 0b111 << ItemKindShift;
+  static constexpr uint32_t SortShift = 21;
+  static constexpr uint32_t SortMask = 0b11111111 << SortShift;
+  static constexpr uint32_t AliasKindShift = 19;
+  static constexpr uint32_t AliasKindMask = 0b11 << AliasKindShift;
+  static constexpr uint32_t AliasInstanceMask = (1 << AliasKindShift) - 1;
+
+  enum class ItemKind : uint8_t {
+    Defined,
+    Import,
+    Export,
+
+    Alias,
+
+    Raw,
+  };
+
+  explicit ComponentItem(ItemKind kind, ComponentSort sort, uint32_t itemIndex)
+      : whatAndWhere_(0), itemIndex_(itemIndex) {
+    MOZ_ASSERT(kind != ItemKind::Alias);
+
+    whatAndWhere_ |= uint32_t(kind) << ItemKindShift;
+    whatAndWhere_ |= uint32_t(sort) << SortShift;
+
+    MOZ_ASSERT(this->kind() == kind);
+    MOZ_ASSERT(this->sort() == sort);
+  }
+  explicit ComponentItem(ComponentAliasKind aliasKind, ComponentSort sort,
+                         uint32_t instanceIndex, uint32_t itemIndex)
+      : whatAndWhere_(0), itemIndex_(itemIndex) {
+    MOZ_ASSERT((instanceIndex & ~AliasInstanceMask) == 0);
+    whatAndWhere_ |= uint32_t(ItemKind::Alias) << ItemKindShift;
+    whatAndWhere_ |= uint32_t(sort) << SortShift;
+    whatAndWhere_ |= uint32_t(aliasKind) << AliasKindShift;
+    whatAndWhere_ |= instanceIndex;
+
+    MOZ_ASSERT(this->kind() == ItemKind::Alias);
+    MOZ_ASSERT(this->sort() == sort);
+    MOZ_ASSERT(this->aliasKind() == aliasKind);
+    MOZ_ASSERT(this->aliasInstanceIndex() == instanceIndex);
+  }
+
+ public:
+  static ComponentItem defined(ComponentSort sort, uint32_t itemIndex) {
+    return ComponentItem(ItemKind::Defined, sort, itemIndex);
+  }
+  static ComponentItem import(ComponentSort sort, uint32_t itemIndex) {
+    return ComponentItem(ItemKind::Import, sort, itemIndex);
+  }
+  static ComponentItem export_(ComponentSort sort, uint32_t itemIndex) {
+    return ComponentItem(ItemKind::Export, sort, itemIndex);
+  }
+  static ComponentItem alias(ComponentAliasKind aliasKind, ComponentSort sort,
+                             uint32_t instanceIndex, uint32_t itemIndex) {
+    return ComponentItem(aliasKind, sort, instanceIndex, itemIndex);
+  }
+  static ComponentItem raw(ComponentSort sort, uint32_t itemIndex) {
+    return ComponentItem(ItemKind::Raw, sort, itemIndex);
+  }
+
+  ItemKind kind() const {
+    return ItemKind((whatAndWhere_ & ItemKindMask) >> ItemKindShift);
+  }
+  ComponentSort sort() const {
+    return ComponentSort((whatAndWhere_ & SortMask) >> SortShift);
+  }
+  uint32_t itemIndex() const { return itemIndex_; }
+
+  ComponentAliasKind aliasKind() const {
+    MOZ_RELEASE_ASSERT(kind() == ItemKind::Alias);
+    return ComponentAliasKind((whatAndWhere_ & AliasKindMask) >>
+                              AliasKindShift);
+  }
+  uint32_t aliasInstanceIndex() const {
+    MOZ_RELEASE_ASSERT(kind() == ItemKind::Alias);
+    return whatAndWhere_ & AliasInstanceMask;
+  }
+
+  bool operator==(const ComponentItem& other) const {
+    return whatAndWhere_ == other.whatAndWhere_ &&
+           itemIndex_ == other.itemIndex_;
+  }
+};
+
+static_assert(MaxComponentCoreInstances <= ComponentItem::AliasInstanceMask);
+
+struct ComponentItemHasher {
+  using Lookup = ComponentItem;
+  static HashNumber hash(const Lookup& l) {
+    return mozilla::HashGeneric(l.whatAndWhere_, l.itemIndex_);
+  }
+  static bool match(const ComponentItem& k, const Lookup& l) { return k == l; }
+};
+
+using CoreInstanceInstantiateArgs =
+    mozilla::HashMap<CacheableName,  
+                     uint32_t,       
+                     CacheableNameHasher, SystemAllocPolicy>;
+
+struct CoreInstanceDescFromModule {
+  uint32_t moduleIndex;
+
+  CoreInstanceInstantiateArgs args;
+};
+
+class ComponentInlineExports {
+  using ExportMap = mozilla::HashMap<CacheableName, ComponentItem,
+                                     CacheableNameHasher, SystemAllocPolicy>;
+  using OriginalIndexMap =
+      mozilla::HashMap<ComponentItem, uint32_t, ComponentItemHasher,
+                       SystemAllocPolicy>;
+
+  ExportMap exports_;
+
+  OriginalIndexMap originalIndices_;
+
+ public:
+  struct Builder {
+    uint32_t numFuncs = 0;
+    uint32_t numTypes = 0;
+    uint32_t numComponents = 0;
+    uint32_t numInstances = 0;
+    uint32_t numCoreFunctions = 0;
+    uint32_t numCoreTables = 0;
+    uint32_t numCoreMemories = 0;
+    uint32_t numCoreGlobals = 0;
+    uint32_t numCoreTags = 0;
+    uint32_t numCoreTypes = 0;
+    uint32_t numCoreModules = 0;
+    uint32_t numCoreInstances = 0;
+
+    uint32_t trackItemOfSort(ComponentSort sort);
+  };
+
+  bool addExport(Builder* builder, CacheableName&& name, ComponentSort sort,
+                 uint32_t index);
+  mozilla::Maybe<ComponentItem> getExport(const CacheableName& name) const;
+
+  ComponentItem resolveOriginalItem(ComponentItem exp) const;
+};
+
+class CoreInstanceDesc {
+  using CoreInstanceVariant =
+      mozilla::Variant<CoreInstanceDescFromModule, ComponentInlineExports>;
+
+  CoreInstanceVariant desc_;
+
+  const Component* component_;
+
+ public:
+  explicit CoreInstanceDesc(const Component* c,
+                            CoreInstanceDescFromModule&& fromModule)
+      : desc_(std::move(fromModule)), component_(c) {}
+  explicit CoreInstanceDesc(const Component* c,
+                            ComponentInlineExports&& inlineExports)
+      : desc_(std::move(inlineExports)), component_(c) {}
+
+  const CoreInstanceVariant& desc() const { return desc_; }
+
+  mozilla::Maybe<ComponentItem> getExport(const CacheableName& name) const;
+
+  const TypeDef& getCoreFuncType(uint32_t coreFuncIndex) const;
+  const TableDesc& getTable(uint32_t tableIndex) const;
+  const MemoryDesc& getMemory(uint32_t memoryIndex) const;
+  const GlobalDesc& getGlobal(uint32_t globalIndex) const;
+  const TagDesc& getTag(uint32_t tagIndex) const;
+};
+
+class ComponentExternDesc {
+  ComponentSort sort_;
+  ComponentType type_;
+
+  uint32_t coreModuleIndex_;
+
+  explicit ComponentExternDesc(ComponentSort sort, ComponentType&& type)
+      : sort_(sort), type_(std::move(type)) {
+    MOZ_ASSERT(ComponentSortValidForExternDesc(sort));
+  }
+  explicit ComponentExternDesc(uint32_t coreModuleIndex)
+      : sort_(ComponentSort::CoreModule), coreModuleIndex_(coreModuleIndex) {}
+
+ public:
+  ComponentExternDesc() = default;
+
+  static ComponentExternDesc func(ComponentType&& funcType) {
+    MOZ_ASSERT(funcType.kind() == ComponentTypeKind::Func);
+    return ComponentExternDesc(ComponentSort::Func, std::move(funcType));
+  }
+  static ComponentExternDesc type(ComponentType&& type) {
+    return ComponentExternDesc(ComponentSort::Type, std::move(type));
+  }
+  static ComponentExternDesc coreModule(uint32_t coreModuleIndex) {
+    return ComponentExternDesc(coreModuleIndex);
+  }
+
+  bool isValid() const { return sort_ != ComponentSort::Invalid; }
+  ComponentSort sort() const { return sort_; }
+  ComponentType asFunc() const {
+    MOZ_RELEASE_ASSERT(sort() == ComponentSort::Func);
+    return type_;
+  }
+  ComponentType asType() const {
+    MOZ_RELEASE_ASSERT(sort() == ComponentSort::Type);
+    return type_;
+  }
+  uint32_t asCoreModule() const {
+    MOZ_RELEASE_ASSERT(sort() == ComponentSort::CoreModule);
+    return coreModuleIndex_;
+  }
+
+  static bool matches(const ComponentExternDesc& sub,
+                      const ComponentExternDesc& super);
+};
+
+static_assert(std::is_default_constructible_v<ComponentExternDesc>);
+
+class ComponentImport {
+  CacheableName name_;
+  ComponentExternDesc externDesc_;
+
+ public:
+  explicit ComponentImport(CacheableName&& name,
+                           const ComponentExternDesc& externDesc)
+      : name_(std::move(name)), externDesc_(externDesc) {}
+
+  const CacheableName& name() const { return name_; }
+  const ComponentExternDesc& externDesc() const { return externDesc_; }
+};
+
+class ComponentExport {
+  CacheableName name_;
+  ComponentExternDesc externDesc_;
+
+ public:
+  explicit ComponentExport(CacheableName&& name, ComponentExternDesc externDesc)
+      : name_(std::move(name)), externDesc_(externDesc) {}
+
+  const CacheableName& name() const { return name_; }
+  const ComponentExternDesc& externDesc() const { return externDesc_; }
+};
+
+class Component : public JS::WasmComponent {
+ public:
+  using CoreModuleVector = mozilla::Vector<SharedModule, 0, SystemAllocPolicy>;
+  using CoreInstanceVector =
+      mozilla::Vector<CoreInstanceDesc, 0, SystemAllocPolicy>;
+  using TypeVector = mozilla::Vector<ComponentType, 0, SystemAllocPolicy>;
+  using FuncVector =
+      mozilla::Vector<ComponentLiftedFuncDesc, 0, SystemAllocPolicy>;
+  using LoweredFuncVector =
+      mozilla::Vector<ComponentLoweredFuncDesc, 0, SystemAllocPolicy>;
+  using ImportVector = mozilla::Vector<ComponentImport, 0, SystemAllocPolicy>;
+  using ExportVector = mozilla::Vector<ComponentExport, 0, SystemAllocPolicy>;
+  using ItemVector = mozilla::Vector<ComponentItem, 0, SystemAllocPolicy>;
+
+ private:
+  CoreModuleVector definedCoreModules_;
+  CoreInstanceVector definedCoreInstances_;
+  TypeVector definedTypes_;
+  FuncVector definedFuncs_;
+  LoweredFuncVector loweredFuncs_;
+  ImportVector imports_;
+  ExportVector exports_;
+
+  ItemVector funcs_;
+  ItemVector types_;
+  ItemVector components_;
+  ItemVector instances_;
+  ItemVector coreFuncs_;
+  ItemVector coreTables_;
+  ItemVector coreMemories_;
+  ItemVector coreGlobals_;
+  ItemVector coreTags_;
+  ItemVector coreTypes_;
+  ItemVector coreModules_;
+  ItemVector coreInstances_;
+
+  template <typename T>
+  bool addDefinedItem(
+      ComponentSort sort, T&& item,
+      mozilla::Vector<T, 0, SystemAllocPolicy>& definedItemsVector,
+      ItemVector& indexSpaceVector) {
+    uint32_t index = definedItemsVector.length();
+    if (!definedItemsVector.append(std::forward<T>(item))) {
+      return false;
+    }
+    return indexSpaceVector.append(ComponentItem::defined(sort, index));
+  }
+
+ public:
+  Component() = default;
+
+
+  const ImportVector& imports() const { return imports_; }
+  [[nodiscard]] bool addImport(ComponentImport&& import);
+
+  const ExportVector& exports() const { return exports_; }
+  [[nodiscard]] bool addExport(ComponentExport&& exp);
+
+  const ItemVector& funcs() const { return funcs_; }
+  [[nodiscard]] bool addFunc(ComponentLiftedFuncDesc&& func) {
+    return addDefinedItem(ComponentSort::Func, std::move(func), definedFuncs_,
+                          funcs_);
+  }
+
+  const ItemVector& types() const { return types_; }
+  ComponentType getType(uint32_t typeIndex) const;
+  [[nodiscard]] bool addType(ComponentType&& type) {
+    MOZ_RELEASE_ASSERT(type.isValid());
+    return addDefinedItem(ComponentSort::Type, std::move(type), definedTypes_,
+                          types_);
+  }
+
+
+  const ItemVector& coreFuncs() const { return coreFuncs_; }
+  [[nodiscard]] bool addAliasOfExportedCoreFunc(ComponentItem funcItem) {
+    MOZ_RELEASE_ASSERT(funcItem.kind() == ComponentItem::ItemKind::Alias);
+    MOZ_RELEASE_ASSERT(funcItem.sort() == ComponentSort::CoreFunction);
+    return coreFuncs_.append(funcItem);
+  }
+  [[nodiscard]] bool addLoweredFunc(ComponentLoweredFuncDesc&& loweredFunc) {
+    uint32_t funcIndex = loweredFuncs_.length();
+    if (!loweredFuncs_.append(std::move(loweredFunc))) {
+      return false;
+    }
+    return coreFuncs_.append(
+        ComponentItem::defined(ComponentSort::CoreFunction, funcIndex));
+  }
+
+  const ItemVector& coreTables() const { return coreTables_; }
+  const TableDesc& getCoreTable(uint32_t tableIndex) const;
+  [[nodiscard]] bool addCoreTable(ComponentItem tableItem) {
+    MOZ_RELEASE_ASSERT(tableItem.sort() == ComponentSort::CoreTable);
+    return coreTables_.append(tableItem);
+  }
+
+  const ItemVector& coreMemories() const { return coreMemories_; }
+  const MemoryDesc& getCoreMemory(uint32_t memoryIndex) const;
+  [[nodiscard]] bool addCoreMemory(ComponentItem memoryItem) {
+    MOZ_RELEASE_ASSERT(memoryItem.sort() == ComponentSort::CoreMemory);
+    return coreMemories_.append(memoryItem);
+  }
+
+  const ItemVector& coreGlobals() const { return coreGlobals_; }
+  const GlobalDesc& getCoreGlobal(uint32_t globalIndex) const;
+  [[nodiscard]] bool addCoreGlobal(ComponentItem globalItem) {
+    MOZ_RELEASE_ASSERT(globalItem.sort() == ComponentSort::CoreGlobal);
+    return coreGlobals_.append(globalItem);
+  }
+
+  const ItemVector& coreTags() const { return coreTags_; }
+  const TagDesc& getCoreTag(uint32_t tagIndex) const;
+  bool addCoreTag(ComponentItem tagItem) {
+    MOZ_RELEASE_ASSERT(tagItem.sort() == ComponentSort::CoreTag);
+    return coreTags_.append(tagItem);
+  }
+
+  const ItemVector& coreModules() const { return coreModules_; }
+  SharedModule getCoreModule(uint32_t modIndex) const;
+  [[nodiscard]] bool addCoreModule(SharedModule module) {
+    return addDefinedItem(ComponentSort::CoreModule, std::move(module),
+                          definedCoreModules_, coreModules_);
+  }
+
+  const ItemVector& coreInstances() const { return coreInstances_; }
+  const CoreInstanceDesc& getCoreInstance(uint32_t instanceIndex) const;
+  [[nodiscard]] bool addCoreInstance(CoreInstanceDesc&& instance) {
+    return addDefinedItem(ComponentSort::CoreInstance, std::move(instance),
+                          definedCoreInstances_, coreInstances_);
+  }
+
+
+  ComponentType getTypeForFunc(uint32_t funcIndex) const;
+
+  const TypeDef& getTypeForCoreFunc(uint32_t coreFuncIndex) const;
+
+  size_t gcMallocBytesExcludingCode() const {
+    size_t total = 0;
+    for (const SharedModule& module : definedCoreModules_) {
+      total += module->gcMallocBytesExcludingCode();
+    }
+    return total;
+  }
+
+  size_t tier1CodeMemoryUsed() const {
+    size_t total = 0;
+    for (const SharedModule& module : definedCoreModules_) {
+      total += module->tier1CodeMemoryUsed();
+    }
+    return total;
+  }
+
+ private:
+  JSObject* createObject(JSContext* cx) const override;
+};
+
+using MutableComponent = RefPtr<Component>;
+using SharedComponent = RefPtr<const Component>;
+
+}  
+}  
+
+#endif  // ENABLE_WASM_COMPONENTS
+
+#endif  // wasm_component_h

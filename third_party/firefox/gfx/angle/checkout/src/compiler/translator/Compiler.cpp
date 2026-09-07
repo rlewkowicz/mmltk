@@ -1,0 +1,1731 @@
+// Copyright 2002 The ANGLE Project Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if defined(UNSAFE_BUFFERS_BUILD)
+#    pragma allow_unsafe_buffers
+#endif
+
+#include "compiler/translator/Compiler.h"
+
+#include <sstream>
+
+#include "angle_gl.h"
+
+#include "common/BinaryStream.h"
+#include "common/CompiledShaderState.h"
+#include "common/PackedEnums.h"
+#include "common/angle_version_info.h"
+
+#include "compiler/translator/CallDAG.h"
+#include "compiler/translator/CollectVariables.h"
+#include "compiler/translator/Initialize.h"
+#include "compiler/translator/IsASTDepthBelowLimit.h"
+#include "compiler/translator/OutputTree.h"
+#include "compiler/translator/ParseContext.h"
+#include "compiler/translator/SizeClipCullDistance.h"
+#include "compiler/translator/VariablePacker.h"
+#include "compiler/translator/ir/src/compile.h"
+#include "compiler/translator/tree_ops/ClampFragDepth.h"
+#include "compiler/translator/tree_ops/ClampIndirectIndices.h"
+#include "compiler/translator/tree_ops/ClampPointSize.h"
+#include "compiler/translator/tree_ops/DeclareAndInitBuiltinsForInstancedMultiview.h"
+#include "compiler/translator/tree_ops/DeferGlobalInitializers.h"
+#include "compiler/translator/tree_ops/EmulateGLFragColorBroadcast.h"
+#include "compiler/translator/tree_ops/EmulateMultiDrawShaderBuiltins.h"
+#include "compiler/translator/tree_ops/FoldExpressions.h"
+#include "compiler/translator/tree_ops/InitializeVariables.h"
+#include "compiler/translator/tree_ops/PruneEmptyCases.h"
+#include "compiler/translator/tree_ops/PruneNoOps.h"
+#include "compiler/translator/tree_ops/RemoveArrayLengthMethod.h"
+#include "compiler/translator/tree_ops/RemoveDynamicIndexing.h"
+#include "compiler/translator/tree_ops/RemoveInactiveInterfaceVariables.h"
+#include "compiler/translator/tree_ops/RemoveInvariantDeclaration.h"
+#include "compiler/translator/tree_ops/RemoveUnreferencedVariables.h"
+#include "compiler/translator/tree_ops/RemoveUnusedFramebufferFetch.h"
+#include "compiler/translator/tree_ops/RewritePixelLocalStorage.h"
+#include "compiler/translator/tree_ops/ScalarizeVecAndMatConstructorArgs.h"
+#include "compiler/translator/tree_ops/SeparateDeclarations.h"
+#include "compiler/translator/tree_ops/SimplifyLoopConditions.h"
+#include "compiler/translator/tree_ops/SplitSequenceOperator.h"
+#include "compiler/translator/tree_ops/glsl/RegenerateStructNames.h"
+#include "compiler/translator/tree_ops/glsl/RewriteRepeatedAssignToSwizzled.h"
+#include "compiler/translator/tree_ops/glsl/UseInterfaceBlockFields.h"
+#include "compiler/translator/tree_util/FindSymbolNode.h"
+#include "compiler/translator/tree_util/IntermNodePatternMatcher.h"
+#include "compiler/translator/tree_util/ReplaceShadowingVariables.h"
+#include "compiler/translator/tree_util/ReplaceVariable.h"
+#include "compiler/translator/util.h"
+
+namespace sh
+{
+
+namespace
+{
+bool IsTopLevelNodeUnusedFunction(const CallDAG &callDag,
+                                  const std::vector<TFunctionMetadata> &metadata,
+                                  TIntermNode *node,
+                                  const TFunction **functionOut)
+{
+    const TIntermFunctionPrototype *asFunctionPrototype   = node->getAsFunctionPrototypeNode();
+    const TIntermFunctionDefinition *asFunctionDefinition = node->getAsFunctionDefinition();
+
+    *functionOut = nullptr;
+
+    if (asFunctionDefinition)
+    {
+        *functionOut = asFunctionDefinition->getFunction();
+    }
+    else if (asFunctionPrototype)
+    {
+        *functionOut = asFunctionPrototype->getFunction();
+    }
+    if (*functionOut == nullptr)
+    {
+        return false;
+    }
+
+    size_t callDagIndex = callDag.findIndex((*functionOut)->uniqueId());
+    if (callDagIndex == CallDAG::InvalidIndex)
+    {
+        ASSERT(asFunctionPrototype);
+        return true;
+    }
+
+    ASSERT(callDagIndex < metadata.size());
+    return !metadata[callDagIndex].used;
+}
+
+void AddBuiltInToInitList(TSymbolTable *symbolTable,
+                          int shaderVersion,
+                          TIntermBlock *root,
+                          const char *name,
+                          InitVariableList *list)
+{
+    const TIntermSymbol *builtin = FindSymbolNode(root, ImmutableString(name));
+    const TVariable *builtinVar  = nullptr;
+    if (builtin != nullptr)
+    {
+        builtinVar = &builtin->variable();
+    }
+    else
+    {
+        builtinVar = static_cast<const TVariable *>(
+            symbolTable->findBuiltIn(ImmutableString(name), shaderVersion));
+    }
+
+    if (builtinVar != nullptr)
+    {
+        list->push_back(builtinVar);
+    }
+}
+
+bool IsCurrentNodeStructTypeDeclaration(TIntermNode *node)
+{
+    TIntermDeclaration *declarationNode = node->getAsDeclarationNode();
+    if (declarationNode != nullptr)
+    {
+        TIntermTyped *typeNode = declarationNode->getSequence()->front()->getAsTyped();
+        if (typeNode != nullptr && (typeNode->getType().getBasicType() == EbtStruct &&
+                                    typeNode->getType().isStructSpecifier()))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool IsCurrentNodeUniformDeclaration(TIntermNode *node)
+{
+    TIntermDeclaration *declarationNode = node->getAsDeclarationNode();
+    if (declarationNode != nullptr)
+    {
+        TIntermTyped *typeNode = declarationNode->getSequence()->front()->getAsTyped();
+        if (typeNode != nullptr && typeNode->getType().getQualifier() == TQualifier::EvqUniform &&
+            !IsCurrentNodeStructTypeDeclaration(node))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+struct UniformSortComparator
+{
+    bool operator()(TIntermNode *first, TIntermNode *second)
+    {
+        const TType &firstType = first->getAsDeclarationNode()
+                                     ->getSequence()
+                                     ->front()
+                                     ->getAsSymbolNode()
+                                     ->variable()
+                                     .getType();
+        const TType &secondType = second->getAsDeclarationNode()
+                                      ->getSequence()
+                                      ->front()
+                                      ->getAsSymbolNode()
+                                      ->variable()
+                                      .getType();
+        if (firstType.getStruct() != nullptr && secondType.getStruct() != nullptr)
+        {
+            return false;
+        }
+
+        const TPrecision firstPrecision  = firstType.getPrecision();
+        const TPrecision secondPrecision = secondType.getPrecision();
+        const bool firstIsHighP          = (firstPrecision == TPrecision::EbpHigh);
+        const bool secondIsHighP         = (secondPrecision == TPrecision::EbpHigh);
+        if (firstIsHighP != secondIsHighP)
+        {
+            return secondIsHighP;
+        }
+        if (firstIsHighP)
+        {
+            return false;
+        }
+        ASSERT(firstType.getPrecision() != TPrecision::EbpHigh &&
+               secondType.getPrecision() != TPrecision::EbpHigh);
+        if ((firstType.getStruct() == nullptr) != (secondType.getStruct() == nullptr))
+        {
+            return firstType.getStruct() == nullptr;
+        }
+        if (firstType.isArray() != secondType.isArray())
+        {
+            return !firstType.isArray();
+        }
+        if (firstType.isMatrix() != secondType.isMatrix())
+        {
+            return !firstType.isMatrix();
+        }
+        if (firstType.isMatrix() == secondType.isMatrix() && firstType.isMatrix())
+        {
+            if (firstType.getCols() != secondType.getCols())
+            {
+                return firstType.getCols() < secondType.getCols();
+            }
+            else
+            {
+                return firstType.getRows() < secondType.getRows();
+            }
+        }
+        if (firstType.isVector() != secondType.isVector())
+        {
+            return !firstType.isVector();
+        }
+        if (firstType.isVector() == secondType.isVector() && firstType.isVector())
+        {
+            return firstType.getNominalSize() < secondType.getNominalSize();
+        }
+
+        return false;
+    }
+};
+
+}  
+
+bool IsGLSL150OrNewer(ShShaderOutput output)
+{
+    return (output == SH_GLSL_150_CORE_OUTPUT || output == SH_GLSL_330_CORE_OUTPUT ||
+            output == SH_GLSL_400_CORE_OUTPUT || output == SH_GLSL_410_CORE_OUTPUT ||
+            output == SH_GLSL_420_CORE_OUTPUT || output == SH_GLSL_430_CORE_OUTPUT ||
+            output == SH_GLSL_440_CORE_OUTPUT || output == SH_GLSL_450_CORE_OUTPUT);
+}
+
+bool IsGLSL420OrNewer(ShShaderOutput output)
+{
+    return (output == SH_GLSL_420_CORE_OUTPUT || output == SH_GLSL_430_CORE_OUTPUT ||
+            output == SH_GLSL_440_CORE_OUTPUT || output == SH_GLSL_450_CORE_OUTPUT);
+}
+
+bool IsGLSL410OrOlder(ShShaderOutput output)
+{
+    return (output == SH_GLSL_150_CORE_OUTPUT || output == SH_GLSL_330_CORE_OUTPUT ||
+            output == SH_GLSL_400_CORE_OUTPUT || output == SH_GLSL_410_CORE_OUTPUT);
+}
+
+bool RemoveInvariant(sh::GLenum shaderType,
+                     int shaderVersion,
+                     ShShaderOutput outputType,
+                     const ShCompileOptions &compileOptions)
+{
+    if (shaderType == GL_FRAGMENT_SHADER &&
+        (IsGLSL420OrNewer(outputType) || IsOutputSPIRV(outputType)))
+    {
+        return true;
+    }
+
+    if (compileOptions.removeInvariantAndCentroidForESSL3 && shaderVersion >= 300 &&
+        shaderType == GL_VERTEX_SHADER)
+    {
+        return true;
+    }
+
+    return false;
+}
+
+size_t GetGlobalMaxTokenSize(ShShaderSpec spec)
+{
+    switch (spec)
+    {
+        case SH_WEBGL_SPEC:
+            return 256;
+        default:
+            return 1024;
+    }
+}
+
+int GetMaxUniformVectorsForShaderType(GLenum shaderType, const ShBuiltInResources &resources)
+{
+    switch (shaderType)
+    {
+        case GL_VERTEX_SHADER:
+            return resources.MaxVertexUniformVectors;
+        case GL_FRAGMENT_SHADER:
+            return resources.MaxFragmentUniformVectors;
+
+        case GL_COMPUTE_SHADER:
+            return resources.MaxComputeUniformComponents / 4;
+        case GL_GEOMETRY_SHADER_EXT:
+            return resources.MaxGeometryUniformComponents / 4;
+        default:
+            UNREACHABLE();
+            return -1;
+    }
+}
+
+namespace
+{
+class [[nodiscard]] TScopedSymbolTableLevel
+{
+  public:
+    TScopedSymbolTableLevel(TSymbolTable *table) : mTable(table)
+    {
+        ASSERT(mTable->isEmpty());
+        mTable->push();
+    }
+    ~TScopedSymbolTableLevel()
+    {
+        while (!mTable->isEmpty())
+        {
+            mTable->pop();
+        }
+    }
+
+  private:
+    TSymbolTable *mTable;
+};
+
+int GetMaxShaderVersionForSpec(ShShaderSpec spec)
+{
+    switch (spec)
+    {
+        case SH_GLES2_SPEC:
+        case SH_WEBGL_SPEC:
+            return 100;
+        case SH_GLES3_SPEC:
+        case SH_WEBGL2_SPEC:
+            return 300;
+        case SH_GLES3_1_SPEC:
+            return 310;
+        case SH_GLES3_2_SPEC:
+            return 320;
+        default:
+            UNREACHABLE();
+            return 0;
+    }
+}
+
+}  
+
+TShHandleBase::TShHandleBase()
+{
+    SetGlobalPoolAllocator(&allocator);
+}
+
+TShHandleBase::~TShHandleBase()
+{
+    SetGlobalPoolAllocator(nullptr);
+}
+
+TCompiler::TCompiler(sh::GLenum type, ShShaderSpec spec, ShShaderOutput output)
+    : mShaderType(type),
+      mShaderSpec(spec),
+      mOutputType(output),
+      mDiagnostics(mInfoSink.info),
+      mSourcePath(nullptr),
+      mVariablesCollected(false),
+      mGLPositionInitialized(false),
+      mComputeShaderLocalSizeDeclared(false),
+      mComputeShaderLocalSize(1),
+      mGeometryShaderMaxVertices(-1),
+      mGeometryShaderInvocations(0),
+      mGeometryShaderInputPrimitiveType(EptUndefined),
+      mGeometryShaderOutputPrimitiveType(EptUndefined),
+      mTessControlShaderOutputVertices(0),
+      mTessEvaluationShaderInputPrimitiveType(EtetUndefined),
+      mTessEvaluationShaderInputVertexSpacingType(EtetUndefined),
+      mTessEvaluationShaderInputOrderingType(EtetUndefined),
+      mTessEvaluationShaderInputPointType(EtetUndefined),
+      mHasAnyPreciseType(false),
+      mAdvancedBlendEquations(0),
+      mUsesDerivatives(false),
+      mCompileOptions{}
+{}
+
+TCompiler::~TCompiler() {}
+
+bool TCompiler::shouldRunLoopAndIndexingValidation(const ShCompileOptions &compileOptions) const
+{
+    return (IsWebGLBasedSpec(mShaderSpec) && mShaderVersion == 100) ||
+           compileOptions.validateLoopIndexing;
+}
+
+bool TCompiler::Init(const ShBuiltInResources &resources)
+{
+    SetGlobalPoolAllocator(&allocator);
+
+    if (!initBuiltInSymbolTable(resources))
+    {
+        return false;
+    }
+
+    mResources = resources;
+    setResourceString();
+
+    InitExtensionBehavior(resources, mExtensionBehavior);
+    return true;
+}
+
+TIntermBlock *TCompiler::compileTreeForTesting(angle::Span<const char *const> shaderStrings,
+                                               const ShCompileOptions &compileOptionsIn)
+{
+    ResetExtensionBehavior(mResources, mExtensionBehavior, compileOptionsIn);
+
+    const ShCompileOptions compileOptions = adjustOptions(compileOptionsIn);
+    return compileTreeImpl(shaderStrings, compileOptions);
+}
+
+TIntermBlock *TCompiler::compileTreeImpl(angle::Span<const char *const> shaderStrings,
+                                         const ShCompileOptions &compileOptions)
+{
+    mCompileOptions = compileOptions;
+
+    clearResults();
+
+    ASSERT(!shaderStrings.empty());
+    ASSERT(GetGlobalPoolAllocator());
+
+    size_t firstSource = 0;
+    if (compileOptions.sourcePath)
+    {
+        mSourcePath = shaderStrings[0];
+        ++firstSource;
+    }
+
+    TParseContext parseContext(mSymbolTable, mExtensionBehavior, mShaderType, mShaderSpec,
+                               compileOptions, &mDiagnostics, mResources, getOutputType());
+
+    TScopedSymbolTableLevel globalLevel(&mSymbolTable);
+    ASSERT(mSymbolTable.atGlobalLevel());
+
+    if (PaParseStrings(shaderStrings.subspan(firstSource), nullptr, &parseContext) != 0)
+    {
+        return nullptr;
+    }
+
+    if (!parseContext.postParseChecks())
+    {
+        return nullptr;
+    }
+
+    setShaderMetadata(parseContext);
+
+    if (!checkShaderVersion(&parseContext))
+    {
+        return nullptr;
+    }
+
+    TIntermBlock *root = parseContext.getTreeRoot();
+#if defined(ANGLE_IR)
+    if (compileOptions.useIR)
+    {
+        ASSERT(root == nullptr);
+        ir::IR ir = parseContext.getIR();
+
+        ir::Output output = ir::GenerateAST(std::move(ir), this, compileOptions);
+        root              = output.root;
+
+        if (mShaderType == GL_VERTEX_SHADER || mShaderType == GL_COMPUTE_SHADER)
+        {
+            mAttributes = std::move(output.inputs);
+        }
+        else
+        {
+            mInputVaryings = std::move(output.inputs);
+        }
+        if (mShaderType == GL_FRAGMENT_SHADER)
+        {
+            mOutputVariables = std::move(output.outputs);
+        }
+        else
+        {
+            mOutputVaryings = std::move(output.outputs);
+        }
+        mUniforms            = std::move(output.uniforms);
+        mSharedVariables     = std::move(output.shared);
+        mUniformBlocks       = std::move(output.uniformBlocks);
+        mShaderStorageBlocks = std::move(output.storageBlocks);
+        collectInterfaceBlocks();
+
+        mVariablesCollected = true;
+    }
+#endif
+    ASSERT(root != nullptr);
+    if (compileOptions.skipAllValidationAndTransforms)
+    {
+        if (!compileOptions.useIR)
+        {
+            collectVariables(root);
+        }
+    }
+    else
+    {
+        if (!checkAndSimplifyAST(root, parseContext, compileOptions))
+        {
+            return nullptr;
+        }
+    }
+
+    return root;
+}
+
+bool TCompiler::checkShaderVersion(TParseContext *parseContext)
+{
+    if (GetMaxShaderVersionForSpec(mShaderSpec) < mShaderVersion)
+    {
+        mDiagnostics.globalError("unsupported shader version");
+        return false;
+    }
+
+    ASSERT(parseContext);
+    switch (mShaderType)
+    {
+        case GL_COMPUTE_SHADER:
+            if (mShaderVersion < 310)
+            {
+                mDiagnostics.globalError("Compute shader is not supported in this shader version.");
+                return false;
+            }
+            break;
+
+        case GL_GEOMETRY_SHADER_EXT:
+            if (mShaderVersion < 310)
+            {
+                mDiagnostics.globalError(
+                    "Geometry shader is not supported in this shader version.");
+                return false;
+            }
+            else if (mShaderVersion == 310)
+            {
+                if (!parseContext->checkCanUseOneOfExtensions(
+                        sh::TSourceLoc(),
+                        std::array<TExtension, 2u>{
+                            {TExtension::EXT_geometry_shader, TExtension::OES_geometry_shader}}))
+                {
+                    return false;
+                }
+            }
+            break;
+
+        case GL_TESS_CONTROL_SHADER_EXT:
+        case GL_TESS_EVALUATION_SHADER_EXT:
+            if (mShaderVersion < 310)
+            {
+                mDiagnostics.globalError(
+                    "Tessellation shaders are not supported in this shader version.");
+                return false;
+            }
+            else if (mShaderVersion == 310)
+            {
+                if (!parseContext->checkCanUseOneOfExtensions(
+                        sh::TSourceLoc(),
+                        std::array<TExtension, 2u>{{TExtension::EXT_tessellation_shader,
+                                                    TExtension::OES_tessellation_shader}}))
+                {
+                    return false;
+                }
+            }
+            break;
+
+        default:
+            break;
+    }
+
+    return true;
+}
+
+void TCompiler::setShaderMetadata(const TParseContext &parseContext)
+{
+    mShaderVersion = parseContext.getShaderVersion();
+
+    mPragma = parseContext.pragma();
+    mSymbolTable.setGlobalInvariant(mPragma.stdgl.invariantAll);
+
+    mEarlyFragmentTestsSpecified = parseContext.isEarlyFragmentTestsSpecified();
+
+    mMetadataFlags[MetadataFlags::HasDiscard] = parseContext.hasDiscard();
+    mMetadataFlags[MetadataFlags::EnablesPerSampleShading] =
+        parseContext.isSampleQualifierSpecified();
+
+    mComputeShaderLocalSizeDeclared = parseContext.isComputeShaderLocalSizeDeclared();
+    mComputeShaderLocalSize         = parseContext.getComputeShaderLocalSize();
+
+    mNumViews = parseContext.getNumViews();
+
+    mHasAnyPreciseType = parseContext.hasAnyPreciseType();
+
+    mUsesDerivatives = parseContext.usesDerivatives();
+
+    if (mShaderType == GL_FRAGMENT_SHADER)
+    {
+        mAdvancedBlendEquations = parseContext.getAdvancedBlendEquations();
+        const std::map<int, ShPixelLocalStorageLayout> &plsLayouts =
+            parseContext.pixelLocalStorageLayouts();
+        mPixelLocalStorageLayouts.resize(plsLayouts.empty() ? 0 : plsLayouts.rbegin()->first + 1);
+        for (const auto &[binding, layout] : plsLayouts)
+        {
+            mPixelLocalStorageLayouts[binding] = layout;
+        }
+    }
+    if (mShaderType == GL_GEOMETRY_SHADER_EXT)
+    {
+        mGeometryShaderInputPrimitiveType  = parseContext.getGeometryShaderInputPrimitiveType();
+        mGeometryShaderOutputPrimitiveType = parseContext.getGeometryShaderOutputPrimitiveType();
+        mGeometryShaderMaxVertices         = parseContext.getGeometryShaderMaxVertices();
+        mGeometryShaderInvocations         = parseContext.getGeometryShaderInvocations();
+
+        mMetadataFlags[MetadataFlags::HasValidGeometryShaderInputPrimitiveType] =
+            mGeometryShaderInputPrimitiveType != EptUndefined;
+        mMetadataFlags[MetadataFlags::HasValidGeometryShaderOutputPrimitiveType] =
+            mGeometryShaderOutputPrimitiveType != EptUndefined;
+        mMetadataFlags[MetadataFlags::HasValidGeometryShaderMaxVertices] =
+            mGeometryShaderMaxVertices >= 0;
+    }
+    if (mShaderType == GL_TESS_CONTROL_SHADER_EXT)
+    {
+        mTessControlShaderOutputVertices = parseContext.getTessControlShaderOutputVertices();
+    }
+    if (mShaderType == GL_TESS_EVALUATION_SHADER_EXT)
+    {
+        mTessEvaluationShaderInputPrimitiveType =
+            parseContext.getTessEvaluationShaderInputPrimitiveType();
+        mTessEvaluationShaderInputVertexSpacingType =
+            parseContext.getTessEvaluationShaderInputVertexSpacingType();
+        mTessEvaluationShaderInputOrderingType =
+            parseContext.getTessEvaluationShaderInputOrderingType();
+        mTessEvaluationShaderInputPointType = parseContext.getTessEvaluationShaderInputPointType();
+
+        mMetadataFlags[MetadataFlags::HasValidTessGenMode] =
+            mTessEvaluationShaderInputPrimitiveType != EtetUndefined;
+        mMetadataFlags[MetadataFlags::HasValidTessGenSpacing] =
+            mTessEvaluationShaderInputVertexSpacingType != EtetUndefined;
+        mMetadataFlags[MetadataFlags::HasValidTessGenVertexOrder] =
+            mTessEvaluationShaderInputOrderingType != EtetUndefined;
+        mMetadataFlags[MetadataFlags::HasValidTessGenPointMode] =
+            mTessEvaluationShaderInputPointType != EtetUndefined;
+    }
+}
+
+unsigned int TCompiler::getSharedMemorySize() const
+{
+    unsigned int sharedMemSize = 0;
+    for (const sh::ShaderVariable &var : mSharedVariables)
+    {
+        sharedMemSize += var.getExternalSize();
+    }
+
+    return sharedMemSize;
+}
+
+bool TCompiler::getShaderBinary(const ShHandle compilerHandle,
+                                angle::Span<const char *const> shaderStrings,
+                                const ShCompileOptions &compileOptions,
+                                ShaderBinaryBlob *const binaryOut)
+{
+    if (!compile(shaderStrings, compileOptions))
+    {
+        return false;
+    }
+
+    gl::BinaryOutputStream stream;
+    gl::ShaderType shaderType = gl::FromGLenum<gl::ShaderType>(mShaderType);
+    gl::CompiledShaderState state(shaderType);
+    state.buildCompiledShaderState(compilerHandle, mOutputType);
+
+    stream.writeBytes(
+        ANGLE_UNSAFE_TODO(angle::Span(
+            reinterpret_cast<const unsigned char *>(angle::GetANGLEShaderProgramVersion()),
+            angle::GetANGLEShaderProgramVersionHashSize())));
+    stream.writeEnum(shaderType);
+    stream.writeEnum(mOutputType);
+
+    std::string sourceString;
+    size_t startingIndex = compileOptions.sourcePath ? 1 : 0;
+    for (const char *str : shaderStrings.subspan(startingIndex))
+    {
+        sourceString.append(str);
+    }
+    stream.writeString(sourceString);
+
+    stream.writeBytes(angle::byte_span_from_ref(compileOptions));
+    stream.writeBytes(angle::byte_span_from_ref(mResources));
+
+    state.serialize(stream);
+
+    *binaryOut = stream.takeData();
+    return true;
+}
+
+bool TCompiler::validateAST(TIntermNode *root)
+{
+    if (mCompileOptions.validateAST)
+    {
+        bool valid = ValidateAST(root, &mDiagnostics, mValidateASTOptions);
+
+#if defined(ANGLE_ENABLE_ASSERTS)
+        if (!valid)
+        {
+            OutputTree(root, mInfoSink.info);
+            fprintf(stderr, "AST validation error(s):\n%s\n", mInfoSink.info.c_str());
+        }
+#endif
+        ASSERT(valid);
+
+        return valid;
+    }
+    return true;
+}
+
+bool TCompiler::disableValidateFunctionCall()
+{
+    bool wasEnabled                          = mValidateASTOptions.validateFunctionCall;
+    mValidateASTOptions.validateFunctionCall = false;
+    return wasEnabled;
+}
+
+void TCompiler::restoreValidateFunctionCall(bool enable)
+{
+    ASSERT(!mValidateASTOptions.validateFunctionCall);
+    mValidateASTOptions.validateFunctionCall = enable;
+}
+
+bool TCompiler::disableValidateVariableReferences()
+{
+    bool wasEnabled                                = mValidateASTOptions.validateVariableReferences;
+    mValidateASTOptions.validateVariableReferences = false;
+    return wasEnabled;
+}
+
+void TCompiler::restoreValidateVariableReferences(bool enable)
+{
+    ASSERT(!mValidateASTOptions.validateVariableReferences);
+    mValidateASTOptions.validateVariableReferences = enable;
+}
+
+void TCompiler::enableValidateNoMoreTransformations()
+{
+    mValidateASTOptions.validateNoMoreTransformations = true;
+}
+
+bool TCompiler::checkAndSimplifyAST(TIntermBlock *root,
+                                    const TParseContext &parseContext,
+                                    const ShCompileOptions &compileOptions)
+{
+    mValidateASTOptions = {};
+
+    const bool useIR = compileOptions.useIR;
+
+    if (compileOptions.limitExpressionComplexity && !limitExpressionComplexity(root))
+    {
+        return false;
+    }
+
+    if (!useIR)
+    {
+        mValidateASTOptions.validateNoStatementsAfterBranch = false;
+        mValidateASTOptions.validateMultiDeclarations       = false;
+    }
+
+    if (!validateAST(root))
+    {
+        return false;
+    }
+
+    const bool hasAnyClipCullDistance =
+        parseContext.isExtensionEnabled(TExtension::ANGLE_clip_cull_distance) ||
+        parseContext.isExtensionEnabled(TExtension::EXT_clip_cull_distance) ||
+        parseContext.isExtensionEnabled(TExtension::APPLE_clip_distance);
+    if (hasAnyClipCullDistance)
+    {
+        mClipDistanceSize = static_cast<uint8_t>(parseContext.getClipDistanceArraySize());
+        mCullDistanceSize = static_cast<uint8_t>(parseContext.getCullDistanceArraySize());
+        mMetadataFlags[MetadataFlags::HasClipDistance] = parseContext.isClipDistanceUsed();
+    }
+
+    if (!useIR)
+    {
+        if (mShaderVersion >= 300 &&
+            (IsExtensionEnabled(mExtensionBehavior, TExtension::EXT_shader_framebuffer_fetch) ||
+             IsExtensionEnabled(mExtensionBehavior,
+                                TExtension::EXT_shader_framebuffer_fetch_non_coherent)))
+        {
+            if (!RemoveUnusedFramebufferFetch(this, root, &mSymbolTable))
+            {
+                return false;
+            }
+        }
+
+        if (!FoldExpressions(this, root, &mDiagnostics))
+        {
+            return false;
+        }
+        ASSERT(mDiagnostics.numErrors() == 0);
+
+        if (hasAnyClipCullDistance)
+        {
+            if (mClipDistanceSize > 0 && !parseContext.isClipDistanceRedeclared() &&
+                !SizeClipCullDistance(this, root, ImmutableString("gl_ClipDistance"),
+                                      mClipDistanceSize))
+            {
+
+                return false;
+            }
+            if (mCullDistanceSize > 0 && !parseContext.isCullDistanceRedeclared() &&
+                !SizeClipCullDistance(this, root, ImmutableString("gl_CullDistance"),
+                                      mCullDistanceSize))
+            {
+                return false;
+            }
+        }
+
+        if (!PruneNoOps(this, root, &mSymbolTable))
+        {
+            return false;
+        }
+        mValidateASTOptions.validateNoStatementsAfterBranch = true;
+    }
+
+    bool initializeLocalsAndGlobals    = compileOptions.initializeUninitializedLocals;
+    bool canUseLoopsToInitialize       = !compileOptions.dontUseLoopsToInitializeVariables;
+    bool enableNonConstantInitializers = IsExtensionEnabled(
+        mExtensionBehavior, TExtension::EXT_shader_non_constant_global_initializers);
+
+    if (!useIR)
+    {
+        if (enableNonConstantInitializers &&
+            !DeferGlobalInitializers(
+                this, root, initializeLocalsAndGlobals, canUseLoopsToInitialize,
+                compileOptions.forceDeferNonConstGlobalInitializers, &mSymbolTable))
+        {
+            return false;
+        }
+
+        initCallDag(root);
+
+        mFunctionMetadata.clear();
+        mFunctionMetadata.resize(mCallDag.size());
+        tagUsedFunctions();
+
+        if (!pruneUnusedFunctions(root))
+        {
+            return false;
+        }
+
+        if (IsSpecWithFunctionBodyNewScope(mShaderSpec, mShaderVersion))
+        {
+            if (!ReplaceShadowingVariables(this, root, &mSymbolTable))
+            {
+                return false;
+            }
+        }
+
+        if (hasPixelLocalStorageUniforms())
+        {
+            ASSERT(IsExtensionEnabled(mExtensionBehavior,
+                                      TExtension::ANGLE_shader_pixel_local_storage));
+            if (!RewritePixelLocalStorage(this, root, getSymbolTable(), compileOptions,
+                                          getShaderVersion()))
+            {
+                return false;
+            }
+        }
+
+        if (compileOptions.initializeBuiltinsForInstancedMultiview &&
+            (parseContext.isExtensionEnabled(TExtension::OVR_multiview2) ||
+             parseContext.isExtensionEnabled(TExtension::OVR_multiview)))
+        {
+            if (!DeclareAndInitBuiltinsForInstancedMultiview(this, root, std::max(mNumViews, 1),
+                                                             mShaderType, compileOptions,
+                                                             mOutputType, &mSymbolTable))
+            {
+                return false;
+            }
+        }
+
+        if (compileOptions.regenerateStructNames)
+        {
+            if (!RegenerateStructNames(this, root, &mSymbolTable))
+            {
+                return false;
+            }
+        }
+
+        if (compileOptions.emulateGLDrawID &&
+            IsExtensionEnabled(mExtensionBehavior, TExtension::ANGLE_multi_draw))
+        {
+            if (!EmulateGLDrawID(this, root, &mSymbolTable))
+            {
+                return false;
+            }
+        }
+
+        if (compileOptions.emulateGLBaseVertexBaseInstance &&
+            IsExtensionEnabled(mExtensionBehavior,
+                               TExtension::ANGLE_base_vertex_base_instance_shader_builtin))
+        {
+            if (!EmulateGLBaseVertexBaseInstance(this, root, &mSymbolTable,
+                                                 compileOptions.addBaseVertexToVertexID))
+            {
+                return false;
+            }
+        }
+
+        if (mShaderType == GL_FRAGMENT_SHADER && mShaderVersion == 100 &&
+            mResources.EXT_draw_buffers && mResources.MaxDrawBuffers > 1 &&
+            IsExtensionEnabled(mExtensionBehavior, TExtension::EXT_draw_buffers))
+        {
+            if (!EmulateGLFragColorBroadcast(this, root, mResources.MaxDrawBuffers,
+                                             mResources.MaxDualSourceDrawBuffers, &mSymbolTable,
+                                             mShaderVersion))
+            {
+                return false;
+            }
+        }
+
+        if (!sortUniforms(root))
+        {
+            return false;
+        }
+
+        if (compileOptions.simplifyLoopConditions)
+        {
+            if (!SimplifyLoopConditions(this, root, &getSymbolTable()))
+            {
+                return false;
+            }
+        }
+        else
+        {
+            if (!SimplifyLoopConditions(this, root,
+                                        IntermNodePatternMatcher::kMultiDeclaration |
+                                            IntermNodePatternMatcher::kArrayLengthMethod,
+                                        &getSymbolTable()))
+            {
+                return false;
+            }
+        }
+
+        if (!SeparateDeclarations(*this, *root, mCompileOptions.separateCompoundStructDeclarations))
+        {
+            return false;
+        }
+        mValidateASTOptions.validateMultiDeclarations = true;
+
+        if (!SplitSequenceOperator(this, root, IntermNodePatternMatcher::kArrayLengthMethod,
+                                   &getSymbolTable()))
+        {
+            return false;
+        }
+
+        if (!RemoveArrayLengthMethod(this, root))
+        {
+            return false;
+        }
+        if (!FoldExpressions(this, root, &mDiagnostics))
+        {
+            return false;
+        }
+
+        if (!RemoveUnreferencedVariables(this, root, &mSymbolTable))
+        {
+            return false;
+        }
+
+        if (!PruneEmptyCases(this, root))
+        {
+            return false;
+        }
+
+        collectVariables(root);
+
+        if (compileOptions.useUnusedStandardSharedBlocks)
+        {
+            if (!useAllMembersInUnusedStandardAndSharedBlocks(root))
+            {
+                return false;
+            }
+        }
+
+        if (compileOptions.enforcePackingRestrictions)
+        {
+            int maxUniformVectors = GetMaxUniformVectorsForShaderType(mShaderType, mResources);
+            if (mShaderType == GL_VERTEX_SHADER && compileOptions.emulateClipOrigin)
+            {
+                --maxUniformVectors;
+            }
+            if (!CheckVariablesInPackingLimits(maxUniformVectors, mUniforms))
+            {
+                mDiagnostics.globalError("too many uniforms");
+                return false;
+            }
+        }
+
+        if (compileOptions.scalarizeVecAndMatConstructorArgs)
+        {
+            if (!ScalarizeVecAndMatConstructorArgs(this, root, &mSymbolTable))
+            {
+                return false;
+            }
+        }
+
+        if (compileOptions.clampIndirectArrayBounds)
+        {
+            if (!ClampIndirectIndices(this, root, &mSymbolTable))
+            {
+                return false;
+            }
+        }
+
+        if (compileOptions.removeInactiveVariables)
+        {
+            if (!RemoveInactiveInterfaceVariables(this, root, &getSymbolTable(), getAttributes(),
+                                                  getInputVaryings(), getOutputVariables(),
+                                                  getUniforms(), getInterfaceBlocks(),
+                                                  !compileOptions.retainInactiveFragmentOutputs))
+            {
+                return false;
+            }
+        }
+
+        if (compileOptions.initOutputVariables)
+        {
+            if (!initializeOutputVariables(root))
+            {
+                return false;
+            }
+        }
+    }
+
+    if (RemoveInvariant(mShaderType, mShaderVersion, mOutputType, compileOptions))
+    {
+        if (!RemoveInvariantDeclaration(this, root))
+        {
+            return false;
+        }
+    }
+
+    if (!useIR)
+    {
+        if (!mGLPositionInitialized && compileOptions.initGLPosition)
+        {
+            if (!initializeGLPosition(root))
+            {
+                return false;
+            }
+            mGLPositionInitialized = true;
+        }
+
+        if (mShaderType == GL_VERTEX_SHADER && compileOptions.initGLPointSize)
+        {
+            InitVariableList list;
+            AddBuiltInToInitList(&mSymbolTable, mShaderVersion, root, "gl_PointSize", &list);
+
+            if (!list.empty() &&
+                !InitializeVariables(this, root, list, &mSymbolTable, mShaderVersion,
+                                     mExtensionBehavior, false))
+            {
+                return false;
+            }
+        }
+
+        if (!enableNonConstantInitializers &&
+            !DeferGlobalInitializers(
+                this, root, initializeLocalsAndGlobals, canUseLoopsToInitialize,
+                compileOptions.forceDeferNonConstGlobalInitializers, &mSymbolTable))
+        {
+            return false;
+        }
+    }
+
+    if (initializeLocalsAndGlobals)
+    {
+
+        if (!shouldRunLoopAndIndexingValidation(compileOptions))
+        {
+            if (!SimplifyLoopConditions(this, root,
+                                        IntermNodePatternMatcher::kArrayDeclaration |
+                                            IntermNodePatternMatcher::kNamelessStructDeclaration,
+                                        &getSymbolTable()))
+            {
+                return false;
+            }
+        }
+
+        if (!useIR)
+        {
+            if (!InitializeUninitializedLocals(this, root, getShaderVersion(),
+                                               canUseLoopsToInitialize, &getSymbolTable()))
+            {
+                return false;
+            }
+        }
+    }
+
+    if (!useIR)
+    {
+        if (compileOptions.clampPointSize)
+        {
+            if (!ClampPointSize(this, root, mResources.MinPointSize, mResources.MaxPointSize,
+                                &getSymbolTable()))
+            {
+                return false;
+            }
+        }
+
+        if (compileOptions.clampFragDepth)
+        {
+            if (!ClampFragDepth(this, root, &getSymbolTable()))
+            {
+                return false;
+            }
+        }
+
+        if (compileOptions.rewriteRepeatedAssignToSwizzled)
+        {
+            if (!sh::RewriteRepeatedAssignToSwizzled(this, root))
+            {
+                return false;
+            }
+        }
+    }
+
+    if (compileOptions.removeDynamicIndexingOfSwizzledVector)
+    {
+        if (!sh::RemoveDynamicIndexingOfSwizzledVector(this, root, &getSymbolTable(), nullptr))
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+ShCompileOptions TCompiler::adjustOptions(const ShCompileOptions &compileOptionsIn)
+{
+    ShCompileOptions compileOptions = compileOptionsIn;
+
+    if (shouldFlattenPragmaStdglInvariantAll())
+    {
+        compileOptions.flattenPragmaSTDGLInvariantAll = true;
+    }
+
+    if (mShaderType == GL_COMPUTE_SHADER)
+    {
+        compileOptions.initOutputVariables                     = false;
+        compileOptions.initializeBuiltinsForInstancedMultiview = false;
+    }
+    if (mShaderType != GL_VERTEX_SHADER)
+    {
+        compileOptions.initGLPosition                  = false;
+        compileOptions.emulateGLDrawID                 = false;
+        compileOptions.emulateGLBaseVertexBaseInstance = false;
+        compileOptions.clampPointSize = false;
+    }
+    if (mShaderType != GL_FRAGMENT_SHADER)
+    {
+        compileOptions.clampFragDepth = false;
+        compileOptions.retainInactiveFragmentOutputs = false;
+    }
+
+#if !defined(ANGLE_IR)
+    compileOptions.useIR = false;
+#endif
+
+    return compileOptions;
+}
+
+bool TCompiler::compile(angle::Span<const char *const> shaderStrings,
+                        const ShCompileOptions &compileOptionsIn)
+{
+    if (shaderStrings.empty())
+    {
+        return true;
+    }
+
+    ResetExtensionBehavior(mResources, mExtensionBehavior, compileOptionsIn);
+
+    const ShCompileOptions compileOptions = adjustOptions(compileOptionsIn);
+
+    TScopedPoolAllocator scopedAlloc;
+    TIntermBlock *root = compileTreeImpl(shaderStrings, compileOptions);
+
+    if (root)
+    {
+        if (compileOptions.intermediateTree)
+        {
+            OutputTree(root, mInfoSink.info);
+        }
+
+        if (compileOptions.objectCode && !compileOptions.skipAllValidationAndTransforms)
+        {
+            PerformanceDiagnostics perfDiagnostics(&mDiagnostics);
+            if (!translate(root, compileOptions, &perfDiagnostics))
+            {
+                return false;
+            }
+        }
+
+        bool lookForDrawID = IsExtensionEnabled(mExtensionBehavior, TExtension::ANGLE_multi_draw) &&
+                             compileOptions.emulateGLDrawID;
+        bool lookForBaseVertexBaseInstance =
+            IsExtensionEnabled(mExtensionBehavior,
+                               TExtension::ANGLE_base_vertex_base_instance_shader_builtin) &&
+            compileOptions.emulateGLBaseVertexBaseInstance;
+
+        if (lookForDrawID || lookForBaseVertexBaseInstance)
+        {
+            ASSERT(mShaderType == GL_VERTEX_SHADER);
+            for (auto &uniform : mUniforms)
+            {
+                if (lookForDrawID && uniform.name == "angle_DrawID" &&
+                    uniform.mappedName == "angle_DrawID")
+                {
+                    uniform.name = "gl_DrawID";
+                }
+                else if (lookForBaseVertexBaseInstance && uniform.name == "angle_BaseVertex" &&
+                         uniform.mappedName == "angle_BaseVertex")
+                {
+                    uniform.name = "gl_BaseVertex";
+                }
+                else if (lookForBaseVertexBaseInstance && uniform.name == "angle_BaseInstance" &&
+                         uniform.mappedName == "angle_BaseInstance")
+                {
+                    uniform.name = "gl_BaseInstance";
+                }
+            }
+        }
+
+        return true;
+    }
+    return false;
+}
+
+bool TCompiler::initBuiltInSymbolTable(const ShBuiltInResources &resources)
+{
+    if (resources.MaxDrawBuffers < 1)
+    {
+        return false;
+    }
+    if (resources.EXT_blend_func_extended && resources.MaxDualSourceDrawBuffers < 1)
+    {
+        return false;
+    }
+
+    mSymbolTable.initializeBuiltIns(mShaderType, mShaderSpec, resources);
+
+    return true;
+}
+
+void TCompiler::setResourceString()
+{
+    std::ostringstream strstream = sh::InitializeStream<std::ostringstream>();
+
+    // clang-format off
+    strstream << ":MaxVertexAttribs:" << mResources.MaxVertexAttribs
+        << ":MaxVertexUniformVectors:" << mResources.MaxVertexUniformVectors
+        << ":MaxVaryingVectors:" << mResources.MaxVaryingVectors
+        << ":MaxVertexTextureImageUnits:" << mResources.MaxVertexTextureImageUnits
+        << ":MaxCombinedTextureImageUnits:" << mResources.MaxCombinedTextureImageUnits
+        << ":MaxTextureImageUnits:" << mResources.MaxTextureImageUnits
+        << ":MaxFragmentUniformVectors:" << mResources.MaxFragmentUniformVectors
+        << ":MaxDrawBuffers:" << mResources.MaxDrawBuffers
+        << ":ShadingRateFlag2VerticalPixelsEXT:" << mResources.ShadingRateFlag2VerticalPixelsEXT
+        << ":ShadingRateFlag2VerticalPixelsEXT:" << mResources.ShadingRateFlag2VerticalPixelsEXT
+        << ":ShadingRateFlag2HorizontalPixelsEXT:" << mResources.ShadingRateFlag2HorizontalPixelsEXT
+        << ":ShadingRateFlag4HorizontalPixelsEXT:" << mResources.ShadingRateFlag4HorizontalPixelsEXT
+        << ":OES_standard_derivatives:" << mResources.OES_standard_derivatives
+        << ":OES_EGL_image_external:" << mResources.OES_EGL_image_external
+        << ":OES_EGL_image_external_essl3:" << mResources.OES_EGL_image_external_essl3
+        << ":NV_EGL_stream_consumer_external:" << mResources.NV_EGL_stream_consumer_external
+        << ":ARB_texture_rectangle:" << mResources.ARB_texture_rectangle
+        << ":EXT_draw_buffers:" << mResources.EXT_draw_buffers
+        << ":MaxExpressionComplexity:" << mResources.MaxExpressionComplexity
+        << ":MaxStatementDepth:" << mResources.MaxStatementDepth
+        << ":MaxCallStackDepth:" << mResources.MaxCallStackDepth
+        << ":MaxFunctionParameters:" << mResources.MaxFunctionParameters
+        << ":EXT_blend_func_extended:" << mResources.EXT_blend_func_extended
+        << ":EXT_conservative_depth:" << mResources.EXT_conservative_depth
+        << ":EXT_frag_depth:" << mResources.EXT_frag_depth
+        << ":EXT_primitive_bounding_box:" << mResources.EXT_primitive_bounding_box
+        << ":OES_primitive_bounding_box:" << mResources.OES_primitive_bounding_box
+        << ":EXT_separate_shader_objects:" << mResources.EXT_separate_shader_objects
+        << ":EXT_shader_texture_lod:" << mResources.EXT_shader_texture_lod
+        << ":EXT_shader_framebuffer_fetch:" << mResources.EXT_shader_framebuffer_fetch
+        << ":EXT_shader_framebuffer_fetch_non_coherent:" << mResources.EXT_shader_framebuffer_fetch_non_coherent
+        << ":ARM_shader_framebuffer_fetch:" << mResources.ARM_shader_framebuffer_fetch
+        << ":ARM_shader_framebuffer_fetch_depth_stencil:" << mResources.ARM_shader_framebuffer_fetch_depth_stencil
+        << ":OVR_multiview2:" << mResources.OVR_multiview2
+        << ":OVR_multiview:" << mResources.OVR_multiview
+        << ":EXT_YUV_target:" << mResources.EXT_YUV_target
+        << ":EXT_geometry_shader:" << mResources.EXT_geometry_shader
+        << ":OES_geometry_shader:" << mResources.OES_geometry_shader
+        << ":OES_shader_io_blocks:" << mResources.OES_shader_io_blocks
+        << ":EXT_shader_io_blocks:" << mResources.EXT_shader_io_blocks
+        << ":EXT_gpu_shader5:" << mResources.EXT_gpu_shader5
+        << ":OES_texture_3D:" << mResources.OES_texture_3D
+        << ":MaxVertexOutputVectors:" << mResources.MaxVertexOutputVectors
+        << ":MaxFragmentInputVectors:" << mResources.MaxFragmentInputVectors
+        << ":MinProgramTexelOffset:" << mResources.MinProgramTexelOffset
+        << ":MaxProgramTexelOffset:" << mResources.MaxProgramTexelOffset
+        << ":MaxFragmentUniformBlocks:" << mResources.MaxFragmentUniformBlocks
+        << ":MaxVertexUniformBlocks:" << mResources.MaxVertexUniformBlocks
+        << ":MaxDualSourceDrawBuffers:" << mResources.MaxDualSourceDrawBuffers
+        << ":MaxViewsOVR:" << mResources.MaxViewsOVR
+        << ":NV_draw_buffers:" << mResources.NV_draw_buffers
+        << ":ANGLE_multi_draw:" << mResources.ANGLE_multi_draw
+        << ":ANGLE_base_vertex_base_instance_shader_builtin:" << mResources.ANGLE_base_vertex_base_instance_shader_builtin
+        << ":APPLE_clip_distance:" << mResources.APPLE_clip_distance
+        << ":OES_texture_cube_map_array:" << mResources.OES_texture_cube_map_array
+        << ":EXT_texture_cube_map_array:" << mResources.EXT_texture_cube_map_array
+        << ":EXT_texture_query_lod:" << mResources.EXT_texture_query_lod
+        << ":EXT_texture_shadow_lod:" << mResources.EXT_texture_shadow_lod
+        << ":EXT_shadow_samplers:" << mResources.EXT_shadow_samplers
+        << ":OES_shader_multisample_interpolation:" << mResources.OES_shader_multisample_interpolation
+        << ":OES_shader_image_atomic:" << mResources.OES_shader_image_atomic
+        << ":EXT_tessellation_shader:" << mResources.EXT_tessellation_shader
+        << ":OES_tessellation_shader:" << mResources.OES_tessellation_shader
+        << ":OES_texture_buffer:" << mResources.OES_texture_buffer
+        << ":EXT_texture_buffer:" << mResources.EXT_texture_buffer
+        << ":EXT_fragment_shading_rate:" << mResources.EXT_fragment_shading_rate
+        << ":EXT_fragment_shading_rate_primitive:" << mResources.EXT_fragment_shading_rate_primitive
+        << ":OES_sample_variables:" << mResources.OES_sample_variables
+        << ":EXT_clip_cull_distance:" << mResources.EXT_clip_cull_distance
+        << ":ANGLE_clip_cull_distance:" << mResources.ANGLE_clip_cull_distance
+        << ":MinProgramTextureGatherOffset:" << mResources.MinProgramTextureGatherOffset
+        << ":MaxProgramTextureGatherOffset:" << mResources.MaxProgramTextureGatherOffset
+        << ":MaxImageUnits:" << mResources.MaxImageUnits
+        << ":MaxSamples:" << mResources.MaxSamples
+        << ":MaxVertexImageUniforms:" << mResources.MaxVertexImageUniforms
+        << ":MaxFragmentImageUniforms:" << mResources.MaxFragmentImageUniforms
+        << ":MaxComputeImageUniforms:" << mResources.MaxComputeImageUniforms
+        << ":MaxCombinedImageUniforms:" << mResources.MaxCombinedImageUniforms
+        << ":MaxVariableSizeInBytes:" << mResources.MaxVariableSizeInBytes
+        << ":MaxPrivateVariableSizeInBytes:" << mResources.MaxPrivateVariableSizeInBytes
+        << ":MaxTotalPrivateVariableSizeInBytes:" << mResources.MaxTotalPrivateVariableSizeInBytes
+        << ":MaxCombinedShaderOutputResources:" << mResources.MaxCombinedShaderOutputResources
+        << ":MaxComputeWorkGroupCountX:" << mResources.MaxComputeWorkGroupCount[0]
+        << ":MaxComputeWorkGroupCountY:" << mResources.MaxComputeWorkGroupCount[1]
+        << ":MaxComputeWorkGroupCountZ:" << mResources.MaxComputeWorkGroupCount[2]
+        << ":MaxComputeWorkGroupSizeX:" << mResources.MaxComputeWorkGroupSize[0]
+        << ":MaxComputeWorkGroupSizeY:" << mResources.MaxComputeWorkGroupSize[1]
+        << ":MaxComputeWorkGroupSizeZ:" << mResources.MaxComputeWorkGroupSize[2]
+        << ":MaxComputeUniformComponents:" << mResources.MaxComputeUniformComponents
+        << ":MaxComputeTextureImageUnits:" << mResources.MaxComputeTextureImageUnits
+        << ":MaxComputeAtomicCounters:" << mResources.MaxComputeAtomicCounters
+        << ":MaxComputeAtomicCounterBuffers:" << mResources.MaxComputeAtomicCounterBuffers
+        << ":MaxVertexAtomicCounters:" << mResources.MaxVertexAtomicCounters
+        << ":MaxFragmentAtomicCounters:" << mResources.MaxFragmentAtomicCounters
+        << ":MaxCombinedAtomicCounters:" << mResources.MaxCombinedAtomicCounters
+        << ":MaxAtomicCounterBindings:" << mResources.MaxAtomicCounterBindings
+        << ":MaxVertexAtomicCounterBuffers:" << mResources.MaxVertexAtomicCounterBuffers
+        << ":MaxFragmentAtomicCounterBuffers:" << mResources.MaxFragmentAtomicCounterBuffers
+        << ":MaxCombinedAtomicCounterBuffers:" << mResources.MaxCombinedAtomicCounterBuffers
+        << ":MaxAtomicCounterBufferSize:" << mResources.MaxAtomicCounterBufferSize
+        << ":MaxComputeUnformBlocks:" << mResources.MaxComputeUniformBlocks
+        << ":MaxGeometryUniformComponents:" << mResources.MaxGeometryUniformComponents
+        << ":MaxGeometryInputComponents:" << mResources.MaxGeometryInputComponents
+        << ":MaxGeometryOutputComponents:" << mResources.MaxGeometryOutputComponents
+        << ":MaxGeometryOutputVertices:" << mResources.MaxGeometryOutputVertices
+        << ":MaxGeometryTotalOutputComponents:" << mResources.MaxGeometryTotalOutputComponents
+        << ":MaxGeometryTextureImageUnits:" << mResources.MaxGeometryTextureImageUnits
+        << ":MaxGeometryAtomicCounterBuffers:" << mResources.MaxGeometryAtomicCounterBuffers
+        << ":MaxGeometryAtomicCounters:" << mResources.MaxGeometryAtomicCounters
+        << ":MaxGeometryShaderInvocations:" << mResources.MaxGeometryShaderInvocations
+        << ":MaxGeometryImageUniforms:" << mResources.MaxGeometryImageUniforms
+        << ":MaxGeometryUniformBlocks:" << mResources.MaxGeometryUniformBlocks
+        << ":MaxClipDistances" << mResources.MaxClipDistances
+        << ":MaxCullDistances" << mResources.MaxCullDistances
+        << ":MaxCombinedClipAndCullDistances" << mResources.MaxCombinedClipAndCullDistances
+        << ":MaxTessControlInputComponents:" << mResources.MaxTessControlInputComponents
+        << ":MaxTessControlOutputComponents:" << mResources.MaxTessControlOutputComponents
+        << ":MaxTessControlTextureImageUnits:" << mResources.MaxTessControlTextureImageUnits
+        << ":MaxTessControlUniformComponents:" << mResources.MaxTessControlUniformComponents
+        << ":MaxTessControlTotalOutputComponents:" << mResources.MaxTessControlTotalOutputComponents
+        << ":MaxTessControlImageUniforms:" << mResources.MaxTessControlImageUniforms
+        << ":MaxTessControlAtomicCounters:" << mResources.MaxTessControlAtomicCounters
+        << ":MaxTessControlAtomicCounterBuffers:" << mResources.MaxTessControlAtomicCounterBuffers
+        << ":MaxTessControlUniformBlocks:" << mResources.MaxTessControlUniformBlocks
+        << ":MaxTessPatchComponents:" << mResources.MaxTessPatchComponents
+        << ":MaxPatchVertices:" << mResources.MaxPatchVertices
+        << ":MaxTessGenLevel:" << mResources.MaxTessGenLevel
+        << ":MaxTessEvaluationInputComponents:" << mResources.MaxTessEvaluationInputComponents
+        << ":MaxTessEvaluationOutputComponents:" << mResources.MaxTessEvaluationOutputComponents
+        << ":MaxTessEvaluationTextureImageUnits:" << mResources.MaxTessEvaluationTextureImageUnits
+        << ":MaxTessEvaluationUniformComponents:" << mResources.MaxTessEvaluationUniformComponents
+        << ":MaxTessEvaluationImageUniforms:" << mResources.MaxTessEvaluationImageUniforms
+        << ":MaxTessEvaluationAtomicCounters:" << mResources.MaxTessEvaluationAtomicCounters
+        << ":MaxTessEvaluationAtomicCounterBuffers:" << mResources.MaxTessEvaluationAtomicCounterBuffers
+        << ":MaxTessControlUniformBlocks:" << mResources.MaxTessControlUniformBlocks
+    ;
+    // clang-format on
+
+    mBuiltInResourcesString = strstream.str();
+}
+
+void TCompiler::collectVariables(TIntermBlock *root)
+{
+    ASSERT(!mCompileOptions.useIR);
+    ASSERT(!mVariablesCollected);
+    CollectVariables(root, &mAttributes, &mOutputVariables, &mUniforms, &mInputVaryings,
+                     &mOutputVaryings, &mSharedVariables, &mUniformBlocks, &mShaderStorageBlocks,
+                     mResources.UserVariableNamePrefix, mResources.HashFunction, &mSymbolTable,
+                     mShaderType, mExtensionBehavior,
+                     mCompileOptions.transformFloatUniformTo16Bits);
+    collectInterfaceBlocks();
+    mVariablesCollected = true;
+}
+
+void TCompiler::collectInterfaceBlocks()
+{
+    ASSERT(mInterfaceBlocks.empty());
+    mInterfaceBlocks.reserve(mUniformBlocks.size() + mShaderStorageBlocks.size());
+    mInterfaceBlocks.insert(mInterfaceBlocks.end(), mUniformBlocks.begin(), mUniformBlocks.end());
+    mInterfaceBlocks.insert(mInterfaceBlocks.end(), mShaderStorageBlocks.begin(),
+                            mShaderStorageBlocks.end());
+}
+
+void TCompiler::clearResults()
+{
+    mInfoSink.info.erase();
+    mInfoSink.obj.erase();
+    mInfoSink.debug.erase();
+    mDiagnostics.resetErrorCount();
+
+    mMetadataFlags.reset();
+    mSpecConstUsageBits.reset();
+
+    mAttributes.clear();
+    mOutputVariables.clear();
+    mUniforms.clear();
+    mInputVaryings.clear();
+    mOutputVaryings.clear();
+    mSharedVariables.clear();
+    mInterfaceBlocks.clear();
+    mUniformBlocks.clear();
+    mShaderStorageBlocks.clear();
+    mVariablesCollected    = false;
+    mGLPositionInitialized = false;
+
+    mNumViews = -1;
+
+    mClipDistanceSize = 0;
+    mCullDistanceSize = 0;
+
+    mGeometryShaderInputPrimitiveType  = EptUndefined;
+    mGeometryShaderOutputPrimitiveType = EptUndefined;
+    mGeometryShaderInvocations         = 0;
+    mGeometryShaderMaxVertices         = -1;
+
+    mTessControlShaderOutputVertices            = 0;
+    mTessEvaluationShaderInputPrimitiveType     = EtetUndefined;
+    mTessEvaluationShaderInputVertexSpacingType = EtetUndefined;
+    mTessEvaluationShaderInputOrderingType      = EtetUndefined;
+    mTessEvaluationShaderInputPointType         = EtetUndefined;
+
+    mNameMap.clear();
+
+    mSourcePath = nullptr;
+
+    mSymbolTable.clearCompilationResults();
+}
+
+void TCompiler::initCallDag(TIntermNode *root)
+{
+    mCallDag.clear();
+    mCallDag.init(root);
+}
+
+void TCompiler::tagUsedFunctions()
+{
+    for (size_t i = mCallDag.size(); i-- > 0;)
+    {
+        if (mCallDag.getRecordFromIndex(i).node->getFunction()->isMain())
+        {
+            internalTagUsedFunction(i);
+            break;
+        }
+    }
+}
+
+void TCompiler::internalTagUsedFunction(size_t index)
+{
+    if (mFunctionMetadata[index].used)
+    {
+        return;
+    }
+
+    mFunctionMetadata[index].used = true;
+
+    for (int calleeIndex : mCallDag.getRecordFromIndex(index).callees)
+    {
+        internalTagUsedFunction(calleeIndex);
+    }
+}
+
+bool TCompiler::sortUniforms(TIntermBlock *root)
+{
+    TIntermSequence structTypeDeclarationSequence;
+    TIntermSequence uniformDeclarationSequence;
+    TIntermSequence remainingSequence;
+
+    TIntermSequence *sequence = root->getSequence();
+    size_t nodeIndex          = 0;
+    while (nodeIndex < sequence->size())
+    {
+        TIntermNode *node = sequence->at(nodeIndex);
+        if (IsCurrentNodeStructTypeDeclaration(node))
+        {
+            structTypeDeclarationSequence.push_back(node);
+        }
+        else if (IsCurrentNodeUniformDeclaration(node))
+        {
+            uniformDeclarationSequence.push_back(node);
+        }
+        else
+        {
+            remainingSequence.push_back(node);
+        }
+        ++nodeIndex;
+    }
+
+    std::stable_sort(uniformDeclarationSequence.begin(), uniformDeclarationSequence.end(),
+                     UniformSortComparator());
+
+    TIntermSequence reorderedSequence;
+    reorderedSequence.reserve(structTypeDeclarationSequence.size() +
+                              uniformDeclarationSequence.size() + remainingSequence.size());
+    std::move(structTypeDeclarationSequence.begin(), structTypeDeclarationSequence.end(),
+              std::back_inserter(reorderedSequence));
+    std::move(uniformDeclarationSequence.begin(), uniformDeclarationSequence.end(),
+              std::back_inserter(reorderedSequence));
+    std::move(remainingSequence.begin(), remainingSequence.end(),
+              std::back_inserter(reorderedSequence));
+
+    root->replaceAllChildren(std::move(reorderedSequence));
+    return validateAST(root);
+}
+
+bool TCompiler::pruneUnusedFunctions(TIntermBlock *root)
+{
+    TIntermSequence *sequence = root->getSequence();
+
+    size_t writeIndex = 0;
+    for (size_t readIndex = 0; readIndex < sequence->size(); ++readIndex)
+    {
+        TIntermNode *node = sequence->at(readIndex);
+
+        const TFunction *function = nullptr;
+        const bool shouldPrune =
+            IsTopLevelNodeUnusedFunction(mCallDag, mFunctionMetadata, node, &function);
+        if (!shouldPrune)
+        {
+            (*sequence)[writeIndex++] = node;
+            continue;
+        }
+
+        ASSERT(function != nullptr);
+        const TType &returnType = function->getReturnType();
+        if (!returnType.isStructSpecifier())
+        {
+            continue;
+        }
+
+        TVariable *structVariable =
+            new TVariable(&mSymbolTable, kEmptyImmutableString, &returnType, SymbolType::Empty);
+        TIntermSymbol *structSymbol           = new TIntermSymbol(structVariable);
+        TIntermDeclaration *structDeclaration = new TIntermDeclaration;
+        structDeclaration->appendDeclarator(structSymbol);
+
+        structSymbol->setLine(node->getLine());
+        structDeclaration->setLine(node->getLine());
+
+        (*sequence)[writeIndex++] = structDeclaration;
+    }
+
+    sequence->resize(writeIndex);
+
+    return validateAST(root);
+}
+
+bool TCompiler::limitExpressionComplexity(TIntermBlock *root)
+{
+    if (!IsASTDepthBelowLimit(root, mResources.MaxExpressionComplexity))
+    {
+        mDiagnostics.globalError("Expression too complex.");
+        return false;
+    }
+
+    return true;
+}
+
+bool TCompiler::initializeGLPosition(TIntermBlock *root)
+{
+    InitVariableList list;
+    AddBuiltInToInitList(&mSymbolTable, mShaderVersion, root, "gl_Position", &list);
+
+    if (!list.empty())
+    {
+        return InitializeVariables(this, root, list, &mSymbolTable, mShaderVersion,
+                                   mExtensionBehavior, false);
+    }
+
+    return true;
+}
+
+bool TCompiler::useAllMembersInUnusedStandardAndSharedBlocks(TIntermBlock *root)
+{
+    sh::InterfaceBlockList list;
+
+    for (const sh::InterfaceBlock &block : mUniformBlocks)
+    {
+        if (!block.staticUse &&
+            (block.layout == sh::BLOCKLAYOUT_STD140 || block.layout == sh::BLOCKLAYOUT_SHARED))
+        {
+            list.push_back(block);
+        }
+    }
+
+    return sh::UseInterfaceBlockFields(this, root, list, mSymbolTable);
+}
+
+bool TCompiler::initializeOutputVariables(TIntermBlock *root)
+{
+    {
+        const TIntermSequence *original = root->getSequence();
+        TIntermSequence reordered;
+        TIntermNode *main = nullptr;
+
+        for (TIntermNode *node : *original)
+        {
+            TIntermFunctionDefinition *function = node->getAsFunctionDefinition();
+            if (function != nullptr && function->getFunction()->isMain())
+            {
+                ASSERT(main == nullptr);
+                main = node;
+            }
+            else
+            {
+                reordered.push_back(node);
+            }
+        }
+        ASSERT(main != nullptr);
+        reordered.push_back(main);
+
+        root->replaceAllChildren(std::move(reordered));
+    }
+
+    InitVariableList list;
+
+    for (TIntermNode *node : *root->getSequence())
+    {
+        TIntermDeclaration *asDecl = node->getAsDeclarationNode();
+        if (asDecl == nullptr)
+        {
+            continue;
+        }
+
+        TIntermSymbol *symbol = asDecl->getSequence()->front()->getAsSymbolNode();
+        if (symbol == nullptr)
+        {
+            TIntermBinary *initNode = asDecl->getSequence()->front()->getAsBinaryNode();
+            ASSERT(initNode->getOp() == EOpInitialize);
+            symbol = initNode->getLeft()->getAsSymbolNode();
+        }
+        ASSERT(symbol);
+
+        const TQualifier qualifier = symbol->getType().getQualifier();
+        if (qualifier != EvqFragmentInOut && IsShaderOut(symbol->getType().getQualifier()))
+        {
+            list.push_back(&symbol->variable());
+        }
+    }
+
+    const std::vector<ShaderVariable> &outputVariables =
+        mShaderType == GL_FRAGMENT_SHADER ? mOutputVariables : mOutputVaryings;
+
+    for (const ShaderVariable &var : outputVariables)
+    {
+        if (var.isFragmentInOut || !var.isBuiltIn())
+        {
+            continue;
+        }
+
+        AddBuiltInToInitList(&mSymbolTable, mShaderVersion, root, var.name.c_str(), &list);
+        if (var.name == "gl_Position")
+        {
+            ASSERT(!mGLPositionInitialized);
+            mGLPositionInitialized = true;
+        }
+    }
+
+    return InitializeVariables(this, root, list, &mSymbolTable, mShaderVersion, mExtensionBehavior,
+                               false);
+}
+
+const TExtensionBehavior &TCompiler::getExtensionBehavior() const
+{
+    return mExtensionBehavior;
+}
+
+const char *TCompiler::getSourcePath() const
+{
+    return mSourcePath;
+}
+
+const ShBuiltInResources &TCompiler::getResources() const
+{
+    return mResources;
+}
+
+bool TCompiler::isVaryingDefined(const char *varyingName)
+{
+    ASSERT(mVariablesCollected);
+    for (size_t ii = 0; ii < mInputVaryings.size(); ++ii)
+    {
+        if (mInputVaryings[ii].name == varyingName)
+        {
+            return true;
+        }
+    }
+    for (size_t ii = 0; ii < mOutputVaryings.size(); ++ii)
+    {
+        if (mOutputVaryings[ii].name == varyingName)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+}  

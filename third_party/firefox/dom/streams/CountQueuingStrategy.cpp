@@ -1,0 +1,84 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/CountQueuingStrategy.h"
+
+#include "mozilla/dom/FunctionBinding.h"
+#include "mozilla/dom/QueuingStrategyBinding.h"
+#include "nsCOMPtr.h"
+#include "nsISupports.h"
+
+namespace mozilla::dom {
+
+NS_IMPL_CYCLE_COLLECTION(BaseQueuingStrategy, mGlobal)
+NS_IMPL_CYCLE_COLLECTING_ADDREF(BaseQueuingStrategy)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(BaseQueuingStrategy)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(BaseQueuingStrategy)
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE_INHERITED(CountQueuingStrategy,
+                                                BaseQueuingStrategy)
+NS_IMPL_ADDREF_INHERITED(CountQueuingStrategy, BaseQueuingStrategy)
+NS_IMPL_RELEASE_INHERITED(CountQueuingStrategy, BaseQueuingStrategy)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(CountQueuingStrategy)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+NS_INTERFACE_MAP_END_INHERITING(BaseQueuingStrategy)
+
+already_AddRefed<CountQueuingStrategy> CountQueuingStrategy::Constructor(
+    const GlobalObject& aGlobal, const QueuingStrategyInit& aInit) {
+  RefPtr<CountQueuingStrategy> strategy =
+      new CountQueuingStrategy(aGlobal.GetAsSupports(), aInit.mHighWaterMark);
+  return strategy.forget();
+}
+
+nsIGlobalObject* BaseQueuingStrategy::GetParentObject() const {
+  return mGlobal;
+}
+
+JSObject* CountQueuingStrategy::WrapObject(JSContext* aCx,
+                                           JS::Handle<JSObject*> aGivenProto) {
+  return CountQueuingStrategy_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+static bool CountQueuingStrategySize(JSContext* aCx, unsigned aArgc,
+                                     JS::Value* aVp) {
+  JS::CallArgs args = CallArgsFromVp(aArgc, aVp);
+
+  args.rval().setInt32(1);
+  return true;
+}
+
+already_AddRefed<Function> CountQueuingStrategy::GetSize(ErrorResult& aRv) {
+  if (RefPtr<Function> fun = mGlobal->GetCountQueuingStrategySizeFunction()) {
+    return fun.forget();
+  }
+
+
+  AutoJSAPI jsapi;
+  if (!jsapi.Init(mGlobal)) {
+    aRv.ThrowUnknownError("Internal error");
+    return nullptr;
+  }
+  JSContext* cx = jsapi.cx();
+
+
+  JS::Rooted<JSFunction*> sizeFunction(
+      cx, JS_NewFunction(cx, CountQueuingStrategySize, 0, 0, "size"));
+  if (!sizeFunction) {
+    aRv.StealExceptionFromJSContext(cx);
+    return nullptr;
+  }
+
+  JS::Rooted<JSObject*> funObj(cx, JS_GetFunctionObject(sizeFunction));
+  JS::Rooted<JSObject*> global(cx, mGlobal->GetGlobalJSObject());
+  RefPtr<Function> function = new Function(cx, funObj, global, mGlobal);
+  mGlobal->SetCountQueuingStrategySizeFunction(function);
+
+  return function.forget();
+}
+
+}  

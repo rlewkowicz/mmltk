@@ -1,0 +1,2568 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "IOUtils.h"
+
+#include <cstdint>
+
+#include "ErrorList.h"
+#include "js/ArrayBuffer.h"
+#include "js/ColumnNumber.h"  // JS::ColumnNumberOneOrigin
+#include "js/JSON.h"
+#include "js/Utility.h"
+#include "js/experimental/TypedData.h"
+#include "jsfriendapi.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/AutoRestore.h"
+#include "mozilla/CheckedInt.h"
+#include "mozilla/Compression.h"
+#include "mozilla/Encoding.h"
+#include "mozilla/EndianUtils.h"
+#include "mozilla/ErrorNames.h"
+#include "mozilla/FileUtils.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/ResultExtensions.h"
+#include "mozilla/Services.h"
+#include "mozilla/Span.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/TextUtils.h"
+#include "mozilla/Try.h"
+#include "mozilla/Utf8.h"
+#include "mozilla/dom/BindingUtils.h"
+#include "mozilla/dom/IOUtilsBinding.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/WorkerCommon.h"
+#include "mozilla/dom/WorkerRef.h"
+#include "mozilla/ipc/LaunchError.h"
+#include "PathUtils.h"
+#include "nsCOMPtr.h"
+#include "nsError.h"
+#include "nsFileStreams.h"
+#include "nsIDirectoryEnumerator.h"
+#include "nsIFile.h"
+#include "nsIGlobalObject.h"
+#include "nsIInputStream.h"
+#include "nsISupports.h"
+#include "nsLocalFile.h"
+#include "nsNetUtil.h"
+#include "nsNSSComponent.h"
+#include "nsPrintfCString.h"
+#include "nsReadableUtils.h"
+#include "nsString.h"
+#include "nsStringFwd.h"
+#include "nsTArray.h"
+#include "nsThreadManager.h"
+#include "nsXULAppAPI.h"
+#include "prerror.h"
+#include "prio.h"
+#include "prtime.h"
+#include "prtypes.h"
+#include "ScopedNSSTypes.h"
+#include "secoidt.h"
+
+#if defined(XP_UNIX) && !0
+#  include "nsSystemInfo.h"
+#endif
+
+
+#if defined(XP_UNIX)
+#  include "base/process_util.h"
+#endif
+
+#define REJECT_IF_INIT_PATH_FAILED(_file, _path, _promise, _msg, ...) \
+  do {                                                                \
+    if (nsresult _rv = PathUtils::InitFileWithPath((_file), (_path)); \
+        NS_FAILED(_rv)) {                                             \
+      (_promise)->MaybeRejectWithOperationError(FormatErrorMessage(   \
+          _rv, _msg ": could not parse path", ##__VA_ARGS__));        \
+      return;                                                         \
+    }                                                                 \
+  } while (0)
+
+#define IOUTILS_TRY_WITH_CONTEXT(_expr, _fmt, ...)            \
+  do {                                                        \
+    if (nsresult _rv = (_expr); NS_FAILED(_rv)) {             \
+      return Err(IOUtils::IOError(_rv, _fmt, ##__VA_ARGS__)); \
+    }                                                         \
+  } while (0)
+
+using namespace mozilla::dom;
+
+static constexpr auto SHUTDOWN_ERROR =
+    "IOUtils: Shutting down and refusing additional I/O tasks"_ns;
+
+namespace mozilla {
+
+
+static bool IsFileNotFound(nsresult aResult) {
+  return aResult == NS_ERROR_FILE_NOT_FOUND;
+}
+static bool IsNotDirectory(nsresult aResult) {
+  return aResult == NS_ERROR_FILE_DESTINATION_NOT_DIR ||
+         aResult == NS_ERROR_FILE_NOT_DIRECTORY;
+}
+
+static nsCString MOZ_FORMAT_PRINTF(2, 3)
+    FormatErrorMessage(nsresult aError, const char* const aFmt, ...) {
+  nsAutoCString errorName;
+  GetErrorName(aError, errorName);
+
+  nsCString msg;
+
+  va_list ap;
+  va_start(ap, aFmt);
+  msg.AppendVprintf(aFmt, ap);
+  va_end(ap);
+
+  msg.AppendPrintf(" (%s)", errorName.get());
+
+  return msg;
+}
+
+static nsCString FormatErrorMessage(nsresult aError,
+                                    const nsCString& aMessage) {
+  nsAutoCString errorName;
+  GetErrorName(aError, errorName);
+
+  nsCString msg(aMessage);
+  msg.AppendPrintf(" (%s)", errorName.get());
+
+  return msg;
+}
+
+[[nodiscard]] inline bool ToJSValue(
+    JSContext* aCx, const IOUtils::InternalFileInfo& aInternalFileInfo,
+    JS::MutableHandle<JS::Value> aValue) {
+  dom::FileInfo info;
+  info.mPath.Construct(aInternalFileInfo.mPath);
+  info.mType.Construct(aInternalFileInfo.mType);
+  info.mSize.Construct(aInternalFileInfo.mSize);
+
+  if (aInternalFileInfo.mCreationTime.isSome()) {
+    info.mCreationTime.Construct(aInternalFileInfo.mCreationTime.ref());
+  }
+  info.mLastAccessed.Construct(aInternalFileInfo.mLastAccessed);
+  info.mLastModified.Construct(aInternalFileInfo.mLastModified);
+
+  info.mPermissions.Construct(aInternalFileInfo.mPermissions);
+
+  return ToJSValue(aCx, info, aValue);
+}
+
+template <typename T>
+static void ResolveJSPromise(Promise* aPromise, T&& aValue) {
+  if constexpr (std::is_same_v<T, Ok>) {
+    aPromise->MaybeResolveWithUndefined();
+  } else if constexpr (std::is_same_v<T, nsTArray<uint8_t>>) {
+    TypedArrayCreator<Uint8Array> array(aValue);
+    aPromise->MaybeResolve(array);
+  } else {
+    aPromise->MaybeResolve(std::forward<T>(aValue));
+  }
+}
+
+static void RejectJSPromise(Promise* aPromise, const IOUtils::IOError& aError) {
+  const auto errMsg = FormatErrorMessage(aError.Code(), aError.Message());
+
+  switch (aError.Code()) {
+    case NS_ERROR_FILE_UNRESOLVABLE_SYMLINK:
+      [[fallthrough]];
+    case NS_ERROR_FILE_NOT_FOUND:
+      [[fallthrough]];
+    case NS_ERROR_FILE_INVALID_PATH:
+      [[fallthrough]];
+    case NS_ERROR_NOT_AVAILABLE:
+      aPromise->MaybeRejectWithNotFoundError(errMsg);
+      break;
+
+    case NS_ERROR_FILE_IS_LOCKED:
+      [[fallthrough]];
+    case NS_ERROR_FILE_ACCESS_DENIED:
+      aPromise->MaybeRejectWithNotAllowedError(errMsg);
+      break;
+
+    case NS_ERROR_FILE_TOO_BIG:
+      [[fallthrough]];
+    case NS_ERROR_FILE_NO_DEVICE_SPACE:
+      [[fallthrough]];
+    case NS_ERROR_FILE_DEVICE_FAILURE:
+      [[fallthrough]];
+    case NS_ERROR_FILE_FS_CORRUPTED:
+      [[fallthrough]];
+    case NS_ERROR_FILE_CORRUPTED:
+      aPromise->MaybeRejectWithNotReadableError(errMsg);
+      break;
+
+    case NS_ERROR_FILE_ALREADY_EXISTS:
+      aPromise->MaybeRejectWithNoModificationAllowedError(errMsg);
+      break;
+
+    case NS_ERROR_FILE_COPY_OR_MOVE_FAILED:
+      [[fallthrough]];
+    case NS_ERROR_FILE_NAME_TOO_LONG:
+      [[fallthrough]];
+    case NS_ERROR_FILE_UNRECOGNIZED_PATH:
+      [[fallthrough]];
+    case NS_ERROR_FILE_DIR_NOT_EMPTY:
+      aPromise->MaybeRejectWithOperationError(errMsg);
+      break;
+
+    case NS_ERROR_FILE_READ_ONLY:
+      aPromise->MaybeRejectWithReadOnlyError(errMsg);
+      break;
+
+    case NS_ERROR_FILE_NOT_DIRECTORY:
+      [[fallthrough]];
+    case NS_ERROR_FILE_DESTINATION_NOT_DIR:
+      [[fallthrough]];
+    case NS_ERROR_FILE_IS_DIRECTORY:
+      [[fallthrough]];
+    case NS_ERROR_FILE_UNKNOWN_TYPE:
+      aPromise->MaybeRejectWithInvalidAccessError(errMsg);
+      break;
+
+    case NS_ERROR_ILLEGAL_INPUT:
+      [[fallthrough]];
+    case NS_ERROR_ILLEGAL_VALUE:
+      aPromise->MaybeRejectWithDataError(errMsg);
+      break;
+
+    case NS_ERROR_ABORT:
+      aPromise->MaybeRejectWithAbortError(errMsg);
+      break;
+
+    default:
+      aPromise->MaybeRejectWithUnknownError(errMsg);
+  }
+}
+
+static void RejectShuttingDown(Promise* aPromise) {
+  RejectJSPromise(aPromise, IOUtils::IOError(NS_ERROR_ABORT, SHUTDOWN_ERROR));
+}
+
+static bool AssertParentProcessWithCallerLocationImpl(GlobalObject& aGlobal,
+                                                      nsCString& reason) {
+  if (MOZ_LIKELY(XRE_IsParentProcess())) {
+    return true;
+  }
+
+  AutoJSAPI jsapi;
+  nsCOMPtr<nsIGlobalObject> global = do_QueryInterface(aGlobal.GetAsSupports());
+  MOZ_ALWAYS_TRUE(global);
+  MOZ_ALWAYS_TRUE(jsapi.Init(global));
+
+  JSContext* cx = jsapi.cx();
+
+  JS::AutoFilename scriptFilename;
+  uint32_t lineNo = 0;
+  JS::ColumnNumberOneOrigin colNo;
+
+  NS_ENSURE_TRUE(
+      JS::DescribeScriptedCaller(&scriptFilename, cx, &lineNo, &colNo), false);
+
+  NS_ENSURE_TRUE(scriptFilename.get(), false);
+
+  reason.AppendPrintf(" Called from %s:%d:%d.", scriptFilename.get(), lineNo,
+                      colNo.oneOriginValue());
+  return false;
+}
+
+static void AssertParentProcessWithCallerLocation(GlobalObject& aGlobal) {
+  nsCString reason = "IOUtils can only be used in the parent process."_ns;
+  if (!AssertParentProcessWithCallerLocationImpl(aGlobal, reason)) {
+    MOZ_CRASH_UNSAFE_PRINTF("%s", reason.get());
+  }
+}
+
+constinit IOUtils::StateMutex IOUtils::sState{"IOUtils::sState"};
+
+template <typename Fn>
+already_AddRefed<Promise> IOUtils::WithPromiseAndState(GlobalObject& aGlobal,
+                                                       ErrorResult& aError,
+                                                       Fn aFn) {
+  AssertParentProcessWithCallerLocation(aGlobal);
+
+  RefPtr<Promise> promise = CreateJSPromise(aGlobal, aError);
+  if (!promise) {
+    return nullptr;
+  }
+
+  if (auto state = GetState()) {
+    aFn(promise, state.ref());
+  } else {
+    RejectShuttingDown(promise);
+  }
+  return promise.forget();
+}
+
+template <typename OkT, typename Fn>
+void IOUtils::DispatchAndResolve(IOUtils::EventQueue* aQueue, Promise* aPromise,
+                                 Fn aFunc) {
+  RefPtr<StrongWorkerRef> workerRef;
+  if (!NS_IsMainThread()) {
+    workerRef = StrongWorkerRef::CreateForcibly(GetCurrentThreadWorkerPrivate(),
+                                                __func__);
+  }
+
+  if (RefPtr<IOPromise<OkT>> p = aQueue->Dispatch<OkT, Fn>(std::move(aFunc))) {
+    p->Then(
+        GetCurrentSerialEventTarget(), __func__,
+        [workerRef, promise = RefPtr(aPromise)](OkT&& ok) {
+          ResolveJSPromise(promise, std::forward<OkT>(ok));
+        },
+        [workerRef, promise = RefPtr(aPromise)](const IOError& err) {
+          RejectJSPromise(promise, err);
+        });
+  }
+}
+
+already_AddRefed<Promise> IOUtils::Read(GlobalObject& aGlobal,
+                                        const nsAString& aPath,
+                                        const ReadOptions& aOptions,
+                                        ErrorResult& aError) {
+  return WithPromiseAndState(
+      aGlobal, aError, [&](Promise* promise, auto& state) {
+        nsCOMPtr<nsIFile> file = new nsLocalFile();
+        REJECT_IF_INIT_PATH_FAILED(file, aPath, promise, "Could not read `%s'",
+                                   NS_ConvertUTF16toUTF8(aPath).get());
+
+        Maybe<uint32_t> toRead = Nothing();
+        if (!aOptions.mMaxBytes.IsNull()) {
+          if (aOptions.mDecompress) {
+            RejectJSPromise(
+                promise, IOError(NS_ERROR_ILLEGAL_INPUT,
+                                 "Could not read `%s': the `maxBytes' and "
+                                 "`decompress' options are mutually exclusive",
+                                 file->HumanReadablePath().get()));
+            return;
+          }
+
+          if (aOptions.mMaxBytes.Value() == 0) {
+            nsTArray<uint8_t> arr(0);
+            promise->MaybeResolve(TypedArrayCreator<Uint8Array>(arr));
+            return;
+          }
+          toRead.emplace(aOptions.mMaxBytes.Value());
+        }
+
+        DispatchAndResolve<JsBuffer>(
+            state->mEventQueue, promise,
+            [file = std::move(file), offset = aOptions.mOffset, toRead,
+             decompress = aOptions.mDecompress]() {
+              return ReadSync(file, offset, toRead, decompress,
+                              BufferKind::Uint8Array);
+            });
+      });
+}
+
+RefPtr<SyncReadFile> IOUtils::OpenFileForSyncReading(GlobalObject& aGlobal,
+                                                     const nsAString& aPath,
+                                                     ErrorResult& aRv) {
+  MOZ_DIAGNOSTIC_ASSERT(XRE_IsParentProcess());
+
+  MOZ_RELEASE_ASSERT(!NS_IsMainThread());
+
+  nsCOMPtr<nsIFile> file = new nsLocalFile();
+  if (nsresult rv = PathUtils::InitFileWithPath(file, aPath); NS_FAILED(rv)) {
+    aRv.ThrowOperationError(FormatErrorMessage(
+        rv, "Could not parse path (%s)", NS_ConvertUTF16toUTF8(aPath).get()));
+    return nullptr;
+  }
+
+  RefPtr stream = MakeRefPtr<nsFileRandomAccessStream>();
+  if (nsresult rv =
+          stream->Init(file, PR_RDONLY | nsIFile::OS_READAHEAD, 0666, 0);
+      NS_FAILED(rv)) {
+    aRv.ThrowOperationError(
+        FormatErrorMessage(rv, "Could not open the file at %s",
+                           NS_ConvertUTF16toUTF8(aPath).get()));
+    return nullptr;
+  }
+
+  int64_t size = 0;
+  if (nsresult rv = stream->GetSize(&size); NS_FAILED(rv)) {
+    aRv.ThrowOperationError(FormatErrorMessage(
+        rv, "Could not get the stream size for the file at %s",
+        NS_ConvertUTF16toUTF8(aPath).get()));
+    return nullptr;
+  }
+
+  return new SyncReadFile(aGlobal.GetAsSupports(), std::move(stream), size);
+}
+
+already_AddRefed<Promise> IOUtils::ReadUTF8(GlobalObject& aGlobal,
+                                            const nsAString& aPath,
+                                            const ReadUTF8Options& aOptions,
+                                            ErrorResult& aError) {
+  return WithPromiseAndState(
+      aGlobal, aError, [&](Promise* promise, auto& state) {
+        nsCOMPtr<nsIFile> file = new nsLocalFile();
+        REJECT_IF_INIT_PATH_FAILED(file, aPath, promise, "Could not read `%s'",
+                                   NS_ConvertUTF16toUTF8(aPath).get());
+
+        DispatchAndResolve<JsBuffer>(
+            state->mEventQueue, promise,
+            [file = std::move(file), decompress = aOptions.mDecompress]() {
+              return ReadUTF8Sync(file, decompress);
+            });
+      });
+}
+
+already_AddRefed<Promise> IOUtils::ReadJSON(GlobalObject& aGlobal,
+                                            const nsAString& aPath,
+                                            const ReadUTF8Options& aOptions,
+                                            ErrorResult& aError) {
+  return WithPromiseAndState(
+      aGlobal, aError, [&](Promise* promise, auto& state) {
+        nsCOMPtr<nsIFile> file = new nsLocalFile();
+        REJECT_IF_INIT_PATH_FAILED(file, aPath, promise, "Could not read `%s'",
+                                   NS_ConvertUTF16toUTF8(aPath).get());
+
+        RefPtr<StrongWorkerRef> workerRef;
+        if (!NS_IsMainThread()) {
+          workerRef = StrongWorkerRef::CreateForcibly(
+              GetCurrentThreadWorkerPrivate(), __func__);
+        }
+
+        state->mEventQueue
+            ->template Dispatch<JsBuffer>(
+                [file, decompress = aOptions.mDecompress]() {
+                  return ReadUTF8Sync(file, decompress);
+                })
+            ->Then(
+                GetCurrentSerialEventTarget(), __func__,
+                [workerRef, promise = RefPtr{promise},
+                 file](JsBuffer&& aBuffer) {
+                  AutoJSAPI jsapi;
+                  if (NS_WARN_IF(!jsapi.Init(promise->GetGlobalObject()))) {
+                    RejectJSPromise(
+                        promise,
+                        IOError(
+                            NS_ERROR_DOM_UNKNOWN_ERR,
+                            "Could not read `%s': could not initialize JS API",
+                            file->HumanReadablePath().get()));
+                    return;
+                  }
+                  JSContext* cx = jsapi.cx();
+
+                  JS::Rooted<JSString*> jsonStr(
+                      cx,
+                      IOUtils::JsBuffer::IntoString(cx, std::move(aBuffer)));
+                  if (!jsonStr) {
+                    RejectJSPromise(
+                        promise,
+                        IOError(
+                            NS_ERROR_OUT_OF_MEMORY,
+                            "Could not read `%s': failed to allocate buffer",
+                            file->HumanReadablePath().get()));
+                    return;
+                  }
+
+                  JS::Rooted<JS::Value> val(cx);
+                  if (!JS_ParseJSON(cx, jsonStr, &val)) {
+                    JS::Rooted<JS::Value> exn(cx);
+                    if (JS_GetPendingException(cx, &exn)) {
+                      JS_ClearPendingException(cx);
+                      promise->MaybeReject(exn);
+                    } else {
+                      RejectJSPromise(promise,
+                                      IOError(NS_ERROR_DOM_UNKNOWN_ERR,
+                                              "Could not read `%s': ParseJSON "
+                                              "threw an uncatchable exception",
+                                              file->HumanReadablePath().get()));
+                    }
+
+                    return;
+                  }
+
+                  promise->MaybeResolve(val);
+                },
+                [workerRef, promise = RefPtr{promise}](const IOError& aErr) {
+                  RejectJSPromise(promise, aErr);
+                });
+      });
+}
+
+already_AddRefed<Promise> IOUtils::Write(GlobalObject& aGlobal,
+                                         const nsAString& aPath,
+                                         const Uint8Array& aData,
+                                         const WriteOptions& aOptions,
+                                         ErrorResult& aError) {
+  return WithPromiseAndState(
+      aGlobal, aError, [&](Promise* promise, auto& state) {
+        nsCOMPtr<nsIFile> file = new nsLocalFile();
+        REJECT_IF_INIT_PATH_FAILED(file, aPath, promise,
+                                   "Could not write to `%s'",
+                                   NS_ConvertUTF16toUTF8(aPath).get());
+
+        Maybe<Buffer<uint8_t>> buf = aData.CreateFromData<Buffer<uint8_t>>();
+        if (buf.isNothing()) {
+          promise->MaybeRejectWithOperationError(nsPrintfCString(
+              "Could not write to `%s': could not allocate buffer",
+              file->HumanReadablePath().get()));
+          return;
+        }
+
+        auto result = InternalWriteOpts::FromBinding(aOptions);
+        if (result.isErr()) {
+          RejectJSPromise(
+              promise,
+              IOError::WithCause(result.unwrapErr(), "Could not write to `%s'",
+                                 file->HumanReadablePath().get()));
+          return;
+        }
+
+        DispatchAndResolve<uint32_t>(
+            state->mEventQueue, promise,
+            [file = std::move(file), buf = buf.extract(),
+             opts = result.unwrap()]() { return WriteSync(file, buf, opts); });
+      });
+}
+
+already_AddRefed<Promise> IOUtils::WriteUTF8(GlobalObject& aGlobal,
+                                             const nsAString& aPath,
+                                             const nsACString& aString,
+                                             const WriteOptions& aOptions,
+                                             ErrorResult& aError) {
+  return WithPromiseAndState(
+      aGlobal, aError, [&](Promise* promise, auto& state) {
+        nsCOMPtr<nsIFile> file = new nsLocalFile();
+        REJECT_IF_INIT_PATH_FAILED(file, aPath, promise,
+                                   "Could not write to `%s'",
+                                   NS_ConvertUTF16toUTF8(aPath).get());
+
+        auto result = InternalWriteOpts::FromBinding(aOptions);
+        if (result.isErr()) {
+          RejectJSPromise(
+              promise,
+              IOError::WithCause(result.unwrapErr(), "Could not write to `%s'",
+                                 file->HumanReadablePath().get()));
+          return;
+        }
+
+        DispatchAndResolve<uint32_t>(
+            state->mEventQueue, promise,
+            [file = std::move(file), str = nsCString(aString),
+             opts = result.unwrap()]() {
+              return WriteSync(file, AsBytes(Span(str)), opts);
+            });
+      });
+}
+
+static bool AppendJSON(const char16_t* aBuf, uint32_t aLen, void* aStr) {
+  nsAString* str = static_cast<nsAString*>(aStr);
+
+  return str->Append(aBuf, aLen, fallible);
+}
+
+already_AddRefed<Promise> IOUtils::WriteJSON(GlobalObject& aGlobal,
+                                             const nsAString& aPath,
+                                             JS::Handle<JS::Value> aValue,
+                                             const WriteJSONOptions& aOptions,
+                                             ErrorResult& aError) {
+  return WithPromiseAndState(
+      aGlobal, aError, [&](Promise* promise, auto& state) {
+        nsCOMPtr<nsIFile> file = new nsLocalFile();
+        REJECT_IF_INIT_PATH_FAILED(file, aPath, promise,
+                                   "Could not write to `%s'",
+                                   NS_ConvertUTF16toUTF8(aPath).get());
+
+        auto result = InternalWriteOpts::FromBinding(aOptions);
+        if (result.isErr()) {
+          RejectJSPromise(
+              promise,
+              IOError::WithCause(result.unwrapErr(), "Could not write to `%s'",
+                                 file->HumanReadablePath().get()));
+          return;
+        }
+
+        auto opts = result.unwrap();
+
+        if (opts.mMode == WriteMode::Append ||
+            opts.mMode == WriteMode::AppendOrCreate) {
+          promise->MaybeRejectWithNotSupportedError(
+              nsPrintfCString("Could not write to `%s': IOUtils.writeJSON does "
+                              "not support appending to files.",
+                              file->HumanReadablePath().get()));
+          return;
+        }
+
+        JSContext* cx = aGlobal.Context();
+        JS::Rooted<JS::Value> value(cx, aValue);
+        nsString string;
+        if (!JS_StringifyWithLengthHint(cx, &value, nullptr,
+                                        JS::NullHandleValue, AppendJSON,
+                                        &string, opts.mLengthHint)) {
+          JS::Rooted<JS::Value> exn(cx, JS::UndefinedValue());
+          if (JS_GetPendingException(cx, &exn)) {
+            JS_ClearPendingException(cx);
+            promise->MaybeReject(exn);
+          } else {
+            RejectJSPromise(promise,
+                            IOError(NS_ERROR_DOM_UNKNOWN_ERR,
+                                    "Could not serialize object to JSON"_ns));
+          }
+          return;
+        }
+
+        DispatchAndResolve<dom::WriteJSONResult>(
+            state->mEventQueue, promise,
+            [file = std::move(file), string = std::move(string),
+             opts = std::move(opts)]() -> Result<WriteJSONResult, IOError> {
+              nsAutoCString utf8Str;
+              if (!CopyUTF16toUTF8(string, utf8Str, fallible)) {
+                return Err(IOError(
+                    NS_ERROR_OUT_OF_MEMORY,
+                    "Failed to write to `%s': could not allocate buffer",
+                    file->HumanReadablePath().get()));
+              }
+
+              uint32_t size =
+                  MOZ_TRY(WriteSync(file, AsBytes(Span(utf8Str)), opts));
+
+              dom::WriteJSONResult result;
+              result.mSize = size;
+              result.mJsonLength = static_cast<uint32_t>(string.Length());
+              return result;
+            });
+      });
+}
+
+already_AddRefed<Promise> IOUtils::Move(GlobalObject& aGlobal,
+                                        const nsAString& aSourcePath,
+                                        const nsAString& aDestPath,
+                                        const MoveOptions& aOptions,
+                                        ErrorResult& aError) {
+  return WithPromiseAndState(
+      aGlobal, aError, [&](Promise* promise, auto& state) {
+        nsCOMPtr<nsIFile> sourceFile = new nsLocalFile();
+        REJECT_IF_INIT_PATH_FAILED(sourceFile, aSourcePath, promise,
+                                   "Could not move `%s' to `%s'",
+                                   NS_ConvertUTF16toUTF8(aSourcePath).get(),
+                                   NS_ConvertUTF16toUTF8(aDestPath).get());
+
+        nsCOMPtr<nsIFile> destFile = new nsLocalFile();
+        REJECT_IF_INIT_PATH_FAILED(destFile, aDestPath, promise,
+                                   "Could not move `%s' to `%s'",
+                                   NS_ConvertUTF16toUTF8(aSourcePath).get(),
+                                   NS_ConvertUTF16toUTF8(aDestPath).get());
+
+        DispatchAndResolve<Ok>(
+            state->mEventQueue, promise,
+            [sourceFile = std::move(sourceFile), destFile = std::move(destFile),
+             noOverwrite = aOptions.mNoOverwrite]() {
+              return MoveSync(sourceFile, destFile, noOverwrite);
+            });
+      });
+}
+
+already_AddRefed<Promise> IOUtils::Remove(GlobalObject& aGlobal,
+                                          const nsAString& aPath,
+                                          const RemoveOptions& aOptions,
+                                          ErrorResult& aError) {
+  return WithPromiseAndState(
+      aGlobal, aError, [&](Promise* promise, auto& state) {
+        nsCOMPtr<nsIFile> file = new nsLocalFile();
+        REJECT_IF_INIT_PATH_FAILED(file, aPath, promise,
+                                   "Could not remove `%s'",
+                                   NS_ConvertUTF16toUTF8(aPath).get());
+
+        DispatchAndResolve<Ok>(
+            state->mEventQueue, promise,
+            [file = std::move(file), ignoreAbsent = aOptions.mIgnoreAbsent,
+             recursive = aOptions.mRecursive,
+             retryReadonly = aOptions.mRetryReadonly]() {
+              return RemoveSync(file, ignoreAbsent, recursive, retryReadonly);
+            });
+      });
+}
+
+already_AddRefed<Promise> IOUtils::MakeDirectory(
+    GlobalObject& aGlobal, const nsAString& aPath,
+    const MakeDirectoryOptions& aOptions, ErrorResult& aError) {
+  return WithPromiseAndState(
+      aGlobal, aError, [&](Promise* promise, auto& state) {
+        nsCOMPtr<nsIFile> file = new nsLocalFile();
+        REJECT_IF_INIT_PATH_FAILED(file, aPath, promise,
+                                   "Could not make directory `%s'",
+                                   NS_ConvertUTF16toUTF8(aPath).get());
+
+        DispatchAndResolve<Ok>(state->mEventQueue, promise,
+                               [file = std::move(file),
+                                createAncestors = aOptions.mCreateAncestors,
+                                ignoreExisting = aOptions.mIgnoreExisting,
+                                permissions = aOptions.mPermissions]() {
+                                 return MakeDirectorySync(file, createAncestors,
+                                                          ignoreExisting,
+                                                          permissions);
+                               });
+      });
+}
+
+already_AddRefed<Promise> IOUtils::Stat(GlobalObject& aGlobal,
+                                        const nsAString& aPath,
+                                        ErrorResult& aError) {
+  return WithPromiseAndState(
+      aGlobal, aError, [&](Promise* promise, auto& state) {
+        nsCOMPtr<nsIFile> file = new nsLocalFile();
+        REJECT_IF_INIT_PATH_FAILED(file, aPath, promise, "Could not stat `%s'",
+                                   NS_ConvertUTF16toUTF8(aPath).get());
+
+        DispatchAndResolve<InternalFileInfo>(
+            state->mEventQueue, promise,
+            [file = std::move(file)]() { return StatSync(file); });
+      });
+}
+
+already_AddRefed<Promise> IOUtils::Copy(GlobalObject& aGlobal,
+                                        const nsAString& aSourcePath,
+                                        const nsAString& aDestPath,
+                                        const CopyOptions& aOptions,
+                                        ErrorResult& aError) {
+  return WithPromiseAndState(
+      aGlobal, aError, [&](Promise* promise, auto& state) {
+        nsCOMPtr<nsIFile> sourceFile = new nsLocalFile();
+        REJECT_IF_INIT_PATH_FAILED(sourceFile, aSourcePath, promise,
+                                   "Could not copy `%s' to `%s'",
+                                   NS_ConvertUTF16toUTF8(aSourcePath).get(),
+                                   NS_ConvertUTF16toUTF8(aDestPath).get());
+
+        nsCOMPtr<nsIFile> destFile = new nsLocalFile();
+        REJECT_IF_INIT_PATH_FAILED(destFile, aDestPath, promise,
+                                   "Could not copy `%s' to `%s'",
+                                   NS_ConvertUTF16toUTF8(aSourcePath).get(),
+                                   NS_ConvertUTF16toUTF8(aDestPath).get());
+
+        DispatchAndResolve<Ok>(
+            state->mEventQueue, promise,
+            [sourceFile = std::move(sourceFile), destFile = std::move(destFile),
+             noOverwrite = aOptions.mNoOverwrite,
+             recursive = aOptions.mRecursive]() {
+              return CopySync(sourceFile, destFile, noOverwrite, recursive);
+            });
+      });
+}
+
+already_AddRefed<Promise> IOUtils::SetAccessTime(
+    GlobalObject& aGlobal, const nsAString& aPath,
+    const Optional<int64_t>& aAccess, ErrorResult& aError) {
+  return SetTime(aGlobal, aPath, aAccess, &nsIFile::SetLastAccessedTime,
+                 "access", aError);
+}
+
+already_AddRefed<Promise> IOUtils::SetModificationTime(
+    GlobalObject& aGlobal, const nsAString& aPath,
+    const Optional<int64_t>& aModification, ErrorResult& aError) {
+  return SetTime(aGlobal, aPath, aModification, &nsIFile::SetLastModifiedTime,
+                 "modification", aError);
+}
+
+already_AddRefed<Promise> IOUtils::SetTime(GlobalObject& aGlobal,
+                                           const nsAString& aPath,
+                                           const Optional<int64_t>& aNewTime,
+                                           IOUtils::SetTimeFn aSetTimeFn,
+                                           const char* const aTimeKind,
+                                           ErrorResult& aError) {
+  return WithPromiseAndState(
+      aGlobal, aError, [&](Promise* promise, auto& state) {
+        nsCOMPtr<nsIFile> file = new nsLocalFile();
+        REJECT_IF_INIT_PATH_FAILED(file, aPath, promise,
+                                   "Could not set %s time on `%s'", aTimeKind,
+                                   NS_ConvertUTF16toUTF8(aPath).get());
+
+        int64_t newTime = aNewTime.WasPassed() ? aNewTime.Value()
+                                               : PR_Now() / PR_USEC_PER_MSEC;
+        DispatchAndResolve<int64_t>(
+            state->mEventQueue, promise,
+            [file = std::move(file), aSetTimeFn, newTime]() {
+              return SetTimeSync(file, aSetTimeFn, newTime);
+            });
+      });
+}
+
+already_AddRefed<Promise> IOUtils::HasChildren(
+    GlobalObject& aGlobal, const nsAString& aPath,
+    const HasChildrenOptions& aOptions, ErrorResult& aError) {
+  return WithPromiseAndState(
+      aGlobal, aError, [&](Promise* promise, auto& state) {
+        nsCOMPtr<nsIFile> file = new nsLocalFile();
+        REJECT_IF_INIT_PATH_FAILED(file, aPath, promise,
+                                   "Could not check children of `%s'",
+                                   NS_ConvertUTF16toUTF8(aPath).get());
+
+        DispatchAndResolve<bool>(
+            state->mEventQueue, promise,
+            [file = std::move(file), ignoreAbsent = aOptions.mIgnoreAbsent]() {
+              return HasChildrenSync(file, ignoreAbsent);
+            });
+      });
+}
+
+already_AddRefed<Promise> IOUtils::GetChildren(
+    GlobalObject& aGlobal, const nsAString& aPath,
+    const GetChildrenOptions& aOptions, ErrorResult& aError) {
+  return WithPromiseAndState(
+      aGlobal, aError, [&](Promise* promise, auto& state) {
+        nsCOMPtr<nsIFile> file = new nsLocalFile();
+        REJECT_IF_INIT_PATH_FAILED(file, aPath, promise,
+                                   "Could not get children of `%s'",
+                                   NS_ConvertUTF16toUTF8(aPath).get());
+
+        DispatchAndResolve<nsTArray<nsString>>(
+            state->mEventQueue, promise,
+            [file = std::move(file), ignoreAbsent = aOptions.mIgnoreAbsent]() {
+              return GetChildrenSync(file, ignoreAbsent);
+            });
+      });
+}
+
+already_AddRefed<Promise> IOUtils::SetPermissions(GlobalObject& aGlobal,
+                                                  const nsAString& aPath,
+                                                  uint32_t aPermissions,
+                                                  const bool aHonorUmask,
+                                                  ErrorResult& aError) {
+  return WithPromiseAndState(
+      aGlobal, aError, [&](Promise* promise, auto& state) {
+#if defined(XP_UNIX) && !0
+        if (aHonorUmask) {
+          aPermissions &= ~nsSystemInfo::gUserUmask;
+        }
+#endif
+
+        nsCOMPtr<nsIFile> file = new nsLocalFile();
+        REJECT_IF_INIT_PATH_FAILED(file, aPath, promise,
+                                   "Could not set permissions on `%s'",
+                                   NS_ConvertUTF16toUTF8(aPath).get());
+
+        DispatchAndResolve<Ok>(
+            state->mEventQueue, promise,
+            [file = std::move(file), permissions = aPermissions]() {
+              return SetPermissionsSync(file, permissions);
+            });
+      });
+}
+
+already_AddRefed<Promise> IOUtils::Exists(GlobalObject& aGlobal,
+                                          const nsAString& aPath,
+                                          ErrorResult& aError) {
+  return WithPromiseAndState(
+      aGlobal, aError, [&](Promise* promise, auto& state) {
+        nsCOMPtr<nsIFile> file = new nsLocalFile();
+        REJECT_IF_INIT_PATH_FAILED(file, aPath, promise,
+                                   "Could not determine if `%s' exists",
+                                   NS_ConvertUTF16toUTF8(aPath).get());
+
+        DispatchAndResolve<bool>(
+            state->mEventQueue, promise,
+            [file = std::move(file)]() { return ExistsSync(file); });
+      });
+}
+
+already_AddRefed<Promise> IOUtils::CreateUniqueFile(GlobalObject& aGlobal,
+                                                    const nsAString& aParent,
+                                                    const nsAString& aPrefix,
+                                                    const uint32_t aPermissions,
+                                                    ErrorResult& aError) {
+  return CreateUnique(aGlobal, aParent, aPrefix, nsIFile::NORMAL_FILE_TYPE,
+                      aPermissions, aError);
+}
+
+already_AddRefed<Promise> IOUtils::CreateUniqueDirectory(
+    GlobalObject& aGlobal, const nsAString& aParent, const nsAString& aPrefix,
+    const uint32_t aPermissions, ErrorResult& aError) {
+  return CreateUnique(aGlobal, aParent, aPrefix, nsIFile::DIRECTORY_TYPE,
+                      aPermissions, aError);
+}
+
+already_AddRefed<Promise> IOUtils::CreateUnique(GlobalObject& aGlobal,
+                                                const nsAString& aParent,
+                                                const nsAString& aPrefix,
+                                                const uint32_t aFileType,
+                                                const uint32_t aPermissions,
+                                                ErrorResult& aError) {
+  return WithPromiseAndState(
+      aGlobal, aError, [&](Promise* promise, auto& state) {
+        nsCOMPtr<nsIFile> file = new nsLocalFile();
+        REJECT_IF_INIT_PATH_FAILED(
+            file, aParent, promise, "Could not create unique %s in `%s'",
+            aFileType == nsIFile::NORMAL_FILE_TYPE ? "file" : "directory",
+            NS_ConvertUTF16toUTF8(aParent).get());
+
+        if (nsresult rv = file->Append(aPrefix); NS_FAILED(rv)) {
+          RejectJSPromise(
+              promise,
+              IOError(
+                  rv,
+                  "Could not create unique %s: could not append prefix `%s' to "
+                  "parent `%s'",
+                  aFileType == nsIFile::NORMAL_FILE_TYPE ? "file" : "directory",
+                  NS_ConvertUTF16toUTF8(aPrefix).get(),
+                  file->HumanReadablePath().get()));
+          return;
+        }
+
+        DispatchAndResolve<nsString>(
+            state->mEventQueue, promise,
+            [file = std::move(file), aPermissions, aFileType]() {
+              return CreateUniqueSync(file, aFileType, aPermissions);
+            });
+      });
+}
+
+already_AddRefed<Promise> IOUtils::ComputeHexDigest(
+    GlobalObject& aGlobal, const nsAString& aPath,
+    const HashAlgorithm aAlgorithm, ErrorResult& aError) {
+  const bool nssInitialized = EnsureNSSInitializedChromeOrContent();
+
+  return WithPromiseAndState(
+      aGlobal, aError, [&](Promise* promise, auto& state) {
+        if (!nssInitialized) {
+          RejectJSPromise(promise, IOError(NS_ERROR_UNEXPECTED,
+                                           "Could not initialize NSS"_ns));
+          return;
+        }
+
+        nsCOMPtr<nsIFile> file = new nsLocalFile();
+        REJECT_IF_INIT_PATH_FAILED(file, aPath, promise, "Could not hash `%s'",
+                                   NS_ConvertUTF16toUTF8(aPath).get());
+
+        DispatchAndResolve<nsCString>(state->mEventQueue, promise,
+                                      [file = std::move(file), aAlgorithm]() {
+                                        return ComputeHexDigestSync(file,
+                                                                    aAlgorithm);
+                                      });
+      });
+}
+
+
+already_AddRefed<Promise> IOUtils::GetFile(
+    GlobalObject& aGlobal, const Sequence<nsString>& aComponents,
+    ErrorResult& aError) {
+  return WithPromiseAndState(
+      aGlobal, aError, [&](Promise* promise, auto& state) {
+        ErrorResult joinErr;
+        nsCOMPtr<nsIFile> file = PathUtils::Join(aComponents, joinErr);
+        if (joinErr.Failed()) {
+          promise->MaybeReject(std::move(joinErr));
+          return;
+        }
+
+        nsCOMPtr<nsIFile> parent;
+        if (nsresult rv = file->GetParent(getter_AddRefs(parent));
+            NS_FAILED(rv)) {
+          RejectJSPromise(promise, IOError(rv,
+                                           "Could not get nsIFile for `%s': "
+                                           "could not get parent directory",
+                                           file->HumanReadablePath().get()));
+          return;
+        }
+
+        if (!parent) {
+          promise->MaybeResolve(file);
+          return;
+        }
+
+        state->mEventQueue
+            ->template Dispatch<Ok>([parent = std::move(parent)]() {
+              return MakeDirectorySync(parent,  true,
+                                        true, 0755);
+            })
+            ->Then(
+                GetCurrentSerialEventTarget(), __func__,
+                [file = std::move(file), promise = RefPtr(promise)](const Ok&) {
+                  promise->MaybeResolve(file);
+                },
+                [promise = RefPtr(promise)](const IOError& err) {
+                  RejectJSPromise(promise, err);
+                });
+      });
+}
+
+already_AddRefed<Promise> IOUtils::GetDirectory(
+    GlobalObject& aGlobal, const Sequence<nsString>& aComponents,
+    ErrorResult& aError) {
+  return WithPromiseAndState(
+      aGlobal, aError, [&](Promise* promise, auto& state) {
+        ErrorResult joinErr;
+        nsCOMPtr<nsIFile> dir = PathUtils::Join(aComponents, joinErr);
+        if (joinErr.Failed()) {
+          promise->MaybeReject(std::move(joinErr));
+          return;
+        }
+
+        state->mEventQueue
+            ->template Dispatch<Ok>([dir]() {
+              return MakeDirectorySync(dir,  true,
+                                        true, 0755);
+            })
+            ->Then(
+                GetCurrentSerialEventTarget(), __func__,
+                [dir, promise = RefPtr(promise)](const Ok&) {
+                  promise->MaybeResolve(dir);
+                },
+                [promise = RefPtr(promise)](const IOError& err) {
+                  RejectJSPromise(promise, err);
+                });
+      });
+}
+
+already_AddRefed<Promise> IOUtils::CreateJSPromise(GlobalObject& aGlobal,
+                                                   ErrorResult& aError) {
+  nsCOMPtr<nsIGlobalObject> global = do_QueryInterface(aGlobal.GetAsSupports());
+  RefPtr<Promise> promise = Promise::Create(global, aError);
+  if (aError.Failed()) {
+    return nullptr;
+  }
+  MOZ_ASSERT(promise);
+  return do_AddRef(promise);
+}
+
+Result<IOUtils::JsBuffer, IOUtils::IOError> IOUtils::ReadSync(
+    nsIFile* aFile, const uint64_t aOffset, const Maybe<uint32_t> aMaxBytes,
+    const bool aDecompress, IOUtils::BufferKind aBufferKind) {
+  MOZ_ASSERT(!NS_IsMainThread());
+  MOZ_ASSERT(aMaxBytes.isNothing() || !aDecompress,
+             "maxBytes and decompress are mutually exclusive");
+
+  if (aOffset > static_cast<uint64_t>(INT64_MAX)) {
+    return Err(
+        IOError(NS_ERROR_ILLEGAL_INPUT,
+                "Could not read `%s': requested offset is too large (%" PRIu64
+                " > %" PRId64 ")",
+                aFile->HumanReadablePath().get(), aOffset, INT64_MAX));
+  }
+
+  const int64_t offset = static_cast<int64_t>(aOffset);
+
+  RefPtr stream = MakeRefPtr<nsFileRandomAccessStream>();
+  if (nsresult rv =
+          stream->Init(aFile, PR_RDONLY | nsIFile::OS_READAHEAD, 0666, 0);
+      NS_FAILED(rv)) {
+    if (IsFileNotFound(rv)) {
+      return Err(IOError(rv, "Could not open `%s': file does not exist",
+                         aFile->HumanReadablePath().get()));
+    }
+    return Err(
+        IOError(rv, "Could not open `%s'", aFile->HumanReadablePath().get()));
+  }
+
+  uint32_t bufSize = 0;
+
+  if (aMaxBytes.isNothing()) {
+
+    int64_t rawStreamSize = -1;
+    if (nsresult rv = stream->GetSize(&rawStreamSize); NS_FAILED(rv)) {
+      return Err(
+          IOError(NS_ERROR_FILE_ACCESS_DENIED,
+                  "Could not open `%s': could not stat file or directory",
+                  aFile->HumanReadablePath().get()));
+    }
+    MOZ_RELEASE_ASSERT(rawStreamSize >= 0);
+
+    uint64_t streamSize = static_cast<uint64_t>(rawStreamSize);
+    if (aOffset >= streamSize) {
+      bufSize = 0;
+    } else {
+      if (streamSize - offset > static_cast<int64_t>(UINT32_MAX)) {
+        return Err(IOError(NS_ERROR_FILE_TOO_BIG,
+                           "Could not read `%s' with offset %" PRIu64
+                           ": file is too large (%" PRIu64 " bytes)",
+                           aFile->HumanReadablePath().get(), offset,
+                           streamSize));
+      }
+
+      bufSize = static_cast<uint32_t>(streamSize - offset);
+    }
+  } else {
+    bufSize = aMaxBytes.value();
+  }
+
+  if (offset > 0) {
+    if (nsresult rv = stream->Seek(PR_SEEK_SET, offset); NS_FAILED(rv)) {
+      return Err(IOError(
+          rv, "Could not read `%s': could not seek to position %" PRId64,
+          aFile->HumanReadablePath().get(), offset));
+    }
+  }
+
+  JsBuffer buffer = JsBuffer::CreateEmpty(aBufferKind);
+
+  if (bufSize > 0) {
+    auto result = JsBuffer::Create(aBufferKind, bufSize);
+    if (result.isErr()) {
+      return Err(IOError::WithCause(result.unwrapErr(), "Could not read `%s'",
+                                    aFile->HumanReadablePath().get()));
+    }
+    buffer = result.unwrap();
+    Span<char> toRead = buffer.BeginWriting();
+
+    uint32_t totalRead = 0;
+    while (totalRead != bufSize) {
+      uint32_t bytesToReadThisChunk =
+          std::min<uint32_t>(bufSize - totalRead, INT32_MAX);
+      uint32_t bytesRead = 0;
+      if (nsresult rv =
+              stream->Read(toRead.Elements(), bytesToReadThisChunk, &bytesRead);
+          NS_FAILED(rv)) {
+        return Err(
+            IOError(rv, "Could not read `%s': encountered an unexpected error",
+                    aFile->HumanReadablePath().get()));
+      }
+      if (bytesRead == 0) {
+        break;
+      }
+      totalRead += bytesRead;
+      toRead = toRead.From(bytesRead);
+    }
+
+    buffer.SetLength(totalRead);
+  }
+
+  if (aDecompress) {
+    auto result =
+        MozLZ4::Decompress(AsBytes(buffer.BeginReading()), aBufferKind);
+    if (result.isErr()) {
+      return Err(IOError::WithCause(result.unwrapErr(), "Could not read `%s'",
+                                    aFile->HumanReadablePath().get()));
+    }
+    return result;
+  }
+
+  return std::move(buffer);
+}
+
+Result<IOUtils::JsBuffer, IOUtils::IOError> IOUtils::ReadUTF8Sync(
+    nsIFile* aFile, bool aDecompress) {
+  auto result = ReadSync(aFile, 0, Nothing{}, aDecompress, BufferKind::String);
+  if (result.isErr()) {
+    return result.propagateErr();
+  }
+
+  JsBuffer buffer = result.unwrap();
+  if (!IsUtf8(buffer.BeginReading())) {
+    return Err(IOError(NS_ERROR_FILE_CORRUPTED,
+                       "Could not read `%s': file is not UTF-8 encoded",
+                       aFile->HumanReadablePath().get()));
+  }
+
+  return buffer;
+}
+
+Result<uint32_t, IOUtils::IOError> IOUtils::WriteSync(
+    nsIFile* aFile, const Span<const uint8_t>& aByteArray,
+    const IOUtils::InternalWriteOpts& aOptions) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  nsIFile* backupFile = aOptions.mBackupFile;
+  nsIFile* tempFile = aOptions.mTmpFile;
+
+  bool exists = false;
+  IOUTILS_TRY_WITH_CONTEXT(
+      aFile->Exists(&exists),
+      "Could not write to `%s': could not stat file or directory",
+      aFile->HumanReadablePath().get());
+
+  if (exists && aOptions.mMode == WriteMode::Create) {
+    return Err(IOError(NS_ERROR_FILE_ALREADY_EXISTS,
+                       "Could not write to `%s': refusing to overwrite file, "
+                       "`mode' is not \"overwrite\"",
+                       aFile->HumanReadablePath().get()));
+  }
+
+  if (exists && backupFile) {
+    nsCOMPtr<nsIFile> toMove;
+    MOZ_ALWAYS_SUCCEEDS(aFile->Clone(getter_AddRefs(toMove)));
+
+    bool noOverwrite = aOptions.mMode == WriteMode::Create;
+
+    if (auto result = MoveSync(toMove, backupFile, noOverwrite);
+        result.isErr()) {
+      return Err(IOError::WithCause(
+          result.unwrapErr(),
+          "Could not write to `%s': failed to back up source file",
+          aFile->HumanReadablePath().get()));
+    }
+  }
+
+  nsIFile* writeFile;
+
+  if (tempFile) {
+    writeFile = tempFile;
+
+    if (aOptions.mMode == WriteMode::Append) {
+      if (auto result = CopySync(aFile, tempFile,  false,
+                                  false);
+          result.isErr()) {
+        return Err(IOError::WithCause(
+            result.unwrapErr(),
+            "Could not write to `%s': failed to copy for append",
+            aFile->HumanReadablePath().get()));
+      }
+    }
+  } else {
+    writeFile = aFile;
+  }
+
+  int32_t flags = PR_WRONLY;
+
+  switch (aOptions.mMode) {
+    case WriteMode::Overwrite:
+      flags |= PR_TRUNCATE | PR_CREATE_FILE;
+      break;
+
+    case WriteMode::Append:
+      flags |= PR_APPEND;
+      break;
+
+    case WriteMode::AppendOrCreate:
+      flags |= PR_APPEND | PR_CREATE_FILE;
+      break;
+
+    case WriteMode::Create:
+      flags |= PR_CREATE_FILE | PR_EXCL;
+      break;
+
+    default:
+      MOZ_CRASH("IOUtils: unknown write mode");
+  }
+
+  if (aOptions.mFlush) {
+    flags |= PR_SYNC;
+  }
+
+  uint32_t totalWritten = 0;
+  {
+    nsTArray<uint8_t> compressed;
+    Span<const char> bytes;
+    if (aOptions.mCompress) {
+      auto result = MozLZ4::Compress(aByteArray);
+      if (result.isErr()) {
+        return Err(IOError::WithCause(result.unwrapErr(),
+                                      "Could not write to `%s'",
+                                      writeFile->HumanReadablePath().get()));
+      }
+      compressed = result.unwrap();
+      bytes = Span(reinterpret_cast<const char*>(compressed.Elements()),
+                   compressed.Length());
+    } else {
+      bytes = Span(reinterpret_cast<const char*>(aByteArray.Elements()),
+                   aByteArray.Length());
+    }
+
+    RefPtr stream = MakeRefPtr<nsFileOutputStream>();
+    if (nsresult rv = stream->Init(writeFile, flags, 0666, 0); NS_FAILED(rv)) {
+      if (rv == nsresult::NS_ERROR_FILE_IS_DIRECTORY) {
+        rv = NS_ERROR_FILE_ACCESS_DENIED;
+      }
+      return Err(IOError(
+          rv, "Could not write to `%s': failed to open file for writing",
+          writeFile->HumanReadablePath().get()));
+    }
+
+    uint32_t chunkSize = INT32_MAX;
+    Span<const char> pendingBytes = bytes;
+
+    while (pendingBytes.Length() > 0) {
+      if (pendingBytes.Length() < chunkSize) {
+        chunkSize = pendingBytes.Length();
+      }
+
+      uint32_t bytesWritten = 0;
+      if (nsresult rv =
+              stream->Write(pendingBytes.Elements(), chunkSize, &bytesWritten);
+          NS_FAILED(rv)) {
+        return Err(IOError(rv,
+                           "Could not write to `%s': failed to write chunk; "
+                           "the file may be corrupt",
+                           writeFile->HumanReadablePath().get()));
+      }
+      pendingBytes = pendingBytes.From(bytesWritten);
+      totalWritten += bytesWritten;
+    }
+  }
+
+  if (tempFile) {
+    nsAutoStringN<256> destPath;
+    nsAutoStringN<256> writePath;
+
+    MOZ_ALWAYS_SUCCEEDS(aFile->GetPath(destPath));
+    MOZ_ALWAYS_SUCCEEDS(writeFile->GetPath(writePath));
+
+    if (destPath != writePath) {
+      if (aOptions.mTmpFile) {
+        bool isDir = false;
+        if (nsresult rv = aFile->IsDirectory(&isDir);
+            NS_FAILED(rv) && !IsFileNotFound(rv)) {
+          return Err(IOError(
+              rv, "Could not write to `%s': could not stat file or directory",
+              aFile->HumanReadablePath().get()));
+        }
+
+        if (isDir) {
+          return Err(IOError(NS_ERROR_FILE_ACCESS_DENIED,
+                             "Could not write to `%s': file is a directory",
+                             aFile->HumanReadablePath().get()));
+        }
+      }
+
+      if (auto result = MoveSync(writeFile, aFile,  false);
+          result.isErr()) {
+        return Err(IOError::WithCause(
+            result.unwrapErr(),
+            "Could not write to `%s': could not move overwite with temporary "
+            "file",
+            aFile->HumanReadablePath().get()));
+      }
+    }
+  }
+  return totalWritten;
+}
+
+Result<Ok, IOUtils::IOError> IOUtils::MoveSync(nsIFile* aSourceFile,
+                                               nsIFile* aDestFile,
+                                               bool aNoOverwrite) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  bool srcExists = false;
+  IOUTILS_TRY_WITH_CONTEXT(
+      aSourceFile->Exists(&srcExists),
+      "Could not move `%s' to `%s': could not stat source file or directory",
+      aSourceFile->HumanReadablePath().get(),
+      aDestFile->HumanReadablePath().get());
+
+  if (!srcExists) {
+    return Err(
+        IOError(NS_ERROR_FILE_NOT_FOUND,
+                "Could not move `%s' to `%s': source file does not exist",
+                aSourceFile->HumanReadablePath().get(),
+                aDestFile->HumanReadablePath().get()));
+  }
+
+  return CopyOrMoveSync(&nsIFile::MoveToFollowingLinks, "move", aSourceFile,
+                        aDestFile, aNoOverwrite);
+}
+
+Result<Ok, IOUtils::IOError> IOUtils::CopySync(nsIFile* aSourceFile,
+                                               nsIFile* aDestFile,
+                                               bool aNoOverwrite,
+                                               bool aRecursive) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  bool srcExists;
+  IOUTILS_TRY_WITH_CONTEXT(
+      aSourceFile->Exists(&srcExists),
+      "Could not copy `%s' to `%s': could not stat source file or directory",
+      aSourceFile->HumanReadablePath().get(),
+      aDestFile->HumanReadablePath().get());
+
+  if (!srcExists) {
+    return Err(
+        IOError(NS_ERROR_FILE_NOT_FOUND,
+                "Could not copy `%s' to `%s': source file does not exist",
+                aSourceFile->HumanReadablePath().get(),
+                aDestFile->HumanReadablePath().get()));
+  }
+
+  bool srcIsDir = false;
+  IOUTILS_TRY_WITH_CONTEXT(
+      aSourceFile->IsDirectory(&srcIsDir),
+      "Could not copy `%s' to `%s': could not stat source file or directory",
+      aSourceFile->HumanReadablePath().get(),
+      aDestFile->HumanReadablePath().get());
+
+  if (srcIsDir && !aRecursive) {
+    return Err(IOError(NS_ERROR_FILE_COPY_OR_MOVE_FAILED,
+                       "Refused to copy directory `%s' to `%s': `recursive' is "
+                       "false\n",
+                       aSourceFile->HumanReadablePath().get(),
+                       aDestFile->HumanReadablePath().get()));
+  }
+
+  return CopyOrMoveSync(&nsIFile::CopyToFollowingLinks, "copy", aSourceFile,
+                        aDestFile, aNoOverwrite);
+}
+
+template <typename CopyOrMoveFn>
+Result<Ok, IOUtils::IOError> IOUtils::CopyOrMoveSync(CopyOrMoveFn aMethod,
+                                                     const char* aMethodName,
+                                                     nsIFile* aSource,
+                                                     nsIFile* aDest,
+                                                     bool aNoOverwrite) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  bool destIsDir = false;
+  bool destExists = true;
+
+  nsresult rv = aDest->IsDirectory(&destIsDir);
+  if (NS_SUCCEEDED(rv) && destIsDir) {
+    rv = (aSource->*aMethod)(aDest, u""_ns);
+    if (NS_FAILED(rv)) {
+      return Err(IOError(rv, "Could not %s `%s' to `%s'", aMethodName,
+                         aSource->HumanReadablePath().get(),
+                         aDest->HumanReadablePath().get()));
+    }
+    return Ok();
+  }
+
+  if (NS_FAILED(rv)) {
+    if (!IsFileNotFound(rv)) {
+      return Err(IOError(rv, "Could not %s `%s' to `%s'", aMethodName,
+                         aSource->HumanReadablePath().get(),
+                         aDest->HumanReadablePath().get()));
+    }
+    destExists = false;
+  }
+
+  if (aNoOverwrite && destExists) {
+    return Err(IOError(NS_ERROR_FILE_ALREADY_EXISTS,
+                       "Could not %s `%s' to `%s': destination file exists and "
+                       "`noOverwrite' is true",
+                       aMethodName, aSource->HumanReadablePath().get(),
+                       aDest->HumanReadablePath().get()));
+  }
+  if (destExists && !destIsDir) {
+    bool srcIsDir = false;
+    IOUTILS_TRY_WITH_CONTEXT(
+        aSource->IsDirectory(&srcIsDir),
+        "Could not %s `%s' to `%s': could not stat source file or directory",
+        aMethodName, aSource->HumanReadablePath().get(),
+        aDest->HumanReadablePath().get());
+    if (srcIsDir) {
+      return Err(IOError(
+          NS_ERROR_FILE_DESTINATION_NOT_DIR,
+          "Could not %s directory `%s' to `%s': destination is not a directory",
+          aMethodName, aSource->HumanReadablePath().get(),
+          aDest->HumanReadablePath().get()));
+    }
+  }
+
+  nsAutoString destName;
+  MOZ_ALWAYS_SUCCEEDS(aDest->GetLeafName(destName));
+
+  nsCOMPtr<nsIFile> destDir;
+  IOUTILS_TRY_WITH_CONTEXT(
+      aDest->GetParent(getter_AddRefs(destDir)),
+      "Could not %s `%s` to `%s': path `%s' does not have a parent",
+      aMethodName, aSource->HumanReadablePath().get(),
+      aDest->HumanReadablePath().get(), aDest->HumanReadablePath().get());
+
+  MOZ_RELEASE_ASSERT(destDir);
+
+  rv = (aSource->*aMethod)(destDir, destName);
+  if (NS_FAILED(rv)) {
+    return Err(IOError(rv, "Could not %s `%s' to `%s'", aMethodName,
+                       aSource->HumanReadablePath().get(),
+                       aDest->HumanReadablePath().get()));
+  }
+  return Ok();
+}
+
+Result<Ok, IOUtils::IOError> IOUtils::RemoveSync(nsIFile* aFile,
+                                                 bool aIgnoreAbsent,
+                                                 bool aRecursive,
+                                                 bool aRetryReadonly) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  (void)aRetryReadonly;
+
+  nsresult rv = aFile->Remove(aRecursive);
+  if (aIgnoreAbsent && IsFileNotFound(rv)) {
+    return Ok();
+  }
+  if (NS_FAILED(rv)) {
+    if (IsFileNotFound(rv)) {
+      return Err(IOError(rv, "Could not remove `%s': file does not exist",
+                         aFile->HumanReadablePath().get()));
+    }
+
+
+    if (rv == NS_ERROR_FILE_DIR_NOT_EMPTY) {
+      return Err(IOError(rv,
+                         "Could not remove `%s': the directory is not empty",
+                         aFile->HumanReadablePath().get()));
+    }
+
+    return Err(
+        IOError(rv, "Could not remove `%s'", aFile->HumanReadablePath().get()));
+  }
+  return Ok();
+}
+
+Result<Ok, IOUtils::IOError> IOUtils::MakeDirectorySync(nsIFile* aFile,
+                                                        bool aCreateAncestors,
+                                                        bool aIgnoreExisting,
+                                                        int32_t aMode) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  nsCOMPtr<nsIFile> parent;
+  IOUTILS_TRY_WITH_CONTEXT(
+      aFile->GetParent(getter_AddRefs(parent)),
+      "Could not make directory `%s': could not get parent directory",
+      aFile->HumanReadablePath().get());
+  if (!parent) {
+    // Otherwise, we fall through to `nsiFile::Create()` and let it fail there
+    bool exists = false;
+    IOUTILS_TRY_WITH_CONTEXT(
+        aFile->Exists(&exists),
+        "Could not make directory `%s': could not stat file or directory",
+        aFile->HumanReadablePath().get());
+
+    if (exists) {
+      return Ok();
+    }
+  }
+
+  nsresult rv =
+      aFile->Create(nsIFile::DIRECTORY_TYPE, aMode, !aCreateAncestors);
+  if (NS_FAILED(rv)) {
+    if (rv == NS_ERROR_FILE_ALREADY_EXISTS) {
+      bool isDirectory;
+      IOUTILS_TRY_WITH_CONTEXT(
+          aFile->IsDirectory(&isDirectory),
+          "Could not make directory `%s': could not stat file or directory",
+          aFile->HumanReadablePath().get());
+
+      if (!isDirectory) {
+        return Err(IOError(NS_ERROR_FILE_NOT_DIRECTORY,
+                           "Could not create directory `%s': file exists and "
+                           "is not a directory",
+                           aFile->HumanReadablePath().get()));
+      }
+      if (aIgnoreExisting) {
+        return Ok();
+      }
+      return Err(IOError(
+          rv, "Could not create directory `%s': directory already exists",
+          aFile->HumanReadablePath().get()));
+    }
+    return Err(IOError(rv, "Could not create directory `%s'",
+                       aFile->HumanReadablePath().get()));
+  }
+  return Ok();
+}
+
+Result<IOUtils::InternalFileInfo, IOUtils::IOError> IOUtils::StatSync(
+    nsIFile* aFile) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  InternalFileInfo info;
+  MOZ_ALWAYS_SUCCEEDS(aFile->GetPath(info.mPath));
+
+  bool isRegular = false;
+  nsresult rv = aFile->IsFile(&isRegular);
+  if (NS_FAILED(rv)) {
+    if (IsFileNotFound(rv)) {
+      return Err(IOError(rv, "Could not stat `%s': file does not exist",
+                         aFile->HumanReadablePath().get()));
+    }
+    return Err(
+        IOError(rv, "Could not stat `%s'", aFile->HumanReadablePath().get()));
+  }
+
+  info.mType = dom::FileType::Regular;
+  if (!isRegular) {
+    bool isDir = false;
+    IOUTILS_TRY_WITH_CONTEXT(aFile->IsDirectory(&isDir), "Could not stat `%s'",
+                             aFile->HumanReadablePath().get());
+    info.mType = isDir ? dom::FileType::Directory : dom::FileType::Other;
+  }
+
+  int64_t size = -1;
+  if (info.mType == dom::FileType::Regular) {
+    IOUTILS_TRY_WITH_CONTEXT(aFile->GetFileSize(&size), "Could not stat `%s'",
+                             aFile->HumanReadablePath().get());
+  }
+  info.mSize = size;
+
+  PRTime creationTime = 0;
+  if (nsresult rv = aFile->GetCreationTime(&creationTime); NS_SUCCEEDED(rv)) {
+    info.mCreationTime.emplace(static_cast<int64_t>(creationTime));
+  } else if (NS_FAILED(rv) && rv != NS_ERROR_NOT_IMPLEMENTED) {
+    return Err(
+        IOError(rv, "Could not stat `%s'", aFile->HumanReadablePath().get()));
+  }
+
+  PRTime lastAccessed = 0;
+  IOUTILS_TRY_WITH_CONTEXT(aFile->GetLastAccessedTime(&lastAccessed),
+                           "Could not stat `%s'",
+                           aFile->HumanReadablePath().get());
+
+  info.mLastAccessed = static_cast<int64_t>(lastAccessed);
+
+  PRTime lastModified = 0;
+  IOUTILS_TRY_WITH_CONTEXT(aFile->GetLastModifiedTime(&lastModified),
+                           "Could not stat `%s'",
+                           aFile->HumanReadablePath().get());
+
+  info.mLastModified = static_cast<int64_t>(lastModified);
+
+  IOUTILS_TRY_WITH_CONTEXT(aFile->GetPermissions(&info.mPermissions),
+                           "Could not stat `%s'",
+                           aFile->HumanReadablePath().get());
+
+  return info;
+}
+
+Result<int64_t, IOUtils::IOError> IOUtils::SetTimeSync(
+    nsIFile* aFile, IOUtils::SetTimeFn aSetTimeFn, int64_t aNewTime) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  if (aNewTime == 0) {
+    return Err(IOError(
+        NS_ERROR_ILLEGAL_VALUE,
+        "Refusing to set modification time of `%s' to 0: to use the current "
+        "system time, call `setModificationTime' with no arguments",
+        aFile->HumanReadablePath().get()));
+  }
+
+  nsresult rv = (aFile->*aSetTimeFn)(aNewTime);
+
+  if (NS_FAILED(rv)) {
+    if (IsFileNotFound(rv)) {
+      return Err(IOError(
+          rv, "Could not set modification time of `%s': file does not exist",
+          aFile->HumanReadablePath().get()));
+    }
+    return Err(IOError(rv, "Could not set modification time of `%s'",
+                       aFile->HumanReadablePath().get()));
+  }
+  return aNewTime;
+}
+
+Result<bool, IOUtils::IOError> IOUtils::HasChildrenSync(nsIFile* aFile,
+                                                        bool aIgnoreAbsent) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  nsCOMPtr<nsIDirectoryEnumerator> iter;
+  nsresult rv = aFile->GetDirectoryEntries(getter_AddRefs(iter));
+  if (aIgnoreAbsent && IsFileNotFound(rv)) {
+    return false;
+  }
+  if (NS_FAILED(rv)) {
+    if (IsFileNotFound(rv)) {
+      return Err(IOError(
+          rv, "Could not check children of `%s': directory does not exist",
+          aFile->HumanReadablePath().get()));
+    }
+    if (IsNotDirectory(rv)) {
+      return Err(IOError(
+          rv, "Could not check children of `%s': file is not a directory",
+          aFile->HumanReadablePath().get()));
+    }
+    return Err(IOError(rv, "Could not check children of `%s'",
+                       aFile->HumanReadablePath().get()));
+  }
+
+  bool hasMoreElements = false;
+  IOUTILS_TRY_WITH_CONTEXT(
+      iter->HasMoreElements(&hasMoreElements),
+      "Could not check children of `%s': could not iterate children",
+      aFile->HumanReadablePath().get());
+
+  return hasMoreElements;
+}
+
+Result<nsTArray<nsString>, IOUtils::IOError> IOUtils::GetChildrenSync(
+    nsIFile* aFile, bool aIgnoreAbsent) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  nsTArray<nsString> children;
+  nsCOMPtr<nsIDirectoryEnumerator> iter;
+  nsresult rv = aFile->GetDirectoryEntries(getter_AddRefs(iter));
+  if (aIgnoreAbsent && IsFileNotFound(rv)) {
+    return children;
+  }
+  if (NS_FAILED(rv)) {
+    if (IsFileNotFound(rv)) {
+      return Err(IOError(
+          rv, "Could not get children of `%s': directory does not exist",
+          aFile->HumanReadablePath().get()));
+    }
+    if (IsNotDirectory(rv)) {
+      return Err(
+          IOError(rv, "Could not get children of `%s': file is not a directory",
+                  aFile->HumanReadablePath().get()));
+    }
+    return Err(IOError(rv, "Could not get children of `%s'",
+                       aFile->HumanReadablePath().get()));
+  }
+
+  bool hasMoreElements = false;
+  IOUTILS_TRY_WITH_CONTEXT(
+      iter->HasMoreElements(&hasMoreElements),
+      "Could not get children of `%s': could not iterate children",
+      aFile->HumanReadablePath().get());
+
+  while (hasMoreElements) {
+    nsCOMPtr<nsIFile> child;
+    IOUTILS_TRY_WITH_CONTEXT(
+        iter->GetNextFile(getter_AddRefs(child)),
+        "Could not get children of `%s': could not retrieve child file",
+        aFile->HumanReadablePath().get());
+
+    if (child) {
+      nsString path;
+      MOZ_ALWAYS_SUCCEEDS(child->GetPath(path));
+      children.AppendElement(path);
+    }
+
+    IOUTILS_TRY_WITH_CONTEXT(
+        iter->HasMoreElements(&hasMoreElements),
+        "Could not get children of `%s': could not iterate children",
+        aFile->HumanReadablePath().get());
+  }
+
+  return children;
+}
+
+Result<Ok, IOUtils::IOError> IOUtils::SetPermissionsSync(
+    nsIFile* aFile, const uint32_t aPermissions) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  IOUTILS_TRY_WITH_CONTEXT(aFile->SetPermissions(aPermissions),
+                           "Could not set permissions on `%s'",
+                           aFile->HumanReadablePath().get());
+
+  return Ok{};
+}
+
+Result<bool, IOUtils::IOError> IOUtils::ExistsSync(nsIFile* aFile) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  bool exists = false;
+  IOUTILS_TRY_WITH_CONTEXT(aFile->Exists(&exists), "Could not stat `%s'",
+                           aFile->HumanReadablePath().get());
+
+  return exists;
+}
+
+Result<nsString, IOUtils::IOError> IOUtils::CreateUniqueSync(
+    nsIFile* aFile, const uint32_t aFileType, const uint32_t aPermissions) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  if (nsresult rv = aFile->CreateUnique(aFileType, aPermissions);
+      NS_FAILED(rv)) {
+    nsCOMPtr<nsIFile> aParent = nullptr;
+    MOZ_ALWAYS_SUCCEEDS(aFile->GetParent(getter_AddRefs(aParent)));
+    MOZ_RELEASE_ASSERT(aParent);
+    return Err(
+        IOError(rv, "Could not create unique %s in `%s'",
+                aFileType == nsIFile::NORMAL_FILE_TYPE ? "file" : "directory",
+                aParent->HumanReadablePath().get()));
+  }
+
+  nsString path;
+  MOZ_ALWAYS_SUCCEEDS(aFile->GetPath(path));
+
+  return path;
+}
+
+Result<nsCString, IOUtils::IOError> IOUtils::ComputeHexDigestSync(
+    nsIFile* aFile, const HashAlgorithm aAlgorithm) {
+  using HashAlgorithm = HashAlgorithm;
+
+  static constexpr size_t BUFFER_SIZE = 8192;
+
+  SECOidTag alg;
+  switch (aAlgorithm) {
+    case HashAlgorithm::Sha256:
+      alg = SEC_OID_SHA256;
+      break;
+
+    case HashAlgorithm::Sha384:
+      alg = SEC_OID_SHA384;
+      break;
+
+    case HashAlgorithm::Sha512:
+      alg = SEC_OID_SHA512;
+      break;
+
+    default:
+      MOZ_RELEASE_ASSERT(false, "Unexpected HashAlgorithm");
+  }
+
+  Digest digest;
+  if (nsresult rv = digest.Begin(alg); NS_FAILED(rv)) {
+    return Err(IOError(rv, "Could not hash `%s': could not create digest",
+                       aFile->HumanReadablePath().get()));
+  }
+
+  RefPtr<nsIInputStream> stream;
+  if (nsresult rv = NS_NewLocalFileInputStream(getter_AddRefs(stream), aFile);
+      NS_FAILED(rv)) {
+    return Err(IOError(rv, "Could not hash `%s': could not open for reading",
+                       aFile->HumanReadablePath().get()));
+  }
+
+  char buffer[BUFFER_SIZE];
+  uint32_t read = 0;
+  for (;;) {
+    if (nsresult rv = stream->Read(buffer, BUFFER_SIZE, &read); NS_FAILED(rv)) {
+      return Err(IOError(rv,
+                         "Could not hash `%s': encountered an unexpected error "
+                         "while reading file",
+                         aFile->HumanReadablePath().get()));
+    }
+    if (read == 0) {
+      break;
+    }
+
+    if (nsresult rv =
+            digest.Update(reinterpret_cast<unsigned char*>(buffer), read);
+        NS_FAILED(rv)) {
+      return Err(IOError(rv, "Could not hash `%s': could not update digest",
+                         aFile->HumanReadablePath().get()));
+    }
+  }
+
+  AutoTArray<uint8_t, SHA512_LENGTH> rawDigest;
+  if (nsresult rv = digest.End(rawDigest); NS_FAILED(rv)) {
+    return Err(IOError(rv, "Could not hash `%s': could not compute digest",
+                       aFile->HumanReadablePath().get()));
+  }
+
+  nsCString hexDigest;
+  if (!hexDigest.SetCapacity(2 * rawDigest.Length(), fallible)) {
+    return Err(IOError(NS_ERROR_OUT_OF_MEMORY,
+                       "Could not hash `%s': out of memory",
+                       aFile->HumanReadablePath().get()));
+  }
+
+  const char HEX[] = "0123456789abcdef";
+  for (uint8_t b : rawDigest) {
+    hexDigest.Append(HEX[(b >> 4) & 0xF]);
+    hexDigest.Append(HEX[b & 0xF]);
+  }
+
+  return hexDigest;
+}
+
+
+void IOUtils::GetProfileBeforeChange(GlobalObject& aGlobal,
+                                     JS::MutableHandle<JS::Value> aClient,
+                                     ErrorResult& aRv) {
+  return GetShutdownClient(aGlobal, aClient, aRv,
+                           ShutdownPhase::ProfileBeforeChange);
+}
+
+void IOUtils::GetSendTelemetry(GlobalObject& aGlobal,
+                               JS::MutableHandle<JS::Value> aClient,
+                               ErrorResult& aRv) {
+  return GetShutdownClient(aGlobal, aClient, aRv, ShutdownPhase::SendTelemetry);
+}
+
+static void AssertHasShutdownClient(const IOUtils::ShutdownPhase aPhase) {
+  MOZ_RELEASE_ASSERT(aPhase >= IOUtils::ShutdownPhase::ProfileBeforeChange &&
+                     aPhase < IOUtils::ShutdownPhase::XpcomWillShutdown);
+}
+
+void IOUtils::GetShutdownClient(GlobalObject& aGlobal,
+                                JS::MutableHandle<JS::Value> aClient,
+                                ErrorResult& aRv,
+                                const IOUtils::ShutdownPhase aPhase) {
+  MOZ_RELEASE_ASSERT(XRE_IsParentProcess());
+  MOZ_RELEASE_ASSERT(NS_IsMainThread());
+  AssertHasShutdownClient(aPhase);
+
+  if (auto state = GetState()) {
+    MOZ_RELEASE_ASSERT(state.ref()->mBlockerStatus !=
+                       ShutdownBlockerStatus::Uninitialized);
+
+    if (state.ref()->mBlockerStatus == ShutdownBlockerStatus::Failed) {
+      aRv.ThrowAbortError("IOUtils: could not register shutdown blockers");
+      return;
+    }
+
+    MOZ_RELEASE_ASSERT(state.ref()->mBlockerStatus ==
+                       ShutdownBlockerStatus::Initialized);
+    auto result = state.ref()->mEventQueue->GetShutdownClient(aPhase);
+    if (result.isErr()) {
+      aRv.ThrowAbortError("IOUtils: could not get shutdown client");
+      return;
+    }
+
+    RefPtr<nsIAsyncShutdownClient> client = result.unwrap();
+    MOZ_RELEASE_ASSERT(client);
+    if (nsresult rv = client->GetJsclient(aClient); NS_FAILED(rv)) {
+      aRv.ThrowAbortError("IOUtils: Could not get shutdown jsclient");
+    }
+    return;
+  }
+
+  aRv.ThrowAbortError(
+      "IOUtils: profileBeforeChange phase has already finished");
+}
+
+Maybe<IOUtils::StateMutex::AutoLock> IOUtils::GetState() {
+  auto state = sState.Lock();
+  if (state->mQueueStatus == EventQueueStatus::Shutdown) {
+    return Nothing{};
+  }
+
+  if (state->mQueueStatus == EventQueueStatus::Uninitialized) {
+    MOZ_RELEASE_ASSERT(!state->mEventQueue);
+    state->mEventQueue = new EventQueue();
+    state->mQueueStatus = EventQueueStatus::Initialized;
+
+    MOZ_RELEASE_ASSERT(state->mBlockerStatus ==
+                       ShutdownBlockerStatus::Uninitialized);
+  }
+
+  if (NS_IsMainThread() &&
+      state->mBlockerStatus == ShutdownBlockerStatus::Uninitialized) {
+    state->SetShutdownHooks();
+  }
+
+  return Some(std::move(state));
+}
+
+IOUtils::EventQueue::EventQueue() {
+  MOZ_ALWAYS_SUCCEEDS(NS_CreateBackgroundTaskQueue(
+      "IOUtils::EventQueue", getter_AddRefs(mBackgroundEventTarget)));
+
+  MOZ_RELEASE_ASSERT(mBackgroundEventTarget);
+}
+
+void IOUtils::State::SetShutdownHooks() {
+  if (mBlockerStatus != ShutdownBlockerStatus::Uninitialized) {
+    return;
+  }
+
+  if (NS_WARN_IF(NS_FAILED(mEventQueue->SetShutdownHooks()))) {
+    mBlockerStatus = ShutdownBlockerStatus::Failed;
+  } else {
+    mBlockerStatus = ShutdownBlockerStatus::Initialized;
+  }
+
+  if (mBlockerStatus != ShutdownBlockerStatus::Initialized) {
+    NS_WARNING("IOUtils: could not register shutdown blockers.");
+  }
+}
+
+nsresult IOUtils::EventQueue::SetShutdownHooks() {
+  MOZ_RELEASE_ASSERT(NS_IsMainThread());
+
+  constexpr static auto STACK = u"IOUtils::EventQueue::SetShutdownHooks"_ns;
+  constexpr static auto FILE = NS_LITERAL_STRING_FROM_CSTRING(__FILE__);
+
+  nsCOMPtr<nsIAsyncShutdownService> svc = services::GetAsyncShutdownService();
+  if (!svc) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  nsCOMPtr<nsIAsyncShutdownBlocker> profileBeforeChangeBlocker;
+
+  {
+    profileBeforeChangeBlocker =
+        new IOUtilsShutdownBlocker(ShutdownPhase::ProfileBeforeChange);
+
+    nsCOMPtr<nsIAsyncShutdownClient> globalClient;
+    MOZ_TRY(svc->GetProfileBeforeChange(getter_AddRefs(globalClient)));
+    MOZ_RELEASE_ASSERT(globalClient);
+
+    MOZ_TRY(globalClient->AddBlocker(profileBeforeChangeBlocker, FILE, __LINE__,
+                                     STACK));
+  }
+
+  {
+    nsCOMPtr<nsIAsyncShutdownBarrier> barrier;
+
+    MOZ_TRY(svc->MakeBarrier(
+        u"IOUtils: waiting for profileBeforeChange IO to complete"_ns,
+        getter_AddRefs(barrier)));
+    MOZ_RELEASE_ASSERT(barrier);
+
+    mBarriers[ShutdownPhase::ProfileBeforeChange] = std::move(barrier);
+  }
+
+  nsCOMPtr<nsIAsyncShutdownBlocker> sendTelemetryBlocker;
+  {
+    sendTelemetryBlocker =
+        new IOUtilsShutdownBlocker(ShutdownPhase::SendTelemetry);
+
+    nsCOMPtr<nsIAsyncShutdownClient> globalClient;
+    MOZ_TRY(svc->GetSendTelemetry(getter_AddRefs(globalClient)));
+    MOZ_RELEASE_ASSERT(globalClient);
+
+    MOZ_TRY(
+        globalClient->AddBlocker(sendTelemetryBlocker, FILE, __LINE__, STACK));
+  }
+
+  {
+    nsCOMPtr<nsIAsyncShutdownBarrier> barrier;
+
+    MOZ_TRY(svc->MakeBarrier(
+        u"IOUtils: waiting for sendTelemetry IO to complete"_ns,
+        getter_AddRefs(barrier)));
+    MOZ_RELEASE_ASSERT(barrier);
+
+    nsCOMPtr<nsIAsyncShutdownClient> client;
+    MOZ_TRY(barrier->GetClient(getter_AddRefs(client)));
+
+    MOZ_TRY(
+        client->AddBlocker(profileBeforeChangeBlocker, FILE, __LINE__, STACK));
+
+    mBarriers[ShutdownPhase::SendTelemetry] = std::move(barrier);
+  }
+
+  {
+    nsCOMPtr<nsIAsyncShutdownClient> globalClient;
+    MOZ_TRY(svc->GetXpcomWillShutdown(getter_AddRefs(globalClient)));
+    MOZ_RELEASE_ASSERT(globalClient);
+
+    nsCOMPtr<nsIAsyncShutdownBlocker> blocker =
+        new IOUtilsShutdownBlocker(ShutdownPhase::XpcomWillShutdown);
+    MOZ_TRY(globalClient->AddBlocker(
+        blocker, FILE, __LINE__, u"IOUtils::EventQueue::SetShutdownHooks"_ns));
+  }
+
+  {
+    nsCOMPtr<nsIAsyncShutdownBarrier> barrier;
+
+    MOZ_TRY(svc->MakeBarrier(
+        u"IOUtils: waiting for xpcomWillShutdown IO to complete"_ns,
+        getter_AddRefs(barrier)));
+    MOZ_RELEASE_ASSERT(barrier);
+
+    nsCOMPtr<nsIAsyncShutdownClient> client;
+    MOZ_TRY(barrier->GetClient(getter_AddRefs(client)));
+
+    client->AddBlocker(sendTelemetryBlocker, FILE, __LINE__,
+                       u"IOUtils::EventQueue::SetShutdownHooks"_ns);
+
+    mBarriers[ShutdownPhase::XpcomWillShutdown] = std::move(barrier);
+  }
+
+  return NS_OK;
+}
+
+template <typename OkT, typename Fn>
+RefPtr<IOUtils::IOPromise<OkT>> IOUtils::EventQueue::Dispatch(Fn aFunc) {
+  MOZ_RELEASE_ASSERT(mBackgroundEventTarget);
+
+  auto promise =
+      MakeRefPtr<typename IOUtils::IOPromise<OkT>::Private>(__func__);
+  mBackgroundEventTarget->Dispatch(
+      NS_NewRunnableFunction("IOUtils::EventQueue::Dispatch",
+                             [promise, func = std::move(aFunc)] {
+                               Result<OkT, IOError> result = func();
+                               if (result.isErr()) {
+                                 promise->Reject(result.unwrapErr(), __func__);
+                               } else {
+                                 promise->Resolve(result.unwrap(), __func__);
+                               }
+                             }),
+      NS_DISPATCH_EVENT_MAY_BLOCK);
+  return promise;
+};
+
+Result<already_AddRefed<nsIAsyncShutdownBarrier>, nsresult>
+IOUtils::EventQueue::GetShutdownBarrier(const IOUtils::ShutdownPhase aPhase) {
+  if (!mBarriers[aPhase]) {
+    return Err(NS_ERROR_NOT_AVAILABLE);
+  }
+
+  return do_AddRef(mBarriers[aPhase]);
+}
+
+Result<already_AddRefed<nsIAsyncShutdownClient>, nsresult>
+IOUtils::EventQueue::GetShutdownClient(const IOUtils::ShutdownPhase aPhase) {
+  AssertHasShutdownClient(aPhase);
+
+  if (!mBarriers[aPhase]) {
+    return Err(NS_ERROR_NOT_AVAILABLE);
+  }
+
+  nsCOMPtr<nsIAsyncShutdownClient> client;
+  MOZ_TRY(mBarriers[aPhase]->GetClient(getter_AddRefs(client)));
+
+  return do_AddRef(client);
+}
+
+Result<nsTArray<uint8_t>, IOUtils::IOError> IOUtils::MozLZ4::Compress(
+    Span<const uint8_t> aUncompressed) {
+  nsTArray<uint8_t> result;
+  size_t worstCaseSize =
+      Compression::LZ4::maxCompressedSize(aUncompressed.Length()) + HEADER_SIZE;
+  if (!result.SetCapacity(worstCaseSize, fallible)) {
+    return Err(IOError(NS_ERROR_OUT_OF_MEMORY,
+                       "could not allocate buffer to compress data"_ns));
+  }
+  result.AppendElements(Span(MAGIC_NUMBER.data(), MAGIC_NUMBER.size()));
+  std::array<uint8_t, sizeof(uint32_t)> contentSizeBytes{};
+  LittleEndian::writeUint32(contentSizeBytes.data(), aUncompressed.Length());
+  result.AppendElements(Span(contentSizeBytes.data(), contentSizeBytes.size()));
+
+  if (aUncompressed.Length() == 0) {
+    result.SetLength(HEADER_SIZE);
+    return result;
+  }
+
+  size_t compressed = Compression::LZ4::compress(
+      reinterpret_cast<const char*>(aUncompressed.Elements()),
+      aUncompressed.Length(),
+      reinterpret_cast<char*>(result.Elements()) + HEADER_SIZE);
+  if (!compressed) {
+    return Err(IOError(NS_ERROR_UNEXPECTED, "could not compress data"_ns));
+  }
+  result.SetLength(HEADER_SIZE + compressed);
+  return result;
+}
+
+Result<IOUtils::JsBuffer, IOUtils::IOError> IOUtils::MozLZ4::Decompress(
+    Span<const uint8_t> aFileContents, IOUtils::BufferKind aBufferKind) {
+  if (aFileContents.LengthBytes() < HEADER_SIZE) {
+    return Err(IOError(NS_ERROR_FILE_CORRUPTED,
+                       "could not decompress file: buffer is too small"_ns));
+  }
+  auto header = aFileContents.To(HEADER_SIZE);
+  if (!std::equal(std::begin(MAGIC_NUMBER), std::end(MAGIC_NUMBER),
+                  std::begin(header))) {
+    nsCString magicStr;
+    uint32_t i = 0;
+    for (; i < header.Length() - 1; ++i) {
+      magicStr.AppendPrintf("%02X ", header.at(i));
+    }
+    magicStr.AppendPrintf("%02X", header.at(i));
+
+    return Err(IOError(NS_ERROR_FILE_CORRUPTED,
+                       "could not decompress file: invalid LZ4 header: wrong "
+                       "magic number: `%s'",
+                       magicStr.get()));
+  }
+  size_t numBytes = sizeof(uint32_t);
+  Span<const uint8_t> sizeBytes = header.Last(numBytes);
+  uint32_t expectedDecompressedSize =
+      LittleEndian::readUint32(sizeBytes.data());
+  if (expectedDecompressedSize == 0) {
+    return JsBuffer::CreateEmpty(aBufferKind);
+  }
+  auto contents = aFileContents.From(HEADER_SIZE);
+  auto result = JsBuffer::Create(aBufferKind, expectedDecompressedSize);
+  if (result.isErr()) {
+    return Err(IOError::WithCause(
+        result.unwrapErr(),
+        "could not decompress file: could not allocate buffer"_ns));
+  }
+
+  JsBuffer decompressed = result.unwrap();
+  size_t actualSize = 0;
+  if (!Compression::LZ4::decompress(
+          reinterpret_cast<const char*>(contents.Elements()), contents.Length(),
+          reinterpret_cast<char*>(decompressed.Elements()),
+          expectedDecompressedSize, &actualSize)) {
+    return Err(
+        IOError(NS_ERROR_FILE_CORRUPTED,
+                "could not decompress file: the file may be corrupt"_ns));
+  }
+  decompressed.SetLength(actualSize);
+  return decompressed;
+}
+
+NS_IMPL_ISUPPORTS(IOUtilsShutdownBlocker, nsIAsyncShutdownBlocker,
+                  nsIAsyncShutdownCompletionCallback);
+
+NS_IMETHODIMP IOUtilsShutdownBlocker::GetName(nsAString& aName) {
+  aName = u"IOUtils Blocker ("_ns;
+  aName.Append(PHASE_NAMES[mPhase]);
+  aName.Append(')');
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP IOUtilsShutdownBlocker::BlockShutdown(
+    nsIAsyncShutdownClient* aBarrierClient) {
+  using EventQueueStatus = IOUtils::EventQueueStatus;
+  using ShutdownPhase = IOUtils::ShutdownPhase;
+
+  MOZ_RELEASE_ASSERT(NS_IsMainThread());
+
+  nsCOMPtr<nsIAsyncShutdownBarrier> barrier;
+
+  {
+    auto state = IOUtils::sState.Lock();
+    if (state->mQueueStatus == EventQueueStatus::Shutdown) {
+
+      MOZ_RELEASE_ASSERT(mPhase == ShutdownPhase::XpcomWillShutdown);
+      MOZ_RELEASE_ASSERT(!state->mEventQueue);
+
+      (void)NS_WARN_IF(NS_FAILED(aBarrierClient->RemoveBlocker(this)));
+      mParentClient = nullptr;
+
+      return NS_OK;
+    }
+
+    MOZ_RELEASE_ASSERT(state->mEventQueue);
+
+    mParentClient = aBarrierClient;
+
+    barrier = state->mEventQueue->GetShutdownBarrier(mPhase).unwrapOr(nullptr);
+  }
+
+  if (!barrier || NS_WARN_IF(NS_FAILED(barrier->Wait(this)))) {
+    (void)Done();
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP IOUtilsShutdownBlocker::Done() {
+  using EventQueueStatus = IOUtils::EventQueueStatus;
+  using ShutdownPhase = IOUtils::ShutdownPhase;
+
+  MOZ_RELEASE_ASSERT(NS_IsMainThread());
+
+  bool didFlush = false;
+
+  {
+    auto state = IOUtils::sState.Lock();
+
+    if (state->mEventQueue) {
+      MOZ_RELEASE_ASSERT(state->mQueueStatus == EventQueueStatus::Initialized);
+
+      state->mEventQueue->Dispatch<Ok>([]() { return Ok{}; })
+          ->Then(GetMainThreadSerialEventTarget(), __func__,
+                 [self = RefPtr(this)]() { self->OnFlush(); });
+
+      if (mPhase >= LAST_IO_PHASE) {
+        state->mQueueStatus = EventQueueStatus::Shutdown;
+      }
+
+      didFlush = true;
+    }
+  }
+
+  if (!didFlush) {
+    MOZ_RELEASE_ASSERT(mPhase == ShutdownPhase::XpcomWillShutdown);
+    OnFlush();
+  }
+
+  return NS_OK;
+}
+
+void IOUtilsShutdownBlocker::OnFlush() {
+  if (mParentClient) {
+    (void)NS_WARN_IF(NS_FAILED(mParentClient->RemoveBlocker(this)));
+    mParentClient = nullptr;
+
+    if (mPhase >= LAST_IO_PHASE) {
+      auto state = IOUtils::sState.Lock();
+      if (state->mEventQueue) {
+        state->mEventQueue = nullptr;
+      }
+    }
+  }
+}
+
+NS_IMETHODIMP IOUtilsShutdownBlocker::GetState(nsIPropertyBag** aState) {
+  return NS_OK;
+}
+
+Result<IOUtils::InternalWriteOpts, IOUtils::IOError>
+IOUtils::InternalWriteOpts::FromBinding(const WriteOptions& aOptions) {
+  InternalWriteOpts opts;
+  opts.mFlush = aOptions.mFlush;
+  opts.mMode = aOptions.mMode;
+
+  if (aOptions.mBackupFile.WasPassed()) {
+    opts.mBackupFile = new nsLocalFile();
+    if (nsresult rv = PathUtils::InitFileWithPath(opts.mBackupFile,
+                                                  aOptions.mBackupFile.Value());
+        NS_FAILED(rv)) {
+      return Err(IOUtils::IOError(
+          rv, "Could not parse path of backupFile `%s'",
+          NS_ConvertUTF16toUTF8(aOptions.mBackupFile.Value()).get()));
+    }
+  }
+
+  if (aOptions.mTmpPath.WasPassed()) {
+    opts.mTmpFile = new nsLocalFile();
+    if (nsresult rv = PathUtils::InitFileWithPath(opts.mTmpFile,
+                                                  aOptions.mTmpPath.Value());
+        NS_FAILED(rv)) {
+      return Err(IOUtils::IOError(
+          rv, "Could not parse path of temp file `%s'",
+          NS_ConvertUTF16toUTF8(aOptions.mTmpPath.Value()).get()));
+    }
+  }
+
+  opts.mCompress = aOptions.mCompress;
+  return opts;
+}
+
+Result<IOUtils::InternalWriteOpts, IOUtils::IOError>
+IOUtils::InternalWriteOpts::FromBinding(const WriteJSONOptions& aOptions) {
+  InternalWriteOpts opts =
+      MOZ_TRY(FromBinding(static_cast<const WriteOptions&>(aOptions)));
+
+  opts.mLengthHint = aOptions.mLengthHint;
+
+  return opts;
+}
+
+Result<IOUtils::JsBuffer, IOUtils::IOError> IOUtils::JsBuffer::Create(
+    IOUtils::BufferKind aBufferKind, size_t aCapacity) {
+  JsBuffer buffer(aBufferKind, aCapacity);
+  if (aCapacity != 0 && !buffer.mBuffer) {
+    return Err(IOError(NS_ERROR_OUT_OF_MEMORY, "Could not allocate buffer"_ns));
+  }
+  return buffer;
+}
+
+IOUtils::JsBuffer IOUtils::JsBuffer::CreateEmpty(
+    IOUtils::BufferKind aBufferKind) {
+  JsBuffer buffer(aBufferKind, 0);
+  MOZ_RELEASE_ASSERT(buffer.mBuffer == nullptr);
+  return buffer;
+}
+
+IOUtils::JsBuffer::JsBuffer(IOUtils::BufferKind aBufferKind, size_t aCapacity)
+    : mBufferKind(aBufferKind), mCapacity(aCapacity), mLength(0) {
+  if (mCapacity) {
+    if (aBufferKind == BufferKind::String) {
+      mBuffer = JS::UniqueChars(
+          js_pod_arena_malloc<char>(js::StringBufferArena, mCapacity));
+    } else {
+      MOZ_RELEASE_ASSERT(aBufferKind == BufferKind::Uint8Array);
+      mBuffer = JS::UniqueChars(
+          js_pod_arena_malloc<char>(js::ArrayBufferContentsArena, mCapacity));
+    }
+  }
+}
+
+IOUtils::JsBuffer::JsBuffer(IOUtils::JsBuffer&& aOther) noexcept
+    : mBufferKind(aOther.mBufferKind),
+      mCapacity(aOther.mCapacity),
+      mLength(aOther.mLength),
+      mBuffer(std::move(aOther.mBuffer)) {
+  aOther.mCapacity = 0;
+  aOther.mLength = 0;
+}
+
+IOUtils::JsBuffer& IOUtils::JsBuffer::operator=(
+    IOUtils::JsBuffer&& aOther) noexcept {
+  mBufferKind = aOther.mBufferKind;
+  mCapacity = aOther.mCapacity;
+  mLength = aOther.mLength;
+  mBuffer = std::move(aOther.mBuffer);
+
+  aOther.mCapacity = 0;
+  aOther.mLength = 0;
+
+  return *this;
+}
+
+JSString* IOUtils::JsBuffer::IntoString(JSContext* aCx, JsBuffer aBuffer) {
+  MOZ_RELEASE_ASSERT(aBuffer.mBufferKind == IOUtils::BufferKind::String);
+
+  if (!aBuffer.mCapacity) {
+    return JS_GetEmptyString(aCx);
+  }
+
+  if (IsAscii(aBuffer.BeginReading())) {
+    JS::UniqueLatin1Chars asLatin1(
+        reinterpret_cast<JS::Latin1Char*>(aBuffer.mBuffer.release()));
+    return JS_NewLatin1String(aCx, std::move(asLatin1), aBuffer.mLength);
+  }
+
+  const char* ptr = aBuffer.mBuffer.get();
+  size_t length = aBuffer.mLength;
+
+  if (length >= 3 && Substring(ptr, 3) == "\xEF\xBB\xBF"_ns) {
+    ptr += 3;
+    length -= 3;
+  }
+
+  return JS_NewStringCopyUTF8N(aCx, JS::UTF8Chars(ptr, length));
+}
+
+JSObject* IOUtils::JsBuffer::IntoUint8Array(JSContext* aCx, JsBuffer aBuffer) {
+  MOZ_RELEASE_ASSERT(aBuffer.mBufferKind == IOUtils::BufferKind::Uint8Array);
+
+  if (!aBuffer.mCapacity) {
+    return JS_NewUint8Array(aCx, 0);
+  }
+
+  MOZ_RELEASE_ASSERT(aBuffer.mBuffer);
+  JS::Rooted<JSObject*> arrayBuffer(
+      aCx, JS::NewArrayBufferWithContents(aCx, aBuffer.mLength,
+                                          std::move(aBuffer.mBuffer)));
+
+  if (!arrayBuffer) {
+    return nullptr;
+  }
+
+  return JS_NewUint8ArrayWithBuffer(aCx, arrayBuffer, 0, aBuffer.mLength);
+}
+
+[[nodiscard]] bool ToJSValue(JSContext* aCx, IOUtils::JsBuffer&& aBuffer,
+                             JS::MutableHandle<JS::Value> aValue) {
+  if (aBuffer.mBufferKind == IOUtils::BufferKind::String) {
+    JSString* str = IOUtils::JsBuffer::IntoString(aCx, std::move(aBuffer));
+    if (!str) {
+      return false;
+    }
+
+    aValue.setString(str);
+    return true;
+  }
+
+  JSObject* array = IOUtils::JsBuffer::IntoUint8Array(aCx, std::move(aBuffer));
+  if (!array) {
+    return false;
+  }
+
+  aValue.setObject(*array);
+  return true;
+}
+
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(SyncReadFile)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(SyncReadFile)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(SyncReadFile)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(SyncReadFile, mParent)
+
+SyncReadFile::SyncReadFile(nsISupports* aParent,
+                           RefPtr<nsFileRandomAccessStream>&& aStream,
+                           int64_t aSize)
+    : mParent(aParent), mStream(std::move(aStream)), mSize(aSize) {
+  MOZ_RELEASE_ASSERT(mSize >= 0);
+}
+
+SyncReadFile::~SyncReadFile() = default;
+
+JSObject* SyncReadFile::WrapObject(JSContext* aCx,
+                                   JS::Handle<JSObject*> aGivenProto) {
+  return SyncReadFile_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+void SyncReadFile::ReadBytesInto(const Uint8Array& aDestArray,
+                                 const int64_t aOffset, ErrorResult& aRv) {
+  if (!mStream) {
+    return aRv.ThrowOperationError("SyncReadFile is closed");
+  }
+
+  aDestArray.ProcessFixedData([&](const Span<uint8_t>& aData) {
+    auto rangeEnd = CheckedInt64(aOffset) + aData.Length();
+    if (!rangeEnd.isValid()) {
+      return aRv.ThrowOperationError("Requested range overflows i64");
+    }
+
+    if (rangeEnd.value() > mSize) {
+      return aRv.ThrowOperationError(
+          "Requested range overflows SyncReadFile size");
+    }
+
+    size_t readLen{aData.Length()};
+    if (readLen == 0) {
+      return;
+    }
+
+    if (nsresult rv = mStream->Seek(PR_SEEK_SET, aOffset); NS_FAILED(rv)) {
+      return aRv.ThrowOperationError(FormatErrorMessage(
+          rv, "Could not seek to position %" PRId64, aOffset));
+    }
+
+    Span<char> toRead = AsWritableChars(aData);
+
+    size_t totalRead = 0;
+    while (totalRead != readLen) {
+      uint32_t bytesToReadThisChunk =
+          std::min(readLen - totalRead, size_t(INT32_MAX));
+
+      uint32_t bytesRead = 0;
+      if (nsresult rv = mStream->Read(toRead.Elements(), bytesToReadThisChunk,
+                                      &bytesRead);
+          NS_FAILED(rv)) {
+        return aRv.ThrowOperationError(FormatErrorMessage(
+            rv,
+            "Encountered an unexpected error while reading file stream"_ns));
+      }
+      if (bytesRead == 0) {
+        return aRv.ThrowOperationError(
+            "Reading stopped before the entire array was filled");
+      }
+      totalRead += bytesRead;
+      toRead = toRead.From(bytesRead);
+    }
+  });
+}
+
+void SyncReadFile::Close() { mStream = nullptr; }
+
+#if defined(XP_UNIX)
+namespace {
+
+static nsCString FromUnixString(const IOUtils::UnixString& aString) {
+  if (aString.IsUTF8String()) {
+    return aString.GetAsUTF8String();
+  }
+  if (aString.IsUint8Array()) {
+    nsCString data;
+    (void)aString.GetAsUint8Array().AppendDataTo(data);
+    return data;
+  }
+  MOZ_CRASH("unreachable");
+}
+
+}  
+
+uint32_t IOUtils::LaunchProcess(GlobalObject& aGlobal,
+                                const Sequence<UnixString>& aArgv,
+                                const LaunchOptions& aOptions,
+                                ErrorResult& aRv) {
+  MOZ_ASSERT(!NS_IsMainThread());
+
+  AssertParentProcessWithCallerLocation(aGlobal);
+
+  std::vector<std::string> argv;
+  base::LaunchOptions options;
+
+  for (const auto& arg : aArgv) {
+    argv.push_back(FromUnixString(arg).get());
+  }
+
+  size_t envLen = aOptions.mEnvironment.Length();
+  base::EnvironmentArray envp(new char*[envLen + 1]);
+  for (size_t i = 0; i < envLen; ++i) {
+    envp[i] = strdup(FromUnixString(aOptions.mEnvironment[i]).get());
+  }
+  envp[envLen] = nullptr;
+  options.full_env = std::move(envp);
+
+  if (aOptions.mWorkdir.WasPassed()) {
+    options.workdir = FromUnixString(aOptions.mWorkdir.Value()).get();
+  }
+
+  if (aOptions.mFdMap.WasPassed()) {
+    for (const auto& fdItem : aOptions.mFdMap.Value()) {
+      options.fds_to_remap.push_back({fdItem.mSrc, fdItem.mDst});
+    }
+  }
+
+
+  base::ProcessHandle pid;
+  static_assert(sizeof(pid) <= sizeof(uint32_t),
+                "WebIDL long should be large enough for a pid");
+  Result<Ok, mozilla::ipc::LaunchError> err =
+      base::LaunchApp(argv, std::move(options), &pid);
+  if (err.isErr()) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return 0;
+  }
+
+  MOZ_ASSERT(pid >= 0);
+  return static_cast<uint32_t>(pid);
+}
+#endif
+
+}  
+
+#undef REJECT_IF_INIT_PATH_FAILED
+#undef IOUTILS_TRY_WITH_CONTEXT

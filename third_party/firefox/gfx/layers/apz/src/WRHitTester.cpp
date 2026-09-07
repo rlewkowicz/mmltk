@@ -1,0 +1,209 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "WRHitTester.h"
+#include "AsyncPanZoomController.h"
+#include "APZCTreeManager.h"
+#include "TreeTraversal.h"  // for BreadthFirstSearch
+#include "mozilla/gfx/CompositorHitTestInfo.h"
+#include "mozilla/layers/CompositorBridgeParent.h"
+#include "mozilla/webrender/WebRenderAPI.h"
+#include "nsDebug.h"        // for NS_ASSERTION
+#include "nsIXULRuntime.h"  // for FissionAutostart
+#include "mozilla/gfx/Matrix.h"
+
+#define APZCTM_LOG(...) \
+  MOZ_LOG(APZCTreeManager::sLog, LogLevel::Debug, (__VA_ARGS__))
+
+namespace mozilla {
+namespace layers {
+
+using mozilla::gfx::CompositorHitTestFlags;
+using mozilla::gfx::CompositorHitTestInvisibleToHit;
+
+static bool CheckCloseToIdentity(const gfx::Matrix4x4& aMatrix) {
+  const float multiplyEps = 1 / 2048.f;
+  const float translateEps = 1.f;
+
+  if (!FuzzyEqualsAdditive(aMatrix._11, 1.f, multiplyEps) ||
+      !FuzzyEqualsAdditive(aMatrix._12, 0.f, multiplyEps) ||
+      !FuzzyEqualsAdditive(aMatrix._13, 0.f, multiplyEps) ||
+      !FuzzyEqualsAdditive(aMatrix._14, 0.f, multiplyEps) ||
+      !FuzzyEqualsAdditive(aMatrix._21, 0.f, multiplyEps) ||
+      !FuzzyEqualsAdditive(aMatrix._22, 1.f, multiplyEps) ||
+      !FuzzyEqualsAdditive(aMatrix._23, 0.f, multiplyEps) ||
+      !FuzzyEqualsAdditive(aMatrix._24, 0.f, multiplyEps) ||
+      !FuzzyEqualsAdditive(aMatrix._31, 0.f, multiplyEps) ||
+      !FuzzyEqualsAdditive(aMatrix._32, 0.f, multiplyEps) ||
+      !FuzzyEqualsAdditive(aMatrix._33, 1.f, multiplyEps) ||
+      !FuzzyEqualsAdditive(aMatrix._34, 0.f, multiplyEps) ||
+      !FuzzyEqualsAdditive(aMatrix._41, 0.f, translateEps) ||
+      !FuzzyEqualsAdditive(aMatrix._42, 0.f, translateEps) ||
+      !FuzzyEqualsAdditive(aMatrix._43, 0.f, translateEps) ||
+      !FuzzyEqualsAdditive(aMatrix._44, 1.f, multiplyEps)) {
+    return false;
+  }
+  return true;
+}
+
+static bool CheckInvertibleWithFinitePrecision(const gfx::Matrix4x4& aMatrix) {
+  auto inverse = aMatrix.MaybeInverse();
+  if (inverse.isNothing()) {
+    return true;
+  }
+  if (!CheckCloseToIdentity(aMatrix * *inverse)) {
+    return false;
+  }
+  if (!CheckCloseToIdentity(*inverse * aMatrix)) {
+    return false;
+  }
+  return true;
+}
+
+IAPZHitTester::HitTestResult WRHitTester::GetAPZCAtPoint(
+    const ScreenPoint& aHitTestPoint,
+    const RecursiveMutexAutoLock& aProofOfTreeLock) {
+  HitTestResult hit;
+  RefPtr<wr::WebRenderAPI> wr = mTreeManager->GetWebRenderAPI();
+  if (!wr) {
+    hit.mTargetApzc = FindRootApzcForLayersId(GetRootLayersId());
+    hit.mHitResult = CompositorHitTestFlags::eVisibleToHitTest;
+    return hit;
+  }
+
+  APZCTM_LOG("Hit-testing point %s with WR\n", ToString(aHitTestPoint).c_str());
+  std::vector<wr::WrHitResult> results =
+      wr->HitTest(wr::ToWorldPoint(aHitTestPoint));
+
+  Maybe<wr::WrHitResult> chosenResult;
+  DebugOnly<bool> layersIdExists = true;
+  for (const wr::WrHitResult& result : results) {
+    ScrollableLayerGuid guid{result.mLayersId, 0, result.mScrollId};
+    APZCTM_LOG("Examining result with guid %s hit info 0x%x... ",
+               ToString(guid).c_str(), result.mHitInfo.serialize());
+    if (result.mHitInfo == CompositorHitTestInvisibleToHit) {
+      APZCTM_LOG("skipping due to invisibility.\n");
+      continue;
+    }
+    RefPtr<HitTestingTreeNode> node =
+        GetTargetNode(guid, &ScrollableLayerGuid::EqualsIgnoringPresShell);
+    if (!node) {
+      APZCTM_LOG("no corresponding node found, falling back to root.\n");
+
+#if defined(DEBUG)
+      layersIdExists =
+          CompositorBridgeParent::HasLayerTreeState(result.mLayersId);
+      if (FissionAutostart()) {
+        MOZ_ASSERT(result.mScrollId == ScrollableLayerGuid::NULL_SCROLL_ID ||
+                   !layersIdExists);
+      } else {
+        NS_ASSERTION(
+            result.mScrollId == ScrollableLayerGuid::NULL_SCROLL_ID,
+            "Inconsistency between WebRender display list and APZ scroll data");
+      }
+#endif
+      node = FindRootNodeForLayersId(result.mLayersId);
+      if (!node) {
+        MOZ_ASSERT(!layersIdExists,
+                   "No root node found for hit-test result layers id");
+        chosenResult = Some(result);
+        break;
+      }
+    }
+    MOZ_ASSERT(node->GetApzc());  
+    EventRegionsOverride flags = node->GetEventRegionsOverride();
+    if (flags & EventRegionsOverride::ForceEmptyHitRegion) {
+      APZCTM_LOG("skipping due to FEHR subtree.\n");
+      continue;
+    }
+
+    if (!CheckInvertibleWithFinitePrecision(
+            mTreeManager->GetScreenToApzcTransform(node->GetApzc())
+                .ToUnknownMatrix())) {
+      APZCTM_LOG("skipping due to check inverse accuracy\n");
+      continue;
+    }
+
+    APZCTM_LOG("selecting as chosen result.\n");
+    chosenResult = Some(result);
+    hit.mTargetApzc = node->GetApzc();
+    if (flags & EventRegionsOverride::ForceDispatchToContent) {
+      chosenResult->mHitInfo += CompositorHitTestFlags::eApzAwareListeners;
+    }
+    break;
+  }
+  if (!chosenResult) {
+    return hit;
+  }
+
+  MOZ_ASSERT(
+      hit.mTargetApzc || !layersIdExists,
+      "A hit-test result with a valid layers id should have a target APZC");
+  hit.mLayersId = chosenResult->mLayersId;
+  ScrollableLayerGuid::ViewID scrollId = chosenResult->mScrollId;
+  gfx::CompositorHitTestInfo hitInfo = chosenResult->mHitInfo;
+  Maybe<uint64_t> animationId = chosenResult->mAnimationId;
+  SideBits sideBits = chosenResult->mSideBits;
+
+  APZCTM_LOG("Successfully matched APZC %p (hit result 0x%x)\n",
+             hit.mTargetApzc.get(), hitInfo.serialize());
+
+  const bool isScrollbar =
+      hitInfo.contains(gfx::CompositorHitTestFlags::eScrollbar);
+  const bool isScrollbarThumb =
+      hitInfo.contains(gfx::CompositorHitTestFlags::eScrollbarThumb);
+  const ScrollDirection direction =
+      hitInfo.contains(gfx::CompositorHitTestFlags::eScrollbarVertical)
+          ? ScrollDirection::eVertical
+          : ScrollDirection::eHorizontal;
+  HitTestingTreeNode* scrollbarNode = nullptr;
+  if (isScrollbar || isScrollbarThumb) {
+    scrollbarNode = BreadthFirstSearch<ReverseIterator>(
+        GetRootNode(), [&](HitTestingTreeNode* aNode) {
+          return (aNode->GetLayersId() == hit.mLayersId) &&
+                 (aNode->IsScrollbarNode() == isScrollbar) &&
+                 (aNode->IsScrollThumbNode() == isScrollbarThumb) &&
+                 (aNode->GetScrollbarDirection() == direction) &&
+                 (aNode->GetScrollTargetId() == scrollId);
+        });
+  }
+
+  hit.mHitResult = hitInfo;
+
+  if (scrollbarNode) {
+    RefPtr<HitTestingTreeNode> scrollbarRef = scrollbarNode;
+    InitializeHitTestingTreeNodeAutoLock(hit.mScrollbarNode, aProofOfTreeLock,
+                                         scrollbarRef);
+  }
+
+  hit.mFixedPosSides = sideBits;
+  if (animationId.isSome()) {
+    RefPtr<HitTestingTreeNode> positionedNode = nullptr;
+
+    positionedNode = BreadthFirstSearch<ReverseIterator>(
+        GetRootNode(), [&](HitTestingTreeNode* aNode) {
+          return (aNode->GetFixedPositionAnimationId() == animationId ||
+                  aNode->GetStickyPositionAnimationId() == animationId);
+        });
+
+    if (positionedNode) {
+      MOZ_ASSERT(positionedNode->GetLayersId() == chosenResult->mLayersId,
+                 "Found node layers id does not match the hit result");
+      MOZ_ASSERT((positionedNode->GetFixedPositionAnimationId().isSome() ||
+                  positionedNode->GetStickyPositionAnimationId().isSome()),
+                 "A a matching fixed/sticky position node should be found");
+      InitializeHitTestingTreeNodeAutoLock(hit.mNode, aProofOfTreeLock,
+                                           positionedNode);
+    }
+
+  }
+
+  hit.mHitOverscrollGutter =
+      hit.mTargetApzc && hit.mTargetApzc->IsInOverscrollGutter(aHitTestPoint);
+
+  return hit;
+}
+
+}  
+}  

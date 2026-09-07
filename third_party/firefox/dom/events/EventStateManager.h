@@ -1,0 +1,799 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_EventStateManager_h_
+#define mozilla_EventStateManager_h_
+
+#include "Units.h"
+#include "WheelHandlingHelper.h"  // for WheelDeltaAdjustmentStrategy
+#include "mozilla/Attributes.h"
+#include "mozilla/EventForwards.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/dom/Record.h"
+#include "mozilla/layers/APZPublicUtils.h"
+#include "nsCOMArray.h"
+#include "nsCOMPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsIObserver.h"
+#include "nsIWeakReferenceUtils.h"
+#include "nsRefPtrHashtable.h"
+#include "nsWeakReference.h"
+
+class nsFrameLoader;
+class nsIContent;
+class nsICookieJarSettings;
+class nsIDocShell;
+class nsIDocShellTreeItem;
+class nsIFrame;
+class imgIContainer;
+class nsIDocumentViewer;
+class nsITimer;
+class nsIWidget;
+class nsPresContext;
+
+enum class FormControlType : uint8_t;
+
+namespace mozilla {
+
+class EditorBase;
+class EnterLeaveDispatcher;
+class IMEContentObserver;
+class LazyLogModule;
+class ScrollbarsForWheel;
+class ScrollContainerFrame;
+class WheelTransaction;
+
+namespace dom {
+class DataTransfer;
+class Document;
+class Element;
+class Selection;
+class BrowserParent;
+class RemoteDragStartData;
+struct InteractionData;
+
+}  
+
+class OverOutElementsWrapper final : public nsISupports {
+  ~OverOutElementsWrapper() = default;
+
+ public:
+  enum class BoundaryEventType : bool { Mouse, Pointer };
+  explicit OverOutElementsWrapper(BoundaryEventType aType) : mType(aType) {}
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_CLASS(OverOutElementsWrapper)
+
+  already_AddRefed<nsIWidget> GetLastOverWidget() const;
+
+  void ContentRemoved(nsIContent& aContent);
+  void WillDispatchOverAndEnterEvent(nsIContent* aOverEventTarget);
+  void DidDispatchOverAndEnterEvent(
+      nsIContent* aOriginalOverTargetInComposedDoc,
+      nsIWidget* aOverEventTargetWidget);
+  [[nodiscard]] bool IsDispatchingOverEventOn(
+      nsIContent* aOverEventTarget) const {
+    MOZ_ASSERT(aOverEventTarget);
+    return LastOverEventTargetIsOutEventTarget() &&
+           mDeepestEnterEventTarget == aOverEventTarget;
+  }
+  void WillDispatchOutAndOrLeaveEvent() {
+    mDispatchingOutOrDeepestLeaveEventTarget = mDeepestEnterEventTarget;
+  }
+  void DidDispatchOutAndOrLeaveEvent() {
+    StoreOverEventTargetAndDeepestEnterEventTarget(nullptr);
+    mDispatchingOutOrDeepestLeaveEventTarget = nullptr;
+  }
+  [[nodiscard]] bool IsDispatchingOutEventOnLastOverEventTarget() const {
+    return mDispatchingOutOrDeepestLeaveEventTarget &&
+           mDispatchingOutOrDeepestLeaveEventTarget == mDeepestEnterEventTarget;
+  }
+  void OverrideOverEventTarget(nsIContent* aOverEventTarget) {
+    StoreOverEventTargetAndDeepestEnterEventTarget(aOverEventTarget);
+    mLastOverWidget = nullptr;
+  }
+
+  [[nodiscard]] nsIContent* GetDeepestLeaveEventTarget() const {
+    return mDeepestEnterEventTarget;
+  }
+  [[nodiscard]] nsIContent* GetOutEventTarget() const {
+    return LastOverEventTargetIsOutEventTarget()
+               ? mDeepestEnterEventTarget.get()
+               : nullptr;
+  }
+
+  void TryToRestorePendingRemovedOverTarget(const WidgetEvent* aEvent);
+
+  [[nodiscard]] bool MaybeHasPendingRemovingOverEventTarget() const {
+    return mPendingRemovingOverEventTarget;
+  }
+
+ private:
+  [[nodiscard]] bool LastOverEventTargetIsOutEventTarget() const {
+    MOZ_ASSERT_IF(mDeepestEnterEventTargetIsOverEventTarget,
+                  mDeepestEnterEventTarget);
+    MOZ_ASSERT_IF(mDeepestEnterEventTargetIsOverEventTarget,
+                  !MaybeHasPendingRemovingOverEventTarget());
+    return mDeepestEnterEventTargetIsOverEventTarget;
+  }
+
+  void StoreOverEventTargetAndDeepestEnterEventTarget(
+      nsIContent* aOverEventTargetAndDeepestEnterEventTarget);
+  void UpdateDeepestEnterEventTarget(nsIContent* aDeepestEnterEventTarget);
+
+  nsCOMPtr<nsIContent> GetPendingRemovingOverEventTarget() const {
+    nsCOMPtr<nsIContent> pendingRemovingOverEventTarget =
+        do_QueryReferent(mPendingRemovingOverEventTarget);
+    return pendingRemovingOverEventTarget.forget();
+  }
+
+  nsCOMPtr<nsIContent> mDeepestEnterEventTarget;
+
+  nsWeakPtr mPendingRemovingOverEventTarget;
+
+  nsCOMPtr<nsIContent> mDispatchingOverEventTarget;
+
+  nsCOMPtr<nsIContent> mDispatchingOutOrDeepestLeaveEventTarget;
+
+  nsWeakPtr mLastOverWidget;
+
+  const BoundaryEventType mType;
+
+  bool mDeepestEnterEventTargetIsOverEventTarget = false;
+};
+
+class EventStateManager : public nsSupportsWeakReference, public nsIObserver {
+  friend class mozilla::EnterLeaveDispatcher;
+  friend class mozilla::ScrollbarsForWheel;
+  friend class mozilla::WheelTransaction;
+
+  using ElementState = dom::ElementState;
+
+  virtual ~EventStateManager();
+
+ public:
+  EventStateManager();
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+
+  void Init();
+  void Shutdown();
+
+  static LazyLogModule& MouseCursorUpdateLogRef();
+
+  MOZ_CAN_RUN_SCRIPT
+  nsresult PreHandleEvent(nsPresContext* aPresContext, WidgetEvent* aEvent,
+                          nsIFrame* aTargetFrame, nsIContent* aTargetContent,
+                          nsEventStatus* aStatus,
+                          nsIContent* aOverrideClickTarget);
+
+  MOZ_CAN_RUN_SCRIPT
+  nsresult PostHandleEvent(nsPresContext* aPresContext, WidgetEvent* aEvent,
+                           nsIFrame* aTargetFrame, nsEventStatus* aStatus,
+                           nsIContent* aOverrideClickTarget);
+
+  MOZ_CAN_RUN_SCRIPT void PostHandleKeyboardEvent(
+      WidgetKeyboardEvent* aKeyboardEvent, nsIFrame* aTargetFrame,
+      nsEventStatus& aStatus);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void DispatchLegacyMouseScrollEvents(
+      nsIFrame* aTargetFrame, WidgetWheelEvent* aEvent, nsEventStatus* aStatus);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void NotifyDestroyPresContext(
+      nsPresContext* aPresContext);
+
+  void ResetHoverState();
+
+  void SetPresContext(nsPresContext* aPresContext);
+  void ClearFrameRefs(nsIFrame* aFrame);
+
+  nsIFrame* GetEventTarget();
+  nsIContent* GetExplicitEventTargetContent(const WidgetEvent* = nullptr);
+  nsIContent* GetEventTargetContent(const WidgetEvent* = nullptr);
+
+  static bool ManagesState(ElementState aState) {
+    return aState == ElementState::ACTIVE || aState == ElementState::HOVER ||
+           aState == ElementState::DRAGOVER ||
+           aState == ElementState::URLTARGET;
+  }
+
+  bool SetContentState(nsIContent* aContent, ElementState aState);
+
+  nsIContent* GetActiveContent() const { return mActiveContent; }
+
+  void SetLinkOverFrame(nsIFrame* aFrame) { mLinkOverFrame = aFrame; }
+
+  void NativeAnonymousContentRemoved(nsIContent* aAnonContent);
+  void ContentInserted(nsIContent* aChild, const ContentInsertInfo& aInfo);
+  void ContentAppended(nsIContent* aFirstNewContent,
+                       const ContentAppendInfo& aInfo);
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void ContentRemoved(
+      dom::Document* aDocument, nsIContent* aContent,
+      const ContentRemoveInfo& aInfo);
+
+  bool EventStatusOK(WidgetGUIEvent* aEvent);
+
+  void OnStartToObserveContent(IMEContentObserver* aIMEContentObserver);
+  void OnStopObservingContent(IMEContentObserver* aIMEContentObserver);
+
+  void TryToFlushPendingNotificationsToIME();
+
+  static bool IsKeyboardEventUserActivity(WidgetEvent* aEvent);
+
+  void RegisterAccessKey(dom::Element* aElement, uint32_t aKey);
+
+  void UnregisterAccessKey(dom::Element* aElement, uint32_t aKey);
+
+  uint32_t GetRegisteredAccessKey(dom::Element* aContent);
+
+  static void GetAccessKeyLabelPrefix(dom::Element* aElement,
+                                      nsAString& aPrefix);
+
+  bool HandleAccessKey(WidgetKeyboardEvent* aEvent, nsPresContext* aPresContext,
+                       nsTArray<uint32_t>& aAccessCharCodes) {
+    return WalkESMTreeToHandleAccessKey(aEvent, aPresContext, aAccessCharCodes,
+                                        nullptr, eAccessKeyProcessingNormal,
+                                        true);
+  }
+
+  bool CheckIfEventMatchesAccessKey(WidgetKeyboardEvent* aEvent,
+                                    nsPresContext* aPresContext);
+
+  nsresult SetCursor(StyleCursorKind, imgIContainer*, const ImageResolution&,
+                     const Maybe<gfx::IntPoint>& aHotspot, nsIWidget* aWidget,
+                     bool aLockCursor);
+
+  void StartHidingCursorWhileTyping(nsIWidget*);
+
+  void RecomputeMouseEnterStateForRemoteFrame(dom::Element& aElement);
+
+  nsPresContext* GetPresContext() const { return mPresContext; }
+
+  PresShell* GetPresShell() const {
+    return mPresContext ? mPresContext->GetPresShell() : nullptr;
+  }
+
+  PresShell* GetRootPresShell() const;
+
+  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(EventStateManager, nsIObserver)
+
+  static EventStateManager* sCursorSettingManager;
+  static void ClearCursorSettingManager() { sCursorSettingManager = nullptr; }
+
+  static bool CursorSettingManagerHasLockedCursor();
+
+  static EventStateManager* GetActiveEventStateManager() { return sActiveESM; }
+
+  static void SetActiveManager(EventStateManager* aNewESM,
+                               nsIContent* aContent);
+
+  static bool IsRemoteTarget(nsIContent* target);
+
+  static bool IsTopLevelRemoteTarget(nsIContent* aTarget);
+
+  static Maybe<layers::APZWheelAction> APZWheelActionFor(
+      const WidgetWheelEvent* aEvent);
+
+  static WheelDeltaAdjustmentStrategy GetWheelDeltaAdjustmentStrategy(
+      const WidgetWheelEvent& aEvent);
+
+  static void GetUserPrefsForWheelEvent(const WidgetWheelEvent* aEvent,
+                                        double* aOutMultiplierX,
+                                        double* aOutMultiplierY);
+
+  static CSSIntPoint sLastScreenPoint;
+
+  static CSSIntPoint sLastClientPoint;
+
+  static constexpr double MIN_MULTIPLIER_VALUE_ALLOWING_OVER_ONE_PAGE_SCROLL =
+      1000.0;
+
+  MOZ_CAN_RUN_SCRIPT
+  nsresult HandleMiddleClickPaste(PresShell* aPresShell,
+                                  WidgetMouseEvent* aMouseOrPointerEvent,
+                                  nsEventStatus* aStatus,
+                                  EditorBase* aEditorBase);
+
+  static void ConsumeInteractionData(
+      dom::Record<nsString, dom::InteractionData>& aInteractions);
+
+  void StopTrackingDragGesture(bool aClearInChildProcesses);
+
+  const OverOutElementsWrapper* GetExtantMouseBoundaryEventTarget() const {
+    return mMouseEnterLeaveHelper;
+  }
+
+  nsIContent* GetTrackingDragGestureContent() const {
+    return mGestureDownContent;
+  }
+
+  void NotifyContentWillBeRemovedForGesture(nsIContent& aContent);
+
+  bool IsTrackingDragGesture() const { return mGestureDownContent != nullptr; }
+
+  nsIContent* GetURLTargetContent() const { return mURLTargetContent; }
+
+ protected:
+  void ClearCachedWidgetCursor(nsIFrame* aTargetFrame);
+
+  void UpdateCursor(nsPresContext*, WidgetMouseEvent*, nsIFrame* aTargetFrame,
+                    nsEventStatus* aStatus);
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT already_AddRefed<nsIWidget>
+  DispatchMouseOrPointerBoundaryEvent(WidgetMouseEvent* aMouseEvent,
+                                      EventMessage aMessage,
+                                      nsIContent* aTargetContent,
+                                      nsIContent* aRelatedContent);
+  void GeneratePointerEnterExit(EventMessage aMessage,
+                                WidgetMouseEvent* aEvent);
+  void GenerateMouseEnterExit(WidgetMouseEvent* aMouseEvent);
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void NotifyMouseOver(
+      WidgetMouseEvent* aMouseEvent, nsIContent* aContent);
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void NotifyMouseOut(WidgetMouseEvent* aMouseEvent,
+                                                  nsIContent* aMovingInto);
+  MOZ_CAN_RUN_SCRIPT void GenerateDragDropEnterExit(
+      nsPresContext* aPresContext, WidgetDragEvent& aDragEvent);
+
+  OverOutElementsWrapper* GetWrapperByEventID(WidgetMouseEvent* aMouseEvent);
+
+  MOZ_CAN_RUN_SCRIPT void FireDragEnterOrExit(nsPresContext* aPresContext,
+                                              const WidgetDragEvent& aDragEvent,
+                                              EventMessage aMessage,
+                                              nsIContent* aRelatedTarget,
+                                              nsIContent* aTargetContent,
+                                              AutoWeakFrame& aTargetFrame);
+  void UpdateDragDataTransfer(WidgetDragEvent* dragEvent);
+
+  MOZ_CAN_RUN_SCRIPT
+  static nsresult InitAndDispatchClickEvent(
+      WidgetMouseEvent* aMouseUpEvent, nsEventStatus* aStatus,
+      EventMessage aMessage, PresShell* aPresShell, nsIContent* aMouseUpContent,
+      AutoWeakFrame aCurrentTarget, bool aNoContentDispatch,
+      nsIContent* aOverrideClickTarget);
+
+  void PrepareForFollowingClickEvent(
+      WidgetMouseEvent& aEvent, nsIContent* aOverrideClickTarget = nullptr);
+
+  static bool EventCausesClickEvents(const WidgetMouseEvent& aMouseEvent);
+
+  MOZ_CAN_RUN_SCRIPT
+  nsresult PostHandleMouseUp(WidgetMouseEvent* aMouseUpEvent,
+                             nsEventStatus* aStatus,
+                             nsIContent* aOverrideClickTarget);
+
+  MOZ_CAN_RUN_SCRIPT
+  nsresult DispatchClickEvents(PresShell* aPresShell,
+                               WidgetMouseEvent* aMouseUpEvent,
+                               nsEventStatus* aStatus,
+                               nsIContent* aMouseUpContent,
+                               nsIContent* aOverrideClickTarget);
+
+  void EnsureDocument(nsPresContext* aPresContext);
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  void FlushLayout(nsPresContext* aPresContext);
+
+  enum ProcessingAccessKeyState {
+    eAccessKeyProcessingNormal = 0,
+    eAccessKeyProcessingUp,
+    eAccessKeyProcessingDown
+  };
+
+  bool WalkESMTreeToHandleAccessKey(WidgetKeyboardEvent* aEvent,
+                                    nsPresContext* aPresContext,
+                                    nsTArray<uint32_t>& aAccessCharCodes,
+                                    nsIDocShellTreeItem* aBubbledFrom,
+                                    ProcessingAccessKeyState aAccessKeyState,
+                                    bool aExecute);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY bool LookForAccessKeyAndExecute(
+      nsTArray<uint32_t>& aAccessCharCodes, bool aIsTrustedEvent,
+      bool aIsRepeat, bool aExecute);
+
+
+  dom::Element* GetFocusedElement();
+  bool IsShellVisible(nsIDocShell* aShell);
+
+
+  class WheelPrefs {
+   public:
+    static WheelPrefs* GetInstance();
+    static void Shutdown();
+
+    void ApplyUserPrefsToDelta(WidgetWheelEvent* aEvent);
+
+    void GetUserPrefsForEvent(const WidgetWheelEvent* aEvent,
+                              double* aOutMultiplierX, double* aOutMultiplierY);
+
+    void CancelApplyingUserPrefsFromOverflowDelta(WidgetWheelEvent* aEvent);
+
+    enum Action : uint8_t {
+      ACTION_NONE = 0,
+      ACTION_SCROLL,
+      ACTION_HISTORY,
+      ACTION_ZOOM,
+      ACTION_HORIZONTALIZED_SCROLL,
+      ACTION_PINCH_ZOOM,
+      ACTION_LAST = ACTION_PINCH_ZOOM,
+      ACTION_SEND_TO_PLUGIN,
+    };
+    Action ComputeActionFor(const WidgetWheelEvent* aEvent);
+
+    bool NeedToComputeLineOrPageDelta(const WidgetWheelEvent* aEvent);
+
+    bool IsOverOnePageScrollAllowedX(const WidgetWheelEvent* aEvent);
+    bool IsOverOnePageScrollAllowedY(const WidgetWheelEvent* aEvent);
+
+   private:
+    WheelPrefs();
+    ~WheelPrefs();
+
+    static void OnPrefChanged(const char* aPrefName, void* aClosure);
+
+    enum Index {
+      INDEX_DEFAULT = 0,
+      INDEX_ALT,
+      INDEX_CONTROL,
+      INDEX_META,
+      INDEX_SHIFT,
+      COUNT_OF_MULTIPLIERS
+    };
+
+    Index GetIndexFor(const WidgetWheelEvent* aEvent);
+
+    void GetBasePrefName(Index aIndex, nsACString& aBasePrefName);
+
+    void Init(Index aIndex);
+
+    void Reset();
+
+    void GetMultiplierForDeltaXAndY(const WidgetWheelEvent* aEvent,
+                                    Index aIndex, double* aMultiplierForDeltaX,
+                                    double* aMultiplierForDeltaY);
+
+    bool mInit[COUNT_OF_MULTIPLIERS];
+    double mMultiplierX[COUNT_OF_MULTIPLIERS];
+    double mMultiplierY[COUNT_OF_MULTIPLIERS];
+    double mMultiplierZ[COUNT_OF_MULTIPLIERS];
+    Action mActions[COUNT_OF_MULTIPLIERS];
+    Action mOverriddenActionsX[COUNT_OF_MULTIPLIERS];
+
+    static WheelPrefs* sInstance;
+  };
+
+  enum DeltaDirection { DELTA_DIRECTION_X = 0, DELTA_DIRECTION_Y };
+
+  struct MOZ_STACK_CLASS EventState {
+    bool mDefaultPrevented;
+    bool mDefaultPreventedByContent;
+
+    EventState()
+        : mDefaultPrevented(false), mDefaultPreventedByContent(false) {}
+  };
+
+  MOZ_CAN_RUN_SCRIPT void SendLineScrollEvent(nsIFrame* aTargetFrame,
+                                              WidgetWheelEvent* aEvent,
+                                              EventState& aState,
+                                              int32_t aDelta,
+                                              DeltaDirection aDeltaDirection);
+
+  MOZ_CAN_RUN_SCRIPT void SendPixelScrollEvent(nsIFrame* aTargetFrame,
+                                               WidgetWheelEvent* aEvent,
+                                               EventState& aState,
+                                               int32_t aPixelDelta,
+                                               DeltaDirection aDeltaDirection);
+
+  enum {
+    PREFER_MOUSE_WHEEL_TRANSACTION = 0x00000001,
+    PREFER_ACTUAL_SCROLLABLE_TARGET_ALONG_X_AXIS = 0x00000002,
+    PREFER_ACTUAL_SCROLLABLE_TARGET_ALONG_Y_AXIS = 0x00000004,
+    START_FROM_PARENT = 0x00000008,
+    INCLUDE_PLUGIN_AS_TARGET = 0x00000010,
+    MAY_BE_ADJUSTED_BY_AUTO_DIR = 0x00000020,
+  };
+  enum ComputeScrollTargetOptions {
+    COMPUTE_LEGACY_MOUSE_SCROLL_EVENT_TARGET = 0,
+    COMPUTE_DEFAULT_ACTION_TARGET =
+        (PREFER_MOUSE_WHEEL_TRANSACTION |
+         PREFER_ACTUAL_SCROLLABLE_TARGET_ALONG_X_AXIS |
+         PREFER_ACTUAL_SCROLLABLE_TARGET_ALONG_Y_AXIS),
+    COMPUTE_DEFAULT_ACTION_TARGET_WITHOUT_WHEEL_TRANSACTION =
+        (PREFER_ACTUAL_SCROLLABLE_TARGET_ALONG_X_AXIS |
+         PREFER_ACTUAL_SCROLLABLE_TARGET_ALONG_Y_AXIS),
+    COMPUTE_DEFAULT_ACTION_TARGET_WITH_AUTO_DIR =
+        (COMPUTE_DEFAULT_ACTION_TARGET | MAY_BE_ADJUSTED_BY_AUTO_DIR),
+    COMPUTE_SCROLLABLE_ANCESTOR_ALONG_X_AXIS =
+        (PREFER_ACTUAL_SCROLLABLE_TARGET_ALONG_X_AXIS | START_FROM_PARENT),
+    COMPUTE_SCROLLABLE_ANCESTOR_ALONG_Y_AXIS =
+        (PREFER_ACTUAL_SCROLLABLE_TARGET_ALONG_Y_AXIS | START_FROM_PARENT),
+    COMPUTE_SCROLLABLE_ANCESTOR_ALONG_X_AXIS_WITH_AUTO_DIR =
+        (COMPUTE_SCROLLABLE_ANCESTOR_ALONG_X_AXIS |
+         MAY_BE_ADJUSTED_BY_AUTO_DIR),
+    COMPUTE_SCROLLABLE_ANCESTOR_ALONG_Y_AXIS_WITH_AUTO_DIR =
+        (COMPUTE_SCROLLABLE_ANCESTOR_ALONG_Y_AXIS |
+         MAY_BE_ADJUSTED_BY_AUTO_DIR),
+  };
+
+  ScrollContainerFrame* ComputeScrollTargetAndMayAdjustWheelEvent(
+      nsIFrame* aTargetFrame, WidgetWheelEvent* aEvent,
+      ComputeScrollTargetOptions aOptions);
+
+  ScrollContainerFrame* ComputeScrollTargetAndMayAdjustWheelEvent(
+      nsIFrame* aTargetFrame, double aDirectionX, double aDirectionY,
+      WidgetWheelEvent* aEvent, ComputeScrollTargetOptions aOptions);
+
+  ScrollContainerFrame* ComputeScrollTarget(
+      nsIFrame* aTargetFrame, WidgetWheelEvent* aEvent,
+      ComputeScrollTargetOptions aOptions) {
+    MOZ_ASSERT(!(aOptions & MAY_BE_ADJUSTED_BY_AUTO_DIR),
+               "aEvent may be modified by auto-dir");
+    return ComputeScrollTargetAndMayAdjustWheelEvent(aTargetFrame, aEvent,
+                                                     aOptions);
+  }
+
+  ScrollContainerFrame* ComputeScrollTarget(
+      nsIFrame* aTargetFrame, double aDirectionX, double aDirectionY,
+      WidgetWheelEvent* aEvent, ComputeScrollTargetOptions aOptions) {
+    MOZ_ASSERT(!(aOptions & MAY_BE_ADJUSTED_BY_AUTO_DIR),
+               "aEvent may be modified by auto-dir");
+    return ComputeScrollTargetAndMayAdjustWheelEvent(
+        aTargetFrame, aDirectionX, aDirectionY, aEvent, aOptions);
+  }
+
+  nsSize GetScrollAmount(nsPresContext* aPresContext, WidgetWheelEvent* aEvent,
+                         ScrollContainerFrame* aScrollContainerFrame);
+
+  void DoScrollText(ScrollContainerFrame* aScrollContainerFrame,
+                    WidgetWheelEvent* aEvent);
+
+  MOZ_CAN_RUN_SCRIPT
+  void DoScrollHistory(int32_t direction);
+  void DoScrollZoom(nsIFrame* aTargetFrame, int32_t adjustment);
+  void ChangeZoom(bool aIncrease);
+
+  class DeltaAccumulator {
+   public:
+    static DeltaAccumulator* GetInstance() {
+      if (!sInstance) {
+        sInstance = new DeltaAccumulator;
+      }
+      return sInstance;
+    }
+
+    static void Shutdown() {
+      delete sInstance;
+      sInstance = nullptr;
+    }
+
+    bool IsInTransaction() { return mHandlingDeltaMode != UINT32_MAX; }
+
+    void InitLineOrPageDelta(nsIFrame* aTargetFrame, EventStateManager* aESM,
+                             WidgetWheelEvent* aEvent);
+
+    void Reset();
+
+    nsIntPoint ComputeScrollAmountForDefaultAction(
+        WidgetWheelEvent* aEvent, const nsIntSize& aScrollAmountInDevPixels);
+
+   private:
+    DeltaAccumulator()
+        : mX(0.0),
+          mY(0.0),
+          mPendingScrollAmountX(0.0),
+          mPendingScrollAmountY(0.0),
+          mHandlingDeltaMode(UINT32_MAX),
+          mIsNoLineOrPageDeltaDevice(false) {}
+
+    double mX;
+    double mY;
+
+    double mPendingScrollAmountX;
+    double mPendingScrollAmountY;
+
+    TimeStamp mLastTime;
+
+    uint32_t mHandlingDeltaMode;
+    bool mIsNoLineOrPageDeltaDevice;
+
+    static DeltaAccumulator* sInstance;
+  };
+
+
+  void DecideGestureEvent(WidgetGestureNotifyEvent* aEvent,
+                          nsIFrame* targetFrame);
+
+  void BeginTrackingDragGesture(nsPresContext* aPresContext,
+                                WidgetMouseEvent& aMouseDownOrTouchDragEvent,
+                                nsIFrame* aMouseDownOrTouchDragFrame);
+
+  void SetGestureDownPoint(const WidgetGUIEvent& aEvent);
+
+  [[nodiscard]] LayoutDeviceIntPoint GetEventRefPoint(
+      const WidgetEvent& aEvent) const;
+
+  friend class mozilla::dom::BrowserParent;
+  void BeginTrackingRemoteDragGesture(nsIContent* aContent,
+                                      dom::RemoteDragStartData* aDragStartData);
+
+  MOZ_CAN_RUN_SCRIPT void GenerateDragGesture(
+      nsPresContext* aPresContext,
+      WidgetInputEvent& aMouseOrTouchOrPointerEvent);
+
+  MOZ_CAN_RUN_SCRIPT void MaybeDispatchPointerCancel(
+      const WidgetInputEvent& aSourceEvent, nsIContent& aTargetContent);
+
+  void DetermineDragTargetAndDefaultData(
+      nsPIDOMWindowOuter* aWindow, nsIContent* aSelectionTarget,
+      dom::DataTransfer* aDataTransfer, bool* aAllowEmptyDataTransfer,
+      dom::Selection** aSelection,
+      dom::RemoteDragStartData** aRemoteDragStartData, nsIContent** aTargetNode,
+      nsIPrincipal** aPrincipal, nsIPolicyContainer** aPolicyContainer,
+      nsICookieJarSettings** aCookieJarSettings);
+
+  MOZ_CAN_RUN_SCRIPT
+  bool DoDefaultDragStart(nsPresContext* aPresContext,
+                          WidgetDragEvent* aDragEvent,
+                          dom::DataTransfer* aDataTransfer,
+                          bool aAllowEmptyDataTransfer, nsIContent* aDragTarget,
+                          dom::Selection* aSelection,
+                          dom::RemoteDragStartData* aDragStartData,
+                          nsIPrincipal* aPrincipal,
+                          nsIPolicyContainer* aPolicyContainer,
+                          nsICookieJarSettings* aCookieJarSettings);
+
+  void FillInEventFromGestureDown(WidgetMouseEvent* aEvent);
+
+  MOZ_CAN_RUN_SCRIPT
+  nsresult DoContentCommandEvent(WidgetContentCommandEvent* aEvent);
+  MOZ_CAN_RUN_SCRIPT
+  nsresult DoContentCommandInsertTextEvent(WidgetContentCommandEvent* aEvent);
+  MOZ_CAN_RUN_SCRIPT
+  nsresult DoContentCommandReplaceTextEvent(WidgetContentCommandEvent* aEvent);
+  nsresult DoContentCommandScrollEvent(WidgetContentCommandEvent* aEvent);
+
+  dom::BrowserParent* GetCrossProcessTarget();
+  bool IsTargetCrossProcess(WidgetGUIEvent* aEvent);
+
+  void DispatchCrossProcessEvent(WidgetEvent* aEvent,
+                                 dom::BrowserParent* aRemoteTarget,
+                                 nsEventStatus* aStatus);
+  bool HandleCrossProcessEvent(WidgetEvent* aEvent, nsEventStatus* aStatus);
+
+  void ReleaseCurrentIMEContentObserver();
+
+  MOZ_CAN_RUN_SCRIPT void HandleQueryContentEvent(
+      WidgetQueryContentEvent* aEvent);
+
+ private:
+  void RemoveNodeFromChainIfNeeded(ElementState aState,
+                                   nsIContent* aContentRemoved, bool aNotify);
+
+  [[nodiscard]] bool IsEventOutsideDragThreshold(
+      const WidgetInputEvent& aEvent) const;
+
+  static inline void DoStateChange(dom::Element* aElement, ElementState aState,
+                                   bool aAddState);
+  static inline void DoStateChange(nsIContent* aContent, ElementState aState,
+                                   bool aAddState);
+  static void UpdateAncestorState(nsIContent* aStartNode,
+                                  nsIContent* aStopBefore, ElementState aState,
+                                  bool aAddState);
+
+  static void UpdateLastRefPointOfMouseEvent(WidgetMouseEvent* aMouseEvent);
+
+  static void ResetPointerToWindowCenterWhilePointerLocked(
+      WidgetMouseEvent* aMouseEvent);
+
+  static void UpdateLastPointerPosition(WidgetMouseEvent* aMouseEvent);
+
+  void UpdateGestureContent(nsIContent* aContent);
+
+  void NotifyTargetUserActivation(WidgetEvent* aEvent,
+                                  nsIContent* aTargetContent);
+
+  MOZ_CAN_RUN_SCRIPT void LightDismissOpenPopovers(WidgetEvent* aEvent,
+                                                   nsIContent* aTargetContent);
+
+  MOZ_CAN_RUN_SCRIPT void LightDismissOpenDialogs(WidgetEvent* aEvent,
+                                                  nsIContent* aTargetContent);
+
+  already_AddRefed<EventStateManager> ESMFromContentOrThis(
+      nsIContent* aContent);
+
+  struct LastMouseDownInfo {
+    nsCOMPtr<nsIContent> mLastMouseDownContent;
+    Maybe<FormControlType> mLastMouseDownInputControlType;
+    uint32_t mClickCount = 0;
+  };
+
+  LastMouseDownInfo& GetLastMouseDownInfo(int16_t aButton);
+
+  StyleCursorKind mLockCursor;
+  bool mHidingCursorWhileTyping = false;
+
+  static LayoutDeviceIntPoint sPreLockScreenPoint;
+
+  static LayoutDeviceIntPoint sSynthCenteringPoint;
+
+  WeakFrame mCurrentTarget;
+  nsCOMPtr<nsIContent> mCurrentTargetContent;
+  static AutoWeakFrame sLastDragOverFrame;
+
+  static LayoutDeviceIntPoint sLastRefPoint;
+  static LayoutDeviceIntPoint sLastRefPointOfRawUpdate;
+
+  LayoutDeviceIntPoint mGestureDownPoint;  
+  RefPtr<nsIContent> mGestureDownContent;
+  nsCOMPtr<nsIContent> mGestureDownFrameOwner;
+  RefPtr<dom::RemoteDragStartData> mGestureDownDragStartData;
+  Modifiers mGestureModifiers;
+  uint16_t mGestureDownButtons;
+  int16_t mGestureDownButton;
+
+  LastMouseDownInfo mLastLeftMouseDownInfo;
+  LastMouseDownInfo mLastMiddleMouseDownInfo;
+  LastMouseDownInfo mLastRightMouseDownInfo;
+
+  nsCOMPtr<nsIContent> mActiveContent;
+  nsCOMPtr<nsIContent> mHoverContent;
+  static nsCOMPtr<nsIContent> sDragOverContent;
+  nsCOMPtr<nsIContent> mURLTargetContent;
+  nsCOMPtr<nsINode> mPopoverPointerDownTarget;
+
+  WeakFrame mLinkOverFrame;
+
+  nsPresContext* mPresContext;      
+  RefPtr<dom::Document> mDocument;  
+
+  RefPtr<IMEContentObserver> mIMEContentObserver;
+
+  bool mShouldAlwaysUseLineDeltas : 1;
+  bool mShouldAlwaysUseLineDeltasInitialized : 1;
+
+  bool mInTouchDrag;
+
+  bool m_haveShutdown;
+
+  RefPtr<OverOutElementsWrapper> mMouseEnterLeaveHelper;
+  nsRefPtrHashtable<nsUint32HashKey, OverOutElementsWrapper>
+      mPointersEnterLeaveHelper;
+
+  nsCOMArray<dom::Element> mAccessKeys;
+
+  bool ShouldAlwaysUseLineDeltas();
+
+ public:
+  static nsresult UpdateUserActivityTimer(void);
+
+  static bool sNormalLMouseEventInProcess;
+  static int16_t sCurrentMouseBtn;
+
+  static EventStateManager* sActiveESM;
+
+  static void ClearGlobalActiveContent(EventStateManager* aClearer);
+
+  nsCOMPtr<nsITimer> mClickHoldTimer;
+  void CreateClickHoldTimer(nsPresContext* aPresContext, nsIFrame* aDownFrame,
+                            WidgetGUIEvent* aMouseDownEvent);
+  void KillClickHoldTimer();
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void FireContextClick();
+
+  MOZ_CAN_RUN_SCRIPT static void SetPointerLock(nsIWidget* aWidget,
+                                                nsPresContext* aPresContext,
+                                                bool aUnadjustedMovement);
+  static void RequestLockPointer(nsIWidget* aWidget,
+                                 nsPresContext* aPresContext,
+                                 bool aUnadjustedMovement);
+  static void ReleaseLockedPointer(nsIWidget* aWidget);
+
+  static void sClickHoldCallback(nsITimer* aTimer, void* aESM);
+};
+
+}  
+
+#define NS_EVENT_NEEDS_FRAME(event)          \
+  ((event)->mMessage != ePointerClick &&     \
+   (event)->mMessage != eMouseDoubleClick && \
+   (event)->mMessage != ePointerAuxClick)
+
+#endif  // mozilla_EventStateManager_h_

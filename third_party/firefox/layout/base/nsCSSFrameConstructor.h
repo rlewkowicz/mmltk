@@ -1,0 +1,1221 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#if !defined(nsCSSFrameConstructor_h_)
+#define nsCSSFrameConstructor_h_
+
+#include "mozilla/ArenaAllocator.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/ContainStyleScopeManager.h"
+#include "mozilla/FunctionRef.h"
+#include "mozilla/LinkedList.h"
+#include "mozilla/ScrollStyles.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/dom/ChildIterator.h"
+#include "nsCOMPtr.h"
+#include "nsFrameManager.h"
+#include "nsIAnonymousContentCreator.h"
+#include "nsIFrame.h"
+#include "nsILayoutHistoryState.h"
+
+struct nsStyleDisplay;
+struct nsGenConInitializer;
+
+class nsBlockFrame;
+class nsContainerFrame;
+class nsCanvasFrame;
+class nsFirstLetterFrame;
+class nsFirstLineFrame;
+class nsFrameConstructorState;
+class nsPageContentFrame;
+class nsPageSequenceFrame;
+
+namespace mozilla {
+
+class ComputedStyle;
+class PresShell;
+class PrintedSheetFrame;
+class RestyleManager;
+class ViewportFrame;
+
+namespace dom {
+
+class CharacterData;
+class Text;
+}  
+}  
+
+class nsCSSFrameConstructor final : public nsFrameManager {
+ public:
+  using ComputedStyle = mozilla::ComputedStyle;
+  using PseudoStyleType = mozilla::PseudoStyleType;
+  using PresShell = mozilla::PresShell;
+  using Element = mozilla::dom::Element;
+  using Text = mozilla::dom::Text;
+
+  friend class mozilla::RestyleManager;
+
+  nsCSSFrameConstructor(mozilla::dom::Document* aDocument,
+                        PresShell* aPresShell);
+  ~nsCSSFrameConstructor() { MOZ_ASSERT(mFCItemsInUse == 0); }
+
+  nsCSSFrameConstructor(const nsCSSFrameConstructor& aCopy) = delete;
+  nsCSSFrameConstructor& operator=(const nsCSSFrameConstructor& aCopy) = delete;
+
+  static void GetAlternateTextFor(const Element&, nsAString& aAltText);
+
+  enum class InsertionKind {
+    Sync,
+    Async,
+  };
+
+  mozilla::RestyleManager* RestyleManager() const;
+
+  mozilla::ViewportFrame* ConstructRootFrame();
+
+ private:
+  void ConstructLazily(nsIContent* aStartChild, nsIContent* aEndChild);
+
+#if defined(DEBUG)
+  void CheckBitsForLazyFrameConstruction(nsIContent* aParent);
+#else
+  void CheckBitsForLazyFrameConstruction(nsIContent*) {}
+#endif
+
+  void IssueSingleInsertNofications(nsIContent* aStartChild,
+                                    nsIContent* aEndChild, InsertionKind);
+
+  struct InsertionPoint {
+    InsertionPoint() : mParentFrame(nullptr), mContainer(nullptr) {}
+
+    InsertionPoint(nsContainerFrame* aParentFrame, nsIContent* aContainer)
+        : mParentFrame(aParentFrame), mContainer(aContainer) {}
+
+    nsContainerFrame* mParentFrame;
+    nsIContent* mContainer;
+  };
+
+  InsertionPoint GetRangeInsertionPoint(nsIContent* aStartChild,
+                                        nsIContent* aEndChild, InsertionKind);
+
+  bool MaybeRecreateForFrameset(nsIFrame* aParentFrame, nsIContent* aStartChild,
+                                nsIContent* aEndChild);
+
+  void LazilyStyleNewChildRange(nsIContent* aStartChild, nsIContent* aEndChild);
+
+  void StyleNewChildRange(nsIContent* aStartChild, nsIContent* aEndChild);
+
+ public:
+
+  void ContentAppended(nsIContent* aFirstNewContent, InsertionKind);
+
+  void ContentInserted(nsIContent* aChild, InsertionKind);
+
+  void ContentRangeInserted(nsIContent* aStartChild, nsIContent* aEndChild,
+                            InsertionKind aInsertionKind);
+
+  enum class RemovalKind : uint8_t {
+    Dom,
+    ForReconstruction,
+    ForDisplayNoneChange,
+  };
+
+  bool ContentWillBeRemoved(nsIContent* aChild, RemovalKind);
+
+  void CharacterDataChanged(nsIContent* aContent,
+                            const CharacterDataChangeInfo& aInfo);
+
+  bool EnsureFrameForTextNodeIsCreatedAfterFlush(
+      mozilla::dom::CharacterData* aContent);
+
+  void NotifyDestroyingFrame(nsIFrame* aFrame);
+
+  void RecalcQuotesAndCounters();
+
+  void NotifyCounterStylesAreDirty();
+
+  void WillDestroyFrameTree();
+
+  bool DestroyFramesFor(nsIContent* aContent);
+
+  nsIFrame* CreateContinuingFrame(nsIFrame* aFrame,
+                                  nsContainerFrame* aParentFrame,
+                                  bool aIsFluid = true);
+
+  void SetNextPageContentFramePageName(const nsAtom* aPageName) {
+    MOZ_ASSERT(aPageName, "New page name should never be null");
+    MOZ_ASSERT(!mNextPageContentFramePageName,
+               "PageContentFrame page name was already set");
+    mNextPageContentFramePageName = aPageName;
+  }
+
+  void MaybeSetNextPageContentFramePageName(const nsIFrame* aFrame);
+
+  nsresult ReplicateFixedFrames(nsPageContentFrame* aParentFrame);
+
+  InsertionPoint GetInsertionPoint(nsIContent* aChild);
+
+  nsContainerFrame* GetContentInsertionFrameFor(nsIContent* aContent);
+
+  nsContainerFrame* GetRootElementFrame() { return mRootElementFrame; }
+  nsIFrame* GetRootElementStyleFrame() { return mRootElementStyleFrame; }
+  nsPageSequenceFrame* GetPageSequenceFrame() { return mPageSequenceFrame; }
+  nsCanvasFrame* GetCanvasFrame() { return mCanvasFrame; }
+  nsCanvasFrame* GetDocElementContainingBlock() {
+    return mDocElementContainingBlock;
+  }
+
+  void AddSizeOfIncludingThis(nsWindowSizes& aSizes) const;
+
+#if defined(ACCESSIBILITY) || 0
+  mozilla::ContainStyleScopeManager& GetContainStyleScopeManager() {
+    return mContainStyleScopeManager;
+  }
+#endif
+
+ private:
+  struct FrameConstructionItem;
+  class FrameConstructionItemList;
+
+  mozilla::PrintedSheetFrame* ConstructPrintedSheetFrame(
+      PresShell* aPresShell, nsContainerFrame* aParentFrame,
+      nsIFrame* aPrevSheetFrame);
+
+  nsContainerFrame* ConstructPageFrame(PresShell* aPresShell,
+                                       nsContainerFrame* aParentFrame,
+                                       nsIFrame* aPrevPageFrame,
+                                       nsCanvasFrame*& aCanvasFrame);
+
+  enum class AllowCounters : bool { No, Yes };
+
+  void InitAndRestoreFrame(const nsFrameConstructorState& aState,
+                           nsIContent* aContent, nsContainerFrame* aParentFrame,
+                           nsIFrame* aNewFrame,
+                           AllowCounters = AllowCounters::Yes);
+
+  already_AddRefed<ComputedStyle> ResolveComputedStyle(nsIContent* aContent);
+
+  enum class ItemFlag : uint8_t {
+    AllowPageBreak,
+    IsGeneratedContent,
+    IsWithinSVGText,
+    AllowTextPathChild,
+    IsAnonymousContentCreatorContent,
+    IsForRenderedLegend,
+    IsForOutsideMarker,
+  };
+
+  using ItemFlags = mozilla::EnumSet<ItemFlag>;
+
+  void AddFrameConstructionItems(nsFrameConstructorState& aState,
+                                 nsIContent* aContent,
+                                 bool aSuppressWhiteSpaceOptimizations,
+                                 const ComputedStyle& aParentStyle,
+                                 const InsertionPoint& aInsertion,
+                                 FrameConstructionItemList& aItems,
+                                 ItemFlags = {});
+
+  bool ShouldCreateItemsForChild(nsFrameConstructorState& aState,
+                                 nsIContent* aContent,
+                                 nsContainerFrame* aParentFrame);
+
+  nsIFrame* ConstructDocElementFrame(Element* aDocElement);
+
+  void SetUpDocElementContainingBlock(nsIContent* aDocElement);
+
+  void CreateAttributeContent(const Element& aParentContent,
+                              nsIFrame* aParentFrame, int32_t aAttrNamespace,
+                              nsAtom* aAttrName, ComputedStyle* aComputedStyle,
+                              nsCOMArray<nsIContent>& aGeneratedContent,
+                              nsIContent** aNewContent, nsIFrame** aNewFrame);
+
+  already_AddRefed<nsIContent> CreateGenConTextNode(
+      nsFrameConstructorState& aState, const nsAString& aString,
+      mozilla::UniquePtr<nsGenConInitializer> aInitializer);
+
+  void CreateGeneratedContent(
+      nsFrameConstructorState& aState, Element& aOriginatingElement,
+      ComputedStyle& aPseudoStyle, const mozilla::StyleContentItem& aItem,
+      size_t aContentIndex,
+      const mozilla::FunctionRef<void(nsIContent*)> aAddChild);
+
+  void CreateGeneratedContentFromListStyle(
+      nsFrameConstructorState& aState, Element& aOriginatingElement,
+      const ComputedStyle& aPseudoStyle,
+      const mozilla::FunctionRef<void(nsIContent*)> aAddChild);
+  void CreateGeneratedContentFromListStyleType(
+      nsFrameConstructorState& aState, Element& aOriginatingElement,
+      const ComputedStyle& aPseudoStyle,
+      const mozilla::FunctionRef<void(nsIContent*)> aAddChild);
+
+  void CreateGeneratedContentItem(nsFrameConstructorState& aState,
+                                  nsContainerFrame* aParentFrame,
+                                  Element& aOriginatingElement, ComputedStyle&,
+                                  PseudoStyleType aPseudoElement,
+                                  FrameConstructionItemList& aItems,
+                                  ItemFlags aExtraFlags = {});
+
+  void AppendFramesToParent(nsFrameConstructorState& aState,
+                            nsContainerFrame* aParentFrame,
+                            nsFrameList& aFrameList, nsIFrame* aPrevSibling,
+                            bool aIsRecursiveCall = false);
+
+  nsIFrame* ConstructTable(nsFrameConstructorState& aState,
+                           FrameConstructionItem& aItem,
+                           nsContainerFrame* aParentFrame,
+                           const nsStyleDisplay* aDisplay,
+                           nsFrameList& aFrameList);
+
+  nsIFrame* ConstructTableRowOrRowGroup(nsFrameConstructorState& aState,
+                                        FrameConstructionItem& aItem,
+                                        nsContainerFrame* aParentFrame,
+                                        const nsStyleDisplay* aStyleDisplay,
+                                        nsFrameList& aFrameList);
+
+  nsIFrame* ConstructTableCol(nsFrameConstructorState& aState,
+                              FrameConstructionItem& aItem,
+                              nsContainerFrame* aParentFrame,
+                              const nsStyleDisplay* aStyleDisplay,
+                              nsFrameList& aFrameList);
+
+  nsIFrame* ConstructTableCell(nsFrameConstructorState& aState,
+                               FrameConstructionItem& aItem,
+                               nsContainerFrame* aParentFrame,
+                               const nsStyleDisplay* aStyleDisplay,
+                               nsFrameList& aFrameList);
+
+ private:
+  enum ParentType {
+    eTypeBlock = 0, 
+    eTypeRow,
+    eTypeRowGroup,
+    eTypeColGroup,
+    eTypeTable,
+    eTypeRuby,
+    eTypeRubyBase,
+    eTypeRubyBaseContainer,
+    eTypeRubyText,
+    eTypeRubyTextContainer,
+    eParentTypeCount
+  };
+
+#define FCDATA_PARENT_TYPE_OFFSET 28
+#define FCDATA_DESIRED_PARENT_TYPE(_bits) \
+  ParentType((_bits) >> FCDATA_PARENT_TYPE_OFFSET)
+#define FCDATA_DESIRED_PARENT_TYPE_TO_BITS(_type) \
+  (((uint32_t)(_type)) << FCDATA_PARENT_TYPE_OFFSET)
+
+  static ParentType GetParentType(nsIFrame* aParentFrame) {
+    return GetParentType(aParentFrame->Type());
+  }
+
+  static ParentType GetParentType(mozilla::LayoutFrameType aFrameType);
+
+  static bool IsRubyParentType(ParentType aParentType) {
+    return (aParentType == eTypeRuby || aParentType == eTypeRubyBase ||
+            aParentType == eTypeRubyBaseContainer ||
+            aParentType == eTypeRubyText ||
+            aParentType == eTypeRubyTextContainer);
+  }
+
+  static bool IsTableParentType(ParentType aParentType) {
+    return (aParentType == eTypeTable || aParentType == eTypeRow ||
+            aParentType == eTypeRowGroup || aParentType == eTypeColGroup);
+  }
+
+  using FrameCreationFunc = nsIFrame* (*)(PresShell*, ComputedStyle*);
+  using ContainerFrameCreationFunc = nsContainerFrame* (*)(PresShell*,
+                                                           ComputedStyle*);
+  using BlockFrameCreationFunc = nsBlockFrame* (*)(PresShell*, ComputedStyle*);
+
+  struct FrameConstructionData;
+  using FrameConstructionDataGetter =
+      const FrameConstructionData* (*)(const Element&, ComputedStyle&);
+
+  using FrameFullConstructor =
+      nsIFrame* (nsCSSFrameConstructor::*)(nsFrameConstructorState & aState,
+                                           FrameConstructionItem& aItem,
+                                           nsContainerFrame* aParentFrame,
+                                           const nsStyleDisplay* aStyleDisplay,
+                                           nsFrameList& aFrameList);
+
+
+#define FCDATA_SKIP_FRAMESET 0x1
+#define FCDATA_FUNC_IS_DATA_GETTER 0x2
+#define FCDATA_FUNC_IS_FULL_CTOR 0x4
+#define FCDATA_DISALLOW_OUT_OF_FLOW 0x8
+#define FCDATA_FORCE_NULL_ABSPOS_CONTAINER 0x10
+#define FCDATA_WRAP_KIDS_IN_BLOCKS 0x20
+#define FCDATA_SUPPRESS_FRAME 0x40
+#define FCDATA_MAY_NEED_SCROLLFRAME 0x80
+#define FCDATA_SKIP_ABSPOS_PUSH 0x200
+#define FCDATA_DISALLOW_GENERATED_CONTENT 0x400
+#define FCDATA_IS_TABLE_PART 0x800
+#define FCDATA_IS_INLINE 0x1000
+#define FCDATA_IS_LINE_PARTICIPANT 0x2000
+#define FCDATA_IS_LINE_BREAK 0x4000
+#define FCDATA_ALLOW_BLOCK_STYLES 0x8000
+#define FCDATA_USE_CHILD_ITEMS 0x10000
+#define FCDATA_CREATE_BLOCK_WRAPPER_FOR_ALL_KIDS 0x40000
+#define FCDATA_IS_SVG_TEXT 0x80000
+#define FCDATA_IS_WRAPPER_ANON_BOX 0x400000
+
+  struct FrameConstructionData {
+    union Func {
+      FrameCreationFunc mCreationFunc;
+      FrameConstructionDataGetter mDataGetter;
+      FrameFullConstructor mFullConstructor;
+
+      explicit constexpr Func(FrameCreationFunc aFunc) : mCreationFunc(aFunc) {}
+      explicit constexpr Func(FrameConstructionDataGetter aDataGetter)
+          : mDataGetter(aDataGetter) {}
+      explicit constexpr Func(FrameFullConstructor aCtor)
+          : mFullConstructor(aCtor) {}
+    } mFunc;
+    const uint32_t mBits = 0;
+    PseudoStyleType const mAnonBoxPseudo = PseudoStyleType::NotPseudo;
+
+    constexpr FrameConstructionData() : FrameConstructionData(nullptr) {}
+
+    MOZ_IMPLICIT constexpr FrameConstructionData(std::nullptr_t,
+                                                 uint32_t aBits = 0)
+        : mFunc(static_cast<FrameCreationFunc>(nullptr)), mBits(aBits) {}
+
+    MOZ_IMPLICIT constexpr FrameConstructionData(
+        FrameCreationFunc aCreationFunc, uint32_t aBits = 0)
+        : mFunc(aCreationFunc), mBits(aBits) {}
+    constexpr FrameConstructionData(FrameCreationFunc aCreationFunc,
+                                    uint32_t aBits,
+                                    PseudoStyleType aAnonBoxPseudo)
+        : mFunc(aCreationFunc),
+          mBits(aBits | FCDATA_CREATE_BLOCK_WRAPPER_FOR_ALL_KIDS),
+          mAnonBoxPseudo(aAnonBoxPseudo) {}
+    MOZ_IMPLICIT constexpr FrameConstructionData(
+        FrameConstructionDataGetter aDataGetter, uint32_t aBits = 0)
+        : mFunc(aDataGetter),
+          mBits(aBits | FCDATA_FUNC_IS_DATA_GETTER),
+          mAnonBoxPseudo(PseudoStyleType::NotPseudo) {}
+    MOZ_IMPLICIT constexpr FrameConstructionData(FrameFullConstructor aCtor,
+                                                 uint32_t aBits = 0)
+        : mFunc(aCtor),
+          mBits(aBits | FCDATA_FUNC_IS_FULL_CTOR),
+          mAnonBoxPseudo(PseudoStyleType::NotPseudo) {}
+  };
+
+  struct FrameConstructionDataByTag {
+    const nsStaticAtom* const mTag;
+    const FrameConstructionData mData;
+  };
+
+  struct FrameConstructionDataByInt {
+    const int32_t mInt;
+    const FrameConstructionData mData;
+  };
+
+  struct FrameConstructionDataByDisplay {
+#if defined(DEBUG)
+    const mozilla::StyleDisplay mDisplay;
+#endif
+    const FrameConstructionData mData;
+  };
+
+  struct PseudoParentData {
+    const FrameConstructionData mFCData;
+    mozilla::PseudoStyleType const mPseudoType;
+  };
+  static const PseudoParentData sPseudoParentData[eParentTypeCount];
+
+  const FrameConstructionData* FindDataForContent(nsIContent&, ComputedStyle&,
+                                                  nsIFrame* aParentFrame,
+                                                  ItemFlags aFlags);
+
+  static const FrameConstructionData* FindTextData(const Text&,
+                                                   nsIFrame* aParentFrame);
+  const FrameConstructionData* FindElementData(const Element&, ComputedStyle&,
+                                               nsIFrame* aParentFrame,
+                                               ItemFlags aFlags);
+  const FrameConstructionData* FindElementTagData(const Element&,
+                                                  ComputedStyle&,
+                                                  nsIFrame* aParentFrame,
+                                                  ItemFlags aFlags);
+
+  static const FrameConstructionData* FindDataByInt(
+      int32_t aInt, const Element&, ComputedStyle&,
+      const FrameConstructionDataByInt* aDataPtr, uint32_t aDataLength);
+
+  static const FrameConstructionData* FindDataByTag(
+      const Element& aElement, ComputedStyle& aComputedStyle,
+      const FrameConstructionDataByTag* aDataPtr, uint32_t aDataLength);
+
+  class FrameConstructionItemList {
+   public:
+    void Reset(nsCSSFrameConstructor* aFCtor) {
+      Destroy(aFCtor);
+      this->~FrameConstructionItemList();
+      new (this) FrameConstructionItemList();
+    }
+
+    void SetLineBoundaryAtStart(bool aBoundary) {
+      mLineBoundaryAtStart = aBoundary;
+    }
+    void SetLineBoundaryAtEnd(bool aBoundary) {
+      mLineBoundaryAtEnd = aBoundary;
+    }
+    void SetParentHasNoShadowDOM(bool aValue) {
+      mParentHasNoShadowDOM = aValue;
+    }
+    bool HasLineBoundaryAtStart() { return mLineBoundaryAtStart; }
+    bool HasLineBoundaryAtEnd() { return mLineBoundaryAtEnd; }
+    bool ParentHasNoShadowDOM() { return mParentHasNoShadowDOM; }
+    bool IsEmpty() const { return mItems.isEmpty(); }
+    bool AreAllItemsInline() const { return mInlineCount == mItemCount; }
+    bool AreAllItemsBlock() const { return mBlockCount == mItemCount; }
+    bool AllWantParentType(ParentType aDesiredParentType) const {
+      return mDesiredParentCounts[aDesiredParentType] == mItemCount;
+    }
+
+    FrameConstructionItem* AppendItem(
+        nsCSSFrameConstructor* aFCtor, const FrameConstructionData* aFCData,
+        nsIContent* aContent, already_AddRefed<ComputedStyle> aComputedStyle,
+        bool aSuppressWhiteSpaceOptimizations) {
+      FrameConstructionItem* item = new (aFCtor)
+          FrameConstructionItem(aFCData, aContent, std::move(aComputedStyle),
+                                aSuppressWhiteSpaceOptimizations);
+      mItems.insertBack(item);
+      ++mItemCount;
+      ++mDesiredParentCounts[item->DesiredParentType()];
+      return item;
+    }
+
+    FrameConstructionItem* PrependItem(
+        nsCSSFrameConstructor* aFCtor, const FrameConstructionData* aFCData,
+        nsIContent* aContent, already_AddRefed<ComputedStyle> aComputedStyle,
+        bool aSuppressWhiteSpaceOptimizations) {
+      FrameConstructionItem* item = new (aFCtor)
+          FrameConstructionItem(aFCData, aContent, std::move(aComputedStyle),
+                                aSuppressWhiteSpaceOptimizations);
+      mItems.insertFront(item);
+      ++mItemCount;
+      ++mDesiredParentCounts[item->DesiredParentType()];
+      return item;
+    }
+
+    void InlineItemAdded() { ++mInlineCount; }
+    void BlockItemAdded() { ++mBlockCount; }
+
+    void* operator new(size_t) = delete;
+    void* operator new[](size_t) = delete;
+#if defined(_MSC_VER)
+   private:
+    void operator delete(void*) { MOZ_CRASH("FrameConstructionItemList::del"); }
+
+   public:
+#else
+    void operator delete(void*) = delete;
+#endif
+    void operator delete[](void*) = delete;
+
+    class Iterator {
+     public:
+      explicit Iterator(FrameConstructionItemList& aList)
+          : mCurrent(aList.mItems.getFirst()), mList(aList) {}
+      Iterator(const Iterator& aOther) = default;
+
+      bool operator==(const Iterator& aOther) const {
+        MOZ_ASSERT(&mList == &aOther.mList, "Iterators for different lists?");
+        return mCurrent == aOther.mCurrent;
+      }
+      bool operator!=(const Iterator& aOther) const = default;
+
+      Iterator& operator=(const Iterator& aOther) {
+        MOZ_ASSERT(&mList == &aOther.mList, "Iterators for different lists?");
+        mCurrent = aOther.mCurrent;
+        return *this;
+      }
+
+      FrameConstructionItemList* List() { return &mList; }
+
+      FrameConstructionItem& item() {
+        MOZ_ASSERT(!IsDone(), "Should have checked IsDone()!");
+        return *mCurrent;
+      }
+
+      const FrameConstructionItem& item() const {
+        MOZ_ASSERT(!IsDone(), "Should have checked IsDone()!");
+        return *mCurrent;
+      }
+
+      bool IsDone() const { return mCurrent == nullptr; }
+      bool AtStart() const { return mCurrent == mList.mItems.getFirst(); }
+      void Next() {
+        NS_ASSERTION(!IsDone(), "Should have checked IsDone()!");
+        mCurrent = mCurrent->getNext();
+      }
+      void Prev() {
+        NS_ASSERTION(!AtStart(), "Should have checked AtStart()!");
+        mCurrent = mCurrent ? mCurrent->getPrevious() : mList.mItems.getLast();
+      }
+      void SetToEnd() { mCurrent = nullptr; }
+
+      inline bool SkipItemsWantingParentType(ParentType aParentType);
+
+      inline bool SkipItemsNotWantingParentType(ParentType aParentType);
+
+      inline bool SkipItemsThatNeedAnonFlexOrGridItem(
+          const nsFrameConstructorState& aState, bool aIsWebkitBox);
+
+      inline bool SkipItemsThatDontNeedAnonFlexOrGridItem(
+          const nsFrameConstructorState& aState, bool aIsWebkitBox);
+
+      inline bool SkipItemsNotWantingRubyParent();
+
+      inline bool SkipWhitespace(nsFrameConstructorState& aState);
+
+      void AppendItemToList(FrameConstructionItemList& aTargetList);
+
+      void AppendItemsToList(nsCSSFrameConstructor* aFCtor,
+                             const Iterator& aEnd,
+                             FrameConstructionItemList& aTargetList);
+
+      void InsertItem(FrameConstructionItem* aItem);
+
+      void DeleteItemsTo(nsCSSFrameConstructor* aFCtor, const Iterator& aEnd);
+
+     private:
+      FrameConstructionItem* mCurrent;
+      FrameConstructionItemList& mList;
+    };
+
+   protected:
+    FrameConstructionItemList()
+        : mInlineCount(0),
+          mBlockCount(0),
+          mItemCount(0),
+          mLineBoundaryAtStart(false),
+          mLineBoundaryAtEnd(false),
+          mParentHasNoShadowDOM(false) {
+      MOZ_COUNT_CTOR(FrameConstructionItemList);
+      memset(mDesiredParentCounts, 0, sizeof(mDesiredParentCounts));
+    }
+
+    void Destroy(nsCSSFrameConstructor* aFCtor) {
+      while (FrameConstructionItem* item = mItems.popFirst()) {
+        item->Delete(aFCtor);
+      }
+    }
+
+    friend struct FrameConstructionItem;
+    ~FrameConstructionItemList() {
+      MOZ_COUNT_DTOR(FrameConstructionItemList);
+      MOZ_ASSERT(mItems.isEmpty(), "leaking");
+    }
+
+   private:
+    void* operator new(size_t, void* aPtr) { return aPtr; }
+
+    struct UndisplayedItem {
+      UndisplayedItem(nsIContent* aContent, ComputedStyle* aComputedStyle)
+          : mContent(aContent), mComputedStyle(aComputedStyle) {}
+
+      nsIContent* const mContent;
+      RefPtr<ComputedStyle> mComputedStyle;
+    };
+
+    void AdjustCountsForItem(FrameConstructionItem* aItem, int32_t aDelta);
+
+    mozilla::LinkedList<FrameConstructionItem> mItems;
+    uint32_t mInlineCount;
+    uint32_t mBlockCount;
+    uint32_t mItemCount;
+    uint32_t mDesiredParentCounts[eParentTypeCount];
+    bool mLineBoundaryAtStart;
+    bool mLineBoundaryAtEnd;
+    bool mParentHasNoShadowDOM;
+  };
+
+  struct MOZ_RAII AutoFrameConstructionItemList final
+      : public FrameConstructionItemList {
+    template <typename... Args>
+    explicit AutoFrameConstructionItemList(nsCSSFrameConstructor* aFCtor,
+                                           Args&&... args)
+        : FrameConstructionItemList(std::forward<Args>(args)...),
+          mFCtor(aFCtor) {
+      MOZ_ASSERT(mFCtor);
+    }
+    ~AutoFrameConstructionItemList() { Destroy(mFCtor); }
+
+   private:
+    nsCSSFrameConstructor* const mFCtor;
+  };
+
+  typedef FrameConstructionItemList::Iterator FCItemIterator;
+
+  struct FrameConstructionItem final
+      : public mozilla::LinkedListElement<FrameConstructionItem> {
+    FrameConstructionItem(const FrameConstructionData* aFCData,
+                          nsIContent* aContent,
+                          already_AddRefed<ComputedStyle> aComputedStyle,
+                          bool aSuppressWhiteSpaceOptimizations)
+        : mFCData(aFCData),
+          mContent(aContent),
+          mComputedStyle(std::move(aComputedStyle)),
+          mSuppressWhiteSpaceOptimizations(aSuppressWhiteSpaceOptimizations),
+          mIsText(false),
+          mIsGeneratedContent(false),
+          mIsAllInline(false),
+          mIsBlock(false),
+          mIsRenderedLegend(false) {
+      MOZ_COUNT_CTOR(FrameConstructionItem);
+    }
+
+    void* operator new(size_t, nsCSSFrameConstructor* aFCtor) {
+      return aFCtor->AllocateFCItem();
+    }
+
+    void* operator new(size_t) = delete;
+    void* operator new[](size_t) = delete;
+#if defined(_MSC_VER)
+   private:
+    void operator delete(void*) { MOZ_CRASH("FrameConstructionItem::delete"); }
+
+   public:
+#else
+    void operator delete(void*) = delete;
+#endif
+    void operator delete[](void*) = delete;
+    FrameConstructionItem(const FrameConstructionItem& aOther) = delete;
+
+    void Delete(nsCSSFrameConstructor* aFCtor) {
+      mChildItems.Destroy(aFCtor);
+      if (mIsGeneratedContent) {
+        mContent->UnbindFromTree();
+        NS_RELEASE(mContent);
+      }
+      this->~FrameConstructionItem();
+      aFCtor->FreeFCItem(this);
+    }
+
+    ParentType DesiredParentType() {
+      return FCDATA_DESIRED_PARENT_TYPE(mFCData->mBits);
+    }
+
+    bool NeedsAnonFlexOrGridItem(const nsFrameConstructorState& aState,
+                                 bool aIsWebkitBox);
+
+    bool IsWhitespace(nsFrameConstructorState& aState) const;
+
+    bool IsLineBoundary() const {
+      return mIsBlock || (mFCData->mBits & FCDATA_IS_LINE_BREAK);
+    }
+
+    FrameConstructionItemList mChildItems;
+
+    const FrameConstructionData* mFCData;
+    nsIContent* mContent;
+    RefPtr<ComputedStyle> mComputedStyle;
+    bool mSuppressWhiteSpaceOptimizations : 1;
+    bool mIsText : 1;
+    bool mIsGeneratedContent : 1;
+    bool mIsAllInline : 1;
+    bool mIsBlock : 1;
+    bool mIsRenderedLegend : 1;
+
+   private:
+    ~FrameConstructionItem() {
+      MOZ_COUNT_DTOR(FrameConstructionItem);
+      MOZ_ASSERT(mChildItems.IsEmpty(), "leaking");
+    }
+  };
+
+  struct MOZ_RAII AutoFrameConstructionItem final {
+    template <typename... Args>
+    explicit AutoFrameConstructionItem(nsCSSFrameConstructor* aFCtor,
+                                       Args&&... args)
+        : mFCtor(aFCtor),
+          mItem(new (aFCtor)
+                    FrameConstructionItem(std::forward<Args>(args)...)) {
+      MOZ_ASSERT(mFCtor);
+    }
+    ~AutoFrameConstructionItem() { mItem->Delete(mFCtor); }
+    operator FrameConstructionItem&() { return *mItem; }
+
+   private:
+    nsCSSFrameConstructor* const mFCtor;
+    FrameConstructionItem* const mItem;
+  };
+
+  class MOZ_RAII AutoFrameConstructionPageName final {
+    nsFrameConstructorState& mState;
+    const nsAtom* mNameToRestore;
+
+   public:
+    AutoFrameConstructionPageName(const AutoFrameConstructionPageName&) =
+        delete;
+    AutoFrameConstructionPageName(AutoFrameConstructionPageName&&) = delete;
+    AutoFrameConstructionPageName(nsFrameConstructorState& aState,
+                                  nsIFrame* const aFrame);
+    ~AutoFrameConstructionPageName();
+  };
+
+  void CreateNeededAnonFlexOrGridItems(nsFrameConstructorState& aState,
+                                       FrameConstructionItemList& aItems,
+                                       nsIFrame* aParentFrame);
+
+  enum RubyWhitespaceType {
+    eRubyNotWhitespace,
+    eRubyInterLevelWhitespace,
+    eRubyInterLeafWhitespace,
+    eRubyInterSegmentWhitespace
+  };
+
+  static inline RubyWhitespaceType ComputeRubyWhitespaceType(
+      mozilla::StyleDisplay aPrevDisplay, mozilla::StyleDisplay aNextDisplay);
+
+  static inline RubyWhitespaceType InterpretRubyWhitespace(
+      nsFrameConstructorState& aState, const FCItemIterator& aStartIter,
+      const FCItemIterator& aEndIter);
+
+  void WrapItemsInPseudoRubyLeafBox(FCItemIterator& aIter,
+                                    ComputedStyle* aParentStyle,
+                                    nsIContent* aParentContent);
+
+  inline void WrapItemsInPseudoRubyLevelContainer(
+      nsFrameConstructorState& aState, FCItemIterator& aIter,
+      ComputedStyle* aParentStyle, nsIContent* aParentContent);
+
+  inline void TrimLeadingAndTrailingWhitespaces(
+      nsFrameConstructorState& aState, FrameConstructionItemList& aItems);
+
+  inline void CreateNeededPseudoInternalRubyBoxes(
+      nsFrameConstructorState& aState, FrameConstructionItemList& aItems,
+      nsIFrame* aParentFrame);
+
+  inline void CreateNeededPseudoContainers(nsFrameConstructorState& aState,
+                                           FrameConstructionItemList& aItems,
+                                           nsIFrame* aParentFrame);
+
+  inline void WrapItemsInPseudoParent(nsIContent* aParentContent,
+                                      ComputedStyle* aParentStyle,
+                                      ParentType aWrapperType,
+                                      FCItemIterator& aIter,
+                                      const FCItemIterator& aEndIter);
+
+  inline void CreateNeededPseudoSiblings(nsFrameConstructorState& aState,
+                                         FrameConstructionItemList& aItems,
+                                         nsIFrame* aParentFrame);
+
+
+ protected:
+  static nsIFrame* CreatePlaceholderFrameFor(PresShell* aPresShell,
+                                             nsIContent* aContent,
+                                             nsIFrame* aFrame,
+                                             nsContainerFrame* aParentFrame,
+                                             nsIFrame* aPrevInFlow,
+                                             nsFrameState aTypeBit);
+
+ private:
+  nsIFrame* ConstructFieldSetFrame(nsFrameConstructorState& aState,
+                                   FrameConstructionItem& aItem,
+                                   nsContainerFrame* aParentFrame,
+                                   const nsStyleDisplay* aStyleDisplay,
+                                   nsFrameList& aFrameList);
+
+  nsIFrame* ConstructListBoxSelectFrame(nsFrameConstructorState& aState,
+                                        FrameConstructionItem& aItem,
+                                        nsContainerFrame* aParentFrame,
+                                        const nsStyleDisplay* aStyleDisplay,
+                                        nsFrameList& aFrameList);
+
+  nsIFrame* ConstructTextControl(nsFrameConstructorState& aState,
+                                 FrameConstructionItem& aItem,
+                                 nsContainerFrame* aParentFrame,
+                                 const nsStyleDisplay* aStyleDisplay,
+                                 nsFrameList& aFrameList);
+
+  nsIFrame* ConstructBlockRubyFrame(nsFrameConstructorState& aState,
+                                    FrameConstructionItem& aItem,
+                                    nsContainerFrame* aParentFrame,
+                                    const nsStyleDisplay* aStyleDisplay,
+                                    nsFrameList& aFrameList);
+
+  void ConstructTextFrame(const FrameConstructionData* aData,
+                          nsFrameConstructorState& aState, nsIContent* aContent,
+                          nsContainerFrame* aParentFrame,
+                          ComputedStyle* aComputedStyle,
+                          nsFrameList& aFrameList);
+
+  void AddTextItemIfNeeded(nsFrameConstructorState& aState,
+                           const ComputedStyle& aParentStyle,
+                           const InsertionPoint& aInsertion,
+                           nsIContent* aPossibleTextContent,
+                           FrameConstructionItemList& aItems);
+
+  void ReframeTextIfNeeded(nsIContent* aContent);
+
+  void AppendPageBreakItem(nsIContent* aContent,
+                           FrameConstructionItemList& aItems);
+
+  static const FrameConstructionData* FindHTMLData(const Element&,
+                                                   nsIFrame* aParentFrame,
+                                                   ComputedStyle&);
+  static const FrameConstructionData* FindSelectData(const Element&,
+                                                     ComputedStyle&);
+  static const FrameConstructionData* FindImgData(const Element&,
+                                                  ComputedStyle&);
+  static const FrameConstructionData* FindHTMLButtonData(const Element&,
+                                                         ComputedStyle&);
+  static const FrameConstructionData* FindGeneratedImageData(const Element&,
+                                                             ComputedStyle&);
+  static const FrameConstructionData* FindImgControlData(const Element&,
+                                                         ComputedStyle&);
+  static const FrameConstructionData* FindSearchControlData(const Element&,
+                                                            ComputedStyle&);
+  static const FrameConstructionData* FindInputData(const Element&,
+                                                    ComputedStyle&);
+  static const FrameConstructionData* FindObjectData(const Element&,
+                                                     ComputedStyle&);
+  static const FrameConstructionData* FindCanvasData(const Element&,
+                                                     ComputedStyle&);
+  static const FrameConstructionData* FindDetailsData(const Element&,
+                                                      ComputedStyle&);
+
+  void ConstructFrameFromItemInternal(FrameConstructionItem& aItem,
+                                      nsFrameConstructorState& aState,
+                                      nsContainerFrame* aParentFrame,
+                                      nsFrameList& aFrameList);
+
+  void AddFrameConstructionItemsInternal(nsFrameConstructorState& aState,
+                                         nsIContent* aContent,
+                                         nsContainerFrame* aParentFrame,
+                                         bool aSuppressWhiteSpaceOptimizations,
+                                         ComputedStyle*, ItemFlags,
+                                         FrameConstructionItemList& aItems);
+
+  void ConstructFramesFromItemList(nsFrameConstructorState& aState,
+                                   FrameConstructionItemList& aItems,
+                                   nsContainerFrame* aParentFrame,
+                                   bool aParentIsWrapperAnonBox,
+                                   nsFrameList& aFrameList);
+  void ConstructFramesFromItem(nsFrameConstructorState& aState,
+                               FCItemIterator& aItem,
+                               nsContainerFrame* aParentFrame,
+                               nsFrameList& aFrameList);
+  static bool AtLineBoundary(FCItemIterator& aIter);
+
+  nsresult GetAnonymousContent(
+      nsIContent* aParent, nsIFrame* aParentFrame,
+      nsTArray<nsIAnonymousContentCreator::ContentInfo>& aAnonContent);
+
+  void FlushAccumulatedBlock(nsFrameConstructorState& aState,
+                             nsIContent* aContent,
+                             nsContainerFrame* aParentFrame,
+                             nsFrameList& aBlockList, nsFrameList& aNewList);
+
+  static const FrameConstructionData* FindMathMLData(const Element&,
+                                                     ComputedStyle&);
+
+  static const FrameConstructionData* FindXULTagData(const Element&,
+                                                     ComputedStyle&);
+  static const FrameConstructionData* FindXULLabelOrDescriptionData(
+      const Element&, ComputedStyle&);
+
+  nsContainerFrame* ConstructSVGFrameWithAnonymousChild(
+      nsFrameConstructorState& aState, FrameConstructionItem& aItem,
+      nsContainerFrame* aParentFrame, nsFrameList& aFrameList,
+      ContainerFrameCreationFunc aConstructor,
+      ContainerFrameCreationFunc aInnerConstructor,
+      PseudoStyleType aInnerPseudo, bool aCandidateRootFrame);
+
+  nsIFrame* ConstructOuterSVG(nsFrameConstructorState& aState,
+                              FrameConstructionItem& aItem,
+                              nsContainerFrame* aParentFrame,
+                              const nsStyleDisplay* aDisplay,
+                              nsFrameList& aFrameList);
+
+  nsIFrame* ConstructMarker(nsFrameConstructorState& aState,
+                            FrameConstructionItem& aItem,
+                            nsContainerFrame* aParentFrame,
+                            const nsStyleDisplay* aDisplay,
+                            nsFrameList& aFrameList);
+
+  static const FrameConstructionData* FindSVGData(const Element&,
+                                                  nsIFrame* aParentFrame,
+                                                  bool aIsWithinSVGText,
+                                                  bool aAllowsTextPathChild,
+                                                  ComputedStyle&);
+
+  const FrameConstructionData* FindDisplayData(const nsStyleDisplay&,
+                                               const Element&);
+
+  nsIFrame* ConstructScrollableBlock(nsFrameConstructorState& aState,
+                                     FrameConstructionItem& aItem,
+                                     nsContainerFrame* aParentFrame,
+                                     const nsStyleDisplay* aDisplay,
+                                     nsFrameList& aFrameList);
+
+  nsIFrame* ConstructNonScrollableBlock(nsFrameConstructorState& aState,
+                                        FrameConstructionItem& aItem,
+                                        nsContainerFrame* aParentFrame,
+                                        const nsStyleDisplay* aDisplay,
+                                        nsFrameList& aFrameList);
+
+  void ConstructScrollableBlockWithScrollContainer(
+      nsFrameConstructorState& aState, FrameConstructionItem& aItem,
+      nsContainerFrame* aParentFrame, const nsStyleDisplay* aDisplay,
+      nsFrameList& aFrameList, nsContainerFrame*&);
+
+  void AddFCItemsForAnonymousContent(
+      nsFrameConstructorState& aState, nsContainerFrame* aFrame,
+      const nsTArray<nsIAnonymousContentCreator::ContentInfo>& aAnonymousItems,
+      FrameConstructionItemList& aItemsToConstruct,
+      const AutoFrameConstructionPageName& aUnusedPageNameTracker);
+
+  void ProcessChildren(nsFrameConstructorState& aState, nsIContent* aContent,
+                       ComputedStyle* aComputedStyle,
+                       nsContainerFrame* aParentFrame,
+                       const bool aCanHaveGeneratedContent,
+                       nsFrameList& aFrameList, const bool aAllowBlockStyles,
+                       nsIFrame* aPossiblyLeafFrame = nullptr);
+
+ public:
+  enum ContainingBlockType { ABS_POS, FIXED_POS };
+  nsContainerFrame* GetAbsoluteContainingBlock(nsIFrame* aFrame,
+                                               ContainingBlockType aType);
+  nsContainerFrame* GetFloatContainingBlock(nsIFrame* aFrame);
+
+ private:
+  void BuildScrollContainerFrame(nsFrameConstructorState& aState,
+                                 nsIContent* aContent,
+                                 ComputedStyle* aContentStyle,
+                                 nsIFrame* aScrolledFrame,
+                                 nsContainerFrame* aParentFrame,
+                                 nsContainerFrame*& aNewFrame);
+
+  already_AddRefed<ComputedStyle> BeginBuildingScrollContainerFrame(
+      nsFrameConstructorState& aState, nsIContent* aContent,
+      ComputedStyle* aContentStyle, nsContainerFrame* aParentFrame,
+      bool aIsRoot, nsContainerFrame*& aNewFrame);
+
+  void FinishBuildingScrollContainerFrame(
+      nsContainerFrame* aScrollContainerFrame, nsIFrame* aScrolledFrame);
+
+  void InitializeListboxSelect(nsFrameConstructorState& aState,
+                               nsContainerFrame* aScrollFrame,
+                               nsContainerFrame* aScrolledFrame,
+                               nsIContent* aContent,
+                               nsContainerFrame* aParentFrame,
+                               ComputedStyle* aComputedStyle,
+                               nsFrameList& aFrameList);
+
+  void RecreateFramesForContent(nsIContent* aContent, InsertionKind);
+
+  void UpdateTableCellSpans(nsIContent* aContent);
+
+  bool MaybeRecreateContainerForFrameRemoval(nsIFrame* aFrame);
+
+  nsIFrame* CreateContinuingOuterTableFrame(nsIFrame* aFrame,
+                                            nsContainerFrame* aParentFrame,
+                                            nsIContent* aContent,
+                                            ComputedStyle* aComputedStyle);
+
+  nsIFrame* CreateContinuingTableFrame(nsIFrame* aFrame,
+                                       nsContainerFrame* aParentFrame,
+                                       nsIContent* aContent,
+                                       ComputedStyle* aComputedStyle);
+
+
+
+  already_AddRefed<ComputedStyle> GetFirstLetterStyle(
+      nsIContent* aContent, ComputedStyle* aComputedStyle);
+
+  already_AddRefed<ComputedStyle> GetFirstLineStyle(
+      nsIContent* aContent, ComputedStyle* aComputedStyle);
+
+  bool ShouldHaveFirstLetterStyle(nsIContent* aContent,
+                                  ComputedStyle* aComputedStyle);
+
+  bool HasFirstLetterStyle(nsIFrame* aBlockFrame);
+
+  bool ShouldHaveFirstLineStyle(nsIContent* aContent,
+                                ComputedStyle* aComputedStyle);
+
+  void ShouldHaveSpecialBlockStyle(nsIContent* aContent,
+                                   ComputedStyle* aComputedStyle,
+                                   bool* aHaveFirstLetterStyle,
+                                   bool* aHaveFirstLineStyle);
+
+  void ConstructBlock(nsFrameConstructorState& aState, nsIContent* aContent,
+                      nsContainerFrame* aParentFrame,
+                      nsContainerFrame* aContentParentFrame,
+                      ComputedStyle* aComputedStyle,
+                      nsContainerFrame** aNewFrame, nsFrameList& aFrameList,
+                      nsIFrame* aPositionedFrameForAbsPosContainer);
+
+  nsBlockFrame* BeginBuildingColumns(nsFrameConstructorState& aState,
+                                     nsIContent* aContent,
+                                     nsContainerFrame* aParentFrame,
+                                     nsContainerFrame* aColumnContent,
+                                     ComputedStyle* aComputedStyle);
+
+  void FinishBuildingColumns(nsFrameConstructorState& aState,
+                             nsContainerFrame* aColumnSetWrapper,
+                             nsContainerFrame* aColumnContent,
+                             nsFrameList& aColumnContentSiblings);
+
+  bool MayNeedToCreateColumnSpanSiblings(nsContainerFrame* aBlockFrame,
+                                         const nsFrameList& aChildList);
+
+  nsFrameList CreateColumnSpanSiblings(nsFrameConstructorState& aState,
+                                       nsContainerFrame* aInitialBlock,
+                                       nsFrameList& aChildList,
+                                       nsIFrame* aPositionedFrame);
+
+  bool MaybeRecreateForColumnSpan(nsFrameConstructorState& aState,
+                                  nsContainerFrame* aParentFrame,
+                                  nsFrameList& aFrameList,
+                                  nsIFrame* aPrevSibling);
+
+  nsIFrame* ConstructInline(nsFrameConstructorState& aState,
+                            FrameConstructionItem& aItem,
+                            nsContainerFrame* aParentFrame,
+                            const nsStyleDisplay* aDisplay,
+                            nsFrameList& aFrameList);
+
+  void CreateIBSiblings(nsFrameConstructorState& aState,
+                        nsContainerFrame* aInitialInline, bool aIsPositioned,
+                        nsFrameList& aChildList, nsFrameList& aSiblings);
+
+  void BuildInlineChildItems(nsFrameConstructorState& aState,
+                             FrameConstructionItem& aParentItem,
+                             bool aItemIsWithinSVGText,
+                             bool aItemAllowsTextPathChild);
+
+  bool WipeInsertionParent(nsContainerFrame* aFrame);
+
+  bool WipeContainingBlock(nsFrameConstructorState& aState,
+                           nsIFrame* aContainingBlock, nsIFrame* aFrame,
+                           FrameConstructionItemList& aItems, bool aIsAppend,
+                           nsIFrame* aPrevSibling);
+
+  void ReframeContainingBlock(nsIFrame* aFrame);
+
+
+
+  nsFirstLetterFrame* CreateFloatingLetterFrame(
+      nsFrameConstructorState& aState, mozilla::dom::Text* aTextContent,
+      nsIFrame* aTextFrame, nsContainerFrame* aParentFrame,
+      ComputedStyle* aParentStyle, ComputedStyle* aComputedStyle,
+      nsFrameList& aResult);
+
+  void CreateLetterFrame(nsContainerFrame* aBlockFrame,
+                         nsContainerFrame* aBlockContinuation,
+                         mozilla::dom::Text* aTextContent,
+                         nsContainerFrame* aParentFrame, nsFrameList& aResult);
+
+  void WrapFramesInFirstLetterFrame(nsContainerFrame* aBlockFrame,
+                                    nsFrameList& aBlockFrames);
+
+  void WrapFramesInFirstLetterFrame(
+      nsContainerFrame* aBlockFrame, nsContainerFrame* aBlockContinuation,
+      nsContainerFrame* aParentFrame, nsIFrame* aParentFrameList,
+      nsContainerFrame** aModifiedParent, nsIFrame** aTextFrame,
+      nsIFrame** aPrevFrame, nsFrameList& aLetterFrames, bool* aStopLooking);
+
+  void RecoverLetterFrames(nsContainerFrame* aBlockFrame);
+
+  void RemoveLetterFrames(PresShell* aPresShell, nsContainerFrame* aBlockFrame);
+
+  void RemoveFirstLetterFrames(PresShell* aPresShell, nsContainerFrame* aFrame,
+                               nsContainerFrame* aBlockFrame,
+                               bool* aStopLooking);
+
+  void RemoveFloatingFirstLetterFrames(PresShell* aPresShell,
+                                       nsIFrame* aBlockFrame);
+
+  void CaptureStateForFramesOf(nsIContent* aContent,
+                               nsILayoutHistoryState* aHistoryState);
+
+
+
+  void WrapFramesInFirstLineFrame(nsFrameConstructorState& aState,
+                                  nsIContent* aBlockContent,
+                                  nsContainerFrame* aBlockFrame,
+                                  nsFirstLineFrame* aLineFrame,
+                                  nsFrameList& aFrameList);
+
+  void AppendFirstLineFrames(nsFrameConstructorState& aState,
+                             nsIContent* aContent,
+                             nsContainerFrame* aBlockFrame,
+                             nsFrameList& aFrameList);
+
+  void CheckForFirstLineInsertion(nsIFrame* aParentFrame,
+                                  nsFrameList& aFrameList);
+
+  enum class SiblingDirection {
+    Forward,
+    Backward,
+  };
+
+  template <SiblingDirection>
+  nsIFrame* FindSibling(const mozilla::dom::FlattenedChildIterator& aIter);
+
+  template <SiblingDirection>
+  nsIFrame* FindSiblingInternal(mozilla::dom::FlattenedChildIterator&);
+
+  nsIFrame* FindNextSibling(const mozilla::dom::FlattenedChildIterator& aIter);
+  nsIFrame* FindPreviousSibling(
+      const mozilla::dom::FlattenedChildIterator& aIter);
+
+  nsIFrame* AdjustSiblingFrame(nsIFrame* aSibling, SiblingDirection);
+
+  nsIFrame* GetInsertionPrevSibling(InsertionPoint* aInsertion,  
+                                    nsIContent* aChild, bool* aIsAppend);
+
+  void QuotesDirty();
+  void CountersDirty();
+
+  void ConstructAnonymousContentForRoot(nsFrameConstructorState& aState,
+                                        nsContainerFrame* aCanvasFrame,
+                                        nsIContent* aDocElement, nsFrameList&);
+
+ public:
+  friend class nsFrameConstructorState;
+
+ private:
+  friend struct FrameConstructionItem;
+  void* AllocateFCItem();
+  void FreeFCItem(FrameConstructionItem*);
+
+  mozilla::dom::Document* mDocument;  
+
+
+  nsContainerFrame* mRootElementFrame = nullptr;
+  nsIFrame* mRootElementStyleFrame = nullptr;
+  nsCanvasFrame* mDocElementContainingBlock = nullptr;
+  nsCanvasFrame* mCanvasFrame = nullptr;
+  nsPageSequenceFrame* mPageSequenceFrame = nullptr;
+
+  mozilla::ArenaAllocator<4096, 8> mFCItemPool;
+
+  RefPtr<const nsAtom> mNextPageContentFramePageName;
+
+  struct FreeFCItemLink {
+    FreeFCItemLink* mNext;
+  };
+  FreeFCItemLink* mFirstFreeFCItem;
+  size_t mFCItemsInUse;
+
+  mozilla::ContainStyleScopeManager mContainStyleScopeManager;
+
+  uint16_t mCurrentDepth;
+  bool mQuotesDirty : 1;
+  bool mCountersDirty : 1;
+  bool mAlwaysCreateFramesForIgnorableWhitespace : 1;
+  bool mRemovingContent : 1;
+
+  nsCOMPtr<nsILayoutHistoryState> mFrameTreeState;
+};
+
+#endif

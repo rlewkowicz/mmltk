@@ -1,0 +1,64 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_GFX_FONTSRCURI_H
+#define MOZILLA_GFX_FONTSRCURI_H
+
+#include "nsCOMPtr.h"
+#include "nsTString.h"
+#include "PLDHashTable.h"
+
+class nsIURI;
+
+namespace mozilla {
+namespace net {
+class nsSimpleURI;
+}  
+}  
+
+class gfxFontSrcURI final {
+ public:
+  explicit gfxFontSrcURI(nsIURI* aURI);
+
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(gfxFontSrcURI)
+
+  nsIURI* get() { return mURI; }
+
+  bool Equals(gfxFontSrcURI* aOther);
+  nsresult GetSpec(nsACString& aResult);
+  nsCString GetSpecOrDefault();
+
+  PLDHashNumber Hash() const { return mHash; }
+
+  bool InheritsSecurityContext() {
+    EnsureInitialized();
+    return mInheritsSecurityContext;
+  }
+
+  bool SyncLoadIsOK() {
+    EnsureInitialized();
+    return mSyncLoadIsOK;
+  }
+
+ private:
+  ~gfxFontSrcURI();
+
+  void EnsureInitialized();
+
+  nsCOMPtr<nsIURI> mURI;
+
+  mozilla::net::nsSimpleURI* mSimpleURI;
+
+  nsCString mSpec;
+
+  PLDHashNumber mHash;
+
+  bool mInitialized = false;
+
+  bool mInheritsSecurityContext = false;
+
+  bool mSyncLoadIsOK = false;
+};
+
+#endif  // MOZILLA_GFX_FONTSRCURI_H

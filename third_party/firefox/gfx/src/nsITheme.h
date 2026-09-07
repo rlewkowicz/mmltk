@@ -1,0 +1,150 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsITheme_h_
+#define nsITheme_h_
+
+#include "mozilla/AlreadyAddRefed.h"
+#include "nsISupports.h"
+#include "nsID.h"
+#include "nscore.h"
+#include "Units.h"
+
+struct nsRect;
+class gfxContext;
+class nsAttrValue;
+class nsPresContext;
+class nsDeviceContext;
+class nsIFrame;
+class nsAtom;
+class nsIWidget;
+
+namespace mozilla {
+class ComputedStyle;
+enum class StyleAppearance : uint8_t;
+enum class StyleScrollbarWidth : uint8_t;
+namespace layers {
+class StackingContextHelper;
+class RenderRootStateManager;
+}  
+namespace widget {
+class Theme;
+}  
+namespace wr {
+class DisplayListBuilder;
+class IpcResourceUpdateQueue;
+}  
+}  
+
+#define NS_ITHEME_IID \
+  {0x7329f760, 0x08cb, 0x450f, {0x82, 0x25, 0xda, 0xe7, 0x29, 0x09, 0x6d, 0xec}}
+
+class nsITheme : public nsISupports {
+ protected:
+  using LayoutDeviceIntMargin = mozilla::LayoutDeviceIntMargin;
+  using LayoutDeviceIntSize = mozilla::LayoutDeviceIntSize;
+  using LayoutDeviceIntCoord = mozilla::LayoutDeviceIntCoord;
+  using StyleAppearance = mozilla::StyleAppearance;
+  using StyleScrollbarWidth = mozilla::StyleScrollbarWidth;
+  using ComputedStyle = mozilla::ComputedStyle;
+
+ public:
+  NS_INLINE_DECL_STATIC_IID(NS_ITHEME_IID)
+
+  enum class DrawOverflow { No, Yes };
+  virtual void DrawWidgetBackground(gfxContext* aContext, nsIFrame* aFrame,
+                                    StyleAppearance aWidgetType,
+                                    const nsRect& aRect,
+                                    const nsRect& aDirtyRect,
+                                    DrawOverflow = DrawOverflow::Yes) = 0;
+
+  virtual bool CreateWebRenderCommandsForWidget(
+      mozilla::wr::DisplayListBuilder& aBuilder,
+      mozilla::wr::IpcResourceUpdateQueue& aResources,
+      const mozilla::layers::StackingContextHelper& aSc,
+      mozilla::layers::RenderRootStateManager* aManager, nsIFrame* aFrame,
+      StyleAppearance aWidgetType, const nsRect& aRect) {
+    return false;
+  }
+
+  enum class Overlay { No, Yes };
+  virtual LayoutDeviceIntCoord GetScrollbarSize(const nsPresContext*,
+                                                StyleScrollbarWidth,
+                                                Overlay) = 0;
+
+  [[nodiscard]] virtual LayoutDeviceIntMargin GetWidgetBorder(
+      nsDeviceContext* aContext, nsIFrame* aFrame,
+      StyleAppearance aWidgetType) = 0;
+
+  virtual bool GetWidgetPadding(nsDeviceContext* aContext, nsIFrame* aFrame,
+                                StyleAppearance aWidgetType,
+                                LayoutDeviceIntMargin* aResult) = 0;
+
+  virtual bool GetWidgetOverflow(nsDeviceContext* aContext, nsIFrame* aFrame,
+                                 StyleAppearance aWidgetType,
+                                  nsRect* aOverflowRect) {
+    return false;
+  }
+
+  virtual mozilla::CSSCoord GetCheckboxRadioPrefSize() {
+    return mozilla::CSSCoord(9.0f);
+  }
+
+  virtual mozilla::CSSCoord GetCheckboxRadioBorderWidth() {
+    return mozilla::CSSCoord(1.0f);
+  }
+
+  virtual mozilla::CSSCoord GetMinimumRangeThumbSize() {
+    return mozilla::CSSCoord(20.0f);
+  }
+
+  virtual mozilla::LayoutDeviceIntSize GetMinimumWidgetSize(
+      nsPresContext* aPresContext, nsIFrame* aFrame,
+      StyleAppearance aWidgetType) = 0;
+
+  enum Transparency { eOpaque = 0, eTransparent, eUnknownTransparency };
+
+  virtual Transparency GetWidgetTransparency(nsIFrame* aFrame,
+                                             StyleAppearance aWidgetType) {
+    return eUnknownTransparency;
+  }
+
+  virtual bool WidgetAttributeChangeRequiresRepaint(StyleAppearance,
+                                                    nsAtom* aAttribute) = 0;
+
+  virtual void ThemeChanged() {}
+
+  virtual bool WidgetAppearanceDependsOnWindowFocus(
+      StyleAppearance aWidgetType) {
+    return false;
+  }
+
+  typedef uint8_t ThemeGeometryType;
+  enum { eThemeGeometryTypeUnknown = 0 };
+
+  virtual ThemeGeometryType ThemeGeometryTypeForWidget(
+      nsIFrame* aFrame, StyleAppearance aWidgetType) {
+    return eThemeGeometryTypeUnknown;
+  }
+
+  virtual bool ThemeSupportsWidget(nsPresContext* aPresContext,
+                                   nsIFrame* aFrame,
+                                   StyleAppearance aWidgetType) = 0;
+
+  virtual bool ThemeDrawsFocusForWidget(nsIFrame*, StyleAppearance) = 0;
+
+  virtual bool ThemeNeedsComboboxDropmarker() = 0;
+
+  virtual bool ThemeSupportsScrollbarButtons() = 0;
+};
+
+extern already_AddRefed<nsITheme> do_GetNativeThemeDoNotUseDirectly();
+extern already_AddRefed<nsITheme> do_GetBasicNativeThemeDoNotUseDirectly();
+extern already_AddRefed<nsITheme> do_GetRDMThemeDoNotUseDirectly();
+
+extern already_AddRefed<mozilla::widget::Theme>
+do_CreateNativeThemeDoNotUseDirectly();
+
+#endif

@@ -1,0 +1,230 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsHttpResponseHead_h_
+#define nsHttpResponseHead_h_
+
+#include "nsHttpHeaderArray.h"
+#include "nsHttp.h"
+#include "nsISupportsImpl.h"
+#include "nsString.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/RecursiveMutex.h"
+
+#ifdef Status
+typedef Status __StatusTmp;
+#  undef Status
+typedef __StatusTmp Status;
+#endif
+
+class nsIHttpHeaderVisitor;
+
+namespace IPC {
+template <typename>
+struct ParamTraits;
+}  
+
+namespace mozilla {
+namespace net {
+
+
+class nsHttpResponseHead {
+ public:
+  nsHttpResponseHead() = default;
+
+  nsHttpResponseHead(const nsHttpResponseHead& aOther);
+  nsHttpResponseHead(nsHttpResponseHead&& aOther);
+  nsHttpResponseHead& operator=(const nsHttpResponseHead& aOther);
+
+  void Enter() const MOZ_CAPABILITY_ACQUIRE(mRecursiveMutex) {
+    mRecursiveMutex.Lock();
+  }
+  void Exit() const MOZ_CAPABILITY_RELEASE(mRecursiveMutex) {
+    mRecursiveMutex.Unlock();
+  }
+  void AssertMutexOwned() const { mRecursiveMutex.AssertCurrentThreadIn(); }
+
+  HttpVersion Version() const;
+  uint16_t Status() const;
+  void StatusText(nsACString& aStatusText);
+  int64_t ContentLength();
+  void ContentType(nsACString& aContentType) const;
+  void ContentCharset(nsACString& aContentCharset);
+  bool Public();
+  bool Private();
+  bool NoStore();
+  bool NoCache();
+  bool Immutable();
+  int64_t TotalEntitySize();
+
+  [[nodiscard]] nsresult SetHeader(const nsACString& h, const nsACString& v,
+                                   bool m = false);
+  [[nodiscard]] nsresult SetHeaderOverride(const nsHttpAtom& h,
+                                           const nsACString& v);
+  [[nodiscard]] nsresult SetHeader(const nsHttpAtom& h, const nsACString& v,
+                                   bool m = false);
+  [[nodiscard]] nsresult GetHeader(const nsHttpAtom& h, nsACString& v) const;
+  void ClearHeader(const nsHttpAtom& h);
+  void ClearHeaders();
+  bool HasHeaderValue(const nsHttpAtom& h, const char* v);
+  bool HasHeader(const nsHttpAtom& h) const;
+
+  void SetContentType(const nsACString& s);
+  void SetContentCharset(const nsACString& s);
+  void SetContentLength(int64_t);
+
+  void Flatten(nsACString&, bool pruneTransients);
+  void FlattenNetworkOriginalHeaders(nsACString& buf);
+
+  [[nodiscard]] nsresult ParseCachedHead(const char* block);
+  [[nodiscard]] nsresult ParseCachedOriginalHeaders(char* block);
+
+  nsresult ParseStatusLine(const nsACString& line);
+
+  [[nodiscard]] nsresult ParseHeaderLine(const nsACString& line);
+
+  [[nodiscard]] nsresult ComputeFreshnessLifetime(uint32_t*);
+  [[nodiscard]] nsresult ComputeCurrentAge(uint32_t now, uint32_t requestTime,
+                                           uint32_t* result);
+  bool MustValidate();
+  bool MustValidateIfExpired();
+
+  bool StaleWhileRevalidate(uint32_t now, uint32_t expiration);
+
+  bool IsResumable();
+
+  bool ExpiresInPast();
+
+  void UpdateHeaders(nsHttpResponseHead* aOther);
+
+  void Reset();
+
+  [[nodiscard]] nsresult GetLastModifiedValue(uint32_t* result);
+
+  bool operator==(const nsHttpResponseHead& aOther) const;
+
+  [[nodiscard]] nsresult VisitHeaders(nsIHttpHeaderVisitor* visitor,
+                                      nsHttpHeaderArray::VisitorFilter filter);
+  [[nodiscard]] nsresult GetOriginalHeader(const nsHttpAtom& aHeader,
+                                           nsIHttpHeaderVisitor* aVisitor);
+
+  bool HasContentType() const;
+  bool HasContentCharset();
+  bool GetContentTypeOptionsHeader(nsACString& aOutput);
+
+  size_t SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const {
+    return aMallocSizeOf(this) + SizeOfExcludingThis(aMallocSizeOf);
+  }
+
+  size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const {
+    RecursiveMutexAutoLock monitor(mRecursiveMutex);
+    return mStatusText.SizeOfExcludingThisIfUnshared(aMallocSizeOf) +
+           mContentType.SizeOfExcludingThisIfUnshared(aMallocSizeOf) +
+           mContentCharset.SizeOfExcludingThisIfUnshared(aMallocSizeOf);
+  }
+
+ private:
+  [[nodiscard]] nsresult SetHeader_locked(const nsHttpAtom& atom,
+                                          const nsACString& h,
+                                          const nsACString& v, bool m = false)
+      MOZ_REQUIRES(mRecursiveMutex);
+  void AssignDefaultStatusText() MOZ_REQUIRES(mRecursiveMutex);
+  void ParseVersion(const char*) MOZ_REQUIRES(mRecursiveMutex);
+  void ParseCacheControl(const char*) MOZ_REQUIRES(mRecursiveMutex);
+  void ParsePragma(const char*) MOZ_REQUIRES(mRecursiveMutex);
+  nsresult ParseResponseContentLength(const nsACString& aHeaderStr)
+      MOZ_REQUIRES(mRecursiveMutex);
+  void ParseContentTypeValue(const nsHttpAtom& aAtom,
+                             const nsACString& aContentTypeValue)
+      MOZ_REQUIRES(mRecursiveMutex);
+
+  nsresult ParseStatusLine_locked(const nsACString& line)
+      MOZ_REQUIRES(mRecursiveMutex);
+  [[nodiscard]] nsresult ParseHeaderLine_locked(const nsACString& line,
+                                                bool originalFromNetHeaders)
+      MOZ_REQUIRES(mRecursiveMutex);
+
+  [[nodiscard]] nsresult ParseDateHeader(const nsHttpAtom& header,
+                                         uint32_t* result) const
+      MOZ_REQUIRES(mRecursiveMutex);
+  [[nodiscard]] nsresult GetAgeValue(uint32_t* result);
+  [[nodiscard]] nsresult GetMaxAgeValue(uint32_t* result);
+  [[nodiscard]] nsresult GetStaleWhileRevalidateValue(uint32_t* result);
+  [[nodiscard]] nsresult GetDateValue(uint32_t* result);
+  [[nodiscard]] nsresult GetExpiresValue(uint32_t* result);
+
+  bool ExpiresInPast_locked() const MOZ_REQUIRES(mRecursiveMutex);
+  [[nodiscard]] nsresult GetAgeValue_locked(uint32_t* result) const
+      MOZ_REQUIRES(mRecursiveMutex);
+  [[nodiscard]] nsresult GetExpiresValue_locked(uint32_t* result) const
+      MOZ_REQUIRES(mRecursiveMutex);
+  [[nodiscard]] nsresult GetMaxAgeValue_locked(uint32_t* result) const
+      MOZ_REQUIRES(mRecursiveMutex);
+  [[nodiscard]] nsresult GetStaleWhileRevalidateValue_locked(
+      uint32_t* result) const MOZ_REQUIRES(mRecursiveMutex);
+
+  [[nodiscard]] nsresult GetDateValue_locked(uint32_t* result) const
+      MOZ_REQUIRES(mRecursiveMutex) {
+    return ParseDateHeader(nsHttp::Date, result);
+  }
+
+  [[nodiscard]] nsresult GetLastModifiedValue_locked(uint32_t* result) const
+      MOZ_REQUIRES(mRecursiveMutex) {
+    return ParseDateHeader(nsHttp::Last_Modified, result);
+  }
+
+  bool NoCache_locked() const MOZ_REQUIRES(mRecursiveMutex) {
+    MOZ_ASSERT_IF(mCacheControlNoCache, mHasCacheControl);
+    return (mPragmaNoCache && !mCacheControlImmutable) || mCacheControlNoCache;
+  }
+
+ private:
+  nsHttpHeaderArray mHeaders MOZ_GUARDED_BY(mRecursiveMutex);
+  HttpVersion mVersion MOZ_GUARDED_BY(mRecursiveMutex){HttpVersion::v1_1};
+  uint16_t mStatus MOZ_GUARDED_BY(mRecursiveMutex){200};
+  nsCString mStatusText MOZ_GUARDED_BY(mRecursiveMutex);
+  int64_t mContentLength MOZ_GUARDED_BY(mRecursiveMutex){-1};
+  nsCString mContentTypeBuffer MOZ_GUARDED_BY(mRecursiveMutex);
+  nsCString mContentType MOZ_GUARDED_BY(mRecursiveMutex);
+  nsCString mContentCharset MOZ_GUARDED_BY(mRecursiveMutex);
+  bool mHasCacheControl MOZ_GUARDED_BY(mRecursiveMutex){false};
+  bool mCacheControlPublic MOZ_GUARDED_BY(mRecursiveMutex){false};
+  bool mCacheControlPrivate MOZ_GUARDED_BY(mRecursiveMutex){false};
+  bool mCacheControlNoStore MOZ_GUARDED_BY(mRecursiveMutex){false};
+  bool mCacheControlNoCache MOZ_GUARDED_BY(mRecursiveMutex){false};
+  bool mCacheControlImmutable MOZ_GUARDED_BY(mRecursiveMutex){false};
+  bool mCacheControlStaleWhileRevalidateSet MOZ_GUARDED_BY(mRecursiveMutex){
+      false};
+  uint32_t mCacheControlStaleWhileRevalidate MOZ_GUARDED_BY(mRecursiveMutex){0};
+  bool mCacheControlMaxAgeSet MOZ_GUARDED_BY(mRecursiveMutex){false};
+  uint32_t mCacheControlMaxAge MOZ_GUARDED_BY(mRecursiveMutex){0};
+  bool mPragmaNoCache MOZ_GUARDED_BY(mRecursiveMutex){false};
+
+  mutable RecursiveMutex mRecursiveMutex{"nsHttpResponseHead.mRecursiveMutex"};
+  uint32_t mInVisitHeaders MOZ_GUARDED_BY(mRecursiveMutex){0};
+
+  friend struct IPC::ParamTraits<nsHttpResponseHead>;
+};
+
+class ProxyConnectResponseHead final {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(ProxyConnectResponseHead)
+
+  explicit ProxyConnectResponseHead(const nsHttpResponseHead& aHead)
+      : mHead(aHead) {}
+  explicit ProxyConnectResponseHead(nsHttpResponseHead&& aHead)
+      : mHead(std::move(aHead)) {}
+
+  const nsHttpResponseHead& Head() const { return mHead; }
+
+ private:
+  ~ProxyConnectResponseHead() = default;
+
+  const nsHttpResponseHead mHead;
+};
+
+}  
+}  
+
+#endif  // nsHttpResponseHead_h_

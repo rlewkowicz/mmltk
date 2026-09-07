@@ -1,0 +1,185 @@
+/*
+ * Copyright 2013 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkResourceCache_DEFINED)
+#define SkResourceCache_DEFINED
+
+#include "include/private/base/SkDebug.h"
+#include "src/core/SkMessageBus.h"
+
+#include <cstddef>
+#include <cstdint>
+
+class SkCachedData;
+class SkDiscardableMemory;
+class SkTraceMemoryDump;
+
+class SkResourceCache {
+public:
+    struct Key {
+        void init(void* nameSpace, uint64_t sharedID, size_t dataSize);
+
+        size_t size() const {
+            return fCount32 << 2;
+        }
+
+        void* getNamespace() const { return fNamespace; }
+        uint64_t getSharedID() const { return ((uint64_t)fSharedID_hi << 32) | fSharedID_lo; }
+
+        uint32_t hash() const { return fHash; }
+
+        bool operator==(const Key& other) const {
+            const uint32_t* a = this->as32();
+            const uint32_t* b = other.as32();
+            for (int i = 0; i < fCount32; ++i) {  
+                if (a[i] != b[i]) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+    private:
+        int32_t  fCount32;   
+        uint32_t fHash;
+        uint32_t fSharedID_lo;
+        uint32_t fSharedID_hi;
+        void*    fNamespace; 
+
+        const uint32_t* as32() const { return (const uint32_t*)this; }
+    };
+
+    struct Rec {
+        typedef SkResourceCache::Key Key;
+
+        Rec() {}
+        virtual ~Rec() {}
+
+        uint32_t getHash() const { return this->getKey().hash(); }
+
+        virtual const Key& getKey() const = 0;
+        virtual size_t bytesUsed() const = 0;
+
+        virtual bool canBePurged() { return true; }
+
+        virtual void postAddInstall(void*) {}
+
+        virtual const char* getCategory() const = 0;
+        virtual SkDiscardableMemory* diagnostic_only_getDiscardable() const { return nullptr; }
+
+    private:
+        Rec*    fNext;
+        Rec*    fPrev;
+
+        friend class SkResourceCache;
+    };
+
+    struct PurgeSharedIDMessage {
+        PurgeSharedIDMessage(uint64_t sharedID) : fSharedID(sharedID) {}
+        uint64_t fSharedID;
+    };
+
+    typedef const Rec* ID;
+
+    typedef bool (*FindVisitor)(const Rec&, void* context);
+
+    typedef SkDiscardableMemory* (*DiscardableFactory)(size_t bytes);
+
+
+    static bool Find(const Key& key, FindVisitor, void* context);
+    static void Add(Rec*, void* payload = nullptr);
+
+    typedef void (*Visitor)(const Rec&, void* context);
+    static void VisitAll(Visitor, void* context);
+
+    static size_t GetTotalBytesUsed();
+    static size_t GetTotalByteLimit();
+    static size_t SetTotalByteLimit(size_t newLimit);
+
+    static size_t SetSingleAllocationByteLimit(size_t);
+    static size_t GetSingleAllocationByteLimit();
+    static size_t GetEffectiveSingleAllocationByteLimit();
+
+    static void PurgeAll();
+    static void CheckMessages();
+
+    static void TestDumpMemoryStatistics();
+
+    static void DumpMemoryStatistics(SkTraceMemoryDump* dump);
+
+    static DiscardableFactory GetDiscardableFactory();
+
+    static SkCachedData* NewCachedData(size_t bytes);
+
+    static void PostPurgeSharedID(uint64_t sharedID);
+
+    static void Dump();
+
+
+    SkResourceCache(DiscardableFactory);
+
+    explicit SkResourceCache(size_t byteLimit);
+    virtual ~SkResourceCache();
+
+    virtual bool find(const Key&, FindVisitor, void* context) ;
+    virtual void add(Rec*, void* payload = nullptr);
+    virtual void visitAll(Visitor, void* context);
+
+    virtual size_t getTotalBytesUsed() const { return fTotalBytesUsed; }
+    virtual size_t getTotalByteLimit() const { return fTotalByteLimit; }
+
+    virtual size_t setSingleAllocationByteLimit(size_t maximumAllocationSize);
+    virtual size_t getSingleAllocationByteLimit() const;
+    virtual size_t getEffectiveSingleAllocationByteLimit() const;
+
+    virtual size_t setTotalByteLimit(size_t newLimit);
+
+    virtual void purgeSharedID(uint64_t sharedID);
+
+    virtual void purgeAll() {
+        this->purgeAsNeeded(true);
+    }
+
+    virtual DiscardableFactory discardableFactory() const { return fDiscardableFactory; }
+
+    virtual SkCachedData* newCachedData(size_t bytes);
+
+    virtual void dump() const;
+
+private:
+    Rec*    fHead;
+    Rec*    fTail;
+
+    class Hash;
+    Hash*   fHash;
+
+    DiscardableFactory  fDiscardableFactory;
+
+    size_t  fTotalBytesUsed;
+    size_t  fTotalByteLimit;
+    size_t  fSingleAllocationByteLimit;
+    int     fCount;
+
+    SkMessageBus<PurgeSharedIDMessage, uint32_t>::Inbox fPurgeSharedIDInbox;
+
+    void checkMessages();
+    void purgeAsNeeded(bool forcePurge = false);
+
+    void moveToHead(Rec*);
+    void addToHead(Rec*);
+    void release(Rec*);
+    void remove(Rec*);
+
+    void init();    
+
+#if defined(SK_DEBUG)
+    void validate() const;
+#else
+    void validate() const {}
+#endif
+};
+#endif

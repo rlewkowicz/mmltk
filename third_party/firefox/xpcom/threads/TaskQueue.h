@@ -1,0 +1,227 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef TaskQueue_h_
+#define TaskQueue_h_
+
+#include "mozilla/AbstractThread.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/Monitor.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/TargetShutdownTaskSet.h"
+#include "mozilla/TaskDispatcher.h"
+#include "nsIDirectTaskDispatcher.h"
+#include "nsITargetShutdownTask.h"
+#include "nsThreadUtils.h"
+
+#define MOZILLA_TASKQUEUE_IID \
+  {0xb5181e3a, 0x39cf, 0x4d32, {0x81, 0x4a, 0xea, 0x86, 0x94, 0x16, 0x95, 0xd1}}
+
+namespace mozilla {
+
+typedef MozPromise<bool, bool, false> ShutdownPromise;
+
+class TaskQueueTargetShutdownTask;
+
+class TaskQueue final : public AbstractThread,
+                        public nsIDirectTaskDispatcher,
+                        public nsITargetShutdownTask {
+  class EventTargetWrapper;
+
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIDIRECTTASKDISPATCHER
+  MOZ_DECLARE_REFCOUNTED_TYPENAME(TaskQueue)
+  NS_INLINE_DECL_STATIC_IID(MOZILLA_TASKQUEUE_IID)
+
+  void TargetShutdown() override;
+
+  static RefPtr<TaskQueue> Create(already_AddRefed<nsIEventTarget> aTarget,
+                                  StaticString aName,
+                                  bool aSupportsTailDispatch = false);
+
+  TaskDispatcher& TailDispatcher() override;
+
+  NS_IMETHOD DispatchFromScript(nsIRunnable* aEvent,
+                                DispatchFlags aFlags) override {
+    return Dispatch(do_AddRef(aEvent), aFlags);
+  }
+
+  NS_IMETHOD Dispatch(already_AddRefed<nsIRunnable> aEvent,
+                      DispatchFlags aFlags) override {
+    nsCOMPtr<nsIRunnable> runnable = aEvent;
+    {
+      MonitorAutoLock mon(mQueueMonitor);
+      return DispatchLocked( runnable, aFlags,
+                            NormalDispatch);
+    }
+  }
+
+  [[nodiscard]] nsresult Dispatch(
+      already_AddRefed<nsIRunnable> aRunnable,
+      DispatchReason aReason = NormalDispatch) override {
+    nsCOMPtr<nsIRunnable> r = aRunnable;
+    {
+      MonitorAutoLock mon(mQueueMonitor);
+      return DispatchLocked( r, NS_DISPATCH_NORMAL, aReason);
+    }
+  }
+
+  using nsIEventTarget::Dispatch;
+
+  NS_IMETHOD RegisterShutdownTask(nsITargetShutdownTask* aTask) override;
+  NS_IMETHOD UnregisterShutdownTask(nsITargetShutdownTask* aTask) override;
+  NS_IMETHOD_(FeatureFlags) GetFeatures() override;
+
+  using CancelPromise = MozPromise<bool, bool, false>;
+
+  RefPtr<ShutdownPromise> BeginShutdown();
+
+  void AwaitIdle();
+
+  void AwaitShutdownAndIdle();
+
+  bool IsEmpty();
+
+  bool IsCurrentThreadIn() const override;
+  using nsISerialEventTarget::IsOnCurrentThread;
+
+  class Observer {
+   public:
+    NS_INLINE_DECL_PURE_VIRTUAL_REFCOUNTING
+    virtual void WillProcessEvent(TaskQueue* aQueue) = 0;
+    virtual void DidProcessEvent(TaskQueue* aQueue) = 0;
+
+   protected:
+    virtual ~Observer() = default;
+  };
+
+  void SetObserver(Observer* aObserver);
+
+ private:
+  TaskQueue(already_AddRefed<nsIEventTarget> aTarget, const char* aName,
+            bool aSupportsTailDispatch);
+
+  virtual ~TaskQueue();
+
+  void AwaitIdleLocked();
+
+  nsresult DispatchLocked(nsCOMPtr<nsIRunnable>& aRunnable,
+                          DispatchFlags aFlags,
+                          DispatchReason aReason = NormalDispatch);
+
+  void MaybeResolveShutdown();
+
+  void MaybeUnregisterTargetShutdownTask() MOZ_REQUIRES(mQueueMonitor);
+
+  nsCOMPtr<nsIEventTarget> mTarget MOZ_GUARDED_BY(mQueueMonitor);
+
+  Monitor mQueueMonitor;
+
+  struct TaskStruct {
+    nsCOMPtr<nsIRunnable> event;
+    DispatchFlags flags;
+  };
+  using TaskArray = AutoTArray<TaskStruct, 4>;
+
+  TaskArray mTasks MOZ_GUARDED_BY(mQueueMonitor);
+
+  TargetShutdownTaskSet mShutdownTasks MOZ_GUARDED_BY(mQueueMonitor);
+
+  Atomic<PRThread*> mRunningThread;
+
+  class AutoTaskGuard {
+   public:
+    AutoTaskGuard(TaskQueue* aQueue, TaskQueue::Observer* aObserver)
+        : mQueue(aQueue), mObserver(aObserver), mLastCurrentThread(nullptr) {
+      MOZ_ASSERT(!mQueue->mTailDispatcher);
+      mTaskDispatcher.emplace(aQueue,
+                               true);
+      mQueue->mTailDispatcher = mTaskDispatcher.ptr();
+
+      mLastCurrentThread = sCurrentThreadTLS.get();
+      sCurrentThreadTLS.set(aQueue);
+
+      MOZ_ASSERT(mQueue->mRunningThread == nullptr);
+      mQueue->mRunningThread = PR_GetCurrentThread();
+
+      mEventTargetGuard.emplace(mQueue);
+
+      if (mObserver) {
+        mObserver->WillProcessEvent(mQueue);
+      }
+    }
+
+    ~AutoTaskGuard() {
+      mTaskDispatcher->DrainDirectTasks();
+
+      if (mObserver) {
+        mObserver->DidProcessEvent(mQueue);
+        MOZ_ASSERT(!mTaskDispatcher->HaveDirectTasks(),
+                   "TaskQueue::Observer instance in "
+                   "DidProcessEvent(TaskQueue*) added direct tasks in error");
+      }
+
+      mTaskDispatcher.reset();
+      mQueue->mTailDispatcher = nullptr;
+
+      mEventTargetGuard = Nothing();
+
+      MOZ_ASSERT(mQueue->mRunningThread == PR_GetCurrentThread());
+      mQueue->mRunningThread = nullptr;
+
+      sCurrentThreadTLS.set(mLastCurrentThread);
+    }
+
+   private:
+    Maybe<AutoTaskDispatcher> mTaskDispatcher;
+    Maybe<SerialEventTargetGuard> mEventTargetGuard;
+    TaskQueue* mQueue;
+    TaskQueue::Observer* mObserver;
+    AbstractThread* mLastCurrentThread;
+  };
+
+  TaskDispatcher* mTailDispatcher;
+
+  bool mIsTargetShutdownTaskRegistered MOZ_GUARDED_BY(mQueueMonitor);
+
+  bool mIsRunning MOZ_GUARDED_BY(mQueueMonitor);
+
+  bool mIsShutdown MOZ_GUARDED_BY(mQueueMonitor);
+  MozPromiseHolder<ShutdownPromise> mShutdownPromise
+      MOZ_GUARDED_BY(mQueueMonitor);
+
+  const char* const mName;
+
+  SimpleTaskQueue mDirectTasks;
+
+  RefPtr<Observer> mObserver MOZ_GUARDED_BY(mQueueMonitor);
+
+  class Runner : public Runnable {
+   public:
+    Runner(TaskQueue* aQueue, nsIEventTarget* aTarget, Observer* aObserver,
+           TaskArray&& aTasks)
+        : Runnable("TaskQueue::Runner"),
+          mQueue(aQueue),
+          mTarget(aTarget),
+          mObserver(aObserver),
+          mTasks(std::move(aTasks)) {}
+    NS_IMETHOD Run() override;
+
+   private:
+    RefPtr<TaskQueue> mQueue;
+
+    nsCOMPtr<nsIEventTarget> mTarget;
+    RefPtr<Observer> mObserver;
+
+    TaskArray mTasks;
+
+    size_t mNextTask = 0;
+  };
+};
+
+}  
+
+#endif  // TaskQueue_h_

@@ -1,0 +1,604 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "HTMLEditor.h"
+
+#include "AutoClonedRangeArray.h"
+#include "CSSEditUtils.h"
+#include "EditAction.h"
+#include "EditorUtils.h"
+#include "HTMLEditHelpers.h"
+#include "HTMLEditUtils.h"
+
+#include "mozilla/Assertions.h"
+#include "mozilla/OwningNonNull.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/Selection.h"
+
+#include "nsAString.h"
+#include "nsAtom.h"
+#include "nsDebug.h"
+#include "nsError.h"
+#include "nsGkAtoms.h"
+#include "nsIContent.h"
+#include "nsINode.h"
+#include "nsRange.h"
+#include "nsString.h"
+#include "nsStringFwd.h"
+#include "nsTArray.h"
+
+
+namespace mozilla {
+
+using namespace dom;
+
+using EditorType = EditorUtils::EditorType;
+using LeafNodeOption = HTMLEditUtils::LeafNodeOption;
+
+
+ListElementSelectionState::ListElementSelectionState(HTMLEditor& aHTMLEditor,
+                                                     ErrorResult& aRv) {
+  MOZ_ASSERT(!aRv.Failed());
+
+  if (NS_WARN_IF(aHTMLEditor.Destroyed())) {
+    aRv.Throw(NS_ERROR_EDITOR_DESTROYED);
+    return;
+  }
+
+  EditorBase::AutoEditActionDataSetter editActionData(aHTMLEditor,
+                                                      EditAction::eNotEditing);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    aRv = EditorBase::ToGenericNSResult(NS_ERROR_EDITOR_DESTROYED);
+    return;
+  }
+
+  Element* editingHostOrRoot = aHTMLEditor.ComputeEditingHost();
+  if (!editingHostOrRoot) {
+    editingHostOrRoot = aHTMLEditor.GetRoot();
+    if (!editingHostOrRoot) {
+      return;
+    }
+  }
+
+  AutoTArray<OwningNonNull<nsIContent>, 64> arrayOfContents;
+  {
+    AutoClonedSelectionRangeArray extendedSelectionRanges(
+        aHTMLEditor.SelectionRef());
+    extendedSelectionRanges.ExtendRangesToWrapLines(
+        EditSubAction::eCreateOrChangeList,
+        BlockInlineCheck::UseHTMLDefaultStyle, *editingHostOrRoot);
+    nsresult rv = extendedSelectionRanges.CollectEditTargetNodes(
+        aHTMLEditor, arrayOfContents, EditSubAction::eCreateOrChangeList,
+        AutoClonedRangeArray::CollectNonEditableNodes::No);
+    if (NS_FAILED(rv)) {
+      NS_WARNING(
+          "AutoClonedRangeArray::CollectEditTargetNodes(EditSubAction::"
+          "eCreateOrChangeList, CollectNonEditableNodes::No) failed");
+      aRv = EditorBase::ToGenericNSResult(rv);
+      return;
+    }
+  }
+
+  for (const auto& content : arrayOfContents) {
+    if (!content->IsElement()) {
+      mIsOtherContentSelected = true;
+    } else if (content->IsHTMLElement(nsGkAtoms::ul)) {
+      mIsULElementSelected = true;
+    } else if (content->IsHTMLElement(nsGkAtoms::ol)) {
+      mIsOLElementSelected = true;
+    } else if (content->IsHTMLElement(nsGkAtoms::li)) {
+      if (dom::Element* parent = content->GetParentElement()) {
+        if (parent->IsHTMLElement(nsGkAtoms::ul)) {
+          mIsULElementSelected = true;
+        } else if (parent->IsHTMLElement(nsGkAtoms::ol)) {
+          mIsOLElementSelected = true;
+        }
+      }
+    } else if (content->IsAnyOfHTMLElements(nsGkAtoms::dl, nsGkAtoms::dt,
+                                            nsGkAtoms::dd)) {
+      mIsDLElementSelected = true;
+    } else {
+      mIsOtherContentSelected = true;
+    }
+
+    if (mIsULElementSelected && mIsOLElementSelected && mIsDLElementSelected &&
+        mIsOtherContentSelected) {
+      break;
+    }
+  }
+}
+
+
+ListItemElementSelectionState::ListItemElementSelectionState(
+    HTMLEditor& aHTMLEditor, ErrorResult& aRv) {
+  MOZ_ASSERT(!aRv.Failed());
+
+  if (NS_WARN_IF(aHTMLEditor.Destroyed())) {
+    aRv.Throw(NS_ERROR_EDITOR_DESTROYED);
+    return;
+  }
+
+  EditorBase::AutoEditActionDataSetter editActionData(aHTMLEditor,
+                                                      EditAction::eNotEditing);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    aRv = EditorBase::ToGenericNSResult(NS_ERROR_EDITOR_DESTROYED);
+    return;
+  }
+
+  Element* editingHostOrRoot = aHTMLEditor.ComputeEditingHost();
+  if (!editingHostOrRoot) {
+    editingHostOrRoot = aHTMLEditor.GetRoot();
+    if (!editingHostOrRoot) {
+      return;
+    }
+  }
+
+  AutoTArray<OwningNonNull<nsIContent>, 64> arrayOfContents;
+  {
+    AutoClonedSelectionRangeArray extendedSelectionRanges(
+        aHTMLEditor.SelectionRef());
+    extendedSelectionRanges.ExtendRangesToWrapLines(
+        EditSubAction::eCreateOrChangeList,
+        BlockInlineCheck::UseHTMLDefaultStyle, *editingHostOrRoot);
+    nsresult rv = extendedSelectionRanges.CollectEditTargetNodes(
+        aHTMLEditor, arrayOfContents, EditSubAction::eCreateOrChangeList,
+        AutoClonedRangeArray::CollectNonEditableNodes::No);
+    if (NS_FAILED(rv)) {
+      NS_WARNING_ASSERTION(
+          NS_SUCCEEDED(rv),
+          "AutoClonedRangeArray::CollectEditTargetNodes(EditSubAction::"
+          "eCreateOrChangeList, CollectNonEditableNodes::No) failed");
+      aRv = EditorBase::ToGenericNSResult(rv);
+      return;
+    }
+  }
+
+  for (const auto& content : arrayOfContents) {
+    if (!content->IsElement()) {
+      mIsOtherElementSelected = true;
+    } else if (content->IsAnyOfHTMLElements(nsGkAtoms::ul, nsGkAtoms::ol,
+                                            nsGkAtoms::li)) {
+      mIsLIElementSelected = true;
+    } else if (content->IsHTMLElement(nsGkAtoms::dt)) {
+      mIsDTElementSelected = true;
+    } else if (content->IsHTMLElement(nsGkAtoms::dd)) {
+      mIsDDElementSelected = true;
+    } else if (content->IsHTMLElement(nsGkAtoms::dl)) {
+      if (mIsDTElementSelected && mIsDDElementSelected) {
+        continue;
+      }
+      DefinitionListItemScanner scanner(*content->AsElement());
+      mIsDTElementSelected |= scanner.DTElementFound();
+      mIsDDElementSelected |= scanner.DDElementFound();
+    } else {
+      mIsOtherElementSelected = true;
+    }
+
+    if (mIsLIElementSelected && mIsDTElementSelected && mIsDDElementSelected &&
+        mIsOtherElementSelected) {
+      break;
+    }
+  }
+}
+
+
+AlignStateAtSelection::AlignStateAtSelection(HTMLEditor& aHTMLEditor,
+                                             ErrorResult& aRv) {
+  MOZ_ASSERT(!aRv.Failed());
+
+  if (NS_WARN_IF(aHTMLEditor.Destroyed())) {
+    aRv = EditorBase::ToGenericNSResult(NS_ERROR_EDITOR_DESTROYED);
+    return;
+  }
+
+  EditorBase::AutoEditActionDataSetter editActionData(aHTMLEditor,
+                                                      EditAction::eNotEditing);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    aRv = EditorBase::ToGenericNSResult(NS_ERROR_EDITOR_DESTROYED);
+    return;
+  }
+
+  if (aHTMLEditor.IsSelectionRangeContainerNotContent()) {
+    NS_WARNING("Some selection containers are not content node, but ignored");
+    return;
+  }
+
+
+
+  if (NS_WARN_IF(!aHTMLEditor.GetRoot())) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return;
+  }
+
+  OwningNonNull<dom::Element> bodyOrDocumentElement = *aHTMLEditor.GetRoot();
+  EditorRawDOMPoint atBodyOrDocumentElement(bodyOrDocumentElement);
+
+  const nsRange* firstRange = aHTMLEditor.SelectionRef().GetRangeAt(0);
+  mFoundSelectionRanges = !!firstRange;
+  if (!mFoundSelectionRanges) {
+    NS_WARNING("There was no selection range");
+    aRv.Throw(NS_ERROR_FAILURE);
+    return;
+  }
+  EditorRawDOMPoint atStartOfSelection(firstRange->StartRef());
+  if (NS_WARN_IF(!atStartOfSelection.IsSet())) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return;
+  }
+  MOZ_ASSERT(atStartOfSelection.IsSetAndValid());
+
+  nsIContent* editTargetContent = nullptr;
+  if (aHTMLEditor.SelectionRef().IsCollapsed() ||
+      atStartOfSelection.IsInTextNode()) {
+    editTargetContent = atStartOfSelection.GetContainerAs<nsIContent>();
+    if (NS_WARN_IF(!editTargetContent)) {
+      aRv.Throw(NS_ERROR_FAILURE);
+      return;
+    }
+  }
+  else if (atStartOfSelection.IsContainerHTMLElement(nsGkAtoms::html) &&
+           atBodyOrDocumentElement.IsSet() &&
+           atStartOfSelection.Offset() == atBodyOrDocumentElement.Offset()) {
+    editTargetContent = HTMLEditUtils::GetNextLeafContent(
+        atStartOfSelection, {LeafNodeOption::IgnoreNonEditableNode},
+        BlockInlineCheck::Auto, aHTMLEditor.ComputeEditingHost());
+    if (NS_WARN_IF(!editTargetContent)) {
+      aRv.Throw(NS_ERROR_FAILURE);
+      return;
+    }
+  }
+  else {
+    Element* editingHostOrRoot = aHTMLEditor.ComputeEditingHost();
+    if (!editingHostOrRoot) {
+      editingHostOrRoot = aHTMLEditor.GetRoot();
+      if (!editingHostOrRoot) {
+        return;
+      }
+    }
+    AutoClonedSelectionRangeArray extendedSelectionRanges(
+        aHTMLEditor.SelectionRef());
+    extendedSelectionRanges.ExtendRangesToWrapLines(
+        EditSubAction::eSetOrClearAlignment,
+        BlockInlineCheck::UseHTMLDefaultStyle, *editingHostOrRoot);
+
+    AutoTArray<OwningNonNull<nsIContent>, 64> arrayOfContents;
+    nsresult rv = extendedSelectionRanges.CollectEditTargetNodes(
+        aHTMLEditor, arrayOfContents, EditSubAction::eSetOrClearAlignment,
+        AutoClonedRangeArray::CollectNonEditableNodes::Yes);
+    if (NS_FAILED(rv)) {
+      NS_WARNING(
+          "AutoClonedRangeArray::CollectEditTargetNodes(eSetOrClearAlignment, "
+          "CollectNonEditableNodes::Yes) failed");
+      aRv.Throw(NS_ERROR_FAILURE);
+      return;
+    }
+    if (arrayOfContents.IsEmpty()) {
+      NS_WARNING(
+          "AutoClonedRangeArray::CollectEditTargetNodes(eSetOrClearAlignment, "
+          "CollectNonEditableNodes::Yes) returned no contents");
+      aRv.Throw(NS_ERROR_FAILURE);
+      return;
+    }
+    editTargetContent = arrayOfContents[0];
+  }
+
+  const RefPtr<dom::Element> maybeNonEditableBlockElement =
+      HTMLEditUtils::GetInclusiveAncestorElement(
+          *editTargetContent, HTMLEditUtils::ClosestBlockElement,
+          BlockInlineCheck::UseHTMLDefaultStyle);
+  if (NS_WARN_IF(!maybeNonEditableBlockElement)) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return;
+  }
+
+  if (aHTMLEditor.IsCSSEnabled() && EditorElementStyle::Align().IsCSSSettable(
+                                        *maybeNonEditableBlockElement)) {
+    nsAutoString value;
+    DebugOnly<nsresult> rvIgnored = CSSEditUtils::GetComputedCSSEquivalentTo(
+        *maybeNonEditableBlockElement, EditorElementStyle::Align(), value);
+    if (NS_WARN_IF(aHTMLEditor.Destroyed())) {
+      aRv.Throw(NS_ERROR_EDITOR_DESTROYED);
+      return;
+    }
+    NS_WARNING_ASSERTION(NS_SUCCEEDED(rvIgnored),
+                         "CSSEditUtils::GetComputedCSSEquivalentTo("
+                         "EditorElementStyle::Align()) failed, but ignored");
+    if (value.EqualsLiteral(u"center") || value.EqualsLiteral(u"-moz-center") ||
+        value.EqualsLiteral(u"auto auto")) {
+      mFirstAlign = nsIHTMLEditor::eCenter;
+      return;
+    }
+    if (value.EqualsLiteral(u"right") || value.EqualsLiteral(u"-moz-right") ||
+        value.EqualsLiteral(u"auto 0px")) {
+      mFirstAlign = nsIHTMLEditor::eRight;
+      return;
+    }
+    if (value.EqualsLiteral(u"justify")) {
+      mFirstAlign = nsIHTMLEditor::eJustify;
+      return;
+    }
+    mFirstAlign = nsIHTMLEditor::eLeft;
+    return;
+  }
+
+  for (Element* const containerElement :
+       editTargetContent->InclusiveAncestorsOfType<Element>()) {
+    if (containerElement != editTargetContent &&
+        containerElement->IsHTMLElement(nsGkAtoms::table)) {
+      return;
+    }
+
+    if (EditorElementStyle::Align().IsCSSSettable(*containerElement)) {
+      nsAutoString value;
+      DebugOnly<nsresult> rvIgnored = CSSEditUtils::GetSpecifiedProperty(
+          *containerElement, *nsGkAtoms::textAlign, value);
+      NS_WARNING_ASSERTION(NS_SUCCEEDED(rvIgnored),
+                           "CSSEditUtils::GetSpecifiedProperty(nsGkAtoms::"
+                           "textAlign) failed, but ignored");
+      if (!value.IsEmpty()) {
+        if (value.EqualsLiteral("center")) {
+          mFirstAlign = nsIHTMLEditor::eCenter;
+          return;
+        }
+        if (value.EqualsLiteral("right")) {
+          mFirstAlign = nsIHTMLEditor::eRight;
+          return;
+        }
+        if (value.EqualsLiteral("justify")) {
+          mFirstAlign = nsIHTMLEditor::eJustify;
+          return;
+        }
+        if (value.EqualsLiteral("left")) {
+          mFirstAlign = nsIHTMLEditor::eLeft;
+          return;
+        }
+      }
+    }
+
+    if (!HTMLEditUtils::IsAlignAttrSupported(*containerElement)) {
+      continue;
+    }
+
+    nsAutoString alignAttributeValue;
+    containerElement->GetAttr(nsGkAtoms::align, alignAttributeValue);
+    if (alignAttributeValue.IsEmpty()) {
+      continue;
+    }
+
+    if (alignAttributeValue.LowerCaseEqualsASCII("center")) {
+      mFirstAlign = nsIHTMLEditor::eCenter;
+      return;
+    }
+    if (alignAttributeValue.LowerCaseEqualsASCII("right")) {
+      mFirstAlign = nsIHTMLEditor::eRight;
+      return;
+    }
+    if (alignAttributeValue.LowerCaseEqualsASCII("justify")) {
+      mFirstAlign = nsIHTMLEditor::eJustify;
+      return;
+    }
+    mFirstAlign = nsIHTMLEditor::eLeft;
+    return;
+  }
+}
+
+
+ParagraphStateAtSelection::ParagraphStateAtSelection(
+    HTMLEditor& aHTMLEditor, FormatBlockMode aFormatBlockMode,
+    ErrorResult& aRv) {
+  if (NS_WARN_IF(aHTMLEditor.Destroyed())) {
+    aRv = EditorBase::ToGenericNSResult(NS_ERROR_EDITOR_DESTROYED);
+    return;
+  }
+
+  EditorBase::AutoEditActionDataSetter editActionData(aHTMLEditor,
+                                                      EditAction::eNotEditing);
+  if (NS_WARN_IF(!editActionData.CanHandle())) {
+    aRv = EditorBase::ToGenericNSResult(NS_ERROR_EDITOR_DESTROYED);
+    return;
+  }
+
+  if (aHTMLEditor.IsSelectionRangeContainerNotContent()) {
+    NS_WARNING("Some selection containers are not content node, but ignored");
+    return;
+  }
+
+  if (MOZ_UNLIKELY(!aHTMLEditor.SelectionRef().RangeCount())) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return;
+  }
+
+  const Element* const editingHostOrBodyOrDocumentElement = [&]() -> Element* {
+    if (Element* editingHost = aHTMLEditor.ComputeEditingHost()) {
+      return editingHost;
+    }
+    return aHTMLEditor.GetRoot();
+  }();
+  if (!editingHostOrBodyOrDocumentElement ||
+      !HTMLEditUtils::IsSimplyEditableNode(
+          *editingHostOrBodyOrDocumentElement)) {
+    return;
+  }
+
+  AutoTArray<OwningNonNull<nsIContent>, 64> arrayOfContents;
+  nsresult rv = CollectEditableFormatNodesInSelection(
+      aHTMLEditor, aFormatBlockMode, *editingHostOrBodyOrDocumentElement,
+      arrayOfContents);
+  if (NS_FAILED(rv)) {
+    NS_WARNING(
+        "ParagraphStateAtSelection::CollectEditableFormatNodesInSelection() "
+        "failed");
+    aRv.Throw(rv);
+    return;
+  }
+
+  for (size_t index : Reversed(IntegerRange(arrayOfContents.Length()))) {
+    OwningNonNull<nsIContent>& content = arrayOfContents[index];
+    if (HTMLEditUtils::IsBlockElement(content,
+                                      BlockInlineCheck::UseHTMLDefaultStyle) &&
+        !HTMLEditor::IsFormatElement(aFormatBlockMode, content)) {
+      ParagraphStateAtSelection::AppendDescendantFormatNodesAndFirstInlineNode(
+          arrayOfContents, aFormatBlockMode, *content->AsElement());
+    }
+  }
+
+  if (arrayOfContents.IsEmpty()) {
+    const auto atCaret =
+        aHTMLEditor.GetFirstSelectionStartPoint<EditorRawDOMPoint>();
+    if (NS_WARN_IF(!atCaret.IsInContentNode())) {
+      MOZ_ASSERT(false,
+                 "We've already checked whether there is a selection range, "
+                 "but we have no range right now.");
+      aRv.Throw(NS_ERROR_FAILURE);
+      return;
+    }
+    arrayOfContents.AppendElement(*atCaret.ContainerAs<nsIContent>());
+  }
+
+  for (auto& content : Reversed(arrayOfContents)) {
+    const Element* formatElement = nullptr;
+    if (HTMLEditor::IsFormatElement(aFormatBlockMode, content)) {
+      formatElement = content->AsElement();
+    }
+    else if (HTMLEditUtils::IsBlockElement(
+                 content, BlockInlineCheck::UseHTMLDefaultStyle)) {
+      continue;
+    }
+    else {
+      for (Element* parentElement : content->AncestorsOfType<Element>()) {
+        if (parentElement == editingHostOrBodyOrDocumentElement) {
+          break;
+        }
+        if (HTMLEditor::IsFormatElement(aFormatBlockMode, *parentElement)) {
+          MOZ_ASSERT(parentElement->NodeInfo()->NameAtom());
+          formatElement = parentElement;
+          break;
+        }
+      }
+    }
+
+    auto FormatElementIsInclusiveDescendantOfFormatDLElement = [&]() {
+      if (aFormatBlockMode == FormatBlockMode::XULParagraphStateCommand) {
+        return false;
+      }
+      if (!formatElement) {
+        return false;
+      }
+      for (const Element* const element :
+           formatElement->InclusiveAncestorsOfType<Element>()) {
+        if (element->IsHTMLElement(nsGkAtoms::dl)) {
+          return true;
+        }
+        if (element->IsAnyOfHTMLElements(nsGkAtoms::dd, nsGkAtoms::dt)) {
+          continue;
+        }
+        if (HTMLEditUtils::IsFormatElementForFormatBlockCommand(
+                *formatElement)) {
+          return false;
+        }
+      }
+      return false;
+    };
+
+    if (!mFirstParagraphState) {
+      mFirstParagraphState = formatElement
+                                 ? formatElement->NodeInfo()->NameAtom()
+                                 : nsGkAtoms::_empty;
+      mIsInDLElement = FormatElementIsInclusiveDescendantOfFormatDLElement();
+      continue;
+    }
+    mIsInDLElement &= FormatElementIsInclusiveDescendantOfFormatDLElement();
+    if ((!formatElement && mFirstParagraphState != nsGkAtoms::_empty) ||
+        (formatElement &&
+         !formatElement->IsHTMLElement(mFirstParagraphState))) {
+      mIsMixed = true;
+      break;
+    }
+  }
+}
+
+void ParagraphStateAtSelection::AppendDescendantFormatNodesAndFirstInlineNode(
+    nsTArray<OwningNonNull<nsIContent>>& aArrayOfContents,
+    FormatBlockMode aFormatBlockMode, dom::Element& aNonFormatBlockElement) {
+  MOZ_ASSERT(HTMLEditUtils::IsBlockElement(
+      aNonFormatBlockElement, BlockInlineCheck::UseHTMLDefaultStyle));
+  MOZ_ASSERT(
+      !HTMLEditor::IsFormatElement(aFormatBlockMode, aNonFormatBlockElement));
+
+  bool foundInline = false;
+  for (nsIContent* childContent = aNonFormatBlockElement.GetFirstChild();
+       childContent; childContent = childContent->GetNextSibling()) {
+    const bool isBlock = HTMLEditUtils::IsBlockElement(
+        *childContent, BlockInlineCheck::UseHTMLDefaultStyle);
+    const bool isFormat =
+        HTMLEditor::IsFormatElement(aFormatBlockMode, *childContent);
+    if (isBlock && !isFormat) {
+      ParagraphStateAtSelection::AppendDescendantFormatNodesAndFirstInlineNode(
+          aArrayOfContents, aFormatBlockMode, *childContent->AsElement());
+      continue;
+    }
+
+    if (isFormat) {
+      aArrayOfContents.AppendElement(*childContent);
+      continue;
+    }
+
+    MOZ_ASSERT(!isBlock);
+
+    if (!foundInline) {
+      foundInline = true;
+      aArrayOfContents.AppendElement(*childContent);
+      continue;
+    }
+  }
+}
+
+nsresult ParagraphStateAtSelection::CollectEditableFormatNodesInSelection(
+    HTMLEditor& aHTMLEditor, FormatBlockMode aFormatBlockMode,
+    const Element& aEditingHost,
+    nsTArray<OwningNonNull<nsIContent>>& aArrayOfContents) {
+  {
+    AutoClonedSelectionRangeArray extendedSelectionRanges(
+        aHTMLEditor.SelectionRef());
+    extendedSelectionRanges.ExtendRangesToWrapLines(
+        aFormatBlockMode == FormatBlockMode::HTMLFormatBlockCommand
+            ? EditSubAction::eFormatBlockForHTMLCommand
+            : EditSubAction::eCreateOrRemoveBlock,
+        BlockInlineCheck::UseHTMLDefaultStyle, aEditingHost);
+    nsresult rv = extendedSelectionRanges.CollectEditTargetNodes(
+        aHTMLEditor, aArrayOfContents,
+        aFormatBlockMode == FormatBlockMode::HTMLFormatBlockCommand
+            ? EditSubAction::eFormatBlockForHTMLCommand
+            : EditSubAction::eCreateOrRemoveBlock,
+        AutoClonedRangeArray::CollectNonEditableNodes::Yes);
+    if (NS_FAILED(rv)) {
+      NS_WARNING(
+          "AutoClonedRangeArray::CollectEditTargetNodes("
+          "CollectNonEditableNodes::Yes) failed");
+      return rv;
+    }
+  }
+
+  for (size_t index : Reversed(IntegerRange(aArrayOfContents.Length()))) {
+    const OwningNonNull<nsIContent> content = aArrayOfContents[index];
+
+    if (!EditorUtils::IsEditableContent(content, EditorType::HTML)) {
+      aArrayOfContents.RemoveElementAt(index);
+      continue;
+    }
+
+    if (HTMLEditUtils::IsAnyTableElementExceptColumnElement(content) ||
+        HTMLEditUtils::IsListElement(*content) ||
+        HTMLEditUtils::IsListItemElement(*content)) {
+      aArrayOfContents.RemoveElementAt(index);
+      HTMLEditUtils::CollectChildren(
+          content, aArrayOfContents, index,
+          {CollectChildrenOption::CollectListChildren,
+           CollectChildrenOption::CollectTableChildren});
+    }
+  }
+  return NS_OK;
+}
+
+}  

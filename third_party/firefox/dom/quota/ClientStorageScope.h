@@ -1,0 +1,138 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_QUOTA_CLIENTSTORAGESCOPE_H_
+#define DOM_QUOTA_CLIENTSTORAGESCOPE_H_
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Variant.h"
+#include "mozilla/dom/quota/Client.h"
+
+namespace mozilla::dom::quota {
+
+class ClientStorageScope {
+  class Client {
+    quota::Client::Type mClientType;
+
+   public:
+    explicit Client(quota::Client::Type aClientType)
+        : mClientType(aClientType) {}
+
+    quota::Client::Type GetClientType() const { return mClientType; }
+  };
+
+  struct Metadata {};
+
+  struct Null {};
+
+  using DataType = Variant<Client, Metadata, Null>;
+
+  DataType mData;
+
+ public:
+  ClientStorageScope() : mData(Null()) {}
+
+  static ClientStorageScope CreateFromClient(quota::Client::Type aClientType) {
+    return ClientStorageScope(std::move(Client(aClientType)));
+  }
+
+  static ClientStorageScope CreateFromMetadata() {
+    return ClientStorageScope(std::move(Metadata()));
+  }
+
+  static ClientStorageScope CreateFromNull() {
+    return ClientStorageScope(std::move(Null()));
+  }
+
+  bool IsClient() const { return mData.is<Client>(); }
+
+  bool IsMetadata() const { return mData.is<Metadata>(); }
+
+  bool IsNull() const { return mData.is<Null>(); }
+
+  void SetFromClient(quota::Client::Type aClientType) {
+    mData = AsVariant(Client(aClientType));
+  }
+
+  void SetFromNull() { mData = AsVariant(Null()); }
+
+  quota::Client::Type GetClientType() const {
+    MOZ_ASSERT(IsClient());
+
+    return mData.as<Client>().GetClientType();
+  }
+
+  bool Matches(const ClientStorageScope& aOther) const {
+    struct Matcher {
+      const ClientStorageScope& mThis;
+
+      explicit Matcher(const ClientStorageScope& aThis) : mThis(aThis) {}
+
+      bool operator()(const Client& aOther) {
+        return mThis.MatchesClient(aOther);
+      }
+
+      bool operator()(const Metadata& aOther) {
+        return mThis.MatchesMetadata(aOther);
+      }
+
+      bool operator()(const Null& aOther) { return true; }
+    };
+
+    return aOther.mData.match(Matcher(*this));
+  }
+
+ private:
+  explicit ClientStorageScope(const Client&& aClient) : mData(aClient) {}
+
+  explicit ClientStorageScope(const Metadata&& aMetadata) : mData(aMetadata) {}
+
+  explicit ClientStorageScope(const Null&& aNull) : mData(aNull) {}
+
+  explicit ClientStorageScope(const DataType& aOther) : mData(aOther) {}
+
+  bool MatchesClient(const Client& aOther) const {
+    struct ClientMatcher {
+      const Client& mOther;
+
+      explicit ClientMatcher(const Client& aOther) : mOther(aOther) {}
+
+      bool operator()(const Client& aThis) {
+        return aThis.GetClientType() == mOther.GetClientType();
+      }
+
+      bool operator()(const Metadata& aThis) { return false; }
+
+      bool operator()(const Null& aThis) {
+        return true;
+      }
+    };
+
+    return mData.match(ClientMatcher(aOther));
+  }
+
+  bool MatchesMetadata(const Metadata& aOther) const {
+    struct MetadataMatcher {
+      const Metadata& mOther;
+
+      explicit MetadataMatcher(const Metadata& aOther) : mOther(aOther) {}
+
+      bool operator()(const Client& aThis) { return false; }
+
+      bool operator()(const Metadata& aThis) { return true; }
+
+      bool operator()(const Null& aThis) {
+        return true;
+      }
+    };
+
+    return mData.match(MetadataMatcher(aOther));
+  }
+
+  bool operator==(const ClientStorageScope& aOther) = delete;
+};
+
+}  
+
+#endif  // DOM_QUOTA_CLIENTSTORAGESCOPE_H_

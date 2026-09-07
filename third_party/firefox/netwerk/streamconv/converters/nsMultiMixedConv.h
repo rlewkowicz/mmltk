@@ -1,0 +1,169 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef _nsmultimixedconv_h_
+#define _nsmultimixedconv_h_
+
+#include "nsIStreamConverter.h"
+#include "nsIChannel.h"
+#include "nsString.h"
+#include "nsCOMPtr.h"
+#include "nsIByteRangeRequest.h"
+#include "nsIMultiPartChannel.h"
+#include "mozilla/IncrementalTokenizer.h"
+#include "nsHttpResponseHead.h"
+#include "mozilla/UniquePtr.h"
+
+#define NS_MULTIMIXEDCONVERTER_CID            \
+  { \
+   0x7584ce90,                                \
+   0x5b25,                                    \
+   0x11d3,                                    \
+   {0xa1, 0x75, 0x0, 0x50, 0x4, 0x1c, 0xaf, 0x44}}
+
+class nsPartChannel final : public nsIChannel,
+                            public nsIByteRangeRequest,
+                            public nsIMultiPartChannel {
+ public:
+  nsPartChannel(nsIChannel* aMultipartChannel, uint32_t aPartID,
+                bool aIsFirstPart, nsIStreamListener* aListener);
+
+  void InitializeByteRange(int64_t aStart, int64_t aEnd);
+  void SetIsLastPart() { mIsLastPart = true; }
+  nsresult SendOnStartRequest(nsISupports* aContext);
+  nsresult SendOnDataAvailable(nsISupports* aContext, nsIInputStream* aStream,
+                               uint64_t aOffset, uint32_t aLen);
+  nsresult SendOnStopRequest(nsISupports* aContext, nsresult aStatus);
+  void SetContentDisposition(const nsACString& aContentDispositionHeader);
+  void SetResponseHead(mozilla::net::nsHttpResponseHead* head) {
+    mResponseHead.reset(head);
+  }
+
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIREQUEST
+  NS_DECL_NSICHANNEL
+  NS_DECL_NSIBYTERANGEREQUEST
+  NS_DECL_NSIMULTIPARTCHANNEL
+
+ protected:
+  ~nsPartChannel() = default;
+
+ protected:
+  nsCOMPtr<nsIChannel> mMultipartChannel;
+  nsCOMPtr<nsIStreamListener> mListener;
+  mozilla::UniquePtr<mozilla::net::nsHttpResponseHead> mResponseHead;
+
+  nsresult mStatus{NS_OK};
+  nsLoadFlags mLoadFlags{0};
+
+  nsCOMPtr<nsILoadGroup> mLoadGroup;
+
+  nsCString mContentType;
+  nsCString mContentCharset;
+  uint32_t mContentDisposition{0};
+  nsString mContentDispositionFilename;
+  nsCString mContentDispositionHeader;
+  uint64_t mContentLength{UINT64_MAX};
+
+  bool mIsByteRangeRequest{false};
+  int64_t mByteRangeStart{0};
+  int64_t mByteRangeEnd{0};
+
+  uint32_t mPartID;  
+  bool mIsFirstPart;
+  bool mIsLastPart{false};
+};
+
+
+class nsMultiMixedConv : public nsIStreamConverter {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSISTREAMCONVERTER
+  NS_DECL_NSISTREAMLISTENER
+  NS_DECL_NSITHREADRETARGETABLESTREAMLISTENER
+  NS_DECL_NSIREQUESTOBSERVER
+
+  explicit nsMultiMixedConv();
+
+ protected:
+  using Token = mozilla::IncrementalTokenizer::Token;
+
+  virtual ~nsMultiMixedConv() = default;
+
+  nsresult SendStart();
+  void AccumulateData(Token const& aToken);
+  nsresult SendData();
+  nsresult SendStop(nsresult aStatus);
+
+  nsCOMPtr<nsIStreamListener> mFinalListener;  
+
+  nsCOMPtr<nsIChannel> mChannel;
+  RefPtr<nsPartChannel> mPartChannel;
+  nsCOMPtr<nsISupports> mContext;
+  nsCString mContentType;
+  nsCString mContentDisposition;
+  nsCString mContentSecurityPolicy;
+  nsCString mRootContentSecurityPolicy;
+  nsCString mRootContentDisposition;
+  uint64_t mContentLength{UINT64_MAX};
+  uint64_t mTotalSent{0};
+
+  int64_t mByteRangeStart{0};
+  int64_t mByteRangeEnd{0};
+  bool mIsByteRangeRequest{false};
+  bool mRequestListenerNotified{false};
+
+  uint32_t mCurrentPartID{0};
+
+  bool mInOnDataAvailable{false};
+
+  enum EParserState {
+    PREAMBLE,
+    BOUNDARY_CRLF,
+    HEADER_NAME,
+    HEADER_SEP,
+    HEADER_VALUE,
+    BODY_INIT,
+    BODY,
+    TRAIL_DASH1,
+    TRAIL_DASH2,
+    EPILOGUE,
+
+    INIT = PREAMBLE
+  } mParserState{INIT};
+
+  enum EHeader : uint32_t {
+    HEADER_FIRST,
+    HEADER_CONTENT_TYPE = HEADER_FIRST,
+    HEADER_CONTENT_LENGTH,
+    HEADER_CONTENT_DISPOSITION,
+    HEADER_SET_COOKIE,
+    HEADER_CONTENT_RANGE,
+    HEADER_RANGE,
+    HEADER_CONTENT_SECURITY_POLICY,
+    HEADER_UNKNOWN
+  } mResponseHeader{HEADER_UNKNOWN};
+  nsCString mResponseHeaderValue;
+
+  nsCString mBoundary;
+  mozilla::IncrementalTokenizer mTokenizer;
+
+  nsACString::const_char_iterator mRawData{nullptr};
+  nsACString::size_type mRawDataLength{0};
+
+  Token mBoundaryToken;
+  Token mBoundaryTokenWithDashes;
+  Token mLFToken;
+  Token mCRLFToken;
+  Token mHeaderTokens[HEADER_UNKNOWN];
+
+  void HeadersToDefault();
+  nsresult ProcessHeader();
+  void SwitchToBodyParsing();
+  void SwitchToControlParsing();
+  void SetHeaderTokensEnabled(bool aEnable);
+
+  nsresult ConsumeToken(Token const& token);
+};
+
+#endif /* _nsmultimixedconv_h_ */

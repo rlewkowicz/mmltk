@@ -1,0 +1,67 @@
+/*
+ * Copyright 2011 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkImageFilter_DEFINED)
+#define SkImageFilter_DEFINED
+
+#include "include/core/SkFlattenable.h"
+#include "include/core/SkRect.h"
+#include "include/core/SkRefCnt.h"
+#include "include/private/base/SkAPI.h"
+
+#include <cstddef>
+
+class SkColorFilter;
+class SkMatrix;
+struct SkDeserialProcs;
+
+class SK_API SkImageFilter : public SkFlattenable {
+public:
+    enum MapDirection {
+        kForward_MapDirection,
+        kReverse_MapDirection,
+    };
+    SkIRect filterBounds(const SkIRect& src, const SkMatrix& ctm,
+                         MapDirection, const SkIRect* inputRect = nullptr) const;
+
+    bool isColorFilterNode(SkColorFilter** filterPtr) const;
+
+    bool asColorFilter(SkColorFilter** filterPtr) const {
+        return this->isColorFilterNode(filterPtr);
+    }
+
+    bool asAColorFilter(SkColorFilter** filterPtr) const;
+
+    int countInputs() const;
+
+    const SkImageFilter* getInput(int i) const;
+
+    virtual SkRect computeFastBounds(const SkRect& bounds) const;
+
+    bool canComputeFastBounds() const;
+
+    sk_sp<SkImageFilter> makeWithLocalMatrix(const SkMatrix& matrix) const;
+
+    static sk_sp<SkImageFilter> Deserialize(const void* data, size_t size,
+                                          const SkDeserialProcs* procs = nullptr) {
+        return sk_sp<SkImageFilter>(static_cast<SkImageFilter*>(
+                SkFlattenable::Deserialize(kSkImageFilter_Type, data, size, procs).release()));
+    }
+
+protected:
+
+    sk_sp<SkImageFilter> refMe() const {
+        return sk_ref_sp(const_cast<SkImageFilter*>(this));
+    }
+
+private:
+    friend class SkImageFilter_Base;
+
+    using INHERITED = SkFlattenable;
+};
+
+#endif

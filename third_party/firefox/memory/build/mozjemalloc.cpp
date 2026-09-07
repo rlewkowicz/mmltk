@@ -1,0 +1,3501 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+// Portions of this file were originally under the following license:
+// Copyright (C) 2006-2008 Jason Evans <jasone@FreeBSD.org>.
+// All rights reserved.
+// Copyright (C) 2007-2017 Mozilla Foundation.
+// Redistribution and use in source and binary forms, with or without
+// 1. Redistributions of source code must retain the above copyright
+//    addition of one or more copyright notices.
+// 2. Redistributions in binary form must reproduce the above copyright
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDER(S) ``AS IS'' AND ANY
+// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT HOLDER(S) BE
+
+#include "mozmemory_wrap.h"
+#include "mozjemalloc.h"
+#include "mozjemalloc_types.h"
+#include "PurgeStats.h"
+
+#include <bit>
+#include <cstring>
+#include <cerrno>
+#include <chrono>
+#  include <sys/mman.h>
+#  include <unistd.h>
+
+#include "mozilla/Atomics.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/CheckedInt.h"
+#include "mozilla/DebugOnly.h"
+#include "mozilla/DoublyLinkedList.h"
+#include "mozilla/HelperMacros.h"
+#include "mozilla/Likely.h"
+#include "mozilla/Literals.h"
+#include "mozilla/MathAlgorithms.h"
+#include "mozilla/RandomNum.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/TaggedAnonymousMemory.h"
+#include "mozilla/ThreadLocal.h"
+#include "mozilla/XorShift128PlusRNG.h"
+#include "mozilla/fallible.h"
+#include "RadixTree.h"
+#include "Arena.h"
+#include "BaseAlloc.h"
+#include "Chunk.h"
+#include "Constants.h"
+#include "Extent.h"
+#include "Globals.h"
+#include "Mutex.h"
+#include "RedBlackTree.h"
+#include "Utils.h"
+#include "Zero.h"
+
+
+using namespace mozilla;
+
+#if defined(MALLOC_DECOMMIT) && defined(MALLOC_DOUBLE_PURGE)
+#  error MALLOC_DECOMMIT and MALLOC_DOUBLE_PURGE are mutually exclusive.
+#endif
+
+#if defined(_MSC_VER) && !defined(__clang__)
+static bool malloc_initialized;
+#else
+static Atomic<bool, MemoryOrdering::Relaxed> malloc_initialized;
+#endif
+
+constinit StaticMutex gInitLock MOZ_UNANNOTATED;
+
+uint64_t GetTimestampNS() {
+  return std::chrono::floor<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now())
+      .time_since_epoch()
+      .count();
+}
+
+namespace mozilla {
+
+template <>
+struct GetDoublyLinkedListElement<arena_t> {
+  static DoublyLinkedListElement<arena_t>& Get(arena_t* aThis) {
+    return aThis->mPurgeListElem;
+  }
+  static const DoublyLinkedListElement<arena_t>& Get(const arena_t* aThis) {
+    return aThis->mPurgeListElem;
+  }
+};
+
+}  
+
+struct ArenaTreeTrait {
+  static RedBlackTreeNode<arena_t>& GetTreeNode(arena_t* aThis) {
+    return aThis->mLink;
+  }
+
+  static inline Order Compare(arena_t* aNode, arena_t* aOther) {
+    MOZ_ASSERT(aNode);
+    MOZ_ASSERT(aOther);
+    return CompareInt(aNode->mId, aOther->mId);
+  }
+
+  using SearchKey = arena_id_t;
+
+  static inline Order Compare(SearchKey aKey, arena_t* aOther) {
+    MOZ_ASSERT(aOther);
+    return CompareInt(aKey, aOther->mId);
+  }
+};
+
+class ArenaCollection {
+ public:
+  constexpr ArenaCollection() = default;
+
+  bool Init() MOZ_REQUIRES(gInitLock) MOZ_EXCLUDES(mLock) {
+    arena_params_t params;
+    params.mMaxDirty = opt_dirty_max;
+    params.mLabel = "Default";
+    mDefaultArena =
+        mLock.Init() ? CreateArena( false, &params) : nullptr;
+    mPurgeListLock.Init();
+    mIsDeferredPurgeEnabled = false;
+    return bool(mDefaultArena);
+  }
+
+  inline arena_t* GetById(arena_id_t aArenaId, bool aIsPrivate)
+      MOZ_EXCLUDES(mLock);
+
+  arena_t* CreateArena(bool aIsPrivate, arena_params_t* aParams)
+      MOZ_EXCLUDES(mLock);
+
+  void DisposeArena(arena_t* aArena) MOZ_EXCLUDES(mLock) {
+    bool delete_now = RemoveFromOutstandingPurges(aArena);
+
+    {
+      MutexAutoLock lock(mLock);
+      Tree& tree =
+#if !defined(NON_RANDOM_ARENA_IDS)
+          aArena->IsMainThreadOnly() ? mMainThreadArenas :
+#endif
+                                     mPrivateArenas;
+
+      MOZ_RELEASE_ASSERT(tree.Search(aArena->mId), "Arena not in tree");
+      tree.Remove(aArena);
+      mNumOperationsDisposedArenas += aArena->Operations();
+    }
+    {
+      MutexAutoLock lock(aArena->mLock);
+      if (!aArena->mIsPurgePending) {
+        delete_now = true;
+      } else if (!delete_now) {
+        aArena->mMustDeleteAfterPurge = true;
+
+      }
+    }
+
+    if (delete_now) {
+      delete aArena;
+    }
+  }
+
+  void SetDefaultMaxDirtyPageModifier(int32_t aModifier) {
+    {
+      MutexAutoLock lock(mLock);
+      bool decreased = aModifier < mDefaultMaxDirtyPageModifier;
+      mDefaultMaxDirtyPageModifier = aModifier;
+      for (auto* arena : iter()) {
+        if (!arena->IsMainThreadOnly() || IsOnMainThreadWeak()) {
+          arena->UpdateMaxDirty();
+          if (decreased) {
+            purge_action_t action;
+            {
+              MaybeMutexAutoLock arena_lock(arena->mLock);
+              action = arena->ShouldStartPurge();
+            }
+            arena->MayDoOrQueuePurge(action, "SetDefaultMaxDirtyPageModifier");
+          }
+        }
+      }
+    }
+  }
+
+  int32_t DefaultMaxDirtyPageModifier() { return mDefaultMaxDirtyPageModifier; }
+
+  using Tree = RedBlackTree<arena_t, ArenaTreeTrait>;
+
+  class Iterator {
+   public:
+    explicit Iterator(Tree* aTree, Tree* aSecondTree,
+                      Tree* aThirdTree = nullptr)
+        : mFirstIterator(aTree),
+          mSecondTree(aSecondTree),
+          mThirdTree(aThirdTree) {}
+
+    class Item {
+     private:
+      Iterator& mIter;
+      arena_t* mArena;
+
+     public:
+      Item(Iterator& aIter, arena_t* aArena) : mIter(aIter), mArena(aArena) {}
+
+      bool operator!=(const Item& aOther) const {
+        return mArena != aOther.mArena;
+      }
+
+      arena_t* operator*() const { return mArena; }
+
+      const Item& operator++() {
+        mArena = mIter.Next();
+        return *this;
+      }
+    };
+
+    Item begin() {
+      MaybeNextTree();
+      return Item(*this, mFirstIterator.Current());
+    }
+
+    Item end() { return Item(*this, nullptr); }
+
+   private:
+    Tree::Iterator mFirstIterator;
+    Tree* mSecondTree;
+    Tree* mThirdTree;
+
+    void MaybeNextTree() {
+      while (!mFirstIterator.NotDone() && mSecondTree) {
+        mFirstIterator = mSecondTree->iter();
+        mSecondTree = mThirdTree;
+        mThirdTree = nullptr;
+      }
+    }
+
+    arena_t* Next() {
+      arena_t* arena = mFirstIterator.Next();
+      if (arena) {
+        return arena;
+      }
+
+      MaybeNextTree();
+      return mFirstIterator.Current();
+    }
+
+    friend Item;
+  };
+
+  Iterator iter() MOZ_REQUIRES(mLock) {
+#if defined(NON_RANDOM_ARENA_IDS)
+    return Iterator(&mArenas, &mPrivateArenas);
+#else
+    return Iterator(&mArenas, &mPrivateArenas, &mMainThreadArenas);
+#endif
+  }
+
+  inline arena_t* GetDefault() { return mDefaultArena; }
+
+  Mutex mLock MOZ_UNANNOTATED;
+
+  Mutex mPurgeListLock;
+
+  bool IsOnMainThread() const {
+    return mMainThreadId.isSome() &&
+           ThreadIdEqual(mMainThreadId.value(), GetThreadId());
+  }
+
+  bool IsOnMainThreadWeak() const {
+    return mMainThreadId.isNothing() || IsOnMainThread();
+  }
+
+  void ResetMainThread() MOZ_EXCLUDES(mLock) {
+    mMainThreadId = Nothing();
+  }
+
+  void SetMainThread() MOZ_EXCLUDES(mLock) {
+    MutexAutoLock lock(mLock);
+    MOZ_ASSERT(mMainThreadId.isNothing());
+    mMainThreadId = Some(GetThreadId());
+  }
+
+  uint64_t OperationsDisposedArenas() MOZ_REQUIRES(mLock) {
+    return mNumOperationsDisposedArenas;
+  }
+
+  bool SetDeferredPurge(bool aEnable) {
+    MOZ_ASSERT(IsOnMainThreadWeak());
+
+    bool ret = mIsDeferredPurgeEnabled;
+    {
+      MutexAutoLock lock(mLock);
+      mIsDeferredPurgeEnabled = aEnable;
+      for (auto* arena : iter()) {
+        MaybeMutexAutoLock lock(arena->mLock);
+        arena->mIsDeferredPurgeEnabled = aEnable;
+      }
+    }
+    if (ret != aEnable) {
+      MayPurgeAll(PurgeIfThreshold, __func__);
+    }
+    return ret;
+  }
+
+  bool IsDeferredPurgeEnabled() { return mIsDeferredPurgeEnabled; }
+
+  void AddToOutstandingPurges(arena_t* aArena) MOZ_EXCLUDES(mPurgeListLock);
+
+  bool RemoveFromOutstandingPurges(arena_t* aArena)
+      MOZ_EXCLUDES(mPurgeListLock);
+
+  void MayPurgeAll(PurgeCondition aCond, const char* aCaller);
+
+  may_purge_now_result_t MayPurgeSteps(
+      bool aPeekOnly, uint32_t aReuseGraceMS,
+      const Maybe<std::function<bool()>>& aKeepGoing);
+
+ private:
+  const static arena_id_t MAIN_THREAD_ARENA_BIT = 0x1;
+
+#if !defined(NON_RANDOM_ARENA_IDS)
+  arena_id_t MakeRandArenaId(bool aIsMainThreadOnly) const MOZ_REQUIRES(mLock);
+#endif
+  static bool ArenaIdIsMainThreadOnly(arena_id_t aArenaId) {
+    return aArenaId & MAIN_THREAD_ARENA_BIT;
+  }
+
+  arena_t* mDefaultArena = nullptr;
+  arena_id_t mLastPublicArenaId MOZ_GUARDED_BY(mLock) = 0;
+
+  Tree mArenas MOZ_GUARDED_BY(mLock);
+  Tree mPrivateArenas MOZ_GUARDED_BY(mLock);
+
+#if defined(NON_RANDOM_ARENA_IDS)
+  arena_id_t mArenaIdKey = 0;
+  int8_t mArenaIdRotation = 0;
+#else
+  Tree mMainThreadArenas MOZ_GUARDED_BY(mLock);
+#endif
+
+  Atomic<int32_t> mDefaultMaxDirtyPageModifier;
+  Maybe<ThreadId> mMainThreadId;
+
+  uint64_t mNumOperationsDisposedArenas = 0;
+
+  DoublyLinkedList<arena_t> mOutstandingPurges MOZ_GUARDED_BY(mPurgeListLock);
+  Atomic<bool> mIsDeferredPurgeEnabled;
+};
+
+constinit static ArenaCollection gArenas;
+
+static Mutex huge_mtx;
+
+static RedBlackTree<extent_node_t, ExtentTreeTrait> huge
+    MOZ_GUARDED_BY(huge_mtx);
+
+static size_t huge_allocated MOZ_GUARDED_BY(huge_mtx);
+static size_t huge_mapped MOZ_GUARDED_BY(huge_mtx);
+static uint64_t huge_operations MOZ_GUARDED_BY(huge_mtx);
+
+
+static MOZ_THREAD_LOCAL(arena_t*) thread_arena;
+
+
+static void huge_dalloc(void* aPtr, arena_t* aArena);
+static bool malloc_init_hard();
+
+#    define FORK_HOOK static
+FORK_HOOK void _malloc_prefork(void);
+FORK_HOOK void _malloc_postfork_parent(void);
+FORK_HOOK void _malloc_postfork_child(void);
+
+
+static inline bool malloc_init() {
+  if (!malloc_initialized) {
+    return malloc_init_hard();
+  }
+  return true;
+}
+
+
+
+
+static inline arena_t* thread_local_arena(bool enabled) {
+  arena_t* arena;
+
+  if (enabled) {
+    arena_params_t params;
+    params.mLabel = "Thread local";
+    arena = gArenas.CreateArena( false, &params);
+  } else {
+    arena = gArenas.GetDefault();
+  }
+  thread_arena.set(arena);
+  return arena;
+}
+
+inline void MozJemalloc::jemalloc_thread_local_arena(bool aEnabled) {
+  if (malloc_init()) {
+    thread_local_arena(aEnabled);
+  }
+}
+
+static inline arena_t* choose_arena(size_t size) {
+  arena_t* ret = nullptr;
+
+
+  if (size > kMaxQuantumClass) {
+    ret = gArenas.GetDefault();
+  } else {
+    ret = thread_arena.get();
+    MOZ_DIAGNOSTIC_ASSERT_IF(ret, (size_t)ret >= gPageSize);
+    if (!ret) {
+      ret = thread_local_arena(false);
+    }
+  }
+
+  MOZ_DIAGNOSTIC_ASSERT(ret);
+  return ret;
+}
+
+inline uint8_t arena_t::FindFreeBitInMask(uint32_t aMask, uint32_t& aRng) {
+  if (mPRNG != nullptr) {
+    if (aRng == UINT_MAX) {
+      aRng = mPRNG->next() % 32;
+    }
+    uint8_t bitIndex;
+    aMask = aRng ? RotateRight(aMask, aRng)
+                 : aMask;  
+    bitIndex = static_cast<uint8_t>(std::countr_zero(aMask));
+    return (bitIndex + aRng) % 32;
+  }
+  return static_cast<uint8_t>(std::countr_zero(aMask));
+}
+
+inline void* arena_t::ArenaRunRegAlloc(arena_run_t* aRun, arena_bin_t* aBin) {
+  void* ret;
+  unsigned i, mask, bit, regind;
+  uint32_t rndPos = UINT_MAX;
+
+  MOZ_DIAGNOSTIC_ASSERT(aRun->mMagic == ARENA_RUN_MAGIC);
+  MOZ_ASSERT(aRun->mRegionsMinElement < aBin->mRunNumRegionsMask);
+
+  i = aRun->mRegionsMinElement;
+  mask = aRun->mRegionsMask[i];
+  if (mask != 0) {
+    bit = FindFreeBitInMask(mask, rndPos);
+
+    regind = ((i << (LOG2(sizeof(int)) + 3)) + bit);
+    MOZ_ASSERT(regind < aBin->mRunNumRegions);
+    ret = (void*)(((uintptr_t)aRun) + aBin->mRunFirstRegionOffset +
+                  (aBin->mSizeClass * regind));
+
+    mask ^= (1U << bit);
+    aRun->mRegionsMask[i] = mask;
+
+    return ret;
+  }
+
+  for (i++; i < aBin->mRunNumRegionsMask; i++) {
+    mask = aRun->mRegionsMask[i];
+    if (mask != 0) {
+      bit = FindFreeBitInMask(mask, rndPos);
+
+      regind = ((i << (LOG2(sizeof(int)) + 3)) + bit);
+      MOZ_ASSERT(regind < aBin->mRunNumRegions);
+      ret = (void*)(((uintptr_t)aRun) + aBin->mRunFirstRegionOffset +
+                    (aBin->mSizeClass * regind));
+
+      mask ^= (1U << bit);
+      aRun->mRegionsMask[i] = mask;
+
+      aRun->mRegionsMinElement = i;  
+
+      return ret;
+    }
+  }
+  MOZ_DIAGNOSTIC_ASSERT(0);
+  return nullptr;
+}
+
+static inline void arena_run_reg_dalloc(arena_run_t* run, arena_bin_t* bin,
+                                        void* ptr, size_t size) {
+  uint32_t diff, regind;
+  unsigned elm, bit;
+
+  MOZ_DIAGNOSTIC_ASSERT(run->mMagic == ARENA_RUN_MAGIC);
+
+  diff =
+      (uint32_t)((uintptr_t)ptr - (uintptr_t)run - bin->mRunFirstRegionOffset);
+
+  MOZ_ASSERT(diff <=
+             (static_cast<unsigned>(bin->mRunSizePages) << gPageSize2Pow));
+  regind = diff / bin->mSizeDivisor;
+
+  MOZ_DIAGNOSTIC_ASSERT(diff == regind * size);
+  MOZ_DIAGNOSTIC_ASSERT(regind < bin->mRunNumRegions);
+
+  elm = regind >> (LOG2(sizeof(int)) + 3);
+  if (elm < run->mRegionsMinElement) {
+    run->mRegionsMinElement = elm;
+  }
+  bit = regind - (elm << (LOG2(sizeof(int)) + 3));
+  MOZ_RELEASE_ASSERT((run->mRegionsMask[elm] & (1U << bit)) == 0,
+                     "Double-free?");
+  run->mRegionsMask[elm] |= (1U << bit);
+}
+
+#if !defined(MALLOC_DECOMMIT)
+void arena_t::TouchMadvisedPage(arena_chunk_t* aChunk, size_t page) {
+  MOZ_ASSERT(aChunk->mPageMap[page].bits & CHUNK_MAP_MADVISED);
+
+  MOZ_ASSERT((aChunk->mPageMap[page].bits &
+              (CHUNK_MAP_FRESH | CHUNK_MAP_DECOMMITTED | CHUNK_MAP_DIRTY)) ==
+             0);
+
+  aChunk->mPageMap[page].bits =
+      (aChunk->mPageMap[page].bits & ~CHUNK_MAP_MADVISED) | CHUNK_MAP_DIRTY;
+
+  aChunk->mNumDirty++;
+  mNumDirty++;
+  mStats.committed++;
+  mNumMAdvised--;
+}
+#endif
+
+bool arena_t::SplitAndAllocRun(arena_run_t* aRun, size_t aSize, bool aLarge,
+                               bool aZero) {
+  arena_chunk_t* chunk = GetChunkForPtr(aRun);
+  size_t old_ndirty = chunk->mNumDirty;
+  size_t run_ind =
+      (unsigned)((uintptr_t(aRun) - uintptr_t(chunk)) >> gPageSize2Pow);
+  size_t total_pages =
+      (chunk->mPageMap[run_ind].bits & ~gPageSizeMask) >> gPageSize2Pow;
+  size_t need_pages = (aSize >> gPageSize2Pow);
+  MOZ_ASSERT(need_pages > 0);
+  MOZ_ASSERT(need_pages <= total_pages);
+  size_t rem_pages = total_pages - need_pages;
+
+  MOZ_ASSERT((chunk->mPageMap[run_ind].bits & CHUNK_MAP_BUSY) == 0);
+
+#if defined(MALLOC_DECOMMIT)
+  size_t i = 0;
+  while (i < need_pages) {
+    MOZ_ASSERT((chunk->mPageMap[run_ind + i].bits & CHUNK_MAP_BUSY) == 0);
+
+    if (chunk->mPageMap[run_ind + i].bits & CHUNK_MAP_DECOMMITTED) {
+      MOZ_ASSERT((run_ind + i) % gPagesPerRealPage == 0);
+
+      size_t j;
+      for (j = 0; i + j < need_pages && (chunk->mPageMap[run_ind + i + j].bits &
+                                         CHUNK_MAP_DECOMMITTED);
+           j++) {
+        MOZ_ASSERT((chunk->mPageMap[run_ind + i + j].bits &
+                    (CHUNK_MAP_FRESH | CHUNK_MAP_MADVISED)) == 0);
+      }
+
+      if (i + j == need_pages) {
+        size_t extra_commit = ExtraCommitPages(j, rem_pages);
+        extra_commit =
+            PAGES_PER_REAL_PAGE_CEILING(run_ind + i + j + extra_commit) -
+            run_ind - i - j;
+        for (; i + j < need_pages + extra_commit &&
+               (chunk->mPageMap[run_ind + i + j].bits &
+                CHUNK_MAP_MADVISED_OR_DECOMMITTED);
+             j++) {
+          MOZ_ASSERT((chunk->mPageMap[run_ind + i + j].bits &
+                      (CHUNK_MAP_FRESH | CHUNK_MAP_MADVISED)) == 0);
+        }
+      }
+      MOZ_ASSERT((run_ind + i + j) % gPagesPerRealPage == 0);
+
+      if (!pages_commit(
+              (void*)(uintptr_t(chunk) + ((run_ind + i) << gPageSize2Pow)),
+              j << gPageSize2Pow)) {
+        return false;
+      }
+
+      for (size_t k = 0; k < j; k++) {
+        chunk->mPageMap[run_ind + i + k].bits =
+            (chunk->mPageMap[run_ind + i + k].bits & ~CHUNK_MAP_DECOMMITTED) |
+            CHUNK_MAP_ZEROED | CHUNK_MAP_FRESH;
+      }
+
+      mNumFresh += j;
+      i += j;
+    } else {
+      i++;
+    }
+  }
+#endif
+
+  if (rem_pages > 0) {
+    chunk->mPageMap[run_ind + need_pages].bits =
+        (rem_pages << gPageSize2Pow) |
+        (chunk->mPageMap[run_ind + need_pages].bits & gPageSizeMask);
+    chunk->mPageMap[run_ind + total_pages - 1].bits =
+        (rem_pages << gPageSize2Pow) |
+        (chunk->mPageMap[run_ind + total_pages - 1].bits & gPageSizeMask);
+    mRunsAvail.Insert(&chunk->mPageMap[run_ind + need_pages]);
+  }
+
+  if (chunk->mDirtyRunHint == run_ind) {
+    chunk->mDirtyRunHint = run_ind + need_pages;
+  }
+
+#if !defined(MALLOC_DECOMMIT)
+  bool first_page_was_madvised =
+      chunk->mPageMap[run_ind].bits & CHUNK_MAP_MADVISED;
+  bool last_page_was_madvised =
+      chunk->mPageMap[run_ind + need_pages - 1].bits & CHUNK_MAP_MADVISED;
+#endif
+  for (size_t i = 0; i < need_pages; i++) {
+    if (aZero) {
+      if ((chunk->mPageMap[run_ind + i].bits & CHUNK_MAP_ZEROED) == 0) {
+        memset((void*)(uintptr_t(chunk) + ((run_ind + i) << gPageSize2Pow)), 0,
+               gPageSize);
+      }
+    }
+
+    if (chunk->mPageMap[run_ind + i].bits & CHUNK_MAP_DIRTY) {
+      chunk->mNumDirty--;
+      mNumDirty--;
+    } else if (chunk->mPageMap[run_ind + i].bits & CHUNK_MAP_MADVISED) {
+      mStats.committed++;
+      mNumMAdvised--;
+    } else if (chunk->mPageMap[run_ind + i].bits & CHUNK_MAP_FRESH) {
+      mStats.committed++;
+      mNumFresh--;
+    }
+
+    MOZ_ASSERT(!(chunk->mPageMap[run_ind + i].bits & CHUNK_MAP_DECOMMITTED));
+
+    if (aLarge) {
+      chunk->mPageMap[run_ind + i].bits = CHUNK_MAP_LARGE | CHUNK_MAP_ALLOCATED;
+    } else {
+      chunk->mPageMap[run_ind + i].bits = size_t(aRun) | CHUNK_MAP_ALLOCATED;
+    }
+  }
+
+#if !defined(MALLOC_DECOMMIT)
+  if (first_page_was_madvised) {
+    for (size_t i = run_ind - 1;
+         (i & (gPagesPerRealPage - 1)) != (gPagesPerRealPage - 1); i--) {
+      MOZ_ASSERT(gChunkHeaderNumPages <= i);
+
+      TouchMadvisedPage(chunk, i);
+    }
+  }
+
+  if (last_page_was_madvised) {
+    for (size_t i = run_ind + need_pages; (i & (gPagesPerRealPage - 1)) != 0;
+         i++) {
+      MOZ_ASSERT(i < gChunkNumPages - gPagesPerRealPage);
+
+      TouchMadvisedPage(chunk, i);
+    }
+  }
+#endif
+
+  if (aLarge) {
+    chunk->mPageMap[run_ind].bits |= aSize;
+  }
+
+  if (chunk->mNumDirty == 0 && old_ndirty > 0 && !chunk->mIsPurging &&
+      mChunksDirty.ElementProbablyInList(chunk)) {
+    mChunksDirty.remove(chunk);
+  }
+  return true;
+}
+
+void arena_t::InitChunk(arena_chunk_t* aChunk, size_t aMinCommittedPages) {
+  new (aChunk) arena_chunk_t(this);
+
+  mStats.mapped += kChunkSize;
+
+
+  size_t i;
+  for (i = 0; i < gChunkHeaderNumPages - gPagesPerRealPage; i++) {
+    aChunk->mPageMap[i].bits = 0;
+  }
+  mStats.committed += gChunkHeaderNumPages - gPagesPerRealPage;
+
+  MOZ_ASSERT(i % gPagesPerRealPage == 0);
+  pages_decommit((void*)(uintptr_t(aChunk) + (i << gPageSize2Pow)),
+                 gRealPageSize);
+  for (; i < gChunkHeaderNumPages; i++) {
+    aChunk->mPageMap[i].bits = CHUNK_MAP_DECOMMITTED;
+  }
+
+#if defined(MALLOC_DECOMMIT)
+  size_t chunk_usable_pages =
+      gChunkNumPages - gChunkHeaderNumPages - gPagesPerRealPage;
+  size_t n_fresh_pages = PAGES_PER_REAL_PAGE_CEILING(
+      aMinCommittedPages +
+      ExtraCommitPages(aMinCommittedPages,
+                       chunk_usable_pages - aMinCommittedPages));
+#else
+  size_t n_fresh_pages =
+      gChunkNumPages - gPagesPerRealPage - gChunkHeaderNumPages;
+#endif
+
+  for (size_t j = 0; j < n_fresh_pages; j++) {
+    aChunk->mPageMap[i + j].bits = CHUNK_MAP_ZEROED | CHUNK_MAP_FRESH;
+  }
+  i += n_fresh_pages;
+  mNumFresh += n_fresh_pages;
+
+#if !defined(MALLOC_DECOMMIT)
+  MOZ_ASSERT(i == gChunkNumPages - gPagesPerRealPage);
+#endif
+
+  MOZ_ASSERT(i % gPagesPerRealPage == 0);
+  pages_decommit((void*)(uintptr_t(aChunk) + (i << gPageSize2Pow)),
+                 (gChunkNumPages - i) << gPageSize2Pow);
+  for (; i < gChunkNumPages; i++) {
+    aChunk->mPageMap[i].bits = CHUNK_MAP_DECOMMITTED;
+  }
+
+  MOZ_ASSERT(aMinCommittedPages > 0);
+  MOZ_ASSERT(aMinCommittedPages <=
+             gChunkNumPages - gChunkHeaderNumPages - gPagesPerRealPage);
+
+  aChunk->mPageMap[gChunkHeaderNumPages].bits |= gMaxLargeClass;
+  aChunk->mPageMap[gChunkNumPages - gPagesPerRealPage - 1].bits |=
+      gMaxLargeClass;
+}
+
+bool arena_t::RemoveChunk(arena_chunk_t* aChunk) {
+  aChunk->mDying = true;
+
+  if (aChunk->mIsPurging) {
+    return false;
+  }
+
+  if (aChunk->mNumDirty > 0) {
+    MOZ_ASSERT(aChunk->mArena == this);
+    if (mChunksDirty.ElementProbablyInList(aChunk)) {
+      mChunksDirty.remove(aChunk);
+    }
+    mNumDirty -= aChunk->mNumDirty;
+    mStats.committed -= aChunk->mNumDirty;
+  }
+
+  size_t madvised = 0;
+  size_t fresh = 0;
+  for (size_t i = gChunkHeaderNumPages; i < gChunkNumPages - gPagesPerRealPage;
+       i++) {
+    MOZ_ASSERT((aChunk->mPageMap[i].bits & CHUNK_MAP_ALLOCATED) == 0);
+    MOZ_ASSERT((aChunk->mPageMap[i].bits & CHUNK_MAP_BUSY) == 0);
+
+    if (aChunk->mPageMap[i].bits & CHUNK_MAP_MADVISED) {
+      madvised++;
+    } else if (aChunk->mPageMap[i].bits & CHUNK_MAP_FRESH) {
+      fresh++;
+    }
+  }
+
+  mNumMAdvised -= madvised;
+  mNumFresh -= fresh;
+
+#if defined(MALLOC_DOUBLE_PURGE)
+  if (mChunksMAdvised.ElementProbablyInList(aChunk)) {
+    mChunksMAdvised.remove(aChunk);
+  }
+#endif
+
+  mStats.mapped -= kChunkSize;
+  mStats.committed -= gChunkHeaderNumPages - gPagesPerRealPage;
+
+  return true;
+}
+
+arena_chunk_t* arena_t::DemoteChunkToSpare(arena_chunk_t* aChunk) {
+  if (mSpare) {
+    if (!RemoveChunk(mSpare)) {
+      mSpare = nullptr;
+    }
+  }
+
+  arena_chunk_t* chunk_dealloc = mSpare;
+  mSpare = aChunk;
+  return chunk_dealloc;
+}
+
+arena_run_t* arena_t::AllocRun(size_t aSize, bool aLarge, bool aZero) {
+  arena_run_t* run;
+  arena_chunk_map_t* mapelm;
+
+  MOZ_ASSERT(aSize <= gMaxLargeClass);
+  MOZ_ASSERT((aSize & gPageSizeMask) == 0);
+
+  mapelm = mRunsAvail.SearchOrNext(aSize);
+  if (mapelm) {
+    arena_chunk_t* chunk = GetChunkForPtr(mapelm);
+    size_t pageind = (uintptr_t(mapelm) - uintptr_t(chunk->mPageMap)) /
+                     sizeof(arena_chunk_map_t);
+
+    MOZ_ASSERT((chunk->mPageMap[pageind].bits & CHUNK_MAP_BUSY) == 0);
+    run = (arena_run_t*)(uintptr_t(chunk) + (pageind << gPageSize2Pow));
+    mRunsAvail.Remove(mapelm);
+  } else if (mSpare && !mSpare->mIsPurging) {
+    arena_chunk_t* chunk = mSpare;
+    mSpare = nullptr;
+    run = (arena_run_t*)(uintptr_t(chunk) +
+                         (gChunkHeaderNumPages << gPageSize2Pow));
+    MOZ_ASSERT((chunk->mPageMap[gChunkHeaderNumPages].bits & CHUNK_MAP_BUSY) ==
+               0);
+    mapelm = &chunk->mPageMap[gChunkHeaderNumPages];
+  } else {
+    arena_chunk_t* chunk = (arena_chunk_t*)arena_chunk_alloc(
+        mChunkAllocator, kChunkSize, kChunkSize);
+    if (!chunk) {
+      return nullptr;
+    }
+
+    InitChunk(chunk, aSize >> gPageSize2Pow);
+    run = (arena_run_t*)(uintptr_t(chunk) +
+                         (gChunkHeaderNumPages << gPageSize2Pow));
+    mapelm = &chunk->mPageMap[gChunkHeaderNumPages];
+  }
+  if (!SplitAndAllocRun(run, aSize, aLarge, aZero)) {
+    mRunsAvail.Insert(mapelm);
+    return nullptr;
+  }
+  return run;
+}
+
+void arena_t::UpdateMaxDirty() {
+  MaybeMutexAutoLock lock(mLock);
+  int32_t modifier = gArenas.DefaultMaxDirtyPageModifier();
+  if (modifier) {
+    int32_t arenaOverride =
+        modifier > 0 ? mMaxDirtyIncreaseOverride : mMaxDirtyDecreaseOverride;
+    if (arenaOverride) {
+      modifier = arenaOverride;
+    }
+  }
+
+  mMaxDirty =
+      modifier >= 0 ? mMaxDirtyBase << modifier : mMaxDirtyBase >> -modifier;
+}
+
+#if defined(MALLOC_DECOMMIT)
+
+size_t arena_t::ExtraCommitPages(size_t aReqPages, size_t aRemainingPages) {
+  const int32_t modifier = gArenas.DefaultMaxDirtyPageModifier();
+  if (modifier < 0) {
+    return 0;
+  }
+
+  const size_t max_page_cache = mMaxDirty;
+
+  const size_t page_cache = mNumDirty + mNumFresh + mNumMAdvised;
+
+  if (page_cache > max_page_cache) {
+    return 0;
+  }
+  if (modifier > 0) {
+    return std::min(aRemainingPages, max_page_cache - page_cache);
+  }
+
+
+  const size_t min = max_page_cache / 4;
+  const size_t max = 3 * max_page_cache / 4;
+
+  size_t amortisation_threshold = 32;
+
+  size_t extra_pages = aReqPages < amortisation_threshold
+                           ? amortisation_threshold - aReqPages
+                           : 0;
+
+  if (page_cache + extra_pages < min) {
+    extra_pages = min - page_cache;
+  } else if (page_cache + extra_pages > max) {
+
+    amortisation_threshold /= 2;
+    extra_pages = std::min(aReqPages < amortisation_threshold
+                               ? amortisation_threshold - aReqPages
+                               : 0,
+                           max_page_cache - page_cache);
+  }
+
+  extra_pages = std::min(extra_pages, aRemainingPages);
+
+  if ((aRemainingPages - extra_pages) < amortisation_threshold / 2 &&
+      (page_cache + aRemainingPages) < max_page_cache) {
+    return aRemainingPages;
+  }
+
+  return extra_pages;
+}
+#endif
+
+ArenaPurgeResult arena_t::Purge(
+    PurgeCondition aCond, PurgeStats& aStats,
+    const Maybe<std::function<bool()>>& aKeepGoing) {
+  arena_chunk_t* chunk = nullptr;
+
+  {
+    MaybeMutexAutoLock lock(mLock);
+
+    if (mMustDeleteAfterPurge) {
+      mIsPurgePending = false;
+      return Dying;
+    }
+
+#if defined(MOZ_DEBUG)
+    size_t ndirty = 0;
+    for (auto& chunk : mChunksDirty) {
+      ndirty += chunk.mNumDirty;
+    }
+    MOZ_ASSERT(ndirty <= mNumDirty);
+#endif
+
+    if (!ShouldContinuePurge(aCond)) {
+      mIsPurgePending = false;
+      return ReachedThresholdOrBusy;
+    }
+
+    if (mSpare && mSpare->mNumDirty && !mSpare->mIsPurging &&
+        mChunksDirty.ElementProbablyInList(mSpare)) {
+      chunk = mSpare;
+      mChunksDirty.remove(chunk);
+    } else {
+      if (!mChunksDirty.isEmpty()) {
+        chunk = mChunksDirty.popFront();
+      }
+    }
+    if (!chunk) {
+      mIsPurgePending = false;
+
+      return ReachedThresholdOrBusy;
+    }
+    MOZ_ASSERT(chunk->mNumDirty > 0);
+
+    MOZ_ASSERT(!chunk->mIsPurging);
+    chunk->mIsPurging = true;
+    aStats.chunks++;
+  }  
+
+  bool continue_purge_arena = true;
+
+  bool continue_purge_chunk = true;
+
+  bool purged_once = false;
+
+  bool keep_going = true;
+
+  while (continue_purge_chunk && continue_purge_arena && keep_going) {
+    PurgeInfo purge_info(*this, chunk, aStats);
+
+    bool chunk_is_dying;
+    {
+      MaybeMutexAutoLock lock(purge_info.mArena.mLock);
+      MOZ_ASSERT(chunk->mIsPurging);
+
+      if (purge_info.mArena.mMustDeleteAfterPurge) {
+        chunk->mIsPurging = false;
+        purge_info.mArena.mIsPurgePending = false;
+        return Dying;
+      }
+
+      continue_purge_chunk = purge_info.FindDirtyPages(purged_once);
+      continue_purge_arena = purge_info.mArena.ShouldContinuePurge(aCond);
+      chunk_is_dying = chunk->mDying;
+
+      if (!continue_purge_chunk && !continue_purge_arena) {
+        purge_info.mArena.mIsPurgePending = false;
+      }
+    }
+    if (!continue_purge_chunk) {
+      if (chunk_is_dying) {
+        arena_chunk_dealloc(purge_info.mArena.mChunkAllocator, (void*)chunk,
+                            kChunkSize);
+      }
+      return continue_purge_arena ? NotDone : ReachedThresholdOrBusy;
+    }
+
+#if defined(MALLOC_DECOMMIT)
+    pages_decommit(purge_info.DirtyPtr(), purge_info.DirtyLenBytes());
+#else
+    madvise(purge_info.DirtyPtr(), purge_info.DirtyLenBytes(), MADV_FREE);
+#endif
+
+    keep_going = aKeepGoing ? (*aKeepGoing)() : true;
+
+    arena_chunk_t* chunk_to_release = nullptr;
+    bool arena_is_dying;
+    {
+      MaybeMutexAutoLock lock(purge_info.mArena.mLock);
+      MOZ_ASSERT(chunk->mIsPurging);
+
+      arena_is_dying = purge_info.mArena.mMustDeleteAfterPurge;
+
+      auto [cpc, ctr] = purge_info.UpdatePagesAndCounts();
+      continue_purge_chunk = cpc;
+      chunk_to_release = ctr;
+      continue_purge_arena = purge_info.mArena.ShouldContinuePurge(aCond);
+
+      if (!continue_purge_chunk || !continue_purge_arena || !keep_going) {
+        purge_info.FinishPurgingInChunk(true, continue_purge_chunk);
+        if (!continue_purge_arena) {
+          purge_info.mArena.mIsPurgePending = false;
+        }
+      }
+    }  
+
+    if (chunk_to_release) {
+      arena_chunk_dealloc(purge_info.mArena.mChunkAllocator,
+                          (void*)chunk_to_release, kChunkSize);
+    }
+    if (arena_is_dying) {
+      return Dying;
+    }
+    purged_once = true;
+  }
+
+  return continue_purge_arena ? NotDone : ReachedThresholdOrBusy;
+}
+
+ArenaPurgeResult arena_t::PurgeLoop(PurgeCondition aCond, const char* aCaller,
+                                    uint32_t aReuseGraceMS,
+                                    Maybe<std::function<bool()>> aKeepGoing) {
+  PurgeStats purge_stats(mId, mLabel, aCaller);
+
+  uint64_t reuseGraceNS = (uint64_t)aReuseGraceMS * 1000 * 1000;
+  uint64_t now = aReuseGraceMS ? 0 : GetTimestampNS();
+  ArenaPurgeResult pr;
+  do {
+    pr = Purge(aCond, purge_stats, aKeepGoing);
+    now = aReuseGraceMS ? 0 : GetTimestampNS();
+  } while (
+      pr == NotDone &&
+      (!aReuseGraceMS || (now - mLastSignificantReuseNS >= reuseGraceNS)) &&
+      (!aKeepGoing || (*aKeepGoing)()));
+
+  return pr;
+}
+
+bool arena_t::PurgeInfo::FindDirtyPages(bool aPurgedOnce) {
+  if (mChunk->mNumDirty == 0 || mChunk->mDying) {
+    FinishPurgingInChunk(aPurgedOnce, false);
+    return false;
+  }
+
+  do {
+    if (!ScanForFirstDirtyPage()) {
+      FinishPurgingInChunk(aPurgedOnce, false);
+      return false;
+    }
+  } while (!ScanForLastDirtyPage());
+
+  MOZ_ASSERT(mFreeRunInd >= gChunkHeaderNumPages);
+  MOZ_ASSERT(mFreeRunInd <= mDirtyInd);
+  MOZ_ASSERT(mFreeRunLen > 0);
+  MOZ_ASSERT(mDirtyInd != 0);
+  MOZ_ASSERT(mDirtyLen != 0);
+  MOZ_ASSERT(mDirtyLen <= mFreeRunLen);
+  MOZ_ASSERT(mDirtyInd + mDirtyLen <= mFreeRunInd + mFreeRunLen);
+  MOZ_ASSERT(mDirtyInd % gPagesPerRealPage == 0);
+  MOZ_ASSERT(mDirtyLen % gPagesPerRealPage == 0);
+
+  mDirtyNPages = 0;
+  for (size_t i = 0; i < mDirtyLen; i++) {
+    size_t& bits = mChunk->mPageMap[mDirtyInd + i].bits;
+    if (bits & CHUNK_MAP_DIRTY) {
+      mDirtyNPages++;
+      bits ^= CHUNK_MAP_DIRTY;
+    }
+  }
+
+  MOZ_ASSERT(mDirtyNPages > 0);
+  MOZ_ASSERT(mDirtyNPages <= mChunk->mNumDirty);
+  MOZ_ASSERT(mDirtyNPages <= mDirtyLen);
+
+  mChunk->mNumDirty -= mDirtyNPages;
+  mArena.mNumDirty -= mDirtyNPages;
+
+  mChunk->mPageMap[mFreeRunInd].bits |= CHUNK_MAP_BUSY;
+  mChunk->mPageMap[FreeRunLastInd()].bits |= CHUNK_MAP_BUSY;
+
+  if (mArena.mSpare != mChunk) {
+    mArena.mRunsAvail.Remove(&mChunk->mPageMap[mFreeRunInd]);
+  }
+  return true;
+}
+
+bool arena_t::PurgeInfo::ScanForFirstDirtyPage() {
+  size_t run_pages;
+  for (size_t run_idx = mChunk->mDirtyRunHint;
+       run_idx < gChunkNumPages - gPagesPerRealPage; run_idx += run_pages) {
+    size_t run_bits = mChunk->mPageMap[run_idx].bits;
+    MOZ_ASSERT((run_bits & CHUNK_MAP_BUSY) == 0);
+
+    if (run_bits & CHUNK_MAP_LARGE || !(run_bits & CHUNK_MAP_ALLOCATED)) {
+      size_t size = run_bits & ~gPageSizeMask;
+      run_pages = size >> gPageSize2Pow;
+    } else {
+      arena_run_t* run =
+          reinterpret_cast<arena_run_t*>(run_bits & ~gPageSizeMask);
+      MOZ_ASSERT(run == reinterpret_cast<arena_run_t*>(
+                            reinterpret_cast<uintptr_t>(mChunk) +
+                            (run_idx << gPageSize2Pow)));
+      run_pages = run->mBin->mRunSizePages;
+    }
+    MOZ_ASSERT(run_pages > 0);
+    MOZ_ASSERT(run_idx + run_pages <= gChunkNumPages);
+
+    if (run_bits & CHUNK_MAP_ALLOCATED) {
+      continue;
+    }
+
+    mFreeRunInd = run_idx;
+    mFreeRunLen = run_pages;
+    mDirtyInd = 0;
+    for (size_t page_idx = run_idx; page_idx < run_idx + run_pages;
+         page_idx++) {
+      size_t& page_bits = mChunk->mPageMap[page_idx].bits;
+      MOZ_ASSERT((page_bits & CHUNK_MAP_BUSY) == 0);
+
+      if ((page_idx & (gPagesPerRealPage - 1)) == 0) {
+        mDirtyInd = page_idx;
+      }
+
+      if (page_bits & CHUNK_MAP_DIRTY) {
+        MOZ_ASSERT((page_bits & CHUNK_MAP_FRESH_MADVISED_OR_DECOMMITTED) == 0);
+        MOZ_ASSERT(mChunk->mDirtyRunHint <= run_idx);
+        mChunk->mDirtyRunHint = run_idx;
+
+        if (mDirtyInd) {
+          return true;
+        }
+
+        mPurgeStats.pages_unpurgable++;
+      }
+    }
+  }
+
+  return false;
+}
+
+bool arena_t::PurgeInfo::ScanForLastDirtyPage() {
+  mDirtyLen = 0;
+  for (size_t i = FreeRunLastInd(); i >= mDirtyInd; i--) {
+    size_t& bits = mChunk->mPageMap[i].bits;
+    MOZ_ASSERT(!(bits & CHUNK_MAP_BUSY));
+
+    if ((i & (gPagesPerRealPage - 1)) == gPagesPerRealPage - 1) {
+      mDirtyLen = i - mDirtyInd + 1;
+    }
+
+    if (bits & CHUNK_MAP_DIRTY) {
+      if (mDirtyLen) {
+        return true;
+      }
+
+      mPurgeStats.pages_unpurgable++;
+    }
+  }
+
+  mChunk->mDirtyRunHint = FreeRunLastInd() + 1;
+  return false;
+}
+
+std::pair<bool, arena_chunk_t*> arena_t::PurgeInfo::UpdatePagesAndCounts() {
+  size_t num_madvised = 0;
+  size_t num_decommitted = 0;
+  size_t num_fresh = 0;
+
+  for (size_t i = 0; i < mDirtyLen; i++) {
+    size_t& bits = mChunk->mPageMap[mDirtyInd + i].bits;
+
+    MOZ_ASSERT((bits & CHUNK_MAP_DIRTY) == 0);
+
+#if defined(MALLOC_DECOMMIT)
+    if (bits & CHUNK_MAP_DECOMMITTED) {
+      num_decommitted++;
+    }
+#else
+    if (bits & CHUNK_MAP_MADVISED) {
+      num_madvised++;
+    }
+#endif
+    else if (bits & CHUNK_MAP_FRESH) {
+      num_fresh++;
+    }
+
+    bits &= ~CHUNK_MAP_FRESH_MADVISED_OR_DECOMMITTED;
+
+#if defined(MALLOC_DECOMMIT)
+    bits |= CHUNK_MAP_DECOMMITTED;
+#else
+    bits |= CHUNK_MAP_MADVISED;
+#endif
+  }
+
+#if defined(MOZ_DEBUG)
+  MOZ_ASSERT(mChunk->mPageMap[mFreeRunInd].bits & CHUNK_MAP_BUSY);
+  MOZ_ASSERT(mChunk->mPageMap[FreeRunLastInd()].bits & CHUNK_MAP_BUSY);
+#endif
+  mChunk->mPageMap[mFreeRunInd].bits &= ~CHUNK_MAP_BUSY;
+  mChunk->mPageMap[FreeRunLastInd()].bits &= ~CHUNK_MAP_BUSY;
+
+#if !defined(MALLOC_DECOMMIT)
+  mArena.mNumMAdvised += mDirtyLen - num_madvised;
+#endif
+
+  mArena.mNumFresh -= num_fresh;
+  mArena.mStats.committed -=
+      mDirtyLen - num_madvised - num_decommitted - num_fresh;
+  mPurgeStats.pages_dirty += mDirtyNPages;
+  mPurgeStats.pages_total += mDirtyLen;
+  mPurgeStats.system_calls++;
+
+
+  if (mChunk->mDying) {
+    MOZ_ASSERT(mFreeRunInd == gChunkHeaderNumPages &&
+               mFreeRunLen ==
+                   gChunkNumPages - gChunkHeaderNumPages - gPagesPerRealPage);
+
+    return std::make_pair(false, mChunk);
+  }
+
+  bool was_empty = mChunk->IsEmpty();
+  mFreeRunInd =
+      mArena.TryCoalesce(mChunk, mFreeRunInd, mFreeRunLen, FreeRunLenBytes());
+
+  arena_chunk_t* chunk_to_release = nullptr;
+  if (!was_empty && mChunk->IsEmpty()) {
+    chunk_to_release = mArena.DemoteChunkToSpare(mChunk);
+  }
+
+  if (mChunk != mArena.mSpare) {
+    mArena.mRunsAvail.Insert(&mChunk->mPageMap[mFreeRunInd]);
+  }
+
+  return std::make_pair(mChunk->mNumDirty != 0, chunk_to_release);
+}
+
+void arena_t::PurgeInfo::FinishPurgingInChunk(bool aAddToMAdvised,
+                                              bool aAddToDirty) {
+  MOZ_ASSERT(mChunk->mIsPurging);
+  mChunk->mIsPurging = false;
+
+  if (mChunk->mDying) {
+
+    DebugOnly<bool> release_chunk = mArena.RemoveChunk(mChunk);
+    MOZ_ASSERT(release_chunk);
+    return;
+  }
+
+  if (mChunk->mNumDirty != 0 && aAddToDirty) {
+    mArena.mChunksDirty.pushFront(mChunk);
+  }
+
+#if defined(MALLOC_DOUBLE_PURGE)
+  if (aAddToMAdvised) {
+    if (mArena.mChunksMAdvised.ElementProbablyInList(mChunk)) {
+      mArena.mChunksMAdvised.remove(mChunk);
+    }
+    mArena.mChunksMAdvised.pushFront(mChunk);
+  }
+#endif
+}
+
+size_t arena_t::TryCoalesce(arena_chunk_t* aChunk, size_t run_ind,
+                            size_t run_pages, size_t size) {
+  MOZ_ASSERT(size == run_pages << gPageSize2Pow);
+
+  if (run_ind + run_pages < gChunkNumPages - gPagesPerRealPage &&
+      (aChunk->mPageMap[run_ind + run_pages].bits &
+       (CHUNK_MAP_ALLOCATED | CHUNK_MAP_BUSY)) == 0) {
+    size_t nrun_size =
+        aChunk->mPageMap[run_ind + run_pages].bits & ~gPageSizeMask;
+
+    mRunsAvail.Remove(&aChunk->mPageMap[run_ind + run_pages]);
+
+    size += nrun_size;
+    run_pages = size >> gPageSize2Pow;
+
+    MOZ_DIAGNOSTIC_ASSERT((aChunk->mPageMap[run_ind + run_pages - 1].bits &
+                           ~gPageSizeMask) == nrun_size);
+    aChunk->mPageMap[run_ind].bits =
+        size | (aChunk->mPageMap[run_ind].bits & gPageSizeMask);
+    aChunk->mPageMap[run_ind + run_pages - 1].bits =
+        size | (aChunk->mPageMap[run_ind + run_pages - 1].bits & gPageSizeMask);
+  }
+
+  if (run_ind > gChunkHeaderNumPages &&
+      (aChunk->mPageMap[run_ind - 1].bits &
+       (CHUNK_MAP_ALLOCATED | CHUNK_MAP_BUSY)) == 0) {
+    size_t prun_size = aChunk->mPageMap[run_ind - 1].bits & ~gPageSizeMask;
+
+    run_ind -= prun_size >> gPageSize2Pow;
+
+    mRunsAvail.Remove(&aChunk->mPageMap[run_ind]);
+
+    size += prun_size;
+    run_pages = size >> gPageSize2Pow;
+
+    MOZ_DIAGNOSTIC_ASSERT((aChunk->mPageMap[run_ind].bits & ~gPageSizeMask) ==
+                          prun_size);
+    aChunk->mPageMap[run_ind].bits =
+        size | (aChunk->mPageMap[run_ind].bits & gPageSizeMask);
+    aChunk->mPageMap[run_ind + run_pages - 1].bits =
+        size | (aChunk->mPageMap[run_ind + run_pages - 1].bits & gPageSizeMask);
+  }
+
+  if ((aChunk->mDirtyRunHint > run_ind) &&
+      (aChunk->mDirtyRunHint < run_ind + run_pages)) {
+    aChunk->mDirtyRunHint = run_ind;
+  }
+
+  return run_ind;
+}
+
+arena_chunk_t* arena_t::DallocRun(arena_run_t* aRun, bool aDirty) {
+  arena_chunk_t* chunk = GetChunkForPtr(aRun);
+  size_t run_ind =
+      (size_t)((uintptr_t(aRun) - uintptr_t(chunk)) >> gPageSize2Pow);
+  MOZ_DIAGNOSTIC_ASSERT(run_ind >= gChunkHeaderNumPages);
+  MOZ_RELEASE_ASSERT(run_ind < gChunkNumPages - 1);
+
+  size_t size, run_pages;
+  if ((chunk->mPageMap[run_ind].bits & CHUNK_MAP_LARGE) != 0) {
+    size = chunk->mPageMap[run_ind].bits & ~gPageSizeMask;
+    run_pages = (size >> gPageSize2Pow);
+  } else {
+    run_pages = aRun->mBin->mRunSizePages;
+    size = run_pages << gPageSize2Pow;
+  }
+
+  for (size_t i = 0; i < run_pages; i++) {
+    size_t& bits = chunk->mPageMap[run_ind + i].bits;
+
+    MOZ_DIAGNOSTIC_ASSERT(
+        (bits & gPageSizeMask & ~(CHUNK_MAP_LARGE | CHUNK_MAP_ALLOCATED)) == 0);
+    bits = aDirty ? CHUNK_MAP_DIRTY : 0;
+  }
+
+  if (aDirty) {
+    if (!chunk->mIsPurging &&
+        (chunk->mNumDirty == 0 || !mChunksDirty.ElementProbablyInList(chunk))) {
+      mChunksDirty.pushBack(chunk);
+    }
+    chunk->mNumDirty += run_pages;
+    mNumDirty += run_pages;
+  }
+
+  chunk->mPageMap[run_ind].bits |= size;
+  chunk->mPageMap[run_ind + run_pages - 1].bits |= size;
+
+  run_ind = TryCoalesce(chunk, run_ind, run_pages, size);
+
+  if (aDirty && run_ind < chunk->mDirtyRunHint) {
+    chunk->mDirtyRunHint = run_ind;
+  }
+
+  arena_chunk_t* chunk_dealloc = nullptr;
+  if (chunk->IsEmpty()) {
+    chunk_dealloc = DemoteChunkToSpare(chunk);
+  } else {
+    mRunsAvail.Insert(&chunk->mPageMap[run_ind]);
+  }
+
+  return chunk_dealloc;
+}
+
+void arena_t::TrimRunHead(arena_chunk_t* aChunk, arena_run_t* aRun,
+                          size_t aOldSize, size_t aNewSize) {
+  size_t pageind = (uintptr_t(aRun) - uintptr_t(aChunk)) >> gPageSize2Pow;
+  size_t head_npages = (aOldSize - aNewSize) >> gPageSize2Pow;
+
+  MOZ_ASSERT(aOldSize > aNewSize);
+
+  aChunk->mPageMap[pageind].bits =
+      (aOldSize - aNewSize) | CHUNK_MAP_LARGE | CHUNK_MAP_ALLOCATED;
+  aChunk->mPageMap[pageind + head_npages].bits =
+      aNewSize | CHUNK_MAP_LARGE | CHUNK_MAP_ALLOCATED;
+
+  DebugOnly<arena_chunk_t*> no_chunk = DallocRun(aRun, false);
+  MOZ_ASSERT(!no_chunk);
+}
+
+void arena_t::TrimRunTail(arena_chunk_t* aChunk, arena_run_t* aRun,
+                          size_t aOldSize, size_t aNewSize, bool aDirty) {
+  size_t pageind = (uintptr_t(aRun) - uintptr_t(aChunk)) >> gPageSize2Pow;
+  size_t npages = aNewSize >> gPageSize2Pow;
+
+  MOZ_ASSERT(aOldSize > aNewSize);
+
+  aChunk->mPageMap[pageind].bits =
+      aNewSize | CHUNK_MAP_LARGE | CHUNK_MAP_ALLOCATED;
+  aChunk->mPageMap[pageind + npages].bits =
+      (aOldSize - aNewSize) | CHUNK_MAP_LARGE | CHUNK_MAP_ALLOCATED;
+
+  DebugOnly<arena_chunk_t*> no_chunk =
+      DallocRun((arena_run_t*)(uintptr_t(aRun) + aNewSize), aDirty);
+
+  MOZ_ASSERT(!no_chunk);
+}
+
+arena_run_t* arena_t::GetNewEmptyBinRun(arena_bin_t* aBin) {
+  arena_run_t* run;
+  unsigned i, remainder;
+
+  run = AllocRun(static_cast<size_t>(aBin->mRunSizePages) << gPageSize2Pow,
+                 false, false);
+  if (!run) {
+    return nullptr;
+  }
+
+  run->mBin = aBin;
+
+  for (i = 0; i < aBin->mRunNumRegionsMask - 1; i++) {
+    run->mRegionsMask[i] = UINT_MAX;
+  }
+  remainder = aBin->mRunNumRegions & ((1U << (LOG2(sizeof(int)) + 3)) - 1);
+  if (remainder == 0) {
+    run->mRegionsMask[i] = UINT_MAX;
+  } else {
+    run->mRegionsMask[i] =
+        (UINT_MAX >> ((1U << (LOG2(sizeof(int)) + 3)) - remainder));
+  }
+
+  run->mRegionsMinElement = 0;
+
+  run->mNumFree = aBin->mRunNumRegions;
+#if defined(MOZ_DIAGNOSTIC_ASSERT_ENABLED)
+  run->mMagic = ARENA_RUN_MAGIC;
+#endif
+
+  new (&run->mRunListElem) DoublyLinkedListElement<arena_run_t>();
+  aBin->mNonFullRuns.pushFront(run);
+
+  aBin->mNumRuns++;
+  return run;
+}
+
+arena_run_t* arena_t::GetNonFullBinRun(arena_bin_t* aBin) {
+  auto mrf_head = aBin->mNonFullRuns.begin();
+  if (mrf_head) {
+    arena_run_t* run = &(*mrf_head);
+    MOZ_DIAGNOSTIC_ASSERT(run->mMagic == ARENA_RUN_MAGIC);
+    if (run->mNumFree == 1) {
+      aBin->mNonFullRuns.remove(run);
+    }
+    return run;
+  }
+  return GetNewEmptyBinRun(aBin);
+}
+
+arena_bin_t::arena_bin_t(SizeClass aSizeClass) : mSizeClass(aSizeClass.Size()) {
+  size_t try_run_size;
+  unsigned try_nregs, try_mask_nelms, try_reg0_offset;
+  static const size_t kFixedHeaderSize = offsetof(arena_run_t, mRegionsMask);
+
+  MOZ_ASSERT(aSizeClass.Size() <= gMaxBinClass);
+
+  try_run_size = gMinimumRunSize;
+
+  while (true) {
+    try_nregs = ((try_run_size - kFixedHeaderSize) / mSizeClass) +
+                1;  
+
+    do {
+      try_nregs--;
+      try_mask_nelms =
+          (try_nregs >> (LOG2(sizeof(int)) + 3)) +
+          ((try_nregs & ((1U << (LOG2(sizeof(int)) + 3)) - 1)) ? 1 : 0);
+      try_reg0_offset = try_run_size - (try_nregs * mSizeClass);
+    } while (kFixedHeaderSize + (sizeof(unsigned) * try_mask_nelms) >
+             try_reg0_offset);
+
+    if (Fraction(try_reg0_offset, try_run_size) <= kRunOverhead) {
+      break;
+    }
+
+    if (try_reg0_offset > mSizeClass) {
+      if (Fraction(try_reg0_offset, try_run_size) <= kRunRelaxedOverhead) {
+        break;
+      }
+    }
+
+    if (try_mask_nelms * sizeof(unsigned) >= kFixedHeaderSize) {
+      break;
+    }
+
+    if (try_run_size + gPageSize > gMaxLargeClass) {
+      break;
+    }
+
+    try_run_size += gPageSize;
+  }
+
+  MOZ_ASSERT(kFixedHeaderSize + (sizeof(unsigned) * try_mask_nelms) <=
+             try_reg0_offset);
+  MOZ_ASSERT((try_mask_nelms << (LOG2(sizeof(int)) + 3)) >= try_nregs);
+
+  MOZ_ASSERT(try_nregs > 1);
+
+  MOZ_ASSERT((try_run_size >> gPageSize2Pow) <= UINT8_MAX);
+  mRunSizePages = static_cast<uint8_t>(try_run_size >> gPageSize2Pow);
+  mRunNumRegions = try_nregs;
+  mRunNumRegionsMask = try_mask_nelms;
+  mRunFirstRegionOffset = try_reg0_offset;
+  mSizeDivisor = FastDivisor<uint16_t>(aSizeClass.Size(), try_run_size);
+}
+
+void arena_t::ResetSmallAllocRandomization() {
+  if (MOZ_UNLIKELY(opt_randomize_small)) {
+    MaybeMutexAutoLock lock(mLock);
+    InitPRNG();
+  }
+  mRandomizeSmallAllocations = opt_randomize_small;
+}
+
+void arena_t::InitPRNG() {
+  mIsPRNGInitializing = true;
+  {
+    mLock.Unlock();
+    mozilla::Maybe<uint64_t> prngState1 = mozilla::RandomUint64();
+    mozilla::Maybe<uint64_t> prngState2 = mozilla::RandomUint64();
+    mLock.Lock();
+
+    mozilla::non_crypto::XorShift128PlusRNG prng(prngState1.valueOr(0),
+                                                 prngState2.valueOr(0));
+    if (mPRNG) {
+      *mPRNG = prng;
+    } else {
+      void* backing =
+          sBaseAlloc.alloc(sizeof(mozilla::non_crypto::XorShift128PlusRNG));
+      mPRNG = new (backing)
+          mozilla::non_crypto::XorShift128PlusRNG(std::move(prng));
+    }
+  }
+  mIsPRNGInitializing = false;
+}
+
+void* arena_t::MallocSmall(size_t aSize, bool aZero) {
+  void* ret;
+  arena_bin_t* bin;
+  arena_run_t* run;
+  SizeClass sizeClass(aSize);
+  aSize = sizeClass.Size();
+
+  switch (sizeClass.Type()) {
+    case SizeClass::Quantum:
+      bin = &mBins[(aSize / kQuantum) - (kMinQuantumClass / kQuantum)];
+      break;
+    case SizeClass::QuantumWide:
+      bin = &mBins[kNumQuantumClasses + (aSize / kQuantumWide) -
+                   (kMinQuantumWideClass / kQuantumWide)];
+      break;
+    case SizeClass::SubPage:
+      bin = &mBins[kNumQuantumClasses + kNumQuantumWideClasses +
+                   (FloorLog2(aSize) - LOG2(kMinSubPageClass))];
+      break;
+    default:
+      MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE("Unexpected size class type");
+  }
+  MOZ_DIAGNOSTIC_ASSERT(aSize == bin->mSizeClass);
+
+  size_t num_dirty_before, num_dirty_after;
+  {
+    MaybeMutexAutoLock lock(mLock);
+
+#if defined(MOZ_DEBUG)
+    bool isInitializingThread(false);
+#endif
+
+    if (MOZ_UNLIKELY(mRandomizeSmallAllocations && mPRNG == nullptr &&
+                     !mIsPRNGInitializing)) {
+#if defined(MOZ_DEBUG)
+      isInitializingThread = true;
+#endif
+      InitPRNG();
+    }
+
+    MOZ_ASSERT(!mRandomizeSmallAllocations || mPRNG ||
+               (mIsPRNGInitializing && !isInitializingThread));
+
+    num_dirty_before = mNumDirty;
+    run = GetNonFullBinRun(bin);
+    num_dirty_after = mNumDirty;
+    if (MOZ_UNLIKELY(!run)) {
+      return nullptr;
+    }
+    MOZ_DIAGNOSTIC_ASSERT(run->mMagic == ARENA_RUN_MAGIC);
+    MOZ_DIAGNOSTIC_ASSERT(run->mNumFree > 0);
+    ret = ArenaRunRegAlloc(run, bin);
+    MOZ_DIAGNOSTIC_ASSERT(ret);
+    run->mNumFree--;
+    if (!ret) {
+      return nullptr;
+    }
+
+    mStats.allocated_small += aSize;
+    mStats.operations++;
+  }
+  if (num_dirty_after < num_dirty_before) {
+    NotifySignificantReuse();
+  }
+  if (!aZero) {
+    ApplyZeroOrJunk(ret, aSize);
+  } else {
+    memset(ret, 0, aSize);
+  }
+
+  return ret;
+}
+
+void* arena_t::MallocLarge(size_t aSize, bool aZero) {
+  void* ret;
+
+  aSize = PAGE_CEILING(aSize);
+
+  size_t num_dirty_before, num_dirty_after;
+  {
+    MaybeMutexAutoLock lock(mLock);
+    num_dirty_before = mNumDirty;
+    ret = AllocRun(aSize, true, aZero);
+    num_dirty_after = mNumDirty;
+    if (!ret) {
+      return nullptr;
+    }
+    mStats.allocated_large += aSize;
+    mStats.operations++;
+  }
+  if (num_dirty_after < num_dirty_before) {
+    NotifySignificantReuse();
+  }
+
+  if (!aZero) {
+    ApplyZeroOrJunk(ret, aSize);
+  }
+
+  return ret;
+}
+
+void* arena_t::Malloc(size_t aSize, bool aZero) {
+  MOZ_DIAGNOSTIC_ASSERT(mMagic == ARENA_MAGIC);
+  MOZ_ASSERT(aSize != 0);
+
+  if (aSize <= gMaxBinClass) {
+    return MallocSmall(aSize, aZero);
+  }
+  if (aSize <= gMaxLargeClass) {
+    return MallocLarge(aSize, aZero);
+  }
+  return MallocHuge(aSize, aZero);
+}
+
+void* arena_t::PallocLarge(size_t aAlignment, size_t aSize, size_t aAllocSize) {
+  void* ret;
+  size_t offset;
+  arena_chunk_t* chunk;
+
+  MOZ_ASSERT((aSize & gPageSizeMask) == 0);
+  MOZ_ASSERT((aAlignment & gPageSizeMask) == 0);
+
+  size_t num_dirty_before, num_dirty_after;
+  {
+    MaybeMutexAutoLock lock(mLock);
+    num_dirty_before = mNumDirty;
+    ret = AllocRun(aAllocSize, true, false);
+    if (!ret) {
+      return nullptr;
+    }
+
+    chunk = GetChunkForPtr(ret);
+
+    offset = uintptr_t(ret) & (aAlignment - 1);
+    MOZ_ASSERT((offset & gPageSizeMask) == 0);
+    MOZ_ASSERT(offset < aAllocSize);
+    if (offset == 0) {
+      TrimRunTail(chunk, (arena_run_t*)ret, aAllocSize, aSize, false);
+    } else {
+      size_t leadsize, trailsize;
+
+      leadsize = aAlignment - offset;
+      if (leadsize > 0) {
+        TrimRunHead(chunk, (arena_run_t*)ret, aAllocSize,
+                    aAllocSize - leadsize);
+        ret = (void*)(uintptr_t(ret) + leadsize);
+      }
+
+      trailsize = aAllocSize - leadsize - aSize;
+      if (trailsize != 0) {
+        MOZ_ASSERT(trailsize < aAllocSize);
+        TrimRunTail(chunk, (arena_run_t*)ret, aSize + trailsize, aSize, false);
+      }
+    }
+    num_dirty_after = mNumDirty;
+
+    mStats.allocated_large += aSize;
+    mStats.operations++;
+  }
+  if (num_dirty_after < num_dirty_before) {
+    NotifySignificantReuse();
+  }
+
+  ApplyZeroOrJunk(ret, aSize);
+  return ret;
+}
+
+void* arena_t::Palloc(size_t aAlignment, size_t aSize) {
+  void* ret;
+  size_t ceil_size;
+
+  ceil_size = ALIGNMENT_CEILING(aSize, aAlignment);
+
+  if (ceil_size < aSize) {
+    return nullptr;
+  }
+
+  if (ceil_size <= gPageSize ||
+      (aAlignment <= gPageSize && ceil_size <= gMaxLargeClass)) {
+    ret = Malloc(ceil_size, false);
+  } else {
+    size_t run_size;
+
+    aAlignment = PAGE_CEILING(aAlignment);
+    ceil_size = PAGE_CEILING(aSize);
+
+    if (ceil_size < aSize || ceil_size + aAlignment < ceil_size) {
+      return nullptr;
+    }
+
+    if (ceil_size >= aAlignment) {
+      run_size = ceil_size + aAlignment - gPageSize;
+    } else {
+      run_size = (aAlignment << 1) - gPageSize;
+    }
+
+    if (run_size <= gMaxLargeClass) {
+      ret = PallocLarge(aAlignment, ceil_size, run_size);
+    } else if (aAlignment <= kChunkSize) {
+      ret = MallocHuge(ceil_size, false);
+    } else {
+      ret = PallocHuge(ceil_size, aAlignment, false);
+    }
+  }
+
+  MOZ_ASSERT((uintptr_t(ret) & (aAlignment - 1)) == 0);
+  return ret;
+}
+
+class AllocInfo {
+ public:
+  template <bool Validate = false>
+  static inline AllocInfo Get(const void* aPtr) {
+    if (Validate && !malloc_initialized) {
+      return AllocInfo();
+    }
+
+    auto chunk = GetChunkForPtr(aPtr);
+    if (Validate) {
+      if (!chunk || !gChunkRTree.Get(chunk)) {
+        return AllocInfo();
+      }
+    }
+
+    if (chunk != aPtr) {
+      MOZ_DIAGNOSTIC_ASSERT(chunk->mArena->mMagic == ARENA_MAGIC);
+      size_t pageind = (((uintptr_t)aPtr - (uintptr_t)chunk) >> gPageSize2Pow);
+      return GetInChunk(aPtr, chunk, pageind);
+    }
+
+    MutexAutoLock lock(huge_mtx);
+    extent_node_t* node = huge.Search(chunk);
+    if (Validate && !node) {
+      return AllocInfo();
+    }
+    return AllocInfo(node->mSize, node);
+  }
+
+  static inline AllocInfo GetInChunk(const void* aPtr, arena_chunk_t* aChunk,
+                                     size_t pageind) {
+    size_t mapbits = aChunk->mPageMap[pageind].bits;
+    MOZ_DIAGNOSTIC_ASSERT((mapbits & CHUNK_MAP_ALLOCATED) != 0);
+
+    size_t size;
+    if ((mapbits & CHUNK_MAP_LARGE) == 0) {
+      arena_run_t* run = (arena_run_t*)(mapbits & ~gPageSizeMask);
+      MOZ_DIAGNOSTIC_ASSERT(run->mMagic == ARENA_RUN_MAGIC);
+      size = run->mBin->mSizeClass;
+    } else {
+      size = mapbits & ~gPageSizeMask;
+      MOZ_DIAGNOSTIC_ASSERT(size != 0);
+    }
+
+    return AllocInfo(size, aChunk);
+  }
+
+  static inline AllocInfo GetValidated(const void* aPtr) {
+    return Get<true>(aPtr);
+  }
+
+  AllocInfo() : mSize(0), mChunk(nullptr) {}
+
+  explicit AllocInfo(size_t aSize, arena_chunk_t* aChunk)
+      : mSize(aSize), mChunk(aChunk) {
+    MOZ_ASSERT(mSize <= gMaxLargeClass);
+  }
+
+  explicit AllocInfo(size_t aSize, extent_node_t* aNode)
+      : mSize(aSize), mNode(aNode) {
+    MOZ_ASSERT(mSize > gMaxLargeClass);
+  }
+
+  size_t Size() { return mSize; }
+
+  arena_t* Arena() {
+    if (mSize <= gMaxLargeClass) {
+      return mChunk->mArena;
+    }
+    MOZ_RELEASE_ASSERT(mNode->mArenaId == mNode->mArena->mId);
+    return mNode->mArena;
+  }
+
+  bool IsValid() const { return !!mSize; }
+
+ private:
+  size_t mSize;
+  union {
+    arena_chunk_t* mChunk;
+
+    extent_node_t* mNode;
+  };
+};
+
+inline void MozJemalloc::jemalloc_ptr_info(const void* aPtr,
+                                           jemalloc_ptr_info_t* aInfo) {
+  arena_chunk_t* chunk = GetChunkForPtr(aPtr);
+
+  if (!chunk || !malloc_initialized) {
+    *aInfo = {TagUnknown, nullptr, 0, 0};
+    return;
+  }
+
+  extent_node_t* node;
+  {
+    MutexAutoLock lock(huge_mtx);
+    node =
+        reinterpret_cast<RedBlackTree<extent_node_t, ExtentTreeBoundsTrait>*>(
+            &huge)
+            ->Search(const_cast<void*>(aPtr));
+    if (node) {
+      *aInfo = {TagLiveAlloc, node->mAddr, node->mSize, node->mArena->mId};
+      return;
+    }
+  }
+
+  if (!gChunkRTree.Get(chunk)) {
+    *aInfo = {TagUnknown, nullptr, 0, 0};
+    return;
+  }
+
+  MOZ_DIAGNOSTIC_ASSERT(chunk->mArena->mMagic == ARENA_MAGIC);
+
+  size_t pageind = (((uintptr_t)aPtr - (uintptr_t)chunk) >> gPageSize2Pow);
+  if (pageind < gChunkHeaderNumPages) {
+    *aInfo = {TagUnknown, nullptr, 0, 0};
+    return;
+  }
+
+  size_t mapbits = chunk->mPageMap[pageind].bits;
+
+  if (!(mapbits & CHUNK_MAP_ALLOCATED)) {
+    void* pageaddr = (void*)(uintptr_t(aPtr) & ~gPageSizeMask);
+    *aInfo = {TagFreedPage, pageaddr, gPageSize, chunk->mArena->mId};
+    return;
+  }
+
+  if (mapbits & CHUNK_MAP_LARGE) {
+    size_t size;
+    while (true) {
+      size = mapbits & ~gPageSizeMask;
+      if (size != 0) {
+        break;
+      }
+
+      pageind--;
+      MOZ_DIAGNOSTIC_ASSERT(pageind >= gChunkHeaderNumPages);
+      if (pageind < gChunkHeaderNumPages) {
+        *aInfo = {TagUnknown, nullptr, 0, 0};
+        return;
+      }
+
+      mapbits = chunk->mPageMap[pageind].bits;
+      MOZ_DIAGNOSTIC_ASSERT(mapbits & CHUNK_MAP_LARGE);
+      if (!(mapbits & CHUNK_MAP_LARGE)) {
+        *aInfo = {TagUnknown, nullptr, 0, 0};
+        return;
+      }
+    }
+
+    void* addr = ((char*)chunk) + (pageind << gPageSize2Pow);
+    *aInfo = {TagLiveAlloc, addr, size, chunk->mArena->mId};
+    return;
+  }
+
+  auto run = (arena_run_t*)(mapbits & ~gPageSizeMask);
+  MOZ_DIAGNOSTIC_ASSERT(run->mMagic == ARENA_RUN_MAGIC);
+
+  size_t size = run->mBin->mSizeClass;
+
+  uintptr_t reg0_addr = (uintptr_t)run + run->mBin->mRunFirstRegionOffset;
+  if (aPtr < (void*)reg0_addr) {
+    *aInfo = {TagUnknown, nullptr, 0, 0};
+    return;
+  }
+
+  unsigned regind = ((uintptr_t)aPtr - reg0_addr) / size;
+
+  void* addr = (void*)(reg0_addr + regind * size);
+
+  unsigned elm = regind >> (LOG2(sizeof(int)) + 3);
+  unsigned bit = regind - (elm << (LOG2(sizeof(int)) + 3));
+  PtrInfoTag tag =
+      ((run->mRegionsMask[elm] & (1U << bit))) ? TagFreedAlloc : TagLiveAlloc;
+
+  *aInfo = {tag, addr, size, chunk->mArena->mId};
+}
+
+namespace Debug {
+MOZ_NEVER_INLINE jemalloc_ptr_info_t* jemalloc_ptr_info(const void* aPtr) {
+  static jemalloc_ptr_info_t info;
+  MozJemalloc::jemalloc_ptr_info(aPtr, &info);
+  return &info;
+}
+}  
+
+arena_chunk_t* arena_t::DallocSmall(arena_chunk_t* aChunk, void* aPtr,
+                                    arena_chunk_map_t* aMapElm) {
+  arena_run_t* run;
+  arena_bin_t* bin;
+  size_t size;
+
+  run = (arena_run_t*)(aMapElm->bits & ~gPageSizeMask);
+  MOZ_DIAGNOSTIC_ASSERT(run->mMagic == ARENA_RUN_MAGIC);
+  bin = run->mBin;
+  size = bin->mSizeClass;
+  MOZ_DIAGNOSTIC_ASSERT(uintptr_t(aPtr) >=
+                        uintptr_t(run) + bin->mRunFirstRegionOffset);
+
+  arena_run_reg_dalloc(run, bin, aPtr, size);
+  run->mNumFree++;
+  arena_chunk_t* dealloc_chunk = nullptr;
+
+  if (run->mNumFree == bin->mRunNumRegions) {
+#if defined(MOZ_DIAGNOSTIC_ASSERT_ENABLED)
+    run->mMagic = 0;
+#endif
+    MOZ_ASSERT(bin->mNonFullRuns.ElementProbablyInList(run));
+    bin->mNonFullRuns.remove(run);
+    dealloc_chunk = DallocRun(run, true);
+    bin->mNumRuns--;
+  } else if (run->mNumFree == 1) {
+    MOZ_ASSERT(!bin->mNonFullRuns.ElementProbablyInList(run));
+    bin->mNonFullRuns.pushFront(run);
+  }
+
+  mStats.allocated_small -= size;
+  mStats.operations++;
+
+  return dealloc_chunk;
+}
+
+arena_chunk_t* arena_t::DallocLarge(arena_chunk_t* aChunk, void* aPtr) {
+  MOZ_DIAGNOSTIC_ASSERT((uintptr_t(aPtr) & gPageSizeMask) == 0);
+  size_t pageind = (uintptr_t(aPtr) - uintptr_t(aChunk)) >> gPageSize2Pow;
+  size_t size = aChunk->mPageMap[pageind].bits & ~gPageSizeMask;
+
+  mStats.allocated_large -= size;
+  mStats.operations++;
+
+  return DallocRun((arena_run_t*)aPtr, true);
+}
+
+static inline void arena_dalloc(void* aPtr, size_t aOffset, arena_t* aArena) {
+  MOZ_ASSERT(aPtr);
+  MOZ_ASSERT(aOffset != 0);
+  MOZ_ASSERT(GetChunkOffsetForPtr(aPtr) == aOffset);
+
+  auto chunk = (arena_chunk_t*)((uintptr_t)aPtr - aOffset);
+  auto arena = chunk->mArena;
+  MOZ_ASSERT(arena);
+  MOZ_DIAGNOSTIC_ASSERT(arena->mMagic == ARENA_MAGIC);
+  MOZ_RELEASE_ASSERT(!aArena || arena == aArena);
+
+  size_t pageind = aOffset >> gPageSize2Pow;
+  if (opt_poison) {
+    AllocInfo info = AllocInfo::GetInChunk(aPtr, chunk, pageind);
+    MOZ_ASSERT(info.IsValid());
+    MaybePoison(aPtr, info.Size());
+  }
+
+  arena_chunk_t* chunk_dealloc_delay = nullptr;
+  purge_action_t purge_action;
+  {
+    MOZ_DIAGNOSTIC_ASSERT(arena->mLock.SafeOnThisThread());
+    MaybeMutexAutoLock lock(arena->mLock);
+    arena_chunk_map_t* mapelm = &chunk->mPageMap[pageind];
+    MOZ_RELEASE_ASSERT(
+        (mapelm->bits &
+         (CHUNK_MAP_FRESH_MADVISED_OR_DECOMMITTED | CHUNK_MAP_ZEROED)) == 0,
+        "Freeing in a page with bad bits.");
+    MOZ_RELEASE_ASSERT((mapelm->bits & CHUNK_MAP_ALLOCATED) != 0,
+                       "Double-free?");
+    if ((mapelm->bits & CHUNK_MAP_LARGE) == 0) {
+      chunk_dealloc_delay = arena->DallocSmall(chunk, aPtr, mapelm);
+    } else {
+      chunk_dealloc_delay = arena->DallocLarge(chunk, aPtr);
+    }
+
+    purge_action = arena->ShouldStartPurge();
+  }
+
+  if (chunk_dealloc_delay) {
+    arena_chunk_dealloc(arena->mChunkAllocator, (void*)chunk_dealloc_delay,
+                        kChunkSize);
+  }
+
+  arena->MayDoOrQueuePurge(purge_action, "arena_dalloc");
+}
+
+static inline void idalloc(void* ptr, arena_t* aArena) {
+  size_t offset;
+
+  MOZ_ASSERT(ptr);
+
+  offset = GetChunkOffsetForPtr(ptr);
+  if (offset != 0) {
+    arena_dalloc(ptr, offset, aArena);
+  } else {
+    huge_dalloc(ptr, aArena);
+  }
+}
+
+inline purge_action_t arena_t::ShouldStartPurge() {
+  if (mNumDirty > mMaxDirty) {
+    if (!mIsDeferredPurgeEnabled) {
+      return purge_action_t::PurgeNow;
+    }
+    if (mIsPurgePending) {
+      return purge_action_t::None;
+    }
+    mIsPurgePending = true;
+    return purge_action_t::Queue;
+  }
+  return purge_action_t::None;
+}
+
+inline void arena_t::MayDoOrQueuePurge(purge_action_t aAction,
+                                       const char* aCaller) {
+  switch (aAction) {
+    case purge_action_t::Queue:
+      gArenas.AddToOutstandingPurges(this);
+      break;
+    case purge_action_t::PurgeNow: {
+      ArenaPurgeResult pr = PurgeLoop(PurgeIfThreshold, aCaller);
+      MOZ_RELEASE_ASSERT(pr != ArenaPurgeResult::Dying);
+      break;
+    }
+    case purge_action_t::None:
+      break;
+  }
+}
+
+inline void arena_t::NotifySignificantReuse() {
+  mLastSignificantReuseNS = GetTimestampNS();
+}
+
+void arena_t::RallocShrinkLarge(arena_chunk_t* aChunk, void* aPtr, size_t aSize,
+                                size_t aOldSize) {
+  MOZ_ASSERT(aSize < aOldSize);
+
+  purge_action_t purge_action;
+  {
+    MaybeMutexAutoLock lock(mLock);
+    TrimRunTail(aChunk, (arena_run_t*)aPtr, aOldSize, aSize, true);
+    mStats.allocated_large -= aOldSize - aSize;
+    mStats.operations++;
+
+    purge_action = ShouldStartPurge();
+  }
+  MayDoOrQueuePurge(purge_action, "RallocShrinkLarge");
+}
+
+bool arena_t::RallocGrowLarge(arena_chunk_t* aChunk, void* aPtr, size_t aSize,
+                              size_t aOldSize) {
+  size_t pageind = (uintptr_t(aPtr) - uintptr_t(aChunk)) >> gPageSize2Pow;
+  size_t npages = aOldSize >> gPageSize2Pow;
+
+  size_t num_dirty_before, num_dirty_after;
+  {
+    MaybeMutexAutoLock lock(mLock);
+    MOZ_DIAGNOSTIC_ASSERT(aOldSize ==
+                          (aChunk->mPageMap[pageind].bits & ~gPageSizeMask));
+
+    MOZ_ASSERT(aSize > aOldSize);
+    if (pageind + npages < gChunkNumPages - 1 &&
+        (aChunk->mPageMap[pageind + npages].bits &
+         (CHUNK_MAP_ALLOCATED | CHUNK_MAP_BUSY)) == 0 &&
+        (aChunk->mPageMap[pageind + npages].bits & ~gPageSizeMask) >=
+            aSize - aOldSize) {
+      num_dirty_before = mNumDirty;
+      mRunsAvail.Remove(&aChunk->mPageMap[pageind + npages]);
+      if (!SplitAndAllocRun(
+              (arena_run_t*)(uintptr_t(aChunk) +
+                             ((pageind + npages) << gPageSize2Pow)),
+              aSize - aOldSize, true, false)) {
+        mRunsAvail.Insert(&aChunk->mPageMap[pageind + npages]);
+        return false;
+      }
+
+      aChunk->mPageMap[pageind].bits =
+          aSize | CHUNK_MAP_LARGE | CHUNK_MAP_ALLOCATED;
+      aChunk->mPageMap[pageind + npages].bits =
+          CHUNK_MAP_LARGE | CHUNK_MAP_ALLOCATED;
+
+      mStats.allocated_large += aSize - aOldSize;
+      mStats.operations++;
+      num_dirty_after = mNumDirty;
+    } else {
+      return false;
+    }
+  }
+  if (num_dirty_after < num_dirty_before) {
+    NotifySignificantReuse();
+  }
+  return true;
+}
+
+
+void* arena_t::RallocSmallOrLarge(void* aPtr, size_t aSize, size_t aOldSize) {
+  void* ret;
+  size_t copysize;
+  SizeClass sizeClass(aSize);
+
+  if (aOldSize <= gMaxLargeClass && sizeClass.Size() == aOldSize) {
+    if (aSize < aOldSize) {
+      MaybePoison((void*)(uintptr_t(aPtr) + aSize), aOldSize - aSize);
+    }
+    return aPtr;
+  }
+  if (sizeClass.Type() == SizeClass::Large && aOldSize > gMaxBinClass &&
+      aOldSize <= gMaxLargeClass) {
+    arena_chunk_t* chunk = GetChunkForPtr(aPtr);
+    if (sizeClass.Size() < aOldSize) {
+      MaybePoison((void*)((uintptr_t)aPtr + aSize), aOldSize - aSize);
+      RallocShrinkLarge(chunk, aPtr, sizeClass.Size(), aOldSize);
+      return aPtr;
+    }
+    if (RallocGrowLarge(chunk, aPtr, sizeClass.Size(), aOldSize)) {
+      ApplyZeroOrJunk((void*)((uintptr_t)aPtr + aOldSize), aSize - aOldSize);
+      return aPtr;
+    }
+  }
+
+  ret = (mIsPrivate ? this : choose_arena(aSize))->Malloc(aSize, false);
+  if (!ret) {
+    return nullptr;
+  }
+
+  copysize = (aSize < aOldSize) ? aSize : aOldSize;
+#if defined(VM_COPY_MIN)
+  if (copysize >= VM_COPY_MIN) {
+    pages_copy(ret, aPtr, copysize);
+  } else
+#endif
+  {
+    memcpy(ret, aPtr, copysize);
+  }
+  idalloc(aPtr, this);
+  return ret;
+}
+
+void* arena_t::Ralloc(void* aPtr, size_t aSize, size_t aOldSize) {
+  MOZ_DIAGNOSTIC_ASSERT(mMagic == ARENA_MAGIC);
+  MOZ_ASSERT(aPtr);
+  MOZ_ASSERT(aSize != 0);
+
+  return (aSize <= gMaxLargeClass) ? RallocSmallOrLarge(aPtr, aSize, aOldSize)
+                                   : RallocHuge(aPtr, aSize, aOldSize);
+}
+
+void* arena_t::operator new(size_t aCount, const fallible_t&) noexcept {
+  MOZ_ASSERT(aCount == sizeof(arena_t));
+  return sBaseAlloc.alloc(sizeof(arena_t) +
+                          (sizeof(arena_bin_t) * NUM_SMALL_CLASSES));
+}
+
+arena_t::arena_t(arena_params_t* aParams, bool aIsPrivate)
+    : mRandomizeSmallAllocations(opt_randomize_small),
+      mIsPrivate(aIsPrivate),
+      mMaxDirtyBase((aParams && aParams->mMaxDirty) ? aParams->mMaxDirty
+                                                    : (opt_dirty_max / 8)),
+      mLastSignificantReuseNS(GetTimestampNS()),
+      mIsDeferredPurgeEnabled(gArenas.IsDeferredPurgeEnabled()),
+      mChunkAllocator(&gSystemChunkAllocator) {
+  MaybeMutex::DoLock doLock = MaybeMutex::MUST_LOCK;
+  if (aParams) {
+    uint32_t randFlags = aParams->mFlags & ARENA_FLAG_RANDOMIZE_SMALL_MASK;
+    switch (randFlags) {
+      case ARENA_FLAG_RANDOMIZE_SMALL_ENABLED:
+        mRandomizeSmallAllocations = true;
+        break;
+      case ARENA_FLAG_RANDOMIZE_SMALL_DISABLED:
+        mRandomizeSmallAllocations = false;
+        break;
+      case ARENA_FLAG_RANDOMIZE_SMALL_DEFAULT:
+      default:
+        break;
+    }
+
+    uint32_t threadFlags = aParams->mFlags & ARENA_FLAG_THREAD_MASK;
+    if (threadFlags == ARENA_FLAG_THREAD_MAIN_THREAD_ONLY) {
+      MOZ_ASSERT(gArenas.IsOnMainThread());
+      MOZ_ASSERT(aIsPrivate);
+      doLock = MaybeMutex::AVOID_LOCK_UNSAFE;
+    }
+
+    mMaxDirtyIncreaseOverride = aParams->mMaxDirtyIncreaseOverride;
+    mMaxDirtyDecreaseOverride = aParams->mMaxDirtyDecreaseOverride;
+
+    if (aParams->mLabel) {
+      strncpy(mLabel, aParams->mLabel, LABEL_MAX_CAPACITY - 1);
+      mLabel[LABEL_MAX_CAPACITY - 1] = 0;
+
+      if (strlen(aParams->mLabel) >= LABEL_MAX_CAPACITY) {
+        for (int i = 0; i < 3; i++) {
+          mLabel[LABEL_MAX_CAPACITY - 2 - i] = '.';
+        }
+      }
+    }
+
+    if (aParams->mChunkAllocator) {
+      MOZ_ASSERT(aIsPrivate);
+      mChunkAllocator = aParams->mChunkAllocator;
+    }
+  }
+
+  MOZ_RELEASE_ASSERT(mLock.Init(doLock));
+
+  UpdateMaxDirty();
+
+  SizeClass sizeClass(1);
+
+  unsigned i;
+  for (i = 0;; i++) {
+    new (&mBins[i]) arena_bin_t(sizeClass);
+
+    if (sizeClass.Size() == gMaxBinClass) {
+      break;
+    }
+    sizeClass = sizeClass.Next();
+  }
+  MOZ_ASSERT(i == NUM_SMALL_CLASSES - 1);
+}
+
+arena_t::~arena_t() {
+  size_t i;
+  MaybeMutexAutoLock lock(mLock);
+
+  MOZ_RELEASE_ASSERT(!mLink.Left() && !mLink.Right(),
+                     "Arena is still registered");
+  MOZ_RELEASE_ASSERT(!mStats.allocated_small && !mStats.allocated_large,
+                     "Arena is not empty");
+  if (mSpare) {
+    arena_chunk_dealloc(mChunkAllocator, mSpare, kChunkSize);
+  }
+  for (i = 0; i < NUM_SMALL_CLASSES; i++) {
+    MOZ_RELEASE_ASSERT(mBins[i].mNonFullRuns.isEmpty(), "Bin is not empty");
+  }
+#if defined(MOZ_DEBUG)
+  {
+    MutexAutoLock lock(huge_mtx);
+    for (auto node : huge.iter()) {
+      MOZ_RELEASE_ASSERT(node->mArenaId != mId, "Arena has huge allocations");
+    }
+  }
+#endif
+  mId = 0;
+}
+
+arena_t* ArenaCollection::CreateArena(bool aIsPrivate,
+                                      arena_params_t* aParams) {
+  arena_t* ret = new (fallible) arena_t(aParams, aIsPrivate);
+  if (!ret) {
+
+    _malloc_message(_getprogname(), ": (malloc) Error initializing arena\n");
+
+    return mDefaultArena;
+  }
+
+  MutexAutoLock lock(mLock);
+
+  if (!aIsPrivate) {
+    ret->mId = mLastPublicArenaId++;
+    mArenas.Insert(ret);
+    return ret;
+  }
+
+#if defined(NON_RANDOM_ARENA_IDS)
+  if (mArenaIdKey == 0) {
+    mozilla::Maybe<uint64_t> maybeRandom = mozilla::RandomUint64();
+    MOZ_RELEASE_ASSERT(maybeRandom.isSome());
+    mArenaIdKey = maybeRandom.value();
+    maybeRandom = mozilla::RandomUint64();
+    MOZ_RELEASE_ASSERT(maybeRandom.isSome());
+    mArenaIdRotation = maybeRandom.value() & (sizeof(void*) * 8 - 1);
+  }
+  arena_id_t id = reinterpret_cast<arena_id_t>(ret) ^ mArenaIdKey;
+  ret->mId =
+      (id >> mArenaIdRotation) | (id << (sizeof(void*) * 8 - mArenaIdRotation));
+  mPrivateArenas.Insert(ret);
+  return ret;
+#else
+  Tree& tree = (ret->IsMainThreadOnly()) ? mMainThreadArenas : mPrivateArenas;
+  arena_id_t arena_id;
+  do {
+    arena_id = MakeRandArenaId(ret->IsMainThreadOnly());
+  } while (tree.Search(arena_id));
+
+  ret->mId = arena_id;
+  tree.Insert(ret);
+  return ret;
+#endif
+}
+
+#if !defined(NON_RANDOM_ARENA_IDS)
+arena_id_t ArenaCollection::MakeRandArenaId(bool aIsMainThreadOnly) const {
+  uint64_t rand;
+  do {
+    mozilla::Maybe<uint64_t> maybeRandomId = mozilla::RandomUint64();
+    MOZ_RELEASE_ASSERT(maybeRandomId.isSome());
+
+    rand = maybeRandomId.value();
+
+    if (aIsMainThreadOnly) {
+      rand = rand | MAIN_THREAD_ARENA_BIT;
+    } else {
+      rand = rand & ~MAIN_THREAD_ARENA_BIT;
+    }
+
+  } while (rand == 0);
+
+  return arena_id_t(rand);
+}
+#endif
+
+
+static void huge_init() MOZ_REQUIRES(gInitLock) {
+  huge_mtx.Init();
+  MOZ_PUSH_IGNORE_THREAD_SAFETY
+  huge_allocated = 0;
+  huge_mapped = 0;
+  huge_operations = 0;
+  MOZ_POP_THREAD_SAFETY
+}
+
+void* arena_t::MallocHuge(size_t aSize, bool aZero) {
+  return PallocHuge(aSize, kChunkSize, aZero);
+}
+
+void* arena_t::PallocHuge(size_t aSize, size_t aAlignment, bool aZero) {
+  void* ret;
+  size_t csize;
+  size_t psize;
+  extent_node_t* node;
+
+  csize = CHUNK_CEILING(aSize + gRealPageSize);
+  if (csize < aSize) {
+    return nullptr;
+  }
+
+  node = new (fallible) extent_node_t();
+  if (!node) {
+    return nullptr;
+  }
+
+  ret = arena_chunk_alloc(mChunkAllocator, csize, aAlignment);
+  if (!ret) {
+    delete node;
+    return nullptr;
+  }
+  psize = REAL_PAGE_CEILING(aSize);
+  MOZ_ASSERT(psize < csize);
+#if defined(MOZ_DEBUG)
+  if (aZero) {
+    chunk_assert_zero(ret, psize);
+  }
+#endif
+
+  node->mAddr = ret;
+  node->mSize = psize;
+  node->mArena = this;
+  node->mArenaId = mId;
+
+  {
+    MutexAutoLock lock(huge_mtx);
+    huge.Insert(node);
+
+    huge_allocated += psize;
+    huge_mapped += csize;
+    huge_operations++;
+  }
+
+  pages_decommit((void*)((uintptr_t)ret + psize), csize - psize);
+
+  if (!aZero) {
+    ApplyZeroOrJunk(ret, psize);
+  }
+
+  return ret;
+}
+
+void* arena_t::RallocHuge(void* aPtr, size_t aSize, size_t aOldSize) {
+  void* ret;
+  size_t copysize;
+
+  if (aOldSize > gMaxLargeClass &&
+      CHUNK_CEILING(aSize + gRealPageSize) ==
+          CHUNK_CEILING(aOldSize + gRealPageSize)) {
+    size_t psize = REAL_PAGE_CEILING(aSize);
+    if (aSize < aOldSize) {
+      MaybePoison((void*)((uintptr_t)aPtr + aSize), aOldSize - aSize);
+    }
+    if (psize < aOldSize) {
+      pages_decommit((void*)((uintptr_t)aPtr + psize), aOldSize - psize);
+
+      MutexAutoLock lock(huge_mtx);
+      extent_node_t* node = huge.Search(aPtr);
+      MOZ_ASSERT(node);
+      MOZ_ASSERT(node->mSize == aOldSize);
+      MOZ_RELEASE_ASSERT(node->mArena == this);
+      huge_allocated -= aOldSize - psize;
+      huge_operations++;
+      node->mSize = psize;
+    } else if (psize > aOldSize) {
+      if (!pages_commit((void*)((uintptr_t)aPtr + aOldSize),
+                        psize - aOldSize)) {
+        return nullptr;
+      }
+
+      MutexAutoLock lock(huge_mtx);
+      extent_node_t* node = huge.Search(aPtr);
+      MOZ_ASSERT(node);
+      MOZ_ASSERT(node->mSize == aOldSize);
+      MOZ_RELEASE_ASSERT(node->mArena == this);
+      huge_allocated += psize - aOldSize;
+      huge_operations++;
+      node->mSize = psize;
+    }
+
+    if (aSize > aOldSize) {
+      ApplyZeroOrJunk((void*)((uintptr_t)aPtr + aOldSize), aSize - aOldSize);
+    }
+    return aPtr;
+  }
+
+  ret = (mIsPrivate ? this : choose_arena(aSize))->MallocHuge(aSize, false);
+  if (!ret) {
+    return nullptr;
+  }
+
+  copysize = (aSize < aOldSize) ? aSize : aOldSize;
+#if defined(VM_COPY_MIN)
+  if (copysize >= VM_COPY_MIN) {
+    pages_copy(ret, aPtr, copysize);
+  } else
+#endif
+  {
+    memcpy(ret, aPtr, copysize);
+  }
+  idalloc(aPtr, this);
+  return ret;
+}
+
+static void huge_dalloc(void* aPtr, arena_t* aArena) {
+  extent_node_t* node;
+  size_t mapped = 0;
+  {
+    MutexAutoLock lock(huge_mtx);
+
+    node = huge.Search(aPtr);
+    MOZ_RELEASE_ASSERT(node, "Double-free?");
+    MOZ_ASSERT(node->mAddr == aPtr);
+    MOZ_RELEASE_ASSERT(!aArena || node->mArena == aArena);
+    MOZ_RELEASE_ASSERT(node->mArenaId == node->mArena->mId);
+    huge.Remove(node);
+
+    mapped = CHUNK_CEILING(node->mSize + gRealPageSize);
+    huge_allocated -= node->mSize;
+    huge_mapped -= mapped;
+    huge_operations++;
+  }
+
+  arena_chunk_dealloc(node->mArena->mChunkAllocator, node->mAddr, mapped);
+
+  delete node;
+}
+
+static bool malloc_init_hard() {
+  unsigned i;
+  const char* opts;
+
+  AutoLock<StaticMutex> lock(gInitLock);
+
+  if (malloc_initialized) {
+    return true;
+  }
+
+  if (!thread_arena.init()) {
+    return true;
+  }
+
+  const size_t page_size = GetKernelPageSize();
+  MOZ_ASSERT(std::has_single_bit(page_size));
+#if defined(MALLOC_STATIC_PAGESIZE)
+  if (gRealPageSize % page_size) {
+    _malloc_message(
+        _getprogname(),
+        "Compile-time page size does not divide the runtime one.\n");
+    MOZ_CRASH();
+  }
+#else
+  gRealPageSize = page_size;
+  gPageSize = page_size;
+#endif
+
+  if ((opts = getenv("MALLOC_OPTIONS"))) {
+    for (i = 0; opts[i] != '\0'; i++) {
+
+      unsigned prefix_arg = 0;
+      while (opts[i] >= '0' && opts[i] <= '9') {
+        prefix_arg *= 10;
+        prefix_arg += opts[i] - '0';
+        i++;
+      }
+
+      switch (opts[i]) {
+        case 'f':
+          opt_dirty_max >>= prefix_arg ? prefix_arg : 1;
+          break;
+        case 'F':
+          prefix_arg = prefix_arg ? prefix_arg : 1;
+          if (opt_dirty_max == 0) {
+            opt_dirty_max = 1;
+            prefix_arg--;
+          }
+          opt_dirty_max <<= prefix_arg;
+          if (opt_dirty_max == 0) {
+            opt_dirty_max = size_t(1) << (sizeof(size_t) * CHAR_BIT - 1);
+          }
+          break;
+#if defined(MALLOC_RUNTIME_CONFIG)
+        case 'j':
+          opt_junk = false;
+          break;
+        case 'J':
+          opt_junk = true;
+          break;
+        case 'q':
+          opt_poison = NONE;
+          break;
+        case 'Q':
+          if (opts[i + 1] == 'Q') {
+            i++;
+            opt_poison = ALL;
+          } else {
+            opt_poison = SOME;
+            opt_poison_size = kCacheLineSize * prefix_arg;
+          }
+          break;
+        case 'z':
+          opt_zero = false;
+          break;
+        case 'Z':
+          opt_zero = true;
+          break;
+#if !defined(MALLOC_STATIC_PAGESIZE)
+        case 'P':
+          MOZ_ASSERT(gPageSize >= 1_KiB);
+          MOZ_ASSERT(gPageSize <= 64_KiB);
+          prefix_arg = prefix_arg ? prefix_arg : 1;
+          gPageSize <<= prefix_arg;
+          if (gPageSize < 1_KiB || gPageSize > 64_KiB) {
+            gPageSize = 64_KiB;
+          }
+          if (gPageSize > gRealPageSize) {
+            gPageSize = gRealPageSize;
+          }
+          break;
+        case 'p':
+          MOZ_ASSERT(gPageSize >= 1_KiB);
+          MOZ_ASSERT(gPageSize <= 64_KiB);
+          prefix_arg = prefix_arg ? prefix_arg : 1;
+          gPageSize >>= prefix_arg;
+          if (gPageSize < 1_KiB) {
+            gPageSize = 1_KiB;
+          }
+          break;
+#endif
+#endif
+        case 'r':
+          opt_randomize_small = false;
+          break;
+        case 'R':
+          opt_randomize_small = true;
+          break;
+        default: {
+          char cbuf[2];
+
+          cbuf[0] = opts[i];
+          cbuf[1] = '\0';
+          _malloc_message(_getprogname(),
+                          ": (malloc) Unsupported character "
+                          "in malloc options: '",
+                          cbuf, "'\n");
+        }
+      }
+    }
+  }
+
+  MOZ_ASSERT(gPageSize <= gRealPageSize);
+#if !defined(MALLOC_STATIC_PAGESIZE)
+  DefineGlobals();
+#endif
+  gRecycledSize = 0;
+
+  chunks_init();
+  huge_init();
+  sBaseAlloc.Init();
+
+  if (!gArenas.Init()) {
+    return false;
+  }
+
+  thread_arena.set(gArenas.GetDefault());
+
+  if (!gChunkRTree.Init()) {
+    return false;
+  }
+
+  malloc_initialized = true;
+
+  Debug::jemalloc_ptr_info(nullptr);
+
+  pthread_atfork(_malloc_prefork, _malloc_postfork_parent,
+                 _malloc_postfork_child);
+
+
+  return true;
+}
+
+
+struct BaseAllocator {
+#define MALLOC_DECL(name, return_type, ...) \
+  inline return_type name(__VA_ARGS__);
+
+#define MALLOC_FUNCS MALLOC_FUNCS_MALLOC_BASE
+#include "malloc_decls.h"
+
+  explicit BaseAllocator(arena_t* aArena) : mArena(aArena) {}
+
+ private:
+  arena_t* mArena;
+};
+
+#define MALLOC_DECL(name, return_type, ...)                  \
+  inline return_type MozJemalloc::name(                      \
+      ARGS_HELPER(TYPED_ARGS, ##__VA_ARGS__)) {              \
+    BaseAllocator allocator(nullptr);                        \
+    return allocator.name(ARGS_HELPER(ARGS, ##__VA_ARGS__)); \
+  }
+#define MALLOC_FUNCS MALLOC_FUNCS_MALLOC_BASE
+#include "malloc_decls.h"
+
+inline void* BaseAllocator::malloc(size_t aSize) {
+  void* ret;
+  arena_t* arena;
+
+  if (!malloc_init()) {
+    ret = nullptr;
+    goto RETURN;
+  }
+
+  if (aSize == 0) {
+    aSize = 1;
+  }
+  MOZ_DIAGNOSTIC_ASSERT_IF(mArena, (size_t)mArena >= gPageSize);
+  arena = mArena ? mArena : choose_arena(aSize);
+  ret = arena->Malloc(aSize,  false);
+
+RETURN:
+  if (!ret) {
+    errno = ENOMEM;
+  }
+
+  return ret;
+}
+
+inline void* BaseAllocator::memalign(size_t aAlignment, size_t aSize) {
+  MOZ_ASSERT(((aAlignment - 1) & aAlignment) == 0);
+
+  if (!malloc_init()) {
+    return nullptr;
+  }
+
+  if (aSize == 0) {
+    aSize = 1;
+  }
+
+  aAlignment = aAlignment < sizeof(void*) ? sizeof(void*) : aAlignment;
+  arena_t* arena = mArena ? mArena : choose_arena(aSize);
+  return arena->Palloc(aAlignment, aSize);
+}
+
+inline void* BaseAllocator::calloc(size_t aNum, size_t aSize) {
+  void* ret;
+
+  if (malloc_init()) {
+    CheckedInt<size_t> checkedSize = CheckedInt<size_t>(aNum) * aSize;
+    if (checkedSize.isValid()) {
+      size_t allocSize = checkedSize.value();
+      if (allocSize == 0) {
+        allocSize = 1;
+      }
+      arena_t* arena = mArena ? mArena : choose_arena(allocSize);
+      ret = arena->Malloc(allocSize,  true);
+    } else {
+      ret = nullptr;
+    }
+  } else {
+    ret = nullptr;
+  }
+
+  if (!ret) {
+    errno = ENOMEM;
+  }
+
+  return ret;
+}
+
+inline void* BaseAllocator::realloc(void* aPtr, size_t aSize) {
+  void* ret;
+
+  if (aSize == 0) {
+    aSize = 1;
+  }
+
+  if (aPtr) {
+    MOZ_RELEASE_ASSERT(malloc_initialized);
+
+    auto info = AllocInfo::Get(aPtr);
+    auto arena = info.Arena();
+    MOZ_RELEASE_ASSERT(!mArena || arena == mArena);
+    ret = arena->Ralloc(aPtr, aSize, info.Size());
+  } else {
+    if (!malloc_init()) {
+      ret = nullptr;
+    } else {
+      arena_t* arena = mArena ? mArena : choose_arena(aSize);
+      ret = arena->Malloc(aSize,  false);
+    }
+  }
+
+  if (!ret) {
+    errno = ENOMEM;
+  }
+  return ret;
+}
+
+inline void BaseAllocator::free(void* aPtr) {
+  size_t offset;
+
+  offset = GetChunkOffsetForPtr(aPtr);
+  if (offset != 0) {
+    MOZ_RELEASE_ASSERT(malloc_initialized);
+    arena_dalloc(aPtr, offset, mArena);
+  } else if (aPtr) {
+    MOZ_RELEASE_ASSERT(malloc_initialized);
+    huge_dalloc(aPtr, mArena);
+  }
+}
+
+inline int MozJemalloc::posix_memalign(void** aMemPtr, size_t aAlignment,
+                                       size_t aSize) {
+  return AlignedAllocator<memalign>::posix_memalign(aMemPtr, aAlignment, aSize);
+}
+
+inline void* MozJemalloc::aligned_alloc(size_t aAlignment, size_t aSize) {
+  return AlignedAllocator<memalign>::aligned_alloc(aAlignment, aSize);
+}
+
+inline void* MozJemalloc::valloc(size_t aSize) {
+  return AlignedAllocator<memalign>::valloc(aSize);
+}
+
+
+inline size_t MozJemalloc::malloc_good_size(size_t aSize) {
+  if (aSize == 0) {
+    aSize = SizeClass(1).Size();
+  } else if (aSize <= gMaxLargeClass) {
+    aSize = SizeClass(aSize).Size();
+  } else {
+    aSize = REAL_PAGE_CEILING(aSize);
+  }
+  return aSize;
+}
+
+inline size_t MozJemalloc::malloc_usable_size(usable_ptr_t aPtr) {
+  return AllocInfo::GetValidated(aPtr).Size();
+}
+
+inline void MozJemalloc::jemalloc_stats_internal(
+    jemalloc_stats_t* aStats, jemalloc_bin_stats_t* aBinStats) {
+  size_t non_arena_mapped, chunk_header_size;
+
+  if (!aStats) {
+    return;
+  }
+  if (!malloc_init()) {
+    memset(aStats, 0, sizeof(*aStats));
+    return;
+  }
+  if (aBinStats) {
+    memset(aBinStats, 0, sizeof(jemalloc_bin_stats_t) * NUM_SMALL_CLASSES);
+  }
+
+  aStats->opt_junk = opt_junk;
+  aStats->opt_randomize_small = opt_randomize_small;
+  aStats->opt_zero = opt_zero;
+  aStats->quantum = kQuantum;
+  aStats->quantum_max = kMaxQuantumClass;
+  aStats->quantum_wide = kQuantumWide;
+  aStats->quantum_wide_max = kMaxQuantumWideClass;
+  aStats->subpage_max = gMaxSubPageClass;
+  aStats->large_max = gMaxLargeClass;
+  aStats->chunksize = kChunkSize;
+  aStats->page_size = gPageSize;
+  aStats->real_page_size = gRealPageSize;
+  aStats->dirty_max = opt_dirty_max;
+  aStats->arena_run_header = offsetof(arena_run_t, mRegionsMask);
+
+  aStats->narenas = 0;
+  aStats->mapped = 0;
+  aStats->allocated = 0;
+  aStats->waste = 0;
+  aStats->pages_dirty = 0;
+  aStats->pages_fresh = 0;
+  aStats->pages_madvised = 0;
+  aStats->bookkeeping = 0;
+  aStats->bin_unused = 0;
+
+  non_arena_mapped = 0;
+
+  {
+    MutexAutoLock lock(huge_mtx);
+    non_arena_mapped += huge_mapped;
+    aStats->allocated += huge_allocated;
+    aStats->num_operations += huge_operations;
+    MOZ_ASSERT(huge_mapped >= huge_allocated);
+  }
+
+  auto base_stats = sBaseAlloc.GetStats();
+  non_arena_mapped += base_stats.mMapped;
+  aStats->bookkeeping += base_stats.mCommitted;
+
+  gArenas.mLock.Lock();
+
+  MOZ_ASSERT(gArenas.IsOnMainThreadWeak());
+
+  for (auto arena : gArenas.iter()) {
+    MOZ_ASSERT(arena->mLock.SafeOnThisThread());
+
+    size_t arena_mapped, arena_allocated, arena_committed, arena_dirty,
+        arena_fresh, arena_madvised, j, arena_unused, arena_headers;
+
+    arena_headers = 0;
+    arena_unused = 0;
+
+    {
+      MaybeMutexAutoLock lock(arena->mLock);
+
+      arena_mapped = arena->mStats.mapped;
+
+      arena_committed = arena->mStats.committed << gPageSize2Pow;
+
+      arena_allocated =
+          arena->mStats.allocated_small + arena->mStats.allocated_large;
+
+      arena_dirty = arena->mNumDirty << gPageSize2Pow;
+      arena_fresh = arena->mNumFresh << gPageSize2Pow;
+      arena_madvised = arena->mNumMAdvised << gPageSize2Pow;
+
+      aStats->num_operations += arena->mStats.operations;
+
+      for (j = 0; j < NUM_SMALL_CLASSES; j++) {
+        arena_bin_t* bin = &arena->mBins[j];
+        size_t bin_unused = 0;
+        size_t num_non_full_runs = 0;
+
+        for (arena_run_t& run : bin->mNonFullRuns) {
+          MOZ_DIAGNOSTIC_ASSERT(run.mMagic == ARENA_RUN_MAGIC);
+          MOZ_RELEASE_ASSERT(run.mNumFree > 0 &&
+                             run.mNumFree < bin->mRunNumRegions);
+          MOZ_RELEASE_ASSERT(run.mBin == bin);
+          MOZ_RELEASE_ASSERT(bin->mNonFullRuns.ElementIsLinkedWell(&run));
+          arena_chunk_t* chunk = GetChunkForPtr(&run);
+          MOZ_RELEASE_ASSERT(chunk->mArena == arena);
+          bin_unused += run.mNumFree * bin->mSizeClass;
+          num_non_full_runs++;
+        }
+
+        arena_unused += bin_unused;
+        arena_headers += bin->mNumRuns * bin->mRunFirstRegionOffset;
+        if (aBinStats) {
+          aBinStats[j].size = bin->mSizeClass;
+          aBinStats[j].num_non_full_runs += num_non_full_runs;
+          aBinStats[j].num_runs += bin->mNumRuns;
+          aBinStats[j].bytes_unused += bin_unused;
+          size_t bytes_per_run = static_cast<size_t>(bin->mRunSizePages)
+                                 << gPageSize2Pow;
+          aBinStats[j].bytes_total +=
+              bin->mNumRuns * (bytes_per_run - bin->mRunFirstRegionOffset);
+          aBinStats[j].bytes_per_run = bytes_per_run;
+          aBinStats[j].regions_per_run = bin->mRunNumRegions;
+        }
+      }
+    }
+
+    MOZ_ASSERT(arena_mapped >= arena_committed);
+    MOZ_ASSERT(arena_committed >= arena_allocated + arena_dirty);
+
+    aStats->mapped += arena_mapped;
+    aStats->allocated += arena_allocated;
+    aStats->pages_dirty += arena_dirty;
+    aStats->pages_fresh += arena_fresh;
+    aStats->pages_madvised += arena_madvised;
+    MOZ_ASSERT(arena_committed >=
+               (arena_allocated + arena_dirty + arena_unused + arena_headers));
+    aStats->waste += arena_committed - arena_allocated - arena_dirty -
+                     arena_unused - arena_headers;
+    aStats->bin_unused += arena_unused;
+    aStats->bookkeeping += arena_headers;
+    aStats->narenas++;
+  }
+  gArenas.mLock.Unlock();
+
+  chunk_header_size =
+      ((aStats->mapped / aStats->chunksize) * (gChunkHeaderNumPages - 1))
+      << gPageSize2Pow;
+
+  aStats->mapped += non_arena_mapped;
+  aStats->bookkeeping += chunk_header_size;
+  aStats->waste -= chunk_header_size;
+
+  MOZ_ASSERT(aStats->mapped >= aStats->allocated + aStats->waste +
+                                   aStats->pages_dirty + aStats->bookkeeping);
+}
+
+inline void MozJemalloc::jemalloc_stats_lite(jemalloc_stats_lite_t* aStats) {
+  if (!aStats) {
+    return;
+  }
+  if (!malloc_init()) {
+    memset(aStats, 0, sizeof(*aStats));
+    return;
+  }
+
+  aStats->allocated_bytes = 0;
+  aStats->num_operations = 0;
+
+  {
+    MutexAutoLock lock(huge_mtx);
+    aStats->allocated_bytes += huge_allocated;
+    aStats->num_operations += huge_operations;
+    MOZ_ASSERT(huge_mapped >= huge_allocated);
+  }
+
+  {
+    MutexAutoLock lock(gArenas.mLock);
+    for (auto arena : gArenas.iter()) {
+      aStats->allocated_bytes += arena->AllocatedBytes();
+      aStats->num_operations += arena->Operations();
+    }
+    aStats->num_operations += gArenas.OperationsDisposedArenas();
+  }
+}
+
+inline size_t MozJemalloc::jemalloc_stats_num_bins() {
+  return NUM_SMALL_CLASSES;
+}
+
+inline void MozJemalloc::jemalloc_set_main_thread() {
+  MOZ_ASSERT(malloc_initialized);
+  gArenas.SetMainThread();
+}
+
+#if defined(MALLOC_DOUBLE_PURGE)
+
+static size_t hard_purge_chunk(arena_chunk_t* aChunk) {
+  size_t total_npages = 0;
+  for (size_t i = gChunkHeaderNumPages; i < gChunkNumPages; i++) {
+    size_t npages;
+    for (npages = 0; aChunk->mPageMap[i + npages].bits & CHUNK_MAP_MADVISED &&
+                     i + npages < gChunkNumPages;
+         npages++) {
+      MOZ_DIAGNOSTIC_ASSERT(!(aChunk->mPageMap[i + npages].bits &
+                              (CHUNK_MAP_FRESH | CHUNK_MAP_DECOMMITTED)));
+      aChunk->mPageMap[i + npages].bits ^=
+          (CHUNK_MAP_MADVISED | CHUNK_MAP_FRESH);
+    }
+
+    if (npages > 0) {
+      MOZ_ASSERT((i % gPagesPerRealPage) == 0);
+      MOZ_ASSERT((npages % gPagesPerRealPage) == 0);
+      pages_decommit(((char*)aChunk) + (i << gPageSize2Pow),
+                     npages << gPageSize2Pow);
+      (void)pages_commit(((char*)aChunk) + (i << gPageSize2Pow),
+                         npages << gPageSize2Pow);
+    }
+    total_npages += npages;
+    i += npages;
+  }
+
+  return total_npages;
+}
+
+void arena_t::HardPurge() {
+  MaybeMutexAutoLock lock(mLock);
+
+  while (!mChunksMAdvised.isEmpty()) {
+    arena_chunk_t* chunk = mChunksMAdvised.popFront();
+    size_t npages = hard_purge_chunk(chunk);
+    mNumMAdvised -= npages;
+    mNumFresh += npages;
+  }
+}
+
+inline void MozJemalloc::jemalloc_purge_freed_pages() {
+  if (malloc_initialized) {
+    MutexAutoLock lock(gArenas.mLock);
+    MOZ_ASSERT(gArenas.IsOnMainThreadWeak());
+    for (auto arena : gArenas.iter()) {
+      arena->HardPurge();
+    }
+  }
+}
+
+#else
+
+inline void MozJemalloc::jemalloc_purge_freed_pages() {
+}
+
+#endif
+
+inline void MozJemalloc::jemalloc_free_dirty_pages(void) {
+  if (malloc_initialized) {
+    gArenas.MayPurgeAll(PurgeUnconditional, __func__);
+  }
+}
+
+inline void MozJemalloc::jemalloc_free_excess_dirty_pages(void) {
+  if (malloc_initialized) {
+    gArenas.MayPurgeAll(PurgeIfThreshold, __func__);
+  }
+}
+
+inline arena_t* ArenaCollection::GetById(arena_id_t aArenaId, bool aIsPrivate) {
+  if (!malloc_initialized) {
+    return nullptr;
+  }
+
+#if defined(NON_RANDOM_ARENA_IDS)
+  MOZ_RELEASE_ASSERT(aIsPrivate);
+  // coverity[missing_lock]
+  MOZ_RELEASE_ASSERT(mArenaIdKey);
+  arena_id_t id = (aArenaId << mArenaIdRotation) |
+                  (aArenaId >> (sizeof(void*) * 8 - mArenaIdRotation));
+  arena_t* result = reinterpret_cast<arena_t*>(id ^ mArenaIdKey);
+#else
+  Tree* tree = nullptr;
+  if (aIsPrivate) {
+    if (ArenaIdIsMainThreadOnly(aArenaId)) {
+      MOZ_ASSERT(IsOnMainThread());
+      MOZ_PUSH_IGNORE_THREAD_SAFETY
+      arena_t* result = mMainThreadArenas.Search(aArenaId);
+      MOZ_POP_THREAD_SAFETY
+      MOZ_RELEASE_ASSERT(result);
+      return result;
+    }
+    tree = &mPrivateArenas;
+  } else {
+    tree = &mArenas;
+  }
+
+  MutexAutoLock lock(mLock);
+  arena_t* result = tree->Search(aArenaId);
+#endif
+  MOZ_RELEASE_ASSERT(result);
+  MOZ_RELEASE_ASSERT(result->mId == aArenaId);
+  return result;
+}
+
+inline arena_id_t MozJemalloc::moz_create_arena_with_params(
+    arena_params_t* aParams) {
+  if (malloc_init()) {
+    arena_t* arena = gArenas.CreateArena( true, aParams);
+    return arena->mId;
+  }
+  return 0;
+}
+
+inline void MozJemalloc::moz_dispose_arena(arena_id_t aArenaId) {
+  arena_t* arena = gArenas.GetById(aArenaId,  true);
+  MOZ_RELEASE_ASSERT(arena);
+  gArenas.DisposeArena(arena);
+}
+
+inline void MozJemalloc::moz_set_max_dirty_page_modifier(int32_t aModifier) {
+  if (malloc_init()) {
+    gArenas.SetDefaultMaxDirtyPageModifier(aModifier);
+  }
+}
+
+inline void MozJemalloc::jemalloc_reset_small_alloc_randomization(
+    bool aRandomizeSmall) {
+
+  {
+    AutoLock<StaticMutex> lock(gInitLock);
+    opt_randomize_small = aRandomizeSmall;
+  }
+
+  MutexAutoLock lock(gArenas.mLock);
+  for (auto* arena : gArenas.iter()) {
+    if (!arena->IsMainThreadOnly() || gArenas.IsOnMainThreadWeak()) {
+      arena->ResetSmallAllocRandomization();
+    }
+  }
+}
+
+inline bool MozJemalloc::moz_enable_deferred_purge(bool aEnabled) {
+  return gArenas.SetDeferredPurge(aEnabled);
+}
+
+inline may_purge_now_result_t MozJemalloc::moz_may_purge_now(
+    bool aPeekOnly, uint32_t aReuseGraceMS,
+    const Maybe<std::function<bool()>>& aKeepGoing) {
+  return gArenas.MayPurgeSteps(aPeekOnly, aReuseGraceMS, aKeepGoing);
+}
+
+inline void ArenaCollection::AddToOutstandingPurges(arena_t* aArena) {
+  MOZ_ASSERT(aArena);
+
+  MutexAutoLock lock(mPurgeListLock);
+  if (!mOutstandingPurges.ElementProbablyInList(aArena)) {
+    mOutstandingPurges.pushBack(aArena);
+  }
+}
+
+inline bool ArenaCollection::RemoveFromOutstandingPurges(arena_t* aArena) {
+  MOZ_ASSERT(aArena);
+
+  MutexAutoLock lock(mPurgeListLock);
+  if (mOutstandingPurges.ElementProbablyInList(aArena)) {
+    mOutstandingPurges.remove(aArena);
+    return true;
+  }
+  return false;
+}
+
+may_purge_now_result_t ArenaCollection::MayPurgeSteps(
+    bool aPeekOnly, uint32_t aReuseGraceMS,
+    const Maybe<std::function<bool()>>& aKeepGoing) {
+  MOZ_ASSERT(IsOnMainThreadWeak());
+
+  uint64_t now = GetTimestampNS();
+  uint64_t reuseGraceNS = (uint64_t)aReuseGraceMS * 1000 * 1000;
+  arena_t* found = nullptr;
+  {
+    MutexAutoLock lock(mPurgeListLock);
+    if (mOutstandingPurges.isEmpty()) {
+      return may_purge_now_result_t::Done;
+    }
+    for (arena_t& arena : mOutstandingPurges) {
+      if (now - arena.mLastSignificantReuseNS >= reuseGraceNS) {
+        found = &arena;
+        break;
+      }
+    }
+
+    if (!found) {
+      return may_purge_now_result_t::WantsLater;
+    }
+    if (aPeekOnly) {
+      return may_purge_now_result_t::NeedsMore;
+    }
+
+    mOutstandingPurges.remove(found);
+  }
+
+  ArenaPurgeResult pr =
+      found->PurgeLoop(PurgeIfThreshold, __func__, aReuseGraceMS, aKeepGoing);
+
+  if (pr == ArenaPurgeResult::NotDone) {
+
+    MutexAutoLock lock(mPurgeListLock);
+    if (!mOutstandingPurges.ElementProbablyInList(found)) {
+      mOutstandingPurges.pushFront(found);
+    }
+  } else if (pr == ArenaPurgeResult::Dying) {
+    delete found;
+  }
+
+  return may_purge_now_result_t::NeedsMore;
+}
+
+void ArenaCollection::MayPurgeAll(PurgeCondition aCond, const char* aCaller) {
+  MutexAutoLock lock(mLock);
+  for (auto* arena : iter()) {
+    if (!arena->IsMainThreadOnly() || IsOnMainThreadWeak()) {
+      RemoveFromOutstandingPurges(arena);
+      ArenaPurgeResult pr = arena->PurgeLoop(aCond, aCaller);
+
+      MOZ_RELEASE_ASSERT(pr != ArenaPurgeResult::Dying);
+    }
+  }
+}
+
+#define MALLOC_DECL(name, return_type, ...)                          \
+  inline return_type MozJemalloc::moz_arena_##name(                  \
+      arena_id_t aArenaId, ARGS_HELPER(TYPED_ARGS, ##__VA_ARGS__)) { \
+    BaseAllocator allocator(                                         \
+        gArenas.GetById(aArenaId,  true));          \
+    return allocator.name(ARGS_HELPER(ARGS, ##__VA_ARGS__));         \
+  }
+#define MALLOC_FUNCS MALLOC_FUNCS_MALLOC_BASE
+#include "malloc_decls.h"
+
+static pthread_t gForkingThread;
+
+
+FORK_HOOK
+void _malloc_prefork(void) MOZ_NO_THREAD_SAFETY_ANALYSIS {
+  gArenas.mLock.Lock();
+  gForkingThread = pthread_self();
+
+  for (auto arena : gArenas.iter()) {
+    if (arena->mLock.LockIsEnabled()) {
+      arena->mLock.Lock();
+    }
+  }
+
+  gArenas.mPurgeListLock.Lock();
+
+  sBaseAlloc.mMutex.Lock();
+
+  huge_mtx.Lock();
+}
+
+FORK_HOOK
+void _malloc_postfork_parent(void) MOZ_NO_THREAD_SAFETY_ANALYSIS {
+  huge_mtx.Unlock();
+
+  sBaseAlloc.mMutex.Unlock();
+
+  gArenas.mPurgeListLock.Unlock();
+
+  for (auto arena : gArenas.iter()) {
+    if (arena->mLock.LockIsEnabled()) {
+      arena->mLock.Unlock();
+    }
+  }
+
+  gArenas.mLock.Unlock();
+}
+
+FORK_HOOK
+void _malloc_postfork_child(void) {
+  gArenas.ResetMainThread();
+
+  huge_mtx.Init();
+
+  sBaseAlloc.mMutex.Init();
+
+  gArenas.mPurgeListLock.Init();
+
+  MOZ_PUSH_IGNORE_THREAD_SAFETY
+  for (auto arena : gArenas.iter()) {
+    arena->mLock.Reinit(gForkingThread);
+  }
+  MOZ_POP_THREAD_SAFETY
+
+  gArenas.mLock.Init();
+}
+
+
+#if defined(MOZ_REPLACE_MALLOC)
+#if defined(__GNUC__)
+#    define MOZ_REPLACE_WEAK __attribute__((weak))
+#endif
+
+#  include "replace_malloc.h"
+
+#  define MALLOC_DECL(name, return_type, ...) CanonicalMalloc::name,
+
+static const malloc_table_t gDefaultMallocTable = {
+#  include "malloc_decls.h"
+};
+
+static malloc_table_t gOriginalMallocTable = {
+#  include "malloc_decls.h"
+};
+
+static malloc_table_t gDynamicMallocTable = {
+#  include "malloc_decls.h"
+};
+
+static Atomic<malloc_table_t const*, mozilla::MemoryOrdering::Relaxed>
+    gMallocTablePtr;
+
+#if defined(MOZ_DYNAMIC_REPLACE_INIT)
+#    undef replace_init
+typedef decltype(replace_init_decl) replace_init_impl_t;
+static replace_init_impl_t* replace_init = nullptr;
+#endif
+
+
+static void replace_malloc_init_funcs(malloc_table_t*);
+
+#if defined(MOZ_REPLACE_MALLOC_STATIC)
+extern "C" void logalloc_init(malloc_table_t*, ReplaceMallocBridge**);
+
+extern "C" void dmd_init(malloc_table_t*, ReplaceMallocBridge**);
+#endif
+
+void phc_init(malloc_table_t*, ReplaceMallocBridge**);
+
+bool Equals(const malloc_table_t& aTable1, const malloc_table_t& aTable2) {
+  return memcmp(&aTable1, &aTable2, sizeof(malloc_table_t)) == 0;
+}
+
+static ReplaceMallocBridge* gReplaceMallocBridge = nullptr;
+static void init() {
+  malloc_table_t tempTable = gDefaultMallocTable;
+
+#if defined(MOZ_DYNAMIC_REPLACE_INIT)
+  replace_malloc_handle_t handle = replace_malloc_handle();
+  if (handle) {
+    replace_init = REPLACE_MALLOC_GET_INIT_FUNC(handle);
+  }
+#endif
+
+  gMallocTablePtr = &gDefaultMallocTable;
+
+  if (replace_init) {
+    replace_init(&tempTable, &gReplaceMallocBridge);
+  }
+#if defined(MOZ_REPLACE_MALLOC_STATIC)
+  if (Equals(tempTable, gDefaultMallocTable)) {
+    logalloc_init(&tempTable, &gReplaceMallocBridge);
+  }
+#if defined(MOZ_DMD)
+  if (Equals(tempTable, gDefaultMallocTable)) {
+    dmd_init(&tempTable, &gReplaceMallocBridge);
+  }
+#endif
+#endif
+  if (!Equals(tempTable, gDefaultMallocTable)) {
+    replace_malloc_init_funcs(&tempTable);
+  }
+  gOriginalMallocTable = tempTable;
+  gMallocTablePtr = &gOriginalMallocTable;
+}
+
+MOZ_JEMALLOC_API void jemalloc_replace_dynamic(
+    jemalloc_init_func replace_init_func) {
+  if (replace_init_func) {
+    malloc_table_t tempTable = gOriginalMallocTable;
+    (*replace_init_func)(&tempTable, &gReplaceMallocBridge);
+    if (!Equals(tempTable, gOriginalMallocTable)) {
+      replace_malloc_init_funcs(&tempTable);
+
+      gMallocTablePtr = &gOriginalMallocTable;
+
+      gDynamicMallocTable = tempTable;
+      gMallocTablePtr = &gDynamicMallocTable;
+    }
+  } else {
+    gMallocTablePtr = &gOriginalMallocTable;
+  }
+}
+
+#  define MALLOC_DECL(name, return_type, ...)                           \
+    inline return_type ReplaceMalloc::name(                             \
+        ARGS_HELPER(TYPED_ARGS, ##__VA_ARGS__)) {                       \
+      if (MOZ_UNLIKELY(!gMallocTablePtr)) {                             \
+        init();                                                         \
+      }                                                                 \
+      return (*gMallocTablePtr).name(ARGS_HELPER(ARGS, ##__VA_ARGS__)); \
+    }
+#  include "malloc_decls.h"
+
+MOZ_JEMALLOC_API struct ReplaceMallocBridge* get_bridge(void) {
+  if (MOZ_UNLIKELY(!gMallocTablePtr)) {
+    init();
+  }
+  return gReplaceMallocBridge;
+}
+
+static void replace_malloc_init_funcs(malloc_table_t* table) {
+  if (table->posix_memalign == CanonicalMalloc::posix_memalign &&
+      table->memalign != CanonicalMalloc::memalign) {
+    table->posix_memalign =
+        AlignedAllocator<ReplaceMalloc::memalign>::posix_memalign;
+  }
+  if (table->aligned_alloc == CanonicalMalloc::aligned_alloc &&
+      table->memalign != CanonicalMalloc::memalign) {
+    table->aligned_alloc =
+        AlignedAllocator<ReplaceMalloc::memalign>::aligned_alloc;
+  }
+  if (table->valloc == CanonicalMalloc::valloc &&
+      table->memalign != CanonicalMalloc::memalign) {
+    table->valloc = AlignedAllocator<ReplaceMalloc::memalign>::valloc;
+  }
+  if (table->moz_create_arena_with_params ==
+          CanonicalMalloc::moz_create_arena_with_params &&
+      table->malloc != CanonicalMalloc::malloc) {
+#  define MALLOC_DECL(name, ...) \
+    table->name = DummyArenaAllocator<ReplaceMalloc>::name;
+#  define MALLOC_FUNCS MALLOC_FUNCS_ARENA_BASE
+#  include "malloc_decls.h"
+  }
+  if (table->moz_arena_malloc == CanonicalMalloc::moz_arena_malloc &&
+      table->malloc != CanonicalMalloc::malloc) {
+#  define MALLOC_DECL(name, ...) \
+    table->name = DummyArenaAllocator<ReplaceMalloc>::name;
+#  define MALLOC_FUNCS MALLOC_FUNCS_ARENA_ALLOC
+#  include "malloc_decls.h"
+  }
+}
+
+#endif
+#define GENERIC_MALLOC_DECL2_MINGW(name, name_impl, return_type, ...) \
+  return_type name(ARGS_HELPER(TYPED_ARGS, ##__VA_ARGS__))            \
+      __attribute__((alias(MOZ_STRINGIFY(name_impl))));
+
+#define GENERIC_MALLOC_DECL2(attributes, name, name_impl, return_type, ...)  \
+  return_type name_impl(ARGS_HELPER(TYPED_ARGS, ##__VA_ARGS__)) attributes { \
+    return DefaultMalloc::name(ARGS_HELPER(ARGS, ##__VA_ARGS__));            \
+  }
+
+#if !defined(__MINGW32__)
+#  define GENERIC_MALLOC_DECL(attributes, name, return_type, ...)    \
+    GENERIC_MALLOC_DECL2(attributes, name, name##_impl, return_type, \
+                         ##__VA_ARGS__)
+#else
+#  define GENERIC_MALLOC_DECL(attributes, name, return_type, ...)    \
+    GENERIC_MALLOC_DECL2(attributes, name, name##_impl, return_type, \
+                         ##__VA_ARGS__)                              \
+    GENERIC_MALLOC_DECL2_MINGW(name, name##_impl, return_type, ##__VA_ARGS__)
+#endif
+
+#define NOTHROW_MALLOC_DECL(...) \
+  MOZ_MEMORY_API MACRO_CALL(GENERIC_MALLOC_DECL, (noexcept(true), __VA_ARGS__))
+#define MALLOC_DECL(...) \
+  MOZ_MEMORY_API MACRO_CALL(GENERIC_MALLOC_DECL, (, __VA_ARGS__))
+#define MALLOC_FUNCS MALLOC_FUNCS_MALLOC
+#include "malloc_decls.h"
+
+#undef GENERIC_MALLOC_DECL
+#define GENERIC_MALLOC_DECL(attributes, name, return_type, ...) \
+  GENERIC_MALLOC_DECL2(attributes, name, name, return_type, ##__VA_ARGS__)
+
+#define MALLOC_DECL(...) \
+  MOZ_JEMALLOC_API MACRO_CALL(GENERIC_MALLOC_DECL, (, __VA_ARGS__))
+#define MALLOC_FUNCS (MALLOC_FUNCS_JEMALLOC | MALLOC_FUNCS_ARENA)
+#include "malloc_decls.h"
+
+#if defined(HAVE_DLFCN_H)
+#  include <dlfcn.h>
+#endif
+
+#if defined(__GLIBC__) && !defined(__UCLIBC__)
+
+extern "C" {
+MOZ_EXPORT void (*__free_hook)(void*) = free_impl;
+MOZ_EXPORT void* (*__malloc_hook)(size_t) = malloc_impl;
+MOZ_EXPORT void* (*__realloc_hook)(void*, size_t) = realloc_impl;
+MOZ_EXPORT void* (*__memalign_hook)(size_t, size_t) = memalign_impl;
+}
+
+#elif defined(RTLD_DEEPBIND)
+#  error \
+      "Interposing malloc is unsafe on this system without libc malloc hooks."
+#endif

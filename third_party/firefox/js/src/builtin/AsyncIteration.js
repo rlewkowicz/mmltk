@@ -1,0 +1,507 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+function AsyncIteratorIdentity() {
+  return this;
+}
+
+function AsyncGeneratorNext(val) {
+  assert(
+    IsAsyncGeneratorObject(this),
+    "ThisArgument must be a generator object for async generators"
+  );
+  return resumeGenerator(this, val, "next");
+}
+
+function AsyncGeneratorThrow(val) {
+  assert(
+    IsAsyncGeneratorObject(this),
+    "ThisArgument must be a generator object for async generators"
+  );
+  return resumeGenerator(this, val, "throw");
+}
+
+function AsyncGeneratorReturn(val) {
+  assert(
+    IsAsyncGeneratorObject(this),
+    "ThisArgument must be a generator object for async generators"
+  );
+  return resumeGenerator(this, val, "return");
+}
+
+async function AsyncIteratorClose(iteratorRecord, value) {
+  var iterator = iteratorRecord.iterator;
+  var returnMethod = iterator.return;
+  if (!IsNullOrUndefined(returnMethod)) {
+    var result = await callContentFunction(returnMethod, iterator);
+    if (!IsObject(result)) {
+      ThrowTypeError(JSMSG_OBJECT_REQUIRED, DecompileArg(0, result));
+    }
+  }
+  return value;
+}
+
+function GetIteratorDirect(obj) {
+  if (!IsObject(obj)) {
+    ThrowTypeError(JSMSG_OBJECT_REQUIRED, DecompileArg(0, obj));
+  }
+
+  var nextMethod = obj.next;
+  if (!IsCallable(nextMethod)) {
+    ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(0, nextMethod));
+  }
+
+  return {
+    iterator: obj,
+    nextMethod,
+    done: false,
+  };
+}
+
+function GetAsyncIteratorDirectWrapper(obj) {
+  if (!IsObject(obj)) {
+    ThrowTypeError(JSMSG_OBJECT_REQUIRED, obj);
+  }
+
+  var nextMethod = obj.next;
+  if (!IsCallable(nextMethod)) {
+    ThrowTypeError(JSMSG_NOT_FUNCTION, nextMethod);
+  }
+
+  return {
+    [GetBuiltinSymbol("asyncIterator")]: function AsyncIteratorMethod() {
+      return this;
+    },
+    next(value) {
+      return callContentFunction(nextMethod, obj, value);
+    },
+    async return(value) {
+      var returnMethod = obj.return;
+      if (!IsNullOrUndefined(returnMethod)) {
+        return callContentFunction(returnMethod, obj, value);
+      }
+      return { done: true, value };
+    },
+  };
+}
+
+function AsyncIteratorHelperNext(value) {
+  var O = this;
+  if (!IsObject(O) || (O = GuardToAsyncIteratorHelper(O)) === null) {
+    return callFunction(
+      CallAsyncIteratorHelperMethodIfWrapped,
+      this,
+      value,
+      "AsyncIteratorHelperNext"
+    );
+  }
+  var generator = UnsafeGetReservedSlot(
+    O,
+    ASYNC_ITERATOR_HELPER_GENERATOR_SLOT
+  );
+  return callFunction(IntrinsicAsyncGeneratorNext, generator, value);
+}
+
+function AsyncIteratorHelperReturn(value) {
+  var O = this;
+  if (!IsObject(O) || (O = GuardToAsyncIteratorHelper(O)) === null) {
+    return callFunction(
+      CallAsyncIteratorHelperMethodIfWrapped,
+      this,
+      value,
+      "AsyncIteratorHelperReturn"
+    );
+  }
+  var generator = UnsafeGetReservedSlot(
+    O,
+    ASYNC_ITERATOR_HELPER_GENERATOR_SLOT
+  );
+  return callFunction(IntrinsicAsyncGeneratorReturn, generator, value);
+}
+
+function AsyncIteratorHelperThrow(value) {
+  var O = this;
+  if (!IsObject(O) || (O = GuardToAsyncIteratorHelper(O)) === null) {
+    return callFunction(
+      CallAsyncIteratorHelperMethodIfWrapped,
+      this,
+      value,
+      "AsyncIteratorHelperThrow"
+    );
+  }
+  var generator = UnsafeGetReservedSlot(
+    O,
+    ASYNC_ITERATOR_HELPER_GENERATOR_SLOT
+  );
+  return callFunction(IntrinsicAsyncGeneratorThrow, generator, value);
+}
+
+
+function AsyncIteratorMap(mapper) {
+  var iterated = GetIteratorDirect(this);
+
+  if (!IsCallable(mapper)) {
+    ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(0, mapper));
+  }
+
+  var iteratorHelper = NewAsyncIteratorHelper();
+  var generator = AsyncIteratorMapGenerator(iterated, mapper);
+  callFunction(IntrinsicAsyncGeneratorNext, generator);
+  UnsafeSetReservedSlot(
+    iteratorHelper,
+    ASYNC_ITERATOR_HELPER_GENERATOR_SLOT,
+    generator
+  );
+  return iteratorHelper;
+}
+
+async function* AsyncIteratorMapGenerator(iterated, mapper) {
+  var lastValue;
+  var needClose = true;
+  try {
+    yield;
+    needClose = false;
+
+    for (
+      var next = await IteratorNext(iterated, lastValue);
+      !next.done;
+      next = await IteratorNext(iterated, lastValue)
+    ) {
+      var value = next.value;
+
+      needClose = true;
+      lastValue = yield callContentFunction(mapper, undefined, value);
+      needClose = false;
+    }
+  } finally {
+    if (needClose) {
+      AsyncIteratorClose(iterated);
+    }
+  }
+}
+
+function AsyncIteratorFilter(filterer) {
+  var iterated = GetIteratorDirect(this);
+
+  if (!IsCallable(filterer)) {
+    ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(0, filterer));
+  }
+
+  var iteratorHelper = NewAsyncIteratorHelper();
+  var generator = AsyncIteratorFilterGenerator(iterated, filterer);
+  callFunction(IntrinsicAsyncGeneratorNext, generator);
+  UnsafeSetReservedSlot(
+    iteratorHelper,
+    ASYNC_ITERATOR_HELPER_GENERATOR_SLOT,
+    generator
+  );
+  return iteratorHelper;
+}
+
+async function* AsyncIteratorFilterGenerator(iterated, filterer) {
+  var lastValue;
+  var needClose = true;
+  try {
+    yield;
+    needClose = false;
+
+    for (
+      var next = await IteratorNext(iterated, lastValue);
+      !next.done;
+      next = await IteratorNext(iterated, lastValue)
+    ) {
+      var value = next.value;
+
+      needClose = true;
+      if (await callContentFunction(filterer, undefined, value)) {
+        lastValue = yield value;
+      }
+      needClose = false;
+    }
+  } finally {
+    if (needClose) {
+      AsyncIteratorClose(iterated);
+    }
+  }
+}
+
+function AsyncIteratorTake(limit) {
+  var iterated = GetIteratorDirect(this);
+
+  var remaining = ToInteger(limit);
+  if (remaining < 0) {
+    ThrowRangeError(JSMSG_NEGATIVE_LIMIT);
+  }
+
+  var iteratorHelper = NewAsyncIteratorHelper();
+  var generator = AsyncIteratorTakeGenerator(iterated, remaining);
+  callFunction(IntrinsicAsyncGeneratorNext, generator);
+  UnsafeSetReservedSlot(
+    iteratorHelper,
+    ASYNC_ITERATOR_HELPER_GENERATOR_SLOT,
+    generator
+  );
+  return iteratorHelper;
+}
+
+async function* AsyncIteratorTakeGenerator(iterated, remaining) {
+  var lastValue;
+  var needClose = true;
+  try {
+    yield;
+    needClose = false;
+
+    for (; remaining > 0; remaining--) {
+      var next = await IteratorNext(iterated, lastValue);
+      if (next.done) {
+        return undefined;
+      }
+
+      var value = next.value;
+
+      needClose = true;
+      lastValue = yield value;
+      needClose = false;
+    }
+  } finally {
+    if (needClose) {
+      AsyncIteratorClose(iterated, undefined);
+    }
+  }
+
+  return AsyncIteratorClose(iterated, undefined);
+}
+
+function AsyncIteratorDrop(limit) {
+  var iterated = GetIteratorDirect(this);
+
+  var remaining = ToInteger(limit);
+  if (remaining < 0) {
+    ThrowRangeError(JSMSG_NEGATIVE_LIMIT);
+  }
+
+  var iteratorHelper = NewAsyncIteratorHelper();
+  var generator = AsyncIteratorDropGenerator(iterated, remaining);
+  callFunction(IntrinsicAsyncGeneratorNext, generator);
+  UnsafeSetReservedSlot(
+    iteratorHelper,
+    ASYNC_ITERATOR_HELPER_GENERATOR_SLOT,
+    generator
+  );
+  return iteratorHelper;
+}
+
+async function* AsyncIteratorDropGenerator(iterated, remaining) {
+  var needClose = true;
+  try {
+    yield;
+    needClose = false;
+
+    for (; remaining > 0; remaining--) {
+      var next = await IteratorNext(iterated);
+      if (next.done) {
+        return;
+      }
+    }
+
+    var lastValue;
+    for (
+      var next = await IteratorNext(iterated, lastValue);
+      !next.done;
+      next = await IteratorNext(iterated, lastValue)
+    ) {
+      var value = next.value;
+
+      needClose = true;
+      lastValue = yield value;
+      needClose = false;
+    }
+  } finally {
+    if (needClose) {
+      AsyncIteratorClose(iterated);
+    }
+  }
+}
+
+function AsyncIteratorAsIndexedPairs() {
+  var iterated = GetIteratorDirect(this);
+
+  var iteratorHelper = NewAsyncIteratorHelper();
+  var generator = AsyncIteratorAsIndexedPairsGenerator(iterated);
+  callFunction(IntrinsicAsyncGeneratorNext, generator);
+  UnsafeSetReservedSlot(
+    iteratorHelper,
+    ASYNC_ITERATOR_HELPER_GENERATOR_SLOT,
+    generator
+  );
+  return iteratorHelper;
+}
+
+async function* AsyncIteratorAsIndexedPairsGenerator(iterated) {
+  var needClose = true;
+  try {
+    yield;
+    needClose = false;
+
+    var lastValue;
+    for (
+      var next = await IteratorNext(iterated, lastValue), index = 0;
+      !next.done;
+      next = await IteratorNext(iterated, lastValue), index++
+    ) {
+      var value = next.value;
+
+      needClose = true;
+      lastValue = yield [index, value];
+      needClose = false;
+    }
+  } finally {
+    if (needClose) {
+      AsyncIteratorClose(iterated);
+    }
+  }
+}
+
+function AsyncIteratorFlatMap(mapper) {
+  var iterated = GetIteratorDirect(this);
+
+  if (!IsCallable(mapper)) {
+    ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(0, mapper));
+  }
+
+  var iteratorHelper = NewAsyncIteratorHelper();
+  var generator = AsyncIteratorFlatMapGenerator(iterated, mapper);
+  callFunction(IntrinsicAsyncGeneratorNext, generator);
+  UnsafeSetReservedSlot(
+    iteratorHelper,
+    ASYNC_ITERATOR_HELPER_GENERATOR_SLOT,
+    generator
+  );
+  return iteratorHelper;
+}
+
+async function* AsyncIteratorFlatMapGenerator(iterated, mapper) {
+  var needClose = true;
+  try {
+    yield;
+    needClose = false;
+
+    for (
+      var next = await IteratorNext(iterated);
+      !next.done;
+      next = await IteratorNext(iterated)
+    ) {
+      var value = next.value;
+
+      needClose = true;
+      var mapped = await callContentFunction(mapper, undefined, value);
+      for await (var innerValue of allowContentIter(mapped)) {
+        yield innerValue;
+      }
+      needClose = false;
+    }
+  } finally {
+    if (needClose) {
+      AsyncIteratorClose(iterated);
+    }
+  }
+}
+
+async function AsyncIteratorReduce(reducer ) {
+  var iterated = GetAsyncIteratorDirectWrapper(this);
+
+  if (!IsCallable(reducer)) {
+    ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(0, reducer));
+  }
+
+  var accumulator;
+  if (ArgumentsLength() === 1) {
+    var next = await callContentFunction(iterated.next, iterated);
+    if (!IsObject(next)) {
+      ThrowTypeError(JSMSG_OBJECT_REQUIRED, DecompileArg(0, next));
+    }
+    if (next.done) {
+      ThrowTypeError(JSMSG_EMPTY_ITERATOR_REDUCE);
+    }
+    accumulator = next.value;
+  } else {
+    accumulator = GetArgument(1);
+  }
+
+  for await (var value of allowContentIter(iterated)) {
+    accumulator = await callContentFunction(
+      reducer,
+      undefined,
+      accumulator,
+      value
+    );
+  }
+  return accumulator;
+}
+
+async function AsyncIteratorToArray() {
+  var iterated = { [GetBuiltinSymbol("asyncIterator")]: () => this };
+  var items = [];
+  var index = 0;
+  for await (var value of allowContentIter(iterated)) {
+    DefineDataProperty(items, index++, value);
+  }
+  return items;
+}
+
+async function AsyncIteratorForEach(fn) {
+  var iterated = GetAsyncIteratorDirectWrapper(this);
+
+  if (!IsCallable(fn)) {
+    ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(0, fn));
+  }
+
+  for await (var value of allowContentIter(iterated)) {
+    await callContentFunction(fn, undefined, value);
+  }
+}
+
+async function AsyncIteratorSome(fn) {
+  var iterated = GetAsyncIteratorDirectWrapper(this);
+
+  if (!IsCallable(fn)) {
+    ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(0, fn));
+  }
+
+  for await (var value of allowContentIter(iterated)) {
+    if (await callContentFunction(fn, undefined, value)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function AsyncIteratorEvery(fn) {
+  var iterated = GetAsyncIteratorDirectWrapper(this);
+
+  if (!IsCallable(fn)) {
+    ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(0, fn));
+  }
+
+  for await (var value of allowContentIter(iterated)) {
+    if (!(await callContentFunction(fn, undefined, value))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+async function AsyncIteratorFind(fn) {
+  var iterated = GetAsyncIteratorDirectWrapper(this);
+
+  if (!IsCallable(fn)) {
+    ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(0, fn));
+  }
+
+  for await (var value of allowContentIter(iterated)) {
+    if (await callContentFunction(fn, undefined, value)) {
+      return value;
+    }
+  }
+}

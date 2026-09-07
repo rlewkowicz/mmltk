@@ -1,0 +1,95 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_Keyframe_h
+#define mozilla_dom_Keyframe_h
+
+#include "mozilla/CSSPropertyId.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/ServoStyleConsts.h"
+#include "mozilla/dom/BaseKeyframeTypesBinding.h"  // CompositeOperationOrAuto
+#include "nsTArray.h"
+
+namespace mozilla {
+struct StyleLockedDeclarationBlock;
+
+struct PropertyValuePair {
+  explicit PropertyValuePair(const CSSPropertyId& aProperty)
+      : mProperty(aProperty) {}
+
+  PropertyValuePair(const CSSPropertyId& aProperty,
+                    RefPtr<StyleLockedDeclarationBlock>&& aValue)
+      : mProperty(aProperty), mServoDeclarationBlock(std::move(aValue)) {
+    MOZ_ASSERT(mServoDeclarationBlock, "Should be valid property value");
+  }
+
+  CSSPropertyId mProperty;
+
+  RefPtr<StyleLockedDeclarationBlock> mServoDeclarationBlock;
+
+#ifdef DEBUG
+  bool mSimulateComputeValuesFailure = false;
+#endif
+
+  bool operator==(const PropertyValuePair&) const;
+};
+
+struct KeyframesOffsetHasAny {
+  bool mRangeOffset = false;
+  bool mNonRangeOffset = false;
+};
+
+struct Keyframe {
+  Keyframe() = default;
+  Keyframe(const Keyframe& aOther) = default;
+  Keyframe(Keyframe&& aOther) = default;
+
+  Keyframe& operator=(const Keyframe& aOther) = default;
+  Keyframe& operator=(Keyframe&& aOther) = default;
+
+  static bool ComputedOffsetsAreDifferent(const double aFirst,
+                                          const double aSecond) {
+    return aFirst != aSecond && !(std::isnan(aFirst) && std::isnan(aSecond));
+  }
+
+  bool IsRangedKeyframe() const {
+    return mOffset && mOffset->IsTimelineRangeOffset();
+  }
+
+  struct OffsetType {
+    StyleTimelineRangeName mRangeName = StyleTimelineRangeName::None;
+    double mPercentage = 0.0;
+
+    static OffsetType PercentageOffset(const double aPercentage) {
+      return {StyleTimelineRangeName::None, aPercentage};
+    }
+
+    bool IsPercentageOffset() const {
+      MOZ_ASSERT(mRangeName != StyleTimelineRangeName::Normal);
+      return mRangeName == StyleTimelineRangeName::None;
+    }
+    bool IsTimelineRangeOffset() const {
+      MOZ_ASSERT(mRangeName != StyleTimelineRangeName::Normal);
+      return mRangeName != StyleTimelineRangeName::None;
+    }
+
+    bool operator==(const OffsetType& aOther) const {
+      return mRangeName == aOther.mRangeName &&
+             mPercentage == aOther.mPercentage;
+    }
+  };
+  Maybe<OffsetType> mOffset;
+  double mComputedOffset = std::numeric_limits<double>::quiet_NaN();
+  Maybe<StyleComputedTimingFunction> mTimingFunction;  
+  dom::CompositeOperationOrAuto mComposite =
+      dom::CompositeOperationOrAuto::Auto;
+  CopyableTArray<PropertyValuePair> mPropertyValues;
+
+  bool mIsGenerated = false;
+};
+
+}  
+
+#endif  // mozilla_dom_Keyframe_h

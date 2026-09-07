@@ -1,0 +1,58 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_SIMD_h
+#define mozilla_SIMD_h
+
+#include "mozilla/Types.h"
+#include <cstdint>
+
+namespace mozilla {
+class SIMD {
+ public:
+  static const void* memchr(const void* ptr, int value, size_t num) {
+    return memchr8(reinterpret_cast<const char*>(ptr), static_cast<char>(value),
+                   num);
+  }
+
+  static MFBT_API const char* memchr8(const char* ptr, char value,
+                                      size_t length);
+
+  static MFBT_API const char* memchr8SSE2(const char* ptr, char value,
+                                          size_t length);
+
+  static MFBT_API const char* memchr8AVX2(const char* ptr, char value,
+                                          size_t length);
+
+  static MFBT_API const char16_t* memchr16(const char16_t* ptr, char16_t value,
+                                           size_t length);
+
+  static MFBT_API const char16_t* memchr16SSE2(const char16_t* ptr,
+                                               char16_t value, size_t length);
+
+  static MFBT_API const char16_t* memchr16AVX2(const char16_t* ptr,
+                                               char16_t value, size_t length);
+
+  static MFBT_API const uint32_t* memchr32(const uint32_t* ptr, uint32_t value,
+                                           size_t length);
+
+  static MFBT_API const uint32_t* memchr32AVX2(const uint32_t* ptr,
+                                               uint32_t value, size_t length);
+
+  static MFBT_API const uint64_t* memchr64(const uint64_t* ptr, uint64_t value,
+                                           size_t length);
+
+  static MFBT_API const uint64_t* memchr64AVX2(const uint64_t* ptr,
+                                               uint64_t value, size_t length);
+
+  static MFBT_API const char* memchr2x8(const char* ptr, char v1, char v2,
+                                        size_t length);
+
+  static MFBT_API const char16_t* memchr2x16(const char16_t* ptr, char16_t v1,
+                                             char16_t v2, size_t length);
+};
+
+}  
+
+#endif  // mozilla_SIMD_h

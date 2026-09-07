@@ -1,0 +1,10 @@
+
+[package]
+name = "runloop"
+version = "0.1.0"
+authors = ["Tim Taubert <tim@timtaubert.de>"]
+description = "Cancelable non-blocking polling threads (with optional timeouts)."
+homepage = "https://github.com/ttaubert/rust-runloop/"
+keywords = ["runloop", "threads"]
+license = "MPL-2.0"
+repository = "https://github.com/ttaubert/rust-runloop/"

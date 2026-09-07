@@ -1,0 +1,50 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef GTK_NSNATIVETHEMEGTK_H_
+#define GTK_NSNATIVETHEMEGTK_H_
+
+#include "Theme.h"
+
+class nsNativeThemeGTK final : public mozilla::widget::Theme {
+  using Theme = mozilla::widget::Theme;
+
+ public:
+  void DrawWidgetBackground(gfxContext*, nsIFrame*, StyleAppearance,
+                            const nsRect& aRect, const nsRect& aDirtyRect,
+                            DrawOverflow) override;
+
+  bool CreateWebRenderCommandsForWidget(
+      mozilla::wr::DisplayListBuilder&, mozilla::wr::IpcResourceUpdateQueue&,
+      const mozilla::layers::StackingContextHelper&,
+      mozilla::layers::RenderRootStateManager*, nsIFrame*, StyleAppearance,
+      const nsRect&) override;
+
+  [[nodiscard]] LayoutDeviceIntMargin GetWidgetBorder(nsDeviceContext*,
+                                                      nsIFrame*,
+                                                      StyleAppearance) override;
+
+  bool GetWidgetPadding(nsDeviceContext*, nsIFrame*, StyleAppearance,
+                        LayoutDeviceIntMargin*) override;
+  bool GetWidgetOverflow(nsDeviceContext*, nsIFrame*, StyleAppearance,
+                         nsRect*) override;
+
+  enum class NonNative { No, Always, BecauseColorMismatch };
+  static bool IsWidgetAlwaysNonNative(nsIFrame*, StyleAppearance);
+  NonNative IsWidgetNonNative(nsIFrame*, StyleAppearance);
+
+  mozilla::LayoutDeviceIntSize GetMinimumWidgetSize(nsPresContext*, nsIFrame*,
+                                                    StyleAppearance) override;
+
+  bool ThemeSupportsWidget(nsPresContext*, nsIFrame*, StyleAppearance) override;
+  bool ThemeDrawsFocusForWidget(nsIFrame*, StyleAppearance) override;
+  Transparency GetWidgetTransparency(nsIFrame*, StyleAppearance) override;
+
+  nsNativeThemeGTK();
+
+ protected:
+  virtual ~nsNativeThemeGTK();
+};
+
+#endif

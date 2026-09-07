@@ -1,0 +1,105 @@
+/*
+ * Copyright (c) 2018, Alliance for Open Media. All rights reserved.
+ *
+ * This source code is subject to the terms of the BSD 2 Clause License and
+ * the Alliance for Open Media Patent License 1.0. If the BSD 2 Clause License
+ * was not distributed with this source code in the LICENSE file, you can
+ * obtain it at www.aomedia.org/license/software. If the Alliance for Open
+ * Media Patent License 1.0 was not distributed with this source code in the
+ * PATENTS file, you can obtain it at www.aomedia.org/license/patent.
+ */
+
+#include <stdlib.h>
+#include <memory.h>
+#include <math.h>
+#include <assert.h>
+
+#include <smmintrin.h>
+
+#include "config/aom_dsp_rtcd.h"
+
+#include "aom_ports/mem.h"
+#include "aom_dsp/flow_estimation/corner_match.h"
+
+DECLARE_ALIGNED(16, static const uint16_t, ones_array[8]) = { 1, 1, 1, 1,
+                                                              1, 1, 1, 1 };
+
+#if MATCH_SZ != 16
+#error "Need to apply pixel mask in corner_match_sse4.c if MATCH_SZ != 16"
+#endif
+
+bool aom_compute_mean_stddev_sse4_1(const unsigned char *frame, int stride,
+                                    int x, int y, double *mean,
+                                    double *one_over_stddev) {
+  __m128i sum_vec = _mm_setzero_si128();
+
+  __m128i sumsq_vec_l = _mm_setzero_si128();
+  __m128i sumsq_vec_r = _mm_setzero_si128();
+
+  frame += (y - MATCH_SZ_BY2) * stride + (x - MATCH_SZ_BY2);
+
+  for (int i = 0; i < MATCH_SZ; ++i) {
+    const __m128i v = _mm_loadu_si128((__m128i *)frame);
+    const __m128i v_l = _mm_cvtepu8_epi16(v);
+    const __m128i v_r = _mm_cvtepu8_epi16(_mm_srli_si128(v, 8));
+
+    sum_vec = _mm_add_epi16(sum_vec, _mm_add_epi16(v_l, v_r));
+    sumsq_vec_l = _mm_add_epi32(sumsq_vec_l, _mm_madd_epi16(v_l, v_l));
+    sumsq_vec_r = _mm_add_epi32(sumsq_vec_r, _mm_madd_epi16(v_r, v_r));
+
+    frame += stride;
+  }
+
+  const __m128i ones = _mm_load_si128((__m128i *)ones_array);
+  const __m128i partial_sum = _mm_madd_epi16(sum_vec, ones);
+  const __m128i partial_sumsq = _mm_add_epi32(sumsq_vec_l, sumsq_vec_r);
+  const __m128i tmp = _mm_hadd_epi32(partial_sum, partial_sumsq);
+  const int sum = _mm_extract_epi32(tmp, 0) + _mm_extract_epi32(tmp, 1);
+  const int sumsq = _mm_extract_epi32(tmp, 2) + _mm_extract_epi32(tmp, 3);
+
+  *mean = (double)sum / MATCH_SZ;
+  const double variance = sumsq - (*mean) * (*mean);
+  if (variance < MIN_FEATURE_VARIANCE) {
+    *one_over_stddev = 0.0;
+    return false;
+  }
+  *one_over_stddev = 1.0 / sqrt(variance);
+  return true;
+}
+
+double aom_compute_correlation_sse4_1(const unsigned char *frame1, int stride1,
+                                      int x1, int y1, double mean1,
+                                      double one_over_stddev1,
+                                      const unsigned char *frame2, int stride2,
+                                      int x2, int y2, double mean2,
+                                      double one_over_stddev2) {
+  __m128i cross_vec_l = _mm_setzero_si128();
+  __m128i cross_vec_r = _mm_setzero_si128();
+
+  frame1 += (y1 - MATCH_SZ_BY2) * stride1 + (x1 - MATCH_SZ_BY2);
+  frame2 += (y2 - MATCH_SZ_BY2) * stride2 + (x2 - MATCH_SZ_BY2);
+
+  for (int i = 0; i < MATCH_SZ; ++i) {
+    const __m128i v1 = _mm_loadu_si128((__m128i *)frame1);
+    const __m128i v2 = _mm_loadu_si128((__m128i *)frame2);
+
+    const __m128i v1_l = _mm_cvtepu8_epi16(v1);
+    const __m128i v1_r = _mm_cvtepu8_epi16(_mm_srli_si128(v1, 8));
+    const __m128i v2_l = _mm_cvtepu8_epi16(v2);
+    const __m128i v2_r = _mm_cvtepu8_epi16(_mm_srli_si128(v2, 8));
+
+    cross_vec_l = _mm_add_epi32(cross_vec_l, _mm_madd_epi16(v1_l, v2_l));
+    cross_vec_r = _mm_add_epi32(cross_vec_r, _mm_madd_epi16(v1_r, v2_r));
+
+    frame1 += stride1;
+    frame2 += stride2;
+  }
+
+  const __m128i tmp = _mm_add_epi32(cross_vec_l, cross_vec_r);
+  const int cross = _mm_extract_epi32(tmp, 0) + _mm_extract_epi32(tmp, 1) +
+                    _mm_extract_epi32(tmp, 2) + _mm_extract_epi32(tmp, 3);
+
+  const double covariance = cross - mean1 * mean2;
+  const double correlation = covariance * (one_over_stddev1 * one_over_stddev2);
+  return correlation;
+}

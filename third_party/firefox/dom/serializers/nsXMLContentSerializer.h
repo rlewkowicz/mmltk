@@ -1,0 +1,275 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsXMLContentSerializer_h_
+#define nsXMLContentSerializer_h_
+
+#include "mozilla/Attributes.h"
+#include "nsCOMPtr.h"
+#include "nsIContentSerializer.h"
+#include "nsISupportsUtils.h"
+#include "nsString.h"
+#include "nsTArray.h"
+
+#define kIndentStr u"  "_ns
+#define kEndTag u"</"_ns
+
+class nsAtom;
+class nsINode;
+
+namespace mozilla {
+class Encoding;
+}
+
+class nsXMLContentSerializer : public nsIContentSerializer {
+ public:
+  nsXMLContentSerializer();
+
+  NS_DECL_ISUPPORTS
+
+  NS_IMETHOD Init(uint32_t flags, uint32_t aWrapColumn,
+                  const mozilla::Encoding* aEncoding, bool aIsCopying,
+                  bool aRewriteEncodingDeclaration,
+                  bool* aNeedsPreformatScanning, nsAString& aOutput) override;
+
+  NS_IMETHOD AppendText(mozilla::dom::Text* aText, int32_t aStartOffset,
+                        int32_t aEndOffset) override;
+
+  NS_IMETHOD AppendCDATASection(mozilla::dom::Text* aCDATASection,
+                                int32_t aStartOffset,
+                                int32_t aEndOffset) override;
+
+  NS_IMETHOD AppendProcessingInstruction(
+      mozilla::dom::ProcessingInstruction* aPI, int32_t aStartOffset,
+      int32_t aEndOffset) override;
+
+  NS_IMETHOD AppendComment(mozilla::dom::Comment* aComment,
+                           int32_t aStartOffset, int32_t aEndOffset) override;
+
+  NS_IMETHOD AppendDoctype(mozilla::dom::DocumentType* aDoctype) override;
+
+  NS_IMETHOD AppendElementStart(
+      mozilla::dom::Element* aElement,
+      mozilla::dom::Element* aOriginalElement) override;
+
+  NS_IMETHOD AppendElementEnd(mozilla::dom::Element* aElement,
+                              mozilla::dom::Element* aOriginalElement) override;
+
+  NS_IMETHOD FlushAndFinish() override { return NS_OK; }
+
+  NS_IMETHOD Finish() override;
+
+  NS_IMETHOD GetOutputLength(uint32_t& aLength) const override;
+
+  NS_IMETHOD AppendDocumentStart(mozilla::dom::Document* aDocument) override;
+
+  NS_IMETHOD ScanElementForPreformat(mozilla::dom::Element* aElement) override {
+    return NS_OK;
+  }
+  NS_IMETHOD ForgetElementForPreformat(
+      mozilla::dom::Element* aElement) override {
+    return NS_OK;
+  }
+
+ protected:
+  virtual ~nsXMLContentSerializer();
+
+  [[nodiscard]] bool AppendToString(const char16_t aChar,
+                                    nsAString& aOutputStr);
+
+  [[nodiscard]] bool AppendToString(const nsAString& aStr,
+                                    nsAString& aOutputStr);
+
+  [[nodiscard]] bool AppendToStringConvertLF(const nsAString& aStr,
+                                             nsAString& aOutputStr);
+
+  [[nodiscard]] bool AppendToStringWrapped(const nsAString& aStr,
+                                           nsAString& aOutputStr);
+
+  [[nodiscard]] bool AppendToStringFormatedWrapped(const nsAString& aStr,
+                                                   nsAString& aOutputStr);
+
+  [[nodiscard]] bool AppendWrapped_WhitespaceSequence(
+      nsAString::const_char_iterator& aPos,
+      const nsAString::const_char_iterator aEnd,
+      const nsAString::const_char_iterator aSequenceStart,
+      nsAString& aOutputStr);
+
+  [[nodiscard]] bool AppendFormatedWrapped_WhitespaceSequence(
+      nsAString::const_char_iterator& aPos,
+      const nsAString::const_char_iterator aEnd,
+      const nsAString::const_char_iterator aSequenceStart,
+      bool& aMayIgnoreStartOfLineWhitespaceSequence, nsAString& aOutputStr);
+
+  [[nodiscard]] bool AppendWrapped_NonWhitespaceSequence(
+      nsAString::const_char_iterator& aPos,
+      const nsAString::const_char_iterator aEnd,
+      const nsAString::const_char_iterator aSequenceStart,
+      bool& aMayIgnoreStartOfLineWhitespaceSequence,
+      bool& aSequenceStartAfterAWhiteSpace, nsAString& aOutputStr);
+
+  [[nodiscard]] bool AppendNewLineToString(nsAString& aOutputStr);
+
+  [[nodiscard]] virtual bool AppendAndTranslateEntities(const nsAString& aStr,
+                                                        nsAString& aOutputStr);
+
+ private:
+  [[nodiscard]] static bool AppendAndTranslateEntities(
+      const nsAString& aStr, nsAString& aOutputStr,
+      const uint8_t aEntityTable[], uint16_t aMaxTableIndex,
+      const char* const aStringTable[]);
+
+ protected:
+  template <uint16_t LargestIndex, uint16_t TableLength>
+  [[nodiscard]] bool AppendAndTranslateEntities(
+      const nsAString& aStr, nsAString& aOutputStr,
+      const uint8_t (&aEntityTable)[TableLength],
+      const char* const aStringTable[]) {
+    static_assert(LargestIndex < TableLength,
+                  "Largest allowed index must be smaller than table length");
+    return AppendAndTranslateEntities(aStr, aOutputStr, aEntityTable,
+                                      LargestIndex, aStringTable);
+  }
+
+  static const uint16_t kGTVal = 62;
+
+  nsresult AppendTextData(mozilla::dom::Text* aText, int32_t aStartOffset,
+                          int32_t aEndOffset, nsAString& aStr,
+                          bool aTranslateEntities);
+
+  virtual nsresult PushNameSpaceDecl(const nsAString& aPrefix,
+                                     const nsAString& aURI, nsIContent* aOwner);
+  void PopNameSpaceDeclsFor(nsIContent* aOwner);
+
+  bool ConfirmPrefix(nsAString& aPrefix, const nsAString& aURI,
+                     nsIContent* aElement, bool aIsAttribute);
+  void GenerateNewPrefix(nsAString& aPrefix);
+
+  uint32_t ScanNamespaceDeclarations(mozilla::dom::Element* aContent,
+                                     mozilla::dom::Element* aOriginalElement,
+                                     const nsAString& aTagNamespaceURI);
+
+  [[nodiscard]] virtual bool SerializeAttributes(
+      mozilla::dom::Element* aContent, mozilla::dom::Element* aOriginalElement,
+      nsAString& aTagPrefix, const nsAString& aTagNamespaceURI,
+      nsAtom* aTagName, nsAString& aStr, uint32_t aSkipAttr, bool aAddNSAttr);
+
+  [[nodiscard]] bool SerializeAttr(const nsAString& aPrefix,
+                                   const nsAString& aName,
+                                   const nsAString& aValue, nsAString& aStr,
+                                   bool aDoEscapeEntities);
+
+  bool IsJavaScript(nsIContent* aContent, nsAtom* aAttrNameAtom,
+                    int32_t aAttrNamespaceID, const nsAString& aValueString);
+
+  virtual bool CheckElementStart(mozilla::dom::Element* aElement,
+                                 bool& aForceFormat, nsAString& aStr,
+                                 nsresult& aResult);
+
+  [[nodiscard]] bool AppendEndOfElementStart(
+      mozilla::dom::Element* aEleemnt, mozilla::dom::Element* aOriginalElement,
+      nsAString& aStr);
+
+  [[nodiscard]] virtual bool AfterElementStart(nsIContent* aContent,
+                                               nsIContent* aOriginalElement,
+                                               nsAString& aStr) {
+    return true;
+  };
+
+  virtual bool CheckElementEnd(mozilla::dom::Element* aElement,
+                               mozilla::dom::Element* aOriginalElement,
+                               bool& aForceFormat, nsAString& aStr);
+
+  virtual void AfterElementEnd(nsIContent* aContent, nsAString& aStr) {};
+
+  virtual bool LineBreakBeforeOpen(int32_t aNamespaceID, nsAtom* aName);
+
+  virtual bool LineBreakAfterOpen(int32_t aNamespaceID, nsAtom* aName);
+
+  virtual bool LineBreakBeforeClose(int32_t aNamespaceID, nsAtom* aName);
+
+  virtual bool LineBreakAfterClose(int32_t aNamespaceID, nsAtom* aName);
+
+  [[nodiscard]] bool AppendIndentation(nsAString& aStr);
+
+  [[nodiscard]] bool IncrIndentation(nsAtom* aName);
+  void DecrIndentation(nsAtom* aName);
+
+  [[nodiscard]] bool MaybeAddNewlineForRootNode(nsAString& aStr);
+  void MaybeFlagNewlineForRootNode(nsINode* aNode);
+
+  virtual void MaybeEnterInPreContent(nsIContent* aNode);
+  virtual void MaybeLeaveFromPreContent(nsIContent* aNode);
+
+  bool ShouldMaintainPreLevel() const;
+  int32_t PreLevel() const {
+    MOZ_ASSERT(ShouldMaintainPreLevel());
+    return mPreLevel;
+  }
+  int32_t& PreLevel() {
+    MOZ_ASSERT(ShouldMaintainPreLevel());
+    return mPreLevel;
+  }
+
+  bool MaybeSerializeIsValue(mozilla::dom::Element* aElement, nsAString& aStr);
+
+  int32_t mPrefixIndex;
+
+  struct NameSpaceDecl {
+    nsString mPrefix;
+    nsString mURI;
+    nsIContent* mOwner;
+  };
+
+  nsTArray<NameSpaceDecl> mNameSpaceStack;
+
+  MOZ_INIT_OUTSIDE_CTOR uint32_t mFlags;
+
+  nsString mLineBreak;
+
+  nsCString mCharset;
+
+  uint32_t mColPos;
+
+  MOZ_INIT_OUTSIDE_CTOR bool mDoFormat;
+
+  MOZ_INIT_OUTSIDE_CTOR bool mDoRaw;
+
+  MOZ_INIT_OUTSIDE_CTOR bool mDoWrap;
+
+  MOZ_INIT_OUTSIDE_CTOR bool mAllowLineBreaking;
+
+  MOZ_INIT_OUTSIDE_CTOR uint32_t mMaxColumn;
+
+  nsString mIndent;
+
+  int32_t mIndentOverflow;
+
+  bool mIsIndentationAddedOnCurrentLine;
+
+  bool mInAttribute;
+
+  bool mAddNewlineForRootNode;
+
+  bool mAddSpace;
+
+  bool mMayIgnoreLineBreakSequence;
+
+  bool mBodyOnly;
+  int32_t mInBody;
+
+  nsAString* mOutput;
+
+ private:
+  MOZ_INIT_OUTSIDE_CTOR int32_t mPreLevel;
+
+  static const uint8_t kEntities[];
+  static const uint8_t kAttrEntities[];
+  static const char* const kEntityStrings[];
+};
+
+nsresult NS_NewXMLContentSerializer(nsIContentSerializer** aSerializer);
+
+#endif

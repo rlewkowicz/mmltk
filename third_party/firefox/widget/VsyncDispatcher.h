@@ -1,0 +1,102 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_widget_VsyncDispatcher_h
+#define mozilla_widget_VsyncDispatcher_h
+
+#include "mozilla/DataMutex.h"
+#include "mozilla/TimeStamp.h"
+#include "nsISupportsImpl.h"
+#include "nsTArray.h"
+#include "mozilla/RefPtr.h"
+#include "VsyncSource.h"
+
+namespace mozilla {
+
+class VsyncObserver {
+  NS_INLINE_DECL_PURE_VIRTUAL_REFCOUNTING
+
+ public:
+  virtual void NotifyVsync(const VsyncEvent& aVsync) = 0;
+
+ protected:
+  VsyncObserver() = default;
+  virtual ~VsyncObserver() = default;
+};  
+
+class VsyncDispatcher;
+
+class CompositorVsyncDispatcher final : public VsyncObserver {
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(CompositorVsyncDispatcher, override)
+
+ public:
+  explicit CompositorVsyncDispatcher(RefPtr<VsyncDispatcher> aVsyncDispatcher);
+
+  void NotifyVsync(const VsyncEvent& aVsync) override;
+
+  void SetCompositorVsyncObserver(VsyncObserver* aVsyncObserver);
+  void Shutdown();
+
+ private:
+  virtual ~CompositorVsyncDispatcher();
+  void ObserveVsync(bool aEnable);
+
+  RefPtr<VsyncDispatcher> mVsyncDispatcher;
+  Mutex mCompositorObserverLock MOZ_UNANNOTATED;
+  RefPtr<VsyncObserver> mCompositorVsyncObserver;
+  bool mDidShutdown;
+};
+
+class VsyncDispatcher final {
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(VsyncDispatcher)
+
+ public:
+  explicit VsyncDispatcher(gfx::VsyncSource* aVsyncSource);
+
+  void NotifyVsync(const VsyncEvent& aVsync);
+
+  void SetVsyncSource(gfx::VsyncSource* aVsyncSource);
+
+  RefPtr<gfx::VsyncSource> GetCurrentVsyncSource();
+
+  TimeDuration GetVsyncRate();
+
+  void AddVsyncObserver(VsyncObserver* aVsyncObserver);
+
+  void RemoveVsyncObserver(VsyncObserver* aVsyncObserver);
+
+  void AddMainThreadObserver(VsyncObserver* aObserver);
+  void RemoveMainThreadObserver(VsyncObserver* aObserver);
+
+ private:
+  virtual ~VsyncDispatcher();
+
+  void UpdateVsyncStatus();
+
+  void NotifyMainThreadObservers(VsyncEvent aEvent);
+
+  struct State {
+    explicit State(gfx::VsyncSource* aVsyncSource)
+        : mCurrentVsyncSource(aVsyncSource) {}
+    State(State&&) = default;
+    ~State() = default;
+
+    nsTArray<RefPtr<VsyncObserver>> mObservers;
+    nsTArray<RefPtr<VsyncObserver>> mMainThreadObservers;
+    VsyncId mLastVsyncIdSentToMainThread;
+    VsyncId mLastMainThreadProcessedVsyncId;
+
+    RefPtr<gfx::VsyncSource> mCurrentVsyncSource;
+
+    int32_t mVsyncSkipCounter = 0;
+
+    bool mIsObservingVsync = false;
+  };
+
+  DataMutex<State> mState;
+};
+
+}  
+
+#endif  // mozilla_widget_VsyncDispatcher_h

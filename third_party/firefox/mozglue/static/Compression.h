@@ -1,0 +1,90 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_Compression_h_
+#define mozilla_Compression_h_
+
+#include "mozilla/Assertions.h"
+#include "mozilla/ResultVariant.h"
+#include "mozilla/Span.h"
+
+struct LZ4F_cctx_s;  
+struct LZ4F_dctx_s;  
+
+namespace mozilla {
+namespace Compression {
+
+
+class LZ4 {
+ public:
+  static size_t compress(const char* aSource, size_t aInputSize, char* aDest);
+
+  static size_t compressLimitedOutput(const char* aSource, size_t aInputSize,
+                                      char* aDest, size_t aMaxOutputSize);
+
+  [[nodiscard]] static bool decompress(const char* aSource, size_t aInputSize,
+                                       char* aDest, size_t aMaxOutputSize,
+                                       size_t* aOutputSize);
+
+  [[nodiscard]] static bool decompressPartial(const char* aSource,
+                                              size_t aInputSize, char* aDest,
+                                              size_t aMaxOutputSize,
+                                              size_t* aOutputSize);
+
+  static inline size_t maxCompressedSize(size_t aInputSize) {
+    size_t max = (aInputSize + (aInputSize / 255) + 16);
+    MOZ_RELEASE_ASSERT(max > aInputSize);
+    return max;
+  }
+};
+
+class LZ4FrameCompressionContext final {
+ public:
+  LZ4FrameCompressionContext(int aCompressionLevel, size_t aMaxSrcSize,
+                             bool aChecksum, bool aStableSrc = false);
+
+  ~LZ4FrameCompressionContext();
+
+  size_t GetRequiredWriteBufferLength() { return mWriteBufLen; }
+
+  Result<Span<const char>, size_t> BeginCompressing(Span<char> aWriteBuffer);
+
+  Result<Span<const char>, size_t> ContinueCompressing(Span<const char> aInput);
+
+  Result<Span<const char>, size_t> EndCompressing();
+
+ private:
+  LZ4F_cctx_s* mContext;
+  int mCompressionLevel;
+  bool mGenerateChecksum;
+  bool mStableSrc;
+  size_t mMaxSrcSize;
+  size_t mWriteBufLen;
+  Span<char> mWriteBuffer;
+};
+
+struct LZ4FrameDecompressionResult {
+  size_t mSizeRead;
+  size_t mSizeWritten;
+  bool mFinished;
+};
+
+class LZ4FrameDecompressionContext final {
+ public:
+  explicit LZ4FrameDecompressionContext(bool aStableDest = false);
+  ~LZ4FrameDecompressionContext();
+
+  Result<LZ4FrameDecompressionResult, size_t> Decompress(
+      Span<char> aOutput, Span<const char> aInput);
+
+ private:
+  LZ4F_dctx_s* mContext;
+  bool mStableDest;
+};
+
+} 
+} 
+
+#endif /* mozilla_Compression_h_ */

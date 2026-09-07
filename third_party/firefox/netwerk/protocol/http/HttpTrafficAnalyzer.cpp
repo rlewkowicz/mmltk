@@ -1,0 +1,190 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "HttpTrafficAnalyzer.h"
+#include "HttpLog.h"
+
+#include "mozilla/StaticPrefs_network.h"
+#include "nsSocketTransportService2.h"
+
+namespace mozilla {
+namespace net {
+
+constexpr auto kInvalidCategory = "INVALID_CATEGORY"_ns;
+
+#define DEFINE_CATEGORY(_name, _idx) nsLiteralCString("Y" #_idx "_" #_name),
+static constexpr nsLiteralCString gKeyName[] = {
+    FOR_EACH_HTTP_TRAFFIC_CATEGORY(DEFINE_CATEGORY)
+
+        kInvalidCategory,
+};
+#undef DEFINE_CATEGORY
+
+
+HttpTrafficCategory HttpTrafficAnalyzer::CreateTrafficCategory(
+    bool aIsPrivateMode, bool aIsSystemPrincipal, bool aIsThirdParty,
+    ClassOfService aClassOfService, TrackingClassification aClassification) {
+  uint8_t category = aIsPrivateMode ? 12 : 0;
+  if (aIsSystemPrincipal) {
+    MOZ_ASSERT_IF(!aIsPrivateMode,
+                  gKeyName[category].EqualsLiteral("Y0_N1Sys"));
+    MOZ_ASSERT_IF(aIsPrivateMode,
+                  gKeyName[category].EqualsLiteral("Y12_P1Sys"));
+    return static_cast<HttpTrafficCategory>(category);
+  }
+  ++category;
+
+  if (!aIsThirdParty) {
+    MOZ_ASSERT_IF(!aIsPrivateMode, gKeyName[category].EqualsLiteral("Y1_N1"));
+    MOZ_ASSERT_IF(aIsPrivateMode, gKeyName[category].EqualsLiteral("Y13_P1"));
+    return static_cast<HttpTrafficCategory>(category);
+  }
+
+  switch (aClassification) {
+    case TrackingClassification::eNone:
+      ++category;
+      MOZ_ASSERT_IF(!aIsPrivateMode,
+                    gKeyName[category].EqualsLiteral("Y2_N3Oth"));
+      MOZ_ASSERT_IF(aIsPrivateMode,
+                    gKeyName[category].EqualsLiteral("Y14_P3Oth"));
+      return static_cast<HttpTrafficCategory>(category);
+    case TrackingClassification::eBasic:
+      category += 2;
+      break;
+    case TrackingClassification::eContent:
+      category += 5;
+      break;
+    case TrackingClassification::eFingerprinting:
+      category += 8;
+      break;
+    default:
+      MOZ_ASSERT(false, "incorrect classification");
+      return HttpTrafficCategory::eInvalid;
+  }
+
+  switch (aClassOfService) {
+    case ClassOfService::eLeader:
+      MOZ_ASSERT_IF(
+          !aIsPrivateMode,
+          (aClassification == TrackingClassification::eBasic &&
+           gKeyName[category].EqualsLiteral("Y3_N3BasicLead")) ||
+              (aClassification == TrackingClassification::eContent &&
+               gKeyName[category].EqualsLiteral("Y6_N3ContentLead")) ||
+              (aClassification == TrackingClassification::eFingerprinting &&
+               gKeyName[category].EqualsLiteral("Y9_N3FpLead")));
+      MOZ_ASSERT_IF(
+          aIsPrivateMode,
+          (aClassification == TrackingClassification::eBasic &&
+           gKeyName[category].EqualsLiteral("Y15_P3BasicLead")) ||
+              (aClassification == TrackingClassification::eContent &&
+               gKeyName[category].EqualsLiteral("Y18_P3ContentLead")) ||
+              (aClassification == TrackingClassification::eFingerprinting &&
+               gKeyName[category].EqualsLiteral("Y21_P3FpLead")));
+      return static_cast<HttpTrafficCategory>(category);
+    case ClassOfService::eBackground:
+      ++category;
+
+      MOZ_ASSERT_IF(
+          !aIsPrivateMode,
+          (aClassification == TrackingClassification::eBasic &&
+           gKeyName[category].EqualsLiteral("Y4_N3BasicBg")) ||
+              (aClassification == TrackingClassification::eContent &&
+               gKeyName[category].EqualsLiteral("Y7_N3ContentBg")) ||
+              (aClassification == TrackingClassification::eFingerprinting &&
+               gKeyName[category].EqualsLiteral("Y10_N3FpBg")));
+      MOZ_ASSERT_IF(
+          aIsPrivateMode,
+          (aClassification == TrackingClassification::eBasic &&
+           gKeyName[category].EqualsLiteral("Y16_P3BasicBg")) ||
+              (aClassification == TrackingClassification::eContent &&
+               gKeyName[category].EqualsLiteral("Y19_P3ContentBg")) ||
+              (aClassification == TrackingClassification::eFingerprinting &&
+               gKeyName[category].EqualsLiteral("Y22_P3FpBg")));
+
+      return static_cast<HttpTrafficCategory>(category);
+    case ClassOfService::eOther:
+      category += 2;
+
+      MOZ_ASSERT_IF(
+          !aIsPrivateMode,
+          (aClassification == TrackingClassification::eBasic &&
+           gKeyName[category].EqualsLiteral("Y5_N3BasicOth")) ||
+              (aClassification == TrackingClassification::eContent &&
+               gKeyName[category].EqualsLiteral("Y8_N3ContentOth")) ||
+              (aClassification == TrackingClassification::eFingerprinting &&
+               gKeyName[category].EqualsLiteral("Y11_N3FpOth")));
+      MOZ_ASSERT_IF(
+          aIsPrivateMode,
+          (aClassification == TrackingClassification::eBasic &&
+           gKeyName[category].EqualsLiteral("Y17_P3BasicOth")) ||
+              (aClassification == TrackingClassification::eContent &&
+               gKeyName[category].EqualsLiteral("Y20_P3ContentOth")) ||
+              (aClassification == TrackingClassification::eFingerprinting &&
+               gKeyName[category].EqualsLiteral("Y23_P3FpOth")));
+
+      return static_cast<HttpTrafficCategory>(category);
+  }
+
+  MOZ_ASSERT(false, "incorrect class of service");
+  return HttpTrafficCategory::eInvalid;
+}
+
+void HttpTrafficAnalyzer::IncrementHttpTransaction(
+    HttpTrafficCategory aCategory) {
+  MOZ_ASSERT(OnSocketThread(), "not on socket thread");
+  MOZ_ASSERT(StaticPrefs::network_traffic_analyzer_enabled());
+  MOZ_ASSERT(aCategory != HttpTrafficCategory::eInvalid, "invalid category");
+
+  LOG(("HttpTrafficAnalyzer::IncrementHttpTransaction [%s] [this=%p]\n",
+       gKeyName[aCategory].get(), this));
+
+
+}
+
+void HttpTrafficAnalyzer::IncrementHttpConnection(
+    HttpTrafficCategory aCategory) {
+  MOZ_ASSERT(OnSocketThread(), "not on socket thread");
+  MOZ_ASSERT(StaticPrefs::network_traffic_analyzer_enabled());
+  MOZ_ASSERT(aCategory != HttpTrafficCategory::eInvalid, "invalid category");
+
+  LOG(("HttpTrafficAnalyzer::IncrementHttpConnection [%s] [this=%p]\n",
+       gKeyName[aCategory].get(), this));
+
+
+}
+
+void HttpTrafficAnalyzer::IncrementHttpConnection(
+    nsTArray<HttpTrafficCategory>&& aCategories) {
+  MOZ_ASSERT(OnSocketThread(), "not on socket thread");
+  MOZ_ASSERT(StaticPrefs::network_traffic_analyzer_enabled());
+  MOZ_ASSERT(!aCategories.IsEmpty(), "empty category");
+
+  nsTArray<HttpTrafficCategory> categories(std::move(aCategories));
+
+  LOG(("HttpTrafficAnalyzer::IncrementHttpConnection size=%" PRIuPTR
+       " [this=%p]\n",
+       categories.Length(), this));
+
+  HttpTrafficCategory best = categories[0];
+  for (auto category : categories) {
+    MOZ_ASSERT(category != HttpTrafficCategory::eInvalid, "invalid category");
+
+    if (category == 0 || category == 1 || category == 12 || category == 13) {
+      MOZ_ASSERT(gKeyName[category].EqualsLiteral("Y0_N1Sys") ||
+                 gKeyName[category].EqualsLiteral("Y1_N1") ||
+                 gKeyName[category].EqualsLiteral("Y12_P1Sys") ||
+                 gKeyName[category].EqualsLiteral("Y13_P1"));
+      continue;
+    }
+    MOZ_ASSERT(gKeyName[24].Equals(kInvalidCategory),
+               "category definition isn't consistent");
+    best = category;
+    break;
+  }
+
+  IncrementHttpConnection(best);
+}
+
+}  
+}  

@@ -1,0 +1,318 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsHttpConnection_h_
+#define nsHttpConnection_h_
+
+#include <functional>
+#include "HttpConnectionBase.h"
+#include "nsHttpConnectionInfo.h"
+#include "nsHttpResponseHead.h"
+#include "nsAHttpTransaction.h"
+#include "nsCOMPtr.h"
+#include "nsProxyRelease.h"
+#include "prinrval.h"
+#include "mozilla/Mutex.h"
+#include "ARefBase.h"
+#include "TimingStruct.h"
+#include "HttpTrafficAnalyzer.h"
+#include "TlsHandshaker.h"
+
+#include "nsIAsyncInputStream.h"
+#include "nsIAsyncOutputStream.h"
+#include "nsIInterfaceRequestor.h"
+#include "nsILoadInfo.h"
+#include "nsISocketTransport.h"
+#include "nsISupportsPriority.h"
+#include "nsITimer.h"
+#include "nsITlsHandshakeListener.h"
+
+class nsISocketTransport;
+class nsITLSSocketControl;
+
+namespace mozilla {
+namespace net {
+
+class nsHttpHandler;
+class ASpdySession;
+
+#define NS_HTTPCONNECTION_IID \
+  {0x1dcc863e, 0xdb90, 0x4652, {0xa1, 0xfe, 0x13, 0xfe, 0xa0, 0xb5, 0x4e, 0x46}}
+
+
+class nsHttpConnection final : public HttpConnectionBase,
+                               public nsAHttpSegmentReader,
+                               public nsAHttpSegmentWriter,
+                               public nsIInputStreamCallback,
+                               public nsIOutputStreamCallback,
+                               public nsITransportEventSink,
+                               public nsIInterfaceRequestor {
+ private:
+  virtual ~nsHttpConnection();
+
+ public:
+  NS_INLINE_DECL_STATIC_IID(NS_HTTPCONNECTION_IID)
+  NS_DECL_HTTPCONNECTIONBASE
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSAHTTPSEGMENTREADER
+  NS_DECL_NSAHTTPSEGMENTWRITER
+  NS_DECL_NSIINPUTSTREAMCALLBACK
+  NS_DECL_NSIOUTPUTSTREAMCALLBACK
+  NS_DECL_NSITRANSPORTEVENTSINK
+  NS_DECL_NSIINTERFACEREQUESTOR
+
+  nsHttpConnection();
+
+  [[nodiscard]] virtual nsresult Init(nsHttpConnectionInfo* info,
+                                      uint16_t maxHangTime, nsISocketTransport*,
+                                      nsIAsyncInputStream*,
+                                      nsIAsyncOutputStream*,
+                                      bool connectedTransport, nsresult status,
+                                      nsIInterfaceRequestor*, PRIntervalTime,
+                                      bool forWebSocket);
+
+
+  bool IsKeepAlive() {
+    return (mUsingSpdyVersion != SpdyVersion::NONE) ||
+           (mKeepAliveMask && mKeepAlive);
+  }
+
+  bool CanReuseLikely();
+  const char* CanDirectlyActivateReason() const;
+
+  uint32_t TimeToLive();
+
+  bool NeedSpdyTunnel() {
+    return mConnInfo->UsingHttpsProxy() && !mHasTLSTransportLayer &&
+           mConnInfo->UsingConnect();
+  }
+
+  void ForcePlainText() { mForcePlainText = true; }
+
+  bool IsUrgentStartPreferred() const {
+    return mUrgentStartPreferredKnown && mUrgentStartPreferred;
+  }
+  void SetUrgentStartPreferred(bool urgent);
+
+  void SetIsReusedAfter(uint32_t afterMilliseconds);
+
+  int64_t MaxBytesRead() { return mMaxBytesRead; }
+  HttpVersion GetLastHttpResponseVersion() { return mLastHttpResponseVersion; }
+
+  nsresult HandshakeError() const { return mHandshakeError; }
+
+  void OnClientAuthCertificateRequested();
+  void OnClientAuthCertificateSelected();
+
+  const nsACString& CachedRetryEchConfig() const { return mRetryEchConfig; }
+
+  friend class HttpConnectionForceIO;
+  friend class TlsHandshaker;
+
+  void BeginIdleMonitoring();
+  void EndIdleMonitoring();
+
+  bool UsingSpdy() override { return (mUsingSpdyVersion != SpdyVersion::NONE); }
+  SpdyVersion GetSpdyVersion() { return mUsingSpdyVersion; }
+  bool EverUsedSpdy() { return mEverUsedSpdy; }
+  bool UsingHttp3() override { return false; }
+
+  bool ReportedNPN() { return mReportedSpdy; }
+
+  uint32_t ReadTimeoutTick(PRIntervalTime now);
+
+  static void UpdateTCPKeepalive(nsITimer* aTimer, void* aClosure);
+
+  void ReadTimeoutTick();
+
+  int64_t ContentBytesWritten() { return mContentBytesWritten; }
+
+  void SetupSecondaryTLS();
+  void SetInTunnel() override;
+
+  void CheckForTraffic(bool check);
+
+  bool NoTraffic() {
+    return mTrafficStamp &&
+           (mTrafficCount == (mTotalBytesWritten + mTotalBytesRead));
+  }
+
+  bool NoClientCertAuth() const override;
+
+  ExtendedCONNECTSupport GetExtendedCONNECTSupport() override;
+
+  int64_t BytesWritten() override { return mTotalBytesWritten; }
+
+  nsISocketTransport* Transport() override { return mSocketTransport; }
+
+  nsresult GetSelfAddr(NetAddr* addr) override;
+  nsresult GetPeerAddr(NetAddr* addr) override;
+  bool ResolvedByTRR() override;
+  bool GetEchConfigUsed() override;
+  nsIRequest::TRRMode EffectiveTRRMode() override;
+  TRRSkippedReason TRRSkipReason() override;
+  bool IsForWebSocket() { return mForWebSocket; }
+
+  [[nodiscard]] static nsresult MakeConnectString(
+      nsAHttpTransaction* trans, nsHttpRequestHead* request, nsACString& result,
+      bool aShouldResistFingerprinting);
+  [[nodiscard]] static nsresult ReadFromStream(nsIInputStream*, void*,
+                                               const char*, uint32_t, uint32_t,
+                                               uint32_t*);
+
+  nsresult CreateTunnelStream(nsAHttpTransaction* httpTransaction,
+                              HttpConnectionBase** aHttpConnection,
+                              bool aIsExtendedCONNECT = false) override;
+
+  void SwapTransaction(nsAHttpTransaction* aOld, nsAHttpTransaction* aNew);
+
+ private:
+  void SetTunnelSetupDone() override;
+  nsresult SetupProxyConnectStream() override;
+  nsresult SendConnectRequest(void* closure, uint32_t* transactionBytes);
+
+  void HandleTunnelResponse(const nsHttpResponseHead& responseHead,
+                            bool* reset);
+  void HandleWebSocketResponse(nsHttpRequestHead* requestHead,
+                               nsHttpResponseHead* responseHead,
+                               uint16_t responseStatus);
+  void ResetTransaction(RefPtr<nsAHttpTransaction>&& trans,
+                        bool aForH2Proxy = false);
+
+  enum TCPKeepaliveConfig {
+    kTCPKeepaliveDisabled = 0,
+    kTCPKeepaliveShortLivedConfig,
+    kTCPKeepaliveLongLivedConfig
+  };
+
+  [[nodiscard]] nsresult OnTransactionDone(nsresult reason);
+  [[nodiscard]] nsresult OnSocketWritable();
+  [[nodiscard]] nsresult OnSocketReadable();
+
+  PRIntervalTime IdleTime();
+  bool IsAlive();
+
+  void StartSpdy(nsITLSSocketControl* ssl, SpdyVersion spdyVersion);
+  void Start0RTTSpdy(SpdyVersion spdyVersion);
+
+  nsresult TryTakeSubTransactions(nsTArray<RefPtr<nsAHttpTransaction> >& list);
+  nsresult MoveTransactionsToSpdy(nsresult status,
+                                  nsTArray<RefPtr<nsAHttpTransaction> >& list);
+
+  [[nodiscard]] nsresult AddTransaction(nsAHttpTransaction*, int32_t);
+
+  [[nodiscard]] nsresult StartShortLivedTCPKeepalives();
+  [[nodiscard]] nsresult StartLongLivedTCPKeepalives();
+  [[nodiscard]] nsresult DisableTCPKeepalives();
+
+  bool CheckCanWrite0RTTData();
+  void PostProcessNPNSetup(bool handshakeSucceeded, bool hasSecurityInfo,
+                           bool earlyDataUsed);
+  void Reset0RttForSpdy();
+  void HandshakeDoneInternal();
+  uint32_t TransactionCaps() const { return mTransactionCaps; }
+
+  void MarkAsDontReuse();
+
+  virtual WebTransportSessionBase* GetWebTransportSession(
+      nsAHttpTransaction* aTransaction) override;
+
+ private:
+  RefPtr<nsAHttpTransaction> mTransaction;
+
+  RefPtr<TlsHandshaker> mTlsHandshaker;
+
+  nsCOMPtr<nsIAsyncInputStream> mSocketIn;
+  nsCOMPtr<nsIAsyncOutputStream> mSocketOut;
+
+  nsresult mSocketInCondition{NS_ERROR_NOT_INITIALIZED};
+  nsresult mSocketOutCondition{NS_ERROR_NOT_INITIALIZED};
+
+  RefPtr<nsHttpHandler> mHttpHandler;  
+
+  PRIntervalTime mLastReadTime{0};
+  PRIntervalTime mLastWriteTime{0};
+  PRIntervalTime mMaxHangTime{0};
+  PRIntervalTime mIdleTimeout;  
+  PRIntervalTime mConsiderReusedAfterInterval{0};
+  PRIntervalTime mConsiderReusedAfterEpoch{0};
+  TimeStamp mLastTRRResponseTime;   
+  int64_t mCurrentBytesRead{0};     
+  int64_t mMaxBytesRead{0};         
+  int64_t mTotalBytesRead{0};       
+  int64_t mContentBytesWritten{0};  
+
+  RefPtr<nsIAsyncInputStream> mInputOverflow;
+
+  bool mUrgentStartPreferred{false};
+  bool mUrgentStartPreferredKnown{false};
+  bool mConnectedTransport{false};
+  bool mKeepAlive{true};
+  bool mKeepAliveMask{true};
+  bool mDontReuse{false};
+  bool mIsReused{false};
+  bool mLastTransactionExpectedNoContent{false};
+  bool mIdleMonitoring{false};
+  bool mInSpdyTunnel{false};
+  bool mForcePlainText{false};
+
+  int64_t mTrafficCount{0};
+  bool mTrafficStamp{false};  
+
+  uint32_t mHttp1xTransactionCount{0};
+
+  uint32_t mRemainingConnectionUses{0xffffffff};
+
+  SpdyVersion mUsingSpdyVersion{SpdyVersion::NONE};
+
+  RefPtr<ASpdySession> mSpdySession;
+  RefPtr<ASpdySession> mExtendedCONNECTHttp2Session;
+  int32_t mPriority{nsISupportsPriority::PRIORITY_NORMAL};
+  bool mReportedSpdy{false};
+
+  bool mEverUsedSpdy{false};
+
+  HttpVersion mLastHttpResponseVersion{HttpVersion::v1_1};
+
+  nsresult mHandshakeError{NS_OK};
+
+  nsCString mRetryEchConfig;
+
+  uint32_t mDefaultTimeoutFactor{1};
+
+  bool mResponseTimeoutEnabled{false};
+
+  uint32_t mTCPKeepaliveConfig{kTCPKeepaliveDisabled};
+  nsCOMPtr<nsITimer> mTCPKeepaliveTransitionTimer;
+
+ private:
+  static void ForceSendIO(nsITimer* aTimer, void* aClosure);
+  [[nodiscard]] nsresult MaybeForceSendIO();
+  bool mForceSendPending{false};
+  nsCOMPtr<nsITimer> mForceSendTimer;
+
+  int64_t mContentBytesWritten0RTT{0};
+  bool mDid0RTTSpdy{false};
+
+  nsresult mErrorBeforeConnect = NS_OK;
+
+  nsCOMPtr<nsISocketTransport> mSocketTransport;
+
+  bool mForWebSocket{false};
+
+  std::function<void()> mContinueHandshakeDone{nullptr};
+
+ private:
+  int64_t mTotalBytesWritten = 0;  
+
+  nsCOMPtr<nsIInputStream> mProxyConnectStream;
+
+  bool mHasTLSTransportLayer{false};
+  bool mTransactionDisallowHttp3{false};
+};
+
+}  
+}  
+
+#endif  // nsHttpConnection_h_

@@ -1,0 +1,29 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef js_Interrupt_h
+#define js_Interrupt_h
+
+#include "jstypes.h"
+
+struct JS_PUBLIC_API JSContext;
+
+using JSInterruptCallback = bool (*)(JSContext*);
+
+extern JS_PUBLIC_API bool JS_CheckForInterrupt(JSContext* cx);
+
+extern JS_PUBLIC_API bool JS_AddInterruptCallback(JSContext* cx,
+                                                  JSInterruptCallback callback);
+
+extern JS_PUBLIC_API bool JS_DisableInterruptCallback(JSContext* cx);
+
+extern JS_PUBLIC_API void JS_ResetInterruptCallback(JSContext* cx, bool enable);
+
+extern JS_PUBLIC_API void JS_RequestInterruptCallback(JSContext* cx);
+
+extern JS_PUBLIC_API void JS_RequestInterruptCallbackCanWait(JSContext* cx);
+
+extern JS_PUBLIC_API void JS_SuppressInterruptTerminationWarning(JSContext* cx);
+
+#endif  // js_Interrupt_h

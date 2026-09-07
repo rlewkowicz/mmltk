@@ -1,0 +1,127 @@
+// Copyright (c) 2010 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+
+
+#if !defined(MEDIA_BASE_YUV_ROW_H_)
+#define MEDIA_BASE_YUV_ROW_H_
+
+#include "chromium_types.h"
+
+extern "C" {
+void FastConvertYUVToRGB32Row(const uint8_t* y_buf,
+                              const uint8_t* u_buf,
+                              const uint8_t* v_buf,
+                              uint8_t* rgb_buf,
+                              int width);
+
+void FastConvertYUVToRGB32Row_C(const uint8_t* y_buf,
+                                const uint8_t* u_buf,
+                                const uint8_t* v_buf,
+                                uint8_t* rgb_buf,
+                                int width,
+                                unsigned int x_shift);
+
+void FastConvertYUVToRGB32Row(const uint8_t* y_buf,
+                              const uint8_t* u_buf,
+                              const uint8_t* v_buf,
+                              uint8_t* rgb_buf,
+                              int width);
+
+void ConvertYUVToRGB32Row_SSE(const uint8_t* y_buf,
+                              const uint8_t* u_buf,
+                              const uint8_t* v_buf,
+                              uint8_t* rgb_buf,
+                              int width,
+                              int step);
+
+void RotateConvertYUVToRGB32Row_SSE(const uint8_t* y_buf,
+                                    const uint8_t* u_buf,
+                                    const uint8_t* v_buf,
+                                    uint8_t* rgb_buf,
+                                    int width,
+                                    int ystep,
+                                    int uvstep);
+
+void DoubleYUVToRGB32Row_SSE(const uint8_t* y_buf,
+                             const uint8_t* u_buf,
+                             const uint8_t* v_buf,
+                             uint8_t* rgb_buf,
+                             int width);
+
+void ScaleYUVToRGB32Row(const uint8_t* y_buf,
+                        const uint8_t* u_buf,
+                        const uint8_t* v_buf,
+                        uint8_t* rgb_buf,
+                        int width,
+                        int source_dx);
+
+void ScaleYUVToRGB32Row(const uint8_t* y_buf,
+                        const uint8_t* u_buf,
+                        const uint8_t* v_buf,
+                        uint8_t* rgb_buf,
+                        int width,
+                        int source_dx);
+
+void ScaleYUVToRGB32Row_C(const uint8_t* y_buf,
+                          const uint8_t* u_buf,
+                          const uint8_t* v_buf,
+                          uint8_t* rgb_buf,
+                          int width,
+                          int source_dx);
+
+void LinearScaleYUVToRGB32Row(const uint8_t* y_buf,
+                              const uint8_t* u_buf,
+                              const uint8_t* v_buf,
+                              uint8_t* rgb_buf,
+                              int width,
+                              int source_dx);
+
+void LinearScaleYUVToRGB32Row(const uint8_t* y_buf,
+                              const uint8_t* u_buf,
+                              const uint8_t* v_buf,
+                              uint8_t* rgb_buf,
+                              int width,
+                              int source_dx);
+
+void LinearScaleYUVToRGB32Row_C(const uint8_t* y_buf,
+                                const uint8_t* u_buf,
+                                const uint8_t* v_buf,
+                                uint8_t* rgb_buf,
+                                int width,
+                                int source_dx);
+
+
+#if defined(_MSC_VER) && !defined(__CLR_VER) && !defined(__clang__)
+#if defined(VISUALC_HAS_AVX2)
+#define SIMD_ALIGNED(var) __declspec(align(32)) var
+#else
+#define SIMD_ALIGNED(var) __declspec(align(16)) var
+#endif
+#elif defined(__GNUC__) || defined(__clang__)
+#if defined(CLANG_HAS_AVX2) || defined(GCC_HAS_AVX2)
+#define SIMD_ALIGNED(var) var __attribute__((aligned(32)))
+#else
+#define SIMD_ALIGNED(var) var __attribute__((aligned(16)))
+#endif
+#else
+#define SIMD_ALIGNED(var) var
+#endif
+
+extern SIMD_ALIGNED(const int16_t kCoefficientsRgbY[768][4]);
+
+#if defined(ARCH_CPU_X86) && !defined(ARCH_CPU_X86_64)
+#if defined(_MSC_VER)
+#define EMMS() __asm emms
+#pragma warning(disable: 4799)
+#else
+#define EMMS() asm("emms")
+#endif
+#else
+#define EMMS() ((void)0)
+#endif
+
+}  
+
+#endif

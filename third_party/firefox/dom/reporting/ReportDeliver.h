@@ -1,0 +1,90 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_ReportDeliver_h
+#define mozilla_dom_ReportDeliver_h
+
+#include "mozilla/dom/ReportingHeader.h"
+#include "nsIObserver.h"
+#include "nsITimer.h"
+#include "nsTArray.h"
+#include "nsTHashMap.h"
+
+#include "nsIPrincipal.h"
+
+class nsICookieJarSettings;
+class nsIPrincipal;
+class nsPIDOMWindowInner;
+class nsIGlobalObject;
+
+namespace mozilla::dom {
+
+class ReportBody;
+
+struct GlobalReportingData {
+  nsString mUserAgentData;
+  EndpointsList mEndpoints;
+  nsCOMPtr<nsICookieJarSettings> mCookieJarSettings;
+};
+
+class ReportDeliver final : public nsIObserver, public nsINamed {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+  NS_DECL_NSINAMED
+
+  struct ReportData {
+    nsString mType;
+    nsString mGroupName;
+    nsString mURL;
+    nsCString mEndpointURL;
+    nsString mUserAgent;
+    TimeStamp mCreationTime;
+    nsCString mReportBodyJSON;
+    nsCOMPtr<nsIPrincipal> mPrincipal;
+    nsCOMPtr<nsICookieJarSettings> mCookieJarSettings;
+    uint32_t mFailures;
+    uintptr_t mGlobalKey;
+    uint64_t mAssociatedBrowsingContext;
+  };
+
+  static void AttemptDelivery(nsIGlobalObject* aGlobal, const nsAString& aType,
+                              const nsAString& aGroupName,
+                              const nsAString& aURL, ReportBody* aBody,
+                              uint64_t aAssociatedBrowsingContextId);
+
+  static void Fetch(const ReportData& aReportData);
+
+  void Notify();
+  void EnqueueReport(const ReportData& aReportData);
+
+  static void Initialize();
+
+  static void WorkerInitializeReportingEndpoints(
+      uintptr_t aGlobalKey, nsIURI* aResourceURI, nsCString aHeaderContents,
+      bool aShouldResistFingerprinting,
+      nsICookieJarSettings* aCookieJarSettings);
+
+  static void WindowInitializeReportingEndpoints(
+      nsIGlobalObject* aGlobal, mozilla::dom::EndpointsList aEndpointList);
+
+  nsIURI* GetEndpointURLFor(uintptr_t aGlobalKey, const nsAString& aGroupName);
+  void EndpointRespondedWithRemove(uint64_t aGlobalKey,
+                                   const nsAString& aEndpointName);
+
+ private:
+  ReportDeliver();
+  ~ReportDeliver();
+
+  void ScheduleFetch();
+  void SetGlobalAndUserAgentData(ReportDeliver::ReportData& aReportData,
+                                 uintptr_t aGlobalKey);
+  bool mPendingDelivery{false};
+  nsTArray<ReportData> mReportQueue;
+  nsTHashMap<uintptr_t, GlobalReportingData> mGlobalsEndpointLists;
+};
+
+}  
+
+#endif  // mozilla_dom_ReportDeliver_h

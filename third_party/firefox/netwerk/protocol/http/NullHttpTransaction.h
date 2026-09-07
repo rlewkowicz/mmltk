@@ -1,0 +1,76 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_net_NullHttpTransaction_h
+#define mozilla_net_NullHttpTransaction_h
+
+#include "nsAHttpTransaction.h"
+#include "TimingStruct.h"
+
+
+class nsIHttpActivityObserver;
+
+namespace mozilla {
+namespace net {
+
+class nsAHttpConnection;
+class nsHttpConnectionInfo;
+class nsHttpRequestHead;
+
+#define NS_NULLHTTPTRANSACTION_IID \
+  {0x6c445340, 0x3b82, 0x4345, {0x8e, 0xfa, 0x49, 0x02, 0xc3, 0xb8, 0x80, 0x5a}}
+
+class NullHttpTransaction : public nsAHttpTransaction {
+ public:
+  NS_INLINE_DECL_STATIC_IID(NS_NULLHTTPTRANSACTION_IID)
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSAHTTPTRANSACTION
+
+  NullHttpTransaction(nsHttpConnectionInfo* ci,
+                      nsIInterfaceRequestor* callbacks, uint32_t caps,
+                      bool reportActivity = true);
+
+  [[nodiscard]] bool Claim();
+  void Unclaim();
+
+  bool IsNullTransaction() final { return true; }
+  NullHttpTransaction* QueryNullTransaction() final { return this; }
+  bool ResponseTimeoutEnabled() const final { return true; }
+  PRIntervalTime ResponseTimeout() final { return PR_SecondsToInterval(15); }
+
+  uint64_t BrowserId() override { return 0; }
+
+  TimingStruct Timings() { return mTimings; }
+
+  mozilla::TimeStamp GetTcpConnectEnd() { return mTimings.tcpConnectEnd; }
+  mozilla::TimeStamp GetSecureConnectionStart() {
+    return mTimings.secureConnectionStart;
+  }
+
+ protected:
+  virtual ~NullHttpTransaction();
+
+ private:
+  nsresult mStatus;
+
+ protected:
+  uint32_t mCaps;
+  nsHttpRequestHead* mRequestHead;
+
+ private:
+  bool mIsDone;
+  bool mClaimed;
+  TimingStruct mTimings;
+
+ protected:
+  RefPtr<nsAHttpConnection> mConnection;
+  nsCOMPtr<nsIInterfaceRequestor> mCallbacks;
+  RefPtr<nsHttpConnectionInfo> mConnectionInfo;
+  nsCOMPtr<nsIHttpActivityObserver> mActivityDistributor;
+};
+
+}  
+}  
+
+#endif  // mozilla_net_NullHttpTransaction_h

@@ -1,0 +1,128 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef vm_SymbolType_h
+#define vm_SymbolType_h
+
+#include <stdio.h>
+
+#include "gc/Barrier.h"
+#include "gc/Tracer.h"
+#include "js/AllocPolicy.h"
+#include "js/GCHashTable.h"
+#include "js/RootingAPI.h"
+#include "js/shadow/Symbol.h"  // JS::shadow::Symbol
+#include "js/Symbol.h"
+#include "js/TypeDecls.h"
+#include "vm/StringType.h"
+
+namespace js {
+class JS_PUBLIC_API GenericPrinter;
+class JSONPrinter;
+} 
+
+namespace JS {
+
+class Symbol
+    : public js::gc::CellWithTenuredGCPointer<js::gc::TenuredCell, JSAtom> {
+  friend class js::gc::CellAllocator;
+
+ public:
+  Symbol(const Symbol&) = delete;
+  void operator=(const Symbol&) = delete;
+
+  JSAtom* description() const { return headerPtr(); }
+
+ private:
+  SymbolCode code_;
+
+  js::HashNumber hash_;
+
+  Symbol(SymbolCode code, js::HashNumber hash, Handle<JSAtom*> desc)
+      : CellWithTenuredGCPointer(desc), code_(code), hash_(hash) {}
+
+  static Symbol* newInternal(JSContext* cx, SymbolCode code,
+                             js::HashNumber hash, Handle<JSAtom*> description);
+
+  static void staticAsserts() {
+    static_assert(uint32_t(SymbolCode::WellKnownAPILimit) ==
+                      JS::shadow::Symbol::WellKnownAPILimit,
+                  "JS::shadow::Symbol::WellKnownAPILimit must match "
+                  "SymbolCode::WellKnownAPILimit");
+    static_assert(
+        offsetof(Symbol, code_) == offsetof(JS::shadow::Symbol, code_),
+        "JS::shadow::Symbol::code_ offset must match SymbolCode::code_");
+  }
+
+ public:
+  static Symbol* new_(JSContext* cx, SymbolCode code,
+                      js::HandleString description);
+  static Symbol* newWellKnown(JSContext* cx, SymbolCode code,
+                              Handle<js::PropertyName*> description);
+  static Symbol* for_(JSContext* cx, js::HandleString description);
+
+  SymbolCode code() const { return code_; }
+  js::HashNumber hash() const { return hash_; }
+
+  bool isWellKnownSymbol() const {
+    return uint32_t(code_) < WellKnownSymbolLimit;
+  }
+
+  bool isInterestingSymbol() const {
+    return code_ == SymbolCode::toStringTag ||
+           code_ == SymbolCode::toPrimitive ||
+           code_ == SymbolCode::isConcatSpreadable;
+  }
+
+  bool isPrivateName() const { return code_ == SymbolCode::PrivateNameSymbol; }
+
+  static const JS::TraceKind TraceKind = JS::TraceKind::Symbol;
+
+  void traceChildren(JSTracer* trc);
+
+  bool isPermanentAndMayBeShared() const { return isWellKnownSymbol(); }
+
+  size_t sizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+    return mallocSizeOf(this);
+  }
+
+#if defined(DEBUG) || defined(JS_JITSPEW)
+  void dump() const;  
+  void dump(js::GenericPrinter& out) const;
+  void dump(js::JSONPrinter& json) const;
+
+  void dumpFields(js::JSONPrinter& json) const;
+  void dumpStringContent(js::GenericPrinter& out) const;
+  void dumpPropertyName(js::GenericPrinter& out) const;
+#endif
+
+  static constexpr size_t offsetOfHash() { return offsetof(Symbol, hash_); }
+  static constexpr size_t offsetOfCode() { return offsetof(Symbol, code_); }
+};
+
+} 
+
+namespace js {
+
+struct HashSymbolsByDescription {
+  using Key = JS::Symbol*;
+  using Lookup = JSAtom*;
+
+  static HashNumber hash(Lookup l) { return HashNumber(l->hash()); }
+  static bool match(Key sym, Lookup l) { return sym->description() == l; }
+};
+
+class SymbolRegistry
+    : public GCHashSet<WeakHeapPtr<JS::Symbol*>, HashSymbolsByDescription,
+                       SystemAllocPolicy> {
+ public:
+  SymbolRegistry() = default;
+};
+
+bool SymbolDescriptiveString(JSContext* cx, JS::Symbol* sym,
+                             JS::MutableHandleValue result);
+
+} 
+
+#endif /* vm_SymbolType_h */

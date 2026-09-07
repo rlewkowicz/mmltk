@@ -1,0 +1,54 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef LoadContext_h
+#define LoadContext_h
+
+#include "SerializedLoadContext.h"
+#include "mozilla/BasePrincipal.h"
+#include "nsIWeakReferenceUtils.h"
+#include "nsIInterfaceRequestor.h"
+#include "nsILoadContext.h"
+
+namespace mozilla::dom {
+class Element;
+}
+
+namespace mozilla {
+
+
+class LoadContext final : public nsILoadContext, public nsIInterfaceRequestor {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSILOADCONTEXT
+  NS_DECL_NSIINTERFACEREQUESTOR
+
+  LoadContext(const IPC::SerializedLoadContext& aToCopy,
+              dom::Element* aTopFrameElement, OriginAttributes& aAttrs);
+
+  explicit LoadContext(OriginAttributes& aAttrs);
+
+  explicit LoadContext(nsIPrincipal* aPrincipal,
+                       nsILoadContext* aOptionalBase = nullptr);
+
+ private:
+  ~LoadContext();
+
+  nsWeakPtr mTopFrameElement;
+  bool mIsContent;
+  bool mUseRemoteTabs;
+  bool mUseRemoteSubframes;
+  bool mUseTrackingProtection;
+#ifdef DEBUG
+  bool mIsNotNull;
+#endif
+  OriginAttributes mOriginAttributes;
+};
+
+already_AddRefed<nsILoadContext> CreateLoadContext();
+already_AddRefed<nsILoadContext> CreatePrivateLoadContext();
+
+}  
+
+#endif  // LoadContext_h

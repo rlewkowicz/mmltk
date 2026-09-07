@@ -1,0 +1,91 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef builtin_temporal_PlainTime_h
+#define builtin_temporal_PlainTime_h
+
+#include "mozilla/Casting.h"
+
+#include <stdint.h>
+
+#include "builtin/temporal/TemporalTypes.h"
+#include "js/TypeDecls.h"
+#include "js/Value.h"
+#include "vm/NativeObject.h"
+
+namespace js {
+struct ClassSpec;
+}
+
+namespace js::temporal {
+
+class PlainTimeObject : public NativeObject {
+ public:
+  static const JSClass class_;
+  static const JSClass& protoClass_;
+
+  static constexpr uint32_t PACKED_TIME_SLOT = 0;
+  static constexpr uint32_t SLOT_COUNT = 1;
+
+  Time time() const {
+    auto packed = PackedTime{mozilla::BitwiseCast<uint64_t>(
+        getFixedSlot(PACKED_TIME_SLOT).toDouble())};
+    return PackedTime::unpack(packed);
+  }
+
+ private:
+  static const ClassSpec classSpec_;
+};
+
+class Increment;
+enum class TemporalOverflow;
+enum class TemporalRoundingMode;
+enum class TemporalUnit;
+
+#ifdef DEBUG
+bool IsValidTime(const Time& time);
+
+bool IsValidTime(double hour, double minute, double second, double millisecond,
+                 double microsecond, double nanosecond);
+#endif
+
+bool ThrowIfInvalidTime(JSContext* cx, double hour, double minute,
+                        double second, double millisecond, double microsecond,
+                        double nanosecond);
+
+PlainTimeObject* CreateTemporalTime(JSContext* cx, const Time& time);
+
+bool ToTemporalTime(JSContext* cx, JS::Handle<JS::Value> item, Time* result);
+
+struct TimeRecord final {
+  int64_t days = 0;
+  Time time;
+};
+
+TimeRecord AddTime(const Time& time, const TimeDuration& duration);
+
+TimeDuration DifferenceTime(const Time& time1, const Time& time2);
+
+struct TemporalTimeLike final {
+  double hour = 0;
+  double minute = 0;
+  double second = 0;
+  double millisecond = 0;
+  double microsecond = 0;
+  double nanosecond = 0;
+};
+
+bool RegulateTime(JSContext* cx, const TemporalTimeLike& time,
+                  TemporalOverflow overflow, Time* result);
+
+int32_t CompareTimeRecord(const Time& one, const Time& two);
+
+TimeRecord BalanceTime(const Time& time, int64_t nanoseconds);
+
+TimeRecord RoundTime(const Time& time, Increment increment, TemporalUnit unit,
+                     TemporalRoundingMode roundingMode);
+
+} 
+
+#endif /* builtin_temporal_PlainTime_h */

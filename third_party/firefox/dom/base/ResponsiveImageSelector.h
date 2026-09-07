@@ -1,0 +1,150 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_responsiveimageselector_h_
+#define mozilla_dom_responsiveimageselector_h_
+
+#include "mozilla/FunctionRef.h"
+#include "mozilla/ServoBindingTypes.h"
+#include "mozilla/UniquePtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsIContent.h"
+#include "nsISupports.h"
+#include "nsString.h"
+
+class nsMediaQuery;
+class nsCSSValue;
+
+namespace mozilla::dom {
+
+class ResponsiveImageCandidate;
+
+class ResponsiveImageSelector {
+  friend class ResponsiveImageCandidate;
+
+ public:
+  NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(ResponsiveImageSelector)
+  NS_DECL_CYCLE_COLLECTION_NATIVE_CLASS(ResponsiveImageSelector)
+
+  explicit ResponsiveImageSelector(nsIContent* aContent);
+  explicit ResponsiveImageSelector(dom::Document* aDocument);
+
+  static void ParseSourceSet(const nsAString& aSrcSet,
+                             FunctionRef<void(ResponsiveImageCandidate&&)>);
+
+
+  bool SetCandidatesFromSourceSet(const nsAString& aSrcSet,
+                                  nsIPrincipal* aTriggeringPrincipal = nullptr);
+
+  bool SetSizesFromDescriptor(const nsAString& aSizesDescriptor);
+
+  void SetDefaultSource(const nsAString& aURLString, nsIPrincipal* = nullptr);
+  void SetDefaultSource(nsIURI* aURI, nsIPrincipal* = nullptr);
+  void ClearDefaultSource();
+
+  uint32_t NumCandidates(bool aIncludeDefault = true);
+
+  nsIContent* Content();
+
+  dom::Document* Document();
+
+  already_AddRefed<nsIURI> GetSelectedImageURL();
+  bool GetSelectedImageURLSpec(nsAString& aResult);
+  double GetSelectedImageDensity();
+  nsIPrincipal* GetSelectedImageTriggeringPrincipal();
+
+  bool SelectImage(bool aReselect = false);
+
+  bool SetAutoWidth(Maybe<nscoord> aWidth) {
+    nscoord width = aWidth.valueOr(-1);
+    if (mAutoWidth == width) {
+      return false;
+    }
+    mAutoWidth = width;
+    return true;
+  }
+
+ protected:
+  virtual ~ResponsiveImageSelector();
+
+ private:
+  void AppendCandidateIfUnique(ResponsiveImageCandidate&& aCandidate);
+
+  void MaybeAppendDefaultCandidate();
+
+  int GetSelectedCandidateIndex();
+
+  void ClearSelectedCandidate();
+
+  bool ComputeFinalWidthForCurrentViewport(double* aWidth);
+
+  nsCOMPtr<nsINode> mOwnerNode;
+  nsString mDefaultSourceURL;
+  nsCOMPtr<nsIPrincipal> mDefaultSourceTriggeringPrincipal;
+  nsTArray<ResponsiveImageCandidate> mCandidates;
+  nscoord mAutoWidth = -1;
+  int mSelectedCandidateIndex;
+  nsCOMPtr<nsIURI> mSelectedCandidateURL;
+
+  UniquePtr<StyleSourceSizeList> mServoSourceSizeList;
+};
+
+class ResponsiveImageCandidate {
+ public:
+  ResponsiveImageCandidate();
+  ResponsiveImageCandidate(const ResponsiveImageCandidate&) = delete;
+  ResponsiveImageCandidate(ResponsiveImageCandidate&&) = default;
+
+  void SetURLSpec(const nsAString& aURLString);
+  void SetTriggeringPrincipal(nsIPrincipal* aPrincipal);
+  void SetParameterDefault();
+
+  void SetParameterAsDensity(double aDensity);
+  void SetParameterAsComputedWidth(int32_t aWidth);
+
+  void SetParameterInvalid();
+
+  bool ConsumeDescriptors(nsAString::const_iterator& aIter,
+                          const nsAString::const_iterator& aIterEnd);
+
+  bool HasSameParameter(const ResponsiveImageCandidate& aOther) const;
+
+  const nsAString& URLString() const { return mURLString; }
+  nsIPrincipal* TriggeringPrincipal() const { return mTriggeringPrincipal; }
+
+  double Density(ResponsiveImageSelector* aSelector) const;
+  double Density(double aMatchingWidth) const;
+
+  void AppendDescriptors(nsAString&) const;
+
+  bool IsValid() const { return mType != CandidateType::Invalid; }
+
+  bool IsComputedFromWidth() const {
+    return mType == CandidateType::ComputedFromWidth;
+  }
+
+  bool IsDefault() const { return mType == CandidateType::Default; }
+
+  enum class CandidateType : uint8_t {
+    Invalid,
+    Density,
+    Default,
+    ComputedFromWidth
+  };
+
+  CandidateType Type() const { return mType; }
+
+ private:
+  nsString mURLString;
+  nsCOMPtr<nsIPrincipal> mTriggeringPrincipal;
+  CandidateType mType;
+  union {
+    double mDensity;
+    int32_t mWidth;
+  } mValue;
+};
+
+}  
+
+#endif  // mozilla_dom_responsiveimageselector_h_

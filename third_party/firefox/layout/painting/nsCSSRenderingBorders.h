@@ -1,0 +1,270 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef NS_CSS_RENDERING_BORDERS_H
+#define NS_CSS_RENDERING_BORDERS_H
+
+#include "gfxRect.h"
+#include "gfxUtils.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/gfx/2D.h"
+#include "mozilla/gfx/BezierUtils.h"
+#include "mozilla/gfx/PathHelpers.h"
+#include "nsCOMPtr.h"
+#include "nsColor.h"
+#include "nsIFrame.h"
+#include "nsImageRenderer.h"
+
+struct nsBorderColors;
+
+namespace mozilla {
+class nsDisplayItem;
+class nsDisplayList;
+class nsDisplayListBuilder;
+
+class nsDisplayBorder;
+class nsDisplayButtonBorder;
+class nsDisplayOutline;
+
+enum class StyleBorderStyle : uint8_t;
+enum class StyleBorderImageRepeatKeyword : uint8_t;
+
+namespace gfx {
+class GradientStops;
+}  
+namespace layers {
+class StackingContextHelper;
+}  
+}  
+
+#undef DEBUG_NEW_BORDERS
+
+
+typedef enum {
+  BorderColorStyleNone,
+  BorderColorStyleSolid,
+  BorderColorStyleLight,
+  BorderColorStyleDark
+} BorderColorStyle;
+
+class nsPresContext;
+
+class nsCSSBorderRenderer final {
+  typedef mozilla::gfx::Bezier Bezier;
+  typedef mozilla::gfx::ColorPattern ColorPattern;
+  typedef mozilla::gfx::DrawTarget DrawTarget;
+  typedef mozilla::gfx::Float Float;
+  typedef mozilla::gfx::Path Path;
+  typedef mozilla::gfx::Point Point;
+  typedef mozilla::gfx::Rect Rect;
+  typedef mozilla::gfx::Margin Margin;
+  typedef mozilla::gfx::RectCornerRadii RectCornerRadii;
+  typedef mozilla::gfx::StrokeOptions StrokeOptions;
+
+  friend class mozilla::nsDisplayOutline;
+  friend class mozilla::nsDisplayButtonBorder;
+
+ public:
+  nsCSSBorderRenderer(nsPresContext* aPresContext, DrawTarget* aDrawTarget,
+                      const Rect& aDirtyRect, Rect& aOuterRect,
+                      const mozilla::StyleBorderStyle* aBorderStyles,
+                      const Margin& aBorderWidths,
+                      RectCornerRadii& aBorderRadii,
+                      const nscolor* aBorderColors, bool aBackfaceIsVisible,
+                      const mozilla::Maybe<Rect>& aClipRect);
+
+  void DrawBorders();
+
+  void CreateWebRenderCommands(
+      mozilla::nsDisplayItem* aItem, mozilla::wr::DisplayListBuilder& aBuilder,
+      mozilla::wr::IpcResourceUpdateQueue& aResources,
+      const mozilla::layers::StackingContextHelper& aSc);
+
+  static void ComputeInnerRadii(const RectCornerRadii& aRadii,
+                                const Margin& aBorderSizes,
+                                RectCornerRadii* aInnerRadiiRet);
+
+  static void ComputeOuterRadii(const RectCornerRadii& aRadii,
+                                const Margin& aBorderSizes,
+                                RectCornerRadii* aOuterRadiiRet);
+
+  static bool AllCornersZeroSize(const RectCornerRadii& corners);
+
+ private:
+  RectCornerRadii mBorderCornerDimensions;
+
+  nsPresContext* mPresContext;
+
+  DrawTarget* mDrawTarget;
+  Rect mDirtyRect;
+
+  Rect mOuterRect;
+  Rect mInnerRect;
+
+  mozilla::StyleBorderStyle mBorderStyles[4];
+  Margin mBorderWidths;
+  RectCornerRadii mBorderRadii;
+
+  nscolor mBorderColors[4];
+
+  bool mAllBordersSameStyle;
+  bool mAllBordersSameWidth;
+  bool mOneUnitBorder;
+  bool mNoBorderRadius;
+  bool mAvoidStroke;
+  bool mBackfaceIsVisible;
+  mozilla::Maybe<Rect> mLocalClip;
+
+  bool AreBorderSideFinalStylesSame(mozilla::SideBits aSides);
+
+  bool IsSolidCornerStyle(mozilla::StyleBorderStyle aStyle,
+                          mozilla::Corner aCorner);
+
+  bool IsCornerMergeable(mozilla::Corner aCorner);
+
+  BorderColorStyle BorderColorStyleForSolidCorner(
+      mozilla::StyleBorderStyle aStyle, mozilla::Corner aCorner);
+
+
+  Rect GetCornerRect(mozilla::Corner aCorner);
+  Rect GetSideClipWithoutCornersRect(mozilla::Side aSide);
+
+  already_AddRefed<Path> GetSideClipSubPath(mozilla::Side aSide);
+
+  Point GetStraightBorderPoint(mozilla::Side aSide, mozilla::Corner aCorner,
+                               bool* aIsUnfilled, Float aDotOffset = 0.0f);
+
+  void GetOuterAndInnerBezier(Bezier* aOuterBezier, Bezier* aInnerBezier,
+                              mozilla::Corner aCorner);
+
+  void FillSolidBorder(const Rect& aOuterRect, const Rect& aInnerRect,
+                       const RectCornerRadii& aBorderRadii,
+                       const Margin& aBorderSizes, mozilla::SideBits aSides,
+                       const ColorPattern& aColor);
+
+
+  void DrawBorderSides(mozilla::SideBits aSides);
+
+  void SetupDashedOptions(StrokeOptions* aStrokeOptions, Float aDash[2],
+                          mozilla::Side aSide, Float aBorderLength,
+                          bool isCorner);
+
+  void DrawDashedOrDottedSide(mozilla::Side aSide);
+
+  void DrawDottedSideSlow(mozilla::Side aSide);
+
+  void DrawDashedOrDottedCorner(mozilla::Side aSide, mozilla::Corner aCorner);
+
+  void DrawDottedCornerSlow(mozilla::Side aSide, mozilla::Corner aCorner);
+
+  void DrawDashedCornerSlow(mozilla::Side aSide, mozilla::Corner aCorner);
+
+  void DrawFallbackSolidCorner(mozilla::Side aSide, mozilla::Corner aCorner);
+
+  bool AllBordersSameWidth();
+
+  bool AllBordersSolid();
+
+  void DrawSingleWidthSolidBorder();
+
+  void DrawSolidBorder();
+};
+
+class nsCSSBorderImageRenderer final {
+  typedef mozilla::nsImageRenderer nsImageRenderer;
+
+ public:
+  static mozilla::Maybe<nsCSSBorderImageRenderer> CreateBorderImageRenderer(
+      nsPresContext* aPresContext, nsIFrame* aForFrame,
+      const nsRect& aBorderArea, const nsStyleBorder& aStyleBorder,
+      const nsRect& aDirtyRect, nsIFrame::Sides aSkipSides, uint32_t aFlags,
+      mozilla::image::ImgDrawResult* aDrawResult);
+
+  mozilla::image::ImgDrawResult DrawBorderImage(nsPresContext* aPresContext,
+                                                gfxContext& aRenderingContext,
+                                                nsIFrame* aForFrame,
+                                                const nsRect& aDirtyRect);
+  mozilla::image::ImgDrawResult CreateWebRenderCommands(
+      mozilla::nsDisplayItem* aItem, nsIFrame* aForFrame,
+      mozilla::wr::DisplayListBuilder& aBuilder,
+      mozilla::wr::IpcResourceUpdateQueue& aResources,
+      const mozilla::layers::StackingContextHelper& aSc,
+      mozilla::layers::RenderRootStateManager* aManager,
+      mozilla::nsDisplayListBuilder* aDisplayListBuilder);
+
+  nsCSSBorderImageRenderer(const nsCSSBorderImageRenderer& aRhs);
+  nsCSSBorderImageRenderer& operator=(const nsCSSBorderImageRenderer& aRhs);
+
+ private:
+  nsCSSBorderImageRenderer(nsIFrame* aForFrame, const nsRect& aBorderArea,
+                           const nsStyleBorder& aStyleBorder,
+                           nsIFrame::Sides aSkipSides,
+                           const nsImageRenderer& aImageRenderer);
+
+  nsImageRenderer mImageRenderer;
+  nsSize mImageSize;
+  nsMargin mSlice;
+  nsMargin mWidths;
+  nsMargin mImageOutset;
+  nsRect mArea;
+  nsRect mClip;
+  mozilla::StyleBorderImageRepeatKeyword mRepeatModeHorizontal;
+  mozilla::StyleBorderImageRepeatKeyword mRepeatModeVertical;
+  bool mFill;
+
+  friend class mozilla::nsDisplayBorder;
+  friend struct nsCSSRendering;
+};
+
+namespace mozilla {
+#ifdef DEBUG_NEW_BORDERS
+#  include <stdarg.h>
+
+static inline void PrintAsString(const mozilla::gfx::Point& p) {
+  fprintf(stderr, "[%f,%f]", p.x, p.y);
+}
+
+static inline void PrintAsString(const mozilla::gfx::Size& s) {
+  fprintf(stderr, "[%f %f]", s.width, s.height);
+}
+
+static inline void PrintAsString(const mozilla::gfx::Rect& r) {
+  fprintf(stderr, "[%f %f %f %f]", r.X(), r.Y(), r.Width(), r.Height());
+}
+
+static inline void PrintAsString(const mozilla::gfx::Float f) {
+  fprintf(stderr, "%f", f);
+}
+
+static inline void PrintAsString(const char* s) { fprintf(stderr, "%s", s); }
+
+static inline void PrintAsStringNewline(const char* s = nullptr) {
+  if (s) fprintf(stderr, "%s", s);
+  fprintf(stderr, "\n");
+  fflush(stderr);
+}
+
+static inline MOZ_FORMAT_PRINTF(1, 2) void PrintAsFormatString(const char* fmt,
+                                                               ...) {
+  va_list vl;
+  va_start(vl, fmt);
+  vfprintf(stderr, fmt, vl);
+  va_end(vl);
+}
+
+#else
+static inline void PrintAsString(const mozilla::gfx::Point& p) {}
+static inline void PrintAsString(const mozilla::gfx::Size& s) {}
+static inline void PrintAsString(const mozilla::gfx::Rect& r) {}
+static inline void PrintAsString(const mozilla::gfx::Float f) {}
+static inline void PrintAsString(const char* s) {}
+static inline void PrintAsStringNewline(const char* s = nullptr) {}
+static inline MOZ_FORMAT_PRINTF(1, 2) void PrintAsFormatString(const char* fmt,
+                                                               ...) {}
+#endif
+
+}  
+
+#endif /* NS_CSS_RENDERING_BORDERS_H */

@@ -1,0 +1,466 @@
+/*
+ * Copyright (c) 2016, Alliance for Open Media. All rights reserved.
+ *
+ * This source code is subject to the terms of the BSD 2 Clause License and
+ * the Alliance for Open Media Patent License 1.0. If the BSD 2 Clause License
+ * was not distributed with this source code in the LICENSE file, you can
+ * obtain it at www.aomedia.org/license/software. If the Alliance for Open
+ * Media Patent License 1.0 was not distributed with this source code in the
+ * PATENTS file, you can obtain it at www.aomedia.org/license/patent.
+ */
+
+#if !defined(AOM_AV1_DECODER_DECODER_H_)
+#define AOM_AV1_DECODER_DECODER_H_
+
+#include "config/aom_config.h"
+
+#include "aom/aom_codec.h"
+#include "aom_dsp/bitreader.h"
+#include "aom_scale/yv12config.h"
+#include "aom_util/aom_thread.h"
+
+#include "av1/common/av1_common_int.h"
+#include "av1/common/thread_common.h"
+#include "av1/decoder/dthread.h"
+#if CONFIG_ACCOUNTING
+#include "av1/decoder/accounting.h"
+#endif
+#if CONFIG_INSPECTION
+#include "av1/decoder/inspection.h"
+#endif
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+/*!
+ * \brief Contains coding block data required by the decoder.
+ *
+ * This includes:
+ * - Coding block info that is common between encoder and decoder.
+ * - Other coding block info only needed by the decoder.
+ * Contrast this with a similar struct MACROBLOCK on encoder side.
+ * This data is also common between ThreadData and AV1Decoder structs.
+ */
+typedef struct DecoderCodingBlock {
+  /*!
+   * Coding block info that is common between encoder and decoder.
+   */
+  DECLARE_ALIGNED(32, MACROBLOCKD, xd);
+  /*!
+   * True if the at least one of the coding blocks decoded was corrupted.
+   */
+  int corrupted;
+  /*!
+   * Pointer to 'mc_buf' inside 'pbi->td' (single-threaded decoding) or
+   * 'pbi->thread_data[i].td' (multi-threaded decoding).
+   */
+  uint8_t *mc_buf[2];
+  /*!
+   * Pointer to 'dqcoeff' inside 'td->cb_buffer_base' or 'pbi->cb_buffer_base'
+   * with appropriate offset for the current superblock, for each plane.
+   */
+  tran_low_t *dqcoeff_block[MAX_MB_PLANE];
+  /*!
+   * cb_offset[p] is the offset into the dqcoeff_block[p] for the current coding
+   * block, for each plane 'p'.
+   */
+  uint16_t cb_offset[MAX_MB_PLANE];
+  /*!
+   * Pointer to 'eob_data' inside 'td->cb_buffer_base' or 'pbi->cb_buffer_base'
+   * with appropriate offset for the current superblock, for each plane.
+   */
+  eob_info *eob_data[MAX_MB_PLANE];
+  /*!
+   * txb_offset[p] is the offset into the eob_data[p] for the current coding
+   * block, for each plane 'p'.
+   */
+  uint16_t txb_offset[MAX_MB_PLANE];
+  /*!
+   * ref_mv_count[i] specifies the number of number of motion vector candidates
+   * in xd->ref_mv_stack[i].
+   */
+  uint8_t ref_mv_count[MODE_CTX_REF_FRAMES];
+} DecoderCodingBlock;
+
+/*!\cond */
+
+typedef void (*decode_block_visitor_fn_t)(const AV1_COMMON *const cm,
+                                          DecoderCodingBlock *dcb,
+                                          aom_reader *const r, const int plane,
+                                          const int row, const int col,
+                                          const TX_SIZE tx_size);
+
+typedef void (*predict_inter_block_visitor_fn_t)(AV1_COMMON *const cm,
+                                                 DecoderCodingBlock *dcb,
+                                                 BLOCK_SIZE bsize);
+
+typedef void (*cfl_store_inter_block_visitor_fn_t)(AV1_COMMON *const cm,
+                                                   MACROBLOCKD *const xd);
+
+typedef struct ThreadData {
+  DecoderCodingBlock dcb;
+
+  CB_BUFFER cb_buffer_base;
+
+  aom_reader *bit_reader;
+
+  uint8_t *mc_buf[2];
+  uint8_t *seg_mask;
+  int32_t mc_buf_size;
+  int mc_buf_use_highbd;  
+
+  CONV_BUF_TYPE *tmp_conv_dst;
+  uint8_t *tmp_obmc_bufs[2];
+
+  decode_block_visitor_fn_t read_coeffs_tx_intra_block_visit;
+  decode_block_visitor_fn_t predict_and_recon_intra_block_visit;
+  decode_block_visitor_fn_t read_coeffs_tx_inter_block_visit;
+  decode_block_visitor_fn_t inverse_tx_inter_block_visit;
+  predict_inter_block_visitor_fn_t predict_inter_block_visit;
+  cfl_store_inter_block_visitor_fn_t cfl_store_inter_block_visit;
+} ThreadData;
+
+typedef struct AV1DecRowMTJobInfo {
+  int tile_row;
+  int tile_col;
+  int mi_row;
+} AV1DecRowMTJobInfo;
+
+typedef struct AV1DecRowMTSyncData {
+#if CONFIG_MULTITHREAD
+  pthread_mutex_t *mutex_;
+  pthread_cond_t *cond_;
+#endif
+  int allocated_sb_rows;
+  int *cur_sb_col;
+  int sync_range;
+  int intrabc_extra_top_right_sb_delay;
+  int mi_rows;
+  int mi_cols;
+  int mi_rows_parse_done;
+  int mi_rows_decode_started;
+  int num_threads_working;
+} AV1DecRowMTSync;
+
+typedef struct AV1DecRowMTInfo {
+  int tile_rows_start;
+  int tile_rows_end;
+  int tile_cols_start;
+  int tile_cols_end;
+  int start_tile;
+  int end_tile;
+  int mi_rows_to_decode;
+
+
+  int mi_rows_parse_done;
+  int mi_rows_decode_started;
+  int row_mt_exit;
+} AV1DecRowMTInfo;
+
+typedef struct TileDataDec {
+  TileInfo tile_info;
+  aom_reader bit_reader;
+  DECLARE_ALIGNED(16, FRAME_CONTEXT, tctx);
+  AV1DecRowMTSync dec_row_mt_sync;
+} TileDataDec;
+
+typedef struct TileBufferDec {
+  const uint8_t *data;
+  size_t size;
+} TileBufferDec;
+
+typedef struct DataBuffer {
+  const uint8_t *data;
+  size_t size;
+} DataBuffer;
+
+typedef struct EXTERNAL_REFERENCES {
+  YV12_BUFFER_CONFIG refs[MAX_EXTERNAL_REFERENCES];
+  int num;
+} EXTERNAL_REFERENCES;
+
+typedef struct TileJobsDec {
+  TileBufferDec *tile_buffer;
+  TileDataDec *tile_data;
+} TileJobsDec;
+
+typedef struct AV1DecTileMTData {
+#if CONFIG_MULTITHREAD
+  pthread_mutex_t *job_mutex;
+#endif
+  TileJobsDec *job_queue;
+  int jobs_enqueued;
+  int jobs_dequeued;
+  int alloc_tile_rows;
+  int alloc_tile_cols;
+} AV1DecTileMT;
+
+#if CONFIG_COLLECT_COMPONENT_TIMING
+#include "aom_ports/aom_timer.h"
+enum {
+  decode_mbmi_block_time,
+  decode_token_recon_block_intra_time,
+  predict_inter_block_time,
+  decode_reconstruct_tx_inter_time,
+  decode_token_recon_block_inter_time,
+  decode_token_recon_block_time,
+  parse_decode_block_time,
+  decode_tile_time,
+  decode_tiles_time,
+  av1_loop_filter_frame_time,
+  cdef_and_lr_time,
+  av1_decode_tg_tiles_and_wrapup_time,
+  aom_decode_frame_from_obus_time,
+  kTimingComponents,
+} UENUM1BYTE(TIMING_COMPONENT);
+
+static inline char const *get_component_name(int index) {
+  switch (index) {
+    case decode_mbmi_block_time: return "decode_mbmi_block_time";
+    case decode_token_recon_block_intra_time:
+      return "decode_token_recon_block_intra_time";
+    case predict_inter_block_time: return "predict_inter_block_time";
+    case decode_reconstruct_tx_inter_time:
+      return "decode_reconstruct_tx_inter_time";
+    case decode_token_recon_block_inter_time:
+      return "decode_token_recon_block_inter_time";
+    case decode_token_recon_block_time: return "decode_token_recon_block_time";
+    case parse_decode_block_time: return "parse_decode_block_time";
+    case decode_tile_time: return "decode_tile_time";
+    case decode_tiles_time: return "decode_tiles_time";
+    case av1_loop_filter_frame_time: return "av1_loop_filter_frame_time";
+    case cdef_and_lr_time: return "cdef_and_lr_time";
+    case av1_decode_tg_tiles_and_wrapup_time:
+      return "av1_decode_tg_tiles_and_wrapup_time";
+    case aom_decode_frame_from_obus_time:
+      return "aom_decode_frame_from_obus_time";
+
+    default: assert(0);
+  }
+  return "error";
+}
+#endif
+
+typedef struct AV1Decoder {
+  DecoderCodingBlock dcb;
+
+  DECLARE_ALIGNED(32, AV1_COMMON, common);
+
+  AVxWorker lf_worker;
+  AV1LfSync lf_row_sync;
+  AV1LrSync lr_row_sync;
+  AV1LrStruct lr_ctxt;
+  AV1CdefSync cdef_sync;
+  AV1CdefWorkerData *cdef_worker;
+  AVxWorker *tile_workers;
+  int num_workers;
+  DecWorkerData *thread_data;
+  ThreadData td;
+  TileDataDec *tile_data;
+  int allocated_tiles;
+
+  TileBufferDec tile_buffers[MAX_TILE_ROWS][MAX_TILE_COLS];
+  AV1DecTileMT tile_mt_info;
+
+  int output_all_layers;
+  RefCntBuffer *output_frames[MAX_NUM_SPATIAL_LAYERS];
+  size_t num_output_frames;  
+
+  int decoding_first_frame;
+
+  int allow_lowbitdepth;
+  int max_threads;
+  int inv_tile_order;
+  int need_resync;  
+  int reset_decoder_state;
+
+  int tile_size_bytes;
+  int tile_col_size_bytes;
+  int dec_tile_row, dec_tile_col;  
+#if CONFIG_ACCOUNTING
+  int acct_enabled;
+  Accounting accounting;
+#endif
+  int sequence_header_ready;
+  int sequence_header_changed;
+#if CONFIG_INSPECTION
+  aom_inspect_cb inspect_cb;
+  void *inspect_ctx;
+  int *sb_bits;
+  int sb_bits_alloc_size;
+#endif
+  int operating_point;
+  int current_operating_point;
+  unsigned int frame_size_limit;
+  int seen_frame_header;
+  int next_start_tile;
+
+  int camera_frame_header_ready;
+  size_t frame_header_size;
+  DataBuffer obu_size_hdr;
+  int output_frame_width_in_tiles_minus_1;
+  int output_frame_height_in_tiles_minus_1;
+  int tile_count_minus_1;
+  uint32_t coded_tile_data_size;
+  unsigned int ext_tile_debug;  
+
+  unsigned int row_mt;
+
+  EXTERNAL_REFERENCES ext_refs;
+  YV12_BUFFER_CONFIG tile_list_outbuf;
+
+  CB_BUFFER *cb_buffer_base;
+  int cb_buffer_alloc_size;
+
+  int allocated_row_mt_sync_rows;
+
+#if CONFIG_MULTITHREAD
+  pthread_mutex_t *row_mt_mutex_;
+  pthread_cond_t *row_mt_cond_;
+#endif
+
+  AV1DecRowMTInfo frame_row_mt_info;
+  aom_metadata_array_t *metadata;
+
+  int context_update_tile_id;
+  int skip_loop_filter;
+  int skip_film_grain;
+  int is_annexb;
+  int valid_for_referencing[REF_FRAMES];
+  int is_fwd_kf_present;
+  int is_arf_frame_present;
+  int num_tile_groups;
+  aom_s_frame_info sframe_info;
+
+  /*!
+   * Elements part of the sequence header, that are applicable for all the
+   * frames in the video.
+   */
+  SequenceHeader seq_params;
+
+  /*!
+   * If true, buffer removal times are present.
+   */
+  bool buffer_removal_time_present;
+
+  /*!
+   * Code and details about current error status.
+   */
+  struct aom_internal_error_info error;
+
+  /*!
+   * Number of temporal layers: may be > 1 for SVC (scalable vector coding).
+   */
+  unsigned int number_temporal_layers;
+
+  /*!
+   * Number of spatial layers: may be > 1 for SVC (scalable vector coding).
+   */
+  unsigned int number_spatial_layers;
+
+#if CONFIG_COLLECT_COMPONENT_TIMING
+  /*!
+   * component_time[] are initialized to zero while decoder starts.
+   */
+  uint64_t component_time[kTimingComponents];
+  struct aom_usec_timer component_timer[kTimingComponents];
+  /*!
+   * frame_component_time[] are initialized to zero at beginning of each frame.
+   */
+  uint64_t frame_component_time[kTimingComponents];
+#endif
+} AV1Decoder;
+
+int av1_receive_compressed_data(struct AV1Decoder *pbi, size_t size,
+                                const uint8_t **psource);
+
+int av1_get_raw_frame(AV1Decoder *pbi, size_t index, YV12_BUFFER_CONFIG **sd,
+                      aom_film_grain_t **grain_params);
+
+int av1_get_frame_to_show(struct AV1Decoder *pbi, YV12_BUFFER_CONFIG *frame);
+
+aom_codec_err_t av1_copy_reference_dec(struct AV1Decoder *pbi, int idx,
+                                       YV12_BUFFER_CONFIG *sd);
+
+aom_codec_err_t av1_set_reference_dec(AV1_COMMON *cm, int idx,
+                                      int use_external_ref,
+                                      YV12_BUFFER_CONFIG *sd);
+aom_codec_err_t av1_copy_new_frame_dec(AV1_COMMON *cm,
+                                       YV12_BUFFER_CONFIG *new_frame,
+                                       YV12_BUFFER_CONFIG *sd);
+
+struct AV1Decoder *av1_decoder_create(BufferPool *const pool);
+
+void av1_decoder_remove(struct AV1Decoder *pbi);
+void av1_dealloc_dec_jobs(struct AV1DecTileMTData *tile_mt_info);
+
+void av1_dec_row_mt_dealloc(AV1DecRowMTSync *dec_row_mt_sync);
+
+void av1_dec_free_cb_buf(AV1Decoder *pbi);
+
+static inline void decrease_ref_count(RefCntBuffer *const buf,
+                                      BufferPool *const pool) {
+  if (buf != NULL) {
+    --buf->ref_count;
+    assert(buf->ref_count >= 0);
+    if (buf->ref_count == 0 && buf->raw_frame_buffer.data) {
+      pool->release_fb_cb(pool->cb_priv, &buf->raw_frame_buffer);
+      buf->raw_frame_buffer.data = NULL;
+      buf->raw_frame_buffer.size = 0;
+      buf->raw_frame_buffer.priv = NULL;
+    }
+  }
+}
+
+#define ACCT_STR __func__
+static inline int av1_read_uniform(aom_reader *r, int n) {
+  const int l = get_unsigned_bits(n);
+  const int m = (1 << l) - n;
+  const int v = aom_read_literal(r, l - 1, ACCT_STR);
+  assert(l != 0);
+  if (v < m)
+    return v;
+  else
+    return (v << 1) - m + aom_read_literal(r, 1, ACCT_STR);
+}
+
+typedef void (*palette_visitor_fn_t)(MACROBLOCKD *const xd, int plane,
+                                     aom_reader *r);
+
+void av1_visit_palette(AV1Decoder *const pbi, MACROBLOCKD *const xd,
+                       aom_reader *r, palette_visitor_fn_t visit);
+
+typedef void (*block_visitor_fn_t)(AV1Decoder *const pbi, ThreadData *const td,
+                                   int mi_row, int mi_col, aom_reader *r,
+                                   PARTITION_TYPE partition, BLOCK_SIZE bsize);
+
+/*!\endcond */
+
+#if CONFIG_COLLECT_COMPONENT_TIMING
+static inline void start_timing(AV1Decoder *pbi, int component) {
+  aom_usec_timer_start(&pbi->component_timer[component]);
+}
+static inline void end_timing(AV1Decoder *pbi, int component) {
+  aom_usec_timer_mark(&pbi->component_timer[component]);
+  pbi->frame_component_time[component] +=
+      aom_usec_timer_elapsed(&pbi->component_timer[component]);
+}
+
+static inline char const *get_frame_type_enum(int type) {
+  switch (type) {
+    case 0: return "KEY_FRAME";
+    case 1: return "INTER_FRAME";
+    case 2: return "INTRA_ONLY_FRAME";
+    case 3: return "S_FRAME";
+    default: assert(0);
+  }
+  return "error";
+}
+#endif
+
+#if defined(__cplusplus)
+}  
+#endif
+
+#endif

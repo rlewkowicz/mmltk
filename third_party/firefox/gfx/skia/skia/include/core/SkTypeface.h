@@ -1,0 +1,245 @@
+/*
+ * Copyright 2006 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkTypeface_DEFINED)
+#define SkTypeface_DEFINED
+
+#include "include/core/SkFontArguments.h"
+#include "include/core/SkFontParameters.h"
+#include "include/core/SkFontStyle.h"
+#include "include/core/SkFourByteTag.h"
+#include "include/core/SkRect.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkSpan.h"
+#include "include/core/SkString.h"
+#include "include/core/SkTypes.h"
+#include "include/private/SkWeakRefCnt.h"
+#include "include/private/base/SkOnce.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+
+class SkData;
+class SkDescriptor;
+class SkFontMgr;
+class SkFontDescriptor;
+class SkScalerContext;
+class SkStream;
+class SkStreamAsset;
+class SkWStream;
+enum class SkTextEncoding;
+struct SkAdvancedTypefaceMetrics;
+struct SkScalerContextEffects;
+struct SkScalerContextRec;
+
+using SkTypefaceID = uint32_t;
+
+typedef uint32_t SkFontTableTag;
+
+class SK_API SkTypeface : public SkWeakRefCnt {
+public:
+    SkFontStyle fontStyle() const;
+
+    bool isBold() const;
+
+    bool isItalic() const;
+
+    bool isFixedPitch() const;
+
+    int getVariationDesignPosition(
+                       SkSpan<SkFontArguments::VariationPosition::Coordinate> coordinates) const;
+
+    int getVariationDesignParameters(SkSpan<SkFontParameters::Variation::Axis> parameters) const;
+
+    bool isSyntheticBold() const;
+
+    bool isSyntheticOblique() const;
+
+    SkTypefaceID uniqueID() const { return fUniqueID; }
+
+    static bool Equal(const SkTypeface* facea, const SkTypeface* faceb);
+
+    static sk_sp<SkTypeface> MakeEmpty();
+
+    sk_sp<SkTypeface> makeClone(const SkFontArguments&) const;
+
+    enum class SerializeBehavior {
+        kDoIncludeData,
+        kDontIncludeData,
+        kIncludeDataIfLocal,
+    };
+
+    bool serialize(SkWStream*, SerializeBehavior = SerializeBehavior::kIncludeDataIfLocal) const;
+
+    sk_sp<SkData> serialize(SerializeBehavior = SerializeBehavior::kIncludeDataIfLocal) const;
+
+
+    static sk_sp<SkTypeface> MakeDeserialize(SkStream*, sk_sp<SkFontMgr> lastResortMgr);
+
+    void unicharsToGlyphs(SkSpan<const SkUnichar> unis, SkSpan<SkGlyphID> glyphs) const;
+
+    size_t textToGlyphs(const void* text, size_t byteLength, SkTextEncoding encoding,
+                        SkSpan<SkGlyphID> glyphs) const;
+
+    SkGlyphID unicharToGlyph(SkUnichar unichar) const;
+
+    int countGlyphs() const;
+
+
+    int countTables() const;
+
+    int readTableTags(SkSpan<SkFontTableTag> tags) const;
+
+    size_t getTableSize(SkFontTableTag) const;
+
+    size_t getTableData(SkFontTableTag tag, size_t offset, size_t length,
+                        void* data) const;
+
+    sk_sp<SkData> copyTableData(SkFontTableTag tag) const;
+
+    int getUnitsPerEm() const;
+
+    bool getKerningPairAdjustments(SkSpan<const SkGlyphID> glyphs,
+                                   SkSpan<int32_t> adjustments) const;
+
+    struct LocalizedString {
+        SkString fString;
+        SkString fLanguage;
+    };
+    class LocalizedStrings {
+    public:
+        LocalizedStrings() = default;
+        virtual ~LocalizedStrings() { }
+        virtual bool next(LocalizedString* localizedString) = 0;
+        void unref() { delete this; }
+
+    private:
+        LocalizedStrings(const LocalizedStrings&) = delete;
+        LocalizedStrings& operator=(const LocalizedStrings&) = delete;
+    };
+    LocalizedStrings* createFamilyNameIterator() const;
+
+    void getFamilyName(SkString* name) const;
+
+    bool getPostScriptName(SkString* name) const;
+
+    int getResourceName(SkString* resourceName) const;
+
+    std::unique_ptr<SkStreamAsset> openStream(int* ttcIndex) const;
+
+    std::unique_ptr<SkStreamAsset> openExistingStream(int* ttcIndex) const;
+
+    std::unique_ptr<SkScalerContext> createScalerContext(const SkScalerContextEffects&,
+                                                         const SkDescriptor*) const;
+
+    SkRect getBounds() const;
+
+    virtual bool hasColorGlyphs() const { return false; }
+
+    void filterRec(SkScalerContextRec* rec) const {
+        this->onFilterRec(rec);
+    }
+    void getFontDescriptor(SkFontDescriptor* desc, bool* isLocal) const {
+        this->onGetFontDescriptor(desc, isLocal);
+    }
+    void* internal_private_getCTFontRef() const {
+        return this->onGetCTFontRef();
+    }
+
+    using FactoryId = SkFourByteTag;
+    static void Register(
+            FactoryId id,
+            sk_sp<SkTypeface> (*make)(std::unique_ptr<SkStreamAsset>, const SkFontArguments&));
+
+protected:
+    enum { MAX_REASONABLE_TABLE_COUNT = (1 << 16) - 1 };
+
+    explicit SkTypeface(const SkFontStyle& style, bool isFixedPitch = false);
+    ~SkTypeface() override;
+
+    virtual sk_sp<SkTypeface> onMakeClone(const SkFontArguments&) const = 0;
+
+    void setIsFixedPitch(bool isFixedPitch) { fIsFixedPitch = isFixedPitch; }
+    void setFontStyle(SkFontStyle style) { fStyle = style; }
+
+    virtual SkFontStyle onGetFontStyle() const; 
+
+    virtual bool onGetFixedPitch() const; 
+
+    virtual std::unique_ptr<SkScalerContext> onCreateScalerContext(
+        const SkScalerContextEffects&, const SkDescriptor*) const = 0;
+    virtual std::unique_ptr<SkScalerContext> onCreateScalerContextAsProxyTypeface
+        (const SkScalerContextEffects&, const SkDescriptor*, SkTypeface* proxyTypeface) const;
+    virtual void onFilterRec(SkScalerContextRec*) const = 0;
+    friend class SkScalerContext;  
+
+    virtual std::unique_ptr<SkAdvancedTypefaceMetrics> onGetAdvancedMetrics() const = 0;
+    virtual void getPostScriptGlyphNames(SkString*) const = 0;
+
+    virtual void getGlyphToUnicodeMap(SkSpan<SkUnichar> dstArray) const = 0;
+
+    virtual std::unique_ptr<SkStreamAsset> onOpenStream(int* ttcIndex) const = 0;
+
+    virtual std::unique_ptr<SkStreamAsset> onOpenExistingStream(int* ttcIndex) const;
+
+    virtual bool onGlyphMaskNeedsCurrentColor() const = 0;
+
+    virtual int onGetVariationDesignPosition(
+                                 SkSpan<SkFontArguments::VariationPosition::Coordinate>) const = 0;
+
+    virtual int onGetVariationDesignParameters(SkSpan<SkFontParameters::Variation::Axis>) const = 0;
+
+    virtual bool onIsSyntheticBold() const;
+    virtual bool onIsSyntheticOblique() const;
+
+    virtual void onGetFontDescriptor(SkFontDescriptor*, bool* isLocal) const = 0;
+
+    virtual void onCharsToGlyphs(SkSpan<const SkUnichar>, SkSpan<SkGlyphID>) const = 0;
+    virtual int onCountGlyphs() const = 0;
+
+    virtual int onGetUPEM() const = 0;
+    virtual bool onGetKerningPairAdjustments(SkSpan<const SkGlyphID>,
+                                             SkSpan<int32_t> adjustments) const;
+
+    virtual void onGetFamilyName(SkString* familyName) const = 0;
+    virtual bool onGetPostScriptName(SkString*) const = 0;
+    virtual int onGetResourceName(SkString* resourceName) const; 
+
+    virtual LocalizedStrings* onCreateFamilyNameIterator() const = 0;
+
+    virtual int onGetTableTags(SkSpan<SkFontTableTag>) const = 0;
+    virtual size_t onGetTableData(SkFontTableTag, size_t offset,
+                                  size_t length, void* data) const = 0;
+    virtual sk_sp<SkData> onCopyTableData(SkFontTableTag) const;
+
+    virtual bool onComputeBounds(SkRect*) const;
+
+    virtual void* onGetCTFontRef() const { return nullptr; }
+
+private:
+    bool glyphMaskNeedsCurrentColor() const;
+    friend class SkStrikeServerImpl;  
+    friend class SkTypefaceProxyPrototype;  
+
+    std::unique_ptr<SkAdvancedTypefaceMetrics> getAdvancedMetrics() const;
+    friend class SkRandomTypeface;   
+    friend class SkPDFFont;          
+    friend class SkTypeface_proxy;
+    friend class SkFontPriv;         
+    friend void TestSkTypefaceGlyphToUnicodeMap(SkTypeface&, SkSpan<SkUnichar>);
+
+private:
+    SkTypefaceID        fUniqueID;
+    SkFontStyle         fStyle;
+    mutable SkRect      fBounds;
+    mutable SkOnce      fBoundsOnce;
+    bool                fIsFixedPitch;
+
+    using INHERITED = SkWeakRefCnt;
+};
+#endif

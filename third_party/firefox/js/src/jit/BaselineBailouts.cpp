@@ -1,0 +1,1711 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/Assertions.h"
+#include "mozilla/CheckedArithmetic.h"
+#include "mozilla/Likely.h"
+#include "mozilla/ScopeExit.h"
+
+#include "builtin/ModuleObject.h"
+#include "debugger/DebugAPI.h"
+#include "gc/GC.h"
+#include "jit/Bailouts.h"
+#include "jit/BaselineFrame.h"
+#include "jit/BaselineIC.h"
+#include "jit/BaselineJIT.h"
+#include "jit/CalleeToken.h"
+#include "jit/Invalidation.h"
+#include "jit/Ion.h"
+#include "jit/IonScript.h"
+#include "jit/JitFrames.h"
+#include "jit/JitRuntime.h"
+#include "jit/JitSpewer.h"
+#include "jit/JitZone.h"
+#include "jit/RematerializedFrame.h"
+#include "jit/SharedICRegisters.h"
+#include "jit/Simulator.h"
+#include "jit/VMFunctions.h"
+#include "js/friend/StackLimits.h"  // js::AutoCheckRecursionLimit, js::ReportOverRecursed
+#include "js/Utility.h"
+#include "proxy/ScriptedProxyHandler.h"
+#include "util/Memory.h"
+#include "vm/ArgumentsObject.h"
+#include "vm/BytecodeUtil.h"
+#include "vm/Iteration.h"
+#include "vm/JitActivation.h"
+
+#include "jit/JitFrames-inl.h"
+#include "vm/JSAtomUtils-inl.h"
+#include "vm/JSContext-inl.h"
+#include "vm/JSScript-inl.h"
+
+using namespace js;
+using namespace js::jit;
+
+using mozilla::DebugOnly;
+using mozilla::Maybe;
+
+template <typename T>
+class BufferPointer {
+  const UniquePtr<BaselineBailoutInfo>& header_;
+  size_t offset_;
+  bool heap_;
+
+ public:
+  BufferPointer(const UniquePtr<BaselineBailoutInfo>& header, size_t offset,
+                bool heap)
+      : header_(header), offset_(offset), heap_(heap) {}
+
+  T* get() const {
+    BaselineBailoutInfo* header = header_.get();
+    if (!heap_) {
+      return (T*)(header->incomingStack + offset_);
+    }
+
+    uint8_t* p = header->copyStackTop - offset_;
+    MOZ_ASSERT(p >= header->copyStackBottom && p < header->copyStackTop);
+    return (T*)p;
+  }
+
+  void set(const T& value) { *get() = value; }
+
+  const T operator*() const { return *get(); }
+  T* operator->() const { return get(); }
+};
+
+class MOZ_STACK_CLASS BaselineStackBuilder {
+  JSContext* cx_;
+  JitFrameLayout* frame_ = nullptr;
+  SnapshotIterator& iter_;
+  RootedValueVector outermostFrameFormals_;
+
+  size_t bufferTotal_ = 1024;
+  size_t bufferAvail_ = 0;
+  size_t bufferUsed_ = 0;
+  size_t framePushed_ = 0;
+
+  UniquePtr<BaselineBailoutInfo> header_;
+
+  JSScript* script_;
+  JSFunction* fun_;
+  const ExceptionBailoutInfo* excInfo_;
+  ICScript* icScript_;
+
+  jsbytecode* pc_ = nullptr;
+  JSOp op_ = JSOp::Nop;
+  mozilla::Maybe<ResumeMode> resumeMode_;
+  uint32_t exprStackSlots_ = 0;
+  void* prevFramePtr_ = nullptr;
+  Maybe<BufferPointer<BaselineFrame>> blFrame_;
+
+  size_t frameNo_ = 0;
+  JSFunction* nextCallee_ = nullptr;
+
+  BailoutKind bailoutKind_;
+
+  bool canUseTrialInlinedICScripts_ = true;
+
+  gc::AutoSuppressGC suppress_;
+
+ public:
+  BaselineStackBuilder(JSContext* cx, const JSJitFrameIter& frameIter,
+                       SnapshotIterator& iter,
+                       const ExceptionBailoutInfo* excInfo,
+                       BailoutReason reason);
+
+  [[nodiscard]] bool init() {
+    MOZ_ASSERT(!header_);
+    MOZ_ASSERT(bufferUsed_ == 0);
+
+    uint8_t* bufferRaw = cx_->pod_calloc<uint8_t>(bufferTotal_);
+    if (!bufferRaw) {
+      return false;
+    }
+    bufferAvail_ = bufferTotal_ - sizeof(BaselineBailoutInfo);
+
+    header_.reset(new (bufferRaw) BaselineBailoutInfo());
+    header_->incomingStack = reinterpret_cast<uint8_t*>(frame_);
+    header_->copyStackTop = bufferRaw + bufferTotal_;
+    header_->copyStackBottom = header_->copyStackTop;
+    return true;
+  }
+
+  [[nodiscard]] bool buildOneFrame();
+  bool done();
+  void nextFrame();
+
+  JSScript* script() const { return script_; }
+  size_t frameNo() const { return frameNo_; }
+  bool isOutermostFrame() const { return frameNo_ == 0; }
+  MutableHandleValueVector outermostFrameFormals() {
+    return &outermostFrameFormals_;
+  }
+  BailoutKind bailoutKind() const { return bailoutKind_; }
+
+  inline JitFrameLayout* startFrame() { return frame_; }
+
+  BaselineBailoutInfo* info() {
+    MOZ_ASSERT(header_);
+    return header_.get();
+  }
+
+  BaselineBailoutInfo* takeBuffer() {
+    MOZ_ASSERT(header_);
+    return header_.release();
+  }
+
+ private:
+  [[nodiscard]] bool initFrame();
+  [[nodiscard]] bool buildBaselineFrame();
+  [[nodiscard]] bool buildArguments();
+  [[nodiscard]] bool buildFixedSlots();
+  [[nodiscard]] bool fixUpCallerArgs(MutableHandleValueVector savedCallerArgs,
+                                     bool* fixedUp);
+  [[nodiscard]] bool buildFinallyException();
+  [[nodiscard]] bool buildExpressionStack();
+  [[nodiscard]] bool finishLastFrame();
+
+  [[nodiscard]] bool prepareForNextFrame(HandleValueVector savedCallerArgs);
+  [[nodiscard]] bool finishOuterFrame();
+
+  template <typename GetSlot>
+  [[nodiscard]] bool buildStubFrameArgs(uint32_t actualArgs, bool constructing,
+                                        GetSlot getSlot);
+  [[nodiscard]] bool buildStubFrame(uint32_t frameSize,
+                                    HandleValueVector savedCallerArgs);
+
+#ifdef DEBUG
+  [[nodiscard]] bool validateFrame();
+#endif
+
+#ifdef DEBUG
+  bool envChainSlotCanBeOptimized();
+#endif
+
+  bool isPrologueBailout();
+  jsbytecode* getResumePC();
+  void* getStubReturnAddress();
+
+  uint32_t exprStackSlots() const { return exprStackSlots_; }
+
+  bool catchingException() const {
+    return excInfo_ && excInfo_->catchingException() &&
+           excInfo_->frameNo() == frameNo_;
+  }
+
+  bool resumingInFinallyBlock() const {
+    return catchingException() && excInfo_->isFinally();
+  }
+
+  bool forcedReturn() const { return excInfo_ && excInfo_->forcedReturn(); }
+
+  bool propagatingIonExceptionForDebugMode() const {
+    return excInfo_ && excInfo_->propagatingIonExceptionForDebugMode();
+  }
+
+  void* prevFramePtr() const {
+    MOZ_ASSERT(prevFramePtr_);
+    return prevFramePtr_;
+  }
+  BufferPointer<BaselineFrame>& blFrame() { return blFrame_.ref(); }
+
+  void setNextCallee(JSFunction* nextCallee,
+                     TrialInliningState trialInliningState);
+  JSFunction* nextCallee() const { return nextCallee_; }
+
+  jsbytecode* pc() const { return pc_; }
+  bool resumeAfter() const {
+    return !catchingException() && iter_.resumeAfter();
+  }
+
+  ResumeMode resumeMode() const { return *resumeMode_; }
+
+  bool needToSaveCallerArgs() const {
+    return resumeMode() == ResumeMode::InlinedAccessor;
+  }
+
+  [[nodiscard]] bool enlarge() {
+    MOZ_ASSERT(header_ != nullptr);
+    size_t newSize;
+
+    if (MOZ_UNLIKELY(!mozilla::SafeMul(bufferTotal_, size_t(2), &newSize))) {
+      ReportOutOfMemory(cx_);
+      return false;
+    }
+
+    uint8_t* newBufferRaw = cx_->pod_calloc<uint8_t>(newSize);
+    if (!newBufferRaw) {
+      return false;
+    }
+
+    using BailoutInfoPtr = UniquePtr<BaselineBailoutInfo>;
+    BailoutInfoPtr newHeader(new (newBufferRaw) BaselineBailoutInfo(*header_));
+    newHeader->copyStackTop = newBufferRaw + newSize;
+    newHeader->copyStackBottom = newHeader->copyStackTop - bufferUsed_;
+    memcpy(newHeader->copyStackBottom, header_->copyStackBottom, bufferUsed_);
+    bufferTotal_ = newSize;
+    bufferAvail_ = newSize - (sizeof(BaselineBailoutInfo) + bufferUsed_);
+    header_ = std::move(newHeader);
+    return true;
+  }
+
+  void resetFramePushed() { framePushed_ = 0; }
+
+  size_t framePushed() const { return framePushed_; }
+
+  [[nodiscard]] bool subtract(size_t size, const char* info = nullptr) {
+    while (size > bufferAvail_) {
+      if (!enlarge()) {
+        return false;
+      }
+    }
+
+    header_->copyStackBottom -= size;
+    bufferAvail_ -= size;
+    bufferUsed_ += size;
+    framePushed_ += size;
+    if (info) {
+      JitSpew(JitSpew_BaselineBailouts, "      SUB_%03d   %p/%p %-15s",
+              (int)size, header_->copyStackBottom,
+              virtualPointerAtStackOffset(0), info);
+    }
+    return true;
+  }
+
+  template <typename T>
+  [[nodiscard]] bool write(const T& t) {
+    MOZ_ASSERT(!(uintptr_t(&t) >= uintptr_t(header_->copyStackBottom) &&
+                 uintptr_t(&t) < uintptr_t(header_->copyStackTop)),
+               "Should not reference memory that can be freed");
+    if (!subtract(sizeof(T))) {
+      return false;
+    }
+    memcpy(header_->copyStackBottom, &t, sizeof(T));
+    return true;
+  }
+
+  template <typename T>
+  [[nodiscard]] bool writePtr(T* t, const char* info) {
+    if (!write<T*>(t)) {
+      return false;
+    }
+    if (info) {
+      JitSpew(JitSpew_BaselineBailouts, "      WRITE_PTR %p/%p %-15s %p",
+              header_->copyStackBottom, virtualPointerAtStackOffset(0), info,
+              t);
+    }
+    return true;
+  }
+
+  [[nodiscard]] bool writeWord(size_t w, const char* info) {
+    if (!write<size_t>(w)) {
+      return false;
+    }
+    if (info) {
+      if (sizeof(size_t) == 4) {
+        JitSpew(JitSpew_BaselineBailouts, "      WRITE_WRD %p/%p %-15s %08zx",
+                header_->copyStackBottom, virtualPointerAtStackOffset(0), info,
+                w);
+      } else {
+        JitSpew(JitSpew_BaselineBailouts, "      WRITE_WRD %p/%p %-15s %016zx",
+                header_->copyStackBottom, virtualPointerAtStackOffset(0), info,
+                w);
+      }
+    }
+    return true;
+  }
+
+  [[nodiscard]] bool writeValue(const Value& val, const char* info) {
+    if (!write<Value>(val)) {
+      return false;
+    }
+    if (info) {
+      JitSpew(JitSpew_BaselineBailouts,
+              "      WRITE_VAL %p/%p %-15s %016" PRIx64,
+              header_->copyStackBottom, virtualPointerAtStackOffset(0), info,
+              *((uint64_t*)&val));
+    }
+    return true;
+  }
+
+  [[nodiscard]] bool peekLastValue(Value* result) {
+    if (bufferUsed_ < sizeof(Value)) {
+      return false;
+    }
+
+    memcpy(result, header_->copyStackBottom, sizeof(Value));
+    return true;
+  }
+
+  [[nodiscard]] bool maybeWritePadding(size_t alignment, size_t after,
+                                       const char* info) {
+    MOZ_ASSERT(framePushed_ % sizeof(Value) == 0);
+    MOZ_ASSERT(after % sizeof(Value) == 0);
+    size_t offset = ComputeByteAlignment(after, alignment);
+    while (framePushed_ % alignment != offset) {
+      if (!writeValue(MagicValue(JS_ARG_POISON), info)) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  void setResumeFramePtr(void* resumeFramePtr) {
+    header_->resumeFramePtr = resumeFramePtr;
+  }
+
+  void setResumeAddr(void* resumeAddr) { header_->resumeAddr = resumeAddr; }
+
+  template <typename T>
+  BufferPointer<T> pointerAtStackOffset(size_t offset) {
+    if (offset < bufferUsed_) {
+      offset = header_->copyStackTop - (header_->copyStackBottom + offset);
+      return BufferPointer<T>(header_, offset,  true);
+    }
+
+    return BufferPointer<T>(header_, offset - bufferUsed_,  false);
+  }
+
+  BufferPointer<Value> valuePointerAtStackOffset(size_t offset) {
+    return pointerAtStackOffset<Value>(offset);
+  }
+
+  inline uint8_t* virtualPointerAtStackOffset(size_t offset) {
+    if (offset < bufferUsed_) {
+      return reinterpret_cast<uint8_t*>(frame_) - (bufferUsed_ - offset);
+    }
+    return reinterpret_cast<uint8_t*>(frame_) + (offset - bufferUsed_);
+  }
+};
+
+void BaselineBailoutInfo::trace(JSTracer* trc) {
+  TraceRoot(trc, &tempId, "BaselineBailoutInfo::tempId");
+}
+
+BaselineStackBuilder::BaselineStackBuilder(JSContext* cx,
+                                           const JSJitFrameIter& frameIter,
+                                           SnapshotIterator& iter,
+                                           const ExceptionBailoutInfo* excInfo,
+                                           BailoutReason reason)
+    : cx_(cx),
+      frame_(static_cast<JitFrameLayout*>(frameIter.current())),
+      iter_(iter),
+      outermostFrameFormals_(cx),
+      script_(frameIter.script()),
+      fun_(frameIter.maybeCallee()),
+      excInfo_(excInfo),
+      icScript_(script_->jitScript()->icScript()),
+      bailoutKind_(iter.bailoutKind()),
+      suppress_(cx) {
+  MOZ_ASSERT(bufferTotal_ >= sizeof(BaselineBailoutInfo));
+  if (reason == BailoutReason::Invalidate) {
+    bailoutKind_ = BailoutKind::OnStackInvalidation;
+  }
+}
+
+bool BaselineStackBuilder::initFrame() {
+  if (catchingException()) {
+    pc_ = excInfo_->resumePC();
+    resumeMode_ = mozilla::Some(ResumeMode::ResumeAt);
+  } else {
+    pc_ = script_->offsetToPC(iter_.pcOffset());
+    resumeMode_ = mozilla::Some(iter_.resumeMode());
+  }
+  op_ = JSOp(*pc_);
+
+  if (catchingException()) {
+    exprStackSlots_ = excInfo_->numExprSlots();
+  } else {
+    uint32_t totalFrameSlots = iter_.numAllocations();
+    uint32_t fixedSlots = script_->nfixed();
+    uint32_t argSlots = CountArgSlots(script_, fun_);
+    uint32_t intermediates = NumIntermediateValues(resumeMode());
+    exprStackSlots_ = totalFrameSlots - fixedSlots - argSlots - intermediates;
+
+    MOZ_ASSERT(exprStackSlots_ <= totalFrameSlots);
+  }
+
+  JitSpew(JitSpew_BaselineBailouts, "      Unpacking %s:%u:%u",
+          script_->filename(), script_->lineno(),
+          script_->column().oneOriginValue());
+  JitSpew(JitSpew_BaselineBailouts, "      [BASELINE-JS FRAME]");
+
+  if (!isOutermostFrame()) {
+    if (!writePtr(prevFramePtr(), "PrevFramePtr")) {
+      return false;
+    }
+  }
+  prevFramePtr_ = virtualPointerAtStackOffset(0);
+
+  resetFramePushed();
+
+  return true;
+}
+
+void BaselineStackBuilder::setNextCallee(
+    JSFunction* nextCallee, TrialInliningState trialInliningState) {
+  nextCallee_ = nextCallee;
+
+  if (trialInliningState == TrialInliningState::Inlined &&
+      !iter_.ionScript()->purgedICScripts() && canUseTrialInlinedICScripts_) {
+    const uint32_t pcOff = script_->pcToOffset(pc_);
+    icScript_ = icScript_->findInlinedChild(pcOff);
+  } else {
+    icScript_ = nextCallee->nonLazyScript()->jitScript()->icScript();
+
+    if (trialInliningState != TrialInliningState::MonomorphicInlined) {
+      canUseTrialInlinedICScripts_ = false;
+    }
+  }
+
+  JSScript* calleeScript = nextCallee->nonLazyScript();
+  MOZ_RELEASE_ASSERT(icScript_->numICEntries() == calleeScript->numICEntries());
+  MOZ_RELEASE_ASSERT(icScript_->bytecodeSize() == calleeScript->length());
+}
+
+bool BaselineStackBuilder::done() {
+  if (!iter_.moreFrames()) {
+    MOZ_ASSERT(!nextCallee_);
+    return true;
+  }
+  return catchingException();
+}
+
+void BaselineStackBuilder::nextFrame() {
+  MOZ_ASSERT(nextCallee_);
+  fun_ = nextCallee_;
+  script_ = fun_->nonLazyScript();
+  nextCallee_ = nullptr;
+
+  MOZ_ASSERT(script_->hasBaselineScript());
+
+  frameNo_++;
+  iter_.nextInstruction();
+}
+
+bool BaselineStackBuilder::buildBaselineFrame() {
+  if (!subtract(BaselineFrame::Size(), "BaselineFrame")) {
+    return false;
+  }
+  blFrame_.reset();
+  blFrame_.emplace(pointerAtStackOffset<BaselineFrame>(0));
+
+  uint32_t flags = BaselineFrame::RUNNING_IN_INTERPRETER;
+
+  if (script_->isDebuggee()) {
+    flags |= BaselineFrame::DEBUGGEE;
+  }
+
+  JSObject* envChain = nullptr;
+  Value envChainSlot = iter_.read();
+  if (envChainSlot.isObject()) {
+    envChain = &envChainSlot.toObject();
+
+    MOZ_ASSERT(!script_->isForEval());
+    if (fun_ && fun_->needsFunctionEnvironmentObjects()) {
+      MOZ_ASSERT(fun_->nonLazyScript()->initialEnvironmentShape());
+      flags |= BaselineFrame::HAS_INITIAL_ENV;
+    }
+  } else {
+    MOZ_ASSERT(envChainSlot.isUndefined() ||
+               envChainSlot.isMagic(JS_OPTIMIZED_OUT));
+    MOZ_ASSERT(envChainSlotCanBeOptimized());
+
+    if (fun_) {
+      envChain = fun_->environment();
+    } else if (script_->isModule()) {
+      envChain = script_->module()->environment();
+    } else {
+      MOZ_ASSERT(!script_->isForEval());
+      MOZ_ASSERT(!script_->hasNonSyntacticScope());
+      envChain = &(script_->global().lexicalEnvironment());
+    }
+  }
+
+  MOZ_ASSERT(envChain);
+  JitSpew(JitSpew_BaselineBailouts, "      EnvChain=%p", envChain);
+  blFrame()->setEnvironmentChain(envChain);
+
+  Value returnValue = UndefinedValue();
+  if (script_->noScriptRval()) {
+    iter_.skip();
+  } else {
+    returnValue = iter_.read();
+    flags |= BaselineFrame::HAS_RVAL;
+  }
+
+  JitSpew(JitSpew_BaselineBailouts, "      ReturnValue=%016" PRIx64,
+          *((uint64_t*)&returnValue));
+  blFrame()->setReturnValue(returnValue);
+
+  ArgumentsObject* argsObj = nullptr;
+  if (script_->needsArgsObj()) {
+    Value maybeArgsObj = iter_.read();
+    MOZ_RELEASE_ASSERT(maybeArgsObj.isObject() || maybeArgsObj.isUndefined() ||
+                       maybeArgsObj.isMagic(JS_OPTIMIZED_OUT));
+    if (maybeArgsObj.isObject()) {
+      argsObj = &maybeArgsObj.toObject().as<ArgumentsObject>();
+    }
+  }
+
+
+  blFrame()->setFlags(flags);
+
+  JitSpew(JitSpew_BaselineBailouts, "      ICScript=%p", icScript_);
+  blFrame()->setICScript(icScript_);
+
+  if (argsObj) {
+    blFrame()->initArgsObjUnchecked(*argsObj);
+  }
+  return true;
+}
+
+bool BaselineStackBuilder::buildArguments() {
+  Value thisv = iter_.read();
+  JitSpew(JitSpew_BaselineBailouts, "      Is function!");
+  JitSpew(JitSpew_BaselineBailouts, "      thisv=%016" PRIx64,
+          *((uint64_t*)&thisv));
+
+  size_t thisvOffset = framePushed() + JitFrameLayout::offsetOfThis();
+  valuePointerAtStackOffset(thisvOffset).set(thisv);
+
+  MOZ_ASSERT(iter_.numAllocations() >= CountArgSlots(script_, fun_));
+  JitSpew(JitSpew_BaselineBailouts,
+          "      frame slots %u, nargs %zu, nfixed %zu", iter_.numAllocations(),
+          fun_->nargs(), script_->nfixed());
+
+  bool shouldStoreOutermostFormals =
+      isOutermostFrame() && !script_->argsObjAliasesFormals();
+  if (shouldStoreOutermostFormals) {
+    MOZ_ASSERT(outermostFrameFormals().empty());
+    if (!outermostFrameFormals().resize(fun_->nargs())) {
+      return false;
+    }
+  }
+
+  for (uint32_t i = 0; i < fun_->nargs(); i++) {
+    Value arg = iter_.read();
+    JitSpew(JitSpew_BaselineBailouts, "      arg %d = %016" PRIx64, (int)i,
+            *((uint64_t*)&arg));
+    if (!isOutermostFrame()) {
+      size_t argOffset = framePushed() + JitFrameLayout::offsetOfActualArg(i);
+      valuePointerAtStackOffset(argOffset).set(arg);
+    } else if (shouldStoreOutermostFormals) {
+      outermostFrameFormals()[i].set(arg);
+    } else {
+    }
+  }
+  return true;
+}
+
+bool BaselineStackBuilder::buildFixedSlots() {
+  for (uint32_t i = 0; i < script_->nfixed(); i++) {
+    Value slot = iter_.read();
+    if (!writeValue(slot, "FixedValue")) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool BaselineStackBuilder::fixUpCallerArgs(
+    MutableHandleValueVector savedCallerArgs, bool* fixedUp) {
+  MOZ_ASSERT(!*fixedUp);
+
+  MOZ_ASSERT(!IsSpreadOp(op_));
+
+  if (resumeMode() != ResumeMode::InlinedFunCall && !needToSaveCallerArgs()) {
+    return true;
+  }
+
+  uint32_t inlinedArgs = 2;
+  if (resumeMode() == ResumeMode::InlinedFunCall) {
+    MOZ_ASSERT(IsInvokeOp(op_));
+    inlinedArgs += GET_ARGC(pc_) > 0 ? GET_ARGC(pc_) - 1 : 0;
+  } else {
+    MOZ_ASSERT(resumeMode() == ResumeMode::InlinedAccessor);
+    MOZ_ASSERT(IsIonInlinableGetterOrSetterOp(op_));
+    if (IsSetPropOp(op_)) {
+      inlinedArgs++;
+    }
+  }
+
+  MOZ_ASSERT(inlinedArgs <= exprStackSlots());
+  uint32_t liveStackSlots = exprStackSlots() - inlinedArgs;
+
+  JitSpew(JitSpew_BaselineBailouts,
+          "      pushing %u expression stack slots before fixup",
+          liveStackSlots);
+  for (uint32_t i = 0; i < liveStackSlots; i++) {
+    Value v = iter_.read();
+    if (!writeValue(v, "StackValue")) {
+      return false;
+    }
+  }
+
+  if (resumeMode() == ResumeMode::InlinedFunCall) {
+    JitSpew(JitSpew_BaselineBailouts,
+            "      pushing undefined to fixup funcall");
+    if (!writeValue(UndefinedValue(), "StackValue")) {
+      return false;
+    }
+    if (GET_ARGC(pc_) > 0) {
+      JitSpew(JitSpew_BaselineBailouts,
+              "      pushing %u expression stack slots", inlinedArgs);
+      for (uint32_t i = 0; i < inlinedArgs; i++) {
+        Value arg = iter_.read();
+        if (!writeValue(arg, "StackValue")) {
+          return false;
+        }
+      }
+    } else {
+      JitSpew(JitSpew_BaselineBailouts, "      pushing target of funcall");
+      Value target = iter_.read();
+      if (!writeValue(target, "StackValue")) {
+        return false;
+      }
+      iter_.skip();
+    }
+  }
+
+  if (needToSaveCallerArgs()) {
+    if (!savedCallerArgs.resize(inlinedArgs)) {
+      return false;
+    }
+    for (uint32_t i = 0; i < inlinedArgs; i++) {
+      savedCallerArgs[i].set(iter_.read());
+    }
+
+    if (IsSetPropOp(op_)) {
+      Value initialArg = savedCallerArgs[inlinedArgs - 1];
+      JitSpew(JitSpew_BaselineBailouts,
+              "     pushing setter's initial argument");
+      if (!writeValue(initialArg, "StackValue")) {
+        return false;
+      }
+    }
+  }
+
+  *fixedUp = true;
+  return true;
+}
+
+bool BaselineStackBuilder::buildExpressionStack() {
+  JitSpew(JitSpew_BaselineBailouts, "      pushing %u expression stack slots",
+          exprStackSlots());
+
+  for (uint32_t i = 0; i < exprStackSlots(); i++) {
+    Value v;
+    if (!iter_.tryRead(&v)) {
+      MOZ_ASSERT(
+          !iter_.moreFrames() &&
+          (catchingException() || propagatingIonExceptionForDebugMode()));
+      v = MagicValue(JS_OPTIMIZED_OUT);
+    }
+    if (!writeValue(v, "StackValue")) {
+      return false;
+    }
+  }
+
+  if (resumeMode() == ResumeMode::ResumeAfterCheckProxyGetResult) {
+    JitSpew(JitSpew_BaselineBailouts,
+            "      Checking that the proxy's get trap result matches "
+            "expectations.");
+    Value returnVal;
+    if (peekLastValue(&returnVal) && !returnVal.isMagic(JS_OPTIMIZED_OUT)) {
+      Value idVal = iter_.read();
+      Value targetVal = iter_.read();
+
+      MOZ_RELEASE_ASSERT(!idVal.isMagic());
+      MOZ_RELEASE_ASSERT(targetVal.isObject());
+      RootedObject target(cx_, &targetVal.toObject());
+      RootedValue rootedIdVal(cx_, idVal);
+      RootedId id(cx_);
+      if (!PrimitiveValueToId<CanGC>(cx_, rootedIdVal, &id)) {
+        return false;
+      }
+      RootedValue value(cx_, returnVal);
+
+      auto validation =
+          ScriptedProxyHandler::checkGetTrapResult(cx_, target, id, value);
+      if (validation != ScriptedProxyHandler::GetTrapValidationResult::OK) {
+        header_->tempId = id.get();
+
+        JitSpew(
+            JitSpew_BaselineBailouts,
+            "      Proxy get trap result mismatch! Overwriting bailout kind");
+        if (validation == ScriptedProxyHandler::GetTrapValidationResult::
+                              MustReportSameValue) {
+          bailoutKind_ = BailoutKind::ThrowProxyTrapMustReportSameValue;
+        } else if (validation == ScriptedProxyHandler::GetTrapValidationResult::
+                                     MustReportUndefined) {
+          bailoutKind_ = BailoutKind::ThrowProxyTrapMustReportUndefined;
+        } else {
+          return false;
+        }
+      }
+    }
+
+    return true;
+  }
+
+  if (resumeMode() == ResumeMode::ResumeAfterCheckIsObject) {
+    JitSpew(JitSpew_BaselineBailouts,
+            "      Checking that intermediate value is an object");
+    Value returnVal;
+    if (iter_.tryRead(&returnVal) && !returnVal.isObject()) {
+      MOZ_RELEASE_ASSERT(!returnVal.isMagic());
+      JitSpew(JitSpew_BaselineBailouts,
+              "      Not an object! Overwriting bailout kind");
+      bailoutKind_ = BailoutKind::ThrowCheckIsObject;
+    }
+  }
+
+  if (resumeMode() == ResumeMode::ResumeAfterObjectKeys) {
+    JitSpew(JitSpew_BaselineBailouts,
+            "      Converting Object.keys iterator to keys array");
+    Value iterVal;
+    if (peekLastValue(&iterVal) && !iterVal.isMagic(JS_OPTIMIZED_OUT)) {
+      MOZ_RELEASE_ASSERT(iterVal.isObject());
+      MOZ_RELEASE_ASSERT(iterVal.toObject().is<PropertyIteratorObject>());
+      RootedObject iterObj(cx_, &iterVal.toObject());
+      JSObject* keys = ObjectKeysFromIterator(cx_, iterObj);
+      if (!keys) {
+        return false;
+      }
+      valuePointerAtStackOffset(0).set(ObjectValue(*keys));
+    }
+  }
+
+  return true;
+}
+
+bool BaselineStackBuilder::buildFinallyException() {
+  MOZ_ASSERT(resumingInFinallyBlock());
+
+  if (!writeValue(excInfo_->finallyException(), "Exception")) {
+    return false;
+  }
+  if (!writeValue(excInfo_->finallyExceptionStack(), "ExceptionStack")) {
+    return false;
+  }
+  if (!writeValue(BooleanValue(true), "throwing")) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BaselineStackBuilder::prepareForNextFrame(
+    HandleValueVector savedCallerArgs) {
+  const uint32_t frameSize = framePushed();
+
+  if (!finishOuterFrame()) {
+    return false;
+  }
+
+  return buildStubFrame(frameSize, savedCallerArgs);
+}
+
+bool BaselineStackBuilder::finishOuterFrame() {
+
+  const BaselineInterpreter& baselineInterp =
+      cx_->runtime()->jitRuntime()->baselineInterpreter();
+
+  blFrame()->setInterpreterFields(script_, pc_);
+
+  size_t baselineFrameDescr = MakeFrameDescriptor(FrameType::BaselineJS);
+  if (!writeWord(baselineFrameDescr, "Descriptor")) {
+    return false;
+  }
+
+  uint8_t* retAddr = baselineInterp.retAddrForIC(op_);
+  return writePtr(retAddr, "ReturnAddr");
+}
+
+template <typename GetSlot>
+bool BaselineStackBuilder::buildStubFrameArgs(uint32_t actualArgc,
+                                              bool constructing,
+                                              GetSlot getSlot) {
+  const uint32_t CalleeOffset = 0;
+  const uint32_t ThisOffset = 1;
+  const uint32_t ArgsOffset = 2;  
+
+  Value callee = getSlot(CalleeOffset);
+  JSFunction* calleeFun = &callee.toObject().as<JSFunction>();
+
+  bool hasUnderflow = actualArgc < calleeFun->nargs();
+  uint32_t argsPushed = hasUnderflow ? calleeFun->nargs() : actualArgc;
+  uint32_t afterFrameSize =
+      (1 + argsPushed + constructing) * sizeof(Value) + JitFrameLayout::Size();
+  if (!maybeWritePadding(JitStackAlignment, afterFrameSize, "Padding")) {
+    return false;
+  }
+
+  if (constructing) {
+    Value newTarget = getSlot(ArgsOffset + actualArgc);
+    if (!writeValue(newTarget, "NewTarget")) {
+      return false;
+    }
+  }
+
+  if (hasUnderflow) {
+    uint32_t numUndef = argsPushed - actualArgc;
+    for (uint32_t i = 0; i < numUndef; i++) {
+      if (!writeValue(UndefinedValue(), "UndefArgVal")) {
+        return false;
+      }
+    }
+  }
+
+  for (int32_t arg = actualArgc - 1; arg >= 0; arg--) {
+    Value v = getSlot(ArgsOffset + arg);  
+    if (!writeValue(v, "ArgVal")) {
+      return false;
+    }
+  }
+
+  Value v = getSlot(ThisOffset);  
+  if (!writeValue(v, "ThisVal")) {
+    return false;
+  }
+
+  JitSpew(JitSpew_BaselineBailouts, "      Callee = %016" PRIx64,
+          callee.asRawBits());
+
+  if (!writePtr(CalleeToToken(calleeFun, constructing), "CalleeToken")) {
+    return false;
+  }
+
+  return true;
+}
+
+bool BaselineStackBuilder::buildStubFrame(uint32_t frameSize,
+                                          HandleValueVector savedCallerArgs) {
+
+  JitSpew(JitSpew_BaselineBailouts, "      [BASELINE-STUB FRAME]");
+
+  if (!writePtr(prevFramePtr(), "PrevFramePtr")) {
+    return false;
+  }
+  prevFramePtr_ = virtualPointerAtStackOffset(0);
+
+  uint32_t pcOff = script_->pcToOffset(pc_);
+  JitScript* jitScript = script_->jitScript();
+  const ICEntry& icEntry = jitScript->icEntryFromPCOffset(pcOff);
+  ICFallbackStub* fallback = jitScript->fallbackStubForICEntry(&icEntry);
+  if (!writePtr(fallback, "StubPtr")) {
+    return false;
+  }
+
+  MOZ_ASSERT(IsIonInlinableOp(op_));
+  bool constructing = IsConstructPC(pc_);
+  unsigned actualArgc;
+  Value callee;
+  if (needToSaveCallerArgs()) {
+    MOZ_ASSERT(!constructing);
+    callee = savedCallerArgs[0];
+    actualArgc = IsSetPropOp(op_) ? 1 : 0;
+
+    if (!buildStubFrameArgs(actualArgc, constructing, [&](uint32_t idx) {
+          return savedCallerArgs[idx];
+        })) {
+      return false;
+    }
+  } else if (resumeMode() == ResumeMode::InlinedFunCall && GET_ARGC(pc_) == 0) {
+    MOZ_ASSERT(!constructing);
+    actualArgc = 0;
+
+    size_t calleeSlot = blFrame()->numValueSlots(frameSize) - 1;
+    callee = *blFrame()->valueSlot(calleeSlot);
+    if (!buildStubFrameArgs(actualArgc, constructing, [&](uint32_t idx) {
+          switch (idx) {
+            case 0:
+              return callee;
+            case 1:
+              return UndefinedValue();  
+            default:
+              MOZ_CRASH("unreachable");
+          }
+        })) {
+      return false;
+    }
+  } else {
+    MOZ_ASSERT(resumeMode() == ResumeMode::InlinedStandardCall ||
+               resumeMode() == ResumeMode::InlinedFunCall);
+    actualArgc = GET_ARGC(pc_);
+    if (resumeMode() == ResumeMode::InlinedFunCall) {
+      MOZ_ASSERT(actualArgc > 0);
+      actualArgc--;
+    }
+
+    size_t valueSlot = blFrame()->numValueSlots(frameSize) - 1;
+    size_t calleeSlot = valueSlot - actualArgc - 1 - constructing;
+    if (!buildStubFrameArgs(actualArgc, constructing, [&](uint32_t idx) {
+          return *blFrame()->valueSlot(calleeSlot + idx);
+        })) {
+      return false;
+    }
+    callee = *blFrame()->valueSlot(calleeSlot);
+  }
+
+  JSFunction* calleeFun = &callee.toObject().as<JSFunction>();
+  const ICEntry& icScriptEntry = icScript_->icEntryFromPCOffset(pcOff);
+  ICFallbackStub* icScriptFallback =
+      icScript_->fallbackStubForICEntry(&icScriptEntry);
+  setNextCallee(calleeFun, icScriptFallback->trialInliningState());
+
+  size_t baselineStubFrameDescr =
+      MakeFrameDescriptorForJitCall(FrameType::BaselineStub, actualArgc);
+  if (!writeWord(baselineStubFrameDescr, "Descriptor")) {
+    return false;
+  }
+
+  void* baselineCallReturnAddr = getStubReturnAddress();
+  MOZ_ASSERT(baselineCallReturnAddr);
+  if (!writePtr(baselineCallReturnAddr, "ReturnAddr")) {
+    return false;
+  }
+
+  MOZ_ASSERT((framePushed() + sizeof(void*)) % JitStackAlignment == 0);
+
+  return true;
+}
+
+bool BaselineStackBuilder::finishLastFrame() {
+  const BaselineInterpreter& baselineInterp =
+      cx_->runtime()->jitRuntime()->baselineInterpreter();
+
+  setResumeFramePtr(prevFramePtr());
+
+  uint8_t* resumeAddr;
+  if (isPrologueBailout()) {
+    JitSpew(JitSpew_BaselineBailouts, "      Resuming into prologue.");
+    MOZ_ASSERT(pc_ == script_->code());
+    blFrame()->setInterpreterFieldsForPrologue(script_);
+    resumeAddr = baselineInterp.bailoutPrologueEntryAddr();
+  } else if (propagatingIonExceptionForDebugMode()) {
+    jsbytecode* throwPC = script_->offsetToPC(iter_.pcOffset());
+    blFrame()->setInterpreterFields(script_, throwPC);
+    resumeAddr = baselineInterp.interpretOpAddr().value;
+  } else {
+    jsbytecode* resumePC = getResumePC();
+    blFrame()->setInterpreterFields(script_, resumePC);
+    resumeAddr = baselineInterp.interpretOpAddr().value;
+  }
+  setResumeAddr(resumeAddr);
+  JitSpew(JitSpew_BaselineBailouts, "      Set resumeAddr=%p", resumeAddr);
+
+  return true;
+}
+
+#ifdef DEBUG
+bool BaselineStackBuilder::envChainSlotCanBeOptimized() {
+  jsbytecode* pc = script_->offsetToPC(iter_.pcOffset());
+  Scope* scopeIter = script_->innermostScope(pc);
+  while (scopeIter != script_->bodyScope()) {
+    if (!scopeIter || scopeIter->hasEnvironment()) {
+      return false;
+    }
+    scopeIter = scopeIter->enclosing();
+  }
+  return true;
+}
+
+bool jit::AssertBailoutStackDepth(JSContext* cx, JSScript* script,
+                                  jsbytecode* pc, ResumeMode mode,
+                                  uint32_t exprStackSlots) {
+  if (IsResumeAfter(mode)) {
+    pc = GetNextPc(pc);
+  }
+
+  uint32_t expectedDepth;
+  bool reachablePC;
+  if (!ReconstructStackDepth(cx, script, pc, &expectedDepth, &reachablePC)) {
+    return false;
+  }
+  if (!reachablePC) {
+    return true;
+  }
+
+  JSOp op = JSOp(*pc);
+
+  if (mode == ResumeMode::InlinedFunCall) {
+    MOZ_ASSERT(IsInvokeOp(op));
+    if (GET_ARGC(pc) > 0) {
+      MOZ_ASSERT(expectedDepth == exprStackSlots + 1);
+    } else {
+      MOZ_ASSERT(expectedDepth == exprStackSlots);
+    }
+    return true;
+  }
+
+  if (mode == ResumeMode::InlinedAccessor) {
+    MOZ_ASSERT(IsIonInlinableGetterOrSetterOp(op));
+    if (IsGetElemOp(op)) {
+      MOZ_ASSERT(exprStackSlots == expectedDepth);
+    } else {
+      MOZ_ASSERT(exprStackSlots == expectedDepth + 1);
+    }
+    return true;
+  }
+
+  MOZ_ASSERT(exprStackSlots == expectedDepth);
+  return true;
+}
+
+bool BaselineStackBuilder::validateFrame() {
+  const uint32_t frameSize = framePushed();
+  blFrame()->setDebugFrameSize(frameSize);
+  JitSpew(JitSpew_BaselineBailouts, "      FrameSize=%u", frameSize);
+
+  MOZ_ASSERT(blFrame()->debugNumValueSlots() >= script_->nfixed());
+  MOZ_ASSERT(blFrame()->debugNumValueSlots() <= script_->nslots());
+
+  uint32_t expectedSlots = exprStackSlots();
+  if (resumingInFinallyBlock()) {
+    expectedSlots += 3;
+  }
+  return AssertBailoutStackDepth(cx_, script_, pc_, resumeMode(),
+                                 expectedSlots);
+}
+#endif
+
+void* BaselineStackBuilder::getStubReturnAddress() {
+  const BaselineICFallbackCode& code =
+      cx_->runtime()->jitRuntime()->baselineICFallbackCode();
+
+  if (IsGetPropOp(op_)) {
+    return code.bailoutReturnAddr(BailoutReturnKind::GetProp);
+  }
+  if (IsSetPropOp(op_)) {
+    return code.bailoutReturnAddr(BailoutReturnKind::SetProp);
+  }
+  if (IsGetElemOp(op_)) {
+    return code.bailoutReturnAddr(BailoutReturnKind::GetElem);
+  }
+
+  MOZ_ASSERT(IsInvokeOp(op_) && !IsSpreadOp(op_));
+  if (IsConstructOp(op_)) {
+    return code.bailoutReturnAddr(BailoutReturnKind::New);
+  }
+  return code.bailoutReturnAddr(BailoutReturnKind::Call);
+}
+
+static inline jsbytecode* GetNextNonLoopHeadPc(jsbytecode* pc) {
+  JSOp op = JSOp(*pc);
+  switch (op) {
+    case JSOp::Goto:
+      return pc + GET_JUMP_OFFSET(pc);
+
+    case JSOp::LoopHead:
+    case JSOp::Nop:
+      return GetNextPc(pc);
+
+    default:
+      return pc;
+  }
+}
+
+jsbytecode* BaselineStackBuilder::getResumePC() {
+  if (resumeAfter()) {
+    return GetNextPc(pc_);
+  }
+
+  jsbytecode* slowerPc = pc_;
+  jsbytecode* fasterPc = pc_;
+  while (true) {
+    slowerPc = GetNextNonLoopHeadPc(slowerPc);
+    fasterPc = GetNextNonLoopHeadPc(fasterPc);
+    fasterPc = GetNextNonLoopHeadPc(fasterPc);
+
+    if (fasterPc == slowerPc) {
+      break;
+    }
+  }
+
+  return slowerPc;
+}
+
+bool BaselineStackBuilder::isPrologueBailout() {
+  return iter_.pcOffset() == 0 && !iter_.resumeAfter() &&
+         !propagatingIonExceptionForDebugMode();
+}
+
+bool BaselineStackBuilder::buildOneFrame() {
+
+  if (!initFrame()) {
+    return false;
+  }
+
+  if (!buildBaselineFrame()) {
+    return false;
+  }
+
+  if (fun_ && !buildArguments()) {
+    return false;
+  }
+
+  if (!buildFixedSlots()) {
+    return false;
+  }
+
+  bool fixedUp = false;
+  RootedValueVector savedCallerArgs(cx_);
+  if (iter_.moreFrames() && !fixUpCallerArgs(&savedCallerArgs, &fixedUp)) {
+    return false;
+  }
+
+  if (!fixedUp) {
+    if (!buildExpressionStack()) {
+      return false;
+    }
+    if (resumingInFinallyBlock() && !buildFinallyException()) {
+      return false;
+    }
+  }
+
+#ifdef DEBUG
+  if (!validateFrame()) {
+    return false;
+  }
+#endif
+
+#ifdef JS_JITSPEW
+  const uint32_t pcOff = script_->pcToOffset(pc());
+  JitSpew(JitSpew_BaselineBailouts,
+          "      Resuming %s pc offset %d (op %s) (line %u) of %s:%u:%u",
+          resumeAfter() ? "after" : "at", (int)pcOff, CodeName(op_),
+          PCToLineNumber(script_, pc()), script_->filename(), script_->lineno(),
+          script_->column().oneOriginValue());
+  JitSpew(JitSpew_BaselineBailouts, "      Bailout kind: %s",
+          BailoutKindString(bailoutKind()));
+#endif
+
+  if (done()) {
+    return finishLastFrame();
+  }
+
+  return prepareForNextFrame(savedCallerArgs);
+}
+
+bool jit::BailoutIonToBaseline(JSContext* cx, JitActivation* activation,
+                               const JSJitFrameIter& iter,
+                               BaselineBailoutInfo** bailoutInfo,
+                               const ExceptionBailoutInfo* excInfo,
+                               BailoutReason reason) {
+  MOZ_ASSERT(bailoutInfo != nullptr);
+  MOZ_ASSERT(*bailoutInfo == nullptr);
+  MOZ_ASSERT(iter.isBailoutJS());
+
+  MOZ_ASSERT(!cx->isExceptionPending());
+
+  auto guardRemoveRematerializedFramesFromDebugger =
+      mozilla::MakeScopeExit([&] {
+        activation->removeRematerializedFramesFromDebugger(cx, iter.fp());
+      });
+
+  auto removeIonFrameRecovery = mozilla::MakeScopeExit(
+      [&] { activation->removeIonFrameRecovery(iter.jsFrame()); });
+
+  MOZ_ASSERT(iter.isBailoutJS());
+#if defined(DEBUG) || defined(JS_JITSPEW)
+  FrameType prevFrameType = iter.prevType();
+  MOZ_ASSERT(JSJitFrameIter::isEntry(prevFrameType) ||
+             prevFrameType == FrameType::IonJS ||
+             prevFrameType == FrameType::BaselineStub ||
+             prevFrameType == FrameType::TrampolineNative ||
+             prevFrameType == FrameType::IonICCall ||
+             prevFrameType == FrameType::BaselineJS ||
+             prevFrameType == FrameType::BaselineInterpreterEntry);
+#endif
+
+
+  JitSpew(JitSpew_BaselineBailouts,
+          "Bailing to baseline %s:%u:%u (IonScript=%p) (FrameType=%d)",
+          iter.script()->filename(), iter.script()->lineno(),
+          iter.script()->column().oneOriginValue(), (void*)iter.ionScript(),
+          (int)prevFrameType);
+
+  if (excInfo) {
+    if (excInfo->catchingException()) {
+      JitSpew(JitSpew_BaselineBailouts, "Resuming in catch or finally block");
+    }
+    if (excInfo->propagatingIonExceptionForDebugMode()) {
+      JitSpew(JitSpew_BaselineBailouts, "Resuming in-place for debug mode");
+    }
+  }
+
+  JitSpew(JitSpew_BaselineBailouts,
+          "  Reading from snapshot offset %u size %zu", iter.snapshotOffset(),
+          iter.ionScript()->snapshotsListSize());
+
+  iter.script()->updateJitCodeRaw(cx->runtime());
+
+  MaybeReadFallback recoverBailout(cx, activation, &iter,
+                                   MaybeReadFallback::Fallback_DoNothing);
+
+  SnapshotIterator snapIter(iter, activation->bailoutData()->machineState());
+  if (!snapIter.initInstructionResults(recoverBailout)) {
+    return false;
+  }
+
+#ifdef TRACK_SNAPSHOTS
+  snapIter.spewBailingFrom();
+#endif
+
+  BaselineStackBuilder builder(cx, iter, snapIter, excInfo, reason);
+  if (!builder.init()) {
+    return false;
+  }
+
+  JitSpew(JitSpew_BaselineBailouts, "  Incoming frame ptr = %p",
+          builder.startFrame());
+  if (iter.maybeCallee()) {
+    JitSpew(JitSpew_BaselineBailouts, "  Callee function (%s:%u:%u)",
+            iter.script()->filename(), iter.script()->lineno(),
+            iter.script()->column().oneOriginValue());
+  } else {
+    JitSpew(JitSpew_BaselineBailouts, "  No callee!");
+  }
+
+  if (iter.isConstructing()) {
+    JitSpew(JitSpew_BaselineBailouts, "  Constructing!");
+  } else {
+    JitSpew(JitSpew_BaselineBailouts, "  Not constructing!");
+  }
+
+  JitSpew(JitSpew_BaselineBailouts, "  Restoring frames:");
+
+  while (true) {
+    snapIter.settleOnFrame();
+
+    JitSpew(JitSpew_BaselineBailouts, "    FrameNo %zu", builder.frameNo());
+
+    if (!builder.buildOneFrame()) {
+      MOZ_ASSERT(cx->isExceptionPending());
+      return false;
+    }
+
+    if (builder.done()) {
+      break;
+    }
+
+    builder.nextFrame();
+  }
+  JitSpew(JitSpew_BaselineBailouts, "  Done restoring frames");
+
+  BailoutKind bailoutKind = builder.bailoutKind();
+
+  if (!builder.outermostFrameFormals().empty()) {
+    Value* argv = builder.startFrame()->actualArgs();
+    mozilla::PodCopy(argv, builder.outermostFrameFormals().begin(),
+                     builder.outermostFrameFormals().length());
+  }
+
+  bool overRecursed = false;
+  BaselineBailoutInfo* info = builder.info();
+  size_t numBytesToPush = info->copyStackTop - info->copyStackBottom;
+  MOZ_ASSERT((numBytesToPush % sizeof(uintptr_t)) == 0);
+  uint8_t* newsp = info->incomingStack - numBytesToPush;
+#ifdef JS_SIMULATOR
+  if (Simulator::Current()->overRecursed(uintptr_t(newsp))) {
+    overRecursed = true;
+  }
+#else
+  AutoCheckRecursionLimit recursion(cx);
+  if (!recursion.checkWithStackPointerDontReport(cx, newsp)) {
+    overRecursed = true;
+  }
+#endif
+  if (overRecursed) {
+    JitSpew(JitSpew_BaselineBailouts, "  Overrecursion check failed!");
+    ReportOverRecursed(cx);
+    return false;
+  }
+
+  info = builder.takeBuffer();
+  info->numFrames = builder.frameNo() + 1;
+  info->bailoutKind.emplace(bailoutKind);
+  *bailoutInfo = info;
+  guardRemoveRematerializedFramesFromDebugger.release();
+  return true;
+}
+
+static void InvalidateAfterBailout(JSContext* cx, HandleScript outerScript,
+                                   const char* reason) {
+  if (!outerScript->hasIonScript()) {
+    JitSpew(JitSpew_BaselineBailouts, "Ion script is already invalidated");
+    return;
+  }
+
+  if (cx->runtime()->jitRuntime()->hasJitHintsMap()) {
+    JitHintsMap* jitHints = cx->runtime()->jitRuntime()->getJitHintsMap();
+    jitHints->recordInvalidation(outerScript);
+  }
+
+  MOZ_ASSERT(!outerScript->ionScript()->invalidated());
+
+  JitSpew(JitSpew_BaselineBailouts, "Invalidating due to %s", reason);
+  Invalidate(cx, outerScript);
+}
+
+static void HandleLexicalCheckFailure(JSContext* cx, HandleScript outerScript,
+                                      HandleScript innerScript) {
+  JitSpew(JitSpew_IonBailouts,
+          "Lexical check failure %s:%u:%u, inlined into %s:%u:%u",
+          innerScript->filename(), innerScript->lineno(),
+          innerScript->column().oneOriginValue(), outerScript->filename(),
+          outerScript->lineno(), outerScript->column().oneOriginValue());
+
+  if (!innerScript->failedLexicalCheck()) {
+    innerScript->setFailedLexicalCheck();
+  }
+
+  InvalidateAfterBailout(cx, outerScript, "lexical check failure");
+  if (innerScript->hasIonScript()) {
+    Invalidate(cx, innerScript);
+  }
+}
+
+static bool CopyFromRematerializedFrame(JSContext* cx, JitActivation* act,
+                                        uint8_t* fp, size_t inlineDepth,
+                                        BaselineFrame* frame) {
+  RematerializedFrame* rematFrame =
+      act->lookupRematerializedFrame(fp, inlineDepth);
+
+  if (!rematFrame) {
+    return true;
+  }
+
+  MOZ_ASSERT(rematFrame->script() == frame->script());
+  MOZ_ASSERT(rematFrame->numActualArgs() == frame->numActualArgs());
+
+  frame->setEnvironmentChain(rematFrame->environmentChain());
+
+  if (frame->isFunctionFrame()) {
+    frame->thisArgument() = rematFrame->thisArgument();
+  }
+
+  for (unsigned i = 0; i < frame->numActualArgs(); i++) {
+    frame->argv()[i] = rematFrame->argv()[i];
+  }
+
+  for (size_t i = 0; i < frame->script()->nfixed(); i++) {
+    *frame->valueSlot(i) = rematFrame->locals()[i];
+  }
+
+  if (frame->script()->noScriptRval()) {
+    frame->setReturnValue(UndefinedValue());
+  } else {
+    frame->setReturnValue(rematFrame->returnValue());
+  }
+
+
+  JitSpew(JitSpew_BaselineBailouts,
+          "  Copied from rematerialized frame at (%p,%zu)", fp, inlineDepth);
+
+  if (rematFrame->isDebuggee()) {
+    frame->setIsDebuggee();
+    DebugAPI::handleIonBailout(cx, rematFrame, frame);
+  }
+
+  return true;
+}
+
+enum class BailoutAction {
+  InvalidateImmediately,
+  InvalidateIfFrequent,
+  DisableIfFrequent,
+  NoAction
+};
+
+bool jit::FinishBailoutToBaseline(BaselineBailoutInfo* bailoutInfoArg) {
+  JitSpew(JitSpew_BaselineBailouts, "  Done restoring frames");
+
+  JSContext* cx = TlsContext.get();
+  Rooted<UniquePtr<BaselineBailoutInfo>> bailoutInfo(cx, bailoutInfoArg);
+  bailoutInfoArg = nullptr;
+
+  MOZ_DIAGNOSTIC_ASSERT(*bailoutInfo->bailoutKind != BailoutKind::Unreachable);
+
+  MOZ_ASSERT(!cx->isInUnsafeRegion());
+
+  BaselineFrame* topFrame = GetTopBaselineFrame(cx);
+
+  uint8_t* incomingStack = bailoutInfo->incomingStack;
+  auto guardRemoveRematerializedFramesFromDebugger =
+      mozilla::MakeScopeExit([&] {
+        JitActivation* act = cx->activation()->asJit();
+        act->removeRematerializedFramesFromDebugger(cx, incomingStack);
+      });
+
+  if (!EnsureHasEnvironmentObjects(cx, topFrame)) {
+    return false;
+  }
+
+  RootedScript innerScript(cx, nullptr);
+  RootedScript outerScript(cx, nullptr);
+
+  MOZ_ASSERT(cx->currentlyRunningInJit());
+  JSJitFrameIter iter(cx->activation()->asJit());
+  uint8_t* outerFp = nullptr;
+
+  if (cx->runtime()->jitRuntime()->isProfilerInstrumentationEnabled(
+          cx->runtime())) {
+    MOZ_ASSERT(iter.prevType() == FrameType::BaselineJS);
+    JitFrameLayout* fp = reinterpret_cast<JitFrameLayout*>(iter.prevFp());
+    cx->jitActivation->setLastProfilingFrame(fp);
+  }
+
+  uint32_t numFrames = bailoutInfo->numFrames;
+  MOZ_ASSERT(numFrames > 0);
+
+  uint32_t frameno = 0;
+  while (frameno < numFrames) {
+    MOZ_ASSERT(!iter.isIonJS());
+
+    if (iter.isBaselineJS()) {
+      BaselineFrame* frame = iter.baselineFrame();
+      MOZ_ASSERT(frame->script()->hasBaselineScript());
+
+      if (frame->environmentChain() && frame->script()->needsArgsObj()) {
+        ArgumentsObject* argsObj;
+        if (frame->hasArgsObj()) {
+          argsObj = &frame->argsObj();
+        } else {
+          argsObj = ArgumentsObject::createExpected(cx, frame);
+          if (!argsObj) {
+            return false;
+          }
+        }
+
+        SetFrameArgumentsObject(cx, frame, argsObj);
+      }
+
+      if (frameno == 0) {
+        innerScript = frame->script();
+      }
+
+      if (frameno == numFrames - 1) {
+        outerScript = frame->script();
+        outerFp = iter.fp();
+        MOZ_ASSERT(outerFp == incomingStack);
+      }
+
+      frameno++;
+    }
+
+    ++iter;
+  }
+
+  MOZ_ASSERT(innerScript);
+  MOZ_ASSERT(outerScript);
+  MOZ_ASSERT(outerFp);
+
+  JitActivation* act = cx->activation()->asJit();
+  if (act->hasRematerializedFrame(outerFp)) {
+    JSJitFrameIter iter(act);
+    size_t inlineDepth = numFrames;
+    bool ok = true;
+    while (inlineDepth > 0) {
+      if (iter.isBaselineJS()) {
+        if (!CopyFromRematerializedFrame(cx, act, outerFp, --inlineDepth,
+                                         iter.baselineFrame())) {
+          ok = false;
+        }
+      }
+      ++iter;
+    }
+
+    if (!ok) {
+      return false;
+    }
+
+    guardRemoveRematerializedFramesFromDebugger.release();
+    act->removeRematerializedFrame(outerFp);
+  }
+
+  if (bailoutInfo->faultPC) {
+    EnvironmentIter ei(cx, topFrame, bailoutInfo->faultPC);
+    UnwindEnvironment(cx, ei, bailoutInfo->tryPC);
+  }
+
+  BailoutKind bailoutKind = *bailoutInfo->bailoutKind;
+  JitSpew(JitSpew_BaselineBailouts,
+          "  Restored outerScript=(%s:%u:%u,%u) innerScript=(%s:%u:%u,%u) "
+          "(bailoutKind=%u)",
+          outerScript->filename(), outerScript->lineno(),
+          outerScript->column().oneOriginValue(), outerScript->getWarmUpCount(),
+          innerScript->filename(), innerScript->lineno(),
+          innerScript->column().oneOriginValue(), innerScript->getWarmUpCount(),
+          (unsigned)bailoutKind);
+
+  BailoutAction action = BailoutAction::InvalidateImmediately;
+  DebugOnly<bool> saveFailedICHash = false;
+  switch (bailoutKind) {
+    case BailoutKind::TranspiledCacheIR:
+      action = BailoutAction::InvalidateIfFrequent;
+      saveFailedICHash = true;
+      break;
+
+    case BailoutKind::StubFoldingGuardMultipleShapes:
+      action = BailoutAction::InvalidateIfFrequent;
+      saveFailedICHash = true;
+      cx->zone()->jitZone()->noteStubFoldingBailout(innerScript, outerScript);
+      break;
+
+    case BailoutKind::SpeculativePhi:
+      MOZ_ASSERT(!outerScript->hadSpeculativePhiBailout());
+      if (!outerScript->hasIonScript() ||
+          outerScript->ionScript()->numFixableBailouts() == 0) {
+        outerScript->setHadSpeculativePhiBailout();
+      }
+      InvalidateAfterBailout(cx, outerScript, "phi specialization failure");
+      break;
+
+    case BailoutKind::TypePolicy:
+      action = BailoutAction::DisableIfFrequent;
+      break;
+
+    case BailoutKind::LICM:
+      MOZ_ASSERT(!outerScript->hadLICMInvalidation());
+      if (outerScript->hasIonScript()) {
+        switch (outerScript->ionScript()->licmState()) {
+          case IonScript::LICMState::NeverBailed:
+            outerScript->ionScript()->setHadLICMBailout();
+            action = BailoutAction::NoAction;
+            break;
+          case IonScript::LICMState::Bailed:
+            outerScript->setHadLICMInvalidation();
+            InvalidateAfterBailout(cx, outerScript, "LICM failure");
+            break;
+          case IonScript::LICMState::BailedAndHitFallback:
+            action = BailoutAction::InvalidateIfFrequent;
+            break;
+        }
+      }
+      break;
+
+    case BailoutKind::InstructionReordering:
+      outerScript->setHadReorderingBailout();
+      action = BailoutAction::InvalidateIfFrequent;
+      break;
+
+    case BailoutKind::HoistBoundsCheck:
+      // An instruction hoisted or generated by tryHoistBoundsCheck bailed out.
+      MOZ_ASSERT(!outerScript->failedBoundsCheck());
+      outerScript->setFailedBoundsCheck();
+      InvalidateAfterBailout(cx, outerScript, "bounds check failure");
+      break;
+
+    case BailoutKind::EagerTruncation:
+      // An eager truncation generated by range analysis bailed out.
+      MOZ_ASSERT(!outerScript->hadEagerTruncationBailout());
+      outerScript->setHadEagerTruncationBailout();
+      InvalidateAfterBailout(cx, outerScript, "eager range analysis failure");
+      break;
+
+    case BailoutKind::UnboxFolding:
+      MOZ_ASSERT(!outerScript->hadUnboxFoldingBailout());
+      outerScript->setHadUnboxFoldingBailout();
+      InvalidateAfterBailout(cx, outerScript, "unbox folding failure");
+      break;
+
+    case BailoutKind::TooManyArguments:
+      action = BailoutAction::DisableIfFrequent;
+      break;
+
+    case BailoutKind::DuringVMCall:
+      if (cx->isExceptionPending()) {
+        action = BailoutAction::DisableIfFrequent;
+      }
+      break;
+
+    case BailoutKind::Finally:
+      action = BailoutAction::DisableIfFrequent;
+      break;
+
+    case BailoutKind::Inevitable:
+    case BailoutKind::Debugger:
+      action = BailoutAction::NoAction;
+      break;
+
+    case BailoutKind::FirstExecution:
+      action = BailoutAction::InvalidateIfFrequent;
+      saveFailedICHash = true;
+      break;
+
+    case BailoutKind::UninitializedLexical:
+      HandleLexicalCheckFailure(cx, outerScript, innerScript);
+      break;
+
+    case BailoutKind::ThrowCheckIsObject:
+      MOZ_ASSERT(!cx->isExceptionPending());
+      return ThrowCheckIsObject(cx, CheckIsObjectKind::IteratorReturn);
+
+    case BailoutKind::ThrowProxyTrapMustReportSameValue:
+    case BailoutKind::ThrowProxyTrapMustReportUndefined: {
+      MOZ_ASSERT(!cx->isExceptionPending());
+      RootedId rootedId(cx, bailoutInfo->tempId);
+      ScriptedProxyHandler::reportGetTrapValidationError(
+          cx, rootedId,
+          bailoutKind == BailoutKind::ThrowProxyTrapMustReportSameValue
+              ? ScriptedProxyHandler::GetTrapValidationResult::
+                    MustReportSameValue
+              : ScriptedProxyHandler::GetTrapValidationResult::
+                    MustReportUndefined);
+      return false;
+    }
+
+    case BailoutKind::IonExceptionDebugMode:
+      return false;
+
+    case BailoutKind::OnStackInvalidation:
+      action = BailoutAction::NoAction;
+      break;
+
+    default:
+      MOZ_CRASH("Unknown bailout kind!");
+  }
+
+#ifdef DEBUG
+  if (MOZ_UNLIKELY(cx->runtime()->jitRuntime()->ionBailAfterEnabled())) {
+    action = BailoutAction::NoAction;
+  }
+#endif
+
+  if (outerScript->hasIonScript()) {
+    IonScript* ionScript = outerScript->ionScript();
+    switch (action) {
+      case BailoutAction::InvalidateImmediately:
+        MOZ_ASSERT(false);
+        break;
+      case BailoutAction::InvalidateIfFrequent:
+        ionScript->incNumFixableBailouts();
+        if (ionScript->shouldInvalidate()) {
+#ifdef DEBUG
+          if (saveFailedICHash && !JitOptions.disableBailoutLoopCheck &&
+              JitOptions.frequentBailoutThreshold > 1) {
+            outerScript->jitScript()->setFailedICHash(ionScript->icHash());
+          }
+#endif
+          InvalidateAfterBailout(cx, outerScript, "fixable bailouts");
+        }
+        break;
+      case BailoutAction::DisableIfFrequent:
+        ionScript->incNumUnfixableBailouts();
+        if (ionScript->shouldInvalidateAndDisable()) {
+          InvalidateAfterBailout(cx, outerScript, "unfixable bailouts");
+          outerScript->disableIon();
+        }
+        break;
+      case BailoutAction::NoAction:
+        break;
+    }
+  }
+
+  return true;
+}

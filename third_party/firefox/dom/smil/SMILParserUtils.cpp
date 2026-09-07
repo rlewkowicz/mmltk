@@ -1,0 +1,582 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "SMILParserUtils.h"
+
+#include "mozilla/SMILAttr.h"
+#include "mozilla/SMILKeySpline.h"
+#include "mozilla/SMILRepeatCount.h"
+#include "mozilla/SMILTimeValueSpecParams.h"
+#include "mozilla/SMILTypes.h"
+#include "mozilla/SMILValue.h"
+#include "mozilla/SVGContentUtils.h"
+#include "mozilla/TextUtils.h"
+#include "nsCharSeparatedTokenizer.h"
+#include "nsContentUtils.h"
+
+using namespace mozilla::dom;
+
+namespace {
+
+using namespace mozilla;
+
+const uint32_t MSEC_PER_SEC = 1000;
+const uint32_t MSEC_PER_MIN = 1000 * 60;
+const uint32_t MSEC_PER_HOUR = 1000 * 60 * 60;
+
+#define ACCESSKEY_PREFIX_LC u"accesskey("_ns  // SMIL2+
+#define ACCESSKEY_PREFIX_CC u"accessKey("_ns  // SVG/SMIL ANIM
+#define REPEAT_PREFIX u"repeat("_ns
+#define WALLCLOCK_PREFIX u"wallclock("_ns
+
+inline bool SkipWhitespace(nsAString::const_iterator& aIter,
+                           const nsAString::const_iterator& aEnd) {
+  while (aIter != aEnd) {
+    if (!nsContentUtils::IsHTMLWhitespace(*aIter)) {
+      return true;
+    }
+    ++aIter;
+  }
+  return false;
+}
+
+inline bool ParseColon(nsAString::const_iterator& aIter,
+                       const nsAString::const_iterator& aEnd) {
+  if (aIter == aEnd || *aIter != ':') {
+    return false;
+  }
+  ++aIter;
+  return true;
+}
+
+bool ParseSecondsOrMinutes(nsAString::const_iterator& aIter,
+                           const nsAString::const_iterator& aEnd,
+                           uint32_t& aValue) {
+  if (aIter == aEnd || !mozilla::IsAsciiDigit(*aIter)) {
+    return false;
+  }
+
+  nsAString::const_iterator iter(aIter);
+
+  if (++iter == aEnd || !mozilla::IsAsciiDigit(*iter)) {
+    return false;
+  }
+
+  uint32_t value = 10 * mozilla::AsciiAlphanumericToNumber(*aIter) +
+                   mozilla::AsciiAlphanumericToNumber(*iter);
+  if (value > 59) {
+    return false;
+  }
+  if (++iter != aEnd && mozilla::IsAsciiDigit(*iter)) {
+    return false;
+  }
+
+  aValue = value;
+  aIter = iter;
+  return true;
+}
+
+inline bool ParseClockMetric(nsAString::const_iterator& aIter,
+                             const nsAString::const_iterator& aEnd,
+                             uint32_t& aMultiplier) {
+  if (aIter == aEnd) {
+    aMultiplier = MSEC_PER_SEC;
+    return true;
+  }
+
+  switch (*aIter) {
+    case 'h':
+      if (++aIter == aEnd) {
+        aMultiplier = MSEC_PER_HOUR;
+        return true;
+      }
+      return false;
+    case 'm': {
+      const nsAString& metric = Substring(aIter, aEnd);
+      if (metric.EqualsLiteral("min")) {
+        aMultiplier = MSEC_PER_MIN;
+        aIter = aEnd;
+        return true;
+      }
+      if (metric.EqualsLiteral("ms")) {
+        aMultiplier = 1;
+        aIter = aEnd;
+        return true;
+      }
+    }
+      return false;
+    case 's':
+      if (++aIter == aEnd) {
+        aMultiplier = MSEC_PER_SEC;
+        return true;
+      }
+  }
+  return false;
+}
+
+bool ParseClockValue(nsAString::const_iterator& aIter,
+                     const nsAString::const_iterator& aEnd,
+                     SMILTimeValue::Rounding aRounding,
+                     SMILTimeValue* aResult) {
+  if (aIter == aEnd) {
+    return false;
+  }
+
+  enum ClockType { TIMECOUNT_VALUE, PARTIAL_CLOCK_VALUE, FULL_CLOCK_VALUE };
+
+  int32_t clockType = TIMECOUNT_VALUE;
+
+  nsAString::const_iterator iter(aIter);
+
+  do {
+    switch (*iter) {
+      case ':':
+        if (clockType == FULL_CLOCK_VALUE) {
+          return false;
+        }
+        ++clockType;
+        break;
+      case 'e':
+      case 'E':
+      case '-':
+      case '+':
+        return false;
+    }
+    ++iter;
+  } while (iter != aEnd);
+
+  iter = aIter;
+
+  int32_t hours = 0, timecount = 0;
+  double fraction = 0.0;
+  uint32_t minutes, seconds, multiplier;
+
+  switch (clockType) {
+    case FULL_CLOCK_VALUE:
+      if (!SVGContentUtils::ParseInteger(iter, aEnd, hours) ||
+          !ParseColon(iter, aEnd)) {
+        return false;
+      }
+      [[fallthrough]];
+    case PARTIAL_CLOCK_VALUE:
+      if (!ParseSecondsOrMinutes(iter, aEnd, minutes) ||
+          !ParseColon(iter, aEnd) ||
+          !ParseSecondsOrMinutes(iter, aEnd, seconds)) {
+        return false;
+      }
+      if (iter != aEnd && (*iter != '.' || !SVGContentUtils::ParseNumber(
+                                               iter, aEnd, fraction))) {
+        return false;
+      }
+      aResult->SetMillis(SMILTime(hours) * MSEC_PER_HOUR +
+                             minutes * MSEC_PER_MIN +
+                             (seconds + fraction) * MSEC_PER_SEC,
+                         aRounding);
+      aIter = iter;
+      return true;
+    case TIMECOUNT_VALUE:
+      if (*iter != '.' &&
+          !SVGContentUtils::ParseInteger(iter, aEnd, timecount)) {
+        return false;
+      }
+      if (iter != aEnd && *iter == '.' &&
+          !SVGContentUtils::ParseNumber(iter, aEnd, fraction)) {
+        return false;
+      }
+      if (!ParseClockMetric(iter, aEnd, multiplier)) {
+        return false;
+      }
+      aResult->SetMillis((timecount + fraction) * multiplier, aRounding);
+      aIter = iter;
+      return true;
+  }
+
+  return false;
+}
+
+bool ParseOffsetValue(nsAString::const_iterator& aIter,
+                      const nsAString::const_iterator& aEnd,
+                      SMILTimeValue* aResult) {
+  nsAString::const_iterator iter(aIter);
+
+  int32_t sign;
+  if (!SVGContentUtils::ParseOptionalSign(iter, aEnd, sign) ||
+      !SkipWhitespace(iter, aEnd) ||
+      !ParseClockValue(iter, aEnd, SMILTimeValue::Rounding::Nearest, aResult)) {
+    return false;
+  }
+  if (sign == -1) {
+    aResult->SetMillis(-aResult->GetMillis());
+  }
+  aIter = iter;
+  return true;
+}
+
+bool ParseOffsetValue(const nsAString& aSpec, SMILTimeValue* aResult) {
+  nsAString::const_iterator iter, end;
+  aSpec.BeginReading(iter);
+  aSpec.EndReading(end);
+
+  return ParseOffsetValue(iter, end, aResult) && iter == end;
+}
+
+bool ParseOptionalOffset(nsAString::const_iterator& aIter,
+                         const nsAString::const_iterator& aEnd,
+                         SMILTimeValue* aResult) {
+  if (aIter == aEnd) {
+    *aResult = SMILTimeValue::Zero();
+    return true;
+  }
+
+  return SkipWhitespace(aIter, aEnd) && ParseOffsetValue(aIter, aEnd, aResult);
+}
+
+void MoveToNextToken(nsAString::const_iterator& aIter,
+                     const nsAString::const_iterator& aEnd, bool aBreakOnDot,
+                     bool& aIsAnyCharEscaped) {
+  aIsAnyCharEscaped = false;
+
+  bool isCurrentCharEscaped = false;
+
+  while (aIter != aEnd && !nsContentUtils::IsHTMLWhitespace(*aIter)) {
+    if (isCurrentCharEscaped) {
+      isCurrentCharEscaped = false;
+    } else {
+      if (*aIter == '+' || *aIter == '-' || (aBreakOnDot && *aIter == '.')) {
+        break;
+      }
+      if (*aIter == '\\') {
+        isCurrentCharEscaped = true;
+        aIsAnyCharEscaped = true;
+      }
+    }
+    ++aIter;
+  }
+}
+
+already_AddRefed<nsAtom> ConvertUnescapedTokenToAtom(const nsAString& aToken) {
+  if (aToken.IsEmpty() || NS_FAILED(nsContentUtils::CheckQName(aToken, false)))
+    return nullptr;
+  return NS_Atomize(aToken);
+}
+
+already_AddRefed<nsAtom> ConvertTokenToAtom(const nsAString& aToken,
+                                            bool aUnescapeToken) {
+  if (!aUnescapeToken) {
+    return ConvertUnescapedTokenToAtom(aToken);
+  }
+
+  nsAutoString token(aToken);
+
+  const char16_t* read = token.BeginReading();
+  const char16_t* const end = token.EndReading();
+  char16_t* write = token.BeginWriting();
+  bool escape = false;
+
+  while (read != end) {
+    MOZ_ASSERT(write <= read, "Writing past where we've read");
+    if (!escape && *read == '\\') {
+      escape = true;
+      ++read;
+    } else {
+      *write++ = *read++;
+      escape = false;
+    }
+  }
+  token.Truncate(write - token.BeginReading());
+
+  return ConvertUnescapedTokenToAtom(token);
+}
+
+bool ParseElementBaseTimeValueSpec(const nsAString& aSpec,
+                                   SMILTimeValueSpecParams& aResult) {
+  SMILTimeValueSpecParams result;
+
+
+  nsAString::const_iterator start, end;
+  aSpec.BeginReading(start);
+  aSpec.EndReading(end);
+
+  if (start == end) {
+    return false;
+  }
+
+  nsAString::const_iterator tokenEnd(start);
+
+  bool requiresUnescaping;
+  MoveToNextToken(tokenEnd, end, true, requiresUnescaping);
+
+  RefPtr<nsAtom> atom =
+      ConvertTokenToAtom(Substring(start, tokenEnd), requiresUnescaping);
+  if (atom == nullptr) {
+    return false;
+  }
+
+  if (tokenEnd != end && *tokenEnd == '.') {
+    result.mDependentElemID = atom;
+
+    ++tokenEnd;
+    start = tokenEnd;
+    MoveToNextToken(tokenEnd, end, false, requiresUnescaping);
+
+    const nsAString& token2 = Substring(start, tokenEnd);
+
+    if (token2.EqualsLiteral("begin")) {
+      result.mType = SMILTimeValueSpecParams::Type::Syncbase;
+      result.mSyncBegin = true;
+    } else if (token2.EqualsLiteral("end")) {
+      result.mType = SMILTimeValueSpecParams::Type::Syncbase;
+      result.mSyncBegin = false;
+    } else if (StringBeginsWith(token2, REPEAT_PREFIX)) {
+      start.advance(REPEAT_PREFIX.Length());
+      int32_t repeatValue;
+      if (start == tokenEnd || *start == '+' || *start == '-' ||
+          !SVGContentUtils::ParseInteger(start, tokenEnd, repeatValue)) {
+        return false;
+      }
+      if (start == tokenEnd || *start != ')') {
+        return false;
+      }
+      result.mType = SMILTimeValueSpecParams::Type::Repeat;
+      result.mRepeatIteration = repeatValue;
+    } else {
+      atom = ConvertTokenToAtom(token2, requiresUnescaping);
+      if (atom == nullptr) {
+        return false;
+      }
+      result.mType = SMILTimeValueSpecParams::Type::Event;
+      result.mEventSymbol = atom;
+    }
+  } else {
+    result.mType = SMILTimeValueSpecParams::Type::Event;
+    result.mEventSymbol = atom;
+  }
+
+  if (!ParseOptionalOffset(tokenEnd, end, &result.mOffset) || tokenEnd != end) {
+    return false;
+  }
+  aResult = std::move(result);
+  return true;
+}
+
+}  
+
+namespace mozilla {
+
+
+const nsDependentSubstring SMILParserUtils::TrimWhitespace(
+    const nsAString& aString) {
+  nsAString::const_iterator start, end;
+
+  aString.BeginReading(start);
+  aString.EndReading(end);
+
+  while (start != end && nsContentUtils::IsHTMLWhitespace(*start)) {
+    ++start;
+  }
+
+  while (end != start) {
+    --end;
+
+    if (!nsContentUtils::IsHTMLWhitespace(*end)) {
+      ++end;
+
+      break;
+    }
+  }
+
+  return Substring(start, end);
+}
+
+bool SMILParserUtils::ParseKeySplines(
+    const nsAString& aSpec, FallibleTArray<SMILKeySpline>& aKeySplines) {
+  for (const auto& controlPoint :
+       nsCharSeparatedTokenizerTemplate<nsContentUtils::IsHTMLWhitespace>(aSpec,
+                                                                          ';')
+           .ToRange()) {
+    nsCharSeparatedTokenizerTemplate<nsContentUtils::IsHTMLWhitespace,
+                                     nsTokenizerFlags::SeparatorOptional>
+        tokenizer(controlPoint, ',');
+
+    double values[4];
+    for (auto& value : values) {
+      if (!tokenizer.hasMoreTokens() ||
+          !SVGContentUtils::ParseNumber(tokenizer.nextToken(), value) ||
+          value > 1.0 || value < 0.0) {
+        return false;
+      }
+    }
+    if (tokenizer.hasMoreTokens() || tokenizer.separatorAfterCurrentToken() ||
+        !aKeySplines.AppendElement(
+            SMILKeySpline(values[0], values[1], values[2], values[3]),
+            fallible)) {
+      return false;
+    }
+  }
+
+  return !aKeySplines.IsEmpty();
+}
+
+bool SMILParserUtils::ParseSemicolonDelimitedProgressList(
+    const nsAString& aSpec, bool aNonDecreasing,
+    FallibleTArray<double>& aArray) {
+  nsCharSeparatedTokenizerTemplate<nsContentUtils::IsHTMLWhitespace> tokenizer(
+      aSpec, ';');
+
+  double previousValue = -1.0;
+
+  while (tokenizer.hasMoreTokens()) {
+    double value;
+    if (!SVGContentUtils::ParseNumber(tokenizer.nextToken(), value)) {
+      return false;
+    }
+
+    if (value > 1.0 || value < 0.0 ||
+        (aNonDecreasing && value < previousValue)) {
+      return false;
+    }
+
+    if (!aArray.AppendElement(value, fallible)) {
+      return false;
+    }
+    previousValue = value;
+  }
+
+  return !aArray.IsEmpty();
+}
+
+class MOZ_STACK_CLASS SMILValueParser
+    : public SMILParserUtils::GenericValueParser {
+ public:
+  SMILValueParser(const SVGAnimationElement* aSrcElement,
+                  const SMILAttr* aSMILAttr,
+                  FallibleTArray<SMILValue>* aValuesArray,
+                  bool* aPreventCachingOfSandwich)
+      : mSrcElement(aSrcElement),
+        mSMILAttr(aSMILAttr),
+        mValuesArray(aValuesArray),
+        mPreventCachingOfSandwich(aPreventCachingOfSandwich) {}
+
+  bool Parse(const nsAString& aValueStr) override {
+    SMILValue newValue;
+    if (NS_FAILED(mSMILAttr->ValueFromString(aValueStr, mSrcElement, newValue,
+                                             *mPreventCachingOfSandwich)))
+      return false;
+
+    if (!mValuesArray->AppendElement(newValue, fallible)) {
+      return false;
+    }
+    return true;
+  }
+
+ protected:
+  const SVGAnimationElement* mSrcElement;
+  const SMILAttr* mSMILAttr;
+  FallibleTArray<SMILValue>* mValuesArray;
+  bool* mPreventCachingOfSandwich;
+};
+
+bool SMILParserUtils::ParseValues(const nsAString& aSpec,
+                                  const SVGAnimationElement* aSrcElement,
+                                  const SMILAttr& aAttribute,
+                                  FallibleTArray<SMILValue>& aValuesArray,
+                                  bool& aPreventCachingOfSandwich) {
+  aPreventCachingOfSandwich = false;
+  SMILValueParser valueParser(aSrcElement, &aAttribute, &aValuesArray,
+                              &aPreventCachingOfSandwich);
+  return ParseValuesGeneric(aSpec, valueParser);
+}
+
+bool SMILParserUtils::ParseValuesGeneric(const nsAString& aSpec,
+                                         GenericValueParser& aParser) {
+  nsCharSeparatedTokenizerTemplate<nsContentUtils::IsHTMLWhitespace> tokenizer(
+      aSpec, ';');
+  if (!tokenizer.hasMoreTokens()) {  
+    return false;
+  }
+
+  while (tokenizer.hasMoreTokens()) {
+    if (!aParser.Parse(tokenizer.nextToken())) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool SMILParserUtils::ParseRepeatCount(const nsAString& aSpec,
+                                       SMILRepeatCount& aResult) {
+  const nsAString& spec = SMILParserUtils::TrimWhitespace(aSpec);
+
+  if (spec.EqualsLiteral("indefinite")) {
+    aResult.SetIndefinite();
+    return true;
+  }
+
+  double value;
+  if (!SVGContentUtils::ParseNumber(spec, value) || value <= 0.0) {
+    return false;
+  }
+  aResult = value;
+  return true;
+}
+
+bool SMILParserUtils::ParseTimeValueSpecParams(
+    const nsAString& aSpec, SMILTimeValueSpecParams& aResult) {
+  const nsAString& spec = TrimWhitespace(aSpec);
+
+  if (spec.EqualsLiteral("indefinite")) {
+    aResult.mType = SMILTimeValueSpecParams::Type::Indefinite;
+    return true;
+  }
+
+  if (ParseOffsetValue(spec, &aResult.mOffset)) {
+    aResult.mType = SMILTimeValueSpecParams::Type::Offset;
+    return true;
+  }
+
+  if (StringBeginsWith(spec, WALLCLOCK_PREFIX)) {
+    return false;  
+  }
+
+  if (StringBeginsWith(spec, ACCESSKEY_PREFIX_LC) ||
+      StringBeginsWith(spec, ACCESSKEY_PREFIX_CC)) {
+    return false;  
+  }
+
+  return ParseElementBaseTimeValueSpec(spec, aResult);
+}
+
+bool SMILParserUtils::ParseClockValue(const nsAString& aSpec,
+                                      SMILTimeValue::Rounding aRounding,
+                                      SMILTimeValue* aResult) {
+  nsAString::const_iterator iter, end;
+  aSpec.BeginReading(iter);
+  aSpec.EndReading(end);
+
+  return ::ParseClockValue(iter, end, aRounding, aResult) && iter == end;
+}
+
+int32_t SMILParserUtils::CheckForNegativeNumber(const nsAString& aStr) {
+  int32_t absValLocation = -1;
+
+  nsAString::const_iterator start, iter, end;
+  aStr.BeginReading(start);
+  aStr.EndReading(end);
+  iter = start;
+
+  while (iter != end && nsContentUtils::IsHTMLWhitespace(*iter)) {
+    ++iter;
+  }
+
+  if (iter != end && *iter == '-') {
+    ++iter;
+    if (iter != end && mozilla::IsAsciiDigit(*iter)) {
+      absValLocation = iter - start;
+    }
+  }
+  return absValLocation;
+}
+
+}  

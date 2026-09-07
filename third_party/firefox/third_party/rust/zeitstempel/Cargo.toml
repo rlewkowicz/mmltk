@@ -1,0 +1,37 @@
+
+[package]
+edition = "2018"
+name = "zeitstempel"
+version = "0.2.1"
+authors = ["Jan-Erik Rediger <jrediger@mozilla.com>"]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "A timestamp you can serialize, and it might include suspend time."
+license = "MPL-2.0"
+repository = "https://github.com/badboy/zeitstempel"
+
+[package.metadata.docs.rs]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+
+[features]
+win10plus = []
+
+[lib]
+name = "zeitstempel"
+path = "src/lib.rs"
+
+[dependencies.cfg-if]
+version = "1.0.0"
+
+[dependencies.once_cell]
+version = "1.5.2"
+
+[target.'cfg(target_os = "linux")'.dependencies.libc]
+version = "0.2"

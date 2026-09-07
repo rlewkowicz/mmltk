@@ -1,0 +1,36 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/mozalloc_abort.h"
+#include "mozilla/mozalloc_oom.h"
+
+#define OOM_MSG_LEADER "out of memory: 0x"
+#define OOM_MSG_DIGITS "0000000000000000"  // large enough for 2^64
+#define OOM_MSG_TRAILER " bytes requested"
+#define OOM_MSG_FIRST_DIGIT_OFFSET sizeof(OOM_MSG_LEADER) - 1
+#define OOM_MSG_LAST_DIGIT_OFFSET \
+  sizeof(OOM_MSG_LEADER) + sizeof(OOM_MSG_DIGITS) - 3
+
+MFBT_DATA size_t gOOMAllocationSize = 0;
+
+static const char* hex = "0123456789ABCDEF";
+
+void mozalloc_handle_oom(size_t size) {
+  char oomMsg[] = OOM_MSG_LEADER OOM_MSG_DIGITS OOM_MSG_TRAILER;
+  size_t i;
+
+
+  gOOMAllocationSize = size;
+
+  static_assert(OOM_MSG_FIRST_DIGIT_OFFSET > 0,
+                "Loop below will never terminate (i can't go below 0)");
+
+  for (i = OOM_MSG_LAST_DIGIT_OFFSET; size && i >= OOM_MSG_FIRST_DIGIT_OFFSET;
+       i--) {
+    oomMsg[i] = hex[size % 16];
+    size /= 16;
+  }
+
+  mozalloc_abort(oomMsg);
+}

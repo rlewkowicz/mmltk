@@ -1,0 +1,26 @@
+// Copyright 2022 Google Inc. All Rights Reserved.
+// Use of this source code is governed by a BSD-style license
+
+#if !defined(WEBP_SHARPYUV_SHARPYUV_GAMMA_H_)
+#define WEBP_SHARPYUV_SHARPYUV_GAMMA_H_
+
+#include "sharpyuv/sharpyuv.h"
+#include "src/webp/types.h"
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+void SharpYuvInitGammaTables(void);
+
+uint32_t SharpYuvGammaToLinear(uint16_t v, int bit_depth,
+                               SharpYuvTransferFunctionType transfer_type);
+
+uint16_t SharpYuvLinearToGamma(uint32_t value, int bit_depth,
+                               SharpYuvTransferFunctionType transfer_type);
+
+#if defined(__cplusplus)
+}  
+#endif
+
+#endif

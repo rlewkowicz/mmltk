@@ -1,0 +1,66 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef NS_STYLEDELEMENT_H_
+#define NS_STYLEDELEMENT_H_
+
+#include "mozilla/dom/Element.h"
+#include "nsString.h"
+
+namespace mozilla::dom {
+class StylePropertyMap;
+}  
+
+#define NS_STYLED_ELEMENT_IID \
+  {0xacbd9ea6, 0x15aa, 0x4f37, {0x8c, 0xe0, 0x35, 0x1e, 0xd7, 0x21, 0xca, 0xe9}}
+
+using nsStyledElementBase = mozilla::dom::Element;
+
+class nsStyledElement : public nsStyledElementBase {
+ protected:
+  inline explicit nsStyledElement(
+      already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo)
+      : nsStyledElementBase(std::move(aNodeInfo)) {}
+
+ public:
+  NS_IMETHOD QueryInterface(REFNSIID aIID, void** aInstancePtr) override;
+
+  virtual void InlineStyleDeclarationWillChange(
+      mozilla::MutationClosureData& aData) override;
+  virtual nsresult SetInlineStyleDeclaration(
+      mozilla::StyleLockedDeclarationBlock&,
+      mozilla::MutationClosureData& aData) override;
+  virtual nsresult BindToTree(BindContext& aContext, nsINode& aParent) override;
+
+  nsDOMCSSDeclaration* Style();
+
+  mozilla::dom::StylePropertyMap* AttributeStyleMap();
+
+  NS_INLINE_DECL_STATIC_IID(NS_STYLED_ELEMENT_IID)
+  NS_IMPL_FROMNODE_HELPER(nsStyledElement, IsStyledElement());
+
+  bool IsStyledElement() const final { return true; }
+
+ protected:
+  nsDOMCSSDeclaration* GetExistingStyle();
+
+  void ParseStyleAttribute(const nsAString& aValue,
+                           nsIPrincipal* aMaybeScriptedPrincipal,
+                           nsAttrValue& aResult, bool aForceInDataDoc);
+
+  bool ParseAttribute(int32_t aNamespaceID, nsAtom* aAttribute,
+                      const nsAString& aValue,
+                      nsIPrincipal* aMaybeScriptedPrincipal,
+                      nsAttrValue& aResult) override;
+
+  friend class mozilla::dom::Element;
+
+  nsresult ReparseStyleAttribute(bool aForceInDataDoc);
+
+  void BeforeSetAttr(int32_t aNamespaceID, nsAtom* aName,
+                     const nsAttrValue* aValue, bool aNotify) override;
+};
+
+#endif  // NS_STYLEDELEMENT_H_

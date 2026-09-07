@@ -1,0 +1,39 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+XPIDL_SOURCES += [
+    "nsIExpatSink.idl",
+]
+
+XPIDL_MODULE = "htmlparser"
+
+EXPORTS += [
+    "nsElementTable.h",
+    "nsHTMLTagList.inc",
+    "nsHTMLTags.h",
+    "nsIContentSink.h",
+    "nsIFragmentContentSink.h",
+    "nsIParser.h",
+    "nsParserBase.h",
+    "nsParserConstants.h",
+    "nsScannerString.h",
+]
+
+UNIFIED_SOURCES += [
+    "CParserContext.cpp",
+    "nsElementTable.cpp",
+    "nsExpatDriver.cpp",
+    "nsHTMLTags.cpp",
+    "nsParser.cpp",
+    "nsParserMsgUtils.cpp",
+    "nsScanner.cpp",
+    "nsScannerString.cpp",
+]
+
+include("/ipc/chromium/chromium-config.mozbuild")
+
+FINAL_LIBRARY = "xul"
+
+LOCAL_INCLUDES += [
+]

@@ -1,0 +1,168 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "MediaStreamTrackAudioSourceNode.h"
+
+#include "AudioNodeEngine.h"
+#include "AudioNodeExternalInputTrack.h"
+#include "AudioStreamTrack.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/MediaStreamTrackAudioSourceNodeBinding.h"
+#include "nsContentUtils.h"
+#include "nsGlobalWindowInner.h"
+#include "nsIScriptError.h"
+
+namespace mozilla::dom {
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(MediaStreamTrackAudioSourceNode)
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(MediaStreamTrackAudioSourceNode)
+  tmp->Destroy();
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mInputTrack)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_WEAK_PTR
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END_INHERITED(AudioNode)
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(
+    MediaStreamTrackAudioSourceNode, AudioNode)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mInputTrack)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(MediaStreamTrackAudioSourceNode)
+NS_INTERFACE_MAP_END_INHERITING(AudioNode)
+
+NS_IMPL_ADDREF_INHERITED(MediaStreamTrackAudioSourceNode, AudioNode)
+NS_IMPL_RELEASE_INHERITED(MediaStreamTrackAudioSourceNode, AudioNode)
+
+MediaStreamTrackAudioSourceNode::MediaStreamTrackAudioSourceNode(
+    AudioContext* aContext)
+    : AudioNode(aContext, 2, ChannelCountMode::Max,
+                ChannelInterpretation::Speakers),
+      mTrackListener(this) {}
+
+ already_AddRefed<MediaStreamTrackAudioSourceNode>
+MediaStreamTrackAudioSourceNode::Create(
+    AudioContext& aAudioContext,
+    const MediaStreamTrackAudioSourceOptions& aOptions, ErrorResult& aRv) {
+  MOZ_RELEASE_ASSERT(!aAudioContext.IsOffline(), "Bindings messed up?");
+
+  RefPtr<MediaStreamTrackAudioSourceNode> node =
+      new MediaStreamTrackAudioSourceNode(&aAudioContext);
+
+  node->Init(aOptions.mMediaStreamTrack, aRv);
+  if (aRv.Failed()) {
+    return nullptr;
+  }
+
+  return node.forget();
+}
+
+void MediaStreamTrackAudioSourceNode::Init(MediaStreamTrack* aMediaStreamTrack,
+                                           ErrorResult& aRv) {
+  MOZ_ASSERT(aMediaStreamTrack);
+
+  if (!aMediaStreamTrack->AsAudioStreamTrack()) {
+    aRv.ThrowInvalidStateError("\"mediaStreamTrack\" must be an audio track");
+    return;
+  }
+
+  if (aMediaStreamTrack->Ended()) {
+    return;
+  }
+
+  MarkActive();
+
+  MediaTrackGraph* graph = Context()->Graph();
+
+  AudioNodeEngine* engine = new MediaStreamTrackAudioSourceNodeEngine(this);
+  mTrack = AudioNodeExternalInputTrack::Create(graph, engine);
+
+  MOZ_ASSERT(mTrack);
+
+  mInputTrack = aMediaStreamTrack->AsAudioStreamTrack();
+  ProcessedMediaTrack* outputTrack =
+      static_cast<ProcessedMediaTrack*>(mTrack.get());
+  mInputPort = mInputTrack->AddConsumerPort(outputTrack);
+  PrincipalChanged(mInputTrack);  
+  mInputTrack->AddPrincipalChangeObserver(this);
+
+  mInputTrack->AddConsumer(&mTrackListener);
+}
+
+void MediaStreamTrackAudioSourceNode::Destroy() {
+  if (mInputTrack) {
+    mInputTrack->RemoveConsumerPort(mInputPort);
+    mTrackListener.NotifyEnded(mInputTrack);
+    mInputTrack->RemovePrincipalChangeObserver(this);
+    mInputTrack->RemoveConsumer(&mTrackListener);
+    mInputTrack = nullptr;
+  }
+
+  if (mInputPort) {
+    mInputPort->Destroy();
+    mInputPort = nullptr;
+  }
+}
+
+MediaStreamTrackAudioSourceNode::~MediaStreamTrackAudioSourceNode() {
+  Destroy();
+}
+
+void MediaStreamTrackAudioSourceNode::PrincipalChanged(
+    MediaStreamTrack* aMediaStreamTrack) {
+  MOZ_ASSERT(aMediaStreamTrack == mInputTrack);
+
+  bool subsumes = false;
+  Document* doc = nullptr;
+  if (nsGlobalWindowInner* win = Context()->GetOwnerWindow()) {
+    doc = win->GetExtantDoc();
+    if (doc) {
+      nsIPrincipal* docPrincipal = doc->NodePrincipal();
+      nsIPrincipal* trackPrincipal = aMediaStreamTrack->GetPrincipal();
+      if (!trackPrincipal ||
+          NS_FAILED(docPrincipal->Subsumes(trackPrincipal, &subsumes))) {
+        subsumes = false;
+      }
+    }
+  }
+  auto track = static_cast<AudioNodeExternalInputTrack*>(mTrack.get());
+  bool enabled = subsumes;
+  track->SetInt32Parameter(MediaStreamTrackAudioSourceNodeEngine::ENABLE,
+                           enabled);
+
+  if (!enabled && doc) {
+    nsContentUtils::ReportToConsole(nsIScriptError::warningFlag, "Web Audio"_ns,
+                                    doc, PropertiesFile::DOM_PROPERTIES,
+                                    CrossOriginErrorString());
+  }
+}
+
+size_t MediaStreamTrackAudioSourceNode::SizeOfExcludingThis(
+    MallocSizeOf aMallocSizeOf) const {
+  size_t amount = AudioNode::SizeOfExcludingThis(aMallocSizeOf);
+  if (mInputPort) {
+    amount += mInputPort->SizeOfIncludingThis(aMallocSizeOf);
+  }
+  return amount;
+}
+
+size_t MediaStreamTrackAudioSourceNode::SizeOfIncludingThis(
+    MallocSizeOf aMallocSizeOf) const {
+  return aMallocSizeOf(this) + SizeOfExcludingThis(aMallocSizeOf);
+}
+
+void MediaStreamTrackAudioSourceNode::DestroyMediaTrack() {
+  if (mInputPort) {
+    mInputTrack->RemoveConsumerPort(mInputPort);
+    mInputPort->Destroy();
+    mInputPort = nullptr;
+  }
+  AudioNode::DestroyMediaTrack();
+}
+
+JSObject* MediaStreamTrackAudioSourceNode::WrapObject(
+    JSContext* aCx, JS::Handle<JSObject*> aGivenProto) {
+  return MediaStreamTrackAudioSourceNode_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+}  

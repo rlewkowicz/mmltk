@@ -1,0 +1,85 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsContainerFrameInlines_h_
+#define nsContainerFrameInlines_h_
+
+#include "nsContainerFrame.h"
+
+template <typename ISizeData, typename F>
+void nsContainerFrame::DoInlineIntrinsicISize(ISizeData* aData,
+                                              F& aHandleChildren) {
+  using namespace mozilla;
+
+  auto GetMargin = [](const AnchorResolvedMargin& aCoord) -> nscoord {
+    if (!aCoord->IsLengthPercentage()) {
+      MOZ_ASSERT(aCoord->IsAuto(), "Didn't resolve anchor functions first?");
+      return 0;
+    }
+    return aCoord->AsLengthPercentage().Resolve(0);
+  };
+
+  if (GetPrevInFlow()) {
+    return;  
+  }
+
+  WritingMode wm = GetWritingMode();
+  Side startSide = wm.PhysicalSideForInlineAxis(LogicalEdge::Start);
+  Side endSide = wm.PhysicalSideForInlineAxis(LogicalEdge::End);
+
+  const nsStylePadding* stylePadding = StylePadding();
+  const nsStyleBorder* styleBorder = StyleBorder();
+  const nsStyleMargin* styleMargin = StyleMargin();
+  const auto anchorResolutionParams = AnchorPosResolutionParams::From(this);
+
+  nscoord clonePBM = 0;  
+  const bool sliceBreak =
+      styleBorder->mBoxDecorationBreak == StyleBoxDecorationBreak::Slice;
+  if (!GetPrevContinuation() || MOZ_UNLIKELY(!sliceBreak)) {
+    nscoord startPBM =
+        std::max(stylePadding->mPadding.Get(startSide).Resolve(0), 0) +
+        styleBorder->GetComputedBorderWidth(startSide) +
+        GetMargin(styleMargin->GetMargin(startSide, anchorResolutionParams));
+    if (MOZ_LIKELY(sliceBreak)) {
+      aData->mCurrentLine += startPBM;
+    } else {
+      clonePBM = startPBM;
+    }
+  }
+
+  nscoord endPBM =
+      std::max(stylePadding->mPadding.Get(endSide).Resolve(0), 0) +
+      styleBorder->GetComputedBorderWidth(endSide) +
+      GetMargin(styleMargin->GetMargin(endSide, anchorResolutionParams));
+  if (MOZ_UNLIKELY(!sliceBreak)) {
+    clonePBM += endPBM;
+    aData->mCurrentLine += clonePBM;
+  }
+
+  const LineListIterator* savedLine = aData->mLine;
+  nsIFrame* const savedLineContainer = aData->LineContainer();
+
+  nsContainerFrame* lastInFlow;
+  for (nsContainerFrame* nif = this; nif;
+       nif = static_cast<nsContainerFrame*>(nif->GetNextInFlow())) {
+    if (aData->mCurrentLine == 0) {
+      aData->mCurrentLine = clonePBM;
+    }
+    aHandleChildren(nif, aData);
+
+    aData->mLine = nullptr;
+    aData->SetLineContainer(nullptr);
+
+    lastInFlow = nif;
+  }
+
+  aData->mLine = savedLine;
+  aData->SetLineContainer(savedLineContainer);
+
+  if (MOZ_LIKELY(!lastInFlow->GetNextContinuation() && sliceBreak)) {
+    aData->mCurrentLine += endPBM;
+  }
+}
+
+#endif  // nsContainerFrameInlines_h_

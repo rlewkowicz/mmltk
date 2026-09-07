@@ -1,0 +1,58 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef mozilla_dom_MenuBarListener_h
+#define mozilla_dom_MenuBarListener_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/EventForwards.h"
+#include "nsIDOMEventListener.h"
+
+namespace mozilla::dom {
+class Document;
+class EventTarget;
+class KeyboardEvent;
+class XULMenuBarElement;
+class XULButtonElement;
+
+class MenuBarListener final : public nsIDOMEventListener {
+ public:
+  explicit MenuBarListener(XULMenuBarElement&);
+
+  NS_DECL_ISUPPORTS
+
+  NS_DECL_NSIDOMEVENTLISTENER
+
+  void Detach();
+
+ protected:
+  virtual ~MenuBarListener();
+
+  bool IsMenuOpen() const;
+
+  MOZ_CAN_RUN_SCRIPT nsresult KeyUp(Event* aMouseEvent);
+  MOZ_CAN_RUN_SCRIPT nsresult KeyDown(Event* aMouseEvent);
+  MOZ_CAN_RUN_SCRIPT nsresult KeyPress(Event* aMouseEvent);
+  MOZ_CAN_RUN_SCRIPT nsresult Blur(Event* aEvent);
+  MOZ_CAN_RUN_SCRIPT nsresult OnWindowDeactivated(Event* aEvent);
+  MOZ_CAN_RUN_SCRIPT nsresult MouseDown(Event* aMouseEvent);
+  MOZ_CAN_RUN_SCRIPT nsresult Fullscreen(Event* aEvent);
+
+  XULButtonElement* GetMenuForKeyEvent(KeyboardEvent& aKeyEvent);
+
+  void ReserveKeyIfNeeded(Event* aKeyEvent);
+
+  enum class ByKeyboard : bool { No, Yes };
+  MOZ_CAN_RUN_SCRIPT void ToggleMenuActiveState(ByKeyboard);
+
+  bool Destroyed() const { return !mMenuBar; }
+
+  XULMenuBarElement* mMenuBar;
+  Document* mEventTarget;
+  bool mAccessKeyDown = false;
+  bool mAccessKeyDownCanceled = false;
+};
+
+}  
+
+#endif  // #ifndef mozilla_dom_MenuBarListener_h

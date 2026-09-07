@@ -1,0 +1,263 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef URLPreloader_h
+#define URLPreloader_h
+
+#include "mozilla/DataMutex.h"
+#include "mozilla/FileLocation.h"
+#include "mozilla/HashFunctions.h"
+#include "mozilla/LinkedList.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/Monitor.h"
+#include "mozilla/Omnijar.h"
+#include "mozilla/Result.h"
+#include "nsClassHashtable.h"
+#include "nsHashKeys.h"
+#include "nsIChromeRegistry.h"
+#include "nsIFile.h"
+#include "nsIURI.h"
+#include "nsIMemoryReporter.h"
+#include "nsIResProtocolHandler.h"
+#include "nsIThread.h"
+#include "nsReadableUtils.h"
+
+class nsZipArchive;
+
+namespace mozilla {
+namespace loader {
+class InputBuffer;
+}
+
+using namespace mozilla::loader;
+
+class ScriptPreloader;
+
+class URLPreloader final : public nsIMemoryReporter {
+  MOZ_DEFINE_MALLOC_SIZE_OF(MallocSizeOf)
+
+  URLPreloader() = default;
+
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIMEMORYREPORTER
+
+  static URLPreloader& GetSingleton();
+
+  enum ReadType {
+    Forget,
+    Retain,
+  };
+
+  static Result<nsCString, nsresult> Read(FileLocation& location,
+                                          ReadType readType = Forget);
+
+  static Result<nsCString, nsresult> ReadURI(nsIURI* uri,
+                                             ReadType readType = Forget);
+
+  static Result<nsCString, nsresult> ReadFile(nsIFile* file,
+                                              ReadType readType = Forget);
+
+  static Result<nsCString, nsresult> ReadZip(nsZipArchive* archive,
+                                             const nsACString& path,
+                                             ReadType readType = Forget);
+
+  void SetStartupFinished() { mStartupFinished = true; }
+
+ private:
+  struct CacheKey;
+
+  Result<nsCString, nsresult> ReadInternal(const CacheKey& key,
+                                           ReadType readType);
+
+  Result<nsCString, nsresult> ReadURIInternal(nsIURI* uri, ReadType readType);
+
+  Result<nsCString, nsresult> ReadFileInternal(nsIFile* file,
+                                               ReadType readType);
+
+  static Result<nsCString, nsresult> Read(const CacheKey& key,
+                                          ReadType readType);
+
+  static bool sInitialized;
+
+  static mozilla::StaticRefPtr<URLPreloader> sSingleton;
+
+ protected:
+  friend class AddonManagerStartup;
+  friend class ScriptPreloader;
+
+  virtual ~URLPreloader();
+
+  Result<Ok, nsresult> WriteCache();
+
+  static URLPreloader& ReInitialize();
+
+  void Cleanup();
+
+  struct MOZ_RAII AutoBeginReading final {
+    AutoBeginReading() { GetSingleton().BeginBackgroundRead(); }
+
+    ~AutoBeginReading() {
+      auto& reader = GetSingleton();
+
+      MonitorAutoLock mal(reader.mMonitor);
+
+      while (!reader.mReaderInitialized && URLPreloader::sInitialized) {
+        mal.Wait();
+      }
+    }
+  };
+
+ private:
+  struct CacheKey {
+    enum EntryType : uint8_t {
+      TypeAppJar,
+      TypeGREJar,
+      TypeFile,
+    };
+
+    CacheKey() = default;
+    CacheKey(const CacheKey& other) = default;
+
+    CacheKey(EntryType type, const nsACString& path)
+        : mType(type), mPath(path) {}
+
+    explicit CacheKey(nsIFile* file) : mType(TypeFile) {
+      nsString path;
+      MOZ_ALWAYS_SUCCEEDS(file->GetPath(path));
+      MOZ_DIAGNOSTIC_ASSERT(path.Length() > 0);
+      CopyUTF16toUTF8(path, mPath);
+    }
+
+    explicit inline CacheKey(InputBuffer& buffer);
+
+    template <typename Buffer>
+    void Code(Buffer& buffer) {
+      buffer.codeUint8(*reinterpret_cast<uint8_t*>(&mType));
+      buffer.codeString(mPath);
+      MOZ_DIAGNOSTIC_ASSERT(mPath.Length() > 0);
+    }
+
+    uint32_t Hash() const { return HashGeneric(mType, HashString(mPath)); }
+
+    bool operator==(const CacheKey& other) const {
+      return mType == other.mType && mPath == other.mPath;
+    }
+
+    Omnijar::Type OmnijarType() {
+      switch (mType) {
+        case TypeAppJar:
+          return Omnijar::APP;
+        case TypeGREJar:
+          return Omnijar::GRE;
+        default:
+          MOZ_CRASH("Unexpected entry type");
+          return Omnijar::GRE;
+      }
+    }
+
+    const char* TypeString() const {
+      switch (mType) {
+        case TypeAppJar:
+          return "AppJar";
+        case TypeGREJar:
+          return "GREJar";
+        case TypeFile:
+          return "File";
+      }
+      MOZ_ASSERT_UNREACHABLE("no such type");
+      return "";
+    }
+
+    already_AddRefed<nsZipArchive> Archive() {
+      return Omnijar::GetReader(OmnijarType());
+    }
+
+    Result<FileLocation, nsresult> ToFileLocation();
+
+    EntryType mType = TypeFile;
+
+    nsCString mPath{};
+  };
+
+  struct URLEntry final : public CacheKey, public LinkedListElement<URLEntry> {
+    MOZ_IMPLICIT URLEntry(const CacheKey& key)
+        : CacheKey(key), mData(VoidCString()) {}
+
+    explicit URLEntry(nsIFile* file) : CacheKey(file) {}
+
+    struct Comparator final {
+      bool Equals(const URLEntry* a, const URLEntry* b) const {
+        return a->mReadTime == b->mReadTime;
+      }
+
+      bool LessThan(const URLEntry* a, const URLEntry* b) const {
+        return a->mReadTime < b->mReadTime;
+      }
+    };
+
+    void UpdateUsedTime(const TimeStamp& time = TimeStamp::Now()) {
+      if (!mReadTime || time < mReadTime) {
+        mReadTime = time;
+      }
+    }
+
+    Result<nsCString, nsresult> Read();
+    static Result<nsCString, nsresult> ReadLocation(FileLocation& location);
+
+    size_t SizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf) const {
+      return (mallocSizeOf(this) +
+              mPath.SizeOfExcludingThisEvenIfShared(mallocSizeOf) +
+              mData.SizeOfExcludingThisEvenIfShared(mallocSizeOf));
+    }
+
+    Result<nsCString, nsresult> ReadOrWait(ReadType readType);
+
+    nsCString mData;
+
+    TimeStamp mReadTime{};
+
+    nsresult mResultCode = NS_OK;
+  };
+
+  Result<CacheKey, nsresult> ResolveURI(nsIURI* uri);
+
+  static already_AddRefed<URLPreloader> Create(bool* aInitialized);
+
+  Result<Ok, nsresult> InitInternal();
+
+  Result<nsCOMPtr<nsIFile>, nsresult> GetCacheFile(const nsAString& suffix);
+  Result<nsCOMPtr<nsIFile>, nsresult> FindCacheFile();
+
+  Result<Ok, nsresult> ReadCache(LinkedList<URLEntry>& pendingURLs);
+
+  void BackgroundReadFiles();
+  void BeginBackgroundRead();
+
+  using HashType = nsClassHashtable<nsGenericHashKey<CacheKey>, URLEntry>;
+
+  size_t ShallowSizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf);
+
+  bool mStartupFinished = false;
+  bool mReaderInitialized = false;
+
+  bool mCacheWritten = false;
+
+  nsCString mGREPrefix;
+  nsCString mAppPrefix;
+
+  nsCOMPtr<nsIResProtocolHandler> mResProto;
+  nsCOMPtr<nsIChromeRegistry> mChromeReg;
+  nsCOMPtr<nsIFile> mProfD;
+
+  DataMutex<RefPtr<nsIThread>> mReaderThread{"ReaderThread"};
+
+  HashType mCachedURLs;
+
+  Monitor mMonitor MOZ_UNANNOTATED{"[URLPreloader::mMutex]"};
+};
+
+}  
+
+#endif  // URLPreloader_h

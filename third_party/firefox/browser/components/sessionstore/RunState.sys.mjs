@@ -1,0 +1,57 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+const STATE_STOPPED = 0;
+const STATE_RUNNING = 1;
+const STATE_QUITTING = 2;
+const STATE_CLOSING = 3;
+const STATE_CLOSED = 4;
+
+var state = STATE_STOPPED;
+
+export var RunState = Object.freeze({
+  get isStopped() {
+    return state == STATE_STOPPED;
+  },
+
+  get isRunning() {
+    return state == STATE_RUNNING;
+  },
+
+  get isQuitting() {
+    return state >= STATE_QUITTING;
+  },
+
+  get isClosing() {
+    return state == STATE_CLOSING;
+  },
+
+  get isClosed() {
+    return state == STATE_CLOSED;
+  },
+
+  setRunning() {
+    if (this.isStopped) {
+      state = STATE_RUNNING;
+    }
+  },
+
+  setClosing() {
+    if (this.isQuitting) {
+      state = STATE_CLOSING;
+    }
+  },
+
+  setClosed() {
+    if (this.isClosing) {
+      state = STATE_CLOSED;
+    }
+  },
+
+  setQuitting() {
+    if (this.isRunning) {
+      state = STATE_QUITTING;
+    }
+  },
+});

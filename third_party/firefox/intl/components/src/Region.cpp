@@ -1,0 +1,41 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/intl/Region.h"
+
+#include "mozilla/Assertions.h"
+
+#include <algorithm>
+
+#include "unicode/uregion.h"
+#include "unicode/utypes.h"
+
+namespace mozilla::intl {
+
+Result<Maybe<Region>, ICUError> Region::From(const RegionSubtag& aRegion) {
+  auto regionSpan = aRegion.Span();
+  MOZ_ASSERT(IsStructurallyValidRegionTag(regionSpan));
+
+  char region[LanguageTagLimits::RegionLength + 1] = {};
+  std::copy_n(regionSpan.Elements(), LanguageTagLimits::RegionLength, region);
+
+  UErrorCode status = U_ZERO_ERROR;
+  const URegion* uregion = uregion_getRegionFromCode(region, &status);
+
+  if (U_FAILURE(status)) {
+    if (status != U_ILLEGAL_ARGUMENT_ERROR) {
+      return Err(ToICUError(status));
+    }
+    return Maybe<Region>{};
+  }
+  return Some(Region{uregion, aRegion});
+}
+
+bool Region::IsRegular() const {
+  return uregion_getType(mURegion) == URGN_TERRITORY &&
+         mozilla::MakeStringSpan(uregion_getRegionCode(mURegion)) ==
+             mRegion.Span();
+}
+
+}  

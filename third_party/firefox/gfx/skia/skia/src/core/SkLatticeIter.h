@@ -1,0 +1,64 @@
+/*
+ * Copyright 2015 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkLatticeIter_DEFINED)
+#define SkLatticeIter_DEFINED
+
+#include "include/core/SkCanvas.h"
+#include "include/core/SkColor.h"
+#include "include/core/SkRect.h"
+#include "include/core/SkScalar.h"
+#include "include/private/base/SkAPI.h"
+#include "include/private/base/SkTArray.h"
+
+class SkMatrix;
+
+class SK_SPI SkLatticeIter {
+public:
+
+    static bool Valid(int imageWidth, int imageHeight, const SkCanvas::Lattice& lattice);
+
+    SkLatticeIter(const SkCanvas::Lattice& lattice, const SkRect& dst);
+
+    static bool Valid(int imageWidth, int imageHeight, const SkIRect& center);
+
+    SkLatticeIter(int imageWidth, int imageHeight, const SkIRect& center, const SkRect& dst);
+
+    bool next(SkIRect* src, SkRect* dst, bool* isFixedColor = nullptr,
+              SkColor* fixedColor = nullptr);
+
+    bool next(SkRect* src, SkRect* dst, bool* isFixedColor = nullptr,
+              SkColor* fixedColor = nullptr) {
+        SkIRect isrcR;
+        if (this->next(&isrcR, dst, isFixedColor, fixedColor)) {
+            *src = SkRect::Make(isrcR);
+            return true;
+        }
+        return false;
+    }
+
+    void mapDstScaleTranslate(const SkMatrix& matrix);
+
+    int numRectsToDraw() const {
+        return fNumRectsToDraw;
+    }
+
+private:
+    skia_private::TArray<int> fSrcX;
+    skia_private::TArray<int> fSrcY;
+    skia_private::TArray<SkScalar> fDstX;
+    skia_private::TArray<SkScalar> fDstY;
+    skia_private::TArray<SkCanvas::Lattice::RectType> fRectTypes;
+    skia_private::TArray<SkColor> fColors;
+
+    int  fCurrX;
+    int  fCurrY;
+    int  fNumRectsInLattice;
+    int  fNumRectsToDraw;
+};
+
+#endif

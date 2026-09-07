@@ -1,0 +1,268 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef CertVerifier_h
+#define CertVerifier_h
+
+#include "CTPolicyEnforcer.h"
+#include "CTVerifyResult.h"
+#include "EnterpriseRoots.h"
+#include "OCSPCache.h"
+#include "ScopedNSSTypes.h"
+#include "mozilla/EnumSet.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/UniquePtr.h"
+#include "mozpkix/pkixder.h"
+#include "mozpkix/pkixtypes.h"
+#include "nsString.h"
+#include "signature_cache_ffi.h"
+#include "sslt.h"
+
+#if defined(_MSC_VER)
+#  pragma warning(push)
+#  pragma warning(disable : 4324)
+#endif /* defined(_MSC_VER) */
+#include "mozilla/BasePrincipal.h"
+#if defined(_MSC_VER)
+#  pragma warning(pop) /* popping the pragma in this file */
+#endif                 /* defined(_MSC_VER) */
+
+namespace mozilla {
+namespace ct {
+
+class MultiLogCTVerifier;
+
+}  
+}  
+
+namespace mozilla {
+namespace psm {
+
+typedef mozilla::pkix::Result Result;
+
+enum class EVStatus : uint8_t {
+  NotEV = 0,
+  EV = 1,
+};
+
+enum class KeySizeStatus {
+  NeverChecked = 0,
+  LargeMinimumSucceeded = 1,
+  CompatibilityRisk = 2,
+  AlreadyBad = 3,
+};
+
+enum class CRLiteMode {
+  Disabled = 0,
+  TelemetryOnly = 1,
+  Enforce = 2,
+};
+
+enum class VerifyUsage {
+  TLSServer = 1,
+  TLSServerCA = 2,
+  TLSClient = 3,
+  TLSClientCA = 4,
+  EmailSigner = 5,
+  EmailRecipient = 6,
+  EmailCA = 7,
+};
+
+enum class IssuerSource {
+  TLSHandshake,            
+  PreloadedIntermediates,  
+  ThirdPartyCertificates,  
+  NSSCertDB,  
+  BuiltInRootsModule,  
+};
+
+using IssuerSources = EnumSet<IssuerSource>;
+
+class CertificateTransparencyInfo {
+ public:
+  CertificateTransparencyInfo() : enabled(false), policyCompliance(Nothing()) {
+    Reset();
+  }
+
+  bool enabled;
+  mozilla::ct::CTVerifyResult verifyResult;
+  Maybe<mozilla::ct::CTPolicyCompliance> policyCompliance;
+
+  void Reset();
+};
+
+class DelegatedCredentialInfo {
+ public:
+  DelegatedCredentialInfo() : scheme(ssl_sig_none), authKeyBits(0) {}
+  DelegatedCredentialInfo(SSLSignatureScheme scheme, uint32_t authKeyBits)
+      : scheme(scheme), authKeyBits(authKeyBits) {}
+
+  SSLSignatureScheme scheme;
+
+  uint32_t authKeyBits;
+};
+
+class SkipInvalidSANsForNonBuiltInRootsPolicy
+    : public pkix::NameMatchingPolicy {
+ public:
+  explicit SkipInvalidSANsForNonBuiltInRootsPolicy(bool rootIsBuiltIn)
+      : mRootIsBuiltIn(rootIsBuiltIn) {}
+
+  virtual pkix::Result FallBackToCommonName(
+      pkix::Time,
+       pkix::FallBackToSearchWithinSubject& fallBackToCommonName)
+      override {
+    fallBackToCommonName = pkix::FallBackToSearchWithinSubject::No;
+    return pkix::Success;
+  }
+
+  virtual pkix::HandleInvalidSubjectAlternativeNamesBy
+  HandleInvalidSubjectAlternativeNames() override {
+    return mRootIsBuiltIn
+               ? pkix::HandleInvalidSubjectAlternativeNamesBy::Halting
+               : pkix::HandleInvalidSubjectAlternativeNamesBy::Skipping;
+  }
+
+ private:
+  bool mRootIsBuiltIn;
+};
+
+class NSSCertDBTrustDomain;
+
+class CertVerifier {
+ public:
+  typedef unsigned int Flags;
+  static const Flags FLAG_LOCAL_ONLY;
+  static const Flags FLAG_MUST_BE_EV;
+  static const Flags FLAG_TLS_IGNORE_STATUS_REQUEST;
+
+  enum OCSPStaplingStatus {
+    OCSP_STAPLING_NEVER_CHECKED = 0,
+    OCSP_STAPLING_GOOD = 1,
+    OCSP_STAPLING_NONE = 2,
+    OCSP_STAPLING_EXPIRED = 3,
+    OCSP_STAPLING_INVALID = 4,
+  };
+
+  mozilla::pkix::Result VerifyCert(
+      const nsTArray<uint8_t>& certBytes, VerifyUsage usage,
+      mozilla::pkix::Time time, void* pinArg, const char* hostname,
+       nsTArray<nsTArray<uint8_t>>& builtChain, Flags flags = 0,
+      const Maybe<nsTArray<nsTArray<uint8_t>>>& extraCertificates = Nothing(),
+       const Maybe<nsTArray<uint8_t>>& stapledOCSPResponseArg =
+          Nothing(),
+       const Maybe<nsTArray<uint8_t>>& sctsFromTLS = Nothing(),
+       const OriginAttributes& originAttributes =
+          OriginAttributes(),
+       EVStatus* evStatus = nullptr,
+       OCSPStaplingStatus* ocspStaplingStatus = nullptr,
+       KeySizeStatus* keySizeStatus = nullptr,
+       CertificateTransparencyInfo* ctInfo = nullptr,
+       bool* isBuiltChainRootBuiltInRoot = nullptr,
+       bool* madeOCSPRequests = nullptr,
+       IssuerSources* = nullptr);
+
+  mozilla::pkix::Result VerifySSLServerCert(
+      const nsTArray<uint8_t>& peerCert, mozilla::pkix::Time time, void* pinarg,
+      const nsACString& hostname,
+       nsTArray<nsTArray<uint8_t>>& builtChain,
+       Flags flags = 0,
+       const Maybe<nsTArray<nsTArray<uint8_t>>>& extraCertificates =
+          Nothing(),
+       const Maybe<nsTArray<uint8_t>>& stapledOCSPResponse =
+          Nothing(),
+       const Maybe<nsTArray<uint8_t>>& sctsFromTLS = Nothing(),
+       const Maybe<DelegatedCredentialInfo>& dcInfo = Nothing(),
+       const OriginAttributes& originAttributes =
+          OriginAttributes(),
+       EVStatus* evStatus = nullptr,
+       OCSPStaplingStatus* ocspStaplingStatus = nullptr,
+       KeySizeStatus* keySizeStatus = nullptr,
+       CertificateTransparencyInfo* ctInfo = nullptr,
+       bool* isBuiltChainRootBuiltInRoot = nullptr,
+       bool* madeOCSPRequests = nullptr,
+       IssuerSources* = nullptr);
+
+  enum OcspDownloadConfig { ocspOff = 0, ocspOn = 1, ocspEVOnly = 2 };
+  enum OcspStrictConfig { ocspRelaxed = 0, ocspStrict };
+
+  enum class CertificateTransparencyMode {
+    Disabled = 0,
+    TelemetryOnly = 1,
+    Enforce = 2,
+  };
+
+  struct CertificateTransparencyConfig {
+    CertificateTransparencyConfig(
+        CertificateTransparencyMode mode, nsCString&& skipForHosts,
+        nsTArray<CopyableTArray<uint8_t>>&& skipForSPKIHashes)
+        : mMode(mode),
+          mSkipForHosts(std::move(skipForHosts)),
+          mSkipForSPKIHashes(std::move(skipForSPKIHashes)) {}
+
+    CertificateTransparencyMode mMode;
+    nsCString mSkipForHosts;
+    nsTArray<CopyableTArray<uint8_t>> mSkipForSPKIHashes;
+  };
+
+  CertVerifier(OcspDownloadConfig odc, OcspStrictConfig osc,
+               mozilla::TimeDuration ocspTimeoutSoft,
+               mozilla::TimeDuration ocspTimeoutHard,
+               uint32_t certShortLifetimeInDays,
+               CertificateTransparencyConfig&& ctConfig, CRLiteMode crliteMode,
+               const nsTArray<EnterpriseCert>& thirdPartyCerts);
+  ~CertVerifier();
+
+  void ClearOCSPCache() { mOCSPCache.Clear(); }
+  void ClearPrivateBrowsingOCSPCache() { mOCSPCache.ClearPrivateBrowsing(); }
+  void ClearTrustCache() { trust_cache_clear(mTrustCache.get()); }
+
+  const OcspDownloadConfig mOCSPDownloadConfig;
+  const bool mOCSPStrict;
+  const mozilla::TimeDuration mOCSPTimeoutSoft;
+  const mozilla::TimeDuration mOCSPTimeoutHard;
+  const uint32_t mCertShortLifetimeInDays;
+  const CertificateTransparencyConfig mCTConfig;
+  const CRLiteMode mCRLiteMode;
+
+ private:
+  OCSPCache mOCSPCache;
+  nsTArray<EnterpriseCert> mThirdPartyCerts;
+  nsTArray<mozilla::pkix::Input> mThirdPartyRootInputs;
+  nsTArray<mozilla::pkix::Input> mThirdPartyIntermediateInputs;
+
+  UniquePtr<mozilla::ct::MultiLogCTVerifier> mCTVerifier;
+
+  UniquePtr<SignatureCache, decltype(&signature_cache_free)> mSignatureCache;
+  UniquePtr<TrustCache, decltype(&trust_cache_free)> mTrustCache;
+
+  void LoadKnownCTLogs();
+  mozilla::pkix::Result VerifyCertificateTransparencyPolicy(
+      NSSCertDBTrustDomain& trustDomain,
+      const nsTArray<nsTArray<uint8_t>>& builtChain,
+      mozilla::pkix::Input sctsFromTLS, mozilla::pkix::Time time,
+      const char* hostname,
+       CertificateTransparencyInfo* ctInfo);
+  mozilla::pkix::Result VerifyCertificateTransparencyPolicyInner(
+      NSSCertDBTrustDomain& trustDomain,
+      const nsTArray<nsTArray<uint8_t>>& builtChain,
+      mozilla::pkix::Input sctsFromTLS, mozilla::pkix::Time time,
+       CertificateTransparencyInfo* ctInfo);
+};
+
+mozilla::pkix::Result IsCertBuiltInRoot(pkix::Input certInput, bool& result);
+mozilla::pkix::Result CertListContainsExpectedKeys(const CERTCertList* certList,
+                                                   const char* hostname,
+                                                   mozilla::pkix::Time time);
+
+mozilla::pkix::Result VerifySignedDataWithCache(
+    mozilla::pkix::der::PublicKeyAlgorithm publicKeyAlg,
+    mozilla::pkix::Input data, mozilla::pkix::DigestAlgorithm digestAlgorithm,
+    mozilla::pkix::Input signature, mozilla::pkix::Input subjectPublicKeyInfo,
+    SignatureCache* signatureCache, void* pinArg);
+
+}  
+}  
+
+#endif  // CertVerifier_h

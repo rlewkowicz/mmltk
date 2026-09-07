@@ -1,0 +1,378 @@
+// Copyright 2011 Google Inc. All Rights Reserved.
+// Use of this source code is governed by a BSD-style license
+
+#if !defined(WEBP_ENC_VP8I_ENC_H_)
+#define WEBP_ENC_VP8I_ENC_H_
+
+#include <string.h>     // for memcpy()
+
+#include "src/dec/common_dec.h"
+#include "src/dsp/cpu.h"
+#include "src/dsp/dsp.h"
+#include "src/utils/bit_writer_utils.h"
+#include "src/utils/thread_utils.h"
+#include "src/utils/utils.h"
+#include "src/webp/encode.h"
+#include "src/webp/types.h"
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+
+#define ENC_MAJ_VERSION 1
+#define ENC_MIN_VERSION 6
+#define ENC_REV_VERSION 0
+
+enum { MAX_LF_LEVELS = 64,       
+       MAX_VARIABLE_LEVEL = 67,  
+       MAX_LEVEL = 2047          
+     };
+
+typedef enum {   
+  RD_OPT_NONE        = 0,  
+  RD_OPT_BASIC       = 1,  
+  RD_OPT_TRELLIS     = 2,  
+  RD_OPT_TRELLIS_ALL = 3   
+} VP8RDLevel;
+
+#define YUV_SIZE_ENC (BPS * 16)
+#define PRED_SIZE_ENC (32 * BPS + 16 * BPS + 8 * BPS)   // I16+Chroma+I4 preds
+#define Y_OFF_ENC    (0)
+#define U_OFF_ENC    (16)
+#define V_OFF_ENC    (16 + 8)
+
+extern const uint16_t VP8Scan[16];
+extern const uint16_t VP8UVModeOffsets[4];
+extern const uint16_t VP8I16ModeOffsets[4];
+
+#define I16DC16 (0 * 16 * BPS)
+#define I16TM16 (I16DC16 + 16)
+#define I16VE16 (1 * 16 * BPS)
+#define I16HE16 (I16VE16 + 16)
+#define C8DC8 (2 * 16 * BPS)
+#define C8TM8 (C8DC8 + 1 * 16)
+#define C8VE8 (2 * 16 * BPS + 8 * BPS)
+#define C8HE8 (C8VE8 + 1 * 16)
+#define I4DC4 (3 * 16 * BPS +  0)
+#define I4TM4 (I4DC4 +  4)
+#define I4VE4 (I4DC4 +  8)
+#define I4HE4 (I4DC4 + 12)
+#define I4RD4 (I4DC4 + 16)
+#define I4VR4 (I4DC4 + 20)
+#define I4LD4 (I4DC4 + 24)
+#define I4VL4 (I4DC4 + 28)
+#define I4HD4 (3 * 16 * BPS + 4 * BPS)
+#define I4HU4 (I4HD4 + 4)
+#define I4TMP (I4HD4 + 8)
+
+typedef int64_t score_t;     
+#define MAX_COST ((score_t)0x7fffffffffffffLL)
+
+#define QFIX 17
+#define BIAS(b)  ((b) << (QFIX - 8))
+static WEBP_INLINE int QUANTDIV(uint32_t n, uint32_t iQ, uint32_t B) {
+  return (int)((n * iQ + B) >> QFIX);
+}
+
+
+#define ERROR_DIFFUSION_QUALITY 98
+
+
+typedef uint32_t proba_t;   
+typedef uint8_t ProbaArray[NUM_CTX][NUM_PROBAS];
+typedef proba_t StatsArray[NUM_CTX][NUM_PROBAS];
+typedef uint16_t CostArray[NUM_CTX][MAX_VARIABLE_LEVEL + 1];
+typedef const uint16_t* (*CostArrayPtr)[NUM_CTX];   
+typedef const uint16_t* CostArrayMap[16][NUM_CTX];
+typedef double LFStats[NUM_MB_SEGMENTS][MAX_LF_LEVELS];  
+
+typedef struct VP8Encoder VP8Encoder;
+
+typedef struct {
+  int num_segments;       
+  int update_map;         
+  int size;               
+} VP8EncSegmentHeader;
+
+typedef struct {
+  uint8_t segments[3];     
+  uint8_t skip_proba;      
+  ProbaArray coeffs[NUM_TYPES][NUM_BANDS];      
+  StatsArray stats[NUM_TYPES][NUM_BANDS];       
+  CostArray level_cost[NUM_TYPES][NUM_BANDS];   
+  CostArrayMap remapped_costs[NUM_TYPES];       
+  int dirty;               
+  int use_skip_proba;      
+  int nb_skip;             
+} VP8EncProba;
+
+typedef struct {
+  int simple;             
+  int level;              
+  int sharpness;          
+  int i4x4_lf_delta;      
+} VP8EncFilterHeader;
+
+
+typedef struct {
+  unsigned int type:2;     
+  unsigned int uv_mode:2;
+  unsigned int skip:1;
+  unsigned int segment:2;
+  uint8_t alpha;      
+} VP8MBInfo;
+
+typedef struct VP8Matrix {
+  uint16_t q[16];        
+  uint16_t iq[16];       
+  uint32_t bias[16];     
+  uint32_t zthresh[16];  
+  uint16_t sharpen[16];  
+} VP8Matrix;
+
+typedef struct {
+  VP8Matrix y1, y2, uv;  
+  int alpha;       
+  int beta;        
+  int quant;       
+  int fstrength;   
+  int max_edge;    
+  int min_disto;   
+  int lambda_i16, lambda_i4, lambda_uv;
+  int lambda_mode, lambda_trellis, tlambda;
+  int lambda_trellis_i16, lambda_trellis_i4, lambda_trellis_uv;
+
+  score_t i4_penalty;   
+} VP8SegmentInfo;
+
+typedef int8_t DError[2 ][2 ];
+
+typedef struct {
+  score_t D, SD;              
+  score_t H, R, score;        
+  int16_t y_dc_levels[16];    
+  int16_t y_ac_levels[16][16];
+  int16_t uv_levels[4 + 4][16];
+  int mode_i16;               
+  uint8_t modes_i4[16];       
+  int mode_uv;                
+  uint32_t nz;                
+  int8_t derr[2][3];          
+} VP8ModeScore;
+
+typedef struct {
+  int x, y;                       
+  uint8_t*      yuv_in;           
+  uint8_t*      yuv_out;          
+  uint8_t*      yuv_out2;         
+  uint8_t*      yuv_p;            
+  VP8Encoder*   enc;              
+  VP8MBInfo*    mb;               
+  VP8BitWriter* bw;               
+  uint8_t*      preds;            
+  uint32_t*     nz;               
+#if WEBP_AARCH64 && BPS == 32
+  uint8_t       i4_boundary[40];  
+#else
+  uint8_t       i4_boundary[37];  
+#endif
+  uint8_t*      i4_top;           
+  int           i4;               
+  int           top_nz[9];        
+  int           left_nz[9];       
+  uint64_t      bit_count[4][3];  
+  uint64_t      luma_bits;        
+  uint64_t      uv_bits;          
+  LFStats*      lf_stats;         
+  int           do_trellis;       
+  int           count_down;       
+  int           count_down0;      
+  int           percent0;         
+
+  DError        left_derr;        
+  DError*       top_derr;         
+
+  uint8_t* y_left;    
+  uint8_t* u_left;    
+  uint8_t* v_left;    
+
+  uint8_t* y_top;     
+  uint8_t* uv_top;    
+
+  uint8_t yuv_left_mem[17 + 16 + 16 + 8 + WEBP_ALIGN_CST];
+  uint8_t yuv_mem[3 * YUV_SIZE_ENC + PRED_SIZE_ENC + WEBP_ALIGN_CST];
+} VP8EncIterator;
+
+void VP8IteratorInit(VP8Encoder* const enc, VP8EncIterator* const it);
+void VP8IteratorSetRow(VP8EncIterator* const it, int y);
+void VP8IteratorSetCountDown(VP8EncIterator* const it, int count_down);
+int VP8IteratorIsDone(const VP8EncIterator* const it);
+void VP8IteratorImport(VP8EncIterator* const it, uint8_t* const tmp_32);
+void VP8IteratorExport(const VP8EncIterator* const it);
+int VP8IteratorNext(VP8EncIterator* const it);
+void VP8IteratorSaveBoundary(VP8EncIterator* const it);
+int VP8IteratorProgress(const VP8EncIterator* const it, int delta);
+void VP8IteratorStartI4(VP8EncIterator* const it);
+int VP8IteratorRotateI4(VP8EncIterator* const it,
+                        const uint8_t* const yuv_out);
+
+void VP8IteratorNzToBytes(VP8EncIterator* const it);
+void VP8IteratorBytesToNz(VP8EncIterator* const it);
+
+void VP8SetIntra16Mode(const VP8EncIterator* const it, int mode);
+void VP8SetIntra4Mode(const VP8EncIterator* const it, const uint8_t* modes);
+void VP8SetIntraUVMode(const VP8EncIterator* const it, int mode);
+void VP8SetSkip(const VP8EncIterator* const it, int skip);
+void VP8SetSegment(const VP8EncIterator* const it, int segment);
+
+
+typedef struct VP8Tokens VP8Tokens;  
+
+typedef struct {
+#if !defined(DISABLE_TOKEN_BUFFER)
+  VP8Tokens* pages;        
+  VP8Tokens** last_page;   
+  uint16_t* tokens;        
+  int left;                
+  int page_size;           
+#endif
+  int error;         
+} VP8TBuffer;
+
+void VP8TBufferInit(VP8TBuffer* const b, int page_size);
+void VP8TBufferClear(VP8TBuffer* const b);   
+
+#if !defined(DISABLE_TOKEN_BUFFER)
+
+int VP8EmitTokens(VP8TBuffer* const b, VP8BitWriter* const bw,
+                  const uint8_t* const probas, int final_pass);
+
+int VP8RecordCoeffTokens(int ctx, const struct VP8Residual* const res,
+                         VP8TBuffer* const tokens);
+
+size_t VP8EstimateTokenSize(VP8TBuffer* const b, const uint8_t* const probas);
+
+#endif
+
+
+struct VP8Encoder {
+  const WebPConfig* config;    
+  WebPPicture* pic;            
+
+  VP8EncFilterHeader   filter_hdr;     
+  VP8EncSegmentHeader  segment_hdr;    
+
+  int profile;                      
+
+  int mb_w, mb_h;
+  int preds_w;   
+
+  int num_parts;
+
+  VP8BitWriter bw;                         
+  VP8BitWriter parts[MAX_NUM_PARTITIONS];  
+  VP8TBuffer tokens;                       
+
+  int percent;                             
+
+  int has_alpha;
+  uint8_t* alpha_data;       
+  uint32_t alpha_data_size;
+  WebPWorker alpha_worker;
+
+  VP8SegmentInfo dqm[NUM_MB_SEGMENTS];
+  int base_quant;                  
+  int alpha;                       
+  int uv_alpha;                    
+  int dq_y1_dc;
+  int dq_y2_dc, dq_y2_ac;
+  int dq_uv_dc, dq_uv_ac;
+
+  VP8EncProba proba;
+  uint64_t    sse[4];      
+  uint64_t    sse_count;   
+  int         coded_size;
+  int         residual_bytes[3][4];
+  int         block_count[3];
+
+  int method;               
+  VP8RDLevel rd_opt_level;  
+  int max_i4_header_bits;   
+  int mb_header_limit;      
+  int thread_level;         
+  int do_search;            
+  int use_tokens;           
+
+  VP8MBInfo* mb_info;   
+  uint8_t*   preds;     
+  uint32_t*  nz;        
+  uint8_t*   y_top;     
+  uint8_t*   uv_top;    
+  LFStats*   lf_stats;  
+  DError*    top_derr;  
+};
+
+
+extern const uint8_t VP8CoeffsProba0[NUM_TYPES][NUM_BANDS][NUM_CTX][NUM_PROBAS];
+extern const uint8_t
+    VP8CoeffsUpdateProba[NUM_TYPES][NUM_BANDS][NUM_CTX][NUM_PROBAS];
+void VP8DefaultProbas(VP8Encoder* const enc);
+void VP8WriteProbas(VP8BitWriter* const bw, const VP8EncProba* const probas);
+void VP8CodeIntraModes(VP8Encoder* const enc);
+
+int VP8EncWrite(VP8Encoder* const enc);
+void VP8EncFreeBitWriters(VP8Encoder* const enc);
+
+extern const uint8_t VP8Cat3[];
+extern const uint8_t VP8Cat4[];
+extern const uint8_t VP8Cat5[];
+extern const uint8_t VP8Cat6[];
+
+void VP8MakeLuma16Preds(const VP8EncIterator* const it);
+void VP8MakeChroma8Preds(const VP8EncIterator* const it);
+int VP8GetCostLuma16(VP8EncIterator* const it, const VP8ModeScore* const rd);
+int VP8GetCostLuma4(VP8EncIterator* const it, const int16_t levels[16]);
+int VP8GetCostUV(VP8EncIterator* const it, const VP8ModeScore* const rd);
+int VP8EncLoop(VP8Encoder* const enc);
+int VP8EncTokenLoop(VP8Encoder* const enc);
+
+int WebPEncodingSetError(const WebPPicture* const pic, WebPEncodingError error);
+int WebPReportProgress(const WebPPicture* const pic,
+                       int percent, int* const percent_store);
+
+int VP8EncAnalyze(VP8Encoder* const enc);
+
+void VP8SetSegmentParams(VP8Encoder* const enc, float quality);
+int VP8Decimate(VP8EncIterator* WEBP_RESTRICT const it,
+                VP8ModeScore* WEBP_RESTRICT const rd,
+                VP8RDLevel rd_opt);
+
+void VP8EncInitAlpha(VP8Encoder* const enc);    
+int VP8EncStartAlpha(VP8Encoder* const enc);    
+int VP8EncFinishAlpha(VP8Encoder* const enc);   
+int VP8EncDeleteAlpha(VP8Encoder* const enc);   
+
+void VP8InitFilter(VP8EncIterator* const it);
+void VP8StoreFilterStats(VP8EncIterator* const it);
+void VP8AdjustFilterStrength(VP8EncIterator* const it);
+
+int VP8FilterStrengthFromDelta(int sharpness, int delta);
+
+
+int WebPValidatePicture(const WebPPicture* const picture);
+
+void WebPPictureResetBuffers(WebPPicture* const picture);
+
+int WebPPictureAllocARGB(WebPPicture* const picture);
+
+int WebPPictureAllocYUVA(WebPPicture* const picture);
+
+void WebPReplaceTransparentPixels(WebPPicture* const pic, uint32_t color);
+
+
+#if defined(__cplusplus)
+}    
+#endif
+
+#endif

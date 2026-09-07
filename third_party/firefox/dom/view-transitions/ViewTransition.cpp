@@ -1,0 +1,1666 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ViewTransition.h"
+
+#include "AnchorPositioningUtils.h"
+#include "Units.h"
+#include "WindowRenderer.h"
+#include "mozilla/AnimationEventDispatcher.h"
+#include "mozilla/AutoRestore.h"
+#include "mozilla/EffectSet.h"
+#include "mozilla/ElementAnimationData.h"
+#include "mozilla/SVGIntegrationUtils.h"
+#include "mozilla/ServoStyleConsts.h"
+#include "mozilla/WritingModes.h"
+#include "mozilla/dom/BindContext.h"
+#include "mozilla/dom/DocumentInlines.h"
+#include "mozilla/dom/DocumentTimeline.h"
+#include "mozilla/dom/Promise-inl.h"
+#include "mozilla/dom/ViewTransitionBinding.h"
+#include "mozilla/dom/ViewTransitionTypeSet.h"
+#include "mozilla/image/WebRenderImageProvider.h"
+#include "mozilla/layers/RenderRootStateManager.h"
+#include "mozilla/layers/WebRenderBridgeChild.h"
+#include "mozilla/layers/WebRenderLayerManager.h"
+#include "mozilla/webrender/WebRenderAPI.h"
+#include "nsCanvasFrame.h"
+#include "nsDisplayList.h"
+#include "nsFrameState.h"
+#include "nsITimer.h"
+#include "nsLayoutUtils.h"
+#include "nsPresContext.h"
+#include "nsString.h"
+
+namespace mozilla::dom {
+
+LazyLogModule gViewTransitionsLog("ViewTransitions");
+
+NS_DECLARE_FRAME_PROPERTY_RELEASABLE(ViewTransitionCaptureName, nsAtom)
+
+static void SetCaptured(nsIFrame* aFrame, bool aCaptured,
+                        nsAtom* aNameIfCaptured) {
+  aFrame->AddOrRemoveStateBits(NS_FRAME_CAPTURED_IN_VIEW_TRANSITION, aCaptured);
+  if (aCaptured) {
+    aFrame->AddProperty(ViewTransitionCaptureName(),
+                        do_AddRef(aNameIfCaptured).take());
+  } else {
+    aFrame->RemoveProperty(ViewTransitionCaptureName());
+  }
+  aFrame->InvalidateFrameSubtree();
+  if (aFrame->Style()->IsRootElementStyle()) {
+    aFrame->PresShell()->GetRootFrame()->InvalidateFrameSubtree();
+  }
+}
+
+static CSSToCSSMatrix4x4Flagged EffectiveTransform(nsIFrame* aFrame) {
+  if (aFrame->GetSize().IsEmpty() || aFrame->Style()->IsRootElementStyle()) {
+    return {};
+  }
+
+  auto matrix = CSSToCSSMatrix4x4Flagged::FromUnknownMatrix(
+      nsLayoutUtils::GetTransformToAncestor(
+          RelativeTo{aFrame},
+          RelativeTo{nsLayoutUtils::GetContainingBlockForClientRect(aFrame)},
+          nsIFrame::IN_CSS_UNITS, nullptr));
+
+  auto borderBoxRect = CSSRect::FromAppUnits(aFrame->GetRect());
+  matrix.ChangeBasis(-borderBoxRect.Width() / 2, -borderBoxRect.Height() / 2,
+                     0.0f);
+  return matrix;
+}
+
+enum class CapturedRectType { BorderBox, InkOverflowBox };
+
+static inline nsRect SnapRect(const nsRect& aRect, nscoord aAppUnitsPerPixel) {
+  return LayoutDeviceIntRect::ToAppUnits(
+      LayoutDeviceIntRect::FromUnknownRect(
+          aRect.ToOutsidePixels(aAppUnitsPerPixel)),
+      aAppUnitsPerPixel);
+}
+
+static inline nsRect CapturedRect(const nsIFrame* aFrame,
+                                  const nsSize& aSnapshotContainingBlockSize,
+                                  CapturedRectType aType) {
+  if (aFrame->Style()->IsRootElementStyle()) {
+    return nsRect(nsPoint(), aSnapshotContainingBlockSize);
+  }
+
+  if (aType == CapturedRectType::BorderBox) {
+    return aFrame->GetRectRelativeToSelf();
+  }
+
+  return SnapRect(aFrame->InkOverflowRectRelativeToSelf(),
+                  aFrame->PresContext()->AppUnitsPerDevPixel());
+}
+
+static StyleViewTransitionClass DocumentScopedClassListFor(
+    const nsIFrame* aFrame) {
+  const auto& classInfo = aFrame->StyleUIReset()->mViewTransitionClass;
+  nsIContent* content = aFrame->GetContent();
+  if (!content || AnchorPositioningUtils::GetShadowRootForTreeScope(
+                      *content->AsElement(), classInfo.scope)) {
+    return StyleViewTransitionClass();
+  }
+
+  return classInfo;
+}
+
+static constexpr wr::ImageKey kNoKey{{0}, 0};
+struct OldSnapshotData {
+  wr::ImageKey mImageKey = kNoKey;
+  nsRect mSnapshotRect;
+  RefPtr<layers::RenderRootStateManager> mManager;
+  bool mUsed = false;
+
+  OldSnapshotData() = default;
+
+  explicit OldSnapshotData(nsIFrame* aFrame,
+                           const nsSize& aSnapshotContainingBlockSize)
+      : mSnapshotRect(CapturedRect(aFrame, aSnapshotContainingBlockSize,
+                                   CapturedRectType::InkOverflowBox)) {}
+
+  void EnsureKey(layers::RenderRootStateManager* aManager,
+                 wr::IpcResourceUpdateQueue& aResources) {
+    if (mImageKey != kNoKey) {
+      MOZ_ASSERT(mManager == aManager, "Stale manager?");
+      return;
+    }
+    mManager = aManager;
+    mImageKey = aManager->WrBridge()->GetNextImageKey();
+    aResources.AddSnapshotImage(wr::SnapshotImageKey{mImageKey});
+  }
+
+  ~OldSnapshotData() {
+    if (mManager) {
+      wr::SnapshotImageKey key = {mImageKey};
+      if (mUsed) {
+        mManager->AddSnapshotImageKeyForDiscard(key);
+      } else {
+        mManager->AddUnusedSnapshotImageKeyForDiscard(key);
+      }
+    }
+  }
+};
+
+struct CapturedElementOldState {
+  OldSnapshotData mSnapshot;
+  bool mTriedImage = false;
+
+  nsSize mBorderBoxSize;
+  CSSToCSSMatrix4x4Flagged mTransform;
+  StyleWritingModeProperty mWritingMode =
+      StyleWritingModeProperty::HorizontalTb;
+  StyleDirection mDirection = StyleDirection::Ltr;
+  StyleTextOrientation mTextOrientation = StyleTextOrientation::Mixed;
+  StyleBlend mMixBlendMode = StyleBlend::Normal;
+  StyleOwnedSlice<StyleFilter> mBackdropFilters;
+  StyleColorScheme mColorScheme;
+
+  CapturedElementOldState(nsIFrame* aFrame,
+                          const nsSize& aSnapshotContainingBlockSize)
+      : mSnapshot(aFrame, aSnapshotContainingBlockSize),
+        mTriedImage(true),
+        mBorderBoxSize(CapturedRect(aFrame, aSnapshotContainingBlockSize,
+                                    CapturedRectType::BorderBox)
+                           .Size()),
+        mTransform(EffectiveTransform(aFrame)),
+        mWritingMode(aFrame->StyleVisibility()->mWritingMode),
+        mDirection(aFrame->StyleVisibility()->mDirection),
+        mTextOrientation(aFrame->StyleVisibility()->mTextOrientation),
+        mMixBlendMode(aFrame->StyleEffects()->mMixBlendMode),
+        mBackdropFilters(aFrame->StyleEffects()->mBackdropFilters),
+        mColorScheme(aFrame->StyleUI()->mColorScheme) {}
+
+  CapturedElementOldState() = default;
+};
+
+struct ViewTransitionCapturedElement {
+  CapturedElementOldState mOldState;
+  RefPtr<Element> mNewElement;
+  wr::SnapshotImageKey mNewSnapshotKey{kNoKey};
+  nsRect mNewSnapshotRect;
+  nsSize mNewBorderBoxSize;
+
+  ViewTransitionCapturedElement() = default;
+
+  ViewTransitionCapturedElement(nsIFrame* aFrame,
+                                const nsSize& aSnapshotContainingBlockSize,
+                                StyleViewTransitionClass&& aClassList)
+      : mOldState(aFrame, aSnapshotContainingBlockSize),
+        mClassList(std::move(aClassList)) {}
+
+  nsTArray<Keyframe> mGroupKeyframes;
+  RefPtr<StyleLockedDeclarationBlock> mGroupRule;
+  RefPtr<StyleLockedDeclarationBlock> mImagePairRule;
+  RefPtr<StyleLockedDeclarationBlock> mOldRule;
+  RefPtr<StyleLockedDeclarationBlock> mNewRule;
+
+  StyleViewTransitionClass mClassList;
+
+  Maybe<nsRect> mOldActiveRect;
+  Maybe<nsRect> mNewActiveRect;
+
+  void CaptureClassList(StyleViewTransitionClass&& aClassList) {
+    mClassList = std::move(aClassList);
+  }
+
+  ~ViewTransitionCapturedElement() {
+    if (wr::AsImageKey(mNewSnapshotKey) != kNoKey) {
+      MOZ_ASSERT(mOldState.mSnapshot.mManager);
+      mOldState.mSnapshot.mManager->AddSnapshotImageKeyForDiscard(
+          mNewSnapshotKey);
+    }
+  }
+};
+
+ViewTransitionParams::~ViewTransitionParams() = default;
+
+static inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCb,
+    const ViewTransitionCapturedElement& aField, const char* aName,
+    uint32_t aFlags = 0) {
+  ImplCycleCollectionTraverse(aCb, aField.mNewElement, aName, aFlags);
+}
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(ViewTransition, mDocument,
+                                      mUpdateCallback,
+                                      mUpdateCallbackDonePromise, mReadyPromise,
+                                      mFinishedPromise, mNamedElements, mTypes,
+                                      mSnapshotContainingBlock)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(ViewTransition)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(ViewTransition)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(ViewTransition)
+
+ViewTransition::ViewTransition(Document& aDoc,
+                               ViewTransitionUpdateCallback* aCb,
+                               TypeList&& aTypeList)
+    : mDocument(&aDoc), mUpdateCallback(aCb), mTypeList(std::move(aTypeList)) {}
+
+ViewTransition::~ViewTransition() { ClearTimeoutTimer(); }
+
+already_AddRefed<ViewTransition> ViewTransition::CreateCrossDocument(
+    Document& aDocument, UniquePtr<ViewTransitionParams> aInboundParams,
+    TypeList&& aResolvedRule) {
+
+  MOZ_ASSERT(aInboundParams);
+  RefPtr<ViewTransition> vt =
+      new ViewTransition(aDocument, nullptr, std::move(aResolvedRule));
+  vt->mNamedElements = std::move(aInboundParams->namedElements);
+  vt->mNames = std::move(aInboundParams->names);
+  vt->mInitialSnapshotContainingBlockSize =
+      aInboundParams->initialSnapshotContainingBlockSize;
+
+  vt->mUpdateCallbackDonePromise->MaybeResolveWithUndefined();
+
+  vt->mPhase = Phase::UpdateCallbackCalled;
+
+  return vt.forget();
+}
+
+Element* ViewTransition::GetViewTransitionTreeRoot() const {
+  return mSnapshotContainingBlock
+             ? mSnapshotContainingBlock->GetFirstElementChild()
+             : nullptr;
+}
+
+void ViewTransition::GetCapturedFrames(
+    nsTArray<nsIFrame*>& aCapturedFrames) const {
+  if (mOldCaptureElements) {
+    for (const auto& [f, _] : *mOldCaptureElements) {
+      aCapturedFrames.AppendElement(f);
+    }
+  }
+
+  for (const auto& entry : mNamedElements) {
+    CapturedElement& capturedElement = *entry.GetData();
+    if (capturedElement.mNewElement &&
+        capturedElement.mNewElement->GetPrimaryFrame()) {
+      aCapturedFrames.AppendElement(
+          capturedElement.mNewElement->GetPrimaryFrame());
+    }
+  }
+}
+
+Maybe<nsRect> ViewTransition::GetOldInkOverflowRect(nsAtom* aName) const {
+  auto* el = mNamedElements.Get(aName);
+  if (NS_WARN_IF(!el)) {
+    return {};
+  }
+  return Some(el->mOldState.mSnapshot.mSnapshotRect);
+}
+
+Maybe<nsRect> ViewTransition::GetNewInkOverflowRect(nsAtom* aName) const {
+  auto* el = mNamedElements.Get(aName);
+  if (NS_WARN_IF(!el)) {
+    return {};
+  }
+  return Some(el->mNewSnapshotRect);
+}
+
+Maybe<nsSize> ViewTransition::GetOldBorderBoxSize(nsAtom* aName) const {
+  auto* el = mNamedElements.Get(aName);
+  if (NS_WARN_IF(!el)) {
+    return {};
+  }
+  return Some(el->mOldState.mBorderBoxSize);
+}
+
+Maybe<nsSize> ViewTransition::GetNewBorderBoxSize(nsAtom* aName) const {
+  auto* el = mNamedElements.Get(aName);
+  if (NS_WARN_IF(!el)) {
+    return {};
+  }
+  return Some(el->mNewBorderBoxSize);
+}
+
+const wr::ImageKey* ViewTransition::GetOrCreateOldImageKey(
+    nsAtom* aName, layers::RenderRootStateManager* aManager,
+    wr::IpcResourceUpdateQueue& aResources) const {
+  auto* el = mNamedElements.Get(aName);
+  if (NS_WARN_IF(!el)) {
+    return nullptr;
+  }
+  el->mOldState.mSnapshot.EnsureKey(aManager, aResources);
+  return &el->mOldState.mSnapshot.mImageKey;
+}
+
+const wr::ImageKey* ViewTransition::ReadOldImageKey(
+    nsAtom* aName, layers::RenderRootStateManager* aManager,
+    wr::IpcResourceUpdateQueue& aResources) const {
+  auto* el = mNamedElements.Get(aName);
+  if (NS_WARN_IF(!el)) {
+    return nullptr;
+  }
+
+  el->mOldState.mSnapshot.mUsed = true;
+  return &el->mOldState.mSnapshot.mImageKey;
+}
+
+const wr::ImageKey* ViewTransition::GetNewImageKey(nsAtom* aName) const {
+  auto* el = mNamedElements.Get(aName);
+  if (NS_WARN_IF(!el)) {
+    return nullptr;
+  }
+  return &el->mNewSnapshotKey._0;
+}
+
+const wr::ImageKey* ViewTransition::GetImageKeyForCapturedFrame(
+    nsIFrame* aFrame, layers::RenderRootStateManager* aManager,
+    wr::IpcResourceUpdateQueue& aResources) const {
+  MOZ_ASSERT(aFrame);
+  MOZ_ASSERT(aFrame->HasAnyStateBits(NS_FRAME_CAPTURED_IN_VIEW_TRANSITION));
+
+  nsAtom* name = aFrame->GetProperty(ViewTransitionCaptureName());
+  if (NS_WARN_IF(!name)) {
+    return nullptr;
+  }
+  const bool isOld = mPhase < Phase::Animating;
+
+  VT_LOG("ViewTransition::GetImageKeyForCapturedFrame(%s, old=%d)\n",
+         nsAtomCString(name).get(), isOld);
+
+  if (isOld) {
+    const auto* key = GetOrCreateOldImageKey(name, aManager, aResources);
+    VT_LOG(" > old image is %s", key ? ToString(*key).c_str() : "null");
+    return key;
+  }
+  auto* el = mNamedElements.Get(name);
+  if (NS_WARN_IF(!el)) {
+    return nullptr;
+  }
+  if (NS_WARN_IF(el->mNewElement != aFrame->GetContent())) {
+    return nullptr;
+  }
+  if (wr::AsImageKey(el->mNewSnapshotKey) == kNoKey) {
+    MOZ_ASSERT(!el->mOldState.mSnapshot.mManager ||
+                   el->mOldState.mSnapshot.mManager == aManager,
+               "Stale manager?");
+    el->mNewSnapshotKey = {aManager->WrBridge()->GetNextImageKey()};
+    el->mOldState.mSnapshot.mManager = aManager;
+    aResources.AddSnapshotImage(el->mNewSnapshotKey);
+  }
+  VT_LOG(" > new image is %s", ToString(el->mNewSnapshotKey._0).c_str());
+  return &el->mNewSnapshotKey._0;
+}
+
+nsIGlobalObject* ViewTransition::GetParentObject() const {
+  return mDocument ? mDocument->GetParentObject() : nullptr;
+}
+
+Promise* ViewTransition::GetUpdateCallbackDone(ErrorResult& aRv) {
+  if (!mUpdateCallbackDonePromise) {
+    mUpdateCallbackDonePromise = Promise::Create(GetParentObject(), aRv);
+  }
+  return mUpdateCallbackDonePromise;
+}
+
+Promise* ViewTransition::GetReady(ErrorResult& aRv) {
+  if (!mReadyPromise) {
+    mReadyPromise = Promise::Create(GetParentObject(), aRv);
+  }
+  return mReadyPromise;
+}
+
+Promise* ViewTransition::GetFinished(ErrorResult& aRv) {
+  if (!mFinishedPromise) {
+    mFinishedPromise = Promise::Create(GetParentObject(), aRv);
+  }
+  return mFinishedPromise;
+}
+
+void ViewTransition::MaybeScheduleUpdateCallback() {
+  if (mPhase == Phase::Done) {
+    return;
+  }
+
+  RefPtr doc = mDocument;
+
+  doc->ScheduleViewTransitionUpdateCallback(this);
+
+  doc->FlushViewTransitionUpdateCallbackQueue();
+}
+
+void ViewTransition::CallUpdateCallback(ErrorResult& aRv) {
+  MOZ_ASSERT(mDocument);
+  MOZ_ASSERT(mPhase == Phase::Done ||
+             UnderlyingValue(mPhase) <
+                 UnderlyingValue(Phase::UpdateCallbackCalled));
+  VT_LOG("ViewTransition::CallUpdateCallback(%d)\n", int(mPhase));
+
+  if (mPhase != Phase::Done) {
+    mPhase = Phase::UpdateCallbackCalled;
+  }
+
+  RefPtr<Promise> callbackPromise;
+  if (!mUpdateCallback) {
+    callbackPromise =
+        Promise::CreateResolvedWithUndefined(GetParentObject(), aRv);
+  } else {
+    callbackPromise = MOZ_KnownLive(mUpdateCallback)->Call(aRv);
+  }
+  if (aRv.Failed()) {
+    return;
+  }
+  MOZ_ASSERT(callbackPromise);
+  callbackPromise->AddCallbacksWithCycleCollectedArgs(
+      [](JSContext*, JS::Handle<JS::Value>, ErrorResult& aRv,
+         ViewTransition* aVt) {
+        aVt->ClearTimeoutTimer();
+
+        if (Promise* ucd = aVt->GetUpdateCallbackDone(aRv)) {
+          ucd->MaybeResolveWithUndefined();
+        }
+        aVt->mDocument->FlushPendingNotifications(FlushType::Layout);
+        if (aVt->mPhase == Phase::Done) {
+          if (Promise* finished = aVt->GetFinished(aRv)) {
+            finished->MaybeResolveWithUndefined();
+          }
+        }
+        aVt->Activate();
+      },
+      [](JSContext*, JS::Handle<JS::Value> aReason, ErrorResult& aRv,
+         ViewTransition* aVt) {
+        aVt->ClearTimeoutTimer();
+
+        if (Promise* ucd = aVt->GetUpdateCallbackDone(aRv)) {
+          ucd->MaybeReject(aReason);
+        }
+
+        if (aVt->mPhase == Phase::Done) {
+          if (Promise* finished = aVt->GetFinished(aRv)) {
+            finished->MaybeReject(aReason);
+          }
+          return;
+        }
+
+        if (Promise* ready = aVt->GetReady(aRv)) {
+          MOZ_ALWAYS_TRUE(ready->SetAnyPromiseIsHandled());
+        }
+        aVt->SkipTransition(SkipTransitionReason::UpdateCallbackRejected,
+                            aReason);
+      },
+      RefPtr(this));
+
+  MOZ_ASSERT(!mTimeoutTimer);
+  ClearTimeoutTimer();  
+  mTimeoutTimer = NS_NewTimer();
+  mTimeoutTimer->InitWithNamedFuncCallback(
+      TimeoutCallback, this, StaticPrefs::dom_viewTransitions_timeout_ms(),
+      nsITimer::TYPE_ONE_SHOT, "ViewTransition::TimeoutCallback"_ns);
+}
+
+void ViewTransition::ClearTimeoutTimer() {
+  if (mTimeoutTimer) {
+    mTimeoutTimer->Cancel();
+    mTimeoutTimer = nullptr;
+  }
+}
+
+void ViewTransition::TimeoutCallback(nsITimer* aTimer, void* aClosure) {
+  RefPtr vt = static_cast<ViewTransition*>(aClosure);
+  MOZ_DIAGNOSTIC_ASSERT(aTimer == vt->mTimeoutTimer);
+  vt->Timeout();
+}
+
+void ViewTransition::Timeout() {
+  ClearTimeoutTimer();
+  if (mPhase != Phase::Done && mDocument) {
+    SkipTransition(SkipTransitionReason::Timeout);
+  }
+}
+
+static already_AddRefed<Element> MakePseudo(Document& aDoc,
+                                            PseudoStyleType aType,
+                                            nsAtom* aName) {
+  RefPtr<Element> el = aDoc.CreateHTMLElement(nsGkAtoms::div);
+  if (aType == PseudoStyleType::MozSnapshotContainingBlock) {
+    el->SetIsNativeAnonymousRoot();
+  }
+  el->SetPseudoElementType(aType);
+  if (aName) {
+    el->SetAttr(nsGkAtoms::name, nsDependentAtomString(aName), IgnoreErrors());
+  }
+  el->SetAttr(nsGkAtoms::type,
+              nsDependentAtomString(PseudoStyle::GetAtom(aType)),
+              IgnoreErrors());
+  return el.forget();
+}
+
+static bool SetProp(StyleLockedDeclarationBlock* aDecls, Document* aDoc,
+                    NonCustomCSSPropertyId aProp, const nsACString& aValue) {
+  return Servo_DeclarationBlock_SetPropertyById(
+      aDecls, aProp, &aValue,
+       false, aDoc->DefaultStyleAttrURLData(),
+      StyleParsingMode::DEFAULT, eCompatibility_FullStandards,
+      &aDoc->EnsureCSSLoader(), StyleCssRuleType::Style, {});
+}
+
+static bool SetProp(StyleLockedDeclarationBlock* aDecls, Document*,
+                    NonCustomCSSPropertyId aProp, float aLength,
+                    nsCSSUnit aUnit) {
+  return Servo_DeclarationBlock_SetLengthValue(aDecls, aProp, aLength, aUnit);
+}
+
+static bool SetProp(StyleLockedDeclarationBlock* aDecls, Document*,
+                    NonCustomCSSPropertyId aProp,
+                    const CSSToCSSMatrix4x4Flagged& aM) {
+  MOZ_ASSERT(aProp == eCSSProperty_transform);
+  AutoTArray<StyleTransformOperation, 1> ops;
+  ops.AppendElement(
+      StyleTransformOperation::Matrix3D(StyleGenericMatrix3D<StyleNumber>{
+          aM._11, aM._12, aM._13, aM._14, aM._21, aM._22, aM._23, aM._24,
+          aM._31, aM._32, aM._33, aM._34, aM._41, aM._42, aM._43, aM._44}));
+  return Servo_DeclarationBlock_SetTransform(aDecls, aProp, &ops);
+}
+
+static bool SetProp(StyleLockedDeclarationBlock* aDecls, Document* aDoc,
+                    NonCustomCSSPropertyId aProp,
+                    const StyleWritingModeProperty aWM) {
+  return Servo_DeclarationBlock_SetKeywordValue(aDecls, aProp, (int32_t)aWM);
+}
+
+static bool SetProp(StyleLockedDeclarationBlock* aDecls, Document* aDoc,
+                    NonCustomCSSPropertyId aProp,
+                    const StyleDirection aDirection) {
+  return Servo_DeclarationBlock_SetKeywordValue(aDecls, aProp,
+                                                (int32_t)aDirection);
+}
+
+static bool SetProp(StyleLockedDeclarationBlock* aDecls, Document* aDoc,
+                    NonCustomCSSPropertyId aProp,
+                    const StyleTextOrientation aTextOrientation) {
+  return Servo_DeclarationBlock_SetKeywordValue(aDecls, aProp,
+                                                (int32_t)aTextOrientation);
+}
+
+static bool SetProp(StyleLockedDeclarationBlock* aDecls, Document* aDoc,
+                    NonCustomCSSPropertyId aProp, const StyleBlend aBlend) {
+  return Servo_DeclarationBlock_SetKeywordValue(aDecls, aProp, (int32_t)aBlend);
+}
+
+static bool SetProp(
+    StyleLockedDeclarationBlock* aDecls, Document*,
+    NonCustomCSSPropertyId aProp,
+    const StyleOwnedSlice<mozilla::StyleFilter>& aBackdropFilters) {
+  return Servo_DeclarationBlock_SetBackdropFilter(aDecls, aProp,
+                                                  &aBackdropFilters);
+}
+
+static bool SetProp(StyleLockedDeclarationBlock* aDecls, Document*,
+                    NonCustomCSSPropertyId aProp,
+                    const StyleColorScheme& aColorScheme) {
+  return Servo_DeclarationBlock_SetColorScheme(aDecls, aProp, &aColorScheme);
+}
+
+static StyleLockedDeclarationBlock* EnsureRule(
+    RefPtr<StyleLockedDeclarationBlock>& aRule) {
+  if (!aRule) {
+    aRule = Servo_DeclarationBlock_CreateEmpty().Consume();
+  }
+  return aRule.get();
+}
+
+static nsTArray<Keyframe> BuildGroupKeyframes(
+    Document* aDoc, const CSSToCSSMatrix4x4Flagged& aTransform,
+    const nsSize& aSize, const StyleOwnedSlice<StyleFilter>& aBackdropFilters) {
+  Keyframe firstKeyframe;
+  firstKeyframe.mOffset = Some(Keyframe::OffsetType::PercentageOffset(0.0));
+  PropertyValuePair transform{
+      CSSPropertyId(eCSSProperty_transform),
+      Servo_DeclarationBlock_CreateEmpty().Consume(),
+  };
+  SetProp(transform.mServoDeclarationBlock, aDoc, eCSSProperty_transform,
+          aTransform);
+  PropertyValuePair width{
+      CSSPropertyId(eCSSProperty_width),
+      Servo_DeclarationBlock_CreateEmpty().Consume(),
+  };
+  CSSSize cssSize = CSSSize::FromAppUnits(aSize);
+  SetProp(width.mServoDeclarationBlock, aDoc, eCSSProperty_width, cssSize.width,
+          eCSSUnit_Pixel);
+  PropertyValuePair height{
+      CSSPropertyId(eCSSProperty_height),
+      Servo_DeclarationBlock_CreateEmpty().Consume(),
+  };
+  SetProp(height.mServoDeclarationBlock, aDoc, eCSSProperty_height,
+          cssSize.height, eCSSUnit_Pixel);
+  PropertyValuePair backdropFilters{
+      CSSPropertyId(eCSSProperty_backdrop_filter),
+      Servo_DeclarationBlock_CreateEmpty().Consume(),
+  };
+  SetProp(backdropFilters.mServoDeclarationBlock, aDoc,
+          eCSSProperty_backdrop_filter, aBackdropFilters);
+  firstKeyframe.mPropertyValues.AppendElement(std::move(transform));
+  firstKeyframe.mPropertyValues.AppendElement(std::move(width));
+  firstKeyframe.mPropertyValues.AppendElement(std::move(height));
+  firstKeyframe.mPropertyValues.AppendElement(std::move(backdropFilters));
+
+  Keyframe lastKeyframe;
+  lastKeyframe.mOffset = Some(Keyframe::OffsetType::PercentageOffset(1.0));
+  lastKeyframe.mPropertyValues.AppendElement(
+      PropertyValuePair{CSSPropertyId(eCSSProperty_transform)});
+  lastKeyframe.mPropertyValues.AppendElement(
+      PropertyValuePair{CSSPropertyId(eCSSProperty_width)});
+  lastKeyframe.mPropertyValues.AppendElement(
+      PropertyValuePair{CSSPropertyId(eCSSProperty_height)});
+  lastKeyframe.mPropertyValues.AppendElement(
+      PropertyValuePair{CSSPropertyId(eCSSProperty_backdrop_filter)});
+
+  nsTArray<Keyframe> result;
+  result.AppendElement(std::move(firstKeyframe));
+  result.AppendElement(std::move(lastKeyframe));
+  return result;
+}
+
+bool ViewTransition::GetGroupKeyframes(
+    nsAtom* aAnimationName, const StyleComputedTimingFunction& aTimingFunction,
+    nsTArray<Keyframe>& aResult) {
+  MOZ_ASSERT(StringBeginsWith(nsDependentAtomString(aAnimationName),
+                              kGroupAnimPrefix));
+  RefPtr<nsAtom> transitionName = NS_Atomize(Substring(
+      nsDependentAtomString(aAnimationName), kGroupAnimPrefix.Length()));
+  auto* el = mNamedElements.Get(transitionName);
+  if (NS_WARN_IF(!el) || NS_WARN_IF(el->mGroupKeyframes.IsEmpty())) {
+    return false;
+  }
+  aResult = el->mGroupKeyframes.Clone();
+  MOZ_ASSERT(aResult.Length() == 2);
+  aResult[0].mTimingFunction = Some(aTimingFunction);
+  aResult[1].mTimingFunction = Some(aTimingFunction);
+  return true;
+}
+
+bool ViewTransition::MatchClassList(
+    nsAtom* aTransitionName,
+    const nsTArray<StyleAtom>& aPtNameAndClassSelector) const {
+  MOZ_ASSERT(aPtNameAndClassSelector.Length() > 1,
+             "Should have a vt-class selector");
+  MOZ_ASSERT(aTransitionName, "No transition name?");
+
+  const auto* el = mNamedElements.Get(aTransitionName);
+  MOZ_ASSERT(el,
+             "Our caller should have the view transition pseudo handy, how do "
+             "we have no capture?");
+  if (MOZ_UNLIKELY(!el)) {
+    return false;
+  }
+  const auto& classList = el->mClassList.value._0.AsSpan();
+  if (classList.IsEmpty()) {
+    return false;
+  }
+  auto hasClass = [&classList](nsAtom* aClass) {
+    for (const auto& ident : classList) {
+      if (ident.AsAtom() == aClass) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  for (const auto& atom : Span(aPtNameAndClassSelector).From(1)) {
+    if (!hasClass(atom.AsAtom())) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void ViewTransition::SetupTransitionPseudoElements() {
+  MOZ_ASSERT(!mSnapshotContainingBlock);
+
+  nsAutoScriptBlocker scriptBlocker;
+
+  RefPtr docElement = mDocument->GetRootElement();
+  if (!docElement) {
+    return;
+  }
+
+  constexpr bool kNotify = false;
+
+
+  mSnapshotContainingBlock = MakePseudo(
+      *mDocument, PseudoStyleType::MozSnapshotContainingBlock, nullptr);
+  RefPtr<Element> root =
+      MakePseudo(*mDocument, PseudoStyleType::ViewTransition, nullptr);
+  mSnapshotContainingBlock->AppendChildTo(root, kNotify, IgnoreErrors());
+#ifdef DEBUG
+  mSnapshotContainingBlock->SetProperty(nsGkAtoms::restylableAnonymousNode,
+                                        reinterpret_cast<void*>(true));
+#endif
+
+  MOZ_ASSERT(mNames.Length() == mNamedElements.Count());
+  for (nsAtom* transitionName : mNames) {
+    CapturedElement& capturedElement = *mNamedElements.Get(transitionName);
+    RefPtr<Element> group = MakePseudo(
+        *mDocument, PseudoStyleType::ViewTransitionGroup, transitionName);
+    root->AppendChildTo(group, kNotify, IgnoreErrors());
+    RefPtr<Element> imagePair = MakePseudo(
+        *mDocument, PseudoStyleType::ViewTransitionImagePair, transitionName);
+    group->AppendChildTo(imagePair, kNotify, IgnoreErrors());
+    if (capturedElement.mOldState.mTriedImage) {
+      RefPtr<Element> old = MakePseudo(
+          *mDocument, PseudoStyleType::ViewTransitionOld, transitionName);
+      imagePair->AppendChildTo(old, kNotify, IgnoreErrors());
+    } else {
+      MOZ_ASSERT(capturedElement.mNewElement);
+      auto* rule = EnsureRule(capturedElement.mNewRule);
+      SetProp(rule, mDocument, eCSSProperty_animation_name,
+              "-ua-view-transition-fade-in"_ns);
+    }
+    if (capturedElement.mNewElement) {
+      RefPtr<Element> new_ = MakePseudo(
+          *mDocument, PseudoStyleType::ViewTransitionNew, transitionName);
+      imagePair->AppendChildTo(new_, kNotify, IgnoreErrors());
+    } else {
+      MOZ_ASSERT(capturedElement.mOldState.mTriedImage);
+      SetProp(EnsureRule(capturedElement.mOldRule), mDocument,
+              eCSSProperty_animation_name, "-ua-view-transition-fade-out"_ns);
+
+      auto* rule = EnsureRule(capturedElement.mGroupRule);
+      auto oldRect =
+          CSSPixel::FromAppUnits(capturedElement.mOldState.mBorderBoxSize);
+      SetProp(rule, mDocument, eCSSProperty_width, oldRect.width,
+              eCSSUnit_Pixel);
+      SetProp(rule, mDocument, eCSSProperty_height, oldRect.height,
+              eCSSUnit_Pixel);
+      SetProp(rule, mDocument, eCSSProperty_transform,
+              capturedElement.mOldState.mTransform);
+      SetProp(rule, mDocument, eCSSProperty_writing_mode,
+              capturedElement.mOldState.mWritingMode);
+      SetProp(rule, mDocument, eCSSProperty_direction,
+              capturedElement.mOldState.mDirection);
+      SetProp(rule, mDocument, eCSSProperty_text_orientation,
+              capturedElement.mOldState.mTextOrientation);
+      SetProp(rule, mDocument, eCSSProperty_mix_blend_mode,
+              capturedElement.mOldState.mMixBlendMode);
+      SetProp(rule, mDocument, eCSSProperty_backdrop_filter,
+              capturedElement.mOldState.mBackdropFilters);
+      SetProp(rule, mDocument, eCSSProperty_color_scheme,
+              capturedElement.mOldState.mColorScheme);
+    }
+    if (capturedElement.mOldState.mTriedImage && capturedElement.mNewElement) {
+      nsAutoCString dynamicAnimationName;
+      nsStyleUtil::AppendQuotedCSSString(
+          NS_ConvertUTF16toUTF8(kGroupAnimPrefix +
+                                nsDependentAtomString(transitionName)),
+          dynamicAnimationName);
+      capturedElement.mGroupKeyframes =
+          BuildGroupKeyframes(mDocument, capturedElement.mOldState.mTransform,
+                              capturedElement.mOldState.mBorderBoxSize,
+                              capturedElement.mOldState.mBackdropFilters);
+      SetProp(EnsureRule(capturedElement.mGroupRule), mDocument,
+              eCSSProperty_animation_name, dynamicAnimationName);
+
+      SetProp(EnsureRule(capturedElement.mImagePairRule), mDocument,
+              eCSSProperty_isolation, "isolate"_ns);
+
+      SetProp(
+          EnsureRule(capturedElement.mOldRule), mDocument,
+          eCSSProperty_animation_name,
+          "-ua-view-transition-fade-out, -ua-mix-blend-mode-plus-lighter"_ns);
+      SetProp(
+          EnsureRule(capturedElement.mNewRule), mDocument,
+          eCSSProperty_animation_name,
+          "-ua-view-transition-fade-in, -ua-mix-blend-mode-plus-lighter"_ns);
+    }
+  }
+  BindContext context(*docElement, BindContext::ForNativeAnonymous);
+  if (NS_FAILED(mSnapshotContainingBlock->BindToTree(context, *docElement))) {
+    mSnapshotContainingBlock->UnbindFromTree();
+    mSnapshotContainingBlock = nullptr;
+    return;
+  }
+  if (mDocument->DevToolsAnonymousAndShadowEventsEnabled()) {
+    mSnapshotContainingBlock->QueueDevtoolsAnonymousEvent(
+         false);
+  }
+  if (PresShell* ps = mDocument->GetPresShell()) {
+    ps->ContentAppended(mSnapshotContainingBlock, {});
+  }
+}
+
+bool ViewTransition::UpdatePseudoElementStyles(bool aNeedsInvalidation) {
+  for (auto& entry : mNamedElements) {
+    nsAtom* transitionName = entry.GetKey();
+    CapturedElement& capturedElement = *entry.GetData();
+    if (!capturedElement.mNewElement) {
+      continue;
+    }
+    nsIFrame* frame = capturedElement.mNewElement->GetPrimaryFrame();
+    if (!frame || frame->IsHiddenByContentVisibilityOnAnyAncestor() ||
+        frame->GetPrevContinuation() || frame->GetNextContinuation()) {
+      return false;
+    }
+    auto* rule = EnsureRule(capturedElement.mGroupRule);
+    const auto newBorderBoxSize =
+        CapturedRect(frame, mInitialSnapshotContainingBlockSize,
+                     CapturedRectType::BorderBox)
+            .Size();
+    auto size = CSSPixel::FromAppUnits(newBorderBoxSize);
+    bool groupStyleChanged =
+        int(SetProp(rule, mDocument, eCSSProperty_width, size.width,
+                    eCSSUnit_Pixel)) |
+        SetProp(rule, mDocument, eCSSProperty_height, size.height,
+                eCSSUnit_Pixel) |
+        SetProp(rule, mDocument, eCSSProperty_transform,
+                EffectiveTransform(frame)) |
+        SetProp(rule, mDocument, eCSSProperty_writing_mode,
+                frame->StyleVisibility()->mWritingMode) |
+        SetProp(rule, mDocument, eCSSProperty_direction,
+                frame->StyleVisibility()->mDirection) |
+        SetProp(rule, mDocument, eCSSProperty_text_orientation,
+                frame->StyleVisibility()->mTextOrientation) |
+        SetProp(rule, mDocument, eCSSProperty_mix_blend_mode,
+                frame->StyleEffects()->mMixBlendMode) |
+        SetProp(rule, mDocument, eCSSProperty_backdrop_filter,
+                frame->StyleEffects()->mBackdropFilters) |
+        SetProp(rule, mDocument, eCSSProperty_color_scheme,
+                frame->StyleUI()->mColorScheme);
+    if (groupStyleChanged && aNeedsInvalidation) {
+      auto* pseudo = FindPseudo(PseudoStyleRequest(
+          PseudoStyleType::ViewTransitionGroup, transitionName));
+      MOZ_ASSERT(pseudo);
+      nsLayoutUtils::PostRestyleEvent(pseudo, RestyleHint::RECASCADE_SELF,
+                                      nsChangeHint(0));
+    }
+
+    const auto newSnapshotRect =
+        CapturedRect(frame, mInitialSnapshotContainingBlockSize,
+                     CapturedRectType::InkOverflowBox);
+    auto oldRect = capturedElement.mNewSnapshotRect;
+    capturedElement.mNewSnapshotRect = newSnapshotRect;
+    capturedElement.mNewBorderBoxSize = newBorderBoxSize;
+    if (!oldRect.IsEqualEdges(capturedElement.mNewSnapshotRect) &&
+        aNeedsInvalidation) {
+      frame->PresShell()->FrameNeedsReflow(
+          frame, IntrinsicDirty::FrameAndAncestors, NS_FRAME_IS_DIRTY);
+    }
+  }
+  return true;
+}
+
+void ViewTransition::Activate() {
+  if (mPhase == Phase::Done) {
+    return;
+  }
+
+  mDocument->SetRenderingSuppressedForViewTransitions(false);
+
+  if (mInitialSnapshotContainingBlockSize !=
+      SnapshotContainingBlockRect().Size()) {
+    return SkipTransition(SkipTransitionReason::Resize);
+  }
+
+  if (auto skipReason = CaptureNewState()) {
+    ClearNamedElements();
+    return SkipTransition(*skipReason);
+  }
+
+  SetupTransitionPseudoElements();
+
+  if (!UpdatePseudoElementStyles( false)) {
+    return SkipTransition(SkipTransitionReason::PseudoUpdateFailure);
+  }
+
+  mPhase = Phase::Animating;
+  if (Promise* ready = GetReady(IgnoreErrors())) {
+    ready->MaybeResolveWithUndefined();
+  }
+
+  MOZ_ASSERT(mDocument);
+  mDocument->EnsureViewTransitionOperationsHappen();
+}
+
+void ViewTransition::PerformPendingOperations() {
+  MOZ_ASSERT(mDocument);
+  MOZ_ASSERT(mDocument->GetActiveViewTransition() == this);
+
+  RefPtr doc = mDocument;
+  doc->FlushViewTransitionUpdateCallbackQueue();
+
+  switch (mPhase) {
+    case Phase::PendingCapture:
+      return Setup();
+    case Phase::Animating:
+      return HandleFrame();
+    default:
+      break;
+  }
+}
+
+nsRect ViewTransition::SnapshotContainingBlockRect(nsPresContext* aPc) {
+  return aPc ? nsRect(aPc->GetVisibleArea().TopLeft(),
+                      aPc->GetSizeForViewportUnits())
+             : nsRect();
+}
+
+nsRect ViewTransition::SnapshotContainingBlockRect() const {
+  nsPresContext* pc = mDocument->GetPresContext();
+  return SnapshotContainingBlockRect(pc);
+}
+
+nsRect ViewTransition::CapturedInkOverflowRectForFrame(nsIFrame* aFrame,
+                                                       bool aIsRoot) {
+  auto snapshotCb = SnapshotContainingBlockRect(aFrame->PresContext());
+  if (aIsRoot) {
+    return snapshotCb;
+  }
+  return CapturedRect(aFrame, snapshotCb.Size(),
+                      CapturedRectType::InkOverflowBox);
+}
+
+Element* ViewTransition::FindPseudo(const PseudoStyleRequest& aRequest) const {
+  Element* root = GetViewTransitionTreeRoot();
+  if (!root) {
+    return nullptr;
+  }
+  MOZ_ASSERT(root->GetPseudoElementType() == PseudoStyleType::ViewTransition);
+
+  if (aRequest.mType == PseudoStyleType::ViewTransition) {
+    return root;
+  }
+
+  Element* group = root->GetFirstElementChild();
+  for (; group; group = group->GetNextElementSibling()) {
+    MOZ_ASSERT(group->HasName(),
+               "The generated ::view-transition-group() should have a name");
+    nsAtom* name = group->GetParsedAttr(nsGkAtoms::name)->GetAtomValue();
+    if (name == aRequest.mIdentifier) {
+      break;
+    }
+  }
+
+  if (!group) {
+    return nullptr;
+  }
+
+  if (aRequest.mType == PseudoStyleType::ViewTransitionGroup) {
+    return group;
+  }
+
+  Element* imagePair = group->GetFirstElementChild();
+  MOZ_ASSERT(imagePair, "::view-transition-image-pair() should exist always");
+  if (aRequest.mType == PseudoStyleType::ViewTransitionImagePair) {
+    return imagePair;
+  }
+
+  Element* child = imagePair->GetFirstElementChild();
+  if (!child) {
+    return nullptr;
+  }
+
+  const PseudoStyleType type = child->GetPseudoElementType();
+  if (type == aRequest.mType) {
+    return child;
+  }
+
+  if (aRequest.mType == PseudoStyleType::ViewTransitionOld) {
+    return nullptr;
+  }
+
+  child = child->GetNextElementSibling();
+  MOZ_ASSERT(aRequest.mType == PseudoStyleType::ViewTransitionNew);
+  MOZ_ASSERT(!child || !child->GetNextElementSibling(),
+             "No more psuedo elements in this subtree");
+  return child;
+}
+
+const StyleLockedDeclarationBlock* ViewTransition::GetDynamicRuleFor(
+    const Element& aElement) const {
+  if (!aElement.HasName()) {
+    return nullptr;
+  }
+  nsAtom* name = aElement.GetParsedAttr(nsGkAtoms::name)->GetAtomValue();
+  auto* capture = mNamedElements.Get(name);
+  if (!capture) {
+    return nullptr;
+  }
+
+  switch (aElement.GetPseudoElementType()) {
+    case PseudoStyleType::ViewTransitionNew:
+      return capture->mNewRule.get();
+    case PseudoStyleType::ViewTransitionOld:
+      return capture->mOldRule.get();
+    case PseudoStyleType::ViewTransitionImagePair:
+      return capture->mImagePairRule.get();
+    case PseudoStyleType::ViewTransitionGroup:
+      return capture->mGroupRule.get();
+    default:
+      return nullptr;
+  }
+}
+
+static void CollectDescendantStackingContexts(nsIFrame* aStackingContextRoot,
+                                              nsTArray<nsIFrame*>& aList) {
+  for (auto& [list, id] : aStackingContextRoot->ChildLists()) {
+    for (nsIFrame* f : list) {
+
+      if (f->Style()->IsRootElementStyle() || f->IsStackingContext()) {
+        aList.AppendElement(f);
+        continue;
+      }
+
+      if (f->IsHiddenByContentVisibilityOnAnyAncestor()) {
+        continue;
+      }
+
+      CollectDescendantStackingContexts(f, aList);
+    }
+  }
+}
+
+struct ZOrderComparator {
+  bool LessThan(const nsIFrame* aLeft, const nsIFrame* aRight) const {
+    return aLeft->ZIndex().valueOr(0) < aRight->ZIndex().valueOr(0);
+  }
+};
+
+template <typename Callback>
+static bool ForEachDescendantWithViewTransitionNameInPaintOrder(
+    nsIFrame* aFrame, const Callback& aCb) {
+  if (aFrame->StyleUIReset()->HasViewTransitionName() && !aCb(aFrame)) {
+    return false;
+  }
+
+  nsTArray<nsIFrame*> descendantStackingContexts;
+  CollectDescendantStackingContexts(aFrame, descendantStackingContexts);
+  descendantStackingContexts.StableSort(ZOrderComparator());
+
+  for (nsIFrame* f : descendantStackingContexts) {
+    if (!ForEachDescendantWithViewTransitionNameInPaintOrder(f, aCb)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+template <typename Callback>
+static void ForEachFrameWithViewTransitionName(Document* aDoc,
+                                               const Callback& aCb) {
+  PresShell* ps = aDoc->GetPresShell();
+  if (!ps) {
+    return;
+  }
+  nsIFrame* root = ps->GetRootFrame();
+  if (!root) {
+    return;
+  }
+  ForEachDescendantWithViewTransitionNameInPaintOrder(root, aCb);
+}
+
+Maybe<SkipTransitionReason> ViewTransition::CaptureOldState() {
+  MOZ_ASSERT(mNamedElements.IsEmpty());
+
+  nsTHashSet<nsAtom*> usedTransitionNames;
+  OldCaptureFramesArray captureElements;
+
+  mInitialSnapshotContainingBlockSize = SnapshotContainingBlockRect().Size();
+
+  Maybe<SkipTransitionReason> result;
+  ForEachFrameWithViewTransitionName(mDocument, [&](nsIFrame* aFrame) {
+    RefPtr<nsAtom> name = DocumentScopedTransitionNameFor(aFrame);
+    if (!name) {
+      return true;
+    }
+    if (aFrame->IsHiddenByContentVisibilityOnAnyAncestor()) {
+      return true;
+    }
+    if (aFrame->GetPrevContinuation() || aFrame->GetNextContinuation()) {
+      return true;
+    }
+    if (!usedTransitionNames.EnsureInserted(name)) {
+      MOZ_ASSERT(aFrame->StyleUIReset()->mViewTransitionName.value.AsAtom() !=
+                 nsGkAtoms::match_element);
+
+      result.emplace(
+          SkipTransitionReason::DuplicateTransitionNameCapturingOldState);
+      return false;
+    }
+    SetCaptured(aFrame, true, name.get());
+    captureElements.AppendElement(std::make_pair(aFrame, std::move(name)));
+    return true;
+  });
+
+  if (result) {
+    for (auto& [f, name] : captureElements) {
+      SetCaptured(f, false, nullptr);
+    }
+    return result;
+  }
+
+  for (auto& [f, name] : captureElements) {
+    MOZ_ASSERT(f);
+    MOZ_ASSERT(f->GetContent()->IsElement());
+    auto capture = MakeUnique<CapturedElement>(
+        f, mInitialSnapshotContainingBlockSize, DocumentScopedClassListFor(f));
+    mNamedElements.InsertOrUpdate(name, std::move(capture));
+    mNames.AppendElement(name);
+  }
+
+  if (!captureElements.IsEmpty()) {
+    AutoRestore guard{mOldCaptureElements};
+    mOldCaptureElements = &captureElements;
+    if (RefPtr<PresShell> ps =
+            nsContentUtils::GetInProcessSubtreeRootDocument(mDocument)
+                ->GetPresShell()) {
+      if (RefPtr widget = ps->GetRootWidget()) {
+        VT_LOG("ViewTransitions::CaptureOldState(), requesting composite");
+        ps->PaintAndRequestComposite(ps->GetRootFrame(),
+                                     widget->GetWindowRenderer(),
+                                     PaintFlags::PaintCompositeOffscreen);
+        VT_LOG("ViewTransitions::CaptureOldState(), requesting composite end");
+      }
+    }
+  }
+
+  for (auto& [f, name] : captureElements) {
+    SetCaptured(f, false, nullptr);
+  }
+  return result;
+}
+
+Maybe<SkipTransitionReason> ViewTransition::CaptureNewState() {
+  nsTHashSet<nsAtom*> usedTransitionNames;
+  Maybe<SkipTransitionReason> result;
+  ForEachFrameWithViewTransitionName(mDocument, [&](nsIFrame* aFrame) {
+    RefPtr<nsAtom> name = DocumentScopedTransitionNameFor(aFrame);
+    if (!name) {
+      return true;
+    }
+    if (aFrame->IsHiddenByContentVisibilityOnAnyAncestor()) {
+      return true;
+    }
+    if (aFrame->GetPrevContinuation() || aFrame->GetNextContinuation()) {
+      return true;
+    }
+    if (!usedTransitionNames.EnsureInserted(name)) {
+      MOZ_ASSERT(aFrame->StyleUIReset()->mViewTransitionName.value.AsAtom() !=
+                 nsGkAtoms::match_element);
+      result.emplace(
+          SkipTransitionReason::DuplicateTransitionNameCapturingNewState);
+      return false;
+    }
+    bool wasPresent = true;
+    auto& capturedElement = mNamedElements.LookupOrInsertWith(name, [&] {
+      wasPresent = false;
+      return MakeUnique<CapturedElement>();
+    });
+    if (!wasPresent) {
+      mNames.AppendElement(name);
+    }
+    capturedElement->mNewElement = aFrame->GetContent()->AsElement();
+    auto capturedRect =
+        CapturedRect(aFrame, mInitialSnapshotContainingBlockSize,
+                     CapturedRectType::InkOverflowBox);
+    capturedElement->mNewSnapshotRect = capturedRect;
+    capturedElement->mNewBorderBoxSize =
+        CapturedRect(aFrame, mInitialSnapshotContainingBlockSize,
+                     CapturedRectType::BorderBox)
+            .Size();
+    capturedElement->CaptureClassList(DocumentScopedClassListFor(aFrame));
+    SetCaptured(aFrame, true, name);
+    return true;
+  });
+  return result;
+}
+
+void ViewTransition::Setup() {
+  if (auto skipReason = CaptureOldState()) {
+    return SkipTransition(*skipReason);
+  }
+
+  mDocument->SetRenderingSuppressedForViewTransitions(true);
+
+  mDocument->Dispatch(
+      NewRunnableMethod("ViewTransition::MaybeScheduleUpdateCallback", this,
+                        &ViewTransition::MaybeScheduleUpdateCallback));
+}
+
+void ViewTransition::FinishDone() {
+  if (mPhase != Phase::PendingDone) {
+    return;
+  }
+  ClearActiveTransition(false);
+  if (Promise* finished = GetFinished(IgnoreErrors())) {
+    finished->MaybeResolveWithUndefined();
+  }
+}
+
+void ViewTransition::HandleFrame() {
+  const bool hasActiveAnimations = CheckForActiveAnimations();
+
+  if (!hasActiveAnimations) {
+    mPhase = Phase::PendingDone;
+    mDocument->Dispatch(NewRunnableMethod("ViewTransition::FinishDone", this,
+                                          &ViewTransition::FinishDone));
+    return;
+  }
+
+
+  if (SnapshotContainingBlockRect().Size() !=
+      mInitialSnapshotContainingBlockSize) {
+    SkipTransition(SkipTransitionReason::Resize);
+    return;
+  }
+
+  if (!UpdatePseudoElementStyles( true)) {
+    return SkipTransition(SkipTransitionReason::PseudoUpdateFailure);
+  }
+
+  mDocument->EnsureViewTransitionOperationsHappen();
+}
+
+static bool CheckForActiveAnimationsForEachPseudo(
+    const Element& aRoot, const AnimationTimeline& aDocTimeline,
+    const AnimationEventDispatcher& aDispatcher,
+    PseudoStyleRequest&& aRequest) {
+  EffectSet* effects = EffectSet::Get(&aRoot, aRequest);
+  if (!effects) {
+    return false;
+  }
+
+  for (const auto* effect : *effects) {
+
+    MOZ_ASSERT(effect && effect->GetAnimation(),
+               "Only effects associated with an animation should be "
+               "added to an element's effect set");
+    const Animation* anim = effect->GetAnimation();
+
+    if (anim->GetTimeline() != &aDocTimeline) {
+      continue;
+    }
+
+    const auto playState = anim->PlayState();
+    if (playState != AnimationPlayState::Paused &&
+        playState != AnimationPlayState::Running &&
+        !aDispatcher.HasQueuedEventsFor(anim)) {
+      continue;
+    }
+    return true;
+  }
+  return false;
+}
+
+bool ViewTransition::CheckForActiveAnimations() const {
+  MOZ_ASSERT(mDocument);
+
+  if (StaticPrefs::dom_viewTransitions_remain_active()) {
+    return true;
+  }
+
+  const Element* root = mDocument->GetRootElement();
+  if (!root) {
+    return false;
+  }
+
+  const AnimationTimeline* timeline = mDocument->Timeline();
+  if (!timeline) {
+    return false;
+  }
+
+  nsPresContext* presContext = mDocument->GetPresContext();
+  if (!presContext) {
+    return false;
+  }
+
+  const AnimationEventDispatcher* dispatcher =
+      presContext->AnimationEventDispatcher();
+  MOZ_ASSERT(dispatcher);
+
+  auto checkForEachPseudo = [&](PseudoStyleRequest&& aRequest) {
+    return CheckForActiveAnimationsForEachPseudo(*root, *timeline, *dispatcher,
+                                                 std::move(aRequest));
+  };
+
+  bool hasActiveAnimations =
+      checkForEachPseudo(PseudoStyleRequest(PseudoStyleType::ViewTransition));
+  for (nsAtom* name : mNamedElements.Keys()) {
+    if (hasActiveAnimations) {
+      break;
+    }
+
+    hasActiveAnimations =
+        checkForEachPseudo({PseudoStyleType::ViewTransitionGroup, name}) ||
+        checkForEachPseudo({PseudoStyleType::ViewTransitionImagePair, name}) ||
+        checkForEachPseudo({PseudoStyleType::ViewTransitionOld, name}) ||
+        checkForEachPseudo({PseudoStyleType::ViewTransitionNew, name});
+  }
+  return hasActiveAnimations;
+}
+
+void ViewTransition::ClearNamedElements() {
+  for (auto& entry : mNamedElements) {
+    if (auto* element = entry.GetData()->mNewElement.get()) {
+      if (nsIFrame* f = element->GetPrimaryFrame()) {
+        SetCaptured(f, false, nullptr);
+      }
+    }
+  }
+  mNamedElements.Clear();
+  mNames.Clear();
+}
+
+static void ClearViewTransitionsAnimationData(Element* aRoot) {
+  if (!aRoot) {
+    return;
+  }
+
+  auto* data = aRoot->GetAnimationData();
+  if (!data) {
+    return;
+  }
+  data->ClearViewTransitionPseudos();
+}
+
+void ViewTransition::ClearActiveTransition(bool aIsDocumentHidden) {
+  MOZ_ASSERT(mDocument);
+  MOZ_ASSERT(mDocument->GetActiveViewTransition() == this);
+
+  if (auto* root = mDocument->GetRootElement()) {
+    root->RemoveStates(ElementState::ACTIVE_VIEW_TRANSITION);
+  }
+
+  ClearNamedElements();
+
+  if (mSnapshotContainingBlock) {
+    nsAutoScriptBlocker scriptBlocker;
+    if (mDocument->DevToolsAnonymousAndShadowEventsEnabled()) {
+      mSnapshotContainingBlock->QueueDevtoolsAnonymousEvent(
+           true);
+    }
+    if (PresShell* ps = mDocument->GetPresShell()) {
+      ps->ContentWillBeRemoved(mSnapshotContainingBlock, {});
+    }
+    mSnapshotContainingBlock->UnbindFromTree();
+    mSnapshotContainingBlock = nullptr;
+
+    if (!aIsDocumentHidden) {
+      ClearViewTransitionsAnimationData(mDocument->GetRootElement());
+    }
+  }
+  mDocument->ClearActiveViewTransition();
+}
+
+void ViewTransition::SkipTransition(SkipTransitionReason aReason) {
+  SkipTransition(aReason, JS::UndefinedHandleValue);
+}
+
+void ViewTransition::SkipTransition(
+    SkipTransitionReason aReason,
+    JS::Handle<JS::Value> aUpdateCallbackRejectReason) {
+  MOZ_ASSERT(mDocument);
+  MOZ_ASSERT_IF(aReason != SkipTransitionReason::JS, mPhase != Phase::Done);
+  MOZ_ASSERT_IF(aReason != SkipTransitionReason::UpdateCallbackRejected,
+                aUpdateCallbackRejectReason == JS::UndefinedHandleValue);
+  VT_LOG("ViewTransition::SkipTransition(%d, %d)\n", int(mPhase), int(aReason));
+  if (mPhase == Phase::Done) {
+    return;
+  }
+  if (UnderlyingValue(mPhase) < UnderlyingValue(Phase::UpdateCallbackCalled)) {
+    mDocument->ScheduleViewTransitionUpdateCallback(this);
+  }
+
+  mDocument->SetRenderingSuppressedForViewTransitions(false);
+
+  if (mDocument->GetActiveViewTransition() == this) {
+    ClearActiveTransition(aReason == SkipTransitionReason::DocumentHidden);
+  }
+
+  mPhase = Phase::Done;
+
+  Promise* ucd = GetUpdateCallbackDone(IgnoreErrors());
+  if (Promise* readyPromise = GetReady(IgnoreErrors())) {
+    switch (aReason) {
+      case SkipTransitionReason::JS:
+        readyPromise->MaybeRejectWithAbortError(
+            "Skipped ViewTransition due to skipTransition() call");
+        break;
+      case SkipTransitionReason::ClobberedActiveTransition:
+        readyPromise->MaybeRejectWithAbortError(
+            "Skipped ViewTransition due to another transition starting");
+        break;
+      case SkipTransitionReason::DocumentHidden:
+        readyPromise->MaybeRejectWithInvalidStateError(
+            "Skipped ViewTransition due to document being hidden");
+        break;
+      case SkipTransitionReason::Timeout:
+        readyPromise->MaybeRejectWithTimeoutError(
+            "Skipped ViewTransition due to timeout");
+        break;
+      case SkipTransitionReason::DuplicateTransitionNameCapturingOldState:
+        readyPromise->MaybeRejectWithInvalidStateError(
+            "Duplicate view-transition-name value while capturing old state");
+        break;
+      case SkipTransitionReason::DuplicateTransitionNameCapturingNewState:
+        readyPromise->MaybeRejectWithInvalidStateError(
+            "Duplicate view-transition-name value while capturing new state");
+        break;
+      case SkipTransitionReason::RootRemoved:
+        readyPromise->MaybeRejectWithInvalidStateError(
+            "Skipped view transition due to root element going away");
+        break;
+      case SkipTransitionReason::PageSwap:
+        readyPromise->MaybeRejectWithInvalidStateError(
+            "Skipped view transition due to page swap");
+        break;
+      case SkipTransitionReason::Resize:
+        readyPromise->MaybeRejectWithInvalidStateError(
+            "Skipped view transition due to viewport resize");
+        break;
+      case SkipTransitionReason::PseudoUpdateFailure:
+        readyPromise->MaybeRejectWithInvalidStateError(
+            "Skipped view transition due to hidden new element");
+        break;
+      case SkipTransitionReason::ResetRendering:
+        readyPromise->MaybeRejectWithInvalidStateError(
+            "Skipped view transition due to graphics process or device reset");
+        break;
+      case SkipTransitionReason::UpdateCallbackRejected:
+        readyPromise->MaybeReject(aUpdateCallbackRejectReason);
+
+        if (ucd) {
+          MOZ_ASSERT(ucd->State() == Promise::PromiseState::Rejected);
+          if (Promise* finished = GetFinished(IgnoreErrors())) {
+            finished->MaybeReject(aUpdateCallbackRejectReason);
+          }
+        }
+        break;
+    }
+  }
+
+  if (ucd && ucd->State() == Promise::PromiseState::Resolved) {
+    if (Promise* finished = GetFinished(IgnoreErrors())) {
+      finished->MaybeResolveWithUndefined();
+    }
+  }
+}
+
+Maybe<uint64_t> ViewTransition::GetElementIdentifier(Element* aElement) const {
+  return mElementIdentifiers.MaybeGet(aElement);
+}
+
+uint64_t ViewTransition::EnsureElementIdentifier(Element* aElement) {
+  static uint64_t sLastIdentifier = 0;
+  return mElementIdentifiers.WithEntryHandle(aElement, [&](auto&& entry) {
+    return entry.OrInsertWith([&]() { return sLastIdentifier++; });
+  });
+}
+
+already_AddRefed<nsAtom> ViewTransition::DocumentScopedTransitionNameFor(
+    nsIFrame* aFrame) {
+  const auto& computed = aFrame->StyleUIReset()->mViewTransitionName;
+  nsAtom* ident = computed.value.AsAtom();
+
+  if (ident == nsGkAtoms::none) {
+    return nullptr;
+  }
+
+  if (aFrame->IsTableFrame()) {
+    return nullptr;
+  }
+
+  nsIContent* content = aFrame->GetContent();
+  if (MOZ_UNLIKELY(!content) ||
+      AnchorPositioningUtils::GetShadowRootForTreeScope(*content->AsElement(),
+                                                        computed.scope)) {
+    return nullptr;
+  }
+
+  if (ident != nsGkAtoms::match_element) {
+    return do_AddRef(ident);
+  }
+
+
+  if (MOZ_UNLIKELY(!content->IsElement())) {
+    return nullptr;
+  }
+
+  uint64_t id = EnsureElementIdentifier(content->AsElement());
+
+  nsCString name;
+  // auto-generated view-transition-name.
+  name.AppendLiteral("-ua-view-transition-name-");
+  name.AppendInt(id);
+  return NS_Atomize(name);
+}
+
+JSObject* ViewTransition::WrapObject(JSContext* aCx,
+                                     JS::Handle<JSObject*> aGivenProto) {
+  return ViewTransition_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+static void ComputeActiveRect1D(nscoord aViewMin, nscoord aViewSize,
+                                nscoord& aCaptureMin, nscoord& aCaptureSize) {
+  nscoord captureMax = aCaptureMin + aCaptureSize;
+  nscoord viewMax = aViewMin + aViewSize;
+
+  nscoord min;
+  nscoord max;
+
+  if (aCaptureSize < aViewSize) {
+    min = aCaptureMin;
+    max = min + aCaptureSize;
+  } else if (aViewMin < aCaptureMin) {
+    min = aCaptureMin;
+    max = min + aViewSize;
+  } else if (viewMax > captureMax) {
+    max = captureMax;
+    min = max - aViewSize;
+  } else {
+    min = aViewMin;
+    max = viewMax;
+  }
+
+  aCaptureMin = min;
+  aCaptureSize = max - min;
+}
+
+void ViewTransition::UpdateActiveRectForCapturedFrame(
+    nsIFrame* aCapturedFrame, const gfx::MatrixScales& aInheritedScale,
+    nsRect& aOutCaptureRect) {
+  nsAtom* name = aCapturedFrame->GetProperty(ViewTransitionCaptureName());
+  if (NS_WARN_IF(!name)) {
+    return;
+  }
+
+  auto* el = mNamedElements.Get(name);
+  if (NS_WARN_IF(!el)) {
+    return;
+  }
+
+  const bool isOld = mPhase < Phase::Animating;
+
+  Maybe<nsRect>* activeRect;
+  if (isOld) {
+    activeRect = &el->mOldActiveRect;
+    MOZ_ASSERT(activeRect->isNothing());
+  } else {
+    activeRect = &el->mNewActiveRect;
+  }
+
+  activeRect->reset();
+
+  auto presShell = aCapturedFrame->PresShell();
+  if (!presShell->IsVisualViewportSizeSet()) {
+    return;
+  }
+
+  nsPresContext* pc = aCapturedFrame->PresContext();
+
+  auto rootViewportSize = presShell->GetVisualViewportSize();
+  auto auPerDevPx = pc->AppUnitsPerDevPixel();
+  auto vvpSize = LayoutDeviceSize::FromAppUnits(rootViewportSize, auPerDevPx);
+  auto capSize =
+      LayoutDeviceSize::FromAppUnits(aOutCaptureRect.Size(), auPerDevPx);
+  capSize.width *= aInheritedScale.xScale;
+  capSize.height *= aInheritedScale.yScale;
+
+  if (capSize.width < vvpSize.width && capSize.height < vvpSize.height) {
+    return;
+  }
+
+  auto rootViewportOrigin = nsPoint(0, 0);
+  nsRect viewport = nsRect(rootViewportOrigin, rootViewportSize);
+
+  float scale = std::max(aInheritedScale.xScale, aInheritedScale.yScale);
+  nscoord margin = NSFloatPixelsToAppUnits(512.0 / scale, auPerDevPx);
+  nscoord maxSize = NSFloatPixelsToAppUnits(4096.0 / scale, auPerDevPx);
+  margin = std::min(
+      margin,
+      std::max(0, maxSize - std::max(viewport.width, viewport.height)) / 2);
+
+  viewport.Inflate(margin);
+
+  nsIFrame* rootFrame = pc->GetPresShell()->GetRootFrame();
+
+  const auto SUCCESS = nsLayoutUtils::TransformResult::TRANSFORM_SUCCEEDED;
+  if (!rootFrame || nsLayoutUtils::TransformRect(rootFrame, aCapturedFrame,
+                                                 viewport) != SUCCESS) {
+    return;
+  }
+
+  ComputeActiveRect1D(viewport.x, viewport.width, aOutCaptureRect.x,
+                      aOutCaptureRect.width);
+  ComputeActiveRect1D(viewport.y, viewport.height, aOutCaptureRect.y,
+                      aOutCaptureRect.height);
+
+  *activeRect = Some(aOutCaptureRect);
+}
+
+Maybe<nsRect> ViewTransition::GetOldActiveRect(nsAtom* aName) const {
+  auto* el = mNamedElements.Get(aName);
+  if (NS_WARN_IF(!el)) {
+    return Nothing();
+  }
+
+  return el->mOldActiveRect;
+}
+
+Maybe<nsRect> ViewTransition::GetNewActiveRect(nsAtom* aName) const {
+  auto* el = mNamedElements.Get(aName);
+  if (NS_WARN_IF(!el)) {
+    return Nothing();
+  }
+
+  return el->mNewActiveRect;
+}
+
+ViewTransitionTypeSet* ViewTransition::Types() {
+  if (!mTypes) {
+    mTypes = new ViewTransitionTypeSet(*this);
+    for (const auto& type : mTypeList) {
+      ViewTransitionTypeSet_Binding::SetlikeHelpers::Add(
+          mTypes, nsDependentAtomString(type), IgnoreErrors());
+    }
+  }
+  return mTypes;
+}
+
+};  

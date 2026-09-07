@@ -1,0 +1,1547 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsArrayUtils.h"
+#include "nsClipboard.h"
+#include "nsComponentManagerUtils.h"
+#if defined(MOZ_WAYLAND)
+#  include "RetrievalContextGtk.h"
+#  include "nsWaylandDisplay.h"
+#endif
+#include "nsGtkUtils.h"
+#include "nsIURI.h"
+#include "nsIFile.h"
+#include "nsNetUtil.h"
+#include "nsContentUtils.h"
+#include "nsSupportsPrimitives.h"
+#include "nsString.h"
+#include "nsReadableUtils.h"
+#include "nsPrimitiveHelpers.h"
+#include "nsImageToPixbuf.h"
+#include "nsStringStream.h"
+#include "nsIFileURL.h"
+#include "nsIObserverService.h"
+#include "mozilla/GRefPtr.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/SchedulerGroup.h"
+#include "mozilla/Services.h"
+#include "mozilla/StaticPrefs_clipboard.h"
+#include "mozilla/TimeStamp.h"
+#include "GRefPtr.h"
+#include "WidgetUtilsGtk.h"
+
+#include "imgIContainer.h"
+#include "mozilla/widget/nsGtkHtmlUtils.h"
+
+#include <gtk/gtk.h>
+
+using namespace mozilla;
+using namespace mozilla::widget;
+
+const int mozilla::kClipboardTimeout = 1000000;
+
+const int mozilla::kClipboardFastIterationNum = 3;
+
+static const char kURIListMime[] = "text/uri-list";
+
+static constexpr char kWebCustomFormatMapTarget[] =
+    "application/web;type=\"custom/formatmap\"";
+static constexpr char kWebCustomFormatTargetPrefix[] =
+    "application/web;type=\"custom/format";
+
+static const char kKDEPasswordManagerHintMime[] = "x-kde-passwordManagerHint";
+
+static void clipboard_get_cb(GtkClipboard* aGtkClipboard,
+                             GtkSelectionData* aSelectionData, guint info,
+                             gpointer user_data);
+
+static void clipboard_clear_cb(GtkClipboard* aGtkClipboard, gpointer user_data);
+
+static void clipboard_owner_change_cb(GtkClipboard* aGtkClipboard,
+                                      GdkEventOwnerChange* aEvent,
+                                      gpointer aUserData);
+
+ClipboardTargets::ClipboardTargets(GList* aTargets) {
+  for (GList* tmp = aTargets; tmp; tmp = tmp->next) {
+    mTargets.AppendElement(GDK_POINTER_TO_ATOM(tmp->data));
+  }
+}
+
+ClipboardTargets::ClipboardTargets(GUniquePtr<GdkAtom> aTargets,
+                                   int aTargetsNum) {
+  for (int j = 0; j < aTargetsNum; j++) {
+    mTargets.AppendElement(aTargets.get()[j]);
+  }
+}
+
+ClipboardTargets ClipboardTargets::Clone() const {
+  return ClipboardTargets(mTargets.Clone());
+}
+
+void ClipboardTargets::Set(ClipboardTargets aTargets) {
+  mTargets = std::move(aTargets.mTargets);
+}
+
+bool ClipboardTargets::Contains(GdkAtom aTarget) const {
+  return mTargets.Contains(aTarget);
+}
+
+void ClipboardData::SetData(Span<const uint8_t> aData) {
+  mData = nullptr;
+  mLength = aData.Length();
+  if (mLength) {
+    mData.reset(reinterpret_cast<char*>(g_malloc(sizeof(char) * mLength)));
+    memcpy(mData.get(), aData.data(), sizeof(char) * mLength);
+  }
+}
+
+void ClipboardData::SetText(Span<const char> aData) {
+  mData = nullptr;
+  mLength = aData.Length();
+  if (mLength) {
+    mData.reset(
+        reinterpret_cast<char*>(g_malloc(sizeof(char) * (mLength + 1))));
+    memcpy(mData.get(), aData.data(), sizeof(char) * mLength);
+    mData.get()[mLength] = '\0';
+  }
+}
+
+void ClipboardData::SetTargets(GUniquePtr<GdkAtom> aTarget, int aTargetsNum) {
+  mLength = aTargetsNum;
+  mData.reset(reinterpret_cast<char*>(aTarget.release()));
+}
+
+ClipboardTargets ClipboardData::ExtractTargets() {
+  ClipboardTargets targets(
+      GUniquePtr<GdkAtom>(reinterpret_cast<GdkAtom*>(mData.release())),
+      mLength);
+  mLength = 0;
+  return targets;
+}
+
+GdkAtom mozilla::GetSelectionAtom(int32_t aWhichClipboard) {
+  if (aWhichClipboard == nsIClipboard::kGlobalClipboard)
+    return GDK_SELECTION_CLIPBOARD;
+
+  return GDK_SELECTION_PRIMARY;
+}
+
+Maybe<nsIClipboard::ClipboardType> mozilla::GetGeckoClipboardType(
+    GtkClipboard* aGtkClipboard) {
+  if (aGtkClipboard == gtk_clipboard_get(GDK_SELECTION_PRIMARY)) {
+    return Some(nsClipboard::kSelectionClipboard);
+  }
+  if (aGtkClipboard == gtk_clipboard_get(GDK_SELECTION_CLIPBOARD)) {
+    return Some(nsClipboard::kGlobalClipboard);
+  }
+  return Nothing();  
+}
+
+nsClipboard::nsClipboard()
+    : nsBaseClipboard(mozilla::dom::ClipboardCapabilities(
+#ifdef MOZ_WAYLAND
+          widget::GdkIsWaylandDisplay()
+              ? widget::WaylandDisplayGet()->IsPrimarySelectionEnabled()
+              : true,
+#else
+          true, 
+#endif
+          false ,
+          false )) {
+  g_signal_connect(gtk_clipboard_get(GDK_SELECTION_CLIPBOARD), "owner-change",
+                   G_CALLBACK(clipboard_owner_change_cb), this);
+  g_signal_connect(gtk_clipboard_get(GDK_SELECTION_PRIMARY), "owner-change",
+                   G_CALLBACK(clipboard_owner_change_cb), this);
+}
+
+nsClipboard::~nsClipboard() {
+  g_signal_handlers_disconnect_by_func(
+      gtk_clipboard_get(GDK_SELECTION_CLIPBOARD),
+      FuncToGpointer(clipboard_owner_change_cb), this);
+  g_signal_handlers_disconnect_by_func(
+      gtk_clipboard_get(GDK_SELECTION_PRIMARY),
+      FuncToGpointer(clipboard_owner_change_cb), this);
+}
+
+NS_IMPL_ISUPPORTS_INHERITED(nsClipboard, nsBaseClipboard, nsIObserver)
+
+nsresult nsClipboard::Init(void) {
+#if defined(MOZ_WAYLAND)
+  if (widget::GdkIsWaylandDisplay()) {
+    mContext = new RetrievalContextGtk();
+  }
+#endif
+
+  nsCOMPtr<nsIObserverService> os = mozilla::services::GetObserverService();
+  if (os) {
+    os->AddObserver(this, "xpcom-shutdown", false);
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsClipboard::Observe(nsISupports* aSubject, const char* aTopic,
+                     const char16_t* aData) {
+  return SchedulerGroup::Dispatch(
+      NS_NewRunnableFunction("gtk_clipboard_store()", []() {
+        MOZ_CLIPBOARD_LOG("nsClipboard storing clipboard content\n");
+        gtk_clipboard_store(gtk_clipboard_get(GDK_SELECTION_CLIPBOARD));
+      }));
+}
+
+NS_IMETHODIMP
+nsClipboard::SetNativeClipboardData(nsITransferable* aTransferable,
+                                    ClipboardType aWhichClipboard) {
+  MOZ_DIAGNOSTIC_ASSERT(aTransferable);
+  MOZ_DIAGNOSTIC_ASSERT(
+      nsIClipboard::IsClipboardTypeSupported(aWhichClipboard));
+
+  if ((aWhichClipboard == kGlobalClipboard &&
+       aTransferable == mGlobalTransferable.get()) ||
+      (aWhichClipboard == kSelectionClipboard &&
+       aTransferable == mSelectionTransferable.get())) {
+    return NS_OK;
+  }
+
+  MOZ_CLIPBOARD_LOG(
+      "nsClipboard::SetNativeClipboardData (%s)\n",
+      aWhichClipboard == kSelectionClipboard ? "primary" : "clipboard");
+
+  GtkTargetList* list = gtk_target_list_new(nullptr, 0);
+
+  nsTArray<nsCString> flavors;
+  nsresult rv = aTransferable->FlavorsTransferableCanExport(flavors);
+  if (NS_FAILED(rv)) {
+    MOZ_CLIPBOARD_LOG("    FlavorsTransferableCanExport failed!\n");
+  }
+
+  mozilla::widget::WebCustomFormatMap newWebCustomFormatMap;
+  uint32_t webCustomFormatIndex = 0;
+  bool imagesAdded = false;
+  for (uint32_t i = 0; i < flavors.Length(); i++) {
+    nsCString& flavorStr = flavors[i];
+    MOZ_CLIPBOARD_LOG("    processing target %s\n", flavorStr.get());
+
+    if (flavorStr.EqualsLiteral(kTextMime)) {
+      MOZ_CLIPBOARD_LOG("    adding TEXT targets\n");
+      gtk_target_list_add_text_targets(list, 0);
+      continue;
+    }
+
+    if (nsContentUtils::IsFlavorImage(flavorStr)) {
+      if (!imagesAdded) {
+        MOZ_CLIPBOARD_LOG("    adding IMAGE targets\n");
+        gtk_target_list_add_image_targets(list, 0, TRUE);
+        imagesAdded = true;
+      }
+      continue;
+    }
+
+    if (flavorStr.EqualsLiteral(kFileMime)) {
+      MOZ_CLIPBOARD_LOG("    adding text/uri-list target\n");
+      GdkAtom atom = gdk_atom_intern(kURIListMime, FALSE);
+      gtk_target_list_add(list, atom, 0, 0);
+      continue;
+    }
+
+    if (StringBeginsWith(flavorStr, nsLiteralCString(kWebCustomFormatPrefix))) {
+      if (!nsBaseClipboard::IsValidFlavor(flavorStr)) {
+        continue;
+      }
+      nsAutoCString targetName(kWebCustomFormatTargetPrefix);
+      targetName.AppendInt(webCustomFormatIndex);
+      targetName.Append('"');
+      MOZ_CLIPBOARD_LOG("    adding web custom format target %s for %s\n",
+                        targetName.get(), flavorStr.get());
+      GdkAtom atom = gdk_atom_intern(targetName.get(), FALSE);
+      gtk_target_list_add(list, atom, 0, 0);
+      nsDependentCSubstring essence(
+          Substring(flavorStr, strlen(kWebCustomFormatPrefix)));
+      newWebCustomFormatMap.InsertOrUpdate(essence, targetName);
+      webCustomFormatIndex++;
+      continue;
+    }
+
+    MOZ_CLIPBOARD_LOG("    adding OTHER target %s\n", flavorStr.get());
+    GdkAtom atom = gdk_atom_intern(flavorStr.get(), FALSE);
+    gtk_target_list_add(list, atom, 0, 0);
+  }
+
+  if (!newWebCustomFormatMap.IsEmpty()) {
+    MOZ_CLIPBOARD_LOG("    adding web custom format map target %s\n",
+                      kWebCustomFormatMapTarget);
+    GdkAtom mapAtom = gdk_atom_intern(kWebCustomFormatMapTarget, FALSE);
+    gtk_target_list_add(list, mapAtom, 0, 0);
+  }
+
+  if (!StaticPrefs::clipboard_copyPrivateDataToClipboardCloudOrHistory() &&
+      aTransferable->GetIsPrivateData()) {
+    GdkAtom atom = gdk_atom_intern(kKDEPasswordManagerHintMime, FALSE);
+    gtk_target_list_add(list, atom, 0, 0);
+  }
+
+  GtkClipboard* gtkClipboard =
+      gtk_clipboard_get(GetSelectionAtom(aWhichClipboard));
+
+  gint numTargets = 0;
+  GtkTargetEntry* gtkTargets =
+      gtk_target_table_new_from_list(list, &numTargets);
+  if (!gtkTargets || numTargets == 0) {
+    MOZ_CLIPBOARD_LOG(
+        "    gtk_target_table_new_from_list() failed or empty list of "
+        "targets!\n");
+    EmptyNativeClipboardData(aWhichClipboard);
+    return NS_ERROR_FAILURE;
+  }
+
+  ClearCachedTargets(aWhichClipboard);
+
+  MarkNextOwnerClipboardChange(aWhichClipboard,  true);
+
+  if (gtk_clipboard_set_with_data(gtkClipboard, gtkTargets, numTargets,
+                                  clipboard_get_cb, clipboard_clear_cb, this)) {
+    IncrementSequenceNumber(aWhichClipboard);
+    if (aWhichClipboard == kSelectionClipboard) {
+      mSelectionTransferable = aTransferable;
+    } else {
+      mGlobalTransferable = aTransferable;
+      gtk_clipboard_set_can_store(gtkClipboard, gtkTargets, numTargets);
+    }
+    WebCustomFormatMapFor(aWhichClipboard) = std::move(newWebCustomFormatMap);
+    MOZ_CLIPBOARD_LOG("     sequence %d", GetSequenceNumber(aWhichClipboard));
+    rv = NS_OK;
+  } else {
+    MOZ_CLIPBOARD_LOG("     gtk_clipboard_set_with_data() failed!\n");
+    EmptyNativeClipboardData(aWhichClipboard);
+    MOZ_CLIPBOARD_LOG("     sequence %d", GetSequenceNumber(aWhichClipboard));
+    rv = NS_ERROR_FAILURE;
+  }
+
+  gtk_target_table_free(gtkTargets, numTargets);
+  gtk_target_list_unref(list);
+  return rv;
+}
+
+mozilla::Result<int32_t, nsresult>
+nsClipboard::GetNativeClipboardSequenceNumber(ClipboardType aWhichClipboard) {
+  MOZ_DIAGNOSTIC_ASSERT(
+      nsIClipboard::IsClipboardTypeSupported(aWhichClipboard));
+  return aWhichClipboard == kSelectionClipboard ? mSelectionSequenceNumber
+                                                : mGlobalSequenceNumber;
+}
+
+mozilla::widget::WebCustomFormatMap
+nsClipboard::GetWebCustomFormatMapFromClipboard(int32_t aWhichClipboard) {
+  mozilla::widget::WebCustomFormatMap map;
+  if (!mContext) {
+    return map;
+  }
+  auto mapData =
+      mContext->GetClipboardData(kWebCustomFormatMapTarget, aWhichClipboard);
+  if (!mapData) {
+    MOZ_CLIPBOARD_LOG("    no web custom format map on clipboard\n");
+    return map;
+  }
+  if (!mozilla::widget::JSONToWebCustomFormatMap(
+          nsDependentCSubstring(mapData.AsSpan()), map)) {
+    MOZ_CLIPBOARD_LOG("    failed to parse web custom format map JSON\n");
+    map.Clear();
+  }
+  return map;
+}
+
+bool nsClipboard::HasSuitableData(int32_t aWhichClipboard,
+                                  const nsACString& aFlavor) {
+  MOZ_CLIPBOARD_LOG("%s for %s", __FUNCTION__,
+                    PromiseFlatCString(aFlavor).get());
+
+  auto targets = mContext->GetTargets(aWhichClipboard);
+  if (!targets) {
+    MOZ_CLIPBOARD_LOG("    X11: no targes at clipboard (null), quit.\n");
+    return aFlavor.EqualsLiteral(kTextMime);
+  }
+
+  for (const auto& atom : targets.AsSpan()) {
+    GUniquePtr<gchar> atom_name(gdk_atom_name(atom));
+    if (!atom_name) {
+      continue;
+    }
+    if (strcmp(atom_name.get(), "TARGETS") == 0 ||
+        strcmp(atom_name.get(), "TIMESTAMP") == 0 ||
+        strcmp(atom_name.get(), "SAVE_TARGETS") == 0 ||
+        strcmp(atom_name.get(), "MULTIPLE") == 0) {
+      continue;
+    }
+    if (strncmp(atom_name.get(), "image/", 6) == 0 ||
+        strncmp(atom_name.get(), "application/", 12) == 0 ||
+        strncmp(atom_name.get(), "audio/", 6) == 0 ||
+        strncmp(atom_name.get(), "video/", 6) == 0) {
+      continue;
+    }
+    MOZ_CLIPBOARD_LOG(
+        "    X11: text types in clipboard, no need to filter them.\n");
+    return true;
+  }
+
+  for (const auto& atom : targets.AsSpan()) {
+    GUniquePtr<gchar> atom_name(gdk_atom_name(atom));
+    if (!atom_name) {
+      continue;
+    }
+    if (aFlavor.Equals(atom_name.get())) {
+      return true;
+    }
+  }
+
+  MOZ_CLIPBOARD_LOG("    X11: no suitable data in clipboard, quit.\n");
+  return false;
+}
+
+static already_AddRefed<nsIFile> GetFileData(const nsACString& aURIList) {
+  nsCOMPtr<nsIFile> file;
+  nsTArray<nsCString> uris = mozilla::widget::ParseTextURIList(aURIList);
+  if (!uris.IsEmpty()) {
+    nsCOMPtr<nsIURI> fileURI;
+    NS_NewURI(getter_AddRefs(fileURI), uris[0]);
+    if (nsCOMPtr<nsIFileURL> fileURL = do_QueryInterface(fileURI)) {
+      fileURL->GetFile(getter_AddRefs(file));
+    }
+  }
+  return file.forget();
+}
+
+static already_AddRefed<nsISupports> GetHTMLData(Span<const char> aData) {
+  nsAutoString unicodeData;
+  if (!DecodeHTMLData(aData, unicodeData)) {
+    MOZ_CLIPBOARD_LOG("GetHTMLData: failed to decode HTML");
+    return nullptr;
+  }
+  nsCOMPtr<nsISupports> wrapper;
+  nsPrimitiveHelpers::CreatePrimitiveForData(
+      nsLiteralCString(kHTMLMime), (const char*)unicodeData.BeginReading(),
+      unicodeData.Length() * sizeof(char16_t), getter_AddRefs(wrapper));
+  return wrapper.forget();
+}
+
+mozilla::Result<nsCOMPtr<nsISupports>, nsresult>
+nsClipboard::GetNativeClipboardData(const nsACString& aFlavor,
+                                    ClipboardType aWhichClipboard,
+                                    uint64_t aThreshold) {
+  MOZ_DIAGNOSTIC_ASSERT(
+      nsIClipboard::IsClipboardTypeSupported(aWhichClipboard));
+  MOZ_DIAGNOSTIC_ASSERT(IsValidFlavor(aFlavor));
+
+  MOZ_CLIPBOARD_LOG(
+      "nsClipboard::GetNativeClipboardData (%s) for %s sequence num %d",
+      aWhichClipboard == kSelectionClipboard ? "primary" : "clipboard",
+      PromiseFlatCString(aFlavor).get(), GetSequenceNumber(aWhichClipboard));
+
+  if (!mContext) {
+    return Err(NS_ERROR_FAILURE);
+  }
+
+  const bool isWebMap = aFlavor.EqualsLiteral(kWebCustomFormatMapType);
+  const bool isWebFormat =
+      StringBeginsWith(aFlavor, nsLiteralCString(kWebCustomFormatPrefix));
+  mozilla::widget::WebCustomFormatMap cachedMap;
+  nsAutoCString targetName(aFlavor);
+  if (isWebMap || isWebFormat) {
+    cachedMap = GetWebCustomFormatMapFromClipboard(aWhichClipboard);
+    if (cachedMap.IsEmpty()) {
+      return nsCOMPtr<nsISupports>{};
+    }
+    if (isWebMap) {
+      targetName.Assign(kWebCustomFormatMapTarget);
+    } else {
+      nsDependentCSubstring essence(
+          Substring(aFlavor, strlen(kWebCustomFormatPrefix)));
+      auto entry = cachedMap.Lookup(essence);
+      if (!entry) {
+        return nsCOMPtr<nsISupports>{};
+      }
+      targetName.Assign(entry.Data());
+    }
+  }
+
+  if (widget::GdkIsX11Display() &&
+      !HasSuitableData(aWhichClipboard, targetName)) {
+    MOZ_CLIPBOARD_LOG("    Missing suitable clipboard data, quit.");
+    return nsCOMPtr<nsISupports>{};
+  }
+
+  if (isWebMap) {
+    nsCOMPtr<nsIMutableArray> customFormats =
+        do_CreateInstance(NS_ARRAY_CONTRACTID);
+    for (const auto& essence : cachedMap.Keys()) {
+      nsCOMPtr<nsISupportsCString> customFormat =
+          do_CreateInstance(NS_SUPPORTS_CSTRING_CONTRACTID);
+      customFormat->SetData(nsLiteralCString(kWebCustomFormatPrefix) + essence);
+      customFormats->AppendElement(customFormat);
+    }
+    return nsCOMPtr<nsISupports>(std::move(customFormats));
+  }
+
+  if (isWebFormat) {
+    MOZ_CLIPBOARD_LOG(
+        "    Getting web custom format %s clipboard data (target %s)\n",
+        PromiseFlatCString(aFlavor).get(), targetName.get());
+    auto targetData =
+        mContext->GetClipboardData(targetName.get(), aWhichClipboard);
+    if (!targetData) {
+      return nsCOMPtr<nsISupports>{};
+    }
+    auto span = targetData.AsSpan();
+    nsCOMPtr<nsISupports> wrapper;
+    nsPrimitiveHelpers::CreatePrimitiveForData(
+        aFlavor, span.data(), span.Length(), getter_AddRefs(wrapper));
+    return wrapper;
+  }
+
+  if (aFlavor.EqualsLiteral(kJPEGImageMime) ||
+      aFlavor.EqualsLiteral(kJPGImageMime) ||
+      aFlavor.EqualsLiteral(kPNGImageMime) ||
+      aFlavor.EqualsLiteral(kGIFImageMime)) {
+    nsAutoCString flavor(aFlavor.EqualsLiteral(kJPGImageMime)
+                             ? kJPEGImageMime
+                             : PromiseFlatCString(aFlavor).get());
+    MOZ_CLIPBOARD_LOG("    Getting image %s MIME clipboard data\n",
+                      flavor.get());
+
+    auto clipboardData =
+        mContext->GetClipboardData(flavor.get(), aWhichClipboard);
+    if (!clipboardData) {
+      MOZ_CLIPBOARD_LOG("    %s type is missing\n", flavor.get());
+      return nsCOMPtr<nsISupports>{};
+    }
+
+    nsCOMPtr<nsIInputStream> byteStream;
+    NS_NewByteInputStream(getter_AddRefs(byteStream), clipboardData.AsSpan(),
+                          NS_ASSIGNMENT_COPY);
+
+    MOZ_CLIPBOARD_LOG("    got %s MIME data\n", flavor.get());
+    return nsCOMPtr<nsISupports>(std::move(byteStream));
+  }
+
+  if (aFlavor.EqualsLiteral(kTextMime)) {
+    MOZ_CLIPBOARD_LOG("    Getting text %s MIME clipboard data\n",
+                      PromiseFlatCString(aFlavor).get());
+
+    auto clipboardData = mContext->GetClipboardText(aWhichClipboard);
+    if (!clipboardData) {
+      MOZ_CLIPBOARD_LOG("    failed to get text data\n");
+      return nsCOMPtr<nsISupports>{};
+    }
+
+    if (aThreshold && strlen(clipboardData.get()) * 2 > aThreshold) {
+      return mozilla::Err(NS_ERROR_CLIPBOARD_TOO_BIG);
+    }
+
+    NS_ConvertUTF8toUTF16 ucs2string(clipboardData.get());
+
+    nsCOMPtr<nsISupports> wrapper;
+    nsPrimitiveHelpers::CreatePrimitiveForData(
+        aFlavor, (const char*)ucs2string.BeginReading(),
+        ucs2string.Length() * 2, getter_AddRefs(wrapper));
+
+    MOZ_CLIPBOARD_LOG("    got text data, length %zd\n", ucs2string.Length());
+    return wrapper;
+  }
+
+  if (aFlavor.EqualsLiteral(kFileMime)) {
+    MOZ_CLIPBOARD_LOG("    Getting file %s MIME clipboard data\n",
+                      PromiseFlatCString(aFlavor).get());
+
+    auto clipboardData =
+        mContext->GetClipboardData(kURIListMime, aWhichClipboard);
+    if (!clipboardData) {
+      MOZ_CLIPBOARD_LOG("    text/uri-list type is missing\n");
+      return nsCOMPtr<nsISupports>{};
+    }
+
+    nsDependentCSubstring fileName(clipboardData.AsSpan());
+    if (nsCOMPtr<nsIFile> file = GetFileData(fileName)) {
+      MOZ_CLIPBOARD_LOG("    got file data\n");
+      return nsCOMPtr<nsISupports>(std::move(file));
+    }
+
+    MOZ_CLIPBOARD_LOG("    failed to get file data\n");
+    return nsCOMPtr<nsISupports>{};
+  }
+
+  MOZ_CLIPBOARD_LOG("    Getting %s MIME clipboard data\n",
+                    PromiseFlatCString(aFlavor).get());
+
+  auto clipboardData = mContext->GetClipboardData(
+      PromiseFlatCString(aFlavor).get(), aWhichClipboard);
+  if (!clipboardData) {
+    MOZ_CLIPBOARD_LOG("    failed to get clipboard content.\n");
+    return nsCOMPtr<nsISupports>{};
+  }
+
+  MOZ_CLIPBOARD_LOG("    got %s mime type data.\n",
+                    PromiseFlatCString(aFlavor).get());
+
+  auto span = clipboardData.AsSpan();
+  if (aFlavor.EqualsLiteral(kHTMLMime)) {
+    return nsCOMPtr<nsISupports>(GetHTMLData(span));
+  }
+
+  nsCOMPtr<nsISupports> wrapper;
+  nsPrimitiveHelpers::CreatePrimitiveForData(
+      aFlavor, span.data(), span.Length(), getter_AddRefs(wrapper));
+  return wrapper;
+}
+
+enum DataType {
+  DATATYPE_IMAGE,
+  DATATYPE_FILE,
+  DATATYPE_HTML,
+  DATATYPE_RAW,
+};
+
+struct DataCallbackHandler {
+  nsBaseClipboard::GetNativeDataCallback mDataCallback;
+  nsCString mMimeType;
+  DataType mDataType;
+
+  DataCallbackHandler(nsBaseClipboard::GetNativeDataCallback&& aDataCallback,
+                      const nsACString& aMimeType,
+                      DataType aDataType = DATATYPE_RAW)
+      : mDataCallback(std::move(aDataCallback)),
+        mMimeType(aMimeType),
+        mDataType(aDataType) {
+    MOZ_COUNT_CTOR(DataCallbackHandler);
+    MOZ_CLIPBOARD_LOG("DataCallbackHandler created [%p] MIME %s type %d", this,
+                      mMimeType.get(), mDataType);
+  }
+  ~DataCallbackHandler() {
+    MOZ_CLIPBOARD_LOG("DataCallbackHandler deleted [%p]", this);
+    MOZ_COUNT_DTOR(DataCallbackHandler);
+  }
+};
+
+using WebCustomFormatMapCallback =
+    mozilla::MoveOnlyFunction<void(mozilla::widget::WebCustomFormatMap&&)>;
+static void AsyncGetWebCustomFormatMapImpl(
+    int32_t aWhichClipboard, WebCustomFormatMapCallback&& aCallback) {
+  MOZ_CLIPBOARD_LOG("AsyncGetWebCustomFormatMapImpl() type '%s'",
+                    aWhichClipboard == nsClipboard::kSelectionClipboard
+                        ? "primary"
+                        : "clipboard");
+  auto* heapCallback = new WebCustomFormatMapCallback(std::move(aCallback));
+  gtk_clipboard_request_contents(
+      gtk_clipboard_get(GetSelectionAtom(aWhichClipboard)),
+      gdk_atom_intern(kWebCustomFormatMapTarget, FALSE),
+      [](GtkClipboard*, GtkSelectionData* aSelection, gpointer aData) -> void {
+        mozilla::UniquePtr<WebCustomFormatMapCallback> cb(
+            static_cast<WebCustomFormatMapCallback*>(aData));
+        mozilla::widget::WebCustomFormatMap map;
+        int dataLength = gtk_selection_data_get_length(aSelection);
+        if (dataLength > 0) {
+          const char* data =
+              (const char*)gtk_selection_data_get_data(aSelection);
+          if (data) {
+            mozilla::widget::JSONToWebCustomFormatMap(
+                nsDependentCSubstring(data, dataLength), map);
+          }
+        }
+        (*cb)(std::move(map));
+      },
+      heapCallback);
+}
+
+static void AsyncGetTextImpl(
+    int32_t aWhichClipboard,
+    nsBaseClipboard::GetNativeDataCallback&& aCallback) {
+  MOZ_CLIPBOARD_LOG("AsyncGetText() type '%s'",
+                    aWhichClipboard == nsClipboard::kSelectionClipboard
+                        ? "primary"
+                        : "clipboard");
+
+  gtk_clipboard_request_text(
+      gtk_clipboard_get(GetSelectionAtom(aWhichClipboard)),
+      [](GtkClipboard* aClipboard, const gchar* aText, gpointer aData) -> void {
+        UniquePtr<DataCallbackHandler> ref(
+            static_cast<DataCallbackHandler*>(aData));
+        MOZ_CLIPBOARD_LOG("AsyncGetText async handler of [%p]", aData);
+
+        size_t dataLength = aText ? strlen(aText) : 0;
+        if (dataLength <= 0) {
+          MOZ_CLIPBOARD_LOG("  quit, text is not available");
+          ref->mDataCallback(nsCOMPtr<nsISupports>{});
+          return;
+        }
+
+        NS_ConvertUTF8toUTF16 utf16string(aText, dataLength);
+        nsLiteralCString flavor(kTextMime);
+
+        nsCOMPtr<nsISupports> wrapper;
+        nsPrimitiveHelpers::CreatePrimitiveForData(
+            flavor, (const char*)utf16string.BeginReading(),
+            utf16string.Length() * 2, getter_AddRefs(wrapper));
+
+        MOZ_CLIPBOARD_LOG("  text is set, length = %d", (int)dataLength);
+        ref->mDataCallback(wrapper);
+      },
+      new DataCallbackHandler(std::move(aCallback),
+                              nsLiteralCString(kTextMime)));
+}
+
+static void AsyncGetDataImpl(int32_t aWhichClipboard,
+                             const nsACString& aMimeType, DataType aDataType,
+                             nsBaseClipboard::GetNativeDataCallback&& aCallback,
+                             const nsACString& aTargetName = ""_ns) {
+  MOZ_CLIPBOARD_LOG("AsyncGetData() type '%s'",
+                    aWhichClipboard == nsClipboard::kSelectionClipboard
+                        ? "primary"
+                        : "clipboard");
+
+  const nsACString& targetName =
+      aTargetName.IsEmpty() ? aMimeType : aTargetName;
+  gtk_clipboard_request_contents(
+      gtk_clipboard_get(GetSelectionAtom(aWhichClipboard)),
+      gdk_atom_intern((aDataType == DATATYPE_FILE)
+                          ? kURIListMime
+                          : PromiseFlatCString(targetName).get(),
+                      FALSE),
+      [](GtkClipboard* aClipboard, GtkSelectionData* aSelection,
+         gpointer aData) -> void {
+        UniquePtr<DataCallbackHandler> ref(
+            static_cast<DataCallbackHandler*>(aData));
+        MOZ_CLIPBOARD_LOG("AsyncGetData async handler [%p] MIME %s type %d",
+                          aData, ref->mMimeType.get(), ref->mDataType);
+
+        int dataLength = gtk_selection_data_get_length(aSelection);
+        if (dataLength <= 0) {
+          ref->mDataCallback(nsCOMPtr<nsISupports>{});
+          return;
+        }
+        const char* data = (const char*)gtk_selection_data_get_data(aSelection);
+        if (!data) {
+          ref->mDataCallback(nsCOMPtr<nsISupports>{});
+          return;
+        }
+        switch (ref->mDataType) {
+          case DATATYPE_IMAGE: {
+            MOZ_CLIPBOARD_LOG("  get image clipboard data");
+            nsCOMPtr<nsIInputStream> byteStream;
+            NS_NewByteInputStream(getter_AddRefs(byteStream),
+                                  Span(data, dataLength), NS_ASSIGNMENT_COPY);
+            ref->mDataCallback(nsCOMPtr<nsISupports>(byteStream));
+            return;
+          }
+          case DATATYPE_FILE: {
+            MOZ_CLIPBOARD_LOG("  get file clipboard data");
+            nsDependentCSubstring uriList(data, dataLength);
+            if (nsCOMPtr<nsIFile> file = GetFileData(uriList)) {
+              MOZ_CLIPBOARD_LOG("  successfully get file data\n");
+              ref->mDataCallback(nsCOMPtr<nsISupports>(file));
+              return;
+            }
+            break;
+          }
+          case DATATYPE_HTML: {
+            MOZ_CLIPBOARD_LOG("  html clipboard data");
+            Span dataSpan(data, dataLength);
+            if (nsCOMPtr<nsISupports> data = GetHTMLData(dataSpan)) {
+              MOZ_CLIPBOARD_LOG("  successfully get HTML data\n");
+              ref->mDataCallback(nsCOMPtr<nsISupports>(data));
+              return;
+            }
+            break;
+          }
+          case DATATYPE_RAW: {
+            MOZ_CLIPBOARD_LOG("  raw clipboard data %s", ref->mMimeType.get());
+
+            nsCOMPtr<nsISupports> wrapper;
+            nsPrimitiveHelpers::CreatePrimitiveForData(
+                ref->mMimeType, data, dataLength, getter_AddRefs(wrapper));
+            ref->mDataCallback(nsCOMPtr<nsISupports>(wrapper));
+            return;
+          }
+        }
+        ref->mDataCallback(nsCOMPtr<nsISupports>{});
+      },
+      new DataCallbackHandler(std::move(aCallback), aMimeType, aDataType));
+}
+
+static void AsyncGetDataFlavor(
+    int32_t aWhichClipboard, const nsACString& aFlavorStr,
+    nsBaseClipboard::GetNativeDataCallback&& aCallback,
+    mozilla::Maybe<mozilla::widget::WebCustomFormatMap>&& aWebCustomFormatMap =
+        mozilla::Nothing()) {
+  if (aFlavorStr.EqualsLiteral(kWebCustomFormatMapType)) {
+    auto buildResult = [callback = std::move(aCallback)](
+                           mozilla::widget::WebCustomFormatMap&& map) mutable {
+      nsCOMPtr<nsIMutableArray> customFormats =
+          do_CreateInstance(NS_ARRAY_CONTRACTID);
+      for (const auto& essence : map.Keys()) {
+        nsCOMPtr<nsISupportsCString> customFormat =
+            do_CreateInstance(NS_SUPPORTS_CSTRING_CONTRACTID);
+        customFormat->SetData(nsLiteralCString(kWebCustomFormatPrefix) +
+                              essence);
+        customFormats->AppendElement(customFormat);
+      }
+      callback(nsCOMPtr<nsISupports>(std::move(customFormats)));
+    };
+    if (aWebCustomFormatMap.isSome()) {
+      buildResult(aWebCustomFormatMap.extract());
+      return;
+    }
+    AsyncGetWebCustomFormatMapImpl(aWhichClipboard, std::move(buildResult));
+    return;
+  }
+  if (StringBeginsWith(aFlavorStr, nsLiteralCString(kWebCustomFormatPrefix))) {
+    nsCString flavorCopy(aFlavorStr);
+    auto lookupAndFetch =
+        [aWhichClipboard, flavorCopy, callback = std::move(aCallback)](
+            mozilla::widget::WebCustomFormatMap&& map) mutable {
+          nsDependentCSubstring essence(
+              Substring(flavorCopy, strlen(kWebCustomFormatPrefix)));
+          auto entry = map.Lookup(essence);
+          if (!entry) {
+            callback(nsCOMPtr<nsISupports>{});
+            return;
+          }
+          AsyncGetDataImpl(aWhichClipboard, flavorCopy, DATATYPE_RAW,
+                           std::move(callback), entry.Data());
+        };
+    if (aWebCustomFormatMap.isSome()) {
+      lookupAndFetch(aWebCustomFormatMap.extract());
+      return;
+    }
+    AsyncGetWebCustomFormatMapImpl(aWhichClipboard, std::move(lookupAndFetch));
+    return;
+  }
+  if (aFlavorStr.EqualsLiteral(kJPEGImageMime) ||
+      aFlavorStr.EqualsLiteral(kJPGImageMime) ||
+      aFlavorStr.EqualsLiteral(kPNGImageMime) ||
+      aFlavorStr.EqualsLiteral(kGIFImageMime)) {
+    nsAutoCString flavor(aFlavorStr.EqualsLiteral(kJPGImageMime)
+                             ? kJPEGImageMime
+                             : PromiseFlatCString(aFlavorStr).get());
+    MOZ_CLIPBOARD_LOG("  Getting image %s MIME clipboard data", flavor.get());
+    AsyncGetDataImpl(aWhichClipboard, flavor, DATATYPE_IMAGE,
+                     std::move(aCallback));
+    return;
+  }
+  if (aFlavorStr.EqualsLiteral(kTextMime)) {
+    MOZ_CLIPBOARD_LOG("  Getting unicode clipboard data");
+    AsyncGetTextImpl(aWhichClipboard, std::move(aCallback));
+    return;
+  }
+  if (aFlavorStr.EqualsLiteral(kFileMime)) {
+    MOZ_CLIPBOARD_LOG("  Getting file clipboard data\n");
+    AsyncGetDataImpl(aWhichClipboard, aFlavorStr, DATATYPE_FILE,
+                     std::move(aCallback));
+    return;
+  }
+  if (aFlavorStr.EqualsLiteral(kHTMLMime)) {
+    MOZ_CLIPBOARD_LOG("  Getting HTML clipboard data");
+    AsyncGetDataImpl(aWhichClipboard, aFlavorStr, DATATYPE_HTML,
+                     std::move(aCallback));
+    return;
+  }
+  MOZ_CLIPBOARD_LOG("  Getting raw %s MIME clipboard data\n",
+                    PromiseFlatCString(aFlavorStr).get());
+  AsyncGetDataImpl(aWhichClipboard, aFlavorStr, DATATYPE_RAW,
+                   std::move(aCallback));
+}
+
+void nsClipboard::AsyncGetNativeClipboardData(
+    const nsACString& aFlavor, ClipboardType aWhichClipboard,
+    GetNativeDataCallback&& aCallback) {
+  MOZ_DIAGNOSTIC_ASSERT(
+      nsIClipboard::IsClipboardTypeSupported(aWhichClipboard));
+
+  MOZ_CLIPBOARD_LOG("nsClipboard::AsyncGetNativeClipboardData (%s) for %s",
+                    aWhichClipboard == nsClipboard::kSelectionClipboard
+                        ? "primary"
+                        : "clipboard",
+                    PromiseFlatCString(aFlavor).get());
+
+  if (widget::GdkIsX11Display()) {
+    AsyncHasNativeClipboardDataMatchingFlavorsWithMap(
+        nsTArray<nsCString>{PromiseFlatCString(aFlavor)}, aWhichClipboard,
+        [aWhichClipboard, flavorCopy = nsCString(aFlavor),
+         callback = std::move(aCallback)](
+            auto aResultOrError,
+            mozilla::Maybe<mozilla::widget::WebCustomFormatMap>
+                aWebCustomFormatMap) mutable {
+          if (aResultOrError.isErr()) {
+            callback(Err(aResultOrError.unwrapErr()));
+            return;
+          }
+
+          nsTArray<nsCString> clipboardFlavors =
+              std::move(aResultOrError.unwrap());
+          if (!clipboardFlavors.Length()) {
+            MOZ_CLIPBOARD_LOG("  no flavors in clipboard, quit.");
+            callback(nsCOMPtr<nsISupports>{});
+            return;
+          }
+
+          const bool isWebRequest =
+              flavorCopy.EqualsLiteral(kWebCustomFormatMapType) ||
+              StringBeginsWith(flavorCopy,
+                               nsLiteralCString(kWebCustomFormatPrefix));
+          const nsACString& fetchFlavor =
+              isWebRequest
+                  ? static_cast<const nsACString&>(flavorCopy)
+                  : static_cast<const nsACString&>(clipboardFlavors[0]);
+          AsyncGetDataFlavor(aWhichClipboard, fetchFlavor, std::move(callback),
+                             std::move(aWebCustomFormatMap));
+        });
+    return;
+  }
+
+  AsyncGetDataFlavor(aWhichClipboard, aFlavor, std::move(aCallback));
+}
+
+nsresult nsClipboard::EmptyNativeClipboardData(ClipboardType aWhichClipboard) {
+  MOZ_DIAGNOSTIC_ASSERT(
+      nsIClipboard::IsClipboardTypeSupported(aWhichClipboard));
+
+  MOZ_CLIPBOARD_LOG(
+      "nsClipboard::EmptyNativeClipboardData (%s)\n",
+      aWhichClipboard == kSelectionClipboard ? "primary" : "clipboard");
+  if (aWhichClipboard == kSelectionClipboard) {
+    if (mSelectionTransferable) {
+      gtk_clipboard_clear(gtk_clipboard_get(GDK_SELECTION_PRIMARY));
+      MOZ_ASSERT(!mSelectionTransferable);
+      MarkNextOwnerClipboardChange(aWhichClipboard,  true);
+    }
+  } else {
+    if (mGlobalTransferable) {
+      gtk_clipboard_clear(gtk_clipboard_get(GDK_SELECTION_CLIPBOARD));
+      MOZ_ASSERT(!mGlobalTransferable);
+      MarkNextOwnerClipboardChange(aWhichClipboard,  true);
+    }
+  }
+  ClearCachedTargets(aWhichClipboard);
+  return NS_OK;
+}
+
+void nsClipboard::ClearTransferable(int32_t aWhichClipboard) {
+  IncrementSequenceNumber(aWhichClipboard);
+  if (aWhichClipboard == kSelectionClipboard) {
+    mSelectionTransferable = nullptr;
+  } else {
+    mGlobalTransferable = nullptr;
+  }
+  WebCustomFormatMapFor(aWhichClipboard).Clear();
+}
+
+static bool FlavorMatchesTarget(const nsACString& aFlavor, GdkAtom aTarget) {
+  GUniquePtr<gchar> atom_name(gdk_atom_name(aTarget));
+  if (!atom_name) {
+    return false;
+  }
+  if (aFlavor.Equals(atom_name.get())) {
+    return true;
+  }
+  if (aFlavor.EqualsLiteral(kJPGImageMime) &&
+      !strcmp(atom_name.get(), kJPEGImageMime)) {
+    return true;
+  }
+  if (aFlavor.EqualsLiteral(kFileMime) &&
+      !strcmp(atom_name.get(), kURIListMime)) {
+    MOZ_CLIPBOARD_LOG(
+        "    has text/uri-list treating as application/x-moz-file");
+    return true;
+  }
+  return false;
+}
+
+mozilla::Result<bool, nsresult>
+nsClipboard::HasNativeClipboardDataMatchingFlavors(
+    const nsTArray<nsCString>& aFlavorList, ClipboardType aWhichClipboard) {
+  MOZ_DIAGNOSTIC_ASSERT(
+      nsIClipboard::IsClipboardTypeSupported(aWhichClipboard));
+
+  MOZ_CLIPBOARD_LOG(
+      "nsClipboard::HasNativeClipboardDataMatchingFlavors (%s)\n",
+      aWhichClipboard == kSelectionClipboard ? "primary" : "clipboard");
+
+  if (!mContext) {
+    MOZ_CLIPBOARD_LOG("    RetrievalContext is not available\n");
+    return Err(NS_ERROR_FAILURE);
+  }
+
+  auto targets = mContext->GetTargets(aWhichClipboard);
+  if (!targets) {
+    MOZ_CLIPBOARD_LOG("    no targes at clipboard (null)\n");
+    for (auto& flavor : aFlavorList) {
+      if (flavor.EqualsLiteral(kTextMime)) {
+        MOZ_CLIPBOARD_LOG("    try text data\n");
+        if (auto clipboardData = mContext->GetClipboardText(aWhichClipboard)) {
+          return true;
+        }
+        MOZ_CLIPBOARD_LOG("    no text data\n");
+      }
+    }
+    return false;
+  }
+
+#ifdef MOZ_LOGGING
+  if (MOZ_CLIPBOARD_LOG_ENABLED()) {
+    MOZ_CLIPBOARD_LOG("    Clipboard content (target nums %zu):\n",
+                      targets.AsSpan().Length());
+    for (const auto& target : targets.AsSpan()) {
+      GUniquePtr<gchar> atom_name(gdk_atom_name(target));
+      if (!atom_name) {
+        MOZ_CLIPBOARD_LOG("        failed to get MIME\n");
+        continue;
+      }
+      MOZ_CLIPBOARD_LOG("        MIME %s\n", atom_name.get());
+    }
+  }
+#endif
+
+  mozilla::widget::WebCustomFormatMap webCustomFormatMap;
+  bool didLoadWebCustomFormatMap = false;
+  auto loadWebCustomFormatMap = [&]() {
+    if (didLoadWebCustomFormatMap) {
+      return;
+    }
+    didLoadWebCustomFormatMap = true;
+    webCustomFormatMap = GetWebCustomFormatMapFromClipboard(aWhichClipboard);
+  };
+  GdkAtom webMapAtom = gdk_atom_intern(kWebCustomFormatMapTarget, FALSE);
+
+  for (auto& flavor : aFlavorList) {
+    if (flavor.EqualsLiteral(kWebCustomFormatMapType)) {
+      for (const auto& target : targets.AsSpan()) {
+        if (target == webMapAtom) {
+          return true;
+        }
+      }
+      continue;
+    }
+    if (StringBeginsWith(flavor, nsLiteralCString(kWebCustomFormatPrefix))) {
+      loadWebCustomFormatMap();
+      nsDependentCSubstring essence(
+          Substring(flavor, strlen(kWebCustomFormatPrefix)));
+      if (webCustomFormatMap.Lookup(essence)) {
+        return true;
+      }
+      continue;
+    }
+    if (flavor.EqualsLiteral(kTextMime) &&
+        gtk_targets_include_text(targets.AsSpan().data(),
+                                 targets.AsSpan().Length())) {
+      return true;
+    }
+    for (const auto& target : targets.AsSpan()) {
+      if (FlavorMatchesTarget(flavor, target)) {
+        return true;
+      }
+    }
+  }
+
+  MOZ_CLIPBOARD_LOG("    no matched targes at clipboard\n");
+  return false;
+}
+
+struct TargetCallbackHandler {
+  TargetCallbackHandler(
+      const nsTArray<nsCString>& aAcceptedFlavorList,
+      nsClipboard::HasMatchingFlavorsCallbackWithMap&& aCallback)
+      : mAcceptedFlavorList(aAcceptedFlavorList.Clone()),
+        mCallback(std::move(aCallback)) {
+    MOZ_CLIPBOARD_LOG("TargetCallbackHandler(%p) created", this);
+  }
+  ~TargetCallbackHandler() {
+    MOZ_CLIPBOARD_LOG("TargetCallbackHandler(%p) deleted", this);
+  }
+  nsTArray<nsCString> mAcceptedFlavorList;
+  nsClipboard::HasMatchingFlavorsCallbackWithMap mCallback;
+};
+
+void nsClipboard::AsyncHasNativeClipboardDataMatchingFlavors(
+    const nsTArray<nsCString>& aFlavorList, ClipboardType aWhichClipboard,
+    nsBaseClipboard::HasMatchingFlavorsCallback&& aCallback) {
+  AsyncHasNativeClipboardDataMatchingFlavorsWithMap(
+      aFlavorList, aWhichClipboard,
+      [callback = std::move(aCallback)](
+          mozilla::Result<nsTArray<nsCString>, nsresult> aResultOrError,
+          mozilla::Maybe<mozilla::widget::WebCustomFormatMap>
+          ) mutable { callback(std::move(aResultOrError)); });
+}
+
+void nsClipboard::AsyncHasNativeClipboardDataMatchingFlavorsWithMap(
+    const nsTArray<nsCString>& aFlavorList, ClipboardType aWhichClipboard,
+    nsClipboard::HasMatchingFlavorsCallbackWithMap&& aCallback) {
+  MOZ_DIAGNOSTIC_ASSERT(
+      nsIClipboard::IsClipboardTypeSupported(aWhichClipboard));
+
+  MOZ_CLIPBOARD_LOG(
+      "nsClipboard::AsyncHasNativeClipboardDataMatchingFlavors (%s)",
+      aWhichClipboard == kSelectionClipboard ? "primary" : "clipboard");
+
+  gtk_clipboard_request_contents(
+      gtk_clipboard_get(GetSelectionAtom(aWhichClipboard)),
+      gdk_atom_intern("TARGETS", FALSE),
+      [](GtkClipboard* aClipboard, GtkSelectionData* aSelection,
+         gpointer aData) -> void {
+        MOZ_CLIPBOARD_LOG("gtk_clipboard_request_contents async handler (%p)",
+                          aData);
+        UniquePtr<TargetCallbackHandler> handler(
+            static_cast<TargetCallbackHandler*>(aData));
+
+        if (gtk_selection_data_get_length(aSelection) > 0) {
+          GdkAtom* targets = nullptr;
+          gint targetsNum = 0;
+          gtk_selection_data_get_targets(aSelection, &targets, &targetsNum);
+
+          if (targetsNum > 0) {
+#ifdef MOZ_LOGGING
+            if (MOZ_CLIPBOARD_LOG_ENABLED()) {
+              MOZ_CLIPBOARD_LOG("    Clipboard content (target nums %d):\n",
+                                targetsNum);
+              for (int i = 0; i < targetsNum; i++) {
+                GUniquePtr<gchar> atom_name(gdk_atom_name(targets[i]));
+                if (!atom_name) {
+                  MOZ_CLIPBOARD_LOG("        failed to get MIME\n");
+                  continue;
+                }
+                MOZ_CLIPBOARD_LOG("        MIME %s\n", atom_name.get());
+              }
+            }
+#endif
+
+            GdkAtom webMapAtom =
+                gdk_atom_intern(kWebCustomFormatMapTarget, FALSE);
+            bool mapAtomPresent = false;
+            for (int i = 0; i < targetsNum; i++) {
+              if (targets[i] == webMapAtom) {
+                mapAtomPresent = true;
+                break;
+              }
+            }
+
+            nsTArray<nsCString> results;
+            bool needsMap = false;
+            for (auto& flavor : handler->mAcceptedFlavorList) {
+              if (mapAtomPresent &&
+                  (flavor.EqualsLiteral(kWebCustomFormatMapType) ||
+                   StringBeginsWith(
+                       flavor, nsLiteralCString(kWebCustomFormatPrefix)))) {
+                needsMap = true;
+                continue;
+              }
+              if (flavor.EqualsLiteral(kTextMime) &&
+                  gtk_targets_include_text(targets, targetsNum)) {
+                results.AppendElement(flavor);
+                continue;
+              }
+              for (int i = 0; i < targetsNum; i++) {
+                if (FlavorMatchesTarget(flavor, targets[i])) {
+                  results.AppendElement(flavor);
+                }
+              }
+            }
+
+            if (needsMap) {
+              mozilla::Maybe<nsIClipboard::ClipboardType> whichClipboard =
+                  GetGeckoClipboardType(aClipboard);
+              MOZ_ASSERT(whichClipboard.isSome());
+              AsyncGetWebCustomFormatMapImpl(
+                  *whichClipboard,
+                  [handler = std::move(handler), results = std::move(results)](
+                      mozilla::widget::WebCustomFormatMap&& map) mutable {
+                    for (const auto& flavor : handler->mAcceptedFlavorList) {
+                      if (flavor.EqualsLiteral(kWebCustomFormatMapType)) {
+                        for (const auto& essence : map.Keys()) {
+                          results.AppendElement(
+                              nsLiteralCString(kWebCustomFormatPrefix) +
+                              essence);
+                        }
+                      } else if (StringBeginsWith(
+                                     flavor, nsLiteralCString(
+                                                 kWebCustomFormatPrefix))) {
+                        nsDependentCSubstring essence(
+                            Substring(flavor, strlen(kWebCustomFormatPrefix)));
+                        if (map.Lookup(essence)) {
+                          results.AppendElement(flavor);
+                        }
+                      }
+                    }
+                    handler->mCallback(std::move(results),
+                                       mozilla::Some(std::move(map)));
+                  });
+              return;
+            }
+
+            handler->mCallback(std::move(results), mozilla::Nothing());
+            return;
+          }
+        }
+
+        MOZ_CLIPBOARD_LOG("    no targets found\n");
+        for (auto& flavor : handler->mAcceptedFlavorList) {
+          if (flavor.EqualsLiteral(kTextMime)) {
+            MOZ_CLIPBOARD_LOG("    try text data\n");
+            gtk_clipboard_request_text(
+                aClipboard,
+                [](GtkClipboard* aClipboard, const gchar* aText,
+                   gpointer aData) -> void {
+                  MOZ_CLIPBOARD_LOG(
+                      "gtk_clipboard_request_text async handler (%p)", aData);
+                  UniquePtr<TargetCallbackHandler> handler(
+                      static_cast<TargetCallbackHandler*>(aData));
+
+                  nsTArray<nsCString> results;
+                  if (aText) {
+                    results.AppendElement(kTextMime);
+                  }
+                  handler->mCallback(std::move(results), mozilla::Nothing());
+                },
+                handler.release());
+            return;
+          }
+        }
+
+        handler->mCallback(nsTArray<nsCString>{}, mozilla::Nothing());
+      },
+      new TargetCallbackHandler(aFlavorList, std::move(aCallback)));
+}
+
+nsITransferable* nsClipboard::GetTransferable(int32_t aWhichClipboard) {
+  nsITransferable* retval;
+
+  if (aWhichClipboard == kSelectionClipboard)
+    retval = mSelectionTransferable.get();
+  else
+    retval = mGlobalTransferable.get();
+
+  return retval;
+}
+
+void nsClipboard::SelectionGetEvent(GtkClipboard* aClipboard,
+                                    GtkSelectionData* aSelectionData) {
+  int32_t whichClipboard;
+
+  GdkAtom selection = gtk_selection_data_get_selection(aSelectionData);
+  if (selection == GDK_SELECTION_PRIMARY)
+    whichClipboard = kSelectionClipboard;
+  else if (selection == GDK_SELECTION_CLIPBOARD)
+    whichClipboard = kGlobalClipboard;
+  else
+    return;  
+
+  MOZ_CLIPBOARD_LOG(
+      "nsClipboard::SelectionGetEvent (%s)\n",
+      whichClipboard == kSelectionClipboard ? "primary" : "clipboard");
+
+  nsCOMPtr<nsITransferable> trans = GetTransferable(whichClipboard);
+  if (!trans) {
+    MOZ_CLIPBOARD_LOG(
+        "nsClipboard::SelectionGetEvent() - %s clipboard is empty!\n",
+        whichClipboard == kSelectionClipboard ? "Primary" : "Clipboard");
+    return;
+  }
+
+  nsresult rv;
+  nsCOMPtr<nsISupports> item;
+
+  GdkAtom selectionTarget = gtk_selection_data_get_target(aSelectionData);
+  MOZ_CLIPBOARD_LOG("  selection target %s\n",
+                    GUniquePtr<gchar>(gdk_atom_name(selectionTarget)).get());
+
+  if (gtk_targets_include_text(&selectionTarget, 1)) {
+    MOZ_CLIPBOARD_LOG("  providing text/plain data\n");
+    rv = trans->GetTransferData("text/plain", getter_AddRefs(item));
+    if (NS_FAILED(rv) || !item) {
+      MOZ_CLIPBOARD_LOG("  GetTransferData() failed to get text/plain!\n");
+      return;
+    }
+
+    nsCOMPtr<nsISupportsString> wideString;
+    wideString = do_QueryInterface(item);
+    if (!wideString) return;
+
+    nsAutoString ucs2string;
+    wideString->GetData(ucs2string);
+    NS_ConvertUTF16toUTF8 utf8string(ucs2string);
+
+    MOZ_CLIPBOARD_LOG("  sent %zd bytes of utf-8 data\n", utf8string.Length());
+    if (selectionTarget == gdk_atom_intern("text/plain;charset=utf-8", FALSE)) {
+      MOZ_CLIPBOARD_LOG(
+          "  using gtk_selection_data_set for 'text/plain;charset=utf-8'\n");
+      gtk_selection_data_set(aSelectionData, selectionTarget, 8,
+                             reinterpret_cast<const guchar*>(utf8string.get()),
+                             utf8string.Length());
+    } else {
+      gtk_selection_data_set_text(aSelectionData, utf8string.get(),
+                                  utf8string.Length());
+    }
+    return;
+  }
+
+  if (gtk_targets_include_image(&selectionTarget, 1, TRUE)) {
+    MOZ_CLIPBOARD_LOG("  providing image data\n");
+    static const char* const imageMimeTypes[] = {kNativeImageMime,
+                                                 kPNGImageMime, kJPEGImageMime,
+                                                 kJPGImageMime, kGIFImageMime};
+    nsCOMPtr<nsISupports> imageItem;
+    nsCOMPtr<imgIContainer> image;
+    for (auto imageMimeType : imageMimeTypes) {
+      rv = trans->GetTransferData(imageMimeType, getter_AddRefs(imageItem));
+      if (NS_FAILED(rv)) {
+        MOZ_CLIPBOARD_LOG("    %s is missing at GetTransferData()\n",
+                          imageMimeType);
+        continue;
+      }
+
+      image = do_QueryInterface(imageItem);
+      if (image) {
+        MOZ_CLIPBOARD_LOG("    %s is available at GetTransferData()\n",
+                          imageMimeType);
+        break;
+      }
+    }
+
+    if (!image) {  
+      MOZ_CLIPBOARD_LOG(
+          "    Failed to get any image mime from GetTransferData()!\n");
+      return;
+    }
+
+    RefPtr<GdkPixbuf> pixbuf = nsImageToPixbuf::ImageToPixbuf(image);
+    if (!pixbuf) {
+      MOZ_CLIPBOARD_LOG("    nsImageToPixbuf::ImageToPixbuf() failed!\n");
+      return;
+    }
+
+    MOZ_CLIPBOARD_LOG("    Setting pixbuf image data as %s\n",
+                      GUniquePtr<gchar>(gdk_atom_name(selectionTarget)).get());
+    gtk_selection_data_set_pixbuf(aSelectionData, pixbuf);
+    return;
+  }
+
+  if (selectionTarget == gdk_atom_intern(kHTMLMime, FALSE)) {
+    MOZ_CLIPBOARD_LOG("  providing %s data\n", kHTMLMime);
+    rv = trans->GetTransferData(kHTMLMime, getter_AddRefs(item));
+    if (NS_FAILED(rv) || !item) {
+      MOZ_CLIPBOARD_LOG("  failed to get %s data by GetTransferData()!\n",
+                        kHTMLMime);
+      return;
+    }
+
+    nsCOMPtr<nsISupportsString> wideString;
+    wideString = do_QueryInterface(item);
+    if (!wideString) {
+      MOZ_CLIPBOARD_LOG("  failed to get wideString interface!");
+      return;
+    }
+
+    nsAutoString ucs2string;
+    wideString->GetData(ucs2string);
+
+    nsAutoCString html;
+    html.AppendLiteral(kHTMLMarkupPrefix);
+    AppendUTF16toUTF8(ucs2string, html);
+
+    MOZ_CLIPBOARD_LOG("  Setting %zd bytes of %s data\n", html.Length(),
+                      GUniquePtr<gchar>(gdk_atom_name(selectionTarget)).get());
+    gtk_selection_data_set(aSelectionData, selectionTarget, 8,
+                           (const guchar*)html.get(), html.Length());
+    return;
+  }
+
+  if (selectionTarget == gdk_atom_intern(kURIListMime, FALSE)) {
+    MOZ_CLIPBOARD_LOG("  providing %s data\n", kURIListMime);
+    rv = trans->GetTransferData(kFileMime, getter_AddRefs(item));
+    if (NS_FAILED(rv) || !item) {
+      MOZ_CLIPBOARD_LOG("  failed to get %s data by GetTransferData()!\n",
+                        kFileMime);
+      return;
+    }
+
+    nsCOMPtr<nsIFile> file = do_QueryInterface(item);
+    if (!file) {
+      MOZ_CLIPBOARD_LOG("  failed to get nsIFile interface!");
+      return;
+    }
+
+    nsCOMPtr<nsIURI> fileURI;
+    rv = NS_NewFileURI(getter_AddRefs(fileURI), file);
+    if (NS_FAILED(rv)) {
+      MOZ_CLIPBOARD_LOG("  failed to get fileURI\n");
+      return;
+    }
+
+    nsAutoCString uri;
+    if (NS_FAILED(fileURI->GetSpec(uri))) {
+      MOZ_CLIPBOARD_LOG("  failed to get fileURI spec\n");
+      return;
+    }
+
+    MOZ_CLIPBOARD_LOG("  Setting %zd bytes of data\n", uri.Length());
+    gtk_selection_data_set(aSelectionData, selectionTarget, 8,
+                           (const guchar*)uri.get(), uri.Length());
+    return;
+  }
+
+  if (!StaticPrefs::clipboard_copyPrivateDataToClipboardCloudOrHistory() &&
+      selectionTarget == gdk_atom_intern(kKDEPasswordManagerHintMime, FALSE)) {
+    if (!trans->GetIsPrivateData()) {
+      MOZ_CLIPBOARD_LOG(
+          "  requested %s, but the data isn't actually private!\n",
+          kKDEPasswordManagerHintMime);
+      return;
+    }
+
+    static const char* kSecret = "secret";
+    MOZ_CLIPBOARD_LOG("  Setting data to '%s' for %s\n", kSecret,
+                      kKDEPasswordManagerHintMime);
+    gtk_selection_data_set(aSelectionData, selectionTarget, 8,
+                           (const guchar*)kSecret, strlen(kSecret));
+    return;
+  }
+
+  MOZ_CLIPBOARD_LOG("  Try if we have anything at GetTransferData() for %s\n",
+                    GUniquePtr<gchar>(gdk_atom_name(selectionTarget)).get());
+
+  GUniquePtr<gchar> target_name(gdk_atom_name(selectionTarget));
+  if (!target_name) {
+    MOZ_CLIPBOARD_LOG("  Failed to get target name!\n");
+    return;
+  }
+
+  const mozilla::widget::WebCustomFormatMap& webCustomFormatMap =
+      WebCustomFormatMapFor(whichClipboard);
+  if (!strcmp(target_name.get(), kWebCustomFormatMapTarget)) {
+    nsAutoCString json;
+    mozilla::widget::WebCustomFormatMapToJSON(webCustomFormatMap, json);
+    MOZ_CLIPBOARD_LOG("  Setting %zd bytes of web custom format map JSON\n",
+                      json.Length());
+    gtk_selection_data_set(aSelectionData, selectionTarget, 8,
+                           reinterpret_cast<const guchar*>(json.get()),
+                           json.Length());
+    return;
+  }
+  if (!strncmp(target_name.get(), kWebCustomFormatTargetPrefix,
+               strlen(kWebCustomFormatTargetPrefix))) {
+    for (const auto& entry : webCustomFormatMap) {
+      if (!strcmp(entry.GetData().get(), target_name.get())) {
+        nsAutoCString webFlavor(kWebCustomFormatPrefix);
+        webFlavor.Append(entry.GetKey());
+        nsCOMPtr<nsISupports> targetData;
+        if (NS_FAILED(trans->GetTransferData(webFlavor.get(),
+                                             getter_AddRefs(targetData))) ||
+            !targetData) {
+          MOZ_CLIPBOARD_LOG("  Failed to get %s data\n", webFlavor.get());
+          return;
+        }
+        nsCOMPtr<nsISupportsCString> cstr = do_QueryInterface(targetData);
+        if (!cstr) {
+          MOZ_CLIPBOARD_LOG("  %s isn't an nsISupportsCString\n",
+                            webFlavor.get());
+          return;
+        }
+        nsAutoCString bytes;
+        cstr->GetData(bytes);
+        MOZ_CLIPBOARD_LOG("  Setting %zd bytes for %s (target %s)\n",
+                          bytes.Length(), webFlavor.get(), target_name.get());
+        gtk_selection_data_set(aSelectionData, selectionTarget, 8,
+                               reinterpret_cast<const guchar*>(bytes.get()),
+                               bytes.Length());
+        return;
+      }
+    }
+    MOZ_CLIPBOARD_LOG("  No web custom format mapped to %s\n",
+                      target_name.get());
+    return;
+  }
+
+  rv = trans->GetTransferData(target_name.get(), getter_AddRefs(item));
+  if (NS_FAILED(rv) || !item) {
+    MOZ_CLIPBOARD_LOG("  Failed to get anything from GetTransferData()!\n");
+    return;
+  }
+
+  void* primitive_data = nullptr;
+  uint32_t dataLen = 0;
+  nsPrimitiveHelpers::CreateDataFromPrimitive(
+      nsDependentCString(target_name.get()), item, &primitive_data, &dataLen);
+  if (!primitive_data) {
+    MOZ_CLIPBOARD_LOG("  Failed to get primitive data!\n");
+    return;
+  }
+
+  MOZ_CLIPBOARD_LOG("  Setting %s as a primitive data type, %d bytes\n",
+                    target_name.get(), dataLen);
+  gtk_selection_data_set(aSelectionData, selectionTarget,
+                         8, 
+                         (const guchar*)primitive_data, dataLen);
+  free(primitive_data);
+}
+
+void nsClipboard::ClearCachedTargets(int32_t aWhichClipboard) {
+  if (mContext) {
+    mContext->ClearCachedTargets(aWhichClipboard);
+  }
+}
+
+void nsClipboard::SelectionClearEvent(GtkClipboard* aGtkClipboard) {
+  Maybe<ClipboardType> whichClipboard = GetGeckoClipboardType(aGtkClipboard);
+  if (whichClipboard.isNothing()) {
+    return;
+  }
+  MOZ_CLIPBOARD_LOG(
+      "nsClipboard::SelectionClearEvent (%s)\n",
+      *whichClipboard == kSelectionClipboard ? "primary" : "clipboard");
+  ClearCachedTargets(*whichClipboard);
+  ClearTransferable(*whichClipboard);
+  ClearClipboardCache(*whichClipboard);
+}
+
+void nsClipboard::OwnerChangedEvent(GtkClipboard* aGtkClipboard,
+                                    GdkEventOwnerChange* aEvent) {
+  Maybe<ClipboardType> whichClipboard = GetGeckoClipboardType(aGtkClipboard);
+  if (whichClipboard.isNothing()) {
+    return;
+  }
+
+  bool shouldIncrementSequence = !IsOurOwnerClipboardChange(*whichClipboard);
+  MarkNextOwnerClipboardChange(*whichClipboard,  false);
+
+  if (shouldIncrementSequence) {
+    IncrementSequenceNumber(*whichClipboard);
+  }
+
+  MOZ_CLIPBOARD_LOG(
+      "nsClipboard::OwnerChangedEvent (%s) %s sequence %d\n",
+      *whichClipboard == kSelectionClipboard ? "primary" : "clipboard",
+      shouldIncrementSequence ? "external change" : "internal change",
+      *whichClipboard == kSelectionClipboard ? mSelectionSequenceNumber
+                                             : mGlobalSequenceNumber);
+
+  ClearCachedTargets(*whichClipboard);
+}
+
+void clipboard_get_cb(GtkClipboard* aGtkClipboard,
+                      GtkSelectionData* aSelectionData, guint info,
+                      gpointer user_data) {
+  MOZ_CLIPBOARD_LOG("clipboard_get_cb() callback\n");
+  nsClipboard* clipboard = static_cast<nsClipboard*>(user_data);
+  clipboard->SelectionGetEvent(aGtkClipboard, aSelectionData);
+}
+
+void clipboard_clear_cb(GtkClipboard* aGtkClipboard, gpointer user_data) {
+  MOZ_CLIPBOARD_LOG("clipboard_clear_cb() callback\n");
+  nsClipboard* clipboard = static_cast<nsClipboard*>(user_data);
+  clipboard->SelectionClearEvent(aGtkClipboard);
+}
+
+void clipboard_owner_change_cb(GtkClipboard* aGtkClipboard,
+                               GdkEventOwnerChange* aEvent,
+                               gpointer aUserData) {
+  MOZ_CLIPBOARD_LOG("clipboard_owner_change_cb() callback\n");
+  nsClipboard* clipboard = static_cast<nsClipboard*>(aUserData);
+  clipboard->OwnerChangedEvent(aGtkClipboard, aEvent);
+}

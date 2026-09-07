@@ -1,0 +1,57 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_StyleSheetInfo_h
+#define mozilla_StyleSheetInfo_h
+
+#include "mozilla/CORSMode.h"
+#include "mozilla/dom/SRIMetadata.h"
+#include "nsIReferrerInfo.h"
+
+class nsIPrincipal;
+class nsIURI;
+
+namespace mozilla {
+class StyleSheet;
+struct StyleStylesheetContents;
+enum class StyleOrigin : uint8_t;
+struct URLExtraData;
+
+struct StyleSheetInfo final {
+  using ReferrerPolicy = dom::ReferrerPolicy;
+
+  StyleSheetInfo(CORSMode aCORSMode, const dom::SRIMetadata& aIntegrity,
+                 StyleOrigin);
+
+  StyleSheetInfo(StyleSheetInfo& aCopy, StyleSheet* aPrimarySheet);
+
+  ~StyleSheetInfo();
+
+  StyleSheetInfo* CloneFor(StyleSheet* aPrimarySheet);
+
+  void AddSheet(StyleSheet* aSheet);
+  [[nodiscard]] bool RemoveSheet(StyleSheet* aSheet);
+
+  size_t SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const;
+
+  const CORSMode mCORSMode;
+  dom::SRIMetadata mIntegrity;
+  bool mOriginClean = true;
+
+  nsTArray<RefPtr<StyleSheet>> mChildren;
+
+  nsCString mSourceMapURL;
+
+  RefPtr<const StyleStylesheetContents> mContents;
+
+  AutoTArray<StyleSheet*, 8> mSheets;
+
+#ifdef DEBUG
+  bool mPrincipalSet = false;
+#endif
+};
+
+}  
+
+#endif  // mozilla_StyleSheetInfo_h

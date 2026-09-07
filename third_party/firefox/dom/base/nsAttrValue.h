@@ -1,0 +1,364 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsAttrValue_h_
+#define nsAttrValue_h_
+
+#include <type_traits>
+
+#include "mozilla/AtomArray.h"
+#include "mozilla/EnumTypeTraits.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/StringBuffer.h"
+#include "nsAtom.h"
+#include "nsCaseTreatment.h"
+#include "nsColor.h"
+#include "nsMargin.h"
+#include "nsString.h"
+#include "nsStringFwd.h"
+#include "nsTArrayForwardDeclare.h"
+#include "nscore.h"
+
+class nsIPrincipal;
+class nsIURI;
+class nsStyledElement;
+struct MiscContainer;
+
+namespace mozilla {
+class DeclarationBlock;
+class ShadowParts;
+class SVGAnimatedIntegerPair;
+class SVGAnimatedLength;
+class SVGAnimatedNumberPair;
+class SVGAnimatedOrient;
+class SVGAnimatedPreserveAspectRatio;
+class SVGAnimatedViewBox;
+class SVGLengthList;
+class SVGNumberList;
+class SVGPathData;
+class SVGPointList;
+class SVGStringList;
+class SVGTransformList;
+
+struct AttrAtomArray {
+  AtomArray mArray;
+  mutable bool mMayContainDuplicates = false;
+  UniquePtr<AttrAtomArray> CreateDeduplicatedCopyIfDifferent() const {
+    if (!mMayContainDuplicates) {
+      return nullptr;
+    }
+    return CreateDeduplicatedCopyIfDifferentImpl();
+  }
+  bool operator==(const AttrAtomArray& aOther) const {
+    return mArray == aOther.mArray;
+  }
+
+  size_t ShallowSizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const {
+    return aMallocSizeOf(this) +
+           mArray.ShallowSizeOfExcludingThis(aMallocSizeOf);
+  }
+
+ private:
+  UniquePtr<AttrAtomArray> CreateDeduplicatedCopyIfDifferentImpl() const;
+};
+
+namespace dom {
+class DOMString;
+}
+}  
+
+#define NS_ATTRVALUE_MAX_STRINGLENGTH_ATOM 12
+
+const uintptr_t NS_ATTRVALUE_BASETYPE_MASK = 3;
+#define NS_ATTRVALUE_POINTERVALUE_MASK (~NS_ATTRVALUE_BASETYPE_MASK)
+
+#define NS_ATTRVALUE_INTEGERTYPE_BITS 4
+#define NS_ATTRVALUE_INTEGERTYPE_MASK \
+  (uintptr_t((1 << NS_ATTRVALUE_INTEGERTYPE_BITS) - 1))
+#define NS_ATTRVALUE_INTEGERTYPE_MULTIPLIER (1 << NS_ATTRVALUE_INTEGERTYPE_BITS)
+#define NS_ATTRVALUE_INTEGERTYPE_MAXVALUE \
+  ((1 << (31 - NS_ATTRVALUE_INTEGERTYPE_BITS)) - 1)
+#define NS_ATTRVALUE_INTEGERTYPE_MINVALUE \
+  (-NS_ATTRVALUE_INTEGERTYPE_MAXVALUE - 1)
+
+#define NS_ATTRVALUE_ENUMTABLEINDEX_BITS \
+  (32 - 16 - NS_ATTRVALUE_INTEGERTYPE_BITS)
+#define NS_ATTRVALUE_ENUMTABLE_VALUE_NEEDS_TO_UPPER \
+  (1 << (NS_ATTRVALUE_ENUMTABLEINDEX_BITS - 1))
+#define NS_ATTRVALUE_ENUMTABLEINDEX_MAXVALUE \
+  (NS_ATTRVALUE_ENUMTABLE_VALUE_NEEDS_TO_UPPER - 1)
+#define NS_ATTRVALUE_ENUMTABLEINDEX_MASK                      \
+  (uintptr_t((((1 << NS_ATTRVALUE_ENUMTABLEINDEX_BITS) - 1) & \
+              ~NS_ATTRVALUE_ENUMTABLE_VALUE_NEEDS_TO_UPPER)))
+
+class nsCheapString : public nsString {
+ public:
+  explicit nsCheapString(mozilla::StringBuffer* aBuf) {
+    if (aBuf) {
+      Assign(aBuf, aBuf->StorageSize() / sizeof(char16_t) - 1);
+    }
+  }
+};
+
+class nsAttrValue {
+  friend struct MiscContainer;
+
+ public:
+  enum ValueType {
+    eString = 0x00,   
+    eAtom = 0x02,     
+    eInteger = 0x03,  
+    eColor = 0x07,    
+    eEnum = 0x0B,     
+    ePercent = 0x0F,  
+    eCSSDeclaration = 0x10,
+    eURL,
+    eAtomArray,
+    eDoubleValue,
+    eShadowParts,
+    eSVGIntegerPair,
+    eSVGTypesBegin = eSVGIntegerPair,
+    eSVGOrient,
+    eSVGLength,
+    eSVGLengthList,
+    eSVGNumberList,
+    eSVGNumberPair,
+    eSVGPathData,
+    eSVGPointList,
+    eSVGPreserveAspectRatio,
+    eSVGStringList,
+    eSVGTransformList,
+    eSVGViewBox,
+    eSVGTypesEnd = eSVGViewBox,
+  };
+
+  nsAttrValue();
+  nsAttrValue(const nsAttrValue& aOther);
+  explicit nsAttrValue(const nsAString& aValue);
+  explicit nsAttrValue(nsAtom* aValue);
+  nsAttrValue(already_AddRefed<mozilla::DeclarationBlock> aValue,
+              const nsAString* aSerialized);
+  ~nsAttrValue();
+
+  inline const nsAttrValue& operator=(const nsAttrValue& aOther);
+
+  static void Init();
+  static void Shutdown();
+
+  inline ValueType Type() const;
+  inline bool StoresOwnData() const;
+
+  void Reset();
+
+  void SetTo(const nsAttrValue& aOther);
+  void SetTo(const nsAString& aValue);
+  void SetToAssumeUnset(already_AddRefed<mozilla::StringBuffer> aValue);
+  void SetTo(nsAtom* aValue);
+  void SetToAssumeUnset(already_AddRefed<nsAtom> aValue);
+  void SetTo(int16_t aInt);
+  void SetTo(int32_t aInt, const nsAString* aSerialized);
+  void SetTo(double aValue, const nsAString* aSerialized);
+  void SetTo(already_AddRefed<mozilla::DeclarationBlock> aValue,
+             const nsAString* aSerialized);
+  void SetTo(nsIURI* aValue, const nsAString* aSerialized);
+  void SetTo(const mozilla::SVGAnimatedIntegerPair& aValue,
+             const nsAString* aSerialized);
+  void SetTo(const mozilla::SVGAnimatedLength& aValue,
+             const nsAString* aSerialized);
+  void SetTo(const mozilla::SVGAnimatedNumberPair& aValue,
+             const nsAString* aSerialized);
+  void SetTo(const mozilla::SVGAnimatedOrient& aValue,
+             const nsAString* aSerialized);
+  void SetTo(const mozilla::SVGAnimatedPreserveAspectRatio& aValue,
+             const nsAString* aSerialized);
+  void SetTo(const mozilla::SVGAnimatedViewBox& aValue,
+             const nsAString* aSerialized);
+  void SetTo(const mozilla::SVGLengthList& aValue,
+             const nsAString* aSerialized);
+  void SetTo(const mozilla::SVGNumberList& aValue,
+             const nsAString* aSerialized);
+  void SetTo(const mozilla::SVGPathData& aValue, const nsAString* aSerialized);
+  void SetTo(const mozilla::SVGPointList& aValue, const nsAString* aSerialized);
+  void SetTo(const mozilla::SVGStringList& aValue,
+             const nsAString* aSerialized);
+  void SetTo(const mozilla::SVGTransformList& aValue,
+             const nsAString* aSerialized);
+
+  void SetToSerialized(const nsAttrValue& aValue);
+
+  void SwapValueWith(nsAttrValue& aOther);
+
+  void RemoveDuplicatesFromAtomArray();
+
+  void ToString(nsAString& aResult) const;
+  inline void ToString(mozilla::dom::DOMString& aResult) const;
+
+  already_AddRefed<nsAtom> GetAsAtom() const;
+
+  inline bool IsEmptyString() const;
+  const nsCheapString GetStringValue() const;
+  inline nsAtom* GetAtomValue() const;
+  inline int32_t GetIntegerValue() const;
+  bool GetColorValue(nscolor& aColor) const;
+  inline int16_t GetEnumValue() const;
+  inline double GetPercentValue() const;
+  inline const mozilla::AttrAtomArray* GetAtomArrayValue() const;
+  inline mozilla::DeclarationBlock* GetCSSDeclarationValue() const;
+  inline nsIURI* GetURLValue() const;
+  inline double GetDoubleValue() const;
+  inline const mozilla::ShadowParts& GetShadowPartsValue() const;
+
+  void GetEnumString(nsAString& aResult, bool aRealTag) const;
+
+  uint32_t GetAtomCount() const;
+  nsAtom* AtomAt(int32_t aIndex) const;
+
+  uint32_t HashValue() const;
+  bool Equals(const nsAttrValue& aOther) const;
+  bool Equals(const nsAString& aValue, nsCaseTreatment aCaseSensitive) const;
+  bool Equals(const nsAtom* aValue, nsCaseTreatment aCaseSensitive) const;
+  bool HasPrefix(const nsAString& aValue, nsCaseTreatment aCaseSensitive) const;
+  bool HasSuffix(const nsAString& aValue, nsCaseTreatment aCaseSensitive) const;
+  bool HasSubstring(const nsAString& aValue,
+                    nsCaseTreatment aCaseSensitive) const;
+
+  bool EqualsAsStrings(const nsAttrValue& aOther) const;
+
+  bool Contains(nsAtom* aValue, nsCaseTreatment aCaseSensitive) const;
+  bool Contains(const nsAString& aValue) const;
+
+  void ParseAtom(const nsAString& aValue);
+  void ParseAtomArray(const nsAString& aValue);
+  void ParseAtomArray(nsAtom* aValue);
+  void ParseStringOrAtom(const nsAString& aValue);
+
+  void ParsePartMapping(const nsAString&);
+
+  struct EnumTableEntry {
+
+    constexpr EnumTableEntry(const char* aTag, int16_t aValue)
+        : tag(aTag), value(aValue) {}
+
+    template <typename T, typename = std::enable_if_t<std::is_enum_v<T>>>
+    constexpr EnumTableEntry(const char* aTag, T aValue)
+        : tag(aTag), value(static_cast<int16_t>(aValue)) {
+      static_assert(mozilla::EnumTypeFitsWithin<T, int16_t>::value,
+                    "aValue must be an enum that fits within int16_t");
+    }
+
+    const char* tag;
+    int16_t value;
+  };
+
+  using EnumTableSpan = mozilla::Span<const EnumTableEntry>;
+  bool ParseEnumValue(const nsAString& aValue, EnumTableSpan aTable,
+                      bool aCaseSensitive,
+                      const EnumTableEntry* aDefaultValue = nullptr);
+
+  bool ParseHTMLDimension(const nsAString& aInput) {
+    return DoParseHTMLDimension(aInput, false);
+  }
+
+  bool ParseNonzeroHTMLDimension(const nsAString& aInput) {
+    return DoParseHTMLDimension(aInput, true);
+  }
+
+  bool ParseIntValue(const nsAString& aString) {
+    return ParseIntWithBounds(aString, INT32_MIN, INT32_MAX);
+  }
+
+  bool ParseIntWithBounds(const nsAString& aString, int32_t aMin,
+                          int32_t aMax = INT32_MAX);
+
+  void ParseIntWithFallback(const nsAString& aString, int32_t aDefault,
+                            int32_t aMax = INT32_MAX);
+
+  bool ParseNonNegativeIntValue(const nsAString& aString);
+
+  void ParseClampedNonNegativeInt(const nsAString& aString, int32_t aDefault,
+                                  int32_t aMin, int32_t aMax);
+
+  bool ParsePositiveIntValue(const nsAString& aString);
+
+  bool ParseColor(const nsAString& aString);
+
+  bool ParseDoubleValue(const nsAString& aString);
+
+  bool ParseStyleAttribute(const nsAString& aString,
+                           nsIPrincipal* aMaybeScriptedPrincipal,
+                           nsStyledElement* aElement);
+
+  size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) const;
+
+  nsAtom* GetStoredAtom() const;
+  mozilla::StringBuffer* GetStoredStringBuffer() const;
+
+ private:
+  enum ValueBaseType {
+    eStringBase = eString,  
+    eOtherBase = 0x01,      
+    eAtomBase = eAtom,      
+    eIntegerBase = 0x03     
+  };
+
+  inline ValueBaseType BaseType() const;
+  inline bool IsSVGType(ValueType aType) const;
+
+  int16_t GetEnumTableIndex(EnumTableSpan aTable);
+
+  inline void SetPtrValueAndType(void* aValue, ValueBaseType aType);
+  void SetIntValueAndType(int32_t aValue, ValueType aType,
+                          const nsAString* aStringValue);
+  void SetDoubleValueAndType(double aValue, ValueType aType,
+                             const nsAString* aStringValue);
+  bool SetColorValue(nscolor aColor, const nsAString& aString);
+  void SetMiscAtomOrString(const nsAString* aValue);
+  void ResetMiscAtomOrString();
+  void SetSVGType(ValueType aType, const void* aValue,
+                  const nsAString* aSerialized);
+  inline void ResetIfSet();
+
+  inline void* GetPtr() const;
+  inline MiscContainer* GetMiscContainer() const;
+  inline int32_t GetIntInternal() const;
+
+  MiscContainer* ClearMiscContainer();
+  MiscContainer* EnsureEmptyMiscContainer();
+  already_AddRefed<mozilla::StringBuffer> GetStringBuffer(
+      const nsAString& aValue) const;
+  int32_t EnumTableEntryToValue(EnumTableSpan aEnumTable,
+                                const EnumTableEntry& aTableEntry);
+
+  template <typename F>
+  bool SubstringCheck(const nsAString& aValue,
+                      nsCaseTreatment aCaseSensitive) const;
+
+  static MiscContainer* AllocMiscContainer();
+  static void DeallocMiscContainer(MiscContainer* aCont);
+
+  static nsTArray<EnumTableSpan>* sEnumTableArray;
+
+  bool DoParseHTMLDimension(const nsAString& aInput, bool aEnsureNonzero);
+
+  uintptr_t mBits;
+};
+
+inline const nsAttrValue& nsAttrValue::operator=(const nsAttrValue& aOther) {
+  SetTo(aOther);
+  return *this;
+}
+
+inline nsAttrValue::ValueBaseType nsAttrValue::BaseType() const {
+  return static_cast<ValueBaseType>(mBits & NS_ATTRVALUE_BASETYPE_MASK);
+}
+
+inline void* nsAttrValue::GetPtr() const {
+  NS_ASSERTION(BaseType() != eIntegerBase, "getting pointer from non-pointer");
+  return reinterpret_cast<void*>(mBits & NS_ATTRVALUE_POINTERVALUE_MASK);
+}
+
+inline bool nsAttrValue::IsEmptyString() const { return !mBits; }
+
+#endif

@@ -1,0 +1,11 @@
+//! Types for the `termios` module.
+
+#![allow(non_camel_case_types)]
+
+use crate::ffi;
+
+
+#[cfg(target_arch = "sparc")]
+pub type tcflag_t = ffi::c_ulong;
+#[cfg(not(target_arch = "sparc"))]
+pub type tcflag_t = ffi::c_uint;

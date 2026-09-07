@@ -1,0 +1,546 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+******************************************************************************
+*
+*   Copyright (C) 1997-2016, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+*
+******************************************************************************
+*
+* File CMEMORY.H
+*
+*  Contains stdlib.h/string.h memory functions
+*
+* @author       Bertrand A. Damiba
+*
+* Modification History:
+*
+*   Date        Name        Description
+*   6/20/98     Bertrand    Created.
+*  05/03/99     stephen     Changed from functions to macros.
+*
+******************************************************************************
+*/
+
+#ifndef CMEMORY_H
+#define CMEMORY_H
+
+#include "unicode/utypes.h"
+
+#include <stddef.h>
+#include <string.h>
+#include "unicode/localpointer.h"
+#include "uassert.h"
+
+#if U_DEBUG && defined(UPRV_MALLOC_COUNT)
+#include <stdio.h>
+#endif
+
+#if defined(__clang__)
+#define uprv_memcpy(dst, src, size) UPRV_BLOCK_MACRO_BEGIN { \
+     \
+    _Pragma("clang diagnostic push") \
+    _Pragma("clang diagnostic ignored \"-Waddress\"") \
+    U_ASSERT(dst != NULL); \
+    U_ASSERT(src != NULL); \
+    _Pragma("clang diagnostic pop") \
+    U_STANDARD_CPP_NAMESPACE memcpy(dst, src, size); \
+} UPRV_BLOCK_MACRO_END
+#define uprv_memmove(dst, src, size) UPRV_BLOCK_MACRO_BEGIN { \
+     \
+    _Pragma("clang diagnostic push") \
+    _Pragma("clang diagnostic ignored \"-Waddress\"") \
+    U_ASSERT(dst != NULL); \
+    U_ASSERT(src != NULL); \
+    _Pragma("clang diagnostic pop") \
+    U_STANDARD_CPP_NAMESPACE memmove(dst, src, size); \
+} UPRV_BLOCK_MACRO_END
+#elif defined(__GNUC__)
+#define uprv_memcpy(dst, src, size) UPRV_BLOCK_MACRO_BEGIN { \
+     \
+    _Pragma("GCC diagnostic push") \
+    _Pragma("GCC diagnostic ignored \"-Waddress\"") \
+    U_ASSERT(dst != NULL); \
+    U_ASSERT(src != NULL); \
+    _Pragma("GCC diagnostic pop") \
+    U_STANDARD_CPP_NAMESPACE memcpy(dst, src, size); \
+} UPRV_BLOCK_MACRO_END
+#define uprv_memmove(dst, src, size) UPRV_BLOCK_MACRO_BEGIN { \
+     \
+    _Pragma("GCC diagnostic push") \
+    _Pragma("GCC diagnostic ignored \"-Waddress\"") \
+    U_ASSERT(dst != NULL); \
+    U_ASSERT(src != NULL); \
+    _Pragma("GCC diagnostic pop") \
+    U_STANDARD_CPP_NAMESPACE memmove(dst, src, size); \
+} UPRV_BLOCK_MACRO_END
+#else
+#define uprv_memcpy(dst, src, size) UPRV_BLOCK_MACRO_BEGIN { \
+    U_ASSERT(dst != NULL); \
+    U_ASSERT(src != NULL); \
+    U_STANDARD_CPP_NAMESPACE memcpy(dst, src, size); \
+} UPRV_BLOCK_MACRO_END
+#define uprv_memmove(dst, src, size) UPRV_BLOCK_MACRO_BEGIN { \
+    U_ASSERT(dst != NULL); \
+    U_ASSERT(src != NULL); \
+    U_STANDARD_CPP_NAMESPACE memmove(dst, src, size); \
+} UPRV_BLOCK_MACRO_END
+#endif
+
+#define UPRV_LENGTHOF(array) (int32_t)(sizeof(array)/sizeof((array)[0]))
+#define uprv_memset(buffer, mark, size) U_STANDARD_CPP_NAMESPACE memset(buffer, mark, size)
+#define uprv_memcmp(buffer1, buffer2, size) U_STANDARD_CPP_NAMESPACE memcmp(buffer1, buffer2,size)
+#define uprv_memchr(ptr, value, num) U_STANDARD_CPP_NAMESPACE memchr(ptr, value, num)
+
+U_CAPI void * U_EXPORT2
+uprv_malloc(size_t s) U_MALLOC_ATTR U_ALLOC_SIZE_ATTR(1);
+
+U_CAPI void * U_EXPORT2
+uprv_realloc(void *mem, size_t size) U_ALLOC_SIZE_ATTR(2);
+
+U_CAPI void U_EXPORT2
+uprv_free(void *mem);
+
+U_CAPI void * U_EXPORT2
+uprv_calloc(size_t num, size_t size) U_MALLOC_ATTR U_ALLOC_SIZE_ATTR2(1,2);
+
+#define U_POINTER_MASK_LSB(ptr, mask) ((uintptr_t)(ptr) & (mask))
+
+#define STATIC_NEW(type) [] () { \
+    alignas(type) static char storage[sizeof(type)]; \
+    return new(storage) type();} ()
+
+U_CFUNC UBool 
+cmemory_cleanup(void);
+
+typedef void U_CALLCONV UObjectDeleter(void* obj);
+
+U_CAPI void U_EXPORT2
+uprv_deleteUObject(void *obj);
+
+#ifdef __cplusplus
+
+#include <utility>
+#include "unicode/uobject.h"
+
+U_NAMESPACE_BEGIN
+
+template<typename T>
+class LocalMemory : public LocalPointerBase<T> {
+public:
+    using LocalPointerBase<T>::operator*;
+    using LocalPointerBase<T>::operator->;
+    explicit LocalMemory(T *p=nullptr) : LocalPointerBase<T>(p) {}
+    LocalMemory(LocalMemory<T> &&src) noexcept : LocalPointerBase<T>(src.ptr) {
+        src.ptr=nullptr;
+    }
+    ~LocalMemory() {
+        uprv_free(LocalPointerBase<T>::ptr);
+    }
+    LocalMemory<T> &operator=(LocalMemory<T> &&src) noexcept {
+        uprv_free(LocalPointerBase<T>::ptr);
+        LocalPointerBase<T>::ptr=src.ptr;
+        src.ptr=nullptr;
+        return *this;
+    }
+    void swap(LocalMemory<T> &other) noexcept {
+        T *temp=LocalPointerBase<T>::ptr;
+        LocalPointerBase<T>::ptr=other.ptr;
+        other.ptr=temp;
+    }
+    friend inline void swap(LocalMemory<T> &p1, LocalMemory<T> &p2) noexcept {
+        p1.swap(p2);
+    }
+    void adoptInstead(T *p) {
+        uprv_free(LocalPointerBase<T>::ptr);
+        LocalPointerBase<T>::ptr=p;
+    }
+    inline T *allocateInsteadAndReset(int32_t newCapacity=1);
+    inline T *allocateInsteadAndCopy(int32_t newCapacity=1, int32_t length=0);
+    T &operator[](ptrdiff_t i) const { return LocalPointerBase<T>::ptr[i]; }
+};
+
+template<typename T>
+inline T *LocalMemory<T>::allocateInsteadAndReset(int32_t newCapacity) {
+    if(newCapacity>0) {
+        T *p=(T *)uprv_malloc(newCapacity*sizeof(T));
+        if(p!=nullptr) {
+            uprv_memset(p, 0, newCapacity*sizeof(T));
+            uprv_free(LocalPointerBase<T>::ptr);
+            LocalPointerBase<T>::ptr=p;
+        }
+        return p;
+    } else {
+        return nullptr;
+    }
+}
+
+
+template<typename T>
+inline T *LocalMemory<T>::allocateInsteadAndCopy(int32_t newCapacity, int32_t length) {
+    if(newCapacity>0) {
+        T *p=(T *)uprv_malloc(newCapacity*sizeof(T));
+        if(p!=nullptr) {
+            if(length>0) {
+                if(length>newCapacity) {
+                    length=newCapacity;
+                }
+                uprv_memcpy(p, LocalPointerBase<T>::ptr, (size_t)length*sizeof(T));
+            }
+            uprv_free(LocalPointerBase<T>::ptr);
+            LocalPointerBase<T>::ptr=p;
+        }
+        return p;
+    } else {
+        return nullptr;
+    }
+}
+
+template<typename T, int32_t stackCapacity>
+class MaybeStackArray {
+public:
+    static void* U_EXPORT2 operator new(size_t) noexcept = delete;
+    static void* U_EXPORT2 operator new[](size_t) noexcept = delete;
+    static void* U_EXPORT2 operator new(size_t, void*) noexcept = delete;
+
+    MaybeStackArray() : ptr(stackArray), capacity(stackCapacity), needToRelease(false) {}
+    MaybeStackArray(int32_t newCapacity, UErrorCode status) : MaybeStackArray() {
+        if (U_FAILURE(status)) {
+            return;
+        }
+        if (capacity < newCapacity) {
+            if (resize(newCapacity) == nullptr) {
+                status = U_MEMORY_ALLOCATION_ERROR;
+            }
+        }
+    }
+    ~MaybeStackArray() { releaseArray(); }
+    MaybeStackArray(MaybeStackArray<T, stackCapacity> &&src) noexcept;
+    MaybeStackArray<T, stackCapacity> &operator=(MaybeStackArray<T, stackCapacity> &&src) noexcept;
+    int32_t getCapacity() const { return capacity; }
+    T *getAlias() const { return ptr; }
+    T *getArrayLimit() const { return getAlias()+capacity; }
+    const T &operator[](ptrdiff_t i) const { return ptr[i]; }
+    T &operator[](ptrdiff_t i) { return ptr[i]; }
+    void aliasInstead(T *otherArray, int32_t otherCapacity) {
+        if(otherArray!=nullptr && otherCapacity>0) {
+            releaseArray();
+            ptr=otherArray;
+            capacity=otherCapacity;
+            needToRelease=false;
+        }
+    }
+    inline T *resize(int32_t newCapacity, int32_t length=0);
+    inline T *orphanOrClone(int32_t length, int32_t &resultCapacity);
+
+protected:
+    void copyFrom(const MaybeStackArray &src, UErrorCode &status) {
+        if (U_FAILURE(status)) {
+            return;
+        }
+        if (this->resize(src.capacity, 0) == nullptr) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+            return;
+        }
+        uprv_memcpy(this->ptr, src.ptr, (size_t)capacity * sizeof(T));
+    }
+
+private:
+    T *ptr;
+    int32_t capacity;
+    UBool needToRelease;
+    T stackArray[stackCapacity];
+    void releaseArray() {
+        if(needToRelease) {
+            uprv_free(ptr);
+        }
+    }
+    void resetToStackArray() {
+        ptr=stackArray;
+        capacity=stackCapacity;
+        needToRelease=false;
+    }
+    bool operator==(const MaybeStackArray & ) = delete;
+    bool operator!=(const MaybeStackArray & ) = delete;
+    MaybeStackArray(const MaybeStackArray & ) = delete;
+    void operator=(const MaybeStackArray & ) = delete;
+};
+
+template<typename T, int32_t stackCapacity>
+icu::MaybeStackArray<T, stackCapacity>::MaybeStackArray(
+        MaybeStackArray <T, stackCapacity>&& src) noexcept
+        : ptr(src.ptr), capacity(src.capacity), needToRelease(src.needToRelease) {
+    if (src.ptr == src.stackArray) {
+        ptr = stackArray;
+        uprv_memcpy(stackArray, src.stackArray, sizeof(T) * src.capacity);
+    } else {
+        src.resetToStackArray();  
+    }
+}
+
+template<typename T, int32_t stackCapacity>
+inline MaybeStackArray <T, stackCapacity>&
+MaybeStackArray<T, stackCapacity>::operator=(MaybeStackArray <T, stackCapacity>&& src) noexcept {
+    releaseArray();  
+    capacity = src.capacity;
+    needToRelease = src.needToRelease;
+    if (src.ptr == src.stackArray) {
+        ptr = stackArray;
+        uprv_memcpy(stackArray, src.stackArray, sizeof(T) * src.capacity);
+    } else {
+        ptr = src.ptr;
+        src.resetToStackArray();  
+    }
+    return *this;
+}
+
+template<typename T, int32_t stackCapacity>
+inline T *MaybeStackArray<T, stackCapacity>::resize(int32_t newCapacity, int32_t length) {
+    if(newCapacity>0) {
+#if U_DEBUG && defined(UPRV_MALLOC_COUNT)
+        ::fprintf(::stderr, "MaybeStackArray (resize) alloc %d * %lu\n", newCapacity, sizeof(T));
+#endif
+        T *p=(T *)uprv_malloc(newCapacity*sizeof(T));
+        if(p!=nullptr) {
+            if(length>0) {
+                if(length>capacity) {
+                    length=capacity;
+                }
+                if(length>newCapacity) {
+                    length=newCapacity;
+                }
+                uprv_memcpy(p, ptr, (size_t)length*sizeof(T));
+            }
+            releaseArray();
+            ptr=p;
+            capacity=newCapacity;
+            needToRelease=true;
+        }
+        return p;
+    } else {
+        return nullptr;
+    }
+}
+
+template<typename T, int32_t stackCapacity>
+inline T *MaybeStackArray<T, stackCapacity>::orphanOrClone(int32_t length, int32_t &resultCapacity) {
+    T *p;
+    if(needToRelease) {
+        p=ptr;
+    } else if(length<=0) {
+        return nullptr;
+    } else {
+        if(length>capacity) {
+            length=capacity;
+        }
+        p=(T *)uprv_malloc(length*sizeof(T));
+#if U_DEBUG && defined(UPRV_MALLOC_COUNT)
+      ::fprintf(::stderr,"MaybeStacArray (orphan) alloc %d * %lu\n", length,sizeof(T));
+#endif
+        if(p==nullptr) {
+            return nullptr;
+        }
+        uprv_memcpy(p, ptr, (size_t)length*sizeof(T));
+    }
+    resultCapacity=length;
+    resetToStackArray();
+    return p;
+}
+
+template<typename H, typename T, int32_t stackCapacity>
+class MaybeStackHeaderAndArray {
+public:
+    static void* U_EXPORT2 operator new(size_t) noexcept = delete;
+    static void* U_EXPORT2 operator new[](size_t) noexcept = delete;
+    static void* U_EXPORT2 operator new(size_t, void*) noexcept = delete;
+
+    MaybeStackHeaderAndArray() : ptr(&stackHeader), capacity(stackCapacity), needToRelease(false) {}
+    ~MaybeStackHeaderAndArray() { releaseMemory(); }
+    int32_t getCapacity() const { return capacity; }
+    H *getAlias() const { return ptr; }
+    T *getArrayStart() const { return reinterpret_cast<T *>(getAlias()+1); }
+    T *getArrayLimit() const { return getArrayStart()+capacity; }
+    operator H *() const { return ptr; }
+    T &operator[](ptrdiff_t i) { return getArrayStart()[i]; }
+    void aliasInstead(H *otherMemory, int32_t otherCapacity) {
+        if(otherMemory!=nullptr && otherCapacity>0) {
+            releaseMemory();
+            ptr=otherMemory;
+            capacity=otherCapacity;
+            needToRelease=false;
+        }
+    }
+    inline H *resize(int32_t newCapacity, int32_t length=0);
+    inline H *orphanOrClone(int32_t length, int32_t &resultCapacity);
+private:
+    H *ptr;
+    int32_t capacity;
+    UBool needToRelease;
+    H stackHeader;
+    T stackArray[stackCapacity];
+    void releaseMemory() {
+        if(needToRelease) {
+            uprv_free(ptr);
+        }
+    }
+    bool operator==(const MaybeStackHeaderAndArray & ) {return false;}
+    bool operator!=(const MaybeStackHeaderAndArray & ) {return true;}
+    MaybeStackHeaderAndArray(const MaybeStackHeaderAndArray & ) {}
+    void operator=(const MaybeStackHeaderAndArray & ) {}
+};
+
+template<typename H, typename T, int32_t stackCapacity>
+inline H *MaybeStackHeaderAndArray<H, T, stackCapacity>::resize(int32_t newCapacity,
+                                                                int32_t length) {
+    if(newCapacity>=0) {
+#if U_DEBUG && defined(UPRV_MALLOC_COUNT)
+      ::fprintf(::stderr,"MaybeStackHeaderAndArray alloc %d + %d * %ul\n", sizeof(H),newCapacity,sizeof(T));
+#endif
+        H *p=(H *)uprv_malloc(sizeof(H)+newCapacity*sizeof(T));
+        if(p!=nullptr) {
+            if(length<0) {
+                length=0;
+            } else if(length>0) {
+                if(length>capacity) {
+                    length=capacity;
+                }
+                if(length>newCapacity) {
+                    length=newCapacity;
+                }
+            }
+            uprv_memcpy(p, ptr, sizeof(H)+(size_t)length*sizeof(T));
+            releaseMemory();
+            ptr=p;
+            capacity=newCapacity;
+            needToRelease=true;
+        }
+        return p;
+    } else {
+        return nullptr;
+    }
+}
+
+template<typename H, typename T, int32_t stackCapacity>
+inline H *MaybeStackHeaderAndArray<H, T, stackCapacity>::orphanOrClone(int32_t length,
+                                                                       int32_t &resultCapacity) {
+    H *p;
+    if(needToRelease) {
+        p=ptr;
+    } else {
+        if(length<0) {
+            length=0;
+        } else if(length>capacity) {
+            length=capacity;
+        }
+#if U_DEBUG && defined(UPRV_MALLOC_COUNT)
+      ::fprintf(::stderr,"MaybeStackHeaderAndArray (orphan) alloc %ul + %d * %lu\n", sizeof(H),length,sizeof(T));
+#endif
+        p=(H *)uprv_malloc(sizeof(H)+length*sizeof(T));
+        if(p==nullptr) {
+            return nullptr;
+        }
+        uprv_memcpy(p, ptr, sizeof(H)+(size_t)length*sizeof(T));
+    }
+    resultCapacity=length;
+    ptr=&stackHeader;
+    capacity=stackCapacity;
+    needToRelease=false;
+    return p;
+}
+
+template<typename T, int32_t stackCapacity = 8>
+class MemoryPool : public UMemory {
+public:
+    MemoryPool() : fCount(0), fPool() {}
+
+    ~MemoryPool() {
+        for (int32_t i = 0; i < fCount; ++i) {
+            delete fPool[i];
+        }
+    }
+
+    MemoryPool(const MemoryPool&) = delete;
+    MemoryPool& operator=(const MemoryPool&) = delete;
+
+    MemoryPool(MemoryPool&& other) noexcept : fCount(other.fCount),
+                                                fPool(std::move(other.fPool)) {
+        other.fCount = 0;
+    }
+
+    MemoryPool& operator=(MemoryPool&& other) noexcept {
+        std::swap(fCount, other.fCount);
+        std::swap(fPool, other.fPool);
+        return *this;
+    }
+
+    template<typename... Args>
+    T* create(Args&&... args) {
+        int32_t capacity = fPool.getCapacity();
+        if (fCount == capacity &&
+            fPool.resize(capacity == stackCapacity ? 4 * capacity : 2 * capacity,
+                         capacity) == nullptr) {
+            return nullptr;
+        }
+        return fPool[fCount++] = new T(std::forward<Args>(args)...);
+    }
+
+    template <typename... Args>
+    T* createAndCheckErrorCode(UErrorCode &status, Args &&... args) {
+        if (U_FAILURE(status)) {
+            return nullptr;
+        }
+        T *pointer = this->create(args...);
+        if (U_SUCCESS(status) && pointer == nullptr) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+        }
+        return pointer;
+    }
+
+    int32_t count() const {
+        return fCount;
+    }
+
+protected:
+    int32_t fCount;
+    MaybeStackArray<T*, stackCapacity> fPool;
+};
+
+template<typename T, int32_t stackCapacity = 8>
+class MaybeStackVector : protected MemoryPool<T, stackCapacity> {
+public:
+    template<typename... Args>
+    T* emplaceBack(Args&&... args) {
+        return this->create(args...);
+    }
+
+    template <typename... Args>
+    T *emplaceBackAndCheckErrorCode(UErrorCode &status, Args &&... args) {
+        return this->createAndCheckErrorCode(status, args...);
+    }
+
+    int32_t length() const {
+        return this->fCount;
+    }
+
+    T** getAlias() {
+        return this->fPool.getAlias();
+    }
+
+    const T *const *getAlias() const {
+        return this->fPool.getAlias();
+    }
+
+    const T* operator[](ptrdiff_t i) const {
+        return this->fPool[i];
+    }
+
+    T* operator[](ptrdiff_t i) {
+        return this->fPool[i];
+    }
+};
+
+
+U_NAMESPACE_END
+
+#endif  /* __cplusplus */
+#endif  /* CMEMORY_H */

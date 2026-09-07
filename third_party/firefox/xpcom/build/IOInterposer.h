@@ -1,0 +1,131 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_IOInterposer_h
+#define mozilla_IOInterposer_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/TimeStamp.h"
+#include "nsString.h"
+
+namespace mozilla {
+
+class IOInterposeObserver {
+ public:
+  enum Operation {
+    OpNone = 0,
+    OpCreateOrOpen = (1 << 0),
+    OpRead = (1 << 1),
+    OpWrite = (1 << 2),
+    OpFSync = (1 << 3),
+    OpStat = (1 << 4),
+    OpClose = (1 << 5),
+    OpNextStage =
+        (1 << 6),  
+    OpWriteFSync = (OpWrite | OpFSync),
+    OpAll = (OpCreateOrOpen | OpRead | OpWrite | OpFSync | OpStat | OpClose),
+    OpAllWithStaging = (OpAll | OpNextStage)
+  };
+
+  class Observation {
+   protected:
+    Observation(Operation aOperation, const char* aReference,
+                bool aShouldReport = true);
+
+   public:
+    Observation(Operation aOperation, const TimeStamp& aStart,
+                const TimeStamp& aEnd, const char* aReference);
+
+    Operation ObservedOperation() const { return mOperation; }
+
+    const char* ObservedOperationString() const;
+
+    TimeStamp Start() const { return mStart; }
+
+    TimeStamp End() const { return mEnd; }
+
+    TimeDuration Duration() const { return mEnd - mStart; }
+
+    const char* Reference() const { return mReference; }
+
+    virtual const char* FileType() const { return "File"; }
+
+    virtual void Filename(nsAString& aString) { aString.Truncate(); }
+
+    virtual ~Observation() = default;
+
+   protected:
+    void Report();
+
+    Operation mOperation;
+    TimeStamp mStart;
+    TimeStamp mEnd;
+    const char* mReference;  
+    bool mShouldReport;      
+  };
+
+  virtual void Observe(Observation& aObservation) = 0;
+
+  virtual ~IOInterposeObserver() = default;
+
+ protected:
+  static bool IsMainThread();
+};
+
+namespace IOInterposer {
+
+bool Init();
+
+void Clear();
+
+void Disable();
+
+void Enable();
+
+void Report(IOInterposeObserver::Observation& aObservation);
+
+bool IsObservedOperation(IOInterposeObserver::Operation aOp);
+
+void Register(IOInterposeObserver::Operation aOp,
+              IOInterposeObserver* aStaticObserver);
+
+void Unregister(IOInterposeObserver::Operation aOp,
+                IOInterposeObserver* aStaticObserver);
+
+void RegisterCurrentThread(bool aIsMainThread = false);
+
+void UnregisterCurrentThread();
+
+void EnteringNextStage();
+
+}  
+
+class MOZ_RAII AutoIOInterposer {
+ public:
+  AutoIOInterposer() = default;
+
+  void Init() {
+#if defined(EARLY_BETA_OR_EARLIER)
+    IOInterposer::Init();
+#endif
+  }
+
+  ~AutoIOInterposer() {
+#if defined(EARLY_BETA_OR_EARLIER)
+    IOInterposer::Clear();
+#endif
+  }
+};
+
+class MOZ_RAII AutoIOInterposerDisable final {
+ public:
+  explicit AutoIOInterposerDisable() { IOInterposer::Disable(); }
+  ~AutoIOInterposerDisable() { IOInterposer::Enable(); }
+
+ private:
+};
+
+}  
+
+#endif  // mozilla_IOInterposer_h

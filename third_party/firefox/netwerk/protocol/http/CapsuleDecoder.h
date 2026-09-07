@@ -1,0 +1,37 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_net_capsule_decoder_h
+#define mozilla_net_capsule_decoder_h
+
+#include "mozilla/RefPtr.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/Span.h"
+
+namespace mozilla::net {
+
+class NeqoDecoder;
+
+class MOZ_STACK_CLASS CapsuleDecoder final {
+ public:
+  explicit CapsuleDecoder(const uint8_t* aData, size_t aLength);
+  ~CapsuleDecoder();
+
+  template <typename T>
+  Maybe<T> DecodeUint();
+
+  Maybe<uint64_t> DecodeVarint();
+  Maybe<mozilla::Span<const uint8_t>> Decode(size_t n);
+  mozilla::Span<const uint8_t> GetRemaining();
+  size_t BytesRemaining();
+
+  size_t CurrentPos();
+
+ private:
+  RefPtr<NeqoDecoder> mDecoder;
+};
+
+}  
+
+#endif

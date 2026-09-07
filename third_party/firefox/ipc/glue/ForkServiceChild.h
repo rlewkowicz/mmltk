@@ -1,0 +1,84 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef FORKSERVICE_CHILD_H_
+#define FORKSERVICE_CHILD_H_
+
+#include "base/process_util.h"
+#include "mozilla/GeckoArgs.h"
+#include "nsIObserver.h"
+#include "nsString.h"
+#include "mozilla/ipc/MiniTransceiver.h"
+#include "mozilla/ipc/LaunchError.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/Result.h"
+#include "mozilla/StaticMutex.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/ThreadSafety.h"
+
+#include <sys/types.h>
+#include <poll.h>
+
+namespace mozilla {
+namespace ipc {
+
+class GeckoChildProcessHost;
+
+class ForkServiceChild final {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(ForkServiceChild)
+  Result<Ok, LaunchError> SendForkNewSubprocess(
+      geckoargs::ChildProcessArgs&& aArgs, base::LaunchOptions&& aOptions,
+      pid_t* aPid) MOZ_EXCLUDES(mMutex);
+
+  struct ProcStatus {
+    int status;
+  };
+
+  Result<ProcStatus, int> SendWaitPid(pid_t aPid, bool aBlock);
+
+  static void StartForkServer();
+  static void StopForkServer();
+
+  static RefPtr<ForkServiceChild> Get();
+
+  static bool WasUsed() { return sForkServiceUsed; }
+
+ private:
+  ForkServiceChild(int aFd, GeckoChildProcessHost* aProcess);
+  ~ForkServiceChild();
+
+  void OnError() MOZ_REQUIRES(mMutex);
+
+  static StaticMutex sMutex;
+  static StaticRefPtr<ForkServiceChild> sSingleton MOZ_GUARDED_BY(sMutex);
+  static Atomic<bool> sForkServiceUsed;
+  Mutex mMutex;
+  UniquePtr<MiniTransceiver> mTcver MOZ_GUARDED_BY(mMutex);
+  bool mFailed MOZ_GUARDED_BY(mMutex);  
+  GeckoChildProcessHost* mProcess;
+};
+
+class ForkServerLauncher final : public nsIObserver {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+
+  ForkServerLauncher();
+  static already_AddRefed<ForkServerLauncher> Create();
+
+ private:
+  friend class ForkServiceChild;
+  ~ForkServerLauncher() = default;
+
+  static void RestartForkServer();
+
+  static bool sHaveStartedClient;
+  static StaticRefPtr<ForkServerLauncher> sSingleton;
+};
+
+}  
+}  
+
+#endif /* FORKSERVICE_CHILD_H_ */

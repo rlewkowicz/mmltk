@@ -1,0 +1,58 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef FLAC_FRAME_PARSER_H_
+#define FLAC_FRAME_PARSER_H_
+
+#include "MediaDecoder.h"  // For MetadataTags
+#include "MediaInfo.h"
+#include "MediaResource.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/Result.h"
+
+namespace mozilla {
+
+#define FLAC_MAX_CHANNELS 8
+#define FLAC_MIN_BLOCKSIZE 16
+#define FLAC_MAX_BLOCKSIZE 65535
+#define FLAC_MIN_FRAME_SIZE 11
+#define FLAC_MAX_FRAME_HEADER_SIZE 16
+#define FLAC_MAX_FRAME_SIZE \
+  (FLAC_MAX_FRAME_HEADER_SIZE + FLAC_MAX_BLOCKSIZE * FLAC_MAX_CHANNELS * 3)
+
+
+class FlacFrameParser {
+ public:
+  FlacFrameParser();
+  ~FlacFrameParser();
+
+  Result<bool, nsresult> IsHeaderBlock(const uint8_t* aPacket,
+                                       size_t aLength) const;
+  uint32_t HeaderBlockLength(const uint8_t* aPacket) const;
+  Result<Ok, nsresult> DecodeHeaderBlock(const uint8_t* aPacket,
+                                         size_t aLength);
+  bool HasFullMetadata() const { return mFullMetadata; }
+  int64_t BlockDuration(const uint8_t* aPacket, size_t aLength) const;
+
+  UniquePtr<MetadataTags> GetTags() const;
+
+  AudioInfo mInfo;
+
+ private:
+  bool ReconstructFlacGranulepos(void);
+  Maybe<uint32_t> mNumHeaders;
+  uint32_t mMinBlockSize;
+  uint32_t mMaxBlockSize;
+  uint32_t mMinFrameSize;
+  uint32_t mMaxFrameSize;
+  uint64_t mNumFrames;
+  bool mFullMetadata;
+  uint32_t mPacketCount;
+
+  MetadataTags mTags;
+};
+
+}  
+
+#endif  // FLAC_FRAME_PARSER_H_

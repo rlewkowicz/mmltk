@@ -1,0 +1,95 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "SampledAPZCState.h"
+#include "APZUtils.h"
+
+namespace mozilla {
+namespace layers {
+
+SampledAPZCState::SampledAPZCState() = default;
+
+SampledAPZCState::SampledAPZCState(const FrameMetrics& aMetrics)
+    : mLayoutViewport(aMetrics.GetLayoutViewport()),
+      mVisualScrollOffset(aMetrics.GetVisualScrollOffset()),
+      mZoom(aMetrics.GetZoom()) {
+  RemoveFractionalAsyncDelta();
+}
+
+SampledAPZCState::SampledAPZCState(
+    const FrameMetrics& aMetrics, Maybe<CompositionPayload>&& aPayload,
+    APZScrollGeneration aGeneration,
+    std::vector<CompositorScrollUpdate>&& aUpdates)
+    : mLayoutViewport(aMetrics.GetLayoutViewport()),
+      mVisualScrollOffset(aMetrics.GetVisualScrollOffset()),
+      mZoom(aMetrics.GetZoom()),
+      mScrollPayload(std::move(aPayload)),
+      mGeneration(aGeneration),
+      mUpdates(std::move(aUpdates)) {
+  RemoveFractionalAsyncDelta();
+}
+
+bool SampledAPZCState::operator==(const SampledAPZCState& aOther) const {
+  return mLayoutViewport.IsEqualEdges(aOther.mLayoutViewport) &&
+         mVisualScrollOffset == aOther.mVisualScrollOffset &&
+         mZoom == aOther.mZoom;
+}
+
+bool SampledAPZCState::operator!=(const SampledAPZCState& aOther) const {
+  return !(*this == aOther);
+}
+
+Maybe<CompositionPayload> SampledAPZCState::TakeScrollPayload() {
+  return std::move(mScrollPayload);
+}
+
+void SampledAPZCState::UpdateScrollProperties(const FrameMetrics& aMetrics) {
+  mLayoutViewport = aMetrics.GetLayoutViewport();
+  mVisualScrollOffset = aMetrics.GetVisualScrollOffset();
+}
+
+void SampledAPZCState::UpdateScrollPropertiesWithRelativeDelta(
+    const FrameMetrics& aMetrics, const CSSPoint& aRelativeDelta) {
+  mVisualScrollOffset += aRelativeDelta;
+  KeepLayoutViewportEnclosingVisualViewport(aMetrics);
+}
+
+void SampledAPZCState::UpdateZoomProperties(const FrameMetrics& aMetrics) {
+  mZoom = aMetrics.GetZoom();
+}
+
+void SampledAPZCState::ClampVisualScrollOffset(const FrameMetrics& aMetrics) {
+  CSSRect scrollRange = FrameMetrics::CalculateScrollRange(
+      aMetrics.GetScrollableRect(), aMetrics.GetCompositionBounds(), mZoom);
+  mVisualScrollOffset = scrollRange.ClampPoint(mVisualScrollOffset);
+
+  KeepLayoutViewportEnclosingVisualViewport(aMetrics);
+}
+
+void SampledAPZCState::ZoomBy(float aScale) { mZoom.scale *= aScale; }
+
+void SampledAPZCState::RemoveFractionalAsyncDelta() {
+  if (mLayoutViewport.TopLeft() == mVisualScrollOffset) {
+    return;
+  }
+  const ParentLayerCoord EPSILON = 0.01;
+  ParentLayerPoint paintedOffset = mLayoutViewport.TopLeft() * mZoom;
+  ParentLayerPoint asyncOffset = mVisualScrollOffset * mZoom;
+  if (FuzzyEqualsAdditive(paintedOffset.x, asyncOffset.x, EPSILON) &&
+      FuzzyEqualsAdditive(paintedOffset.y, asyncOffset.y, EPSILON)) {
+    mVisualScrollOffset = mLayoutViewport.TopLeft();
+  }
+}
+
+void SampledAPZCState::KeepLayoutViewportEnclosingVisualViewport(
+    const FrameMetrics& aMetrics) {
+  FrameMetrics::KeepLayoutViewportEnclosingVisualViewport(
+      CSSRect(mVisualScrollOffset,
+              FrameMetrics::CalculateCompositedSizeInCssPixels(
+                  aMetrics.GetCompositionBounds(), mZoom)),
+      aMetrics.GetScrollableRect(), mLayoutViewport);
+}
+
+}  
+}  

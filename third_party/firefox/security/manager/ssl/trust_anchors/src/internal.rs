@@ -1,0 +1,223 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+use pkcs11_bindings::*;
+
+use smallvec::SmallVec;
+
+use crate::certdata::*;
+
+#[derive(Clone, Copy)]
+pub enum ObjectClass {
+    RootList = 1,
+    Certificate = 2,
+    Trust = 3,
+}
+
+#[derive(Clone, Copy)]
+pub struct ObjectHandle {
+    class: ObjectClass,
+    index: usize,
+}
+
+impl TryFrom<CK_OBJECT_HANDLE> for ObjectHandle {
+    type Error = ();
+    fn try_from(handle: CK_OBJECT_HANDLE) -> Result<Self, Self::Error> {
+        if let Ok(handle) = usize::try_from(handle) {
+            let index = handle >> 2;
+            let class = match handle & 3 {
+                1 if index == 0 => ObjectClass::RootList,
+                2 if index < BUILTINS.len() => ObjectClass::Certificate,
+                3 if index < BUILTINS.len() => ObjectClass::Trust,
+                _ => return Err(()),
+            };
+            Ok(ObjectHandle { class, index })
+        } else {
+            Err(())
+        }
+    }
+}
+
+impl From<ObjectHandle> for CK_OBJECT_HANDLE {
+    fn from(object_handle: ObjectHandle) -> CK_OBJECT_HANDLE {
+        match CK_OBJECT_HANDLE::try_from(object_handle.index) {
+            Ok(index) => (index << 2) | (object_handle.class as CK_OBJECT_HANDLE),
+            Err(_) => 0,
+        }
+    }
+}
+
+pub fn get_attribute(attribute: CK_ATTRIBUTE_TYPE, object: &ObjectHandle) -> Option<&'static [u8]> {
+    match object.class {
+        ObjectClass::RootList => get_root_list_attribute(attribute),
+        ObjectClass::Certificate => get_cert_attribute(attribute, &BUILTINS[object.index]),
+        ObjectClass::Trust => get_trust_attribute(attribute, &BUILTINS[object.index]),
+    }
+}
+
+fn get_root_list_attribute(attribute: CK_ATTRIBUTE_TYPE) -> Option<&'static [u8]> {
+    match attribute {
+        CKA_CLASS => Some(CKO_NSS_BUILTIN_ROOT_LIST_BYTES),
+        CKA_TOKEN => Some(CK_TRUE_BYTES),
+        CKA_PRIVATE => Some(CK_FALSE_BYTES),
+        CKA_MODIFIABLE => Some(CK_FALSE_BYTES),
+        CKA_LABEL => Some(&ROOT_LIST_LABEL[..]),
+        _ => None,
+    }
+}
+
+fn get_cert_attribute(attribute: CK_ATTRIBUTE_TYPE, cert: &Root) -> Option<&[u8]> {
+    match attribute {
+        CKA_CLASS => Some(CKO_CERTIFICATE_BYTES),
+        CKA_TOKEN => Some(CK_TRUE_BYTES),
+        CKA_PRIVATE => Some(CK_FALSE_BYTES),
+        CKA_MODIFIABLE => Some(CK_FALSE_BYTES),
+        CKA_LABEL => Some(cert.label.as_bytes()),
+        CKA_CERTIFICATE_TYPE => Some(CKC_X_509_BYTES),
+        CKA_SUBJECT => Some(cert.der_name()),
+        CKA_ID => Some(b"0\0"), 
+        CKA_ISSUER => Some(cert.der_name()),
+        CKA_SERIAL_NUMBER => Some(cert.der_serial()),
+        CKA_VALUE => Some(cert.der_cert),
+        nss::CKA_NSS_MOZILLA_CA_POLICY => cert.mozilla_ca_policy,
+        nss::CKA_NSS_SERVER_DISTRUST_AFTER => cert.server_distrust_after,
+        nss::CKA_NSS_EMAIL_DISTRUST_AFTER => cert.email_distrust_after,
+        _ => None,
+    }
+}
+
+fn get_trust_attribute(attribute: CK_ATTRIBUTE_TYPE, cert: &Root) -> Option<&[u8]> {
+    match attribute {
+        CKA_CLASS => Some(CKO_TRUST_BYTES),
+        CKA_TOKEN => Some(CK_TRUE_BYTES),
+        CKA_PRIVATE => Some(CK_FALSE_BYTES),
+        CKA_MODIFIABLE => Some(CK_FALSE_BYTES),
+        CKA_LABEL => Some(cert.label.as_bytes()),
+        CKA_NAME_HASH_ALGORITHM => Some(CKM_SHA256_BYTES),
+        CKA_HASH_OF_CERTIFICATE => Some(&cert.sha256[..]),
+        CKA_ISSUER => Some(cert.der_name()),
+        CKA_SERIAL_NUMBER => Some(cert.der_serial()),
+        nss::CKA_PKCS_TRUST_SERVER_AUTH => Some(cert.trust_server),
+        nss::CKA_PKCS_TRUST_CLIENT_AUTH => Some(CKT_TRUST_MUST_VERIFY_TRUST_BYTES),
+        nss::CKA_PKCS_TRUST_CODE_SIGNING => Some(CKT_TRUST_MUST_VERIFY_TRUST_BYTES),
+        nss::CKA_PKCS_TRUST_EMAIL_PROTECTION => Some(cert.trust_email),
+        _ => None,
+    }
+}
+
+pub type Query<'a> = [(CK_ATTRIBUTE_TYPE, &'a [u8])];
+pub type SearchResult = SmallVec<[ObjectHandle; 1]>;
+
+pub fn search(query: &Query) -> SearchResult {
+    for &(attr, value) in query {
+        if attr == CKA_SUBJECT || attr == CKA_ISSUER {
+            return search_by_name(value, query);
+        }
+    }
+
+    let mut results: SearchResult = SearchResult::default();
+
+    if match_root_list(query) {
+        results.push(ObjectHandle {
+            class: ObjectClass::RootList,
+            index: 0,
+        });
+    }
+
+    let mut maybe_cert = true;
+    let mut maybe_trust = true;
+    for &(attr, value) in query {
+        if attr == CKA_CLASS {
+            maybe_cert = value.eq(CKO_CERTIFICATE_BYTES);
+            maybe_trust = value.eq(CKO_TRUST_BYTES);
+            break;
+        }
+    }
+
+    if !(maybe_cert || maybe_trust) {
+        return results; 
+    }
+
+    for (index, builtin) in BUILTINS.iter().enumerate() {
+        if maybe_cert && match_cert(query, builtin) {
+            results.push(ObjectHandle {
+                class: ObjectClass::Certificate,
+                index,
+            });
+        }
+        if maybe_trust && match_trust(query, builtin) {
+            results.push(ObjectHandle {
+                class: ObjectClass::Trust,
+                index,
+            });
+        }
+    }
+    results
+}
+
+fn search_by_name(name: &[u8], query: &Query) -> SearchResult {
+    let mut results: SearchResult = SearchResult::default();
+
+    let index = match BUILTINS.binary_search_by_key(&name, |r| r.der_name()) {
+        Ok(index) => index,
+        _ => return results,
+    };
+
+    let mut min = index;
+    while min > 0 && name.eq(BUILTINS[min - 1].der_name()) {
+        min -= 1;
+    }
+
+    let mut max = index;
+    while max < BUILTINS.len() - 1 && name.eq(BUILTINS[max + 1].der_name()) {
+        max += 1;
+    }
+
+    for (index, builtin) in BUILTINS.iter().enumerate().take(max + 1).skip(min) {
+        if match_cert(query, builtin) {
+            results.push(ObjectHandle {
+                class: ObjectClass::Certificate,
+                index,
+            });
+        }
+        if match_trust(query, builtin) {
+            results.push(ObjectHandle {
+                class: ObjectClass::Trust,
+                index,
+            });
+        }
+    }
+
+    results
+}
+
+fn match_root_list(query: &Query) -> bool {
+    for &(typ, x) in query {
+        match get_root_list_attribute(typ) {
+            Some(y) if x.eq(y) => (),
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn match_cert(query: &Query, cert: &Root) -> bool {
+    for &(typ, x) in query {
+        match get_cert_attribute(typ, cert) {
+            Some(y) if x.eq(y) => (),
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn match_trust(query: &Query, cert: &Root) -> bool {
+    for &(typ, x) in query {
+        match get_trust_attribute(typ, cert) {
+            Some(y) if x.eq(y) => (),
+            _ => return false,
+        }
+    }
+    true
+}

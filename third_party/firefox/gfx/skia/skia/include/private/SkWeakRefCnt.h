@@ -1,0 +1,89 @@
+/*
+ * Copyright 2012 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkWeakRefCnt_DEFINED)
+#define SkWeakRefCnt_DEFINED
+
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkTypes.h"
+
+#include <atomic>
+#include <cstdint>
+
+class SK_API SkWeakRefCnt : public SkRefCnt {
+public:
+    SkWeakRefCnt() : SkRefCnt(), fWeakCnt(1) {}
+
+    ~SkWeakRefCnt() override {
+#if defined(SK_DEBUG)
+        SkASSERT(getWeakCnt() == 1);
+        fWeakCnt.store(0, std::memory_order_relaxed);
+#endif
+    }
+
+#if defined(SK_DEBUG)
+    int32_t getWeakCnt() const {
+        return fWeakCnt.load(std::memory_order_relaxed);
+    }
+#endif
+
+private:
+    int32_t atomic_conditional_acquire_strong_ref() const {
+        int32_t prev = fRefCnt.load(std::memory_order_relaxed);
+        do {
+            if (0 == prev) {
+                break;
+            }
+        } while(!fRefCnt.compare_exchange_weak(prev, prev+1, std::memory_order_acquire,
+                                                             std::memory_order_relaxed));
+        return prev;
+    }
+
+public:
+    [[nodiscard]] bool try_ref() const {
+        if (atomic_conditional_acquire_strong_ref() != 0) {
+            return true;
+        }
+        return false;
+    }
+
+    void weak_ref() const {
+        SkASSERT(getRefCnt() > 0);
+        SkASSERT(getWeakCnt() > 0);
+        (void)fWeakCnt.fetch_add(+1, std::memory_order_relaxed);
+    }
+
+    void weak_unref() const {
+        SkASSERT(getWeakCnt() > 0);
+        if (1 == fWeakCnt.fetch_add(-1, std::memory_order_acq_rel)) {
+#if defined(SK_DEBUG)
+            fWeakCnt.store(1, std::memory_order_relaxed);
+#endif
+            this->INHERITED::internal_dispose();
+        }
+    }
+
+    bool weak_expired() const {
+        return fRefCnt.load(std::memory_order_relaxed) == 0;
+    }
+
+protected:
+    virtual void weak_dispose() const {
+    }
+
+private:
+    void internal_dispose() const override {
+        weak_dispose();
+        weak_unref();
+    }
+
+    mutable std::atomic<int32_t> fWeakCnt;
+
+    using INHERITED = SkRefCnt;
+};
+
+#endif

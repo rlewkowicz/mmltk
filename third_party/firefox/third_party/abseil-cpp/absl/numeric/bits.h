@@ -1,0 +1,181 @@
+// Copyright 2020 The Abseil Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//     https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef ABSL_NUMERIC_BITS_H_
+#define ABSL_NUMERIC_BITS_H_
+
+#include <cstdint>
+#include <limits>
+#include <type_traits>
+
+#include "absl/base/config.h"
+
+#if ABSL_INTERNAL_CPLUSPLUS_LANG >= 202002L
+#include <bit>
+#endif
+
+#include "absl/base/attributes.h"
+#include "absl/base/internal/endian.h"
+#include "absl/numeric/internal/bits.h"
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+
+#if (defined(__cpp_lib_bitops) && __cpp_lib_bitops >= 201907L) &&     \
+    (!defined(_LIBCPP_VERSION) || _LIBCPP_VERSION >= 180000)
+using std::rotl;
+using std::rotr;
+
+#else
+
+template <class T>
+[[nodiscard]] constexpr std::enable_if_t<std::is_unsigned_v<T>, T> rotl(
+    T x, int s) noexcept {
+  return numeric_internal::RotateLeft(x, s);
+}
+
+template <class T>
+[[nodiscard]] constexpr std::enable_if_t<std::is_unsigned_v<T>, T> rotr(
+    T x, int s) noexcept {
+  return numeric_internal::RotateRight(x, s);
+}
+
+#endif
+
+#if (defined(__cpp_lib_bitops) && __cpp_lib_bitops >= 201907L)
+
+using std::countl_one;
+using std::countl_zero;
+using std::countr_one;
+using std::countr_zero;
+using std::popcount;
+
+#else
+
+template <class T>
+ABSL_INTERNAL_CONSTEXPR_CLZ inline std::enable_if_t<std::is_unsigned_v<T>, int>
+countl_zero(T x) noexcept {
+  return numeric_internal::CountLeadingZeroes(x);
+}
+
+template <class T>
+ABSL_INTERNAL_CONSTEXPR_CLZ inline std::enable_if_t<std::is_unsigned_v<T>, int>
+countl_one(T x) noexcept {
+  return countl_zero(static_cast<T>(~x));
+}
+
+template <class T>
+ABSL_INTERNAL_CONSTEXPR_CTZ inline std::enable_if_t<std::is_unsigned_v<T>, int>
+countr_zero(T x) noexcept {
+  return numeric_internal::CountTrailingZeroes(x);
+}
+
+template <class T>
+ABSL_INTERNAL_CONSTEXPR_CTZ inline std::enable_if_t<std::is_unsigned_v<T>, int>
+countr_one(T x) noexcept {
+  return countr_zero(static_cast<T>(~x));
+}
+
+template <class T>
+ABSL_INTERNAL_CONSTEXPR_POPCOUNT inline std::enable_if_t<std::is_unsigned_v<T>,
+                                                         int>
+popcount(T x) noexcept {
+  return numeric_internal::Popcount(x);
+}
+
+#endif
+
+#if (defined(__cpp_lib_int_pow2) && __cpp_lib_int_pow2 >= 202002L)
+
+using std::bit_ceil;
+using std::bit_floor;
+using std::bit_width;
+using std::has_single_bit;
+
+#else
+
+template <class T>
+constexpr inline std::enable_if_t<std::is_unsigned_v<T>, bool> has_single_bit(
+    T x) noexcept {
+  return x != 0 && (x & (x - 1)) == 0;
+}
+
+template <class T>
+ABSL_INTERNAL_CONSTEXPR_CLZ inline std::enable_if_t<std::is_unsigned_v<T>, int>
+bit_width(T x) noexcept {
+  return std::numeric_limits<T>::digits - countl_zero(x);
+}
+
+template <class T>
+ABSL_INTERNAL_CONSTEXPR_CLZ inline std::enable_if_t<std::is_unsigned_v<T>, T>
+bit_floor(T x) noexcept {
+  return x == 0 ? 0 : T{1} << (bit_width(x) - 1);
+}
+
+template <class T>
+ABSL_INTERNAL_CONSTEXPR_CLZ inline std::enable_if_t<std::is_unsigned_v<T>, T>
+bit_ceil(T x) {
+  return has_single_bit(x) ? T{1} << (bit_width(x) - 1)
+                           : numeric_internal::BitCeilNonPowerOf2(x);
+}
+
+#endif
+
+#if defined(__cpp_lib_endian) && __cpp_lib_endian >= 201907L
+
+using std::endian;
+
+#else
+
+enum class endian {
+  little,
+  big,
+#if defined(ABSL_IS_LITTLE_ENDIAN)
+  native = little
+#elif defined(ABSL_IS_BIG_ENDIAN)
+  native = big
+#else
+#error "Endian detection needs to be set up for this platform"
+#endif
+};
+
+#endif  // defined(__cpp_lib_endian) && __cpp_lib_endian >= 201907L
+
+#if defined(__cpp_lib_byteswap) && __cpp_lib_byteswap >= 202110L
+
+using std::byteswap;
+
+#else
+
+template <class T>
+[[nodiscard]] constexpr T byteswap(T x) noexcept {
+  static_assert(std::is_integral_v<T>,
+                "byteswap requires an integral argument");
+  static_assert(
+      sizeof(T) == 1 || sizeof(T) == 2 || sizeof(T) == 4 || sizeof(T) == 8,
+      "byteswap works only with 8, 16, 32, or 64-bit integers");
+  if constexpr (sizeof(T) == 1) {
+    return x;
+  } else if constexpr (sizeof(T) == 2) {
+    return static_cast<T>(gbswap_16(static_cast<uint16_t>(x)));
+  } else if constexpr (sizeof(T) == 4) {
+    return static_cast<T>(gbswap_32(static_cast<uint32_t>(x)));
+  } else if constexpr (sizeof(T) == 8) {
+    return static_cast<T>(gbswap_64(static_cast<uint64_t>(x)));
+  }
+}
+
+#endif  // defined(__cpp_lib_byteswap) && __cpp_lib_byteswap >= 202110L
+
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_NUMERIC_BITS_H_

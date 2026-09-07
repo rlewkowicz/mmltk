@@ -1,0 +1,812 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/Notification.h"
+
+#include <utility>
+
+#include "Navigator.h"
+#include "NotificationUtils.h"
+#include "mozilla/HoldDropJSObjects.h"
+#include "mozilla/OwningNonNull.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/dom/BindingUtils.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/Promise-inl.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/RootedDictionary.h"
+#include "mozilla/dom/ServiceWorkerGlobalScopeBinding.h"
+#include "mozilla/dom/WorkerRef.h"
+#include "mozilla/dom/WorkerRunnable.h"
+#include "mozilla/dom/WorkerScope.h"
+#include "mozilla/image/FetchDecodedImage.h"
+#include "mozilla/ipc/BackgroundChild.h"
+#include "mozilla/ipc/BackgroundUtils.h"
+#include "mozilla/ipc/PBackgroundChild.h"
+#include "nsContentPermissionHelper.h"
+#include "nsContentUtils.h"
+#include "nsGlobalWindowInner.h"
+#include "nsIContentPermissionPrompt.h"
+#include "nsIScriptError.h"
+#include "nsNetUtil.h"
+#include "nsStructuredCloneContainer.h"
+
+namespace mozilla::dom {
+
+using namespace notification;
+
+class NotificationPermissionRequest : public ContentPermissionRequestBase,
+                                      public nsIRunnable,
+                                      public nsINamed {
+ public:
+  NS_DECL_NSIRUNNABLE
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(NotificationPermissionRequest,
+                                           ContentPermissionRequestBase)
+
+  NS_IMETHOD Cancel(void) override;
+  NS_IMETHOD Allow(JS::Handle<JS::Value> choices) override;
+
+  NotificationPermissionRequest(nsIPrincipal* aPrincipal,
+                                nsIPrincipal* aEffectiveStoragePrincipal,
+                                nsPIDOMWindowInner* aWindow, Promise* aPromise,
+                                NotificationPermissionCallback* aCallback)
+      : ContentPermissionRequestBase(aPrincipal, aWindow, "notification"_ns,
+                                     "desktop-notification"_ns),
+        mEffectiveStoragePrincipal(aEffectiveStoragePrincipal),
+        mPermission(NotificationPermission::Default),
+        mPromise(aPromise),
+        mCallback(aCallback) {
+    MOZ_ASSERT(aPromise);
+  }
+
+  NS_IMETHOD GetName(nsACString& aName) override {
+    aName.AssignLiteral("NotificationPermissionRequest");
+    return NS_OK;
+  }
+
+ protected:
+  ~NotificationPermissionRequest() = default;
+
+  MOZ_CAN_RUN_SCRIPT nsresult ResolvePromise();
+  nsresult DispatchResolvePromise();
+  nsCOMPtr<nsIPrincipal> mEffectiveStoragePrincipal;
+  NotificationPermission mPermission;
+  RefPtr<Promise> mPromise;
+  RefPtr<NotificationPermissionCallback> mCallback;
+};
+
+namespace {
+class GetPermissionRunnable final : public WorkerMainThreadRunnable {
+ public:
+  explicit GetPermissionRunnable(WorkerPrivate* aWorker,
+                                 bool aUseRegularPrincipal,
+                                 PermissionCheckPurpose aPurpose)
+      : WorkerMainThreadRunnable(aWorker, "Notification :: Get Permission"_ns),
+        mUseRegularPrincipal(aUseRegularPrincipal),
+        mPurpose(aPurpose) {}
+
+  bool MainThreadRun() override {
+    MOZ_ASSERT(mWorkerRef);
+    WorkerPrivate* workerPrivate = mWorkerRef->Private();
+    nsIPrincipal* principal = workerPrivate->GetPrincipal();
+    nsIPrincipal* effectiveStoragePrincipal =
+        mUseRegularPrincipal ? principal
+                             : workerPrivate->GetPartitionedPrincipal();
+    mPermission =
+        GetNotificationPermission(principal, effectiveStoragePrincipal,
+                                  workerPrivate->IsSecureContext(), mPurpose);
+    return true;
+  }
+
+  NotificationPermission GetPermission() { return mPermission; }
+
+ private:
+  NotificationPermission mPermission = NotificationPermission::Denied;
+  bool mUseRegularPrincipal;
+  PermissionCheckPurpose mPurpose;
+};
+
+}  
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED(NotificationPermissionRequest,
+                                   ContentPermissionRequestBase, mCallback,
+                                   mPromise)
+NS_IMPL_ADDREF_INHERITED(NotificationPermissionRequest,
+                         ContentPermissionRequestBase)
+NS_IMPL_RELEASE_INHERITED(NotificationPermissionRequest,
+                          ContentPermissionRequestBase)
+
+NS_IMPL_QUERY_INTERFACE_CYCLE_COLLECTION_INHERITED(
+    NotificationPermissionRequest, ContentPermissionRequestBase, nsIRunnable,
+    nsINamed)
+
+NS_IMETHODIMP
+NotificationPermissionRequest::Run() {
+  if (IsNotificationAllowedFor(mPrincipal)) {
+    mPermission = NotificationPermission::Granted;
+  } else if (IsNotificationForbiddenFor(
+                 mPrincipal, mEffectiveStoragePrincipal,
+                 mWindow->IsSecureContext(),
+                 PermissionCheckPurpose::PermissionRequest,
+                 mWindow->GetExtantDoc())) {
+    mPermission = NotificationPermission::Denied;
+  } else if (!StaticPrefs::dom_webnotifications_allowcrossoriginiframe() &&
+             !mPrincipal->Subsumes(mTopLevelPrincipal)) {
+    mPermission = NotificationPermission::Denied;
+  }
+
+  PromptResult pr = CheckPromptPrefs();
+  switch (pr) {
+    case PromptResult::Granted:
+      mPermission = NotificationPermission::Granted;
+      break;
+    case PromptResult::Denied:
+      mPermission = NotificationPermission::Denied;
+      break;
+    default:
+      break;
+  }
+
+  if (!mHasValidTransientUserGestureActivation &&
+      !StaticPrefs::dom_webnotifications_requireuserinteraction()) {
+    nsCOMPtr<Document> doc = mWindow->GetExtantDoc();
+    if (doc) {
+      doc->WarnOnceAbout(Document::eNotificationsRequireUserGestureDeprecation);
+    }
+  }
+
+  if (mPermission != NotificationPermission::Default) {
+    return DispatchResolvePromise();
+  }
+
+  return nsContentPermissionUtils::AskPermission(this, mWindow);
+}
+
+NS_IMETHODIMP
+NotificationPermissionRequest::Cancel() {
+  mPermission = NotificationPermission::Default;
+  return DispatchResolvePromise();
+}
+
+NS_IMETHODIMP
+NotificationPermissionRequest::Allow(JS::Handle<JS::Value> aChoices) {
+  MOZ_ASSERT(aChoices.isUndefined());
+
+  mPermission = NotificationPermission::Granted;
+  return DispatchResolvePromise();
+}
+
+inline nsresult NotificationPermissionRequest::DispatchResolvePromise() {
+  nsCOMPtr<nsIRunnable> resolver =
+      NewRunnableMethod("NotificationPermissionRequest::DispatchResolvePromise",
+                        this, &NotificationPermissionRequest::ResolvePromise);
+  return nsGlobalWindowInner::Cast(mWindow.get())->Dispatch(resolver.forget());
+}
+
+nsresult NotificationPermissionRequest::ResolvePromise() {
+  nsresult rv = NS_OK;
+  if (mPermission == NotificationPermission::Default) {
+    if (!mHasValidTransientUserGestureActivation &&
+        StaticPrefs::dom_webnotifications_requireuserinteraction()) {
+      nsCOMPtr<Document> doc = mWindow->GetExtantDoc();
+      if (doc) {
+        nsContentUtils::ReportToConsole(nsIScriptError::errorFlag, "DOM"_ns,
+                                        doc, PropertiesFile::DOM_PROPERTIES,
+                                        "NotificationsRequireUserGesture");
+      }
+    }
+
+    mPermission = GetRawNotificationPermission(mPrincipal);
+  }
+  if (mCallback) {
+    ErrorResult error;
+    RefPtr<NotificationPermissionCallback> callback(mCallback);
+    callback->Call(mPermission, error);
+    rv = error.StealNSResult();
+  }
+  mPromise->MaybeResolve(mPermission);
+  return rv;
+}
+
+bool Notification::PrefEnabled(JSContext* aCx, JSObject* aObj) {
+  return StaticPrefs::dom_webnotifications_enabled();
+}
+
+Notification::Notification(nsIGlobalObject* aGlobal,
+                           const IPCNotification& aIPCNotification,
+                           const nsAString& aScope)
+    : DOMEventTargetHelper(aGlobal),
+      mIPCNotification(aIPCNotification),
+      mData(JS::NullValue()),
+      mScope(aScope) {
+  KeepAliveIfHasListenersFor(nsGkAtoms::onclick);
+  KeepAliveIfHasListenersFor(nsGkAtoms::onshow);
+  KeepAliveIfHasListenersFor(nsGkAtoms::onerror);
+  KeepAliveIfHasListenersFor(nsGkAtoms::onclose);
+}
+
+already_AddRefed<Notification> Notification::Constructor(
+    const GlobalObject& aGlobal, const nsAString& aTitle,
+    const NotificationOptions& aOptions, ErrorResult& aRv) {
+  RefPtr<ServiceWorkerGlobalScope> scope;
+  UNWRAP_OBJECT(ServiceWorkerGlobalScope, aGlobal.Get(), scope);
+  if (scope) {
+    aRv.ThrowTypeError(
+        "Notification constructor cannot be used in ServiceWorkerGlobalScope. "
+        "Use registration.showNotification() instead.");
+    return nullptr;
+  }
+
+  nsCOMPtr<nsIGlobalObject> global = do_QueryInterface(aGlobal.GetAsSupports());
+  RefPtr<Notification> notification = ValidateAndCreate(
+      aGlobal.Context(), global, aTitle, aOptions, u""_ns, aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+
+  RefPtr<Promise> promise = Promise::CreateInfallible(global);
+  promise->AddCallbacksWithCycleCollectedArgs(
+      [](JSContext*, JS::Handle<JS::Value>, ErrorResult&,
+         Notification* aNotification) {
+        aNotification->DispatchTrustedEvent(u"show"_ns);
+      },
+      [](JSContext*, JS::Handle<JS::Value> aValue, ErrorResult&,
+         Notification* aNotification) {
+        aNotification->DispatchTrustedEvent(u"error"_ns);
+        aNotification->Deactivate();
+      },
+      notification);
+
+  ContextInfo contextInfo = notification->GetContextInfo();
+  if (!notification->CreateActor(contextInfo)) {
+    notification->Deactivate();
+    aRv.ThrowUnknownError("Failed to create actor.");
+    return nullptr;
+  }
+
+  notification->LoadImageAndShow(promise, std::move(contextInfo));
+
+  notification->KeepAliveIfHasListenersFor(nsGkAtoms::onclick);
+  notification->KeepAliveIfHasListenersFor(nsGkAtoms::onshow);
+  notification->KeepAliveIfHasListenersFor(nsGkAtoms::onerror);
+  notification->KeepAliveIfHasListenersFor(nsGkAtoms::onclose);
+
+  return notification.forget();
+}
+
+Result<Ok, nsresult> ValidateBase64Data(const nsAString& aData) {
+  if (aData.IsEmpty()) {
+    return Ok();
+  }
+
+  RefPtr<nsStructuredCloneContainer> container =
+      new nsStructuredCloneContainer();
+  MOZ_TRY(container->InitFromBase64(aData, JS_STRUCTURED_CLONE_VERSION));
+
+  nsString result;
+  MOZ_TRY(container->GetDataAsBase64(result));
+
+  return Ok();
+}
+
+Result<already_AddRefed<Notification>, nsresult> Notification::ConstructFromIPC(
+    nsIGlobalObject* aGlobal, const IPCNotification& aIPCNotification,
+    const nsAString& aServiceWorkerRegistrationScope) {
+  MOZ_ASSERT(aGlobal);
+
+  MOZ_TRY(ValidateBase64Data(aIPCNotification.options().dataSerialized()));
+
+  RefPtr<Notification> notification = new Notification(
+      aGlobal, aIPCNotification, aServiceWorkerRegistrationScope);
+
+  return notification.forget();
+}
+
+void Notification::MaybeNotifyClose() {
+  if (mIsClosed) {
+    return;
+  }
+  mIsClosed = true;
+  DispatchTrustedEvent(u"close"_ns);
+}
+
+static Result<nsString, nsresult> SerializeDataAsBase64(
+    JSContext* aCx, JS::Handle<JS::Value> aData) {
+  if (aData.isNull()) {
+    return nsString();
+  }
+  RefPtr<nsStructuredCloneContainer> dataObjectContainer =
+      new nsStructuredCloneContainer();
+  MOZ_TRY(dataObjectContainer->InitFromJSVal(aData, aCx));
+
+  nsString result;
+  MOZ_TRY(dataObjectContainer->GetDataAsBase64(result));
+
+  return result;
+}
+
+already_AddRefed<Notification> Notification::ValidateAndCreate(
+    JSContext* aCx, nsIGlobalObject* aGlobal, const nsAString& aTitle,
+    const NotificationOptions& aOptions, const nsAString& aScope,
+    ErrorResult& aRv) {
+  MOZ_ASSERT(aGlobal);
+
+  JS::Rooted<JS::Value> data(aCx, aOptions.mData);
+  Result<nsString, nsresult> dataResult = SerializeDataAsBase64(aCx, data);
+  if (dataResult.isErr()) {
+    aRv = dataResult.unwrapErr();
+    return nullptr;
+  }
+
+  bool silent = false;
+  if (StaticPrefs::dom_webnotifications_silent_enabled()) {
+    silent = aOptions.mSilent;
+  }
+
+  nsTArray<uint32_t> vibrate;
+  if (StaticPrefs::dom_webnotifications_vibrate_enabled() &&
+      aOptions.mVibrate.WasPassed()) {
+    if (silent) {
+      aRv.ThrowTypeError(
+          "Silent notifications must not specify vibration patterns.");
+      return nullptr;
+    }
+
+    const OwningUnsignedLongOrUnsignedLongSequence& value =
+        aOptions.mVibrate.Value();
+    if (value.IsUnsignedLong()) {
+      AutoTArray<uint32_t, 1> array;
+      array.AppendElement(value.GetAsUnsignedLong());
+      vibrate = SanitizeVibratePattern(array);
+    } else {
+      vibrate = SanitizeVibratePattern(value.GetAsUnsignedLongSequence());
+    }
+  }
+
+  RefPtr<nsIURI> iconUrl = ResolveIconURL(aGlobal, aOptions.mIcon);
+
+  nsTArray<IPCNotificationAction> actions;
+  if (StaticPrefs::dom_webnotifications_actions_enabled()) {
+    for (const auto& entry : aOptions.mActions) {
+      IPCNotificationAction action;
+      action.name() = entry.mAction;
+      action.title() = entry.mTitle;
+      actions.AppendElement(std::move(action));
+      if (actions.Length() == kMaxActions) {
+        break;
+      }
+    }
+  }
+
+  IPCNotification ipcNotification(
+      nsString(), IPCNotificationOptions(
+                      nsString(aTitle), aOptions.mDir, nsString(aOptions.mLang),
+                      nsString(aOptions.mBody), nsString(aOptions.mTag),
+                      iconUrl, aOptions.mRequireInteraction, silent, vibrate,
+                      nsString(dataResult.unwrap()), actions));
+
+  RefPtr<Notification> notification =
+      new Notification(aGlobal, ipcNotification, aScope);
+  return notification.forget();
+}
+
+Notification::~Notification() { mozilla::DropJSObjects(this); }
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(Notification)
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_INHERITED(Notification,
+                                                DOMEventTargetHelper)
+  tmp->mData.setUndefined();
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_WEAK_PTR
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(Notification,
+                                                  DOMEventTargetHelper)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTION_TRACE_BEGIN_INHERITED(Notification,
+                                               DOMEventTargetHelper)
+  NS_IMPL_CYCLE_COLLECTION_TRACE_JS_MEMBER_CALLBACK(mData)
+NS_IMPL_CYCLE_COLLECTION_TRACE_END
+
+NS_IMPL_ADDREF_INHERITED(Notification, DOMEventTargetHelper)
+NS_IMPL_RELEASE_INHERITED(Notification, DOMEventTargetHelper)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(Notification)
+NS_INTERFACE_MAP_END_INHERITING(DOMEventTargetHelper)
+
+bool Notification::RequestPermissionEnabledForScope(JSContext* aCx,
+                                                    JSObject* ) {
+  return NS_IsMainThread();
+}
+
+already_AddRefed<Promise> Notification::RequestPermission(
+    const GlobalObject& aGlobal,
+    const Optional<OwningNonNull<NotificationPermissionCallback>>& aCallback,
+    ErrorResult& aRv) {
+  AssertIsOnMainThread();
+
+  nsCOMPtr<nsPIDOMWindowInner> window =
+      do_QueryInterface(aGlobal.GetAsSupports());
+  nsCOMPtr<nsIScriptObjectPrincipal> sop =
+      do_QueryInterface(aGlobal.GetAsSupports());
+  if (!sop || !window) {
+    aRv.Throw(NS_ERROR_UNEXPECTED);
+    return nullptr;
+  }
+
+  nsCOMPtr<nsIPrincipal> principal = sop->GetPrincipal();
+  nsCOMPtr<nsIPrincipal> effectiveStoragePrincipal =
+      sop->GetEffectiveStoragePrincipal();
+  if (!principal || !effectiveStoragePrincipal) {
+    aRv.Throw(NS_ERROR_UNEXPECTED);
+    return nullptr;
+  }
+
+  RefPtr<Promise> promise = Promise::Create(window->AsGlobal(), aRv);
+  if (aRv.Failed()) {
+    return nullptr;
+  }
+  NotificationPermissionCallback* permissionCallback = nullptr;
+  if (aCallback.WasPassed()) {
+    permissionCallback = &aCallback.Value();
+  }
+  nsCOMPtr<nsIRunnable> request =
+      new NotificationPermissionRequest(principal, effectiveStoragePrincipal,
+                                        window, promise, permissionCallback);
+
+  window->AsGlobal()->Dispatch(request.forget());
+
+  return promise.forget();
+}
+
+NotificationPermission Notification::GetPermission(const GlobalObject& aGlobal,
+                                                   ErrorResult& aRv) {
+  nsCOMPtr<nsIGlobalObject> global = do_QueryInterface(aGlobal.GetAsSupports());
+  return GetPermission(global, PermissionCheckPurpose::PermissionAttribute,
+                       aRv);
+}
+
+NotificationPermission Notification::GetPermission(
+    nsIGlobalObject* aGlobal, PermissionCheckPurpose aPurpose,
+    ErrorResult& aRv) {
+  if (NS_IsMainThread()) {
+    return GetPermissionInternal(aGlobal->GetAsInnerWindow(), aPurpose, aRv);
+  }
+
+  WorkerPrivate* worker = GetCurrentThreadWorkerPrivate();
+  MOZ_ASSERT(worker);
+  RefPtr<GetPermissionRunnable> r = new GetPermissionRunnable(
+      worker, worker->UseRegularPrincipal(), aPurpose);
+  r->Dispatch(worker, Canceling, aRv);
+  if (aRv.Failed()) {
+    return NotificationPermission::Denied;
+  }
+
+  return r->GetPermission();
+}
+
+NotificationPermission Notification::GetPermissionInternal(
+    nsPIDOMWindowInner* aWindow, PermissionCheckPurpose aPurpose,
+    ErrorResult& aRv) {
+  nsCOMPtr<nsIScriptObjectPrincipal> sop = do_QueryInterface(aWindow);
+  if (!sop) {
+    aRv.Throw(NS_ERROR_UNEXPECTED);
+    return NotificationPermission::Denied;
+  }
+
+  nsCOMPtr<nsIPrincipal> principal = sop->GetPrincipal();
+  nsCOMPtr<nsIPrincipal> effectiveStoragePrincipal =
+      sop->GetEffectiveStoragePrincipal();
+  if (!principal || !effectiveStoragePrincipal) {
+    aRv.Throw(NS_ERROR_UNEXPECTED);
+    return NotificationPermission::Denied;
+  }
+
+  return GetNotificationPermission(principal, effectiveStoragePrincipal,
+                                   aWindow->IsSecureContext(), aPurpose);
+}
+
+uint32_t Notification::MaxActions(const GlobalObject& aGlobal) {
+  return kMaxActions;
+}
+
+already_AddRefed<nsIURI> Notification::ResolveIconURL(
+    nsIGlobalObject* aGlobal, const nsACString& aIconUrl) {
+  nsresult rv = NS_OK;
+
+  if (aIconUrl.IsEmpty()) {
+    return nullptr;
+  }
+
+  nsCOMPtr<nsIURI> baseUri = aGlobal->GetBaseURI();
+  if (!baseUri) {
+    return nullptr;
+  }
+
+  nsCOMPtr<nsIURI> srcUri;
+  rv = NS_NewURI(getter_AddRefs(srcUri), aIconUrl, nullptr, baseUri);
+  if (NS_FAILED(rv)) {
+    return nullptr;
+  }
+
+  return srcUri.forget();
+}
+
+JSObject* Notification::WrapObject(JSContext* aCx,
+                                   JS::Handle<JSObject*> aGivenProto) {
+  return mozilla::dom::Notification_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+void Notification::Close() {
+  if (mIsClosed) {
+    return;
+  }
+  if (!mActor) {
+    CreateActor(GetContextInfo());
+  }
+  if (mActor) {
+    (void)mActor->SendClose();
+  }
+}
+
+bool Notification::RequireInteraction() const {
+  return mIPCNotification.options().requireInteraction();
+}
+
+bool Notification::Silent() const {
+  return mIPCNotification.options().silent();
+}
+
+void Notification::GetVibrate(nsTArray<uint32_t>& aRetval) const {
+  aRetval = mIPCNotification.options().vibrate().Clone();
+}
+
+void Notification::GetData(JSContext* aCx,
+                           JS::MutableHandle<JS::Value> aRetval) {
+  const nsString& dataSerialized = mIPCNotification.options().dataSerialized();
+  if (mData.isNull() && !dataSerialized.IsEmpty()) {
+    nsresult rv;
+    RefPtr<nsStructuredCloneContainer> container =
+        new nsStructuredCloneContainer();
+    rv = container->InitFromBase64(dataSerialized, JS_STRUCTURED_CLONE_VERSION);
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      aRetval.setNull();
+      return;
+    }
+
+    JS::Rooted<JS::Value> data(aCx);
+    rv = container->DeserializeToJsval(aCx, &data);
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      aRetval.setNull();
+      return;
+    }
+
+    if (data.isGCThing()) {
+      mozilla::HoldJSObjects(this);
+    }
+    mData = data;
+  }
+  if (mData.isNull()) {
+    aRetval.setNull();
+    return;
+  }
+
+  aRetval.set(mData);
+}
+
+void Notification::GetActions(nsTArray<NotificationAction>& aRetVal) {
+  aRetVal.Clear();
+  for (const IPCNotificationAction& entry :
+       mIPCNotification.options().actions()) {
+    RootedDictionary<NotificationAction> action(RootingCx());
+    action.mAction = entry.name();
+    action.mTitle = entry.title();
+    aRetVal.AppendElement(action);
+  }
+}
+
+already_AddRefed<Promise> Notification::ShowPersistentNotification(
+    JSContext* aCx, nsIGlobalObject* aGlobal, const nsAString& aScope,
+    const nsAString& aTitle, const NotificationOptions& aOptions,
+    const ServiceWorkerRegistrationDescriptor& aDescriptor, ErrorResult& aRv) {
+  MOZ_ASSERT(aGlobal);
+
+  RefPtr<Promise> p = Promise::Create(aGlobal, aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+
+  if (!aDescriptor.GetActive()) {
+    aRv.ThrowTypeError<MSG_NO_ACTIVE_WORKER>(NS_ConvertUTF16toUTF8(aScope));
+    return nullptr;
+  }
+
+  RefPtr<Notification> notification =
+      ValidateAndCreate(aCx, aGlobal, aTitle, aOptions, aScope, aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+
+  ContextInfo contextInfo = notification->GetContextInfo();
+  if (!notification->CreateActor(contextInfo)) {
+    aRv.ThrowUnknownError("Failed to create actor.");
+    return nullptr;
+  }
+  notification->LoadImageAndShow(p, std::move(contextInfo));
+
+  return p.forget();
+}
+
+Notification::ContextInfo Notification::GetContextInfo() {
+  if (WorkerPrivate* workerPrivate = GetCurrentThreadWorkerPrivate()) {
+    return {.mTarget = workerPrivate->HybridEventTarget(),
+            .mPrincipal = workerPrivate->GetPrincipal(),
+            .mEffectiveStoragePrincipal =
+                workerPrivate->GetEffectiveStoragePrincipal(),
+            .mIsSecureContext = workerPrivate->IsSecureContext()};
+  }
+
+  nsGlobalWindowInner* win = GetOwnerWindow();
+  return {
+      .mPrincipal = win->GetPrincipal(),
+      .mEffectiveStoragePrincipal = win->GetEffectiveStoragePrincipal(),
+      .mIsSecureContext = win->IsSecureContext(),
+  };
+}
+
+bool Notification::CreateActor(const ContextInfo& aInfo) {
+  mozilla::ipc::PBackgroundChild* backgroundActor =
+      mozilla::ipc::BackgroundChild::GetOrCreateForCurrentThread();
+
+
+  mozilla::ipc::Endpoint<notification::PNotificationParent> parentEndpoint;
+  mozilla::ipc::Endpoint<notification::PNotificationChild> childEndpoint;
+  notification::PNotification::CreateEndpoints(&parentEndpoint, &childEndpoint);
+
+  bool persistent = !mScope.IsEmpty();
+  RefPtr<nsPIDOMWindowInner> window = GetOwnerWindow();
+  mActor = new notification::NotificationChild(
+      persistent ? nullptr : this,
+      window ? window->GetWindowGlobalChild() : nullptr);
+
+  if (!childEndpoint.Bind(mActor, aInfo.mTarget)) {
+    return false;
+  }
+
+  (void)backgroundActor->SendCreateNotificationParent(
+      std::move(parentEndpoint), WrapNotNull(aInfo.mPrincipal),
+      WrapNotNull(aInfo.mEffectiveStoragePrincipal), aInfo.mIsSecureContext,
+      mScope, mIPCNotification);
+
+  return true;
+}
+
+void Notification::LoadImageAndShow(Promise* aPromise, ContextInfo&& aInfo) {
+  nsCOMPtr<nsIURI> uri = mIPCNotification.options().icon();
+  Maybe<ClientInfo> clientInfo = GetParentObject()->GetClientInfo();
+  if (!uri || clientInfo.isNothing()) {
+    SendShow(aPromise, Nothing());
+    return;
+  }
+
+  RefPtr<StrongWorkerRef> workerRef;
+  if (!NS_IsMainThread()) {
+    workerRef = StrongWorkerRef::Create(GetCurrentThreadWorkerPrivate(),
+                                        "Notification::LoadImageAndShow");
+    if (!workerRef) {
+      return;
+    }
+  }
+
+  using IPCImagePromise = mozilla::MozPromise<Maybe<IPCImage>, bool, true>;
+  InvokeAsync(
+      GetMainThreadSerialEventTarget(), __func__,
+      [uri, clientInfo, contextInfo = std::move(aInfo)]() {
+        NotificationPermission permission = GetNotificationPermission(
+            contextInfo.mPrincipal, contextInfo.mEffectiveStoragePrincipal,
+            contextInfo.mIsSecureContext,
+            PermissionCheckPurpose::LoadImageForShow);
+        if (permission != NotificationPermission::Granted) {
+          return image::FetchDecodedImagePromise::CreateAndReject(
+              NS_ERROR_FAILURE, __func__);
+        }
+
+        nsCOMPtr<nsIChannel> channel;
+        nsresult rv = NS_NewChannel(
+            getter_AddRefs(channel), uri, contextInfo.mPrincipal,
+            clientInfo.ref(), Maybe<dom::ServiceWorkerDescriptor>(),
+            nsILoadInfo::SEC_ALLOW_CROSS_ORIGIN_SEC_CONTEXT_IS_NULL,
+            nsIContentPolicy::TYPE_INTERNAL_IMAGE_NOTIFICATION);
+        if (NS_FAILED(rv)) {
+          return image::FetchDecodedImagePromise::CreateAndReject(rv, __func__);
+        }
+
+        return image::FetchDecodedImage(uri, channel, gfx::IntSize{});
+      })
+      ->Then(
+          GetMainThreadSerialEventTarget(), __func__,
+          [](already_AddRefed<imgIContainer> aImage) {
+            nsCOMPtr<imgIContainer> image(std::move(aImage));
+            if (RefPtr<mozilla::gfx::SourceSurface> surface =
+                    image->GetFrame(imgIContainer::FRAME_FIRST,
+                                    imgIContainer::FLAG_SYNC_DECODE |
+                                        imgIContainer::FLAG_ASYNC_NOTIFY)) {
+              if (RefPtr<mozilla::gfx::DataSourceSurface> dataSurface =
+                      surface->GetDataSurface()) {
+                return IPCImagePromise::CreateAndResolve(
+                    nsContentUtils::SurfaceToIPCImage(*dataSurface), __func__);
+              }
+            }
+
+            return IPCImagePromise::CreateAndResolve(Nothing(), __func__);
+          },
+          [](nsresult) {
+            return IPCImagePromise::CreateAndResolve(Nothing(), __func__);
+          })
+      ->Then(
+          GetCurrentSerialEventTarget(), __func__,
+          [self = RefPtr{this}, promise = RefPtr{aPromise},
+           workerRef = std::move(workerRef)](Maybe<IPCImage>&& aImage) {
+            self->SendShow(promise, std::move(aImage));
+          },
+          [](bool) {});
+}
+
+void Notification::SendShow(Promise* aPromise, Maybe<IPCImage>&& aIcon) {
+  if (mIsClosed) {
+    MOZ_ASSERT(mIPCNotification.options().icon(),
+               "Closure before SendShow can only happen with image resources");
+    return;
+  }
+
+  mActor->SendShow(std::move(aIcon))
+      ->Then(GetCurrentSerialEventTarget(), __func__,
+             [self = RefPtr{this}, promise = RefPtr(aPromise)](
+                 notification::PNotificationChild::ShowPromise::
+                     ResolveOrRejectValue&& aResult) {
+               if (aResult.IsReject()) {
+                 promise->MaybeRejectWithUnknownError(
+                     "Failed to open notification");
+                 self->Deactivate();
+                 return;
+               }
+
+               CopyableErrorResult rv = aResult.ResolveValue();
+               if (rv.Failed()) {
+                 promise->MaybeReject(std::move(rv));
+                 self->Deactivate();
+                 return;
+               }
+
+               if (promise) {
+                 promise->MaybeResolveWithUndefined();
+               } else {
+                 self->DispatchTrustedEvent(u"show"_ns);
+               }
+             });
+}
+
+void Notification::Deactivate() {
+  IgnoreKeepAliveIfHasListenersFor(nsGkAtoms::onclick);
+  IgnoreKeepAliveIfHasListenersFor(nsGkAtoms::onshow);
+  IgnoreKeepAliveIfHasListenersFor(nsGkAtoms::onerror);
+  IgnoreKeepAliveIfHasListenersFor(nsGkAtoms::onclose);
+  mIsClosed = true;
+  if (mActor) {
+    mActor->Close();
+    mActor = nullptr;
+  }
+}
+
+nsresult Notification::DispatchToMainThread(
+    already_AddRefed<nsIRunnable> aRunnable) {
+  if (WorkerPrivate* workerPrivate = GetCurrentThreadWorkerPrivate()) {
+    return workerPrivate->DispatchToMainThread(std::move(aRunnable));
+  }
+  AssertIsOnMainThread();
+  return NS_DispatchToCurrentThread(std::move(aRunnable));
+}
+
+}  

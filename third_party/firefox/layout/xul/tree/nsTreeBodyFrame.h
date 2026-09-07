@@ -1,0 +1,438 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsTreeBodyFrame_h
+#define nsTreeBodyFrame_h
+
+#include "SimpleXULLeafFrame.h"
+#include "imgINotificationObserver.h"
+#include "imgIRequest.h"
+#include "mozilla/AtomArray.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/LookAndFeel.h"
+#include "nsIReflowCallback.h"
+#include "nsIScrollbarMediator.h"
+#include "nsITimer.h"
+#include "nsITreeView.h"
+#include "nsScrollbarFrame.h"
+#include "nsTArray.h"
+#include "nsTHashMap.h"
+#include "nsTHashSet.h"
+#include "nsThreadUtils.h"
+#include "nsTreeColumns.h"
+#include "nsTreeStyleCache.h"
+
+class nsFontMetrics;
+class nsOverflowChecker;
+class nsTreeImageListener;
+
+namespace mozilla {
+class PresShell;
+class ScrollContainerFrame;
+namespace layout {
+class ScrollbarActivity;
+}  
+}  
+
+struct nsTreeImageCacheEntry {
+  nsTreeImageCacheEntry();
+  nsTreeImageCacheEntry(imgIRequest* aRequest, nsTreeImageListener* aListener);
+  ~nsTreeImageCacheEntry();
+
+  nsCOMPtr<imgIRequest> request;
+  RefPtr<nsTreeImageListener> listener;
+};
+
+class nsTreeBodyFrame final : public mozilla::SimpleXULLeafFrame,
+                              public nsIScrollbarMediator,
+                              public nsIReflowCallback {
+  typedef mozilla::layout::ScrollbarActivity ScrollbarActivity;
+  typedef mozilla::image::ImgDrawResult ImgDrawResult;
+
+ public:
+  explicit nsTreeBodyFrame(ComputedStyle* aStyle, nsPresContext* aPresContext);
+  ~nsTreeBodyFrame();
+
+  mozilla::IntrinsicSize GetIntrinsicSize() override;
+
+  NS_DECL_QUERYFRAME
+  NS_DECL_FRAMEARENA_HELPERS(nsTreeBodyFrame)
+
+  void OnImageIsAnimated(imgIRequest* aRequest);
+
+  already_AddRefed<nsTreeColumns> Columns() const {
+    RefPtr<nsTreeColumns> cols = mColumns;
+    return cols.forget();
+  }
+  already_AddRefed<nsITreeView> GetExistingView() const {
+    nsCOMPtr<nsITreeView> view = mView;
+    return view.forget();
+  }
+  already_AddRefed<nsITreeSelection> GetSelection() const;
+  nsresult GetView(nsITreeView** aView);
+  nsresult SetView(nsITreeView* aView);
+  bool GetFocused() const { return mFocused; }
+  nsresult SetFocused(bool aFocused);
+  nsresult GetTreeBody(mozilla::dom::Element** aElement);
+  int32_t RowHeight() const;
+  int32_t RowWidth();
+  mozilla::Maybe<mozilla::CSSIntRegion> GetSelectionRegion();
+  int32_t FirstVisibleRow() const { return mTopRowIndex; }
+  int32_t LastVisibleRow() const { return mTopRowIndex + mPageLength; }
+  int32_t PageLength() const { return mPageLength; }
+  nsresult EnsureRowIsVisible(int32_t aRow);
+  nsresult EnsureCellIsVisible(int32_t aRow, nsTreeColumn* aCol);
+  void ScrollToRow(int32_t aRow);
+  void ScrollByLines(int32_t aNumLines);
+  void ScrollByPages(int32_t aNumPages);
+  nsresult Invalidate();
+  nsresult InvalidateColumn(nsTreeColumn* aCol);
+  nsresult InvalidateRow(int32_t aRow);
+  nsresult InvalidateCell(int32_t aRow, nsTreeColumn* aCol);
+  nsresult InvalidateRange(int32_t aStart, int32_t aEnd);
+  int32_t GetRowAt(int32_t aX, int32_t aY);
+  nsresult GetCellAt(int32_t aX, int32_t aY, int32_t* aRow, nsTreeColumn** aCol,
+                     nsACString& aChildElt);
+  nsresult GetCoordsForCellItem(int32_t aRow, nsTreeColumn* aCol,
+                                const nsACString& aElt, int32_t* aX,
+                                int32_t* aY, int32_t* aWidth, int32_t* aHeight);
+  nsresult IsCellCropped(int32_t aRow, nsTreeColumn* aCol, bool* aResult);
+  nsresult RowCountChanged(int32_t aIndex, int32_t aCount);
+  nsresult BeginUpdateBatch();
+  nsresult EndUpdateBatch();
+  nsresult ClearStyleAndImageCaches();
+  void RemoveImageCacheEntry(int32_t aRowIndex, nsTreeColumn* aCol);
+
+  void CancelImageRequests();
+
+  void ManageReflowCallback();
+
+  void DidReflow(nsPresContext*, const ReflowInput*) override;
+
+  bool ReflowFinished() override;
+  void ReflowCallbackCanceled() override;
+
+  void ScrollByPage(nsScrollbarFrame* aScrollbar, int32_t aDirection,
+                    mozilla::ScrollSnapFlags aSnapFlags =
+                        mozilla::ScrollSnapFlags::Disabled) override;
+  void ScrollByWhole(nsScrollbarFrame* aScrollbar, int32_t aDirection,
+                     mozilla::ScrollSnapFlags aSnapFlags =
+                         mozilla::ScrollSnapFlags::Disabled) override;
+  void ScrollByLine(nsScrollbarFrame* aScrollbar, int32_t aDirection,
+                    mozilla::ScrollSnapFlags aSnapFlags =
+                        mozilla::ScrollSnapFlags::Disabled) override;
+  void ScrollByUnit(nsScrollbarFrame* aScrollbar, mozilla::ScrollMode aMode,
+                    int32_t aDirection, mozilla::ScrollUnit aUnit,
+                    mozilla::ScrollSnapFlags aSnapFlags =
+                        mozilla::ScrollSnapFlags::Disabled) override;
+  void RepeatButtonScroll(nsScrollbarFrame* aScrollbar) override;
+  void ThumbMoved(nsScrollbarFrame* aScrollbar, nscoord aOldPos,
+                  nscoord aNewPos) override;
+  void ScrollbarReleased(nsScrollbarFrame* aScrollbar) override {}
+  void VisibilityChanged(bool aVisible) override { Invalidate(); }
+  nsScrollbarFrame* GetScrollbarBox(bool aVertical) override {
+    ScrollParts parts = GetScrollParts();
+    return aVertical ? parts.mVScrollbar : nullptr;
+  }
+  void ScrollbarActivityStarted() const override;
+  void ScrollbarActivityStopped() const override;
+  bool IsScrollbarOnRight() const override {
+    return StyleVisibility()->mDirection == mozilla::StyleDirection::Ltr;
+  }
+  bool ShouldSuppressScrollbarRepaints() const override { return false; }
+
+  void Init(nsIContent* aContent, nsContainerFrame* aParent,
+            nsIFrame* aPrevInFlow) override;
+  void Destroy(DestroyContext&) override;
+
+  Cursor GetCursor(const nsPoint&) override;
+
+  nsresult HandleEvent(nsPresContext* aPresContext,
+                       mozilla::WidgetGUIEvent* aEvent,
+                       nsEventStatus* aEventStatus) override;
+
+  void BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                        const nsDisplayListSet& aLists) override;
+
+  void DidSetComputedStyle(ComputedStyle* aOldComputedStyle) override;
+
+  friend nsIFrame* NS_NewTreeBodyFrame(mozilla::PresShell* aPresShell);
+  friend class nsTreeColumn;
+
+  struct ScrollParts {
+    nsScrollbarFrame* mVScrollbar = nullptr;
+    RefPtr<mozilla::dom::Element> mVScrollbarContent;
+  };
+
+  ImgDrawResult PaintTreeBody(gfxContext& aRenderingContext,
+                              const nsRect& aDirtyRect, nsPoint aPt,
+                              nsDisplayListBuilder* aBuilder);
+
+  mozilla::dom::XULTreeElement* GetBaseElement();
+
+  bool GetVerticalOverflow() const { return mVerticalOverflow; }
+
+  const mozilla::AtomArray& GetPropertyArrayForCurrentDrawingItem() {
+    return mScratchArray;
+  }
+
+ protected:
+  friend class nsOverflowChecker;
+
+  ImgDrawResult PaintColumn(nsTreeColumn* aColumn, const nsRect& aColumnRect,
+                            nsPresContext* aPresContext,
+                            gfxContext& aRenderingContext,
+                            const nsRect& aDirtyRect);
+
+  ImgDrawResult PaintRow(int32_t aRowIndex, const nsRect& aRowRect,
+                         nsPresContext* aPresContext,
+                         gfxContext& aRenderingContext,
+                         const nsRect& aDirtyRect, nsPoint aPt,
+                         nsDisplayListBuilder* aBuilder);
+
+  ImgDrawResult PaintSeparator(int32_t aRowIndex, const nsRect& aSeparatorRect,
+                               nsPresContext* aPresContext,
+                               gfxContext& aRenderingContext,
+                               const nsRect& aDirtyRect);
+
+  ImgDrawResult PaintCell(int32_t aRowIndex, nsTreeColumn* aColumn,
+                          const nsRect& aCellRect, nsPresContext* aPresContext,
+                          gfxContext& aRenderingContext,
+                          const nsRect& aDirtyRect, nscoord& aCurrX,
+                          nsPoint aPt, nsDisplayListBuilder* aBuilder);
+
+  ImgDrawResult PaintTwisty(int32_t aRowIndex, nsTreeColumn* aColumn,
+                            const nsRect& aTwistyRect,
+                            nsPresContext* aPresContext,
+                            gfxContext& aRenderingContext,
+                            const nsRect& aDirtyRect, nscoord& aRemainingWidth,
+                            nscoord& aCurrX);
+
+  ImgDrawResult PaintImage(int32_t aRowIndex, nsTreeColumn* aColumn,
+                           const nsRect& aImageRect,
+                           nsPresContext* aPresContext,
+                           gfxContext& aRenderingContext,
+                           const nsRect& aDirtyRect, nscoord& aRemainingWidth,
+                           nscoord& aCurrX, nsDisplayListBuilder* aBuilder);
+
+  ImgDrawResult PaintText(int32_t aRowIndex, nsTreeColumn* aColumn,
+                          const nsRect& aTextRect, nsPresContext* aPresContext,
+                          gfxContext& aRenderingContext,
+                          const nsRect& aDirtyRect, nscoord& aCurrX);
+
+  ImgDrawResult PaintCheckbox(int32_t aRowIndex, nsTreeColumn* aColumn,
+                              const nsRect& aCheckboxRect,
+                              nsPresContext* aPresContext,
+                              gfxContext& aRenderingContext,
+                              const nsRect& aDirtyRect);
+
+  ImgDrawResult PaintDropFeedback(const nsRect& aDropFeedbackRect,
+                                  nsPresContext* aPresContext,
+                                  gfxContext& aRenderingContext,
+                                  const nsRect& aDirtyRect, nsPoint aPt);
+
+  ImgDrawResult PaintBackgroundLayer(ComputedStyle* aComputedStyle,
+                                     nsPresContext* aPresContext,
+                                     gfxContext& aRenderingContext,
+                                     const nsRect& aRect,
+                                     const nsRect& aDirtyRect);
+
+  int32_t GetRowAtInternal(nscoord aX, nscoord aY);
+
+  void CheckTextForBidi(nsAutoString& aText);
+
+  void AdjustForCellText(nsAutoString& aText, int32_t aRowIndex,
+                         nsTreeColumn* aColumn, gfxContext& aRenderingContext,
+                         nsFontMetrics& aFontMetrics, nsRect& aTextRect);
+
+  mozilla::PseudoStyleType GetItemWithinCellAt(nscoord aX,
+                                               const nsRect& aCellRect,
+                                               int32_t aRowIndex,
+                                               nsTreeColumn* aColumn);
+
+  void GetCellAt(nscoord aX, nscoord aY, int32_t* aRow, nsTreeColumn** aCol,
+                 mozilla::PseudoStyleType* aChildElt);
+
+  void GetTwistyRect(int32_t aRowIndex, nsTreeColumn* aColumn,
+                     nsRect& aImageRect, nsRect& aTwistyRect,
+                     nsPresContext* aPresContext,
+                     ComputedStyle* aTwistyContext);
+
+  already_AddRefed<imgIContainer> GetImage(int32_t aRowIndex,
+                                           nsTreeColumn* aCol, bool aUseContext,
+                                           ComputedStyle* aComputedStyle);
+
+  nsRect GetImageSize(int32_t aRowIndex, nsTreeColumn* aCol, bool aUseContext,
+                      ComputedStyle* aComputedStyle);
+
+  nsSize GetImageDestSize(ComputedStyle*, imgIContainer*);
+
+  nsRect GetImageSourceRect(ComputedStyle*, imgIContainer*);
+
+  int32_t GetRowHeight();
+
+  int32_t GetIndentation();
+
+  void CalcInnerBox();
+
+  nscoord CalcHorzWidth(const ScrollParts& aParts);
+
+  ComputedStyle* GetPseudoComputedStyle(
+      mozilla::PseudoStyleType aPseudoElement);
+
+  ScrollParts GetScrollParts();
+
+  void UpdateScrollbars(const ScrollParts& aParts);
+
+  void InvalidateScrollbars(const ScrollParts& aParts);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void CheckOverflow(const ScrollParts& aParts);
+
+  bool FullScrollbarsUpdate(bool aNeedsFullInvalidation);
+
+  void PrefillPropertyArray(int32_t aRowIndex, nsTreeColumn* aCol);
+
+  nsresult ScrollInternal(const ScrollParts& aParts, int32_t aRow);
+  nsresult ScrollToRowInternal(const ScrollParts& aParts, int32_t aRow);
+  nsresult EnsureRowIsVisibleInternal(const ScrollParts& aParts, int32_t aRow);
+
+  nsPoint AdjustClientCoordsToBoxCoordSpace(int32_t aX, int32_t aY);
+
+  void EnsureView();
+
+  nsresult GetCellWidth(int32_t aRow, nsTreeColumn* aCol,
+                        gfxContext* aRenderingContext, nscoord& aDesiredSize,
+                        nscoord& aCurrentSize);
+
+  bool OffsetForHorzScroll(nsRect& rect, bool clip);
+
+  bool CanAutoScroll(int32_t aRowIndex);
+
+  void ComputeDropPosition(mozilla::WidgetGUIEvent* aEvent, int32_t* aRow,
+                           int16_t* aOrient, int16_t* aScrollLines);
+
+  void InvalidateDropFeedback(int32_t aRow, int16_t aOrientation) {
+    InvalidateRow(aRow);
+    if (aOrientation != nsITreeView::DROP_ON) {
+      InvalidateRow(aRow + aOrientation);
+    }
+  }
+
+ protected:
+  nsresult CreateTimer(const mozilla::LookAndFeel::IntID aID,
+                       nsTimerCallbackFunc aFunc, int32_t aType,
+                       nsITimer** aTimer, const nsACString& aName);
+
+  static void OpenCallback(nsITimer* aTimer, void* aClosure);
+
+  static void CloseCallback(nsITimer* aTimer, void* aClosure);
+
+  static void LazyScrollCallback(nsITimer* aTimer, void* aClosure);
+
+  static void ScrollCallback(nsITimer* aTimer, void* aClosure);
+
+  class ScrollEvent : public mozilla::Runnable {
+   public:
+    NS_DECL_NSIRUNNABLE
+    explicit ScrollEvent(nsTreeBodyFrame* aInner)
+        : mozilla::Runnable("nsTreeBodyFrame::ScrollEvent"), mInner(aInner) {}
+    void Revoke() { mInner = nullptr; }
+
+   private:
+    nsTreeBodyFrame* mInner;
+  };
+
+  void PostScrollEvent();
+  MOZ_CAN_RUN_SCRIPT void FireScrollEvent();
+
+  void DetachImageListeners();
+
+#ifdef ACCESSIBILITY
+  void FireRowCountChangedEvent(int32_t aIndex, int32_t aCount);
+
+  void FireInvalidateEvent(int32_t aStartRow, int32_t aEndRow,
+                           nsTreeColumn* aStartCol, nsTreeColumn* aEndCol);
+#endif
+
+ protected:  
+  class Slots {
+   public:
+    Slots() = default;
+
+    ~Slots() {
+      if (mTimer) {
+        mTimer->Cancel();
+      }
+    }
+
+    friend class nsTreeBodyFrame;
+
+   protected:
+    bool mDropAllowed = false;
+
+    bool mIsDragging = false;
+
+    int32_t mDropRow = -1;
+
+    int16_t mDropOrient = -1;
+
+    int16_t mScrollLines = 0;
+
+    uint32_t mDragAction = 0;
+
+    nsCOMPtr<nsITimer> mTimer;
+
+    nsTArray<int32_t> mArray;
+  };
+
+  mozilla::UniquePtr<Slots> mSlots;
+
+  nsRevocableEventPtr<ScrollEvent> mScrollEvent;
+
+  RefPtr<ScrollbarActivity> mScrollbarActivity;
+
+  RefPtr<mozilla::dom::XULTreeElement> mTree;
+
+  RefPtr<nsTreeColumns> mColumns;
+
+  nsCOMPtr<nsITreeView> mView;
+
+  nsTreeStyleCache mStyleCache;
+
+  nsTHashMap<nsURIHashKey, nsTreeImageCacheEntry> mImageCache;
+
+  mozilla::AtomArray mScratchArray;
+
+  int32_t mTopRowIndex;
+  int32_t mPageLength;
+
+  nscoord mHorzPosition;
+
+  nscoord mOriginalHorzWidth;
+  nscoord mHorzWidth;
+
+  Maybe<nsRect> mLastReflowRect;
+
+  nsRect mInnerBox;  
+  int32_t mRowHeight;
+  int32_t mIndentation;
+
+  int32_t mUpdateBatchNest;
+
+  int32_t mRowCount;
+
+  int32_t mMouseOverRow;
+
+  bool mFocused;
+
+  bool mHasFixedRowCount;
+
+  bool mVerticalOverflow;
+
+  bool mReflowCallbackPosted;
+
+  bool mCheckingOverflow;
+};  
+
+#endif

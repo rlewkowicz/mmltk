@@ -1,0 +1,595 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "LocalStorageManager2.h"
+
+#include "ActorsChild.h"
+#include "LSObject.h"
+
+#include <utility>
+
+#include "MainThreadUtils.h"
+#include "jsapi.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/OriginAttributes.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/RemoteLazyInputStreamThread.h"
+#include "mozilla/dom/LocalStorageCommon.h"
+#include "mozilla/dom/PBackgroundLSRequest.h"
+#include "mozilla/dom/PBackgroundLSSharedTypes.h"
+#include "mozilla/dom/PBackgroundLSSimpleRequest.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/quota/PrincipalUtils.h"
+#include "mozilla/dom/quota/PromiseUtils.h"
+#include "mozilla/ipc/BackgroundChild.h"
+#include "mozilla/ipc/BackgroundUtils.h"
+#include "mozilla/ipc/PBackgroundChild.h"
+#include "mozilla/ipc/PBackgroundSharedTypes.h"
+#include "nsCOMPtr.h"
+#include "nsDebug.h"
+#include "nsError.h"
+#include "nsIEventTarget.h"
+#include "nsILocalStorageManager.h"
+#include "nsIPrincipal.h"
+#include "nsIRunnable.h"
+#include "nsPIDOMWindow.h"
+#include "nsStringFwd.h"
+#include "nsThreadUtils.h"
+#include "nscore.h"
+#include "xpcpublic.h"
+
+namespace mozilla::dom {
+
+namespace {
+
+class AsyncRequestHelper final : public Runnable,
+                                 public LSRequestChildCallback {
+  enum class State {
+    Initial,
+    ResponsePending,
+    Finishing,
+    Complete
+  };
+
+  RefPtr<LocalStorageManager2> mManager;
+  nsCOMPtr<nsIEventTarget> mOwningEventTarget;
+  LSRequestChild* mActor;
+  RefPtr<Promise> mPromise;
+  const LSRequestParams mParams;
+  LSRequestResponse mResponse;
+  nsresult mResultCode;
+  State mState;
+
+ public:
+  AsyncRequestHelper(LocalStorageManager2* aManager, Promise* aPromise,
+                     const LSRequestParams& aParams)
+      : Runnable("dom::LocalStorageManager2::AsyncRequestHelper"),
+        mManager(aManager),
+        mOwningEventTarget(GetCurrentSerialEventTarget()),
+        mActor(nullptr),
+        mPromise(aPromise),
+        mParams(aParams),
+        mResultCode(NS_OK),
+        mState(State::Initial) {}
+
+  bool IsOnOwningThread() const {
+    MOZ_ASSERT(mOwningEventTarget);
+
+    bool current;
+    return NS_SUCCEEDED(mOwningEventTarget->IsOnCurrentThread(&current)) &&
+           current;
+  }
+
+  void AssertIsOnOwningThread() const {
+    MOZ_ASSERT(NS_IsMainThread());
+    MOZ_ASSERT(IsOnOwningThread());
+  }
+
+  nsresult Dispatch();
+
+ private:
+  ~AsyncRequestHelper() = default;
+
+  nsresult Start();
+
+  void Finish();
+
+  NS_DECL_ISUPPORTS_INHERITED
+
+  NS_DECL_NSIRUNNABLE
+
+  void OnResponse(LSRequestResponse&& aResponse) override;
+};
+
+class SimpleRequestResolver final : public LSSimpleRequestChildCallback {
+  RefPtr<Promise> mPromise;
+
+ public:
+  explicit SimpleRequestResolver(Promise* aPromise) : mPromise(aPromise) {}
+
+  NS_INLINE_DECL_REFCOUNTING(SimpleRequestResolver, override);
+
+ private:
+  ~SimpleRequestResolver() = default;
+
+  void HandleResponse(nsresult aResponse);
+
+  void HandleResponse(bool aResponse);
+
+  void HandleResponse(const nsTArray<LSItemInfo>& aResponse);
+
+  void OnResponse(const LSSimpleRequestResponse& aResponse) override;
+};
+
+nsresult CheckedPrincipalToPrincipalInfo(
+    nsIPrincipal* aPrincipal, mozilla::ipc::PrincipalInfo& aPrincipalInfo) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aPrincipal);
+
+  nsresult rv = PrincipalToPrincipalInfo(aPrincipal, &aPrincipalInfo);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  if (NS_WARN_IF(!quota::IsPrincipalInfoValid(aPrincipalInfo))) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (aPrincipalInfo.type() !=
+          mozilla::ipc::PrincipalInfo::TContentPrincipalInfo &&
+      aPrincipalInfo.type() !=
+          mozilla::ipc::PrincipalInfo::TSystemPrincipalInfo) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  return NS_OK;
+}
+
+}  
+
+LocalStorageManager2::LocalStorageManager2() {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(NextGenLocalStorageEnabled());
+}
+
+LocalStorageManager2::~LocalStorageManager2() { MOZ_ASSERT(NS_IsMainThread()); }
+
+NS_IMPL_ISUPPORTS(LocalStorageManager2, nsIDOMStorageManager,
+                  nsILocalStorageManager)
+
+NS_IMETHODIMP
+LocalStorageManager2::PrecacheStorage(nsIPrincipal* aPrincipal,
+                                      nsIPrincipal* aStoragePrincipal,
+                                      Storage** _retval) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aPrincipal);
+  MOZ_ASSERT(aStoragePrincipal);
+  MOZ_ASSERT(_retval);
+
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+NS_IMETHODIMP
+LocalStorageManager2::CreateStorage(mozIDOMWindow* aWindow,
+                                    nsIPrincipal* aPrincipal,
+                                    nsIPrincipal* aStoragePrincipal,
+                                    const nsAString& aDocumentURI,
+                                    bool aPrivate, Storage** _retval) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aPrincipal);
+  MOZ_ASSERT(aStoragePrincipal);
+  MOZ_ASSERT(_retval);
+
+  nsCOMPtr<nsPIDOMWindowInner> inner = nsPIDOMWindowInner::From(aWindow);
+
+  RefPtr<LSObject> object;
+  nsresult rv = LSObject::CreateForPrincipal(inner, aPrincipal,
+                                             aStoragePrincipal, aDocumentURI,
+                                             aPrivate, getter_AddRefs(object));
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  object.forget(_retval);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+LocalStorageManager2::GetStorage(mozIDOMWindow* aWindow,
+                                 nsIPrincipal* aPrincipal,
+                                 nsIPrincipal* aStoragePrincipal, bool aPrivate,
+                                 Storage** _retval) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aPrincipal);
+  MOZ_ASSERT(aStoragePrincipal);
+  MOZ_ASSERT(_retval);
+
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+NS_IMETHODIMP
+LocalStorageManager2::CloneStorage(Storage* aStorageToCloneFrom) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aStorageToCloneFrom);
+
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+NS_IMETHODIMP
+LocalStorageManager2::CheckStorage(nsIPrincipal* aPrincipal, Storage* aStorage,
+                                   bool* _retval) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aPrincipal);
+  MOZ_ASSERT(aStorage);
+  MOZ_ASSERT(_retval);
+
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+NS_IMETHODIMP
+LocalStorageManager2::GetNextGenLocalStorageEnabled(bool* aResult) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aResult);
+
+  *aResult = NextGenLocalStorageEnabled();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+LocalStorageManager2::Preload(nsIPrincipal* aPrincipal, JSContext* aContext,
+                              Promise** _retval) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aPrincipal);
+  MOZ_ASSERT(_retval);
+
+  nsCString originAttrSuffix;
+  nsCString originKey;
+  nsresult rv = aPrincipal->GetStorageOriginKey(originKey);
+  aPrincipal->OriginAttributesRef().CreateSuffix(originAttrSuffix);
+  if (NS_FAILED(rv)) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  mozilla::ipc::PrincipalInfo principalInfo;
+  rv = CheckedPrincipalToPrincipalInfo(aPrincipal, principalInfo);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  RefPtr<Promise> promise;
+
+  if (aContext) {
+    rv = quota::CreatePromise(aContext, getter_AddRefs(promise));
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      return rv;
+    }
+  }
+
+  LSRequestCommonParams commonParams;
+  commonParams.principalInfo() = principalInfo;
+  commonParams.storagePrincipalInfo() = std::move(principalInfo);
+  commonParams.originKey() = std::move(originKey);
+
+  LSRequestPreloadDatastoreParams params(commonParams);
+
+  RefPtr<AsyncRequestHelper> helper =
+      new AsyncRequestHelper(this, promise, params);
+
+  rv = helper->Dispatch();
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  promise.forget(_retval);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+LocalStorageManager2::IsPreloaded(nsIPrincipal* aPrincipal, JSContext* aContext,
+                                  Promise** _retval) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aPrincipal);
+  MOZ_ASSERT(_retval);
+
+  RefPtr<Promise> promise;
+  nsresult rv = quota::CreatePromise(aContext, getter_AddRefs(promise));
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  LSSimpleRequestPreloadedParams params;
+
+  rv = CheckedPrincipalToPrincipalInfo(aPrincipal, params.principalInfo());
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  params.storagePrincipalInfo() = params.principalInfo();
+
+  rv = StartSimpleRequest(promise, params);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  promise.forget(_retval);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+LocalStorageManager2::GetState(nsIPrincipal* aPrincipal, JSContext* aContext,
+                               Promise** _retval) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aPrincipal);
+  MOZ_ASSERT(_retval);
+
+  RefPtr<Promise> promise;
+  nsresult rv = quota::CreatePromise(aContext, getter_AddRefs(promise));
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  LSSimpleRequestGetStateParams params;
+
+  rv = CheckedPrincipalToPrincipalInfo(aPrincipal, params.principalInfo());
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  params.storagePrincipalInfo() = params.principalInfo();
+
+  rv = StartSimpleRequest(promise, params);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  promise.forget(_retval);
+  return NS_OK;
+}
+
+LSRequestChild* LocalStorageManager2::StartRequest(
+    const LSRequestParams& aParams, LSRequestChildCallback* aCallback) {
+  AssertIsOnDOMFileThread();
+
+  mozilla::ipc::PBackgroundChild* backgroundActor =
+      mozilla::ipc::BackgroundChild::GetOrCreateForCurrentThread();
+  if (NS_WARN_IF(!backgroundActor)) {
+    return nullptr;
+  }
+
+  auto actor = new LSRequestChild();
+
+  if (!backgroundActor->SendPBackgroundLSRequestConstructor(actor, aParams)) {
+    return nullptr;
+  }
+
+  actor->SetCallback(aCallback);
+
+  return actor;
+}
+
+nsresult LocalStorageManager2::StartSimpleRequest(
+    Promise* aPromise, const LSSimpleRequestParams& aParams) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aPromise);
+
+  mozilla::ipc::PBackgroundChild* backgroundActor =
+      mozilla::ipc::BackgroundChild::GetOrCreateForCurrentThread();
+  if (NS_WARN_IF(!backgroundActor)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  auto actor = new LSSimpleRequestChild();
+
+  if (!backgroundActor->SendPBackgroundLSSimpleRequestConstructor(actor,
+                                                                  aParams)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  RefPtr<SimpleRequestResolver> resolver = new SimpleRequestResolver(aPromise);
+
+  actor->SetCallback(resolver);
+
+  return NS_OK;
+}
+
+nsresult AsyncRequestHelper::Dispatch() {
+  AssertIsOnOwningThread();
+
+  nsCOMPtr<nsIEventTarget> domFileThread =
+      RemoteLazyInputStreamThread::GetOrCreate();
+  if (NS_WARN_IF(!domFileThread)) {
+    return NS_ERROR_ILLEGAL_DURING_SHUTDOWN;
+  }
+
+  nsresult rv = domFileThread->Dispatch(this, NS_DISPATCH_NORMAL);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  return NS_OK;
+}
+
+nsresult AsyncRequestHelper::Start() {
+  AssertIsOnDOMFileThread();
+  MOZ_ASSERT(mState == State::Initial);
+
+  mState = State::ResponsePending;
+
+  LSRequestChild* actor = mManager->StartRequest(mParams, this);
+  if (NS_WARN_IF(!actor)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  mActor = actor;
+
+  return NS_OK;
+}
+
+void AsyncRequestHelper::Finish() {
+  AssertIsOnOwningThread();
+  MOZ_ASSERT(mState == State::Finishing);
+
+  if (NS_WARN_IF(NS_FAILED(mResultCode))) {
+    if (mPromise) {
+      mPromise->MaybeReject(mResultCode);
+    }
+  } else {
+    switch (mResponse.type()) {
+      case LSRequestResponse::Tnsresult:
+        if (mPromise) {
+          mPromise->MaybeReject(mResponse.get_nsresult());
+        }
+        break;
+
+      case LSRequestResponse::TLSRequestPreloadDatastoreResponse:
+        if (mPromise) {
+          const LSRequestPreloadDatastoreResponse& preloadDatastoreResponse =
+              mResponse.get_LSRequestPreloadDatastoreResponse();
+
+          const bool invalidated = preloadDatastoreResponse.invalidated();
+
+          if (invalidated) {
+            mPromise->MaybeReject(NS_ERROR_ABORT);
+          } else {
+            mPromise->MaybeResolveWithUndefined();
+          }
+        }
+        break;
+      default:
+        MOZ_CRASH("Unknown response type!");
+    }
+  }
+
+  mManager = nullptr;
+  mPromise = nullptr;
+
+  mState = State::Complete;
+}
+
+NS_IMPL_ISUPPORTS_INHERITED0(AsyncRequestHelper, Runnable)
+
+NS_IMETHODIMP
+AsyncRequestHelper::Run() {
+  nsresult rv;
+
+  switch (mState) {
+    case State::Initial:
+      rv = Start();
+      break;
+
+    case State::Finishing:
+      Finish();
+      return NS_OK;
+
+    default:
+      MOZ_CRASH("Bad state!");
+  }
+
+  if (NS_WARN_IF(NS_FAILED(rv)) && mState != State::Finishing) {
+    if (NS_SUCCEEDED(mResultCode)) {
+      mResultCode = rv;
+    }
+
+    mState = State::Finishing;
+
+    if (IsOnOwningThread()) {
+      Finish();
+    } else {
+      MOZ_ALWAYS_SUCCEEDS(
+          mOwningEventTarget->Dispatch(this, NS_DISPATCH_NORMAL));
+    }
+  }
+
+  return NS_OK;
+}
+
+void AsyncRequestHelper::OnResponse(LSRequestResponse&& aResponse) {
+  AssertIsOnDOMFileThread();
+  MOZ_ASSERT(mState == State::ResponsePending);
+
+  mActor = nullptr;
+
+  mResponse = std::move(aResponse);
+
+  mState = State::Finishing;
+
+  MOZ_ALWAYS_SUCCEEDS(mOwningEventTarget->Dispatch(this, NS_DISPATCH_NORMAL));
+}
+
+void SimpleRequestResolver::HandleResponse(nsresult aResponse) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(mPromise);
+
+  mPromise->MaybeReject(aResponse);
+}
+
+void SimpleRequestResolver::HandleResponse(bool aResponse) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(mPromise);
+
+  mPromise->MaybeResolve(aResponse);
+}
+
+[[nodiscard]] static bool ToJSValue(JSContext* aCx,
+                                    const nsTArray<LSItemInfo>& aArgument,
+                                    JS::MutableHandle<JS::Value> aValue) {
+  JS::Rooted<JSObject*> obj(aCx, JS_NewPlainObject(aCx));
+  if (!obj) {
+    return false;
+  }
+
+  for (size_t i = 0; i < aArgument.Length(); ++i) {
+    const LSItemInfo& itemInfo = aArgument[i];
+
+    const nsString& key = itemInfo.key();
+
+    JS::Rooted<JS::Value> value(aCx);
+    if (!ToJSValue(aCx, itemInfo.value().AsString(), &value)) {
+      return false;
+    }
+
+    if (!JS_DefineUCProperty(aCx, obj, key.BeginReading(), key.Length(), value,
+                             JSPROP_ENUMERATE)) {
+      return false;
+    }
+  }
+
+  aValue.setObject(*obj);
+  return true;
+}
+
+void SimpleRequestResolver::HandleResponse(
+    const nsTArray<LSItemInfo>& aResponse) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(mPromise);
+
+  mPromise->MaybeResolve(aResponse);
+}
+
+void SimpleRequestResolver::OnResponse(
+    const LSSimpleRequestResponse& aResponse) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  switch (aResponse.type()) {
+    case LSSimpleRequestResponse::Tnsresult:
+      HandleResponse(aResponse.get_nsresult());
+      break;
+
+    case LSSimpleRequestResponse::TLSSimpleRequestPreloadedResponse:
+      HandleResponse(
+          aResponse.get_LSSimpleRequestPreloadedResponse().preloaded());
+      break;
+
+    case LSSimpleRequestResponse::TLSSimpleRequestGetStateResponse:
+      HandleResponse(
+          aResponse.get_LSSimpleRequestGetStateResponse().itemInfos());
+      break;
+
+    default:
+      MOZ_CRASH("Unknown response type!");
+  }
+}
+
+}  

@@ -1,0 +1,154 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef SystemTimeConverter_h
+#define SystemTimeConverter_h
+
+#include <cinttypes>
+#include <limits>
+#include <type_traits>
+#include "mozilla/ThreadSafety.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/RWLock.h"
+
+namespace mozilla {
+
+template <typename Time, typename TimeStampNowProvider = TimeStamp>
+class SystemTimeConverter {
+ public:
+  SystemTimeConverter()
+      : mReferenceTime(Time(0)),
+        mLastBackwardsSkewCheck(Time(0)),
+        mReferenceTimeLock("SystemTimeConverter::mReferenceTimeLock"),
+        kTimeRange(std::numeric_limits<Time>::max()),
+        kTimeHalfRange(kTimeRange / 2),
+        kBackwardsSkewCheckInterval(Time(2000)) {
+    static_assert(!std::is_signed_v<Time>, "Expected Time to be unsigned");
+  }
+
+  template <typename CurrentTimeGetter>
+  mozilla::TimeStamp GetTimeStampFromSystemTime(
+      Time aTime, CurrentTimeGetter& aCurrentTimeGetter) {
+    TimeStamp roughlyNow = TimeStampNowProvider::Now();
+
+    bool referenceTimeStampIsNull;
+    {
+      AutoReadLock lock(mReferenceTimeLock);
+      referenceTimeStampIsNull = mReferenceTimeStamp.IsNull();
+    }
+    if (referenceTimeStampIsNull) {
+      if (!aTime) return roughlyNow;
+      UpdateReferenceTime(aTime, aCurrentTimeGetter);
+    }
+
+    TimeStamp timeAsTimeStamp;
+    bool newer = IsTimeNewerThanTimestamp(aTime, roughlyNow, &timeAsTimeStamp);
+
+    static const TimeDuration kTolerance = TimeDuration::FromMilliseconds(30.0);
+
+    if (newer) {
+      UpdateReferenceTime(aTime, roughlyNow);
+
+      mLastBackwardsSkewCheck = aTime;
+
+      return roughlyNow;
+    }
+
+    if (roughlyNow - timeAsTimeStamp <= kTolerance) {
+      mLastBackwardsSkewCheck = aTime;
+    } else if (aTime - mLastBackwardsSkewCheck > kBackwardsSkewCheckInterval) {
+      aCurrentTimeGetter.GetTimeAsyncForPossibleBackwardsSkew(roughlyNow);
+      mLastBackwardsSkewCheck = aTime;
+    }
+
+    return timeAsTimeStamp;
+  }
+
+  void CompensateForBackwardsSkew(Time aReferenceTime,
+                                  const TimeStamp& aLowerBound) {
+    if (IsTimeNewerThanTimestamp(aReferenceTime, aLowerBound, nullptr)) {
+      return;
+    }
+
+    UpdateReferenceTime(aReferenceTime, aLowerBound);
+  }
+
+ private:
+  template <typename CurrentTimeGetter>
+  void UpdateReferenceTime(Time aReferenceTime,
+                           const CurrentTimeGetter& aCurrentTimeGetter) {
+    Time currentTime = aCurrentTimeGetter.GetCurrentTime();
+    TimeStamp currentTimeStamp = TimeStampNowProvider::Now();
+    Time timeSinceReference = currentTime - aReferenceTime;
+    TimeStamp referenceTimeStamp =
+        currentTimeStamp - TimeDuration::FromMilliseconds(timeSinceReference);
+    UpdateReferenceTime(aReferenceTime, referenceTimeStamp);
+  }
+
+  void UpdateReferenceTime(Time aReferenceTime,
+                           const TimeStamp& aReferenceTimeStamp) {
+    AutoWriteLock lock(mReferenceTimeLock);
+    mReferenceTime = aReferenceTime;
+    mReferenceTimeStamp = aReferenceTimeStamp;
+  }
+
+  bool IsTimeNewerThanTimestamp(Time aTime, TimeStamp aTimeStamp,
+                                TimeStamp* aTimeAsTimeStamp) {
+    AutoReadLock lock(mReferenceTimeLock);
+    if (mReferenceTimeStamp.IsNull()) {
+      MOZ_ASSERT_UNREACHABLE("mReferenceTimeStamp should have been set by now");
+      if (aTimeAsTimeStamp) {
+        *aTimeAsTimeStamp = aTimeStamp;
+      }
+      return false;
+    }
+    Time timeDelta = aTime - mReferenceTime;
+
+    TimeDuration timeStampDelta = (aTimeStamp - mReferenceTimeStamp);
+    int64_t wholeMillis = static_cast<int64_t>(timeStampDelta.ToMilliseconds());
+    Time wrappedTimeStampDelta = wholeMillis;  
+    const Time shift = (static_cast<Time>(0) - static_cast<Time>(1)) / 2;
+    Time wrappedTimeStampDeltaShifted = wrappedTimeStampDelta + shift;
+
+    int64_t timeToTimeStamp =
+        static_cast<int64_t>(wrappedTimeStampDeltaShifted) -
+        static_cast<int64_t>(timeDelta) - static_cast<int64_t>(shift);
+    bool isNewer = false;
+    if (timeToTimeStamp == 0) {
+    } else if (timeToTimeStamp < 0) {
+      isNewer = true;
+      wholeMillis += (-timeToTimeStamp);
+    } else {
+      wholeMillis -= timeToTimeStamp;
+    }
+    if (aTimeAsTimeStamp) {
+      *aTimeAsTimeStamp =
+          mReferenceTimeStamp + TimeDuration::FromMilliseconds(wholeMillis);
+
+      if (aTimeAsTimeStamp->IsNull()) {
+        MOZ_CRASH_UNSAFE_PRINTF(
+            "Failed to compute the new timestamp, aTime: %" PRIu32
+            ", timeDelta: %" PRIu32 ", wholeMillis: %" PRId64
+            ", timeToTimeStamp: %" PRId64,
+            static_cast<uint32_t>(aTime), static_cast<uint32_t>(timeDelta),
+            wholeMillis, timeToTimeStamp);
+      }
+    }
+
+    return isNewer;
+  }
+
+  Time mReferenceTime MOZ_GUARDED_BY(mReferenceTimeLock);
+  TimeStamp mReferenceTimeStamp MOZ_GUARDED_BY(mReferenceTimeLock);
+  Time mLastBackwardsSkewCheck;
+  mozilla::RWLock mReferenceTimeLock;
+
+  const Time kTimeRange;
+  const Time kTimeHalfRange;
+  const Time kBackwardsSkewCheckInterval;
+};
+
+}  
+
+#endif /* SystemTimeConverter_h */

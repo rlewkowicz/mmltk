@@ -1,0 +1,479 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*******************************************************************************
+* Copyright (C) 1997-2015, International Business Machines Corporation and
+* others. All Rights Reserved.
+*******************************************************************************
+*
+* File brkiter.cpp
+*
+* Modification History:
+*
+*   Date        Name        Description
+*   02/18/97    aliu        Converted from OpenClass.  Added DONE.
+*   01/13/2000  helena      Added UErrorCode parameter to createXXXInstance methods.
+*****************************************************************************************
+*/
+
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_BREAK_ITERATION
+
+#include "unicode/rbbi.h"
+#include "unicode/brkiter.h"
+#include "unicode/udata.h"
+#include "unicode/uloc.h"
+#include "unicode/ures.h"
+#include "unicode/ustring.h"
+#include "unicode/filteredbrk.h"
+#include "bytesinkutil.h"
+#include "ucln_cmn.h"
+#include "cstring.h"
+#include "umutex.h"
+#include "servloc.h"
+#include "locbased.h"
+#include "uresimp.h"
+#include "uassert.h"
+#include "ubrkimpl.h"
+#include "utracimp.h"
+#include "charstr.h"
+
+
+U_NAMESPACE_BEGIN
+
+
+BreakIterator*
+BreakIterator::buildInstance(const Locale& loc, const char *type, UErrorCode &status)
+{
+    char fnbuff[256];
+    char ext[4]={'\0'};
+    CharString actual;
+    int32_t size;
+    const char16_t* brkfname = nullptr;
+    UResourceBundle brkRulesStack;
+    UResourceBundle brkNameStack;
+    UResourceBundle *brkRules = &brkRulesStack;
+    UResourceBundle *brkName  = &brkNameStack;
+    RuleBasedBreakIterator *result = nullptr;
+
+    if (U_FAILURE(status))
+        return nullptr;
+
+    ures_initStackObject(brkRules);
+    ures_initStackObject(brkName);
+
+    UResourceBundle *b = ures_openNoDefault(U_ICUDATA_BRKITR, loc.getName(), &status);
+
+    if (U_SUCCESS(status)) {
+        brkRules = ures_getByKeyWithFallback(b, "boundaries", brkRules, &status);
+        brkName = ures_getByKeyWithFallback(brkRules, type, brkName, &status);
+        brkfname = ures_getString(brkName, &size, &status);
+        U_ASSERT((size_t)size<sizeof(fnbuff));
+        if (static_cast<size_t>(size) >= sizeof(fnbuff)) {
+            size=0;
+            if (U_SUCCESS(status)) {
+                status = U_BUFFER_OVERFLOW_ERROR;
+            }
+        }
+
+        if (U_SUCCESS(status) && brkfname) {
+            actual.append(ures_getLocaleInternal(brkName, &status), -1, status);
+
+            char16_t* extStart=u_strchr(brkfname, 0x002e);
+            int len = 0;
+            if (extStart != nullptr){
+                len = static_cast<int>(extStart - brkfname);
+                u_UCharsToChars(extStart+1, ext, sizeof(ext)); 
+                u_UCharsToChars(brkfname, fnbuff, len);
+            }
+            fnbuff[len]=0; 
+        }
+    }
+
+    ures_close(brkRules);
+    ures_close(brkName);
+
+    UDataMemory* file = udata_open(U_ICUDATA_BRKITR, ext, fnbuff, &status);
+    if (U_FAILURE(status)) {
+        ures_close(b);
+        return nullptr;
+    }
+
+    result = new RuleBasedBreakIterator(file, uprv_strstr(type, "phrase") != nullptr, status);
+
+    if (U_SUCCESS(status) && result != nullptr) {
+        result->actualLocale = Locale(actual.data());
+        result->validLocale = Locale(ures_getLocaleByType(b, ULOC_VALID_LOCALE, &status));
+        result->requestLocale = loc;
+    }
+
+    ures_close(b);
+
+    if (U_FAILURE(status) && result != nullptr) {  
+        delete result;
+        return nullptr;
+    }
+
+    if (result == nullptr) {
+        udata_close(file);
+        if (U_SUCCESS(status)) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+        }
+    }
+
+    return result;
+}
+
+BreakIterator* U_EXPORT2
+BreakIterator::createWordInstance(const Locale& key, UErrorCode& status)
+{
+    return createInstance(key, UBRK_WORD, status);
+}
+
+
+BreakIterator* U_EXPORT2
+BreakIterator::createLineInstance(const Locale& key, UErrorCode& status)
+{
+    return createInstance(key, UBRK_LINE, status);
+}
+
+
+BreakIterator* U_EXPORT2
+BreakIterator::createCharacterInstance(const Locale& key, UErrorCode& status)
+{
+    return createInstance(key, UBRK_CHARACTER, status);
+}
+
+
+BreakIterator* U_EXPORT2
+BreakIterator::createSentenceInstance(const Locale& key, UErrorCode& status)
+{
+    return createInstance(key, UBRK_SENTENCE, status);
+}
+
+
+BreakIterator* U_EXPORT2
+BreakIterator::createTitleInstance(const Locale& key, UErrorCode& status)
+{
+    return createInstance(key, UBRK_TITLE, status);
+}
+
+
+const Locale* U_EXPORT2
+BreakIterator::getAvailableLocales(int32_t& count)
+{
+    return Locale::getAvailableLocales(count);
+}
+
+
+BreakIterator::BreakIterator()
+    : actualLocale(Locale::getRoot()), validLocale(Locale::getRoot()), requestLocale(Locale::getRoot())
+{
+}
+
+BreakIterator::BreakIterator(const BreakIterator &other)
+    : UObject(other),
+      actualLocale(other.actualLocale),
+      validLocale(other.validLocale),
+      requestLocale(other.requestLocale) {
+}
+
+BreakIterator &BreakIterator::operator =(const BreakIterator &other) {
+    if (this != &other) {
+        actualLocale = other.actualLocale;
+        validLocale = other.validLocale;
+        requestLocale = other.requestLocale;
+    }
+    return *this;
+}
+
+BreakIterator::~BreakIterator()
+{
+}
+
+#if !UCONFIG_NO_SERVICE
+
+
+class ICUBreakIteratorFactory : public ICUResourceBundleFactory {
+public:
+    virtual ~ICUBreakIteratorFactory();
+protected:
+    virtual UObject* handleCreate(const Locale& loc, int32_t kind, const ICUService* , UErrorCode& status) const override {
+        return BreakIterator::makeInstance(loc, kind, status);
+    }
+};
+
+ICUBreakIteratorFactory::~ICUBreakIteratorFactory() {}
+
+
+class ICUBreakIteratorService : public ICULocaleService {
+public:
+    ICUBreakIteratorService()
+        : ICULocaleService(UNICODE_STRING("Break Iterator", 14))
+    {
+        UErrorCode status = U_ZERO_ERROR;
+        registerFactory(new ICUBreakIteratorFactory(), status);
+    }
+
+    virtual ~ICUBreakIteratorService();
+
+    virtual UObject* cloneInstance(UObject* instance) const override {
+        return ((BreakIterator*)instance)->clone();
+    }
+
+    virtual UObject* handleDefault(const ICUServiceKey& key, UnicodeString* , UErrorCode& status) const override {
+        LocaleKey& lkey = static_cast<LocaleKey&>(const_cast<ICUServiceKey&>(key));
+        int32_t kind = lkey.kind();
+        Locale loc;
+        lkey.currentLocale(loc);
+        return BreakIterator::makeInstance(loc, kind, status);
+    }
+
+    virtual UBool isDefault() const override {
+        return countFactories() == 1;
+    }
+};
+
+ICUBreakIteratorService::~ICUBreakIteratorService() {}
+
+
+U_NAMESPACE_END
+
+static icu::UInitOnce gInitOnceBrkiter {};
+static icu::ICULocaleService* gService = nullptr;
+
+
+
+U_CDECL_BEGIN
+static UBool U_CALLCONV breakiterator_cleanup() {
+#if !UCONFIG_NO_SERVICE
+    if (gService) {
+        delete gService;
+        gService = nullptr;
+    }
+    gInitOnceBrkiter.reset();
+#endif
+    return true;
+}
+U_CDECL_END
+U_NAMESPACE_BEGIN
+
+static void U_CALLCONV 
+initService() {
+    gService = new ICUBreakIteratorService();
+    ucln_common_registerCleanup(UCLN_COMMON_BREAKITERATOR, breakiterator_cleanup);
+}
+
+static ICULocaleService*
+getService()
+{
+    umtx_initOnce(gInitOnceBrkiter, &initService);
+    return gService;
+}
+
+
+
+static inline UBool
+hasService()
+{
+    return !gInitOnceBrkiter.isReset() && getService() != nullptr;
+}
+
+
+URegistryKey U_EXPORT2
+BreakIterator::registerInstance(BreakIterator* toAdopt, const Locale& locale, UBreakIteratorType kind, UErrorCode& status)
+{
+    ICULocaleService *service = getService();
+    if (service == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        return nullptr;
+    }
+    return service->registerInstance(toAdopt, locale, kind, status);
+}
+
+
+UBool U_EXPORT2
+BreakIterator::unregister(URegistryKey key, UErrorCode& status)
+{
+    if (U_SUCCESS(status)) {
+        if (hasService()) {
+            return gService->unregister(key, status);
+        }
+        status = U_MEMORY_ALLOCATION_ERROR;
+    }
+    return false;
+}
+
+
+StringEnumeration* U_EXPORT2
+BreakIterator::getAvailableLocales()
+{
+    ICULocaleService *service = getService();
+    if (service == nullptr) {
+        return nullptr;
+    }
+    return service->getAvailableLocales();
+}
+#endif /* UCONFIG_NO_SERVICE */
+
+
+BreakIterator*
+BreakIterator::createInstance(const Locale& loc, int32_t kind, UErrorCode& status)
+{
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+
+#if !UCONFIG_NO_SERVICE
+    if (hasService()) {
+        Locale actualLoc("");
+        BreakIterator *result = (BreakIterator*)gService->get(loc, kind, &actualLoc, status);
+        if (U_SUCCESS(status) && (result != nullptr) && *actualLoc.getName() != 0) {
+            result->actualLocale = actualLoc;
+            result->validLocale = actualLoc;
+        }
+        return result;
+    }
+    else
+#endif
+    {
+        return makeInstance(loc, kind, status);
+    }
+}
+
+enum { kKeyValueLenMax = 32 };
+
+BreakIterator*
+BreakIterator::makeInstance(const Locale& loc, int32_t kind, UErrorCode& status)
+{
+
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+
+    BreakIterator *result = nullptr;
+    switch (kind) {
+    case UBRK_CHARACTER:
+        {
+            UTRACE_ENTRY(UTRACE_UBRK_CREATE_CHARACTER);
+            result = BreakIterator::buildInstance(loc, "grapheme", status);
+            UTRACE_EXIT_STATUS(status);
+        }
+        break;
+    case UBRK_WORD:
+        {
+            UTRACE_ENTRY(UTRACE_UBRK_CREATE_WORD);
+            result = BreakIterator::buildInstance(loc, "word", status);
+            UTRACE_EXIT_STATUS(status);
+        }
+        break;
+    case UBRK_LINE:
+        {
+            char lb_lw[kKeyValueLenMax];
+            UTRACE_ENTRY(UTRACE_UBRK_CREATE_LINE);
+            uprv_strcpy(lb_lw, "line");
+            UErrorCode kvStatus = U_ZERO_ERROR;
+            auto value = loc.getKeywordValue<CharString>("lb", kvStatus);
+            if (U_SUCCESS(kvStatus) && (value == "strict" || value == "normal" || value == "loose")) {
+                uprv_strcat(lb_lw, "_");
+                uprv_strcat(lb_lw, value.data());
+            }
+            if (uprv_strcmp(loc.getLanguage(), "ja") == 0 || uprv_strcmp(loc.getLanguage(), "ko") == 0) {
+                value = loc.getKeywordValue<CharString>("lw", kvStatus);
+                if (U_SUCCESS(kvStatus) && value == "phrase") {
+                    uprv_strcat(lb_lw, "_");
+                    uprv_strcat(lb_lw, value.data());
+                }
+            }
+            result = BreakIterator::buildInstance(loc, lb_lw, status);
+
+            UTRACE_DATA1(UTRACE_INFO, "lb_lw=%s", lb_lw);
+            UTRACE_EXIT_STATUS(status);
+        }
+        break;
+    case UBRK_SENTENCE:
+        {
+            UTRACE_ENTRY(UTRACE_UBRK_CREATE_SENTENCE);
+            result = BreakIterator::buildInstance(loc, "sentence", status);
+#if !UCONFIG_NO_FILTERED_BREAK_ITERATION
+            char ssKeyValue[kKeyValueLenMax] = {0};
+            UErrorCode kvStatus = U_ZERO_ERROR;
+            int32_t kLen = loc.getKeywordValue("ss", ssKeyValue, kKeyValueLenMax, kvStatus);
+            if (U_SUCCESS(kvStatus) && kLen > 0 && uprv_strcmp(ssKeyValue,"standard")==0) {
+                FilteredBreakIteratorBuilder* fbiBuilder = FilteredBreakIteratorBuilder::createInstance(loc, kvStatus);
+                if (U_SUCCESS(kvStatus)) {
+                    result = fbiBuilder->build(result, status);
+                    delete fbiBuilder;
+                }
+            }
+#endif
+            UTRACE_EXIT_STATUS(status);
+        }
+        break;
+    case UBRK_TITLE:
+        {
+            UTRACE_ENTRY(UTRACE_UBRK_CREATE_TITLE);
+            result = BreakIterator::buildInstance(loc, "title", status);
+            UTRACE_EXIT_STATUS(status);
+        }
+        break;
+    default:
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+    }
+
+    if (U_FAILURE(status)) {
+        delete result;
+        return nullptr;
+    }
+
+    return result;
+}
+
+Locale
+BreakIterator::getLocale(ULocDataLocaleType type, UErrorCode& status) const {
+    if (U_FAILURE(status)) {
+        return Locale::getRoot();
+    }
+    if (type == ULOC_REQUESTED_LOCALE) {
+        return requestLocale;
+    }
+    return LocaleBased::getLocale(validLocale, actualLocale, type, status);
+}
+
+const char *
+BreakIterator::getLocaleID(ULocDataLocaleType type, UErrorCode& status) const {
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+    if (type == ULOC_REQUESTED_LOCALE) {
+        return requestLocale.getName();
+    }
+    return LocaleBased::getLocaleID(validLocale, actualLocale, type, status);
+}
+
+
+int32_t BreakIterator::getRuleStatus() const {
+    return 0;
+}
+
+int32_t BreakIterator::getRuleStatusVec(int32_t *fillInVec, int32_t capacity, UErrorCode &status) {
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+    if (capacity < 1) {
+        status = U_BUFFER_OVERFLOW_ERROR;
+        return 1;
+    }
+    *fillInVec = 0;
+    return 1;
+}
+
+BreakIterator::BreakIterator(const Locale& valid, const Locale& actual)
+    : actualLocale(actual), validLocale(valid), requestLocale(Locale::getRoot()) {
+}
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_BREAK_ITERATION */
+

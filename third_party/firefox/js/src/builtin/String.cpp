@@ -1,0 +1,4309 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "builtin/String.h"
+
+#include "mozilla/Attributes.h"
+#include "mozilla/CheckedInt.h"
+#include "mozilla/Compiler.h"
+#if JS_HAS_INTL_API
+#  include "mozilla/intl/Locale.h"
+#  include "mozilla/intl/String.h"
+#endif
+#include "mozilla/Likely.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/PodOperations.h"
+#include "mozilla/Range.h"
+#include "mozilla/SIMD.h"
+#include "mozilla/TextUtils.h"
+
+#include <algorithm>
+#include <limits>
+#include <string.h>
+#include <type_traits>
+
+#include "jstypes.h"
+
+#include "builtin/Array.h"
+#if JS_HAS_INTL_API
+#  include "builtin/intl/Collator.h"
+#  include "builtin/intl/CommonFunctions.h"
+#  include "builtin/intl/FormatBuffer.h"
+#  include "builtin/intl/GlobalIntlData.h"
+#  include "builtin/intl/LocaleNegotiation.h"
+#endif
+#include "builtin/Number.h"
+#include "builtin/RegExp.h"
+#include "gc/GC.h"
+#include "jit/InlinableNatives.h"
+#include "js/Conversions.h"
+#include "js/friend/ErrorMessages.h"  // js::GetErrorMessage, JSMSG_*
+#if !JS_HAS_INTL_API
+#  include "js/LocaleSensitive.h"
+#endif
+#include "js/normalizer_glue.h"
+#include "js/Prefs.h"
+#include "js/Printer.h"
+#include "js/PropertyAndElement.h"  // JS_DefineFunctions
+#include "js/PropertySpec.h"
+#include "js/StableStringChars.h"
+#include "js/UniquePtr.h"
+#include "js/Utility.h"
+#include "util/LanguageId.h"
+#include "util/StringBuilder.h"
+#include "util/Unicode.h"
+#include "vm/GlobalObject.h"
+#include "vm/JSContext.h"
+#include "vm/JSObject.h"
+#include "vm/RegExpObject.h"
+#include "vm/SelfHosting.h"
+#include "vm/StaticStrings.h"
+#include "vm/ToSource.h"  // js::ValueToSource
+
+#include "vm/GeckoProfiler-inl.h"
+#include "vm/NativeObject-inl.h"
+#include "vm/StringObject-inl.h"
+#include "vm/StringType-inl.h"
+
+using namespace js;
+
+using mozilla::AsciiAlphanumericToNumber;
+using mozilla::CheckedInt;
+using mozilla::EnsureUtf16ValiditySpan;
+using mozilla::IsAsciiHexDigit;
+using mozilla::PodCopy;
+using mozilla::RangedPtr;
+using mozilla::SIMD;
+using mozilla::Span;
+using mozilla::Utf16ValidUpTo;
+
+using JS::AutoCheckCannotGC;
+using JS::AutoStableStringChars;
+
+static JSLinearString* ArgToLinearString(JSContext* cx, const CallArgs& args,
+                                         unsigned argno) {
+  if (argno >= args.length()) {
+    return cx->names().undefined;
+  }
+
+  JSString* str = ToString<CanGC>(cx, args[argno]);
+  if (!str) {
+    return nullptr;
+  }
+
+  return str->ensureLinear(cx);
+}
+
+static bool str_decodeURI(JSContext* cx, unsigned argc, Value* vp);
+
+static bool str_decodeURI_Component(JSContext* cx, unsigned argc, Value* vp);
+
+static bool str_encodeURI(JSContext* cx, unsigned argc, Value* vp);
+
+static bool str_encodeURI_Component(JSContext* cx, unsigned argc, Value* vp);
+
+
+template <typename CharT>
+static bool Escape(JSContext* cx, const CharT* chars, uint32_t length,
+                   StringChars<Latin1Char>& newChars, uint32_t* newLengthOut) {
+  // clang-format off
+    static const uint8_t shouldPassThrough[128] = {
+         0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+         0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+         0,0,0,0,0,0,0,0,0,0,1,1,0,1,1,1,       
+         1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,       
+         1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,       
+         1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,1,       
+         0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,       
+         1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,       
+    };
+  // clang-format on
+
+  uint32_t newLength = length;
+  for (size_t i = 0; i < length; i++) {
+    char16_t ch = chars[i];
+    if (ch < 128 && shouldPassThrough[ch]) {
+      continue;
+    }
+
+    static_assert(JSString::MAX_LENGTH < UINT32_MAX - 5,
+                  "Adding 5 to valid string length should not overflow");
+
+    MOZ_ASSERT(newLength <= JSString::MAX_LENGTH);
+
+    newLength += (ch < 256) ? 2 : 5;
+
+    if (MOZ_UNLIKELY(newLength > JSString::MAX_LENGTH)) {
+      ReportAllocationOverflow(cx);
+      return false;
+    }
+  }
+
+  if (newLength == length) {
+    *newLengthOut = newLength;
+    return true;
+  }
+
+  if (!newChars.maybeAlloc(cx, newLength)) {
+    return false;
+  }
+
+  static const char digits[] = "0123456789ABCDEF";
+
+  JS::AutoCheckCannotGC nogc;
+  Latin1Char* rawNewChars = newChars.data(nogc);
+  size_t i, ni;
+  for (i = 0, ni = 0; i < length; i++) {
+    char16_t ch = chars[i];
+    if (ch < 128 && shouldPassThrough[ch]) {
+      rawNewChars[ni++] = ch;
+    } else if (ch < 256) {
+      rawNewChars[ni++] = '%';
+      rawNewChars[ni++] = digits[ch >> 4];
+      rawNewChars[ni++] = digits[ch & 0xF];
+    } else {
+      rawNewChars[ni++] = '%';
+      rawNewChars[ni++] = 'u';
+      rawNewChars[ni++] = digits[ch >> 12];
+      rawNewChars[ni++] = digits[(ch & 0xF00) >> 8];
+      rawNewChars[ni++] = digits[(ch & 0xF0) >> 4];
+      rawNewChars[ni++] = digits[ch & 0xF];
+    }
+  }
+  MOZ_ASSERT(ni == newLength);
+
+  *newLengthOut = newLength;
+  return true;
+}
+
+static bool str_escape(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "escape");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  Rooted<JSLinearString*> str(cx, ArgToLinearString(cx, args, 0));
+  if (!str) {
+    return false;
+  }
+
+  StringChars<Latin1Char> newChars(cx);
+  uint32_t newLength = 0;  
+  if (str->hasLatin1Chars()) {
+    AutoCheckCannotGC nogc;
+    if (!Escape(cx, str->latin1Chars(nogc), str->length(), newChars,
+                &newLength)) {
+      return false;
+    }
+  } else {
+    AutoCheckCannotGC nogc;
+    if (!Escape(cx, str->twoByteChars(nogc), str->length(), newChars,
+                &newLength)) {
+      return false;
+    }
+  }
+
+  if (newLength == str->length()) {
+    args.rval().setString(str);
+    return true;
+  }
+
+  JSString* res = newChars.toStringDontDeflateNonStatic<CanGC>(cx, newLength);
+  if (!res) {
+    return false;
+  }
+
+  args.rval().setString(res);
+  return true;
+}
+
+template <typename CharT>
+static inline bool Unhex4(const RangedPtr<const CharT> chars,
+                          char16_t* result) {
+  CharT a = chars[0], b = chars[1], c = chars[2], d = chars[3];
+
+  if (!(IsAsciiHexDigit(a) && IsAsciiHexDigit(b) && IsAsciiHexDigit(c) &&
+        IsAsciiHexDigit(d))) {
+    return false;
+  }
+
+  char16_t unhex = AsciiAlphanumericToNumber(a);
+  unhex = (unhex << 4) + AsciiAlphanumericToNumber(b);
+  unhex = (unhex << 4) + AsciiAlphanumericToNumber(c);
+  unhex = (unhex << 4) + AsciiAlphanumericToNumber(d);
+  *result = unhex;
+  return true;
+}
+
+template <typename CharT>
+static inline bool Unhex2(const RangedPtr<const CharT> chars,
+                          char16_t* result) {
+  CharT a = chars[0], b = chars[1];
+
+  if (!(IsAsciiHexDigit(a) && IsAsciiHexDigit(b))) {
+    return false;
+  }
+
+  *result = (AsciiAlphanumericToNumber(a) << 4) + AsciiAlphanumericToNumber(b);
+  return true;
+}
+
+template <typename CharT>
+static bool Unescape(StringBuilder& sb,
+                     const mozilla::Range<const CharT> chars) {
+  uint32_t length = chars.length();
+
+  bool building = false;
+
+#define ENSURE_BUILDING                            \
+  do {                                             \
+    if (!building) {                               \
+      building = true;                             \
+      if (!sb.reserve(length)) return false;       \
+      sb.infallibleAppend(chars.begin().get(), k); \
+    }                                              \
+  } while (false);
+
+  uint32_t k = 0;
+
+  while (k < length) {
+    char16_t c = chars[k];
+
+    if (c == '%') {
+      static_assert(JSString::MAX_LENGTH < UINT32_MAX - 6,
+                    "String length is not near UINT32_MAX");
+
+      if (k + 6 <= length && chars[k + 1] == 'u') {
+        if (Unhex4(chars.begin() + k + 2, &c)) {
+          ENSURE_BUILDING
+          k += 5;
+        }
+      } else if (k + 3 <= length) {
+        if (Unhex2(chars.begin() + k + 1, &c)) {
+          ENSURE_BUILDING
+          k += 2;
+        }
+      }
+    }
+
+    if (building && !sb.append(c)) {
+      return false;
+    }
+
+    k += 1;
+  }
+
+  return true;
+#undef ENSURE_BUILDING
+}
+
+static bool str_unescape(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "unescape");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  Rooted<JSLinearString*> str(cx, ArgToLinearString(cx, args, 0));
+  if (!str) {
+    return false;
+  }
+
+  JSStringBuilder sb(cx);
+  if (str->hasTwoByteChars() && !sb.ensureTwoByteChars()) {
+    return false;
+  }
+
+  bool unescapeFailed = false;
+  if (str->hasLatin1Chars()) {
+    AutoCheckCannotGC nogc;
+    unescapeFailed = !Unescape(sb, str->latin1Range(nogc));
+  } else {
+    AutoCheckCannotGC nogc;
+    unescapeFailed = !Unescape(sb, str->twoByteRange(nogc));
+  }
+  if (unescapeFailed) {
+    return false;
+  }
+
+  JSLinearString* result;
+  if (!sb.empty()) {
+    result = sb.finishString();
+    if (!result) {
+      return false;
+    }
+  } else {
+    result = str;
+  }
+
+  args.rval().setString(result);
+  return true;
+}
+
+static bool str_uneval(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  JSString* str = ValueToSource(cx, args.get(0));
+  if (!str) {
+    return false;
+  }
+
+  args.rval().setString(str);
+  return true;
+}
+
+static const JSFunctionSpec string_functions[] = {
+    JS_FN("escape", str_escape, 1, JSPROP_RESOLVING),
+    JS_FN("unescape", str_unescape, 1, JSPROP_RESOLVING),
+    JS_FN("uneval", str_uneval, 1, JSPROP_RESOLVING),
+    JS_FN("decodeURI", str_decodeURI, 1, JSPROP_RESOLVING),
+    JS_FN("encodeURI", str_encodeURI, 1, JSPROP_RESOLVING),
+    JS_FN("decodeURIComponent", str_decodeURI_Component, 1, JSPROP_RESOLVING),
+    JS_FN("encodeURIComponent", str_encodeURI_Component, 1, JSPROP_RESOLVING),
+    JS_FS_END,
+};
+
+static const unsigned STRING_ELEMENT_ATTRS =
+    JSPROP_ENUMERATE | JSPROP_READONLY | JSPROP_PERMANENT;
+
+static bool str_enumerate(JSContext* cx, HandleObject obj) {
+  RootedString str(cx, obj->as<StringObject>().unbox());
+  js::StaticStrings& staticStrings = cx->staticStrings();
+
+  RootedValue value(cx);
+  for (size_t i = 0, length = str->length(); i < length; i++) {
+    JSString* str1 = staticStrings.getUnitStringForElement(cx, str, i);
+    if (!str1) {
+      return false;
+    }
+    value.setString(str1);
+    if (!DefineDataElement(cx, obj, i, value,
+                           STRING_ELEMENT_ATTRS | JSPROP_RESOLVING)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static bool str_mayResolve(const JSAtomState&, jsid id, JSObject*) {
+  return id.isInt();
+}
+
+static bool str_resolve(JSContext* cx, HandleObject obj, HandleId id,
+                        bool* resolvedp) {
+  if (!id.isInt()) {
+    return true;
+  }
+
+  RootedString str(cx, obj->as<StringObject>().unbox());
+
+  int32_t slot = id.toInt();
+  if ((size_t)slot < str->length()) {
+    JSString* str1 =
+        cx->staticStrings().getUnitStringForElement(cx, str, size_t(slot));
+    if (!str1) {
+      return false;
+    }
+    RootedValue value(cx, StringValue(str1));
+    if (!DefineDataElement(cx, obj, uint32_t(slot), value,
+                           STRING_ELEMENT_ATTRS | JSPROP_RESOLVING)) {
+      return false;
+    }
+    *resolvedp = true;
+  }
+  return true;
+}
+
+static const JSClassOps StringObjectClassOps = {
+    .enumerate = str_enumerate,
+    .resolve = str_resolve,
+    .mayResolve = str_mayResolve,
+};
+
+const JSClass StringObject::class_ = {
+    "String",
+    JSCLASS_HAS_RESERVED_SLOTS(StringObject::RESERVED_SLOTS) |
+        JSCLASS_HAS_CACHED_PROTO(JSProto_String),
+    &StringObjectClassOps,
+    &StringObject::classSpec_,
+};
+
+static MOZ_ALWAYS_INLINE JSString* ToStringForStringFunction(
+    JSContext* cx, const char* funName, HandleValue thisv) {
+  if (thisv.isString()) {
+    return thisv.toString();
+  }
+
+  if (thisv.isObject()) {
+    if (thisv.toObject().is<StringObject>()) {
+      StringObject* nobj = &thisv.toObject().as<StringObject>();
+      if (HasNoToPrimitiveMethodPure(nobj, cx) &&
+          HasNativeMethodPure(nobj, cx->names().toString, str_toString, cx)) {
+        return nobj->unbox();
+      }
+    }
+  } else if (thisv.isNullOrUndefined()) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_INCOMPATIBLE_PROTO, "String", funName,
+                              thisv.isNull() ? "null" : "undefined");
+    return nullptr;
+  }
+
+  return ToStringSlow<CanGC>(cx, thisv);
+}
+
+MOZ_ALWAYS_INLINE bool IsString(HandleValue v) {
+  return v.isString() || (v.isObject() && v.toObject().is<StringObject>());
+}
+
+MOZ_ALWAYS_INLINE bool str_toSource_impl(JSContext* cx, const CallArgs& args) {
+  MOZ_ASSERT(IsString(args.thisv()));
+
+  JSString* str = ToString<CanGC>(cx, args.thisv());
+  if (!str) {
+    return false;
+  }
+
+  UniqueChars quoted = QuoteString(cx, str, '"');
+  if (!quoted) {
+    return false;
+  }
+
+  JSStringBuilder sb(cx);
+  if (!sb.append("(new String(") ||
+      !sb.append(quoted.get(), strlen(quoted.get())) || !sb.append("))")) {
+    return false;
+  }
+
+  JSString* result = sb.finishString();
+  if (!result) {
+    return false;
+  }
+  args.rval().setString(result);
+  return true;
+}
+
+static bool str_toSource(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsString, str_toSource_impl>(cx, args);
+}
+
+MOZ_ALWAYS_INLINE bool str_toString_impl(JSContext* cx, const CallArgs& args) {
+  MOZ_ASSERT(IsString(args.thisv()));
+
+  args.rval().setString(
+      args.thisv().isString()
+          ? args.thisv().toString()
+          : args.thisv().toObject().as<StringObject>().unbox());
+  return true;
+}
+
+bool js::str_toString(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsString, str_toString_impl>(cx, args);
+}
+
+template <typename DestChar, typename SrcChar>
+static inline void CopyChars(DestChar* destChars, const SrcChar* srcChars,
+                             size_t length) {
+  if constexpr (std::is_same_v<DestChar, SrcChar>) {
+#if MOZ_IS_GCC
+    memcpy(destChars, srcChars, length * sizeof(DestChar));
+#else
+    PodCopy(destChars, srcChars, length);
+#endif
+  } else {
+    for (size_t i = 0; i < length; i++) {
+      destChars[i] = srcChars[i];
+    }
+  }
+}
+
+template <typename CharT>
+static inline void CopyChars(CharT* to, const JSLinearString* from,
+                             size_t begin, size_t length) {
+  MOZ_ASSERT(begin + length <= from->length());
+
+  JS::AutoCheckCannotGC nogc;
+  if (from->hasLatin1Chars()) {
+    CopyChars(to, from->latin1Chars(nogc) + begin, length);
+  } else {
+    CopyChars(to, from->twoByteChars(nogc) + begin, length);
+  }
+}
+
+template <typename CharT>
+static JSLinearString* SubstringInlineString(JSContext* cx,
+                                             Handle<JSLinearString*> left,
+                                             Handle<JSLinearString*> right,
+                                             size_t begin, size_t lhsLength,
+                                             size_t rhsLength) {
+  constexpr size_t MaxLength = std::is_same_v<CharT, Latin1Char>
+                                   ? JSFatInlineString::MAX_LENGTH_LATIN1
+                                   : JSFatInlineString::MAX_LENGTH_TWO_BYTE;
+
+  size_t length = lhsLength + rhsLength;
+  MOZ_ASSERT(length <= MaxLength, "total length fits in stack chars");
+  MOZ_ASSERT(JSInlineString::lengthFits<CharT>(length));
+
+  CharT chars[MaxLength] = {};
+
+  CopyChars(chars, left, begin, lhsLength);
+  CopyChars(chars + lhsLength, right, 0, rhsLength);
+
+  if (auto* str = cx->staticStrings().lookup(chars, length)) {
+    return str;
+  }
+  return NewInlineString<CanGC>(cx, chars, length);
+}
+
+JSString* js::SubstringKernel(JSContext* cx, HandleString str, int32_t beginInt,
+                              int32_t lengthInt) {
+  MOZ_ASSERT(0 <= beginInt);
+  MOZ_ASSERT(0 <= lengthInt);
+  MOZ_ASSERT(uint32_t(beginInt) <= str->length());
+  MOZ_ASSERT(uint32_t(lengthInt) <= str->length() - beginInt);
+
+  uint32_t begin = beginInt;
+  uint32_t len = lengthInt;
+
+  if (str->isRope()) {
+    JSRope* rope = &str->asRope();
+
+    if (rope->length() == len) {
+      MOZ_ASSERT(begin == 0);
+      return rope;
+    }
+
+    if (begin + len <= rope->leftChild()->length()) {
+      return NewDependentString(cx, rope->leftChild(), begin, len);
+    }
+
+    if (begin >= rope->leftChild()->length()) {
+      begin -= rope->leftChild()->length();
+      return NewDependentString(cx, rope->rightChild(), begin, len);
+    }
+
+
+    MOZ_ASSERT(begin < rope->leftChild()->length() &&
+               begin + len > rope->leftChild()->length());
+
+    bool fitsInline = rope->hasLatin1Chars()
+                          ? JSInlineString::lengthFits<Latin1Char>(len)
+                          : JSInlineString::lengthFits<char16_t>(len);
+    if (fitsInline && rope->leftChild()->isLinear() &&
+        rope->rightChild()->isLinear()) {
+      Rooted<JSLinearString*> left(cx, &rope->leftChild()->asLinear());
+      Rooted<JSLinearString*> right(cx, &rope->rightChild()->asLinear());
+
+      size_t lhsLength = left->length() - begin;
+      size_t rhsLength = len - lhsLength;
+
+      if (rope->hasLatin1Chars()) {
+        return SubstringInlineString<Latin1Char>(cx, left, right, begin,
+                                                 lhsLength, rhsLength);
+      }
+      return SubstringInlineString<char16_t>(cx, left, right, begin, lhsLength,
+                                             rhsLength);
+    }
+  }
+
+  return NewDependentString(cx, str, begin, len);
+}
+
+static char16_t Final_Sigma(const char16_t* chars, size_t length,
+                            size_t index) {
+  MOZ_ASSERT(index < length);
+  MOZ_ASSERT(chars[index] == unicode::GREEK_CAPITAL_LETTER_SIGMA);
+  MOZ_ASSERT(unicode::ToLowerCase(unicode::GREEK_CAPITAL_LETTER_SIGMA) ==
+             unicode::GREEK_SMALL_LETTER_SIGMA);
+
+#if JS_HAS_INTL_API
+  JS::AutoSuppressGCAnalysis nogc;
+
+  bool precededByCased = false;
+  for (size_t i = index; i > 0;) {
+    char16_t c = chars[--i];
+    char32_t codePoint = c;
+    if (unicode::IsTrailSurrogate(c) && i > 0) {
+      char16_t lead = chars[i - 1];
+      if (unicode::IsLeadSurrogate(lead)) {
+        codePoint = unicode::UTF16Decode(lead, c);
+        i--;
+      }
+    }
+
+    if (mozilla::intl::String::IsCaseIgnorable(codePoint)) {
+      continue;
+    }
+
+    precededByCased = mozilla::intl::String::IsCased(codePoint);
+    break;
+  }
+  if (!precededByCased) {
+    return unicode::GREEK_SMALL_LETTER_SIGMA;
+  }
+
+  bool followedByCased = false;
+  for (size_t i = index + 1; i < length;) {
+    char16_t c = chars[i++];
+    char32_t codePoint = c;
+    if (unicode::IsLeadSurrogate(c) && i < length) {
+      char16_t trail = chars[i];
+      if (unicode::IsTrailSurrogate(trail)) {
+        codePoint = unicode::UTF16Decode(c, trail);
+        i++;
+      }
+    }
+
+    if (mozilla::intl::String::IsCaseIgnorable(codePoint)) {
+      continue;
+    }
+
+    followedByCased = mozilla::intl::String::IsCased(codePoint);
+    break;
+  }
+  if (!followedByCased) {
+    return unicode::GREEK_SMALL_LETTER_FINAL_SIGMA;
+  }
+#endif
+
+  return unicode::GREEK_SMALL_LETTER_SIGMA;
+}
+
+template <typename CharT>
+static size_t ToLowerCaseImpl(CharT* destChars, const CharT* srcChars,
+                              size_t startIndex, size_t srcLength,
+                              size_t destLength) {
+  MOZ_ASSERT(startIndex < srcLength);
+  MOZ_ASSERT(srcLength <= destLength);
+  if constexpr (std::is_same_v<CharT, Latin1Char>) {
+    MOZ_ASSERT(srcLength == destLength);
+  }
+
+  size_t j = startIndex;
+  for (size_t i = startIndex; i < srcLength; i++) {
+    CharT c = srcChars[i];
+    if constexpr (!std::is_same_v<CharT, Latin1Char>) {
+      if (unicode::IsLeadSurrogate(c) && i + 1 < srcLength) {
+        char16_t trail = srcChars[i + 1];
+        if (unicode::IsTrailSurrogate(trail)) {
+          trail = unicode::ToLowerCaseNonBMPTrail(c, trail);
+          destChars[j++] = c;
+          destChars[j++] = trail;
+          i++;
+          continue;
+        }
+      }
+
+      if (c == unicode::LATIN_CAPITAL_LETTER_I_WITH_DOT_ABOVE) {
+        if (srcLength == destLength) {
+          return i;
+        }
+
+        destChars[j++] = CharT('i');
+        destChars[j++] = CharT(unicode::COMBINING_DOT_ABOVE);
+        continue;
+      }
+
+      if (c == unicode::GREEK_CAPITAL_LETTER_SIGMA) {
+        destChars[j++] = Final_Sigma(srcChars, srcLength, i);
+        continue;
+      }
+    }
+
+    c = unicode::ToLowerCase(c);
+    destChars[j++] = c;
+  }
+
+  MOZ_ASSERT(j == destLength);
+  return srcLength;
+}
+
+static size_t ToLowerCaseLength(const char16_t* chars, size_t startIndex,
+                                size_t length) {
+  size_t lowerLength = length;
+  for (size_t i = startIndex; i < length; i++) {
+    char16_t c = chars[i];
+
+    if (c == unicode::LATIN_CAPITAL_LETTER_I_WITH_DOT_ABOVE) {
+      lowerLength += 1;
+    }
+  }
+  return lowerLength;
+}
+
+template <typename CharT>
+static JSLinearString* ToLowerCase(JSContext* cx, JSLinearString* str) {
+
+  StringChars<CharT> newChars(cx);
+
+  const size_t length = str->length();
+  size_t resultLength;
+  {
+    AutoCheckCannotGC nogc;
+    const CharT* chars = str->chars<CharT>(nogc);
+
+    MOZ_ASSERT(unicode::ChangesWhenLowerCased(
+                   unicode::LATIN_CAPITAL_LETTER_I_WITH_DOT_ABOVE),
+               "U+0130 has a simple lower case mapping");
+    MOZ_ASSERT(
+        unicode::ChangesWhenLowerCased(unicode::GREEK_CAPITAL_LETTER_SIGMA),
+        "U+03A3 has a simple lower case mapping");
+
+    if constexpr (std::is_same_v<CharT, Latin1Char>) {
+      if (length == 1) {
+        CharT lower = unicode::ToLowerCase(chars[0]);
+        MOZ_ASSERT(StaticStrings::hasUnit(lower));
+
+        return cx->staticStrings().getUnit(lower);
+      }
+    }
+
+    size_t i = 0;
+    for (; i < length; i++) {
+      CharT c = chars[i];
+      if constexpr (!std::is_same_v<CharT, Latin1Char>) {
+        if (unicode::IsLeadSurrogate(c) && i + 1 < length) {
+          CharT trail = chars[i + 1];
+          if (unicode::IsTrailSurrogate(trail)) {
+            if (unicode::ChangesWhenLowerCasedNonBMP(c, trail)) {
+              break;
+            }
+
+            i++;
+            continue;
+          }
+        }
+      }
+      if (unicode::ChangesWhenLowerCased(c)) {
+        break;
+      }
+    }
+
+    if (i == length) {
+      return str;
+    }
+
+    resultLength = length;
+    if (!newChars.maybeAlloc(cx, resultLength)) {
+      return nullptr;
+    }
+
+    PodCopy(newChars.data(nogc), chars, i);
+
+    size_t readChars =
+        ToLowerCaseImpl(newChars.data(nogc), chars, i, length, resultLength);
+    if constexpr (!std::is_same_v<CharT, Latin1Char>) {
+      if (readChars < length) {
+        resultLength = ToLowerCaseLength(chars, readChars, length);
+
+        if (!newChars.maybeRealloc(cx, length, resultLength)) {
+          return nullptr;
+        }
+
+        MOZ_ALWAYS_TRUE(length == ToLowerCaseImpl(newChars.data(nogc), chars,
+                                                  readChars, length,
+                                                  resultLength));
+      }
+    } else {
+      MOZ_ASSERT(readChars == length,
+                 "Latin-1 strings don't have special lower case mappings");
+    }
+  }
+
+  return newChars.template toStringDontDeflate<CanGC>(cx, resultLength);
+}
+
+JSLinearString* js::StringToLowerCase(JSContext* cx, JSString* string) {
+  JSLinearString* linear = string->ensureLinear(cx);
+  if (!linear) {
+    return nullptr;
+  }
+
+  if (linear->hasLatin1Chars()) {
+    return ToLowerCase<Latin1Char>(cx, linear);
+  }
+  return ToLowerCase<char16_t>(cx, linear);
+}
+
+static bool str_toLowerCase(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "String.prototype", "toLowerCase");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  JSString* str = ToStringForStringFunction(cx, "toLowerCase", args.thisv());
+  if (!str) {
+    return false;
+  }
+
+  JSString* result = StringToLowerCase(cx, str);
+  if (!result) {
+    return false;
+  }
+
+  args.rval().setString(result);
+  return true;
+}
+
+#if JS_HAS_INTL_API
+static const char* CaseMappingLocale(std::string_view lang) {
+  MOZ_ASSERT(lang.length() >= 2, "lang is a valid language tag");
+
+  static constexpr std::string_view LanguagesWithSpecialCasing[] = {
+      "lt",
+      "tr",
+      "az",
+  };
+
+  for (const auto& language : LanguagesWithSpecialCasing) {
+    if (lang == language) {
+      return language.data();
+    }
+  }
+  return nullptr;
+}
+
+bool js::LocaleHasDefaultCaseMapping(LanguageId locale) {
+  auto language = locale.language();
+
+  mozilla::intl::LanguageSubtag subtag{
+      mozilla::Span{language.data(), language.length()}};
+
+  {
+    JS::AutoSuppressGCAnalysis nogc;
+
+    (void)mozilla::intl::Locale::LanguageMapping(subtag);
+  }
+
+  auto tagSpan = subtag.Span();
+  if (CaseMappingLocale(std::string_view{tagSpan.data(), tagSpan.size()})) {
+    return false;
+  }
+
+  return true;
+}
+
+static const char* CaseMappingLocale(JSLinearString* locale) {
+  MOZ_ASSERT(locale->length() >= 2, "locale is a valid language tag");
+
+  if (locale->length() == 2 || locale->latin1OrTwoByteChar(2) == '-') {
+    char chars[] = {
+        char(locale->latin1OrTwoByteChar(0)),
+        char(locale->latin1OrTwoByteChar(1)),
+    };
+    return CaseMappingLocale(std::string_view{chars, 2});
+  }
+
+  return nullptr;
+}
+
+enum class TargetCase { Lower, Upper };
+
+static JSLinearString* TransformCase(JSContext* cx, Handle<JSString*> string,
+                                     Handle<Value> locales,
+                                     TargetCase targetCase) {
+  Rooted<intl::LocalesList> requestedLocales(cx, cx);
+  if (!intl::CanonicalizeLocaleList(cx, locales, &requestedLocales)) {
+    return nullptr;
+  }
+
+  if (string->empty()) {
+    return cx->emptyString();
+  }
+
+  const char* locale;
+  if (!requestedLocales.empty()) {
+    locale = CaseMappingLocale(requestedLocales[0]);
+  } else {
+    auto defaultLocale = LanguageId::und();
+    if (!intl::DefaultLocale(cx, &defaultLocale)) {
+      return nullptr;
+    }
+    locale = CaseMappingLocale(defaultLocale.language());
+  }
+
+  if (!locale) {
+    return targetCase == TargetCase::Lower ? StringToLowerCase(cx, string)
+                                           : StringToUpperCase(cx, string);
+  }
+
+  AutoStableStringChars inputChars(cx);
+  if (!inputChars.initTwoByte(cx, string)) {
+    return nullptr;
+  }
+  mozilla::Range<const char16_t> input = inputChars.twoByteRange();
+
+  static_assert(JSString::MAX_LENGTH <= INT32_MAX,
+                "String length must fit in int32_t for ICU");
+
+  static const size_t INLINE_CAPACITY = js::intl::INITIAL_CHAR_BUFFER_SIZE;
+
+  intl::FormatBuffer<char16_t, INLINE_CAPACITY> buffer(cx);
+
+  auto ok =
+      targetCase == TargetCase::Lower
+          ? mozilla::intl::String::ToLocaleLowerCase(locale, input, buffer)
+          : mozilla::intl::String::ToLocaleUpperCase(locale, input, buffer);
+  if (ok.isErr()) {
+    intl::ReportInternalError(cx, ok.unwrapErr());
+    return nullptr;
+  }
+
+  return buffer.toString(cx);
+}
+#endif
+
+static bool str_toLocaleLowerCase(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "String.prototype",
+                                        "toLocaleLowerCase");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  Rooted<JSString*> str(
+      cx, ToStringForStringFunction(cx, "toLocaleLowerCase", args.thisv()));
+  if (!str) {
+    return false;
+  }
+
+#if JS_HAS_INTL_API
+  auto* result = TransformCase(cx, str, args.get(0), TargetCase::Lower);
+  if (!result) {
+    return false;
+  }
+
+  args.rval().setString(result);
+  return true;
+#else
+  if (cx->runtime()->localeCallbacks &&
+      cx->runtime()->localeCallbacks->localeToLowerCase) {
+    Rooted<Value> result(cx);
+    if (!cx->runtime()->localeCallbacks->localeToLowerCase(cx, str, &result)) {
+      return false;
+    }
+
+    args.rval().set(result);
+    return true;
+  }
+
+  Rooted<JSLinearString*> linear(cx, str->ensureLinear(cx));
+  if (!linear) {
+    return false;
+  }
+
+  JSString* result = StringToLowerCase(cx, linear);
+  if (!result) {
+    return false;
+  }
+
+  args.rval().setString(result);
+  return true;
+#endif
+}
+
+static inline bool ToUpperCaseHasSpecialCasing(Latin1Char charCode) {
+  bool hasUpperCaseSpecialCasing =
+      charCode == unicode::LATIN_SMALL_LETTER_SHARP_S;
+  MOZ_ASSERT(hasUpperCaseSpecialCasing ==
+             unicode::ChangesWhenUpperCasedSpecialCasing(charCode));
+
+  return hasUpperCaseSpecialCasing;
+}
+
+static inline bool ToUpperCaseHasSpecialCasing(char16_t charCode) {
+  return unicode::ChangesWhenUpperCasedSpecialCasing(charCode);
+}
+
+static inline size_t ToUpperCaseLengthSpecialCasing(Latin1Char charCode) {
+  MOZ_ASSERT(charCode == unicode::LATIN_SMALL_LETTER_SHARP_S);
+
+  return 2;
+}
+
+static inline size_t ToUpperCaseLengthSpecialCasing(char16_t charCode) {
+  MOZ_ASSERT(ToUpperCaseHasSpecialCasing(charCode));
+
+  return unicode::LengthUpperCaseSpecialCasing(charCode);
+}
+
+static inline void ToUpperCaseAppendUpperCaseSpecialCasing(char16_t charCode,
+                                                           Latin1Char* elements,
+                                                           size_t* index) {
+  MOZ_ASSERT(charCode == unicode::LATIN_SMALL_LETTER_SHARP_S);
+  static_assert('S' <= JSString::MAX_LATIN1_CHAR, "'S' is a Latin-1 character");
+
+  elements[(*index)++] = 'S';
+  elements[(*index)++] = 'S';
+}
+
+static inline void ToUpperCaseAppendUpperCaseSpecialCasing(char16_t charCode,
+                                                           char16_t* elements,
+                                                           size_t* index) {
+  unicode::AppendUpperCaseSpecialCasing(charCode, elements, index);
+}
+
+template <typename DestChar, typename SrcChar>
+static size_t ToUpperCaseImpl(DestChar* destChars, const SrcChar* srcChars,
+                              size_t startIndex, size_t srcLength,
+                              size_t destLength) {
+  static_assert(std::is_same_v<SrcChar, Latin1Char> ||
+                    !std::is_same_v<DestChar, Latin1Char>,
+                "cannot write non-Latin-1 characters into Latin-1 string");
+  MOZ_ASSERT(startIndex < srcLength);
+  MOZ_ASSERT(srcLength <= destLength);
+
+  size_t j = startIndex;
+  for (size_t i = startIndex; i < srcLength; i++) {
+    char16_t c = srcChars[i];
+    if constexpr (!std::is_same_v<DestChar, Latin1Char>) {
+      if (unicode::IsLeadSurrogate(c) && i + 1 < srcLength) {
+        char16_t trail = srcChars[i + 1];
+        if (unicode::IsTrailSurrogate(trail)) {
+          trail = unicode::ToUpperCaseNonBMPTrail(c, trail);
+          destChars[j++] = c;
+          destChars[j++] = trail;
+          i++;
+          continue;
+        }
+      }
+    }
+
+    if (MOZ_UNLIKELY(c > 0x7f &&
+                     ToUpperCaseHasSpecialCasing(static_cast<SrcChar>(c)))) {
+      if (srcLength == destLength) {
+        return i;
+      }
+
+      ToUpperCaseAppendUpperCaseSpecialCasing(c, destChars, &j);
+      continue;
+    }
+
+    c = unicode::ToUpperCase(c);
+    if constexpr (std::is_same_v<DestChar, Latin1Char>) {
+      MOZ_ASSERT(c <= JSString::MAX_LATIN1_CHAR);
+    }
+    destChars[j++] = c;
+  }
+
+  MOZ_ASSERT(j == destLength);
+  return srcLength;
+}
+
+template <typename CharT>
+static size_t ToUpperCaseLength(const CharT* chars, size_t startIndex,
+                                size_t length) {
+  size_t upperLength = length;
+  for (size_t i = startIndex; i < length; i++) {
+    char16_t c = chars[i];
+
+    if (c > 0x7f && ToUpperCaseHasSpecialCasing(static_cast<CharT>(c))) {
+      upperLength += ToUpperCaseLengthSpecialCasing(static_cast<CharT>(c)) - 1;
+    }
+  }
+  return upperLength;
+}
+
+template <typename DestChar, typename SrcChar>
+static inline bool ToUpperCase(JSContext* cx, StringChars<DestChar>& newChars,
+                               const SrcChar* chars, size_t startIndex,
+                               size_t length, size_t* resultLength) {
+  MOZ_ASSERT(startIndex < length);
+
+  AutoCheckCannotGC nogc;
+
+  *resultLength = length;
+  if (!newChars.maybeAlloc(cx, length)) {
+    return false;
+  }
+
+  CopyChars(newChars.data(nogc), chars, startIndex);
+
+  size_t readChars =
+      ToUpperCaseImpl(newChars.data(nogc), chars, startIndex, length, length);
+  if (readChars < length) {
+    size_t actualLength = ToUpperCaseLength(chars, readChars, length);
+
+    *resultLength = actualLength;
+    if (!newChars.maybeRealloc(cx, length, actualLength)) {
+      return false;
+    }
+
+    MOZ_ALWAYS_TRUE(length == ToUpperCaseImpl(newChars.data(nogc), chars,
+                                              readChars, length, actualLength));
+  }
+
+  return true;
+}
+
+template <typename CharT>
+static JSLinearString* ToUpperCase(JSContext* cx, JSLinearString* str) {
+  using Latin1StringChars = StringChars<Latin1Char>;
+  using TwoByteStringChars = StringChars<char16_t>;
+
+  mozilla::MaybeOneOf<Latin1StringChars, TwoByteStringChars> newChars;
+  const size_t length = str->length();
+  size_t resultLength;
+  {
+    AutoCheckCannotGC nogc;
+    const CharT* chars = str->chars<CharT>(nogc);
+
+    if constexpr (std::is_same_v<CharT, Latin1Char>) {
+      if (length == 1) {
+        Latin1Char c = chars[0];
+        if (c != unicode::MICRO_SIGN &&
+            c != unicode::LATIN_SMALL_LETTER_Y_WITH_DIAERESIS &&
+            c != unicode::LATIN_SMALL_LETTER_SHARP_S) {
+          char16_t upper = unicode::ToUpperCase(c);
+          MOZ_ASSERT(upper <= JSString::MAX_LATIN1_CHAR);
+          MOZ_ASSERT(StaticStrings::hasUnit(upper));
+
+          return cx->staticStrings().getUnit(upper);
+        }
+
+        MOZ_ASSERT(unicode::ToUpperCase(c) > JSString::MAX_LATIN1_CHAR ||
+                   ToUpperCaseHasSpecialCasing(c));
+      }
+    }
+
+    size_t i = 0;
+    for (; i < length; i++) {
+      CharT c = chars[i];
+      if constexpr (!std::is_same_v<CharT, Latin1Char>) {
+        if (unicode::IsLeadSurrogate(c) && i + 1 < length) {
+          CharT trail = chars[i + 1];
+          if (unicode::IsTrailSurrogate(trail)) {
+            if (unicode::ChangesWhenUpperCasedNonBMP(c, trail)) {
+              break;
+            }
+
+            i++;
+            continue;
+          }
+        }
+      }
+      if (unicode::ChangesWhenUpperCased(c)) {
+        break;
+      }
+      if (MOZ_UNLIKELY(c > 0x7f && ToUpperCaseHasSpecialCasing(c))) {
+        break;
+      }
+    }
+
+    if (i == length) {
+      return str;
+    }
+
+    if constexpr (std::is_same_v<CharT, Latin1Char>) {
+      bool resultIsLatin1 = std::none_of(chars + i, chars + length, [](auto c) {
+        bool upperCaseIsTwoByte =
+            c == unicode::MICRO_SIGN ||
+            c == unicode::LATIN_SMALL_LETTER_Y_WITH_DIAERESIS;
+        MOZ_ASSERT(upperCaseIsTwoByte ==
+                   (unicode::ToUpperCase(c) > JSString::MAX_LATIN1_CHAR));
+        return upperCaseIsTwoByte;
+      });
+
+      if (resultIsLatin1) {
+        newChars.construct<Latin1StringChars>(cx);
+
+        if (!ToUpperCase(cx, newChars.ref<Latin1StringChars>(), chars, i,
+                         length, &resultLength)) {
+          return nullptr;
+        }
+      } else {
+        newChars.construct<TwoByteStringChars>(cx);
+
+        if (!ToUpperCase(cx, newChars.ref<TwoByteStringChars>(), chars, i,
+                         length, &resultLength)) {
+          return nullptr;
+        }
+      }
+    } else {
+      newChars.construct<TwoByteStringChars>(cx);
+
+      if (!ToUpperCase(cx, newChars.ref<TwoByteStringChars>(), chars, i, length,
+                       &resultLength)) {
+        return nullptr;
+      }
+    }
+  }
+
+  auto toString = [&](auto& chars) {
+    return chars.template toStringDontDeflate<CanGC>(cx, resultLength);
+  };
+
+  return newChars.mapNonEmpty(toString);
+}
+
+JSLinearString* js::StringToUpperCase(JSContext* cx, JSString* string) {
+  JSLinearString* linear = string->ensureLinear(cx);
+  if (!linear) {
+    return nullptr;
+  }
+
+  if (linear->hasLatin1Chars()) {
+    return ToUpperCase<Latin1Char>(cx, linear);
+  }
+  return ToUpperCase<char16_t>(cx, linear);
+}
+
+static bool str_toUpperCase(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "String.prototype", "toUpperCase");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  JSString* str = ToStringForStringFunction(cx, "toUpperCase", args.thisv());
+  if (!str) {
+    return false;
+  }
+
+  JSString* result = StringToUpperCase(cx, str);
+  if (!result) {
+    return false;
+  }
+
+  args.rval().setString(result);
+  return true;
+}
+
+static bool str_toLocaleUpperCase(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "String.prototype",
+                                        "toLocaleUpperCase");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  Rooted<JSString*> str(
+      cx, ToStringForStringFunction(cx, "toLocaleUpperCase", args.thisv()));
+  if (!str) {
+    return false;
+  }
+
+#if JS_HAS_INTL_API
+  auto* result = TransformCase(cx, str, args.get(0), TargetCase::Upper);
+  if (!result) {
+    return false;
+  }
+
+  args.rval().setString(result);
+  return true;
+#else
+  if (cx->runtime()->localeCallbacks &&
+      cx->runtime()->localeCallbacks->localeToUpperCase) {
+    Rooted<Value> result(cx);
+    if (!cx->runtime()->localeCallbacks->localeToUpperCase(cx, str, &result)) {
+      return false;
+    }
+
+    args.rval().set(result);
+    return true;
+  }
+
+  Rooted<JSLinearString*> linear(cx, str->ensureLinear(cx));
+  if (!linear) {
+    return false;
+  }
+
+  JSString* result = StringToUpperCase(cx, linear);
+  if (!result) {
+    return false;
+  }
+
+  args.rval().setString(result);
+  return true;
+#endif
+}
+
+static JSString* NormalizeString(JSContext* cx, NormalizationForm form,
+                                 Handle<JSString*> str) {
+  if (str->empty() ||
+      (form == NormalizationForm::NFC && str->hasLatin1Chars())) {
+    return str;
+  }
+
+  JSLinearString* linear = str->ensureLinear(cx);
+  if (!linear) {
+    return nullptr;
+  }
+
+  return js_normalize(cx, form, linear, linear->hasLatin1Chars());
+}
+
+static bool str_localeCompare(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "String.prototype",
+                                        "localeCompare");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  RootedString str(
+      cx, ToStringForStringFunction(cx, "localeCompare", args.thisv()));
+  if (!str) {
+    return false;
+  }
+
+  RootedString thatStr(cx, ToString<CanGC>(cx, args.get(0)));
+  if (!thatStr) {
+    return false;
+  }
+
+#if JS_HAS_INTL_API
+  HandleValue locales = args.get(1);
+  HandleValue options = args.get(2);
+
+  Rooted<intl::CollatorObject*> collator(
+      cx, intl::GetOrCreateCollator(cx, locales, options));
+  if (!collator) {
+    return false;
+  }
+
+  return intl::CompareStrings(cx, collator, str, thatStr, args.rval());
+#else
+  if (cx->runtime()->localeCallbacks &&
+      cx->runtime()->localeCallbacks->localeCompare) {
+    RootedValue result(cx);
+    if (!cx->runtime()->localeCallbacks->localeCompare(cx, str, thatStr,
+                                                       &result)) {
+      return false;
+    }
+
+    args.rval().set(result);
+    return true;
+  }
+
+
+  Rooted<JSString*> normalizedStr(
+      cx, NormalizeString(cx, NormalizationForm::NFD, str));
+  if (!normalizedStr) {
+    return false;
+  }
+
+  Rooted<JSString*> normalizedThatStr(
+      cx, NormalizeString(cx, NormalizationForm::NFD, thatStr));
+  if (!normalizedThatStr) {
+    return false;
+  }
+
+  int32_t result;
+  if (!CompareStrings(cx, normalizedStr, normalizedThatStr, &result)) {
+    return false;
+  }
+
+  args.rval().setInt32(result);
+  return true;
+#endif  // JS_HAS_INTL_API
+}
+
+
+extern "C" MOZ_EXPORT bool js_call_js_normalize_utf16(JSContext* cx,
+                                                      NormalizationForm form,
+                                                      JSLinearString* str,
+                                                      void* buffer) {
+  MOZ_ASSERT(str->hasTwoByteChars());
+  MOZ_ASSERT(!str->empty(), "empty string must be handled in caller");
+
+  AutoCheckCannotGC nogc;
+  if (!js_normalize_utf16(
+          form, reinterpret_cast<const uint16_t*>(str->twoByteChars(nogc)),
+          str->length(), buffer)) {
+    ReportOutOfMemory(cx);
+    return false;
+  }
+  return true;
+}
+
+extern "C" MOZ_EXPORT bool js_call_js_normalize_latin1(JSContext* cx,
+                                                       NormalizationForm form,
+                                                       JSLinearString* str,
+                                                       void* buffer) {
+  MOZ_ASSERT(str->hasLatin1Chars());
+  MOZ_ASSERT(!str->empty(), "empty string must be handled in caller");
+
+  AutoCheckCannotGC nogc;
+  if (!js_normalize_latin1(
+          form, reinterpret_cast<const uint8_t*>(str->latin1Chars(nogc)),
+          str->length(), buffer)) {
+    ReportOutOfMemory(cx);
+    return false;
+  }
+  return true;
+}
+
+extern "C" MOZ_EXPORT JSLinearString* js_new_ucstring_copy_n(
+    JSContext* cx, const char16_t* ptr, size_t len) {
+  return NewStringCopyN<CanGC>(cx, ptr, len);
+}
+
+extern "C" MOZ_EXPORT JSLinearString* js_new_ucstring_copy_n_dont_deflate(
+    JSContext* cx, const char16_t* ptr, size_t len) {
+  return NewStringCopyNDontDeflate<CanGC>(cx, ptr, len);
+}
+
+
+static bool str_normalize(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "String.prototype", "normalize");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  RootedString str(cx,
+                   ToStringForStringFunction(cx, "normalize", args.thisv()));
+  if (!str) {
+    return false;
+  }
+
+  NormalizationForm form;
+  if (!args.hasDefined(0)) {
+    form = NormalizationForm::NFC;
+  } else {
+    JSLinearString* formStr = ArgToLinearString(cx, args, 0);
+    if (!formStr) {
+      return false;
+    }
+
+    if (EqualStrings(formStr, cx->names().NFC)) {
+      form = NormalizationForm::NFC;
+    } else if (EqualStrings(formStr, cx->names().NFD)) {
+      form = NormalizationForm::NFD;
+    } else if (EqualStrings(formStr, cx->names().NFKC)) {
+      form = NormalizationForm::NFKC;
+    } else if (EqualStrings(formStr, cx->names().NFKD)) {
+      form = NormalizationForm::NFKD;
+    } else {
+      JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                                JSMSG_INVALID_NORMALIZE_FORM);
+      return false;
+    }
+  }
+
+  JSString* ret = NormalizeString(cx, form, str);
+  if (!ret) {
+    return false;
+  }
+
+  args.rval().setString(ret);
+  return true;
+}
+
+static bool IsStringWellFormedUnicode(JSContext* cx, JSString* str,
+                                      size_t* isWellFormedUpTo) {
+  MOZ_ASSERT(isWellFormedUpTo);
+  *isWellFormedUpTo = 0;
+
+  AutoCheckCannotGC nogc;
+
+  size_t len = str->length();
+
+  if (str->hasLatin1Chars()) {
+    *isWellFormedUpTo = len;
+    return true;
+  }
+
+  JSLinearString* linear = str->ensureLinear(cx);
+  if (!linear) {
+    return false;
+  }
+
+  *isWellFormedUpTo = Utf16ValidUpTo(Span{linear->twoByteChars(nogc), len});
+  return true;
+}
+
+static bool str_isWellFormed(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "String.prototype", "isWellFormed");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  JSString* str = ToStringForStringFunction(cx, "isWellFormed", args.thisv());
+  if (!str) {
+    return false;
+  }
+
+  size_t isWellFormedUpTo;
+  if (!IsStringWellFormedUnicode(cx, str, &isWellFormedUpTo)) {
+    return false;
+  }
+  MOZ_ASSERT(isWellFormedUpTo <= str->length());
+
+  args.rval().setBoolean(isWellFormedUpTo == str->length());
+  return true;
+}
+
+static bool str_toWellFormed(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "String.prototype", "toWellFormed");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  RootedString str(cx,
+                   ToStringForStringFunction(cx, "toWellFormed", args.thisv()));
+  if (!str) {
+    return false;
+  }
+
+  size_t len = str->length();
+
+  size_t isWellFormedUpTo;
+  if (!IsStringWellFormedUnicode(cx, str, &isWellFormedUpTo)) {
+    return false;
+  }
+  if (isWellFormedUpTo == len) {
+    args.rval().setString(str);
+    return true;
+  }
+  MOZ_ASSERT(isWellFormedUpTo < len);
+
+  StringChars<char16_t> newChars(cx);
+  if (!newChars.maybeAlloc(cx, len)) {
+    return false;
+  }
+
+  {
+    AutoCheckCannotGC nogc;
+
+    JSLinearString* linear = str->ensureLinear(cx);
+    MOZ_ASSERT(linear, "IsStringWellFormedUnicode linearized the string");
+
+    PodCopy(newChars.data(nogc), linear->twoByteChars(nogc), len);
+
+    auto span = mozilla::Span{newChars.data(nogc), len};
+
+    span[isWellFormedUpTo] = unicode::REPLACEMENT_CHARACTER;
+
+    auto remaining = span.From(isWellFormedUpTo + 1);
+    if (!remaining.IsEmpty()) {
+      EnsureUtf16ValiditySpan(remaining);
+    }
+  }
+
+  JSString* result = newChars.toStringDontDeflateNonStatic<CanGC>(cx, len);
+  if (!result) {
+    return false;
+  }
+
+  args.rval().setString(result);
+  return true;
+}
+
+static MOZ_ALWAYS_INLINE bool ToClampedStringIndex(JSContext* cx,
+                                                   Handle<Value> value,
+                                                   uint32_t length,
+                                                   uint32_t* result) {
+  if (value.isInt32()) {
+    int32_t i = value.toInt32();
+    *result = std::min(uint32_t(std::max(i, 0)), length);
+    return true;
+  }
+
+  double d;
+  if (!ToInteger(cx, value, &d)) {
+    return false;
+  }
+  *result = uint32_t(std::clamp(d, 0.0, double(length)));
+  return true;
+}
+
+static MOZ_ALWAYS_INLINE bool ToStringIndex(JSContext* cx, Handle<Value> value,
+                                            size_t length,
+                                            mozilla::Maybe<size_t>* result) {
+  if (MOZ_LIKELY(value.isInt32())) {
+    size_t index = size_t(value.toInt32());
+    if (index < length) {
+      *result = mozilla::Some(index);
+    }
+    return true;
+  }
+
+  double index = 0.0;
+  if (!ToInteger(cx, value, &index)) {
+    return false;
+  }
+  if (0 <= index && index < length) {
+    *result = mozilla::Some(size_t(index));
+  }
+  return true;
+}
+
+static MOZ_ALWAYS_INLINE bool ToRelativeStringIndex(
+    JSContext* cx, Handle<Value> value, size_t length,
+    mozilla::Maybe<size_t>* result) {
+  if (MOZ_LIKELY(value.isInt32())) {
+    int32_t index = value.toInt32();
+    if (index < 0) {
+      index += int32_t(length);
+    }
+    if (size_t(index) < length) {
+      *result = mozilla::Some(size_t(index));
+    }
+    return true;
+  }
+
+  double index = 0.0;
+  if (!ToInteger(cx, value, &index)) {
+    return false;
+  }
+  if (index < 0) {
+    index += length;
+  }
+  if (0 <= index && index < length) {
+    *result = mozilla::Some(size_t(index));
+  }
+  return true;
+}
+
+static bool str_charAt(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "String.prototype", "charAt");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  RootedString str(cx, ToStringForStringFunction(cx, "charAt", args.thisv()));
+  if (!str) {
+    return false;
+  }
+
+  mozilla::Maybe<size_t> index{};
+  if (!ToStringIndex(cx, args.get(0), str->length(), &index)) {
+    return false;
+  }
+
+  if (index.isNothing()) {
+    args.rval().setString(cx->runtime()->emptyString);
+    return true;
+  }
+  MOZ_ASSERT(*index < str->length());
+
+  auto* result = cx->staticStrings().getUnitStringForElement(cx, str, *index);
+  if (!result) {
+    return false;
+  }
+  args.rval().setString(result);
+  return true;
+}
+
+static bool str_charCodeAt(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "String.prototype", "charCodeAt");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  RootedString str(cx,
+                   ToStringForStringFunction(cx, "charCodeAt", args.thisv()));
+  if (!str) {
+    return false;
+  }
+
+  mozilla::Maybe<size_t> index{};
+  if (!ToStringIndex(cx, args.get(0), str->length(), &index)) {
+    return false;
+  }
+
+  if (index.isNothing()) {
+    args.rval().setNaN();
+    return true;
+  }
+  MOZ_ASSERT(*index < str->length());
+
+  char16_t c;
+  if (!str->getChar(cx, *index, &c)) {
+    return false;
+  }
+  args.rval().setInt32(c);
+  return true;
+}
+
+bool js::str_codePointAt(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "String.prototype", "codePointAt");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  RootedString str(cx,
+                   ToStringForStringFunction(cx, "codePointAt", args.thisv()));
+  if (!str) {
+    return false;
+  }
+
+  mozilla::Maybe<size_t> index{};
+  if (!ToStringIndex(cx, args.get(0), str->length(), &index)) {
+    return false;
+  }
+
+  if (index.isNothing()) {
+    args.rval().setUndefined();
+    return true;
+  }
+  MOZ_ASSERT(*index < str->length());
+
+  char32_t codePoint;
+  if (!str->getCodePoint(cx, *index, &codePoint)) {
+    return false;
+  }
+
+  args.rval().setInt32(codePoint);
+  return true;
+}
+
+static bool str_at(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "String.prototype", "at");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  RootedString str(cx, ToStringForStringFunction(cx, "at", args.thisv()));
+  if (!str) {
+    return false;
+  }
+
+  mozilla::Maybe<size_t> index{};
+  if (!ToRelativeStringIndex(cx, args.get(0), str->length(), &index)) {
+    return false;
+  }
+
+  if (index.isNothing()) {
+    args.rval().setUndefined();
+    return true;
+  }
+  MOZ_ASSERT(*index < str->length());
+
+  auto* result = cx->staticStrings().getUnitStringForElement(cx, str, *index);
+  if (!result) {
+    return false;
+  }
+  args.rval().setString(result);
+  return true;
+}
+
+static const uint32_t sBMHCharSetSize = 256; 
+static const uint32_t sBMHPatLenMax = 255;   
+static const int sBMHBadPattern =
+    -2; 
+
+template <typename TextChar, typename PatChar>
+static int BoyerMooreHorspool(const TextChar* text, uint32_t textLen,
+                              const PatChar* pat, uint32_t patLen) {
+  MOZ_ASSERT(0 < patLen && patLen <= sBMHPatLenMax);
+
+  uint8_t skip[sBMHCharSetSize];
+  std::fill(std::begin(skip), std::end(skip), uint8_t(patLen));
+
+  uint32_t patLast = patLen - 1;
+  for (uint32_t i = 0; i < patLast; i++) {
+    char16_t c = pat[i];
+    if (c >= sBMHCharSetSize) {
+      return sBMHBadPattern;
+    }
+    skip[c] = uint8_t(patLast - i);
+  }
+
+  for (uint32_t k = patLast; k < textLen;) {
+    for (uint32_t i = k, j = patLast;; i--, j--) {
+      if (text[i] != pat[j]) {
+        break;
+      }
+      if (j == 0) {
+        return static_cast<int>(i); 
+      }
+    }
+
+    char16_t c = text[k];
+    k += (c >= sBMHCharSetSize) ? patLen : skip[c];
+  }
+  return -1;
+}
+
+template <typename TextChar, typename PatChar>
+struct MemCmp {
+  using Extent = uint32_t;
+  static MOZ_ALWAYS_INLINE Extent computeExtent(const PatChar*,
+                                                uint32_t patLen) {
+    return (patLen - 2) * sizeof(PatChar);
+  }
+  static MOZ_ALWAYS_INLINE bool match(const PatChar* p, const TextChar* t,
+                                      Extent extent) {
+    MOZ_ASSERT(sizeof(TextChar) == sizeof(PatChar));
+    return memcmp(p, t, extent) == 0;
+  }
+};
+
+template <typename TextChar, typename PatChar>
+struct ManualCmp {
+  using Extent = const PatChar*;
+  static MOZ_ALWAYS_INLINE Extent computeExtent(const PatChar* pat,
+                                                uint32_t patLen) {
+    return pat + patLen;
+  }
+  static MOZ_ALWAYS_INLINE bool match(const PatChar* p, const TextChar* t,
+                                      Extent extent) {
+    for (; p != extent; ++p, ++t) {
+      if (*p != *t) {
+        return false;
+      }
+    }
+    return true;
+  }
+};
+
+template <class InnerMatch, typename TextChar, typename PatChar>
+static int Matcher(const TextChar* text, uint32_t textlen, const PatChar* pat,
+                   uint32_t patlen) {
+  MOZ_ASSERT(patlen > 1);
+
+  const typename InnerMatch::Extent extent =
+      InnerMatch::computeExtent(pat, patlen);
+
+  uint32_t i = 0;
+  uint32_t n = textlen - patlen + 1;
+
+  while (i < n) {
+    const TextChar* pos;
+
+    size_t searchLen = n - i + 1;
+    if (sizeof(TextChar) == 1) {
+      MOZ_ASSERT(pat[0] <= 0xff);
+      pos = (TextChar*)SIMD::memchr2x8((char*)text + i, pat[0], pat[1],
+                                       searchLen);
+    } else {
+      pos = (TextChar*)SIMD::memchr2x16((char16_t*)(text + i), char16_t(pat[0]),
+                                        char16_t(pat[1]), searchLen);
+    }
+
+    if (pos == nullptr) {
+      return -1;
+    }
+
+    i = static_cast<uint32_t>(pos - text);
+    const uint32_t inlineLookaheadChars = 2;
+    if (InnerMatch::match(pat + inlineLookaheadChars,
+                          text + i + inlineLookaheadChars, extent)) {
+      return i;
+    }
+
+    i += 1;
+  }
+  return -1;
+}
+
+template <typename TextChar, typename PatChar>
+static MOZ_ALWAYS_INLINE int StringMatch(const TextChar* text, uint32_t textLen,
+                                         const PatChar* pat, uint32_t patLen) {
+  if (patLen == 0) {
+    return 0;
+  }
+  if (textLen < patLen) {
+    return -1;
+  }
+
+  if (sizeof(TextChar) == 1 && sizeof(PatChar) > 1 && pat[0] > 0xff) {
+    return -1;
+  }
+
+  if (patLen == 1) {
+    const TextChar* pos;
+    if (sizeof(TextChar) == 1) {
+      MOZ_ASSERT(pat[0] <= 0xff);
+      pos = (TextChar*)SIMD::memchr8((char*)text, pat[0], textLen);
+    } else {
+      pos =
+          (TextChar*)SIMD::memchr16((char16_t*)text, char16_t(pat[0]), textLen);
+    }
+
+    if (pos == nullptr) {
+      return -1;
+    }
+
+    return pos - text;
+  }
+
+  if (sizeof(TextChar) == 1 && sizeof(PatChar) > 1 && pat[1] > 0xff) {
+    return -1;
+  }
+
+  if (textLen >= 512 && patLen >= 11 && patLen <= sBMHPatLenMax) {
+    int index = BoyerMooreHorspool(text, textLen, pat, patLen);
+    if (index != sBMHBadPattern) {
+      return index;
+    }
+  }
+
+  return (patLen > 128 && std::is_same_v<TextChar, PatChar>)
+             ? Matcher<MemCmp<TextChar, PatChar>, TextChar, PatChar>(
+                   text, textLen, pat, patLen)
+             : Matcher<ManualCmp<TextChar, PatChar>, TextChar, PatChar>(
+                   text, textLen, pat, patLen);
+}
+
+static int32_t StringMatch(const JSLinearString* text,
+                           const JSLinearString* pat, uint32_t start = 0) {
+  MOZ_ASSERT(start <= text->length());
+  uint32_t textLen = text->length() - start;
+  uint32_t patLen = pat->length();
+
+  int match;
+  AutoCheckCannotGC nogc;
+  if (text->hasLatin1Chars()) {
+    const Latin1Char* textChars = text->latin1Chars(nogc) + start;
+    if (pat->hasLatin1Chars()) {
+      match = StringMatch(textChars, textLen, pat->latin1Chars(nogc), patLen);
+    } else {
+      match = StringMatch(textChars, textLen, pat->twoByteChars(nogc), patLen);
+    }
+  } else {
+    const char16_t* textChars = text->twoByteChars(nogc) + start;
+    if (pat->hasLatin1Chars()) {
+      match = StringMatch(textChars, textLen, pat->latin1Chars(nogc), patLen);
+    } else {
+      match = StringMatch(textChars, textLen, pat->twoByteChars(nogc), patLen);
+    }
+  }
+
+  return (match == -1) ? -1 : start + match;
+}
+
+static const size_t sRopeMatchThresholdRatioLog2 = 4;
+
+int js::StringFindPattern(const JSLinearString* text, const JSLinearString* pat,
+                          size_t start) {
+  return StringMatch(text, pat, start);
+}
+
+using LinearStringVector = Vector<JSLinearString*, 16, SystemAllocPolicy>;
+
+template <typename TextChar, typename PatChar>
+static int RopeMatchImpl(const AutoCheckCannotGC& nogc,
+                         LinearStringVector& strings, const PatChar* pat,
+                         size_t patLen) {
+  int pos = 0;
+
+  for (JSLinearString** outerp = strings.begin(); outerp != strings.end();
+       ++outerp) {
+    JSLinearString* outer = *outerp;
+    const TextChar* chars = outer->chars<TextChar>(nogc);
+    size_t len = outer->length();
+    int matchResult = StringMatch(chars, len, pat, patLen);
+    if (matchResult != -1) {
+      return pos + matchResult;
+    }
+
+    const TextChar* const text = chars + (patLen > len ? 0 : len - patLen + 1);
+    const TextChar* const textend = chars + len;
+    const PatChar p0 = *pat;
+    const PatChar* const p1 = pat + 1;
+    const PatChar* const patend = pat + patLen;
+    for (const TextChar* t = text; t != textend;) {
+      if (*t++ != p0) {
+        continue;
+      }
+
+      JSLinearString** innerp = outerp;
+      const TextChar* ttend = textend;
+      const TextChar* tt = t;
+      for (const PatChar* pp = p1; pp != patend; ++pp, ++tt) {
+        while (tt == ttend) {
+          if (++innerp == strings.end()) {
+            return -1;
+          }
+
+          JSLinearString* inner = *innerp;
+          tt = inner->chars<TextChar>(nogc);
+          ttend = tt + inner->length();
+        }
+        if (*pp != *tt) {
+          goto break_continue;
+        }
+      }
+
+      return pos + (t - chars) - 1; 
+
+    break_continue:;
+    }
+
+    pos += len;
+  }
+
+  return -1;
+}
+
+static bool RopeMatch(JSContext* cx, JSRope* text, const JSLinearString* pat,
+                      int* match) {
+  uint32_t patLen = pat->length();
+  if (patLen == 0) {
+    *match = 0;
+    return true;
+  }
+  if (text->length() < patLen) {
+    *match = -1;
+    return true;
+  }
+
+  LinearStringVector strings;
+
+  {
+    size_t threshold = text->length() >> sRopeMatchThresholdRatioLog2;
+    StringSegmentRange r(cx);
+    if (!r.init(text)) {
+      return false;
+    }
+
+    bool textIsLatin1 = text->hasLatin1Chars();
+    while (!r.empty()) {
+      if (threshold-- == 0 || r.front()->hasLatin1Chars() != textIsLatin1 ||
+          !strings.append(r.front())) {
+        JSLinearString* linear = text->ensureLinear(cx);
+        if (!linear) {
+          return false;
+        }
+
+        *match = StringMatch(linear, pat);
+        return true;
+      }
+      if (!r.popFront()) {
+        return false;
+      }
+    }
+  }
+
+  AutoCheckCannotGC nogc;
+  if (text->hasLatin1Chars()) {
+    if (pat->hasLatin1Chars()) {
+      *match = RopeMatchImpl<Latin1Char>(nogc, strings, pat->latin1Chars(nogc),
+                                         patLen);
+    } else {
+      *match = RopeMatchImpl<Latin1Char>(nogc, strings, pat->twoByteChars(nogc),
+                                         patLen);
+    }
+  } else {
+    if (pat->hasLatin1Chars()) {
+      *match = RopeMatchImpl<char16_t>(nogc, strings, pat->latin1Chars(nogc),
+                                       patLen);
+    } else {
+      *match = RopeMatchImpl<char16_t>(nogc, strings, pat->twoByteChars(nogc),
+                                       patLen);
+    }
+  }
+
+  return true;
+}
+
+static MOZ_ALWAYS_INLINE bool ReportErrorIfFirstArgIsRegExp(
+    JSContext* cx, const CallArgs& args) {
+  if (args.length() == 0 || !args[0].isObject()) {
+    return true;
+  }
+
+  bool isRegExp;
+  if (!IsRegExp(cx, args[0], &isRegExp)) {
+    return false;
+  }
+
+  if (isRegExp) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_INVALID_ARG_TYPE, "first", "",
+                              "Regular Expression");
+    return false;
+  }
+  return true;
+}
+
+bool js::str_includes(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "String.prototype", "includes");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  RootedString str(cx, ToStringForStringFunction(cx, "includes", args.thisv()));
+  if (!str) {
+    return false;
+  }
+
+  if (!ReportErrorIfFirstArgIsRegExp(cx, args)) {
+    return false;
+  }
+
+  Rooted<JSLinearString*> searchStr(cx, ArgToLinearString(cx, args, 0));
+  if (!searchStr) {
+    return false;
+  }
+
+  uint32_t start = 0;
+  if (args.hasDefined(1)) {
+    if (!ToClampedStringIndex(cx, args[1], str->length(), &start)) {
+      return false;
+    }
+  }
+
+  JSLinearString* text = str->ensureLinear(cx);
+  if (!text) {
+    return false;
+  }
+
+  args.rval().setBoolean(StringMatch(text, searchStr, start) != -1);
+  return true;
+}
+
+bool js::StringIncludes(JSContext* cx, HandleString string,
+                        HandleString searchString, bool* result) {
+  JSLinearString* text = string->ensureLinear(cx);
+  if (!text) {
+    return false;
+  }
+
+  JSLinearString* searchStr = searchString->ensureLinear(cx);
+  if (!searchStr) {
+    return false;
+  }
+
+  *result = StringMatch(text, searchStr, 0) != -1;
+  return true;
+}
+
+bool js::str_indexOf(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "String.prototype", "indexOf");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  RootedString str(cx, ToStringForStringFunction(cx, "indexOf", args.thisv()));
+  if (!str) {
+    return false;
+  }
+
+  Rooted<JSLinearString*> searchStr(cx, ArgToLinearString(cx, args, 0));
+  if (!searchStr) {
+    return false;
+  }
+
+  uint32_t start = 0;
+  if (args.hasDefined(1)) {
+    if (!ToClampedStringIndex(cx, args[1], str->length(), &start)) {
+      return false;
+    }
+  }
+
+  if (str == searchStr) {
+    args.rval().setInt32(start == 0 ? 0 : -1);
+    return true;
+  }
+
+  JSLinearString* text = str->ensureLinear(cx);
+  if (!text) {
+    return false;
+  }
+
+  args.rval().setInt32(StringMatch(text, searchStr, start));
+  return true;
+}
+
+bool js::StringIndexOf(JSContext* cx, HandleString string,
+                       HandleString searchString, int32_t* result) {
+  if (string == searchString) {
+    *result = 0;
+    return true;
+  }
+
+  JSLinearString* text = string->ensureLinear(cx);
+  if (!text) {
+    return false;
+  }
+
+  JSLinearString* searchStr = searchString->ensureLinear(cx);
+  if (!searchStr) {
+    return false;
+  }
+
+  *result = StringMatch(text, searchStr, 0);
+  return true;
+}
+
+template <typename TextChar, typename PatChar>
+static int32_t LastIndexOfImpl(const TextChar* text, size_t textLen,
+                               const PatChar* pat, size_t patLen,
+                               size_t start) {
+  MOZ_ASSERT(patLen > 0);
+  MOZ_ASSERT(patLen <= textLen);
+  MOZ_ASSERT(start <= textLen - patLen);
+
+  const PatChar p0 = *pat;
+  const PatChar* patNext = pat + 1;
+  const PatChar* patEnd = pat + patLen;
+
+  for (const TextChar* t = text + start; t >= text; --t) {
+    if (*t == p0) {
+      const TextChar* t1 = t + 1;
+      for (const PatChar* p1 = patNext; p1 < patEnd; ++p1, ++t1) {
+        if (*t1 != *p1) {
+          goto break_continue;
+        }
+      }
+
+      return static_cast<int32_t>(t - text);
+    }
+  break_continue:;
+  }
+
+  return -1;
+}
+
+static int32_t LastIndexOf(const JSLinearString* text,
+                           const JSLinearString* searchStr, size_t start) {
+  AutoCheckCannotGC nogc;
+
+  size_t len = text->length();
+  size_t searchLen = searchStr->length();
+
+  if (text->hasLatin1Chars()) {
+    const Latin1Char* textChars = text->latin1Chars(nogc);
+    if (searchStr->hasLatin1Chars()) {
+      return LastIndexOfImpl(textChars, len, searchStr->latin1Chars(nogc),
+                             searchLen, start);
+    }
+    return LastIndexOfImpl(textChars, len, searchStr->twoByteChars(nogc),
+                           searchLen, start);
+  }
+
+  const char16_t* textChars = text->twoByteChars(nogc);
+  if (searchStr->hasLatin1Chars()) {
+    return LastIndexOfImpl(textChars, len, searchStr->latin1Chars(nogc),
+                           searchLen, start);
+  }
+  return LastIndexOfImpl(textChars, len, searchStr->twoByteChars(nogc),
+                         searchLen, start);
+}
+
+static bool str_lastIndexOf(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "String.prototype", "lastIndexOf");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  RootedString str(cx,
+                   ToStringForStringFunction(cx, "lastIndexOf", args.thisv()));
+  if (!str) {
+    return false;
+  }
+
+  Rooted<JSLinearString*> searchStr(cx, ArgToLinearString(cx, args, 0));
+  if (!searchStr) {
+    return false;
+  }
+
+  size_t len = str->length();
+
+  size_t searchLen = searchStr->length();
+
+  int start = len - searchLen;  
+  if (args.hasDefined(1)) {
+    if (args[1].isInt32()) {
+      int i = args[1].toInt32();
+      if (i <= 0) {
+        start = 0;
+      } else if (i < start) {
+        start = i;
+      }
+    } else {
+      double d;
+      if (!ToNumber(cx, args[1], &d)) {
+        return false;
+      }
+      if (!std::isnan(d)) {
+        d = JS::ToInteger(d);
+        if (d <= 0) {
+          start = 0;
+        } else if (d < start) {
+          start = int(d);
+        }
+      }
+    }
+  }
+
+  if (str == searchStr) {
+    args.rval().setInt32(0);
+    return true;
+  }
+
+  if (searchLen > len) {
+    args.rval().setInt32(-1);
+    return true;
+  }
+
+  if (searchLen == 0) {
+    args.rval().setInt32(start);
+    return true;
+  }
+  MOZ_ASSERT(0 <= start && size_t(start) < len);
+
+  JSLinearString* text = str->ensureLinear(cx);
+  if (!text) {
+    return false;
+  }
+
+  args.rval().setInt32(LastIndexOf(text, searchStr, start));
+  return true;
+}
+
+bool js::StringLastIndexOf(JSContext* cx, HandleString string,
+                           HandleString searchString, int32_t* result) {
+  if (string == searchString) {
+    *result = 0;
+    return true;
+  }
+
+  size_t len = string->length();
+  size_t searchLen = searchString->length();
+
+  if (searchLen > len) {
+    *result = -1;
+    return true;
+  }
+
+  MOZ_ASSERT(len >= searchLen);
+  size_t start = len - searchLen;
+
+  if (searchLen == 0) {
+    *result = start;
+    return true;
+  }
+  MOZ_ASSERT(start < len);
+
+  JSLinearString* text = string->ensureLinear(cx);
+  if (!text) {
+    return false;
+  }
+
+  JSLinearString* searchStr = searchString->ensureLinear(cx);
+  if (!searchStr) {
+    return false;
+  }
+
+  *result = LastIndexOf(text, searchStr, start);
+  return true;
+}
+
+static bool str_startsWith(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "String.prototype", "startsWith");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  RootedString str(cx,
+                   ToStringForStringFunction(cx, "startsWith", args.thisv()));
+  if (!str) {
+    return false;
+  }
+
+  if (!ReportErrorIfFirstArgIsRegExp(cx, args)) {
+    return false;
+  }
+
+  Rooted<JSLinearString*> searchStr(cx, ArgToLinearString(cx, args, 0));
+  if (!searchStr) {
+    return false;
+  }
+
+  uint32_t textLen = str->length();
+
+  uint32_t start = 0;
+  if (args.hasDefined(1)) {
+    if (!ToClampedStringIndex(cx, args[1], textLen, &start)) {
+      return false;
+    }
+  }
+
+  uint32_t searchLen = searchStr->length();
+
+  if (searchLen + start < searchLen || searchLen + start > textLen) {
+    args.rval().setBoolean(false);
+    return true;
+  }
+
+  JSLinearString* text = str->ensureLinear(cx);
+  if (!text) {
+    return false;
+  }
+
+  args.rval().setBoolean(HasSubstringAt(text, searchStr, start));
+  return true;
+}
+
+bool js::StringStartsWith(JSContext* cx, HandleString string,
+                          HandleString searchString, bool* result) {
+  if (searchString->length() > string->length()) {
+    *result = false;
+    return true;
+  }
+
+  JSLinearString* str = string->ensureLinear(cx);
+  if (!str) {
+    return false;
+  }
+
+  JSLinearString* searchStr = searchString->ensureLinear(cx);
+  if (!searchStr) {
+    return false;
+  }
+
+  *result = HasSubstringAt(str, searchStr, 0);
+  return true;
+}
+
+static bool str_endsWith(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "String.prototype", "endsWith");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  RootedString str(cx, ToStringForStringFunction(cx, "endsWith", args.thisv()));
+  if (!str) {
+    return false;
+  }
+
+  if (!ReportErrorIfFirstArgIsRegExp(cx, args)) {
+    return false;
+  }
+
+  Rooted<JSLinearString*> searchStr(cx, ArgToLinearString(cx, args, 0));
+  if (!searchStr) {
+    return false;
+  }
+
+  uint32_t textLen = str->length();
+
+  uint32_t end = textLen;
+  if (args.hasDefined(1)) {
+    if (!ToClampedStringIndex(cx, args[1], textLen, &end)) {
+      return false;
+    }
+  }
+
+  uint32_t searchLen = searchStr->length();
+
+  if (searchLen > end) {
+    args.rval().setBoolean(false);
+    return true;
+  }
+
+  uint32_t start = end - searchLen;
+
+  JSLinearString* text = str->ensureLinear(cx);
+  if (!text) {
+    return false;
+  }
+
+  args.rval().setBoolean(HasSubstringAt(text, searchStr, start));
+  return true;
+}
+
+bool js::StringEndsWith(JSContext* cx, HandleString string,
+                        HandleString searchString, bool* result) {
+  if (searchString->length() > string->length()) {
+    *result = false;
+    return true;
+  }
+
+  JSLinearString* str = string->ensureLinear(cx);
+  if (!str) {
+    return false;
+  }
+
+  JSLinearString* searchStr = searchString->ensureLinear(cx);
+  if (!searchStr) {
+    return false;
+  }
+
+  uint32_t start = str->length() - searchStr->length();
+
+  *result = HasSubstringAt(str, searchStr, start);
+  return true;
+}
+
+template <typename CharT>
+static void TrimString(const CharT* chars, bool trimStart, bool trimEnd,
+                       size_t length, size_t* pBegin, size_t* pEnd) {
+  size_t begin = 0, end = length;
+
+  if (trimStart) {
+    while (begin < length && unicode::IsSpace(chars[begin])) {
+      ++begin;
+    }
+  }
+
+  if (trimEnd) {
+    while (end > begin && unicode::IsSpace(chars[end - 1])) {
+      --end;
+    }
+  }
+
+  *pBegin = begin;
+  *pEnd = end;
+}
+
+static JSLinearString* TrimString(JSContext* cx, JSString* str, bool trimStart,
+                                  bool trimEnd) {
+  JSLinearString* linear = str->ensureLinear(cx);
+  if (!linear) {
+    return nullptr;
+  }
+
+  size_t length = linear->length();
+  size_t begin, end;
+  if (linear->hasLatin1Chars()) {
+    AutoCheckCannotGC nogc;
+    TrimString(linear->latin1Chars(nogc), trimStart, trimEnd, length, &begin,
+               &end);
+  } else {
+    AutoCheckCannotGC nogc;
+    TrimString(linear->twoByteChars(nogc), trimStart, trimEnd, length, &begin,
+               &end);
+  }
+
+  return NewDependentString(cx, linear, begin, end - begin);
+}
+
+JSString* js::StringTrim(JSContext* cx, HandleString string) {
+  return TrimString(cx, string, true, true);
+}
+
+JSString* js::StringTrimStart(JSContext* cx, HandleString string) {
+  return TrimString(cx, string, true, false);
+}
+
+JSString* js::StringTrimEnd(JSContext* cx, HandleString string) {
+  return TrimString(cx, string, false, true);
+}
+
+static bool TrimString(JSContext* cx, const CallArgs& args, const char* funName,
+                       bool trimStart, bool trimEnd) {
+  JSString* str = ToStringForStringFunction(cx, funName, args.thisv());
+  if (!str) {
+    return false;
+  }
+
+  JSLinearString* result = TrimString(cx, str, trimStart, trimEnd);
+  if (!result) {
+    return false;
+  }
+
+  args.rval().setString(result);
+  return true;
+}
+
+static bool str_trim(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "String.prototype", "trim");
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return TrimString(cx, args, "trim", true, true);
+}
+
+static bool str_trimStart(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "String.prototype", "trimStart");
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return TrimString(cx, args, "trimStart", true, false);
+}
+
+static bool str_trimEnd(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "String.prototype", "trimEnd");
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return TrimString(cx, args, "trimEnd", false, true);
+}
+
+class RopeBuilder {
+  JSContext* cx;
+  RootedString res;
+
+ public:
+  explicit RopeBuilder(JSContext* cx)
+      : cx(cx), res(cx, cx->runtime()->emptyString) {}
+
+  inline bool append(HandleString str) {
+    res = ConcatStrings<CanGC>(cx, res, str);
+    return !!res;
+  }
+
+  inline JSString* result() { return res; }
+
+  RopeBuilder(const RopeBuilder& other) = delete;
+  void operator=(const RopeBuilder& other) = delete;
+};
+
+namespace {
+
+template <typename CharT>
+static uint32_t FindDollarIndex(const CharT* chars, size_t length) {
+  if (const CharT* p = js_strchr_limit(chars, '$', chars + length)) {
+    uint32_t dollarIndex = p - chars;
+    MOZ_ASSERT(dollarIndex < length);
+    return dollarIndex;
+  }
+  return UINT32_MAX;
+}
+
+} 
+
+static JSString* BuildFlatReplacement(JSContext* cx, HandleString textstr,
+                                      Handle<JSLinearString*> repstr,
+                                      size_t matchStart, size_t patternLength) {
+  size_t matchEnd = matchStart + patternLength;
+
+  RootedString resultStr(cx, NewDependentString(cx, textstr, 0, matchStart));
+  if (!resultStr) {
+    return nullptr;
+  }
+
+  resultStr = ConcatStrings<CanGC>(cx, resultStr, repstr);
+  if (!resultStr) {
+    return nullptr;
+  }
+
+  MOZ_ASSERT(textstr->length() >= matchEnd);
+  RootedString rest(cx, NewDependentString(cx, textstr, matchEnd,
+                                           textstr->length() - matchEnd));
+  if (!rest) {
+    return nullptr;
+  }
+
+  return ConcatStrings<CanGC>(cx, resultStr, rest);
+}
+
+static JSString* BuildFlatRopeReplacement(JSContext* cx, HandleString textstr,
+                                          Handle<JSLinearString*> repstr,
+                                          size_t match, size_t patternLength) {
+  MOZ_ASSERT(textstr->isRope());
+
+  size_t matchEnd = match + patternLength;
+
+  StringSegmentRange r(cx);
+  if (!r.init(textstr)) {
+    return nullptr;
+  }
+
+  RopeBuilder builder(cx);
+
+  if (patternLength == 0) {
+    MOZ_ASSERT(match == 0);
+    if (!builder.append(repstr)) {
+      return nullptr;
+    }
+  }
+
+  size_t pos = 0;
+  while (!r.empty()) {
+    RootedString str(cx, r.front());
+    size_t len = str->length();
+    size_t strEnd = pos + len;
+    if (pos < matchEnd && strEnd > match) {
+      if (match >= pos) {
+        RootedString leftSide(cx, NewDependentString(cx, str, 0, match - pos));
+        if (!leftSide || !builder.append(leftSide) || !builder.append(repstr)) {
+          return nullptr;
+        }
+      }
+
+      if (strEnd > matchEnd) {
+        RootedString rightSide(
+            cx, NewDependentString(cx, str, matchEnd - pos, strEnd - matchEnd));
+        if (!rightSide || !builder.append(rightSide)) {
+          return nullptr;
+        }
+      }
+    } else {
+      if (!builder.append(str)) {
+        return nullptr;
+      }
+    }
+    pos += str->length();
+    if (!r.popFront()) {
+      return nullptr;
+    }
+  }
+
+  return builder.result();
+}
+
+template <typename CharT>
+static bool AppendDollarReplacement(StringBuilder& newReplaceChars,
+                                    size_t firstDollarIndex, size_t matchStart,
+                                    size_t matchLimit,
+                                    const JSLinearString* text,
+                                    const CharT* repChars, size_t repLength) {
+  MOZ_ASSERT(firstDollarIndex < repLength);
+  MOZ_ASSERT(matchStart <= matchLimit);
+  MOZ_ASSERT(matchLimit <= text->length());
+
+  if (!newReplaceChars.append(repChars, firstDollarIndex)) {
+    return false;
+  }
+
+  const CharT* repLimit = repChars + repLength;
+  for (const CharT* it = repChars + firstDollarIndex; it < repLimit; ++it) {
+    if (*it != '$' || it == repLimit - 1) {
+      if (!newReplaceChars.append(*it)) {
+        return false;
+      }
+      continue;
+    }
+
+    switch (*(it + 1)) {
+      case '$':
+        if (!newReplaceChars.append(*it)) {
+          return false;
+        }
+        break;
+      case '&':
+        if (!newReplaceChars.appendSubstring(text, matchStart,
+                                             matchLimit - matchStart)) {
+          return false;
+        }
+        break;
+      case '`':
+        if (!newReplaceChars.appendSubstring(text, 0, matchStart)) {
+          return false;
+        }
+        break;
+      case '\'':
+        if (!newReplaceChars.appendSubstring(text, matchLimit,
+                                             text->length() - matchLimit)) {
+          return false;
+        }
+        break;
+      default:
+        if (!newReplaceChars.append(*it)) {
+          return false;
+        }
+        continue;
+    }
+    ++it;  
+  }
+
+  return true;
+}
+
+static JSLinearString* InterpretDollarReplacement(
+    JSContext* cx, HandleString textstrArg, Handle<JSLinearString*> repstr,
+    uint32_t firstDollarIndex, size_t matchStart, size_t patternLength) {
+  Rooted<JSLinearString*> textstr(cx, textstrArg->ensureLinear(cx));
+  if (!textstr) {
+    return nullptr;
+  }
+
+  size_t matchLimit = matchStart + patternLength;
+
+  JSStringBuilder newReplaceChars(cx);
+  if (repstr->hasTwoByteChars() && !newReplaceChars.ensureTwoByteChars()) {
+    return nullptr;
+  }
+
+  if (!newReplaceChars.reserve(textstr->length() - patternLength +
+                               repstr->length())) {
+    return nullptr;
+  }
+
+  bool res;
+  if (repstr->hasLatin1Chars()) {
+    AutoCheckCannotGC nogc;
+    res = AppendDollarReplacement(newReplaceChars, firstDollarIndex, matchStart,
+                                  matchLimit, textstr,
+                                  repstr->latin1Chars(nogc), repstr->length());
+  } else {
+    AutoCheckCannotGC nogc;
+    res = AppendDollarReplacement(newReplaceChars, firstDollarIndex, matchStart,
+                                  matchLimit, textstr,
+                                  repstr->twoByteChars(nogc), repstr->length());
+  }
+  if (!res) {
+    return nullptr;
+  }
+
+  return newReplaceChars.finishString();
+}
+
+template <typename StrChar, typename RepChar>
+static bool StrFlatReplaceGlobal(JSContext* cx, const JSLinearString* str,
+                                 const JSLinearString* pat,
+                                 const JSLinearString* rep, StringBuilder& sb) {
+  MOZ_ASSERT(str->length() > 0);
+
+  AutoCheckCannotGC nogc;
+  const StrChar* strChars = str->chars<StrChar>(nogc);
+  const RepChar* repChars = rep->chars<RepChar>(nogc);
+
+  if (!pat->length()) {
+    CheckedInt<uint32_t> strLength(str->length());
+    CheckedInt<uint32_t> repLength(rep->length());
+    CheckedInt<uint32_t> length = repLength * (strLength - 1) + strLength;
+    if (!length.isValid()) {
+      ReportAllocationOverflow(cx);
+      return false;
+    }
+
+    if (!sb.reserve(length.value())) {
+      return false;
+    }
+
+    for (unsigned i = 0; i < str->length() - 1; ++i, ++strChars) {
+      sb.infallibleAppend(*strChars);
+      sb.infallibleAppend(repChars, rep->length());
+    }
+    sb.infallibleAppend(*strChars);
+    return true;
+  }
+
+  if (rep->length() >= pat->length()) {
+    if (!sb.reserve(str->length())) {
+      return false;
+    }
+  }
+
+  uint32_t start = 0;
+  for (;;) {
+    int match = StringMatch(str, pat, start);
+    if (match < 0) {
+      break;
+    }
+    if (!sb.append(strChars + start, match - start)) {
+      return false;
+    }
+    if (!sb.append(repChars, rep->length())) {
+      return false;
+    }
+    start = match + pat->length();
+  }
+
+  if (!sb.append(strChars + start, str->length() - start)) {
+    return false;
+  }
+
+  return true;
+}
+
+JSString* js::StringFlatReplaceString(JSContext* cx, HandleString string,
+                                      HandleString pattern,
+                                      HandleString replacement) {
+  MOZ_ASSERT(string);
+  MOZ_ASSERT(pattern);
+  MOZ_ASSERT(replacement);
+
+  if (!string->length()) {
+    return string;
+  }
+
+  Rooted<JSLinearString*> linearRepl(cx, replacement->ensureLinear(cx));
+  if (!linearRepl) {
+    return nullptr;
+  }
+
+  Rooted<JSLinearString*> linearPat(cx, pattern->ensureLinear(cx));
+  if (!linearPat) {
+    return nullptr;
+  }
+
+  Rooted<JSLinearString*> linearStr(cx, string->ensureLinear(cx));
+  if (!linearStr) {
+    return nullptr;
+  }
+
+  JSStringBuilder sb(cx);
+  if (linearStr->hasTwoByteChars()) {
+    if (!sb.ensureTwoByteChars()) {
+      return nullptr;
+    }
+    if (linearRepl->hasTwoByteChars()) {
+      if (!StrFlatReplaceGlobal<char16_t, char16_t>(cx, linearStr, linearPat,
+                                                    linearRepl, sb)) {
+        return nullptr;
+      }
+    } else {
+      if (!StrFlatReplaceGlobal<char16_t, Latin1Char>(cx, linearStr, linearPat,
+                                                      linearRepl, sb)) {
+        return nullptr;
+      }
+    }
+  } else {
+    if (linearRepl->hasTwoByteChars()) {
+      if (!sb.ensureTwoByteChars()) {
+        return nullptr;
+      }
+      if (!StrFlatReplaceGlobal<Latin1Char, char16_t>(cx, linearStr, linearPat,
+                                                      linearRepl, sb)) {
+        return nullptr;
+      }
+    } else {
+      if (!StrFlatReplaceGlobal<Latin1Char, Latin1Char>(
+              cx, linearStr, linearPat, linearRepl, sb)) {
+        return nullptr;
+      }
+    }
+  }
+
+  return sb.finishString();
+}
+
+JSString* js::str_replace_string_raw(JSContext* cx, HandleString string,
+                                     HandleString pattern,
+                                     HandleString replacement) {
+  Rooted<JSLinearString*> pat(cx, pattern->ensureLinear(cx));
+  if (!pat) {
+    return nullptr;
+  }
+
+  int32_t match;
+  if (string->isRope()) {
+    if (!RopeMatch(cx, &string->asRope(), pat, &match)) {
+      return nullptr;
+    }
+  } else {
+    match = StringMatch(&string->asLinear(), pat, 0);
+  }
+
+  if (match < 0) {
+    return string;
+  }
+
+  Rooted<JSLinearString*> repl(cx, replacement->ensureLinear(cx));
+  if (!repl) {
+    return nullptr;
+  }
+  uint32_t dollarIndex;
+  {
+    AutoCheckCannotGC nogc;
+    dollarIndex =
+        repl->hasLatin1Chars()
+            ? FindDollarIndex(repl->latin1Chars(nogc), repl->length())
+            : FindDollarIndex(repl->twoByteChars(nogc), repl->length());
+  }
+
+  size_t patternLength = pat->length();
+
+  if (dollarIndex != UINT32_MAX) {
+    repl = InterpretDollarReplacement(cx, string, repl, dollarIndex, match,
+                                      patternLength);
+    if (!repl) {
+      return nullptr;
+    }
+  } else if (string->isRope()) {
+    return BuildFlatRopeReplacement(cx, string, repl, match, patternLength);
+  }
+  return BuildFlatReplacement(cx, string, repl, match, patternLength);
+}
+
+template <typename StrChar, typename RepChar>
+static bool ReplaceAllInternal(const AutoCheckCannotGC& nogc,
+                               const JSLinearString* string,
+                               const JSLinearString* searchString,
+                               const JSLinearString* replaceString,
+                               const int32_t startPosition,
+                               JSStringBuilder& result) {
+  const size_t stringLength = string->length();
+  const size_t searchLength = searchString->length();
+  const size_t replaceLength = replaceString->length();
+
+  MOZ_ASSERT(stringLength > 0);
+  MOZ_ASSERT(searchLength > 0);
+  MOZ_ASSERT(stringLength >= searchLength);
+
+  uint32_t endOfLastMatch = 0;
+
+  const StrChar* strChars = string->chars<StrChar>(nogc);
+  const RepChar* repChars = replaceString->chars<RepChar>(nogc);
+
+  uint32_t dollarIndex = FindDollarIndex(repChars, replaceLength);
+
+  if (replaceLength >= searchLength) {
+    if (!result.reserve(stringLength)) {
+      return false;
+    }
+  }
+
+  int32_t position = startPosition;
+  do {
+    if (!result.append(strChars + endOfLastMatch, position - endOfLastMatch)) {
+      return false;
+    }
+
+    if (dollarIndex != UINT32_MAX) {
+      size_t matchLimit = position + searchLength;
+      if (!AppendDollarReplacement(result, dollarIndex, position, matchLimit,
+                                   string, repChars, replaceLength)) {
+        return false;
+      }
+    } else {
+      if (!result.append(repChars, replaceLength)) {
+        return false;
+      }
+    }
+
+    endOfLastMatch = position + searchLength;
+
+    position = StringMatch(string, searchString, endOfLastMatch);
+  } while (position >= 0);
+
+  return result.append(strChars + endOfLastMatch,
+                       stringLength - endOfLastMatch);
+}
+
+template <typename StrChar, typename RepChar>
+static JSString* ReplaceAll(JSContext* cx, JSLinearString* string,
+                            const JSLinearString* searchString,
+                            const JSLinearString* replaceString) {
+
+
+
+  int32_t position = StringMatch(string, searchString, 0);
+
+  if (position < 0) {
+    return string;
+  }
+
+
+  JSStringBuilder result(cx);
+  if constexpr (std::is_same_v<StrChar, char16_t> ||
+                std::is_same_v<RepChar, char16_t>) {
+    if (!result.ensureTwoByteChars()) {
+      return nullptr;
+    }
+  }
+
+  bool internalFailure = false;
+  {
+    AutoCheckCannotGC nogc;
+    internalFailure = !ReplaceAllInternal<StrChar, RepChar>(
+        nogc, string, searchString, replaceString, position, result);
+  }
+  if (internalFailure) {
+    return nullptr;
+  }
+
+  return result.finishString();
+}
+
+template <typename StrChar, typename RepChar>
+static bool ReplaceAllInterleaveInternal(const AutoCheckCannotGC& nogc,
+                                         JSContext* cx,
+                                         const JSLinearString* string,
+                                         const JSLinearString* replaceString,
+                                         JSStringBuilder& result) {
+  const size_t stringLength = string->length();
+  const size_t replaceLength = replaceString->length();
+
+  const StrChar* strChars = string->chars<StrChar>(nogc);
+  const RepChar* repChars = replaceString->chars<RepChar>(nogc);
+
+  uint32_t dollarIndex = FindDollarIndex(repChars, replaceLength);
+
+  if (dollarIndex != UINT32_MAX) {
+    if (!result.reserve(stringLength)) {
+      return false;
+    }
+  } else {
+    CheckedInt<uint32_t> strLength(stringLength);
+    CheckedInt<uint32_t> repLength(replaceLength);
+    CheckedInt<uint32_t> length = strLength + (strLength + 1) * repLength;
+    if (!length.isValid()) {
+      ReportAllocationOverflow(cx);
+      return false;
+    }
+
+    if (!result.reserve(length.value())) {
+      return false;
+    }
+  }
+
+  auto appendReplacement = [&](size_t match) {
+    if (dollarIndex != UINT32_MAX) {
+      return AppendDollarReplacement(result, dollarIndex, match, match, string,
+                                     repChars, replaceLength);
+    }
+    return result.append(repChars, replaceLength);
+  };
+
+  for (size_t index = 0; index < stringLength; index++) {
+    if (!appendReplacement(index)) {
+      return false;
+    }
+
+    if (!result.append(strChars[index])) {
+      return false;
+    }
+  }
+
+  return appendReplacement(stringLength);
+
+}
+
+template <typename StrChar, typename RepChar>
+static JSString* ReplaceAllInterleave(JSContext* cx,
+                                      const JSLinearString* string,
+                                      const JSLinearString* replaceString) {
+
+
+
+  JSStringBuilder result(cx);
+  if constexpr (std::is_same_v<StrChar, char16_t> ||
+                std::is_same_v<RepChar, char16_t>) {
+    if (!result.ensureTwoByteChars()) {
+      return nullptr;
+    }
+  }
+
+  bool internalFailure = false;
+  {
+    AutoCheckCannotGC nogc;
+    internalFailure = !ReplaceAllInterleaveInternal<StrChar, RepChar>(
+        nogc, cx, string, replaceString, result);
+  }
+  if (internalFailure) {
+    return nullptr;
+  }
+
+  return result.finishString();
+}
+
+JSString* js::str_replaceAll_string_raw(JSContext* cx, HandleString string,
+                                        HandleString searchString,
+                                        HandleString replaceString) {
+  const size_t stringLength = string->length();
+  const size_t searchLength = searchString->length();
+
+  if (searchLength > stringLength) {
+    return string;
+  }
+
+  Rooted<JSLinearString*> str(cx, string->ensureLinear(cx));
+  if (!str) {
+    return nullptr;
+  }
+
+  Rooted<JSLinearString*> repl(cx, replaceString->ensureLinear(cx));
+  if (!repl) {
+    return nullptr;
+  }
+
+  Rooted<JSLinearString*> search(cx, searchString->ensureLinear(cx));
+  if (!search) {
+    return nullptr;
+  }
+
+  if (searchLength == 0) {
+    if (str->hasTwoByteChars()) {
+      if (repl->hasTwoByteChars()) {
+        return ReplaceAllInterleave<char16_t, char16_t>(cx, str, repl);
+      }
+      return ReplaceAllInterleave<char16_t, Latin1Char>(cx, str, repl);
+    }
+    if (repl->hasTwoByteChars()) {
+      return ReplaceAllInterleave<Latin1Char, char16_t>(cx, str, repl);
+    }
+    return ReplaceAllInterleave<Latin1Char, Latin1Char>(cx, str, repl);
+  }
+
+  MOZ_ASSERT(stringLength > 0);
+
+  if (str->hasTwoByteChars()) {
+    if (repl->hasTwoByteChars()) {
+      return ReplaceAll<char16_t, char16_t>(cx, str, search, repl);
+    }
+    return ReplaceAll<char16_t, Latin1Char>(cx, str, search, repl);
+  }
+  if (repl->hasTwoByteChars()) {
+    return ReplaceAll<Latin1Char, char16_t>(cx, str, search, repl);
+  }
+  return ReplaceAll<Latin1Char, Latin1Char>(cx, str, search, repl);
+}
+
+static ArrayObject* SingleElementStringArray(JSContext* cx,
+                                             Handle<JSLinearString*> str) {
+  ArrayObject* array = NewDenseFullyAllocatedArray(cx, 1);
+  if (!array) {
+    return nullptr;
+  }
+  array->setDenseInitializedLength(1);
+  array->initDenseElement(0, StringValue(str));
+  return array;
+}
+
+static ArrayObject* SplitHelper(JSContext* cx, Handle<JSLinearString*> str,
+                                uint32_t limit, Handle<JSLinearString*> sep) {
+  size_t strLength = str->length();
+  size_t sepLength = sep->length();
+  MOZ_ASSERT(sepLength != 0);
+
+  if (strLength == 0) {
+    int match = StringMatch(str, sep, 0);
+
+    if (match != -1) {
+      return NewDenseEmptyArray(cx);
+    }
+
+    return SingleElementStringArray(cx, str);
+  }
+
+  Rooted<ArrayObject*> substrings(cx, NewDenseEmptyArray(cx));
+  if (!substrings) {
+    return nullptr;
+  }
+
+  AutoSelectGCHeap gcHeap(cx);
+
+  size_t lastEndIndex = 0;
+
+  size_t index = 0;
+
+  while (index != strLength) {
+    int match = StringMatch(str, sep, index);
+
+    if (match == -1) {
+      break;
+    }
+
+    size_t endIndex = match + sepLength;
+
+    if (endIndex == lastEndIndex) {
+      index++;
+      continue;
+    }
+
+    MOZ_ASSERT(lastEndIndex < endIndex);
+    MOZ_ASSERT(sepLength <= strLength);
+    MOZ_ASSERT(lastEndIndex + sepLength <= endIndex);
+
+    size_t subLength = size_t(endIndex - sepLength - lastEndIndex);
+    JSString* sub =
+        NewDependentString(cx, str, lastEndIndex, subLength, gcHeap);
+
+    if (!sub || !NewbornArrayPush(cx, substrings, StringValue(sub))) {
+      return nullptr;
+    }
+
+    if (substrings->length() == limit) {
+      return substrings;
+    }
+
+    index = endIndex;
+
+    lastEndIndex = index;
+  }
+
+  size_t subLength = strLength - lastEndIndex;
+  JSString* sub = NewDependentString(cx, str, lastEndIndex, subLength, gcHeap);
+
+  if (!sub || !NewbornArrayPush(cx, substrings, StringValue(sub))) {
+    return nullptr;
+  }
+
+  return substrings;
+}
+
+static ArrayObject* CharSplitHelper(JSContext* cx, Handle<JSLinearString*> str,
+                                    uint32_t limit) {
+  size_t strLength = str->length();
+  if (strLength == 0) {
+    return NewDenseEmptyArray(cx);
+  }
+
+  js::StaticStrings& staticStrings = cx->staticStrings();
+  uint32_t resultlen = (limit < strLength ? limit : strLength);
+  MOZ_ASSERT(limit > 0 && resultlen > 0,
+             "Neither limit nor strLength is zero, so resultlen is greater "
+             "than zero.");
+
+  Rooted<ArrayObject*> splits(cx, NewDenseFullyAllocatedArray(cx, resultlen));
+  if (!splits) {
+    return nullptr;
+  }
+
+  if (str->hasLatin1Chars()) {
+    splits->setDenseInitializedLength(resultlen);
+
+    JS::AutoCheckCannotGC nogc;
+    const Latin1Char* latin1Chars = str->latin1Chars(nogc);
+    for (size_t i = 0; i < resultlen; ++i) {
+      Latin1Char c = latin1Chars[i];
+      MOZ_ASSERT(staticStrings.hasUnit(c));
+      splits->initDenseElement(i, StringValue(staticStrings.getUnit(c)));
+    }
+  } else {
+    splits->ensureDenseInitializedLength(0, resultlen);
+
+    for (size_t i = 0; i < resultlen; ++i) {
+      JSString* sub = staticStrings.getUnitStringForElement(cx, str, i);
+      if (!sub) {
+        return nullptr;
+      }
+      splits->initDenseElement(i, StringValue(sub));
+    }
+  }
+
+  return splits;
+}
+
+template <typename TextChar>
+static ArrayObject* SplitSingleCharHelper(JSContext* cx,
+                                          Handle<JSLinearString*> str,
+                                          char16_t patCh) {
+  uint32_t count = 0;
+  if (patCh <= std::numeric_limits<TextChar>::max()) {
+    JS::AutoCheckCannotGC nogc;
+
+    auto text = str->range<TextChar>(nogc);
+
+    count = std::count(text.begin().get(), text.end().get(),
+                       static_cast<TextChar>(patCh));
+  }
+
+  if (count == 0) {
+    return SingleElementStringArray(cx, str);
+  }
+
+  Rooted<ArrayObject*> splits(cx, NewDenseFullyAllocatedArray(cx, count + 1));
+  if (!splits) {
+    return nullptr;
+  }
+  splits->ensureDenseInitializedLength(0, count + 1);
+
+  uint32_t splitsIndex = 0;
+  size_t lastEndIndex = 0;
+  size_t textLen = str->length();
+  while (splitsIndex < count) {
+    size_t index;
+    {
+      JS::AutoCheckCannotGC nogc;
+
+      auto text = str->range<TextChar>(nogc);
+
+      auto* p = std::find(text.begin().get() + lastEndIndex, text.end().get(),
+                          static_cast<TextChar>(patCh));
+      MOZ_ASSERT(p != text.end().get());
+
+      index = std::distance(text.begin().get(), p);
+    }
+
+    size_t subLength = index - lastEndIndex;
+    JSString* sub = NewDependentString(cx, str, lastEndIndex, subLength);
+    if (!sub) {
+      return nullptr;
+    }
+    splits->initDenseElement(splitsIndex++, StringValue(sub));
+    lastEndIndex = index + 1;
+  }
+  MOZ_ASSERT(lastEndIndex <= textLen);
+
+  JSString* sub =
+      NewDependentString(cx, str, lastEndIndex, textLen - lastEndIndex);
+  if (!sub) {
+    return nullptr;
+  }
+  splits->initDenseElement(splitsIndex++, StringValue(sub));
+
+  return splits;
+}
+
+ArrayObject* js::StringSplitString(JSContext* cx, HandleString str,
+                                   HandleString sep, uint32_t limit) {
+  MOZ_ASSERT(limit > 0, "Only called for strictly positive limit.");
+
+  Rooted<JSLinearString*> linearStr(cx, str->ensureLinear(cx));
+  if (!linearStr) {
+    return nullptr;
+  }
+
+  Rooted<JSLinearString*> linearSep(cx, sep->ensureLinear(cx));
+  if (!linearSep) {
+    return nullptr;
+  }
+
+  if (linearSep->length() == 0) {
+    return CharSplitHelper(cx, linearStr, limit);
+  }
+
+  if (linearSep->length() == 1 && limit >= static_cast<uint32_t>(INT32_MAX)) {
+    char16_t ch = linearSep->latin1OrTwoByteChar(0);
+    if (linearStr->hasLatin1Chars()) {
+      return SplitSingleCharHelper<Latin1Char>(cx, linearStr, ch);
+    }
+    return SplitSingleCharHelper<char16_t>(cx, linearStr, ch);
+  }
+
+  return SplitHelper(cx, linearStr, limit, linearSep);
+}
+
+static const JSFunctionSpec string_methods[] = {
+    JS_FN("toSource", str_toSource, 0, 0),
+
+    JS_INLINABLE_FN("toString", str_toString, 0, 0, StringToString),
+    JS_INLINABLE_FN("valueOf", str_toString, 0, 0, StringValueOf),
+    JS_INLINABLE_FN("toLowerCase", str_toLowerCase, 0, 0, StringToLowerCase),
+    JS_INLINABLE_FN("toUpperCase", str_toUpperCase, 0, 0, StringToUpperCase),
+    JS_INLINABLE_FN("charAt", str_charAt, 1, 0, StringCharAt),
+    JS_INLINABLE_FN("charCodeAt", str_charCodeAt, 1, 0, StringCharCodeAt),
+    JS_INLINABLE_FN("codePointAt", str_codePointAt, 1, 0, StringCodePointAt),
+    JS_INLINABLE_FN("at", str_at, 1, 0, StringAt),
+    JS_SELF_HOSTED_FN("substring", "String_substring", 2, 0),
+    JS_SELF_HOSTED_FN("padStart", "String_pad_start", 2, 0),
+    JS_SELF_HOSTED_FN("padEnd", "String_pad_end", 2, 0),
+    JS_INLINABLE_FN("includes", str_includes, 1, 0, StringIncludes),
+    JS_INLINABLE_FN("indexOf", str_indexOf, 1, 0, StringIndexOf),
+    JS_INLINABLE_FN("lastIndexOf", str_lastIndexOf, 1, 0, StringLastIndexOf),
+    JS_INLINABLE_FN("startsWith", str_startsWith, 1, 0, StringStartsWith),
+    JS_INLINABLE_FN("endsWith", str_endsWith, 1, 0, StringEndsWith),
+    JS_INLINABLE_FN("trim", str_trim, 0, 0, StringTrim),
+    JS_INLINABLE_FN("trimStart", str_trimStart, 0, 0, StringTrimStart),
+    JS_INLINABLE_FN("trimEnd", str_trimEnd, 0, 0, StringTrimEnd),
+    JS_INLINABLE_FN("toLocaleLowerCase", str_toLocaleLowerCase, 0, 0,
+                    StringToLocaleLowerCase),
+    JS_INLINABLE_FN("toLocaleUpperCase", str_toLocaleUpperCase, 0, 0,
+                    StringToLocaleUpperCase),
+    JS_FN("localeCompare", str_localeCompare, 1, 0),
+    JS_SELF_HOSTED_FN("repeat", "String_repeat", 1, 0),
+    JS_FN("normalize", str_normalize, 0, 0),
+
+    JS_SELF_HOSTED_FN("match", "String_match", 1, 0),
+    JS_SELF_HOSTED_FN("matchAll", "String_matchAll", 1, 0),
+    JS_SELF_HOSTED_FN("search", "String_search", 1, 0),
+    JS_SELF_HOSTED_FN("replace", "String_replace", 2, 0),
+    JS_SELF_HOSTED_FN("replaceAll", "String_replaceAll", 2, 0),
+    JS_SELF_HOSTED_FN("split", "String_split", 2, 0),
+    JS_SELF_HOSTED_FN("substr", "String_substr", 2, 0),
+
+    JS_SELF_HOSTED_FN("concat", "String_concat", 1, 0),
+    JS_SELF_HOSTED_FN("slice", "String_slice", 2, 0),
+
+    JS_SELF_HOSTED_FN("bold", "String_bold", 0, 0),
+    JS_SELF_HOSTED_FN("italics", "String_italics", 0, 0),
+    JS_SELF_HOSTED_FN("fixed", "String_fixed", 0, 0),
+    JS_SELF_HOSTED_FN("strike", "String_strike", 0, 0),
+    JS_SELF_HOSTED_FN("small", "String_small", 0, 0),
+    JS_SELF_HOSTED_FN("big", "String_big", 0, 0),
+    JS_SELF_HOSTED_FN("blink", "String_blink", 0, 0),
+    JS_SELF_HOSTED_FN("sup", "String_sup", 0, 0),
+    JS_SELF_HOSTED_FN("sub", "String_sub", 0, 0),
+    JS_SELF_HOSTED_FN("anchor", "String_anchor", 1, 0),
+    JS_SELF_HOSTED_FN("link", "String_link", 1, 0),
+    JS_SELF_HOSTED_FN("fontcolor", "String_fontcolor", 1, 0),
+    JS_SELF_HOSTED_FN("fontsize", "String_fontsize", 1, 0),
+
+    JS_SELF_HOSTED_SYM_FN(iterator, "String_iterator", 0, 0),
+
+    JS_FN("isWellFormed", str_isWellFormed, 0, 0),
+    JS_FN("toWellFormed", str_toWellFormed, 0, 0),
+
+    JS_FS_END,
+};
+
+bool js::StringConstructor(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  RootedString str(cx);
+  if (args.length() > 0) {
+    if (!args.isConstructing() && args[0].isSymbol()) {
+      return js::SymbolDescriptiveString(cx, args[0].toSymbol(), args.rval());
+    }
+
+    str = ToString<CanGC>(cx, args[0]);
+    if (!str) {
+      return false;
+    }
+  } else {
+    str = cx->runtime()->emptyString;
+  }
+
+  if (args.isConstructing()) {
+    RootedObject proto(cx);
+    if (!GetPrototypeFromBuiltinConstructor(cx, args, JSProto_String, &proto)) {
+      return false;
+    }
+
+    StringObject* strobj = StringObject::create(cx, str, proto);
+    if (!strobj) {
+      return false;
+    }
+    args.rval().setObject(*strobj);
+    return true;
+  }
+
+  args.rval().setString(str);
+  return true;
+}
+
+static inline JSLinearString* CodeUnitToString(JSContext* cx, char16_t code) {
+  if (StaticStrings::hasUnit(code)) {
+    return cx->staticStrings().getUnit(code);
+  }
+  return NewInlineString<CanGC>(cx, {code}, 1);
+}
+
+JSLinearString* js::StringFromCharCode(JSContext* cx, int32_t charCode) {
+  return CodeUnitToString(cx, char16_t(charCode));
+}
+
+JSLinearString* js::StringFromCodePoint(JSContext* cx, char32_t codePoint) {
+  MOZ_ASSERT(codePoint <= unicode::NonBMPMax);
+
+  if (!unicode::IsSupplementary(codePoint)) {
+    return CodeUnitToString(cx, char16_t(codePoint));
+  }
+
+  char16_t chars[] = {unicode::LeadSurrogate(codePoint),
+                      unicode::TrailSurrogate(codePoint)};
+  return NewInlineString<CanGC>(cx, chars, 2);
+}
+
+static bool GuessFromCharCodeIsLatin1(const CallArgs& args) {
+  constexpr unsigned SampleSize = 8;
+
+  for (unsigned i = 0; i < std::min(args.length(), SampleSize); i++) {
+    auto v = args[i];
+    if (v.isInt32() && uint16_t(v.toInt32()) > JSString::MAX_LATIN1_CHAR) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool str_fromCharCode(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  MOZ_ASSERT(args.length() <= ARGS_LENGTH_MAX);
+
+  if (args.length() == 1) {
+    uint16_t code;
+    if (!ToUint16(cx, args[0], &code)) {
+      return false;
+    }
+
+    JSString* str = CodeUnitToString(cx, char16_t(code));
+    if (!str) {
+      return false;
+    }
+
+    args.rval().setString(str);
+    return true;
+  }
+
+  StringChars<Latin1Char> latin1Chars(cx);
+
+  unsigned i = 0;
+  uint16_t firstTwoByteChar = 0;
+  if (GuessFromCharCodeIsLatin1(args)) {
+    if (!latin1Chars.maybeAlloc(cx, args.length())) {
+      return false;
+    }
+
+    for (; i < args.length(); i++) {
+      uint16_t code;
+      if (!ToUint16(cx, args[i], &code)) {
+        return false;
+      }
+
+      if (code > JSString::MAX_LATIN1_CHAR) {
+        firstTwoByteChar = code;
+        break;
+      }
+
+      AutoCheckCannotGC nogc;
+      latin1Chars.data(nogc)[i] = code;
+    }
+
+    if (i == args.length()) {
+      JSString* str = latin1Chars.toStringDontDeflate<CanGC>(cx, args.length());
+      if (!str) {
+        return false;
+      }
+
+      args.rval().setString(str);
+      return true;
+    }
+  }
+
+  StringChars<char16_t> twoByteChars(cx);
+  if (!twoByteChars.maybeAlloc(cx, args.length())) {
+    return false;
+  }
+
+  if (i > 0) {
+    AutoCheckCannotGC nogc;
+    std::copy_n(latin1Chars.data(nogc), i, twoByteChars.data(nogc));
+  }
+
+  if (firstTwoByteChar > 0) {
+    MOZ_ASSERT(firstTwoByteChar > JSString::MAX_LATIN1_CHAR);
+
+    AutoCheckCannotGC nogc;
+    twoByteChars.data(nogc)[i++] = char16_t(firstTwoByteChar);
+  }
+
+  for (; i < args.length(); i++) {
+    uint16_t code;
+    if (!ToUint16(cx, args[i], &code)) {
+      return false;
+    }
+
+    AutoCheckCannotGC nogc;
+    twoByteChars.data(nogc)[i] = code;
+  }
+
+  JSString* str = twoByteChars.toStringDontDeflate<CanGC>(cx, args.length());
+  if (!str) {
+    return false;
+  }
+
+  args.rval().setString(str);
+  return true;
+}
+
+static MOZ_ALWAYS_INLINE bool ToCodePoint(JSContext* cx, HandleValue code,
+                                          char32_t* codePoint) {
+
+  if (code.isInt32()) {
+    int32_t nextCP = code.toInt32();
+
+    if (MOZ_LIKELY(uint32_t(nextCP) <= unicode::NonBMPMax)) {
+      *codePoint = char32_t(nextCP);
+      return true;
+    }
+  }
+
+  double nextCP;
+  if (!ToNumber(cx, code, &nextCP)) {
+    return false;
+  }
+
+  if (JS::ToInteger(nextCP) != nextCP || nextCP < 0 ||
+      nextCP > unicode::NonBMPMax) {
+    ToCStringBuf cbuf;
+    const char* numStr = NumberToCString(&cbuf, nextCP);
+    MOZ_ASSERT(numStr);
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_NOT_A_CODEPOINT, numStr);
+    return false;
+  }
+
+  *codePoint = char32_t(nextCP);
+  return true;
+}
+
+static bool str_fromCodePoint_few_args(JSContext* cx, const CallArgs& args) {
+  MOZ_ASSERT(args.length() <= JSFatInlineString::MAX_LENGTH_TWO_BYTE / 2);
+
+  char16_t elements[JSFatInlineString::MAX_LENGTH_TWO_BYTE];
+
+  unsigned length = 0;
+  for (unsigned nextIndex = 0; nextIndex < args.length(); nextIndex++) {
+    char32_t codePoint;
+    if (!ToCodePoint(cx, args[nextIndex], &codePoint)) {
+      return false;
+    }
+
+    unicode::UTF16Encode(codePoint, elements, &length);
+  }
+
+  JSString* str = NewStringCopyN<CanGC>(cx, elements, length);
+  if (!str) {
+    return false;
+  }
+
+  args.rval().setString(str);
+  return true;
+}
+
+bool js::str_fromCodePoint(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  if (args.length() == 1) {
+
+    char32_t codePoint;
+    if (!ToCodePoint(cx, args[0], &codePoint)) {
+      return false;
+    }
+
+    JSString* str = StringFromCodePoint(cx, codePoint);
+    if (!str) {
+      return false;
+    }
+
+    args.rval().setString(str);
+    return true;
+  }
+
+  if (args.length() <= JSFatInlineString::MAX_LENGTH_TWO_BYTE / 2) {
+    return str_fromCodePoint_few_args(cx, args);
+  }
+
+  static_assert(
+      ARGS_LENGTH_MAX < std::numeric_limits<decltype(args.length())>::max() / 2,
+      "|args.length() * 2| does not overflow");
+  auto elements = cx->make_pod_arena_array<char16_t>(js::StringBufferArena,
+                                                     args.length() * 2);
+  if (!elements) {
+    return false;
+  }
+
+  unsigned length = 0;
+  for (unsigned nextIndex = 0; nextIndex < args.length(); nextIndex++) {
+    char32_t codePoint;
+    if (!ToCodePoint(cx, args[nextIndex], &codePoint)) {
+      return false;
+    }
+
+    unicode::UTF16Encode(codePoint, elements.get(), &length);
+  }
+
+  JSString* str = NewString<CanGC>(cx, std::move(elements), length);
+  if (!str) {
+    return false;
+  }
+
+  args.rval().setString(str);
+  return true;
+}
+
+static const JSFunctionSpec string_static_methods[] = {
+    JS_INLINABLE_FN("fromCharCode", str_fromCharCode, 1, 0, StringFromCharCode),
+    JS_INLINABLE_FN("fromCodePoint", str_fromCodePoint, 1, 0,
+                    StringFromCodePoint),
+
+    JS_SELF_HOSTED_FN("raw", "String_static_raw", 1, 0),
+    JS_FS_END,
+};
+
+SharedShape* StringObject::assignInitialShape(JSContext* cx,
+                                              Handle<StringObject*> obj) {
+  MOZ_ASSERT(obj->empty());
+
+  if (!NativeObject::addPropertyInReservedSlot(cx, obj, cx->names().length,
+                                               LENGTH_SLOT, {})) {
+    return nullptr;
+  }
+
+  return obj->sharedShape();
+}
+
+JSObject* StringObject::createPrototype(JSContext* cx, JSProtoKey key) {
+  Rooted<JSString*> empty(cx, cx->runtime()->emptyString);
+
+  Rooted<StringObject*> proto(
+      cx, GlobalObject::createBlankPrototype<StringObject>(
+              cx, cx->global(),
+              ObjectFlags({
+                  ObjectFlag::NeedsProxyGetSetResultValidation,
+                  ObjectFlag::HasNonWritableOrAccessorPropExclProto,
+              })));
+  if (!proto) {
+    return nullptr;
+  }
+  if (!StringObject::init(cx, proto, empty)) {
+    return nullptr;
+  }
+  return proto;
+}
+
+static bool StringClassFinish(JSContext* cx, HandleObject ctor,
+                              HandleObject proto) {
+  Handle<NativeObject*> nativeProto = proto.as<NativeObject>();
+
+  RootedValue trimFn(cx);
+  RootedId trimId(cx, NameToId(cx->names().trimStart));
+  RootedId trimAliasId(cx, NameToId(cx->names().trimLeft));
+  if (!NativeGetProperty(cx, nativeProto, trimId, &trimFn) ||
+      !NativeDefineDataProperty(cx, nativeProto, trimAliasId, trimFn, 0)) {
+    return false;
+  }
+
+  trimId = NameToId(cx->names().trimEnd);
+  trimAliasId = NameToId(cx->names().trimRight);
+  if (!NativeGetProperty(cx, nativeProto, trimId, &trimFn) ||
+      !NativeDefineDataProperty(cx, nativeProto, trimAliasId, trimFn, 0)) {
+    return false;
+  }
+
+  if (!JS_DefineFunctions(cx, cx->global(), string_functions)) {
+    return false;
+  }
+
+  return true;
+}
+
+const ClassSpec StringObject::classSpec_ = {
+    GenericCreateConstructor<StringConstructor, 1, gc::AllocKind::FUNCTION,
+                             &jit::JitInfo_String>,
+    StringObject::createPrototype,
+    string_static_methods,
+    nullptr,
+    string_methods,
+    nullptr,
+    StringClassFinish,
+};
+
+#define ____ false
+
+static const bool js_isUriReservedPlusPound[] = {
+    // clang-format off
+ ____, ____, ____, ____, ____, ____, ____, ____, ____, ____,
+ ____, ____, ____, ____, ____, ____, ____, ____, ____, ____,
+ ____, ____, ____, ____, ____, ____, ____, ____, ____, ____,
+ ____, ____, ____, ____, ____, true, true, ____, true, ____,
+ ____, ____, ____, true, true, ____, ____, true, ____, ____,
+ ____, ____, ____, ____, ____, ____, ____, ____, true, true,
+ ____, true, ____, true, true, ____, ____, ____, ____, ____,
+ ____, ____, ____, ____, ____, ____, ____, ____, ____, ____,
+ ____, ____, ____, ____, ____, ____, ____, ____, ____, ____,
+ ____, ____, ____, ____, ____, ____, ____, ____, ____, ____,
+ ____, ____, ____, ____, ____, ____, ____, ____, ____, ____,
+ ____, ____, ____, ____, ____, ____, ____, ____, ____, ____,
+ ____, ____, ____, ____, ____, ____, ____, ____
+    // clang-format on
+};
+
+static const bool js_isUriUnescaped[] = {
+    // clang-format off
+ ____, ____, ____, ____, ____, ____, ____, ____, ____, ____,
+ ____, ____, ____, ____, ____, ____, ____, ____, ____, ____,
+ ____, ____, ____, ____, ____, ____, ____, ____, ____, ____,
+ ____, ____, ____, true, ____, ____, ____, ____, ____, true,
+ true, true, true, ____, ____, true, true, ____, true, true,
+ true, true, true, true, true, true, true, true, ____, ____,
+ ____, ____, ____, ____, ____, true, true, true, true, true,
+ true, true, true, true, true, true, true, true, true, true,
+ true, true, true, true, true, true, true, true, true, true,
+ true, ____, ____, ____, ____, true, ____, true, true, true,
+ true, true, true, true, true, true, true, true, true, true,
+ true, true, true, true, true, true, true, true, true, true,
+ true, true, true, ____, ____, ____, true, ____
+    // clang-format on
+};
+
+#undef ____
+
+static inline bool TransferBufferToString(JSStringBuilder& sb, JSString* str,
+                                          MutableHandleValue rval) {
+  if (!sb.empty()) {
+    str = sb.finishString();
+    if (!str) {
+      return false;
+    }
+  }
+  rval.setString(str);
+  return true;
+}
+
+enum EncodeResult { Encode_Failure, Encode_BadUri, Encode_Success };
+
+template <typename CharT>
+static MOZ_NEVER_INLINE EncodeResult Encode(StringBuilder& sb,
+                                            const CharT* chars, size_t length,
+                                            const bool* unescapedSet) {
+  Latin1Char hexBuf[3];
+  hexBuf[0] = '%';
+
+  auto appendEncoded = [&sb, &hexBuf](Latin1Char c) {
+    static const char HexDigits[] = "0123456789ABCDEF"; 
+
+    hexBuf[1] = HexDigits[c >> 4];
+    hexBuf[2] = HexDigits[c & 0xf];
+    return sb.append(hexBuf, 3);
+  };
+
+  auto appendRange = [&sb, chars, length](size_t start, size_t end) {
+    MOZ_ASSERT(start <= end);
+
+    if (start < end) {
+      if (start == 0) {
+        if (!sb.reserve(length)) {
+          return false;
+        }
+      }
+      return sb.append(chars + start, chars + end);
+    }
+    return true;
+  };
+
+  size_t startAppend = 0;
+  for (size_t k = 0; k < length; k++) {
+    CharT c = chars[k];
+    if (c < 128 &&
+        (js_isUriUnescaped[c] || (unescapedSet && unescapedSet[c]))) {
+      continue;
+    } else {
+      if (!appendRange(startAppend, k)) {
+        return Encode_Failure;
+      }
+
+      if constexpr (std::is_same_v<CharT, Latin1Char>) {
+        if (c < 0x80) {
+          if (!appendEncoded(c)) {
+            return Encode_Failure;
+          }
+        } else {
+          if (!appendEncoded(0xC0 | (c >> 6)) ||
+              !appendEncoded(0x80 | (c & 0x3F))) {
+            return Encode_Failure;
+          }
+        }
+      } else {
+        if (unicode::IsTrailSurrogate(c)) {
+          return Encode_BadUri;
+        }
+
+        char32_t v;
+        if (!unicode::IsLeadSurrogate(c)) {
+          v = c;
+        } else {
+          k++;
+          if (k == length) {
+            return Encode_BadUri;
+          }
+
+          char16_t c2 = chars[k];
+          if (!unicode::IsTrailSurrogate(c2)) {
+            return Encode_BadUri;
+          }
+
+          v = unicode::UTF16Decode(c, c2);
+        }
+
+        uint8_t utf8buf[4];
+        size_t L = OneUcs4ToUtf8Char(utf8buf, v);
+        for (size_t j = 0; j < L; j++) {
+          if (!appendEncoded(utf8buf[j])) {
+            return Encode_Failure;
+          }
+        }
+      }
+
+      startAppend = k + 1;
+    }
+  }
+
+  if (startAppend > 0) {
+    if (!appendRange(startAppend, length)) {
+      return Encode_Failure;
+    }
+  }
+
+  return Encode_Success;
+}
+
+static MOZ_ALWAYS_INLINE bool Encode(JSContext* cx, Handle<JSLinearString*> str,
+                                     const bool* unescapedSet,
+                                     MutableHandleValue rval) {
+  size_t length = str->length();
+  if (length == 0) {
+    rval.setString(cx->runtime()->emptyString);
+    return true;
+  }
+
+  JSStringBuilder sb(cx);
+
+  EncodeResult res;
+  if (str->hasLatin1Chars()) {
+    AutoCheckCannotGC nogc;
+    res = Encode(sb, str->latin1Chars(nogc), str->length(), unescapedSet);
+  } else {
+    AutoCheckCannotGC nogc;
+    res = Encode(sb, str->twoByteChars(nogc), str->length(), unescapedSet);
+  }
+
+  if (res == Encode_Failure) {
+    return false;
+  }
+
+  if (res == Encode_BadUri) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr, JSMSG_BAD_URI);
+    return false;
+  }
+
+  MOZ_ASSERT(res == Encode_Success);
+  return TransferBufferToString(sb, str, rval);
+}
+
+enum DecodeResult { Decode_Failure, Decode_BadUri, Decode_Success };
+
+template <typename CharT>
+static DecodeResult Decode(StringBuilder& sb, const CharT* chars, size_t length,
+                           const bool* reservedSet) {
+  auto appendRange = [&sb, chars](size_t start, size_t end) {
+    MOZ_ASSERT(start <= end);
+
+    if (start < end) {
+      return sb.append(chars + start, chars + end);
+    }
+    return true;
+  };
+
+  size_t startAppend = 0;
+  for (size_t k = 0; k < length; k++) {
+    CharT c = chars[k];
+    if (c == '%') {
+      size_t start = k;
+      if ((k + 2) >= length) {
+        return Decode_BadUri;
+      }
+
+      if (!IsAsciiHexDigit(chars[k + 1]) || !IsAsciiHexDigit(chars[k + 2])) {
+        return Decode_BadUri;
+      }
+
+      uint32_t B = AsciiAlphanumericToNumber(chars[k + 1]) * 16 +
+                   AsciiAlphanumericToNumber(chars[k + 2]);
+      k += 2;
+      if (B < 128) {
+        Latin1Char ch = Latin1Char(B);
+        if (reservedSet && reservedSet[ch]) {
+          continue;
+        }
+
+        if (!appendRange(startAppend, start)) {
+          return Decode_Failure;
+        }
+        if (!sb.append(ch)) {
+          return Decode_Failure;
+        }
+      } else {
+        int n = 1;
+        while (B & (0x80 >> n)) {
+          n++;
+        }
+
+        if (n == 1 || n > 4) {
+          return Decode_BadUri;
+        }
+
+        uint8_t octets[4];
+        octets[0] = (uint8_t)B;
+        if (k + 3 * (n - 1) >= length) {
+          return Decode_BadUri;
+        }
+
+        for (int j = 1; j < n; j++) {
+          k++;
+          if (chars[k] != '%') {
+            return Decode_BadUri;
+          }
+
+          if (!IsAsciiHexDigit(chars[k + 1]) ||
+              !IsAsciiHexDigit(chars[k + 2])) {
+            return Decode_BadUri;
+          }
+
+          B = AsciiAlphanumericToNumber(chars[k + 1]) * 16 +
+              AsciiAlphanumericToNumber(chars[k + 2]);
+          if ((B & 0xC0) != 0x80) {
+            return Decode_BadUri;
+          }
+
+          k += 2;
+          octets[j] = char(B);
+        }
+
+        if (!appendRange(startAppend, start)) {
+          return Decode_Failure;
+        }
+
+        char32_t v = JS::Utf8ToOneUcs4Char(octets, n);
+        MOZ_ASSERT(v >= 128);
+        if (v >= unicode::NonBMPMin) {
+          if (v > unicode::NonBMPMax) {
+            return Decode_BadUri;
+          }
+
+          if (!sb.append(unicode::LeadSurrogate(v))) {
+            return Decode_Failure;
+          }
+          if (!sb.append(unicode::TrailSurrogate(v))) {
+            return Decode_Failure;
+          }
+        } else {
+          if (!sb.append(char16_t(v))) {
+            return Decode_Failure;
+          }
+        }
+      }
+
+      startAppend = k + 1;
+    }
+  }
+
+  if (startAppend > 0) {
+    if (!appendRange(startAppend, length)) {
+      return Decode_Failure;
+    }
+  }
+
+  return Decode_Success;
+}
+
+static bool Decode(JSContext* cx, Handle<JSLinearString*> str,
+                   const bool* reservedSet, MutableHandleValue rval) {
+  size_t length = str->length();
+  if (length == 0) {
+    rval.setString(cx->runtime()->emptyString);
+    return true;
+  }
+
+  JSStringBuilder sb(cx);
+
+  DecodeResult res;
+  if (str->hasLatin1Chars()) {
+    AutoCheckCannotGC nogc;
+    res = Decode(sb, str->latin1Chars(nogc), str->length(), reservedSet);
+  } else {
+    AutoCheckCannotGC nogc;
+    res = Decode(sb, str->twoByteChars(nogc), str->length(), reservedSet);
+  }
+
+  if (res == Decode_Failure) {
+    return false;
+  }
+
+  if (res == Decode_BadUri) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr, JSMSG_BAD_URI);
+    return false;
+  }
+
+  MOZ_ASSERT(res == Decode_Success);
+  return TransferBufferToString(sb, str, rval);
+}
+
+static bool str_decodeURI(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "decodeURI");
+  CallArgs args = CallArgsFromVp(argc, vp);
+  Rooted<JSLinearString*> str(cx, ArgToLinearString(cx, args, 0));
+  if (!str) {
+    return false;
+  }
+
+  return Decode(cx, str, js_isUriReservedPlusPound, args.rval());
+}
+
+static bool str_decodeURI_Component(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "decodeURIComponent");
+  CallArgs args = CallArgsFromVp(argc, vp);
+  Rooted<JSLinearString*> str(cx, ArgToLinearString(cx, args, 0));
+  if (!str) {
+    return false;
+  }
+
+  return Decode(cx, str, nullptr, args.rval());
+}
+
+static bool str_encodeURI(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "encodeURI");
+  CallArgs args = CallArgsFromVp(argc, vp);
+  Rooted<JSLinearString*> str(cx, ArgToLinearString(cx, args, 0));
+  if (!str) {
+    return false;
+  }
+
+  return Encode(cx, str, js_isUriReservedPlusPound, args.rval());
+}
+
+static bool str_encodeURI_Component(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "encodeURIComponent");
+  CallArgs args = CallArgsFromVp(argc, vp);
+  Rooted<JSLinearString*> str(cx, ArgToLinearString(cx, args, 0));
+  if (!str) {
+    return false;
+  }
+
+  return Encode(cx, str, nullptr, args.rval());
+}
+
+JSString* js::EncodeURI(JSContext* cx, const char* chars, size_t length) {
+  JSStringBuilder sb(cx);
+  EncodeResult result = Encode(sb, reinterpret_cast<const Latin1Char*>(chars),
+                               length, js_isUriReservedPlusPound);
+  if (result == EncodeResult::Encode_Failure) {
+    return nullptr;
+  }
+  if (result == EncodeResult::Encode_BadUri) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr, JSMSG_BAD_URI);
+    return nullptr;
+  }
+  if (sb.empty()) {
+    return NewStringCopyN<CanGC>(cx, chars, length);
+  }
+  return sb.finishString();
+}
+
+static bool FlatStringMatchHelper(JSContext* cx, JSString* str,
+                                  JSString* pattern, bool* isFlat,
+                                  int32_t* match) {
+  JSLinearString* linearPattern = pattern->ensureLinear(cx);
+  if (!linearPattern) {
+    return false;
+  }
+
+  static const size_t MAX_FLAT_PAT_LEN = 256;
+  if (linearPattern->length() > MAX_FLAT_PAT_LEN ||
+      StringHasRegExpMetaChars(linearPattern)) {
+    *isFlat = false;
+    return true;
+  }
+
+  *isFlat = true;
+  if (str->isRope()) {
+    if (!RopeMatch(cx, &str->asRope(), linearPattern, match)) {
+      return false;
+    }
+  } else {
+    *match = StringMatch(&str->asLinear(), linearPattern);
+  }
+
+  return true;
+}
+
+static bool BuildFlatMatchArray(JSContext* cx, HandleString str,
+                                HandleString pattern, int32_t match,
+                                MutableHandleValue rval) {
+  if (match < 0) {
+    rval.setNull();
+    return true;
+  }
+
+  Rooted<SharedShape*> shape(
+      cx, cx->global()->regExpRealm().getOrCreateMatchResultShape(cx));
+  if (!shape) {
+    return false;
+  }
+
+  Rooted<ArrayObject*> arr(cx,
+                           NewDenseFullyAllocatedArrayWithShape(cx, 1, shape));
+  if (!arr) {
+    return false;
+  }
+
+  arr->setDenseInitializedLength(1);
+  arr->initDenseElement(0, StringValue(pattern));
+
+  arr->initSlot(RegExpRealm::MatchResultObjectIndexSlot, Int32Value(match));
+
+  arr->initSlot(RegExpRealm::MatchResultObjectInputSlot, StringValue(str));
+
+#ifdef DEBUG
+  RootedValue test(cx);
+  RootedId id(cx, NameToId(cx->names().index));
+  if (!NativeGetProperty(cx, arr, id, &test)) {
+    return false;
+  }
+  MOZ_ASSERT(test == arr->getSlot(0));
+  id = NameToId(cx->names().input);
+  if (!NativeGetProperty(cx, arr, id, &test)) {
+    return false;
+  }
+  MOZ_ASSERT(test == arr->getSlot(1));
+#endif
+
+  rval.setObject(*arr);
+  return true;
+}
+
+bool js::FlatStringMatch(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  MOZ_ASSERT(args.length() == 2);
+  MOZ_ASSERT(args[0].isString());
+  MOZ_ASSERT(args[1].isString());
+  MOZ_ASSERT(cx->realm()->realmFuses.optimizeRegExpPrototypeFuse.intact());
+
+  RootedString str(cx, args[0].toString());
+  RootedString pattern(cx, args[1].toString());
+
+  bool isFlat = false;
+  int32_t match = 0;
+  if (!FlatStringMatchHelper(cx, str, pattern, &isFlat, &match)) {
+    return false;
+  }
+
+  if (!isFlat) {
+    args.rval().setUndefined();
+    return true;
+  }
+
+  return BuildFlatMatchArray(cx, str, pattern, match, args.rval());
+}
+
+bool js::FlatStringSearch(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  MOZ_ASSERT(args.length() == 2);
+  MOZ_ASSERT(args[0].isString());
+  MOZ_ASSERT(args[1].isString());
+  MOZ_ASSERT(cx->realm()->realmFuses.optimizeRegExpPrototypeFuse.intact());
+
+  JSString* str = args[0].toString();
+  JSString* pattern = args[1].toString();
+
+  bool isFlat = false;
+  int32_t match = 0;
+  if (!FlatStringMatchHelper(cx, str, pattern, &isFlat, &match)) {
+    return false;
+  }
+
+  if (!isFlat) {
+    args.rval().setInt32(-2);
+    return true;
+  }
+
+  args.rval().setInt32(match);
+  return true;
+}

@@ -1,0 +1,149 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "gfxVars.h"
+#include "gfxVarReceiver.h"
+#include "mozilla/dom/ContentChild.h"
+
+namespace mozilla {
+namespace gfx {
+
+StaticAutoPtr<gfxVars> gfxVars::sInstance;
+StaticAutoPtr<nsTArray<gfxVars::VarBase*>> gfxVars::sVarList;
+
+StaticAutoPtr<nsTArray<GfxVarUpdate>> gGfxVarInitUpdates;
+
+StaticAutoPtr<nsTArray<GfxVarUpdate>> gGfxVarPendingUpdates;
+
+void gfxVars::SetValuesForInitialize(
+    const nsTArray<GfxVarUpdate>& aInitUpdates) {
+  MOZ_RELEASE_ASSERT(!gGfxVarInitUpdates);
+
+  if (sInstance) {
+    ApplyUpdate(aInitUpdates);
+  } else {
+    gGfxVarInitUpdates = new nsTArray<GfxVarUpdate>(aInitUpdates.Clone());
+  }
+}
+
+void gfxVars::StartCollectingUpdates() {
+  MOZ_RELEASE_ASSERT(XRE_IsParentProcess());
+  MOZ_RELEASE_ASSERT(sInstance);
+  MOZ_RELEASE_ASSERT(!gGfxVarPendingUpdates);
+  gGfxVarPendingUpdates = new nsTArray<GfxVarUpdate>();
+}
+
+void gfxVars::StopCollectingUpdates() {
+  MOZ_RELEASE_ASSERT(XRE_IsParentProcess());
+  MOZ_RELEASE_ASSERT(sInstance);
+  MOZ_RELEASE_ASSERT(gGfxVarPendingUpdates);
+  if (!gGfxVarPendingUpdates->IsEmpty()) {
+    for (auto& receiver : sInstance->mReceivers) {
+      receiver->OnVarChanged(*gGfxVarPendingUpdates);
+    }
+  }
+  gGfxVarPendingUpdates = nullptr;
+}
+
+void gfxVars::Initialize() {
+  if (sInstance) {
+    MOZ_RELEASE_ASSERT(
+        !gGfxVarInitUpdates,
+        "Initial updates should not be present after any gfxVars operation");
+    return;
+  }
+
+  sVarList = new nsTArray<gfxVars::VarBase*>();
+  sInstance = new gfxVars;
+
+  MOZ_ASSERT_IF(XRE_IsContentProcess(), gGfxVarInitUpdates);
+
+  if (gGfxVarInitUpdates) {
+    ApplyUpdate(*gGfxVarInitUpdates);
+    gGfxVarInitUpdates = nullptr;
+  }
+}
+
+gfxVars::gfxVars() = default;
+
+void gfxVars::Shutdown() {
+  sInstance = nullptr;
+  sVarList = nullptr;
+  gGfxVarInitUpdates = nullptr;
+}
+
+void gfxVars::ApplyUpdate(const nsTArray<GfxVarUpdate>& aUpdate) {
+  MOZ_ASSERT(!XRE_IsParentProcess());
+  MOZ_DIAGNOSTIC_ASSERT(sVarList || gGfxVarInitUpdates);
+  if (sVarList) {
+    for (auto& i : aUpdate) {
+      sVarList->ElementAt(i.index())->SetValue(i.value());
+    }
+  } else if (gGfxVarInitUpdates) {
+    gGfxVarInitUpdates->AppendElements(aUpdate);
+  }
+}
+
+void gfxVars::AddReceiver(gfxVarReceiver* aReceiver) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (!sInstance->mReceivers.Contains(aReceiver)) {
+    sInstance->mReceivers.AppendElement(aReceiver);
+  }
+}
+
+void gfxVars::RemoveReceiver(gfxVarReceiver* aReceiver) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (sInstance) {
+    sInstance->mReceivers.RemoveElement(aReceiver);
+  }
+}
+
+nsTArray<GfxVarUpdate> gfxVars::FetchNonDefaultVars() {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(sVarList);
+
+  nsTArray<GfxVarUpdate> updates;
+  for (size_t i = 0; i < sVarList->Length(); i++) {
+    VarBase* var = sVarList->ElementAt(i);
+    if (var->HasDefaultValue()) {
+      continue;
+    }
+
+    GfxVarValue value;
+    var->GetValue(&value);
+
+    updates.AppendElement(GfxVarUpdate(i, value));
+  }
+
+  return updates;
+}
+
+gfxVars::VarBase::VarBase() {
+  mIndex = gfxVars::sVarList->Length();
+  gfxVars::sVarList->AppendElement(this);
+}
+
+void gfxVars::NotifyReceivers(VarBase* aVar) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  GfxVarValue value;
+  aVar->GetValue(&value);
+
+  if (XRE_IsParentProcess() && gGfxVarPendingUpdates) {
+    gGfxVarPendingUpdates->AppendElement(GfxVarUpdate(aVar->Index(), value));
+    return;
+  }
+
+  AutoTArray<GfxVarUpdate, 1> vars;
+  vars.AppendElement(GfxVarUpdate(aVar->Index(), value));
+
+  for (auto& receiver : mReceivers) {
+    receiver->OnVarChanged(vars);
+  }
+}
+
+}  
+}  

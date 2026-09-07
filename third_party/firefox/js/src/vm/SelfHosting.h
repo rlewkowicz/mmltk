@@ -1,0 +1,68 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef vm_SelfHosting_h_
+#define vm_SelfHosting_h_
+
+#include "NamespaceImports.h"
+
+#include "js/CallNonGenericMethod.h"
+#include "js/RootingAPI.h"
+#include "js/TypeDecls.h"
+
+
+namespace JS {
+class JS_PUBLIC_API CompileOptions;
+}
+
+namespace js {
+
+class AnyInvokeArgs;
+class PropertyName;
+class ScriptSourceObject;
+
+ScriptSourceObject* SelfHostingScriptSourceObject(JSContext* cx);
+
+bool IsSelfHostedFunctionWithName(JSFunction* fun, JSAtom* name);
+bool IsSelfHostedFunctionWithName(const Value& v, JSAtom* name);
+
+PropertyName* GetClonedSelfHostedFunctionName(const JSFunction* fun);
+void SetClonedSelfHostedFunctionName(JSFunction* fun, PropertyName* name);
+
+constexpr char ExtendedUnclonedSelfHostedFunctionNamePrefix = '$';
+
+bool IsExtendedUnclonedSelfHostedFunctionName(JSAtom* name);
+
+void SetUnclonedSelfHostedCanonicalName(JSFunction* fun, JSAtom* name);
+
+bool IsCallSelfHostedNonGenericMethod(NativeImpl impl);
+
+enum class IncompatibleContext { Regular, RegExpExec };
+
+bool ReportIncompatibleSelfHostedMethod(
+    JSContext* cx, Handle<Value> thisValue,
+    IncompatibleContext incompatibleContext);
+
+void FillSelfHostingCompileOptions(JS::CompileOptions& options);
+
+const JSFunctionSpec* FindIntrinsicSpec(PropertyName* name);
+
+#ifdef DEBUG
+bool CallSelfHostedFunction(JSContext* cx, char const* name, HandleValue thisv,
+                            const AnyInvokeArgs& args, MutableHandleValue rval);
+#endif
+
+bool CallSelfHostedFunction(JSContext* cx, Handle<PropertyName*> name,
+                            HandleValue thisv, const AnyInvokeArgs& args,
+                            MutableHandleValue rval);
+
+bool intrinsic_NewArrayIterator(JSContext* cx, unsigned argc, JS::Value* vp);
+
+bool intrinsic_NewStringIterator(JSContext* cx, unsigned argc, JS::Value* vp);
+
+bool intrinsic_NewRegExpStringIterator(JSContext* cx, unsigned argc,
+                                       JS::Value* vp);
+} 
+
+#endif /* vm_SelfHosting_h_ */

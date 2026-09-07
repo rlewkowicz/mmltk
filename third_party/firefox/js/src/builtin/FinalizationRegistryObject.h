@@ -1,0 +1,160 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef builtin_FinalizationRegistryObject_h
+#define builtin_FinalizationRegistryObject_h
+
+#include "gc/Barrier.h"
+#include "gc/FinalizationObservers.h"
+#include "js/GCVector.h"
+#include "vm/NativeObject.h"
+
+namespace js {
+
+class FinalizationRegistryObject;
+class FinalizationRecordObject;
+class FinalizationQueueObject;
+
+using HandleFinalizationRegistryObject = Handle<FinalizationRegistryObject*>;
+using HandleFinalizationRecordObject = Handle<FinalizationRecordObject*>;
+using HandleFinalizationQueueObject = Handle<FinalizationQueueObject*>;
+using RootedFinalizationRegistryObject = Rooted<FinalizationRegistryObject*>;
+using RootedFinalizationRecordObject = Rooted<FinalizationRecordObject*>;
+using RootedFinalizationQueueObject = Rooted<FinalizationQueueObject*>;
+
+
+class FinalizationRecordObject : public gc::ObserverListObject {
+  enum {
+    QueueSlot = ObserverListObject::SlotCount,
+    HeldValueSlot,
+    DebugStateSlot,  
+    SlotCount
+  };
+
+ public:
+  enum State { Unknown, InRecordMap, InQueue };
+
+  static const JSClass class_;
+
+  static FinalizationRecordObject* create(JSContext* cx,
+                                          HandleFinalizationQueueObject queue,
+                                          HandleValue heldValue);
+
+  FinalizationQueueObject* queue() const;
+  Value heldValue() const;
+  bool isRegistered() const;
+
+#ifdef DEBUG
+  void setState(State state);
+  State getState() const;
+  bool isInRecordMap() const { return getState() == InRecordMap; }
+  bool isInQueue() const { return getState() == InQueue; }
+#endif
+
+  void setInRecordMap(bool newValue);
+  void setInQueue(bool newValue);
+  void clear();
+
+ private:
+  static const JSClassOps classOps_;
+
+  static void finalize(JS::GCContext* gcx, JSObject* obj);
+};
+
+using FinalizationRecordVector =
+    GCVector<HeapPtr<FinalizationRecordObject*>, 1, js::CellAllocPolicy>;
+
+class FinalizationRegistryObject : public NativeObject {
+  enum { QueueSlot = 0, RegistrationsSlot, RecordsWithoutTokenSlot, SlotCount };
+
+ public:
+  using RegistrationsMap =
+      GCHashMap<HeapPtr<Value>, FinalizationRecordVector, gc::WeakTargetHasher>;
+
+  static const JSClass class_;
+  static const JSClass protoClass_;
+
+  FinalizationQueueObject* queue() const;
+  RegistrationsMap* registrations() const;
+  FinalizationRecordVector* recordsWithoutToken() const;
+
+  void traceWeak(JSTracer* trc, bool* hasSymbolRegistrations);
+
+  static bool unregisterRecord(FinalizationRecordObject* record);
+
+ private:
+  static const JSClassOps classOps_;
+  static const ClassSpec classSpec_;
+  static const JSFunctionSpec methods_[];
+  static const JSPropertySpec properties_[];
+
+  static bool construct(JSContext* cx, unsigned argc, Value* vp);
+  static bool register_(JSContext* cx, unsigned argc, Value* vp);
+  static bool unregister(JSContext* cx, unsigned argc, Value* vp);
+  static bool cleanupSome(JSContext* cx, unsigned argc, Value* vp);
+
+  static bool addRegistration(JSContext* cx,
+                              HandleFinalizationRegistryObject registry,
+                              HandleValue unregisterToken,
+                              HandleFinalizationRecordObject record);
+  static void removeRegistrationOnError(
+      HandleFinalizationRegistryObject registry, HandleValue unregisterToken,
+      HandleFinalizationRecordObject record);
+
+  static void trace(JSTracer* trc, JSObject* obj);
+  static void finalize(JS::GCContext* gcx, JSObject* obj);
+};
+
+class FinalizationQueueObject : public NativeObject {
+  enum {
+    CleanupCallbackSlot = 0,
+    IncumbentGlobalRepresentative,
+    RecordsToBeCleanedUpSlot,
+    IsQueuedForCleanupSlot,
+    DoCleanupFunctionSlot,
+    HasRegistrySlot,
+    SlotCount
+  };
+
+  enum DoCleanupFunctionSlots {
+    DoCleanupFunction_QueueSlot = 0,
+  };
+
+ public:
+  static const JSClass class_;
+
+  JSObject* cleanupCallback() const;
+  JSObject* getIncumbentGlobalRepresentative() const;
+  bool hasRecordsToCleanUp() const;
+  FinalizationRecordVector* recordsToBeCleanedUp() const;
+  bool isQueuedForCleanup() const;
+  JSFunction* doCleanupFunction() const;
+  bool hasRegistry() const;
+
+  void queueRecordToBeCleanedUp(FinalizationRecordObject* record);
+  void setQueuedForCleanup(bool value);
+
+  void setHasRegistry(bool newValue);
+  void clear();
+
+  static FinalizationQueueObject* create(JSContext* cx,
+                                         HandleObject cleanupCallback);
+
+  static bool cleanupQueuedRecords(JSContext* cx,
+                                   HandleFinalizationQueueObject registry,
+                                   HandleObject callback = nullptr);
+
+ private:
+  static const JSClassOps classOps_;
+
+  static bool doCleanup(JSContext* cx, unsigned argc, Value* vp);
+
+  static void trace(JSTracer* trc, JSObject* obj);
+  static void finalize(JS::GCContext* gcx, JSObject* obj);
+};
+
+}  
+
+#endif /* builtin_FinalizationRegistryObject_h */

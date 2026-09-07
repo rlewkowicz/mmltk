@@ -1,0 +1,143 @@
+/*
+ * Copyright 2024 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "src/sksl/SkSLDefines.h"
+#include "src/sksl/SkSLModule.h"
+#include "src/sksl/SkSLPosition.h"
+#include "src/sksl/ir/SkSLBlock.h"
+#include "src/sksl/ir/SkSLDoStatement.h"
+#include "src/sksl/ir/SkSLExpression.h"
+#include "src/sksl/ir/SkSLForStatement.h"
+#include "src/sksl/ir/SkSLFunctionDefinition.h"
+#include "src/sksl/ir/SkSLIRNode.h"
+#include "src/sksl/ir/SkSLIfStatement.h"
+#include "src/sksl/ir/SkSLNop.h"
+#include "src/sksl/ir/SkSLProgramElement.h"
+#include "src/sksl/ir/SkSLStatement.h"
+#include "src/sksl/transform/SkSLProgramWriter.h"
+#include "src/sksl/transform/SkSLTransform.h"
+
+#include <memory>
+#include <utility>
+#include <vector>
+
+namespace SkSL {
+
+class Context;
+
+void Transform::EliminateUnnecessaryBraces(const Context& context, Module& module) {
+    class UnnecessaryBraceEliminator : public ProgramWriter {
+    public:
+        bool visitExpressionPtr(std::unique_ptr<Expression>& expr) override {
+            return false;
+        }
+
+        bool visitStatementPtr(std::unique_ptr<Statement>& stmt) override {
+            INHERITED::visitStatementPtr(stmt);
+
+            switch (stmt->kind()) {
+                case StatementKind::kIf: {
+                    IfStatement& ifStmt = stmt->as<IfStatement>();
+                    EliminateBracesFrom(ifStmt.ifTrue());
+                    EliminateBracesFrom(ifStmt.ifFalse());
+                    break;
+                }
+                case StatementKind::kFor: {
+                    ForStatement& forStmt = stmt->as<ForStatement>();
+                    EliminateBracesFrom(forStmt.statement());
+                    break;
+                }
+                case StatementKind::kDo: {
+                    DoStatement& doStmt = stmt->as<DoStatement>();
+                    EliminateBracesFrom(doStmt.statement());
+                    break;
+                }
+                default:
+                    break;
+            }
+
+            return false;
+        }
+
+        static void EliminateBracesFrom(std::unique_ptr<Statement>& stmt) {
+            if (!stmt || !stmt->is<Block>()) {
+                return;
+            }
+            Block& block = stmt->as<Block>();
+            std::unique_ptr<Statement>* usefulStmt = nullptr;
+            for (std::unique_ptr<Statement>& childStmt : block.children()) {
+                if (childStmt->isEmpty()) {
+                    continue;
+                }
+                if (usefulStmt) {
+                    return;
+                }
+                usefulStmt = &childStmt;
+            }
+
+            if (!usefulStmt) {
+                stmt = Nop::Make();
+            } else {
+                stmt = std::move(*usefulStmt);
+            }
+        }
+
+        using INHERITED = ProgramWriter;
+    };
+
+    class RequiredBraceWriter : public ProgramWriter {
+    public:
+        RequiredBraceWriter(const Context& ctx) : fContext(ctx) {}
+
+        bool visitExpressionPtr(std::unique_ptr<Expression>& expr) override {
+            return false;
+        }
+
+        bool visitStatementPtr(std::unique_ptr<Statement>& stmt) override {
+
+            INHERITED::visitStatementPtr(stmt);
+
+            if (stmt->is<IfStatement>()) {
+                IfStatement& outer = stmt->as<IfStatement>();
+
+                if (outer.ifFalse() && outer.ifTrue()->is<IfStatement>()) {
+                    const IfStatement& inner = outer.ifTrue()->as<IfStatement>();
+
+                    if (!inner.ifFalse()) {
+                        StatementArray blockStmts;
+                        blockStmts.push_back(std::move(outer.ifTrue()));
+                        Position stmtPosition = blockStmts.front()->position();
+                        std::unique_ptr<Statement> bracedIfTrue =
+                                Block::MakeBlock(stmtPosition, std::move(blockStmts));
+                        stmt = IfStatement::Make(fContext,
+                                                 outer.position(),
+                                                 std::move(outer.test()),
+                                                 std::move(bracedIfTrue),
+                                                 std::move(outer.ifFalse()));
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        const Context& fContext;
+        using INHERITED = ProgramWriter;
+    };
+
+    for (std::unique_ptr<ProgramElement>& pe : module.fElements) {
+        if (pe->is<FunctionDefinition>()) {
+            UnnecessaryBraceEliminator eliminator;
+            eliminator.visitStatementPtr(pe->as<FunctionDefinition>().body());
+
+            RequiredBraceWriter writer(context);
+            writer.visitStatementPtr(pe->as<FunctionDefinition>().body());
+        }
+    }
+}
+
+}  

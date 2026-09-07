@@ -1,0 +1,1123 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef mozilla_dom_HTMLMediaElement_h
+#define mozilla_dom_HTMLMediaElement_h
+
+#include <utility>
+
+#include "AudioChannelService.h"
+#include "DecoderTraits.h"
+#include "MediaDecoderOwner.h"
+#include "MediaElementEventRunners.h"
+#include "MediaEventSource.h"
+#include "MediaPlaybackDelayPolicy.h"
+#include "MediaSegment.h"  // for PrincipalHandle, GraphTime
+#include "MediaTimer.h"
+#include "PrincipalChangeObserver.h"
+#include "SeekTarget.h"
+#include "Visibility.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/AwakeTimeStamp.h"
+#include "mozilla/CORSMode.h"
+#include "mozilla/StateWatching.h"
+#include "mozilla/WeakPtr.h"
+#include "mozilla/dom/DecoderDoctorNotificationBinding.h"
+#include "mozilla/dom/HTMLMediaElementBinding.h"
+#include "mozilla/dom/MediaDebugInfoBinding.h"
+#include "mozilla/dom/TextTrackManager.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsGenericHTMLElement.h"
+#include "nsGkAtoms.h"
+#include "nsStubMutationObserver.h"
+
+#ifdef CurrentTime
+#  undef CurrentTime
+#endif
+
+
+using nsMediaNetworkState = uint16_t;
+using nsMediaReadyState = uint16_t;
+using SuspendTypes = uint32_t;
+using AudibleChangedReasons = uint32_t;
+
+class nsIStreamListener;
+
+namespace mozilla {
+class AbstractThread;
+class ChannelMediaDecoder;
+class DecoderDoctorDiagnostics;
+class DOMMediaStream;
+class ErrorResult;
+class FirstFrameVideoOutput;
+class FrameStatistics;
+class MediaResource;
+class MediaDecoder;
+class MediaInputPort;
+class MediaTrack;
+class MediaTrackGraph;
+class MediaStreamWindowCapturer;
+struct SharedDummyTrack;
+class VideoFrameContainer;
+class VideoOutput;
+namespace dom {
+class HTMLSourceElement;
+class TextTrack;
+class TimeRanges;
+class WakeLock;
+class MediaStreamTrack;
+class MediaStreamTrackSource;
+class MediaTrack;
+class VideoStreamTrack;
+}  
+}  
+
+class AudioDeviceInfo;
+class nsIChannel;
+class nsIHttpChannel;
+class nsILoadGroup;
+class nsIRunnable;
+class nsISerialEventTarget;
+class nsITimer;
+class nsRange;
+
+namespace mozilla::dom {
+
+#define TIMEUPDATE_MS 250
+
+class HTMLVideoElement;
+class MediaError;
+class MediaSource;
+class PlayPromise;
+class Promise;
+class TextTrackList;
+class AudioTrackList;
+class VideoTrackList;
+
+enum class StreamCaptureType : uint8_t { CAPTURE_ALL_TRACKS, CAPTURE_AUDIO };
+
+enum class StreamCaptureBehavior : uint8_t {
+  CONTINUE_WHEN_ENDED,
+  FINISH_WHEN_ENDED
+};
+
+enum class AudioOutputConfig : bool { NotNeeded = false, Needed = true };
+
+enum MediaPreloadAttrValue : uint8_t {
+  PRELOAD_ATTR_NONE,      
+  PRELOAD_ATTR_METADATA,  
+  PRELOAD_ATTR_AUTO       
+};
+
+static const nsAttrValue::EnumTableEntry kPreloadTable[] = {
+    {"none", MediaPreloadAttrValue::PRELOAD_ATTR_NONE},
+    {"metadata", MediaPreloadAttrValue::PRELOAD_ATTR_METADATA},
+    {"auto", MediaPreloadAttrValue::PRELOAD_ATTR_AUTO},
+};
+
+static constexpr const nsAttrValue::EnumTableEntry* kPreloadDefaultType =
+    &kPreloadTable[std::size(kPreloadTable) - 1];
+
+class HTMLMediaElement : public nsGenericHTMLElement,
+                         public MediaDecoderOwner,
+                         public PrincipalChangeObserver<MediaStreamTrack>,
+                         public SupportsWeakPtr,
+                         public nsStubMutationObserver {
+ public:
+  using TimeStamp = mozilla::TimeStamp;
+  using ImageContainer = mozilla::layers::ImageContainer;
+  using VideoFrameContainer = mozilla::VideoFrameContainer;
+  using MediaResource = mozilla::MediaResource;
+  using MediaDecoderOwner = mozilla::MediaDecoderOwner;
+  using MetadataTags = mozilla::MetadataTags;
+
+  struct OutputMediaStream {
+    OutputMediaStream(RefPtr<DOMMediaStream> aStream, bool aCapturingAudioOnly,
+                      bool aFinishWhenEnded);
+    ~OutputMediaStream();
+
+    RefPtr<DOMMediaStream> mStream;
+    nsTArray<RefPtr<MediaStreamTrack>> mLiveTracks;
+    const bool mCapturingAudioOnly;
+    const bool mFinishWhenEnded;
+    nsCOMPtr<nsIURI> mFinishWhenEndedLoadingSrc;
+    RefPtr<DOMMediaStream> mFinishWhenEndedAttrStream;
+    RefPtr<MediaSource> mFinishWhenEndedMediaSource;
+  };
+
+  NS_DECL_NSIMUTATIONOBSERVER_CONTENTREMOVED
+
+  CORSMode GetCORSMode() { return mCORSMode; }
+
+  explicit HTMLMediaElement(already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo);
+  void Init();
+
+  virtual HTMLVideoElement* AsHTMLVideoElement() { return nullptr; };
+
+  enum class TimeupdateType : bool {
+    eMandatory = false,
+    ePeriodic = true,
+  };
+
+  enum class EventFlag : uint8_t {
+    eNone = 0,
+    eMandatory = 1,
+  };
+
+  nsresult LoadWithChannel(nsIChannel* aChannel, nsIStreamListener** aListener);
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(HTMLMediaElement,
+                                           nsGenericHTMLElement)
+  NS_IMPL_FROMNODE_HELPER(HTMLMediaElement,
+                          IsAnyOfHTMLElements(nsGkAtoms::video,
+                                              nsGkAtoms::audio))
+
+  NS_DECL_ADDSIZEOFEXCLUDINGTHIS
+
+  void GetEventTargetParent(EventChainPreVisitor& aVisitor) override;
+
+  void NodeInfoChanged(Document* aOldDoc) override;
+
+  bool ParseAttribute(int32_t aNamespaceID, nsAtom* aAttribute,
+                      const nsAString& aValue,
+                      nsIPrincipal* aMaybeScriptedPrincipal,
+                      nsAttrValue& aResult) override;
+
+  nsresult BindToTree(BindContext&, nsINode& aParent) override;
+  void UnbindFromTree(UnbindContext&) override;
+  void DoneCreatingElement() override;
+
+  bool IsHTMLFocusable(IsFocusableFlags, bool* aIsFocusable,
+                       int32_t* aTabIndex) override;
+  int32_t TabIndexDefault() override;
+
+  void MetadataLoaded(const MediaInfo* aInfo,
+                      UniquePtr<const MetadataTags> aTags) final;
+
+  void FirstFrameLoaded() final;
+
+  void NetworkError(const MediaResult& aError) final;
+
+  void DecodeError(const MediaResult& aError) final;
+
+  void DecodeWarning(const MediaResult& aError) final;
+
+  bool HasError() const final;
+
+  void LoadAborted() final;
+
+  void PlaybackEnded() final;
+
+  void SeekStarted() final;
+
+  void SeekCompleted() final;
+
+  void UpdatePlayedRangesBeforeSeek(double aRangeEndTime) final;
+
+  void SeekAborted() final;
+
+  void DownloadSuspended() final;
+
+  void DownloadResumed();
+
+  void DownloadProgressed() final;
+
+  void NotifySuspendedByCache(bool aSuspendedByCache) final;
+
+  bool IsActuallyInvisible() const override;
+
+  bool IsInViewPort() const;
+
+  VideoFrameContainer* GetVideoFrameContainer() final;
+  layers::ImageContainer* GetImageContainer();
+
+  void NotifyOwnerDocumentActivityChanged();
+
+  void NotifyFullScreenChanged();
+
+  bool IsInFullScreen() const;
+
+  void PrincipalChanged(MediaStreamTrack* aTrack) override;
+
+  void UpdateSrcStreamVideoPrincipal(const PrincipalHandle& aPrincipalHandle);
+
+  void PrincipalHandleChangedForVideoFrameContainer(
+      VideoFrameContainer* aContainer,
+      const PrincipalHandle& aNewPrincipalHandle) override;
+
+  void QueueEvent(const nsAString& aName) final;
+  void QueueTask(RefPtr<nsMediaEventRunner> aRunner);
+
+  void UpdateReadyState() override {
+    mWatchManager.ManualNotify(&HTMLMediaElement::UpdateReadyStateInternal);
+  }
+
+  nsresult DispatchPendingMediaEvents();
+
+  bool IsEligibleForAutoplay();
+
+  void CheckAutoplayDataReady();
+
+  void RunAutoplay();
+
+  void StartObservingGVAutoplayIfNeeded();
+
+  void StopObservingGVAutoplayIfNeeded();
+
+  bool ShouldDelayPlayUntilGVAutoplayRequestResolved() const;
+
+  bool ShouldCheckAllowOrigin();
+
+  bool IsCORSSameOrigin();
+
+  bool IsPotentiallyPlaying() const;
+
+  bool IsPlaybackEnded() const;
+
+  already_AddRefed<nsIPrincipal> GetCurrentPrincipal();
+
+  bool HadCrossOriginRedirects();
+
+  bool ShouldResistFingerprinting(RFPTarget aTarget) const override;
+
+  already_AddRefed<nsIPrincipal> GetCurrentVideoPrincipal();
+
+  void NotifyDecoderPrincipalChanged() final;
+
+  virtual void UpdateMediaSize(const nsIntSize& aSize);
+
+  void Invalidate(ImageSizeChanged aImageSizeChanged,
+                  const Maybe<nsIntSize>& aNewIntrinsicSize,
+                  ForceInvalidate aForceInvalidate) override;
+
+  static CanPlayStatus GetCanPlay(const nsAString& aType,
+                                  DecoderDoctorDiagnostics* aDiagnostics);
+
+  void NotifyAddedSource();
+
+  void NotifyLoadError(const nsACString& aErrorDetails = nsCString());
+
+  void NotifyMediaTrackAdded(dom::MediaTrack* aTrack);
+
+  void NotifyMediaTrackRemoved(dom::MediaTrack* aTrack);
+
+  void NotifyMediaTrackEnabled(dom::MediaTrack* aTrack);
+
+  void NotifyMediaTrackDisabled(dom::MediaTrack* aTrack);
+
+  uint32_t GetCurrentLoadID() const { return mCurrentLoadID; }
+
+  already_AddRefed<nsILoadGroup> GetDocumentLoadGroup();
+
+  bool GetPlayedOrSeeked() const { return mHasPlayedOrSeeked; }
+
+  nsresult CopyInnerTo(Element* aDest);
+
+  virtual nsresult SetAcceptHeader(nsIHttpChannel* aChannel) = 0;
+
+  void SetRequestHeaders(nsIHttpChannel* aChannel);
+
+  void RunInStableState(nsIRunnable* aRunnable);
+
+  void FireTimeUpdate(TimeupdateType aType);
+
+  void MaybeQueueTimeupdateEvent() final {
+    FireTimeUpdate(TimeupdateType::ePeriodic);
+  }
+
+  const TimeStamp& LastTimeupdateDispatchTime() const;
+  void UpdateLastTimeupdateDispatchTime();
+
+
+  MediaError* GetError() const;
+
+  void GetSrc(nsAString& aSrc) { GetURIAttr(nsGkAtoms::src, nullptr, aSrc); }
+  void SetSrc(const nsAString& aSrc, ErrorResult& aError) {
+    SetHTMLAttr(nsGkAtoms::src, aSrc, aError);
+  }
+  void SetSrc(const nsAString& aSrc, nsIPrincipal* aTriggeringPrincipal,
+              ErrorResult& aError) {
+    SetHTMLAttr(nsGkAtoms::src, aSrc, aTriggeringPrincipal, aError);
+  }
+
+  void GetCurrentSrc(nsAString& aCurrentSrc);
+
+  void GetCrossOrigin(nsAString& aResult) {
+    GetEnumAttr(nsGkAtoms::crossorigin, nullptr, aResult);
+  }
+  void SetCrossOrigin(const nsAString& aCrossOrigin, ErrorResult& aError) {
+    SetOrRemoveNullableStringAttr(nsGkAtoms::crossorigin, aCrossOrigin, aError);
+  }
+
+  uint16_t NetworkState() const { return mNetworkState; }
+
+  void NotifyXPCOMShutdown() final;
+
+  void SetAudibleState(bool aAudible) final;
+
+  void NotifyAudioPlaybackChanged(AudibleChangedReasons aReason);
+
+  void GetPreload(nsAString& aValue) {
+    if (mSrcAttrStream) {
+      nsGkAtoms::none->ToString(aValue);
+      return;
+    }
+    GetEnumAttr(nsGkAtoms::preload, kPreloadDefaultType->tag, aValue);
+  }
+  void SetPreload(const nsAString& aValue, ErrorResult& aRv) {
+    if (mSrcAttrStream) {
+      return;
+    }
+    SetHTMLAttr(nsGkAtoms::preload, aValue, aRv);
+  }
+
+  already_AddRefed<TimeRanges> Buffered() const;
+
+  void Load();
+
+  void CanPlayType(const nsAString& aType, nsAString& aResult);
+
+  uint16_t ReadyState() const { return mReadyState; }
+
+  bool Seeking() const;
+
+  double CurrentTime() const;
+
+  void SetCurrentTime(double aCurrentTime, ErrorResult& aRv);
+  void SetCurrentTime(double aCurrentTime) {
+    SetCurrentTime(aCurrentTime, IgnoreErrors());
+  }
+
+  void FastSeek(double aTime, ErrorResult& aRv);
+
+  already_AddRefed<Promise> SeekToNextFrame(ErrorResult& aRv);
+
+  double Duration() const;
+
+  bool HasAudio() const { return mMediaInfo.HasAudio(); }
+
+  virtual bool IsVideo() const { return false; }
+
+  bool HasVideo() const { return mMediaInfo.HasVideo(); }
+
+  bool Paused() const { return mPaused; }
+
+  double DefaultPlaybackRate() const {
+    if (mSrcAttrStream) {
+      return 1.0;
+    }
+    return mDefaultPlaybackRate;
+  }
+
+  void SetDefaultPlaybackRate(double aDefaultPlaybackRate, ErrorResult& aRv);
+
+  double PlaybackRate() const {
+    if (mSrcAttrStream) {
+      return 1.0;
+    }
+    return mPlaybackRate;
+  }
+
+  void SetPlaybackRate(double aPlaybackRate, ErrorResult& aRv);
+
+  already_AddRefed<TimeRanges> Played();
+
+  already_AddRefed<TimeRanges> Seekable() const;
+
+  bool Ended();
+
+  bool Autoplay() const { return GetBoolAttr(nsGkAtoms::autoplay); }
+
+  void SetAutoplay(bool aValue, ErrorResult& aRv) {
+    SetHTMLBoolAttr(nsGkAtoms::autoplay, aValue, aRv);
+  }
+
+  bool Loop() const { return GetBoolAttr(nsGkAtoms::loop); }
+
+  void SetLoop(bool aValue, ErrorResult& aRv) {
+    SetHTMLBoolAttr(nsGkAtoms::loop, aValue, aRv);
+  }
+
+  already_AddRefed<Promise> Play(ErrorResult& aRv);
+  void Play() {
+    IgnoredErrorResult dummy;
+    RefPtr<Promise> toBeIgnored = Play(dummy);
+  }
+
+  void Pause(ErrorResult& aRv);
+  void Pause() { Pause(IgnoreErrors()); }
+
+  bool Controls() const { return GetBoolAttr(nsGkAtoms::controls); }
+
+  void SetControls(bool aValue, ErrorResult& aRv) {
+    SetHTMLBoolAttr(nsGkAtoms::controls, aValue, aRv);
+  }
+
+  double Volume() const { return mVolume; }
+
+  void SetVolume(double aVolume, ErrorResult& aRv);
+
+  enum MutedReasons {
+    MUTED_BY_CONTENT = 0x01,
+    MUTED_BY_INVALID_PLAYBACK_RATE = 0x02,
+    MUTED_BY_AUDIO_CHANNEL = 0x04,
+    MUTED_BY_AUDIO_TRACK = 0x08,
+    MUTED_BY_MEDIA_CONTROL = 0x10
+  };
+
+  bool Muted() const {
+    return !!(mMuted & (MUTED_BY_CONTENT | MUTED_BY_INVALID_PLAYBACK_RATE));
+  }
+  void SetMuted(bool aMuted, MutedReasons aReason = MUTED_BY_CONTENT);
+
+  uint32_t GetMutedReasons() const { return mMuted; }
+
+  bool DefaultMuted() const { return GetBoolAttr(nsGkAtoms::muted); }
+
+  void SetDefaultMuted(bool aMuted, ErrorResult& aRv) {
+    SetHTMLBoolAttr(nsGkAtoms::muted, aMuted, aRv);
+  }
+
+  bool AllowedToPlay() const;
+
+  already_AddRefed<MediaSource> GetMozMediaSourceObject() const;
+
+  already_AddRefed<Promise> MozRequestDebugInfo(ErrorResult& aRv);
+
+  static void MozEnableDebugLog(const GlobalObject&);
+
+  already_AddRefed<Promise> MozRequestDebugLog(ErrorResult& aRv);
+
+  void SetVisible(bool aVisible);
+
+  bool HasSuspendTaint() const;
+
+  bool IsVideoDecodingSuspended() const;
+
+  void SetFormatDiagnosticsReportForMimeType(const nsAString& aMimeType,
+                                             DecoderDoctorReportType aType);
+  void SetDecodeError(const nsAString& aError, ErrorResult& aRv);
+  void SetAudioSinkFailedStartup();
+
+  already_AddRefed<layers::Image> GetCurrentImage();
+
+  already_AddRefed<DOMMediaStream> GetSrcObject() const;
+  void SetSrcObject(DOMMediaStream& aValue);
+  void SetSrcObject(DOMMediaStream* aValue);
+
+  bool PreservesPitch() const { return mPreservesPitch; }
+  void SetPreservesPitch(bool aPreservesPitch);
+
+  bool IsEventAttributeNameInternal(nsAtom* aName) override;
+
+  already_AddRefed<DOMMediaStream> CaptureAudio(ErrorResult& aRv,
+                                                MediaTrackGraph* aGraph);
+
+  already_AddRefed<DOMMediaStream> MozCaptureStream(ErrorResult& aRv);
+
+  already_AddRefed<DOMMediaStream> MozCaptureStreamUntilEnded(ErrorResult& aRv);
+
+  already_AddRefed<DOMMediaStream> CaptureStream(ErrorResult& aRv);
+
+  bool MozAudioCaptured() const;
+
+  void MozGetMetadata(JSContext* aCx, JS::MutableHandle<JSObject*> aResult,
+                      ErrorResult& aRv);
+
+  double MozFragmentEnd();
+
+  AudioTrackList* AudioTracks();
+
+  VideoTrackList* VideoTracks();
+
+  TextTrackList* GetTextTracks();
+
+  already_AddRefed<TextTrack> AddTextTrack(TextTrackKind aKind,
+                                           const nsAString& aLabel,
+                                           const nsAString& aLanguage);
+
+  void AddTextTrack(TextTrack* aTextTrack) {
+    GetOrCreateTextTrackManager()->AddTextTrack(aTextTrack);
+  }
+
+  void RemoveTextTrack(TextTrack* aTextTrack, bool aPendingListOnly = false) {
+    if (mTextTrackManager) {
+      mTextTrackManager->RemoveTextTrack(aTextTrack, aPendingListOnly);
+    }
+  }
+
+  void NotifyCueAdded(TextTrackCue& aCue) {
+    if (mTextTrackManager) {
+      mTextTrackManager->NotifyCueAdded(aCue);
+    }
+  }
+  void NotifyCueRemoved(TextTrackCue& aCue) {
+    if (mTextTrackManager) {
+      mTextTrackManager->NotifyCueRemoved(aCue);
+    }
+  }
+  void NotifyCueUpdated(TextTrackCue* aCue) {
+    if (mTextTrackManager) {
+      mTextTrackManager->NotifyCueUpdated(aCue);
+    }
+  }
+
+  void NotifyCueDisplayStatesChanged();
+
+  void SetCuesDirty() {
+    if (mTextTrackManager) {
+      mTextTrackManager->SetCuesDirty();
+    }
+  }
+
+  void UpdateCueDisplay() {
+    if (mTextTrackManager) {
+      mTextTrackManager->UpdateCueDisplay();
+    }
+  }
+
+  bool IsBlessed() const { return mIsBlessed; }
+
+  bool IsCurrentlyPlaying() const;
+
+  bool IsBeingDestroyed();
+
+  virtual void OnVisibilityChange(Visibility aNewVisibility);
+
+  float ComputedVolume() const;
+
+  bool ComputedMuted() const;
+
+  bool IsSuspendedByInactiveDocOrDocShell() const;
+
+  void SetMediaInfo(const MediaInfo& aInfo);
+  MediaInfo GetMediaInfo() const;
+
+  FrameStatistics* GetFrameStatistics() const;
+
+  enum class CallerAPI {
+    DRAW_IMAGE,
+    CREATE_PATTERN,
+    CREATE_IMAGEBITMAP,
+    CAPTURE_STREAM,
+    CREATE_VIDEOFRAME,
+  };
+  void LogVisibility(CallerAPI aAPI);
+
+  Document* GetDocument() const override;
+
+  RefPtr<GenericNonExclusivePromise> GetAllowedToPlayPromise();
+
+  bool GetShowPosterFlag() const { return mShowPoster; }
+
+  bool IsAudible() const;
+
+  MediaEventSource<float>& EffectiveVolumeChangeEvent() {
+    return mEffectiveVolumeChangeEvent;
+  }
+
+ protected:
+  virtual ~HTMLMediaElement();
+
+  class AudioChannelAgentCallback;
+  class ChannelLoader;
+  class ErrorSink;
+  class GVAutoplayObserver;
+  class MediaElementTrackSource;
+  class MediaLoadListener;
+  class MediaStreamRenderer;
+  class MediaStreamTrackListener;
+  class ShutdownObserver;
+  class TitleChangeObserver;
+  class MediaControlKeyListener;
+
+  MediaDecoderOwner::NextFrameStatus NextFrameStatus();
+
+  void SetDecoder(MediaDecoder* aDecoder);
+
+  void PlayInternal(bool aHandlingUserInput);
+
+  void PauseInternal();
+
+  void ChangeReadyState(nsMediaReadyState aState);
+
+  void ChangeNetworkState(nsMediaNetworkState aState);
+
+  virtual void WakeLockRelease();
+  virtual void UpdateWakeLock();
+
+  void UpdatePlaybackPseudoClasses();
+
+  void CreateAudioWakeLockIfNeeded();
+  void ReleaseAudioWakeLockIfExists();
+  void ReleaseAudioWakeLockInternal();
+  RefPtr<WakeLock> mWakeLock;
+
+  void ReportLoadError(const char* aMsg, const nsTArray<nsString>& aParams =
+                                             nsTArray<nsString>());
+
+  void ReportToConsole(
+      uint32_t aErrorFlags, const char* aMsg,
+      const nsTArray<nsString>& aParams = nsTArray<nsString>()) const;
+
+  void SetPlayedOrSeeked(bool aValue);
+
+  void SetupSrcMediaStreamPlayback(DOMMediaStream* aStream);
+  void EndSrcMediaStreamPlayback();
+  enum { REMOVING_SRC_STREAM = 0x1 };
+  void UpdateSrcMediaStreamPlaying(uint32_t aFlags = 0);
+
+  void UpdateSrcStreamPotentiallyPlaying();
+
+  void UpdateSrcStreamTime();
+
+  void UpdateSrcStreamReportPlaybackEnded();
+
+  void NotifyMediaStreamTrackAdded(const RefPtr<MediaStreamTrack>& aTrack);
+
+  void NotifyMediaStreamTrackRemoved(const RefPtr<MediaStreamTrack>& aTrack);
+
+  void GetAllEnabledMediaTracks(nsTArray<RefPtr<MediaTrack>>& aTracks);
+
+  void SetCapturedOutputStreamsEnabled(bool aEnabled);
+
+  enum class OutputMuteState { Muted, Unmuted };
+  OutputMuteState OutputTracksMuted();
+
+  void UpdateOutputTracksMuting();
+
+  enum class AddTrackMode { ASYNC, SYNC };
+  void AddOutputTrackSourceToOutputStream(
+      MediaElementTrackSource* aSource, OutputMediaStream& aOutputStream,
+      AddTrackMode aMode = AddTrackMode::ASYNC);
+
+  void UpdateOutputTrackSources();
+
+  already_AddRefed<DOMMediaStream> CaptureStreamInternal(
+      StreamCaptureBehavior aFinishBehavior,
+      StreamCaptureType aStreamCaptureType,
+      AudioOutputConfig aAudioOutputConfig, MediaTrackGraph* aGraph);
+
+  nsresult InitializeDecoderAsClone(ChannelMediaDecoder* aOriginal);
+
+  template <typename DecoderType, typename... LoadArgs>
+  nsresult SetupDecoder(DecoderType* aDecoder, LoadArgs&&... aArgs);
+
+  nsresult InitializeDecoderForChannel(nsIChannel* aChannel,
+                                       nsIStreamListener** aListener);
+
+  nsresult FinishDecoderSetup(MediaDecoder* aDecoder);
+
+  void AddMediaElementToURITable();
+  void RemoveMediaElementFromURITable();
+  HTMLMediaElement* LookupMediaElementURITable(nsIURI* aURI);
+
+  void ShutdownDecoder();
+  void AbortExistingLoads();
+
+  void NoSupportedMediaSourceError(const nsACString& aErrorDetails);
+
+  void DealWithFailedElement(nsIContent* aSourceElement);
+
+  void LoadFromSourceChildren(const JSCallingLocation& aCallingLocation);
+
+  void QueueLoadFromSourceTask();
+
+  void SelectResource(const JSCallingLocation& aCallingLocation);
+
+  void SelectResourceWrapper(const JSCallingLocation& aCallingLocation);
+
+  void QueueSelectResourceTask();
+
+  virtual void ResetState();
+
+  MediaResult LoadResource(const JSCallingLocation& aCallingLocation);
+
+  HTMLSourceElement* GetNextSource();
+
+  void ChangeDelayLoadStatus(bool aDelay);
+
+  void StopSuspendingAfterFirstFrame();
+
+  nsresult OnChannelRedirect(nsIChannel* aChannel, nsIChannel* aNewChannel,
+                             uint32_t aFlags);
+
+  void AddRemoveSelfReference();
+
+  void NotifyShutdownEvent();
+
+  enum PreloadAction {
+    PRELOAD_UNDEFINED = 0,  
+    PRELOAD_NONE = 1,       
+    PRELOAD_METADATA = 2,   
+    PRELOAD_ENOUGH = 3      
+  };
+
+  void DoLoad();
+
+  void SuspendLoad();
+
+  void ResumeLoad(PreloadAction aAction,
+                  const JSCallingLocation& aCallingLocation);
+
+  void UpdatePreloadAction(const JSCallingLocation& aCallingLocation);
+
+  void CheckProgress(bool aHaveNewProgress);
+  static void ProgressTimerCallback(nsITimer* aTimer, void* aClosure);
+  void StartProgressTimer();
+  void StartProgress();
+  void StopProgress();
+
+  void DispatchAsyncSourceError(nsIContent* aSourceElement,
+                                const nsACString& aErrorDetails);
+
+  void Error(uint16_t aErrorCode,
+             const Maybe<MediaResult>& aResult = Nothing());
+
+  void GetCurrentSpec(nsCString& aString);
+
+  void ProcessMediaFragmentURI();
+
+  void SetMutedInternal(uint32_t aMuted);
+  void SetVolumeInternal();
+
+  void SuspendOrResumeElement(bool aSuspendElement);
+
+  HTMLMediaElement* GetMediaElement() final { return this; }
+
+  bool GetPaused() final { return Paused(); }
+
+  void Seek(double aTime, SeekTarget::Type aSeekType, ErrorResult& aRv);
+
+  void UpdateAudioChannelPlayingState();
+
+  void PopulatePendingTextTrackList();
+
+  TextTrackManager* GetOrCreateTextTrackManager();
+
+  void UpdateReadyStateInternal();
+
+  void AudioCaptureTrackChange(bool aCapture);
+
+  void MaybeDoLoad();
+
+  void UpdateCustomPolicyAfterPlayed();
+
+  StreamCaptureType CaptureTypeForElement();
+
+  bool CanBeCaptured(StreamCaptureType aCaptureType, ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT nsresult FireEvent(const nsAString& aName);
+
+  already_AddRefed<nsMediaEventRunner> GetEventRunner(
+      const nsAString& aName, EventFlag aFlag = EventFlag::eNone);
+
+  nsTArray<RefPtr<PlayPromise>> TakePendingPlayPromises();
+
+  void AsyncResolvePendingPlayPromises();
+
+  void AsyncRejectPendingPlayPromises(nsresult aError);
+
+  void NotifyAboutPlaying();
+
+  already_AddRefed<Promise> CreateDOMPromise(ErrorResult& aRv) const;
+
+  void NotifyDecoderActivityChanges() const;
+
+  void ConstructMediaTracks(const MediaInfo* aInfo);
+
+  void RemoveMediaTracks();
+
+  void MarkAsTainted();
+
+  virtual void AfterSetAttr(int32_t aNameSpaceID, nsAtom* aName,
+                            const nsAttrValue* aValue,
+                            const nsAttrValue* aOldValue,
+                            nsIPrincipal* aMaybeScriptedPrincipal,
+                            bool aNotify) override;
+  virtual void OnAttrSetButNotChanged(int32_t aNamespaceID, nsAtom* aName,
+                                      const nsAttrValueOrString& aValue,
+                                      bool aNotify) override;
+
+  void PauseIfShouldNotBePlaying();
+
+  WatchManager<HTMLMediaElement> mWatchManager;
+
+  void DispatchEventsWhenPlayWasNotAllowed();
+
+  void MaybeNotifyAutoplayBlocked();
+
+  void DispatchBlockEventForVideoControl();
+
+  void NotifyMediaControlPlaybackStateChanged();
+
+  void ClearStopMediaControlTimerIfNeeded();
+
+  virtual bool HasPendingCallbacks() const { return false; }
+
+  RefPtr<MediaDecoder> mDecoder;
+
+  RefPtr<VideoFrameContainer> mVideoFrameContainer;
+
+  RefPtr<DOMMediaStream> mSrcAttrStream;
+
+  nsCOMPtr<nsIPrincipal> mSrcAttrTriggeringPrincipal;
+
+  RefPtr<DOMMediaStream> mSrcStream;
+
+  RefPtr<MediaStreamRenderer> mMediaStreamRenderer;
+
+  Watchable<bool> mSrcStreamPlaybackEnded = {
+      false, "HTMLMediaElement::mSrcStreamPlaybackEnded"};
+
+  bool mSrcStreamReportPlaybackEnded = false;
+
+  RefPtr<MediaStreamWindowCapturer> mStreamWindowCapturer;
+
+  nsTArray<OutputMediaStream> mOutputStreams;
+
+  nsRefPtrHashtable<nsStringHashKey, MediaElementTrackSource>
+      mOutputTrackSources;
+
+  RefPtr<VideoStreamTrack> mSelectedVideoStreamTrack;
+
+  RefPtr<GVAutoplayObserver> mGVAutoplayObserver;
+
+  const RefPtr<ShutdownObserver> mShutdownObserver;
+
+  const RefPtr<TitleChangeObserver> mTitleChangeObserver;
+
+  RefPtr<MediaSource> mSrcMediaSource;
+
+  RefPtr<MediaSource> mMediaSource;
+
+  RefPtr<ChannelLoader> mChannelLoader;
+
+  nsCOMPtr<nsIContent> mSourcePointer;
+
+  nsCOMPtr<Document> mLoadBlockedDoc;
+
+  class EventBlocker;
+  RefPtr<EventBlocker> mEventBlocker;
+
+  nsMediaNetworkState mNetworkState = HTMLMediaElement_Binding::NETWORK_EMPTY;
+  Watchable<nsMediaReadyState> mReadyState = {
+      HTMLMediaElement_Binding::HAVE_NOTHING, "HTMLMediaElement::mReadyState"};
+
+  enum LoadAlgorithmState {
+    NOT_WAITING,
+    WAITING_FOR_SOURCE
+  };
+
+  uint32_t mCurrentLoadID = 0;
+
+  LoadAlgorithmState mLoadWaitStatus = NOT_WAITING;
+
+  double mVolume = 1.0;
+
+  bool mIsAudioTrackAudible = false;
+
+  uint32_t mMuted = 0;
+
+  enum class MutedState : uint8_t { Default, True, False };
+  MutedState mMutedState = MutedState::Default;
+
+  UniquePtr<const MetadataTags> mTags;
+
+  nsCOMPtr<nsIURI> mLoadingSrc;
+
+  nsCOMPtr<nsIPrincipal> mLoadingSrcTriggeringPrincipal;
+
+  PreloadAction mPreloadAction = PRELOAD_UNDEFINED;
+
+  TimeStamp mQueueTimeUpdateRunnerTime;
+
+  TimeStamp mLastTimeUpdateDispatchTime;
+
+  TimeStamp mProgressTime;
+
+  TimeStamp mDataTime;
+
+  double mLastCurrentTime = 0.0;
+
+  double mFragmentStart = -1.0;
+
+  double mFragmentEnd = -1.0;
+
+  double mDefaultPlaybackRate = 1.0;
+
+  double mPlaybackRate = 1.0;
+
+  bool mPreservesPitch = true;
+
+  nsCOMPtr<nsIContent> mSourceLoadCandidate;
+
+  RefPtr<TimeRanges> mPlayed;
+
+  nsCOMPtr<nsITimer> mProgressTimer;
+
+  double mCurrentPlayRangeStart = 1.0;
+
+  bool mLoadedDataFired = false;
+
+  bool mCanAutoplayFlag = true;
+
+  Watchable<bool> mPaused = {true, "HTMLMediaElement::mPaused"};
+
+  bool mAllowCasting = false;
+  bool mIsCasting = false;
+
+  Watchable<RefPtr<SharedDummyTrack>> mTracksCaptured;
+
+  bool mAudioCaptured = false;
+
+  bool mPlayingBeforeSeek = false;
+
+  bool mSuspendedByInactiveDocOrDocshell = false;
+
+  bool mIsRunningLoadMethod = false;
+
+  bool mIsDoingExplicitLoad = false;
+
+  bool mIsLoadingFromSourceChildren = false;
+
+  bool mDelayingLoadEvent = false;
+
+  bool mIsRunningSelectResource = false;
+
+  bool mHaveQueuedSelectResource = false;
+
+  bool mSuspendedAfterFirstFrame = false;
+
+  bool mAllowSuspendAfterFirstFrame = true;
+
+  bool mHasPlayedOrSeeked = false;
+
+  bool mHasSelfReference = false;
+
+  bool mShuttingDown = false;
+
+  bool mSuspendedForPreloadNone = false;
+
+  bool mSrcStreamIsPlaying = false;
+
+  bool mUseUrgentStartForChannel = false;
+
+  CORSMode mCORSMode = CORS_NONE;
+
+  MediaInfo mMediaInfo;
+
+  Watchable<bool> mDownloadSuspendedByCache = {
+      false, "HTMLMediaElement::mDownloadSuspendedByCache"};
+
+  bool mDisableVideo = false;
+
+  RefPtr<TextTrackManager> mTextTrackManager;
+
+  RefPtr<AudioTrackList> mAudioTrackList;
+
+  RefPtr<VideoTrackList> mVideoTrackList;
+
+  RefPtr<MediaStreamTrackListener> mMediaStreamTrackListener;
+
+  nsCOMPtr<nsIPrincipal> mSrcStreamVideoPrincipal;
+
+  bool mBlockedAsWithoutMetadata = false;
+
+  MozPromiseHolder<GenericNonExclusivePromise> mAllowedToPlayPromise;
+
+  bool mHasEverBeenBlockedForAutoplay = false;
+
+  bool mPendingTextTrackChanged = false;
+
+  Visibility mVisibilityState = Visibility::Untracked;
+
+ public:
+  void NotifyTextTrackModeChanged();
+
+ private:
+  friend class nsMediaEventRunner;
+  friend class nsResolveOrRejectPendingPlayPromisesRunner;
+
+  already_AddRefed<PlayPromise> CreatePlayPromise(ErrorResult& aRv) const;
+
+  uint32_t GetPreloadDefault() const;
+  uint32_t GetPreloadDefaultAuto() const;
+
+  bool ShouldSuspendDownloadAfterFirstFrameLoaded() const;
+
+  void AfterMaybeChangeAttr(int32_t aNamespaceID, nsAtom* aName, bool aNotify);
+
+  bool mInitialized = false;
+
+  bool mIsBlessed = false;
+
+  Watchable<bool> mFirstFrameLoaded = {false,
+                                       "HTMLMediaElement::mFirstFrameLoaded"};
+
+  double mDefaultPlaybackStartPosition = 0.0;
+
+  bool mHasSuspendTaint = false;
+
+  bool mForcedHidden = false;
+
+  bool mIsCurrentlyStalled = false;
+
+  UniquePtr<ErrorSink> mErrorSink;
+
+  RefPtr<AudioChannelAgentCallback> mAudioChannelWrapper;
+
+  nsTArray<RefPtr<PlayPromise>> mPendingPlayPromises;
+
+  nsTArray<nsResolveOrRejectPendingPlayPromisesRunner*>
+      mPendingPlayPromisesRunners;
+
+  RefPtr<dom::Promise> mSeekDOMPromise;
+
+  bool ShouldBeSuspendedByInactiveDocShell() const;
+
+  void AssertReadyStateIsNothing();
+
+  std::pair<nsString, RefPtr<AudioDeviceInfo>> mSink;
+
+  bool mShowPoster;
+
+  void CreateResumeDelayedMediaPlaybackAgentIfNeeded();
+  void ClearResumeDelayedMediaPlaybackAgentIfNeeded();
+  RefPtr<ResumeDelayedPlaybackAgent> mResumeDelayedPlaybackAgent;
+  MozPromiseRequestHolder<ResumeDelayedPlaybackAgent::ResumePromise>
+      mResumePlaybackRequest;
+
+  bool IsPlayable() const;
+
+  bool IsControllableMediaSource() const;
+
+  void StartMediaControlKeyListenerIfNeeded();
+
+  RefPtr<MediaControlKeyListener> mMediaControlKeyListener;
+
+  void UpdateStreamName();
+
+  bool ShouldQueueTimeupdateAsyncTask(TimeupdateType aType) const;
+
+  void MaybeMarkSHEntryAsUserInteracted();
+
+  bool ShouldHaveTrackSources() const;
+
+  Maybe<DelayedScheduler<AwakeTimeStamp>> mAudioWakelockReleaseScheduler;
+
+  AudioOutputConfig mAudioOutputConfig = AudioOutputConfig::Needed;
+
+  MediaEventProducer<float> mEffectiveVolumeChangeEvent;
+};
+
+bool HasDebuggerOrTabsPrivilege(JSContext* aCx, JSObject* aObj);
+
+}  
+
+inline nsISupports* ToSupports(mozilla::dom::HTMLMediaElement* aElement) {
+  return static_cast<mozilla::dom::EventTarget*>(aElement);
+}
+
+#endif  // mozilla_dom_HTMLMediaElement_h

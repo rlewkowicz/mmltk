@@ -1,0 +1,109 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(mozilla_DbgMacro_h)
+#define mozilla_DbgMacro_h
+
+
+#include "mozilla/MacroForEach.h"
+#include "mozilla/Span.h"
+
+#include <fmt/format.h>
+#include <cstdio>
+#include <sstream>
+
+template <typename T>
+class nsTSubstring;
+
+
+namespace mozilla {
+
+namespace detail {
+
+template <typename T, typename = void>
+struct supports_os : std::false_type {};
+
+template <typename T>
+struct supports_os<T, std::void_t<decltype(std::declval<std::ostream&>()
+                                           << std::declval<T&>())>>
+    : std::true_type {};
+
+}  
+
+template <typename T>
+std::ostream& DebugValue(std::ostream& aOut, T* aValue) {
+  if (!aValue) {
+    return aOut << "null";
+  }
+  if constexpr (fmt::is_formattable<T>::value) {
+    return aOut << fmt::format("{}", *aValue) << " @ " << aValue;
+  } else if constexpr (detail::supports_os<T>::value) {
+    return aOut << *aValue << " @ " << aValue;
+  } else {
+    return aOut << aValue;
+  }
+}
+
+template <typename T>
+std::ostream& DebugValue(std::ostream& aOut, const T& aValue) {
+  if constexpr (std::is_base_of<nsTSubstring<char>, T>::value ||
+                std::is_base_of<nsTSubstring<char16_t>, T>::value) {
+    return aOut << '"' << aValue << '"';
+  } else {
+    return aOut << aValue;
+  }
+}
+
+namespace detail {
+
+template <typename T>
+auto&& MozDbg(const char* aFile, int aLine, const char* aExpression,
+              T&& aValue) {
+  std::ostringstream s;
+  s << "[MozDbg] [" << aFile << ':' << aLine << "] " << aExpression << " = ";
+  mozilla::DebugValue(s, std::forward<T>(aValue)) << '\n';
+  fputs(s.str().c_str(), stderr);
+  return std::forward<T>(aValue);
+}
+
+}  
+
+}  
+
+template <class ElementType, size_t Extent>
+std::ostream& operator<<(std::ostream& aOut,
+                         const mozilla::Span<ElementType, Extent>& aSpan) {
+  aOut << '[';
+  if (!aSpan.IsEmpty()) {
+    aOut << aSpan[0];
+    for (size_t i = 1; i < aSpan.Length(); ++i) {
+      aOut << ", " << aSpan[i];
+    }
+  }
+  return aOut << ']';
+}
+
+template <typename T, size_t N,
+          typename = std::enable_if_t<!std::is_same<T, char>::value>>
+std::ostream& operator<<(std::ostream& aOut, const T (&aArray)[N]) {
+  return aOut << mozilla::Span(aArray);
+}
+
+#if !defined(MOZILLA_OFFICIAL)
+#  define MOZ_DBG(...) \
+    mozilla::detail::MozDbg(__FILE__, __LINE__, #__VA_ARGS__, __VA_ARGS__)
+#endif
+
+#define MOZ_DBG_FIELD(name_) << #name_ << " = " << aValue.name_
+
+#define MOZ_DEFINE_DBG(type_, ...)                                           \
+  friend std::ostream& operator<<(std::ostream& aOut, const type_& aValue) { \
+    return aOut << #type_                                                    \
+                << (MOZ_ARG_COUNT(__VA_ARGS__) == 0 ? "" : " { ")            \
+                       MOZ_FOR_EACH_SEPARATED(MOZ_DBG_FIELD, (<< ", "), (),  \
+                                              (__VA_ARGS__))                 \
+                << (MOZ_ARG_COUNT(__VA_ARGS__) == 0 ? "" : " }");            \
+  }
+
+#endif

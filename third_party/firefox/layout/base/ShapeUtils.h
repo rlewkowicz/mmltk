@@ -1,0 +1,81 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_ShapeUtils_h
+#define mozilla_ShapeUtils_h
+
+#include "nsCoord.h"
+#include "nsSize.h"
+#include "nsStyleConsts.h"
+#include "nsTArray.h"
+
+struct nsPoint;
+struct nsRect;
+
+namespace mozilla {
+namespace gfx {
+class Path;
+class PathBuilder;
+}  
+
+struct ShapeUtils final {
+  static nscoord ComputeOrthogonalDistanceTo(const StyleShapeRadius& aType,
+                                             const nscoord aCenter,
+                                             const nscoord aPosMin,
+                                             const nscoord aPosMax);
+
+  static nsPoint ComputePosition(const StylePosition&, const nsRect&);
+
+  static nsPoint ComputeCircleOrEllipseCenter(const StyleBasicShape&,
+                                              const nsRect& aRefBox);
+
+  static nscoord ComputeCircleRadius(const StyleBasicShape&,
+                                     const nsPoint& aCenter,
+                                     const nsRect& aRefBox);
+
+  static nsSize ComputeEllipseRadii(const StyleBasicShape&,
+                                    const nsPoint& aCenter,
+                                    const nsRect& aRefBox);
+
+  static nsRect ComputeInsetRect(const StyleRect<LengthPercentage>& aStyleRect,
+                                 const nsRect& aRefBox);
+
+  static bool ComputeRectRadii(const StyleBorderRadius&, const nsRect& aRefBox,
+                               const nsRect& aRect, nsRectCornerRadii&);
+
+  static nsTArray<nsPoint> ComputePolygonVertices(const StyleBasicShape&,
+                                                  const nsRect& aRefBox);
+
+  static already_AddRefed<gfx::Path> BuildCirclePath(const StyleBasicShape&,
+                                                     const nsRect& aRefBox,
+                                                     const nsPoint& aCenter,
+                                                     nscoord aAppUnitsPerPixel,
+                                                     gfx::PathBuilder*);
+
+  static already_AddRefed<gfx::Path> BuildEllipsePath(const StyleBasicShape&,
+                                                      const nsRect& aRefBox,
+                                                      const nsPoint& aCenter,
+                                                      nscoord aAppUnitsPerPixel,
+                                                      gfx::PathBuilder*);
+
+  static already_AddRefed<gfx::Path> BuildPolygonPath(const StyleBasicShape&,
+                                                      const nsRect& aRefBox,
+                                                      nscoord aAppUnitsPerPixel,
+                                                      gfx::PathBuilder*);
+
+  static already_AddRefed<gfx::Path> BuildInsetPath(const StyleBasicShape&,
+                                                    const nsRect& aRefBox,
+                                                    nscoord aAppUnitsPerPixel,
+                                                    gfx::PathBuilder*);
+
+  static already_AddRefed<gfx::Path> BuildRectPath(const nsRect& aRect,
+                                                   const nsRectCornerRadii*,
+                                                   const nsRect& aRefBox,
+                                                   nscoord aAppUnitsPerPixel,
+                                                   gfx::PathBuilder*);
+};
+
+}  
+
+#endif  // mozilla_ShapeUtils_h

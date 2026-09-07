@@ -1,0 +1,254 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_RefCounted_h
+#define mozilla_RefCounted_h
+
+#include <type_traits>
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/RefCountType.h"
+
+#ifdef __wasi__
+#  include "mozilla/WasiAtomic.h"
+#else
+#  include <atomic>
+#endif  // __wasi__
+
+#if defined(MOZ_SUPPORT_LEAKCHECKING) && defined(NS_BUILD_REFCNT_LOGGING)
+#  define MOZ_REFCOUNTED_LEAK_CHECKING
+#endif
+
+namespace mozilla {
+
+namespace detail {
+const MozRefCountType DEAD = 0xffffdead;
+
+#ifdef MOZ_REFCOUNTED_LEAK_CHECKING
+using LogAddRefFunc = void (*)(void* aPtr, MozRefCountType aNewRefCnt,
+                               const char* aTypeName, uint32_t aClassSize);
+using LogReleaseFunc = void (*)(void* aPtr, MozRefCountType aNewRefCnt,
+                                const char* aTypeName);
+extern MFBT_DATA LogAddRefFunc gLogAddRefFunc;
+extern MFBT_DATA LogReleaseFunc gLogReleaseFunc;
+extern MFBT_DATA size_t gNumStaticCtors;
+extern MFBT_DATA const char* gLastStaticCtorTypeName;
+#endif
+
+class RefCountLogger {
+ public:
+  template <class T>
+  static void logAddRef(const T* aPointer, MozRefCountType aRefCount) {
+#ifdef MOZ_REFCOUNTED_LEAK_CHECKING
+    const void* pointer = aPointer;
+    const char* typeName = aPointer->typeName();
+    uint32_t typeSize = aPointer->typeSize();
+    if (gLogAddRefFunc) {
+      gLogAddRefFunc(const_cast<void*>(pointer), aRefCount, typeName, typeSize);
+    } else {
+      gNumStaticCtors++;
+      gLastStaticCtorTypeName = typeName;
+    }
+#endif
+  }
+
+#ifdef MOZ_REFCOUNTED_LEAK_CHECKING
+  static MFBT_API void SetLeakCheckingFunctions(LogAddRefFunc aLogAddRefFunc,
+                                                LogReleaseFunc aLogReleaseFunc);
+#endif
+
+  class MOZ_STACK_CLASS ReleaseLogger final {
+   public:
+    template <class T>
+    explicit ReleaseLogger(const T* aPointer)
+#ifdef MOZ_REFCOUNTED_LEAK_CHECKING
+        : mPointer(aPointer),
+          mTypeName(aPointer->typeName())
+#endif
+    {
+    }
+
+    void logRelease(MozRefCountType aRefCount) {
+#ifdef MOZ_REFCOUNTED_LEAK_CHECKING
+      MOZ_ASSERT(aRefCount != DEAD);
+      if (gLogReleaseFunc) {
+        gLogReleaseFunc(const_cast<void*>(mPointer), aRefCount, mTypeName);
+      } else {
+        gNumStaticCtors++;
+        gLastStaticCtorTypeName = mTypeName;
+      }
+#endif
+    }
+
+#ifdef MOZ_REFCOUNTED_LEAK_CHECKING
+    const void* mPointer;
+    const char* mTypeName;
+#endif
+  };
+};
+
+enum RefCountAtomicity { AtomicRefCount, NonAtomicRefCount };
+
+template <typename T, RefCountAtomicity Atomicity>
+class RC {
+ public:
+  explicit RC(T aCount) : mValue(aCount) {}
+
+  RC(const RC&) = delete;
+  RC& operator=(const RC&) = delete;
+  RC(RC&&) = delete;
+  RC& operator=(RC&&) = delete;
+
+  T operator++() { return ++mValue; }
+  T operator--() { return --mValue; }
+
+#ifdef DEBUG
+  void operator=(const T& aValue) { mValue = aValue; }
+#endif
+
+  operator T() const { return mValue; }
+
+ private:
+  T mValue;
+};
+
+template <typename T>
+class RC<T, AtomicRefCount> {
+ public:
+  explicit RC(T aCount) : mValue(aCount) {}
+
+  RC(const RC&) = delete;
+  RC& operator=(const RC&) = delete;
+  RC(RC&&) = delete;
+  RC& operator=(RC&&) = delete;
+
+  T operator++() {
+    return mValue.fetch_add(1, std::memory_order_relaxed) + 1;
+  }
+
+  T operator--() {
+    T result = mValue.fetch_sub(1, std::memory_order_release) - 1;
+    if (result == 0) {
+#if defined(MOZ_TSAN) || defined(__wasi__)
+      mValue.load(std::memory_order_acquire);
+#else
+      std::atomic_thread_fence(std::memory_order_acquire);
+#endif
+    }
+    return result;
+  }
+
+#ifdef DEBUG
+  void operator=(const T& aValue) {
+    mValue.store(aValue, std::memory_order_seq_cst);
+  }
+#endif
+
+  operator T() const {
+    return mValue.load(std::memory_order_acquire);
+  }
+
+  T IncrementIfNonzero() {
+    T prev = mValue.load(std::memory_order_relaxed);
+    while (prev != 0) {
+      MOZ_ASSERT(prev != detail::DEAD,
+                 "Cannot IncrementIfNonzero if marked as dead!");
+      if (mValue.compare_exchange_weak(prev, prev + 1,
+                                       std::memory_order_acquire,
+                                       std::memory_order_relaxed)) {
+        return prev + 1;
+      }
+    }
+    return 0;
+  }
+
+ private:
+  std::atomic<T> mValue;
+};
+
+template <typename T, RefCountAtomicity Atomicity>
+class RefCounted {
+ protected:
+  RefCounted() : mRefCnt(0) {}
+#ifdef DEBUG
+  ~RefCounted() { MOZ_ASSERT(mRefCnt == detail::DEAD); }
+#endif
+
+ public:
+  void AddRef() const {
+    MOZ_ASSERT(int32_t(mRefCnt) >= 0);
+    MozRefCountType cnt = ++mRefCnt;
+    detail::RefCountLogger::logAddRef(static_cast<const T*>(this), cnt);
+  }
+
+  void Release() const {
+    MOZ_ASSERT(int32_t(mRefCnt) > 0);
+    detail::RefCountLogger::ReleaseLogger logger(static_cast<const T*>(this));
+    MozRefCountType cnt = --mRefCnt;
+    logger.logRelease(cnt);
+    if (0 == cnt) {
+#ifdef DEBUG
+      mRefCnt = detail::DEAD;
+#endif
+      delete static_cast<const T*>(this);
+    }
+  }
+
+  using HasThreadSafeRefCnt =
+      std::integral_constant<bool, Atomicity == AtomicRefCount>;
+
+  void ref() { AddRef(); }
+  void deref() { Release(); }
+  MozRefCountType refCount() const { return mRefCnt; }
+  bool hasOneRef() const {
+    MOZ_ASSERT(mRefCnt > 0);
+    return mRefCnt == 1;
+  }
+
+ private:
+  mutable RC<MozRefCountType, Atomicity> mRefCnt;
+};
+
+#ifdef MOZ_REFCOUNTED_LEAK_CHECKING
+#  define MOZ_DECLARE_REFCOUNTED_VIRTUAL_TYPENAME(T, ...)           \
+    virtual const char* typeName() const __VA_ARGS__ { return #T; } \
+    virtual size_t typeSize() const __VA_ARGS__ { return sizeof(*this); }
+#else
+#  define MOZ_DECLARE_REFCOUNTED_VIRTUAL_TYPENAME(T, ...)
+#endif
+
+#define MOZ_DECLARE_REFCOUNTED_TYPENAME(T)    \
+  const char* typeName() const { return #T; } \
+  size_t typeSize() const { return sizeof(*this); }
+
+}  
+
+template <typename T>
+class RefCounted : public detail::RefCounted<T, detail::NonAtomicRefCount> {
+ public:
+  ~RefCounted() {
+    static_assert(std::is_base_of<RefCounted, T>::value,
+                  "T must derive from RefCounted<T>");
+  }
+};
+
+namespace external {
+
+template <typename T>
+class AtomicRefCounted
+    : public mozilla::detail::RefCounted<T, mozilla::detail::AtomicRefCount> {
+ public:
+  ~AtomicRefCounted() {
+    static_assert(std::is_base_of<AtomicRefCounted, T>::value,
+                  "T must derive from AtomicRefCounted<T>");
+  }
+};
+
+}  
+
+}  
+
+#endif  // mozilla_RefCounted_h

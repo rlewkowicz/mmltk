@@ -1,0 +1,107 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_image_decoders_nsJPEGDecoder_h
+#define mozilla_image_decoders_nsJPEGDecoder_h
+
+#include "EXIF.h"
+#include "RasterImage.h"
+#include "SurfacePipe.h"
+
+#undef INT32
+
+#include "Decoder.h"
+
+extern "C" {
+#include "jpeglib.h"
+}
+
+#include <setjmp.h>
+
+namespace mozilla::image {
+
+typedef struct {
+  struct jpeg_error_mgr pub;  
+  jmp_buf setjmp_buffer;      
+} decoder_error_mgr;
+
+typedef enum {
+  JPEG_HEADER,  
+  JPEG_START_DECOMPRESS,
+  JPEG_DECOMPRESS_PROGRESSIVE,  
+  JPEG_DECOMPRESS_SEQUENTIAL,   
+  JPEG_DONE,
+  JPEG_SINK_NON_JPEG_TRAILER,  
+  JPEG_ERROR
+} jstate;
+
+class RasterImage;
+struct Orientation;
+
+class nsJPEGDecoder : public Decoder {
+ public:
+  virtual ~nsJPEGDecoder();
+
+  DecoderType GetType() const override { return DecoderType::JPEG; }
+
+  void NotifyDone();
+
+ protected:
+  nsresult InitInternal() override;
+  LexerResult DoDecode(SourceBufferIterator& aIterator,
+                       IResumable* aOnResume) override;
+  nsresult FinishInternal() override;
+
+ protected:
+  EXIFData ReadExifData() const;
+  WriteState OutputScanlines();
+
+ private:
+  friend class DecoderFactory;
+
+  nsJPEGDecoder(RasterImage* aImage, Decoder::DecodeStyle aDecodeStyle,
+                bool aIsPDF = false);
+
+  enum class State { JPEG_DATA, FINISHED_JPEG_DATA };
+
+  void FinishRow(uint32_t aLastSourceRow);
+  LexerTransition<State> ReadJPEGData(const char* aData, size_t aLength);
+  LexerTransition<State> FinishedJPEGData();
+
+  StreamingLexer<State> mLexer;
+
+ public:
+  struct jpeg_decompress_struct mInfo;
+  struct jpeg_source_mgr mSourceMgr;
+  struct jpeg_progress_mgr mProgressMgr;
+  decoder_error_mgr mErr;
+  jstate mState;
+
+  uint32_t mBytesToSkip;
+
+  const JOCTET* mSegment;  
+  uint32_t mSegmentLen;    
+
+  JOCTET* mBackBuffer;
+  uint32_t mBackBufferLen;   
+  uint32_t mBackBufferSize;  
+  uint32_t mBackBufferUnreadLen;  
+
+  JOCTET* mProfile;
+  uint32_t mProfileLength;
+
+  uint32_t* mCMSLine;
+
+  bool mReading;
+
+  const Decoder::DecodeStyle mDecodeStyle;
+  bool mIsPDF;
+
+  SurfacePipe mPipe;
+};
+
+}  
+
+#endif  // mozilla_image_decoders_nsJPEGDecoder_h

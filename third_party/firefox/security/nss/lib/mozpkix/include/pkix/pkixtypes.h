@@ -1,0 +1,229 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+/* Copyright 2013 Mozilla Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#ifndef mozilla_pkix_pkixtypes_h
+#define mozilla_pkix_pkixtypes_h
+
+#include <memory>
+
+#include "mozpkix/Input.h"
+#include "mozpkix/Time.h"
+#include "stdint.h"
+
+namespace mozilla {
+namespace pkix {
+
+enum class DigestAlgorithm {
+  sha512 = 1,
+  sha384 = 2,
+  sha256 = 3,
+  sha1 = 4,
+};
+
+enum class NamedCurve {
+  secp521r1 = 1,
+
+  secp384r1 = 2,
+
+  secp256r1 = 3,
+};
+
+enum class EndEntityOrCA { MustBeEndEntity = 0, MustBeCA = 1 };
+
+enum class KeyUsage : uint8_t {
+  digitalSignature = 0,
+  nonRepudiation = 1,
+  keyEncipherment = 2,
+  dataEncipherment = 3,
+  keyAgreement = 4,
+  keyCertSign = 5,
+  noParticularKeyUsageRequired = 0xff,
+};
+
+enum class KeyPurposeId {
+  anyExtendedKeyUsage = 0,
+  id_kp_serverAuth = 1,       
+  id_kp_clientAuth = 2,       
+  id_kp_codeSigning = 3,      
+  id_kp_emailProtection = 4,  
+  id_kp_OCSPSigning = 9,      
+  id_kp_documentSigning = 36,  
+  id_kp_documentSigningAdobe,
+  id_kp_documentSigningMicrosoft,
+};
+
+struct CertPolicyId final {
+  uint16_t numBytes;
+  static const uint16_t MAX_BYTES = 24;
+  uint8_t bytes[MAX_BYTES];
+
+  bool IsAnyPolicy() const;
+  bool operator==(const CertPolicyId& other) const;
+
+  static const CertPolicyId anyPolicy;
+};
+
+enum class TrustLevel {
+  TrustAnchor = 1,         
+  ActivelyDistrusted = 2,  
+  InheritsTrust = 3        
+};
+
+enum class AuxiliaryExtension {
+
+  EmbeddedSCTList = 1,
+  SCTListFromOCSPResponse = 2
+};
+
+struct CertID final {
+ public:
+  CertID(Input aIssuer, Input aIssuerSubjectPublicKeyInfo, Input aSerialNumber)
+      : issuer(aIssuer),
+        issuerSubjectPublicKeyInfo(aIssuerSubjectPublicKeyInfo),
+        serialNumber(aSerialNumber) {}
+  const Input issuer;
+  const Input issuerSubjectPublicKeyInfo;
+  const Input serialNumber;
+
+  void operator=(const CertID&) = delete;
+};
+typedef std::unique_ptr<CertID> ScopedCertID;
+
+class DERArray {
+ public:
+  virtual size_t GetLength() const = 0;
+
+  virtual const Input* GetDER(size_t i) const = 0;
+
+ protected:
+  DERArray() {}
+  virtual ~DERArray() {}
+};
+
+class TrustDomain {
+ public:
+  virtual ~TrustDomain() {}
+
+  virtual Result GetCertTrust(EndEntityOrCA endEntityOrCA,
+                              const CertPolicyId& policy,
+                              Input candidateCertDER,
+                               TrustLevel& trustLevel) = 0;
+
+  class IssuerChecker {
+   public:
+    virtual Result Check(Input potentialIssuerDER,
+                          const Input* additionalNameConstraints,
+                          bool& keepGoing) = 0;
+
+   protected:
+    IssuerChecker();
+    virtual ~IssuerChecker();
+
+    IssuerChecker(const IssuerChecker&) = delete;
+    void operator=(const IssuerChecker&) = delete;
+  };
+
+  virtual Result FindIssuer(Input encodedIssuerName, IssuerChecker& checker,
+                            Time time) = 0;
+
+  virtual Result IsChainValid(const DERArray& certChain, Time time,
+                              const CertPolicyId& requiredPolicy) = 0;
+
+  virtual Result CheckRevocation(EndEntityOrCA endEntityOrCA,
+                                 const CertID& certID, Time time,
+                                 Duration validityDuration,
+                                  const Input* stapledOCSPresponse,
+                                  const Input* aiaExtension) = 0;
+
+  virtual Result CheckSignatureDigestAlgorithm(DigestAlgorithm digestAlg,
+                                               EndEntityOrCA endEntityOrCA,
+                                               Time notBefore) = 0;
+
+  virtual Result CheckRSAPublicKeyModulusSizeInBits(
+      EndEntityOrCA endEntityOrCA, unsigned int modulusSizeInBits) = 0;
+
+  virtual Result VerifyRSAPKCS1SignedData(Input data,
+                                          DigestAlgorithm digestAlgorithm,
+                                          Input signature,
+                                          Input subjectPublicKeyInfo) = 0;
+
+  virtual Result VerifyRSAPSSSignedData(Input data,
+                                        DigestAlgorithm digestAlgorithm,
+                                        Input signature,
+                                        Input subjectPublicKeyInfo) = 0;
+
+  virtual Result CheckECDSACurveIsAcceptable(EndEntityOrCA endEntityOrCA,
+                                             NamedCurve curve) = 0;
+
+  virtual Result VerifyECDSASignedData(Input data,
+                                       DigestAlgorithm digestAlgorithm,
+                                       Input signature,
+                                       Input subjectPublicKeyInfo) = 0;
+
+  virtual Result CheckValidityIsAcceptable(Time notBefore, Time notAfter,
+                                           EndEntityOrCA endEntityOrCA,
+                                           KeyPurposeId keyPurpose) = 0;
+
+  virtual void NoteAuxiliaryExtension(AuxiliaryExtension extension,
+                                      Input extensionData) = 0;
+
+  virtual Result DigestBuf(Input item, DigestAlgorithm digestAlg,
+                            uint8_t* digestBuf, size_t digestBufLen) = 0;
+
+ protected:
+  TrustDomain() {}
+
+  TrustDomain(const TrustDomain&) = delete;
+  void operator=(const TrustDomain&) = delete;
+};
+
+enum class FallBackToSearchWithinSubject { No = 0, Yes = 1 };
+enum class HandleInvalidSubjectAlternativeNamesBy { Halting = 0, Skipping = 1 };
+
+class NameMatchingPolicy {
+ public:
+  virtual ~NameMatchingPolicy() {}
+
+  virtual Result FallBackToCommonName(
+      Time notBefore,
+       FallBackToSearchWithinSubject& fallBackToCommonName) = 0;
+
+  virtual HandleInvalidSubjectAlternativeNamesBy
+  HandleInvalidSubjectAlternativeNames() = 0;
+
+ protected:
+  NameMatchingPolicy() {}
+
+  NameMatchingPolicy(const NameMatchingPolicy&) = delete;
+  void operator=(const NameMatchingPolicy&) = delete;
+};
+
+class StrictNameMatchingPolicy : public NameMatchingPolicy {
+ public:
+  virtual Result FallBackToCommonName(
+      Time notBefore,
+       FallBackToSearchWithinSubject& fallBacktoCommonName) override;
+
+  virtual HandleInvalidSubjectAlternativeNamesBy
+  HandleInvalidSubjectAlternativeNames() override;
+};
+}  
+}  
+
+#endif  // mozilla_pkix_pkixtypes_h

@@ -1,0 +1,360 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_StructuredCloneHolder_h
+#define mozilla_dom_StructuredCloneHolder_h
+
+#include <cstddef>
+#include <cstdint>
+#include <utility>
+
+#include "js/StructuredClone.h"
+#include "js/TypeDecls.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/ProcessType.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/ipc/EagerIPCStream.h"
+#include "nsCOMPtr.h"
+#include "nsString.h"
+#include "nsTArray.h"
+
+class nsIEventTarget;
+class nsIGlobalObject;
+class nsIInputStream;
+struct JSStructuredCloneReader;
+struct JSStructuredCloneWriter;
+
+namespace JS {
+class Value;
+struct WasmModule;
+}  
+
+namespace mozilla {
+class ErrorResult;
+template <class T>
+class OwningNonNull;
+
+namespace layers {
+class Image;
+}
+
+namespace gfx {
+class DataSourceSurface;
+}
+
+namespace dom {
+
+class BlobImpl;
+class MessagePort;
+class MessagePortIdentifier;
+template <typename T>
+class Sequence;
+
+class StructuredCloneHolderBase {
+ public:
+  typedef JS::StructuredCloneScope StructuredCloneScope;
+
+  StructuredCloneHolderBase(
+      StructuredCloneScope aScope = StructuredCloneScope::SameProcess);
+  virtual ~StructuredCloneHolderBase();
+
+  StructuredCloneHolderBase(StructuredCloneHolderBase&& aOther) = delete;
+
+
+  virtual JSObject* CustomReadHandler(
+      JSContext* aCx, JSStructuredCloneReader* aReader,
+      const JS::CloneDataPolicy& aCloneDataPolicy, uint32_t aTag,
+      uint32_t aIndex) = 0;
+
+  virtual bool CustomWriteHandler(JSContext* aCx,
+                                  JSStructuredCloneWriter* aWriter,
+                                  JS::Handle<JSObject*> aObj,
+                                  bool* aSameProcessScopeRequired) = 0;
+
+  void Clear();
+
+
+  virtual bool CustomReadTransferHandler(
+      JSContext* aCx, JSStructuredCloneReader* aReader,
+      const JS::CloneDataPolicy& aCloneDataPolicy, uint32_t aTag,
+      void* aContent, uint64_t aExtraData,
+      JS::MutableHandle<JSObject*> aReturnObject);
+
+  virtual bool CustomWriteTransferHandler(JSContext* aCx,
+                                          JS::Handle<JSObject*> aObj,
+                                          uint32_t* aTag,
+                                          JS::TransferableOwnership* aOwnership,
+                                          void** aContent,
+                                          uint64_t* aExtraData);
+
+  virtual void CustomFreeTransferHandler(uint32_t aTag,
+                                         JS::TransferableOwnership aOwnership,
+                                         void* aContent, uint64_t aExtraData);
+
+  virtual bool CustomCanTransferHandler(JSContext* aCx,
+                                        JS::Handle<JSObject*> aObj,
+                                        bool* aSameProcessScopeRequired);
+
+
+  void Write(JSContext* aCx, JS::Handle<JS::Value> aValue, ErrorResult& aRv);
+
+  void Write(JSContext* aCx, JS::Handle<JS::Value> aValue,
+             JS::Handle<JS::Value> aTransfer,
+             const JS::CloneDataPolicy& aCloneDataPolicy, ErrorResult& aRv);
+
+  void Read(JSContext* aCx, JS::MutableHandle<JS::Value> aValue,
+            ErrorResult& aRv);
+
+  void Read(JSContext* aCx, JS::MutableHandle<JS::Value> aValue,
+            const JS::CloneDataPolicy& aCloneDataPolicy, ErrorResult& aRv);
+
+  void Adopt(JSStructuredCloneData&& aData,
+             uint32_t aVersion = JS_STRUCTURED_CLONE_VERSION);
+
+  bool HasData() const { return !!mBuffer; }
+
+  JSStructuredCloneData& BufferData() const {
+    MOZ_ASSERT(mBuffer, "Write() has never been called.");
+    return mBuffer->data();
+  }
+
+  uint32_t BufferVersion() const {
+    MOZ_ASSERT(mBuffer, "Write() has never been called.");
+    return mBuffer->version();
+  }
+
+  size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) {
+    size_t size = 0;
+    if (HasData()) {
+      size += mBuffer->sizeOfIncludingThis(aMallocSizeOf);
+    }
+    return size;
+  }
+
+ protected:
+  UniquePtr<JSAutoStructuredCloneBuffer> mBuffer;
+
+  StructuredCloneScope mStructuredCloneScope;
+
+#ifdef DEBUG
+  bool mClearCalled;
+#endif
+};
+
+class BlobImpl;
+class EncodedAudioChunkData;
+class EncodedVideoChunkData;
+class MessagePort;
+class MessagePortIdentifier;
+struct VideoFrameSerializedData;
+struct AudioDataSerializedData;
+
+class StructuredCloneHolder : public StructuredCloneHolderBase {
+ public:
+  enum CloningSupport { CloningSupported, CloningNotSupported };
+
+  enum TransferringSupport { TransferringSupported, TransferringNotSupported };
+
+  explicit StructuredCloneHolder(CloningSupport aSupportsCloning,
+                                 TransferringSupport aSupportsTransferring,
+                                 StructuredCloneScope aStructuredCloneScope);
+  virtual ~StructuredCloneHolder();
+
+  StructuredCloneHolder(StructuredCloneHolder&& aOther) = delete;
+
+
+  virtual void Write(JSContext* aCx, JS::Handle<JS::Value> aValue,
+                     ErrorResult& aRv);
+
+  virtual void Write(JSContext* aCx, JS::Handle<JS::Value> aValue,
+                     JS::Handle<JS::Value> aTransfer,
+                     const JS::CloneDataPolicy& aCloneDataPolicy,
+                     ErrorResult& aRv);
+
+  void Read(JSContext* aCx, JS::MutableHandle<JS::Value> aValue,
+            ErrorResult& aRv);
+
+  void Read(JSContext* aCx, JS::MutableHandle<JS::Value> aValue,
+            const JS::CloneDataPolicy& aCloneDataPolicy, ErrorResult& aRv);
+
+  void Adopt(JSStructuredCloneData&& aData,
+             uint32_t aVersion = JS_STRUCTURED_CLONE_VERSION,
+             GeckoChildID aOriginChildID = kInvalidGeckoChildID);
+
+  bool HasClonedDOMObjects();
+
+  bool SupportsTransferring() const { return mSupportsTransferring; }
+
+  GeckoChildID GetOriginChildID() const { return mOriginChildID; }
+
+  nsTArray<NotNull<RefPtr<BlobImpl>>>& BlobImpls() {
+    MOZ_ASSERT(mSupportsCloning,
+               "Blobs cannot be taken/set if cloning is not supported.");
+    return mBlobImplArray;
+  }
+
+  nsTArray<RefPtr<JS::WasmModule>>& WasmModules() {
+    MOZ_ASSERT(mSupportsCloning,
+               "WasmModules cannot be taken/set if cloning is not supported.");
+    return mWasmModuleArray;
+  }
+
+  nsTArray<mozilla::ipc::EagerIPCStream>& InputStreams() {
+    MOZ_ASSERT(mSupportsCloning,
+               "InputStreams cannot be taken/set if cloning is not supported.");
+    return mInputStreamArray;
+  }
+
+  StructuredCloneScope CloneScope() const {
+    if (mStructuredCloneScope == StructuredCloneScope::UnknownDestination) {
+      return StructuredCloneScope::DifferentProcess;
+    }
+    return mStructuredCloneScope;
+  }
+
+  // This must be called if the transferring has ports generated by Read().
+  nsTArray<RefPtr<MessagePort>>&& TakeTransferredPorts() {
+    MOZ_ASSERT(mSupportsTransferring);
+    return std::move(mTransferredPorts);
+  }
+
+  bool TakeTransferredPortsAsSequence(
+      Sequence<OwningNonNull<mozilla::dom::MessagePort>>& aPorts);
+
+  nsTArray<MessagePortIdentifier>& PortIdentifiers() const {
+    MOZ_ASSERT(mSupportsTransferring);
+    return mPortIdentifiers;
+  }
+
+  nsTArray<RefPtr<gfx::DataSourceSurface>>& GetSurfaces() {
+    return mClonedSurfaces;
+  }
+
+  nsTArray<VideoFrameSerializedData>& VideoFrames() { return mVideoFrames; }
+
+  nsTArray<AudioDataSerializedData>& AudioData() { return mAudioData; }
+
+  nsTArray<EncodedVideoChunkData>& EncodedVideoChunks() {
+    return mEncodedVideoChunks;
+  }
+
+  nsTArray<EncodedAudioChunkData>& EncodedAudioChunks() {
+    return mEncodedAudioChunks;
+  }
+
+
+
+  virtual JSObject* CustomReadHandler(
+      JSContext* aCx, JSStructuredCloneReader* aReader,
+      const JS::CloneDataPolicy& aCloneDataPolicy, uint32_t aTag,
+      uint32_t aIndex) override;
+
+  virtual bool CustomWriteHandler(JSContext* aCx,
+                                  JSStructuredCloneWriter* aWriter,
+                                  JS::Handle<JSObject*> aObj,
+                                  bool* aSameProcessScopeRequired) override;
+
+  virtual bool CustomReadTransferHandler(
+      JSContext* aCx, JSStructuredCloneReader* aReader,
+      const JS::CloneDataPolicy& aCloneDataPolicy, uint32_t aTag,
+      void* aContent, uint64_t aExtraData,
+      JS::MutableHandle<JSObject*> aReturnObject) override;
+
+  virtual bool CustomWriteTransferHandler(JSContext* aCx,
+                                          JS::Handle<JSObject*> aObj,
+                                          uint32_t* aTag,
+                                          JS::TransferableOwnership* aOwnership,
+                                          void** aContent,
+                                          uint64_t* aExtraData) override;
+
+  virtual void CustomFreeTransferHandler(uint32_t aTag,
+                                         JS::TransferableOwnership aOwnership,
+                                         void* aContent,
+                                         uint64_t aExtraData) override;
+
+  virtual bool CustomCanTransferHandler(
+      JSContext* aCx, JS::Handle<JSObject*> aObj,
+      bool* aSameProcessScopeRequired) override;
+
+
+  static JSObject* ReadFullySerializableObjects(
+      JSContext* aCx, JSStructuredCloneReader* aReader, uint32_t aTag,
+      bool aIsForIndexedDB);
+
+  static bool WriteFullySerializableObjects(JSContext* aCx,
+                                            JSStructuredCloneWriter* aWriter,
+                                            JS::Handle<JSObject*> aObj);
+
+  static bool ReadString(JSStructuredCloneReader* aReader, nsString& aString);
+  static bool WriteString(JSStructuredCloneWriter* aWriter,
+                          const nsAString& aString);
+  static bool ReadCString(JSStructuredCloneReader* aReader, nsCString& aString);
+  static bool WriteCString(JSStructuredCloneWriter* aWriter,
+                           const nsACString& aString);
+
+  static const JSStructuredCloneCallbacks sCallbacks;
+
+ protected:
+  void SameProcessScopeRequired(bool* aSameProcessScopeRequired);
+
+  void MaybeClearTransferredState();
+
+  already_AddRefed<MessagePort> ReceiveMessagePort(nsIGlobalObject* aGlobal,
+                                                   uint64_t aIndex);
+
+#ifdef DEBUG
+  void AssertAttachmentsMatchFlags();
+#else
+  void AssertAttachmentsMatchFlags() {}
+#endif
+
+  auto CloneableAttachmentArrays() { return std::tie(mBlobImplArray); }
+  auto InProcessCloneableAttachmentArrays() {
+    return std::tie(mWasmModuleArray, mClonedSurfaces, mVideoFrames, mAudioData,
+                    mEncodedVideoChunks, mEncodedAudioChunks
+    );
+  }
+  auto TransferableAttachmentArrays() {
+    return std::tie(mPortIdentifiers, mInputStreamArray);
+  }
+  auto AttachmentArrays() {
+    return std::tuple_cat(CloneableAttachmentArrays(),
+                          InProcessCloneableAttachmentArrays(),
+                          TransferableAttachmentArrays());
+  }
+
+  bool mSupportsCloning;
+  bool mSupportsTransferring;
+
+  GeckoChildID mOriginChildID = kInvalidGeckoChildID;
+
+
+  nsTArray<NotNull<RefPtr<BlobImpl>>> mBlobImplArray;
+
+  nsTArray<RefPtr<JS::WasmModule>> mWasmModuleArray;
+
+  nsTArray<mozilla::ipc::EagerIPCStream> mInputStreamArray;
+
+  nsTArray<RefPtr<gfx::DataSourceSurface>> mClonedSurfaces;
+
+  nsTArray<VideoFrameSerializedData> mVideoFrames;
+
+  nsTArray<AudioDataSerializedData> mAudioData;
+
+  nsTArray<EncodedVideoChunkData> mEncodedVideoChunks;
+
+  nsTArray<EncodedAudioChunkData> mEncodedAudioChunks;
+
+
+  nsTArray<RefPtr<MessagePort>> mTransferredPorts;
+
+  mutable nsTArray<MessagePortIdentifier> mPortIdentifiers;
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_StructuredCloneHolder_h

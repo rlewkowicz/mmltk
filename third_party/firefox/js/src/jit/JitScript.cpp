@@ -1,0 +1,981 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "jit/JitScript-inl.h"
+
+#include "mozilla/BinarySearch.h"
+#include "mozilla/CheckedInt.h"
+
+#include <utility>
+
+#include "gc/GCMarker.h"
+#include "jit/BaselineIC.h"
+#include "jit/BaselineJIT.h"
+#include "jit/BytecodeAnalysis.h"
+#include "jit/CacheIRCompiler.h"
+#include "jit/IonOptimizationLevels.h"  // jit::OptimizationInfo
+#include "jit/IonScript.h"
+#include "jit/JitFrames.h"
+#include "jit/JitSpewer.h"
+#include "jit/ScriptFromCalleeToken.h"
+#include "jit/ShapeList.h"
+#include "jit/TrialInlining.h"
+#include "jit/WarpSnapshot.h"
+#include "js/ColumnNumber.h"  // JS::LimitedColumnNumberOneOrigin
+#include "vm/BytecodeUtil.h"
+#include "vm/Compartment.h"
+#include "vm/FrameIter.h"  // js::OnlyJSJitFrameIter
+#include "vm/JitActivation.h"
+#include "vm/JSScript.h"
+
+#include "gc/GCContext-inl.h"
+#include "jit/JSJitFrameIter-inl.h"
+#include "vm/JSContext-inl.h"
+#include "vm/JSScript-inl.h"
+
+using namespace js;
+using namespace js::jit;
+
+using mozilla::CheckedInt;
+
+JitScript::JitScript(JSScript* script, Offset fallbackStubsOffset,
+                     Offset endOffset, const char* profileString)
+    : profileString_(profileString),
+      owningScript_(script),
+      endOffset_(endOffset),
+      icScript_(script->getWarmUpCount(),
+                fallbackStubsOffset - offsetOfICScript(),
+                endOffset - offsetOfICScript(),
+                0, script->length()) {
+  if (!script->canBaselineCompile()) {
+    setBaselineScriptImpl(script, BaselineDisabledScriptPtr);
+  }
+  if (!script->canIonCompile()) {
+    setIonScriptImpl(script, IonDisabledScriptPtr);
+  }
+}
+
+ICScript::~ICScript() {
+  MOZ_ASSERT(allocSitesSpace_.isEmpty());
+  MOZ_ASSERT(!envAllocSite_);
+}
+
+#ifdef DEBUG
+JitScript::~JitScript() {
+  MOZ_ASSERT(!hasBaselineScript());
+  MOZ_ASSERT(!hasIonScript());
+
+  MOZ_ASSERT(!isInList());
+}
+#else
+JitScript::~JitScript() = default;
+#endif
+
+bool JSScript::createJitScript(JSContext* cx) {
+  MOZ_ASSERT(!hasJitScript());
+  cx->check(this);
+
+  MOZ_ASSERT_IF(IsBaselineInterpreterEnabled(),
+                CanBaselineInterpretScript(this));
+
+  const char* profileString = nullptr;
+  if (cx->runtime()->geckoProfiler().enabled()) {
+    profileString = cx->runtime()->geckoProfiler().profileString(cx, this);
+    if (!profileString) {
+      return false;
+    }
+
+    if (!cx->runtime()->geckoProfiler().insertScriptSource(scriptSource())) {
+      ReportOutOfMemory(cx);
+      return false;
+    }
+  }
+
+  static_assert(sizeof(JitScript) % sizeof(uintptr_t) == 0,
+                "Trailing arrays must be aligned properly");
+  static_assert(sizeof(ICEntry) % sizeof(uintptr_t) == 0,
+                "Trailing arrays must be aligned properly");
+
+  static_assert(
+      sizeof(JitScript) == offsetof(JitScript, icScript_) + sizeof(ICScript),
+      "icScript_ must be the last field");
+
+  CheckedInt<uint32_t> allocSize = sizeof(JitScript);
+  allocSize += CheckedInt<uint32_t>(numICEntries()) * sizeof(ICEntry);
+  allocSize += CheckedInt<uint32_t>(numICEntries()) * sizeof(ICFallbackStub);
+  if (!allocSize.isValid()) {
+    ReportAllocationOverflow(cx);
+    return false;
+  }
+
+  void* raw = cx->pod_malloc<uint8_t>(allocSize.value());
+  MOZ_ASSERT(uintptr_t(raw) % alignof(JitScript) == 0);
+  if (!raw) {
+    return false;
+  }
+
+  size_t fallbackStubsOffset =
+      sizeof(JitScript) + numICEntries() * sizeof(ICEntry);
+
+  UniquePtr<JitScript> jitScript(new (raw) JitScript(
+      this, fallbackStubsOffset, allocSize.value(), profileString));
+
+  MOZ_ASSERT(jitScript->numICEntries() == numICEntries());
+
+  jitScript->icScript()->initICEntries(cx, this);
+
+  cx->zone()->jitZone()->registerJitScript(jitScript.get());
+
+  uint32_t baseWarmUpThreshold =
+      jit::OptimizationInfo::baseWarmUpThresholdForScript(cx, this);
+  jitScript->setIonThreshold(baseWarmUpThreshold);
+
+  MemoryReleaseFence(cx->zone());
+
+  warmUpData_.initJitScript(jitScript.release());
+  AddCellMemory(this, allocSize.value(), MemoryUse::JitScript);
+
+  updateJitCodeRaw(cx->runtime());
+
+  return true;
+}
+
+void JSScript::maybeReleaseJitScript(JS::GCContext* gcx) {
+  MOZ_ASSERT(hasJitScript());
+
+  if (zone()->jitZone()->keepJitScripts() || jitScript()->hasBaselineScript() ||
+      jitScript()->icScript()->active()) {
+    return;
+  }
+
+  releaseJitScript(gcx);
+}
+
+void JSScript::releaseJitScript(JS::GCContext* gcx) {
+  MOZ_ASSERT(hasJitScript());
+  MOZ_ASSERT(!hasBaselineScript());
+  MOZ_ASSERT(!hasIonScript());
+
+  gcx->removeCellMemory(this, jitScript()->allocBytes(), MemoryUse::JitScript);
+
+  JitScript::Destroy(zone(), jitScript());
+  warmUpData_.clearJitScript();
+  updateJitCodeRaw(gcx->runtime());
+}
+
+void JSScript::releaseJitScriptOnFinalize(JS::GCContext* gcx) {
+  MOZ_ASSERT(hasJitScript());
+
+  if (hasIonScript()) {
+    IonScript* ion = jitScript()->clearIonScript(gcx, this);
+    jit::IonScript::Destroy(gcx, ion);
+  }
+
+  if (hasBaselineScript()) {
+    BaselineScript* baseline = jitScript()->clearBaselineScript(gcx, this);
+    jit::BaselineScript::Destroy(gcx, baseline);
+  }
+
+  releaseJitScript(gcx);
+}
+
+void JitScript::trace(JSTracer* trc) {
+  TraceEdge(trc, &owningScript_, "JitScript::owningScript_");
+
+  icScript_.trace(trc);
+
+  BaselineScript* baselineScript = baselineScript_.getForTracing();
+  if (baselineScript && IsBaselineScript(baselineScript)) {
+    baselineScript->trace(trc);
+  }
+
+  IonScript* ionScript = ionScript_.getForTracing();
+  if (ionScript && IsIonScript(ionScript)) {
+    ionScript->trace(trc);
+  }
+
+  TraceEdge(trc, &templateEnv_, "jitscript-template-env");
+
+  if (hasInliningRoot()) {
+    inliningRoot()->trace(trc);
+  }
+}
+
+void JitScript::traceWeak(JSTracer* trc) {
+  if (!icScript_.traceWeak(trc)) {
+    notePurgedStubs();
+  }
+
+  if (hasInliningRoot()) {
+    if (!inliningRoot()->traceWeak(trc)) {
+      notePurgedStubs();
+    }
+  }
+
+  if (hasIonScript()) {
+    ionScript()->traceWeak(trc);
+  }
+}
+
+void ICScript::trace(JSTracer* trc) {
+  gc::AutoMarkingLock lock(trc, markingLock_);
+
+  for (size_t i = 0; i < numICEntries(); i++) {
+    ICEntry& ent = icEntry(i);
+    ICFallbackStub* fallback = fallbackStub(i);
+    ent.trace(trc, fallback);
+  }
+
+  for (gc::AllocSite* site : allocSites_) {
+    site->trace(trc);
+  }
+}
+
+bool ICScript::traceWeak(JSTracer* trc) {
+  bool allSurvived = true;
+  for (size_t i = 0; i < numICEntries(); i++) {
+    ICEntry& ent = icEntry(i);
+    ICFallbackStub* fallback = fallbackStub(i);
+    if (!ent.traceWeak(trc, fallback)) {
+      allSurvived = false;
+    }
+  }
+
+  return allSurvived;
+}
+
+bool ICScript::addInlinedChild(JSContext* cx, UniquePtr<ICScript> child,
+                               uint32_t pcOffset) {
+  MOZ_ASSERT(!hasInlinedChild(pcOffset));
+
+  if (!inlinedChildren_) {
+    inlinedChildren_ = cx->make_unique<Vector<CallSite>>(cx);
+    if (!inlinedChildren_) {
+      return false;
+    }
+  }
+
+  CallSite callsite(child.get(), pcOffset);
+  if (!inlinedChildren_->reserve(inlinedChildren_->length() + 1)) {
+    return false;
+  }
+  if (!inliningRoot()->addInlinedScript(std::move(child))) {
+    return false;
+  }
+  inlinedChildren_->infallibleAppend(callsite);
+  return true;
+}
+
+ICScript* ICScript::findInlinedChild(uint32_t pcOffset) {
+  for (auto& callsite : *inlinedChildren_) {
+    if (callsite.pcOffset_ == pcOffset) {
+      return callsite.callee_;
+    }
+  }
+  MOZ_CRASH("Inlined child expected at pcOffset");
+}
+
+void ICScript::removeInlinedChild(uint32_t pcOffset) {
+  MOZ_ASSERT(inliningRoot());
+  inlinedChildren_->eraseIf([pcOffset](const CallSite& callsite) -> bool {
+    return callsite.pcOffset_ == pcOffset;
+  });
+}
+
+bool ICScript::hasInlinedChild(uint32_t pcOffset) {
+  if (!inlinedChildren_) {
+    return false;
+  }
+  for (auto& callsite : *inlinedChildren_) {
+    if (callsite.pcOffset_ == pcOffset) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void ICScript::purgeInactiveICScripts() {
+  MOZ_ASSERT(inliningRoot());
+
+  if (!inlinedChildren_) {
+    return;
+  }
+
+  inlinedChildren_->eraseIf(
+      [](const CallSite& callsite) { return !callsite.callee_->active(); });
+
+  if (inlinedChildren_->empty()) {
+    inlinedChildren_.reset();
+    return;
+  }
+
+  MOZ_ASSERT(active());
+}
+
+void JitScript::resetWarmUpCount(uint32_t count) {
+  forEachICScript([&](ICScript* script) { script->resetWarmUpCount(count); });
+}
+
+#ifdef DEBUG
+bool JitScript::hasActiveICScript() const {
+  bool hasActive = false;
+  forEachICScript([&](const ICScript* script) {
+    if (script->active()) {
+      hasActive = true;
+    }
+  });
+  return hasActive;
+}
+#endif
+
+void JitScript::resetAllActiveFlags() {
+  forEachICScript([](ICScript* script) { script->resetActive(); });
+}
+
+void JitScript::ensureProfileString(JSContext* cx, JSScript* script) {
+  MOZ_ASSERT(cx->runtime()->geckoProfiler().enabled());
+
+  if (profileString_) {
+    return;
+  }
+
+  AutoEnterOOMUnsafeRegion oomUnsafe;
+  profileString_ = cx->runtime()->geckoProfiler().profileString(cx, script);
+  if (!profileString_) {
+    oomUnsafe.crash("Failed to allocate profile string");
+  }
+}
+
+void JitScript::ensureProfilerScriptSource(JSContext* cx, JSScript* script) {
+  MOZ_ASSERT(cx->runtime()->geckoProfiler().enabled());
+
+  AutoEnterOOMUnsafeRegion oomUnsafe;
+  if (!cx->runtime()->geckoProfiler().insertScriptSource(
+          script->scriptSource())) {
+    oomUnsafe.crash("Failed to insert profiled script source");
+  }
+}
+
+void JitScript::Destroy(Zone* zone, JitScript* script) {
+  script->prepareForDestruction(zone);
+
+  script->remove();
+
+  js_delete(script);
+}
+
+template <typename F>
+void JitScript::forEachICScript(const F& f) {
+  f(&icScript_);
+  if (hasInliningRoot()) {
+    inliningRoot()->forEachInlinedScript(f);
+  }
+}
+
+template <typename F>
+void JitScript::forEachICScript(const F& f) const {
+  f(&icScript_);
+  if (hasInliningRoot()) {
+    inliningRoot()->forEachInlinedScript(f);
+  }
+}
+
+void ICScript::prepareForDestruction(Zone* zone) {
+  envAllocSite_ = nullptr;  
+
+  JSRuntime* rt = zone->runtimeFromMainThread();
+  rt->gc.queueAllLifoBlocksForFreeAfterMinorGC(&allocSitesSpace_);
+
+  PreWriteBarrier(zone, this);
+}
+
+void JitScript::prepareForDestruction(Zone* zone) {
+  forEachICScript(
+      [&](ICScript* script) { script->prepareForDestruction(zone); });
+
+  owningScript_ = nullptr;
+  baselineScript_.set(zone, nullptr);
+  ionScript_.set(zone, nullptr);
+  templateEnv_ = nullptr;
+}
+
+struct FallbackStubs {
+  ICScript* const icScript_;
+
+  explicit FallbackStubs(ICScript* icScript) : icScript_(icScript) {}
+
+  size_t numEntries() const { return icScript_->numICEntries(); }
+  ICFallbackStub* operator[](size_t index) const {
+    return icScript_->fallbackStub(index);
+  }
+};
+
+static bool ComputeBinarySearchMid(FallbackStubs stubs, uint32_t pcOffset,
+                                   size_t* loc) {
+  return mozilla::BinarySearchIf(
+      stubs, 0, stubs.numEntries(),
+      [pcOffset](const ICFallbackStub* stub) {
+        if (pcOffset < stub->pcOffset()) {
+          return -1;
+        }
+        if (stub->pcOffset() < pcOffset) {
+          return 1;
+        }
+        return 0;
+      },
+      loc);
+}
+
+ICEntry& ICScript::icEntryFromPCOffset(uint32_t pcOffset) {
+  size_t mid;
+  bool success = ComputeBinarySearchMid(FallbackStubs(this), pcOffset, &mid);
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+  if (!success) {
+    MOZ_CRASH_UNSAFE_PRINTF("Missing icEntry for offset %d (max offset: %d)",
+                            int(pcOffset),
+                            int(fallbackStub(numICEntries() - 1)->pcOffset()));
+  }
+#endif
+  MOZ_ALWAYS_TRUE(success);
+
+  MOZ_ASSERT(mid < numICEntries());
+
+  ICEntry& entry = icEntry(mid);
+  MOZ_ASSERT(fallbackStubForICEntry(&entry)->pcOffset() == pcOffset);
+  return entry;
+}
+
+ICEntry* ICScript::interpreterICEntryFromPCOffset(uint32_t pcOffset) {
+
+  size_t mid;
+  ComputeBinarySearchMid(FallbackStubs(this), pcOffset, &mid);
+
+  if (mid < numICEntries()) {
+    ICEntry& entry = icEntry(mid);
+    MOZ_ASSERT(fallbackStubForICEntry(&entry)->pcOffset() >= pcOffset);
+    return &entry;
+  }
+
+  return nullptr;
+}
+
+void JitScript::purgeInactiveICScripts() {
+  if (!hasInliningRoot()) {
+    return;
+  }
+
+  forEachICScript([](ICScript* script) { script->purgeInactiveICScripts(); });
+
+  inliningRoot()->purgeInactiveICScripts();
+  if (inliningRoot()->numInlinedScripts() == 0) {
+    inliningRoot_.reset();
+    icScript()->inliningRoot_ = nullptr;
+  } else {
+    MOZ_ASSERT(icScript()->active());
+  }
+}
+
+void JitScript::purgeStubs(JSScript* script, ICStubSpace& newStubSpace) {
+  MOZ_ASSERT(script->jitScript() == this);
+
+  Zone* zone = script->zone();
+  if (IsAboutToBeFinalizedUnbarriered(script)) {
+    return;
+  }
+
+  JitSpew(JitSpew_BaselineIC, "Purging optimized stubs");
+
+  forEachICScript(
+      [&](ICScript* script) { script->purgeStubs(zone, newStubSpace); });
+
+  notePurgedStubs();
+}
+
+void ICScript::purgeStubs(Zone* zone, ICStubSpace& newStubSpace) {
+  for (size_t i = 0; i < numICEntries(); i++) {
+    ICEntry& entry = icEntry(i);
+    ICFallbackStub* fallback = fallbackStub(i);
+
+    if (fallback->trialInliningState() == TrialInliningState::Inlined &&
+        hasInlinedChild(fallback->pcOffset())) {
+      MOZ_ASSERT(active());
+#ifdef DEBUG
+      ICScript* callee = findInlinedChild(fallback->pcOffset());
+      MOZ_ASSERT(callee->active());
+      MOZ_ASSERT(callee->bytecodeSize() < inliningRoot()->totalBytecodeSize());
+#endif
+
+      JSRuntime* rt = zone->runtimeFromMainThread();
+      ICCacheIRStub* prev = nullptr;
+      ICStub* stub = entry.firstStub();
+      while (stub != fallback) {
+        ICCacheIRStub* clone = stub->toCacheIRStub()->clone(
+            rt, newStubSpace, ICCacheIRStub::ICScriptHandling::AssertActive);
+        if (prev) {
+          prev->setNext(clone);
+        } else {
+          entry.setFirstStub(clone);
+        }
+        MOZ_ASSERT(stub->toCacheIRStub()->next() == clone->next());
+        prev = clone;
+        stub = clone->next();
+      }
+      continue;
+    }
+
+    MOZ_ASSERT(!hasInlinedChild(fallback->pcOffset()));
+
+    fallback->discardStubs(zone, &entry);
+    fallback->state().reset();
+  }
+}
+
+bool JitScript::ensureHasCachedBaselineJitData(JSContext* cx,
+                                               HandleScript script) {
+  if (flags_.initializedTemplateEnv) {
+    return true;
+  }
+
+  MOZ_ASSERT(!templateEnv_);
+
+  if (!script->function() ||
+      !script->function()->needsFunctionEnvironmentObjects()) {
+    flags_.initializedTemplateEnv = true;
+    return true;
+  }
+
+  Rooted<EnvironmentObject*> templateEnv(cx);
+  Rooted<JSFunction*> fun(cx, script->function());
+
+  if (fun->needsNamedLambdaEnvironment()) {
+    templateEnv = NamedLambdaObject::createTemplateObject(cx, fun);
+    if (!templateEnv) {
+      return false;
+    }
+  }
+
+  if (fun->needsCallObject()) {
+    templateEnv = CallObject::createTemplateObject(cx, script, templateEnv);
+    if (!templateEnv) {
+      return false;
+    }
+  }
+
+  templateEnv_ = templateEnv;
+  flags_.initializedTemplateEnv = true;
+  return true;
+}
+
+bool JitScript::ensureHasCachedIonData(JSContext* cx, HandleScript script) {
+  MOZ_ASSERT(script->jitScript() == this);
+
+  if (usesEnvironmentChain_.isSome()) {
+    return true;
+  }
+
+  if (!ensureHasCachedBaselineJitData(cx, script)) {
+    return false;
+  }
+
+  usesEnvironmentChain_.emplace(ScriptUsesEnvironmentChain(script));
+  return true;
+}
+
+std::pair<CallObject*, NamedLambdaObject*>
+JitScript::functionEnvironmentTemplates(JSFunction* fun) const {
+  EnvironmentObject* templateEnv = templateEnvironment();
+
+  CallObject* callObjectTemplate = nullptr;
+  if (fun->needsCallObject()) {
+    callObjectTemplate = &templateEnv->as<CallObject>();
+  }
+
+  NamedLambdaObject* namedLambdaTemplate = nullptr;
+  if (fun->needsNamedLambdaEnvironment()) {
+    if (callObjectTemplate) {
+      namedLambdaTemplate =
+          &callObjectTemplate->enclosingEnvironment().as<NamedLambdaObject>();
+    } else {
+      namedLambdaTemplate = &templateEnv->as<NamedLambdaObject>();
+    }
+  }
+
+  return {callObjectTemplate, namedLambdaTemplate};
+}
+
+void JitScript::setBaselineScriptImpl(JSScript* script,
+                                      BaselineScript* baselineScript) {
+  JSRuntime* rt = script->runtimeFromMainThread();
+  setBaselineScriptImpl(rt->gcContext(), script, baselineScript);
+}
+
+void JitScript::setBaselineScriptImpl(JS::GCContext* gcx, JSScript* script,
+                                      BaselineScript* baselineScript) {
+  if (hasBaselineScript()) {
+    gcx->removeCellMemory(script, baselineScript_->allocBytes(),
+                          MemoryUse::BaselineScript);
+    baselineScript_.set(script->zone(), nullptr);
+  }
+
+  MOZ_ASSERT(ionScript_ == nullptr || ionScript_ == IonDisabledScriptPtr);
+
+  baselineScript_.set(script->zone(), baselineScript);
+  if (hasBaselineScript()) {
+    AddCellMemory(script, baselineScript_->allocBytes(),
+                  MemoryUse::BaselineScript);
+  }
+
+  script->resetWarmUpResetCounter();
+  script->updateJitCodeRaw(gcx->runtime());
+}
+
+void JitScript::setIonScriptImpl(JSScript* script, IonScript* ionScript) {
+  JSRuntime* rt = script->runtimeFromMainThread();
+  setIonScriptImpl(rt->gcContext(), script, ionScript);
+}
+
+void JitScript::setIonScriptImpl(JS::GCContext* gcx, JSScript* script,
+                                 IonScript* ionScript) {
+  MOZ_ASSERT_IF(ionScript != IonDisabledScriptPtr,
+                !baselineScript()->hasPendingIonCompileTask());
+
+  JS::Zone* zone = script->zone();
+  if (hasIonScript()) {
+    gcx->removeCellMemory(script, ionScript_->allocBytes(),
+                          MemoryUse::IonScript);
+    ionScript_.set(zone, nullptr);
+  }
+
+  ionScript_.set(zone, ionScript);
+  MOZ_ASSERT_IF(hasIonScript(), hasBaselineScript());
+  if (hasIonScript()) {
+    AddCellMemory(script, ionScript_->allocBytes(), MemoryUse::IonScript);
+  }
+
+  script->updateJitCodeRaw(gcx->runtime());
+}
+
+#ifdef JS_STRUCTURED_SPEW
+static bool HasEnteredCounters(ICEntry& entry) {
+  ICStub* stub = entry.firstStub();
+  if (stub && !stub->isFallback()) {
+    return true;
+  }
+  return false;
+}
+
+void jit::JitSpewBaselineICStats(JSScript* script, const char* dumpReason) {
+  MOZ_ASSERT(script->hasJitScript());
+  JSContext* cx = TlsContext.get();
+  AutoStructuredSpewer spew(cx, SpewChannel::BaselineICStats, script);
+  if (!spew) {
+    return;
+  }
+
+  JitScript* jitScript = script->jitScript();
+  spew->property("reason", dumpReason);
+  spew->beginListProperty("entries");
+  for (size_t i = 0; i < jitScript->numICEntries(); i++) {
+    ICEntry& entry = jitScript->icEntry(i);
+    ICFallbackStub* fallback = jitScript->fallbackStub(i);
+    if (!HasEnteredCounters(entry)) {
+      continue;
+    }
+
+    uint32_t pcOffset = fallback->pcOffset();
+    jsbytecode* pc = script->offsetToPC(pcOffset);
+
+    JS::LimitedColumnNumberOneOrigin column;
+    unsigned int line = PCToLineNumber(script, pc, &column);
+
+    spew->beginObject();
+    spew->property("op", CodeName(JSOp(*pc)));
+    spew->property("pc", pcOffset);
+    spew->property("line", line);
+    spew->property("column", column.oneOriginValue());
+
+    spew->beginListProperty("counts");
+    ICStub* stub = entry.firstStub();
+    while (stub && !stub->isFallback()) {
+      uint32_t count = stub->enteredCount();
+      spew->value(count);
+      stub = stub->toCacheIRStub()->next();
+    }
+    spew->endList();
+    spew->property("fallback_count", fallback->enteredCount());
+    spew->endObject();
+  }
+  spew->endList();
+}
+#endif
+
+using StubHashMap = HashMap<ICCacheIRStub*, ICCacheIRStub*,
+                            DefaultHasher<ICCacheIRStub*>, SystemAllocPolicy>;
+
+static void MarkActiveICScriptsAndCopyStubs(
+    JSContext* cx, const JitActivationIterator& activation,
+    ICStubSpace& newStubSpace, StubHashMap& alreadyClonedStubs) {
+  for (OnlyJSJitFrameIter iter(activation); !iter.done(); ++iter) {
+    const JSJitFrameIter& frame = iter.frame();
+    switch (frame.type()) {
+      case FrameType::BaselineJS:
+        frame.script()->jitScript()->icScript()->setActive();
+        if (frame.baselineFrame()->icScript()->isInlined()) {
+          frame.baselineFrame()->icScript()->setActive();
+        }
+        break;
+      case FrameType::BaselineStub: {
+        auto* layout = reinterpret_cast<BaselineStubFrameLayout*>(frame.fp());
+        if (layout->maybeStubPtr() && !layout->maybeStubPtr()->isFallback()) {
+          ICCacheIRStub* stub = layout->maybeStubPtr()->toCacheIRStub();
+          auto lookup = alreadyClonedStubs.lookupForAdd(stub);
+          if (!lookup) {
+            ICCacheIRStub* newStub =
+                stub->clone(cx->runtime(), newStubSpace,
+                            ICCacheIRStub::ICScriptHandling::MarkActive);
+            AutoEnterOOMUnsafeRegion oomUnsafe;
+            if (!alreadyClonedStubs.add(lookup, stub, newStub)) {
+              oomUnsafe.crash("MarkActiveICScriptsAndCopyStubs");
+            }
+          }
+          layout->setStubPtr(lookup->value());
+        }
+        break;
+      }
+      case FrameType::Exit:
+        if (frame.exitFrame()->is<LazyLinkExitFrameLayout>()) {
+          LazyLinkExitFrameLayout* ll =
+              frame.exitFrame()->as<LazyLinkExitFrameLayout>();
+          JSScript* script =
+              ScriptFromCalleeToken(ll->jsFrame()->calleeToken());
+          script->jitScript()->icScript()->setActive();
+        }
+        break;
+      case FrameType::Bailout:
+      case FrameType::IonJS: {
+        frame.script()->jitScript()->icScript()->setActive();
+        for (InlineFrameIterator inlineIter(cx, &frame); inlineIter.more();
+             ++inlineIter) {
+          inlineIter.script()->jitScript()->icScript()->setActive();
+        }
+        frame.ionScript()->notePurgedICScripts();
+        break;
+      }
+      default:;
+    }
+  }
+}
+
+void jit::MarkActiveICScriptsAndCopyStubs(Zone* zone,
+                                          ICStubSpace& newStubSpace) {
+  if (zone->isAtomsZone()) {
+    return;
+  }
+  StubHashMap alreadyClonedStubs;
+  JSContext* cx = TlsContext.get();
+  for (JitActivationIterator iter(cx); !iter.done(); ++iter) {
+    if (iter->compartment()->zone() == zone) {
+      MarkActiveICScriptsAndCopyStubs(cx, iter, newStubSpace,
+                                      alreadyClonedStubs);
+    }
+  }
+}
+
+InliningRoot* JitScript::getOrCreateInliningRoot(JSContext* cx,
+                                                 JSScript* script) {
+  MOZ_ASSERT(script->jitScript() == this);
+
+  if (!inliningRoot_) {
+    inliningRoot_ = js::MakeUnique<InliningRoot>(cx, script);
+    if (!inliningRoot_) {
+      ReportOutOfMemory(cx);
+      return nullptr;
+    }
+    icScript_.inliningRoot_ = inliningRoot_.get();
+  }
+  return inliningRoot_.get();
+}
+
+gc::AllocSite* ICScript::getOrCreateAllocSite(JSScript* outerScript,
+                                              uint32_t pcOffset,
+                                              const gc::AutoMarkingLock& lock) {
+  MOZ_ASSERT(outerScript->jitScript()->icScript() == this ||
+             (inliningRoot() && inliningRoot()->owningScript() == outerScript));
+
+  MOZ_ASSERT_IF(pcOffset != gc::AllocSite::EnvSitePCOffset,
+                pcOffset < bytecodeSize());
+
+  for (gc::AllocSite* site : allocSites_) {
+    if (site->pcOffset() == pcOffset) {
+      MOZ_ASSERT(site->isNormal());
+      MOZ_ASSERT(site->script() == outerScript);
+      MOZ_ASSERT(site->traceKind() == JS::TraceKind::Object);
+      return site;
+    }
+  }
+
+  Zone* zone = outerScript->zone();
+  Nursery& nursery = outerScript->runtimeFromMainThread()->gc.nursery();
+  if (!nursery.canCreateAllocSite()) {
+    return zone->unknownAllocSite(JS::TraceKind::Object);
+  }
+
+  if (!allocSites_.reserve(allocSites_.length() + 1)) {
+    return nullptr;
+  }
+
+  auto* site = allocSitesSpace_.new_<gc::AllocSite>(zone, outerScript, pcOffset,
+                                                    JS::TraceKind::Object);
+  if (!site) {
+    return nullptr;
+  }
+
+  allocSites_.infallibleAppend(site);
+
+  nursery.noteAllocSiteCreated();
+
+  return site;
+}
+
+void ICScript::ensureEnvAllocSite(JSScript* outerScript,
+                                  const gc::AutoMarkingLock& lock) {
+  if (envAllocSite_) {
+    return;
+  }
+
+  uint32_t pcoffset = gc::AllocSite::EnvSitePCOffset;
+  gc::AllocSite* site = getOrCreateAllocSite(outerScript, pcoffset, lock);
+  if (!site) {
+    site = outerScript->zone()->unknownAllocSite(JS::TraceKind::Object);
+  }
+
+  envAllocSite_ = site;
+}
+
+bool JitScript::resetAllocSites(bool resetNurserySites,
+                                bool resetPretenuredSites) {
+  MOZ_ASSERT(resetNurserySites || resetPretenuredSites);
+
+  bool anyReset = false;
+
+  forEachICScript([&](ICScript* script) {
+    for (gc::AllocSite* site : script->allocSites_) {
+      if ((resetNurserySites && site->initialHeap() == gc::Heap::Default) ||
+          (resetPretenuredSites && site->initialHeap() == gc::Heap::Tenured)) {
+        if (site->maybeResetState()) {
+          anyReset = true;
+        }
+      }
+    }
+  });
+
+  return anyReset;
+}
+
+bool JitScript::hasPretenuredAllocSites() {
+  bool found = false;
+  forEachICScript([&](ICScript* script) {
+    if (!found) {
+      for (gc::AllocSite* site : script->allocSites_) {
+        if (site->initialHeap() == gc::Heap::Tenured) {
+          found = true;
+        }
+      }
+    }
+  });
+
+  return found;
+}
+
+void JitScript::addSizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf,
+                                       size_t* data, size_t* allocSites) const {
+  *data += mallocSizeOf(this);
+
+  forEachICScript([=, this](const ICScript* script) {
+    if (script != &icScript_) {
+      *data += mallocSizeOf(script);
+    }
+
+    *allocSites += script->allocSitesSpace_.sizeOfExcludingThis(mallocSizeOf);
+    *allocSites += script->allocSites_.sizeOfExcludingThis(mallocSizeOf);
+  });
+}
+
+JitScript* ICScript::outerJitScript() {
+  MOZ_ASSERT(!isInlined());
+  uint8_t* ptr = reinterpret_cast<uint8_t*>(this);
+  return reinterpret_cast<JitScript*>(ptr - JitScript::offsetOfICScript());
+}
+
+#ifdef DEBUG
+HashNumber ICScript::hash(JSContext* cx) {
+  HashNumber h = 0;
+  for (size_t i = 0; i < numICEntries(); i++) {
+    ICStub* stub = icEntry(i).firstStub();
+    ICFallbackStub* fallback = fallbackStub(i);
+
+    h = mozilla::AddToHash(h, stub);
+
+    if (!stub->isFallback() && fallback->mayHaveFoldedStub()) {
+      const CacheIRStubInfo* stubInfo = stub->toCacheIRStub()->stubInfo();
+      CacheIRReader reader(stubInfo);
+      while (reader.more()) {
+        CacheOp op = reader.readOp();
+        switch (op) {
+          case CacheOp::GuardMultipleShapes: {
+            auto args = reader.argsForGuardMultipleShapes();
+            JSObject* shapes =
+                stubInfo->getStubField<StubField::Type::JSObject>(
+                    stub->toCacheIRStub(), args.shapesOffset);
+            auto* shapesObject = &shapes->as<ShapeListObject>();
+            size_t numShapes = shapesObject->length();
+            if (ShapeListSnapshot::shouldSnapshot(numShapes)) {
+              for (size_t i = 0; i < numShapes; i++) {
+                Shape* shape = shapesObject->getUnbarriered(i);
+                h = mozilla::AddToHash(h, shape);
+              }
+              h = mozilla::AddToHash(h, cx->runtime()->gc.majorGCCount());
+            }
+            break;
+          }
+          case CacheOp::GuardMultipleShapesToOffset: {
+            auto args = reader.argsForGuardMultipleShapesToOffset();
+            JSObject* shapes =
+                stubInfo->getStubField<StubField::Type::JSObject>(
+                    stub->toCacheIRStub(), args.shapesOffset);
+            auto* shapesObject = &shapes->as<ShapeListWithOffsetsObject>();
+            size_t numShapes = shapesObject->numShapes();
+            if (ShapeListSnapshot::shouldSnapshot(numShapes)) {
+              for (size_t i = 0; i < numShapes; i++) {
+                Shape* shape = shapesObject->getShapeUnbarriered(i);
+                h = mozilla::AddToHash(h, shape);
+                h = mozilla::AddToHash(h, shapesObject->getOffset(i));
+              }
+              h = mozilla::AddToHash(h, cx->runtime()->gc.majorGCCount());
+            }
+            break;
+          }
+          default:
+            reader.skip(CacheIROpInfos[size_t(op)].argLength);
+            break;
+        }
+      }
+    }
+
+    if (!stub->isFallback()) {
+      stub = stub->toCacheIRStub()->next();
+      while (!stub->isFallback()) {
+        h = mozilla::AddToHash(h, stub->enteredCount() == 0);
+        stub = stub->toCacheIRStub()->next();
+      }
+    }
+
+    MOZ_ASSERT(stub->isFallback());
+    h = mozilla::AddToHash(h, stub->enteredCount() == 0);
+    h = mozilla::AddToHash(h, stub->toFallbackStub()->state().hasFailures());
+  }
+
+  return h;
+}
+#endif

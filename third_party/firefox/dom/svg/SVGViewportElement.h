@@ -1,0 +1,123 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SVG_SVGVIEWPORTELEMENT_H_
+#define DOM_SVG_SVGVIEWPORTELEMENT_H_
+
+#include "SVGAnimatedEnumeration.h"
+#include "SVGAnimatedLength.h"
+#include "SVGAnimatedPreserveAspectRatio.h"
+#include "SVGAnimatedViewBox.h"
+#include "SVGGraphicsElement.h"
+#include "SVGPreserveAspectRatio.h"
+#include "nsIContentInlines.h"
+
+namespace mozilla {
+class AutoPreserveAspectRatioOverride;
+class SVGOuterSVGFrame;
+class SVGViewportFrame;
+
+namespace dom {
+class DOMSVGAnimatedPreserveAspectRatio;
+class SVGAnimatedRect;
+class SVGViewElement;
+class SVGViewportElement;
+
+class SVGViewportElement : public SVGGraphicsElement {
+  friend class mozilla::SVGOuterSVGFrame;
+  friend class mozilla::SVGViewportFrame;
+
+ protected:
+  explicit SVGViewportElement(
+      already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo);
+  ~SVGViewportElement() = default;
+
+ public:
+  NS_IMETHOD_(bool) IsAttributeMapped(const nsAtom* aAttribute) const override;
+
+  gfxMatrix ChildToUserSpaceTransform() const override;
+
+  bool HasValidDimensions() const override;
+
+
+  float GetLength(SVGLength::Axis aAxis) const;
+
+
+  bool HasViewBox() const { return GetViewBoxInternal().HasRect(); }
+
+  bool ShouldSynthesizeViewBox() const;
+
+  bool HasViewBoxOrSyntheticViewBox() const {
+    return HasViewBox() || ShouldSynthesizeViewBox();
+  }
+
+  bool HasChildrenOnlyTransform() const { return mHasChildrenOnlyTransform; }
+
+  void UpdateHasChildrenOnlyTransform();
+
+  enum class ChildrenOnlyTransformChangedFlag { DuringReflow };
+
+  using ChildrenOnlyTransformChangedFlags =
+      EnumSet<ChildrenOnlyTransformChangedFlag>;
+
+  void ChildrenOnlyTransformChanged(
+      ChildrenOnlyTransformChangedFlags aFlags = {});
+
+  gfx::Matrix GetViewBoxTransform() const;
+
+  gfx::Size GetViewportSize() const { return mViewportSize; }
+
+  void SetViewportSize(const gfx::Size& aSize) { mViewportSize = aSize; }
+
+  bool IsInner() const {
+    const nsIContent* parent = GetFlattenedTreeParent();
+    return parent && parent->IsSVGElement() &&
+           !parent->IsSVGElement(nsGkAtoms::foreignObject);
+  }
+
+  already_AddRefed<SVGAnimatedRect> ViewBox();
+  already_AddRefed<DOMSVGAnimatedPreserveAspectRatio> PreserveAspectRatio();
+  SVGAnimatedViewBox* GetAnimatedViewBox() override;
+
+ protected:
+
+  bool IsRootSVGSVGElement() const {
+    NS_ASSERTION((IsInUncomposedDoc() && !GetParent()) ==
+                     (OwnerDoc()->GetRootElement() == this),
+                 "Can't determine if we're root");
+    return !GetParent() && IsInUncomposedDoc() && IsSVGElement(nsGkAtoms::svg);
+  }
+
+  virtual SVGPreserveAspectRatio GetPreserveAspectRatioWithOverride() const {
+    return mPreserveAspectRatio.GetAnimValue();
+  }
+
+  SVGViewBox GetViewBoxWithSynthesis(float aViewportWidth,
+                                     float aViewportHeight) const;
+
+  SVGAnimatedPreserveAspectRatio* GetAnimatedPreserveAspectRatio() override;
+
+  virtual const SVGAnimatedViewBox& GetViewBoxInternal() const {
+    return mViewBox;
+  }
+
+  SVGAnimatedViewBox mViewBox;
+
+  enum { ATTR_X, ATTR_Y, ATTR_WIDTH, ATTR_HEIGHT };
+  SVGAnimatedLength mLengthAttributes[4];
+  static LengthInfo sLengthInfo[4];
+  LengthAttributesInfo GetLengthInfo() override;
+
+  gfx::Size mViewportSize;
+
+  SVGAnimatedPreserveAspectRatio mPreserveAspectRatio;
+
+  bool mHasChildrenOnlyTransform = false;
+};
+
+}  
+
+}  
+
+#endif  // DOM_SVG_SVGVIEWPORTELEMENT_H_

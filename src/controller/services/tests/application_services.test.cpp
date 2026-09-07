@@ -1,0 +1,842 @@
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <catch2/catch_test_macros.hpp>
+#include <cerrno>
+#include <chrono>
+#include <csignal>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <nlohmann/json.hpp>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <type_traits>
+#include <utility>
+
+#include "filesystem_test_utils.hpp"
+#include "src/common/io/scoped_fd.h"
+#include "src/controller/contracts/gui_settings_mutation.h"
+#include "src/controller/contracts/workspace.h"
+#include "src/controller/services/diagnostics_client.h"
+#include "src/controller/services/file_dialog_client.h"
+#include "src/controller/services/file_dialog_catalog.h"
+#include "src/controller/services/firefox_process_owner.h"
+#include "src/controller/services/runtime_diagnostics.h"
+#include "src/controller/services/settings_store.h"
+
+namespace mmltk::controller::services {
+namespace {
+
+using mmltk::common::io::ScopedFd;
+
+class ScopedEnvironmentVariable final {
+   public:
+    explicit ScopedEnvironmentVariable(const std::string_view name) : name_(name) {
+        if (const char* existing = std::getenv(name_.c_str()); existing != nullptr) previous_.emplace(existing);
+        if (::unsetenv(name_.c_str()) != 0) throw std::runtime_error("cannot unset test environment variable");
+    }
+    ScopedEnvironmentVariable(const std::string_view name, const std::string_view value) : name_(name) {
+        if (const char* existing = std::getenv(name_.c_str()); existing != nullptr) previous_.emplace(existing);
+        if (::setenv(name_.c_str(), std::string{value}.c_str(), 1) != 0) throw std::runtime_error("cannot set test environment variable");
+    }
+    ~ScopedEnvironmentVariable() noexcept {
+        if (previous_)
+            static_cast<void>(::setenv(name_.c_str(), previous_->c_str(), 1));
+        else
+            static_cast<void>(::unsetenv(name_.c_str()));
+    }
+
+   private:
+    std::string name_;
+    std::optional<std::string> previous_{};
+};
+
+[[nodiscard]] std::string read_file(const std::filesystem::path& path) {
+    std::ifstream stream(path, std::ios::binary | std::ios::ate);
+    if (!stream) throw std::runtime_error("cannot open test output");
+    const std::streampos end = stream.tellg();
+    if (end < 0) throw std::runtime_error("cannot size test output");
+    std::string contents(static_cast<std::size_t>(end), '\0');
+    stream.seekg(0);
+    if (!contents.empty() && !stream.read(contents.data(), static_cast<std::streamsize>(contents.size()))) {
+        throw std::runtime_error("cannot read test output");
+    }
+    return contents;
+}
+
+[[nodiscard]] std::string maximum_diagnostic_record() {
+    std::string record{"{\"payload\":\""};
+    record.append(DiagnosticsClient::kRecordCapacity - record.size() - 2U, 'x');
+    record += "\"}";
+    return record;
+}
+
+void require_one_terminal_wake(DiagnosticsClient& diagnostics) {
+    const int terminal_fd = diagnostics.terminal_fd();
+    REQUIRE(terminal_fd >= 0);
+    pollfd ready{.fd = terminal_fd, .events = POLLIN, .revents = 0};
+    REQUIRE(::poll(&ready, 1U, 5000) == 1);
+    std::uint64_t wake = 0U;
+    REQUIRE(::read(terminal_fd, &wake, sizeof(wake)) == static_cast<ssize_t>(sizeof(wake)));
+    CHECK(wake == 1U);
+    CHECK(::read(terminal_fd, &wake, sizeof(wake)) < 0);
+    CHECK(errno == EAGAIN);
+}
+
+[[nodiscard]] std::filesystem::path make_dialog_helper(const std::filesystem::path& directory, const std::string_view name,
+                                                       const std::string_view body) {
+    const std::filesystem::path helper = directory / std::string{name};
+    {
+        std::ofstream stream(helper);
+        stream << "#!/bin/sh\n" << body << "\n";
+    }
+    std::filesystem::permissions(
+        helper, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write | std::filesystem::perms::owner_exec,
+        std::filesystem::perm_options::replace);
+    return helper;
+}
+
+[[nodiscard]] FileDialogRequest dialog_request(
+    const std::string_view title = "Select",
+    const mmltk::controller::contracts::FileDialogMode mode = mmltk::controller::contracts::FileDialogMode::OpenFile,
+    const std::string_view filter = "Files", const std::string_view pattern = "*") {
+    return {.title = mmltk::controller::services::BoundedText<mmltk::controller::services::kFileDialogTextCapacity>::From(title),
+            .mode = mode,
+            .filter = {
+                .name = mmltk::controller::services::BoundedText<mmltk::controller::services::kFileDialogTextCapacity>::From(filter),
+                .pattern = mmltk::controller::services::BoundedText<mmltk::controller::services::kFileDialogTextCapacity>::From(pattern)}};
+}
+
+[[nodiscard]] FileDialogResult run_dialog(const std::filesystem::path& helper, const std::filesystem::path& launch_directory,
+                                          const FileDialogRequest& request, const bool cancel_before_run = false) {
+    FileDialogClientOwner owner{helper.string(), launch_directory.string()};
+    auto [cancellation, token] = FileDialogCancellationSource::Mint();
+    if (cancel_before_run) REQUIRE(cancellation.RequestCancel());
+    return owner.client().run(request, std::move(token));
+}
+
+}  // namespace
+
+TEST_CASE("browser runtime exit policy classifies every owned Firefox terminal", "[gui][services][firefox][lifecycle]") {
+    CHECK(browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::Exited, .status = 0, .stop_requested = true}, true) == 0);
+    CHECK(browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::Exited, .status = 17, .stop_requested = true}, true) == 17);
+    CHECK(browser_runtime_exit_status(
+              {.terminal = FirefoxProcessTerminal::Signaled, .status = 128 + SIGTERM, .stop_requested = true, .kill_selected = false},
+              true) == 0);
+    CHECK(browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::Signaled, .status = 128 + SIGTERM}, true) == 128 + SIGTERM);
+    CHECK(browser_runtime_exit_status(
+              {.terminal = FirefoxProcessTerminal::Signaled, .status = 128 + SIGTERM, .stop_requested = true, .kill_selected = true},
+              true) == 128 + SIGTERM);
+    CHECK(browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::StartupFailed, .status = 1}, true) == 1);
+    CHECK(browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::Signaled, .status = 128 + SIGTERM, .stop_requested = true},
+                                      false) == 128 + SIGTERM);
+}
+
+TEST_CASE("settings store repairs missing malformed and normalized documents", "[gui][services]") {
+    mmltk::testsupport::ScopedTempDir temporary{"mmltk-settings-store-repair"};
+    const auto path = temporary.path() / "gui.json";
+    const auto defaults = SettingsStore::load(path);
+    CHECK(gui_settings_valid(defaults.settings));
+    CHECK(defaults.revision_frontier == 0U);
+    CHECK_FALSE(std::filesystem::exists(path));
+    {
+        std::ofstream malformed(path);
+        malformed << "{";
+    }
+    const auto repaired = SettingsStore::load(path);
+    CHECK(gui_settings_valid(repaired.settings));
+    CHECK(std::filesystem::exists(path));
+    {
+        std::ofstream normalizable(path);
+        normalizable << R"({"schema_version":0})";
+    }
+    const auto normalized = SettingsStore::load(path);
+    CHECK(gui_settings_valid(normalized.settings));
+    CHECK(read_file(path).find("schema_version") != std::string::npos);
+}
+
+TEST_CASE("settings store validates, creates parents, and cleans failed atomics", "[gui][services]") {
+    mmltk::testsupport::ScopedTempDir temporary{"mmltk-settings-store-write"};
+    const auto root = temporary.path();
+    const auto path = root / "nested" / "gui.json";
+    const auto record = SettingsStore::load(path);
+    SettingsStore::save(path, record.settings, record.revision_frontier);
+    CHECK(std::filesystem::exists(path));
+    CHECK_FALSE(std::filesystem::exists(path.string() + ".tmp"));
+    auto invalid = record;
+    invalid.settings.workflows.train.request.preset_name.clear();
+    try {
+        SettingsStore::save(path, invalid.settings, invalid.revision_frontier);
+        FAIL("invalid settings were persisted");
+    } catch (const SettingsStoreError& error) { CHECK(error.stage == SettingsStoreWriteStage::Validation); }
+    const auto blocked = root / "blocked";
+    {
+        std::ofstream blocker(blocked);
+        blocker << "file";
+    }
+    try {
+        SettingsStore::save(blocked / "gui.json", record.settings, record.revision_frontier);
+        FAIL("settings parent failure was not reported");
+    } catch (const SettingsStoreError& error) { CHECK(error.stage == SettingsStoreWriteStage::Parent); }
+    CHECK_FALSE(std::filesystem::exists((blocked / "gui.json").string() + ".tmp"));
+    const auto rename_target = root / "rename-target";
+    std::filesystem::create_directory(rename_target);
+    try {
+        SettingsStore::save(rename_target, record.settings, record.revision_frontier);
+        FAIL("settings rename failure was not reported");
+    } catch (const SettingsStoreError& error) { CHECK(error.stage == SettingsStoreWriteStage::Rename); }
+    CHECK_FALSE(std::filesystem::exists(rename_target.string() + ".tmp"));
+}
+
+TEST_CASE("settings store preserves one durable revision frontier", "[gui][services]") {
+    mmltk::testsupport::ScopedTempDir temporary{"mmltk-settings-store-revision"};
+    const auto path = temporary.path() / "gui.json";
+    auto record = SettingsStore::load(path);
+    record.revision_frontier = 41U;
+    record.settings.ui.dark_mode = true;
+    SettingsStore::save(path, record.settings, record.revision_frontier);
+    const auto reloaded = SettingsStore::load(path);
+    CHECK(reloaded.revision_frontier == 41U);
+    CHECK(reloaded.settings.ui.dark_mode);
+    {
+        std::ofstream invalid(path);
+        invalid << R"({"schema_version":1,"settings_revision":-1})";
+    }
+    CHECK_THROWS_AS(SettingsStore::load(path), SettingsStoreError);
+}
+
+TEST_CASE("diagnostics disabled producers perform no submission work", "[gui][services]") {
+    DiagnosticsClient diagnostics;
+    CHECK_FALSE(diagnostics.enabled());
+    CHECK(diagnostics.terminal() == DiagnosticsTerminal::Drained);
+    CHECK(diagnostics.terminal_fd() < 0);
+    const auto producer = diagnostics.producer();
+    CHECK_FALSE(producer.enabled());
+    CHECK(producer.acquire().submit({"{\"event\":\"disabled\"}"}) == DiagnosticSubmitResult::Disabled);
+    CHECK(diagnostics.counters().accepted == 0U);
+    RuntimeDiagnostics runtime{diagnostics.producer()};
+    const auto target = runtime.target();
+    CHECK_FALSE(target.benchmark_trace_enabled());
+}
+
+TEST_CASE("diagnostics environment uses only the canonical GUI trace path", "[gui][services]") {
+    mmltk::testsupport::ScopedTempDir temporary{"mmltk-diagnostics-environment"};
+    const auto canonical_path = temporary.path() / "gui-trace.jsonl";
+    const auto removed_path = temporary.path() / "removed-diagnostics.jsonl";
+    ScopedEnvironmentVariable removed{"MMLTK_DIAGNOSTICS_FILE", removed_path.string()};
+
+    {
+        ScopedEnvironmentVariable canonical{"MMLTK_GUI_TRACE_FILE", canonical_path.string()};
+        auto diagnostics = DiagnosticsClient::from_environment();
+        CHECK(diagnostics.enabled());
+        CHECK(std::filesystem::exists(canonical_path));
+        CHECK_FALSE(std::filesystem::exists(removed_path));
+        diagnostics.close(DiagnosticsCloseMode::Discard);
+    }
+    {
+        ScopedEnvironmentVariable canonical{"MMLTK_GUI_TRACE_FILE", ""};
+        auto diagnostics = DiagnosticsClient::from_environment();
+        CHECK_FALSE(diagnostics.enabled());
+        CHECK_FALSE(std::filesystem::exists(removed_path));
+    }
+    {
+        ScopedEnvironmentVariable canonical{"MMLTK_GUI_TRACE_FILE"};
+        auto diagnostics = DiagnosticsClient::from_environment();
+        CHECK_FALSE(diagnostics.enabled());
+        CHECK_FALSE(std::filesystem::exists(removed_path));
+    }
+}
+
+TEST_CASE("runtime diagnostics owns bounded benchmark trace JSONL", "[gui][services]") {
+    int descriptors[2]{-1, -1};
+    REQUIRE(::pipe2(descriptors, O_CLOEXEC) == 0);
+    ScopedFd reader{descriptors[0]};
+    DiagnosticsClient diagnostics{ScopedFd{descriptors[1]}, DiagnosticsExecutionPolicy::CallerDriven};
+    RuntimeDiagnostics runtime{diagnostics.producer()};
+    const auto target = runtime.target();
+    REQUIRE(target.benchmark_trace_enabled());
+    target.write_benchmark_trace("benchmark.publication.complete", R"({"output":"/tmp/compiled","train_images":100})");
+    CHECK(diagnostics.counters().accepted == 1U);
+    diagnostics.flush();
+    std::array<char, DiagnosticsClient::kRecordCapacity> record{};
+    const ssize_t size = ::read(reader.get(), record.data(), record.size());
+    REQUIRE(size > 0);
+    const std::string_view jsonl{record.data(), static_cast<std::size_t>(size)};
+    CHECK(jsonl.contains(R"("kind":"benchmark_dataset")"));
+    CHECK(jsonl.contains(R"("name":"benchmark.publication.complete")"));
+    CHECK(jsonl.contains(R"("train_images":100)"));
+    diagnostics.close(DiagnosticsCloseMode::Discard);
+}
+
+TEST_CASE("diagnostics close publishes one synchronous owner terminal for manual clients", "[gui][services]") {
+    int descriptors[2]{-1, -1};
+    REQUIRE(::pipe2(descriptors, O_CLOEXEC) == 0);
+    ScopedFd reader{descriptors[0]};
+    DiagnosticsClient diagnostics{ScopedFd{descriptors[1]}, DiagnosticsExecutionPolicy::CallerDriven};
+    REQUIRE(diagnostics.producer().acquire().submit({"{\"event\":\"terminal\"}"}) == DiagnosticSubmitResult::Accepted);
+    CHECK(diagnostics.terminal() == DiagnosticsTerminal::Pending);
+    diagnostics.close(DiagnosticsCloseMode::Discard);
+    CHECK(diagnostics.terminal() == DiagnosticsTerminal::Drained);
+    require_one_terminal_wake(diagnostics);
+    CHECK(diagnostics.producer().acquire().submit({"{\"event\":\"closed\"}"}) == DiagnosticSubmitResult::Disabled);
+    diagnostics.close(DiagnosticsCloseMode::Flush);
+}
+
+TEST_CASE("diagnostics flush close settles a queued manual owner exactly once", "[gui][services]") {
+    int descriptors[2]{-1, -1};
+    REQUIRE(::pipe2(descriptors, O_CLOEXEC) == 0);
+    ScopedFd reader{descriptors[0]};
+    DiagnosticsClient diagnostics{ScopedFd{descriptors[1]}, DiagnosticsExecutionPolicy::CallerDriven};
+    const auto operation = diagnostics.producer().acquire();
+    REQUIRE(operation.submit({"{\"index\":1}"}) == DiagnosticSubmitResult::Accepted);
+    REQUIRE(operation.submit({"{\"index\":2}"}) == DiagnosticSubmitResult::Accepted);
+    diagnostics.close(DiagnosticsCloseMode::Flush);
+    CHECK(diagnostics.terminal() == DiagnosticsTerminal::Drained);
+    CHECK(diagnostics.counters().accepted == 2U);
+    CHECK(diagnostics.counters().flushed == 2U);
+    CHECK(diagnostics.counters().dropped == 0U);
+    require_one_terminal_wake(diagnostics);
+    std::array<char, 32U> contents{};
+    const ssize_t read = ::read(reader.get(), contents.data(), contents.size());
+    REQUIRE(read > 0);
+    CHECK(std::string_view{contents.data(), static_cast<std::size_t>(read)} == "{\"index\":1}\n{\"index\":2}\n");
+}
+
+TEST_CASE("diagnostics writer failure publishes a failed terminal and releases its owner", "[gui][services]") {
+    const int full = ::open("/dev/full", O_WRONLY | O_CLOEXEC);
+    REQUIRE(full >= 0);
+    DiagnosticsClient diagnostics{ScopedFd{full}, DiagnosticsExecutionPolicy::CallerDriven};
+    const auto operation = diagnostics.producer().acquire();
+    REQUIRE(operation.submit({"{\"event\":\"fail\"}"}) == DiagnosticSubmitResult::Accepted);
+    diagnostics.flush();
+    CHECK(diagnostics.terminal() == DiagnosticsTerminal::Failed);
+    CHECK_FALSE(diagnostics.enabled());
+    CHECK(diagnostics.counters().write_failures == 1U);
+    CHECK(diagnostics.counters().dropped == 1U);
+    CHECK(operation.submit({"{\"event\":\"after-failure\"}"}) == DiagnosticSubmitResult::Disabled);
+    require_one_terminal_wake(diagnostics);
+    diagnostics.close(DiagnosticsCloseMode::Flush);
+}
+
+TEST_CASE("diagnostics manual flush close makes a full descriptor terminal without blocking", "[gui][services]") {
+    int descriptors[2]{-1, -1};
+    REQUIRE(::pipe2(descriptors, O_CLOEXEC | O_NONBLOCK) == 0);
+    ScopedFd reader{descriptors[0]};
+    ScopedFd writer{descriptors[1]};
+    std::array<char, 4096U> fill{};
+    while (::write(writer.get(), fill.data(), fill.size()) > 0) {}
+    REQUIRE((errno == EAGAIN || errno == EWOULDBLOCK));
+
+    const int owned_writer = writer.get();
+    DiagnosticsClient diagnostics{std::move(writer), DiagnosticsExecutionPolicy::CallerDriven};
+    REQUIRE(diagnostics.producer().acquire().submit({"{\"event\":\"full\"}"}) == DiagnosticSubmitResult::Accepted);
+    diagnostics.close(DiagnosticsCloseMode::Flush);
+
+    CHECK(diagnostics.terminal() == DiagnosticsTerminal::Failed);
+    CHECK(diagnostics.counters().write_failures == 1U);
+    CHECK(diagnostics.counters().dropped == 1U);
+    CHECK(::fcntl(owned_writer, F_GETFD) == -1);
+    CHECK(errno == EBADF);
+    require_one_terminal_wake(diagnostics);
+    diagnostics.close(DiagnosticsCloseMode::Flush);
+    diagnostics.close(DiagnosticsCloseMode::Discard);
+    std::uint64_t extra_wake = 0U;
+    CHECK(::read(diagnostics.terminal_fd(), &extra_wake, sizeof(extra_wake)) < 0);
+    CHECK(errno == EAGAIN);
+}
+
+TEST_CASE("diagnostics manual flush publishes one terminal after a partial write", "[gui][services]") {
+    int descriptors[2]{-1, -1};
+    REQUIRE(::pipe2(descriptors, O_CLOEXEC | O_NONBLOCK) == 0);
+    ScopedFd reader{descriptors[0]};
+    ScopedFd writer{descriptors[1]};
+    REQUIRE(::fcntl(writer.get(), F_SETPIPE_SZ, 4096) > 0);
+
+    DiagnosticsClient diagnostics{std::move(writer), DiagnosticsExecutionPolicy::CallerDriven};
+    const std::string record = maximum_diagnostic_record();
+    REQUIRE(diagnostics.producer().acquire().submit({record}) == DiagnosticSubmitResult::Accepted);
+    diagnostics.flush();
+
+    CHECK(diagnostics.terminal() == DiagnosticsTerminal::Failed);
+    CHECK(diagnostics.counters().write_failures == 1U);
+    CHECK(diagnostics.counters().flushed == 0U);
+    CHECK(diagnostics.counters().dropped == 1U);
+    require_one_terminal_wake(diagnostics);
+    diagnostics.close(DiagnosticsCloseMode::Flush);
+    std::uint64_t extra_wake = 0U;
+    CHECK(::read(diagnostics.terminal_fd(), &extra_wake, sizeof(extra_wake)) < 0);
+    CHECK(errno == EAGAIN);
+}
+
+TEST_CASE("diagnostics validates records and fixed capacity", "[gui][services]") {
+    mmltk::testsupport::ScopedTempDir temporary{"mmltk-diagnostics-capacity"};
+    const auto path = temporary.path() / "diagnostics.jsonl";
+    const int descriptor = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    REQUIRE(descriptor >= 0);
+    DiagnosticsClient diagnostics{ScopedFd{descriptor}, DiagnosticsExecutionPolicy::CallerDriven};
+    const auto operation = diagnostics.producer().acquire();
+    CHECK(operation.submit({"not-json"}) == DiagnosticSubmitResult::InvalidJson);
+    CHECK(operation.submit({"[]"}) == DiagnosticSubmitResult::InvalidJson);
+    CHECK(operation.submit({"{\"bad\":\n1}"}) == DiagnosticSubmitResult::InvalidJson);
+    CHECK(operation.submit({" \t{\"valid\":true}\t "}) == DiagnosticSubmitResult::Accepted);
+    std::string oversized(DiagnosticsClient::kRecordCapacity + 1U, 'x');
+    CHECK(operation.submit({oversized}) == DiagnosticSubmitResult::RecordTooLarge);
+    for (std::size_t index = 1U; index < DiagnosticsClient::kQueueCapacity; ++index) {
+        CHECK(operation.submit({"{\"index\":1}"}) == DiagnosticSubmitResult::Accepted);
+    }
+    CHECK(operation.submit({"{\"index\":2}"}) == DiagnosticSubmitResult::Capacity);
+    CHECK(diagnostics.counters().accepted == DiagnosticsClient::kQueueCapacity);
+    diagnostics.close(DiagnosticsCloseMode::Discard);
+    CHECK(diagnostics.counters().dropped >= DiagnosticsClient::kQueueCapacity);
+    CHECK(diagnostics.terminal() == DiagnosticsTerminal::Drained);
+    require_one_terminal_wake(diagnostics);
+}
+
+TEST_CASE("diagnostics close interrupts a stalled output descriptor", "[gui][services]") {
+    for (const DiagnosticsCloseMode mode : {DiagnosticsCloseMode::Discard, DiagnosticsCloseMode::Flush}) {
+        INFO((mode == DiagnosticsCloseMode::Discard ? "discard" : "flush"));
+        int descriptors[2]{-1, -1};
+        REQUIRE(::pipe2(descriptors, O_CLOEXEC) == 0);
+        ScopedFd reader{descriptors[0]};
+        ScopedFd writer{descriptors[1]};
+        const std::string maximum_record = maximum_diagnostic_record();
+        const int pipe_capacity = ::fcntl(writer.get(), F_SETPIPE_SZ, 4096);
+        REQUIRE(pipe_capacity > 0);
+        REQUIRE(static_cast<std::size_t>(pipe_capacity) < maximum_record.size());
+
+        DiagnosticsClient diagnostics{std::move(writer)};
+        REQUIRE(diagnostics.producer().acquire().submit({maximum_record}) == DiagnosticSubmitResult::Accepted);
+        pollfd readable{.fd = reader.get(), .events = POLLIN, .revents = 0};
+        REQUIRE(::poll(&readable, 1U, 5000) == 1);
+
+        diagnostics.close(mode);
+        require_one_terminal_wake(diagnostics);
+        CHECK(diagnostics.counters().flushed == 0U);
+        CHECK(diagnostics.counters().dropped == 1U);
+        CHECK(diagnostics.counters().write_failures == (mode == DiagnosticsCloseMode::Flush ? 1U : 0U));
+        CHECK(diagnostics.terminal() == (mode == DiagnosticsCloseMode::Flush ? DiagnosticsTerminal::Failed : DiagnosticsTerminal::Drained));
+    }
+}
+
+TEST_CASE("diagnostics flush preserves order and reports write failure", "[gui][services]") {
+    mmltk::testsupport::ScopedTempDir temporary{"mmltk-diagnostics-order"};
+    const auto path = temporary.path() / "diagnostics.jsonl";
+    const int descriptor = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    REQUIRE(descriptor >= 0);
+    DiagnosticsClient diagnostics{ScopedFd{descriptor}};
+    const auto operation = diagnostics.producer().acquire();
+    REQUIRE(operation.submit({"{\"index\":1}"}) == DiagnosticSubmitResult::Accepted);
+    REQUIRE(operation.submit({"{\"index\":2}"}) == DiagnosticSubmitResult::Accepted);
+    diagnostics.flush();
+    CHECK(read_file(path) == "{\"index\":1}\n{\"index\":2}\n");
+    diagnostics.close();
+    CHECK(operation.submit({"{\"index\":3}"}) == DiagnosticSubmitResult::Disabled);
+    const int full = ::open("/dev/full", O_WRONLY | O_CLOEXEC);
+    REQUIRE(full >= 0);
+    DiagnosticsClient failing{ScopedFd{full}};
+    REQUIRE(failing.producer().acquire().submit({"{\"event\":\"fail\"}"}) == DiagnosticSubmitResult::Accepted);
+    failing.flush();
+    CHECK(failing.counters().write_failures == 1U);
+    CHECK_FALSE(failing.enabled());
+    failing.close();
+    CHECK(failing.terminal() == DiagnosticsTerminal::Failed);
+    require_one_terminal_wake(failing);
+}
+
+TEST_CASE("background diagnostics serialize concurrent producers without losing records", "[gui][services]") {
+    constexpr std::size_t kProducerCount = 4U;
+    constexpr std::size_t kRecordsPerProducer = 512U;
+    constexpr std::size_t kExpectedRecords = kProducerCount * kRecordsPerProducer;
+    mmltk::testsupport::ScopedTempDir temporary{"mmltk-diagnostics-lossless"};
+    const auto path = temporary.path() / "diagnostics.jsonl";
+    DiagnosticsClient diagnostics{path};
+    const auto producer = diagnostics.producer();
+    std::atomic<std::size_t> accepted{0U};
+    std::array<std::thread, kProducerCount> submitters;
+    for (std::thread& submitter : submitters) {
+        submitter = std::thread([operation = producer.acquire(), &accepted] {
+            for (std::size_t index = 0U; index != kRecordsPerProducer; ++index) {
+                if (operation.submit({"{\"event\":\"concurrent\"}"}) == DiagnosticSubmitResult::Accepted)
+                    accepted.fetch_add(1U, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (std::thread& submitter : submitters)
+        submitter.join();
+
+    diagnostics.close(DiagnosticsCloseMode::Flush);
+    require_one_terminal_wake(diagnostics);
+    const DiagnosticsCounters counters = diagnostics.counters();
+    CHECK(accepted.load(std::memory_order_relaxed) == kExpectedRecords);
+    CHECK(counters.accepted == kExpectedRecords);
+    CHECK(counters.flushed == kExpectedRecords);
+    CHECK(counters.dropped == 0U);
+    CHECK(counters.write_failures == 0U);
+    CHECK(std::ranges::count(read_file(path), '\n') == kExpectedRecords);
+}
+
+TEST_CASE("diagnostics path sessions truncate and producers expire after close", "[gui][services]") {
+    mmltk::testsupport::ScopedTempDir temporary{"mmltk-diagnostics-session"};
+    const auto path = temporary.path() / "diagnostics.jsonl";
+    {
+        std::ofstream old(path);
+        old << "old\n";
+    }
+    DiagnosticsProducer producer;
+    {
+        DiagnosticsClient diagnostics{path};
+        producer = diagnostics.producer();
+        REQUIRE(producer.acquire().submit({"{\"event\":\"fresh\"}"}) == DiagnosticSubmitResult::Accepted);
+        diagnostics.flush();
+        CHECK(read_file(path) == "{\"event\":\"fresh\"}\n");
+        // Destruction is the final fallback owner cleanup path after an
+        // ordinary producer has escaped the client scope.
+    }
+    CHECK(producer.acquire().submit({"{\"event\":\"closed\"}"}) == DiagnosticSubmitResult::Disabled);
+}
+
+TEST_CASE("diagnostics moves release replaced owners without terminal waits", "[gui][services]") {
+    int first_descriptors[2]{-1, -1};
+    int second_descriptors[2]{-1, -1};
+    REQUIRE(::pipe2(first_descriptors, O_CLOEXEC) == 0);
+    REQUIRE(::pipe2(second_descriptors, O_CLOEXEC) == 0);
+    ScopedFd first_reader{first_descriptors[0]};
+    ScopedFd second_reader{second_descriptors[0]};
+
+    DiagnosticsClient first{ScopedFd{first_descriptors[1]}, DiagnosticsExecutionPolicy::CallerDriven};
+    REQUIRE(first.producer().acquire().submit({"{\"event\":\"first\"}"}) == DiagnosticSubmitResult::Accepted);
+    DiagnosticsClient moved{std::move(first)};
+    CHECK(first.terminal() == DiagnosticsTerminal::Drained);
+
+    DiagnosticsClient replacement{ScopedFd{second_descriptors[1]}, DiagnosticsExecutionPolicy::CallerDriven};
+    REQUIRE(replacement.producer().acquire().submit({"{\"event\":\"second\"}"}) == DiagnosticSubmitResult::Accepted);
+    replacement = std::move(moved);
+    CHECK(moved.terminal() == DiagnosticsTerminal::Drained);
+    replacement.close(DiagnosticsCloseMode::Discard);
+    CHECK(replacement.terminal() == DiagnosticsTerminal::Drained);
+    require_one_terminal_wake(replacement);
+}
+
+TEST_CASE("diagnostics destruction releases an active detached writer after its terminal", "[gui][services]") {
+    int descriptors[2]{-1, -1};
+    REQUIRE(::pipe2(descriptors, O_CLOEXEC) == 0);
+    ScopedFd reader{descriptors[0]};
+    ScopedFd writer{descriptors[1]};
+    const std::string record = maximum_diagnostic_record();
+    REQUIRE(::fcntl(writer.get(), F_SETPIPE_SZ, 4096) > 0);
+
+    DiagnosticsProducer::Operation retained;
+    ScopedFd terminal;
+    {
+        DiagnosticsClient diagnostics{std::move(writer)};
+        retained = diagnostics.producer().acquire();
+        REQUIRE(retained.submit({record}) == DiagnosticSubmitResult::Accepted);
+        terminal.reset(::dup(diagnostics.terminal_fd()));
+        REQUIRE(terminal.get() >= 0);
+        pollfd readable{.fd = reader.get(), .events = POLLIN, .revents = 0};
+        REQUIRE(::poll(&readable, 1U, 5000) == 1);
+    }
+
+    pollfd terminal_ready{.fd = terminal.get(), .events = POLLIN, .revents = 0};
+    REQUIRE(::poll(&terminal_ready, 1U, 5000) == 1);
+    std::uint64_t wake = 0U;
+    REQUIRE(::read(terminal.get(), &wake, sizeof(wake)) == static_cast<ssize_t>(sizeof(wake)));
+    CHECK(wake == 1U);
+    CHECK(retained.submit({"{\"event\":\"after-destruction\"}"}) == DiagnosticSubmitResult::Disabled);
+}
+
+TEST_CASE("diagnostics close races safely with weak producer submissions", "[gui][services]") {
+    mmltk::testsupport::ScopedTempDir temporary{"mmltk-diagnostics-concurrent"};
+    const auto path = temporary.path() / "diagnostics.jsonl";
+    DiagnosticsClient diagnostics{path};
+    const auto producer = diagnostics.producer();
+    std::thread submitter([operation = producer.acquire()] {
+        for (std::size_t index = 0; index < 1024U; ++index) {
+            static_cast<void>(operation.submit({"{\"event\":\"concurrent\"}"}));
+        }
+    });
+    diagnostics.close(DiagnosticsCloseMode::Discard);
+    submitter.join();
+    CHECK_FALSE(producer.enabled());
+    require_one_terminal_wake(diagnostics);
+    CHECK(diagnostics.terminal() == DiagnosticsTerminal::Drained);
+}
+
+TEST_CASE("file dialog client has typed pre-cancel and terminal outcomes", "[gui][services]") {
+    mmltk::testsupport::ScopedTempDir temporary{"mmltk-file-dialog-terminals"};
+    const auto selected = make_dialog_helper(temporary.path(), "selected", "printf '%s\\n' chosen.txt");
+    const auto pre_cancel_marker = temporary.path() / "pre-cancelled";
+    const auto pre_cancel_helper =
+        make_dialog_helper(temporary.path(), "pre-cancel-helper", "printf launched > '" + pre_cancel_marker.string() + "'");
+    const auto cancelled = make_dialog_helper(temporary.path(), "cancelled", "exit 1");
+    const auto failing = make_dialog_helper(temporary.path(), "failing", "exit 42");
+    const FileDialogRequest request = dialog_request();
+
+    CHECK(run_dialog(pre_cancel_helper, temporary.path(), request, true).disposition == FileDialogDisposition::Reaped);
+    CHECK_FALSE(std::filesystem::exists(pre_cancel_marker));
+
+    const auto selected_result = run_dialog(selected, temporary.path(), request);
+    CHECK(selected_result.disposition == FileDialogDisposition::Selected);
+    CHECK(selected_result.path.view() == (temporary.path() / "chosen.txt").string());
+
+    CHECK(run_dialog(cancelled, temporary.path(), request).disposition == FileDialogDisposition::Cancelled);
+    const auto process_exit = run_dialog(failing, temporary.path(), request);
+    CHECK(process_exit.disposition == FileDialogDisposition::Failed);
+    CHECK(process_exit.failure == FileDialogFailure::ProcessExit);
+    const auto missing = run_dialog(temporary.path() / "missing", temporary.path(), request);
+    CHECK(missing.disposition == FileDialogDisposition::Failed);
+    CHECK(missing.failure == FileDialogFailure::CapabilityUnavailable);
+}
+
+TEST_CASE("file dialog capability is validated once and later exec failure is typed", "[gui][services]") {
+    mmltk::testsupport::ScopedTempDir temporary{"mmltk-file-dialog-capability"};
+    const auto non_executable = temporary.path() / "non-executable";
+    {
+        std::ofstream output(non_executable);
+        output << "#!/bin/sh\nexit 0\n";
+    }
+    REQUIRE(::chmod(non_executable.c_str(), 0600) == 0);
+    FileDialogClientOwner unavailable{non_executable.string(), temporary.path().string()};
+    CHECK_FALSE(unavailable.client().valid());
+
+    const auto removed_after_admission = make_dialog_helper(temporary.path(), "removed-after-admission", "exit 0");
+    FileDialogClientOwner admitted{removed_after_admission.string(), temporary.path().string()};
+    REQUIRE(admitted.client().valid());
+    REQUIRE(::unlink(removed_after_admission.c_str()) == 0);
+    auto [cancellation, token] = FileDialogCancellationSource::Mint();
+    const auto exec_failure = admitted.client().run(dialog_request(), std::move(token));
+    CHECK(exec_failure.disposition == FileDialogDisposition::Failed);
+    CHECK(exec_failure.failure == FileDialogFailure::Exec);
+}
+
+TEST_CASE("file dialog PATH resolution skips invalid shadow candidates", "[gui][services]") {
+    mmltk::testsupport::ScopedTempDir temporary{"mmltk-file-dialog-path"};
+    const auto shadow = temporary.path() / "shadow";
+    const auto valid = temporary.path() / "valid";
+    REQUIRE(std::filesystem::create_directories(shadow / "dialog-helper"));
+    REQUIRE(std::filesystem::create_directory(valid));
+    const auto executable = make_dialog_helper(valid, "dialog-helper", "printf '%s\\n' selected.bin");
+    const std::string path = shadow.string() + ":" + valid.string();
+    ScopedEnvironmentVariable environment{"PATH", path};
+
+    FileDialogClientOwner owner{"dialog-helper", temporary.path().string()};
+    REQUIRE(owner.client().valid());
+    auto [cancellation, token] = FileDialogCancellationSource::Mint();
+    const auto result = owner.client().run(dialog_request(), std::move(token));
+    CHECK(result.disposition == FileDialogDisposition::Selected);
+    CHECK(result.path.view() == (temporary.path() / "selected.bin").string());
+    CHECK(executable.filename() == "dialog-helper");
+}
+
+TEST_CASE("file dialog cancellation source publishes exactly once across moves", "[gui][services]") {
+    static_assert(!std::is_copy_constructible_v<FileDialogCancellationSource>);
+    static_assert(!std::is_copy_constructible_v<FileDialogCancellationToken>);
+    static_assert(std::is_nothrow_move_constructible_v<FileDialogCancellationSource>);
+    static_assert(std::is_nothrow_move_constructible_v<FileDialogCancellationToken>);
+
+    auto [source, token] = FileDialogCancellationSource::Mint();
+    CHECK(source.valid());
+    CHECK(token.valid());
+    FileDialogCancellationSource moved_source{std::move(source)};
+    CHECK_FALSE(source.valid());
+    CHECK_FALSE(source.RequestCancel());
+    CHECK(moved_source.RequestCancel());
+    CHECK_FALSE(moved_source.RequestCancel());
+    FileDialogCancellationToken moved_token{std::move(token)};
+    CHECK_FALSE(token.valid());
+    CHECK(moved_token.valid());
+
+    FileDialogClient stale;
+    {
+        FileDialogClientOwner owner{"/bin/true", "/tmp"};
+        stale = owner.client();
+        CHECK(stale.valid());
+    }
+    CHECK(stale.valid());
+    auto [stale_source, stale_token] = FileDialogCancellationSource::Mint();
+    CHECK(stale_source.valid());
+    CHECK(stale_source.RequestCancel());
+    CHECK(stale.run(dialog_request(), std::move(stale_token)).disposition == FileDialogDisposition::Reaped);
+}
+
+TEST_CASE("file dialog owner and value capacities reject before publication", "[gui][services]") {
+    const std::string oversized_path(mmltk::controller::services::kFileDialogPathStorageCapacity, 'x');
+    const std::string oversized_policy(mmltk::controller::services::kFileDialogTextCapacity, 'x');
+    CHECK_FALSE(mmltk::controller::services::BoundedText<mmltk::controller::services::kFileDialogPathStorageCapacity>::From(oversized_path)
+                    .valid());
+    CHECK_FALSE(
+        mmltk::controller::services::BoundedText<mmltk::controller::services::kFileDialogTextCapacity>::From(oversized_policy).valid());
+    CHECK_THROWS_AS(FileDialogClientOwner(oversized_path, "/tmp"), std::invalid_argument);
+
+    std::array<std::optional<FileDialogClientOwner>, 8U> owners;
+    for (auto& owner : owners)
+        owner.emplace("/bin/true", "/tmp");
+    owners[0].reset();
+    CHECK_NOTHROW(FileDialogClientOwner("/bin/true", "/tmp"));
+}
+
+TEST_CASE("file dialog selected results require an owned bounded nonempty path", "[gui][services]") {
+    using mmltk::controller::services::FileDialogSelected;
+    using mmltk::controller::services::FileDialogSelection;
+    using mmltk::controller::services::FileDialogTarget;
+    using mmltk::controller::services::SettingsFieldTarget;
+    constexpr std::uint64_t field_id = 7U;
+    const FileDialogTarget target{SettingsFieldTarget{field_id}};
+    const FileDialogSelection empty{.target = target, .result = FileDialogSelected{""}};
+    const FileDialogSelection selected{.target = target, .result = FileDialogSelected{"/tmp/selected"}};
+    const FileDialogSelection oversized{
+        .target = target, .result = FileDialogSelected{std::string(mmltk::frameworks::reflection::kMaximumPathBytes + 1U, 'x')}};
+    CHECK_FALSE(empty.valid_for(target));
+    CHECK(selected.valid_for(target));
+    CHECK_FALSE(oversized.valid_for(target));
+}
+
+TEST_CASE("model file dialog targets remain typed through native resolution", "[gui][services][model]") {
+    using mmltk::backend::models::catalog::ModelArtifactInputKind;
+    using mmltk::controller::contracts::FeatureId;
+    using mmltk::controller::services::FileDialogOpen;
+    using mmltk::controller::services::ModelArtifactTarget;
+    const auto entries = mmltk::controller::services::file_dialog_catalog().entries();
+    const auto descriptor =
+        std::ranges::find(entries, std::string_view{"workflows.train.request.weights_path"},
+                          [](const mmltk::controller::services::FileDialogDescriptor& value) { return value.field_path.view(); });
+    REQUIRE(descriptor != entries.end());
+    const auto stable_id = descriptor->stable_id;
+    const FileDialogOpen request{
+        .target = mmltk::controller::services::FileDialogTarget{ModelArtifactTarget{
+            .stable_id = stable_id,
+            .workflow = FeatureId::Train,
+            .input = ModelArtifactInputKind::Weights,
+        }},
+    };
+    const auto resolved = mmltk::controller::services::file_dialog_catalog().resolve(request);
+    REQUIRE(resolved);
+    CHECK(resolved->target == request.target);
+    CHECK(resolved->descriptor.defer_apply());
+    CHECK_FALSE(mmltk::controller::services::file_dialog_catalog().resolve(FileDialogOpen{
+        .target = mmltk::controller::services::FileDialogTarget{mmltk::controller::services::SettingsFieldTarget{stable_id}}}));
+
+    auto mismatched = request;
+    std::get<ModelArtifactTarget>(mismatched.target.value).input = ModelArtifactInputKind::Onnx;
+    CHECK_FALSE(mmltk::controller::services::file_dialog_catalog().resolve(mismatched));
+}
+
+TEST_CASE("workspace path values reject malformed boundaries and preserve exact identity", "[gui][services]") {
+    using namespace mmltk::controller::contracts;
+    constexpr std::string_view resource_name{"image.png"};
+    const WorkspaceResource resource = WorkspaceResource::From(resource_name, 7U);
+    CHECK(resource.valid());
+    CHECK(resource.view() == resource_name);
+    CHECK_FALSE(WorkspaceResource::From({}, 7U).valid());
+    CHECK_FALSE(WorkspaceResource::From(resource_name, 0U).valid());
+    CHECK_FALSE(WorkspaceResource::From(std::string(kWorkspaceResourceCapacity + 1U, 'x'), 7U).valid());
+    CHECK_FALSE(WorkspaceResource::From(std::string_view{"bad\0resource", 12U}, 7U).valid());
+    WorkspaceResource noncanonical_resource = resource;
+    noncanonical_resource.storage.back() = 'x';
+    CHECK_FALSE(noncanonical_resource.valid());
+
+    const WorkspacePath path = WorkspacePath::From("/workspace/image.png", 7U);
+    CHECK(path.valid());
+    CHECK(path.view() == "/workspace/image.png");
+    CHECK_FALSE(WorkspacePath::From({}, 7U).valid());
+    CHECK_FALSE(WorkspacePath::From("/workspace/image.png", 0U).valid());
+    CHECK_FALSE(WorkspacePath::From(std::string(kWorkspacePathCapacity + 1U, 'x'), 7U).valid());
+    WorkspacePath noncanonical_path = path;
+    noncanonical_path.storage.back() = 'x';
+    CHECK_FALSE(noncanonical_path.valid());
+}
+
+TEST_CASE("file dialog client validates relative absolute and escaped selections", "[gui][services]") {
+    mmltk::testsupport::ScopedTempDir temporary{"mmltk-file-dialog-scope"};
+    const auto root = temporary.path() / "root";
+    std::filesystem::create_directory(root);
+    const auto relative = make_dialog_helper(temporary.path(), "relative", "printf '%s\\n' child/item.txt");
+    const auto absolute = make_dialog_helper(temporary.path(), "absolute", "printf '%s\\n' '" + (root / "absolute.txt").string() + "'");
+    const auto escape = make_dialog_helper(temporary.path(), "escape", "printf '%s\\n' ../escape.txt");
+    const FileDialogRequest request = dialog_request();
+
+    const auto relative_result = run_dialog(relative, root, request);
+    CHECK(relative_result.disposition == FileDialogDisposition::Selected);
+    CHECK(relative_result.path.view() == (root / "child" / "item.txt").string());
+    CHECK(run_dialog(absolute, root, request).disposition == FileDialogDisposition::Selected);
+    CHECK(run_dialog(escape, root, request).disposition == FileDialogDisposition::Failed);
+}
+
+TEST_CASE("file dialog client drains complete immediate-exit selection output", "[gui][services]") {
+    mmltk::testsupport::ScopedTempDir temporary{"mmltk-file-dialog-immediate-output"};
+    const auto helper = make_dialog_helper(temporary.path(), "immediate-output", "printf '%2048s%s\\n' '' selected.txt");
+    const FileDialogResult result = run_dialog(helper, temporary.path(), dialog_request());
+    CHECK(result.disposition == FileDialogDisposition::Selected);
+    CHECK(result.path.view() == (temporary.path() / "selected.txt").string());
+}
+
+TEST_CASE("file dialog client preserves canonical mode and filter arguments", "[gui][services]") {
+    mmltk::testsupport::ScopedTempDir temporary{"mmltk-file-dialog-arguments"};
+    const auto arguments = temporary.path() / "arguments";
+    const auto helper =
+        make_dialog_helper(temporary.path(), "arguments-helper", "printf '%s\\n' \"$@\" > '" + arguments.string() + "'; exit 1");
+    const FileDialogRequest request =
+        dialog_request("Save result", mmltk::controller::contracts::FileDialogMode::SaveFile, "Models", "*.onnx *.engine");
+    CHECK(run_dialog(helper, temporary.path(), request).disposition == FileDialogDisposition::Cancelled);
+    const std::string captured = read_file(arguments);
+    CHECK(captured.find("--file-selection") != std::string::npos);
+    CHECK(captured.find("--save") != std::string::npos);
+    CHECK(captured.find("--confirm-overwrite") != std::string::npos);
+    CHECK(captured.find("--file-filter=Models | *.onnx *.engine") != std::string::npos);
+}
+
+TEST_CASE("file dialog client bounds output and reaps cancellation-resistant helpers", "[gui][services]") {
+    using namespace std::chrono_literals;
+    mmltk::testsupport::ScopedTempDir temporary{"mmltk-file-dialog-reap"};
+    const auto oversized = make_dialog_helper(temporary.path(), "oversized", "head -c 70000 /dev/zero");
+    const FileDialogRequest request = dialog_request();
+    const auto oversized_result = run_dialog(oversized, temporary.path(), request);
+    CHECK(oversized_result.disposition == FileDialogDisposition::Failed);
+    CHECK(oversized_result.error.view().find("capacity") != std::string_view::npos);
+
+    const auto pid_fifo = temporary.path() / "helper.pid.fifo";
+    REQUIRE(::mkfifo(pid_fifo.c_str(), 0600) == 0);
+    ScopedFd readiness{::open(pid_fifo.c_str(), O_RDWR | O_CLOEXEC | O_NONBLOCK)};
+    REQUIRE(readiness.get() >= 0);
+    const auto resistant = make_dialog_helper(
+        temporary.path(), "resistant", "printf '%s\\n' \"$$\" > '" + pid_fifo.string() + "'; trap '' TERM; while :; do sleep 1; done");
+    FileDialogClientOwner owner{resistant.string(), temporary.path().string()};
+    auto [cancellation, cancellation_token] = FileDialogCancellationSource::Mint();
+    FileDialogResult result;
+    std::thread runner([&] { result = owner.client().run(request, std::move(cancellation_token)); });
+    pollfd ready{.fd = readiness.get(), .events = POLLIN, .revents = 0};
+    const int readiness_result = ::poll(&ready, 1U, 5000);
+    if (readiness_result != 1 || (ready.revents & POLLIN) == 0) {
+        CHECK(cancellation.RequestCancel());
+        runner.join();
+        FAIL("file-dialog helper did not publish its readiness event");
+    }
+    std::array<char, 32U> pid_bytes{};
+    const ssize_t pid_size = ::read(readiness.get(), pid_bytes.data(), pid_bytes.size());
+    if (pid_size <= 0) {
+        CHECK(cancellation.RequestCancel());
+        runner.join();
+        FAIL("file-dialog helper readiness event did not contain its pid");
+    }
+    const pid_t helper_pid = static_cast<pid_t>(std::stol(std::string{pid_bytes.data(), static_cast<std::size_t>(pid_size)}));
+    CHECK(cancellation.RequestCancel());
+    runner.join();
+    CHECK(result.disposition == FileDialogDisposition::Reaped);
+    errno = 0;
+    CHECK(::waitpid(helper_pid, nullptr, WNOHANG) == -1);
+    CHECK(errno == ECHILD);
+    errno = 0;
+    CHECK(::kill(helper_pid, 0) == -1);
+    CHECK(errno == ESRCH);
+}
+}  // namespace mmltk::controller::services

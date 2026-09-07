@@ -1,0 +1,605 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef InputData_h_
+#define InputData_h_
+
+#include "nsDebug.h"
+#include "nsPoint.h"
+#include "nsTArray.h"
+#include "Units.h"
+#include "mozilla/ScrollTypes.h"
+#include "mozilla/DefineEnum.h"
+#include "mozilla/EventForwards.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/WheelHandlingHelper.h"  // for WheelDeltaAdjustmentStrategy
+#include "mozilla/gfx/MatrixFwd.h"
+#include "mozilla/layers/APZPublicUtils.h"
+#include "mozilla/layers/KeyboardScrollAction.h"
+#include "mozilla/TextEvents.h"
+#include "mozilla/ipc/IPCForwards.h"
+
+template <class E>
+struct already_AddRefed;
+class nsIWidget;
+
+enum TouchPointerState : uint8_t;
+
+namespace mozilla {
+
+namespace layers {
+class APZInputBridgeChild;
+class PAPZInputBridgeParent;
+}  
+
+namespace dom {
+class Touch;
+}  
+
+// clang-format off
+MOZ_DEFINE_ENUM(
+  InputType, (
+    MULTITOUCH_INPUT,
+    MOUSE_INPUT,
+    PANGESTURE_INPUT,
+    PINCHGESTURE_INPUT,
+    TAPGESTURE_INPUT,
+    SCROLLWHEEL_INPUT,
+    KEYBOARD_INPUT
+));
+// clang-format on
+
+class MultiTouchInput;
+class MouseInput;
+class PanGestureInput;
+class PinchGestureInput;
+class TapGestureInput;
+class ScrollWheelInput;
+class KeyboardInput;
+
+#define INPUTDATA_AS_CHILD_TYPE(type, enumID)                       \
+  const type& As##type() const {                                    \
+    MOZ_ASSERT(mInputType == enumID, "Invalid cast of InputData."); \
+    return (const type&)*this;                                      \
+  }                                                                 \
+  type& As##type() {                                                \
+    MOZ_ASSERT(mInputType == enumID, "Invalid cast of InputData."); \
+    return (type&)*this;                                            \
+  }
+
+class InputData {
+ public:
+  InputType mInputType;
+  TimeStamp mTimeStamp;
+  uint64_t mFocusSequenceNumber;
+
+  layers::LayersId mLayersId;
+
+  Maybe<uint64_t> mCallbackId;
+
+  Modifiers modifiers;
+
+  INPUTDATA_AS_CHILD_TYPE(MultiTouchInput, MULTITOUCH_INPUT)
+  INPUTDATA_AS_CHILD_TYPE(MouseInput, MOUSE_INPUT)
+  INPUTDATA_AS_CHILD_TYPE(PanGestureInput, PANGESTURE_INPUT)
+  INPUTDATA_AS_CHILD_TYPE(PinchGestureInput, PINCHGESTURE_INPUT)
+  INPUTDATA_AS_CHILD_TYPE(TapGestureInput, TAPGESTURE_INPUT)
+  INPUTDATA_AS_CHILD_TYPE(ScrollWheelInput, SCROLLWHEEL_INPUT)
+  INPUTDATA_AS_CHILD_TYPE(KeyboardInput, KEYBOARD_INPUT)
+
+  virtual ~InputData();
+  explicit InputData(InputType aInputType);
+
+ protected:
+  InputData(InputType aInputType, TimeStamp aTimeStamp, Modifiers aModifiers);
+  InputData(InputType aInputType, TimeStamp aTimeStamp,
+            const Maybe<uint64_t>& aCallback, Modifiers aModifiers);
+};
+
+class SingleTouchData {
+ public:
+  SingleTouchData(int32_t aIdentifier, ScreenIntPoint aScreenPoint,
+                  ScreenSize aRadius, float aRotationAngle, float aForce);
+
+  SingleTouchData(int32_t aIdentifier, ParentLayerPoint aLocalScreenPoint,
+                  ScreenSize aRadius, float aRotationAngle, float aForce);
+
+  SingleTouchData();
+
+  already_AddRefed<dom::Touch> ToNewDOMTouch() const;
+
+
+
+  struct HistoricalTouchData {
+    TimeStamp mTimeStamp;
+
+    ScreenIntPoint mScreenPoint;
+    ParentLayerPoint mLocalScreenPoint;
+    ScreenSize mRadius;
+    float mRotationAngle = 0.0f;
+    float mForce = 0.0f;
+  };
+  CopyableTArray<HistoricalTouchData> mHistoricalData;
+
+  int32_t mIdentifier;
+
+  ScreenIntPoint mScreenPoint;
+
+  ParentLayerPoint mLocalScreenPoint;
+
+  ScreenSize mRadius;
+
+  float mRotationAngle;
+
+  float mForce;
+
+  int32_t mTiltX = 0;
+  int32_t mTiltY = 0;
+  int32_t mTwist = 0;
+};
+
+class MultiTouchInput : public InputData {
+ public:
+  // clang-format off
+  MOZ_DEFINE_ENUM_AT_CLASS_SCOPE(
+    MultiTouchType, (
+      MULTITOUCH_START,
+      MULTITOUCH_MOVE,
+      MULTITOUCH_END,
+      MULTITOUCH_CANCEL
+  ));
+  // clang-format on
+
+  MultiTouchInput(MultiTouchType aType, uint32_t aTime, TimeStamp aTimeStamp,
+                  Modifiers aModifiers);
+  MultiTouchInput();
+  MultiTouchInput(MultiTouchInput&&) = default;
+  MultiTouchInput(const MultiTouchInput&) = default;
+  explicit MultiTouchInput(const WidgetTouchEvent& aTouchEvent);
+
+  MultiTouchInput& operator=(MultiTouchInput&&) = default;
+  MultiTouchInput& operator=(const MultiTouchInput&) = default;
+
+  void Translate(const ScreenPoint& aTranslation);
+
+  WidgetTouchEvent ToWidgetEvent(nsIWidget* aWidget) const;
+
+  int32_t IndexOfTouch(int32_t aTouchIdentifier);
+
+  bool TransformToLocal(const ScreenToParentLayerMatrix4x4& aTransform);
+
+  MultiTouchType mType;
+  CopyableTArray<SingleTouchData> mTouches;
+  ExternalPoint mScreenOffset;
+  bool mHandledByAPZ;
+  int16_t mButton = eNotPressed;
+  int16_t mButtons = 0;
+  uint16_t mInputSource =  5;
+};
+
+class MouseInput : public InputData {
+ protected:
+  friend mozilla::layers::APZInputBridgeChild;
+  friend mozilla::layers::PAPZInputBridgeParent;
+  ALLOW_DEPRECATED_READPARAM
+
+  MouseInput();
+
+ public:
+  // clang-format off
+  MOZ_DEFINE_ENUM_AT_CLASS_SCOPE(
+    MouseType, (
+      MOUSE_NONE,
+      MOUSE_MOVE,
+      MOUSE_DOWN,
+      MOUSE_UP,
+      MOUSE_DRAG_START,
+      MOUSE_DRAG_END,
+      MOUSE_DRAG_ENTER,
+      MOUSE_DRAG_OVER,
+      MOUSE_DRAG_EXIT,
+      MOUSE_DROP,
+      MOUSE_WIDGET_ENTER,
+      MOUSE_WIDGET_EXIT,
+      MOUSE_HITTEST,
+      MOUSE_EXPLORE_BY_TOUCH,
+      MOUSE_CONTEXTMENU
+  ));
+
+  MOZ_DEFINE_ENUM_AT_CLASS_SCOPE(
+    ButtonType, (
+      PRIMARY_BUTTON,
+      MIDDLE_BUTTON,
+      SECONDARY_BUTTON,
+      NONE
+  ));
+  // clang-format on
+
+  MouseInput(MouseType aType, ButtonType aButtonType, uint16_t aInputSource,
+             int16_t aButtons, const ScreenPoint& aPoint, TimeStamp aTimeStamp,
+             Modifiers aModifiers);
+  explicit MouseInput(const WidgetMouseEvent& aMouseEvent);
+
+  bool IsLeftButton() const;
+
+  bool TransformToLocal(const ScreenToParentLayerMatrix4x4& aTransform);
+  [[nodiscard]] bool IsPointerEventType() const;
+  template <typename WidgetMouseOrPointerEvent>
+  WidgetMouseOrPointerEvent ToWidgetEvent(nsIWidget* aWidget) const;
+
+  MouseType mType;
+  ButtonType mButtonType;
+  uint32_t mClickCount = 0;
+  uint16_t mInputSource;
+  int16_t mButtons;
+  ScreenPoint mOrigin;
+  ParentLayerPoint mLocalOrigin;
+  bool mHandledByAPZ;
+  bool mPreventClickEvent;
+  bool mIgnoreCapturingContent;
+  bool mSynthesizeMoveAfterDispatch;
+};
+
+class PanGestureInput : public InputData {
+  friend struct IPC::ParamTraits<PanGestureInput>;
+
+ protected:
+  friend mozilla::layers::APZInputBridgeChild;
+  friend mozilla::layers::PAPZInputBridgeParent;
+  ALLOW_DEPRECATED_READPARAM
+
+  PanGestureInput();
+
+ public:
+  // clang-format off
+  MOZ_DEFINE_ENUM_AT_CLASS_SCOPE(
+    PanGestureType, (
+      PANGESTURE_MAYSTART,
+
+      PANGESTURE_CANCELLED,
+
+      PANGESTURE_START,
+
+      PANGESTURE_PAN,
+
+      PANGESTURE_END,
+
+
+      PANGESTURE_MOMENTUMSTART,
+
+      PANGESTURE_MOMENTUMPAN,
+
+      PANGESTURE_MOMENTUMEND,
+
+      PANGESTURE_INTERRUPTED
+  ));
+
+  MOZ_DEFINE_ENUM_AT_CLASS_SCOPE(
+    PanDeltaType, (
+      PANDELTA_PAGE,
+      PANDELTA_PIXEL
+  ));
+  // clang-format on
+
+  PanGestureInput(PanGestureType aType, TimeStamp aTimeStamp,
+                  const ScreenPoint& aPanStartPoint,
+                  const ScreenPoint& aPanDisplacement, Modifiers aModifiers);
+
+  enum class IsEligibleForSwipe : bool { No, Yes };
+  PanGestureInput(PanGestureType aType, TimeStamp aTimeStamp,
+                  const ScreenPoint& aPanStartPoint,
+                  const ScreenPoint& aPanDisplacement, Modifiers aModifiers,
+                  IsEligibleForSwipe aIsEligibleForSwipe);
+
+  void SetLineOrPageDeltas(int32_t aLineOrPageDeltaX,
+                           int32_t aLineOrPageDeltaY);
+
+  bool IsMomentum() const;
+
+  WidgetWheelEvent ToWidgetEvent(nsIWidget* aWidget) const;
+
+  bool TransformToLocal(const ScreenToParentLayerMatrix4x4& aTransform);
+
+  ScreenPoint UserMultipliedPanDisplacement() const;
+  ParentLayerPoint UserMultipliedLocalPanDisplacement() const;
+
+  void SetHandledByAPZ(bool aHandled) { mHandledByAPZ = aHandled; }
+  void SetOverscrollBehaviorAllowsSwipe(bool aAllows) {
+    mOverscrollBehaviorAllowsSwipe = aAllows;
+  }
+  void SetSimulateMomentum(bool aSimulate) { mSimulateMomentum = aSimulate; }
+  void SetIsNoLineOrPageDelta(bool aIsNoLineOrPageDelta) {
+    mIsNoLineOrPageDelta = aIsNoLineOrPageDelta;
+  }
+
+  bool AllowsSwipe() const {
+    MOZ_ASSERT(mHandledByAPZ);
+    return mMayTriggerSwipe && mOverscrollBehaviorAllowsSwipe;
+  }
+
+  bool MayTriggerSwipe() const { return mMayTriggerSwipe; }
+  bool RequiresContentResponseIfCannotScrollHorizontallyInStartDirection();
+
+  static gfx::IntPoint GetIntegerDeltaForEvent(bool aIsStart, float x, float y);
+
+  PanGestureType mType;
+  ScreenPoint mPanStartPoint;
+
+  ScreenPoint mPanDisplacement;
+
+  ParentLayerPoint mLocalPanStartPoint;
+  ParentLayerPoint mLocalPanDisplacement;
+
+  int32_t mLineOrPageDeltaX;
+  int32_t mLineOrPageDeltaY;
+
+  double mUserDeltaMultiplierX;
+  double mUserDeltaMultiplierY;
+
+  PanDeltaType mDeltaType = PANDELTA_PIXEL;
+
+  bool mHandledByAPZ : 1;
+
+  bool mOverscrollBehaviorAllowsSwipe : 1;
+
+  bool mSimulateMomentum : 1;
+
+  bool mIsNoLineOrPageDelta : 1;
+
+ private:
+  bool mMayTriggerSwipe : 1;
+  void SetMayTriggerSwipe(bool aValue) { mMayTriggerSwipe = aValue; }
+};
+
+/**
+ * Encapsulation class for pinch events. In general, these will be generated by
+ * a gesture listener by looking at SingleTouchData/MultiTouchInput instances
+ * and determining whether or not the user was trying to do a gesture.
+ */
+class PinchGestureInput : public InputData {
+ protected:
+  friend mozilla::layers::APZInputBridgeChild;
+  friend mozilla::layers::PAPZInputBridgeParent;
+  ALLOW_DEPRECATED_READPARAM
+
+  PinchGestureInput();
+
+ public:
+  // clang-format off
+  MOZ_DEFINE_ENUM_AT_CLASS_SCOPE(
+    PinchGestureType, (
+      PINCHGESTURE_START,
+      PINCHGESTURE_SCALE,
+      PINCHGESTURE_FINGERLIFTED,
+      PINCHGESTURE_END
+  ));
+
+  MOZ_DEFINE_ENUM_AT_CLASS_SCOPE(
+    PinchGestureSource, (
+      UNKNOWN, 
+      TOUCH, 
+      ONE_TOUCH, 
+      TRACKPAD, 
+      MOUSEWHEEL 
+
+  ));
+  // clang-format on
+
+  PinchGestureInput(PinchGestureType aType, PinchGestureSource aSource,
+                    TimeStamp aTimeStamp, const ExternalPoint& aScreenOffset,
+                    const ScreenPoint& aFocusPoint, ScreenCoord aCurrentSpan,
+                    ScreenCoord aPreviousSpan, Modifiers aModifiers);
+
+  bool TransformToLocal(const ScreenToParentLayerMatrix4x4& aTransform);
+
+  WidgetWheelEvent ToWidgetEvent(nsIWidget* aWidget) const;
+
+  double ComputeDeltaY(nsIWidget* aWidget) const;
+
+  bool SetLineOrPageDeltaY(nsIWidget* aWidget);
+
+  static gfx::IntPoint GetIntegerDeltaForEvent(bool aIsStart, float x, float y);
+
+  PinchGestureType mType;
+
+  PinchGestureSource mSource;
+
+  ScreenPoint mFocusPoint;
+
+  ExternalPoint mScreenOffset;
+
+  ParentLayerPoint mLocalFocusPoint;
+
+  ScreenCoord mCurrentSpan;
+
+  ScreenCoord mPreviousSpan;
+
+  int32_t mLineOrPageDeltaY = 0;
+
+  bool mHandledByAPZ = false;
+};
+
+/**
+ * Encapsulation class for tap events. In general, these will be generated by
+ * a gesture listener by looking at SingleTouchData/MultiTouchInput instances
+ * and determining whether or not the user was trying to do a gesture.
+ */
+class TapGestureInput : public InputData {
+ protected:
+  friend mozilla::layers::APZInputBridgeChild;
+  friend mozilla::layers::PAPZInputBridgeParent;
+  ALLOW_DEPRECATED_READPARAM
+
+  TapGestureInput();
+
+ public:
+  // clang-format off
+  MOZ_DEFINE_ENUM_AT_CLASS_SCOPE(
+    TapGestureType, (
+      TAPGESTURE_LONG,
+      TAPGESTURE_LONG_UP,
+      TAPGESTURE_UP,
+      TAPGESTURE_CONFIRMED,
+      TAPGESTURE_DOUBLE,
+      TAPGESTURE_SECOND, 
+      TAPGESTURE_CANCEL
+  ));
+  // clang-format on
+
+  TapGestureInput(TapGestureType aType, TimeStamp aTimeStamp,
+                  const ScreenIntPoint& aPoint, Modifiers aModifiers);
+
+  TapGestureInput(TapGestureType aType, TimeStamp aTimeStamp,
+                  const ParentLayerPoint& aLocalPoint, Modifiers aModifiers);
+
+  bool TransformToLocal(const ScreenToParentLayerMatrix4x4& aTransform);
+
+  WidgetSimpleGestureEvent ToWidgetEvent(nsIWidget* aWidget) const;
+
+  TapGestureType mType;
+
+  ScreenIntPoint mPoint;
+
+  ParentLayerPoint mLocalPoint;
+};
+
+// Encapsulation class for scroll-wheel events. These are generated by mice
+class ScrollWheelInput : public InputData {
+ protected:
+  friend mozilla::layers::APZInputBridgeChild;
+  friend mozilla::layers::PAPZInputBridgeParent;
+  ALLOW_DEPRECATED_READPARAM
+
+  typedef mozilla::layers::APZWheelAction APZWheelAction;
+
+  ScrollWheelInput();
+
+ public:
+  // clang-format off
+  MOZ_DEFINE_ENUM_AT_CLASS_SCOPE(
+    ScrollDeltaType, (
+      SCROLLDELTA_LINE,
+      SCROLLDELTA_PAGE,
+      SCROLLDELTA_PIXEL
+  ));
+
+  MOZ_DEFINE_ENUM_AT_CLASS_SCOPE(
+    ScrollMode, (
+      SCROLLMODE_INSTANT,
+      SCROLLMODE_SMOOTH
+    )
+  );
+  // clang-format on
+
+  ScrollWheelInput(TimeStamp aTimeStamp, Modifiers aModifiers,
+                   ScrollMode aScrollMode, ScrollDeltaType aDeltaType,
+                   const ScreenPoint& aOrigin, double aDeltaX, double aDeltaY,
+                   bool aAllowToOverrideSystemScrollSpeed,
+                   WheelDeltaAdjustmentStrategy aWheelDeltaAdjustmentStrategy);
+  explicit ScrollWheelInput(const WidgetWheelEvent& aEvent);
+
+  static ScrollDeltaType DeltaTypeForDeltaMode(uint32_t aDeltaMode);
+  static uint32_t DeltaModeForDeltaType(ScrollDeltaType aDeltaType);
+  static mozilla::ScrollUnit ScrollUnitForDeltaType(ScrollDeltaType aDeltaType);
+
+  WidgetWheelEvent ToWidgetEvent(nsIWidget* aWidget) const;
+  bool TransformToLocal(const ScreenToParentLayerMatrix4x4& aTransform);
+
+  bool IsCustomizedByUserPrefs() const;
+
+  bool IsAutoDir(bool aForce = false) const {
+    if (aForce) {
+      return true;
+    }
+
+    switch (mWheelDeltaAdjustmentStrategy) {
+      case WheelDeltaAdjustmentStrategy::eAutoDir:
+      case WheelDeltaAdjustmentStrategy::eAutoDirWithRootHonour:
+        return true;
+      default:
+        // Prevent compilation errors generated by -Werror=switch
+        break;
+    }
+    return false;
+  }
+  bool HonoursRoot(bool aForce = false) const {
+    return WheelDeltaAdjustmentStrategy::eAutoDirWithRootHonour ==
+               mWheelDeltaAdjustmentStrategy ||
+           aForce;
+  }
+
+  ScrollDeltaType mDeltaType;
+  ScrollMode mScrollMode;
+  ScreenPoint mOrigin;
+
+  bool mHandledByAPZ;
+
+  double mDeltaX;
+  double mDeltaY;
+
+  double mWheelTicksX = 0.0;
+  double mWheelTicksY = 0.0;
+
+  ParentLayerPoint mLocalOrigin;
+
+  int32_t mLineOrPageDeltaX;
+  int32_t mLineOrPageDeltaY;
+
+  uint32_t mScrollSeriesNumber;
+
+  double mUserDeltaMultiplierX;
+  double mUserDeltaMultiplierY;
+
+  bool mMayHaveMomentum;
+  bool mIsMomentum;
+  bool mAllowToOverrideSystemScrollSpeed = false;
+
+  WheelDeltaAdjustmentStrategy mWheelDeltaAdjustmentStrategy =
+      WheelDeltaAdjustmentStrategy::eNone;
+
+  APZWheelAction mAPZAction;
+};
+
+class KeyboardInput : public InputData {
+ public:
+  typedef mozilla::layers::KeyboardScrollAction KeyboardScrollAction;
+
+  enum KeyboardEventType {
+    KEY_DOWN,
+    KEY_PRESS,
+    KEY_UP,
+    KEY_OTHER,
+
+    KEY_SENTINEL,
+  };
+
+  explicit KeyboardInput(const WidgetKeyboardEvent& aEvent);
+
+
+  KeyboardEventType mType;
+  uint32_t mKeyCode;
+  uint32_t mCharCode;
+  CopyableTArray<ShortcutKeyCandidate> mShortcutCandidates;
+
+  bool mHandledByAPZ;
+
+  KeyboardScrollAction mAction;
+
+ protected:
+  friend mozilla::layers::APZInputBridgeChild;
+  friend mozilla::layers::PAPZInputBridgeParent;
+  ALLOW_DEPRECATED_READPARAM
+
+  KeyboardInput();
+};
+
+MultiTouchInput UpdateSynthesizedTouchState(
+    MultiTouchInput* aState, TimeStamp aTimeStamp, uint32_t aPointerId,
+    TouchPointerState aPointerState, LayoutDeviceIntPoint aPoint,
+    double aPointerPressure, uint32_t aPointerOrientation);
+
+}  
+
+#endif  // InputData_h_

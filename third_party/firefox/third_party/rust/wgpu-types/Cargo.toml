@@ -1,0 +1,104 @@
+
+[package]
+edition = "2021"
+rust-version = "1.87"
+name = "wgpu-types"
+version = "30.0.0"
+authors = ["gfx-rs developers"]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Common types and utilities for wgpu, the cross-platform, safe, pure-rust graphics API"
+homepage = "https://wgpu.rs/"
+keywords = ["graphics"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/gfx-rs/wgpu"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = [
+    "--cfg",
+    "docsrs",
+]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+
+[features]
+counters = []
+default = ["std"]
+exhaust = ["dep:exhaust"]
+serde = [
+    "dep:serde",
+    "bitflags/serde",
+    "naga-types/serialize",
+    "naga-types/deserialize",
+]
+std = [
+    "naga-types/std",
+]
+strict_asserts = []
+trace = [
+    "std",
+    "serde/std",
+]
+
+[lib]
+name = "wgpu_types"
+path = "src/lib.rs"
+
+[dependencies.bitflags]
+version = "2.9"
+
+[dependencies.bytemuck]
+version = "1.22"
+features = [
+    "extern_crate_alloc",
+    "min_const_generics",
+    "derive",
+]
+
+[dependencies.exhaust]
+version = "0.2"
+optional = true
+
+[dependencies.log]
+version = "0.4.29"
+
+[dependencies.naga-types]
+version = "30.0.0"
+path = "../naga-types"
+features = []
+
+[dependencies.raw-window-handle]
+version = "0.6.2"
+default-features = false
+
+[dependencies.serde]
+version = "1.0.225"
+features = [
+    "alloc",
+    "derive",
+]
+optional = true
+default-features = false
+
+[dependencies.static_assertions]
+version = "1.1"
+
+[lints.clippy]
+alloc_instead_of_core = "warn"
+std_instead_of_alloc = "warn"
+std_instead_of_core = "warn"
+
+[lints.rust]
+missing_debug_implementations = "warn"
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+priority = 0
+check-cfg = ["cfg(web_sys_unstable_apis)"]

@@ -1,0 +1,51 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "nsNoDataProtocolContentPolicy.h"
+
+#include "nsContentUtils.h"
+#include "nsIProtocolHandler.h"
+#include "nsIURI.h"
+#include "nsNetUtil.h"
+#include "nsString.h"
+
+NS_IMPL_ISUPPORTS(nsNoDataProtocolContentPolicy, nsIContentPolicy)
+
+NS_IMETHODIMP
+nsNoDataProtocolContentPolicy::ShouldLoad(nsIURI* aContentLocation,
+                                          nsILoadInfo* aLoadInfo,
+                                          int16_t* aDecision) {
+  ExtContentPolicyType contentType = aLoadInfo->GetExternalContentPolicyType();
+
+  *aDecision = nsIContentPolicy::ACCEPT;
+
+  if (contentType != ExtContentPolicy::TYPE_DOCUMENT &&
+      contentType != ExtContentPolicy::TYPE_SUBDOCUMENT &&
+      contentType != ExtContentPolicy::TYPE_OBJECT &&
+      contentType != ExtContentPolicy::TYPE_WEBSOCKET) {
+    nsAutoCString scheme;
+    aContentLocation->GetScheme(scheme);
+    if (scheme.EqualsLiteral("http") || scheme.EqualsLiteral("https") ||
+        scheme.EqualsLiteral("file") || scheme.EqualsLiteral("chrome")) {
+      return NS_OK;
+    }
+
+    if (nsContentUtils::IsExternalProtocol(aContentLocation)) {
+      NS_SetRequestBlockingReason(
+          aLoadInfo,
+          nsILoadInfo::BLOCKING_REASON_CONTENT_POLICY_NO_DATA_PROTOCOL);
+      *aDecision = nsIContentPolicy::REJECT_REQUEST;
+    }
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsNoDataProtocolContentPolicy::ShouldProcess(nsIURI* aContentLocation,
+                                             nsILoadInfo* aLoadInfo,
+                                             int16_t* aDecision) {
+  return ShouldLoad(aContentLocation, aLoadInfo, aDecision);
+}

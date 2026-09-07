@@ -1,0 +1,68 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_AsyncPanZoomAnimation_h_
+#define mozilla_layers_AsyncPanZoomAnimation_h_
+
+#include "APZUtils.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/TimeStamp.h"
+#include "nsISupportsImpl.h"
+#include "nsTArray.h"
+#include "nsThreadUtils.h"
+
+namespace mozilla {
+namespace layers {
+
+struct FrameMetrics;
+
+class WheelScrollAnimation;
+class OverscrollAnimation;
+class SmoothMsdScrollAnimation;
+class SmoothScrollAnimation;
+
+class AsyncPanZoomAnimation {
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(AsyncPanZoomAnimation)
+
+ public:
+  explicit AsyncPanZoomAnimation() = default;
+
+  virtual bool DoSample(FrameMetrics& aFrameMetrics,
+                        const TimeDuration& aDelta) = 0;
+
+  virtual bool HandleScrollOffsetUpdate(const Maybe<CSSPoint>& aRelativeDelta) {
+    return false;
+  }
+
+  bool Sample(FrameMetrics& aFrameMetrics, const TimeDuration& aDelta) {
+    if (aDelta.ToMilliseconds() <= 0) {
+      return true;
+    }
+
+    return DoSample(aFrameMetrics, aDelta);
+  }
+
+  nsTArray<RefPtr<Runnable>> TakeDeferredTasks() {
+    return std::move(mDeferredTasks);
+  }
+
+  virtual SmoothScrollAnimation* AsSmoothScrollAnimation() { return nullptr; }
+  virtual OverscrollAnimation* AsOverscrollAnimation() { return nullptr; }
+
+  virtual bool WantsRepaints() { return true; }
+
+  virtual void Cancel(CancelAnimationFlags aFlags) {}
+
+  virtual bool WasTriggeredByScript() const { return false; }
+
+ protected:
+  virtual ~AsyncPanZoomAnimation() = default;
+
+  nsTArray<RefPtr<Runnable>> mDeferredTasks;
+};
+
+}  
+}  
+
+#endif  // mozilla_layers_AsyncPanZoomAnimation_h_

@@ -1,0 +1,50 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef PendingTransactionInfo_h_
+#define PendingTransactionInfo_h_
+
+#include "DnsAndConnectSocket.h"
+
+namespace mozilla {
+namespace net {
+
+class PendingTransactionInfo final : public ARefBase {
+ public:
+  explicit PendingTransactionInfo(nsHttpTransaction* trans)
+      : mTransaction(trans) {}
+
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(PendingTransactionInfo, override)
+
+  void PrintDiagnostics(nsCString& log);
+
+  bool IsAlreadyClaimedInitializingConn();
+
+  [[nodiscard]] nsWeakPtr ForgetConnectionAttemptAndActiveConn();
+
+  void RememberConnectionAttempt(ConnectionAttempt* sock);
+  bool TryClaimingActiveConn(HttpConnectionBase* conn);
+
+  nsHttpTransaction* Transaction() const { return mTransaction; }
+
+ private:
+  RefPtr<nsHttpTransaction> mTransaction;
+  nsWeakPtr mConnectionAttempt;
+  nsWeakPtr mActiveConn;
+
+  ~PendingTransactionInfo();
+};
+
+class PendingComparator {
+ public:
+  bool Equals(const PendingTransactionInfo* aPendingTrans,
+              const nsAHttpTransaction* aTrans) const {
+    return aPendingTrans->Transaction() == aTrans;
+  }
+};
+
+}  
+}  
+
+#endif  // !PendingTransactionInfo_h_

@@ -1,0 +1,80 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef SignedCertificateTimestamp_h
+#define SignedCertificateTimestamp_h
+
+#include "Buffer.h"
+#include "mozilla/Maybe.h"
+#include "mozpkix/Input.h"
+#include "mozpkix/Result.h"
+
+namespace mozilla {
+namespace ct {
+
+struct LogEntry {
+  enum class Type { X509 = 0, Precert = 1 };
+
+  void Reset();
+
+  Type type;
+
+  Buffer leafCertificate;
+
+  Buffer issuerKeyHash;
+  Buffer tbsCertificate;
+};
+
+struct DigitallySigned {
+  enum class HashAlgorithm {
+    None = 0,
+    MD5 = 1,
+    SHA1 = 2,
+    SHA224 = 3,
+    SHA256 = 4,
+    SHA384 = 5,
+    SHA512 = 6,
+  };
+
+  enum class SignatureAlgorithm { Anonymous = 0, RSA = 1, DSA = 2, ECDSA = 3 };
+
+  bool SignatureParametersMatch(HashAlgorithm aHashAlgorithm,
+                                SignatureAlgorithm aSignatureAlgorithm) const;
+
+  HashAlgorithm hashAlgorithm;
+  SignatureAlgorithm signatureAlgorithm;
+  Buffer signatureData;
+};
+
+struct SignedCertificateTimestamp {
+  enum class Version {
+    V1 = 0,
+  };
+
+  pkix::Result DecodeExtensions();
+
+  Version version;
+  Buffer logId;
+  uint64_t timestamp;
+  Buffer extensions;
+  Maybe<uint64_t> leafIndex;
+  DigitallySigned signature;
+};
+
+inline pkix::Result BufferToInput(const Buffer& buffer, pkix::Input& input) {
+  if (buffer.empty()) {
+    return pkix::Result::FATAL_ERROR_LIBRARY_FAILURE;
+  }
+  return input.Init(buffer.data(), buffer.size());
+}
+
+inline void InputToBuffer(pkix::Input input, Buffer& buffer) {
+  buffer.assign(input.UnsafeGetData(),
+                input.UnsafeGetData() + input.GetLength());
+}
+
+}  
+}  
+
+#endif  // SignedCertificateTimestamp_h

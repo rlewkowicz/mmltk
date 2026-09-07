@@ -1,0 +1,245 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_GFX_IMAGEBRIDGECHILD_H
+#define MOZILLA_GFX_IMAGEBRIDGECHILD_H
+
+#include <stddef.h>  // for size_t
+#include <stdint.h>  // for uint32_t, uint64_t
+#include <unordered_map>
+
+#include "ImageContainer.h"
+#include "mozilla/Attributes.h"  // for override
+#include "mozilla/Atomics.h"
+#include "mozilla/RefPtr.h"  // for already_AddRefed
+#include "mozilla/layers/CompositableForwarder.h"
+#include "mozilla/layers/CompositorTypes.h"
+#include "mozilla/layers/PImageBridgeChild.h"
+#include "mozilla/layers/TextureForwarder.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/webrender/WebRenderTypes.h"
+#include "nsRegion.h"  // for nsIntRegion
+#include "mozilla/gfx/Rect.h"
+#include "mozilla/ReentrantMonitor.h"  // for ReentrantMonitor, etc
+
+namespace mozilla {
+namespace ipc {
+class Shmem;
+}  
+
+namespace layers {
+
+class ImageClient;
+class ImageContainer;
+class ImageContainerListener;
+class ImageBridgeParent;
+class CompositableClient;
+struct CompositableTransaction;
+class Image;
+class TextureClient;
+class SynchronousTask;
+
+bool InImageBridgeChildThread();
+
+class ImageBridgeChild final : public PImageBridgeChild,
+                               public CompositableForwarder,
+                               public TextureForwarder {
+  friend class ImageContainer;
+
+  typedef nsTArray<AsyncParentMessageData> AsyncParentMessageArray;
+
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(ImageBridgeChild, override);
+
+  RefPtr<TextureForwarder> GetTextureForwarder() override { return this; }
+  LayersIPCActor* GetLayersIPCActor() override { return this; }
+
+  static void InitSameProcess(uint32_t aNamespace);
+
+  static void InitWithGPUProcess(Endpoint<PImageBridgeChild>&& aEndpoint,
+                                 uint32_t aNamespace);
+  static bool InitForContent(Endpoint<PImageBridgeChild>&& aEndpoint,
+                             uint32_t aNamespace);
+  static bool ReinitForContent(Endpoint<PImageBridgeChild>&& aEndpoint,
+                               uint32_t aNamespace);
+
+  static void ShutDown();
+
+  static RefPtr<ImageBridgeChild> GetSingleton();
+
+  static void IdentifyCompositorTextureHost(
+      const TextureFactoryIdentifier& aIdentifier);
+
+  void BeginTransaction();
+  void EndTransaction();
+
+  FixedSizeSmallShmemSectionAllocator* GetTileLockAllocator() override;
+
+  nsISerialEventTarget* GetThread() const override;
+
+  base::ProcessId GetParentPid() const override { return OtherPid(); }
+
+  void SyncWithCompositor(
+      const Maybe<uint64_t>& aWindowID = Nothing()) override;
+
+  already_AddRefed<PTextureChild> AllocPTextureChild(
+      const SurfaceDescriptor& aSharedData, ReadLockDescriptor& aReadLock,
+      const LayersBackend& aLayersBackend, const TextureFlags& aFlags,
+      const uint64_t& aSerial,
+      const wr::MaybeExternalImageId& aExternalImageId);
+
+  mozilla::ipc::IPCResult RecvParentAsyncMessages(
+      nsTArray<AsyncParentMessageData>&& aMessages);
+
+  mozilla::ipc::IPCResult RecvDidComposite(
+      nsTArray<ImageCompositeNotification>&& aNotifications);
+
+  mozilla::ipc::IPCResult RecvReportFramesDropped(
+      const CompositableHandle& aHandle, const uint32_t& aFrames);
+
+  RefPtr<ImageClient> CreateImageClient(CompositableType aType,
+                                        ImageContainer* aImageContainer);
+
+  RefPtr<ImageClient> CreateImageClientNow(CompositableType aType,
+                                           ImageContainer* aImageContainer);
+
+  void UpdateImageClient(RefPtr<ImageContainer> aContainer);
+
+  void UpdateCompositable(const RefPtr<ImageContainer> aContainer,
+                          const RemoteTextureId aTextureId,
+                          const RemoteTextureOwnerId aOwnerId,
+                          const gfx::IntSize aSize, const TextureFlags aFlags,
+                          const RefPtr<FwdTransactionTracker> aTracker);
+
+  void ClearImagesInHost(ImageClient* aClient, ImageContainer* aContainer,
+                         ClearImagesType aType);
+
+  bool IPCOpen() const override { return mCanSend; }
+
+ private:
+  virtual ~ImageBridgeChild();
+
+  void CreateImageClientSync(SynchronousTask* aTask,
+                             RefPtr<ImageClient>* result,
+                             CompositableType aType,
+                             ImageContainer* aImageContainer);
+
+  void ClearImagesInHostSync(SynchronousTask* aTask, ImageClient* aClient,
+                             ImageContainer* aContainer, ClearImagesType aType);
+
+  void ProxyAllocShmemNow(SynchronousTask* aTask, size_t aSize,
+                          mozilla::ipc::Shmem* aShmem, bool aUnsafe,
+                          bool* aSuccess);
+  void ProxyDeallocShmemNow(SynchronousTask* aTask, mozilla::ipc::Shmem* aShmem,
+                            bool* aResult);
+
+  void UpdateTextureFactoryIdentifier(
+      const TextureFactoryIdentifier& aIdentifier);
+
+ public:
+
+  void Connect(CompositableClient* aCompositable,
+               ImageContainer* aImageContainer) override;
+
+  bool UsesImageBridge() const override { return true; }
+
+  void UseTextures(CompositableClient* aCompositable,
+                   const nsTArray<TimedTextureClient>& aTextures) override;
+
+  void UseRemoteTexture(CompositableClient* aCompositable,
+                        const RemoteTextureId aTextureId,
+                        const RemoteTextureOwnerId aOwnerId,
+                        const gfx::IntSize aSize, const TextureFlags aFlags,
+                        const RefPtr<FwdTransactionTracker>& aTracker) override;
+
+  void ReleaseCompositable(const CompositableHandle& aHandle) override;
+
+  void ForgetImageContainer(const CompositableHandle& aHandle);
+
+  void HoldUntilCompositableRefReleasedIfNecessary(TextureClient* aClient);
+
+  void NotifyNotUsed(uint64_t aTextureId, uint64_t aFwdTransactionId);
+
+  void CancelWaitForNotifyNotUsed(uint64_t aTextureId) override;
+
+  bool DestroyInTransaction(PTextureChild* aTexture) override;
+  bool DestroyInTransaction(const CompositableHandle& aHandle);
+
+  void RemoveTextureFromCompositable(CompositableClient* aCompositable,
+                                     TextureClient* aTexture) override;
+
+  void ClearImagesFromCompositable(CompositableClient* aCompositable,
+                                   ClearImagesType aType) override;
+
+
+  bool AllocUnsafeShmem(size_t aSize, mozilla::ipc::Shmem* aShmem) override;
+  bool AllocShmem(size_t aSize, mozilla::ipc::Shmem* aShmem) override;
+
+  bool DeallocShmem(mozilla::ipc::Shmem& aShmem) override;
+
+  already_AddRefed<PTextureChild> CreateTexture(
+      const SurfaceDescriptor& aSharedData, ReadLockDescriptor&& aReadLock,
+      LayersBackend aLayersBackend, TextureFlags aFlags,
+      const dom::ContentParentId& aContentId, uint64_t aSerial,
+      wr::MaybeExternalImageId& aExternalImageId) override;
+
+  bool IsSameProcess() const override;
+
+  FwdTransactionCounter& GetFwdTransactionCounter() override {
+    return mFwdTransactionCounter;
+  }
+
+  bool InForwarderThread() override { return InImageBridgeChildThread(); }
+
+  void HandleFatalError(const char* aMsg) override;
+
+  wr::MaybeExternalImageId GetNextExternalImageId() override;
+
+ protected:
+  explicit ImageBridgeChild(uint32_t aNamespace);
+  bool DispatchAllocShmemInternal(size_t aSize, Shmem* aShmem, bool aUnsafe);
+
+  void Bind(Endpoint<PImageBridgeChild>&& aEndpoint);
+  void BindSameProcess(RefPtr<ImageBridgeParent> aParent);
+
+  void SendImageBridgeThreadId();
+
+  void WillShutdown();
+  void ShutdownStep1(SynchronousTask* aTask);
+  void ShutdownStep2(SynchronousTask* aTask);
+  void MarkShutDown();
+
+  void ActorDestroy(ActorDestroyReason aWhy) override;
+
+  bool CanSend() const;
+  bool CanPostTask() const;
+
+  static void ShutdownSingleton();
+
+ private:
+  uint32_t mNamespace;
+
+  CompositableTransaction* mTxn;
+  UniquePtr<FixedSizeSmallShmemSectionAllocator> mSectionAllocator;
+
+  mozilla::Atomic<bool> mCanSend;
+  mozilla::Atomic<bool> mDestroyed;
+
+  FwdTransactionCounter mFwdTransactionCounter;
+
+  std::unordered_map<uint64_t, RefPtr<TextureClient>>
+      mTexturesWaitingNotifyNotUsed;
+
+  Mutex mContainerMapLock MOZ_UNANNOTATED;
+  std::unordered_map<uint64_t, RefPtr<ImageContainerListener>>
+      mImageContainerListeners;
+  RefPtr<ImageContainerListener> FindListener(
+      const CompositableHandle& aHandle);
+};
+
+}  
+}  
+
+#endif

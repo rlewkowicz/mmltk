@@ -1,0 +1,807 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "DOMIntersectionObserver.h"
+
+#include "NonCustomCSSPropertyId.h"
+#include "Units.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/ScrollContainerFrame.h"
+#include "mozilla/ServoBindings.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/StaticPrefs_layout.h"
+#include "mozilla/dom/BrowserChild.h"
+#include "mozilla/dom/BrowsingContext.h"
+#include "mozilla/dom/DocumentInlines.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/ElementInlines.h"
+#include "mozilla/dom/HTMLIFrameElement.h"
+#include "mozilla/dom/HTMLImageElement.h"
+#include "nsContainerFrame.h"
+#include "nsContentUtils.h"
+#include "nsIFrame.h"
+#include "nsLayoutUtils.h"
+#include "nsRefreshDriver.h"
+
+namespace mozilla::dom {
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(DOMIntersectionObserverEntry)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(DOMIntersectionObserverEntry)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(DOMIntersectionObserverEntry)
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(DOMIntersectionObserverEntry, mOwner,
+                                      mRootBounds, mBoundingClientRect,
+                                      mIntersectionRect, mTarget)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(DOMIntersectionObserver)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+  NS_INTERFACE_MAP_ENTRY(DOMIntersectionObserver)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(DOMIntersectionObserver)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(DOMIntersectionObserver)
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(DOMIntersectionObserver)
+
+NS_IMPL_CYCLE_COLLECTION_TRACE_BEGIN(DOMIntersectionObserver)
+  NS_IMPL_CYCLE_COLLECTION_TRACE_PRESERVED_WRAPPER
+NS_IMPL_CYCLE_COLLECTION_TRACE_END
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(DOMIntersectionObserver)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_PRESERVED_WRAPPER
+  tmp->Disconnect();
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mOwner)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mDocument)
+  if (tmp->mCallback.is<RefPtr<dom::IntersectionCallback>>()) {
+    ImplCycleCollectionUnlink(
+        tmp->mCallback.as<RefPtr<dom::IntersectionCallback>>());
+  }
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mRoot)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mQueuedEntries)
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(DOMIntersectionObserver)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mOwner)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mDocument)
+  if (tmp->mCallback.is<RefPtr<dom::IntersectionCallback>>()) {
+    ImplCycleCollectionTraverse(
+        cb, tmp->mCallback.as<RefPtr<dom::IntersectionCallback>>(), "mCallback",
+        0);
+  }
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mRoot)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mQueuedEntries)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+DOMIntersectionObserver::DOMIntersectionObserver(
+    already_AddRefed<nsPIDOMWindowInner> aOwner, dom::IntersectionCallback& aCb)
+    : mOwner(aOwner),
+      mDocument(mOwner->GetExtantDoc()),
+      mCallback(RefPtr<dom::IntersectionCallback>(&aCb)) {}
+
+already_AddRefed<DOMIntersectionObserver> DOMIntersectionObserver::Constructor(
+    const GlobalObject& aGlobal, dom::IntersectionCallback& aCb,
+    ErrorResult& aRv) {
+  return Constructor(aGlobal, aCb, IntersectionObserverInit(), aRv);
+}
+
+already_AddRefed<DOMIntersectionObserver> DOMIntersectionObserver::Constructor(
+    const GlobalObject& aGlobal, dom::IntersectionCallback& aCb,
+    const IntersectionObserverInit& aOptions, ErrorResult& aRv) {
+  nsCOMPtr<nsPIDOMWindowInner> window =
+      do_QueryInterface(aGlobal.GetAsSupports());
+  if (!window) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return nullptr;
+  }
+
+  RefPtr<DOMIntersectionObserver> observer =
+      new DOMIntersectionObserver(window.forget(), aCb);
+
+  if (!aOptions.mRoot.IsNull()) {
+    if (aOptions.mRoot.Value().IsElement()) {
+      observer->mRoot = aOptions.mRoot.Value().GetAsElement();
+    } else {
+      MOZ_ASSERT(aOptions.mRoot.Value().IsDocument());
+      observer->mRoot = aOptions.mRoot.Value().GetAsDocument();
+    }
+  }
+
+  if (!observer->SetRootMargin(aOptions.mRootMargin)) {
+    aRv.ThrowSyntaxError("rootMargin must be specified in pixels or percent.");
+    return nullptr;
+  }
+
+  if (!observer->SetScrollMargin(aOptions.mScrollMargin)) {
+    aRv.ThrowSyntaxError(
+        "scrollMargin must be specified in pixels or percent.");
+    return nullptr;
+  }
+
+  if (aOptions.mThreshold.IsDoubleSequence()) {
+    const Sequence<double>& thresholds =
+        aOptions.mThreshold.GetAsDoubleSequence();
+    observer->mThresholds.SetCapacity(thresholds.Length());
+
+    for (const auto& thresh : thresholds) {
+      if (thresh < 0.0 || thresh > 1.0) {
+        aRv.ThrowRangeError<dom::MSG_THRESHOLD_RANGE_ERROR>();
+        return nullptr;
+      }
+      observer->mThresholds.AppendElement(thresh);
+    }
+
+    observer->mThresholds.Sort();
+
+    if (observer->mThresholds.IsEmpty()) {
+      observer->mThresholds.AppendElement(0.0);
+    }
+  } else {
+    double thresh = aOptions.mThreshold.GetAsDouble();
+    if (thresh < 0.0 || thresh > 1.0) {
+      aRv.ThrowRangeError<dom::MSG_THRESHOLD_RANGE_ERROR>();
+      return nullptr;
+    }
+    observer->mThresholds.AppendElement(thresh);
+  }
+
+
+
+
+
+
+  return observer.forget();
+}
+
+static void LazyLoadCallback(
+    const Sequence<OwningNonNull<DOMIntersectionObserverEntry>>& aEntries) {
+  for (const auto& entry : aEntries) {
+    Element* target = entry->Target();
+    if (entry->IsIntersecting()) {
+      if (auto* image = HTMLImageElement::FromNode(target)) {
+        image->StopLazyLoading(HTMLImageElement::StartLoad::Yes);
+      } else if (auto* iframe = HTMLIFrameElement::FromNode(target)) {
+        iframe->StopLazyLoading(HTMLIFrameElement::TriggerLoad::Yes);
+      } else {
+        MOZ_ASSERT_UNREACHABLE(
+            "Only <img> and <iframe> should be observed by lazy load observer");
+      }
+    }
+  }
+}
+
+static LengthPercentage PrefMargin(float aValue, bool aIsPercentage) {
+  return aIsPercentage ? LengthPercentage::FromPercentage(aValue / 100.0f)
+                       : LengthPercentage::FromPixels(aValue);
+}
+
+static IntersectionObserverMargin LazyLoadingMargin() {
+  IntersectionObserverMargin margin;
+#define SET_MARGIN(side_, side_lower_)                      \
+  margin.Get(eSide##side_) = PrefMargin(                    \
+      StaticPrefs::dom_lazy_loading_margin_##side_lower_(), \
+      StaticPrefs::dom_lazy_loading_margin_##side_lower_##_percentage());
+  SET_MARGIN(Top, top);
+  SET_MARGIN(Right, right);
+  SET_MARGIN(Bottom, bottom);
+  SET_MARGIN(Left, left);
+#undef SET_MARGIN
+  return margin;
+}
+
+DOMIntersectionObserver::DOMIntersectionObserver(Document& aDocument,
+                                                 NativeCallback aCallback)
+    : mOwner(aDocument.GetInnerWindow()),
+      mDocument(&aDocument),
+      mCallback(aCallback) {}
+
+already_AddRefed<DOMIntersectionObserver>
+DOMIntersectionObserver::CreateLazyLoadObserver(Document& aDocument) {
+  RefPtr<DOMIntersectionObserver> observer =
+      new DOMIntersectionObserver(aDocument, LazyLoadCallback);
+  observer->mThresholds.AppendElement(0.0f);
+  auto* margin = StaticPrefs::dom_lazy_loading_margin_is_scroll()
+                     ? &observer->mScrollMargin
+                     : &observer->mRootMargin;
+  *margin = LazyLoadingMargin();
+  return observer.forget();
+}
+
+bool DOMIntersectionObserver::SetRootMargin(const nsACString& aString) {
+  return Servo_IntersectionObserverMargin_Parse(&aString, &mRootMargin);
+}
+
+bool DOMIntersectionObserver::SetScrollMargin(const nsACString& aString) {
+  return Servo_IntersectionObserverMargin_Parse(&aString, &mScrollMargin);
+}
+
+nsISupports* DOMIntersectionObserver::GetParentObject() const { return mOwner; }
+
+void DOMIntersectionObserver::GetRootMargin(nsACString& aRetVal) {
+  Servo_IntersectionObserverMargin_ToString(&mRootMargin, &aRetVal);
+}
+
+void DOMIntersectionObserver::GetScrollMargin(nsACString& aRetVal) {
+  Servo_IntersectionObserverMargin_ToString(&mScrollMargin, &aRetVal);
+}
+
+void DOMIntersectionObserver::GetThresholds(nsTArray<double>& aRetVal) {
+  aRetVal = mThresholds.Clone();
+}
+
+bool DOMIntersectionObserver::Observes(Element& aTarget) const {
+  return mObservationTargetMap.Contains(&aTarget);
+}
+
+void DOMIntersectionObserver::Observe(Element& aTarget) {
+  bool wasPresent =
+      mObservationTargetMap.WithEntryHandle(&aTarget, [](auto handle) {
+        if (handle.HasEntry()) {
+          return true;
+        }
+        handle.Insert(Uninitialized);
+        return false;
+      });
+  if (wasPresent) {
+    return;
+  }
+
+  aTarget.BindObject(this, [](nsISupports* aObserver, nsINode* aTarget) {
+    static_cast<DOMIntersectionObserver*>(aObserver)->UnlinkTarget(
+        *aTarget->AsElement());
+  });
+  mObservationTargets.AppendElement(&aTarget);
+
+  MOZ_ASSERT(mObservationTargets.Length() == mObservationTargetMap.Count());
+
+  Connect();
+  if (mDocument) {
+    if (nsPresContext* pc = mDocument->GetPresContext()) {
+      pc->RefreshDriver()->EnsureIntersectionObservationsUpdateHappens();
+    }
+  }
+}
+
+void DOMIntersectionObserver::Unobserve(Element& aTarget) {
+  if (!mObservationTargetMap.Remove(&aTarget)) {
+    return;
+  }
+
+  mObservationTargets.RemoveElement(&aTarget);
+
+  aTarget.UnbindObject(this);
+
+  MOZ_ASSERT(mObservationTargets.Length() == mObservationTargetMap.Count());
+
+  if (mObservationTargets.IsEmpty()) {
+    Disconnect();
+  }
+}
+
+void DOMIntersectionObserver::UnlinkTarget(Element& aTarget) {
+  mObservationTargets.RemoveElement(&aTarget);
+  mObservationTargetMap.Remove(&aTarget);
+
+  if (mObservationTargets.IsEmpty()) {
+    Disconnect();
+  }
+}
+
+void DOMIntersectionObserver::Connect() {
+  if (mConnected) {
+    return;
+  }
+
+  mConnected = true;
+  if (mDocument) {
+    mDocument->AddIntersectionObserver(*this);
+  }
+}
+
+void DOMIntersectionObserver::Disconnect() {
+  if (!mConnected) {
+    return;
+  }
+
+  mConnected = false;
+  for (Element* target : mObservationTargets) {
+    target->UnbindObject(this);
+  }
+
+  mObservationTargets.Clear();
+  mObservationTargetMap.Clear();
+  if (mDocument) {
+    mDocument->RemoveIntersectionObserver(*this);
+  }
+}
+
+void DOMIntersectionObserver::TakeRecords(
+    nsTArray<RefPtr<DOMIntersectionObserverEntry>>& aRetVal) {
+  aRetVal = std::move(mQueuedEntries);
+}
+
+enum class BrowsingContextOrigin { Similar, Different };
+
+static BrowsingContextOrigin SimilarOrigin(const nsIContent& aTarget,
+                                           const nsINode* aRoot) {
+  if (!aRoot) {
+    return BrowsingContextOrigin::Different;
+  }
+  return aTarget.OwnerDoc()->GetDocGroup() == aRoot->OwnerDoc()->GetDocGroup()
+             ? BrowsingContextOrigin::Similar
+             : BrowsingContextOrigin::Different;
+}
+
+static const Document* GetTopLevelContentDocumentInThisProcess(
+    const Document& aDocument) {
+  auto* wc = aDocument.GetTopLevelWindowContext();
+  return wc ? wc->GetExtantDoc() : nullptr;
+}
+
+static nsMargin ResolveMargin(const IntersectionObserverMargin& aMargin,
+                              const nsSize& aPercentBasis) {
+  nsMargin margin;
+  for (const auto side : mozilla::AllPhysicalSides()) {
+    nscoord basis = side == eSideTop || side == eSideBottom
+                        ? aPercentBasis.Height()
+                        : aPercentBasis.Width();
+    margin.Side(side) = aMargin.Get(side).Resolve(
+        basis, static_cast<nscoord (*)(float)>(NSToCoordRoundWithClamp));
+  }
+  return margin;
+}
+
+static Maybe<nsRect> ComputeTheIntersection(
+    nsIFrame* aTarget, const nsRect& aTargetRectRelativeToTarget,
+    nsIFrame* aRoot, const nsRect& aRootBounds,
+    const IntersectionObserverMargin& aScrollMargin,
+    const Maybe<nsRect>& aRemoteDocumentVisibleRect,
+    DOMIntersectionObserver::IsForProximityToViewport aIsForProximityToViewport,
+    bool* aPreservesAxisAlignedRectangles) {
+  nsIFrame* target = aTarget;
+  auto inflowRect = aTargetRectRelativeToTarget;
+  Maybe<nsRect> intersectionRect = Some(inflowRect);
+
+  nsIFrame* containerFrame =
+      nsLayoutUtils::GetCrossDocParentFrameInProcess(target);
+  while (containerFrame && containerFrame != aRoot) {
+    if (ScrollContainerFrame* scrollContainerFrame =
+            do_QueryFrame(containerFrame)) {
+      if (containerFrame->GetParent() == aRoot && !aRoot->GetParent()) {
+        break;
+      }
+      nsRect subFrameRect =
+          scrollContainerFrame->GetScrollPortRectAccountingForDynamicToolbar();
+
+
+      bool preservesAxisAlignedRectangles = false;
+      nsRect intersectionRectRelativeToContainer =
+          nsLayoutUtils::TransformFrameRectToAncestor(
+              target, intersectionRect.value(), containerFrame,
+              &preservesAxisAlignedRectangles);
+      if (aPreservesAxisAlignedRectangles) {
+        *aPreservesAxisAlignedRectangles |= preservesAxisAlignedRectangles;
+      }
+
+      subFrameRect.Inflate(ResolveMargin(aScrollMargin, subFrameRect.Size()));
+
+      intersectionRect =
+          intersectionRectRelativeToContainer.EdgeInclusiveIntersection(
+              subFrameRect);
+      if (!intersectionRect) {
+        return Nothing();
+      }
+      target = containerFrame;
+    } else {
+      const auto& disp = *containerFrame->StyleDisplay();
+      auto clipAxes = containerFrame->ShouldApplyOverflowClipping(&disp);
+
+      if (!clipAxes.isEmpty()) {
+        bool preservesAxisAlignedRectangles = false;
+        const nsRect intersectionRectRelativeToContainer =
+            nsLayoutUtils::TransformFrameRectToAncestor(
+                target, intersectionRect.value(), containerFrame,
+                &preservesAxisAlignedRectangles);
+        if (aPreservesAxisAlignedRectangles) {
+          *aPreservesAxisAlignedRectangles |= preservesAxisAlignedRectangles;
+        }
+        const nsRect clipRect = OverflowAreas::GetOverflowClipRect(
+            intersectionRectRelativeToContainer,
+            containerFrame->GetRectRelativeToSelf(), clipAxes,
+            containerFrame->OverflowClipMargin(clipAxes));
+        intersectionRect =
+            intersectionRectRelativeToContainer.EdgeInclusiveIntersection(
+                clipRect);
+        if (!intersectionRect) {
+          return Nothing();
+        }
+        target = containerFrame;
+      }
+    }
+    containerFrame =
+        nsLayoutUtils::GetCrossDocParentFrameInProcess(containerFrame);
+  }
+  MOZ_ASSERT(intersectionRect);
+
+  bool preservesAxisAlignedRectangles = false;
+  nsRect intersectionRectRelativeToRoot =
+      nsLayoutUtils::TransformFrameRectToAncestor(
+          target, intersectionRect.value(),
+          nsLayoutUtils::GetContainingBlockForClientRect(aRoot),
+          &preservesAxisAlignedRectangles);
+  if (aPreservesAxisAlignedRectangles) {
+    *aPreservesAxisAlignedRectangles |= preservesAxisAlignedRectangles;
+  }
+
+  if (aRemoteDocumentVisibleRect) {
+    MOZ_ASSERT(aRoot->PresContext()->IsRootContentDocumentInProcess() &&
+               !aRoot->PresContext()->IsRootContentDocumentCrossProcess());
+
+    intersectionRect = intersectionRectRelativeToRoot.EdgeInclusiveIntersection(
+        *aRemoteDocumentVisibleRect);
+  } else if (aTarget->HasAnyStateBits(NS_FRAME_IN_POPUP)) {
+    intersectionRect = Some(intersectionRectRelativeToRoot);
+  } else {
+    intersectionRect =
+        intersectionRectRelativeToRoot.EdgeInclusiveIntersection(aRootBounds);
+  }
+
+  if (intersectionRect.isNothing()) {
+    return Nothing();
+  }
+  nsRect rect = intersectionRect.value();
+  if (aTarget->PresContext() != aRoot->PresContext()) {
+    if (nsIFrame* rootScrollContainerFrame =
+            aTarget->PresShell()->GetRootScrollContainerFrame()) {
+      nsLayoutUtils::TransformRect(aRoot, rootScrollContainerFrame, rect);
+    }
+  }
+
+  return Some(rect);
+}
+
+struct OopIframeMetrics {
+  nsIFrame* mInProcessRootFrame = nullptr;
+  nsRect mInProcessRootRect;
+  nsRect mRemoteDocumentVisibleRect;
+};
+
+static Maybe<OopIframeMetrics> GetOopIframeMetrics(
+    const Document& aDocument, const Document* aRootDocument) {
+  const Document* rootDoc =
+      nsContentUtils::GetInProcessSubtreeRootDocument(&aDocument);
+  MOZ_ASSERT(rootDoc);
+
+  if (rootDoc->IsTopLevelContentDocument()) {
+    return Nothing();
+  }
+
+  if (aRootDocument &&
+      rootDoc ==
+          nsContentUtils::GetInProcessSubtreeRootDocument(aRootDocument)) {
+    return Nothing();
+  }
+
+  PresShell* rootPresShell = rootDoc->GetPresShell();
+  if (!rootPresShell || rootPresShell->IsDestroying()) {
+    return Some(OopIframeMetrics{});
+  }
+
+  nsIFrame* inProcessRootFrame = rootPresShell->GetRootFrame();
+  if (!inProcessRootFrame) {
+    return Some(OopIframeMetrics{});
+  }
+
+  BrowserChild* browserChild = BrowserChild::GetFrom(rootDoc->GetDocShell());
+  if (!browserChild) {
+    return Some(OopIframeMetrics{});
+  }
+
+  if (MOZ_UNLIKELY(NS_WARN_IF(browserChild->IsTopLevel()))) {
+    return Nothing();
+  }
+
+  nsRect inProcessRootRect;
+  if (ScrollContainerFrame* rootScrollContainerFrame =
+          rootPresShell->GetRootScrollContainerFrame()) {
+    inProcessRootRect = rootScrollContainerFrame
+                            ->GetScrollPortRectAccountingForDynamicToolbar();
+  }
+
+  Maybe<LayoutDeviceRect> remoteDocumentVisibleRect =
+      browserChild->GetTopLevelViewportVisibleRectInSelfCoords();
+  if (!remoteDocumentVisibleRect) {
+    return Some(OopIframeMetrics{});
+  }
+
+  return Some(OopIframeMetrics{
+      inProcessRootFrame,
+      inProcessRootRect,
+      LayoutDeviceRect::ToAppUnits(
+          *remoteDocumentVisibleRect,
+          rootPresShell->GetPresContext()->AppUnitsPerDevPixel()),
+  });
+}
+
+IntersectionInput DOMIntersectionObserver::ComputeInputForIframeThrottling(
+    const Document& aEmbedderDocument) {
+  auto margin = LazyLoadingMargin();
+  const bool useScroll = StaticPrefs::dom_lazy_loading_margin_is_scroll();
+  return ComputeInput(aEmbedderDocument,  nullptr,
+                       useScroll ? nullptr : &margin,
+                       useScroll ? &margin : nullptr);
+}
+
+IntersectionInput DOMIntersectionObserver::ComputeInput(
+    const Document& aDocument, const nsINode* aRoot,
+    const IntersectionObserverMargin* aRootMargin,
+    const IntersectionObserverMargin* aScrollMargin) {
+  nsRect rootRect;
+  nsIFrame* rootFrame = nullptr;
+  const nsINode* root = aRoot;
+  const bool isImplicitRoot = !aRoot;
+  Maybe<nsRect> remoteDocumentVisibleRect;
+  if (aRoot && aRoot->IsElement()) {
+    if ((rootFrame = aRoot->AsElement()->GetPrimaryFrame())) {
+      nsRect rootRectRelativeToRootFrame;
+      nsIFrame* containingBlock =
+          nsLayoutUtils::GetContainingBlockForClientRect(rootFrame);
+      if (ScrollContainerFrame* scrollContainerFrame =
+              do_QueryFrame(rootFrame)) {
+        rootRect = nsLayoutUtils::TransformFrameRectToAncestor(
+            rootFrame,
+            scrollContainerFrame
+                ->GetScrollPortRectAccountingForDynamicToolbar(),
+            containingBlock);
+      } else {
+        rootRect = nsLayoutUtils::GetAllInFlowRectsUnion(
+            rootFrame, containingBlock,
+            nsLayoutUtils::GetAllInFlowRectsFlag::AccountForTransforms);
+      }
+    }
+  } else {
+    MOZ_ASSERT(!aRoot || aRoot->IsDocument());
+    const Document* rootDocument =
+        aRoot ? aRoot->AsDocument()
+              : GetTopLevelContentDocumentInThisProcess(aDocument);
+    root = rootDocument;
+
+    if (rootDocument) {
+      if (PresShell* presShell = rootDocument->GetPresShell()) {
+        rootFrame = presShell->GetRootFrame();
+        if (ScrollContainerFrame* rootScrollContainerFrame =
+                presShell->GetRootScrollContainerFrame()) {
+          rootRect = rootScrollContainerFrame
+                         ->GetScrollPortRectAccountingForDynamicToolbar();
+        } else if (rootFrame) {
+          rootRect = rootFrame->GetRectRelativeToSelf();
+        }
+      }
+    }
+
+    if (Maybe<OopIframeMetrics> metrics =
+            GetOopIframeMetrics(aDocument, rootDocument)) {
+      rootFrame = metrics->mInProcessRootFrame;
+      if (!rootDocument) {
+        rootRect = metrics->mInProcessRootRect;
+      }
+      remoteDocumentVisibleRect = Some(metrics->mRemoteDocumentVisibleRect);
+    }
+  }
+
+  nsMargin rootMargin;  
+  if (aRootMargin) {
+    rootMargin = ResolveMargin(*aRootMargin, rootRect.Size());
+  }
+
+  return {isImplicitRoot,
+          root,
+          rootFrame,
+          rootRect,
+          rootMargin,
+          aScrollMargin ? *aScrollMargin : IntersectionObserverMargin(),
+          remoteDocumentVisibleRect};
+}
+
+IntersectionOutput DOMIntersectionObserver::Intersect(
+    const IntersectionInput& aInput, const Element& aTarget, BoxToUse aBoxToUse,
+    IsForProximityToViewport aIsForProximityToViewport) {
+  nsIFrame* targetFrame = aTarget.GetPrimaryFrame();
+  if (!targetFrame) {
+    return {SimilarOrigin(aTarget, aInput.mRootNode) ==
+            BrowsingContextOrigin::Similar};
+  }
+  return Intersect(aInput, targetFrame, aBoxToUse, aIsForProximityToViewport);
+}
+
+IntersectionOutput DOMIntersectionObserver::Intersect(
+    const IntersectionInput& aInput, nsIFrame* aTargetFrame, BoxToUse aBoxToUse,
+    IsForProximityToViewport aIsForProximityToViewport) {
+  MOZ_ASSERT(aTargetFrame);
+
+  const nsIContent* target = aTargetFrame->GetContent();
+  const bool isSimilarOrigin =
+      target && SimilarOrigin(*target, aInput.mRootNode) ==
+                    BrowsingContextOrigin::Similar;
+  if (!aInput.mRootFrame) {
+    return {isSimilarOrigin};
+  }
+
+  if (aIsForProximityToViewport == IsForProximityToViewport::No &&
+      aTargetFrame->IsHiddenByContentVisibilityOnAnyAncestor()) {
+    return {isSimilarOrigin};
+  }
+
+  if (!aInput.mIsImplicitRoot &&
+      aInput.mRootNode->OwnerDoc() != target->OwnerDoc()) {
+    return {isSimilarOrigin};
+  }
+
+  if (aInput.mRootFrame == aTargetFrame ||
+      !nsLayoutUtils::IsAncestorFrameCrossDocInProcessConsideringContinuations(
+          aInput.mRootFrame, aTargetFrame)) {
+    return {isSimilarOrigin};
+  }
+
+  nsRect rootBounds = aInput.mRootRect;
+  if (isSimilarOrigin) {
+    rootBounds.Inflate(aInput.mRootMargin);
+
+    if (aInput.mIsImplicitRoot) {
+      rootBounds.Inflate(
+          ResolveMargin(aInput.mScrollMargin, aInput.mRootRect.Size()));
+    }
+  }
+
+  nsLayoutUtils::GetAllInFlowRectsFlags flags{
+      nsLayoutUtils::GetAllInFlowRectsFlag::AccountForTransforms};
+  if (aBoxToUse == BoxToUse::Content) {
+    flags += nsLayoutUtils::GetAllInFlowRectsFlag::UseContentBox;
+  }
+  nsRect targetRectRelativeToTarget =
+      nsLayoutUtils::GetAllInFlowRectsUnion(aTargetFrame, aTargetFrame, flags);
+
+  if (aBoxToUse == BoxToUse::OverflowClip) {
+    const auto& disp = *aTargetFrame->StyleDisplay();
+    auto clipAxes = aTargetFrame->ShouldApplyOverflowClipping(&disp);
+    if (!clipAxes.isEmpty()) {
+      targetRectRelativeToTarget = OverflowAreas::GetOverflowClipRect(
+          targetRectRelativeToTarget, targetRectRelativeToTarget, clipAxes,
+          aTargetFrame->OverflowClipMargin(clipAxes,
+                                            false));
+    }
+  }
+
+  auto targetRect = nsLayoutUtils::TransformFrameRectToAncestor(
+      aTargetFrame, targetRectRelativeToTarget,
+      nsLayoutUtils::GetContainingBlockForClientRect(aTargetFrame));
+
+  MOZ_ASSERT_IF(aIsForProximityToViewport == IsForProximityToViewport::Yes,
+                aBoxToUse == BoxToUse::OverflowClip);
+
+  bool preservesAxisAlignedRectangles = false;
+  Maybe<nsRect> intersectionRect = ComputeTheIntersection(
+      aTargetFrame, targetRectRelativeToTarget, aInput.mRootFrame, rootBounds,
+      aInput.mScrollMargin, aInput.mRemoteDocumentVisibleRect,
+      aIsForProximityToViewport, &preservesAxisAlignedRectangles);
+
+  return {isSimilarOrigin, rootBounds, targetRect, intersectionRect,
+          preservesAxisAlignedRectangles};
+}
+
+IntersectionOutput DOMIntersectionObserver::Intersect(
+    const IntersectionInput& aInput, const nsRect& aTargetRect) {
+  nsRect rootBounds = aInput.mRootRect;
+  rootBounds.Inflate(aInput.mRootMargin);
+  auto intersectionRect =
+      aInput.mRootRect.EdgeInclusiveIntersection(aTargetRect);
+  if (intersectionRect && aInput.mRemoteDocumentVisibleRect) {
+    intersectionRect = intersectionRect->EdgeInclusiveIntersection(
+        *aInput.mRemoteDocumentVisibleRect);
+  }
+  return {true, rootBounds, aTargetRect, intersectionRect,
+           false};
+}
+
+void DOMIntersectionObserver::Update(Document& aDocument,
+                                     DOMHighResTimeStamp time) {
+  auto input = ComputeInput(aDocument, mRoot, &mRootMargin, &mScrollMargin);
+
+  for (Element* target : mObservationTargets) {
+    IntersectionOutput output = Intersect(input, *target);
+
+    int64_t targetArea = (int64_t)output.mTargetRect.Width() *
+                         (int64_t)output.mTargetRect.Height();
+
+    int64_t intersectionArea =
+        !output.mIntersectionRect
+            ? 0
+            : (int64_t)output.mIntersectionRect->Width() *
+                  (int64_t)output.mIntersectionRect->Height();
+
+    const bool isIntersecting = output.Intersects();
+
+    double intersectionRatio;
+    if (targetArea > 0.0) {
+      intersectionRatio =
+          std::min((double)intersectionArea / (double)targetArea, 1.0);
+    } else {
+      intersectionRatio = isIntersecting ? 1.0 : 0.0;
+    }
+
+    int32_t thresholdIndex = -1;
+
+    if (isIntersecting) {
+      thresholdIndex = mThresholds.IndexOfFirstElementGt(intersectionRatio);
+      if (thresholdIndex == 0) {
+        thresholdIndex = -1;
+      }
+    }
+
+    bool updated = false;
+    if (auto entry = mObservationTargetMap.Lookup(target)) {
+      updated = entry.Data() != thresholdIndex;
+      entry.Data() = thresholdIndex;
+    } else {
+      MOZ_ASSERT_UNREACHABLE("Target not properly registered?");
+    }
+
+    if (updated) {
+      QueueIntersectionObserverEntry(
+          target, time,
+          output.mIsSimilarOrigin ? Some(output.mRootBounds) : Nothing(),
+          output.mTargetRect, output.mIntersectionRect, thresholdIndex > 0,
+          intersectionRatio);
+    }
+  }
+}
+
+void DOMIntersectionObserver::QueueIntersectionObserverEntry(
+    Element* aTarget, DOMHighResTimeStamp time, const Maybe<nsRect>& aRootRect,
+    const nsRect& aTargetRect, const Maybe<nsRect>& aIntersectionRect,
+    bool aIsIntersecting, double aIntersectionRatio) {
+  RefPtr<DOMRect> rootBounds;
+  if (aRootRect.isSome()) {
+    rootBounds = new DOMRect(mOwner);
+    rootBounds->SetLayoutRect(aRootRect.value());
+  }
+  RefPtr<DOMRect> boundingClientRect = new DOMRect(mOwner);
+  boundingClientRect->SetLayoutRect(aTargetRect);
+  RefPtr<DOMRect> intersectionRect = new DOMRect(mOwner);
+  if (aIntersectionRect.isSome()) {
+    intersectionRect->SetLayoutRect(aIntersectionRect.value());
+  }
+  RefPtr<DOMIntersectionObserverEntry> entry = new DOMIntersectionObserverEntry(
+      mOwner, time, rootBounds.forget(), boundingClientRect.forget(),
+      intersectionRect.forget(), aIsIntersecting, aTarget, aIntersectionRatio);
+  mQueuedEntries.AppendElement(entry.forget());
+}
+
+void DOMIntersectionObserver::Notify() {
+  if (!mQueuedEntries.Length()) {
+    return;
+  }
+  Sequence<OwningNonNull<DOMIntersectionObserverEntry>> entries;
+  if (entries.SetCapacity(mQueuedEntries.Length(), mozilla::fallible)) {
+    for (size_t i = 0; i < mQueuedEntries.Length(); ++i) {
+      RefPtr<DOMIntersectionObserverEntry> next = mQueuedEntries[i];
+      *entries.AppendElement(mozilla::fallible) = next;
+    }
+  }
+  mQueuedEntries.Clear();
+
+  if (mCallback.is<RefPtr<dom::IntersectionCallback>>()) {
+    RefPtr<dom::IntersectionCallback> callback(
+        mCallback.as<RefPtr<dom::IntersectionCallback>>());
+    callback->Call(this, entries, *this);
+  } else {
+    mCallback.as<NativeCallback>()(entries);
+  }
+}
+
+}  

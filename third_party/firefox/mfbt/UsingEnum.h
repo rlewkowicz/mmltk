@@ -1,0 +1,25 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_UsingEnum_h
+#define mozilla_UsingEnum_h
+
+#include "mozilla/MacroForEach.h"
+
+
+#if defined(__cpp_using_enum) && !defined(DEBUG)
+#  define MOZ_USING_ENUM(ENUM, ...) using enum ENUM
+#  define MOZ_USING_ENUM_STATIC(ENUM, ...) using enum ENUM
+#else
+#  define MOZ_USING_ENUM_DECLARE(ENUM, NAME) constexpr auto NAME = ENUM::NAME;
+#  define MOZ_USING_ENUM(ENUM, ...) \
+    MOZ_FOR_EACH(MOZ_USING_ENUM_DECLARE, (ENUM, ), (__VA_ARGS__))
+
+#  define MOZ_USING_ENUM_DECLARE_STATIC(ENUM, NAME) \
+    static constexpr auto NAME = ENUM::NAME;
+#  define MOZ_USING_ENUM_STATIC(ENUM, ...) \
+    MOZ_FOR_EACH(MOZ_USING_ENUM_DECLARE_STATIC, (ENUM, ), (__VA_ARGS__))
+#endif
+
+#endif  // mozilla_UsingEnum_h

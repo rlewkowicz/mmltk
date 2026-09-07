@@ -1,0 +1,53 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef gc_RelocationOverlay_h
+#define gc_RelocationOverlay_h
+
+#include "mozilla/Assertions.h"
+
+#include "gc/Cell.h"
+
+namespace js {
+namespace gc {
+
+class RelocationOverlay : public Cell {
+ public:
+  Cell* forwardingAddress() const {
+    MOZ_ASSERT(isForwarded());
+    return reinterpret_cast<Cell*>(header_.getForwardingAddress());
+  }
+
+ protected:
+  RelocationOverlay* next_;
+
+  explicit RelocationOverlay(Cell* dst);
+
+ public:
+  static const RelocationOverlay* fromCell(const Cell* cell) {
+    return static_cast<const RelocationOverlay*>(cell);
+  }
+
+  static RelocationOverlay* fromCell(Cell* cell) {
+    return static_cast<RelocationOverlay*>(cell);
+  }
+
+  static RelocationOverlay* forwardCell(Cell* src, Cell* dst);
+
+  void setNext(RelocationOverlay* next) {
+    MOZ_ASSERT(isForwarded());
+    next_ = next;
+  }
+
+  RelocationOverlay* next() const {
+    MOZ_ASSERT(isForwarded());
+    return next_;
+  }
+};
+
+}  
+}  
+
+#endif /* gc_RelocationOverlay_h */

@@ -1,0 +1,26 @@
+CONFIGURE_SUBST_FILES += ['js-config', 'js.pc']
+LIBRARY_DEFINES['EXPORT_JS_API'] = True
+LIBRARY_DEFINES['MOZ_HAS_MOZGLUE'] = True
+LIBRARY_DEFINES['MOZ_SUPPORT_LEAKCHECKING'] = True
+if CONFIG['JS_SHARED_LIBRARY']:
+    GeckoSharedLibrary('js')
+    SHARED_LIBRARY_NAME = CONFIG['JS_LIBRARY_NAME']
+    GeneratedFile('symverscript', script='/build/gen_symverscript.py', inputs=['symverscript.in'], flags=[CONFIG['JS_LIBRARY_NAME'].replace('-', '_')])
+    SYMBOLS_FILE = '!symverscript'
+else:
+    Library('js')
+FORCE_STATIC_LIB = True
+STATIC_LIBRARY_NAME = 'js_static'
+if CONFIG['JS_HAS_INTL_API']:
+    USE_LIBS += ['icu']
+USE_LIBS += ['fdlibm', 'nspr']
+if not CONFIG['USE_LIBZ_RS']:
+    USE_LIBS += ['zlib']
+OS_LIBS += ['m']
+OS_LIBS += ['dl']
+OS_LIBS += CONFIG['LIBATOMIC_LIBS']
+OS_LIBS += CONFIG['REALTIME_LIBS']
+NO_EXPAND_LIBS = True
+DIST_INSTALL = True
+if CONFIG['JS_STANDALONE']:
+    GeneratedFile('spidermonkey_checks', script='/config/run_spidermonkey_checks.py', inputs=['!%sjs_static.%s' % (CONFIG['LIB_PREFIX'], CONFIG['LIB_SUFFIX']), '/config/check_spidermonkey_style.py', '/config/check_macroassembler_style.py', '/config/check_js_opcode.py'])

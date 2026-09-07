@@ -1,0 +1,428 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/ResizeObserver.h"
+
+#include <limits>
+
+#include "mozilla/SVGUtils.h"
+#include "mozilla/ScrollContainerFrame.h"
+#include "mozilla/dom/DOMRect.h"
+#include "mozilla/dom/Document.h"
+#include "nsIContent.h"
+#include "nsIContentInlines.h"
+#include "nsLayoutUtils.h"
+
+namespace mozilla::dom {
+
+static uint32_t GetNodeDepth(nsINode* aNode) {
+  uint32_t depth = 1;
+
+  MOZ_ASSERT(aNode, "Node shouldn't be null");
+
+  while ((aNode = aNode->GetFlattenedTreeParentNode())) {
+    ++depth;
+  }
+
+  return depth;
+}
+
+static nsSize GetContentRectSize(const nsIFrame& aFrame) {
+  if (const ScrollContainerFrame* f = do_QueryFrame(&aFrame)) {
+    nsRect scrollPort = f->GetScrollPortRect();
+    nsMargin padding =
+        aFrame.GetUsedPadding().ApplySkipSides(aFrame.GetSkipSides());
+    scrollPort.Deflate(padding);
+    NS_ASSERTION(
+        !f->UseOverlayScrollbars() ||
+            scrollPort.Size() == aFrame.GetContentRectRelativeToSelf().Size(),
+        "Wrong scrollport?");
+    return scrollPort.Size();
+  }
+  return aFrame.GetContentRectRelativeToSelf().Size();
+}
+
+AutoTArray<LogicalPixelSize, 1> ResizeObserver::CalculateBoxSize(
+    Element* aTarget, ResizeObserverBoxOptions aBox,
+    bool aForceFragmentHandling) {
+  nsIFrame* frame = aTarget->GetPrimaryFrame();
+
+  if (!frame) {
+    return {LogicalPixelSize()};
+  }
+
+  const auto zoom = frame->Style()->EffectiveZoom();
+  if (frame->HasAnyStateBits(NS_FRAME_SVG_LAYOUT)) {
+    const gfxRect bbox = SVGUtils::GetBBox(frame);
+    gfx::Size size(static_cast<float>(bbox.width),
+                   static_cast<float>(bbox.height));
+    const WritingMode wm = frame->GetWritingMode();
+    if (aBox == ResizeObserverBoxOptions::Device_pixel_content_box) {
+      const LayoutDeviceIntSize snappedSize =
+          RoundedToInt(CSSSize::FromUnknownSize(size) *
+                       frame->PresContext()->CSSToDevPixelScale());
+      return {LogicalPixelSize(wm, gfx::Size(snappedSize.ToUnknownSize()))};
+    }
+    size.width = zoom.Unzoom(size.width);
+    size.height = zoom.Unzoom(size.height);
+    return {LogicalPixelSize(wm, size)};
+  }
+
+  if (!frame->IsReplaced() && frame->IsLineParticipant()) {
+    return {LogicalPixelSize()};
+  }
+
+  auto GetFrameSize = [aBox, zoom](nsIFrame* aFrame) {
+    switch (aBox) {
+      case ResizeObserverBoxOptions::Border_box:
+        return CSSPixel::FromAppUnits(zoom.Unzoom(aFrame->GetSize()))
+            .ToUnknownSize();
+      case ResizeObserverBoxOptions::Device_pixel_content_box: {
+        const auto* referenceFrame = nsLayoutUtils::GetReferenceFrame(aFrame);
+        const auto offset = aFrame->GetOffsetToCrossDoc(referenceFrame);
+        const auto contentSize = GetContentRectSize(*aFrame);
+        const auto appUnitsPerDevPixel =
+            static_cast<double>(aFrame->PresContext()->AppUnitsPerDevPixel());
+        gfx::Rect rect{gfx::Float(offset.X() / appUnitsPerDevPixel),
+                       gfx::Float(offset.Y() / appUnitsPerDevPixel),
+                       gfx::Float(contentSize.Width() / appUnitsPerDevPixel),
+                       gfx::Float(contentSize.Height() / appUnitsPerDevPixel)};
+        gfx::Point tl = rect.TopLeft().Round();
+        gfx::Point br = rect.BottomRight().Round();
+
+        rect.SizeTo(gfx::Size(br.x - tl.x, br.y - tl.y));
+        rect.NudgeToIntegers();
+        return rect.Size().ToUnknownSize();
+      }
+      case ResizeObserverBoxOptions::Content_box:
+      default:
+        break;
+    }
+    return CSSPixel::FromAppUnits(zoom.Unzoom(GetContentRectSize(*aFrame)))
+        .ToUnknownSize();
+  };
+  if (!StaticPrefs::dom_resize_observer_support_fragments() &&
+      !aForceFragmentHandling) {
+    return {LogicalPixelSize(frame->GetWritingMode(), GetFrameSize(frame))};
+  }
+  AutoTArray<LogicalPixelSize, 1> size;
+  for (nsIFrame* cur = frame; cur; cur = cur->GetNextContinuation()) {
+    const WritingMode wm = cur->GetWritingMode();
+    size.AppendElement(LogicalPixelSize(wm, GetFrameSize(cur)));
+  }
+  return size;
+}
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(ResizeObservation)
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(ResizeObservation)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mTarget);
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(ResizeObservation)
+  tmp->Unlink(RemoveFromObserver::Yes);
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+ResizeObservation::ResizeObservation(Element& aTarget,
+                                     ResizeObserver& aObserver,
+                                     ResizeObserverBoxOptions aBox)
+    : mTarget(&aTarget),
+      mObserver(&aObserver),
+      mObservedBox(aBox),
+      mLastReportedSize({LogicalPixelSize(WritingMode(), gfx::Size(-1, -1))}) {
+  aTarget.BindObject(mObserver);
+}
+
+void ResizeObservation::Unlink(RemoveFromObserver aRemoveFromObserver) {
+  ResizeObserver* observer = std::exchange(mObserver, nullptr);
+  nsCOMPtr<Element> target = std::move(mTarget);
+  if (observer && target) {
+    if (aRemoveFromObserver == RemoveFromObserver::Yes) {
+      observer->Unobserve(*target);
+    }
+    target->UnbindObject(observer);
+  }
+}
+
+bool ResizeObservation::IsActive() const {
+  nsIFrame* frame = mTarget->GetPrimaryFrame();
+  if (frame && frame->IsHiddenByContentVisibilityOnAnyAncestor()) {
+    return false;
+  }
+
+  return mLastReportedSize !=
+         ResizeObserver::CalculateBoxSize(mTarget, mObservedBox);
+}
+
+void ResizeObservation::UpdateLastReportedSize(
+    const nsTArray<LogicalPixelSize>& aSize) {
+  mLastReportedSize.Assign(aSize);
+}
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(ResizeObserver)
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(ResizeObserver)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mOwner, mDocument, mActiveTargets,
+                                    mObservationMap);
+  if (tmp->mCallback.is<RefPtr<ResizeObserverCallback>>()) {
+    ImplCycleCollectionTraverse(
+        cb, tmp->mCallback.as<RefPtr<ResizeObserverCallback>>(), "mCallback",
+        0);
+  }
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(ResizeObserver)
+  tmp->Disconnect();
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mOwner, mDocument, mActiveTargets,
+                                  mObservationMap);
+  if (tmp->mCallback.is<RefPtr<ResizeObserverCallback>>()) {
+    ImplCycleCollectionUnlink(
+        tmp->mCallback.as<RefPtr<ResizeObserverCallback>>());
+  }
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_PRESERVED_WRAPPER
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(ResizeObserver)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(ResizeObserver)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(ResizeObserver)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+already_AddRefed<ResizeObserver> ResizeObserver::Constructor(
+    const GlobalObject& aGlobal, ResizeObserverCallback& aCb,
+    ErrorResult& aRv) {
+  nsCOMPtr<nsPIDOMWindowInner> window =
+      do_QueryInterface(aGlobal.GetAsSupports());
+  if (!window) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return nullptr;
+  }
+
+  Document* doc = window->GetExtantDoc();
+  if (!doc) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return nullptr;
+  }
+
+  return do_AddRef(new ResizeObserver(std::move(window), doc, aCb));
+}
+
+void ResizeObserver::Observe(Element& aTarget,
+                             const ResizeObserverOptions& aOptions) {
+  if (MOZ_UNLIKELY(!mDocument)) {
+    MOZ_ASSERT_UNREACHABLE("How did we call observe() after unlink?");
+    return;
+  }
+
+  if (mObservationList.isEmpty()) {
+    MOZ_ASSERT(mObservationMap.IsEmpty());
+    mDocument->AddResizeObserver(*this);
+  }
+
+  auto& observation = mObservationMap.LookupOrInsert(&aTarget);
+  if (observation) {
+    if (observation->BoxOptions() == aOptions.mBox) {
+      return;
+    }
+    observation->remove();
+    observation = nullptr;
+  }
+
+  observation = new ResizeObservation(aTarget, *this, aOptions.mBox);
+  mObservationList.insertBack(observation);
+
+  mDocument->ScheduleResizeObserversNotification();
+}
+
+void ResizeObserver::Unobserve(Element& aTarget) {
+  RefPtr<ResizeObservation> observation;
+  if (!mObservationMap.Remove(&aTarget, getter_AddRefs(observation))) {
+    return;
+  }
+
+  MOZ_ASSERT(!mObservationList.isEmpty(),
+             "If ResizeObservation found for an element, observation list "
+             "must be not empty.");
+  observation->remove();
+  if (mObservationList.isEmpty()) {
+    if (MOZ_LIKELY(mDocument)) {
+      mDocument->RemoveResizeObserver(*this);
+    }
+  }
+}
+
+void ResizeObserver::Disconnect() {
+  const bool registered = !mObservationList.isEmpty();
+  while (auto* observation = mObservationList.popFirst()) {
+    observation->Unlink(ResizeObservation::RemoveFromObserver::No);
+  }
+  MOZ_ASSERT(mObservationList.isEmpty());
+  mObservationMap.Clear();
+  mActiveTargets.Clear();
+  if (registered && MOZ_LIKELY(mDocument)) {
+    mDocument->RemoveResizeObserver(*this);
+  }
+}
+
+void ResizeObserver::GatherActiveObservations(uint32_t aDepth) {
+  mActiveTargets.Clear();
+  mHasSkippedTargets = false;
+
+  for (auto* observation : mObservationList) {
+    if (!observation->IsActive()) {
+      continue;
+    }
+
+    uint32_t targetDepth = GetNodeDepth(observation->Target());
+
+    if (targetDepth > aDepth) {
+      mActiveTargets.AppendElement(observation);
+    } else {
+      mHasSkippedTargets = true;
+    }
+  }
+}
+
+uint32_t ResizeObserver::BroadcastActiveObservations() {
+  uint32_t shallowestTargetDepth = std::numeric_limits<uint32_t>::max();
+
+  if (!HasActiveObservations()) {
+    return shallowestTargetDepth;
+  }
+
+  Sequence<OwningNonNull<ResizeObserverEntry>> entries;
+
+  for (auto& observation : mActiveTargets) {
+    Element* target = observation->Target();
+
+    auto borderBoxSize = ResizeObserver::CalculateBoxSize(
+        target, ResizeObserverBoxOptions::Border_box);
+    auto contentBoxSize = ResizeObserver::CalculateBoxSize(
+        target, ResizeObserverBoxOptions::Content_box);
+    auto devicePixelContentBoxSize = ResizeObserver::CalculateBoxSize(
+        target, ResizeObserverBoxOptions::Device_pixel_content_box);
+    RefPtr<ResizeObserverEntry> entry =
+        new ResizeObserverEntry(mOwner, *target, borderBoxSize, contentBoxSize,
+                                devicePixelContentBoxSize);
+
+    if (!entries.AppendElement(entry.forget(), fallible)) {
+      break;
+    }
+
+    switch (observation->BoxOptions()) {
+      case ResizeObserverBoxOptions::Border_box:
+        observation->UpdateLastReportedSize(borderBoxSize);
+        break;
+      case ResizeObserverBoxOptions::Device_pixel_content_box:
+        observation->UpdateLastReportedSize(devicePixelContentBoxSize);
+        break;
+      case ResizeObserverBoxOptions::Content_box:
+      default:
+        observation->UpdateLastReportedSize(contentBoxSize);
+    }
+
+    uint32_t targetDepth = GetNodeDepth(observation->Target());
+
+    if (targetDepth < shallowestTargetDepth) {
+      shallowestTargetDepth = targetDepth;
+    }
+  }
+
+  if (mCallback.is<RefPtr<ResizeObserverCallback>>()) {
+    auto callback(mCallback.as<RefPtr<ResizeObserverCallback>>());
+    callback->Call(this, entries, *this);
+  } else {
+    mCallback.as<NativeCallback>()(entries);
+  }
+
+  mActiveTargets.Clear();
+  mHasSkippedTargets = false;
+
+  return shallowestTargetDepth;
+}
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(ResizeObserverEntry, mOwner, mTarget,
+                                      mContentRect, mBorderBoxSize,
+                                      mContentBoxSize,
+                                      mDevicePixelContentBoxSize)
+NS_IMPL_CYCLE_COLLECTING_ADDREF(ResizeObserverEntry)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(ResizeObserverEntry)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(ResizeObserverEntry)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+void ResizeObserverEntry::GetBorderBoxSize(
+    nsTArray<RefPtr<ResizeObserverSize>>& aRetVal) const {
+  aRetVal.Assign(mBorderBoxSize);
+}
+
+void ResizeObserverEntry::GetContentBoxSize(
+    nsTArray<RefPtr<ResizeObserverSize>>& aRetVal) const {
+  aRetVal.Assign(mContentBoxSize);
+}
+
+void ResizeObserverEntry::GetDevicePixelContentBoxSize(
+    nsTArray<RefPtr<ResizeObserverSize>>& aRetVal) const {
+  aRetVal.Assign(mDevicePixelContentBoxSize);
+}
+
+void ResizeObserverEntry::SetBorderBoxSize(
+    const nsTArray<LogicalPixelSize>& aSize) {
+  mBorderBoxSize.Clear();
+  mBorderBoxSize.SetCapacity(aSize.Length());
+  for (const LogicalPixelSize& size : aSize) {
+    mBorderBoxSize.AppendElement(new ResizeObserverSize(mOwner, size));
+  }
+}
+
+void ResizeObserverEntry::SetContentRectAndSize(
+    const nsTArray<LogicalPixelSize>& aSize) {
+  nsIFrame* frame = mTarget->GetPrimaryFrame();
+
+  mContentRect = [&] {
+    nsMargin padding = frame ? frame->GetUsedPadding() : nsMargin();
+    const auto zoom = frame ? frame->Style()->EffectiveZoom() : StyleZoom::ONE;
+    const nsPoint origin = zoom.Unzoom(nsPoint(padding.left, padding.top));
+
+    gfx::Size sizeForRect;
+    MOZ_DIAGNOSTIC_ASSERT(!aSize.IsEmpty());
+    if (!aSize.IsEmpty()) {
+      const WritingMode wm = frame ? frame->GetWritingMode() : WritingMode();
+      sizeForRect = aSize[0].PhysicalSize(wm);
+    }
+    nsRect rect(origin,
+                CSSPixel::ToAppUnits(CSSSize::FromUnknownSize(sizeForRect)));
+    RefPtr<DOMRect> contentRect = new DOMRect(mOwner);
+    contentRect->SetLayoutRect(rect);
+    return contentRect.forget();
+  }();
+
+  mContentBoxSize.Clear();
+  mContentBoxSize.SetCapacity(aSize.Length());
+  for (const LogicalPixelSize& size : aSize) {
+    mContentBoxSize.AppendElement(new ResizeObserverSize(mOwner, size));
+  }
+}
+
+void ResizeObserverEntry::SetDevicePixelContentSize(
+    const nsTArray<LogicalPixelSize>& aSize) {
+  mDevicePixelContentBoxSize.Clear();
+  mDevicePixelContentBoxSize.SetCapacity(aSize.Length());
+  for (const LogicalPixelSize& size : aSize) {
+    mDevicePixelContentBoxSize.AppendElement(
+        new ResizeObserverSize(mOwner, size));
+  }
+}
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(ResizeObserverSize, mOwner)
+NS_IMPL_CYCLE_COLLECTING_ADDREF(ResizeObserverSize)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(ResizeObserverSize)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(ResizeObserverSize)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+}  

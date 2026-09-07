@@ -1,0 +1,90 @@
+# Copyright (c) 2005-2020, Ilya Etingof <etingof@gmail.com>
+# License: https://pyasn1.readthedocs.io/en/latest/license.html
+import warnings
+
+from pyasn1 import error
+from pyasn1.codec.streaming import readFromStream
+from pyasn1.codec.ber import decoder
+from pyasn1.type import univ
+
+__all__ = ['decode', 'StreamingDecoder']
+
+SubstrateUnderrunError = error.SubstrateUnderrunError
+
+
+class BooleanPayloadDecoder(decoder.AbstractSimplePayloadDecoder):
+    protoComponent = univ.Boolean(0)
+
+    def valueDecoder(self, substrate, asn1Spec,
+                     tagSet=None, length=None, state=None,
+                     decodeFun=None, substrateFun=None,
+                     **options):
+
+        if length != 1:
+            raise error.PyAsn1Error('Not single-octet Boolean payload')
+
+        for chunk in readFromStream(substrate, length, options):
+            if isinstance(chunk, SubstrateUnderrunError):
+                yield chunk
+
+        byte = chunk[0]
+
+        if byte == 0xff:
+            value = 1
+
+        elif byte == 0x00:
+            value = 0
+
+        else:
+            raise error.PyAsn1Error('Unexpected Boolean payload: %s' % byte)
+
+        yield self._createComponent(asn1Spec, tagSet, value, **options)
+
+
+BitStringPayloadDecoder = decoder.BitStringPayloadDecoder
+OctetStringPayloadDecoder = decoder.OctetStringPayloadDecoder
+RealPayloadDecoder = decoder.RealPayloadDecoder
+
+TAG_MAP = decoder.TAG_MAP.copy()
+TAG_MAP.update(
+    {univ.Boolean.tagSet: BooleanPayloadDecoder(),
+     univ.BitString.tagSet: BitStringPayloadDecoder(),
+     univ.OctetString.tagSet: OctetStringPayloadDecoder(),
+     univ.Real.tagSet: RealPayloadDecoder()}
+)
+
+TYPE_MAP = decoder.TYPE_MAP.copy()
+
+for typeDecoder in TAG_MAP.values():
+    if typeDecoder.protoComponent is not None:
+        typeId = typeDecoder.protoComponent.__class__.typeId
+        if typeId is not None and typeId not in TYPE_MAP:
+            TYPE_MAP[typeId] = typeDecoder
+
+
+class SingleItemDecoder(decoder.SingleItemDecoder):
+    __doc__ = decoder.SingleItemDecoder.__doc__
+
+    TAG_MAP = TAG_MAP
+    TYPE_MAP = TYPE_MAP
+
+
+class StreamingDecoder(decoder.StreamingDecoder):
+    __doc__ = decoder.StreamingDecoder.__doc__
+
+    SINGLE_ITEM_DECODER = SingleItemDecoder
+
+
+class Decoder(decoder.Decoder):
+    __doc__ = decoder.Decoder.__doc__
+
+    STREAMING_DECODER = StreamingDecoder
+
+
+decode = Decoder()
+
+def __getattr__(attr: str):
+    if newAttr := {"tagMap": "TAG_MAP", "typeMap": "TYPE_MAP"}.get(attr):
+        warnings.warn(f"{attr} is deprecated. Please use {newAttr} instead.", DeprecationWarning)
+        return globals()[newAttr]
+    raise AttributeError(attr)

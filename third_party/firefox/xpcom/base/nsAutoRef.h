@@ -1,0 +1,198 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsAutoRef_h_
+#define nsAutoRef_h_
+
+#include "mozilla/Attributes.h"
+
+template <class T>
+class nsSimpleRef;
+template <class T>
+class nsAutoRefBase;
+template <class T>
+class nsReturnRef;
+template <class T>
+class nsReturningRef;
+
+
+template <class T>
+class nsAutoRef : public nsAutoRefBase<T> {
+ protected:
+  typedef nsAutoRef<T> ThisClass;
+  typedef nsAutoRefBase<T> BaseClass;
+  typedef nsSimpleRef<T> SimpleRef;
+  typedef typename BaseClass::RawRefOnly RawRefOnly;
+  typedef typename BaseClass::LocalSimpleRef LocalSimpleRef;
+
+ public:
+  nsAutoRef() = default;
+
+  explicit nsAutoRef(RawRefOnly aRefToRelease) : BaseClass(aRefToRelease) {}
+
+  explicit nsAutoRef(const nsReturningRef<T>& aReturning)
+      : BaseClass(aReturning) {}
+
+
+  ThisClass& operator=(const nsReturningRef<T>& aReturning) {
+    BaseClass::steal(aReturning.mReturnRef);
+    return *this;
+  }
+
+  operator typename SimpleRef::RawRef() const { return this->get(); }
+
+  explicit operator bool() const { return this->HaveResource(); }
+
+  void steal(ThisClass& aOtherRef) { BaseClass::steal(aOtherRef); }
+
+  void own(RawRefOnly aRefToRelease) { BaseClass::own(aRefToRelease); }
+
+  void swap(ThisClass& aOther) {
+    LocalSimpleRef temp;
+    temp.SimpleRef::operator=(*this);
+    SimpleRef::operator=(aOther);
+    aOther.SimpleRef::operator=(temp);
+  }
+
+  void reset() {
+    this->SafeRelease();
+    LocalSimpleRef empty;
+    SimpleRef::operator=(empty);
+  }
+
+  nsReturnRef<T> out() { return nsReturnRef<T>(this->disown()); }
+
+
+  explicit nsAutoRef(const ThisClass& aRefToSteal) = delete;
+};
+
+
+template <class T>
+class nsReturnRef : public nsAutoRefBase<T> {
+ protected:
+  typedef nsAutoRefBase<T> BaseClass;
+  typedef typename BaseClass::RawRefOnly RawRefOnly;
+
+ public:
+  nsReturnRef() = default;
+
+  MOZ_IMPLICIT nsReturnRef(RawRefOnly aRefToRelease)
+      : BaseClass(aRefToRelease) {}
+
+  nsReturnRef(nsReturnRef<T>&& aRefToSteal) = default;
+
+  MOZ_IMPLICIT nsReturnRef(const nsReturningRef<T>& aReturning)
+      : BaseClass(aReturning) {}
+
+  operator nsReturningRef<T>() { return nsReturningRef<T>(*this); }
+
+};
+
+
+template <class T>
+class nsReturningRef {
+ private:
+  friend class nsReturnRef<T>;
+
+  explicit nsReturningRef(nsReturnRef<T>& aReturnRef)
+      : mReturnRef(aReturnRef) {}
+
+ public:
+  nsReturnRef<T>& mReturnRef;
+};
+
+
+template <class T>
+class nsAutoRefTraits;
+
+
+template <class T>
+class nsPointerRefTraits {
+ public:
+  typedef T* RawRef;
+  static RawRef Void() { return nullptr; }
+};
+
+
+template <class T>
+class nsSimpleRef : protected nsAutoRefTraits<T> {
+ protected:
+  typedef nsAutoRefTraits<T> Traits;
+  typedef typename Traits::RawRef RawRef;
+
+  nsSimpleRef() : mRawRef(Traits::Void()) {}
+  explicit nsSimpleRef(RawRef aRawRef) : mRawRef(aRawRef) {}
+
+  bool HaveResource() const { return mRawRef != Traits::Void(); }
+
+ public:
+  RawRef get() const { return mRawRef; }
+
+ private:
+  RawRef mRawRef;
+};
+
+
+template <class T>
+class nsAutoRefBase : public nsSimpleRef<T> {
+ protected:
+  typedef nsAutoRefBase<T> ThisClass;
+  typedef nsSimpleRef<T> SimpleRef;
+  typedef typename SimpleRef::RawRef RawRef;
+
+  nsAutoRefBase() = default;
+
+  class RawRefOnly {
+   public:
+    MOZ_IMPLICIT RawRefOnly(RawRef aRawRef) : mRawRef(aRawRef) {}
+    operator RawRef() const { return mRawRef; }
+
+   private:
+    RawRef mRawRef;
+  };
+
+  explicit nsAutoRefBase(RawRefOnly aRefToRelease) : SimpleRef(aRefToRelease) {}
+
+  nsAutoRefBase(ThisClass&& aRefToSteal) : SimpleRef(aRefToSteal.disown()) {}
+  explicit nsAutoRefBase(const nsReturningRef<T>& aReturning)
+      : SimpleRef(aReturning.mReturnRef.disown()) {}
+
+  ~nsAutoRefBase() { SafeRelease(); }
+
+  class LocalSimpleRef : public SimpleRef {
+   public:
+    LocalSimpleRef() = default;
+    explicit LocalSimpleRef(RawRef aRawRef) : SimpleRef(aRawRef) {}
+  };
+
+ public:
+  ThisClass& operator=(const ThisClass& aSmartRef) = delete;
+
+  RawRef operator->() const { return this->get(); }
+
+  RawRef disown() {
+    RawRef temp = this->get();
+    LocalSimpleRef empty;
+    SimpleRef::operator=(empty);
+    return temp;
+  }
+
+ protected:
+
+  void steal(ThisClass& aOtherRef) { own(aOtherRef.disown()); }
+  void own(RawRefOnly aRefToRelease) {
+    SafeRelease();
+    LocalSimpleRef ref(aRefToRelease);
+    SimpleRef::operator=(ref);
+  }
+
+  void SafeRelease() {
+    if (this->HaveResource()) {
+      this->Release(this->get());
+    }
+  }
+};
+
+#endif  // !defined(nsAutoRef_h_)

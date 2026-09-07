@@ -1,0 +1,197 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "SRIMetadata.h"
+
+#include "hasht.h"
+#include "mozilla/Logging.h"
+#include "nsCSPParser.h"
+#include "nsICryptoHash.h"
+
+static mozilla::LogModule* GetSriMetadataLog() {
+  static mozilla::LazyLogModule gSriMetadataPRLog("SRIMetadata");
+  return gSriMetadataPRLog;
+}
+
+#define SRIMETADATALOG(args) \
+  MOZ_LOG(GetSriMetadataLog(), mozilla::LogLevel::Debug, args)
+#define SRIMETADATAERROR(args) \
+  MOZ_LOG(GetSriMetadataLog(), mozilla::LogLevel::Error, args)
+
+namespace mozilla::dom {
+
+SRIMetadata::SRIMetadata(const nsACString& aToken)
+    : mAlgorithmType(SRIMetadata::UNKNOWN_ALGORITHM), mEmpty(false) {
+  MOZ_ASSERT(!aToken.IsEmpty());  
+
+  SRIMETADATALOG(("SRIMetadata::SRIMetadata, aToken='%s'",
+                  PromiseFlatCString(aToken).get()));
+
+  int32_t hyphen = aToken.FindChar('-');
+  if (hyphen == -1) {
+    SRIMETADATAERROR(("SRIMetadata::SRIMetadata, invalid (no hyphen)"));
+    return;  
+  }
+
+  mAlgorithm = Substring(aToken, 0, hyphen);
+  uint32_t hashStart = hyphen + 1;
+  uint32_t hashEnd = aToken.Length();
+  if (hashStart >= aToken.Length()) {
+    SRIMETADATAERROR(("SRIMetadata::SRIMetadata, invalid (missing digest)"));
+    return;  
+  }
+
+  int32_t question = aToken.FindChar('?');
+  if (question != -1) {
+    MOZ_ASSERT(question > 0);
+    if (static_cast<uint32_t>(question) <= hashStart) {
+      SRIMETADATAERROR(
+          ("SRIMetadata::SRIMetadata, invalid (options w/o digest)"));
+      return;  
+    }
+    hashEnd = question;
+  }
+
+  if (!nsCSPParser::isValidBase64Value(NS_ConvertUTF8toUTF16(
+          Substring(aToken, hashStart, hashEnd - hashStart)))) {
+    SRIMETADATAERROR(
+        ("SRIMetadata::SRIMetadata, invalid (digest not in base64 format)"));
+    return;  
+  }
+
+  mHashes.AppendElement(Substring(aToken, hashStart, hashEnd - hashStart));
+
+  if (mAlgorithm.EqualsLiteral("sha256")) {
+    mAlgorithmType = nsICryptoHash::SHA256;
+  } else if (mAlgorithm.EqualsLiteral("sha384")) {
+    mAlgorithmType = nsICryptoHash::SHA384;
+  } else if (mAlgorithm.EqualsLiteral("sha512")) {
+    mAlgorithmType = nsICryptoHash::SHA512;
+  }
+
+  SRIMETADATALOG(("SRIMetadata::SRIMetadata, hash='%s'; alg='%s'",
+                  mHashes[0].get(), mAlgorithm.get()));
+}
+
+bool SRIMetadata::operator<(const SRIMetadata& aOther) const {
+  static_assert(nsICryptoHash::SHA256 < nsICryptoHash::SHA384,
+                "We rely on the order indicating relative alg strength");
+  static_assert(nsICryptoHash::SHA384 < nsICryptoHash::SHA512,
+                "We rely on the order indicating relative alg strength");
+  MOZ_ASSERT(mAlgorithmType == SRIMetadata::UNKNOWN_ALGORITHM ||
+             mAlgorithmType == nsICryptoHash::SHA256 ||
+             mAlgorithmType == nsICryptoHash::SHA384 ||
+             mAlgorithmType == nsICryptoHash::SHA512);
+  MOZ_ASSERT(aOther.mAlgorithmType == SRIMetadata::UNKNOWN_ALGORITHM ||
+             aOther.mAlgorithmType == nsICryptoHash::SHA256 ||
+             aOther.mAlgorithmType == nsICryptoHash::SHA384 ||
+             aOther.mAlgorithmType == nsICryptoHash::SHA512);
+
+  if (mEmpty) {
+    SRIMETADATALOG(("SRIMetadata::operator<, first metadata is empty"));
+    return true;  
+  }
+
+  SRIMETADATALOG(("SRIMetadata::operator<, alg1='%d'; alg2='%d'",
+                  mAlgorithmType, aOther.mAlgorithmType));
+  return (mAlgorithmType < aOther.mAlgorithmType);
+}
+
+bool SRIMetadata::operator>(const SRIMetadata& aOther) const {
+  MOZ_ASSERT(false);
+  return false;
+}
+
+SRIMetadata& SRIMetadata::operator+=(const SRIMetadata& aOther) {
+  MOZ_ASSERT(!aOther.IsEmpty() && !IsEmpty());
+  MOZ_ASSERT(aOther.IsValid() && IsValid());
+  MOZ_ASSERT(mAlgorithmType == aOther.mAlgorithmType);
+
+  MOZ_ASSERT(aOther.mHashes.Length() == 1);
+  if (mHashes.Length() < SRIMetadata::MAX_ALTERNATE_HASHES) {
+    SRIMETADATALOG((
+        "SRIMetadata::operator+=, appending another '%s' hash (new length=%zu)",
+        mAlgorithm.get(), mHashes.Length()));
+    mHashes.AppendElement(aOther.mHashes[0]);
+  }
+
+  MOZ_ASSERT(mHashes.Length() > 1);
+  MOZ_ASSERT(mHashes.Length() <= SRIMetadata::MAX_ALTERNATE_HASHES);
+  return *this;
+}
+
+bool SRIMetadata::operator==(const SRIMetadata& aOther) const {
+  if (IsEmpty() || !IsValid()) {
+    return false;
+  }
+  return mAlgorithmType == aOther.mAlgorithmType;
+}
+
+void SRIMetadata::GetHash(uint32_t aIndex, nsCString* outHash) const {
+  MOZ_ASSERT(aIndex < SRIMetadata::MAX_ALTERNATE_HASHES);
+  if (NS_WARN_IF(aIndex >= mHashes.Length())) {
+    *outHash = nullptr;
+    return;
+  }
+  *outHash = mHashes[aIndex];
+}
+
+void SRIMetadata::GetHashType(int8_t* outType, uint32_t* outLength) const {
+  switch (mAlgorithmType) {
+    case nsICryptoHash::SHA256:
+      *outLength = SHA256_LENGTH;
+      break;
+    case nsICryptoHash::SHA384:
+      *outLength = SHA384_LENGTH;
+      break;
+    case nsICryptoHash::SHA512:
+      *outLength = SHA512_LENGTH;
+      break;
+    default:
+      *outLength = 0;
+  }
+  *outType = mAlgorithmType;
+}
+
+bool SRIMetadata::CanTrustBeDelegatedTo(const SRIMetadata& aOther) const {
+  if (IsEmpty()) {
+    return true;
+  }
+
+  if (aOther.IsEmpty()) {
+    return false;
+  }
+
+  if (mAlgorithmType != aOther.mAlgorithmType) {
+    return false;
+  }
+
+  if (mHashes.Length() != aOther.mHashes.Length()) {
+    return false;
+  }
+
+  for (const auto& hash : mHashes) {
+    if (!aOther.mHashes.Contains(hash)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+size_t SRIMetadata::SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const {
+  size_t bytes = aMallocSizeOf(this);
+
+  for (const auto& hash : mHashes) {
+    bytes += hash.SizeOfExcludingThisIfUnshared(aMallocSizeOf);
+  }
+
+  bytes += mIntegrityString.SizeOfExcludingThisIfUnshared(aMallocSizeOf);
+
+  bytes += mAlgorithm.SizeOfExcludingThisIfUnshared(aMallocSizeOf);
+
+  return bytes;
+}
+
+}  

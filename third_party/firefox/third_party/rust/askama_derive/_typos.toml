@@ -1,0 +1,27 @@
+[default]
+locale = "en-us"
+
+[files]
+extend-exclude = [
+    "book/ethicalads-theme.css",
+    "fuzzing/fuzz/artifacts/",
+    "fuzzing/fuzz/corpus/",
+    "target/",
+    "askama_parser/tests/*.txt",
+    "testing/templates/fuzzed-*",
+    "askama_parser/benches",
+    "askama_derive_standalone/benches",
+    "*/benches/strings.inc",
+    "testing/tests/gen_ws_tests.py",
+]
+
+[default.extend-words]
+Enquiry = "Enquiry"
+
+exemple = "exemple"
+existant = "existant"
+
+Ba = "Ba"
+fo = "fo"
+Fo = "Fo"
+sur = "sur"

@@ -1,0 +1,445 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef nsIContent_h_
+#define nsIContent_h_
+
+#include "mozilla/FlushType.h"
+#include "nsINode.h"
+#include "nsStringFwd.h"
+
+class nsIURI;
+class nsIFrame;
+
+namespace mozilla {
+enum class IsFocusableFlags : uint8_t;
+class EventChainPreVisitor;
+class HTMLEditor;
+struct URLExtraData;
+namespace dom {
+struct BindContext;
+class CharacterDataBuffer;
+class CustomElementRegistry;
+struct UnbindContext;
+class ShadowRoot;
+class HTMLSlotElement;
+}  
+namespace widget {
+enum class IMEEnabled;
+struct IMEState;
+}  
+}  
+
+struct Focusable {
+  bool mFocusable = false;
+  int32_t mTabIndex = -1;
+  explicit operator bool() const { return mFocusable; }
+  [[nodiscard]] bool IsTabbable() const { return mFocusable && mTabIndex >= 0; }
+};
+
+#define NS_ICONTENT_IID \
+  {0x8e1bab9d, 0x8815, 0x4d2c, {0xa2, 0x4d, 0x7a, 0xba, 0x52, 0x39, 0xdc, 0x22}}
+
+class nsIContent : public nsINode {
+ public:
+  using IMEEnabled = mozilla::widget::IMEEnabled;
+  using IMEState = mozilla::widget::IMEState;
+  using BindContext = mozilla::dom::BindContext;
+  using UnbindContext = mozilla::dom::UnbindContext;
+
+  void ConstructUbiNode(void* storage) override;
+
+#ifdef MOZILLA_INTERNAL_API
+
+  explicit nsIContent(already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo)
+      : nsINode(std::move(aNodeInfo)) {
+    MOZ_ASSERT(mNodeInfo);
+    MOZ_ASSERT(static_cast<nsINode*>(this) == reinterpret_cast<nsINode*>(this));
+    SetNodeIsContent();
+  }
+#endif  // MOZILLA_INTERNAL_API
+
+  NS_INLINE_DECL_STATIC_IID(NS_ICONTENT_IID)
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_IMETHOD_(void) DeleteCycleCollectable(void) final;
+
+  NS_DECL_CYCLE_COLLECTION_CLASS(nsIContent)
+
+  NS_DECL_DOMARENA_DESTROY
+
+  NS_IMPL_FROMNODE_HELPER(nsIContent, IsContent())
+
+  virtual nsresult BindToTree(BindContext&, nsINode& aParent) = 0;
+
+  virtual void UnbindFromTree(UnbindContext&) = 0;
+  void UnbindFromTree(nsINode* aNewParent = nullptr,
+                      const BatchRemovalState* aBatchState = nullptr);
+
+  enum {
+    eAllChildren = 0,
+
+    eSkipPlaceholderContent = 1 << 0,
+
+    eSkipDocumentLevelNativeAnonymousContent = 1 << 1,
+  };
+
+  void SetIsNativeAnonymousRoot() {
+    SetFlags(NODE_IS_IN_NATIVE_ANONYMOUS_SUBTREE |
+             NODE_IS_NATIVE_ANONYMOUS_ROOT);
+  }
+
+  nsIContent* FindFirstNonChromeOnlyAccessContent() const;
+
+  inline bool IsInHTMLDocument() const;
+
+  inline bool IsInChromeDocument() const;
+
+  inline int32_t GetNameSpaceID() const { return mNodeInfo->NamespaceID(); }
+
+  inline bool IsHTMLElement() const {
+    return IsInNamespace(kNameSpaceID_XHTML);
+  }
+
+  inline bool IsHTMLElement(const nsAtom* aTag) const {
+    return mNodeInfo->Equals(aTag, kNameSpaceID_XHTML);
+  }
+
+  template <typename First, typename... Args>
+  inline bool IsAnyOfHTMLElements(First aFirst, Args... aArgs) const {
+    return IsHTMLElement() && IsNodeInternal(aFirst, aArgs...);
+  }
+
+  inline bool IsSVGElement() const { return IsInNamespace(kNameSpaceID_SVG); }
+
+  inline bool IsSVGElement(const nsAtom* aTag) const {
+    return mNodeInfo->Equals(aTag, kNameSpaceID_SVG);
+  }
+
+  template <typename First, typename... Args>
+  inline bool IsAnyOfSVGElements(First aFirst, Args... aArgs) const {
+    return IsSVGElement() && IsNodeInternal(aFirst, aArgs...);
+  }
+
+  inline bool IsXULElement() const { return IsInNamespace(kNameSpaceID_XUL); }
+
+  inline bool IsXULElement(const nsAtom* aTag) const {
+    return mNodeInfo->Equals(aTag, kNameSpaceID_XUL);
+  }
+
+  template <typename First, typename... Args>
+  inline bool IsAnyOfXULElements(First aFirst, Args... aArgs) const {
+    return IsXULElement() && IsNodeInternal(aFirst, aArgs...);
+  }
+
+  inline bool IsMathMLElement() const {
+    return IsInNamespace(kNameSpaceID_MathML);
+  }
+
+  inline bool IsMathMLElement(const nsAtom* aTag) const {
+    return mNodeInfo->Equals(aTag, kNameSpaceID_MathML);
+  }
+
+  template <typename First, typename... Args>
+  inline bool IsAnyOfMathMLElements(First aFirst, Args... aArgs) const {
+    return IsMathMLElement() && IsNodeInternal(aFirst, aArgs...);
+  }
+
+  virtual const mozilla::dom::CharacterDataBuffer* GetCharacterDataBuffer()
+      const = 0;
+
+  virtual uint32_t TextLength() const = 0;
+
+  bool IsEventAttributeName(nsAtom* aName);
+
+  virtual bool IsEventAttributeNameInternal(nsAtom* aName) { return false; }
+
+  virtual bool TextIsOnlyWhitespace() = 0;
+
+  virtual bool ThreadSafeTextIsOnlyWhitespace() const = 0;
+
+  virtual Focusable IsFocusableWithoutStyle(
+      mozilla::IsFocusableFlags = mozilla::IsFocusableFlags(0));
+
+  mozilla::dom::Element* GetFocusDelegate(mozilla::IsFocusableFlags) const;
+
+  mozilla::dom::Element* GetAutofocusDelegate(mozilla::IsFocusableFlags) const;
+
+  virtual IMEState GetDesiredIMEState();
+
+  [[nodiscard]] mozilla::dom::HTMLSlotElement* GetAssignedSlot() const {
+    const nsExtendedContentSlots* slots = GetExistingExtendedContentSlots();
+    return slots ? slots->mAssignedSlot.get() : nullptr;
+  }
+
+  [[nodiscard]] mozilla::dom::HTMLSlotElement* GetAssignedSlotForSelection()
+      const;
+
+  template <TreeKind aKind>
+  [[nodiscard]] mozilla::dom::HTMLSlotElement* GetAssignedSlot() const {
+    if constexpr (aKind == TreeKind::DOM ||
+                  aKind == TreeKind::ShadowIncludingDOM) {
+      return nullptr;  
+    } else if constexpr (aKind == TreeKind::FlatForSelection) {
+      return GetAssignedSlotForSelection();
+    } else if constexpr (aKind == TreeKind::Flat) {
+      return GetAssignedSlot();
+    } else {
+      MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE("Handle the new TreeKind value");
+    }
+  }
+
+  void SetAssignedSlot(mozilla::dom::HTMLSlotElement* aSlot);
+
+  mozilla::dom::HTMLSlotElement* GetAssignedSlotByMode() const;
+
+  mozilla::dom::HTMLSlotElement* GetManualSlotAssignment() const {
+    const nsExtendedContentSlots* slots = GetExistingExtendedContentSlots();
+    return slots ? slots->mManualSlotAssignment : nullptr;
+  }
+
+  void SetManualSlotAssignment(mozilla::dom::HTMLSlotElement* aSlot) {
+    MOZ_ASSERT(aSlot || GetExistingExtendedContentSlots());
+    ExtendedContentSlots()->mManualSlotAssignment = aSlot;
+  }
+
+  inline nsIContent* GetFlattenedTreeParent() const;
+
+  bool CanStartSelectionAsWebCompatHack() const;
+
+ protected:
+  inline void HandleInsertionToOrRemovalFromSlot();
+
+  inline void HandleShadowDOMRelatedInsertionSteps(bool aHadParent);
+
+  inline void HandleShadowDOMRelatedRemovalSteps(bool aNullParent);
+
+ public:
+  virtual void DoneCreatingElement() {}
+
+  virtual void DoneAddingChildren(bool aHaveNotified) {}
+
+  static inline bool RequiresDoneCreatingElement(int32_t aNamespace,
+                                                 nsAtom* aName) {
+    if (aNamespace == kNameSpaceID_XHTML) {
+      if (aName == nsGkAtoms::input || aName == nsGkAtoms::button ||
+          aName == nsGkAtoms::audio || aName == nsGkAtoms::video) {
+        MOZ_ASSERT(!RequiresDoneAddingChildren(aNamespace, aName),
+                   "Both DoneCreatingElement and DoneAddingChildren on a "
+                   "same element isn't supported.");
+        return true;
+      }
+      if (aName->IsDynamic()) {
+        nsDependentString name(aName->GetUTF16String());
+        return name.Contains('-');
+      }
+    }
+    return false;
+  }
+
+  static inline bool RequiresDoneAddingChildren(int32_t aNamespace,
+                                                nsAtom* aName) {
+    return (aNamespace == kNameSpaceID_XHTML &&
+            (aName == nsGkAtoms::select || aName == nsGkAtoms::textarea ||
+             aName == nsGkAtoms::head || aName == nsGkAtoms::title ||
+             aName == nsGkAtoms::object || aName == nsGkAtoms::output)) ||
+           (aNamespace == kNameSpaceID_SVG && aName == nsGkAtoms::title) ||
+           (aNamespace == kNameSpaceID_XUL && aName == nsGkAtoms::linkset);
+  }
+
+  nsAtom* GetID() const {
+    if (HasID()) {
+      return DoGetID();
+    }
+    return nullptr;
+  }
+
+  virtual void UpdateEditableState(bool aNotify);
+
+  virtual void DestroyContent() {}
+
+  virtual void SaveSubtreeState() = 0;
+
+  nsIFrame* GetPrimaryFrame() const { return mPrimaryFrame; }
+
+  nsIFrame* GetPrimaryFrame(mozilla::FlushType aType);
+
+  [[nodiscard]] bool IsSelectable() const;
+
+  inline void SetPrimaryFrame(nsIFrame* aFrame);
+
+  nsresult LookupNamespaceURIInternal(const nsAString& aNamespacePrefix,
+                                      nsAString& aNamespaceURI) const;
+
+  bool HasIndependentSelection() const;
+
+  mozilla::dom::Element* GetEditingHost() const;
+
+  nsIContent* GetInclusiveEditableAncestor() const;
+
+  bool SupportsLangAttr() const {
+    return IsHTMLElement() || IsSVGElement() || IsXULElement();
+  }
+
+  nsAtom* GetLang() const;
+
+  bool GetLang(nsAString& aResult) const {
+    if (auto* lang = GetLang()) {
+      aResult.Assign(nsDependentAtomString(lang));
+      return true;
+    }
+
+    return false;
+  }
+
+  nsIURI* GetBaseURI(bool aTryUseXHRDocBaseURI = false) const override;
+
+  nsIURI* GetBaseURIForStyleAttr() const;
+
+  already_AddRefed<mozilla::URLExtraData> GetURLDataForStyleAttr(
+      nsIPrincipal* aSubjectPrincipal = nullptr) const;
+
+  void GetEventTargetParent(mozilla::EventChainPreVisitor& aVisitor) override;
+
+  void UpdateHeadingElementsOffsetChange();
+
+  bool IsPurple() const { return mRefCnt.IsPurple(); }
+
+  void RemovePurple() { mRefCnt.RemovePurple(); }
+
+  bool OwnedOnlyByTheDOMAndFrameTrees() {
+    return OwnedOnlyByTheDOMTree(GetPrimaryFrame() ? 1 : 0);
+  }
+
+  bool OwnedOnlyByTheDOMTree(uint32_t aExpectedRefs = 0) {
+    uint32_t rc = mRefCnt.get();
+    if (GetParent()) {
+      --rc;
+    }
+    rc -= GetChildCount();
+    return rc == aExpectedRefs;
+  }
+
+ protected:
+  class nsExtendedContentSlots {
+   public:
+    nsExtendedContentSlots();
+    virtual ~nsExtendedContentSlots();
+
+    virtual void TraverseExtendedSlots(nsCycleCollectionTraversalCallback&);
+    virtual void UnlinkExtendedSlots(nsIContent&);
+
+    virtual size_t SizeOfExcludingThis(
+        mozilla::MallocSizeOf aMallocSizeOf) const;
+
+    RefPtr<mozilla::dom::HTMLSlotElement> mAssignedSlot;
+
+    mozilla::dom::HTMLSlotElement* mManualSlotAssignment = nullptr;
+  };
+
+  class nsContentSlots : public nsINode::nsSlots {
+   public:
+    nsContentSlots() : mExtendedSlots(0) {}
+
+    ~nsContentSlots() {
+      if (!(mExtendedSlots & sNonOwningExtendedSlotsFlag)) {
+        nsExtendedContentSlots* extSlots = GetExtendedContentSlots();
+        if (extSlots) {
+          extSlots->~nsExtendedContentSlots();
+          free(extSlots);
+        }
+      }
+    }
+
+    void Traverse(nsCycleCollectionTraversalCallback& aCb) override {
+      nsINode::nsSlots::Traverse(aCb);
+      if (mExtendedSlots) {
+        GetExtendedContentSlots()->TraverseExtendedSlots(aCb);
+      }
+    }
+
+    void Unlink(nsINode& aNode) override {
+      nsINode::nsSlots::Unlink(aNode);
+      if (mExtendedSlots) {
+        GetExtendedContentSlots()->UnlinkExtendedSlots(*aNode.AsContent());
+      }
+    }
+
+    void SetExtendedContentSlots(nsExtendedContentSlots* aSlots, bool aOwning) {
+      mExtendedSlots = reinterpret_cast<uintptr_t>(aSlots);
+      if (!aOwning) {
+        mExtendedSlots |= sNonOwningExtendedSlotsFlag;
+      }
+    }
+
+    bool OwnsExtendedSlots() const {
+      return !(mExtendedSlots & sNonOwningExtendedSlotsFlag);
+    }
+
+    nsExtendedContentSlots* GetExtendedContentSlots() const {
+      return reinterpret_cast<nsExtendedContentSlots*>(
+          mExtendedSlots & ~sNonOwningExtendedSlotsFlag);
+    }
+
+   private:
+    static const uintptr_t sNonOwningExtendedSlotsFlag = 1u;
+
+    uintptr_t mExtendedSlots;
+  };
+
+  nsContentSlots* CreateSlots() override;
+
+  nsContentSlots* ContentSlots() {
+    return static_cast<nsContentSlots*>(Slots());
+  }
+
+  const nsContentSlots* GetExistingContentSlots() const {
+    return static_cast<nsContentSlots*>(GetExistingSlots());
+  }
+
+  nsContentSlots* GetExistingContentSlots() {
+    return static_cast<nsContentSlots*>(GetExistingSlots());
+  }
+
+  virtual nsExtendedContentSlots* CreateExtendedSlots();
+
+  const nsExtendedContentSlots* GetExistingExtendedContentSlots() const {
+    const nsContentSlots* slots = GetExistingContentSlots();
+    return slots ? slots->GetExtendedContentSlots() : nullptr;
+  }
+
+  nsExtendedContentSlots* GetExistingExtendedContentSlots() {
+    nsContentSlots* slots = GetExistingContentSlots();
+    return slots ? slots->GetExtendedContentSlots() : nullptr;
+  }
+
+  nsExtendedContentSlots* ExtendedContentSlots() {
+    nsContentSlots* slots = ContentSlots();
+    if (!slots->GetExtendedContentSlots()) {
+      slots->SetExtendedContentSlots(CreateExtendedSlots(), true);
+    }
+    return slots->GetExtendedContentSlots();
+  }
+
+  nsAtom* DoGetID() const;
+
+  ~nsIContent() = default;
+
+ public:
+#if defined(DEBUG) || defined(MOZ_DUMP_PAINTING)
+#  define MOZ_DOM_LIST
+#endif
+
+#ifdef MOZ_DOM_LIST
+  void Dump();
+
+  virtual void List(FILE* out = stdout, int32_t aIndent = 0) const = 0;
+
+  virtual void DumpContent(FILE* out = stdout, int32_t aIndent = 0,
+                           bool aDumpAll = true) const = 0;
+#endif
+};
+
+NON_VIRTUAL_ADDREF_RELEASE(nsIContent)
+
+#endif /* nsIContent_h_ */

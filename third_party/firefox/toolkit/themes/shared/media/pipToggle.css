@@ -1,0 +1,360 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+
+.controlsOverlay[hidetoggle="true"].hovering > .pip-wrapper:not(.hovering) {
+  opacity: 0 !important;
+}
+
+.pip-wrapper {
+  position: absolute;
+  cursor: pointer;
+  -moz-appearance: none;
+  background: none;
+  color: inherit;
+  border: none;
+  text-align: unset;
+  top: calc(70% - 40px);
+  opacity: 0;
+  padding-inline: 0;
+  transition: opacity 200ms;
+  --pip-icon-size: 24px;
+  --pip-icon-width-with-margins: calc(2 * var(--pip-toggle-margin) + var(--pip-icon-size));
+  --pip-highlight-style: solid rgba(0, 254, 255, 1);
+  --pip-highlight-width: 2px;
+  --pip-toggle-distanceFromVideoEdge: 18px;
+  --pip-toggle-focus-outline-offset: 1px;
+  --pip-toggle-margin: 8px;
+  --pip-border-radius-toggle: 4px;
+  --pip-box-shadow-default: 0 0 4px rgba(255, 255, 255, 0.9);
+  --pip-box-shadow-hover: 0 0 10px rgba(255, 255, 255, 0.7);
+  --pip-expanded-height: 40px;
+  --pip-expanded-min-width: 200px;
+  --pip-expanded-max-width: max-content;
+}
+
+.pip-wrapper[has-used],
+.pip-wrapper[small-video] {
+  height: var(--pip-icon-width-with-margins);
+  width: var(--pip-icon-width-with-margins);
+  border-radius: var(--pip-border-radius-toggle);
+  margin-right: calc(var(--pip-icon-width-with-margins) * -1);
+}
+
+.pip-wrapper[policy="hidden"] {
+  display: none;
+}
+
+.pip-wrapper[policy="top"] {
+  top: 0%;
+  translate: var(--pip-toggle-translate-x);
+}
+
+.pip-wrapper[policy="one-quarter"] {
+  top: 25%;
+}
+
+.pip-wrapper[policy="middle"] {
+  top: 50%;
+}
+
+.pip-wrapper[policy="three-quarters"] {
+  top: 75%;
+}
+
+.pip-wrapper[policy="bottom"] {
+  top: 100%;
+  translate: var(--pip-toggle-translate-x) -100%;
+}
+
+.pip-wrapper[medium-video] > .pip-expanded > .pip-icon-label > .pip-label {
+  font-size: 13px;
+}
+
+.pip-wrapper[medium-video] > .pip-expanded {
+  font-size: 11px;
+}
+
+.pip-wrapper[position="right"] {
+  right: calc(var(--pip-icon-width-with-margins) + var(--pip-toggle-distanceFromVideoEdge));
+}
+
+.pip-wrapper[position="right"] > .pip-expanded {
+  translate: calc(-100% + var(--pip-icon-width-with-margins));
+  transform-origin: right;
+}
+
+.pip-wrapper[position="left"] {
+  left: var(--pip-toggle-distanceFromVideoEdge);
+}
+
+.pip-expanded,
+.pip-small,
+.pip-icon,
+.pip-explainer {
+  position: absolute;
+  left: 0;
+  top: 0;
+}
+
+.pip-wrapper > .pip-expanded {
+  display: flex;
+  opacity: 0;
+  align-items: center;
+  scale: 0.33 1;
+  font-size: 14px;
+}
+
+.pip-wrapper:not([small-video], [has-used]) > .pip-small {
+  opacity: 0;
+  transition: opacity 200ms;
+}
+
+.pip-wrapper:not([small-video], [has-used]) > .pip-expanded {
+  opacity: 1;
+  scale: 1;
+  pointer-events: none;
+}
+
+.pip-wrapper:not([small-video], [has-used]).hovering > .pip-expanded {
+  pointer-events: auto;
+}
+
+.pip-icon {
+  top: 8px;
+  left: 8px;
+  pointer-events: none;
+  background-image: url("chrome://global/skin/media/picture-in-picture-open.svg");
+  background-position: center, center;
+  background-repeat: no-repeat;
+  background-size: var(--pip-icon-size) var(--pip-icon-size);
+  -moz-context-properties: fill;
+  fill: currentColor;
+  height: var(--pip-icon-size);
+  width: var(--pip-icon-size);
+}
+
+.videocontrols[localedir="rtl"] .pip-icon {
+  transform: scaleX(-1);
+}
+
+.pip-wrapper[position="left"] > .pip-expanded > .pip-icon-label > .pip-label {
+  margin-left: var(--pip-icon-width-with-margins);
+  margin-right: var(--pip-toggle-margin);
+}
+
+.pip-small {
+  width: 40px;
+  height: 40px;
+}
+
+.pip-wrapper[position="left"] > .pip-expanded > .pip-icon-label > .pip-icon {
+  display: none;
+}
+
+.pip-wrapper:is([small-video], [has-used]) > .pip-expanded,
+.pip-wrapper[position="right"]:not([small-video], [has-used]) > .pip-icon {
+  display: none;
+}
+
+.pip-wrapper[position="right"] > .pip-expanded > .pip-icon-label > .pip-icon {
+  position: relative;
+  top: 0;
+  left: 0;
+  display: inline-block;
+}
+
+.pip-wrapper[position="right"] > .pip-expanded > .pip-icon-label {
+  display: flex;
+  flex-direction: row;
+  align-content: center;
+}
+
+.pip-wrapper[position="right"] > .pip-expanded > .pip-icon-label > .pip-icon,
+.pip-wrapper[position="right"] > .pip-expanded > .pip-icon-label > .pip-label {
+  margin-block: auto;
+}
+
+.pip-wrapper[position="right"] > .pip-expanded > .pip-icon-label > .pip-icon {
+  margin-inline: var(--pip-toggle-margin);
+}
+
+.pip-wrapper[position="right"] > .pip-expanded > .pip-icon-label > .pip-label {
+  margin-right: var(--pip-toggle-margin);
+}
+
+@media (prefers-reduced-motion) {
+  .pip-wrapper,
+  .pip-expanded,
+  .pip-small,
+  .pip-explainer {
+    transition: none !important;
+  }
+}
+
+
+.controlsOverlay:not(.experiment).hovering > .pip-wrapper:not(:focus-visible) {
+  opacity: 0.8;
+}
+
+.controlsOverlay:not(.experiment).hovering > .pip-wrapper.hovering {
+  opacity: 1;
+}
+
+.pip-wrapper:not([policy="hidden"], .experiment):focus-visible {
+  opacity: 1;
+}
+
+.pip-wrapper:not([policy="hidden"], [has-used], .experiment):focus-visible {
+  outline: none;
+}
+
+.pip-wrapper[has-used]:not([policy="hidden"], .experiment):focus-visible {
+  outline: var(--control-focus-outline);
+}
+
+.pip-wrapper:not(.experiment) > .pip-small {
+  background-color: rgba(12, 12, 13, 0.65);
+  box-shadow: 0 4px 4px rgba(12, 12, 13, 0.25);
+  border-radius: var(--pip-border-radius-toggle);
+}
+
+.pip-wrapper:not(.experiment) > .pip-expanded,
+.pip-wrapper:not(.experiment) > .pip-small {
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-sizing: border-box;
+}
+
+.pip-wrapper:not([has-used], .experiment) > .pip-small {
+  border: var(--pip-highlight-width) var(--pip-highlight-style);
+}
+
+.pip-wrapper:not(.experiment) > .pip-expanded {
+  border: var(--pip-highlight-width) var(--pip-highlight-style);
+  transition:
+    opacity 250ms,
+    scale 200ms;
+  height: var(--pip-expanded-height);
+  background-color: rgba(12, 12, 13, 0.9);
+  box-shadow: 0 4px 4px rgba(12, 12, 13, 0.25);
+  width: var(--pip-expanded-max-width);
+  min-width: var(--pip-expanded-min-width);
+  border-radius: 8px;
+}
+
+.pip-wrapper:not(.experiment).hovering > .pip-expanded {
+  box-shadow: none;
+  border: var(--pip-highlight-width) var(--pip-highlight-style);
+  border-bottom: none;
+  padding-bottom: var(--pip-highlight-width);
+}
+
+.pip-wrapper:not([small-video], [has-used], .experiment).hovering > .pip-expanded {
+  border-bottom-right-radius: 0;
+  border-bottom-left-radius: 0;
+}
+
+.pip-wrapper:not(.experiment) > .pip-expanded > .pip-explainer {
+  padding: 6px 16px 8px 8px;
+  translate: 0;
+  transition:
+    opacity 250ms,
+    translate 190ms;
+  transition-timing-function: cubic-bezier(0.07, 0.95, 0, 1);
+  background: rgba(12, 12, 13, 0.65);
+  border-bottom-right-radius: 8px;
+  border-bottom-left-radius: 8px;
+  border: var(--pip-highlight-width) var(--pip-highlight-style);
+  border-top: 0;
+  box-shadow: 0 4px 4px rgba(12, 12, 13, 0.25);
+  opacity: 0;
+  margin-inline: calc(-1 * var(--pip-highlight-width));
+  width: calc(100% - 24px);
+  word-break: break-word;
+  pointer-events: none;
+  user-select: none;
+}
+
+.videocontrols[localedir="rtl"] .pip-wrapper:not(.experiment) > .pip-explainer {
+  text-align: right;
+  direction: rtl;
+}
+
+.pip-wrapper:not(.experiment).hovering > .pip-expanded > .pip-explainer {
+  pointer-events: auto;
+  opacity: 1;
+  translate: 0 calc(40px - var(--pip-highlight-width));
+}
+
+
+.controlsContainer.experiment {
+  --control-focus-outline: 2px solid #0060df;
+}
+
+.pip-wrapper.experiment > .pip-expanded > .pip-icon-label > .pip-label {
+  font-size: min(16px, 1.4em);
+}
+
+.controlsOverlay.experiment.hovering > .pip-wrapper {
+  opacity: 1;
+}
+
+.pip-wrapper.experiment:not([policy="hidden"]):focus-visible {
+  opacity: 1;
+  outline: none;
+}
+
+.pip-wrapper.experiment:is([has-used], [small-video]):not([policy="hidden"]):focus-visible > .pip-small,
+.pip-wrapper.experiment:not([policy="hidden"], [has-used]):focus-visible > .pip-expanded {
+  outline: var(--control-focus-outline);
+  outline-offset: var(--pip-toggle-focus-outline-offset);
+}
+
+.pip-wrapper.experiment > .pip-expanded > .pip-explainer {
+  display: none;
+}
+
+.pip-wrapper.experiment > .pip-small {
+  border-radius: var(--pip-border-radius-toggle);
+  transition: background-color 200ms;
+}
+
+.pip-wrapper.experiment > .pip-expanded {
+  transition:
+    opacity 250ms,
+    scale 200ms,
+    translate 190ms,
+    background-color 200ms;
+  height: var(--pip-expanded-height);
+  width: var(--pip-expanded-max-width);
+  min-width: var(--pip-expanded-min-width);
+  border-radius: var(--pip-border-radius-toggle);
+}
+
+.pip-wrapper.experiment > .pip-small,
+.pip-wrapper.experiment > .pip-expanded {
+  background-color: rgba(0, 0, 0, 0.7);
+  box-sizing: border-box;
+}
+
+.pip-wrapper.experiment.hovering > .pip-small,
+.pip-wrapper.experiment.hovering > .pip-expanded {
+  background-color: rgba(0, 0, 0, 1);
+}
+
+.pip-wrapper.experiment:not([policy="hidden"], :focus-visible) > .pip-small,
+.pip-wrapper.experiment:not([policy="hidden"], :focus-visible) > .pip-expanded {
+  box-shadow: var(--pip-box-shadow-default);
+}
+
+.pip-wrapper.experiment:not([policy="hidden"], :focus-visible).hovering > .pip-small,
+.pip-wrapper.experiment:not([policy="hidden"], :focus-visible).hovering > .pip-expanded {
+  box-shadow: var(--pip-box-shadow-hover);
+}
+
+.pip-wrapper.experiment:not([policy="hidden"]):focus-visible > .pip-small,
+.pip-wrapper.experiment:not([policy="hidden"]):focus-visible > .pip-expanded {
+  box-shadow: 0 0 10px rgba(0, 96, 223, 0.9);
+}

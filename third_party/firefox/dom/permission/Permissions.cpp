@@ -1,0 +1,187 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/Permissions.h"
+
+#include "PermissionUtils.h"
+#include "mozilla/StaticPrefs_network.h"
+#include "mozilla/StaticPrefs_permissions.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/MidiPermissionStatus.h"
+#include "mozilla/dom/PermissionSetParametersBinding.h"
+#include "mozilla/dom/PermissionStatus.h"
+#include "mozilla/dom/PermissionsBinding.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/RootedDictionary.h"
+#include "mozilla/dom/StorageAccessPermissionStatus.h"
+
+namespace mozilla::dom {
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(Permissions)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(Permissions)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(Permissions)
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE_0(Permissions)
+
+Permissions::Permissions(nsIGlobalObject* aGlobal)
+    : GlobalTeardownObserver(aGlobal) {}
+
+Permissions::~Permissions() = default;
+
+JSObject* Permissions::WrapObject(JSContext* aCx,
+                                  JS::Handle<JSObject*> aGivenProto) {
+  return Permissions_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+namespace {
+
+RefPtr<PermissionStatus> CreatePermissionStatus(
+    JSContext* aCx, JS::Handle<JSObject*> aPermissionDesc,
+    nsIGlobalObject* aGlobal, ErrorResult& aRv) {
+  PermissionDescriptor rootDesc;
+  JS::Rooted<JS::Value> permissionDescValue(
+      aCx, JS::ObjectOrNullValue(aPermissionDesc));
+  if (NS_WARN_IF(!rootDesc.Init(aCx, permissionDescValue))) {
+    aRv.NoteJSContextException(aCx);
+    return nullptr;
+  }
+
+  switch (rootDesc.mName) {
+    case PermissionName::Midi: {
+      MidiPermissionDescriptor midiPerm;
+      if (NS_WARN_IF(!midiPerm.Init(aCx, permissionDescValue))) {
+        aRv.NoteJSContextException(aCx);
+        return nullptr;
+      }
+
+      return MakeRefPtr<MidiPermissionStatus>(aGlobal, midiPerm.mSysex);
+    }
+    case PermissionName::Storage_access:
+      return MakeRefPtr<StorageAccessPermissionStatus>(aGlobal);
+    case PermissionName::Geolocation:
+    case PermissionName::Notifications:
+    case PermissionName::Push:
+    case PermissionName::Persistent_storage:
+    case PermissionName::Screen_wake_lock:
+      return MakeRefPtr<PermissionStatus>(aGlobal, rootDesc.mName);
+    case PermissionName::Camera:
+      if (!StaticPrefs::permissions_media_query_enabled()) {
+        aRv.ThrowTypeError(
+            "'camera' (value of 'name' member of PermissionDescriptor) is not "
+            "a valid value for enumeration PermissionName.");
+        return nullptr;
+      }
+      return MakeRefPtr<PermissionStatus>(aGlobal, rootDesc.mName);
+    case PermissionName::Microphone:
+      if (!StaticPrefs::permissions_media_query_enabled()) {
+        aRv.ThrowTypeError(
+            "'microphone' (value of 'name' member of PermissionDescriptor) is "
+            "not a valid value for enumeration PermissionName.");
+        return nullptr;
+      }
+      return MakeRefPtr<PermissionStatus>(aGlobal, rootDesc.mName);
+    case PermissionName::Loopback_network:
+      if (!StaticPrefs::network_lna_blocking()) {
+        aRv.ThrowTypeError(
+            "'loopback-network' (value of 'name' member of "
+            "PermissionDescriptor) is not a valid value for enumeration "
+            "PermissionName.");
+        return nullptr;
+      }
+      return MakeRefPtr<PermissionStatus>(aGlobal, rootDesc.mName);
+    case PermissionName::Local_network:
+      if (!StaticPrefs::network_lna_blocking()) {
+        aRv.ThrowTypeError(
+            "'local-network' (value of 'name' member of PermissionDescriptor) "
+            "is not a valid value for enumeration PermissionName.");
+        return nullptr;
+      }
+      return MakeRefPtr<PermissionStatus>(aGlobal, rootDesc.mName);
+    default:
+      MOZ_ASSERT_UNREACHABLE("Unhandled type");
+      aRv.Throw(NS_ERROR_NOT_IMPLEMENTED);
+      return nullptr;
+  }
+}
+
+}  
+
+already_AddRefed<Promise> Permissions::Query(JSContext* aCx,
+                                             JS::Handle<JSObject*> aPermission,
+                                             ErrorResult& aRv) {
+
+  nsCOMPtr<nsIGlobalObject> global = GetRelevantGlobal();
+  if (NS_WARN_IF(!global)) {
+    aRv.ThrowInvalidStateError("The context is not fully active.");
+    return nullptr;
+  }
+
+  if (NS_IsMainThread()) {
+    nsCOMPtr<nsPIDOMWindowInner> window = do_QueryInterface(global);
+    if (!window || !window->IsFullyActive()) {
+      aRv.ThrowInvalidStateError("The document is not fully active.");
+      return nullptr;
+    }
+  }
+
+  RefPtr<PermissionStatus> status =
+      CreatePermissionStatus(aCx, aPermission, global, aRv);
+  if (!status) {
+    return nullptr;
+  }
+
+  RefPtr<Promise> promise = Promise::Create(global, aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+
+  RefPtr<StrongWorkerRef> workerRef;
+  if (!NS_IsMainThread()) {
+    workerRef = StrongWorkerRef::Create(GetCurrentThreadWorkerPrivate(),
+                                        "Permissions::Query");
+    if (!workerRef) {
+      aRv.ThrowUnknownError("Invalid worker state");
+      return nullptr;
+    }
+  }
+
+  status->Init()->Then(
+      GetCurrentSerialEventTarget(), __func__,
+      [workerRef = std::move(workerRef), status, promise]() {
+        promise->MaybeResolve(status);
+        return;
+      },
+      [promise](nsresult aError) {
+        MOZ_ASSERT(NS_FAILED(aError));
+        NS_WARNING("Failed PermissionStatus creation");
+        promise->MaybeReject(aError);
+        return;
+      });
+
+  return promise.forget();
+}
+
+already_AddRefed<PermissionStatus> Permissions::ParseSetParameters(
+    JSContext* aCx, const PermissionSetParameters& aParameters,
+    ErrorResult& aRv) {
+
+
+  JS::Rooted<JSObject*> rootDesc(aCx, aParameters.mDescriptor);
+
+  RefPtr<PermissionStatus> status =
+      CreatePermissionStatus(aCx, rootDesc, nullptr, aRv);
+  if (aRv.Failed()) {
+    return nullptr;
+  }
+
+  status->SetState(aParameters.mState);
+
+  return status.forget();
+}
+
+}  

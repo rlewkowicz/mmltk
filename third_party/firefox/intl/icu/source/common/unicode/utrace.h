@@ -1,0 +1,158 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*******************************************************************************
+*
+*   Copyright (C) 2003-2013, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+*
+*******************************************************************************
+*   file name:  utrace.h
+*   encoding:   UTF-8
+*   tab size:   8 (not used)
+*   indentation:4
+*
+*   created on: 2003aug06
+*   created by: Markus W. Scherer
+*
+*   Definitions for ICU tracing/logging.
+*
+*/
+
+#ifndef __UTRACE_H__
+#define __UTRACE_H__
+
+#include <stdarg.h>
+#include "unicode/utypes.h"
+
+ 
+U_CDECL_BEGIN
+
+typedef enum UTraceLevel {
+    UTRACE_OFF=-1,
+    UTRACE_ERROR=0,
+    UTRACE_WARNING=3,
+    UTRACE_OPEN_CLOSE=5,
+    UTRACE_INFO=7,
+    UTRACE_VERBOSE=9
+} UTraceLevel;
+
+typedef enum UTraceFunctionNumber {
+    UTRACE_FUNCTION_START=0,
+    UTRACE_U_INIT=UTRACE_FUNCTION_START,
+    UTRACE_U_CLEANUP,
+
+#ifndef U_HIDE_DEPRECATED_API
+    UTRACE_FUNCTION_LIMIT,
+#endif  // U_HIDE_DEPRECATED_API
+
+    UTRACE_CONVERSION_START=0x1000,
+    UTRACE_UCNV_OPEN=UTRACE_CONVERSION_START,
+    UTRACE_UCNV_OPEN_PACKAGE,
+    UTRACE_UCNV_OPEN_ALGORITHMIC,
+    UTRACE_UCNV_CLONE,
+    UTRACE_UCNV_CLOSE,
+    UTRACE_UCNV_FLUSH_CACHE,
+    UTRACE_UCNV_LOAD,
+    UTRACE_UCNV_UNLOAD,
+
+#ifndef U_HIDE_DEPRECATED_API
+    UTRACE_CONVERSION_LIMIT,
+#endif  // U_HIDE_DEPRECATED_API
+
+    UTRACE_COLLATION_START=0x2000,
+    UTRACE_UCOL_OPEN=UTRACE_COLLATION_START,
+    UTRACE_UCOL_CLOSE,
+    UTRACE_UCOL_STRCOLL,
+    UTRACE_UCOL_GET_SORTKEY,
+    UTRACE_UCOL_GETLOCALE,
+    UTRACE_UCOL_NEXTSORTKEYPART,
+    UTRACE_UCOL_STRCOLLITER,
+    UTRACE_UCOL_OPEN_FROM_SHORT_STRING,
+    UTRACE_UCOL_STRCOLLUTF8, 
+
+#ifndef U_HIDE_DEPRECATED_API
+    UTRACE_COLLATION_LIMIT,
+#endif  // U_HIDE_DEPRECATED_API
+
+    UTRACE_UDATA_START=0x3000,
+
+    UTRACE_UDATA_RESOURCE=UTRACE_UDATA_START,
+
+    UTRACE_UDATA_BUNDLE,
+
+    UTRACE_UDATA_DATA_FILE,
+
+    UTRACE_UDATA_RES_FILE,
+
+#ifndef U_HIDE_INTERNAL_API
+    UTRACE_RES_DATA_LIMIT,
+#endif  // U_HIDE_INTERNAL_API
+
+    UTRACE_UBRK_START=0x4000,
+
+    UTRACE_UBRK_CREATE_CHARACTER = UTRACE_UBRK_START,
+
+    UTRACE_UBRK_CREATE_WORD,
+
+    UTRACE_UBRK_CREATE_LINE,
+
+    UTRACE_UBRK_CREATE_SENTENCE,
+
+    UTRACE_UBRK_CREATE_TITLE,
+
+    UTRACE_UBRK_CREATE_BREAK_ENGINE,
+
+#ifndef U_HIDE_INTERNAL_API
+    UTRACE_UBRK_LIMIT,
+#endif  // U_HIDE_INTERNAL_API
+
+} UTraceFunctionNumber;
+
+U_CAPI void U_EXPORT2
+utrace_setLevel(int32_t traceLevel);
+
+U_CAPI int32_t U_EXPORT2
+utrace_getLevel(void);
+
+
+typedef void U_CALLCONV
+UTraceEntry(const void *context, int32_t fnNumber);
+
+typedef void U_CALLCONV
+UTraceExit(const void *context, int32_t fnNumber, 
+           const char *fmt, va_list args);
+
+typedef void U_CALLCONV
+UTraceData(const void *context, int32_t fnNumber, int32_t level,
+           const char *fmt, va_list args);
+
+U_CAPI void U_EXPORT2
+utrace_setFunctions(const void *context,
+                    UTraceEntry *e, UTraceExit *x, UTraceData *d);
+
+U_CAPI void U_EXPORT2
+utrace_getFunctions(const void **context,
+                    UTraceEntry **e, UTraceExit **x, UTraceData **d);
+
+
+
+
+
+
+U_CAPI int32_t U_EXPORT2
+utrace_vformat(char *outBuf, int32_t capacity,
+              int32_t indent, const char *fmt,  va_list args);
+
+U_CAPI int32_t U_EXPORT2
+utrace_format(char *outBuf, int32_t capacity,
+              int32_t indent, const char *fmt,  ...);
+
+
+
+
+U_CAPI const char * U_EXPORT2
+utrace_functionName(int32_t fnNumber);
+
+U_CDECL_END
+
+#endif

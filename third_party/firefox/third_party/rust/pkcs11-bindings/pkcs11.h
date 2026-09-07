@@ -1,0 +1,90 @@
+/* Copyright (c) OASIS Open 2016,2019,2024. All Rights Reserved./
+ * /Distributed under the terms of the OASIS IPR Policy,
+ * [http://www.oasis-open.org/policies-guidelines/ipr], AS-IS, WITHOUT ANY
+ * IMPLIED OR EXPRESS WARRANTY; there is no warranty of MERCHANTABILITY, FITNESS FOR A
+ * PARTICULAR PURPOSE or NONINFRINGEMENT of the rights of others.
+ */
+
+
+#ifndef _PKCS11_H_
+#define _PKCS11_H_ 1
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
+
+#include "pkcs11t.h"
+
+#define __PASTE(x,y)      x##y
+
+
+
+#define CK_NEED_ARG_LIST  1
+#define CK_PKCS11_FUNCTION_INFO(name) \
+  extern CK_DECLARE_FUNCTION(CK_RV, name)
+
+#include "pkcs11f.h"
+
+#undef CK_NEED_ARG_LIST
+#undef CK_PKCS11_FUNCTION_INFO
+
+
+
+#define CK_NEED_ARG_LIST  1
+#define CK_PKCS11_FUNCTION_INFO(name) \
+  typedef CK_DECLARE_FUNCTION_POINTER(CK_RV, __PASTE(CK_,name))
+
+#include "pkcs11f.h"
+
+#undef CK_NEED_ARG_LIST
+#undef CK_PKCS11_FUNCTION_INFO
+
+
+
+#define CK_PKCS11_FUNCTION_INFO(name) \
+  __PASTE(CK_,name) name;
+
+struct CK_FUNCTION_LIST_3_2 {
+
+  CK_VERSION    version;  
+
+#include "pkcs11f.h"
+
+};
+
+#define CK_PKCS11_3_0_ONLY 1   /* don't include the 3.2 and later functions */
+
+struct CK_FUNCTION_LIST_3_0 {
+
+  CK_VERSION    version;  
+
+#include "pkcs11f.h"
+
+};
+
+#undef CK_PKCS11_3_0_ONLY
+
+#define CK_PKCS11_2_0_ONLY 1   /* don't include the 3.0 and later functions */
+
+struct CK_FUNCTION_LIST {
+
+  CK_VERSION    version;  
+
+#include "pkcs11f.h"
+
+};
+
+#undef CK_PKCS11_FUNCTION_INFO
+#undef CK_PKCS11_2_0_ONLY
+
+
+#undef __PASTE
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* _PKCS11_H_ */
+

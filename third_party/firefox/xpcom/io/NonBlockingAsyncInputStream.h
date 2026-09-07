@@ -1,0 +1,72 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef NonBlockingAsyncInputStream_h
+#define NonBlockingAsyncInputStream_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/Mutex.h"
+#include "nsCOMPtr.h"
+#include "nsIAsyncInputStream.h"
+#include "nsICloneableInputStream.h"
+#include "nsIIPCSerializableInputStream.h"
+#include "nsISeekableStream.h"
+
+
+namespace mozilla {
+
+class NonBlockingAsyncInputStream final : public nsIAsyncInputStream,
+                                          public nsICloneableInputStream,
+                                          public nsIIPCSerializableInputStream,
+                                          public nsISeekableStream {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIINPUTSTREAM
+  NS_DECL_NSIASYNCINPUTSTREAM
+  NS_DECL_NSICLONEABLEINPUTSTREAM
+  NS_DECL_NSIIPCSERIALIZABLEINPUTSTREAM
+  NS_DECL_NSISEEKABLESTREAM
+  NS_DECL_NSITELLABLESTREAM
+
+  static nsresult Create(already_AddRefed<nsIInputStream> aInputStream,
+                         nsIAsyncInputStream** aAsyncInputStream);
+
+ private:
+  explicit NonBlockingAsyncInputStream(
+      already_AddRefed<nsIInputStream> aInputStream);
+  ~NonBlockingAsyncInputStream();
+
+  class AsyncWaitRunnable;
+
+  void RunAsyncWaitCallback(AsyncWaitRunnable* aRunnable,
+                            already_AddRefed<nsIInputStreamCallback> aCallback);
+
+  nsCOMPtr<nsIInputStream> mInputStream;
+
+  nsICloneableInputStream* MOZ_NON_OWNING_REF mWeakCloneableInputStream;
+  nsIIPCSerializableInputStream* MOZ_NON_OWNING_REF
+      mWeakIPCSerializableInputStream;
+  nsISeekableStream* MOZ_NON_OWNING_REF mWeakSeekableInputStream;
+  nsITellableStream* MOZ_NON_OWNING_REF mWeakTellableInputStream;
+
+  Mutex mLock;
+
+  struct WaitClosureOnly {
+    WaitClosureOnly(AsyncWaitRunnable* aRunnable, nsIEventTarget* aEventTarget);
+
+    RefPtr<AsyncWaitRunnable> mRunnable;
+    nsCOMPtr<nsIEventTarget> mEventTarget;
+  };
+
+  Maybe<WaitClosureOnly> mWaitClosureOnly MOZ_GUARDED_BY(mLock);
+
+  RefPtr<AsyncWaitRunnable> mAsyncWaitCallback MOZ_GUARDED_BY(mLock);
+
+  bool mClosed MOZ_GUARDED_BY(mLock);
+};
+
+}  
+
+#endif  // NonBlockingAsyncInputStream_h

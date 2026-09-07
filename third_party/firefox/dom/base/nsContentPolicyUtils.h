@@ -1,0 +1,178 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef _nsContentPolicyUtils_h_
+#define _nsContentPolicyUtils_h_
+
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/dom/nsCSPService.h"
+#include "nsContentPolicyType.h"
+#include "nsContentUtils.h"
+#include "nsIContent.h"
+#include "nsIContentPolicy.h"
+#include "nsIURI.h"
+#include "nsPIDOMWindow.h"
+#include "nsPIDOMWindowInlines.h"  // FIXME: Stop including inline definitions!
+#include "nsServiceManagerUtils.h"
+#include "nsStringFwd.h"
+
+#include "mozilla/dom/Document.h"
+
+#define NS_CONTENTPOLICY_CONTRACTID "@mozilla.org/layout/content-policy;1"
+#define NS_CONTENTPOLICY_CATEGORY "content-policy"
+#define NS_CONTENTPOLICY_CID \
+  {0x0e3afd3d, 0xeb60, 0x4c2b, {0x96, 0x3b, 0x56, 0xd7, 0xc4, 0x39, 0xf1, 0x24}}
+
+#define NS_CP_ACCEPTED(val) ((val) == nsIContentPolicy::ACCEPT)
+
+#define NS_CP_REJECTED(val) ((val) != nsIContentPolicy::ACCEPT)
+
+
+#define CASE_RETURN(name)      \
+  case nsIContentPolicy::name: \
+    return #name
+
+inline const char* NS_CP_ResponseName(int16_t response) {
+  switch (response) {
+    CASE_RETURN(REJECT_REQUEST);
+    CASE_RETURN(REJECT_TYPE);
+    CASE_RETURN(REJECT_SERVER);
+    CASE_RETURN(REJECT_OTHER);
+    CASE_RETURN(ACCEPT);
+    default:
+      return "<Unknown Response>";
+  }
+}
+
+inline const char* NS_CP_ContentTypeName(nsContentPolicyType contentType) {
+  switch (contentType) {
+#define TYPE_TO_STRING(name)      \
+  case nsContentPolicyType::name: \
+    return #name;
+    FOR_EACH_CONTENT_POLICY_TYPE(TYPE_TO_STRING)
+#undef TYPE_TO_STRING
+
+    case nsContentPolicyType::TYPE_INVALID:
+      break;
+
+  }
+  return "<Unknown Type>";
+}
+
+#undef CASE_RETURN
+
+inline const char* NS_CP_ContentTypeName(ExtContentPolicyType contentType) {
+  return NS_CP_ContentTypeName(static_cast<nsContentPolicyType>(contentType));
+}
+
+#define CHECK_CONTENT_POLICY(action)                          \
+  PR_BEGIN_MACRO                                              \
+  nsCOMPtr<nsIContentPolicy> policy =                         \
+      do_GetService(NS_CONTENTPOLICY_CONTRACTID);             \
+  if (!policy) return NS_ERROR_FAILURE;                       \
+                                                              \
+  return policy->action(contentLocation, loadInfo, decision); \
+  PR_END_MACRO
+
+#define CHECK_CONTENT_POLICY_WITH_SERVICE(action, _policy)     \
+  PR_BEGIN_MACRO                                               \
+  return _policy->action(contentLocation, loadInfo, decision); \
+  PR_END_MACRO
+
+#define CHECK_PRINCIPAL_CSP_AND_DATA(action)                                  \
+  PR_BEGIN_MACRO                                                              \
+  if (loadingPrincipal && loadingPrincipal->IsSystemPrincipal()) {            \
+                              \
+                                   \
+    CSPService::ConsultCSP(contentLocation, loadInfo, decision);              \
+    if (NS_CP_REJECTED(*decision)) {                                          \
+      return NS_OK;                                                           \
+    }                                                                         \
+    if (contentType != nsIContentPolicy::TYPE_DOCUMENT &&                     \
+        contentType != nsIContentPolicy::TYPE_UA_FONT) {                      \
+      *decision = nsIContentPolicy::ACCEPT;                                   \
+      nsCOMPtr<nsINode> n = do_QueryInterface(context);                       \
+      if (!n) {                                                               \
+        nsCOMPtr<nsPIDOMWindowOuter> win = do_QueryInterface(context);        \
+        n = win ? win->GetExtantDoc() : nullptr;                              \
+      }                                                                       \
+      if (n) {                                                                \
+        mozilla::dom::Document* d = n->OwnerDoc();                            \
+        if (d->IsLoadedAsData() || d->IsBeingUsedAsImage() ||                 \
+            d->IsResourceDoc()) {                                             \
+          nsCOMPtr<nsIContentPolicy> dataPolicy =                             \
+              do_GetService("@mozilla.org/data-document-content-policy;1");   \
+          if (dataPolicy) {                                                   \
+            dataPolicy->action(contentLocation, loadInfo, decision);          \
+          }                                                                   \
+        }                                                                     \
+      }                                                                       \
+    }                                                                         \
+    return NS_OK;                                                             \
+  }                                                                           \
+  PR_END_MACRO
+
+inline nsresult NS_CheckContentLoadPolicy(
+    nsIURI* contentLocation, nsILoadInfo* loadInfo, int16_t* decision,
+    nsIContentPolicy* policyService = nullptr) {
+  nsIPrincipal* loadingPrincipal = loadInfo->GetLoadingPrincipal();
+  nsCOMPtr<nsISupports> context = loadInfo->GetLoadingContext();
+  nsContentPolicyType contentType = loadInfo->InternalContentPolicyType();
+  CHECK_PRINCIPAL_CSP_AND_DATA(ShouldLoad);
+  if (policyService) {
+    CHECK_CONTENT_POLICY_WITH_SERVICE(ShouldLoad, policyService);
+  }
+  CHECK_CONTENT_POLICY(ShouldLoad);
+}
+
+inline nsresult NS_CheckContentProcessPolicy(
+    nsIURI* contentLocation, nsILoadInfo* loadInfo, int16_t* decision,
+    nsIContentPolicy* policyService = nullptr) {
+  nsIPrincipal* loadingPrincipal = loadInfo->GetLoadingPrincipal();
+  nsCOMPtr<nsISupports> context = loadInfo->GetLoadingContext();
+  nsContentPolicyType contentType = loadInfo->InternalContentPolicyType();
+  CHECK_PRINCIPAL_CSP_AND_DATA(ShouldProcess);
+  if (policyService) {
+    CHECK_CONTENT_POLICY_WITH_SERVICE(ShouldProcess, policyService);
+  }
+  CHECK_CONTENT_POLICY(ShouldProcess);
+}
+
+#undef CHECK_CONTENT_POLICY
+#undef CHECK_CONTENT_POLICY_WITH_SERVICE
+
+inline nsIDocShell* NS_CP_GetDocShellFromContext(nsISupports* aContext) {
+  if (!aContext) {
+    return nullptr;
+  }
+
+  nsCOMPtr<nsPIDOMWindowOuter> window = do_QueryInterface(aContext);
+
+  if (!window) {
+    nsCOMPtr<mozilla::dom::Document> doc = do_QueryInterface(aContext);
+    if (!doc) {
+      nsCOMPtr<nsIContent> content = do_QueryInterface(aContext);
+      if (content) {
+        doc = content->OwnerDoc();
+      }
+    }
+
+    if (doc) {
+      if (doc->GetDisplayDocument()) {
+        doc = doc->GetDisplayDocument();
+      }
+
+      window = doc->GetWindow();
+    }
+  }
+
+  if (!window) {
+    return nullptr;
+  }
+
+  return window->GetDocShell();
+}
+
+#endif /* _nsContentPolicyUtils_h_ */

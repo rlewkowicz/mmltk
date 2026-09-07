@@ -1,0 +1,97 @@
+/*
+ * Copyright 2018 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkFontMetrics_DEFINED)
+#define SkFontMetrics_DEFINED
+
+#include "include/core/SkScalar.h"
+#include "include/private/base/SkTo.h"
+
+struct SK_API SkFontMetrics {
+    bool operator==(const SkFontMetrics& that) const {
+        return
+        this->fFlags == that.fFlags &&
+        this->fTop == that.fTop &&
+        this->fAscent == that.fAscent &&
+        this->fDescent == that.fDescent &&
+        this->fBottom == that.fBottom &&
+        this->fLeading == that.fLeading &&
+        this->fAvgCharWidth == that.fAvgCharWidth &&
+        this->fMaxCharWidth == that.fMaxCharWidth &&
+        this->fXMin == that.fXMin &&
+        this->fXMax == that.fXMax &&
+        this->fXHeight == that.fXHeight &&
+        this->fCapHeight == that.fCapHeight &&
+        this->fUnderlineThickness == that.fUnderlineThickness &&
+        this->fUnderlinePosition == that.fUnderlinePosition &&
+        this->fStrikeoutThickness == that.fStrikeoutThickness &&
+        this->fStrikeoutPosition == that.fStrikeoutPosition;
+    }
+
+    enum FontMetricsFlags {
+        kUnderlineThicknessIsValid_Flag = 1 << 0, 
+        kUnderlinePositionIsValid_Flag  = 1 << 1, 
+        kStrikeoutThicknessIsValid_Flag = 1 << 2, 
+        kStrikeoutPositionIsValid_Flag  = 1 << 3, 
+        kBoundsInvalid_Flag             = 1 << 4, 
+    };
+
+    uint32_t fFlags;              
+    SkScalar fTop;                
+    SkScalar fAscent;             
+    SkScalar fDescent;            
+    SkScalar fBottom;             
+    SkScalar fLeading;            
+    SkScalar fAvgCharWidth;       
+    SkScalar fMaxCharWidth;       
+    SkScalar fXMin;               
+    SkScalar fXMax;               
+    SkScalar fXHeight;            
+    SkScalar fCapHeight;          
+    SkScalar fUnderlineThickness; 
+    SkScalar fUnderlinePosition;  
+    SkScalar fStrikeoutThickness; 
+    SkScalar fStrikeoutPosition;  
+
+    bool hasUnderlineThickness(SkScalar* thickness) const {
+        if (SkToBool(fFlags & kUnderlineThicknessIsValid_Flag)) {
+            *thickness = fUnderlineThickness;
+            return true;
+        }
+        return false;
+    }
+
+    bool hasUnderlinePosition(SkScalar* position) const {
+        if (SkToBool(fFlags & kUnderlinePositionIsValid_Flag)) {
+            *position = fUnderlinePosition;
+            return true;
+        }
+        return false;
+    }
+
+    bool hasStrikeoutThickness(SkScalar* thickness) const {
+        if (SkToBool(fFlags & kStrikeoutThicknessIsValid_Flag)) {
+            *thickness = fStrikeoutThickness;
+            return true;
+        }
+        return false;
+    }
+
+    bool hasStrikeoutPosition(SkScalar* position) const {
+        if (SkToBool(fFlags & kStrikeoutPositionIsValid_Flag)) {
+            *position = fStrikeoutPosition;
+            return true;
+        }
+        return false;
+    }
+
+    bool hasBounds() const {
+        return !SkToBool(fFlags & kBoundsInvalid_Flag);
+    }
+};
+
+#endif

@@ -1,0 +1,473 @@
+/*
+ * Copyright 2016 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "src/sksl/SkSLCompiler.h"
+
+#include "include/private/base/SkDebug.h"
+#include "src/core/SkTraceEvent.h"
+#include "src/sksl/SkSLAnalysis.h"
+#include "src/sksl/SkSLContext.h"
+#include "src/sksl/SkSLDefines.h"
+#include "src/sksl/SkSLInliner.h"
+#include "src/sksl/SkSLModule.h"
+#include "src/sksl/SkSLModuleLoader.h"
+#include "src/sksl/SkSLParser.h"
+#include "src/sksl/SkSLPool.h"
+#include "src/sksl/SkSLProgramKind.h"
+#include "src/sksl/SkSLProgramSettings.h"
+#include "src/sksl/analysis/SkSLProgramUsage.h"
+#include "src/sksl/ir/SkSLProgram.h"
+#include "src/sksl/ir/SkSLProgramElement.h"  // IWYU pragma: keep
+#include "src/sksl/ir/SkSLSymbolTable.h"     // IWYU pragma: keep
+#include "src/sksl/transform/SkSLTransform.h"
+
+#include <cstdint>
+#include <memory>
+#include <utility>
+
+#if defined(SKSL_STANDALONE)
+#include <fstream>
+#endif
+
+namespace SkSL {
+
+Compiler::OverrideFlag Compiler::sOptimizer = OverrideFlag::kDefault;
+Compiler::OverrideFlag Compiler::sInliner = OverrideFlag::kDefault;
+
+class AutoProgramConfig {
+public:
+    AutoProgramConfig(Context& context, ProgramConfig* config)
+            : fContext(context)
+            , fOldConfig(context.fConfig) {
+        fContext.fConfig = config;
+    }
+
+    ~AutoProgramConfig() {
+        fContext.fConfig = fOldConfig;
+    }
+
+    Context& fContext;
+    ProgramConfig* fOldConfig;
+};
+
+Compiler::Compiler() : fErrorReporter(this) {
+    auto moduleLoader = ModuleLoader::Get();
+    fContext = std::make_shared<Context>(moduleLoader.builtinTypes(), fErrorReporter);
+}
+
+Compiler::~Compiler() {}
+
+const Module* Compiler::moduleForProgramKind(ProgramKind kind) {
+    auto m = ModuleLoader::Get();
+    switch (kind) {
+        case ProgramKind::kFragment:              return m.loadFragmentModule(this);
+        case ProgramKind::kVertex:                return m.loadVertexModule(this);
+        case ProgramKind::kCompute:               return m.loadComputeModule(this);
+        case ProgramKind::kGraphiteFragment:      return m.loadGraphiteFragmentModule(this);
+        case ProgramKind::kGraphiteVertex:        return m.loadGraphiteVertexModule(this);
+        case ProgramKind::kPrivateRuntimeBlender:
+        case ProgramKind::kPrivateRuntimeColorFilter:
+        case ProgramKind::kPrivateRuntimeShader:  return m.loadPrivateRTShaderModule(this);
+        case ProgramKind::kRuntimeColorFilter:
+        case ProgramKind::kRuntimeShader:
+        case ProgramKind::kRuntimeBlender:
+        case ProgramKind::kMeshVertex:
+        case ProgramKind::kMeshFragment:          return m.loadPublicModule(this);
+    }
+    SkUNREACHABLE;
+}
+
+void Compiler::FinalizeSettings(ProgramSettings* settings, ProgramKind kind) {
+    switch (sOptimizer) {
+        case OverrideFlag::kDefault:
+            break;
+        case OverrideFlag::kOff:
+            settings->fOptimize = false;
+            break;
+        case OverrideFlag::kOn:
+            settings->fOptimize = true;
+            break;
+    }
+
+    switch (sInliner) {
+        case OverrideFlag::kDefault:
+            break;
+        case OverrideFlag::kOff:
+            settings->fInlineThreshold = 0;
+            break;
+        case OverrideFlag::kOn:
+            if (settings->fInlineThreshold == 0) {
+                settings->fInlineThreshold = kDefaultInlineThreshold;
+            }
+            break;
+    }
+
+    settings->fInlineThreshold *= (int)settings->fOptimize;
+    settings->fRemoveDeadFunctions &= settings->fOptimize;
+    settings->fRemoveDeadVariables &= settings->fOptimize;
+
+    if (ProgramConfig::IsRuntimeEffect(kind)) {
+        settings->fAllowNarrowingConversions = true;
+    }
+}
+
+void Compiler::initializeContext(const SkSL::Module* module,
+                                 ProgramKind kind,
+                                 ProgramSettings settings,
+                                 std::string_view source,
+                                 ModuleType moduleType) {
+    SkASSERT(!fPool);
+    SkASSERT(!fConfig);
+    SkASSERT(!fContext->fSymbolTable);
+    SkASSERT(!fContext->fConfig);
+    SkASSERT(!fContext->fModule);
+
+    this->resetErrors();
+
+    fConfig = std::make_unique<ProgramConfig>();
+    fConfig->fModuleType = moduleType;
+    fConfig->fSettings = settings;
+    fConfig->fKind = kind;
+
+    FinalizeSettings(&fConfig->fSettings, kind);
+
+    if (settings.fUseMemoryPool) {
+        fPool = Pool::Create();
+        fPool->attachToThread();
+    }
+
+    fContext->fConfig = fConfig.get();
+    fContext->fModule = module;
+    fContext->fErrors->setSource(source);
+
+    fGlobalSymbols = std::make_unique<SymbolTable>(module->fSymbols.get(),
+                                                   moduleType != ModuleType::program);
+    fGlobalSymbols->markModuleBoundary();
+    fContext->fSymbolTable = fGlobalSymbols.get();
+}
+
+void Compiler::cleanupContext() {
+    fContext->fConfig = nullptr;
+    fContext->fModule = nullptr;
+    fContext->fErrors->setSource(std::string_view());
+    fContext->fSymbolTable = nullptr;
+
+    fConfig = nullptr;
+    fGlobalSymbols = nullptr;
+
+    if (fPool) {
+        fPool->detachFromThread();
+        fPool = nullptr;
+    }
+}
+
+std::unique_ptr<Module> Compiler::compileModule(ProgramKind kind,
+                                                ModuleType moduleType,
+                                                std::string moduleSource,
+                                                const Module* parentModule,
+                                                bool shouldInline) {
+    SkASSERT(parentModule);
+    SkASSERT(this->errorCount() == 0);
+
+    auto sourcePtr = std::make_unique<std::string>(std::move(moduleSource));
+
+    ProgramSettings settings;
+    settings.fUseMemoryPool = false;
+    this->initializeContext(parentModule, kind, settings, *sourcePtr, moduleType);
+
+    std::unique_ptr<Module> module = SkSL::Parser(this, settings, kind, std::move(sourcePtr))
+                                             .moduleInheritingFrom(parentModule);
+
+    this->cleanupContext();
+
+    if (this->errorCount() != 0) {
+        SkDebugf("Unexpected errors compiling %s:\n\n%s\n",
+                 ModuleTypeToString(moduleType),
+                 this->errorText().c_str());
+        return nullptr;
+    }
+    if (shouldInline) {
+        this->optimizeModuleAfterLoading(kind, *module);
+    }
+    return module;
+}
+
+std::unique_ptr<Program> Compiler::convertProgram(ProgramKind kind,
+                                                  std::string programSource,
+                                                  const ProgramSettings& settings) {
+    TRACE_EVENT0("skia.shaders", "SkSL::Compiler::convertProgram");
+
+    auto sourcePtr = std::make_unique<std::string>(std::move(programSource));
+
+    const SkSL::Module* module = this->moduleForProgramKind(kind);
+
+    this->initializeContext(module, kind, settings, *sourcePtr, ModuleType::program);
+
+    std::unique_ptr<Program> program = SkSL::Parser(this, settings, kind, std::move(sourcePtr))
+                                               .programInheritingFrom(module);
+
+    this->cleanupContext();
+    return program;
+}
+
+std::unique_ptr<SkSL::Program> Compiler::releaseProgram(
+        std::unique_ptr<std::string> source,
+        std::vector<std::unique_ptr<SkSL::ProgramElement>> programElements) {
+    Pool* pool = fPool.get();
+    auto result = std::make_unique<SkSL::Program>(std::move(source),
+                                                  std::move(fConfig),
+                                                  fContext,
+                                                  std::move(programElements),
+                                                  std::move(fGlobalSymbols),
+                                                  std::move(fPool));
+    fContext->fSymbolTable = nullptr;
+
+    bool success = this->finalize(*result) &&
+                   this->optimize(*result);
+    if (pool) {
+        pool->detachFromThread();
+    }
+    return success ? std::move(result) : nullptr;
+}
+
+bool Compiler::optimizeModuleBeforeMinifying(ProgramKind kind, Module& module, bool shrinkSymbols) {
+    SkASSERT(this->errorCount() == 0);
+
+    auto m = SkSL::ModuleLoader::Get();
+
+    ProgramConfig config;
+    config.fModuleType = module.fModuleType;
+    config.fKind = kind;
+    AutoProgramConfig autoConfig(this->context(), &config);
+
+    std::unique_ptr<ProgramUsage> usage = Analysis::GetUsage(module);
+
+    if (shrinkSymbols) {
+        Transform::RenamePrivateSymbols(this->context(), module, usage.get(), kind);
+
+        Transform::ReplaceConstVarsWithLiterals(module, usage.get());
+    }
+
+    Transform::EliminateUnreachableCode(module, usage.get());
+
+    if (kind == ProgramKind::kRuntimeShader) {
+        while (Transform::EliminateDeadFunctions(this->context(), module, usage.get())) {
+        }
+    }
+
+    while (Transform::EliminateDeadLocalVariables(this->context(), module, usage.get())) {
+    }
+
+    bool onlyPrivateGlobals = !ProgramConfig::IsRuntimeEffect(kind);
+    while (Transform::EliminateDeadGlobalVariables(this->context(), module, usage.get(),
+                                                   onlyPrivateGlobals)) {
+    }
+
+    SkSL::Transform::EliminateEmptyStatements(module);
+
+    SkSL::Transform::EliminateUnnecessaryBraces(this->context(), module);
+
+    SkSL::Transform::ReplaceSplatCastsWithSwizzles(this->context(), module);
+
+    SkASSERT(*usage == *Analysis::GetUsage(module));
+
+    return this->errorCount() == 0;
+}
+
+bool Compiler::optimizeModuleAfterLoading(ProgramKind kind, Module& module) {
+    SkASSERT(this->errorCount() == 0);
+
+#if !defined(SK_ENABLE_OPTIMIZE_SIZE)
+    ProgramConfig config;
+    config.fModuleType = module.fModuleType;
+    config.fKind = kind;
+    AutoProgramConfig autoConfig(this->context(), &config);
+
+    std::unique_ptr<ProgramUsage> usage = Analysis::GetUsage(module);
+
+    Inliner inliner(fContext.get());
+    while (this->errorCount() == 0) {
+        if (!this->runInliner(&inliner, module.fElements, module.fSymbols.get(), usage.get())) {
+            break;
+        }
+    }
+    SkASSERT(*usage == *Analysis::GetUsage(module));
+#endif
+
+    return this->errorCount() == 0;
+}
+
+bool Compiler::optimize(Program& program) {
+    if (!program.fConfig->fSettings.fOptimize) {
+        return true;
+    }
+
+    SkASSERT(!this->errorCount());
+    if (this->errorCount() == 0) {
+#if !defined(SK_ENABLE_OPTIMIZE_SIZE)
+        Inliner inliner(fContext.get());
+        this->runInliner(&inliner, program.fOwnedElements, program.fSymbols.get(),
+                         program.fUsage.get());
+#endif
+
+        Transform::EliminateUnreachableCode(program);
+
+        while (Transform::EliminateDeadFunctions(program)) {
+        }
+        while (Transform::EliminateDeadLocalVariables(program)) {
+        }
+        while (Transform::EliminateDeadGlobalVariables(program)) {
+        }
+        SkASSERT(*program.usage() == *Analysis::GetUsage(program));
+
+        SkDEBUGCODE(Analysis::CheckSymbolTableCorrectness(program));
+    }
+
+    return this->errorCount() == 0;
+}
+
+void Compiler::runInliner(Program& program) {
+#if !defined(SK_ENABLE_OPTIMIZE_SIZE)
+    AutoProgramConfig autoConfig(this->context(), program.fConfig.get());
+    Inliner inliner(fContext.get());
+    this->runInliner(&inliner, program.fOwnedElements, program.fSymbols.get(),
+                     program.fUsage.get());
+#endif
+}
+
+bool Compiler::runInliner(Inliner* inliner,
+                          const std::vector<std::unique_ptr<ProgramElement>>& elements,
+                          SymbolTable* symbols,
+                          ProgramUsage* usage) {
+#if defined(SK_ENABLE_OPTIMIZE_SIZE)
+    return true;
+#else
+    SkASSERT(!fContext->fSymbolTable);
+    fContext->fSymbolTable = symbols;
+
+    bool result = inliner->analyze(elements, symbols, usage);
+
+    fContext->fSymbolTable = nullptr;
+    return result;
+#endif
+}
+
+bool Compiler::finalize(Program& program) {
+    Transform::FindAndDeclareBuiltinFunctions(program);
+
+    Transform::FindAndDeclareBuiltinVariables(program);
+
+    Transform::FindAndDeclareBuiltinStructs(program);
+
+    Analysis::DoFinalizationChecks(program);
+
+    if (fContext->fConfig->strictES2Mode() && this->errorCount() == 0) {
+        for (const auto& pe : program.fOwnedElements) {
+            Analysis::ValidateIndexingForES2(*pe, this->errorReporter());
+        }
+    }
+    if (this->errorCount() == 0) {
+        Analysis::CheckProgramStructure(program);
+
+        SkDEBUGCODE(Analysis::CheckSymbolTableCorrectness(program));
+    }
+
+    SkASSERT(*program.usage() == *Analysis::GetUsage(program));
+
+    return this->errorCount() == 0;
+}
+
+void Compiler::handleError(std::string_view msg, Position pos) {
+    fErrorText += "error: ";
+    bool printLocation = false;
+    std::string_view src = this->errorReporter().source();
+    int line = -1;
+    if (pos.valid()) {
+        line = pos.line(src);
+        printLocation = pos.startOffset() < (int)src.length();
+        fErrorText += std::to_string(line) + ": ";
+    }
+    fErrorText += std::string(msg) + "\n";
+    if (printLocation) {
+        const int kMaxSurroundingChars = 100;
+
+        int lineStart = pos.startOffset();
+        while (lineStart > 0) {
+            if (src[lineStart - 1] == '\n') {
+                break;
+            }
+            --lineStart;
+        }
+
+        std::string lineText;
+        std::string caretText;
+        if ((pos.startOffset() - lineStart) > kMaxSurroundingChars) {
+            lineStart = pos.startOffset() - kMaxSurroundingChars;
+            lineText = "...";
+            caretText = "   ";
+        }
+
+        const char* lineSuffix = "...\n";
+        int lineStop = pos.endOffset() + kMaxSurroundingChars;
+        if (lineStop >= (int)src.length()) {
+            lineStop = src.length() - 1;
+            lineSuffix = "\n";  
+        }
+        for (int i = lineStart; i < lineStop; ++i) {
+            char c = src[i];
+            if (c == '\n') {
+                lineSuffix = "\n";  
+                break;
+            }
+            switch (c) {
+                case '\t': lineText += "    "; break;
+                case '\0': lineText += " ";    break;
+                default:   lineText += src[i]; break;
+            }
+        }
+        fErrorText += lineText + lineSuffix;
+
+        for (int i = lineStart; i < (int)src.length(); i++) {
+            if (i >= pos.endOffset()) {
+                break;
+            }
+            switch (src[i]) {
+                case '\t':
+                   caretText += (i >= pos.startOffset()) ? "^^^^" : "    ";
+                   break;
+                case '\n':
+                    SkASSERT(i >= pos.startOffset());
+                    caretText += (pos.endOffset() > i + 1) ? "..." : "^";
+                    i = src.length();
+                    break;
+                default:
+                    caretText += (i >= pos.startOffset()) ? '^' : ' ';
+                    break;
+            }
+        }
+        fErrorText += caretText + '\n';
+    }
+}
+
+std::string Compiler::errorText(bool showCount) {
+    if (showCount) {
+        this->writeErrorCount();
+    }
+    std::string result = fErrorText;
+    this->resetErrors();
+    return result;
+}
+
+void Compiler::writeErrorCount() {
+    int count = this->errorCount();
+    if (count) {
+        fErrorText += std::to_string(count) +
+                      ((count == 1) ? " error\n" : " errors\n");
+    }
+}
+
+}  

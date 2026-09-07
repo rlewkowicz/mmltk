@@ -1,0 +1,248 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+ * Copyright (C) 2003-2014, International Business Machines Corporation
+ * and others. All Rights Reserved.
+ ******************************************************************************
+ *
+ * File INDIANCAL.CPP
+ *****************************************************************************
+ */
+
+#include "indiancal.h"
+#include <stdlib.h>
+#if !UCONFIG_NO_FORMATTING
+
+#include "mutex.h"
+#include <float.h>
+#include "gregoimp.h" // Math
+#include "uhash.h"
+
+#ifdef U_DEBUG_INDIANCAL
+#include <stdio.h>
+#include <stdarg.h>
+
+#endif
+
+U_NAMESPACE_BEGIN
+
+
+
+
+IndianCalendar* IndianCalendar::clone() const {
+  return new IndianCalendar(*this);
+}
+
+IndianCalendar::IndianCalendar(const Locale& aLocale, UErrorCode& success)
+  :   Calendar(TimeZone::forLocaleOrDefault(aLocale), aLocale, success)
+{
+}
+
+IndianCalendar::IndianCalendar(const IndianCalendar& other) : Calendar(other) {
+}
+
+IndianCalendar::~IndianCalendar()
+{
+}
+const char *IndianCalendar::getType() const { 
+   return "indian";
+}
+  
+static const int32_t LIMITS[UCAL_FIELD_COUNT][4] = {
+    {        0,        0,        0,        0}, 
+    { -5000000, -5000000,  5000000,  5000000}, 
+    {        0,        0,       11,       11}, 
+    {        1,        1,       52,       53}, 
+    {-1,-1,-1,-1}, 
+    {        1,        1,       30,       31}, 
+    {        1,        1,      365,      366}, 
+    {-1,-1,-1,-1}, 
+    {       -1,       -1,        5,        5}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    { -5000000, -5000000,  5000000,  5000000}, 
+    {-1,-1,-1,-1}, 
+    { -5000000, -5000000,  5000000,  5000000}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    {        0,        0,       11,       11}, 
+};
+
+static const int32_t INDIAN_ERA_START  = 78;
+static const int32_t INDIAN_YEAR_START = 80;
+
+int32_t IndianCalendar::handleGetLimit(UCalendarDateFields field, ELimitType limitType) const {
+  return LIMITS[field][limitType];
+}
+
+static UBool isGregorianLeap(int32_t year)
+{
+    return Grego::isLeapYear(year);
+}
+  
+
+int32_t IndianCalendar::handleGetMonthLength(int32_t eyear, int32_t month, UErrorCode& ) const {
+   if (month < 0 || month > 11) {
+      eyear += ClockMath::floorDivide(month, 12, &month);
+   }
+
+   if (isGregorianLeap(eyear + INDIAN_ERA_START) && month == 0) {
+       return 31;
+   }
+
+   if (month >= 1 && month <= 5) {
+       return 31;
+   }
+
+   return 30;
+}
+
+int32_t IndianCalendar::handleGetYearLength(int32_t eyear, UErrorCode& status) const {
+    if (U_FAILURE(status)) return 0;
+    return isGregorianLeap(eyear + INDIAN_ERA_START) ? 366 : 365;
+}
+static double gregorianToJD(int32_t year, int32_t month, int32_t date) {
+   return Grego::fieldsToDay(year, month, date) + kEpochStartAsJulianDay - 0.5;
+}
+
+   
+static double IndianToJD(int32_t year, int32_t month, int32_t date) {
+   int32_t leapMonth, gyear, m;
+   double start, jd;
+
+   gyear = year + INDIAN_ERA_START;
+
+
+   if(isGregorianLeap(gyear)) {
+      leapMonth = 31;
+      start = gregorianToJD(gyear, 2 , 21);
+   } 
+   else {
+      leapMonth = 30;
+      start = gregorianToJD(gyear, 2 , 22);
+   }
+
+   if (month == 1) {
+      jd = start + (date - 1);
+   } else {
+      jd = start + leapMonth;
+      m = month - 2;
+
+      if (m > 5) {
+          m = 5;
+      }
+
+      jd += m * 31;
+
+      if (month >= 8) {
+         m = month - 7;
+         jd += m * 30;
+      }
+      jd += date - 1;
+   }
+
+   return jd;
+}
+
+int64_t IndianCalendar::handleComputeMonthStart(int32_t eyear, int32_t month, UBool , UErrorCode& status) const {
+   if (U_FAILURE(status)) {
+       return 0;
+   }
+
+   int32_t imonth;
+
+   if (month < 0 || month > 11) {
+      if (uprv_add32_overflow(eyear, ClockMath::floorDivide(month, 12, &month), &eyear)) {
+          status = U_ILLEGAL_ARGUMENT_ERROR;
+          return 0;
+      }
+   }
+
+   if(month == 12){
+       imonth = 1;
+   } else {
+       imonth = month + 1; 
+   }
+   
+   int64_t jd = IndianToJD(eyear ,imonth, 1);
+
+   return jd;
+}
+
+
+int32_t IndianCalendar::handleGetExtendedYear(UErrorCode& status) {
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+    int32_t year;
+
+    if (newerField(UCAL_EXTENDED_YEAR, UCAL_YEAR) == UCAL_EXTENDED_YEAR) {
+        year = internalGet(UCAL_EXTENDED_YEAR, 1); 
+    } else {
+        year = internalGet(UCAL_YEAR, 1); 
+    }
+
+    return year;
+}
+
+void IndianCalendar::handleComputeFields(int32_t julianDay, UErrorCode& ) {
+    double jdAtStartOfGregYear;
+    int32_t leapMonth, IndianYear, yday, IndianMonth, IndianDayOfMonth, mday;
+    int32_t gregorianYear = getGregorianYear();
+
+    IndianYear = gregorianYear - INDIAN_ERA_START;            
+    jdAtStartOfGregYear = gregorianToJD(gregorianYear, 0, 1); 
+    yday = static_cast<int32_t>(julianDay - jdAtStartOfGregYear); 
+
+    if (yday < INDIAN_YEAR_START) {
+        IndianYear -= 1;
+        leapMonth = isGregorianLeap(gregorianYear - 1) ? 31 : 30; 
+        yday += leapMonth + (31 * 5) + (30 * 3) + 10;
+    } else {
+        leapMonth = isGregorianLeap(gregorianYear) ? 31 : 30; 
+        yday -= INDIAN_YEAR_START;
+    }
+
+    if (yday < leapMonth) {
+        IndianMonth = 0;
+        IndianDayOfMonth = yday + 1;
+    } else {
+        mday = yday - leapMonth;
+        if (mday < (31 * 5)) {
+            IndianMonth = static_cast<int32_t>(uprv_floor(mday / 31)) + 1;
+            IndianDayOfMonth = (mday % 31) + 1;
+        } else {
+            mday -= 31 * 5;
+            IndianMonth = static_cast<int32_t>(uprv_floor(mday / 30)) + 6;
+            IndianDayOfMonth = (mday % 30) + 1;
+        }
+   }
+
+   internalSet(UCAL_ERA, 0);
+   internalSet(UCAL_EXTENDED_YEAR, IndianYear);
+   internalSet(UCAL_YEAR, IndianYear);
+   internalSet(UCAL_MONTH, IndianMonth);
+   internalSet(UCAL_ORDINAL_MONTH, IndianMonth);
+   internalSet(UCAL_DAY_OF_MONTH, IndianDayOfMonth);
+   internalSet(UCAL_DAY_OF_YEAR, yday + 1); 
+}
+
+IMPL_SYSTEM_DEFAULT_CENTURY(IndianCalendar, "@calendar=indian")
+
+UOBJECT_DEFINE_RTTI_IMPLEMENTATION(IndianCalendar)
+
+int32_t IndianCalendar::getRelatedYearDifference() const {
+    constexpr int32_t kIndianCalendarRelatedYearDifference = 79;
+    return kIndianCalendarRelatedYearDifference;
+}
+
+U_NAMESPACE_END
+
+#endif
+

@@ -1,0 +1,141 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_GamepadRemapping_h_
+#define mozilla_dom_GamepadRemapping_h_
+
+#include "mozilla/dom/GamepadBinding.h"
+#include "mozilla/dom/GamepadLightIndicator.h"
+#include "mozilla/dom/GamepadPoseState.h"
+#include "mozilla/dom/GamepadTouchState.h"
+
+namespace mozilla::dom {
+
+enum class GamepadId : uint32_t {
+  kAsusTekProduct4500 = 0x0b054500,
+  kDragonRiseProduct0011 = 0x00790011,
+  kGoogleProduct2c40 = 0x18d12c40,
+  kGoogleProduct9400 = 0x18d19400,
+  kLogitechProductc216 = 0x046dc216,
+  kLogitechProductc218 = 0x046dc218,
+  kLogitechProductc219 = 0x046dc219,
+  kMicrosoftProductXbox360 = 0x045e028e,
+  kMicrosoftProductXbox360Wireless = 0x045e028f,
+  kMicrosoftProductXbox360Wireless2 = 0x045e0719,
+  kMicrosoftProductXbox2013 = 0x045e02d1,
+  kMicrosoftProductXbox2015 = 0x045e02dd,
+  kMicrosoftProductXboxOneS = 0x045e02ea,
+  kMicrosoftProductXboxOneSWireless = 0x045e02e0,
+  kMicrosoftProductXboxOneElite = 0x045e02e3,
+  kMicrosoftProductXboxOneElite2 = 0x045e0b00,
+  kMicrosoftProductXboxOneElite2Wireless = 0x045e0b05,
+  kMicrosoftProductXboxOneSWireless2016 = 0x045e02fd,
+  kMicrosoftProductXboxAdaptive = 0x045e0b0a,
+  kMicrosoftProductXboxAdaptiveWireless = 0x045e0b0c,
+  kMicrosoftProductXboxSeriesXWireless = 0x045e0b13,
+  kNintendoProduct2006 = 0x057e2006,
+  kNintendoProduct2007 = 0x057e2007,
+  kNintendoProduct2009 = 0x057e2009,
+  kNintendoProduct200e = 0x057e200e,
+  kNvidiaProduct7210 = 0x09557210,
+  kNvidiaProduct7214 = 0x09557214,
+  kPadixProduct2060 = 0x05832060,
+  kPlayComProduct0005 = 0x0b430005,
+  kPrototypeVendorProduct0667 = 0x66660667,
+  kPrototypeVendorProduct9401 = 0x66669401,
+  kRazer1532Product0900 = 0x15320900,
+  kSonyProduct0268 = 0x054c0268,
+  kSonyProduct05c4 = 0x054c05c4,
+  kSonyProduct09cc = 0x054c09cc,
+  kSonyProduct0ba0 = 0x054c0ba0,
+  kSonyProduct0ce6 = 0x054c0ce6,
+  kSonyProduct0df2 = 0x054c0df2,
+  kVendor20d6Product6271 = 0x20d66271,
+  kVendor2378Product1008 = 0x23781008,
+  kVendor2378Product100a = 0x2378100a,
+  kVendor2836Product0001 = 0x28360001,
+};
+
+enum CanonicalButtonIndex {
+  BUTTON_INDEX_PRIMARY,
+  BUTTON_INDEX_SECONDARY,
+  BUTTON_INDEX_TERTIARY,
+  BUTTON_INDEX_QUATERNARY,
+  BUTTON_INDEX_LEFT_SHOULDER,
+  BUTTON_INDEX_RIGHT_SHOULDER,
+  BUTTON_INDEX_LEFT_TRIGGER,
+  BUTTON_INDEX_RIGHT_TRIGGER,
+  BUTTON_INDEX_BACK_SELECT,
+  BUTTON_INDEX_START,
+  BUTTON_INDEX_LEFT_THUMBSTICK,
+  BUTTON_INDEX_RIGHT_THUMBSTICK,
+  BUTTON_INDEX_DPAD_UP,
+  BUTTON_INDEX_DPAD_DOWN,
+  BUTTON_INDEX_DPAD_LEFT,
+  BUTTON_INDEX_DPAD_RIGHT,
+  BUTTON_INDEX_META,
+  BUTTON_INDEX_COUNT
+};
+
+enum CanonicalAxisIndex {
+  AXIS_INDEX_LEFT_STICK_X,
+  AXIS_INDEX_LEFT_STICK_Y,
+  AXIS_INDEX_RIGHT_STICK_X,
+  AXIS_INDEX_RIGHT_STICK_Y,
+  AXIS_INDEX_COUNT
+};
+
+const float BUTTON_THRESHOLD_VALUE = 0.1f;
+
+static inline bool AxisNegativeAsButton(double input) { return input < -0.5; }
+
+static inline bool AxisPositiveAsButton(double input) { return input > 0.5; }
+
+static inline double AxisToButtonValue(double aValue) {
+  return (aValue + 1.0f) * 0.5f;
+}
+
+class GamepadRemapper {
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(GamepadRemapper)
+
+ public:
+  virtual uint32_t GetAxisCount() const = 0;
+  virtual uint32_t GetButtonCount() const = 0;
+  virtual uint32_t GetLightIndicatorCount() const { return 0; }
+  virtual void GetLightIndicators(
+      nsTArray<GamepadLightIndicatorType>& aTypes) const {}
+  virtual uint32_t GetTouchEventCount() const { return 0; }
+  virtual void GetLightColorReport(uint8_t aRed, uint8_t aGreen, uint8_t aBlue,
+                                   std::vector<uint8_t>& aReport) const {}
+  virtual uint32_t GetMaxInputReportLength() const { return 0; }
+
+  virtual void SetAxisCount(uint32_t aButtonCount) {}
+  virtual void SetButtonCount(uint32_t aButtonCount) {}
+  virtual GamepadMappingType GetMappingType() const {
+    return GamepadMappingType::Standard;
+  }
+  virtual void ProcessTouchData(GamepadHandle aHandle, const uint8_t* aInput,
+                                size_t aInputLen) {}
+  virtual void RemapAxisMoveEvent(GamepadHandle aHandle, uint32_t aAxis,
+                                  double aValue) const = 0;
+  virtual void RemapButtonEvent(GamepadHandle aHandle, uint32_t aButton,
+                                bool aPressed) const = 0;
+
+ protected:
+  GamepadRemapper() = default;
+  virtual ~GamepadRemapper() = default;
+};
+
+struct GamepadRemappingData {
+  GamepadId id;
+  RefPtr<GamepadRemapper> remapping;
+};
+
+already_AddRefed<GamepadRemapper> GetGamepadRemapper(const uint16_t aVendorId,
+                                                     const uint16_t aProductId,
+                                                     bool& aUsingDefault);
+
+}  
+
+#endif  // mozilla_dom_GamepadRemapping_h_

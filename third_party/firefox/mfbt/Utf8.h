@@ -1,0 +1,294 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_Utf8_h
+#define mozilla_Utf8_h
+
+#include "mozilla/Casting.h"    // for mozilla::AssertedCast
+#include "mozilla/Likely.h"     // for MOZ_UNLIKELY
+#include "mozilla/Maybe.h"      // for mozilla::Maybe
+#include "mozilla/Span.h"       // for mozilla::Span
+#include "mozilla/TextUtils.h"  // for mozilla::IsAscii and via Latin1.h for
+#include "mozilla/Types.h"      // for MFBT_API
+
+#include <limits.h>  // for CHAR_BIT
+#include <stddef.h>  // for size_t
+#include <stdint.h>  // for uint8_t
+
+#if MOZ_HAS_JSRUST()
+#  include <limits>  // for std::numeric_limits
+extern "C" {
+size_t encoding_utf8_valid_up_to(uint8_t const* buffer, size_t buffer_len);
+}
+#else
+namespace mozilla {
+namespace detail {
+extern MFBT_API bool IsValidUtf8(const void* aCodeUnits, size_t aCount);
+};  
+};  
+#endif  // MOZ_HAS_JSRUST
+
+namespace mozilla {
+
+union Utf8Unit;
+
+static_assert(CHAR_BIT == 8,
+              "Utf8Unit won't work so well with non-octet chars");
+
+union Utf8Unit {
+ private:
+  // are given no license to treat |char| memory as such an |enum|'s memory.)
+  char mValue = '\0';
+
+ public:
+  Utf8Unit() = default;
+
+  explicit constexpr Utf8Unit(char aUnit) : mValue(aUnit) {}
+
+  explicit constexpr Utf8Unit(unsigned char aUnit)
+      : mValue(static_cast<char>(aUnit)) {
+  }
+
+  explicit constexpr Utf8Unit(char8_t aUnit)
+      : mValue(static_cast<char>(aUnit)) {}
+
+  constexpr bool operator==(const Utf8Unit& aOther) const {
+    return mValue == aOther.mValue;
+  }
+
+  constexpr bool operator!=(const Utf8Unit& aOther) const {
+    return !(*this == aOther);
+  }
+
+  constexpr char toChar() const {
+    return mValue;
+  }
+
+  constexpr unsigned char toUnsignedChar() const {
+    return static_cast<unsigned char>(mValue);
+  }
+
+  constexpr uint8_t toUint8() const {
+    return static_cast<uint8_t>(mValue);
+  }
+
+};
+
+inline const unsigned char* Utf8AsUnsignedChars(const Utf8Unit* aUnits) {
+  static_assert(sizeof(Utf8Unit) == sizeof(unsigned char),
+                "sizes must match to permissibly reinterpret_cast<>");
+  static_assert(alignof(Utf8Unit) == alignof(unsigned char),
+                "alignment must match to permissibly reinterpret_cast<>");
+
+  return reinterpret_cast<const unsigned char*>(aUnits);
+}
+
+constexpr bool IsAscii(Utf8Unit aUnit) {
+  return IsAscii(aUnit.toUnsignedChar());
+}
+
+inline bool IsUtf8(mozilla::Span<const char> aString) {
+#if MOZ_HAS_JSRUST()
+  size_t length = aString.Length();
+  const uint8_t* ptr = reinterpret_cast<const uint8_t*>(aString.Elements());
+  if (length < 16) {
+    for (size_t i = 0; i < length; i++) {
+      if (ptr[i] >= 0x80U) {
+        ptr += i;
+        length -= i;
+        goto end;
+      }
+    }
+    return true;
+  }
+end:
+  return length == encoding_utf8_valid_up_to(ptr, length);
+#else
+  return detail::IsValidUtf8(aString.Elements(), aString.Length());
+#endif
+}
+
+#if MOZ_HAS_JSRUST()
+
+
+inline size_t Utf8ValidUpTo(mozilla::Span<const char> aString) {
+  return encoding_utf8_valid_up_to(
+      reinterpret_cast<const uint8_t*>(aString.Elements()), aString.Length());
+}
+
+inline size_t ConvertUtf16toUtf8(mozilla::Span<const char16_t> aSource,
+                                 mozilla::Span<char> aDest) {
+  return encoding_mem_convert_utf16_to_utf8(
+      aSource.Elements(), aSource.Length(), aDest.Elements(), aDest.Length());
+}
+
+inline std::tuple<size_t, size_t> ConvertUtf16toUtf8Partial(
+    mozilla::Span<const char16_t> aSource, mozilla::Span<char> aDest) {
+  size_t srcLen = aSource.Length();
+  size_t dstLen = aDest.Length();
+  encoding_mem_convert_utf16_to_utf8_partial(aSource.Elements(), &srcLen,
+                                             aDest.Elements(), &dstLen);
+  return std::make_tuple(srcLen, dstLen);
+}
+
+inline size_t ConvertUtf8toUtf16(mozilla::Span<const char> aSource,
+                                 mozilla::Span<char16_t> aDest) {
+  return encoding_mem_convert_utf8_to_utf16(
+      aSource.Elements(), aSource.Length(), aDest.Elements(), aDest.Length());
+}
+
+inline size_t UnsafeConvertValidUtf8toUtf16(mozilla::Span<const char> aSource,
+                                            mozilla::Span<char16_t> aDest) {
+  return encoding_mem_convert_str_to_utf16(aSource.Elements(), aSource.Length(),
+                                           aDest.Elements(), aDest.Length());
+}
+
+inline mozilla::Maybe<size_t> ConvertUtf8toUtf16WithoutReplacement(
+    mozilla::Span<const char> aSource, mozilla::Span<char16_t> aDest) {
+  size_t written = encoding_mem_convert_utf8_to_utf16_without_replacement(
+      aSource.Elements(), aSource.Length(), aDest.Elements(), aDest.Length());
+  if (MOZ_UNLIKELY(written == std::numeric_limits<size_t>::max())) {
+    return mozilla::Nothing();
+  }
+  return mozilla::Some(written);
+}
+
+#endif  // MOZ_HAS_JSRUST
+
+inline bool IsTrailingUnit(Utf8Unit aUnit) {
+  return (aUnit.toUint8() & 0b1100'0000) == 0b1000'0000;
+}
+
+template <typename Iter, typename EndIter, class OnBadLeadUnit,
+          class OnNotEnoughUnits, class OnBadTrailingUnit, class OnBadCodePoint,
+          class OnNotShortestForm>
+MOZ_ALWAYS_INLINE Maybe<char32_t> DecodeOneUtf8CodePointInline(
+    const Utf8Unit aLeadUnit, Iter* aIter, const EndIter& aEnd,
+    OnBadLeadUnit aOnBadLeadUnit, OnNotEnoughUnits aOnNotEnoughUnits,
+    OnBadTrailingUnit aOnBadTrailingUnit, OnBadCodePoint aOnBadCodePoint,
+    OnNotShortestForm aOnNotShortestForm) {
+  MOZ_ASSERT(Utf8Unit((*aIter)[-1]) == aLeadUnit);
+
+  char32_t n = aLeadUnit.toUint8();
+  MOZ_ASSERT(!IsAscii(n));
+
+  uint8_t remaining;
+  uint32_t min;
+  if ((n & 0b1110'0000) == 0b1100'0000) {
+    remaining = 1;
+    min = 0x80;
+    n &= 0b0001'1111;
+  } else if ((n & 0b1111'0000) == 0b1110'0000) {
+    remaining = 2;
+    min = 0x800;
+    n &= 0b0000'1111;
+  } else if ((n & 0b1111'1000) == 0b1111'0000) {
+    remaining = 3;
+    min = 0x10000;
+    n &= 0b0000'0111;
+  } else {
+    *aIter -= 1;
+    aOnBadLeadUnit();
+    return Nothing();
+  }
+
+  auto actual = aEnd - *aIter;
+  if (MOZ_UNLIKELY(actual < remaining)) {
+    *aIter -= 1;
+    aOnNotEnoughUnits(AssertedCast<uint8_t>(actual + 1), remaining + 1);
+    return Nothing();
+  }
+
+  for (uint8_t i = 0; i < remaining; i++) {
+    const Utf8Unit unit(*(*aIter)++);
+
+    if (MOZ_UNLIKELY(!IsTrailingUnit(unit))) {
+      uint8_t unitsObserved = i + 1 + 1;
+      *aIter -= unitsObserved;
+      aOnBadTrailingUnit(unitsObserved);
+      return Nothing();
+    }
+
+    n = (n << 6) | (unit.toUint8() & 0b0011'1111);
+  }
+
+  if (MOZ_UNLIKELY(n > 0x10FFFF || (0xD800 <= n && n <= 0xDFFF))) {
+    uint8_t unitsObserved = remaining + 1;
+    *aIter -= unitsObserved;
+    aOnBadCodePoint(n, unitsObserved);
+    return Nothing();
+  }
+
+  if (MOZ_UNLIKELY(n < min)) {
+    uint8_t unitsObserved = remaining + 1;
+    *aIter -= unitsObserved;
+    aOnNotShortestForm(n, unitsObserved);
+    return Nothing();
+  }
+
+  return Some(n);
+}
+
+template <typename Iter, typename EndIter, class OnBadLeadUnit,
+          class OnNotEnoughUnits, class OnBadTrailingUnit, class OnBadCodePoint,
+          class OnNotShortestForm>
+inline Maybe<char32_t> DecodeOneUtf8CodePoint(
+    const Utf8Unit aLeadUnit, Iter* aIter, const EndIter& aEnd,
+    OnBadLeadUnit aOnBadLeadUnit, OnNotEnoughUnits aOnNotEnoughUnits,
+    OnBadTrailingUnit aOnBadTrailingUnit, OnBadCodePoint aOnBadCodePoint,
+    OnNotShortestForm aOnNotShortestForm) {
+  return DecodeOneUtf8CodePointInline(aLeadUnit, aIter, aEnd, aOnBadLeadUnit,
+                                      aOnNotEnoughUnits, aOnBadTrailingUnit,
+                                      aOnBadCodePoint, aOnNotShortestForm);
+}
+
+template <typename Iter, typename EndIter>
+MOZ_ALWAYS_INLINE Maybe<char32_t> DecodeOneUtf8CodePointInline(
+    const Utf8Unit aLeadUnit, Iter* aIter, const EndIter& aEnd) {
+  auto onBadLeadUnit = []() {};
+
+  auto onNotEnoughUnits = [](uint8_t aUnitsAvailable, uint8_t aUnitsNeeded) {};
+
+  auto onBadTrailingUnit = [](uint8_t aUnitsObserved) {};
+
+  auto onBadCodePoint = [](char32_t aBadCodePoint, uint8_t aUnitsObserved) {};
+
+  auto onNotShortestForm = [](char32_t aBadCodePoint, uint8_t aUnitsObserved) {
+  };
+
+  return DecodeOneUtf8CodePointInline(aLeadUnit, aIter, aEnd, onBadLeadUnit,
+                                      onNotEnoughUnits, onBadTrailingUnit,
+                                      onBadCodePoint, onNotShortestForm);
+}
+
+template <typename Iter, typename EndIter>
+inline Maybe<char32_t> DecodeOneUtf8CodePoint(const Utf8Unit aLeadUnit,
+                                              Iter* aIter,
+                                              const EndIter& aEnd) {
+  return DecodeOneUtf8CodePointInline(aLeadUnit, aIter, aEnd);
+}
+
+template <typename Iter, typename EndIter>
+inline char32_t LossyDecodeOneUtf8CodePoint(const Utf8Unit aLeadUnit,
+                                            Iter* aIter, const EndIter& aEnd) {
+  return DecodeOneUtf8CodePointInline(
+             aLeadUnit, aIter, aEnd, [&] { (*aIter)++; },
+             [&](uint8_t aUnitsAvailable, uint8_t) {
+               uint8_t n = 1;
+               while (n < aUnitsAvailable &&
+                      IsTrailingUnit(Utf8Unit((*aIter)[n]))) {
+                 ++n;
+               }
+               (*aIter) += n;
+             },
+             [&](uint8_t aUnitsObserved) { (*aIter) += aUnitsObserved - 1; },
+             [&](char32_t, uint8_t) { (*aIter)++; },
+             [&](char32_t, uint8_t) { (*aIter)++; })
+      .valueOr(0xfffdu);
+}
+
+}  
+
+#endif /* mozilla_Utf8_h */

@@ -1,0 +1,383 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsDeviceContext.h"
+#include <algorithm>  // for max
+#include "gfxContext.h"
+#include "gfxPoint.h"    // for gfxSize
+#include "gfxTextRun.h"  // for gfxFontGroup
+#include "mozilla/LookAndFeel.h"
+#include "mozilla/gfx/PathHelpers.h"
+#include "mozilla/gfx/PrintTarget.h"
+#include "mozilla/StaticPrefs_layout.h"
+#include "mozilla/Try.h"            // for MOZ_TRY
+#include "mozilla/widget/Screen.h"  // for Screen
+#include "nsDebug.h"                // for NS_ASSERTION, etc
+#include "nsFontMetrics.h"          // for nsFontMetrics
+#include "nsIDeviceContextSpec.h"   // for nsIDeviceContextSpec
+#include "nsIWidget.h"              // for nsIWidget, NS_NATIVE_WINDOW
+#include "nsRect.h"                 // for nsRect
+#include "nsTArray.h"               // for nsTArray, nsTArray_Impl
+#include "mozilla/gfx/Logging.h"
+#include "mozilla/widget/ScreenManager.h"  // for ScreenManager
+
+#if defined(ACCESSIBILITY) && defined(MOZ_ENABLE_SKIA_PDF)
+#  include "mozilla/a11y/PdfStructTreeBuilder.h"
+#endif
+
+using namespace mozilla;
+using namespace mozilla::gfx;
+using mozilla::widget::ScreenManager;
+
+nsDeviceContext::nsDeviceContext()
+    : mWidth(0),
+      mHeight(0),
+      mAppUnitsPerDevPixel(-1),
+      mAppUnitsPerDevPixelAtUnitFullZoom(-1),
+      mAppUnitsPerPhysicalInch(-1),
+      mFullZoom(1.0f),
+      mPrintingScale(1.0f),
+      mPrintingTranslate(gfxPoint(0, 0)),
+      mIsCurrentlyPrintingDoc(false) {
+  MOZ_ASSERT(NS_IsMainThread(), "nsDeviceContext created off main thread");
+}
+
+nsDeviceContext::~nsDeviceContext() = default;
+
+int32_t nsDeviceContext::ComputeAppUnitsPerDevPixelForWidgetScale(
+    CSSToLayoutDeviceScale aScale) {
+  return std::max(1, NS_lround(AppUnitsPerCSSPixel() / aScale.scale));
+}
+
+int32_t nsDeviceContext::ApplyFullZoomToAPD(int32_t aUnzoomedAppUnits,
+                                            float aFullZoom) {
+  if (aFullZoom == 1.0f) {
+    return aUnzoomedAppUnits;
+  }
+  return std::max(1, NSToIntRound(float(aUnzoomedAppUnits) / aFullZoom));
+}
+
+void nsDeviceContext::SetDPI() {
+  float dpi;
+
+  if (mDeviceContextSpec) {
+    dpi = mDeviceContextSpec->GetDPI();
+    mPrintingScale = 72.0f / dpi;
+    mPrintingTranslate = gfxPoint(0, 0);
+    mAppUnitsPerDevPixelAtUnitFullZoom =
+        ComputeAppUnitsPerDevPixelForWidgetScale(
+            CSSToLayoutDeviceScale(dpi / 96.0));
+  } else {
+    int32_t prefDPI = StaticPrefs::layout_css_dpi();
+    if (prefDPI > 0) {
+      dpi = prefDPI;
+    } else if (mWidget) {
+      dpi = mWidget->GetDPI();
+      MOZ_ASSERT(dpi > 0);
+      if (prefDPI < 0) {
+        dpi = std::max(96.0f, dpi);
+      }
+    } else {
+      dpi = 96.0f;
+    }
+
+    CSSToLayoutDeviceScale scale =
+        mWidget ? mWidget->GetDefaultScale() : CSSToLayoutDeviceScale(1.0);
+    MOZ_ASSERT(scale.scale > 0.0);
+    mAppUnitsPerDevPixelAtUnitFullZoom =
+        ComputeAppUnitsPerDevPixelForWidgetScale(scale);
+  }
+
+  NS_ASSERTION(dpi != -1.0, "no dpi set");
+
+  mAppUnitsPerPhysicalInch =
+      NS_lround(dpi * mAppUnitsPerDevPixelAtUnitFullZoom);
+  UpdateAppUnitsForFullZoom();
+}
+
+void nsDeviceContext::Init(nsIWidget* aWidget) {
+  if (mIsInitialized && mWidget == aWidget) {
+    return;
+  }
+
+  mIsInitialized = true;
+
+  mWidget = aWidget;
+  SetDPI();
+}
+
+UniquePtr<gfxContext> nsDeviceContext::CreateRenderingContext() {
+  return CreateRenderingContextCommon( false);
+}
+
+UniquePtr<gfxContext> nsDeviceContext::CreateReferenceRenderingContext() {
+  return CreateRenderingContextCommon( true);
+}
+
+UniquePtr<gfxContext> nsDeviceContext::CreateRenderingContextCommon(
+    bool aWantReferenceContext) {
+  MOZ_ASSERT(IsPrinterContext());
+  MOZ_ASSERT(mWidth > 0 && mHeight > 0);
+
+  if (NS_WARN_IF(!mPrintTarget)) {
+    return nullptr;
+  }
+
+  RefPtr<gfx::DrawTarget> dt;
+  if (aWantReferenceContext) {
+    dt = mPrintTarget->GetReferenceDrawTarget();
+  } else {
+    RefPtr<DrawEventRecorder> recorder;
+    mDeviceContextSpec->GetDrawEventRecorder(getter_AddRefs(recorder));
+    dt = mPrintTarget->MakeDrawTarget(gfx::IntSize(mWidth, mHeight), recorder);
+  }
+
+  if (!dt || !dt->IsValid()) {
+    gfxCriticalNote << "Failed to create draw target in device context sized "
+                    << mWidth << "x" << mHeight << " and pointer "
+                    << hexa(mPrintTarget);
+    return nullptr;
+  }
+
+  dt->AddUserData(&sDisablePixelSnapping, (void*)0x1, nullptr);
+
+  auto pContext = MakeUnique<gfxContext>(dt);
+
+  gfxMatrix transform;
+  transform.PreTranslate(mPrintingTranslate);
+  transform.PreScale(mPrintingScale, mPrintingScale);
+  pContext->SetMatrixDouble(transform);
+  return pContext;
+}
+
+uint32_t nsDeviceContext::GetDepth() {
+  RefPtr<widget::Screen> screen = FindScreen();
+  int32_t depth = 0;
+  screen->GetColorDepth(&depth);
+  return uint32_t(depth);
+}
+
+dom::ScreenColorGamut nsDeviceContext::GetColorGamut() {
+  RefPtr<widget::Screen> screen = FindScreen();
+  dom::ScreenColorGamut colorGamut;
+  screen->GetColorGamut(&colorGamut);
+  return colorGamut;
+}
+
+hal::ScreenOrientation nsDeviceContext::GetScreenOrientationType() {
+  RefPtr<widget::Screen> screen = FindScreen();
+  return screen->GetOrientationType();
+}
+
+uint16_t nsDeviceContext::GetScreenOrientationAngle() {
+  RefPtr<widget::Screen> screen = FindScreen();
+  return screen->GetOrientationAngle();
+}
+
+bool nsDeviceContext::GetScreenIsHDR() {
+  RefPtr<widget::Screen> screen = FindScreen();
+  return screen->GetIsHDR();
+}
+
+nsSize nsDeviceContext::GetDeviceSurfaceDimensions() {
+  return GetRect().Size();
+}
+
+nsRect nsDeviceContext::GetRect() {
+  if (IsPrinterContext()) {
+    return {0, 0, mWidth, mHeight};
+  }
+  RefPtr<widget::Screen> screen = FindScreen();
+  return LayoutDeviceIntRect::ToAppUnits(screen->GetRect(),
+                                         AppUnitsPerDevPixel());
+}
+
+nsRect nsDeviceContext::GetClientRect() {
+  if (IsPrinterContext()) {
+    return {0, 0, mWidth, mHeight};
+  }
+  RefPtr<widget::Screen> screen = FindScreen();
+  return LayoutDeviceIntRect::ToAppUnits(screen->GetAvailRect(),
+                                         AppUnitsPerDevPixel());
+}
+
+nsresult nsDeviceContext::InitForPrinting(nsIDeviceContextSpec* aDevice) {
+  NS_ENSURE_ARG_POINTER(aDevice);
+
+  MOZ_ASSERT(!mIsInitialized,
+             "Only initialize once, immediately after construction");
+
+
+  mPrintTarget = aDevice->MakePrintTarget();
+  if (!mPrintTarget) {
+    return NS_ERROR_FAILURE;
+  }
+
+  mDeviceContextSpec = aDevice;
+
+  Init(nullptr);
+
+  if (!CalcPrintingSize()) {
+    return NS_ERROR_FAILURE;
+  }
+
+  return NS_OK;
+}
+
+nsresult nsDeviceContext::BeginDocument(const nsAString& aTitle,
+                                        const nsAString& aPrintToFileName,
+                                        uint64_t aBrowsingContextId,
+                                        int32_t aStartPage, int32_t aEndPage) {
+  MOZ_DIAGNOSTIC_ASSERT(!mIsCurrentlyPrintingDoc,
+                        "Mismatched BeginDocument/EndDocument calls");
+
+  mBrowsingContextId = aBrowsingContextId;
+  nsresult rv = mPrintTarget->BeginPrinting(
+      aTitle, aPrintToFileName, aBrowsingContextId, aStartPage, aEndPage);
+
+  if (NS_SUCCEEDED(rv)) {
+    if (mDeviceContextSpec) {
+      rv = mDeviceContextSpec->BeginDocument(
+          aTitle, aPrintToFileName, aBrowsingContextId, aStartPage, aEndPage);
+    }
+    mIsCurrentlyPrintingDoc = true;
+  }
+
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv) || rv == NS_ERROR_ABORT,
+                       "nsDeviceContext::BeginDocument failed");
+
+  return rv;
+}
+
+RefPtr<PrintEndDocumentPromise> nsDeviceContext::EndDocument() {
+  MOZ_DIAGNOSTIC_ASSERT(mIsCurrentlyPrintingDoc,
+                        "Mismatched BeginDocument/EndDocument calls");
+  MOZ_DIAGNOSTIC_ASSERT(mPrintTarget);
+
+  mIsCurrentlyPrintingDoc = false;
+#if defined(ACCESSIBILITY) && defined(MOZ_ENABLE_SKIA_PDF)
+  mozilla::a11y::PdfStructTreeBuilder::Done(mBrowsingContextId);
+#endif
+
+  if (mPrintTarget) {
+    auto result = mPrintTarget->EndPrinting();
+    if (NS_FAILED(result)) {
+      return PrintEndDocumentPromise::CreateAndReject(NS_ERROR_NOT_AVAILABLE,
+                                                      __func__);
+    }
+    mPrintTarget->Finish();
+    mPrintTarget = nullptr;
+  }
+
+  if (mDeviceContextSpec) {
+    return mDeviceContextSpec->EndDocument();
+  }
+
+  return PrintEndDocumentPromise::CreateAndResolve(true, __func__);
+}
+
+nsresult nsDeviceContext::AbortDocument() {
+  MOZ_DIAGNOSTIC_ASSERT(mIsCurrentlyPrintingDoc,
+                        "Mismatched BeginDocument/EndDocument calls");
+
+  nsresult rv = mPrintTarget->AbortPrinting();
+  mIsCurrentlyPrintingDoc = false;
+#if defined(ACCESSIBILITY) && defined(MOZ_ENABLE_SKIA_PDF)
+  mozilla::a11y::PdfStructTreeBuilder::Done(mBrowsingContextId);
+#endif
+
+  if (mDeviceContextSpec) {
+    (void)mDeviceContextSpec->EndDocument();
+  }
+
+  mPrintTarget = nullptr;
+
+  return rv;
+}
+
+nsresult nsDeviceContext::BeginPage(const IntSize& aSizeInPoints) {
+  MOZ_DIAGNOSTIC_ASSERT(!mIsCurrentlyPrintingDoc || mPrintTarget,
+                        "What nulled out our print target while printing?");
+
+  if (mDeviceContextSpec) {
+    MOZ_TRY(mDeviceContextSpec->BeginPage(aSizeInPoints));
+  }
+  if (mPrintTarget) {
+    MOZ_TRY(mPrintTarget->BeginPage(aSizeInPoints));
+  }
+  return NS_OK;
+}
+
+nsresult nsDeviceContext::EndPage() {
+  MOZ_DIAGNOSTIC_ASSERT(!mIsCurrentlyPrintingDoc || mPrintTarget,
+                        "What nulled out our print target while printing?");
+
+  if (mPrintTarget) {
+    MOZ_TRY(mPrintTarget->EndPage());
+  }
+  if (mDeviceContextSpec) {
+    MOZ_TRY(mDeviceContextSpec->EndPage());
+  }
+  return NS_OK;
+}
+
+already_AddRefed<widget::Screen> nsDeviceContext::FindScreen() {
+  if (mWidget) {
+    CheckDPIChange();
+    if (RefPtr<widget::Screen> screen = mWidget->GetWidgetScreen()) {
+      return screen.forget();
+    }
+  }
+  return ScreenManager::GetSingleton().GetPrimaryScreen();
+}
+
+bool nsDeviceContext::CalcPrintingSize() {
+  gfxSize size(mPrintTarget->GetSize());
+  mWidth = NSToCoordRound(size.width * AppUnitsPerPhysicalInch() /
+                          POINTS_PER_INCH_FLOAT);
+  mHeight = NSToCoordRound(size.height * AppUnitsPerPhysicalInch() /
+                           POINTS_PER_INCH_FLOAT);
+
+  return (mWidth > 0 && mHeight > 0);
+}
+
+bool nsDeviceContext::CheckDPIChange() {
+  int32_t oldDevPixels = mAppUnitsPerDevPixelAtUnitFullZoom;
+  int32_t oldInches = mAppUnitsPerPhysicalInch;
+
+  SetDPI();
+
+  return oldDevPixels != mAppUnitsPerDevPixelAtUnitFullZoom ||
+         oldInches != mAppUnitsPerPhysicalInch;
+}
+
+bool nsDeviceContext::SetFullZoom(float aScale) {
+  if (aScale <= 0) {
+    MOZ_ASSERT_UNREACHABLE("Invalid full zoom value");
+    return false;
+  }
+  int32_t oldAppUnitsPerDevPixel = mAppUnitsPerDevPixel;
+  mFullZoom = aScale;
+  UpdateAppUnitsForFullZoom();
+  return oldAppUnitsPerDevPixel != mAppUnitsPerDevPixel;
+}
+
+int32_t nsDeviceContext::AppUnitsPerDevPixelInTopLevelChromePage() const {
+  return ApplyFullZoomToAPD(mAppUnitsPerDevPixelAtUnitFullZoom,
+                            LookAndFeel::SystemZoomSettings().mFullZoom);
+}
+
+void nsDeviceContext::UpdateAppUnitsForFullZoom() {
+  mAppUnitsPerDevPixel =
+      ApplyFullZoomToAPD(mAppUnitsPerDevPixelAtUnitFullZoom, mFullZoom);
+  mFullZoom = float(mAppUnitsPerDevPixelAtUnitFullZoom) / mAppUnitsPerDevPixel;
+}
+
+DesktopToLayoutDeviceScale nsDeviceContext::GetDesktopToDeviceScale() {
+  if (mWidget) {
+    RefPtr<widget::Screen> screen = FindScreen();
+    return screen->GetDesktopToLayoutDeviceScale();
+  }
+  return DesktopToLayoutDeviceScale(1.0);
+}

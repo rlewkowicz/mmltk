@@ -1,0 +1,144 @@
+// Copyright 2017 The ANGLE Project Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(COMPILER_TRANSLATOR_INTERMNODEUTIL_H_)
+#define COMPILER_TRANSLATOR_INTERMNODEUTIL_H_
+
+#include <optional>
+
+#include "compiler/translator/IntermNode.h"
+#include "compiler/translator/Name.h"
+#include "compiler/translator/tree_util/FindFunction.h"
+
+namespace sh
+{
+
+class TSymbolTable;
+class TVariable;
+
+TIntermFunctionPrototype *CreateInternalFunctionPrototypeNode(const TFunction &func);
+TIntermFunctionDefinition *CreateInternalFunctionDefinitionNode(const TFunction &func,
+                                                                TIntermBlock *functionBody);
+
+TIntermTyped *CreateZeroNode(const TType &type);
+TIntermConstantUnion *CreateFloatNode(float value, TPrecision precision);
+TIntermConstantUnion *CreateVecNode(const float values[],
+                                    unsigned int vecSize,
+                                    TPrecision precision);
+TIntermConstantUnion *CreateUVecNode(const unsigned int values[],
+                                     unsigned int vecSize,
+                                     TPrecision precision);
+TIntermConstantUnion *CreateIndexNode(int index);
+TIntermConstantUnion *CreateUIntNode(unsigned int value);
+TIntermConstantUnion *CreateBoolNode(bool value);
+TIntermConstantUnion *CreateYuvCscNode(TYuvCscStandardEXT value);
+
+TVariable *CreateTempVariable(TSymbolTable *symbolTable, const TType *type);
+
+TVariable *CreateTempVariable(TSymbolTable *symbolTable, const TType *type, TQualifier qualifier);
+
+TIntermSymbol *CreateTempSymbolNode(const TVariable *tempVariable);
+TIntermDeclaration *CreateTempDeclarationNode(const TVariable *tempVariable);
+TIntermDeclaration *CreateTempInitDeclarationNode(const TVariable *tempVariable,
+                                                  TIntermTyped *initializer);
+TIntermBinary *CreateTempAssignmentNode(const TVariable *tempVariable, TIntermTyped *rightNode);
+
+TVariable *DeclareTempVariable(TSymbolTable *symbolTable,
+                               const TType *type,
+                               TQualifier qualifier,
+                               TIntermDeclaration **declarationOut);
+TVariable *DeclareTempVariable(TSymbolTable *symbolTable,
+                               TIntermTyped *initializer,
+                               TQualifier qualifier,
+                               TIntermDeclaration **declarationOut);
+std::pair<const TVariable *, const TVariable *> DeclareStructure(
+    TIntermBlock *root,
+    TSymbolTable *symbolTable,
+    TFieldList *fieldList,
+    TQualifier qualifier,
+    const TMemoryQualifier &memoryQualifier,
+    uint32_t arraySize,
+    const ImmutableString &structTypeName,
+    const ImmutableString *structInstanceName);
+TInterfaceBlock *DeclareInterfaceBlock(TSymbolTable *symbolTable,
+                                       TFieldList *fieldList,
+                                       const TLayoutQualifier &layoutQualifier,
+                                       const ImmutableString &blockTypeName);
+
+const TVariable *DeclareInterfaceBlockVariable(TIntermBlock *root,
+                                               TSymbolTable *symbolTable,
+                                               TQualifier qualifier,
+                                               const TInterfaceBlock *interfaceBlock,
+                                               const TLayoutQualifier &layoutQualifier,
+                                               const TMemoryQualifier &memoryQualifier,
+                                               uint32_t arraySize,
+                                               const ImmutableString &blockVariableName);
+
+const TVariable *FindRootVariable(TIntermNode *expr);
+
+const TVariable &CreateStructTypeVariable(TSymbolTable &symbolTable, const TStructure &structure);
+
+const TVariable &CreateInstanceVariable(
+    TSymbolTable &symbolTable,
+    const TStructure &structure,
+    const Name &name,
+    TQualifier qualifier                              = TQualifier::EvqTemporary,
+    const angle::Span<const unsigned int> *arraySizes = nullptr);
+
+TIntermBinary &AccessField(const TVariable &structInstanceVar, const Name &field);
+
+TIntermBinary &AccessField(TIntermTyped &object, const Name &field);
+
+TIntermBinary &AccessFieldByIndex(TIntermTyped &object, int index);
+
+TIntermBinary *AccessFieldOfNamedInterfaceBlock(const TVariable *object, int index);
+
+TIntermBlock *EnsureBlock(TIntermNode *node);
+
+TIntermBlock *EnsureLoopBodyBlock(TIntermNode *node);
+
+TIntermSymbol *ReferenceGlobalVariable(const ImmutableString &name,
+                                       const TSymbolTable &symbolTable);
+
+TIntermSymbol *ReferenceBuiltInVariable(const ImmutableString &name,
+                                        const TSymbolTable &symbolTable,
+                                        int shaderVersion);
+
+TIntermTyped *CreateBuiltInFunctionCallNode(const char *name,
+                                            TIntermSequence *arguments,
+                                            const TSymbolTable &symbolTable,
+                                            int shaderVersion);
+TIntermTyped *CreateBuiltInFunctionCallNode(const char *name,
+                                            const std::initializer_list<TIntermNode *> &arguments,
+                                            const TSymbolTable &symbolTable,
+                                            int shaderVersion);
+TIntermTyped *CreateBuiltInUnaryFunctionCallNode(const char *name,
+                                                 TIntermTyped *argument,
+                                                 const TSymbolTable &symbolTable,
+                                                 int shaderVersion);
+
+inline void GetSwizzleIndex(TVector<uint32_t> *indexOut) {}
+
+template <typename T, typename... ArgsT>
+void GetSwizzleIndex(TVector<uint32_t> *indexOut, T arg, ArgsT... args)
+{
+    indexOut->push_back(arg);
+    GetSwizzleIndex(indexOut, args...);
+}
+
+template <typename... ArgsT>
+TIntermSwizzle *CreateSwizzle(TIntermTyped *reference, ArgsT... args)
+{
+    TVector<uint32_t> swizzleIndex;
+    GetSwizzleIndex(&swizzleIndex, args...);
+    return new TIntermSwizzle(reference, swizzleIndex);
+}
+
+bool EndsInBranch(TIntermBlock *block);
+
+TIntermNode *CastScalar(const TType &type, TIntermTyped *scalar);
+
+}  
+
+#endif

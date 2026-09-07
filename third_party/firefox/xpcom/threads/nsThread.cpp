@@ -1,0 +1,1222 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsThread.h"
+
+#include "base/message_loop.h"
+#include "base/platform_thread.h"
+
+#if defined(LOG)
+#  undef LOG
+#endif
+
+#include "mozilla/ReentrantMonitor.h"
+#include "nsMemoryPressure.h"
+#include "nsThreadManager.h"
+#include "nsIClassInfoImpl.h"
+#include "nsCOMPtr.h"
+#include "nsQueryObject.h"
+#include "pratom.h"
+#include "mozilla/CycleCollectedJSContext.h"
+#include "mozilla/DebugOnly.h"
+#include "mozilla/Logging.h"
+#include "nsIObserverService.h"
+#include "mozilla/IOInterposer.h"
+#include "mozilla/ipc/MessageChannel.h"
+#include "mozilla/ipc/BackgroundChild.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/SchedulerGroup.h"
+#include "mozilla/Services.h"
+#include "mozilla/SpinEventLoopUntil.h"
+#include "mozilla/StaticLocalPtr.h"
+#include "mozilla/StaticPrefs_threads.h"
+#include "mozilla/TaskController.h"
+#include "nsFmtString.h"
+#include "nsXPCOMPrivate.h"
+#include "mozilla/ChaosMode.h"
+#include "prerror.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/dom/DocGroup.h"
+#include "mozilla/dom/ScriptSettings.h"
+#include "nsThreadSyncDispatch.h"
+#include "nsServiceManagerUtils.h"
+#include "ThreadEventQueue.h"
+#include "ThreadEventTarget.h"
+#include "ThreadDelay.h"
+
+#if defined(XP_LINUX)
+#if defined(__GLIBC__)
+#    include <gnu/libc-version.h>
+#endif
+#  include <sys/mman.h>
+#  include <sys/time.h>
+#  include <sys/resource.h>
+#  include <sched.h>
+#  include <stdio.h>
+#endif
+
+
+#define HAVE_UALARM                                                        \
+  _BSD_SOURCE ||                                                           \
+      (_XOPEN_SOURCE >= 500 || _XOPEN_SOURCE && _XOPEN_SOURCE_EXTENDED) && \
+          !(_POSIX_C_SOURCE >= 200809L || _XOPEN_SOURCE >= 700)
+
+#if defined(XP_LINUX) && !0 && defined(_GNU_SOURCE)
+#  define HAVE_SCHED_SETAFFINITY
+#endif
+
+
+#if defined(MOZ_CANARY)
+#  include <unistd.h>
+#  include <execinfo.h>
+#  include <signal.h>
+#  include <fcntl.h>
+#  include "nsXULAppAPI.h"
+#endif
+
+using namespace mozilla;
+
+extern void InitThreadLocalVariables();
+
+static LazyLogModule sThreadLog("nsThread");
+#if defined(LOG)
+#  undef LOG
+#endif
+#define LOG(args) MOZ_LOG(sThreadLog, mozilla::LogLevel::Debug, args)
+
+NS_DECL_CI_INTERFACE_GETTER(nsThread)
+
+Array<char, nsThread::kRunnableNameBufSize> nsThread::sMainThreadRunnableName;
+
+
+class nsThreadClassInfo : public nsIClassInfo {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED  
+      NS_DECL_NSICLASSINFO
+
+      nsThreadClassInfo() = default;
+};
+
+NS_IMETHODIMP_(MozExternalRefCountType)
+nsThreadClassInfo::AddRef() { return 2; }
+NS_IMETHODIMP_(MozExternalRefCountType)
+nsThreadClassInfo::Release() { return 1; }
+NS_IMPL_QUERY_INTERFACE(nsThreadClassInfo, nsIClassInfo)
+
+NS_IMETHODIMP
+nsThreadClassInfo::GetInterfaces(nsTArray<nsIID>& aArray) {
+  return NS_CI_INTERFACE_GETTER_NAME(nsThread)(aArray);
+}
+
+NS_IMETHODIMP
+nsThreadClassInfo::GetScriptableHelper(nsIXPCScriptable** aResult) {
+  *aResult = nullptr;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsThreadClassInfo::GetContractID(nsACString& aResult) {
+  aResult.SetIsVoid(true);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsThreadClassInfo::GetClassDescription(nsACString& aResult) {
+  aResult.SetIsVoid(true);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsThreadClassInfo::GetClassID(nsCID** aResult) {
+  *aResult = nullptr;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsThreadClassInfo::GetFlags(uint32_t* aResult) {
+  *aResult = THREADSAFE;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsThreadClassInfo::GetClassIDNoAlloc(nsCID* aResult) {
+  return NS_ERROR_NOT_AVAILABLE;
+}
+
+
+NS_IMPL_ADDREF(nsThread)
+NS_IMPL_RELEASE(nsThread)
+NS_INTERFACE_MAP_BEGIN(nsThread)
+  NS_INTERFACE_MAP_ENTRY(nsIThread)
+  NS_INTERFACE_MAP_ENTRY(nsIThreadInternal)
+  NS_INTERFACE_MAP_ENTRY(nsIEventTarget)
+  NS_INTERFACE_MAP_ENTRY(nsISerialEventTarget)
+  NS_INTERFACE_MAP_ENTRY(nsISupportsPriority)
+  NS_INTERFACE_MAP_ENTRY(nsIDirectTaskDispatcher)
+  NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIThread)
+  if (aIID.Equals(NS_GET_IID(nsIClassInfo))) {
+    static nsThreadClassInfo sThreadClassInfo;
+    foundInterface = static_cast<nsIClassInfo*>(&sThreadClassInfo);
+  } else
+NS_INTERFACE_MAP_END
+NS_IMPL_CI_INTERFACE_GETTER(nsThread, nsIThread, nsIThreadInternal,
+                            nsIEventTarget, nsISerialEventTarget,
+                            nsISupportsPriority)
+
+
+class nsThreadShutdownAckEvent : public CancelableRunnable {
+ public:
+  explicit nsThreadShutdownAckEvent(NotNull<nsThreadShutdownContext*> aCtx)
+      : CancelableRunnable("nsThreadShutdownAckEvent"),
+        mShutdownContext(aCtx) {}
+  NS_IMETHOD Run() override {
+    mShutdownContext->mTerminatingThread->ShutdownComplete(mShutdownContext);
+    return NS_OK;
+  }
+  nsresult Cancel() override { return Run(); }
+
+ private:
+  virtual ~nsThreadShutdownAckEvent() = default;
+
+  NotNull<RefPtr<nsThreadShutdownContext>> mShutdownContext;
+};
+
+class nsThreadShutdownEvent : public Runnable {
+ public:
+  nsThreadShutdownEvent(NotNull<nsThread*> aThr,
+                        NotNull<nsThreadShutdownContext*> aCtx)
+      : Runnable("nsThreadShutdownEvent"),
+        mThread(aThr),
+        mShutdownContext(aCtx) {}
+  NS_IMETHOD Run() override {
+    mThread->mShutdownContext = mShutdownContext;
+    MessageLoop::current()->Quit();
+#if defined(MOZ_DIAGNOSTIC_ASSERT_ENABLED)
+    nsAutoCString threadName(PR_GetThreadName(PR_GetCurrentThread()));
+    threadName.Append(",SHDRCV"_ns);
+    NS_SetCurrentThreadName(threadName.get());
+#endif
+    return NS_OK;
+  }
+
+ private:
+  NotNull<RefPtr<nsThread>> mThread;
+  NotNull<RefPtr<nsThreadShutdownContext>> mShutdownContext;
+};
+
+
+static void SetThreadAffinity(unsigned int cpu) {
+#if defined(HAVE_SCHED_SETAFFINITY)
+  cpu_set_t cpus;
+  CPU_ZERO(&cpus);
+  CPU_SET(cpu, &cpus);
+  sched_setaffinity(0, sizeof(cpus), &cpus);
+#endif
+}
+
+static void SetupCurrentThreadForChaosMode() {
+  if (!ChaosMode::isActive(ChaosFeature::ThreadScheduling)) {
+    return;
+  }
+
+#if defined(XP_LINUX)
+  setpriority(PRIO_PROCESS, 0, ChaosMode::randomUint32LessThan(4));
+#else
+  uint32_t priority = ChaosMode::randomUint32LessThan(PR_PRIORITY_LAST + 1);
+  PR_SetThreadPriority(PR_GetCurrentThread(), PRThreadPriority(priority));
+#endif
+
+  if (ChaosMode::randomUint32LessThan(2)) {
+    SetThreadAffinity(0);
+  }
+}
+
+namespace {
+
+struct ThreadInitData {
+  RefPtr<nsThread> thread;
+  nsCString name;
+};
+
+}  
+
+void nsThread::MaybeRemoveFromThreadList() {
+  nsThreadManager& tm = nsThreadManager::get();
+  OffTheBooksMutexAutoLock mal(tm.ThreadListMutex());
+  if (isInList()) {
+    removeFrom(tm.ThreadList());
+  }
+}
+
+void nsThread::ThreadFunc(void* aArg) {
+  using mozilla::ipc::BackgroundChild;
+
+  UniquePtr<ThreadInitData> initData(static_cast<ThreadInitData*>(aArg));
+  RefPtr<nsThread>& self = initData->thread;
+
+  MOZ_ASSERT(self->mEventTarget);
+  MOZ_ASSERT(self->mEvents);
+
+  DebugOnly<PRThread*> prev = self->mThread.exchange(PR_GetCurrentThread());
+  MOZ_ASSERT(!prev || prev == PR_GetCurrentThread());
+  self->mEventTarget->SetCurrentThread(self->mThread);
+  SetupCurrentThreadForChaosMode();
+
+  if (!initData->name.IsEmpty()) {
+    NS_SetCurrentThreadName(initData->name.get());
+  }
+
+  self->InitCommon();
+
+
+  nsThreadManager::get().RegisterCurrentThread(*self);
+
+  mozilla::IOInterposer::RegisterCurrentThread();
+
+  {
+    MessageLoop loop(
+        MessageLoop::TYPE_MOZILLA_NONMAINTHREAD,
+        self);
+
+    loop.Run();
+
+    self->mEvents->RunShutdownTasks();
+
+    BackgroundChild::CloseForCurrentThread();
+
+
+    while (true) {
+      self->WaitForAllAsynchronousShutdowns();
+
+      if (self->mEvents->ShutdownIfNoPendingEvents()) {
+        break;
+      }
+      NS_ProcessPendingEvents(self);
+    }
+  }
+
+  mozilla::IOInterposer::UnregisterCurrentThread();
+
+  nsThreadManager::get().UnregisterCurrentThread(*self);
+
+  NotNull<RefPtr<nsThreadShutdownContext>> context =
+      WrapNotNull(self->mShutdownContext);
+  self->mShutdownContext = nullptr;
+  MOZ_ASSERT(context->mTerminatingThread == self);
+
+  RefPtr<nsThread> joiningThread;
+  {
+    MutexAutoLock lock(context->mJoiningThreadMutex);
+    joiningThread = context->mJoiningThread.forget();
+    MOZ_RELEASE_ASSERT(joiningThread || context->mThreadLeaked);
+  }
+  if (joiningThread) {
+    nsCOMPtr<nsIRunnable> event = new nsThreadShutdownAckEvent(context);
+    nsresult dispatch_ack_rv =
+        joiningThread->Dispatch(event, NS_DISPATCH_NORMAL);
+
+    MOZ_RELEASE_ASSERT(NS_SUCCEEDED(dispatch_ack_rv));
+
+#if defined(MOZ_DIAGNOSTIC_ASSERT_ENABLED)
+    nsAutoCString threadName(PR_GetThreadName(PR_GetCurrentThread()));
+    threadName.Append(",SHDACK"_ns);
+    NS_SetCurrentThreadName(threadName.get());
+#endif
+  } else {
+    NS_WARNING(
+        "nsThread exiting after StopWaitingAndLeakThread was called, thread "
+        "resources will be leaked!");
+  }
+
+  self->SetObserver(nullptr);
+
+  self->mThread = nullptr;
+  self->mEventTarget->ClearCurrentThread();
+}
+
+void nsThread::InitCommon() {
+  mThreadId = uint32_t(PlatformThread::CurrentId());
+
+  {
+#if defined(XP_LINUX)
+    pthread_attr_t attr;
+    int res = pthread_attr_init(&attr);
+    MOZ_RELEASE_ASSERT(!res);
+    res = pthread_getattr_np(pthread_self(), &attr);
+    MOZ_RELEASE_ASSERT(!res);
+
+    size_t stackSize;
+    res = pthread_attr_getstack(&attr, &mStackBase, &stackSize);
+    MOZ_RELEASE_ASSERT(!res);
+
+    static bool sAdjustForGuardSize = ({
+#if defined(__GLIBC__)
+      unsigned major, minor;
+      sscanf(gnu_get_libc_version(), "%u.%u", &major, &minor) < 2 ||
+          major < 2 || (major == 2 && minor < 27);
+#else
+      false;
+#endif
+    });
+    if (sAdjustForGuardSize) {
+      size_t guardSize;
+      res = pthread_attr_getguardsize(&attr, &guardSize);
+      MOZ_RELEASE_ASSERT(!res);
+
+      mStackBase = reinterpret_cast<char*>(mStackBase) + guardSize;
+      stackSize -= guardSize;
+    }
+
+    mStackSize = stackSize;
+
+    madvise(mStackBase, stackSize, MADV_NOHUGEPAGE);
+
+    res = pthread_attr_destroy(&attr);
+    MOZ_RELEASE_ASSERT(!res);
+#endif
+  }
+
+  InitThreadLocalVariables();
+}
+
+
+#if defined(MOZ_CANARY)
+int sCanaryOutputFD = -1;
+#endif
+
+nsThread::nsThread(NotNull<SynchronizedEventQueue*> aQueue,
+                   MainThreadFlag aMainThread,
+                   nsIThreadManager::ThreadCreationOptions aOptions)
+    : mEvents(aQueue.get()),
+      mEventTarget(new ThreadEventTarget(
+          mEvents.get(), aMainThread == MAIN_THREAD, aOptions.blockDispatch)),
+      mOutstandingShutdownContexts(0),
+      mShutdownContext(nullptr),
+      mScriptObserver(nullptr),
+      mThreadName("<uninitialized>"),
+      mStackSize(aOptions.stackSize),
+      mNestedEventLoopDepth(0),
+      mShutdownRequired(false),
+      mPriority(PRIORITY_NORMAL),
+      mIsMainThread(aMainThread == MAIN_THREAD),
+      mIsUiThread(aOptions.isUiThread),
+      mIsAPoolThreadFreePtr(nullptr),
+      mCanInvokeJS(false),
+      mPerformanceCounterState(mNestedEventLoopDepth, mIsMainThread,
+                               aOptions.longTaskLength) {
+  MOZ_ASSERT(!mIsUiThread,
+             "Non-main UI threads are only supported on Windows and macOS");
+  if (mIsMainThread) {
+    MOZ_ASSERT(!mIsUiThread,
+               "Setting isUIThread is not supported for main threads");
+    mozilla::TaskController::Get()->SetPerformanceCounterState(
+        &mPerformanceCounterState);
+  }
+}
+
+nsThread::nsThread()
+    : mEvents(nullptr),
+      mEventTarget(nullptr),
+      mOutstandingShutdownContexts(0),
+      mShutdownContext(nullptr),
+      mScriptObserver(nullptr),
+      mThreadName("<uninitialized>"),
+      mStackSize(0),
+      mNestedEventLoopDepth(0),
+      mShutdownRequired(false),
+      mPriority(PRIORITY_NORMAL),
+      mIsMainThread(false),
+      mIsUiThread(false),
+      mCanInvokeJS(false),
+      mPerformanceCounterState(mNestedEventLoopDepth) {
+  MOZ_ASSERT(!NS_IsMainThread());
+}
+
+nsThread::~nsThread() {
+  NS_ASSERTION(mOutstandingShutdownContexts == 0,
+               "shouldn't be waiting on other threads to shutdown");
+
+  MaybeRemoveFromThreadList();
+}
+
+nsresult nsThread::Init(const nsACString& aName) {
+  MOZ_ASSERT(mEvents);
+  MOZ_ASSERT(mEventTarget);
+  MOZ_ASSERT(!mThread);
+
+  SetThreadNameInternal(aName);
+
+  PRThread* thread = nullptr;
+
+  nsThreadManager& tm = nsThreadManager::get();
+  {
+    OffTheBooksMutexAutoLock lock(tm.ThreadListMutex());
+    if (!tm.AllowNewXPCOMThreadsLocked()) {
+      return NS_ERROR_NOT_INITIALIZED;
+    }
+
+
+    UniquePtr<ThreadInitData> initData(
+        new ThreadInitData{this, nsCString(aName)});
+
+    if (!(thread = PR_CreateThread(PR_USER_THREAD, ThreadFunc, initData.get(),
+                                   PR_PRIORITY_NORMAL, PR_GLOBAL_THREAD,
+                                   PR_JOINABLE_THREAD, mStackSize))) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+
+    (void)initData.release();
+
+    mShutdownRequired = true;
+    tm.ThreadList().insertBack(this);
+  }
+
+  DebugOnly<PRThread*> prev = mThread.exchange(thread);
+  MOZ_ASSERT(!prev || prev == thread);
+
+  mEventTarget->SetCurrentThread(thread);
+  return NS_OK;
+}
+
+nsresult nsThread::InitCurrentThread() {
+  mThread = PR_GetCurrentThread();
+
+  nsThreadManager& tm = nsThreadManager::get();
+  {
+    OffTheBooksMutexAutoLock lock(tm.ThreadListMutex());
+    tm.ThreadList().insertBack(this);
+  }
+
+  SetupCurrentThreadForChaosMode();
+  InitCommon();
+
+  tm.RegisterCurrentThread(*this);
+  return NS_OK;
+}
+
+void nsThread::GetThreadName(nsACString& aNameBuffer) {
+  auto lock = mThreadName.Lock();
+  aNameBuffer = lock.ref();
+}
+
+void nsThread::SetThreadNameInternal(const nsACString& aName) {
+  auto lock = mThreadName.Lock();
+  lock->Assign(aName);
+}
+
+
+NS_IMETHODIMP
+nsThread::DispatchFromScript(nsIRunnable* aEvent, DispatchFlags aFlags) {
+  return Dispatch(do_AddRef(aEvent), aFlags);
+}
+
+NS_IMETHODIMP
+nsThread::Dispatch(already_AddRefed<nsIRunnable> aEvent, DispatchFlags aFlags) {
+  MaybeLeakRefPtr<nsIRunnable> event(std::move(aEvent),
+                                     aFlags & NS_DISPATCH_FALLIBLE);
+  MOZ_ASSERT(mEventTarget);
+  NS_ENSURE_TRUE(mEventTarget, NS_ERROR_NOT_IMPLEMENTED);
+
+  LOG(("THRD(%p) Dispatch [%p %x]\n", this, event.get(), aFlags));
+
+  return mEventTarget->Dispatch(event.forget(), aFlags);
+}
+
+NS_IMETHODIMP
+nsThread::DelayedDispatch(already_AddRefed<nsIRunnable> aEvent,
+                          uint32_t aDelayMs) {
+  MOZ_ASSERT(mEventTarget);
+  NS_ENSURE_TRUE(mEventTarget, NS_ERROR_NOT_IMPLEMENTED);
+
+  return mEventTarget->DelayedDispatch(std::move(aEvent), aDelayMs);
+}
+
+NS_IMETHODIMP
+nsThread::RegisterShutdownTask(nsITargetShutdownTask* aTask) {
+  MOZ_ASSERT(mEventTarget);
+  NS_ENSURE_TRUE(mEventTarget, NS_ERROR_NOT_IMPLEMENTED);
+
+  return mEventTarget->RegisterShutdownTask(aTask);
+}
+
+NS_IMETHODIMP
+nsThread::UnregisterShutdownTask(nsITargetShutdownTask* aTask) {
+  MOZ_ASSERT(mEventTarget);
+  NS_ENSURE_TRUE(mEventTarget, NS_ERROR_NOT_IMPLEMENTED);
+
+  return mEventTarget->UnregisterShutdownTask(aTask);
+}
+
+nsIEventTarget::FeatureFlags nsThread::GetFeatures() {
+  return (mIsMainThread ? SUPPORTS_PRIORITIZATION : SUPPORTS_BASE) |
+         (SUPPORTS_SHUTDOWN_TASKS | SUPPORTS_SHUTDOWN_TASK_DISPATCH);
+}
+
+NS_IMETHODIMP
+nsThread::GetRunningEventDelay(TimeDuration* aDelay, TimeStamp* aStart) {
+  if (mIsAPoolThreadFreePtr && *mIsAPoolThreadFreePtr) {
+    *aDelay = TimeDuration();
+    *aStart = TimeStamp();
+  } else {
+    *aDelay = mLastEventDelay;
+    *aStart = mLastEventStart;
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsThread::SetRunningEventDelay(TimeDuration aDelay, TimeStamp aStart) {
+  mLastEventDelay = aDelay;
+  mLastEventStart = aStart;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsThread::IsOnCurrentThread(bool* aResult) {
+  if (mEventTarget) {
+    return mEventTarget->IsOnCurrentThread(aResult);
+  }
+  *aResult = PR_GetCurrentThread() == mThread;
+  return NS_OK;
+}
+
+NS_IMETHODIMP_(bool)
+nsThread::IsOnCurrentThreadInfallible() {
+  return false;
+}
+
+
+NS_IMETHODIMP
+nsThread::GetPRThread(PRThread** aResult) {
+  PRThread* thread = mThread;  
+  *aResult = thread;
+  return thread ? NS_OK : NS_ERROR_NOT_AVAILABLE;
+}
+
+NS_IMETHODIMP
+nsThread::GetCanInvokeJS(bool* aResult) {
+  *aResult = mCanInvokeJS;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsThread::SetCanInvokeJS(bool aCanInvokeJS) {
+  mCanInvokeJS = aCanInvokeJS;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsThread::GetLastLongTaskEnd(TimeStamp* _retval) {
+  *_retval = mPerformanceCounterState.LastLongTaskEnd();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsThread::GetLastLongNonIdleTaskEnd(TimeStamp* _retval) {
+  *_retval = mPerformanceCounterState.LastLongNonIdleTaskEnd();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsThread::AsyncShutdown() {
+  LOG(("THRD(%p) async shutdown\n", this));
+
+  nsCOMPtr<nsIThreadShutdown> shutdown;
+  BeginShutdown(getter_AddRefs(shutdown));
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsThread::BeginShutdown(nsIThreadShutdown** aShutdown) {
+  LOG(("THRD(%p) begin shutdown\n", this));
+
+  MOZ_ASSERT(mEvents);
+  MOZ_ASSERT(mEventTarget);
+  MOZ_ASSERT(mThread != PR_GetCurrentThread());
+  if (NS_WARN_IF(mThread == PR_GetCurrentThread())) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  if (!mShutdownRequired.compareExchange(true, false)) {
+    return NS_ERROR_UNEXPECTED;
+  }
+  MOZ_ASSERT(mThread);
+
+  RefPtr<nsThread> currentThread = nsThreadManager::get().GetCurrentThread();
+
+  MOZ_DIAGNOSTIC_ASSERT(currentThread->EventQueue(),
+                        "Shutdown() may only be called from an XPCOM thread");
+
+  RefPtr<nsThreadShutdownContext> context =
+      new nsThreadShutdownContext(WrapNotNull(this), currentThread);
+
+  ++currentThread->mOutstandingShutdownContexts;
+  nsCOMPtr<nsIRunnable> clearOutstanding = NS_NewRunnableFunction(
+      "nsThread::ClearOutstandingShutdownContext",
+      [currentThread] { --currentThread->mOutstandingShutdownContexts; });
+  context->OnCompletion(clearOutstanding);
+
+  RefPtr<nsIRunnable> event = MakeRefPtr<nsThreadShutdownEvent>(
+      WrapNotNull(this), WrapNotNull(context));
+  if (!mEvents->PutEvent(event, EventQueuePriority::Normal)) {
+    nsAutoCString threadName;
+    GetThreadName(threadName);
+    MOZ_CRASH_UNSAFE_PRINTF("Attempt to shutdown an already dead thread: %s",
+                            threadName.get());
+  }
+
+  context.forget(aShutdown);
+  return NS_OK;
+}
+
+void nsThread::ShutdownComplete(NotNull<nsThreadShutdownContext*> aContext) {
+  MOZ_ASSERT(mEvents);
+  MOZ_ASSERT(mEventTarget);
+  MOZ_ASSERT(aContext->mTerminatingThread == this);
+
+#if defined(MOZ_DIAGNOSTIC_ASSERT_ENABLED)
+  {
+    MutexAutoLock lock(aContext->mJoiningThreadMutex);
+
+    MOZ_DIAGNOSTIC_ASSERT(!aContext->mThreadLeaked);
+  }
+#endif
+
+  MaybeRemoveFromThreadList();
+
+  PR_JoinThread(aContext->mTerminatingPRThread);
+  MOZ_ASSERT(!mThread);
+
+#if defined(DEBUG)
+  nsCOMPtr<nsIThreadObserver> obs = mEvents->GetObserver();
+  MOZ_ASSERT(!obs, "Should have been cleared at shutdown!");
+#endif
+
+  aContext->MarkCompleted();
+}
+
+void nsThread::WaitForAllAsynchronousShutdowns() {
+  SpinEventLoopUntil<ProcessFailureBehavior::IgnoreAndContinue>(
+      "nsThread::WaitForAllAsynchronousShutdowns"_ns,
+      [&]() { return mOutstandingShutdownContexts == 0; }, this);
+}
+
+NS_IMETHODIMP
+nsThread::Shutdown() {
+  LOG(("THRD(%p) sync shutdown\n", this));
+
+  nsCOMPtr<nsIThreadShutdown> context;
+  nsresult rv = BeginShutdown(getter_AddRefs(context));
+  if (NS_FAILED(rv)) {
+    return NS_OK;  
+  }
+
+  nsAutoCString threadName;
+  GetThreadName(threadName);
+
+  SpinEventLoopUntil("nsThread::Shutdown: "_ns + threadName,
+                     [&]() { return context->GetCompleted(); });
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsThread::HasPendingEvents(bool* aResult) {
+  if (NS_WARN_IF(PR_GetCurrentThread() != mThread)) {
+    return NS_ERROR_NOT_SAME_THREAD;
+  }
+
+  if (mIsMainThread) {
+    *aResult = TaskController::Get()->HasMainThreadPendingTasks();
+  } else {
+    *aResult = mEvents->HasPendingEvent();
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsThread::HasPendingHighPriorityEvents(bool* aResult) {
+  if (NS_WARN_IF(PR_GetCurrentThread() != mThread)) {
+    return NS_ERROR_NOT_SAME_THREAD;
+  }
+
+  *aResult = false;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsThread::DispatchToQueue(already_AddRefed<nsIRunnable> aEvent,
+                          EventQueuePriority aQueue) {
+  RefPtr<nsIRunnable> event = aEvent;
+
+  if (NS_WARN_IF(!event)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  if (!mEvents->PutEvent(event, aQueue)) {
+    NS_WARNING(
+        "An idle event was posted to a thread that will never run it "
+        "(rejected)");
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsThread::SetThreadQoS(nsIThread::QoSPriority aPriority) {
+  if (!StaticPrefs::threads_use_low_power_enabled()) {
+    return NS_OK;
+  }
+  MOZ_ASSERT(IsOnCurrentThread(), "Can only change the current thread's QoS");
+
+  return NS_OK;
+}
+
+#if defined(MOZ_CANARY)
+void canary_alarm_handler(int signum);
+
+class Canary {
+ public:
+  Canary() {
+    if (sCanaryOutputFD > 0 && EventLatencyIsImportant()) {
+      signal(SIGALRM, canary_alarm_handler);
+      ualarm(15000, 0);
+    }
+  }
+
+  ~Canary() {
+    if (sCanaryOutputFD != 0 && EventLatencyIsImportant()) {
+      ualarm(0, 0);
+    }
+  }
+
+  static bool EventLatencyIsImportant() {
+    return NS_IsMainThread() && XRE_IsParentProcess();
+  }
+};
+
+void canary_alarm_handler(int signum) {
+  void* array[30];
+  const char msg[29] = "event took too long to run:\n";
+  write(sCanaryOutputFD, msg, sizeof(msg));
+  backtrace_symbols_fd(array, backtrace(array, 30), sCanaryOutputFD);
+}
+
+#endif
+
+#define NOTIFY_EVENT_OBSERVERS(observers_, func_, params_)                 \
+  do {                                                                     \
+    if (!observers_.IsEmpty()) {                                           \
+      for (nsCOMPtr<nsIThreadObserver> obs_ : observers_.ForwardRange()) { \
+        obs_->func_ params_;                                               \
+      }                                                                    \
+    }                                                                      \
+  } while (0)
+
+size_t nsThread::ShallowSizeOfIncludingThis(
+    mozilla::MallocSizeOf aMallocSizeOf) const {
+  size_t n = 0;
+  if (mShutdownContext) {
+    n += aMallocSizeOf(mShutdownContext);
+  }
+  return aMallocSizeOf(this) + aMallocSizeOf(mThread) + n;
+}
+
+size_t nsThread::SizeOfEventQueues(mozilla::MallocSizeOf aMallocSizeOf) const {
+  size_t n = 0;
+  if (mEventTarget) {
+    n += mEventTarget->SizeOfIncludingThis(aMallocSizeOf);
+  }
+  return n;
+}
+
+size_t nsThread::SizeOfIncludingThis(
+    mozilla::MallocSizeOf aMallocSizeOf) const {
+  return ShallowSizeOfIncludingThis(aMallocSizeOf) +
+         SizeOfEventQueues(aMallocSizeOf);
+}
+
+NS_IMETHODIMP
+nsThread::ProcessNextEvent(bool aMayWait, bool* aResult) {
+  MOZ_ASSERT(mEvents);
+  NS_ENSURE_TRUE(mEvents, NS_ERROR_NOT_IMPLEMENTED);
+
+  LOG(("THRD(%p) ProcessNextEvent [%u %u]\n", this, aMayWait,
+       mNestedEventLoopDepth));
+
+  if (NS_WARN_IF(PR_GetCurrentThread() != mThread)) {
+    return NS_ERROR_NOT_SAME_THREAD;
+  }
+
+  bool reallyWait = aMayWait && (mNestedEventLoopDepth > 0 || !ShuttingDown());
+
+  Maybe<dom::AutoNoJSAPI> noJSAPI;
+
+  if (mIsMainThread) {
+    DoMainThreadSpecificProcessing();
+  }
+
+#if defined(DEBUG)
+  BlockingResourceBase::AssertSafeToProcessEventLoop();
+#endif
+
+  ++mNestedEventLoopDepth;
+
+  bool callScriptObserver = !!mScriptObserver;
+  if (callScriptObserver) {
+    noJSAPI.emplace();
+    mScriptObserver->BeforeProcessTask(reallyWait);
+  }
+
+  DrainDirectTasks();
+
+  nsCOMPtr<nsIThreadObserver> obs = mEvents->GetObserverOnThread();
+  if (obs) {
+    obs->OnProcessNextEvent(this, reallyWait);
+  }
+
+  NOTIFY_EVENT_OBSERVERS(EventQueue()->EventObservers(), OnProcessNextEvent,
+                         (this, reallyWait));
+
+  DrainDirectTasks();
+
+#if defined(MOZ_CANARY)
+  Canary canary;
+#endif
+  nsresult rv = NS_OK;
+
+  bool usingTaskController = mIsMainThread;
+  {
+    nsCOMPtr<nsIRunnable> event;
+    if (usingTaskController) {
+      event = TaskController::Get()->GetRunnableForMTTask(reallyWait);
+    } else {
+      event = mEvents->GetEvent(reallyWait, &mLastEventDelay);
+    }
+
+    *aResult = (event.get() != nullptr);
+
+    if (event) {
+      LOG(("THRD(%p) running [%p]\n", this, event.get()));
+
+      Maybe<LogRunnable::Run> log;
+
+      if (!usingTaskController) {
+        log.emplace(event);
+      }
+
+      DelayForChaosMode(ChaosFeature::TaskRunning, 1000);
+
+      mozilla::TimeStamp now = mozilla::TimeStamp::Now();
+
+      Maybe<PerformanceCounterState::Snapshot> snapshot;
+      if (!usingTaskController) {
+        snapshot.emplace(mPerformanceCounterState.RunnableWillRun(now, false));
+      }
+
+      mLastEventStart = now;
+
+      if (!usingTaskController) {
+        event->Run();
+      } else {
+        event->Run();
+      }
+
+      if (usingTaskController) {
+        *aResult = TaskController::Get()->MTTaskRunnableProcessedTask();
+      } else {
+        mPerformanceCounterState.RunnableDidRun(EmptyCString(),
+                                                std::move(snapshot.ref()));
+      }
+
+      event = nullptr;
+    } else {
+      mLastEventDelay = TimeDuration();
+      mLastEventStart = TimeStamp();
+      if (aMayWait) {
+        MOZ_ASSERT(ShuttingDown(),
+                   "This should only happen when shutting down");
+        rv = NS_ERROR_UNEXPECTED;
+      }
+    }
+  }
+
+  DrainDirectTasks();
+
+#if defined(MOZ_MEMORY)
+  if (usingTaskController) {
+    TaskController::Get()->MayScheduleIdleMemoryCleanup();
+  }
+#endif
+
+  NOTIFY_EVENT_OBSERVERS(EventQueue()->EventObservers(), AfterProcessNextEvent,
+                         (this, *aResult));
+
+  if (obs) {
+    obs->AfterProcessNextEvent(this, *aResult);
+  }
+
+  DrainDirectTasks();
+
+  if (callScriptObserver) {
+    if (mScriptObserver) {
+      mScriptObserver->AfterProcessTask(mNestedEventLoopDepth);
+    }
+    noJSAPI.reset();
+  }
+
+  --mNestedEventLoopDepth;
+
+  return rv;
+}
+
+
+NS_IMETHODIMP
+nsThread::GetPriority(int32_t* aPriority) {
+  *aPriority = mPriority;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsThread::SetPriority(int32_t aPriority) {
+  if (NS_WARN_IF(!mThread)) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+
+  mPriority = aPriority;
+
+  PRThreadPriority pri;
+  if (mPriority <= PRIORITY_HIGHEST) {
+    pri = PR_PRIORITY_URGENT;
+  } else if (mPriority < PRIORITY_NORMAL) {
+    pri = PR_PRIORITY_HIGH;
+  } else if (mPriority > PRIORITY_NORMAL) {
+    pri = PR_PRIORITY_LOW;
+  } else {
+    pri = PR_PRIORITY_NORMAL;
+  }
+  if (!ChaosMode::isActive(ChaosFeature::ThreadScheduling)) {
+    PR_SetThreadPriority(mThread, pri);
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsThread::AdjustPriority(int32_t aDelta) {
+  return SetPriority(mPriority + aDelta);
+}
+
+
+NS_IMETHODIMP
+nsThread::GetObserver(nsIThreadObserver** aObs) {
+  MOZ_ASSERT(mEvents);
+  NS_ENSURE_TRUE(mEvents, NS_ERROR_NOT_IMPLEMENTED);
+
+  nsCOMPtr<nsIThreadObserver> obs = mEvents->GetObserver();
+  obs.forget(aObs);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsThread::SetObserver(nsIThreadObserver* aObs) {
+  MOZ_ASSERT(mEvents);
+  NS_ENSURE_TRUE(mEvents, NS_ERROR_NOT_IMPLEMENTED);
+
+  if (NS_WARN_IF(PR_GetCurrentThread() != mThread)) {
+    return NS_ERROR_NOT_SAME_THREAD;
+  }
+
+  mEvents->SetObserver(aObs);
+  return NS_OK;
+}
+
+uint32_t nsThread::RecursionDepth() const {
+  MOZ_ASSERT(PR_GetCurrentThread() == mThread);
+  return mNestedEventLoopDepth;
+}
+
+NS_IMETHODIMP
+nsThread::AddObserver(nsIThreadObserver* aObserver) {
+  MOZ_ASSERT(mEvents);
+  NS_ENSURE_TRUE(mEvents, NS_ERROR_NOT_IMPLEMENTED);
+
+  if (NS_WARN_IF(!aObserver)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+  if (NS_WARN_IF(PR_GetCurrentThread() != mThread)) {
+    return NS_ERROR_NOT_SAME_THREAD;
+  }
+
+  EventQueue()->AddObserver(aObserver);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsThread::RemoveObserver(nsIThreadObserver* aObserver) {
+  MOZ_ASSERT(mEvents);
+  NS_ENSURE_TRUE(mEvents, NS_ERROR_NOT_IMPLEMENTED);
+
+  if (NS_WARN_IF(PR_GetCurrentThread() != mThread)) {
+    return NS_ERROR_NOT_SAME_THREAD;
+  }
+
+  EventQueue()->RemoveObserver(aObserver);
+
+  return NS_OK;
+}
+
+void nsThread::SetScriptObserver(
+    mozilla::CycleCollectedJSContext* aScriptObserver) {
+  if (!aScriptObserver) {
+    mScriptObserver = nullptr;
+    return;
+  }
+
+  MOZ_ASSERT(!mScriptObserver);
+  mScriptObserver = aScriptObserver;
+}
+
+void NS_DispatchMemoryPressure();
+
+void nsThread::DoMainThreadSpecificProcessing() const {
+  MOZ_ASSERT(mIsMainThread);
+
+  ipc::CancelCPOWs();
+
+  if (!ShuttingDown()) {
+    NS_DispatchMemoryPressure();
+  }
+}
+
+
+NS_IMETHODIMP
+nsThread::DispatchDirectTask(already_AddRefed<nsIRunnable> aEvent) {
+  if (!IsOnCurrentThread()) {
+    return NS_ERROR_FAILURE;
+  }
+  mDirectTasks.AddTask(std::move(aEvent));
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsThread::DrainDirectTasks() {
+  if (!IsOnCurrentThread()) {
+    return NS_ERROR_FAILURE;
+  }
+  mDirectTasks.DrainTasks();
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsThread::HaveDirectTasks(bool* aValue) {
+  if (!IsOnCurrentThread()) {
+    return NS_ERROR_FAILURE;
+  }
+
+  *aValue = mDirectTasks.HaveTasks();
+  return NS_OK;
+}
+
+NS_IMPL_ISUPPORTS(nsThreadShutdownContext, nsIThreadShutdown)
+
+NS_IMETHODIMP
+nsThreadShutdownContext::OnCompletion(nsIRunnable* aEvent) {
+  if (mCompleted) {
+    aEvent->Run();
+  } else {
+    mCompletionCallbacks.AppendElement(aEvent);
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsThreadShutdownContext::GetCompleted(bool* aCompleted) {
+  *aCompleted = mCompleted;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsThreadShutdownContext::StopWaitingAndLeakThread() {
+  RefPtr<nsThread> joiningThread;
+  {
+    MutexAutoLock lock(mJoiningThreadMutex);
+    if (!mJoiningThread) {
+      return NS_ERROR_NOT_AVAILABLE;
+    }
+    joiningThread = mJoiningThread.forget();
+    mThreadLeaked = true;
+  }
+
+  MOZ_DIAGNOSTIC_ASSERT(joiningThread->IsOnCurrentThread());
+
+  MarkCompleted();
+
+  return NS_OK;
+}
+
+void nsThreadShutdownContext::MarkCompleted() {
+  MOZ_ASSERT(!mCompleted);
+  mCompleted = true;
+  nsTArray<nsCOMPtr<nsIRunnable>> callbacks(std::move(mCompletionCallbacks));
+  for (auto& callback : callbacks) {
+    callback->Run();
+  }
+}
+
+namespace mozilla {
+PerformanceCounterState::Snapshot PerformanceCounterState::RunnableWillRun(
+    TimeStamp aNow, bool aIsIdleRunnable) {
+  if (mIsMainThread && IsNestedRunnable()) {
+    MaybeReportAccumulatedTime("nested runnable"_ns, aNow);
+  }
+
+  Snapshot snapshot(mCurrentEventLoopDepth, mCurrentRunnableIsIdleRunnable);
+
+  mCurrentEventLoopDepth = mNestedEventLoopDepth;
+  mCurrentRunnableIsIdleRunnable = aIsIdleRunnable;
+  mCurrentTimeSliceStart = aNow;
+
+  return snapshot;
+}
+
+void PerformanceCounterState::RunnableDidRun(const nsCString& aName,
+                                             Snapshot&& aSnapshot) {
+  mCurrentEventLoopDepth = aSnapshot.mOldEventLoopDepth;
+
+  TimeStamp now;
+  if (mLongTaskLength.isSome() || IsNestedRunnable()) {
+    now = TimeStamp::Now();
+  }
+  if (mLongTaskLength.isSome()) {
+    MaybeReportAccumulatedTime(aName, now);
+  }
+
+  mCurrentRunnableIsIdleRunnable = aSnapshot.mOldIsIdleRunnable;
+  if (IsNestedRunnable()) {
+    mCurrentTimeSliceStart = now;
+  } else {
+    mCurrentTimeSliceStart = TimeStamp();
+  }
+}
+
+void PerformanceCounterState::MaybeReportAccumulatedTime(const nsCString&,
+                                                         TimeStamp aNow) {
+  MOZ_ASSERT(mCurrentTimeSliceStart,
+             "How did we get here if we're not in a timeslice?");
+  if (!mLongTaskLength.isSome()) {
+    return;
+  }
+
+  TimeDuration duration = aNow - mCurrentTimeSliceStart;
+  if (duration.ToMilliseconds() >= mLongTaskLength.value()) {
+    if (!mCurrentRunnableIsIdleRunnable) {
+      mLastLongNonIdleTaskEnd = aNow;
+    }
+    mLastLongTaskEnd = aNow;
+
+  }
+}
+
+}  

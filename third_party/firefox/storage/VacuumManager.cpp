@@ -1,0 +1,239 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/DebugOnly.h"
+
+#include "VacuumManager.h"
+
+#include "mozilla/ErrorNames.h"
+#include "mozilla/Services.h"
+#include "mozilla/Preferences.h"
+#include "nsIObserverService.h"
+#include "nsIFile.h"
+#include "nsThreadUtils.h"
+#include "mozilla/Logging.h"
+#include "mozilla/IntegerPrintfMacros.h"
+#include "prtime.h"
+
+#include "mozStorageConnection.h"
+#include "mozStoragePrivateHelpers.h"
+#include "mozIStorageCompletionCallback.h"
+#include "nsXULAppAPI.h"
+#include "xpcpublic.h"
+
+#define OBSERVER_TOPIC_IDLE_DAILY "idle-daily"
+
+#define OBSERVER_TOPIC_VACUUM_BEGIN "vacuum-begin"
+#define OBSERVER_TOPIC_VACUUM_END "vacuum-end"
+#define OBSERVER_TOPIC_VACUUM_SKIP "vacuum-skip"
+
+#define PREF_VACUUM_BRANCH "storage.vacuum.last."
+
+#define VACUUM_INTERVAL_SECONDS (30 * 86400)  // 30 days.
+
+extern mozilla::LazyLogModule gStorageLog;
+
+namespace mozilla::storage {
+
+namespace {
+
+
+class Vacuumer final : public mozIStorageCompletionCallback {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_MOZISTORAGECOMPLETIONCALLBACK
+
+  explicit Vacuumer(mozIStorageVacuumParticipant* aParticipant);
+  bool execute();
+
+ private:
+  nsresult notifyCompletion(bool aSucceeded);
+  ~Vacuumer() = default;
+
+  nsCOMPtr<mozIStorageVacuumParticipant> mParticipant;
+  nsCString mDBFilename;
+  nsCOMPtr<mozIStorageAsyncConnection> mDBConn;
+};
+
+
+NS_IMPL_ISUPPORTS(Vacuumer, mozIStorageCompletionCallback)
+
+Vacuumer::Vacuumer(mozIStorageVacuumParticipant* aParticipant)
+    : mParticipant(aParticipant) {}
+
+bool Vacuumer::execute() {
+  MOZ_ASSERT(NS_IsMainThread(), "Must be running on the main thread!");
+
+  nsresult rv = mParticipant->GetDatabaseConnection(getter_AddRefs(mDBConn));
+  if (NS_FAILED(rv) || !mDBConn) return false;
+
+  nsCOMPtr<nsIObserverService> os = mozilla::services::GetObserverService();
+
+  bool inAutomation = false;
+  nsCOMPtr<nsIFile> databaseFile;
+  mDBConn->GetDatabaseFile(getter_AddRefs(databaseFile));
+  if (!databaseFile) {
+    NS_WARNING("Trying to vacuum a in-memory database!");
+    if (inAutomation && os) {
+      (void)os->NotifyObservers(nullptr, OBSERVER_TOPIC_VACUUM_SKIP,
+                                u":memory:");
+    }
+    return false;
+  }
+  nsAutoString databaseFilename;
+  rv = databaseFile->GetLeafName(databaseFilename);
+  NS_ENSURE_SUCCESS(rv, false);
+  CopyUTF16toUTF8(databaseFilename, mDBFilename);
+  MOZ_ASSERT(!mDBFilename.IsEmpty(), "Database filename cannot be empty");
+
+  int32_t now = static_cast<int32_t>(PR_Now() / PR_USEC_PER_SEC);
+  int32_t lastVacuum;
+  nsAutoCString prefName(PREF_VACUUM_BRANCH);
+  prefName += mDBFilename;
+  rv = Preferences::GetInt(prefName.get(), &lastVacuum);
+  if (NS_SUCCEEDED(rv) && (now - lastVacuum) < VACUUM_INTERVAL_SECONDS) {
+    if (inAutomation && os) {
+      (void)os->NotifyObservers(nullptr, OBSERVER_TOPIC_VACUUM_SKIP,
+                                NS_ConvertUTF8toUTF16(mDBFilename).get());
+    }
+    return false;
+  }
+
+  bool vacuumGranted = false;
+  rv = mParticipant->OnBeginVacuum(&vacuumGranted);
+  NS_ENSURE_SUCCESS(rv, false);
+  if (!vacuumGranted) {
+    if (inAutomation && os) {
+      (void)os->NotifyObservers(nullptr, OBSERVER_TOPIC_VACUUM_SKIP,
+                                NS_ConvertUTF8toUTF16(mDBFilename).get());
+    }
+    return false;
+  }
+
+  int32_t expectedPageSize = 0;
+  rv = mParticipant->GetExpectedDatabasePageSize(&expectedPageSize);
+  if (NS_FAILED(rv) || !Service::pageSizeIsValid(expectedPageSize)) {
+    NS_WARNING("Invalid page size requested for database, won't set it. ");
+    NS_WARNING(mDBFilename.get());
+    expectedPageSize = 0;
+  }
+
+  bool incremental = false;
+  (void)mParticipant->GetUseIncrementalVacuum(&incremental);
+
+  if (os) {
+    (void)os->NotifyObservers(nullptr, OBSERVER_TOPIC_VACUUM_BEGIN,
+                              NS_ConvertUTF8toUTF16(mDBFilename).get());
+  }
+
+  rv = mDBConn->AsyncVacuum(this, incremental, expectedPageSize);
+  if (NS_FAILED(rv)) {
+    (void)Complete(rv, nullptr);
+    return false;
+  }
+
+  return true;
+}
+
+NS_IMETHODIMP
+Vacuumer::Complete(nsresult aStatus, nsISupports* aValue) {
+  if (NS_SUCCEEDED(aStatus)) {
+    int32_t now = static_cast<int32_t>(PR_Now() / PR_USEC_PER_SEC);
+    MOZ_ASSERT(!mDBFilename.IsEmpty(), "Database filename cannot be empty");
+    nsAutoCString prefName(PREF_VACUUM_BRANCH);
+    prefName += mDBFilename;
+    DebugOnly<nsresult> rv = Preferences::SetInt(prefName.get(), now);
+    MOZ_ASSERT(NS_SUCCEEDED(rv), "Should be able to set a preference");
+    notifyCompletion(true);
+    return NS_OK;
+  }
+
+  nsAutoCString errName;
+  GetErrorName(aStatus, errName);
+  nsCString errMsg = nsPrintfCString(
+      "Vacuum failed on '%s' with error %s - code %" PRIX32, mDBFilename.get(),
+      errName.get(), static_cast<uint32_t>(aStatus));
+  NS_WARNING(errMsg.get());
+  if (MOZ_LOG_TEST(gStorageLog, LogLevel::Error)) {
+    MOZ_LOG(gStorageLog, LogLevel::Error, ("%s", errMsg.get()));
+  }
+
+  notifyCompletion(false);
+  return NS_OK;
+}
+
+nsresult Vacuumer::notifyCompletion(bool aSucceeded) {
+  nsCOMPtr<nsIObserverService> os = mozilla::services::GetObserverService();
+  if (os) {
+    (void)os->NotifyObservers(nullptr, OBSERVER_TOPIC_VACUUM_END,
+                              NS_ConvertUTF8toUTF16(mDBFilename).get());
+  }
+
+  nsresult rv = mParticipant->OnEndVacuum(aSucceeded);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+}  
+
+
+NS_IMPL_ISUPPORTS(VacuumManager, nsIObserver)
+
+VacuumManager* VacuumManager::gVacuumManager = nullptr;
+
+already_AddRefed<VacuumManager> VacuumManager::getSingleton() {
+  if (!XRE_IsParentProcess()) {
+    return nullptr;
+  }
+
+  if (!gVacuumManager) {
+    auto manager = MakeRefPtr<VacuumManager>();
+    MOZ_ASSERT(gVacuumManager == manager.get());
+    return manager.forget();
+  }
+  return do_AddRef(gVacuumManager);
+}
+
+VacuumManager::VacuumManager() : mParticipants("vacuum-participant") {
+  MOZ_ASSERT(!gVacuumManager,
+             "Attempting to create two instances of the service!");
+  gVacuumManager = this;
+}
+
+VacuumManager::~VacuumManager() {
+  MOZ_ASSERT(gVacuumManager == this,
+             "Deleting a non-singleton instance of the service");
+  if (gVacuumManager == this) {
+    gVacuumManager = nullptr;
+  }
+}
+
+
+NS_IMETHODIMP
+VacuumManager::Observe(nsISupports* aSubject, const char* aTopic,
+                       const char16_t* aData) {
+  if (strcmp(aTopic, OBSERVER_TOPIC_IDLE_DAILY) == 0) {
+    nsCOMArray<mozIStorageVacuumParticipant> entries;
+    mParticipants.GetEntries(entries);
+    static const char* kPrefName = PREF_VACUUM_BRANCH "index";
+    int32_t startIndex = Preferences::GetInt(kPrefName, 0);
+    if (startIndex >= entries.Count()) {
+      startIndex = 0;
+    }
+    int32_t index;
+    for (index = startIndex; index < entries.Count(); ++index) {
+      auto vacuum = MakeRefPtr<Vacuumer>(entries[index]);
+      if (vacuum->execute()) {
+        break;
+      }
+    }
+    DebugOnly<nsresult> rv = Preferences::SetInt(kPrefName, index);
+    MOZ_ASSERT(NS_SUCCEEDED(rv), "Should be able to set a preference");
+  }
+
+  return NS_OK;
+}
+
+}  

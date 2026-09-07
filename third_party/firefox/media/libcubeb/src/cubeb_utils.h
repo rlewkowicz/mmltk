@@ -1,0 +1,277 @@
+/*
+ * Copyright © 2016 Mozilla Foundation
+ *
+ * This program is made available under an ISC-style license.  See the
+ * accompanying file LICENSE for details.
+ */
+
+#if !defined(CUBEB_UTILS)
+#define CUBEB_UTILS
+
+#if !defined(NOMINMAX)
+#define NOMINMAX
+#endif
+
+#include "cubeb/cubeb.h"
+
+#if defined(__cplusplus)
+
+#include <algorithm>
+#include <assert.h>
+#include <mutex>
+#include <stdint.h>
+#include <string.h>
+#include <type_traits>
+#include "cubeb_utils_unix.h"
+
+template <typename T>
+void
+PodCopy(T * destination, const T * source, size_t count)
+{
+  static_assert(std::is_trivial<T>::value, "Requires trivial type");
+  assert(destination && source);
+  memcpy(destination, source, count * sizeof(T));
+}
+
+template <typename T>
+void
+PodMove(T * destination, const T * source, size_t count)
+{
+  static_assert(std::is_trivial<T>::value, "Requires trivial type");
+  assert(destination && source);
+  memmove(destination, source, count * sizeof(T));
+}
+
+template <typename T>
+void
+PodZero(T * destination, size_t count)
+{
+  static_assert(std::is_trivial<T>::value, "Requires trivial type");
+  assert(destination);
+  memset(destination, 0, count * sizeof(T));
+}
+
+namespace {
+template <typename T, typename Trait>
+void
+Copy(T * destination, const T * source, size_t count, Trait)
+{
+  for (size_t i = 0; i < count; i++) {
+    destination[i] = source[i];
+  }
+}
+
+template <typename T>
+void
+Copy(T * destination, const T * source, size_t count, std::true_type)
+{
+  PodCopy(destination, source, count);
+}
+} 
+
+template <typename T>
+void
+Copy(T * destination, const T * source, size_t count)
+{
+  assert(destination && source);
+  Copy(destination, source, count, typename std::is_trivial<T>::type());
+}
+
+namespace {
+template <typename T, typename Trait>
+void
+ConstructDefault(T * destination, size_t count, Trait)
+{
+  for (size_t i = 0; i < count; i++) {
+    destination[i] = T();
+  }
+}
+
+template <typename T>
+void
+ConstructDefault(T * destination, size_t count, std::true_type)
+{
+  PodZero(destination, count);
+}
+} 
+
+template <typename T>
+void
+ConstructDefault(T * destination, size_t count)
+{
+  assert(destination);
+  ConstructDefault(destination, count, typename std::is_arithmetic<T>::type());
+}
+
+template <typename T> class auto_array {
+public:
+  explicit auto_array(uint32_t capacity = 0)
+      : data_(capacity ? new T[capacity] : nullptr), capacity_(capacity),
+        length_(0)
+  {
+  }
+
+  ~auto_array() { delete[] data_; }
+
+  auto_array(const auto_array &) = delete;
+  auto_array & operator=(const auto_array &) = delete;
+  auto_array(auto_array &&) = delete;
+  auto_array & operator=(auto_array &&) = delete;
+
+  T * data() const { return data_; }
+
+  T * end() const { return data_ + length_; }
+
+  const T & at(size_t index) const
+  {
+    assert(index < length_ && "out of range");
+    return data_[index];
+  }
+
+  T & at(size_t index)
+  {
+    assert(index < length_ && "out of range");
+    return data_[index];
+  }
+
+  size_t capacity() const { return capacity_; }
+
+  size_t length() const { return length_; }
+
+  void clear() { length_ = 0; }
+
+  void reserve(size_t new_capacity)
+  {
+    if (new_capacity <= capacity_) {
+      return;
+    }
+    T * new_data = new T[new_capacity];
+    if (data_ && length_) {
+      PodCopy(new_data, data_, length_);
+    }
+    capacity_ = new_capacity;
+    delete[] data_;
+    data_ = new_data;
+  }
+
+  void push(const T * elements, size_t length)
+  {
+    if (length_ + length > capacity_) {
+      reserve(std::max(length_ + length, capacity_ * 2));
+    }
+    if (data_) {
+      PodCopy(data_ + length_, elements, length);
+    }
+    length_ += length;
+  }
+
+  void push_silence(size_t length)
+  {
+    if (length_ + length > capacity_) {
+      reserve(std::max(length_ + length, capacity_ * 2));
+    }
+    if (data_) {
+      PodZero(data_ + length_, length);
+    }
+    length_ += length;
+  }
+
+  void push_front_silence(size_t length)
+  {
+    if (length_ + length > capacity_) {
+      reserve(std::max(length_ + length, capacity_ * 2));
+    }
+    if (data_) {
+      PodMove(data_ + length, data_, length_);
+      PodZero(data_, length);
+    }
+    length_ += length;
+  }
+
+  size_t available() const { return capacity_ - length_; }
+
+  bool pop(T * elements, size_t length)
+  {
+    if (length > length_) {
+      return false;
+    }
+    if (!data_) {
+      return true;
+    }
+    if (elements) {
+      PodCopy(elements, data_, length);
+    }
+    PodMove(data_, data_ + length, length_ - length);
+
+    length_ -= length;
+
+    return true;
+  }
+
+  void set_length(size_t length)
+  {
+    assert(length <= capacity_);
+    length_ = length;
+  }
+
+private:
+  T * data_;
+  size_t capacity_;
+  size_t length_;
+};
+
+struct auto_array_wrapper {
+  virtual void push(void * elements, size_t length) = 0;
+  virtual size_t length() = 0;
+  virtual void push_silence(size_t length) = 0;
+  virtual bool pop(size_t length) = 0;
+  virtual void * data() = 0;
+  virtual void * end() = 0;
+  virtual void clear() = 0;
+  virtual void reserve(size_t capacity) = 0;
+  virtual void set_length(size_t length) = 0;
+  virtual ~auto_array_wrapper() {}
+};
+
+template <typename T>
+struct auto_array_wrapper_impl : public auto_array_wrapper {
+  auto_array_wrapper_impl() {}
+
+  explicit auto_array_wrapper_impl(uint32_t size) : ar(size) {}
+
+  void push(void * elements, size_t length) override
+  {
+    ar.push(static_cast<T *>(elements), length);
+  }
+
+  size_t length() override { return ar.length(); }
+
+  void push_silence(size_t length) override { ar.push_silence(length); }
+
+  bool pop(size_t length) override { return ar.pop(nullptr, length); }
+
+  void * data() override { return ar.data(); }
+
+  void * end() override { return ar.end(); }
+
+  void clear() override { ar.clear(); }
+
+  void reserve(size_t capacity) override { ar.reserve(capacity); }
+
+  void set_length(size_t length) override { ar.set_length(length); }
+
+  ~auto_array_wrapper_impl() { ar.clear(); }
+
+private:
+  auto_array<T> ar;
+};
+
+extern "C" {
+size_t
+cubeb_sample_size(cubeb_sample_format format);
+}
+
+using auto_lock = std::lock_guard<owned_critical_section>;
+#endif
+
+#endif

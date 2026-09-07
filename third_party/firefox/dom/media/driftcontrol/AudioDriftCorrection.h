@@ -1,0 +1,51 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_MEDIA_DRIFTCONTROL_AUDIODRIFTCORRECTION_H_
+#define DOM_MEDIA_DRIFTCONTROL_AUDIODRIFTCORRECTION_H_
+
+#include "AudioSegment.h"
+#include "TimeUnits.h"
+
+namespace mozilla {
+
+class AudioResampler;
+class DriftController;
+
+class AudioDriftCorrection final {
+ public:
+  AudioDriftCorrection(uint32_t aSourceRate, uint32_t aTargetRate,
+                       const PrincipalHandle& aPrincipalHandle);
+
+  ~AudioDriftCorrection();
+
+  AudioSegment RequestFrames(const AudioSegment& aInput,
+                             uint32_t aOutputFrames);
+
+  uint32_t CurrentBuffering() const;
+
+  uint32_t BufferSize() const;
+
+  uint32_t NumCorrectionChanges() const;
+
+  uint32_t NumUnderruns() const { return mNumUnderruns; }
+
+  void SetSourceLatency(media::TimeUnit aSourceLatency);
+
+  const uint32_t mTargetRate;
+  const media::TimeUnit mLatencyReductionTimeLimit =
+      media::TimeUnit(15, 1).ToBase(mTargetRate);
+
+ private:
+  void SetDesiredBuffering(media::TimeUnit aDesiredBuffering);
+
+  media::TimeUnit mSourceLatency = media::TimeUnit::Zero();
+  media::TimeUnit mDesiredBuffering = media::TimeUnit::Zero();
+  uint32_t mNumUnderruns = 0;
+  bool mIsHandlingUnderrun = false;
+  const UniquePtr<DriftController> mDriftController;
+  const UniquePtr<AudioResampler> mResampler;
+};
+}  
+#endif  // DOM_MEDIA_DRIFTCONTROL_AUDIODRIFTCORRECTION_H_

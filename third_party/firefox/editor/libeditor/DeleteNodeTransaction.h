@@ -1,0 +1,59 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DeleteNodeTransaction_h
+#define DeleteNodeTransaction_h
+
+#include "DeleteContentTransactionBase.h"
+
+#include "EditorForwards.h"
+
+#include "nsCOMPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsIContent.h"
+#include "nsINode.h"
+#include "nsISupportsImpl.h"
+#include "nscore.h"
+
+namespace mozilla {
+
+class DeleteNodeTransaction final : public DeleteContentTransactionBase {
+ protected:
+  DeleteNodeTransaction(EditorBase& aEditorBase, nsIContent& aContentToDelete);
+
+ public:
+  static already_AddRefed<DeleteNodeTransaction> MaybeCreate(
+      EditorBase& aEditorBase, nsIContent& aContentToDelete);
+
+  bool CanDoIt() const;
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(DeleteNodeTransaction,
+                                           DeleteContentTransactionBase)
+
+  NS_DECL_EDITTRANSACTIONBASE
+  NS_DECL_EDITTRANSACTIONBASE_GETASMETHODS_OVERRIDE(DeleteNodeTransaction)
+
+  MOZ_CAN_RUN_SCRIPT NS_IMETHOD RedoTransaction() final;
+
+  EditorDOMPoint SuggestPointToPutCaret() const final;
+
+  nsIContent* GetContent() const { return mContentToDelete; }
+
+  friend std::ostream& operator<<(std::ostream& aStream,
+                                  const DeleteNodeTransaction& aTransaction);
+
+ protected:
+  virtual ~DeleteNodeTransaction() = default;
+
+  nsCOMPtr<nsIContent> mContentToDelete;
+
+  nsCOMPtr<nsINode> mParentNode;
+
+  nsCOMPtr<nsIContent> mRefContent;
+};
+
+}  
+
+#endif  // #ifndef DeleteNodeTransaction_h

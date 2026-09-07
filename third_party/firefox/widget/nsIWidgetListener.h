@@ -1,0 +1,91 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsIWidgetListener_h_
+#define nsIWidgetListener_h_
+
+#include "mozilla/EventForwards.h"
+#include "mozilla/layers/LayersTypes.h"
+#include "mozilla/TimeStamp.h"
+
+#include "nsRegionFwd.h"
+#include "Units.h"
+
+class nsView;
+class nsIWidget;
+class nsIAppWindow;
+class nsMenuPopupFrame;
+
+namespace mozilla {
+class PresShell;
+class PresShellWidgetListener;
+}  
+
+enum nsSizeMode {
+  nsSizeMode_Normal = 0,
+  nsSizeMode_Minimized,
+  nsSizeMode_Maximized,
+  nsSizeMode_Fullscreen,
+  nsSizeMode_Invalid
+};
+
+class nsIWidgetListener {
+ public:
+  virtual nsIAppWindow* GetAppWindow() { return nullptr; }
+
+  virtual mozilla::PresShellWidgetListener* GetAsPresShellWidgetListener() {
+    return nullptr;
+  }
+
+  virtual nsMenuPopupFrame* GetAsMenuPopupFrame() { return nullptr; }
+
+  virtual mozilla::PresShell* GetPresShell() { return nullptr; }
+
+  enum class ByMoveToRect : bool { No, Yes };
+  virtual void WindowMoved(nsIWidget*, const mozilla::LayoutDeviceIntPoint&,
+                           ByMoveToRect) {}
+
+  virtual void WindowResized(nsIWidget*, const mozilla::LayoutDeviceIntSize&) {}
+
+  virtual void SizeModeChanged(nsSizeMode aSizeMode) {}
+
+  virtual void DynamicToolbarMaxHeightChanged(mozilla::ScreenIntCoord aHeight) {
+  }
+  virtual void DynamicToolbarOffsetChanged(mozilla::ScreenIntCoord aOffset) {}
+  virtual void KeyboardHeightChanged(mozilla::ScreenIntCoord aHeight) {}
+  virtual void AndroidPipModeChanged(bool) {}
+
+  virtual void MacFullscreenMenubarOverlapChanged(
+      mozilla::DesktopCoord aOverlapAmount) {}
+
+  virtual void OcclusionStateChanged(bool aIsFullyOccluded) {}
+
+  virtual void WindowActivated() {}
+
+  virtual void WindowDeactivated() {}
+
+  virtual void OSToolbarButtonPressed() {}
+
+  virtual bool RequestWindowClose(nsIWidget* aWidget) { return false; }
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  virtual void PaintWindow(nsIWidget* aWidget) {}
+
+  virtual void DidCompositeWindow(mozilla::layers::TransactionId aTransactionId,
+                                  const mozilla::TimeStamp& aCompositeStart,
+                                  const mozilla::TimeStamp& aCompositeEnd) {}
+
+  virtual bool ShouldNotBeVisible() { return false; }
+
+  virtual bool IsPaintSuppressed() const { return false; }
+
+  virtual nsEventStatus HandleEvent(mozilla::WidgetGUIEvent* aEvent) {
+    return nsEventStatus_eIgnore;
+  }
+
+  virtual void SafeAreaInsetsChanged(
+      const mozilla::LayoutDeviceIntMargin& aSafeAreaInsets) {}
+};
+
+#endif

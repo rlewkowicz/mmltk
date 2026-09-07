@@ -1,0 +1,58 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef nsIContentSink_h_
+#define nsIContentSink_h_
+
+#include "nsISupports.h"
+#include "nsString.h"
+#include "mozilla/FlushType.h"
+#include "mozilla/NotNull.h"
+
+class nsParserBase;
+namespace mozilla {
+class Encoding;
+}
+
+#define NS_ICONTENT_SINK_IID \
+  {0xcf9a7cbb, 0xfcbc, 0x4e13, {0x8e, 0xf5, 0x18, 0xef, 0x2d, 0x3d, 0x58, 0x29}}
+
+class nsIContentSink : public nsISupports {
+ protected:
+  using Encoding = mozilla::Encoding;
+  template <typename T>
+  using NotNull = mozilla::NotNull<T>;
+
+ public:
+  NS_INLINE_DECL_STATIC_IID(NS_ICONTENT_SINK_IID)
+
+  NS_IMETHOD WillParse(void) = 0;
+
+  NS_IMETHOD WillBuildModel() { return NS_OK; }
+
+  NS_IMETHOD DidBuildModel(bool aTerminated) { return NS_OK; }
+
+  NS_IMETHOD WillInterrupt(void) = 0;
+
+  virtual void WillResume() = 0;
+
+  virtual nsIContentSink* AsExecutor() { return nullptr; }
+
+  NS_IMETHOD SetParser(nsParserBase* aParser) = 0;
+
+  virtual void FlushPendingNotifications(mozilla::FlushType aType) = 0;
+
+  virtual void SetDocumentCharset(NotNull<const Encoding*> aEncoding) = 0;
+
+  virtual nsISupports* GetTarget() = 0;
+
+  virtual bool IsScriptExecuting() { return false; }
+
+  virtual void ContinueParsingDocumentAfterCurrentScript() {};
+
+  virtual void ContinueInterruptedParsingAsync() {}
+
+  virtual void InitialTranslationCompleted() {}
+};
+
+#endif /* nsIContentSink_h_ */

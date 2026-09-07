@@ -1,0 +1,16 @@
+NVCC 13.4 rejects GCC 16.2's mixed unqualified/ref-qualified substr overload
+set. Keep the original ABI and substring results in CUDA host code by omitting
+only the new rvalue storage-reuse overloads there. Ordinary C++ retains them.
+The constructor implementations and the selected C++23 dialect stay intact.
+
+--- a/bits/basic_string.h
++++ b/bits/basic_string.h
+@@ -3469,7 +3469,7 @@
+-#if __cplusplus >= 202302L
++#if __cplusplus >= 202302L && !defined(__CUDACC__)
+       _GLIBCXX_NODISCARD
+       constexpr basic_string
+       substr(size_type __pos = 0) &&
+       { return basic_string(std::move(*this), __pos); }
+ 
+       _GLIBCXX_NODISCARD

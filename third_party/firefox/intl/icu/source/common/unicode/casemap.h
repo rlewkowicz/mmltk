@@ -1,0 +1,113 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+
+#ifndef __CASEMAP_H__
+#define __CASEMAP_H__
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+#include "unicode/stringpiece.h"
+#include "unicode/uobject.h"
+
+
+U_NAMESPACE_BEGIN
+
+class BreakIterator;
+class ByteSink;
+class Edits;
+
+class U_COMMON_API CaseMap final : public UMemory {
+public:
+     static int32_t toLower(
+            const char *locale, uint32_t options,
+            const char16_t *src, int32_t srcLength,
+            char16_t *dest, int32_t destCapacity, Edits *edits,
+            UErrorCode &errorCode);
+
+    static int32_t toUpper(
+            const char *locale, uint32_t options,
+            const char16_t *src, int32_t srcLength,
+            char16_t *dest, int32_t destCapacity, Edits *edits,
+            UErrorCode &errorCode);
+
+#if !UCONFIG_NO_BREAK_ITERATION
+
+    static int32_t toTitle(
+            const char *locale, uint32_t options, BreakIterator *iter,
+            const char16_t *src, int32_t srcLength,
+            char16_t *dest, int32_t destCapacity, Edits *edits,
+            UErrorCode &errorCode);
+
+#endif  // UCONFIG_NO_BREAK_ITERATION
+
+    static int32_t fold(
+            uint32_t options,
+            const char16_t *src, int32_t srcLength,
+            char16_t *dest, int32_t destCapacity, Edits *edits,
+            UErrorCode &errorCode);
+
+    static void utf8ToLower(
+            const char *locale, uint32_t options,
+            StringPiece src, ByteSink &sink, Edits *edits,
+            UErrorCode &errorCode);
+
+    static void utf8ToUpper(
+            const char *locale, uint32_t options,
+            StringPiece src, ByteSink &sink, Edits *edits,
+            UErrorCode &errorCode);
+
+#if !UCONFIG_NO_BREAK_ITERATION
+
+    static void utf8ToTitle(
+            const char *locale, uint32_t options, BreakIterator *iter,
+            StringPiece src, ByteSink &sink, Edits *edits,
+            UErrorCode &errorCode);
+
+#endif  // UCONFIG_NO_BREAK_ITERATION
+
+    static void utf8Fold(
+            uint32_t options,
+            StringPiece src, ByteSink &sink, Edits *edits,
+            UErrorCode &errorCode);
+
+    static int32_t utf8ToLower(
+            const char *locale, uint32_t options,
+            const char *src, int32_t srcLength,
+            char *dest, int32_t destCapacity, Edits *edits,
+            UErrorCode &errorCode);
+
+    static int32_t utf8ToUpper(
+            const char *locale, uint32_t options,
+            const char *src, int32_t srcLength,
+            char *dest, int32_t destCapacity, Edits *edits,
+            UErrorCode &errorCode);
+
+#if !UCONFIG_NO_BREAK_ITERATION
+
+    static int32_t utf8ToTitle(
+            const char *locale, uint32_t options, BreakIterator *iter,
+            const char *src, int32_t srcLength,
+            char *dest, int32_t destCapacity, Edits *edits,
+            UErrorCode &errorCode);
+
+#endif  // UCONFIG_NO_BREAK_ITERATION
+
+    static int32_t utf8Fold(
+            uint32_t options,
+            const char *src, int32_t srcLength,
+            char *dest, int32_t destCapacity, Edits *edits,
+            UErrorCode &errorCode);
+
+private:
+    CaseMap() = delete;
+    CaseMap(const CaseMap &other) = delete;
+    CaseMap &operator=(const CaseMap &other) = delete;
+};
+
+U_NAMESPACE_END
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif  // __CASEMAP_H__

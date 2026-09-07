@@ -1,0 +1,1043 @@
+/*
+ * Copyright 2019 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SKVX_DEFINED)
+#define SKVX_DEFINED
+
+
+#include "include/private/base/SkFeatures.h"
+#include "include/private/base/SkLoadUserConfig.h"
+#include "src/base/SkUtils.h"
+#include <algorithm>         // std::min, std::max
+#include <cassert>           // assert()
+#include <cmath>             // ceilf, floorf, truncf, roundf, sqrtf, etc.
+#include <cstdint>           // intXX_t
+#include <cstring>           // memcpy()
+#include <initializer_list>  // std::initializer_list
+#include <type_traits>
+#include <utility>           // std::index_sequence
+
+#if defined(SKVX_DISABLE_SIMD)
+#define SKVX_USE_SIMD 0
+#else
+#define SKVX_USE_SIMD 1
+#endif
+
+#if SKVX_USE_SIMD
+    #if SK_CPU_X64_LEVEL >= SK_CPU_X64_LEVEL_AVX
+        #include <immintrin.h>
+    #elif SK_CPU_X64_LEVEL >= SK_CPU_X64_LEVEL_SSE41
+        #include <smmintrin.h>
+    #elif SK_CPU_X64_LEVEL >= SK_CPU_X64_LEVEL_SSE1
+        #include <emmintrin.h>
+        #include <xmmintrin.h>
+    #elif defined(SK_ARM_HAS_NEON)
+        #include <arm_neon.h>
+    #elif defined(__wasm_simd128__)
+        #include <wasm_simd128.h>
+    #elif SK_CPU_LSX_LEVEL >= SK_CPU_LSX_LEVEL_LASX
+        #include <lasxintrin.h>
+        #include <lsxintrin.h>
+    #elif SK_CPU_LSX_LEVEL >= SK_CPU_LSX_LEVEL_LSX
+        #include <lsxintrin.h>
+    #endif
+#endif
+
+#if defined(_MSC_VER)
+    #define SKVX_ALWAYS_INLINE __forceinline
+#else
+    #define SKVX_ALWAYS_INLINE __attribute__((always_inline))
+#endif
+
+#define SI    static inline
+#define SIT   template <       typename T> SI
+#define SIN   template <int N            > SI
+#define SINT  template <int N, typename T> SI
+#define SINTU template <int N, typename T, typename U, \
+                        typename=std::enable_if_t<std::is_convertible<U,T>::value>> SI
+
+namespace skvx {
+
+template <int N, typename T>
+struct alignas(N*sizeof(T)) Vec;
+
+template <int... Ix, int N, typename T>
+SI Vec<sizeof...(Ix),T> shuffle(const Vec<N,T>&);
+
+template <int N, typename T>
+struct alignas(N*sizeof(T)) Vec {
+    static_assert((N & (N-1)) == 0,        "N must be a power of 2.");
+    static_assert(sizeof(T) >= alignof(T), "What kind of unusual T is this?");
+
+
+    SKVX_ALWAYS_INLINE Vec() = default;
+    SKVX_ALWAYS_INLINE Vec(T s) : lo(s), hi(s) {}
+
+    SKVX_ALWAYS_INLINE Vec(std::initializer_list<T> xs) {
+        T vals[N] = {0};
+        assert(xs.size() <= (size_t)N);
+        memcpy(vals, xs.begin(), std::min(xs.size(), (size_t)N)*sizeof(T));
+
+        this->lo = Vec<N/2,T>::Load(vals +   0);
+        this->hi = Vec<N/2,T>::Load(vals + N/2);
+    }
+
+    SKVX_ALWAYS_INLINE T  operator[](int i) const { return i<N/2 ? this->lo[i] : this->hi[i-N/2]; }
+    SKVX_ALWAYS_INLINE T& operator[](int i)       { return i<N/2 ? this->lo[i] : this->hi[i-N/2]; }
+
+    SKVX_ALWAYS_INLINE static Vec Load(const void* ptr) {
+        return sk_unaligned_load<Vec>(ptr);
+    }
+    SKVX_ALWAYS_INLINE void store(void* ptr) const {
+        memcpy(ptr, this, sizeof(Vec));
+    }
+
+    Vec<N/2,T> lo, hi;
+};
+
+template <typename T>
+struct alignas(4*sizeof(T)) Vec<4,T> {
+    static_assert(sizeof(T) >= alignof(T), "What kind of unusual T is this?");
+
+    SKVX_ALWAYS_INLINE Vec() = default;
+    SKVX_ALWAYS_INLINE Vec(T s) : lo(s), hi(s) {}
+    SKVX_ALWAYS_INLINE Vec(T x, T y, T z, T w) : lo(x,y), hi(z,w) {}
+    SKVX_ALWAYS_INLINE Vec(Vec<2,T> xy, T z, T w) : lo(xy), hi(z,w) {}
+    SKVX_ALWAYS_INLINE Vec(T x, T y, Vec<2,T> zw) : lo(x,y), hi(zw) {}
+    SKVX_ALWAYS_INLINE Vec(Vec<2,T> xy, Vec<2,T> zw) : lo(xy), hi(zw) {}
+
+    SKVX_ALWAYS_INLINE Vec(std::initializer_list<T> xs) {
+        T vals[4] = {0};
+        assert(xs.size() <= (size_t)4);
+        memcpy(vals, xs.begin(), std::min(xs.size(), (size_t)4)*sizeof(T));
+
+        this->lo = Vec<2,T>::Load(vals + 0);
+        this->hi = Vec<2,T>::Load(vals + 2);
+    }
+
+    SKVX_ALWAYS_INLINE T  operator[](int i) const { return i<2 ? this->lo[i] : this->hi[i-2]; }
+    SKVX_ALWAYS_INLINE T& operator[](int i)       { return i<2 ? this->lo[i] : this->hi[i-2]; }
+
+    SKVX_ALWAYS_INLINE static Vec Load(const void* ptr) {
+        return sk_unaligned_load<Vec>(ptr);
+    }
+    SKVX_ALWAYS_INLINE void store(void* ptr) const {
+        memcpy(ptr, this, sizeof(Vec));
+    }
+
+    SKVX_ALWAYS_INLINE Vec<2,T>& xy() { return lo; }
+    SKVX_ALWAYS_INLINE Vec<2,T>& zw() { return hi; }
+    SKVX_ALWAYS_INLINE T& x() { return lo.lo.val; }
+    SKVX_ALWAYS_INLINE T& y() { return lo.hi.val; }
+    SKVX_ALWAYS_INLINE T& z() { return hi.lo.val; }
+    SKVX_ALWAYS_INLINE T& w() { return hi.hi.val; }
+
+    SKVX_ALWAYS_INLINE Vec<2,T> xy() const { return lo; }
+    SKVX_ALWAYS_INLINE Vec<2,T> zw() const { return hi; }
+    SKVX_ALWAYS_INLINE T x() const { return lo.lo.val; }
+    SKVX_ALWAYS_INLINE T y() const { return lo.hi.val; }
+    SKVX_ALWAYS_INLINE T z() const { return hi.lo.val; }
+    SKVX_ALWAYS_INLINE T w() const { return hi.hi.val; }
+
+    SKVX_ALWAYS_INLINE Vec<4,T> yxwz() const { return shuffle<1,0,3,2>(*this); }
+    SKVX_ALWAYS_INLINE Vec<4,T> zwxy() const { return shuffle<2,3,0,1>(*this); }
+
+    Vec<2,T> lo, hi;
+};
+
+template <typename T>
+struct alignas(2*sizeof(T)) Vec<2,T> {
+    static_assert(sizeof(T) >= alignof(T), "What kind of unusual T is this?");
+
+    SKVX_ALWAYS_INLINE Vec() = default;
+    SKVX_ALWAYS_INLINE Vec(T s) : lo(s), hi(s) {}
+    SKVX_ALWAYS_INLINE Vec(T x, T y) : lo(x), hi(y) {}
+
+    SKVX_ALWAYS_INLINE Vec(std::initializer_list<T> xs) {
+        T vals[2] = {0};
+        assert(xs.size() <= (size_t)2);
+        memcpy(vals, xs.begin(), std::min(xs.size(), (size_t)2)*sizeof(T));
+
+        this->lo = Vec<1,T>::Load(vals + 0);
+        this->hi = Vec<1,T>::Load(vals + 1);
+    }
+
+    SKVX_ALWAYS_INLINE T  operator[](int i) const { return i<1 ? this->lo[i] : this->hi[i-1]; }
+    SKVX_ALWAYS_INLINE T& operator[](int i)       { return i<1 ? this->lo[i] : this->hi[i-1]; }
+
+    SKVX_ALWAYS_INLINE static Vec Load(const void* ptr) {
+        return sk_unaligned_load<Vec>(ptr);
+    }
+    SKVX_ALWAYS_INLINE void store(void* ptr) const {
+        memcpy(ptr, this, sizeof(Vec));
+    }
+
+    SKVX_ALWAYS_INLINE T& x() { return lo.val; }
+    SKVX_ALWAYS_INLINE T& y() { return hi.val; }
+
+    SKVX_ALWAYS_INLINE T x() const { return lo.val; }
+    SKVX_ALWAYS_INLINE T y() const { return hi.val; }
+
+    SKVX_ALWAYS_INLINE Vec<2,T> yx() const { return shuffle<1,0>(*this); }
+    SKVX_ALWAYS_INLINE Vec<4,T> xyxy() const { return Vec<4,T>(*this, *this); }
+
+    Vec<1,T> lo, hi;
+};
+
+template <typename T>
+struct Vec<1,T> {
+    T val = {};
+
+    SKVX_ALWAYS_INLINE Vec() = default;
+    SKVX_ALWAYS_INLINE Vec(T s) : val(s) {}
+
+    SKVX_ALWAYS_INLINE Vec(std::initializer_list<T> xs) : val(xs.size() ? *xs.begin() : 0) {
+        assert(xs.size() <= (size_t)1);
+    }
+
+    SKVX_ALWAYS_INLINE T  operator[](int i) const { assert(i == 0); return val; }
+    SKVX_ALWAYS_INLINE T& operator[](int i)       { assert(i == 0); return val; }
+
+    SKVX_ALWAYS_INLINE static Vec Load(const void* ptr) {
+        return sk_unaligned_load<Vec>(ptr);
+    }
+    SKVX_ALWAYS_INLINE void store(void* ptr) const {
+        memcpy(ptr, this, sizeof(Vec));
+    }
+};
+
+template <typename T> struct Mask { using type = T; };
+template <> struct Mask<float > { using type = int32_t; };
+template <> struct Mask<double> { using type = int64_t; };
+template <typename T> using M = typename Mask<T>::type;
+
+SINT Vec<2*N,T> join(const Vec<N,T>& lo, const Vec<N,T>& hi) {
+    Vec<2*N,T> v;
+    v.lo = lo;
+    v.hi = hi;
+    return v;
+}
+
+
+#if SKVX_USE_SIMD && (defined(__clang__) || defined(__GNUC__))
+
+    #if defined(__clang__)
+        template <int N, typename T>
+        using VExt = T __attribute__((ext_vector_type(N)));
+
+    #elif defined(__GNUC__)
+        template <int N, typename T>
+        struct VExtHelper {
+            typedef T __attribute__((vector_size(N*sizeof(T)))) type;
+        };
+
+        template <int N, typename T>
+        using VExt = typename VExtHelper<N,T>::type;
+
+        SI Vec<4,float> to_vec(VExt<4,float> v) { return sk_bit_cast<Vec<4,float>>(v); }
+    #endif
+
+    SINT VExt<N,T> to_vext(const Vec<N,T>& v) { return sk_bit_cast<VExt<N,T>>(v); }
+    SINT Vec <N,T> to_vec(const VExt<N,T>& v) { return sk_bit_cast<Vec <N,T>>(v); }
+
+    SINT Vec<N,T> operator+(const Vec<N,T>& x, const Vec<N,T>& y) {
+        return to_vec<N,T>(to_vext(x) + to_vext(y));
+    }
+    SINT Vec<N,T> operator-(const Vec<N,T>& x, const Vec<N,T>& y) {
+        return to_vec<N,T>(to_vext(x) - to_vext(y));
+    }
+    SINT Vec<N,T> operator*(const Vec<N,T>& x, const Vec<N,T>& y) {
+        return to_vec<N,T>(to_vext(x) * to_vext(y));
+    }
+    SINT Vec<N,T> operator/(const Vec<N,T>& x, const Vec<N,T>& y) {
+        return to_vec<N,T>(to_vext(x) / to_vext(y));
+    }
+
+    SINT Vec<N,T> operator^(const Vec<N,T>& x, const Vec<N,T>& y) {
+        return to_vec<N,T>(to_vext(x) ^ to_vext(y));
+    }
+    SINT Vec<N,T> operator&(const Vec<N,T>& x, const Vec<N,T>& y) {
+        return to_vec<N,T>(to_vext(x) & to_vext(y));
+    }
+    SINT Vec<N,T> operator|(const Vec<N,T>& x, const Vec<N,T>& y) {
+        return to_vec<N,T>(to_vext(x) | to_vext(y));
+    }
+
+    SINT Vec<N,T> operator!(const Vec<N,T>& x) { return to_vec<N,T>(!to_vext(x)); }
+    SINT Vec<N,T> operator-(const Vec<N,T>& x) { return to_vec<N,T>(-to_vext(x)); }
+    SINT Vec<N,T> operator~(const Vec<N,T>& x) { return to_vec<N,T>(~to_vext(x)); }
+
+    SINT Vec<N,T> operator<<(const Vec<N,T>& x, int k) { return to_vec<N,T>(to_vext(x) << k); }
+    SINT Vec<N,T> operator>>(const Vec<N,T>& x, int k) { return to_vec<N,T>(to_vext(x) >> k); }
+
+    SINT Vec<N,M<T>> operator==(const Vec<N,T>& x, const Vec<N,T>& y) {
+        return sk_bit_cast<Vec<N,M<T>>>(to_vext(x) == to_vext(y));
+    }
+    SINT Vec<N,M<T>> operator!=(const Vec<N,T>& x, const Vec<N,T>& y) {
+        return sk_bit_cast<Vec<N,M<T>>>(to_vext(x) != to_vext(y));
+    }
+    SINT Vec<N,M<T>> operator<=(const Vec<N,T>& x, const Vec<N,T>& y) {
+        return sk_bit_cast<Vec<N,M<T>>>(to_vext(x) <= to_vext(y));
+    }
+    SINT Vec<N,M<T>> operator>=(const Vec<N,T>& x, const Vec<N,T>& y) {
+        return sk_bit_cast<Vec<N,M<T>>>(to_vext(x) >= to_vext(y));
+    }
+    SINT Vec<N,M<T>> operator< (const Vec<N,T>& x, const Vec<N,T>& y) {
+        return sk_bit_cast<Vec<N,M<T>>>(to_vext(x) <  to_vext(y));
+    }
+    SINT Vec<N,M<T>> operator> (const Vec<N,T>& x, const Vec<N,T>& y) {
+        return sk_bit_cast<Vec<N,M<T>>>(to_vext(x) >  to_vext(y));
+    }
+
+#else
+
+
+    SIT Vec<1,T> operator+(const Vec<1,T>& x, const Vec<1,T>& y) { return x.val + y.val; }
+    SIT Vec<1,T> operator-(const Vec<1,T>& x, const Vec<1,T>& y) { return x.val - y.val; }
+    SIT Vec<1,T> operator*(const Vec<1,T>& x, const Vec<1,T>& y) { return x.val * y.val; }
+    SIT Vec<1,T> operator/(const Vec<1,T>& x, const Vec<1,T>& y) { return x.val / y.val; }
+
+    SIT Vec<1,T> operator^(const Vec<1,T>& x, const Vec<1,T>& y) { return x.val ^ y.val; }
+    SIT Vec<1,T> operator&(const Vec<1,T>& x, const Vec<1,T>& y) { return x.val & y.val; }
+    SIT Vec<1,T> operator|(const Vec<1,T>& x, const Vec<1,T>& y) { return x.val | y.val; }
+
+    SIT Vec<1,T> operator!(const Vec<1,T>& x) { return !x.val; }
+    SIT Vec<1,T> operator-(const Vec<1,T>& x) { return -x.val; }
+    SIT Vec<1,T> operator~(const Vec<1,T>& x) { return ~x.val; }
+
+    SIT Vec<1,T> operator<<(const Vec<1,T>& x, int k) { return x.val << k; }
+    SIT Vec<1,T> operator>>(const Vec<1,T>& x, int k) { return x.val >> k; }
+
+    SIT Vec<1,M<T>> operator==(const Vec<1,T>& x, const Vec<1,T>& y) {
+        return x.val == y.val ? ~0 : 0;
+    }
+    SIT Vec<1,M<T>> operator!=(const Vec<1,T>& x, const Vec<1,T>& y) {
+        return x.val != y.val ? ~0 : 0;
+    }
+    SIT Vec<1,M<T>> operator<=(const Vec<1,T>& x, const Vec<1,T>& y) {
+        return x.val <= y.val ? ~0 : 0;
+    }
+    SIT Vec<1,M<T>> operator>=(const Vec<1,T>& x, const Vec<1,T>& y) {
+        return x.val >= y.val ? ~0 : 0;
+    }
+    SIT Vec<1,M<T>> operator< (const Vec<1,T>& x, const Vec<1,T>& y) {
+        return x.val <  y.val ? ~0 : 0;
+    }
+    SIT Vec<1,M<T>> operator> (const Vec<1,T>& x, const Vec<1,T>& y) {
+        return x.val >  y.val ? ~0 : 0;
+    }
+
+    SINT Vec<N,T> operator+(const Vec<N,T>& x, const Vec<N,T>& y) {
+        return join(x.lo + y.lo, x.hi + y.hi);
+    }
+    SINT Vec<N,T> operator-(const Vec<N,T>& x, const Vec<N,T>& y) {
+        return join(x.lo - y.lo, x.hi - y.hi);
+    }
+    SINT Vec<N,T> operator*(const Vec<N,T>& x, const Vec<N,T>& y) {
+        return join(x.lo * y.lo, x.hi * y.hi);
+    }
+    SINT Vec<N,T> operator/(const Vec<N,T>& x, const Vec<N,T>& y) {
+        return join(x.lo / y.lo, x.hi / y.hi);
+    }
+
+    SINT Vec<N,T> operator^(const Vec<N,T>& x, const Vec<N,T>& y) {
+        return join(x.lo ^ y.lo, x.hi ^ y.hi);
+    }
+    SINT Vec<N,T> operator&(const Vec<N,T>& x, const Vec<N,T>& y) {
+        return join(x.lo & y.lo, x.hi & y.hi);
+    }
+    SINT Vec<N,T> operator|(const Vec<N,T>& x, const Vec<N,T>& y) {
+        return join(x.lo | y.lo, x.hi | y.hi);
+    }
+
+    SINT Vec<N,T> operator!(const Vec<N,T>& x) { return join(!x.lo, !x.hi); }
+    SINT Vec<N,T> operator-(const Vec<N,T>& x) { return join(-x.lo, -x.hi); }
+    SINT Vec<N,T> operator~(const Vec<N,T>& x) { return join(~x.lo, ~x.hi); }
+
+    SINT Vec<N,T> operator<<(const Vec<N,T>& x, int k) { return join(x.lo << k, x.hi << k); }
+    SINT Vec<N,T> operator>>(const Vec<N,T>& x, int k) { return join(x.lo >> k, x.hi >> k); }
+
+    SINT Vec<N,M<T>> operator==(const Vec<N,T>& x, const Vec<N,T>& y) {
+        return join(x.lo == y.lo, x.hi == y.hi);
+    }
+    SINT Vec<N,M<T>> operator!=(const Vec<N,T>& x, const Vec<N,T>& y) {
+        return join(x.lo != y.lo, x.hi != y.hi);
+    }
+    SINT Vec<N,M<T>> operator<=(const Vec<N,T>& x, const Vec<N,T>& y) {
+        return join(x.lo <= y.lo, x.hi <= y.hi);
+    }
+    SINT Vec<N,M<T>> operator>=(const Vec<N,T>& x, const Vec<N,T>& y) {
+        return join(x.lo >= y.lo, x.hi >= y.hi);
+    }
+    SINT Vec<N,M<T>> operator< (const Vec<N,T>& x, const Vec<N,T>& y) {
+        return join(x.lo <  y.lo, x.hi <  y.hi);
+    }
+    SINT Vec<N,M<T>> operator> (const Vec<N,T>& x, const Vec<N,T>& y) {
+        return join(x.lo >  y.lo, x.hi >  y.hi);
+    }
+#endif
+
+SINTU Vec<N,T>    operator+ (U x, const Vec<N,T>& y) { return Vec<N,T>(x) +  y; }
+SINTU Vec<N,T>    operator- (U x, const Vec<N,T>& y) { return Vec<N,T>(x) -  y; }
+SINTU Vec<N,T>    operator* (U x, const Vec<N,T>& y) { return Vec<N,T>(x) *  y; }
+SINTU Vec<N,T>    operator/ (U x, const Vec<N,T>& y) { return Vec<N,T>(x) /  y; }
+SINTU Vec<N,T>    operator^ (U x, const Vec<N,T>& y) { return Vec<N,T>(x) ^  y; }
+SINTU Vec<N,T>    operator& (U x, const Vec<N,T>& y) { return Vec<N,T>(x) &  y; }
+SINTU Vec<N,T>    operator| (U x, const Vec<N,T>& y) { return Vec<N,T>(x) |  y; }
+SINTU Vec<N,M<T>> operator==(U x, const Vec<N,T>& y) { return Vec<N,T>(x) == y; }
+SINTU Vec<N,M<T>> operator!=(U x, const Vec<N,T>& y) { return Vec<N,T>(x) != y; }
+SINTU Vec<N,M<T>> operator<=(U x, const Vec<N,T>& y) { return Vec<N,T>(x) <= y; }
+SINTU Vec<N,M<T>> operator>=(U x, const Vec<N,T>& y) { return Vec<N,T>(x) >= y; }
+SINTU Vec<N,M<T>> operator< (U x, const Vec<N,T>& y) { return Vec<N,T>(x) <  y; }
+SINTU Vec<N,M<T>> operator> (U x, const Vec<N,T>& y) { return Vec<N,T>(x) >  y; }
+
+SINTU Vec<N,T>    operator+ (const Vec<N,T>& x, U y) { return x +  Vec<N,T>(y); }
+SINTU Vec<N,T>    operator- (const Vec<N,T>& x, U y) { return x -  Vec<N,T>(y); }
+SINTU Vec<N,T>    operator* (const Vec<N,T>& x, U y) { return x *  Vec<N,T>(y); }
+SINTU Vec<N,T>    operator/ (const Vec<N,T>& x, U y) { return x /  Vec<N,T>(y); }
+SINTU Vec<N,T>    operator^ (const Vec<N,T>& x, U y) { return x ^  Vec<N,T>(y); }
+SINTU Vec<N,T>    operator& (const Vec<N,T>& x, U y) { return x &  Vec<N,T>(y); }
+SINTU Vec<N,T>    operator| (const Vec<N,T>& x, U y) { return x |  Vec<N,T>(y); }
+SINTU Vec<N,M<T>> operator==(const Vec<N,T>& x, U y) { return x == Vec<N,T>(y); }
+SINTU Vec<N,M<T>> operator!=(const Vec<N,T>& x, U y) { return x != Vec<N,T>(y); }
+SINTU Vec<N,M<T>> operator<=(const Vec<N,T>& x, U y) { return x <= Vec<N,T>(y); }
+SINTU Vec<N,M<T>> operator>=(const Vec<N,T>& x, U y) { return x >= Vec<N,T>(y); }
+SINTU Vec<N,M<T>> operator< (const Vec<N,T>& x, U y) { return x <  Vec<N,T>(y); }
+SINTU Vec<N,M<T>> operator> (const Vec<N,T>& x, U y) { return x >  Vec<N,T>(y); }
+
+SINT Vec<N,T>& operator+=(Vec<N,T>& x, const Vec<N,T>& y) { return (x = x + y); }
+SINT Vec<N,T>& operator-=(Vec<N,T>& x, const Vec<N,T>& y) { return (x = x - y); }
+SINT Vec<N,T>& operator*=(Vec<N,T>& x, const Vec<N,T>& y) { return (x = x * y); }
+SINT Vec<N,T>& operator/=(Vec<N,T>& x, const Vec<N,T>& y) { return (x = x / y); }
+SINT Vec<N,T>& operator^=(Vec<N,T>& x, const Vec<N,T>& y) { return (x = x ^ y); }
+SINT Vec<N,T>& operator&=(Vec<N,T>& x, const Vec<N,T>& y) { return (x = x & y); }
+SINT Vec<N,T>& operator|=(Vec<N,T>& x, const Vec<N,T>& y) { return (x = x | y); }
+
+SINTU Vec<N,T>& operator+=(Vec<N,T>& x, U y) { return (x = x + Vec<N,T>(y)); }
+SINTU Vec<N,T>& operator-=(Vec<N,T>& x, U y) { return (x = x - Vec<N,T>(y)); }
+SINTU Vec<N,T>& operator*=(Vec<N,T>& x, U y) { return (x = x * Vec<N,T>(y)); }
+SINTU Vec<N,T>& operator/=(Vec<N,T>& x, U y) { return (x = x / Vec<N,T>(y)); }
+SINTU Vec<N,T>& operator^=(Vec<N,T>& x, U y) { return (x = x ^ Vec<N,T>(y)); }
+SINTU Vec<N,T>& operator&=(Vec<N,T>& x, U y) { return (x = x & Vec<N,T>(y)); }
+SINTU Vec<N,T>& operator|=(Vec<N,T>& x, U y) { return (x = x | Vec<N,T>(y)); }
+
+SINT Vec<N,T>& operator<<=(Vec<N,T>& x, int bits) { return (x = x << bits); }
+SINT Vec<N,T>& operator>>=(Vec<N,T>& x, int bits) { return (x = x >> bits); }
+
+
+SINT Vec<N,T> naive_if_then_else(const Vec<N,M<T>>& cond, const Vec<N,T>& t, const Vec<N,T>& e) {
+    return sk_bit_cast<Vec<N,T>>(( cond & sk_bit_cast<Vec<N, M<T>>>(t)) |
+                                 (~cond & sk_bit_cast<Vec<N, M<T>>>(e)) );
+}
+
+SIT Vec<1,T> if_then_else(const Vec<1,M<T>>& cond, const Vec<1,T>& t, const Vec<1,T>& e) {
+    return sk_bit_cast<Vec<1,T>>(( cond & sk_bit_cast<Vec<1, M<T>>>(t)) |
+                                 (~cond & sk_bit_cast<Vec<1, M<T>>>(e)) );
+}
+SINT Vec<N,T> if_then_else(const Vec<N,M<T>>& cond, const Vec<N,T>& t, const Vec<N,T>& e) {
+#if SKVX_USE_SIMD && SK_CPU_X64_LEVEL >= SK_CPU_X64_LEVEL_AVX2
+    if constexpr (N*sizeof(T) == 32) {
+        return sk_bit_cast<Vec<N,T>>(_mm256_blendv_epi8(sk_bit_cast<__m256i>(e),
+                                                        sk_bit_cast<__m256i>(t),
+                                                        sk_bit_cast<__m256i>(cond)));
+    }
+#endif
+#if SKVX_USE_SIMD && SK_CPU_X64_LEVEL >= SK_CPU_X64_LEVEL_SSE41
+    if constexpr (N*sizeof(T) == 16) {
+        return sk_bit_cast<Vec<N,T>>(_mm_blendv_epi8(sk_bit_cast<__m128i>(e),
+                                                     sk_bit_cast<__m128i>(t),
+                                                     sk_bit_cast<__m128i>(cond)));
+    }
+#endif
+#if SKVX_USE_SIMD && defined(SK_ARM_HAS_NEON)
+    if constexpr (N*sizeof(T) == 16) {
+        return sk_bit_cast<Vec<N,T>>(vbslq_u8(sk_bit_cast<uint8x16_t>(cond),
+                                              sk_bit_cast<uint8x16_t>(t),
+                                              sk_bit_cast<uint8x16_t>(e)));
+    }
+#endif
+#if SKVX_USE_SIMD && SK_CPU_LSX_LEVEL >= SK_CPU_LSX_LEVEL_LASX
+    if constexpr (N*sizeof(T) == 32) {
+        return sk_bit_cast<Vec<N,T>>(__lasx_xvbitsel_v(sk_bit_cast<__m256i>(e),
+                                                       sk_bit_cast<__m256i>(t),
+                                                       sk_bit_cast<__m256i>(cond)));
+    }
+#endif
+#if SKVX_USE_SIMD && SK_CPU_LSX_LEVEL >= SK_CPU_LSX_LEVEL_LSX
+    if constexpr (N*sizeof(T) == 16) {
+        return sk_bit_cast<Vec<N,T>>(__lsx_vbitsel_v(sk_bit_cast<__m128i>(e),
+                                                     sk_bit_cast<__m128i>(t),
+                                                     sk_bit_cast<__m128i>(cond)));
+    }
+#endif
+    if constexpr (N*sizeof(T) > 16) {
+        return join(if_then_else(cond.lo, t.lo, e.lo),
+                    if_then_else(cond.hi, t.hi, e.hi));
+    }
+    return naive_if_then_else(cond, t, e);
+}
+
+SIT  bool any(const Vec<1,T>& x) { return x.val != 0; }
+SINT bool any(const Vec<N,T>& x) {
+#if SKVX_USE_SIMD && SK_CPU_X64_LEVEL >= SK_CPU_X64_LEVEL_AVX2
+    if constexpr (N*sizeof(T) == 32) {
+        return !_mm256_testz_si256(sk_bit_cast<__m256i>(x), _mm256_set1_epi32(-1));
+    }
+#endif
+#if SKVX_USE_SIMD && SK_CPU_X64_LEVEL >= SK_CPU_X64_LEVEL_SSE41
+    if constexpr (N*sizeof(T) == 16) {
+        return !_mm_testz_si128(sk_bit_cast<__m128i>(x), _mm_set1_epi32(-1));
+    }
+#endif
+#if SKVX_USE_SIMD && SK_CPU_X64_LEVEL >= SK_CPU_X64_LEVEL_SSE1
+    if constexpr (N*sizeof(T) == 16) {
+        return _mm_movemask_ps(_mm_cmpneq_ps(sk_bit_cast<__m128>(x), _mm_set1_ps(0))) != 0b0000;
+    }
+#endif
+#if SKVX_USE_SIMD && defined(__aarch64__)
+    if constexpr (N*sizeof(T) == 8 ) { return vmaxv_u8 (sk_bit_cast<uint8x8_t> (x)) > 0; }
+    if constexpr (N*sizeof(T) == 16) { return vmaxvq_u8(sk_bit_cast<uint8x16_t>(x)) > 0; }
+#endif
+#if SKVX_USE_SIMD && defined(__wasm_simd128__)
+    if constexpr (N == 4 && sizeof(T) == 4) {
+        return wasm_i32x4_any_true(sk_bit_cast<VExt<4,int>>(x));
+    }
+#endif
+#if SKVX_USE_SIMD && SK_CPU_LSX_LEVEL >= SK_CPU_LSX_LEVEL_LASX
+    if constexpr (N*sizeof(T) == 32) {
+        v8i32 retv = (v8i32)__lasx_xvmskltz_w(__lasx_xvslt_wu(__lasx_xvldi(0),
+                                                              sk_bit_cast<__m256i>(x)));
+        return (retv[0] | retv[4]) != 0b0000;
+    }
+#endif
+#if SKVX_USE_SIMD && SK_CPU_LSX_LEVEL >= SK_CPU_LSX_LEVEL_LSX
+    if constexpr (N*sizeof(T) == 16) {
+        v4i32 retv = (v4i32)__lsx_vmskltz_w(__lsx_vslt_wu(__lsx_vldi(0),
+                                                          sk_bit_cast<__m128i>(x)));
+        return retv[0] != 0b0000;
+    }
+#endif
+    return any(x.lo)
+        || any(x.hi);
+}
+
+SIT  bool all(const Vec<1,T>& x) { return x.val != 0; }
+SINT bool all(const Vec<N,T>& x) {
+#if SKVX_USE_SIMD && SK_CPU_X64_LEVEL >= SK_CPU_X64_LEVEL_SSE1
+    if constexpr (N == 4 && sizeof(T) == 4) {
+        return _mm_movemask_ps(_mm_cmpneq_ps(sk_bit_cast<__m128>(x), _mm_set1_ps(0))) == 0b1111;
+    }
+#endif
+#if SKVX_USE_SIMD && defined(__aarch64__)
+    if constexpr (sizeof(T)==1 && N==8)  {return vminv_u8  (sk_bit_cast<uint8x8_t> (x)) > 0;}
+    if constexpr (sizeof(T)==1 && N==16) {return vminvq_u8 (sk_bit_cast<uint8x16_t>(x)) > 0;}
+    if constexpr (sizeof(T)==2 && N==4)  {return vminv_u16 (sk_bit_cast<uint16x4_t>(x)) > 0;}
+    if constexpr (sizeof(T)==2 && N==8)  {return vminvq_u16(sk_bit_cast<uint16x8_t>(x)) > 0;}
+    if constexpr (sizeof(T)==4 && N==2)  {return vminv_u32 (sk_bit_cast<uint32x2_t>(x)) > 0;}
+    if constexpr (sizeof(T)==4 && N==4)  {return vminvq_u32(sk_bit_cast<uint32x4_t>(x)) > 0;}
+#endif
+#if SKVX_USE_SIMD && defined(__wasm_simd128__)
+    if constexpr (N == 4 && sizeof(T) == 4) {
+        return wasm_i32x4_all_true(sk_bit_cast<VExt<4,int>>(x));
+    }
+#endif
+#if SKVX_USE_SIMD && SK_CPU_LSX_LEVEL >= SK_CPU_LSX_LEVEL_LASX
+    if constexpr (N == 8 && sizeof(T) == 4) {
+        v8i32 retv = (v8i32)__lasx_xvmskltz_w(__lasx_xvslt_wu(__lasx_xvldi(0),
+                                                              sk_bit_cast<__m256i>(x)));
+        return (retv[0] & retv[4]) == 0b1111;
+    }
+#endif
+#if SKVX_USE_SIMD && SK_CPU_LSX_LEVEL >= SK_CPU_LSX_LEVEL_LSX
+    if constexpr (N == 4 && sizeof(T) == 4) {
+        v4i32 retv = (v4i32)__lsx_vmskltz_w(__lsx_vslt_wu(__lsx_vldi(0),
+                                                          sk_bit_cast<__m128i>(x)));
+        return retv[0] == 0b1111;
+    }
+#endif
+    return all(x.lo)
+        && all(x.hi);
+}
+
+template <typename D, typename S>
+SI Vec<1,D> cast(const Vec<1,S>& src) { return (D)src.val; }
+
+template <typename D, int N, typename S>
+SI Vec<N,D> cast(const Vec<N,S>& src) {
+#if SKVX_USE_SIMD && defined(__clang__)
+    return to_vec(__builtin_convertvector(to_vext(src), VExt<N,D>));
+#else
+    return join(cast<D>(src.lo), cast<D>(src.hi));
+#endif
+}
+
+SIT  T min(const Vec<1,T>& x) { return x.val; }
+SIT  T max(const Vec<1,T>& x) { return x.val; }
+SINT T min(const Vec<N,T>& x) { return std::min(min(x.lo), min(x.hi)); }
+SINT T max(const Vec<N,T>& x) { return std::max(max(x.lo), max(x.hi)); }
+
+SINT Vec<N,T> min(const Vec<N,T>& x, const Vec<N,T>& y) { return naive_if_then_else(y < x, y, x); }
+SINT Vec<N,T> max(const Vec<N,T>& x, const Vec<N,T>& y) { return naive_if_then_else(x < y, y, x); }
+
+SINTU Vec<N,T> min(const Vec<N,T>& x, U y) { return min(x, Vec<N,T>(y)); }
+SINTU Vec<N,T> max(const Vec<N,T>& x, U y) { return max(x, Vec<N,T>(y)); }
+SINTU Vec<N,T> min(U x, const Vec<N,T>& y) { return min(Vec<N,T>(x), y); }
+SINTU Vec<N,T> max(U x, const Vec<N,T>& y) { return max(Vec<N,T>(x), y); }
+
+SINT Vec<N,T> pin(const Vec<N,T>& x, const Vec<N,T>& lo, const Vec<N,T>& hi) {
+    return max(lo, min(x, hi));
+}
+
+template <int... Ix, int N, typename T>
+SI Vec<sizeof...(Ix),T> shuffle(const Vec<N,T>& x) {
+#if SKVX_USE_SIMD && defined(__clang__)
+    return to_vec<sizeof...(Ix),T>(__builtin_shufflevector(to_vext(x), to_vext(x), Ix...));
+#else
+    return { x[Ix]... };
+#endif
+}
+
+
+template <typename Fn, typename... Args, size_t... I>
+SI auto map(std::index_sequence<I...>,
+            Fn&& fn, const Args&... args) -> skvx::Vec<sizeof...(I), decltype(fn(args[0]...))> {
+    auto lane = [&](size_t i)
+    SK_NO_SANITIZE_CFI
+    { return fn(args[static_cast<int>(i)]...); };
+
+    return { lane(I)... };
+}
+
+template <typename Fn, int N, typename T, typename... Rest>
+auto map(Fn&& fn, const Vec<N,T>& first, const Rest&... rest) {
+    return map(std::make_index_sequence<N>{}, fn, first,rest...);
+}
+
+SIN Vec<N,float>  ceil(const Vec<N,float>& x) { return map( ceilf, x); }
+SIN Vec<N,float> floor(const Vec<N,float>& x) { return map(floorf, x); }
+SIN Vec<N,float> trunc(const Vec<N,float>& x) { return map(truncf, x); }
+SIN Vec<N,float> round(const Vec<N,float>& x) { return map(roundf, x); }
+SIN Vec<N,float>  sqrt(const Vec<N,float>& x) { return map( sqrtf, x); }
+SIN Vec<N,float>   abs(const Vec<N,float>& x) { return map( fabsf, x); }
+SIN Vec<N,float>   fma(const Vec<N,float>& x,
+                       const Vec<N,float>& y,
+                       const Vec<N,float>& z) {
+    auto fn = [](float x, float y, float z) { return fmaf(x,y,z); };
+    return map(fn, x,y,z);
+}
+
+SI Vec<1,int> lrint(const Vec<1,float>& x) {
+    return (int)lrintf(x.val);
+}
+SIN Vec<N,int> lrint(const Vec<N,float>& x) {
+#if SKVX_USE_SIMD && SK_CPU_X64_LEVEL >= SK_CPU_X64_LEVEL_AVX
+    if constexpr (N == 8) {
+        return sk_bit_cast<Vec<N,int>>(_mm256_cvtps_epi32(sk_bit_cast<__m256>(x)));
+    }
+#endif
+#if SKVX_USE_SIMD && SK_CPU_X64_LEVEL >= SK_CPU_X64_LEVEL_SSE1
+    if constexpr (N == 4) {
+        return sk_bit_cast<Vec<N,int>>(_mm_cvtps_epi32(sk_bit_cast<__m128>(x)));
+    }
+#endif
+#if SKVX_USE_SIMD && SK_CPU_LSX_LEVEL >= SK_CPU_LSX_LEVEL_LASX
+    if constexpr (N == 8) {
+        return sk_bit_cast<Vec<N,int>>(__lasx_xvftint_w_s(sk_bit_cast<__m256>(x)));
+    }
+#endif
+#if SKVX_USE_SIMD && SK_CPU_LSX_LEVEL >= SK_CPU_LSX_LEVEL_LSX
+    if constexpr (N == 4) {
+        return sk_bit_cast<Vec<N,int>>(__lsx_vftint_w_s(sk_bit_cast<__m128>(x)));
+    }
+#endif
+    return join(lrint(x.lo),
+                lrint(x.hi));
+}
+
+SIN Vec<N,float> fract(const Vec<N,float>& x) { return x - floor(x); }
+
+SIN Vec<N,uint16_t> to_half(const Vec<N,float>& x) {
+    assert(all(x == x)); 
+
+    if constexpr (N > 4) {
+        return join(to_half(x.lo),
+                    to_half(x.hi));
+    }
+
+#if SKVX_USE_SIMD && defined(__aarch64__)
+    if constexpr (N == 4) {
+        return sk_bit_cast<Vec<N,uint16_t>>(vcvt_f16_f32(sk_bit_cast<float32x4_t>(x)));
+
+    }
+#endif
+
+#define I(x) sk_bit_cast<Vec<N,int32_t>>(x)
+#define F(x) sk_bit_cast<Vec<N,float>>(x)
+    Vec<N,int32_t> sem = I(x),
+                   s   = sem & 0x8000'0000,
+                    em = min(sem ^ s, 0x4780'0000), 
+                 magic = I(max(F(em) * 8192.f, 0.5f)) & (255 << 23),
+               rounded = I((F(em) + F(magic))), 
+                   exp = ((magic >> 13) - ((127-15+13+1)<<10)), 
+                   f16 = rounded + exp; 
+    return cast<uint16_t>((s>>16) | f16);
+#undef I
+#undef F
+}
+
+SIN Vec<N,float> from_half(const Vec<N,uint16_t>& x) {
+    if constexpr (N > 4) {
+        return join(from_half(x.lo),
+                    from_half(x.hi));
+    }
+
+#if SKVX_USE_SIMD && defined(__aarch64__)
+    if constexpr (N == 4) {
+        return sk_bit_cast<Vec<N,float>>(vcvt_f32_f16(sk_bit_cast<float16x4_t>(x)));
+    }
+#endif
+
+    Vec<N,int32_t> wide = cast<int32_t>(x),
+                      s  = wide & 0x8000,
+                      em = wide ^ s,
+              inf_or_nan =  (em >= (31 << 10)) & (255 << 23),  
+                 is_norm =   em > 0x3ff,
+                     sub = sk_bit_cast<Vec<N,int32_t>>((cast<float>(em) * (1.f/(1<<24)))),
+                    norm = ((em<<13) + ((127-15)<<23)), 
+                  finite = (is_norm & norm) | (~is_norm & sub);
+    return sk_bit_cast<Vec<N,float>>((s<<16) | finite | inf_or_nan);
+}
+
+SIN Vec<N,uint8_t> div255(const Vec<N,uint16_t>& x) {
+    return cast<uint8_t>( (x+127)/255 );
+}
+
+SIN Vec<N,uint8_t> approx_scale(const Vec<N,uint8_t>& x, const Vec<N,uint8_t>& y) {
+    auto X = cast<uint16_t>(x),
+         Y = cast<uint16_t>(y);
+    return cast<uint8_t>( (X*Y+X)/256 );
+}
+
+SINT std::enable_if_t<std::is_unsigned_v<T>, Vec<N,T>> saturated_add(const Vec<N,T>& x,
+                                                                     const Vec<N,T>& y) {
+#if SKVX_USE_SIMD && (SK_CPU_X64_LEVEL >= SK_CPU_X64_LEVEL_SSE1 || defined(SK_ARM_HAS_NEON) || \
+        SK_CPU_LSX_LEVEL >= SK_CPU_LSX_LEVEL_LSX)
+    if constexpr (N == 16 && sizeof(T) == 1) {
+        #if SK_CPU_X64_LEVEL >= SK_CPU_X64_LEVEL_SSE1
+        return sk_bit_cast<Vec<N,T>>(_mm_adds_epu8(sk_bit_cast<__m128i>(x),
+                                                   sk_bit_cast<__m128i>(y)));
+        #elif SK_CPU_LSX_LEVEL >= SK_CPU_LSX_LEVEL_LSX
+        return sk_bit_cast<Vec<N,T>>(__lsx_vsadd_bu(sk_bit_cast<__m128i>(x),
+                                                    sk_bit_cast<__m128i>(y)));
+        #else
+        return sk_bit_cast<Vec<N,T>>(vqaddq_u8(sk_bit_cast<uint8x16_t>(x),
+                                               sk_bit_cast<uint8x16_t>(y)));
+        #endif
+    } else if constexpr (N < 16 && sizeof(T) == 1) {
+        return saturated_add(join(x,x), join(y,y)).lo;
+    } else if constexpr (sizeof(T) == 1) {
+        return join(saturated_add(x.lo, y.lo), saturated_add(x.hi, y.hi));
+    }
+#endif
+    auto sum = x + y;
+    return if_then_else(sum < x, Vec<N,T>(std::numeric_limits<T>::max()), sum);
+}
+
+class ScaledDividerU32 {
+public:
+    explicit ScaledDividerU32(uint32_t divisor)
+            : fDivisorFactor{(uint32_t)(std::round((1.0 / divisor) * (1ull << 32)))}
+            , fHalf{(divisor + 1) >> 1} {
+        assert(divisor > 1);
+    }
+
+    Vec<4, uint32_t> divide(const Vec<4, uint32_t>& numerator) const {
+#if SKVX_USE_SIMD && defined(SK_ARM_HAS_NEON)
+        uint64x2_t hi = vmull_n_u32(vget_high_u32(to_vext(numerator)), fDivisorFactor);
+        uint64x2_t lo = vmull_n_u32(vget_low_u32(to_vext(numerator)),  fDivisorFactor);
+
+        return to_vec<4, uint32_t>(vcombine_u32(vshrn_n_u64(lo,32), vshrn_n_u64(hi,32)));
+#else
+        return cast<uint32_t>((cast<uint64_t>(numerator) * fDivisorFactor) >> 32);
+#endif
+    }
+
+    uint32_t half() const { return fHalf; }
+    uint32_t divisorFactor() const { return fDivisorFactor; }
+
+private:
+    const uint32_t fDivisorFactor;
+    const uint32_t fHalf;
+};
+
+
+SIN Vec<N,uint16_t> mull(const Vec<N,uint8_t>& x,
+                         const Vec<N,uint8_t>& y) {
+#if SKVX_USE_SIMD && defined(SK_ARM_HAS_NEON)
+    if constexpr (N == 8) {
+        return to_vec<8,uint16_t>(vmull_u8(to_vext(x), to_vext(y)));
+    } else if constexpr (N < 8) {
+        return mull(join(x,x), join(y,y)).lo;
+    } else { 
+        return join(mull(x.lo, y.lo), mull(x.hi, y.hi));
+    }
+#else
+    return cast<uint16_t>(x) * cast<uint16_t>(y);
+#endif
+}
+
+SIN Vec<N,uint32_t> mull(const Vec<N,uint16_t>& x,
+                         const Vec<N,uint16_t>& y) {
+#if SKVX_USE_SIMD && defined(SK_ARM_HAS_NEON)
+    if constexpr (N == 4) {
+        return to_vec<4,uint32_t>(vmull_u16(to_vext(x), to_vext(y)));
+    } else if constexpr (N < 4) {
+        return mull(join(x,x), join(y,y)).lo;
+    } else { 
+        return join(mull(x.lo, y.lo), mull(x.hi, y.hi));
+    }
+#else
+    return cast<uint32_t>(x) * cast<uint32_t>(y);
+#endif
+}
+
+SIN Vec<N,uint16_t> mulhi(const Vec<N,uint16_t>& x,
+                          const Vec<N,uint16_t>& y) {
+#if SKVX_USE_SIMD && SK_CPU_X64_LEVEL >= SK_CPU_X64_LEVEL_SSE1
+    if constexpr (N == 8) {
+        return sk_bit_cast<Vec<8,uint16_t>>(_mm_mulhi_epu16(sk_bit_cast<__m128i>(x),
+                                                            sk_bit_cast<__m128i>(y)));
+    } else if constexpr (N < 8) {
+        return mulhi(join(x,x), join(y,y)).lo;
+    } else { 
+        return join(mulhi(x.lo, y.lo), mulhi(x.hi, y.hi));
+    }
+#elif SKVX_USE_SIMD && SK_CPU_LSX_LEVEL >= SK_CPU_LSX_LEVEL_LSX
+    if constexpr (N == 8) {
+        return sk_bit_cast<Vec<8,uint16_t>>(__lsx_vmuh_hu(sk_bit_cast<__m128i>(x),
+                                                          sk_bit_cast<__m128i>(y)));
+    } else if constexpr (N < 8) {
+        return mulhi(join(x,x), join(y,y)).lo;
+    } else { 
+        return join(mulhi(x.lo, y.lo), mulhi(x.hi, y.hi));
+    }
+#else
+    return skvx::cast<uint16_t>(mull(x, y) >> 16);
+#endif
+}
+
+SINT T dot(const Vec<N, T>& a, const Vec<N, T>& b) {
+    auto ab = a*b;
+    if constexpr (N == 2) {
+        return ab[0] + ab[1];
+    } else if constexpr (N == 4) {
+        return ab[0] + ab[1] + ab[2] + ab[3];
+    } else {
+        T sum = ab[0];
+        for (int i = 1; i < N; ++i) {
+            sum += ab[i];
+        }
+        return sum;
+    }
+}
+
+SIT T cross(const Vec<2, T>& a, const Vec<2, T>& b) {
+    auto x = a * shuffle<1,0>(b);
+    return x[0] - x[1];
+}
+
+SIN float length(const Vec<N, float>& v) {
+    return std::sqrt(dot(v, v));
+}
+
+SIN double length(const Vec<N, double>& v) {
+    return std::sqrt(dot(v, v));
+}
+
+SIN Vec<N, float> normalize(const Vec<N, float>& v) {
+    return v / length(v);
+}
+
+SIN Vec<N, double> normalize(const Vec<N, double>& v) {
+    return v / length(v);
+}
+
+SINT bool isfinite(const Vec<N, T>& v) {
+    return SkIsFinite(dot(v, Vec<N, T>(0)));
+}
+
+SIT void strided_load4(const T* v,
+                       Vec<1,T>& a,
+                       Vec<1,T>& b,
+                       Vec<1,T>& c,
+                       Vec<1,T>& d) {
+    a.val = v[0];
+    b.val = v[1];
+    c.val = v[2];
+    d.val = v[3];
+}
+SINT void strided_load4(const T* v,
+                        Vec<N,T>& a,
+                        Vec<N,T>& b,
+                        Vec<N,T>& c,
+                        Vec<N,T>& d) {
+    strided_load4(v, a.lo, b.lo, c.lo, d.lo);
+    strided_load4(v + 4*(N/2), a.hi, b.hi, c.hi, d.hi);
+}
+#if SKVX_USE_SIMD && defined(SK_ARM_HAS_NEON)
+#define IMPL_LOAD4_TRANSPOSED(N, T, VLD) \
+SI void strided_load4(const T* v, \
+                      Vec<N,T>& a, \
+                      Vec<N,T>& b, \
+                      Vec<N,T>& c, \
+                      Vec<N,T>& d) { \
+    auto mat = VLD(v); \
+    a = sk_bit_cast<Vec<N,T>>(mat.val[0]); \
+    b = sk_bit_cast<Vec<N,T>>(mat.val[1]); \
+    c = sk_bit_cast<Vec<N,T>>(mat.val[2]); \
+    d = sk_bit_cast<Vec<N,T>>(mat.val[3]); \
+}
+IMPL_LOAD4_TRANSPOSED(2, uint32_t, vld4_u32)
+IMPL_LOAD4_TRANSPOSED(4, uint16_t, vld4_u16)
+IMPL_LOAD4_TRANSPOSED(8, uint8_t, vld4_u8)
+IMPL_LOAD4_TRANSPOSED(2, int32_t, vld4_s32)
+IMPL_LOAD4_TRANSPOSED(4, int16_t, vld4_s16)
+IMPL_LOAD4_TRANSPOSED(8, int8_t, vld4_s8)
+IMPL_LOAD4_TRANSPOSED(2, float, vld4_f32)
+IMPL_LOAD4_TRANSPOSED(4, uint32_t, vld4q_u32)
+IMPL_LOAD4_TRANSPOSED(8, uint16_t, vld4q_u16)
+IMPL_LOAD4_TRANSPOSED(16, uint8_t, vld4q_u8)
+IMPL_LOAD4_TRANSPOSED(4, int32_t, vld4q_s32)
+IMPL_LOAD4_TRANSPOSED(8, int16_t, vld4q_s16)
+IMPL_LOAD4_TRANSPOSED(16, int8_t, vld4q_s8)
+IMPL_LOAD4_TRANSPOSED(4, float, vld4q_f32)
+#undef IMPL_LOAD4_TRANSPOSED
+
+#elif SKVX_USE_SIMD && SK_CPU_X64_LEVEL >= SK_CPU_X64_LEVEL_SSE1
+
+SI void strided_load4(const float* v,
+                      Vec<4,float>& a,
+                      Vec<4,float>& b,
+                      Vec<4,float>& c,
+                      Vec<4,float>& d) {
+    __m128 a_ = _mm_loadu_ps(v);
+    __m128 b_ = _mm_loadu_ps(v+4);
+    __m128 c_ = _mm_loadu_ps(v+8);
+    __m128 d_ = _mm_loadu_ps(v+12);
+    _MM_TRANSPOSE4_PS(a_, b_, c_, d_);
+    a = sk_bit_cast<Vec<4,float>>(a_);
+    b = sk_bit_cast<Vec<4,float>>(b_);
+    c = sk_bit_cast<Vec<4,float>>(c_);
+    d = sk_bit_cast<Vec<4,float>>(d_);
+}
+
+#elif SKVX_USE_SIMD && SKVX_CPU_LSX_LEVEL >= SK_CPU_LSX_LEVEL_LSX
+#define _LSX_TRANSPOSE4(row0, row1, row2, row3) \
+do {                                            \
+    __m128i __t0 = __lsx_vilvl_w (row1, row0);  \
+    __m128i __t1 = __lsx_vilvl_w (row3, row2);  \
+    __m128i __t2 = __lsx_vilvh_w (row1, row0);  \
+    __m128i __t3 = __lsx_vilvh_w (row3, row2);  \
+    (row0) = __lsx_vilvl_d (__t1, __t0);        \
+    (row1) = __lsx_vilvh_d (__t1, __t0);        \
+    (row2) = __lsx_vilvl_d (__t3, __t2);        \
+    (row3) = __lsx_vilvh_d (__t3, __t2);        \
+} while (0)
+
+SI void strided_load4(const int* v,
+                      Vec<4,int>& a,
+                      Vec<4,int>& b,
+                      Vec<4,int>& c,
+                      Vec<4,int>& d) {
+    __m128i a_ = __lsx_vld(v, 0);
+    __m128i b_ = __lsx_vld(v, 16);
+    __m128i c_ = __lsx_vld(v, 32);
+    __m128i d_ = __lsx_vld(v, 48);
+    _LSX_TRANSPOSE4(a_, b_, c_, d_);
+    a = sk_bit_cast<Vec<4,int>>(a_);
+    b = sk_bit_cast<Vec<4,int>>(b_);
+    c = sk_bit_cast<Vec<4,int>>(c_);
+    d = sk_bit_cast<Vec<4,int>>(d_);
+}
+#endif
+
+SIT void strided_load2(const T* v, Vec<1,T>& a, Vec<1,T>& b) {
+    a.val = v[0];
+    b.val = v[1];
+}
+SINT void strided_load2(const T* v, Vec<N,T>& a, Vec<N,T>& b) {
+    strided_load2(v, a.lo, b.lo);
+    strided_load2(v + 2*(N/2), a.hi, b.hi);
+}
+#if SKVX_USE_SIMD && defined(SK_ARM_HAS_NEON)
+#define IMPL_LOAD2_TRANSPOSED(N, T, VLD) \
+SI void strided_load2(const T* v, Vec<N,T>& a, Vec<N,T>& b) { \
+    auto mat = VLD(v); \
+    a = sk_bit_cast<Vec<N,T>>(mat.val[0]); \
+    b = sk_bit_cast<Vec<N,T>>(mat.val[1]); \
+}
+IMPL_LOAD2_TRANSPOSED(2, uint32_t, vld2_u32)
+IMPL_LOAD2_TRANSPOSED(4, uint16_t, vld2_u16)
+IMPL_LOAD2_TRANSPOSED(8, uint8_t, vld2_u8)
+IMPL_LOAD2_TRANSPOSED(2, int32_t, vld2_s32)
+IMPL_LOAD2_TRANSPOSED(4, int16_t, vld2_s16)
+IMPL_LOAD2_TRANSPOSED(8, int8_t, vld2_s8)
+IMPL_LOAD2_TRANSPOSED(2, float, vld2_f32)
+IMPL_LOAD2_TRANSPOSED(4, uint32_t, vld2q_u32)
+IMPL_LOAD2_TRANSPOSED(8, uint16_t, vld2q_u16)
+IMPL_LOAD2_TRANSPOSED(16, uint8_t, vld2q_u8)
+IMPL_LOAD2_TRANSPOSED(4, int32_t, vld2q_s32)
+IMPL_LOAD2_TRANSPOSED(8, int16_t, vld2q_s16)
+IMPL_LOAD2_TRANSPOSED(16, int8_t, vld2q_s8)
+IMPL_LOAD2_TRANSPOSED(4, float, vld2q_f32)
+#undef IMPL_LOAD2_TRANSPOSED
+#endif
+
+using float2  = Vec< 2, float>;
+using float4  = Vec< 4, float>;
+using float8  = Vec< 8, float>;
+
+using double2 = Vec< 2, double>;
+using double4 = Vec< 4, double>;
+using double8 = Vec< 8, double>;
+
+using byte2   = Vec< 2, uint8_t>;
+using byte4   = Vec< 4, uint8_t>;
+using byte8   = Vec< 8, uint8_t>;
+using byte16  = Vec<16, uint8_t>;
+
+using int2    = Vec< 2, int32_t>;
+using int4    = Vec< 4, int32_t>;
+using int8    = Vec< 8, int32_t>;
+
+using ushort2 = Vec< 2, uint16_t>;
+using ushort4 = Vec< 4, uint16_t>;
+using ushort8 = Vec< 8, uint16_t>;
+
+using uint2   = Vec< 2, uint32_t>;
+using uint4   = Vec< 4, uint32_t>;
+using uint8   = Vec< 8, uint32_t>;
+
+using long2   = Vec< 2, int64_t>;
+using long4   = Vec< 4, int64_t>;
+using long8   = Vec< 8, int64_t>;
+
+using half2   = Vec< 2, uint16_t>;
+using half4   = Vec< 4, uint16_t>;
+using half8   = Vec< 8, uint16_t>;
+
+}  
+
+#undef SINTU
+#undef SINT
+#undef SIN
+#undef SIT
+#undef SI
+#undef SKVX_ALWAYS_INLINE
+#undef SKVX_USE_SIMD
+
+#endif

@@ -1,0 +1,225 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/layers/StackingContextHelper.h"
+
+#include "mozilla/PresShell.h"
+#include "mozilla/gfx/Point.h"
+#include "mozilla/gfx/Matrix.h"
+#include "UnitTransforms.h"
+#include "nsDisplayList.h"
+#include "mozilla/dom/BrowserChild.h"
+#include "nsLayoutUtils.h"
+#include "ActiveLayerTracker.h"
+
+namespace mozilla {
+namespace layers {
+using namespace gfx;
+
+StackingContextHelper::StackingContextHelper()
+    : mBuilder(nullptr),
+      mScale(1.0f, 1.0f),
+      mAffectsClipPositioning(false),
+      mDeferredTransformItem(nullptr) {}
+
+static nsSize ComputeDesiredDisplaySizeForAnimation(nsIFrame* aContainerFrame) {
+  nsPresContext* presContext = aContainerFrame->PresContext();
+  nsIWidget* widget = aContainerFrame->GetNearestWidget();
+  if (widget) {
+    return LayoutDevicePixel::ToAppUnits(widget->GetClientSize(),
+                                         presContext->AppUnitsPerDevPixel());
+  }
+
+  return presContext->GetVisibleArea().Size();
+}
+
+MatrixScales ChooseScale(nsIFrame* aContainerFrame,
+                         nsDisplayItem* aContainerItem,
+                         const nsRect& aVisibleRect, float aXScale,
+                         float aYScale, const Matrix& aTransform2d,
+                         bool aCanDraw2D) {
+  MatrixScales scale;
+  if (aCanDraw2D && !aContainerFrame->Combines3DTransformWithAncestors() &&
+      !aContainerFrame->HasPerspective()) {
+    if (aContainerItem &&
+        aContainerItem->GetType() == DisplayItemType::TYPE_TRANSFORM &&
+        EffectCompositor::HasAnimationsForCompositor(
+            aContainerFrame, DisplayItemType::TYPE_TRANSFORM)) {
+      nsSize displaySize =
+          ComputeDesiredDisplaySizeForAnimation(aContainerFrame);
+      nsSize scaledVisibleSize = nsSize(aVisibleRect.Width() * aXScale,
+                                        aVisibleRect.Height() * aYScale);
+      scale = nsLayoutUtils::ComputeSuitableScaleForAnimation(
+          aContainerFrame, scaledVisibleSize, displaySize);
+      float incomingScale = std::max(aXScale, aYScale);
+      scale = scale * ScaleFactor<UnknownUnits, UnknownUnits>(incomingScale);
+    } else {
+      scale = (aTransform2d * gfx::Matrix::Scaling(aXScale, aYScale))
+                  .ScaleFactors();
+      Matrix frameTransform;
+      if (ActiveLayerTracker::IsScaleSubjectToAnimation(aContainerFrame)) {
+        scale.xScale = gfxUtils::ClampToScaleFactor(scale.xScale);
+        scale.yScale = gfxUtils::ClampToScaleFactor(scale.yScale);
+
+        nsSize maxScale(4, 4);
+        if (!aVisibleRect.IsEmpty()) {
+          nsSize displaySize =
+              ComputeDesiredDisplaySizeForAnimation(aContainerFrame);
+          maxScale = Max(maxScale, displaySize / aVisibleRect.Size());
+        }
+        if (scale.xScale > maxScale.width) {
+          scale.xScale = gfxUtils::ClampToScaleFactor(maxScale.width, true);
+        }
+        if (scale.yScale > maxScale.height) {
+          scale.yScale = gfxUtils::ClampToScaleFactor(maxScale.height, true);
+        }
+      } else {
+      }
+    }
+    if (fabs(scale.xScale) < 1e-8 || fabs(scale.yScale) < 1e-8) {
+      scale = MatrixScales(1.0, 1.0);
+    }
+  } else {
+    scale = MatrixScales(1.0, 1.0);
+  }
+
+  return MatrixScales(std::min(scale.xScale, 32768.0f),
+                      std::min(scale.yScale, 32768.0f));
+}
+
+StackingContextHelper::StackingContextHelper(
+    const StackingContextHelper& aParentSC, const ActiveScrolledRoot* aAsr,
+    nsIFrame* aContainerFrame, nsDisplayItem* aContainerItem,
+    wr::DisplayListBuilder& aBuilder, const wr::StackingContextParams& aParams,
+    const LayoutDeviceRect& aBounds)
+    : mBuilder(&aBuilder),
+      mScale(1.0f, 1.0f),
+      mDeferredTransformItem(aParams.mDeferredTransformItem) {
+  MOZ_ASSERT(!aContainerItem || aContainerItem->CreatesStackingContextHelper());
+
+
+  if (aParams.mBoundTransform) {
+    gfx::Matrix transform2d;
+    bool canDraw2D = aParams.mBoundTransform->CanDraw2D(&transform2d);
+    if (canDraw2D &&
+        aParams.reference_frame_kind != wr::WrReferenceFrameKind::Perspective &&
+        !aContainerFrame->Combines3DTransformWithAncestors()) {
+      mInheritedTransform = transform2d * aParentSC.mInheritedTransform;
+
+      int32_t apd = aContainerFrame->PresContext()->AppUnitsPerDevPixel();
+      nsRect r = LayoutDevicePixel::ToAppUnits(aBounds, apd);
+      mScale = ChooseScale(aContainerFrame, aContainerItem, r,
+                           aParentSC.mScale.xScale, aParentSC.mScale.yScale,
+                           transform2d,
+                            true);
+    } else {
+      mScale = gfx::MatrixScales(1.0f, 1.0f);
+      mInheritedTransform = gfx::Matrix::Scaling(1.f, 1.f);
+    }
+
+    if (aParams.mAnimated) {
+      mSnappingSurfaceTransform = gfx::Matrix::Scaling(mScale);
+    } else {
+      mSnappingSurfaceTransform =
+          transform2d * aParentSC.mSnappingSurfaceTransform;
+    }
+
+  } else if (aParams.reference_frame_kind ==
+                 wr::WrReferenceFrameKind::Transform &&
+             aContainerItem &&
+             aContainerItem->GetType() == DisplayItemType::TYPE_ASYNC_ZOOM &&
+             aContainerItem->Frame()) {
+    float resolution = aContainerItem->Frame()->PresShell()->GetResolution();
+    gfx::Matrix transform = gfx::Matrix::Scaling(resolution, resolution);
+
+    mInheritedTransform = transform * aParentSC.mInheritedTransform;
+    mScale =
+        ScaleFactor<UnknownUnits, UnknownUnits>(resolution) * aParentSC.mScale;
+
+    MOZ_ASSERT(!aParams.mAnimated);
+    mSnappingSurfaceTransform = transform * aParentSC.mSnappingSurfaceTransform;
+
+  } else if (!aAsr && !aContainerFrame && !aContainerItem &&
+             aParams.mRootReferenceFrame) {
+    Scale2D resolution;
+
+    if (mozilla::dom::BrowserChild* browserChild =
+            mozilla::dom::BrowserChild::GetFrom(
+                aParams.mRootReferenceFrame->PresShell())) {
+      resolution = browserChild->GetEffectsInfo().mRasterScale;
+    }
+
+    gfx::Matrix transform =
+        gfx::Matrix::Scaling(resolution.xScale, resolution.yScale);
+
+    mInheritedTransform = transform * aParentSC.mInheritedTransform;
+    mScale = aParentSC.mScale * resolution;
+
+    MOZ_ASSERT(!aParams.mAnimated);
+    mSnappingSurfaceTransform = transform * aParentSC.mSnappingSurfaceTransform;
+
+  } else {
+    mInheritedTransform = aParentSC.mInheritedTransform;
+    mScale = aParentSC.mScale;
+  }
+
+  auto rasterSpace = wr::RasterSpace::Screen();
+
+  MOZ_ASSERT(!aParams.clip.IsNone());
+  mReferenceFrameId = mBuilder->PushStackingContext(
+      aParams, wr::ToLayoutRect(aBounds), rasterSpace);
+
+  if (mReferenceFrameId) {
+    mSpaceAndClipChainHelper.emplace(aBuilder, mReferenceFrameId.ref());
+  }
+
+  mAffectsClipPositioning =
+      mReferenceFrameId.isSome() || (aBounds.TopLeft() != LayoutDevicePoint());
+
+  if (aParentSC.mDeferredTransformItem &&
+      aAsr == aParentSC.mDeferredTransformItem->GetActiveScrolledRoot()) {
+    if (mDeferredTransformItem) {
+      mDeferredAncestorTransform = aParentSC.GetDeferredTransformMatrix();
+    } else {
+      mDeferredTransformItem = aParentSC.mDeferredTransformItem;
+      mDeferredAncestorTransform = aParentSC.mDeferredAncestorTransform;
+    }
+  }
+}
+
+StackingContextHelper::~StackingContextHelper() {
+  if (mBuilder) {
+    mSpaceAndClipChainHelper.reset();
+    mBuilder->PopStackingContext(mReferenceFrameId.isSome());
+  }
+}
+
+nsDisplayTransform* StackingContextHelper::GetDeferredTransformItem() const {
+  return mDeferredTransformItem;
+}
+
+Maybe<gfx::Matrix4x4> StackingContextHelper::GetDeferredTransformMatrix()
+    const {
+  if (mDeferredTransformItem) {
+    gfx::Matrix4x4 result = mDeferredTransformItem->GetTransform().GetMatrix();
+    if (mDeferredAncestorTransform) {
+      result = result * *mDeferredAncestorTransform;
+    }
+    return Some(result);
+  } else {
+    return Nothing();
+  }
+}
+
+void StackingContextHelper::ClearDeferredTransformItem() const {
+  mDeferredTransformItem = nullptr;
+}
+
+void StackingContextHelper::RestoreDeferredTransformItem(
+    nsDisplayTransform* aItem) const {
+  mDeferredTransformItem = aItem;
+}
+
+}  
+}  

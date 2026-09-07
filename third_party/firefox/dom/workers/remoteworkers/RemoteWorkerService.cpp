@@ -1,0 +1,338 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "RemoteWorkerService.h"
+
+#include "RemoteWorkerController.h"
+#include "RemoteWorkerDebuggerManagerChild.h"
+#include "RemoteWorkerDebuggerManagerParent.h"
+#include "RemoteWorkerServiceChild.h"
+#include "RemoteWorkerServiceParent.h"
+#include "mozilla/SchedulerGroup.h"
+#include "mozilla/Services.h"
+#include "mozilla/SpinEventLoopUntil.h"
+#include "mozilla/StaticMutex.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/dom/PRemoteWorkerDebuggerParent.h"
+#include "mozilla/dom/PRemoteWorkerParent.h"
+#include "mozilla/ipc/BackgroundChild.h"
+#include "mozilla/ipc/BackgroundParent.h"
+#include "mozilla/ipc/PBackgroundChild.h"
+#include "mozilla/ipc/PBackgroundParent.h"
+#include "nsIObserverService.h"
+#include "nsIThread.h"
+#include "nsThreadUtils.h"
+#include "nsXPCOMPrivate.h"
+
+namespace mozilla {
+
+using namespace ipc;
+
+namespace dom {
+
+namespace {
+
+StaticMutex sRemoteWorkerServiceMutex;
+StaticRefPtr<RemoteWorkerService> sRemoteWorkerService;
+
+}  
+
+class RemoteWorkerServiceShutdownBlocker final {
+  ~RemoteWorkerServiceShutdownBlocker() = default;
+
+ public:
+  explicit RemoteWorkerServiceShutdownBlocker(RemoteWorkerService* aService)
+      : mService(aService), mBlockShutdown(true) {}
+
+  void RemoteWorkersAllGoneAllowShutdown() {
+    mService->FinishShutdown();
+    mService = nullptr;
+
+    mBlockShutdown = false;
+  }
+
+  bool ShouldBlockShutdown() { return mBlockShutdown; }
+
+  NS_INLINE_DECL_REFCOUNTING(RemoteWorkerServiceShutdownBlocker);
+
+  RefPtr<RemoteWorkerService> mService;
+  bool mBlockShutdown;
+};
+
+RemoteWorkerServiceKeepAlive::RemoteWorkerServiceKeepAlive(
+    RemoteWorkerServiceShutdownBlocker* aBlocker)
+    : mBlocker(aBlocker) {
+  MOZ_ASSERT(NS_IsMainThread());
+}
+
+RemoteWorkerServiceKeepAlive::~RemoteWorkerServiceKeepAlive() {
+  nsCOMPtr<nsIRunnable> r =
+      NS_NewRunnableFunction(__func__, [blocker = std::move(mBlocker)] {
+        blocker->RemoteWorkersAllGoneAllowShutdown();
+      });
+  MOZ_ALWAYS_SUCCEEDS(SchedulerGroup::Dispatch(r.forget()));
+}
+
+void RemoteWorkerService::InitializeParent() {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(XRE_IsParentProcess());
+
+  StaticMutexAutoLock lock(sRemoteWorkerServiceMutex);
+  MOZ_ASSERT(!sRemoteWorkerService);
+
+  RefPtr<RemoteWorkerService> service = new RemoteWorkerService();
+
+
+  nsCOMPtr<nsIObserverService> obs = services::GetObserverService();
+  if (NS_WARN_IF(!obs)) {
+    return;
+  }
+
+  nsresult rv = obs->AddObserver(service, "profile-after-change", false);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return;
+  }
+
+  sRemoteWorkerService = service;
+}
+
+void RemoteWorkerService::InitializeChild(
+    mozilla::ipc::Endpoint<PRemoteWorkerServiceChild> aEndpoint,
+    mozilla::ipc::Endpoint<PRemoteWorkerDebuggerManagerChild>
+        aDebuggerChildEp) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(!XRE_IsParentProcess());
+
+  StaticMutexAutoLock lock(sRemoteWorkerServiceMutex);
+  MOZ_ASSERT(!sRemoteWorkerService);
+
+  RefPtr<RemoteWorkerService> service = new RemoteWorkerService();
+
+
+  nsresult rv = service->InitializeOnMainThread(std::move(aEndpoint),
+                                                std::move(aDebuggerChildEp));
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return;
+  }
+
+  sRemoteWorkerService = service;
+}
+
+nsIThread* RemoteWorkerService::Thread() {
+  StaticMutexAutoLock lock(sRemoteWorkerServiceMutex);
+  MOZ_ASSERT(sRemoteWorkerService);
+  MOZ_ASSERT(sRemoteWorkerService->mThread);
+  return sRemoteWorkerService->mThread;
+}
+
+bool RemoteWorkerService::IsInitialized() {
+  StaticMutexAutoLock lock(sRemoteWorkerServiceMutex);
+  return sRemoteWorkerService && sRemoteWorkerService->mThread;
+}
+
+void RemoteWorkerService::RegisterRemoteDebugger(
+    RemoteWorkerDebuggerInfo aDebuggerInfo,
+    mozilla::ipc::Endpoint<PRemoteWorkerDebuggerParent> aDebuggerParentEp) {
+  StaticMutexAutoLock lock(sRemoteWorkerServiceMutex);
+  MOZ_ASSERT(sRemoteWorkerService);
+  MOZ_ASSERT(sRemoteWorkerService->mThread);
+
+  if (sRemoteWorkerService->mThread->IsOnCurrentThread()) {
+    MOZ_ASSERT(sRemoteWorkerService->mDebuggerManagerChild);
+    (void)sRemoteWorkerService->mDebuggerManagerChild->SendRegister(
+        std::move(aDebuggerInfo), std::move(aDebuggerParentEp));
+    return;
+  }
+
+  if (XRE_IsParentProcess() && NS_IsMainThread()) {
+    MOZ_ASSERT(sRemoteWorkerService->mDebuggerManagerParent);
+    (void)sRemoteWorkerService->mDebuggerManagerParent->RecvRegister(
+        std::move(aDebuggerInfo), std::move(aDebuggerParentEp));
+    return;
+  }
+
+  nsCOMPtr<nsIRunnable> r = NS_NewRunnableFunction(
+      "RemoteWorkerService::RegisterRemoteDebugger",
+      [debuggerInfo = std::move(aDebuggerInfo),
+       debuggerParentEp = std::move(aDebuggerParentEp)]() mutable {
+        RemoteWorkerService::RegisterRemoteDebugger(
+            std::move(debuggerInfo), std::move(debuggerParentEp));
+      });
+  (void)NS_WARN_IF(
+      NS_FAILED(sRemoteWorkerService->mThread->Dispatch(r.forget())));
+}
+
+already_AddRefed<RemoteWorkerServiceKeepAlive>
+RemoteWorkerService::MaybeGetKeepAlive() {
+  StaticMutexAutoLock lock(sRemoteWorkerServiceMutex);
+  MOZ_ASSERT(sRemoteWorkerService);
+  if (!sRemoteWorkerService) {
+    return nullptr;
+  }
+
+  auto lockedKeepAlive = sRemoteWorkerService->mKeepAlive.Lock();
+  RefPtr<RemoteWorkerServiceKeepAlive> extraRef = *lockedKeepAlive;
+  return extraRef.forget();
+}
+
+nsresult RemoteWorkerService::InitializeOnMainThread(
+    mozilla::ipc::Endpoint<PRemoteWorkerServiceChild> aEndpoint,
+    mozilla::ipc::Endpoint<PRemoteWorkerDebuggerManagerChild>
+        aDebuggerChildEp) {
+  nsresult rv = NS_NewNamedThread("Worker Launcher", getter_AddRefs(mThread));
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  nsCOMPtr<nsIObserverService> obs = services::GetObserverService();
+  if (NS_WARN_IF(!obs)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  rv = obs->AddObserver(this, NS_XPCOM_SHUTDOWN_OBSERVER_ID, false);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  mShutdownBlocker = new RemoteWorkerServiceShutdownBlocker(this);
+
+  {
+    RefPtr<RemoteWorkerServiceKeepAlive> keepAlive =
+        new RemoteWorkerServiceKeepAlive(mShutdownBlocker);
+
+    auto lockedKeepAlive = mKeepAlive.Lock();
+    *lockedKeepAlive = std::move(keepAlive);
+  }
+
+  RefPtr<RemoteWorkerService> self = this;
+  nsCOMPtr<nsIRunnable> r = NS_NewRunnableFunction(
+      "InitializeThread",
+      [self, endpoint = std::move(aEndpoint),
+       debuggerChildEp = std::move(aDebuggerChildEp)]() mutable {
+        self->InitializeOnTargetThread(std::move(endpoint),
+                                       std::move(debuggerChildEp));
+      });
+
+  rv = mThread->Dispatch(r.forget(), NS_DISPATCH_NORMAL);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  return NS_OK;
+}
+
+RemoteWorkerService::RemoteWorkerService()
+    : mKeepAlive(nullptr, "RemoteWorkerService::mKeepAlive") {
+  MOZ_ASSERT(NS_IsMainThread());
+}
+
+RemoteWorkerService::~RemoteWorkerService() = default;
+
+void RemoteWorkerService::InitializeOnTargetThread(
+    mozilla::ipc::Endpoint<PRemoteWorkerServiceChild> aEndpoint,
+    mozilla::ipc::Endpoint<PRemoteWorkerDebuggerManagerChild>
+        aDebuggerMgrEndpoint) {
+  MOZ_ASSERT(mThread);
+  MOZ_ASSERT(mThread->IsOnCurrentThread());
+
+  RefPtr<RemoteWorkerDebuggerManagerChild> debuggerManagerActor =
+      MakeRefPtr<RemoteWorkerDebuggerManagerChild>();
+  if (NS_WARN_IF(!aDebuggerMgrEndpoint.Bind(debuggerManagerActor))) {
+    return;
+  }
+
+  RefPtr<RemoteWorkerServiceChild> serviceActor =
+      MakeAndAddRef<RemoteWorkerServiceChild>();
+  if (NS_WARN_IF(!aEndpoint.Bind(serviceActor))) {
+    return;
+  }
+
+  mDebuggerManagerChild = std::move(debuggerManagerActor);
+  mActor = std::move(serviceActor);
+}
+
+void RemoteWorkerService::CloseActorOnTargetThread() {
+  MOZ_ASSERT(mThread);
+  MOZ_ASSERT(mThread->IsOnCurrentThread());
+
+  if (mActor) {
+    mActor->Close();
+    mActor = nullptr;
+  }
+  if (mDebuggerManagerChild) {
+    mDebuggerManagerChild->Close();
+    mDebuggerManagerChild = nullptr;
+  }
+}
+
+NS_IMETHODIMP
+RemoteWorkerService::Observe(nsISupports* aSubject, const char* aTopic,
+                             const char16_t* aData) {
+  if (!strcmp(aTopic, NS_XPCOM_SHUTDOWN_OBSERVER_ID)) {
+    MOZ_ASSERT(mThread);
+
+    nsCOMPtr<nsIObserverService> obs = services::GetObserverService();
+    if (obs) {
+      obs->RemoveObserver(this, NS_XPCOM_SHUTDOWN_OBSERVER_ID);
+    }
+
+
+    BeginShutdown();
+
+    MOZ_ALWAYS_TRUE(SpinEventLoopUntil(
+        "RemoteWorkerService::Observe"_ns,
+        [&]() { return !mShutdownBlocker->ShouldBlockShutdown(); }));
+
+    mShutdownBlocker = nullptr;
+
+    return NS_OK;
+  }
+
+  MOZ_ASSERT(!strcmp(aTopic, "profile-after-change"));
+  MOZ_ASSERT(XRE_IsParentProcess());
+
+  nsCOMPtr<nsIObserverService> obs = services::GetObserverService();
+  if (obs) {
+    obs->RemoveObserver(this, "profile-after-change");
+  }
+
+  Endpoint<PRemoteWorkerServiceChild> childEp;
+  RefPtr<RemoteWorkerServiceParent> parentActor =
+      RemoteWorkerServiceParent::CreateForProcess(nullptr, &childEp);
+  NS_ENSURE_TRUE(parentActor, NS_ERROR_FAILURE);
+
+  Endpoint<PRemoteWorkerDebuggerManagerChild> debuggerChildEp;
+  mDebuggerManagerParent =
+      RemoteWorkerDebuggerManagerParent::CreateForProcess(&debuggerChildEp);
+  NS_ENSURE_TRUE(mDebuggerManagerParent, NS_ERROR_FAILURE);
+
+  return InitializeOnMainThread(std::move(childEp), std::move(debuggerChildEp));
+}
+
+void RemoteWorkerService::BeginShutdown() {
+  auto lockedKeepAlive = mKeepAlive.Lock();
+  *lockedKeepAlive = nullptr;
+}
+
+void RemoteWorkerService::FinishShutdown() {
+  {
+    StaticMutexAutoLock lock(sRemoteWorkerServiceMutex);
+    sRemoteWorkerService = nullptr;
+  }
+
+  RefPtr<RemoteWorkerService> self = this;
+  nsCOMPtr<nsIRunnable> r =
+      NS_NewRunnableFunction("RemoteWorkerService::CloseActorOnTargetThread",
+                             [self]() { self->CloseActorOnTargetThread(); });
+
+  mThread->Dispatch(r.forget(), NS_DISPATCH_NORMAL);
+
+  mThread->Shutdown();
+  mThread = nullptr;
+}
+
+NS_IMPL_ISUPPORTS(RemoteWorkerService, nsIObserver)
+
+}  
+}  

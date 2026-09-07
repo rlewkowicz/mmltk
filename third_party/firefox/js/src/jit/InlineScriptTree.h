@@ -1,0 +1,116 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_InlineScriptTree_h
+#define jit_InlineScriptTree_h
+
+#include "mozilla/Assertions.h"
+
+#include "jit/JitAllocPolicy.h"
+#include "js/TypeDecls.h"
+
+namespace js {
+namespace jit {
+
+class InlineScriptTree {
+ public:
+  static constexpr uint32_t MaxDepth = 8;
+
+ private:
+  InlineScriptTree* caller_;
+
+  jsbytecode* callerPc_;
+
+  JSScript* script_;
+
+  InlineScriptTree* children_;
+  InlineScriptTree* nextCallee_;
+
+  bool isMonomorphicallyInlined_;
+
+ public:
+  InlineScriptTree(InlineScriptTree* caller, jsbytecode* callerPc,
+                   JSScript* script, bool isMonomorphicallyInlined)
+      : caller_(caller),
+        callerPc_(callerPc),
+        script_(script),
+        children_(nullptr),
+        nextCallee_(nullptr),
+        isMonomorphicallyInlined_(isMonomorphicallyInlined) {}
+
+  static inline InlineScriptTree* New(TempAllocator* allocator,
+                                      InlineScriptTree* caller,
+                                      jsbytecode* callerPc, JSScript* script,
+                                      bool isMonomorphicallyInlined = false);
+
+  inline InlineScriptTree* addCallee(TempAllocator* allocator,
+                                     jsbytecode* callerPc,
+                                     JSScript* calleeScript,
+                                     bool isMonomorphicallyInlined);
+  inline void removeCallee(InlineScriptTree* callee);
+
+  InlineScriptTree* caller() const { return caller_; }
+
+  bool isOutermostCaller() const { return caller_ == nullptr; }
+  bool hasCaller() const { return caller_ != nullptr; }
+
+  jsbytecode* callerPc() const { return callerPc_; }
+
+  JSScript* script() const { return script_; }
+
+  bool hasChildren() const { return children_ != nullptr; }
+  InlineScriptTree* firstChild() const {
+    MOZ_ASSERT(hasChildren());
+    return children_;
+  }
+
+  bool hasNextCallee() const { return nextCallee_ != nullptr; }
+  InlineScriptTree* nextCallee() const {
+    MOZ_ASSERT(hasNextCallee());
+    return nextCallee_;
+  }
+
+  unsigned depth() const {
+    if (isOutermostCaller()) {
+      return 1;
+    }
+    return 1 + caller_->depth();
+  }
+
+  bool hasSharedICScript() const {
+    const InlineScriptTree* script = this;
+    while (!script->isOutermostCaller()) {
+      if (script->isMonomorphicallyInlined_) {
+        return true;
+      }
+      script = script->caller();
+    }
+    return false;
+  }
+};
+
+class BytecodeSite : public TempObject {
+  InlineScriptTree* tree_;
+
+  jsbytecode* pc_;
+
+ public:
+  BytecodeSite() : tree_(nullptr), pc_(nullptr) {}
+
+  BytecodeSite(InlineScriptTree* tree, jsbytecode* pc) : tree_(tree), pc_(pc) {
+    MOZ_ASSERT(tree_ != nullptr);
+    MOZ_ASSERT(pc_ != nullptr);
+  }
+
+  InlineScriptTree* tree() const { return tree_; }
+
+  jsbytecode* pc() const { return pc_; }
+
+  JSScript* script() const { return tree_ ? tree_->script() : nullptr; }
+};
+
+}  
+}  
+
+#endif /* jit_InlineScriptTree_h */

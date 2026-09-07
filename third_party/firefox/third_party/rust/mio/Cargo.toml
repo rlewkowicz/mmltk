@@ -1,0 +1,81 @@
+
+[package]
+edition = "2021"
+rust-version = "1.71"
+name = "mio"
+version = "1.2.0"
+authors = [
+    "Carl Lerche <me@carllerche.com>",
+    "Thomas de Zeeuw <thomasdezeeuw@gmail.com>",
+    "Tokio Contributors <team@tokio.rs>",
+]
+build = false
+include = [
+    "Cargo.toml",
+    "LICENSE",
+    "README.md",
+    "CHANGELOG.md",
+    "src/**/*.rs",
+    "examples/**/*.rs",
+]
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Lightweight non-blocking I/O."
+homepage = "https://github.com/tokio-rs/mio"
+keywords = [
+    "io",
+    "async",
+    "non-blocking",
+]
+categories = ["asynchronous"]
+license = "MIT"
+repository = "https://github.com/tokio-rs/mio"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = [
+    "--cfg",
+    "docsrs",
+    "--generate-link-to-definition",
+]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+
+[package.metadata.playground]
+features = [
+    "os-poll",
+    "os-ext",
+    "net",
+]
+
+[features]
+default = ["log"]
+net = []
+os-ext = [
+    "os-poll",
+]
+os-poll = []
+
+[lib]
+name = "mio"
+path = "src/lib.rs"
+
+[dependencies.log]
+version = "0.4.8"
+optional = true
+
+[dependencies.libc]
+version = "0.2"
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+priority = 0
+check-cfg = [
+    "cfg(mio_unsupported_force_poll_poll)",
+    "cfg(mio_unsupported_force_waker_pipe)",
+]

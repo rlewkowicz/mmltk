@@ -1,0 +1,2587 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "jit/JitFrames-inl.h"
+
+#include "mozilla/ScopeExit.h"
+
+#include <algorithm>
+
+#include "builtin/ModuleObject.h"
+#include "builtin/Sorting.h"
+#include "gc/GC.h"
+#include "jit/BaselineFrame.h"
+#include "jit/BaselineIC.h"
+#include "jit/BaselineJIT.h"
+#include "jit/Ion.h"
+#include "jit/IonScript.h"
+#include "jit/JitRuntime.h"
+#include "jit/JitSpewer.h"
+#include "jit/LIR.h"
+#include "jit/Recover.h"
+#include "jit/Safepoints.h"
+#include "jit/ScriptFromCalleeToken.h"
+#include "jit/Snapshots.h"
+#include "jit/VMFunctions.h"
+#include "js/Exception.h"
+#include "js/friend/DumpFunctions.h"  // js::DumpObject, js::DumpValue
+#include "vm/Interpreter.h"
+#include "vm/JSContext.h"
+#include "vm/JSFunction.h"
+#include "vm/JSObject.h"
+#include "vm/JSScript.h"
+#include "wasm/WasmBuiltins.h"
+#include "wasm/WasmInstance.h"
+
+#include "builtin/Sorting-inl.h"
+#include "debugger/DebugAPI-inl.h"
+#include "jit/JSJitFrameIter-inl.h"
+#include "vm/GeckoProfiler-inl.h"
+#include "vm/JSScript-inl.h"
+#include "vm/Probes-inl.h"
+
+namespace js {
+namespace jit {
+
+static inline int32_t OffsetOfFrameSlot(int32_t slot) { return -slot; }
+
+static inline uint8_t* AddressOfFrameSlot(JitFrameLayout* fp, int32_t slot) {
+  return (uint8_t*)fp + OffsetOfFrameSlot(slot);
+}
+
+static inline uintptr_t ReadFrameSlot(JitFrameLayout* fp, int32_t slot) {
+  return *(uintptr_t*)AddressOfFrameSlot(fp, slot);
+}
+
+static inline void WriteFrameSlot(JitFrameLayout* fp, int32_t slot,
+                                  uintptr_t value) {
+  *(uintptr_t*)AddressOfFrameSlot(fp, slot) = value;
+}
+
+static inline double ReadFrameDoubleSlot(JitFrameLayout* fp, int32_t slot) {
+  return *(double*)AddressOfFrameSlot(fp, slot);
+}
+
+static inline float ReadFrameFloat32Slot(JitFrameLayout* fp, int32_t slot) {
+  return *(float*)AddressOfFrameSlot(fp, slot);
+}
+
+static inline int32_t ReadFrameInt32Slot(JitFrameLayout* fp, int32_t slot) {
+  return *(int32_t*)AddressOfFrameSlot(fp, slot);
+}
+
+static inline bool ReadFrameBooleanSlot(JitFrameLayout* fp, int32_t slot) {
+  return *(bool*)AddressOfFrameSlot(fp, slot);
+}
+
+static uint32_t NumArgAndLocalSlots(const InlineFrameIterator& frame) {
+  JSScript* script = frame.script();
+  return CountArgSlots(script, frame.maybeCalleeTemplate()) + script->nfixed();
+}
+
+static TrampolineNative TrampolineNativeForFrame(
+    JSRuntime* rt, TrampolineNativeFrameLayout* layout) {
+  JSFunction* nativeFun = CalleeTokenToFunction(layout->calleeToken());
+  MOZ_ASSERT(nativeFun->isBuiltinNative());
+  void** jitEntry = nativeFun->nativeJitEntry();
+  return rt->jitRuntime()->trampolineNativeForJitEntry(jitEntry);
+}
+
+static void UnwindTrampolineNativeFrame(JSRuntime* rt,
+                                        const JSJitFrameIter& frame) {
+  auto* layout = (TrampolineNativeFrameLayout*)frame.fp();
+  TrampolineNative native = TrampolineNativeForFrame(rt, layout);
+  switch (native) {
+    case TrampolineNative::ArraySort:
+    case TrampolineNative::TypedArraySort:
+      layout->getFrameData<ArraySortData>()->freeMallocData();
+      break;
+    case TrampolineNative::Count:
+      MOZ_CRASH("Invalid value");
+  }
+}
+
+static void CloseLiveIteratorIon(JSContext* cx,
+                                 const InlineFrameIterator& frame,
+                                 const TryNote* tn) {
+  MOZ_ASSERT(tn->kind() == TryNoteKind::ForIn ||
+             tn->kind() == TryNoteKind::Destructuring);
+
+  bool isDestructuring = tn->kind() == TryNoteKind::Destructuring;
+  MOZ_ASSERT_IF(!isDestructuring, tn->stackDepth > 0);
+  MOZ_ASSERT_IF(isDestructuring, tn->stackDepth > 1);
+
+  JS::AutoSaveExceptionState savedExc(cx);
+
+  SnapshotIterator si = frame.snapshotIterator();
+
+  uint32_t stackSlot = tn->stackDepth;
+  uint32_t adjust = isDestructuring ? 2 : 1;
+  uint32_t skipSlots = NumArgAndLocalSlots(frame) + stackSlot - adjust;
+
+  for (unsigned i = 0; i < skipSlots; i++) {
+    si.skip();
+  }
+
+  MaybeReadFallback recover(cx, cx->activation()->asJit(), &frame.frame(),
+                            MaybeReadFallback::Fallback_DoNothing);
+  Value v = si.maybeRead(recover);
+  MOZ_RELEASE_ASSERT(v.isObject());
+  RootedObject iterObject(cx, &v.toObject());
+
+  if (isDestructuring) {
+    RootedValue doneValue(cx, si.maybeRead(recover));
+    MOZ_RELEASE_ASSERT(!doneValue.isMagic());
+    bool done = ToBoolean(doneValue);
+    if (done) {
+      return;
+    }
+  }
+
+  savedExc.restore();
+
+  if (cx->isExceptionPending()) {
+    if (tn->kind() == TryNoteKind::ForIn) {
+      CloseIterator(iterObject);
+    } else {
+      IteratorCloseForException(cx, iterObject);
+    }
+  } else {
+    UnwindIteratorForUncatchableException(iterObject);
+  }
+}
+
+class IonTryNoteFilter {
+  uint32_t depth_;
+
+ public:
+  explicit IonTryNoteFilter(const InlineFrameIterator& frame) {
+    uint32_t base = NumArgAndLocalSlots(frame);
+    SnapshotIterator si = frame.snapshotIterator();
+    MOZ_ASSERT(si.numAllocations() >= base);
+    depth_ = si.numAllocations() - base;
+  }
+
+  bool operator()(const TryNote* note) { return note->stackDepth <= depth_; }
+};
+
+class TryNoteIterIon : public TryNoteIter<IonTryNoteFilter> {
+ public:
+  TryNoteIterIon(JSContext* cx, const InlineFrameIterator& frame)
+      : TryNoteIter(cx, frame.script(), frame.pc(), IonTryNoteFilter(frame)) {}
+};
+
+static bool ShouldBailoutForDebugger(JSContext* cx,
+                                     const InlineFrameIterator& frame,
+                                     bool hitBailoutException) {
+  if (hitBailoutException) {
+    MOZ_ASSERT(!cx->isPropagatingForcedReturn());
+    return false;
+  }
+
+  if (cx->isPropagatingForcedReturn() && frame.more()) {
+    return true;
+  }
+
+  if (!cx->realm()->isDebuggee()) {
+    return false;
+  }
+
+  if (cx->isExceptionPending() &&
+      DebugAPI::hasExceptionUnwindHook(cx->global())) {
+    return true;
+  }
+
+  JitActivation* act = cx->activation()->asJit();
+  RematerializedFrame* rematFrame =
+      act->lookupRematerializedFrame(frame.frame().fp(), frame.frameNo());
+  return rematFrame && rematFrame->isDebuggee();
+}
+
+static void OnLeaveIonFrame(JSContext* cx, const InlineFrameIterator& frame,
+                            ResumeFromException* rfe) {
+  bool returnFromThisFrame =
+      cx->isPropagatingForcedReturn() || cx->isClosingGenerator();
+  if (!returnFromThisFrame) {
+    return;
+  }
+
+  JitActivation* act = cx->activation()->asJit();
+  RematerializedFrame* rematFrame = nullptr;
+  {
+    JS::AutoSaveExceptionState savedExc(cx);
+    rematFrame = act->getRematerializedFrame(cx, frame.frame(), frame.frameNo(),
+                                             IsLeavingFrame::Yes);
+    if (!rematFrame) {
+      return;
+    }
+  }
+
+  MOZ_ASSERT(!frame.more());
+
+  if (cx->isClosingGenerator()) {
+    HandleClosingGeneratorReturn(cx, rematFrame, true);
+  } else {
+    cx->clearPropagatingForcedReturn();
+  }
+
+  Value& rval = rematFrame->returnValue();
+  MOZ_RELEASE_ASSERT(!rval.isMagic());
+
+  rfe->kind = ExceptionResumeKind::ForcedReturnIon;
+  rfe->framePointer = frame.frame().fp();
+  rfe->stackPointer = frame.frame().fp();
+  rfe->exception = rval;
+  rfe->exceptionStack = NullValue();
+
+  act->removeIonFrameRecovery(frame.frame().jsFrame());
+  act->removeRematerializedFrame(frame.frame().fp());
+}
+
+static void HandleExceptionIon(JSContext* cx, const InlineFrameIterator& frame,
+                               ResumeFromException* rfe,
+                               bool* hitBailoutException) {
+  if (ShouldBailoutForDebugger(cx, frame, *hitBailoutException)) {
+    ExceptionBailoutInfo propagateInfo(cx);
+    if (ExceptionHandlerBailout(cx, frame, rfe, propagateInfo)) {
+      return;
+    }
+    *hitBailoutException = true;
+  }
+
+  RootedTuple<JSScript*, Value, Value> ionRoots(cx);
+  RootedField<JSScript*> script(ionRoots, frame.script());
+  RootedField<Value, 1> exception(ionRoots);
+  RootedField<Value, 2> exceptionStack(ionRoots);
+
+  for (TryNoteIterIon tni(cx, frame); !tni.done(); ++tni) {
+    const TryNote* tn = *tni;
+    switch (tn->kind()) {
+      case TryNoteKind::ForIn:
+      case TryNoteKind::Destructuring:
+        CloseLiveIteratorIon(cx, frame, tn);
+        break;
+
+      case TryNoteKind::Catch:
+        if (cx->isClosingGenerator()) {
+          break;
+        }
+
+        if (cx->isExceptionPending()) {
+          script->resetWarmUpCounterToDelayIonCompilation();
+
+          if (*hitBailoutException) {
+            break;
+          }
+
+          jsbytecode* catchPC = script->offsetToPC(tn->start + tn->length);
+          ExceptionBailoutInfo excInfo(cx, frame.frameNo(), catchPC,
+                                       tn->stackDepth);
+          if (ExceptionHandlerBailout(cx, frame, rfe, excInfo)) {
+            MOZ_ASSERT(cx->isExceptionPending());
+            rfe->bailoutInfo->tryPC =
+                UnwindEnvironmentToTryPc(frame.script(), tn);
+            rfe->bailoutInfo->faultPC = frame.pc();
+            return;
+          }
+
+          *hitBailoutException = true;
+          MOZ_ASSERT(cx->isExceptionPending() || cx->hadUncatchableException());
+        }
+        break;
+
+      case TryNoteKind::Finally: {
+        if (!cx->isExceptionPending()) {
+          break;
+        }
+
+        script->resetWarmUpCounterToDelayIonCompilation();
+
+        if (*hitBailoutException) {
+          break;
+        }
+
+        jsbytecode* finallyPC = script->offsetToPC(tn->start + tn->length);
+        ExceptionBailoutInfo excInfo(cx, frame.frameNo(), finallyPC,
+                                     tn->stackDepth);
+
+        exception = UndefinedValue();
+        exceptionStack = UndefinedValue();
+        if (!cx->getPendingException(&exception) ||
+            !cx->getPendingExceptionStack(&exceptionStack)) {
+          exception = UndefinedValue();
+          exceptionStack = NullValue();
+        }
+        excInfo.setFinallyException(exception.get(), exceptionStack.get());
+        cx->clearPendingException();
+
+        if (ExceptionHandlerBailout(cx, frame, rfe, excInfo)) {
+          rfe->bailoutInfo->tryPC =
+              UnwindEnvironmentToTryPc(frame.script(), tn);
+          rfe->bailoutInfo->faultPC = frame.pc();
+          return;
+        }
+
+        *hitBailoutException = true;
+        MOZ_ASSERT(cx->isExceptionPending());
+        break;
+      }
+
+      case TryNoteKind::ForOf:
+      case TryNoteKind::Loop:
+        break;
+
+      default:
+        MOZ_CRASH("Unexpected try note");
+    }
+  }
+
+  OnLeaveIonFrame(cx, frame, rfe);
+}
+
+static void OnLeaveBaselineFrame(JSContext* cx, const JSJitFrameIter& frame,
+                                 jsbytecode* pc, ResumeFromException* rfe,
+                                 bool frameOk) {
+  BaselineFrame* baselineFrame = frame.baselineFrame();
+  bool returnFromThisFrame = jit::DebugEpilogue(cx, baselineFrame, pc, frameOk);
+  if (returnFromThisFrame) {
+    if (!baselineFrame->hasReturnValue()) {
+      baselineFrame->setReturnValue(UndefinedValue());
+    }
+    rfe->kind = ExceptionResumeKind::ForcedReturnBaseline;
+    rfe->framePointer = frame.fp();
+    rfe->stackPointer = reinterpret_cast<uint8_t*>(baselineFrame);
+  }
+}
+
+static inline void BaselineFrameAndStackPointersFromTryNote(
+    const TryNote* tn, const JSJitFrameIter& frame, uint8_t** framePointer,
+    uint8_t** stackPointer) {
+  JSScript* script = frame.baselineFrame()->script();
+  *framePointer = frame.fp();
+  *stackPointer = *framePointer - BaselineFrame::Size() -
+                  (script->nfixed() + tn->stackDepth) * sizeof(Value);
+}
+
+static void SettleOnTryNote(JSContext* cx, const TryNote* tn,
+                            const JSJitFrameIter& frame, EnvironmentIter& ei,
+                            ResumeFromException* rfe, jsbytecode** pc) {
+  RootedScript script(cx, frame.baselineFrame()->script());
+
+  if (cx->isExceptionPending()) {
+    UnwindEnvironment(cx, ei, UnwindEnvironmentToTryPc(script, tn));
+  }
+
+  BaselineFrameAndStackPointersFromTryNote(tn, frame, &rfe->framePointer,
+                                           &rfe->stackPointer);
+
+  *pc = script->offsetToPC(tn->start + tn->length);
+}
+
+class BaselineTryNoteFilter {
+  const JSJitFrameIter& frame_;
+
+ public:
+  explicit BaselineTryNoteFilter(const JSJitFrameIter& frame) : frame_(frame) {}
+  bool operator()(const TryNote* note) {
+    BaselineFrame* frame = frame_.baselineFrame();
+
+    uint32_t numValueSlots = frame_.baselineFrameNumValueSlots();
+    MOZ_RELEASE_ASSERT(numValueSlots >= frame->script()->nfixed());
+
+    uint32_t currDepth = numValueSlots - frame->script()->nfixed();
+    return note->stackDepth <= currDepth;
+  }
+};
+
+class TryNoteIterBaseline : public TryNoteIter<BaselineTryNoteFilter> {
+ public:
+  TryNoteIterBaseline(JSContext* cx, const JSJitFrameIter& frame,
+                      jsbytecode* pc)
+      : TryNoteIter(cx, frame.script(), pc, BaselineTryNoteFilter(frame)) {}
+};
+
+static void CloseLiveIteratorsBaselineForUncatchableException(
+    JSContext* cx, const JSJitFrameIter& frame, jsbytecode* pc) {
+  for (TryNoteIterBaseline tni(cx, frame, pc); !tni.done(); ++tni) {
+    const TryNote* tn = *tni;
+    switch (tn->kind()) {
+      case TryNoteKind::ForIn: {
+        uint8_t* framePointer;
+        uint8_t* stackPointer;
+        BaselineFrameAndStackPointersFromTryNote(tn, frame, &framePointer,
+                                                 &stackPointer);
+        Value iterValue(*(Value*)stackPointer);
+        RootedObject iterObject(cx, &iterValue.toObject());
+        UnwindIteratorForUncatchableException(iterObject);
+        break;
+      }
+
+      default:
+        break;
+    }
+  }
+}
+
+static bool ProcessTryNotesBaseline(JSContext* cx, const JSJitFrameIter& frame,
+                                    EnvironmentIter& ei,
+                                    ResumeFromException* rfe, jsbytecode** pc) {
+  MOZ_ASSERT(frame.baselineFrame()->runningInInterpreter(),
+             "Caller must ensure frame is an interpreter frame");
+
+  RootedTuple<JSScript*, Value, Value, Value, JSObject*> baselineRoots(cx);
+  RootedField<JSScript*> script(baselineRoots, frame.baselineFrame()->script());
+  RootedField<Value, 1> exception(baselineRoots);
+  RootedField<Value, 2> exceptionStack(baselineRoots);
+  RootedField<Value, 3> doneValue(baselineRoots);
+  RootedField<JSObject*> iterObject(baselineRoots);
+
+  for (TryNoteIterBaseline tni(cx, frame, *pc); !tni.done(); ++tni) {
+    const TryNote* tn = *tni;
+
+    MOZ_ASSERT(cx->isExceptionPending());
+    switch (tn->kind()) {
+      case TryNoteKind::Catch: {
+        if (cx->isClosingGenerator()) {
+          break;
+        }
+
+        SettleOnTryNote(cx, tn, frame, ei, rfe, pc);
+
+        script->resetWarmUpCounterToDelayIonCompilation();
+
+        frame.baselineFrame()->setInterpreterFields(*pc);
+        rfe->kind = ExceptionResumeKind::Catch;
+        if (IsBaselineInterpreterEnabled()) {
+          const BaselineInterpreter& interp =
+              cx->runtime()->jitRuntime()->baselineInterpreter();
+          rfe->target = interp.interpretOpAddr().value;
+        }
+        return true;
+      }
+
+      case TryNoteKind::Finally: {
+        SettleOnTryNote(cx, tn, frame, ei, rfe, pc);
+
+        frame.baselineFrame()->setInterpreterFields(*pc);
+        rfe->kind = ExceptionResumeKind::Finally;
+        if (IsBaselineInterpreterEnabled()) {
+          const BaselineInterpreter& interp =
+              cx->runtime()->jitRuntime()->baselineInterpreter();
+          rfe->target = interp.interpretOpAddr().value;
+        }
+
+        exception = UndefinedValue();
+        exceptionStack = UndefinedValue();
+        if (!cx->getPendingException(&exception) ||
+            !cx->getPendingExceptionStack(&exceptionStack)) {
+          rfe->exception = UndefinedValue();
+          rfe->exceptionStack = NullValue();
+        } else {
+          rfe->exception = exception;
+          rfe->exceptionStack = exceptionStack;
+        }
+        cx->clearPendingException();
+        return true;
+      }
+
+      case TryNoteKind::ForIn: {
+        uint8_t* framePointer;
+        uint8_t* stackPointer;
+        BaselineFrameAndStackPointersFromTryNote(tn, frame, &framePointer,
+                                                 &stackPointer);
+        Value iterValue(*reinterpret_cast<Value*>(stackPointer));
+        JSObject* iterObject = &iterValue.toObject();
+        CloseIterator(iterObject);
+        break;
+      }
+
+      case TryNoteKind::Destructuring: {
+        uint8_t* framePointer;
+        uint8_t* stackPointer;
+        BaselineFrameAndStackPointersFromTryNote(tn, frame, &framePointer,
+                                                 &stackPointer);
+        doneValue = *(reinterpret_cast<Value*>(stackPointer));
+        MOZ_RELEASE_ASSERT(!doneValue.isMagic());
+        bool done = ToBoolean(doneValue);
+        if (!done) {
+          Value iterValue(*(reinterpret_cast<Value*>(stackPointer) + 1));
+          iterObject = &iterValue.toObject();
+          if (!IteratorCloseForException(cx, iterObject)) {
+            SettleOnTryNote(cx, tn, frame, ei, rfe, pc);
+            return false;
+          }
+        }
+        break;
+      }
+
+      case TryNoteKind::ForOf:
+      case TryNoteKind::Loop:
+        break;
+
+      default:
+        MOZ_CRASH("Invalid try note");
+    }
+  }
+  return true;
+}
+
+static void HandleExceptionBaseline(JSContext* cx, JSJitFrameIter& frame,
+                                    CommonFrameLayout* prevFrame,
+                                    ResumeFromException* rfe) {
+  MOZ_ASSERT(frame.isBaselineJS());
+  MOZ_ASSERT(prevFrame);
+
+  jsbytecode* pc;
+  frame.baselineScriptAndPc(nullptr, &pc);
+
+  if (!frame.baselineFrame()->runningInInterpreter()) {
+    const BaselineInterpreter& interp =
+        cx->runtime()->jitRuntime()->baselineInterpreter();
+    uint8_t* retAddr = interp.codeRaw();
+    BaselineFrame* baselineFrame = frame.baselineFrame();
+
+    AutoSuppressProfilerSampling suppressProfilerSampling(cx);
+    baselineFrame->switchFromJitToInterpreterForExceptionHandler(cx, pc);
+    prevFrame->setReturnAddress(retAddr);
+
+    frame.setResumePCInCurrentFrame(nullptr);
+  }
+
+  bool frameOk = false;
+  RootedScript script(cx, frame.baselineFrame()->script());
+
+  if (script->hasScriptCounts()) {
+    PCCounts* counts = script->getThrowCounts(pc);
+    if (counts) {
+      counts->numExec()++;
+    }
+  }
+
+  bool hasTryNotes = !script->trynotes().empty();
+
+again:
+  if (cx->isExceptionPending()) {
+    if (!cx->isClosingGenerator()) {
+      if (!DebugAPI::onExceptionUnwind(cx, frame.baselineFrame())) {
+        if (!cx->isExceptionPending()) {
+          goto again;
+        }
+      }
+      MOZ_ASSERT(cx->isExceptionPending());
+    }
+
+    if (hasTryNotes) {
+      EnvironmentIter ei(cx, frame.baselineFrame(), pc);
+      if (!ProcessTryNotesBaseline(cx, frame, ei, rfe, &pc)) {
+        goto again;
+      }
+      if (rfe->kind != ExceptionResumeKind::EntryFrame) {
+        MOZ_ASSERT_IF(script->hasScriptCounts(), script->maybeGetPCCounts(pc));
+        return;
+      }
+    }
+
+    frameOk = HandleClosingGeneratorReturn(cx, frame.baselineFrame(), frameOk);
+  } else {
+    if (hasTryNotes) {
+      CloseLiveIteratorsBaselineForUncatchableException(cx, frame, pc);
+    }
+
+    if (MOZ_UNLIKELY(cx->isPropagatingForcedReturn())) {
+      cx->clearPropagatingForcedReturn();
+      frameOk = true;
+    }
+  }
+
+  OnLeaveBaselineFrame(cx, frame, pc, rfe, frameOk);
+}
+
+static JitFrameLayout* GetLastProfilingFrame(ResumeFromException* rfe) {
+  switch (rfe->kind) {
+    case ExceptionResumeKind::EntryFrame:
+    case ExceptionResumeKind::WasmInterpEntry:
+    case ExceptionResumeKind::WasmCatch:
+      return nullptr;
+
+    case ExceptionResumeKind::Catch:
+    case ExceptionResumeKind::Finally:
+    case ExceptionResumeKind::ForcedReturnBaseline:
+    case ExceptionResumeKind::ForcedReturnIon:
+      return reinterpret_cast<JitFrameLayout*>(rfe->framePointer);
+
+    case ExceptionResumeKind::Bailout:
+      return reinterpret_cast<JitFrameLayout*>(rfe->bailoutInfo->incomingStack);
+  }
+
+  MOZ_CRASH("Invalid ResumeFromException type!");
+  return nullptr;
+}
+
+void HandleException(ResumeFromException* rfe) {
+  JSContext* cx = TlsContext.get();
+
+  if (!CheckForOOMStackTraceInterrupt(cx)) {
+    return;
+  }
+
+  cx->realm()->localAllocSite = nullptr;
+#ifdef DEBUG
+  if (!IsPortableBaselineInterpreterEnabled()) {
+    cx->runtime()->jitRuntime()->clearDisallowArbitraryCode();
+  }
+
+  cx->resetInUnsafeRegion();
+#endif
+
+  auto resetProfilerFrame = mozilla::MakeScopeExit([=] {
+    if (!IsPortableBaselineInterpreterEnabled()) {
+      if (!cx->runtime()->jitRuntime()->isProfilerInstrumentationEnabled(
+              cx->runtime())) {
+        return;
+      }
+    }
+
+    MOZ_ASSERT(cx->jitActivation == cx->profilingActivation());
+
+    auto* lastProfilingFrame = GetLastProfilingFrame(rfe);
+    cx->jitActivation->setLastProfilingFrame(lastProfilingFrame);
+  });
+
+  rfe->kind = ExceptionResumeKind::EntryFrame;
+
+  JitSpew(JitSpew_IonInvalidate, "handling exception");
+
+  JitActivation* activation = cx->activation()->asJit();
+
+#ifdef CHECK_OSIPOINT_REGISTERS
+  if (JitOptions.checkOsiPointRegisters) {
+    activation->setCheckRegs(false);
+  }
+#endif
+
+  JitFrameIter iter(cx->activation()->asJit(),
+                     true);
+
+  Rooted<WasmInstanceObject*> keepAlive(cx);
+  if (iter.isWasm()) {
+    keepAlive = iter.asWasm().instance()->object();
+  }
+
+  CommonFrameLayout* prevJitFrame = nullptr;
+  while (!iter.done()) {
+    if (iter.isWasm()) {
+      prevJitFrame = nullptr;
+      wasm::HandleExceptionWasm(cx, iter, rfe);
+      if (rfe->kind == ExceptionResumeKind::WasmCatch) {
+        return;
+      }
+      MOZ_ASSERT(iter.isJSJit() || (iter.isWasm() && iter.done()));
+      continue;
+    }
+
+    JSJitFrameIter& frame = iter.asJSJit();
+
+    if (frame.isScripted() || frame.isTrampolineNative()) {
+      cx->setRealmForJitExceptionHandler(iter.realm());
+    }
+
+    if (frame.isIonJS()) {
+      InlineFrameIterator frames(cx, &frame);
+
+      IonScript* ionScript = nullptr;
+      bool invalidated = frame.checkInvalidation(&ionScript);
+
+      bool hitBailoutException = false;
+      for (;;) {
+        HandleExceptionIon(cx, frames, rfe, &hitBailoutException);
+
+        if (rfe->kind == ExceptionResumeKind::Bailout ||
+            rfe->kind == ExceptionResumeKind::ForcedReturnIon) {
+          if (invalidated) {
+            ionScript->decrementInvalidationCount(cx->gcContext());
+          }
+          return;
+        }
+
+        MOZ_ASSERT(rfe->kind == ExceptionResumeKind::EntryFrame);
+
+
+        JSScript* script = frames.script();
+        probes::ExitScript(cx, script, script->function(),
+                            false);
+        if (!frames.more()) {
+          break;
+        }
+        ++frames;
+      }
+
+      activation->removeIonFrameRecovery(frame.jsFrame());
+      activation->removeRematerializedFrame(frame.fp());
+
+      if (invalidated) {
+        ionScript->decrementInvalidationCount(cx->gcContext());
+      }
+
+    } else if (frame.isBaselineJS()) {
+      HandleExceptionBaseline(cx, frame, prevJitFrame, rfe);
+
+      if (rfe->kind != ExceptionResumeKind::EntryFrame &&
+          rfe->kind != ExceptionResumeKind::ForcedReturnBaseline) {
+        return;
+      }
+
+      JSScript* script = frame.script();
+      probes::ExitScript(cx, script, script->function(),
+                          false);
+
+      if (rfe->kind == ExceptionResumeKind::ForcedReturnBaseline) {
+        return;
+      }
+    } else if (frame.isTrampolineNative()) {
+      UnwindTrampolineNativeFrame(cx->runtime(), frame);
+    }
+
+    prevJitFrame = frame.current();
+    ++iter;
+  }
+
+  if (iter.isJSJit()) {
+    MOZ_ASSERT(rfe->kind == ExceptionResumeKind::EntryFrame);
+    rfe->framePointer = iter.asJSJit().current()->callerFramePtr();
+    rfe->stackPointer =
+        iter.asJSJit().fp() + CommonFrameLayout::offsetOfReturnAddress();
+  } else {
+    MOZ_ASSERT(iter.isWasm());
+    rfe->kind = ExceptionResumeKind::WasmInterpEntry;
+    rfe->framePointer = (uint8_t*)iter.asWasm().unwoundCallerFP();
+    rfe->stackPointer = (uint8_t*)iter.asWasm().unwoundAddressOfReturnAddress();
+    rfe->instance = nullptr;
+    rfe->target = nullptr;
+  }
+}
+
+void EnsureUnwoundJitExitFrame(JitActivation* act, JitFrameLayout* frame) {
+  ExitFrameLayout* exitFrame = reinterpret_cast<ExitFrameLayout*>(frame);
+
+  if (act->jsExitFP() == (uint8_t*)frame) {
+    MOZ_ASSERT(exitFrame->isUnwoundJitExit());
+    return;
+  }
+
+#ifdef DEBUG
+  JSJitFrameIter iter(act);
+  while (!iter.isScripted()) {
+    ++iter;
+  }
+  MOZ_ASSERT(iter.current() == frame, "|frame| must be the top JS frame");
+
+  MOZ_ASSERT(!!act->jsExitFP());
+  MOZ_ASSERT((uint8_t*)exitFrame->footer() >= act->jsExitFP(),
+             "Must have space for ExitFooterFrame before jsExitFP");
+#endif
+
+  act->setJSExitFP((uint8_t*)frame);
+  exitFrame->footer()->setUnwoundJitExitFrame();
+  MOZ_ASSERT(exitFrame->isUnwoundJitExit());
+}
+
+JSScript* MaybeForwardedScriptFromCalleeToken(CalleeToken token) {
+  switch (GetCalleeTokenTag(token)) {
+    case CalleeToken_Script:
+      return MaybeForwarded(CalleeTokenToScript(token));
+    case CalleeToken_Function:
+    case CalleeToken_FunctionConstructing: {
+      JSFunction* fun = MaybeForwarded(CalleeTokenToFunction(token));
+      return MaybeForwarded(fun)->nonLazyScript();
+    }
+  }
+  MOZ_CRASH("invalid callee token tag");
+}
+
+CalleeToken TraceCalleeToken(JSTracer* trc, CalleeToken token) {
+  switch (CalleeTokenTag tag = GetCalleeTokenTag(token)) {
+    case CalleeToken_Function:
+    case CalleeToken_FunctionConstructing: {
+      JSFunction* fun = CalleeTokenToFunction(token);
+      TraceRoot(trc, &fun, "jit-callee");
+      return CalleeToToken(fun, tag == CalleeToken_FunctionConstructing);
+    }
+    case CalleeToken_Script: {
+      JSScript* script = CalleeTokenToScript(token);
+      TraceRoot(trc, &script, "jit-script");
+      return CalleeToToken(script);
+    }
+    default:
+      MOZ_CRASH("unknown callee token type");
+  }
+}
+
+uintptr_t* JitFrameLayout::slotRef(SafepointSlotEntry where) {
+  if (where.stack) {
+    return (uintptr_t*)((uint8_t*)this - where.slot);
+  }
+  return (uintptr_t*)((uint8_t*)thisAndActualArgs() + where.slot);
+}
+
+#ifdef DEBUG
+void ExitFooterFrame::assertValidVMFunctionId() const {
+  MOZ_ASSERT(data_ >= uintptr_t(ExitFrameType::VMFunction));
+  MOZ_ASSERT(data_ - uintptr_t(ExitFrameType::VMFunction) < NumVMFunctions());
+}
+#endif
+
+#ifdef JS_NUNBOX32
+static inline uintptr_t ReadAllocation(const JSJitFrameIter& frame,
+                                       const LAllocation* a) {
+  if (a->isGeneralReg()) {
+    Register reg = a->toGeneralReg()->reg();
+    return frame.machineState().read(reg);
+  }
+  return *frame.jsFrame()->slotRef(SafepointSlotEntry(a));
+}
+#endif
+
+static void TraceThisAndArguments(JSTracer* trc, const JSJitFrameIter& frame,
+                                  JitFrameLayout* layout) {
+
+  if (!CalleeTokenIsFunction(layout->calleeToken())) {
+    return;
+  }
+
+  JSFunction* fun = CalleeTokenToFunction(layout->calleeToken());
+
+  size_t numFormals = fun->nargs();
+  size_t numArgs = std::max(layout->numActualArgs(), numFormals);
+  size_t firstArg = 0;
+
+  if (frame.isIonScripted() &&
+      !fun->nonLazyScript()->mayReadFrameArgsDirectly()) {
+    firstArg = numFormals;
+  }
+
+  Value* argv = layout->thisAndActualArgs();
+
+  TraceRoot(trc, argv, "jit-thisv");
+
+  for (size_t i = firstArg; i < numArgs; i++) {
+    TraceRoot(trc, &argv[i + 1], "jit-argv");
+  }
+
+  if (CalleeTokenIsConstructing(layout->calleeToken())) {
+    TraceRoot(trc, &argv[1 + numArgs], "jit-newTarget");
+  }
+}
+
+#ifdef JS_NUNBOX32
+static inline void WriteAllocation(const JSJitFrameIter& frame,
+                                   const LAllocation* a, uintptr_t value) {
+  if (a->isGeneralReg()) {
+    Register reg = a->toGeneralReg()->reg();
+    frame.machineState().write(reg, value);
+  } else {
+    *frame.jsFrame()->slotRef(SafepointSlotEntry(a)) = value;
+  }
+}
+#endif
+
+static void TraceIonJSFrame(JSTracer* trc, const JSJitFrameIter& frame) {
+  JitFrameLayout* layout = (JitFrameLayout*)frame.fp();
+
+  layout->replaceCalleeToken(TraceCalleeToken(trc, layout->calleeToken()));
+
+  IonScript* ionScript = nullptr;
+  if (frame.checkInvalidation(&ionScript)) {
+    ionScript->trace(trc);
+  } else {
+    ionScript = frame.ionScriptFromCalleeToken();
+  }
+
+  TraceThisAndArguments(trc, frame, frame.jsFrame());
+
+  const SafepointIndex* si =
+      ionScript->getSafepointIndex(frame.resumePCinCurrentFrame());
+
+  SafepointReader safepoint(ionScript, si);
+
+  SafepointSlotEntry entry;
+
+  while (safepoint.getGcSlot(&entry)) {
+    uintptr_t* ref = layout->slotRef(entry);
+    TraceGenericPointerRoot(trc, reinterpret_cast<gc::Cell**>(ref),
+                            "ion-gc-slot");
+  }
+
+  uintptr_t* spill = frame.spillBase();
+  LiveGeneralRegisterSet gcRegs = safepoint.gcSpills();
+  LiveGeneralRegisterSet valueRegs = safepoint.valueSpills();
+  LiveGeneralRegisterSet wasmAnyRefRegs = safepoint.wasmAnyRefSpills();
+  for (GeneralRegisterBackwardIterator iter(safepoint.allGprSpills());
+       iter.more(); ++iter) {
+    --spill;
+    if (gcRegs.has(*iter)) {
+      TraceGenericPointerRoot(trc, reinterpret_cast<gc::Cell**>(spill),
+                              "ion-gc-spill");
+    } else if (valueRegs.has(*iter)) {
+      TraceRoot(trc, reinterpret_cast<Value*>(spill), "ion-value-spill");
+    } else if (wasmAnyRefRegs.has(*iter)) {
+      TraceRoot(trc, reinterpret_cast<wasm::AnyRef*>(spill),
+                "ion-anyref-spill");
+    }
+  }
+
+#ifdef JS_PUNBOX64
+  while (safepoint.getValueSlot(&entry)) {
+    Value* v = (Value*)layout->slotRef(entry);
+    TraceRoot(trc, v, "ion-gc-slot");
+  }
+#else
+  LAllocation type, payload;
+  while (safepoint.getNunboxSlot(&type, &payload)) {
+    JSValueTag tag = JSValueTag(ReadAllocation(frame, &type));
+    uintptr_t rawPayload = ReadAllocation(frame, &payload);
+
+    Value v = Value::fromTagAndPayload(tag, rawPayload);
+    TraceRoot(trc, &v, "ion-torn-value");
+
+    if (v != Value::fromTagAndPayload(tag, rawPayload)) {
+      rawPayload = v.toNunboxPayload();
+      WriteAllocation(frame, &payload, rawPayload);
+    }
+  }
+#endif
+
+  while (safepoint.getSlotsOrElementsSlot(&entry)) {
+  }
+
+  while (safepoint.getWasmAnyRefSlot(&entry)) {
+    wasm::AnyRef* v = (wasm::AnyRef*)layout->slotRef(entry);
+    TraceRoot(trc, v, "ion-wasm-anyref-slot");
+  }
+}
+
+static void TraceBailoutFrame(JSTracer* trc, const JSJitFrameIter& frame) {
+  JitFrameLayout* layout = (JitFrameLayout*)frame.fp();
+
+  layout->replaceCalleeToken(TraceCalleeToken(trc, layout->calleeToken()));
+
+  TraceThisAndArguments(trc, frame, frame.jsFrame());
+
+
+  SnapshotIterator snapIter(frame,
+                            frame.activation()->bailoutData()->machineState());
+
+  while (true) {
+    while (snapIter.moreAllocations()) {
+      snapIter.traceAllocation(trc);
+    }
+
+    if (!snapIter.moreInstructions()) {
+      break;
+    }
+    snapIter.nextInstruction();
+  }
+}
+
+static void UpdateIonJSFrameForMinorGC(JSRuntime* rt,
+                                       const JSJitFrameIter& frame) {
+
+  JitFrameLayout* layout = (JitFrameLayout*)frame.fp();
+
+  IonScript* ionScript = nullptr;
+  if (frame.checkInvalidation(&ionScript)) {
+  } else {
+    ionScript = frame.ionScriptFromCalleeToken();
+  }
+
+  Nursery& nursery = rt->gc.nursery();
+
+  const SafepointIndex* si =
+      ionScript->getSafepointIndex(frame.resumePCinCurrentFrame());
+  SafepointReader safepoint(ionScript, si);
+
+  LiveGeneralRegisterSet slotsRegs = safepoint.slotsOrElementsSpills();
+  uintptr_t* spill = frame.spillBase();
+  for (GeneralRegisterBackwardIterator iter(safepoint.allGprSpills());
+       iter.more(); ++iter) {
+    --spill;
+    if (slotsRegs.has(*iter)) {
+      nursery.forwardBufferPointer(spill);
+    }
+  }
+
+  SafepointSlotEntry entry;
+  while (safepoint.getGcSlot(&entry)) {
+  }
+
+#ifdef JS_PUNBOX64
+  while (safepoint.getValueSlot(&entry)) {
+  }
+#else
+  LAllocation type, payload;
+  while (safepoint.getNunboxSlot(&type, &payload)) {
+  }
+#endif
+
+  while (safepoint.getSlotsOrElementsSlot(&entry)) {
+    nursery.forwardBufferPointer(layout->slotRef(entry));
+  }
+}
+
+static void TraceBaselineStubFrame(JSTracer* trc, const JSJitFrameIter& frame) {
+
+  MOZ_ASSERT(frame.type() == FrameType::BaselineStub);
+  BaselineStubFrameLayout* layout = (BaselineStubFrameLayout*)frame.fp();
+
+  if (ICStub* stub = layout->maybeStubPtr()) {
+    if (stub->isFallback()) {
+      MOZ_ASSERT(stub->usesTrampolineCode());
+    } else {
+      MOZ_ASSERT(stub->toCacheIRStub()->makesGCCalls());
+      stub->toCacheIRStub()->trace(trc);
+
+#ifndef ENABLE_PORTABLE_BASELINE_INTERP
+      for (int i = 0; i < stub->jitCode()->localTracingSlots(); ++i) {
+        TraceRoot(trc, layout->locallyTracedValuePtr(i),
+                  "baseline-local-tracing-slot");
+      }
+#endif
+    }
+  }
+}
+
+static void TraceWeakBaselineStubFrame(JSTracer* trc,
+                                       const JSJitFrameIter& frame) {
+  MOZ_ASSERT(frame.type() == FrameType::BaselineStub);
+  BaselineStubFrameLayout* layout = (BaselineStubFrameLayout*)frame.fp();
+
+  if (ICStub* stub = layout->maybeStubPtr()) {
+    if (!stub->isFallback()) {
+      MOZ_ASSERT(stub->toCacheIRStub()->makesGCCalls());
+      stub->toCacheIRStub()->traceWeak(trc);
+    }
+  }
+}
+
+static void TraceIonICCallFrame(JSTracer* trc, const JSJitFrameIter& frame) {
+  MOZ_ASSERT(frame.type() == FrameType::IonICCall);
+  IonICCallFrameLayout* layout = (IonICCallFrameLayout*)frame.fp();
+  TraceRoot(trc, layout->stubCode(), "ion-ic-call-code");
+
+  for (int i = 0; i < (*layout->stubCode())->localTracingSlots(); ++i) {
+    TraceRoot(trc, layout->locallyTracedValuePtr(i),
+              "ion-ic-local-tracing-slot");
+  }
+}
+
+#if defined(JS_CODEGEN_ARM64)
+uint8_t* alignDoubleSpill(uint8_t* pointer) {
+  uintptr_t address = reinterpret_cast<uintptr_t>(pointer);
+  address &= ~(uintptr_t(ABIStackAlignment) - 1);
+  return reinterpret_cast<uint8_t*>(address);
+}
+#endif
+
+static void TraceJitExitFrame(JSTracer* trc, const JSJitFrameIter& frame) {
+  ExitFooterFrame* footer = frame.exitFrame()->footer();
+
+  if (frame.isExitFrameLayout<NativeExitFrameLayout>()) {
+    NativeExitFrameLayout* native =
+        frame.exitFrame()->as<NativeExitFrameLayout>();
+    size_t len = native->argc() + 2;
+    Value* vp = native->vp();
+    TraceRootRange(trc, len, vp, "ion-native-args");
+    if (frame.isExitFrameLayout<ConstructNativeExitFrameLayout>()) {
+      TraceRoot(trc, vp + len, "ion-native-new-target");
+    }
+    return;
+  }
+
+  if (frame.isExitFrameLayout<IonOOLNativeExitFrameLayout>()) {
+    IonOOLNativeExitFrameLayout* oolnative =
+        frame.exitFrame()->as<IonOOLNativeExitFrameLayout>();
+    TraceRoot(trc, oolnative->stubCode(), "ion-ool-native-code");
+    TraceRoot(trc, oolnative->vp(), "iol-ool-native-vp");
+    size_t len = oolnative->argc() + 1;
+    TraceRootRange(trc, len, oolnative->thisp(), "ion-ool-native-thisargs");
+    return;
+  }
+
+  if (frame.isExitFrameLayout<IonOOLProxyExitFrameLayout>()) {
+    IonOOLProxyExitFrameLayout* oolproxy =
+        frame.exitFrame()->as<IonOOLProxyExitFrameLayout>();
+    TraceRoot(trc, oolproxy->stubCode(), "ion-ool-proxy-code");
+    TraceRoot(trc, oolproxy->vp(), "ion-ool-proxy-vp");
+    TraceRoot(trc, oolproxy->id(), "ion-ool-proxy-id");
+    TraceRoot(trc, oolproxy->proxy(), "ion-ool-proxy-proxy");
+    return;
+  }
+
+  if (frame.isExitFrameLayout<IonDOMExitFrameLayout>()) {
+    IonDOMExitFrameLayout* dom = frame.exitFrame()->as<IonDOMExitFrameLayout>();
+    TraceRoot(trc, dom->thisObjAddress(), "ion-dom-args");
+    if (dom->isMethodFrame()) {
+      IonDOMMethodExitFrameLayout* method =
+          reinterpret_cast<IonDOMMethodExitFrameLayout*>(dom);
+      size_t len = method->argc() + 2;
+      Value* vp = method->vp();
+      TraceRootRange(trc, len, vp, "ion-dom-args");
+    } else {
+      TraceRoot(trc, dom->vp(), "ion-dom-args");
+    }
+    return;
+  }
+
+  if (frame.isExitFrameLayout<CalledFromJitExitFrameLayout>()) {
+    auto* layout = frame.exitFrame()->as<CalledFromJitExitFrameLayout>();
+    JitFrameLayout* jsLayout = layout->jsFrame();
+    jsLayout->replaceCalleeToken(
+        TraceCalleeToken(trc, jsLayout->calleeToken()));
+    TraceThisAndArguments(trc, frame, jsLayout);
+    return;
+  }
+
+  if (frame.isExitFrameLayout<DirectWasmJitCallFrameLayout>()) {
+    return;
+  }
+
+  if (frame.isBareExit() || frame.isUnwoundJitExit()) {
+    return;
+  }
+
+  MOZ_ASSERT(frame.exitFrame()->isWrapperExit());
+
+  const VMFunctionData& f = GetVMFunction(footer->functionId());
+
+  uint8_t* argBase = frame.exitFrame()->argBase();
+  for (uint32_t explicitArg = 0; explicitArg < f.explicitArgs; explicitArg++) {
+    switch (f.argRootType(explicitArg)) {
+      case VMFunctionData::RootNone:
+        break;
+      case VMFunctionData::RootObject: {
+        JSObject** pobj = reinterpret_cast<JSObject**>(argBase);
+        if (*pobj) {
+          TraceRoot(trc, pobj, "ion-vm-args");
+        }
+        break;
+      }
+      case VMFunctionData::RootString:
+        TraceRoot(trc, reinterpret_cast<JSString**>(argBase), "ion-vm-args");
+        break;
+      case VMFunctionData::RootValue:
+        TraceRoot(trc, reinterpret_cast<Value*>(argBase), "ion-vm-args");
+        break;
+      case VMFunctionData::RootId:
+        TraceRoot(trc, reinterpret_cast<jsid*>(argBase), "ion-vm-args");
+        break;
+      case VMFunctionData::RootCell:
+        TraceGenericPointerRoot(trc, reinterpret_cast<gc::Cell**>(argBase),
+                                "ion-vm-args");
+        break;
+      case VMFunctionData::RootBigInt:
+        TraceRoot(trc, reinterpret_cast<JS::BigInt**>(argBase), "ion-vm-args");
+        break;
+    }
+
+    switch (f.argProperties(explicitArg)) {
+      case VMFunctionData::WordByValue:
+      case VMFunctionData::WordByRef:
+        argBase += sizeof(void*);
+        break;
+      case VMFunctionData::DoubleByValue:
+      case VMFunctionData::DoubleByRef:
+        argBase += 2 * sizeof(void*);
+        break;
+    }
+  }
+
+  if (f.outParam == Type_Handle) {
+    switch (f.outParamRootType) {
+      case VMFunctionData::RootNone:
+        MOZ_CRASH("Handle outparam must have root type");
+      case VMFunctionData::RootObject:
+        TraceRoot(trc, footer->outParam<JSObject*>(), "ion-vm-out");
+        break;
+      case VMFunctionData::RootString:
+        TraceRoot(trc, footer->outParam<JSString*>(), "ion-vm-out");
+        break;
+      case VMFunctionData::RootValue:
+        TraceRoot(trc, footer->outParam<Value>(), "ion-vm-outvp");
+        break;
+      case VMFunctionData::RootId:
+        TraceRoot(trc, footer->outParam<jsid>(), "ion-vm-outvp");
+        break;
+      case VMFunctionData::RootCell:
+        TraceGenericPointerRoot(trc, footer->outParam<gc::Cell*>(),
+                                "ion-vm-out");
+        break;
+      case VMFunctionData::RootBigInt:
+        TraceRoot(trc, footer->outParam<JS::BigInt*>(), "ion-vm-out");
+        break;
+    }
+  }
+}
+
+static void TraceBaselineInterpreterEntryFrame(JSTracer* trc,
+                                               const JSJitFrameIter& frame) {
+  BaselineInterpreterEntryFrameLayout* layout =
+      (BaselineInterpreterEntryFrameLayout*)frame.fp();
+  layout->replaceCalleeToken(TraceCalleeToken(trc, layout->calleeToken()));
+  TraceThisAndArguments(trc, frame, layout);
+}
+
+static void TraceTrampolineNativeFrame(JSTracer* trc,
+                                       const JSJitFrameIter& frame) {
+  auto* layout = (TrampolineNativeFrameLayout*)frame.fp();
+  layout->replaceCalleeToken(TraceCalleeToken(trc, layout->calleeToken()));
+  TraceThisAndArguments(trc, frame, layout);
+
+  TrampolineNative native = TrampolineNativeForFrame(trc->runtime(), layout);
+  switch (native) {
+    case TrampolineNative::ArraySort:
+    case TrampolineNative::TypedArraySort:
+      layout->getFrameData<ArraySortData>()->trace(trc);
+      break;
+    case TrampolineNative::Count:
+      MOZ_CRASH("Invalid value");
+  }
+}
+
+void TraceJitFrames(JSTracer* trc, JitActivation* activation) {
+#ifdef CHECK_OSIPOINT_REGISTERS
+  if (JitOptions.checkOsiPointRegisters) {
+    activation->setCheckRegs(false);
+  }
+#endif
+
+  uintptr_t highestByteVisitedInPrevWasmFrame = 0;
+
+  for (JitFrameIter frames(activation); !frames.done(); ++frames) {
+    if (frames.isJSJit()) {
+      const JSJitFrameIter& jitFrame = frames.asJSJit();
+      switch (jitFrame.type()) {
+        case FrameType::Exit:
+          TraceJitExitFrame(trc, jitFrame);
+          break;
+        case FrameType::BaselineJS:
+          jitFrame.baselineFrame()->trace(trc, jitFrame);
+          break;
+        case FrameType::IonJS:
+          TraceIonJSFrame(trc, jitFrame);
+          break;
+        case FrameType::BaselineStub:
+          TraceBaselineStubFrame(trc, jitFrame);
+          break;
+        case FrameType::Bailout:
+          TraceBailoutFrame(trc, jitFrame);
+          break;
+        case FrameType::BaselineInterpreterEntry:
+          TraceBaselineInterpreterEntryFrame(trc, jitFrame);
+          break;
+        case FrameType::TrampolineNative:
+          TraceTrampolineNativeFrame(trc, jitFrame);
+          break;
+        case FrameType::IonICCall:
+          TraceIonICCallFrame(trc, jitFrame);
+          break;
+        case FrameType::WasmToJSJit:
+          break;
+        default:
+          MOZ_CRASH("unexpected frame type");
+      }
+      highestByteVisitedInPrevWasmFrame = 0; 
+    } else {
+      gc::AssertRootMarkingPhase(trc);
+      MOZ_ASSERT(frames.isWasm());
+      uint8_t* nextPC = frames.resumePCinCurrentFrame();
+      MOZ_ASSERT(nextPC != nullptr);
+      wasm::WasmFrameIter& wasmFrameIter = frames.asWasm();
+#ifdef ENABLE_WASM_JSPI
+      if (wasmFrameIter.currentFrameStackSwitched()) {
+        highestByteVisitedInPrevWasmFrame = 0;
+        if (wasmFrameIter.contStack()) {
+          wasmFrameIter.contStack()->traceFields(trc);
+        }
+      }
+#endif
+      wasm::Instance* instance = wasmFrameIter.instance();
+      wasm::TraceInstanceEdge(trc, instance, "WasmFrameIter instance");
+      highestByteVisitedInPrevWasmFrame = instance->traceFrame(
+          trc, wasmFrameIter, nextPC, highestByteVisitedInPrevWasmFrame);
+    }
+  }
+}
+
+#ifdef ENABLE_WASM_JSPI
+void TraceWasmSuspendedContStacks(JSContext* cx, JSTracer* trc) {
+  gc::AssertRootMarkingPhase(trc);
+
+  if (!trc->isTenuringTracer()) {
+    return;
+  }
+
+  cx->wasm().contStacks().forEachAllocatedStack([trc](wasm::ContStack* stack) {
+    if (stack->canResume()) {
+      stack->traceSuspended(trc, nullptr);
+    }
+  });
+}
+#endif
+
+void TraceWeakJitActivationsInSweepingZones(JSContext* cx, JSTracer* trc) {
+  for (JitActivationIterator activation(cx); !activation.done(); ++activation) {
+    if (activation->compartment()->zone()->isGCSweeping()) {
+      for (JitFrameIter frame(activation->asJit()); !frame.done(); ++frame) {
+        if (frame.isJSJit()) {
+          const JSJitFrameIter& jitFrame = frame.asJSJit();
+          if (jitFrame.type() == FrameType::BaselineStub) {
+            TraceWeakBaselineStubFrame(trc, jitFrame);
+          }
+        }
+      }
+    }
+  }
+}
+
+void UpdateJitActivationsForMinorGC(JSRuntime* rt) {
+  MOZ_ASSERT(JS::RuntimeHeapIsMinorCollecting());
+  Nursery& nursery = rt->gc.nursery();
+  JSContext* cx = rt->mainContextFromOwnThread();
+  for (JitActivationIterator activations(cx); !activations.done();
+       ++activations) {
+    for (JitFrameIter iter(activations->asJit()); !iter.done(); ++iter) {
+      if (iter.isJSJit()) {
+        const JSJitFrameIter& jitFrame = iter.asJSJit();
+        if (jitFrame.type() == FrameType::IonJS) {
+          UpdateIonJSFrameForMinorGC(rt, jitFrame);
+        }
+      } else if (iter.isWasm()) {
+        const wasm::WasmFrameIter& frame = iter.asWasm();
+        frame.instance()->updateFrameForMovingGC(
+            frame, frame.resumePCinCurrentFrame(), nursery);
+      }
+    }
+  }
+#ifdef ENABLE_WASM_JSPI
+  cx->wasm().contStacks().forEachAllocatedStack(
+      [&nursery](wasm::ContStack* stack) {
+        if (stack->canResume()) {
+          stack->updateSuspendedForMovingGC(nursery);
+        }
+      });
+#endif
+}
+
+void UpdateJitActivationsForCompactingGC(JSRuntime* rt) {
+  MOZ_ASSERT(JS::RuntimeHeapIsMajorCollecting());
+  Nursery& nursery = rt->gc.nursery();
+  JSContext* cx = rt->mainContextFromOwnThread();
+  for (JitActivationIterator activations(cx); !activations.done();
+       ++activations) {
+    for (JitFrameIter iter(activations->asJit()); !iter.done(); ++iter) {
+      if (iter.isWasm()) {
+        const wasm::WasmFrameIter& frame = iter.asWasm();
+        frame.instance()->updateFrameForMovingGC(
+            frame, frame.resumePCinCurrentFrame(), nursery);
+      }
+    }
+  }
+#ifdef ENABLE_WASM_JSPI
+  cx->wasm().contStacks().forEachAllocatedStack(
+      [&nursery](wasm::ContStack* stack) {
+        if (stack->canResume()) {
+          stack->updateSuspendedForMovingGC(nursery);
+        }
+      });
+#endif
+}
+
+JSScript* GetTopJitJSScript(JSContext* cx) {
+  JSJitFrameIter frame(cx->activation()->asJit());
+  MOZ_ASSERT(frame.type() == FrameType::Exit);
+  ++frame;
+
+  if (frame.isBaselineStub()) {
+    ++frame;
+    MOZ_ASSERT(frame.isBaselineJS());
+  }
+
+  MOZ_ASSERT(frame.isScripted());
+  return frame.script();
+}
+
+RInstructionResults::RInstructionResults(JitFrameLayout* fp)
+    : results_(nullptr), fp_(fp), initialized_(false) {}
+
+RInstructionResults::RInstructionResults(RInstructionResults&& src)
+    : results_(std::move(src.results_)),
+      fp_(src.fp_),
+      initialized_(src.initialized_) {
+  src.initialized_ = false;
+}
+
+RInstructionResults& RInstructionResults::operator=(RInstructionResults&& rhs) {
+  MOZ_ASSERT(&rhs != this, "self-moves are prohibited");
+  this->~RInstructionResults();
+  new (this) RInstructionResults(std::move(rhs));
+  return *this;
+}
+
+RInstructionResults::~RInstructionResults() = default;
+
+bool RInstructionResults::init(JSContext* cx, uint32_t numResults) {
+  if (numResults) {
+    results_ = cx->make_unique<Values>();
+    if (!results_) {
+      return false;
+    }
+    if (!results_->growBy(numResults)) {
+      ReportOutOfMemory(cx);
+      return false;
+    }
+
+    Value guard = MagicValue(JS_ION_BAILOUT);
+    for (size_t i = 0; i < numResults; i++) {
+      (*results_)[i].init(guard);
+    }
+  }
+
+  initialized_ = true;
+  return true;
+}
+
+bool RInstructionResults::isInitialized() const { return initialized_; }
+
+size_t RInstructionResults::length() const { return results_->length(); }
+
+JitFrameLayout* RInstructionResults::frame() const {
+  MOZ_ASSERT(fp_);
+  return fp_;
+}
+
+HeapPtr<Value>& RInstructionResults::operator[](size_t index) {
+  return (*results_)[index];
+}
+
+void RInstructionResults::trace(JSTracer* trc) {
+  TraceRange(trc, results_->length(), results_->begin(), "ion-recover-results");
+}
+
+SnapshotIterator::SnapshotIterator(const JSJitFrameIter& iter,
+                                   const MachineState* machineState)
+    : snapshot_(iter.ionScript()->snapshots(), iter.snapshotOffset(),
+                iter.ionScript()->snapshotsRVATableSize(),
+                iter.ionScript()->snapshotsListSize()),
+      recover_(snapshot_, iter.ionScript()->recovers(),
+               iter.ionScript()->recoversSize()),
+      fp_(iter.jsFrame()),
+      machine_(machineState),
+      ionScript_(iter.ionScript()),
+      instructionResults_(nullptr) {}
+
+SnapshotIterator::SnapshotIterator()
+    : snapshot_(nullptr, 0, 0, 0),
+      recover_(snapshot_, nullptr, 0),
+      fp_(nullptr),
+      machine_(nullptr),
+      ionScript_(nullptr),
+      instructionResults_(nullptr) {}
+
+uintptr_t SnapshotIterator::fromStack(int32_t offset) const {
+  return ReadFrameSlot(fp_, offset);
+}
+
+static Value FromObjectPayload(uintptr_t payload) {
+  MOZ_ASSERT(payload != 0);
+  return ObjectValue(*reinterpret_cast<JSObject*>(payload));
+}
+
+static Value FromStringPayload(uintptr_t payload) {
+  return StringValue(reinterpret_cast<JSString*>(payload));
+}
+
+static Value FromSymbolPayload(uintptr_t payload) {
+  return SymbolValue(reinterpret_cast<JS::Symbol*>(payload));
+}
+
+static Value FromBigIntPayload(uintptr_t payload) {
+  return BigIntValue(reinterpret_cast<JS::BigInt*>(payload));
+}
+
+static Value FromTypedPayload(JSValueType type, uintptr_t payload) {
+  switch (type) {
+    case JSVAL_TYPE_INT32:
+      return Int32Value(payload);
+    case JSVAL_TYPE_BOOLEAN:
+      return BooleanValue(!!payload);
+    case JSVAL_TYPE_STRING:
+      return FromStringPayload(payload);
+    case JSVAL_TYPE_SYMBOL:
+      return FromSymbolPayload(payload);
+    case JSVAL_TYPE_BIGINT:
+      return FromBigIntPayload(payload);
+    case JSVAL_TYPE_OBJECT:
+      return FromObjectPayload(payload);
+    default:
+      MOZ_CRASH("unexpected type - needs payload");
+  }
+}
+
+bool SnapshotIterator::allocationReadable(const RValueAllocation& alloc,
+                                          ReadMethod rm) {
+  if (alloc.needSideEffect() && rm != ReadMethod::AlwaysDefault) {
+    if (!hasInstructionResults()) {
+      return false;
+    }
+  }
+
+  switch (alloc.mode()) {
+    case RValueAllocation::DOUBLE_REG:
+    case RValueAllocation::FLOAT32_REG:
+      return hasRegister(alloc.fpuReg());
+    case RValueAllocation::FLOAT32_STACK:
+      return hasStack(alloc.stackOffset());
+
+    case RValueAllocation::TYPED_REG:
+      return hasRegister(alloc.reg2());
+    case RValueAllocation::TYPED_STACK:
+      return hasStack(alloc.stackOffset2());
+
+#if defined(JS_NUNBOX32)
+    case RValueAllocation::UNTYPED_REG_REG:
+      return hasRegister(alloc.reg()) && hasRegister(alloc.reg2());
+    case RValueAllocation::UNTYPED_REG_STACK:
+      return hasRegister(alloc.reg()) && hasStack(alloc.stackOffset2());
+    case RValueAllocation::UNTYPED_STACK_REG:
+      return hasStack(alloc.stackOffset()) && hasRegister(alloc.reg2());
+    case RValueAllocation::UNTYPED_STACK_STACK:
+      return hasStack(alloc.stackOffset()) && hasStack(alloc.stackOffset2());
+#elif defined(JS_PUNBOX64)
+    case RValueAllocation::UNTYPED_REG:
+      return hasRegister(alloc.reg());
+    case RValueAllocation::UNTYPED_STACK:
+      return hasStack(alloc.stackOffset());
+#endif
+
+    case RValueAllocation::RECOVER_INSTRUCTION:
+      return hasInstructionResult(alloc.index());
+    case RValueAllocation::RI_WITH_DEFAULT_CST:
+      return rm == ReadMethod::AlwaysDefault ||
+             hasInstructionResult(alloc.index());
+
+    case RValueAllocation::INTPTR_REG:
+      return hasRegister(alloc.reg());
+    case RValueAllocation::INTPTR_STACK:
+    case RValueAllocation::INTPTR_INT32_STACK:
+      return hasStack(alloc.stackOffset());
+
+#if defined(JS_NUNBOX32)
+    case RValueAllocation::INT64_REG_REG:
+      return hasRegister(alloc.reg()) && hasRegister(alloc.reg2());
+    case RValueAllocation::INT64_REG_STACK:
+      return hasRegister(alloc.reg()) && hasStack(alloc.stackOffset2());
+    case RValueAllocation::INT64_STACK_REG:
+      return hasStack(alloc.stackOffset()) && hasRegister(alloc.reg2());
+    case RValueAllocation::INT64_STACK_STACK:
+      return hasStack(alloc.stackOffset()) && hasStack(alloc.stackOffset2());
+#elif defined(JS_PUNBOX64)
+    case RValueAllocation::INT64_REG:
+      return hasRegister(alloc.reg());
+    case RValueAllocation::INT64_STACK:
+    case RValueAllocation::INT64_INT32_STACK:
+      return hasStack(alloc.stackOffset());
+#endif
+
+    case RValueAllocation::CONSTANT:
+    case RValueAllocation::CST_UNDEFINED:
+    case RValueAllocation::CST_NULL:
+    case RValueAllocation::INTPTR_CST:
+    case RValueAllocation::INT64_CST:
+      return true;
+
+    default:
+      MOZ_CRASH("Unexpected mode");
+  }
+}
+
+Value SnapshotIterator::allocationValue(const RValueAllocation& alloc,
+                                        ReadMethod rm) {
+  switch (alloc.mode()) {
+    case RValueAllocation::CONSTANT:
+      return ionScript_->getConstant(alloc.index());
+
+    case RValueAllocation::CST_UNDEFINED:
+      return UndefinedValue();
+
+    case RValueAllocation::CST_NULL:
+      return NullValue();
+
+    case RValueAllocation::DOUBLE_REG:
+      return JS::CanonicalizedDoubleValue(fromRegister<double>(alloc.fpuReg()));
+
+    case RValueAllocation::FLOAT32_REG:
+      return JS::CanonicalizedDoubleValue(fromRegister<float>(alloc.fpuReg()));
+
+    case RValueAllocation::FLOAT32_STACK:
+      return JS::CanonicalizedDoubleValue(
+          ReadFrameFloat32Slot(fp_, alloc.stackOffset()));
+
+    case RValueAllocation::TYPED_REG:
+      return FromTypedPayload(alloc.knownType(), fromRegister(alloc.reg2()));
+
+    case RValueAllocation::TYPED_STACK: {
+      switch (alloc.knownType()) {
+        case JSVAL_TYPE_DOUBLE:
+          return JS::CanonicalizedDoubleValue(
+              ReadFrameDoubleSlot(fp_, alloc.stackOffset2()));
+        case JSVAL_TYPE_INT32:
+          return Int32Value(ReadFrameInt32Slot(fp_, alloc.stackOffset2()));
+        case JSVAL_TYPE_BOOLEAN:
+          return BooleanValue(ReadFrameBooleanSlot(fp_, alloc.stackOffset2()));
+        case JSVAL_TYPE_STRING:
+          return FromStringPayload(fromStack(alloc.stackOffset2()));
+        case JSVAL_TYPE_SYMBOL:
+          return FromSymbolPayload(fromStack(alloc.stackOffset2()));
+        case JSVAL_TYPE_BIGINT:
+          return FromBigIntPayload(fromStack(alloc.stackOffset2()));
+        case JSVAL_TYPE_OBJECT:
+          return FromObjectPayload(fromStack(alloc.stackOffset2()));
+        default:
+          MOZ_CRASH("Unexpected type");
+      }
+    }
+
+#if defined(JS_NUNBOX32)
+    case RValueAllocation::UNTYPED_REG_REG: {
+      return Value::fromTagAndPayload(JSValueTag(fromRegister(alloc.reg())),
+                                      fromRegister(alloc.reg2()));
+    }
+
+    case RValueAllocation::UNTYPED_REG_STACK: {
+      return Value::fromTagAndPayload(JSValueTag(fromRegister(alloc.reg())),
+                                      fromStack(alloc.stackOffset2()));
+    }
+
+    case RValueAllocation::UNTYPED_STACK_REG: {
+      return Value::fromTagAndPayload(
+          JSValueTag(fromStack(alloc.stackOffset())),
+          fromRegister(alloc.reg2()));
+    }
+
+    case RValueAllocation::UNTYPED_STACK_STACK: {
+      return Value::fromTagAndPayload(
+          JSValueTag(fromStack(alloc.stackOffset())),
+          fromStack(alloc.stackOffset2()));
+    }
+#elif defined(JS_PUNBOX64)
+    case RValueAllocation::UNTYPED_REG: {
+      return Value::fromRawBits(fromRegister(alloc.reg()));
+    }
+
+    case RValueAllocation::UNTYPED_STACK: {
+      return Value::fromRawBits(fromStack(alloc.stackOffset()));
+    }
+#endif
+
+    case RValueAllocation::RECOVER_INSTRUCTION:
+      return fromInstructionResult(alloc.index());
+
+    case RValueAllocation::RI_WITH_DEFAULT_CST:
+      if (rm == ReadMethod::Normal && hasInstructionResult(alloc.index())) {
+        return fromInstructionResult(alloc.index());
+      }
+      MOZ_ASSERT(rm == ReadMethod::AlwaysDefault);
+      return ionScript_->getConstant(alloc.index2());
+
+    case RValueAllocation::INTPTR_CST:
+    case RValueAllocation::INTPTR_REG:
+    case RValueAllocation::INTPTR_STACK:
+    case RValueAllocation::INTPTR_INT32_STACK:
+      MOZ_CRASH("Can't read IntPtr as Value");
+
+    case RValueAllocation::INT64_CST:
+#if defined(JS_NUNBOX32)
+    case RValueAllocation::INT64_REG_REG:
+    case RValueAllocation::INT64_REG_STACK:
+    case RValueAllocation::INT64_STACK_REG:
+    case RValueAllocation::INT64_STACK_STACK:
+#elif defined(JS_PUNBOX64)
+    case RValueAllocation::INT64_REG:
+    case RValueAllocation::INT64_STACK:
+    case RValueAllocation::INT64_INT32_STACK:
+#endif
+      MOZ_CRASH("Can't read Int64 as Value");
+
+    default:
+      MOZ_CRASH("huh?");
+  }
+}
+
+Value SnapshotIterator::maybeRead(const RValueAllocation& a,
+                                  MaybeReadFallback& fallback) {
+  if (allocationReadable(a)) {
+    return allocationValue(a);
+  }
+
+  if (fallback.canRecoverResults()) {
+    AutoEnterOOMUnsafeRegion oomUnsafe;
+    if (!initInstructionResults(fallback)) {
+      oomUnsafe.crash("js::jit::SnapshotIterator::maybeRead");
+    }
+
+    if (allocationReadable(a)) {
+      return allocationValue(a);
+    }
+
+    MOZ_ASSERT_UNREACHABLE("All allocations should be readable.");
+  }
+
+  return UndefinedValue();
+}
+
+bool SnapshotIterator::tryRead(Value* result) {
+  RValueAllocation a = readAllocation();
+  if (allocationReadable(a)) {
+    *result = allocationValue(a);
+    return true;
+  }
+  return false;
+}
+
+bool SnapshotIterator::readMaybeUnpackedBigInt(JSContext* cx,
+                                               MutableHandle<Value> result) {
+  RValueAllocation alloc = readAllocation();
+  MOZ_ASSERT(allocationReadable(alloc));
+
+  switch (alloc.mode()) {
+    case RValueAllocation::INT64_CST:
+#if defined(JS_NUNBOX32)
+    case RValueAllocation::INT64_REG_REG:
+    case RValueAllocation::INT64_REG_STACK:
+    case RValueAllocation::INT64_STACK_REG:
+    case RValueAllocation::INT64_STACK_STACK:
+#elif defined(JS_PUNBOX64)
+    case RValueAllocation::INT64_REG:
+    case RValueAllocation::INT64_STACK:
+    case RValueAllocation::INT64_INT32_STACK:
+#endif
+    {
+      auto* bigInt = JS::BigInt::createFromInt64(cx, allocationInt64(alloc));
+      if (!bigInt) {
+        return false;
+      }
+      result.setBigInt(bigInt);
+      return true;
+    }
+    case RValueAllocation::INTPTR_CST:
+    case RValueAllocation::INTPTR_REG:
+    case RValueAllocation::INTPTR_STACK:
+    case RValueAllocation::INTPTR_INT32_STACK: {
+      auto* bigInt = JS::BigInt::createFromIntPtr(cx, allocationIntPtr(alloc));
+      if (!bigInt) {
+        return false;
+      }
+      result.setBigInt(bigInt);
+      return true;
+    }
+    default:
+      result.set(allocationValue(alloc));
+      return true;
+  }
+}
+
+int64_t SnapshotIterator::allocationInt64(const RValueAllocation& alloc) {
+  MOZ_ASSERT(allocationReadable(alloc));
+
+  auto fromParts = [](uint32_t hi, uint32_t lo) {
+    return static_cast<int64_t>((static_cast<uint64_t>(hi) << 32) | lo);
+  };
+
+  switch (alloc.mode()) {
+    case RValueAllocation::INT64_CST: {
+      uint32_t lo = ionScript_->getConstant(alloc.index()).toInt32();
+      uint32_t hi = ionScript_->getConstant(alloc.index2()).toInt32();
+      return fromParts(hi, lo);
+    }
+#if defined(JS_NUNBOX32)
+    case RValueAllocation::INT64_REG_REG: {
+      uintptr_t lo = fromRegister(alloc.reg());
+      uintptr_t hi = fromRegister(alloc.reg2());
+      return fromParts(hi, lo);
+    }
+    case RValueAllocation::INT64_REG_STACK: {
+      uintptr_t lo = fromRegister(alloc.reg());
+      uintptr_t hi = fromStack(alloc.stackOffset2());
+      return fromParts(hi, lo);
+    }
+    case RValueAllocation::INT64_STACK_REG: {
+      uintptr_t lo = fromStack(alloc.stackOffset());
+      uintptr_t hi = fromRegister(alloc.reg2());
+      return fromParts(hi, lo);
+    }
+    case RValueAllocation::INT64_STACK_STACK: {
+      uintptr_t lo = fromStack(alloc.stackOffset());
+      uintptr_t hi = fromStack(alloc.stackOffset2());
+      return fromParts(hi, lo);
+    }
+#elif defined(JS_PUNBOX64)
+    case RValueAllocation::INT64_REG: {
+      return static_cast<int64_t>(fromRegister(alloc.reg()));
+    }
+    case RValueAllocation::INT64_STACK: {
+      return static_cast<int64_t>(fromStack(alloc.stackOffset()));
+    }
+    case RValueAllocation::INT64_INT32_STACK: {
+      return static_cast<int64_t>(ReadFrameInt32Slot(fp_, alloc.stackOffset()));
+    }
+#endif
+    default:
+      break;
+  }
+  MOZ_CRASH("invalid int64 allocation");
+}
+
+intptr_t SnapshotIterator::allocationIntPtr(const RValueAllocation& alloc) {
+  MOZ_ASSERT(allocationReadable(alloc));
+  switch (alloc.mode()) {
+    case RValueAllocation::INTPTR_CST: {
+#if !defined(JS_64BIT)
+      int32_t cst = ionScript_->getConstant(alloc.index()).toInt32();
+      return static_cast<intptr_t>(cst);
+#else
+      uint32_t lo = ionScript_->getConstant(alloc.index()).toInt32();
+      uint32_t hi = ionScript_->getConstant(alloc.index2()).toInt32();
+      return static_cast<intptr_t>((static_cast<uint64_t>(hi) << 32) | lo);
+#endif
+    }
+    case RValueAllocation::INTPTR_REG:
+      return static_cast<intptr_t>(fromRegister(alloc.reg()));
+    case RValueAllocation::INTPTR_STACK:
+      return static_cast<intptr_t>(fromStack(alloc.stackOffset()));
+    case RValueAllocation::INTPTR_INT32_STACK:
+      return static_cast<intptr_t>(
+          ReadFrameInt32Slot(fp_, alloc.stackOffset()));
+    default:
+      break;
+  }
+  MOZ_CRASH("invalid intptr allocation");
+}
+
+JS::BigInt* SnapshotIterator::readBigInt(JSContext* cx) {
+  RValueAllocation alloc = readAllocation();
+  switch (alloc.mode()) {
+    case RValueAllocation::INTPTR_CST:
+    case RValueAllocation::INTPTR_REG:
+    case RValueAllocation::INTPTR_STACK:
+    case RValueAllocation::INTPTR_INT32_STACK:
+      return JS::BigInt::createFromIntPtr(cx, allocationIntPtr(alloc));
+    default:
+      return allocationValue(alloc).toBigInt();
+  }
+}
+
+void SnapshotIterator::writeAllocationValuePayload(
+    const RValueAllocation& alloc, const Value& v) {
+  MOZ_ASSERT(v.isGCThing());
+
+  switch (alloc.mode()) {
+    case RValueAllocation::CONSTANT:
+      ionScript_->getConstant(alloc.index()) = v;
+      break;
+
+    case RValueAllocation::CST_UNDEFINED:
+    case RValueAllocation::CST_NULL:
+    case RValueAllocation::DOUBLE_REG:
+    case RValueAllocation::FLOAT32_REG:
+    case RValueAllocation::FLOAT32_STACK:
+    case RValueAllocation::INTPTR_CST:
+    case RValueAllocation::INTPTR_REG:
+    case RValueAllocation::INTPTR_STACK:
+    case RValueAllocation::INTPTR_INT32_STACK:
+    case RValueAllocation::INT64_CST:
+#if defined(JS_NUNBOX32)
+    case RValueAllocation::INT64_REG_REG:
+    case RValueAllocation::INT64_REG_STACK:
+    case RValueAllocation::INT64_STACK_REG:
+    case RValueAllocation::INT64_STACK_STACK:
+#elif defined(JS_PUNBOX64)
+    case RValueAllocation::INT64_REG:
+    case RValueAllocation::INT64_STACK:
+    case RValueAllocation::INT64_INT32_STACK:
+#endif
+      MOZ_CRASH("Not a GC thing: Unexpected write");
+      break;
+
+    case RValueAllocation::TYPED_REG:
+      machine_->write(alloc.reg2(), uintptr_t(v.toGCThing()));
+      break;
+
+    case RValueAllocation::TYPED_STACK:
+      switch (alloc.knownType()) {
+        default:
+          MOZ_CRASH("Not a GC thing: Unexpected write");
+          break;
+        case JSVAL_TYPE_STRING:
+        case JSVAL_TYPE_SYMBOL:
+        case JSVAL_TYPE_BIGINT:
+        case JSVAL_TYPE_OBJECT:
+          WriteFrameSlot(fp_, alloc.stackOffset2(), uintptr_t(v.toGCThing()));
+          break;
+      }
+      break;
+
+#if defined(JS_NUNBOX32)
+    case RValueAllocation::UNTYPED_REG_REG:
+    case RValueAllocation::UNTYPED_STACK_REG:
+      machine_->write(alloc.reg2(), uintptr_t(v.toGCThing()));
+      break;
+
+    case RValueAllocation::UNTYPED_REG_STACK:
+    case RValueAllocation::UNTYPED_STACK_STACK:
+      WriteFrameSlot(fp_, alloc.stackOffset2(), uintptr_t(v.toGCThing()));
+      break;
+#elif defined(JS_PUNBOX64)
+    case RValueAllocation::UNTYPED_REG:
+      machine_->write(alloc.reg(), v.asRawBits());
+      break;
+
+    case RValueAllocation::UNTYPED_STACK:
+      WriteFrameSlot(fp_, alloc.stackOffset(), v.asRawBits());
+      break;
+#endif
+
+    case RValueAllocation::RECOVER_INSTRUCTION:
+      MOZ_CRASH("Recover instructions are handled by the JitActivation.");
+      break;
+
+    case RValueAllocation::RI_WITH_DEFAULT_CST:
+      ionScript_->getConstant(alloc.index2()) = v;
+      break;
+
+    default:
+      MOZ_CRASH("huh?");
+  }
+}
+
+void SnapshotIterator::traceAllocation(JSTracer* trc) {
+  RValueAllocation alloc = readAllocation();
+  if (!allocationReadable(alloc, ReadMethod::AlwaysDefault)) {
+    return;
+  }
+
+  Value v = allocationValue(alloc, ReadMethod::AlwaysDefault);
+  if (!v.isGCThing()) {
+    return;
+  }
+
+  Value copy = v;
+  TraceRoot(trc, &v, "ion-typed-reg");
+  if (v != copy) {
+    MOZ_ASSERT(SameType(v, copy));
+    writeAllocationValuePayload(alloc, v);
+  }
+}
+
+const RResumePoint* SnapshotIterator::resumePoint() const {
+  return instruction()->toResumePoint();
+}
+
+uint32_t SnapshotIterator::numAllocations() const {
+  return recover_.numOperands();
+}
+
+uint32_t SnapshotIterator::pcOffset() const {
+  return resumePoint()->pcOffset();
+}
+
+ResumeMode SnapshotIterator::resumeMode() const {
+  return resumePoint()->mode();
+}
+
+void SnapshotIterator::skipInstruction() {
+  MOZ_ASSERT(snapshot_.numAllocationsRead() == 0);
+  size_t numOperands = recover_.numOperands();
+  for (size_t i = 0; i < numOperands; i++) {
+    skip();
+  }
+  nextInstruction();
+}
+
+bool SnapshotIterator::initInstructionResults(MaybeReadFallback& fallback) {
+  MOZ_ASSERT(fallback.canRecoverResults());
+  JSContext* cx = fallback.maybeCx;
+
+  if (recover_.numInstructions() == 1) {
+    return true;
+  }
+
+  JitFrameLayout* fp = fallback.frame->jsFrame();
+  RInstructionResults* results = fallback.activation->maybeIonFrameRecovery(fp);
+  if (!results) {
+    AutoRealm ar(cx, fallback.frame->script());
+
+    if (fallback.consequence == MaybeReadFallback::Fallback_Invalidate) {
+      ionScript_->invalidate(cx, fallback.frame->script(),
+                              false,
+                             "Observe recovered instruction.");
+    }
+
+    RInstructionResults tmp(fallback.frame->jsFrame());
+    if (!fallback.activation->registerIonFrameRecovery(std::move(tmp))) {
+      return false;
+    }
+
+    results = fallback.activation->maybeIonFrameRecovery(fp);
+
+    MachineState machine = fallback.frame->machineState();
+    SnapshotIterator s(*fallback.frame, &machine);
+    if (!s.computeInstructionResults(cx, results)) {
+      fallback.activation->removeIonFrameRecovery(fp);
+      return false;
+    }
+  }
+
+  MOZ_ASSERT(results->isInitialized());
+  MOZ_RELEASE_ASSERT(results->length() == recover_.numInstructions() - 1);
+  instructionResults_ = results;
+  return true;
+}
+
+bool SnapshotIterator::computeInstructionResults(
+    JSContext* cx, RInstructionResults* results) const {
+  MOZ_ASSERT(!results->isInitialized());
+  MOZ_ASSERT(recover_.numInstructionsRead() == 1);
+
+  size_t numResults = recover_.numInstructions() - 1;
+  if (!results->isInitialized()) {
+    if (!results->init(cx, numResults)) {
+      return false;
+    }
+
+    if (!numResults) {
+      MOZ_ASSERT(results->isInitialized());
+      return true;
+    }
+
+    gc::AutoSuppressGC suppressGC(cx);
+    js::AutoSuppressAllocationMetadataBuilder suppressMetadata(cx);
+
+    SnapshotIterator s(*this);
+    s.instructionResults_ = results;
+    while (s.moreInstructions()) {
+      if (s.instruction()->isResumePoint()) {
+        s.skipInstruction();
+        continue;
+      }
+
+      if (!s.instruction()->recover(cx, s)) {
+        return false;
+      }
+      s.nextInstruction();
+    }
+  }
+
+  MOZ_ASSERT(results->isInitialized());
+  return true;
+}
+
+void SnapshotIterator::storeInstructionResult(const Value& v) {
+  uint32_t currIns = recover_.numInstructionsRead() - 1;
+  MOZ_ASSERT((*instructionResults_)[currIns].isMagic(JS_ION_BAILOUT));
+  (*instructionResults_)[currIns] = v;
+}
+
+Value SnapshotIterator::fromInstructionResult(uint32_t index) const {
+  MOZ_RELEASE_ASSERT(instructionResults_,
+                     "missing instruction results for recovered allocation");
+  Value v = (*instructionResults_)[index];
+  MOZ_RELEASE_ASSERT(!v.isMagic());
+  return v;
+}
+
+void SnapshotIterator::settleOnFrame() {
+  MOZ_ASSERT(snapshot_.numAllocationsRead() == 0);
+  while (!instruction()->isResumePoint()) {
+    skipInstruction();
+  }
+}
+
+void SnapshotIterator::nextFrame() {
+  nextInstruction();
+  settleOnFrame();
+}
+
+Value SnapshotIterator::maybeReadAllocByIndex(size_t index) {
+  while (index--) {
+    MOZ_ASSERT(moreAllocations());
+    skip();
+  }
+
+  Value s;
+  {
+    JS::AutoSuppressGCAnalysis nogc;
+    MaybeReadFallback fallback;
+    s = maybeRead(fallback);
+  }
+
+  while (moreAllocations()) {
+    skip();
+  }
+
+  return s;
+}
+
+InlineFrameIterator::InlineFrameIterator(JSContext* cx,
+                                         const JSJitFrameIter* iter)
+    : calleeTemplate_(cx), script_(cx), pc_(nullptr), numActualArgs_(0) {
+  resetOn(iter);
+}
+
+InlineFrameIterator::InlineFrameIterator(JSContext* cx,
+                                         const InlineFrameIterator* iter)
+    : frame_(iter ? iter->frame_ : nullptr),
+      framesRead_(0),
+      frameCount_(iter ? iter->frameCount_ : UINT32_MAX),
+      calleeTemplate_(cx),
+      script_(cx),
+      pc_(nullptr),
+      numActualArgs_(0) {
+  if (frame_) {
+    machine_ = iter->machine_;
+    start_ = SnapshotIterator(*frame_, &machine_);
+
+    framesRead_ = iter->framesRead_ - 1;
+    findNextFrame();
+  }
+}
+
+void InlineFrameIterator::resetOn(const JSJitFrameIter* iter) {
+  frame_ = iter;
+  framesRead_ = 0;
+  frameCount_ = UINT32_MAX;
+
+  if (iter) {
+    machine_ = iter->machineState();
+    start_ = SnapshotIterator(*iter, &machine_);
+    findNextFrame();
+  }
+}
+
+void InlineFrameIterator::findNextFrame() {
+  MOZ_ASSERT(more());
+
+  si_ = start_;
+
+  calleeTemplate_ = frame_->maybeCallee();
+  calleeRVA_ = RValueAllocation();
+  script_ = frame_->script();
+  MOZ_ASSERT(script_->hasBaselineScript());
+
+  si_.settleOnFrame();
+
+  pc_ = script_->offsetToPC(si_.pcOffset());
+  numActualArgs_ = 0xbadbad;
+
+
+  size_t remaining = (frameCount_ != UINT32_MAX) ? frameNo() - 1 : SIZE_MAX;
+
+  size_t i = 1;
+  for (; i <= remaining && si_.moreFrames(); i++) {
+    ResumeMode mode = si_.resumeMode();
+    MOZ_ASSERT(IsIonInlinableOp(JSOp(*pc_)));
+
+    if (IsInvokeOp(JSOp(*pc_))) {
+      MOZ_ASSERT(mode == ResumeMode::InlinedStandardCall ||
+                 mode == ResumeMode::InlinedFunCall);
+      numActualArgs_ = GET_ARGC(pc_);
+      if (mode == ResumeMode::InlinedFunCall && numActualArgs_ > 0) {
+        numActualArgs_--;
+      }
+    } else if (IsGetPropPC(pc_) || IsGetElemPC(pc_)) {
+      MOZ_ASSERT(mode == ResumeMode::InlinedAccessor);
+      numActualArgs_ = 0;
+    } else {
+      MOZ_RELEASE_ASSERT(IsSetPropPC(pc_));
+      MOZ_ASSERT(mode == ResumeMode::InlinedAccessor);
+      numActualArgs_ = 1;
+    }
+
+    bool skipNewTarget = IsConstructPC(pc_);
+    unsigned skipCount =
+        (si_.numAllocations() - 1) - numActualArgs_ - 1 - skipNewTarget;
+    for (unsigned j = 0; j < skipCount; j++) {
+      si_.skip();
+    }
+
+    Value funval = si_.readWithDefault(&calleeRVA_);
+
+    while (si_.moreAllocations()) {
+      si_.skip();
+    }
+
+    si_.nextFrame();
+
+    calleeTemplate_ = &funval.toObject().as<JSFunction>();
+    script_ = calleeTemplate_->nonLazyScript();
+    MOZ_ASSERT(script_->hasBaselineScript());
+
+    pc_ = script_->offsetToPC(si_.pcOffset());
+  }
+
+  if (frameCount_ == UINT32_MAX) {
+    MOZ_ASSERT(!si_.moreFrames());
+    frameCount_ = i;
+  }
+
+  framesRead_++;
+}
+
+JSFunction* InlineFrameIterator::callee(MaybeReadFallback& fallback) const {
+  MOZ_ASSERT(isFunctionFrame());
+  if (calleeRVA_.mode() == RValueAllocation::INVALID ||
+      !fallback.canRecoverResults()) {
+    return calleeTemplate_;
+  }
+
+  SnapshotIterator s(si_);
+  Value funval = s.maybeRead(calleeRVA_, fallback);
+  return &funval.toObject().as<JSFunction>();
+}
+
+JSObject* InlineFrameIterator::computeEnvironmentChain(
+    const Value& envChainValue, MaybeReadFallback& fallback,
+    bool* hasInitialEnv) const {
+  if (envChainValue.isObject()) {
+    if (hasInitialEnv) {
+      if (fallback.canRecoverResults()) {
+        RootedObject obj(fallback.maybeCx, &envChainValue.toObject());
+        *hasInitialEnv = isFunctionFrame() &&
+                         callee(fallback)->needsFunctionEnvironmentObjects();
+        return obj;
+      }
+      JS::AutoSuppressGCAnalysis
+          nogc;  
+      *hasInitialEnv = isFunctionFrame() &&
+                       callee(fallback)->needsFunctionEnvironmentObjects();
+    }
+
+    return &envChainValue.toObject();
+  }
+
+  if (isFunctionFrame()) {
+    return callee(fallback)->environment();
+  }
+
+  if (isModuleFrame()) {
+    return script()->module()->environment();
+  }
+
+  MOZ_ASSERT(!script()->isForEval());
+  MOZ_ASSERT(!script()->hasNonSyntacticScope());
+  return &script()->global().lexicalEnvironment();
+}
+
+bool InlineFrameIterator::isFunctionFrame() const { return !!calleeTemplate_; }
+
+bool InlineFrameIterator::isModuleFrame() const { return script()->isModule(); }
+
+uintptr_t* MachineState::SafepointState::addressOfRegister(Register reg) const {
+  size_t offset = regs.offsetOfPushedRegister(reg);
+
+  MOZ_ASSERT((offset % sizeof(uintptr_t)) == 0);
+  uint32_t index = offset / sizeof(uintptr_t);
+
+#ifdef DEBUG
+  uint32_t expectedIndex = 0;
+  bool found = false;
+  for (GeneralRegisterBackwardIterator iter(regs); iter.more(); ++iter) {
+    expectedIndex++;
+    if (*iter == reg) {
+      found = true;
+      break;
+    }
+  }
+  MOZ_ASSERT(found);
+  MOZ_ASSERT(expectedIndex == index);
+#endif
+
+  return spillBase - index;
+}
+
+char* MachineState::SafepointState::addressOfRegister(FloatRegister reg) const {
+  MOZ_ASSERT(!reg.isSimd128());
+  char* ptr = floatSpillBase;
+  for (FloatRegisterBackwardIterator iter(floatRegs); iter.more(); ++iter) {
+    ptr -= (*iter).size();
+    if ((*iter).size() < reg.size()) {
+      continue;
+    }
+    for (uint32_t a = 0; a < (*iter).numAlignedAliased(); a++) {
+      FloatRegister ftmp = (*iter).alignedAliased(a);
+      if (ftmp == reg) {
+        return ptr;
+      }
+    }
+  }
+  MOZ_CRASH("Invalid register");
+}
+
+bool MachineState::has(FloatRegister reg) const {
+  if (state_.is<BailoutState>()) {
+    return true;
+  }
+  const auto& s = state_.as<SafepointState>();
+  for (uint32_t a = 0; a < reg.numAlignedAliased(); a++) {
+    FloatRegister alias = reg.alignedAliased(a);
+    if (alias.size() >= reg.size() && s.floatRegs.hasRegisterIndex(alias)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+uintptr_t MachineState::read(Register reg) const {
+  if (state_.is<BailoutState>()) {
+    return state_.as<BailoutState>().regs[reg.code()].r;
+  }
+  if (state_.is<SafepointState>()) {
+    uintptr_t* addr = state_.as<SafepointState>().addressOfRegister(reg);
+    return *addr;
+  }
+  MOZ_CRASH("Invalid state");
+}
+
+template <typename T>
+T MachineState::read(FloatRegister reg) const {
+  MOZ_RELEASE_ASSERT(reg.size() == sizeof(T));
+
+#if !defined(JS_CODEGEN_NONE) && !defined(JS_CODEGEN_WASM32)
+  if (state_.is<BailoutState>()) {
+    uint32_t offset = reg.getRegisterDumpOffsetInBytes();
+    MOZ_RELEASE_ASSERT((offset % sizeof(T)) == 0);
+    MOZ_RELEASE_ASSERT(offset <= sizeof(RegisterDump::FPUArray) - sizeof(T));
+
+    const BailoutState& state = state_.as<BailoutState>();
+    char* addr = reinterpret_cast<char*>(state.floatRegs.begin()) + offset;
+    return *reinterpret_cast<T*>(addr);
+  }
+  if (state_.is<SafepointState>()) {
+    char* addr = state_.as<SafepointState>().addressOfRegister(reg);
+    return *reinterpret_cast<T*>(addr);
+  }
+#endif
+  MOZ_CRASH("Invalid state");
+}
+
+void MachineState::write(Register reg, uintptr_t value) const {
+  if (state_.is<SafepointState>()) {
+    uintptr_t* addr = state_.as<SafepointState>().addressOfRegister(reg);
+    *addr = value;
+    return;
+  }
+  MOZ_CRASH("Invalid state");
+}
+
+bool InlineFrameIterator::isConstructing() const {
+  if (more()) {
+    InlineFrameIterator parent(TlsContext.get(), this);
+    ++parent;
+
+    JSOp parentOp = JSOp(*parent.pc());
+
+    if (IsIonInlinableGetterOrSetterOp(parentOp)) {
+      return false;
+    }
+
+    MOZ_ASSERT(IsInvokeOp(parentOp) && !IsSpreadOp(parentOp));
+
+    return IsConstructOp(parentOp);
+  }
+
+  return frame_->isConstructing();
+}
+
+void SnapshotIterator::warnUnreadableAllocation() {
+  fprintf(stderr,
+          "Warning! Tried to access unreadable value allocation (possible "
+          "f.arguments).\n");
+}
+
+struct DumpOverflownOp {
+  const unsigned numFormals_;
+  unsigned i_ = 0;
+
+  explicit DumpOverflownOp(unsigned numFormals) : numFormals_(numFormals) {}
+
+  void operator()(const Value& v) {
+    if (i_ >= numFormals_) {
+      fprintf(stderr, "  actual (arg %u): ", i_);
+#if defined(DEBUG) || defined(JS_JITSPEW)
+      DumpValue(v);
+#else
+      fprintf(stderr, "?\n");
+#endif
+    }
+    i_++;
+  }
+};
+
+void InlineFrameIterator::dump() const {
+  MaybeReadFallback fallback;
+
+  if (more()) {
+    fprintf(stderr, " JS frame (inlined)\n");
+  } else {
+    fprintf(stderr, " JS frame\n");
+  }
+
+  bool isFunction = false;
+  if (isFunctionFrame()) {
+    isFunction = true;
+    fprintf(stderr, "  callee fun: ");
+#if defined(DEBUG) || defined(JS_JITSPEW)
+    DumpObject(callee(fallback));
+#else
+    fprintf(stderr, "?\n");
+#endif
+  } else {
+    fprintf(stderr, "  global frame, no callee\n");
+  }
+
+  fprintf(stderr, "  file %s line %u\n", script()->filename(),
+          script()->lineno());
+
+  fprintf(stderr, "  script = %p, pc = %p\n", (void*)script(), pc());
+  fprintf(stderr, "  current op: %s\n", CodeName(JSOp(*pc())));
+
+  if (!more()) {
+    numActualArgs();
+  }
+
+  SnapshotIterator si = snapshotIterator();
+  fprintf(stderr, "  slots: %u\n", si.numAllocations() - 1);
+  for (unsigned i = 0; i < si.numAllocations() - 1; i++) {
+    if (isFunction) {
+      if (i == 0) {
+        fprintf(stderr, "  env chain: ");
+      } else if (i == 1) {
+        fprintf(stderr, "  this: ");
+      } else if (i - 2 < calleeTemplate()->nargs()) {
+        fprintf(stderr, "  formal (arg %u): ", i - 2);
+      } else {
+        if (i - 2 == calleeTemplate()->nargs() &&
+            numActualArgs() > calleeTemplate()->nargs()) {
+          DumpOverflownOp d(calleeTemplate()->nargs());
+          unaliasedForEachActual(TlsContext.get(), d, fallback);
+        }
+
+        fprintf(stderr, "  slot %d: ", int(i - 2 - calleeTemplate()->nargs()));
+      }
+    } else
+      fprintf(stderr, "  slot %u: ", i);
+#if defined(DEBUG) || defined(JS_JITSPEW)
+    DumpValue(si.maybeRead(fallback));
+#else
+    fprintf(stderr, "?\n");
+#endif
+  }
+
+  fputc('\n', stderr);
+}
+
+JitFrameLayout* InvalidationBailoutStack::fp() const {
+  return (JitFrameLayout*)(sp() + ionScript_->frameSize());
+}
+
+void InvalidationBailoutStack::checkInvariants() const {
+#ifdef DEBUG
+  JitFrameLayout* frame = fp();
+  CalleeToken token = frame->calleeToken();
+  MOZ_ASSERT(token);
+
+  uint8_t* rawBase = ionScript()->method()->raw();
+  uint8_t* rawLimit = rawBase + ionScript()->method()->instructionsSize();
+  uint8_t* osiPoint = osiPointReturnAddress();
+  MOZ_ASSERT(rawBase <= osiPoint && osiPoint <= rawLimit);
+#endif
+}
+
+void AssertJitStackInvariants(JSContext* cx) {
+  for (JitActivationIterator activations(cx); !activations.done();
+       ++activations) {
+    JitFrameIter iter(activations->asJit());
+    if (iter.isJSJit()) {
+      JSJitFrameIter& frames = iter.asJSJit();
+      size_t prevFrameSize = 0;
+      size_t frameSize = 0;
+      bool isScriptedCallee = false;
+      for (; !frames.done(); ++frames) {
+        size_t calleeFp = reinterpret_cast<size_t>(frames.fp());
+        size_t callerFp = reinterpret_cast<size_t>(frames.prevFp());
+        MOZ_ASSERT(callerFp >= calleeFp);
+        prevFrameSize = frameSize;
+        frameSize = callerFp - calleeFp;
+
+        if (frames.isScripted() &&
+            frames.prevType() == FrameType::BaselineInterpreterEntry) {
+          MOZ_RELEASE_ASSERT(
+              frameSize % JitStackAlignment == 0,
+              "The blinterp entry frame should keep the alignment");
+
+          size_t numArgs = frames.numActualArgs();
+          if (frames.isFunctionFrame()) {
+            numArgs = std::max(numArgs, frames.callee()->nargs());
+          }
+          size_t expectedFrameSize =
+              sizeof(Value) * (numArgs + 1  +
+                               frames.isConstructing() ) +
+              sizeof(JitFrameLayout);
+          MOZ_RELEASE_ASSERT(frameSize >= expectedFrameSize,
+                             "The frame is large enough to hold all arguments");
+          MOZ_RELEASE_ASSERT(expectedFrameSize + JitStackAlignment > frameSize,
+                             "The frame size is optimal");
+        }
+
+        if (frames.isExitFrame()) {
+          frameSize -= ExitFrameLayout::Size();
+        }
+
+        if (frames.isIonJS()) {
+          MOZ_RELEASE_ASSERT(
+              frames.ionScript()->frameSize() % JitStackAlignment == 0,
+              "Ensure that if the Ion frame is aligned, then the spill base is "
+              "also aligned");
+
+          if (isScriptedCallee) {
+            MOZ_RELEASE_ASSERT(prevFrameSize % JitStackAlignment == 0,
+                               "The ion frame should keep the alignment");
+          }
+        }
+
+        if (frames.prevType() == FrameType::BaselineStub && isScriptedCallee) {
+          MOZ_RELEASE_ASSERT(calleeFp % JitStackAlignment == 0,
+                             "The baseline stub restores the stack alignment");
+        }
+
+        isScriptedCallee = frames.isScripted();
+      }
+
+      MOZ_RELEASE_ASSERT(
+          JSJitFrameIter::isEntry(frames.type()),
+          "The first frame of a Jit activation should be an entry frame");
+      MOZ_RELEASE_ASSERT(
+          reinterpret_cast<size_t>(frames.fp()) % JitStackAlignment == 0,
+          "The entry frame should be properly aligned");
+    } else {
+      MOZ_ASSERT(iter.isWasm());
+      wasm::WasmFrameIter& frames = iter.asWasm();
+      while (!frames.done()) {
+        ++frames;
+      }
+    }
+  }
+}
+
+}  
+}  

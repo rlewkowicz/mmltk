@@ -1,0 +1,68 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_JSProcessActorProtocol_h
+#define mozilla_dom_JSProcessActorProtocol_h
+
+#include "mozilla/dom/BrowsingContext.h"
+#include "mozilla/dom/JSActorService.h"
+#include "nsIObserver.h"
+#include "nsString.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+class ErrorResult;
+
+namespace dom {
+
+struct ProcessActorOptions;
+class JSProcessActorInfo;
+class EventTarget;
+class JSActorProtocolUtils;
+
+class JSProcessActorProtocol final : public JSActorProtocol,
+                                     public nsIObserver {
+ public:
+  NS_DECL_NSIOBSERVER
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(JSProcessActorProtocol, nsIObserver)
+
+  static already_AddRefed<JSProcessActorProtocol> FromIPC(
+      const JSProcessActorInfo& aInfo);
+  JSProcessActorInfo ToIPC();
+
+  static already_AddRefed<JSProcessActorProtocol> FromWebIDLOptions(
+      const nsACString& aName, const ProcessActorOptions& aOptions,
+      ErrorResult& aRv);
+
+  struct ParentSide : public Sided {};
+
+  struct ChildSide : public Sided {
+    nsTArray<nsCString> mObservers;
+  };
+
+  const ParentSide& Parent() const override { return mParent; }
+  const ChildSide& Child() const override { return mChild; }
+
+  void AddObservers();
+  void RemoveObservers();
+  bool Matches(const nsACString& aRemoteType, ErrorResult& aRv);
+
+ private:
+  explicit JSProcessActorProtocol(const nsACString& aName)
+      : JSActorProtocol(aName) {}
+  ~JSProcessActorProtocol() = default;
+
+  bool mIncludeParent = false;
+
+  friend class JSActorProtocolUtils;
+
+  ParentSide mParent;
+  ChildSide mChild;
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_JSProcessActorProtocol_h

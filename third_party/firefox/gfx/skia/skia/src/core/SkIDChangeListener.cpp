@@ -1,0 +1,63 @@
+/*
+ * Copyright 2020 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "include/private/SkIDChangeListener.h"
+
+#include "include/private/base/SkAssert.h"
+
+#include <utility>
+
+SkIDChangeListener::SkIDChangeListener() : fShouldDeregister(false) {}
+
+SkIDChangeListener::~SkIDChangeListener() = default;
+
+using List = SkIDChangeListener::List;
+
+List::List() = default;
+
+List::~List() {
+    for (auto& listener : fListeners) {
+        if (!listener->shouldDeregister()) {
+            listener->changed();
+        }
+    }
+}
+
+void List::add(sk_sp<SkIDChangeListener> listener) {
+    if (!listener) {
+        return;
+    }
+    SkASSERT(!listener->shouldDeregister());
+
+    SkAutoMutexExclusive lock(fMutex);
+    for (int i = 0; i < fListeners.size(); ++i) {
+        if (fListeners[i]->shouldDeregister()) {
+            fListeners.removeShuffle(i--);  
+        }
+    }
+    fListeners.push_back(std::move(listener));
+}
+
+int List::count() const {
+    SkAutoMutexExclusive lock(fMutex);
+    return fListeners.size();
+}
+
+void List::changed() {
+    SkAutoMutexExclusive lock(fMutex);
+    for (auto& listener : fListeners) {
+        if (!listener->shouldDeregister()) {
+            listener->changed();
+        }
+    }
+    fListeners.clear();
+}
+
+void List::reset() {
+    SkAutoMutexExclusive lock(fMutex);
+    fListeners.clear();
+}

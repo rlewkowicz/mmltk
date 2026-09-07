@@ -1,0 +1,84 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_GFX_PRINTTARGET_H
+#define MOZILLA_GFX_PRINTTARGET_H
+
+#include "mozilla/RefPtr.h"
+#include "mozilla/gfx/2D.h"
+#include "nsISupportsImpl.h"
+#include "nsStringFwd.h"
+
+namespace mozilla {
+namespace gfx {
+
+class DrawEventRecorder;
+
+class PrintTarget {
+ public:
+  NS_INLINE_DECL_REFCOUNTING(PrintTarget);
+
+  virtual nsresult BeginPrinting(const nsAString& aTitle,
+                                 const nsAString& aPrintToFileName,
+                                 uint64_t aBrowsingContextId,
+                                 int32_t aStartPage, int32_t aEndPage) {
+    return NS_OK;
+  }
+  virtual nsresult EndPrinting() { return NS_OK; }
+  virtual nsresult AbortPrinting() {
+#ifdef DEBUG
+    mHasActivePage = false;
+#endif
+    return NS_OK;
+  }
+  virtual nsresult BeginPage(const IntSize& aSizeInPoints) {
+#ifdef DEBUG
+    MOZ_ASSERT(!mHasActivePage, "Missing EndPage() call");
+    mHasActivePage = true;
+#endif
+    return NS_OK;
+  }
+  virtual nsresult EndPage() {
+#ifdef DEBUG
+    mHasActivePage = false;
+#endif
+    return NS_OK;
+  }
+
+  virtual void Finish();
+
+  const IntSize& GetSize() const { return mSize; }
+
+  virtual already_AddRefed<DrawTarget> MakeDrawTarget(
+      const IntSize& aSize, DrawEventRecorder* aRecorder = nullptr);
+
+  virtual already_AddRefed<DrawTarget> GetReferenceDrawTarget();
+
+  static void AdjustPrintJobNameForIPP(const nsAString& aJobName,
+                                       nsCString& aAdjustedJobName);
+  static void AdjustPrintJobNameForIPP(const nsAString& aJobName,
+                                       nsString& aAdjustedJobName);
+
+ protected:
+  explicit PrintTarget(cairo_surface_t* aCairoSurface, const IntSize& aSize);
+
+  virtual ~PrintTarget();
+
+  static already_AddRefed<DrawTarget> CreateRecordingDrawTarget(
+      DrawEventRecorder* aRecorder, DrawTarget* aDrawTarget);
+
+  cairo_surface_t* mCairoSurface;
+  RefPtr<DrawTarget> mRefDT;  
+
+  IntSize mSize;
+  bool mIsFinished;
+#ifdef DEBUG
+  bool mHasActivePage;
+#endif
+};
+
+}  
+}  
+
+#endif /* MOZILLA_GFX_PRINTTARGET_H */

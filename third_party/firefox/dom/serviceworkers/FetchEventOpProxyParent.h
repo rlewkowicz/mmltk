@@ -1,0 +1,57 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_fetcheventopproxyparent_h_
+#define mozilla_dom_fetcheventopproxyparent_h_
+
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/PFetchEventOpProxyParent.h"
+#include "mozilla/dom/ServiceWorkerOpPromise.h"
+
+namespace mozilla::dom {
+
+class FetchEventOpParent;
+class PRemoteWorkerParent;
+class ParentToParentServiceWorkerFetchEventOpArgs;
+
+class FetchEventOpProxyParent final : public PFetchEventOpProxyParent {
+  friend class PFetchEventOpProxyParent;
+
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(FetchEventOpProxyParent, override);
+
+  static void Create(
+      PRemoteWorkerParent* aManager,
+      RefPtr<ServiceWorkerFetchEventOpPromise::Private>&& aPromise,
+      const ParentToParentServiceWorkerFetchEventOpArgs& aArgs,
+      RefPtr<FetchEventOpParent> aReal, nsCOMPtr<nsIInputStream> aBodyStream);
+
+ private:
+  FetchEventOpProxyParent(
+      RefPtr<FetchEventOpParent>&& aReal,
+      RefPtr<ServiceWorkerFetchEventOpPromise::Private>&& aPromise);
+
+  ~FetchEventOpProxyParent();
+
+  mozilla::ipc::IPCResult RecvAsyncLog(const nsCString& aScriptSpec,
+                                       const uint32_t& aLineNumber,
+                                       const uint32_t& aColumnNumber,
+                                       const nsCString& aMessageName,
+                                       nsTArray<nsString>&& aParams);
+
+  mozilla::ipc::IPCResult RecvRespondWith(
+      const ChildToParentFetchEventRespondWithResult& aResult);
+
+  mozilla::ipc::IPCResult Recv__delete__(
+      const ServiceWorkerFetchEventOpResult& aResult);
+
+  void ActorDestroy(ActorDestroyReason) override;
+
+  RefPtr<FetchEventOpParent> mReal;
+  RefPtr<ServiceWorkerFetchEventOpPromise::Private> mLifetimePromise;
+};
+
+}  
+
+#endif  // mozilla_dom_fetcheventopproxyparent_h_

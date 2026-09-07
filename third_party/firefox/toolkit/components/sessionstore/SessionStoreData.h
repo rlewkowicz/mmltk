@@ -1,0 +1,34 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_SessionStoreData_h
+#define mozilla_dom_SessionStoreData_h
+
+#include "nsString.h"
+#include "nsTArray.h"
+#include "mozilla/dom/SessionStoreUtilsBinding.h"
+#include "mozilla/Variant.h"
+
+typedef mozilla::Variant<nsString, bool,
+                         mozilla::dom::CollectedNonMultipleSelectValue,
+                         CopyableTArray<nsString>>
+    InputDataValue;
+
+struct CollectedInputDataValue {
+  nsString id;
+  nsString type;
+  InputDataValue value{false};
+
+  CollectedInputDataValue() = default;
+};
+
+struct InputFormData {
+  int32_t descendants;
+  nsString innerHTML;
+  nsCString url;
+  int32_t numId;
+  int32_t numXPath;
+};
+
+#endif /* mozilla_dom_SessionStoreData_h */

@@ -1,0 +1,18 @@
+
+[package]
+edition = "2018"
+name = "macro_rules_attribute-proc_macro"
+version = "0.2.2"
+authors = ["Daniel Henry-Mantilla <daniel.henry.mantilla@gmail.com>"]
+description = "Use declarative macros as proc_macro attributes or derives"
+license = "Apache-2.0 OR MIT OR Zlib"
+repository = "https://github.com/danielhenrymantilla/macro_rules_attribute-rs"
+
+[lib]
+path = "mod.rs"
+proc-macro = true
+
+[dependencies]
+
+[features]
+verbose-expansions = []

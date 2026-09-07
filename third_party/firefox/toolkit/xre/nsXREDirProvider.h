@@ -1,0 +1,139 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(_nsXREDirProvider_h_)
+#define _nsXREDirProvider_h_
+
+#include "nsIDirectoryService.h"
+#include "nsIProfileMigrator.h"
+#include "nsIFile.h"
+#include "nsIXREDirProvider.h"
+
+#include "nsCOMPtr.h"
+#include "nsCOMArray.h"
+#if defined(MOZ_BACKGROUNDTASKS)
+#  include "mozilla/BackgroundTasks.h"
+#endif
+
+#define NS_XREDIRPROVIDER_CID \
+  {0x5573967d, 0xf6cf, 0x4c63, {0x8e, 0x0e, 0x9a, 0xc0, 0x6e, 0x04, 0xd6, 0x2b}}
+#define NS_XREDIRPROVIDER_CONTRACTID "@mozilla.org/xre/directory-provider;1"
+
+class nsXREDirProvider final : public nsIDirectoryServiceProvider2,
+                               public nsIXREDirProvider,
+                               public nsIProfileStartup {
+ public:
+  NS_IMETHOD QueryInterface(REFNSIID aIID, void** aInstancePtr) override;
+  NS_IMETHOD_(MozExternalRefCountType) AddRef(void) override;
+  NS_IMETHOD_(MozExternalRefCountType) Release(void) override;
+
+  NS_DECL_NSIDIRECTORYSERVICEPROVIDER
+  NS_DECL_NSIDIRECTORYSERVICEPROVIDER2
+  NS_DECL_NSIXREDIRPROVIDER
+  NS_DECL_NSIPROFILESTARTUP
+
+  nsXREDirProvider();
+
+  nsresult Initialize(nsIFile* aXULAppDir, nsIFile* aGREDir);
+  ~nsXREDirProvider();
+
+  static already_AddRefed<nsXREDirProvider> GetSingleton();
+
+  nsresult GetUserProfilesRootDir(nsIFile** aResult);
+  nsresult GetUserProfilesLocalDir(nsIFile** aResult);
+#if defined(MOZ_BACKGROUNDTASKS)
+  nsresult GetBackgroundTasksProfilesRootDir(nsIFile** aResult);
+#endif
+
+  nsresult GetLegacyInstallHash(nsAString& aPathHash);
+
+  nsresult SetProfile(nsIFile* aProfileDir, nsIFile* aProfileLocalDir);
+
+  void InitializeUserPrefs();
+  void FinishInitializingUserPrefs();
+
+  void DoShutdown();
+
+  static nsresult GetUserAppDataDirectory(nsIFile** aFile) {
+    return GetUserDataDirectory(aFile, false);
+  }
+  static nsresult GetUserLocalDataDirectory(nsIFile** aFile) {
+    return GetUserDataDirectory(aFile, true);
+  }
+
+  static nsresult GetUserDataDirectory(nsIFile** aFile, bool aLocal);
+
+#if defined(MOZ_WIDGET_GTK)
+  static nsresult GetLegacyOrXDGEnvValue(const char* aHomeDir,
+                                         const char* aEnvName,
+                                         nsCString aSubdir, nsIFile** aFile,
+                                         bool* aWasFromEnv);
+  static nsresult GetLegacyOrXDGCachePath(const char* aHomeDir,
+                                          nsIFile** aFile);
+  static nsresult GetLegacyOrXDGHomePath(const char* aHomeDir, nsIFile** aFile,
+                                         bool aForceLegacy = false);
+  static nsresult AppendFromAppData(nsIFile* aFile, bool aIsDotted);
+
+  static bool IsForceLegacyHome();
+
+  static bool LegacyHomeExists(nsIFile** aFile);
+
+  static nsresult GetLegacyOrXDGConfigHome(const char* aHomeDir,
+                                           nsIFile** aFile);
+
+#endif
+
+  nsIFile* GetGREDir() { return mGREDir; }
+  nsIFile* GetGREBinDir() { return mGREBinDir; }
+  nsIFile* GetAppDir() {
+    if (mXULAppDir) return mXULAppDir;
+    return mGREDir;
+  }
+
+  nsresult GetUpdateRootDir(nsIFile** aResult, bool aGetOldLocation = false);
+
+  nsresult GetProfileStartupDir(nsIFile** aResult);
+
+  nsresult GetProfileDir(nsIFile** aResult);
+
+  static nsresult ClearUserDataProfileDirectoryFromGTest(nsIFile** aLocal,
+                                                         nsIFile** aGlobal);
+
+  static nsresult RestoreUserDataProfileDirectoryFromGTest(
+      nsCOMPtr<nsIFile>& aLocal, nsCOMPtr<nsIFile>& aGlobal);
+
+ private:
+  nsresult GetFilesInternal(const char* aProperty,
+                            nsISimpleEnumerator** aResult);
+
+  static nsresult GetUserDataDirectoryHome(nsIFile** aFile, bool aLocal,
+                                           bool aForceLegacy = false);
+  static nsresult GetNativeUserManifestsDirectory(nsIFile** aFile);
+  static nsresult GetSysUserExtensionsDirectory(nsIFile** aFile);
+#if defined(XP_UNIX) || 0
+  static nsresult GetSystemExtensionsDirectory(nsIFile** aFile);
+#endif
+  static nsresult EnsureDirectoryExists(nsIFile* aDirectory);
+
+  static nsresult AppendProfilePath(nsIFile* aFile, bool aLocal);
+
+  static nsresult AppendSysUserExtensionPath(nsIFile* aFile);
+
+  static inline nsresult AppendProfileString(nsIFile* aFile, const char* aPath);
+
+  static nsresult SetUserDataProfileDirectory(nsCOMPtr<nsIFile>& aFile,
+                                              bool aLocal);
+
+  void Append(nsIFile* aDirectory);
+
+  nsCOMPtr<nsIFile> mGREDir;
+  nsCOMPtr<nsIFile> mGREBinDir;
+  nsCOMPtr<nsIFile> mXULAppDir;
+  nsCOMPtr<nsIFile> mProfileDir;
+  nsCOMPtr<nsIFile> mProfileLocalDir;
+  bool mAppStarted = false;
+  bool mPrefsInitialized = false;
+};
+
+#endif

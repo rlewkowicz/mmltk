@@ -1,0 +1,223 @@
+/*
+ * Copyright 2021 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "src/sksl/ir/SkSLForStatement.h"
+
+#include "include/core/SkTypes.h"
+#include "src/sksl/SkSLAnalysis.h"
+#include "src/sksl/SkSLBuiltinTypes.h"
+#include "src/sksl/SkSLContext.h"
+#include "src/sksl/SkSLDefines.h"
+#include "src/sksl/SkSLErrorReporter.h"
+#include "src/sksl/SkSLProgramSettings.h"
+#include "src/sksl/analysis/SkSLProgramVisitor.h"
+#include "src/sksl/ir/SkSLBlock.h"
+#include "src/sksl/ir/SkSLExpressionStatement.h"
+#include "src/sksl/ir/SkSLNop.h"
+#include "src/sksl/ir/SkSLType.h"
+#include "src/sksl/ir/SkSLVarDeclarations.h"
+#include "src/sksl/ir/SkSLVariable.h"
+
+namespace SkSL {
+
+static bool is_vardecl_block_initializer(const Statement* stmt) {
+    if (!stmt) {
+        return false;
+    }
+    if (!stmt->is<SkSL::Block>()) {
+        return false;
+    }
+    const SkSL::Block& b = stmt->as<SkSL::Block>();
+    if (b.isScope()) {
+        return false;
+    }
+    for (const auto& child : b.children()) {
+        if (!child->is<SkSL::VarDeclaration>()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool is_simple_initializer(const Statement* stmt) {
+    return !stmt || stmt->isEmpty() || stmt->is<SkSL::VarDeclaration>() ||
+           stmt->is<SkSL::ExpressionStatement>();
+}
+
+std::string ForStatement::description() const {
+    std::string result("for (");
+    if (this->initializer()) {
+        result += this->initializer()->description();
+    } else {
+        result += ";";
+    }
+    result += " ";
+    if (this->test()) {
+        result += this->test()->description();
+    }
+    result += "; ";
+    if (this->next()) {
+        result += this->next()->description();
+    }
+    result += ") " + this->statement()->description();
+    return result;
+}
+
+static void hoist_vardecl_symbols_into_outer_scope(const Context& context,
+                                                   const Block& initBlock,
+                                                   SymbolTable* innerSymbols,
+                                                   SymbolTable* hoistedSymbols) {
+    class SymbolHoister : public ProgramVisitor {
+    public:
+        SymbolHoister(const Context& ctx, SymbolTable* innerSym, SymbolTable* hoistSym)
+                : fContext(ctx)
+                , fInnerSymbols(innerSym)
+                , fHoistedSymbols(hoistSym) {}
+
+        bool visitStatement(const Statement& stmt) override {
+            if (stmt.is<VarDeclaration>()) {
+                Variable* var = stmt.as<VarDeclaration>().var();
+                fInnerSymbols->moveSymbolTo(fHoistedSymbols, var, fContext);
+                return false;
+            }
+            return ProgramVisitor::visitStatement(stmt);
+        }
+
+        const Context& fContext;
+        SymbolTable* fInnerSymbols;
+        SymbolTable* fHoistedSymbols;
+    };
+
+    SymbolHoister{context, innerSymbols, hoistedSymbols}.visitStatement(initBlock);
+}
+
+std::unique_ptr<Statement> ForStatement::Convert(const Context& context,
+                                                 Position pos,
+                                                 ForLoopPositions positions,
+                                                 std::unique_ptr<Statement> initializer,
+                                                 std::unique_ptr<Expression> test,
+                                                 std::unique_ptr<Expression> next,
+                                                 std::unique_ptr<Statement> statement,
+                                                 std::unique_ptr<SymbolTable> symbolTable) {
+    bool isSimpleInitializer = is_simple_initializer(initializer.get());
+    bool isVardeclBlockInitializer = !isSimpleInitializer &&
+                                     is_vardecl_block_initializer(initializer.get());
+
+    if (!isSimpleInitializer && !isVardeclBlockInitializer) {
+        context.fErrors->error(initializer->fPosition, "invalid for loop initializer");
+        return nullptr;
+    }
+
+    if (test) {
+        test = context.fTypes.fBool->coerceExpression(std::move(test), context);
+        if (!test) {
+            return nullptr;
+        }
+    }
+
+    if (next && next->isIncomplete(context)) {
+        return nullptr;
+    }
+
+    std::unique_ptr<LoopUnrollInfo> unrollInfo;
+    if (context.fConfig->strictES2Mode()) {
+        unrollInfo = Analysis::GetLoopUnrollInfo(context, pos, positions, initializer.get(), &test,
+                                                 next.get(), statement.get(), context.fErrors);
+        if (!unrollInfo) {
+            return nullptr;
+        }
+    } else {
+        unrollInfo = Analysis::GetLoopUnrollInfo(context, pos, positions, initializer.get(), &test,
+                                                 next.get(), statement.get(), nullptr);
+    }
+
+    if (Analysis::DetectVarDeclarationWithoutScope(*statement, context.fErrors)) {
+        return nullptr;
+    }
+
+    if (isVardeclBlockInitializer) {
+        std::unique_ptr<SymbolTable> hoistedSymbols = symbolTable->insertNewParent();
+        hoist_vardecl_symbols_into_outer_scope(context, initializer->as<Block>(),
+                                               symbolTable.get(), hoistedSymbols.get());
+        StatementArray scope;
+        scope.push_back(std::move(initializer));
+        scope.push_back(ForStatement::Make(context,
+                                           pos,
+                                           positions,
+                                           nullptr,
+                                           std::move(test),
+                                           std::move(next),
+                                           std::move(statement),
+                                           std::move(unrollInfo),
+                                           std::move(symbolTable)));
+        return Block::Make(pos,
+                           std::move(scope),
+                           Block::Kind::kBracedScope,
+                           std::move(hoistedSymbols));
+    }
+
+    return ForStatement::Make(context,
+                              pos,
+                              positions,
+                              std::move(initializer),
+                              std::move(test),
+                              std::move(next),
+                              std::move(statement),
+                              std::move(unrollInfo),
+                              std::move(symbolTable));
+}
+
+std::unique_ptr<Statement> ForStatement::ConvertWhile(const Context& context,
+                                                      Position pos,
+                                                      std::unique_ptr<Expression> test,
+                                                      std::unique_ptr<Statement> statement) {
+    if (context.fConfig->strictES2Mode()) {
+        context.fErrors->error(pos, "while loops are not supported");
+        return nullptr;
+    }
+    return ForStatement::Convert(context,
+                                 pos,
+                                 ForLoopPositions(),
+                                 nullptr,
+                                 std::move(test),
+                                 nullptr,
+                                 std::move(statement),
+                                 nullptr);
+}
+
+std::unique_ptr<Statement> ForStatement::Make(const Context& context,
+                                              Position pos,
+                                              ForLoopPositions positions,
+                                              std::unique_ptr<Statement> initializer,
+                                              std::unique_ptr<Expression> test,
+                                              std::unique_ptr<Expression> next,
+                                              std::unique_ptr<Statement> statement,
+                                              std::unique_ptr<LoopUnrollInfo> unrollInfo,
+                                              std::unique_ptr<SymbolTable> symbolTable) {
+    SkASSERT(is_simple_initializer(initializer.get()) ||
+             is_vardecl_block_initializer(initializer.get()));
+    SkASSERT(!test || test->type().matches(*context.fTypes.fBool));
+    SkASSERT(!Analysis::DetectVarDeclarationWithoutScope(*statement));
+    SkASSERT(unrollInfo || !context.fConfig->strictES2Mode());
+
+    if (unrollInfo) {
+        if (unrollInfo->fCount <= 0 || statement->isEmpty()) {
+            return Nop::Make();
+        }
+    }
+
+    return std::make_unique<ForStatement>(pos,
+                                          positions,
+                                          std::move(initializer),
+                                          std::move(test),
+                                          std::move(next),
+                                          std::move(statement),
+                                          std::move(unrollInfo),
+                                          std::move(symbolTable));
+}
+
+}  

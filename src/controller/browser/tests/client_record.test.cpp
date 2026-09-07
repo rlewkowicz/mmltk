@@ -1,0 +1,515 @@
+#include "src/controller/browser/client_record.h"
+#include "src/controller/browser/application_materializer.h"
+#include "src/controller/browser/application_schema.h"
+#include "src/controller/contracts/gui_settings_mutation.h"
+#include "src/controller/contracts/model_selection.h"
+#include "src/controller/services/file_dialog_catalog.h"
+#include "src/controller/services/file_dialog_system.h"
+#include "src/controller/services/settings_system.h"
+#include "src/controller/subsystems/annotation/annotation_system.h"
+#include "src/controller/subsystems/explore/explore_system.h"
+
+#include <catch2/catch_test_macros.hpp>
+
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <fstream>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <variant>
+#include <vector>
+
+namespace mmltk::controller::browser {
+namespace {
+
+struct ClientFixture final {
+    std::string kind;
+    wire::ByteBuffer bytes;
+};
+
+class FixtureFileDialogSystem final {
+   public:
+    using event_type = std::variant<mmltk::controller::FileDialogFailed>;
+    [[= mmltk::controller::contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::controller::FileDialogSnapshot Open(
+        mmltk::controller::services::FileDialogOpen request) {
+        const auto dialog = mmltk::controller::services::file_dialog_catalog().resolve(request);
+        if (!dialog) throw mmltk::controller::contracts::InvalidIntentError("unknown fixture file dialog");
+        opened = request;
+        return {
+            .generation = 1U,
+            .active = true,
+            .target = request.target,
+        };
+    }
+    [[= mmltk::controller::contracts::reflection::Snapshot{8192U}]] [[nodiscard]] mmltk::controller::FileDialogSnapshot snapshot() const {
+        return {};
+    }
+    mmltk::controller::services::FileDialogOpen opened{};
+};
+
+class FixtureSettingsSystem final {
+   public:
+    using event_type = std::variant<mmltk::controller::SettingsChanged>;
+    [[= mmltk::controller::contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::controller::contracts::SettingsUiState
+        Update(mmltk::controller::contracts::SettingsUpdateRequest request) {
+        state = mmltk::controller::contracts::default_gui_settings_state();
+        const auto applied = mmltk::controller::contracts::apply_gui_settings_values(
+            state, std::span<const mmltk::controller::contracts::SettingsValueUpdate>{request.updates});
+        if (!applied) throw mmltk::controller::contracts::InvalidIntentError("invalid fixture settings update");
+        latest = std::move(request);
+        return snapshot();
+    }
+    [[= mmltk::controller::contracts::reflection::Snapshot{mmltk::controller::contracts::kSettingsUiStateByteBudget}]]
+        [[nodiscard]] mmltk::controller::contracts::SettingsUiState snapshot() const {
+        return {.revision = 1U, .settings_state = state};
+    }
+    mmltk::controller::contracts::GuiSettingsState state{};
+    mmltk::controller::contracts::SettingsUpdateRequest latest{};
+};
+
+class FixtureExploreSystem final {
+   public:
+    using event_type = std::variant<mmltk::controller::ExploreChanged>;
+    [[= mmltk::controller::contracts::reflection::direct::InteractionEndpoint{}]] void UpdateViewport(
+        mmltk::controller::ExploreViewportUpdate request) {
+        latest = request.viewport;
+    }
+    [[= mmltk::controller::contracts::reflection::Snapshot{64U *
+                                                           1024U}]] [[nodiscard]] mmltk::controller::ExploreSnapshot snapshot() const {
+        return {.viewport = latest};
+    }
+    mmltk::controller::ExploreViewport latest{};
+};
+
+class FixtureAnnotationSystem final {
+   public:
+    using event_type = std::variant<mmltk::controller::AnnotationChanged>;
+    [[= mmltk::controller::contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::controller::AnnotationSnapshot Edit(
+        mmltk::controller::AnnotationEditRequest request) {
+        if (const auto* category = std::get_if<mmltk::controller::AnnotationCategoryEdit>(&request.edit.value);
+            category != nullptr && !category->category.valid())
+            throw mmltk::controller::contracts::InvalidIntentError("invalid fixture annotation category");
+        alternatives.push_back(request.edit.value.index());
+        return {};
+    }
+    [[= mmltk::controller::contracts::reflection::Snapshot{256U *
+                                                           1024U}]] [[nodiscard]] mmltk::controller::AnnotationSnapshot snapshot() const {
+        return {};
+    }
+    std::vector<std::size_t> alternatives;
+};
+
+struct FixtureApplicationSystems final {
+    FixtureSettingsSystem* settings = nullptr;
+    FixtureFileDialogSystem* file_dialog = nullptr;
+    FixtureExploreSystem* explore = nullptr;
+    FixtureAnnotationSystem* annotation = nullptr;
+};
+
+[[nodiscard]] std::vector<ClientFixture> protocol_client_fixtures() {
+    std::ifstream input(MMLTK_PROTOCOL_V13_CLIENT_FIXTURE_PATH);
+    REQUIRE(input.good());
+    const auto nibble = [](const char value) -> unsigned char {
+        if (value >= '0' && value <= '9') return static_cast<unsigned char>(value - '0');
+        if (value >= 'a' && value <= 'f') return static_cast<unsigned char>(value - 'a' + 10);
+        throw std::invalid_argument("invalid protocol fixture hex");
+    };
+    std::vector<ClientFixture> fixtures;
+    for (std::string kind, hex; input >> kind >> hex;) {
+        REQUIRE(hex.size() % 2U == 0U);
+        wire::ByteBuffer bytes;
+        bytes.reserve(hex.size() / 2U);
+        for (std::size_t index = 0U; index < hex.size(); index += 2U)
+            bytes.push_back(static_cast<std::byte>((nibble(hex[index]) << 4U) | nibble(hex[index + 1U])));
+        fixtures.push_back({.kind = std::move(kind), .bytes = std::move(bytes)});
+    }
+    return fixtures;
+}
+
+[[nodiscard]] const ClientFixture& fixture_named(const std::vector<ClientFixture>& fixtures, const std::string_view name) {
+    const auto found = std::ranges::find(fixtures, name, &ClientFixture::kind);
+    REQUIRE(found != fixtures.end());
+    return *found;
+}
+
+[[nodiscard]] Intent decode_intent_fixture(const ClientFixture& fixture) {
+    const auto record = decode_client_record(wire::ByteSegments{.first = fixture.bytes, .second = {}});
+    REQUIRE(record);
+    REQUIRE(std::holds_alternative<Intent>(*record));
+    Intent intent = std::get<Intent>(std::move(*record));
+    CHECK(intent.protocol_version == kBrowserProtocolVersion);
+    return intent;
+}
+
+template <class Exception>
+[[nodiscard]] ApplicationErrorRecord map_exception(Exception exception) {
+    try {
+        throw std::move(exception);
+    } catch (...) { return map_current_exception(); }
+}
+
+TEST_CASE("browser client records are one complete canonical CBOR item", "[controller][browser][protocol]") {
+    const ClientRecord source = Intent{
+        .correlation = 7U,
+        .endpoint_id = 11U,
+        .fields = {{.field_id = 13U, .value = wire::Value(std::uint64_t{17U})}},
+    };
+    wire::ByteBuffer encoded;
+    REQUIRE(encode_client_record(source, encoded));
+    const auto decoded = decode_client_record(wire::ByteSegments{.first = encoded, .second = {}});
+    REQUIRE(decoded);
+    CHECK(*decoded == source);
+
+    encoded.push_back(std::byte{0xf6});
+    CHECK_FALSE(decode_client_record(wire::ByteSegments{.first = encoded, .second = {}}));
+}
+
+TEST_CASE("Rust Protocol-13 client fixtures are accepted by native codec", "[controller][browser][protocol][interop]") {
+    STATIC_REQUIRE(kBrowserProtocolVersion == 13U);
+    const auto fixtures = protocol_client_fixtures();
+    constexpr auto annotation_alternatives = std::variant_size_v<decltype(AnnotationEdit::value)>;
+    REQUIRE(fixtures.size() == 5U + annotation_alternatives);
+    const auto& dialog_fixture = fixture_named(fixtures, "Intent:file_dialog.Open");
+    const auto& model_dialog_fixture = fixture_named(fixtures, "Intent:file_dialog.Open.model_artifact");
+    const auto& settings_fixture = fixture_named(fixtures, "Intent:settings.Update");
+    const auto& interaction_fixture = fixture_named(fixtures, "Interaction:explore.UpdateViewport");
+    const auto& observation_fixture = fixture_named(fixtures, "RendererObservation");
+
+    const Intent intent = decode_intent_fixture(dialog_fixture);
+    CHECK(intent.correlation == 17U);
+    CHECK(intent.endpoint_id == application_stable_id("file_dialog", "Open"));
+    REQUIRE(intent.fields.size() == 1U);
+    FixtureFileDialogSystem file_dialog;
+    FixtureSettingsSystem settings;
+    FixtureExploreSystem explore;
+    FixtureAnnotationSystem annotation;
+    FixtureApplicationSystems systems{
+        .settings = &settings,
+        .file_dialog = &file_dialog,
+        .explore = &explore,
+        .annotation = &annotation,
+    };
+    const auto reply = dispatch_intent(systems, intent);
+    CHECK(reply.result.has_value());
+    CHECK_FALSE(reply.error.has_value());
+    REQUIRE(mmltk::controller::services::file_dialog_stable_id(file_dialog.opened.target) != 0U);
+    CHECK(std::holds_alternative<mmltk::controller::services::SettingsFieldTarget>(file_dialog.opened.target.value));
+    REQUIRE(mmltk::controller::services::file_dialog_catalog().resolve(file_dialog.opened));
+
+    const Intent model_intent = decode_intent_fixture(model_dialog_fixture);
+    CHECK(model_intent.correlation == 23U);
+    CHECK(model_intent.endpoint_id == application_stable_id("file_dialog", "Open"));
+    REQUIRE(model_intent.fields.size() == 1U);
+    const auto model_reply = dispatch_intent(systems, model_intent);
+    REQUIRE(model_reply.result.has_value());
+    CHECK_FALSE(model_reply.error.has_value());
+    REQUIRE(std::holds_alternative<mmltk::controller::services::ModelArtifactTarget>(file_dialog.opened.target.value));
+    const auto& model_target = std::get<mmltk::controller::services::ModelArtifactTarget>(file_dialog.opened.target.value);
+    const auto& expected_model = mmltk::controller::contracts::kModelSelectionCompatibility.front();
+    CHECK(model_target.stable_id == application_settings_field_stable_id(expected_model.artifact_field_path));
+    CHECK(model_target.workflow == expected_model.workflow);
+    CHECK(model_target.input == expected_model.input);
+    REQUIRE(mmltk::controller::services::file_dialog_catalog().resolve(file_dialog.opened));
+
+    const Intent settings_intent = decode_intent_fixture(settings_fixture);
+    CHECK(settings_intent.correlation == 19U);
+    CHECK(settings_intent.endpoint_id == application_stable_id("settings", "Update"));
+    const auto settings_reply = dispatch_intent(systems, settings_intent);
+    REQUIRE(settings_reply.result.has_value());
+    CHECK_FALSE(settings_reply.error.has_value());
+    REQUIRE(settings.latest.updates.size() == 1U);
+    // CLEANUP-IGNORE: Settings and file-dialog fixtures prove separate generated endpoints and native dispatch paths.
+    CHECK(mmltk::controller::contracts::gui_settings_valid(settings.state));
+
+    const auto interaction_record = decode_client_record(wire::ByteSegments{.first = interaction_fixture.bytes, .second = {}});
+    REQUIRE(interaction_record);
+    REQUIRE(std::holds_alternative<Interaction>(*interaction_record));
+    const Interaction& interaction = std::get<Interaction>(*interaction_record);
+    CHECK(interaction.endpoint_id == application_stable_id("explore", "UpdateViewport"));
+    ExploreViewportUpdate decoded_interaction{};
+    REQUIRE(mmltk::frameworks::serialization::decode_into(decoded_interaction, interaction.value));
+    CHECK(decoded_interaction.viewport.first_row == 0U);
+    CHECK(decoded_interaction.viewport.row_count == 1U);
+    CHECK(decoded_interaction.viewport.columns == 1U);
+    CHECK_FALSE(decoded_interaction.focused_compiled_index);
+    const auto accepted_interaction = dispatch_interaction(systems, interaction);
+    CHECK(accepted_interaction.disposition == InteractionDispatchDisposition::Accepted);
+    CHECK_FALSE(accepted_interaction.error.has_value());
+    CHECK(explore.latest.extent.width == 0U);
+    CHECK(explore.latest.extent.height == 0U);
+
+    const auto malformed_interaction = dispatch_interaction(systems, Interaction{.endpoint_id = interaction.endpoint_id,
+                                                                                 .value = wire::Value(wire::Value::Object{
+                                                                                     {"viewport", wire::Value(std::string{"invalid"})},
+                                                                                 })});
+    CHECK(malformed_interaction.disposition == InteractionDispatchDisposition::ProtocolInvalid);
+
+    systems.explore = nullptr;
+    const auto unavailable_interaction = dispatch_interaction(systems, interaction);
+    CHECK(unavailable_interaction.disposition == InteractionDispatchDisposition::ApplicationRejected);
+    REQUIRE(unavailable_interaction.error.has_value());
+    CHECK(unavailable_interaction.error->category == mmltk::controller::contracts::ApplicationErrorCategory::Unavailable);
+    systems.explore = &explore;
+
+    for (std::size_t alternative = 0U; alternative != annotation_alternatives; ++alternative) {
+        const std::string name = "Intent:annotation.Edit." + std::to_string(alternative);
+        const auto& fixture = fixture_named(fixtures, name);
+        const auto record = decode_client_record(wire::ByteSegments{.first = fixture.bytes, .second = {}});
+        REQUIRE(record);
+        REQUIRE(std::holds_alternative<Intent>(*record));
+        const auto& edit = std::get<Intent>(*record);
+        CHECK(edit.correlation == 100U + alternative);
+        CHECK(edit.endpoint_id == application_stable_id("annotation", "Edit"));
+        const auto edit_reply = dispatch_intent(systems, edit);
+        REQUIRE(edit_reply.result.has_value());
+        CHECK_FALSE(edit_reply.error.has_value());
+    }
+    REQUIRE(annotation.alternatives.size() == annotation_alternatives);
+    for (std::size_t alternative = 0U; alternative != annotation.alternatives.size(); ++alternative)
+        // CLEANUP-IGNORE: Exhaustive annotation alternatives and renderer observations are independent protocol
+        // evidence.
+        CHECK(annotation.alternatives[alternative] == alternative);
+
+    const auto observation_record = decode_client_record(wire::ByteSegments{.first = observation_fixture.bytes, .second = {}});
+    REQUIRE(observation_record);
+    REQUIRE(std::holds_alternative<RendererObservation>(*observation_record));
+    const RendererObservation& observation = std::get<RendererObservation>(*observation_record);
+    CHECK(observation.kind == RendererObservationKind::Surface);
+    CHECK(observation.width == 640U);
+    CHECK(observation.height == 480U);
+    CHECK(observation.scale == 1.5);
+    CHECK(observation.sample_revision == 0U);
+}
+
+TEST_CASE("browser server records preserve reply and event error vocabulary", "[controller][browser][protocol]") {
+    const ServerRecord failed = IntentReply{
+        .correlation = 23U,
+        .result = {},
+        .error =
+            ApplicationErrorRecord{
+                .category = mmltk::controller::contracts::ApplicationErrorCategory::Busy,
+                .detail = "operation already active",
+            },
+    };
+    wire::ByteBuffer encoded;
+    REQUIRE(encode_server_record(failed, encoded));
+    const auto decoded = decode_server_record(wire::ByteSegments{.first = encoded, .second = {}});
+    REQUIRE(decoded);
+    CHECK(*decoded == failed);
+
+    for (const auto delivery : {mmltk::controller::contracts::reflection::EventDelivery::Transient,
+                                mmltk::controller::contracts::reflection::EventDelivery::Critical,
+                                mmltk::controller::contracts::reflection::EventDelivery::LatestState}) {
+        const ServerRecord event = SystemEvent{
+            .system_id = 29U,
+            .event_id = 31U,
+            .delivery = delivery,
+            .state_revision = 3U,
+            .value = wire::Value(wire::Value::Object{{"progress", wire::Value(std::uint64_t{3U})}}),
+        };
+        REQUIRE(encode_server_record(event, encoded));
+        const auto roundtrip = decode_server_record(wire::ByteSegments{.first = encoded, .second = {}});
+        REQUIRE(roundtrip);
+        CHECK(*roundtrip == event);
+    }
+}
+
+TEST_CASE("output records admit bounded scene collections and complete bootstrap payloads", "[controller][browser][protocol][limits]") {
+    namespace cbor = mmltk::frameworks::serialization;
+    wire::ByteBuffer encoded;
+    wire::Value::Array objects(4096U, wire::Value(std::uint64_t{1U}));
+    const ServerRecord event = SystemEvent{.system_id = 1U,
+                                           .event_id = 2U,
+                                           .delivery = mmltk::controller::contracts::reflection::EventDelivery::LatestState,
+                                           .state_revision = 1U,
+                                           .value = wire::Value(std::move(objects))};
+    REQUIRE(encode_server_record(event, encoded));
+    const auto event_payload_bytes =
+        cbor::measure(std::get<SystemEvent>(event).value,
+                      {.max_bytes = kMaxOutputValueBytes, .max_items = kMaxOutputValueItems, .max_depth = kMaxIntentValueDepth});
+    REQUIRE(event_payload_bytes);
+    CHECK(encoded.size() <= cbor::reflected_structural_cbor_bytes<std::variant<SystemEvent>>(*event_payload_bytes));
+    const auto decoded = decode_server_record(wire::ByteSegments{.first = encoded, .second = {}});
+    REQUIRE(decoded);
+    CHECK(*decoded == event);
+    const wire::Value payload(std::string(kMaxOutputValueBytes, 'x'));
+    const ServerRecord bootstrap = Bootstrap{.schema_fingerprint = {11U, 13U},
+                                             .snapshots = {{.system_id = 1U, .value = payload}, {.system_id = 2U, .value = payload}}};
+    REQUIRE(encode_server_record(bootstrap, encoded));
+    CHECK(encoded.size() > kMaxOutputValueBytes * 2U);
+    CHECK(encoded.size() <= kMaxRecordWireBytes);
+    const auto snapshot_bytes =
+        cbor::measure(payload, {.max_bytes = kMaxRecordWireBytes, .max_items = kMaxOutputValueItems, .max_depth = kMaxIntentValueDepth});
+    REQUIRE(snapshot_bytes);
+    CHECK(encoded.size() <= cbor::reflected_structural_cbor_bytes<std::variant<Bootstrap>>(2U * *snapshot_bytes));
+    REQUIRE(decode_server_record(wire::ByteSegments{.first = encoded, .second = {}}));
+    const ServerRecord oversized =
+        SystemEvent{.system_id = 1U, .event_id = 2U, .value = wire::Value(std::string(kMaxOutputValueBytes + 1U, 'x'))};
+    CHECK_FALSE(encode_server_record(oversized, encoded));
+    const ClientRecord oversized_input = Interaction{.endpoint_id = 2U, .value = std::get<SystemEvent>(event).value};
+    CHECK_FALSE(encode_client_record(oversized_input, encoded));
+}
+
+TEST_CASE("materialized Annotation categories retain native fixed text validation") {
+    FixtureAnnotationSystem annotation;
+    FixtureApplicationSystems systems{.annotation = &annotation};
+    const auto intent = [](mmltk::controller::contracts::AnnotationText category) {
+        const mmltk::controller::AnnotationEditRequest request{
+            .edit = {.value = mmltk::controller::AnnotationCategoryEdit{std::move(category)}},
+        };
+        auto encoded = mmltk::frameworks::serialization::reflected_value(request);
+        REQUIRE(encoded);
+        auto object = std::get<wire::Value::Object>(std::move(encoded->storage));
+        REQUIRE(object.size() == 1U);
+        return Intent{
+            .correlation = 1U,
+            .endpoint_id = application_stable_id("annotation", "Edit"),
+            .fields = {{
+                .field_id = application_field_stable_id(application_stable_id("annotation", "Edit"), "edit"),
+                .value = std::move(object.front().second),
+            }},
+        };
+    };
+    const auto rejected = [&systems, &intent](mmltk::controller::contracts::AnnotationText category) {
+        const auto reply = dispatch_intent(systems, intent(std::move(category)));
+        REQUIRE(reply.error);
+        CHECK(reply.error->category == mmltk::controller::contracts::ApplicationErrorCategory::InvalidIntent);
+    };
+
+    rejected({});
+    auto over_capacity = mmltk::controller::contracts::AnnotationText::From("x");
+    over_capacity.size = static_cast<std::uint8_t>(over_capacity.bytes.size() + 1U);
+    rejected(over_capacity);
+    auto control = mmltk::controller::contracts::AnnotationText{};
+    control.bytes[0] = '\n';
+    control.size = 1U;
+    rejected(control);
+    auto nonzero_tail = mmltk::controller::contracts::AnnotationText::From("x");
+    nonzero_tail.bytes[1] = 'y';
+    rejected(nonzero_tail);
+
+    const auto accepted = dispatch_intent(systems, intent(mmltk::controller::contracts::AnnotationText::From("category")));
+    CHECK_FALSE(accepted.error);
+    REQUIRE(accepted.result);
+}
+
+TEST_CASE("Bootstrap uses the compact protocol-13 fingerprint and bounded snapshots", "[controller][browser][protocol][limits]") {
+    STATIC_REQUIRE(kMaxRecordWireBytes >=
+                   mmltk::frameworks::serialization::reflected_structural_cbor_bytes<std::variant<SystemEvent>>(kMaxOutputValueBytes));
+    STATIC_REQUIRE(mmltk::frameworks::serialization::reflected_cbor_member_count<SystemEvent>() == 6U);
+    STATIC_REQUIRE(mmltk::frameworks::serialization::reflected_structural_cbor_bytes<std::variant<Bootstrap>>() == 933U);
+    STATIC_REQUIRE(kMaxOutputValueBytes == 8388608U);
+    STATIC_REQUIRE(kMaxRecordWireBytes == 33554432U);
+    STATIC_REQUIRE(kMaxIntentValueBytes == 65536U);
+    STATIC_REQUIRE(kMaxIntentValueItems == 1024U);
+    STATIC_REQUIRE(kMaxIntentValueDepth == 64U);
+    STATIC_REQUIRE(kMaxSnapshotCount == 32U);
+    STATIC_REQUIRE(kMaxIntentFields == 64U);
+    STATIC_REQUIRE(kMaxErrorDetailBytes == 512U);
+
+    const ServerRecord bootstrap = Bootstrap{
+        .schema_fingerprint = {11U, 13U},
+        .snapshots = {},
+    };
+    wire::ByteBuffer encoded;
+    REQUIRE(encode_server_record(bootstrap, encoded));
+    REQUIRE(decode_server_record(wire::ByteSegments{.first = encoded, .second = {}}));
+
+    std::vector<SystemSnapshot> too_many_snapshots;
+    too_many_snapshots.reserve(kMaxSnapshotCount + 1U);
+    for (std::size_t index = 0U; index <= kMaxSnapshotCount; ++index)
+        too_many_snapshots.push_back({.system_id = index + 1U, .value = wire::Value{}});
+    CHECK_FALSE(encode_server_record(ServerRecord{Bootstrap{.snapshots = std::move(too_many_snapshots)}}, encoded));
+
+    CHECK_FALSE(encode_server_record(ServerRecord{Bootstrap{
+                                         .snapshots = {{
+                                             .system_id = 1U,
+                                             .value = wire::Value(std::string(kMaxIntentValueBytes + 1U, 'x')),
+                                         }},
+                                     }},
+                                     encoded));
+
+    REQUIRE(encode_server_record(bootstrap, encoded));
+    encoded.push_back(std::byte{0xf6});
+    CHECK_FALSE(decode_server_record(wire::ByteSegments{.first = encoded, .second = {}}));
+    const wire::ByteBuffer malformed{std::byte{0xbf}};
+    CHECK_FALSE(decode_server_record(wire::ByteSegments{.first = malformed, .second = {}}));
+}
+
+TEST_CASE("browser records reject duplicate identities and invalid renderer observations", "[controller][browser][protocol]") {
+    wire::ByteBuffer encoded;
+    CHECK_FALSE(encode_client_record(ClientRecord{Intent{
+                                         .correlation = 1U,
+                                         .endpoint_id = 2U,
+                                         .fields =
+                                             {
+                                                 {.field_id = 3U, .value = wire::Value{}},
+                                                 {.field_id = 3U, .value = wire::Value{}},
+                                             },
+                                     }},
+                                     encoded));
+    CHECK_FALSE(encode_client_record(ClientRecord{RendererObservation{
+                                         .kind = RendererObservationKind::Surface,
+                                         .width = 0U,
+                                         .height = 1080U,
+                                     }},
+                                     encoded));
+}
+
+TEST_CASE("settings leaf traversal retains every reflected constraint dimension", "[controller][browser][schema][settings]") {
+    std::size_t leaves = 0U;
+    bool observed_byte_bound = false;
+    bool observed_item_bound = false;
+    ApplicationSchema<FixtureApplicationSystems>::template VisitSettingsLeaves<mmltk::controller::contracts::GuiSettingsState>(
+        [&]<class, class, class>(const ApplicationSettingsLeafFact& fact) {
+            ++leaves;
+            observed_byte_bound = observed_byte_bound || fact.constraint.minimum_bytes != 0U || fact.constraint.maximum_bytes != 0U;
+            observed_item_bound = observed_item_bound || fact.constraint.maximum_items != 0U;
+            CHECK((fact.constraint.maximum_bytes == 0U || fact.constraint.minimum_bytes <= fact.constraint.maximum_bytes));
+            CHECK((!fact.constraint.has_minimum || !fact.constraint.has_maximum || fact.constraint.minimum <= fact.constraint.maximum));
+        });
+    CHECK(leaves != 0U);
+    CHECK(observed_byte_bound);
+    CHECK(observed_item_bound);
+}
+
+TEST_CASE("exception mapping preserves the common bounded error vocabulary", "[controller][browser][protocol]") {
+    using mmltk::controller::contracts::ApplicationErrorCategory;
+    const auto invalid = map_exception(mmltk::controller::contracts::InvalidIntentError("invalid"));
+    const auto busy = map_exception(mmltk::controller::contracts::BusyError("busy"));
+    const auto unavailable = map_exception(mmltk::controller::contracts::UnavailableError("unavailable"));
+    const auto failed = map_exception(std::runtime_error("failed"));
+    CHECK(invalid.category == ApplicationErrorCategory::InvalidIntent);
+    CHECK(busy.category == ApplicationErrorCategory::Busy);
+    CHECK(unavailable.category == ApplicationErrorCategory::Unavailable);
+    CHECK(failed.category == ApplicationErrorCategory::Failed);
+
+    std::string oversized(kMaxErrorDetailBytes * 2U, 'x');
+    oversized[1U] = '\n';
+    oversized[2U] = static_cast<char>(0xff);
+    const auto bounded = map_exception(mmltk::controller::contracts::BusyError(std::move(oversized)));
+    CHECK(bounded.category == ApplicationErrorCategory::Busy);
+    CHECK(bounded.detail.size() == kMaxErrorDetailBytes);
+    CHECK(bounded.detail[1U] == '?');
+    CHECK(bounded.detail[2U] == '?');
+
+    wire::ByteBuffer encoded;
+    REQUIRE(encode_server_record(ServerRecord{IntentReply{.correlation = 1U, .result = {}, .error = bounded}}, encoded));
+    CHECK_FALSE(encode_server_record(ServerRecord{IntentReply{
+                                         .correlation = 1U,
+                                         .result = {},
+                                         .error =
+                                             ApplicationErrorRecord{
+                                                 .category = ApplicationErrorCategory::Failed,
+                                                 .detail = std::string(kMaxErrorDetailBytes + 1U, 'x'),
+                                             },
+                                     }},
+                                     encoded));
+}
+
+}  // namespace
+}  // namespace mmltk::controller::browser

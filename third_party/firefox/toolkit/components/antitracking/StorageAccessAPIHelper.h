@@ -1,0 +1,138 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_antitrackingservice_h
+#define mozilla_antitrackingservice_h
+
+#include "nsString.h"
+#include "mozilla/ContentBlockingNotifier.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/StaticPrefs_privacy.h"
+
+class nsIChannel;
+class nsICookieJarSettings;
+class nsIPermission;
+class nsIPrincipal;
+class nsIURI;
+class nsPIDOMWindowInner;
+class nsPIDOMWindowOuter;
+
+namespace mozilla {
+
+class OriginAttributes;
+
+namespace dom {
+class BrowsingContext;
+class ContentParent;
+class Document;
+}  
+
+class StorageAccessAPIHelper final {
+ public:
+  enum StorageAccessPromptChoices { eAllow, eAllowAutoGrant };
+
+  typedef MozPromise<StorageAccessPromptChoices, bool, true>
+      StorageAccessPermissionGrantPromise;
+  typedef std::function<RefPtr<StorageAccessPermissionGrantPromise>()>
+      PerformPermissionGrant;
+  [[nodiscard]] static RefPtr<StorageAccessPermissionGrantPromise>
+  AllowAccessForOnParentProcess(
+      nsIPrincipal* aPrincipal, dom::BrowsingContext* aParentContext,
+      ContentBlockingNotifier::StorageAccessPermissionGrantedReason aReason,
+      const PerformPermissionGrant& aPerformFinalChecks = nullptr);
+
+  [[nodiscard]] static RefPtr<StorageAccessPermissionGrantPromise>
+  AllowAccessForOnChildProcess(
+      nsIPrincipal* aPrincipal, dom::BrowsingContext* aParentContext,
+      ContentBlockingNotifier::StorageAccessPermissionGrantedReason aReason,
+      const PerformPermissionGrant& aPerformFinalChecks = nullptr);
+
+  static void OnAllowAccessFor(
+      dom::BrowsingContext* aParentContext, const nsACString& aTrackingOrigin,
+      uint32_t aCookieBehavior,
+      ContentBlockingNotifier::StorageAccessPermissionGrantedReason aReason);
+
+  typedef MozPromise<nsresult, bool, true> ParentAccessGrantPromise;
+  static RefPtr<ParentAccessGrantPromise> SaveAccessForOriginOnParentProcess(
+      nsIPrincipal* aParentPrincipal, nsIPrincipal* aTrackingPrincipal,
+      StorageAccessPromptChoices aAllowMode, bool aFrameOnly,
+      uint64_t aExpirationTime =
+          StaticPrefs::privacy_restrict3rdpartystorage_expiration());
+
+  static RefPtr<ParentAccessGrantPromise> SaveAccessForOriginOnParentProcess(
+      uint64_t aTopLevelWindowId, dom::BrowsingContext* aParentContext,
+      nsIPrincipal* aTrackingPrincipal, StorageAccessPromptChoices aAllowMode,
+      bool aFrameOnly,
+      uint64_t aExpirationTime =
+          StaticPrefs::privacy_restrict3rdpartystorage_expiration());
+
+  static Maybe<bool> CheckCookiesPermittedDecidesStorageAccessAPI(
+      nsICookieJarSettings* aCookieJarSettings,
+      nsIPrincipal* aRequestingPrincipal);
+
+  static RefPtr<MozPromise<Maybe<bool>, nsresult, true>>
+  AsyncCheckCookiesPermittedDecidesStorageAccessAPIOnChildProcess(
+      dom::BrowsingContext* aBrowsingContext,
+      nsIPrincipal* aRequestingPrincipal);
+
+  static Maybe<bool> CheckBrowserSettingsDecidesStorageAccessAPI(
+      nsICookieJarSettings* aCookieJarSettings, bool aThirdParty,
+      bool aIsOnThirdPartySkipList, bool aIsThirdPartyTracker);
+
+  static Maybe<bool> CheckCallingContextDecidesStorageAccessAPI(
+      dom::Document* aDocument, bool aRequestingStorageAccess);
+
+  static Maybe<bool> CheckSameSiteCallingContextDecidesStorageAccessAPI(
+      dom::Document* aDocument, bool aRequireUserActivation);
+
+  static Maybe<bool> CheckExistingPermissionDecidesStorageAccessAPI(
+      dom::Document* aDocument, bool aRequestingStorageAccess);
+
+  static RefPtr<StorageAccessPermissionGrantPromise>
+  RequestStorageAccessAsyncHelper(
+      dom::Document* aDocument, nsPIDOMWindowInner* aInnerWindow,
+      dom::BrowsingContext* aBrowsingContext, nsIPrincipal* aPrincipal,
+      bool aHasUserInteraction, bool aRequireUserInteraction, bool aFrameOnly,
+      ContentBlockingNotifier::StorageAccessPermissionGrantedReason aNotifier,
+      bool aRequireGrant);
+
+ private:
+  friend class dom::ContentParent;
+
+  [[nodiscard]] static RefPtr<
+      StorageAccessAPIHelper::StorageAccessPermissionGrantPromise>
+  AllowAccessForHelper(
+      nsIPrincipal* aPrincipal, dom::BrowsingContext* aParentContext,
+      ContentBlockingNotifier::StorageAccessPermissionGrantedReason aReason,
+      nsCOMPtr<nsIPrincipal>* aTrackingPrincipal, nsACString& aTrackingOrigin,
+      uint64_t* aTopLevelWindowId, uint32_t* aBehavior);
+
+  [[nodiscard]] static RefPtr<StorageAccessPermissionGrantPromise>
+  CompleteAllowAccessForOnParentProcess(
+      dom::BrowsingContext* aParentContext, uint64_t aTopLevelWindowId,
+      nsIPrincipal* aTrackingPrincipal, const nsACString& aTrackingOrigin,
+      uint32_t aCookieBehavior,
+      ContentBlockingNotifier::StorageAccessPermissionGrantedReason aReason,
+      const PerformPermissionGrant& aPerformFinalChecks = nullptr);
+
+  [[nodiscard]] static RefPtr<StorageAccessPermissionGrantPromise>
+  CompleteAllowAccessForOnChildProcess(
+      dom::BrowsingContext* aParentContext, uint64_t aTopLevelWindowId,
+      nsIPrincipal* aTrackingPrincipal, const nsACString& aTrackingOrigin,
+      uint32_t aCookieBehavior,
+      ContentBlockingNotifier::StorageAccessPermissionGrantedReason aReason,
+      const PerformPermissionGrant& aPerformFinalChecks = nullptr);
+
+  static void UpdateAllowAccessOnCurrentProcess(
+      dom::BrowsingContext* aParentContext, const nsACString& aTrackingOrigin);
+
+  static void UpdateAllowAccessOnParentProcess(
+      dom::BrowsingContext* aParentContext, const nsACString& aTrackingOrigin);
+
+};
+
+}  
+
+#endif  // mozilla_antitrackingservice_h

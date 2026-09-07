@@ -1,0 +1,131 @@
+/*
+ * Copyright 2006 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "include/core/SkPath.h"
+
+#include "include/core/SkRect.h"
+#include "include/core/SkRegion.h"
+#include "include/private/base/SkAssert.h"
+#include "include/private/base/SkMath.h"
+#include "src/core/SkAAClip.h"
+#include "src/core/SkBlitter.h"
+#include "src/core/SkPathRaw.h"
+#include "src/core/SkRasterClip.h"
+#include "src/core/SkScan.h"
+#include "src/core/SkScanPriv.h"
+
+#include <cstdint>
+
+static SkIRect safeRoundOut(const SkRect& src) {
+    SkIRect dst = src.roundOut();
+
+    const int32_t limit = SK_MaxS32 >> SK_SUPERSAMPLE_SHIFT;
+    (void)dst.intersect({ -limit, -limit, limit, limit});
+
+    return dst;
+}
+
+static int overflows_short_shift(int value, int shift) {
+    const int s = 16 + shift;
+    return (SkLeftShift(value, s) >> s) - value;
+}
+
+static int rect_overflows_short_shift(SkIRect rect, int shift) {
+    SkASSERT(!overflows_short_shift(8191, shift));
+    SkASSERT(overflows_short_shift(8192, shift));
+    SkASSERT(!overflows_short_shift(32767, 0));
+    SkASSERT(overflows_short_shift(32768, 0));
+
+    return overflows_short_shift(rect.fLeft, shift) |
+           overflows_short_shift(rect.fRight, shift) |
+           overflows_short_shift(rect.fTop, shift) |
+           overflows_short_shift(rect.fBottom, shift);
+}
+
+void SkScan::AntiFillPath(const SkPathRaw& path, const SkRegion& origClip,
+                          SkBlitter* blitter, bool forceRLE) {
+    if (origClip.isEmpty()) {
+        return;
+    }
+
+    const bool isInverse = path.isInverseFillType();
+    SkIRect ir = safeRoundOut(path.bounds());
+    if (ir.isEmpty()) {
+        if (isInverse) {
+            blitter->blitRegion(origClip);
+        }
+        return;
+    }
+
+    SkIRect clippedIR;
+    if (isInverse) {
+       clippedIR = origClip.getBounds();
+    } else {
+       if (!clippedIR.intersect(ir, origClip.getBounds())) {
+           return;
+       }
+    }
+    if (rect_overflows_short_shift(clippedIR, SK_SUPERSAMPLE_SHIFT)) {
+        SkScan::FillPath(path, origClip, blitter);
+        return;
+    }
+
+    SkRegion tmpClipStorage;
+    const SkRegion* clipRgn = &origClip;
+    {
+        static const int32_t kMaxClipCoord = 32767;
+        const SkIRect& bounds = origClip.getBounds();
+        if (bounds.fRight > kMaxClipCoord || bounds.fBottom > kMaxClipCoord) {
+            SkIRect limit = { 0, 0, kMaxClipCoord, kMaxClipCoord };
+            tmpClipStorage.op(origClip, limit, SkRegion::kIntersect_Op);
+            clipRgn = &tmpClipStorage;
+        }
+    }
+
+    SkScanClipper   clipper(blitter, clipRgn, ir);
+
+    if (clipper.getBlitter() == nullptr) { 
+        if (isInverse) {
+            blitter->blitRegion(*clipRgn);
+        }
+        return;
+    }
+
+    SkASSERT(clipper.getClipRect() == nullptr ||
+            *clipper.getClipRect() == clipRgn->getBounds());
+
+    blitter = clipper.getBlitter();
+
+    if (isInverse) {
+        sk_blit_above(blitter, ir, *clipRgn);
+    }
+
+    SkScan::AAAFillPath(path, blitter, ir, clipRgn->getBounds(), forceRLE);
+
+    if (isInverse) {
+        sk_blit_below(blitter, ir, *clipRgn);
+    }
+}
+
+
+void SkScan::AntiFillPath(const SkPathRaw& raw, const SkRasterClip& clip, SkBlitter* blitter) {
+    SkASSERT(raw.bounds().isFinite());
+    if (clip.isEmpty()) {
+        return;
+    }
+
+    if (clip.isBW()) {
+        AntiFillPath(raw, clip.bwRgn(), blitter, false);
+    } else {
+        SkRegion        tmp;
+        SkAAClipBlitter aaBlitter;
+
+        tmp.setRect(clip.getBounds());
+        aaBlitter.init(blitter, &clip.aaRgn());
+        AntiFillPath(raw, tmp, &aaBlitter, true); 
+    }
+}

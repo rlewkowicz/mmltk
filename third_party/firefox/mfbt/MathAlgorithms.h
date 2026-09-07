@@ -1,0 +1,158 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_MathAlgorithms_h
+#define mozilla_MathAlgorithms_h
+
+#include "mozilla/Assertions.h"
+
+#include <algorithm>
+#include <bit>
+#include <cmath>
+#include <climits>
+#include <cstdint>
+#include <type_traits>
+
+namespace mozilla {
+
+namespace detail {
+
+template <typename T, typename = void>
+struct AbsReturnType;
+
+template <typename T>
+struct AbsReturnType<
+    T, std::enable_if_t<std::is_integral_v<T> && std::is_signed_v<T>>> {
+  using Type = std::make_unsigned_t<T>;
+};
+
+template <typename T>
+struct AbsReturnType<T, std::enable_if_t<std::is_floating_point_v<T>>> {
+  using Type = T;
+};
+
+}  
+
+template <typename T>
+inline constexpr typename detail::AbsReturnType<T>::Type Abs(const T aValue) {
+  using ReturnType = typename detail::AbsReturnType<T>::Type;
+  return aValue >= 0 ? ReturnType(aValue) : ~ReturnType(aValue) + 1;
+}
+
+template <>
+inline float Abs<float>(const float aFloat) {
+  return std::fabs(aFloat);
+}
+
+template <>
+inline double Abs<double>(const double aDouble) {
+  return std::fabs(aDouble);
+}
+
+template <>
+inline long double Abs<long double>(const long double aLongDouble) {
+  return std::fabs(aLongDouble);
+}
+
+template <typename T>
+constexpr uint_fast8_t CeilingLog2(const T aValue) {
+  static_assert(std::is_integral_v<T> && std::is_unsigned_v<T>);
+
+  return aValue <= 1 ? 0u
+                     : static_cast<uint_fast8_t>(
+                           std::bit_width(static_cast<T>(aValue - 1)));
+}
+
+constexpr uint_fast8_t CeilingLog2Size(size_t aValue) {
+  return CeilingLog2(aValue);
+}
+
+template <typename T>
+constexpr uint_fast8_t FindMostSignificantBit(T aValue) {
+  static_assert(std::is_integral_v<T> && std::is_unsigned_v<T>);
+
+  MOZ_ASSERT(aValue != 0);
+  return static_cast<uint_fast8_t>(std::bit_width(aValue) - 1);
+}
+
+template <typename T>
+constexpr uint_fast8_t FloorLog2(const T aValue) {
+  return FindMostSignificantBit(static_cast<T>(aValue | 1));
+}
+
+constexpr uint_fast8_t FloorLog2Size(size_t aValue) {
+  return FloorLog2(aValue);
+}
+
+constexpr size_t RoundUpPow2(size_t aValue) {
+  MOZ_ASSERT(aValue <= (size_t(1) << (sizeof(size_t) * CHAR_BIT - 1)),
+             "can't round up -- will overflow!");
+  return std::bit_ceil(aValue);
+}
+
+template <typename T>
+MOZ_NO_SANITIZE_UNSIGNED_OVERFLOW constexpr T RotateLeft(const T aValue,
+                                                         uint_fast8_t aShift) {
+  MOZ_ASSERT(aShift < sizeof(T) * CHAR_BIT, "Shift value is too large!");
+
+  return std::rotl(aValue, aShift);
+}
+
+template <typename T>
+MOZ_NO_SANITIZE_UNSIGNED_OVERFLOW constexpr T RotateRight(const T aValue,
+                                                          uint_fast8_t aShift) {
+  MOZ_ASSERT(aShift < sizeof(T) * CHAR_BIT, "Shift value is too large!");
+
+  return std::rotr(aValue, aShift);
+}
+
+template <typename T>
+MOZ_ALWAYS_INLINE T GCD(T aA, T aB) {
+  static_assert(std::is_integral_v<T>);
+
+  MOZ_ASSERT(aA >= 0);
+  MOZ_ASSERT(aB >= 0);
+
+  if (aA == 0) {
+    return aB;
+  }
+  if (aB == 0) {
+    return aA;
+  }
+
+  using UnsignedT = std::make_unsigned_t<T>;
+
+  auto az = std::countr_zero(static_cast<UnsignedT>(aA));
+  auto bz = std::countr_zero(static_cast<UnsignedT>(aB));
+  auto shift = std::min<T>(az, bz);
+  aA >>= az;
+  aB >>= bz;
+
+  while (aA != 0) {
+    if constexpr (!std::is_signed_v<T>) {
+      if (aA < aB) {
+        std::swap(aA, aB);
+      }
+    }
+    T diff = aA - aB;
+    if constexpr (std::is_signed_v<T>) {
+      aB = std::min<T>(aA, aB);
+    }
+    if constexpr (std::is_signed_v<T>) {
+      aA = std::abs(diff);
+    } else {
+      aA = diff;
+    }
+    if (aA) {
+      aA >>= std::countr_zero(static_cast<UnsignedT>(aA));
+    }
+  }
+
+  return aB << shift;
+}
+
+} 
+
+#endif /* mozilla_MathAlgorithms_h */

@@ -1,0 +1,84 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsHTMLCanvasFrame_h_
+#define nsHTMLCanvasFrame_h_
+
+#include "nsContainerFrame.h"
+#include "nsStringFwd.h"
+
+namespace mozilla {
+class PresShell;
+namespace layers {
+class WebRenderCanvasData;
+}  
+}  
+
+class nsPresContext;
+
+nsIFrame* NS_NewHTMLCanvasFrame(mozilla::PresShell* aPresShell,
+                                mozilla::ComputedStyle* aStyle);
+
+class nsHTMLCanvasFrame final : public nsContainerFrame {
+ public:
+  using WebRenderCanvasData = mozilla::layers::WebRenderCanvasData;
+
+  NS_DECL_QUERYFRAME
+  NS_DECL_FRAMEARENA_HELPERS(nsHTMLCanvasFrame)
+
+  nsHTMLCanvasFrame(ComputedStyle* aStyle, nsPresContext* aPresContext)
+      : nsContainerFrame(aStyle, aPresContext, kClassID) {}
+
+  void BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                        const nsDisplayListSet& aLists) override;
+
+  void Destroy(DestroyContext&) override;
+
+  bool UpdateWebRenderCanvasData(nsDisplayListBuilder* aBuilder,
+                                 WebRenderCanvasData* aCanvasData);
+
+  mozilla::CSSIntSize GetCanvasSize() const;
+
+  nscoord IntrinsicISize(const mozilla::IntrinsicSizeInput& aInput,
+                         mozilla::IntrinsicISizeType aType) override;
+
+  mozilla::IntrinsicSize GetIntrinsicSize() override;
+  mozilla::AspectRatio GetIntrinsicRatio() const override;
+
+  void UnionChildOverflow(mozilla::OverflowAreas&, bool aAsIfScrolled) override;
+
+  SizeComputationResult ComputeSize(
+      const SizeComputationInput& aSizingInput, mozilla::WritingMode aWM,
+      const mozilla::LogicalSize& aCBSize, nscoord aAvailableISize,
+      const mozilla::LogicalSize& aMargin,
+      const mozilla::LogicalSize& aBorderPadding,
+      const mozilla::StyleSizeOverrides& aSizeOverrides,
+      mozilla::ComputeSizeFlags aFlags) override;
+
+  void Reflow(nsPresContext* aPresContext, ReflowOutput& aDesiredSize,
+              const ReflowInput& aReflowInput,
+              nsReflowStatus& aStatus) override;
+
+  nsRect GetDestRect(const nsRect& aFrameContentBox) const;
+
+#ifdef ACCESSIBILITY
+  mozilla::a11y::AccType AccessibleType() override;
+#endif
+
+#ifdef DEBUG_FRAME_DUMP
+  nsresult GetFrameName(nsAString& aResult) const override;
+#endif
+
+  nsContainerFrame* GetContentInsertionFrame() override {
+    return PrincipalChildList().FirstChild()->GetContentInsertionFrame();
+  }
+
+  void AppendDirectlyOwnedAnonBoxes(nsTArray<OwnedAnonBox>& aResult) override;
+
+ protected:
+  virtual ~nsHTMLCanvasFrame();
+};
+
+#endif /* nsHTMLCanvasFrame_h_ */

@@ -1,0 +1,97 @@
+# syntax=docker/dockerfile:1
+
+FROM mmltk_gcc16 AS gcc16
+FROM mmltk_nvidia_payload AS nvidia_payload
+FROM mmltk_ubuntu AS build
+ARG MMLTK_ONNXRUNTIME_VERSION=1.27.1
+ARG MMLTK_ONNXRUNTIME_COMMIT=df2ba1cf8108aa63627cf4cdf8f807880b938616
+ARG MMLTK_ONNXRUNTIME_SOURCE_SHA256=e53b06ccd454f56088fde374d1af6660ef111ca7ce7a98d62b274ff9094d3005
+ARG MMLTK_CUDA_ROOT
+ARG MMLTK_NVIDIA_NATIVE_ROOT
+ARG MMLTK_NVIDIA_LIBRARY_PATH
+ARG MMLTK_ONNXRUNTIME_BUILD_JOBS=4
+COPY --link --from=gcc16 /opt/gcc-16.2 /opt/gcc-16.2
+COPY --link --from=nvidia_payload /development/ /
+ENV CC=/opt/gcc-16.2/bin/gcc \
+    CXX=/opt/gcc-16.2/bin/g++ \
+    CUDAHOSTCXX=/opt/gcc-16.2/bin/g++ \
+    CUDACXX=${MMLTK_CUDA_ROOT}/bin/nvcc \
+    CUDA_HOME=${MMLTK_CUDA_ROOT} \
+    PATH=/opt/gcc-16.2/bin:${MMLTK_CUDA_ROOT}/bin:${PATH} \
+    LD_LIBRARY_PATH=/opt/gcc-16.2/lib64:${MMLTK_NVIDIA_LIBRARY_PATH}
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        binutils ccache cmake curl git libc6-dev libgmp10 libmpc3 libmpfr6 ninja-build patch pkg-config python3 \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL \
+        "https://codeload.github.com/microsoft/onnxruntime/tar.gz/refs/tags/v${MMLTK_ONNXRUNTIME_VERSION}" \
+        -o /tmp/onnxruntime.tar.gz \
+    && echo "${MMLTK_ONNXRUNTIME_SOURCE_SHA256}  /tmp/onnxruntime.tar.gz" | sha256sum -c - \
+    && mkdir /src \
+    && tar -xzf /tmp/onnxruntime.tar.gz --strip-components=1 -C /src \
+    && test "$(cat /src/VERSION_NUMBER)" = "${MMLTK_ONNXRUNTIME_VERSION}" \
+    && rm /tmp/onnxruntime.tar.gz
+COPY docker/patches/onnxruntime-1.27.1-cuda-graph-capture-end.patch /tmp/capture-end.patch
+COPY docker/patches/onnxruntime-1.27.1-gcc16.patch /tmp/gcc16.patch
+RUN patch --batch --fuzz=0 -d /src -p1 </tmp/capture-end.patch \
+    && patch --batch --fuzz=0 -d /src -p1 </tmp/gcc16.patch
+# Keep the dependency's C/C++/CUDA dialects and kernel inventory. Its C++20
+# policy is separate from the application's C++26/CUDA C++23 policy.
+RUN test -f "${MMLTK_NVIDIA_NATIVE_ROOT}/include/cudnn.h" \
+        || { echo "Selected NVIDIA payload is missing include/cudnn.h" >&2; \
+             find "${MMLTK_NVIDIA_NATIVE_ROOT}/include" -maxdepth 1 -name 'cudnn*' -printf '%f -> %l\n' >&2; \
+             exit 1; }
+RUN test -f "${MMLTK_CUDA_ROOT}/targets/x86_64-linux/include/cudalibxt.h" \
+    || { echo "Selected NVIDIA payload is missing cuFFT's cudalibxt.h" >&2; exit 1; }
+RUN --mount=type=cache,id=mmltk-onnxruntime-ccache,target=/ccache \
+    export CCACHE_DIR=/ccache CCACHE_MAXSIZE=20G \
+    && set -- "${MMLTK_NVIDIA_NATIVE_ROOT}"/lib/libcudnn.so* \
+    && { test -f "$1" || { echo "Selected NVIDIA payload is missing lib/libcudnn.so*" >&2; exit 1; }; } \
+    && cmake -S /src/cmake -B /build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_COMPILER=/opt/gcc-16.2/bin/gcc \
+        -DCMAKE_CXX_COMPILER=/opt/gcc-16.2/bin/g++ \
+        -DCMAKE_CUDA_COMPILER="${MMLTK_CUDA_ROOT}/bin/nvcc" \
+        -DCMAKE_CUDA_HOST_COMPILER=/opt/gcc-16.2/bin/g++ \
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CUDA_FLAGS=--allow-unsupported-compiler \
+        -DCMAKE_INSTALL_PREFIX=/opt/onnxruntime \
+        -DCMAKE_INSTALL_LIBDIR=lib \
+        -Donnxruntime_BUILD_SHARED_LIB=ON \
+        -Donnxruntime_BUILD_UNIT_TESTS=OFF \
+        -Donnxruntime_USE_CUDA=ON \
+        -Donnxruntime_USE_TENSORRT=OFF \
+        -Donnxruntime_CUDA_HOME="${MMLTK_CUDA_ROOT}" \
+        -DCUDNN_PATH="${MMLTK_NVIDIA_NATIVE_ROOT}" \
+    && cmake --build /build --parallel "${MMLTK_ONNXRUNTIME_BUILD_JOBS}" \
+    && cmake --install /build --prefix /tmp/install
+# Use the upstream public-header install inventory, flattening only its package
+# prefix to match the released archive; CUDA header subdirectories stay intact.
+RUN mkdir -p /opt/onnxruntime/include /opt/onnxruntime/lib \
+    && cp -a /tmp/install/include/onnxruntime/. /opt/onnxruntime/include/ \
+    && cp -a /tmp/install/lib/libonnxruntime*.so* /opt/onnxruntime/lib/ \
+    && cp /src/LICENSE /src/ThirdPartyNotices.txt /src/docs/Privacy.md /src/README.md /src/VERSION_NUMBER /opt/onnxruntime/ \
+    && printf '%s\n' "${MMLTK_ONNXRUNTIME_SOURCE_SHA256}" >/opt/onnxruntime/SOURCE_SHA256 \
+    && printf '%s\n' "${MMLTK_ONNXRUNTIME_COMMIT}" >/opt/onnxruntime/GIT_COMMIT_ID \
+    && test -f /opt/onnxruntime/include/onnxruntime_cxx_api.h \
+    && test -f /opt/onnxruntime/lib/libonnxruntime.so.${MMLTK_ONNXRUNTIME_VERSION} \
+    && test -f /opt/onnxruntime/lib/libonnxruntime_providers_shared.so \
+    && test -f /opt/onnxruntime/lib/libonnxruntime_providers_cuda.so \
+    && test ! -e /opt/onnxruntime/lib/libonnxruntime_providers_tensorrt.so \
+    && mkdir -p /mmltk-onnxruntime/development/opt /mmltk-onnxruntime/runtime/opt \
+    && mv /opt/onnxruntime /mmltk-onnxruntime/development/opt/ \
+    && cp -al /mmltk-onnxruntime/development/opt/onnxruntime /mmltk-onnxruntime/runtime/opt/ \
+    && rm -rf /mmltk-onnxruntime/runtime/opt/onnxruntime/include
+
+FROM scratch AS onnxruntime
+COPY --from=build /mmltk-onnxruntime/ /
+ARG MMLTK_IMAGE_FINGERPRINT=unlabeled
+ARG MMLTK_UBUNTU_IDENTITY=unknown
+ARG MMLTK_GCC_IDENTITY=unknown
+ARG MMLTK_NVIDIA_PAYLOAD_IDENTITY=unknown
+LABEL com.mmltk.input-fingerprint="${MMLTK_IMAGE_FINGERPRINT}" \
+      com.mmltk.ubuntu-identity="${MMLTK_UBUNTU_IDENTITY}" \
+      com.mmltk.gcc-identity="${MMLTK_GCC_IDENTITY}" \
+      com.mmltk.nvidia-payload-identity="${MMLTK_NVIDIA_PAYLOAD_IDENTITY}"

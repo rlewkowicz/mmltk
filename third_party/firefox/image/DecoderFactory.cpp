@@ -1,0 +1,418 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "DecoderFactory.h"
+
+#include "AnimationSurfaceProvider.h"
+#include "DecodedSurfaceProvider.h"
+#include "Decoder.h"
+#include "IDecodingTask.h"
+#include "ImageOps.h"
+#include "ImageUtils.h"
+#include "mozilla/RefPtr.h"
+#include "nsAVIFDecoder.h"
+#include "nsBMPDecoder.h"
+#include "nsGIFDecoder2.h"
+#include "nsICODecoder.h"
+#include "nsIconDecoder.h"
+#include "nsJPEGDecoder.h"
+#include "nsMimeTypes.h"
+#include "nsPNGDecoder.h"
+#include "nsWebPDecoder.h"
+
+#ifdef MOZ_JXL
+#  include "nsJXLDecoder.h"
+#endif
+
+namespace mozilla {
+
+using namespace gfx;
+
+namespace image {
+
+DecoderType DecoderFactory::GetDecoderType(const char* aMimeType) {
+  DecoderType type = DecoderType::UNKNOWN;
+
+  if (!strcmp(aMimeType, IMAGE_PNG)) {
+    type = DecoderType::PNG;
+  } else if (!strcmp(aMimeType, IMAGE_X_PNG)) {
+    type = DecoderType::PNG;
+  } else if (!strcmp(aMimeType, IMAGE_APNG)) {
+    type = DecoderType::PNG;
+
+  } else if (!strcmp(aMimeType, IMAGE_GIF)) {
+    type = DecoderType::GIF;
+
+  } else if (!strcmp(aMimeType, IMAGE_JPEG)) {
+    type = DecoderType::JPEG;
+  } else if (!strcmp(aMimeType, IMAGE_PJPEG)) {
+    type = DecoderType::JPEG;
+  } else if (!strcmp(aMimeType, IMAGE_JPG)) {
+    type = DecoderType::JPEG;
+  } else if (!strcmp(aMimeType, IMAGE_JPEG_PDF)) {
+    type = DecoderType::JPEG_PDF;
+
+  } else if (!strcmp(aMimeType, IMAGE_BMP)) {
+    type = DecoderType::BMP;
+  } else if (!strcmp(aMimeType, IMAGE_BMP_MS)) {
+    type = DecoderType::BMP;
+
+  } else if (!strcmp(aMimeType, IMAGE_BMP_MS_CLIPBOARD)) {
+    type = DecoderType::BMP_CLIPBOARD;
+
+  } else if (!strcmp(aMimeType, IMAGE_ICO)) {
+    type = DecoderType::ICO;
+  } else if (!strcmp(aMimeType, IMAGE_ICO_MS)) {
+    type = DecoderType::ICO;
+
+  } else if (!strcmp(aMimeType, IMAGE_ICON_MS)) {
+    type = DecoderType::ICON;
+
+  } else if (!strcmp(aMimeType, IMAGE_WEBP)) {
+    type = DecoderType::WEBP;
+
+  } else if (!strcmp(aMimeType, IMAGE_AVIF)) {
+    type = DecoderType::AVIF;
+  }
+#ifdef MOZ_JXL
+  else if (!strcmp(aMimeType, IMAGE_JXL) && StaticPrefs::image_jxl_enabled()) {
+    type = DecoderType::JXL;
+  }
+#endif
+
+  return type;
+}
+
+already_AddRefed<Decoder> DecoderFactory::GetDecoder(DecoderType aType,
+                                                     RasterImage* aImage,
+                                                     bool aIsRedecode) {
+  RefPtr<Decoder> decoder;
+
+  switch (aType) {
+    case DecoderType::PNG:
+      decoder = new nsPNGDecoder(aImage);
+      break;
+    case DecoderType::GIF:
+      decoder = new nsGIFDecoder2(aImage);
+      break;
+    case DecoderType::JPEG:
+    case DecoderType::JPEG_PDF:
+      decoder = new nsJPEGDecoder(
+          aImage, aIsRedecode ? Decoder::SEQUENTIAL : Decoder::PROGRESSIVE,
+          aType == DecoderType::JPEG_PDF);
+      break;
+    case DecoderType::BMP:
+      decoder = new nsBMPDecoder(aImage);
+      break;
+    case DecoderType::BMP_CLIPBOARD:
+      decoder = new nsBMPDecoder(aImage,  true);
+      break;
+    case DecoderType::ICO:
+      decoder = new nsICODecoder(aImage);
+      break;
+    case DecoderType::ICON:
+      decoder = new nsIconDecoder(aImage);
+      break;
+    case DecoderType::WEBP:
+      decoder = new nsWebPDecoder(aImage);
+      break;
+    case DecoderType::AVIF:
+      decoder = new nsAVIFDecoder(aImage);
+      break;
+#ifdef MOZ_JXL
+    case DecoderType::JXL:
+      decoder = new nsJXLDecoder(aImage);
+      break;
+#endif
+    default:
+      MOZ_ASSERT_UNREACHABLE("Unknown decoder type");
+  }
+
+  return decoder.forget();
+}
+
+nsresult DecoderFactory::CreateDecoder(
+    DecoderType aType, NotNull<RasterImage*> aImage,
+    NotNull<SourceBuffer*> aSourceBuffer, const IntSize& aIntrinsicSize,
+    const IntSize& aOutputSize, DecoderFlags aDecoderFlags,
+    SurfaceFlags aSurfaceFlags, IDecodingTask** aOutTask) {
+  if (aType == DecoderType::UNKNOWN) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  if (NS_WARN_IF(bool(aDecoderFlags & DecoderFlags::COUNT_FRAMES))) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  RefPtr<Decoder> decoder = GetDecoder(
+      aType, nullptr, bool(aDecoderFlags & DecoderFlags::IS_REDECODE));
+  MOZ_ASSERT(decoder, "Should have a decoder now");
+
+  decoder->SetMetadataDecode(false);
+  decoder->SetIterator(aSourceBuffer->Iterator());
+  decoder->SetOutputSize(OrientedIntSize::FromUnknownSize(aOutputSize));
+  decoder->SetDecoderFlags(aDecoderFlags | DecoderFlags::FIRST_FRAME_ONLY);
+  decoder->SetSurfaceFlags(aSurfaceFlags);
+
+  nsresult rv = decoder->Init();
+  if (NS_FAILED(rv)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  SurfaceKey surfaceKey =
+      RasterSurfaceKey(aOutputSize, aSurfaceFlags, PlaybackType::eStatic);
+  auto provider = MakeNotNull<RefPtr<DecodedSurfaceProvider>>(
+      aImage, surfaceKey, WrapNotNull(decoder));
+  if (aDecoderFlags & DecoderFlags::CANNOT_SUBSTITUTE) {
+    provider->Availability().SetCannotSubstitute();
+  }
+
+  switch (SurfaceCache::Insert(provider)) {
+    case InsertOutcome::SUCCESS:
+      break;
+    case InsertOutcome::FAILURE_ALREADY_PRESENT:
+      return NS_ERROR_ALREADY_INITIALIZED;
+    default:
+      return NS_ERROR_FAILURE;
+  }
+
+  RefPtr<IDecodingTask> task = provider.get();
+  task.forget(aOutTask);
+  return NS_OK;
+}
+
+nsresult DecoderFactory::CreateAnimationDecoder(
+    DecoderType aType, NotNull<RasterImage*> aImage,
+    NotNull<SourceBuffer*> aSourceBuffer, const IntSize& aIntrinsicSize,
+    DecoderFlags aDecoderFlags, SurfaceFlags aSurfaceFlags,
+    size_t aCurrentFrame, IDecodingTask** aOutTask) {
+  if (aType == DecoderType::UNKNOWN) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  if (NS_WARN_IF(bool(aDecoderFlags & DecoderFlags::COUNT_FRAMES))) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  MOZ_ASSERT(aType == DecoderType::GIF || aType == DecoderType::PNG ||
+                 aType == DecoderType::WEBP || aType == DecoderType::AVIF
+#ifdef MOZ_JXL
+                 || aType == DecoderType::JXL
+#endif
+             ,
+             "Calling CreateAnimationDecoder for non-animating DecoderType");
+
+  RefPtr<Decoder> decoder =
+      GetDecoder(aType, nullptr,  true);
+  MOZ_ASSERT(decoder, "Should have a decoder now");
+
+  decoder->SetMetadataDecode(false);
+  decoder->SetIterator(aSourceBuffer->Iterator());
+  decoder->SetDecoderFlags(aDecoderFlags | DecoderFlags::IS_REDECODE);
+  decoder->SetSurfaceFlags(aSurfaceFlags);
+
+  nsresult rv = decoder->Init();
+  if (NS_FAILED(rv)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  SurfaceKey surfaceKey =
+      RasterSurfaceKey(aIntrinsicSize, aSurfaceFlags, PlaybackType::eAnimated);
+  auto provider = MakeNotNull<RefPtr<AnimationSurfaceProvider>>(
+      aImage, surfaceKey, WrapNotNull(decoder), aCurrentFrame);
+
+  switch (SurfaceCache::Insert(provider)) {
+    case InsertOutcome::SUCCESS:
+      break;
+    case InsertOutcome::FAILURE_ALREADY_PRESENT:
+      return NS_ERROR_ALREADY_INITIALIZED;
+    default:
+      return NS_ERROR_FAILURE;
+  }
+
+  RefPtr<IDecodingTask> task = provider.get();
+  task.forget(aOutTask);
+  return NS_OK;
+}
+
+already_AddRefed<Decoder> DecoderFactory::CloneAnimationDecoder(
+    Decoder* aDecoder) {
+  MOZ_ASSERT(aDecoder);
+
+  DecoderType type = aDecoder->GetType();
+  MOZ_ASSERT(type == DecoderType::GIF || type == DecoderType::PNG ||
+                 type == DecoderType::WEBP || type == DecoderType::AVIF
+#ifdef MOZ_JXL
+                 || type == DecoderType::JXL
+#endif
+             ,
+             "Calling CloneAnimationDecoder for non-animating DecoderType");
+
+  RefPtr<Decoder> decoder = GetDecoder(type, nullptr,  true);
+  MOZ_ASSERT(decoder, "Should have a decoder now");
+
+  decoder->SetMetadataDecode(false);
+  decoder->SetIterator(aDecoder->GetSourceBuffer()->Iterator());
+  decoder->SetDecoderFlags(aDecoder->GetDecoderFlags());
+  decoder->SetSurfaceFlags(aDecoder->GetSurfaceFlags());
+  decoder->SetFrameRecycler(aDecoder->GetFrameRecycler());
+
+  if (NS_FAILED(decoder->Init())) {
+    return nullptr;
+  }
+
+  return decoder.forget();
+}
+
+already_AddRefed<Decoder> DecoderFactory::CloneAnonymousMetadataDecoder(
+    Decoder* aDecoder, const Maybe<DecoderFlags>& aDecoderFlags) {
+  MOZ_ASSERT(aDecoder);
+
+  DecoderType type = aDecoder->GetType();
+  RefPtr<Decoder> decoder =
+      GetDecoder(type, nullptr,  false);
+  MOZ_ASSERT(decoder, "Should have a decoder now");
+
+  decoder->SetMetadataDecode(true);
+  decoder->SetIterator(aDecoder->GetSourceBuffer()->Iterator());
+  if (aDecoderFlags) {
+    decoder->SetDecoderFlags(*aDecoderFlags);
+  } else {
+    decoder->SetDecoderFlags(aDecoder->GetDecoderFlags());
+  }
+
+  if (NS_FAILED(decoder->Init())) {
+    return nullptr;
+  }
+
+  return decoder.forget();
+}
+
+already_AddRefed<IDecodingTask> DecoderFactory::CreateMetadataDecoder(
+    DecoderType aType, NotNull<RasterImage*> aImage, DecoderFlags aFlags,
+    NotNull<SourceBuffer*> aSourceBuffer) {
+  if (aType == DecoderType::UNKNOWN) {
+    return nullptr;
+  }
+
+  RefPtr<Decoder> decoder =
+      GetDecoder(aType, aImage,  false);
+  MOZ_ASSERT(decoder, "Should have a decoder now");
+
+  decoder->SetMetadataDecode(true);
+  decoder->SetDecoderFlags(aFlags);
+  decoder->SetIterator(aSourceBuffer->Iterator());
+
+  if (NS_FAILED(decoder->Init())) {
+    return nullptr;
+  }
+
+  auto task = MakeRefPtr<MetadataDecodingTask>(WrapNotNull(decoder));
+  return task.forget();
+}
+
+already_AddRefed<Decoder> DecoderFactory::CreateDecoderForICOResource(
+    DecoderType aType, SourceBufferIterator&& aIterator,
+    NotNull<nsICODecoder*> aICODecoder, bool aIsMetadataDecode,
+    const Maybe<OrientedIntSize>& aExpectedSize,
+    const Maybe<uint32_t>& aDataOffset
+    ) {
+  RefPtr<Decoder> decoder;
+  switch (aType) {
+    case DecoderType::BMP:
+      MOZ_ASSERT(aDataOffset);
+      decoder =
+          new nsBMPDecoder(aICODecoder->GetImageMaybeNull(), *aDataOffset);
+      break;
+
+    case DecoderType::PNG:
+      MOZ_ASSERT(!aDataOffset);
+      decoder = new nsPNGDecoder(aICODecoder->GetImageMaybeNull());
+      break;
+
+    default:
+      MOZ_ASSERT_UNREACHABLE("Invalid ICO resource decoder type");
+      return nullptr;
+  }
+
+  MOZ_ASSERT(decoder);
+
+  decoder->SetMetadataDecode(aIsMetadataDecode);
+  decoder->SetIterator(std::forward<SourceBufferIterator>(aIterator));
+  if (!aIsMetadataDecode) {
+    decoder->SetOutputSize(aICODecoder->OutputSize());
+  }
+  if (aExpectedSize) {
+    decoder->SetExpectedSize(*aExpectedSize);
+  }
+  decoder->SetDecoderFlags(aICODecoder->GetDecoderFlags());
+  decoder->SetSurfaceFlags(aICODecoder->GetSurfaceFlags());
+  decoder->SetFinalizeFrames(false);
+
+  if (NS_FAILED(decoder->Init())) {
+    return nullptr;
+  }
+
+  return decoder.forget();
+}
+
+already_AddRefed<Decoder> DecoderFactory::CreateAnonymousDecoder(
+    DecoderType aType, NotNull<SourceBuffer*> aSourceBuffer,
+    const Maybe<IntSize>& aOutputSize, DecoderFlags aDecoderFlags,
+    SurfaceFlags aSurfaceFlags) {
+  if (aType == DecoderType::UNKNOWN) {
+    return nullptr;
+  }
+
+  if (NS_WARN_IF(bool(aDecoderFlags & DecoderFlags::COUNT_FRAMES))) {
+    return nullptr;
+  }
+
+  RefPtr<Decoder> decoder =
+      GetDecoder(aType,  nullptr,  false);
+  MOZ_ASSERT(decoder, "Should have a decoder now");
+
+  decoder->SetMetadataDecode(false);
+  decoder->SetIterator(aSourceBuffer->Iterator());
+
+  DecoderFlags decoderFlags = DecoderFlags::IMAGE_IS_TRANSIENT;
+
+  decoder->SetDecoderFlags(aDecoderFlags | decoderFlags);
+  decoder->SetSurfaceFlags(aSurfaceFlags);
+
+  if (aOutputSize) {
+    decoder->SetOutputSize(OrientedIntSize::FromUnknownSize(*aOutputSize));
+  }
+
+  if (NS_FAILED(decoder->Init())) {
+    return nullptr;
+  }
+
+  return decoder.forget();
+}
+
+already_AddRefed<Decoder> DecoderFactory::CreateAnonymousMetadataDecoder(
+    DecoderType aType, NotNull<SourceBuffer*> aSourceBuffer,
+    DecoderFlags aDecoderFlags) {
+  if (aType == DecoderType::UNKNOWN) {
+    return nullptr;
+  }
+
+  RefPtr<Decoder> decoder =
+      GetDecoder(aType,  nullptr,  false);
+  MOZ_ASSERT(decoder, "Should have a decoder now");
+
+  decoder->SetMetadataDecode(true);
+  decoder->SetIterator(aSourceBuffer->Iterator());
+  decoder->SetDecoderFlags(aDecoderFlags);
+
+  if (NS_FAILED(decoder->Init())) {
+    return nullptr;
+  }
+
+  return decoder.forget();
+}
+
+}  
+}  

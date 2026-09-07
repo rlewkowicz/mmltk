@@ -1,0 +1,64 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+******************************************************************************
+* Copyright (C) 2001-2016, International Business Machines
+*                Corporation and others. All Rights Reserved.
+******************************************************************************
+*   file name:  ucln_cmn.h
+*   encoding:   UTF-8
+*   tab size:   8 (not used)
+*   indentation:4
+*
+*   created on: 2001July05
+*   created by: George Rhoten
+*/
+
+#ifndef __UCLN_CMN_H__
+#define __UCLN_CMN_H__
+
+#include "unicode/utypes.h"
+#include "ucln.h"
+
+U_CFUNC UBool utrace_cleanup(void);
+
+U_CFUNC UBool ucln_lib_cleanup(void);
+
+typedef enum ECleanupCommonType {
+    UCLN_COMMON_START = -1,
+    UCLN_COMMON_NUMPARSE_UNISETS,
+    UCLN_COMMON_USPREP,
+    UCLN_COMMON_BREAKITERATOR,
+    UCLN_COMMON_RBBI,
+    UCLN_COMMON_SERVICE,
+    UCLN_COMMON_LOCALE_KEY_TYPE,
+    UCLN_COMMON_LOCALE,
+    UCLN_COMMON_LOCALE_ALIAS,
+    UCLN_COMMON_LOCALE_KNOWN_CANONICALIZED,
+    UCLN_COMMON_LOCALE_AVAILABLE,
+    UCLN_COMMON_LIKELY_SUBTAGS,
+    UCLN_COMMON_LOCALE_DISTANCE,
+    UCLN_COMMON_ULOC,
+    UCLN_COMMON_CURRENCY,
+    UCLN_COMMON_LOADED_NORMALIZER2,
+    UCLN_COMMON_NORMALIZER2,
+    UCLN_COMMON_CHARACTERPROPERTIES,
+    UCLN_COMMON_USET,
+    UCLN_COMMON_UNAMES,
+    UCLN_COMMON_UPROPS,
+    UCLN_COMMON_EMOJIPROPS,
+    UCLN_COMMON_UCNV,
+    UCLN_COMMON_UCNV_IO,
+    UCLN_COMMON_UDATA,
+    UCLN_COMMON_PUTIL,
+    UCLN_COMMON_UINIT,
+
+    UCLN_COMMON_UNIFIED_CACHE,
+    UCLN_COMMON_URES,
+    UCLN_COMMON_MUTEX,    
+    UCLN_COMMON_COUNT 
+} ECleanupCommonType;
+
+U_CFUNC void U_EXPORT2 ucln_common_registerCleanup(ECleanupCommonType type,
+                                                   cleanupFunc *func);
+
+#endif

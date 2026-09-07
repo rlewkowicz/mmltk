@@ -1,0 +1,76 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozStorageStatement_h
+#define mozStorageStatement_h
+
+#include "nsString.h"
+
+#include "nsTArray.h"
+
+#include "mozStorageBindingParamsArray.h"
+#include "mozStorageStatementData.h"
+#include "mozIStorageStatement.h"
+#include "mozIStorageValueArray.h"
+#include "StorageBaseStatementInternal.h"
+
+struct sqlite3_stmt;
+
+namespace mozilla {
+namespace storage {
+class StatementJSHelper;
+class Connection;
+class StatementParamsHolder;
+class StatementRowHolder;
+
+class Statement final : public mozIStorageStatement,
+                        public mozIStorageValueArray,
+                        public StorageBaseStatementInternal {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_MOZISTORAGESTATEMENT
+  NS_DECL_MOZISTORAGEBASESTATEMENT
+  NS_DECL_MOZISTORAGEBINDINGPARAMS
+  NS_DECL_STORAGEBASESTATEMENTINTERNAL
+
+  Statement();
+
+  nsresult initialize(Connection* aDBConnection, sqlite3* aNativeConnection,
+                      const nsACString& aSQLStatement);
+
+  inline sqlite3_stmt* nativeStatement() { return mDBStatement; }
+
+  inline already_AddRefed<BindingParamsArray> bindingParamsArray() {
+    return mParamsArray.forget();
+  }
+
+ private:
+  ~Statement();
+
+  sqlite3_stmt* mDBStatement;
+  uint32_t mParamCount;
+  uint32_t mResultColumnCount;
+  nsTArray<nsCString> mColumnNames;
+  bool mExecuting;
+
+  mozIStorageBindingParams* getParams();
+
+  RefPtr<BindingParamsArray> mParamsArray;
+
+  nsMainThreadPtrHandle<StatementParamsHolder> mStatementParamsHolder;
+  nsMainThreadPtrHandle<StatementRowHolder> mStatementRowHolder;
+
+  void internalFinalize(bool aDestructing);
+
+  friend class StatementJSHelper;
+};
+
+inline nsISupports* ToSupports(Statement* p) {
+  return NS_ISUPPORTS_CAST(mozIStorageStatement*, p);
+}
+
+}  
+}  
+
+#endif  // mozStorageStatement_h

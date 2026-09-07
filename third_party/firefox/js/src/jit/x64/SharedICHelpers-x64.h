@@ -1,0 +1,58 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_x64_SharedICHelpers_x64_h
+#define jit_x64_SharedICHelpers_x64_h
+
+#include "jit/BaselineIC.h"
+#include "jit/JitFrames.h"
+#include "jit/MacroAssembler.h"
+#include "jit/SharedICRegisters.h"
+
+namespace js {
+namespace jit {
+
+static const size_t ICStackValueOffset = sizeof(void*);
+
+inline void EmitRestoreTailCallReg(MacroAssembler& masm) {
+  masm.Pop(ICTailCallReg);
+}
+
+inline void EmitRepushTailCallReg(MacroAssembler& masm) {
+  masm.Push(ICTailCallReg);
+}
+
+inline void EmitCallIC(MacroAssembler& masm, CodeOffset* callOffset) {
+  masm.call(Address(ICStubReg, ICStub::offsetOfStubCode()));
+  *callOffset = CodeOffset(masm.currentOffset());
+}
+
+inline void EmitReturnFromIC(MacroAssembler& masm) { masm.ret(); }
+
+inline void EmitBaselineLeaveStubFrame(MacroAssembler& masm) {
+  Address stubAddr(FramePointer, BaselineStubFrameLayout::ICStubOffsetFromFP);
+  masm.loadPtr(stubAddr, ICStubReg);
+
+  masm.mov(FramePointer, StackPointer);
+  masm.Pop(FramePointer);
+
+  masm.Pop(Operand(StackPointer, 0));
+}
+
+template <typename AddrType>
+inline void EmitPreBarrier(MacroAssembler& masm, const AddrType& addr,
+                           MIRType type) {
+  masm.guardedCallPreBarrier(addr, type);
+}
+
+inline void EmitStubGuardFailure(MacroAssembler& masm) {
+  masm.loadPtr(Address(ICStubReg, ICCacheIRStub::offsetOfNext()), ICStubReg);
+
+  masm.jmp(Operand(ICStubReg, ICStub::offsetOfStubCode()));
+}
+
+}  
+}  
+
+#endif /* jit_x64_SharedICHelpers_x64_h */

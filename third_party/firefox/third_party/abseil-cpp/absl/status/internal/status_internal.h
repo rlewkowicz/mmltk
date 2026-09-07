@@ -1,0 +1,132 @@
+// Copyright 2019 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+#ifndef ABSL_STATUS_INTERNAL_STATUS_INTERNAL_H_
+#define ABSL_STATUS_INTERNAL_STATUS_INTERNAL_H_
+
+// IWYU pragma: private, include "absl/status/status.h"
+
+#include <atomic>
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "absl/base/attributes.h"
+#include "absl/base/config.h"
+#include "absl/base/nullability.h"
+#include "absl/container/inlined_vector.h"
+#include "absl/strings/cord.h"
+#include "absl/strings/string_view.h"
+#include "absl/types/optional.h"
+#include "absl/types/optional_ref.h"
+#include "absl/types/source_location.h"
+#include "absl/types/span.h"
+
+#ifndef SWIG
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+#if ABSL_HAVE_CPP_ATTRIBUTE(nodiscard)
+class [[nodiscard]] ABSL_ATTRIBUTE_TRIVIAL_ABI
+    Status;
+#else
+class ABSL_MUST_USE_RESULT ABSL_ATTRIBUTE_TRIVIAL_ABI
+    Status;
+#endif
+
+ABSL_NAMESPACE_END
+}  
+#endif  // !SWIG
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+
+enum class StatusCode : int;
+enum class StatusToStringMode : int;
+
+namespace status_internal {
+#ifndef SWIG
+class StatusPrivateAccessor;
+class StatusPrivateAccessorForStatusBuilder;
+#endif  // !SWIG
+
+struct Payload {
+  std::string type_url;
+  absl::Cord payload;
+};
+
+using Payloads = absl::InlinedVector<Payload, 1>;
+
+class StatusRep {
+ public:
+  StatusRep(absl::StatusCode code_arg, absl::string_view message_arg,
+            std::unique_ptr<status_internal::Payloads> payloads_arg)
+      : ref_(int32_t{1}),
+        code_(code_arg),
+        message_(message_arg),
+        payloads_(std::move(payloads_arg)) {}
+
+  absl::StatusCode code() const { return code_; }
+  const std::string& message() const { return message_; }
+
+  void Ref() const { ref_.fetch_add(1, std::memory_order_relaxed); }
+  void Unref() const;
+
+  std::optional<absl::Cord> GetPayload(absl::string_view type_url) const;
+  void SetPayload(absl::string_view type_url, absl::Cord payload);
+  struct EraseResult {
+    bool erased;
+    uintptr_t new_rep;
+  };
+  EraseResult ErasePayload(absl::string_view type_url);
+  void ForEachPayload(
+      absl::FunctionRef<void(absl::string_view, const absl::Cord&)> visitor)
+      const;
+
+  absl::Span<const SourceLocation> GetSourceLocations() const;
+  void AddSourceLocation(absl::SourceLocation loc);
+
+  std::string ToString(StatusToStringMode mode) const;
+
+  bool operator==(const StatusRep& other) const;
+  bool operator!=(const StatusRep& other) const { return !(*this == other); }
+
+  StatusRep* absl_nonnull Clone(
+      absl::optional_ref<absl::string_view> new_message, bool include_payloads,
+      bool include_source_locations) const;
+
+  StatusRep* absl_nonnull CloneAndUnref(
+      absl::optional_ref<absl::string_view> new_message, bool include_payloads,
+      bool include_source_locations) const;
+  StatusRep* absl_nonnull CloneAndUnref() const;
+
+ private:
+  mutable std::atomic<int32_t> ref_;
+  absl::StatusCode code_;
+
+  std::string message_;
+  absl::InlinedVector<absl::SourceLocation, 1> source_locations_;
+  std::unique_ptr<status_internal::Payloads> payloads_;
+};
+
+absl::StatusCode MapToLocalCode(int value);
+
+ABSL_ATTRIBUTE_PURE_FUNCTION
+const char* absl_nonnull MakeCheckFailString(
+    const absl::Status* absl_nonnull status, const char* absl_nonnull prefix);
+
+}  
+
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_STATUS_INTERNAL_STATUS_INTERNAL_H_

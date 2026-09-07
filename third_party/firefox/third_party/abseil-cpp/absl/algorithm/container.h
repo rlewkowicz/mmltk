@@ -1,0 +1,1398 @@
+// Copyright 2017 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef ABSL_ALGORITHM_CONTAINER_H_
+#define ABSL_ALGORITHM_CONTAINER_H_
+
+#include <algorithm>
+#include <cassert>
+#include <cstddef>
+#include <iterator>
+#include <numeric>
+#include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+#include "absl/algorithm/algorithm.h"
+#include "absl/base/config.h"
+#include "absl/base/internal/hardening.h"
+#include "absl/base/internal/iterator_traits.h"
+#include "absl/base/macros.h"
+#include "absl/meta/type_traits.h"
+
+#ifdef __cpp_lib_span
+#include <span>  // NOLINT(build/c++20)
+#endif
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+
+template <typename T>
+class Span;
+
+namespace container_algorithm_internal {
+
+using std::begin;
+using std::end;
+
+template <typename C>
+using ContainerIter = decltype(begin(std::declval<C&>()));
+
+template <typename C1, typename C2>
+using ContainerIterPairType = decltype(std::make_pair(
+    std::declval<ContainerIter<C1>>(), std::declval<ContainerIter<C2>>()));
+
+template <typename C>
+using ContainerDifferenceType = decltype(std::distance(
+    std::declval<ContainerIter<C>>(), std::declval<ContainerIter<C>>()));
+
+template <typename C>
+using ContainerPointerType =
+    typename std::iterator_traits<ContainerIter<C>>::pointer;
+
+
+template <typename C>
+constexpr ContainerIter<C> c_begin(C& c) {
+  return begin(c);
+}
+
+template <typename C>
+constexpr ContainerIter<C> c_end(C& c) {
+  return end(c);
+}
+
+template <typename InputSequence, typename Size, typename OutputRange>
+constexpr void AssertCopyNSize(InputSequence& input, Size n,
+                               OutputRange& output) {
+  using InputIter = ContainerIter<InputSequence>;
+  using OutputIter = ContainerIter<OutputRange>;
+
+  if constexpr (base_internal::IsAtLeastForwardIterator<InputIter>::value) {
+    base_internal::HardeningAssertLE(
+        n, std::distance(container_algorithm_internal::c_begin(input),
+                         container_algorithm_internal::c_end(input)));
+  }
+  if constexpr (base_internal::IsAtLeastForwardIterator<OutputIter>::value) {
+    base_internal::HardeningAssertLE(
+        n, std::distance(container_algorithm_internal::c_begin(output),
+                         container_algorithm_internal::c_end(output)));
+  }
+}
+
+template <typename InputSequence, typename OutputRange>
+constexpr void AssertCopySize(InputSequence& input, OutputRange& output) {
+  using InputIter = ContainerIter<InputSequence>;
+  using OutputIter = ContainerIter<OutputRange>;
+  if constexpr (base_internal::IsAtLeastForwardIterator<InputIter>::value &&
+                base_internal::IsAtLeastForwardIterator<OutputIter>::value) {
+    base_internal::HardeningAssertLE(
+        std::distance(container_algorithm_internal::c_begin(input),
+                      container_algorithm_internal::c_end(input)),
+        std::distance(container_algorithm_internal::c_begin(output),
+                      container_algorithm_internal::c_end(output)));
+  }
+}
+
+template <typename T>
+struct IsUnorderedContainer : std::false_type {};
+
+template <class Key, class T, class Hash, class KeyEqual, class Allocator>
+struct IsUnorderedContainer<
+    std::unordered_map<Key, T, Hash, KeyEqual, Allocator>> : std::true_type {};
+
+template <class Key, class Hash, class KeyEqual, class Allocator>
+struct IsUnorderedContainer<std::unordered_set<Key, Hash, KeyEqual, Allocator>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct HasBeginEnd : std::false_type {};
+
+template <typename T>
+struct HasBeginEnd<T, std::void_t<decltype(container_algorithm_internal::begin(
+                                      std::declval<T (*)()>()())),
+                                  decltype(container_algorithm_internal::end(
+                                      std::declval<T (*)()>()()))>>
+    : std::true_type {};
+
+template <class T>
+using IsMultidimensionalArray = std::is_array<std::remove_extent_t<T>>;
+
+template <typename Iter, typename = void>
+struct IsIterator : std::false_type {};
+
+template <typename Iter>
+struct IsIterator<
+    Iter, std::void_t<typename std::iterator_traits<Iter>::iterator_category>>
+    : std::true_type {};
+
+template <typename C, typename OutputIterator>
+using ResultOfRangeToIteratorTransfer =
+    std::enable_if_t<container_algorithm_internal::IsIterator<
+                         absl::remove_cvref_t<OutputIterator>>::value &&
+                         !container_algorithm_internal::IsMultidimensionalArray<
+                             std::remove_reference_t<C>>::value,
+                     std::decay_t<OutputIterator>>;
+
+template <typename T>
+struct IsSpan
+    : std::conditional_t<std::is_same_v<T, std::remove_cv_t<T>>,
+                         std::false_type, IsSpan<std::remove_cv_t<T>>> {};
+
+template <typename T>
+struct IsSpan<absl::Span<T>> : std::true_type {};
+
+#ifdef __cpp_lib_span
+template <typename T, size_t Extent>
+struct IsSpan<std::span<T, Extent>> : std::true_type {};
+#endif
+
+template <typename C>
+using IsPermissibleDestinationRange =
+    std::conditional_t<std::is_lvalue_reference<C>::value, std::true_type,
+                       IsSpan<C>>;
+
+template <typename C, typename OutputRange>
+using ResultOfRangeToRangeTransfer =
+    std::enable_if_t<container_algorithm_internal::HasBeginEnd<
+                         std::add_lvalue_reference_t<OutputRange>>::value &&
+                         !container_algorithm_internal::IsMultidimensionalArray<
+                             std::remove_reference_t<OutputRange>>::value &&
+                         !container_algorithm_internal::IsMultidimensionalArray<
+                             std::remove_reference_t<C>>::value &&
+                         container_algorithm_internal::
+                             IsPermissibleDestinationRange<OutputRange>::value,
+                     void>;
+
+}  
+
+
+
+template <typename C, typename EqualityComparable>
+constexpr bool c_linear_search(const C& c, EqualityComparable&& value) {
+  return absl::linear_search(container_algorithm_internal::c_begin(c),
+                             container_algorithm_internal::c_end(c),
+                             std::forward<EqualityComparable>(value));
+}
+
+
+template <typename C>
+constexpr container_algorithm_internal::ContainerDifferenceType<const C>
+c_distance(const C& c) {
+  return std::distance(container_algorithm_internal::c_begin(c),
+                       container_algorithm_internal::c_end(c));
+}
+
+
+template <typename C, typename Pred>
+constexpr bool c_all_of(const C& c, Pred&& pred) {
+  return std::all_of(container_algorithm_internal::c_begin(c),
+                     container_algorithm_internal::c_end(c),
+                     std::forward<Pred>(pred));
+}
+
+template <typename C, typename Pred>
+constexpr bool c_any_of(const C& c, Pred&& pred) {
+  return std::any_of(container_algorithm_internal::c_begin(c),
+                     container_algorithm_internal::c_end(c),
+                     std::forward<Pred>(pred));
+}
+
+template <typename C, typename Pred>
+constexpr bool c_none_of(const C& c, Pred&& pred) {
+  return std::none_of(container_algorithm_internal::c_begin(c),
+                      container_algorithm_internal::c_end(c),
+                      std::forward<Pred>(pred));
+}
+
+template <typename C, typename Function>
+constexpr std::decay_t<Function> c_for_each(C&& c, Function&& f) {
+  return std::for_each(container_algorithm_internal::c_begin(c),
+                       container_algorithm_internal::c_end(c),
+                       std::forward<Function>(f));
+}
+
+template <typename C, typename T>
+constexpr container_algorithm_internal::ContainerIter<C> c_find(C& c,
+                                                                T&& value) {
+  return std::find(container_algorithm_internal::c_begin(c),
+                   container_algorithm_internal::c_end(c),
+                   std::forward<T>(value));
+}
+
+template <typename Sequence, typename T>
+constexpr bool c_contains(const Sequence& sequence, T&& value) {
+  return absl::c_find(sequence, std::forward<T>(value)) !=
+         container_algorithm_internal::c_end(sequence);
+}
+
+template <typename C, typename Pred>
+constexpr container_algorithm_internal::ContainerIter<C> c_find_if(
+    C& c, Pred&& pred) {
+  return std::find_if(container_algorithm_internal::c_begin(c),
+                      container_algorithm_internal::c_end(c),
+                      std::forward<Pred>(pred));
+}
+
+template <typename C, typename Pred>
+constexpr container_algorithm_internal::ContainerIter<C> c_find_if_not(
+    C& c, Pred&& pred) {
+  return std::find_if_not(container_algorithm_internal::c_begin(c),
+                          container_algorithm_internal::c_end(c),
+                          std::forward<Pred>(pred));
+}
+
+template <typename Sequence1, typename Sequence2>
+constexpr container_algorithm_internal::ContainerIter<Sequence1> c_find_end(
+    Sequence1& sequence, Sequence2& subsequence) {
+  return std::find_end(container_algorithm_internal::c_begin(sequence),
+                       container_algorithm_internal::c_end(sequence),
+                       container_algorithm_internal::c_begin(subsequence),
+                       container_algorithm_internal::c_end(subsequence));
+}
+
+template <typename Sequence1, typename Sequence2, typename BinaryPredicate>
+constexpr container_algorithm_internal::ContainerIter<Sequence1> c_find_end(
+    Sequence1& sequence, Sequence2& subsequence, BinaryPredicate&& pred) {
+  return std::find_end(container_algorithm_internal::c_begin(sequence),
+                       container_algorithm_internal::c_end(sequence),
+                       container_algorithm_internal::c_begin(subsequence),
+                       container_algorithm_internal::c_end(subsequence),
+                       std::forward<BinaryPredicate>(pred));
+}
+
+template <typename C1, typename C2>
+constexpr container_algorithm_internal::ContainerIter<C1> c_find_first_of(
+    C1& container, const C2& options) {
+  return std::find_first_of(container_algorithm_internal::c_begin(container),
+                            container_algorithm_internal::c_end(container),
+                            container_algorithm_internal::c_begin(options),
+                            container_algorithm_internal::c_end(options));
+}
+
+template <typename C1, typename C2, typename BinaryPredicate>
+constexpr container_algorithm_internal::ContainerIter<C1> c_find_first_of(
+    C1& container, const C2& options, BinaryPredicate&& pred) {
+  return std::find_first_of(container_algorithm_internal::c_begin(container),
+                            container_algorithm_internal::c_end(container),
+                            container_algorithm_internal::c_begin(options),
+                            container_algorithm_internal::c_end(options),
+                            std::forward<BinaryPredicate>(pred));
+}
+
+template <typename Sequence>
+constexpr container_algorithm_internal::ContainerIter<Sequence> c_adjacent_find(
+    Sequence& sequence) {
+  return std::adjacent_find(container_algorithm_internal::c_begin(sequence),
+                            container_algorithm_internal::c_end(sequence));
+}
+
+template <typename Sequence, typename BinaryPredicate>
+constexpr container_algorithm_internal::ContainerIter<Sequence> c_adjacent_find(
+    Sequence& sequence, BinaryPredicate&& pred) {
+  return std::adjacent_find(container_algorithm_internal::c_begin(sequence),
+                            container_algorithm_internal::c_end(sequence),
+                            std::forward<BinaryPredicate>(pred));
+}
+
+template <typename C, typename T>
+constexpr container_algorithm_internal::ContainerDifferenceType<const C>
+c_count(const C& c, T&& value) {
+  return std::count(container_algorithm_internal::c_begin(c),
+                    container_algorithm_internal::c_end(c),
+                    std::forward<T>(value));
+}
+
+template <typename C, typename Pred>
+constexpr container_algorithm_internal::ContainerDifferenceType<const C>
+c_count_if(const C& c, Pred&& pred) {
+  return std::count_if(container_algorithm_internal::c_begin(c),
+                       container_algorithm_internal::c_end(c),
+                       std::forward<Pred>(pred));
+}
+
+template <typename C1, typename C2>
+constexpr container_algorithm_internal::ContainerIterPairType<C1, C2>
+c_mismatch(C1& c1, C2& c2) {
+  return std::mismatch(container_algorithm_internal::c_begin(c1),
+                       container_algorithm_internal::c_end(c1),
+                       container_algorithm_internal::c_begin(c2),
+                       container_algorithm_internal::c_end(c2));
+}
+
+template <typename C1, typename C2, typename BinaryPredicate>
+constexpr container_algorithm_internal::ContainerIterPairType<C1, C2>
+c_mismatch(C1& c1, C2& c2, BinaryPredicate pred) {
+  return std::mismatch(container_algorithm_internal::c_begin(c1),
+                       container_algorithm_internal::c_end(c1),
+                       container_algorithm_internal::c_begin(c2),
+                       container_algorithm_internal::c_end(c2), pred);
+}
+
+template <typename C1, typename C2>
+constexpr bool c_equal(const C1& c1, const C2& c2) {
+  return std::equal(container_algorithm_internal::c_begin(c1),
+                    container_algorithm_internal::c_end(c1),
+                    container_algorithm_internal::c_begin(c2),
+                    container_algorithm_internal::c_end(c2));
+}
+
+template <typename C1, typename C2, typename BinaryPredicate>
+constexpr bool c_equal(const C1& c1, const C2& c2, BinaryPredicate&& pred) {
+  return std::equal(container_algorithm_internal::c_begin(c1),
+                    container_algorithm_internal::c_end(c1),
+                    container_algorithm_internal::c_begin(c2),
+                    container_algorithm_internal::c_end(c2),
+                    std::forward<BinaryPredicate>(pred));
+}
+
+template <typename C1, typename C2>
+constexpr bool c_is_permutation(const C1& c1, const C2& c2) {
+  return std::is_permutation(container_algorithm_internal::c_begin(c1),
+                             container_algorithm_internal::c_end(c1),
+                             container_algorithm_internal::c_begin(c2),
+                             container_algorithm_internal::c_end(c2));
+}
+
+template <typename C1, typename C2, typename BinaryPredicate>
+constexpr bool c_is_permutation(const C1& c1, const C2& c2,
+                                BinaryPredicate&& pred) {
+  return std::is_permutation(container_algorithm_internal::c_begin(c1),
+                             container_algorithm_internal::c_end(c1),
+                             container_algorithm_internal::c_begin(c2),
+                             container_algorithm_internal::c_end(c2),
+                             std::forward<BinaryPredicate>(pred));
+}
+
+template <typename Sequence1, typename Sequence2>
+constexpr container_algorithm_internal::ContainerIter<Sequence1> c_search(
+    Sequence1& sequence, Sequence2& subsequence) {
+  return std::search(container_algorithm_internal::c_begin(sequence),
+                     container_algorithm_internal::c_end(sequence),
+                     container_algorithm_internal::c_begin(subsequence),
+                     container_algorithm_internal::c_end(subsequence));
+}
+
+template <typename Sequence1, typename Sequence2, typename BinaryPredicate>
+constexpr container_algorithm_internal::ContainerIter<Sequence1> c_search(
+    Sequence1& sequence, Sequence2& subsequence, BinaryPredicate&& pred) {
+  return std::search(container_algorithm_internal::c_begin(sequence),
+                     container_algorithm_internal::c_end(sequence),
+                     container_algorithm_internal::c_begin(subsequence),
+                     container_algorithm_internal::c_end(subsequence),
+                     std::forward<BinaryPredicate>(pred));
+}
+
+template <typename Sequence1, typename Sequence2>
+constexpr bool c_contains_subrange(Sequence1& sequence,
+                                   Sequence2& subsequence) {
+  return absl::c_search(sequence, subsequence) !=
+         container_algorithm_internal::c_end(sequence);
+}
+
+template <typename Sequence1, typename Sequence2, typename BinaryPredicate>
+constexpr bool c_contains_subrange(Sequence1& sequence, Sequence2& subsequence,
+                                   BinaryPredicate&& pred) {
+  return absl::c_search(sequence, subsequence,
+                        std::forward<BinaryPredicate>(pred)) !=
+         container_algorithm_internal::c_end(sequence);
+}
+
+template <typename Sequence, typename Size, typename T>
+constexpr container_algorithm_internal::ContainerIter<Sequence> c_search_n(
+    Sequence& sequence, Size count, T&& value) {
+  return std::search_n(container_algorithm_internal::c_begin(sequence),
+                       container_algorithm_internal::c_end(sequence), count,
+                       std::forward<T>(value));
+}
+
+template <typename Sequence, typename Size, typename T,
+          typename BinaryPredicate>
+constexpr container_algorithm_internal::ContainerIter<Sequence> c_search_n(
+    Sequence& sequence, Size count, T&& value, BinaryPredicate&& pred) {
+  return std::search_n(container_algorithm_internal::c_begin(sequence),
+                       container_algorithm_internal::c_end(sequence), count,
+                       std::forward<T>(value),
+                       std::forward<BinaryPredicate>(pred));
+}
+
+
+template <typename InputSequence, typename OutputIterator>
+constexpr container_algorithm_internal::ResultOfRangeToIteratorTransfer<
+    InputSequence, OutputIterator>
+c_copy(const InputSequence& input, OutputIterator&& output) {
+  return std::copy(container_algorithm_internal::c_begin(input),
+                   container_algorithm_internal::c_end(input),
+                   std::forward<OutputIterator>(output));
+}
+
+
+template <typename InputSequence, typename OutputRange>
+constexpr container_algorithm_internal::ResultOfRangeToRangeTransfer<
+    InputSequence, OutputRange>
+c_copy(const InputSequence& input, OutputRange&& output) {
+  container_algorithm_internal::AssertCopySize(input, output);
+  absl::c_copy(input, container_algorithm_internal::c_begin(output));
+}
+
+template <typename C, typename Size, typename OutputIterator>
+constexpr container_algorithm_internal::ResultOfRangeToIteratorTransfer<
+    C, OutputIterator>
+c_copy_n(const C& input, Size n, OutputIterator&& output) {
+  return std::copy_n(container_algorithm_internal::c_begin(input), n,
+                     std::forward<OutputIterator>(output));
+}
+
+template <typename C, typename Size, typename OutputRange>
+constexpr container_algorithm_internal::ResultOfRangeToRangeTransfer<
+    C, OutputRange>
+c_copy_n(const C& input, Size n, OutputRange&& output) {
+  container_algorithm_internal::AssertCopyNSize(input, n, output);
+  absl::c_copy_n(input, n, container_algorithm_internal::c_begin(output));
+}
+
+template <typename InputSequence, typename OutputIterator, typename Pred>
+constexpr OutputIterator c_copy_if(const InputSequence& input,
+                                   OutputIterator output, Pred&& pred) {
+  return std::copy_if(container_algorithm_internal::c_begin(input),
+                      container_algorithm_internal::c_end(input), output,
+                      std::forward<Pred>(pred));
+}
+
+template <typename C, typename BidirectionalIterator>
+constexpr BidirectionalIterator c_copy_backward(const C& src,
+                                                BidirectionalIterator dest) {
+  return std::copy_backward(container_algorithm_internal::c_begin(src),
+                            container_algorithm_internal::c_end(src), dest);
+}
+
+template <typename C, typename OutputIterator>
+constexpr container_algorithm_internal::ResultOfRangeToIteratorTransfer<
+    C, OutputIterator>
+c_move(C&& src, OutputIterator&& dest) {
+  return std::move(container_algorithm_internal::c_begin(src),
+                   container_algorithm_internal::c_end(src),
+                   std::forward<OutputIterator>(dest));
+}
+
+template <typename C, typename OutputRange>
+constexpr container_algorithm_internal::ResultOfRangeToRangeTransfer<
+    C, OutputRange>
+c_move(C&& src, OutputRange&& dest) {
+  container_algorithm_internal::AssertCopySize(src, dest);
+  absl::c_move(std::forward<C>(src),
+               container_algorithm_internal::c_begin(dest));
+}
+
+template <typename C, typename BidirectionalIterator>
+constexpr BidirectionalIterator c_move_backward(C&& src,
+                                                BidirectionalIterator dest) {
+  return std::move_backward(container_algorithm_internal::c_begin(src),
+                            container_algorithm_internal::c_end(src), dest);
+}
+
+template <typename C1, typename C2>
+constexpr container_algorithm_internal::ContainerIter<C2> c_swap_ranges(
+    C1& c1, C2& c2) {
+  auto first1 = container_algorithm_internal::c_begin(c1);
+  auto last1 = container_algorithm_internal::c_end(c1);
+  auto first2 = container_algorithm_internal::c_begin(c2);
+  auto last2 = container_algorithm_internal::c_end(c2);
+
+  using std::swap;
+  for (; first1 != last1 && first2 != last2; ++first1, (void)++first2) {
+    swap(*first1, *first2);
+  }
+  return first2;
+}
+
+template <typename InputSequence, typename OutputIterator, typename UnaryOp>
+constexpr container_algorithm_internal::ResultOfRangeToIteratorTransfer<
+    InputSequence, OutputIterator>
+c_transform(const InputSequence& input, OutputIterator&& output,
+            UnaryOp&& unary_op) {
+  return std::transform(container_algorithm_internal::c_begin(input),
+                        container_algorithm_internal::c_end(input),
+                        std::forward<OutputIterator>(output),
+                        std::forward<UnaryOp>(unary_op));
+}
+
+template <typename InputSequence, typename OutputRange, typename UnaryOp>
+constexpr container_algorithm_internal::ResultOfRangeToRangeTransfer<
+    InputSequence, OutputRange>
+c_transform(const InputSequence& input, OutputRange&& output,
+            UnaryOp&& unary_op) {
+  container_algorithm_internal::AssertCopySize(input, output);
+  absl::c_transform(
+      input,
+      container_algorithm_internal::c_begin(std::forward<OutputRange>(output)),
+      std::forward<UnaryOp>(unary_op));
+}
+
+template <typename InputSequence1, typename InputSequence2,
+          typename OutputIterator, typename BinaryOp>
+constexpr container_algorithm_internal::ResultOfRangeToIteratorTransfer<
+    InputSequence1, OutputIterator>
+c_transform(const InputSequence1& input1, const InputSequence2& input2,
+            OutputIterator&& output, BinaryOp&& binary_op) {
+  auto first1 = container_algorithm_internal::c_begin(input1);
+  auto last1 = container_algorithm_internal::c_end(input1);
+  auto first2 = container_algorithm_internal::c_begin(input2);
+  auto last2 = container_algorithm_internal::c_end(input2);
+  std::decay_t<OutputIterator> out = std::forward<OutputIterator>(output);
+  for (; first1 != last1 && first2 != last2; ++first1, (void)++first2, ++out) {
+    *out = binary_op(*first1, *first2);
+  }
+  return out;
+}
+
+template <typename InputSequence1, typename InputSequence2,
+          typename OutputRange, typename BinaryOp>
+constexpr std::common_type_t<
+    container_algorithm_internal::ResultOfRangeToRangeTransfer<InputSequence1,
+                                                               OutputRange>,
+    container_algorithm_internal::ResultOfRangeToRangeTransfer<InputSequence2,
+                                                               OutputRange>>
+c_transform(const InputSequence1& input1, const InputSequence2& input2,
+            OutputRange&& output, BinaryOp&& binary_op) {
+  using InputIter1 =
+      container_algorithm_internal::ContainerIter<InputSequence1>;
+  using InputIter2 =
+      container_algorithm_internal::ContainerIter<InputSequence2>;
+  using OutputIter = container_algorithm_internal::ContainerIter<OutputRange>;
+  if constexpr (base_internal::IsAtLeastForwardIterator<OutputIter>::value) {
+    constexpr bool input1_has_size =
+        base_internal::IsAtLeastForwardIterator<InputIter1>::value;
+    constexpr bool input2_has_size =
+        base_internal::IsAtLeastForwardIterator<InputIter2>::value;
+    auto output_size =
+        std::distance(container_algorithm_internal::c_begin(output),
+                      container_algorithm_internal::c_end(output));
+
+    if constexpr (input1_has_size && input2_has_size) {
+      base_internal::HardeningAssertLE(
+          (std::min)(std::distance(
+                         container_algorithm_internal::c_begin(input1),
+                         container_algorithm_internal::c_end(input1)),
+                     std::distance(
+                         container_algorithm_internal::c_begin(input2),
+                         container_algorithm_internal::c_end(input2))),
+          output_size);
+    } else if constexpr (input1_has_size) {
+      base_internal::HardeningAssertLE(
+          std::distance(container_algorithm_internal::c_begin(input1),
+                        container_algorithm_internal::c_end(input1)),
+          output_size);
+    } else if constexpr (input2_has_size) {
+      base_internal::HardeningAssertLE(
+          std::distance(container_algorithm_internal::c_begin(input2),
+                        container_algorithm_internal::c_end(input2)),
+          output_size);
+    }
+  }
+  absl::c_transform(
+      input1, input2,
+      container_algorithm_internal::c_begin(std::forward<OutputRange>(output)),
+      std::forward<BinaryOp>(binary_op));
+}
+
+template <typename Sequence, typename T>
+constexpr void c_replace(Sequence& sequence, const T& old_value,
+                         const T& new_value) {
+  std::replace(container_algorithm_internal::c_begin(sequence),
+               container_algorithm_internal::c_end(sequence), old_value,
+               new_value);
+}
+
+template <typename C, typename Pred, typename T>
+constexpr void c_replace_if(C& c, Pred&& pred, T&& new_value) {
+  std::replace_if(container_algorithm_internal::c_begin(c),
+                  container_algorithm_internal::c_end(c),
+                  std::forward<Pred>(pred), std::forward<T>(new_value));
+}
+
+template <typename C, typename OutputIterator, typename T>
+constexpr OutputIterator c_replace_copy(const C& c, OutputIterator result,
+                                        T&& old_value, T&& new_value) {
+  return std::replace_copy(container_algorithm_internal::c_begin(c),
+                           container_algorithm_internal::c_end(c), result,
+                           std::forward<T>(old_value),
+                           std::forward<T>(new_value));
+}
+
+template <typename C, typename OutputIterator, typename Pred, typename T>
+constexpr OutputIterator c_replace_copy_if(const C& c, OutputIterator result,
+                                           Pred&& pred, const T& new_value) {
+  return std::replace_copy_if(container_algorithm_internal::c_begin(c),
+                              container_algorithm_internal::c_end(c), result,
+                              std::forward<Pred>(pred), new_value);
+}
+
+template <typename C, typename T>
+constexpr std::enable_if_t<
+    container_algorithm_internal::IsPermissibleDestinationRange<C>::value, void>
+c_fill(C&& c, const T& value) {
+  std::fill(container_algorithm_internal::c_begin(c),
+            container_algorithm_internal::c_end(c), value);
+}
+
+template <typename C, typename Size, typename T>
+constexpr std::enable_if_t<
+    container_algorithm_internal::IsPermissibleDestinationRange<C>::value, void>
+c_fill_n(C&& c, Size n, const T& value) {
+  std::fill_n(container_algorithm_internal::c_begin(c), n, value);
+}
+
+template <typename C, typename Generator>
+constexpr void c_generate(C& c, Generator&& gen) {
+  std::generate(container_algorithm_internal::c_begin(c),
+                container_algorithm_internal::c_end(c),
+                std::forward<Generator>(gen));
+}
+
+template <typename C, typename Size, typename Generator>
+constexpr container_algorithm_internal::ContainerIter<C> c_generate_n(
+    C& c, Size n, Generator&& gen) {
+  return std::generate_n(container_algorithm_internal::c_begin(c), n,
+                         std::forward<Generator>(gen));
+}
+
+
+template <typename C, typename OutputIterator, typename T>
+constexpr OutputIterator c_remove_copy(const C& c, OutputIterator result,
+                                       const T& value) {
+  return std::remove_copy(container_algorithm_internal::c_begin(c),
+                          container_algorithm_internal::c_end(c), result,
+                          value);
+}
+
+template <typename C, typename OutputIterator, typename Pred>
+constexpr OutputIterator c_remove_copy_if(const C& c, OutputIterator result,
+                                          Pred&& pred) {
+  return std::remove_copy_if(container_algorithm_internal::c_begin(c),
+                             container_algorithm_internal::c_end(c), result,
+                             std::forward<Pred>(pred));
+}
+
+template <typename C, typename OutputIterator>
+constexpr OutputIterator c_unique_copy(const C& c, OutputIterator result) {
+  return std::unique_copy(container_algorithm_internal::c_begin(c),
+                          container_algorithm_internal::c_end(c), result);
+}
+
+template <typename C, typename OutputIterator, typename BinaryPredicate>
+constexpr OutputIterator c_unique_copy(const C& c, OutputIterator result,
+                                       BinaryPredicate&& pred) {
+  return std::unique_copy(container_algorithm_internal::c_begin(c),
+                          container_algorithm_internal::c_end(c), result,
+                          std::forward<BinaryPredicate>(pred));
+}
+
+template <typename Sequence>
+constexpr void c_reverse(Sequence& sequence) {
+  std::reverse(container_algorithm_internal::c_begin(sequence),
+               container_algorithm_internal::c_end(sequence));
+}
+
+template <typename C, typename OutputIterator>
+constexpr OutputIterator c_reverse_copy(const C& sequence,
+                                        OutputIterator result) {
+  return std::reverse_copy(container_algorithm_internal::c_begin(sequence),
+                           container_algorithm_internal::c_end(sequence),
+                           result);
+}
+
+template <typename C,
+          typename Iterator = container_algorithm_internal::ContainerIter<C>>
+constexpr Iterator c_rotate(C& sequence, Iterator middle) {
+  return std::rotate(container_algorithm_internal::c_begin(sequence), middle,
+                     container_algorithm_internal::c_end(sequence));
+}
+
+template <typename C, typename OutputIterator>
+constexpr OutputIterator c_rotate_copy(
+    const C& sequence,
+    container_algorithm_internal::ContainerIter<const C> middle,
+    OutputIterator result) {
+  return std::rotate_copy(container_algorithm_internal::c_begin(sequence),
+                          middle, container_algorithm_internal::c_end(sequence),
+                          result);
+}
+
+template <typename RandomAccessContainer, typename UniformRandomBitGenerator>
+void c_shuffle(RandomAccessContainer& c, UniformRandomBitGenerator&& gen) {
+  std::shuffle(container_algorithm_internal::c_begin(c),
+               container_algorithm_internal::c_end(c),
+               std::forward<UniformRandomBitGenerator>(gen));
+}
+
+template <typename C, typename OutputIterator, typename Distance,
+          typename UniformRandomBitGenerator>
+OutputIterator c_sample(const C& c, OutputIterator result, Distance n,
+                        UniformRandomBitGenerator&& gen) {
+  return std::sample(container_algorithm_internal::c_begin(c),
+                     container_algorithm_internal::c_end(c), result, n,
+                     std::forward<UniformRandomBitGenerator>(gen));
+}
+
+
+template <typename C, typename Pred>
+constexpr bool c_is_partitioned(const C& c, Pred&& pred) {
+  return std::is_partitioned(container_algorithm_internal::c_begin(c),
+                             container_algorithm_internal::c_end(c),
+                             std::forward<Pred>(pred));
+}
+
+template <typename C, typename Pred>
+constexpr container_algorithm_internal::ContainerIter<C> c_partition(
+    C& c, Pred&& pred) {
+  return std::partition(container_algorithm_internal::c_begin(c),
+                        container_algorithm_internal::c_end(c),
+                        std::forward<Pred>(pred));
+}
+
+template <typename C, typename Pred>
+container_algorithm_internal::ContainerIter<C> c_stable_partition(C& c,
+                                                                  Pred&& pred) {
+  return std::stable_partition(container_algorithm_internal::c_begin(c),
+                               container_algorithm_internal::c_end(c),
+                               std::forward<Pred>(pred));
+}
+
+
+template <typename C, typename OutputIterator1, typename OutputIterator2,
+          typename Pred>
+constexpr std::pair<OutputIterator1, OutputIterator2> c_partition_copy(
+    const C& c, OutputIterator1 out_true, OutputIterator2 out_false,
+    Pred&& pred) {
+  return std::partition_copy(container_algorithm_internal::c_begin(c),
+                             container_algorithm_internal::c_end(c), out_true,
+                             out_false, std::forward<Pred>(pred));
+}
+
+template <typename C, typename Pred>
+constexpr container_algorithm_internal::ContainerIter<C> c_partition_point(
+    C& c, Pred&& pred) {
+  return std::partition_point(container_algorithm_internal::c_begin(c),
+                              container_algorithm_internal::c_end(c),
+                              std::forward<Pred>(pred));
+}
+
+
+template <typename C>
+constexpr void c_sort(C& c) {
+  std::sort(container_algorithm_internal::c_begin(c),
+            container_algorithm_internal::c_end(c));
+}
+
+template <typename C, typename LessThan>
+constexpr void c_sort(C& c, LessThan&& comp) {
+  std::sort(container_algorithm_internal::c_begin(c),
+            container_algorithm_internal::c_end(c),
+            std::forward<LessThan>(comp));
+}
+
+template <typename C>
+void c_stable_sort(C& c) {
+  std::stable_sort(container_algorithm_internal::c_begin(c),
+                   container_algorithm_internal::c_end(c));
+}
+
+template <typename C, typename LessThan>
+void c_stable_sort(C& c, LessThan&& comp) {
+  std::stable_sort(container_algorithm_internal::c_begin(c),
+                   container_algorithm_internal::c_end(c),
+                   std::forward<LessThan>(comp));
+}
+
+template <typename C>
+constexpr bool c_is_sorted(const C& c) {
+  return std::is_sorted(container_algorithm_internal::c_begin(c),
+                        container_algorithm_internal::c_end(c));
+}
+
+template <typename C, typename LessThan>
+constexpr bool c_is_sorted(const C& c, LessThan&& comp) {
+  return std::is_sorted(container_algorithm_internal::c_begin(c),
+                        container_algorithm_internal::c_end(c),
+                        std::forward<LessThan>(comp));
+}
+
+template <typename RandomAccessContainer>
+constexpr void c_partial_sort(
+    RandomAccessContainer& sequence,
+    container_algorithm_internal::ContainerIter<RandomAccessContainer> middle) {
+  std::partial_sort(container_algorithm_internal::c_begin(sequence), middle,
+                    container_algorithm_internal::c_end(sequence));
+}
+
+template <typename RandomAccessContainer, typename LessThan>
+constexpr void c_partial_sort(
+    RandomAccessContainer& sequence,
+    container_algorithm_internal::ContainerIter<RandomAccessContainer> middle,
+    LessThan&& comp) {
+  std::partial_sort(container_algorithm_internal::c_begin(sequence), middle,
+                    container_algorithm_internal::c_end(sequence),
+                    std::forward<LessThan>(comp));
+}
+
+template <typename C, typename RandomAccessContainer>
+constexpr container_algorithm_internal::ContainerIter<RandomAccessContainer>
+c_partial_sort_copy(const C& sequence, RandomAccessContainer& result) {
+  return std::partial_sort_copy(container_algorithm_internal::c_begin(sequence),
+                                container_algorithm_internal::c_end(sequence),
+                                container_algorithm_internal::c_begin(result),
+                                container_algorithm_internal::c_end(result));
+}
+
+template <typename C, typename RandomAccessContainer, typename LessThan>
+constexpr container_algorithm_internal::ContainerIter<RandomAccessContainer>
+c_partial_sort_copy(const C& sequence, RandomAccessContainer& result,
+                    LessThan&& comp) {
+  return std::partial_sort_copy(container_algorithm_internal::c_begin(sequence),
+                                container_algorithm_internal::c_end(sequence),
+                                container_algorithm_internal::c_begin(result),
+                                container_algorithm_internal::c_end(result),
+                                std::forward<LessThan>(comp));
+}
+
+template <typename C>
+constexpr container_algorithm_internal::ContainerIter<C> c_is_sorted_until(
+    C& c) {
+  return std::is_sorted_until(container_algorithm_internal::c_begin(c),
+                              container_algorithm_internal::c_end(c));
+}
+
+template <typename C, typename LessThan>
+constexpr container_algorithm_internal::ContainerIter<C> c_is_sorted_until(
+    C& c, LessThan&& comp) {
+  return std::is_sorted_until(container_algorithm_internal::c_begin(c),
+                              container_algorithm_internal::c_end(c),
+                              std::forward<LessThan>(comp));
+}
+
+template <typename RandomAccessContainer>
+constexpr void c_nth_element(
+    RandomAccessContainer& sequence,
+    container_algorithm_internal::ContainerIter<RandomAccessContainer> nth) {
+  std::nth_element(container_algorithm_internal::c_begin(sequence), nth,
+                   container_algorithm_internal::c_end(sequence));
+}
+
+template <typename RandomAccessContainer, typename LessThan>
+constexpr void c_nth_element(
+    RandomAccessContainer& sequence,
+    container_algorithm_internal::ContainerIter<RandomAccessContainer> nth,
+    LessThan&& comp) {
+  std::nth_element(container_algorithm_internal::c_begin(sequence), nth,
+                   container_algorithm_internal::c_end(sequence),
+                   std::forward<LessThan>(comp));
+}
+
+
+template <typename Sequence, typename T>
+constexpr container_algorithm_internal::ContainerIter<Sequence> c_lower_bound(
+    Sequence& sequence, const T& value) {
+  return std::lower_bound(container_algorithm_internal::c_begin(sequence),
+                          container_algorithm_internal::c_end(sequence), value);
+}
+
+template <typename Sequence, typename T, typename LessThan>
+constexpr container_algorithm_internal::ContainerIter<Sequence> c_lower_bound(
+    Sequence& sequence, const T& value, LessThan&& comp) {
+  return std::lower_bound(container_algorithm_internal::c_begin(sequence),
+                          container_algorithm_internal::c_end(sequence), value,
+                          std::forward<LessThan>(comp));
+}
+
+template <typename Sequence, typename T>
+constexpr container_algorithm_internal::ContainerIter<Sequence> c_upper_bound(
+    Sequence& sequence, const T& value) {
+  return std::upper_bound(container_algorithm_internal::c_begin(sequence),
+                          container_algorithm_internal::c_end(sequence), value);
+}
+
+template <typename Sequence, typename T, typename LessThan>
+constexpr container_algorithm_internal::ContainerIter<Sequence> c_upper_bound(
+    Sequence& sequence, const T& value, LessThan&& comp) {
+  return std::upper_bound(container_algorithm_internal::c_begin(sequence),
+                          container_algorithm_internal::c_end(sequence), value,
+                          std::forward<LessThan>(comp));
+}
+
+template <typename Sequence, typename T>
+constexpr container_algorithm_internal::ContainerIterPairType<Sequence,
+                                                              Sequence>
+c_equal_range(Sequence& sequence, const T& value) {
+  return std::equal_range(container_algorithm_internal::c_begin(sequence),
+                          container_algorithm_internal::c_end(sequence), value);
+}
+
+template <typename Sequence, typename T, typename LessThan>
+constexpr container_algorithm_internal::ContainerIterPairType<Sequence,
+                                                              Sequence>
+c_equal_range(Sequence& sequence, const T& value, LessThan&& comp) {
+  return std::equal_range(container_algorithm_internal::c_begin(sequence),
+                          container_algorithm_internal::c_end(sequence), value,
+                          std::forward<LessThan>(comp));
+}
+
+template <typename Sequence, typename T>
+constexpr bool c_binary_search(const Sequence& sequence, const T& value) {
+  return std::binary_search(container_algorithm_internal::c_begin(sequence),
+                            container_algorithm_internal::c_end(sequence),
+                            value);
+}
+
+template <typename Sequence, typename T, typename LessThan>
+constexpr bool c_binary_search(const Sequence& sequence, const T& value,
+                               LessThan&& comp) {
+  return std::binary_search(container_algorithm_internal::c_begin(sequence),
+                            container_algorithm_internal::c_end(sequence),
+                            value, std::forward<LessThan>(comp));
+}
+
+
+template <typename C1, typename C2, typename OutputIterator>
+constexpr OutputIterator c_merge(const C1& c1, const C2& c2,
+                                 OutputIterator result) {
+  return std::merge(container_algorithm_internal::c_begin(c1),
+                    container_algorithm_internal::c_end(c1),
+                    container_algorithm_internal::c_begin(c2),
+                    container_algorithm_internal::c_end(c2), result);
+}
+
+template <typename C1, typename C2, typename OutputIterator, typename LessThan>
+constexpr OutputIterator c_merge(const C1& c1, const C2& c2,
+                                 OutputIterator result, LessThan&& comp) {
+  return std::merge(container_algorithm_internal::c_begin(c1),
+                    container_algorithm_internal::c_end(c1),
+                    container_algorithm_internal::c_begin(c2),
+                    container_algorithm_internal::c_end(c2), result,
+                    std::forward<LessThan>(comp));
+}
+
+template <typename C>
+void c_inplace_merge(C& c,
+                     container_algorithm_internal::ContainerIter<C> middle) {
+  std::inplace_merge(container_algorithm_internal::c_begin(c), middle,
+                     container_algorithm_internal::c_end(c));
+}
+
+template <typename C, typename LessThan>
+void c_inplace_merge(C& c,
+                     container_algorithm_internal::ContainerIter<C> middle,
+                     LessThan&& comp) {
+  std::inplace_merge(container_algorithm_internal::c_begin(c), middle,
+                     container_algorithm_internal::c_end(c),
+                     std::forward<LessThan>(comp));
+}
+
+template <typename C1, typename C2>
+constexpr bool c_includes(const C1& c1, const C2& c2) {
+  return std::includes(container_algorithm_internal::c_begin(c1),
+                       container_algorithm_internal::c_end(c1),
+                       container_algorithm_internal::c_begin(c2),
+                       container_algorithm_internal::c_end(c2));
+}
+
+template <typename C1, typename C2, typename LessThan>
+constexpr bool c_includes(const C1& c1, const C2& c2, LessThan&& comp) {
+  return std::includes(container_algorithm_internal::c_begin(c1),
+                       container_algorithm_internal::c_end(c1),
+                       container_algorithm_internal::c_begin(c2),
+                       container_algorithm_internal::c_end(c2),
+                       std::forward<LessThan>(comp));
+}
+
+template <
+    typename C1, typename C2, typename OutputIterator,
+    typename = std::enable_if_t<
+        !container_algorithm_internal::IsUnorderedContainer<C1>::value, void>,
+    typename = std::enable_if_t<
+        !container_algorithm_internal::IsUnorderedContainer<C2>::value, void>>
+constexpr OutputIterator c_set_union(const C1& c1, const C2& c2,
+                                     OutputIterator output) {
+  return std::set_union(container_algorithm_internal::c_begin(c1),
+                        container_algorithm_internal::c_end(c1),
+                        container_algorithm_internal::c_begin(c2),
+                        container_algorithm_internal::c_end(c2), output);
+}
+
+template <
+    typename C1, typename C2, typename OutputIterator, typename LessThan,
+    typename = std::enable_if_t<
+        !container_algorithm_internal::IsUnorderedContainer<C1>::value, void>,
+    typename = std::enable_if_t<
+        !container_algorithm_internal::IsUnorderedContainer<C2>::value, void>>
+constexpr OutputIterator c_set_union(const C1& c1, const C2& c2,
+                                     OutputIterator output, LessThan&& comp) {
+  return std::set_union(container_algorithm_internal::c_begin(c1),
+                        container_algorithm_internal::c_end(c1),
+                        container_algorithm_internal::c_begin(c2),
+                        container_algorithm_internal::c_end(c2), output,
+                        std::forward<LessThan>(comp));
+}
+
+template <
+    typename C1, typename C2, typename OutputIterator,
+    typename = std::enable_if_t<
+        !container_algorithm_internal::IsUnorderedContainer<C1>::value, void>,
+    typename = std::enable_if_t<
+        !container_algorithm_internal::IsUnorderedContainer<C2>::value, void>>
+constexpr OutputIterator c_set_intersection(const C1& c1, const C2& c2,
+                                            OutputIterator output) {
+  ABSL_ASSERT(absl::c_is_sorted(c1));
+  ABSL_ASSERT(absl::c_is_sorted(c2));
+  return std::set_intersection(container_algorithm_internal::c_begin(c1),
+                               container_algorithm_internal::c_end(c1),
+                               container_algorithm_internal::c_begin(c2),
+                               container_algorithm_internal::c_end(c2), output);
+}
+
+template <
+    typename C1, typename C2, typename OutputIterator, typename LessThan,
+    typename = std::enable_if_t<
+        !container_algorithm_internal::IsUnorderedContainer<C1>::value, void>,
+    typename = std::enable_if_t<
+        !container_algorithm_internal::IsUnorderedContainer<C2>::value, void>>
+constexpr OutputIterator c_set_intersection(const C1& c1, const C2& c2,
+                                            OutputIterator output,
+                                            LessThan&& comp) {
+  ABSL_ASSERT(absl::c_is_sorted(c1, comp));
+  ABSL_ASSERT(absl::c_is_sorted(c2, comp));
+  return std::set_intersection(container_algorithm_internal::c_begin(c1),
+                               container_algorithm_internal::c_end(c1),
+                               container_algorithm_internal::c_begin(c2),
+                               container_algorithm_internal::c_end(c2), output,
+                               std::forward<LessThan>(comp));
+}
+
+template <
+    typename C1, typename C2, typename OutputIterator,
+    typename = std::enable_if_t<
+        !container_algorithm_internal::IsUnorderedContainer<C1>::value, void>,
+    typename = std::enable_if_t<
+        !container_algorithm_internal::IsUnorderedContainer<C2>::value, void>>
+constexpr OutputIterator c_set_difference(const C1& c1, const C2& c2,
+                                          OutputIterator output) {
+  return std::set_difference(container_algorithm_internal::c_begin(c1),
+                             container_algorithm_internal::c_end(c1),
+                             container_algorithm_internal::c_begin(c2),
+                             container_algorithm_internal::c_end(c2), output);
+}
+
+template <
+    typename C1, typename C2, typename OutputIterator, typename LessThan,
+    typename = std::enable_if_t<
+        !container_algorithm_internal::IsUnorderedContainer<C1>::value, void>,
+    typename = std::enable_if_t<
+        !container_algorithm_internal::IsUnorderedContainer<C2>::value, void>>
+constexpr OutputIterator c_set_difference(const C1& c1, const C2& c2,
+                                          OutputIterator output,
+                                          LessThan&& comp) {
+  return std::set_difference(container_algorithm_internal::c_begin(c1),
+                             container_algorithm_internal::c_end(c1),
+                             container_algorithm_internal::c_begin(c2),
+                             container_algorithm_internal::c_end(c2), output,
+                             std::forward<LessThan>(comp));
+}
+
+template <
+    typename C1, typename C2, typename OutputIterator,
+    typename = std::enable_if_t<
+        !container_algorithm_internal::IsUnorderedContainer<C1>::value, void>,
+    typename = std::enable_if_t<
+        !container_algorithm_internal::IsUnorderedContainer<C2>::value, void>>
+constexpr OutputIterator c_set_symmetric_difference(const C1& c1, const C2& c2,
+                                                    OutputIterator output) {
+  return std::set_symmetric_difference(
+      container_algorithm_internal::c_begin(c1),
+      container_algorithm_internal::c_end(c1),
+      container_algorithm_internal::c_begin(c2),
+      container_algorithm_internal::c_end(c2), output);
+}
+
+template <
+    typename C1, typename C2, typename OutputIterator, typename LessThan,
+    typename = std::enable_if_t<
+        !container_algorithm_internal::IsUnorderedContainer<C1>::value, void>,
+    typename = std::enable_if_t<
+        !container_algorithm_internal::IsUnorderedContainer<C2>::value, void>>
+constexpr OutputIterator c_set_symmetric_difference(const C1& c1, const C2& c2,
+                                                    OutputIterator output,
+                                                    LessThan&& comp) {
+  return std::set_symmetric_difference(
+      container_algorithm_internal::c_begin(c1),
+      container_algorithm_internal::c_end(c1),
+      container_algorithm_internal::c_begin(c2),
+      container_algorithm_internal::c_end(c2), output,
+      std::forward<LessThan>(comp));
+}
+
+
+template <typename RandomAccessContainer>
+constexpr void c_push_heap(RandomAccessContainer& sequence) {
+  std::push_heap(container_algorithm_internal::c_begin(sequence),
+                 container_algorithm_internal::c_end(sequence));
+}
+
+template <typename RandomAccessContainer, typename LessThan>
+constexpr void c_push_heap(RandomAccessContainer& sequence, LessThan&& comp) {
+  std::push_heap(container_algorithm_internal::c_begin(sequence),
+                 container_algorithm_internal::c_end(sequence),
+                 std::forward<LessThan>(comp));
+}
+
+template <typename RandomAccessContainer>
+constexpr void c_pop_heap(RandomAccessContainer& sequence) {
+  std::pop_heap(container_algorithm_internal::c_begin(sequence),
+                container_algorithm_internal::c_end(sequence));
+}
+
+template <typename RandomAccessContainer, typename LessThan>
+constexpr void c_pop_heap(RandomAccessContainer& sequence, LessThan&& comp) {
+  std::pop_heap(container_algorithm_internal::c_begin(sequence),
+                container_algorithm_internal::c_end(sequence),
+                std::forward<LessThan>(comp));
+}
+
+template <typename RandomAccessContainer>
+constexpr void c_make_heap(RandomAccessContainer& sequence) {
+  std::make_heap(container_algorithm_internal::c_begin(sequence),
+                 container_algorithm_internal::c_end(sequence));
+}
+
+template <typename RandomAccessContainer, typename LessThan>
+constexpr void c_make_heap(RandomAccessContainer& sequence, LessThan&& comp) {
+  std::make_heap(container_algorithm_internal::c_begin(sequence),
+                 container_algorithm_internal::c_end(sequence),
+                 std::forward<LessThan>(comp));
+}
+
+template <typename RandomAccessContainer>
+constexpr void c_sort_heap(RandomAccessContainer& sequence) {
+  std::sort_heap(container_algorithm_internal::c_begin(sequence),
+                 container_algorithm_internal::c_end(sequence));
+}
+
+template <typename RandomAccessContainer, typename LessThan>
+constexpr void c_sort_heap(RandomAccessContainer& sequence, LessThan&& comp) {
+  std::sort_heap(container_algorithm_internal::c_begin(sequence),
+                 container_algorithm_internal::c_end(sequence),
+                 std::forward<LessThan>(comp));
+}
+
+template <typename RandomAccessContainer>
+constexpr bool c_is_heap(const RandomAccessContainer& sequence) {
+  return std::is_heap(container_algorithm_internal::c_begin(sequence),
+                      container_algorithm_internal::c_end(sequence));
+}
+
+template <typename RandomAccessContainer, typename LessThan>
+constexpr bool c_is_heap(const RandomAccessContainer& sequence,
+                         LessThan&& comp) {
+  return std::is_heap(container_algorithm_internal::c_begin(sequence),
+                      container_algorithm_internal::c_end(sequence),
+                      std::forward<LessThan>(comp));
+}
+
+template <typename RandomAccessContainer>
+constexpr container_algorithm_internal::ContainerIter<RandomAccessContainer>
+c_is_heap_until(RandomAccessContainer& sequence) {
+  return std::is_heap_until(container_algorithm_internal::c_begin(sequence),
+                            container_algorithm_internal::c_end(sequence));
+}
+
+template <typename RandomAccessContainer, typename LessThan>
+constexpr container_algorithm_internal::ContainerIter<RandomAccessContainer>
+c_is_heap_until(RandomAccessContainer& sequence, LessThan&& comp) {
+  return std::is_heap_until(container_algorithm_internal::c_begin(sequence),
+                            container_algorithm_internal::c_end(sequence),
+                            std::forward<LessThan>(comp));
+}
+
+
+template <typename Sequence>
+constexpr container_algorithm_internal::ContainerIter<Sequence> c_min_element(
+    Sequence& sequence) {
+  return std::min_element(container_algorithm_internal::c_begin(sequence),
+                          container_algorithm_internal::c_end(sequence));
+}
+
+template <typename Sequence, typename LessThan>
+constexpr container_algorithm_internal::ContainerIter<Sequence> c_min_element(
+    Sequence& sequence, LessThan&& comp) {
+  return std::min_element(container_algorithm_internal::c_begin(sequence),
+                          container_algorithm_internal::c_end(sequence),
+                          std::forward<LessThan>(comp));
+}
+
+template <typename Sequence>
+constexpr container_algorithm_internal::ContainerIter<Sequence> c_max_element(
+    Sequence& sequence) {
+  return std::max_element(container_algorithm_internal::c_begin(sequence),
+                          container_algorithm_internal::c_end(sequence));
+}
+
+template <typename Sequence, typename LessThan>
+constexpr container_algorithm_internal::ContainerIter<Sequence> c_max_element(
+    Sequence& sequence, LessThan&& comp) {
+  return std::max_element(container_algorithm_internal::c_begin(sequence),
+                          container_algorithm_internal::c_end(sequence),
+                          std::forward<LessThan>(comp));
+}
+
+template <typename C>
+constexpr container_algorithm_internal::ContainerIterPairType<C, C>
+c_minmax_element(C& c) {
+  return std::minmax_element(container_algorithm_internal::c_begin(c),
+                             container_algorithm_internal::c_end(c));
+}
+
+template <typename C, typename LessThan>
+constexpr container_algorithm_internal::ContainerIterPairType<C, C>
+c_minmax_element(C& c, LessThan&& comp) {
+  return std::minmax_element(container_algorithm_internal::c_begin(c),
+                             container_algorithm_internal::c_end(c),
+                             std::forward<LessThan>(comp));
+}
+
+
+template <typename Sequence1, typename Sequence2>
+constexpr bool c_lexicographical_compare(const Sequence1& sequence1,
+                                         const Sequence2& sequence2) {
+  return std::lexicographical_compare(
+      container_algorithm_internal::c_begin(sequence1),
+      container_algorithm_internal::c_end(sequence1),
+      container_algorithm_internal::c_begin(sequence2),
+      container_algorithm_internal::c_end(sequence2));
+}
+
+template <typename Sequence1, typename Sequence2, typename LessThan>
+constexpr bool c_lexicographical_compare(const Sequence1& sequence1,
+                                         const Sequence2& sequence2,
+                                         LessThan&& comp) {
+  return std::lexicographical_compare(
+      container_algorithm_internal::c_begin(sequence1),
+      container_algorithm_internal::c_end(sequence1),
+      container_algorithm_internal::c_begin(sequence2),
+      container_algorithm_internal::c_end(sequence2),
+      std::forward<LessThan>(comp));
+}
+
+template <typename C>
+constexpr bool c_next_permutation(C& c) {
+  return std::next_permutation(container_algorithm_internal::c_begin(c),
+                               container_algorithm_internal::c_end(c));
+}
+
+template <typename C, typename LessThan>
+constexpr bool c_next_permutation(C& c, LessThan&& comp) {
+  return std::next_permutation(container_algorithm_internal::c_begin(c),
+                               container_algorithm_internal::c_end(c),
+                               std::forward<LessThan>(comp));
+}
+
+template <typename C>
+constexpr bool c_prev_permutation(C& c) {
+  return std::prev_permutation(container_algorithm_internal::c_begin(c),
+                               container_algorithm_internal::c_end(c));
+}
+
+template <typename C, typename LessThan>
+constexpr bool c_prev_permutation(C& c, LessThan&& comp) {
+  return std::prev_permutation(container_algorithm_internal::c_begin(c),
+                               container_algorithm_internal::c_end(c),
+                               std::forward<LessThan>(comp));
+}
+
+
+template <typename Sequence, typename T>
+constexpr void c_iota(Sequence& sequence, const T& value) {
+  std::iota(container_algorithm_internal::c_begin(sequence),
+            container_algorithm_internal::c_end(sequence), value);
+}
+
+template <typename Sequence, typename T>
+constexpr std::decay_t<T> c_accumulate(const Sequence& sequence, T&& init) {
+  return std::accumulate(container_algorithm_internal::c_begin(sequence),
+                         container_algorithm_internal::c_end(sequence),
+                         std::forward<T>(init));
+}
+
+template <typename Sequence, typename T, typename BinaryOp>
+constexpr std::decay_t<T> c_accumulate(const Sequence& sequence, T&& init,
+                                       BinaryOp&& binary_op) {
+  return std::accumulate(container_algorithm_internal::c_begin(sequence),
+                         container_algorithm_internal::c_end(sequence),
+                         std::forward<T>(init),
+                         std::forward<BinaryOp>(binary_op));
+}
+
+template <typename Sequence1, typename Sequence2, typename T>
+constexpr std::decay_t<T> c_inner_product(const Sequence1& factors1,
+                                          const Sequence2& factors2, T&& sum) {
+  return std::inner_product(container_algorithm_internal::c_begin(factors1),
+                            container_algorithm_internal::c_end(factors1),
+                            container_algorithm_internal::c_begin(factors2),
+                            std::forward<T>(sum));
+}
+
+template <typename Sequence1, typename Sequence2, typename T,
+          typename BinaryOp1, typename BinaryOp2>
+constexpr std::decay_t<T> c_inner_product(const Sequence1& factors1,
+                                          const Sequence2& factors2, T&& sum,
+                                          BinaryOp1&& op1, BinaryOp2&& op2) {
+  return std::inner_product(container_algorithm_internal::c_begin(factors1),
+                            container_algorithm_internal::c_end(factors1),
+                            container_algorithm_internal::c_begin(factors2),
+                            std::forward<T>(sum), std::forward<BinaryOp1>(op1),
+                            std::forward<BinaryOp2>(op2));
+}
+
+template <typename InputSequence, typename OutputIt>
+constexpr OutputIt c_adjacent_difference(const InputSequence& input,
+                                         OutputIt output_first) {
+  return std::adjacent_difference(container_algorithm_internal::c_begin(input),
+                                  container_algorithm_internal::c_end(input),
+                                  output_first);
+}
+
+template <typename InputSequence, typename OutputIt, typename BinaryOp>
+constexpr OutputIt c_adjacent_difference(const InputSequence& input,
+                                         OutputIt output_first, BinaryOp&& op) {
+  return std::adjacent_difference(container_algorithm_internal::c_begin(input),
+                                  container_algorithm_internal::c_end(input),
+                                  output_first, std::forward<BinaryOp>(op));
+}
+
+template <typename InputSequence, typename OutputIt>
+constexpr OutputIt c_partial_sum(const InputSequence& input,
+                                 OutputIt output_first) {
+  return std::partial_sum(container_algorithm_internal::c_begin(input),
+                          container_algorithm_internal::c_end(input),
+                          output_first);
+}
+
+template <typename InputSequence, typename OutputIt, typename BinaryOp>
+constexpr OutputIt c_partial_sum(const InputSequence& input,
+                                 OutputIt output_first, BinaryOp&& op) {
+  return std::partial_sum(container_algorithm_internal::c_begin(input),
+                          container_algorithm_internal::c_end(input),
+                          output_first, std::forward<BinaryOp>(op));
+}
+
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_ALGORITHM_CONTAINER_H_

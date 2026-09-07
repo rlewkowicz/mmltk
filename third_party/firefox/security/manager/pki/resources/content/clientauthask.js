@@ -1,0 +1,136 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+"use strict";
+
+
+
+var certArray;
+
+var args;
+
+async function onLoad() {
+  let rememberSetting = Services.prefs.getIntPref(
+    "security.client_auth_certificate_default_remember_setting"
+  );
+  document.getElementById("rememberSetting").value =
+    rememberSetting >= 0 && rememberSetting <= 2 ? rememberSetting : 2;
+
+  let propBag = window.arguments[0]
+    .QueryInterface(Ci.nsIWritablePropertyBag2)
+    .QueryInterface(Ci.nsIWritablePropertyBag);
+  args = {};
+  for (let prop of propBag.enumerator) {
+    args[prop.name] = prop.value;
+  }
+
+  certArray = args.certArray;
+
+  document.l10n.setAttributes(
+    document.getElementById("clientAuthSiteIdentification"),
+    "client-auth-site-identification",
+    { hostname: args.hostname }
+  );
+
+  let selectElement = document.getElementById("nicknames");
+  for (let i = 0; i < certArray.length; i++) {
+    let menuItemNode = document.createXULElement("menuitem");
+    let cert = certArray[i];
+    let nickAndSerial = `${cert.displayName} [${cert.serialNumber}]`;
+    menuItemNode.setAttribute("value", i);
+    menuItemNode.setAttribute("label", nickAndSerial); 
+    selectElement.menupopup.appendChild(menuItemNode);
+    if (i == 0) {
+      selectElement.selectedItem = menuItemNode;
+    }
+  }
+
+  await setDetails();
+  document.addEventListener("dialogaccept", doOK);
+  document.addEventListener("dialogcancel", doCancel);
+  document
+    .getElementById("nicknames")
+    .addEventListener("command", () => onCertSelected());
+
+  Services.obs.notifyObservers(
+    document.getElementById("certAuthAsk"),
+    "cert-dialog-loaded"
+  );
+}
+
+async function setDetails() {
+  let index = parseInt(document.getElementById("nicknames").value);
+  let cert = certArray[index];
+  document.l10n.setAttributes(
+    document.getElementById("clientAuthCertDetailsIssuedTo"),
+    "client-auth-cert-details-issued-to",
+    { issuedTo: cert.subjectName }
+  );
+  document.l10n.setAttributes(
+    document.getElementById("clientAuthCertDetailsSerialNumber"),
+    "client-auth-cert-details-serial-number",
+    { serialNumber: cert.serialNumber }
+  );
+  const formatter = new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "long",
+  });
+  document.l10n.setAttributes(
+    document.getElementById("clientAuthCertDetailsValidityPeriod"),
+    "client-auth-cert-details-validity-period",
+    {
+      notBefore: formatter.format(new Date(cert.validity.notBefore / 1000)),
+      notAfter: formatter.format(new Date(cert.validity.notAfter / 1000)),
+    }
+  );
+  document.l10n.setAttributes(
+    document.getElementById("clientAuthCertDetailsKeyUsages"),
+    "client-auth-cert-details-key-usages",
+    { keyUsages: "" }
+  );
+  let emailAddresses = cert.getEmailAddresses();
+  let emailAddressesJoined = emailAddresses.length
+    ? emailAddresses.join(", ")
+    : "";
+  document.l10n.setAttributes(
+    document.getElementById("clientAuthCertDetailsEmailAddresses"),
+    "client-auth-cert-details-email-addresses",
+    { emailAddresses: emailAddressesJoined }
+  );
+  document.l10n.setAttributes(
+    document.getElementById("clientAuthCertDetailsIssuedBy"),
+    "client-auth-cert-details-issued-by",
+    { issuedBy: cert.issuerName }
+  );
+  document.l10n.setAttributes(
+    document.getElementById("clientAuthCertDetailsStoredOn"),
+    "client-auth-cert-details-stored-on",
+    { storedOn: cert.tokenName }
+  );
+}
+
+async function onCertSelected() {
+  await setDetails();
+}
+
+function getRememberSetting() {
+  return parseInt(document.getElementById("rememberSetting").value);
+}
+
+function doOK() {
+  let { retVals } = args;
+  let index = parseInt(document.getElementById("nicknames").value);
+  let cert = certArray[index];
+  retVals.cert = cert;
+  retVals.rememberDuration = getRememberSetting();
+}
+
+function doCancel() {
+  let { retVals } = args;
+  retVals.cert = null;
+  retVals.rememberDuration = getRememberSetting();
+}
+
+window.addEventListener("load", () => onLoad());

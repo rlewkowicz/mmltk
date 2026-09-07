@@ -1,0 +1,242 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_WarpBuilder_h
+#define jit_WarpBuilder_h
+
+#include <initializer_list>
+
+#include "ds/InlineTable.h"
+#include "jit/JitContext.h"
+#include "jit/MIR-wasm.h"
+#include "jit/MIR.h"
+#include "jit/WarpBuilderShared.h"
+#include "jit/WarpSnapshot.h"
+#include "vm/Opcodes.h"
+
+namespace js {
+namespace jit {
+
+#define WARP_UNSUPPORTED_OPCODE_LIST(_)  \
+      \
+  _(ForceInterpreter)                    \
+                               \
+  _(EnterWith)                           \
+  _(LeaveWith)                           \
+                               \
+  _(Eval)                                \
+  _(StrictEval)                          \
+  _(SpreadEval)                          \
+  _(StrictSpreadEval)                    \
+  _(BindVar)                             \
+                              \
+  _(SetPropSuper)                        \
+  _(SetElemSuper)                        \
+  _(StrictSetPropSuper)                  \
+  _(StrictSetElemSuper)                  \
+   \
+  _(IsGenClosing)                        \
+  _(Resume)                              \
+                               \
+  _(DelName)                             \
+  _(SetIntrinsic)                        \
+                     \
+  _(GetAliasedDebugVar)                  \
+                \
+  _(NonSyntacticGlobalThis)              \
+
+class MIRGenerator;
+class MIRGraph;
+class WarpSnapshot;
+
+enum class CacheKind : uint8_t;
+
+// Some bytecode instructions never fall through to the next instruction, for
+
+class PendingEdge {
+  MBasicBlock* block_;
+  uint32_t successor_;
+  uint8_t numToPop_;
+
+ public:
+  PendingEdge(MBasicBlock* block, uint32_t successor, uint32_t numToPop)
+      : block_(block), successor_(successor), numToPop_(numToPop) {
+    MOZ_ASSERT(numToPop_ == numToPop, "value must fit in field");
+  }
+
+  MBasicBlock* block() const { return block_; }
+  uint32_t successor() const { return successor_; }
+  uint8_t numToPop() const { return numToPop_; }
+};
+
+using PendingEdges = Vector<PendingEdge, 2, SystemAllocPolicy>;
+using PendingEdgesMap =
+    InlineMap<jsbytecode*, PendingEdges, 8, PointerHasher<jsbytecode*>,
+              SystemAllocPolicy>;
+
+class LoopState {
+  MBasicBlock* header_ = nullptr;
+
+ public:
+  explicit LoopState(MBasicBlock* header) : header_(header) {}
+
+  MBasicBlock* header() const { return header_; }
+};
+using LoopStateStack = Vector<LoopState, 4, JitAllocPolicy>;
+
+class MOZ_STACK_CLASS WarpCompilation {
+  uint32_t loopDepth_ = 0;
+
+  PhiVector iterators_;
+
+ public:
+  explicit WarpCompilation(TempAllocator& alloc) : iterators_(alloc) {}
+
+  uint32_t loopDepth() const { return loopDepth_; }
+  void incLoopDepth() { loopDepth_++; }
+  void decLoopDepth() {
+    MOZ_ASSERT(loopDepth() > 0);
+    loopDepth_--;
+  }
+
+  PhiVector* iterators() { return &iterators_; }
+};
+
+class MOZ_STACK_CLASS WarpBuilder : public WarpBuilderShared {
+  WarpCompilation* warpCompilation_;
+  MIRGraph& graph_;
+  const CompileInfo& info_;
+  const WarpScriptSnapshot* scriptSnapshot_;
+  JSScript* script_;
+
+  const WarpOpSnapshot* opSnapshotIter_ = nullptr;
+
+  LoopStateStack loopStack_;
+  PendingEdgesMap pendingEdges_;
+
+  WarpBuilder* callerBuilder_ = nullptr;
+  MResumePoint* callerResumePoint_ = nullptr;
+  CallInfo* inlineCallInfo_ = nullptr;
+
+  WarpCompilation* warpCompilation() const { return warpCompilation_; }
+  MIRGraph& graph() { return graph_; }
+  const WarpScriptSnapshot* scriptSnapshot() const { return scriptSnapshot_; }
+
+  uint32_t loopDepth() const { return warpCompilation_->loopDepth(); }
+  void incLoopDepth() { warpCompilation_->incLoopDepth(); }
+  void decLoopDepth() { warpCompilation_->decLoopDepth(); }
+  PhiVector* iterators() { return warpCompilation_->iterators(); }
+
+  WarpBuilder* callerBuilder() const { return callerBuilder_; }
+  MResumePoint* callerResumePoint() const { return callerResumePoint_; }
+
+  BytecodeSite* newBytecodeSite(BytecodeLocation loc);
+
+  const WarpOpSnapshot* getOpSnapshotImpl(BytecodeLocation loc,
+                                          WarpOpSnapshot::Kind kind);
+
+  template <typename T>
+  const T* getOpSnapshot(BytecodeLocation loc) {
+    const WarpOpSnapshot* snapshot = getOpSnapshotImpl(loc, T::ThisKind);
+    return snapshot ? snapshot->as<T>() : nullptr;
+  }
+
+  void initBlock(MBasicBlock* block);
+  [[nodiscard]] bool startNewEntryBlock(size_t stackDepth,
+                                        BytecodeLocation loc);
+  [[nodiscard]] bool startNewBlock(MBasicBlock* predecessor,
+                                   BytecodeLocation loc, size_t numToPop = 0);
+  [[nodiscard]] bool startNewLoopHeaderBlock(BytecodeLocation loopHead);
+  [[nodiscard]] bool startNewOsrPreHeaderBlock(BytecodeLocation loopHead);
+
+  bool hasTerminatedBlock() const { return current == nullptr; }
+  void setTerminatedBlock() { current = nullptr; }
+
+  [[nodiscard]] bool addPendingEdge(BytecodeLocation target, MBasicBlock* block,
+                                    uint32_t successor, uint32_t numToPop = 0);
+  [[nodiscard]] bool buildForwardGoto(BytecodeLocation target);
+  [[nodiscard]] bool buildBackedge();
+  [[nodiscard]] bool buildTestBackedge(BytecodeLocation loc);
+
+  [[nodiscard]] bool addIteratorLoopPhis(BytecodeLocation loopHead);
+
+  [[nodiscard]] bool buildPrologue();
+  [[nodiscard]] bool buildBody();
+
+  [[nodiscard]] bool buildInlinePrologue();
+
+  [[nodiscard]] bool buildIC(BytecodeLocation loc, CacheKind kind,
+                             std::initializer_list<MDefinition*> inputs);
+  [[nodiscard]] bool buildBailoutForColdIC(BytecodeLocation loc,
+                                           CacheKind kind);
+
+  [[nodiscard]] bool buildEnvironmentChain();
+  MInstruction* buildNamedLambdaEnv(MDefinition* callee, MDefinition* env,
+                                    NamedLambdaObject* templateObj,
+                                    gc::Heap initialHeap);
+  MInstruction* buildCallObject(MDefinition* callee, MDefinition* env,
+                                CallObject* templateObj, gc::Heap initialHeap);
+  MInstruction* buildLoadSlot(MDefinition* obj, uint32_t numFixedSlots,
+                              uint32_t slot);
+
+  MConstant* globalLexicalEnvConstant();
+  MDefinition* getCallee();
+
+  [[nodiscard]] bool buildUnaryOp(BytecodeLocation loc);
+  [[nodiscard]] bool buildBinaryOp(BytecodeLocation loc);
+  [[nodiscard]] bool buildCompareOp(BytecodeLocation loc);
+  [[nodiscard]] bool buildStrictConstantEqOp(BytecodeLocation loc, JSOp op);
+  [[nodiscard]] bool buildTestOp(BytecodeLocation loc);
+  [[nodiscard]] bool buildCallOp(BytecodeLocation loc);
+
+  [[nodiscard]] bool buildInitPropGetterSetterOp(BytecodeLocation loc);
+  [[nodiscard]] bool buildInitElemGetterSetterOp(BytecodeLocation loc);
+
+  [[nodiscard]] bool buildSuspend(BytecodeLocation loc, MDefinition* gen,
+                                  MDefinition* retVal);
+
+  void buildCheckLexicalOp(BytecodeLocation loc);
+
+  bool usesEnvironmentChain() const;
+  MDefinition* walkEnvironmentChain(uint32_t numHops);
+
+  void buildCreateThis(CallInfo& callInfo);
+
+  [[nodiscard]] bool transpileCall(BytecodeLocation loc,
+                                   const WarpCacheIR* cacheIRSnapshot,
+                                   CallInfo* callInfo);
+
+  [[nodiscard]] bool buildInlinedCall(BytecodeLocation loc,
+                                      const WarpInlinedCall* snapshot,
+                                      CallInfo& callInfo);
+
+  MDefinition* patchInlinedReturns(CompileInfo* calleeCompileInfo,
+                                   CallInfo& callInfo, MIRGraphReturns& exits,
+                                   MBasicBlock* returnBlock);
+  MDefinition* patchInlinedReturn(CompileInfo* calleeCompileInfo,
+                                  CallInfo& callInfo, MBasicBlock* exit,
+                                  MBasicBlock* returnBlock);
+
+#define BUILD_OP(OP, ...) [[nodiscard]] bool build_##OP(BytecodeLocation loc);
+  FOR_EACH_OPCODE(BUILD_OP)
+#undef BUILD_OP
+
+ public:
+  WarpBuilder(WarpSnapshot& snapshot, MIRGenerator& mirGen,
+              WarpCompilation* warpCompilation);
+  WarpBuilder(WarpBuilder* caller, WarpScriptSnapshot* snapshot,
+              CompileInfo& compileInfo, CallInfo* inlineCallInfo,
+              MResumePoint* callerResumePoint);
+
+  [[nodiscard]] bool build();
+  [[nodiscard]] bool buildInline();
+
+  const CompileInfo& info() const { return info_; }
+  CallInfo* inlineCallInfo() const { return inlineCallInfo_; }
+};
+
+}  
+}  
+
+#endif /* jit_WarpBuilder_h */

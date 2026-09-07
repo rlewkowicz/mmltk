@@ -1,0 +1,780 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/WindowGlobalChild.h"
+#include "Navigator.h"
+#include "mozilla/AntiTrackingUtils.h"
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/dom/AudioSession.h"
+#include "mozilla/dom/BrowserBridgeChild.h"
+#include "mozilla/dom/BrowserChild.h"
+#include "mozilla/dom/BrowsingContext.h"
+#include "mozilla/dom/BrowsingContextGroup.h"
+#include "mozilla/dom/CloseWatcherManager.h"
+#include "mozilla/dom/ContentChild.h"
+#include "mozilla/dom/ContentParent.h"
+#include "mozilla/dom/InProcessChild.h"
+#include "mozilla/dom/InProcessParent.h"
+#include "mozilla/dom/JSActorService.h"
+#include "mozilla/dom/JSWindowActorBinding.h"
+#include "mozilla/dom/JSWindowActorChild.h"
+#include "mozilla/dom/MozFrameLoaderOwnerBinding.h"
+#include "mozilla/dom/PolicyContainer.h"
+#include "mozilla/dom/Promise-inl.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/ReportingUtils.h"
+#include "mozilla/dom/ScriptSettings.h"
+#include "mozilla/dom/SecurityPolicyViolationEvent.h"
+#include "mozilla/dom/SessionStoreRestoreData.h"
+#include "mozilla/dom/WindowContext.h"
+#include "mozilla/dom/WindowGlobalActorsBinding.h"
+#include "mozilla/dom/WindowGlobalParent.h"
+#include "mozilla/ipc/Endpoint.h"
+#include "nsContentUtils.h"
+#include "nsDocShell.h"
+#include "nsFocusManager.h"
+#include "nsFrameLoader.h"
+#include "nsFrameLoaderOwner.h"
+#include "nsGlobalWindowInner.h"
+#include "nsIHttpChannelInternal.h"
+#include "nsIURIMutator.h"
+#include "nsNetUtil.h"
+#include "nsQueryObject.h"
+#include "nsScriptSecurityManager.h"
+#include "nsSerializationHelper.h"
+#include "nsURLHelper.h"
+#include "xpcpublic.h"
+
+using namespace mozilla::ipc;
+using namespace mozilla::dom::ipc;
+
+namespace mozilla::dom {
+
+WindowGlobalChild::WindowGlobalChild(dom::WindowContext* aWindowContext,
+                                     nsIPrincipal* aPrincipal,
+                                     nsIURI* aDocumentURI)
+    : mWindowContext(aWindowContext),
+      mDocumentPrincipal(aPrincipal),
+      mDocumentURI(aDocumentURI) {
+  MOZ_DIAGNOSTIC_ASSERT(mWindowContext);
+  MOZ_DIAGNOSTIC_ASSERT(mDocumentPrincipal);
+  MOZ_DIAGNOSTIC_ASSERT(mDocumentPrincipal->GetIsLocalIpAddress() ==
+                        mWindowContext->IsLocalIP());
+
+  if (!mDocumentURI) {
+    NS_NewURI(getter_AddRefs(mDocumentURI), "about:blank");
+  }
+
+}
+
+void VerifyStoragePrincipalMatchesDocumentPrincipal(WindowGlobalInit aInit) {
+  nsCString noSuffix, storageNoSuffix;
+  aInit.principal()->GetOriginNoSuffix(noSuffix);
+  aInit.storagePrincipal()->GetOriginNoSuffix(storageNoSuffix);
+  MOZ_RELEASE_ASSERT(noSuffix == storageNoSuffix);
+  MOZ_RELEASE_ASSERT(
+      aInit.principal()->OriginAttributesRef().EqualsIgnoringPartitionKey(
+          aInit.storagePrincipal()->OriginAttributesRef()));
+}
+
+already_AddRefed<WindowGlobalChild> WindowGlobalChild::Create(
+    nsGlobalWindowInner* aWindow) {
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+  nsCOMPtr<nsIChannel> chan = aWindow->GetDocument()->GetChannel();
+  nsCOMPtr<nsILoadInfo> loadInfo = chan ? chan->LoadInfo() : nullptr;
+  nsCOMPtr<nsIHttpChannelInternal> httpChan = do_QueryInterface(chan);
+  nsILoadInfo::CrossOriginOpenerPolicy policy;
+  if (httpChan &&
+      loadInfo->GetExternalContentPolicyType() ==
+          ExtContentPolicy::TYPE_DOCUMENT &&
+      NS_SUCCEEDED(httpChan->GetCrossOriginOpenerPolicy(&policy))) {
+    MOZ_DIAGNOSTIC_ASSERT(policy ==
+                          aWindow->GetBrowsingContext()->GetOpenerPolicy());
+  }
+#endif
+
+  WindowGlobalInit init = WindowGlobalActor::WindowInitializer(aWindow);
+  RefPtr<WindowGlobalChild> wgc = CreateDisconnected(init);
+
+  if (XRE_IsParentProcess()) {
+    InProcessChild* ipChild = InProcessChild::Singleton();
+    InProcessParent* ipParent = InProcessParent::Singleton();
+    if (!ipChild || !ipParent) {
+      return nullptr;
+    }
+
+    ManagedEndpoint<PWindowGlobalParent> endpoint =
+        ipChild->OpenPWindowGlobalEndpoint(wgc);
+    ipParent->BindPWindowGlobalEndpoint(std::move(endpoint),
+                                        wgc->WindowContext()->Canonical());
+  } else {
+    RefPtr<BrowserChild> browserChild =
+        BrowserChild::GetFrom(static_cast<mozIDOMWindow*>(aWindow));
+    MOZ_ASSERT(browserChild);
+
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+    dom::BrowsingContext* bc = aWindow->GetBrowsingContext();
+#endif
+
+    MOZ_DIAGNOSTIC_ASSERT(bc->AncestorsAreCurrent());
+    MOZ_DIAGNOSTIC_ASSERT(bc->IsInProcess());
+
+    VerifyStoragePrincipalMatchesDocumentPrincipal(init);
+
+    ManagedEndpoint<PWindowGlobalParent> endpoint =
+        browserChild->OpenPWindowGlobalEndpoint(wgc);
+    browserChild->SendNewWindowGlobal(std::move(endpoint), init);
+  }
+
+  wgc->Init();
+  wgc->InitWindowGlobal(aWindow);
+  return wgc.forget();
+}
+
+already_AddRefed<WindowGlobalChild> WindowGlobalChild::CreateDisconnected(
+    const WindowGlobalInit& aInit) {
+  RefPtr<dom::BrowsingContext> browsingContext =
+      dom::BrowsingContext::Get(aInit.context().mBrowsingContextId);
+
+  RefPtr<dom::WindowContext> windowContext =
+      dom::WindowContext::GetById(aInit.context().mInnerWindowId);
+  MOZ_RELEASE_ASSERT(!windowContext, "Creating duplicate WindowContext");
+
+  if (XRE_IsParentProcess()) {
+    windowContext = WindowGlobalParent::CreateDisconnected(aInit, nullptr);
+  } else {
+    dom::WindowContext::FieldValues fields = aInit.context().mFields;
+    windowContext = new dom::WindowContext(
+        browsingContext, aInit.context().mInnerWindowId,
+        aInit.context().mOuterWindowId, std::move(fields));
+  }
+
+  RefPtr<WindowGlobalChild> windowChild = new WindowGlobalChild(
+      windowContext, aInit.principal(), aInit.documentURI());
+  windowContext->mIsInProcess = true;
+  windowContext->mWindowGlobalChild = windowChild;
+  return windowChild.forget();
+}
+
+void WindowGlobalChild::Init() {
+  MOZ_ASSERT(mWindowContext->mWindowGlobalChild == this);
+  mWindowContext->Init();
+}
+
+void WindowGlobalChild::InitWindowGlobal(nsGlobalWindowInner* aWindow) {
+  mWindowGlobal = aWindow;
+}
+
+void WindowGlobalChild::OnNewDocument(Document* aDocument) {
+  MOZ_RELEASE_ASSERT(mWindowGlobal);
+  MOZ_RELEASE_ASSERT(aDocument);
+
+
+  SendSetIsInitialDocument(aDocument->IsInitialDocument());
+  SetDocumentURI(aDocument->GetDocumentURI());
+  SetDocumentPrincipal(aDocument->NodePrincipal(),
+                       aDocument->EffectiveStoragePrincipal());
+
+  RefPtr<ParentProcessChannelHandle> documentChannelHandle;
+  if (nsIChannel* chan = aDocument->GetChannel()) {
+    (void)chan->GetParentProcessChannelHandle(
+        getter_AddRefs(documentChannelHandle));
+  }
+  RefPtr<ParentProcessChannelHandle> failedChannelHandle;
+  if (nsIChannel* chan = aDocument->GetFailedChannel()) {
+    (void)chan->GetParentProcessChannelHandle(
+        getter_AddRefs(failedChannelHandle));
+  }
+  SendUpdateChannels(documentChannelHandle, failedChannelHandle);
+
+  SendUpdateDocumentCspSettings(aDocument->GetBlockAllMixedContent(false),
+                                aDocument->GetUpgradeInsecureRequests(false));
+  SendUpdateSandboxFlags(aDocument->GetSandboxFlags());
+
+  net::CookieJarSettingsArgs csArgs;
+  net::CookieJarSettings::Cast(aDocument->CookieJarSettings())
+      ->Serialize(csArgs);
+  if (!SendUpdateCookieJarSettings(csArgs)) {
+    NS_WARNING(
+        "Failed to update document's cookie jar settings on the "
+        "WindowGlobalParent");
+  }
+
+  SendUpdateHttpsOnlyStatus(aDocument->HttpsOnlyStatus());
+
+  WindowContext::Transaction txn;
+  txn.SetCookieBehavior(
+      Some(aDocument->CookieJarSettings()->GetCookieBehavior()));
+  txn.SetIsOnContentBlockingAllowList(
+      aDocument->CookieJarSettings()->GetIsOnContentBlockingAllowList());
+  txn.SetIsThirdPartyWindow(aDocument->HasThirdPartyChannel());
+  txn.SetIsThirdPartyTrackingResourceWindow(
+      nsContentUtils::IsThirdPartyTrackingResourceWindow(mWindowGlobal));
+  txn.SetIsSecureContext(mWindowGlobal->IsSecureContext());
+  txn.SetIsFramebustingAllowed(
+      mWindowGlobal->GetBrowsingContext()->ComputeIsFramebustingAllowed());
+  if (auto policy = aDocument->GetEmbedderPolicy()) {
+    txn.SetEmbedderPolicy(*policy);
+  }
+  txn.SetShouldResistFingerprinting(aDocument->ShouldResistFingerprinting(
+      RFPTarget::IsAlwaysEnabledForPrecompute));
+  txn.SetOverriddenFingerprintingSettings(
+      aDocument->GetOverriddenFingerprintingSettings());
+
+  if (nsCOMPtr<nsIChannel> channel = aDocument->GetChannel()) {
+    nsCOMPtr<nsILoadInfo> loadInfo(channel->LoadInfo());
+    txn.SetIsOriginalFrameSource(loadInfo->GetOriginalFrameSrcLoad());
+
+    nsILoadInfo::StoragePermissionState storageAccess =
+        loadInfo->GetStoragePermission();
+    txn.SetUsingStorageAccess(
+        storageAccess == nsILoadInfo::HasStoragePermission ||
+        storageAccess == nsILoadInfo::StoragePermissionAllowListed);
+  } else {
+    txn.SetIsOriginalFrameSource(false);
+  }
+
+  nsCOMPtr<nsIURI> innerDocURI =
+      NS_GetInnermostURI(aDocument->GetDocumentURI());
+  if (innerDocURI) {
+    txn.SetIsSecure(innerDocURI->SchemeIs("https"));
+  }
+
+  MOZ_DIAGNOSTIC_ASSERT(mDocumentPrincipal->GetIsLocalIpAddress() ==
+                        mWindowContext->IsLocalIP());
+
+  MOZ_ALWAYS_SUCCEEDS(txn.Commit(mWindowContext));
+}
+
+already_AddRefed<WindowGlobalChild> WindowGlobalChild::GetByInnerWindowId(
+    uint64_t aInnerWindowId) {
+  if (RefPtr<dom::WindowContext> context =
+          dom::WindowContext::GetById(aInnerWindowId)) {
+    return do_AddRef(context->GetWindowGlobalChild());
+  }
+  return nullptr;
+}
+
+dom::BrowsingContext* WindowGlobalChild::BrowsingContext() {
+  return mWindowContext->GetBrowsingContext();
+}
+
+Nullable<WindowProxyHolder> WindowGlobalChild::GetContentWindow() {
+  if (IsCurrentGlobal()) {
+    return WindowProxyHolder(BrowsingContext());
+  }
+  return nullptr;
+}
+
+uint64_t WindowGlobalChild::InnerWindowId() {
+  return mWindowContext->InnerWindowId();
+}
+
+uint64_t WindowGlobalChild::OuterWindowId() {
+  return mWindowContext->OuterWindowId();
+}
+
+bool WindowGlobalChild::IsCurrentGlobal() {
+  return CanSend() && mWindowGlobal->IsCurrentInnerWindow();
+}
+
+already_AddRefed<WindowGlobalParent> WindowGlobalChild::GetParentActor() {
+  if (!CanSend()) {
+    return nullptr;
+  }
+  IProtocol* otherSide = InProcessChild::ParentActorFor(this);
+  return do_AddRef(static_cast<WindowGlobalParent*>(otherSide));
+}
+
+already_AddRefed<BrowserChild> WindowGlobalChild::GetBrowserChild() {
+  if (IsInProcess() || !CanSend()) {
+    return nullptr;
+  }
+  return do_AddRef(static_cast<BrowserChild*>(Manager()));
+}
+
+uint64_t WindowGlobalChild::ContentParentId() {
+  if (XRE_IsParentProcess()) {
+    return 0;
+  }
+  return ContentChild::GetSingleton()->GetID();
+}
+
+bool WindowGlobalChild::IsProcessRoot() {
+  if (!BrowsingContext()->GetParent()) {
+    return true;
+  }
+
+  return !BrowsingContext()->GetEmbedderElement();
+}
+
+void WindowGlobalChild::BeforeUnloadAdded() {
+  if (mBeforeUnloadListeners == 0 && CanSend()) {
+    (void)mWindowContext->SetNeedsBeforeUnload(true);
+  }
+
+  mBeforeUnloadListeners++;
+  MOZ_ASSERT(mBeforeUnloadListeners > 0);
+}
+
+void WindowGlobalChild::BeforeUnloadRemoved() {
+  mBeforeUnloadListeners--;
+  MOZ_ASSERT(mBeforeUnloadListeners >= 0);
+
+  if (mBeforeUnloadListeners == 0) {
+    (void)mWindowContext->SetNeedsBeforeUnload(false);
+  }
+}
+
+void WindowGlobalChild::NavigateAdded() {
+  if (!BrowsingContext()->IsTop()) {
+    return;
+  }
+  BeforeUnloadAdded();
+}
+
+void WindowGlobalChild::NavigateRemoved() {
+  if (!BrowsingContext()->IsTop()) {
+    return;
+  }
+  BeforeUnloadRemoved();
+}
+
+void WindowGlobalChild::Destroy() {
+  JSActorWillDestroy();
+
+  mWindowContext->Discard();
+
+  RefPtr<BrowserChild> browserChild = GetBrowserChild();
+  if (!browserChild || !browserChild->IsDestroyed()) {
+    SendDestroy();
+  }
+}
+
+mozilla::ipc::IPCResult WindowGlobalChild::RecvMakeFrameLocal(
+    const MaybeDiscarded<dom::BrowsingContext>& aFrameContext,
+    uint64_t aPendingSwitchId) {
+  MOZ_DIAGNOSTIC_ASSERT(XRE_IsContentProcess());
+
+  MOZ_LOG(BrowsingContext::GetLog(), LogLevel::Debug,
+          ("RecvMakeFrameLocal ID=%" PRIx64, aFrameContext.ContextId()));
+
+  if (NS_WARN_IF(aFrameContext.IsNullOrDiscarded())) {
+    return IPC_OK();
+  }
+  dom::BrowsingContext* frameContext = aFrameContext.get();
+
+  RefPtr<Element> embedderElt = frameContext->GetEmbedderElement();
+  if (NS_WARN_IF(!embedderElt)) {
+    return IPC_OK();
+  }
+
+  if (NS_WARN_IF(embedderElt->GetDocumentGlobal() != GetWindowGlobal())) {
+    return IPC_OK();
+  }
+
+  RefPtr<nsFrameLoaderOwner> flo = do_QueryObject(embedderElt);
+  MOZ_DIAGNOSTIC_ASSERT(flo, "Embedder must be a nsFrameLoaderOwner");
+
+  RemotenessOptions options;
+  options.mRemoteType = NOT_REMOTE_TYPE;
+  options.mPendingSwitchID.Construct(aPendingSwitchId);
+  options.mSwitchingInProgressLoad = true;
+  flo->ChangeRemoteness(options, IgnoreErrors());
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult WindowGlobalChild::RecvMakeFrameRemote(
+    const MaybeDiscarded<dom::BrowsingContext>& aFrameContext,
+    ManagedEndpoint<PBrowserBridgeChild>&& aEndpoint, const TabId& aTabId,
+    const LayersId& aLayersId, MakeFrameRemoteResolver&& aResolve) {
+  MOZ_DIAGNOSTIC_ASSERT(XRE_IsContentProcess());
+
+  MOZ_LOG(BrowsingContext::GetLog(), LogLevel::Debug,
+          ("RecvMakeFrameRemote ID=%" PRIx64, aFrameContext.ContextId()));
+
+  if (!aLayersId.IsValid()) {
+    return IPC_FAIL(this, "Received an invalid LayersId");
+  }
+
+  auto scopeExit = MakeScopeExit([&] { aResolve(true); });
+
+  RefPtr<dom::BrowsingContext> frameContext;
+  if (!aFrameContext.IsDiscarded()) {
+    frameContext = aFrameContext.get();
+  }
+
+  RefPtr<BrowserBridgeChild> bridge =
+      new BrowserBridgeChild(frameContext, aTabId, aLayersId);
+  RefPtr<BrowserChild> manager = GetBrowserChild();
+  if (NS_WARN_IF(
+          !manager->BindPBrowserBridgeEndpoint(std::move(aEndpoint), bridge))) {
+    return IPC_OK();
+  }
+
+  auto deleteBridge =
+      MakeScopeExit([&] { BrowserBridgeChild::Send__delete__(bridge); });
+
+  if (NS_WARN_IF(aFrameContext.IsNullOrDiscarded())) {
+    return IPC_OK();
+  }
+
+  RefPtr<Element> embedderElt = frameContext->GetEmbedderElement();
+  if (NS_WARN_IF(!embedderElt)) {
+    return IPC_OK();
+  }
+
+  if (NS_WARN_IF(embedderElt->GetDocumentGlobal() != GetWindowGlobal())) {
+    return IPC_OK();
+  }
+
+  RefPtr<nsFrameLoaderOwner> flo = do_QueryObject(embedderElt);
+  MOZ_DIAGNOSTIC_ASSERT(flo, "Embedder must be a nsFrameLoaderOwner");
+
+  IgnoredErrorResult rv;
+  flo->ChangeRemotenessWithBridge(bridge, rv);
+  if (NS_WARN_IF(rv.Failed())) {
+    return IPC_OK();
+  }
+
+  deleteBridge.release();
+
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult WindowGlobalChild::RecvDrawSnapshot(
+    const Maybe<IntRect>& aRect, const float& aScale,
+    const nscolor& aBackgroundColor, const gfx::CrossProcessPaintFlags& aFlags,
+    DrawSnapshotResolver&& aResolve) {
+  aResolve(gfx::PaintFragment::Record(BrowsingContext(), aRect, aScale,
+                                      aBackgroundColor, aFlags));
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult
+WindowGlobalChild::RecvSaveStorageAccessPermissionGranted() {
+  nsCOMPtr<nsPIDOMWindowInner> inner = GetWindowGlobal();
+  if (inner) {
+    inner->SaveStorageAccessPermissionGranted();
+  }
+
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult WindowGlobalChild::RecvDispatchSecurityPolicyViolation(
+    const nsString& aViolationEventJSON, const nsString& aReportGroupName) {
+  nsGlobalWindowInner* window = GetWindowGlobal();
+  if (!window) {
+    return IPC_OK();
+  }
+
+  Document* doc = window->GetDocument();
+  if (!doc) {
+    return IPC_OK();
+  }
+
+  ReportingUtils::DeserializeSecurityViolationEventAndReport(
+      doc->GetTargetForDOMEvent(), window, aViolationEventJSON,
+      aReportGroupName);
+
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult WindowGlobalChild::RecvResetScalingZoom() {
+  if (Document* doc = mWindowGlobal->GetExtantDoc()) {
+    if (PresShell* ps = doc->GetPresShell()) {
+      ps->SetResolutionAndScaleTo(1.0,
+                                  ResolutionChangeOrigin::MainThreadAdjustment);
+    }
+  }
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult WindowGlobalChild::RecvRestoreDocShellState(
+    const dom::sessionstore::DocShellRestoreState& aState,
+    RestoreDocShellStateResolver&& aResolve) {
+  if (mWindowGlobal) {
+    SessionStoreUtils::RestoreDocShellState(mWindowGlobal->GetDocShell(),
+                                            aState);
+  }
+  aResolve(true);
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult WindowGlobalChild::RecvRestoreTabContent(
+    dom::SessionStoreRestoreData* aData, RestoreTabContentResolver&& aResolve) {
+  aData->RestoreInto(BrowsingContext());
+  aResolve(true);
+  return IPC_OK();
+}
+
+IPCResult WindowGlobalChild::RecvRawMessage(const JSActorMessageMeta& aMeta,
+                                            JSIPCValue&& aData,
+                                            StructuredCloneData* aStack) {
+  ReceiveRawMessage(aMeta, std::move(aData), aStack);
+  return IPC_OK();
+}
+
+IPCResult WindowGlobalChild::RecvNotifyAudioSessionStateChanged(
+    const AudioSessionState& aState) {
+  nsGlobalWindowInner* window = GetWindowGlobal();
+  if (!window) {
+    return IPC_OK();
+  }
+  if (RefPtr<dom::AudioSession> session = window->Navigator()->AudioSession()) {
+    session->SetState(aState);
+  }
+  return IPC_OK();
+}
+
+IPCResult WindowGlobalChild::RecvNotifyPermissionChange(const nsCString& aType,
+                                                        uint32_t aPermission) {
+  nsCOMPtr<nsIObserverService> observerService = services::GetObserverService();
+  NS_ENSURE_TRUE(observerService,
+                 IPC_FAIL(this, "Failed to get observer service"));
+  nsPIDOMWindowInner* notifyTarget =
+      static_cast<nsPIDOMWindowInner*>(this->GetWindowGlobal());
+  observerService->NotifyObservers(notifyTarget, "perm-changed-notify-only",
+                                   NS_ConvertUTF8toUTF16(aType).get());
+  if (this->GetWindowGlobal() &&
+      this->GetWindowGlobal()->UsingStorageAccess() &&
+      aPermission != nsIPermissionManager::ALLOW_ACTION) {
+    this->GetWindowGlobal()->SaveStorageAccessPermissionRevoked();
+  }
+  return IPC_OK();
+}
+
+IPCResult WindowGlobalChild::RecvProcessCloseRequest(
+    const MaybeDiscarded<dom::BrowsingContext>& aFocused) {
+  RefPtr<nsFocusManager> focusManager = nsFocusManager::GetFocusManager();
+  RefPtr<dom::BrowsingContext> focusedContext =
+      focusManager ? focusManager->GetFocusedBrowsingContext() : nullptr;
+  if (!focusedContext) {
+    return IPC_OK();
+  }
+  if (RefPtr<Document> doc = focusedContext->GetExtantDocument()) {
+    RefPtr<nsPIDOMWindowInner> win = doc->GetInnerWindow();
+    if (win && win->IsFullyActive()) {
+      RefPtr manager = win->EnsureCloseWatcherManager();
+      manager->ProcessCloseRequest();
+    }
+  }
+  return IPC_OK();
+}
+
+void WindowGlobalChild::SetDocumentURI(nsIURI* aDocumentURI) {
+  nsCOMPtr<nsIURI> principalURI = mDocumentPrincipal->GetURI();
+  if (mDocumentPrincipal->GetIsNullPrincipal()) {
+    if (nsCOMPtr<nsIPrincipal> precursor =
+            mDocumentPrincipal->GetPrecursorPrincipal()) {
+      principalURI = precursor->GetURI();
+    }
+  }
+
+  MOZ_DIAGNOSTIC_ASSERT(!nsScriptSecurityManager::IsHttpOrHttpsAndCrossOrigin(
+                            principalURI, aDocumentURI),
+                        "Setting DocumentURI with a different origin "
+                        "than principal URI");
+
+  mDocumentURI = aDocumentURI;
+  SendUpdateDocumentURI(WrapNotNull(aDocumentURI));
+}
+
+void WindowGlobalChild::SetDocumentPrincipal(
+    nsIPrincipal* aNewDocumentPrincipal,
+    nsIPrincipal* aNewDocumentStoragePrincipal) {
+  MOZ_ASSERT(mDocumentPrincipal->Equals(aNewDocumentPrincipal));
+  mDocumentPrincipal = aNewDocumentPrincipal;
+  SendUpdateDocumentPrincipal(aNewDocumentPrincipal,
+                              aNewDocumentStoragePrincipal);
+}
+
+const nsACString& WindowGlobalChild::GetRemoteType() const {
+  if (XRE_IsContentProcess()) {
+    return ContentChild::GetSingleton()->GetRemoteType();
+  }
+
+  return NOT_REMOTE_TYPE;
+}
+
+already_AddRefed<JSWindowActorChild> WindowGlobalChild::GetActor(
+    JSContext* aCx, const nsACString& aName, ErrorResult& aRv) {
+  return JSActorManager::GetActor(aCx, aName, aRv)
+      .downcast<JSWindowActorChild>();
+}
+
+already_AddRefed<JSWindowActorChild> WindowGlobalChild::GetExistingActor(
+    const nsACString& aName) {
+  return JSActorManager::GetExistingActor(aName).downcast<JSWindowActorChild>();
+}
+
+already_AddRefed<JSActor> WindowGlobalChild::InitJSActor(
+    JS::Handle<JSObject*> aMaybeActor, const nsACString& aName,
+    ErrorResult& aRv) {
+  RefPtr<JSWindowActorChild> actor;
+  if (aMaybeActor.get()) {
+    aRv = UNWRAP_OBJECT(JSWindowActorChild, aMaybeActor.get(), actor);
+    if (aRv.Failed()) {
+      return nullptr;
+    }
+  } else {
+    actor = new JSWindowActorChild();
+  }
+
+  MOZ_RELEASE_ASSERT(!actor->GetManager(),
+                     "mManager was already initialized once!");
+  actor->Init(aName, this);
+  return actor.forget();
+}
+
+void WindowGlobalChild::ActorDestroy(ActorDestroyReason aWhy) {
+  MOZ_ASSERT(nsContentUtils::IsSafeToRunScript(),
+             "Destroying WindowGlobalChild can run script");
+
+  mWindowContext->Discard();
+
+  JSActorDidDestroy();
+}
+
+bool WindowGlobalChild::IsSameOriginWith(
+    const dom::WindowContext* aOther) const {
+  if (aOther == WindowContext()) {
+    return true;
+  }
+
+  MOZ_DIAGNOSTIC_ASSERT(WindowContext()->Group() == aOther->Group());
+  if (nsGlobalWindowInner* otherWin = aOther->GetInnerWindow()) {
+    return mDocumentPrincipal->Equals(otherWin->GetPrincipal());
+  }
+  return false;
+}
+
+bool WindowGlobalChild::SameOriginWithTop() {
+  return IsSameOriginWith(WindowContext()->TopWindowContext());
+}
+
+bool WindowGlobalChild::CanNavigate(dom::BrowsingContext* aTarget,
+                                    bool aConsiderOpener) {
+  return nsContentUtils::CanNavigate(BrowsingContext(), aTarget,
+                                     DocumentPrincipal(), aConsiderOpener);
+}
+
+dom::BrowsingContext* WindowGlobalChild::FindBrowsingContextWithName(
+    const nsAString& aName, bool aUseEntryGlobalForAccessCheck) {
+  RefPtr<WindowGlobalChild> requestingContext = this;
+  if (aUseEntryGlobalForAccessCheck) {
+    if (nsGlobalWindowInner* caller = nsContentUtils::EntryInnerWindow()) {
+      if (caller->GetBrowsingContextGroup() == WindowContext()->Group()) {
+        requestingContext = caller->GetWindowGlobalChild();
+      } else {
+        MOZ_RELEASE_ASSERT(caller->GetPrincipal()->IsSystemPrincipal(),
+                           "caller must be either same-group or system");
+      }
+    }
+  }
+  MOZ_ASSERT(requestingContext, "must have a requestingContext");
+
+  dom::BrowsingContext* found = nullptr;
+  if (aName.IsEmpty()) {
+    found = nullptr;
+  } else if (aName.LowerCaseEqualsLiteral("_blank")) {
+    found = nullptr;
+  } else if (nsContentUtils::IsSpecialName(aName)) {
+    found = BrowsingContext()->FindWithSpecialName(aName, *requestingContext);
+  } else if (dom::BrowsingContext* child =
+                 BrowsingContext()->FindWithNameInSubtree(aName,
+                                                          requestingContext)) {
+    found = child;
+  } else {
+    dom::WindowContext* current = WindowContext();
+
+    do {
+      Span<RefPtr<dom::BrowsingContext>> siblings;
+      dom::WindowContext* parent = current->GetParentWindowContext();
+
+      if (!parent) {
+        siblings = WindowContext()->Group()->Toplevels();
+      } else if (dom::BrowsingContext* bc = parent->GetBrowsingContext();
+                 bc && bc->NameEquals(aName) &&
+                 requestingContext->CanNavigate(bc) && bc->IsTargetable()) {
+        found = bc;
+        break;
+      } else {
+        siblings = parent->NonSyntheticChildren();
+      }
+
+      for (dom::BrowsingContext* sibling : siblings) {
+        if (sibling == current->GetBrowsingContext()) {
+          continue;
+        }
+
+        if (dom::BrowsingContext* relative =
+                sibling->FindWithNameInSubtree(aName, requestingContext)) {
+          found = relative;
+          parent = nullptr;
+          break;
+        }
+      }
+
+      current = parent;
+    } while (current);
+  }
+
+  MOZ_DIAGNOSTIC_ASSERT(!found || requestingContext->CanNavigate(found));
+
+  return found;
+}
+
+void WindowGlobalChild::UnblockBFCacheFor(BFCacheStatus aStatus) {
+  SendUpdateBFCacheStatus(0, aStatus);
+}
+
+void WindowGlobalChild::BlockBFCacheFor(BFCacheStatus aStatus) {
+  SendUpdateBFCacheStatus(aStatus, 0);
+}
+
+WindowGlobalChild::~WindowGlobalChild() = default;
+
+JSObject* WindowGlobalChild::WrapObject(JSContext* aCx,
+                                        JS::Handle<JSObject*> aGivenProto) {
+  return WindowGlobalChild_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+nsISupports* WindowGlobalChild::GetParentObject() {
+  return xpc::NativeGlobal(xpc::PrivilegedJunkScope());
+}
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(WindowGlobalChild)
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(WindowGlobalChild)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mWindowGlobal)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mContainerFeaturePolicy)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mWindowContext)
+  tmp->UnlinkManager();
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_PRESERVED_WRAPPER
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_WEAK_PTR
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(WindowGlobalChild)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mWindowGlobal)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mContainerFeaturePolicy)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mWindowContext)
+  if (!tmp->IsInProcess()) {
+    CycleCollectionNoteChild(cb, static_cast<BrowserChild*>(tmp->Manager()),
+                             "Manager()");
+  }
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(WindowGlobalChild)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(WindowGlobalChild)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(WindowGlobalChild)
+
+}  

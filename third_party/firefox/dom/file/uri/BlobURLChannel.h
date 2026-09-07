@@ -1,0 +1,60 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_BlobURLChannel_h
+#define mozilla_dom_BlobURLChannel_h
+
+#include "mozilla/net/ContentRange.h"
+#include "nsBaseChannel.h"
+#include "nsCOMPtr.h"
+#include "nsContentUtils.h"
+#include "nsIInputStream.h"
+
+class nsIURI;
+
+namespace mozilla::dom {
+
+#define MOZ_BLOBURLCHANNEL_IID \
+  {0xe6d2a388, 0x0007, 0x42e4, {0xbf, 0x0b, 0xa1, 0x2b, 0xc8, 0x1a, 0x8c, 0x1f}}
+
+class BlobImpl;
+
+class BlobURLChannel final : public nsBaseChannel {
+ public:
+  NS_INLINE_DECL_STATIC_IID(MOZ_BLOBURLCHANNEL_IID)
+
+  NS_DECL_ISUPPORTS_INHERITED
+
+  BlobURLChannel(nsIURI* aURI, nsILoadInfo* aLoadInfo);
+
+  nsresult SetRequestContentRangeHeader(const nsACString& aContentRangeHeader);
+  const Maybe<nsContentUtils::ParsedRange>& GetRequestContentRange() {
+    return mRequestContentRange;
+  }
+
+  net::ContentRange* GetResponseContentRange() { return mResponseContentRange; }
+  nsresult SetResponseContentRange(net::ContentRange* aContentRange);
+
+  nsresult GetBackingBlob(BlobImpl** aBlobImpl);
+  nsresult SetBackingBlob(BlobImpl* aBlobImpl);
+
+  NS_IMETHOD SetContentType(const nsACString& aContentType) override;
+
+ private:
+  ~BlobURLChannel() override;
+
+  nsresult OpenContentStream(bool aAsync, nsIInputStream** aResult,
+                             nsIChannel** aChannel) override;
+
+  bool mContentStreamOpened;
+
+  Maybe<nsContentUtils::ParsedRange> mRequestContentRange;
+
+  RefPtr<BlobImpl> mBlobImpl;
+  RefPtr<net::ContentRange> mResponseContentRange;
+};
+
+}  
+
+#endif /* mozilla_dom_BlobURLChannel_h */

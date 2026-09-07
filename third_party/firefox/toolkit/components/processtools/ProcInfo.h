@@ -1,0 +1,169 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(_mozilla_ProcInfo_h)
+#define _mozilla_ProcInfo_h
+
+#include <base/process.h>
+#include <stdint.h>
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/ChromeUtilsBinding.h"
+#include "mozilla/dom/ipc/IdType.h"
+#include "mozilla/HashTable.h"
+#include "mozilla/MozPromise.h"
+
+namespace mozilla {
+
+namespace ipc {
+class GeckoChildProcessHost;
+}
+
+nsresult GetCurrentProcessMemoryUsage(uint64_t* aResult);
+
+nsresult GetCpuTimeSinceProcessStartInMs(uint64_t* aResult);
+
+nsresult GetGpuTimeSinceProcessStartInMs(uint64_t* aResult);
+
+enum class ProcType {
+  Web,
+  WebIsolated,
+  File,
+  Extension,
+  PrivilegedAbout,
+  PrivilegedMozilla,
+  WebCOOPCOEP,
+  WebServiceWorker,
+  Inference,
+#define GECKO_PROCESS_TYPE(enum_value, enum_name, string_name, proc_typename, \
+                           process_bin_type, procinfo_typename,               \
+                           webidl_typename, allcaps_name)                     \
+  procinfo_typename,
+#define SKIP_PROCESS_TYPE_CONTENT
+#if !defined(MOZ_ENABLE_FORKSERVER)
+#  define SKIP_PROCESS_TYPE_FORKSERVER
+#endif
+#include "mozilla/GeckoProcessTypes.h"
+#undef SKIP_PROCESS_TYPE_CONTENT
+#if !defined(MOZ_ENABLE_FORKSERVER)
+#  undef SKIP_PROCESS_TYPE_FORKSERVER
+#endif
+#undef GECKO_PROCESS_TYPE
+  Preallocated,
+  Unknown,
+  Max = Unknown,
+};
+
+using UtilityActorName = mozilla::dom::WebIDLUtilityActorName;
+
+nsCString GetUtilityActorName(const UtilityActorName aActorName);
+
+int GetCycleTimeFrequencyMHz();
+
+struct ThreadInfo {
+  base::ProcessId tid = 0;
+  nsString name;
+  uint64_t cpuTime = 0;
+  uint64_t cpuCycleCount = 0;
+};
+
+struct WindowInfo {
+  explicit WindowInfo()
+      : outerWindowId(0),
+        documentURI(nullptr),
+        documentTitle(u""_ns),
+        isProcessRoot(false),
+        isInProcess(false) {}
+  WindowInfo(uint64_t aOuterWindowId, nsIURI* aDocumentURI,
+             nsAString&& aDocumentTitle, bool aIsProcessRoot, bool aIsInProcess)
+      : outerWindowId(aOuterWindowId),
+        documentURI(aDocumentURI),
+        documentTitle(std::move(aDocumentTitle)),
+        isProcessRoot(aIsProcessRoot),
+        isInProcess(aIsInProcess) {}
+
+  const uint64_t outerWindowId;
+
+  const nsCOMPtr<nsIURI> documentURI;
+
+  const nsString documentTitle;
+
+  const bool isProcessRoot;
+
+  const bool isInProcess;
+};
+
+struct UtilityInfo {
+  explicit UtilityInfo() : actorName(UtilityActorName::Unknown) {}
+  explicit UtilityInfo(UtilityActorName aActorName) : actorName(aActorName) {}
+  const UtilityActorName actorName;
+};
+
+struct ProcInfo {
+  base::ProcessId pid = 0;
+  dom::ContentParentId childId;
+  ProcType type;
+  nsCString origin;
+  uint64_t memory = 0;
+  uint64_t cpuTime = 0;
+  uint64_t cpuCycleCount = 0;
+  CopyableTArray<ThreadInfo> threads;
+  CopyableTArray<WindowInfo> windows;
+  CopyableTArray<UtilityInfo> utilityActors;
+};
+
+typedef MozPromise<mozilla::HashMap<base::ProcessId, ProcInfo>, nsresult, true>
+    ProcInfoPromise;
+
+struct ProcInfoRequest {
+  ProcInfoRequest(base::ProcessId aPid, ProcType aProcessType,
+                  const nsACString& aOrigin, nsTArray<WindowInfo>&& aWindowInfo,
+                  nsTArray<UtilityInfo>&& aUtilityInfo, uint32_t aChildId = 0
+                  )
+      : pid(aPid),
+        processType(aProcessType),
+        origin(aOrigin),
+        windowInfo(std::move(aWindowInfo)),
+        utilityInfo(std::move(aUtilityInfo)),
+        childId(aChildId)
+  {
+  }
+  const base::ProcessId pid;
+  const ProcType processType;
+  const nsCString origin;
+  const nsTArray<WindowInfo> windowInfo;
+  const nsTArray<UtilityInfo> utilityInfo;
+  const int32_t childId;
+};
+
+RefPtr<ProcInfoPromise> GetProcInfo(nsTArray<ProcInfoRequest>&& aRequests);
+
+ProcInfoPromise::ResolveOrRejectValue GetProcInfoSync(
+    nsTArray<ProcInfoRequest>&& aRequests);
+
+template <typename T>
+nsresult CopySysProcInfoToDOM(const ProcInfo& source, T* dest) {
+  dest->mPid = source.pid;
+  dest->mMemory = source.memory;
+  dest->mCpuTime = source.cpuTime;
+  dest->mCpuCycleCount = source.cpuCycleCount;
+
+  mozilla::dom::Sequence<mozilla::dom::ThreadInfoDictionary> threads;
+  for (const ThreadInfo& entry : source.threads) {
+    mozilla::dom::ThreadInfoDictionary* thread =
+        threads.AppendElement(fallible);
+    if (NS_WARN_IF(!thread)) {
+      return NS_ERROR_OUT_OF_MEMORY;
+    }
+    thread->mCpuTime = entry.cpuTime;
+    thread->mCpuCycleCount = entry.cpuCycleCount;
+    thread->mTid = entry.tid;
+    thread->mName.Assign(entry.name);
+  }
+  dest->mThreads = std::move(threads);
+  return NS_OK;
+}
+
+}  
+
+#endif

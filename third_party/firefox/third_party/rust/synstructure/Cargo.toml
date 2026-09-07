@@ -1,0 +1,51 @@
+
+[package]
+edition = "2018"
+name = "synstructure"
+version = "0.13.1"
+authors = ["Nika Layzell <nika@thelayzells.com>"]
+include = [
+    "src/**/*",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE",
+]
+description = "Helper methods and macros for custom derives"
+documentation = "https://docs.rs/synstructure"
+keywords = [
+    "syn",
+    "macros",
+    "derive",
+    "expand_substructure",
+    "enum",
+]
+license = "MIT"
+repository = "https://github.com/mystor/synstructure"
+
+[dependencies.proc-macro2]
+version = "1.0.60"
+default-features = false
+
+[dependencies.quote]
+version = "1"
+default-features = false
+
+[dependencies.syn]
+version = "2"
+features = [
+    "derive",
+    "parsing",
+    "printing",
+    "clone-impls",
+    "visit",
+    "extra-traits",
+]
+default-features = false
+
+[features]
+default = ["proc-macro"]
+proc-macro = [
+    "proc-macro2/proc-macro",
+    "syn/proc-macro",
+    "quote/proc-macro",
+]

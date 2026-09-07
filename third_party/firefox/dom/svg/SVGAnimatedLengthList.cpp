@@ -1,0 +1,133 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "SVGAnimatedLengthList.h"
+
+#include <utility>
+
+#include "DOMSVGAnimatedLengthList.h"
+#include "SVGLengthListSMILType.h"
+#include "mozilla/SMILValue.h"
+#include "mozilla/Try.h"
+#include "mozilla/dom/SVGElement.h"
+#include "mozilla/dom/SVGLengthBinding.h"
+
+namespace mozilla {
+
+using namespace dom;
+
+nsresult SVGAnimatedLengthList::SetBaseValueString(const nsAString& aValue) {
+  SVGLengthList newBaseValue;
+  MOZ_TRY(newBaseValue.SetValueFromString(aValue));
+
+  DOMSVGAnimatedLengthList* domWrapper =
+      DOMSVGAnimatedLengthList::GetDOMWrapperIfExists(this);
+  if (domWrapper) {
+    domWrapper->InternalBaseValListWillChangeTo(newBaseValue);
+  }
+
+  mBaseVal.SwapWith(newBaseValue);
+  return NS_OK;
+}
+
+void SVGAnimatedLengthList::ClearBaseValue(uint32_t aAttrEnum) {
+  DOMSVGAnimatedLengthList* domWrapper =
+      DOMSVGAnimatedLengthList::GetDOMWrapperIfExists(this);
+  if (domWrapper) {
+    domWrapper->InternalBaseValListWillChangeTo(SVGLengthList());
+  }
+  mBaseVal.Clear();
+}
+
+nsresult SVGAnimatedLengthList::SetAnimValue(const SVGLengthList& aNewAnimValue,
+                                             SVGElement* aElement,
+                                             uint32_t aAttrEnum) {
+  DOMSVGAnimatedLengthList* domWrapper =
+      DOMSVGAnimatedLengthList::GetDOMWrapperIfExists(this);
+  if (domWrapper) {
+    domWrapper->InternalAnimValListWillChangeTo(aNewAnimValue);
+  }
+  if (!mAnimVal) {
+    mAnimVal = std::make_unique<SVGLengthList>();
+  }
+  nsresult rv = mAnimVal->CopyFrom(aNewAnimValue);
+  if (NS_FAILED(rv)) {
+    ClearAnimValue(aElement, aAttrEnum);
+    return rv;
+  }
+  aElement->DidAnimateLengthList(aAttrEnum);
+  return NS_OK;
+}
+
+void SVGAnimatedLengthList::ClearAnimValue(SVGElement* aElement,
+                                           uint32_t aAttrEnum) {
+  DOMSVGAnimatedLengthList* domWrapper =
+      DOMSVGAnimatedLengthList::GetDOMWrapperIfExists(this);
+  if (domWrapper) {
+    domWrapper->InternalAnimValListWillChangeTo(mBaseVal);
+  }
+  mAnimVal = nullptr;
+  aElement->DidAnimateLengthList(aAttrEnum);
+}
+
+std::unique_ptr<SMILAttr> SVGAnimatedLengthList::ToSMILAttr(
+    SVGElement* aSVGElement, uint8_t aAttrEnum, SVGLength::Axis aAxis,
+    bool aCanZeroPadList) {
+  return std::make_unique<SMILAnimatedLengthList>(this, aSVGElement, aAttrEnum,
+                                                  aAxis, aCanZeroPadList);
+}
+
+nsresult SVGAnimatedLengthList::SMILAnimatedLengthList::ValueFromString(
+    const nsAString& aStr, const dom::SVGAnimationElement* ,
+    SMILValue& aValue, bool& aPreventCachingOfSandwich) const {
+  SMILValue val(&SVGLengthListSMILType::sSingleton);
+  SVGLengthListAndInfo* llai = static_cast<SVGLengthListAndInfo*>(val.mU.mPtr);
+  nsresult rv = llai->SetValueFromString(aStr);
+  if (NS_SUCCEEDED(rv)) {
+    llai->SetInfo(mElement, mAxis, mCanZeroPadList);
+    aValue = std::move(val);
+
+
+    for (uint32_t i = 0; i < llai->Length(); ++i) {
+      uint8_t unit = (*llai)[i].GetUnit();
+      if (!SVGLength::IsAbsoluteUnit(unit)) {
+        aPreventCachingOfSandwich = true;
+        break;
+      }
+    }
+  }
+  return rv;
+}
+
+SMILValue SVGAnimatedLengthList::SMILAnimatedLengthList::GetBaseValue() const {
+  SMILValue val;
+
+  SMILValue tmp(&SVGLengthListSMILType::sSingleton);
+  SVGLengthListAndInfo* llai = static_cast<SVGLengthListAndInfo*>(tmp.mU.mPtr);
+  nsresult rv = llai->CopyFrom(mVal->mBaseVal);
+  if (NS_SUCCEEDED(rv)) {
+    llai->SetInfo(mElement, mAxis, mCanZeroPadList);
+    val = std::move(tmp);
+  }
+  return val;
+}
+
+nsresult SVGAnimatedLengthList::SMILAnimatedLengthList::SetAnimValue(
+    const SMILValue& aValue) {
+  NS_ASSERTION(aValue.mType == &SVGLengthListSMILType::sSingleton,
+               "Unexpected type to assign animated value");
+  if (aValue.mType == &SVGLengthListSMILType::sSingleton) {
+    mVal->SetAnimValue(*static_cast<SVGLengthListAndInfo*>(aValue.mU.mPtr),
+                       mElement, mAttrEnum);
+  }
+  return NS_OK;
+}
+
+void SVGAnimatedLengthList::SMILAnimatedLengthList::ClearAnimValue() {
+  if (mVal->mAnimVal) {
+    mVal->ClearAnimValue(mElement, mAttrEnum);
+  }
+}
+
+}  

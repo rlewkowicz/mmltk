@@ -1,0 +1,35 @@
+/***************************************************************************
+ * Copyright (c) Johan Mabille, Sylvain Corlay, Wolf Vollprecht and         *
+ * Martin Renou                                                             *
+ * Copyright (c) QuantStack                                                 *
+ * Copyright (c) Serge Guelton                                              *
+ *                                                                          *
+ * Distributed under the terms of the BSD 3-Clause License.                 *
+ *                                                                          *
+ * The full license is in the file LICENSE, distributed with this software. *
+ ****************************************************************************/
+
+#if !defined(XSIMD_COMMON_ARCH_HPP)
+#define XSIMD_COMMON_ARCH_HPP
+
+#include "../config/xsimd_config.hpp"
+
+#include <cstddef>
+
+namespace xsimd
+{
+    struct common
+    {
+        static constexpr bool supported() noexcept { return true; }
+        static constexpr bool available() noexcept { return true; }
+        static constexpr std::size_t alignment() noexcept { return 0; }
+        static constexpr bool requires_alignment() noexcept { return false; }
+        static constexpr char const* name() noexcept { return "common"; }
+    };
+
+    struct unsupported
+    {
+    };
+}
+
+#endif

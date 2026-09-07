@@ -1,0 +1,206 @@
+// Copyright 2012 the V8 project authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(V8_REGEXP_REGEXP_BYTECODE_GENERATOR_H_)
+#define V8_REGEXP_REGEXP_BYTECODE_GENERATOR_H_
+
+#include "irregexp/imported/regexp-bytecodes.h"
+#include "irregexp/imported/regexp-macro-assembler.h"
+
+namespace v8 {
+namespace internal {
+namespace regexp {
+
+class V8_EXPORT_PRIVATE BytecodeWriter {
+ public:
+  explicit BytecodeWriter(Zone* zone);
+  virtual ~BytecodeWriter() = default;
+
+  template <typename T>
+  void OverwriteValue(T value, int absolute_offset);
+  void EmitRawBytecodeStream(const uint8_t* data, int length);
+  void EmitRawBytecodeStream(const BytecodeWriter* src_writer, int src_offset,
+                             int length);
+  void Finalize(Bytecode bc);
+
+  int pc() const { return pc_; }
+  ZoneVector<uint8_t>& buffer() { return buffer_; }
+  const ZoneVector<uint8_t>& buffer() const { return buffer_; }
+
+  template <typename T>
+  inline void Emit(T value, int offset);
+  inline void EmitBytecode(Bytecode bc);
+
+  inline void ResetPc(int new_pc);
+
+  template <Bytecode bytecode, typename... Args>
+  void Emit(Args... args);
+  template <BytecodeOperandType OperandType, typename T>
+  void EmitOperand(T value, int offset);
+  template <BytecodeOperandType OperandType, typename T>
+  auto GetCheckedBasicOperandValue(T value);
+
+  template <typename T>
+  void EmitOperand(BytecodeOperandType type, T value, int offset);
+
+  uint32_t length() const {
+    DCHECK_GE(pc_, 0);
+    return static_cast<uint32_t>(pc_);
+  }
+  void CopyBufferTo(uint8_t* a) const;
+
+  ZoneMap<int, int>& jump_edges() { return jump_edges_; }
+  const ZoneMap<int, int>& jump_edges() const { return jump_edges_; }
+
+  void PatchJump(int target, int absolute_offset);
+
+#if defined(DEBUG)
+  inline void EmitPadding(int offset);
+#define EMIT_PADDING(offset) EmitPadding(offset)
+#else
+#define EMIT_PADDING(offset) ((void)0)
+#endif
+
+ protected:
+  static constexpr int kInitialBufferSizeInBytes = 1 * KB;
+  static constexpr size_t kMaxBufferGrowthInBytes = 1 * MB;
+  ZoneVector<uint8_t> buffer_;
+
+  int pc_;
+
+ private:
+  ZoneMap<int, int> jump_edges_;
+
+#if defined(DEBUG)
+  int end_of_bc_;
+  int pc_within_bc_;
+#endif
+
+  inline void EnsureCapacity(size_t size);
+  void ExpandBuffer(size_t new_size);
+};
+
+class V8_EXPORT_PRIVATE BytecodeGenerator : public RegExpMacroAssembler,
+                                            public BytecodeWriter {
+ public:
+  BytecodeGenerator(Isolate* isolate, Zone* zone, Mode mode);
+  ~BytecodeGenerator() override;
+  void Bind(Label* label) override;
+  void AdvanceCurrentPosition(int by) override;  
+  void PopCurrentPosition() override;
+  void PushCurrentPosition() override;
+  void Backtrack() override;
+  void GoTo(Label* label) override;
+  void PushBacktrack(Label* label) override;
+  bool Succeed() override;
+  void Fail() override;
+  void PopRegister(int register_index) override;
+  void PushRegister(int register_index,
+                    StackCheckFlag check_stack_limit) override;
+  void AdvanceRegister(int register_index, int by) override;  
+  void SetCurrentPositionFromEnd(int by) override;
+  void SetRegister(int register_index, int to) override;
+  void WriteCurrentPositionToRegister(int register_index,
+                                      int cp_offset) override;
+  void ClearRegisters(int reg_from, int reg_to) override;
+  void ReadCurrentPositionFromRegister(int reg) override;
+  void WriteStackPointerToRegister(int register_index) override;
+  void ReadStackPointerFromRegister(int register_index) override;
+  void CheckPosition(int cp_offset, Label* on_outside_input) override;
+  void CheckSpecialClassRanges(StandardCharacterSet type,
+                               Label* on_no_match) override;
+  void LoadCurrentCharacterImpl(int cp_offset, Label* on_end_of_input,
+                                bool check_bounds, int characters,
+                                int eats_at_least) override;
+  void CheckCharacter(unsigned c, Label* on_equal) override;
+  void CheckCharacterAfterAnd(unsigned c, unsigned mask,
+                              Label* on_equal) override;
+  void CheckCharacterGT(base::uc16 limit, Label* on_greater) override;
+  void CheckCharacterLT(base::uc16 limit, Label* on_less) override;
+  void CheckFixedLengthLoop(Label* on_tos_equals_current_position) override;
+  void CheckAtStart(int cp_offset, Label* on_at_start) override;
+  void CheckNotAtStart(int cp_offset, Label* on_not_at_start) override;
+  void CheckNotCharacter(unsigned c, Label* on_not_equal) override;
+  void CheckNotCharacterAfterAnd(unsigned c, unsigned mask,
+                                 Label* on_not_equal) override;
+  void CheckNotCharacterAfterMinusAnd(base::uc16 c, base::uc16 minus,
+                                      base::uc16 mask,
+                                      Label* on_not_equal) override;
+  void CheckCharacterInRange(base::uc16 from, base::uc16 to,
+                             Label* on_in_range) override;
+  void CheckCharacterNotInRange(base::uc16 from, base::uc16 to,
+                                Label* on_not_in_range) override;
+  bool CheckCharacterInRangeArray(const ZoneList<CharacterRange>* ranges,
+                                  Label* on_in_range) override {
+    return false;
+  }
+  bool CheckCharacterNotInRangeArray(const ZoneList<CharacterRange>* ranges,
+                                     Label* on_not_in_range) override {
+    return false;
+  }
+  void CheckBitInTable(Handle<ByteArray> table, Label* on_bit_set) override;
+  void SkipUntilBitInTable(int cp_offset, Handle<ByteArray> table,
+                           Handle<ByteArray> nibble_table, int advance_by,
+                           Label* on_match, Label* on_no_match) override;
+  void SkipUntilCharAnd(int cp_offset, int advance_by, unsigned character,
+                        unsigned mask, int eats_at_least, Label* on_match,
+                        Label* on_no_match) override;
+  void SkipUntilChar(int cp_offset, int advance_by, unsigned character,
+                     Label* on_match, Label* on_no_match) override;
+  void SkipUntilCharPosChecked(int cp_offset, int advance_by,
+                               unsigned character, int eats_at_least,
+                               Label* on_match, Label* on_no_match) override;
+  void SkipUntilCharOrChar(int cp_offset, int advance_by, unsigned char1,
+                           unsigned char2, Label* on_match,
+                           Label* on_no_match) override;
+  void SkipUntilGtOrNotBitInTable(int cp_offset, int advance_by,
+                                  unsigned character, Handle<ByteArray> table,
+                                  Label* on_match, Label* on_no_match) override;
+  void SkipUntilOneOfMasked(int cp_offset, int advance_by, unsigned both_chars,
+                            unsigned both_mask, int max_offset, unsigned chars1,
+                            unsigned mask1, unsigned chars2, unsigned mask2,
+                            Label* on_match1, Label* on_match2,
+                            Label* on_failure) override;
+  void SkipUntilOneOfMasked3(const SkipUntilOneOfMasked3Args& args) override;
+  void CheckNotBackReference(int start_reg, bool read_backward,
+                             Label* on_no_match) override;
+  void CheckNotBackReferenceIgnoreCase(int start_reg, bool read_backward,
+                                       bool unicode,
+                                       Label* on_no_match) override;
+  void IfRegisterLT(int register_index, int comparand,
+                    Label* on_less_than) override;
+  void IfRegisterGE(int register_index, int comparand,
+                    Label* on_greater_or_equal) override;
+  void IfRegisterEqPos(int register_index, Label* on_equal) override;
+  void RecordComment(std::string_view comment) override {}
+  MacroAssembler* masm() override { return nullptr; }
+
+  IrregexpImplementation Implementation() override;
+  DirectHandle<HeapObject> GetCode(DirectHandle<RegExpData> re_data,
+                                   Flags flags) override;
+
+ private:
+  template <Bytecode bytecode, typename... Args>
+  void Emit(Args... args);
+  using BytecodeWriter::Emit;
+
+  void EmitSkipTable(DirectHandle<ByteArray> table);
+
+  Label backtrack_;
+
+  static const int kInvalidPC = -1;
+  int advance_current_start_ = 0;
+  int advance_current_offset_ = 0;
+  int advance_current_end_ = kInvalidPC;
+
+  Isolate* isolate_;
+
+  DISALLOW_IMPLICIT_CONSTRUCTORS(BytecodeGenerator);
+};
+
+}  
+}  
+}  
+
+#endif

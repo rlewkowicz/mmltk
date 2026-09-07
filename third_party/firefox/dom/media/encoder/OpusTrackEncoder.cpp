@@ -1,0 +1,355 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+#include "OpusTrackEncoder.h"
+
+#include <opus/opus.h>
+
+#include "VideoUtils.h"
+#include "mozilla/CheckedInt.h"
+#include "nsString.h"
+
+#define LOG(args, ...)
+
+namespace mozilla {
+
+constexpr int MAX_SUPPORTED_AUDIO_CHANNELS = 8;
+
+constexpr int MAX_CHANNELS = 2;
+
+constexpr int MAX_DATA_BYTES = 4096;
+
+constexpr int kOpusSamplingRate = 48000;
+
+constexpr int kFrameDurationMs = 20;
+
+constexpr int kOpusSupportedInputSamplingRates[] = {8000, 12000, 16000, 24000,
+                                                    48000};
+
+namespace {
+
+template <typename T>
+static void SerializeToBuffer(T aValue, nsTArray<uint8_t>* aOutput) {
+  for (uint32_t i = 0; i < sizeof(T); i++) {
+    aOutput->AppendElement((uint8_t)(0x000000ff & (aValue >> (i * 8))));
+  }
+}
+
+static inline void SerializeToBuffer(const nsCString& aComment,
+                                     nsTArray<uint8_t>* aOutput) {
+  SerializeToBuffer((uint32_t)(aComment.Length()), aOutput);
+  aOutput->AppendElements(aComment.get(), aComment.Length());
+}
+
+static void SerializeOpusIdHeader(uint8_t aChannelCount, uint16_t aPreskip,
+                                  uint32_t aInputSampleRate,
+                                  nsTArray<uint8_t>* aOutput) {
+  constexpr uint8_t magic[] = "OpusHead";
+  aOutput->AppendElements(magic, sizeof(magic) - 1);
+
+  aOutput->AppendElement(1);
+
+  aOutput->AppendElement(aChannelCount);
+
+  SerializeToBuffer(aPreskip, aOutput);
+
+  SerializeToBuffer(aInputSampleRate, aOutput);
+
+  SerializeToBuffer((int16_t)0, aOutput);
+
+  aOutput->AppendElement(0);
+}
+
+static void SerializeOpusCommentHeader(const nsCString& aVendor,
+                                       const nsTArray<nsCString>& aComments,
+                                       nsTArray<uint8_t>* aOutput) {
+  constexpr uint8_t magic[] = "OpusTags";
+  aOutput->AppendElements(magic, sizeof(magic) - 1);
+
+  SerializeToBuffer(aVendor, aOutput);
+
+  SerializeToBuffer((uint32_t)aComments.Length(), aOutput);
+  for (uint32_t i = 0; i < aComments.Length(); ++i) {
+    SerializeToBuffer(aComments[i], aOutput);
+  }
+}
+
+bool IsSampleRateSupported(TrackRate aSampleRate) {
+  AutoTArray<int, 5> supportedSamplingRates;
+  supportedSamplingRates.AppendElements(
+      kOpusSupportedInputSamplingRates,
+      std::size(kOpusSupportedInputSamplingRates));
+  return supportedSamplingRates.Contains(aSampleRate);
+}
+
+}  
+
+OpusTrackEncoder::OpusTrackEncoder(TrackRate aTrackRate,
+                                   MediaQueue<EncodedFrame>& aEncodedDataQueue)
+    : AudioTrackEncoder(aTrackRate, aEncodedDataQueue),
+      mOutputSampleRate(IsSampleRateSupported(aTrackRate) ? aTrackRate
+                                                          : kOpusSamplingRate),
+      mEncoder(nullptr),
+      mLookahead(0),
+      mLookaheadWritten(0),
+      mResampler(nullptr),
+      mNumOutputFrames(0) {}
+
+OpusTrackEncoder::~OpusTrackEncoder() {
+  if (mEncoder) {
+    opus_encoder_destroy(mEncoder);
+  }
+  if (mResampler) {
+    speex_resampler_destroy(mResampler);
+    mResampler = nullptr;
+  }
+}
+
+nsresult OpusTrackEncoder::Init(int aChannels) {
+  NS_ENSURE_TRUE((aChannels <= MAX_SUPPORTED_AUDIO_CHANNELS) && (aChannels > 0),
+                 NS_ERROR_FAILURE);
+
+  mChannels = aChannels > MAX_CHANNELS ? MAX_CHANNELS : aChannels;
+
+  NS_ENSURE_TRUE(mTrackRate >= 8000, NS_ERROR_INVALID_ARG);
+  NS_ENSURE_TRUE(mTrackRate <= 192000, NS_ERROR_INVALID_ARG);
+
+  if (NeedsResampler()) {
+    int error;
+    mResampler = speex_resampler_init(mChannels, mTrackRate, kOpusSamplingRate,
+                                      SPEEX_RESAMPLER_QUALITY_DEFAULT, &error);
+
+    if (error != RESAMPLER_ERR_SUCCESS) {
+      return NS_ERROR_FAILURE;
+    }
+  }
+
+  int error = 0;
+  mEncoder = opus_encoder_create(mOutputSampleRate, mChannels,
+                                 OPUS_APPLICATION_AUDIO, &error);
+
+  if (error != OPUS_OK) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (mAudioBitrate) {
+    int bps = static_cast<int>(
+        std::min<uint32_t>(mAudioBitrate, std::numeric_limits<int>::max()));
+    error = opus_encoder_ctl(mEncoder, OPUS_SET_BITRATE(bps));
+    if (error != OPUS_OK) {
+      return NS_ERROR_FAILURE;
+    }
+  }
+
+  error = opus_encoder_ctl(mEncoder, OPUS_GET_LOOKAHEAD(&mLookahead));
+  if (error != OPUS_OK) {
+    mLookahead = 0;
+    return NS_ERROR_FAILURE;
+  }
+
+  SetInitialized();
+
+  return NS_OK;
+}
+
+int OpusTrackEncoder::GetLookahead() const {
+  return mLookahead * kOpusSamplingRate / mOutputSampleRate;
+}
+
+int OpusTrackEncoder::NumInputFramesPerPacket() const {
+  return mTrackRate * kFrameDurationMs / 1000;
+}
+
+int OpusTrackEncoder::NumOutputFramesPerPacket() const {
+  return mOutputSampleRate * kFrameDurationMs / 1000;
+}
+
+bool OpusTrackEncoder::NeedsResampler() const {
+  return mTrackRate != mOutputSampleRate &&
+         mOutputSampleRate == kOpusSamplingRate;
+}
+
+already_AddRefed<TrackMetadataBase> OpusTrackEncoder::GetMetadata() {
+
+  MOZ_ASSERT(mInitialized);
+
+  if (!mInitialized) {
+    return nullptr;
+  }
+
+  RefPtr<OpusMetadata> meta = new OpusMetadata();
+  meta->mChannels = mChannels;
+  meta->mSamplingFrequency = mTrackRate;
+
+  SerializeOpusIdHeader(mChannels,
+                        mLookahead * (kOpusSamplingRate / mOutputSampleRate),
+                        mTrackRate, &meta->mIdHeader);
+
+  nsCString vendor;
+  vendor.AppendASCII(opus_get_version_string());
+
+  nsTArray<nsCString> comments;
+  comments.AppendElement(
+      nsLiteralCString("ENCODER=Mozilla" MOZ_APP_UA_VERSION));
+
+  SerializeOpusCommentHeader(vendor, comments, &meta->mCommentHeader);
+
+  return meta.forget();
+}
+
+nsresult OpusTrackEncoder::Encode(AudioSegment* aSegment) {
+
+  MOZ_ASSERT(aSegment);
+  MOZ_ASSERT(mInitialized || mCanceled);
+
+  if (mCanceled || IsEncodingComplete()) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (!mInitialized) {
+    return NS_ERROR_FAILURE;
+  }
+
+  int result = 0;
+  while (result >= 0 && !IsEncodingComplete()) {
+    const int framesLeft = mResampledLeftover.Length() / mChannels;
+    MOZ_ASSERT(NumOutputFramesPerPacket() >= framesLeft);
+    const int framesToFetch = NumInputFramesPerPacket() -
+                              (framesLeft * mTrackRate / kOpusSamplingRate) +
+                              (NeedsResampler() ? 1 : 0);
+
+    if (!mEndOfStream && aSegment->GetDuration() < framesToFetch) {
+      return NS_OK;
+    }
+
+    AutoTArray<AudioDataValue, 9600> pcm;
+    pcm.SetLength(NumOutputFramesPerPacket() * mChannels);
+
+    int frameCopied = 0;
+
+    for (AudioSegment::ChunkIterator iter(*aSegment);
+         !iter.IsEnded() && frameCopied < framesToFetch; iter.Next()) {
+      AudioChunk chunk = *iter;
+
+      TrackTime frameToCopy =
+          std::min(chunk.GetDuration(),
+                   static_cast<TrackTime>(framesToFetch - frameCopied));
+
+      MOZ_ASSERT(frameToCopy <= 3844, "frameToCopy exceeded expected range");
+
+      if (!chunk.IsNull()) {
+        AudioTrackEncoder::InterleaveTrackData(
+            chunk, frameToCopy, mChannels,
+            pcm.Elements() + frameCopied * mChannels);
+      } else {
+        CheckedInt<int> memsetLength =
+            CheckedInt<int>(frameToCopy) * mChannels * sizeof(AudioDataValue);
+        if (!memsetLength.isValid()) {
+          MOZ_ASSERT_UNREACHABLE("memsetLength invalid!");
+          return NS_ERROR_FAILURE;
+        }
+        memset(pcm.Elements() + frameCopied * mChannels, 0,
+               memsetLength.value());
+      }
+
+      frameCopied += frameToCopy;
+    }
+
+    MOZ_ASSERT(frameCopied <= 3844, "frameCopied exceeded expected range");
+
+    int framesInPCM = frameCopied;
+    if (mResampler) {
+      AutoTArray<AudioDataValue, 9600> resamplingDest;
+      uint32_t inframes = frameCopied;
+      uint32_t outframes = inframes * kOpusSamplingRate / mTrackRate + 1;
+
+      resamplingDest.SetLength(outframes * mChannels);
+
+      float* in = reinterpret_cast<float*>(pcm.Elements());
+      float* out = reinterpret_cast<float*>(resamplingDest.Elements());
+      speex_resampler_process_interleaved_float(mResampler, in, &inframes, out,
+                                                &outframes);
+
+      MOZ_ASSERT(pcm.Length() >= mResampledLeftover.Length());
+      PodCopy(pcm.Elements(), mResampledLeftover.Elements(),
+              mResampledLeftover.Length());
+
+      uint32_t outframesToCopy = std::min(
+          outframes,
+          static_cast<uint32_t>(NumOutputFramesPerPacket() - framesLeft));
+
+      MOZ_ASSERT(pcm.Length() - mResampledLeftover.Length() >=
+                 outframesToCopy * mChannels);
+      PodCopy(pcm.Elements() + mResampledLeftover.Length(),
+              resamplingDest.Elements(), outframesToCopy * mChannels);
+      int frameLeftover = outframes - outframesToCopy;
+      mResampledLeftover.SetLength(frameLeftover * mChannels);
+      PodCopy(mResampledLeftover.Elements(),
+              resamplingDest.Elements() + outframesToCopy * mChannels,
+              mResampledLeftover.Length());
+      framesInPCM = framesLeft + outframesToCopy;
+    }
+
+    aSegment->RemoveLeading(frameCopied);
+
+    bool isFinalPacket = false;
+    if (aSegment->GetDuration() == 0 && mEndOfStream &&
+        framesInPCM < NumOutputFramesPerPacket()) {
+      const int toWrite = std::min(mLookahead - mLookaheadWritten,
+                                   NumOutputFramesPerPacket() - framesInPCM);
+      PodZero(pcm.Elements() + framesInPCM * mChannels, toWrite * mChannels);
+      mLookaheadWritten += toWrite;
+      framesInPCM += toWrite;
+      if (mLookaheadWritten == mLookahead) {
+        isFinalPacket = true;
+      }
+    }
+
+    MOZ_ASSERT_IF(!isFinalPacket, framesInPCM == NumOutputFramesPerPacket());
+
+    if (framesInPCM < NumOutputFramesPerPacket() && isFinalPacket) {
+      PodZero(pcm.Elements() + framesInPCM * mChannels,
+              (NumOutputFramesPerPacket() - framesInPCM) * mChannels);
+    }
+    auto frameData = MakeRefPtr<EncodedFrame::FrameData>();
+    frameData->SetLength(MAX_DATA_BYTES);
+    result = 0;
+    const float* pcmBuf = static_cast<float*>(pcm.Elements());
+    result = opus_encode_float(mEncoder, pcmBuf, NumOutputFramesPerPacket(),
+                               frameData->Elements(), MAX_DATA_BYTES);
+    frameData->SetLength(result >= 0 ? result : 0);
+
+    if (result < 0) {
+      LOG("[Opus] Fail to encode data! Result: {}.", opus_strerror(result));
+    }
+    if (isFinalPacket) {
+      if (mResampler) {
+        speex_resampler_destroy(mResampler);
+        mResampler = nullptr;
+      }
+      mResampledLeftover.SetLength(0);
+    }
+
+    mEncodedDataQueue.Push(MakeAndAddRef<EncodedFrame>(
+        media::TimeUnit(mNumOutputFrames + mLookahead, mOutputSampleRate),
+        static_cast<uint64_t>(framesInPCM) * kOpusSamplingRate /
+            mOutputSampleRate,
+        kOpusSamplingRate, EncodedFrame::OPUS_AUDIO_FRAME,
+        std::move(frameData)));
+
+    mNumOutputFrames += NumOutputFramesPerPacket();
+    LOG("[Opus] mOutputTimeStamp {:.3f}.",
+        media::TimeUnit(mNumOutputFrames, mOutputSampleRate).ToSeconds());
+
+    if (isFinalPacket) {
+      LOG("[Opus] Done encoding.");
+      mEncodedDataQueue.Finish();
+    }
+  }
+
+  return result >= 0 ? NS_OK : NS_ERROR_FAILURE;
+}
+
+}  
+
+#undef LOG

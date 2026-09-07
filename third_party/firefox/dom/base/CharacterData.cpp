@@ -1,0 +1,530 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "mozilla/dom/CharacterData.h"
+
+#include "mozAutoDocUpdate.h"
+#include "mozilla/AsyncEventDispatcher.h"
+#include "mozilla/Sprintf.h"
+#include "mozilla/dom/BindContext.h"
+#include "mozilla/dom/DirectionalityUtils.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/MutationObservers.h"
+#include "mozilla/dom/ShadowRoot.h"
+#include "mozilla/dom/UnbindContext.h"
+#include "nsBidiUtils.h"
+#include "nsIContentInlines.h"
+#include "nsReadableUtils.h"
+#include "nsTextNode.h"
+#include "nsWindowSizes.h"
+
+#if defined(ACCESSIBILITY) && defined(DEBUG)
+#  include "nsAccessibilityService.h"
+#endif
+
+namespace mozilla::dom {
+
+CharacterData::CharacterData(already_AddRefed<dom::NodeInfo> aNodeInfo)
+    : nsIContent(std::move(aNodeInfo)) {
+  MOZ_ASSERT(mNodeInfo->NodeType() == TEXT_NODE ||
+                 mNodeInfo->NodeType() == CDATA_SECTION_NODE ||
+                 mNodeInfo->NodeType() == COMMENT_NODE ||
+                 mNodeInfo->NodeType() == PROCESSING_INSTRUCTION_NODE ||
+                 mNodeInfo->NodeType() == DOCUMENT_TYPE_NODE,
+             "Bad NodeType in aNodeInfo");
+}
+
+CharacterData::~CharacterData() {
+  MOZ_ASSERT(!IsInUncomposedDoc(),
+             "Please remove this from the document properly");
+  if (GetParent()) {
+    NS_RELEASE(mParent);
+  }
+}
+
+Element* CharacterData::GetNameSpaceElement() {
+  return Element::FromNodeOrNull(GetParentNode());
+}
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(CharacterData)
+
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_BEGIN(CharacterData)
+  return Element::CanSkip(tmp, aRemovingAllowed);
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_END
+
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_IN_CC_BEGIN(CharacterData)
+  return Element::CanSkipInCC(tmp);
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_IN_CC_END
+
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_THIS_BEGIN(CharacterData)
+  return Element::CanSkipThis(tmp);
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_THIS_END
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INTERNAL(CharacterData)
+  if (MOZ_UNLIKELY(cb.WantDebugInfo())) {
+    char name[40];
+    SprintfLiteral(name, "CharacterData (len=%d)", tmp->mBuffer.GetLength());
+    cb.DescribeRefCountedNode(tmp->mRefCnt.get(), name);
+  } else {
+    NS_IMPL_CYCLE_COLLECTION_DESCRIBE(CharacterData, tmp->mRefCnt.get())
+  }
+
+  if (!nsIContent::Traverse(tmp, cb)) {
+    return NS_SUCCESS_INTERRUPTED_TRAVERSE;
+  }
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(CharacterData)
+  nsIContent::Unlink(tmp);
+
+  if (nsContentSlots* slots = tmp->GetExistingContentSlots()) {
+    slots->Unlink(*tmp);
+  }
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_INTERFACE_MAP_BEGIN(CharacterData)
+  NS_INTERFACE_MAP_ENTRIES_CYCLE_COLLECTION(CharacterData)
+NS_INTERFACE_MAP_END_INHERITING(nsIContent)
+
+void CharacterData::GetNodeValueInternal(nsAString& aNodeValue) {
+  GetData(aNodeValue);
+}
+
+void CharacterData::SetNodeValueInternal(
+    const nsAString& aNodeValue, ErrorResult& aError,
+    MutationEffectOnScript aMutationEffectOnScript) {
+  aError = SetTextInternal(0, mBuffer.GetLength(), aNodeValue.BeginReading(),
+                           aNodeValue.Length(), true, aMutationEffectOnScript);
+}
+
+
+
+void CharacterData::SetTextContentInternal(
+    const nsAString& aTextContent, nsIPrincipal* aSubjectPrincipal,
+    ErrorResult& aError, MutationEffectOnScript aMutationEffectOnScript) {
+  return SetNodeValueInternal(aTextContent, aError, aMutationEffectOnScript);
+}
+
+void CharacterData::GetData(nsAString& aData) const {
+  if (mBuffer.Is2b()) {
+    aData.Truncate();
+    mBuffer.AppendTo(aData);
+  } else {
+    if (const char* data = mBuffer.Get1b()) {
+      CopyASCIItoUTF16(Substring(data, data + mBuffer.GetLength()), aData);
+    } else {
+      aData.Truncate();
+    }
+  }
+}
+
+void CharacterData::SetDataInternal(
+    const nsAString& aData, MutationEffectOnScript aMutationEffectOnScript,
+    ErrorResult& aRv) {
+  nsresult rv = SetTextInternal(0, mBuffer.GetLength(), aData.BeginReading(),
+                                aData.Length(), true, aMutationEffectOnScript);
+  if (NS_FAILED(rv)) {
+    aRv.Throw(rv);
+  }
+}
+
+void CharacterData::SubstringData(uint32_t aStart, uint32_t aCount,
+                                  nsAString& aReturn, ErrorResult& rv) {
+  aReturn.Truncate();
+
+  uint32_t textLength = mBuffer.GetLength();
+  if (aStart > textLength) {
+    rv.Throw(NS_ERROR_DOM_INDEX_SIZE_ERR);
+    return;
+  }
+
+  uint32_t amount = aCount;
+  if (amount > textLength - aStart) {
+    amount = textLength - aStart;
+  }
+
+  if (mBuffer.Is2b()) {
+    aReturn.Assign(mBuffer.Get2b() + aStart, amount);
+  } else {
+
+    const char* data = mBuffer.Get1b() + aStart;
+    CopyASCIItoUTF16(Substring(data, data + amount), aReturn);
+  }
+}
+
+
+void CharacterData::AppendDataInternal(
+    const nsAString& aData, MutationEffectOnScript aMutationEffectOnScript,
+    ErrorResult& aRv) {
+  InsertDataInternal(mBuffer.GetLength(), aData, aMutationEffectOnScript, aRv);
+}
+
+void CharacterData::InsertDataInternal(
+    uint32_t aOffset, const nsAString& aData,
+    MutationEffectOnScript aMutationEffectOnScript, ErrorResult& aRv) {
+  nsresult rv = SetTextInternal(aOffset, 0, aData.BeginReading(),
+                                aData.Length(), true, aMutationEffectOnScript);
+  if (NS_FAILED(rv)) {
+    aRv.Throw(rv);
+  }
+}
+
+void CharacterData::DeleteDataInternal(
+    uint32_t aOffset, uint32_t aCount,
+    MutationEffectOnScript aMutationEffectOnScript, ErrorResult& aRv) {
+  nsresult rv = SetTextInternal(aOffset, aCount, nullptr, 0, true,
+                                aMutationEffectOnScript);
+  if (NS_FAILED(rv)) {
+    aRv.Throw(rv);
+  }
+}
+
+void CharacterData::ReplaceDataInternal(
+    uint32_t aOffset, uint32_t aCount, const nsAString& aData,
+    MutationEffectOnScript aMutationEffectOnScript, ErrorResult& aRv) {
+  nsresult rv = SetTextInternal(aOffset, aCount, aData.BeginReading(),
+                                aData.Length(), true, aMutationEffectOnScript);
+  if (NS_FAILED(rv)) {
+    aRv.Throw(rv);
+  }
+}
+
+nsresult CharacterData::SetTextInternal(
+    uint32_t aOffset, uint32_t aCount, const char16_t* aBuffer,
+    uint32_t aLength, bool aNotify,
+    MutationEffectOnScript aMutationEffectOnScript,
+    CharacterDataChangeInfo::Details* aDetails) {
+  MOZ_ASSERT(aBuffer || !aLength, "Null buffer passed to SetTextInternal!");
+
+  uint32_t textLength = mBuffer.GetLength();
+  if (aOffset > textLength) {
+    return NS_ERROR_DOM_INDEX_SIZE_ERR;
+  }
+
+  if (aCount > textLength - aOffset) {
+    aCount = textLength - aOffset;
+  }
+
+  uint32_t endOffset = aOffset + aCount;
+
+  if (aLength > aCount && !mBuffer.CanGrowBy(aLength - aCount)) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+
+  Document* document = GetComposedDoc();
+  mozAutoDocUpdate updateBatch(document, aNotify);
+
+  if (aNotify) {
+    CharacterDataChangeInfo info = {
+        aOffset == textLength,   aOffset, endOffset, aLength,
+        aMutationEffectOnScript, aDetails};
+    MutationObservers::NotifyCharacterDataWillChange(this, info);
+  }
+
+  auto oldDir = Directionality::Unset;
+  const bool dirAffectsAncestor =
+      IsText() && TextNodeWillChangeDirection(AsText(), &oldDir, aOffset);
+
+  if (aOffset == 0 && endOffset == textLength) {
+    bool ok = mBuffer.SetTo(aBuffer, aLength, true,
+                            HasFlag(NS_MAYBE_MODIFIED_FREQUENTLY));
+    NS_ENSURE_TRUE(ok, NS_ERROR_OUT_OF_MEMORY);
+  } else if (aOffset == textLength) {
+    bool ok = mBuffer.Append(aBuffer, aLength, !mBuffer.IsBidi(),
+                             HasFlag(NS_MAYBE_MODIFIED_FREQUENTLY));
+    NS_ENSURE_TRUE(ok, NS_ERROR_OUT_OF_MEMORY);
+  } else {
+
+    bool bidi = mBuffer.IsBidi();
+
+    const uint32_t newLength = textLength - aCount + aLength;
+    nsString to;
+    to.SetCapacity(newLength);
+
+    if (aOffset) {
+      mBuffer.AppendTo(to, 0, aOffset);
+    }
+    if (aLength) {
+      to.Append(aBuffer, aLength);
+      if (!bidi) {
+        bidi = HasRTLChars(Span(aBuffer, aLength));
+      }
+    }
+    if (endOffset != textLength) {
+      mBuffer.AppendTo(to, endOffset, textLength - endOffset);
+    }
+
+    bool use2b = HasFlag(NS_MAYBE_MODIFIED_FREQUENTLY) || bidi;
+    bool ok = mBuffer.SetTo(to, false, use2b);
+    mBuffer.SetBidi(bidi);
+
+    NS_ENSURE_TRUE(ok, NS_ERROR_OUT_OF_MEMORY);
+  }
+
+  UnsetFlags(NS_CACHED_TEXT_IS_ONLY_WHITESPACE);
+
+  if (document && mBuffer.IsBidi()) {
+    document->SetBidiEnabled();
+  }
+
+  if (dirAffectsAncestor) {
+    MOZ_ASSERT(IsText());
+    TextNodeChangedDirection(AsText(), oldDir, aNotify);
+  }
+
+  if (aNotify) {
+    CharacterDataChangeInfo info = {
+        aOffset == textLength,   aOffset, endOffset, aLength,
+        aMutationEffectOnScript, aDetails};
+    MutationObservers::NotifyCharacterDataChanged(this, info);
+  }
+
+  return NS_OK;
+}
+
+
+
+#ifdef MOZ_DOM_LIST
+void CharacterData::ToCString(nsAString& aBuf, int32_t aOffset,
+                              int32_t aLen) const {
+  if (mBuffer.Is2b()) {
+    const char16_t* cp = mBuffer.Get2b() + aOffset;
+    const char16_t* end = cp + aLen;
+
+    while (cp < end) {
+      char16_t ch = *cp++;
+      if (ch == '&') {
+        aBuf.AppendLiteral("&amp;");
+      } else if (ch == '<') {
+        aBuf.AppendLiteral("&lt;");
+      } else if (ch == '>') {
+        aBuf.AppendLiteral("&gt;");
+      } else if ((ch < ' ') || (ch >= 127)) {
+        aBuf.AppendPrintf("\\u%04x", ch);
+      } else {
+        aBuf.Append(ch);
+      }
+    }
+  } else {
+    unsigned char* cp = (unsigned char*)mBuffer.Get1b() + aOffset;
+    const unsigned char* end = cp + aLen;
+
+    while (cp < end) {
+      char16_t ch = *cp++;
+      if (ch == '&') {
+        aBuf.AppendLiteral("&amp;");
+      } else if (ch == '<') {
+        aBuf.AppendLiteral("&lt;");
+      } else if (ch == '>') {
+        aBuf.AppendLiteral("&gt;");
+      } else if ((ch < ' ') || (ch >= 127)) {
+        aBuf.AppendPrintf("\\u%04x", ch);
+      } else {
+        aBuf.Append(ch);
+      }
+    }
+  }
+}
+#endif
+
+nsresult CharacterData::BindToTree(BindContext& aContext, nsINode& aParent) {
+  MOZ_ASSERT(aParent.IsContent() || aParent.IsDocument(),
+             "Must have content or document parent!");
+  MOZ_ASSERT(aParent.OwnerDoc() == OwnerDoc(),
+             "Must have the same owner document");
+  MOZ_ASSERT(OwnerDoc() == &aContext.OwnerDoc(), "These should match too");
+  MOZ_ASSERT(!IsInUncomposedDoc(), "Already have a document.  Unbind first!");
+  MOZ_ASSERT(!IsInComposedDoc(), "Already have a document.  Unbind first!");
+  MOZ_ASSERT(!GetParentNode() || &aParent == GetParentNode(),
+             "Already have a parent.  Unbind first!");
+
+  const bool hadParent = !!GetParentNode();
+
+  if (aParent.IsInNativeAnonymousSubtree()) {
+    SetFlags(NODE_IS_IN_NATIVE_ANONYMOUS_SUBTREE);
+  }
+  if (IsRootOfNativeAnonymousSubtree()) {
+    aParent.SetMayHaveAnonymousChildren();
+  } else if (aParent.HasFlag(NODE_HAS_BEEN_IN_UA_WIDGET)) {
+    SetFlags(NODE_HAS_BEEN_IN_UA_WIDGET);
+  }
+
+  mParent = &aParent;
+  if (!hadParent && aParent.IsContent()) {
+    SetParentIsContent(true);
+    NS_ADDREF(mParent);
+  }
+  MOZ_ASSERT(!!GetParent() == aParent.IsContent());
+
+  SetSubtreeRootPointer(aParent.SubtreeRoot());
+  const bool connected = aParent.IsInComposedDoc();
+  SetIsConnected(connected);
+  if (connected) {
+    UnsetFlags(NODE_NEEDS_FRAME | NODE_DESCENDANTS_NEED_FRAMES);
+    if (mBuffer.IsBidi()) {
+      aContext.OwnerDoc().SetBidiEnabled();
+    }
+  }
+  if (aParent.IsInUncomposedDoc()) {
+    SetIsInDocument();
+  } else if (aParent.IsInShadowTree()) {
+    SetFlags(NODE_IS_IN_SHADOW_TREE);
+  }
+  MutationObservers::NotifyParentChainChanged(this);
+
+  UpdateEditableState(false);
+
+  if (aContext.SubtreeRootChanges()) {
+    HandleShadowDOMRelatedInsertionSteps(hadParent);
+  }
+
+  MOZ_ASSERT(OwnerDoc() == aParent.OwnerDoc(), "Bound to wrong document");
+  MOZ_ASSERT(IsInComposedDoc() == aContext.InComposedDoc());
+  MOZ_ASSERT(IsInUncomposedDoc() == aContext.InUncomposedDoc());
+  MOZ_ASSERT(&aParent == GetParentNode(), "Bound to wrong parent node");
+  MOZ_ASSERT(aParent.IsInUncomposedDoc() == IsInUncomposedDoc());
+  MOZ_ASSERT(aParent.IsInComposedDoc() == IsInComposedDoc());
+  MOZ_ASSERT(aParent.IsInShadowTree() == IsInShadowTree());
+  MOZ_ASSERT(aParent.SubtreeRoot() == SubtreeRoot());
+  return NS_OK;
+}
+
+void CharacterData::UnbindFromTree(UnbindContext& aContext) {
+  UnsetFlags(NS_CREATE_FRAME_IF_NON_WHITESPACE | NS_REFRAME_IF_WHITESPACE);
+
+  const bool nullParent = aContext.IsUnbindRoot(this);
+  HandleShadowDOMRelatedRemovalSteps(nullParent);
+
+  if (nullParent) {
+    if (GetParent()) {
+      NS_RELEASE(mParent);
+    } else {
+      mParent = nullptr;
+    }
+    SetParentIsContent(false);
+  }
+  ClearInDocument();
+  SetIsConnected(false);
+
+  if (nullParent || !mParent->IsInShadowTree()) {
+    UnsetFlags(NODE_IS_IN_SHADOW_TREE);
+  }
+
+  SetSubtreeRootPointer(nullParent ? this : mParent->SubtreeRoot());
+
+  MutationObservers::NotifyParentChainChanged(this);
+
+#if defined(ACCESSIBILITY) && defined(DEBUG)
+  MOZ_ASSERT(!GetAccService() || !GetAccService()->HasAccessible(this),
+             "An accessible for this element still exists!");
+#endif
+}
+
+
+
+nsresult CharacterData::SetText(const char16_t* aBuffer, uint32_t aLength,
+                                bool aNotify) {
+  return SetTextInternal(0, mBuffer.GetLength(), aBuffer, aLength, aNotify,
+                         MutationEffectOnScript::KeepTrustWorthiness);
+}
+
+nsresult CharacterData::AppendText(const char16_t* aBuffer, uint32_t aLength,
+                                   bool aNotify) {
+  return SetTextInternal(mBuffer.GetLength(), 0, aBuffer, aLength, aNotify,
+                         MutationEffectOnScript::KeepTrustWorthiness);
+}
+
+bool CharacterData::TextIsOnlyWhitespace() {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (!ThreadSafeTextIsOnlyWhitespace()) {
+    UnsetFlags(NS_TEXT_IS_ONLY_WHITESPACE);
+    SetFlags(NS_CACHED_TEXT_IS_ONLY_WHITESPACE);
+    return false;
+  }
+
+  SetFlags(NS_CACHED_TEXT_IS_ONLY_WHITESPACE | NS_TEXT_IS_ONLY_WHITESPACE);
+  return true;
+}
+
+bool CharacterData::ThreadSafeTextIsOnlyWhitespace() const {
+  if (mBuffer.Is2b()) {
+    return false;
+  }
+
+  if (HasFlag(NS_CACHED_TEXT_IS_ONLY_WHITESPACE)) {
+    return HasFlag(NS_TEXT_IS_ONLY_WHITESPACE);
+  }
+
+  return CheckTextIsOnlyWhitespace(0, mBuffer.GetLength());
+}
+
+bool CharacterData::TextStartsWithOnlyWhitespace(uint32_t aOffset) const {
+  MOZ_ASSERT(aOffset <= mBuffer.GetLength());
+
+  if (HasFlag(NS_CACHED_TEXT_IS_ONLY_WHITESPACE) &&
+      HasFlag(NS_TEXT_IS_ONLY_WHITESPACE)) {
+    return true;
+  }
+
+  return CheckTextIsOnlyWhitespace(0, aOffset);
+}
+
+bool CharacterData::TextEndsWithOnlyWhitespace(uint32_t aOffset) const {
+  MOZ_ASSERT(aOffset <= mBuffer.GetLength());
+
+  if (HasFlag(NS_CACHED_TEXT_IS_ONLY_WHITESPACE) &&
+      HasFlag(NS_TEXT_IS_ONLY_WHITESPACE)) {
+    return true;
+  }
+
+  return CheckTextIsOnlyWhitespace(aOffset, mBuffer.GetLength());
+}
+
+bool CharacterData::CheckTextIsOnlyWhitespace(uint32_t aStartOffset,
+                                              uint32_t aEndOffset) const {
+  if (mBuffer.Is2b()) {
+    const char16_t* cp = mBuffer.Get2b() + aStartOffset;
+    const char16_t* end = mBuffer.Get2b() + aEndOffset;
+
+    while (cp < end) {
+      char16_t ch = *cp;
+
+      if (!dom::IsSpaceCharacter(ch)) {
+        return false;
+      }
+
+      ++cp;
+    }
+  } else {
+    const char* cp = mBuffer.Get1b() + aStartOffset;
+    const char* end = mBuffer.Get1b() + aEndOffset;
+
+    while (cp < end) {
+      char ch = *cp;
+
+      if (!dom::IsSpaceCharacter(ch)) {
+        return false;
+      }
+
+      ++cp;
+    }
+  }
+  return true;
+}
+
+already_AddRefed<nsAtom> CharacterData::GetCurrentValueAtom() {
+  nsAutoString val;
+  GetData(val);
+  return NS_Atomize(val);
+}
+
+void CharacterData::AddSizeOfExcludingThis(nsWindowSizes& aSizes,
+                                           size_t* aNodeSize) const {
+  nsIContent::AddSizeOfExcludingThis(aSizes, aNodeSize);
+  *aNodeSize += mBuffer.SizeOfExcludingThis(aSizes.mState.mMallocSizeOf);
+}
+
+}  

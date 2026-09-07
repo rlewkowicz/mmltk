@@ -1,0 +1,104 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_EventQueue_h
+#define mozilla_EventQueue_h
+
+#include "mozilla/Mutex.h"
+#include "mozilla/Queue.h"
+#include "mozilla/TimeStamp.h"
+#include "nsCOMPtr.h"
+#include "nsIRunnable.h"
+
+namespace mozilla {
+
+#define EVENT_QUEUE_PRIORITY_LIST(EVENT_PRIORITY) \
+  EVENT_PRIORITY(Idle, 0)                         \
+  EVENT_PRIORITY(DeferredTimers, 1)               \
+  EVENT_PRIORITY(Low, 2)                          \
+  EVENT_PRIORITY(InputLow, 3)                     \
+  EVENT_PRIORITY(Normal, 4)                       \
+  EVENT_PRIORITY(MediumHigh, 5)                   \
+  EVENT_PRIORITY(InputHigh, 6)                    \
+  EVENT_PRIORITY(Vsync, 7)                        \
+  EVENT_PRIORITY(InputHighest, 8)                 \
+  EVENT_PRIORITY(RenderBlocking, 9)               \
+  EVENT_PRIORITY(Control, 10)
+
+enum class EventQueuePriority {
+#define EVENT_PRIORITY(NAME, VALUE) NAME = VALUE,
+  EVENT_QUEUE_PRIORITY_LIST(EVENT_PRIORITY)
+#undef EVENT_PRIORITY
+      Invalid
+};
+
+class IdlePeriodState;
+
+namespace detail {
+
+template <size_t ItemsPerPage>
+class EventQueueInternal {
+ public:
+  explicit EventQueueInternal(bool aForwardToTC) : mForwardToTC(aForwardToTC) {}
+
+  void PutEvent(already_AddRefed<nsIRunnable> aEvent,
+                EventQueuePriority aPriority, const MutexAutoLock& aProofOfLock,
+                mozilla::TimeDuration* aDelay = nullptr);
+
+  already_AddRefed<nsIRunnable> GetEvent(
+      const MutexAutoLock& aProofOfLock,
+      mozilla::TimeDuration* aLastEventDelay = nullptr);
+
+  bool IsEmpty(const MutexAutoLock& aProofOfLock);
+
+  bool HasReadyEvent(const MutexAutoLock& aProofOfLock);
+
+  size_t Count(const MutexAutoLock& aProofOfLock) const;
+  already_AddRefed<nsIRunnable> PeekEvent(const MutexAutoLock& aProofOfLock) {
+    if (mQueue.IsEmpty()) {
+      return nullptr;
+    }
+
+    nsCOMPtr<nsIRunnable> result = mQueue.FirstElement();
+    return result.forget();
+  }
+
+  void EnableInputEventPrioritization(const MutexAutoLock& aProofOfLock) {}
+  void FlushInputEventPrioritization(const MutexAutoLock& aProofOfLock) {}
+  void SuspendInputEventPrioritization(const MutexAutoLock& aProofOfLock) {}
+  void ResumeInputEventPrioritization(const MutexAutoLock& aProofOfLock) {}
+
+  size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const {
+    return aMallocSizeOf(this) + SizeOfExcludingThis(aMallocSizeOf);
+  }
+
+  size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) const {
+    return mQueue.ShallowSizeOfExcludingThis(aMallocSizeOf);
+  }
+
+ private:
+  mozilla::Queue<nsCOMPtr<nsIRunnable>, ItemsPerPage> mQueue;
+  TimeDuration mLastEventDelay;
+  bool mForwardToTC;
+};
+
+}  
+
+class EventQueue final : public mozilla::detail::EventQueueInternal<16> {
+ public:
+  explicit EventQueue(bool aForwardToTC = false)
+      : mozilla::detail::EventQueueInternal<16>(aForwardToTC) {}
+};
+
+template <size_t ItemsPerPage = 16>
+class EventQueueSized final
+    : public mozilla::detail::EventQueueInternal<ItemsPerPage> {
+ public:
+  explicit EventQueueSized(bool aForwardToTC = false)
+      : mozilla::detail::EventQueueInternal<ItemsPerPage>(aForwardToTC) {}
+};
+
+}  
+
+#endif  // mozilla_EventQueue_h

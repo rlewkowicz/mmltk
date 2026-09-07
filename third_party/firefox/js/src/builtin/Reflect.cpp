@@ -1,0 +1,210 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "builtin/Reflect.h"
+
+#include "jsapi.h"
+
+#include "builtin/Object.h"
+#include "jit/InlinableNatives.h"
+#include "js/friend/ErrorMessages.h"  // js::GetErrorMessage, JSMSG_NOT_EXPECTED_TYPE
+#include "js/PropertySpec.h"
+#include "vm/GlobalObject.h"
+#include "vm/JSContext.h"
+#include "vm/PlainObject.h"
+
+#include "vm/GeckoProfiler-inl.h"
+#include "vm/JSObject-inl.h"
+#include "vm/ObjectOperations-inl.h"
+
+using namespace js;
+
+
+static bool Reflect_deleteProperty(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  RootedObject target(
+      cx,
+      RequireObjectArg(cx, "`target`", "Reflect.deleteProperty", args.get(0)));
+  if (!target) {
+    return false;
+  }
+
+  RootedValue propertyKey(cx, args.get(1));
+  RootedId key(cx);
+  if (!ToPropertyKey(cx, propertyKey, &key)) {
+    return false;
+  }
+
+  ObjectOpResult result;
+  if (!DeleteProperty(cx, target, key, result)) {
+    return false;
+  }
+  args.rval().setBoolean(result.ok());
+  return true;
+}
+
+bool js::Reflect_getPrototypeOf(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  RootedObject target(
+      cx,
+      RequireObjectArg(cx, "`target`", "Reflect.getPrototypeOf", args.get(0)));
+  if (!target) {
+    return false;
+  }
+
+  RootedObject proto(cx);
+  if (!GetPrototype(cx, target, &proto)) {
+    return false;
+  }
+  args.rval().setObjectOrNull(proto);
+  return true;
+}
+
+bool js::Reflect_isExtensible(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  RootedObject target(
+      cx,
+      RequireObjectArg(cx, "`target`", "Reflect.isExtensible", args.get(0)));
+  if (!target) {
+    return false;
+  }
+
+  bool extensible;
+  if (!IsExtensible(cx, target, &extensible)) {
+    return false;
+  }
+  args.rval().setBoolean(extensible);
+  return true;
+}
+
+bool js::Reflect_ownKeys(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "Reflect", "ownKeys");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  RootedObject target(
+      cx, RequireObjectArg(cx, "`target`", "Reflect.ownKeys", args.get(0)));
+  if (!target) {
+    return false;
+  }
+
+  return GetOwnPropertyKeys(
+      cx, target, JSITER_OWNONLY | JSITER_HIDDEN | JSITER_SYMBOLS, args.rval());
+}
+
+static bool Reflect_preventExtensions(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  RootedObject target(
+      cx, RequireObjectArg(cx, "`target`", "Reflect.preventExtensions",
+                           args.get(0)));
+  if (!target) {
+    return false;
+  }
+
+  ObjectOpResult result;
+  if (!PreventExtensions(cx, target, result)) {
+    return false;
+  }
+  args.rval().setBoolean(result.ok());
+  return true;
+}
+
+static bool Reflect_set(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  RootedObject target(
+      cx, RequireObjectArg(cx, "`target`", "Reflect.set", args.get(0)));
+  if (!target) {
+    return false;
+  }
+
+  RootedValue propertyKey(cx, args.get(1));
+  RootedId key(cx);
+  if (!ToPropertyKey(cx, propertyKey, &key)) {
+    return false;
+  }
+
+  RootedValue receiver(cx, args.length() > 3 ? args[3] : args.get(0));
+
+  ObjectOpResult result;
+  RootedValue value(cx, args.get(2));
+  if (!SetProperty(cx, target, key, value, receiver, result)) {
+    return false;
+  }
+  args.rval().setBoolean(result.ok());
+  return true;
+}
+
+static bool Reflect_setPrototypeOf(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  RootedObject obj(cx, RequireObjectArg(cx, "`target`",
+                                        "Reflect.setPrototypeOf", args.get(0)));
+  if (!obj) {
+    return false;
+  }
+
+  if (!args.get(1).isObjectOrNull()) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_NOT_EXPECTED_TYPE, "Reflect.setPrototypeOf",
+                              "an object or null",
+                              InformalValueTypeName(args.get(1)));
+    return false;
+  }
+  RootedObject proto(cx, args.get(1).toObjectOrNull());
+
+  ObjectOpResult result;
+  if (!SetPrototype(cx, obj, proto, result)) {
+    return false;
+  }
+  args.rval().setBoolean(result.ok());
+  return true;
+}
+
+static const JSFunctionSpec reflect_methods[] = {
+    JS_SELF_HOSTED_FN("apply", "Reflect_apply", 3, 0),
+    JS_SELF_HOSTED_FN("construct", "Reflect_construct", 2, 0),
+    JS_SELF_HOSTED_FN("defineProperty", "Reflect_defineProperty", 3, 0),
+    JS_FN("deleteProperty", Reflect_deleteProperty, 2, 0),
+    JS_SELF_HOSTED_FN("get", "Reflect_get", 2, 0),
+    JS_SELF_HOSTED_FN("getOwnPropertyDescriptor",
+                      "Reflect_getOwnPropertyDescriptor", 2, 0),
+    JS_INLINABLE_FN("getPrototypeOf", Reflect_getPrototypeOf, 1, 0,
+                    ReflectGetPrototypeOf),
+    JS_SELF_HOSTED_FN("has", "Reflect_has", 2, 0),
+    JS_FN("isExtensible", Reflect_isExtensible, 1, 0),
+    JS_FN("ownKeys", Reflect_ownKeys, 1, 0),
+    JS_FN("preventExtensions", Reflect_preventExtensions, 1, 0),
+    JS_FN("set", Reflect_set, 3, 0),
+    JS_FN("setPrototypeOf", Reflect_setPrototypeOf, 2, 0),
+    JS_FS_END,
+};
+
+static const JSPropertySpec reflect_properties[] = {
+    JS_STRING_SYM_PS(toStringTag, "Reflect", JSPROP_READONLY),
+    JS_PS_END,
+};
+
+
+static JSObject* CreateReflectObject(JSContext* cx, JSProtoKey key) {
+  RootedObject proto(cx, &cx->global()->getObjectPrototype());
+  return NewPlainObjectWithProto(cx, proto, {.newKind = TenuredObject});
+}
+
+static const ClassSpec ReflectClassSpec = {
+    CreateReflectObject,
+    nullptr,
+    reflect_methods,
+    reflect_properties,
+};
+
+const JSClass js::ReflectClass = {
+    "Reflect",
+    0,
+    JS_NULL_CLASS_OPS,
+    &ReflectClassSpec,
+};

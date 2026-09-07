@@ -1,0 +1,81 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_css_GroupRule_h_
+#define mozilla_css_GroupRule_h_
+
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/ServoCSSRuleList.h"
+#include "mozilla/css/Rule.h"
+#include "nsCycleCollectionParticipant.h"
+
+namespace mozilla {
+
+class ErrorResult;
+class StyleSheet;
+
+namespace dom {
+class CSSRuleList;
+}  
+
+namespace css {
+
+class GroupRule : public Rule {
+ protected:
+  GroupRule(StyleSheet* aSheet, Rule* aParentRule, uint32_t aLineNumber,
+            uint32_t aColumnNumber);
+  virtual ~GroupRule();
+  virtual already_AddRefed<StyleLockedCssRules> GetOrCreateRawRules() = 0;
+
+ public:
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(GroupRule, Rule)
+  NS_DECL_ISUPPORTS_INHERITED
+
+  GroupRule(const GroupRule&) = delete;
+  bool IsCCLeaf() const override;
+
+  bool IsGroupRule() const final { return true; }
+
+#ifdef DEBUG
+  void List(FILE* out = stdout, int32_t aIndent = 0) const override;
+#endif
+  void DropSheetReference() override;
+  uint32_t StyleRuleCount() { return CssRules()->Length(); }
+  Rule* GetStyleRuleAt(int32_t aIndex) { return CssRules()->GetRule(aIndex); }
+
+  void DidSetRawAfterClone() {
+    if (mRuleList) {
+      mRuleList->SetRawAfterClone(GetOrCreateRawRules());
+    }
+  }
+
+  nsresult DeleteStyleRuleAt(uint32_t aIndex) {
+    return CssRules()->DeleteRule(aIndex);
+  }
+
+  size_t SizeOfExcludingThis(MallocSizeOf) const;
+  size_t SizeOfIncludingThis(MallocSizeOf) const override = 0;
+
+  ServoCSSRuleList* CssRules();
+  uint32_t InsertRule(const nsACString& aRule, uint32_t aIndex,
+                      ErrorResult& aRv);
+  void DeleteRule(uint32_t aIndex, ErrorResult& aRv);
+
+ private:
+  RefPtr<ServoCSSRuleList> mRuleList;
+};
+
+class ConditionRule : public GroupRule {
+ protected:
+  using GroupRule::GroupRule;
+
+ public:
+  virtual void GetConditionText(nsACString& aConditionText) = 0;
+};
+
+}  
+}  
+
+#endif /* mozilla_css_GroupRule_h_ */

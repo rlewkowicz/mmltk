@@ -1,0 +1,405 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+function SetConstructorInit(iterable) {
+  var set = this;
+
+  var adder = set.add;
+
+  if (!IsCallable(adder)) {
+    ThrowTypeError(JSMSG_NOT_FUNCTION, typeof adder);
+  }
+
+  for (var nextValue of allowContentIter(iterable)) {
+    callContentFunction(adder, set, nextValue);
+  }
+}
+
+function SetForEach(callbackfn, thisArg = undefined) {
+  var S = this;
+
+  if (!IsObject(S) || (S = GuardToSetObject(S)) === null) {
+    return callFunction(
+      CallSetMethodIfWrapped,
+      this,
+      callbackfn,
+      thisArg,
+      "SetForEach"
+    );
+  }
+
+  if (!IsCallable(callbackfn)) {
+    ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(0, callbackfn));
+  }
+
+  var values = callFunction(std_Set_values, S);
+
+  var setIterationResult = globalSetIterationResult;
+
+  while (true) {
+    var done = GetNextSetEntryForIterator(values, setIterationResult);
+    if (done) {
+      break;
+    }
+
+    var value = setIterationResult[0];
+    setIterationResult[0] = null;
+
+    callContentFunction(callbackfn, thisArg, value, value, S);
+  }
+}
+
+function $SetSpecies() {
+  return this;
+}
+SetCanonicalName($SetSpecies, "get [Symbol.species]");
+
+var globalSetIterationResult = CreateSetIterationResult();
+
+function SetIteratorNext() {
+  var O = this;
+
+  if (!IsObject(O) || (O = GuardToSetIterator(O)) === null) {
+    return callFunction(
+      CallSetIteratorMethodIfWrapped,
+      this,
+      "SetIteratorNext"
+    );
+  }
+
+
+  var setIterationResult = globalSetIterationResult;
+
+  var retVal = { value: undefined, done: true };
+
+  var done = GetNextSetEntryForIterator(O, setIterationResult);
+  if (!done) {
+
+    var itemKind = UnsafeGetInt32FromReservedSlot(O, MAP_SET_ITERATOR_SLOT_ITEM_KIND);
+
+    var result;
+    if (itemKind === ITEM_KIND_VALUE) {
+      result = setIterationResult[0];
+    } else {
+      assert(itemKind === ITEM_KIND_KEY_AND_VALUE, itemKind);
+      result = [setIterationResult[0], setIterationResult[0]];
+    }
+
+    setIterationResult[0] = null;
+    retVal.value = result;
+    retVal.done = false;
+  }
+
+  return retVal;
+}
+
+function GetSetRecord(obj) {
+  if (!IsObject(obj)) {
+    ThrowTypeError(JSMSG_OBJECT_REQUIRED, obj === null ? "null" : typeof obj);
+  }
+
+  var rawSize = obj.size;
+
+  var numSize = +rawSize;
+
+  if (numSize !== numSize) {
+    if (rawSize === undefined) {
+      ThrowTypeError(JSMSG_UNEXPECTED_TYPE, "size", "undefined");
+    } else {
+      ThrowTypeError(JSMSG_UNEXPECTED_TYPE, "size", "NaN");
+    }
+  }
+
+  var intSize = ToInteger(numSize);
+
+  if (intSize < 0) {
+    ThrowRangeError(JSMSG_SET_NEGATIVE_SIZE);
+  }
+
+  var has = obj.has;
+
+  if (!IsCallable(has)) {
+    ThrowTypeError(JSMSG_PROPERTY_NOT_CALLABLE, "has");
+  }
+
+  var keys = obj.keys;
+
+  if (!IsCallable(keys)) {
+    ThrowTypeError(JSMSG_PROPERTY_NOT_CALLABLE, "keys");
+  }
+
+  return { set: obj, size: intSize, has, keys };
+}
+
+function GetIteratorFromMethod(setRec) {
+  var keysIter = callContentFunction(setRec.keys, setRec.set);
+
+  if (!IsObject(keysIter)) {
+    ThrowTypeError(
+      JSMSG_OBJECT_REQUIRED,
+      keysIter === null ? "null" : typeof keysIter
+    );
+  }
+
+
+  return keysIter;
+}
+
+function SetUnion(other) {
+  var O = this;
+
+  if (!IsObject(O) || (O = GuardToSetObject(O)) === null) {
+    return callFunction(CallSetMethodIfWrapped, this, other, "SetUnion");
+  }
+
+  var otherRec = GetSetRecord(other);
+
+  var keysIter = GetIteratorFromMethod(otherRec);
+  var keysIterNext = keysIter.next;
+
+  var result = SetCopy(O);
+
+  for (var nextValue of allowContentIterWithNext(keysIter, keysIterNext)) {
+
+
+    callFunction(std_Set_add, result, nextValue);
+  }
+
+  return result;
+}
+
+function SetIntersection(other) {
+  var O = this;
+
+  if (!IsObject(O) || (O = GuardToSetObject(O)) === null) {
+    return callFunction(CallSetMethodIfWrapped, this, other, "SetIntersection");
+  }
+
+  var otherRec = GetSetRecord(other);
+
+  var Set = GetBuiltinConstructor("Set");
+  var result = new Set();
+
+  var thisSize = callFunction(std_Set_size, O);
+
+  if (thisSize <= otherRec.size) {
+    var values = callFunction(std_Set_values, O);
+    var setIterationResult = globalSetIterationResult;
+    while (true) {
+      var done = GetNextSetEntryForIterator(values, setIterationResult);
+      if (done) {
+        break;
+      }
+
+      var value = setIterationResult[0];
+      setIterationResult[0] = null;
+
+
+      if (callContentFunction(otherRec.has, otherRec.set, value)) {
+
+        callFunction(std_Set_add, result, value);
+      }
+
+    }
+  } else {
+    var keysIter = GetIteratorFromMethod(otherRec);
+
+    for (var nextValue of allowContentIterWithNext(keysIter, keysIter.next)) {
+
+
+      if (callFunction(std_Set_has, O, nextValue)) {
+        callFunction(std_Set_add, result, nextValue);
+      }
+    }
+  }
+
+  return result;
+}
+
+function SetDifference(other) {
+  var O = this;
+
+  if (!IsObject(O) || (O = GuardToSetObject(O)) === null) {
+    return callFunction(CallSetMethodIfWrapped, this, other, "SetDifference");
+  }
+
+  var otherRec = GetSetRecord(other);
+
+  var result = SetCopy(O);
+
+  var thisSize = callFunction(std_Set_size, O);
+
+  if (thisSize <= otherRec.size) {
+    var values = callFunction(std_Set_values, result);
+    var setIterationResult = globalSetIterationResult;
+    while (true) {
+      var done = GetNextSetEntryForIterator(values, setIterationResult);
+      if (done) {
+        break;
+      }
+
+      var value = setIterationResult[0];
+      setIterationResult[0] = null;
+
+
+      if (callContentFunction(otherRec.has, otherRec.set, value)) {
+        callFunction(std_Set_delete, result, value);
+      }
+    }
+  } else {
+    var keysIter = GetIteratorFromMethod(otherRec);
+
+    for (var nextValue of allowContentIterWithNext(keysIter, keysIter.next)) {
+
+      callFunction(std_Set_delete, result, nextValue);
+    }
+  }
+
+  return result;
+}
+
+function SetSymmetricDifference(other) {
+  var O = this;
+
+  if (!IsObject(O) || (O = GuardToSetObject(O)) === null) {
+    return callFunction(
+      CallSetMethodIfWrapped,
+      this,
+      other,
+      "SetSymmetricDifference"
+    );
+  }
+
+  var otherRec = GetSetRecord(other);
+
+  var keysIter = GetIteratorFromMethod(otherRec);
+  var keysIterNext = keysIter.next;
+
+  var result = SetCopy(O);
+
+  for (var nextValue of allowContentIterWithNext(keysIter, keysIterNext)) {
+
+
+    if (callFunction(std_Set_has, O, nextValue)) {
+      callFunction(std_Set_delete, result, nextValue);
+    } else {
+      callFunction(std_Set_add, result, nextValue);
+    }
+  }
+
+  return result;
+}
+
+function SetIsSubsetOf(other) {
+  var O = this;
+
+  if (!IsObject(O) || (O = GuardToSetObject(O)) === null) {
+    return callFunction(CallSetMethodIfWrapped, this, other, "SetIsSubsetOf");
+  }
+
+  var otherRec = GetSetRecord(other);
+
+  var thisSize = callFunction(std_Set_size, O);
+
+  if (thisSize > otherRec.size) {
+    return false;
+  }
+
+  var values = callFunction(std_Set_values, O);
+  var setIterationResult = globalSetIterationResult;
+  while (true) {
+    var done = GetNextSetEntryForIterator(values, setIterationResult);
+    if (done) {
+      break;
+    }
+
+    var value = setIterationResult[0];
+    setIterationResult[0] = null;
+
+
+    if (!callContentFunction(otherRec.has, otherRec.set, value)) {
+      return false;
+    }
+
+  }
+
+  return true;
+}
+
+function SetIsSupersetOf(other) {
+  var O = this;
+
+  if (!IsObject(O) || (O = GuardToSetObject(O)) === null) {
+    return callFunction(CallSetMethodIfWrapped, this, other, "SetIsSupersetOf");
+  }
+
+  var otherRec = GetSetRecord(other);
+
+  var thisSize = callFunction(std_Set_size, O);
+
+  if (thisSize < otherRec.size) {
+    return false;
+  }
+
+  var keysIter = GetIteratorFromMethod(otherRec);
+
+  for (var nextValue of allowContentIterWithNext(keysIter, keysIter.next)) {
+
+    if (!callFunction(std_Set_has, O, nextValue)) {
+
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function SetIsDisjointFrom(other) {
+  var O = this;
+
+  if (!IsObject(O) || (O = GuardToSetObject(O)) === null) {
+    return callFunction(
+      CallSetMethodIfWrapped,
+      this,
+      other,
+      "SetIsDisjointFrom"
+    );
+  }
+
+  var otherRec = GetSetRecord(other);
+
+  var thisSize = callFunction(std_Set_size, O);
+
+  if (thisSize <= otherRec.size) {
+    var values = callFunction(std_Set_values, O);
+    var setIterationResult = globalSetIterationResult;
+    while (true) {
+      var done = GetNextSetEntryForIterator(values, setIterationResult);
+      if (done) {
+        break;
+      }
+
+      var value = setIterationResult[0];
+      setIterationResult[0] = null;
+
+
+      if (callContentFunction(otherRec.has, otherRec.set, value)) {
+        return false;
+      }
+
+    }
+  } else {
+    var keysIter = GetIteratorFromMethod(otherRec);
+
+    for (var nextValue of allowContentIterWithNext(keysIter, keysIter.next)) {
+
+      if (callFunction(std_Set_has, O, nextValue)) {
+
+        return false;
+      }
+    }
+  }
+
+  return true;
+}

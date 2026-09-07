@@ -1,0 +1,380 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_KeyframeEffect_h
+#define mozilla_dom_KeyframeEffect_h
+
+#include "NonCustomCSSPropertyId.h"
+#include "mozilla/AnimatedPropertyIDSet.h"
+#include "mozilla/AnimationPerformanceWarning.h"
+#include "mozilla/AnimationPropertySegment.h"
+#include "mozilla/AnimationTarget.h"
+#include "mozilla/CSSPropertyId.h"
+#include "mozilla/EffectCompositor.h"
+#include "mozilla/Keyframe.h"
+#include "mozilla/KeyframeEffectParams.h"
+#include "mozilla/PostRestyleMode.h"
+#include "nsCSSPropertyIDSet.h"
+#include "nsCSSValue.h"
+#include "nsChangeHint.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsRefPtrHashtable.h"
+#include "nsTArray.h"
+#include "nsWrapperCache.h"
+#include "mozilla/ServoBindingTypes.h"
+#include "mozilla/StyleAnimationValue.h"
+#include "mozilla/dom/AnimationEffect.h"
+#include "mozilla/dom/BindingDeclarations.h"
+
+struct JSContext;
+class JSObject;
+class nsIContent;
+class nsIFrame;
+
+namespace mozilla {
+
+class AnimValuesStyleRule;
+class ErrorResult;
+struct AnimationRule;
+struct TimingParams;
+class EffectSet;
+class ComputedStyle;
+class PresShell;
+
+namespace dom {
+class Element;
+class GlobalObject;
+class UnrestrictedDoubleOrKeyframeAnimationOptions;
+class UnrestrictedDoubleOrKeyframeEffectOptions;
+enum class IterationCompositeOperation : uint8_t;
+enum class CompositeOperation : uint8_t;
+struct AnimationPropertyDetails;
+}  
+
+struct AnimationProperty {
+  CSSPropertyId mProperty;
+
+  bool mIsRunningOnCompositor = false;
+
+  Maybe<AnimationPerformanceWarning> mPerformanceWarning;
+
+  nsTArray<AnimationPropertySegment> mSegments;
+
+  AnimationProperty() : mProperty(eCSSProperty_UNKNOWN) {};
+  AnimationProperty(const AnimationProperty& aOther)
+      : mProperty(aOther.mProperty), mSegments(aOther.mSegments.Clone()) {}
+  AnimationProperty& operator=(const AnimationProperty& aOther) {
+    mProperty = aOther.mProperty;
+    mSegments = aOther.mSegments.Clone();
+    return *this;
+  }
+
+  bool operator==(const AnimationProperty& aOther) const {
+    return mProperty == aOther.mProperty && mSegments == aOther.mSegments;
+  }
+  bool operator!=(const AnimationProperty& aOther) const {
+    return !(*this == aOther);
+  }
+
+  void SetPerformanceWarning(const AnimationPerformanceWarning& aWarning,
+                             const dom::Element* aElement);
+};
+
+namespace dom {
+
+class Animation;
+class Document;
+
+class KeyframeEffect : public AnimationEffect {
+ public:
+  KeyframeEffect(Document* aDocument, OwningAnimationTarget&& aTarget,
+                 TimingParams&& aTiming, const KeyframeEffectParams& aOptions);
+
+  KeyframeEffect(Document* aDocument, OwningAnimationTarget&& aTarget,
+                 const KeyframeEffect& aOther);
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_CLASS_INHERITED(KeyframeEffect,
+                                                         AnimationEffect)
+
+  virtual JSObject* WrapObject(JSContext* aCx,
+                               JS::Handle<JSObject*> aGivenProto) override;
+
+  KeyframeEffect* AsKeyframeEffect() override { return this; }
+
+  bool IsValidTransition() const {
+    return Properties().Length() == 1 &&
+           Properties()[0].mSegments.Length() == 1;
+  }
+
+  static already_AddRefed<KeyframeEffect> Constructor(
+      const GlobalObject& aGlobal, Element* aTarget,
+      JS::Handle<JSObject*> aKeyframes,
+      const UnrestrictedDoubleOrKeyframeEffectOptions& aOptions,
+      ErrorResult& aRv);
+
+  static already_AddRefed<KeyframeEffect> Constructor(
+      const GlobalObject& aGlobal, KeyframeEffect& aSource, ErrorResult& aRv);
+
+  static already_AddRefed<KeyframeEffect> Constructor(
+      const GlobalObject& aGlobal, Element* aTarget,
+      JS::Handle<JSObject*> aKeyframes,
+      const UnrestrictedDoubleOrKeyframeAnimationOptions& aOptions,
+      ErrorResult& aRv);
+
+  Element* GetTarget() const { return mTarget.mElement.get(); }
+  NonOwningAnimationTarget GetAnimationTarget() const {
+    return NonOwningAnimationTarget(mTarget.mElement, mTarget.mPseudoRequest);
+  }
+  void GetPseudoElement(nsAString& aRetVal) const {
+    if (mTarget.mPseudoRequest.IsNotPseudo()) {
+      SetDOMStringToNull(aRetVal);
+      return;
+    }
+    mTarget.mPseudoRequest.ToString(aRetVal);
+  }
+
+  void SetTarget(Element* aTarget) {
+    UpdateTarget(aTarget, mTarget.mPseudoRequest);
+  }
+  void SetPseudoElement(const nsAString& aPseudoElement, ErrorResult& aRv);
+
+  void GetKeyframes(JSContext* aCx, nsTArray<JSObject*>& aResult,
+                    ErrorResult& aRv);
+  void GetProperties(nsTArray<AnimationPropertyDetails>& aProperties,
+                     ErrorResult& aRv) const;
+
+  IterationCompositeOperation IterationComposite() const;
+  void SetIterationComposite(
+      const IterationCompositeOperation& aIterationComposite);
+
+  CompositeOperation Composite() const;
+  virtual void SetComposite(const CompositeOperation& aComposite);
+  void SetCompositeFromStyle(const CompositeOperation& aComposite) {
+    KeyframeEffect::SetComposite(aComposite);
+  }
+
+  void NotifySpecifiedTimingUpdated();
+  void NotifyAnimationTimingUpdated(PostRestyleMode aPostRestyle);
+  void RequestRestyle(EffectCompositor::RestyleType aRestyleType);
+  void SetAnimation(Animation* aAnimation) override;
+  virtual void SetKeyframes(JSContext* aContext,
+                            JS::Handle<JSObject*> aKeyframes, ErrorResult& aRv);
+  void SetKeyframes(nsTArray<Keyframe>&& aKeyframes,
+                    const ComputedStyle* aStyle,
+                    const AnimationTimeline* aTimeline,
+                    const AnimationRange* aRange);
+
+  void ReplaceTransitionStartValue(AnimationValue&& aStartValue);
+
+  AnimatedPropertyIDSet GetPropertySet() const;
+
+  bool HasAnimationOfPropertySet(const nsCSSPropertyIDSet& aPropertySet) const {
+    return GetPropertySet().Intersects(aPropertySet);
+  }
+
+  bool HasEffectiveAnimationOfProperty(const CSSPropertyId& aProperty,
+                                       const EffectSet& aEffect) const {
+    return GetEffectiveAnimationOfProperty(aProperty, aEffect) != nullptr;
+  }
+  const AnimationProperty* GetEffectiveAnimationOfProperty(
+      const CSSPropertyId&, const EffectSet&) const;
+
+  bool HasEffectiveAnimationOfPropertySet(
+      const nsCSSPropertyIDSet& aPropertySet,
+      const EffectSet& aEffectSet) const;
+
+  nsCSSPropertyIDSet GetPropertiesForCompositor(EffectSet& aEffects,
+                                                const nsIFrame* aFrame) const;
+
+  const nsTArray<AnimationProperty>& Properties() const { return mProperties; }
+
+  void UpdateProperties(const ComputedStyle* aStyle,
+                        const AnimationTimeline* aTimeline = nullptr);
+
+  void WillComposeStyle();
+
+  void ComposeStyle(
+      StyleAnimationValueMap& aComposeResult,
+      const InvertibleAnimatedPropertyIDSet& aPropertiesToSkip,
+      EndpointBehavior aEndpointBehavior = EndpointBehavior::Exclusive);
+
+  bool IsRunningOnCompositor() const;
+  void SetIsRunningOnCompositor(NonCustomCSSPropertyId aProperty,
+                                bool aIsRunning);
+  void SetIsRunningOnCompositor(const nsCSSPropertyIDSet& aPropertySet,
+                                bool aIsRunning);
+  void ResetIsRunningOnCompositor();
+
+  void ResetPartialPrerendered();
+
+  bool ShouldBlockAsyncTransformAnimations(
+      const nsIFrame* aFrame, const nsCSSPropertyIDSet& aPropertySet,
+      AnimationPerformanceWarning::Type& aPerformanceWarning ) const;
+  bool HasGeometricProperties() const;
+  bool AffectsGeometry() const override {
+    return mTarget && HasGeometricProperties();
+  }
+
+  Document* GetRenderedDocument() const;
+  PresShell* GetPresShell() const;
+
+  void SetPerformanceWarning(const nsCSSPropertyIDSet& aPropertySet,
+                             const AnimationPerformanceWarning& aWarning);
+
+  void CalculateCumulativeChangesForProperty(const AnimationProperty&);
+
+  bool CanIgnoreIfNotVisible() const;
+
+  bool ContainsAnimatedScale(const nsIFrame* aFrame) const;
+
+  AnimationValue BaseStyle(const CSSPropertyId& aProperty) const {
+    AnimationValue result;
+    bool hasProperty = false;
+    result.mServo = mBaseValues.GetWeak(aProperty, &hasProperty);
+    MOZ_ASSERT(hasProperty || result.IsNull());
+    return result;
+  }
+
+  void UpdateBaseStyle(const ComputedStyle* aStyle);
+
+  enum class MatchForCompositor {
+    Yes,
+    IfNeeded,
+    No,
+    NoAndBlockThisProperty
+  };
+
+  MatchForCompositor IsMatchForCompositor(
+      const nsCSSPropertyIDSet& aPropertySet, const nsIFrame* aFrame,
+      const EffectSet& aEffects,
+      AnimationPerformanceWarning::Type& aPerformanceWarning ) const;
+
+  static bool HasComputedTimingChanged(
+      const ComputedTiming& aComputedTiming,
+      IterationCompositeOperation aIterationComposite,
+      const Nullable<double>& aProgressOnLastCompose,
+      uint64_t aCurrentIterationOnLastCompose);
+
+  bool HasOpacityChange() const { return mCumulativeChanges.mOpacity; }
+
+  double AnimationsPlayBackRateMultiplier() const;
+
+  void MaybeUpdateKeyframeComputedOffsets(const AnimationTimeline* aTimelne,
+                                          const AnimationRange& aRange);
+
+ protected:
+  ~KeyframeEffect() override = default;
+
+  template <class OptionsType>
+  static already_AddRefed<KeyframeEffect> ConstructKeyframeEffect(
+      const GlobalObject& aGlobal, Element* aTarget,
+      JS::Handle<JSObject*> aKeyframes, const OptionsType& aOptions,
+      ErrorResult& aRv);
+
+  nsTArray<AnimationProperty> BuildProperties(
+      const ComputedStyle* aStyle, const AnimationTimeline* aTimeline);
+
+  void UpdateTarget(Element* aElement,
+                    const PseudoStyleRequest& aPseudoRequest);
+
+  void UpdateTargetRegistration();
+
+  void UnregisterTarget();
+
+  enum class Flush {
+    Style,
+    None,
+  };
+  already_AddRefed<const ComputedStyle> GetTargetComputedStyle(Flush) const;
+
+  void MarkCascadeNeedsUpdate();
+
+  void EnsureBaseStyles(const ComputedStyle* aComputedValues,
+                        const nsTArray<AnimationProperty>& aProperties,
+                        const AnimationTimeline* aTimeline,
+                        bool* aBaseStylesChanged);
+  void EnsureBaseStyle(const AnimationProperty& aProperty,
+                       nsPresContext* aPresContext,
+                       const ComputedStyle* aComputedValues,
+                       const AnimationTimeline* aTimeline,
+                       RefPtr<const ComputedStyle>& aBaseComputedValues);
+
+  OwningAnimationTarget mTarget;
+
+  KeyframeEffectParams mEffectOptions;
+
+  nsTArray<Keyframe> mKeyframes;
+  KeyframesOffsetHasAny mKeyframesOffsetInfo;
+
+  nsTArray<AnimationProperty> mProperties;
+
+  Nullable<double> mProgressOnLastCompose;
+
+  uint64_t mCurrentIterationOnLastCompose = 0;
+
+  bool mInEffectOnLastAnimationTimingUpdate = false;
+
+  bool mInEffectSet = false;
+
+  using BaseValuesHashmap =
+      nsRefPtrHashtable<nsGenericHashKey<CSSPropertyId>, StyleAnimationValue>;
+  BaseValuesHashmap mBaseValues;
+
+ private:
+  struct CumulativeChanges {
+    bool mOpacity : 1;
+    bool mVisibility : 1;
+    bool mLayout : 1;
+    bool mOverflow : 1;
+    bool mHasBackgroundColorCurrentColor : 1;
+
+    CumulativeChanges()
+        : mOpacity(false),
+          mVisibility(false),
+          mLayout(false),
+          mOverflow(false),
+          mHasBackgroundColorCurrentColor(false) {}
+  };
+  CumulativeChanges mCumulativeChanges;
+
+  void ComposeStyleRule(StyleAnimationValueMap& aAnimationValues,
+                        const AnimationProperty& aProperty,
+                        const AnimationPropertySegment& aSegment,
+                        const ComputedTiming& aComputedTiming);
+
+  already_AddRefed<const ComputedStyle> CreateComputedStyleForAnimationValue(
+      NonCustomCSSPropertyId aProperty, const AnimationValue& aValue,
+      nsPresContext* aPresContext, const ComputedStyle* aBaseComputedStyle);
+
+  nsIFrame* GetPrimaryFrame() const;
+  nsIFrame* GetStyleFrame() const;
+
+  bool CanThrottle() const;
+  bool CanThrottleOverflowChanges(const nsIFrame& aFrame) const;
+  bool CanThrottleOverflowChangesInScrollable(nsIFrame& aFrame) const;
+  bool CanThrottleIfNotVisible(nsIFrame& aFrame) const;
+
+  bool HasComputedTimingChanged() const;
+
+  static bool CanAnimateTransformOnCompositor(
+      const nsIFrame* aFrame,
+      AnimationPerformanceWarning::Type& aPerformanceWarning );
+  static bool IsGeometricProperty(const NonCustomCSSPropertyId aProperty);
+
+  static const TimeDuration OverflowRegionRefreshInterval();
+
+  void UpdateEffectSet(mozilla::EffectSet* aEffectSet = nullptr) const;
+
+  bool HasPropertiesThatMightAffectOverflow() const {
+    return mCumulativeChanges.mOverflow;
+  }
+
+  bool HasVisibilityChange() const { return mCumulativeChanges.mVisibility; }
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_KeyframeEffect_h

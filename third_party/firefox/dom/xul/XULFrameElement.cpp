@@ -1,0 +1,200 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/XULFrameElement.h"
+
+#include "mozilla/AsyncEventDispatcher.h"
+#include "mozilla/dom/BindContext.h"
+#include "mozilla/dom/BrowserParent.h"
+#include "mozilla/dom/HTMLIFrameElement.h"
+#include "mozilla/dom/UnbindContext.h"
+#include "mozilla/dom/WindowProxyHolder.h"
+#include "mozilla/dom/XULFrameElementBinding.h"
+#include "nsCOMPtr.h"
+#include "nsFrameLoader.h"
+#include "nsIBrowser.h"
+#include "nsIContent.h"
+#include "nsIOpenWindowInfo.h"
+
+namespace mozilla::dom {
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(XULFrameElement)
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(XULFrameElement, nsXULElement)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mFrameLoader)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mOpenWindowInfo)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_INHERITED(XULFrameElement, nsXULElement)
+  if (tmp->mFrameLoader) {
+    tmp->mFrameLoader->Destroy();
+  }
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mOpenWindowInfo)
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_ISUPPORTS_CYCLE_COLLECTION_INHERITED(XULFrameElement, nsXULElement,
+                                             nsFrameLoaderOwner)
+
+JSObject* XULFrameElement::WrapNode(JSContext* aCx,
+                                    JS::Handle<JSObject*> aGivenProto) {
+  return XULFrameElement_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+nsDocShell* XULFrameElement::GetDocShell() {
+  RefPtr<nsFrameLoader> frameLoader = GetFrameLoader();
+  return frameLoader ? frameLoader->GetDocShell(IgnoreErrors()) : nullptr;
+}
+
+already_AddRefed<nsIWebNavigation> XULFrameElement::GetWebNavigation() {
+  nsCOMPtr<nsIDocShell> docShell = GetDocShell();
+  nsCOMPtr<nsIWebNavigation> webnav = do_QueryInterface(docShell);
+  return webnav.forget();
+}
+
+Nullable<WindowProxyHolder> XULFrameElement::GetContentWindow() {
+  RefPtr<nsDocShell> docShell = GetDocShell();
+  if (docShell) {
+    return docShell->GetWindowProxy();
+  }
+
+  return nullptr;
+}
+
+Document* XULFrameElement::GetContentDocument() {
+  nsCOMPtr<nsIDocShell> docShell = GetDocShell();
+  if (docShell) {
+    nsCOMPtr<nsPIDOMWindowOuter> win = docShell->GetWindow();
+    if (win) {
+      return win->GetDoc();
+    }
+  }
+  return nullptr;
+}
+
+uint64_t XULFrameElement::BrowserId() {
+  if (mFrameLoader) {
+    if (auto* bc = mFrameLoader->GetExtantBrowsingContext()) {
+      return bc->GetBrowserId();
+    }
+  }
+  return 0;
+}
+
+nsIOpenWindowInfo* XULFrameElement::GetOpenWindowInfo() const {
+  return mOpenWindowInfo;
+}
+
+void XULFrameElement::SetOpenWindowInfo(nsIOpenWindowInfo* aInfo) {
+  mOpenWindowInfo = aInfo;
+}
+
+void XULFrameElement::LoadSrc() {
+  if (!IsInComposedDoc()) {
+    return;
+  }
+  RefPtr<nsFrameLoader> frameLoader = GetFrameLoader();
+  if (!frameLoader) {
+    nsCOMPtr<nsIOpenWindowInfo> openWindowInfo = mOpenWindowInfo.forget();
+
+    mFrameLoader = nsFrameLoader::Create(this, false, openWindowInfo);
+    if (NS_WARN_IF(!mFrameLoader)) {
+      return;
+    }
+
+    AsyncEventDispatcher::RunDOMEventWhenSafe(
+        *this, u"XULFrameLoaderCreated"_ns, CanBubble::eYes);
+  }
+
+  mFrameLoader->LoadFrame( false,
+                           false);
+}
+
+void XULFrameElement::SwapFrameLoaders(HTMLIFrameElement& aOtherLoaderOwner,
+                                       ErrorResult& rv) {
+  aOtherLoaderOwner.SwapFrameLoaders(this, rv);
+}
+
+void XULFrameElement::SwapFrameLoaders(XULFrameElement& aOtherLoaderOwner,
+                                       ErrorResult& rv) {
+  if (&aOtherLoaderOwner == this) {
+    return;
+  }
+
+  aOtherLoaderOwner.SwapFrameLoaders(this, rv);
+}
+
+void XULFrameElement::SwapFrameLoaders(nsFrameLoaderOwner* aOtherLoaderOwner,
+                                       mozilla::ErrorResult& rv) {
+  if (RefPtr<Document> doc = GetComposedDoc()) {
+    doc->FlushPendingNotifications(FlushType::Frames);
+  }
+
+  RefPtr<nsFrameLoader> loader = GetFrameLoader();
+  RefPtr<nsFrameLoader> otherLoader = aOtherLoaderOwner->GetFrameLoader();
+  if (!loader || !otherLoader) {
+    rv.Throw(NS_ERROR_NOT_IMPLEMENTED);
+    return;
+  }
+
+  rv = loader->SwapWithOtherLoader(otherLoader, this, aOtherLoaderOwner);
+}
+
+nsresult XULFrameElement::BindToTree(BindContext& aContext, nsINode& aParent) {
+  MOZ_TRY(nsXULElement::BindToTree(aContext, aParent));
+
+  if (IsInComposedDoc() && !aContext.IsMove()) {
+    NS_ASSERTION(!nsContentUtils::IsSafeToRunScript(),
+                 "Missing a script blocker!");
+    LoadSrc();
+  }
+
+  return NS_OK;
+}
+
+void XULFrameElement::UnbindFromTree(UnbindContext& aContext) {
+  if (!aContext.IsMove()) {
+    if (RefPtr<nsFrameLoader> frameLoader = GetFrameLoader()) {
+      frameLoader->Destroy();
+      mFrameLoader = nullptr;
+    }
+  }
+
+  nsXULElement::UnbindFromTree(aContext);
+}
+
+void XULFrameElement::DestroyContent() {
+  RefPtr<nsFrameLoader> frameLoader = GetFrameLoader();
+  if (frameLoader) {
+    frameLoader->Destroy();
+  }
+  mFrameLoader = nullptr;
+
+  nsXULElement::DestroyContent();
+}
+
+void XULFrameElement::AfterSetAttr(int32_t aNamespaceID, nsAtom* aName,
+                                   const nsAttrValue* aValue,
+                                   const nsAttrValue* aOldValue,
+                                   nsIPrincipal* aSubjectPrincipal,
+                                   bool aNotify) {
+  if (aNamespaceID == kNameSpaceID_None) {
+    if (aName == nsGkAtoms::src && aValue) {
+      LoadSrc();
+    } else if (aName == nsGkAtoms::disablefullscreen && mFrameLoader) {
+      if (auto* bc = mFrameLoader->GetExtantBrowsingContext()) {
+        MOZ_ALWAYS_SUCCEEDS(bc->SetFullscreenAllowedByOwner(!aValue));
+      }
+    } else if (aName == nsGkAtoms::transparent && mFrameLoader &&
+               (!!aValue != !!aOldValue)) {
+      if (auto* bp = mFrameLoader->GetBrowserParent()) {
+        bp->NotifyTransparencyChanged();
+      }
+    }
+  }
+
+  return nsXULElement::AfterSetAttr(aNamespaceID, aName, aValue, aOldValue,
+                                    aSubjectPrincipal, aNotify);
+}
+
+}  

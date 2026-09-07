@@ -1,0 +1,353 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+const { PrivateBrowsingUtils } = ChromeUtils.importESModule(
+  "resource://gre/modules/PrivateBrowsingUtils.sys.mjs"
+);
+const { EnableDelayHelper } = ChromeUtils.importESModule(
+  "resource://gre/modules/PromptUtils.sys.mjs"
+);
+const { getMozRemoteImageURL } = ChromeUtils.importESModule(
+  "moz-src:///toolkit/modules/FaviconUtils.sys.mjs"
+);
+
+class MozHandler extends window.MozElements.MozRichlistitem {
+  static get markup() {
+    return `
+    <vbox pack="center">
+      <html:img alt="" height="32" width="32" loading="lazy" />
+    </vbox>
+    <vbox flex="1">
+      <label class="name"/>
+      <label class="description"/>
+    </vbox>
+    `;
+  }
+
+  connectedCallback() {
+    this.textContent = "";
+    this.appendChild(this.constructor.fragment);
+    this.initializeAttributeInheritance();
+  }
+
+  static get inheritedAttributes() {
+    return {
+      img: "src=image,disabled",
+      ".name": "value=name,disabled",
+      ".description": "value=description,disabled",
+    };
+  }
+
+  get label() {
+    return `${this.getAttribute("name")} ${this.getAttribute("description")}`;
+  }
+}
+
+customElements.define("mozapps-handler", MozHandler, {
+  extends: "richlistitem",
+});
+
+window.addEventListener("DOMContentLoaded", () => dialog.initialize(), {
+  once: true,
+});
+
+let dialog = {
+  initialize() {
+    let args = window.arguments[0].wrappedJSObject || window.arguments[0];
+    let { handler, outArgs, usePrivateBrowsing, enableButtonDelay, kind } =
+      args;
+
+    this._handlerInfo = handler.QueryInterface(Ci.nsIHandlerInfo);
+    this._outArgs = outArgs;
+    this._kind = kind;
+
+    this.isPrivate =
+      usePrivateBrowsing ||
+      (window.opener && PrivateBrowsingUtils.isWindowPrivate(window.opener));
+
+    this._dialog = document.querySelector("dialog");
+    this._itemChoose = document.getElementById("item-choose");
+    this._rememberCheck = document.getElementById("remember");
+
+    let items = document.getElementById("items");
+    items.addEventListener("dblclick", () => this.onDblClick());
+    items.addEventListener("select", () => this.updateAcceptButton());
+    document
+      .getElementById("choose-app-btn")
+      .addEventListener("command", () => this.chooseApplication());
+
+    this._rememberCheck.addEventListener("change", () => this.onCheck());
+
+    document.addEventListener("dialogaccept", () => {
+      this.onAccept();
+    });
+
+    this.populateList();
+
+    if (this._kind === "mailto") {
+      this._itemChoose.hidden = true;
+      if (!this.selectedItem || this.selectedItem == this._itemChoose) {
+        this.selectedItem = items.querySelector("richlistitem:not([hidden])");
+      }
+      this._dialog.removeAttribute("data-l10n-id");
+    }
+
+    this.initL10n();
+
+    if (enableButtonDelay) {
+      this._delayHelper = new EnableDelayHelper({
+        disableDialog: () => {
+          this._acceptBtnDisabled = true;
+          this.updateAcceptButton();
+        },
+        enableDialog: () => {
+          this._acceptBtnDisabled = false;
+          this.updateAcceptButton();
+        },
+        focusTarget: window,
+      });
+    }
+  },
+
+  initL10n() {
+    let rememberLabel = document.getElementById("remember-label");
+    let description = document.getElementById("description");
+
+    if (this._kind === "mailto") {
+      document.l10n.setAttributes(
+        document.documentElement,
+        "mailto-handler-picker-window"
+      );
+      document.l10n.setAttributes(
+        rememberLabel,
+        "mailto-handler-picker-always-ask"
+      );
+      document.l10n.setAttributes(
+        description,
+        "mailto-handler-picker-subtitle"
+      );
+      document.l10n.setAttributes(
+        this._dialog.getButton("accept"),
+        "mailto-handler-picker-set-default"
+      );
+      document.l10n.setAttributes(
+        this._dialog.getButton("cancel"),
+        "mailto-handler-picker-not-now"
+      );
+      return;
+    }
+
+    document.l10n.setAttributes(rememberLabel, "chooser-dialog-remember", {
+      scheme: this._handlerInfo.type,
+    });
+    document.l10n.setAttributes(description, "chooser-dialog-description", {
+      scheme: this._handlerInfo.type,
+    });
+  },
+
+  populateList: function populateList() {
+    var items = document.getElementById("items");
+    var possibleHandlers = this._handlerInfo.possibleApplicationHandlers;
+    var preferredHandler = this._handlerInfo.preferredApplicationHandler;
+    for (let i = possibleHandlers.length - 1; i >= 0; --i) {
+      let app = possibleHandlers.queryElementAt(i, Ci.nsIHandlerApp);
+      if (this._kind === "mailto" && !(app instanceof Ci.nsIWebHandlerApp)) {
+        continue;
+      }
+      let elm = document.createXULElement("richlistitem", {
+        is: "mozapps-handler",
+      });
+      elm.setAttribute("name", app.name);
+      elm.obj = app;
+
+      if (app instanceof Ci.nsIGIOHandlerApp) {
+        elm.setAttribute("image", "moz-icon://" + app.id + "?size=32");
+      } else if (app instanceof Ci.nsILocalHandlerApp) {
+        let uri = Services.io.newFileURI(app.executable);
+        elm.setAttribute("image", "moz-icon://" + uri.spec + "?size=32");
+      } else if (app instanceof Ci.nsIWebHandlerApp) {
+        let uri = Services.io.newURI(app.uriTemplate);
+        if (/^https?$/.test(uri.scheme)) {
+          elm.setAttribute(
+            "image",
+            getMozRemoteImageURL(uri.prePath + "/favicon.ico", { size: 32 })
+          );
+        }
+        elm.setAttribute("description", uri.prePath);
+
+      } else if (!(app instanceof Ci.nsIGIOMimeApp)) {
+        throw new Error("unknown handler type");
+      }
+
+      items.insertBefore(elm, this._itemChoose);
+      if (preferredHandler && app == preferredHandler) {
+        this.selectedItem = elm;
+      }
+    }
+
+    if (this._handlerInfo.hasDefaultHandler) {
+      let elm = document.createXULElement("richlistitem", {
+        is: "mozapps-handler",
+      });
+      elm.id = "os-default-handler";
+      elm.setAttribute("name", this._handlerInfo.defaultDescription);
+
+      items.insertBefore(elm, items.firstChild);
+      if (
+        this._handlerInfo.preferredAction == Ci.nsIHandlerInfo.useSystemDefault
+      ) {
+        this.selectedItem = elm;
+      }
+    }
+
+    if (Cc["@mozilla.org/gio-service;1"] && this._kind !== "mailto") {
+      let gIOSvc = Cc["@mozilla.org/gio-service;1"].getService(
+        Ci.nsIGIOService
+      );
+      var gioApps = gIOSvc.getAppsForURIScheme(this._handlerInfo.type);
+      for (let handler of gioApps.enumerate(Ci.nsIHandlerApp)) {
+        if (handler.name == this._handlerInfo.defaultDescription) {
+          continue;
+        }
+        let appAlreadyInHandlers = false;
+        for (let i = possibleHandlers.length - 1; i >= 0; --i) {
+          let app = possibleHandlers.queryElementAt(i, Ci.nsIHandlerApp);
+          if (handler.equals(app)) {
+            appAlreadyInHandlers = true;
+            break;
+          }
+        }
+        if (!appAlreadyInHandlers) {
+          let elm = document.createXULElement("richlistitem", {
+            is: "mozapps-handler",
+          });
+          elm.setAttribute("name", handler.name);
+          elm.obj = handler;
+          items.insertBefore(elm, this._itemChoose);
+        }
+      }
+    }
+
+    items.ensureSelectedElementIsVisible();
+  },
+
+  async chooseApplication() {
+    let title = await this.getChooseAppWindowTitle();
+
+    var fp = Cc["@mozilla.org/filepicker;1"].createInstance(Ci.nsIFilePicker);
+    fp.init(window.browsingContext, title, Ci.nsIFilePicker.modeOpen);
+    fp.appendFilters(Ci.nsIFilePicker.filterApps);
+
+    fp.open(rv => {
+      if (rv == Ci.nsIFilePicker.returnOK && fp.file) {
+        let uri = Services.io.newFileURI(fp.file);
+
+        let handlerApp = Cc[
+          "@mozilla.org/uriloader/local-handler-app;1"
+        ].createInstance(Ci.nsILocalHandlerApp);
+        handlerApp.executable = fp.file;
+
+        let parent = document.getElementById("items");
+        for (let i = 0; i < parent.childNodes.length; ++i) {
+          let elm = parent.childNodes[i];
+          if (
+            elm.obj instanceof Ci.nsILocalHandlerApp &&
+            elm.obj.equals(handlerApp)
+          ) {
+            parent.selectedItem = elm;
+            parent.ensureSelectedElementIsVisible();
+            return;
+          }
+        }
+
+        let elm = document.createXULElement("richlistitem", {
+          is: "mozapps-handler",
+        });
+        elm.setAttribute("name", fp.file.leafName);
+        elm.setAttribute("image", "moz-icon://" + uri.spec + "?size=32");
+        elm.obj = handlerApp;
+
+        parent.selectedItem = parent.insertBefore(elm, parent.firstChild);
+        parent.ensureSelectedElementIsVisible();
+      }
+    });
+  },
+
+  onAccept() {
+    let skipAsk =
+      this._kind === "mailto"
+        ? !this._rememberCheck.checked
+        : this._rememberCheck.checked;
+    this.updateHandlerData(skipAsk);
+    this._outArgs.setProperty("openHandler", true);
+  },
+
+  updateAcceptButton() {
+    this._dialog.toggleAttribute(
+      "buttondisabledaccept",
+      this._acceptBtnDisabled || this._itemChoose.selected
+    );
+  },
+
+  updateHandlerData(skipAsk) {
+    if (this.selectedItem.obj) {
+      this._outArgs.setProperty(
+        "preferredAction",
+        Ci.nsIHandlerInfo.useHelperApp
+      );
+      this._outArgs.setProperty(
+        "preferredApplicationHandler",
+        this.selectedItem.obj
+      );
+    } else {
+      this._outArgs.setProperty(
+        "preferredAction",
+        Ci.nsIHandlerInfo.useSystemDefault
+      );
+    }
+    this._outArgs.setProperty("alwaysAskBeforeHandling", !skipAsk);
+  },
+
+  onCheck() {
+    if (document.getElementById("remember").checked) {
+      document.getElementById("remember-text").setAttribute("visible", "true");
+    } else {
+      document.getElementById("remember-text").removeAttribute("visible");
+    }
+  },
+
+  onDblClick: function onDblClick() {
+    if (this.selectedItem == this._itemChoose) {
+      this.chooseApplication();
+    } else {
+      this._dialog.acceptDialog();
+    }
+  },
+
+
+  get selectedItem() {
+    return document.getElementById("items").selectedItem;
+  },
+  set selectedItem(aItem) {
+    document.getElementById("items").selectedItem = aItem;
+  },
+
+  async getChooseAppWindowTitle() {
+    if (!this._chooseAppWindowTitle) {
+      this._chooseAppWindowTitle = await document.l10n.formatValues([
+        "choose-other-app-window-title",
+      ]);
+    }
+    return this._chooseAppWindowTitle;
+  },
+
+  async getPrivateBrowsingDisabledLabel() {
+    if (!this._privateBrowsingDisabledLabel) {
+      this._privateBrowsingDisabledLabel = await document.l10n.formatValues([
+        "choose-dialog-privatebrowsing-disabled",
+      ]);
+    }
+    return this._privateBrowsingDisabledLabel;
+  },
+};

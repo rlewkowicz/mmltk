@@ -1,0 +1,142 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsHTMLTags.h"
+#include "nsCRT.h"
+#include "nsElementTable.h"
+#include "nsReadableUtils.h"
+#include "nsString.h"
+#include "nsUnicharUtils.h"
+#include <algorithm>
+
+using namespace mozilla;
+
+#define HTML_TAG(_tag, _classname, _interfacename) (u"" #_tag),
+#define HTML_OTHER(_tag)
+const char16_t* const nsHTMLTags::sTagNames[] = {
+#include "nsHTMLTagList.inc"
+};
+#undef HTML_TAG
+#undef HTML_OTHER
+
+int32_t nsHTMLTags::gTableRefCount;
+nsHTMLTags::TagStringHash* nsHTMLTags::gTagTable;
+nsHTMLTags::TagAtomHash* nsHTMLTags::gTagAtomTable;
+
+#define NS_HTMLTAG_NAME_MAX_LENGTH 15
+
+nsresult nsHTMLTags::AddRefTable(void) {
+  if (gTableRefCount++ == 0) {
+    NS_ASSERTION(!gTagTable && !gTagAtomTable, "pre existing hash!");
+
+    gTagTable = new TagStringHash(64);
+    gTagAtomTable = new TagAtomHash(64);
+
+
+    for (size_t i = 0; i < std::size(sTagNames); ++i) {
+      const char16_t* tagName = sTagNames[i];
+      const nsHTMLTag tagValue = static_cast<nsHTMLTag>(i + 1);
+
+      nsString tmp;
+      tmp.AssignLiteral(tagName, nsString::char_traits::length(tagName));
+      gTagTable->InsertOrUpdate(tmp, tagValue);
+
+      nsStaticAtom* atom = NS_GetStaticAtom(tmp);
+      MOZ_ASSERT(atom);
+      gTagAtomTable->InsertOrUpdate(atom, tagValue);
+    }
+
+#ifdef DEBUG
+    uint32_t maxTagNameLength = 0;
+    for (const char16_t* tagName : sTagNames) {
+      nsAutoString lowerTagName(tagName);
+      ToLowerCase(lowerTagName);
+      MOZ_ASSERT(lowerTagName.Equals(tagName));
+
+      maxTagNameLength = std::max(NS_strlen(tagName), maxTagNameLength);
+    }
+
+    MOZ_ASSERT(maxTagNameLength == NS_HTMLTAG_NAME_MAX_LENGTH);
+
+    CheckElementTable();
+    TestTagTable();
+#endif
+  }
+
+  return NS_OK;
+}
+
+void nsHTMLTags::ReleaseTable(void) {
+  if (0 == --gTableRefCount) {
+    delete gTagTable;
+    delete gTagAtomTable;
+    gTagTable = nullptr;
+    gTagAtomTable = nullptr;
+  }
+}
+
+nsHTMLTag nsHTMLTags::StringTagToId(const nsAString& aTagName) {
+  uint32_t length = aTagName.Length();
+
+  if (length > NS_HTMLTAG_NAME_MAX_LENGTH) {
+    return eHTMLTag_userdefined;
+  }
+
+  nsAutoString lowerCase;
+  lowerCase.SetLength(length);
+
+  auto src = aTagName.BeginReading();
+  auto dst = lowerCase.BeginWriting();
+
+
+  for (uint32_t i = 0; i < length; i++) {
+    char16_t c = src[i];
+
+    if (c <= 'Z' && c >= 'A') {
+      c |= 0x20;  
+    }
+
+    dst[i] = c;  
+  }
+
+  return CaseSensitiveStringTagToId(lowerCase);
+}
+
+#ifdef DEBUG
+void nsHTMLTags::TestTagTable() {
+  nsHTMLTag id;
+  RefPtr<nsAtom> atom;
+
+  nsHTMLTags::AddRefTable();
+  for (const char16_t* tag : sTagNames) {
+    const nsAString& tagString = nsDependentString(tag);
+    id = StringTagToId(tagString);
+    NS_ASSERTION(id != eHTMLTag_userdefined, "can't find tag id");
+
+    nsAutoString uname(tagString);
+    ToUpperCase(uname);
+    NS_ASSERTION(id == StringTagToId(uname), "wrong id");
+
+    NS_ASSERTION(id == CaseSensitiveStringTagToId(tagString), "wrong id");
+
+    atom = NS_Atomize(tag);
+    NS_ASSERTION(id == CaseSensitiveAtomTagToId(atom), "wrong id");
+  }
+
+  id = StringTagToId(u"@"_ns);
+  NS_ASSERTION(id == eHTMLTag_userdefined, "found @");
+  id = StringTagToId(u"zzzzz"_ns);
+  NS_ASSERTION(id == eHTMLTag_userdefined, "found zzzzz");
+
+  atom = NS_Atomize("@");
+  id = CaseSensitiveAtomTagToId(atom);
+  NS_ASSERTION(id == eHTMLTag_userdefined, "found @");
+  atom = NS_Atomize("zzzzz");
+  id = CaseSensitiveAtomTagToId(atom);
+  NS_ASSERTION(id == eHTMLTag_userdefined, "found zzzzz");
+
+  ReleaseTable();
+}
+
+#endif  // DEBUG

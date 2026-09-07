@@ -1,0 +1,123 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_GestureEventListener_h
+#define mozilla_layers_GestureEventListener_h
+
+#include <iosfwd>
+#include "InputData.h"  // for MultiTouchInput, etc
+#include "Units.h"
+#include "mozilla/EventForwards.h"  // for nsEventStatus
+#include "mozilla/RefPtr.h"         // for RefPtr
+#include "nsISupportsImpl.h"
+#include "nsTArray.h"  // for nsTArray
+
+namespace mozilla {
+
+class CancelableRunnable;
+
+namespace layers {
+
+class AsyncPanZoomController;
+
+class GestureEventListener final {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(GestureEventListener)
+
+  explicit GestureEventListener(
+      AsyncPanZoomController* aAsyncPanZoomController);
+
+
+  nsEventStatus HandleInputEvent(const MultiTouchInput& aEvent);
+
+  int32_t GetLastTouchIdentifier() const;
+
+  void Destroy();
+
+  static void SetLongTapEnabled(bool aLongTapEnabled);
+  static bool IsLongTapEnabled();
+
+ private:
+  ~GestureEventListener();
+
+  enum GestureState {
+    GESTURE_NONE,
+
+    GESTURE_FIRST_SINGLE_TOUCH_DOWN,
+
+    GESTURE_FIRST_SINGLE_TOUCH_MAX_TAP_DOWN,
+
+    GESTURE_FIRST_SINGLE_TOUCH_UP,
+
+    GESTURE_SECOND_SINGLE_TOUCH_DOWN,
+
+    GESTURE_LONG_TOUCH_DOWN,
+
+    GESTURE_MULTI_TOUCH_DOWN,
+
+    GESTURE_PINCH,
+
+    GESTURE_ONE_TOUCH_PINCH
+  };
+
+  friend std::ostream& operator<<(std::ostream& os, GestureState aState);
+
+  nsEventStatus HandleInputTouchSingleStart();
+  nsEventStatus HandleInputTouchMultiStart();
+  nsEventStatus HandleInputTouchEnd();
+  nsEventStatus HandleInputTouchMove();
+  nsEventStatus HandleInputTouchCancel();
+  void HandleInputTimeoutLongTap();
+  void HandleInputTimeoutMaxTap(bool aDuringFastFling);
+
+  void EnterFirstSingleTouchDown();
+
+  void TriggerSingleTapConfirmedEvent();
+
+  bool MoveDistanceExceeds(ScreenCoord aThreshold) const;
+  bool MoveDistanceIsLarge() const;
+  bool SecondTapIsFar() const;
+
+  ScreenCoord GetYSpanFromGestureStartPoint();
+
+  void SetState(GestureState aState);
+
+  RefPtr<AsyncPanZoomController> mAsyncPanZoomController;
+
+  nsTArray<SingleTouchData> mTouches;
+
+  GestureState mState;
+
+  ScreenCoord mSpanChange;
+
+  ScreenCoord mPreviousSpan;
+
+  ScreenCoord mFocusChange;
+  ScreenPoint mPreviousFocus;
+
+  MultiTouchInput mLastTouchInput;
+
+  MultiTouchInput mLastTapInput;
+
+  ScreenPoint mOneTouchPinchStartPosition;
+
+  ScreenPoint mTouchStartPosition;
+
+  ExternalPoint mTouchStartOffset;
+
+  RefPtr<CancelableRunnable> mLongTapTimeoutTask;
+  void CancelLongTapTimeoutTask();
+  void CreateLongTapTimeoutTask();
+
+  RefPtr<CancelableRunnable> mMaxTapTimeoutTask;
+  void CancelMaxTapTimeoutTask();
+  void CreateMaxTapTimeoutTask();
+
+  Maybe<bool> mSingleTapSent;
+};
+
+}  
+}  
+
+#endif

@@ -1,0 +1,111 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_SimpleMap_h
+#define mozilla_SimpleMap_h
+
+#include <utility>
+
+#include "mozilla/Maybe.h"
+#include "mozilla/Mutex.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+
+struct ThreadSafePolicy {
+  struct PolicyLock {
+    explicit PolicyLock(const char* aName) : mMutex(aName) {}
+    Mutex mMutex MOZ_UNANNOTATED;
+  };
+  PolicyLock& mPolicyLock;
+  explicit ThreadSafePolicy(PolicyLock& aPolicyLock)
+      : mPolicyLock(aPolicyLock) {
+    mPolicyLock.mMutex.Lock();
+  }
+  ~ThreadSafePolicy() { mPolicyLock.mMutex.Unlock(); }
+};
+
+struct NoOpPolicy {
+  struct PolicyLock {
+    explicit PolicyLock(const char*) {}
+  };
+  explicit NoOpPolicy(PolicyLock&) {}
+  ~NoOpPolicy() = default;
+};
+
+template <typename K, typename V, typename Policy = NoOpPolicy>
+class SimpleMap {
+  using ElementType = std::pair<K, V>;
+  using MapType = AutoTArray<ElementType, 16>;
+
+ public:
+  SimpleMap() : mLock("SimpleMap") {};
+
+  bool Contains(const K& aKey) {
+    Policy guard(mLock);
+    return FindIndex(aKey).isSome();
+  }
+
+  void Insert(const K& aKey, const V& aValue) {
+    Policy guard(mLock);
+    mMap.AppendElement(std::make_pair(aKey, aValue));
+  }
+
+  Maybe<V> Take(const K& aKey) {
+    Policy guard(mLock);
+    if (Maybe<size_t> index = FindIndex(aKey)) {
+      Maybe<V> value = Some(std::move(mMap[*index].second));
+      mMap.RemoveElementAt(*index);
+      return value;
+    }
+    return Nothing();
+  }
+
+  template <typename F>
+  bool Take(const K& aKey, F&& aCallback) {
+    Policy guard(mLock);
+    if (Maybe<size_t> index = FindIndex(aKey)) {
+      aCallback(mMap[*index].second);
+      mMap.RemoveElementAt(*index);
+      return true;
+    }
+    return false;
+  }
+
+  void Clear() {
+    Policy guard(mLock);
+    mMap.Clear();
+  }
+
+  template <typename F>
+  void Clear(F&& aCallback) {
+    Policy guard(mLock);
+    for (const auto& element : mMap) {
+      aCallback(element.first, element.second);
+    }
+    mMap.Clear();
+  }
+
+  size_t Count() {
+    Policy guard(mLock);
+    return mMap.Length();
+  }
+
+ private:
+  Maybe<size_t> FindIndex(const K& aKey) const {
+    for (size_t i = 0; i < mMap.Length(); ++i) {
+      if (mMap[i].first == aKey) {
+        return Some(i);
+      }
+    }
+    return Nothing();
+  }
+
+  typename Policy::PolicyLock mLock;
+  MapType mMap;
+};
+
+}  
+
+#endif  // mozilla_SimpleMap_h

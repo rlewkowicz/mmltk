@@ -1,0 +1,223 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef CacheFileChunk_h_
+#define CacheFileChunk_h_
+
+#include "CacheCrypto.h"
+#include "CacheFileIOManager.h"
+#include "CacheStorageService.h"
+#include "CacheHashUtils.h"
+#include "CacheFileUtils.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/UniquePtr.h"
+
+namespace mozilla {
+namespace net {
+
+constexpr int32_t kChunkSize = 256 * 1024;
+constexpr size_t kEmptyChunkHash = 0x1826;
+
+class CacheFileChunk;
+class CacheFile;
+
+class CacheFileChunkBuffer {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(CacheFileChunkBuffer)
+
+  explicit CacheFileChunkBuffer(CacheFileChunk* aChunk);
+
+  nsresult EnsureBufSize(uint32_t aBufSize);
+  void CopyFrom(CacheFileChunkBuffer* aOther);
+  nsresult FillInvalidRanges(CacheFileChunkBuffer* aOther,
+                             CacheFileUtils::ValidityMap* aMap);
+  size_t SizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+
+  char* Buf() const { return mBuf; }
+  void SetDataSize(uint32_t aDataSize);
+  uint32_t DataSize() const { return mDataSize; }
+  uint32_t ReadHandlesCount() const { return mReadHandlesCount; }
+  bool WriteHandleExists() const { return mWriteHandleExists; }
+
+ private:
+  friend class CacheFileChunkHandle;
+  friend class CacheFileChunkReadHandle;
+  friend class CacheFileChunkWriteHandle;
+
+  ~CacheFileChunkBuffer();
+
+  void AssertOwnsLock() const;
+
+  void RemoveReadHandle();
+  void RemoveWriteHandle();
+
+  CacheFileChunk* mChunk;
+  char* mBuf;
+  uint32_t mBufSize;
+  uint32_t mDataSize;
+  uint32_t mReadHandlesCount;
+  bool mWriteHandleExists;
+};
+
+class CacheFileChunkHandle {
+ public:
+  uint32_t DataSize();
+  uint32_t Offset();
+
+ protected:
+  RefPtr<CacheFileChunkBuffer> mBuf;
+};
+
+class CacheFileChunkReadHandle : public CacheFileChunkHandle {
+ public:
+  explicit CacheFileChunkReadHandle(CacheFileChunkBuffer* aBuf);
+  ~CacheFileChunkReadHandle();
+
+  const char* Buf();
+};
+
+class CacheFileChunkWriteHandle : public CacheFileChunkHandle {
+ public:
+  explicit CacheFileChunkWriteHandle(CacheFileChunkBuffer* aBuf);
+  ~CacheFileChunkWriteHandle();
+
+  char* Buf();
+  void UpdateDataSize(uint32_t aOffset, uint32_t aLen);
+};
+
+#define CACHEFILECHUNKLISTENER_IID            \
+  { \
+   0xbaf16149,                                \
+   0x2ab5,                                    \
+   0x499c,                                    \
+   {0xa9, 0xc2, 0x59, 0x04, 0xeb, 0x95, 0xc2, 0x88}}
+
+class CacheFileChunkListener : public nsISupports {
+ public:
+  NS_INLINE_DECL_STATIC_IID(CACHEFILECHUNKLISTENER_IID)
+
+  NS_IMETHOD OnChunkRead(nsresult aResult, CacheFileChunk* aChunk) = 0;
+  NS_IMETHOD OnChunkWritten(nsresult aResult, CacheFileChunk* aChunk) = 0;
+  NS_IMETHOD OnChunkAvailable(nsresult aResult, uint32_t aChunkIdx,
+                              CacheFileChunk* aChunk) = 0;
+  NS_IMETHOD OnChunkUpdated(CacheFileChunk* aChunk) = 0;
+};
+
+class ChunkListenerItem {
+ public:
+  MOZ_COUNTED_DEFAULT_CTOR(ChunkListenerItem)
+  MOZ_COUNTED_DTOR(ChunkListenerItem)
+
+  nsCOMPtr<nsIEventTarget> mTarget;
+  nsCOMPtr<CacheFileChunkListener> mCallback;
+};
+
+class ChunkListeners {
+ public:
+  MOZ_COUNTED_DEFAULT_CTOR(ChunkListeners)
+  MOZ_COUNTED_DTOR(ChunkListeners)
+
+  nsTArray<ChunkListenerItem*> mItems;
+};
+
+class CacheFileChunk final : public CacheFileIOListener,
+                             public CacheMemoryConsumer {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  bool DispatchRelease();
+
+  CacheFileChunk(CacheFile* aFile, uint32_t aIndex, bool aInitByWriter);
+
+  void InitNew();
+  nsresult Read(CacheFileHandle* aHandle, uint32_t aLen,
+                CacheHash::Hash16_t aHash, CacheFileChunkListener* aCallback);
+  nsresult Write(CacheFileHandle* aHandle, CacheFileChunkListener* aCallback);
+  void WaitForUpdate(CacheFileChunkListener* aCallback);
+  void CancelWait(CacheFileChunkListener* aCallback);
+  nsresult NotifyUpdateListeners();
+
+  uint32_t Index() const;
+  CacheHash::Hash16_t Hash() const;
+  uint32_t DataSize() const;
+
+  void SetEncrypted();
+
+  NS_IMETHOD OnFileOpened(CacheFileHandle* aHandle, nsresult aResult) override;
+  NS_IMETHOD OnDataWritten(CacheFileHandle* aHandle, const char* aBuf,
+                           nsresult aResult) override;
+  NS_IMETHOD OnDataRead(CacheFileHandle* aHandle, char* aBuf,
+                        nsresult aResult) override;
+  NS_IMETHOD OnFileDoomed(CacheFileHandle* aHandle, nsresult aResult) override;
+  NS_IMETHOD OnEOFSet(CacheFileHandle* aHandle, nsresult aResult) override;
+  NS_IMETHOD OnFileRenamed(CacheFileHandle* aHandle, nsresult aResult) override;
+  virtual bool IsKilled() override;
+
+  bool IsReady() const;
+  bool IsDirty() const;
+
+  nsresult GetStatus();
+  void SetError(nsresult aStatus);
+
+  CacheFileChunkReadHandle GetReadHandle();
+  CacheFileChunkWriteHandle GetWriteHandle(uint32_t aEnsuredBufSize);
+
+  size_t SizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+  size_t SizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+
+ private:
+  friend class CacheFileChunkBuffer;
+  friend class CacheFileChunkWriteHandle;
+  friend class CacheFileInputStream;
+  friend class CacheFileOutputStream;
+  friend class CacheFile;
+
+  virtual ~CacheFileChunk();
+
+  void AssertOwnsLock() const;
+
+  void UpdateDataSize(uint32_t aOffset, uint32_t aLen);
+  void Truncate(uint32_t aOffset);
+
+  bool CanAllocate(uint32_t aSize) const;
+  void BuffersAllocationChanged(uint32_t aFreed, uint32_t aAllocated);
+
+  mozilla::Atomic<uint32_t, ReleaseAcquire>& ChunksMemoryUsage() const;
+
+  enum EState { INITIAL = 0, READING = 1, WRITING = 2, READY = 3 };
+
+  uint32_t mIndex;
+  EState mState;
+  nsresult mStatus;
+
+  Atomic<bool> mActiveChunk;  
+  bool mIsDirty : 1;
+  bool mDiscardedChunk : 1;
+
+  uint32_t mBuffersSize;
+  bool const mLimitAllocation : 1;  
+  bool const mIsPriority : 1;
+
+  RefPtr<CacheFileChunkBuffer> mBuf;
+
+  nsTArray<RefPtr<CacheFileChunkBuffer>> mOldBufs;
+
+  UniquePtr<CacheFileChunkReadHandle> mWritingStateHandle;
+
+  bool mEncrypted{false};
+  UniquePtr<uint8_t[]> mEncryptedReadBuf;
+  UniquePtr<uint8_t[]> mEncryptedWriteBuf;
+
+  RefPtr<CacheFileChunkBuffer> mReadingStateBuf;
+  CacheHash::Hash16_t mExpectedHash;
+
+  RefPtr<CacheFile> mFile;  
+  nsCOMPtr<CacheFileChunkListener> mListener;
+  nsTArray<ChunkListenerItem*> mUpdateListeners;
+  CacheFileUtils::ValidityMap mValidityMap;
+};
+
+}  
+}  
+
+#endif

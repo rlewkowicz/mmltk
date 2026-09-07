@@ -1,0 +1,108 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef GFX_MATH_TABLE_H
+#define GFX_MATH_TABLE_H
+
+#include "gfxFont.h"
+
+class gfxMathTable {
+ public:
+  gfxMathTable(hb_face_t* aFace, gfxFloat aSize);
+
+  ~gfxMathTable();
+
+  enum MathConstant {
+    ScriptPercentScaleDown,
+    ScriptScriptPercentScaleDown,
+    DelimitedSubFormulaMinHeight,
+    DisplayOperatorMinHeight,
+    MathLeading,
+    AxisHeight,
+    AccentBaseHeight,
+    FlattenedAccentBaseHeight,
+    SubscriptShiftDown,
+    SubscriptTopMax,
+    SubscriptBaselineDropMin,
+    SuperscriptShiftUp,
+    SuperscriptShiftUpCramped,
+    SuperscriptBottomMin,
+    SuperscriptBaselineDropMax,
+    SubSuperscriptGapMin,
+    SuperscriptBottomMaxWithSubscript,
+    SpaceAfterScript,
+    UpperLimitGapMin,
+    UpperLimitBaselineRiseMin,
+    LowerLimitGapMin,
+    LowerLimitBaselineDropMin,
+    StackTopShiftUp,
+    StackTopDisplayStyleShiftUp,
+    StackBottomShiftDown,
+    StackBottomDisplayStyleShiftDown,
+    StackGapMin,
+    StackDisplayStyleGapMin,
+    StretchStackTopShiftUp,
+    StretchStackBottomShiftDown,
+    StretchStackGapAboveMin,
+    StretchStackGapBelowMin,
+    FractionNumeratorShiftUp,
+    FractionNumeratorDisplayStyleShiftUp,
+    FractionDenominatorShiftDown,
+    FractionDenominatorDisplayStyleShiftDown,
+    FractionNumeratorGapMin,
+    FractionNumDisplayStyleGapMin,
+    FractionRuleThickness,
+    FractionDenominatorGapMin,
+    FractionDenomDisplayStyleGapMin,
+    SkewedFractionHorizontalGap,
+    SkewedFractionVerticalGap,
+    OverbarVerticalGap,
+    OverbarRuleThickness,
+    OverbarExtraAscender,
+    UnderbarVerticalGap,
+    UnderbarRuleThickness,
+    UnderbarExtraDescender,
+    RadicalVerticalGap,
+    RadicalDisplayStyleVerticalGap,
+    RadicalRuleThickness,
+    RadicalExtraAscender,
+    RadicalKernBeforeDegree,
+    RadicalKernAfterDegree,
+    RadicalDegreeBottomRaisePercent
+  };
+
+  gfxFloat Constant(MathConstant aConstant) const;
+
+  nscoord Constant(MathConstant aConstant,
+                   uint32_t aAppUnitsPerDevPixel) const {
+    return NSToCoordRound(Constant(aConstant) * aAppUnitsPerDevPixel);
+  }
+
+  gfxFloat ItalicsCorrection(uint32_t aGlyphID) const;
+
+  uint32_t VariantsSize(uint32_t aGlyphID, bool aVertical, bool aRTL,
+                        uint16_t aSize) const;
+
+  bool VariantsParts(uint32_t aGlyphID, bool aVertical, bool aRTL,
+                     uint32_t aGlyphs[4]) const;
+
+ private:
+  hb_font_t* mHBFont;
+
+  static const unsigned int kMaxCachedSizeCount = 10;
+  struct MathVariantCacheEntry {
+    uint32_t glyphID;
+    bool vertical;
+    bool isRTL;
+    uint32_t sizes[kMaxCachedSizeCount];
+    uint32_t parts[4];
+    bool arePartsValid;
+  };
+  mutable MathVariantCacheEntry mMathVariantCache;
+  void ClearCache() const;
+  void UpdateMathVariantCache(uint32_t aGlyphID, bool aVertical,
+                              bool aRTL) const;
+};
+
+#endif

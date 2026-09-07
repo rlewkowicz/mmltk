@@ -1,0 +1,323 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_CompileInfo_h
+#define jit_CompileInfo_h
+
+#include "mozilla/Assertions.h"  // MOZ_ASSERT
+#include "mozilla/Maybe.h"       // mozilla::Maybe, mozilla::Some
+
+#include <algorithm>  // std::max
+#include <stdint.h>   // uint32_t
+
+#include "jit/CompileWrappers.h"  // CompileRuntime
+#include "jit/JitFrames.h"        // MinJITStackSize
+#include "jit/shared/Assembler-shared.h"
+#include "js/TypeDecls.h"    // jsbytecode
+#include "vm/BindingKind.h"  // BindingLocation
+#include "vm/JSAtomState.h"  // JSAtomState
+#include "vm/JSFunction.h"   // JSFunction
+#include "vm/JSScript.h"     // JSScript
+#include "vm/Opcodes.h"      // JSOp
+#include "vm/Scope.h"        // BindingIter
+
+namespace js {
+
+class ModuleObject;
+
+namespace jit {
+
+class InlineScriptTree;
+
+inline unsigned StartArgSlot(JSScript* script) {
+
+
+  return 2 + (script->needsArgsObj() ? 1 : 0);
+}
+
+inline unsigned CountArgSlots(JSScript* script, JSFunction* fun) {
+
+  return StartArgSlot(script) + (fun ? fun->nargs() + 1 : 0);
+}
+
+inline unsigned CountArgSlots(JSScript* script, bool hasFun,
+                              uint32_t funArgCount) {
+  return StartArgSlot(script) + (hasFun ? funArgCount + 1 : 0);
+}
+
+class CompileInfo {
+ public:
+  CompileInfo(CompileRuntime* runtime, JSScript* script, jsbytecode* osrPc,
+              bool scriptNeedsArgsObj, InlineScriptTree* inlineScriptTree)
+      : script_(script),
+        fun_(script->function()),
+        osrPc_(osrPc),
+        scriptNeedsArgsObj_(scriptNeedsArgsObj),
+        hadEagerTruncationBailout_(script->hadEagerTruncationBailout()),
+        hadSpeculativePhiBailout_(script->hadSpeculativePhiBailout()),
+        hadLICMInvalidation_(script->hadLICMInvalidation()),
+        hadReorderingBailout_(script->hadReorderingBailout()),
+        hadBoundsCheckBailout_(script->failedBoundsCheck()),
+        hadUnboxFoldingBailout_(script->hadUnboxFoldingBailout()),
+        mayReadFrameArgsDirectly_(script->mayReadFrameArgsDirectly()),
+        anyFormalIsForwarded_(script->anyFormalIsForwarded()),
+        isDerivedClassConstructor_(script->isDerivedClassConstructor()),
+        inlineScriptTree_(inlineScriptTree),
+        hasSeenObjectEmulateUndefinedFuseIntact_(
+            runtime->hasSeenObjectEmulateUndefinedFuseIntact()),
+        hasSeenArrayExceedsInt32LengthFuseIntact_(
+            runtime->hasSeenArrayExceedsInt32LengthFuseIntact()) {
+    MOZ_ASSERT_IF(osrPc, JSOp(*osrPc) == JSOp::LoopHead);
+
+    nimplicit_ = StartArgSlot(script) 
+                 + (fun_ ? 1 : 0);    
+    nargs_ = fun_ ? fun_->nargs() : 0;
+    nlocals_ = script->nfixed();
+
+    uint32_t extra = script->isGlobalCode() ? 1 : 0;
+    nstack_ = std::max<unsigned>(script->nslots() - script->nfixed(),
+                                 MinJITStackSize) +
+              extra;
+    nslots_ = nimplicit_ + nargs_ + nlocals_ + nstack_;
+
+    if (script->isDerivedClassConstructor()) {
+      MOZ_ASSERT(script->functionHasThisBinding());
+      for (BindingIter bi(script); bi; bi++) {
+        if (bi.name() != runtime->names().dot_this_) {
+          continue;
+        }
+        BindingLocation loc = bi.location();
+        if (loc.kind() == BindingLocation::Kind::Frame) {
+          thisSlotForDerivedClassConstructor_ =
+              mozilla::Some(localSlot(loc.slot()));
+          break;
+        }
+      }
+    }
+
+    needsBodyEnvironmentObject_ = script->needsBodyEnvironment();
+    funNeedsSomeEnvironmentObject_ =
+        fun_ ? fun_->needsSomeEnvironmentObject() : false;
+  }
+
+  explicit CompileInfo(unsigned nlocals)
+      : script_(nullptr),
+        fun_(nullptr),
+        osrPc_(nullptr),
+        scriptNeedsArgsObj_(false),
+        hadEagerTruncationBailout_(false),
+        hadSpeculativePhiBailout_(false),
+        hadLICMInvalidation_(false),
+        hadReorderingBailout_(false),
+        hadBoundsCheckBailout_(false),
+        hadUnboxFoldingBailout_(false),
+        branchHintingEnabled_(false),
+        mayReadFrameArgsDirectly_(false),
+        anyFormalIsForwarded_(false),
+        inlineScriptTree_(nullptr),
+        needsBodyEnvironmentObject_(false),
+        funNeedsSomeEnvironmentObject_(false),
+        hasSeenObjectEmulateUndefinedFuseIntact_(false),
+        hasSeenArrayExceedsInt32LengthFuseIntact_(false) {
+    nimplicit_ = 0;
+    nargs_ = 0;
+    nlocals_ = nlocals;
+    nstack_ = 1; 
+    nslots_ = nlocals_ + nstack_;
+  }
+
+  JSScript* script() const { return script_; }
+  bool compilingWasm() const { return script() == nullptr; }
+  ModuleObject* module() const { return script_->module(); }
+  jsbytecode* osrPc() const { return osrPc_; }
+  InlineScriptTree* inlineScriptTree() const { return inlineScriptTree_; }
+
+  bool hasFunMaybeLazy() const { return fun_; }
+  ImmGCPtr funMaybeLazy() const { return ImmGCPtr(fun_); }
+
+  const char* filename() const { return script_->filename(); }
+
+  unsigned lineno() const { return script_->lineno(); }
+
+  unsigned nslots() const { return nslots_; }
+
+  unsigned nimplicit() const { return nimplicit_; }
+  unsigned nargs() const { return nargs_; }
+  unsigned nlocals() const { return nlocals_; }
+  unsigned ninvoke() const { return nslots_ - nstack_; }
+
+  uint32_t environmentChainSlot() const {
+    MOZ_ASSERT(script());
+    return 0;
+  }
+  uint32_t returnValueSlot() const {
+    MOZ_ASSERT(script());
+    return 1;
+  }
+  uint32_t argsObjSlot() const {
+    MOZ_ASSERT(needsArgsObj());
+    return 2;
+  }
+  uint32_t thisSlot() const {
+    MOZ_ASSERT(hasFunMaybeLazy());
+    MOZ_ASSERT(nimplicit_ > 0);
+    return nimplicit_ - 1;
+  }
+  uint32_t firstArgSlot() const { return nimplicit_; }
+  uint32_t argSlotUnchecked(uint32_t i) const {
+    MOZ_ASSERT(i < nargs_);
+    return nimplicit_ + i;
+  }
+  uint32_t argSlot(uint32_t i) const {
+    MOZ_ASSERT(!argsObjAliasesFormals());
+    return argSlotUnchecked(i);
+  }
+  uint32_t firstLocalSlot() const { return nimplicit_ + nargs_; }
+  uint32_t localSlot(uint32_t i) const { return firstLocalSlot() + i; }
+  uint32_t firstStackSlot() const { return firstLocalSlot() + nlocals(); }
+  uint32_t stackSlot(uint32_t i) const { return firstStackSlot() + i; }
+
+  uint32_t totalSlots() const {
+    MOZ_ASSERT(script() && hasFunMaybeLazy());
+    return nimplicit() + nargs() + nlocals();
+  }
+
+  bool hasMappedArgsObj() const { return script()->hasMappedArgsObj(); }
+  bool needsArgsObj() const { return scriptNeedsArgsObj_; }
+  bool argsObjAliasesFormals() const {
+    return scriptNeedsArgsObj_ && script()->hasMappedArgsObj();
+  }
+
+  bool needsBodyEnvironmentObject() const {
+    return needsBodyEnvironmentObject_;
+  }
+
+  enum class SlotObservableKind {
+    ObservableNotRecoverable,
+
+    ObservableRecoverable,
+
+    NotObservable,
+  };
+
+  inline SlotObservableKind getSlotObservableKind(uint32_t slot) const {
+    if (slot >= firstLocalSlot()) {
+      if (thisSlotForDerivedClassConstructor_ &&
+          *thisSlotForDerivedClassConstructor_ == slot) {
+        return SlotObservableKind::ObservableNotRecoverable;
+      }
+      return SlotObservableKind::NotObservable;
+    }
+
+    if (slot >= firstArgSlot()) {
+      MOZ_ASSERT(hasFunMaybeLazy());
+      MOZ_ASSERT(slot - firstArgSlot() < nargs());
+
+      if (mayReadFrameArgsDirectly_ || !script()->strict()) {
+        return SlotObservableKind::ObservableRecoverable;
+      }
+      return SlotObservableKind::NotObservable;
+    }
+
+    if (hasFunMaybeLazy() && slot == thisSlot()) {
+      return SlotObservableKind::ObservableRecoverable;
+    }
+
+    if (slot == environmentChainSlot()) {
+      if (needsBodyEnvironmentObject()) {
+        return SlotObservableKind::ObservableNotRecoverable;
+      }
+      if (funNeedsSomeEnvironmentObject_ || needsArgsObj()) {
+        return SlotObservableKind::ObservableRecoverable;
+      }
+      return SlotObservableKind::NotObservable;
+    }
+
+    if (needsArgsObj() && slot == argsObjSlot()) {
+      MOZ_ASSERT(hasFunMaybeLazy());
+      return SlotObservableKind::ObservableRecoverable;
+    }
+
+    MOZ_ASSERT(slot == returnValueSlot());
+    return SlotObservableKind::NotObservable;
+  }
+
+  inline bool isObservableSlot(uint32_t slot) const {
+    SlotObservableKind kind = getSlotObservableKind(slot);
+    return (kind == SlotObservableKind::ObservableNotRecoverable ||
+            kind == SlotObservableKind::ObservableRecoverable);
+  }
+
+  bool isRecoverableOperand(uint32_t slot) const {
+    SlotObservableKind kind = getSlotObservableKind(slot);
+    return (kind == SlotObservableKind::ObservableRecoverable ||
+            kind == SlotObservableKind::NotObservable);
+  }
+
+  bool hadEagerTruncationBailout() const { return hadEagerTruncationBailout_; }
+  bool hadSpeculativePhiBailout() const { return hadSpeculativePhiBailout_; }
+  bool hadLICMInvalidation() const { return hadLICMInvalidation_; }
+  bool hadReorderingBailout() const { return hadReorderingBailout_; }
+  bool hadBoundsCheckBailout() const { return hadBoundsCheckBailout_; }
+  bool hadUnboxFoldingBailout() const { return hadUnboxFoldingBailout_; }
+
+  bool branchHintingEnabled() const {
+    return compilingWasm() && branchHintingEnabled_;
+  }
+
+  void setBranchHinting(bool value) { branchHintingEnabled_ = value; }
+
+  bool mayReadFrameArgsDirectly() const { return mayReadFrameArgsDirectly_; }
+  bool anyFormalIsForwarded() const { return anyFormalIsForwarded_; }
+
+  bool isDerivedClassConstructor() const { return isDerivedClassConstructor_; }
+
+  bool hasSeenObjectEmulateUndefinedFuseIntact() const {
+    return hasSeenObjectEmulateUndefinedFuseIntact_;
+  }
+
+  bool hasSeenArrayExceedsInt32LengthFuseIntact() const {
+    return hasSeenArrayExceedsInt32LengthFuseIntact_;
+  }
+
+ private:
+  unsigned nimplicit_;
+  unsigned nargs_;
+  unsigned nlocals_;
+  unsigned nstack_;
+  unsigned nslots_;
+  mozilla::Maybe<unsigned> thisSlotForDerivedClassConstructor_;
+  JSScript* script_;
+  JSFunction* fun_;
+  jsbytecode* osrPc_;
+
+  bool scriptNeedsArgsObj_;
+
+  bool hadEagerTruncationBailout_;
+  bool hadSpeculativePhiBailout_;
+  bool hadLICMInvalidation_;
+  bool hadReorderingBailout_;
+  bool hadBoundsCheckBailout_;
+  bool hadUnboxFoldingBailout_;
+
+  bool branchHintingEnabled_ = false;
+
+  bool mayReadFrameArgsDirectly_;
+  bool anyFormalIsForwarded_;
+
+  bool isDerivedClassConstructor_;
+
+  InlineScriptTree* inlineScriptTree_;
+
+  bool needsBodyEnvironmentObject_;
+  bool funNeedsSomeEnvironmentObject_;
+
+  bool hasSeenObjectEmulateUndefinedFuseIntact_;
+  bool hasSeenArrayExceedsInt32LengthFuseIntact_;
+};
+
+}  
+}  
+
+#endif /* jit_CompileInfo_h */

@@ -1,0 +1,521 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include <algorithm>
+
+#include "nsAboutCacheEntry.h"
+
+#include "CacheFileUtils.h"
+#include "CacheObserver.h"
+#include "Dictionary.h"
+#include "mozilla/Sprintf.h"
+#include "nsAboutCache.h"
+#include "nsAboutProtocolUtils.h"
+#include "nsContentUtils.h"
+#include "nsEscape.h"
+#include "nsIAsyncInputStream.h"
+#include "nsIAsyncOutputStream.h"
+#include "nsICacheStorage.h"
+#include "nsIPipe.h"
+#include "nsITransportSecurityInfo.h"
+#include "nsInputStreamPump.h"
+#include "nsNetUtil.h"
+
+using namespace mozilla::net;
+
+#define HEXDUMP_MAX_ROWS 16
+
+static void HexDump(uint32_t* state, const char* buf, int32_t n,
+                    nsCString& result) {
+  char temp[16];
+
+  const unsigned char* p;
+  while (n) {
+    SprintfLiteral(temp, "%08x:  ", *state);
+    result.Append(temp);
+    *state += HEXDUMP_MAX_ROWS;
+
+    p = (const unsigned char*)buf;
+
+    int32_t i, row_max = std::min(HEXDUMP_MAX_ROWS, n);
+
+    for (i = 0; i < row_max; ++i) {
+      SprintfLiteral(temp, "%02x  ", *p++);
+      result.Append(temp);
+    }
+    for (i = row_max; i < HEXDUMP_MAX_ROWS; ++i) {
+      result.AppendLiteral("    ");
+    }
+
+    p = (const unsigned char*)buf;
+    for (i = 0; i < row_max; ++i, ++p) {
+      switch (*p) {
+        case '<':
+          result.AppendLiteral("&lt;");
+          break;
+        case '>':
+          result.AppendLiteral("&gt;");
+          break;
+        case '&':
+          result.AppendLiteral("&amp;");
+          break;
+        default:
+          if (*p < 0x7F && *p > 0x1F) {
+            result.Append(*p);
+          } else {
+            result.Append('.');
+          }
+      }
+    }
+
+    result.Append('\n');
+
+    buf += row_max;
+    n -= row_max;
+  }
+}
+
+
+NS_IMPL_ISUPPORTS(nsAboutCacheEntry, nsIAboutModule)
+NS_IMPL_ISUPPORTS(nsAboutCacheEntry::Channel, nsICacheEntryOpenCallback,
+                  nsICacheEntryMetaDataVisitor, nsIStreamListener, nsIRequest,
+                  nsIChannel)
+
+
+NS_IMETHODIMP
+nsAboutCacheEntry::NewChannel(nsIURI* uri, nsILoadInfo* aLoadInfo,
+                              nsIChannel** result) {
+  NS_ENSURE_ARG_POINTER(uri);
+  nsresult rv;
+
+  RefPtr<Channel> channel = new Channel();
+  rv = channel->Init(uri, aLoadInfo);
+  if (NS_FAILED(rv)) return rv;
+
+  channel.forget(result);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsAboutCacheEntry::GetURIFlags(nsIURI* aURI, uint32_t* result) {
+  *result = nsIAboutModule::HIDE_FROM_ABOUTABOUT |
+            nsIAboutModule::URI_SAFE_FOR_UNTRUSTED_CONTENT;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsAboutCacheEntry::GetChromeURI(nsIURI* aURI, nsIURI** chromeURI) {
+  return NS_ERROR_ILLEGAL_VALUE;
+}
+
+
+nsresult nsAboutCacheEntry::Channel::Init(nsIURI* uri, nsILoadInfo* aLoadInfo) {
+  nsresult rv;
+
+  nsCOMPtr<nsIInputStream> stream;
+  rv = GetContentStream(uri, getter_AddRefs(stream));
+  if (NS_FAILED(rv)) return rv;
+
+  rv = NS_NewInputStreamChannelInternal(getter_AddRefs(mChannel), uri,
+                                        stream.forget(), "text/html"_ns,
+                                        "utf-8"_ns, aLoadInfo);
+  if (NS_FAILED(rv)) return rv;
+
+  return NS_OK;
+}
+
+nsresult nsAboutCacheEntry::Channel::GetContentStream(nsIURI* uri,
+                                                      nsIInputStream** result) {
+  nsresult rv;
+
+  nsCOMPtr<nsIAsyncInputStream> inputStream;
+  NS_NewPipe2(getter_AddRefs(inputStream), getter_AddRefs(mOutputStream), true,
+              false, 256, UINT32_MAX);
+
+  constexpr auto buffer =
+      "<!DOCTYPE html>\n"
+      "<html>\n"
+      "<head>\n"
+      "  <meta http-equiv=\"Content-Security-Policy\" content=\"default-src "
+      "chrome:; object-src 'none'\" />\n"
+      "  <meta name=\"color-scheme\" content=\"light dark\" />\n"
+      "  <title>Cache entry information</title>\n"
+      "  <link rel=\"stylesheet\" "
+      "href=\"chrome://global/skin/in-content/info-pages.css\" "
+      "type=\"text/css\"/>\n"
+      "  <link rel=\"stylesheet\" "
+      "href=\"chrome://global/skin/aboutCacheEntry.css\" type=\"text/css\"/>\n"
+      "</head>\n"
+      "<body>\n"
+      "<h1>Cache entry information</h1>\n"_ns;
+  uint32_t n;
+  rv = mOutputStream->Write(buffer.get(), buffer.Length(), &n);
+  if (NS_FAILED(rv)) return rv;
+  if (n != buffer.Length()) return NS_ERROR_UNEXPECTED;
+
+  rv = OpenCacheEntry(uri);
+  if (NS_FAILED(rv)) return rv;
+
+  inputStream.forget(result);
+  return NS_OK;
+}
+
+nsresult nsAboutCacheEntry::Channel::OpenCacheEntry(nsIURI* uri) {
+  nsresult rv;
+
+  rv = ParseURI(uri, mStorageName, getter_AddRefs(mLoadInfo), mEnhanceId,
+                getter_AddRefs(mCacheURI));
+  if (NS_FAILED(rv)) return rv;
+
+  return OpenCacheEntry();
+}
+
+nsresult nsAboutCacheEntry::Channel::OpenCacheEntry() {
+  nsresult rv;
+
+  nsCOMPtr<nsICacheStorage> storage;
+  rv = nsAboutCache::GetStorage(mStorageName, mLoadInfo,
+                                getter_AddRefs(storage));
+  if (NS_FAILED(rv)) return rv;
+
+  rv = storage->AsyncOpenURI(
+      mCacheURI, mEnhanceId,
+      nsICacheStorage::OPEN_READONLY | nsICacheStorage::OPEN_SECRETLY, this);
+  if (NS_FAILED(rv)) return rv;
+
+  return NS_OK;
+}
+
+nsresult nsAboutCacheEntry::Channel::ParseURI(nsIURI* uri,
+                                              nsACString& storageName,
+                                              nsILoadContextInfo** loadInfo,
+                                              nsCString& enahnceID,
+                                              nsIURI** cacheUri) {
+  nsresult rv;
+
+  nsAutoCString path;
+  rv = uri->GetPathQueryRef(path);
+  if (NS_FAILED(rv)) return rv;
+
+  nsACString::const_iterator keyBegin, keyEnd, valBegin, begin, end;
+  path.BeginReading(begin);
+  path.EndReading(end);
+
+  keyBegin = begin;
+  keyEnd = end;
+  if (!FindInReadable("?storage="_ns, keyBegin, keyEnd)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  valBegin = keyEnd;  
+
+  keyBegin = keyEnd;
+  keyEnd = end;
+  if (!FindInReadable("&context="_ns, keyBegin, keyEnd)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  storageName.Assign(Substring(valBegin, keyBegin));
+  valBegin = keyEnd;  
+
+  keyBegin = keyEnd;
+  keyEnd = end;
+  if (!FindInReadable("&eid="_ns, keyBegin, keyEnd)) return NS_ERROR_FAILURE;
+
+  nsAutoCString contextKey(Substring(valBegin, keyBegin));
+  valBegin = keyEnd;  
+
+  keyBegin = keyEnd;
+  keyEnd = end;
+  if (!FindInReadable("&uri="_ns, keyBegin, keyEnd)) return NS_ERROR_FAILURE;
+
+  enahnceID.Assign(Substring(valBegin, keyBegin));
+
+  valBegin = keyEnd;  
+  nsAutoCString uriSpec(Substring(valBegin, end));  
+
+
+  nsCOMPtr<nsILoadContextInfo> info = CacheFileUtils::ParseKey(contextKey);
+  if (!info) return NS_ERROR_FAILURE;
+  info.forget(loadInfo);
+
+  rv = NS_NewURI(cacheUri, uriSpec);
+  if (NS_FAILED(rv)) return rv;
+
+  return NS_OK;
+}
+
+
+NS_IMETHODIMP
+nsAboutCacheEntry::Channel::OnCacheEntryCheck(nsICacheEntry* aEntry,
+                                              uint32_t* result) {
+  *result = nsICacheEntryOpenCallback::ENTRY_WANTED;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsAboutCacheEntry::Channel::OnCacheEntryAvailable(nsICacheEntry* entry,
+                                                  bool isNew, nsresult status) {
+  nsresult rv;
+
+  mWaitingForData = false;
+  if (entry) {
+    rv = WriteCacheEntryDescription(entry);
+  } else {
+    rv = WriteCacheEntryUnavailable();
+  }
+  if (NS_FAILED(rv)) return rv;
+
+  if (!mWaitingForData) {
+    CloseContent();
+  }
+
+  return NS_OK;
+}
+
+
+#define APPEND_ROW(label, value) \
+  PR_BEGIN_MACRO                 \
+  buffer.AppendLiteral(          \
+      "  <tr>\n"                 \
+      "    <th>");               \
+  buffer.AppendLiteral(label);   \
+  buffer.AppendLiteral(          \
+      ":</th>\n"                 \
+      "    <td>");               \
+  buffer.Append(value);          \
+  buffer.AppendLiteral(          \
+      "</td>\n"                  \
+      "  </tr>\n");              \
+  PR_END_MACRO
+
+nsresult nsAboutCacheEntry::Channel::WriteCacheEntryDescription(
+    nsICacheEntry* entry) {
+  nsresult rv;
+  nsAutoCStringN<4097> buffer;
+  uint32_t n;
+
+  nsAutoCString str;
+
+  rv = entry->GetKey(str);
+  if (NS_FAILED(rv)) return rv;
+
+  buffer.AssignLiteral(
+      "<table>\n"
+      "  <tr>\n"
+      "    <th>key:</th>\n"
+      "    <td id=\"td-key\">");
+
+  nsCOMPtr<nsIURI> uri;
+  rv = NS_NewURI(getter_AddRefs(uri), str);
+
+  nsAutoCString escapedStr;
+  nsAppendEscapedHTML(str, escapedStr);
+
+  if (NS_SUCCEEDED(rv) &&
+      !(uri->SchemeIs("javascript") || uri->SchemeIs("data"))) {
+    buffer.AppendLiteral("<a href=\"");
+    buffer.Append(escapedStr);
+    buffer.AppendLiteral("\">");
+    buffer.Append(escapedStr);
+    buffer.AppendLiteral("</a>");
+    uri = nullptr;
+  } else {
+    buffer.Append(escapedStr);
+  }
+  buffer.AppendLiteral(
+      "</td>\n"
+      "  </tr>\n");
+
+  char timeBuf[255];
+  uint32_t u = 0;
+  nsAutoCString s;
+
+  s.Truncate();
+  entry->GetFetchCount(&u);
+  s.AppendInt(u);
+  APPEND_ROW("fetch count", s);
+
+  entry->GetLastFetched(&u);
+  if (u) {
+    PrintTimeString(timeBuf, sizeof(timeBuf), u);
+    APPEND_ROW("last fetched", timeBuf);
+  } else {
+    APPEND_ROW("last fetched", "No last fetch time (bug 1000338)");
+  }
+
+  entry->GetLastModified(&u);
+  if (u) {
+    PrintTimeString(timeBuf, sizeof(timeBuf), u);
+    APPEND_ROW("last modified", timeBuf);
+  } else {
+    APPEND_ROW("last modified", "No last modified time (bug 1000338)");
+  }
+
+  entry->GetExpirationTime(&u);
+
+  if (u == 0) {
+    APPEND_ROW("expires", "Expired Immediately");
+  } else if (u < 0xFFFFFFFF) {
+    PrintTimeString(timeBuf, sizeof(timeBuf), u);
+    APPEND_ROW("expires", timeBuf);
+  } else {
+    APPEND_ROW("expires", "No expiration time");
+  }
+
+  s.Truncate();
+  uint32_t dataSize;
+  if (NS_FAILED(entry->GetStorageDataSize(&dataSize))) dataSize = 0;
+  s.AppendInt(
+      (int32_t)dataSize);  
+  s.AppendLiteral(" B");
+  APPEND_ROW("Data size", s);
+
+
+  nsCOMPtr<nsITransportSecurityInfo> securityInfo;
+  entry->GetSecurityInfo(getter_AddRefs(securityInfo));
+  if (securityInfo) {
+    APPEND_ROW("Security", "This is a secure document.");
+  } else {
+    APPEND_ROW(
+        "Security",
+        "This document does not have any security info associated with it.");
+  }
+
+  buffer.AppendLiteral(
+      "</table>\n"
+      "<hr/>\n"
+      "<table>\n");
+
+  mBuffer = &buffer;  
+  entry->VisitMetaData(this);
+  mBuffer = nullptr;
+
+  buffer.AppendLiteral("</table>\n");
+  mOutputStream->Write(buffer.get(), buffer.Length(), &n);
+  buffer.Truncate();
+
+  if (!dataSize) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIInputStream> stream;
+  entry->OpenInputStream(0, getter_AddRefs(stream));
+  if (!stream) {
+    return NS_OK;
+  }
+
+  RefPtr<nsInputStreamPump> pump;
+  rv = nsInputStreamPump::Create(getter_AddRefs(pump), stream);
+  if (NS_FAILED(rv)) {
+    return NS_OK;  
+  }
+
+  rv = pump->AsyncRead(this);
+  if (NS_FAILED(rv)) {
+    return NS_OK;  
+  }
+
+  mWaitingForData = true;
+  return NS_OK;
+}
+
+nsresult nsAboutCacheEntry::Channel::WriteCacheEntryUnavailable() {
+  uint32_t n;
+  constexpr auto buffer = "The cache entry you selected is not available."_ns;
+  mOutputStream->Write(buffer.get(), buffer.Length(), &n);
+  return NS_OK;
+}
+
+
+NS_IMETHODIMP
+nsAboutCacheEntry::Channel::OnMetaDataElement(char const* key,
+                                              char const* value) {
+  mBuffer->AppendLiteral(
+      "  <tr>\n"
+      "    <th>");
+  mBuffer->Append(key);
+  mBuffer->AppendLiteral(
+      ":</th>\n"
+      "    <td>");
+  if (mEnhanceId.EqualsLiteral("dict:")) {
+    if (strcmp(key, "ctid") == 0) {
+      MOZ_ASSERT(strcmp(value, "7") == 0);
+    } else {
+      RefPtr<DictionaryCacheEntry> dict = new DictionaryCacheEntry("temp");
+      dict->ParseMetadata(value);
+      nsAppendEscapedHTML(
+          nsPrintfCString("Hash: %s\nPattern: %s\nId: %s\nMatch-Id: ",
+                          dict->GetHash().get(), dict->GetPattern().get(),
+                          dict->GetId().get()),
+          *mBuffer);
+      dict->AppendMatchDest(*mBuffer);
+      mBuffer->AppendLiteral("\n");
+    }
+  }
+  nsAppendEscapedHTML(nsDependentCString(value), *mBuffer);
+  mBuffer->AppendLiteral(
+      "</td>\n"
+      "  </tr>\n");
+
+  return NS_OK;
+}
+
+
+NS_IMETHODIMP
+nsAboutCacheEntry::Channel::OnStartRequest(nsIRequest* request) {
+  mHexDumpState = 0;
+
+  constexpr auto buffer = "<hr/>\n<pre>"_ns;
+  uint32_t n;
+  return mOutputStream->Write(buffer.get(), buffer.Length(), &n);
+}
+
+NS_IMETHODIMP
+nsAboutCacheEntry::Channel::OnDataAvailable(nsIRequest* request,
+                                            nsIInputStream* aInputStream,
+                                            uint64_t aOffset, uint32_t aCount) {
+  uint32_t n;
+  return aInputStream->ReadSegments(&nsAboutCacheEntry::Channel::PrintCacheData,
+                                    this, aCount, &n);
+}
+
+nsresult nsAboutCacheEntry::Channel::PrintCacheData(
+    nsIInputStream* aInStream, void* aClosure, const char* aFromSegment,
+    uint32_t aToOffset, uint32_t aCount, uint32_t* aWriteCount) {
+  nsAboutCacheEntry::Channel* a =
+      static_cast<nsAboutCacheEntry::Channel*>(aClosure);
+
+  nsCString buffer;
+  HexDump(&a->mHexDumpState, aFromSegment, aCount, buffer);
+
+  uint32_t n;
+  a->mOutputStream->Write(buffer.get(), buffer.Length(), &n);
+
+  *aWriteCount = aCount;
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsAboutCacheEntry::Channel::OnStopRequest(nsIRequest* request,
+                                          nsresult result) {
+  constexpr auto buffer = "</pre>\n"_ns;
+  uint32_t n;
+  mOutputStream->Write(buffer.get(), buffer.Length(), &n);
+
+  CloseContent();
+
+  return NS_OK;
+}
+
+void nsAboutCacheEntry::Channel::CloseContent() {
+  constexpr auto buffer = "</body>\n</html>\n"_ns;
+  uint32_t n;
+  mOutputStream->Write(buffer.get(), buffer.Length(), &n);
+
+  mOutputStream->Close();
+  mOutputStream = nullptr;
+}

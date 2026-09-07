@@ -1,0 +1,452 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/CallbackObject.h"
+
+#include "WorkerPrivate.h"
+#include "WorkerScope.h"
+#include "js/ContextOptions.h"
+#include "jsapi.h"
+#include "jsfriendapi.h"
+#include "mozilla/CycleCollectedJSContext.h"
+#include "mozilla/dom/BindingUtils.h"
+#include "nsContentUtils.h"
+#include "nsGlobalWindowInner.h"
+#include "nsIScriptContext.h"
+#include "nsIScriptGlobalObject.h"
+#include "nsJSPrincipals.h"
+#include "nsJSUtils.h"
+#include "nsPIDOMWindow.h"
+#include "nsPIDOMWindowInlines.h"
+#include "xpcprivate.h"
+
+namespace mozilla::dom {
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(CallbackObject)
+  NS_INTERFACE_MAP_ENTRY(mozilla::dom::CallbackObject)
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(CallbackObject)
+NS_IMPL_CYCLE_COLLECTING_RELEASE_WITH_LAST_RELEASE(CallbackObject, Reset())
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(CallbackObject)
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(CallbackObject)
+  tmp->ClearJSReferences();
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mIncumbentGlobal)
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_BEGIN(CallbackObject)
+  JSObject* callback = tmp->CallbackPreserveColor();
+
+  if (!aRemovingAllowed) {
+    return !callback;
+  }
+
+
+  if (!callback) [[unlikely]] {
+    return true;
+  }
+  if (tmp->mIncumbentGlobal &&
+      js::NukedObjectRealm(tmp->CallbackGlobalPreserveColor())) [[unlikely]] {
+    AddForDeferredFinalization(new JSObjectsDropper(tmp));
+    DeferredFinalize(tmp->mIncumbentGlobal.forget().take());
+    return true;
+  }
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_END
+
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_IN_CC_BEGIN(CallbackObject)
+  return !tmp->mCallback;
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_IN_CC_END
+
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_THIS_BEGIN(CallbackObject)
+  return !tmp->mCallback;
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_THIS_END
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(CallbackObject)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mIncumbentGlobal)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+NS_IMPL_CYCLE_COLLECTION_TRACE_BEGIN(CallbackObject)
+  NS_IMPL_CYCLE_COLLECTION_TRACE_JS_MEMBER_CALLBACK(mCallback)
+  NS_IMPL_CYCLE_COLLECTION_TRACE_JS_MEMBER_CALLBACK(mCallbackGlobal)
+  NS_IMPL_CYCLE_COLLECTION_TRACE_JS_MEMBER_CALLBACK(mCreationStack)
+  NS_IMPL_CYCLE_COLLECTION_TRACE_JS_MEMBER_CALLBACK(mIncumbentJSGlobal)
+NS_IMPL_CYCLE_COLLECTION_TRACE_END
+
+void CallbackObjectBase::Trace(JSTracer* aTracer) {
+  JS::TraceEdge(aTracer, &mCallback, "CallbackObject.mCallback");
+  JS::TraceEdge(aTracer, &mCallbackGlobal, "CallbackObject.mCallbackGlobal");
+  JS::TraceEdge(aTracer, &mCreationStack, "CallbackObject.mCreationStack");
+  JS::TraceEdge(aTracer, &mIncumbentJSGlobal,
+                "CallbackObject.mIncumbentJSGlobal");
+}
+
+void CallbackObject::FinishSlowJSInitIfMoreThanOneOwner(JSContext* aCx) {
+  MOZ_ASSERT(mRefCnt.get() > 0);
+  if (mRefCnt.get() > 1) {
+    mozilla::HoldJSObjectsWithKey(this);
+    if (JS::IsAsyncStackCaptureEnabledForRealm(aCx)) {
+      JS::Rooted<JSObject*> stack(aCx);
+      if (!JS::CaptureCurrentStack(aCx, &stack)) {
+        JS_ClearPendingException(aCx);
+      }
+      mCreationStack = stack;
+    }
+    mIncumbentGlobal = GetIncumbentGlobal();
+    if (mIncumbentGlobal) {
+      mIncumbentJSGlobal = mIncumbentGlobal->GetGlobalJSObjectPreserveColor();
+    }
+  } else {
+    ClearJSReferences();
+  }
+}
+
+JSObject* CallbackObjectBase::Callback(JSContext* aCx) {
+  JSObject* callback = CallbackOrNull();
+  if (!callback) {
+    callback = JS_NewDeadWrapper(aCx);
+  }
+
+  MOZ_DIAGNOSTIC_ASSERT(callback);
+  return callback;
+}
+
+void CallbackObjectBase::GetDescription(nsACString& aOutString) {
+  JSObject* wrappedCallback = CallbackOrNull();
+  if (!wrappedCallback) {
+    aOutString.Append("<callback from a nuked compartment>");
+    return;
+  }
+
+  JS::Rooted<JSObject*> unwrappedCallback(
+      RootingCx(), js::CheckedUnwrapStatic(wrappedCallback));
+  if (!unwrappedCallback) {
+    aOutString.Append("<not a function>");
+    return;
+  }
+
+  AutoJSAPI jsapi;
+  jsapi.Init();
+  JSContext* cx = jsapi.cx();
+
+  JS::Rooted<JSObject*> rootedCallback(cx, unwrappedCallback);
+  JSAutoRealm ar(cx, rootedCallback);
+
+  JS::Rooted<JSFunction*> rootedFunction(cx,
+                                         JS_GetObjectFunction(rootedCallback));
+  if (!rootedFunction) {
+    aOutString.Append("<not a function>");
+    return;
+  }
+
+  JS::Rooted<JSString*> displayId(
+      cx, JS_GetMaybePartialFunctionDisplayId(rootedFunction));
+  if (displayId) {
+    nsAutoJSString funcNameStr;
+    if (funcNameStr.init(cx, displayId)) {
+      if (funcNameStr.IsEmpty()) {
+        aOutString.Append("<empty name>");
+      } else {
+        AppendUTF16toUTF8(funcNameStr, aOutString);
+      }
+    } else {
+      aOutString.Append("<function name string failed to materialize>");
+      jsapi.ClearException();
+    }
+  } else {
+    aOutString.Append("<anonymous>");
+  }
+
+  JS::Rooted<JSScript*> rootedScript(cx,
+                                     JS_GetFunctionScript(cx, rootedFunction));
+  if (!rootedScript) {
+    return;
+  }
+
+  aOutString.Append(" (");
+  aOutString.Append(JS_GetScriptFilename(rootedScript));
+  aOutString.Append(":");
+  aOutString.AppendInt(JS_GetScriptBaseLineNumber(cx, rootedScript));
+  aOutString.Append(")");
+}
+
+nsIGlobalObject* CallSetup::GetActiveGlobalObjectForCall(
+    JS::Handle<JSObject*> callbackOrGlobal, bool aIsMainThread,
+    bool aIsJSImplementedWebIDL, ErrorResult& aRv) {
+  nsGlobalWindowInner* win = aIsMainThread && !aIsJSImplementedWebIDL
+                                 ? xpc::WindowGlobalOrNull(callbackOrGlobal)
+                                 : nullptr;
+  if (win) {
+    if (!win->HasActiveDocument()) {
+      aRv.ThrowNotSupportedError(
+          "Refusing to execute function from window whose document is no "
+          "longer active.");
+      return nullptr;
+    }
+    return win;
+  }
+
+  auto* globalObject = xpc::NativeGlobal(callbackOrGlobal);
+  MOZ_ASSERT(globalObject);
+  return globalObject;
+}
+
+bool CallSetup::CheckBeforeExecution(nsIGlobalObject* aGlobalObject,
+                                     JSObject* aCallbackOrGlobal,
+                                     bool aIsJSImplementedWebIDL,
+                                     ErrorResult& aRv) {
+  if (aGlobalObject->IsScriptForbidden(aCallbackOrGlobal,
+                                       aIsJSImplementedWebIDL)) {
+    aRv.ThrowNotSupportedError(
+        "Refusing to execute function from global in which script is "
+        "disabled.");
+    return false;
+  }
+
+  if (!aGlobalObject->HasJSGlobal()) {
+    aRv.ThrowNotSupportedError(
+        "Refusing to execute function from global which is being torn down.");
+    return false;
+  }
+
+  return true;
+}
+
+void CallSetup::SetupForExecution(nsIGlobalObject* aGlobalObject,
+                                  nsIGlobalObject* aIncumbentGlobal,
+                                  JS::Handle<JSObject*> aCallbackOrGlobal,
+                                  JS::Handle<JSObject*> aCallbackGlobal,
+                                  JS::Handle<JSObject*> aCreationStack,
+                                  nsIPrincipal* aWebIDLCallerPrincipal,
+                                  const char* aExecutionReason,
+                                  ErrorResult& aRv) {
+  AutoAllowLegacyScriptExecution exemption;
+  mAutoEntryScript.emplace(aGlobalObject, aExecutionReason, mIsMainThread);
+  mAutoEntryScript->SetWebIDLCallerPrincipal(aWebIDLCallerPrincipal);
+
+  if (aIncumbentGlobal) {
+    if (!aIncumbentGlobal->HasJSGlobal()) {
+      aRv.ThrowNotSupportedError(
+          "Refusing to execute function because our incumbent global is being "
+          "torn down.");
+      return;
+    }
+    mAutoIncumbentScript.emplace(aIncumbentGlobal);
+  }
+
+  JSContext* cx = mAutoEntryScript->cx();
+
+  mRootedCallable.emplace(cx, aCallbackOrGlobal);
+
+  if (aCreationStack) {
+    mAsyncStackSetter.emplace(cx, aCreationStack, aExecutionReason);
+  }
+
+  mAr.emplace(cx, aCallbackGlobal);
+
+  mCx = cx;
+
+  mCallContext.emplace(cx, nullptr);
+}
+
+CallSetup::CallSetup(ErrorResult& aRv,
+                     CallbackObjectBase::ExceptionHandling aExceptionHandling,
+                     JS::Realm* aRealm, bool aIsMainThread,
+                     CycleCollectedJSContext* aCCJS)
+    : mCx(nullptr),
+      mRealm(aRealm),
+      mErrorResult(aRv),
+      mExceptionHandling(aExceptionHandling),
+      mIsMainThread(aIsMainThread) {
+  MOZ_ASSERT(aCCJS);
+  aCCJS->EnterMicroTask();
+}
+
+CallSetup::CallSetup(CallbackObjectBase* aCallback, ErrorResult& aRv,
+                     const char* aExecutionReason,
+                     CallbackObjectBase::ExceptionHandling aExceptionHandling,
+                     JS::Realm* aRealm, bool aIsJSImplementedWebIDL)
+    : CallSetup(aCallback, aRv, aExecutionReason, aExceptionHandling, aRealm,
+                aIsJSImplementedWebIDL, CycleCollectedJSContext::Get()) {}
+
+CallSetup::CallSetup(CallbackObjectBase* aCallback, ErrorResult& aRv,
+                     const char* aExecutionReason,
+                     CallbackObjectBase::ExceptionHandling aExceptionHandling,
+                     JS::Realm* aRealm, bool aIsJSImplementedWebIDL,
+                     CycleCollectedJSContext* aCCJS)
+    : CallSetup(aRv, aExceptionHandling, aRealm, NS_IsMainThread(), aCCJS) {
+  MOZ_ASSERT_IF(
+      aExceptionHandling == CallbackObjectBase::eReportExceptions ||
+          aExceptionHandling == CallbackObjectBase::eRethrowExceptions,
+      !aRealm);
+
+  JS::RootedTuple<JSObject*, JSObject*, JSObject*> roots(aCCJS->RootingCx());
+
+  nsIPrincipal* webIDLCallerPrincipal = nullptr;
+  if (aIsJSImplementedWebIDL) {
+    webIDLCallerPrincipal =
+        nsContentUtils::SubjectPrincipalOrSystemIfNativeCaller();
+  }
+
+  JSObject* wrappedCallback = aCallback->CallbackPreserveColor();
+  if (!wrappedCallback) {
+    aRv.ThrowNotSupportedError(
+        "Cannot execute callback from a nuked compartment.");
+    return;
+  }
+
+  nsIGlobalObject* globalObject = nullptr;
+
+  {
+    JS::RootedField<JSObject*, 0> realCallback(
+        roots, js::UncheckedUnwrap(wrappedCallback));
+
+    globalObject = GetActiveGlobalObjectForCall(realCallback, mIsMainThread,
+                                                aIsJSImplementedWebIDL, aRv);
+    if (!globalObject) {
+      MOZ_ASSERT(aRv.Failed());
+      return;
+    }
+
+    if (!CheckBeforeExecution(globalObject, realCallback,
+                              aIsJSImplementedWebIDL, aRv)) {
+      return;
+    }
+  }
+
+  nsIGlobalObject* incumbent = aCallback->IncumbentGlobalOrNull();
+
+  JS::RootedField<JSObject*, 0> rootedCallback(roots,
+                                               aCallback->CallbackOrNull());
+  JS::RootedField<JSObject*, 1> rootedCallbackGlobal(
+      roots, aCallback->CallbackGlobalOrNull());
+  JS::RootedField<JSObject*, 2> rootedCreationStack(
+      roots, aCallback->GetCreationStack());
+  SetupForExecution(globalObject, incumbent, rootedCallback,
+                    rootedCallbackGlobal, rootedCreationStack,
+                    webIDLCallerPrincipal, aExecutionReason, aRv);
+}
+
+CallSetup::CallSetup(JS::Handle<JSObject*> aCallbackGlobal,
+                     nsIGlobalObject* aIncumbentGlobal,
+                     JS::Handle<JSObject*> aCreationStack, ErrorResult& aRv,
+                     const char* aExecutionReason,
+                     CallbackObjectBase::ExceptionHandling aExceptionHandling,
+                     JS::Realm* aRealm)
+    : CallSetup(aRv, aExceptionHandling, aRealm, NS_IsMainThread(),
+                CycleCollectedJSContext::Get()) {
+  MOZ_ASSERT_IF(aExceptionHandling == CallbackFunction::eReportExceptions ||
+                    aExceptionHandling == CallbackFunction::eRethrowExceptions,
+                !aRealm);
+
+  MOZ_RELEASE_ASSERT(aCallbackGlobal);
+  nsIGlobalObject* globalObject = GetActiveGlobalObjectForCall(
+      aCallbackGlobal, mIsMainThread, false, aRv);
+  if (!globalObject) {
+    MOZ_ASSERT(aRv.Failed());
+    return;
+  }
+
+  if (!CheckBeforeExecution(globalObject, aCallbackGlobal,
+                            false, aRv)) {
+    return;
+  }
+
+  SetupForExecution(globalObject, aIncumbentGlobal, aCallbackGlobal,
+                    aCallbackGlobal, aCreationStack,
+                    nullptr, aExecutionReason, aRv);
+}
+
+bool CallSetup::ShouldRethrowException(JS::Handle<JS::Value> aException) {
+  if (mExceptionHandling == CallbackObjectBase::eRethrowExceptions) {
+    MOZ_ASSERT(!mRealm);
+    return true;
+  }
+
+  MOZ_ASSERT(mRealm);
+
+
+  if (!aException.isObject()) {
+    return false;
+  }
+
+  JS::Rooted<JSObject*> obj(mCx, &aException.toObject());
+  obj = js::UncheckedUnwrap(obj,  false);
+  return js::GetNonCCWObjectRealm(obj) == mRealm;
+}
+
+CallSetup::~CallSetup() {
+  mAr.reset();
+
+  if (mCx) {
+    bool needToDealWithException = mAutoEntryScript->HasException();
+    if ((mRealm &&
+         mExceptionHandling == CallbackObjectBase::eRethrowContentExceptions) ||
+        mExceptionHandling == CallbackObjectBase::eRethrowExceptions) {
+      mErrorResult.MightThrowJSException();
+      if (needToDealWithException) {
+        JS::Rooted<JS::Value> exn(mCx);
+        if (mAutoEntryScript->PeekException(&exn) &&
+            ShouldRethrowException(exn)) {
+          mAutoEntryScript->ClearException();
+          MOZ_ASSERT(!mAutoEntryScript->HasException());
+          mErrorResult.ThrowJSException(mCx, exn);
+          needToDealWithException = false;
+        }
+      }
+    }
+
+    if (needToDealWithException) {
+      if (mErrorResult.IsJSContextException()) {
+
+        mErrorResult.Throw(NS_ERROR_UNEXPECTED);
+      }
+    }
+  }
+
+  mAutoIncumbentScript.reset();
+  mAutoEntryScript.reset();
+
+  CycleCollectedJSContext* ccjs = CycleCollectedJSContext::Get();
+  if (ccjs) {
+    ccjs->LeaveMicroTask();
+  }
+}
+
+already_AddRefed<nsISupports> CallbackObjectHolderBase::ToXPCOMCallback(
+    CallbackObject* aCallback, const nsIID& aIID) const {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (!aCallback) {
+    return nullptr;
+  }
+
+  AutoJSAPI jsapi;
+  jsapi.Init();
+  JSContext* cx = jsapi.cx();
+
+  JS::Rooted<JSObject*> callback(cx, aCallback->CallbackOrNull());
+  if (!callback) {
+    return nullptr;
+  }
+
+  JSAutoRealm ar(cx, aCallback->CallbackGlobalOrNull());
+
+  RefPtr<nsXPCWrappedJS> wrappedJS;
+  nsresult rv = nsXPCWrappedJS::GetNewOrUsed(cx, callback, aIID,
+                                             getter_AddRefs(wrappedJS));
+  if (NS_FAILED(rv) || !wrappedJS) {
+    return nullptr;
+  }
+
+  nsCOMPtr<nsISupports> retval;
+  rv = wrappedJS->QueryInterface(aIID, getter_AddRefs(retval));
+  if (NS_FAILED(rv)) {
+    return nullptr;
+  }
+
+  return retval.forget();
+}
+
+}  

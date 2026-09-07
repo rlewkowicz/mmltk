@@ -1,0 +1,98 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_image_ImageOps_h
+#define mozilla_image_ImageOps_h
+
+#include "ImageMetadata.h"
+#include "nsCOMPtr.h"
+#include "nsRect.h"
+
+class gfxDrawable;
+class imgIContainer;
+class nsIInputStream;
+
+namespace mozilla {
+
+namespace gfx {
+class SourceSurface;
+}
+
+namespace image {
+
+class Image;
+struct Orientation;
+class SourceBuffer;
+enum class DecoderType : uint8_t;
+
+class ImageOps {
+ public:
+  class ImageBuffer {
+   public:
+    NS_INLINE_DECL_THREADSAFE_REFCOUNTING(ImageOps::ImageBuffer);
+
+   protected:
+    friend class ImageOps;
+
+    ImageBuffer() = default;
+    virtual ~ImageBuffer() = default;
+
+    virtual already_AddRefed<SourceBuffer> GetSourceBuffer() const = 0;
+  };
+
+  static already_AddRefed<Image> Freeze(Image* aImage);
+  static already_AddRefed<imgIContainer> Freeze(imgIContainer* aImage);
+
+  static already_AddRefed<Image> Clip(
+      Image* aImage, nsIntRect aClip,
+      const Maybe<nsSize>& aSVGViewportSize = Nothing());
+  static already_AddRefed<imgIContainer> Clip(
+      imgIContainer* aImage, nsIntRect aClip,
+      const Maybe<nsSize>& aSVGViewportSize = Nothing());
+
+  static already_AddRefed<Image> Orient(Image* aImage,
+                                        Orientation aOrientation);
+  static already_AddRefed<imgIContainer> Orient(imgIContainer* aImage,
+                                                Orientation aOrientation);
+
+  static already_AddRefed<imgIContainer> Unorient(imgIContainer* aImage);
+
+  static already_AddRefed<imgIContainer> CreateFromDrawable(
+      gfxDrawable* aDrawable);
+
+  static already_AddRefed<ImageBuffer> CreateImageBuffer(
+      already_AddRefed<nsIInputStream> aInputStream);
+
+  static nsresult DecodeMetadata(already_AddRefed<nsIInputStream> aInputStream,
+                                 const nsACString& aMimeType,
+                                 ImageMetadata& aMetadata);
+
+  static nsresult DecodeMetadata(ImageBuffer* aBuffer,
+                                 const nsACString& aMimeType,
+                                 ImageMetadata& aMetadata);
+
+  static already_AddRefed<gfx::SourceSurface> DecodeToSurface(
+      already_AddRefed<nsIInputStream> aInputStream,
+      const nsACString& aMimeType, uint32_t aFlags,
+      const Maybe<gfx::IntSize>& aSize = Nothing());
+
+  static already_AddRefed<gfx::SourceSurface> DecodeToSurface(
+      ImageBuffer* aBuffer, const nsACString& aMimeType, uint32_t aFlags,
+      const Maybe<gfx::IntSize>& aSize = Nothing());
+
+  static already_AddRefed<gfx::SourceSurface> DecodeToSurface(
+      SourceBuffer* aSourceBuffer, image::DecoderType aDecoderType,
+      uint32_t aFlags, const Maybe<gfx::IntSize>& aSize = Nothing());
+
+ private:
+  class ImageBufferImpl;
+
+  virtual ~ImageOps() = 0;
+};
+
+}  
+}  
+
+#endif  // mozilla_image_ImageOps_h

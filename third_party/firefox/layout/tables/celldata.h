@@ -1,0 +1,295 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef CellData_h_
+#define CellData_h_
+
+#include <stdint.h>
+
+#include <algorithm>
+
+#include "mozilla/WritingModes.h"
+#include "mozilla/gfx/Types.h"
+#include "nsCoord.h"
+#include "nsISupports.h"
+#include "nsITableCellLayout.h"  // for MAX_COLSPAN / MAX_ROWSPAN
+
+class nsTableCellFrame;
+class nsCellMap;
+class BCCellData;
+
+class CellData {
+ public:
+  void Init(nsTableCellFrame* aCellFrame);
+
+  bool IsOrig() const;
+
+  bool IsDead() const;
+
+  bool IsSpan() const;
+
+  bool IsRowSpan() const;
+
+  bool IsZeroRowSpan() const;
+
+  void SetZeroRowSpan(bool aIsZero);
+
+  uint32_t GetRowSpanOffset() const;
+
+  void SetRowSpanOffset(uint32_t aSpan);
+
+  bool IsColSpan() const;
+
+  uint32_t GetColSpanOffset() const;
+
+  void SetColSpanOffset(uint32_t aSpan);
+
+  bool IsOverlap() const;
+
+  void SetOverlap(bool aOverlap);
+
+  nsTableCellFrame* GetCellFrame() const;
+
+ private:
+  friend class nsCellMap;
+  friend class BCCellData;
+
+  explicit CellData(nsTableCellFrame* aOrigCell);
+
+  ~CellData();  
+
+ protected:
+  union {
+    nsTableCellFrame* mOrigCell;
+    uintptr_t mBits;
+  };
+};
+
+enum BCBorderOwner {
+  eTableOwner = 0,
+  eColGroupOwner = 1,
+  eAjaColGroupOwner = 2,  
+  eColOwner = 3,
+  eAjaColOwner = 4,  
+  eRowGroupOwner = 5,
+  eAjaRowGroupOwner = 6,  
+  eRowOwner = 7,
+  eAjaRowOwner = 8,  
+  eCellOwner = 9,
+  eAjaCellOwner = 10  
+};
+
+#define MAX_BORDER_WIDTH nscoord((1u << (sizeof(uint16_t) * 8)) - 1)
+
+static inline nscoord BC_BORDER_START_HALF(nscoord aCoord) {
+  return aCoord - aCoord / 2;
+}
+static inline nscoord BC_BORDER_END_HALF(nscoord aCoord) { return aCoord / 2; }
+
+class BCData {
+ public:
+  BCData();
+
+  ~BCData() = default;
+
+  nscoord GetIStartEdge(BCBorderOwner& aOwner, bool& aStart) const;
+
+  void SetIStartEdge(BCBorderOwner aOwner, nscoord aSize, bool aStart);
+
+  nscoord GetBStartEdge(BCBorderOwner& aOwner, bool& aStart) const;
+
+  void SetBStartEdge(BCBorderOwner aOwner, nscoord aSize, bool aStart);
+
+  nscoord GetCorner(mozilla::LogicalSide& aOwnerSide, bool& aBevel) const;
+
+  void SetCorner(nscoord aSubSize, mozilla::LogicalSide aOwner, bool aBevel);
+
+  inline bool IsIStartStart() const { return (bool)mIStartStart; }
+
+  inline void SetIStartStart(bool aValue) { mIStartStart = aValue; }
+
+  inline bool IsBStartStart() const { return (bool)mBStartStart; }
+
+  inline void SetBStartStart(bool aValue) { mBStartStart = aValue; }
+
+ protected:
+  nscoord mIStartSize;        
+  nscoord mBStartSize;        
+  nscoord mCornerSubSize;     
+  unsigned mIStartOwner : 4;  
+  unsigned mBStartOwner : 4;  
+  unsigned mIStartStart : 1;  
+  unsigned mBStartStart : 1;  
+  unsigned mCornerSide : 2;   
+  unsigned mCornerBevel : 1;  
+};
+
+class BCCellData : public CellData {
+ public:
+  explicit BCCellData(nsTableCellFrame* aOrigCell);
+  ~BCCellData();
+
+  BCData mData;
+};
+
+
+#define COL_SPAN_SHIFT 22
+#define ROW_SPAN_SHIFT 3
+
+#define COL_SPAN_OFFSET (0x3FF << COL_SPAN_SHIFT)
+#define ROW_SPAN_OFFSET (0xFFFF << ROW_SPAN_SHIFT)
+
+#define SPAN 0x00000001                       // there a row or col span
+#define ROW_SPAN 0x00000002                   // there is a row span
+#define ROW_SPAN_0 0x00000004                 // the row span is 0
+#define COL_SPAN (1 << (COL_SPAN_SHIFT - 2))  // there is a col span
+#define OVERLAP \
+  (1 << (COL_SPAN_SHIFT - 1))  // there is a row span and
+
+inline nsTableCellFrame* CellData::GetCellFrame() const {
+  if (SPAN != (SPAN & mBits)) {
+    return mOrigCell;
+  }
+  return nullptr;
+}
+
+inline void CellData::Init(nsTableCellFrame* aCellFrame) {
+  mOrigCell = aCellFrame;
+}
+
+inline bool CellData::IsOrig() const {
+  return ((nullptr != mOrigCell) && (SPAN != (SPAN & mBits)));
+}
+
+inline bool CellData::IsDead() const { return (0 == mBits); }
+
+inline bool CellData::IsSpan() const { return (SPAN == (SPAN & mBits)); }
+
+inline bool CellData::IsRowSpan() const {
+  return (SPAN == (SPAN & mBits)) && (ROW_SPAN == (ROW_SPAN & mBits));
+}
+
+inline bool CellData::IsZeroRowSpan() const {
+  return (SPAN == (SPAN & mBits)) && (ROW_SPAN == (ROW_SPAN & mBits)) &&
+         (ROW_SPAN_0 == (ROW_SPAN_0 & mBits));
+}
+
+inline void CellData::SetZeroRowSpan(bool aIsZeroSpan) {
+  if (SPAN == (SPAN & mBits)) {
+    if (aIsZeroSpan) {
+      mBits |= ROW_SPAN_0;
+    } else {
+      mBits &= ~ROW_SPAN_0;
+    }
+  }
+}
+
+inline uint32_t CellData::GetRowSpanOffset() const {
+  if ((SPAN == (SPAN & mBits)) && ((ROW_SPAN == (ROW_SPAN & mBits)))) {
+    return (uint32_t)((mBits & ROW_SPAN_OFFSET) >> ROW_SPAN_SHIFT);
+  }
+  return 0;
+}
+
+inline void CellData::SetRowSpanOffset(uint32_t aSpan) {
+  MOZ_ASSERT(aSpan > 0, "a zero-sized span is nonsensical");
+  MOZ_ASSERT(aSpan <= MAX_ROWSPAN, "span shouldn't exceed what we can handle");
+  aSpan = std::min(aSpan, static_cast<uint32_t>(MAX_ROWSPAN));
+
+  mBits &= ~ROW_SPAN_OFFSET;
+  mBits |= (aSpan << ROW_SPAN_SHIFT);
+  mBits |= SPAN;
+  mBits |= ROW_SPAN;
+}
+
+inline bool CellData::IsColSpan() const {
+  return (SPAN == (SPAN & mBits)) && (COL_SPAN == (COL_SPAN & mBits));
+}
+
+inline uint32_t CellData::GetColSpanOffset() const {
+  if ((SPAN == (SPAN & mBits)) && ((COL_SPAN == (COL_SPAN & mBits)))) {
+    return (uint32_t)((mBits & COL_SPAN_OFFSET) >> COL_SPAN_SHIFT);
+  }
+  return 0;
+}
+
+inline void CellData::SetColSpanOffset(uint32_t aSpan) {
+  MOZ_ASSERT(aSpan > 0, "a zero-sized span is nonsensical");
+  MOZ_ASSERT(aSpan <= MAX_COLSPAN, "span shouldn't exceed what we can handle");
+  aSpan = std::min(aSpan, static_cast<uint32_t>(MAX_COLSPAN));
+
+  mBits &= ~COL_SPAN_OFFSET;
+  mBits |= (aSpan << COL_SPAN_SHIFT);
+
+  mBits |= SPAN;
+  mBits |= COL_SPAN;
+}
+
+inline bool CellData::IsOverlap() const {
+  return (SPAN == (SPAN & mBits)) && (OVERLAP == (OVERLAP & mBits));
+}
+
+inline void CellData::SetOverlap(bool aOverlap) {
+  if (SPAN == (SPAN & mBits)) {
+    if (aOverlap) {
+      mBits |= OVERLAP;
+    } else {
+      mBits &= ~OVERLAP;
+    }
+  }
+}
+
+inline BCData::BCData() {
+  mIStartOwner = mBStartOwner = eCellOwner;
+  SetBStartStart(true);
+  SetIStartStart(true);
+  mIStartSize = mCornerSubSize = mBStartSize = 0;
+  mCornerSide = static_cast<uint8_t>(mozilla::LogicalSide::BStart);
+  mCornerBevel = false;
+}
+
+inline nscoord BCData::GetIStartEdge(BCBorderOwner& aOwner,
+                                     bool& aStart) const {
+  aOwner = (BCBorderOwner)mIStartOwner;
+  aStart = IsIStartStart();
+
+  return (nscoord)mIStartSize;
+}
+
+inline void BCData::SetIStartEdge(BCBorderOwner aOwner, nscoord aSize,
+                                  bool aStart) {
+  mIStartOwner = aOwner;
+  mIStartSize = (aSize > MAX_BORDER_WIDTH) ? MAX_BORDER_WIDTH : aSize;
+  SetIStartStart(aStart);
+}
+
+inline nscoord BCData::GetBStartEdge(BCBorderOwner& aOwner,
+                                     bool& aStart) const {
+  aOwner = (BCBorderOwner)mBStartOwner;
+  aStart = IsBStartStart();
+
+  return (nscoord)mBStartSize;
+}
+
+inline void BCData::SetBStartEdge(BCBorderOwner aOwner, nscoord aSize,
+                                  bool aStart) {
+  mBStartOwner = aOwner;
+  mBStartSize = (aSize > MAX_BORDER_WIDTH) ? MAX_BORDER_WIDTH : aSize;
+  SetBStartStart(aStart);
+}
+
+inline nscoord BCData::GetCorner(mozilla::LogicalSide& aOwnerSide,
+                                 bool& aBevel) const {
+  aOwnerSide = mozilla::LogicalSide(mCornerSide);
+  aBevel = (bool)mCornerBevel;
+  return mCornerSubSize;
+}
+
+inline void BCData::SetCorner(nscoord aSubSize, mozilla::LogicalSide aOwnerSide,
+                              bool aBevel) {
+  mCornerSubSize = aSubSize;
+  mCornerSide = static_cast<uint8_t>(aOwnerSide);
+  mCornerBevel = aBevel;
+}
+
+#endif

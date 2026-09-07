@@ -1,0 +1,113 @@
+// Copyright 2012 Google Inc. All Rights Reserved.
+// Use of this source code is governed by a BSD-style license
+
+#if !defined(WEBP_DEC_VP8LI_DEC_H_)
+#define WEBP_DEC_VP8LI_DEC_H_
+
+#include <string.h>     // for memcpy()
+
+#include "src/dec/vp8_dec.h"
+#include "src/dec/webpi_dec.h"
+#include "src/utils/bit_reader_utils.h"
+#include "src/utils/color_cache_utils.h"
+#include "src/utils/huffman_utils.h"
+#include "src/utils/rescaler_utils.h"
+#include "src/webp/decode.h"
+#include "src/webp/format_constants.h"
+#include "src/webp/types.h"
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+typedef enum {
+  READ_DATA = 0,
+  READ_HDR = 1,
+  READ_DIM = 2
+} VP8LDecodeState;
+
+typedef struct VP8LTransform VP8LTransform;
+struct VP8LTransform {
+  VP8LImageTransformType type;   
+  int                    bits;   
+  int                    xsize;  
+  int                    ysize;  
+  uint32_t*              data;   
+};
+
+typedef struct {
+  int             color_cache_size;
+  VP8LColorCache  color_cache;
+  VP8LColorCache  saved_color_cache;  
+
+  int             huffman_mask;
+  int             huffman_subsample_bits;
+  int             huffman_xsize;
+  uint32_t*       huffman_image;
+  int             num_htree_groups;
+  HTreeGroup*     htree_groups;
+  HuffmanTables   huffman_tables;
+} VP8LMetadata;
+
+typedef struct VP8LDecoder VP8LDecoder;
+struct VP8LDecoder {
+  VP8StatusCode    status;
+  VP8LDecodeState  state;
+  VP8Io*           io;
+
+  const WebPDecBuffer* output;    
+
+  uint32_t*        pixels;        
+  uint32_t*        argb_cache;    
+
+  VP8LBitReader    br;
+  int              incremental;   
+  VP8LBitReader    saved_br;      
+  int              saved_last_pixel;
+
+  int              width;
+  int              height;
+  int              last_row;      
+  int              last_pixel;    
+  int              last_out_row;  
+
+  VP8LMetadata     hdr;
+
+  int              next_transform;
+  VP8LTransform    transforms[NUM_TRANSFORMS];
+  uint32_t         transforms_seen;
+
+  uint8_t*         rescaler_memory;  
+  WebPRescaler*    rescaler;         
+};
+
+
+struct ALPHDecoder;  
+
+
+WEBP_NODISCARD int VP8LDecodeAlphaHeader(struct ALPHDecoder* const alph_dec,
+                                         const uint8_t* const data,
+                                         size_t data_size);
+
+WEBP_NODISCARD int VP8LDecodeAlphaImageStream(
+    struct ALPHDecoder* const alph_dec, int last_row);
+
+WEBP_NODISCARD VP8LDecoder* VP8LNew(void);
+
+WEBP_NODISCARD int VP8LDecodeHeader(VP8LDecoder* const dec, VP8Io* const io);
+
+WEBP_NODISCARD int VP8LDecodeImage(VP8LDecoder* const dec);
+
+void VP8LDelete(VP8LDecoder* const dec);
+
+WEBP_NODISCARD int ReadHuffmanCodesHelper(
+    int color_cache_bits, int num_htree_groups, int num_htree_groups_max,
+    const int* const mapping, VP8LDecoder* const dec,
+    HuffmanTables* const huffman_tables, HTreeGroup** const htree_groups);
+
+
+#if defined(__cplusplus)
+}    
+#endif
+
+#endif

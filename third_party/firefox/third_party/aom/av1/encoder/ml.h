@@ -1,0 +1,70 @@
+/*
+ * Copyright (c) 2016, Alliance for Open Media. All rights reserved.
+ *
+ * This source code is subject to the terms of the BSD 2 Clause License and
+ * the Alliance for Open Media Patent License 1.0. If the BSD 2 Clause License
+ * was not distributed with this source code in the LICENSE file, you can
+ * obtain it at www.aomedia.org/license/software. If the Alliance for Open
+ * Media Patent License 1.0 was not distributed with this source code in the
+ * PATENTS file, you can obtain it at www.aomedia.org/license/patent.
+ */
+
+#if !defined(AOM_AV1_ENCODER_ML_H_)
+#define AOM_AV1_ENCODER_ML_H_
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+#include "config/av1_rtcd.h"
+
+#define NN_MAX_HIDDEN_LAYERS 10
+#define NN_MAX_NODES_PER_LAYER 128
+
+struct NN_CONFIG {
+  int num_inputs;         
+  int num_outputs;        
+  int num_hidden_layers;  
+  int num_hidden_nodes[NN_MAX_HIDDEN_LAYERS];
+  const float *weights[NN_MAX_HIDDEN_LAYERS + 1];
+  const float *bias[NN_MAX_HIDDEN_LAYERS + 1];
+};
+
+#if CONFIG_NN_V2
+struct FC_LAYER {
+  const int num_inputs;   
+  const int num_outputs;  
+
+  float *weights;               
+  float *bias;                  
+  const ACTIVATION activation;  
+
+  float *output;  
+  float *dY;      
+  float *dW;      
+  float *db;      
+};
+
+struct NN_CONFIG_V2 {
+  const int num_hidden_layers;  
+  FC_LAYER layer[NN_MAX_HIDDEN_LAYERS + 1];  
+  const int num_logits;                      
+  float *logits;    
+  const LOSS loss;  
+};
+
+void av1_nn_predict_v2(const float *features, NN_CONFIG_V2 *nn_config,
+                       int reduce_prec, float *output);
+#endif
+
+void av1_nn_softmax(const float *input, float *output, int n);
+
+void av1_nn_fast_softmax_16_c(const float *input, float *output);
+
+void av1_nn_output_prec_reduce(float *const output, int num_output);
+
+#if defined(__cplusplus)
+}  
+#endif
+
+#endif

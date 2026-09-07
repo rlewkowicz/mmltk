@@ -1,0 +1,131 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsEditingSession_h_
+#define nsEditingSession_h_
+
+#include "nsCOMPtr.h"               // for nsCOMPtr
+#include "nsISupportsImpl.h"        // for NS_DECL_ISUPPORTS
+#include "nsIWeakReferenceUtils.h"  // for nsWeakPtr
+#include "nsWeakReference.h"        // for nsSupportsWeakReference, etc
+#include "nscore.h"                 // for nsresult
+
+#ifndef __gen_nsIWebProgressListener_h__
+#  include "nsIWebProgressListener.h"
+#endif
+
+#ifndef __gen_nsIEditingSession_h__
+#  include "nsIEditingSession.h"  // for NS_DECL_NSIEDITINGSESSION, etc
+#endif
+
+#include "nsString.h"  // for nsCString
+
+class mozIDOMWindowProxy;
+class nsBaseCommandController;
+class nsIDOMWindow;
+class nsISupports;
+class nsITimer;
+class nsIChannel;
+class nsIControllers;
+class nsIDocShell;
+class nsIWebProgress;
+class nsIPIDOMWindowOuter;
+class nsIPIDOMWindowInner;
+
+namespace mozilla {
+class ComposerCommandsUpdater;
+class HTMLEditor;
+}  
+
+class nsEditingSession final : public nsIEditingSession,
+                               public nsIWebProgressListener,
+                               public nsSupportsWeakReference {
+ public:
+  nsEditingSession();
+
+  NS_DECL_ISUPPORTS
+
+  NS_DECL_NSIWEBPROGRESSLISTENER
+
+  NS_DECL_NSIEDITINGSESSION
+
+  nsresult DetachFromWindow(nsPIDOMWindowOuter* aWindow);
+
+  nsresult ReattachToWindow(nsPIDOMWindowOuter* aWindow);
+
+ protected:
+  virtual ~nsEditingSession();
+
+  typedef already_AddRefed<nsBaseCommandController> (*ControllerCreatorFn)();
+
+  nsresult SetupEditorCommandController(
+      ControllerCreatorFn aControllerCreatorFn, mozIDOMWindowProxy* aWindow,
+      nsISupportsWeakReference* aContext, uint32_t* aControllerId);
+
+  nsresult SetContextOnControllerById(nsIControllers* aControllers,
+                                      nsISupportsWeakReference* aContext,
+                                      uint32_t aID);
+
+  nsresult SetEditorOnControllers(nsPIDOMWindowOuter& aWindow,
+                                  mozilla::HTMLEditor* aEditor);
+
+  MOZ_CAN_RUN_SCRIPT nsresult SetupEditorOnWindow(nsPIDOMWindowOuter& aWindow);
+
+  nsresult PrepareForEditing(nsPIDOMWindowOuter* aWindow);
+
+  static void TimerCallback(nsITimer* aTimer, void* aClosure);
+  nsCOMPtr<nsITimer> mLoadBlankDocTimer;
+
+  nsresult StartDocumentLoad(nsIWebProgress* aWebProgress,
+                             bool isToBeMadeEditable);
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  nsresult EndDocumentLoad(nsIWebProgress* aWebProgress, nsIChannel* aChannel,
+                           nsresult aStatus, bool isToBeMadeEditable);
+  nsresult StartPageLoad(nsIChannel* aChannel);
+  nsresult EndPageLoad(nsIWebProgress* aWebProgress, nsIChannel* aChannel,
+                       nsresult aStatus);
+
+  bool IsProgressForTargetDocument(nsIWebProgress* aWebProgress);
+
+  void RemoveEditorControllers(nsPIDOMWindowOuter* aWindow);
+  void RemoveWebProgressListener(nsPIDOMWindowOuter* aWindow);
+  void RestoreAnimationMode(nsPIDOMWindowOuter* aWindow);
+  void RemoveListenersAndControllers(nsPIDOMWindowOuter* aWindow,
+                                     mozilla::HTMLEditor* aHTMLEditor);
+
+  nsresult DisableJS(nsPIDOMWindowInner* aWindow);
+
+  nsresult RestoreJS(nsPIDOMWindowInner* aWindow);
+
+ protected:
+  bool mDoneSetup;  
+
+  bool mCanCreateEditor;
+
+  bool mInteractive;
+  bool mMakeWholeDocumentEditable;
+
+  bool mDisabledJS;
+
+  bool mScriptsEnabled;
+
+  bool mProgressListenerRegistered;
+
+  uint16_t mImageAnimationMode;
+
+  RefPtr<mozilla::ComposerCommandsUpdater> mComposerCommandsUpdater;
+
+  nsCString mEditorType;
+  uint32_t mEditorFlags;
+  uint32_t mEditorStatus;
+  uint32_t mBaseCommandControllerId;
+  uint32_t mDocStateControllerId;
+  uint32_t mHTMLCommandControllerId;
+
+  nsWeakPtr mDocShell;
+
+  nsWeakPtr mExistingEditor;
+};
+
+#endif  // nsEditingSession_h_

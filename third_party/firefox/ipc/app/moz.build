@@ -1,0 +1,37 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+GeckoProgram(CONFIG["MOZ_CHILD_PROCESS_NAME"], linkage="dependent")
+
+SOURCES += [
+    "MozillaRuntimeMain.cpp",
+]
+
+include("/ipc/chromium/chromium-config.mozbuild")
+
+LOCAL_INCLUDES += [
+    "/toolkit/xre",
+    "/xpcom/base",
+]
+
+OS_LIBS += CONFIG["DL_LIBS"]
+
+# DELAYLOAD_DLLS in this block ensures that the DLL blocklist is functional
+
+
+
+# Control the default heap size.
+# This is the heap returned by GetProcessHeap().
+# As we use the CRT heap, the default size is too large and wastes VM.
+#
+# The heap will grow if need be.
+#
+# Set it to 256k.  See bug 127069.
+
+COMPILE_FLAGS["WARNINGS_CXXFLAGS"] += ["-Wshadow"]
+
+if CONFIG["MOZ_DEBUG"]:
+    WINCONSOLE = True
+else:
+    WINCONSOLE = False

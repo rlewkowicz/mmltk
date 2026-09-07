@@ -1,0 +1,77 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef vm_GetterSetter_h
+#define vm_GetterSetter_h
+
+#include "gc/Barrier.h"  // js::GCPtr<JSObject*>
+#include "gc/Cell.h"     // js::gc::CellWithGCPointer
+
+#include "js/TypeDecls.h"  // JS::HandleObject
+#include "js/UbiNode.h"    // JS::ubi::TracerConcrete
+
+namespace js {
+
+class GetterSetter : public gc::CellWithGCPointer<JSObject> {
+  friend class gc::CellAllocator;
+
+ public:
+  JSObject* getter() const { return headerPtr(); }
+
+  const GCPtr<JSObject*> setter_;
+
+#ifndef JS_64BIT
+  uint64_t padding_ = 0;
+#endif
+
+ private:
+  GetterSetter(HandleObject getter, HandleObject setter);
+
+ public:
+  static GetterSetter* create(JSContext* cx, Handle<NativeObject*> owner,
+                              HandleObject getter, HandleObject setter);
+
+  JSObject* setter() const { return setter_; }
+
+  static const JS::TraceKind TraceKind = JS::TraceKind::GetterSetter;
+
+  js::gc::AllocKind getAllocKind() const {
+    return js::gc::AllocKind::GETTER_SETTER;
+  }
+  void fixupAfterMovingGC() {}
+
+  static constexpr size_t offsetOfGetter() { return offsetOfHeaderPtr(); }
+  static constexpr size_t offsetOfSetter() {
+    return offsetof(GetterSetter, setter_);
+  }
+
+  void traceChildren(JSTracer* trc);
+};
+
+}  
+
+namespace JS {
+namespace ubi {
+
+template <>
+class Concrete<js::GetterSetter> : TracerConcrete<js::GetterSetter> {
+ protected:
+  explicit Concrete(js::GetterSetter* ptr)
+      : TracerConcrete<js::GetterSetter>(ptr) {}
+
+ public:
+  static void construct(void* storage, js::GetterSetter* ptr) {
+    new (storage) Concrete(ptr);
+  }
+
+  Size size(mozilla::MallocSizeOf mallocSizeOf) const override;
+
+  const char16_t* typeName() const override { return concreteTypeName; }
+  static const char16_t concreteTypeName[];
+};
+
+}  
+}  
+
+#endif  // vm_GetterSetter_h

@@ -1,0 +1,92 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef SCANNER
+#define SCANNER
+
+#include "nsCharsetSource.h"
+#include "nsCOMPtr.h"
+#include "nsString.h"
+#include "nsIParser.h"
+#include "mozilla/Encoding.h"
+#include "nsScannerString.h"
+
+class nsReadEndCondition {
+ public:
+  const char16_t* mChars;
+  char16_t mFilter;
+  explicit nsReadEndCondition(const char16_t* aTerminateChars);
+
+  nsReadEndCondition(const nsReadEndCondition& aOther) = delete;  
+  void operator=(const nsReadEndCondition& aOther) = delete;  
+};
+
+class nsScanner final {
+  using Encoding = mozilla::Encoding;
+  template <typename T>
+  using NotNull = mozilla::NotNull<T>;
+
+ public:
+  nsScanner(const nsAString& anHTMLString, bool aIncremental);
+
+  explicit nsScanner(nsIURI* aURI);
+
+  ~nsScanner();
+
+  nsScanner& operator=(const nsScanner&) = delete;
+
+  nsresult GetChar(char16_t& ch);
+
+  int32_t Mark(void);
+
+  void RewindToMark(void);
+
+  bool UngetReadable(const nsAString& aBuffer);
+
+  nsresult Append(const nsAString& aBuffer);
+
+  nsresult Append(const char* aBuffer, uint32_t aLen);
+
+  bool CopyUnusedData(nsString& aCopyBuffer);
+
+  nsIURI* GetURI(void) const { return mURI; }
+
+  static void SelfTest();
+
+  nsresult SetDocumentCharset(NotNull<const Encoding*> aEncoding,
+                              int32_t aSource);
+
+  void BindSubstring(nsScannerSubstring& aSubstring,
+                     const nsScannerIterator& aStart,
+                     const nsScannerIterator& aEnd);
+  void CurrentPosition(nsScannerIterator& aPosition);
+  void EndReading(nsScannerIterator& aPosition);
+  void SetPosition(nsScannerIterator& aPosition, bool aTruncate = false);
+
+  bool IsIncremental(void) { return mIncremental; }
+  void SetIncremental(bool anIncrValue) { mIncremental = anIncrValue; }
+
+ protected:
+  void AppendToBuffer(nsScannerString::Buffer* aBuffer);
+  bool AppendToBuffer(const nsAString& aStr) {
+    nsScannerString::Buffer* buf = nsScannerString::AllocBufferFromString(aStr);
+    if (!buf) return false;
+    AppendToBuffer(buf);
+    return true;
+  }
+
+  mozilla::UniquePtr<nsScannerString> mSlidingBuffer;
+  nsScannerIterator mCurrentPosition;  
+  nsScannerIterator
+      mMarkPosition;  
+  nsScannerIterator mEndPosition;  
+  nsCOMPtr<nsIURI> mURI;
+  bool mIncremental;
+  int32_t mCharsetSource = kCharsetUninitialized;
+  nsCString mCharset;
+  mozilla::UniquePtr<mozilla::Decoder> mUnicodeDecoder;
+};
+
+#endif

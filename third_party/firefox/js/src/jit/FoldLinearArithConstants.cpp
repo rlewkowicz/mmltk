@@ -1,0 +1,100 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "jit/FoldLinearArithConstants.h"
+
+#include "jit/IonAnalysis.h"
+#include "jit/MIR-wasm.h"
+#include "jit/MIR.h"
+#include "jit/MIRGenerator.h"
+#include "jit/MIRGraph.h"
+
+using namespace js;
+using namespace jit;
+
+namespace js {
+namespace jit {
+
+static void markNodesAsRecoveredOnBailout(MDefinition* def) {
+  if (def->hasLiveDefUses() || !DeadIfUnused(def) ||
+      !def->canRecoverOnBailout()) {
+    return;
+  }
+
+  JitSpew(JitSpew_FLAC, "mark as recovered on bailout: %s%u", def->opName(),
+          def->id());
+  def->setRecoveredOnBailoutUnchecked();
+
+  for (size_t i = 0; i < def->numOperands(); i++) {
+    markNodesAsRecoveredOnBailout(def->getOperand(i));
+  }
+}
+
+static void AnalyzeAdd(TempAllocator& alloc, MAdd* add) {
+  if (add->type() != MIRType::Int32 || add->isRecoveredOnBailout()) {
+    return;
+  }
+
+  if (!add->hasUses()) {
+    return;
+  }
+
+  JitSpew(JitSpew_FLAC, "analyze add: %s%u", add->opName(), add->id());
+
+  SimpleLinearSum sum = ExtractLinearSum(add);
+  if (sum.constant == 0 || !sum.term) {
+    return;
+  }
+
+  int idx = add->getOperand(0)->isConstant() ? 0 : 1;
+  if (add->getOperand(idx)->isConstant()) {
+    MOZ_ASSERT(add->getOperand(idx)->toConstant()->type() == MIRType::Int32);
+    if (sum.term == add->getOperand(1 - idx) ||
+        sum.constant == add->getOperand(idx)->toConstant()->toInt32()) {
+      return;
+    }
+  }
+
+  MInstruction* rhs = MConstant::NewInt32(alloc, sum.constant);
+  add->block()->insertBefore(add, rhs);
+
+  MAdd* addNew = MAdd::New(alloc, sum.term, rhs, add->truncateKind());
+  addNew->setBailoutKind(add->bailoutKind());
+
+  add->replaceAllLiveUsesWith(addNew);
+  add->block()->insertBefore(add, addNew);
+  JitSpew(JitSpew_FLAC, "replaced with: %s%u", addNew->opName(), addNew->id());
+  JitSpew(JitSpew_FLAC, "and constant: %s%u (%d)", rhs->opName(), rhs->id(),
+          sum.constant);
+
+  markNodesAsRecoveredOnBailout(add);
+}
+
+bool FoldLinearArithConstants(const MIRGenerator* mir, MIRGraph& graph) {
+  JitSpew(JitSpew_FLAC, "Begin");
+  for (PostorderIterator block(graph.poBegin()); block != graph.poEnd();
+       block++) {
+    if (mir->shouldCancel("Fold Linear Arithmetic Constants (main loop)")) {
+      return false;
+    }
+
+    for (MInstructionIterator i = block->begin(); i != block->end(); i++) {
+      if (!graph.alloc().ensureBallast()) {
+        return false;
+      }
+
+      if (mir->shouldCancel("Fold Linear Arithmetic Constants (inner loop)")) {
+        return false;
+      }
+
+      if (i->isAdd()) {
+        AnalyzeAdd(graph.alloc(), i->toAdd());
+      }
+    }
+  }
+  return true;
+}
+
+} 
+} 

@@ -1,0 +1,138 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef js_Exception_h
+#define js_Exception_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/Maybe.h"
+
+#include "jstypes.h"
+
+#include "js/RootingAPI.h"  // JS::{Handle,Rooted}
+#include "js/TypeDecls.h"
+#include "js/Value.h"  // JS::Value, JS::Handle<JS::Value>
+
+class JSErrorReport;
+
+namespace JS {
+enum class ExceptionStackBehavior : bool {
+  DoNotCapture,
+
+  Capture
+};
+
+class MOZ_RAII BorrowedErrorReport {
+  Rooted<JSObject*> owner_;
+  JSErrorReport* report_ = nullptr;
+
+ public:
+  explicit BorrowedErrorReport(JSContext* cx) : owner_(cx) {}
+
+  void init(JSObject* owner, JSErrorReport* report) {
+    MOZ_ASSERT(owner);
+    MOZ_ASSERT(report);
+    owner_ = owner;
+    report_ = report;
+  }
+
+  JSErrorReport* get() const {
+    MOZ_ASSERT(report_);
+    return report_;
+  }
+  const JSErrorReport* operator->() const { return get(); }
+};
+
+}  
+
+extern JS_PUBLIC_API bool JS_IsExceptionPending(JSContext* cx);
+
+
+extern JS_PUBLIC_API bool JS_IsThrowingOutOfMemory(JSContext* cx);
+
+extern JS_PUBLIC_API bool JS_GetPendingException(JSContext* cx,
+                                                 JS::MutableHandleValue vp);
+
+extern JS_PUBLIC_API void JS_SetPendingException(
+    JSContext* cx, JS::HandleValue v,
+    JS::ExceptionStackBehavior behavior = JS::ExceptionStackBehavior::Capture);
+
+extern JS_PUBLIC_API void JS_ClearPendingException(JSContext* cx);
+
+extern JS_PUBLIC_API bool JS_ErrorFromException(
+    JSContext* cx, JS::HandleObject obj, JS::BorrowedErrorReport& errorReport);
+
+namespace JS {
+
+enum class ExceptionStatus {
+  None,
+
+  ForcedReturn,
+
+  Throwing,
+  OutOfMemory,
+  OverRecursed,
+};
+
+static MOZ_ALWAYS_INLINE bool IsCatchableExceptionStatus(
+    ExceptionStatus status) {
+  return status >= ExceptionStatus::Throwing;
+}
+
+class MOZ_STACK_CLASS ExceptionStack {
+  Rooted<Value> exception_;
+  Rooted<JSObject*> stack_;
+
+  friend JS_PUBLIC_API bool GetPendingExceptionStack(
+      JSContext* cx, JS::ExceptionStack* exceptionStack);
+
+  void init(HandleValue exception, HandleObject stack) {
+    exception_ = exception;
+    stack_ = stack;
+  }
+
+ public:
+  explicit ExceptionStack(JSContext* cx) : exception_(cx), stack_(cx) {}
+
+  ExceptionStack(JSContext* cx, HandleValue exception, HandleObject stack)
+      : exception_(cx, exception), stack_(cx, stack) {}
+
+  HandleValue exception() const { return exception_; }
+
+  HandleObject stack() const { return stack_; }
+};
+
+class JS_PUBLIC_API AutoSaveExceptionState {
+ private:
+  JSContext* context;
+  ExceptionStatus status;
+  RootedValue exceptionValue;
+  RootedObject exceptionStack;
+
+ public:
+  explicit AutoSaveExceptionState(JSContext* cx);
+
+  ~AutoSaveExceptionState();
+
+  void drop();
+
+  void restore();
+};
+
+extern JS_PUBLIC_API bool GetPendingExceptionStack(
+    JSContext* cx, JS::ExceptionStack* exceptionStack);
+
+extern JS_PUBLIC_API bool StealPendingExceptionStack(
+    JSContext* cx, JS::ExceptionStack* exceptionStack);
+
+extern JS_PUBLIC_API void SetPendingExceptionStack(
+    JSContext* cx, const JS::ExceptionStack& exceptionStack);
+
+extern JS_PUBLIC_API JSObject* ExceptionStackOrNull(JS::HandleObject obj);
+
+extern JS_PUBLIC_API mozilla::Maybe<JS::Value> GetExceptionCause(JSObject* exc);
+
+}  
+
+#endif  // js_Exception_h

@@ -1,0 +1,52 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_cache_ActorUtils_h
+#define mozilla_dom_cache_ActorUtils_h
+
+#include "mozilla/dom/cache/Types.h"
+
+namespace mozilla {
+
+namespace ipc {
+class PBackgroundParent;
+class PrincipalInfo;
+}  
+
+namespace dom::cache {
+class ActorChild;
+class BoundStorageKeyParent;
+class PCacheChild;
+class PCacheParent;
+class PCacheStreamControlChild;
+class PCacheStreamControlParent;
+class PCacheStorageChild;
+class PCacheStorageParent;
+
+
+already_AddRefed<PCacheChild> AllocPCacheChild(
+    ActorChild* aParentActor = nullptr);
+
+void DeallocPCacheChild(PCacheChild* aActor);
+
+void DeallocPCacheParent(PCacheParent* aActor);
+
+already_AddRefed<PCacheStreamControlChild> AllocPCacheStreamControlChild(
+    ActorChild* aParentActor = nullptr);
+
+void DeallocPCacheStreamControlParent(PCacheStreamControlParent* aActor);
+
+already_AddRefed<PCacheStorageParent> AllocPCacheStorageParent(
+    mozilla::ipc::PBackgroundParent* aBackgroundIPCActor,
+    PBoundStorageKeyParent* aBoundStorageKeyActor, Namespace aNamespace,
+    const mozilla::ipc::PrincipalInfo& aPrincipalInfo);
+
+void DeallocPCacheStorageChild(PCacheStorageChild* aActor);
+
+void DeallocPCacheStorageParent(PCacheStorageParent* aActor);
+
+}  
+}  
+
+#endif  // mozilla_dom_cache_ActorUtils_h

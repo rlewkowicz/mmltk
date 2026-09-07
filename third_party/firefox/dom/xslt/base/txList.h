@@ -1,0 +1,80 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef TRANSFRMX_LIST_H
+#define TRANSFRMX_LIST_H
+
+#include "txCore.h"
+
+class txListIterator;
+
+class txList : public txObject {
+  friend class txListIterator;
+
+ public:
+  txList();
+
+  ~txList();
+
+  txList(const txList& aOther) = delete;
+
+  int32_t getLength();
+
+  inline bool isEmpty() { return itemCount == 0; }
+
+  void add(void* objPtr);
+
+  void clear();
+
+ protected:
+  struct ListItem {
+    ListItem* nextItem;
+    ListItem* prevItem;
+    void* objPtr;
+  };
+
+  ListItem* remove(ListItem* sItem);
+
+ private:
+  ListItem* firstItem;
+  ListItem* lastItem;
+  int32_t itemCount;
+
+  void insertAfter(void* objPtr, ListItem* sItem);
+  void insertBefore(void* objPtr, ListItem* sItem);
+};
+
+class txListIterator {
+ public:
+  explicit txListIterator(txList* list);
+
+  void addAfter(void* objPtr);
+
+  void addBefore(void* objPtr);
+
+  bool hasNext();
+
+  void* next();
+
+  void* previous();
+
+  void* current();
+
+  void* remove();
+
+  void reset();
+
+  void resetToEnd();
+
+ private:
+  txList::ListItem* currentItem;
+
+  txList* list;
+
+  bool atEndOfList;
+};
+
+using List = txList;
+
+#endif

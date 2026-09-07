@@ -1,0 +1,67 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+include('sources.mozbuild')
+
+# Linux, Mac and Win share file lists for x86* but not configurations.
+EXPORTS.aom += files['X64_EXPORTS']
+SOURCES += files['X64_SOURCES']
+USE_NASM = True
+ASFLAGS += [ '-I%s/media/libaom/config/linux/x64/' % TOPSRCDIR ]
+LOCAL_INCLUDES += [ '/media/libaom/config/linux/x64/' ]
+EXPORTS.aom += [ 'config/linux/x64/config/aom_config.h' ]
+
+# We allow warnings for third-party code that can be updated from upstream.
+AllowCompilerWarnings()
+
+FINAL_LIBRARY = 'gkcodecs'
+NoVisibilityFlags()
+
+
+for f in SOURCES:
+    if f.endswith('sse2.c'):
+        SOURCES[f].flags += CONFIG['SSE2_FLAGS']
+    elif f.endswith('ssse3.c'):
+        SOURCES[f].flags += ['-mssse3']
+    elif f.endswith('sse3.c'):
+        SOURCES[f].flags += ['-msse3']
+    elif f.endswith('sse4.c'):
+        SOURCES[f].flags += ['-msse4.1']
+    elif f.endswith('sse42.c'):
+        SOURCES[f].flags += ['-msse4.2']
+    elif f.endswith('avx.c'):
+        SOURCES[f].flags += ['-mavx']
+    elif f.endswith('avx2.c'):
+        SOURCES[f].flags += ['-mavx2']
+    elif f.endswith('neon.c'):
+        SOURCES[f].flags += CONFIG['NEON_FLAGS']
+    elif f.endswith('neon_i8mm.c'):
+        SOURCES[f].flags += CONFIG['NEON_I8MM_FLAGS']
+    elif f.endswith('neon_dotprod.c'):
+        SOURCES[f].flags += ['-march=armv8.2-a+dotprod']
+    elif f.endswith('arm_crc32.c'):
+        SOURCES[f].flags += ['-march=armv8-a+crc']
+
+SOURCES += [ 'build_config.c' ]
+
+# Suppress warnings in third-party code.
+CFLAGS += [
+    '-Wno-sign-compare',
+    '-Wno-unused-function', # so many of these warnings; just ignore them
+]
+CFLAGS += [
+    '-Wno-unreachable-code',
+    '-Wno-unneeded-internal-declaration',
+]
+
+ASFLAGS += CONFIG['VPX_ASFLAGS']
+ASFLAGS += [
+    '-I./',
+    '-I%s/third_party/aom/' % TOPSRCDIR,
+]
+
+LOCAL_INCLUDES += [
+    '/media/libaom/config', # aom_version.h
+    '/third_party/aom',
+]

@@ -1,0 +1,1362 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsContentSecurityManager.h"
+
+#include "js/RegExp.h"
+#include "jsapi.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/Components.h"
+#include "mozilla/Logging.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/StaticPrefs_content.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/StaticPrefs_security.h"
+#include "mozilla/dom/BrowserChild.h"
+#include "mozilla/dom/ContentChild.h"
+#include "mozilla/dom/ContentParent.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/PolicyContainer.h"
+#include "mozilla/dom/nsMixedContentBlocker.h"
+#include "nsAboutProtocolUtils.h"
+#include "nsArray.h"
+#include "nsCORSListenerProxy.h"
+#include "nsContentPolicyUtils.h"
+#include "nsContentSecurityUtils.h"
+#include "nsContentUtils.h"
+#include "nsDataHandler.h"
+#include "nsEscape.h"
+#include "nsIChannel.h"
+#include "nsIContentPolicy.h"
+#include "nsIHttpChannelInternal.h"
+#include "nsILoadInfo.h"
+#include "nsIMIMEService.h"
+#include "nsINode.h"
+#include "nsIOService.h"
+#include "nsIParentChannel.h"
+#include "nsIRedirectHistoryEntry.h"
+#include "nsIStreamListener.h"
+#include "nsIXULRuntime.h"
+#include "nsMimeTypes.h"
+#include "nsNetUtil.h"
+#include "nsReadableUtils.h"
+#include "nsSandboxFlags.h"
+#include "nsScriptSecurityManager.h"
+#include "xpcpublic.h"
+
+using namespace mozilla;
+using namespace mozilla::dom;
+
+NS_IMPL_ISUPPORTS(nsContentSecurityManager, nsIContentSecurityManager,
+                  nsIChannelEventSink)
+
+mozilla::LazyLogModule sCSMLog("CSMLog");
+mozilla::LazyLogModule sUELLog("UnexpectedLoad");
+
+Atomic<bool, mozilla::Relaxed> sJSHacksChecked(false);
+Atomic<bool, mozilla::Relaxed> sJSHacksPresent(false);
+
+bool nsContentSecurityManager::AllowTopLevelNavigationToDataURI(
+    nsIChannel* aChannel) {
+  if (!StaticPrefs::security_data_uri_block_toplevel_data_uri_navigations()) {
+    return true;
+  }
+  nsCOMPtr<nsILoadInfo> loadInfo = aChannel->LoadInfo();
+  if (loadInfo->GetExternalContentPolicyType() !=
+      ExtContentPolicy::TYPE_DOCUMENT) {
+    return true;
+  }
+  if (loadInfo->GetForceAllowDataURI()) {
+    return true;
+  }
+  nsCOMPtr<nsIURI> uri;
+  nsresult rv = NS_GetFinalChannelURI(aChannel, getter_AddRefs(uri));
+  NS_ENSURE_SUCCESS(rv, true);
+  if (!uri->SchemeIs("data")) {
+    return true;
+  }
+
+  nsAutoCString spec;
+  rv = uri->GetSpec(spec);
+  NS_ENSURE_SUCCESS(rv, true);
+  nsAutoCString contentType;
+  bool base64;
+  rv = nsDataHandler::ParseURI(spec, contentType, nullptr, base64, nullptr);
+  NS_ENSURE_SUCCESS(rv, true);
+
+  if (StringBeginsWith(contentType, "image/"_ns) &&
+      !contentType.EqualsLiteral(IMAGE_SVG_XML)) {
+    return true;
+  }
+  if (contentType.EqualsLiteral(APPLICATION_JSON) ||
+      contentType.EqualsLiteral(TEXT_JSON) ||
+      contentType.EqualsLiteral(APPLICATION_PDF)) {
+    return true;
+  }
+  if (!loadInfo->GetLoadTriggeredFromExternal() &&
+      loadInfo->TriggeringPrincipal()->IsSystemPrincipal() &&
+      loadInfo->RedirectChain().IsEmpty()) {
+    return true;
+  }
+
+  ReportBlockedDataURI(uri, loadInfo);
+
+  return false;
+}
+
+void nsContentSecurityManager::ReportBlockedDataURI(nsIURI* aURI,
+                                                    nsILoadInfo* aLoadInfo,
+                                                    bool aIsRedirect) {
+  nsAutoCString dataSpec;
+  aURI->GetSpec(dataSpec);
+  if (dataSpec.Length() > 50) {
+    dataSpec.Truncate(50);
+    dataSpec.AppendLiteral("...");
+  }
+  AutoTArray<nsString, 1> params;
+  CopyUTF8toUTF16(NS_UnescapeURL(dataSpec), *params.AppendElement());
+  nsAutoString errorText;
+  const char* stringID =
+      aIsRedirect ? "BlockRedirectToDataURI" : "BlockTopLevelDataURINavigation";
+  nsresult rv = nsContentUtils::FormatLocalizedString(
+      PropertiesFile::SECURITY_PROPERTIES, stringID, params, errorText);
+  if (NS_FAILED(rv)) {
+    return;
+  }
+
+  RefPtr<BrowsingContext> target = aLoadInfo->GetBrowsingContext();
+  nsContentUtils::ReportToConsoleByWindowID(
+      errorText, nsIScriptError::warningFlag, "DATA_URI_BLOCKED"_ns,
+      target ? target->GetCurrentInnerWindowId() : 0);
+}
+
+bool nsContentSecurityManager::AllowInsecureRedirectToDataURI(
+    nsIChannel* aNewChannel) {
+  nsCOMPtr<nsILoadInfo> loadInfo = aNewChannel->LoadInfo();
+  if (loadInfo->GetExternalContentPolicyType() !=
+      ExtContentPolicy::TYPE_SCRIPT) {
+    return true;
+  }
+  nsCOMPtr<nsIURI> newURI;
+  nsresult rv = NS_GetFinalChannelURI(aNewChannel, getter_AddRefs(newURI));
+  if (NS_FAILED(rv) || !newURI || !newURI->SchemeIs("data")) {
+    return true;
+  }
+
+  if (loadInfo->GetAllowInsecureRedirectToDataURI()) {
+    return true;
+  }
+
+  ReportBlockedDataURI(newURI, loadInfo, true);
+
+  return false;
+}
+
+static nsresult ValidateSecurityFlags(nsILoadInfo* aLoadInfo) {
+  nsSecurityFlags securityMode = aLoadInfo->GetSecurityMode();
+
+  if (securityMode !=
+          nsILoadInfo::SEC_REQUIRE_SAME_ORIGIN_INHERITS_SEC_CONTEXT &&
+      securityMode != nsILoadInfo::SEC_REQUIRE_SAME_ORIGIN_DATA_IS_BLOCKED &&
+      securityMode !=
+          nsILoadInfo::SEC_ALLOW_CROSS_ORIGIN_INHERITS_SEC_CONTEXT &&
+      securityMode != nsILoadInfo::SEC_ALLOW_CROSS_ORIGIN_SEC_CONTEXT_IS_NULL &&
+      securityMode != nsILoadInfo::SEC_REQUIRE_CORS_INHERITS_SEC_CONTEXT) {
+    MOZ_ASSERT(
+        false,
+        "need one securityflag from nsILoadInfo to perform security checks");
+    return NS_ERROR_FAILURE;
+  }
+
+  return NS_OK;
+}
+
+static bool IsImageLoadInEditorAppType(nsILoadInfo* aLoadInfo) {
+  nsContentPolicyType type = aLoadInfo->InternalContentPolicyType();
+  if (type != nsIContentPolicy::TYPE_INTERNAL_IMAGE &&
+      type != nsIContentPolicy::TYPE_INTERNAL_IMAGE_PRELOAD &&
+      type != nsIContentPolicy::TYPE_INTERNAL_IMAGE_FAVICON &&
+      type != nsIContentPolicy::TYPE_IMAGESET) {
+    return false;
+  }
+
+  auto appType = nsIDocShell::APP_TYPE_UNKNOWN;
+  nsINode* node = aLoadInfo->LoadingNode();
+  if (!node) {
+    return false;
+  }
+  Document* doc = node->OwnerDoc();
+  if (!doc) {
+    return false;
+  }
+
+  nsCOMPtr<nsIDocShellTreeItem> docShellTreeItem = doc->GetDocShell();
+  if (!docShellTreeItem) {
+    return false;
+  }
+
+  nsCOMPtr<nsIDocShellTreeItem> root;
+  docShellTreeItem->GetInProcessRootTreeItem(getter_AddRefs(root));
+  nsCOMPtr<nsIDocShell> docShell(do_QueryInterface(root));
+  if (docShell) {
+    appType = docShell->GetAppType();
+  }
+
+  return appType == nsIDocShell::APP_TYPE_EDITOR;
+}
+
+static nsresult DoCheckLoadURIChecks(nsIURI* aURI, nsILoadInfo* aLoadInfo) {
+  if (aLoadInfo->InternalContentPolicyType() ==
+          nsIContentPolicy::TYPE_INTERNAL_DTD &&
+      mozilla::StaticPrefs::dom_fetch_allow_force_allowed_dtd()) {
+    RefPtr<Document> doc;
+    aLoadInfo->GetLoadingDocument(getter_AddRefs(doc));
+    bool allowed = false;
+    aLoadInfo->TriggeringPrincipal()->IsL10nAllowed(
+        doc ? doc->GetDocumentURI() : nullptr, &allowed);
+
+    return allowed ? NS_OK : NS_ERROR_DOM_BAD_URI;
+  }
+
+  if (aLoadInfo->InternalContentPolicyType() ==
+          nsIContentPolicy::TYPE_INTERNAL_FORCE_ALLOWED_DTD &&
+      mozilla::StaticPrefs::dom_fetch_allow_force_allowed_dtd()) {
+    return NS_OK;
+  }
+
+  if (IsImageLoadInEditorAppType(aLoadInfo)) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIPrincipal> triggeringPrincipal = aLoadInfo->TriggeringPrincipal();
+
+  return nsContentUtils::GetSecurityManager()->CheckLoadURIWithPrincipal(
+      triggeringPrincipal, aURI, aLoadInfo->CheckLoadURIFlags(),
+      aLoadInfo->GetInnerWindowID());
+}
+
+static bool URIHasFlags(nsIURI* aURI, uint32_t aURIFlags) {
+  bool hasFlags;
+  nsresult rv = NS_URIChainHasFlags(aURI, aURIFlags, &hasFlags);
+  NS_ENSURE_SUCCESS(rv, false);
+
+  return hasFlags;
+}
+
+static nsresult DoSOPChecks(nsIURI* aURI, nsILoadInfo* aLoadInfo,
+                            nsIChannel* aChannel) {
+  if (aLoadInfo->GetAllowChrome() &&
+      (URIHasFlags(aURI, nsIProtocolHandler::URI_IS_UI_RESOURCE) ||
+       nsContentUtils::SchemeIs(aURI, "moz-safe-about"))) {
+    return DoCheckLoadURIChecks(aURI, aLoadInfo);
+  }
+
+  if (NS_HasBeenCrossOrigin(aChannel, true)) {
+    NS_SetRequestBlockingReason(aLoadInfo,
+                                nsILoadInfo::BLOCKING_REASON_NOT_SAME_ORIGIN);
+    return NS_ERROR_DOM_BAD_URI;
+  }
+
+  return NS_OK;
+}
+
+static nsIPrincipal* DeterminePrincipalForCORSChecks(nsILoadInfo* aLoadInfo) {
+  nsIPrincipal* const triggeringPrincipal = aLoadInfo->TriggeringPrincipal();
+
+  if (StaticPrefs::content_cors_use_triggering_principal()) {
+    return triggeringPrincipal;
+  }
+
+  return aLoadInfo->GetLoadingPrincipal();
+}
+
+static nsresult DoCORSChecks(nsIChannel* aChannel, nsILoadInfo* aLoadInfo,
+                             nsCOMPtr<nsIStreamListener>& aInAndOutListener) {
+  MOZ_RELEASE_ASSERT(aInAndOutListener,
+                     "can not perform CORS checks without a listener");
+
+  if (aLoadInfo->TriggeringPrincipal()->IsSystemPrincipal()) {
+    return NS_OK;
+  }
+
+  nsIPrincipal* principalForCORSCheck =
+      DeterminePrincipalForCORSChecks(aLoadInfo);
+
+  RefPtr<nsCORSListenerProxy> corsListener = new nsCORSListenerProxy(
+      aInAndOutListener, principalForCORSCheck,
+      aLoadInfo->GetCookiePolicy() == nsILoadInfo::SEC_COOKIES_INCLUDE);
+  nsresult rv = corsListener->Init(aChannel, DataURIHandling::Allow);
+  NS_ENSURE_SUCCESS(rv, rv);
+  aInAndOutListener = corsListener;
+  return NS_OK;
+}
+
+static nsresult DoContentSecurityChecks(nsIChannel* aChannel,
+                                        nsILoadInfo* aLoadInfo) {
+  ExtContentPolicyType contentPolicyType =
+      aLoadInfo->GetExternalContentPolicyType();
+
+  nsCOMPtr<nsIURI> uri;
+  nsresult rv = NS_GetFinalChannelURI(aChannel, getter_AddRefs(uri));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  switch (contentPolicyType) {
+    case ExtContentPolicy::TYPE_XMLHTTPREQUEST: {
+#ifdef DEBUG
+      {
+        nsCOMPtr<nsINode> node = aLoadInfo->LoadingNode();
+        MOZ_ASSERT(!node || node->NodeType() == nsINode::DOCUMENT_NODE,
+                   "type_xml requires requestingContext of type Document");
+      }
+#endif
+      break;
+    }
+
+    case ExtContentPolicy::TYPE_DTD: {
+#ifdef DEBUG
+      {
+        nsCOMPtr<nsINode> node = aLoadInfo->LoadingNode();
+        MOZ_ASSERT(!node || node->NodeType() == nsINode::DOCUMENT_NODE,
+                   "type_dtd requires requestingContext of type Document");
+      }
+#endif
+      break;
+    }
+
+    case ExtContentPolicy::TYPE_MEDIA: {
+#ifdef DEBUG
+      {
+        nsCOMPtr<nsINode> node = aLoadInfo->LoadingNode();
+        MOZ_ASSERT(!node || node->NodeType() == nsINode::ELEMENT_NODE,
+                   "type_media requires requestingContext of type Element");
+      }
+#endif
+      break;
+    }
+
+    case ExtContentPolicy::TYPE_WEBSOCKET: {
+      nsCOMPtr<nsIHttpChannelInternal> httpChannelInternal =
+          do_QueryInterface(aChannel);
+      MOZ_ASSERT(httpChannelInternal);
+      if (httpChannelInternal) {
+        rv = httpChannelInternal->GetProxyURI(getter_AddRefs(uri));
+        MOZ_ASSERT(NS_SUCCEEDED(rv));
+      }
+      break;
+    }
+
+    case ExtContentPolicy::TYPE_XSLT: {
+#ifdef DEBUG
+      {
+        nsCOMPtr<nsINode> node = aLoadInfo->LoadingNode();
+        MOZ_ASSERT(!node || node->NodeType() == nsINode::DOCUMENT_NODE,
+                   "type_xslt requires requestingContext of type Document");
+      }
+#endif
+      break;
+    }
+
+    case ExtContentPolicy::TYPE_BEACON: {
+#ifdef DEBUG
+      {
+        nsCOMPtr<nsINode> node = aLoadInfo->LoadingNode();
+        MOZ_ASSERT(!node || node->NodeType() == nsINode::DOCUMENT_NODE,
+                   "type_beacon requires requestingContext of type Document");
+      }
+#endif
+      break;
+    }
+
+    case ExtContentPolicy::TYPE_OTHER:
+    case ExtContentPolicy::TYPE_SCRIPT:
+    case ExtContentPolicy::TYPE_IMAGE:
+    case ExtContentPolicy::TYPE_STYLESHEET:
+    case ExtContentPolicy::TYPE_OBJECT:
+    case ExtContentPolicy::TYPE_DOCUMENT:
+    case ExtContentPolicy::TYPE_SUBDOCUMENT:
+    case ExtContentPolicy::TYPE_PING:
+    case ExtContentPolicy::TYPE_FONT:
+    case ExtContentPolicy::TYPE_UA_FONT:
+    case ExtContentPolicy::TYPE_CSP_REPORT:
+    case ExtContentPolicy::TYPE_WEB_MANIFEST:
+    case ExtContentPolicy::TYPE_FETCH:
+    case ExtContentPolicy::TYPE_IMAGESET:
+    case ExtContentPolicy::TYPE_SAVEAS_DOWNLOAD:
+    case ExtContentPolicy::TYPE_SPECULATIVE:
+    case ExtContentPolicy::TYPE_PROXIED_WEBRTC_MEDIA:
+    case ExtContentPolicy::TYPE_WEB_TRANSPORT:
+    case ExtContentPolicy::TYPE_WEB_IDENTITY:
+    case ExtContentPolicy::TYPE_JSON:
+    case ExtContentPolicy::TYPE_TEXT:
+      break;
+
+    case ExtContentPolicy::TYPE_INVALID:
+      MOZ_ASSERT(false,
+                 "can not perform security check without a valid contentType");
+  }
+
+  int16_t shouldLoad = nsIContentPolicy::ACCEPT;
+  rv = NS_CheckContentLoadPolicy(uri, aLoadInfo, &shouldLoad,
+                                 nsContentUtils::GetContentPolicy());
+
+  if (NS_FAILED(rv) || NS_CP_REJECTED(shouldLoad)) {
+    NS_SetRequestBlockingReasonIfNull(
+        aLoadInfo, nsILoadInfo::BLOCKING_REASON_CONTENT_POLICY_GENERAL);
+
+    if (NS_SUCCEEDED(rv) &&
+        (contentPolicyType == ExtContentPolicy::TYPE_DOCUMENT ||
+         contentPolicyType == ExtContentPolicy::TYPE_SUBDOCUMENT)) {
+      if (shouldLoad == nsIContentPolicy::REJECT_TYPE) {
+        return NS_ERROR_CONTENT_BLOCKED_SHOW_ALT;
+      }
+      if (shouldLoad == nsIContentPolicy::REJECT_POLICY) {
+        return NS_ERROR_BLOCKED_BY_POLICY;
+      }
+    }
+    return NS_ERROR_CONTENT_BLOCKED;
+  }
+
+  return NS_OK;
+}
+
+static void LogHTTPSOnlyInfo(nsILoadInfo* aLoadInfo) {
+  MOZ_LOG(sCSMLog, LogLevel::Verbose, ("  httpsOnlyFirstStatus:"));
+  uint32_t httpsOnlyStatus = aLoadInfo->GetHttpsOnlyStatus();
+
+  if (httpsOnlyStatus & nsILoadInfo::HTTPS_ONLY_UNINITIALIZED) {
+    MOZ_LOG(sCSMLog, LogLevel::Verbose, ("    - HTTPS_ONLY_UNINITIALIZED"));
+  }
+  if (httpsOnlyStatus &
+      nsILoadInfo::HTTPS_ONLY_UPGRADED_LISTENER_NOT_REGISTERED) {
+    MOZ_LOG(sCSMLog, LogLevel::Verbose,
+            ("    - HTTPS_ONLY_UPGRADED_LISTENER_NOT_REGISTERED"));
+  }
+  if (httpsOnlyStatus & nsILoadInfo::HTTPS_ONLY_UPGRADED_LISTENER_REGISTERED) {
+    MOZ_LOG(sCSMLog, LogLevel::Verbose,
+            ("    - HTTPS_ONLY_UPGRADED_LISTENER_REGISTERED"));
+  }
+  if (httpsOnlyStatus & nsILoadInfo::HTTPS_ONLY_EXEMPT) {
+    MOZ_LOG(sCSMLog, LogLevel::Verbose, ("    - HTTPS_ONLY_EXEMPT"));
+  }
+  if (httpsOnlyStatus & nsILoadInfo::HTTPS_ONLY_TOP_LEVEL_LOAD_IN_PROGRESS) {
+    MOZ_LOG(sCSMLog, LogLevel::Verbose,
+            ("    - HTTPS_ONLY_TOP_LEVEL_LOAD_IN_PROGRESS"));
+  }
+  if (httpsOnlyStatus & nsILoadInfo::HTTPS_ONLY_DOWNLOAD_IN_PROGRESS) {
+    MOZ_LOG(sCSMLog, LogLevel::Verbose,
+            ("    - HTTPS_ONLY_DOWNLOAD_IN_PROGRESS"));
+  }
+  if (httpsOnlyStatus & nsILoadInfo::HTTPS_ONLY_DO_NOT_LOG_TO_CONSOLE) {
+    MOZ_LOG(sCSMLog, LogLevel::Verbose,
+            ("    - HTTPS_ONLY_DO_NOT_LOG_TO_CONSOLE"));
+  }
+  if (httpsOnlyStatus & nsILoadInfo::HTTPS_ONLY_UPGRADED_HTTPS_FIRST) {
+    MOZ_LOG(sCSMLog, LogLevel::Verbose,
+            ("    - HTTPS_ONLY_UPGRADED_HTTPS_FIRST"));
+  }
+}
+
+static void LogPrincipal(nsIPrincipal* aPrincipal,
+                         const nsAString& aPrincipalName,
+                         const uint8_t& aNestingLevel) {
+  nsPrintfCString aIndentationString("%*s", aNestingLevel * 2, "");
+
+  if (aPrincipal && aPrincipal->IsSystemPrincipal()) {
+    MOZ_LOG(sCSMLog, LogLevel::Debug,
+            ("%s%s: SystemPrincipal\n", aIndentationString.get(),
+             NS_ConvertUTF16toUTF8(aPrincipalName).get()));
+    return;
+  }
+  if (aPrincipal) {
+    if (aPrincipal->GetIsNullPrincipal()) {
+      MOZ_LOG(sCSMLog, LogLevel::Debug,
+              ("%s%s: NullPrincipal\n", aIndentationString.get(),
+               NS_ConvertUTF16toUTF8(aPrincipalName).get()));
+      return;
+    }
+    if (aPrincipal->GetIsExpandedPrincipal()) {
+      nsCOMPtr<nsIExpandedPrincipal> expanded(do_QueryInterface(aPrincipal));
+      nsAutoCString origin;
+      origin.AssignLiteral("[Expanded Principal [");
+
+      StringJoinAppend(origin, ", "_ns, expanded->AllowList(),
+                       [](nsACString& dest, nsIPrincipal* principal) {
+                         nsAutoCString subOrigin;
+                         DebugOnly<nsresult> rv =
+                             principal->GetOrigin(subOrigin);
+                         MOZ_ASSERT(NS_SUCCEEDED(rv));
+                         dest.Append(subOrigin);
+                       });
+
+      origin.AppendLiteral("]]");
+
+      MOZ_LOG(sCSMLog, LogLevel::Debug,
+              ("%s%s: %s\n", aIndentationString.get(),
+               NS_ConvertUTF16toUTF8(aPrincipalName).get(), origin.get()));
+      return;
+    }
+    nsAutoCString principalSpec;
+    aPrincipal->GetAsciiSpec(principalSpec);
+    if (aPrincipalName.IsEmpty()) {
+      MOZ_LOG(sCSMLog, LogLevel::Debug,
+              ("%s - \"%s\"\n", aIndentationString.get(), principalSpec.get()));
+    } else {
+      MOZ_LOG(
+          sCSMLog, LogLevel::Debug,
+          ("%s%s: \"%s\"\n", aIndentationString.get(),
+           NS_ConvertUTF16toUTF8(aPrincipalName).get(), principalSpec.get()));
+    }
+    return;
+  }
+  MOZ_LOG(sCSMLog, LogLevel::Debug,
+          ("%s%s: nullptr\n", aIndentationString.get(),
+           NS_ConvertUTF16toUTF8(aPrincipalName).get()));
+}
+
+static void LogSecurityFlags(nsSecurityFlags securityFlags) {
+  struct DebugSecFlagType {
+    unsigned long secFlag;
+    char secTypeStr[128];
+  };
+  static const DebugSecFlagType secTypes[] = {
+      {nsILoadInfo::SEC_ONLY_FOR_EXPLICIT_CONTENTSEC_CHECK,
+       "SEC_ONLY_FOR_EXPLICIT_CONTENTSEC_CHECK"},
+      {nsILoadInfo::SEC_REQUIRE_SAME_ORIGIN_INHERITS_SEC_CONTEXT,
+       "SEC_REQUIRE_SAME_ORIGIN_INHERITS_SEC_CONTEXT"},
+      {nsILoadInfo::SEC_REQUIRE_SAME_ORIGIN_DATA_IS_BLOCKED,
+       "SEC_REQUIRE_SAME_ORIGIN_DATA_IS_BLOCKED"},
+      {nsILoadInfo::SEC_ALLOW_CROSS_ORIGIN_INHERITS_SEC_CONTEXT,
+       "SEC_ALLOW_CROSS_ORIGIN_INHERITS_SEC_CONTEXT"},
+      {nsILoadInfo::SEC_ALLOW_CROSS_ORIGIN_SEC_CONTEXT_IS_NULL,
+       "SEC_ALLOW_CROSS_ORIGIN_SEC_CONTEXT_IS_NULL"},
+      {nsILoadInfo::SEC_REQUIRE_CORS_INHERITS_SEC_CONTEXT,
+       "SEC_REQUIRE_CORS_INHERITS_SEC_CONTEXT"},
+      {nsILoadInfo::SEC_COOKIES_DEFAULT, "SEC_COOKIES_DEFAULT"},
+      {nsILoadInfo::SEC_COOKIES_INCLUDE, "SEC_COOKIES_INCLUDE"},
+      {nsILoadInfo::SEC_COOKIES_SAME_ORIGIN, "SEC_COOKIES_SAME_ORIGIN"},
+      {nsILoadInfo::SEC_COOKIES_OMIT, "SEC_COOKIES_OMIT"},
+      {nsILoadInfo::SEC_FORCE_INHERIT_PRINCIPAL, "SEC_FORCE_INHERIT_PRINCIPAL"},
+      {nsILoadInfo::SEC_ABOUT_BLANK_INHERITS, "SEC_ABOUT_BLANK_INHERITS"},
+      {nsILoadInfo::SEC_ALLOW_CHROME, "SEC_ALLOW_CHROME"},
+      {nsILoadInfo::SEC_DISALLOW_SCRIPT, "SEC_DISALLOW_SCRIPT"},
+      {nsILoadInfo::SEC_DONT_FOLLOW_REDIRECTS, "SEC_DONT_FOLLOW_REDIRECTS"},
+      {nsILoadInfo::SEC_LOAD_ERROR_PAGE, "SEC_LOAD_ERROR_PAGE"},
+      {nsILoadInfo::SEC_FORCE_INHERIT_PRINCIPAL_OVERRULE_OWNER,
+       "SEC_FORCE_INHERIT_PRINCIPAL_OVERRULE_OWNER"}};
+
+  for (const DebugSecFlagType& flag : secTypes) {
+    if (securityFlags & flag.secFlag) {
+      MOZ_LOG(sCSMLog, LogLevel::Verbose, ("    - %s\n", flag.secTypeStr));
+    }
+  }
+}
+static void DebugDoContentSecurityCheck(nsIChannel* aChannel,
+                                        nsILoadInfo* aLoadInfo) {
+  nsCOMPtr<nsIHttpChannel> httpChannel(do_QueryInterface(aChannel));
+
+  MOZ_LOG(sCSMLog, LogLevel::Debug, ("\n#DebugDoContentSecurityCheck Begin\n"));
+
+  if (httpChannel || MOZ_LOG_TEST(sCSMLog, LogLevel::Verbose)) {
+    MOZ_LOG(sCSMLog, LogLevel::Verbose, ("doContentSecurityCheck:\n"));
+
+    nsAutoCString remoteType;
+    if (XRE_IsParentProcess()) {
+      nsCOMPtr<nsIParentChannel> parentChannel;
+      NS_QueryNotificationCallbacks(aChannel, parentChannel);
+      if (parentChannel) {
+        parentChannel->GetRemoteType(remoteType);
+      }
+    } else {
+      remoteType.Assign(
+          mozilla::dom::ContentChild::GetSingleton()->GetRemoteType());
+    }
+    MOZ_LOG(sCSMLog, LogLevel::Verbose,
+            ("  processType: \"%s\"\n", remoteType.get()));
+
+    nsCOMPtr<nsIURI> channelURI;
+    nsAutoCString channelSpec;
+    nsAutoCString channelMethod;
+    NS_GetFinalChannelURI(aChannel, getter_AddRefs(channelURI));
+    if (channelURI) {
+      channelURI->GetSpec(channelSpec);
+    }
+    MOZ_LOG(sCSMLog, LogLevel::Verbose,
+            ("  channelURI: \"%s\"\n", channelSpec.get()));
+
+    if (httpChannel) {
+      nsresult rv;
+      rv = httpChannel->GetRequestMethod(channelMethod);
+      if (!NS_FAILED(rv)) {
+        MOZ_LOG(sCSMLog, LogLevel::Verbose,
+                ("  httpMethod: %s\n", channelMethod.get()));
+      }
+    }
+
+    nsCOMPtr<nsIPrincipal> requestPrincipal = aLoadInfo->TriggeringPrincipal();
+    LogPrincipal(aLoadInfo->GetLoadingPrincipal(), u"loadingPrincipal"_ns, 1);
+    LogPrincipal(requestPrincipal, u"triggeringPrincipal"_ns, 1);
+    LogPrincipal(aLoadInfo->PrincipalToInherit(), u"principalToInherit"_ns, 1);
+
+    MOZ_LOG(sCSMLog, LogLevel::Verbose, ("  redirectChain:\n"));
+    for (nsIRedirectHistoryEntry* redirectHistoryEntry :
+         aLoadInfo->RedirectChain()) {
+      nsCOMPtr<nsIPrincipal> principal;
+      redirectHistoryEntry->GetPrincipal(getter_AddRefs(principal));
+      LogPrincipal(principal, u""_ns, 2);
+    }
+
+    MOZ_LOG(sCSMLog, LogLevel::Verbose,
+            ("  internalContentPolicyType: %s\n",
+             NS_CP_ContentTypeName(aLoadInfo->InternalContentPolicyType())));
+    MOZ_LOG(sCSMLog, LogLevel::Verbose,
+            ("  externalContentPolicyType: %s\n",
+             NS_CP_ContentTypeName(aLoadInfo->GetExternalContentPolicyType())));
+    MOZ_LOG(sCSMLog, LogLevel::Verbose,
+            ("  upgradeInsecureRequests: %s\n",
+             aLoadInfo->GetUpgradeInsecureRequests() ? "true" : "false"));
+    MOZ_LOG(sCSMLog, LogLevel::Verbose,
+            ("  initialSecurityChecksDone: %s\n",
+             aLoadInfo->GetInitialSecurityCheckDone() ? "true" : "false"));
+    MOZ_LOG(sCSMLog, LogLevel::Verbose,
+            ("  allowDeprecatedSystemRequests: %s\n",
+             aLoadInfo->GetAllowDeprecatedSystemRequests() ? "true" : "false"));
+    MOZ_LOG(sCSMLog, LogLevel::Verbose,
+            ("  schemelessInput: %d\n", aLoadInfo->GetSchemelessInput()));
+
+    nsCOMPtr<nsIPolicyContainer> policyContainer =
+        aLoadInfo->GetPolicyContainer();
+    nsCOMPtr<nsIContentSecurityPolicy> csp =
+        PolicyContainer::GetCSP(policyContainer);
+    MOZ_LOG(sCSMLog, LogLevel::Debug, ("  CSP:"));
+    if (csp) {
+      nsAutoString parsedPolicyStr;
+      uint32_t count = 0;
+      csp->GetPolicyCount(&count);
+      for (uint32_t i = 0; i < count; ++i) {
+        csp->GetPolicyString(i, parsedPolicyStr);
+        MOZ_LOG(sCSMLog, LogLevel::Debug,
+                ("  - \"%s\"\n", NS_ConvertUTF16toUTF8(parsedPolicyStr).get()));
+      }
+    }
+
+    MOZ_LOG(sCSMLog, LogLevel::Verbose, ("  securityFlags:"));
+    LogSecurityFlags(aLoadInfo->GetSecurityFlags());
+    LogHTTPSOnlyInfo(aLoadInfo);
+
+    MOZ_LOG(sCSMLog, LogLevel::Debug, ("\n#DebugDoContentSecurityCheck End\n"));
+  }
+}
+
+nsSecurityFlags nsContentSecurityManager::ComputeSecurityFlags(
+    mozilla::CORSMode aCORSMode, CORSSecurityMapping aCORSSecurityMapping) {
+  if (aCORSSecurityMapping == CORSSecurityMapping::DISABLE_CORS_CHECKS) {
+    return nsILoadInfo::SEC_ALLOW_CROSS_ORIGIN_SEC_CONTEXT_IS_NULL;
+  }
+
+  switch (aCORSMode) {
+    case CORS_NONE:
+      if (aCORSSecurityMapping == CORSSecurityMapping::REQUIRE_CORS_CHECKS) {
+        return nsILoadInfo::SEC_REQUIRE_CORS_INHERITS_SEC_CONTEXT |
+               nsILoadInfo::SEC_COOKIES_SAME_ORIGIN;
+      } else if (aCORSSecurityMapping ==
+                 CORSSecurityMapping::CORS_NONE_MAPS_TO_INHERITED_CONTEXT) {
+        return nsILoadInfo::SEC_ALLOW_CROSS_ORIGIN_INHERITS_SEC_CONTEXT;
+      } else {
+        MOZ_ASSERT(aCORSSecurityMapping ==
+                   CORSSecurityMapping::CORS_NONE_MAPS_TO_DISABLED_CORS_CHECKS);
+        return nsILoadInfo::SEC_ALLOW_CROSS_ORIGIN_SEC_CONTEXT_IS_NULL;
+      }
+    case CORS_ANONYMOUS:
+      return nsILoadInfo::SEC_REQUIRE_CORS_INHERITS_SEC_CONTEXT |
+             nsILoadInfo::SEC_COOKIES_SAME_ORIGIN;
+    case CORS_USE_CREDENTIALS:
+      return nsILoadInfo::SEC_REQUIRE_CORS_INHERITS_SEC_CONTEXT |
+             nsILoadInfo::SEC_COOKIES_INCLUDE;
+      break;
+    default:
+      MOZ_ASSERT_UNREACHABLE("Invalid aCORSMode enum value");
+      return nsILoadInfo::SEC_REQUIRE_CORS_INHERITS_SEC_CONTEXT |
+             nsILoadInfo::SEC_COOKIES_SAME_ORIGIN;
+  }
+}
+
+nsSecurityFlags nsContentSecurityManager::ComputeSecurityMode(
+    nsSecurityFlags aSecurityFlags) {
+  return aSecurityFlags &
+         (nsILoadInfo::SEC_REQUIRE_SAME_ORIGIN_INHERITS_SEC_CONTEXT |
+          nsILoadInfo::SEC_REQUIRE_SAME_ORIGIN_DATA_IS_BLOCKED |
+          nsILoadInfo::SEC_ALLOW_CROSS_ORIGIN_INHERITS_SEC_CONTEXT |
+          nsILoadInfo::SEC_ALLOW_CROSS_ORIGIN_SEC_CONTEXT_IS_NULL |
+          nsILoadInfo::SEC_REQUIRE_CORS_INHERITS_SEC_CONTEXT);
+}
+
+mozilla::dom::RequestMode nsContentSecurityManager::SecurityModeToRequestMode(
+    uint32_t aSecurityMode) {
+  if (aSecurityMode ==
+          nsILoadInfo::SEC_REQUIRE_SAME_ORIGIN_INHERITS_SEC_CONTEXT ||
+      aSecurityMode == nsILoadInfo::SEC_REQUIRE_SAME_ORIGIN_DATA_IS_BLOCKED) {
+    return mozilla::dom::RequestMode::Same_origin;
+  }
+
+  if (aSecurityMode == nsILoadInfo::SEC_REQUIRE_CORS_INHERITS_SEC_CONTEXT) {
+    return mozilla::dom::RequestMode::Cors;
+  }
+
+  MOZ_ASSERT(aSecurityMode ==
+                     nsILoadInfo::SEC_ALLOW_CROSS_ORIGIN_INHERITS_SEC_CONTEXT ||
+                 aSecurityMode ==
+                     nsILoadInfo::SEC_ALLOW_CROSS_ORIGIN_SEC_CONTEXT_IS_NULL,
+             "unhandled security mode");
+
+  return mozilla::dom::RequestMode::No_cors;
+}
+
+nsresult nsContentSecurityManager::CheckAllowLoadInSystemPrivilegedContext(
+    nsIChannel* aChannel) {
+  nsCOMPtr<nsILoadInfo> loadInfo = aChannel->LoadInfo();
+  nsCOMPtr<nsIPrincipal> inspectedPrincipal = loadInfo->GetLoadingPrincipal();
+  if (!inspectedPrincipal) {
+    return NS_OK;
+  }
+  if (!inspectedPrincipal->IsSystemPrincipal()) {
+    return NS_OK;
+  }
+  if (loadInfo->GetAllowDeprecatedSystemRequests()) {
+    return NS_OK;
+  }
+  ExtContentPolicyType contentPolicyType =
+      loadInfo->GetExternalContentPolicyType();
+  if (contentPolicyType == ExtContentPolicy::TYPE_DOCUMENT) {
+    return NS_OK;
+  }
+
+  if ((contentPolicyType == ExtContentPolicy::TYPE_FETCH) ||
+      (contentPolicyType == ExtContentPolicy::TYPE_XMLHTTPREQUEST) ||
+      (contentPolicyType == ExtContentPolicy::TYPE_WEBSOCKET) ||
+      (contentPolicyType == ExtContentPolicy::TYPE_SAVEAS_DOWNLOAD) ||
+      (contentPolicyType == ExtContentPolicy::TYPE_IMAGE)) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIURI> finalURI;
+  NS_GetFinalChannelURI(aChannel, getter_AddRefs(finalURI));
+  bool isUiResource = false;
+  if (NS_SUCCEEDED(NS_URIChainHasFlags(
+          finalURI, nsIProtocolHandler::URI_IS_UI_RESOURCE, &isUiResource)) &&
+      isUiResource) {
+    return NS_OK;
+  }
+  nsCOMPtr<nsIURI> innerURI = NS_GetInnermostURI(finalURI);
+
+  if (!innerURI) {
+    aChannel->Cancel(NS_ERROR_CONTENT_BLOCKED);
+    return NS_ERROR_CONTENT_BLOCKED;
+  }
+  if (innerURI->SchemeIs("file")) {
+    if ((contentPolicyType == ExtContentPolicy::TYPE_STYLESHEET) ||
+        (contentPolicyType == ExtContentPolicy::TYPE_OTHER)) {
+      return NS_OK;
+    }
+  }
+  if (innerURI->SchemeIs("jar") || innerURI->SchemeIs("about") ||
+      innerURI->SchemeIs("moz-safe-about")) {
+    return NS_OK;
+  }
+
+  nsAutoCString requestedURL;
+  innerURI->GetAsciiSpec(requestedURL);
+  MOZ_LOG(sUELLog, LogLevel::Warning,
+          ("SystemPrincipal should not load remote resources. URL: %s, type %d",
+           requestedURL.get(), int(contentPolicyType)));
+
+
+  if (contentPolicyType == ExtContentPolicy::TYPE_SUBDOCUMENT) {
+    if (net::SchemeIsHttpOrHttps(innerURI)) {
+      MOZ_ASSERT(
+          false,
+          "Disallowing SystemPrincipal load of subdocuments on HTTP(S).");
+      aChannel->Cancel(NS_ERROR_CONTENT_BLOCKED);
+      return NS_ERROR_CONTENT_BLOCKED;
+    }
+    if (innerURI->SchemeIs("data")) {
+      MOZ_ASSERT(
+          false,
+          "Disallowing SystemPrincipal load of subdocuments on data URL.");
+      aChannel->Cancel(NS_ERROR_CONTENT_BLOCKED);
+      return NS_ERROR_CONTENT_BLOCKED;
+    }
+  }
+  if (contentPolicyType == ExtContentPolicy::TYPE_SCRIPT) {
+    if (net::SchemeIsHttpOrHttps(innerURI)) {
+      MOZ_ASSERT(false,
+                 "Disallowing SystemPrincipal load of scripts on HTTP(S).");
+      aChannel->Cancel(NS_ERROR_CONTENT_BLOCKED);
+      return NS_ERROR_CONTENT_BLOCKED;
+    }
+  }
+  if (contentPolicyType == ExtContentPolicy::TYPE_STYLESHEET) {
+    if (net::SchemeIsHttpOrHttps(innerURI)) {
+      MOZ_ASSERT(false,
+                 "Disallowing SystemPrincipal load of stylesheets on HTTP(S).");
+      aChannel->Cancel(NS_ERROR_CONTENT_BLOCKED);
+      return NS_ERROR_CONTENT_BLOCKED;
+    }
+  }
+  return NS_OK;
+}
+
+nsresult nsContentSecurityManager::CheckAllowLoadInPrivilegedAboutContext(
+    nsIChannel* aChannel) {
+  if (!StaticPrefs::security_disallow_privilegedabout_remote_script_loads()) {
+    return NS_OK;
+  }
+
+  nsAutoCString remoteType;
+  if (XRE_IsParentProcess()) {
+    nsCOMPtr<nsIParentChannel> parentChannel;
+    NS_QueryNotificationCallbacks(aChannel, parentChannel);
+    if (parentChannel) {
+      parentChannel->GetRemoteType(remoteType);
+    }
+  } else {
+    remoteType.Assign(
+        mozilla::dom::ContentChild::GetSingleton()->GetRemoteType());
+  }
+
+  if (!remoteType.Equals(PRIVILEGEDABOUT_REMOTE_TYPE)) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsILoadInfo> loadInfo = aChannel->LoadInfo();
+  ExtContentPolicyType contentPolicyType =
+      loadInfo->GetExternalContentPolicyType();
+  if (contentPolicyType != ExtContentPolicy::TYPE_SCRIPT) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIURI> finalURI;
+  NS_GetFinalChannelURI(aChannel, getter_AddRefs(finalURI));
+  nsCOMPtr<nsIURI> innerURI = NS_GetInnermostURI(finalURI);
+
+  bool isLocal;
+  NS_URIChainHasFlags(innerURI, nsIProtocolHandler::URI_IS_LOCAL_RESOURCE,
+                      &isLocal);
+  if (isLocal && !innerURI->SchemeIs("data") && !innerURI->SchemeIs("blob")) {
+    return NS_OK;
+  }
+  MOZ_ASSERT(
+      false,
+      "Disallowing privileged about process to load scripts on HTTP(S).");
+  aChannel->Cancel(NS_ERROR_CONTENT_BLOCKED);
+  return NS_ERROR_CONTENT_BLOCKED;
+}
+
+nsresult nsContentSecurityManager::CheckChannelHasProtocolSecurityFlag(
+    nsIChannel* aChannel) {
+  nsCOMPtr<nsIURI> uri;
+  nsresult rv = NS_GetFinalChannelURI(aChannel, getter_AddRefs(uri));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsIIOService> ios = do_GetIOService(&rv);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  uint32_t flags;
+  rv = ios->GetDynamicProtocolFlags(uri, &flags);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  uint32_t securityFlagsSet = 0;
+  if (flags & nsIProtocolHandler::URI_LOADABLE_BY_ANYONE) {
+    securityFlagsSet += 1;
+  }
+  if (flags & nsIProtocolHandler::URI_DANGEROUS_TO_LOAD) {
+    securityFlagsSet += 1;
+  }
+  if (flags & nsIProtocolHandler::URI_IS_UI_RESOURCE) {
+    securityFlagsSet += 1;
+  }
+  if (flags & nsIProtocolHandler::URI_IS_LOCAL_FILE) {
+    securityFlagsSet += 1;
+  }
+  if (flags & nsIProtocolHandler::URI_LOADABLE_BY_SUBSUMERS) {
+    securityFlagsSet += 1;
+  }
+
+  if (securityFlagsSet == 1) {
+    return NS_OK;
+  }
+
+  MOZ_ASSERT(false, "protocol must use one valid security flag");
+  return NS_ERROR_CONTENT_BLOCKED;
+}
+
+static nsresult CheckAllowFileProtocolScriptLoad(nsIChannel* aChannel) {
+  nsCOMPtr<nsILoadInfo> loadInfo = aChannel->LoadInfo();
+  ExtContentPolicyType type = loadInfo->GetExternalContentPolicyType();
+
+  if (type != ExtContentPolicy::TYPE_SCRIPT) {
+    return NS_OK;
+  }
+
+  if (!StaticPrefs::security_block_fileuri_script_with_wrong_mime()) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIURI> uri;
+  nsresult rv = NS_GetFinalChannelURI(aChannel, getter_AddRefs(uri));
+  NS_ENSURE_SUCCESS(rv, rv);
+  if (!uri || !uri->SchemeIs("file")) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIMIMEService> mime = do_GetService("@mozilla.org/mime;1", &rv);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsAutoCString contentType;
+  rv = mime->GetTypeFromURI(uri, contentType);
+  if (NS_FAILED(rv) || !nsContentUtils::IsJavascriptMIMEType(
+                           NS_ConvertUTF8toUTF16(contentType))) {
+    nsCOMPtr<Document> doc;
+    if (nsINode* node = loadInfo->LoadingNode()) {
+      doc = node->OwnerDoc();
+    }
+
+    nsAutoCString spec;
+    uri->GetSpec(spec);
+
+    AutoTArray<nsString, 1> params;
+    CopyUTF8toUTF16(NS_UnescapeURL(spec), *params.AppendElement());
+    CopyUTF8toUTF16(NS_UnescapeURL(contentType), *params.AppendElement());
+
+    nsContentUtils::ReportToConsole(nsIScriptError::warningFlag,
+                                    "FILE_SCRIPT_BLOCKED"_ns, doc,
+                                    PropertiesFile::SECURITY_PROPERTIES,
+                                    "BlockFileScriptWithWrongMimeType", params);
+
+    return NS_ERROR_CONTENT_BLOCKED;
+  }
+
+  return NS_OK;
+}
+
+static nsresult CheckAllowLoadByTriggeringRemoteType(nsIChannel* aChannel) {
+  MOZ_ASSERT(aChannel);
+
+  nsCOMPtr<nsILoadInfo> loadInfo = aChannel->LoadInfo();
+
+  nsAutoCString triggeringRemoteType;
+  nsresult rv = loadInfo->GetTriggeringRemoteType(triggeringRemoteType);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (!ValidatePrincipalCouldPotentiallyBeLoadedBy(
+          loadInfo->PrincipalToInherit(), triggeringRemoteType,
+          {ValidatePrincipalOptions::AllowNullPtr})) {
+    if (MOZ_LOG_TEST(sUELLog, LogLevel::Warning)) {
+      nsAutoCString origin;
+      loadInfo->PrincipalToInherit()->GetOrigin(origin);
+      MOZ_LOG(sUELLog, LogLevel::Warning,
+              ("Unexpected PrincipalToInherit %s for remote %s", origin.get(),
+               triggeringRemoteType.get()));
+    }
+    return NS_ERROR_CONTENT_BLOCKED;
+  }
+
+  ExtContentPolicy contentPolicyType = loadInfo->GetExternalContentPolicyType();
+  if (contentPolicyType != ExtContentPolicy::TYPE_DOCUMENT &&
+      contentPolicyType != ExtContentPolicy::TYPE_SUBDOCUMENT &&
+      contentPolicyType != ExtContentPolicy::TYPE_OBJECT) {
+    return NS_OK;
+  }
+
+  MOZ_DIAGNOSTIC_ASSERT(NS_IsMainThread(),
+                        "Unexpected off-the-main-thread call to "
+                        "CheckAllowLoadByTriggeringRemoteType");
+
+  if (!StringBeginsWith(triggeringRemoteType, WEB_REMOTE_TYPE)) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIURI> finalURI;
+  rv = NS_GetFinalChannelURI(aChannel, getter_AddRefs(finalURI));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsIURI> innermostURI = NS_GetInnermostURI(finalURI);
+  if (innermostURI->SchemeIs("about")) {
+    nsCOMPtr<nsIAboutModule> aboutModule;
+    rv = NS_GetAboutModule(innermostURI, getter_AddRefs(aboutModule));
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    uint32_t aboutModuleFlags = 0;
+    rv = aboutModule->GetURIFlags(innermostURI, &aboutModuleFlags);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    if (!(aboutModuleFlags & nsIAboutModule::MAKE_LINKABLE) &&
+        !(aboutModuleFlags & nsIAboutModule::URI_CAN_LOAD_IN_CHILD) &&
+        !(aboutModuleFlags & nsIAboutModule::URI_MUST_LOAD_IN_CHILD)) {
+      NS_WARNING(nsPrintfCString("Blocking load of about URI (%s) which cannot "
+                                 "be linked to in web content process",
+                                 finalURI->GetSpecOrDefault().get())
+                     .get());
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+      if (NS_SUCCEEDED(
+              loadInfo->TriggeringPrincipal()->CheckMayLoad(finalURI, true))) {
+        nsAutoCString aboutModuleName;
+        MOZ_ALWAYS_SUCCEEDS(
+            NS_GetAboutModuleName(innermostURI, aboutModuleName));
+        MOZ_CRASH_UNSAFE_PRINTF(
+            "Blocking load of about uri by content process which may have "
+            "otherwise succeeded [aboutModule=%s, isSystemPrincipal=%d]",
+            aboutModuleName.get(),
+            loadInfo->TriggeringPrincipal()->IsSystemPrincipal());
+      }
+#endif
+      return NS_ERROR_CONTENT_BLOCKED;
+    }
+    return NS_OK;
+  }
+
+  bool localFile = false;
+  rv = NS_URIChainHasFlags(finalURI, nsIProtocolHandler::URI_IS_LOCAL_FILE,
+                           &localFile);
+  NS_ENSURE_SUCCESS(rv, rv);
+  if (localFile) {
+    NS_WARNING(
+        nsPrintfCString(
+            "Blocking document load of file URI (%s) from web content process",
+            innermostURI->GetSpecOrDefault().get())
+            .get());
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+    if (NS_SUCCEEDED(
+            loadInfo->TriggeringPrincipal()->CheckMayLoad(finalURI, true))) {
+      MOZ_CRASH_UNSAFE_PRINTF(
+          "Blocking document load of file URI by content process which may "
+          "have otherwise succeeded [isSystemPrincipal=%d]",
+          loadInfo->TriggeringPrincipal()->IsSystemPrincipal());
+    }
+#endif
+    return NS_ERROR_CONTENT_BLOCKED;
+  }
+
+  return NS_OK;
+}
+
+nsresult nsContentSecurityManager::doContentSecurityCheck(
+    nsIChannel* aChannel, nsCOMPtr<nsIStreamListener>& aInAndOutListener) {
+  NS_ENSURE_ARG(aChannel);
+  nsCOMPtr<nsILoadInfo> loadInfo = aChannel->LoadInfo();
+  if (MOZ_UNLIKELY(MOZ_LOG_TEST(sCSMLog, LogLevel::Verbose))) {
+    DebugDoContentSecurityCheck(aChannel, loadInfo);
+  }
+
+  MOZ_TRY(CheckAllowLoadInSystemPrivilegedContext(aChannel));
+
+  MOZ_TRY(CheckAllowLoadInPrivilegedAboutContext(aChannel));
+
+  MOZ_TRY(CheckChannelHasProtocolSecurityFlag(aChannel));
+
+  MOZ_TRY(CheckAllowLoadByTriggeringRemoteType(aChannel));
+
+  MOZ_TRY(CheckForIncoherentResultPrincipal(aChannel));
+
+  if (loadInfo->GetInitialSecurityCheckDone()) {
+    return NS_OK;
+  }
+
+  MOZ_TRY(ValidateSecurityFlags(loadInfo));
+
+  if (loadInfo->GetSecurityMode() ==
+      nsILoadInfo::SEC_REQUIRE_CORS_INHERITS_SEC_CONTEXT) {
+    MOZ_TRY(DoCORSChecks(aChannel, loadInfo, aInAndOutListener));
+  }
+
+  MOZ_TRY(CheckChannel(aChannel));
+
+  MOZ_TRY(DoContentSecurityChecks(aChannel, loadInfo));
+
+  MOZ_TRY(CheckAllowFileProtocolScriptLoad(aChannel));
+
+  loadInfo->SetInitialSecurityCheckDone(true);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsContentSecurityManager::AsyncOnChannelRedirect(
+    nsIChannel* aOldChannel, nsIChannel* aNewChannel, uint32_t aRedirFlags,
+    nsIAsyncVerifyRedirectCallback* aCb) {
+  if (aRedirFlags & nsIChannelEventSink::REDIRECT_INTERNAL) {
+    aCb->OnRedirectVerifyCallback(NS_OK);
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsILoadInfo> loadInfo = aOldChannel->LoadInfo();
+  nsresult rv = CheckChannel(aNewChannel);
+  if (NS_FAILED(rv)) {
+    aOldChannel->Cancel(rv);
+    return rv;
+  }
+
+  nsCOMPtr<nsIPrincipal> oldPrincipal;
+  nsContentUtils::GetSecurityManager()->GetChannelResultPrincipal(
+      aOldChannel, getter_AddRefs(oldPrincipal));
+
+  nsCOMPtr<nsIURI> newURI;
+  (void)NS_GetFinalChannelURI(aNewChannel, getter_AddRefs(newURI));
+  NS_ENSURE_STATE(oldPrincipal && newURI);
+
+  if (!AllowInsecureRedirectToDataURI(aNewChannel)) {
+    aOldChannel->Cancel(NS_ERROR_CONTENT_BLOCKED);
+    return NS_ERROR_CONTENT_BLOCKED;
+  }
+
+  const uint32_t flags =
+      nsIScriptSecurityManager::LOAD_IS_AUTOMATIC_DOCUMENT_REPLACEMENT |
+      nsIScriptSecurityManager::DISALLOW_SCRIPT;
+  rv = nsContentUtils::GetSecurityManager()->CheckLoadURIWithPrincipal(
+      oldPrincipal, newURI, flags, loadInfo->GetInnerWindowID());
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  aCb->OnRedirectVerifyCallback(NS_OK);
+  return NS_OK;
+}
+
+static void AddLoadFlags(nsIRequest* aRequest, nsLoadFlags aNewFlags) {
+  nsLoadFlags flags;
+  aRequest->GetLoadFlags(&flags);
+  flags |= aNewFlags;
+  aRequest->SetLoadFlags(flags);
+}
+
+nsresult nsContentSecurityManager::CheckChannel(nsIChannel* aChannel) {
+  nsCOMPtr<nsILoadInfo> loadInfo = aChannel->LoadInfo();
+  nsCOMPtr<nsIURI> uri;
+  nsresult rv = NS_GetFinalChannelURI(aChannel, getter_AddRefs(uri));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  uint32_t cookiePolicy = loadInfo->GetCookiePolicy();
+  if (cookiePolicy == nsILoadInfo::SEC_COOKIES_SAME_ORIGIN) {
+    MOZ_ASSERT(loadInfo->GetExternalContentPolicyType() !=
+               ExtContentPolicy::TYPE_DOCUMENT);
+    nsIPrincipal* loadingPrincipal = loadInfo->GetLoadingPrincipal();
+
+    rv = loadingPrincipal->CheckMayLoad(uri, false);
+    if (NS_FAILED(rv)) {
+      AddLoadFlags(aChannel, nsIRequest::LOAD_ANONYMOUS);
+    }
+  } else if (cookiePolicy == nsILoadInfo::SEC_COOKIES_OMIT) {
+    AddLoadFlags(aChannel, nsIRequest::LOAD_ANONYMOUS);
+  }
+
+  if (!CrossOriginEmbedderPolicyAllowsCredentials(aChannel)) {
+    AddLoadFlags(aChannel, nsIRequest::LOAD_ANONYMOUS);
+  }
+
+  nsSecurityFlags securityMode = loadInfo->GetSecurityMode();
+
+  if (securityMode == nsILoadInfo::SEC_REQUIRE_CORS_INHERITS_SEC_CONTEXT) {
+    if (NS_HasBeenCrossOrigin(aChannel)) {
+      loadInfo->MaybeIncreaseTainting(LoadTainting::CORS);
+    }
+    return NS_OK;
+  }
+
+  if (loadInfo->TriggeringPrincipal()->IsSystemPrincipal() &&
+      loadInfo->GetExternalContentPolicyType() !=
+          ExtContentPolicy::TYPE_DOCUMENT &&
+      loadInfo->GetExternalContentPolicyType() !=
+          ExtContentPolicy::TYPE_SUBDOCUMENT) {
+    return NS_OK;
+  }
+
+  if ((securityMode ==
+       nsILoadInfo::SEC_REQUIRE_SAME_ORIGIN_INHERITS_SEC_CONTEXT) ||
+      (securityMode == nsILoadInfo::SEC_REQUIRE_SAME_ORIGIN_DATA_IS_BLOCKED)) {
+    rv = DoSOPChecks(uri, loadInfo, aChannel);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  if ((securityMode ==
+       nsILoadInfo::SEC_ALLOW_CROSS_ORIGIN_INHERITS_SEC_CONTEXT) ||
+      (securityMode ==
+       nsILoadInfo::SEC_ALLOW_CROSS_ORIGIN_SEC_CONTEXT_IS_NULL)) {
+    if (NS_HasBeenCrossOrigin(aChannel)) {
+      NS_ENSURE_FALSE(loadInfo->GetDontFollowRedirects(), NS_ERROR_DOM_BAD_URI);
+      loadInfo->MaybeIncreaseTainting(LoadTainting::Opaque);
+    }
+    rv = DoCheckLoadURIChecks(uri, loadInfo);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  return NS_OK;
+}
+
+bool nsContentSecurityManager::CrossOriginEmbedderPolicyAllowsCredentials(
+    nsIChannel* aChannel) {
+  nsCOMPtr<nsILoadInfo> loadInfo = aChannel->LoadInfo();
+
+  if (loadInfo->GetExternalContentPolicyType() ==
+          ExtContentPolicy::TYPE_DOCUMENT ||
+      loadInfo->GetExternalContentPolicyType() ==
+          ExtContentPolicy::TYPE_SUBDOCUMENT ||
+      loadInfo->GetExternalContentPolicyType() ==
+          ExtContentPolicy::TYPE_WEBSOCKET) {
+    return true;
+  }
+
+  if (loadInfo->GetSecurityMode() !=
+          nsILoadInfo::SEC_ALLOW_CROSS_ORIGIN_SEC_CONTEXT_IS_NULL &&
+      loadInfo->GetSecurityMode() !=
+          nsILoadInfo::SEC_ALLOW_CROSS_ORIGIN_INHERITS_SEC_CONTEXT) {
+    return true;
+  }
+
+  if (loadInfo->GetLoadingEmbedderPolicy() !=
+      nsILoadInfo::EMBEDDER_POLICY_CREDENTIALLESS) {
+    return true;
+  }
+
+  nsIScriptSecurityManager* ssm = nsContentUtils::GetSecurityManager();
+  nsCOMPtr<nsIPrincipal> resourcePrincipal;
+  ssm->GetChannelURIPrincipal(aChannel, getter_AddRefs(resourcePrincipal));
+
+  bool sameOrigin = resourcePrincipal->Equals(loadInfo->TriggeringPrincipal());
+  nsAutoCString serializedOrigin;
+  GetSerializedOrigin(loadInfo->TriggeringPrincipal(), resourcePrincipal,
+                      serializedOrigin, loadInfo);
+  if (sameOrigin && !serializedOrigin.IsEmpty()) {
+    return true;
+  }
+
+  return false;
+}
+
+void nsContentSecurityManager::GetSerializedOrigin(
+    nsIPrincipal* aOrigin, nsIPrincipal* aResourceOrigin,
+    nsACString& aSerializedOrigin, nsILoadInfo* aLoadInfo) {
+  nsCOMPtr<nsIPrincipal> lastOrigin;
+  for (nsIRedirectHistoryEntry* entry : aLoadInfo->RedirectChain()) {
+    if (!lastOrigin) {
+      entry->GetPrincipal(getter_AddRefs(lastOrigin));
+      continue;
+    }
+
+    nsCOMPtr<nsIPrincipal> currentOrigin;
+    entry->GetPrincipal(getter_AddRefs(currentOrigin));
+
+    if (!currentOrigin->Equals(lastOrigin) && !lastOrigin->Equals(aOrigin)) {
+      aSerializedOrigin.AssignLiteral("null");
+      return;
+    }
+    lastOrigin = currentOrigin;
+  }
+
+  if (!lastOrigin) {
+    aOrigin->GetWebExposedOriginSerialization(aSerializedOrigin);
+    return;
+  }
+
+  if (!lastOrigin->Equals(aResourceOrigin) && !lastOrigin->Equals(aOrigin)) {
+    aSerializedOrigin.AssignLiteral("null");
+    return;
+  }
+
+  aOrigin->GetWebExposedOriginSerialization(aSerializedOrigin);
+}
+
+bool nsContentSecurityManager::IsCompatibleWithCrossOriginIsolation(
+    nsILoadInfo::CrossOriginEmbedderPolicy aPolicy) {
+  return aPolicy == nsILoadInfo::EMBEDDER_POLICY_CREDENTIALLESS ||
+         aPolicy == nsILoadInfo::EMBEDDER_POLICY_REQUIRE_CORP;
+}
+
+
+NS_IMETHODIMP
+nsContentSecurityManager::PerformSecurityCheck(
+    nsIChannel* aChannel, nsIStreamListener* aStreamListener,
+    nsIStreamListener** outStreamListener) {
+  nsCOMPtr<nsIStreamListener> inAndOutListener = aStreamListener;
+  nsresult rv = doContentSecurityCheck(aChannel, inAndOutListener);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  inAndOutListener.forget(outStreamListener);
+  return NS_OK;
+}
+
+nsresult nsContentSecurityManager::CheckForIncoherentResultPrincipal(
+    nsIChannel* aChannel) {
+  nsCOMPtr<nsILoadInfo> loadInfo = aChannel->LoadInfo();
+  ExtContentPolicyType contentPolicyType =
+      loadInfo->GetExternalContentPolicyType();
+  if (contentPolicyType != ExtContentPolicyType::TYPE_DOCUMENT &&
+      contentPolicyType != ExtContentPolicyType::TYPE_SUBDOCUMENT &&
+      contentPolicyType != ExtContentPolicyType::TYPE_OBJECT) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIPrincipal> result;
+  nsresult rv = nsScriptSecurityManager::GetScriptSecurityManager()
+                    ->GetChannelResultPrincipalIfNotSandboxed(
+                        aChannel, getter_AddRefs(result));
+  NS_ENSURE_SUCCESS(rv, rv);
+  NS_ENSURE_STATE(result);
+
+  nsCOMPtr<nsIPrincipal> resultOrPrecursor;
+  if (nsCOMPtr<nsIPrincipal> precursor = result->GetPrecursorPrincipal()) {
+    resultOrPrecursor = precursor;
+  } else {
+    resultOrPrecursor = result;
+  }
+
+  if (!resultOrPrecursor->GetIsContentPrincipal()) {
+    return NS_OK;
+  }
+
+  nsAutoCString resultSiteOriginNoSuffix;
+  rv = resultOrPrecursor->GetSiteOriginNoSuffix(resultSiteOriginNoSuffix);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsIURI> resultSiteOriginURI;
+  NS_NewURI(getter_AddRefs(resultSiteOriginURI), resultSiteOriginNoSuffix);
+  NS_ENSURE_STATE(resultSiteOriginURI);
+
+  nsCOMPtr<nsIURI> channelURI;
+  aChannel->GetURI(getter_AddRefs(channelURI));
+  NS_ENSURE_STATE(channelURI);
+
+  if (channelURI->SchemeIs("data") && !result->GetIsNullPrincipal()) {
+    MOZ_ASSERT_UNREACHABLE("data URI with a non-null principal");
+    return NS_ERROR_CONTENT_BLOCKED;
+  }
+
+  if (NS_IsAboutSrcdoc(channelURI)) {
+    nsIPrincipal* loadingPrincipal = loadInfo->GetLoadingPrincipal();
+    if (!loadingPrincipal || !loadingPrincipal->Subsumes(result)) {
+      MOZ_ASSERT_UNREACHABLE(
+          "about:srcdoc result principal not subsumed by embedder");
+      return NS_ERROR_CONTENT_BLOCKED;
+    }
+  }
+
+  nsCOMPtr<nsIPrincipal> channelUriPrincipal =
+      BasePrincipal::CreateContentPrincipal(channelURI, {});
+  NS_ENSURE_STATE(channelUriPrincipal);
+
+  nsAutoCString channelUriSiteOrigin;
+  rv = channelUriPrincipal->GetSiteOriginNoSuffix(channelUriSiteOrigin);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsIURI> channelSiteOriginURI;
+  NS_NewURI(getter_AddRefs(channelSiteOriginURI), channelUriSiteOrigin);
+  NS_ENSURE_STATE(channelSiteOriginURI);
+
+  if (nsScriptSecurityManager::IsHttpOrHttpsAndCrossOrigin(
+          resultSiteOriginURI, channelSiteOriginURI) ||
+      (!net::SchemeIsHttpOrHttps(resultSiteOriginURI) &&
+       net::SchemeIsHttpOrHttps(channelSiteOriginURI))) {
+    return NS_ERROR_CONTENT_BLOCKED;
+  }
+
+  return NS_OK;
+}

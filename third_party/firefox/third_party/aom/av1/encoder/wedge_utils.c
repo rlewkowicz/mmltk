@@ -1,0 +1,54 @@
+/*
+ * Copyright (c) 2016, Alliance for Open Media. All rights reserved.
+ *
+ * This source code is subject to the terms of the BSD 2 Clause License and
+ * the Alliance for Open Media Patent License 1.0. If the BSD 2 Clause License
+ * was not distributed with this source code in the LICENSE file, you can
+ * obtain it at www.aomedia.org/license/software. If the Alliance for Open
+ * Media Patent License 1.0 was not distributed with this source code in the
+ * PATENTS file, you can obtain it at www.aomedia.org/license/patent.
+ */
+
+#include <assert.h>
+
+#include "aom/aom_integer.h"
+
+#include "aom_ports/mem.h"
+
+#include "aom_dsp/aom_dsp_common.h"
+
+#include "av1/common/reconinter.h"
+
+#define MAX_MASK_VALUE (1 << WEDGE_WEIGHT_BITS)
+
+uint64_t av1_wedge_sse_from_residuals_c(const int16_t *r1, const int16_t *d,
+                                        const uint8_t *m, int N) {
+  uint64_t csse = 0;
+  int i;
+
+  for (i = 0; i < N; i++) {
+    int32_t t = MAX_MASK_VALUE * r1[i] + m[i] * d[i];
+    t = clamp(t, INT16_MIN, INT16_MAX);
+    csse += t * t;
+  }
+  return ROUND_POWER_OF_TWO(csse, 2 * WEDGE_WEIGHT_BITS);
+}
+
+int8_t av1_wedge_sign_from_residuals_c(const int16_t *ds, const uint8_t *m,
+                                       int N, int64_t limit) {
+  int64_t acc = 0;
+
+  do {
+    acc += *ds++ * *m++;
+  } while (--N);
+
+  return acc > limit;
+}
+
+void av1_wedge_compute_delta_squares_c(int16_t *d, const int16_t *a,
+                                       const int16_t *b, int N) {
+  int i;
+
+  for (i = 0; i < N; i++)
+    d[i] = clamp(a[i] * a[i] - b[i] * b[i], INT16_MIN, INT16_MAX);
+}

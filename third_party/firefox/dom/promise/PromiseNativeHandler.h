@@ -1,0 +1,63 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_PromiseNativeHandler_h
+#define mozilla_dom_PromiseNativeHandler_h
+
+#include "js/TypeDecls.h"
+#include "js/Value.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/StaticString.h"
+#include "nsISupports.h"
+
+namespace mozilla::dom {
+
+class PromiseNativeHandler : public nsISupports {
+ protected:
+  virtual ~PromiseNativeHandler() = default;
+
+ public:
+  MOZ_CAN_RUN_SCRIPT
+  virtual void ResolvedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue,
+                                ErrorResult& aRv) = 0;
+
+  MOZ_CAN_RUN_SCRIPT
+  virtual void RejectedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue,
+                                ErrorResult& aRv) = 0;
+};
+
+class MozPromiseRejectOnDestructionBase : public PromiseNativeHandler {
+  NS_DECL_ISUPPORTS
+
+  void ResolvedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue,
+                        ErrorResult& aRv) override {}
+  void RejectedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue,
+                        ErrorResult& aRv) override {}
+
+ protected:
+  ~MozPromiseRejectOnDestructionBase() override = default;
+};
+
+template <typename T>
+class MozPromiseRejectOnDestruction final
+    : public MozPromiseRejectOnDestructionBase {
+ public:
+  MozPromiseRejectOnDestruction(const RefPtr<T>& aMozPromise,
+                                StaticString aCallSite)
+      : mMozPromise(aMozPromise), mCallSite(aCallSite) {
+    MOZ_ASSERT(aMozPromise);
+  }
+
+ protected:
+  ~MozPromiseRejectOnDestruction() override {
+    mMozPromise->Reject(NS_BINDING_ABORTED, mCallSite);
+  }
+
+  RefPtr<T> mMozPromise;
+  StaticString mCallSite;
+};
+
+}  
+
+#endif  // mozilla_dom_PromiseNativeHandler_h

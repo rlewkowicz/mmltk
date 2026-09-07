@@ -1,0 +1,359 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "DoubleTapToZoom.h"
+
+#include <algorithm>  // for std::min, std::max
+
+#include "mozilla/PresShell.h"
+#include "mozilla/ScrollContainerFrame.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/EffectsInfo.h"
+#include "mozilla/dom/BrowserChild.h"
+#include "nsCOMPtr.h"
+#include "nsIContent.h"
+#include "mozilla/dom/Document.h"
+#include "nsIFrame.h"
+#include "nsIFrameInlines.h"
+#include "nsTableCellFrame.h"
+#include "nsLayoutUtils.h"
+#include "nsStyleConsts.h"
+#include "mozilla/ViewportUtils.h"
+#include "mozilla/EventListenerManager.h"
+#include "mozilla/layers/APZUtils.h"
+
+namespace mozilla {
+namespace layers {
+
+namespace {
+
+using FrameForPointOption = nsLayoutUtils::FrameForPointOption;
+
+static bool IsGeneratedContent(nsIContent* aContent) {
+  return aContent->IsGeneratedContentContainerForBefore() ||
+         aContent->IsGeneratedContentContainerForAfter();
+}
+
+static already_AddRefed<dom::Element> ElementFromPoint(
+    const RefPtr<PresShell>& aPresShell, const CSSPoint& aPoint) {
+  nsIFrame* rootFrame = aPresShell->GetRootFrame();
+  if (!rootFrame) {
+    return nullptr;
+  }
+  nsIFrame* frame = nsLayoutUtils::GetFrameForPoint(
+      RelativeTo{rootFrame, ViewportType::Visual}, CSSPoint::ToAppUnits(aPoint),
+      {{FrameForPointOption::IgnorePaintSuppression}});
+  while (frame && (!frame->GetContent() ||
+                   (frame->GetContent()->IsInNativeAnonymousSubtree() &&
+                    !IsGeneratedContent(frame->GetContent())))) {
+    frame = nsLayoutUtils::GetParentOrPlaceholderFor(frame);
+  }
+  if (!frame) {
+    return nullptr;
+  }
+  nsIContent* content = frame->GetContent();
+  if (!content) {
+    return nullptr;
+  }
+  if (dom::Element* element = content->GetAsElementOrParentElement()) {
+    return do_AddRef(element);
+  }
+  return nullptr;
+}
+
+static dom::Element* GetNearbyTableCell(
+    const nsCOMPtr<dom::Element>& aElement) {
+  nsTableCellFrame* tableCell = do_QueryFrame(aElement->GetPrimaryFrame());
+  if (tableCell) {
+    return aElement.get();
+  }
+  if (dom::Element* parent = aElement->GetFlattenedTreeParentElement()) {
+    nsTableCellFrame* tableCell = do_QueryFrame(parent->GetPrimaryFrame());
+    if (tableCell) {
+      return parent;
+    }
+    if (dom::Element* grandParent = parent->GetFlattenedTreeParentElement()) {
+      tableCell = do_QueryFrame(grandParent->GetPrimaryFrame());
+      if (tableCell) {
+        return grandParent;
+      }
+    }
+  }
+  return nullptr;
+}
+
+static CSSRect GetBoundingContentRect(
+    const dom::Element* aElement,
+    const RefPtr<dom::Document>& aInProcessRootContentDocument,
+    const ScrollContainerFrame* aRootScrollContainerFrame,
+    const DoubleTapToZoomMetrics& aMetrics,
+    mozilla::Maybe<CSSRect>* aOutNearestScrollClip = nullptr) {
+  CSSRect result = nsLayoutUtils::GetBoundingContentRect(
+      aElement, aRootScrollContainerFrame, aOutNearestScrollClip);
+  if (aInProcessRootContentDocument->IsTopLevelContentDocument()) {
+    return result;
+  }
+
+  nsIFrame* frame = aElement->GetPrimaryFrame();
+  if (!frame) {
+    return CSSRect();
+  }
+
+  if (aOutNearestScrollClip && aOutNearestScrollClip->isNothing()) {
+    if (dom::BrowserChild* browserChild =
+            dom::BrowserChild::GetFrom(frame->PresShell())) {
+      const dom::EffectsInfo& effectsInfo = browserChild->GetEffectsInfo();
+      if (effectsInfo.IsVisible()) {
+        *aOutNearestScrollClip =
+            effectsInfo.mVisibleRect.map([&aMetrics](const nsRect& aRect) {
+              return aMetrics.mTransformMatrix.TransformBounds(
+                  CSSRect::FromAppUnits(aRect));
+            });
+      }
+    }
+  }
+
+  return aMetrics.mTransformMatrix.TransformBounds(
+      CSSRect::FromAppUnits(frame->GetBoundingClientRect()));
+}
+
+static bool ShouldZoomToElement(
+    const nsCOMPtr<dom::Element>& aElement,
+    const RefPtr<dom::Document>& aInProcessRootContentDocument,
+    ScrollContainerFrame* aRootScrollContainerFrame,
+    const DoubleTapToZoomMetrics& aMetrics) {
+  if (nsIFrame* frame = aElement->GetPrimaryFrame()) {
+    if (frame->StyleDisplay()->IsInlineFlow() &&
+        !frame->IsReplaced()) {
+      return false;
+    }
+  }
+  if (aElement->OwnerDoc() == aInProcessRootContentDocument &&
+      aElement->IsHTMLElement(nsGkAtoms::html)) {
+    return false;
+  }
+  if (aElement->IsAnyOfHTMLElements(nsGkAtoms::li, nsGkAtoms::q)) {
+    return false;
+  }
+
+  if (dom::Element* tableCell = GetNearbyTableCell(aElement)) {
+    CSSRect rect =
+        GetBoundingContentRect(tableCell, aInProcessRootContentDocument,
+                               aRootScrollContainerFrame, aMetrics);
+    if (rect.width < 0.3 * aMetrics.mRootScrollableRect.width) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static bool RectHasAlmostSameZoomLevel(const CSSRect& aRect,
+                                       const CSSRect& aCompositedArea) {
+
+
+  float overlapArea = std::min(aRect.width, aCompositedArea.width) *
+                      std::min(aRect.height, aCompositedArea.height);
+  float availHeight = std::min(
+      aRect.Width() * aCompositedArea.Height() / aCompositedArea.Width(),
+      aRect.Height());
+  float showing = overlapArea / (aRect.Width() * availHeight);
+  float ratioW = aRect.Width() / aCompositedArea.Width();
+  float ratioH = aRect.Height() / aCompositedArea.Height();
+
+  return showing > 0.9 && (ratioW > 0.9 || ratioH > 0.9);
+}
+
+}  
+
+static CSSRect AddHMargin(const CSSRect& aRect, const CSSCoord& aMargin,
+                          const CSSRect& aRootScrollableRect) {
+  CSSRect rect =
+      CSSRect(std::max(aRootScrollableRect.X(), aRect.X() - aMargin), aRect.Y(),
+              aRect.Width() + 2 * aMargin, aRect.Height());
+  rect.SetWidth(std::min(rect.Width(), aRootScrollableRect.XMost() - rect.X()));
+  return rect;
+}
+
+static CSSRect AddVMargin(const CSSRect& aRect, const CSSCoord& aMargin,
+                          const CSSRect& aRootScrollableRect) {
+  CSSRect rect =
+      CSSRect(aRect.X(), std::max(aRootScrollableRect.Y(), aRect.Y() - aMargin),
+              aRect.Width(), aRect.Height() + 2 * aMargin);
+  rect.SetHeight(
+      std::min(rect.Height(), aRootScrollableRect.YMost() - rect.Y()));
+  return rect;
+}
+
+static bool IsReplacedElement(const nsCOMPtr<dom::Element>& aElement) {
+  if (nsIFrame* frame = aElement->GetPrimaryFrame()) {
+    if (frame->IsReplaced()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool HasNonPassiveWheelListenerOnAncestor(nsIContent* aContent) {
+  for (nsIContent* content = aContent; content;
+       content = content->GetFlattenedTreeParent()) {
+    EventListenerManager* elm = content->GetExistingListenerManager();
+    if (elm && elm->HasNonPassiveWheelListener()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+ZoomTarget CalculateRectToZoomTo(
+    const RefPtr<dom::Document>& aInProcessRootContentDocument,
+    const CSSPoint& aPoint, const DoubleTapToZoomMetrics& aMetrics) {
+  aInProcessRootContentDocument->FlushPendingNotifications(FlushType::Layout);
+
+  const CSSRect zoomOut;
+
+  RefPtr<PresShell> presShell = aInProcessRootContentDocument->GetPresShell();
+  if (!presShell) {
+    return ZoomTarget{zoomOut, CantZoomOutBehavior::ZoomIn};
+  }
+
+  ScrollContainerFrame* rootScrollContainerFrame =
+      presShell->GetRootScrollContainerFrame();
+  if (!rootScrollContainerFrame) {
+    return ZoomTarget{zoomOut, CantZoomOutBehavior::ZoomIn};
+  }
+
+  CSSPoint documentRelativePoint =
+      aInProcessRootContentDocument->IsTopLevelContentDocument()
+          ? CSSPoint::FromAppUnits(ViewportUtils::VisualToLayout(
+                CSSPoint::ToAppUnits(aPoint), presShell)) +
+                CSSPoint::FromAppUnits(
+                    rootScrollContainerFrame->GetScrollPosition())
+          : aMetrics.mTransformMatrix.TransformPoint(aPoint);
+
+  nsCOMPtr<dom::Element> element = ElementFromPoint(presShell, aPoint);
+  if (!element) {
+    return ZoomTarget{zoomOut, CantZoomOutBehavior::ZoomIn, Nothing(),
+                      Some(documentRelativePoint)};
+  }
+
+  CantZoomOutBehavior cantZoomOutBehavior =
+      HasNonPassiveWheelListenerOnAncestor(element)
+          ? CantZoomOutBehavior::Nothing
+          : CantZoomOutBehavior::ZoomIn;
+
+  while (element && !ShouldZoomToElement(element, aInProcessRootContentDocument,
+                                         rootScrollContainerFrame, aMetrics)) {
+    element = element->GetFlattenedTreeParentElement();
+  }
+
+  if (!element) {
+    return ZoomTarget{zoomOut, cantZoomOutBehavior, Nothing(),
+                      Some(documentRelativePoint)};
+  }
+
+  Maybe<CSSRect> nearestScrollClip;
+  CSSRect rect = GetBoundingContentRect(element, aInProcessRootContentDocument,
+                                        rootScrollContainerFrame, aMetrics,
+                                        &nearestScrollClip);
+
+  if (!rect.Contains(documentRelativePoint)) {
+    if (nsIFrame* scrolledFrame =
+            rootScrollContainerFrame->GetScrolledFrame()) {
+      if (nsIFrame* f = element->GetPrimaryFrame()) {
+        nsRect overflowRect = f->ScrollableOverflowRect();
+        nsLayoutUtils::TransformResult res =
+            nsLayoutUtils::TransformRect(f, scrolledFrame, overflowRect);
+        MOZ_ASSERT(res == nsLayoutUtils::TRANSFORM_SUCCEEDED ||
+                   res == nsLayoutUtils::NONINVERTIBLE_TRANSFORM);
+        if (res == nsLayoutUtils::TRANSFORM_SUCCEEDED) {
+          CSSRect overflowRectCSS = CSSRect::FromAppUnits(overflowRect);
+
+          if (!aInProcessRootContentDocument->IsTopLevelContentDocument()) {
+            overflowRectCSS.MoveBy(CSSPoint::FromAppUnits(
+                -rootScrollContainerFrame->GetScrollPosition()));
+            overflowRectCSS =
+                aMetrics.mTransformMatrix.TransformBounds(overflowRectCSS);
+          }
+          if (nearestScrollClip.isSome()) {
+            overflowRectCSS = nearestScrollClip->Intersect(overflowRectCSS);
+          }
+          if (overflowRectCSS.Contains(documentRelativePoint)) {
+            rect = overflowRectCSS;
+          }
+        }
+      }
+    }
+  }
+
+  CSSRect elementBoundingRect = rect;
+
+  bool heightConstrained = false;
+
+  if (!rect.IsEmpty() && aMetrics.mVisualViewport.Width() > 0.0f &&
+      aMetrics.mVisualViewport.Height() > 0.0f) {
+    const float widthRatio = rect.Width() / aMetrics.mVisualViewport.Width();
+    float targetHeight = aMetrics.mVisualViewport.Height() * widthRatio;
+
+
+    if (IsReplacedElement(element) && targetHeight < rect.Height() &&
+        rect.Height() < 1.1 * rect.Width() &&
+        aMetrics.mVisualViewport.Width() >= aMetrics.mVisualViewport.Height()) {
+      heightConstrained = true;
+      float targetWidth = rect.Height() * aMetrics.mVisualViewport.Width() /
+                          aMetrics.mVisualViewport.Height();
+      MOZ_ASSERT(targetWidth > rect.Width());
+      if (targetWidth > rect.Width()) {
+        rect.x -= (targetWidth - rect.Width()) / 2;
+        rect.SetWidth(targetWidth);
+        elementBoundingRect = rect;
+      }
+
+    } else if (targetHeight < rect.Height()) {
+      float newY = documentRelativePoint.y - (targetHeight * 0.5f);
+      if ((newY + targetHeight) > rect.YMost()) {
+        rect.MoveByY(rect.Height() - targetHeight);
+      } else if (newY > rect.Y()) {
+        rect.MoveToY(newY);
+      }
+      rect.SetHeight(targetHeight);
+    }
+  }
+
+  const CSSCoord margin = 15;
+  rect = AddHMargin(rect, margin, aMetrics.mRootScrollableRect);
+
+  if (heightConstrained) {
+    rect = AddVMargin(rect, margin, aMetrics.mRootScrollableRect);
+  }
+
+  if (RectHasAlmostSameZoomLevel(rect, aMetrics.mVisualViewport)) {
+    return ZoomTarget{zoomOut, cantZoomOutBehavior, Nothing(),
+                      Some(documentRelativePoint)};
+  }
+
+  elementBoundingRect =
+      AddHMargin(elementBoundingRect, margin, aMetrics.mRootScrollableRect);
+
+  elementBoundingRect =
+      AddVMargin(elementBoundingRect, margin, aMetrics.mRootScrollableRect);
+
+  rect.Round();
+  elementBoundingRect.Round();
+
+  return ZoomTarget{rect, cantZoomOutBehavior, Some(elementBoundingRect),
+                    Some(documentRelativePoint)};
+}
+
+std::ostream& operator<<(std::ostream& aStream,
+                         const DoubleTapToZoomMetrics& aMetrics) {
+  aStream << "{ vv=" << aMetrics.mVisualViewport
+          << ", rscr=" << aMetrics.mRootScrollableRect
+          << ", transform=" << aMetrics.mTransformMatrix << " }";
+  return aStream;
+}
+
+}  
+}  

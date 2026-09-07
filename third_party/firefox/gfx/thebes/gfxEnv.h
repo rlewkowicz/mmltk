@@ -1,0 +1,98 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef GFX_ENV_H
+#define GFX_ENV_H
+
+#include "mozilla/Attributes.h"
+#include "nsDebug.h"
+#include "prenv.h"
+
+#include <sstream>
+#include <string_view>
+
+
+
+struct EnvVal {
+  std::string_view as_str;
+
+  static auto From(const char* const raw) {
+    auto ret = EnvVal{};
+
+    ret.as_str = std::string_view{};
+    if (raw) {
+      ret.as_str = raw;
+    }
+
+    return ret;
+  }
+
+  MOZ_IMPLICIT operator bool() const {
+    return !as_str.empty();  
+  }
+};
+
+class gfxEnv final {
+ public:
+  gfxEnv() = delete;
+
+  static EnvVal Uncached(const char* name) {
+    const auto raw = PR_GetEnv(name);
+    const auto ret = EnvVal::From(raw);
+    if (ret && ret.as_str == "0") {
+      auto msg = std::stringstream{};
+      msg << name << "=" << ret.as_str << " -> true!";
+      NS_WARNING(msg.str().c_str());
+    }
+    return ret;
+  }
+
+#define DECL_GFX_ENV(Name)                      \
+  static const EnvVal& Name() {                 \
+    static const auto cached = Uncached(#Name); \
+    return cached;                              \
+  }
+
+
+  DECL_GFX_ENV(MOZ_DEBUG_SHADERS)
+
+  DECL_GFX_ENV(MOZ_DISABLE_CRASH_GUARD)
+  DECL_GFX_ENV(MOZ_FORCE_CRASH_GUARD_NIGHTLY)
+
+  DECL_GFX_ENV(MOZ_DISABLE_FORCE_PRESENT)
+
+  DECL_GFX_ENV(MOZ_DUMP_COMPOSITOR_TEXTURES)
+
+  DECL_GFX_ENV(MOZ_DUMP_GLBLITHELPER)
+
+  DECL_GFX_ENV(MOZ_DUMP_PAINT)
+  DECL_GFX_ENV(MOZ_DUMP_PAINT_ITEMS)
+  DECL_GFX_ENV(MOZ_DUMP_PAINT_TO_FILE)
+
+  DECL_GFX_ENV(MOZ_GFX_CRASH_MOZ_CRASH)
+  DECL_GFX_ENV(MOZ_GFX_CRASH_TELEMETRY)
+
+  DECL_GFX_ENV(MOZ_GL_DEBUG)
+  DECL_GFX_ENV(MOZ_GL_DEBUG_VERBOSE)
+  DECL_GFX_ENV(MOZ_GL_DEBUG_ABORT_ON_ERROR)
+  DECL_GFX_ENV(MOZ_GL_RELEASE_ASSERT_CONTEXT_OWNERSHIP)
+  DECL_GFX_ENV(MOZ_EGL_RELEASE_ASSERT_CONTEXT_OWNERSHIP)
+
+  DECL_GFX_ENV(MOZ_GL_DUMP_EXTS)
+
+  DECL_GFX_ENV(MOZ_GL_SPEW)
+
+  DECL_GFX_ENV(MOZ_GLX_DEBUG)
+
+  DECL_GFX_ENV(MOZ_LAYERS_PREFER_EGL)
+
+  DECL_GFX_ENV(MOZ_LAYERS_PREFER_OFFSCREEN)
+
+  DECL_GFX_ENV(MOZ_WEBGL_WORKAROUND_FIRST_AFFECTS_INSTANCE_ID)
+
+
+#undef DECL_GFX_ENV
+};
+
+#endif /* GFX_ENV_H */

@@ -1,0 +1,353 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+const { SiteDataManager } = ChromeUtils.importESModule(
+  "resource:///modules/SiteDataManager.sys.mjs"
+);
+const { DownloadUtils } = ChromeUtils.importESModule(
+  "resource://gre/modules/DownloadUtils.sys.mjs"
+);
+const { QWACs } = ChromeUtils.importESModule(
+  "resource://gre/modules/psm/QWACs.sys.mjs"
+);
+const { AppConstants } = ChromeUtils.importESModule(
+  "resource://gre/modules/AppConstants.sys.mjs"
+);
+
+
+var security = {
+  async init(uri, windowInfo, browsingContext) {
+    this.uri = uri;
+    this.windowInfo = windowInfo;
+    this.securityInfo = await this._getSecurityInfo(browsingContext);
+  },
+
+  async _getSecurityInfo(browsingContext) {
+    if (!this.windowInfo.isTopWindow) {
+      return null;
+    }
+
+    var ui = security._getSecurityUI();
+    if (!ui) {
+      return null;
+    }
+
+    var isBroken = ui.state & Ci.nsIWebProgressListener.STATE_IS_BROKEN;
+    var isMixed =
+      ui.state &
+      (Ci.nsIWebProgressListener.STATE_LOADED_MIXED_ACTIVE_CONTENT |
+        Ci.nsIWebProgressListener.STATE_LOADED_MIXED_DISPLAY_CONTENT);
+    var isEV = ui.state & Ci.nsIWebProgressListener.STATE_IDENTITY_EV_TOPLEVEL;
+
+    let retval = {
+      cAName: "",
+      encryptionAlgorithm: "",
+      encryptionStrength: 0,
+      version: "",
+      isBroken,
+      isMixed,
+      isEV,
+      cert: null,
+      qwac: null,
+      certificateTransparency: null,
+    };
+
+    if (!ui.isSecureContext) {
+      return retval;
+    }
+
+    let secInfo = ui.secInfo;
+    if (!secInfo) {
+      return retval;
+    }
+
+    let cert = secInfo.serverCert;
+    let issuerName = null;
+    if (cert) {
+      issuerName = cert.issuerOrganization || cert.issuerName;
+    }
+
+    let certChainArray = [];
+    if (secInfo.succeededCertChain.length) {
+      certChainArray = secInfo.succeededCertChain;
+    } else {
+      certChainArray = secInfo.handshakeCertificates;
+    }
+
+    let qwac = await QWACs.determineQWACStatus(
+      secInfo,
+      this.uri,
+      browsingContext
+    );
+
+    retval = {
+      cAName: issuerName,
+      encryptionAlgorithm: undefined,
+      encryptionStrength: undefined,
+      version: undefined,
+      isBroken,
+      isMixed,
+      isEV,
+      cert,
+      qwac,
+      certChain: certChainArray,
+      certificateTransparency: undefined,
+    };
+
+    var version;
+    try {
+      retval.encryptionAlgorithm = secInfo.cipherName;
+      retval.encryptionStrength = secInfo.secretKeyLength;
+      version = secInfo.protocolVersion;
+    } catch (e) {}
+
+    switch (version) {
+      case Ci.nsITransportSecurityInfo.SSL_VERSION_3:
+        retval.version = "SSL 3";
+        break;
+      case Ci.nsITransportSecurityInfo.TLS_VERSION_1:
+        retval.version = "TLS 1.0";
+        break;
+      case Ci.nsITransportSecurityInfo.TLS_VERSION_1_1:
+        retval.version = "TLS 1.1";
+        break;
+      case Ci.nsITransportSecurityInfo.TLS_VERSION_1_2:
+        retval.version = "TLS 1.2";
+        break;
+      case Ci.nsITransportSecurityInfo.TLS_VERSION_1_3:
+        retval.version = "TLS 1.3";
+        break;
+    }
+
+    switch (secInfo.certificateTransparencyStatus) {
+      case Ci.nsITransportSecurityInfo.CERTIFICATE_TRANSPARENCY_NOT_APPLICABLE:
+      case Ci.nsITransportSecurityInfo
+        .CERTIFICATE_TRANSPARENCY_POLICY_NOT_ENOUGH_SCTS:
+      case Ci.nsITransportSecurityInfo
+        .CERTIFICATE_TRANSPARENCY_POLICY_NOT_DIVERSE_SCTS:
+        retval.certificateTransparency = null;
+        break;
+      case Ci.nsITransportSecurityInfo
+        .CERTIFICATE_TRANSPARENCY_POLICY_COMPLIANT:
+        retval.certificateTransparency = "Compliant";
+        break;
+    }
+
+    return retval;
+  },
+
+  _getSecurityUI() {
+    if (window.opener.gBrowser) {
+      return window.opener.gBrowser.securityUI;
+    }
+    return null;
+  },
+
+  async _updateSiteDataInfo() {
+    this.siteData = await SiteDataManager.getSite(this.uri.host);
+
+    let clearSiteDataButton = document.getElementById(
+      "security-clear-sitedata"
+    );
+    let siteDataLabel = document.getElementById(
+      "security-privacy-sitedata-value"
+    );
+
+    if (!this.siteData) {
+      document.l10n.setAttributes(siteDataLabel, "security-site-data-no");
+      clearSiteDataButton.setAttribute("disabled", "true");
+      return;
+    }
+
+    let { usage } = this.siteData;
+    if (usage > 0) {
+      let size = DownloadUtils.convertByteUnits(usage);
+      if (this.siteData.cookies.length) {
+        document.l10n.setAttributes(
+          siteDataLabel,
+          "security-site-data-cookies",
+          { value: size[0], unit: size[1] }
+        );
+      } else {
+        document.l10n.setAttributes(siteDataLabel, "security-site-data-only", {
+          value: size[0],
+          unit: size[1],
+        });
+      }
+    } else {
+      document.l10n.setAttributes(
+        siteDataLabel,
+        "security-site-data-cookies-only"
+      );
+    }
+
+    clearSiteDataButton.removeAttribute("disabled");
+  },
+
+  clearSiteData() {
+    if (this.siteData) {
+      let { baseDomain } = this.siteData;
+      if (SiteDataManager.promptSiteDataRemoval(window, [baseDomain])) {
+        SiteDataManager.remove(baseDomain).then(() =>
+          this._updateSiteDataInfo()
+        );
+      }
+    }
+  },
+
+};
+
+async function securityOnLoad(uri, windowInfo, browsingContext) {
+  await security.init(uri, windowInfo, browsingContext);
+
+  let info = security.securityInfo;
+  if (
+    !info ||
+    (uri.scheme === "about" && !uri.spec.startsWith("about:certerror"))
+  ) {
+    document.getElementById("securityTab").hidden = true;
+    return;
+  }
+  document.getElementById("securityTab").hidden = false;
+
+  setText("security-identity-domain-value", windowInfo.hostName);
+
+  var validity;
+  if (info.cert && !info.isBroken) {
+    validity = info.cert.validity.notAfterLocalDay;
+
+    if (info.qwac) {
+      setText("security-identity-owner-value", info.qwac.organization);
+      setText("security-identity-verifier-value", info.qwac.issuerOrganization);
+    } else if (info.isEV) {
+      setText("security-identity-owner-value", info.cert.organization);
+      setText("security-identity-verifier-value", info.cAName);
+    } else {
+      document.l10n.setAttributes(
+        document.getElementById("security-identity-owner-value"),
+        "page-info-security-no-owner"
+      );
+      setText(
+        "security-identity-verifier-value",
+        info.cAName || info.cert.issuerCommonName || info.cert.issuerName
+      );
+    }
+  } else {
+    document.l10n.setAttributes(
+      document.getElementById("security-identity-owner-value"),
+      "page-info-security-no-owner"
+    );
+    document.l10n.setAttributes(
+      document.getElementById("security-identity-verifier-value"),
+      "page-info-not-specified"
+    );
+  }
+
+  if (validity) {
+    setText("security-identity-validity-value", validity);
+  } else {
+    document.getElementById("security-identity-validity-row").hidden = true;
+  }
+
+
+  if (uri.scheme == "http" || uri.scheme == "https") {
+    SiteDataManager.updateSites().then(() => security._updateSiteDataInfo());
+  } else {
+    document.getElementById("security-privacy-sitedata-row").hidden = true;
+  }
+
+  document.l10n.setAttributes(
+    document.getElementById("security-privacy-history-value"),
+    "security-visits-number",
+    { visits: previousVisitCount(windowInfo.hostName) }
+  );
+
+  const pkiBundle = document.getElementById("pkiBundle");
+  var hdr;
+  var msg1;
+  var msg2;
+
+  if (info.isBroken) {
+    if (info.isMixed) {
+      hdr = pkiBundle.getString("pageInfo_MixedContent");
+      msg1 = pkiBundle.getString("pageInfo_MixedContent2");
+    } else {
+      hdr = pkiBundle.getFormattedString("pageInfo_BrokenEncryption", [
+        info.encryptionAlgorithm,
+        info.encryptionStrength + "",
+        info.version,
+      ]);
+      msg1 = pkiBundle.getString("pageInfo_WeakCipher");
+    }
+    msg2 = pkiBundle.getString("pageInfo_Privacy_None2");
+  } else if (info.encryptionStrength > 0) {
+    hdr = pkiBundle.getFormattedString(
+      "pageInfo_EncryptionWithBitsAndProtocol",
+      [info.encryptionAlgorithm, info.encryptionStrength + "", info.version]
+    );
+    msg1 = pkiBundle.getString("pageInfo_Privacy_Encrypted1");
+    msg2 = pkiBundle.getString("pageInfo_Privacy_Encrypted2");
+  } else {
+    hdr = pkiBundle.getString("pageInfo_NoEncryption");
+    if (windowInfo.hostName != null) {
+      msg1 = pkiBundle.getFormattedString("pageInfo_Privacy_None1", [
+        windowInfo.hostName,
+      ]);
+    } else {
+      msg1 = pkiBundle.getString("pageInfo_Privacy_None4");
+    }
+    msg2 = pkiBundle.getString("pageInfo_Privacy_None2");
+  }
+  setText("security-technical-shortform", hdr);
+  setText("security-technical-longform1", msg1);
+  setText("security-technical-longform2", msg2);
+
+  const ctStatus = document.getElementById(
+    "security-technical-certificate-transparency"
+  );
+  if (info.certificateTransparency) {
+    ctStatus.hidden = false;
+    ctStatus.value = pkiBundle.getString(
+      "pageInfo_CertificateTransparency_" + info.certificateTransparency
+    );
+  } else {
+    ctStatus.hidden = true;
+  }
+}
+
+function setText(id, value) {
+  var element = document.getElementById(id);
+  if (!element) {
+    return;
+  }
+  if (element.localName == "input" || element.localName == "label") {
+    element.value = value;
+  } else {
+    element.textContent = value;
+  }
+}
+
+function previousVisitCount(host) {
+  if (!AppConstants.MOZ_PLACES || !host) {
+    return 0;
+  }
+
+  var historyService = Cc[
+    "@mozilla.org/browser/nav-history-service;1"
+  ].getService(Ci.nsINavHistoryService);
+
+  var options = historyService.getNewQueryOptions();
+  options.resultType = options.RESULTS_AS_VISIT;
+
+  var query = historyService.getNewQuery();
+  query.endTimeReference = query.TIME_RELATIVE_TODAY;
+  query.endTime = 0;
+  query.domain = host;
+
+  var result = historyService.executeQuery(query, options);
+  result.root.containerOpen = true;
+  var cc = result.root.childCount;
+  result.root.containerOpen = false;
+  return cc;
+}

@@ -1,0 +1,432 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_CustomElementRegistry_h
+#define mozilla_dom_CustomElementRegistry_h
+
+#include "js/GCHashTable.h"
+#include "js/TypeDecls.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/CycleCollectedJSContext.h"  // for MicroTaskRunnable
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/CustomElementRegistryBinding.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/ElementInternals.h"
+#include "nsAtomHashKeys.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsTHashSet.h"
+#include "nsWrapperCache.h"
+
+namespace mozilla {
+class ErrorResult;
+
+namespace dom {
+
+struct CustomElementData;
+struct ElementDefinitionOptions;
+struct LifecycleCallbackArgs;
+class CallbackFunction;
+class CustomElementCallback;
+class CustomElementReaction;
+class DocGroup;
+class Promise;
+
+enum class ElementCallbackType {
+  eConnected,
+  eDisconnected,
+  eAdopted,
+  eConnectedMove,
+  eAttributeChanged,
+  eFormAssociated,
+  eFormReset,
+  eFormDisabled,
+  eFormStateRestore,
+  eGetCustomInterface
+};
+
+struct CustomElementData {
+  enum class State { eUndefined, eFailed, eCustom, ePrecustomized };
+
+  explicit CustomElementData(nsAtom* aType);
+  CustomElementData(nsAtom* aType, State aState);
+  ~CustomElementData() = default;
+
+  State mState;
+  AutoTArray<UniquePtr<CustomElementReaction>, 3> mReactionQueue;
+
+  void SetCustomElementDefinition(CustomElementDefinition* aDefinition);
+  CustomElementDefinition* GetCustomElementDefinition() const;
+  nsAtom* GetCustomElementType() const { return mType; }
+  void AttachedInternals();
+  bool HasAttachedInternals() const { return mIsAttachedInternals; }
+
+  bool IsFormAssociated() const;
+
+  void Traverse(nsCycleCollectionTraversalCallback& aCb) const;
+  void Unlink();
+  size_t SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const;
+
+  nsAtom* GetIs(const Element* aElement) const {
+    return aElement->NodeInfo()->NameAtom() == mType ? nullptr : mType.get();
+  }
+
+  ElementInternals* GetElementInternals() const { return mElementInternals; }
+
+  ElementInternals* GetOrCreateElementInternals(HTMLElement* aTarget) {
+    if (!mElementInternals) {
+      mElementInternals = MakeAndAddRef<ElementInternals>(aTarget);
+    }
+    return mElementInternals;
+  }
+
+ private:
+  RefPtr<nsAtom> mType;
+  RefPtr<CustomElementDefinition> mCustomElementDefinition;
+  RefPtr<ElementInternals> mElementInternals;
+  bool mIsAttachedInternals = false;
+};
+
+#define ALREADY_CONSTRUCTED_MARKER nullptr
+
+struct CustomElementDefinition {
+  NS_DECL_CYCLE_COLLECTION_NATIVE_CLASS(CustomElementDefinition)
+  NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(CustomElementDefinition)
+
+  CustomElementDefinition(
+      nsAtom* aType, nsAtom* aLocalName, int32_t aNamespaceID,
+      CustomElementConstructor* aConstructor,
+      nsTArray<RefPtr<nsAtom>>&& aObservedAttributes,
+      UniquePtr<LifecycleCallbacks>&& aCallbacks,
+      UniquePtr<FormAssociatedLifecycleCallbacks>&& aFormAssociatedCallbacks,
+      bool aFormAssociated, bool aDisableInternals, bool aDisableShadow);
+
+  RefPtr<nsAtom> mType;
+
+  RefPtr<nsAtom> mLocalName;
+
+  int32_t mNamespaceID;
+
+  RefPtr<CustomElementConstructor> mConstructor;
+
+  nsTArray<RefPtr<nsAtom>> mObservedAttributes;
+
+  UniquePtr<LifecycleCallbacks> mCallbacks;
+  UniquePtr<FormAssociatedLifecycleCallbacks> mFormAssociatedCallbacks;
+
+  bool mFormAssociated = false;
+
+  bool mDisableInternals = false;
+
+  bool mDisableShadow = false;
+
+  nsTArray<RefPtr<Element>> mConstructionStack;
+
+  bool IsCustomBuiltIn() { return mType != mLocalName; }
+
+  bool IsInObservedAttributeList(nsAtom* aName) {
+    if (mObservedAttributes.IsEmpty()) {
+      return false;
+    }
+
+    return mObservedAttributes.Contains(aName);
+  }
+
+ private:
+  ~CustomElementDefinition() = default;
+};
+
+class CustomElementReaction {
+ public:
+  virtual ~CustomElementReaction() = default;
+  MOZ_CAN_RUN_SCRIPT
+  virtual void Invoke(Element* aElement, ErrorResult& aRv) = 0;
+  virtual void Traverse(nsCycleCollectionTraversalCallback& aCb) const = 0;
+  virtual size_t SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const = 0;
+
+  bool IsUpgradeReaction() { return mIsUpgradeReaction; }
+
+ protected:
+  bool mIsUpgradeReaction = false;
+};
+
+class CustomElementReactionsStack {
+ public:
+  NS_INLINE_DECL_REFCOUNTING(CustomElementReactionsStack)
+
+  CustomElementReactionsStack()
+      : mIsBackupQueueProcessing(false),
+        mRecursionDepth(0),
+        mIsElementQueuePushedForCurrentRecursionDepth(false) {}
+
+  static constexpr size_t kElementQueueInlineSize = 3;
+  typedef AutoTArray<RefPtr<Element>, kElementQueueInlineSize> ElementQueue;
+
+  void EnqueueUpgradeReaction(Element* aElement,
+                              CustomElementDefinition* aDefinition);
+
+  void EnqueueCallbackReaction(
+      Element* aElement,
+      UniquePtr<CustomElementCallback> aCustomElementCallback);
+
+  bool EnterCEReactions() {
+    bool temp = mIsElementQueuePushedForCurrentRecursionDepth;
+    mRecursionDepth++;
+    mIsElementQueuePushedForCurrentRecursionDepth = false;
+    return temp;
+  }
+
+  MOZ_CAN_RUN_SCRIPT
+  void LeaveCEReactions(JSContext* aCx, bool aWasElementQueuePushed) {
+    MOZ_ASSERT(mRecursionDepth);
+
+    if (mIsElementQueuePushedForCurrentRecursionDepth) {
+      Maybe<JS::AutoSaveExceptionState> ases;
+      if (aCx) {
+        ases.emplace(aCx);
+      }
+      PopAndInvokeElementQueue();
+    }
+    mRecursionDepth--;
+    mIsElementQueuePushedForCurrentRecursionDepth = aWasElementQueuePushed;
+
+    MOZ_ASSERT_IF(!mRecursionDepth, mReactionsStack.IsEmpty());
+  }
+
+  bool IsElementQueuePushedForCurrentRecursionDepth() {
+    MOZ_ASSERT_IF(mIsElementQueuePushedForCurrentRecursionDepth,
+                  !mReactionsStack.IsEmpty() &&
+                      !mReactionsStack.LastElement()->IsEmpty());
+    return mIsElementQueuePushedForCurrentRecursionDepth;
+  }
+
+ private:
+  ~CustomElementReactionsStack() = default;
+  ;
+
+  void CreateAndPushElementQueue();
+
+  MOZ_CAN_RUN_SCRIPT void PopAndInvokeElementQueue();
+
+  AutoTArray<UniquePtr<ElementQueue>, 8> mReactionsStack;
+  UniquePtr<ElementQueue> mCachedElementQueue;
+  ElementQueue mBackupQueue;
+  bool mIsBackupQueueProcessing;
+
+  MOZ_CAN_RUN_SCRIPT void InvokeBackupQueue();
+
+  MOZ_CAN_RUN_SCRIPT
+  void InvokeReactions(ElementQueue* aElementQueue, nsIGlobalObject* aGlobal);
+
+  void Enqueue(Element* aElement, CustomElementReaction* aReaction);
+
+  uint32_t mRecursionDepth;
+  bool mIsElementQueuePushedForCurrentRecursionDepth;
+
+ private:
+  class BackupQueueMicroTask final : public mozilla::MicroTaskRunnable {
+   public:
+    explicit BackupQueueMicroTask(CustomElementReactionsStack* aReactionStack)
+        : MicroTaskRunnable(), mReactionStack(aReactionStack) {
+      MOZ_ASSERT(!mReactionStack->mIsBackupQueueProcessing,
+                 "mIsBackupQueueProcessing should be initially false");
+      mReactionStack->mIsBackupQueueProcessing = true;
+    }
+
+    MOZ_CAN_RUN_SCRIPT void Run(AutoSlowOperation& aAso) override {
+      mReactionStack->InvokeBackupQueue();
+      mReactionStack->mIsBackupQueueProcessing = false;
+    }
+
+   private:
+    const RefPtr<CustomElementReactionsStack> mReactionStack;
+  };
+};
+
+class CustomElementRegistry final : public nsISupports, public nsWrapperCache {
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_CLASS(CustomElementRegistry)
+
+ public:
+  explicit CustomElementRegistry(nsPIDOMWindowInner* aWindow,
+                                 bool aIsScoped = false);
+
+ private:
+  class RunCustomElementCreationCallback : public mozilla::Runnable {
+   public:
+    MOZ_CAN_RUN_SCRIPT_BOUNDARY
+    NS_DECL_NSIRUNNABLE
+
+    explicit RunCustomElementCreationCallback(
+        CustomElementRegistry* aRegistry, nsAtom* aAtom,
+        CustomElementCreationCallback* aCallback)
+        : mozilla::Runnable(
+              "CustomElementRegistry::RunCustomElementCreationCallback"),
+          mRegistry(aRegistry),
+          mAtom(aAtom),
+          mCallback(aCallback) {}
+
+   private:
+    RefPtr<CustomElementRegistry> mRegistry;
+    RefPtr<nsAtom> mAtom;
+    RefPtr<CustomElementCreationCallback> mCallback;
+  };
+
+ public:
+  static already_AddRefed<CustomElementRegistry> Constructor(
+      const GlobalObject& aGlobal);
+
+  CustomElementDefinition* LookupCustomElementDefinition(nsAtom* aNameAtom,
+                                                         int32_t aNameSpaceID,
+                                                         nsAtom* aTypeAtom);
+
+  CustomElementDefinition* LookupCustomElementDefinition(
+      JSContext* aCx, JSObject* aConstructor) const;
+
+  static void EnqueueLifecycleCallback(ElementCallbackType aType,
+                                       Element* aCustomElement,
+                                       const LifecycleCallbackArgs& aArgs,
+                                       CustomElementDefinition* aDefinition);
+
+  MOZ_CAN_RUN_SCRIPT
+  static void Upgrade(Element* aElement, CustomElementDefinition* aDefinition,
+                      ErrorResult& aRv);
+
+  static already_AddRefed<nsISupports> CallGetCustomInterface(
+      Element* aElement, const nsIID& aIID);
+
+  void RegisterUnresolvedElement(Element* aElement,
+                                 nsAtom* aTypeName = nullptr);
+
+  void UnregisterUnresolvedElement(Element* aElement,
+                                   nsAtom* aTypeName = nullptr);
+
+  inline void RegisterCallbackUpgradeElement(Element* aElement,
+                                             nsAtom* aTypeName = nullptr) {
+    if (mElementCreationCallbacksUpgradeCandidatesMap.IsEmpty()) {
+      return;
+    }
+
+    RefPtr<nsAtom> typeName = aTypeName;
+    if (!typeName) {
+      typeName = aElement->NodeInfo()->NameAtom();
+    }
+
+    nsTHashSet<RefPtr<nsIWeakReference>>* elements =
+        mElementCreationCallbacksUpgradeCandidatesMap.Get(typeName);
+
+    if (!elements) {
+      return;
+    }
+
+    nsWeakPtr elem = do_GetWeakReference(aElement);
+    elements->Insert(elem);
+  }
+
+  bool IsScoped() const { return mIsScoped; }
+
+  static already_AddRefed<CustomElementRegistry> GetScopedRegistry(nsINode&);
+  static void SetScopedRegistry(nsINode&, CustomElementRegistry&);
+  static void RemoveScopedRegistry(nsINode&);
+  static bool IsInScopedRegistryMap(nsINode&);
+
+  void TraceDefinitions(JSTracer* aTrc);
+
+ private:
+  ~CustomElementRegistry();
+
+  bool JSObjectToAtomArray(JSContext* aCx, JS::Handle<JSObject*> aConstructor,
+                           const nsString& aName,
+                           nsTArray<RefPtr<nsAtom>>& aArray, ErrorResult& aRv);
+
+  void UpgradeCandidates(nsAtom* aKey, CustomElementDefinition* aDefinition,
+                         ErrorResult& aRv);
+
+  using DefinitionMap =
+      nsRefPtrHashtable<nsAtomHashKey, CustomElementDefinition>;
+  using ElementCreationCallbackMap =
+      nsRefPtrHashtable<nsAtomHashKey, CustomElementCreationCallback>;
+  using CandidateMap =
+      nsClassHashtable<nsAtomHashKey, nsTHashSet<RefPtr<nsIWeakReference>>>;
+  using ConstructorMap =
+      JS::GCHashMap<JS::Heap<JSObject*>, RefPtr<nsAtom>,
+                    js::StableCellHasher<JS::Heap<JSObject*>>,
+                    js::SystemAllocPolicy>;
+
+  DefinitionMap mCustomDefinitions;
+
+  ElementCreationCallbackMap mElementCreationCallbacks;
+
+  ConstructorMap mConstructors;
+
+  using WhenDefinedPromiseMap = nsRefPtrHashtable<nsAtomHashKey, Promise>;
+  WhenDefinedPromiseMap mWhenDefinedPromiseMap;
+
+  CandidateMap mCandidatesMap;
+
+  CandidateMap mElementCreationCallbacksUpgradeCandidatesMap;
+
+  nsCOMPtr<nsPIDOMWindowInner> mWindow;
+
+  bool mIsCustomDefinitionRunning;
+
+  bool mIsScoped;
+
+ private:
+  int32_t InferNamespace(JSContext* aCx, JS::Handle<JSObject*> constructor);
+
+ public:
+  nsISupports* GetParentObject() const;
+
+  DocGroup* GetDocGroup() const;
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  void Define(JSContext* aCx, const nsAString& aName,
+              CustomElementConstructor& aFunctionConstructor,
+              const ElementDefinitionOptions& aOptions, ErrorResult& aRv);
+
+  void Get(const nsAString& name,
+           OwningCustomElementConstructorOrUndefined& aRetVal);
+
+  void GetName(JSContext* aCx, CustomElementConstructor& aConstructor,
+               nsAString& aResult);
+
+  already_AddRefed<Promise> WhenDefined(const nsAString& aName,
+                                        ErrorResult& aRv);
+
+  void SetElementCreationCallback(const nsAString& aName,
+                                  CustomElementCreationCallback& aCallback,
+                                  ErrorResult& aRv);
+
+  void Upgrade(nsINode& aRoot);
+
+  void Initialize(nsINode& aRoot, ErrorResult& aRv);
+};
+
+class MOZ_RAII AutoCEReaction final {
+ public:
+  AutoCEReaction(CustomElementReactionsStack* aReactionsStack, JSContext* aCx)
+      : mReactionsStack(aReactionsStack), mCx(aCx) {
+    mIsElementQueuePushedForPreviousRecursionDepth =
+        mReactionsStack->EnterCEReactions();
+  }
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY ~AutoCEReaction() {
+    mReactionsStack->LeaveCEReactions(
+        mCx, mIsElementQueuePushedForPreviousRecursionDepth);
+  }
+
+ private:
+  const RefPtr<CustomElementReactionsStack> mReactionsStack;
+  JSContext* mCx;
+  bool mIsElementQueuePushedForPreviousRecursionDepth;
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_CustomElementRegistry_h

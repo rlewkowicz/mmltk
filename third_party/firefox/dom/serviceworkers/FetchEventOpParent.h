@@ -1,0 +1,60 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_fetcheventopparent_h_
+#define mozilla_dom_fetcheventopparent_h_
+
+#include "mozilla/dom/FetchEventOpProxyParent.h"
+#include "mozilla/dom/PFetchEventOpParent.h"
+#include "nsISupports.h"
+
+namespace mozilla::dom {
+
+class FetchEventOpParent final : public PFetchEventOpParent {
+  friend class PFetchEventOpParent;
+
+ public:
+  NS_INLINE_DECL_REFCOUNTING(FetchEventOpParent)
+
+  FetchEventOpParent() = default;
+
+  std::tuple<Maybe<ParentToParentInternalResponse>, Maybe<ResponseEndArgs>>
+  OnStart(
+      MovingNotNull<RefPtr<FetchEventOpProxyParent>> aFetchEventOpProxyParent);
+
+  void OnFinish();
+
+ private:
+  ~FetchEventOpParent() = default;
+
+
+  mozilla::ipc::IPCResult RecvPreloadResponse(
+      ParentToParentInternalResponse&& aResponse);
+
+  mozilla::ipc::IPCResult RecvPreloadResponseTiming(ResponseTiming&& aTiming);
+
+  mozilla::ipc::IPCResult RecvPreloadResponseEnd(ResponseEndArgs&& aArgs);
+
+  void ActorDestroy(ActorDestroyReason) override;
+
+  struct Pending {
+    Maybe<ParentToParentInternalResponse> mPreloadResponse;
+    Maybe<ResponseTiming> mTiming;
+    Maybe<ResponseEndArgs> mEndArgs;
+  };
+
+  struct Started {
+    NotNull<RefPtr<FetchEventOpProxyParent>> mFetchEventOpProxyParent;
+  };
+
+  struct Finished {};
+
+  using State = Variant<Pending, Started, Finished>;
+
+  State mState = AsVariant(Pending());
+};
+
+}  
+
+#endif  // mozilla_dom_fetcheventopparent_h_

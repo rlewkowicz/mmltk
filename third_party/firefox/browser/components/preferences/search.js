@@ -1,0 +1,952 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+ChromeUtils.importESModule(
+  "chrome://browser/content/preferences/config/search.mjs",
+  { global: "current" }
+);
+
+const lazy = XPCOMUtils.declareLazy({
+  AppProvidedConfigEngine:
+    "moz-src:///toolkit/components/search/ConfigSearchEngine.sys.mjs",
+  PlacesUtils: "resource://gre/modules/PlacesUtils.sys.mjs",
+  SearchService: "moz-src:///toolkit/components/search/SearchService.sys.mjs",
+  SearchUIUtils: "moz-src:///browser/components/search/SearchUIUtils.sys.mjs",
+  separatePrivateDefaultEnabledPrefValue: {
+    pref: "browser.search.separatePrivateDefault.ui.enabled",
+    default: false,
+    onUpdate: () => window.gSearchPane._engineStore.notifyRebuildViews(),
+  },
+  separatePrivateDefaultPrefValue: {
+    pref: "browser.search.separatePrivateDefault",
+    default: false,
+    onUpdate: () => window.gSearchPane._engineStore.notifyRebuildViews(),
+  },
+  UrlbarPrefs: "moz-src:///browser/components/urlbar/UrlbarPrefs.sys.mjs",
+  UrlbarUtils: "moz-src:///browser/components/urlbar/UrlbarUtils.sys.mjs",
+  UrlbarShared: "chrome://browser/content/urlbar/UrlbarShared.mjs",
+  UserSearchEngine:
+    "moz-src:///toolkit/components/search/UserSearchEngine.sys.mjs",
+});
+
+
+const ENGINE_FLAVOR = "text/x-moz-search-engine";
+const SEARCH_TYPE = "default_search";
+const SEARCH_KEY = "defaultSearch";
+
+var gEngineView = null;
+
+var gSearchPane = {
+  _engineStore: null,
+
+  init() {
+    initSettingGroup("defaultEngine");
+    initSettingGroup("searchSuggestions");
+    initSettingGroup("firefoxSuggest");
+    this._engineStore = new EngineStore();
+    gEngineView = new EngineView(this._engineStore);
+
+    this._engineStore.init().catch(console.error);
+
+    if (
+      Services.policies &&
+      !Services.policies.isAllowed("installSearchEngine")
+    ) {
+      document.getElementById("addEnginesBox").hidden = true;
+    } else {
+      let addEnginesLink = document.getElementById("addEngines");
+      addEnginesLink.setAttribute("href", lazy.SearchUIUtils.searchEnginesURL);
+    }
+
+    window.addEventListener("command", this);
+
+    Services.obs.addObserver(this, "browser-search-engine-modified");
+    Services.obs.addObserver(this, "intl:app-locales-changed");
+    window.addEventListener("unload", () => {
+      Services.obs.removeObserver(this, "browser-search-engine-modified");
+      Services.obs.removeObserver(this, "intl:app-locales-changed");
+    });
+
+    lazy.separatePrivateDefaultEnabledPrefValue;
+    lazy.separatePrivateDefaultPrefValue;
+  },
+
+  handleEvent(aEvent) {
+    if (aEvent.type != "command") {
+      return;
+    }
+    switch (aEvent.target.id) {
+      case "":
+        if (aEvent.target.parentNode && aEvent.target.parentNode.parentNode) {
+          if (aEvent.target.parentNode.parentNode.id == "defaultEngine") {
+            gSearchPane.setDefaultEngine();
+          } else if (
+            aEvent.target.parentNode.parentNode.id == "defaultPrivateEngine"
+          ) {
+            gSearchPane.setDefaultPrivateEngine();
+          }
+        }
+        break;
+      default:
+        gEngineView.handleEvent(aEvent);
+    }
+  },
+
+  async appLocalesChanged() {
+    await document.l10n.ready;
+    await gEngineView.loadL10nNames();
+  },
+
+  observe(subject, topic, data) {
+    switch (topic) {
+      case "intl:app-locales-changed": {
+        this.appLocalesChanged();
+        break;
+      }
+      case "browser-search-engine-modified": {
+        this._engineStore.browserSearchEngineModified(
+          subject.wrappedJSObject,
+          data
+        );
+        break;
+      }
+    }
+  },
+
+  showRestoreDefaults(aEnable) {
+    document.getElementById("restoreDefaultSearchEngines").disabled = !aEnable;
+  },
+
+  async setDefaultEngine() {
+    await lazy.SearchService.setDefault(
+      document.getElementById("defaultEngine").selectedItem.engine
+        .originalEngine,
+      lazy.SearchService.CHANGE_REASON.USER
+    );
+  },
+
+  async setDefaultPrivateEngine() {
+    await lazy.SearchService.setDefaultPrivate(
+      document.getElementById("defaultPrivateEngine").selectedItem.engine
+        .originalEngine,
+      lazy.SearchService.CHANGE_REASON.USER
+    );
+  },
+};
+
+class EngineStore {
+  engines = [];
+
+  #listeners = [];
+
+  async init() {
+    let engines = await lazy.SearchService.getEngines();
+
+    let visibleEngines = engines.filter(e => !e.hidden);
+    for (let engine of visibleEngines) {
+      this.addEngine(engine);
+    }
+    this.notifyRowCountChanged(0, visibleEngines.length);
+
+    gSearchPane.showRestoreDefaults(
+      engines.some(e => e instanceof lazy.AppProvidedConfigEngine && e.hidden)
+    );
+  }
+
+  addListener(aListener) {
+    this.#listeners.push(aListener);
+  }
+
+  notifyRebuildViews() {
+    for (let listener of this.#listeners) {
+      try {
+        listener.rebuild(this.engines);
+      } catch (ex) {
+        console.error("Error notifying EngineStore listener", ex);
+      }
+    }
+  }
+
+  notifyRowCountChanged(index, count) {
+    for (let listener of this.#listeners) {
+      listener.rowCountChanged(index, count, this.engines);
+    }
+  }
+
+  notifyDefaultEngineChanged(type, engine) {
+    for (let listener of this.#listeners) {
+      if ("defaultEngineChanged" in listener) {
+        listener.defaultEngineChanged(type, engine, this.engines);
+      }
+    }
+  }
+
+  notifyEngineIconUpdated(engine) {
+    let index = this._getIndexForEngine(engine);
+    if (index != -1) {
+      for (let listener of this.#listeners) {
+        listener.engineIconUpdated(index, this.engines);
+      }
+    }
+  }
+
+  _getIndexForEngine(aEngine) {
+    return this.engines.indexOf(aEngine);
+  }
+
+  _getEngineByName(aName) {
+    return this.engines.find(engine => engine.name == aName);
+  }
+
+  _cloneEngine(aEngine) {
+    var clonedObj = {
+      iconURL: null,
+    };
+    for (let i of ["id", "name", "alias", "hidden"]) {
+      clonedObj[i] = aEngine[i];
+    }
+    clonedObj.isAddonEngine = false;
+    clonedObj.isAppProvided = aEngine instanceof lazy.AppProvidedConfigEngine;
+    clonedObj.isUserEngine = aEngine instanceof lazy.UserSearchEngine;
+    clonedObj.originalEngine = aEngine;
+
+    aEngine.getIconURL().then(iconURL => {
+      if (iconURL) {
+        clonedObj.iconURL = iconURL;
+      } else if (window.devicePixelRatio > 1) {
+        clonedObj.iconURL =
+          "chrome://browser/skin/search-engine-placeholder@2x.png";
+      } else {
+        clonedObj.iconURL =
+          "chrome://browser/skin/search-engine-placeholder.png";
+      }
+
+      this.notifyEngineIconUpdated(clonedObj);
+    });
+
+    return clonedObj;
+  }
+
+  _isSameEngine(aEngineClone) {
+    return aEngineClone.originalEngine.id == this.originalEngine.id;
+  }
+
+  addEngine(aEngine) {
+    this.engines.push(this._cloneEngine(aEngine));
+  }
+
+  updateEngine(newEngine) {
+    let engineToUpdate = this.engines.findIndex(
+      e => e.originalEngine.id == newEngine.id
+    );
+    if (engineToUpdate != -1) {
+      this.engines[engineToUpdate] = this._cloneEngine(newEngine);
+    }
+  }
+
+  moveEngine(aEngine, aNewIndex) {
+    if (aNewIndex < 0 || aNewIndex > this.engines.length - 1) {
+      throw new Error("ES_moveEngine: invalid aNewIndex!");
+    }
+    var index = this._getIndexForEngine(aEngine);
+    if (index == -1) {
+      throw new Error("ES_moveEngine: invalid engine?");
+    }
+
+    if (index == aNewIndex) {
+      return Promise.resolve();
+    } 
+
+    var removedEngine = this.engines.splice(index, 1)[0];
+    this.engines.splice(aNewIndex, 0, removedEngine);
+
+    return lazy.SearchService.moveEngine(
+      aEngine.originalEngine,
+      aNewIndex,
+      null,
+      true
+    );
+  }
+
+  removeEngine(aEngine) {
+    if (this.engines.length == 1) {
+      throw new Error("Cannot remove last engine!");
+    }
+
+    let engineId = aEngine.id;
+    let index = this.engines.findIndex(element => element.id == engineId);
+
+    if (index == -1) {
+      throw new Error("invalid engine?");
+    }
+
+    this.engines.splice(index, 1)[0];
+
+    if (aEngine instanceof lazy.AppProvidedConfigEngine) {
+      gSearchPane.showRestoreDefaults(true);
+    }
+
+    this.notifyRowCountChanged(index, -1);
+
+    document.getElementById("engineList").focus();
+  }
+
+  browserSearchEngineModified(engine, data) {
+    switch (data) {
+      case "engine-added":
+        this.addEngine(engine);
+        this.notifyRowCountChanged(gEngineView.lastEngineIndex, 1);
+        break;
+      case "engine-changed":
+      case "engine-icon-changed":
+        this.updateEngine(engine);
+        this.notifyRebuildViews();
+        break;
+      case "engine-removed":
+        this.removeEngine(engine);
+        break;
+      case "engine-default":
+        this.notifyDefaultEngineChanged("normal", engine);
+        break;
+      case "engine-default-private":
+        this.notifyDefaultEngineChanged("private", engine);
+        break;
+    }
+  }
+
+  async restoreDefaultEngines() {
+    var added = 0;
+    let appProvidedEngines = (
+      await lazy.SearchService.getAppProvidedEngines()
+    ).map(this._cloneEngine, this);
+
+    for (var i = 0; i < appProvidedEngines.length; ++i) {
+      var e = appProvidedEngines[i];
+
+      if (this.engines.some(this._isSameEngine, e)) {
+        await this.moveEngine(this._getEngineByName(e.name), i);
+      } else {
+
+        e.alias = "";
+
+        this.engines.splice(i, 0, e);
+        let engine = e.originalEngine;
+        engine.hidden = false;
+        await lazy.SearchService.moveEngine(engine, i, null, true);
+        added++;
+      }
+    }
+
+    let policyRemovedEngineNames =
+      Services.policies.getActivePolicies()?.SearchEngines?.Remove || [];
+    for (let engineName of policyRemovedEngineNames) {
+      let engine = lazy.SearchService.getEngineByName(engineName);
+      if (engine) {
+        try {
+          await lazy.SearchService.removeEngine(
+            engine,
+            lazy.SearchService.CHANGE_REASON.ENTERPRISE
+          );
+        } catch (ex) {
+        }
+      }
+    }
+
+    lazy.SearchService.resetToAppDefaultEngine();
+    gSearchPane.showRestoreDefaults(false);
+    this.notifyRebuildViews();
+    return added;
+  }
+
+  changeEngine(aEngine, aProp, aNewValue) {
+    var index = this._getIndexForEngine(aEngine);
+    if (index == -1) {
+      throw new Error("invalid engine?");
+    }
+
+    this.engines[index][aProp] = aNewValue;
+    aEngine.originalEngine[aProp] = aNewValue;
+  }
+}
+
+class EngineView {
+  _engineStore;
+  _engineList = null;
+  tree = null;
+
+  constructor(aEngineStore) {
+    this._engineStore = aEngineStore;
+    this._engineList = document.getElementById("engineList");
+    this._engineList.view = this;
+
+    lazy.UrlbarPrefs.addObserver(this);
+    aEngineStore.addListener(this);
+
+    this.loadL10nNames();
+    this.#addListeners();
+  }
+
+  async loadL10nNames() {
+    this._localShortcutL10nNames = new Map();
+
+    let getIDs = (suffix = "") =>
+      lazy.UrlbarUtils.LOCAL_SEARCH_MODES.map(mode => {
+        let name = lazy.UrlbarUtils.getResultSourceName(mode.source);
+        return { id: `urlbar-search-mode-${name}${suffix}` };
+      });
+
+    try {
+      let localizedIDs = getIDs();
+      let englishIDs = getIDs("-en");
+
+      let englishSearchStrings = new Localization([
+        "preview/enUS-searchFeatures.ftl",
+      ]);
+      let localizedNames = await document.l10n.formatValues(localizedIDs);
+      let englishNames = await englishSearchStrings.formatValues(englishIDs);
+
+      lazy.UrlbarUtils.LOCAL_SEARCH_MODES.forEach(({ source }, index) => {
+        let localizedName = localizedNames[index];
+        let englishName = englishNames[index];
+
+        let names =
+          localizedName === englishName
+            ? [englishName]
+            : [localizedName, englishName];
+
+        this._localShortcutL10nNames.set(source, names);
+
+        this.invalidate();
+      });
+    } catch (ex) {
+      console.error("Error loading l10n names", ex);
+    }
+  }
+
+  #addListeners() {
+    this._engineList.addEventListener("click", this);
+    this._engineList.addEventListener("dragstart", this);
+    this._engineList.addEventListener("keypress", this);
+    this._engineList.addEventListener("select", this);
+    this._engineList.addEventListener("dblclick", this);
+  }
+
+  get lastEngineIndex() {
+    return this._engineStore.engines.length - 1;
+  }
+
+  get selectedIndex() {
+    var seln = this.selection;
+    if (seln.getRangeCount() > 0) {
+      var min = {};
+      seln.getRangeAt(0, min, {});
+      return min.value;
+    }
+    return -1;
+  }
+
+  get selectedEngine() {
+    return this._engineStore.engines[this.selectedIndex];
+  }
+
+  rebuild() {
+    this.invalidate();
+  }
+
+  rowCountChanged(index, count) {
+    if (!this.tree) {
+      return;
+    }
+    this.tree.rowCountChanged(index, count);
+
+    if (count < 0) {
+      this.selection.select(Math.min(index, this.rowCount - 1));
+      this.ensureRowIsVisible(this.currentIndex);
+    }
+  }
+
+  engineIconUpdated(index) {
+    this.tree?.invalidateCell(
+      index,
+      this.tree.columns.getNamedColumn("engineName")
+    );
+  }
+
+  invalidate() {
+    this.tree?.invalidate();
+  }
+
+  ensureRowIsVisible(index) {
+    this.tree.ensureRowIsVisible(index);
+  }
+
+  getSourceIndexFromDrag(dataTransfer) {
+    return parseInt(dataTransfer.getData(ENGINE_FLAVOR));
+  }
+
+  isCheckBox(index, column) {
+    return column.id == "engineShown";
+  }
+
+  isEngineSelectedAndRemovable() {
+    let defaultEngine = lazy.SearchService.defaultEngine;
+    let defaultPrivateEngine = lazy.SearchService.defaultPrivateEngine;
+    return (
+      this.selectedIndex != -1 &&
+      this.lastEngineIndex != 0 &&
+      !this._getLocalShortcut(this.selectedIndex) &&
+      this.selectedEngine.name != defaultEngine.name &&
+      this.selectedEngine.name != defaultPrivateEngine.name
+    );
+  }
+
+  async promptAndRemoveEngine(engine) {
+    if (engine.isAppProvided) {
+      lazy.SearchService.removeEngine(
+        this.selectedEngine.originalEngine,
+        lazy.SearchService.CHANGE_REASON.USER
+      );
+      return;
+    }
+
+    if (engine.isAddonEngine) {
+      let msg = await document.l10n.formatValue("remove-addon-engine-alert");
+      alert(msg);
+      return;
+    }
+
+    let [body, removeLabel] = await document.l10n.formatValues([
+      "remove-engine-confirmation",
+      "remove-engine-remove",
+    ]);
+
+    let button = Services.prompt.confirmExBC(
+      window.browsingContext,
+      Services.prompt.MODAL_TYPE_CONTENT,
+      null,
+      body,
+      (Services.prompt.BUTTON_TITLE_IS_STRING * Services.prompt.BUTTON_POS_0) |
+        (Services.prompt.BUTTON_TITLE_CANCEL * Services.prompt.BUTTON_POS_1),
+      removeLabel,
+      null,
+      null,
+      null,
+      {}
+    );
+
+    if (button == 0) {
+      lazy.SearchService.removeEngine(
+        this.selectedEngine.originalEngine,
+        lazy.SearchService.CHANGE_REASON.USER
+      );
+    }
+  }
+
+  _getLocalShortcut(index) {
+    let engineCount = this._engineStore.engines.length;
+    if (index < engineCount) {
+      return null;
+    }
+    return lazy.UrlbarUtils.LOCAL_SEARCH_MODES[index - engineCount];
+  }
+
+  onPrefChanged(pref) {
+    let parts = pref.split(".");
+    if (parts[0] == "shortcuts" && parts[1] && parts.length == 2) {
+      this.invalidate();
+    }
+  }
+
+  handleEvent(aEvent) {
+    switch (aEvent.type) {
+      case "dblclick":
+        if (aEvent.target.id == "engineChildren") {
+          let cell = aEvent.target.parentNode.getCellAt(
+            aEvent.clientX,
+            aEvent.clientY
+          );
+          if (cell.col?.id == "engineKeyword") {
+            this.#startEditingAlias(this.selectedIndex);
+          }
+        }
+        break;
+      case "click":
+        if (
+          aEvent.target.id != "engineChildren" &&
+          !aEvent.target.classList.contains("searchEngineAction")
+        ) {
+          if (this._engineList.inputField.hidden && this._engineList.view) {
+            let selection = this._engineList.view.selection;
+            if (selection?.count > 0) {
+              selection.toggleSelect(selection.currentIndex);
+            }
+            this._engineList.blur();
+          }
+        }
+        break;
+      case "command":
+        switch (aEvent.target.id) {
+          case "restoreDefaultSearchEngines":
+            this.#onRestoreDefaults();
+            break;
+          case "removeEngineButton":
+            if (this.isEngineSelectedAndRemovable()) {
+              this.promptAndRemoveEngine(this.selectedEngine);
+            }
+            break;
+          case "editEngineButton":
+            if (this.selectedEngine.isUserEngine) {
+              let engine = this.selectedEngine.originalEngine;
+              gSubDialog.open(
+                "chrome://browser/content/search/addEngine.xhtml",
+                { features: "resizable=no, modal=yes" },
+                { engine, mode: "EDIT" }
+              );
+            }
+            break;
+          case "addEngineButton":
+            gSubDialog.open(
+              "chrome://browser/content/search/addEngine.xhtml",
+              { features: "resizable=no, modal=yes" },
+              { mode: "NEW" }
+            );
+            break;
+        }
+        break;
+      case "dragstart":
+        if (aEvent.target.id == "engineChildren") {
+          this.#onDragEngineStart(aEvent);
+        }
+        break;
+      case "keypress":
+        if (aEvent.target.id == "engineList") {
+          this.#onTreeKeyPress(aEvent);
+        }
+        break;
+      case "select":
+        if (aEvent.target.id == "engineList") {
+          this.#onTreeSelect();
+        }
+        break;
+    }
+  }
+
+  async #onRestoreDefaults() {
+    let num = await this._engineStore.restoreDefaultEngines();
+    this.rowCountChanged(0, num);
+  }
+
+  #onDragEngineStart(event) {
+    let selectedIndex = this.selectedIndex;
+
+    if (this._getLocalShortcut(selectedIndex)) {
+      event.preventDefault();
+      return;
+    }
+
+    let tree = document.getElementById("engineList");
+    let cell = tree.getCellAt(event.clientX, event.clientY);
+    if (selectedIndex >= 0 && !this.isCheckBox(cell.row, cell.col)) {
+      event.dataTransfer.setData(ENGINE_FLAVOR, selectedIndex.toString());
+      event.dataTransfer.effectAllowed = "move";
+    }
+  }
+
+  #onTreeSelect() {
+    document.getElementById("removeEngineButton").disabled =
+      !this.isEngineSelectedAndRemovable();
+    document.getElementById("editEngineButton").disabled =
+      !this.selectedEngine?.isUserEngine;
+  }
+
+  #onTreeKeyPress(aEvent) {
+    let index = this.selectedIndex;
+    let tree = document.getElementById("engineList");
+    if (tree.hasAttribute("editing")) {
+      return;
+    }
+
+    if (aEvent.charCode == KeyEvent.DOM_VK_SPACE) {
+      let newValue = !this.getCellValue(
+        index,
+        tree.columns.getNamedColumn("engineShown")
+      );
+      this.setCellValue(
+        index,
+        tree.columns.getFirstColumn(),
+        newValue.toString()
+      );
+      aEvent.preventDefault();
+    } else {
+      let isMac = Services.appinfo.OS == "Darwin";
+      if (
+        (isMac && aEvent.keyCode == KeyEvent.DOM_VK_RETURN) ||
+        (!isMac && aEvent.keyCode == KeyEvent.DOM_VK_F2)
+      ) {
+        this.#startEditingAlias(index);
+      } else if (
+        aEvent.keyCode == KeyEvent.DOM_VK_DELETE ||
+        (isMac &&
+          aEvent.shiftKey &&
+          aEvent.keyCode == KeyEvent.DOM_VK_BACK_SPACE)
+      ) {
+        if (this.isEngineSelectedAndRemovable()) {
+          this.promptAndRemoveEngine(this.selectedEngine);
+        }
+      }
+    }
+  }
+
+  #startEditingAlias(index) {
+    if (this._getLocalShortcut(index)) {
+      return;
+    }
+
+    let engine = this._engineStore.engines[index];
+    this.tree.startEditing(index, this.tree.columns.getLastColumn());
+    this.tree.inputField.value = engine.alias || "";
+    this.tree.inputField.select();
+  }
+
+  #startEditingName(index) {
+    let engine = this._engineStore.engines[index];
+    if (!engine.isUserEngine) {
+      return;
+    }
+
+    this.tree.startEditing(
+      index,
+      this.tree.columns.getNamedColumn("engineName")
+    );
+    this.tree.inputField.value = engine.name;
+    this.tree.inputField.select();
+  }
+
+  get rowCount() {
+    let localModes = lazy.UrlbarUtils.LOCAL_SEARCH_MODES;
+    if (!lazy.UrlbarPrefs.get("scotchBonnet.enableOverride")) {
+      localModes = localModes.filter(
+        mode => mode.source != lazy.UrlbarShared.RESULT_SOURCE.ACTIONS
+      );
+    }
+    return this._engineStore.engines.length + localModes.length;
+  }
+
+  getImageSrc(index, column) {
+    if (column.id == "engineName") {
+      let shortcut = this._getLocalShortcut(index);
+      if (shortcut) {
+        return shortcut.icon;
+      }
+
+      return this._engineStore.engines[index].iconURL;
+    }
+
+    return "";
+  }
+
+  getCellText(index, column) {
+    if (column.id == "engineName") {
+      let shortcut = this._getLocalShortcut(index);
+      if (shortcut) {
+        return this._localShortcutL10nNames.get(shortcut.source)[0] || "";
+      }
+      return this._engineStore.engines[index].name;
+    } else if (column.id == "engineKeyword") {
+      let shortcut = this._getLocalShortcut(index);
+      if (shortcut) {
+        if (
+          lazy.UrlbarPrefs.getScotchBonnetPref(
+            "searchRestrictKeywords.featureGate"
+          )
+        ) {
+          let keywords = this._localShortcutL10nNames
+            .get(shortcut.source)
+            .map(keyword => `@${keyword.toLowerCase()}`)
+            .join(", ");
+
+          return `${keywords}, ${shortcut.restrict}`;
+        }
+
+        return shortcut.restrict;
+      }
+      return this._engineStore.engines[index].originalEngine.aliases.join(", ");
+    }
+    return "";
+  }
+
+  setTree(tree) {
+    this.tree = tree;
+  }
+
+  canDrop(targetIndex, orientation, dataTransfer) {
+    var sourceIndex = this.getSourceIndexFromDrag(dataTransfer);
+    return (
+      sourceIndex != -1 &&
+      sourceIndex != targetIndex &&
+      sourceIndex != targetIndex + orientation &&
+      targetIndex < this._engineStore.engines.length
+    );
+  }
+
+  async drop(dropIndex, orientation, dataTransfer) {
+    if (this._engineStore.engines.length <= dropIndex) {
+      return;
+    }
+
+    var sourceIndex = this.getSourceIndexFromDrag(dataTransfer);
+    var sourceEngine = this._engineStore.engines[sourceIndex];
+
+    const nsITreeView = Ci.nsITreeView;
+    if (dropIndex > sourceIndex) {
+      if (orientation == nsITreeView.DROP_BEFORE) {
+        dropIndex--;
+      }
+    } else if (orientation == nsITreeView.DROP_AFTER) {
+      dropIndex++;
+    }
+
+    await this._engineStore.moveEngine(sourceEngine, dropIndex);
+    gSearchPane.showRestoreDefaults(true);
+
+    this.invalidate();
+    this.selection.select(dropIndex);
+  }
+
+  selection = null;
+  getRowProperties() {
+    return "";
+  }
+  getCellProperties(index, column) {
+    if (column.id == "engineName") {
+      let shortcut = this._getLocalShortcut(index);
+      if (shortcut) {
+        return lazy.UrlbarUtils.getResultSourceName(shortcut.source);
+      }
+    }
+    return "";
+  }
+  getColumnProperties() {
+    return "";
+  }
+  isContainer() {
+    return false;
+  }
+  isContainerOpen() {
+    return false;
+  }
+  isContainerEmpty() {
+    return false;
+  }
+  isSeparator() {
+    return false;
+  }
+  isSorted() {
+    return false;
+  }
+  getParentIndex() {
+    return -1;
+  }
+  hasNextSibling() {
+    return false;
+  }
+  getLevel() {
+    return 0;
+  }
+  getCellValue(index, column) {
+    if (column.id == "engineShown") {
+      let shortcut = this._getLocalShortcut(index);
+      if (shortcut) {
+        return lazy.UrlbarPrefs.get(shortcut.pref);
+      }
+      return !this._engineStore.engines[index].originalEngine.hideOneOffButton;
+    }
+    return undefined;
+  }
+  toggleOpenState() {}
+  cycleHeader() {}
+  selectionChanged() {}
+  cycleCell() {}
+  isEditable(index, column) {
+    return (
+      column.id == "engineShown" ||
+      (column.id == "engineKeyword" && !this._getLocalShortcut(index)) ||
+      (column.id == "engineName" &&
+        this._engineStore.engines[index].isUserEngine)
+    );
+  }
+  setCellValue(index, column, value) {
+    if (column.id == "engineShown") {
+      let shortcut = this._getLocalShortcut(index);
+      if (shortcut) {
+        lazy.UrlbarPrefs.set(shortcut.pref, value == "true");
+        this.invalidate();
+        return;
+      }
+      this._engineStore.engines[index].originalEngine.hideOneOffButton =
+        value != "true";
+      this.invalidate();
+    }
+  }
+  async setCellText(index, column, value) {
+    let engine = this._engineStore.engines[index];
+    if (column.id == "engineKeyword") {
+      let valid = await this.#changeKeyword(engine, value);
+      if (!valid) {
+        this.#startEditingAlias(index);
+      }
+    } else if (column.id == "engineName" && engine.isUserEngine) {
+      let valid = await this.#changeName(engine, value);
+      if (!valid) {
+        this.#startEditingName(index);
+      }
+    }
+  }
+
+  async #changeKeyword(aEngine, aNewKeyword) {
+    let keyword = aNewKeyword.trim();
+    if (keyword) {
+      let isBookmarkDuplicate =
+        AppConstants.MOZ_PLACES &&
+        !!(await lazy.PlacesUtils.keywords.fetch(keyword));
+
+      let dupEngine = await lazy.SearchService.getEngineByAlias(keyword);
+      let isEngineDuplicate = dupEngine !== null && dupEngine.id != aEngine.id;
+
+      if (isEngineDuplicate || isBookmarkDuplicate) {
+        let msgid;
+        if (isEngineDuplicate) {
+          msgid = {
+            id: "search-keyword-warning-engine",
+            args: { name: dupEngine.name },
+          };
+        } else {
+          msgid = { id: "search-keyword-warning-bookmark" };
+        }
+
+        let msg = await document.l10n.formatValue(msgid.id, msgid.args);
+        alert(msg);
+        return false;
+      }
+    }
+
+    this._engineStore.changeEngine(aEngine, "alias", keyword);
+    this.invalidate();
+    return true;
+  }
+
+  async #changeName(aEngine, aNewName) {
+    let valid = aEngine.originalEngine.rename(aNewName);
+    if (!valid) {
+      let msg = await document.l10n.formatValue(
+        "edit-engine-name-warning-duplicate",
+        { name: aNewName }
+      );
+      alert(msg);
+      return false;
+    }
+    return true;
+  }
+}

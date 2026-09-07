@@ -1,0 +1,132 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jspubtd_h
+#define jspubtd_h
+
+
+#include "mozilla/Assertions.h"  // MOZ_ASSERT_UNREACHABLE
+
+#include "jstypes.h"
+
+#include "js/ProtoKey.h"
+#include "js/Result.h"
+#include "js/TraceKind.h"
+#include "js/TypeDecls.h"
+
+#if defined(JS_GC_ZEAL) || defined(DEBUG)
+#  define JSGC_HASH_TABLE_CHECKS
+#  define JS_CHECK_UNSAFE_CALL_WITH_ABI
+#endif
+
+namespace JS {
+
+class CallArgs;
+
+class JS_PUBLIC_API RealmOptions;
+
+}  
+
+enum JSType {
+  JSTYPE_UNDEFINED, 
+  JSTYPE_OBJECT,    
+  JSTYPE_FUNCTION,  
+  JSTYPE_STRING,    
+  JSTYPE_NUMBER,    
+  JSTYPE_BOOLEAN,   
+  JSTYPE_SYMBOL,    
+  JSTYPE_BIGINT,    
+  JSTYPE_LIMIT
+};
+
+inline const char* JSTypeToString(JSType type) {
+  switch (type) {
+    case JSTYPE_UNDEFINED:
+      return "undefined";
+    case JSTYPE_OBJECT:
+      return "object";
+    case JSTYPE_FUNCTION:
+      return "function";
+    case JSTYPE_STRING:
+      return "string";
+    case JSTYPE_NUMBER:
+      return "number";
+    case JSTYPE_BOOLEAN:
+      return "boolean";
+    case JSTYPE_SYMBOL:
+      return "symbol";
+    case JSTYPE_BIGINT:
+      return "bigint";
+    default:
+      MOZ_ASSERT_UNREACHABLE("Unknown JSType");
+  }
+  return "";
+}
+
+enum JSProtoKey {
+#define PROTOKEY_AND_INITIALIZER(name, clasp) JSProto_##name,
+  JS_FOR_EACH_PROTOTYPE(PROTOKEY_AND_INITIALIZER)
+#undef PROTOKEY_AND_INITIALIZER
+      JSProto_LIMIT
+};
+
+struct JSClass;
+class JSErrorReport;
+struct JSFunctionSpec;
+struct JSPrincipals;
+struct JSPropertySpec;
+struct JSSecurityCallbacks;
+struct JSStructuredCloneCallbacks;
+struct JSStructuredCloneReader;
+struct JSStructuredCloneWriter;
+class JS_PUBLIC_API JSTracer;
+
+class JSLinearString;
+
+template <typename T>
+struct JSConstScalarSpec;
+using JSConstDoubleSpec = JSConstScalarSpec<double>;
+using JSConstIntegerSpec = JSConstScalarSpec<int32_t>;
+
+namespace js {
+
+inline JS::Realm* GetContextRealm(const JSContext* cx);
+inline JS::Compartment* GetContextCompartment(const JSContext* cx);
+inline JS::Zone* GetContextZone(const JSContext* cx);
+
+JS_PUBLIC_API bool CurrentThreadCanAccessRuntime(const JSRuntime* rt);
+
+#ifdef DEBUG
+JS_PUBLIC_API bool CurrentThreadIsMainThread();
+JS_PUBLIC_API bool CurrentThreadIsPerformingGC();
+#endif
+
+}  
+
+namespace JS {
+
+class JS_PUBLIC_API PropertyDescriptor;
+
+class MOZ_STACK_CLASS JS_PUBLIC_API AutoEnterCycleCollection {
+#ifdef DEBUG
+  JSRuntime* runtime_;
+
+ public:
+  explicit AutoEnterCycleCollection(JSRuntime* rt);
+  ~AutoEnterCycleCollection();
+#else
+ public:
+  explicit AutoEnterCycleCollection(JSRuntime* rt) {}
+  ~AutoEnterCycleCollection() {}
+#endif
+};
+
+} 
+
+extern "C" {
+
+using PRFileDesc = struct PRFileDesc;
+}
+
+#endif /* jspubtd_h */

@@ -1,0 +1,47 @@
+
+/*
+ * Copyright 2017 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+#if !defined(SkShadowUtils_DEFINED)
+#define SkShadowUtils_DEFINED
+
+#include "include/core/SkColor.h"
+#include "include/core/SkScalar.h"
+#include "include/core/SkTypes.h"
+
+#include <cstdint>
+
+class SkCanvas;
+class SkMatrix;
+class SkPath;
+struct SkPoint3;
+struct SkRect;
+
+enum SkShadowFlags {
+    kNone_ShadowFlag = 0x00,
+    kTransparentOccluder_ShadowFlag = 0x01,
+    kGeometricOnly_ShadowFlag = 0x02,
+    kDirectionalLight_ShadowFlag = 0x04,
+    kConcaveBlurOnly_ShadowFlag = 0x08,
+    kAll_ShadowFlag = 0x0F
+};
+
+class SK_API SkShadowUtils {
+public:
+    static void DrawShadow(SkCanvas* canvas, const SkPath& path, const SkPoint3& zPlaneParams,
+                           const SkPoint3& lightPos, SkScalar lightRadius,
+                           SkColor ambientColor, SkColor spotColor,
+                           uint32_t flags = SkShadowFlags::kNone_ShadowFlag);
+
+    static bool GetLocalBounds(const SkMatrix& ctm, const SkPath& path,
+                               const SkPoint3& zPlaneParams, const SkPoint3& lightPos,
+                               SkScalar lightRadius, uint32_t flags, SkRect* bounds);
+
+    static void ComputeTonalColors(SkColor inAmbientColor, SkColor inSpotColor,
+                                   SkColor* outAmbientColor, SkColor* outSpotColor);
+};
+
+#endif

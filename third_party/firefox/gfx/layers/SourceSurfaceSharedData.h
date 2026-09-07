@@ -1,0 +1,259 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_GFX_SOURCESURFACESHAREDDATA_H_
+#define MOZILLA_GFX_SOURCESURFACESHAREDDATA_H_
+
+#include "base/process.h"
+#include "mozilla/gfx/2D.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/ipc/SharedMemoryHandle.h"
+#include "mozilla/ipc/SharedMemoryMapping.h"
+#include "nsExpirationTracker.h"
+
+namespace mozilla {
+namespace gfx {
+
+class SourceSurfaceSharedData;
+
+class SourceSurfaceSharedDataWrapper final : public DataSourceSurface {
+ public:
+  MOZ_DECLARE_REFCOUNTED_VIRTUAL_TYPENAME(SourceSurfaceSharedDataWrapper,
+                                          override)
+
+  SourceSurfaceSharedDataWrapper() = default;
+
+  void Init(const IntSize& aSize, int32_t aStride, SurfaceFormat aFormat,
+            mozilla::ipc::ReadOnlySharedMemoryHandle aHandle,
+            base::ProcessId aCreatorPid);
+
+  void Init(SourceSurfaceSharedData* aSurface);
+
+  base::ProcessId GetCreatorPid() const { return mCreatorPid; }
+
+  int32_t Stride() override { return mStride; }
+
+  SurfaceType GetType() const override {
+    return SurfaceType::DATA_SHARED_WRAPPER;
+  }
+  IntSize GetSize() const override { return mSize; }
+  SurfaceFormat GetFormat() const override { return mFormat; }
+
+  uint8_t* GetData() override {
+    return mBuf ? const_cast<uint8_t*>(mBuf->DataAs<uint8_t>()) : nullptr;
+  }
+
+  bool OnHeap() const override { return false; }
+
+  bool Map(MapType aMapType, MappedSurface* aMappedSurface) final;
+
+  void Unmap() final;
+
+  void ExpireMap();
+
+  bool AddConsumer() { return ++mConsumers == 1; }
+
+  bool RemoveConsumer(bool aForCreator) {
+    MOZ_ASSERT(mConsumers > 0);
+    if (aForCreator) {
+      if (!mCreatorRef) {
+        MOZ_ASSERT_UNREACHABLE("Already released creator reference!");
+        return false;
+      }
+      mCreatorRef = false;
+    }
+    return --mConsumers == 0;
+  }
+
+  uint32_t GetConsumers() const { return mConsumers; }
+
+  bool HasCreatorRef() const { return mCreatorRef; }
+
+  nsExpirationState* GetExpirationState() { return &mExpirationState; }
+
+ private:
+  ~SourceSurfaceSharedDataWrapper() override {
+    MOZ_RELEASE_ASSERT(!mExpirationState.IsTracked());
+  }
+
+  size_t GetDataLength() const {
+    return static_cast<size_t>(mStride) * mSize.height;
+  }
+
+  size_t GetAlignedDataLength() const {
+    return mozilla::ipc::shared_memory::PageAlignedSize(GetDataLength());
+  }
+
+  bool EnsureMapped();
+
+  Maybe<Mutex> mHandleLock;
+  nsExpirationState mExpirationState;
+  int32_t mStride = 0;
+  uint32_t mConsumers = 1;
+  IntSize mSize;
+  mozilla::ipc::ReadOnlySharedMemoryHandle mBufHandle;
+  std::shared_ptr<mozilla::ipc::MutableOrReadOnlySharedMemoryMapping> mBuf;
+  SurfaceFormat mFormat = SurfaceFormat::UNKNOWN;
+  base::ProcessId mCreatorPid = 0;
+  bool mCreatorRef = true;
+};
+
+class SourceSurfaceSharedData : public DataSourceSurface {
+ public:
+  MOZ_DECLARE_REFCOUNTED_VIRTUAL_TYPENAME(SourceSurfaceSharedData, override)
+
+  SourceSurfaceSharedData()
+      : mMutex("SourceSurfaceSharedData"),
+        mStride(0),
+        mHandleCount(0),
+        mFormat(SurfaceFormat::UNKNOWN),
+        mClosed(false),
+        mFinalized(false),
+        mShared(false) {}
+
+  bool Init(const IntSize& aSize, int32_t aStride, SurfaceFormat aFormat,
+            bool aShare = true);
+
+  uint8_t* GetData() final {
+    MutexAutoLock lock(mMutex);
+    return GetDataInternal();
+  }
+
+  int32_t Stride() final { return mStride; }
+
+  SurfaceType GetType() const override { return SurfaceType::DATA_SHARED; }
+  IntSize GetSize() const final { return mSize; }
+  SurfaceFormat GetFormat() const final { return mFormat; }
+
+  void SizeOfExcludingThis(MallocSizeOf aMallocSizeOf,
+                           SizeOfInfo& aInfo) const final;
+
+  bool OnHeap() const final { return false; }
+
+  bool Map(MapType aMapType, MappedSurface* aMappedSurface) final {
+    MutexAutoLock lock(mMutex);
+    if (mFinalized && aMapType != MapType::READ) {
+      return false;
+    }
+    ++mMapCount;
+    aMappedSurface->mData = GetDataInternal();
+    aMappedSurface->mStride = mStride;
+    return true;
+  }
+
+  void Unmap() final {
+    MutexAutoLock lock(mMutex);
+    MOZ_ASSERT(mMapCount > 0);
+    if (--mMapCount == 0) {
+      mOldBuf = nullptr;
+    }
+  }
+
+  nsresult CloneHandle(mozilla::ipc::ReadOnlySharedMemoryHandle& aHandle);
+
+  void FinishedSharing() {
+    MutexAutoLock lock(mMutex);
+    mShared = true;
+    CloseHandleInternal();
+  }
+
+  bool CanShare() const {
+    MutexAutoLock lock(mMutex);
+    return !mClosed;
+  }
+
+  bool ReallocHandle();
+
+  void Finalize();
+
+  bool IsFinalized() const {
+    MutexAutoLock lock(mMutex);
+    return mFinalized;
+  }
+
+  Maybe<IntRect> TakeDirtyRect() final {
+    MutexAutoLock lock(mMutex);
+    if (mDirtyRect) {
+      Maybe<IntRect> ret = std::move(mDirtyRect);
+      return ret;
+    }
+    return Nothing();
+  }
+
+  void Invalidate(const IntRect& aDirtyRect) final {
+    MutexAutoLock lock(mMutex);
+    if (!aDirtyRect.IsEmpty()) {
+      if (mDirtyRect) {
+        mDirtyRect->UnionRect(mDirtyRect.ref(), aDirtyRect);
+      } else {
+        mDirtyRect = Some(aDirtyRect);
+      }
+    } else {
+      mDirtyRect = Some(IntRect(IntPoint(0, 0), mSize));
+    }
+    MOZ_ASSERT_IF(mDirtyRect, !mDirtyRect->IsEmpty());
+  }
+
+  class MOZ_STACK_CLASS HandleLock final {
+   public:
+    explicit HandleLock(SourceSurfaceSharedData* aSurface)
+        : mSurface(aSurface) {
+      mSurface->LockHandle();
+    }
+
+    ~HandleLock() { mSurface->UnlockHandle(); }
+
+   private:
+    RefPtr<SourceSurfaceSharedData> mSurface;
+  };
+
+ protected:
+  virtual ~SourceSurfaceSharedData() = default;
+
+ private:
+  friend class SourceSurfaceSharedDataWrapper;
+
+  void LockHandle() {
+    MutexAutoLock lock(mMutex);
+    ++mHandleCount;
+  }
+
+  void UnlockHandle() {
+    MutexAutoLock lock(mMutex);
+    MOZ_ASSERT(mHandleCount > 0);
+    --mHandleCount;
+    mShared = true;
+    CloseHandleInternal();
+  }
+
+  uint8_t* GetDataInternal() const;
+
+  size_t GetDataLength() const {
+    return static_cast<size_t>(mStride) * mSize.height;
+  }
+
+  size_t GetAlignedDataLength() const {
+    return mozilla::ipc::shared_memory::PageAlignedSize(GetDataLength());
+  }
+
+  void CloseHandleInternal();
+
+  mutable Mutex mMutex MOZ_UNANNOTATED;
+  int32_t mStride;
+  int32_t mHandleCount;
+  Maybe<IntRect> mDirtyRect;
+  IntSize mSize;
+  mozilla::ipc::MutableSharedMemoryHandle mBufHandle;
+  std::shared_ptr<mozilla::ipc::MutableOrReadOnlySharedMemoryMapping> mBuf;
+  std::shared_ptr<mozilla::ipc::MutableOrReadOnlySharedMemoryMapping> mOldBuf;
+  SurfaceFormat mFormat;
+  bool mClosed : 1;
+  bool mFinalized : 1;
+  bool mShared : 1;
+};
+
+}  
+}  
+
+#endif /* MOZILLA_GFX_SOURCESURFACESHAREDDATA_H_ */

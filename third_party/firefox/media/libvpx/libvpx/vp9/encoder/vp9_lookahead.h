@@ -1,0 +1,73 @@
+/*
+ *  Copyright (c) 2011 The WebM project authors. All Rights Reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS.  All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+#if !defined(VPX_VP9_ENCODER_VP9_LOOKAHEAD_H_)
+#define VPX_VP9_ENCODER_VP9_LOOKAHEAD_H_
+
+#include "vpx_scale/yv12config.h"
+#include "vpx/vpx_encoder.h"
+#include "vpx/vpx_integer.h"
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+#define MAX_LAG_BUFFERS 25
+
+struct lookahead_entry {
+  YV12_BUFFER_CONFIG img;
+  int64_t ts_start;
+  int64_t ts_end;
+  int show_idx; 
+  vpx_enc_frame_flags_t flags;
+};
+
+#define MAX_PRE_FRAMES 1
+
+struct lookahead_ctx {
+  int max_sz;        
+  int sz;            
+  int read_idx;      
+  int write_idx;     
+  int next_show_idx; 
+  struct lookahead_entry *buf; 
+};
+
+struct lookahead_ctx *vp9_lookahead_init(unsigned int width,
+                                         unsigned int height,
+                                         unsigned int subsampling_x,
+                                         unsigned int subsampling_y,
+#if CONFIG_VP9_HIGHBITDEPTH
+                                         int use_highbitdepth,
+#endif
+                                         unsigned int depth);
+
+void vp9_lookahead_destroy(struct lookahead_ctx *ctx);
+
+int vp9_lookahead_full(const struct lookahead_ctx *ctx);
+
+int vp9_lookahead_next_show_idx(const struct lookahead_ctx *ctx);
+
+int vp9_lookahead_push(struct lookahead_ctx *ctx, YV12_BUFFER_CONFIG *src,
+                       int64_t ts_start, int64_t ts_end, int use_highbitdepth,
+                       vpx_enc_frame_flags_t flags);
+
+struct lookahead_entry *vp9_lookahead_pop(struct lookahead_ctx *ctx, int drain);
+
+struct lookahead_entry *vp9_lookahead_peek(struct lookahead_ctx *ctx,
+                                           int index);
+
+unsigned int vp9_lookahead_depth(struct lookahead_ctx *ctx);
+
+#if defined(__cplusplus)
+}  
+#endif
+
+#endif

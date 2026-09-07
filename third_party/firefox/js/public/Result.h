@@ -1,0 +1,93 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef js_Result_h
+#define js_Result_h
+
+#include "mozilla/Result.h"
+
+namespace JS {
+
+using mozilla::Ok;
+
+template <typename T>
+struct UnusedZero;
+
+struct Error {
+  enum class ErrorKind : uintptr_t { Unspecified = 2, OOM = 4 };
+
+  const ErrorKind kind = ErrorKind::Unspecified;
+
+  Error() = default;
+
+ protected:
+  friend struct UnusedZero<Error>;
+
+  constexpr MOZ_IMPLICIT Error(ErrorKind aKind) : kind(aKind) {}
+};
+
+struct OOM : Error {
+  constexpr OOM() : Error(ErrorKind::OOM) {}
+
+ protected:
+  friend struct UnusedZero<OOM>;
+
+  using Error::Error;
+};
+
+template <typename T>
+struct UnusedZero {
+  using StorageType = std::underlying_type_t<Error::ErrorKind>;
+
+  static constexpr bool value = true;
+  static constexpr StorageType nullValue = 0;
+
+  static constexpr void AssertValid(StorageType aValue) {}
+  static constexpr T Inspect(const StorageType& aValue) {
+    return static_cast<Error::ErrorKind>(aValue);
+  }
+  static constexpr T Unwrap(StorageType aValue) {
+    return static_cast<Error::ErrorKind>(aValue);
+  }
+  static constexpr StorageType Store(T aValue) {
+    return static_cast<StorageType>(aValue.kind);
+  }
+};
+
+}  
+
+namespace mozilla::detail {
+
+template <>
+struct UnusedZero<JS::Error> : JS::UnusedZero<JS::Error> {};
+
+template <>
+struct UnusedZero<JS::OOM> : JS::UnusedZero<JS::OOM> {};
+
+template <>
+struct HasFreeLSB<JS::Error> {
+  static const bool value = true;
+};
+
+template <>
+struct HasFreeLSB<JS::OOM> {
+  static const bool value = true;
+};
+}  
+
+namespace JS {
+
+template <typename V = Ok, typename E = Error>
+using Result = mozilla::Result<V, E>;
+
+static_assert(sizeof(Result<>) == sizeof(uintptr_t),
+              "Result<> should be pointer-sized");
+
+static_assert(sizeof(Result<int*, Error>) == sizeof(uintptr_t),
+              "Result<V*, Error> should be pointer-sized");
+
+}  
+
+#endif  // js_Result_h

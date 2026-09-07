@@ -1,0 +1,508 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_CycleCollectedJSContext_h
+#define mozilla_CycleCollectedJSContext_h
+
+#include "js/TracingAPI.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/LinkedList.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/dom/AtomList.h"
+#include "mozilla/dom/Promise.h"
+#include "js/GCVector.h"
+#include "js/Promise.h"
+#include "js/friend/MicroTask.h"
+
+#include "nsCOMPtr.h"
+#include "nsRefPtrHashtable.h"
+#include "nsTArray.h"
+
+class nsCycleCollectionNoteRootCallback;
+class nsIRunnable;
+class nsThread;
+
+namespace mozilla {
+class AutoSlowOperation;
+
+class CycleCollectedJSContext;
+class CycleCollectedJSRuntime;
+
+namespace dom {
+class Exception;
+class WorkerJSContext;
+class WorkletJSContext;
+}  
+
+struct CycleCollectorResults {
+  CycleCollectorResults() {
+    Init();
+  }
+
+  void Init() {
+    mForcedGC = false;
+    mSuspectedAtCCStart = 0;
+    mMergedZones = false;
+    mAnyManual = false;
+    mVisitedRefCounted = 0;
+    mVisitedGCed = 0;
+    mFreedRefCounted = 0;
+    mFreedGCed = 0;
+    mFreedJSZones = 0;
+    mNumSlices = 1;
+  }
+
+  bool mForcedGC;
+  bool mMergedZones;
+  bool mAnyManual;
+  uint32_t mSuspectedAtCCStart;
+  uint32_t mVisitedRefCounted;
+  uint32_t mVisitedGCed;
+  uint32_t mFreedRefCounted;
+  uint32_t mFreedGCed;
+  uint32_t mFreedJSZones;
+  uint32_t mNumSlices;
+};
+
+class MicroTaskRunnable : public LinkedListElement<MicroTaskRunnable> {
+ public:
+  MicroTaskRunnable() = default;
+  NS_INLINE_DECL_REFCOUNTING(MicroTaskRunnable)
+  MOZ_CAN_RUN_SCRIPT virtual void Run(AutoSlowOperation& aAso) = 0;
+  virtual bool Suppressed() { return false; }
+  virtual void TraceMicroTask(JSTracer* aTracer) {}
+
+ protected:
+  virtual ~MicroTaskRunnable() {
+    if (isInList()) {
+      remove();
+    }
+  }
+};
+
+class MOZ_STACK_CLASS MayConsumeMicroTask {
+ public:
+  virtual ~MayConsumeMicroTask() = default;
+
+  bool IsJSMicroTask() const { return JS::IsJSMicroTask(mMicroTask); }
+
+  MicroTaskRunnable* MaybeUnwrapTaskToRunnable() const;
+
+  JSObject* GetExecutionGlobalFromJSMicroTask() const {
+    MOZ_ASSERT(IsJSMicroTask());
+    JS::JSMicroTask* task = JS::ToUnwrappedJSMicroTask(mMicroTask);
+    MOZ_ASSERT(task);
+    return JS::GetExecutionGlobalFromJSMicroTask(task);
+  }
+
+
+  bool GetFlowIdFromJSMicroTask(uint64_t* aFlowId) const {
+    JS::JSMicroTask* task = JS::ToUnwrappedJSMicroTask(mMicroTask);
+    MOZ_ASSERT(task);
+    return JS::GetFlowIdFromJSMicroTask(task, aFlowId);
+  }
+
+  JSObject* MaybeGetPromiseFromJSMicroTask() const {
+    JS::JSMicroTask* task = JS::ToUnwrappedJSMicroTask(mMicroTask);
+    MOZ_ASSERT(task);
+    return JS::MaybeGetPromiseFromJSMicroTask(task);
+  }
+
+  bool MaybeGetHostDefinedDataFromJSMicroTask(
+      JS::MutableHandle<JSObject*> aIncumbentGlobal,
+      JS::MutableHandle<JSObject*> aOptionalHostDefinedData) const {
+    JS::JSMicroTask* task = JS::ToUnwrappedJSMicroTask(mMicroTask);
+    if (!task) {
+      return false;
+    }
+    return JS::MaybeGetHostDefinedDataFromJSMicroTask(task, aIncumbentGlobal,
+                                                      aOptionalHostDefinedData);
+  }
+
+  bool MaybeGetAllocationSiteFromJSMicroTask(
+      JS::MutableHandle<JSObject*> out) const {
+    JS::JSMicroTask* task = JS::ToUnwrappedJSMicroTask(mMicroTask);
+    if (!task) {
+      return false;
+    }
+    return JS::MaybeGetAllocationSiteFromJSMicroTask(task, out);
+  }
+
+  void trace(JSTracer* aTrc) {
+    TraceRoot(aTrc, &mMicroTask, "MayConsumeMicroTask value");
+  }
+
+ protected:
+  explicit MayConsumeMicroTask(JS::GenericMicroTask aMicroTask)
+      : mMicroTask(aMicroTask) {}
+
+  JS::GenericMicroTask mMicroTask;
+};
+
+class MOZ_STACK_CLASS MustConsumeMicroTask : public MayConsumeMicroTask {
+ public:
+  MustConsumeMicroTask() : MayConsumeMicroTask(JS::GenericMicroTask()) {}
+
+  friend MustConsumeMicroTask DequeueNextMicroTask(JSContext* aCx);
+  friend MustConsumeMicroTask DequeueNextRegularMicroTask(JSContext* aCx);
+  friend MustConsumeMicroTask DequeueNextDebuggerMicroTask(JSContext* aCx);
+
+  ~MustConsumeMicroTask() override {
+    if (!mMicroTask.isUndefined()) {
+      MOZ_CRASH("Didn't consume MicroTask");
+    }
+  }
+
+  MustConsumeMicroTask(const MustConsumeMicroTask&) = delete;
+  MustConsumeMicroTask& operator=(const MustConsumeMicroTask&) = delete;
+  MustConsumeMicroTask(MustConsumeMicroTask&& other)
+      : MayConsumeMicroTask(other.mMicroTask) {
+    other.mMicroTask.setUndefined();
+  }
+  MustConsumeMicroTask& operator=(MustConsumeMicroTask&& other) noexcept {
+    if (this != &other) {
+      mMicroTask = other.mMicroTask;
+      other.mMicroTask.setUndefined();
+    }
+    return *this;
+  }
+
+  bool IsConsumed() const { return mMicroTask.isUndefined(); }
+
+  explicit operator bool() const { return !IsConsumed(); }
+
+  already_AddRefed<MicroTaskRunnable> MaybeConsumeAsOwnedRunnable();
+
+  void IgnoreJSMicroTask() {
+    MOZ_ASSERT(IsJSMicroTask());
+    mMicroTask.setUndefined();
+  }
+
+  void ConsumeByPrependToQueue(JSContext* aCx) {
+    MOZ_ASSERT(!IsConsumed(), "Attempting to consume an already-consumed task");
+    if (!JS::PrependMicroTask(aCx, mMicroTask)) {
+      NS_ABORT_OOM(0);
+    }
+    mMicroTask.setUndefined();
+  }
+
+  bool RunAndConsumeJSMicroTask(JSContext* aCx) {
+    MOZ_ASSERT(!JS_IsExceptionPending(aCx));
+    JS::Rooted<JS::JSMicroTask*> task(
+        aCx, JS::ToMaybeWrappedJSMicroTask(mMicroTask));
+    MOZ_ASSERT(task);
+    bool v = JS::RunJSMicroTask(aCx, task);
+    mMicroTask.setUndefined();
+    return v;
+  }
+
+ private:
+  explicit MustConsumeMicroTask(JS::GenericMicroTask aMicroTask)
+      : MayConsumeMicroTask(aMicroTask) {}
+};
+
+class MOZ_STACK_CLASS WontConsumeMicroTask : public MayConsumeMicroTask {
+ public:
+  WontConsumeMicroTask() : MayConsumeMicroTask(JS::GenericMicroTask()) {}
+
+  friend WontConsumeMicroTask PeekNextMicroTask(JSContext* aCx);
+
+  ~WontConsumeMicroTask() = default;
+
+ private:
+  explicit WontConsumeMicroTask(JS::GenericMicroTask aMicroTask)
+      : MayConsumeMicroTask(aMicroTask) {
+    MOZ_RELEASE_ASSERT(!aMicroTask.isNullOrUndefined());
+  }
+};
+
+class SuppressedMicroTaskList final : public MicroTaskRunnable {
+ public:
+  SuppressedMicroTaskList() = delete;
+  explicit SuppressedMicroTaskList(CycleCollectedJSContext* aContext);
+
+  virtual bool Suppressed() override;
+  virtual void Run(AutoSlowOperation& aso) override {
+  }
+
+  CycleCollectedJSContext* mContext = nullptr;
+  uint64_t mSuppressionGeneration = 0;
+  JS::PersistentRooted<JS::GCVector<MustConsumeMicroTask>>
+      mSuppressedMicroTaskRunnables;
+
+ private:
+  ~SuppressedMicroTaskList();
+};
+
+class FinalizationRegistryCleanup {
+ public:
+  explicit FinalizationRegistryCleanup(CycleCollectedJSContext* aContext);
+  void Init();
+  void Destroy();
+  void QueueCallback(JSFunction* aDoCleanup, JSObject* aIncumbentGlobal);
+  MOZ_CAN_RUN_SCRIPT void DoCleanup();
+
+ private:
+  static void QueueCallback(JSFunction* aDoCleanup, JSObject* aIncumbentGlobal,
+                            void* aData);
+
+  class CleanupRunnable;
+
+  struct Callback {
+    JSFunction* mCallbackFunction;
+    JSObject* mIncumbentGlobal;
+    void trace(JSTracer* trc);
+  };
+
+  CycleCollectedJSContext* mContext;
+
+  CleanupRunnable* mPendingRunnable = nullptr;
+
+  using CallbackVector = JS::GCVector<Callback, 0, JSInfallibleAllocPolicy>;
+  JS::PersistentRooted<CallbackVector> mCallbacks;
+};
+
+bool EnqueueMicroTask(JSContext* aCx,
+                      already_AddRefed<MicroTaskRunnable> aRunnable);
+bool EnqueueDebugMicroTask(JSContext* aCx,
+                           already_AddRefed<MicroTaskRunnable> aRunnable);
+
+MustConsumeMicroTask DequeueNextMicroTask(JSContext* aCx);
+MustConsumeMicroTask DequeueNextRegularMicroTask(JSContext* aCx);
+MustConsumeMicroTask DequeueNextDebuggerMicroTask(JSContext* aCx);
+
+WontConsumeMicroTask PeekNextMicroTask(JSContext* aCx);
+
+class CycleCollectedJSContext : dom::PerThreadAtomCache, public JS::JobQueue {
+  friend class CycleCollectedJSRuntime;
+  friend class SuppressedMicroTasks;
+  friend class SuppressedMicroTaskList;
+
+ protected:
+  CycleCollectedJSContext();
+  virtual ~CycleCollectedJSContext();
+
+  MOZ_IS_CLASS_INIT
+  nsresult Initialize(JSRuntime* aParentRuntime, uint32_t aMaxBytes);
+
+  virtual CycleCollectedJSRuntime* CreateRuntime(JSContext* aCx) = 0;
+
+  size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) const;
+
+ private:
+  static void PromiseRejectionTrackerCallback(
+      JSContext* aCx, bool aMutedErrors, JS::Handle<JSObject*> aPromise,
+      JS::PromiseRejectionHandlingState state, void* aData);
+
+  void AfterProcessMicrotasks();
+
+ public:
+  void ProcessStableStateQueue();
+
+  void ClearUncaughtRejectionObservers() {
+    mUncaughtRejectionObservers.Clear();
+  }
+
+ private:
+  void CleanupIDBTransactions(uint32_t aRecursionDepth);
+
+ public:
+  virtual dom::WorkerJSContext* GetAsWorkerJSContext() { return nullptr; }
+  virtual dom::WorkletJSContext* GetAsWorkletJSContext() { return nullptr; }
+
+  CycleCollectedJSRuntime* Runtime() const {
+    MOZ_ASSERT(mRuntime);
+    return mRuntime;
+  }
+
+  already_AddRefed<dom::Exception> GetPendingException() const;
+  void SetPendingException(dom::Exception* aException);
+
+  void TraceMicroTasks(JSTracer* aTracer);
+
+  JSContext* Context() const {
+    MOZ_ASSERT(mJSContext);
+    return mJSContext;
+  }
+
+  JS::RootingContext* RootingCx() const {
+    MOZ_ASSERT(mJSContext);
+    return JS::RootingContext::get(mJSContext);
+  }
+
+  void SetTargetedMicroTaskRecursionDepth(uint32_t aDepth) {
+    mTargetedMicroTaskRecursionDepth = aDepth;
+  }
+
+  void UpdateMicroTaskSuppressionGeneration() { ++mSuppressionGeneration; }
+
+ protected:
+  JSContext* MaybeContext() const { return mJSContext; }
+
+ public:
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  virtual void BeforeProcessTask(bool aMightBlock);
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  virtual void AfterProcessTask(uint32_t aRecursionDepth);
+
+  virtual void MaybePokeGC();
+
+  uint32_t RecursionDepth() const;
+
+  void RunInStableState(already_AddRefed<nsIRunnable> aRunnable);
+
+  void AddPendingIDBTransaction(already_AddRefed<nsIRunnable> aTransaction);
+
+  static CycleCollectedJSContext* GetFor(JSContext* aCx);
+
+  static CycleCollectedJSContext* Get();
+
+  virtual void DispatchToMicroTask(
+      already_AddRefed<MicroTaskRunnable> aRunnable);
+
+  bool EnterMicroTask() { return (mMicroTaskLevel++ == 0); }
+
+  MOZ_CAN_RUN_SCRIPT
+  void LeaveMicroTask() {
+    if (--mMicroTaskLevel == 0) {
+      PerformMicroTaskCheckPoint();
+    }
+  }
+
+  uint32_t MicroTaskLevel() const { return mMicroTaskLevel; }
+
+  void SetMicroTaskLevel(uint32_t aLevel) { mMicroTaskLevel = aLevel; }
+
+  void EnterSyncOperation() { ++mSyncOperations; }
+  void LeaveSyncOperation() { --mSyncOperations; }
+  bool IsInSyncOperation() const { return mSyncOperations > 0; }
+
+  bool CheckRecursionDepth(uint32_t aCurrentDepth, bool aForce = false);
+
+  MOZ_CAN_RUN_SCRIPT
+  bool PerformMicroTaskCheckPoint(bool aForce = false);
+
+  MOZ_CAN_RUN_SCRIPT
+  void PerformDebuggerMicroTaskCheckpoint();
+
+  bool IsInStableOrMetaStableState() const { return mDoingStableStates; }
+
+  JS::PersistentRooted<JS::GCVector<JSObject*, 0, js::SystemAllocPolicy>>
+      mUncaughtRejections;
+
+  JS::PersistentRooted<JS::GCVector<JSObject*, 0, js::SystemAllocPolicy>>
+      mConsumedRejections;
+  nsTArray<nsCOMPtr<nsISupports >>
+      mUncaughtRejectionObservers;
+
+  bool HasPendingUnhandledRejection(uint64_t aPromiseID) const {
+    return mPendingUnhandledRejections.Contains(aPromiseID);
+  }
+
+  virtual bool IsSystemCaller() const = 0;
+
+  virtual void ReportError(JSErrorReport* aReport,
+                           JS::ConstUTF8CharsZ aToStringResult) {
+    MOZ_ASSERT_UNREACHABLE("Not supported");
+  }
+
+  void BeginExecutionTracingAsync();
+  void EndExecutionTracingAsync();
+
+ private:
+  bool getHostDefinedData(
+      JSContext* aCx, JS::MutableHandle<JSObject*> aIncumbentGlobal,
+      JS::MutableHandle<JSObject*> aOptionalHostDefinedData) const override;
+
+  bool getHostDefinedGlobal(JSContext* cx,
+                            JS::MutableHandle<JSObject*>) const override;
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  void runJobs(JSContext* cx) override;
+
+  bool isDrainingStopped() const override { return false; }
+
+  void traceNonGCThingMicroTask(JSTracer* trc, JS::Value* valuePtr) override;
+
+  class SavedMicroTaskQueue;
+  js::UniquePtr<SavedJobQueue> saveJobQueue(JSContext*) override;
+
+ private:
+  CycleCollectedJSRuntime* mRuntime;
+
+  JSContext* mJSContext;
+
+  nsCOMPtr<dom::Exception> mPendingException;
+  nsThread* mOwningThread;  
+
+  struct PendingIDBTransactionData {
+    nsCOMPtr<nsIRunnable> mTransaction;
+    uint32_t mRecursionDepth;
+  };
+
+  nsTArray<nsCOMPtr<nsIRunnable>> mStableStateEvents;
+  nsTArray<PendingIDBTransactionData> mPendingIDBTransactions;
+  uint32_t mBaseRecursionDepth;
+  bool mDoingStableStates;
+
+  uint32_t mTargetedMicroTaskRecursionDepth;
+
+  uint32_t mMicroTaskLevel;
+
+  uint32_t mSyncOperations;
+
+  RefPtr<SuppressedMicroTaskList> mSuppressedMicroTaskList;
+
+  uint64_t mSuppressionGeneration;
+
+ protected:
+  mozilla::LinkedList<MicroTaskRunnable> mMicrotasksToTrace;
+
+ private:
+  uint32_t mDebuggerRecursionDepth;
+
+  Maybe<uint32_t> mMicroTaskRecursionDepth;
+
+  typedef nsTArray<RefPtr<dom::Promise>> PromiseArray;
+  PromiseArray mAboutToBeNotifiedRejectedPromises;
+
+  typedef nsRefPtrHashtable<nsUint64HashKey, dom::Promise> PromiseHashtable;
+  PromiseHashtable mPendingUnhandledRejections;
+
+  class NotifyUnhandledRejections final : public CancelableRunnable {
+   public:
+    explicit NotifyUnhandledRejections(PromiseArray&& aPromises)
+        : CancelableRunnable("NotifyUnhandledRejections"),
+          mUnhandledRejections(std::move(aPromises)) {}
+
+    NS_IMETHOD Run() final;
+
+    nsresult Cancel() final;
+
+   private:
+    PromiseArray mUnhandledRejections;
+  };
+
+  FinalizationRegistryCleanup mFinalizationRegistryCleanup;
+};
+
+class MOZ_STACK_CLASS nsAutoMicroTask {
+ public:
+  nsAutoMicroTask() {
+    CycleCollectedJSContext* ccjs = CycleCollectedJSContext::Get();
+    if (ccjs) {
+      ccjs->EnterMicroTask();
+    }
+  }
+  MOZ_CAN_RUN_SCRIPT ~nsAutoMicroTask() {
+    CycleCollectedJSContext* ccjs = CycleCollectedJSContext::Get();
+    if (ccjs) {
+      ccjs->LeaveMicroTask();
+    }
+  }
+};
+
+}  
+
+#endif  // mozilla_CycleCollectedJSContext_h

@@ -1,0 +1,68 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "IndexedDBCommon.h"
+
+#include "ReportInternalError.h"
+#include "js/StructuredClone.h"
+#include "mozilla/SnappyUncompressInputStream.h"
+#include "nsError.h"
+
+namespace mozilla::dom::indexedDB {
+
+EnumSet<ValidatePrincipalOptions> PrincipalValidationOptions() {
+  return {};
+}
+
+nsresult ClampResultCode(nsresult aResultCode) {
+  if (NS_SUCCEEDED(aResultCode) ||
+      NS_ERROR_GET_MODULE(aResultCode) == NS_ERROR_MODULE_DOM_INDEXEDDB) {
+    return aResultCode;
+  }
+
+  switch (aResultCode) {
+    case NS_ERROR_FILE_NO_DEVICE_SPACE:
+      return NS_ERROR_DOM_INDEXEDDB_QUOTA_ERR;
+    case NS_ERROR_STORAGE_CONSTRAINT:
+      return NS_ERROR_DOM_INDEXEDDB_CONSTRAINT_ERR;
+    default:
+#ifdef DEBUG
+      nsPrintfCString message("Converting non-IndexedDB error code (0x%" PRIX32
+                              ") to "
+                              "NS_ERROR_DOM_INDEXEDDB_UNKNOWN_ERR",
+                              static_cast<uint32_t>(aResultCode));
+      NS_WARNING(message.get());
+#else
+        ;
+#endif
+  }
+
+  IDB_REPORT_INTERNAL_ERR();
+  return NS_ERROR_DOM_INDEXEDDB_UNKNOWN_ERR;
+}
+
+nsresult SnappyUncompressStructuredCloneData(
+    nsIInputStream& aInputStream, JSStructuredCloneData& aStructuredCloneData) {
+  const auto snappyInputStream =
+      MakeRefPtr<SnappyUncompressInputStream>(&aInputStream);
+
+  char buffer[kFileCopyBufferSize];
+
+  QM_TRY(CollectEach(
+      [&snappyInputStream = *snappyInputStream, &buffer] {
+        QM_TRY_RETURN(MOZ_TO_RESULT_INVOKE_MEMBER(snappyInputStream, Read,
+                                                  buffer, sizeof(buffer)));
+      },
+      [&aStructuredCloneData,
+       &buffer](const uint32_t& numRead) -> Result<Ok, nsresult> {
+        QM_TRY(OkIf(aStructuredCloneData.AppendBytes(buffer, numRead)),
+               Err(NS_ERROR_OUT_OF_MEMORY));
+
+        return Ok{};
+      }));
+
+  return NS_OK;
+}
+
+}  

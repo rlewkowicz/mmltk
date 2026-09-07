@@ -1,0 +1,369 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_DOMJSClass_h
+#define mozilla_dom_DOMJSClass_h
+
+#include "js/Object.h"  // JS::GetClass, JS::GetReservedSlot
+#include "js/Wrapper.h"
+#include "jsapi.h"
+#include "jsfriendapi.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/OriginTrials.h"
+#include "mozilla/dom/PrototypeList.h"  // auto-generated
+#include "mozilla/dom/WebIDLPrefs.h"    // auto-generated
+
+class nsCycleCollectionParticipant;
+class nsWrapperCache;
+struct JSFunctionSpec;
+struct JSPropertySpec;
+struct JSStructuredCloneReader;
+struct JSStructuredCloneWriter;
+class nsIGlobalObject;
+
+#define DOM_PROTOTYPE_SLOT JSCLASS_GLOBAL_SLOT_COUNT
+
+#define DOM_GLOBAL_SLOTS 1
+
+#define JSCLASS_DOM_GLOBAL JSCLASS_USERBIT1
+#define JSCLASS_IS_DOMIFACEANDPROTOJSCLASS JSCLASS_USERBIT2
+
+namespace mozilla::dom {
+
+inline bool IsSecureContextOrObjectIsFromSecureContext(JSContext* aCx,
+                                                       JSObject* aObj) {
+  MOZ_ASSERT(!js::IsWrapper(aObj));
+  return JS::GetIsSecureContext(js::GetContextRealm(aCx)) ||
+         JS::GetIsSecureContext(js::GetNonCCWObjectRealm(aObj));
+}
+
+typedef bool (*ResolveOwnProperty)(
+    JSContext* cx, JS::Handle<JSObject*> wrapper, JS::Handle<JSObject*> obj,
+    JS::Handle<jsid> id,
+    JS::MutableHandle<mozilla::Maybe<JS::PropertyDescriptor>> desc);
+
+typedef bool (*EnumerateOwnProperties)(JSContext* cx,
+                                       JS::Handle<JSObject*> wrapper,
+                                       JS::Handle<JSObject*> obj,
+                                       JS::MutableHandleVector<jsid> props);
+
+typedef bool (*DeleteNamedProperty)(JSContext* cx,
+                                    JS::Handle<JSObject*> wrapper,
+                                    JS::Handle<JSObject*> obj,
+                                    JS::Handle<jsid> id,
+                                    JS::ObjectOpResult& opresult);
+
+bool IsGlobalInExposureSet(JSContext* aCx, JSObject* aGlobal,
+                           uint32_t aGlobalSet);
+
+struct ConstantSpec {
+  const char* name;
+  JS::Value value;
+};
+
+typedef bool (*PropertyEnabled)(JSContext* cx, JSObject* global);
+
+namespace GlobalNames {
+static const uint32_t Window = 1u << 0;
+static const uint32_t DedicatedWorkerGlobalScope = 1u << 1;
+static const uint32_t SharedWorkerGlobalScope = 1u << 2;
+static const uint32_t ServiceWorkerGlobalScope = 1u << 3;
+static const uint32_t WorkerDebuggerGlobalScope = 1u << 4;
+static const uint32_t AudioWorkletGlobalScope = 1u << 5;
+static const uint32_t PaintWorkletGlobalScope = 1u << 6;
+
+static constexpr uint32_t kCount = 7;
+}  
+
+struct PrefableDisablers {
+  inline bool isEnabled(JSContext* cx, JS::Handle<JSObject*> obj) const {
+    if (nonExposedGlobals &&
+        IsGlobalInExposureSet(cx, JS::GetNonCCWObjectGlobal(obj),
+                              nonExposedGlobals)) {
+      return false;
+    }
+    if (prefIndex != WebIDLPrefIndex::NoPref &&
+        !sWebIDLPrefs[uint16_t(prefIndex)]()) {
+      return false;
+    }
+    if (secureContext && !IsSecureContextOrObjectIsFromSecureContext(cx, obj)) {
+      return false;
+    }
+    if (trial != OriginTrial(0) &&
+        !OriginTrials::IsEnabled(cx, JS::GetNonCCWObjectGlobal(obj), trial)) {
+      return false;
+    }
+    if (enabledFunc && !enabledFunc(cx, JS::GetNonCCWObjectGlobal(obj))) {
+      return false;
+    }
+    return true;
+  }
+
+  const WebIDLPrefIndex prefIndex;
+
+  const uint16_t nonExposedGlobals : GlobalNames::kCount;
+
+  const uint16_t secureContext : 1;
+
+  const OriginTrial trial;
+
+  const PropertyEnabled enabledFunc;
+};
+
+template <typename T>
+struct Prefable {
+  inline bool isEnabled(JSContext* cx, JS::Handle<JSObject*> obj) const {
+    MOZ_ASSERT(!js::IsWrapper(obj));
+    if (!disablers) [[likely]] {
+      return true;
+    }
+    return disablers->isEnabled(cx, obj);
+  }
+
+  const PrefableDisablers* const disablers;
+
+  const T* const specs;
+};
+
+enum PropertyType {
+  eStaticMethod,
+  eStaticAttribute,
+  eMethod,
+  eAttribute,
+  eUnforgeableMethod,
+  eUnforgeableAttribute,
+  eConstant,
+  ePropertyTypeCount
+};
+
+#define NUM_BITS_PROPERTY_INFO_TYPE 3
+#define NUM_BITS_PROPERTY_INFO_PREF_INDEX 13
+#define NUM_BITS_PROPERTY_INFO_SPEC_INDEX 16
+
+struct PropertyInfo {
+ private:
+  uintptr_t mIdBits;
+
+ public:
+  uint32_t type : NUM_BITS_PROPERTY_INFO_TYPE;
+  uint32_t prefIndex : NUM_BITS_PROPERTY_INFO_PREF_INDEX;
+  uint32_t specIndex : NUM_BITS_PROPERTY_INFO_SPEC_INDEX;
+
+  void SetId(jsid aId) {
+    static_assert(sizeof(jsid) == sizeof(mIdBits),
+                  "jsid should fit in mIdBits");
+    mIdBits = aId.asRawBits();
+  }
+  MOZ_ALWAYS_INLINE jsid Id() const { return jsid::fromRawBits(mIdBits); }
+
+  bool IsStaticMethod() const { return type == eStaticMethod; }
+
+  static int Compare(const PropertyInfo& aInfo1, const PropertyInfo& aInfo2) {
+    if (aInfo1.mIdBits == aInfo2.mIdBits) [[unlikely]] {
+      MOZ_ASSERT((aInfo1.type == eMethod || aInfo1.type == eStaticMethod) &&
+                 (aInfo2.type == eMethod || aInfo2.type == eStaticMethod));
+
+      bool isStatic1 = aInfo1.IsStaticMethod();
+
+      MOZ_ASSERT(isStatic1 != aInfo2.IsStaticMethod(),
+                 "We shouldn't have 2 static methods with the same name!");
+
+      return isStatic1 ? -1 : 1;
+    }
+
+    return aInfo1.mIdBits < aInfo2.mIdBits ? -1 : 1;
+  }
+};
+
+static_assert(
+    ePropertyTypeCount <= 1ull << NUM_BITS_PROPERTY_INFO_TYPE,
+    "We have property type count that is > (1 << NUM_BITS_PROPERTY_INFO_TYPE)");
+
+template <int N>
+struct NativePropertiesN {
+  struct Duo {
+    const  void* const mPrefables;
+    PropertyInfo* const mPropertyInfos;
+  };
+
+  constexpr const NativePropertiesN<7>* Upcast() const {
+    return reinterpret_cast<const NativePropertiesN<7>*>(this);
+  }
+
+  const PropertyInfo* PropertyInfos() const { return duos[0].mPropertyInfos; }
+
+#define DO(SpecT, FieldName)                                                 \
+ public:                                                                     \
+   \
+  const uint32_t mHas##FieldName##s : 1;                                     \
+  const uint32_t m##FieldName##sOffset : 3;                                  \
+                                                                             \
+ private:                                                                    \
+  const Duo* FieldName##sDuo() const {                                       \
+    MOZ_ASSERT(Has##FieldName##s());                                         \
+    return &duos[m##FieldName##sOffset];                                     \
+  }                                                                          \
+                                                                             \
+ public:                                                                     \
+  bool Has##FieldName##s() const { return mHas##FieldName##s; }              \
+  const Prefable<const SpecT>* FieldName##s() const {                        \
+    return static_cast<const Prefable<const SpecT>*>(                        \
+        FieldName##sDuo()->mPrefables);                                      \
+  }                                                                          \
+  PropertyInfo* FieldName##PropertyInfos() const {                           \
+    return FieldName##sDuo()->mPropertyInfos;                                \
+  }
+
+  DO(JSFunctionSpec, StaticMethod)
+  DO(JSPropertySpec, StaticAttribute)
+  DO(JSFunctionSpec, Method)
+  DO(JSPropertySpec, Attribute)
+  DO(JSFunctionSpec, UnforgeableMethod)
+  DO(JSPropertySpec, UnforgeableAttribute)
+  DO(ConstantSpec, Constant)
+
+#undef DO
+
+  const int16_t iteratorAliasMethodIndex;
+  const uint16_t propertyInfoCount;
+  uint16_t* sortedPropertyIndices;
+
+  const Duo duos[N];
+};
+
+static_assert(sizeof(NativePropertiesN<1>) == 8 + 3 * sizeof(void*), "1 size");
+static_assert(sizeof(NativePropertiesN<2>) == 8 + 5 * sizeof(void*), "2 size");
+static_assert(sizeof(NativePropertiesN<3>) == 8 + 7 * sizeof(void*), "3 size");
+static_assert(sizeof(NativePropertiesN<4>) == 8 + 9 * sizeof(void*), "4 size");
+static_assert(sizeof(NativePropertiesN<5>) == 8 + 11 * sizeof(void*), "5 size");
+static_assert(sizeof(NativePropertiesN<6>) == 8 + 13 * sizeof(void*), "6 size");
+static_assert(sizeof(NativePropertiesN<7>) == 8 + 15 * sizeof(void*), "7 size");
+
+typedef NativePropertiesN<7> NativeProperties;
+
+struct NativePropertiesHolder {
+  const NativeProperties* regular;
+  const NativeProperties* chromeOnly;
+  bool* inited;
+};
+
+struct NativeNamedOrIndexedPropertyHooks {
+  ResolveOwnProperty mResolveOwnProperty;
+  EnumerateOwnProperties mEnumerateOwnProperties;
+  DeleteNamedProperty mDeleteNamedProperty;
+};
+
+struct NativePropertyHooks {
+  const NativeNamedOrIndexedPropertyHooks* mIndexedOrNamedNativeProperties;
+
+  NativePropertiesHolder mNativeProperties;
+
+  prototypes::ID mPrototypeID;
+
+  constructors::ID mConstructorID;
+
+  const JSClass* mXrayExpandoClass;
+};
+
+enum DOMObjectType : uint8_t {
+  eInstance,
+  eGlobalInstance,
+  eInterface,
+  eInterfacePrototype,
+  eGlobalInterfacePrototype,
+  eNamespace,
+  eNamedPropertiesObject
+};
+
+inline bool IsInstance(DOMObjectType type) {
+  return type == eInstance || type == eGlobalInstance;
+}
+
+inline bool IsInterfacePrototype(DOMObjectType type) {
+  return type == eInterfacePrototype || type == eGlobalInterfacePrototype;
+}
+
+typedef JSObject* (*ProtoGetter)(JSContext* aCx);
+
+typedef JS::Handle<JSObject*> (*ProtoHandleGetter)(JSContext* aCx);
+
+typedef bool (*WebIDLSerializer)(JSContext* aCx,
+                                 JSStructuredCloneWriter* aWriter,
+                                 JS::Handle<JSObject*> aObj);
+
+typedef JSObject* (*WebIDLDeserializer)(JSContext* aCx,
+                                        nsIGlobalObject* aGlobal,
+                                        JSStructuredCloneReader* aReader);
+
+using WrapperCacheGetter = nsWrapperCache* (*)(JSObject*);
+
+struct DOMJSClass {
+  const JSClass mBase;
+
+  const prototypes::ID mInterfaceChain[MAX_PROTOTYPE_CHAIN_LENGTH];
+
+  const bool mDOMObjectIsISupports;
+
+  const NativePropertyHooks* mNativeHooks;
+
+  ProtoHandleGetter mGetProto;
+
+  nsCycleCollectionParticipant* mParticipant;
+
+  WebIDLSerializer mSerializer;
+
+  WrapperCacheGetter mWrapperCacheGetter;
+
+  static const DOMJSClass* FromJSClass(const JSClass* base) {
+    MOZ_ASSERT(base->flags & JSCLASS_IS_DOMJSCLASS);
+    return reinterpret_cast<const DOMJSClass*>(base);
+  }
+
+  const JSClass* ToJSClass() const { return &mBase; }
+};
+
+struct DOMIfaceAndProtoJSClass {
+  const JSClass mBase;
+
+  DOMObjectType mType;  
+
+  const prototypes::ID mPrototypeID;  
+  const uint32_t mDepth;
+
+  const NativePropertyHooks* mNativeHooks;
+
+  ProtoGetter mGetParentProto;
+
+  static const DOMIfaceAndProtoJSClass* FromJSClass(const JSClass* base) {
+    MOZ_ASSERT(base->flags & JSCLASS_IS_DOMIFACEANDPROTOJSCLASS);
+    return reinterpret_cast<const DOMIfaceAndProtoJSClass*>(base);
+  }
+
+  const JSClass* ToJSClass() const { return &mBase; }
+};
+
+class ProtoAndIfaceCache;
+
+inline bool DOMGlobalHasProtoAndIFaceCache(const JSObject* global) {
+  MOZ_DIAGNOSTIC_ASSERT(JS::GetClass(global)->flags & JSCLASS_DOM_GLOBAL);
+  return !JS::GetReservedSlot(global, DOM_PROTOTYPE_SLOT).isUndefined();
+}
+
+inline bool HasProtoAndIfaceCache(const JSObject* global) {
+  if (!(JS::GetClass(global)->flags & JSCLASS_DOM_GLOBAL)) {
+    return false;
+  }
+  return DOMGlobalHasProtoAndIFaceCache(global);
+}
+
+inline ProtoAndIfaceCache* GetProtoAndIfaceCache(JSObject* global) {
+  MOZ_DIAGNOSTIC_ASSERT(JS::GetClass(global)->flags & JSCLASS_DOM_GLOBAL);
+  return static_cast<ProtoAndIfaceCache*>(
+      JS::GetReservedSlot(global, DOM_PROTOTYPE_SLOT).toPrivate());
+}
+
+}  
+
+#endif /* mozilla_dom_DOMJSClass_h */

@@ -1,0 +1,57 @@
+
+[package]
+edition = "2021"
+name = "unic-langid-impl"
+version = "0.9.6"
+authors = ["Zibi Braniecki <gandalf@mozilla.com>"]
+build = false
+include = [
+    "src/**/*",
+    "benches/*.rs",
+    "tests/*.rs",
+    "Cargo.toml",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
+    "README.md",
+]
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "API for managing Unicode Language Identifiers"
+categories = ["internationalization"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zbraniecki/unic-locale"
+
+[features]
+binary = [
+    "serde",
+    "serde_json",
+]
+likelysubtags = []
+
+[lib]
+name = "unic_langid_impl"
+path = "src/lib.rs"
+
+[[bin]]
+name = "generate_layout"
+path = "src/bin/generate_layout.rs"
+required-features = ["binary"]
+
+[[bin]]
+name = "generate_likelysubtags"
+path = "src/bin/generate_likelysubtags.rs"
+required-features = ["binary"]
+
+[dependencies.serde]
+version = "1.0"
+optional = true
+
+[dependencies.serde_json]
+version = "1.0"
+optional = true
+
+[dependencies.tinystr]
+version = "0.8.0"

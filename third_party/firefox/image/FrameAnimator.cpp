@@ -1,0 +1,381 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "FrameAnimator.h"
+
+#include <utility>
+
+#include "LookupResult.h"
+#include "RasterImage.h"
+#include "imgIContainer.h"
+#include "mozilla/CheckedInt.h"
+#include "mozilla/StaticPrefs_image.h"
+
+namespace mozilla {
+
+using namespace gfx;
+
+namespace image {
+
+
+const gfx::IntRect AnimationState::UpdateState(
+    RasterImage* aImage, const gfx::IntSize& aSize,
+    bool aAllowInvalidation ) {
+  LookupResult result = SurfaceCache::Lookup(
+      ImageKey(aImage),
+      RasterSurfaceKey(aSize, DefaultSurfaceFlags(), PlaybackType::eAnimated),
+       false);
+
+  return UpdateStateInternal(result, aSize, aAllowInvalidation);
+}
+
+const gfx::IntRect AnimationState::UpdateStateInternal(
+    LookupResult& aResult, const gfx::IntSize& aSize,
+    bool aAllowInvalidation ) {
+  if (aResult.Type() == MatchType::NOT_FOUND) {
+    mDiscarded = mHasBeenDecoded;
+    mIsCurrentlyDecoded = false;
+  } else if (aResult.Type() == MatchType::PENDING) {
+    mDiscarded = false;
+    mIsCurrentlyDecoded = false;
+    mHasRequestedDecode = true;
+  } else {
+    MOZ_ASSERT(aResult.Type() == MatchType::EXACT);
+    mDiscarded = false;
+    mHasRequestedDecode = true;
+
+    RefPtr<imgFrame> currentFrame =
+        bool(aResult.Surface())
+            ? aResult.Surface().GetFrame(mCurrentAnimationFrameIndex)
+            : nullptr;
+    mIsCurrentlyDecoded = !!currentFrame;
+  }
+
+  gfx::IntRect ret;
+
+  if (aAllowInvalidation) {
+    if (mIsCurrentlyDecoded) {
+      if (mCompositedFrameInvalid) {
+        ret.SizeTo(aSize);
+      }
+      mCompositedFrameInvalid = false;
+    } else {
+      if (mHasRequestedDecode) {
+        MOZ_ASSERT(StaticPrefs::image_mem_animated_discardable_AtStartup());
+        mCompositedFrameInvalid = true;
+      }
+    }
+  }
+
+  return ret;
+}
+
+void AnimationState::NotifyDecodeComplete() { mHasBeenDecoded = true; }
+
+void AnimationState::ResetAnimation() { mCurrentAnimationFrameIndex = 0; }
+
+void AnimationState::SetAnimationMode(uint16_t aAnimationMode) {
+  mAnimationMode = aAnimationMode;
+}
+
+void AnimationState::UpdateKnownFrameCount(uint32_t aFrameCount) {
+  if (aFrameCount <= mFrameCount) {
+    return;
+  }
+
+  MOZ_ASSERT(!mHasBeenDecoded, "Adding new frames after decoding is finished?");
+  MOZ_ASSERT(aFrameCount <= mFrameCount + 1, "Skipped a frame?");
+
+  mFrameCount = aFrameCount;
+}
+
+Maybe<uint32_t> AnimationState::FrameCount() const {
+  return mHasBeenDecoded ? Some(mFrameCount) : Nothing();
+}
+
+void AnimationState::SetFirstFrameRefreshArea(const IntRect& aRefreshArea) {
+  mFirstFrameRefreshArea = aRefreshArea;
+}
+
+void AnimationState::InitAnimationFrameTimeIfNecessary() {
+  if (mCurrentAnimationFrameTime.IsNull()) {
+    mCurrentAnimationFrameTime = TimeStamp::Now();
+  }
+}
+
+void AnimationState::SetAnimationFrameTime(const TimeStamp& aTime) {
+  mCurrentAnimationFrameTime = aTime;
+}
+
+bool AnimationState::MaybeAdvanceAnimationFrameTime(const TimeStamp& aTime) {
+  if (!StaticPrefs::image_animated_resume_from_last_displayed() ||
+      mCurrentAnimationFrameTime >= aTime) {
+    return false;
+  }
+
+  mCurrentAnimationFrameTime = aTime;
+  return true;
+}
+
+uint32_t AnimationState::GetCurrentAnimationFrameIndex() const {
+  return mCurrentAnimationFrameIndex;
+}
+
+FrameTimeout AnimationState::LoopLength() const {
+  if (!mLoopLength) {
+    return FrameTimeout::Forever();
+  }
+
+  MOZ_ASSERT(mHasBeenDecoded,
+             "We know the loop length but decoding isn't done?");
+
+  if (mAnimationMode != imgIContainer::kNormalAnimMode) {
+    return FrameTimeout::Forever();
+  }
+
+  return *mLoopLength;
+}
+
+
+TimeStamp FrameAnimator::GetCurrentImgFrameEndTime(
+    AnimationState& aState, FrameTimeout aCurrentTimeout) const {
+  if (aCurrentTimeout == FrameTimeout::Forever()) {
+    return TimeStamp::NowLoRes() + TimeDuration::FromMilliseconds(31536000.0);
+  }
+
+  TimeDuration durationOfTimeout =
+      TimeDuration::FromMilliseconds(double(aCurrentTimeout.AsMilliseconds()));
+  return aState.mCurrentAnimationFrameTime + durationOfTimeout;
+}
+
+RefreshResult FrameAnimator::AdvanceFrame(AnimationState& aState,
+                                          DrawableSurface& aFrames,
+                                          RefPtr<imgFrame>& aCurrentFrame,
+                                          TimeStamp aTime) {
+
+  RefreshResult ret;
+
+  uint32_t currentFrameIndex = aState.mCurrentAnimationFrameIndex;
+  uint32_t nextFrameIndex = currentFrameIndex + 1;
+
+  if (aState.FrameCount() == Some(nextFrameIndex)) {
+    if (aState.mLoopRemainingCount < 0 && aState.LoopCount() >= 0) {
+      aState.mLoopRemainingCount = aState.LoopCount();
+    }
+
+    if (aState.mAnimationMode == imgIContainer::kLoopOnceAnimMode ||
+        aState.mLoopRemainingCount == 0) {
+      ret.mAnimationFinished = true;
+    }
+
+    nextFrameIndex = 0;
+
+    if (aState.mLoopRemainingCount > 0) {
+      aState.mLoopRemainingCount--;
+    }
+
+    if (ret.mAnimationFinished) {
+      return ret;
+    }
+  }
+
+  if (nextFrameIndex >= aState.KnownFrameCount()) {
+    aState.mCurrentAnimationFrameTime = aTime;
+    return ret;
+  }
+
+  MOZ_ASSERT(nextFrameIndex < aState.KnownFrameCount());
+  RefPtr<imgFrame> nextFrame = aFrames.GetFrame(nextFrameIndex);
+
+  if (!nextFrame) {
+    aState.mCurrentAnimationFrameTime = aTime;
+    return ret;
+  }
+
+  if (nextFrame->GetTimeout() == FrameTimeout::Forever()) {
+    ret.mAnimationFinished = true;
+  }
+
+  if (nextFrameIndex == 0) {
+    ret.mDirtyRect = aState.FirstFrameRefreshArea();
+  } else {
+    ret.mDirtyRect = nextFrame->GetDirtyRect();
+  }
+
+  aState.mCurrentAnimationFrameTime =
+      GetCurrentImgFrameEndTime(aState, aCurrentFrame->GetTimeout());
+
+  FrameTimeout loopTime = aState.LoopLength();
+  if (loopTime != FrameTimeout::Forever() &&
+      (aState.LoopCount() < 0 || aState.mLoopRemainingCount >= 0)) {
+    TimeDuration delay = aTime - aState.mCurrentAnimationFrameTime;
+    if (delay.ToMilliseconds() > loopTime.AsMilliseconds()) {
+      uint64_t loops = static_cast<uint64_t>(delay.ToMilliseconds()) /
+                       loopTime.AsMilliseconds();
+
+      if (aState.mLoopRemainingCount >= 0) {
+        MOZ_ASSERT(aState.LoopCount() >= 0);
+        loops =
+            std::min(loops, CheckedUint64(aState.mLoopRemainingCount).value());
+      }
+
+      aState.mCurrentAnimationFrameTime +=
+          TimeDuration::FromMilliseconds(loops * loopTime.AsMilliseconds());
+
+      if (aState.mLoopRemainingCount >= 0) {
+        MOZ_ASSERT(loops <= CheckedUint64(aState.mLoopRemainingCount).value());
+        aState.mLoopRemainingCount -= CheckedInt32(loops).value();
+      }
+    }
+  }
+
+  aState.mCurrentAnimationFrameIndex = nextFrameIndex;
+  aCurrentFrame = std::move(nextFrame);
+  aFrames.Advance(nextFrameIndex);
+
+  ret.mFrameAdvanced = true;
+
+  return ret;
+}
+
+void FrameAnimator::ResetAnimation(AnimationState& aState) {
+  aState.ResetAnimation();
+
+  SurfaceCache::ResetAnimation(
+      ImageKey(mImage),
+      RasterSurfaceKey(mSize, DefaultSurfaceFlags(), PlaybackType::eAnimated));
+
+  OrientedIntRect rect =
+      OrientedIntRect::FromUnknownRect(aState.UpdateState(mImage, mSize));
+
+  if (!rect.IsEmpty()) {
+    nsCOMPtr<nsIEventTarget> eventTarget = do_GetMainThread();
+    RefPtr<RasterImage> image = mImage;
+    nsCOMPtr<nsIRunnable> ev = NS_NewRunnableFunction(
+        "FrameAnimator::ResetAnimation",
+        [=]() -> void { image->NotifyProgress(NoProgress, rect); });
+    eventTarget->Dispatch(ev.forget(), NS_DISPATCH_NORMAL);
+  }
+}
+
+RefreshResult FrameAnimator::RequestRefresh(AnimationState& aState,
+                                            const TimeStamp& aTime) {
+  RefreshResult ret;
+
+  if (aState.IsDiscarded()) {
+    aState.MaybeAdvanceAnimationFrameTime(aTime);
+    return ret;
+  }
+
+  LookupResult result = SurfaceCache::Lookup(
+      ImageKey(mImage),
+      RasterSurfaceKey(mSize, DefaultSurfaceFlags(), PlaybackType::eAnimated),
+       true);
+
+  ret.mDirtyRect = aState.UpdateStateInternal(result, mSize);
+  if (aState.IsDiscarded() || !result) {
+    aState.MaybeAdvanceAnimationFrameTime(aTime);
+    return ret;
+  }
+
+  RefPtr<imgFrame> currentFrame =
+      result.Surface().GetFrame(aState.mCurrentAnimationFrameIndex);
+
+  if (!currentFrame) {
+    MOZ_ASSERT(StaticPrefs::image_mem_animated_discardable_AtStartup());
+    MOZ_ASSERT(aState.GetHasRequestedDecode() &&
+               !aState.GetIsCurrentlyDecoded());
+    MOZ_ASSERT(aState.mCompositedFrameInvalid);
+    aState.MaybeAdvanceAnimationFrameTime(aTime);
+    return ret;
+  }
+
+  TimeStamp currentFrameEndTime =
+      GetCurrentImgFrameEndTime(aState, currentFrame->GetTimeout());
+
+  if (!result.Surface().MayAdvance() &&
+      aState.MaybeAdvanceAnimationFrameTime(aTime)) {
+    return ret;
+  }
+
+  while (currentFrameEndTime <= aTime) {
+    TimeStamp oldFrameEndTime = currentFrameEndTime;
+
+    RefreshResult frameRes =
+        AdvanceFrame(aState, result.Surface(), currentFrame, aTime);
+
+    ret.Accumulate(frameRes);
+
+    currentFrameEndTime =
+        GetCurrentImgFrameEndTime(aState, currentFrame->GetTimeout());
+
+    if (!frameRes.mFrameAdvanced && currentFrameEndTime == oldFrameEndTime) {
+      break;
+    }
+  }
+
+  if (currentFrameEndTime > aTime && aState.mCompositedFrameInvalid) {
+    aState.mCompositedFrameInvalid = false;
+    ret.mDirtyRect = IntRect(IntPoint(0, 0), mSize);
+  }
+
+  MOZ_ASSERT(!aState.mIsCurrentlyDecoded || !aState.mCompositedFrameInvalid);
+
+  return ret;
+}
+
+LookupResult FrameAnimator::GetCompositedFrame(AnimationState& aState,
+                                               bool aMarkUsed) {
+  LookupResult result = SurfaceCache::Lookup(
+      ImageKey(mImage),
+      RasterSurfaceKey(mSize, DefaultSurfaceFlags(), PlaybackType::eAnimated),
+      aMarkUsed);
+
+  if (result) {
+    result.Surface().MarkMayAdvance();
+  }
+
+  if (aState.mCompositedFrameInvalid) {
+    MOZ_ASSERT(StaticPrefs::image_mem_animated_discardable_AtStartup());
+    MOZ_ASSERT(aState.GetHasRequestedDecode());
+    MOZ_ASSERT(!aState.GetIsCurrentlyDecoded());
+
+    if (result.Type() == MatchType::EXACT) {
+      OrientedIntRect rect = OrientedIntRect::FromUnknownRect(
+          aState.UpdateStateInternal(result, mSize));
+
+      if (!rect.IsEmpty()) {
+        nsCOMPtr<nsIEventTarget> eventTarget = do_GetMainThread();
+        RefPtr<RasterImage> image = mImage;
+        nsCOMPtr<nsIRunnable> ev = NS_NewRunnableFunction(
+            "FrameAnimator::GetCompositedFrame",
+            [=]() -> void { image->NotifyProgress(NoProgress, rect); });
+        eventTarget->Dispatch(ev.forget(), NS_DISPATCH_NORMAL);
+      }
+    }
+
+    if (aState.mCompositedFrameInvalid) {
+      if (result.Type() == MatchType::NOT_FOUND) {
+        return result;
+      }
+      return LookupResult(MatchType::PENDING);
+    }
+  }
+
+  if (!result) {
+    return result;
+  }
+
+  if (NS_FAILED(result.Surface().Seek(aState.mCurrentAnimationFrameIndex))) {
+    if (result.Type() == MatchType::NOT_FOUND) {
+      return result;
+    }
+    return LookupResult(MatchType::PENDING);
+  }
+
+  return result;
+}
+
+}  
+}  

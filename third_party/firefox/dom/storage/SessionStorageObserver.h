@@ -1,0 +1,45 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_SessionStorageObserver_h
+#define mozilla_dom_SessionStorageObserver_h
+
+#include "nsISupportsImpl.h"
+
+namespace mozilla::dom {
+
+class SessionStorageObserverChild;
+
+class SessionStorageObserver final {
+  friend class SessionStorageManager;
+
+  SessionStorageObserverChild* mActor;
+
+ public:
+  static SessionStorageObserver* Get();
+
+  NS_INLINE_DECL_REFCOUNTING(SessionStorageObserver)
+
+  void AssertIsOnOwningThread() const {
+    NS_ASSERT_OWNINGTHREAD(SessionStorageObserver);
+  }
+
+  void SetActor(SessionStorageObserverChild* aActor);
+
+  void ClearActor() {
+    AssertIsOnOwningThread();
+    MOZ_ASSERT(mActor);
+
+    mActor = nullptr;
+  }
+
+ private:
+  SessionStorageObserver();
+
+  ~SessionStorageObserver();
+};
+
+}  
+
+#endif  // mozilla_dom_SessionStorageObserver_h

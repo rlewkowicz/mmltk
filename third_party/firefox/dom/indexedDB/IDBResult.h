@@ -1,0 +1,123 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_indexeddb_idbresult_h_
+#define mozilla_dom_indexeddb_idbresult_h_
+
+#include <type_traits>
+#include <utility>
+
+#include "mozilla/ErrorResult.h"
+#include "mozilla/ResultVariant.h"
+#include "mozilla/Variant.h"
+
+namespace mozilla::dom::indexedDB {
+
+enum class IDBSpecialValue { Failure, InvalidType, InvalidValue };
+
+namespace detail {
+
+template <IDBSpecialValue Value>
+using SpecialConstant = std::integral_constant<IDBSpecialValue, Value>;
+using FailureType = SpecialConstant<IDBSpecialValue::Failure>;
+using InvalidTypeType = SpecialConstant<IDBSpecialValue::InvalidType>;
+using InvalidValueType = SpecialConstant<IDBSpecialValue::InvalidValue>;
+struct ExceptionType final {};
+}  
+
+namespace SpecialValues {
+constexpr const detail::FailureType Failure;
+constexpr const detail::InvalidTypeType InvalidType;
+constexpr const detail::InvalidValueType InvalidValue;
+constexpr const detail::ExceptionType Exception;
+}  
+
+namespace detail {
+template <IDBSpecialValue... Elements>
+struct IsSortedSet;
+
+template <IDBSpecialValue First, IDBSpecialValue Second,
+          IDBSpecialValue... Rest>
+struct IsSortedSet<First, Second, Rest...>
+    : std::conjunction<IsSortedSet<First, Second>,
+                       IsSortedSet<Second, Rest...>> {};
+
+template <IDBSpecialValue First, IDBSpecialValue Second>
+struct IsSortedSet<First, Second> : std::bool_constant<(First < Second)> {};
+
+template <IDBSpecialValue First>
+struct IsSortedSet<First> : std::true_type {};
+
+template <>
+struct IsSortedSet<> : std::true_type {};
+
+template <IDBSpecialValue... S>
+class IDBError {
+  static_assert(IsSortedSet<S...>::value,
+                "special value list must be sorted and unique");
+
+  template <IDBSpecialValue... U>
+  friend class IDBError;
+
+ public:
+  MOZ_IMPLICIT IDBError(nsresult aRv) : mVariant(ErrorResult{aRv}) {}
+
+  IDBError(ExceptionType, ErrorResult&& aErrorResult)
+      : mVariant(std::move(aErrorResult)) {}
+
+  template <IDBSpecialValue Special>
+  MOZ_IMPLICIT IDBError(SpecialConstant<Special>)
+      : mVariant(SpecialConstant<Special>{}) {}
+
+  IDBError(IDBError&&) = default;
+  IDBError& operator=(IDBError&&) = default;
+
+  template <IDBSpecialValue... U>
+  MOZ_IMPLICIT IDBError(IDBError<U...>&& aOther)
+      : mVariant(aOther.mVariant.match(
+            [](auto& aVariant) { return VariantType{std::move(aVariant)}; })) {}
+
+  bool Is(ExceptionType) const { return mVariant.template is<ErrorResult>(); }
+
+  template <IDBSpecialValue Special>
+  bool Is(SpecialConstant<Special>) const {
+    return mVariant.template is<SpecialConstant<Special>>();
+  }
+
+  ErrorResult& AsException() { return mVariant.template as<ErrorResult>(); }
+
+  template <typename SpecialValueMappers>
+  ErrorResult ExtractErrorResult(SpecialValueMappers aSpecialValueMappers) {
+    return mVariant.match(
+        [](ErrorResult& aException) { return std::move(aException); },
+        [aSpecialValueMappers](const SpecialConstant<S>& aSpecialValue) {
+          return ErrorResult{aSpecialValueMappers(aSpecialValue)};
+        }...);
+  }
+
+ protected:
+  using VariantType = Variant<ErrorResult, SpecialConstant<S>...>;
+
+  VariantType mVariant;
+};
+}  
+
+template <typename T, IDBSpecialValue... S>
+using IDBResult = Result<T, detail::IDBError<S...>>;
+
+template <nsresult E>
+inline constexpr auto InvalidMapsTo = [](auto) { return E; };
+
+inline detail::IDBError<> IDBException(nsresult aRv) {
+  return {SpecialValues::Exception, ErrorResult{aRv}};
+}
+
+template <IDBSpecialValue Special>
+detail::IDBError<Special> IDBError(detail::SpecialConstant<Special> aResult) {
+  return {aResult};
+}
+
+}  
+
+#endif  // mozilla_dom_indexeddb_idbresult_h_

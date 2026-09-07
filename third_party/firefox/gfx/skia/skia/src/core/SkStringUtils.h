@@ -1,0 +1,59 @@
+/*
+ * Copyright 2013 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkStringUtils_DEFINED)
+#define SkStringUtils_DEFINED
+
+#include "include/core/SkScalar.h"
+#include "include/core/SkString.h"
+#include "include/private/base/SkTArray.h"
+
+#include <cstddef>
+#include <cstdint>
+
+enum SkScalarAsStringType {
+    kDec_SkScalarAsStringType,
+    kHex_SkScalarAsStringType,
+};
+
+void SkAppendScalar(SkString*, SkScalar, SkScalarAsStringType);
+
+static inline void SkAppendScalarDec(SkString* str, SkScalar value) {
+    SkAppendScalar(str, value, kDec_SkScalarAsStringType);
+}
+
+static inline void SkAppendScalarHex(SkString* str, SkScalar value) {
+    SkAppendScalar(str, value, kHex_SkScalarAsStringType);
+}
+
+SkString SkTabString(const SkString& string, int tabCnt);
+
+SkString SkStringFromUTF16(const uint16_t* src, size_t count);
+
+#if defined(SK_BUILD_FOR_WIN)
+    #define SK_strcasecmp   _stricmp
+#else
+    #define SK_strcasecmp   strcasecmp
+#endif
+
+enum SkStrSplitMode {
+    kStrict_SkStrSplitMode,
+
+    kCoalesce_SkStrSplitMode
+};
+
+void SkStrSplit(const char* str,
+                const char* delimiters,
+                SkStrSplitMode splitMode,
+                skia_private::TArray<SkString>* out);
+
+inline void SkStrSplit(
+        const char* str, const char* delimiters, skia_private::TArray<SkString>* out) {
+    SkStrSplit(str, delimiters, kCoalesce_SkStrSplitMode, out);
+}
+
+#endif

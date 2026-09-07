@@ -1,0 +1,248 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_GFX_PATHHELPERS_H_
+#define MOZILLA_GFX_PATHHELPERS_H_
+
+#include "2D.h"
+#include "UserData.h"
+
+#include <cmath>
+
+namespace mozilla {
+namespace gfx {
+
+const int32_t sPointCount[] = {1, 1, 3, 2, 0, 0};
+
+const Float kKappaFactor = 0.55191497064665766025f;
+
+inline Float ComputeKappaFactor(Float aAngle) {
+  return (4.0f / 3.0f) * tanf(aAngle / 4.0f);
+}
+
+template <typename T>
+inline void PartialArcToBezier(T* aSink, const Point& aStartOffset,
+                               const Point& aEndOffset,
+                               const Matrix& aTransform,
+                               Float aKappaFactor = kKappaFactor) {
+  Point cp1 =
+      aStartOffset + Point(-aStartOffset.y, aStartOffset.x) * aKappaFactor;
+
+  Point cp2 = aEndOffset + Point(aEndOffset.y, -aEndOffset.x) * aKappaFactor;
+
+  aSink->BezierTo(aTransform.TransformPoint(cp1),
+                  aTransform.TransformPoint(cp2),
+                  aTransform.TransformPoint(aEndOffset));
+}
+
+template <typename T>
+inline void AcuteArcToBezier(T* aSink, const Point& aOrigin,
+                             const Size& aRadius, const Point& aStartPoint,
+                             const Point& aEndPoint,
+                             Float aKappaFactor = kKappaFactor) {
+  aSink->LineTo(aStartPoint);
+  if (!aRadius.IsEmpty()) {
+    Float kappaX = aKappaFactor * aRadius.width / aRadius.height;
+    Float kappaY = aKappaFactor * aRadius.height / aRadius.width;
+    Point startOffset = aStartPoint - aOrigin;
+    Point endOffset = aEndPoint - aOrigin;
+    aSink->BezierTo(
+        aStartPoint + Point(-startOffset.y * kappaX, startOffset.x * kappaY),
+        aEndPoint + Point(endOffset.y * kappaX, -endOffset.x * kappaY),
+        aEndPoint);
+  } else if (aEndPoint != aStartPoint) {
+    aSink->LineTo(aEndPoint);
+  }
+}
+
+template <typename T>
+inline void AcuteArcToBezier(T* aSink, const Point& aOrigin,
+                             const Size& aRadius, const Point& aStartPoint,
+                             const Point& aEndPoint, Float aStartAngle,
+                             Float aEndAngle) {
+  AcuteArcToBezier(aSink, aOrigin, aRadius, aStartPoint, aEndPoint,
+                   ComputeKappaFactor(aEndAngle - aStartAngle));
+}
+
+template <typename T>
+void ArcToBezier(T* aSink, const Point& aOrigin, const Size& aRadius,
+                 float aStartAngle, float aEndAngle, bool aAntiClockwise,
+                 float aRotation = 0.0f, const Matrix& aTransform = Matrix()) {
+  Float sweepDirection = aAntiClockwise ? -1.0f : 1.0f;
+
+  Float arcSweepLeft = (aEndAngle - aStartAngle) * sweepDirection;
+
+  if (arcSweepLeft < 0) {
+    arcSweepLeft = Float(2.0f * M_PI) + fmodf(arcSweepLeft, Float(2.0f * M_PI));
+    aStartAngle = aEndAngle - arcSweepLeft * sweepDirection;
+  } else if (arcSweepLeft > Float(2.0f * M_PI)) {
+    arcSweepLeft = Float(2.0f * M_PI);
+  }
+
+  Float currentStartAngle = aStartAngle;
+  Point currentStartOffset(cosf(aStartAngle), sinf(aStartAngle));
+  Matrix transform = Matrix::Scaling(aRadius.width, aRadius.height);
+  if (aRotation != 0.0f) {
+    transform *= Matrix::Rotation(aRotation);
+  }
+  transform.PostTranslate(aOrigin);
+  transform *= aTransform;
+  aSink->LineTo(transform.TransformPoint(currentStartOffset));
+
+  while (arcSweepLeft > 0) {
+    Float currentEndAngle =
+        currentStartAngle +
+        std::min(arcSweepLeft, Float(M_PI / 2.0f)) * sweepDirection;
+    Point currentEndOffset(cosf(currentEndAngle), sinf(currentEndAngle));
+
+    PartialArcToBezier(aSink, currentStartOffset, currentEndOffset, transform,
+                       ComputeKappaFactor(currentEndAngle - currentStartAngle));
+
+    arcSweepLeft -= Float(M_PI / 2.0f);
+    currentStartAngle = currentEndAngle;
+    currentStartOffset = currentEndOffset;
+  }
+}
+
+template <typename T>
+void EllipseToBezier(T* aSink, const Point& aOrigin, const Size& aRadius) {
+  Matrix transform(aRadius.width, 0, 0, aRadius.height, aOrigin.x, aOrigin.y);
+  Point currentStartOffset(1, 0);
+
+  aSink->LineTo(transform.TransformPoint(currentStartOffset));
+
+  for (int i = 0; i < 4; i++) {
+    Point currentEndOffset(-currentStartOffset.y, currentStartOffset.x);
+
+    PartialArcToBezier(aSink, currentStartOffset, currentEndOffset, transform);
+
+    currentStartOffset = currentEndOffset;
+  }
+}
+
+inline already_AddRefed<Path> MakeEmptyPath(const DrawTarget& aDrawTarget) {
+  RefPtr<PathBuilder> builder = aDrawTarget.CreatePathBuilder();
+  return builder->Finish();
+}
+
+GFX2D_API void AppendRectToPath(PathBuilder* aPathBuilder, const Rect& aRect,
+                                bool aDrawClockwise = true);
+
+inline already_AddRefed<Path> MakePathForRect(const DrawTarget& aDrawTarget,
+                                              const Rect& aRect,
+                                              bool aDrawClockwise = true) {
+  RefPtr<PathBuilder> builder = aDrawTarget.CreatePathBuilder();
+  AppendRectToPath(builder, aRect, aDrawClockwise);
+  return builder->Finish();
+}
+
+GFX2D_API void AppendRoundedRectToPath(
+    PathBuilder* aPathBuilder, const Rect& aRect, const RectCornerRadii& aRadii,
+    bool aDrawClockwise = true, const Maybe<Matrix>& aTransform = Nothing());
+
+inline already_AddRefed<Path> MakePathForRoundedRect(
+    const DrawTarget& aDrawTarget, const Rect& aRect,
+    const RectCornerRadii& aRadii, bool aDrawClockwise = true) {
+  RefPtr<PathBuilder> builder = aDrawTarget.CreatePathBuilder();
+  AppendRoundedRectToPath(builder, aRect, aRadii, aDrawClockwise);
+  return builder->Finish();
+}
+
+GFX2D_API void AppendEllipseToPath(PathBuilder* aPathBuilder,
+                                   const Point& aCenter,
+                                   const Size& aDimensions);
+
+inline already_AddRefed<Path> MakePathForEllipse(const DrawTarget& aDrawTarget,
+                                                 const Point& aCenter,
+                                                 const Size& aDimensions) {
+  RefPtr<PathBuilder> builder = aDrawTarget.CreatePathBuilder();
+  AppendEllipseToPath(builder, aCenter, aDimensions);
+  return builder->Finish();
+}
+
+inline already_AddRefed<Path> MakePathForCircle(const DrawTarget& aDrawTarget,
+                                                const Point& aCenter,
+                                                float aRadius) {
+  RefPtr<PathBuilder> builder = aDrawTarget.CreatePathBuilder();
+  builder->Arc(aCenter, aRadius, 0.0f, Float(2.0 * M_PI));
+  builder->Close();
+  return builder->Finish();
+}
+
+GFX2D_API bool SnapLineToDevicePixelsForStroking(Point& aP1, Point& aP2,
+                                                 const DrawTarget& aDrawTarget,
+                                                 Float aLineWidth);
+
+GFX2D_API void StrokeSnappedEdgesOfRect(const Rect& aRect,
+                                        DrawTarget& aDrawTarget,
+                                        const ColorPattern& aColor,
+                                        const StrokeOptions& aStrokeOptions);
+
+GFX2D_API Margin MaxStrokeExtents(const StrokeOptions& aStrokeOptions,
+                                  const Matrix& aTransform);
+
+extern UserDataKey sDisablePixelSnapping;
+
+inline bool UserToDevicePixelSnapped(Rect& aRect, const DrawTarget& aDrawTarget,
+                                     bool aAllowScaleOr90DegreeRotate = false,
+                                     bool aAllowEmptySnaps = true) {
+  if (aDrawTarget.GetUserData(&sDisablePixelSnapping)) {
+    return false;
+  }
+
+  Matrix mat = aDrawTarget.GetTransform();
+
+  const Float epsilon = 0.0000001f;
+#define WITHIN_E(a, b) (fabs((a) - (b)) < epsilon)
+  if (!aAllowScaleOr90DegreeRotate &&
+      (!WITHIN_E(mat._11, 1.f) || !WITHIN_E(mat._22, 1.f) ||
+       !WITHIN_E(mat._12, 0.f) || !WITHIN_E(mat._21, 0.f))) {
+    return false;
+  }
+#undef WITHIN_E
+
+  Point p1 = mat.TransformPoint(aRect.TopLeft());
+  Point p2 = mat.TransformPoint(aRect.TopRight());
+  Point p3 = mat.TransformPoint(aRect.BottomRight());
+
+  if (p2 == Point(p1.x, p3.y) || p2 == Point(p3.x, p1.y)) {
+    Point p1r = p1;
+    Point p3r = p3;
+    p1r.Round();
+    p3r.Round();
+    if (aAllowEmptySnaps || p1r.x != p3r.x) {
+      p1.x = p1r.x;
+      p3.x = p3r.x;
+    }
+    if (aAllowEmptySnaps || p1r.y != p3r.y) {
+      p1.y = p1r.y;
+      p3.y = p3r.y;
+    }
+
+    aRect.MoveTo(Point(std::min(p1.x, p3.x), std::min(p1.y, p3.y)));
+    aRect.SizeTo(Size(std::max(p1.x, p3.x) - aRect.X(),
+                      std::max(p1.y, p3.y) - aRect.Y()));
+    return true;
+  }
+
+  return false;
+}
+
+inline bool MaybeSnapToDevicePixels(Rect& aRect, const DrawTarget& aDrawTarget,
+                                    bool aAllowScaleOr90DegreeRotate = false,
+                                    bool aAllowEmptySnaps = true) {
+  if (UserToDevicePixelSnapped(aRect, aDrawTarget, aAllowScaleOr90DegreeRotate,
+                               aAllowEmptySnaps)) {
+    Matrix mat = aDrawTarget.GetTransform();
+    mat.Invert();
+    aRect = mat.TransformBounds(aRect);
+    return true;
+  }
+  return false;
+}
+
+}  
+}  
+
+#endif /* MOZILLA_GFX_PATHHELPERS_H_ */

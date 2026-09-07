@@ -1,0 +1,5443 @@
+#include "src/frameworks/gpu/gdr_mapped_buffer.h"
+#include "src/frameworks/gpu/pinned_host_buffer.h"
+#include "src/common/system/cpu_affinity.h"
+#include "src/controller/presentation/presentation_system.h"
+#include "src/controller/browser/application_materializer.h"
+
+#include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
+#include <catch2/matchers/catch_matchers.hpp>
+#include <cuda_runtime_api.h>
+#include <sys/eventfd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+#include <chrono>
+#include <array>
+#include <atomic>
+#include <condition_variable>
+#include <cstdint>
+#include <cstring>
+#include <cstdlib>
+#include <exception>
+#include <filesystem>
+#include <functional>
+#include <future>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <new>
+#include <optional>
+#include <ranges>
+#include <span>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include "src/controller/subsystems/annotation/annotation_system.h"
+#include "src/controller/subsystems/explore/explore_system.h"
+#include "src/controller/subsystems/live/live_system.h"
+#include "src/controller/subsystems/live/live_receiver_copy.h"
+#include "src/controller/subsystems/upscale/upscale_system.h"
+#include "src/controller/presentation/detail/monotonic_identity.h"
+#include "src/controller/presentation/detail/visual_runtime_owner.h"
+#include "src/controller/presentation/detail/workspace_frame_signal.h"
+#include "src/controller/presentation/detail/workspace_surface_import_channel.h"
+#include "src/controller/services/settings_system.h"
+#include "src/common/io/scoped_fd.h"
+#include "src/frameworks/gpu/tests/fake_image_backend.h"
+#include "filesystem_test_utils.hpp"
+
+namespace mmltk::controller {
+namespace {
+
+using mmltk::frameworks::gpu::test_support::FakeImageBackend;
+using mmltk::frameworks::gpu::test_support::RuntimeFactory;
+using namespace std::chrono_literals;
+
+struct LiveReceiverCopyProbe final {
+    static inline cudaError_t wait_status = cudaSuccess;
+    static inline cudaError_t copy_status = cudaSuccess;
+    static inline cudaError_t synchronize_status = cudaSuccess;
+    static inline std::size_t waits = 0U;
+    static inline std::size_t copies = 0U;
+    static inline std::size_t synchronizations = 0U;
+
+    static void Reset() noexcept {
+        wait_status = cudaSuccess;
+        copy_status = cudaSuccess;
+        synchronize_status = cudaSuccess;
+        waits = 0U;
+        copies = 0U;
+        synchronizations = 0U;
+    }
+    static cudaError_t Wait(std::uintptr_t, std::uintptr_t) noexcept {
+        ++waits;
+        return wait_status;
+    }
+    static cudaError_t Copy(mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t, std::size_t, std::uintptr_t) noexcept {
+        ++copies;
+        return copy_status;
+    }
+    static cudaError_t Synchronize(std::uintptr_t) noexcept {
+        ++synchronizations;
+        return synchronize_status;
+    }
+};
+
+constexpr detail::LiveReceiverCopyOperations kLiveReceiverCopyProbe{
+    .wait = &LiveReceiverCopyProbe::Wait,
+    .copy = &LiveReceiverCopyProbe::Copy,
+    .synchronize = &LiveReceiverCopyProbe::Synchronize,
+};
+
+[[nodiscard]] constexpr mmltk::frameworks::gpu::ImagePlaneView live_receiver_copy_target() noexcept {
+    return {
+        .data = 1U,
+        .descriptor =
+            {
+                .kind = mmltk::frameworks::gpu::ImagePlaneKind::Clean,
+                .format = mmltk::frameworks::gpu::ImageFormat::Rgba8,
+                .width = 4U,
+                .height = 4U,
+                .pitch_bytes = 16U,
+            },
+    };
+}
+
+TEST_CASE("Live receiver copy completes only after synchronization") {
+    LiveReceiverCopyProbe::Reset();
+    const auto target = live_receiver_copy_target();
+
+    CHECK(detail::copy_live_receiver_frame(target, 2U, 16U, 3U, 4U, kLiveReceiverCopyProbe) == cudaSuccess);
+    CHECK(LiveReceiverCopyProbe::waits == 1U);
+    CHECK(LiveReceiverCopyProbe::copies == 1U);
+    CHECK(LiveReceiverCopyProbe::synchronizations == 1U);
+}
+
+TEST_CASE("Live receiver submission and synchronization failures stop progress") {
+    const auto target = live_receiver_copy_target();
+
+    LiveReceiverCopyProbe::Reset();
+    LiveReceiverCopyProbe::copy_status = cudaErrorLaunchFailure;
+    CHECK(detail::copy_live_receiver_frame(target, 2U, 16U, 3U, 4U, kLiveReceiverCopyProbe) == cudaErrorLaunchFailure);
+    CHECK(LiveReceiverCopyProbe::synchronizations == 0U);
+
+    LiveReceiverCopyProbe::Reset();
+    LiveReceiverCopyProbe::synchronize_status = cudaErrorLaunchFailure;
+    CHECK(detail::copy_live_receiver_frame(target, 2U, 16U, 3U, 4U, kLiveReceiverCopyProbe) == cudaErrorLaunchFailure);
+    CHECK(LiveReceiverCopyProbe::synchronizations == 1U);
+}
+
+TEST_CASE("Committed visual frames exactly authorize one- and two-plane products") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    mmltk::frameworks::gpu::SystemImageRuntime clean{
+        {.device = 0, .backend = backend, .output_layout = mmltk::frameworks::gpu::ImageProductLayout::Clean}};
+    clean.Publish(8U, 6U, [](auto, auto, auto) {});
+    auto clean_product = clean.Borrow();
+    REQUIRE(clean_product.valid());
+    const auto clean_frame = visual_frame({PresentationSourceKind::Explore, 1U}, {8U, 6U}, clean_product.plane(0U).revision());
+
+    CHECK(visual_product_matches_frame(clean_frame, clean_product));
+    CHECK_FALSE(visual_product_matches_frame({}, clean_product));
+    CHECK_FALSE(
+        visual_product_matches_frame(visual_frame(clean_frame.source, clean_frame.extent, clean_frame.revision + 1U), clean_product));
+    CHECK_FALSE(visual_product_matches_frame(
+        visual_frame(clean_frame.source, {clean_frame.extent.width + 1U, clean_frame.extent.height}, clean_frame.revision), clean_product));
+    CHECK_FALSE(visual_product_matches_frame(clean_frame, {}));
+
+    mmltk::frameworks::gpu::SystemImageRuntime layered{
+        {.device = 0, .backend = backend, .output_layout = mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic}};
+    layered.Publish(9U, 7U, [](auto, auto, auto) {});
+    auto layered_product = layered.Borrow();
+    REQUIRE(layered_product.valid());
+    REQUIRE(layered_product.plane_count() == 2U);
+    const auto layered_frame = visual_frame({PresentationSourceKind::Annotation, 1U}, {9U, 7U}, layered_product.plane(0U).revision());
+    CHECK(visual_product_matches_frame(layered_frame, layered_product));
+}
+
+TEST_CASE("Receiver-owned copy retains its source lease through completion") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    mmltk::frameworks::gpu::SystemImageRuntime source{{.device = 0, .backend = backend}};
+    mmltk::frameworks::gpu::SystemImageRuntime receiver{{.device = 0, .backend = backend}};
+    backend->defer_events = true;
+    source.Publish(8U, 8U, [](auto, auto, auto) {});
+    auto borrowed = source.Borrow();
+    REQUIRE(borrowed.valid());
+
+    auto copy = std::async(std::launch::async, [&receiver, product = std::move(borrowed)]() mutable {
+        static_cast<void>(receiver.CopyFrom(std::move(product)));
+    });
+    auto superseding_publish = std::async(std::launch::async, [&source] { source.Publish(4U, 4U, [](auto, auto, auto) {}); });
+    CHECK(superseding_publish.wait_for(100ms) == std::future_status::timeout);
+
+    backend->CompleteEvents();
+    REQUIRE(copy.wait_for(2s) == std::future_status::ready);
+    copy.get();
+    REQUIRE(superseding_publish.wait_for(2s) == std::future_status::ready);
+    superseding_publish.get();
+}
+
+void Fill(const mmltk::frameworks::gpu::ImagePlaneView plane, const std::uint8_t value) {
+    std::memset(reinterpret_cast<void*>(plane.data), value, plane.descriptor.pitch_bytes * plane.descriptor.height);
+}
+
+struct ExploreRenderGate final {
+    std::atomic<std::size_t> calls{0U};
+    std::promise<void> entered;
+    std::promise<void> release;
+    std::shared_future<void> released = release.get_future().share();
+};
+
+struct ExploreFinalizationGate final {
+    explicit ExploreFinalizationGate(const std::size_t target) : target_call(target) {}
+    std::size_t target_call;
+    std::atomic<std::size_t> calls{0U};
+    std::promise<void> entered;
+    std::promise<void> release;
+    std::shared_future<void> released = release.get_future().share();
+};
+
+struct ExplorePostRenderGate final {
+    explicit ExplorePostRenderGate(const std::size_t target) : target_call(target) {}
+    std::size_t target_call;
+    std::atomic<std::size_t> calls{0U};
+    std::promise<void> entered;
+    std::promise<void> release;
+    std::shared_future<void> released = release.get_future().share();
+};
+
+struct ExploreWorkProbe final {
+    std::atomic<std::size_t> opens{0U};
+    std::atomic<std::size_t> prepares{0U};
+    std::atomic<std::size_t> renders{0U};
+    std::atomic<std::size_t> rendered_count{0U};
+    std::atomic<float> rendered_copy_paste_probability{0.0F};
+    std::array<std::atomic<std::uint32_t>, 2U> rendered_slots{};
+};
+
+struct ExploreDetailExtentProbe final {
+    VisualExtent padded{64U, 64U};
+    VisualExtent original{48U, 32U};
+};
+
+class SynchronousExploreAlgorithm : public ExploreAlgorithm {
+   public:
+    void AbortRenderGeneration() override { generation_ = 0U; }
+    void DiscardCandidate() override {}
+    void SetGalleryReadySink(GalleryReadySink) final {}
+    void PrepareOutputPublication() final {}
+    ExploreGalleryPublication BeginGallery(const ExploreRenderPlan& plan, const ExploreOrderCandidate* candidate, const std::size_t nproc,
+                                           const mmltk::frameworks::gpu::ImagePlaneView clean,
+                                           const mmltk::frameworks::gpu::ImagePlaneView semantic, const std::uintptr_t stream) final {
+        RenderProduct(plan, candidate, nproc, clean, semantic, stream);
+        generation_ = plan.generation;
+        return {.generation = generation_};
+    }
+    ExploreGalleryPublication AdvanceGallery() final { return {.generation = generation_}; }
+    bool HasGalleryTiles() const final { return false; }
+    ExploreGalleryPublication PublishGalleryTiles(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView,
+                                                  std::uintptr_t) final {
+        return {.generation = generation_};
+    }
+    void RenderDetail(const ExploreRenderPlan& plan, const std::size_t nproc, const mmltk::frameworks::gpu::ImagePlaneView clean,
+                      const mmltk::frameworks::gpu::ImagePlaneView semantic, const std::uintptr_t stream) final {
+        RenderProduct(plan, nullptr, nproc, clean, semantic, stream);
+        generation_ = 0U;
+    }
+
+   protected:
+    virtual void RenderProduct(const ExploreRenderPlan&, const ExploreOrderCandidate*, std::size_t, mmltk::frameworks::gpu::ImagePlaneView,
+                               mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) = 0;
+
+   private:
+    std::uint64_t generation_ = 0U;
+};
+
+struct StreamingExploreProbe final {
+    struct Assignment final {
+        std::uint64_t generation = 0U;
+        std::uint32_t compiled_index = 0U;
+        std::uint32_t slot = 0U;
+        bool read_started = false;
+        bool ready = false;
+        bool gpu_pending = false;
+    };
+
+    void Release(const std::uint32_t compiled_index) {
+        ExploreAlgorithm::GalleryReadySink wake;
+        {
+            std::scoped_lock lock(mutex);
+            const auto found = std::ranges::find(assignments, compiled_index, &Assignment::compiled_index);
+            REQUIRE(found != assignments.end());
+            found->ready = true;
+            wake = ready_sink;
+            changed.notify_all();
+        }
+        if (wake) wake();
+    }
+
+    void ReleaseAll() {
+        ExploreAlgorithm::GalleryReadySink wake;
+        {
+            std::scoped_lock lock(mutex);
+            for (auto& assignment : assignments)
+                assignment.ready = true;
+            wake = ready_sink;
+            changed.notify_all();
+        }
+        if (wake) wake();
+    }
+    void StartRead(const std::uint32_t compiled_index) {
+        std::scoped_lock lock(mutex);
+        const auto found = std::ranges::find(assignments, compiled_index, &Assignment::compiled_index);
+        REQUIRE(found != assignments.end());
+        REQUIRE_FALSE(found->read_started);
+        found->read_started = true;
+        ++mapped_reads;
+        changed.notify_all();
+    }
+    void AllowAllocation() {
+        ExploreAlgorithm::GalleryReadySink wake;
+        {
+            std::scoped_lock lock(mutex);
+            allocation_allowed = true;
+            wake = ready_sink;
+        }
+        if (wake) wake();
+    }
+    void AllowPreRead() { SignalGate(pre_read_allowed); }
+    void AllowPostRead() { SignalGate(post_read_allowed); }
+    void CompleteCallbacks() {
+        ExploreAlgorithm::GalleryReadySink wake;
+        {
+            std::scoped_lock lock(mutex);
+            callback_completion_allowed = true;
+            ++callback_completions;
+            std::erase_if(assignments, [this](const auto& assignment) {
+                if (!assignment.gpu_pending) return false;
+                if (assignment.generation == generation) {
+                    completed_slots[assignment.slot] = 1U;
+                    ++cumulative;
+                }
+                return true;
+            });
+            wake = ready_sink;
+            changed.notify_all();
+        }
+        if (wake) wake();
+    }
+    [[nodiscard]] bool Wait(std::function<bool()> predicate) {
+        std::unique_lock lock(mutex);
+        return changed.wait_for(lock, 2s, std::move(predicate));
+    }
+
+    mutable std::mutex mutex;
+    std::condition_variable changed;
+    ExploreAlgorithm::GalleryReadySink ready_sink;
+    std::vector<Assignment> assignments;
+    std::vector<std::uint32_t> visible;
+    std::vector<bool> completed_slots;
+    std::vector<std::uint32_t> priority_slots;
+    std::uint64_t generation = 0U;
+    std::size_t nproc = 1U;
+    std::size_t next_slot = 0U;
+    std::size_t cumulative = 0U;
+    std::size_t publications = 0U;
+    std::size_t stale = 0U;
+    std::size_t maximum_active = 0U;
+    bool allocation_allowed = false;
+    bool pre_read_allowed = false;
+    bool post_read_allowed = false;
+    bool callback_completion_allowed = true;
+    bool fail_callback_admission = false;
+    std::size_t lane_preparations = 0U;
+    std::size_t mapped_reads = 0U;
+    std::size_t queued_closures = 0U;
+    std::size_t callback_completions = 0U;
+    std::size_t quiescences = 0U;
+    std::size_t aborted_assignments = 0U;
+    bool fail_next_render = false;
+    std::shared_ptr<ExplorePostRenderGate> render_gate;
+
+   private:
+    void SignalGate(bool& gate) {
+        ExploreAlgorithm::GalleryReadySink wake;
+        {
+            std::scoped_lock lock(mutex);
+            gate = true;
+            wake = ready_sink;
+        }
+        if (wake) wake();
+    }
+};
+
+[[nodiscard]] std::vector<std::uint32_t> visible_test_order(const std::vector<std::uint32_t>& order, const ExploreViewport viewport) {
+    if (!viewport.valid()) return order;
+    const auto first = std::min<std::size_t>(static_cast<std::size_t>(viewport.first_row) * viewport.columns, order.size());
+    const auto count = std::min<std::size_t>(static_cast<std::size_t>(viewport.row_count) * viewport.columns, order.size() - first);
+    return {order.begin() + static_cast<std::ptrdiff_t>(first), order.begin() + static_cast<std::ptrdiff_t>(first + count)};
+}
+
+class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
+   public:
+    explicit ControlledStreamingExploreAlgorithm(std::shared_ptr<StreamingExploreProbe> probe) : probe_(std::move(probe)) {}
+    ~ControlledStreamingExploreAlgorithm() override {
+        std::scoped_lock lock(probe_->mutex);
+        ++probe_->quiescences;
+        probe_->assignments.clear();
+        probe_->ready_sink = {};
+    }
+
+    ExploreOpened Open(std::string_view, std::stop_token) override {
+        order_ = {0U, 1U, 2U, 3U, 4U, 5U};
+        return {
+            .dataset = {.image_count = 6U, .image_width = 4U, .image_height = 4U},
+            .order = Visible({}),
+        };
+    }
+    ExploreOrderCandidate PrepareFilter(const ExploreFilter& filter, const std::uint64_t seed, std::size_t, std::stop_token) override {
+        return {.filter = filter,
+                .order = {.matching_count = static_cast<std::uint32_t>(order_.size()), .shuffle_seed = seed, .visible_indices = order_},
+                .generation = ++candidate_generation_};
+    }
+    void Commit(ExploreOrderCandidate) noexcept override {}
+    void AbortRenderGeneration() override { ClearStreamingState(); }
+    void DiscardCandidate() override { AbortRenderGeneration(); }
+    void Reset() noexcept override {
+        ClearStreamingState();
+        order_.clear();
+    }
+    ExploreOrderFacts Visible(const ExploreViewport viewport, const ExploreOrderCandidate* candidate = nullptr) const override {
+        const auto& order = candidate == nullptr ? order_ : candidate->order.visible_indices;
+        return {
+            .matching_count = static_cast<std::uint32_t>(order.size()),
+            .visible_indices = visible_test_order(order, viewport),
+        };
+    }
+    bool Contains(const std::uint32_t value) const override { return std::ranges::find(order_, value) != order_.end(); }
+    std::optional<std::uint32_t> Adjacent(const std::uint32_t value, const std::int64_t offset) const override {
+        if (!Contains(value)) return {};
+        const auto count = static_cast<std::int64_t>(order_.size());
+        const auto adjacent = (static_cast<std::int64_t>(value) + offset % count + count) % count;
+        return static_cast<std::uint32_t>(adjacent);
+    }
+    void SetGalleryReadySink(GalleryReadySink sink) override {
+        std::scoped_lock lock(probe_->mutex);
+        probe_->ready_sink = std::move(sink);
+    }
+    void PrepareOutputPublication() override {}
+    ExploreGalleryPublication BeginGallery(const ExploreRenderPlan& plan, const ExploreOrderCandidate* candidate, const std::size_t nproc,
+                                           const mmltk::frameworks::gpu::ImagePlaneView clean,
+                                           const mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t) override {
+        std::shared_ptr<ExplorePostRenderGate> gate;
+        {
+            std::scoped_lock lock(probe_->mutex);
+            if (std::exchange(probe_->fail_next_render, false)) throw std::runtime_error("deterministic streaming Explore render failure");
+            gate = probe_->render_gate;
+        }
+        if (gate && gate->calls.fetch_add(1U, std::memory_order_acq_rel) == gate->target_call) {
+            gate->entered.set_value();
+            gate->released.wait();
+        }
+        {
+            std::scoped_lock lock(probe_->mutex);
+            if (probe_->generation == plan.generation) {
+                PrioritizeLocked(plan);
+                probe_->next_slot = 0U;
+                return FactsLocked(0U);
+            }
+        }
+        Fill(clean, 0x11U);
+        Fill(semantic, 0U);
+        std::scoped_lock lock(probe_->mutex);
+        probe_->generation = plan.generation;
+        probe_->visible = Visible(plan.viewport, candidate).visible_indices;
+        probe_->completed_slots.assign(probe_->visible.size(), 0U);
+        probe_->nproc = nproc;
+        probe_->next_slot = 0U;
+        probe_->cumulative = 0U;
+        PrioritizeLocked(plan);
+        return FactsLocked(0U);
+    }
+    ExploreGalleryPublication AdvanceGallery() override {
+        std::scoped_lock lock(probe_->mutex);
+        const auto before = probe_->assignments.size();
+        std::erase_if(probe_->assignments,
+                      [this](const auto& assignment) { return assignment.ready && assignment.generation != probe_->generation; });
+        const auto discarded = before - probe_->assignments.size();
+        probe_->stale += discarded;
+        if (probe_->allocation_allowed) ScheduleLocked();
+        for (auto& assignment : probe_->assignments) {
+            if (assignment.generation != probe_->generation) continue;
+            if (!assignment.read_started && probe_->pre_read_allowed) {
+                assignment.read_started = true;
+                ++probe_->mapped_reads;
+            }
+            if (assignment.read_started && probe_->post_read_allowed) assignment.ready = true;
+        }
+        probe_->changed.notify_all();
+        return FactsLocked(discarded);
+    }
+    bool HasGalleryTiles() const override {
+        std::scoped_lock lock(probe_->mutex);
+        return std::ranges::any_of(probe_->assignments, [this](const auto& assignment) {
+            return assignment.ready && !assignment.gpu_pending && assignment.generation == probe_->generation;
+        });
+    }
+    ExploreGalleryPublication PublishGalleryTiles(const mmltk::frameworks::gpu::ImagePlaneView clean,
+                                                  const mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t) override {
+        GalleryReadySink wake;
+        ExploreGalleryPublication facts;
+        {
+            std::scoped_lock lock(probe_->mutex);
+            if (probe_->fail_callback_admission) throw std::runtime_error("deterministic Explore callback admission failure");
+            for (auto& assignment : probe_->assignments) {
+                if (!assignment.ready || assignment.gpu_pending || assignment.generation != probe_->generation) continue;
+                FillSlot(clean, assignment.slot, probe_->visible.size(), static_cast<std::uint8_t>(0x40U + assignment.compiled_index));
+                FillSlot(semantic, assignment.slot, probe_->visible.size(), static_cast<std::uint8_t>(0x80U + assignment.compiled_index));
+                assignment.gpu_pending = true;
+            }
+            if (probe_->callback_completion_allowed) {
+                ++probe_->callback_completions;
+                std::erase_if(probe_->assignments, [this](const auto& assignment) {
+                    if (!assignment.gpu_pending || assignment.generation != probe_->generation) return false;
+                    probe_->completed_slots[assignment.slot] = 1U;
+                    ++probe_->cumulative;
+                    return true;
+                });
+            }
+            ++probe_->publications;
+            facts = FactsLocked(0U);
+            probe_->changed.notify_all();
+            if (probe_->callback_completion_allowed) wake = probe_->ready_sink;
+        }
+        if (wake) wake();
+        return facts;
+    }
+    void RenderDetail(const ExploreRenderPlan& plan, std::size_t, const mmltk::frameworks::gpu::ImagePlaneView clean,
+                      const mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t) override {
+        Fill(clean, static_cast<std::uint8_t>(0x60U + plan.selected_image.value_or(0U)));
+        Fill(semantic, 0U);
+        std::scoped_lock lock(probe_->mutex);
+        probe_->generation = 0U;
+        probe_->assignments.clear();
+    }
+
+   private:
+    void PrioritizeLocked(const ExploreRenderPlan& plan) {
+        probe_->priority_slots.clear();
+        if (plan.focused_image) {
+            const auto focused = std::ranges::find(probe_->visible, *plan.focused_image);
+            if (focused != probe_->visible.end())
+                probe_->priority_slots.push_back(static_cast<std::uint32_t>(focused - probe_->visible.begin()));
+        }
+        for (std::size_t slot = 0U; slot != probe_->visible.size(); ++slot)
+            if (probe_->priority_slots.empty() || slot != probe_->priority_slots.front())
+                probe_->priority_slots.push_back(static_cast<std::uint32_t>(slot));
+    }
+    void ClearStreamingState() noexcept {
+        std::scoped_lock lock(probe_->mutex);
+        ++probe_->quiescences;
+        probe_->aborted_assignments += probe_->assignments.size();
+        probe_->assignments.clear();
+        probe_->visible.clear();
+        probe_->priority_slots.clear();
+        probe_->generation = 0U;
+        probe_->next_slot = 0U;
+        probe_->cumulative = 0U;
+    }
+    static void FillSlot(const mmltk::frameworks::gpu::ImagePlaneView plane, const std::size_t slot, const std::size_t count,
+                         const std::uint8_t value) {
+        const auto width = plane.descriptor.width / static_cast<std::uint32_t>(std::max<std::size_t>(count, 1U));
+        for (std::uint32_t y = 0U; y != plane.descriptor.height; ++y) {
+            auto* row = reinterpret_cast<std::uint8_t*>(plane.data) + y * plane.descriptor.pitch_bytes;
+            std::memset(row + slot * width * 4U, value, width * 4U);
+        }
+    }
+    void ScheduleLocked() {
+        while (probe_->assignments.size() < probe_->nproc && probe_->next_slot != probe_->visible.size()) {
+            const auto slot = probe_->priority_slots[probe_->next_slot++];
+            if (probe_->completed_slots[slot] != 0U || std::ranges::any_of(probe_->assignments, [&](const auto& work) {
+                    return work.generation == probe_->generation && work.slot == slot;
+                }))
+                continue;
+            probe_->assignments.push_back({
+                .generation = probe_->generation,
+                .compiled_index = probe_->visible[slot],
+                .slot = slot,
+            });
+            ++probe_->lane_preparations;
+            ++probe_->queued_closures;
+        }
+        probe_->maximum_active = std::max(probe_->maximum_active, probe_->assignments.size());
+        probe_->changed.notify_all();
+    }
+    [[nodiscard]] ExploreGalleryPublication FactsLocked(const std::size_t stale) const {
+        return {
+            .generation = probe_->generation,
+            .ready_slots = probe_->completed_slots,
+            .cumulative_tiles = probe_->cumulative,
+            .remaining_tiles = probe_->visible.size() - probe_->cumulative,
+            .active_pinned_bytes = probe_->assignments.size() * 64U,
+            .stale_discarded = stale,
+        };
+    }
+
+    std::shared_ptr<StreamingExploreProbe> probe_;
+    std::vector<std::uint32_t> order_;
+    std::uint64_t candidate_generation_ = 0U;
+};
+
+[[nodiscard]] VisualRuntimeFactory streaming_explore_runtime_factory(std::shared_ptr<FakeImageBackend> backend,
+                                                                     std::shared_ptr<StreamingExploreProbe> probe) {
+    return RuntimeFactory(0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+                          [probe = std::move(probe)] { return std::make_unique<ControlledStreamingExploreAlgorithm>(probe); });
+}
+
+class TestExploreAlgorithm final : public SynchronousExploreAlgorithm {
+   public:
+    explicit TestExploreAlgorithm(std::shared_ptr<std::atomic<std::size_t>> observed_nproc, std::shared_ptr<ExploreRenderGate> gate = {},
+                                  std::shared_ptr<std::atomic_uint64_t> commits = {},
+                                  std::shared_ptr<ExploreFinalizationGate> finalization_gate = {},
+                                  std::shared_ptr<ExploreWorkProbe> work_probe = {},
+                                  std::shared_ptr<ExplorePostRenderGate> post_render_gate = {},
+                                  std::shared_ptr<ExploreDetailExtentProbe> detail_extent = {})
+        : observed_nproc_(std::move(observed_nproc)),
+          gate_(std::move(gate)),
+          commits_(std::move(commits)),
+          finalization_gate_(std::move(finalization_gate)),
+          work_probe_(std::move(work_probe)),
+          post_render_gate_(std::move(post_render_gate)),
+          detail_extent_(std::move(detail_extent)) {}
+    ExploreOpened Open(const std::string_view source, std::stop_token) override {
+        if (work_probe_) work_probe_->opens.fetch_add(1U, std::memory_order_release);
+        if (source == "/failed") throw std::runtime_error("deterministic Explore open failure");
+        candidate_order_ = {0U, 1U, 2U};
+        candidate_render_failure_ = source == "/render-failed";
+        if (source == "/allocation-failed") throw std::bad_alloc{};
+        const std::vector<contracts::ArtifactClassName> class_names =
+            source == "/different-catalog" ? std::vector<contracts::ArtifactClassName>{{"animal"}, {"building"}}
+                                           : std::vector<contracts::ArtifactClassName>{{"person"}, {"vehicle"}};
+        return {.dataset = {.image_count = 3U, .image_width = 64U, .image_height = 64U, .class_names = class_names},
+                .order = {.matching_count = static_cast<std::uint32_t>(candidate_order_.size()), .visible_indices = candidate_order_}};
+    }
+    ExploreOrderCandidate PrepareFilter(const ExploreFilter& filter, std::uint64_t seed, std::size_t, std::stop_token) override {
+        if (work_probe_) work_probe_->prepares.fetch_add(1U, std::memory_order_release);
+        if (filter.minimum_instances == 7U) throw std::bad_alloc{};
+        if (filter.minimum_instances == 8U) candidate_render_failure_ = true;
+        if (candidate_order_.empty()) candidate_order_ = order_;
+        return {.filter = filter,
+                .order = {.matching_count = static_cast<std::uint32_t>(candidate_order_.size()),
+                          .shuffle_seed = seed,
+                          .visible_indices = candidate_order_},
+                .generation = ++candidate_generation_};
+    }
+    void Commit(ExploreOrderCandidate) noexcept override {
+        order_ = std::move(candidate_order_);
+        candidate_render_failure_ = false;
+        if (commits_) commits_->fetch_add(1U, std::memory_order_release);
+    }
+    void DiscardCandidate() override {
+        candidate_order_.clear();
+        candidate_render_failure_ = false;
+    }
+    void Reset() noexcept override {
+        order_.clear();
+        candidate_order_.clear();
+        candidate_render_failure_ = false;
+        candidate_generation_ = 0U;
+    }
+    ExploreOrderFacts Visible(const ExploreViewport viewport, const ExploreOrderCandidate* candidate = nullptr) const override {
+        const auto& order = candidate == nullptr ? order_ : candidate->order.visible_indices;
+        ExploreOrderFacts facts{
+            .matching_count = static_cast<std::uint32_t>(order.size()),
+            .shuffle_seed = candidate == nullptr ? 0U : candidate->order.shuffle_seed,
+        };
+        if (candidate != nullptr) {
+            if (finalization_gate_ &&
+                finalization_gate_->calls.fetch_add(1U, std::memory_order_acq_rel) == finalization_gate_->target_call) {
+                finalization_gate_->entered.set_value();
+                finalization_gate_->released.wait();
+            }
+        }
+        facts.visible_indices = visible_test_order(order, viewport);
+        return facts;
+    }
+    bool Contains(std::uint32_t value) const override { return std::ranges::find(order_, value) != order_.end(); }
+    VisualExtent DetailExtent(const ExploreRenderPlan& plan) const override {
+        return detail_extent_ ? detail_extent_->padded : ExploreAlgorithm::DetailExtent(plan);
+    }
+    VisualRegion DetailContent(const ExploreRenderPlan&) const override {
+        if (!detail_extent_) return {};
+        return {(detail_extent_->padded.width - detail_extent_->original.width) / 2U,
+                (detail_extent_->padded.height - detail_extent_->original.height) / 2U, detail_extent_->original.width,
+                detail_extent_->original.height};
+    }
+    std::optional<std::uint32_t> Adjacent(std::uint32_t selected, std::int64_t offset) const override {
+        return static_cast<std::uint32_t>((static_cast<std::int64_t>(selected) + offset % 3 + 3) % 3);
+    }
+    void RenderProduct(const ExploreRenderPlan& plan, const ExploreOrderCandidate* candidate, const std::size_t nproc,
+                       const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic,
+                       std::uintptr_t) override {
+        if (candidate != nullptr && candidate_render_failure_) throw std::runtime_error("deterministic Explore candidate render failure");
+        if (work_probe_) work_probe_->renders.fetch_add(1U, std::memory_order_release);
+        if (work_probe_) {
+            work_probe_->rendered_copy_paste_probability.store(plan.augmentation_config.copy_paste_probability, std::memory_order_release);
+            const auto visible = Visible(plan.viewport, candidate).visible_indices;
+            work_probe_->rendered_count.store(visible.size(), std::memory_order_release);
+            for (std::size_t slot = 0U; slot != work_probe_->rendered_slots.size(); ++slot)
+                work_probe_->rendered_slots[slot].store(slot < visible.size() ? visible[slot] : std::numeric_limits<std::uint32_t>::max(),
+                                                        std::memory_order_release);
+        }
+        observed_nproc_->store(nproc, std::memory_order_release);
+        if (gate_ && gate_->calls.fetch_add(1U, std::memory_order_acq_rel) == 1U) {
+            gate_->entered.set_value();
+            gate_->released.wait();
+        }
+        Fill(clean, static_cast<std::uint8_t>(plan.generation));
+        Fill(semantic, 0x5aU);
+        if (post_render_gate_ && post_render_gate_->calls.fetch_add(1U, std::memory_order_acq_rel) == post_render_gate_->target_call) {
+            post_render_gate_->entered.set_value();
+            post_render_gate_->released.wait();
+        }
+    }
+
+   private:
+    std::shared_ptr<std::atomic<std::size_t>> observed_nproc_;
+    std::shared_ptr<ExploreRenderGate> gate_;
+    std::shared_ptr<std::atomic_uint64_t> commits_;
+    std::shared_ptr<ExploreFinalizationGate> finalization_gate_;
+    std::shared_ptr<ExploreWorkProbe> work_probe_;
+    std::shared_ptr<ExplorePostRenderGate> post_render_gate_;
+    std::shared_ptr<ExploreDetailExtentProbe> detail_extent_;
+    std::vector<std::uint32_t> order_;
+    std::vector<std::uint32_t> candidate_order_;
+    std::uint64_t candidate_generation_ = 0U;
+    bool candidate_render_failure_ = false;
+};
+
+class FailingExploreAlgorithm final : public SynchronousExploreAlgorithm {
+   public:
+    ExploreOpened Open(std::string_view, std::stop_token) override {
+        return {
+            .dataset = {.image_count = 1U, .image_width = 32U, .image_height = 32U},
+            .order = {.matching_count = 1U, .visible_indices = {0U}},
+        };
+    }
+    ExploreOrderCandidate PrepareFilter(const ExploreFilter&, std::uint64_t, std::size_t, std::stop_token) override { return {}; }
+    void Commit(ExploreOrderCandidate) noexcept override {}
+    void Reset() noexcept override {}
+    ExploreOrderFacts Visible(ExploreViewport, const ExploreOrderCandidate* = nullptr) const override { return {}; }
+    bool Contains(std::uint32_t) const override { return false; }
+    std::optional<std::uint32_t> Adjacent(std::uint32_t, std::int64_t) const override { return {}; }
+    void RenderProduct(const ExploreRenderPlan&, const ExploreOrderCandidate*, std::size_t, mmltk::frameworks::gpu::ImagePlaneView,
+                       mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) override {
+        throw std::runtime_error("deterministic compiled renderer failure");
+    }
+};
+
+struct CancellationProbe final {
+    std::promise<void> entered;
+    std::promise<void> cancelled;
+};
+
+[[nodiscard]] bool wait_for_cancellation(const std::stop_token stop, CancellationProbe& probe) {
+    probe.entered.set_value();
+    std::mutex mutex;
+    std::condition_variable_any changed;
+    std::stop_callback wake{stop, [&changed] { changed.notify_all(); }};
+    std::unique_lock lock(mutex);
+    changed.wait(lock, stop, [] { return false; });
+    if (!stop.stop_requested()) return false;
+    probe.cancelled.set_value();
+    return true;
+}
+
+class CancellableExploreAlgorithm final : public SynchronousExploreAlgorithm {
+   public:
+    explicit CancellableExploreAlgorithm(std::shared_ptr<CancellationProbe> probe) : probe_(std::move(probe)) {}
+    ExploreOpened Open(std::string_view, const std::stop_token stop) override {
+        if (opened_) {
+            static_cast<void>(wait_for_cancellation(stop, *probe_));
+            return {};
+        }
+        opened_ = true;
+        order_ = {0U};
+        return {.dataset = {.image_count = 1U, .image_width = 32U, .image_height = 32U, .class_names = {}}, .order = Visible({})};
+    }
+    ExploreOrderCandidate PrepareFilter(const ExploreFilter& filter, std::uint64_t seed, std::size_t, std::stop_token) override {
+        return {.filter = filter, .order = Visible({}), .generation = seed + 1U};
+    }
+    void Commit(ExploreOrderCandidate) noexcept override {}
+    void Reset() noexcept override {
+        order_.clear();
+        opened_ = false;
+    }
+    ExploreOrderFacts Visible(ExploreViewport, const ExploreOrderCandidate* candidate = nullptr) const override {
+        if (candidate != nullptr) return candidate->order;
+        return {.matching_count = 1U, .shuffle_seed = 0U, .visible_indices = order_};
+    }
+    bool Contains(std::uint32_t value) const override { return value == 0U; }
+    std::optional<std::uint32_t> Adjacent(std::uint32_t, std::int64_t) const override { return 0U; }
+    void RenderProduct(const ExploreRenderPlan& plan, const ExploreOrderCandidate*, std::size_t,
+                       const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic,
+                       std::uintptr_t) override {
+        Fill(clean, static_cast<std::uint8_t>(plan.generation));
+        Fill(semantic, 2U);
+    }
+
+   private:
+    std::shared_ptr<CancellationProbe> probe_;
+    std::vector<std::uint32_t> order_;
+    bool opened_ = false;
+};
+
+struct OpenPreparationProbe final {
+    explicit OpenPreparationProbe(const std::size_t blocked) : blocked_call(blocked) {}
+    std::size_t blocked_call;
+    std::atomic<std::size_t> prepare_calls{0U};
+    std::atomic<std::size_t> commits{0U};
+    std::atomic<std::size_t> resets{0U};
+    std::promise<void> entered;
+    std::promise<void> cancelled;
+};
+
+class CancellableOpenPreparationAlgorithm final : public SynchronousExploreAlgorithm {
+   public:
+    explicit CancellableOpenPreparationAlgorithm(std::shared_ptr<OpenPreparationProbe> probe) : probe_(std::move(probe)) {}
+    ExploreOpened Open(std::string_view, std::stop_token) override {
+        candidate_order_ = {0U};
+        return {.dataset = {.image_count = 1U, .image_width = 32U, .image_height = 32U, .class_names = {{"person"}}},
+                .order = {.matching_count = 1U, .visible_indices = candidate_order_}};
+    }
+    ExploreOrderCandidate PrepareFilter(const ExploreFilter& filter, const std::uint64_t seed, std::size_t,
+                                        const std::stop_token stop) override {
+        const auto call = probe_->prepare_calls.fetch_add(1U, std::memory_order_acq_rel);
+        if (call == probe_->blocked_call) {
+            probe_->entered.set_value();
+            std::mutex mutex;
+            std::condition_variable_any changed;
+            std::stop_callback wake{stop, [&changed] { changed.notify_all(); }};
+            std::unique_lock lock(mutex);
+            changed.wait(lock, stop, [] { return false; });
+            if (stop.stop_requested()) {
+                probe_->cancelled.set_value();
+                return {};
+            }
+        }
+        return {.filter = filter,
+                .order = {.matching_count = 1U, .shuffle_seed = seed, .visible_indices = candidate_order_},
+                .generation = static_cast<std::uint64_t>(call) + 1U};
+    }
+    void Commit(ExploreOrderCandidate candidate) noexcept override {
+        order_ = std::move(candidate.order.visible_indices);
+        candidate_order_.clear();
+        probe_->commits.fetch_add(1U, std::memory_order_release);
+    }
+    void DiscardCandidate() override { candidate_order_.clear(); }
+    void Reset() noexcept override {
+        order_.clear();
+        candidate_order_.clear();
+        probe_->resets.fetch_add(1U, std::memory_order_release);
+    }
+    ExploreOrderFacts Visible(ExploreViewport, const ExploreOrderCandidate* candidate = nullptr) const override {
+        return candidate == nullptr
+                   ? ExploreOrderFacts{.matching_count = static_cast<std::uint32_t>(order_.size()), .visible_indices = order_}
+                   : candidate->order;
+    }
+    bool Contains(const std::uint32_t value) const override { return std::ranges::find(order_, value) != order_.end(); }
+    std::optional<std::uint32_t> Adjacent(const std::uint32_t value, std::int64_t) const override {
+        return Contains(value) ? std::optional{value} : std::nullopt;
+    }
+    void RenderProduct(const ExploreRenderPlan& plan, const ExploreOrderCandidate*, std::size_t,
+                       const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic,
+                       std::uintptr_t) override {
+        Fill(clean, static_cast<std::uint8_t>(plan.generation));
+        Fill(semantic, 0U);
+    }
+
+   private:
+    std::shared_ptr<OpenPreparationProbe> probe_;
+    std::vector<std::uint32_t> order_;
+    std::vector<std::uint32_t> candidate_order_;
+};
+
+class AtomicFilterExploreAlgorithm final : public SynchronousExploreAlgorithm {
+   public:
+    AtomicFilterExploreAlgorithm(std::shared_ptr<CancellationProbe> probe, std::shared_ptr<std::atomic_uint64_t> commits)
+        : probe_(std::move(probe)), commits_(std::move(commits)) {}
+    ExploreOpened Open(std::string_view, std::stop_token) override {
+        committed_ = {0U};
+        return {.dataset = {.image_count = 2U, .image_width = 32U, .image_height = 32U, .class_names = {}},
+                .order = {.matching_count = 1U, .visible_indices = {0U}}};
+    }
+    ExploreOrderCandidate PrepareFilter(
+        const ExploreFilter& filter, std::uint64_t seed, std::size_t,
+        // CLEANUP-IGNORE: Atomic-filter cancellation and reopen cancellation exercise different algorithm boundaries.
+        const std::stop_token stop) override {
+        if (prepare_count_++ == 0U)
+            return {.filter = filter, .order = {.matching_count = 1U, .shuffle_seed = seed, .visible_indices = {0U}}, .generation = 1U};
+        if (wait_for_cancellation(stop, *probe_)) return {};
+        return {.filter = filter, .order = {.matching_count = 1U, .shuffle_seed = seed, .visible_indices = {1U}}, .generation = 1U};
+    }
+    void Commit(ExploreOrderCandidate candidate) noexcept override {
+        committed_ = std::move(candidate.order.visible_indices);
+        commits_->fetch_add(1U, std::memory_order_release);
+    }
+    void Reset() noexcept override {
+        committed_.clear();
+        prepare_count_ = 0U;
+    }
+    ExploreOrderFacts Visible(ExploreViewport, const ExploreOrderCandidate* candidate = nullptr) const override {
+        if (candidate != nullptr) return candidate->order;
+        return {.matching_count = static_cast<std::uint32_t>(committed_.size()), .visible_indices = committed_};
+    }
+    bool Contains(std::uint32_t value) const override { return std::ranges::find(committed_, value) != committed_.end(); }
+    std::optional<std::uint32_t> Adjacent(std::uint32_t value, std::int64_t) const override {
+        return Contains(value) ? std::optional{value} : std::nullopt;
+    }
+    void RenderProduct(const ExploreRenderPlan& plan, const ExploreOrderCandidate*, std::size_t,
+                       mmltk::frameworks::gpu::ImagePlaneView clean, mmltk::frameworks::gpu::ImagePlaneView semantic,
+                       std::uintptr_t) override {
+        if (plan.generation == 1U) {
+            Fill(clean, 1U);
+            Fill(semantic, 0U);
+            return;
+        }
+        Fill(clean, 2U);
+        Fill(semantic, 0U);
+    }
+
+   private:
+    std::shared_ptr<CancellationProbe> probe_;
+    std::shared_ptr<std::atomic_uint64_t> commits_;
+    std::vector<std::uint32_t> committed_{0U};
+    std::uint64_t prepare_count_ = 0U;
+};
+
+struct MutationCommitProbe final {
+    std::promise<void> committed;
+    std::promise<void> release;
+    std::shared_future<void> released = release.get_future().share();
+};
+
+class TestAnnotationAlgorithm final : public AnnotationAlgorithm {
+   public:
+    explicit TestAnnotationAlgorithm(std::shared_ptr<std::atomic<std::uint64_t>> document_revision,
+                                     std::shared_ptr<std::vector<std::uint64_t>> order = {},
+                                     std::shared_ptr<std::atomic_bool> save_applied = {},
+                                     std::shared_ptr<MutationCommitProbe> mutation = {},
+                                     std::shared_ptr<std::promise<void>> peer_closed = {})
+        : document_revision_(std::move(document_revision)),
+          order_(std::move(order)),
+          save_applied_(std::move(save_applied)),
+          mutation_(std::move(mutation)),
+          peer_closed_(std::move(peer_closed)) {}
+    AnnotationOperationResult Open(const mmltk::frameworks::gpu::ImagePlaneView source, contracts::AnnotationSceneContent,
+                                   VisualRegion) override {
+        state_.scene.document = contracts::WorkspaceResource::From("direct://test-annotation", 1U);
+        state_.scene.categories = {{.value = "object"}};
+        state_.scene.frame_width = static_cast<std::uint16_t>(source.descriptor.width);
+        state_.scene.frame_height = static_cast<std::uint16_t>(source.descriptor.height);
+        state_.scene.frame_ready = true;
+        state_.document_revision = 1U;
+        state_.scene_revision = 1U;
+        state_.interaction_revision = 1U;
+        state_.scene.document.revision = 1U;
+        return {.ui = state_, .detail = {}, .outcome = AnnotationOperationOutcome::Applied};
+    }
+    AnnotationOperationResult Pointer(const AnnotationPointer& pointer) override {
+        ++state_.document_revision;
+        ++state_.scene_revision;
+        ++state_.interaction_revision;
+        state_.scene.document.revision = state_.document_revision;
+        document_revision_->store(pointer.sequence, std::memory_order_release);
+        if (order_) order_->push_back(pointer.sequence);
+        return {.ui = state_, .detail = {}, .outcome = AnnotationOperationOutcome::Applied};
+    }
+    void PeerClosed() noexcept override {
+        if (order_) order_->push_back(200U);
+        if (peer_closed_) peer_closed_->set_value();
+    }
+    AnnotationOperationResult Edit(const AnnotationEdit&) override {
+        ++state_.document_revision;
+        ++state_.scene_revision;
+        state_.scene.document.revision = state_.document_revision;
+        if (order_) order_->push_back(100U);
+        if (mutation_) {
+            mutation_->committed.set_value();
+            mutation_->released.wait();
+        }
+        return {.ui = state_, .detail = {}, .outcome = AnnotationOperationOutcome::Applied};
+    }
+    AnnotationOperationResult Save(std::string_view) override {
+        if (save_applied_ && !save_applied_->load(std::memory_order_acquire))
+            return {.ui = state_, .detail = "deterministic save refusal", .outcome = AnnotationOperationOutcome::Rejected};
+        return {.ui = state_, .detail = {}, .outcome = AnnotationOperationOutcome::Applied};
+    }
+
+    void Render(const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView clean,
+                const mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t) const override {
+        mmltk::frameworks::gpu::test_support::CopyImagePlane(clean, source);
+        Fill(semantic, 0xa5U);
+    }
+
+   private:
+    std::shared_ptr<std::atomic<std::uint64_t>> document_revision_;
+    std::shared_ptr<std::vector<std::uint64_t>> order_;
+    std::shared_ptr<std::atomic_bool> save_applied_;
+    std::shared_ptr<MutationCommitProbe> mutation_;
+    std::shared_ptr<std::promise<void>> peer_closed_;
+    contracts::AnnotationUiState state_;
+};
+
+class CancellableAnnotationAlgorithm final : public AnnotationAlgorithm {
+   public:
+    explicit CancellableAnnotationAlgorithm(std::shared_ptr<CancellationProbe> probe) : probe_(std::move(probe)) {}
+    AnnotationOperationResult Open(const mmltk::frameworks::gpu::ImagePlaneView source, contracts::AnnotationSceneContent,
+                                   VisualRegion) override {
+        static_cast<void>(source);
+        return {.ui = {}, .detail = "deterministic refusal", .outcome = AnnotationOperationOutcome::Rejected};
+    }
+    AnnotationOperationResult Pointer(const AnnotationPointer&) override { return {}; }
+    void PeerClosed() noexcept override {}
+    AnnotationOperationResult Edit(const AnnotationEdit&) override { return {}; }
+    AnnotationOperationResult Save(std::string_view) override { return {}; }
+    void Render(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView,
+                std::uintptr_t) const override {
+        probe_->entered.set_value();
+        probe_->cancelled.set_value();
+    }
+
+   private:
+    std::shared_ptr<CancellationProbe> probe_;
+};
+
+class TestUpscaleAlgorithm final : public UpscaleAlgorithm {
+   public:
+    void Semantics(const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView target,
+                   std::uintptr_t) override {
+        Fill(target, source.valid() ? *reinterpret_cast<const std::uint8_t*>(source.data) : 0U);
+    }
+    explicit TestUpscaleAlgorithm(std::shared_ptr<std::atomic<UpscaleKernel>> kernel, std::shared_ptr<MutationCommitProbe> gate = {},
+                                  std::shared_ptr<std::atomic_uint32_t> runs = {})
+        : kernel_(std::move(kernel)), gate_(std::move(gate)), runs_(std::move(runs)) {}
+    [[nodiscard]] static VisualRuntimeFactory CreateRuntime(std::shared_ptr<FakeImageBackend> backend,
+                                                            std::shared_ptr<std::atomic<UpscaleKernel>> kernel,
+                                                            std::shared_ptr<std::atomic_uint32_t> runs) {
+        return RuntimeFactory(
+            0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+            [kernel = std::move(kernel), runs = std::move(runs)] { return std::make_unique<TestUpscaleAlgorithm>(kernel, nullptr, runs); });
+    }
+    void Warm() override {}
+    void Run(const UpscaleKernel kernel, mmltk::frameworks::gpu::ImagePlaneView, const mmltk::frameworks::gpu::ImagePlaneView target,
+             std::uintptr_t) override {
+        kernel_->store(kernel, std::memory_order_release);
+        if (runs_) runs_->fetch_add(1U, std::memory_order_acq_rel);
+        if (gate_) {
+            gate_->committed.set_value();
+            gate_->released.wait();
+            gate_.reset();
+        }
+        Fill(target, static_cast<std::uint8_t>(kernel) + 1U);
+    }
+
+   private:
+    std::shared_ptr<std::atomic<UpscaleKernel>> kernel_;
+    std::shared_ptr<MutationCommitProbe> gate_;
+    std::shared_ptr<std::atomic_uint32_t> runs_;
+};
+
+class FailingUpscaleAlgorithm final : public UpscaleAlgorithm {
+   public:
+    void Semantics(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) override {}
+    explicit FailingUpscaleAlgorithm(std::shared_ptr<std::atomic_uint32_t> runs) : runs_(std::move(runs)) {}
+    void Warm() override {}
+    void Run(UpscaleKernel, mmltk::frameworks::gpu::ImagePlaneView, const mmltk::frameworks::gpu::ImagePlaneView target,
+             std::uintptr_t) override {
+        if (runs_->fetch_add(1U, std::memory_order_acq_rel) == 1U) throw std::runtime_error("deterministic Upscale failure");
+        Fill(target, 1U);
+    }
+
+   private:
+    std::shared_ptr<std::atomic_uint32_t> runs_;
+};
+
+struct UpscaleActivationProbe final {
+    std::atomic<std::size_t> warms{0U};
+    std::atomic<std::size_t> runs{0U};
+    std::atomic<std::size_t> fallback_activations{0U};
+    std::array<std::atomic_bool, 3U> ready{};
+    std::atomic_bool fail_warm{false};
+    std::atomic_bool hold_warm{false};
+    std::promise<void> warm_entered;
+    std::promise<void> warm_release;
+    std::shared_future<void> warm_released = warm_release.get_future().share();
+    std::promise<void> first_warm_completed;
+};
+
+class UpscaleWarmAdmissionGate final {
+   public:
+    [[nodiscard]] VisualDiagnosticSink sink() noexcept {
+        return {
+            .context = this,
+            .write =
+                [](void* context, const VisualDiagnosticFact fact) noexcept {
+                    if (fact.operation != VisualDiagnosticOperation::UpscaleWarmAdmissionStarted) return;
+                    auto& gate = *static_cast<UpscaleWarmAdmissionGate*>(context);
+                    if (!gate.entered_once_.exchange(true, std::memory_order_acq_rel)) gate.entered_.set_value();
+                    gate.released_.wait();
+                },
+        };
+    }
+    [[nodiscard]] std::future<void> entered() { return entered_.get_future(); }
+    void Release() {
+        if (!released_once_.exchange(true, std::memory_order_acq_rel)) release_.set_value();
+    }
+
+   private:
+    std::atomic_bool entered_once_{false};
+    // CLEANUP-IGNORE: Warm-admission gate state is unrelated to compute-query cancellation probe state.
+    std::atomic_bool released_once_{false};
+    std::promise<void> entered_;
+    std::promise<void> release_;
+    std::shared_future<void> released_ = release_.get_future().share();
+};
+
+class ActivationUpscaleAlgorithm final : public UpscaleAlgorithm {
+   public:
+    void Semantics(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) override {}
+    explicit ActivationUpscaleAlgorithm(std::shared_ptr<UpscaleActivationProbe> probe) : probe_(std::move(probe)) {}
+    void Warm() override {
+        const auto call = probe_->warms.fetch_add(1U, std::memory_order_acq_rel);
+        if (call == 0U && probe_->hold_warm.load(std::memory_order_acquire)) {
+            probe_->warm_entered.set_value();
+            probe_->warm_released.wait();
+        }
+        if (probe_->fail_warm.exchange(false, std::memory_order_acq_rel)) throw std::runtime_error("deterministic Upscale warm failure");
+        Activate();
+        if (call == 0U) probe_->first_warm_completed.set_value();
+    }
+    void Run(UpscaleKernel, const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView target,
+             std::uintptr_t) override {
+        if (!probe_->ready[0U].load(std::memory_order_acquire)) {
+            probe_->fallback_activations.fetch_add(1U, std::memory_order_acq_rel);
+            Activate();
+        }
+        probe_->runs.fetch_add(1U, std::memory_order_acq_rel);
+        Fill(target, *reinterpret_cast<const std::uint8_t*>(source.data));
+    }
+
+   private:
+    void Activate() noexcept {
+        for (auto& ready : probe_->ready)
+            ready.store(true, std::memory_order_release);
+    }
+    std::shared_ptr<UpscaleActivationProbe> probe_;
+};
+
+struct UpscaleExtentProbe final {
+    std::mutex mutex;
+    std::vector<mmltk::frameworks::gpu::ImagePlaneView> sources;
+    // CLEANUP-IGNORE: Captured output views and scalar admission dimensions are distinct test evidence.
+    std::vector<mmltk::frameworks::gpu::ImagePlaneView> targets;
+};
+
+class ExtentUpscaleAlgorithm final : public UpscaleAlgorithm {
+   public:
+    void Semantics(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) override {}
+    explicit ExtentUpscaleAlgorithm(std::shared_ptr<UpscaleExtentProbe> probe) : probe_(std::move(probe)) {}
+    void Warm() override {}
+    void Run(UpscaleKernel, const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView target,
+             std::uintptr_t) override {
+        {
+            std::scoped_lock lock(probe_->mutex);
+            probe_->sources.push_back(source);
+            probe_->targets.push_back(target);
+        }
+        Fill(target, *reinterpret_cast<const std::uint8_t*>(source.data));
+    }
+
+   private:
+    std::shared_ptr<UpscaleExtentProbe> probe_;
+};
+
+struct UpscaleAdmissionRaceProbe final {
+    std::atomic<std::uint8_t> received_value{0U};
+    std::atomic<std::uint32_t> received_width{0U};
+    std::atomic<std::uint32_t> received_height{0U};
+};
+
+class RacingUpscaleAlgorithm final : public UpscaleAlgorithm {
+   public:
+    void Semantics(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) override {}
+    explicit RacingUpscaleAlgorithm(std::shared_ptr<UpscaleAdmissionRaceProbe> probe) : probe_(std::move(probe)) {}
+    void Warm() override {}
+    void Run(UpscaleKernel, const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView target,
+             std::uintptr_t) override {
+        const auto value = *reinterpret_cast<const std::uint8_t*>(source.data);
+        probe_->received_value.store(value, std::memory_order_release);
+        probe_->received_width.store(source.descriptor.width, std::memory_order_release);
+        probe_->received_height.store(source.descriptor.height, std::memory_order_release);
+        Fill(target, value);
+    }
+
+   private:
+    std::shared_ptr<UpscaleAdmissionRaceProbe> probe_;
+};
+
+struct UpscaleReleaseFailureProbe final {
+    std::promise<void> warmed;
+    std::atomic<std::size_t> releases{0U};
+    std::atomic_bool destroyed{false};
+};
+
+class ReleaseFailingUpscaleAlgorithm final : public UpscaleAlgorithm {
+   public:
+    void Semantics(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) override {}
+    explicit ReleaseFailingUpscaleAlgorithm(std::shared_ptr<UpscaleReleaseFailureProbe> probe)
+        : probe_(std::move(probe)), failure_(std::make_exception_ptr(std::runtime_error("deterministic Upscale release failure"))) {}
+    ~ReleaseFailingUpscaleAlgorithm() override { probe_->destroyed.store(true, std::memory_order_release); }
+    void Warm() override { probe_->warmed.set_value(); }
+    void Run(UpscaleKernel, mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) override {}
+    [[nodiscard]] Release ReleaseResources() noexcept override {
+        probe_->releases.fetch_add(1U, std::memory_order_acq_rel);
+        return {.all_released = false, .failure = failure_};
+    }
+
+   private:
+    std::shared_ptr<UpscaleReleaseFailureProbe> probe_;
+    std::exception_ptr failure_;
+};
+
+class TestLiveAlgorithm final : public LiveAlgorithm {
+   public:
+    explicit TestLiveAlgorithm(std::shared_ptr<std::atomic<std::uint64_t>> captures, std::shared_ptr<std::atomic_bool> token_changed = {})
+        : captures_(std::move(captures)), token_changed_(std::move(token_changed)) {}
+    void Start(const LiveStart&) override {}
+    bool Capture(const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t, const std::stop_token stop) override {
+        if (!first_stop_)
+            first_stop_ = stop;
+        else if (*first_stop_ != stop && token_changed_)
+            token_changed_->store(true, std::memory_order_release);
+        if (stop.stop_requested()) return false;
+        const auto value = captures_->fetch_add(1U, std::memory_order_acq_rel) + 1U;
+        Fill(target, static_cast<std::uint8_t>(value));
+        return true;
+    }
+    void Stop() noexcept override {}
+
+   private:
+    std::shared_ptr<std::atomic<std::uint64_t>> captures_;
+    std::shared_ptr<std::atomic_bool> token_changed_;
+    std::optional<std::stop_token> first_stop_;
+};
+
+[[nodiscard]] VisualRuntimeFactory test_live_runtime_factory(std::shared_ptr<FakeImageBackend> backend,
+                                                             std::shared_ptr<std::atomic<std::uint64_t>> captures,
+                                                             std::shared_ptr<std::atomic_bool> token_changed = {}) {
+    return RuntimeFactory(0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::Clean,
+                          [captures = std::move(captures), token_changed = std::move(token_changed)] {
+                              return std::make_unique<TestLiveAlgorithm>(captures, token_changed);
+                          });
+}
+
+[[nodiscard]] detail::VisualRuntimeOwner::Notification no_op_visual_work(mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
+    return {};
+}
+
+[[nodiscard]] detail::VisualRuntimeOwner::Work record_visual_work(std::mutex& mutex, std::vector<int>& values, const int value,
+                                                                  std::promise<void>* completed = nullptr) {
+    return [&mutex, &values, value, completed](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
+        {
+            std::scoped_lock lock(mutex);
+            values.push_back(value);
+        }
+        if (completed != nullptr) completed->set_value();
+        return detail::VisualRuntimeOwner::Notification{};
+    };
+}
+
+void submit_blocked_visual_work(detail::VisualRuntimeOwner& owner, std::promise<void>& entered, std::shared_future<void> release) {
+    REQUIRE(owner.SubmitOrdered([&entered, release = std::move(release)](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
+        entered.set_value();
+        release.wait();
+        return detail::VisualRuntimeOwner::Notification{};
+    }));
+    entered.get_future().wait();
+}
+
+void submit_counting_continuation(detail::VisualRuntimeOwner& owner, std::atomic_uint32_t& count) {
+    owner.RegisterContinuation([&count](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
+        count.fetch_add(1U, std::memory_order_release);
+        return detail::VisualRuntimeOwner::Notification{};
+    });
+    REQUIRE(owner.NotifyContinuation());
+}
+
+class FailingLiveAlgorithm final : public LiveAlgorithm {
+   public:
+    void Start(const LiveStart&) override {}
+    bool Capture(mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t, std::stop_token) override {
+        throw std::runtime_error("deterministic Live capture failure");
+    }
+    void Stop() noexcept override {}
+};
+
+struct TestPresentationWriterState final {
+    std::atomic_bool advertise_waiting_candidate{false};
+    TestPresentationWriterState() : readiness(::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK)), pump_release(release_pump.get_future().share()) {}
+    void SignalReadiness() const {
+        const std::uint64_t value = 1U;
+        REQUIRE(::write(readiness.get(), &value, sizeof(value)) == sizeof(value));
+    }
+    void AcknowledgeAllocationRetirement(const std::uint64_t generation) {
+        retirement_acknowledgement.store(generation, std::memory_order_release);
+        SignalReadiness();
+    }
+    void RecordPump() {
+        {
+            std::scoped_lock lock(pump_mutex);
+            ++pump_count;
+        }
+        pump_changed.notify_all();
+    }
+    [[nodiscard]] std::uint64_t PumpCount() const {
+        std::scoped_lock lock(pump_mutex);
+        return pump_count;
+    }
+    [[nodiscard]] bool WaitForPumpAfter(const std::uint64_t prior) {
+        std::unique_lock lock(pump_mutex);
+        return pump_changed.wait_for(lock, 2s, [&] { return pump_count > prior; });
+    }
+    mmltk::common::io::ScopedFd readiness;
+    // CLEANUP-IGNORE: Presentation lifecycle evidence is unrelated to the GPU fake's transfer counters.
+    std::atomic<std::uint64_t> timeline{0U};
+    std::atomic<std::uint64_t> presentation_revision{0U};
+    std::atomic<std::uint64_t> submissions{0U};
+    std::atomic<std::uint64_t> browser_terminals{0U};
+    std::atomic<std::uint64_t> retirements{0U};
+    std::atomic<std::uint64_t> allocation_retirements{0U};
+    std::atomic<std::uint64_t> retained_allocation_generation{0U};
+    std::atomic<std::uint64_t> retirement_acknowledgement{0U};
+    std::atomic<std::uint64_t> constructions{0U};
+    std::atomic<std::uint64_t> context_bindings{0U};
+    std::atomic_bool allow_publication{true};
+    std::atomic_bool fail_pump{false};
+    std::atomic_bool block_pump{false};
+    std::atomic_bool pump_block_reported{false};
+    std::atomic_bool terminal_release_succeeds{true};
+    std::atomic_bool terminal_source_settled{true};
+    std::promise<void> first_submission;
+    std::promise<void> third_submission;
+    std::promise<void> allocation_retired;
+    std::promise<void> pump_entered;
+    std::promise<void> release_pump;
+    std::shared_future<void> pump_release;
+    mutable std::mutex pump_mutex;
+    std::condition_variable pump_changed;
+    std::uint64_t pump_count = 0U;
+};
+
+class TestPresentationWriter final : public PresentationNativeWriter {
+   public:
+    TestPresentationWriter(const int device, std::shared_ptr<FakeImageBackend> backend, std::shared_ptr<TestPresentationWriterState> state)
+        : context_(device, std::move(backend)),
+          stream_(context_),
+          backbuffer_(context_, mmltk::frameworks::gpu::ImageProductLayout::Clean),
+          state_(std::move(state)) {
+        state_->constructions.fetch_add(1U, std::memory_order_acq_rel);
+    }
+    ~TestPresentationWriter() override { state_->retirements.fetch_add(1U, std::memory_order_acq_rel); }
+
+    void Submit(VisualFrame frame, std::uint64_t selection_generation, const VisualSourceReader& reader) override {
+        context_.Bind();
+        state_->context_bindings.fetch_add(1U, std::memory_order_acq_rel);
+        const auto submission = state_->submissions.fetch_add(1U, std::memory_order_acq_rel);
+        if (submission == 0U) state_->first_submission.set_value();
+        if (submission == 2U) state_->third_submission.set_value();
+        selection_generation_ = selection_generation;
+        const auto width = frame.extent.width;
+        const auto height = frame.extent.height;
+        if (!Contains(active_, width, height)) {
+            if (candidate_ && !Contains(candidate_, width, height)) candidate_.reset();
+            if (!candidate_) {
+                candidate_ = Allocation{
+                    .width = active_ ? std::max(active_->width, width) : width,
+                    .height = active_ ? std::max(active_->height, height) : height,
+                    .generation = next_generation_++,
+                };
+            }
+        }
+        const auto& target = Contains(active_, width, height) ? *active_ : *candidate_;
+        last_completed_ = frame;
+        reader_ = std::addressof(reader);
+        pending_ = PresentationPublication{
+            .capability =
+                {
+                    .surface_high = 1U,
+                    .surface_low = target.generation,
+                    .extent = {target.width, target.height},
+                    .generation = target.generation,
+                    .condition = PresentationCapabilityCondition::Ready,
+                },
+        };
+    }
+    PresentationNativeOutcome Pump(const std::uint64_t current_selection_generation) override {
+        context_.Bind();
+        state_->context_bindings.fetch_add(1U, std::memory_order_acq_rel);
+        std::uint64_t wake = 0U;
+        ssize_t consumed = -1;
+        do {
+            consumed = ::read(state_->readiness.get(), &wake, sizeof(wake));
+        } while (consumed < 0 && errno == EINTR);
+        if (consumed < 0 && errno != EAGAIN) throw std::runtime_error("test presentation readiness read failed");
+        if (state_->fail_pump.load(std::memory_order_acquire)) throw std::runtime_error("test presentation writer failure");
+        if (state_->block_pump.load(std::memory_order_acquire)) {
+            if (!state_->pump_block_reported.exchange(true, std::memory_order_acq_rel)) state_->pump_entered.set_value();
+            state_->pump_release.wait();
+        }
+        const auto retirement_acknowledgement = state_->retirement_acknowledgement.exchange(0U, std::memory_order_acq_rel);
+        if (retiring_ && retirement_acknowledgement == retiring_->generation) {
+            retiring_.reset();
+            state_->retained_allocation_generation.store(0U, std::memory_order_release);
+            const auto prior = state_->allocation_retirements.fetch_add(1U, std::memory_order_acq_rel);
+            if (prior == 0U) state_->allocation_retired.set_value();
+        }
+        state_->RecordPump();
+        if (selection_generation_ != current_selection_generation) {
+            const auto superseded = selection_generation_;
+            pending_.reset();
+            return {
+                .progress = PresentationNativeProgress::Superseded,
+                .selection_generation = superseded,
+            };
+        }
+        if (!pending_ || !state_->allow_publication.load(std::memory_order_acquire)) return {.capability = capability()};
+        const bool candidate_target = candidate_ && pending_->capability.generation == candidate_->generation;
+        if (candidate_target && retiring_) return {.capability = capability()};
+        auto source = reader_->borrow();
+        if (!visual_product_matches_frame(last_completed_, source)) {
+            pending_.reset();
+            reader_ = nullptr;
+            return {
+                .progress = PresentationNativeProgress::Superseded,
+                .selection_generation = selection_generation_,
+                .capability = capability(),
+            };
+        }
+        static_cast<void>(backbuffer_.CopyFrom(stream_, std::move(source)));
+        stream_.Synchronize();
+        if (candidate_target) {
+            if (active_) {
+                retiring_ = std::exchange(active_, std::nullopt);
+                state_->retained_allocation_generation.store(retiring_->generation, std::memory_order_release);
+            }
+            active_ = std::exchange(candidate_, std::nullopt);
+        }
+        pending_->timeline_ready = state_->timeline.fetch_add(1U, std::memory_order_acq_rel) + 1U;
+        pending_->presentation_revision = state_->presentation_revision.fetch_add(1U, std::memory_order_acq_rel) + 1U;
+        auto outcome = PresentationNativeOutcome{
+            .progress = PresentationNativeProgress::Published,
+            .selection_generation = selection_generation_,
+            .publication = std::exchange(pending_, std::nullopt).value(),
+            .capability = capability(),
+        };
+        reader_ = nullptr;
+        return outcome;
+    }
+    int poll_fd() const noexcept override { return state_->readiness.get(); }
+    bool wants_write() const noexcept override { return false; }
+    void SetExpectedBrowserProcessGroup(pid_t) override {}
+    Retirement BrowserPeerLost() noexcept override {
+        try {
+            context_.Bind();
+            state_->context_bindings.fetch_add(1U, std::memory_order_acq_rel);
+        } catch (...) { return {.all_released = false}; }
+        state_->browser_terminals.fetch_add(1U, std::memory_order_acq_rel);
+        return {.all_released = state_->terminal_release_succeeds.load(std::memory_order_acquire),
+                .safe_to_destroy = state_->terminal_source_settled.load(std::memory_order_acquire)};
+    }
+
+   private:
+    struct Allocation final {
+        std::uint32_t width = 0U;
+        std::uint32_t height = 0U;
+        std::uint64_t generation = 0U;
+    };
+
+    [[nodiscard]] static bool Contains(const std::optional<Allocation>& allocation, const std::uint32_t width,
+                                       const std::uint32_t height) noexcept {
+        return allocation && width <= allocation->width && height <= allocation->height;
+    }
+
+    [[nodiscard]] PresentationCapability capability() const noexcept {
+        const auto* allocation = candidate_ ? std::addressof(*candidate_) : active_ ? std::addressof(*active_) : nullptr;
+        if (allocation == nullptr) return {};
+        return {
+            .surface_high = 1U,
+            .surface_low = allocation->generation + (state_->advertise_waiting_candidate.load() ? 100U : 0U),
+            .extent = {allocation->width, allocation->height},
+            .generation = allocation->generation + (state_->advertise_waiting_candidate.load() ? 100U : 0U),
+            .condition = state_->allow_publication.load(std::memory_order_acquire) ? PresentationCapabilityCondition::Ready
+                                                                                   : PresentationCapabilityCondition::Admitted,
+        };
+    }
+    mmltk::frameworks::gpu::DeviceContext context_;
+    mmltk::frameworks::gpu::ImageStream stream_;
+    mmltk::frameworks::gpu::ImageProductBuffer backbuffer_;
+    std::shared_ptr<TestPresentationWriterState> state_;
+    VisualFrame last_completed_{};
+    const VisualSourceReader* reader_ = nullptr;
+    std::uint64_t selection_generation_ = 0U;
+    std::optional<PresentationPublication> pending_;
+    std::optional<Allocation> active_;
+    std::optional<Allocation> candidate_;
+    std::optional<Allocation> retiring_;
+    std::uint64_t next_generation_ = 1U;
+};
+
+TEST_CASE("Presentation target capacity rejects a delayed undersized import") {
+    const PresentationTargetCapacity delayed{
+        .width = 100U,
+        .height = 100U,
+        .pitch = 400U,
+        .bytes = 40'000U,
+    };
+    CHECK(delayed.contains({100U, 100U}));
+    CHECK_FALSE(delayed.contains({200U, 200U}));
+    const PresentationTargetCapacity successor{
+        .width = 200U,
+        .height = 200U,
+        .pitch = 1024U,
+        .bytes = 204'800U,
+    };
+    CHECK(successor.contains({200U, 200U}));
+    CHECK_FALSE(PresentationTargetCapacity{
+        .width = 200U,
+        .height = 200U,
+        .pitch = 799U,
+        .bytes = 204'800U,
+    }
+                    .contains({200U, 200U}));
+}
+
+class EventGate final {
+   public:
+    void Advance() {
+        {
+            std::scoped_lock lock(mutex_);
+            ++revision_;
+        }
+        changed_.notify_all();
+    }
+    template <class Predicate>
+    bool Wait(Predicate predicate) {
+        std::unique_lock lock(mutex_);
+        return changed_.wait_for(lock, 2s, std::move(predicate));
+    }
+    [[nodiscard]] std::uint64_t revision() const noexcept { return revision_; }
+
+   private:
+    mutable std::mutex mutex_;
+    std::condition_variable changed_;
+    std::uint64_t revision_ = 0U;
+};
+
+class DiagnosticCapture final {
+   public:
+    [[nodiscard]] VisualDiagnosticSink sink() noexcept {
+        return {
+            .context = this,
+            .write =
+                [](void* context, const VisualDiagnosticFact fact) noexcept {
+                    auto& capture = *static_cast<DiagnosticCapture*>(context);
+                    capture.last_system.store(fact.system, std::memory_order_release);
+                    if (fact.operation == VisualDiagnosticOperation::StaleThumbnailDiscarded)
+                        capture.stale_discarded.fetch_add(fact.value, std::memory_order_acq_rel);
+                    capture.count.fetch_add(1U, std::memory_order_acq_rel);
+                },
+        };
+    }
+    std::atomic<std::uint64_t> count{0U};
+    std::atomic<std::uint64_t> stale_discarded{0U};
+    std::atomic<VisualSystemKind> last_system{VisualSystemKind::Explore};
+};
+
+constexpr VisualDeviceSettings kDevice{
+    .device = 0,
+    .maximum_width = 1024U,
+    .maximum_height = 1024U,
+};
+
+[[nodiscard]] bool has_cuda_device() noexcept {
+    int device_count = 0;
+    return ::cudaGetDeviceCount(&device_count) == cudaSuccess && device_count > 0;
+}
+
+void check_gallery_first_pixels(ExploreSystem& explore, const std::uint8_t first, const std::uint8_t second) {
+    auto product = explore.BorrowFrame();
+    REQUIRE(product.valid());
+    const auto plane = product.plane(0U).plane();
+    CHECK(*reinterpret_cast<const std::uint8_t*>(plane.data) == first);
+    CHECK(*(reinterpret_cast<const std::uint8_t*>(plane.data) + 16U) == second);
+}
+
+void open_streaming_gallery(ExploreSystem& explore, EventGate& events, ExploreViewport viewport) {
+    static_cast<void>(explore.Open({.viewport = viewport, .compiled_source = "/stream"}));
+    REQUIRE(events.Wait([&explore] { return explore.snapshot().ready; }));
+}
+
+class LoadedSettings final {
+   public:
+    explicit LoadedSettings(SystemEventSink<SettingsSystem::event_type> events = {}) : system_(std::move(events)) {
+        REQUIRE(system_.Load(location()).applied());
+    }
+    [[nodiscard]] SettingsSystem& system() noexcept { return system_; }
+    void BreakPersistence() {
+        std::filesystem::remove_all(directory_.path());
+        mmltk::testsupport::write_text_file(directory_.path(), "blocked");
+    }
+    void RestorePersistence() {
+        std::filesystem::remove_all(directory_.path());
+        std::filesystem::create_directories(directory_.path());
+    }
+    void MakeUnavailable() {
+        std::filesystem::remove_all(directory_.path());
+        std::filesystem::create_directories(directory_.path() / "gui.json");
+        REQUIRE_FALSE(system_.Load(location()).applied());
+    }
+    [[nodiscard]] services::SettingsLocation location() const {
+        return services::SettingsLocation{(directory_.path() / "gui.json").string()};
+    }
+
+   private:
+    mmltk::testsupport::ScopedTempDir directory_{"mmltk-explore-settings"};
+    SettingsSystem system_;
+};
+
+class OpenedExplore final {
+   public:
+    OpenedExplore(std::shared_ptr<FakeImageBackend> backend, const VisualExtent extent)
+        : explore_(settings_.system(), kDevice, 2U,
+                   RuntimeFactory(0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+                                  [] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U)); }),
+                   [this](ExploreSystem::event_type) { events_.Advance(); }) {
+        static_cast<void>(
+            explore_.Open({.viewport = {.extent = extent, .columns = extent.width / extent.height}, .compiled_source = "/test"}));
+        REQUIRE(events_.Wait([this] { return explore_.snapshot().ready; }));
+    }
+
+    [[nodiscard]] ExploreSystem& system() noexcept { return explore_; }
+    void Reopen(const VisualExtent extent) {
+        const auto admitted =
+            explore_.Open({.viewport = {.extent = extent, .columns = extent.width / extent.height}, .compiled_source = "/reopened"});
+        REQUIRE(events_.Wait([this, admitted] { return explore_.snapshot().ready && explore_.snapshot().revision > admitted.revision; }));
+    }
+
+   private:
+    EventGate events_;
+    LoadedSettings settings_;
+    ExploreSystem explore_;
+};
+
+class ExploreScenario final {
+   public:
+    using ModelFactory = std::function<std::unique_ptr<mmltk::frameworks::gpu::SystemImageModel>()>;
+    using Observer = std::function<void(ExploreSystem::event_type)>;
+
+    ExploreScenario(LoadedSettings& settings, std::shared_ptr<FakeImageBackend> backend, ModelFactory model = {}, Observer observer = {})
+        : ExploreScenario(settings, 2U,
+                          RuntimeFactory(0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+                                         model ? std::move(model) : DefaultModel()),
+                          std::move(observer)) {}
+
+    ExploreScenario(LoadedSettings& settings, const std::size_t nproc, VisualRuntimeFactory runtime, Observer observer = {})
+        : observer_(std::move(observer)),
+          explore_(settings.system(), kDevice, nproc, std::move(runtime), [this](ExploreSystem::event_type event) {
+              if (observer_) observer_(std::move(event));
+              events_.Advance();
+          }) {}
+
+    [[nodiscard]] ExploreSystem& system() noexcept { return explore_; }
+
+    void OpenAndWait(const ExploreViewport viewport, const std::string_view compiled_source = "/test") {
+        static_cast<void>(explore_.Open({.viewport = viewport, .compiled_source = std::string{compiled_source}}));
+        REQUIRE(Wait([this] { return explore_.snapshot().ready; }));
+    }
+
+    [[nodiscard]] bool Wait(std::function<bool()> predicate) { return events_.Wait(std::move(predicate)); }
+
+    [[nodiscard]] static ModelFactory TrackCommits(std::shared_ptr<std::atomic_uint64_t> commits) {
+        return [commits = std::move(commits)] {
+            return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr, commits);
+        };
+    }
+
+    [[nodiscard]] static ModelFactory TrackWork(std::shared_ptr<ExploreWorkProbe> work) {
+        return [work = std::move(work)] {
+            return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr, nullptr, nullptr, work);
+        };
+    }
+
+   private:
+    [[nodiscard]] static ModelFactory DefaultModel() {
+        return [] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U)); };
+    }
+
+    Observer observer_;
+    EventGate events_;
+    ExploreSystem explore_;
+};
+
+[[nodiscard]] ExploreFilterPreferences select_explore_subset(LoadedSettings& settings, ExploreScenario& scenario,
+                                                             const std::uint32_t class_index) {
+    auto& explore = scenario.system();
+    const auto admitted = explore.UpdateFilter({
+        .filter = {.class_selection = {.mode = ExploreClassSelectionMode::Subset, .classes = {class_index}}},
+        .overlay = {.class_selection = {.mode = ExploreClassSelectionMode::None}},
+    });
+    REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > admitted.revision; }));
+    return settings.system().explore_settings_candidate().preferences;
+}
+
+void check_catalog_selection_preserved(const ExploreFilterPreferences& actual, const ExploreFilterPreferences& expected) {
+    CHECK(actual.class_catalog_identity == expected.class_catalog_identity);
+    CHECK(actual.policy.filter.class_selection == expected.policy.filter.class_selection);
+    CHECK(actual.policy.overlay.class_selection == expected.policy.overlay.class_selection);
+}
+
+[[nodiscard]] ExploreScenario::Observer count_explore_failures(std::shared_ptr<std::atomic_uint64_t> failures) {
+    return [failures = std::move(failures)](ExploreSystem::event_type event) {
+        if (std::holds_alternative<ExploreFailed>(event)) failures->fetch_add(1U, std::memory_order_acq_rel);
+    };
+}
+
+class StreamingExploreFixture final {
+   public:
+    explicit StreamingExploreFixture(const std::size_t nproc)
+        : backend_(std::make_shared<FakeImageBackend>()),
+          probe_(std::make_shared<StreamingExploreProbe>()),
+          failures_(std::make_shared<std::atomic_uint64_t>(0U)),
+          scenario_(settings_, nproc, streaming_explore_runtime_factory(backend_, probe_), count_explore_failures(failures_)) {}
+
+    [[nodiscard]] LoadedSettings& settings() noexcept { return settings_; }
+    [[nodiscard]] FakeImageBackend& backend() noexcept { return *backend_; }
+    [[nodiscard]] StreamingExploreProbe& probe() noexcept { return *probe_; }
+    [[nodiscard]] std::uint64_t failure_count() const noexcept { return failures_->load(std::memory_order_acquire); }
+    [[nodiscard]] ExploreSystem& system() noexcept { return scenario_.system(); }
+    void OpenAndWait(const ExploreViewport viewport) { scenario_.OpenAndWait(viewport, "/stream"); }
+    [[nodiscard]] bool Wait(std::function<bool()> predicate) { return scenario_.Wait(std::move(predicate)); }
+    void ReleaseAndWaitForFrameAfter(const std::uint64_t revision) {
+        probe_->ReleaseAll();
+        REQUIRE(Wait([&] { return system().snapshot().frame.revision > revision; }));
+    }
+
+   private:
+    LoadedSettings settings_;
+    std::shared_ptr<FakeImageBackend> backend_;
+    std::shared_ptr<StreamingExploreProbe> probe_;
+    std::shared_ptr<std::atomic_uint64_t> failures_;
+    ExploreScenario scenario_;
+};
+
+[[nodiscard]] ExploreScenario tracked_explore_scenario(LoadedSettings& settings, std::shared_ptr<FakeImageBackend> backend,
+                                                       std::shared_ptr<std::atomic_uint64_t> commits,
+                                                       ExploreScenario::Observer observer = {}) {
+    return ExploreScenario{settings, std::move(backend), ExploreScenario::TrackCommits(std::move(commits)), std::move(observer)};
+}
+
+[[nodiscard]] ExploreSnapshot wait_for_explore_failure(ExploreScenario& scenario, const std::shared_ptr<std::atomic_uint64_t>& failures,
+                                                       const std::uint64_t admission_revision) {
+    auto& explore = scenario.system();
+    REQUIRE(scenario.Wait([&] {
+        return failures->load(std::memory_order_acquire) == 1U && !explore.snapshot().busy &&
+               explore.snapshot().revision > admission_revision;
+    }));
+    return explore.snapshot();
+}
+
+class TrackedExploreFailureFixture final {
+   public:
+    TrackedExploreFailureFixture()
+        : backend_(std::make_shared<FakeImageBackend>()),
+          failures_(std::make_shared<std::atomic_uint64_t>(0U)),
+          commits_(std::make_shared<std::atomic_uint64_t>(0U)),
+          scenario_(tracked_explore_scenario(settings_, backend_, commits_, count_explore_failures(failures_))) {}
+
+    [[nodiscard]] ExploreScenario& scenario() noexcept { return scenario_; }
+    [[nodiscard]] ExploreSystem& system() noexcept { return scenario_.system(); }
+    [[nodiscard]] const std::shared_ptr<std::atomic_uint64_t>& failures() const noexcept { return failures_; }
+    [[nodiscard]] std::uint64_t commit_count() const noexcept { return commits_->load(std::memory_order_acquire); }
+    void OpenAndWait() { scenario_.OpenAndWait({.extent = {64U, 64U}}); }
+
+   private:
+    LoadedSettings settings_;
+    std::shared_ptr<FakeImageBackend> backend_;
+    std::shared_ptr<std::atomic_uint64_t> failures_;
+    std::shared_ptr<std::atomic_uint64_t> commits_;
+    ExploreScenario scenario_;
+};
+
+void check_restored_filter(const ExploreSnapshot& restored, const ExploreSnapshot& committed) {
+    CHECK(restored.ready);
+    CHECK(restored.filter == committed.filter);
+    CHECK(restored.order.visible_indices == committed.order.visible_indices);
+    CHECK(restored.frame.revision > committed.frame.revision);
+}
+
+[[nodiscard]] bool assignments_match(const StreamingExploreProbe& probe, const std::span<const std::uint32_t> visible_indices) {
+    return std::ranges::all_of(probe.assignments, [&](const auto& assignment) {
+        return assignment.generation == probe.generation &&
+               std::ranges::find(visible_indices, assignment.compiled_index) != visible_indices.end();
+    });
+}
+
+[[nodiscard]] ExploreClassCatalogIdentity test_explore_catalog_identity() {
+    const std::array names{
+        contracts::ArtifactClassName{.value = "person"},
+        contracts::ArtifactClassName{.value = "vehicle"},
+    };
+    return explore_class_catalog_identity(names);
+}
+
+void persist_explore_catalog(SettingsSystem& settings, const ExploreClassCatalogIdentity identity) {
+    const auto candidate = settings.explore_settings_candidate();
+    auto preferences = candidate.preferences.policy;
+    preferences.filter.class_selection = {};
+    preferences.overlay.class_selection = {};
+    settings.persist_explore_class_catalog(candidate, identity, preferences);
+}
+
+void queue_failed_explore_overlay_update(LoadedSettings& settings) {
+    settings.BreakPersistence();
+    contracts::SettingsUpdateRequest request;
+    request.updates.emplace_back(contracts::SettingsValueUpdate{
+        .path = "workflows.explore.show_boxes",
+        .value = mmltk::frameworks::serialization::wire::FlatValue{false},
+    });
+    request.updates.emplace_back(contracts::SettingsValueUpdate{
+        .path = "workflows.explore.min_instances",
+        .value = mmltk::frameworks::serialization::wire::FlatValue{std::uint64_t{2U}},
+    });
+    CHECK_THROWS_AS(settings.system().Update(std::move(request)), contracts::FailedError);
+    CHECK(settings.system().snapshot().settings_state.workflows.explore.show_boxes);
+    const auto pending = settings.system().explore_settings_candidate().preferences.policy;
+    CHECK_FALSE(pending.overlay.show_boxes);
+    CHECK(pending.filter.minimum_instances == 2U);
+}
+
+void enable_dark_mode(LoadedSettings& settings) {
+    contracts::SettingsUpdateRequest update;
+    update.updates.push_back({
+        .path = "ui.dark_mode",
+        .value = mmltk::frameworks::serialization::wire::FlatValue{true},
+    });
+    static_cast<void>(settings.system().Update(std::move(update)));
+}
+
+void release_and_wait_for_idle(ExploreScenario& scenario, std::promise<void>& release) {
+    release.set_value();
+    REQUIRE(scenario.Wait([&scenario] { return !scenario.system().snapshot().busy; }));
+}
+
+[[nodiscard]] VisualDocumentRead test_document(mmltk::frameworks::gpu::BorrowedImageProductReadView pixels) {
+    auto document = std::make_shared<VisualDocument>();
+    document->scene.document = contracts::WorkspaceResource::From("test://image", 1U);
+    document->scene.categories.push_back({.value = "object"});
+    return {std::move(pixels), std::move(document)};
+}
+[[nodiscard]] ExactVisualDocumentBorrower borrow_exactly_from(ExploreSystem& explore) {
+    return [&explore](const VisualFrame& frame) {
+        if (frame.source != explore.snapshot().frame.source) return VisualDocumentRead{};
+        return test_document(borrow_matching_visual_product(frame, explore.BorrowFrame()));
+    };
+}
+
+template <class System>
+[[nodiscard]] VisualSourceReader read_from(System& system) {
+    return {
+        .source = system.snapshot().frame.source,
+        .latest = [&system] { return system.snapshot().frame; },
+        .borrow = [&system] { return system.BorrowFrame(); },
+    };
+}
+
+void present_and_wait(PresentationSystem& presentation, TestPresentationWriterState& writer, EventGate& events,
+                      const VisualSourceReader& source, const std::uint64_t revision) {
+    static_cast<void>(presentation.Select(source.source));
+    writer.SignalReadiness();
+    REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == revision; }));
+}
+
+class MutableVisualSource final {
+   public:
+    MutableVisualSource(std::shared_ptr<FakeImageBackend> backend, const VisualExtent extent, const std::uint8_t value = 1U)
+        : runtime_(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
+              .device = 0, .backend = std::move(backend), .output_layout = mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic}) {
+        Publish(extent, value);
+    }
+    void Publish(const VisualExtent extent, const std::uint8_t value) {
+        runtime_.Publish(extent.width, extent.height, [value](const auto clean, const auto semantic, const auto) {
+            Fill(clean, value);
+            Fill(semantic, static_cast<std::uint8_t>(value + 20U));
+        });
+        const auto borrowed = runtime_.Borrow();
+        REQUIRE(borrowed.valid());
+        std::scoped_lock lock(mutex_);
+        frame_ = visual_frame(identity_, extent, borrowed.plane(0U).revision());
+        frame_.clean_revision = frame_.revision;
+    }
+    void SetSemantics(const std::uint8_t value) {
+        const auto current = frame();
+        runtime_.Publish(current.extent.width, current.extent.height,
+                         [value](const auto, const auto semantic, const auto) { Fill(semantic, value); });
+        std::scoped_lock lock(mutex_);
+        frame_.revision = runtime_.output().revision();
+    }
+    [[nodiscard]] VisualFrame frame() const {
+        std::scoped_lock lock(mutex_);
+        return frame_;
+    }
+    [[nodiscard]] VisualDocumentRead BorrowExact(const VisualFrame& frame) const {
+        if (frame.source != identity_) return {};
+        return test_document(borrow_matching_visual_product(frame, runtime_.Borrow()));
+    }
+    [[nodiscard]] VisualSourceReader reader() {
+        return {
+            .source = identity_,
+            .latest = [this] { return frame(); },
+            .borrow = [this] { return runtime_.Borrow(); },
+        };
+    }
+
+   private:
+    mutable std::mutex mutex_;
+    mmltk::frameworks::gpu::SystemImageRuntime runtime_;
+    PresentationSourceIdentity identity_{PresentationSourceKind::Explore, 1U};
+    VisualFrame frame_{};
+};
+
+struct UpscaleSourceFixture final {
+    MutableVisualSource source;
+    EventGate events;
+    UpscaleSystem upscale;
+
+    UpscaleSourceFixture(const std::shared_ptr<FakeImageBackend>& backend, VisualExtent extent, std::uint8_t value,
+                         VisualRuntimeFactory runtime)
+        : source(backend, extent, value),
+          upscale{kDevice, std::move(runtime), [this](const VisualFrame& frame) { return source.BorrowExact(frame); },
+                  [this](UpscaleSystem::event_type) { events.Advance(); }} {}
+};
+
+class PresentationSourceFixture final {
+   public:
+    PresentationSourceFixture()
+        : backend_(std::make_shared<FakeImageBackend>()),
+          source_(std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(
+              mmltk::frameworks::gpu::SystemImageRuntimeConfig{.device = 0, .backend = backend_})),
+          sources_{VisualSourceReader{
+              .source = identity_,
+              .latest = [this] { return visual_frame(identity_, {16U, 16U}, latest_revision_.load(std::memory_order_acquire)); },
+              .borrow = [this] { return source_->Borrow(); },
+          }} {
+        source_->Publish(16U, 16U, [](auto, auto, auto) {});
+    }
+
+    [[nodiscard]] std::shared_ptr<FakeImageBackend> backend() const noexcept { return backend_; }
+    [[nodiscard]] std::span<const VisualSourceReader> sources() const noexcept { return sources_; }
+    [[nodiscard]] PresentationSourceIdentity identity() const noexcept { return identity_; }
+    void Advance() {
+        source_->Publish(16U, 16U, [](auto, auto, auto) {});
+        const auto borrowed = source_->Borrow();
+        REQUIRE(borrowed.valid());
+        latest_revision_.store(borrowed.plane(0U).revision(), std::memory_order_release);
+    }
+
+   private:
+    std::shared_ptr<FakeImageBackend> backend_;
+    std::unique_ptr<mmltk::frameworks::gpu::SystemImageRuntime> source_;
+    std::atomic<std::uint64_t> latest_revision_{1U};
+    PresentationSourceIdentity identity_{PresentationSourceKind::Explore, 1U};
+    std::array<VisualSourceReader, 1U> sources_;
+};
+
+class ProductPresentationSources final {
+   public:
+    ProductPresentationSources() : backend_(std::make_shared<FakeImageBackend>()) {
+        constexpr std::array kKinds{
+            PresentationSourceKind::Explore, PresentationSourceKind::Annotation, PresentationSourceKind::Upscale,
+            PresentationSourceKind::Live,    PresentationSourceKind::Predict,
+        };
+        runtimes_.reserve(kKinds.size());
+        sources_.reserve(kKinds.size());
+        for (std::size_t index = 0U; index != kKinds.size(); ++index) {
+            auto runtime = std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(
+                mmltk::frameworks::gpu::SystemImageRuntimeConfig{.device = 0, .backend = backend_});
+            const auto extent = VisualExtent{static_cast<std::uint32_t>(16U + index), 16U};
+            runtime->Publish(extent.width, extent.height, [](auto, auto, auto) {});
+            auto* const private_runtime = runtime.get();
+            const PresentationSourceIdentity identity{kKinds[index], 1U};
+            runtimes_.push_back(std::move(runtime));
+            sources_.push_back({
+                .source = identity,
+                .latest = [identity, extent] { return visual_frame(identity, extent, 1U); },
+                .borrow = [private_runtime] { return private_runtime->Borrow(); },
+            });
+        }
+    }
+
+    [[nodiscard]] std::shared_ptr<FakeImageBackend> backend() const noexcept { return backend_; }
+    [[nodiscard]] std::span<const VisualSourceReader> sources() const noexcept { return sources_; }
+
+   private:
+    std::shared_ptr<FakeImageBackend> backend_;
+    std::vector<std::unique_ptr<mmltk::frameworks::gpu::SystemImageRuntime>> runtimes_;
+    std::vector<VisualSourceReader> sources_;
+};
+
+class PresentationFailureProbe final {
+   public:
+    void Observe(PresentationSystem::event_type event) {
+        if (std::holds_alternative<PresentationFailed>(event)) failures_.fetch_add(1U, std::memory_order_acq_rel);
+        events_.Advance();
+    }
+    [[nodiscard]] EventGate& events() noexcept { return events_; }
+    [[nodiscard]] std::size_t failures() const noexcept { return failures_.load(std::memory_order_acquire); }
+
+   private:
+    EventGate events_;
+    std::atomic<std::size_t> failures_{0U};
+};
+
+[[nodiscard]] PresentationSystem make_failure_presentation(const PresentationSourceFixture& source,
+                                                           const std::shared_ptr<TestPresentationWriterState>& writer_state,
+                                                           PresentationFailureProbe& failures) {
+    return PresentationSystem{
+        kDevice, [backend = source.backend(), writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); },
+        source.sources(), [&failures](PresentationSystem::event_type event) { failures.Observe(std::move(event)); }};
+}
+
+TEST_CASE("Presentation monotonic identities fail before wrap") {
+    namespace identity = mmltk::controller::presentation::detail;
+    CHECK(identity::advance_monotonic_identity(0U) == 1U);
+    CHECK_THROWS_AS(identity::advance_monotonic_identity(std::numeric_limits<std::uint64_t>::max()), std::overflow_error);
+    std::uint64_t timeline = std::numeric_limits<std::uint64_t>::max() - 1U;
+    CHECK_THROWS_AS(identity::take_monotonic_identity(timeline, 2U), std::overflow_error);
+    CHECK(timeline == std::numeric_limits<std::uint64_t>::max() - 1U);
+}
+
+TEST_CASE("Workspace transfer sequences map to their odd timeline values") {
+    namespace workspace = mmltk::controller::presentation::detail;
+    CHECK(workspace::workspace_timeline_ready(1U) == 1U);
+    CHECK(workspace::workspace_timeline_ready(2U) == 3U);
+    CHECK(workspace::workspace_timeline_ready(3U) == 5U);
+    CHECK_THROWS_AS(workspace::workspace_timeline_ready(0U), std::overflow_error);
+    CHECK_THROWS_AS(workspace::workspace_timeline_ready(std::numeric_limits<std::uint64_t>::max()), std::overflow_error);
+}
+
+TEST_CASE("Explore parallelism follows the current Linux affinity limit") {
+    const auto automatic = normalize_explore_parallelism(0U);
+    CHECK(automatic >= 1U);
+    CHECK(automatic <= kExploreMaximumParallelism);
+    CHECK(normalize_explore_parallelism(kExploreMaximumParallelism + 100U) == automatic);
+    CHECK(normalize_explore_parallelism(1U) == 1U);
+}
+
+TEST_CASE("Explore publishes placeholders before loaders and patches released lanes incrementally") {
+    LoadedSettings settings;
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto probe = std::make_shared<StreamingExploreProbe>();
+    EventGate events;
+    ExploreSystem explore{settings.system(), kDevice, 2U, streaming_explore_runtime_factory(backend, probe),
+                          [&events](ExploreSystem::event_type) { events.Advance(); }};
+    open_streaming_gallery(explore, events, {.extent = {8U, 4U}, .row_count = 1U, .columns = 2U});
+    const auto placeholder = explore.snapshot();
+    CHECK_FALSE(placeholder.busy);
+    CHECK(placeholder.order.visible_indices == std::vector<std::uint32_t>{0U, 1U});
+    CHECK(placeholder.gallery.generation != 0U);
+    CHECK(placeholder.gallery.slots == std::vector<bool>{false, false});
+    check_gallery_first_pixels(explore, 0x11U, 0x11U);
+    {
+        std::scoped_lock lock(probe->mutex);
+        CHECK(probe->assignments.empty());
+        CHECK(probe->maximum_active == 0U);
+        CHECK(probe->publications == 0U);
+        CHECK(probe->lane_preparations == 0U);
+        CHECK(probe->queued_closures == 0U);
+    }
+    probe->AllowAllocation();
+    REQUIRE(probe->Wait([&] { return probe->assignments.size() == 2U; }));
+    {
+        std::scoped_lock lock(probe->mutex);
+        CHECK(probe->assignments.size() == 2U);
+        CHECK(probe->maximum_active == 2U);
+        CHECK(probe->publications == 0U);
+        CHECK(probe->lane_preparations == 2U);
+        CHECK(probe->queued_closures == 2U);
+    }
+
+    probe->Release(0U);
+    REQUIRE(events.Wait([&] { return explore.snapshot().frame.revision > placeholder.frame.revision; }));
+    const auto first_patch = explore.snapshot();
+    CHECK(first_patch.gallery.slots == std::vector<bool>{true, false});
+    check_gallery_first_pixels(explore, 0x40U, 0x11U);
+    probe->Release(1U);
+    REQUIRE(events.Wait([&] { return explore.snapshot().frame.revision > first_patch.frame.revision; }));
+    check_gallery_first_pixels(explore, 0x40U, 0x41U);
+    const auto before_focus = explore.snapshot();
+    CHECK(before_focus.gallery.slots == std::vector<bool>{true, true});
+    explore.UpdateViewport({.viewport = {.extent = {8U, 4U}, .row_count = 1U, .columns = 2U}, .focused_compiled_index = 1U});
+    REQUIRE(events.Wait([&] { return explore.snapshot().focused_image == 1U; }));
+    CHECK(explore.snapshot().gallery.generation == before_focus.gallery.generation);
+    CHECK(explore.snapshot().gallery.slots == before_focus.gallery.slots);
+    std::scoped_lock lock(probe->mutex);
+    CHECK(probe->lane_preparations == 2U);
+}
+
+TEST_CASE("Explore batches ready lanes and stale viewport completions cannot publish") {
+    LoadedSettings settings;
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto probe = std::make_shared<StreamingExploreProbe>();
+    EventGate events;
+    std::atomic_uint64_t changed_events = 0U;
+    DiagnosticCapture diagnostics;
+    ExploreSystem explore{settings.system(),
+                          kDevice,
+                          2U,
+                          streaming_explore_runtime_factory(backend, probe),
+                          [&events, &changed_events](ExploreSystem::event_type event) {
+                              if (std::holds_alternative<ExploreChanged>(event)) changed_events.fetch_add(1U, std::memory_order_release);
+                              events.Advance();
+                          },
+                          diagnostics.sink()};
+    open_streaming_gallery(explore, events, {.extent = {8U, 4U}, .row_count = 1U, .columns = 2U});
+    probe->AllowAllocation();
+    REQUIRE(probe->Wait([&] { return probe->assignments.size() == 2U; }));
+    const auto placeholder_revision = explore.snapshot().frame.revision;
+    probe->ReleaseAll();
+    REQUIRE(events.Wait([&] { return explore.snapshot().frame.revision > placeholder_revision; }));
+    {
+        std::scoped_lock lock(probe->mutex);
+        CHECK(probe->publications == 1U);
+        CHECK(probe->cumulative == 2U);
+        CHECK(probe->maximum_active == 2U);
+    }
+
+    const auto before_old_viewport = explore.snapshot().frame.revision;
+    static_cast<void>(explore.UpdateAugmentation({.enabled = true}));
+    REQUIRE(events.Wait([&] { return explore.snapshot().frame.revision > before_old_viewport; }));
+    REQUIRE(probe->Wait([&] {
+        return probe->assignments.size() == 2U && std::ranges::all_of(probe->assignments, [](const auto& assignment) {
+                   return assignment.compiled_index == 0U || assignment.compiled_index == 1U;
+               });
+    }));
+    probe->StartRead(0U);
+    explore.UpdateViewport({.viewport = {.extent = {8U, 4U}, .first_row = 2U, .row_count = 1U, .columns = 2U}});
+    REQUIRE(events.Wait([&] { return explore.snapshot().order.visible_indices == std::vector<std::uint32_t>{4U, 5U}; }));
+    const auto newest_placeholder = explore.snapshot().frame.revision;
+    const auto events_at_placeholder = changed_events.load(std::memory_order_acquire);
+    probe->Release(0U);
+    probe->Release(1U);
+    REQUIRE(probe->Wait([&] {
+        return probe->stale == 2U && std::ranges::all_of(probe->assignments, [](const auto& assignment) {
+                   return assignment.compiled_index == 4U || assignment.compiled_index == 5U;
+               });
+    }));
+    CHECK(explore.snapshot().frame.revision == newest_placeholder);
+    CHECK(changed_events.load(std::memory_order_acquire) == events_at_placeholder);
+    CHECK(explore.snapshot().order.visible_indices == std::vector<std::uint32_t>{4U, 5U});
+    CHECK(diagnostics.stale_discarded.load(std::memory_order_acquire) == 2U);
+    {
+        std::scoped_lock lock(probe->mutex);
+        CHECK(probe->mapped_reads == 1U);
+    }
+    probe->ReleaseAll();
+    REQUIRE(events.Wait([&] { return explore.snapshot().frame.revision > newest_placeholder; }));
+    CHECK(explore.snapshot().order.visible_indices == std::vector<std::uint32_t>{4U, 5U});
+}
+
+TEST_CASE("Explore filter rollback quiesces candidate lanes before restoring committed streaming work") {
+    StreamingExploreFixture scenario{2U};
+    auto& explore = scenario.system();
+    scenario.OpenAndWait({.extent = {8U, 4U}, .row_count = 1U, .columns = 2U});
+    scenario.probe().AllowAllocation();
+    REQUIRE(scenario.probe().Wait([&] { return scenario.probe().assignments.size() == 2U; }));
+    const auto committed = explore.snapshot();
+    scenario.settings().BreakPersistence();
+    const auto admitted = explore.UpdateFilter({.filter = {.minimum_instances = 1U}});
+    REQUIRE(scenario.Wait(
+        [&] { return scenario.failure_count() == 1U && !explore.snapshot().busy && explore.snapshot().revision > admitted.revision; }));
+    const auto restored = explore.snapshot();
+    CHECK(restored.ready);
+    CHECK(restored.order.visible_indices == committed.order.visible_indices);
+    CHECK(restored.filter == committed.filter);
+    CHECK_FALSE(restored.failure.empty());
+    REQUIRE(scenario.probe().Wait([&] { return scenario.probe().assignments.size() == 2U; }));
+    {
+        std::scoped_lock lock(scenario.probe().mutex);
+        CHECK(scenario.probe().quiescences >= 1U);
+        CHECK(assignments_match(scenario.probe(), committed.order.visible_indices));
+    }
+    const auto restored_frame = restored.frame.revision;
+    scenario.ReleaseAndWaitForFrameAfter(restored_frame);
+    CHECK(explore.snapshot().order.visible_indices == committed.order.visible_indices);
+}
+
+TEST_CASE("Explore render mutations abort queued lanes before failed cancelled and stale restoration") {
+    enum class Mutation : std::uint8_t {
+        Augmentation,
+        Reroll,
+    };
+    enum class Rejection : std::uint8_t { Failed, Cancelled, Stale };
+    const auto run = [](const Mutation mutation, const Rejection rejection) {
+        StreamingExploreFixture scenario{2U};
+        auto& explore = scenario.system();
+        scenario.OpenAndWait({.extent = {8U, 4U}, .row_count = 1U, .columns = 2U});
+        if (mutation == Mutation::Reroll) {
+            const auto enabled = explore.UpdateAugmentation({.enabled = true});
+            REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > enabled.revision; }));
+        }
+        scenario.probe().AllowAllocation();
+        REQUIRE(scenario.probe().Wait([&] { return scenario.probe().assignments.size() == 2U; }));
+        scenario.probe().AllowPreRead();
+        REQUIRE(scenario.probe().Wait([&] { return scenario.probe().mapped_reads != 0U; }));
+        const auto committed = explore.snapshot();
+        std::size_t publications_before;
+        {
+            std::scoped_lock lock(scenario.probe().mutex);
+            publications_before = scenario.probe().publications;
+        }
+        std::shared_ptr<ExplorePostRenderGate> gate;
+        std::future<void> entered;
+        if (rejection == Rejection::Failed) {
+            std::scoped_lock lock(scenario.probe().mutex);
+            scenario.probe().fail_next_render = true;
+        } else {
+            gate = std::make_shared<ExplorePostRenderGate>(0U);
+            entered = gate->entered.get_future();
+            std::scoped_lock lock(scenario.probe().mutex);
+            scenario.probe().render_gate = gate;
+        }
+        const auto admitted = [&] {
+            switch (mutation) {
+                case Mutation::Augmentation:
+                    return explore.UpdateAugmentation({.enabled = true});
+                case Mutation::Reroll:
+                    return explore.RerollAugmentation();
+            }
+            std::terminate();
+        }();
+        if (gate) {
+            REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+            if (rejection == Rejection::Cancelled) {
+                static_cast<void>(explore.Stop());
+            } else {
+                enable_dark_mode(scenario.settings());
+            }
+            gate->release.set_value();
+        }
+        REQUIRE(scenario.Wait([&] {
+            const auto snapshot = explore.snapshot();
+            return !snapshot.busy && snapshot.revision > admitted.revision && snapshot.frame.revision > committed.frame.revision;
+        }));
+        // CLEANUP-IGNORE: Render-mutation restoration checks preview/detail facts; open failure checks catalog facts.
+        const auto restored = explore.snapshot();
+        CHECK(restored.ready);
+        CHECK(restored.augmentation.enabled == committed.augmentation.enabled);
+        CHECK(restored.augmentation.seed == committed.augmentation.seed);
+        CHECK(restored.detail.show_original_dimensions == committed.detail.show_original_dimensions);
+        CHECK(restored.order.visible_indices == committed.order.visible_indices);
+        CHECK((rejection == Rejection::Cancelled) == restored.failure.empty());
+        CHECK(scenario.failure_count() == (rejection == Rejection::Cancelled ? 0U : 1U));
+        REQUIRE(scenario.probe().Wait([&] { return scenario.probe().assignments.size() == 2U; }));
+        {
+            std::scoped_lock lock(scenario.probe().mutex);
+            CHECK(scenario.probe().aborted_assignments >= 2U);
+            CHECK(scenario.probe().publications == publications_before);
+            CHECK(assignments_match(scenario.probe(), committed.order.visible_indices));
+            scenario.probe().render_gate.reset();
+        }
+        const auto restored_frame = restored.frame.revision;
+        scenario.ReleaseAndWaitForFrameAfter(restored_frame);
+        CHECK(explore.snapshot().order.visible_indices == committed.order.visible_indices);
+        explore.Shutdown();
+    };
+
+    for (const auto mutation : {Mutation::Augmentation, Mutation::Reroll})
+        for (const auto rejection : {Rejection::Failed, Rejection::Cancelled, Rejection::Stale}) {
+            CAPTURE(static_cast<int>(mutation), static_cast<int>(rejection));
+            run(mutation, rejection);
+        }
+}
+
+TEST_CASE("Explore callback admission failure quiesces its runtime and permits a clean reopen") {
+    StreamingExploreFixture scenario{1U};
+    auto& explore = scenario.system();
+    scenario.OpenAndWait({.extent = {4U, 4U}, .row_count = 1U, .columns = 1U});
+    scenario.probe().AllowAllocation();
+    REQUIRE(scenario.probe().Wait([&] { return scenario.probe().assignments.size() == 1U; }));
+    {
+        std::scoped_lock lock(scenario.probe().mutex);
+        scenario.probe().fail_callback_admission = true;
+    }
+    scenario.backend().FailPersistently(FakeImageBackend::FailurePoint::SynchronizeStream);
+    scenario.probe().Release(0U);
+    REQUIRE(scenario.Wait([&] { return scenario.failure_count() == 1U; }));
+    CHECK_FALSE(explore.snapshot().ready);
+    CHECK_FALSE(explore.snapshot().failure.empty());
+    CHECK(scenario.backend().synchronized >= 1U);
+    CHECK(scenario.backend().streams_destroyed == 1U);
+    {
+        std::scoped_lock lock(scenario.probe().mutex);
+        CHECK(scenario.probe().quiescences >= 1U);
+        CHECK(scenario.probe().assignments.empty());
+    }
+
+    {
+        std::scoped_lock lock(scenario.probe().mutex);
+        scenario.probe().fail_callback_admission = false;
+    }
+    static_cast<void>(explore.Open({.viewport = {.extent = {4U, 4U}, .row_count = 1U, .columns = 1U}, .compiled_source = "/stream"}));
+    REQUIRE(scenario.Wait([&] { return explore.snapshot().ready && explore.snapshot().failure.empty(); }));
+}
+
+TEST_CASE("Explore lane read and callback gates preserve the accepted atlas through shutdown") {
+    LoadedSettings settings;
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto probe = std::make_shared<StreamingExploreProbe>();
+    EventGate events;
+    ExploreSystem explore{settings.system(), kDevice, 1U, streaming_explore_runtime_factory(backend, probe),
+                          [&events](ExploreSystem::event_type) { events.Advance(); }};
+    open_streaming_gallery(explore, events, {.extent = {4U, 4U}, .row_count = 1U, .columns = 1U});
+    const auto placeholder_revision = explore.snapshot().frame.revision;
+    probe->AllowAllocation();
+    REQUIRE(probe->Wait([&] { return probe->lane_preparations == 1U; }));
+    probe->AllowPreRead();
+    REQUIRE(probe->Wait([&] { return probe->mapped_reads == 1U; }));
+    CHECK(explore.snapshot().frame.revision == placeholder_revision);
+    {
+        std::scoped_lock lock(probe->mutex);
+        probe->callback_completion_allowed = false;
+    }
+    probe->AllowPostRead();
+    REQUIRE(probe->Wait([&] { return probe->publications == 1U; }));
+    CHECK(explore.snapshot().frame.revision == placeholder_revision);
+    CHECK(explore.snapshot().gallery.slots == std::vector<bool>{false});
+    {
+        std::scoped_lock lock(probe->mutex);
+        REQUIRE(probe->assignments.size() == 1U);
+        CHECK(probe->assignments.front().gpu_pending);
+    }
+    probe->CompleteCallbacks();
+    REQUIRE(events.Wait([&] { return explore.snapshot().gallery.slots == std::vector<bool>{true}; }));
+    CHECK(explore.snapshot().frame.revision > placeholder_revision);
+    REQUIRE(probe->Wait([&] { return probe->assignments.empty(); }));
+
+    explore.Shutdown();
+    CHECK(explore.stopped());
+    CHECK(backend->synchronized >= 1U);
+    std::scoped_lock lock(probe->mutex);
+    CHECK(probe->quiescences >= 1U);
+    CHECK(probe->assignments.empty());
+}
+
+TEST_CASE("Explore Open rejects never-loaded settings before runtime construction") {
+    SettingsSystem settings;
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto constructions = std::make_shared<std::atomic_uint64_t>(0U);
+    auto events = std::make_shared<std::atomic_uint64_t>(0U);
+    auto factory = RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+                                  [] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U)); });
+    ExploreSystem explore{settings, kDevice, 2U,
+                          [factory = std::move(factory), constructions]() mutable {
+                              constructions->fetch_add(1U, std::memory_order_release);
+                              return factory();
+                          },
+                          [events](ExploreSystem::event_type) { events->fetch_add(1U, std::memory_order_release); }};
+    const auto before = explore.snapshot();
+
+    CHECK_THROWS_AS(explore.Open({.viewport = {}, .compiled_source = "/test"}), contracts::InvalidIntentError);
+    CHECK_THROWS_AS(explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/test"}), contracts::UnavailableError);
+    CHECK(constructions->load(std::memory_order_acquire) == 0U);
+    CHECK(events->load(std::memory_order_acquire) == 0U);
+    CHECK(explore.snapshot().revision == before.revision);
+    CHECK(explore.snapshot().busy == before.busy);
+}
+
+TEST_CASE("Explore settings guards reject reopen and live filter before candidate work") {
+    LoadedSettings settings;
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto work = std::make_shared<ExploreWorkProbe>();
+    EventGate events;
+    ExploreSystem explore{settings.system(), kDevice, 2U,
+                          RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+                                         [work] {
+                                             return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U),
+                                                                                           nullptr, nullptr, nullptr, work);
+                                         }),
+                          [&events](ExploreSystem::event_type) { events.Advance(); }};
+    static_cast<void>(explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/test"}));
+    REQUIRE(events.Wait([&] { return explore.snapshot().ready; }));
+    const auto before = explore.snapshot();
+    const auto opens = work->opens.load(std::memory_order_acquire);
+    const auto prepares = work->prepares.load(std::memory_order_acquire);
+    const auto renders = work->renders.load(std::memory_order_acquire);
+    settings.MakeUnavailable();
+
+    CHECK_THROWS_AS(explore.UpdateFilter({
+                        .filter = {.minimum_instances = 2U, .maximum_instances = 1U},
+                    }),
+                    contracts::InvalidIntentError);
+    CHECK_THROWS_AS(explore.UpdateFilter({.filter = before.filter, .overlay = before.overlay}), contracts::UnavailableError);
+    CHECK_THROWS_AS(explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/reopen"}), contracts::UnavailableError);
+    CHECK(work->opens.load(std::memory_order_acquire) == opens);
+    CHECK(work->prepares.load(std::memory_order_acquire) == prepares);
+    CHECK(work->renders.load(std::memory_order_acquire) == renders);
+    CHECK(explore.snapshot().revision == before.revision);
+    CHECK(explore.snapshot().ready);
+    CHECK_FALSE(explore.snapshot().busy);
+    CHECK(explore.snapshot().filter == before.filter);
+    CHECK(explore.snapshot().frame.source == before.frame.source);
+    CHECK(explore.snapshot().frame.extent == before.frame.extent);
+    CHECK(explore.snapshot().frame.revision == before.frame.revision);
+}
+
+TEST_CASE("Explore viewport and Annotation pointer work preserve their intended ordering") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto observed_nproc = std::make_shared<std::atomic<std::size_t>>(0U);
+    DiagnosticCapture diagnostics;
+    EventGate explore_events;
+    LoadedSettings settings;
+    ExploreSystem explore{settings.system(),
+                          kDevice,
+                          4U,
+                          RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+                                         [observed_nproc] { return std::make_unique<TestExploreAlgorithm>(observed_nproc); }),
+                          [&explore_events](ExploreSystem::event_type) { explore_events.Advance(); },
+                          diagnostics.sink()};
+    CHECK_FALSE(explore.BorrowFrame().valid());
+    CHECK_THROWS_AS(explore.UpdateViewport({.viewport = {.extent = {48U, 48U}}}), contracts::UnavailableError);
+    const auto explore_admitted = explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/test"});
+    CHECK(explore_admitted.busy);
+    CHECK(explore_admitted.revision != 0U);
+    REQUIRE(explore_events.Wait([&] { return explore.snapshot().ready; }));
+    CHECK_FALSE(explore.snapshot().busy);
+    CHECK(explore.snapshot().revision > explore_admitted.revision);
+    explore.UpdateViewport({.viewport = {.extent = {48U, 48U}}});
+    explore.UpdateViewport({.viewport = {.extent = {32U, 32U}}});
+    REQUIRE(explore_events.Wait([&] {
+        const auto state = explore.snapshot();
+        return state.viewport.extent.width == 32U && state.frame.extent.width == 32U;
+    }));
+    CHECK(explore.snapshot().nproc == 4U);
+    REQUIRE(explore.BorrowFrame().valid());
+    CHECK(explore.BorrowFrame().plane(0U).revision() == explore.snapshot().frame.revision);
+    CHECK(observed_nproc->load(std::memory_order_acquire) == 4U);
+    CHECK(diagnostics.count.load(std::memory_order_acquire) != 0U);
+    CHECK(diagnostics.last_system.load(std::memory_order_acquire) == VisualSystemKind::Explore);
+
+    EventGate annotation_events;
+    auto document_revision = std::make_shared<std::atomic<std::uint64_t>>(0U);
+    auto annotation_order = std::make_shared<std::vector<std::uint64_t>>();
+    auto save_applied = std::make_shared<std::atomic_bool>(false);
+    auto save_failures = std::make_shared<std::atomic_uint64_t>(0U);
+    AnnotationSystem annotation{kDevice,
+                                RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+                                               [document_revision, annotation_order, save_applied] {
+                                                   return std::make_unique<TestAnnotationAlgorithm>(document_revision, annotation_order,
+                                                                                                    save_applied);
+                                               }),
+                                borrow_exactly_from(explore), [&annotation_events, save_failures](AnnotationSystem::event_type event) {
+                                    if (std::holds_alternative<AnnotationFailed>(event))
+                                        save_failures->fetch_add(1U, std::memory_order_acq_rel);
+                                    annotation_events.Advance();
+                                }};
+    CHECK_FALSE(annotation.BorrowFrame().valid());
+    // CLEANUP-IGNORE: Annotation admission proves the receiver-owned handoff after Explore admission is already
+    // established.
+    const auto annotation_admitted = annotation.Open({.source = explore.snapshot().frame});
+    CHECK(annotation_admitted.busy);
+    CHECK(annotation_admitted.revision != 0U);
+    REQUIRE(annotation_events.Wait([&] { return annotation.snapshot().ready; }));
+    CHECK_FALSE(annotation.snapshot().busy);
+    CHECK(annotation.snapshot().revision > annotation_admitted.revision);
+    CHECK_THROWS_AS(annotation.Pointer({
+                        .phase = contracts::AnnotationPointerPhase::Begin,
+                        .interaction_id = 7U,
+                        .sequence = 1U,
+                        .target = {.object = 0U, .element = 0U, .role = std::nullopt},
+                        .point = {2.0F, 3.0F},
+                    }),
+                    contracts::InvalidIntentError);
+    annotation.Pointer({
+        .phase = contracts::AnnotationPointerPhase::Begin,
+        .interaction_id = 1U,
+        .sequence = 1U,
+        .target = {.object = 0U},
+        .point = {2.0F, 3.0F},
+    });
+    annotation.Pointer({
+        .phase = contracts::AnnotationPointerPhase::Update,
+        .interaction_id = 1U,
+        .sequence = 2U,
+        .target = {.object = 0U},
+        .point = {7.0F, 8.0F},
+    });
+    annotation.Pointer({
+        .phase = contracts::AnnotationPointerPhase::End,
+        .interaction_id = 1U,
+        .sequence = 3U,
+        .target = {.object = 0U},
+        .point = {9.0F, 10.0F},
+    });
+    static_cast<void>(annotation.Edit({
+        .edit = {.value = AnnotationUndoEdit{}},
+    }));
+    REQUIRE(annotation_events.Wait([&] { return !annotation.snapshot().busy && annotation_order->size() == 4U; }));
+    CHECK(*annotation_order == std::vector<std::uint64_t>{1U, 2U, 3U, 100U});
+    static_cast<void>(annotation.Save({.destination = "/test/refused.json"}));
+    REQUIRE(annotation_events.Wait([&] { return save_failures->load(std::memory_order_acquire) == 1U && !annotation.snapshot().busy; }));
+    save_applied->store(true, std::memory_order_release);
+    const auto save_admitted = annotation.Save({.destination = "/test/saved.json"});
+    REQUIRE(annotation_events.Wait([&] { return !annotation.snapshot().busy && annotation.snapshot().revision > save_admitted.revision; }));
+    explore.Shutdown();
+    CHECK(annotation.BorrowFrame().valid());
+}
+
+TEST_CASE("Explore installs and atomically persists typed live filter preferences") {
+    auto settings_events = std::make_shared<std::atomic_uint64_t>(0U);
+    LoadedSettings settings{[settings_events](SettingsSystem::event_type) { settings_events->fetch_add(1U, std::memory_order_acq_rel); }};
+    persist_explore_catalog(settings.system(), test_explore_catalog_identity());
+    const auto initial_events = settings_events->load(std::memory_order_acquire);
+    (void)settings.system().persist_explore_filter(
+        settings.system().explore_settings_candidate(),
+        {
+            .filter =
+                {
+                    .class_selection = {.mode = ExploreClassSelectionMode::Subset, .classes = {1U}},
+                    .minimum_instances = 1U,
+                    .maximum_instances = 9U,
+                    .minimum_compiled_index = 0U,
+                    .maximum_compiled_index = 2U,
+                    .order = ExploreOrder::Shuffled,
+                    .shuffle_seed = 41U,
+                    .require_boxes = true,
+                },
+            .overlay = {.class_selection = {.mode = ExploreClassSelectionMode::Subset, .classes = {1U}},
+                        .show_boxes = false,
+                        .show_masks = true},
+        });
+    CHECK(settings_events->load(std::memory_order_acquire) == initial_events + 1U);
+
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto commits = std::make_shared<std::atomic_uint64_t>(0U);
+    auto scenario = tracked_explore_scenario(settings, backend, commits);
+    auto& explore = scenario.system();
+    scenario.OpenAndWait({.extent = {64U, 64U}});
+    CHECK(explore.snapshot().filter.class_selection.classes == std::vector<std::uint32_t>{1U});
+    CHECK(explore.snapshot().filter.minimum_instances == 1U);
+    CHECK(explore.snapshot().filter.order == ExploreOrder::Shuffled);
+    CHECK(explore.snapshot().order.shuffle_seed == 41U);
+    CHECK(explore.snapshot().overlay.class_selection.classes == std::vector<std::uint32_t>{1U});
+    CHECK_FALSE(explore.snapshot().overlay.show_boxes);
+
+    const ExploreFilterUpdate updated{
+        .filter =
+            {
+                .class_selection = {.mode = ExploreClassSelectionMode::Subset, .classes = {0U}},
+                .minimum_instances = 2U,
+                .maximum_instances = 8U,
+                .minimum_compiled_index = 1U,
+                .maximum_compiled_index = 2U,
+                .order = ExploreOrder::Sequential,
+                .require_masks = true,
+            },
+        .overlay = {.class_selection = {.mode = ExploreClassSelectionMode::Subset, .classes = {0U}},
+                    .show_boxes = true,
+                    .show_masks = false},
+    };
+    const auto before_update_events = settings_events->load(std::memory_order_acquire);
+    const auto admitted = explore.UpdateFilter(updated);
+    REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > admitted.revision; }));
+    CHECK(explore.snapshot().filter == updated.filter);
+    CHECK(explore.snapshot().overlay.show_boxes == updated.overlay.show_boxes);
+    CHECK(explore.snapshot().overlay.show_masks == updated.overlay.show_masks);
+    CHECK(settings.system().explore_settings_candidate().preferences.policy.filter == updated.filter);
+    CHECK(settings.system().explore_settings_candidate().preferences.policy.overlay == updated.overlay);
+    CHECK(explore.snapshot().order.shuffle_seed == 0U);
+    CHECK_THROWS_AS(explore.Reroll(), contracts::UnavailableError);
+    CHECK(settings_events->load(std::memory_order_acquire) == before_update_events + 1U);
+    CHECK(commits->load(std::memory_order_acquire) == 2U);
+}
+
+TEST_CASE("Explore preserves classes for one catalog and resets both selections after a different successful catalog") {
+    LoadedSettings settings;
+    auto backend = std::make_shared<FakeImageBackend>();
+    ExploreScenario scenario{settings, backend};
+    auto& explore = scenario.system();
+    scenario.OpenAndWait({.extent = {64U, 64U}});
+    const auto first_identity = explore.snapshot().dataset.class_catalog_identity;
+    REQUIRE(first_identity != 0U);
+
+    const ExploreFilterUpdate selected{
+        .filter =
+            {
+                .class_selection = {.mode = ExploreClassSelectionMode::Subset, .classes = {1U}},
+                .minimum_instances = 2U,
+            },
+        .overlay = {.class_selection = {.mode = ExploreClassSelectionMode::None}},
+    };
+    auto admitted = explore.UpdateFilter(selected);
+    REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > admitted.revision; }));
+
+    admitted = explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/same-catalog"});
+    REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > admitted.revision; }));
+    CHECK(explore.snapshot().dataset.class_catalog_identity == first_identity);
+    CHECK(explore.snapshot().filter.class_selection == selected.filter.class_selection);
+    CHECK(explore.snapshot().overlay.class_selection == selected.overlay.class_selection);
+
+    admitted = explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/different-catalog"});
+    REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > admitted.revision; }));
+    const auto changed = explore.snapshot();
+    CHECK(changed.dataset.class_catalog_identity != first_identity);
+    CHECK(changed.filter.minimum_instances == selected.filter.minimum_instances);
+    CHECK(changed.filter.class_selection.mode == ExploreClassSelectionMode::All);
+    CHECK(changed.overlay.class_selection.mode == ExploreClassSelectionMode::All);
+    const auto persisted = settings.system().explore_settings_candidate().preferences;
+    CHECK(persisted.class_catalog_identity == changed.dataset.class_catalog_identity);
+    CHECK(persisted.policy.filter.class_selection.mode == ExploreClassSelectionMode::All);
+    CHECK(persisted.policy.overlay.class_selection.mode == ExploreClassSelectionMode::All);
+}
+
+TEST_CASE("Explore augmentation and detail mutations persist and keep reroll identities distinct") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    LoadedSettings settings;
+    ExploreScenario scenario{settings, backend};
+    auto& explore = scenario.system();
+    scenario.OpenAndWait({.extent = {96U, 48U}, .row_count = 1U, .columns = 2U});
+    REQUIRE_FALSE(explore.snapshot().augmentation.enabled);
+    REQUIRE(explore.snapshot().augmentation.seed == 0U);
+
+    auto admitted = explore.UpdateAugmentation({.enabled = true});
+    REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > admitted.revision; }));
+    const auto order_seed = explore.snapshot().order.shuffle_seed;
+    admitted = explore.RerollAugmentation();
+    REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > admitted.revision; }));
+    CHECK(explore.snapshot().augmentation.seed == 1U);
+    CHECK(explore.snapshot().order.shuffle_seed == order_seed);
+
+    admitted = explore.UpdateDetail({.show_original_dimensions = true});
+    CHECK(explore.snapshot().revision == admitted.revision);
+    CHECK(explore.snapshot().detail.show_original_dimensions);
+    const auto persisted = settings.system().explore_settings_candidate();
+    CHECK(persisted.augmentation_preview_enabled);
+    CHECK(persisted.show_original_dimensions);
+
+    admitted = explore.UpdateAugmentation({.enabled = false});
+    REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > admitted.revision; }));
+    CHECK(explore.snapshot().augmentation.seed == 1U);
+    CHECK_THROWS_AS(explore.RerollAugmentation(), contracts::UnavailableError);
+}
+
+// CLEANUP-IGNORE: Detail-extent and focus-slot scenarios inject different algorithm evidence at distinct boundaries.
+TEST_CASE("Explore original-content sampling preserves the full native detail product") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto extents = std::make_shared<ExploreDetailExtentProbe>();
+    LoadedSettings settings;
+    ExploreScenario scenario{settings, backend, [extents] {
+                                 return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr,
+                                                                               nullptr, nullptr, nullptr, nullptr, extents);
+                             }};
+    auto& explore = scenario.system();
+    scenario.OpenAndWait({.extent = {96U, 48U}, .row_count = 1U, .columns = 2U});
+    auto admitted = explore.Select({.compiled_index = 1U});
+    REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > admitted.revision; }));
+    CHECK(explore.snapshot().frame.extent == extents->padded);
+
+    const auto full_frame = explore.snapshot().frame;
+    CHECK((full_frame.content == VisualRegion{8U, 16U, 48U, 32U}));
+    admitted = explore.UpdateDetail({.show_original_dimensions = true});
+    CHECK(admitted.detail.show_original_dimensions);
+    CHECK(explore.snapshot().frame == full_frame);
+}
+
+TEST_CASE("Explore Open commits the effective pending filter with a different catalog") {
+    auto settings_events = std::make_shared<std::atomic_uint64_t>(0U);
+    auto emitted_revision = std::make_shared<std::atomic_uint64_t>(0U);
+    auto emitted_catalog = std::make_shared<std::atomic_uint64_t>(0U);
+    auto emitted_minimum_instances = std::make_shared<std::atomic_uint32_t>(0U);
+    auto emitted_show_boxes = std::make_shared<std::atomic_bool>(true);
+    LoadedSettings settings{[settings_events, emitted_revision, emitted_catalog, emitted_minimum_instances,
+                             emitted_show_boxes](SettingsSystem::event_type event) {
+        const auto& snapshot = std::get<SettingsChanged>(event).snapshot;
+        emitted_revision->store(snapshot.revision, std::memory_order_release);
+        emitted_catalog->store(snapshot.settings_state.workflows.explore.class_catalog_identity, std::memory_order_release);
+        emitted_minimum_instances->store(snapshot.settings_state.workflows.explore.min_instances, std::memory_order_release);
+        emitted_show_boxes->store(snapshot.settings_state.workflows.explore.show_boxes, std::memory_order_release);
+        settings_events->fetch_add(1U, std::memory_order_acq_rel);
+    }};
+    queue_failed_explore_overlay_update(settings);
+    const auto events_before_open = settings_events->load(std::memory_order_acquire);
+    settings.RestorePersistence();
+
+    auto backend = std::make_shared<FakeImageBackend>();
+    ExploreScenario scenario{settings, backend};
+    auto& explore = scenario.system();
+    scenario.OpenAndWait({.extent = {64U, 64U}}, "/different-catalog");
+    const auto opened = explore.snapshot();
+    CHECK_FALSE(opened.overlay.show_boxes);
+    CHECK(opened.filter.minimum_instances == 2U);
+    CHECK(opened.filter.class_selection.mode == ExploreClassSelectionMode::All);
+    CHECK(opened.overlay.class_selection.mode == ExploreClassSelectionMode::All);
+
+    const auto committed = settings.system().explore_settings_candidate().preferences;
+    CHECK(committed.class_catalog_identity == opened.dataset.class_catalog_identity);
+    CHECK(committed.policy.filter == opened.filter);
+    CHECK(committed.policy.overlay == opened.overlay);
+    CHECK(settings_events->load(std::memory_order_acquire) == events_before_open + 1U);
+    const auto committed_snapshot = settings.system().snapshot();
+    CHECK(emitted_revision->load(std::memory_order_acquire) == committed_snapshot.revision);
+    CHECK(emitted_catalog->load(std::memory_order_acquire) == committed.class_catalog_identity);
+    CHECK(emitted_minimum_instances->load(std::memory_order_acquire) == committed.policy.filter.minimum_instances);
+    CHECK_FALSE(emitted_show_boxes->load(std::memory_order_acquire));
+
+    SettingsSystem reloaded;
+    REQUIRE(reloaded.Load(settings.location()).applied());
+    const auto durable = reloaded.explore_settings_candidate().preferences;
+    CHECK(durable.class_catalog_identity == committed.class_catalog_identity);
+    CHECK(durable.policy.filter == committed.policy.filter);
+    CHECK(durable.policy.overlay == committed.policy.overlay);
+    CHECK(reloaded.snapshot().revision == committed_snapshot.revision);
+}
+
+TEST_CASE("failed Explore catalog persistence restores the pending filter for ordinary Retry") {
+    LoadedSettings settings;
+    auto failures = std::make_shared<std::atomic_uint64_t>(0U);
+    auto backend = std::make_shared<FakeImageBackend>();
+    ExploreScenario scenario{settings, backend, {}, count_explore_failures(failures)};
+    auto& explore = scenario.system();
+    scenario.OpenAndWait({.extent = {64U, 64U}});
+    const auto prior = select_explore_subset(settings, scenario, 1U);
+    const auto committed = explore.snapshot();
+    queue_failed_explore_overlay_update(settings);
+
+    const auto admitted = explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/different-catalog"});
+    REQUIRE(scenario.Wait([&] { return failures->load(std::memory_order_acquire) == 1U && !explore.snapshot().busy; }));
+    CHECK(explore.snapshot().ready);
+    CHECK(explore.snapshot().dataset.class_catalog_identity == committed.dataset.class_catalog_identity);
+    CHECK(explore.snapshot().order.visible_indices == committed.order.visible_indices);
+    CHECK(explore.snapshot().filter == committed.filter);
+    CHECK(explore.snapshot().overlay == committed.overlay);
+    CHECK(explore.snapshot().frame.revision > committed.frame.revision);
+    CHECK(explore.snapshot().revision > admitted.revision);
+    CHECK(settings.system().snapshot().settings_state.workflows.explore.class_catalog_identity == prior.class_catalog_identity);
+
+    settings.RestorePersistence();
+    REQUIRE(settings.system().Retry().applied());
+    const auto recovered = settings.system().explore_settings_candidate().preferences;
+    CHECK_FALSE(recovered.policy.overlay.show_boxes);
+    CHECK(recovered.policy.filter.minimum_instances == 2U);
+    check_catalog_selection_preserved(recovered, prior);
+
+    SettingsSystem reloaded;
+    REQUIRE(reloaded.Load(settings.location()).applied());
+    const auto durable = reloaded.explore_settings_candidate().preferences;
+    CHECK(durable.policy.filter == recovered.policy.filter);
+    CHECK(durable.policy.overlay == recovered.policy.overlay);
+    CHECK(durable.class_catalog_identity == prior.class_catalog_identity);
+}
+
+TEST_CASE("Explore Open rejects a settings candidate made stale during rendering") {
+    LoadedSettings settings;
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto gate = std::make_shared<ExplorePostRenderGate>(0U);
+    auto entered = gate->entered.get_future();
+    auto failures = std::make_shared<std::atomic_uint64_t>(0U);
+    ExploreScenario scenario{settings, backend,
+                             [gate] {
+                                 return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr,
+                                                                               nullptr, nullptr, nullptr, gate);
+                             },
+                             count_explore_failures(failures)};
+    auto& explore = scenario.system();
+    static_cast<void>(explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/different-catalog"}));
+    REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+
+    enable_dark_mode(settings);
+    gate->release.set_value();
+    REQUIRE(scenario.Wait([&] { return failures->load(std::memory_order_acquire) == 1U && !explore.snapshot().busy; }));
+    CHECK_FALSE(explore.snapshot().ready);
+    CHECK_FALSE(explore.snapshot().failure.empty());
+    const auto current = settings.system().snapshot();
+    CHECK(current.settings_state.ui.dark_mode);
+    CHECK(current.settings_state.workflows.explore.class_catalog_identity == 0U);
+}
+
+TEST_CASE("failed and cancelled Explore opens preserve the last successful catalog preferences") {
+    SECTION("failed open") {
+        LoadedSettings settings;
+        auto backend = std::make_shared<FakeImageBackend>();
+        ExploreScenario scenario{settings, backend};
+        auto& explore = scenario.system();
+        scenario.OpenAndWait({.extent = {64U, 64U}});
+        const auto before = select_explore_subset(settings, scenario, 0U);
+
+        const auto admitted = explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/failed"});
+        REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > admitted.revision; }));
+        CHECK_FALSE(explore.snapshot().failure.empty());
+        CHECK(explore.snapshot().ready);
+        CHECK(explore.snapshot().dataset.class_catalog_identity == before.class_catalog_identity);
+        const auto after = settings.system().explore_settings_candidate().preferences;
+        check_catalog_selection_preserved(after, before);
+    }
+
+    SECTION("cancelled open") {
+        LoadedSettings settings;
+        auto backend = std::make_shared<FakeImageBackend>();
+        auto gate = std::make_shared<ExploreFinalizationGate>(2U);
+        auto entered = gate->entered.get_future();
+        ExploreScenario scenario{settings, backend, [gate] {
+                                     return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr,
+                                                                                   nullptr, gate);
+                                 }};
+        auto& explore = scenario.system();
+        scenario.OpenAndWait({.extent = {64U, 64U}});
+        const auto before = select_explore_subset(settings, scenario, 0U);
+
+        const auto admitted = explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/different-catalog"});
+        REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+        static_cast<void>(explore.Stop());
+        gate->release.set_value();
+        REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > admitted.revision; }));
+        const auto after = settings.system().explore_settings_candidate().preferences;
+        check_catalog_selection_preserved(after, before);
+    }
+}
+
+TEST_CASE("Explore candidate allocation and render failures restore the committed dataset and frame") {
+    const auto run = [](const std::string_view source) {
+        TrackedExploreFailureFixture fixture;
+        auto& explore = fixture.system();
+        fixture.OpenAndWait();
+        const auto before = explore.snapshot();
+
+        const auto admitted = explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = std::string{source}});
+        const auto restored = wait_for_explore_failure(fixture.scenario(), fixture.failures(), admitted.revision);
+        CHECK(restored.ready);
+        CHECK(restored.dataset.class_catalog_identity == before.dataset.class_catalog_identity);
+        CHECK(restored.dataset.image_count == before.dataset.image_count);
+        CHECK(restored.dataset.class_names == before.dataset.class_names);
+        CHECK(restored.order.matching_count == before.order.matching_count);
+        CHECK(restored.order.shuffle_seed == before.order.shuffle_seed);
+        CHECK(restored.order.visible_indices == before.order.visible_indices);
+        CHECK(restored.frame.revision > before.frame.revision);
+        CHECK_FALSE(restored.failure.empty());
+        CHECK(fixture.commit_count() == 1U);
+    };
+
+    SECTION("candidate allocation") { run("/allocation-failed"); }
+    SECTION("candidate render") { run("/render-failed"); }
+}
+
+TEST_CASE("Explore filter preparation and render failures discard candidates without invalidating the runtime") {
+    const auto run = [](const std::uint32_t minimum_instances) {
+        TrackedExploreFailureFixture fixture;
+        auto& explore = fixture.system();
+        fixture.OpenAndWait();
+        const auto committed = explore.snapshot();
+        const auto admitted = explore.UpdateFilter({.filter = {.minimum_instances = minimum_instances}});
+        const auto restored = wait_for_explore_failure(fixture.scenario(), fixture.failures(), admitted.revision);
+        check_restored_filter(restored, committed);
+        CHECK_FALSE(explore.snapshot().failure.empty());
+        CHECK(fixture.commit_count() == 1U);
+        const auto selected = explore.Select({.compiled_index = committed.order.visible_indices.front()});
+        REQUIRE(fixture.scenario().Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > selected.revision; }));
+        CHECK(explore.snapshot().mode == ExploreMode::Detail);
+    };
+
+    SECTION("prepare allocation") { run(7U); }
+    SECTION("candidate render") { run(8U); }
+}
+
+TEST_CASE("Explore shuffled policy rerolls with a fresh resolved seed and validates dataset policy") {
+    LoadedSettings settings;
+    auto backend = std::make_shared<FakeImageBackend>();
+    ExploreScenario scenario{settings, backend};
+    auto& explore = scenario.system();
+    scenario.OpenAndWait({.extent = {3U, 80U}, .first_row = 99U, .row_count = 80U, .columns = 3U});
+    CHECK(explore.snapshot().viewport.first_row == 0U);
+    CHECK(explore.snapshot().viewport.row_count == 1U);
+    CHECK(explore.snapshot().viewport.columns == 3U);
+
+    ExploreFilterUpdate shuffled{
+        .filter = {.maximum_compiled_index = 2U, .order = ExploreOrder::Shuffled, .shuffle_seed = 97U},
+        .overlay = {},
+    };
+    auto admitted = explore.UpdateFilter(shuffled);
+    REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > admitted.revision; }));
+    CHECK(explore.snapshot().order.shuffle_seed == 97U);
+    admitted = explore.Reroll();
+    REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > admitted.revision; }));
+    CHECK(explore.snapshot().order.shuffle_seed != 0U);
+    CHECK(explore.snapshot().order.shuffle_seed != 97U);
+
+    shuffled.filter.minimum_compiled_index = 3U;
+    CHECK_THROWS_AS(explore.UpdateFilter(shuffled), contracts::InvalidIntentError);
+    shuffled.filter.minimum_compiled_index = 0U;
+    shuffled.overlay.class_selection = {.mode = ExploreClassSelectionMode::Subset, .classes = {2U}};
+    CHECK_THROWS_AS(explore.UpdateFilter(shuffled), contracts::InvalidIntentError);
+}
+
+TEST_CASE("Explore normalizes saved dataset policy locally and projects every class selection mode") {
+    LoadedSettings settings;
+    persist_explore_catalog(settings.system(), test_explore_catalog_identity());
+    const ExploreFilterUpdate saved{
+        .filter =
+            {
+                .class_selection = {.mode = ExploreClassSelectionMode::Subset, .classes = {1U, 9U}},
+                .minimum_compiled_index = 10U,
+                .maximum_compiled_index = 20U,
+            },
+        .overlay = {.class_selection = {.mode = ExploreClassSelectionMode::Subset, .classes = {9U}}},
+    };
+    (void)settings.system().persist_explore_filter(settings.system().explore_settings_candidate(), saved);
+    const auto saved_revision = settings.system().snapshot().revision;
+
+    auto backend = std::make_shared<FakeImageBackend>();
+    ExploreScenario scenario{settings, backend};
+    auto& explore = scenario.system();
+    scenario.OpenAndWait({.extent = {64U, 64U}});
+    CHECK(explore.snapshot().filter.class_selection == ExploreClassSelection{.mode = ExploreClassSelectionMode::Subset, .classes = {1U}});
+    CHECK(explore.snapshot().filter.minimum_compiled_index == 2U);
+    CHECK(explore.snapshot().filter.maximum_compiled_index == 2U);
+    CHECK(explore.snapshot().overlay.class_selection == ExploreClassSelection{.mode = ExploreClassSelectionMode::None});
+    CHECK(settings.system().explore_settings_candidate().preferences.policy.filter == saved.filter);
+    CHECK(settings.system().explore_settings_candidate().preferences.policy.overlay == saved.overlay);
+    CHECK(settings.system().snapshot().revision == saved_revision);
+
+    const auto update_and_wait = [&scenario, &explore](ExploreFilterUpdate update) {
+        const auto admitted = explore.UpdateFilter(std::move(update));
+        REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > admitted.revision; }));
+    };
+    update_and_wait({
+        .filter = {.class_selection = {.mode = ExploreClassSelectionMode::All}, .maximum_compiled_index = 2U},
+        .overlay = {.class_selection = {.mode = ExploreClassSelectionMode::None}},
+    });
+    CHECK(explore.snapshot().filter.class_selection.mode == ExploreClassSelectionMode::All);
+    CHECK(explore.snapshot().filter.class_selection.classes.empty());
+    CHECK(explore.snapshot().overlay.class_selection.mode == ExploreClassSelectionMode::None);
+    CHECK(explore.snapshot().overlay.class_selection.classes.empty());
+
+    update_and_wait({
+        .filter = {.class_selection = {.mode = ExploreClassSelectionMode::None}, .maximum_compiled_index = 2U},
+        .overlay = {.class_selection = {.mode = ExploreClassSelectionMode::Subset, .classes = {0U}}},
+    });
+    CHECK(explore.snapshot().filter.class_selection.mode == ExploreClassSelectionMode::None);
+    CHECK(explore.snapshot().filter.class_selection.classes.empty());
+    CHECK(explore.snapshot().overlay.class_selection == ExploreClassSelection{.mode = ExploreClassSelectionMode::Subset, .classes = {0U}});
+}
+
+TEST_CASE("Explore persistence failure retains the ready runtime product") {
+    LoadedSettings settings;
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto commits = std::make_shared<std::atomic_uint64_t>(0U);
+    auto failures = std::make_shared<std::atomic_uint64_t>(0U);
+    ExploreScenario scenario{
+        settings, backend,
+        [commits] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr, commits); },
+        count_explore_failures(failures)};
+    auto& explore = scenario.system();
+    scenario.OpenAndWait({.extent = {64U, 64U}});
+    const auto prior = explore.snapshot();
+    const auto persisted = settings.system().snapshot();
+    settings.BreakPersistence();
+
+    static_cast<void>(explore.UpdateFilter({
+        .filter = {.minimum_instances = 3U},
+        .overlay = {.show_boxes = false, .show_masks = false},
+    }));
+    REQUIRE(scenario.Wait([&] { return failures->load(std::memory_order_acquire) == 1U && !explore.snapshot().busy; }));
+    const auto failed = explore.snapshot();
+    CHECK(failed.ready);
+    CHECK_FALSE(failed.failure.empty());
+    CHECK(failed.filter == prior.filter);
+    CHECK(failed.order.matching_count == prior.order.matching_count);
+    CHECK(failed.order.shuffle_seed == prior.order.shuffle_seed);
+    CHECK(failed.order.visible_indices == prior.order.visible_indices);
+    CHECK(failed.mode == prior.mode);
+    CHECK(failed.selected_image == prior.selected_image);
+    CHECK(failed.overlay.show_boxes == prior.overlay.show_boxes);
+    CHECK(failed.frame.revision > prior.frame.revision);
+    REQUIRE(explore.BorrowFrame().valid());
+    CHECK(explore.BorrowFrame().plane(0U).revision() == failed.frame.revision);
+    CHECK(settings.system().snapshot().revision == persisted.revision);
+    CHECK(commits->load(std::memory_order_acquire) == 1U);
+}
+
+TEST_CASE("Explore stale filter persistence discards the rendered candidate and restores the committed product") {
+    LoadedSettings settings;
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto gate = std::make_shared<ExplorePostRenderGate>(1U);
+    auto entered = gate->entered.get_future();
+    auto commits = std::make_shared<std::atomic_uint64_t>(0U);
+    auto failures = std::make_shared<std::atomic_uint64_t>(0U);
+    ExploreScenario scenario{settings, backend,
+                             [gate, commits] {
+                                 return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr,
+                                                                               commits, nullptr, nullptr, gate);
+                             },
+                             count_explore_failures(failures)};
+    auto& explore = scenario.system();
+    scenario.OpenAndWait({.extent = {64U, 64U}});
+    const auto committed = explore.snapshot();
+    const auto admission = explore.UpdateFilter({.filter = {.minimum_instances = 1U}});
+    REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+    enable_dark_mode(settings);
+    gate->release.set_value();
+    const auto restored = wait_for_explore_failure(scenario, failures, admission.revision);
+    check_restored_filter(restored, committed);
+    CHECK(settings.system().snapshot().settings_state.ui.dark_mode);
+    CHECK(settings.system().explore_settings_candidate().preferences.policy.filter == committed.filter);
+    CHECK(commits->load(std::memory_order_acquire) == 1U);
+}
+
+TEST_CASE("Explore successful persistence is settled before Stop can observe it") {
+    auto persistence_entered = std::make_shared<std::promise<void>>();
+    auto release_persistence = std::make_shared<std::promise<void>>();
+    auto released = release_persistence->get_future().share();
+    auto settings_events = std::make_shared<std::atomic_uint64_t>(0U);
+    LoadedSettings settings{[persistence_entered, released, settings_events](SettingsSystem::event_type) {
+        if (settings_events->fetch_add(1U, std::memory_order_acq_rel) == 2U) {
+            persistence_entered->set_value();
+            released.wait();
+        }
+    }};
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto commits = std::make_shared<std::atomic_uint64_t>(0U);
+    auto scenario = tracked_explore_scenario(settings, backend, commits);
+    auto& explore = scenario.system();
+    scenario.OpenAndWait({.extent = {64U, 64U}});
+    static_cast<void>(explore.UpdateFilter({
+        .filter = {.minimum_instances = 1U},
+    }));
+    REQUIRE(persistence_entered->get_future().wait_for(2s) == std::future_status::ready);
+    auto stopped = std::async(std::launch::async, [&explore] { return explore.Stop(); });
+    REQUIRE(stopped.wait_for(2s) == std::future_status::ready);
+    const auto stopping = stopped.get();
+    CHECK(stopping.busy);
+    CHECK(stopping.cancellation_requested);
+    release_persistence->set_value();
+    REQUIRE(scenario.Wait([&] {
+        const auto state = explore.snapshot();
+        return !state.busy && !state.cancellation_requested && state.filter.minimum_instances == 1U;
+    }));
+    CHECK(commits->load(std::memory_order_acquire) == 2U);
+}
+
+TEST_CASE("Explore Open cancellation wins at its post-render finalization boundary") {
+    LoadedSettings settings;
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto commits = std::make_shared<std::atomic_uint64_t>(0U);
+    auto gate = std::make_shared<ExploreFinalizationGate>(0U);
+    auto entered = gate->entered.get_future();
+    ExploreScenario scenario{settings, backend, [commits, gate] {
+                                 return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr,
+                                                                               commits, gate);
+                             }};
+    auto& explore = scenario.system();
+    static_cast<void>(explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/test"}));
+    REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+    const auto stopping = explore.Stop();
+    CHECK(stopping.busy);
+    CHECK(stopping.cancellation_requested);
+    release_and_wait_for_idle(scenario, gate->release);
+    CHECK_FALSE(explore.snapshot().ready);
+    CHECK_FALSE(explore.BorrowFrame().valid());
+    CHECK(commits->load(std::memory_order_acquire) == 0U);
+}
+
+TEST_CASE("Explore Open and Stop linearize around catalog persistence") {
+    auto persistence_entered = std::make_shared<std::promise<void>>();
+    auto release_persistence = std::make_shared<std::promise<void>>();
+    auto released = release_persistence->get_future().share();
+    auto block_persistence = std::make_shared<std::atomic_bool>(false);
+    LoadedSettings settings{[persistence_entered, released, block_persistence](SettingsSystem::event_type) {
+        if (block_persistence->exchange(false, std::memory_order_acq_rel)) {
+            persistence_entered->set_value();
+            released.wait();
+        }
+    }};
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto commits = std::make_shared<std::atomic_uint64_t>(0U);
+    auto changed_events = std::make_shared<std::atomic_uint64_t>(0U);
+    auto changed_revision = std::make_shared<std::atomic_uint64_t>(0U);
+    auto scenario =
+        tracked_explore_scenario(settings, backend, commits, [changed_events, changed_revision](ExploreSystem::event_type event) {
+            if (const auto* changed = std::get_if<ExploreChanged>(&event)) {
+                changed_revision->store(changed->snapshot.revision, std::memory_order_release);
+                changed_events->fetch_add(1U, std::memory_order_acq_rel);
+            }
+        });
+    auto& explore = scenario.system();
+    scenario.OpenAndWait({.extent = {64U, 64U}});
+    const auto first_identity = explore.snapshot().dataset.class_catalog_identity;
+    static_cast<void>(select_explore_subset(settings, scenario, 1U));
+    const auto events_before_open = changed_events->load(std::memory_order_acquire);
+
+    block_persistence->store(true, std::memory_order_release);
+    static_cast<void>(explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/different-catalog"}));
+    REQUIRE(persistence_entered->get_future().wait_for(2s) == std::future_status::ready);
+    auto stopped = std::async(std::launch::async, [&explore] { return explore.Stop(); });
+    CHECK(stopped.wait_for(100ms) == std::future_status::timeout);
+
+    release_persistence->set_value();
+    REQUIRE(stopped.wait_for(2s) == std::future_status::ready);
+    const auto stop_result = stopped.get();
+    REQUIRE(scenario.Wait(
+        [&] { return changed_events->load(std::memory_order_acquire) == events_before_open + 1U && !explore.snapshot().busy; }));
+    const auto settled = explore.snapshot();
+    CHECK(settled.ready);
+    CHECK_FALSE(settled.cancellation_requested);
+    CHECK(settled.dataset.class_catalog_identity != first_identity);
+    CHECK(settled.filter.class_selection.mode == ExploreClassSelectionMode::All);
+    CHECK(settled.overlay.class_selection.mode == ExploreClassSelectionMode::All);
+    CHECK(stop_result.revision == settled.revision);
+    CHECK(stop_result.busy == settled.busy);
+    CHECK(stop_result.cancellation_requested == settled.cancellation_requested);
+    CHECK(stop_result.dataset.class_catalog_identity == settled.dataset.class_catalog_identity);
+    CHECK(changed_events->load(std::memory_order_acquire) == events_before_open + 1U);
+    CHECK(changed_revision->load(std::memory_order_acquire) == settled.revision);
+    CHECK(settings.system().explore_settings_candidate().preferences.class_catalog_identity == settled.dataset.class_catalog_identity);
+    CHECK(commits->load(std::memory_order_acquire) == 3U);
+}
+
+TEST_CASE("Explore cancellation during saved-filter preparation discards the unpublished native Open") {
+    const auto run = [](const std::size_t blocked_call) {
+        LoadedSettings settings;
+        auto backend = std::make_shared<FakeImageBackend>();
+        auto probe = std::make_shared<OpenPreparationProbe>(blocked_call);
+        auto entered = probe->entered.get_future();
+        auto cancelled = probe->cancelled.get_future();
+        ExploreScenario scenario{settings, backend, [probe] { return std::make_unique<CancellableOpenPreparationAlgorithm>(probe); }};
+        auto& explore = scenario.system();
+        if (blocked_call != 0U) { scenario.OpenAndWait({.extent = {64U, 64U}}, "/first"); }
+
+        const auto admission = explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/cancelled"});
+        REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+        const auto stopping = explore.Stop();
+        CHECK_FALSE((stopping.busy && !stopping.cancellation_requested));
+        REQUIRE(cancelled.wait_for(2s) == std::future_status::ready);
+        REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > admission.revision; }));
+        const auto settled = explore.snapshot();
+        CHECK(settled.ready == (blocked_call != 0U));
+        CHECK(settled.dataset.image_count == blocked_call);
+        CHECK(settled.dataset.class_names.empty() == (blocked_call == 0U));
+        CHECK(settled.order.visible_indices.empty() == (blocked_call == 0U));
+        CHECK(settled.frame.valid() == (blocked_call != 0U));
+        CHECK_FALSE(settled.cancellation_requested);
+        CHECK(probe->resets.load(std::memory_order_acquire) == (blocked_call == 0U ? 1U : 0U));
+        CHECK(probe->commits.load(std::memory_order_acquire) == blocked_call);
+
+        const auto reopened = explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/fresh"});
+        REQUIRE(scenario.Wait([&] { return explore.snapshot().ready && explore.snapshot().revision > reopened.revision; }));
+        CHECK(explore.snapshot().dataset.image_count == 1U);
+        CHECK(explore.snapshot().frame.valid());
+        CHECK(probe->commits.load(std::memory_order_acquire) == blocked_call + 1U);
+    };
+
+    SECTION("first Open") { run(0U); }
+    SECTION("reopen") { run(1U); }
+}
+
+TEST_CASE("Annotation peer closure inserts one ordered private cancel barrier") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    OpenedExplore opened_explore{backend, {32U, 32U}};
+    auto& explore = opened_explore.system();
+    auto document_revision = std::make_shared<std::atomic<std::uint64_t>>(0U);
+    auto order = std::make_shared<std::vector<std::uint64_t>>();
+    auto peer_closed = std::make_shared<std::promise<void>>();
+    auto closed = peer_closed->get_future();
+    EventGate events;
+    AnnotationSystem annotation{kDevice,
+                                RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+                                               [document_revision, order, peer_closed] {
+                                                   return std::make_unique<TestAnnotationAlgorithm>(
+                                                       // CLEANUP-IGNORE: Ordered Annotation cancellation and Upscale extent tracking
+                                                       // construct different algorithms and source contracts.
+                                                       document_revision, order, nullptr, nullptr, peer_closed);
+                                               }),
+                                borrow_exactly_from(explore), [&events](AnnotationSystem::event_type) { events.Advance(); }};
+    static_cast<void>(annotation.Open({.source = explore.snapshot().frame}));
+    REQUIRE(events.Wait([&] { return annotation.snapshot().ready; }));
+    annotation.Pointer({
+        .phase = contracts::AnnotationPointerPhase::Begin,
+        .interaction_id = 1U,
+        .sequence = 1U,
+        .point = {2.0F, 3.0F},
+    });
+    annotation.Pointer({
+        .phase = contracts::AnnotationPointerPhase::Update,
+        .interaction_id = 1U,
+        .sequence = 2U,
+        .point = {4.0F, 5.0F},
+    });
+    annotation.PeerClosed();
+    CHECK_THROWS_AS(annotation.Pointer({
+                        .phase = contracts::AnnotationPointerPhase::Begin,
+                        .interaction_id = 2U,
+                        .sequence = 1U,
+                        .point = {6.0F, 7.0F},
+                    }),
+                    contracts::UnavailableError);
+    REQUIRE(closed.wait_for(2s) == std::future_status::ready);
+    const auto edit_admitted = annotation.Edit({
+        .edit = {.value = AnnotationUndoEdit{}},
+    });
+    REQUIRE(events.Wait([&] { return !annotation.snapshot().busy && annotation.snapshot().revision > edit_admitted.revision; }));
+    const auto interaction_revision = annotation.snapshot().ui.interaction_revision;
+    annotation.Pointer({
+        .phase = contracts::AnnotationPointerPhase::Begin,
+        .interaction_id = 2U,
+        .sequence = 1U,
+        .point = {6.0F, 7.0F},
+    });
+    annotation.Pointer({
+        .phase = contracts::AnnotationPointerPhase::End,
+        .interaction_id = 2U,
+        .sequence = 2U,
+        .point = {8.0F, 9.0F},
+    });
+    REQUIRE(events.Wait([&] { return annotation.snapshot().ui.interaction_revision >= interaction_revision + 2U; }));
+    CHECK(*order == std::vector<std::uint64_t>{1U, 2U, 200U, 100U, 1U, 2U});
+    CHECK(annotation.snapshot().ready);
+    CHECK(annotation.BorrowFrame().valid());
+}
+
+// CLEANUP-IGNORE: This settings-capture scenario and the overlay-retention scenario require independent fixture owners.
+TEST_CASE("Explore newest desired work renders the captured current Settings augmentation configuration") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto probe = std::make_shared<ExploreWorkProbe>();
+    LoadedSettings settings;
+    ExploreScenario scenario{settings, backend, ExploreScenario::TrackWork(probe)};
+    static_cast<void>(scenario.system().UpdateAugmentation({.enabled = true}));
+    scenario.OpenAndWait({.extent = {64U, 32U}, .row_count = 1U, .columns = 2U});
+    const float original = probe->rendered_copy_paste_probability.load(std::memory_order_acquire);
+    const float requested = original == 0.75F ? 0.25F : 0.75F;
+    contracts::SettingsUpdateRequest update;
+    update.updates.push_back({.path = "workflows.train.request.gpu_augmentation.copy_paste_probability",
+                              .value = mmltk::frameworks::serialization::wire::FlatValue{static_cast<double>(requested)}});
+    static_cast<void>(settings.system().Update(std::move(update)));
+    const auto previous = scenario.system().snapshot().frame;
+    SECTION("checked reroll") { static_cast<void>(scenario.system().RerollAugmentation()); }
+    SECTION("persisted overlay") {
+        auto overlay = scenario.system().snapshot().overlay;
+        overlay.show_masks = !overlay.show_masks;
+        static_cast<void>(scenario.system().UpdateOverlay(overlay));
+    }
+    REQUIRE(scenario.Wait([&] {
+        return scenario.system().snapshot().frame != previous &&
+               probe->rendered_copy_paste_probability.load(std::memory_order_acquire) == requested;
+    }));
+    CHECK(probe->rendered_copy_paste_probability.load(std::memory_order_acquire) == requested);
+    CHECK(settings.system().explore_settings_candidate().augmentation.copy_paste_probability == requested);
+}
+
+struct ExploreViewportApplication final {
+    ExploreSystem* explore;
+};
+
+TEST_CASE("Explore viewport admission rejects malformed grids and publishes native capacity results") {
+    LoadedSettings settings;
+    auto backend = std::make_shared<FakeImageBackend>();
+    ExploreScenario scenario{settings, backend};
+    auto& explore = scenario.system();
+    scenario.OpenAndWait({.extent = {64U, 32U}, .columns = 2U});
+    const auto prior = explore.snapshot();
+    for (const auto viewport :
+         {ExploreViewport{.extent = {64U, 64U}, .columns = 2U}, ExploreViewport{.extent = {65U, 32U}, .columns = 2U},
+          ExploreViewport{.extent = {64U, 65U}, .row_count = 2U, .columns = 2U}, ExploreViewport{.extent = {64U, 64U}, .row_count = 0U},
+          ExploreViewport{.extent = {64U, 64U}, .columns = 0U},
+          ExploreViewport{.extent = {1U, 1U}, .row_count = UINT32_MAX, .columns = UINT32_MAX}}) {
+        CHECK_FALSE(viewport.valid());
+        CHECK_THROWS_AS(explore.UpdateViewport({.viewport = viewport}), contracts::InvalidIntentError);
+    }
+    const auto rows = static_cast<std::uint32_t>(kExploreVisibleItemCapacity + 1U);
+    const ExploreViewportUpdate request{.viewport = {.extent = {1U, rows}, .row_count = rows}};
+    REQUIRE(request.valid());
+    REQUIRE_FALSE(request.viewport.valid());
+    explore.UpdateViewport(request);
+    auto rejected = explore.snapshot();
+    REQUIRE(rejected.viewport_result);
+    CHECK(rejected.viewport_result->outcome == ExploreViewportOutcome::VisibleCapacityExceeded);
+    CHECK(rejected.viewport_result->request.viewport == request.viewport);
+    CHECK(rejected.frame == prior.frame);
+    CHECK(rejected.gallery.generation == prior.gallery.generation);
+    CHECK(rejected.failure.empty());
+
+    ExploreViewportApplication application{&explore};
+    auto value = mmltk::frameworks::serialization::reflected_value(request);
+    REQUIRE(value);
+    const auto dispatched = browser::dispatch_interaction(
+        application, {.endpoint_id = browser::application_stable_id("explore", "UpdateViewport"), .value = std::move(*value)});
+    CHECK(dispatched.disposition == browser::InteractionDispatchDisposition::Accepted);
+    rejected = explore.snapshot();
+    REQUIRE(rejected.viewport_result);
+    CHECK(rejected.viewport_result->outcome == ExploreViewportOutcome::VisibleCapacityExceeded);
+    const auto encoded = mmltk::frameworks::serialization::reflected_value(rejected);
+    REQUIRE(encoded);
+    ExploreSnapshot decoded;
+    REQUIRE(mmltk::frameworks::serialization::decode_into(decoded, *encoded));
+    REQUIRE(decoded.viewport_result);
+    CHECK(decoded.viewport_result->outcome == ExploreViewportOutcome::VisibleCapacityExceeded);
+    CHECK(decoded.viewport_result->request.viewport == request.viewport);
+
+    const auto side = std::max(kDevice.maximum_width, kDevice.maximum_height) + 1U;
+    explore.UpdateViewport({.viewport = {.extent = {side, side}}});
+    REQUIRE(explore.snapshot().viewport_result);
+    CHECK(explore.snapshot().viewport_result->outcome == ExploreViewportOutcome::AtlasExtentExceeded);
+    CHECK(explore.snapshot().frame == prior.frame);
+
+    explore.UpdateViewport({.viewport = prior.viewport});
+    REQUIRE(explore.snapshot().viewport_result);
+    CHECK(explore.snapshot().viewport_result->outcome == ExploreViewportOutcome::Ready);
+    CHECK(explore.snapshot().viewport.valid());
+}
+
+TEST_CASE("Explore end-of-order clamping preserves square native atlas cells") {
+    LoadedSettings settings;
+    auto backend = std::make_shared<FakeImageBackend>();
+    ExploreScenario scenario{settings, backend};
+    scenario.OpenAndWait({.extent = {64U, 96U}, .row_count = 3U, .columns = 2U});
+    const auto initial = scenario.system().snapshot();
+    CHECK(initial.viewport.row_count == 2U);
+    CHECK(initial.viewport.extent == VisualExtent{64U, 64U});
+    scenario.system().UpdateViewport({.viewport = {.extent = {64U, 96U}, .first_row = 1U, .row_count = 3U, .columns = 2U}});
+    REQUIRE(scenario.Wait([&] { return scenario.system().snapshot().viewport.first_row == 1U; }));
+    const auto end = scenario.system().snapshot();
+    CHECK(end.viewport.row_count == 1U);
+    CHECK(end.viewport.extent == VisualExtent{64U, 32U});
+    CHECK(end.frame.extent == end.viewport.extent);
+}
+
+TEST_CASE("Explore unavailable runtime and selected transport publish distinct typed failures") {
+    const bool transport = GENERATE(false, true);
+    LoadedSettings settings;
+    auto backend = std::make_shared<FakeImageBackend>();
+    ExploreScenario scenario{settings, backend, [transport]() -> std::unique_ptr<mmltk::frameworks::gpu::SystemImageModel> {
+                                 if (transport) throw mmltk::frameworks::gpu::GdrTransportUnavailable("selected GDR transport unavailable");
+                                 throw std::runtime_error("runtime initialization failed");
+                             }};
+    static_cast<void>(scenario.system().Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/test"}));
+    REQUIRE(scenario.Wait([&] { return !scenario.system().snapshot().failure.empty(); }));
+    const auto failed = scenario.system().snapshot();
+    CHECK_FALSE(failed.busy);
+    CHECK_FALSE(failed.ready);
+    CHECK(failed.failure_kind ==
+          (transport ? ExploreFailureKind::SelectedTransportUnavailable : ExploreFailureKind::RuntimeInitialization));
+    CHECK(failed.maximum_atlas_extent.valid());
+}
+
+TEST_CASE("Explore visibility preserves active augmentation and labels preserve the product") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto probe = std::make_shared<ExploreWorkProbe>();
+    LoadedSettings settings;
+    ExploreScenario scenario{settings, backend, ExploreScenario::TrackWork(probe)};
+    static_cast<void>(scenario.system().UpdateAugmentation({.enabled = true}));
+    scenario.OpenAndWait({.extent = {64U, 32U}, .row_count = 1U, .columns = 2U});
+    const auto before = scenario.system().snapshot();
+    auto overlay = before.overlay;
+    overlay.show_labels = !overlay.show_labels;
+    const auto labels = scenario.system().UpdateOverlay(overlay);
+    CHECK(labels.frame == before.frame);
+    CHECK(labels.gallery.generation == before.gallery.generation);
+    CHECK(labels.revision > before.revision);
+    CHECK(settings.system().explore_settings_candidate().preferences.policy.overlay.show_labels == overlay.show_labels);
+    const auto original = probe->rendered_copy_paste_probability.load(std::memory_order_acquire);
+    overlay.show_masks = !overlay.show_masks;
+    static_cast<void>(scenario.system().UpdateOverlay(overlay));
+    REQUIRE(scenario.Wait([&] { return scenario.system().snapshot().frame != before.frame; }));
+    CHECK(probe->rendered_copy_paste_probability.load(std::memory_order_acquire) == original);
+}
+
+TEST_CASE("Explore discrete products use the viewport current at execution") {
+    auto run = [](const bool select) {
+        auto backend = std::make_shared<FakeImageBackend>();
+        auto observed_nproc = std::make_shared<std::atomic<std::size_t>>(0U);
+        auto gate = std::make_shared<ExploreRenderGate>();
+        auto entered = gate->entered.get_future();
+        LoadedSettings settings;
+        ExploreScenario scenario{settings, backend,
+                                 [observed_nproc, gate] { return std::make_unique<TestExploreAlgorithm>(observed_nproc, gate); }};
+        auto& explore = scenario.system();
+        scenario.OpenAndWait({.extent = {63U, 21U}, .row_count = 1U, .columns = 3U});
+
+        explore.UpdateViewport({.viewport = {.extent = {48U, 16U}, .row_count = 1U, .columns = 3U}});
+        REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+        explore.UpdateViewport({.viewport = {.extent = {30U, 10U}, .row_count = 1U, .columns = 3U}});
+        if (select)
+            static_cast<void>(explore.Select({.compiled_index = 1U}));
+        else
+            static_cast<void>(
+                explore.UpdateFilter({.filter = {.minimum_instances = 1U}, .overlay = {.show_boxes = false, .show_masks = true}}));
+        gate->release.set_value();
+
+        REQUIRE(scenario.Wait([&] {
+            const auto state = explore.snapshot();
+            return !state.busy && state.viewport.extent.width == 30U &&
+                   (select ? state.mode == ExploreMode::Detail : state.filter.minimum_instances == 1U);
+        }));
+        const auto state = explore.snapshot();
+        CHECK(state.frame.extent == state.viewport.extent);
+        CHECK(state.order.visible_indices == std::vector<std::uint32_t>{0U, 1U, 2U});
+        CHECK(state.selected_image == (select ? std::optional<std::uint32_t>{1U} : std::nullopt));
+        const auto borrowed = explore.BorrowFrame();
+        REQUIRE(borrowed.valid());
+        CHECK(borrowed.plane(0U).revision() == state.frame.revision);
+    };
+
+    SECTION("filter") { run(false); }
+    SECTION("selection") { run(true); }
+}
+
+TEST_CASE("queued Explore cancellation is finalized by the scheduler callback") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto observed_nproc = std::make_shared<std::atomic<std::size_t>>(0U);
+    auto commits = std::make_shared<std::atomic_uint64_t>(0U);
+    auto gate = std::make_shared<ExploreRenderGate>();
+    auto entered = gate->entered.get_future();
+    LoadedSettings settings;
+    (void)settings.system().persist_explore_filter(settings.system().explore_settings_candidate(),
+                                                   {
+                                                       .filter = {.order = ExploreOrder::Shuffled, .shuffle_seed = 17U},
+                                                   });
+    ExploreScenario scenario{settings, backend, [observed_nproc, commits, gate] {
+                                 return std::make_unique<TestExploreAlgorithm>(observed_nproc, gate, commits);
+                             }};
+    auto& explore = scenario.system();
+    scenario.OpenAndWait({.extent = {64U, 64U}});
+    const auto committed = explore.snapshot();
+    explore.UpdateViewport({.viewport = {.extent = {48U, 48U}}});
+    REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+    const auto admitted = explore.Reroll();
+    CHECK(admitted.busy);
+
+    const auto stopped = explore.Stop();
+    CHECK_FALSE(stopped.busy);
+    CHECK_FALSE(stopped.cancellation_requested);
+    CHECK(stopped.revision > admitted.revision);
+    CHECK(commits->load(std::memory_order_acquire) == 1U);
+
+    gate->release.set_value();
+    REQUIRE(scenario.Wait([&] { return explore.snapshot().frame.revision > committed.frame.revision; }));
+    CHECK(explore.snapshot().viewport.extent == committed.viewport.extent);
+    CHECK_FALSE(explore.snapshot().busy);
+    CHECK(commits->load(std::memory_order_acquire) == 1U);
+}
+
+TEST_CASE("post-render Explore cancellation restores the committed gallery product") {
+    const auto run = [](const bool selection) {
+        auto backend = std::make_shared<FakeImageBackend>();
+        auto gate = std::make_shared<ExplorePostRenderGate>(1U);
+        auto entered = gate->entered.get_future();
+        auto commits = std::make_shared<std::atomic_uint64_t>(0U);
+        LoadedSettings settings;
+        (void)settings.system().persist_explore_filter(settings.system().explore_settings_candidate(),
+                                                       {
+                                                           .filter = {.order = ExploreOrder::Shuffled, .shuffle_seed = 19U},
+                                                       });
+        ExploreScenario scenario{settings, backend, [gate, commits] {
+                                     return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr,
+                                                                                   commits, nullptr, nullptr, gate);
+                                 }};
+        auto& explore = scenario.system();
+        scenario.OpenAndWait({.extent = {63U, 21U}, .row_count = 1U, .columns = 3U});
+        const auto before = explore.snapshot();
+        if (selection)
+            static_cast<void>(explore.Select({.compiled_index = 1U}));
+        else
+            static_cast<void>(explore.Reroll());
+        REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+        const auto stopping = explore.Stop();
+        CHECK(stopping.busy == !selection);
+        CHECK(stopping.cancellation_requested == !selection);
+        gate->release.set_value();
+        REQUIRE(scenario.Wait([&] {
+            const auto snapshot = explore.snapshot();
+            return !snapshot.busy && snapshot.frame.revision > before.frame.revision;
+        }));
+        const auto restored = explore.snapshot();
+        CHECK(restored.filter == before.filter);
+        CHECK(restored.order.visible_indices == before.order.visible_indices);
+        CHECK(restored.mode == before.mode);
+        CHECK(restored.selected_image == before.selected_image);
+        CHECK(restored.frame.revision > before.frame.revision);
+        REQUIRE(explore.BorrowFrame().valid());
+        CHECK(explore.BorrowFrame().plane(0U).revision() == restored.frame.revision);
+        CHECK(commits->load(std::memory_order_acquire) == 1U);
+    };
+
+    SECTION("discrete order") { run(false); }
+    SECTION("selection") { run(true); }
+}
+
+TEST_CASE("Explore focus never changes published target atlas slot identity") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto work = std::make_shared<ExploreWorkProbe>();
+    LoadedSettings settings;
+    ExploreScenario scenario{settings, backend, ExploreScenario::TrackWork(work)};
+    auto& explore = scenario.system();
+    scenario.OpenAndWait({.extent = {96U, 48U}, .row_count = 1U, .columns = 2U});
+
+    const auto before_focus = explore.snapshot().revision;
+    explore.UpdateViewport({.viewport = {.extent = {96U, 48U}, .row_count = 1U, .columns = 2U}, .focused_compiled_index = 1U});
+    REQUIRE(scenario.Wait([&] {
+        const auto state = explore.snapshot();
+        return state.revision > before_focus && state.focused_image == 1U &&
+               state.order.visible_indices == std::vector<std::uint32_t>{0U, 1U};
+    }));
+    CHECK(work->rendered_count.load(std::memory_order_acquire) == 2U);
+    CHECK(work->rendered_slots[0].load(std::memory_order_acquire) == 0U);
+    CHECK(work->rendered_slots[1].load(std::memory_order_acquire) == 1U);
+
+    const auto before_scroll = explore.snapshot().revision;
+    explore.UpdateViewport(
+        {.viewport = {.extent = {96U, 48U}, .first_row = 1U, .row_count = 1U, .columns = 2U}, .focused_compiled_index = 1U});
+    REQUIRE(scenario.Wait([&] {
+        const auto state = explore.snapshot();
+        return state.revision > before_scroll && !state.focused_image && state.order.visible_indices == std::vector<std::uint32_t>{2U};
+    }));
+    CHECK(work->rendered_count.load(std::memory_order_acquire) == 1U);
+    CHECK(work->rendered_slots[0].load(std::memory_order_acquire) == 2U);
+}
+
+TEST_CASE("Explore selection and detail navigation publish complete bounded snapshots") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    LoadedSettings settings;
+    ExploreScenario scenario{settings, backend};
+    auto& explore = scenario.system();
+    scenario.OpenAndWait({.extent = {96U, 64U}, .row_count = 2U, .columns = 3U});
+    explore.UpdateViewport({.viewport = {.extent = {96U, 64U}, .row_count = 2U, .columns = 3U}, .focused_compiled_index = 2U});
+    REQUIRE(scenario.Wait([&] { return explore.snapshot().focused_image == 2U; }));
+    const auto before_stale_focus = explore.snapshot().revision;
+    explore.UpdateViewport({.viewport = {.extent = {96U, 64U}, .row_count = 2U, .columns = 3U}, .focused_compiled_index = 3U});
+    REQUIRE(scenario.Wait([&] {
+        const auto state = explore.snapshot();
+        return state.ready && !state.busy && state.revision > before_stale_focus && !state.focused_image;
+    }));
+    CHECK_THROWS_AS(explore.Select({.compiled_index = 3U}), contracts::InvalidIntentError);
+    static_cast<void>(explore.Select({.compiled_index = 1U}));
+    REQUIRE(scenario.Wait([&] {
+        const auto state = explore.snapshot();
+        return !state.busy && state.mode == ExploreMode::Detail && state.selected_image == 1U;
+    }));
+    static_cast<void>(explore.Navigate({.direction = ExploreNavigation::Next}));
+    REQUIRE(scenario.Wait([&] { return explore.snapshot().selected_image == 2U; }));
+    static_cast<void>(explore.CloseDetail());
+    REQUIRE(scenario.Wait([&] {
+        const auto state = explore.snapshot();
+        return state.mode == ExploreMode::Gallery && !state.selected_image;
+    }));
+    CHECK(explore.snapshot().order.visible_indices.size() <= kExploreVisibleItemCapacity);
+}
+
+TEST_CASE("a failed visual aggregate publishes once and reconstructs lazily") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto constructions = std::make_shared<std::atomic<std::uint64_t>>(0U);
+    auto failures = std::make_shared<std::atomic<std::uint64_t>>(0U);
+    LoadedSettings settings;
+    ExploreScenario scenario{
+        settings, backend,
+        [constructions] {
+            const auto generation = constructions->fetch_add(1U, std::memory_order_acq_rel);
+            if (generation == 0U)
+                return std::unique_ptr<mmltk::frameworks::gpu::SystemImageModel>{std::make_unique<FailingExploreAlgorithm>()};
+            return std::unique_ptr<mmltk::frameworks::gpu::SystemImageModel>{
+                std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U))};
+        },
+        count_explore_failures(failures)};
+    auto& explore = scenario.system();
+    static_cast<void>(explore.Open({.viewport = {.extent = {32U, 32U}}, .compiled_source = "/test"}));
+    REQUIRE(scenario.Wait([&] { return failures->load(std::memory_order_acquire) == 1U; }));
+    CHECK_FALSE(explore.snapshot().ready);
+    CHECK(explore.snapshot().dataset.image_count == 0U);
+    CHECK_FALSE(explore.snapshot().frame.valid());
+    CHECK_FALSE(explore.snapshot().busy);
+    CHECK_FALSE(explore.snapshot().cancellation_requested);
+    static_cast<void>(explore.Open({.viewport = {.extent = {32U, 32U}}, .compiled_source = "/test"}));
+    REQUIRE(scenario.Wait([&] { return explore.snapshot().ready; }));
+    CHECK(failures->load(std::memory_order_acquire) == 1U);
+    CHECK(constructions->load(std::memory_order_acquire) == 2U);
+}
+
+TEST_CASE("stopping Explore retains busy until its admitted operation settles") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto probe = std::make_shared<CancellationProbe>();
+    auto entered = probe->entered.get_future();
+    auto cancellation = probe->cancelled.get_future();
+    LoadedSettings settings;
+    ExploreScenario scenario{settings, backend, [probe] { return std::make_unique<CancellableExploreAlgorithm>(probe); }};
+    auto& explore = scenario.system();
+    const auto first_admission = explore.Open({.viewport = {.extent = {32U, 32U}}, .compiled_source = "/test"});
+    REQUIRE(scenario.Wait([&] { return explore.snapshot().ready; }));
+    const auto completed = explore.snapshot().frame.revision;
+    CHECK(explore.snapshot().revision > first_admission.revision);
+    const auto second_admission = explore.Open({.viewport = {.extent = {32U, 32U}}, .compiled_source = "/test"});
+    CHECK(second_admission.busy);
+    CHECK_THROWS_AS(explore.Open({.viewport = {}, .compiled_source = {}}), contracts::BusyError);
+    REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+    const auto stopping = explore.Stop();
+    CHECK_FALSE((stopping.busy && !stopping.cancellation_requested));
+    const auto repeated = explore.Stop();
+    CHECK(repeated.revision >= stopping.revision);
+    REQUIRE(cancellation.wait_for(2s) == std::future_status::ready);
+    REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy; }));
+    CHECK(explore.snapshot().revision > stopping.revision);
+    CHECK(explore.snapshot().frame.revision == completed);
+}
+
+TEST_CASE("cancelled Explore filter retains one native and public committed order") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto probe = std::make_shared<CancellationProbe>();
+    auto entered = probe->entered.get_future();
+    auto cancelled = probe->cancelled.get_future();
+    // CLEANUP-IGNORE: Filter cancellation observes native commit ownership, unlike the discrete viewport execution
+    // scenario.
+    auto commits = std::make_shared<std::atomic_uint64_t>(0U);
+    LoadedSettings settings;
+    ExploreScenario scenario{settings, backend,
+                             [probe, commits] { return std::make_unique<AtomicFilterExploreAlgorithm>(probe, commits); }};
+    auto& explore = scenario.system();
+    scenario.OpenAndWait({.extent = {32U, 32U}});
+    const auto before = explore.snapshot();
+    const auto settings_revision = settings.system().snapshot().revision;
+    static_cast<void>(explore.UpdateFilter({
+        .filter = {.minimum_instances = 1U},
+    }));
+    REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+    static_cast<void>(explore.Stop());
+    REQUIRE(cancelled.wait_for(2s) == std::future_status::ready);
+    REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy; }));
+    CHECK(commits->load(std::memory_order_acquire) == 1U);
+    CHECK(explore.snapshot().filter == before.filter);
+    CHECK(explore.snapshot().order.visible_indices == before.order.visible_indices);
+    CHECK(settings.system().snapshot().revision == settings_revision);
+    REQUIRE(explore.BorrowFrame().valid());
+    CHECK(explore.BorrowFrame().plane(0U).revision() == explore.snapshot().frame.revision);
+}
+
+TEST_CASE("Explore stop at filter finalization cancels before persistence") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto observed_nproc = std::make_shared<std::atomic<std::size_t>>(0U);
+    auto gate = std::make_shared<ExploreFinalizationGate>(1U);
+    auto entered = gate->entered.get_future();
+    LoadedSettings settings;
+    ExploreScenario scenario{settings, backend, [observed_nproc, gate] {
+                                 // CLEANUP-IGNORE: Finalization-gate rendering and atomic-filter cancellation configure
+                                 // distinct Explore algorithm seams.
+                                 return std::make_unique<TestExploreAlgorithm>(observed_nproc, nullptr, nullptr, gate);
+                             }};
+    auto& explore = scenario.system();
+    scenario.OpenAndWait({.extent = {32U, 32U}});
+    const auto before = explore.snapshot();
+    const auto settings_revision = settings.system().snapshot().revision;
+    static_cast<void>(explore.UpdateFilter({
+        .filter = {.minimum_instances = 1U},
+        .overlay = {.show_boxes = false, .show_masks = true},
+    }));
+    REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+    const auto stopping = explore.Stop();
+    CHECK(stopping.cancellation_requested);
+    release_and_wait_for_idle(scenario, gate->release);
+    const auto settled = explore.snapshot();
+    CHECK(settled.filter == before.filter);
+    CHECK(settled.overlay.show_boxes == before.overlay.show_boxes);
+    CHECK(settled.overlay.show_masks == before.overlay.show_masks);
+    CHECK(settled.frame.revision > before.frame.revision);
+    CHECK(settings.system().snapshot().revision == settings_revision);
+    REQUIRE(explore.BorrowFrame().valid());
+    CHECK(explore.BorrowFrame().plane(0U).revision() == settled.frame.revision);
+}
+
+// CLEANUP-IGNORE: Annotation receiver-copy rejection and Upscale high-water publication are distinct system tests.
+TEST_CASE("Annotation open rejection after receiver copy retires the aggregate") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    OpenedExplore opened_explore{backend, {32U, 32U}};
+    auto& explore = opened_explore.system();
+    auto probe = std::make_shared<CancellationProbe>();
+    EventGate events;
+    AnnotationSystem annotation{kDevice,
+                                RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+                                               [probe] { return std::make_unique<CancellableAnnotationAlgorithm>(probe); }),
+                                borrow_exactly_from(explore), [&events](AnnotationSystem::event_type) { events.Advance(); }};
+    CHECK_FALSE(annotation.BorrowFrame().valid());
+    const auto admission = annotation.Open({.source = explore.snapshot().frame});
+    CHECK(admission.busy);
+    REQUIRE(events.Wait([&] { return !annotation.snapshot().busy; }));
+    CHECK_FALSE(annotation.snapshot().ready);
+    CHECK_FALSE(annotation.snapshot().frame.valid());
+    CHECK_FALSE(annotation.BorrowFrame().valid());
+}
+
+TEST_CASE("Annotation rejects an oversized incoming document without changing its existing editor or pixels") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    MutableVisualSource source{backend, {512U, 256U}};
+    auto rejected_document = std::make_shared<VisualDocument>();
+    rejected_document->scene.document = contracts::WorkspaceResource::From("test://oversized", 1U);
+    rejected_document->scene.categories = {{.value = "object"}};
+    SECTION("object capacity") { rejected_document->scene.objects.resize(contracts::kAnnotationObjectCapacity + 1U); }
+    SECTION("materialized mask capacity") {
+        rejected_document->scene.objects.push_back(
+            {.shape = contracts::AnnotationShape::Mask, .box = {{0.0F, 0.0F}, {512.0F, 256.0F}}, .mask = {.present = true}});
+        rejected_document->mask_contains = [](std::size_t, float x, float) { return static_cast<unsigned>(x * 512.0F) % 2U == 0U; };
+    }
+    bool reject_incoming = false;
+    auto revision = std::make_shared<std::atomic_uint64_t>(0U);
+    EventGate events;
+    AnnotationSystem annotation{kDevice,
+                                RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+                                               [revision] { return std::make_unique<TestAnnotationAlgorithm>(revision); }),
+                                [&](const VisualFrame& frame) {
+                                    auto borrowed = source.BorrowExact(frame);
+                                    if (reject_incoming) borrowed.document = rejected_document;
+                                    return borrowed;
+                                },
+                                [&events](AnnotationSystem::event_type) { events.Advance(); }};
+    static_cast<void>(annotation.Open({.source = source.frame()}));
+    REQUIRE(events.Wait([&] { return annotation.snapshot().ready; }));
+    static_cast<void>(annotation.Edit({.edit = {.value = AnnotationUndoEdit{}}}));
+    REQUIRE(events.Wait([&] { return !annotation.snapshot().busy; }));
+    const auto prior = annotation.snapshot();
+    const auto copies = backend->same_copies.load(std::memory_order_acquire);
+    const auto pixel = *reinterpret_cast<const std::uint8_t*>(annotation.BorrowFrame().plane(0U).plane().data);
+    reject_incoming = true;
+    static_cast<void>(annotation.Open({.source = source.frame()}));
+    REQUIRE(events.Wait([&] { return !annotation.snapshot().busy; }));
+    CHECK(annotation.snapshot().ready);
+    CHECK(annotation.snapshot().ui == prior.ui);
+    CHECK(annotation.snapshot().frame == prior.frame);
+    CHECK(backend->same_copies.load(std::memory_order_acquire) == copies);
+    REQUIRE(annotation.BorrowFrame().valid());
+    CHECK(*reinterpret_cast<const std::uint8_t*>(annotation.BorrowFrame().plane(0U).plane().data) == pixel);
+    static_cast<void>(annotation.Edit({.edit = {.value = AnnotationRedoEdit{}}}));
+    REQUIRE(events.Wait([&] { return !annotation.snapshot().busy; }));
+    CHECK(annotation.snapshot().ui.document_revision == prior.ui.document_revision + 1U);
+}
+
+TEST_CASE("Annotation publishes an admitted mutation that committed before Stop") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    OpenedExplore opened_explore{backend, {32U, 32U}};
+    auto& explore = opened_explore.system();
+    auto revision = std::make_shared<std::atomic_uint64_t>(0U);
+    auto mutation = std::make_shared<MutationCommitProbe>();
+    auto committed = mutation->committed.get_future();
+    EventGate events;
+    AnnotationSystem annotation{kDevice,
+                                RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+                                               [revision, mutation] {
+                                                   return std::make_unique<TestAnnotationAlgorithm>(
+                                                       revision, std::shared_ptr<std::vector<std::uint64_t>>{},
+                                                       // CLEANUP-IGNORE: This mutation probe configures
+                                                       // commit-after-Stop evidence, not peer-close ordering.
+                                                       std::shared_ptr<std::atomic_bool>{}, mutation);
+                                               }),
+                                borrow_exactly_from(explore), [&events](AnnotationSystem::event_type) { events.Advance(); }};
+    static_cast<void>(annotation.Open({.source = explore.snapshot().frame}));
+    REQUIRE(events.Wait([&] { return annotation.snapshot().ready; }));
+    const auto before = annotation.snapshot();
+    // CLEANUP-IGNORE: Undo commit settlement and Explore publish settlement exercise different system-owned products.
+    static_cast<void>(annotation.Edit({.edit = {.value = AnnotationUndoEdit{}}}));
+    REQUIRE(committed.wait_for(2s) == std::future_status::ready);
+    const auto stopping = annotation.Stop();
+    CHECK(stopping.cancellation_requested);
+    mutation->release.set_value();
+    REQUIRE(events.Wait([&] { return !annotation.snapshot().busy; }));
+    CHECK(annotation.snapshot().ui.document_revision == before.ui.document_revision + 1U);
+    CHECK(annotation.snapshot().frame.revision > before.frame.revision);
+    CHECK_FALSE(annotation.snapshot().cancellation_requested);
+}
+
+TEST_CASE("Upscale owns and publishes its receiver image") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    OpenedExplore opened_explore{backend, {32U, 32U}};
+    auto& explore = opened_explore.system();
+
+    EventGate upscale_events;
+    // CLEANUP-IGNORE: Upscale and Annotation are independently sealed receiver systems with different model factories,
+    // intents, snapshots, and output invariants.
+    auto selected_kernel = std::make_shared<std::atomic<UpscaleKernel>>(UpscaleKernel::Default);
+    UpscaleSystem upscale{kDevice,
+                          RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+                                         [selected_kernel] { return std::make_unique<TestUpscaleAlgorithm>(selected_kernel); }),
+                          borrow_exactly_from(explore), [&upscale_events](UpscaleSystem::event_type) { upscale_events.Advance(); }};
+    CHECK_FALSE(upscale.BorrowFrame().valid());
+    static_cast<void>(upscale.Start({
+        .source = explore.snapshot().frame,
+    }));
+    REQUIRE(upscale_events.Wait([&] { return upscale.snapshot().ready; }));
+    REQUIRE(upscale.BorrowFrame().valid());
+    CHECK(upscale.snapshot().frame.extent.width == 128U);
+    CHECK(upscale.snapshot().frame.extent.height == 128U);
+    CHECK(selected_kernel->load(std::memory_order_acquire) == UpscaleKernel::Default);
+    static_cast<void>(upscale.Start({
+        .source = explore.snapshot().frame,
+        .kernel = UpscaleKernel::ShiftLut,
+    }));
+    REQUIRE(upscale_events.Wait([&] { return selected_kernel->load(std::memory_order_acquire) == UpscaleKernel::ShiftLut; }));
+    static_cast<void>(upscale.Start({
+        .source = explore.snapshot().frame,
+        .kernel = UpscaleKernel::RealPlksr,
+    }));
+    REQUIRE(upscale_events.Wait([&] { return selected_kernel->load(std::memory_order_acquire) == UpscaleKernel::RealPlksr; }));
+}
+
+TEST_CASE("Upscale equal extent source changes replace actual receiver pixels") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto probe = std::make_shared<UpscaleExtentProbe>();
+    UpscaleSourceFixture subject{
+        backend, {16U, 8U}, 3U, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [probe] {
+            return std::make_unique<ExtentUpscaleAlgorithm>(probe);
+        })};
+    auto& source = subject.source;
+    auto& events = subject.events;
+    auto& upscale = subject.upscale;
+    for (const auto value : {3U, 19U, 3U}) {
+        source.Publish({16U, 8U}, static_cast<std::uint8_t>(value));
+        const auto input = source.frame();
+        static_cast<void>(upscale.Start({.source = input}));
+        REQUIRE(events.Wait([&] { return upscale.snapshot().ready && upscale.snapshot().input == input; }));
+        const auto output = upscale.BorrowDocument(upscale.snapshot().frame);
+        REQUIRE(output.valid());
+        const auto plane = output.pixels.plane(0U).plane();
+        const auto* pixels = reinterpret_cast<const std::uint8_t*>(plane.data);
+        CHECK(pixels[0] == value);
+        CHECK(pixels[(plane.descriptor.height - 1U) * plane.descriptor.pitch_bytes + plane.descriptor.row_bytes() - 1U] == value);
+    }
+}
+
+TEST_CASE("Upscale exact repeats avoid copying and method switches preserve completed pixels") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    MutableVisualSource source{backend, {16U, 8U}, 3U};
+    auto kernel = std::make_shared<std::atomic<UpscaleKernel>>(UpscaleKernel::Default);
+    auto runs = std::make_shared<std::atomic_uint32_t>(0U);
+    std::atomic_uint32_t copies{0U};
+    EventGate events;
+    const VisualDiagnosticSink diagnostics{.context = &copies, .write = [](void* context, VisualDiagnosticFact fact) noexcept {
+                                               if (fact.operation == VisualDiagnosticOperation::CopyCompleted)
+                                                   static_cast<std::atomic_uint32_t*>(context)->fetch_add(1U);
+                                           }};
+    UpscaleSystem upscale{kDevice, TestUpscaleAlgorithm::CreateRuntime(backend, kernel, runs),
+                          [&source](const VisualFrame& frame) { return source.BorrowExact(frame); },
+                          [&events](UpscaleSystem::event_type) { events.Advance(); }, diagnostics};
+    for (const auto selected : {UpscaleKernel::Default, UpscaleKernel::ShiftLut, UpscaleKernel::Default}) {
+        const auto request = UpscaleRequest{.source = source.frame(), .kernel = selected};
+        static_cast<void>(upscale.Start(request));
+        REQUIRE(events.Wait([&] { return upscale.snapshot().ready && upscale.snapshot().kernel == selected; }));
+        const auto completed = upscale.snapshot().frame;
+        const auto copied = copies.load();
+        const auto inferred = runs->load();
+        {
+            const auto output = upscale.BorrowDocument(completed);
+            REQUIRE(output.valid());
+            CHECK(*reinterpret_cast<const std::uint8_t*>(output.pixels.plane(0U).plane().data) == static_cast<std::uint8_t>(selected) + 1U);
+        }
+        static_cast<void>(upscale.Start(request));
+        REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
+        CHECK(upscale.snapshot().frame == completed);
+        CHECK(copies.load() == copied);
+        CHECK(runs->load() == inferred);
+    }
+    CHECK(runs->load() == 3U);
+    const auto previous = source.frame();
+    source.Publish(previous.extent, 19U);
+    static_cast<void>(upscale.Start({.source = source.frame()}));
+    REQUIRE(events.Wait([&] { return upscale.snapshot().ready && upscale.snapshot().input == source.frame(); }));
+    CHECK(runs->load() == 4U);
+    auto cropped = source.frame();
+    cropped.content = {1U, 1U, 4U, 3U};
+    static_cast<void>(upscale.Start({.source = cropped}));
+    REQUIRE(events.Wait([&] { return upscale.snapshot().ready && upscale.snapshot().input == cropped; }));
+    CHECK(runs->load() == 5U);
+}
+
+TEST_CASE("Upscale semantic revisions reuse clean pixels and retain exact input provenance") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    MutableVisualSource source{backend, {16U, 8U}, 3U};
+    auto kernel = std::make_shared<std::atomic<UpscaleKernel>>(UpscaleKernel::Default);
+    auto runs = std::make_shared<std::atomic_uint32_t>(0U);
+    EventGate events;
+    UpscaleSystem upscale{kDevice, TestUpscaleAlgorithm::CreateRuntime(backend, kernel, runs),
+                          [&source](const VisualFrame& frame) { return source.BorrowExact(frame); },
+                          [&events](UpscaleSystem::event_type) { events.Advance(); }};
+    const auto initial = source.frame();
+    static_cast<void>(upscale.Start({.source = initial}));
+    REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
+    const auto clean_revision = upscale.snapshot().frame.clean_revision;
+    CHECK(upscale.snapshot().input == initial);
+    source.SetSemantics(55U);
+    const auto current = source.frame();
+    REQUIRE(current.clean_revision == initial.clean_revision);
+    REQUIRE(current.revision != initial.revision);
+    static_cast<void>(upscale.Start({.source = current}));
+    REQUIRE(events.Wait([&] { return upscale.snapshot().ready && upscale.snapshot().input == current; }));
+    CHECK(runs->load(std::memory_order_acquire) == 1U);
+    CHECK(upscale.snapshot().frame.clean_revision == clean_revision);
+    const auto output = upscale.BorrowDocument(upscale.snapshot().frame);
+    REQUIRE(output.valid());
+    REQUIRE(output.pixels.plane_count() == 2U);
+    CHECK(*reinterpret_cast<const std::uint8_t*>(output.pixels.plane(0U).plane().data) == 1U);
+    CHECK(*reinterpret_cast<const std::uint8_t*>(output.pixels.plane(1U).plane().data) == 55U);
+    CHECK(output.document->scene.categories.size() == 1U);
+}
+
+TEST_CASE("Upscale publishes only the newest selected kernel after obsolete device work settles") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    MutableVisualSource source{backend, {16U, 8U}};
+    auto kernel = std::make_shared<std::atomic<UpscaleKernel>>(UpscaleKernel::Default);
+    auto runs = std::make_shared<std::atomic_uint32_t>(0U);
+    auto gate = std::make_shared<MutationCommitProbe>();
+    auto entered = gate->committed.get_future();
+    std::atomic_uint32_t ready_publications{0U};
+    EventGate events;
+    UpscaleSystem upscale{kDevice,
+                          RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+                                         [kernel, gate, runs] { return std::make_unique<TestUpscaleAlgorithm>(kernel, gate, runs); }),
+                          [&source](const VisualFrame& frame) { return source.BorrowExact(frame); },
+                          [&](UpscaleSystem::event_type event) {
+                              if (const auto* changed = std::get_if<UpscaleChanged>(&event); changed && changed->snapshot.ready)
+                                  ready_publications.fetch_add(1U, std::memory_order_acq_rel);
+                              events.Advance();
+                          }};
+    static_cast<void>(upscale.Start({.source = source.frame()}));
+    REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+    static_cast<void>(upscale.Start({.source = source.frame(), .kernel = UpscaleKernel::ShiftLut}));
+    static_cast<void>(upscale.Start({.source = source.frame(), .kernel = UpscaleKernel::RealPlksr}));
+    CHECK_FALSE(upscale.snapshot().ready);
+    gate->release.set_value();
+    REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
+    CHECK(upscale.snapshot().kernel == UpscaleKernel::RealPlksr);
+    CHECK(upscale.snapshot().input == source.frame());
+    CHECK(runs->load(std::memory_order_acquire) == 2U);
+    CHECK(ready_publications.load(std::memory_order_acquire) == 1U);
+}
+
+TEST_CASE("Upscale Stop reaches active latest work after its receiver copy settles") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    MutableVisualSource source{backend, {16U, 8U}};
+    auto kernel = std::make_shared<std::atomic<UpscaleKernel>>(UpscaleKernel::Default);
+    auto runs = std::make_shared<std::atomic_uint32_t>(0U);
+    struct CopyGate final {
+        std::atomic_bool first{true};
+        std::promise<void> copied;
+        std::promise<void> release;
+        std::shared_future<void> released = release.get_future().share();
+    } gate;
+    const VisualDiagnosticSink diagnostics{
+        .context = &gate, .write = [](void* context, VisualDiagnosticFact fact) noexcept {
+            auto& current = *static_cast<CopyGate*>(context);
+            if (fact.operation == VisualDiagnosticOperation::CopyCompleted && current.first.exchange(false)) {
+                current.copied.set_value();
+                current.released.wait();
+            }
+        }};
+    EventGate events;
+    UpscaleSystem upscale{kDevice, TestUpscaleAlgorithm::CreateRuntime(backend, kernel, runs),
+                          [&source](const VisualFrame& frame) { return source.BorrowExact(frame); },
+                          [&events](UpscaleSystem::event_type) { events.Advance(); }, diagnostics};
+    static_cast<void>(upscale.Start({.source = source.frame()}));
+    REQUIRE(gate.copied.get_future().wait_for(2s) == std::future_status::ready);
+    upscale.Stop();
+    CHECK_FALSE(upscale.snapshot().busy);
+    CHECK_FALSE(upscale.snapshot().ready);
+    gate.release.set_value();
+    static_cast<void>(upscale.Start({.source = source.frame()}));
+    REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
+    CHECK(runs->load(std::memory_order_acquire) == 1U);
+    CHECK(upscale.snapshot().input == source.frame());
+}
+
+// CLEANUP-IGNORE: Warm idempotence and injected release-failure custody use distinct algorithms and lifecycle
+// assertions.
+TEST_CASE("Upscale warm activates every mode once and repeated ready signals are idempotent") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto activation = std::make_shared<UpscaleActivationProbe>();
+    auto completed = activation->first_warm_completed.get_future();
+    UpscaleSystem upscale{kDevice,
+                          RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+                                         [activation] { return std::make_unique<ActivationUpscaleAlgorithm>(activation); }),
+                          [](const VisualFrame&) { return VisualDocumentRead{}; }};
+
+    upscale.Warm();
+    upscale.Warm();
+    REQUIRE(completed.wait_for(2s) == std::future_status::ready);
+    upscale.Warm();
+    CHECK(activation->warms.load(std::memory_order_acquire) == 1U);
+    for (const auto& ready : activation->ready)
+        CHECK(ready.load(std::memory_order_acquire));
+}
+
+TEST_CASE("Upscale CUDA tile replay preserves reference pixels and pitched receiver storage", "[upscale_gpu]") {
+    if (!has_cuda_device()) SKIP("CUDA device unavailable");
+    using namespace mmltk::frameworks::gpu;
+    struct ReferenceEnvironment final {
+        std::optional<std::string> prior;
+        ReferenceEnvironment() {
+            if (const auto* value = std::getenv("MMLTK_UPSCALE_ONNX_REFERENCE")) prior = value;
+        }
+        ~ReferenceEnvironment() {
+            if (prior)
+                static_cast<void>(::setenv("MMLTK_UPSCALE_ONNX_REFERENCE", prior->c_str(), 1));
+            else
+                static_cast<void>(::unsetenv("MMLTK_UPSCALE_ONNX_REFERENCE"));
+        }
+    } environment;
+    constexpr std::uint32_t width = 197U, height = 193U;
+    SystemImageRuntime source{{.device = 0, .context_mode = DeviceContextMode::PrimaryInterop}};
+    SystemImageRuntime readback{{.device = 0, .context_mode = DeviceContextMode::PrimaryInterop}};
+    source.BeginWork();
+    auto staging = PinnedHostBuffer::ForCurrentDevice();
+    staging->ensure_bytes(width * height * 4U);
+    auto* pixels = static_cast<std::uint8_t*>(staging->data());
+    std::array<std::vector<std::uint8_t>, 6U> reference;
+    for (const bool reference_run : {true, false}) {
+        REQUIRE(::setenv("MMLTK_UPSCALE_ONNX_REFERENCE", reference_run ? "1" : "0", 1) == 0);
+        auto runtime = make_native_upscale_runtime_factory(kDevice)();
+        runtime->BeginWork();
+        auto* model = dynamic_cast<UpscaleAlgorithm*>(runtime->model());
+        REQUIRE(model != nullptr);
+        CUdeviceptr previous_input = 0U, previous_output = 0U;
+        for (std::size_t iteration = 0U; iteration < (reference_run ? 6U : 12U); ++iteration) {
+            const auto pattern = iteration % 2U;
+            const auto method = static_cast<UpscaleKernel>((iteration / 2U) % 3U);
+            CAPTURE(reference_run, iteration, method);
+            for (std::uint32_t y = 0U; y < height; ++y) {
+                for (std::uint32_t x = 0U; x < width; ++x) {
+                    const auto pixel = (static_cast<std::size_t>(y) * width + x) * 4U;
+                    pixels[pixel] = static_cast<std::uint8_t>((x * 7U + y * 3U + pattern * 73U) % 256U);
+                    pixels[pixel + 1U] = static_cast<std::uint8_t>((x ^ y) + pattern * 41U);
+                    pixels[pixel + 2U] = static_cast<std::uint8_t>((x * y + pattern * 109U) % 256U);
+                    pixels[pixel + 3U] = 255U;
+                }
+            }
+            source.Publish(width, height, [&](const auto clean, const auto, const auto stream) {
+                CUDA_MEMCPY2D upload{};
+                upload.srcMemoryType = CU_MEMORYTYPE_HOST;
+                upload.srcHost = pixels;
+                upload.srcPitch = width * 4U;
+                upload.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+                upload.dstDevice = clean.data;
+                upload.dstPitch = clean.descriptor.pitch_bytes;
+                upload.WidthInBytes = width * 4U;
+                upload.Height = height;
+                REQUIRE(cuMemcpy2DAsync(&upload, reinterpret_cast<CUstream>(stream)) == CUDA_SUCCESS);
+            });
+            const auto copied = runtime->CopyInputFrom(
+                source.Borrow(), [model](const auto plane, const auto stream) { model->Semantics({}, plane, stream); });
+            CHECK(copied[0U] == ImageCopyPath::SameDevice);
+            const auto input = runtime->BorrowInput();
+            REQUIRE(input.valid());
+            const auto input_plane = input.plane(0U).plane();
+            if (previous_input != 0U) CHECK(input_plane.data == previous_input);
+            previous_input = input_plane.data;
+            CHECK(input_plane.descriptor.pitch_bytes >= width * 4U);
+            CHECK(input_plane.descriptor.pitch_bytes % 16U == 0U);
+            runtime->Publish(width * 4U, height * 4U, [model, &input, method](const auto clean, const auto semantic, const auto stream) {
+                model->Run(method, input.plane(0U).plane(), clean, stream);
+                model->Semantics({}, semantic, stream);
+            });
+            // The receiver-copy boundary waits for producer completion before
+            // this test-only readback. Product execution never reads through CPU memory.
+            CHECK(readback.CopyFrom(runtime->Borrow())[0U] == ImageCopyPath::SameDevice);
+            {
+                const auto output = runtime->Borrow();
+                const auto plane = output.plane(0U).plane();
+                if (previous_output != 0U) CHECK(plane.data == previous_output);
+                previous_output = plane.data;
+                CHECK(plane.descriptor.pitch_bytes % 16U == 0U);
+            }
+            const auto returned = readback.Borrow();
+            const auto plane = returned.plane(0U).plane();
+            std::vector<std::uint8_t> actual(static_cast<std::size_t>(width) * height * 64U);
+            CUDA_MEMCPY2D download{};
+            download.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+            download.srcDevice = plane.data;
+            download.srcPitch = plane.descriptor.pitch_bytes;
+            download.dstMemoryType = CU_MEMORYTYPE_HOST;
+            download.dstHost = actual.data();
+            download.dstPitch = width * 16U;
+            download.WidthInBytes = width * 16U;
+            download.Height = height * 4U;
+            REQUIRE(cuMemcpy2D(&download) == CUDA_SUCCESS);
+            if (reference_run)
+                reference[iteration] = std::move(actual);
+            else
+                CHECK(actual == reference[iteration % reference.size()]);
+        }
+        REQUIRE(runtime->Retire().safe_to_destroy);
+    }
+}
+
+TEST_CASE("Native Upscale warm aggregate retires before model and primary context destruction") {
+    if (!has_cuda_device()) SKIP("CUDA device unavailable");
+
+    auto runtime = make_native_upscale_runtime_factory(kDevice)();
+    runtime->BeginWork();
+    auto* const model = dynamic_cast<UpscaleAlgorithm*>(runtime->model());
+    REQUIRE(model != nullptr);
+    model->Warm();
+
+    const auto retirement = runtime->Retire();
+    CHECK(retirement.safe_to_destroy);
+    CHECK_FALSE(retirement.failure);
+    CHECK_FALSE(retirement.custody.valid());
+    CHECK_NOTHROW(runtime.reset());
+}
+
+TEST_CASE("Warmed Upscale retains physical custody when model release fails") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto release = std::make_shared<UpscaleReleaseFailureProbe>();
+    auto warmed = release->warmed.get_future();
+    UpscaleSystem upscale{kDevice,
+                          RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+                                         [release] { return std::make_unique<ReleaseFailingUpscaleAlgorithm>(release); }),
+                          [](const VisualFrame&) { return VisualDocumentRead{}; }};
+
+    upscale.Warm();
+    REQUIRE(warmed.wait_for(2s) == std::future_status::ready);
+    upscale.Shutdown();
+    CHECK(upscale.stopped());
+    CHECK(release->releases.load(std::memory_order_acquire) == 1U);
+    CHECK_FALSE(release->destroyed.load(std::memory_order_acquire));
+    CHECK(backend->contexts_destroyed.load(std::memory_order_acquire) == 0U);
+    CHECK(backend->streams_destroyed.load(std::memory_order_acquire) == 0U);
+}
+
+TEST_CASE("Upscale Start cannot pass admitted Warm before its ordered enqueue") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    MutableVisualSource source{backend, {20U, 12U}, 7U};
+    auto activation = std::make_shared<UpscaleActivationProbe>();
+    activation->hold_warm.store(true, std::memory_order_release);
+    auto warm_entered = activation->warm_entered.get_future();
+    UpscaleWarmAdmissionGate warm_admission;
+    auto warm_admission_entered = warm_admission.entered();
+    std::promise<void> borrower_entered;
+    auto borrower_reached = borrower_entered.get_future();
+    std::promise<void> borrower_release;
+    const auto borrower_released = borrower_release.get_future().share();
+    EventGate events;
+    UpscaleSystem upscale{kDevice,
+                          RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+                                         [activation] { return std::make_unique<ActivationUpscaleAlgorithm>(activation); }),
+                          [&source, &borrower_entered, borrower_released](const VisualFrame& frame) {
+                              auto borrowed = source.BorrowExact(frame);
+                              borrower_entered.set_value();
+                              borrower_released.wait();
+                              return borrowed;
+                          },
+                          [&events](UpscaleSystem::event_type) { events.Advance(); }, warm_admission.sink()};
+
+    auto starting = std::async(std::launch::async, [&upscale, &source] { return upscale.Start({.source = source.frame()}); });
+    const bool borrower_blocked = borrower_reached.wait_for(2s) == std::future_status::ready;
+    if (!borrower_blocked) borrower_release.set_value();
+    REQUIRE(borrower_blocked);
+
+    auto warming = std::async(std::launch::async, [&upscale] { upscale.Warm(); });
+    const bool admission_held = warm_admission_entered.wait_for(2s) == std::future_status::ready;
+    if (!admission_held) {
+        borrower_release.set_value();
+        warm_admission.Release();
+        activation->warm_release.set_value();
+    }
+    REQUIRE(admission_held);
+    borrower_release.set_value();
+    CHECK(starting.wait_for(100ms) == std::future_status::timeout);
+    CHECK(warming.wait_for(0ms) == std::future_status::timeout);
+    CHECK(activation->warms.load(std::memory_order_acquire) == 0U);
+
+    warm_admission.Release();
+    const bool warm_queued = warming.wait_for(2s) == std::future_status::ready;
+    if (!warm_queued) activation->warm_release.set_value();
+    REQUIRE(warm_queued);
+    warming.get();
+    const bool warm_blocked = warm_entered.wait_for(2s) == std::future_status::ready;
+    if (!warm_blocked) { activation->warm_release.set_value(); }
+    REQUIRE(warm_blocked);
+    const bool start_admitted = starting.wait_for(2s) == std::future_status::ready;
+    if (!start_admitted) activation->warm_release.set_value();
+    REQUIRE(start_admitted);
+    const auto admitted = starting.get();
+    CHECK(admitted.busy);
+    CHECK(activation->runs.load(std::memory_order_acquire) == 0U);
+    activation->warm_release.set_value();
+    REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
+    CHECK(activation->runs.load(std::memory_order_acquire) == 1U);
+    CHECK(activation->fallback_activations.load(std::memory_order_acquire) == 0U);
+}
+
+TEST_CASE("Upscale warm failure is isolated and Start retains first-use activation fallback") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    MutableVisualSource source{backend, {18U, 10U}, 5U};
+    auto activation = std::make_shared<UpscaleActivationProbe>();
+    activation->fail_warm.store(true, std::memory_order_release);
+    std::promise<void> warm_failed;
+    EventGate events;
+    UpscaleSystem upscale{kDevice,
+                          RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+                                         [activation] { return std::make_unique<ActivationUpscaleAlgorithm>(activation); }),
+                          [&source](const VisualFrame& frame) { return source.BorrowExact(frame); },
+                          [&warm_failed, &events](UpscaleSystem::event_type event) {
+                              if (std::holds_alternative<UpscaleFailed>(event)) warm_failed.set_value();
+                              events.Advance();
+                          }};
+
+    upscale.Warm();
+    REQUIRE(warm_failed.get_future().wait_for(2s) == std::future_status::ready);
+    upscale.Warm();
+    CHECK(activation->warms.load(std::memory_order_acquire) == 1U);
+    CHECK_FALSE(upscale.snapshot().busy);
+    CHECK_FALSE(upscale.snapshot().ready);
+    static_cast<void>(upscale.Start({.source = source.frame(), .kernel = UpscaleKernel::RealPlksr}));
+    REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
+    CHECK(activation->runs.load(std::memory_order_acquire) == 1U);
+    CHECK(activation->fallback_activations.load(std::memory_order_acquire) == 1U);
+    for (const auto& ready : activation->ready)
+        CHECK(ready.load(std::memory_order_acquire));
+}
+
+TEST_CASE("Upscale exact-frame admission separates invalid kernels from unavailable sources") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    MutableVisualSource source{backend, {24U, 15U}};
+    auto selected_kernel = std::make_shared<std::atomic<UpscaleKernel>>(UpscaleKernel::Default);
+    std::atomic<std::size_t> borrows{0U};
+    UpscaleSystem upscale{kDevice,
+                          RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+                                         [selected_kernel] { return std::make_unique<TestUpscaleAlgorithm>(selected_kernel); }),
+                          [&source, &borrows](const VisualFrame& frame) {
+                              borrows.fetch_add(1U, std::memory_order_acq_rel);
+                              return source.BorrowExact(frame);
+                          }};
+    const auto current = source.frame();
+
+    CHECK_THROWS_AS(upscale.Start({.source = current, .kernel = static_cast<UpscaleKernel>(255U)}), contracts::InvalidIntentError);
+    CHECK(borrows.load(std::memory_order_acquire) == 0U);
+    CHECK_THROWS_AS(upscale.Start({.source = visual_frame(current.source, current.extent, current.revision + 1U)}),
+                    contracts::UnavailableError);
+    CHECK_THROWS_AS(
+        upscale.Start({.source = visual_frame(current.source, {current.extent.width + 1U, current.extent.height}, current.revision)}),
+        contracts::UnavailableError);
+    CHECK_THROWS_AS(upscale.Start({.source = visual_frame({PresentationSourceKind::Explore, 2U}, current.extent, current.revision)}),
+                    contracts::UnavailableError);
+    CHECK_THROWS_AS(upscale.Start({.source = {}}), contracts::UnavailableError);
+    CHECK(borrows.load(std::memory_order_acquire) == 4U);
+}
+
+TEST_CASE("Upscale copies the admitted exact revision before a source update can replace it") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    backend->defer_same_device_copies.store(true, std::memory_order_release);
+    auto race = std::make_shared<UpscaleAdmissionRaceProbe>();
+    UpscaleSourceFixture subject{
+        backend, {24U, 15U}, 11U, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [race] {
+            return std::make_unique<RacingUpscaleAlgorithm>(race);
+        })};
+    auto& source = subject.source;
+    auto& events = subject.events;
+    auto& upscale = subject.upscale;
+    const auto admitted_frame = source.frame();
+
+    static_cast<void>(upscale.Start({.source = admitted_frame}));
+    const bool copy_entered = backend->WaitForSameDeviceCopy(2s);
+    if (!copy_entered) backend->CompleteSameDeviceCopies();
+    REQUIRE(copy_entered);
+    auto replacement = std::async(std::launch::async, [&source] { source.Publish({24U, 15U}, 29U); });
+    CHECK(replacement.wait_for(100ms) == std::future_status::timeout);
+    backend->CompleteSameDeviceCopies();
+    REQUIRE(replacement.wait_for(2s) == std::future_status::ready);
+    replacement.get();
+    CHECK(source.frame().revision > admitted_frame.revision);
+    REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
+    CHECK(backend->same_copies.load(std::memory_order_acquire) == 2U);
+    CHECK(race->received_value.load(std::memory_order_acquire) == 11U);
+    CHECK(race->received_width.load(std::memory_order_acquire) == admitted_frame.extent.width);
+    CHECK(race->received_height.load(std::memory_order_acquire) == admitted_frame.extent.height);
+    auto product = upscale.BorrowFrame();
+    REQUIRE(product.valid());
+    CHECK(*reinterpret_cast<const std::uint8_t*>(product.plane(0U).plane().data) == 11U);
+}
+
+TEST_CASE("Upscale derives a checked fixed output envelope") {
+    CHECK(kUpscaleOutputScale == 4U);
+    CHECK((checked_upscale_output_extent({1U, 1U}) == VisualExtent{4U, 4U}));
+    CHECK((checked_upscale_output_extent({320U, 180U}) == VisualExtent{1280U, 720U}));
+    CHECK_THROWS_AS(checked_upscale_output_extent({}), contracts::InvalidIntentError);
+    CHECK_THROWS_AS(checked_upscale_output_extent({std::numeric_limits<std::uint32_t>::max() / kUpscaleOutputScale + 1U, 1U}),
+                    contracts::InvalidIntentError);
+    CHECK_THROWS_AS(checked_upscale_output_extent({1U, std::numeric_limits<std::uint32_t>::max() / kUpscaleOutputScale + 1U}),
+                    contracts::InvalidIntentError);
+}
+
+TEST_CASE("Upscale accepts output beyond the source systems base envelope") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    OpenedExplore opened_explore{backend, {64U, 64U}};
+    auto& explore = opened_explore.system();
+    auto selected_kernel = std::make_shared<std::atomic<UpscaleKernel>>(UpscaleKernel::Default);
+    EventGate events;
+    const VisualDeviceSettings base_envelope{
+        .device = kDevice.device,
+        .maximum_width = 64U,
+        .maximum_height = 64U,
+    };
+    const VisualDeviceSettings output_envelope{
+        .device = kDevice.device,
+        .maximum_width = 256U,
+        .maximum_height = 256U,
+    };
+    CHECK(explore.snapshot().frame.extent.width <= base_envelope.maximum_width);
+    // CLEANUP-IGNORE: The base-envelope assertion and later high-water scenario setup are unrelated test operations.
+    CHECK(explore.snapshot().frame.extent.height <= base_envelope.maximum_height);
+    UpscaleSystem upscale{output_envelope,
+                          RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+                                         // CLEANUP-IGNORE: Upscale Start and Annotation Open are distinct typed runtime paths.
+                                         [selected_kernel] { return std::make_unique<TestUpscaleAlgorithm>(selected_kernel); }),
+                          borrow_exactly_from(explore), [&events](UpscaleSystem::event_type) { events.Advance(); }};
+
+    static_cast<void>(upscale.Start({.source = explore.snapshot().frame}));
+    REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
+    CHECK((upscale.snapshot().frame.extent == VisualExtent{256U, 256U}));
+    REQUIRE(upscale.BorrowFrame().valid());
+    CHECK(upscale.BorrowFrame().plane(0U).plane().descriptor.width == 256U);
+    CHECK(upscale.BorrowFrame().plane(0U).plane().descriptor.height == 256U);
+
+    const std::array sources{read_from(explore), read_from(upscale)};
+    auto writer_state = std::make_shared<TestPresentationWriterState>();
+    auto allocation_retired = writer_state->allocation_retired.get_future();
+    EventGate presentation_events;
+    PresentationSystem presentation{
+        output_envelope, [backend, writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); },
+        std::span{sources}, [&presentation_events](PresentationSystem::event_type) { presentation_events.Advance(); }};
+    static_cast<void>(presentation.Select(sources[0].source));
+    writer_state->SignalReadiness();
+    REQUIRE(presentation_events.Wait([&] { return presentation.snapshot().completed.source == sources[0].source; }));
+    CHECK((presentation.snapshot().capability.extent == VisualExtent{64U, 64U}));
+    const auto initial_generation = presentation.snapshot().capability.generation;
+
+    static_cast<void>(presentation.Select(sources[1].source));
+    writer_state->SignalReadiness();
+    REQUIRE(presentation_events.Wait([&] { return presentation.snapshot().completed.source == sources[1].source; }));
+    CHECK((presentation.snapshot().capability.extent == VisualExtent{256U, 256U}));
+    CHECK(presentation.snapshot().capability.generation > initial_generation);
+    CHECK(presentation.snapshot().completed.revision == upscale.snapshot().frame.revision);
+    CHECK(writer_state->allocation_retirements.load(std::memory_order_acquire) == 0U);
+    CHECK(writer_state->retained_allocation_generation.load(std::memory_order_acquire) == initial_generation);
+    CHECK(allocation_retired.wait_for(0s) == std::future_status::timeout);
+    writer_state->AcknowledgeAllocationRetirement(initial_generation);
+    REQUIRE(allocation_retired.wait_for(2s) == std::future_status::ready);
+    CHECK(writer_state->allocation_retirements.load(std::memory_order_acquire) == 1U);
+    CHECK(writer_state->retained_allocation_generation.load(std::memory_order_acquire) == 0U);
+    const auto pump_count = writer_state->PumpCount();
+    writer_state->AcknowledgeAllocationRetirement(initial_generation);
+    REQUIRE(writer_state->WaitForPumpAfter(pump_count));
+    CHECK(writer_state->allocation_retirements.load(std::memory_order_acquire) == 1U);
+    presentation.CloseAdmission();
+    presentation.BrowserPeerLost();
+    CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
+    upscale.Shutdown();
+    CHECK(upscale.stopped());
+}
+
+TEST_CASE("Upscale and Presentation preserve complete non-square four-times high-water storage") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    OpenedExplore opened_explore{backend, {80U, 40U}};
+    auto& source = opened_explore.system();
+    auto extents = std::make_shared<UpscaleExtentProbe>();
+    EventGate upscale_events;
+    UpscaleSystem upscale{kDevice,
+                          RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+                                         [extents] { return std::make_unique<ExtentUpscaleAlgorithm>(extents); }),
+                          borrow_exactly_from(source), [&upscale_events](UpscaleSystem::event_type) { upscale_events.Advance(); }};
+
+    static_cast<void>(upscale.Start({.source = source.snapshot().frame}));
+    REQUIRE(upscale_events.Wait([&] { return upscale.snapshot().ready; }));
+    REQUIRE((upscale.snapshot().frame.extent == VisualExtent{320U, 160U}));
+    REQUIRE(upscale.BorrowFrame().valid());
+    const auto large_output = upscale.BorrowFrame().plane(0U).plane();
+    CHECK(large_output.descriptor.width == 320U);
+    CHECK(large_output.descriptor.height == 160U);
+    REQUIRE(extents->sources.size() == 1U);
+    REQUIRE(extents->targets.size() == 1U);
+    CHECK(extents->sources[0U].descriptor.width == 80U);
+    CHECK(extents->sources[0U].descriptor.height == 40U);
+    CHECK(extents->targets[0U].descriptor.width == 320U);
+    CHECK(extents->targets[0U].descriptor.height == 160U);
+    const auto input_address = extents->sources[0U].data;
+    const auto output_address = extents->targets[0U].data;
+
+    const std::array presentation_sources{read_from(upscale), read_from(source)};
+    auto writer_state = std::make_shared<TestPresentationWriterState>();
+    EventGate presentation_events;
+    PresentationSystem presentation{
+        kDevice, [backend, writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); },
+        presentation_sources, [&presentation_events](PresentationSystem::event_type) { presentation_events.Advance(); }};
+    present_and_wait(presentation, *writer_state, presentation_events, presentation_sources[0U], upscale.snapshot().frame.revision);
+    CHECK((presentation.snapshot().completed.extent == VisualExtent{320U, 160U}));
+    CHECK((presentation.snapshot().capability.extent == VisualExtent{320U, 160U}));
+    const auto allocations_at_high_water = backend->planes_allocated.load(std::memory_order_acquire);
+    const auto copies_at_high_water = backend->same_copies.load(std::memory_order_acquire);
+    CHECK(backend->staged_downloads.load(std::memory_order_acquire) == 0U);
+    CHECK(backend->staged_uploads.load(std::memory_order_acquire) == 0U);
+
+    opened_explore.Reopen({32U, 16U});
+    static_cast<void>(upscale.Start({.source = source.snapshot().frame, .kernel = UpscaleKernel::ShiftLut}));
+    REQUIRE(upscale_events.Wait([&] { return upscale.snapshot().ready && upscale.snapshot().frame.extent == VisualExtent{128U, 64U}; }));
+    REQUIRE(extents->sources.size() == 2U);
+    REQUIRE(extents->targets.size() == 2U);
+    CHECK(extents->sources[1U].data == input_address);
+    CHECK(extents->targets[1U].data == output_address);
+    CHECK(backend->planes_allocated.load(std::memory_order_acquire) == allocations_at_high_water);
+
+    present_and_wait(presentation, *writer_state, presentation_events, presentation_sources[0U], upscale.snapshot().frame.revision);
+    CHECK((presentation.snapshot().completed.extent == VisualExtent{128U, 64U}));
+    CHECK((presentation.snapshot().capability.extent == VisualExtent{320U, 160U}));
+    CHECK(backend->planes_allocated.load(std::memory_order_acquire) == allocations_at_high_water);
+    CHECK(backend->same_copies.load(std::memory_order_acquire) == copies_at_high_water + 3U);
+    CHECK(backend->staged_downloads.load(std::memory_order_acquire) == 0U);
+    CHECK(backend->staged_uploads.load(std::memory_order_acquire) == 0U);
+    presentation.CloseAdmission();
+    presentation.BrowserPeerLost();
+    CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
+    upscale.Shutdown();
+    CHECK(upscale.stopped());
+    CHECK(backend->contexts_destroyed.load(std::memory_order_acquire) >= 2U);
+}
+
+TEST_CASE("Presentation serializes consecutive growth through exact retirement acknowledgements") {
+    ProductPresentationSources products;
+    const auto sources = products.sources();
+    REQUIRE(sources.size() >= 5U);
+    auto writer_state = std::make_shared<TestPresentationWriterState>();
+    auto third_submission = writer_state->third_submission.get_future();
+    EventGate events;
+    PresentationSystem presentation{
+        kDevice,
+        [backend = products.backend(), writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); },
+        sources, [&events](PresentationSystem::event_type) { events.Advance(); }};
+
+    const auto source_a = sources[0].source;
+    const auto source_b = sources[2].source;
+    const auto source_c = sources[4].source;
+    static_cast<void>(presentation.Select(source_a));
+    writer_state->SignalReadiness();
+    REQUIRE(events.Wait([&] { return presentation.snapshot().completed.source == source_a; }));
+    const auto generation_a = presentation.snapshot().capability.generation;
+
+    static_cast<void>(presentation.Select(source_b));
+    writer_state->SignalReadiness();
+    REQUIRE(events.Wait([&] { return presentation.snapshot().completed.source == source_b; }));
+    const auto generation_b = presentation.snapshot().capability.generation;
+    REQUIRE(generation_b > generation_a);
+    CHECK(writer_state->retained_allocation_generation.load(std::memory_order_acquire) == generation_a);
+    CHECK(writer_state->allocation_retirements.load(std::memory_order_acquire) == 0U);
+
+    static_cast<void>(presentation.Select(source_c));
+    writer_state->SignalReadiness();
+    REQUIRE(third_submission.wait_for(2s) == std::future_status::ready);
+    CHECK(presentation.snapshot().completed.source == source_b);
+    CHECK(writer_state->retained_allocation_generation.load(std::memory_order_acquire) == generation_a);
+    CHECK(writer_state->allocation_retirements.load(std::memory_order_acquire) == 0U);
+
+    auto pump_count = writer_state->PumpCount();
+    writer_state->AcknowledgeAllocationRetirement(generation_b);
+    REQUIRE(writer_state->WaitForPumpAfter(pump_count));
+    CHECK(writer_state->retained_allocation_generation.load(std::memory_order_acquire) == generation_a);
+    CHECK(writer_state->allocation_retirements.load(std::memory_order_acquire) == 0U);
+
+    writer_state->AcknowledgeAllocationRetirement(generation_a);
+    REQUIRE(events.Wait([&] { return presentation.snapshot().completed.source == source_c; }));
+    CHECK(presentation.snapshot().completed.revision == sources[4].latest().revision);
+    CHECK(presentation.snapshot().capability.generation > generation_b);
+    CHECK(writer_state->allocation_retirements.load(std::memory_order_acquire) == 1U);
+    CHECK(writer_state->retained_allocation_generation.load(std::memory_order_acquire) == generation_b);
+
+    pump_count = writer_state->PumpCount();
+    writer_state->AcknowledgeAllocationRetirement(generation_a);
+    REQUIRE(writer_state->WaitForPumpAfter(pump_count));
+    CHECK(writer_state->allocation_retirements.load(std::memory_order_acquire) == 1U);
+    CHECK(writer_state->retained_allocation_generation.load(std::memory_order_acquire) == generation_b);
+
+    pump_count = writer_state->PumpCount();
+    writer_state->AcknowledgeAllocationRetirement(generation_b);
+    REQUIRE(writer_state->WaitForPumpAfter(pump_count));
+    CHECK(writer_state->allocation_retirements.load(std::memory_order_acquire) == 2U);
+    CHECK(writer_state->retained_allocation_generation.load(std::memory_order_acquire) == 0U);
+
+    presentation.CloseAdmission();
+    presentation.BrowserPeerLost();
+    CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
+}
+
+TEST_CASE("Upscale invalid exact-source admission preserves the active operation snapshot") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    OpenedExplore opened_explore{backend, {32U, 32U}};
+    auto& explore = opened_explore.system();
+    auto selected_kernel = std::make_shared<std::atomic<UpscaleKernel>>(UpscaleKernel::Default);
+    auto gate = std::make_shared<MutationCommitProbe>();
+    auto entered = gate->committed.get_future();
+    EventGate events;
+    UpscaleSystem upscale{kDevice,
+                          RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+                                         [selected_kernel, gate] { return std::make_unique<TestUpscaleAlgorithm>(selected_kernel, gate); }),
+                          borrow_exactly_from(explore), [&events](UpscaleSystem::event_type) { events.Advance(); }};
+    const auto admitted = upscale.Start({
+        .source = explore.snapshot().frame,
+        .kernel = UpscaleKernel::ShiftLut,
+    });
+    REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+    CHECK_FALSE(upscale.BorrowFrame().valid());
+    CHECK_THROWS_AS(upscale.Start({
+                        .source = visual_frame({PresentationSourceKind::Explore, 99U}, {32U, 32U}, 1U),
+                        .kernel = UpscaleKernel::RealPlksr,
+                    }),
+                    contracts::UnavailableError);
+    const auto after_duplicate = upscale.snapshot();
+    CHECK(after_duplicate.revision == admitted.revision);
+    CHECK(after_duplicate.busy);
+    CHECK(after_duplicate.kernel == UpscaleKernel::ShiftLut);
+    gate->release.set_value();
+    REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
+}
+
+TEST_CASE("Presentation copies every private visual product into its exported backbuffer") {
+    ProductPresentationSources products;
+    const auto sources = products.sources();
+    EventGate events;
+    auto writer_state = std::make_shared<TestPresentationWriterState>();
+    PresentationSystem presentation{
+        kDevice,
+        [backend = products.backend(), writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); },
+        sources, [&events](PresentationSystem::event_type) { events.Advance(); }};
+
+    std::uint64_t previous_presentation_revision = 0U;
+    for (auto source = sources.rbegin(); source != sources.rend(); ++source) {
+        static_cast<void>(presentation.Select(source->source));
+        writer_state->SignalReadiness();
+        REQUIRE(events.Wait([&] { return presentation.snapshot().completed.source == source->source; }));
+        const auto published_revision = writer_state->presentation_revision.load(std::memory_order_acquire);
+        CHECK(published_revision > previous_presentation_revision);
+        CHECK(presentation.snapshot().presentation_revision == published_revision);
+        previous_presentation_revision = published_revision;
+    }
+    CHECK(writer_state->submissions.load(std::memory_order_acquire) == sources.size());
+    CHECK(writer_state->timeline.load(std::memory_order_acquire) == sources.size());
+    CHECK_THROWS_AS(presentation.Select({PresentationSourceKind::Explore, 2U}), contracts::InvalidIntentError);
+    presentation.CloseAdmission();
+    presentation.BrowserPeerLost();
+    CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
+}
+
+TEST_CASE("Synchronous admission writes retain allocation and frame provenance") {
+    mmltk::testsupport::ScopedTempDir root{"presentation-admission-diagnostics"};
+    const auto path = root.path() / "import.sock";
+    struct Capture final {
+        std::array<VisualDiagnosticFact, 2> facts{};
+        std::size_t count = 0U;
+    } capture;
+    presentation::WorkspaceSurfaceImportChannel channel{
+        path, {.context = &capture, .write = [](void* context, const VisualDiagnosticFact fact) noexcept {
+                   auto& value = *static_cast<Capture*>(context);
+                   if (value.count < value.facts.size()) value.facts[value.count++] = fact;
+               }}};
+    mmltk::common::io::ScopedFd peer{::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0)};
+    REQUIRE(peer.get() >= 0);
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    const auto text = path.string();
+    REQUIRE(text.size() < sizeof(address.sun_path));
+    std::memcpy(address.sun_path, text.c_str(), text.size() + 1U);
+    REQUIRE(::connect(peer.get(), reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0);
+    channel.pump();
+    REQUIRE(channel.connected());
+    mmltk::common::io::ScopedFd memory{::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK)};
+    mmltk::common::io::ScopedFd edge{::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK)};
+    auto signal = presentation::WorkspaceSurfaceFrameSignal::create();
+    const presentation::WorkspaceSurfaceImportId id{11U, 12U};
+    REQUIRE(channel.admit(id, 7U, 64U, 32U, 256U, 8192U, std::move(memory), edge.get(), signal.descriptor(), 19U, 23U));
+    CHECK(channel.claimable(id));
+    REQUIRE(capture.count == 2U);
+    CHECK(capture.facts[0].operation == VisualDiagnosticOperation::PresentationAdmissionEnqueued);
+    CHECK(capture.facts[1].operation == VisualDiagnosticOperation::PresentationAdmissionWritten);
+    for (const auto& fact : capture.facts) {
+        CHECK(fact.context.surface_high == id.high);
+        CHECK(fact.context.surface_low == id.low);
+        CHECK(fact.generation == 7U);
+        CHECK(fact.context.selection_generation == 19U);
+        CHECK(fact.context.frame_revision == 23U);
+        CHECK(fact.context.condition == static_cast<std::uint64_t>(PresentationCapabilityCondition::Admitted));
+    }
+}
+
+void publish_first_presentation(PresentationSystem& presentation, const PresentationSourceFixture& source,
+                                const TestPresentationWriterState& writer, EventGate& events) {
+    static_cast<void>(presentation.Select(source.identity()));
+    writer.SignalReadiness();
+    REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 1U; }));
+}
+
+TEST_CASE("Published frames retain their physical allocation while a waiting candidate is advertised") {
+    PresentationSourceFixture source;
+    EventGate events;
+    auto writer = std::make_shared<TestPresentationWriterState>();
+    writer->advertise_waiting_candidate.store(true);
+    PresentationSystem presentation{
+        kDevice, [backend = source.backend(), writer] { return std::make_unique<TestPresentationWriter>(0, backend, writer); },
+        source.sources(), [&events](PresentationSystem::event_type) { events.Advance(); }};
+    publish_first_presentation(presentation, source, *writer, events);
+    const auto completed = presentation.snapshot();
+    CHECK(completed.capability.surface_low == 1U);
+    CHECK(completed.capability.generation == 1U);
+    CHECK(completed.capability.condition == PresentationCapabilityCondition::Ready);
+    writer->allow_publication.store(false);
+    source.Advance();
+    static_cast<void>(presentation.Select(source.identity()));
+    REQUIRE(events.Wait([&] { return presentation.snapshot().capability.surface_low == 101U; }));
+    CHECK(presentation.snapshot().capability.condition == PresentationCapabilityCondition::Admitted);
+    CHECK(presentation.snapshot().completed == completed.completed);
+    presentation.CloseAdmission();
+    presentation.BrowserPeerLost();
+    REQUIRE(presentation.Shutdown() == PresentationShutdownResult::Stopped);
+}
+
+TEST_CASE("Presentation diagnostics join admitted and completed snapshots to one surface identity") {
+    PresentationSourceFixture source;
+    EventGate events;
+    struct Capture final {
+        std::mutex mutex;
+        std::vector<VisualDiagnosticFact> facts;
+    } capture;
+    capture.facts.reserve(16U);
+    const VisualDiagnosticSink diagnostics{.context = &capture, .write = [](void* context, const VisualDiagnosticFact fact) noexcept {
+                                               if (fact.operation != VisualDiagnosticOperation::PresentationCapabilityPublished &&
+                                                   fact.operation != VisualDiagnosticOperation::TimelineReady)
+                                                   return;
+                                               auto& result = *static_cast<Capture*>(context);
+                                               std::scoped_lock lock(result.mutex);
+                                               result.facts.push_back(fact);
+                                           }};
+    auto writer = std::make_shared<TestPresentationWriterState>();
+    writer->allow_publication.store(false, std::memory_order_release);
+    PresentationSystem presentation{
+        kDevice, [backend = source.backend(), writer] { return std::make_unique<TestPresentationWriter>(0, backend, writer); },
+        source.sources(), [&events](PresentationSystem::event_type) { events.Advance(); }, diagnostics};
+    static_cast<void>(presentation.Select(source.identity()));
+    REQUIRE(events.Wait([&] { return presentation.snapshot().capability.condition == PresentationCapabilityCondition::Admitted; }));
+    const auto admitted = presentation.snapshot().capability;
+    writer->allow_publication.store(true, std::memory_order_release);
+    writer->SignalReadiness();
+    REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 1U; }));
+    const auto completed = presentation.snapshot();
+    presentation.CloseAdmission();
+    presentation.BrowserPeerLost();
+    REQUIRE(presentation.Shutdown() == PresentationShutdownResult::Stopped);
+    REQUIRE_FALSE(capture.facts.empty());
+    for (const auto& fact : capture.facts) {
+        CHECK(fact.context.surface_high == admitted.surface_high);
+        CHECK(fact.context.surface_low == admitted.surface_low);
+        CHECK(fact.generation == admitted.generation);
+        CHECK(fact.context.selection_generation != 0U);
+        CHECK(fact.context.frame_revision == completed.completed.revision);
+    }
+}
+
+TEST_CASE("Presentation explicitly refreshes a selected private product") {
+    PresentationSourceFixture source;
+    EventGate events;
+    std::atomic<std::uint64_t> completed_events{0U};
+    std::atomic<std::uint64_t> last_completed_revision{0U};
+    std::atomic<std::uint64_t> last_completed_sample{0U};
+    auto writer_state = std::make_shared<TestPresentationWriterState>();
+    PresentationSystem presentation{
+        kDevice, [backend = source.backend(), writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); },
+        source.sources(),
+        [&events, &completed_events, &last_completed_revision, &last_completed_sample](PresentationSystem::event_type event) {
+            if (const auto* completed = std::get_if<PresentationCompleted>(&event)) {
+                last_completed_revision.store(completed->snapshot.revision, std::memory_order_release);
+                last_completed_sample.store(completed->snapshot.browser_completed_sample, std::memory_order_release);
+                completed_events.fetch_add(1U, std::memory_order_acq_rel);
+            }
+            events.Advance();
+        }};
+
+    publish_first_presentation(presentation, source, *writer_state, events);
+
+    const auto before_acknowledgement = presentation.snapshot();
+    const auto before_acknowledgement_events = completed_events.load(std::memory_order_acquire);
+    presentation.Observe({
+        .completed_sample = 7U,
+        .redraw_requested = false,
+    });
+    const auto acknowledged = presentation.snapshot();
+    CHECK(acknowledged.revision > before_acknowledgement.revision);
+    CHECK(acknowledged.browser_completed_sample == 7U);
+    CHECK(completed_events.load(std::memory_order_acquire) == before_acknowledgement_events + 1U);
+    CHECK(last_completed_revision.load(std::memory_order_acquire) == acknowledged.revision);
+    CHECK(last_completed_sample.load(std::memory_order_acquire) == 7U);
+
+    presentation.Observe({
+        .completed_sample = 7U,
+        .redraw_requested = false,
+    });
+    presentation.Observe({
+        .completed_sample = 6U,
+        .redraw_requested = false,
+    });
+    CHECK(presentation.snapshot().revision == acknowledged.revision);
+    CHECK(presentation.snapshot().browser_completed_sample == 7U);
+    CHECK(completed_events.load(std::memory_order_acquire) == before_acknowledgement_events + 1U);
+    CHECK(writer_state->submissions.load(std::memory_order_acquire) == 1U);
+
+    source.Advance();
+    presentation.Observe({
+        .completed_sample = 7U,
+        .redraw_requested = true,
+    });
+    writer_state->SignalReadiness();
+    REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 2U; }));
+    CHECK(writer_state->submissions.load(std::memory_order_acquire) == 2U);
+    CHECK(writer_state->timeline.load(std::memory_order_acquire) == 2U);
+    CHECK(presentation.snapshot().browser_completed_sample == 7U);
+    CHECK(completed_events.load(std::memory_order_acquire) == before_acknowledgement_events + 2U);
+
+    writer_state->allow_publication.store(false, std::memory_order_release);
+    source.Advance();
+    static_cast<void>(presentation.Select(source.identity()));
+    writer_state->SignalReadiness();
+    REQUIRE(events.Wait([&] { return presentation.snapshot().capability.condition == PresentationCapabilityCondition::Admitted; }));
+    source.Advance();
+    writer_state->allow_publication.store(true, std::memory_order_release);
+    writer_state->SignalReadiness();
+    REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 4U; }));
+    CHECK(writer_state->submissions.load(std::memory_order_acquire) == 4U);
+    CHECK(writer_state->timeline.load(std::memory_order_acquire) == 3U);
+
+    presentation.CloseAdmission();
+    presentation.BrowserPeerLost();
+    CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
+}
+
+TEST_CASE("Presentation switches sources while Live advances in background") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    OpenedExplore opened_explore{backend, {40U, 20U}};
+    auto& explore = opened_explore.system();
+
+    EventGate live_events;
+    auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
+    auto token_changed = std::make_shared<std::atomic_bool>(false);
+    LiveSystem live{kDevice, test_live_runtime_factory(backend, captures, token_changed),
+                    [&live_events](LiveSystem::event_type) { live_events.Advance(); }};
+    CHECK_FALSE(live.BorrowFrame().valid());
+    const auto admitted_live = live.Start({.extent = {80U, 45U}, .frames_per_second = 120U});
+    CHECK(admitted_live.revision != 0U);
+    CHECK_THROWS_AS(live.Start({.extent = {80U, 45U}, .frames_per_second = 120U}), contracts::BusyError);
+    REQUIRE(live_events.Wait([&] { return live.snapshot().completed_frames >= 2U; }));
+    REQUIRE(live.BorrowFrame().valid());
+    CHECK(live.snapshot().revision > admitted_live.revision);
+    const auto before_switch = live.snapshot().completed_frames;
+
+    const std::array sources{read_from(explore), read_from(live)};
+    EventGate presentation_events;
+    auto writer_state = std::make_shared<TestPresentationWriterState>();
+    writer_state->allow_publication.store(false, std::memory_order_release);
+    auto first_submission = writer_state->first_submission.get_future();
+    PresentationSystem presentation{
+        kDevice, [backend, writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); }, std::span{sources},
+        [&presentation_events](PresentationSystem::event_type) { presentation_events.Advance(); }};
+    CHECK(writer_state->constructions.load(std::memory_order_acquire) == 1U);
+    const auto first_selection = presentation.Select(sources[0].source);
+    CHECK(first_selection.revision != 0U);
+    REQUIRE(first_submission.wait_for(2s) == std::future_status::ready);
+    REQUIRE(presentation_events.Wait([&] { return presentation.snapshot().capability.valid(); }));
+    CHECK(presentation.snapshot().capability.condition == PresentationCapabilityCondition::Admitted);
+    const auto second_selection = presentation.Select(sources[1].source);
+    CHECK(second_selection.revision > first_selection.revision);
+    writer_state->allow_publication.store(true, std::memory_order_release);
+    writer_state->SignalReadiness();
+    REQUIRE(presentation_events.Wait([&] { return presentation.snapshot().completed.source == sources[1].source; }));
+    CHECK(presentation.snapshot().capability.condition == PresentationCapabilityCondition::Ready);
+    REQUIRE(live_events.Wait([&] { return live.snapshot().completed_frames > before_switch; }));
+    CHECK(presentation.snapshot().capability.extent.width == 80U);
+    CHECK(presentation.snapshot().capability.extent.height == 45U);
+    CHECK(presentation.snapshot().capability.generation != 0U);
+    CHECK(writer_state->submissions.load(std::memory_order_acquire) == 2U);
+    CHECK(writer_state->timeline.load(std::memory_order_acquire) == presentation.snapshot().timeline_ready);
+    CHECK(presentation.Shutdown() == PresentationShutdownResult::BrowserTerminalRequired);
+    CHECK_FALSE(presentation.stopped());
+    CHECK(writer_state->retirements.load(std::memory_order_acquire) == 0U);
+    presentation.CloseAdmission();
+    presentation.BrowserPeerLost();
+    presentation.BrowserPeerLost();
+    CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
+    CHECK(writer_state->browser_terminals.load(std::memory_order_acquire) == 1U);
+    CHECK(writer_state->retirements.load(std::memory_order_acquire) == 1U);
+    const auto stopping_live = live.Stop();
+    CHECK(stopping_live.running);
+    CHECK(stopping_live.cancellation_requested);
+    const auto repeated_stop = live.Stop();
+    CHECK(repeated_stop.revision >= stopping_live.revision);
+    CHECK(repeated_stop.completed_frames >= stopping_live.completed_frames);
+    if (repeated_stop.running) {
+        CHECK(repeated_stop.revision == stopping_live.revision);
+        CHECK(repeated_stop.cancellation_requested);
+    } else {
+        CHECK(repeated_stop.revision > stopping_live.revision);
+        CHECK_FALSE(repeated_stop.cancellation_requested);
+    }
+    REQUIRE(live_events.Wait([&] { return !live.snapshot().running; }));
+    REQUIRE(live.BorrowFrame().valid());
+    CHECK_FALSE(live.snapshot().cancellation_requested);
+    CHECK(live.snapshot().revision > stopping_live.revision);
+    CHECK_FALSE(token_changed->load(std::memory_order_acquire));
+}
+
+TEST_CASE("Live queued discrete cancellation settles without running obsolete work") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
+    std::promise<void> latest_entered;
+    std::promise<void> release_latest;
+    auto release = release_latest.get_future().share();
+    std::promise<void> queued_cancelled;
+    std::promise<void> active_cancelled;
+    std::atomic_bool queued_ran = false;
+    std::atomic_bool owner_failed = false;
+    detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures),
+                                     [&owner_failed](std::exception_ptr) { owner_failed.store(true, std::memory_order_release); }};
+    owner.SubmitLatest(
+        [&latest_entered, &active_cancelled, release](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token stop) mutable {
+            std::stop_callback observe_stop{stop, [&active_cancelled] { active_cancelled.set_value(); }};
+            latest_entered.set_value();
+            release.wait();
+            return detail::VisualRuntimeOwner::Notification{};
+        });
+    latest_entered.get_future().wait();
+    REQUIRE(owner.SubmitDiscrete(
+        [&queued_ran](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
+            queued_ran.store(true, std::memory_order_release);
+            return detail::VisualRuntimeOwner::Notification{};
+        },
+        [&queued_cancelled] { queued_cancelled.set_value(); }));
+    owner.RequestActiveStop();
+    REQUIRE(active_cancelled.get_future().wait_for(2s) == std::future_status::ready);
+    REQUIRE(queued_cancelled.get_future().wait_for(2s) == std::future_status::ready);
+    CHECK_FALSE(queued_ran.load(std::memory_order_acquire));
+    release_latest.set_value();
+    owner.StopAndWait();
+    CHECK_FALSE(owner_failed.load(std::memory_order_acquire));
+}
+
+TEST_CASE("visual runtime reconstructs after consecutive factory failures") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
+    auto attempts = std::make_shared<std::atomic_uint32_t>(0U);
+    auto failures = std::make_shared<std::atomic_uint32_t>(0U);
+    EventGate failure_events;
+    std::promise<void> completed;
+    auto successful = test_live_runtime_factory(backend, captures);
+    detail::VisualRuntimeOwner owner{[attempts, successful = std::move(successful)]() mutable {
+                                         if (attempts->fetch_add(1U, std::memory_order_acq_rel) < 2U)
+                                             throw std::runtime_error("deterministic construction failure");
+                                         return successful();
+                                     },
+                                     [failures, &failure_events](std::exception_ptr) {
+                                         failures->fetch_add(1U, std::memory_order_acq_rel);
+                                         failure_events.Advance();
+                                     }};
+    const auto submit = [&owner](detail::VisualRuntimeOwner::Work work) { REQUIRE(owner.SubmitDiscrete(std::move(work))); };
+    submit(no_op_visual_work);
+    REQUIRE(failure_events.Wait([&] { return failures->load(std::memory_order_acquire) == 1U; }));
+    submit(no_op_visual_work);
+    REQUIRE(failure_events.Wait([&] { return failures->load(std::memory_order_acquire) == 2U; }));
+    submit([&completed](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
+        return detail::VisualRuntimeOwner::Notification{[&completed] { completed.set_value(); }};
+    });
+    REQUIRE(completed.get_future().wait_for(2s) == std::future_status::ready);
+    CHECK(attempts->load(std::memory_order_acquire) == 3U);
+    CHECK(failures->load(std::memory_order_acquire) == 2U);
+}
+
+// CLEANUP-IGNORE: Ordered replaceable-input semantics are independent from queued discrete cancellation.
+TEST_CASE("ordered visual input retains boundaries and only the latest replaceable sample") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
+    std::promise<void> boundary_entered;
+    std::promise<void> release_boundary;
+    auto release = release_boundary.get_future().share();
+    std::promise<void> complete;
+    std::mutex values_mutex;
+    std::vector<int> values;
+    detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {}};
+    REQUIRE(owner.SubmitOrdered(
+        [&boundary_entered, release, &values_mutex, &values](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
+            {
+                std::scoped_lock lock(values_mutex);
+                values.push_back(1);
+            }
+            boundary_entered.set_value();
+            release.wait();
+            return detail::VisualRuntimeOwner::Notification{};
+        }));
+    boundary_entered.get_future().wait();
+    // CLEANUP-IGNORE: Latest/discrete and continuation submissions exercise different queue contracts using shared
+    // recording work.
+    owner.SubmitLatest(record_visual_work(values_mutex, values, 2));
+    owner.SubmitLatest(record_visual_work(values_mutex, values, 3));
+    REQUIRE(owner.SubmitDiscrete(record_visual_work(values_mutex, values, 4, &complete)));
+    release_boundary.set_value();
+    REQUIRE(complete.get_future().wait_for(2s) == std::future_status::ready);
+    owner.StopAndWait();
+    CHECK(values == std::vector<int>{1, 3, 4});
+}
+
+// CLEANUP-IGNORE: Coalescing owns a boundary gate distinct from the blocked-borrow concurrency scenario.
+TEST_CASE("visual continuations coalesce behind the newest replaceable input") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
+    std::promise<void> boundary_entered;
+    std::promise<void> release_boundary;
+    const auto release = release_boundary.get_future().share();
+    std::promise<void> completed;
+    std::mutex values_mutex;
+    std::vector<int> values;
+    detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {}};
+    REQUIRE(owner.SubmitOrdered([&](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
+        boundary_entered.set_value();
+        release.wait();
+        std::scoped_lock lock(values_mutex);
+        values.push_back(1);
+        return detail::VisualRuntimeOwner::Notification{};
+    }));
+    boundary_entered.get_future().wait();
+    owner.RegisterContinuation(record_visual_work(values_mutex, values, 4, &completed));
+    REQUIRE(owner.NotifyContinuation());
+    owner.SubmitLatest(record_visual_work(values_mutex, values, 3));
+    REQUIRE(owner.NotifyContinuation());
+    release_boundary.set_value();
+    REQUIRE(completed.get_future().wait_for(2s) == std::future_status::ready);
+    owner.StopAndWait();
+    CHECK(values == std::vector<int>{1, 3, 4});
+}
+
+// CLEANUP-IGNORE: Borrow locking requires independent promises and runtime ownership from continuation draining.
+TEST_CASE("visual completion notification remains independent of a blocked product borrow") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
+    std::promise<void> publish_entered;
+    std::promise<void> release_publish;
+    const auto release = release_publish.get_future().share();
+    std::promise<void> notified;
+    std::promise<void> borrow_locked;
+    detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {},
+                                     [&](detail::VisualRuntimeOwner::ActivityStage stage, std::uint64_t) noexcept {
+                                         if (stage == detail::VisualRuntimeOwner::ActivityStage::BorrowLocked) borrow_locked.set_value();
+                                     }};
+    owner.RegisterContinuation([&](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
+        notified.set_value();
+        return detail::VisualRuntimeOwner::Notification{};
+    });
+    REQUIRE(owner.SubmitOrdered([&](mmltk::frameworks::gpu::SystemImageRuntime& runtime, std::stop_token) {
+        runtime.Publish(8U, 8U, [&](auto, auto, auto) {
+            publish_entered.set_value();
+            release.wait();
+        });
+        return detail::VisualRuntimeOwner::Notification{};
+    }));
+    publish_entered.get_future().wait();
+    auto borrow = std::async(std::launch::async, [&] { return owner.Borrow(); });
+    borrow_locked.get_future().wait();
+    CHECK(borrow.wait_for(0ms) == std::future_status::timeout);
+    auto notification = std::async(std::launch::async, [&] { return owner.NotifyContinuation(); });
+    const auto notification_status = notification.wait_for(2s);
+    // Always release the product even when the assertion fails, so the evidence
+    // reports a failed boundary instead of leaving a test-owned worker blocked.
+    release_publish.set_value();
+    CHECK(notification_status == std::future_status::ready);
+    CHECK(notification.get());
+    auto view = borrow.get();
+    CHECK(view.valid());
+    view = {};
+    REQUIRE(notified.get_future().wait_for(2s) == std::future_status::ready);
+    owner.StopAndWait();
+}
+
+TEST_CASE("visual continuation arrivals while draining survive without later input") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
+    std::promise<void> entered;
+    std::promise<void> release_drain;
+    const auto release = release_drain.get_future().share();
+    std::promise<void> completed;
+    std::atomic_uint32_t drains = 0U;
+    detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {}};
+    owner.RegisterContinuation([&](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
+        if (drains.fetch_add(1U) == 0U) {
+            entered.set_value();
+            release.wait();
+        } else {
+            completed.set_value();
+        }
+        return detail::VisualRuntimeOwner::Notification{};
+    });
+    REQUIRE(owner.NotifyContinuation());
+    entered.get_future().wait();
+    REQUIRE(owner.NotifyContinuation());
+    REQUIRE(owner.NotifyContinuation());
+    release_drain.set_value();
+    REQUIRE(completed.get_future().wait_for(2s) == std::future_status::ready);
+    owner.StopAndWait();
+    CHECK(drains.load() == 2U);
+    CHECK_FALSE(owner.NotifyContinuation());
+}
+
+TEST_CASE("visual terminal and failure boundaries discard pending continuations") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
+    std::atomic_uint32_t continuations = 0U;
+    std::promise<void> boundary_entered;
+    std::promise<void> release_boundary;
+    const auto release = release_boundary.get_future().share();
+    std::promise<void> terminal_completed;
+    detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {}};
+    submit_blocked_visual_work(owner, boundary_entered, release);
+    submit_counting_continuation(owner, continuations);
+    REQUIRE(owner.SubmitTerminalBarrier([&](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
+        terminal_completed.set_value();
+        return detail::VisualRuntimeOwner::Notification{};
+    }));
+    release_boundary.set_value();
+    REQUIRE(terminal_completed.get_future().wait_for(2s) == std::future_status::ready);
+    owner.StopAndWait();
+    CHECK(continuations.load(std::memory_order_acquire) == 0U);
+
+    std::promise<void> failed;
+    std::promise<void> failure_boundary_entered;
+    std::promise<void> release_failure_boundary;
+    const auto failure_release = release_failure_boundary.get_future().share();
+    detail::VisualRuntimeOwner failing{test_live_runtime_factory(backend, captures), [&](std::exception_ptr) { failed.set_value(); }};
+    submit_blocked_visual_work(failing, failure_boundary_entered, failure_release);
+    REQUIRE(
+        failing.SubmitOrdered([](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) -> detail::VisualRuntimeOwner::Notification {
+            throw std::runtime_error("deterministic continuation boundary failure");
+        }));
+    submit_counting_continuation(failing, continuations);
+    release_failure_boundary.set_value();
+    REQUIRE(failed.get_future().wait_for(2s) == std::future_status::ready);
+    failing.StopAndWait();
+    CHECK(continuations.load(std::memory_order_acquire) == 0U);
+
+    std::promise<void> stop_boundary_entered;
+    std::promise<void> release_stop_boundary;
+    const auto stop_release = release_stop_boundary.get_future().share();
+    detail::VisualRuntimeOwner stopping{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {}};
+    submit_blocked_visual_work(stopping, stop_boundary_entered, stop_release);
+    submit_counting_continuation(stopping, continuations);
+    stopping.RequestStop();
+    release_stop_boundary.set_value();
+    stopping.StopAndWait();
+    CHECK(continuations.load(std::memory_order_acquire) == 0U);
+}
+
+class RetainedConstructionModel final : public mmltk::frameworks::gpu::SystemImageModel {
+   public:
+    RetainedConstructionModel(std::shared_ptr<std::atomic_bool> destroyed, std::shared_ptr<std::atomic_uint64_t> release_calls)
+        : destroyed_(std::move(destroyed)),
+          release_calls_(std::move(release_calls)),
+          failure_(std::make_exception_ptr(std::runtime_error("deterministic retained construction resource"))) {}
+    ~RetainedConstructionModel() override { destroyed_->store(true, std::memory_order_release); }
+    [[nodiscard]] Release ReleaseResources() noexcept override {
+        release_calls_->fetch_add(1U, std::memory_order_release);
+        return {
+            .all_released = false,
+            .failure = failure_,
+        };
+    }
+
+   private:
+    std::shared_ptr<std::atomic_bool> destroyed_;
+    std::shared_ptr<std::atomic_uint64_t> release_calls_;
+    std::exception_ptr failure_;
+};
+
+void check_visual_construction_custody(const FakeImageBackend::FailurePoint failure_point, const std::string_view expected_failure,
+                                       const std::uint64_t expected_contexts, const std::uint64_t expected_release_calls) {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto destroyed = std::make_shared<std::atomic_bool>(false);
+    auto release_calls = std::make_shared<std::atomic_uint64_t>(0U);
+    std::atomic_uint64_t constructions = 0U;
+    std::atomic_bool reported_typed_failure = false;
+    std::promise<void> failed;
+    {
+        detail::VisualRuntimeOwner owner{
+            [&] {
+                constructions.fetch_add(1U, std::memory_order_acq_rel);
+                return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
+                    .device = 0,
+                    .backend = backend,
+                    .model = std::make_unique<RetainedConstructionModel>(destroyed, release_calls),
+                });
+            },
+            [&failed, &reported_typed_failure, expected_failure](const std::exception_ptr failure) {
+                try {
+                    std::rethrow_exception(failure);
+                } catch (const std::runtime_error& error) {
+                    reported_typed_failure.store(std::string_view{error.what()} == expected_failure, std::memory_order_release);
+                } catch (...) {}
+                failed.set_value();
+            }};
+        backend->FailAfter(failure_point);
+        REQUIRE(owner.SubmitOrdered(no_op_visual_work));
+        REQUIRE(failed.get_future().wait_for(2s) == std::future_status::ready);
+        CHECK_FALSE(owner.SubmitOrdered(no_op_visual_work));
+        owner.StopAndWait();
+        CHECK(owner.stopped());
+        CHECK(reported_typed_failure.load(std::memory_order_acquire));
+        CHECK(constructions.load(std::memory_order_acquire) == 1U);
+        CHECK(release_calls->load(std::memory_order_acquire) == expected_release_calls);
+        CHECK_FALSE(destroyed->load(std::memory_order_acquire));
+        CHECK(backend->contexts_created == expected_contexts);
+        CHECK(backend->contexts_destroyed == 0U);
+    }
+    CHECK(release_calls->load(std::memory_order_acquire) == expected_release_calls);
+    CHECK_FALSE(destroyed->load(std::memory_order_acquire));
+    CHECK(backend->contexts_destroyed == 0U);
+}
+
+TEST_CASE("visual runtime owner retains unsafe factory construction and blocks reconstruction") {
+    check_visual_construction_custody(FakeImageBackend::FailurePoint::CreateStream, "deterministic retained construction resource", 1U, 1U);
+}
+
+TEST_CASE("visual runtime retirement preserves the model and context while release remains incomplete") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto destroyed = std::make_shared<std::atomic_bool>(false);
+    auto releases = std::make_shared<std::atomic_uint64_t>(0U);
+    auto runtime = std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
+        .device = 0, .backend = backend, .model = std::make_unique<RetainedConstructionModel>(destroyed, releases)});
+    const auto retirement = runtime->Retire();
+    CHECK_FALSE(retirement.safe_to_destroy);
+    REQUIRE(retirement.custody.valid());
+    CHECK(retirement.custody.failure() == retirement.failure);
+    REQUIRE(retirement.failure);
+    CHECK_THROWS_WITH(std::rethrow_exception(retirement.failure), "deterministic retained construction resource");
+    CHECK(releases->load(std::memory_order_acquire) == 1U);
+    runtime.reset();
+    CHECK_FALSE(destroyed->load(std::memory_order_acquire));
+    CHECK(backend->contexts_destroyed == 0U);
+    CHECK(backend->streams_destroyed == 0U);
+}
+
+TEST_CASE("visual runtime owner retains an adopted model when context creation fails") {
+    check_visual_construction_custody(FakeImageBackend::FailurePoint::CreateContext, "injected image backend failure", 0U, 0U);
+}
+
+TEST_CASE("visual retirement reports an unestablished context boundary and disables unsafe reuse") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    std::atomic_uint64_t constructions = 0U;
+    std::promise<void> failed;
+    detail::VisualRuntimeOwner owner{[&] {
+                                         constructions.fetch_add(1U, std::memory_order_acq_rel);
+                                         return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(
+                                             mmltk::frameworks::gpu::SystemImageRuntimeConfig{.device = 0, .backend = backend});
+                                     },
+                                     [&failed](std::exception_ptr) { failed.set_value(); }};
+    REQUIRE(owner.SubmitOrdered(
+        [backend](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) -> detail::VisualRuntimeOwner::Notification {
+            backend->FailPersistently(FakeImageBackend::FailurePoint::Bind);
+            throw std::runtime_error("deterministic work failure before retirement");
+        }));
+    REQUIRE(failed.get_future().wait_for(2s) == std::future_status::ready);
+    CHECK_FALSE(owner.SubmitOrdered(no_op_visual_work));
+    owner.StopAndWait();
+    CHECK(owner.stopped());
+    CHECK(constructions.load(std::memory_order_acquire) == 1U);
+    CHECK(backend->streams_destroyed == 0U);
+    CHECK(backend->contexts_destroyed == 0U);
+}
+
+TEST_CASE("Live failure publishes its newer settled snapshot") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    std::promise<LiveFailed> failure;
+    LiveSystem live{kDevice,
+                    RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::Clean,
+                                   [] { return std::make_unique<FailingLiveAlgorithm>(); }),
+                    [&failure](LiveSystem::event_type event) {
+                        if (auto* failed = std::get_if<LiveFailed>(&event)) failure.set_value(std::move(*failed));
+                    }};
+    const auto admitted = live.Start({.extent = {80U, 45U}, .frames_per_second = 120U});
+    const auto failed = failure.get_future().get();
+    CHECK_FALSE(failed.snapshot.running);
+    CHECK_FALSE(failed.snapshot.cancellation_requested);
+    CHECK(failed.snapshot.revision > admitted.revision);
+    CHECK(failed.snapshot.revision == live.snapshot().revision);
+    CHECK(failed.snapshot.completed_frames == live.snapshot().completed_frames);
+    CHECK_FALSE(failed.snapshot.frame.valid());
+    CHECK_FALSE(live.BorrowFrame().valid());
+}
+
+TEST_CASE("Upscale worker failure retires its public and private product") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    OpenedExplore opened_explore{backend, {32U, 32U}};
+    auto& explore = opened_explore.system();
+    auto runs = std::make_shared<std::atomic_uint32_t>(0U);
+    std::promise<UpscaleFailed> failure;
+    EventGate events;
+    UpscaleSystem upscale{kDevice,
+                          RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+                                         [runs] { return std::make_unique<FailingUpscaleAlgorithm>(runs); }),
+                          borrow_exactly_from(explore), [&failure, &events](UpscaleSystem::event_type event) {
+                              events.Advance();
+                              if (auto* failed = std::get_if<UpscaleFailed>(&event)) failure.set_value(std::move(*failed));
+                          }};
+    static_cast<void>(upscale.Start({.source = explore.snapshot().frame}));
+    REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
+    REQUIRE(upscale.BorrowFrame().valid());
+    static_cast<void>(upscale.Start({.source = explore.snapshot().frame, .kernel = UpscaleKernel::ShiftLut}));
+    auto failed_event = failure.get_future();
+    REQUIRE(failed_event.wait_for(2s) == std::future_status::ready);
+    const auto failed = failed_event.get();
+    CHECK_FALSE(failed.snapshot.ready);
+    CHECK_FALSE(failed.snapshot.frame.valid());
+    CHECK_FALSE(upscale.BorrowFrame().valid());
+    static_cast<void>(upscale.Start({.source = explore.snapshot().frame, .kernel = UpscaleKernel::ShiftLut}));
+    REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
+    CHECK(runs->load(std::memory_order_acquire) == 3U);
+    const auto recovered = upscale.BorrowDocument(upscale.snapshot().frame);
+    REQUIRE(recovered.valid());
+    CHECK(upscale.snapshot().input == explore.snapshot().frame);
+    CHECK(*reinterpret_cast<const std::uint8_t*>(recovered.pixels.plane(0U).plane().data) == 1U);
+}
+
+TEST_CASE("Visual diagnostics name every canonical completion and failure") {
+    using namespace mmltk::frameworks::reflection;
+    CHECK(visual_diagnostic_event_name(VisualDiagnosticOperation::TimelineReady) == "timeline.ready");
+    CHECK(visual_diagnostic_event_name(VisualDiagnosticOperation::CopyCompleted) == "copy.completed");
+    CHECK(visual_diagnostic_event_name(VisualDiagnosticOperation::WorkerFailure) == "worker.failure");
+    CHECK(visual_diagnostic_event_name(VisualDiagnosticOperation::PresentationReleaseWaitStarted) == "presentation.release_wait.started");
+    CHECK(visual_diagnostic_event_name(VisualDiagnosticOperation::AcceptanceCompiledRead) == "acceptance.compiled.read.started");
+    CHECK(visual_diagnostic_event_name(VisualDiagnosticOperation::ExploreSemanticPixels) == "explore.semantic.nonzero_pixels");
+    CHECK(visual_diagnostic_event_name(VisualDiagnosticOperation::ExplorePrefetchReady) == "explore.prefetch.ready");
+
+    for (const auto entry : enum_entries<VisualDiagnosticOperation>()) {
+        const auto alias = visual_diagnostic_event_name(entry.value);
+        CAPTURE(entry.name, alias);
+        REQUIRE_FALSE(alias.empty());
+        CHECK(alias.size() <= 96U);
+        CHECK(enum_name(entry.value) == entry.name);
+        CHECK(try_enum_from_name<VisualDiagnosticOperation>(entry.name) == entry.value);
+        CHECK_FALSE(try_enum_from_name<VisualDiagnosticOperation>(alias).has_value());
+    }
+    CHECK(enum_name(VisualDiagnosticOperation::AcceptanceCompiledRead) == "AcceptanceCompiledRead");
+    CHECK(enum_name(VisualDiagnosticOperation::ExploreSemanticPixels) == "ExploreSemanticPixels");
+
+    for (unsigned int raw = 0U; raw <= std::numeric_limits<std::uint8_t>::max(); ++raw) {
+        const auto operation = static_cast<VisualDiagnosticOperation>(raw);
+        CAPTURE(raw);
+        CHECK(visual_diagnostic_event_name(operation).empty() == !enum_contains(operation));
+    }
+}
+
+TEST_CASE("Presentation control remains available during a native wait") {
+    PresentationSourceFixture source;
+    auto writer_state = std::make_shared<TestPresentationWriterState>();
+    writer_state->block_pump.store(true, std::memory_order_release);
+    auto pump_entered = writer_state->pump_entered.get_future();
+    PresentationSystem presentation{
+        kDevice, [backend = source.backend(), writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); },
+        source.sources()};
+    static_cast<void>(presentation.Select(source.identity()));
+    REQUIRE(pump_entered.wait_for(2s) == std::future_status::ready);
+
+    auto admission_closed = std::async(std::launch::async, [&presentation] { presentation.CloseAdmission(); });
+    CHECK(admission_closed.wait_for(100ms) == std::future_status::ready);
+    writer_state->release_pump.set_value();
+    admission_closed.get();
+    presentation.BrowserPeerLost();
+    CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
+}
+
+TEST_CASE("Presentation release failure publishes once and still stops") {
+    PresentationSourceFixture source;
+    auto writer_state = std::make_shared<TestPresentationWriterState>();
+    writer_state->terminal_release_succeeds.store(false, std::memory_order_release);
+    PresentationFailureProbe failures;
+    auto presentation = make_failure_presentation(source, writer_state, failures);
+    static_cast<void>(presentation.Select(source.identity()));
+    REQUIRE(failures.events().Wait([&] { return presentation.snapshot().completed.valid(); }));
+
+    presentation.CloseAdmission();
+    presentation.BrowserPeerLost();
+    presentation.BrowserPeerLost();
+    CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
+
+    CHECK(presentation.stopped());
+    CHECK(failures.failures() == 1U);
+    CHECK(writer_state->browser_terminals.load(std::memory_order_acquire) == 1U);
+    CHECK(writer_state->retirements.load(std::memory_order_acquire) == 1U);
+}
+
+TEST_CASE("Presentation retains an unprovable native source read through terminal shutdown") {
+    PresentationSourceFixture source;
+    auto writer_state = std::make_shared<TestPresentationWriterState>();
+    writer_state->terminal_release_succeeds.store(false, std::memory_order_release);
+    writer_state->terminal_source_settled.store(false, std::memory_order_release);
+    PresentationFailureProbe failures;
+    {
+        auto presentation = make_failure_presentation(source, writer_state, failures);
+        presentation.CloseAdmission();
+        presentation.BrowserPeerLost();
+        CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
+        CHECK(failures.failures() == 1U);
+        CHECK(writer_state->browser_terminals.load(std::memory_order_acquire) == 1U);
+        CHECK(writer_state->retirements.load(std::memory_order_acquire) == 0U);
+    }
+    CHECK(writer_state->retirements.load(std::memory_order_acquire) == 0U);
+}
+
+TEST_CASE("Presentation worker failure rejects later direct selection") {
+    PresentationSourceFixture source;
+    auto writer_state = std::make_shared<TestPresentationWriterState>();
+    writer_state->fail_pump.store(true, std::memory_order_release);
+    PresentationFailureProbe failures;
+    auto presentation = make_failure_presentation(source, writer_state, failures);
+
+    static_cast<void>(presentation.Select(source.identity()));
+    REQUIRE(failures.events().Wait([&] { return failures.failures() == 1U; }));
+    CHECK(writer_state->browser_terminals.load(std::memory_order_acquire) == 0U);
+    CHECK(writer_state->retirements.load(std::memory_order_acquire) == 0U);
+    CHECK_THROWS_AS(presentation.Select(source.identity()), contracts::FailedError);
+    presentation.CloseAdmission();
+    presentation.BrowserPeerLost();
+    CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
+    CHECK(writer_state->browser_terminals.load(std::memory_order_acquire) == 1U);
+    CHECK(writer_state->retirements.load(std::memory_order_acquire) == 1U);
+}
+
+}  // namespace
+}  // namespace mmltk::controller
+
+namespace mmltk::controller {
+namespace {
+TEST_CASE("recoverable visual failure restores creator policy before rebuilding placed runtime") {
+    using namespace mmltk::common::system;
+    const auto topology = NumaTopology::Capture();
+    const auto baseline = allowed_cpu_set();
+    const auto first = std::ranges::find(topology.cpus, baseline.front(), &CpuTopology::cpu);
+    const mmltk::frameworks::gpu::DeviceExecution execution{.device = 0, .placement = resolve_placement(topology, first->node)};
+    auto backend = std::make_shared<FakeImageBackend>();
+    std::vector<std::vector<int>> construction_affinities;
+    std::promise<void> failed;
+    std::promise<std::vector<int>> completed;
+    detail::VisualRuntimeOwner owner{
+        [&] {
+            construction_affinities.push_back(allowed_cpu_set());
+            return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(
+                mmltk::frameworks::gpu::SystemImageRuntimeConfig{.device = 0, .backend = backend, .execution = execution});
+        },
+        [&](std::exception_ptr) { failed.set_value(); }};
+    REQUIRE(owner.SubmitOrdered([](auto&, std::stop_token) -> detail::VisualRuntimeOwner::Notification {
+        throw std::runtime_error("recoverable operation failure");
+    }));
+    REQUIRE(failed.get_future().wait_for(2s) == std::future_status::ready);
+    REQUIRE(owner.SubmitOrdered([&](auto&, std::stop_token) -> detail::VisualRuntimeOwner::Notification {
+        completed.set_value(allowed_cpu_set());
+        return {};
+    }));
+    const auto active = completed.get_future().get();
+    owner.StopAndWait();
+    CHECK(active == std::vector<int>{execution.placement.cpus.front()});
+    CHECK(construction_affinities == std::vector<std::vector<int>>{baseline, baseline});
+    CHECK(backend->contexts_created == 2U);
+    CHECK(backend->contexts_destroyed == 2U);
+}
+
+TEST_CASE("saved Explore transport changes retire the prior runtime before reopening") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    ExploreSystem* active = nullptr;
+    LoadedSettings settings{[&](SettingsSystem::event_type) {
+        if (active) active->ExecutionSettingsChanged();
+    }};
+    const bool initial_h2d = settings.system().explore_settings_candidate().loading.h2d_dataloader;
+    ExploreScenario scenario{settings, backend};
+    active = &scenario.system();
+    scenario.OpenAndWait({.extent = {63U, 21U}, .row_count = 1U, .columns = 3U});
+    const auto before_frame = active->snapshot().frame;
+    const auto before = active->snapshot().revision;
+    contracts::SettingsUpdateRequest update;
+    update.updates.push_back(
+        {.path = "workflows.explore.h2d_dataloader", .value = mmltk::frameworks::serialization::wire::FlatValue{!initial_h2d}});
+    static_cast<void>(settings.system().Update(std::move(update)));
+    REQUIRE(scenario.Wait([&] {
+        const auto snapshot = active->snapshot();
+        return snapshot.ready && !snapshot.busy && snapshot.revision > before;
+    }));
+    CHECK(active->snapshot().frame.clean_revision > before_frame.clean_revision);
+    active->Shutdown();
+    CHECK(backend->contexts_created == 2U);
+    CHECK(backend->contexts_destroyed == 2U);
+    active = nullptr;
+}
+
+TEST_CASE("Explore applies a transport change after a pending settings mutation rolls back") {
+    const bool initial_h2d = GENERATE(false, true);
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto gate = std::make_shared<ExplorePostRenderGate>(1U);
+    auto work = std::make_shared<ExploreWorkProbe>();
+    auto failures = std::make_shared<std::atomic_uint64_t>(0U);
+    ExploreSystem* active = nullptr;
+    LoadedSettings settings{[&](SettingsSystem::event_type) {
+        if (active) active->ExecutionSettingsChanged();
+    }};
+    contracts::SettingsUpdateRequest initial;
+    initial.updates.push_back(
+        {.path = "workflows.explore.h2d_dataloader", .value = mmltk::frameworks::serialization::wire::FlatValue{initial_h2d}});
+    static_cast<void>(settings.system().Update(std::move(initial)));
+    ExploreScenario scenario{settings, backend,
+                             [gate, work] {
+                                 return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr,
+                                                                               nullptr, nullptr, work, gate);
+                             },
+                             count_explore_failures(failures)};
+    active = &scenario.system();
+    scenario.OpenAndWait({.extent = {63U, 21U}, .row_count = 1U, .columns = 3U});
+    const auto current = active->snapshot();
+    auto overlay = current.overlay;
+    overlay.show_masks = !overlay.show_masks;
+    const auto admitted = active->UpdateFilter({.filter = current.filter, .overlay = overlay});
+    gate->entered.get_future().wait();
+    contracts::SettingsUpdateRequest update;
+    update.updates.push_back(
+        {.path = "workflows.explore.h2d_dataloader", .value = mmltk::frameworks::serialization::wire::FlatValue{!initial_h2d}});
+    static_cast<void>(settings.system().Update(std::move(update)));
+    gate->release.set_value();
+    const bool reopened = scenario.Wait([&] {
+        const auto snapshot = active->snapshot();
+        return work->opens.load(std::memory_order_acquire) == 2U && snapshot.ready && !snapshot.busy && snapshot.failure.empty() &&
+               snapshot.revision > admitted.revision;
+    });
+    const auto observed = active->snapshot();
+    INFO("opens=" << work->opens.load(std::memory_order_acquire) << " ready=" << observed.ready << " busy=" << observed.busy
+                  << " failure=" << observed.failure << " revision=" << observed.revision << " admitted=" << admitted.revision
+                  << " contexts-created=" << backend->contexts_created << " contexts-destroyed=" << backend->contexts_destroyed
+                  << " failures=" << failures->load(std::memory_order_acquire));
+    REQUIRE(reopened);
+    active->Shutdown();
+    CHECK(backend->contexts_created == 2U);
+    CHECK(backend->contexts_destroyed == 2U);
+    CHECK(failures->load(std::memory_order_acquire) == 1U);
+    active = nullptr;
+}
+
+TEST_CASE("Explore locality selects automatic budget and preserves explicit overlapping budget") {
+    const mmltk::common::system::ExecutionPlacement placement{.numa_node = 3, .cpus = {17, 25}};
+    CHECK(normalize_explore_parallelism(0, placement) == 2U);
+    CHECK(normalize_explore_parallelism(8, placement) == 8U);
+}
+
+}  // namespace
+}  // namespace mmltk::controller

@@ -1,0 +1,3498 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#if defined(_PR_PTHREADS)
+
+
+#  include <pthread.h>
+#  include <string.h> /* for memset() */
+#  include <sys/types.h>
+#  include <dirent.h>
+#  include <fcntl.h>
+#  include <unistd.h>
+#  include <sys/socket.h>
+#  include <sys/stat.h>
+#  include <sys/uio.h>
+#  include <sys/file.h>
+#  include <sys/ioctl.h>
+#if defined(_PR_POLL_AVAILABLE)
+#    include <poll.h>
+#endif
+#    include <sys/time.h>
+#    include <sys/resource.h>
+
+
+
+#if defined(LINUX)
+#    include <sys/sendfile.h>
+#endif
+
+#  include "primpl.h"
+
+#if defined(LINUX) || 0
+#    include <netinet/in.h>
+#endif
+
+
+#if defined(HAVE_NETINET_TCP_H)
+#    include <netinet/tcp.h> /* TCP_NODELAY, TCP_MAXSEG */
+#endif
+
+#if defined(LINUX)
+#if !defined(TCP_CORK)
+#      define TCP_CORK 3
+#endif
+#if !defined(MSG_FASTOPEN)
+#      define MSG_FASTOPEN 0x20000000
+#endif
+#endif
+
+#if defined(_PR_IPV6_V6ONLY_PROBE)
+static PRBool _pr_ipv6_v6only_on_by_default;
+#endif
+
+#if defined(AIX4_1)
+#    define _PRSelectFdSetArg_t void*
+#elif (0 && !defined(AIX4_1)) || 0 ||   \
+      defined(HPUX10_30) || defined(HPUX11) || defined(LINUX) ||    \
+      defined(__GNU__) || defined(__GLIBC__) || defined(FREEBSD) || \
+      defined(NETBSD) || defined(OPENBSD) || defined(NTO) ||        \
+      0 || defined(RISCOS)
+#    define _PRSelectFdSetArg_t fd_set*
+#else
+#    error "Cannot determine architecture"
+#endif
+
+#if defined(LINUX)
+#if !defined(AF_INET_SDP)
+#      define AF_INET_SDP 27
+#endif
+#    define _PR_HAVE_SDP
+#endif
+
+static PRFileDesc* pt_SetMethods(PRIntn osfd, PRDescType type,
+                                 PRBool isAcceptedSocket, PRBool imported);
+
+static PRLock* _pr_flock_lock;  
+static PRCondVar* _pr_flock_cv; 
+static PRLock* _pr_rename_lock; 
+
+
+#if defined(DEBUG)
+
+PRBool IsValidNetAddr(const PRNetAddr* addr) {
+  if ((addr != NULL) && (addr->raw.family != AF_UNIX) &&
+      (addr->raw.family != PR_AF_INET6) && (addr->raw.family != AF_INET)) {
+    return PR_FALSE;
+  }
+  return PR_TRUE;
+}
+
+static PRBool IsValidNetAddrLen(const PRNetAddr* addr, PRInt32 addr_len) {
+  if ((addr != NULL) && (addr->raw.family != AF_UNIX) &&
+      (PR_NETADDR_SIZE(addr) != addr_len)) {
+#if defined(LINUX) && __GLIBC__ == 2 && __GLIBC_MINOR__ == 1
+    if ((PR_AF_INET6 == addr->raw.family) && (sizeof(addr->ipv6) == addr_len)) {
+      return PR_TRUE;
+    }
+#endif
+    return PR_FALSE;
+  }
+  return PR_TRUE;
+}
+
+#endif
+
+
+#  define PT_DEFAULT_POLL_MSEC 5000
+
+#if defined(HAVE_SOCKLEN_T) || (defined(__GLIBC__) && __GLIBC__ >= 2)
+typedef socklen_t pt_SockLen;
+#else
+typedef PRIntn pt_SockLen;
+#endif
+
+typedef struct pt_Continuation pt_Continuation;
+typedef PRBool (*ContinuationFn)(pt_Continuation* op, PRInt16 revents);
+
+typedef enum pr_ContuationStatus {
+  pt_continuation_pending,
+  pt_continuation_done
+} pr_ContuationStatus;
+
+struct pt_Continuation {
+  ContinuationFn function; 
+  union {
+    PRIntn osfd;
+  } arg1; 
+  union {
+    void* buffer;
+  } arg2; 
+  union {
+    PRSize amount;        
+    pt_SockLen* addr_len; 
+#if defined(HPUX11)
+    struct file_spec {
+      off_t offset;   
+      size_t nbytes;  
+      size_t st_size; 
+    } file_spec;
+#endif
+  } arg3;
+  union {
+    PRIntn flags;
+  } arg4; 
+  union {
+    PRNetAddr* addr;
+  } arg5; 
+
+#if defined(HPUX11)
+  int filedesc;       
+  int nbytes_to_send; 
+#endif
+
+
+#if defined(LINUX)
+  int in_fd; 
+  off_t offset;
+  size_t count;
+#endif
+
+  PRIntervalTime timeout; 
+
+  PRInt16 event; 
+
+  union {
+    PRSize code;
+    void* object;
+  } result;
+
+  PRIntn syserrno;            
+  pr_ContuationStatus status; 
+};
+
+#if defined(DEBUG)
+
+PTDebug pt_debug; 
+
+PR_IMPLEMENT(void) PT_FPrintStats(PRFileDesc* debug_out, const char* msg) {
+  PTDebug stats;
+  char buffer[100];
+  PRExplodedTime tod;
+  PRInt64 elapsed, aMil;
+  stats = pt_debug; 
+  PR_ExplodeTime(stats.timeStarted, PR_LocalTimeParameters, &tod);
+  (void)PR_FormatTime(buffer, sizeof(buffer), "%T", &tod);
+
+  LL_SUB(elapsed, PR_Now(), stats.timeStarted);
+  LL_I2L(aMil, 1000000);
+  LL_DIV(elapsed, elapsed, aMil);
+
+  if (NULL != msg) {
+    PR_fprintf(debug_out, "%s", msg);
+  }
+  PR_fprintf(debug_out, "\tstarted: %s[%lld]\n", buffer, elapsed);
+  PR_fprintf(debug_out, "\tlocks [created: %u, destroyed: %u]\n",
+             stats.locks_created, stats.locks_destroyed);
+  PR_fprintf(debug_out, "\tlocks [acquired: %u, released: %u]\n",
+             stats.locks_acquired, stats.locks_released);
+  PR_fprintf(debug_out, "\tcvars [created: %u, destroyed: %u]\n",
+             stats.cvars_created, stats.cvars_destroyed);
+  PR_fprintf(debug_out, "\tcvars [notified: %u, delayed_delete: %u]\n",
+             stats.cvars_notified, stats.delayed_cv_deletes);
+} 
+
+#else
+
+PR_IMPLEMENT(void) PT_FPrintStats(PRFileDesc* debug_out, const char* msg) {
+} 
+
+#endif
+
+
+static void pt_poll_now(pt_Continuation* op) {
+  PRInt32 msecs;
+  PRIntervalTime epoch, now, elapsed, remaining;
+  PRBool wait_for_remaining;
+  PRThread* self = PR_GetCurrentThread();
+
+  PR_ASSERT(PR_INTERVAL_NO_WAIT != op->timeout);
+
+  switch (op->timeout) {
+    case PR_INTERVAL_NO_TIMEOUT:
+      msecs = PT_DEFAULT_POLL_MSEC;
+      do {
+        PRIntn rv;
+        struct pollfd tmp_pfd;
+
+        tmp_pfd.revents = 0;
+        tmp_pfd.fd = op->arg1.osfd;
+        tmp_pfd.events = op->event;
+
+        rv = poll(&tmp_pfd, 1, msecs);
+
+        if (_PT_THREAD_INTERRUPTED(self)) {
+          self->state &= ~PT_THREAD_ABORTED;
+          op->result.code = -1;
+          op->syserrno = EINTR;
+          op->status = pt_continuation_done;
+          return;
+        }
+
+        if ((-1 == rv) && ((errno == EINTR) || (errno == EAGAIN))) {
+          continue; 
+        }
+
+        if (rv > 0) {
+          PRInt16 events = tmp_pfd.events;
+          PRInt16 revents = tmp_pfd.revents;
+
+          if ((revents & POLLNVAL) 
+              || ((events & POLLOUT) && (revents & POLLHUP)))
+          {
+            op->result.code = -1;
+            if (POLLNVAL & revents) {
+              op->syserrno = EBADF;
+            } else if (POLLHUP & revents) {
+              op->syserrno = EPIPE;
+            }
+            op->status = pt_continuation_done;
+          } else {
+            if (op->function(op, revents)) {
+              op->status = pt_continuation_done;
+            }
+          }
+        } else if (rv == -1) {
+          op->result.code = -1;
+          op->syserrno = errno;
+          op->status = pt_continuation_done;
+        }
+      } while (pt_continuation_done != op->status);
+      break;
+    default:
+      now = epoch = PR_IntervalNow();
+      remaining = op->timeout;
+      do {
+        PRIntn rv;
+        struct pollfd tmp_pfd;
+
+        tmp_pfd.revents = 0;
+        tmp_pfd.fd = op->arg1.osfd;
+        tmp_pfd.events = op->event;
+
+        wait_for_remaining = PR_TRUE;
+        msecs = (PRInt32)PR_IntervalToMilliseconds(remaining);
+        if (msecs > PT_DEFAULT_POLL_MSEC) {
+          wait_for_remaining = PR_FALSE;
+          msecs = PT_DEFAULT_POLL_MSEC;
+        }
+        rv = poll(&tmp_pfd, 1, msecs);
+
+        if (_PT_THREAD_INTERRUPTED(self)) {
+          self->state &= ~PT_THREAD_ABORTED;
+          op->result.code = -1;
+          op->syserrno = EINTR;
+          op->status = pt_continuation_done;
+          return;
+        }
+
+        if (rv > 0) {
+          PRInt16 events = tmp_pfd.events;
+          PRInt16 revents = tmp_pfd.revents;
+
+          if ((revents & POLLNVAL) 
+              || ((events & POLLOUT) && (revents & POLLHUP)))
+          {
+            op->result.code = -1;
+            if (POLLNVAL & revents) {
+              op->syserrno = EBADF;
+            } else if (POLLHUP & revents) {
+              op->syserrno = EPIPE;
+            }
+            op->status = pt_continuation_done;
+          } else {
+            if (op->function(op, revents)) {
+              op->status = pt_continuation_done;
+            }
+          }
+        } else if ((rv == 0) || ((errno == EINTR) || (errno == EAGAIN))) {
+          if (rv == 0) 
+          {
+            if (wait_for_remaining) {
+              now += remaining;
+            } else {
+              now += PR_MillisecondsToInterval(msecs);
+            }
+          } else {
+            now = PR_IntervalNow();
+          }
+          elapsed = (PRIntervalTime)(now - epoch);
+          if (elapsed >= op->timeout) {
+            op->result.code = -1;
+            op->syserrno = ETIMEDOUT;
+            op->status = pt_continuation_done;
+          } else {
+            remaining = op->timeout - elapsed;
+          }
+        } else {
+          op->result.code = -1;
+          op->syserrno = errno;
+          op->status = pt_continuation_done;
+        }
+      } while (pt_continuation_done != op->status);
+      break;
+  }
+
+} 
+
+static PRIntn pt_Continue(pt_Continuation* op) {
+  op->status = pt_continuation_pending; 
+  pt_poll_now(op);
+  PR_ASSERT(pt_continuation_done == op->status);
+  return op->result.code;
+} 
+
+static PRBool pt_connect_cont(pt_Continuation* op, PRInt16 revents) {
+  op->syserrno = _MD_unix_get_nonblocking_connect_error(op->arg1.osfd);
+  if (op->syserrno != 0) {
+    op->result.code = -1;
+  } else {
+    op->result.code = 0;
+  }
+  return PR_TRUE; 
+} 
+
+static PRBool pt_accept_cont(pt_Continuation* op, PRInt16 revents) {
+  op->syserrno = 0;
+  op->result.code = accept(op->arg1.osfd, op->arg2.buffer, op->arg3.addr_len);
+  if (-1 == op->result.code) {
+    op->syserrno = errno;
+    if (EWOULDBLOCK == errno || EAGAIN == errno || ECONNABORTED == errno) {
+      return PR_FALSE; 
+    }
+  }
+  return PR_TRUE;
+} 
+
+static PRBool pt_read_cont(pt_Continuation* op, PRInt16 revents) {
+  op->result.code = read(op->arg1.osfd, op->arg2.buffer, op->arg3.amount);
+  op->syserrno = errno;
+  return ((-1 == op->result.code) &&
+          (EWOULDBLOCK == op->syserrno || EAGAIN == op->syserrno))
+             ? PR_FALSE
+             : PR_TRUE;
+} 
+
+static PRBool pt_recv_cont(pt_Continuation* op, PRInt16 revents) {
+  op->result.code =
+      recv(op->arg1.osfd, op->arg2.buffer, op->arg3.amount, op->arg4.flags);
+  op->syserrno = errno;
+  return ((-1 == op->result.code) &&
+          (EWOULDBLOCK == op->syserrno || EAGAIN == op->syserrno))
+             ? PR_FALSE
+             : PR_TRUE;
+} 
+
+static PRBool pt_send_cont(pt_Continuation* op, PRInt16 revents) {
+  PRIntn bytes;
+  bytes = send(op->arg1.osfd, op->arg2.buffer, op->arg3.amount, op->arg4.flags);
+  op->syserrno = errno;
+
+
+  if (bytes >= 0) 
+  {
+    char* bp = (char*)op->arg2.buffer;
+    bp += bytes; 
+    op->arg2.buffer = bp;
+    op->result.code += bytes; 
+    op->arg3.amount -= bytes; 
+    return (0 == op->arg3.amount) ? PR_TRUE : PR_FALSE;
+  }
+  if ((EWOULDBLOCK != op->syserrno) && (EAGAIN != op->syserrno)) {
+    op->result.code = -1;
+    return PR_TRUE;
+  } else {
+    return PR_FALSE;
+  }
+} 
+
+static PRBool pt_write_cont(pt_Continuation* op, PRInt16 revents) {
+  PRIntn bytes;
+  bytes = write(op->arg1.osfd, op->arg2.buffer, op->arg3.amount);
+  op->syserrno = errno;
+  if (bytes >= 0) 
+  {
+    char* bp = (char*)op->arg2.buffer;
+    bp += bytes; 
+    op->arg2.buffer = bp;
+    op->result.code += bytes; 
+    op->arg3.amount -= bytes; 
+    return (0 == op->arg3.amount) ? PR_TRUE : PR_FALSE;
+  }
+  if ((EWOULDBLOCK != op->syserrno) && (EAGAIN != op->syserrno)) {
+    op->result.code = -1;
+    return PR_TRUE;
+  } else {
+    return PR_FALSE;
+  }
+} 
+
+static PRBool pt_writev_cont(pt_Continuation* op, PRInt16 revents) {
+  PRIntn bytes;
+  struct iovec* iov = (struct iovec*)op->arg2.buffer;
+  bytes = writev(op->arg1.osfd, iov, op->arg3.amount);
+  op->syserrno = errno;
+  if (bytes >= 0) 
+  {
+    PRIntn iov_index;
+    op->result.code += bytes; 
+    for (iov_index = 0; iov_index < op->arg3.amount; ++iov_index) {
+      if (bytes < iov[iov_index].iov_len) {
+        char** bp = (char**)&(iov[iov_index].iov_base);
+        iov[iov_index].iov_len -= bytes; 
+        *bp += bytes;                    
+        break;                           
+      }
+      bytes -= iov[iov_index].iov_len; 
+    }
+    op->arg2.buffer = &iov[iov_index]; 
+    op->arg3.amount -= iov_index;      
+    return (0 == op->arg3.amount) ? PR_TRUE : PR_FALSE;
+  }
+  if ((EWOULDBLOCK != op->syserrno) && (EAGAIN != op->syserrno)) {
+    op->result.code = -1;
+    return PR_TRUE;
+  } else {
+    return PR_FALSE;
+  }
+} 
+
+static PRBool pt_sendto_cont(pt_Continuation* op, PRInt16 revents) {
+  PRIntn bytes =
+      sendto(op->arg1.osfd, op->arg2.buffer, op->arg3.amount, op->arg4.flags,
+             (struct sockaddr*)op->arg5.addr, PR_NETADDR_SIZE(op->arg5.addr));
+  op->syserrno = errno;
+  if (bytes >= 0) 
+  {
+    char* bp = (char*)op->arg2.buffer;
+    bp += bytes; 
+    op->arg2.buffer = bp;
+    op->result.code += bytes; 
+    op->arg3.amount -= bytes; 
+    return (0 == op->arg3.amount) ? PR_TRUE : PR_FALSE;
+  }
+  if ((EWOULDBLOCK != op->syserrno) && (EAGAIN != op->syserrno)) {
+    op->result.code = -1;
+    return PR_TRUE;
+  } else {
+    return PR_FALSE;
+  }
+} 
+
+static PRBool pt_recvfrom_cont(pt_Continuation* op, PRInt16 revents) {
+  pt_SockLen addr_len = sizeof(PRNetAddr);
+  op->result.code =
+      recvfrom(op->arg1.osfd, op->arg2.buffer, op->arg3.amount, op->arg4.flags,
+               (struct sockaddr*)op->arg5.addr, &addr_len);
+  op->syserrno = errno;
+  return ((-1 == op->result.code) &&
+          (EWOULDBLOCK == op->syserrno || EAGAIN == op->syserrno))
+             ? PR_FALSE
+             : PR_TRUE;
+} 
+
+
+#if defined(HPUX11)
+static PRBool pt_hpux_sendfile_cont(pt_Continuation* op, PRInt16 revents) {
+  struct iovec* hdtrl = (struct iovec*)op->arg2.buffer;
+  int count;
+
+  count = sendfile(op->arg1.osfd, op->filedesc, op->arg3.file_spec.offset,
+                   op->arg3.file_spec.nbytes, hdtrl, op->arg4.flags);
+  PR_ASSERT(count <= op->nbytes_to_send);
+  op->syserrno = errno;
+
+  if (count != -1) {
+    op->result.code += count;
+  } else if (op->syserrno != EWOULDBLOCK && op->syserrno != EAGAIN) {
+    op->result.code = -1;
+  } else {
+    return PR_FALSE;
+  }
+  if (count != -1 && count < op->nbytes_to_send) {
+    if (count < hdtrl[0].iov_len) {
+
+      hdtrl[0].iov_base = ((char*)hdtrl[0].iov_base) + count;
+      hdtrl[0].iov_len -= count;
+
+    } else if (count < (hdtrl[0].iov_len + op->arg3.file_spec.nbytes)) {
+      PRUint32 file_nbytes_sent = count - hdtrl[0].iov_len;
+
+      hdtrl[0].iov_base = NULL;
+      hdtrl[0].iov_len = 0;
+
+      op->arg3.file_spec.offset += file_nbytes_sent;
+      op->arg3.file_spec.nbytes -= file_nbytes_sent;
+    } else if (count < (hdtrl[0].iov_len + op->arg3.file_spec.nbytes +
+                        hdtrl[1].iov_len)) {
+      PRUint32 trailer_nbytes_sent =
+          count - (hdtrl[0].iov_len + op->arg3.file_spec.nbytes);
+
+
+      hdtrl[0].iov_base = NULL;
+      hdtrl[0].iov_len = 0;
+      op->arg3.file_spec.offset = op->arg3.file_spec.st_size;
+      op->arg3.file_spec.nbytes = 0;
+
+      hdtrl[1].iov_base = ((char*)hdtrl[1].iov_base) + trailer_nbytes_sent;
+      hdtrl[1].iov_len -= trailer_nbytes_sent;
+    }
+    op->nbytes_to_send -= count;
+    return PR_FALSE;
+  }
+
+  return PR_TRUE;
+}
+#endif
+
+
+#if defined(LINUX)
+static PRBool pt_linux_sendfile_cont(pt_Continuation* op, PRInt16 revents) {
+  ssize_t rv;
+  off_t oldoffset;
+
+  oldoffset = op->offset;
+  rv = sendfile(op->arg1.osfd, op->in_fd, &op->offset, op->count);
+  op->syserrno = errno;
+
+  if (rv == -1) {
+    if (op->syserrno != EWOULDBLOCK && op->syserrno != EAGAIN) {
+      op->result.code = -1;
+      return PR_TRUE;
+    }
+    rv = 0;
+  }
+  PR_ASSERT(rv == op->offset - oldoffset);
+  op->result.code += rv;
+  if (rv < op->count) {
+    op->count -= rv;
+    return PR_FALSE;
+  }
+  return PR_TRUE;
+}
+#endif
+
+void _PR_InitIO(void) {
+#if defined(DEBUG)
+  memset(&pt_debug, 0, sizeof(PTDebug));
+  pt_debug.timeStarted = PR_Now();
+#endif
+
+  _pr_flock_lock = PR_NewLock();
+  PR_ASSERT(NULL != _pr_flock_lock);
+  _pr_flock_cv = PR_NewCondVar(_pr_flock_lock);
+  PR_ASSERT(NULL != _pr_flock_cv);
+  _pr_rename_lock = PR_NewLock();
+  PR_ASSERT(NULL != _pr_rename_lock);
+
+  _PR_InitFdCache(); 
+
+  _pr_stdin = pt_SetMethods(0, PR_DESC_FILE, PR_FALSE, PR_TRUE);
+  _pr_stdout = pt_SetMethods(1, PR_DESC_FILE, PR_FALSE, PR_TRUE);
+  _pr_stderr = pt_SetMethods(2, PR_DESC_FILE, PR_FALSE, PR_TRUE);
+  PR_ASSERT(_pr_stdin && _pr_stdout && _pr_stderr);
+
+#if defined(_PR_IPV6_V6ONLY_PROBE)
+  {
+    int osfd;
+    osfd = socket(AF_INET6, SOCK_STREAM, 0);
+    if (osfd != -1) {
+      int on;
+      socklen_t optlen = sizeof(on);
+      if (getsockopt(osfd, IPPROTO_IPV6, IPV6_V6ONLY, &on, &optlen) == 0) {
+        _pr_ipv6_v6only_on_by_default = on;
+      }
+      close(osfd);
+    }
+  }
+#endif
+} 
+
+void _PR_CleanupIO(void) {
+  _PR_Putfd(_pr_stdin);
+  _pr_stdin = NULL;
+  _PR_Putfd(_pr_stdout);
+  _pr_stdout = NULL;
+  _PR_Putfd(_pr_stderr);
+  _pr_stderr = NULL;
+
+  _PR_CleanupFdCache();
+
+  if (_pr_flock_cv) {
+    PR_DestroyCondVar(_pr_flock_cv);
+    _pr_flock_cv = NULL;
+  }
+  if (_pr_flock_lock) {
+    PR_DestroyLock(_pr_flock_lock);
+    _pr_flock_lock = NULL;
+  }
+  if (_pr_rename_lock) {
+    PR_DestroyLock(_pr_rename_lock);
+    _pr_rename_lock = NULL;
+  }
+} 
+
+PR_IMPLEMENT(PRFileDesc*) PR_GetSpecialFD(PRSpecialFD osfd) {
+  PRFileDesc* result = NULL;
+  PR_ASSERT(osfd >= PR_StandardInput && osfd <= PR_StandardError);
+
+  if (!_pr_initialized) {
+    _PR_ImplicitInitialization();
+  }
+
+  switch (osfd) {
+    case PR_StandardInput:
+      result = _pr_stdin;
+      break;
+    case PR_StandardOutput:
+      result = _pr_stdout;
+      break;
+    case PR_StandardError:
+      result = _pr_stderr;
+      break;
+    default:
+      (void)PR_SetError(PR_INVALID_ARGUMENT_ERROR, 0);
+  }
+  return result;
+} 
+
+
+static PRBool pt_TestAbort(void) {
+  PRThread* me = PR_GetCurrentThread();
+  if (_PT_THREAD_INTERRUPTED(me)) {
+    PR_SetError(PR_PENDING_INTERRUPT_ERROR, 0);
+    me->state &= ~PT_THREAD_ABORTED;
+    return PR_TRUE;
+  }
+  return PR_FALSE;
+} 
+
+static void pt_MapError(void (*mapper)(PRIntn), PRIntn syserrno) {
+  switch (syserrno) {
+    case EINTR:
+      PR_SetError(PR_PENDING_INTERRUPT_ERROR, 0);
+      break;
+    case ETIMEDOUT:
+      PR_SetError(PR_IO_TIMEOUT_ERROR, 0);
+      break;
+    default:
+      mapper(syserrno);
+  }
+} 
+
+static PRStatus pt_Close(PRFileDesc* fd) {
+  if ((NULL == fd) || (NULL == fd->secret) ||
+      ((_PR_FILEDESC_OPEN != fd->secret->state) &&
+       (_PR_FILEDESC_CLOSED != fd->secret->state))) {
+    PR_SetError(PR_BAD_DESCRIPTOR_ERROR, 0);
+    return PR_FAILURE;
+  }
+  if (pt_TestAbort()) {
+    return PR_FAILURE;
+  }
+
+  if (_PR_FILEDESC_OPEN == fd->secret->state) {
+    if (-1 == close(fd->secret->md.osfd)) {
+      pt_MapError(_PR_MD_MAP_CLOSE_ERROR, errno);
+      return PR_FAILURE;
+    }
+    fd->secret->state = _PR_FILEDESC_CLOSED;
+  }
+  _PR_Putfd(fd);
+  return PR_SUCCESS;
+} 
+
+static PRInt32 pt_Read(PRFileDesc* fd, void* buf, PRInt32 amount) {
+  PRInt32 syserrno, bytes = -1;
+
+  if (pt_TestAbort()) {
+    return bytes;
+  }
+
+  bytes = read(fd->secret->md.osfd, buf, amount);
+  syserrno = errno;
+
+  if ((bytes == -1) && (syserrno == EWOULDBLOCK || syserrno == EAGAIN) &&
+      (!fd->secret->nonblocking)) {
+    pt_Continuation op;
+    op.arg1.osfd = fd->secret->md.osfd;
+    op.arg2.buffer = buf;
+    op.arg3.amount = amount;
+    op.timeout = PR_INTERVAL_NO_TIMEOUT;
+    op.function = pt_read_cont;
+    op.event = POLLIN | POLLPRI;
+    bytes = pt_Continue(&op);
+    syserrno = op.syserrno;
+  }
+  if (bytes < 0) {
+    pt_MapError(_PR_MD_MAP_READ_ERROR, syserrno);
+  }
+  return bytes;
+} 
+
+static PRInt32 pt_Write(PRFileDesc* fd, const void* buf, PRInt32 amount) {
+  PRInt32 syserrno, bytes = -1;
+  PRBool fNeedContinue = PR_FALSE;
+
+  if (pt_TestAbort()) {
+    return bytes;
+  }
+
+  bytes = write(fd->secret->md.osfd, buf, amount);
+  syserrno = errno;
+
+  if ((bytes >= 0) && (bytes < amount) && (!fd->secret->nonblocking)) {
+    buf = (char*)buf + bytes;
+    amount -= bytes;
+    fNeedContinue = PR_TRUE;
+  }
+  if ((bytes == -1) && (syserrno == EWOULDBLOCK || syserrno == EAGAIN) &&
+      (!fd->secret->nonblocking)) {
+    bytes = 0;
+    fNeedContinue = PR_TRUE;
+  }
+
+  if (fNeedContinue == PR_TRUE) {
+    pt_Continuation op;
+    op.arg1.osfd = fd->secret->md.osfd;
+    op.arg2.buffer = (void*)buf;
+    op.arg3.amount = amount;
+    op.timeout = PR_INTERVAL_NO_TIMEOUT;
+    op.result.code = bytes; 
+    op.function = pt_write_cont;
+    op.event = POLLOUT | POLLPRI;
+    bytes = pt_Continue(&op);
+    syserrno = op.syserrno;
+  }
+  if (bytes == -1) {
+    pt_MapError(_PR_MD_MAP_WRITE_ERROR, syserrno);
+  }
+  return bytes;
+} 
+
+static PRInt32 pt_Writev(PRFileDesc* fd, const PRIOVec* iov, PRInt32 iov_len,
+                         PRIntervalTime timeout) {
+  PRIntn iov_index;
+  PRBool fNeedContinue = PR_FALSE;
+  PRInt32 syserrno, bytes, rv = -1;
+  struct iovec osiov_local[PR_MAX_IOVECTOR_SIZE], *osiov;
+  int osiov_len;
+
+  if (pt_TestAbort()) {
+    return rv;
+  }
+
+  PR_ASSERT(iov_len <= PR_MAX_IOVECTOR_SIZE);
+
+  osiov = osiov_local;
+  osiov_len = iov_len;
+  for (iov_index = 0; iov_index < osiov_len; iov_index++) {
+    osiov[iov_index].iov_base = iov[iov_index].iov_base;
+    osiov[iov_index].iov_len = iov[iov_index].iov_len;
+  }
+
+  rv = bytes = writev(fd->secret->md.osfd, osiov, osiov_len);
+  syserrno = errno;
+
+  if (!fd->secret->nonblocking) {
+    if (bytes >= 0) {
+      for (; osiov_len > 0; osiov++, osiov_len--) {
+        if (bytes < osiov->iov_len) {
+          osiov->iov_base = (char*)osiov->iov_base + bytes;
+          osiov->iov_len -= bytes;
+          break; 
+        }
+        bytes -= osiov->iov_len; 
+      }
+      PR_ASSERT(osiov_len > 0 || bytes == 0);
+      if (osiov_len > 0) {
+        if (PR_INTERVAL_NO_WAIT == timeout) {
+          rv = -1;
+          syserrno = ETIMEDOUT;
+        } else {
+          fNeedContinue = PR_TRUE;
+        }
+      }
+    } else if (syserrno == EWOULDBLOCK || syserrno == EAGAIN) {
+      if (PR_INTERVAL_NO_WAIT == timeout) {
+        syserrno = ETIMEDOUT;
+      } else {
+        rv = 0;
+        fNeedContinue = PR_TRUE;
+      }
+    }
+  }
+
+  if (fNeedContinue == PR_TRUE) {
+    pt_Continuation op;
+
+    op.arg1.osfd = fd->secret->md.osfd;
+    op.arg2.buffer = (void*)osiov;
+    op.arg3.amount = osiov_len;
+    op.timeout = timeout;
+    op.result.code = rv;
+    op.function = pt_writev_cont;
+    op.event = POLLOUT | POLLPRI;
+    rv = pt_Continue(&op);
+    syserrno = op.syserrno;
+  }
+  if (rv == -1) {
+    pt_MapError(_PR_MD_MAP_WRITEV_ERROR, syserrno);
+  }
+  return rv;
+} 
+
+static PRInt32 pt_Seek(PRFileDesc* fd, PRInt32 offset, PRSeekWhence whence) {
+  return _PR_MD_LSEEK(fd, offset, whence);
+} 
+
+static PRInt64 pt_Seek64(PRFileDesc* fd, PRInt64 offset, PRSeekWhence whence) {
+  return _PR_MD_LSEEK64(fd, offset, whence);
+} 
+
+static PRInt32 pt_Available_f(PRFileDesc* fd) {
+  PRInt32 result, cur, end;
+
+  cur = _PR_MD_LSEEK(fd, 0, PR_SEEK_CUR);
+
+  if (cur >= 0) {
+    end = _PR_MD_LSEEK(fd, 0, PR_SEEK_END);
+  }
+
+  if ((cur < 0) || (end < 0)) {
+    return -1;
+  }
+
+  result = end - cur;
+  _PR_MD_LSEEK(fd, cur, PR_SEEK_SET);
+
+  return result;
+} 
+
+static PRInt64 pt_Available64_f(PRFileDesc* fd) {
+  PRInt64 result, cur, end;
+  PRInt64 minus_one;
+
+  LL_I2L(minus_one, -1);
+  cur = _PR_MD_LSEEK64(fd, LL_ZERO, PR_SEEK_CUR);
+
+  if (LL_GE_ZERO(cur)) {
+    end = _PR_MD_LSEEK64(fd, LL_ZERO, PR_SEEK_END);
+  }
+
+  if (!LL_GE_ZERO(cur) || !LL_GE_ZERO(end)) {
+    return minus_one;
+  }
+
+  LL_SUB(result, end, cur);
+  (void)_PR_MD_LSEEK64(fd, cur, PR_SEEK_SET);
+
+  return result;
+} 
+
+static PRInt32 pt_Available_s(PRFileDesc* fd) {
+  PRInt32 rv, bytes = -1;
+  if (pt_TestAbort()) {
+    return bytes;
+  }
+
+  rv = ioctl(fd->secret->md.osfd, FIONREAD, &bytes);
+
+  if (rv == -1) {
+    pt_MapError(_PR_MD_MAP_SOCKETAVAILABLE_ERROR, errno);
+  }
+  return bytes;
+} 
+
+static PRInt64 pt_Available64_s(PRFileDesc* fd) {
+  PRInt64 rv;
+  LL_I2L(rv, pt_Available_s(fd));
+  return rv;
+} 
+
+static PRStatus pt_FileInfo(PRFileDesc* fd, PRFileInfo* info) {
+  PRInt32 rv = _PR_MD_GETOPENFILEINFO(fd, info);
+  return (-1 == rv) ? PR_FAILURE : PR_SUCCESS;
+} 
+
+static PRStatus pt_FileInfo64(PRFileDesc* fd, PRFileInfo64* info) {
+  PRInt32 rv = _PR_MD_GETOPENFILEINFO64(fd, info);
+  return (-1 == rv) ? PR_FAILURE : PR_SUCCESS;
+} 
+
+static PRStatus pt_Synch(PRFileDesc* fd) {
+  return (NULL == fd) ? PR_FAILURE : PR_SUCCESS;
+} 
+
+static PRStatus pt_Fsync(PRFileDesc* fd) {
+  PRIntn rv = -1;
+  if (pt_TestAbort()) {
+    return PR_FAILURE;
+  }
+
+  rv = fsync(fd->secret->md.osfd);
+  if (rv < 0) {
+    pt_MapError(_PR_MD_MAP_FSYNC_ERROR, errno);
+    return PR_FAILURE;
+  }
+  return PR_SUCCESS;
+} 
+
+static PRStatus pt_Connect(PRFileDesc* fd, const PRNetAddr* addr,
+                           PRIntervalTime timeout) {
+  PRIntn rv = -1, syserrno;
+  pt_SockLen addr_len;
+  const PRNetAddr* addrp = addr;
+#if defined(_PR_HAVE_SOCKADDR_LEN) || defined(_PR_INET6)
+  PRNetAddr addrCopy;
+#endif
+#if defined(_PR_HAVE_SOCKADDR_LEN)
+  PRUint16 md_af = addr->raw.family;
+#endif
+
+  if (pt_TestAbort()) {
+    return PR_FAILURE;
+  }
+
+  PR_ASSERT(IsValidNetAddr(addr) == PR_TRUE);
+  addr_len = PR_NETADDR_SIZE(addr);
+#if defined(_PR_INET6)
+  if (addr->raw.family == PR_AF_INET6) {
+#if defined(_PR_HAVE_SOCKADDR_LEN)
+    md_af = AF_INET6;
+#else
+    addrCopy = *addr;
+    addrCopy.raw.family = AF_INET6;
+    addrp = &addrCopy;
+#endif
+  }
+#endif
+
+#if defined(_PR_HAVE_SOCKADDR_LEN)
+  addrCopy = *addr;
+  ((struct sockaddr*)&addrCopy)->sa_len = addr_len;
+  ((struct sockaddr*)&addrCopy)->sa_family = md_af;
+  addrp = &addrCopy;
+#endif
+  rv = connect(fd->secret->md.osfd, (struct sockaddr*)addrp, addr_len);
+  syserrno = errno;
+  if ((-1 == rv) && (EINPROGRESS == syserrno) && (!fd->secret->nonblocking)) {
+    if (PR_INTERVAL_NO_WAIT == timeout) {
+      syserrno = ETIMEDOUT;
+    } else {
+      pt_Continuation op;
+      op.arg1.osfd = fd->secret->md.osfd;
+      op.arg2.buffer = (void*)addrp;
+      op.arg3.amount = addr_len;
+      op.timeout = timeout;
+      op.function = pt_connect_cont;
+      op.event = POLLOUT | POLLPRI;
+      rv = pt_Continue(&op);
+      syserrno = op.syserrno;
+    }
+  }
+  if (-1 == rv) {
+    pt_MapError(_PR_MD_MAP_CONNECT_ERROR, syserrno);
+    return PR_FAILURE;
+  }
+  return PR_SUCCESS;
+} 
+
+static PRStatus pt_ConnectContinue(PRFileDesc* fd, PRInt16 out_flags) {
+  int err;
+  PRInt32 osfd;
+
+  if (out_flags & PR_POLL_NVAL) {
+    PR_SetError(PR_BAD_DESCRIPTOR_ERROR, 0);
+    return PR_FAILURE;
+  }
+  if ((out_flags &
+       (PR_POLL_WRITE | PR_POLL_EXCEPT | PR_POLL_ERR | PR_POLL_HUP)) == 0) {
+    PR_ASSERT(out_flags == 0);
+    PR_SetError(PR_IN_PROGRESS_ERROR, 0);
+    return PR_FAILURE;
+  }
+
+  osfd = fd->secret->md.osfd;
+
+  err = _MD_unix_get_nonblocking_connect_error(osfd);
+  if (err != 0) {
+    _PR_MD_MAP_CONNECT_ERROR(err);
+    return PR_FAILURE;
+  }
+  return PR_SUCCESS;
+} 
+
+PR_IMPLEMENT(PRStatus) PR_GetConnectStatus(const PRPollDesc* pd) {
+  PRFileDesc* bottom = PR_GetIdentitiesLayer(pd->fd, PR_NSPR_IO_LAYER);
+
+  if (NULL == bottom) {
+    PR_SetError(PR_INVALID_ARGUMENT_ERROR, 0);
+    return PR_FAILURE;
+  }
+  return pt_ConnectContinue(bottom, pd->out_flags);
+} 
+
+static PRFileDesc* pt_Accept(PRFileDesc* fd, PRNetAddr* addr,
+                             PRIntervalTime timeout) {
+  PRFileDesc* newfd = NULL;
+  PRIntn syserrno, osfd = -1;
+  pt_SockLen addr_len = sizeof(PRNetAddr);
+
+  if (pt_TestAbort()) {
+    return newfd;
+  }
+
+#if defined(_PR_STRICT_ADDR_LEN)
+  if (addr) {
+    addr->raw.family = fd->secret->af;
+    addr_len = PR_NETADDR_SIZE(addr);
+  }
+#endif
+
+  osfd = accept(fd->secret->md.osfd, (struct sockaddr*)addr, &addr_len);
+  syserrno = errno;
+
+  if (osfd == -1) {
+    if (fd->secret->nonblocking) {
+      goto failed;
+    }
+
+    if (EWOULDBLOCK != syserrno && EAGAIN != syserrno &&
+        ECONNABORTED != syserrno) {
+      goto failed;
+    } else {
+      if (PR_INTERVAL_NO_WAIT == timeout) {
+        syserrno = ETIMEDOUT;
+      } else {
+        pt_Continuation op;
+        op.arg1.osfd = fd->secret->md.osfd;
+        op.arg2.buffer = addr;
+        op.arg3.addr_len = &addr_len;
+        op.timeout = timeout;
+        op.function = pt_accept_cont;
+        op.event = POLLIN | POLLPRI;
+        osfd = pt_Continue(&op);
+        syserrno = op.syserrno;
+      }
+      if (osfd < 0) {
+        goto failed;
+      }
+    }
+  }
+#if defined(_PR_HAVE_SOCKADDR_LEN)
+  if (addr) {
+    addr->raw.family = ((struct sockaddr*)addr)->sa_family;
+  }
+#endif
+#if defined(_PR_INET6)
+  if (addr && (AF_INET6 == addr->raw.family)) {
+    addr->raw.family = PR_AF_INET6;
+  }
+#endif
+  newfd = pt_SetMethods(osfd, PR_DESC_SOCKET_TCP, PR_TRUE, PR_FALSE);
+  if (newfd == NULL) {
+    close(osfd); 
+  } else {
+    PR_ASSERT(IsValidNetAddr(addr) == PR_TRUE);
+    PR_ASSERT(IsValidNetAddrLen(addr, addr_len) == PR_TRUE);
+#if defined(LINUX)
+    newfd->secret->md.tcp_nodelay = fd->secret->md.tcp_nodelay;
+#endif
+  }
+  return newfd;
+
+failed:
+  pt_MapError(_PR_MD_MAP_ACCEPT_ERROR, syserrno);
+  return NULL;
+} 
+
+static PRStatus pt_Bind(PRFileDesc* fd, const PRNetAddr* addr) {
+  PRIntn rv;
+  pt_SockLen addr_len;
+  const PRNetAddr* addrp = addr;
+#if defined(_PR_HAVE_SOCKADDR_LEN) || defined(_PR_INET6)
+  PRNetAddr addrCopy;
+#endif
+#if defined(_PR_HAVE_SOCKADDR_LEN)
+  PRUint16 md_af = addr->raw.family;
+#endif
+
+  if (pt_TestAbort()) {
+    return PR_FAILURE;
+  }
+
+  PR_ASSERT(IsValidNetAddr(addr) == PR_TRUE);
+  if (addr->raw.family == AF_UNIX) {
+    if (addr->local.path[0] != '/'
+#if defined(LINUX)
+        && addr->local.path[0] != 0
+#endif
+    ) {
+      PR_SetError(PR_INVALID_ARGUMENT_ERROR, 0);
+      return PR_FAILURE;
+    }
+  }
+
+#if defined(_PR_INET6)
+  if (addr->raw.family == PR_AF_INET6) {
+#if defined(_PR_HAVE_SOCKADDR_LEN)
+    md_af = AF_INET6;
+#else
+    addrCopy = *addr;
+    addrCopy.raw.family = AF_INET6;
+    addrp = &addrCopy;
+#endif
+  }
+#endif
+
+  addr_len = PR_NETADDR_SIZE(addr);
+#if defined(_PR_HAVE_SOCKADDR_LEN)
+  addrCopy = *addr;
+  ((struct sockaddr*)&addrCopy)->sa_len = addr_len;
+  ((struct sockaddr*)&addrCopy)->sa_family = md_af;
+  addrp = &addrCopy;
+#endif
+  rv = bind(fd->secret->md.osfd, (struct sockaddr*)addrp, addr_len);
+
+  if (rv == -1) {
+    pt_MapError(_PR_MD_MAP_BIND_ERROR, errno);
+    return PR_FAILURE;
+  }
+  return PR_SUCCESS;
+} 
+
+static PRStatus pt_Listen(PRFileDesc* fd, PRIntn backlog) {
+  PRIntn rv;
+
+  if (pt_TestAbort()) {
+    return PR_FAILURE;
+  }
+
+  rv = listen(fd->secret->md.osfd, backlog);
+  if (rv == -1) {
+    pt_MapError(_PR_MD_MAP_LISTEN_ERROR, errno);
+    return PR_FAILURE;
+  }
+  return PR_SUCCESS;
+} 
+
+static PRStatus pt_Shutdown(PRFileDesc* fd, PRIntn how) {
+  PRIntn rv = -1;
+  if (pt_TestAbort()) {
+    return PR_FAILURE;
+  }
+
+  rv = shutdown(fd->secret->md.osfd, how);
+
+  if (rv == -1) {
+    pt_MapError(_PR_MD_MAP_SHUTDOWN_ERROR, errno);
+    return PR_FAILURE;
+  }
+  return PR_SUCCESS;
+} 
+
+static PRInt16 pt_Poll(PRFileDesc* fd, PRInt16 in_flags, PRInt16* out_flags) {
+  *out_flags = 0;
+  return in_flags;
+} 
+
+static PRInt32 pt_Recv(PRFileDesc* fd, void* buf, PRInt32 amount, PRIntn flags,
+                       PRIntervalTime timeout) {
+  PRInt32 syserrno, bytes = -1;
+  PRIntn osflags;
+
+  if (0 == flags) {
+    osflags = 0;
+  } else if (PR_MSG_PEEK == flags) {
+    osflags = MSG_PEEK;
+  } else {
+    PR_SetError(PR_INVALID_ARGUMENT_ERROR, 0);
+    return bytes;
+  }
+
+  if (pt_TestAbort()) {
+    return bytes;
+  }
+
+  bytes = recv(fd->secret->md.osfd, buf, amount, osflags);
+  syserrno = errno;
+
+  if ((bytes == -1) && (syserrno == EWOULDBLOCK || syserrno == EAGAIN) &&
+      (!fd->secret->nonblocking)) {
+    if (PR_INTERVAL_NO_WAIT == timeout) {
+      syserrno = ETIMEDOUT;
+    } else {
+      pt_Continuation op;
+      op.arg1.osfd = fd->secret->md.osfd;
+      op.arg2.buffer = buf;
+      op.arg3.amount = amount;
+      op.arg4.flags = osflags;
+      op.timeout = timeout;
+      op.function = pt_recv_cont;
+      op.event = POLLIN | POLLPRI;
+      bytes = pt_Continue(&op);
+      syserrno = op.syserrno;
+    }
+  }
+  if (bytes < 0) {
+    pt_MapError(_PR_MD_MAP_RECV_ERROR, syserrno);
+  }
+  return bytes;
+} 
+
+static PRInt32 pt_SocketRead(PRFileDesc* fd, void* buf, PRInt32 amount) {
+  return pt_Recv(fd, buf, amount, 0, PR_INTERVAL_NO_TIMEOUT);
+} 
+
+static PRInt32 pt_Send(PRFileDesc* fd, const void* buf, PRInt32 amount,
+                       PRIntn flags, PRIntervalTime timeout) {
+  PRInt32 syserrno, bytes = -1;
+  PRBool fNeedContinue = PR_FALSE;
+
+  if (pt_TestAbort()) {
+    return bytes;
+  }
+
+  bytes = send(fd->secret->md.osfd, buf, amount, flags);
+  syserrno = errno;
+
+
+  if ((bytes >= 0) && (bytes < amount) && (!fd->secret->nonblocking)) {
+    if (PR_INTERVAL_NO_WAIT == timeout) {
+      bytes = -1;
+      syserrno = ETIMEDOUT;
+    } else {
+      buf = (char*)buf + bytes;
+      amount -= bytes;
+      fNeedContinue = PR_TRUE;
+    }
+  }
+  if ((bytes == -1) && (syserrno == EWOULDBLOCK || syserrno == EAGAIN) &&
+      (!fd->secret->nonblocking)) {
+    if (PR_INTERVAL_NO_WAIT == timeout) {
+      syserrno = ETIMEDOUT;
+    } else {
+      bytes = 0;
+      fNeedContinue = PR_TRUE;
+    }
+  }
+
+  if (fNeedContinue == PR_TRUE) {
+    pt_Continuation op;
+    op.arg1.osfd = fd->secret->md.osfd;
+    op.arg2.buffer = (void*)buf;
+    op.arg3.amount = amount;
+    op.arg4.flags = flags;
+    op.timeout = timeout;
+    op.result.code = bytes; 
+    op.function = pt_send_cont;
+    op.event = POLLOUT | POLLPRI;
+    bytes = pt_Continue(&op);
+    syserrno = op.syserrno;
+  }
+  if (bytes == -1) {
+    pt_MapError(_PR_MD_MAP_SEND_ERROR, syserrno);
+  }
+  return bytes;
+} 
+
+static PRInt32 pt_SocketWrite(PRFileDesc* fd, const void* buf, PRInt32 amount) {
+  return pt_Send(fd, buf, amount, 0, PR_INTERVAL_NO_TIMEOUT);
+} 
+
+static PRInt32 pt_SendTo(PRFileDesc* fd, const void* buf, PRInt32 amount,
+                         PRIntn flags, const PRNetAddr* addr,
+                         PRIntervalTime timeout) {
+  PRInt32 syserrno, bytes = -1;
+  PRBool fNeedContinue = PR_FALSE;
+  pt_SockLen addr_len;
+  const PRNetAddr* addrp = addr;
+#if defined(_PR_HAVE_SOCKADDR_LEN) || defined(_PR_INET6)
+  PRNetAddr addrCopy;
+#endif
+#if defined(_PR_HAVE_SOCKADDR_LEN)
+  PRUint16 md_af = addr->raw.family;
+#endif
+
+  if (pt_TestAbort()) {
+    return bytes;
+  }
+
+  PR_ASSERT(IsValidNetAddr(addr) == PR_TRUE);
+#if defined(_PR_INET6)
+  if (addr->raw.family == PR_AF_INET6) {
+#if defined(_PR_HAVE_SOCKADDR_LEN)
+    md_af = AF_INET6;
+#else
+    addrCopy = *addr;
+    addrCopy.raw.family = AF_INET6;
+    addrp = &addrCopy;
+#endif
+  }
+#endif
+
+  addr_len = PR_NETADDR_SIZE(addr);
+#if defined(_PR_HAVE_SOCKADDR_LEN)
+  addrCopy = *addr;
+  ((struct sockaddr*)&addrCopy)->sa_len = addr_len;
+  ((struct sockaddr*)&addrCopy)->sa_family = md_af;
+  addrp = &addrCopy;
+#endif
+  bytes = sendto(fd->secret->md.osfd, buf, amount, flags,
+                 (struct sockaddr*)addrp, addr_len);
+  syserrno = errno;
+  if ((bytes == -1) && (syserrno == EWOULDBLOCK || syserrno == EAGAIN) &&
+      (!fd->secret->nonblocking)) {
+    if (PR_INTERVAL_NO_WAIT == timeout) {
+      syserrno = ETIMEDOUT;
+    } else {
+      fNeedContinue = PR_TRUE;
+    }
+  }
+  if (fNeedContinue == PR_TRUE) {
+    pt_Continuation op;
+    op.arg1.osfd = fd->secret->md.osfd;
+    op.arg2.buffer = (void*)buf;
+    op.arg3.amount = amount;
+    op.arg4.flags = flags;
+    op.arg5.addr = (PRNetAddr*)addrp;
+    op.timeout = timeout;
+    op.result.code = 0; 
+    op.function = pt_sendto_cont;
+    op.event = POLLOUT | POLLPRI;
+    bytes = pt_Continue(&op);
+    syserrno = op.syserrno;
+  }
+  if (bytes < 0) {
+    pt_MapError(_PR_MD_MAP_SENDTO_ERROR, syserrno);
+  }
+  return bytes;
+} 
+
+#if defined(LINUX) || 0
+static PRInt32 pt_TCP_SendTo(PRFileDesc* fd, const void* buf, PRInt32 amount,
+                             PRIntn flags, const PRNetAddr* addr,
+                             PRIntervalTime timeout) {
+#if defined(LINUX) || HAS_CONNECTX
+  PRInt32 syserrno;
+  PRBool fNeedContinue = PR_FALSE;
+  pt_SockLen addr_len;
+  const PRNetAddr* addrp = addr;
+#if defined(_PR_HAVE_SOCKADDR_LEN) || defined(_PR_INET6)
+  PRNetAddr addrCopy;
+#endif
+#if defined(_PR_HAVE_SOCKADDR_LEN)
+  PRUint16 md_af = addr->raw.family;
+#endif
+
+  if (pt_TestAbort()) {
+    return -1;
+  }
+
+  PR_ASSERT(IsValidNetAddr(addr) == PR_TRUE);
+  addr_len = PR_NETADDR_SIZE(addr);
+#if defined(_PR_INET6)
+  if (addr->raw.family == PR_AF_INET6) {
+#if defined(_PR_HAVE_SOCKADDR_LEN)
+    md_af = AF_INET6;
+#else
+    addrCopy = *addr;
+    addrCopy.raw.family = AF_INET6;
+    addrp = &addrCopy;
+#endif
+  }
+#endif
+
+#if defined(_PR_HAVE_SOCKADDR_LEN)
+  addrCopy = *addr;
+  ((struct sockaddr*)&addrCopy)->sa_len = addr_len;
+  ((struct sockaddr*)&addrCopy)->sa_family = md_af;
+  addrp = &addrCopy;
+#endif
+
+  size_t bytes = 0;
+  PRInt32 netResult = 0;
+#if !defined(HAS_CONNECTX)
+  netResult = sendto(fd->secret->md.osfd, buf, amount, MSG_FASTOPEN,
+                     (struct sockaddr*)addrp, addr_len);
+  if (netResult >= 0) {
+    bytes = netResult;
+  }
+#else
+  sa_endpoints_t endpoints;
+  endpoints.sae_srcif = 0;
+  endpoints.sae_srcaddr = NULL;
+  endpoints.sae_srcaddrlen = 0;
+  endpoints.sae_dstaddr = (struct sockaddr*)addrp;
+  endpoints.sae_dstaddrlen = addr_len;
+  struct iovec iov[1];
+  iov[0].iov_base = buf;
+  iov[0].iov_len = amount;
+  netResult = connectx(fd->secret->md.osfd, &endpoints, SAE_ASSOCID_ANY,
+                       CONNECT_DATA_IDEMPOTENT, iov, 1, &bytes, NULL);
+#endif
+  syserrno = errno;
+  if ((netResult < 0) && (syserrno == EWOULDBLOCK || syserrno == EAGAIN) &&
+      (!fd->secret->nonblocking)) {
+    if (PR_INTERVAL_NO_WAIT == timeout) {
+      syserrno = ETIMEDOUT;
+    } else {
+      fNeedContinue = PR_TRUE;
+    }
+  }
+  if (fNeedContinue == PR_TRUE) {
+    pt_Continuation op;
+    op.arg1.osfd = fd->secret->md.osfd;
+    op.arg2.buffer = (void*)buf;
+    op.arg3.amount = amount;
+    op.arg4.flags = flags;
+    op.arg5.addr = (PRNetAddr*)addrp;
+    op.timeout = timeout;
+    op.result.code = 0; 
+    op.function = pt_sendto_cont;
+    op.event = POLLOUT | POLLPRI;
+    netResult = pt_Continue(&op);
+    if (netResult >= 0) {
+      bytes = netResult;
+    }
+    syserrno = op.syserrno;
+  }
+  if (netResult < 0) {
+    pt_MapError(_PR_MD_MAP_SENDTO_ERROR, syserrno);
+    return -1;
+  }
+  return bytes;
+#else
+  PR_SetError(PR_NOT_IMPLEMENTED_ERROR, 0);
+  return -1;
+#endif
+} 
+#endif
+
+static PRInt32 pt_RecvFrom(PRFileDesc* fd, void* buf, PRInt32 amount,
+                           PRIntn flags, PRNetAddr* addr,
+                           PRIntervalTime timeout) {
+  PRBool fNeedContinue = PR_FALSE;
+  PRInt32 syserrno, bytes = -1;
+  pt_SockLen addr_len = sizeof(PRNetAddr);
+
+  if (pt_TestAbort()) {
+    return bytes;
+  }
+
+  bytes = recvfrom(fd->secret->md.osfd, buf, amount, flags,
+                   (struct sockaddr*)addr, &addr_len);
+  syserrno = errno;
+
+  if ((bytes == -1) && (syserrno == EWOULDBLOCK || syserrno == EAGAIN) &&
+      (!fd->secret->nonblocking)) {
+    if (PR_INTERVAL_NO_WAIT == timeout) {
+      syserrno = ETIMEDOUT;
+    } else {
+      fNeedContinue = PR_TRUE;
+    }
+  }
+
+  if (fNeedContinue == PR_TRUE) {
+    pt_Continuation op;
+    op.arg1.osfd = fd->secret->md.osfd;
+    op.arg2.buffer = buf;
+    op.arg3.amount = amount;
+    op.arg4.flags = flags;
+    op.arg5.addr = addr;
+    op.timeout = timeout;
+    op.function = pt_recvfrom_cont;
+    op.event = POLLIN | POLLPRI;
+    bytes = pt_Continue(&op);
+    syserrno = op.syserrno;
+  }
+  if (bytes >= 0) {
+#if defined(_PR_HAVE_SOCKADDR_LEN)
+    if (addr) {
+      addr->raw.family = ((struct sockaddr*)addr)->sa_family;
+    }
+#endif
+#if defined(_PR_INET6)
+    if (addr && (AF_INET6 == addr->raw.family)) {
+      addr->raw.family = PR_AF_INET6;
+    }
+#endif
+  } else {
+    pt_MapError(_PR_MD_MAP_RECVFROM_ERROR, syserrno);
+  }
+  return bytes;
+} 
+
+
+#if defined(HPUX11)
+
+static PRInt32 pt_HPUXSendFile(PRFileDesc* sd, PRSendFileData* sfd,
+                               PRTransmitFileFlags flags,
+                               PRIntervalTime timeout) {
+  struct stat statbuf;
+  size_t nbytes_to_send, file_nbytes_to_send;
+  struct iovec hdtrl[2]; 
+  int send_flags;
+  PRInt32 count;
+  int syserrno;
+
+  if (sfd->file_nbytes == 0) {
+    if (fstat(sfd->fd->secret->md.osfd, &statbuf) == -1) {
+      _PR_MD_MAP_FSTAT_ERROR(errno);
+      return -1;
+    }
+    file_nbytes_to_send = statbuf.st_size - sfd->file_offset;
+  } else {
+    file_nbytes_to_send = sfd->file_nbytes;
+  }
+  nbytes_to_send = sfd->hlen + sfd->tlen + file_nbytes_to_send;
+
+  hdtrl[0].iov_base = (void*)sfd->header; 
+  hdtrl[0].iov_len = sfd->hlen;
+  hdtrl[1].iov_base = (void*)sfd->trailer;
+  hdtrl[1].iov_len = sfd->tlen;
+  send_flags = 0;
+
+  do {
+    count = sendfile(sd->secret->md.osfd, sfd->fd->secret->md.osfd,
+                     sfd->file_offset, file_nbytes_to_send, hdtrl, send_flags);
+  } while (count == -1 && (syserrno = errno) == EINTR);
+
+  if (count == -1 && (syserrno == EAGAIN || syserrno == EWOULDBLOCK)) {
+    count = 0;
+  }
+  if (count != -1 && count < nbytes_to_send) {
+    pt_Continuation op;
+
+    if (count < sfd->hlen) {
+
+      hdtrl[0].iov_base = ((char*)sfd->header) + count;
+      hdtrl[0].iov_len = sfd->hlen - count;
+      op.arg3.file_spec.offset = sfd->file_offset;
+      op.arg3.file_spec.nbytes = file_nbytes_to_send;
+    } else if (count < (sfd->hlen + file_nbytes_to_send)) {
+
+      hdtrl[0].iov_base = NULL;
+      hdtrl[0].iov_len = 0;
+
+      op.arg3.file_spec.offset = sfd->file_offset + count - sfd->hlen;
+      op.arg3.file_spec.nbytes = file_nbytes_to_send - (count - sfd->hlen);
+    } else if (count < (sfd->hlen + file_nbytes_to_send + sfd->tlen)) {
+      PRUint32 trailer_nbytes_sent;
+
+
+      hdtrl[0].iov_base = NULL;
+      hdtrl[0].iov_len = 0;
+      op.arg3.file_spec.offset = statbuf.st_size;
+      op.arg3.file_spec.nbytes = 0;
+
+      trailer_nbytes_sent = count - sfd->hlen - file_nbytes_to_send;
+      hdtrl[1].iov_base = ((char*)sfd->trailer) + trailer_nbytes_sent;
+      hdtrl[1].iov_len = sfd->tlen - trailer_nbytes_sent;
+    }
+
+    op.arg1.osfd = sd->secret->md.osfd;
+    op.filedesc = sfd->fd->secret->md.osfd;
+    op.arg2.buffer = hdtrl;
+    op.arg3.file_spec.st_size = statbuf.st_size;
+    op.arg4.flags = send_flags;
+    op.nbytes_to_send = nbytes_to_send - count;
+    op.result.code = count;
+    op.timeout = timeout;
+    op.function = pt_hpux_sendfile_cont;
+    op.event = POLLOUT | POLLPRI;
+    count = pt_Continue(&op);
+    syserrno = op.syserrno;
+  }
+
+  if (count == -1) {
+    pt_MapError(_MD_hpux_map_sendfile_error, syserrno);
+    return -1;
+  }
+  if (flags & PR_TRANSMITFILE_CLOSE_SOCKET) {
+    PR_Close(sd);
+  }
+  PR_ASSERT(count == nbytes_to_send);
+  return count;
+}
+
+#endif
+
+
+#if defined(LINUX)
+
+static PRInt32 pt_LinuxSendFile(PRFileDesc* sd, PRSendFileData* sfd,
+                                PRTransmitFileFlags flags,
+                                PRIntervalTime timeout) {
+  struct stat statbuf;
+  size_t file_nbytes_to_send;
+  PRInt32 count = 0;
+  ssize_t rv;
+  int syserrno;
+  off_t offset;
+  PRBool tcp_cork_enabled = PR_FALSE;
+  int tcp_cork;
+
+  if (sfd->file_nbytes == 0) {
+    if (fstat(sfd->fd->secret->md.osfd, &statbuf) == -1) {
+      _PR_MD_MAP_FSTAT_ERROR(errno);
+      return -1;
+    }
+    file_nbytes_to_send = statbuf.st_size - sfd->file_offset;
+  } else {
+    file_nbytes_to_send = sfd->file_nbytes;
+  }
+
+  if ((sfd->hlen != 0 || sfd->tlen != 0) && sd->secret->md.tcp_nodelay == 0) {
+    tcp_cork = 1;
+    if (setsockopt(sd->secret->md.osfd, SOL_TCP, TCP_CORK, &tcp_cork,
+                   sizeof tcp_cork) == 0) {
+      tcp_cork_enabled = PR_TRUE;
+    } else {
+      syserrno = errno;
+      if (syserrno != EINVAL) {
+        _PR_MD_MAP_SETSOCKOPT_ERROR(syserrno);
+        return -1;
+      }
+      PR_LOG(_pr_io_lm, PR_LOG_WARNING,
+             ("pt_LinuxSendFile: "
+              "setsockopt(TCP_CORK) failed with EINVAL\n"));
+    }
+  }
+
+  if (sfd->hlen != 0) {
+    count = PR_Send(sd, sfd->header, sfd->hlen, 0, timeout);
+    if (count == -1) {
+      goto failed;
+    }
+  }
+
+  if (file_nbytes_to_send != 0) {
+    offset = sfd->file_offset;
+    do {
+      rv = sendfile(sd->secret->md.osfd, sfd->fd->secret->md.osfd, &offset,
+                    file_nbytes_to_send);
+    } while (rv == -1 && (syserrno = errno) == EINTR);
+    if (rv == -1) {
+      if (syserrno != EAGAIN && syserrno != EWOULDBLOCK) {
+        _MD_linux_map_sendfile_error(syserrno);
+        count = -1;
+        goto failed;
+      }
+      rv = 0;
+    }
+    PR_ASSERT(rv == offset - sfd->file_offset);
+    count += rv;
+
+    if (rv < file_nbytes_to_send) {
+      pt_Continuation op;
+
+      op.arg1.osfd = sd->secret->md.osfd;
+      op.in_fd = sfd->fd->secret->md.osfd;
+      op.offset = offset;
+      op.count = file_nbytes_to_send - rv;
+      op.result.code = count;
+      op.timeout = timeout;
+      op.function = pt_linux_sendfile_cont;
+      op.event = POLLOUT | POLLPRI;
+      count = pt_Continue(&op);
+      syserrno = op.syserrno;
+      if (count == -1) {
+        pt_MapError(_MD_linux_map_sendfile_error, syserrno);
+        goto failed;
+      }
+    }
+  }
+
+  if (sfd->tlen != 0) {
+    rv = PR_Send(sd, sfd->trailer, sfd->tlen, 0, timeout);
+    if (rv == -1) {
+      count = -1;
+      goto failed;
+    }
+    count += rv;
+  }
+
+failed:
+  if (tcp_cork_enabled) {
+    tcp_cork = 0;
+    if (setsockopt(sd->secret->md.osfd, SOL_TCP, TCP_CORK, &tcp_cork,
+                   sizeof tcp_cork) == -1 &&
+        count != -1) {
+      _PR_MD_MAP_SETSOCKOPT_ERROR(errno);
+      count = -1;
+    }
+  }
+  if (count != -1) {
+    if (flags & PR_TRANSMITFILE_CLOSE_SOCKET) {
+      PR_Close(sd);
+    }
+    PR_ASSERT(count == sfd->hlen + sfd->tlen + file_nbytes_to_send);
+  }
+  return count;
+}
+#endif
+
+
+static PRInt32 pt_SendFile(PRFileDesc* sd, PRSendFileData* sfd,
+                           PRTransmitFileFlags flags, PRIntervalTime timeout) {
+  if (pt_TestAbort()) {
+    return -1;
+  }
+  if (sd->secret->nonblocking) {
+    PR_SetError(PR_INVALID_ARGUMENT_ERROR, 0);
+    return -1;
+  }
+#if defined(HPUX11)
+  return (pt_HPUXSendFile(sd, sfd, flags, timeout));
+#elif defined(LINUX)
+  return (pt_LinuxSendFile(sd, sfd, flags, timeout));
+#else
+  return (PR_EmulateSendFile(sd, sfd, flags, timeout));
+#endif
+}
+
+static PRInt32 pt_TransmitFile(PRFileDesc* sd, PRFileDesc* fd,
+                               const void* headers, PRInt32 hlen,
+                               PRTransmitFileFlags flags,
+                               PRIntervalTime timeout) {
+  PRSendFileData sfd;
+
+  sfd.fd = fd;
+  sfd.file_offset = 0;
+  sfd.file_nbytes = 0;
+  sfd.header = headers;
+  sfd.hlen = hlen;
+  sfd.trailer = NULL;
+  sfd.tlen = 0;
+
+  return (pt_SendFile(sd, &sfd, flags, timeout));
+} 
+
+static PRInt32 pt_AcceptRead(PRFileDesc* sd, PRFileDesc** nd, PRNetAddr** raddr,
+                             void* buf, PRInt32 amount,
+                             PRIntervalTime timeout) {
+  PRInt32 rv = -1;
+
+  if (pt_TestAbort()) {
+    return rv;
+  }
+  if (sd->secret->nonblocking) {
+    PR_SetError(PR_INVALID_ARGUMENT_ERROR, 0);
+    return rv;
+  }
+
+  rv = PR_EmulateAcceptRead(sd, nd, raddr, buf, amount, timeout);
+  return rv;
+} 
+
+static PRStatus pt_GetSockName(PRFileDesc* fd, PRNetAddr* addr) {
+  PRIntn rv = -1;
+  pt_SockLen addr_len = sizeof(PRNetAddr);
+
+  if (pt_TestAbort()) {
+    return PR_FAILURE;
+  }
+
+  rv = getsockname(fd->secret->md.osfd, (struct sockaddr*)addr, &addr_len);
+  if (rv == -1) {
+    pt_MapError(_PR_MD_MAP_GETSOCKNAME_ERROR, errno);
+    return PR_FAILURE;
+  }
+#if defined(_PR_HAVE_SOCKADDR_LEN)
+  if (addr) {
+    addr->raw.family = ((struct sockaddr*)addr)->sa_family;
+  }
+#endif
+#if defined(_PR_INET6)
+  if (AF_INET6 == addr->raw.family) {
+    addr->raw.family = PR_AF_INET6;
+  }
+#endif
+  PR_ASSERT(IsValidNetAddr(addr) == PR_TRUE);
+  PR_ASSERT(IsValidNetAddrLen(addr, addr_len) == PR_TRUE);
+  return PR_SUCCESS;
+} 
+
+static PRStatus pt_GetPeerName(PRFileDesc* fd, PRNetAddr* addr) {
+  PRIntn rv = -1;
+  pt_SockLen addr_len = sizeof(PRNetAddr);
+
+  if (pt_TestAbort()) {
+    return PR_FAILURE;
+  }
+
+  rv = getpeername(fd->secret->md.osfd, (struct sockaddr*)addr, &addr_len);
+
+  if (rv == -1) {
+    pt_MapError(_PR_MD_MAP_GETPEERNAME_ERROR, errno);
+    return PR_FAILURE;
+  }
+#if defined(_PR_HAVE_SOCKADDR_LEN)
+  if (addr) {
+    addr->raw.family = ((struct sockaddr*)addr)->sa_family;
+  }
+#endif
+#if defined(_PR_INET6)
+  if (AF_INET6 == addr->raw.family) {
+    addr->raw.family = PR_AF_INET6;
+  }
+#endif
+  PR_ASSERT(IsValidNetAddr(addr) == PR_TRUE);
+  PR_ASSERT(IsValidNetAddrLen(addr, addr_len) == PR_TRUE);
+  return PR_SUCCESS;
+} 
+
+static PRStatus pt_GetSocketOption(PRFileDesc* fd, PRSocketOptionData* data) {
+  PRIntn rv;
+  pt_SockLen length;
+  PRInt32 level, name;
+
+  if (PR_SockOpt_Nonblocking == data->option) {
+    data->value.non_blocking = fd->secret->nonblocking;
+    return PR_SUCCESS;
+  }
+
+  rv = _PR_MapOptionName(data->option, &level, &name);
+  if (PR_SUCCESS == rv) {
+    switch (data->option) {
+      case PR_SockOpt_Linger: {
+        struct linger linger;
+        length = sizeof(linger);
+        rv = getsockopt(fd->secret->md.osfd, level, name, (char*)&linger,
+                        &length);
+        PR_ASSERT((-1 == rv) || (sizeof(linger) == length));
+        data->value.linger.polarity = (linger.l_onoff) ? PR_TRUE : PR_FALSE;
+        data->value.linger.linger = PR_SecondsToInterval(linger.l_linger);
+        break;
+      }
+      case PR_SockOpt_Reuseaddr:
+      case PR_SockOpt_Keepalive:
+      case PR_SockOpt_NoDelay:
+      case PR_SockOpt_Broadcast:
+      case PR_SockOpt_Reuseport: {
+        PRIntn value;
+        length = sizeof(PRIntn);
+        rv = getsockopt(fd->secret->md.osfd, level, name, (char*)&value,
+                        &length);
+        PR_ASSERT((-1 == rv) || (sizeof(PRIntn) == length));
+        data->value.reuse_addr = (0 == value) ? PR_FALSE : PR_TRUE;
+        break;
+      }
+      case PR_SockOpt_McastLoopback: {
+        PRUint8 xbool;
+        length = sizeof(xbool);
+        rv = getsockopt(fd->secret->md.osfd, level, name, (char*)&xbool,
+                        &length);
+        PR_ASSERT((-1 == rv) || (sizeof(xbool) == length));
+        data->value.mcast_loopback = (0 == xbool) ? PR_FALSE : PR_TRUE;
+        break;
+      }
+      case PR_SockOpt_RecvBufferSize:
+      case PR_SockOpt_SendBufferSize:
+      case PR_SockOpt_MaxSegment: {
+        PRIntn value;
+        length = sizeof(PRIntn);
+        rv = getsockopt(fd->secret->md.osfd, level, name, (char*)&value,
+                        &length);
+        PR_ASSERT((-1 == rv) || (sizeof(PRIntn) == length));
+        data->value.recv_buffer_size = value;
+        break;
+      }
+      case PR_SockOpt_IpTimeToLive:
+      case PR_SockOpt_IpTypeOfService: {
+        length = sizeof(PRUintn);
+        rv = getsockopt(fd->secret->md.osfd, level, name,
+                        (char*)&data->value.ip_ttl, &length);
+        PR_ASSERT((-1 == rv) || (sizeof(PRIntn) == length));
+        break;
+      }
+      case PR_SockOpt_McastTimeToLive: {
+        PRUint8 ttl;
+        length = sizeof(ttl);
+        rv = getsockopt(fd->secret->md.osfd, level, name, (char*)&ttl, &length);
+        PR_ASSERT((-1 == rv) || (sizeof(ttl) == length));
+        data->value.mcast_ttl = ttl;
+        break;
+      }
+      case PR_SockOpt_AddMember:
+      case PR_SockOpt_DropMember: {
+        struct ip_mreq mreq;
+        length = sizeof(mreq);
+        rv =
+            getsockopt(fd->secret->md.osfd, level, name, (char*)&mreq, &length);
+        PR_ASSERT((-1 == rv) || (sizeof(mreq) == length));
+        data->value.add_member.mcaddr.inet.ip = mreq.imr_multiaddr.s_addr;
+        data->value.add_member.ifaddr.inet.ip = mreq.imr_interface.s_addr;
+        break;
+      }
+      case PR_SockOpt_McastInterface: {
+        length = sizeof(data->value.mcast_if.inet.ip);
+        rv = getsockopt(fd->secret->md.osfd, level, name,
+                        (char*)&data->value.mcast_if.inet.ip, &length);
+        PR_ASSERT((-1 == rv) ||
+                  (sizeof(data->value.mcast_if.inet.ip) == length));
+        break;
+      }
+      case PR_SockOpt_DontFrag: {
+#if !0 && !defined(LINUX) && !0
+        PR_SetError(PR_OPERATION_NOT_SUPPORTED_ERROR, 0);
+        rv = PR_FAILURE;
+#else
+        PRIntn value;
+        length = sizeof(value);
+        rv = getsockopt(fd->secret->md.osfd, level, name, (char*)&value,
+                        &length);
+        data->value.dont_fragment = (value == IP_PMTUDISC_DO) ? 1 : 0;
+#endif
+        break;
+      }
+      default:
+        PR_NOT_REACHED("Unknown socket option");
+        break;
+    }
+    if (-1 == rv) {
+      _PR_MD_MAP_GETSOCKOPT_ERROR(errno);
+    }
+  }
+  return (-1 == rv) ? PR_FAILURE : PR_SUCCESS;
+} 
+
+static PRStatus pt_SetSocketOption(PRFileDesc* fd,
+                                   const PRSocketOptionData* data) {
+  PRIntn rv;
+  PRInt32 level, name;
+
+  if (PR_SockOpt_Nonblocking == data->option) {
+    fd->secret->nonblocking = data->value.non_blocking;
+    return PR_SUCCESS;
+  }
+
+  rv = _PR_MapOptionName(data->option, &level, &name);
+  if (PR_SUCCESS == rv) {
+    switch (data->option) {
+      case PR_SockOpt_Linger: {
+        struct linger linger;
+        linger.l_onoff = data->value.linger.polarity;
+        linger.l_linger = PR_IntervalToSeconds(data->value.linger.linger);
+        rv = setsockopt(fd->secret->md.osfd, level, name, (char*)&linger,
+                        sizeof(linger));
+        break;
+      }
+      case PR_SockOpt_Reuseaddr:
+      case PR_SockOpt_Keepalive:
+      case PR_SockOpt_NoDelay:
+      case PR_SockOpt_Broadcast:
+      case PR_SockOpt_Reuseport: {
+        PRIntn value = (data->value.reuse_addr) ? 1 : 0;
+        rv = setsockopt(fd->secret->md.osfd, level, name, (char*)&value,
+                        sizeof(PRIntn));
+#if defined(LINUX)
+        if (name == TCP_NODELAY && rv == 0) {
+          fd->secret->md.tcp_nodelay = value;
+        }
+#endif
+        break;
+      }
+      case PR_SockOpt_McastLoopback: {
+        PRUint8 xbool = data->value.mcast_loopback ? 1 : 0;
+        rv = setsockopt(fd->secret->md.osfd, level, name, (char*)&xbool,
+                        sizeof(xbool));
+        break;
+      }
+      case PR_SockOpt_RecvBufferSize:
+      case PR_SockOpt_SendBufferSize:
+      case PR_SockOpt_MaxSegment: {
+        PRIntn value = data->value.recv_buffer_size;
+        rv = setsockopt(fd->secret->md.osfd, level, name, (char*)&value,
+                        sizeof(PRIntn));
+        break;
+      }
+      case PR_SockOpt_IpTimeToLive:
+      case PR_SockOpt_IpTypeOfService: {
+        rv = setsockopt(fd->secret->md.osfd, level, name,
+                        (char*)&data->value.ip_ttl, sizeof(PRUintn));
+        break;
+      }
+      case PR_SockOpt_McastTimeToLive: {
+        PRUint8 ttl = data->value.mcast_ttl;
+        rv = setsockopt(fd->secret->md.osfd, level, name, (char*)&ttl,
+                        sizeof(ttl));
+        break;
+      }
+      case PR_SockOpt_AddMember:
+      case PR_SockOpt_DropMember: {
+        struct ip_mreq mreq;
+        mreq.imr_multiaddr.s_addr = data->value.add_member.mcaddr.inet.ip;
+        mreq.imr_interface.s_addr = data->value.add_member.ifaddr.inet.ip;
+        rv = setsockopt(fd->secret->md.osfd, level, name, (char*)&mreq,
+                        sizeof(mreq));
+        break;
+      }
+      case PR_SockOpt_McastInterface: {
+        rv = setsockopt(fd->secret->md.osfd, level, name,
+                        (char*)&data->value.mcast_if.inet.ip,
+                        sizeof(data->value.mcast_if.inet.ip));
+        break;
+      }
+      case PR_SockOpt_DontFrag: {
+#if !0 && !defined(LINUX) && !0
+        PR_SetError(PR_OPERATION_NOT_SUPPORTED_ERROR, 0);
+        rv = PR_FAILURE;
+#else
+        PRIntn value;
+#if defined(LINUX) || 0
+        value = (data->value.dont_fragment) ? IP_PMTUDISC_DO : IP_PMTUDISC_DONT;
+#endif
+        rv = setsockopt(fd->secret->md.osfd, level, name, (char*)&value,
+                        sizeof(value));
+#endif
+        break;
+      }
+      default:
+        PR_NOT_REACHED("Unknown socket option");
+        break;
+    }
+    if (-1 == rv) {
+      _PR_MD_MAP_SETSOCKOPT_ERROR(errno);
+    }
+  }
+  return (-1 == rv) ? PR_FAILURE : PR_SUCCESS;
+} 
+
+
+static PRIOMethods _pr_file_methods = {PR_DESC_FILE,
+                                       pt_Close,
+                                       pt_Read,
+                                       pt_Write,
+                                       pt_Available_f,
+                                       pt_Available64_f,
+                                       pt_Fsync,
+                                       pt_Seek,
+                                       pt_Seek64,
+                                       pt_FileInfo,
+                                       pt_FileInfo64,
+                                       (PRWritevFN)_PR_InvalidInt,
+                                       (PRConnectFN)_PR_InvalidStatus,
+                                       (PRAcceptFN)_PR_InvalidDesc,
+                                       (PRBindFN)_PR_InvalidStatus,
+                                       (PRListenFN)_PR_InvalidStatus,
+                                       (PRShutdownFN)_PR_InvalidStatus,
+                                       (PRRecvFN)_PR_InvalidInt,
+                                       (PRSendFN)_PR_InvalidInt,
+                                       (PRRecvfromFN)_PR_InvalidInt,
+                                       (PRSendtoFN)_PR_InvalidInt,
+                                       pt_Poll,
+                                       (PRAcceptreadFN)_PR_InvalidInt,
+                                       (PRTransmitfileFN)_PR_InvalidInt,
+                                       (PRGetsocknameFN)_PR_InvalidStatus,
+                                       (PRGetpeernameFN)_PR_InvalidStatus,
+                                       (PRReservedFN)_PR_InvalidInt,
+                                       (PRReservedFN)_PR_InvalidInt,
+                                       (PRGetsocketoptionFN)_PR_InvalidStatus,
+                                       (PRSetsocketoptionFN)_PR_InvalidStatus,
+                                       (PRSendfileFN)_PR_InvalidInt,
+                                       (PRConnectcontinueFN)_PR_InvalidStatus,
+                                       (PRReservedFN)_PR_InvalidInt,
+                                       (PRReservedFN)_PR_InvalidInt,
+                                       (PRReservedFN)_PR_InvalidInt,
+                                       (PRReservedFN)_PR_InvalidInt};
+
+static PRIOMethods _pr_pipe_methods = {PR_DESC_PIPE,
+                                       pt_Close,
+                                       pt_Read,
+                                       pt_Write,
+                                       pt_Available_s,
+                                       pt_Available64_s,
+                                       pt_Synch,
+                                       (PRSeekFN)_PR_InvalidInt,
+                                       (PRSeek64FN)_PR_InvalidInt64,
+                                       (PRFileInfoFN)_PR_InvalidStatus,
+                                       (PRFileInfo64FN)_PR_InvalidStatus,
+                                       (PRWritevFN)_PR_InvalidInt,
+                                       (PRConnectFN)_PR_InvalidStatus,
+                                       (PRAcceptFN)_PR_InvalidDesc,
+                                       (PRBindFN)_PR_InvalidStatus,
+                                       (PRListenFN)_PR_InvalidStatus,
+                                       (PRShutdownFN)_PR_InvalidStatus,
+                                       (PRRecvFN)_PR_InvalidInt,
+                                       (PRSendFN)_PR_InvalidInt,
+                                       (PRRecvfromFN)_PR_InvalidInt,
+                                       (PRSendtoFN)_PR_InvalidInt,
+                                       pt_Poll,
+                                       (PRAcceptreadFN)_PR_InvalidInt,
+                                       (PRTransmitfileFN)_PR_InvalidInt,
+                                       (PRGetsocknameFN)_PR_InvalidStatus,
+                                       (PRGetpeernameFN)_PR_InvalidStatus,
+                                       (PRReservedFN)_PR_InvalidInt,
+                                       (PRReservedFN)_PR_InvalidInt,
+                                       (PRGetsocketoptionFN)_PR_InvalidStatus,
+                                       (PRSetsocketoptionFN)_PR_InvalidStatus,
+                                       (PRSendfileFN)_PR_InvalidInt,
+                                       (PRConnectcontinueFN)_PR_InvalidStatus,
+                                       (PRReservedFN)_PR_InvalidInt,
+                                       (PRReservedFN)_PR_InvalidInt,
+                                       (PRReservedFN)_PR_InvalidInt,
+                                       (PRReservedFN)_PR_InvalidInt};
+
+static PRIOMethods _pr_tcp_methods = {
+    PR_DESC_SOCKET_TCP,
+    pt_Close,
+    pt_SocketRead,
+    pt_SocketWrite,
+    pt_Available_s,
+    pt_Available64_s,
+    pt_Synch,
+    (PRSeekFN)_PR_InvalidInt,
+    (PRSeek64FN)_PR_InvalidInt64,
+    (PRFileInfoFN)_PR_InvalidStatus,
+    (PRFileInfo64FN)_PR_InvalidStatus,
+    pt_Writev,
+    pt_Connect,
+    pt_Accept,
+    pt_Bind,
+    pt_Listen,
+    pt_Shutdown,
+    pt_Recv,
+    pt_Send,
+    (PRRecvfromFN)_PR_InvalidInt,
+#if defined(LINUX) || 0
+    pt_TCP_SendTo, 
+#else
+    (PRSendtoFN)_PR_InvalidInt,
+#endif
+    pt_Poll,
+    pt_AcceptRead,
+    pt_TransmitFile,
+    pt_GetSockName,
+    pt_GetPeerName,
+    (PRReservedFN)_PR_InvalidInt,
+    (PRReservedFN)_PR_InvalidInt,
+    pt_GetSocketOption,
+    pt_SetSocketOption,
+    pt_SendFile,
+    pt_ConnectContinue,
+    (PRReservedFN)_PR_InvalidInt,
+    (PRReservedFN)_PR_InvalidInt,
+    (PRReservedFN)_PR_InvalidInt,
+    (PRReservedFN)_PR_InvalidInt};
+
+static PRIOMethods _pr_udp_methods = {PR_DESC_SOCKET_UDP,
+                                      pt_Close,
+                                      pt_SocketRead,
+                                      pt_SocketWrite,
+                                      pt_Available_s,
+                                      pt_Available64_s,
+                                      pt_Synch,
+                                      (PRSeekFN)_PR_InvalidInt,
+                                      (PRSeek64FN)_PR_InvalidInt64,
+                                      (PRFileInfoFN)_PR_InvalidStatus,
+                                      (PRFileInfo64FN)_PR_InvalidStatus,
+                                      pt_Writev,
+                                      pt_Connect,
+                                      (PRAcceptFN)_PR_InvalidDesc,
+                                      pt_Bind,
+                                      pt_Listen,
+                                      pt_Shutdown,
+                                      pt_Recv,
+                                      pt_Send,
+                                      pt_RecvFrom,
+                                      pt_SendTo,
+                                      pt_Poll,
+                                      (PRAcceptreadFN)_PR_InvalidInt,
+                                      (PRTransmitfileFN)_PR_InvalidInt,
+                                      pt_GetSockName,
+                                      pt_GetPeerName,
+                                      (PRReservedFN)_PR_InvalidInt,
+                                      (PRReservedFN)_PR_InvalidInt,
+                                      pt_GetSocketOption,
+                                      pt_SetSocketOption,
+                                      (PRSendfileFN)_PR_InvalidInt,
+                                      (PRConnectcontinueFN)_PR_InvalidStatus,
+                                      (PRReservedFN)_PR_InvalidInt,
+                                      (PRReservedFN)_PR_InvalidInt,
+                                      (PRReservedFN)_PR_InvalidInt,
+                                      (PRReservedFN)_PR_InvalidInt};
+
+static PRIOMethods _pr_socketpollfd_methods = {
+    (PRDescType)0,
+    (PRCloseFN)_PR_InvalidStatus,
+    (PRReadFN)_PR_InvalidInt,
+    (PRWriteFN)_PR_InvalidInt,
+    (PRAvailableFN)_PR_InvalidInt,
+    (PRAvailable64FN)_PR_InvalidInt64,
+    (PRFsyncFN)_PR_InvalidStatus,
+    (PRSeekFN)_PR_InvalidInt,
+    (PRSeek64FN)_PR_InvalidInt64,
+    (PRFileInfoFN)_PR_InvalidStatus,
+    (PRFileInfo64FN)_PR_InvalidStatus,
+    (PRWritevFN)_PR_InvalidInt,
+    (PRConnectFN)_PR_InvalidStatus,
+    (PRAcceptFN)_PR_InvalidDesc,
+    (PRBindFN)_PR_InvalidStatus,
+    (PRListenFN)_PR_InvalidStatus,
+    (PRShutdownFN)_PR_InvalidStatus,
+    (PRRecvFN)_PR_InvalidInt,
+    (PRSendFN)_PR_InvalidInt,
+    (PRRecvfromFN)_PR_InvalidInt,
+    (PRSendtoFN)_PR_InvalidInt,
+    pt_Poll,
+    (PRAcceptreadFN)_PR_InvalidInt,
+    (PRTransmitfileFN)_PR_InvalidInt,
+    (PRGetsocknameFN)_PR_InvalidStatus,
+    (PRGetpeernameFN)_PR_InvalidStatus,
+    (PRReservedFN)_PR_InvalidInt,
+    (PRReservedFN)_PR_InvalidInt,
+    (PRGetsocketoptionFN)_PR_InvalidStatus,
+    (PRSetsocketoptionFN)_PR_InvalidStatus,
+    (PRSendfileFN)_PR_InvalidInt,
+    (PRConnectcontinueFN)_PR_InvalidStatus,
+    (PRReservedFN)_PR_InvalidInt,
+    (PRReservedFN)_PR_InvalidInt,
+    (PRReservedFN)_PR_InvalidInt,
+    (PRReservedFN)_PR_InvalidInt};
+
+#if 0 || defined(LINUX) ||     \
+      defined(__GNU__) || defined(__GLIBC__) || 0 ||  \
+      defined(FREEBSD) || defined(NETBSD) || defined(OPENBSD) || \
+      defined(NTO) || 0 || defined(RISCOS)
+#    define _PR_FCNTL_FLAGS O_NONBLOCK
+#else
+#    error "Can't determine architecture"
+#endif
+
+static void pt_MakeFdNonblock(PRIntn osfd) {
+  PRIntn flags;
+  flags = fcntl(osfd, F_GETFL, 0);
+  flags |= _PR_FCNTL_FLAGS;
+  (void)fcntl(osfd, F_SETFL, flags);
+}
+
+#    define pt_MakeSocketNonblock pt_MakeFdNonblock
+
+static PRFileDesc* pt_SetMethods(PRIntn osfd, PRDescType type,
+                                 PRBool isAcceptedSocket, PRBool imported) {
+  PRFileDesc* fd = _PR_Getfd();
+
+  if (fd == NULL) {
+    PR_SetError(PR_OUT_OF_MEMORY_ERROR, 0);
+  } else {
+    fd->secret->md.osfd = osfd;
+    fd->secret->state = _PR_FILEDESC_OPEN;
+    if (imported) {
+      fd->secret->inheritable = _PR_TRI_UNKNOWN;
+    } else {
+#if defined(DEBUG)
+      PRIntn flags;
+      flags = fcntl(osfd, F_GETFD, 0);
+      PR_ASSERT(0 == flags);
+#endif
+      fd->secret->inheritable = _PR_TRI_TRUE;
+    }
+    switch (type) {
+      case PR_DESC_FILE:
+        fd->methods = PR_GetFileMethods();
+        break;
+      case PR_DESC_SOCKET_TCP:
+        fd->methods = PR_GetTCPMethods();
+#if defined(_PR_ACCEPT_INHERIT_NONBLOCK)
+        if (!isAcceptedSocket) {
+          pt_MakeSocketNonblock(osfd);
+        }
+#else
+        pt_MakeSocketNonblock(osfd);
+#endif
+        break;
+      case PR_DESC_SOCKET_UDP:
+        fd->methods = PR_GetUDPMethods();
+        pt_MakeFdNonblock(osfd);
+        break;
+      case PR_DESC_PIPE:
+        fd->methods = PR_GetPipeMethods();
+        pt_MakeFdNonblock(osfd);
+        break;
+      default:
+        break;
+    }
+  }
+  return fd;
+} 
+
+PR_IMPLEMENT(const PRIOMethods*) PR_GetFileMethods(void) {
+  return &_pr_file_methods;
+} 
+
+PR_IMPLEMENT(const PRIOMethods*) PR_GetPipeMethods(void) {
+  return &_pr_pipe_methods;
+} 
+
+PR_IMPLEMENT(const PRIOMethods*) PR_GetTCPMethods(void) {
+  return &_pr_tcp_methods;
+} 
+
+PR_IMPLEMENT(const PRIOMethods*) PR_GetUDPMethods(void) {
+  return &_pr_udp_methods;
+} 
+
+static const PRIOMethods* PR_GetSocketPollFdMethods(void) {
+  return &_pr_socketpollfd_methods;
+} 
+
+PR_IMPLEMENT(PRFileDesc*)
+PR_AllocFileDesc(PRInt32 osfd, const PRIOMethods* methods) {
+  PRFileDesc* fd = _PR_Getfd();
+
+  if (NULL == fd) {
+    goto failed;
+  }
+
+  fd->methods = methods;
+  fd->secret->md.osfd = osfd;
+  if (osfd > 2) {
+    if (&_pr_tcp_methods == methods) {
+      pt_MakeSocketNonblock(osfd);
+    } else {
+      pt_MakeFdNonblock(osfd);
+    }
+  }
+  fd->secret->state = _PR_FILEDESC_OPEN;
+  fd->secret->inheritable = _PR_TRI_UNKNOWN;
+  return fd;
+
+failed:
+  PR_SetError(PR_OUT_OF_MEMORY_ERROR, 0);
+  return fd;
+} 
+
+#if !defined(_PR_INET6) || defined(_PR_INET6_PROBE)
+PR_EXTERN(PRStatus) _pr_push_ipv6toipv4_layer(PRFileDesc* fd);
+#if defined(_PR_INET6_PROBE)
+extern PRBool _pr_ipv6_is_present(void);
+PR_IMPLEMENT(PRBool) _pr_test_ipv6_socket() {
+  int osfd;
+
+
+  osfd = socket(AF_INET6, SOCK_STREAM, 0);
+  if (osfd != -1) {
+    close(osfd);
+    return PR_TRUE;
+  }
+  return PR_FALSE;
+}
+#endif
+#endif
+
+PR_IMPLEMENT(PRFileDesc*)
+PR_Socket(PRInt32 domain, PRInt32 type, PRInt32 proto) {
+  PRIntn osfd;
+  PRDescType ftype;
+  PRFileDesc* fd = NULL;
+#if defined(_PR_INET6_PROBE) || !defined(_PR_INET6)
+  PRInt32 tmp_domain = domain;
+#endif
+
+  if (!_pr_initialized) {
+    _PR_ImplicitInitialization();
+  }
+
+  if (pt_TestAbort()) {
+    return NULL;
+  }
+
+  if (PF_INET != domain && PR_AF_INET6 != domain
+#if defined(_PR_HAVE_SDP)
+      && PR_AF_INET_SDP != domain
+#endif
+      && PF_UNIX != domain) {
+    PR_SetError(PR_ADDRESS_NOT_SUPPORTED_ERROR, 0);
+    return fd;
+  }
+  if (type == SOCK_STREAM) {
+    ftype = PR_DESC_SOCKET_TCP;
+  } else if (type == SOCK_DGRAM) {
+    ftype = PR_DESC_SOCKET_UDP;
+  } else {
+    (void)PR_SetError(PR_ADDRESS_NOT_SUPPORTED_ERROR, 0);
+    return fd;
+  }
+#if defined(_PR_HAVE_SDP)
+#if defined(LINUX)
+  if (PR_AF_INET_SDP == domain) {
+    domain = AF_INET_SDP;
+  }
+#endif
+#endif
+#if defined(_PR_INET6_PROBE)
+  if (PR_AF_INET6 == domain) {
+    domain = _pr_ipv6_is_present() ? AF_INET6 : AF_INET;
+  }
+#elif defined(_PR_INET6)
+  if (PR_AF_INET6 == domain) {
+    domain = AF_INET6;
+  }
+#else
+  if (PR_AF_INET6 == domain) {
+    domain = AF_INET;
+  }
+#endif
+
+  osfd = socket(domain, type, proto);
+  if (osfd == -1) {
+    pt_MapError(_PR_MD_MAP_SOCKET_ERROR, errno);
+  } else {
+#if defined(_PR_IPV6_V6ONLY_PROBE)
+    if ((domain == AF_INET6) && _pr_ipv6_v6only_on_by_default) {
+      int on = 0;
+      (void)setsockopt(osfd, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof(on));
+    }
+#endif
+    fd = pt_SetMethods(osfd, ftype, PR_FALSE, PR_FALSE);
+    if (fd == NULL) {
+      close(osfd);
+    }
+  }
+#if defined(_PR_NEED_SECRET_AF)
+  if (fd != NULL) {
+    fd->secret->af = domain;
+  }
+#endif
+#if defined(_PR_INET6_PROBE) || !defined(_PR_INET6)
+  if (fd != NULL) {
+    if (PR_AF_INET6 == tmp_domain && PR_AF_INET == domain) {
+      if (PR_FAILURE == _pr_push_ipv6toipv4_layer(fd)) {
+        PR_Close(fd);
+        fd = NULL;
+      }
+    }
+  }
+#endif
+  return fd;
+} 
+
+
+PR_IMPLEMENT(PRFileDesc*)
+PR_OpenFile(const char* name, PRIntn flags, PRIntn mode) {
+  PRFileDesc* fd = NULL;
+  PRIntn syserrno, osfd = -1, osflags = 0;
+  ;
+
+  if (!_pr_initialized) {
+    _PR_ImplicitInitialization();
+  }
+
+  if (pt_TestAbort()) {
+    return NULL;
+  }
+
+  if (flags & PR_RDONLY) {
+    osflags |= O_RDONLY;
+  }
+  if (flags & PR_WRONLY) {
+    osflags |= O_WRONLY;
+  }
+  if (flags & PR_RDWR) {
+    osflags |= O_RDWR;
+  }
+  if (flags & PR_APPEND) {
+    osflags |= O_APPEND;
+  }
+  if (flags & PR_TRUNCATE) {
+    osflags |= O_TRUNC;
+  }
+  if (flags & PR_EXCL) {
+    osflags |= O_EXCL;
+  }
+  if (flags & PR_SYNC) {
+#if defined(O_SYNC)
+    osflags |= O_SYNC;
+#elif defined(O_FSYNC)
+    osflags |= O_FSYNC;
+#else
+#    error "Neither O_SYNC nor O_FSYNC is defined on this platform"
+#endif
+  }
+
+  if (flags & PR_CREATE_FILE) {
+    osflags |= O_CREAT;
+    if (NULL != _pr_rename_lock) {
+      PR_Lock(_pr_rename_lock);
+    }
+  }
+
+  osfd = _md_iovector._open64(name, osflags, mode);
+  syserrno = errno;
+
+  if ((flags & PR_CREATE_FILE) && (NULL != _pr_rename_lock)) {
+    PR_Unlock(_pr_rename_lock);
+  }
+
+  if (osfd == -1) {
+    pt_MapError(_PR_MD_MAP_OPEN_ERROR, syserrno);
+  } else {
+    fd = pt_SetMethods(osfd, PR_DESC_FILE, PR_FALSE, PR_FALSE);
+    if (fd == NULL) {
+      close(osfd); 
+    }
+  }
+  return fd;
+} 
+
+PR_IMPLEMENT(PRFileDesc*) PR_Open(const char* name, PRIntn flags, PRIntn mode) {
+  return PR_OpenFile(name, flags, mode);
+} 
+
+PR_IMPLEMENT(PRStatus) PR_Delete(const char* name) {
+  PRIntn rv = -1;
+
+  if (!_pr_initialized) {
+    _PR_ImplicitInitialization();
+  }
+
+  if (pt_TestAbort()) {
+    return PR_FAILURE;
+  }
+
+  rv = unlink(name);
+
+  if (rv == -1) {
+    pt_MapError(_PR_MD_MAP_UNLINK_ERROR, errno);
+    return PR_FAILURE;
+  }
+  return PR_SUCCESS;
+} 
+
+PR_IMPLEMENT(PRStatus) PR_Access(const char* name, PRAccessHow how) {
+  PRIntn rv;
+
+  if (pt_TestAbort()) {
+    return PR_FAILURE;
+  }
+
+  switch (how) {
+    case PR_ACCESS_READ_OK:
+      rv = access(name, R_OK);
+      break;
+    case PR_ACCESS_WRITE_OK:
+      rv = access(name, W_OK);
+      break;
+    case PR_ACCESS_EXISTS:
+    default:
+      rv = access(name, F_OK);
+  }
+  if (0 == rv) {
+    return PR_SUCCESS;
+  }
+  pt_MapError(_PR_MD_MAP_ACCESS_ERROR, errno);
+  return PR_FAILURE;
+
+} 
+
+PR_IMPLEMENT(PRStatus) PR_GetFileInfo(const char* fn, PRFileInfo* info) {
+  PRInt32 rv = _PR_MD_GETFILEINFO(fn, info);
+  return (0 == rv) ? PR_SUCCESS : PR_FAILURE;
+} 
+
+PR_IMPLEMENT(PRStatus) PR_GetFileInfo64(const char* fn, PRFileInfo64* info) {
+  PRInt32 rv;
+
+  if (!_pr_initialized) {
+    _PR_ImplicitInitialization();
+  }
+  rv = _PR_MD_GETFILEINFO64(fn, info);
+  return (0 == rv) ? PR_SUCCESS : PR_FAILURE;
+} 
+
+PR_IMPLEMENT(PRStatus) PR_Rename(const char* from, const char* to) {
+  PRIntn rv = -1;
+
+  if (pt_TestAbort()) {
+    return PR_FAILURE;
+  }
+
+
+  PR_Lock(_pr_rename_lock);
+  rv = access(to, F_OK);
+  if (0 == rv) {
+    PR_SetError(PR_FILE_EXISTS_ERROR, 0);
+    rv = -1;
+  } else {
+    rv = rename(from, to);
+    if (rv == -1) {
+      pt_MapError(_PR_MD_MAP_RENAME_ERROR, errno);
+    }
+  }
+  PR_Unlock(_pr_rename_lock);
+  return (-1 == rv) ? PR_FAILURE : PR_SUCCESS;
+} 
+
+PR_IMPLEMENT(PRStatus) PR_CloseDir(PRDir* dir) {
+  if (pt_TestAbort()) {
+    return PR_FAILURE;
+  }
+
+  if (NULL != dir->md.d) {
+    if (closedir(dir->md.d) == -1) {
+      _PR_MD_MAP_CLOSEDIR_ERROR(errno);
+      return PR_FAILURE;
+    }
+    dir->md.d = NULL;
+    PR_DELETE(dir);
+  }
+  return PR_SUCCESS;
+} 
+
+PR_IMPLEMENT(PRStatus) PR_MakeDir(const char* name, PRIntn mode) {
+  PRInt32 rv = -1;
+
+  if (pt_TestAbort()) {
+    return PR_FAILURE;
+  }
+
+  if (NULL != _pr_rename_lock) {
+    PR_Lock(_pr_rename_lock);
+  }
+  rv = mkdir(name, mode);
+  if (-1 == rv) {
+    pt_MapError(_PR_MD_MAP_MKDIR_ERROR, errno);
+  }
+  if (NULL != _pr_rename_lock) {
+    PR_Unlock(_pr_rename_lock);
+  }
+
+  return (-1 == rv) ? PR_FAILURE : PR_SUCCESS;
+} 
+
+PR_IMPLEMENT(PRStatus) PR_MkDir(const char* name, PRIntn mode) {
+  return PR_MakeDir(name, mode);
+} 
+
+PR_IMPLEMENT(PRStatus) PR_RmDir(const char* name) {
+  PRInt32 rv;
+
+  if (pt_TestAbort()) {
+    return PR_FAILURE;
+  }
+
+  rv = rmdir(name);
+  if (0 == rv) {
+    return PR_SUCCESS;
+  }
+  pt_MapError(_PR_MD_MAP_RMDIR_ERROR, errno);
+  return PR_FAILURE;
+} 
+
+PR_IMPLEMENT(PRDir*) PR_OpenDir(const char* name) {
+  DIR* osdir;
+  PRDir* dir = NULL;
+
+  if (pt_TestAbort()) {
+    return dir;
+  }
+
+  osdir = opendir(name);
+  if (osdir == NULL) {
+    pt_MapError(_PR_MD_MAP_OPENDIR_ERROR, errno);
+  } else {
+    dir = PR_NEWZAP(PRDir);
+    if (dir) {
+      dir->md.d = osdir;
+    } else {
+      (void)closedir(osdir);
+    }
+  }
+  return dir;
+} 
+
+static PRInt32 _pr_poll_with_poll(PRPollDesc* pds, PRIntn npds,
+                                  PRIntervalTime timeout) {
+  PRInt32 ready = 0;
+  PRIntervalTime start = 0, elapsed, remaining;
+
+  if (pt_TestAbort()) {
+    return -1;
+  }
+
+  if (0 == npds) {
+    PR_Sleep(timeout);
+  } else {
+#  define STACK_POLL_DESC_COUNT 64
+    struct pollfd stack_syspoll[STACK_POLL_DESC_COUNT];
+    struct pollfd* syspoll;
+    PRIntn index, msecs;
+
+    if (npds <= STACK_POLL_DESC_COUNT) {
+      syspoll = stack_syspoll;
+    } else {
+      PRThread* me = PR_GetCurrentThread();
+      if (npds > me->syspoll_count) {
+        PR_Free(me->syspoll_list);
+        me->syspoll_list =
+            (struct pollfd*)PR_MALLOC(npds * sizeof(struct pollfd));
+        if (NULL == me->syspoll_list) {
+          me->syspoll_count = 0;
+          PR_SetError(PR_OUT_OF_MEMORY_ERROR, 0);
+          return -1;
+        }
+        me->syspoll_count = npds;
+      }
+      syspoll = me->syspoll_list;
+    }
+
+    for (index = 0; index < npds; ++index) {
+      PRInt16 in_flags_read = 0, in_flags_write = 0;
+      PRInt16 out_flags_read = 0, out_flags_write = 0;
+
+      if ((NULL != pds[index].fd) && (0 != pds[index].in_flags)) {
+        if (pds[index].in_flags & PR_POLL_READ) {
+          in_flags_read = (pds[index].fd->methods->poll)(
+              pds[index].fd, pds[index].in_flags & ~PR_POLL_WRITE,
+              &out_flags_read);
+        }
+        if (pds[index].in_flags & PR_POLL_WRITE) {
+          in_flags_write = (pds[index].fd->methods->poll)(
+              pds[index].fd, pds[index].in_flags & ~PR_POLL_READ,
+              &out_flags_write);
+        }
+        if ((0 != (in_flags_read & out_flags_read)) ||
+            (0 != (in_flags_write & out_flags_write))) {
+          if (0 == ready) {
+            int i;
+            for (i = 0; i < index; i++) {
+              pds[i].out_flags = 0;
+            }
+          }
+          ready += 1;
+          pds[index].out_flags = out_flags_read | out_flags_write;
+        } else {
+          PRFileDesc* bottom =
+              PR_GetIdentitiesLayer(pds[index].fd, PR_NSPR_IO_LAYER);
+
+          pds[index].out_flags = 0; 
+          if ((NULL != bottom) &&
+              (_PR_FILEDESC_OPEN == bottom->secret->state)) {
+            if (0 == ready) {
+              syspoll[index].fd = bottom->secret->md.osfd;
+              syspoll[index].events = 0;
+              if (in_flags_read & PR_POLL_READ) {
+                pds[index].out_flags |= _PR_POLL_READ_SYS_READ;
+                syspoll[index].events |= POLLIN;
+              }
+              if (in_flags_read & PR_POLL_WRITE) {
+                pds[index].out_flags |= _PR_POLL_READ_SYS_WRITE;
+                syspoll[index].events |= POLLOUT;
+              }
+              if (in_flags_write & PR_POLL_READ) {
+                pds[index].out_flags |= _PR_POLL_WRITE_SYS_READ;
+                syspoll[index].events |= POLLIN;
+              }
+              if (in_flags_write & PR_POLL_WRITE) {
+                pds[index].out_flags |= _PR_POLL_WRITE_SYS_WRITE;
+                syspoll[index].events |= POLLOUT;
+              }
+              if (pds[index].in_flags & PR_POLL_EXCEPT) {
+                syspoll[index].events |= POLLPRI;
+              }
+            }
+          } else {
+            if (0 == ready) {
+              int i;
+              for (i = 0; i < index; i++) {
+                pds[i].out_flags = 0;
+              }
+            }
+            ready += 1; 
+            pds[index].out_flags = PR_POLL_NVAL; 
+          }
+        }
+      } else {
+        syspoll[index].fd = -1;
+        syspoll[index].events = 0;
+        pds[index].out_flags = 0;
+      }
+    }
+    if (0 == ready) {
+      switch (timeout) {
+        case PR_INTERVAL_NO_WAIT:
+          msecs = 0;
+          break;
+        case PR_INTERVAL_NO_TIMEOUT:
+          msecs = -1;
+          break;
+        default:
+          msecs = PR_IntervalToMilliseconds(timeout);
+          start = PR_IntervalNow();
+      }
+
+    retry:
+      ready = poll(syspoll, npds, msecs);
+      if (-1 == ready) {
+        PRIntn oserror = errno;
+
+        if (EINTR == oserror) {
+          if (timeout == PR_INTERVAL_NO_TIMEOUT) {
+            goto retry;
+          } else if (timeout == PR_INTERVAL_NO_WAIT) {
+            ready = 0; 
+          } else {
+            elapsed = (PRIntervalTime)(PR_IntervalNow() - start);
+            if (elapsed > timeout) {
+              ready = 0; 
+            } else {
+              remaining = timeout - elapsed;
+              msecs = PR_IntervalToMilliseconds(remaining);
+              goto retry;
+            }
+          }
+        } else {
+          _PR_MD_MAP_POLL_ERROR(oserror);
+        }
+      } else if (ready > 0) {
+        for (index = 0; index < npds; ++index) {
+          PRInt16 out_flags = 0;
+          if ((NULL != pds[index].fd) && (0 != pds[index].in_flags)) {
+            if (0 != syspoll[index].revents) {
+              if (syspoll[index].revents & POLLIN) {
+                if (pds[index].out_flags & _PR_POLL_READ_SYS_READ) {
+                  out_flags |= PR_POLL_READ;
+                }
+                if (pds[index].out_flags & _PR_POLL_WRITE_SYS_READ) {
+                  out_flags |= PR_POLL_WRITE;
+                }
+              }
+              if (syspoll[index].revents & POLLOUT) {
+                if (pds[index].out_flags & _PR_POLL_READ_SYS_WRITE) {
+                  out_flags |= PR_POLL_READ;
+                }
+                if (pds[index].out_flags & _PR_POLL_WRITE_SYS_WRITE) {
+                  out_flags |= PR_POLL_WRITE;
+                }
+              }
+              if (syspoll[index].revents & POLLPRI) {
+                out_flags |= PR_POLL_EXCEPT;
+              }
+              if (syspoll[index].revents & POLLERR) {
+                out_flags |= PR_POLL_ERR;
+              }
+              if (syspoll[index].revents & POLLNVAL) {
+                out_flags |= PR_POLL_NVAL;
+              }
+              if (syspoll[index].revents & POLLHUP) {
+                out_flags |= PR_POLL_HUP;
+              }
+            }
+          }
+          pds[index].out_flags = out_flags;
+        }
+      }
+    }
+  }
+  return ready;
+
+} 
+
+
+PR_IMPLEMENT(PRInt32)
+PR_Poll(PRPollDesc* pds, PRIntn npds, PRIntervalTime timeout) {
+  return (_pr_poll_with_poll(pds, npds, timeout));
+}
+
+PR_IMPLEMENT(PRDirEntry*) PR_ReadDir(PRDir* dir, PRDirFlags flags) {
+  struct dirent* dp;
+
+  if (pt_TestAbort()) {
+    return NULL;
+  }
+
+  for (;;) {
+    errno = 0;
+    dp = readdir(dir->md.d);
+    if (NULL == dp) {
+      pt_MapError(_PR_MD_MAP_READDIR_ERROR, errno);
+      return NULL;
+    }
+    if ((flags & PR_SKIP_DOT) && ('.' == dp->d_name[0]) &&
+        (0 == dp->d_name[1])) {
+      continue;
+    }
+    if ((flags & PR_SKIP_DOT_DOT) && ('.' == dp->d_name[0]) &&
+        ('.' == dp->d_name[1]) && (0 == dp->d_name[2])) {
+      continue;
+    }
+    if ((flags & PR_SKIP_HIDDEN) && ('.' == dp->d_name[0])) {
+      continue;
+    }
+    break;
+  }
+  dir->d.name = dp->d_name;
+  return &dir->d;
+} 
+
+PR_IMPLEMENT(PRFileDesc*) PR_NewUDPSocket(void) {
+  PRIntn domain = PF_INET;
+
+  return PR_Socket(domain, SOCK_DGRAM, 0);
+} 
+
+PR_IMPLEMENT(PRFileDesc*) PR_NewTCPSocket(void) {
+  PRIntn domain = PF_INET;
+
+  return PR_Socket(domain, SOCK_STREAM, 0);
+} 
+
+PR_IMPLEMENT(PRFileDesc*) PR_OpenUDPSocket(PRIntn af) {
+  return PR_Socket(af, SOCK_DGRAM, 0);
+} 
+
+PR_IMPLEMENT(PRFileDesc*) PR_OpenTCPSocket(PRIntn af) {
+  return PR_Socket(af, SOCK_STREAM, 0);
+} 
+
+PR_IMPLEMENT(PRStatus) PR_NewTCPSocketPair(PRFileDesc* fds[2]) {
+  PRInt32 osfd[2];
+
+  if (pt_TestAbort()) {
+    return PR_FAILURE;
+  }
+
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, osfd) == -1) {
+    pt_MapError(_PR_MD_MAP_SOCKETPAIR_ERROR, errno);
+    return PR_FAILURE;
+  }
+
+  fds[0] = pt_SetMethods(osfd[0], PR_DESC_SOCKET_TCP, PR_FALSE, PR_FALSE);
+  if (fds[0] == NULL) {
+    close(osfd[0]);
+    close(osfd[1]);
+    return PR_FAILURE;
+  }
+  fds[1] = pt_SetMethods(osfd[1], PR_DESC_SOCKET_TCP, PR_FALSE, PR_FALSE);
+  if (fds[1] == NULL) {
+    PR_Close(fds[0]);
+    close(osfd[1]);
+    return PR_FAILURE;
+  }
+  return PR_SUCCESS;
+} 
+
+PR_IMPLEMENT(PRStatus)
+PR_CreatePipe(PRFileDesc** readPipe, PRFileDesc** writePipe) {
+  int pipefd[2];
+
+  if (pt_TestAbort()) {
+    return PR_FAILURE;
+  }
+
+  if (pipe(pipefd) == -1) {
+    PR_SetError(PR_UNKNOWN_ERROR, errno);
+    return PR_FAILURE;
+  }
+  *readPipe = pt_SetMethods(pipefd[0], PR_DESC_PIPE, PR_FALSE, PR_FALSE);
+  if (NULL == *readPipe) {
+    close(pipefd[0]);
+    close(pipefd[1]);
+    return PR_FAILURE;
+  }
+  *writePipe = pt_SetMethods(pipefd[1], PR_DESC_PIPE, PR_FALSE, PR_FALSE);
+  if (NULL == *writePipe) {
+    PR_Close(*readPipe);
+    close(pipefd[1]);
+    return PR_FAILURE;
+  }
+  return PR_SUCCESS;
+}
+
+PR_IMPLEMENT(PRStatus) PR_SetFDInheritable(PRFileDesc* fd, PRBool inheritable) {
+  if (fd->identity != PR_NSPR_IO_LAYER) {
+    PR_SetError(PR_INVALID_ARGUMENT_ERROR, 0);
+    return PR_FAILURE;
+  }
+  if (fd->secret->inheritable != inheritable) {
+    if (fcntl(fd->secret->md.osfd, F_SETFD, inheritable ? 0 : FD_CLOEXEC) ==
+        -1) {
+      _PR_MD_MAP_DEFAULT_ERROR(errno);
+      return PR_FAILURE;
+    }
+    fd->secret->inheritable = (_PRTriStateBool)inheritable;
+  }
+  return PR_SUCCESS;
+}
+
+
+PR_IMPLEMENT(PRFileDesc*) PR_ImportFile(PRInt32 osfd) {
+  PRFileDesc* fd;
+
+  if (!_pr_initialized) {
+    _PR_ImplicitInitialization();
+  }
+  fd = pt_SetMethods(osfd, PR_DESC_FILE, PR_FALSE, PR_TRUE);
+  if (NULL == fd) {
+    close(osfd);
+  }
+  return fd;
+} 
+
+PR_IMPLEMENT(PRFileDesc*) PR_ImportPipe(PRInt32 osfd) {
+  PRFileDesc* fd;
+
+  if (!_pr_initialized) {
+    _PR_ImplicitInitialization();
+  }
+  fd = pt_SetMethods(osfd, PR_DESC_PIPE, PR_FALSE, PR_TRUE);
+  if (NULL == fd) {
+    close(osfd);
+  }
+  return fd;
+} 
+
+PR_IMPLEMENT(PRFileDesc*) PR_ImportTCPSocket(PRInt32 osfd) {
+  PRFileDesc* fd;
+
+  if (!_pr_initialized) {
+    _PR_ImplicitInitialization();
+  }
+  fd = pt_SetMethods(osfd, PR_DESC_SOCKET_TCP, PR_FALSE, PR_TRUE);
+  if (NULL == fd) {
+    close(osfd);
+  }
+#if defined(_PR_NEED_SECRET_AF)
+  if (NULL != fd) {
+    fd->secret->af = PF_INET;
+  }
+#endif
+  return fd;
+} 
+
+PR_IMPLEMENT(PRFileDesc*) PR_ImportUDPSocket(PRInt32 osfd) {
+  PRFileDesc* fd;
+
+  if (!_pr_initialized) {
+    _PR_ImplicitInitialization();
+  }
+  fd = pt_SetMethods(osfd, PR_DESC_SOCKET_UDP, PR_FALSE, PR_TRUE);
+  if (NULL == fd) {
+    close(osfd);
+  }
+  return fd;
+} 
+
+PR_IMPLEMENT(PRFileDesc*) PR_CreateSocketPollFd(PRInt32 osfd) {
+  PRFileDesc* fd;
+
+  if (!_pr_initialized) {
+    _PR_ImplicitInitialization();
+  }
+
+  fd = _PR_Getfd();
+
+  if (fd == NULL) {
+    PR_SetError(PR_OUT_OF_MEMORY_ERROR, 0);
+  } else {
+    fd->secret->md.osfd = osfd;
+    fd->secret->inheritable = _PR_TRI_FALSE;
+    fd->secret->state = _PR_FILEDESC_OPEN;
+    fd->methods = PR_GetSocketPollFdMethods();
+  }
+
+  return fd;
+} 
+
+PR_IMPLEMENT(PRStatus) PR_DestroySocketPollFd(PRFileDesc* fd) {
+  if (NULL == fd) {
+    PR_SetError(PR_BAD_DESCRIPTOR_ERROR, 0);
+    return PR_FAILURE;
+  }
+  fd->secret->state = _PR_FILEDESC_CLOSED;
+  _PR_Putfd(fd);
+  return PR_SUCCESS;
+} 
+
+PR_IMPLEMENT(PRInt32) PR_FileDesc2NativeHandle(PRFileDesc* bottom) {
+  PRInt32 osfd = -1;
+  bottom =
+      (NULL == bottom) ? NULL : PR_GetIdentitiesLayer(bottom, PR_NSPR_IO_LAYER);
+  if (NULL == bottom) {
+    PR_SetError(PR_INVALID_ARGUMENT_ERROR, 0);
+  } else {
+    osfd = bottom->secret->md.osfd;
+  }
+  return osfd;
+} 
+
+PR_IMPLEMENT(void)
+PR_ChangeFileDescNativeHandle(PRFileDesc* fd, PRInt32 handle) {
+  if (fd) {
+    fd->secret->md.osfd = handle;
+  }
+} 
+
+PR_IMPLEMENT(PRStatus) PR_LockFile(PRFileDesc* fd) {
+  PRStatus status = PR_SUCCESS;
+
+  if (pt_TestAbort()) {
+    return PR_FAILURE;
+  }
+
+  PR_Lock(_pr_flock_lock);
+  while (-1 == fd->secret->lockCount) {
+    PR_WaitCondVar(_pr_flock_cv, PR_INTERVAL_NO_TIMEOUT);
+  }
+  if (0 == fd->secret->lockCount) {
+    fd->secret->lockCount = -1;
+    PR_Unlock(_pr_flock_lock);
+    status = _PR_MD_LOCKFILE(fd->secret->md.osfd);
+    PR_Lock(_pr_flock_lock);
+    fd->secret->lockCount = (PR_SUCCESS == status) ? 1 : 0;
+    PR_NotifyAllCondVar(_pr_flock_cv);
+  } else {
+    fd->secret->lockCount += 1;
+  }
+  PR_Unlock(_pr_flock_lock);
+
+  return status;
+} 
+
+PR_IMPLEMENT(PRStatus) PR_TLockFile(PRFileDesc* fd) {
+  PRStatus status = PR_SUCCESS;
+
+  if (pt_TestAbort()) {
+    return PR_FAILURE;
+  }
+
+  PR_Lock(_pr_flock_lock);
+  if (0 == fd->secret->lockCount) {
+    status = _PR_MD_TLOCKFILE(fd->secret->md.osfd);
+    if (PR_SUCCESS == status) {
+      fd->secret->lockCount = 1;
+    }
+  } else {
+    fd->secret->lockCount += 1;
+  }
+  PR_Unlock(_pr_flock_lock);
+
+  return status;
+} 
+
+PR_IMPLEMENT(PRStatus) PR_UnlockFile(PRFileDesc* fd) {
+  PRStatus status = PR_SUCCESS;
+
+  if (pt_TestAbort()) {
+    return PR_FAILURE;
+  }
+
+  PR_Lock(_pr_flock_lock);
+  if (fd->secret->lockCount == 1) {
+    status = _PR_MD_UNLOCKFILE(fd->secret->md.osfd);
+    if (PR_SUCCESS == status) {
+      fd->secret->lockCount = 0;
+    }
+  } else {
+    fd->secret->lockCount -= 1;
+  }
+  PR_Unlock(_pr_flock_lock);
+
+  return status;
+}
+
+
+PR_IMPLEMENT(PRInt32) PR_GetSysfdTableMax(void) {
+  struct rlimit rlim;
+
+  if (getrlimit(RLIMIT_NOFILE, &rlim) < 0) {
+    return -1;
+  }
+
+  return rlim.rlim_max;
+}
+
+PR_IMPLEMENT(PRInt32) PR_SetSysfdTableSize(PRIntn table_size) {
+  struct rlimit rlim;
+  PRInt32 tableMax = PR_GetSysfdTableMax();
+
+  if (tableMax < 0) {
+    return -1;
+  }
+  rlim.rlim_max = tableMax;
+
+  if (rlim.rlim_max < table_size) {
+    rlim.rlim_cur = rlim.rlim_max;
+  } else {
+    rlim.rlim_cur = table_size;
+  }
+
+  if (setrlimit(RLIMIT_NOFILE, &rlim) < 0) {
+    return -1;
+  }
+
+  return rlim.rlim_cur;
+}
+
+
+#if !defined(NO_NSPR_10_SUPPORT)
+PR_IMPLEMENT(PRInt32) PR_Stat(const char* name, struct stat* buf) {
+  static PRBool unwarned = PR_TRUE;
+  if (unwarned) {
+    unwarned = _PR_Obsolete("PR_Stat", "PR_GetFileInfo");
+  }
+
+  if (pt_TestAbort()) {
+    return -1;
+  }
+
+  if (-1 == stat(name, buf)) {
+    pt_MapError(_PR_MD_MAP_STAT_ERROR, errno);
+    return -1;
+  } else {
+    return 0;
+  }
+}
+#endif
+
+PR_IMPLEMENT(void) PR_FD_ZERO(PR_fd_set* set) {
+  static PRBool unwarned = PR_TRUE;
+  if (unwarned) {
+    unwarned = _PR_Obsolete("PR_FD_ZERO (PR_Select)", "PR_Poll");
+  }
+  memset(set, 0, sizeof(PR_fd_set));
+}
+
+PR_IMPLEMENT(void) PR_FD_SET(PRFileDesc* fh, PR_fd_set* set) {
+  static PRBool unwarned = PR_TRUE;
+  if (unwarned) {
+    unwarned = _PR_Obsolete("PR_FD_SET (PR_Select)", "PR_Poll");
+  }
+  PR_ASSERT(set->hsize < PR_MAX_SELECT_DESC);
+
+  set->harray[set->hsize++] = fh;
+}
+
+PR_IMPLEMENT(void) PR_FD_CLR(PRFileDesc* fh, PR_fd_set* set) {
+  PRUint32 index, index2;
+  static PRBool unwarned = PR_TRUE;
+  if (unwarned) {
+    unwarned = _PR_Obsolete("PR_FD_CLR (PR_Select)", "PR_Poll");
+  }
+
+  for (index = 0; index < set->hsize; index++)
+    if (set->harray[index] == fh) {
+      for (index2 = index; index2 < (set->hsize - 1); index2++) {
+        set->harray[index2] = set->harray[index2 + 1];
+      }
+      set->hsize--;
+      break;
+    }
+}
+
+PR_IMPLEMENT(PRInt32) PR_FD_ISSET(PRFileDesc* fh, PR_fd_set* set) {
+  PRUint32 index;
+  static PRBool unwarned = PR_TRUE;
+  if (unwarned) {
+    unwarned = _PR_Obsolete("PR_FD_ISSET (PR_Select)", "PR_Poll");
+  }
+  for (index = 0; index < set->hsize; index++)
+    if (set->harray[index] == fh) {
+      return 1;
+    }
+  return 0;
+}
+
+PR_IMPLEMENT(void) PR_FD_NSET(PRInt32 fd, PR_fd_set* set) {
+  static PRBool unwarned = PR_TRUE;
+  if (unwarned) {
+    unwarned = _PR_Obsolete("PR_FD_NSET (PR_Select)", "PR_Poll");
+  }
+  PR_ASSERT(set->nsize < PR_MAX_SELECT_DESC);
+
+  set->narray[set->nsize++] = fd;
+}
+
+PR_IMPLEMENT(void) PR_FD_NCLR(PRInt32 fd, PR_fd_set* set) {
+  PRUint32 index, index2;
+  static PRBool unwarned = PR_TRUE;
+  if (unwarned) {
+    unwarned = _PR_Obsolete("PR_FD_NCLR (PR_Select)", "PR_Poll");
+  }
+
+  for (index = 0; index < set->nsize; index++)
+    if (set->narray[index] == fd) {
+      for (index2 = index; index2 < (set->nsize - 1); index2++) {
+        set->narray[index2] = set->narray[index2 + 1];
+      }
+      set->nsize--;
+      break;
+    }
+}
+
+PR_IMPLEMENT(PRInt32) PR_FD_NISSET(PRInt32 fd, PR_fd_set* set) {
+  PRUint32 index;
+  static PRBool unwarned = PR_TRUE;
+  if (unwarned) {
+    unwarned = _PR_Obsolete("PR_FD_NISSET (PR_Select)", "PR_Poll");
+  }
+  for (index = 0; index < set->nsize; index++)
+    if (set->narray[index] == fd) {
+      return 1;
+    }
+  return 0;
+}
+
+#  include <sys/types.h>
+#  include <sys/time.h>
+#if !defined(LINUX) && !defined(__GNU__) && \
+      !defined(__GLIBC__)
+#    include <sys/select.h>
+#endif
+
+static PRInt32 _PR_getset(PR_fd_set* pr_set, fd_set* set) {
+  PRUint32 index;
+  PRInt32 max = 0;
+
+  if (!pr_set) {
+    return 0;
+  }
+
+  FD_ZERO(set);
+
+  for (index = 0; index < pr_set->hsize; index++) {
+    FD_SET(pr_set->harray[index]->secret->md.osfd, set);
+    if (pr_set->harray[index]->secret->md.osfd > max) {
+      max = pr_set->harray[index]->secret->md.osfd;
+    }
+  }
+  for (index = 0; index < pr_set->nsize; index++) {
+    FD_SET(pr_set->narray[index], set);
+    if (pr_set->narray[index] > max) {
+      max = pr_set->narray[index];
+    }
+  }
+  return max;
+}
+
+static void _PR_setset(PR_fd_set* pr_set, fd_set* set) {
+  PRUint32 index, last_used;
+
+  if (!pr_set) {
+    return;
+  }
+
+  for (last_used = 0, index = 0; index < pr_set->hsize; index++) {
+    if (FD_ISSET(pr_set->harray[index]->secret->md.osfd, set)) {
+      pr_set->harray[last_used++] = pr_set->harray[index];
+    }
+  }
+  pr_set->hsize = last_used;
+
+  for (last_used = 0, index = 0; index < pr_set->nsize; index++) {
+    if (FD_ISSET(pr_set->narray[index], set)) {
+      pr_set->narray[last_used++] = pr_set->narray[index];
+    }
+  }
+  pr_set->nsize = last_used;
+}
+
+PR_IMPLEMENT(PRInt32)
+PR_Select(PRInt32 unused, PR_fd_set* pr_rd, PR_fd_set* pr_wr, PR_fd_set* pr_ex,
+          PRIntervalTime timeout) {
+  fd_set rd, wr, ex;
+  struct timeval tv, *tvp;
+  PRInt32 max, max_fd;
+  PRInt32 rv;
+  PRIntervalTime start = 0, elapsed, remaining;
+
+  static PRBool unwarned = PR_TRUE;
+  if (unwarned) {
+    unwarned = _PR_Obsolete("PR_Select", "PR_Poll");
+  }
+
+  FD_ZERO(&rd);
+  FD_ZERO(&wr);
+  FD_ZERO(&ex);
+
+  max_fd = _PR_getset(pr_rd, &rd);
+  max_fd = (max = _PR_getset(pr_wr, &wr)) > max_fd ? max : max_fd;
+  max_fd = (max = _PR_getset(pr_ex, &ex)) > max_fd ? max : max_fd;
+
+  if (timeout == PR_INTERVAL_NO_TIMEOUT) {
+    tvp = NULL;
+  } else {
+    tv.tv_sec = (PRInt32)PR_IntervalToSeconds(timeout);
+    tv.tv_usec = (PRInt32)PR_IntervalToMicroseconds(
+        timeout - PR_SecondsToInterval(tv.tv_sec));
+    tvp = &tv;
+    start = PR_IntervalNow();
+  }
+
+retry:
+  rv = select(max_fd + 1, (_PRSelectFdSetArg_t)&rd, (_PRSelectFdSetArg_t)&wr,
+              (_PRSelectFdSetArg_t)&ex, tvp);
+
+  if (rv == -1 && errno == EINTR) {
+    if (timeout == PR_INTERVAL_NO_TIMEOUT) {
+      goto retry;
+    } else {
+      elapsed = (PRIntervalTime)(PR_IntervalNow() - start);
+      if (elapsed > timeout) {
+        rv = 0; 
+      } else {
+        remaining = timeout - elapsed;
+        tv.tv_sec = (PRInt32)PR_IntervalToSeconds(remaining);
+        tv.tv_usec = (PRInt32)PR_IntervalToMicroseconds(
+            remaining - PR_SecondsToInterval(tv.tv_sec));
+        goto retry;
+      }
+    }
+  }
+
+  if (rv > 0) {
+    _PR_setset(pr_rd, &rd);
+    _PR_setset(pr_wr, &wr);
+    _PR_setset(pr_ex, &ex);
+  } else if (rv == -1) {
+    pt_MapError(_PR_MD_MAP_SELECT_ERROR, errno);
+  }
+  return rv;
+}
+#endif
+
+#if defined(MOZ_UNICODE)
+PR_IMPLEMENT(PRFileDesc*)
+PR_OpenFileUTF16(const PRUnichar* name, PRIntn flags, PRIntn mode) {
+  PR_SetError(PR_NOT_IMPLEMENTED_ERROR, 0);
+  return NULL;
+}
+
+PR_IMPLEMENT(PRStatus) PR_CloseDirUTF16(PRDir* dir) {
+  PR_SetError(PR_NOT_IMPLEMENTED_ERROR, 0);
+  return PR_FAILURE;
+}
+
+PR_IMPLEMENT(PRDirUTF16*) PR_OpenDirUTF16(const PRUnichar* name) {
+  PR_SetError(PR_NOT_IMPLEMENTED_ERROR, 0);
+  return NULL;
+}
+
+PR_IMPLEMENT(PRDirEntryUTF16*)
+PR_ReadDirUTF16(PRDirUTF16* dir, PRDirFlags flags) {
+  PR_SetError(PR_NOT_IMPLEMENTED_ERROR, 0);
+  return NULL;
+}
+
+PR_IMPLEMENT(PRStatus)
+PR_GetFileInfo64UTF16(const PRUnichar* fn, PRFileInfo64* info) {
+  PR_SetError(PR_NOT_IMPLEMENTED_ERROR, 0);
+  return PR_FAILURE;
+}
+#endif
+

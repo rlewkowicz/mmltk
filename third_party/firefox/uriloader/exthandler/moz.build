@@ -1,0 +1,95 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+
+XPIDL_SOURCES += [
+    "nsCExternalHandlerService.idl",
+    "nsIContentDispatchChooser.idl",
+    "nsIExternalHelperAppService.idl",
+    "nsIExternalProtocolService.idl",
+    "nsIHandlerService.idl",
+    "nsIHelperAppLauncherDialog.idl",
+    "nsISharingHandlerApp.idl",
+]
+
+XPIDL_MODULE = "exthandler"
+
+osdir = "unix"
+
+EXPORTS += [osdir + "/nsOSHelperAppService.h"]
+
+EXPORTS += [
+    "ContentHandlerService.h",
+    "nsExternalHelperAppService.h",
+    "nsMIMEInfoChild.h",
+    "nsOSHelperAppServiceChild.h",
+]
+
+EXPORTS += [
+    "nsLocalHandlerApp.h",
+]
+
+EXPORTS.mozilla.dom += [
+    "ExternalHelperAppChild.h",
+    "ExternalHelperAppParent.h",
+]
+
+UNIFIED_SOURCES += [
+    "ContentHandlerService.cpp",
+    "ExternalHelperAppChild.cpp",
+    "ExternalHelperAppParent.cpp",
+    "HandlerServiceParent.cpp",
+    "nsExternalHelperAppService.cpp",
+    "nsExternalProtocolHandler.cpp",
+    "nsLocalHandlerApp.cpp",
+    "nsMIMEInfoImpl.cpp",
+    "nsOSHelperAppServiceChild.cpp",
+]
+
+if CONFIG["MOZ_BUILD_APP"] == "browser":
+    DEFINES["MOZ_BUILD_APP_IS_BROWSER"] = True
+
+SOURCES += [
+    osdir + "/nsOSHelperAppService.cpp",
+]
+
+UNIFIED_SOURCES += [
+    "unix/nsGNOMERegistry.cpp",
+    "unix/nsMIMEInfoUnix.cpp",
+]
+
+EXTRA_JS_MODULES += [
+    "ExtHandlerService.sys.mjs",
+    "WebHandlerApp.sys.mjs",
+]
+
+EXTRA_JS_MODULES.handlers += [
+    "HandlerList.sys.mjs",
+]
+
+XPCOM_MANIFESTS += [
+    "components.conf",
+]
+
+IPDL_SOURCES += [
+    "PExternalHelperApp.ipdl",
+    "PHandlerService.ipdl",
+]
+
+include("/ipc/chromium/chromium-config.mozbuild")
+
+FINAL_LIBRARY = "xul"
+
+LOCAL_INCLUDES += [
+    "/docshell/base",
+    "/dom/base",
+    "/dom/ipc",
+    "/netwerk/base",
+    "/netwerk/protocol/http",
+]
+
+if CONFIG["MOZ_ENABLE_DBUS"]:
+    CXXFLAGS += CONFIG["MOZ_DBUS_CFLAGS"]
+
+CXXFLAGS += CONFIG["MOZ_GTK3_CFLAGS"]

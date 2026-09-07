@@ -1,0 +1,551 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef js_loader_LoadedScript_h
+#define js_loader_LoadedScript_h
+
+#include "js/AllocPolicy.h"
+#include "js/experimental/JSStencil.h"
+#include "js/Transcoding.h"
+
+#include "mozilla/Maybe.h"
+#include "mozilla/MaybeOneOf.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/Utf8.h"  // mozilla::Utf8Unit
+#include "mozilla/Variant.h"
+#include "mozilla/Vector.h"
+#include "mozilla/UniquePtr.h"  // mozilla::UniquePtr
+
+#include "mozilla/dom/SRIMetadata.h"  // mozilla::dom::SRIMetadata
+#include "nsCOMPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsICacheInfoChannel.h"  // nsICacheInfoChannel
+
+#include "jsapi.h"
+#include "ResolvedModuleSet.h"
+#include "ScriptKind.h"
+#include "ScriptFetchOptions.h"
+
+class nsIURI;
+
+namespace JS::loader {
+
+class ScriptLoadRequest;
+
+using Utf8Unit = mozilla::Utf8Unit;
+
+void HostAddRefScriptFetchInfo(const Value& aPrivate);
+void HostReleaseScriptFetchInfo(const Value& aPrivate);
+
+class ClassicScript;
+class LoadedModuleScript;
+class LoadContextBase;
+
+class ScriptFetchInfo : public nsISupports {
+ public:
+  ScriptFetchInfo(ScriptKind aKind,
+                  mozilla::dom::ReferrerPolicy aReferrerPolicy,
+                  ScriptFetchOptions* aFetchOptions, nsIURI* aURI);
+
+  NS_DECL_ISUPPORTS
+
+  size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const;
+
+  bool IsForModulePreload() const { return mIsForModulePreload; }
+  void SetForModulePreload(bool aValue) { mIsForModulePreload = aValue; }
+
+  bool IsForModuleScript() const { return mKind == ScriptKind::eModule; }
+  bool IsForEvent() const { return mKind == ScriptKind::eEvent; }
+
+  mozilla::dom::ReferrerPolicy ReferrerPolicy() const {
+    return mReferrerPolicy;
+  }
+  void UpdateReferrerPolicy(mozilla::dom::ReferrerPolicy aReferrerPolicy) {
+    mReferrerPolicy = aReferrerPolicy;
+  }
+
+  ScriptFetchOptions* FetchOptions() const { return mFetchOptions; }
+
+  nsIURI* BaseURL() const { return mBaseURL; }
+  void SetBaseURL(nsIURI* aBaseURL) { mBaseURL = aBaseURL; }
+
+  void SetBaseURLFromChannelAndOriginalURI(nsIChannel* aChannel,
+                                           nsIURI* aOriginalURI);
+
+  void AssociateWithScript(JSScript* aScript);
+  void AssociateWithModule(JSObject* aModuleRecord);
+
+ protected:
+  virtual ~ScriptFetchInfo() = default;
+
+ private:
+  bool mIsForModulePreload = false;
+
+  ScriptKind mKind;
+
+  mozilla::dom::ReferrerPolicy mReferrerPolicy;
+
+  RefPtr<ScriptFetchOptions> mFetchOptions;
+
+  nsCOMPtr<nsIURI> mBaseURL;
+};
+
+class LoadedScript final : public nsISupports {
+  ~LoadedScript() = default;
+
+ public:
+  LoadedScript(ScriptKind aKind, nsIURI* aURI);
+  size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const;
+
+ public:
+  NS_DECL_ISUPPORTS
+
+  bool IsClassicScript() const { return mKind == ScriptKind::eClassic; }
+  bool IsModuleScript() const { return mKind == ScriptKind::eModule; }
+  bool IsImportMapScript() const { return mKind == ScriptKind::eImportMap; }
+  bool IsSpeculationRulesScript() const {
+    return mKind == ScriptKind::eSpeculationRules;
+  }
+
+  nsIURI* GetURI() const { return mURI; }
+
+  nsIURI* CachedBaseURL() const { return mCachedBaseURL; }
+  mozilla::dom::ReferrerPolicy CachedReferrerPolicy() const {
+    return mCachedReferrerPolicy;
+  }
+
+ public:
+  template <typename... Ts>
+  using Variant = mozilla::Variant<Ts...>;
+
+  template <typename... Ts>
+  using VariantType = mozilla::VariantType<Ts...>;
+
+  enum class DataType : uint8_t {
+    eUnknown,
+
+    eTextSource,
+
+    eSerializedStencil,
+
+    eCachedStencil,
+
+    eInvalidatedCachedStencil,
+
+    eWasmBytes,
+  };
+
+  template <typename Unit>
+  using ScriptTextBuffer = mozilla::Vector<Unit, 0, js::MallocAllocPolicy>;
+
+  using MaybeSourceText =
+      mozilla::MaybeOneOf<SourceText<char16_t>, SourceText<Utf8Unit>>;
+
+
+  bool IsUnknownDataType() const { return mDataType == DataType::eUnknown; }
+  bool IsTextSource() const { return mDataType == DataType::eTextSource; }
+  bool IsSerializedStencil() const {
+    return mDataType == DataType::eSerializedStencil;
+  }
+  bool IsCachedStencil() const { return mDataType == DataType::eCachedStencil; }
+  bool IsInvalidatedCachedStencil() const {
+    return mDataType == DataType::eInvalidatedCachedStencil;
+  }
+  bool IsWasmBytes() const { return mDataType == DataType::eWasmBytes; }
+
+
+  void SetUnknownDataType() {
+    mDataType = DataType::eUnknown;
+    mScriptData.reset();
+  }
+
+  void SetTextSource(LoadContextBase* maybeLoadContext) {
+    MOZ_ASSERT(IsUnknownDataType());
+    mDataType = DataType::eTextSource;
+    mScriptData.emplace(VariantType<ScriptTextBuffer<Utf8Unit>>());
+  }
+
+  void SetSerializedStencil() {
+    MOZ_ASSERT(IsUnknownDataType());
+    mDataType = DataType::eSerializedStencil;
+  }
+
+  void ConvertToCachedStencil(JS::Stencil* aStencil,
+                              mozilla::dom::ReferrerPolicy aReferrerPolicy,
+                              nsIURI* aBaseURL) {
+    if (IsTextSource()) {
+      ClearScriptText();
+    } else {
+      MOZ_ASSERT(IsSerializedStencil());
+      MOZ_ASSERT(!JS::StencilIsBorrowed(aStencil));
+      DropSRIOrSRIAndSerializedStencil();
+    }
+    SetUnknownDataType();
+    mDataType = DataType::eCachedStencil;
+    mCachedStencil = aStencil;
+    mCachedReferrerPolicy = aReferrerPolicy;
+    mCachedBaseURL = aBaseURL;
+  }
+
+  void InvalidateCachedStencil() {
+    MOZ_ASSERT(IsCachedStencil());
+    mDataType = DataType::eInvalidatedCachedStencil;
+    mCachedStencil = nullptr;
+  }
+
+  void SetWasmBytes() {
+    MOZ_ASSERT(IsUnknownDataType());
+    mDataType = DataType::eWasmBytes;
+    mScriptData.emplace(VariantType<ScriptTextBuffer<uint8_t>>());
+  }
+
+  bool IsUTF16Text() const {
+    return mScriptData->is<ScriptTextBuffer<char16_t>>();
+  }
+  bool IsUTF8Text() const {
+    return mScriptData->is<ScriptTextBuffer<Utf8Unit>>();
+  }
+
+
+  template <typename Unit>
+  const ScriptTextBuffer<Unit>& ScriptText() const {
+    MOZ_ASSERT(IsTextSource());
+    return mScriptData->as<ScriptTextBuffer<Unit>>();
+  }
+  template <typename Unit>
+  ScriptTextBuffer<Unit>& ScriptText() {
+    MOZ_ASSERT(IsTextSource());
+    return mScriptData->as<ScriptTextBuffer<Unit>>();
+  }
+
+  ScriptTextBuffer<uint8_t>& WasmBytes() {
+    MOZ_ASSERT(IsWasmBytes());
+    return mScriptData->as<ScriptTextBuffer<uint8_t>>();
+  }
+
+  size_t ScriptTextLength() const {
+    MOZ_ASSERT(IsTextSource());
+    return IsUTF16Text() ? ScriptText<char16_t>().length()
+                         : ScriptText<Utf8Unit>().length();
+  }
+
+  nsresult GetScriptSource(JSContext* aCx, MaybeSourceText* aMaybeSource,
+                           LoadContextBase* aMaybeLoadContext);
+
+  void ClearScriptText() {
+    MOZ_ASSERT(IsTextSource());
+    return IsUTF16Text() ? ScriptText<char16_t>().clearAndFree()
+                         : ScriptText<Utf8Unit>().clearAndFree();
+  }
+
+  size_t ReceivedScriptTextLength() const {
+    MOZ_ASSERT(IsTextSource());
+    return mReceivedScriptTextLength;
+  }
+
+  void SetReceivedScriptTextLength(size_t aLength) {
+    MOZ_ASSERT(IsTextSource());
+    mReceivedScriptTextLength = aLength;
+  }
+
+
+
+  bool CanHaveSRIOnly() const {
+    return IsTextSource() || IsCachedStencil() || IsInvalidatedCachedStencil();
+  }
+
+  bool HasSRI() const {
+    MOZ_ASSERT(CanHaveSRIOnly());
+    return !mSRIAndSerializedStencil.empty();
+  }
+
+  TranscodeBuffer& SRI() {
+    MOZ_ASSERT(CanHaveSRIOnly());
+    return mSRIAndSerializedStencil;
+  }
+
+  void DropSRI() {
+    MOZ_ASSERT(CanHaveSRIOnly());
+    mSRIAndSerializedStencil.clearAndFree();
+  }
+
+
+  bool CanHaveSRIAndSerializedStencil() const { return IsSerializedStencil(); }
+
+  TranscodeBuffer& SRIAndSerializedStencil() {
+    MOZ_ASSERT(CanHaveSRIAndSerializedStencil());
+    return mSRIAndSerializedStencil;
+  }
+  TranscodeRange SerializedStencil() const {
+    MOZ_ASSERT(CanHaveSRIAndSerializedStencil());
+    const auto& buf = mSRIAndSerializedStencil;
+    auto offset = mSerializedStencilOffset;
+    return TranscodeRange(buf.begin() + offset, buf.length() - offset);
+  }
+
+
+  size_t GetSRILength() const {
+    MOZ_ASSERT(CanHaveSRIOnly() || CanHaveSRIAndSerializedStencil());
+    return mSerializedStencilOffset;
+  }
+  void SetSRILength(size_t sriLength) {
+    MOZ_ASSERT(CanHaveSRIOnly() || CanHaveSRIAndSerializedStencil());
+    mSerializedStencilOffset = AlignTranscodingBytecodeOffset(sriLength);
+  }
+
+  bool HasNoSRIOrSRIAndSerializedStencil() const {
+    MOZ_ASSERT(CanHaveSRIOnly() || CanHaveSRIAndSerializedStencil());
+    return mSRIAndSerializedStencil.empty();
+  }
+
+  void DropSRIOrSRIAndSerializedStencil() {
+    MOZ_ASSERT(CanHaveSRIOnly() || CanHaveSRIAndSerializedStencil());
+    mSRIAndSerializedStencil.clearAndFree();
+  }
+
+
+  Stencil* GetCachedStencil() const {
+    MOZ_ASSERT(IsCachedStencil());
+    return mCachedStencil;
+  }
+
+
+  bool HasDiskCacheReference() const { return !!mCacheEntry; }
+
+  void DropDiskCacheReference() { mCacheEntry = nullptr; }
+
+  void DropDiskCacheReferenceAndSRI() {
+    DropDiskCacheReference();
+    if (IsTextSource()) {
+      DropSRI();
+    }
+  }
+
+
+  void SetTookLongInPreviousRuns() { mTookLongInPreviousRuns = true; }
+  bool TookLongInPreviousRuns() const { return mTookLongInPreviousRuns; }
+
+  void SetIsEverHitFromMemoryCache() { mIsEverHitFromMemoryCache = true; }
+  bool IsEverHitFromMemoryCache() const { return mIsEverHitFromMemoryCache; }
+
+  bool IsDirty() const { return mIsDirty; }
+  void SetDirty() {
+    MOZ_ASSERT(HasCacheEntryId());
+    mIsDirty = true;
+  }
+  void UnsetDirty() {
+    MOZ_ASSERT(HasCacheEntryId());
+    mIsDirty = false;
+  }
+
+  bool HasCacheEntryId() const { return mCacheEntryId != InvalidCacheEntryId; }
+  uint64_t CacheEntryId() const {
+    MOZ_ASSERT(HasCacheEntryId());
+    return mCacheEntryId;
+  }
+  void SetCacheEntryId(uint64_t aId) {
+    mCacheEntryId = aId;
+
+    MOZ_ASSERT(mCacheEntryId == aId);
+  }
+
+  void AddFetchCount() {
+    if (mFetchCount < UINT8_MAX) {
+      mFetchCount++;
+    }
+  }
+
+  void SetSRIMetadata(const mozilla::dom::SRIMetadata& aSRIMetadata);
+
+  bool IsSRIMetadataReusableBy(const mozilla::dom::SRIMetadata& aSRIMetadata);
+
+ public:
+
+  DataType mDataType;
+
+  uint8_t mFetchCount = 0;
+
+ private:
+  const ScriptKind mKind;
+
+  mozilla::dom::ReferrerPolicy mCachedReferrerPolicy;
+
+ public:
+  uint32_t mSerializedStencilOffset;
+
+ private:
+  static constexpr uint64_t InvalidCacheEntryId = 0;
+
+  uint64_t mCacheEntryId : 48;
+
+  uint64_t mIsDirty : 1;
+
+  uint64_t mTookLongInPreviousRuns : 1;
+
+  uint64_t mIsEverHitFromMemoryCache : 1;
+
+  nsCOMPtr<nsIURI> mURI;
+
+  nsCOMPtr<nsIURI> mCachedBaseURL;
+
+  mozilla::UniquePtr<mozilla::dom::SRIMetadata> mSRIMetadata;
+
+ public:
+  mozilla::Maybe<Variant<ScriptTextBuffer<char16_t>, ScriptTextBuffer<Utf8Unit>,
+                         ScriptTextBuffer<uint8_t>>>
+      mScriptData;
+
+  size_t mReceivedScriptTextLength;
+
+  TranscodeBuffer mSRIAndSerializedStencil;
+
+  RefPtr<Stencil> mCachedStencil;
+
+  nsCOMPtr<nsICacheEntryWriteHandle> mCacheEntry;
+};
+
+template <typename Derived>
+class LoadedScriptDelegate {
+ private:
+  const LoadedScript* GetLoadedScript() const {
+    return static_cast<const Derived*>(this)->getLoadedScript();
+  }
+  LoadedScript* GetLoadedScript() {
+    return static_cast<Derived*>(this)->getLoadedScript();
+  }
+
+ public:
+  template <typename Unit>
+  using ScriptTextBuffer = LoadedScript::ScriptTextBuffer<Unit>;
+  using MaybeSourceText = LoadedScript::MaybeSourceText;
+
+  nsIURI* URI() const { return GetLoadedScript()->GetURI(); }
+
+  bool IsUnknownDataType() const {
+    return GetLoadedScript()->IsUnknownDataType();
+  }
+  bool IsWasmBytes() const { return GetLoadedScript()->IsWasmBytes(); }
+
+  void SetUnknownDataType() { GetLoadedScript()->SetUnknownDataType(); }
+
+  void SetTextSource(LoadContextBase* maybeLoadContext) {
+    GetLoadedScript()->SetTextSource(maybeLoadContext);
+  }
+
+  void SetWasmBytes() { GetLoadedScript()->SetWasmBytes(); }
+
+  void SetSerializedStencil() { GetLoadedScript()->SetSerializedStencil(); }
+
+  bool IsUTF16Text() const { return GetLoadedScript()->IsUTF16Text(); }
+  bool IsUTF8Text() const { return GetLoadedScript()->IsUTF8Text(); }
+
+  template <typename Unit>
+  const ScriptTextBuffer<Unit>& ScriptText() const {
+    const LoadedScript* loader = GetLoadedScript();
+    return loader->ScriptText<Unit>();
+  }
+  template <typename Unit>
+  ScriptTextBuffer<Unit>& ScriptText() {
+    LoadedScript* loader = GetLoadedScript();
+    return loader->ScriptText<Unit>();
+  }
+
+  ScriptTextBuffer<uint8_t>& WasmBytes() {
+    LoadedScript* loader = GetLoadedScript();
+    return loader->WasmBytes();
+  }
+
+  size_t ScriptTextLength() const {
+    return GetLoadedScript()->ScriptTextLength();
+  }
+
+  size_t ReceivedScriptTextLength() const {
+    return GetLoadedScript()->ReceivedScriptTextLength();
+  }
+
+  void SetReceivedScriptTextLength(size_t aLength) {
+    GetLoadedScript()->SetReceivedScriptTextLength(aLength);
+  }
+
+  nsresult GetScriptSource(JSContext* aCx, MaybeSourceText* aMaybeSource,
+                           LoadContextBase* aLoadContext) {
+    return GetLoadedScript()->GetScriptSource(aCx, aMaybeSource, aLoadContext);
+  }
+
+  bool HasNoSRIOrSRIAndSerializedStencil() const {
+    return GetLoadedScript()->HasNoSRIOrSRIAndSerializedStencil();
+  }
+
+  TranscodeBuffer& SRI() { return GetLoadedScript()->SRI(); }
+  TranscodeBuffer& SRIAndSerializedStencil() {
+    return GetLoadedScript()->SRIAndSerializedStencil();
+  }
+  TranscodeRange SerializedStencil() const {
+    return GetLoadedScript()->SerializedStencil();
+  }
+
+  size_t GetSRILength() const { return GetLoadedScript()->GetSRILength(); }
+  void SetSRILength(size_t sriLength) {
+    GetLoadedScript()->SetSRILength(sriLength);
+  }
+
+  void SetTookLongInPreviousRuns() {
+    GetLoadedScript()->SetTookLongInPreviousRuns();
+  }
+  bool TookLongInPreviousRuns() const {
+    return GetLoadedScript()->TookLongInPreviousRuns();
+  }
+};
+
+
+class ModuleScript final : public nsISupports {
+  Heap<JSObject*> mModuleRecord;
+  Heap<Value> mParseError;
+  Heap<Value> mErrorToRethrow;
+
+  RefPtr<ScriptFetchInfo> mFetchInfoForAccessingPreloadFlag;
+
+  bool mHadImportMap = false;
+
+  mozilla::UniquePtr<JS::loader::ResolvedModuleSet> mPreloadedResolvedSet;
+
+  ~ModuleScript();
+
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_CLASS(ModuleScript)
+
+  explicit ModuleScript(ScriptFetchInfo* aFetchInfo);
+
+  void SetModuleRecord(Handle<JSObject*> aModuleRecord);
+  void SetParseError(const Value& aError);
+  void SetErrorToRethrow(const Value& aError);
+  void SetForPreload(bool aValue);
+  void SetHadImportMap(bool aValue);
+
+  JSObject* ModuleRecord() const { return mModuleRecord; }
+
+  Value ParseError() const { return mParseError; }
+  Value ErrorToRethrow() const { return mErrorToRethrow; }
+  bool HasParseError() const { return !mParseError.isUndefined(); }
+  bool HasErrorToRethrow() const { return !mErrorToRethrow.isUndefined(); }
+  bool ForPreload() const {
+    return mFetchInfoForAccessingPreloadFlag->IsForModulePreload();
+  }
+  bool HadImportMap() const { return mHadImportMap; }
+
+  void ResetPreload();
+  void Shutdown();
+
+  friend void CheckModuleScriptPrivate(LoadedScript*, const Value&);
+
+  bool HasPreloadedResolvedSet() { return !!mPreloadedResolvedSet; }
+  ResolvedModuleSet* GetPreloadedResolvedSet();
+  void ReleasePreloadedResolvedSet() { mPreloadedResolvedSet = nullptr; }
+};
+
+}  
+
+#endif  // js_loader_LoadedScript_h

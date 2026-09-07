@@ -1,0 +1,299 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsCSPService.h"
+
+#include "mozilla/Logging.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/StaticPrefs_security.h"
+#include "mozilla/dom/PolicyContainer.h"
+#include "mozilla/net/DocumentChannel.h"
+#include "mozilla/net/DocumentLoadListener.h"
+#include "nsAsyncRedirectVerifyHelper.h"
+#include "nsCOMPtr.h"
+#include "nsContentPolicyUtils.h"
+#include "nsContentUtils.h"
+#include "nsError.h"
+#include "nsIAsyncVerifyRedirectCallback.h"
+#include "nsIContent.h"
+#include "nsIContentSecurityPolicy.h"
+#include "nsIProtocolHandler.h"
+#include "nsIURI.h"
+#include "nsNetUtil.h"
+#include "nsQueryObject.h"
+#include "nsString.h"
+
+using namespace mozilla;
+
+static LazyLogModule gCspPRLog("CSP");
+
+CSPService::CSPService() = default;
+
+CSPService::~CSPService() = default;
+
+NS_IMPL_ISUPPORTS(CSPService, nsIContentPolicy, nsIChannelEventSink)
+
+static bool SubjectToCSP(nsILoadInfo* aLoadInfo, nsIURI* aURI,
+                         nsContentPolicyType aContentType) {
+  ExtContentPolicyType contentType =
+      nsContentUtils::InternalContentPolicyTypeToExternal(aContentType);
+
+  if (contentType == ExtContentPolicy::TYPE_CSP_REPORT ||
+      contentType == ExtContentPolicy::TYPE_DOCUMENT) {
+    return false;
+  }
+
+  if (aURI->SchemeIs("data") || aURI->SchemeIs("blob") ||
+      aURI->SchemeIs("filesystem")) {
+    return true;
+  }
+
+  if (contentType == ExtContentPolicyType::TYPE_SCRIPT) {
+    if (BasePrincipal::Cast(aLoadInfo->GetLoadingPrincipal())
+            ->IsSystemPrincipal()) {
+      return true;
+    }
+  }
+
+  if (aURI->SchemeIs("about") || aURI->SchemeIs("javascript")) {
+    return false;
+  }
+
+  bool isImgOrStyleOrDTD = contentType == ExtContentPolicy::TYPE_IMAGE ||
+                           contentType == ExtContentPolicy::TYPE_STYLESHEET ||
+                           contentType == ExtContentPolicy::TYPE_DTD;
+  if (aURI->SchemeIs("resource")) {
+    nsAutoCString uriSpec;
+    aURI->GetSpec(uriSpec);
+    if (StringBeginsWith(uriSpec, "resource://pdf.js/"_ns)) {
+      return false;
+    }
+    if (!isImgOrStyleOrDTD) {
+      return true;
+    }
+  }
+  if (aURI->SchemeIs("chrome")) {
+    nsAutoCString uriSpec;
+    aURI->GetSpec(uriSpec);
+    if (contentType == ExtContentPolicyType::TYPE_SCRIPT &&
+        uriSpec.EqualsLiteral(
+            "chrome://global/content/TopLevelVideoDocument.js")) {
+      return false;
+    }
+    if (!isImgOrStyleOrDTD) {
+      return true;
+    }
+  }
+  if (aURI->SchemeIs("moz-icon") || aURI->SchemeIs("moz-src")) {
+    return true;
+  }
+  bool match;
+  nsresult rv = NS_URIChainHasFlags(
+      aURI, nsIProtocolHandler::URI_IS_LOCAL_RESOURCE, &match);
+  if (NS_SUCCEEDED(rv) && match) {
+    return false;
+  }
+  return true;
+}
+
+ nsresult CSPService::ConsultCSP(nsIURI* aContentLocation,
+                                             nsILoadInfo* aLoadInfo,
+                                             int16_t* aDecision) {
+  if (!aContentLocation) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsContentPolicyType contentType = aLoadInfo->InternalContentPolicyType();
+
+  nsCOMPtr<nsICSPEventListener> cspEventListener;
+  nsresult rv =
+      aLoadInfo->GetCspEventListener(getter_AddRefs(cspEventListener));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (MOZ_LOG_TEST(gCspPRLog, LogLevel::Debug)) {
+    MOZ_LOG(gCspPRLog, LogLevel::Debug,
+            ("CSPService::ShouldLoad called for %s",
+             aContentLocation->GetSpecOrDefault().get()));
+  }
+
+  *aDecision = nsIContentPolicy::ACCEPT;
+
+  if (!SubjectToCSP(aLoadInfo, aContentLocation, contentType)) {
+    return NS_OK;
+  }
+
+  bool isPreload = nsContentUtils::IsPreloadType(contentType);
+
+  if (isPreload) {
+    nsCOMPtr<nsIContentSecurityPolicy> preloadCsp = aLoadInfo->GetPreloadCsp();
+    if (preloadCsp) {
+      rv = preloadCsp->ShouldLoad(
+          contentType, cspEventListener, aLoadInfo, aContentLocation,
+          nullptr,  
+          false, aDecision);
+      NS_ENSURE_SUCCESS(rv, rv);
+
+      if (NS_CP_REJECTED(*aDecision)) {
+        NS_SetRequestBlockingReason(
+            aLoadInfo, nsILoadInfo::BLOCKING_REASON_CONTENT_POLICY_PRELOAD);
+
+        return NS_OK;
+      }
+    }
+  }
+
+  nsCOMPtr<nsIPolicyContainer> policyContainer =
+      aLoadInfo->GetPolicyContainer();
+  nsCOMPtr<nsIContentSecurityPolicy> csp =
+      PolicyContainer::GetCSP(policyContainer);
+
+  if (csp) {
+    rv = csp->ShouldLoad(
+        contentType, cspEventListener, aLoadInfo, aContentLocation,
+         nullptr,
+        !isPreload && aLoadInfo->GetSendCSPViolationEvents(), aDecision);
+
+    if (NS_CP_REJECTED(*aDecision)) {
+      NS_SetRequestBlockingReason(
+          aLoadInfo, nsILoadInfo::BLOCKING_REASON_CONTENT_POLICY_GENERAL);
+    }
+
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+CSPService::ShouldLoad(nsIURI* aContentLocation, nsILoadInfo* aLoadInfo,
+                       int16_t* aDecision) {
+  return ConsultCSP(aContentLocation, aLoadInfo, aDecision);
+}
+
+NS_IMETHODIMP
+CSPService::ShouldProcess(nsIURI* aContentLocation, nsILoadInfo* aLoadInfo,
+                          int16_t* aDecision) {
+  if (!aContentLocation) {
+    return NS_ERROR_FAILURE;
+  }
+  nsContentPolicyType contentType = aLoadInfo->InternalContentPolicyType();
+
+  if (MOZ_LOG_TEST(gCspPRLog, LogLevel::Debug)) {
+    MOZ_LOG(gCspPRLog, LogLevel::Debug,
+            ("CSPService::ShouldProcess called for %s",
+             aContentLocation->GetSpecOrDefault().get()));
+  }
+
+  ExtContentPolicyType policyType =
+      nsContentUtils::InternalContentPolicyTypeToExternal(contentType);
+
+  if (policyType != ExtContentPolicy::TYPE_OBJECT) {
+    *aDecision = nsIContentPolicy::ACCEPT;
+    return NS_OK;
+  }
+
+  return ShouldLoad(aContentLocation, aLoadInfo, aDecision);
+}
+
+NS_IMETHODIMP
+CSPService::AsyncOnChannelRedirect(nsIChannel* oldChannel,
+                                   nsIChannel* newChannel, uint32_t flags,
+                                   nsIAsyncVerifyRedirectCallback* callback) {
+  net::nsAsyncRedirectAutoCallback autoCallback(callback);
+
+  if (XRE_IsE10sParentProcess()) {
+    nsCOMPtr<nsIParentChannel> parentChannel;
+    NS_QueryNotificationCallbacks(oldChannel, parentChannel);
+    RefPtr<net::DocumentLoadListener> docListener =
+        do_QueryObject(parentChannel);
+    if (parentChannel && !docListener) {
+      return NS_OK;
+    }
+  }
+
+  if (RefPtr<net::DocumentChannel> docChannel = do_QueryObject(oldChannel)) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIURI> newUri;
+  nsresult rv = newChannel->GetURI(getter_AddRefs(newUri));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsILoadInfo> loadInfo = oldChannel->LoadInfo();
+
+  nsCOMPtr<nsIURI> originalUri;
+  rv = oldChannel->GetOriginalURI(getter_AddRefs(originalUri));
+  if (NS_FAILED(rv)) {
+    autoCallback.DontCallback();
+    oldChannel->Cancel(NS_ERROR_DOM_BAD_URI);
+    return rv;
+  }
+
+  Maybe<nsresult> cancelCode;
+  rv = ConsultCSPForRedirect(originalUri, newUri, loadInfo, cancelCode);
+  if (cancelCode) {
+    oldChannel->Cancel(*cancelCode);
+  }
+  if (NS_FAILED(rv)) {
+    autoCallback.DontCallback();
+  }
+
+  return rv;
+}
+
+nsresult CSPService::ConsultCSPForRedirect(nsIURI* aOriginalURI,
+                                           nsIURI* aNewURI,
+                                           nsILoadInfo* aLoadInfo,
+                                           Maybe<nsresult>& aCancelCode) {
+  nsContentPolicyType policyType = aLoadInfo->InternalContentPolicyType();
+  if (!SubjectToCSP(aLoadInfo, aNewURI, policyType)) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsICSPEventListener> cspEventListener;
+  nsresult rv =
+      aLoadInfo->GetCspEventListener(getter_AddRefs(cspEventListener));
+  MOZ_ALWAYS_SUCCEEDS(rv);
+
+  bool isPreload = nsContentUtils::IsPreloadType(policyType);
+
+
+  int16_t decision = nsIContentPolicy::ACCEPT;
+
+  if (isPreload) {
+    nsCOMPtr<nsIContentSecurityPolicy> preloadCsp = aLoadInfo->GetPreloadCsp();
+    if (preloadCsp) {
+      preloadCsp->ShouldLoad(
+          policyType,  
+          cspEventListener, aLoadInfo,
+          aNewURI,       
+          aOriginalURI,  
+          true,          
+          &decision);
+
+      if (NS_CP_REJECTED(decision)) {
+        aCancelCode = Some(NS_ERROR_DOM_BAD_URI);
+        return NS_BINDING_FAILED;
+      }
+    }
+  }
+
+  nsCOMPtr<nsIPolicyContainer> policyContainer =
+      aLoadInfo->GetPolicyContainer();
+  nsCOMPtr<nsIContentSecurityPolicy> csp =
+      PolicyContainer::GetCSP(policyContainer);
+  if (csp) {
+    csp->ShouldLoad(policyType,  
+                    cspEventListener, aLoadInfo,
+                    aNewURI,       
+                    aOriginalURI,  
+                    true,          
+                    &decision);
+    if (NS_CP_REJECTED(decision)) {
+      aCancelCode = Some(NS_ERROR_DOM_BAD_URI);
+      return NS_BINDING_FAILED;
+    }
+  }
+
+  return NS_OK;
+}

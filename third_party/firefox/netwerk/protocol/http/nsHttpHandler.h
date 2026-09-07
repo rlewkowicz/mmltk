@@ -1,0 +1,746 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(nsHttpHandler_h_)
+#define nsHttpHandler_h_
+
+#include <functional>
+
+#include "nsHttp.h"
+#include "nsHttpAuthCache.h"
+#include "nsHttpConnectionInfo.h"
+#include "AlternateServices.h"
+#include "ASpdySession.h"
+#include "HttpTrafficAnalyzer.h"
+#include "EventTokenBucket.h"
+
+#include "mozilla/DataMutex.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/TimeStamp.h"
+#include "nsString.h"
+#include "nsCOMPtr.h"
+#include "nsWeakReference.h"
+#include "mozilla/net/Dictionary.h"
+#include "mozilla/net/HttpConnectionMgrShell.h"
+
+#include "nsIHttpProtocolHandler.h"
+#include "nsIObserver.h"
+#include "nsISpeculativeConnect.h"
+#include "nsTHashMap.h"
+#include "nsTHashSet.h"
+
+#if defined(DEBUG)
+#  include "nsIOService.h"
+#endif
+
+#include "nsIChannel.h"
+#include "nsIHttpChannel.h"
+#include "nsSocketTransportService2.h"
+
+class nsIHttpActivityDistributor;
+class nsIHttpUpgradeListener;
+class nsIPrefBranch;
+class nsICancelable;
+class nsICookieService;
+class nsIIOService;
+class nsIRequestContextService;
+class nsISiteIntegrityService;
+class nsISiteSecurityService;
+class nsIStreamConverterService;
+
+namespace mozilla::net {
+
+class ATokenBucketEvent;
+class EventTokenBucket;
+class HttpActivityArgs;
+class Tickler;
+class nsHttpConnection;
+class nsHttpConnectionInfo;
+class HttpBaseChannel;
+class HttpHandlerInitArgs;
+class HttpTransactionShell;
+class AltSvcMapping;
+class DNSUtils;
+class TRRServiceChannel;
+class SocketProcessChild;
+
+enum FrameCheckLevel {
+  FRAMECHECK_LAX,
+  FRAMECHECK_BARELY,
+  FRAMECHECK_STRICT_CHUNKED,
+  FRAMECHECK_STRICT
+};
+
+
+class nsHttpHandler final : public nsIHttpProtocolHandler,
+                            public nsIObserver,
+                            public nsSupportsWeakReference,
+                            public nsISpeculativeConnect {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIPROTOCOLHANDLER
+  NS_DECL_NSIPROXIEDPROTOCOLHANDLER
+  NS_DECL_NSIHTTPPROTOCOLHANDLER
+  NS_DECL_NSIOBSERVER
+  NS_DECL_NSISPECULATIVECONNECT
+
+  static already_AddRefed<nsHttpHandler> GetInstance();
+
+  [[nodiscard]] nsresult AddAcceptAndDictionaryHeaders(
+      nsIURI* aURI, ExtContentPolicyType aType, nsHttpRequestHead* aRequest,
+      bool aSecure, nsHttpChannel* aChan, void (*aSuspend)(nsHttpChannel*),
+      const std::function<bool(bool, DictionaryCacheEntry*)>& aCallback);
+  [[nodiscard]] nsresult AddStandardRequestHeaders(
+      nsHttpRequestHead*, nsIURI* aURI, bool aIsHTTPS,
+      ExtContentPolicyType aContentPolicyType, bool aShouldResistFingerprinting,
+      const nsCString& aLanguageOverride);
+  [[nodiscard]] nsresult AddConnectionHeader(nsHttpRequestHead*, uint32_t caps);
+  bool IsAcceptableEncoding(const char* encoding, bool isSecure);
+
+  const nsCString& UserAgent(bool aShouldResistFingerprinting);
+
+  enum HttpVersion HttpVersion() { return mHttpVersion; }
+  enum HttpVersion ProxyHttpVersion() { return mProxyHttpVersion; }
+  uint8_t RedirectionLimit() { return mRedirectionLimit; }
+  PRIntervalTime IdleTimeout() { return mIdleTimeout; }
+  PRIntervalTime SpdyTimeout() { return mSpdyTimeout; }
+  PRIntervalTime ResponseTimeout() {
+    return mResponseTimeoutEnabled ? mResponseTimeout : 0;
+  }
+  PRIntervalTime ResponseTimeoutEnabled() { return mResponseTimeoutEnabled; }
+  uint32_t NetworkChangedTimeout() { return mNetworkChangedTimeout; }
+  uint16_t MaxRequestAttempts() { return mMaxRequestAttempts; }
+  const nsCString& DefaultSocketType() { return mDefaultSocketType; }
+  uint8_t GetQoSBits() { return mQoSBits; }
+  uint16_t GetIdleSynTimeout() { return mIdleSynTimeout; }
+  uint16_t GetFallbackSynTimeout() { return mFallbackSynTimeout; }
+  bool FastFallbackToIPv4() { return mFastFallbackToIPv4; }
+  uint32_t MaxSocketCount();
+  bool EnforceAssocReq() { return mEnforceAssocReq; }
+
+  bool IsPersistentHttpsCachingEnabled() {
+    return mEnablePersistentHttpsCaching;
+  }
+
+  uint32_t SpdySendingChunkSize() { return mSpdySendingChunkSize; }
+  uint32_t SpdySendBufferSize() { return mSpdySendBufferSize; }
+  uint32_t SpdyPushAllowance() { return mSpdyPushAllowance; }
+  uint32_t SpdyPullAllowance() { return mSpdyPullAllowance; }
+  uint32_t DefaultSpdyConcurrent() { return mDefaultSpdyConcurrent; }
+  PRIntervalTime SpdyPingThreshold() { return mSpdyPingThreshold; }
+  PRIntervalTime SpdyPingTimeout() { return mSpdyPingTimeout; }
+  bool AllowAltSvc() { return mEnableAltSvc; }
+  uint32_t ConnectTimeout() { return mConnectTimeout; }
+  uint32_t TLSHandshakeTimeout() { return mTLSHandshakeTimeout; }
+  uint32_t ParallelSpeculativeConnectLimit() {
+    return mParallelSpeculativeConnectLimit;
+  }
+  bool CriticalRequestPrioritization() {
+    return mCriticalRequestPrioritization;
+  }
+
+  uint32_t MaxConnectionsPerOrigin() {
+    return mMaxPersistentConnectionsPerServer;
+  }
+  bool UseRequestTokenBucket() { return mRequestTokenBucketEnabled; }
+  uint16_t RequestTokenBucketMinParallelism() {
+    return mRequestTokenBucketMinParallelism;
+  }
+  uint32_t RequestTokenBucketHz() { return mRequestTokenBucketHz; }
+  uint32_t RequestTokenBucketBurst() { return mRequestTokenBucketBurst; }
+
+  bool PromptTempRedirect() { return mPromptTempRedirect; }
+  bool IsUrgentStartEnabled() { return mUrgentStartEnabled; }
+  bool IsTailBlockingEnabled() { return mTailBlockingEnabled; }
+  uint32_t TailBlockingDelayQuantum(bool aAfterDOMContentLoaded) {
+    return aAfterDOMContentLoaded ? mTailDelayQuantumAfterDCL
+                                  : mTailDelayQuantum;
+  }
+  uint32_t TailBlockingDelayMax() { return mTailDelayMax; }
+  uint32_t TailBlockingTotalMax() { return mTailTotalMax; }
+
+  uint32_t ThrottlingReadLimit() { return 0; }
+  int32_t SendWindowSize() { return mSendWindowSize * 1024; }
+
+
+  bool TCPKeepaliveEnabledForShortLivedConns() {
+    return mTCPKeepaliveShortLivedEnabled;
+  }
+  int32_t GetTCPKeepaliveShortLivedTime() {
+    return mTCPKeepaliveShortLivedTimeS;
+  }
+  int32_t GetTCPKeepaliveShortLivedIdleTime() {
+    return mTCPKeepaliveShortLivedIdleTimeS;
+  }
+
+  bool TCPKeepaliveEnabledForLongLivedConns() {
+    return mTCPKeepaliveLongLivedEnabled;
+  }
+  int32_t GetTCPKeepaliveLongLivedIdleTime() {
+    return mTCPKeepaliveLongLivedIdleTimeS;
+  }
+
+  FrameCheckLevel GetEnforceH1Framing() { return mEnforceH1Framing; }
+
+  nsHttpAuthCache* AuthCache(bool aPrivate) {
+    return aPrivate ? mPrivateAuthCache : mAuthCache;
+  }
+  nsHttpConnectionMgr* ConnMgr() {
+    MOZ_ASSERT_IF(nsIOService::UseSocketProcess(), XRE_IsSocketProcess());
+    return mConnMgr->AsHttpConnectionMgr();
+  }
+
+  AltSvcCache* AltServiceCache() const {
+    MOZ_ASSERT(XRE_IsParentProcess());
+    return mAltSvcCache.get();
+  }
+
+  void ClearHostMapping(nsHttpConnectionInfo* aConnInfo);
+
+  uint32_t GenerateUniqueID() { return ++mLastUniqueID; }
+  uint32_t SessionStartTime() { return mSessionStartTime; }
+
+  void GenerateIdempotencyKeyForPost(const uint32_t aPostId,
+                                     nsILoadInfo* aLoadInfo,
+                                     nsACString& aOutKey);
+
+
+  [[nodiscard]] nsresult InitiateTransaction(HttpTransactionShell* trans,
+                                             int32_t priority);
+
+  [[nodiscard]] nsresult InitiateTransactionWithStickyConn(
+      HttpTransactionShell* trans, int32_t priority,
+      HttpTransactionShell* transWithStickyConn);
+
+  [[nodiscard]] nsresult RescheduleTransaction(HttpTransactionShell* trans,
+                                               int32_t priority);
+
+  void UpdateClassOfServiceOnTransaction(HttpTransactionShell* trans,
+                                         const ClassOfService& classOfService);
+
+  [[nodiscard]] nsresult CancelTransaction(HttpTransactionShell* trans,
+                                           nsresult reason);
+
+  [[nodiscard]] nsresult ReclaimConnection(HttpConnectionBase* conn) {
+    return mConnMgr->ReclaimConnection(conn);
+  }
+
+  [[nodiscard]] nsresult ProcessPendingQ(nsHttpConnectionInfo* cinfo) {
+    return mConnMgr->ProcessPendingQ(cinfo);
+  }
+
+  [[nodiscard]] nsresult ProcessPendingQ() {
+    return mConnMgr->ProcessPendingQ();
+  }
+
+  [[nodiscard]] nsresult GetSocketThreadTarget(nsIEventTarget** target) {
+    return mConnMgr->GetSocketThreadTarget(target);
+  }
+
+  [[nodiscard]] nsresult MaybeSpeculativeConnectWithHTTPSRR(
+      nsHttpConnectionInfo* ci, nsIInterfaceRequestor* callbacks, uint32_t caps,
+      bool aFetchHTTPSRR) {
+    TickleWifi(callbacks);
+    RefPtr<nsHttpConnectionInfo> clone = ci->Clone();
+    return mConnMgr->SpeculativeConnect(clone, callbacks, caps, nullptr,
+                                        aFetchHTTPSRR);
+  }
+
+  [[nodiscard]] nsresult SpeculativeConnect(nsHttpConnectionInfo* ci,
+                                            nsIInterfaceRequestor* callbacks,
+                                            uint32_t caps,
+                                            SpeculativeTransaction* aTrans);
+
+  void UpdateAltServiceMapping(AltSvcMapping* map, nsProxyInfo* proxyInfo,
+                               nsIInterfaceRequestor* callbacks, uint32_t caps,
+                               const OriginAttributes& originAttributes) {
+    mAltSvcCache->UpdateAltServiceMapping(map, proxyInfo, callbacks, caps,
+                                          originAttributes);
+  }
+
+  void UpdateAltServiceMappingWithoutValidation(
+      AltSvcMapping* map, nsProxyInfo* proxyInfo,
+      nsIInterfaceRequestor* callbacks, uint32_t caps,
+      const OriginAttributes& originAttributes) {
+    mAltSvcCache->UpdateAltServiceMappingWithoutValidation(
+        map, proxyInfo, callbacks, caps, originAttributes);
+  }
+
+  already_AddRefed<AltSvcMapping> GetAltServiceMapping(
+      const nsACString& scheme, const nsACString& host, int32_t port, bool pb,
+      const OriginAttributes& originAttributes, bool aHttp2Allowed,
+      bool aHttp3Allowed, bool aForceHttp3First = false) {
+    return mAltSvcCache->GetAltServiceMapping(scheme, host, port, pb,
+                                              originAttributes, aHttp2Allowed,
+                                              aHttp3Allowed, aForceHttp3First);
+  }
+
+  [[nodiscard]] nsresult GetIOService(nsIIOService** result);
+  nsICookieService* GetCookieService();  
+  nsISiteIntegrityService* GetSiteIntegrityService();
+  nsISiteSecurityService* GetSSService();
+
+  void OnFailedOpeningRequest(nsIHttpChannel* chan) {
+    NotifyObservers(chan, NS_HTTP_ON_FAILED_OPENING_REQUEST_TOPIC);
+  }
+
+  void OnOpeningRequest(nsIHttpChannel* chan) {
+    NotifyObservers(chan, NS_HTTP_ON_OPENING_REQUEST_TOPIC);
+  }
+
+  void OnOpeningDocumentRequest(nsIIdentChannel* chan) {
+    NotifyObservers(chan, NS_DOCUMENT_ON_OPENING_REQUEST_TOPIC);
+  }
+
+  void OnModifyRequest(nsIHttpChannel* chan) {
+    NotifyObservers(chan, NS_HTTP_ON_MODIFY_REQUEST_TOPIC);
+  }
+
+  void OnModifyRequestBeforeCookies(nsIHttpChannel* chan) {
+    NotifyObservers(chan, NS_HTTP_ON_MODIFY_REQUEST_BEFORE_COOKIES_TOPIC);
+  }
+
+  void OnModifyDocumentRequest(nsIIdentChannel* chan) {
+    NotifyObservers(chan, NS_DOCUMENT_ON_MODIFY_REQUEST_TOPIC);
+  }
+
+  void OnBeforeStopRequest(nsIHttpChannel* chan) {
+    NotifyObservers(chan, NS_HTTP_ON_BEFORE_STOP_REQUEST_TOPIC);
+  }
+
+  void OnStopRequest(nsIHttpChannel* chan) {
+    NotifyObservers(chan, NS_HTTP_ON_STOP_REQUEST_TOPIC);
+  }
+
+  void OnBeforeConnect(nsIHttpChannel* chan) {
+    NotifyObservers(chan, NS_HTTP_ON_BEFORE_CONNECT_TOPIC);
+  }
+
+  void OnExamineResponse(nsIHttpChannel* chan) {
+    NotifyObservers(chan, NS_HTTP_ON_EXAMINE_RESPONSE_TOPIC);
+  }
+
+  void OnAfterExamineResponse(nsIHttpChannel* chan) {
+    NotifyObservers(chan, NS_HTTP_ON_AFTER_EXAMINE_RESPONSE_TOPIC);
+  }
+
+  void OnExamineMergedResponse(nsIHttpChannel* chan) {
+    NotifyObservers(chan, NS_HTTP_ON_EXAMINE_MERGED_RESPONSE_TOPIC);
+  }
+
+  void OnBackgroundRevalidation(nsIHttpChannel* chan) {
+    NotifyObservers(chan, NS_HTTP_ON_BACKGROUND_REVALIDATION);
+  }
+
+  [[nodiscard]] nsresult AsyncOnChannelRedirect(
+      nsIChannel* oldChan, nsIChannel* newChan, uint32_t flags,
+      nsIEventTarget* mainThreadEventTarget = nullptr);
+
+  void OnExamineCachedResponse(nsIHttpChannel* chan) {
+    NotifyObservers(chan, NS_HTTP_ON_EXAMINE_CACHED_RESPONSE_TOPIC);
+  }
+
+  void OnTransactionSuspendedDueToAuthentication(nsIHttpChannel* chan) {
+    NotifyObservers(chan, "http-on-transaction-suspended-authentication");
+  }
+
+  [[nodiscard]] static nsresult GenerateHostPort(const nsCString& host,
+                                                 int32_t port,
+                                                 nsACString& hostLine);
+
+  static uint8_t UrgencyFromCoSFlags(uint32_t cos, int32_t aSupportsPriority);
+
+  SpdyInformation* SpdyInfo() { return &mSpdyInfo; }
+  bool IsH2MandatorySuiteEnabled() { return mH2MandatorySuiteEnabled; }
+
+  bool Active() { return mHandlerActive; }
+
+  nsIRequestContextService* GetRequestContextService() {
+    return mRequestContextService.get();
+  }
+
+  void ShutdownConnectionManager();
+
+  uint32_t DefaultHpackBuffer() const { return mDefaultHpackBuffer; }
+
+  static bool IsHttp3Enabled();
+  bool IsHttp3VersionSupported(const nsACString& version);
+
+  static bool IsHttp3SupportedByServer(nsHttpResponseHead* aResponseHead);
+  uint32_t DefaultQpackTableSize() const { return mQpackTableSize; }
+  uint16_t DefaultHttp3MaxBlockedStreams() const {
+    return (uint16_t)mHttp3MaxBlockedStreams;
+  }
+
+  const nsCString& Http3QlogDir();
+
+  float FocusedWindowTransactionRatio() const {
+    return mFocusedWindowTransactionRatio;
+  }
+
+  void NotifyActiveTabLoadOptimization();
+  TimeStamp GetLastActiveTabLoadOptimizationHit();
+  void SetLastActiveTabLoadOptimizationHit(TimeStamp const& when);
+  bool IsBeforeLastActiveTabLoadOptimization(TimeStamp const& when);
+
+  HttpTrafficAnalyzer* GetHttpTrafficAnalyzer();
+
+  nsresult CompleteUpgrade(HttpTransactionShell* aTrans,
+                           nsIHttpUpgradeListener* aUpgradeListener);
+
+  nsresult DoShiftReloadConnectionCleanupWithConnInfo(
+      nsHttpConnectionInfo* aCI);
+
+  void MaybeAddAltSvcForTesting(nsIURI* aUri, const nsACString& aUsername,
+                                bool aPrivateBrowsing,
+                                nsIInterfaceRequestor* aCallbacks,
+                                const OriginAttributes& aOriginAttributes);
+
+  static bool EchConfigEnabled(bool aIsHttp3 = false);
+  bool FallbackToOriginIfConfigsAreECHAndAllFailed() const;
+
+  static void PresetAcceptLanguages();
+
+  bool HttpActivityDistributorActivated();
+  void ObserveHttpActivityWithArgs(const HttpActivityArgs& aArgs,
+                                   uint32_t aActivityType,
+                                   uint32_t aActivitySubtype, PRTime aTimestamp,
+                                   uint64_t aExtraSizeData,
+                                   const nsACString& aExtraStringData);
+
+ private:
+  nsHttpHandler();
+
+  virtual ~nsHttpHandler();
+
+  [[nodiscard]] nsresult Init();
+
+  void BuildUserAgent();
+  void InitUserAgentComponents();
+  static void PrefsChanged(const char* pref, void* self);
+  void PrefsChanged(const char* pref);
+
+  [[nodiscard]] nsresult SetAcceptLanguages();
+  [[nodiscard]] nsresult SetAcceptEncodings(const char*, bool aIsSecure,
+                                            bool aDictionary);
+
+  [[nodiscard]] nsresult InitConnectionMgr();
+
+  void NotifyObservers(nsIChannel* chan, const char* event);
+
+  friend class SocketProcessChild;
+  void SetHttpHandlerInitArgs(const HttpHandlerInitArgs& aArgs);
+  void SetDeviceModelId(const nsACString& aModelId);
+
+  friend class TRRServiceChannel;
+  friend class DNSUtils;
+  nsresult CreateTRRServiceChannel(nsIURI* uri, nsIProxyInfo* givenProxyInfo,
+                                   uint32_t proxyResolveFlags, nsIURI* proxyURI,
+                                   nsILoadInfo* aLoadInfo, nsIChannel** result);
+  nsresult SetupChannelInternal(HttpBaseChannel* aChannel, nsIURI* uri,
+                                nsIProxyInfo* givenProxyInfo,
+                                uint32_t proxyResolveFlags, nsIURI* proxyURI,
+                                nsILoadInfo* aLoadInfo, nsIChannel** result);
+
+ private:
+  nsMainThreadPtrHandle<nsIIOService> mIOService;
+  nsMainThreadPtrHandle<nsICookieService> mCookieService;
+  nsMainThreadPtrHandle<nsISiteIntegrityService> mSiteIntegrityService;
+  nsMainThreadPtrHandle<nsISiteSecurityService> mSSService;
+
+  RefPtr<nsHttpAuthCache> mAuthCache;
+  RefPtr<nsHttpAuthCache> mPrivateAuthCache;
+
+  RefPtr<HttpConnectionMgrShell> mConnMgr;
+
+  UniquePtr<AltSvcCache> mAltSvcCache;
+
+  RefPtr<DictionaryCache> mDictionaryCache;
+
+
+  enum HttpVersion mHttpVersion { HttpVersion::v1_1 };
+  enum HttpVersion mProxyHttpVersion { HttpVersion::v1_1 };
+  uint32_t mCapabilities{NS_HTTP_ALLOW_KEEPALIVE};
+
+  bool mFastFallbackToIPv4{false};
+  PRIntervalTime mIdleTimeout;
+  PRIntervalTime mSpdyTimeout;
+  PRIntervalTime mResponseTimeout;
+  Atomic<bool, Relaxed> mResponseTimeoutEnabled{false};
+  uint32_t mNetworkChangedTimeout{5000};  
+  uint16_t mMaxRequestAttempts{6};
+  uint16_t mMaxRequestDelay{10};
+  uint16_t mIdleSynTimeout{250};
+  uint16_t mFallbackSynTimeout{5};  
+
+  bool mH2MandatorySuiteEnabled{false};
+  uint16_t mMaxUrgentExcessiveConns{3};
+  uint16_t mMaxConnections{24};
+  uint8_t mMaxPersistentConnectionsPerServer{2};
+  uint8_t mMaxPersistentConnectionsPerProxy{4};
+
+  bool mThrottleEnabled{true};
+  uint32_t mThrottleSuspendFor{3000};
+  uint32_t mThrottleResumeFor{200};
+  uint32_t mThrottleHoldTime{600};
+  uint32_t mThrottleMaxTime{3000};
+
+  int32_t mSendWindowSize{1024};
+
+  bool mUrgentStartEnabled{true};
+  bool mTailBlockingEnabled{true};
+  uint32_t mTailDelayQuantum{600};
+  uint32_t mTailDelayQuantumAfterDCL{100};
+  uint32_t mTailDelayMax{6000};
+  uint32_t mTailTotalMax{0};
+
+  uint8_t mRedirectionLimit{10};
+
+  bool mBeConservativeForProxy{true};
+
+  uint8_t mQoSBits{0x00};
+
+  bool mEnforceAssocReq{false};
+
+  nsCString mImageAcceptHeader;
+  nsCString mDocumentAcceptHeader;
+
+  nsCString mAcceptLanguages;
+  nsCString mHttpAcceptEncodings;
+  nsCString mHttpsAcceptEncodings;
+  nsCString mDictionaryAcceptEncodings;
+
+  nsCString mDefaultSocketType;
+
+  uint32_t mLastUniqueID;
+  Atomic<uint32_t, Relaxed> mSessionStartTime{0};
+
+  nsCString mLegacyAppName{"Mozilla"};
+  nsCString mLegacyAppVersion{"5.0"};
+  uint64_t mIdempotencyKeySeed;
+  uint64_t mPrivateBrowsingIdempotencyKeySeed;
+  nsCString mPlatform;
+  nsCString mOscpu;
+  nsCString mMisc;
+  nsCString mProduct{"Gecko"};
+  nsCString mProductSub;
+  nsCString mAppName;
+  nsCString mAppVersion;
+  nsCString mCompatFirefox;
+  bool mCompatFirefoxEnabled{false};
+  nsCString mCompatDevice;
+  nsCString mDeviceModelId;
+
+  nsCString mUserAgent;
+  nsCString mSpoofedUserAgent;
+  nsCString mUserAgentOverride;
+  bool mUserAgentIsDirty{true};  
+  bool mAcceptLanguagesIsDirty{true};
+
+  bool mPromptTempRedirect{true};
+
+  bool mEnablePersistentHttpsCaching{false};
+
+  bool mSafeHintEnabled{false};
+  Atomic<bool, Relaxed> mHandlerActive{false};
+
+  uint32_t mDebugObservations : 1;
+
+  uint32_t mEnableAltSvc : 1;
+
+  SpdyInformation mSpdyInfo;
+
+  uint32_t mSpdySendingChunkSize{ASpdySession::kSendingChunkSize};
+  uint32_t mSpdySendBufferSize{ASpdySession::kTCPSendBufferSize};
+  uint32_t mSpdyPushAllowance{
+      ASpdySession::kInitialPushAllowance};  
+  uint32_t mSpdyPullAllowance{ASpdySession::kInitialRwin};
+  uint32_t mDefaultSpdyConcurrent{ASpdySession::kDefaultMaxConcurrent};
+  PRIntervalTime mSpdyPingThreshold;
+  PRIntervalTime mSpdyPingTimeout;
+
+  uint32_t mConnectTimeout{90000};
+
+  uint32_t mTLSHandshakeTimeout{30000};
+
+  uint32_t mParallelSpeculativeConnectLimit{6};
+
+  bool mRequestTokenBucketEnabled{true};
+  uint16_t mRequestTokenBucketMinParallelism{6};
+  uint32_t mRequestTokenBucketHz{100};    
+  uint32_t mRequestTokenBucketBurst{32};  
+
+  bool mCriticalRequestPrioritization{true};
+
+
+  bool mTCPKeepaliveShortLivedEnabled{false};
+  int32_t mTCPKeepaliveShortLivedTimeS{60};
+  int32_t mTCPKeepaliveShortLivedIdleTimeS{10};
+
+  bool mTCPKeepaliveLongLivedEnabled{false};
+  int32_t mTCPKeepaliveLongLivedIdleTimeS{600};
+
+  FrameCheckLevel mEnforceH1Framing{FRAMECHECK_BARELY};
+
+  nsCOMPtr<nsIRequestContextService> mRequestContextService;
+
+  uint32_t mDefaultHpackBuffer{4096};
+
+  Atomic<uint32_t, Relaxed> mQpackTableSize{4096};
+  Atomic<uint32_t, Relaxed> mHttp3MaxBlockedStreams{10};
+
+  nsCString mHttp3QlogDir;
+
+  float mFocusedWindowTransactionRatio{0.9f};
+
+  HttpTrafficAnalyzer mHttpTrafficAnalyzer;
+
+ private:
+  void MakeNewRequestTokenBucket();
+  RefPtr<EventTokenBucket> mRequestTokenBucket;
+
+ public:
+  [[nodiscard]] nsresult SubmitPacedRequest(ATokenBucketEvent* event,
+                                            nsICancelable** cancel) {
+    MOZ_ASSERT(OnSocketThread(), "not on socket thread");
+    if (!mRequestTokenBucket) {
+      return NS_ERROR_NOT_AVAILABLE;
+    }
+    return mRequestTokenBucket->SubmitEvent(event, cancel);
+  }
+
+  void SetRequestTokenBucket(EventTokenBucket* aTokenBucket) {
+    MOZ_ASSERT(OnSocketThread(), "not on socket thread");
+    mRequestTokenBucket = aTokenBucket;
+  }
+
+  void StopRequestTokenBucket() {
+    MOZ_ASSERT(OnSocketThread(), "not on socket thread");
+    if (mRequestTokenBucket) {
+      mRequestTokenBucket->Stop();
+      mRequestTokenBucket = nullptr;
+    }
+  }
+
+ private:
+  RefPtr<Tickler> mWifiTickler;
+  void TickleWifi(nsIInterfaceRequestor* cb);
+
+ private:
+  [[nodiscard]] nsresult SpeculativeConnectInternal(
+      nsIURI* aURI, nsIPrincipal* aPrincipal,
+      Maybe<OriginAttributes>&& aOriginAttributes,
+      nsIInterfaceRequestor* aCallbacks, bool anonymous);
+  void ExcludeHttp2OrHttp3Internal(const nsHttpConnectionInfo* ci);
+
+  uint64_t mUniqueProcessId{0};
+  Atomic<uint32_t, Relaxed> mNextChannelId{1};
+
+  uint32_t mProcessId{0};
+
+  DataMutex<TimeStamp> mLastActiveTabLoadOptimizationHit{
+      "nsHttpConnectionMgr::LastActiveTabLoadOptimization"};
+
+  Mutex mHttpExclusionLock{"nsHttpHandler::HttpExclusion"};
+
+ public:
+  [[nodiscard]] uint64_t NewChannelId();
+  void AddHttpChannel(uint64_t aId, nsISupports* aChannel);
+  void RemoveHttpChannel(uint64_t aId);
+  nsWeakPtr GetWeakHttpChannel(uint64_t aId);
+
+  void ExcludeHttp2(const nsHttpConnectionInfo* ci);
+  [[nodiscard]] bool IsHttp2Excluded(const nsHttpConnectionInfo* ci);
+  void ExcludeHttp3(const nsHttpConnectionInfo* ci);
+  [[nodiscard]] bool IsHttp3Excluded(const nsACString& aRoutedHost);
+  void Exclude0RttTcp(const nsHttpConnectionInfo* ci);
+  [[nodiscard]] bool Is0RttTcpExcluded(const nsHttpConnectionInfo* ci);
+
+  void ExcludeHTTPSRRHost(const nsACString& aHost);
+  [[nodiscard]] bool IsHostExcludedForHTTPSRR(const nsACString& aHost);
+
+
+ private:
+  nsTHashSet<nsCString> mExcludedHttp2Origins
+      MOZ_GUARDED_BY(mHttpExclusionLock);
+  nsTHashSet<nsCString> mExcludedHttp3Origins
+      MOZ_GUARDED_BY(mHttpExclusionLock);
+  nsTHashSet<nsCString> mExcluded0RttTcpOrigins;
+  nsTHashSet<nsCString> mExcludedHostsForHTTPSRRUpgrade;
+
+
+  nsTHashMap<nsUint64HashKey, nsWeakPtr> mIDToHttpChannelMap;
+
+  nsClassHashtable<nsCStringHashKey, nsCString> mAltSvcMappingTemptativeMap;
+
+  nsCOMPtr<nsIHttpActivityDistributor> mActivityDistributor;
+};
+
+extern StaticRefPtr<nsHttpHandler> gHttpHandler;
+
+
+class nsHttpsHandler : public nsIHttpProtocolHandler,
+                       public nsSupportsWeakReference,
+                       public nsISpeculativeConnect {
+  virtual ~nsHttpsHandler() = default;
+
+ public:
+
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIPROTOCOLHANDLER
+  NS_FORWARD_NSIPROXIEDPROTOCOLHANDLER(gHttpHandler->)
+  NS_FORWARD_NSIHTTPPROTOCOLHANDLER(gHttpHandler->)
+
+  NS_IMETHOD SpeculativeConnect(nsIURI* aURI, nsIPrincipal* aPrincipal,
+                                nsIInterfaceRequestor* aCallbacks,
+                                bool aAnonymous) override {
+    return gHttpHandler->SpeculativeConnect(aURI, aPrincipal, aCallbacks,
+                                            aAnonymous);
+  }
+
+  NS_IMETHOD SpeculativeConnectWithOriginAttributes(
+      nsIURI* aURI, JS::Handle<JS::Value> originAttributes,
+      nsIInterfaceRequestor* aCallbacks, bool aAnonymous,
+      JSContext* cx) override {
+    return gHttpHandler->SpeculativeConnectWithOriginAttributes(
+        aURI, originAttributes, aCallbacks, aAnonymous, cx);
+  }
+
+  NS_IMETHOD_(void)
+  SpeculativeConnectWithOriginAttributesNative(
+      nsIURI* aURI, mozilla::OriginAttributes&& originAttributes,
+      nsIInterfaceRequestor* aCallbacks, bool aAnonymous) override {
+    gHttpHandler->SpeculativeConnectWithOriginAttributesNative(
+        aURI, std::move(originAttributes), aCallbacks, aAnonymous);
+  }
+
+  nsHttpsHandler() = default;
+
+  [[nodiscard]] nsresult Init();
+};
+
+class HSTSDataCallbackWrapper final {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(HSTSDataCallbackWrapper)
+
+  explicit HSTSDataCallbackWrapper(std::function<void(bool)>&& aCallback)
+      : mCallback(std::move(aCallback)) {
+    MOZ_ASSERT(NS_IsMainThread());
+  }
+
+  void DoCallback(bool aResult) {
+    MOZ_ASSERT(NS_IsMainThread());
+    mCallback(aResult);
+  }
+
+ private:
+  ~HSTSDataCallbackWrapper() = default;
+
+  std::function<void(bool)> mCallback;
+};
+
+}  
+
+#endif

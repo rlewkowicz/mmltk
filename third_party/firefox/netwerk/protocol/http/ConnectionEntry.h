@@ -1,0 +1,219 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef ConnectionEntry_h_
+#define ConnectionEntry_h_
+
+#include "PendingTransactionInfo.h"
+#include "PendingTransactionQueue.h"
+#include "ConnectionAttemptPool.h"
+#include "mozilla/WeakPtr.h"
+#include "nsTHashSet.h"
+
+namespace mozilla {
+namespace net {
+
+class ConnectionEntry : public SupportsWeakPtr {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(ConnectionEntry)
+  ConnectionEntry(nsHttpConnectionInfo* ci,
+                  nsTHashSet<ConnectionEntry*>& aPendingQSet);
+
+  void ReschedTransaction(nsHttpTransaction* aTrans);
+
+  nsTArray<RefPtr<PendingTransactionInfo>>* GetTransactionPendingQHelper(
+      nsAHttpTransaction* trans);
+
+  void InsertTransactionSorted(
+      nsTArray<RefPtr<PendingTransactionInfo>>& pendingQ,
+      PendingTransactionInfo* pendingTransInfo,
+      bool aInsertAsFirstForTheSamePriority = false);
+
+  void InsertTransaction(PendingTransactionInfo* aPendingTransInfo,
+                         bool aInsertAsFirstForTheSamePriority = false);
+
+  size_t UrgentStartQueueLength();
+  bool UrgentStartQueueIsEmpty() const;
+
+  void PrintPendingQ();
+
+  void Compact();
+
+  void CancelAllTransactions(nsresult reason);
+
+  nsresult CloseIdleConnection(nsHttpConnection* conn);
+  void CloseIdleConnections();
+  void CloseIdleConnections(uint32_t maxToClose);
+  void CloseExtendedCONNECTConnections();
+  void ClosePendingConnections();
+  nsresult RemoveIdleConnection(nsHttpConnection* conn);
+  bool IsInIdleConnections(HttpConnectionBase* conn);
+  size_t IdleConnectionsLength() const { return mIdleConns.Length(); }
+  void InsertIntoIdleConnections(nsHttpConnection* conn);
+  already_AddRefed<nsHttpConnection> GetIdleConnection(bool respectUrgency,
+                                                       bool urgentTrans,
+                                                       bool* onlyUrgent);
+
+  size_t ActiveConnsLength() const { return mActiveConns.Length(); }
+  void InsertIntoActiveConns(HttpConnectionBase* conn);
+  bool IsInActiveConns(HttpConnectionBase* conn);
+  nsresult RemoveActiveConnection(HttpConnectionBase* conn);
+  nsresult RemovePendingConnection(HttpConnectionBase* conn);
+  void MakeAllDontReuseExcept(HttpConnectionBase* conn);
+  bool FindConnToClaim(PendingTransactionInfo* pendingTransInfo);
+  void CloseActiveConnections();
+  void CloseAllActiveConnsWithNullTransactcion(nsresult aCloseCode);
+
+  bool IsInExtendedCONNECTConns(HttpConnectionBase* conn);
+  void InsertIntoExtendedCONNECTConns(HttpConnectionBase* conn);
+  void RemoveExtendedCONNECTConns(HttpConnectionBase* conn);
+
+  HttpConnectionBase* GetH2orH3ActiveConn(bool aNoHttp2, bool aNoHttp3);
+  already_AddRefed<nsHttpConnection> GetH2TunnelActiveConn();
+  bool MakeFirstActiveSpdyConnDontReuse();
+
+  void ClosePersistentConnections();
+
+  uint32_t PruneDeadConnections();
+  void MakeConnectionPendingAndDontReuse(HttpConnectionBase* conn);
+  void MoveUnusableH3ConnsToPending();
+  void VerifyTraffic();
+  void PruneNoTraffic();
+  uint32_t TimeoutTick();
+
+  void MoveConnection(HttpConnectionBase* proxyConn, ConnectionEntry* otherEnt);
+
+  size_t DnsAndConnectSocketsLength() const {
+    return mConnectionAttemptPool->Length();
+  }
+
+  void RemoveConnectionAttempt(ConnectionAttempt* sock, bool abandon);
+  void CloseAllConnectionAttempts();
+  void OnConnectionAttemptConnected() {
+    mConnectionAttemptPool->OnConnectionAttemptConnected();
+  }
+
+  HttpRetParams GetConnectionData();
+  Http3ConnectionStatsParams GetHttp3ConnectionStatsData();
+  void LogConnections();
+
+  const RefPtr<nsHttpConnectionInfo> mConnInfo;
+
+  bool AvailableForDispatchNow();
+
+  bool MaybeProcessCoalescingKeys(nsIDNSAddrRecord* dnsRecord,
+                                  bool aIsHttp3 = false);
+  bool MaybeProcessCoalescingKeys(const nsTArray<NetAddr>& aAddresses,
+                                  bool aIsHttp3 = false);
+
+  nsresult CreateDnsAndConnectSocket(nsAHttpTransaction* trans, uint32_t caps,
+                                     bool speculative, bool urgentStart,
+                                     bool allow1918,
+                                     PendingTransactionInfo* pendingTransInfo,
+                                     bool retryWithoutTRR = false);
+
+
+  nsTArray<HashNumber> mCoalescingKeys;
+
+  nsTArray<NetAddr> mAddresses;
+
+  bool mUsingSpdy : 1;
+
+  bool mCanUseSpdy : 1;
+
+  bool mPreferIPv4 : 1;
+  bool mPreferIPv6 : 1;
+
+  bool mUsedForConnection : 1;
+
+  bool mPendingQProcessingScheduled : 1;
+
+  bool IsEmpty() const {
+    return IdleConnectionsLength() == 0 && ActiveConnsLength() == 0 &&
+           DnsAndConnectSocketsLength() == 0 && PendingQueueIsEmpty() &&
+           UrgentStartQueueIsEmpty() && mPendingConns.IsEmpty() &&
+           mExtendedCONNECTConns.IsEmpty();
+  }
+
+  bool IsHttp3ProxyConnection() const {
+    return mConnInfo->IsHttp3ProxyConnection();
+  }
+  bool AllowHttp2() const { return mCanUseSpdy; }
+  void DisallowHttp2();
+  void DontReuseHttp3Conn();
+
+  void RecordIPFamilyPreference(uint16_t family);
+  void ResetIPFamilyPreference();
+  bool PreferenceKnown() const;
+
+  size_t PendingQueueLength() const;
+  size_t PendingQueueLengthForWindow(uint64_t windowId) const;
+  bool PendingQueueIsEmpty() const;
+
+  void AppendPendingUrgentStartQ(
+      nsTArray<RefPtr<PendingTransactionInfo>>& result);
+
+  void AppendPendingQForFocusedWindow(
+      uint64_t windowId, nsTArray<RefPtr<PendingTransactionInfo>>& result,
+      uint32_t maxCount = 0);
+
+  void AppendPendingQForNonFocusedWindows(
+      uint64_t windowId, nsTArray<RefPtr<PendingTransactionInfo>>& result,
+      uint32_t maxCount = 0);
+
+  void RemoveEmptyPendingQ();
+
+  void PrintDiagnostics(nsCString& log, uint32_t aMaxPersistConns);
+
+  bool RestrictConnections();
+
+  uint32_t TotalActiveConnections() const;
+
+  bool HasActiveH3Connection() const;
+
+  bool RemoveTransFromPendingQ(nsHttpTransaction* aTrans);
+
+  void OnPendingTransactionRemovedFromTable() {
+    mPendingQ.OnPendingTransactionRemovedFromTable();
+  }
+
+  void MaybeUpdateEchConfig(nsHttpConnectionInfo* aConnInfo);
+
+  bool AllowToRetryDifferentIPFamilyForHttp3(nsresult aError);
+  void SetRetryDifferentIPFamilyForHttp3(uint16_t aIPFamily);
+
+  void SetServerCertHashes(nsTArray<RefPtr<nsIWebTransportHash>>&& aHashes);
+
+  const nsTArray<RefPtr<nsIWebTransportHash>>& GetServerCertHashes();
+
+  const HashNumber& OriginFrameHashKey();
+
+ private:
+  void MaybeRemoveFromPendingSet();
+  nsTHashSet<ConnectionEntry*>& mPendingQSet;
+  void InsertIntoIdleConnections_internal(nsHttpConnection* conn);
+  void RemoveFromIdleConnectionsIndex(size_t inx);
+  bool RemoveFromIdleConnections(nsHttpConnection* conn);
+
+  nsTArray<RefPtr<nsHttpConnection>> mIdleConns;  
+  nsTArray<RefPtr<HttpConnectionBase>> mActiveConns;  
+  nsTArray<RefPtr<HttpConnectionBase>> mPendingConns;
+  nsTArray<RefPtr<HttpConnectionBase>> mExtendedCONNECTConns;
+
+  RefPtr<ConnectionAttemptPool> mConnectionAttemptPool;
+
+  nsTArray<RefPtr<nsIWebTransportHash>> mServerCertHashes;
+
+  PendingTransactionQueue mPendingQ;
+  ~ConnectionEntry();
+
+  Maybe<HashNumber> mOriginFrameHashKey;
+
+  bool mRetriedDifferentIPFamilyForHttp3 = false;
+};
+
+}  
+}  
+
+#endif  // !ConnectionEntry_h_

@@ -1,0 +1,170 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "DrawEventRecorder.h"
+
+#include "PathRecording.h"
+#include "RecordingTypes.h"
+#include "RecordedEventImpl.h"
+
+namespace mozilla {
+namespace gfx {
+
+DrawEventRecorderPrivate::DrawEventRecorderPrivate() : mExternalFonts(false) {}
+
+DrawEventRecorderPrivate::~DrawEventRecorderPrivate() = default;
+
+void DrawEventRecorderPrivate::SetDrawTarget(ReferencePtr aDT) {
+  NS_ASSERT_OWNINGTHREAD(DrawEventRecorderPrivate);
+
+  RecordEvent(RecordedSetCurrentDrawTarget(aDT));
+  mCurrentDT = aDT;
+}
+
+void DrawEventRecorderPrivate::StoreExternalSurfaceRecording(
+    SourceSurface* aSurface, uint64_t aKey) {
+  NS_ASSERT_OWNINGTHREAD(DrawEventRecorderPrivate);
+
+  RecordEvent(RecordedExternalSurfaceCreation(aSurface, aKey));
+  mExternalSurfaces.push_back({aSurface});
+}
+
+void DrawEventRecorderPrivate::StoreExternalImageRecording(
+    const RefPtr<layers::Image>& aImageOfSurfaceDescriptor) {
+  NS_ASSERT_OWNINGTHREAD(DrawEventRecorderPrivate);
+
+  mExternalImages.push_back({aImageOfSurfaceDescriptor});
+}
+
+void DrawEventRecorderPrivate::StoreSourceSurfaceRecording(
+    SourceSurface* aSurface, const char* aReason) {
+  NS_ASSERT_OWNINGTHREAD(DrawEventRecorderPrivate);
+
+  RefPtr<DataSourceSurface> dataSurf;
+  IntSize surfaceSize = aSurface->GetSize();
+  if (Factory::AllowedSurfaceSize(surfaceSize)) {
+    dataSurf = aSurface->GetDataSurface();
+  }
+  if (!dataSurf) {
+    gfxWarning() << "Recording failed to record SourceSurface for " << aReason;
+
+    surfaceSize.width = std::min(surfaceSize.width, kReasonableSurfaceSize);
+    surfaceSize.height = std::min(surfaceSize.height, kReasonableSurfaceSize);
+
+    if (Factory::AllowedSurfaceSize(surfaceSize)) {
+      dataSurf = Factory::CreateDataSourceSurface(surfaceSize,
+                                                  aSurface->GetFormat(), true);
+    }
+    if (!dataSurf) {
+      dataSurf = Factory::CreateDataSourceSurface(IntSize(1, 1),
+                                                  aSurface->GetFormat(), true);
+      if (!dataSurf) {
+        return;
+      }
+    }
+  }
+
+  RecordEvent(RecordedSourceSurfaceCreation(aSurface, dataSurf));
+}
+
+void DrawEventRecorderPrivate::RecordSourceSurfaceDestruction(void* aSurface) {
+  NS_ASSERT_OWNINGTHREAD(DrawEventRecorderPrivate);
+
+  RemoveSourceSurface(static_cast<SourceSurface*>(aSurface));
+  RemoveStoredObject(aSurface);
+  RecordEvent(RecordedSourceSurfaceDestruction(ReferencePtr(aSurface)));
+}
+
+void DrawEventRecorderPrivate::DecrementUnscaledFontRefCount(
+    const ReferencePtr aUnscaledFont) {
+  NS_ASSERT_OWNINGTHREAD(DrawEventRecorderPrivate);
+
+  auto element = mUnscaledFontRefs.Lookup(aUnscaledFont);
+  MOZ_DIAGNOSTIC_ASSERT(element,
+                        "DecrementUnscaledFontRefCount calls should balance "
+                        "with IncrementUnscaledFontRefCount calls");
+  if (--element.Data() <= 0) {
+    RecordEvent(RecordedUnscaledFontDestruction(aUnscaledFont));
+    element.Remove();
+  }
+}
+
+void DrawEventRecorderMemory::RecordEvent(const RecordedEvent& aEvent) {
+  NS_ASSERT_OWNINGTHREAD(DrawEventRecorderMemory);
+  aEvent.RecordToStream(mOutputStream);
+}
+
+void DrawEventRecorderMemory::AddDependentSurface(uint64_t aDependencyId) {
+  NS_ASSERT_OWNINGTHREAD(DrawEventRecorderMemory);
+  mDependentSurfaces.Insert(aDependencyId);
+}
+
+nsTHashSet<uint64_t>&& DrawEventRecorderMemory::TakeDependentSurfaces() {
+  NS_ASSERT_OWNINGTHREAD(DrawEventRecorderMemory);
+  return std::move(mDependentSurfaces);
+}
+
+DrawEventRecorderMemory::DrawEventRecorderMemory() {
+  WriteHeader(mOutputStream);
+}
+
+DrawEventRecorderMemory::DrawEventRecorderMemory(
+    const SerializeResourcesFn& aFn)
+    : mSerializeCallback(aFn) {
+  mExternalFonts = !!mSerializeCallback;
+  WriteHeader(mOutputStream);
+}
+
+void DrawEventRecorderMemory::Flush() {
+  NS_ASSERT_OWNINGTHREAD(DrawEventRecorderMemory);
+}
+
+void DrawEventRecorderMemory::FlushItem(IntRect aRect) {
+  NS_ASSERT_OWNINGTHREAD(DrawEventRecorderMemory);
+
+  MOZ_RELEASE_ASSERT(!aRect.IsEmpty());
+  DetachResources();
+
+  WriteElement(mIndex, mOutputStream.mLength);
+
+  mSerializeCallback(mOutputStream, mScaledFonts);
+  WriteElement(mIndex, mOutputStream.mLength);
+
+  WriteElement(mIndex, aRect.x);
+  WriteElement(mIndex, aRect.y);
+  WriteElement(mIndex, aRect.XMost());
+  WriteElement(mIndex, aRect.YMost());
+  ClearResources();
+
+  WriteHeader(mOutputStream);
+}
+
+bool DrawEventRecorderMemory::Finish() {
+  NS_ASSERT_OWNINGTHREAD(DrawEventRecorderMemory);
+
+  size_t indexOffset = mOutputStream.mLength;
+  mOutputStream.write(mIndex.mData, mIndex.mLength);
+  bool hasItems = mIndex.mLength != 0;
+  mIndex.reset();
+  WriteElement(mOutputStream, indexOffset);
+  ClearResources();
+  return hasItems;
+}
+
+size_t DrawEventRecorderMemory::RecordingSize() {
+  NS_ASSERT_OWNINGTHREAD(DrawEventRecorderMemory);
+  return mOutputStream.mLength;
+}
+
+void DrawEventRecorderMemory::WipeRecording() {
+  NS_ASSERT_OWNINGTHREAD(DrawEventRecorderMemory);
+
+  mOutputStream.reset();
+  mIndex.reset();
+
+  WriteHeader(mOutputStream);
+}
+
+}  
+}  

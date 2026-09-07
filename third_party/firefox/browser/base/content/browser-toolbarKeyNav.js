@@ -1,0 +1,362 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+ToolbarKeyboardNavigator = {
+  kToolbars: [
+    CustomizableUI.AREA_TABSTRIP,
+    CustomizableUI.AREA_NAVBAR,
+    CustomizableUI.AREA_BOOKMARKS,
+  ],
+  kSearchClearTimeout: 1000,
+
+  _isButton(aElem) {
+    if (aElem.getAttribute("keyNav") === "false") {
+      return false;
+    }
+    return (
+      aElem.tagName == "toolbarbutton" ||
+      aElem.tagName == "html:moz-button" ||
+      aElem.getAttribute("role") == "button"
+    );
+  },
+
+  _getWalker(aRoot) {
+    if (aRoot._toolbarKeyNavWalker) {
+      return aRoot._toolbarKeyNavWalker;
+    }
+
+    let filter = aNode => {
+      if (aNode.tagName == "toolbartabstop") {
+        return NodeFilter.FILTER_ACCEPT;
+      }
+
+      if (
+        aNode.id == "identity-box" &&
+        document.getElementById("urlbar").getAttribute("pageproxystate") ==
+          "invalid"
+      ) {
+        return NodeFilter.FILTER_REJECT;
+      }
+
+      if (aNode.disabled) {
+        return NodeFilter.FILTER_REJECT;
+      }
+
+      const visible = aNode.checkVisibility({
+        checkVisibilityCSS: true,
+        flush: false,
+      });
+      if (!visible) {
+        return NodeFilter.FILTER_REJECT;
+      }
+
+      const bounds = window.windowUtils.getBoundsWithoutFlushing(aNode);
+      if (bounds.width == 0) {
+        return NodeFilter.FILTER_SKIP;
+      }
+
+      if (this._isButton(aNode)) {
+        return NodeFilter.FILTER_ACCEPT;
+      }
+      return NodeFilter.FILTER_SKIP;
+    };
+    aRoot._toolbarKeyNavWalker = document.createTreeWalker(
+      aRoot,
+      NodeFilter.SHOW_ELEMENT,
+      filter
+    );
+    return aRoot._toolbarKeyNavWalker;
+  },
+
+  _initTabStops(aRoot) {
+    for (let stop of aRoot.getElementsByTagName("toolbartabstop")) {
+      stop.setAttribute("aria-hidden", "true");
+      stop.addEventListener("focus", this);
+    }
+  },
+
+  init() {
+    if (!gToolbarKeyNavEnabled || this._initialized) {
+      return;
+    }
+    this._initialized = true;
+    for (let id of this.kToolbars) {
+      let toolbar = document.getElementById(id);
+      toolbar.setAttribute("keyNav", "true");
+      this._initTabStops(toolbar);
+      toolbar.addEventListener("keydown", this);
+      toolbar.addEventListener("keypress", this);
+    }
+    CustomizableUI.addListener(this);
+  },
+
+  uninit() {
+    if (!this._initialized) {
+      return;
+    }
+    this._initialized = false;
+    for (let id of this.kToolbars) {
+      let toolbar = document.getElementById(id);
+      for (let stop of toolbar.getElementsByTagName("toolbartabstop")) {
+        stop.removeEventListener("focus", this);
+      }
+      toolbar.removeEventListener("keydown", this);
+      toolbar.removeEventListener("keypress", this);
+      toolbar.removeAttribute("keyNav");
+    }
+    CustomizableUI.removeListener(this);
+  },
+
+  onWidgetAdded(aWidgetId, aArea) {
+    if (!this.kToolbars.includes(aArea)) {
+      return;
+    }
+    let widget = document.getElementById(aWidgetId);
+    if (!widget) {
+      return;
+    }
+    this._initTabStops(widget);
+  },
+
+  _focusButton(aButton) {
+    aButton.setAttribute("tabindex", "-1");
+    aButton.focus();
+    aButton.addEventListener("blur", this);
+  },
+
+  _onButtonBlur(aEvent) {
+    if (document.activeElement == aEvent.target) {
+      return;
+    }
+    if (aEvent.target.getAttribute("open") == "true") {
+      return;
+    }
+    aEvent.target.removeEventListener("blur", this);
+    aEvent.target.removeAttribute("tabindex");
+  },
+
+  _onTabStopFocus(aEvent) {
+    let toolbar = aEvent.target.closest("toolbar");
+    let walker = this._getWalker(toolbar);
+
+    let oldFocus = aEvent.relatedTarget;
+    if (oldFocus) {
+      this._isFocusMovingBackward =
+        oldFocus.compareDocumentPosition(aEvent.target) &
+        Node.DOCUMENT_POSITION_PRECEDING;
+      if (this._isFocusMovingBackward && oldFocus && this._isButton(oldFocus)) {
+        document.commandDispatcher.rewindFocus();
+        return;
+      }
+    }
+
+    walker.currentNode = aEvent.target;
+    let button = walker.nextNode();
+    if (!button || !this._isButton(button)) {
+      if (
+        this._isFocusMovingBackward &&
+        (!oldFocus || !gNavToolbox.contains(oldFocus))
+      ) {
+        let allStops = Array.from(
+          gNavToolbox.querySelectorAll("toolbartabstop")
+        );
+        let earlierVisibleStopIndex = allStops.indexOf(aEvent.target) - 1;
+        while (earlierVisibleStopIndex >= 0) {
+          let stopToolbar =
+            allStops[earlierVisibleStopIndex].closest("toolbar");
+          if (!stopToolbar.collapsed) {
+            break;
+          }
+          earlierVisibleStopIndex--;
+        }
+        if (earlierVisibleStopIndex == -1) {
+          this._isFocusMovingBackward = false;
+        }
+      }
+      if (this._isFocusMovingBackward) {
+        document.commandDispatcher.rewindFocus();
+      } else {
+        document.commandDispatcher.advanceFocus();
+      }
+      return;
+    }
+
+    this._focusButton(button);
+  },
+
+  navigateButtons(aToolbar, aPrevious) {
+    let oldFocus = document.activeElement;
+    let walker = this._getWalker(aToolbar);
+    walker.currentNode = oldFocus;
+    let newFocus;
+    if (aPrevious) {
+      newFocus = walker.previousNode();
+    } else {
+      newFocus = walker.nextNode();
+    }
+    if (!newFocus || newFocus.tagName == "toolbartabstop") {
+      return;
+    }
+    this._focusButton(newFocus);
+  },
+
+  _onKeyDown(aEvent) {
+    let focus = document.activeElement;
+    if (
+      aEvent.key != " " &&
+      aEvent.key.length == 1 &&
+      this._isButton(focus) &&
+      !focus.closest("panel")
+    ) {
+      this._onSearchChar(aEvent.currentTarget, aEvent.key);
+      return;
+    }
+    this._clearSearch();
+
+    if (
+      aEvent.altKey ||
+      aEvent.controlKey ||
+      aEvent.metaKey ||
+      aEvent.shiftKey ||
+      !this._isButton(focus)
+    ) {
+      return;
+    }
+
+    switch (aEvent.key) {
+      case "ArrowLeft":
+        this.navigateButtons(aEvent.currentTarget, !window.RTL_UI);
+        break;
+      case "ArrowRight":
+        this.navigateButtons(aEvent.currentTarget, window.RTL_UI);
+        break;
+      default:
+        return;
+    }
+    aEvent.preventDefault();
+  },
+
+  _clearSearch() {
+    this._searchText = "";
+    if (this._clearSearchTimeout) {
+      clearTimeout(this._clearSearchTimeout);
+      this._clearSearchTimeout = null;
+    }
+  },
+
+  _onSearchChar(aToolbar, aChar) {
+    if (this._clearSearchTimeout) {
+      clearTimeout(this._clearSearchTimeout);
+    }
+    let char = aChar.toLowerCase();
+    if (!this._searchText) {
+      this._searchText = char;
+    } else if (this._searchText != char) {
+      this._searchText += char;
+    }
+    this._clearSearchTimeout = setTimeout(
+      this._clearSearch.bind(this),
+      this.kSearchClearTimeout
+    );
+
+    let oldFocus = document.activeElement;
+    let walker = this._getWalker(aToolbar);
+    walker.currentNode = oldFocus;
+    for (
+      let newFocus = walker.nextNode();
+      newFocus;
+      newFocus = walker.nextNode()
+    ) {
+      if (this._doesSearchMatch(newFocus)) {
+        this._focusButton(newFocus);
+        return;
+      }
+    }
+    walker.currentNode = walker.root;
+    for (
+      let newFocus = walker.firstChild();
+      newFocus && newFocus != oldFocus;
+      newFocus = walker.nextNode()
+    ) {
+      if (this._doesSearchMatch(newFocus)) {
+        this._focusButton(newFocus);
+        return;
+      }
+    }
+  },
+
+  _doesSearchMatch(aElem) {
+    if (!this._isButton(aElem)) {
+      return false;
+    }
+    for (let attrib of ["aria-label", "label", "tooltiptext"]) {
+      let label = aElem.getAttribute(attrib);
+      if (!label) {
+        continue;
+      }
+      label = label.toLowerCase();
+      if (label.startsWith(this._searchText)) {
+        return true;
+      }
+    }
+    return false;
+  },
+
+  _onKeyPress(aEvent) {
+    let focus = document.activeElement;
+    if (
+      (aEvent.key != "Enter" && aEvent.key != " ") ||
+      !this._isButton(focus)
+    ) {
+      return;
+    }
+
+    if (focus.getAttribute("type") == "menu") {
+      focus.open = true;
+      return;
+    }
+
+    if (focus.localName == "moz-button") {
+      return;
+    }
+
+    const usesClickInsteadOfCommand = (() => {
+      if (focus.tagName != "toolbarbutton") {
+        return true;
+      }
+      return !focus.hasAttribute("oncommand") && focus.hasAttribute("onclick");
+    })();
+
+    if (!usesClickInsteadOfCommand) {
+      return;
+    }
+    focus.dispatchEvent(
+      new PointerEvent("click", {
+        bubbles: true,
+        ctrlKey: aEvent.ctrlKey,
+        altKey: aEvent.altKey,
+        shiftKey: aEvent.shiftKey,
+        metaKey: aEvent.metaKey,
+      })
+    );
+  },
+
+  handleEvent(aEvent) {
+    switch (aEvent.type) {
+      case "focus":
+        this._onTabStopFocus(aEvent);
+        break;
+      case "keydown":
+        this._onKeyDown(aEvent);
+        break;
+      case "keypress":
+        this._onKeyPress(aEvent);
+        break;
+      case "blur":
+        this._onButtonBlur(aEvent);
+        break;
+    }
+  },
+};

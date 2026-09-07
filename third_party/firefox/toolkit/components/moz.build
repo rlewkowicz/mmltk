@@ -1,0 +1,74 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+DIRS += [
+    "antitracking",
+    "apppicker",
+    "asyncshutdown",
+    "browser",
+    "cascade_bloom_filter",
+    "cleardata",
+    "clearsitedata",
+    "commandlines",
+    "contentprefs",
+    "contextualidentity",
+    "downloads",
+    "find",
+    "forgetaboutsite",
+    "httpsonlyerror",
+    "jsoncpp",
+    "jsoncpp/src/lib_json",
+    "kvstore",
+    "mediasniffer",
+    "mozintl",
+    "mozprotocol",
+    "places",
+    "processtools",
+    "processsingleton",
+    "promiseworker",
+    "prompts",
+    "protobuf",
+    "remotebrowserutils",
+    "reflect",
+    "resistfingerprinting",
+    "search",
+    "sessionstore",
+    "startup",
+    "statusfilter",
+    "timermanager",
+    "tooltiptext",
+    "typeaheadfind",
+    "utils",
+    "urlformatter",
+    "viewsource",
+    "windowcreator",
+    "windowwatcher",
+    "workerloader",
+    "xulstore",
+]
+
+if CONFIG["BUILD_CTYPES"]:
+    DIRS += ["ctypes"]
+
+DIRS += ["autocomplete"]
+
+DIRS += ["terminator"]
+
+if CONFIG["MOZ_UPDATE_AGENT"]:
+    DIRS += ["taskscheduler"]
+
+DIRS += ["build"]
+
+
+EXTRA_JS_MODULES += [
+    "DefaultCLH.sys.mjs",
+]
+
+XPCOM_MANIFESTS += [
+    "components.conf",
+]
+
+UNIFIED_SOURCES += [
+    "/toolkit/components/antitracking/ContentBlockingAllowList.cpp",
+]

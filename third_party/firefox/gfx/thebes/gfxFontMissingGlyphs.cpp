@@ -1,0 +1,420 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "gfxFontMissingGlyphs.h"
+
+#include "gfxUtils.h"
+#include "mozilla/gfx/2D.h"
+#include "mozilla/gfx/Helpers.h"
+#include "mozilla/gfx/PathHelpers.h"
+#include "mozilla/LinkedList.h"
+#include "mozilla/RefPtr.h"
+#include "nsDeviceContext.h"
+#include "nsLayoutUtils.h"
+#include "TextDrawTarget.h"
+#include "LayerUserData.h"
+
+using namespace mozilla;
+using namespace mozilla::gfx;
+
+#ifndef MOZ_GFX_OPTIMIZE_MOBILE
+#  define X 255
+static const uint8_t gMiniFontData[] = {
+    0, X, 0, 0, X, 0, X, X, X, X, X, X, X, 0, X, X, X, X, X, X, X, X, X, X,
+    X, X, X, X, X, X, X, X, X, X, X, 0, 0, X, X, X, X, 0, X, X, X, X, X, X,
+    X, 0, X, 0, X, 0, 0, 0, X, 0, 0, X, X, 0, X, X, 0, 0, X, 0, 0, 0, 0, X,
+    X, 0, X, X, 0, X, X, 0, X, X, 0, X, X, 0, 0, X, 0, X, X, 0, 0, X, 0, 0,
+    X, 0, X, 0, X, 0, X, X, X, X, X, X, X, X, X, X, X, X, X, X, X, 0, 0, X,
+    X, X, X, X, X, X, X, X, X, X, X, 0, X, 0, 0, X, 0, X, X, X, X, X, X, X,
+    X, 0, X, 0, X, 0, X, 0, 0, 0, 0, X, 0, 0, X, 0, 0, X, X, 0, X, 0, 0, X,
+    X, 0, X, 0, 0, X, X, 0, X, X, 0, X, X, 0, 0, X, 0, X, X, 0, 0, X, 0, 0,
+    0, X, 0, 0, X, 0, X, X, X, X, X, X, 0, 0, X, X, X, X, X, X, X, 0, 0, X,
+    X, X, X, 0, 0, X, X, 0, X, X, X, 0, 0, X, X, X, X, 0, X, X, X, X, 0, 0,
+};
+#  undef X
+#endif
+
+
+static const int MINIFONT_WIDTH = 3;
+#ifndef MOZ_GFX_OPTIMIZE_MOBILE
+static const int MINIFONT_HEIGHT = 5;
+#endif
+static const int HEX_CHAR_GAP = 1;
+static const int BOX_HORIZONTAL_INSET = 1;
+static const int BOX_BORDER_WIDTH = 1;
+static const Float BOX_BORDER_OPACITY = 0.5;
+
+#ifndef MOZ_GFX_OPTIMIZE_MOBILE
+
+class GlyphAtlas {
+ public:
+  GlyphAtlas(RefPtr<SourceSurface>&& aSurface, const DeviceColor& aColor)
+      : mSurface(std::move(aSurface)), mColor(aColor) {}
+  ~GlyphAtlas() = default;
+
+  already_AddRefed<SourceSurface> Surface() const {
+    RefPtr surface = mSurface;
+    return surface.forget();
+  }
+  DeviceColor Color() const { return mColor; }
+
+ private:
+  RefPtr<SourceSurface> mSurface;
+  DeviceColor mColor;
+};
+
+static std::atomic<GlyphAtlas*> gGlyphAtlas;
+
+static GlyphAtlas* MakeGlyphAtlas(const DeviceColor& aColor) {
+  RefPtr<DrawTarget> glyphDrawTarget =
+      gfxPlatform::GetPlatform()->CreateOffscreenContentDrawTarget(
+          IntSize(MINIFONT_WIDTH * 16, MINIFONT_HEIGHT),
+          SurfaceFormat::B8G8R8A8);
+  if (!glyphDrawTarget) {
+    return nullptr;
+  }
+  RefPtr<SourceSurface> glyphMask =
+      glyphDrawTarget->CreateSourceSurfaceFromData(
+          const_cast<uint8_t*>(gMiniFontData),
+          IntSize(MINIFONT_WIDTH * 16, MINIFONT_HEIGHT), MINIFONT_WIDTH * 16,
+          SurfaceFormat::A8);
+  if (!glyphMask) {
+    return nullptr;
+  }
+  glyphDrawTarget->MaskSurface(ColorPattern(aColor), glyphMask, Point(0, 0),
+                               DrawOptions(1.0f, CompositionOp::OP_SOURCE));
+  RefPtr<SourceSurface> surface = glyphDrawTarget->Snapshot();
+  if (!surface) {
+    return nullptr;
+  }
+  return new GlyphAtlas(std::move(surface), aColor);
+}
+
+static inline already_AddRefed<SourceSurface> GetGlyphAtlas(
+    const DeviceColor& aColor) {
+  DeviceColor color(aColor.r, aColor.g, aColor.b);
+
+  GlyphAtlas* currAtlas = gGlyphAtlas.exchange(nullptr);
+
+  if (currAtlas && currAtlas->Color() == color) {
+    RefPtr<SourceSurface> surface = currAtlas->Surface();
+    delete gGlyphAtlas.exchange(currAtlas);
+    return surface.forget();
+  }
+
+  GlyphAtlas* atlas = MakeGlyphAtlas(color);
+  RefPtr<SourceSurface> surface = atlas ? atlas->Surface() : nullptr;
+
+  delete gGlyphAtlas.exchange(atlas);
+  return surface.forget();
+}
+
+static void PurgeGlyphAtlas() { delete gGlyphAtlas.exchange(nullptr); }
+
+class WRUserData : public layers::LayerUserData,
+                   public LinkedListElement<WRUserData> {
+ public:
+  explicit WRUserData(layers::WebRenderLayerManager* aManager);
+
+  ~WRUserData();
+
+  static void Assign(layers::WebRenderLayerManager* aManager) {
+    if (!aManager->HasUserData(&sWRUserDataKey)) {
+      aManager->SetUserData(&sWRUserDataKey, new WRUserData(aManager));
+    }
+  }
+
+  void Remove() { mManager->RemoveUserData(&sWRUserDataKey); }
+
+  layers::WebRenderLayerManager* mManager;
+
+  static UserDataKey sWRUserDataKey;
+};
+
+static void DestroyImageKey(void* aClosure) {
+  auto* key = static_cast<wr::ImageKey*>(aClosure);
+  delete key;
+}
+
+constinit static RefPtr<SourceSurface> gWRGlyphAtlas[8];
+constinit static LinkedList<WRUserData> gWRUsers;
+UserDataKey WRUserData::sWRUserDataKey;
+
+static already_AddRefed<SourceSurface> MakeWRGlyphAtlas(const Matrix* aMat) {
+  IntSize size(MINIFONT_WIDTH * 16, MINIFONT_HEIGHT);
+  if (aMat && aMat->_11 == 0) {
+    std::swap(size.width, size.height);
+  }
+  RefPtr<DrawTarget> ref =
+      gfxPlatform::GetPlatform()->ScreenReferenceDrawTarget();
+  RefPtr<DrawTarget> dt =
+      gfxPlatform::GetPlatform()->CreateSimilarSoftwareDrawTarget(
+          ref, size, SurfaceFormat::B8G8R8A8);
+  if (!dt) {
+    return nullptr;
+  }
+  if (aMat) {
+    dt->SetTransform(aMat->_11 == 0
+                         ? Matrix(0.0f, copysign(1.0f, aMat->_12),
+                                  copysign(1.0f, aMat->_21), 0.0f,
+                                  aMat->_21 < 0 ? MINIFONT_HEIGHT : 0.0f,
+                                  aMat->_12 < 0 ? MINIFONT_WIDTH * 16 : 0.0f)
+                         : Matrix(copysign(1.0f, aMat->_11), 0.0f, 0.0f,
+                                  copysign(1.0f, aMat->_22),
+                                  aMat->_11 < 0 ? MINIFONT_WIDTH * 16 : 0.0f,
+                                  aMat->_22 < 0 ? MINIFONT_HEIGHT : 0.0f));
+  }
+  RefPtr<SourceSurface> mask = dt->CreateSourceSurfaceFromData(
+      const_cast<uint8_t*>(gMiniFontData),
+      IntSize(MINIFONT_WIDTH * 16, MINIFONT_HEIGHT), MINIFONT_WIDTH * 16,
+      SurfaceFormat::A8);
+  if (!mask) {
+    return nullptr;
+  }
+  dt->MaskSurface(ColorPattern(DeviceColor::MaskOpaqueWhite()), mask,
+                  Point(0, 0));
+  return dt->Snapshot();
+}
+
+static void PurgeWRGlyphAtlas() {
+  for (WRUserData* user : gWRUsers) {
+    auto* manager = user->mManager;
+    for (const auto& gWRGlyphAtla : gWRGlyphAtlas) {
+      if (gWRGlyphAtla) {
+        auto* key = static_cast<wr::ImageKey*>(
+            gWRGlyphAtla->GetUserData(reinterpret_cast<UserDataKey*>(manager)));
+        if (key) {
+          manager->GetRenderRootStateManager()->AddImageKeyForDiscard(*key);
+        }
+      }
+    }
+  }
+  while (!gWRUsers.isEmpty()) {
+    gWRUsers.popFirst()->Remove();
+  }
+  for (auto& gWRGlyphAtla : gWRGlyphAtlas) {
+    gWRGlyphAtla = nullptr;
+  }
+}
+
+WRUserData::WRUserData(layers::WebRenderLayerManager* aManager)
+    : mManager(aManager) {
+  gWRUsers.insertFront(this);
+}
+
+WRUserData::~WRUserData() {
+  if (isInList()) {
+    for (const auto& gWRGlyphAtla : gWRGlyphAtlas) {
+      if (gWRGlyphAtla) {
+        gWRGlyphAtla->RemoveUserData(reinterpret_cast<UserDataKey*>(mManager));
+      }
+    }
+  }
+}
+
+static already_AddRefed<SourceSurface> GetWRGlyphAtlas(DrawTarget& aDrawTarget,
+                                                       const Matrix* aMat) {
+  uint32_t key = 0;
+  if (aMat) {
+    if (aMat->_11 == 0) {
+      key |= 4 | (aMat->_12 < 0 ? 1 : 0) | (aMat->_21 < 0 ? 2 : 0);
+    } else {
+      key |= (aMat->_11 < 0 ? 1 : 0) | (aMat->_22 < 0 ? 2 : 0);
+    }
+  }
+
+  RefPtr<SourceSurface> atlas = gWRGlyphAtlas[key];
+  if (!atlas) {
+    atlas = MakeWRGlyphAtlas(aMat);
+    gWRGlyphAtlas[key] = atlas;
+  }
+
+  auto* tdt = static_cast<layout::TextDrawTarget*>(&aDrawTarget);
+  auto* manager = tdt->WrLayerManager();
+  auto* imageKey = static_cast<wr::ImageKey*>(
+      atlas->GetUserData(reinterpret_cast<UserDataKey*>(manager)));
+  if (!imageKey || !manager->WrBridge()->MatchesNamespace(*imageKey)) {
+    RefPtr<DataSourceSurface> dataSurface = atlas->GetDataSurface();
+    if (!dataSurface) {
+      return nullptr;
+    }
+    DataSourceSurface::ScopedMap map(dataSurface, DataSourceSurface::READ);
+    if (!map.IsMapped()) {
+      return nullptr;
+    }
+    Maybe<wr::ImageKey> result = tdt->DefineImage(
+        atlas->GetSize(), map.GetStride(), atlas->GetFormat(), map.GetData());
+    if (!result.isSome()) {
+      return nullptr;
+    }
+    atlas->AddUserData(reinterpret_cast<UserDataKey*>(manager),
+                       new wr::ImageKey(result.ref()), DestroyImageKey);
+    WRUserData::Assign(manager);
+  }
+  return atlas.forget();
+}
+
+static void DrawHexChar(uint32_t aDigit, Float aLeft, Float aTop,
+                        DrawTarget& aDrawTarget, SourceSurface* aAtlas,
+                        const DeviceColor& aColor,
+                        const Matrix* aMat = nullptr) {
+  Rect dest(aLeft, aTop, MINIFONT_WIDTH, MINIFONT_HEIGHT);
+  if (aDrawTarget.GetBackendType() == BackendType::WEBRENDER_TEXT) {
+    auto* tdt = static_cast<layout::TextDrawTarget*>(&aDrawTarget);
+    auto* manager = tdt->WrLayerManager();
+    auto* key = static_cast<wr::ImageKey*>(
+        aAtlas->GetUserData(reinterpret_cast<UserDataKey*>(manager)));
+    MOZ_ASSERT(key);
+    Rect bounds(aLeft - aDigit * MINIFONT_WIDTH, aTop, MINIFONT_WIDTH * 16,
+                MINIFONT_HEIGHT);
+    if (aMat) {
+      bounds = aMat->TransformRect(bounds);
+      bounds.x += std::min(bounds.width, 0.0f);
+      bounds.y += std::min(bounds.height, 0.0f);
+      bounds.width = fabs(bounds.width);
+      bounds.height = fabs(bounds.height);
+      dest = aMat->TransformRect(dest);
+      dest.x += std::min(dest.width, 0.0f);
+      dest.y += std::min(dest.height, 0.0f);
+      dest.width = fabs(dest.width);
+      dest.height = fabs(dest.height);
+    }
+    tdt->PushImage(*key, bounds, dest, wr::ImageRendering::Pixelated,
+                   wr::ToColorF(aColor));
+  } else {
+    aDrawTarget.DrawSurface(
+        aAtlas, dest,
+        Rect(aDigit * MINIFONT_WIDTH, 0, MINIFONT_WIDTH, MINIFONT_HEIGHT),
+        DrawSurfaceOptions(SamplingFilter::POINT),
+        DrawOptions(aColor.a, CompositionOp::OP_OVER, AntialiasMode::NONE));
+  }
+}
+
+void gfxFontMissingGlyphs::Purge() {
+  PurgeGlyphAtlas();
+  PurgeWRGlyphAtlas();
+}
+
+#else  // MOZ_GFX_OPTIMIZE_MOBILE
+
+void gfxFontMissingGlyphs::Purge() {}
+
+#endif
+
+void gfxFontMissingGlyphs::Shutdown() { Purge(); }
+
+void gfxFontMissingGlyphs::DrawMissingGlyph(uint32_t aChar, const Rect& aRect,
+                                            DrawTarget& aDrawTarget,
+                                            const Pattern& aPattern,
+                                            const Matrix* aMat) {
+  Rect rect(aRect);
+  if (aMat) {
+    rect.MoveBy(-aRect.BottomLeft());
+    rect = aMat->TransformBounds(rect);
+    rect.MoveBy(aRect.BottomLeft());
+  }
+
+  DeviceColor color = aPattern.GetType() == PatternType::COLOR
+                          ? static_cast<const ColorPattern&>(aPattern).mColor
+                          : ToDeviceColor(sRGBColor::OpaqueBlack());
+
+  Float halfBorderWidth = BOX_BORDER_WIDTH / 2.0;
+  Float borderLeft = rect.X() + BOX_HORIZONTAL_INSET + halfBorderWidth;
+  Float borderRight = rect.XMost() - BOX_HORIZONTAL_INSET - halfBorderWidth;
+  Rect borderStrokeRect(borderLeft, rect.Y() + halfBorderWidth,
+                        borderRight - borderLeft,
+                        rect.Height() - 2.0 * halfBorderWidth);
+  if (!borderStrokeRect.IsEmpty()) {
+    ColorPattern adjustedColor(color);
+    adjustedColor.mColor.a *= BOX_BORDER_OPACITY;
+#ifdef MOZ_GFX_OPTIMIZE_MOBILE
+    aDrawTarget.FillRect(borderStrokeRect, adjustedColor);
+#else
+    StrokeOptions strokeOptions(BOX_BORDER_WIDTH);
+    aDrawTarget.StrokeRect(borderStrokeRect, adjustedColor, strokeOptions);
+#endif
+  }
+
+#ifndef MOZ_GFX_OPTIMIZE_MOBILE
+  RefPtr<SourceSurface> atlas =
+      aDrawTarget.GetBackendType() == BackendType::WEBRENDER_TEXT
+          ? GetWRGlyphAtlas(aDrawTarget, aMat)
+          : GetGlyphAtlas(color);
+  if (!atlas) {
+    return;
+  }
+
+  Point center = rect.Center();
+  Float halfGap = HEX_CHAR_GAP / 2.f;
+  Float top = -(MINIFONT_HEIGHT + halfGap);
+
+  Float width = HEX_CHAR_GAP + MINIFONT_WIDTH + HEX_CHAR_GAP + MINIFONT_WIDTH +
+                ((aChar < 0x10000) ? 0 : HEX_CHAR_GAP + MINIFONT_WIDTH) +
+                HEX_CHAR_GAP;
+  Float height = HEX_CHAR_GAP + MINIFONT_HEIGHT + HEX_CHAR_GAP +
+                 MINIFONT_HEIGHT + HEX_CHAR_GAP;
+  Float scaling = std::min(rect.Height() / height, rect.Width() / width);
+
+  int32_t devPixelsPerCSSPx = std::max<int32_t>(1, std::floor(scaling));
+
+  Matrix tempMat;
+  if (aMat) {
+    tempMat = Matrix(*aMat)
+                  .PostScale(devPixelsPerCSSPx, devPixelsPerCSSPx)
+                  .PostTranslate(center);
+    aMat = &tempMat;
+  } else {
+    tempMat = aDrawTarget.GetTransform();
+    aDrawTarget.SetTransform(Matrix(tempMat).PreTranslate(center).PreScale(
+        devPixelsPerCSSPx, devPixelsPerCSSPx));
+  }
+
+  if (aChar < 0x10000) {
+    if (rect.Width() >= 2 * (MINIFONT_WIDTH + HEX_CHAR_GAP) &&
+        rect.Height() >= 2 * MINIFONT_HEIGHT + HEX_CHAR_GAP) {
+      Float left = -(MINIFONT_WIDTH + halfGap);
+      DrawHexChar((aChar >> 12) & 0xF, left, top, aDrawTarget, atlas, color,
+                  aMat);
+      DrawHexChar((aChar >> 8) & 0xF, halfGap, top, aDrawTarget, atlas, color,
+                  aMat);
+      DrawHexChar((aChar >> 4) & 0xF, left, halfGap, aDrawTarget, atlas, color,
+                  aMat);
+      DrawHexChar(aChar & 0xF, halfGap, halfGap, aDrawTarget, atlas, color,
+                  aMat);
+    }
+  } else {
+    if (rect.Width() >= 3 * (MINIFONT_WIDTH + HEX_CHAR_GAP) &&
+        rect.Height() >= 2 * MINIFONT_HEIGHT + HEX_CHAR_GAP) {
+      Float first = -(MINIFONT_WIDTH * 1.5 + HEX_CHAR_GAP);
+      Float second = -(MINIFONT_WIDTH / 2.0);
+      Float third = (MINIFONT_WIDTH / 2.0 + HEX_CHAR_GAP);
+      DrawHexChar((aChar >> 20) & 0xF, first, top, aDrawTarget, atlas, color,
+                  aMat);
+      DrawHexChar((aChar >> 16) & 0xF, second, top, aDrawTarget, atlas, color,
+                  aMat);
+      DrawHexChar((aChar >> 12) & 0xF, third, top, aDrawTarget, atlas, color,
+                  aMat);
+      DrawHexChar((aChar >> 8) & 0xF, first, halfGap, aDrawTarget, atlas, color,
+                  aMat);
+      DrawHexChar((aChar >> 4) & 0xF, second, halfGap, aDrawTarget, atlas,
+                  color, aMat);
+      DrawHexChar(aChar & 0xF, third, halfGap, aDrawTarget, atlas, color, aMat);
+    }
+  }
+
+  if (!aMat) {
+    aDrawTarget.SetTransform(tempMat);
+  }
+#endif
+}
+
+Float gfxFontMissingGlyphs::GetDesiredMinWidth(uint32_t aChar,
+                                               uint32_t aAppUnitsPerDevPixel) {
+  Float width = BOX_HORIZONTAL_INSET + BOX_BORDER_WIDTH + HEX_CHAR_GAP +
+                MINIFONT_WIDTH + HEX_CHAR_GAP + MINIFONT_WIDTH +
+                ((aChar < 0x10000) ? 0 : HEX_CHAR_GAP + MINIFONT_WIDTH) +
+                HEX_CHAR_GAP + BOX_BORDER_WIDTH + BOX_HORIZONTAL_INSET;
+  width *= Float(AppUnitsPerCSSPixel()) / aAppUnitsPerDevPixel;
+  return width;
+}

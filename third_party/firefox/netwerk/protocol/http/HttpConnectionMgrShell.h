@@ -1,0 +1,172 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef HttpConnectionMgrShell_h_
+#define HttpConnectionMgrShell_h_
+
+#include "nsISupports.h"
+
+class nsIEventTarget;
+class nsIHttpUpgradeListener;
+class nsIInterfaceRequestor;
+
+namespace mozilla::net {
+
+class ARefBase;
+class EventTokenBucket;
+class HttpTransactionShell;
+class nsHttpConnectionInfo;
+class HttpConnectionBase;
+class nsHttpConnectionMgr;
+class HttpConnectionMgrParent;
+class SpeculativeTransaction;
+class ClassOfService;
+
+
+#define HTTPCONNECTIONMGRSHELL_IID \
+  {0xf5379ff9, 0x2758, 0x4bec, {0x99, 0x92, 0x23, 0x51, 0xc2, 0x58, 0xae, 0xd6}}
+
+class HttpConnectionMgrShell : public nsISupports {
+ public:
+  NS_INLINE_DECL_STATIC_IID(HTTPCONNECTIONMGRSHELL_IID)
+
+  enum nsParamName : uint32_t {
+    MAX_URGENT_START_Q,
+    MAX_CONNECTIONS,
+    MAX_PERSISTENT_CONNECTIONS_PER_HOST,
+    MAX_PERSISTENT_CONNECTIONS_PER_PROXY,
+    MAX_REQUEST_DELAY,
+    THROTTLING_ENABLED,
+    THROTTLING_SUSPEND_FOR,
+    THROTTLING_RESUME_FOR,
+    THROTTLING_READ_LIMIT,
+    THROTTLING_READ_INTERVAL,
+    THROTTLING_HOLD_TIME,
+    THROTTLING_MAX_TIME,
+    PROXY_BE_CONSERVATIVE
+  };
+
+  [[nodiscard]] virtual nsresult Init(
+      uint16_t maxUrgentExcessiveConns, uint16_t maxConnections,
+      uint16_t maxPersistentConnectionsPerHost,
+      uint16_t maxPersistentConnectionsPerProxy, uint16_t maxRequestDelay,
+      bool throttleEnabled, uint32_t throttleSuspendFor,
+      uint32_t throttleResumeFor, uint32_t throttleHoldTime,
+      uint32_t throttleMaxTime, bool beConservativeForProxy) = 0;
+
+  [[nodiscard]] virtual nsresult Shutdown() = 0;
+
+  [[nodiscard]] virtual nsresult UpdateRequestTokenBucket(
+      EventTokenBucket* aBucket) = 0;
+
+  [[nodiscard]] virtual nsresult DoShiftReloadConnectionCleanup() = 0;
+
+  [[nodiscard]] virtual nsresult DoShiftReloadConnectionCleanupWithConnInfo(
+      nsHttpConnectionInfo*) = 0;
+
+  [[nodiscard]] virtual nsresult PruneDeadConnections() = 0;
+
+  virtual void AbortAndCloseAllConnections(int32_t, ARefBase*) = 0;
+
+  [[nodiscard]] virtual nsresult UpdateParam(nsParamName name,
+                                             uint16_t value) = 0;
+
+  virtual void PrintDiagnostics() = 0;
+
+  virtual nsresult UpdateCurrentBrowserId(uint64_t aId) = 0;
+
+  [[nodiscard]] virtual nsresult AddTransaction(HttpTransactionShell*,
+                                                int32_t priority) = 0;
+
+  [[nodiscard]] virtual nsresult AddTransactionWithStickyConn(
+      HttpTransactionShell* trans, int32_t priority,
+      HttpTransactionShell* transWithStickyConn) = 0;
+
+  [[nodiscard]] virtual nsresult RescheduleTransaction(HttpTransactionShell*,
+                                                       int32_t priority) = 0;
+
+  void virtual UpdateClassOfServiceOnTransaction(
+      HttpTransactionShell*, const ClassOfService& classOfService) = 0;
+
+  [[nodiscard]] virtual nsresult CancelTransaction(HttpTransactionShell*,
+                                                   nsresult reason) = 0;
+
+  [[nodiscard]] virtual nsresult ReclaimConnection(
+      HttpConnectionBase* conn) = 0;
+
+  [[nodiscard]] virtual nsresult ProcessPendingQ(nsHttpConnectionInfo*) = 0;
+
+  [[nodiscard]] virtual nsresult ProcessPendingQ() = 0;
+
+  [[nodiscard]] virtual nsresult GetSocketThreadTarget(nsIEventTarget**) = 0;
+
+  [[nodiscard]] virtual nsresult SpeculativeConnect(
+      nsHttpConnectionInfo*, nsIInterfaceRequestor*, uint32_t caps = 0,
+      SpeculativeTransaction* = nullptr, bool aFetchHTTPSRR = false) = 0;
+
+  [[nodiscard]] virtual nsresult VerifyTraffic() = 0;
+
+  virtual void ExcludeHttp2(const nsHttpConnectionInfo* ci) = 0;
+  virtual void ExcludeHttp3(const nsHttpConnectionInfo* ci) = 0;
+
+  [[nodiscard]] virtual nsresult ClearConnectionHistory() = 0;
+
+  [[nodiscard]] virtual nsresult CompleteUpgrade(
+      HttpTransactionShell* aTrans,
+      nsIHttpUpgradeListener* aUpgradeListener) = 0;
+
+  virtual nsHttpConnectionMgr* AsHttpConnectionMgr() = 0;
+  virtual HttpConnectionMgrParent* AsHttpConnectionMgrParent() = 0;
+};
+
+#define NS_DECL_HTTPCONNECTIONMGRSHELL                                         \
+  virtual nsresult Init(                                                       \
+      uint16_t maxUrgentExcessiveConns, uint16_t maxConnections,               \
+      uint16_t maxPersistentConnectionsPerHost,                                \
+      uint16_t maxPersistentConnectionsPerProxy, uint16_t maxRequestDelay,     \
+      bool throttleEnabled, uint32_t throttleSuspendFor,                       \
+      uint32_t throttleResumeFor, uint32_t throttleHoldTime,                   \
+      uint32_t throttleMaxTime, bool beConservativeForProxy) override;         \
+  virtual nsresult Shutdown() override;                                        \
+  virtual nsresult UpdateRequestTokenBucket(EventTokenBucket* aBucket)         \
+      override;                                                                \
+  virtual nsresult DoShiftReloadConnectionCleanup() override;                  \
+  virtual nsresult DoShiftReloadConnectionCleanupWithConnInfo(                 \
+      nsHttpConnectionInfo*) override;                                         \
+  virtual nsresult PruneDeadConnections() override;                            \
+  virtual void AbortAndCloseAllConnections(int32_t, ARefBase*) override;       \
+  virtual nsresult UpdateParam(nsParamName name, uint16_t value) override;     \
+  virtual void PrintDiagnostics() override;                                    \
+  virtual nsresult UpdateCurrentBrowserId(uint64_t aId) override;              \
+  virtual nsresult AddTransaction(HttpTransactionShell*, int32_t priority)     \
+      override;                                                                \
+  virtual nsresult AddTransactionWithStickyConn(                               \
+      HttpTransactionShell* trans, int32_t priority,                           \
+      HttpTransactionShell* transWithStickyConn) override;                     \
+  virtual nsresult RescheduleTransaction(HttpTransactionShell*,                \
+                                         int32_t priority) override;           \
+  void virtual UpdateClassOfServiceOnTransaction(                              \
+      HttpTransactionShell*, const ClassOfService& classOfService) override;   \
+  virtual nsresult CancelTransaction(HttpTransactionShell*, nsresult reason)   \
+      override;                                                                \
+  virtual nsresult ReclaimConnection(HttpConnectionBase* conn) override;       \
+  virtual nsresult ProcessPendingQ(nsHttpConnectionInfo*) override;            \
+  virtual nsresult ProcessPendingQ() override;                                 \
+  virtual nsresult GetSocketThreadTarget(nsIEventTarget**) override;           \
+  virtual nsresult SpeculativeConnect(                                         \
+      nsHttpConnectionInfo*, nsIInterfaceRequestor*, uint32_t caps = 0,        \
+      SpeculativeTransaction* = nullptr, bool aFetchHTTPSRR = false) override; \
+  virtual nsresult VerifyTraffic() override;                                   \
+  virtual void ExcludeHttp2(const nsHttpConnectionInfo* ci) override;          \
+  virtual void ExcludeHttp3(const nsHttpConnectionInfo* ci) override;          \
+  virtual nsresult ClearConnectionHistory() override;                          \
+  virtual nsresult CompleteUpgrade(HttpTransactionShell* aTrans,               \
+                                   nsIHttpUpgradeListener* aUpgradeListener)   \
+      override;                                                                \
+  nsHttpConnectionMgr* AsHttpConnectionMgr() override;                         \
+  HttpConnectionMgrParent* AsHttpConnectionMgrParent() override;
+
+}  
+
+#endif  // HttpConnectionMgrShell_h_

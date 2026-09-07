@@ -1,0 +1,1112 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(mozilla_dom_quota_quotacommon_h_)
+#define mozilla_dom_quota_quotacommon_h_
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <type_traits>
+#include <utility>
+
+#include "mozIStorageStatement.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/Likely.h"
+#include "mozilla/MacroArgs.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/ResultExtensions.h"
+#include "mozilla/StaticString.h"
+#include "mozilla/Try.h"
+#include "mozilla/dom/quota/Config.h"
+#if defined(QM_LOG_ERROR_ENABLED) && defined(QM_ERROR_STACKS_ENABLED)
+#  include "mozilla/Variant.h"
+#endif
+#include "mozilla/dom/QMResult.h"
+#include "mozilla/dom/quota/FirstInitializationAttemptsImpl.h"
+#include "mozilla/dom/quota/RemoveParen.h"
+#include "mozilla/dom/quota/ScopedLogExtraInfo.h"
+#include "mozilla/ipc/ProtocolUtils.h"
+#include "nsCOMPtr.h"
+#include "nsDebug.h"
+#include "nsError.h"
+#include "nsIDirectoryEnumerator.h"
+#include "nsIEventTarget.h"
+#include "nsIFile.h"
+#include "nsLiteralString.h"
+#include "nsPrintfCString.h"
+#include "nsReadableUtils.h"
+#include "nsString.h"
+#include "nsTArray.h"
+#include "nsTLiteralString.h"
+
+namespace mozilla {
+template <typename T>
+class NotNull;
+}
+
+#define MOZ_ARGS_AFTER_3(a1, a2, a3, ...) __VA_ARGS__
+
+#define MOZ_ADD_ARGS2(...) , ##__VA_ARGS__
+#define MOZ_ADD_ARGS(...) MOZ_ADD_ARGS2(__VA_ARGS__)
+
+#define MOZ_UNIQUE_VAR(base) MOZ_CONCAT(base, __COUNTER__)
+
+#define MOZ_SELECT_OVERLOAD(func)                         \
+  [](auto&&... aArgs) -> decltype(auto) {                 \
+    return func(std::forward<decltype(aArgs)>(aArgs)...); \
+  }
+
+#define DSSTORE_FILE_NAME ".DS_Store"
+#define DESKTOP_FILE_NAME ".desktop"
+#define DESKTOP_INI_FILE_NAME "desktop.ini"
+#define THUMBS_DB_FILE_NAME "thumbs.db"
+
+#define QM_WARNING(...)                                                      \
+  do {                                                                       \
+    nsPrintfCString str(__VA_ARGS__);                                        \
+    mozilla::dom::quota::ReportInternalError(__FILE__, __LINE__, str.get()); \
+    NS_WARNING(str.get());                                                   \
+  } while (0)
+
+#define QM_LOG_TEST() MOZ_LOG_TEST(GetQuotaManagerLogger(), LogLevel::Info)
+#define QM_LOG(_args) MOZ_LOG(GetQuotaManagerLogger(), LogLevel::Info, _args)
+
+#if defined(DEBUG)
+#  define UNKNOWN_FILE_WARNING(_leafName)                                  \
+    NS_WARNING(nsPrintfCString(                                            \
+                   "Something (%s) in the directory that doesn't belong!", \
+                   NS_ConvertUTF16toUTF8(_leafName).get())                 \
+                   .get())
+#else
+#  define UNKNOWN_FILE_WARNING(_leafName) (void)(_leafName);
+#endif
+
+#if defined(DEBUG)
+#  define WARN_IF_FILE_IS_UNKNOWN(_file) \
+    mozilla::dom::quota::WarnIfFileIsUnknown(_file, __FILE__, __LINE__)
+#else
+#  define WARN_IF_FILE_IS_UNKNOWN(_file) Result<bool, nsresult>(false)
+#endif
+
+
+#define QM_VOID
+
+#define QM_PROPAGATE Err(tryTempError)
+
+namespace mozilla::dom::quota::detail {
+
+struct IpcFailCustomRetVal {
+  explicit IpcFailCustomRetVal(
+      mozilla::NotNull<mozilla::ipc::IProtocol*> aActor)
+      : mActor(aActor) {}
+
+  template <size_t NFunc, size_t NExpr>
+  auto operator()(const char (&aFunc)[NFunc],
+                  const char (&aExpr)[NExpr]) const {
+    return mozilla::Err(mozilla::ipc::IPCResult::Fail(mActor, aFunc, aExpr));
+  }
+
+  mozilla::NotNull<mozilla::ipc::IProtocol*> mActor;
+};
+
+}  
+
+#define QM_IPC_FAIL(actor) \
+  mozilla::dom::quota::detail::IpcFailCustomRetVal(mozilla::WrapNotNull(actor))
+
+#if defined(DEBUG)
+#  define QM_ASSERT_UNREACHABLE                                               \
+    [](const char*, const char*) -> ::mozilla::GenericErrorResult<nsresult> { \
+      MOZ_CRASH("Should never be reached.");                                  \
+    }
+
+#  define QM_ASSERT_UNREACHABLE_VOID \
+    [](const char*, const char*) { MOZ_CRASH("Should never be reached."); }
+#endif
+
+#if defined(MOZ_DIAGNOSTIC_ASSERT_ENABLED)
+#  define QM_DIAGNOSTIC_ASSERT_UNREACHABLE                                    \
+    [](const char*, const char*) -> ::mozilla::GenericErrorResult<nsresult> { \
+      MOZ_CRASH("Should never be reached.");                                  \
+    }
+
+#  define QM_DIAGNOSTIC_ASSERT_UNREACHABLE_VOID \
+    [](const char*, const char*) { MOZ_CRASH("Should never be reached."); }
+#endif
+
+#define QM_NO_CLEANUP [](const auto&) {}
+
+
+#define QM_MISSING_ARGS(...)                           \
+  do {                                                 \
+    static_assert(false, "Did you forget arguments?"); \
+  } while (0)
+
+#if defined(DEBUG)
+#  define QM_HANDLE_ERROR(expr, error, severity) \
+    HandleError(#expr, error, __FILE__, __LINE__, severity)
+#else
+#  define QM_HANDLE_ERROR(expr, error, severity) \
+    HandleError("Unavailable", error, __FILE__, __LINE__, severity)
+#endif
+
+#if defined(DEBUG)
+#  define QM_HANDLE_ERROR_RETURN_NOTHING(expr, error, severity) \
+    HandleErrorReturnNothing(#expr, error, __FILE__, __LINE__, severity)
+#else
+#  define QM_HANDLE_ERROR_RETURN_NOTHING(expr, error, severity) \
+    HandleErrorReturnNothing("Unavailable", error, __FILE__, __LINE__, severity)
+#endif
+
+#if defined(DEBUG)
+#  define QM_HANDLE_ERROR_WITH_CLEANUP_RETURN_NOTHING(expr, error, severity, \
+                                                      cleanup)               \
+    HandleErrorWithCleanupReturnNothing(#expr, error, __FILE__, __LINE__,    \
+                                        severity, cleanup)
+#else
+#  define QM_HANDLE_ERROR_WITH_CLEANUP_RETURN_NOTHING(expr, error, severity, \
+                                                      cleanup)               \
+    HandleErrorWithCleanupReturnNothing("Unavailable", error, __FILE__,      \
+                                        __LINE__, severity, cleanup)
+#endif
+
+#define QM_HANDLE_CUSTOM_RET_VAL_HELPER0(func, expr, error)
+
+#define QM_HANDLE_CUSTOM_RET_VAL_HELPER1(func, expr, error, customRetVal) \
+  mozilla::dom::quota::HandleCustomRetVal(func, #expr, error, customRetVal)
+
+#define QM_HANDLE_CUSTOM_RET_VAL_GLUE(a, b) a b
+
+#define QM_HANDLE_CUSTOM_RET_VAL(...)                                 \
+  QM_HANDLE_CUSTOM_RET_VAL_GLUE(                                      \
+      MOZ_PASTE_PREFIX_AND_ARG_COUNT(QM_HANDLE_CUSTOM_RET_VAL_HELPER, \
+                                     MOZ_ARGS_AFTER_3(__VA_ARGS__)),  \
+      (MOZ_ARG_1(__VA_ARGS__), MOZ_ARG_2(__VA_ARGS__),                \
+       MOZ_ARG_3(__VA_ARGS__) MOZ_ADD_ARGS(MOZ_ARGS_AFTER_3(__VA_ARGS__))))
+
+
+#define QM_TRY_PROPAGATE_ERR(tryResult, expr)                                \
+  auto tryResult = (expr);                                                   \
+  static_assert(std::is_empty_v<typename decltype(tryResult)::ok_type>);     \
+  if (MOZ_UNLIKELY(tryResult.isErr())) {                                     \
+    mozilla::dom::quota::QM_HANDLE_ERROR(                                    \
+        expr, tryResult.inspectErr(), mozilla::dom::quota::Severity::Error); \
+    return tryResult.propagateErr();                                         \
+  }
+
+#define QM_TRY_CUSTOM_RET_VAL(tryResult, expr, customRetVal)                 \
+  auto tryResult = (expr);                                                   \
+  static_assert(std::is_empty_v<typename decltype(tryResult)::ok_type>);     \
+  if (MOZ_UNLIKELY(tryResult.isErr())) {                                     \
+    [[maybe_unused]] auto tryTempError = tryResult.unwrapErr();              \
+    mozilla::dom::quota::QM_HANDLE_ERROR(                                    \
+        expr, tryTempError, mozilla::dom::quota::Severity::Error);           \
+    [[maybe_unused]] constexpr const auto& func = __func__;                  \
+    return QM_HANDLE_CUSTOM_RET_VAL(func, expr, tryTempError, customRetVal); \
+  }
+
+#define QM_TRY_CUSTOM_RET_VAL_WITH_CLEANUP(tryResult, expr, customRetVal,    \
+                                           cleanup)                          \
+  auto tryResult = (expr);                                                   \
+  static_assert(std::is_empty_v<typename decltype(tryResult)::ok_type>);     \
+  if (MOZ_UNLIKELY(tryResult.isErr())) {                                     \
+    auto tryTempError = tryResult.unwrapErr();                               \
+    mozilla::dom::quota::QM_HANDLE_ERROR(                                    \
+        expr, tryTempError, mozilla::dom::quota::Severity::Error);           \
+    cleanup(tryTempError);                                                   \
+    [[maybe_unused]] constexpr const auto& func = __func__;                  \
+    return QM_HANDLE_CUSTOM_RET_VAL(func, expr, tryTempError, customRetVal); \
+  }
+
+#define QM_TRY_CUSTOM_RET_VAL_WITH_CLEANUP_AND_PREDICATE(                    \
+    tryResult, expr, customRetVal, cleanup, predicate)                       \
+  auto tryResult = (expr);                                                   \
+  static_assert(std::is_empty_v<typename decltype(tryResult)::ok_type>);     \
+  if (MOZ_UNLIKELY(tryResult.isErr())) {                                     \
+    auto tryTempError = tryResult.unwrapErr();                               \
+    if (predicate()) {                                                       \
+      mozilla::dom::quota::QM_HANDLE_ERROR(                                  \
+          expr, tryTempError, mozilla::dom::quota::Severity::Error);         \
+    }                                                                        \
+    cleanup(tryTempError);                                                   \
+    [[maybe_unused]] constexpr const auto& func = __func__;                  \
+    return QM_HANDLE_CUSTOM_RET_VAL(func, expr, tryTempError, customRetVal); \
+  }
+
+#define QM_TRY_META(...)                                                      \
+  {MOZ_ARG_7(, ##__VA_ARGS__,                                                 \
+             QM_TRY_CUSTOM_RET_VAL_WITH_CLEANUP_AND_PREDICATE(__VA_ARGS__),   \
+             QM_TRY_CUSTOM_RET_VAL_WITH_CLEANUP(__VA_ARGS__),                 \
+             QM_TRY_CUSTOM_RET_VAL(__VA_ARGS__),                              \
+             QM_TRY_PROPAGATE_ERR(__VA_ARGS__), QM_MISSING_ARGS(__VA_ARGS__), \
+             QM_MISSING_ARGS(__VA_ARGS__))}
+
+#define QM_TRY_GLUE(...) QM_TRY_META(MOZ_UNIQUE_VAR(tryResult), ##__VA_ARGS__)
+
+#define QM_TRY(...) QM_TRY_GLUE(__VA_ARGS__)
+
+
+#define QM_TRY_ASSIGN_PROPAGATE_ERR(tryResult, accessFunction, target, expr) \
+  auto tryResult = (expr);                                                   \
+  if (MOZ_UNLIKELY(tryResult.isErr())) {                                     \
+    mozilla::dom::quota::QM_HANDLE_ERROR(                                    \
+        expr, tryResult.inspectErr(), mozilla::dom::quota::Severity::Error); \
+    return tryResult.propagateErr();                                         \
+  }                                                                          \
+  MOZ_REMOVE_PAREN(target) = tryResult.accessFunction();
+
+#define QM_TRY_ASSIGN_CUSTOM_RET_VAL(tryResult, accessFunction, target, expr, \
+                                     customRetVal)                            \
+  auto tryResult = (expr);                                                    \
+  if (MOZ_UNLIKELY(tryResult.isErr())) {                                      \
+    [[maybe_unused]] auto tryTempError = tryResult.unwrapErr();               \
+    mozilla::dom::quota::QM_HANDLE_ERROR(                                     \
+        expr, tryTempError, mozilla::dom::quota::Severity::Error);            \
+    [[maybe_unused]] constexpr const auto& func = __func__;                   \
+    return QM_HANDLE_CUSTOM_RET_VAL(func, expr, tryTempError, customRetVal);  \
+  }                                                                           \
+  MOZ_REMOVE_PAREN(target) = tryResult.accessFunction();
+
+#define QM_TRY_ASSIGN_CUSTOM_RET_VAL_WITH_CLEANUP(                           \
+    tryResult, accessFunction, target, expr, customRetVal, cleanup)          \
+  auto tryResult = (expr);                                                   \
+  if (MOZ_UNLIKELY(tryResult.isErr())) {                                     \
+    auto tryTempError = tryResult.unwrapErr();                               \
+    mozilla::dom::quota::QM_HANDLE_ERROR(                                    \
+        expr, tryTempError, mozilla::dom::quota::Severity::Error);           \
+    cleanup(tryTempError);                                                   \
+    [[maybe_unused]] constexpr const auto& func = __func__;                  \
+    return QM_HANDLE_CUSTOM_RET_VAL(func, expr, tryTempError, customRetVal); \
+  }                                                                          \
+  MOZ_REMOVE_PAREN(target) = tryResult.accessFunction();
+
+#define QM_TRY_ASSIGN_META(...)                                         \
+  MOZ_ARG_8(, ##__VA_ARGS__,                                            \
+            QM_TRY_ASSIGN_CUSTOM_RET_VAL_WITH_CLEANUP(__VA_ARGS__),     \
+            QM_TRY_ASSIGN_CUSTOM_RET_VAL(__VA_ARGS__),                  \
+            QM_TRY_ASSIGN_PROPAGATE_ERR(__VA_ARGS__),                   \
+            QM_MISSING_ARGS(__VA_ARGS__), QM_MISSING_ARGS(__VA_ARGS__), \
+            QM_MISSING_ARGS(__VA_ARGS__), QM_MISSING_ARGS(__VA_ARGS__))
+
+#define QM_TRY_ASSIGN_GLUE(accessFunction, ...) \
+  QM_TRY_ASSIGN_META(MOZ_UNIQUE_VAR(tryResult), accessFunction, ##__VA_ARGS__)
+
+#define QM_TRY_UNWRAP(...) QM_TRY_ASSIGN_GLUE(unwrap, __VA_ARGS__)
+
+#define QM_TRY_INSPECT(...) QM_TRY_ASSIGN_GLUE(inspect, __VA_ARGS__)
+
+
+#define QM_TRY_RETURN_PROPAGATE_ERR(tryResult, expr)                         \
+  auto tryResult = (expr);                                                   \
+  if (MOZ_UNLIKELY(tryResult.isErr())) {                                     \
+    mozilla::dom::quota::QM_HANDLE_ERROR(                                    \
+        expr, tryResult.inspectErr(), mozilla::dom::quota::Severity::Error); \
+  }                                                                          \
+  return tryResult;
+
+#define QM_TRY_RETURN_CUSTOM_RET_VAL(tryResult, expr, customRetVal)          \
+  auto tryResult = (expr);                                                   \
+  if (MOZ_UNLIKELY(tryResult.isErr())) {                                     \
+    [[maybe_unused]] auto tryTempError = tryResult.unwrapErr();              \
+    mozilla::dom::quota::QM_HANDLE_ERROR(                                    \
+        expr, tryResult.inspectErr(), mozilla::dom::quota::Severity::Error); \
+    [[maybe_unused]] constexpr const auto& func = __func__;                  \
+    return QM_HANDLE_CUSTOM_RET_VAL(func, expr, tryTempError, customRetVal); \
+  }                                                                          \
+  return tryResult.unwrap();
+
+#define QM_TRY_RETURN_CUSTOM_RET_VAL_WITH_CLEANUP(tryResult, expr,           \
+                                                  customRetVal, cleanup)     \
+  auto tryResult = (expr);                                                   \
+  if (MOZ_UNLIKELY(tryResult.isErr())) {                                     \
+    auto tryTempError = tryResult.unwrapErr();                               \
+    mozilla::dom::quota::QM_HANDLE_ERROR(                                    \
+        expr, tryTempError, mozilla::dom::quota::Severity::Error);           \
+    cleanup(tryTempError);                                                   \
+    [[maybe_unused]] constexpr const auto& func = __func__;                  \
+    return QM_HANDLE_CUSTOM_RET_VAL(func, expr, tryTempError, customRetVal); \
+  }                                                                          \
+  return tryResult.unwrap();
+
+#define QM_TRY_RETURN_META(...)                                      \
+  {MOZ_ARG_6(, ##__VA_ARGS__,                                        \
+             QM_TRY_RETURN_CUSTOM_RET_VAL_WITH_CLEANUP(__VA_ARGS__), \
+             QM_TRY_RETURN_CUSTOM_RET_VAL(__VA_ARGS__),              \
+             QM_TRY_RETURN_PROPAGATE_ERR(__VA_ARGS__),               \
+             QM_MISSING_ARGS(__VA_ARGS__), QM_MISSING_ARGS(__VA_ARGS__))}
+
+#define QM_TRY_RETURN_GLUE(...) \
+  QM_TRY_RETURN_META(MOZ_UNIQUE_VAR(tryResult), ##__VA_ARGS__)
+
+#define QM_TRY_RETURN(...) QM_TRY_RETURN_GLUE(__VA_ARGS__)
+
+
+#define QM_FAIL_RET_VAL(retVal)                                               \
+  mozilla::dom::quota::QM_HANDLE_ERROR(Failure, 0,                            \
+                                       mozilla::dom::quota::Severity::Error); \
+  return retVal;
+
+#define QM_FAIL_RET_VAL_WITH_CLEANUP(retVal, cleanup)                         \
+  mozilla::dom::quota::QM_HANDLE_ERROR(Failure, 0,                            \
+                                       mozilla::dom::quota::Severity::Error); \
+  cleanup();                                                                  \
+  return retVal;
+
+#define QM_FAIL_META(...)                                               \
+  MOZ_ARG_4(, ##__VA_ARGS__, QM_FAIL_RET_VAL_WITH_CLEANUP(__VA_ARGS__), \
+            QM_FAIL_RET_VAL(__VA_ARGS__), QM_MISSING_ARGS(__VA_ARGS__))
+
+#define QM_FAIL_GLUE(...) QM_FAIL_META(__VA_ARGS__)
+
+#define QM_FAIL(...) QM_FAIL_GLUE(__VA_ARGS__)
+
+
+#define QM_REPORTONLY_TRY(tryResult, severity, expr)                           \
+  auto tryResult = (expr);                                                     \
+  static_assert(std::is_empty_v<typename decltype(tryResult)::ok_type>);       \
+  if (MOZ_UNLIKELY(tryResult.isErr())) {                                       \
+    mozilla::dom::quota::QM_HANDLE_ERROR(                                      \
+        expr, tryResult.unwrapErr(), mozilla::dom::quota::Severity::severity); \
+  }
+
+#define QM_REPORTONLY_TRY_WITH_CLEANUP(tryResult, severity, expr, cleanup) \
+  auto tryResult = (expr);                                                 \
+  static_assert(std::is_empty_v<typename decltype(tryResult)::ok_type>);   \
+  if (MOZ_UNLIKELY(tryResult.isErr())) {                                   \
+    auto tryTempError = tryResult.unwrapErr();                             \
+    mozilla::dom::quota::QM_HANDLE_ERROR(                                  \
+        expr, tryTempError, mozilla::dom::quota::Severity::severity);      \
+    cleanup(tryTempError);                                                 \
+  }
+
+#define QM_REPORTONLY_TRY_META(...)                                        \
+  {MOZ_ARG_6(, ##__VA_ARGS__, QM_REPORTONLY_TRY_WITH_CLEANUP(__VA_ARGS__), \
+             QM_REPORTONLY_TRY(__VA_ARGS__), QM_MISSING_ARGS(__VA_ARGS__), \
+             QM_MISSING_ARGS(__VA_ARGS__), QM_MISSING_ARGS(__VA_ARGS__))}
+
+#define QM_REPORTONLY_TRY_GLUE(severity, ...) \
+  QM_REPORTONLY_TRY_META(MOZ_UNIQUE_VAR(tryResult), severity, ##__VA_ARGS__)
+
+#define QM_WARNONLY_TRY(...) QM_REPORTONLY_TRY_GLUE(Warning, __VA_ARGS__)
+
+#define QM_INFOONLY_TRY(...) QM_REPORTONLY_TRY_GLUE(Info, __VA_ARGS__)
+
+
+#define QM_REPORTONLY_TRY_ASSIGN(tryResult, severity, target, expr) \
+  auto tryResult = (expr);                                          \
+  MOZ_REMOVE_PAREN(target) =                                        \
+      MOZ_LIKELY(tryResult.isOk())                                  \
+          ? Some(tryResult.unwrap())                                \
+          : mozilla::dom::quota::QM_HANDLE_ERROR_RETURN_NOTHING(    \
+                expr, tryResult.unwrapErr(),                        \
+                mozilla::dom::quota::Severity::severity);
+
+#define QM_REPORTONLY_TRY_ASSIGN_WITH_CLEANUP(tryResult, severity, target,    \
+                                              expr, cleanup)                  \
+  auto tryResult = (expr);                                                    \
+  MOZ_REMOVE_PAREN(target) =                                                  \
+      MOZ_LIKELY(tryResult.isOk())                                            \
+          ? Some(tryResult.unwrap())                                          \
+          : mozilla::dom::quota::QM_HANDLE_ERROR_WITH_CLEANUP_RETURN_NOTHING( \
+                expr, tryResult.unwrapErr(),                                  \
+                mozilla::dom::quota::Severity::severity, cleanup);
+
+#define QM_REPORTONLY_TRY_ASSIGN_META(...)                              \
+  MOZ_ARG_7(, ##__VA_ARGS__,                                            \
+            QM_REPORTONLY_TRY_ASSIGN_WITH_CLEANUP(__VA_ARGS__),         \
+            QM_REPORTONLY_TRY_ASSIGN(__VA_ARGS__),                      \
+            QM_MISSING_ARGS(__VA_ARGS__), QM_MISSING_ARGS(__VA_ARGS__), \
+            QM_MISSING_ARGS(__VA_ARGS__), QM_MISSING_ARGS(__VA_ARGS__))
+
+#define QM_REPORTONLY_TRY_ASSIGN_GLUE(severity, ...)                 \
+  QM_REPORTONLY_TRY_ASSIGN_META(MOZ_UNIQUE_VAR(tryResult), severity, \
+                                ##__VA_ARGS__)
+
+#define QM_WARNONLY_TRY_UNWRAP(...) \
+  QM_REPORTONLY_TRY_ASSIGN_GLUE(Warning, __VA_ARGS__)
+
+
+#define QM_INFOONLY_TRY_UNWRAP(...) \
+  QM_REPORTONLY_TRY_ASSIGN_GLUE(Info, __VA_ARGS__)
+
+
+#define QM_VERBOSEONLY_TRY_UNWRAP(...) \
+  QM_REPORTONLY_TRY_ASSIGN_GLUE(Verbose, __VA_ARGS__)
+
+
+
+#define QM_OR_ELSE_REPORT(severity, expr, fallback)                \
+  (expr).orElse([&](const auto& firstRes) {                        \
+    mozilla::dom::quota::QM_HANDLE_ERROR(                          \
+        #expr, firstRes, mozilla::dom::quota::Severity::severity); \
+    return fallback(firstRes);                                     \
+  })
+
+#define QM_OR_ELSE_WARN(...) QM_OR_ELSE_REPORT(Warning, __VA_ARGS__)
+
+#define QM_OR_ELSE_INFO(...) QM_OR_ELSE_REPORT(Info, __VA_ARGS__)
+
+#define QM_OR_ELSE_LOG_VERBOSE(...) QM_OR_ELSE_REPORT(Verbose, __VA_ARGS__)
+
+namespace mozilla::dom::quota {
+
+template <typename V, typename E, typename P, typename F>
+auto OrElseIf(Result<V, E>&& aResult, P&& aPred, F&& aFunc) -> Result<V, E> {
+  return MOZ_UNLIKELY(aResult.isErr())
+             ? (std::forward<P>(aPred)(aResult.inspectErr()))
+                   ? std::forward<F>(aFunc)(aResult.unwrapErr())
+                   : aResult.propagateErr()
+             : aResult.unwrap();
+}
+
+}  
+
+
+#define QM_OR_ELSE_REPORT_IF(severity, expr, predicate, fallback) \
+  mozilla::dom::quota::OrElseIf(                                  \
+      (expr),                                                     \
+      [&](const auto& firstRes) {                                 \
+        bool res = predicate(firstRes);                           \
+        mozilla::dom::quota::QM_HANDLE_ERROR(                     \
+            #expr, firstRes,                                      \
+            res ? mozilla::dom::quota::Severity::severity         \
+                : mozilla::dom::quota::Severity::Error);          \
+        return res;                                               \
+      },                                                          \
+      fallback)
+
+#define QM_OR_ELSE_WARN_IF(...) QM_OR_ELSE_REPORT_IF(Warning, __VA_ARGS__)
+
+#define QM_OR_ELSE_INFO_IF(...) QM_OR_ELSE_REPORT_IF(Info, __VA_ARGS__)
+
+#define QM_OR_ELSE_LOG_VERBOSE_IF(...) \
+  QM_OR_ELSE_REPORT_IF(Verbose, __VA_ARGS__)
+
+#if defined(NIGHTLY_BUILD)
+#  define RECORD_IN_NIGHTLY(_recorder, _status) \
+    do {                                        \
+      if (NS_SUCCEEDED(_recorder)) {            \
+        _recorder = _status;                    \
+      }                                         \
+    } while (0)
+
+#  define OK_IN_NIGHTLY_PROPAGATE_IN_OTHERS \
+    Ok {}
+
+#  define RETURN_STATUS_OR_RESULT(_status, _rv) \
+    return Err(NS_FAILED(_status) ? (_status) : (_rv))
+#else
+#  define RECORD_IN_NIGHTLY(_dummy, _status) \
+    {                                        \
+    }
+
+#  define OK_IN_NIGHTLY_PROPAGATE_IN_OTHERS QM_PROPAGATE
+
+#  define RETURN_STATUS_OR_RESULT(_status, _rv) return Err(_rv)
+#endif
+
+class mozIStorageConnection;
+class mozIStorageStatement;
+class nsIFile;
+
+namespace mozilla {
+
+class LogModule;
+
+struct CreateIfNonExistent {};
+
+struct NotOk {};
+
+inline Result<Ok, NotOk> OkIf(bool aValue) {
+  if (aValue) {
+    return Ok();
+  }
+  return Err(NotOk());
+}
+
+template <auto SuccessValue>
+auto OkToOk(Ok) -> Result<decltype(SuccessValue), nsresult> {
+  return SuccessValue;
+}
+
+template <nsresult ErrorValue, auto SuccessValue,
+          typename V = decltype(SuccessValue)>
+auto ErrToOkOrErr(nsresult aValue) -> Result<V, nsresult> {
+  if (aValue == ErrorValue) {
+    return V{SuccessValue};
+  }
+  return Err(aValue);
+}
+
+template <nsresult ErrorValue, typename V = mozilla::Ok>
+auto ErrToDefaultOkOrErr(nsresult aValue) -> Result<V, nsresult> {
+  if (aValue == ErrorValue) {
+    return V{};
+  }
+  return Err(aValue);
+}
+
+template <nsresult ErrorValue>
+bool IsSpecificError(const nsresult aValue) {
+  return aValue == ErrorValue;
+}
+
+#if defined(QM_ERROR_STACKS_ENABLED)
+template <nsresult ErrorValue>
+bool IsSpecificError(const QMResult& aValue) {
+  return aValue.NSResult() == ErrorValue;
+}
+#endif
+
+template <auto SuccessValue, typename V = decltype(SuccessValue)>
+auto ErrToOk(const nsresult aValue) -> Result<V, nsresult> {
+  return V{SuccessValue};
+}
+
+template <auto SuccessValue, typename V = decltype(SuccessValue)>
+auto ErrToOkFromQMResult(const QMResult& aValue) -> Result<V, QMResult> {
+  return V{SuccessValue};
+}
+
+template <typename V = mozilla::Ok>
+auto ErrToDefaultOk(const nsresult aValue) -> Result<V, nsresult> {
+  return V{};
+}
+
+template <typename MozPromiseType, typename RejectValueT = nsresult>
+auto CreateAndRejectMozPromise(StaticString aFunc, const RejectValueT& aRv)
+    -> decltype(auto) {
+  if constexpr (std::is_same_v<RejectValueT, nsresult>) {
+    return MozPromiseType::CreateAndReject(aRv, aFunc);
+  } else if constexpr (std::is_same_v<RejectValueT, QMResult>) {
+    return MozPromiseType::CreateAndReject(aRv.NSResult(), aFunc);
+  }
+}
+
+RefPtr<BoolPromise> CreateAndRejectBoolPromise(StaticString aFunc,
+                                               nsresult aRv);
+
+RefPtr<Int64Promise> CreateAndRejectInt64Promise(StaticString aFunc,
+                                                 nsresult aRv);
+
+RefPtr<BoolPromise> CreateAndRejectBoolPromiseFromQMResult(StaticString aFunc,
+                                                           const QMResult& aRv);
+
+template <typename Step, typename Body>
+auto CollectEach(Step aStep, const Body& aBody)
+    -> Result<mozilla::Ok, typename std::invoke_result_t<Step>::err_type> {
+  using StepResultType = typename std::invoke_result_t<Step>::ok_type;
+
+  static_assert(
+      std::is_empty_v<
+          typename std::invoke_result_t<Body, StepResultType&&>::ok_type>);
+
+  while (true) {
+    StepResultType element = MOZ_TRY(aStep());
+
+    if (!static_cast<bool>(element)) {
+      break;
+    }
+
+    MOZ_TRY(aBody(std::move(element)));
+  }
+
+  return mozilla::Ok{};
+}
+
+template <typename InputGenerator, typename T, typename BinaryOp>
+auto ReduceEach(InputGenerator aInputGenerator, T aInit,
+                const BinaryOp& aBinaryOp)
+    -> Result<T, typename std::invoke_result_t<InputGenerator>::err_type> {
+  T res = std::move(aInit);
+
+  MOZ_TRY(CollectEach(
+      std::move(aInputGenerator),
+      [&res, &aBinaryOp](const auto& element)
+          -> Result<Ok,
+                    typename std::invoke_result_t<InputGenerator>::err_type> {
+        res = MOZ_TRY(aBinaryOp(std::move(res), element));
+
+        return Ok{};
+      }));
+
+  return std::move(res);
+}
+
+template <typename Range, typename T, typename BinaryOp>
+auto Reduce(Range&& aRange, T aInit, const BinaryOp& aBinaryOp) {
+  using std::begin;
+  using std::end;
+  return ReduceEach(
+      [it = begin(aRange), end = end(aRange)]() mutable {
+        auto res = ToMaybeRef(it != end ? &*it++ : nullptr);
+        return Result<decltype(res), typename std::invoke_result_t<
+                                         BinaryOp, T, decltype(res)>::err_type>(
+            res);
+      },
+      aInit, aBinaryOp);
+}
+
+template <typename Range, typename Body>
+auto CollectEachInRange(Range&& aRange, const Body& aBody)
+    -> Result<mozilla::Ok, nsresult> {
+  for (auto&& element : aRange) {
+    MOZ_TRY(aBody(element));
+  }
+
+  return mozilla::Ok{};
+}
+
+template <typename Cond, typename Body>
+auto CollectWhile(const Cond& aCond, const Body& aBody)
+    -> Result<mozilla::Ok, typename std::invoke_result_t<Cond>::err_type> {
+  return CollectEach(aCond, [&aBody](bool) { return aBody(); });
+}
+
+template <>
+class [[nodiscard]] GenericErrorResult<mozilla::ipc::IPCResult> {
+  mozilla::ipc::IPCResult mErrorValue;
+
+  template <typename V, typename E2>
+  friend class Result;
+
+ public:
+  explicit GenericErrorResult(mozilla::ipc::IPCResult aErrorValue)
+      : mErrorValue(aErrorValue) {
+    MOZ_ASSERT(!aErrorValue);
+  }
+
+  GenericErrorResult(mozilla::ipc::IPCResult aErrorValue,
+                     const ErrorPropagationTag&)
+      : GenericErrorResult(aErrorValue) {}
+
+  operator mozilla::ipc::IPCResult() const { return mErrorValue; }
+};
+
+namespace dom::quota {
+
+extern const char kQuotaGenericDelimiter;
+
+#if defined(NIGHTLY_BUILD)
+extern const nsLiteralCString kQuotaInternalError;
+extern const nsLiteralCString kQuotaExternalError;
+#else
+#  define kQuotaInternalError
+#  define kQuotaExternalError
+#endif
+
+MOZ_COLD void ReportInternalError(const char* aFile, uint32_t aLine,
+                                  const char* aStr);
+
+LogModule* GetQuotaManagerLogger();
+
+void AnonymizeCString(nsACString& aCString);
+
+inline auto AnonymizedCString(const nsACString& aCString) {
+  nsAutoCString result{aCString};
+  AnonymizeCString(result);
+  return result;
+}
+
+void AnonymizeOriginString(nsACString& aOriginString);
+
+inline auto AnonymizedOriginString(const nsACString& aOriginString) {
+  nsAutoCString result{aOriginString};
+  AnonymizeOriginString(result);
+  return result;
+}
+
+
+Result<nsCOMPtr<nsIFile>, nsresult> QM_NewLocalFile(const nsAString& aPath);
+
+nsDependentCSubstring GetLeafName(const nsACString& aPath);
+
+Result<nsCOMPtr<nsIFile>, nsresult> CloneFileAndAppend(
+    nsIFile& aDirectory, const nsAString& aPathElement);
+
+enum class nsIFileKind {
+  ExistsAsDirectory,
+  ExistsAsFile,
+  DoesNotExist,
+};
+
+Result<nsIFileKind, nsresult> GetDirEntryKind(nsIFile& aFile);
+
+Result<nsCOMPtr<mozIStorageStatement>, nsresult> CreateStatement(
+    mozIStorageConnection& aConnection, const nsACString& aStatementString);
+
+enum class SingleStepResult { AssertHasResult, ReturnNullIfNoResult };
+
+template <SingleStepResult ResultHandling>
+using SingleStepSuccessType =
+    std::conditional_t<ResultHandling == SingleStepResult::AssertHasResult,
+                       NotNull<nsCOMPtr<mozIStorageStatement>>,
+                       nsCOMPtr<mozIStorageStatement>>;
+
+template <SingleStepResult ResultHandling>
+Result<SingleStepSuccessType<ResultHandling>, nsresult> ExecuteSingleStep(
+    nsCOMPtr<mozIStorageStatement>&& aStatement);
+
+template <SingleStepResult ResultHandling = SingleStepResult::AssertHasResult>
+Result<SingleStepSuccessType<ResultHandling>, nsresult>
+CreateAndExecuteSingleStepStatement(mozIStorageConnection& aConnection,
+                                    const nsACString& aStatementString);
+
+namespace detail {
+
+nsDependentCSubstring GetSourceTreeBase();
+
+nsDependentCSubstring GetObjdirDistIncludeTreeBase(
+    const nsLiteralCString& aQuotaCommonHPath = nsLiteralCString(__FILE__));
+
+nsDependentCSubstring MakeSourceFileRelativePath(
+    const nsACString& aSourceFilePath);
+
+}  
+
+enum class Severity {
+  Error,
+  Warning,
+  Info,
+  Verbose,
+};
+
+#if defined(QM_LOG_ERROR_ENABLED)
+#if defined(QM_ERROR_STACKS_ENABLED)
+using ResultType = Variant<QMResult, nsresult, Nothing>;
+
+void LogError(const nsACString& aExpr, const ResultType& aResult,
+              const nsACString& aSourceFilePath, int32_t aSourceFileLine,
+              Severity aSeverity)
+#else
+void LogError(const nsACString& aExpr, Maybe<nsresult> aMaybeRv,
+              const nsACString& aSourceFilePath, int32_t aSourceFileLine,
+              Severity aSeverity)
+#endif
+    ;
+#endif
+
+#if defined(DEBUG)
+Result<bool, nsresult> WarnIfFileIsUnknown(nsIFile& aFile,
+                                           const char* aSourceFilePath,
+                                           int32_t aSourceFileLine);
+#endif
+
+#if defined(QM_LOG_ERROR_ENABLED)
+template <typename T>
+MOZ_COLD MOZ_NEVER_INLINE void HandleError(const char* aExpr, const T& aRv,
+                                           const char* aSourceFilePath,
+                                           int32_t aSourceFileLine,
+                                           const Severity aSeverity) {
+#if defined(QM_ERROR_STACKS_ENABLED)
+  if constexpr (std::is_same_v<T, QMResult> || std::is_same_v<T, nsresult>) {
+    mozilla::dom::quota::LogError(nsDependentCString(aExpr), ResultType(aRv),
+                                  nsDependentCString(aSourceFilePath),
+                                  aSourceFileLine, aSeverity);
+  } else {
+    mozilla::dom::quota::LogError(
+        nsDependentCString(aExpr), ResultType(Nothing{}),
+        nsDependentCString(aSourceFilePath), aSourceFileLine, aSeverity);
+  }
+#else
+  if constexpr (std::is_same_v<T, nsresult>) {
+    mozilla::dom::quota::LogError(nsDependentCString(aExpr), Some(aRv),
+                                  nsDependentCString(aSourceFilePath),
+                                  aSourceFileLine, aSeverity);
+  } else {
+    mozilla::dom::quota::LogError(nsDependentCString(aExpr), Nothing{},
+                                  nsDependentCString(aSourceFilePath),
+                                  aSourceFileLine, aSeverity);
+  }
+#endif
+}
+#else
+template <typename T>
+MOZ_ALWAYS_INLINE constexpr void HandleError(const char* aExpr, const T& aRv,
+                                             const char* aSourceFilePath,
+                                             int32_t aSourceFileLine,
+                                             const Severity aSeverity) {}
+#endif
+
+template <typename T>
+Nothing HandleErrorReturnNothing(const char* aExpr, const T& aRv,
+                                 const char* aSourceFilePath,
+                                 int32_t aSourceFileLine,
+                                 const Severity aSeverity) {
+  HandleError(aExpr, aRv, aSourceFilePath, aSourceFileLine, aSeverity);
+  return Nothing();
+}
+
+template <typename T, typename CleanupFunc>
+Nothing HandleErrorWithCleanupReturnNothing(const char* aExpr, const T& aRv,
+                                            const char* aSourceFilePath,
+                                            int32_t aSourceFileLine,
+                                            const Severity aSeverity,
+                                            CleanupFunc&& aCleanupFunc) {
+  HandleError(aExpr, aRv, aSourceFilePath, aSourceFileLine, aSeverity);
+  std::forward<CleanupFunc>(aCleanupFunc)(aRv);
+  return Nothing();
+}
+
+#if defined(__GNUC__) && !defined(__clang__)
+namespace gcc_detail {
+template <typename T>
+struct invokabilize_impl {
+  auto operator()(T t) -> T { return t; }
+};
+template <typename R, typename... Args>
+struct invokabilize_impl<R (&)(Args...)> {
+  auto operator()(R (&t)(Args...)) -> std::function<R(Args...)> {
+    return std::function{t};
+  }
+};
+template <typename R, typename... Args>
+struct invokabilize_impl<R (*)(Args...)> {
+  auto operator()(R (*t)(Args...)) -> std::function<R(Args...)> {
+    return std::function{t};
+  }
+};
+template <typename T>
+auto invokabilize(T t) {
+  return invokabilize_impl<T>{}(std::forward<T>(t));
+}
+}  
+#endif
+
+template <size_t NFunc, size_t NExpr, typename T, typename CustomRetVal_>
+auto HandleCustomRetVal(const char (&aFunc)[NFunc], const char (&aExpr)[NExpr],
+                        const T& aRv, CustomRetVal_&& aCustomRetVal_) {
+#if defined(__GNUC__) && !defined(__clang__)
+  auto aCustomRetVal =
+      gcc_detail::invokabilize(std::forward<CustomRetVal_>(aCustomRetVal_));
+  using CustomRetVal = decltype(aCustomRetVal);
+#else
+  using CustomRetVal = CustomRetVal_;
+  CustomRetVal& aCustomRetVal = aCustomRetVal_;
+#endif
+  if constexpr (std::is_invocable<CustomRetVal, const char[NFunc],
+                                  const char[NExpr]>::value) {
+    return std::forward<CustomRetVal>(aCustomRetVal)(aFunc, aExpr);
+  } else if constexpr (std::is_invocable<CustomRetVal, const char[NFunc],
+                                         const T&>::value) {
+    return aCustomRetVal(aFunc, aRv);
+  } else if constexpr (std::is_invocable<CustomRetVal, const T&>::value) {
+    return aCustomRetVal(aRv);
+  } else {
+    return std::forward<CustomRetVal>(aCustomRetVal);
+  }
+}
+
+template <SingleStepResult ResultHandling = SingleStepResult::AssertHasResult,
+          typename BindFunctor>
+Result<SingleStepSuccessType<ResultHandling>, nsresult>
+CreateAndExecuteSingleStepStatement(mozIStorageConnection& aConnection,
+                                    const nsACString& aStatementString,
+                                    BindFunctor aBindFunctor) {
+  QM_TRY_UNWRAP(auto stmt, CreateStatement(aConnection, aStatementString));
+
+  QM_TRY(aBindFunctor(*stmt));
+
+  return ExecuteSingleStep<ResultHandling>(std::move(stmt));
+}
+
+template <typename StepFunc>
+Result<Ok, nsresult> CollectWhileHasResult(mozIStorageStatement& aStmt,
+                                           StepFunc&& aStepFunc) {
+  return CollectWhile(
+      [&aStmt] {
+        QM_TRY_RETURN(MOZ_TO_RESULT_INVOKE_MEMBER(aStmt, ExecuteStep));
+      },
+      [&aStmt, &aStepFunc] { return aStepFunc(aStmt); });
+}
+
+template <typename StepFunc,
+          typename ArrayType = nsTArray<typename std::invoke_result_t<
+              StepFunc, mozIStorageStatement&>::ok_type>>
+auto CollectElementsWhileHasResult(mozIStorageStatement& aStmt,
+                                   StepFunc&& aStepFunc)
+    -> Result<ArrayType, nsresult> {
+  ArrayType res;
+
+  QM_TRY(CollectWhileHasResult(
+      aStmt, [&aStepFunc, &res](auto& stmt) -> Result<Ok, nsresult> {
+        QM_TRY_UNWRAP(auto element, aStepFunc(stmt));
+        res.AppendElement(std::move(element));
+        return Ok{};
+      }));
+
+  return std::move(res);
+}
+
+template <typename ArrayType, typename StepFunc>
+auto CollectElementsWhileHasResultTyped(mozIStorageStatement& aStmt,
+                                        StepFunc&& aStepFunc) {
+  return CollectElementsWhileHasResult<StepFunc, ArrayType>(
+      aStmt, std::forward<StepFunc>(aStepFunc));
+}
+
+namespace detail {
+template <typename Cancel, typename Body>
+Result<mozilla::Ok, nsresult> CollectEachFile(nsIFile& aDirectory,
+                                              const Cancel& aCancel,
+                                              const Body& aBody) {
+  QM_TRY_INSPECT(const auto& entries, MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+                                          nsCOMPtr<nsIDirectoryEnumerator>,
+                                          aDirectory, GetDirectoryEntries));
+
+  return CollectEach(
+      [&entries, &aCancel]() -> Result<nsCOMPtr<nsIFile>, nsresult> {
+        if (aCancel()) {
+          return nsCOMPtr<nsIFile>{};
+        }
+
+        QM_TRY_RETURN(MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(nsCOMPtr<nsIFile>,
+                                                        entries, GetNextFile));
+      },
+      aBody);
+}
+}  
+
+template <typename Body>
+Result<mozilla::Ok, nsresult> CollectEachFile(nsIFile& aDirectory,
+                                              const Body& aBody) {
+  return detail::CollectEachFile(aDirectory, [] { return false; }, aBody);
+}
+
+template <typename Body>
+Result<mozilla::Ok, nsresult> CollectEachFileAtomicCancelable(
+    nsIFile& aDirectory, const Atomic<bool>& aCanceled, const Body& aBody) {
+  return detail::CollectEachFile(
+      aDirectory, [&aCanceled] { return static_cast<bool>(aCanceled); }, aBody);
+}
+
+template <typename T, typename Body>
+auto ReduceEachFileAtomicCancelable(nsIFile& aDirectory,
+                                    const Atomic<bool>& aCanceled, T aInit,
+                                    const Body& aBody) -> Result<T, nsresult> {
+  QM_TRY_INSPECT(const auto& entries, MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(
+                                          nsCOMPtr<nsIDirectoryEnumerator>,
+                                          aDirectory, GetDirectoryEntries));
+
+  return ReduceEach(
+      [&entries, &aCanceled]() -> Result<nsCOMPtr<nsIFile>, nsresult> {
+        if (aCanceled) {
+          return nsCOMPtr<nsIFile>{};
+        }
+
+        QM_TRY_RETURN(MOZ_TO_RESULT_INVOKE_MEMBER_TYPED(nsCOMPtr<nsIFile>,
+                                                        entries, GetNextFile));
+      },
+      std::move(aInit), aBody);
+}
+
+constexpr bool IsDatabaseCorruptionError(const nsresult aRv) {
+  return aRv == NS_ERROR_FILE_CORRUPTED || aRv == NS_ERROR_STORAGE_IOERR;
+}
+
+template <typename Func>
+auto CallWithDelayedRetriesIfAccessDenied(Func&& aFunc, uint32_t aMaxRetries,
+                                          uint32_t aDelayMs)
+    -> Result<typename std::invoke_result_t<Func>::ok_type, nsresult> {
+  std::decay_t<Func> func = std::forward<Func>(aFunc);
+
+  uint32_t retries = 0;
+
+  while (true) {
+    auto result = std::invoke(func);
+
+    if (result.isOk()) {
+      return result;
+    }
+
+    if (result.inspectErr() != NS_ERROR_FILE_IS_LOCKED &&
+        result.inspectErr() != NS_ERROR_FILE_ACCESS_DENIED) {
+      return result;
+    }
+
+    if (retries++ >= aMaxRetries) {
+      return result;
+    }
+
+    PR_Sleep(PR_MillisecondsToInterval(aDelayMs));
+  }
+}
+
+namespace detail {
+
+template <bool flag = false>
+void UnsupportedReturnType() {
+  static_assert(flag, "Unsupported return type!");
+}
+
+}  
+
+template <typename Initialization, typename StringGenerator, typename Func>
+auto ExecuteInitialization(
+    FirstInitializationAttempts<Initialization, StringGenerator>&
+        aFirstInitializationAttempts,
+    const Initialization aInitialization, Func&& aFunc)
+    -> std::invoke_result_t<Func, const FirstInitializationAttempt<
+                                      Initialization, StringGenerator>&> {
+  return aFirstInitializationAttempts.WithFirstInitializationAttempt(
+      aInitialization, [&aFunc](auto&& firstInitializationAttempt) {
+        auto res = std::forward<Func>(aFunc)(firstInitializationAttempt);
+
+        const auto rv = [&res]() -> nsresult {
+          using RetType =
+              std::invoke_result_t<Func, const FirstInitializationAttempt<
+                                             Initialization, StringGenerator>&>;
+
+          if constexpr (std::is_same_v<RetType, nsresult>) {
+            return res;
+          } else if constexpr (mozilla::detail::IsResult<RetType>::value &&
+                               std::is_same_v<typename RetType::err_type,
+                                              nsresult>) {
+            return res.isOk() ? NS_OK : res.inspectErr();
+          } else {
+            detail::UnsupportedReturnType();
+          }
+        }();
+
+        if (rv == NS_ERROR_ABORT) {
+          return res;
+        }
+
+        if (!firstInitializationAttempt.Recorded()) {
+          firstInitializationAttempt.Record(rv);
+        }
+
+        return res;
+      });
+}
+
+template <typename Initialization, typename StringGenerator, typename Func>
+auto ExecuteInitialization(
+    FirstInitializationAttempts<Initialization, StringGenerator>&
+        aFirstInitializationAttempts,
+    const Initialization aInitialization, const nsACString& aContext,
+    Func&& aFunc)
+    -> std::invoke_result_t<Func, const FirstInitializationAttempt<
+                                      Initialization, StringGenerator>&> {
+  return ExecuteInitialization(
+      aFirstInitializationAttempts, aInitialization,
+      [&](const auto& firstInitializationAttempt) -> decltype(auto) {
+#if defined(QM_SCOPED_LOG_EXTRA_INFO_ENABLED)
+        const auto maybeScopedLogExtraInfo =
+            firstInitializationAttempt.Recorded()
+                ? Nothing{}
+                : Some(ScopedLogExtraInfo{
+                      ScopedLogExtraInfo::kTagContextTainted, aContext});
+#endif
+        return std::forward<Func>(aFunc)(firstInitializationAttempt);
+      });
+}
+
+}  
+}  
+
+#endif

@@ -1,0 +1,195 @@
+/*
+ * Copyright © 2016 Mozilla Foundation
+ *
+ * This program is made available under an ISC-style license.  See the
+ * accompanying file LICENSE for details.
+ */
+#define NOMINMAX
+
+#include "cubeb_log.h"
+#include "cubeb_ringbuffer.h"
+#include <cstdarg>
+#include <time.h>
+
+std::atomic<cubeb_log_level> g_cubeb_log_level;
+std::atomic<cubeb_log_callback> g_cubeb_log_callback;
+
+const size_t CUBEB_LOG_MESSAGE_MAX_SIZE = 256;
+const size_t CUBEB_LOG_MESSAGE_QUEUE_DEPTH = 40;
+const size_t CUBEB_LOG_BATCH_PRINT_INTERVAL_MS = 10;
+
+void
+cubeb_noop_log_callback(char const * , ...)
+{
+}
+
+class cubeb_log_message {
+public:
+  cubeb_log_message() { *storage = '\0'; }
+  cubeb_log_message(char const str[CUBEB_LOG_MESSAGE_MAX_SIZE])
+  {
+    size_t length = strlen(str);
+    assert(length < CUBEB_LOG_MESSAGE_MAX_SIZE);
+    if (length > CUBEB_LOG_MESSAGE_MAX_SIZE - 1) {
+      return;
+    }
+    PodCopy(storage, str, length);
+    storage[length] = '\0';
+  }
+  char const * get() { return storage; }
+
+private:
+  char storage[CUBEB_LOG_MESSAGE_MAX_SIZE]{};
+};
+
+class cubeb_async_logger {
+public:
+  static cubeb_async_logger & get()
+  {
+    static cubeb_async_logger instance;
+    return instance;
+  }
+  void push(char const str[CUBEB_LOG_MESSAGE_MAX_SIZE])
+  {
+    cubeb_log_message msg(str);
+    auto * owned_queue = msg_queue.load();
+    if (!owned_queue ||
+        !msg_queue.compare_exchange_strong(owned_queue, nullptr)) {
+      return;
+    }
+    owned_queue->enqueue(msg);
+    msg_queue.store(owned_queue);
+  }
+  void run()
+  {
+    assert(logging_thread.get_id() == std::thread::id());
+    logging_thread = std::thread([this]() {
+      while (!shutdown_thread) {
+        cubeb_log_message msg;
+        while (msg_queue_consumer.load()->dequeue(&msg, 1)) {
+          cubeb_log_internal_no_format(msg.get());
+        }
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(CUBEB_LOG_BATCH_PRINT_INTERVAL_MS));
+      }
+    });
+  }
+  void reset_producer_thread()
+  {
+    if (msg_queue) {
+      msg_queue.load()->reset_thread_ids();
+    }
+  }
+  void start()
+  {
+    auto * queue =
+        new lock_free_queue<cubeb_log_message>(CUBEB_LOG_MESSAGE_QUEUE_DEPTH);
+    msg_queue.store(queue);
+    msg_queue_consumer.store(queue);
+    shutdown_thread = false;
+    run();
+  }
+  void stop()
+  {
+    assert(((g_cubeb_log_callback == cubeb_noop_log_callback) ||
+            !g_cubeb_log_callback) &&
+           "Only call stop after logging has been disabled.");
+    shutdown_thread = true;
+    if (logging_thread.get_id() != std::thread::id()) {
+      logging_thread.join();
+      logging_thread = std::thread();
+      auto * owned_queue = msg_queue.load();
+      while (!msg_queue.compare_exchange_weak(owned_queue, nullptr)) {
+      }
+      delete owned_queue;
+      msg_queue_consumer.store(nullptr);
+    }
+  }
+
+private:
+  cubeb_async_logger() {}
+  ~cubeb_async_logger()
+  {
+    assert(logging_thread.get_id() == std::thread::id() &&
+           (g_cubeb_log_callback == cubeb_noop_log_callback ||
+            !g_cubeb_log_callback));
+    if (msg_queue.load()) {
+      delete msg_queue.load();
+    }
+  }
+  std::atomic<lock_free_queue<cubeb_log_message> *> msg_queue = {nullptr};
+
+  std::atomic<lock_free_queue<cubeb_log_message> *> msg_queue_consumer = {
+      nullptr};
+  std::atomic<bool> shutdown_thread = {false};
+  std::thread logging_thread;
+};
+
+void
+cubeb_log_internal(char const * file, uint32_t line, char const * fmt, ...)
+{
+  va_list args;
+  va_start(args, fmt);
+  char msg[CUBEB_LOG_MESSAGE_MAX_SIZE];
+  vsnprintf(msg, CUBEB_LOG_MESSAGE_MAX_SIZE, fmt, args);
+  va_end(args);
+  g_cubeb_log_callback.load()("%s:%d:%s", file, line, msg);
+}
+
+void
+cubeb_log_internal_no_format(const char * msg)
+{
+  g_cubeb_log_callback.load()(msg);
+}
+
+void
+cubeb_async_log(char const * fmt, ...)
+{
+  va_list args;
+  va_start(args, fmt);
+  char msg[CUBEB_LOG_MESSAGE_MAX_SIZE];
+  vsnprintf(msg, CUBEB_LOG_MESSAGE_MAX_SIZE, fmt, args);
+  cubeb_async_logger::get().push(msg);
+  va_end(args);
+}
+
+void
+cubeb_async_log_reset_threads(void)
+{
+  if (!g_cubeb_log_callback) {
+    return;
+  }
+  cubeb_async_logger::get().reset_producer_thread();
+}
+
+void
+cubeb_log_set(cubeb_log_level log_level, cubeb_log_callback log_callback)
+{
+  g_cubeb_log_level = log_level;
+  if (log_callback && log_level != CUBEB_LOG_DISABLED) {
+    g_cubeb_log_callback = log_callback;
+    if (log_level == CUBEB_LOG_VERBOSE) {
+      cubeb_async_logger::get().start();
+    }
+  } else if (!log_callback || CUBEB_LOG_DISABLED) {
+    g_cubeb_log_callback = cubeb_noop_log_callback;
+    cubeb_async_logger::get().stop();
+  } else {
+    assert(false && "Incorrect parameters passed to cubeb_log_set");
+  }
+}
+
+cubeb_log_level
+cubeb_log_get_level()
+{
+  return g_cubeb_log_level;
+}
+
+cubeb_log_callback
+cubeb_log_get_callback()
+{
+  if (g_cubeb_log_callback == cubeb_noop_log_callback) {
+    return nullptr;
+  }
+  return g_cubeb_log_callback;
+}

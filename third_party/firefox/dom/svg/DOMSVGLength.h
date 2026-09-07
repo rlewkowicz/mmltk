@@ -1,0 +1,116 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SVG_DOMSVGLENGTH_H_
+#define DOM_SVG_DOMSVGLENGTH_H_
+
+#include "DOMSVGLengthList.h"
+#include "SVGLength.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsDebug.h"
+#include "nsTArray.h"
+#include "nsWrapperCache.h"
+
+#define MOZ_SVG_LIST_INDEX_BIT_COUNT 21  // supports > 2 million list items
+
+namespace mozilla {
+
+class ErrorResult;
+
+namespace dom {
+class SVGElement;
+
+class DOMSVGLength final : public nsWrapperCache {
+  template <class T>
+  friend class AutoChangeLengthListNotifier;
+
+  DOMSVGLength(SVGAnimatedLength* aVal, dom::SVGElement* aSVGElement,
+               bool aAnimVal);
+
+  ~DOMSVGLength() { CleanupWeakRefs(); }
+
+ public:
+  NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(DOMSVGLength)
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_NATIVE_CLASS(DOMSVGLength)
+
+  DOMSVGLength(DOMSVGLengthList* aList, uint8_t aAttrEnum, uint32_t aListIndex,
+               bool aIsAnimValItem);
+
+  DOMSVGLength();
+
+  static already_AddRefed<DOMSVGLength> GetTearOff(SVGAnimatedLength* aVal,
+                                                   dom::SVGElement* aSVGElement,
+                                                   bool aAnimVal);
+
+  already_AddRefed<DOMSVGLength> Copy();
+
+  bool IsAnimating() const;
+
+  bool HasOwner() const { return !!mOwner; }
+
+  void InsertingIntoList(DOMSVGLengthList* aList, uint8_t aAttrEnum,
+                         uint32_t aListIndex, bool aIsAnimValItem);
+
+  static uint32_t MaxListIndex() {
+    return (1U << MOZ_SVG_LIST_INDEX_BIT_COUNT) - 1;
+  }
+
+  void UpdateListIndex(uint32_t aListIndex) {
+    MOZ_RELEASE_ASSERT(aListIndex <= MaxListIndex());
+    mListIndex = aListIndex;
+  }
+
+  void RemovingFromList();
+
+  SVGLength ToSVGLength();
+
+  uint16_t UnitType();
+  float GetValue(ErrorResult& aRv);
+  void SetValue(float aUserUnitValue, ErrorResult& aRv);
+  float ValueInSpecifiedUnits();
+  void SetValueInSpecifiedUnits(float aValue, ErrorResult& aRv);
+  void GetValueAsString(nsAString& aValue);
+  void SetValueAsString(const nsAString& aValue, ErrorResult& aRv);
+  void NewValueSpecifiedUnits(uint16_t aUnit, float aValue, ErrorResult& aRv);
+  void ConvertToSpecifiedUnits(uint16_t aUnit, ErrorResult& aRv);
+
+  nsISupports* GetParentObject() { return mOwner; }
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+ private:
+  dom::SVGElement* Element();
+
+  uint8_t AttrEnum() const { return mAttrEnum; }
+
+  SVGLength& InternalItem();
+
+  void FlushIfNeeded();
+
+#ifdef DEBUG
+  bool IndexIsValid();
+#endif
+
+  void CleanupWeakRefs();
+
+  RefPtr<nsISupports> mOwner;  
+
+
+  uint32_t mListIndex : MOZ_SVG_LIST_INDEX_BIT_COUNT;
+  uint32_t mAttrEnum : 4;  
+  uint32_t mIsAnimValItem : 1;
+
+  uint32_t mIsInTearoffTable : 1;
+
+  uint32_t mUnit : 5;  
+  float mValue = 0.0f;
+};
+
+}  
+}  
+
+#undef MOZ_SVG_LIST_INDEX_BIT_COUNT
+
+#endif  // DOM_SVG_DOMSVGLENGTH_H_

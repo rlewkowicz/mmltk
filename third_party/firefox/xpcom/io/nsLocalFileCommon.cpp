@@ -1,0 +1,403 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsLocalFile.h"  // includes platform-specific headers
+
+#include "mozilla/Try.h"
+#include "mozilla/Utf16.h"
+#include "nsString.h"
+#include "nsCOMPtr.h"
+#include "nsReadableUtils.h"
+#include "nsPrintfCString.h"
+#include "nsCRT.h"
+#include "nsNativeCharsetUtils.h"
+#include "nsUTF8Utils.h"
+#include "nsArray.h"
+#include "nsLocalFileCommon.h"
+
+#  include <limits.h>
+
+const char* const sExecutableExts[] = {
+    // clang-format off
+  ".accda",       
+  ".accdb",       
+  ".accde",       
+  ".accdr",       
+  ".ad",
+  ".ade",         
+  ".adp",
+  ".afploc",      
+  ".air",         
+  ".app",         
+  ".application", 
+  ".appref-ms",   
+  ".appx",
+  ".appxbundle",
+  ".asp",
+  ".atloc",       
+  ".bas",
+  ".bat",
+  ".cer",         
+  ".chm",
+  ".cmd",
+  ".com",
+  ".command",     
+  ".cpl",
+  ".crt",
+  ".der",
+  ".diagcab",     
+  ".exe",
+  ".fileloc",     
+  ".ftploc",      
+  ".fxp",         
+  ".hlp",
+  ".hta",
+  ".inetloc",     
+  ".inf",
+  ".ins",
+  ".isp",
+  ".jar",         
+#if !defined(MOZ_ESR)
+  ".jnlp",
+#endif
+  ".js",
+  ".jse",
+  ".library-ms",  
+  ".lnk",
+  ".mad",         
+  ".maf",         
+  ".mag",         
+  ".mam",         
+  ".maq",         
+  ".mar",         
+  ".mas",         
+  ".mat",         
+  ".mau",         
+  ".mav",         
+  ".maw",         
+  ".mda",         
+  ".mdb",
+  ".mde",
+  ".mdt",         
+  ".mdw",         
+  ".mdz",         
+  ".msc",
+  ".msh",         
+  ".msh1",        
+  ".msh1xml",     
+  ".msh2",        
+  ".msh2xml",     
+  ".mshxml",      
+  ".msi",
+  ".msix",
+  ".msixbundle",
+  ".msp",
+  ".mst",
+  ".ops",         
+  ".pcd",
+  ".pif",
+  ".plg",         
+  ".prf",         
+  ".prg",
+  ".pst",
+  ".reg",
+  ".scf",         
+  ".scr",
+  ".sct",
+  ".search-ms",  
+  ".settingcontent-ms",
+  ".shb",
+  ".shs",
+  ".terminal",    
+  ".url",
+  ".vb",
+  ".vbe",
+  ".vbs",
+  ".vdx",
+  ".vsd",
+  ".vsdm",
+  ".vsdx",
+  ".vsmacros",    
+  ".vss",
+  ".vssm",
+  ".vssx",
+  ".vst",
+  ".vstm",
+  ".vstx",
+  ".vsw",
+  ".vsx",
+  ".vtx",
+  ".webloc",       
+  ".ws",
+  ".wsc",
+  ".wsf",
+  ".wsh",
+  ".xll",         
+  ".xrm-ms"
+    // clang-format on
+};
+
+nsresult NS_NewLocalFileWithFile(nsIFile* aFile, nsIFile** aResult) {
+  nsCOMPtr<nsIFile> file = new nsLocalFile();
+  MOZ_TRY(file->InitWithFile(aFile));
+  file.forget(aResult);
+  return NS_OK;
+}
+
+nsresult NS_NewLocalFileWithRelativeDescriptor(nsIFile* aFromFile,
+                                               const nsACString& aRelativeDesc,
+                                               nsIFile** aResult) {
+  nsCOMPtr<nsIFile> file = new nsLocalFile();
+  MOZ_TRY(file->SetRelativeDescriptor(aFromFile, aRelativeDesc));
+  file.forget(aResult);
+  return NS_OK;
+}
+
+nsresult NS_NewLocalFileWithPersistentDescriptor(
+    const nsACString& aPersistentDescriptor, nsIFile** aResult) {
+  nsCOMPtr<nsIFile> file = new nsLocalFile();
+  MOZ_TRY(file->SetPersistentDescriptor(aPersistentDescriptor));
+  file.forget(aResult);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsLocalFile::InitWithFile(nsIFile* aFile) {
+  if (NS_WARN_IF(!aFile)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  nsAutoCString path;
+  aFile->GetNativePath(path);
+  if (path.IsEmpty()) {
+    return NS_ERROR_INVALID_ARG;
+  }
+  return InitWithNativePath(path);
+}
+
+static constexpr int32_t kMaxUniquePathLength = PATH_MAX - 6;
+
+static constexpr int32_t kMaxUniqueFilenameLength = 250;
+
+NS_IMETHODIMP
+nsLocalFile::CreateUnique(uint32_t aType, uint32_t aAttributes) {
+  nsresult rv;
+
+  auto FailedBecauseExists = [&](nsresult aRv) {
+    if (aRv == NS_ERROR_FILE_ACCESS_DENIED) {
+      bool exists;
+      return NS_SUCCEEDED(Exists(&exists)) && exists;
+    }
+    return aRv == NS_ERROR_FILE_ALREADY_EXISTS;
+  };
+
+  nsAutoCString path, leafName, rootName, suffix;
+  rv = GetNativePath(path);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  rv = GetNativeLeafName(leafName);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  const int32_t lastDot = leafName.RFindChar('.');
+
+  int32_t pathHeadroom =
+      kMaxUniquePathLength - static_cast<int32_t>(path.Length());
+  int32_t leafHeadroom =
+      kMaxUniqueFilenameLength - static_cast<int32_t>(leafName.Length());
+
+  if (pathHeadroom >= 0 && leafHeadroom >= 0) {
+    rv = Create(aType, aAttributes);
+    if (!FailedBecauseExists(rv)) {
+      return rv;
+    }
+  }
+
+  if (lastDot == kNotFound) {
+    rootName = leafName;
+  } else {
+    suffix = Substring(leafName, lastDot);       
+    rootName = Substring(leafName, 0, lastDot);  
+  }
+
+  if (pathHeadroom < 0 || leafHeadroom < 0) {
+    int32_t maxRootPerPathLimit =
+        static_cast<int32_t>(rootName.Length()) + pathHeadroom;
+    int32_t maxRootPerLeafLimit =
+        static_cast<int32_t>(rootName.Length()) + leafHeadroom;
+
+    int32_t maxRootLength = std::min(maxRootPerPathLimit, maxRootPerLeafLimit);
+
+    if (maxRootLength < 2) {
+      return NS_ERROR_FILE_UNRECOGNIZED_PATH;
+    }
+
+    if (NS_IsNativeUTF8()) {
+      while (UTF8traits::isInSeq(rootName[maxRootLength])) {
+        --maxRootLength;
+      }
+
+      if (maxRootLength == 0 && suffix.IsEmpty()) {
+        return NS_ERROR_FILE_UNRECOGNIZED_PATH;
+      }
+    }
+
+    rootName.SetLength(maxRootLength);
+    SetNativeLeafName(rootName + suffix);
+    nsresult rvCreate = Create(aType, aAttributes);
+    if (!FailedBecauseExists(rvCreate)) {
+      return rvCreate;
+    }
+  }
+
+  for (int indx = 1; indx < 10000; ++indx) {
+    SetNativeLeafName(rootName + nsPrintfCString("-%d", indx) + suffix);
+    rv = Create(aType, aAttributes);
+    if (NS_SUCCEEDED(rv) || !FailedBecauseExists(rv)) {
+      return rv;
+    }
+  }
+
+  return NS_ERROR_FILE_TOO_BIG;
+}
+
+#if defined(XP_UNIX)
+static const char16_t kPathSeparatorChar = '/';
+#else
+#  error Need to define file path separator for your platform
+#endif
+
+static void SplitPath(char16_t* aPath, nsTArray<char16_t*>& aNodeArray) {
+  if (*aPath == 0) {
+    return;
+  }
+
+  if (*aPath == kPathSeparatorChar) {
+    aPath++;
+  }
+  aNodeArray.AppendElement(aPath);
+
+  for (char16_t* cp = aPath; *cp != 0; ++cp) {
+    if (*cp == kPathSeparatorChar) {
+      *cp++ = 0;
+      if (*cp == 0) {
+        break;
+      }
+      aNodeArray.AppendElement(cp);
+    }
+  }
+}
+
+NS_IMETHODIMP
+nsLocalFile::GetRelativeDescriptor(nsIFile* aFromFile, nsACString& aResult) {
+  if (NS_WARN_IF(!aFromFile)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+
+  nsresult rv;
+  aResult.Truncate(0);
+
+  nsAutoString thisPath, fromPath;
+  AutoTArray<char16_t*, 32> thisNodes;
+  AutoTArray<char16_t*, 32> fromNodes;
+
+  rv = GetPath(thisPath);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+  rv = aFromFile->GetPath(fromPath);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+
+  char16_t* thisPathPtr = thisPath.BeginWriting();
+  char16_t* fromPathPtr = fromPath.BeginWriting();
+
+  SplitPath(thisPathPtr, thisNodes);
+  SplitPath(fromPathPtr, fromNodes);
+
+  size_t nodeIndex;
+  for (nodeIndex = 0;
+       nodeIndex < thisNodes.Length() && nodeIndex < fromNodes.Length();
+       ++nodeIndex) {
+    if (nsCRT::strcmp(thisNodes[nodeIndex], fromNodes[nodeIndex])) {
+      break;
+    }
+  }
+
+  size_t branchIndex = nodeIndex;
+  for (nodeIndex = branchIndex; nodeIndex < fromNodes.Length(); ++nodeIndex) {
+    aResult.AppendLiteral("../");
+  }
+  StringJoinAppend(aResult, "/"_ns, mozilla::Span{thisNodes}.From(branchIndex),
+                   [](nsACString& dest, const auto& thisNode) {
+                     AppendUTF16toUTF8(nsDependentString{thisNode}, dest);
+                   });
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsLocalFile::SetRelativeDescriptor(nsIFile* aFromFile,
+                                   const nsACString& aRelativeDesc) {
+  constexpr auto kParentDirStr = "../"_ns;
+
+  nsCOMPtr<nsIFile> targetFile;
+  nsresult rv = aFromFile->Clone(getter_AddRefs(targetFile));
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+
+  nsCString::const_iterator strBegin, strEnd;
+  aRelativeDesc.BeginReading(strBegin);
+  aRelativeDesc.EndReading(strEnd);
+
+  nsCString::const_iterator nodeBegin(strBegin), nodeEnd(strEnd);
+  nsCString::const_iterator pos(strBegin);
+
+  nsCOMPtr<nsIFile> parentDir;
+  while (FindInReadable(kParentDirStr, nodeBegin, nodeEnd)) {
+    rv = targetFile->GetParent(getter_AddRefs(parentDir));
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+    if (!parentDir) {
+      return NS_ERROR_FILE_UNRECOGNIZED_PATH;
+    }
+    targetFile = parentDir;
+
+    nodeBegin = nodeEnd;
+    pos = nodeEnd;
+    nodeEnd = strEnd;
+  }
+
+  nodeBegin = nodeEnd = pos;
+  while (nodeEnd != strEnd) {
+    FindCharInReadable('/', nodeEnd, strEnd);
+    targetFile->Append(NS_ConvertUTF8toUTF16(Substring(nodeBegin, nodeEnd)));
+    if (nodeEnd != strEnd) {  
+      ++nodeEnd;
+    }
+    nodeBegin = nodeEnd;
+  }
+
+  return InitWithFile(targetFile);
+}
+
+NS_IMETHODIMP
+nsLocalFile::GetRelativePath(nsIFile* aFromFile, nsACString& aResult) {
+  return GetRelativeDescriptor(aFromFile, aResult);
+}
+
+NS_IMETHODIMP
+nsLocalFile::SetRelativePath(nsIFile* aFromFile,
+                             const nsACString& aRelativePath) {
+  return SetRelativeDescriptor(aFromFile, aRelativePath);
+}

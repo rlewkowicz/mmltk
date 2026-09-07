@@ -1,0 +1,2103 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#if !defined(nsContentUtils_h_)
+#define nsContentUtils_h_
+
+
+
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <tuple>
+
+#include "ErrorList.h"
+#include "Units.h"
+#include "js/Id.h"
+#include "js/RegExpFlags.h"
+#include "js/RootingAPI.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/BasicEvents.h"
+#include "mozilla/CORSMode.h"
+#include "mozilla/CallState.h"
+#include "mozilla/FunctionRef.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/SourceLocation.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/CacheExpirationTime.h"
+#include "mozilla/dom/FetchPriority.h"
+#include "mozilla/dom/FromParser.h"
+#include "mozilla/fallible.h"
+#include "mozilla/gfx/Point.h"
+#include "nsCOMPtr.h"
+#include "nsIContent.h"
+#include "nsIContentPolicy.h"
+#include "nsINode.h"
+#include "nsIScriptError.h"
+#include "nsIThread.h"
+#include "nsLiteralString.h"
+#include "nsMargin.h"
+#include "nsPIDOMWindow.h"
+#include "nsRFPService.h"
+#include "nsStringFwd.h"
+#include "nsTArray.h"
+#include "nsTLiteralString.h"
+#include "prtime.h"
+
+
+class JSObject;
+class imgICache;
+class imgIContainer;
+class imgINotificationObserver;
+class imgIRequest;
+class imgLoader;
+class imgRequestProxy;
+class nsAtom;
+class nsAttrValue;
+class nsAutoScriptBlockerSuppressNodeRemoved;
+class nsCycleCollectionTraversalCallback;
+class nsDocShell;
+class nsGlobalWindowInner;
+class nsHtml5StringParser;
+class nsIArray;
+class nsIBidiKeyboard;
+class nsIChannel;
+class nsIConsoleService;
+class nsIDocShell;
+class nsIDocShellTreeItem;
+class nsIDocumentLoaderFactory;
+class nsIDragSession;
+class nsIFile;
+class nsIFragmentContentSink;
+class nsIFrame;
+class nsIHttpChannel;
+class nsIIOService;
+class nsIImageLoadingContent;
+class nsIInterfaceRequestor;
+class nsILoadGroup;
+class nsILoadInfo;
+class nsIObserver;
+class nsIPrincipal;
+class nsIReferrerInfo;
+class nsIRequest;
+class nsIRunnable;
+class nsIScreen;
+class nsIScriptContext;
+class nsIScriptSecurityManager;
+class nsISerialEventTarget;
+class nsIStringBundle;
+class nsIStringBundleService;
+class nsISupports;
+class nsITransferable;
+class nsIURI;
+class nsIWidget;
+class nsIWritableVariant;
+class nsIXPConnect;
+class nsNodeInfoManager;
+class nsParser;
+class nsPIWindowRoot;
+class nsPresContext;
+class nsWrapperCache;
+enum class WindowMediatorFilter : uint8_t;
+
+struct JSContext;
+struct nsPoint;
+
+namespace IPC {
+class Message;
+class MessageReader;
+class MessageWriter;
+}  
+
+namespace JS {
+class Value;
+class PropertyDescriptor;
+}  
+
+namespace mozilla {
+class Dispatcher;
+class EditorBase;
+class ErrorResult;
+class EventListenerManager;
+class HTMLEditor;
+class LazyLogModule;
+class LogModule;
+class PresShell;
+class StringBuffer;
+class TextEditor;
+class WidgetDragEvent;
+class WidgetKeyboardEvent;
+
+struct InputEventOptions;
+
+template <typename ParentType, typename RefType>
+class RangeBoundaryBase;
+
+template <typename T>
+class NotNull;
+template <class T>
+class OwningNonNull;
+template <class T>
+class StaticRefPtr;
+
+namespace dom {
+class IPCImage;
+struct AutocompleteInfo;
+class BrowserChild;
+class BrowserParent;
+class BrowsingContext;
+class BrowsingContextGroup;
+class ContentChild;
+class ContentList;
+class ContentFrameMessageManager;
+class ContentParent;
+struct CustomElementDefinition;
+class CustomElementFormValue;
+class CustomElementRegistry;
+class DataTransfer;
+enum class DeprecatedOperations : uint16_t;
+class Document;
+class DocumentFragment;
+class DOMArena;
+class Element;
+class Event;
+class EventTarget;
+class FragmentOrElement;
+class HTMLElement;
+class HTMLInputElement;
+class IPCTransferable;
+class IPCTransferableData;
+class IPCTransferableDataImageContainer;
+class IPCTransferableDataItem;
+struct LifecycleCallbackArgs;
+class MessageBroadcaster;
+class NodeInfo;
+class OwningFileOrUSVStringOrFormData;
+class Selection;
+struct SetHTMLOptions;
+struct SetHTMLUnsafeOptions;
+enum class ShadowRootMode : uint8_t;
+class ShadowRoot;
+enum class SlotAssignmentMode : uint8_t;
+struct StructuredSerializeOptions;
+struct SynthesizeMouseEventData;
+struct SynthesizeMouseEventOptions;
+struct SynthesizeTouchEventData;
+struct SynthesizeTouchEventOptions;
+class TrustedHTMLOrString;
+class VoidFunction;
+class WindowContext;
+class WorkerPrivate;
+enum class ElementCallbackType;
+enum class ReferrerPolicy : uint8_t;
+}  
+
+namespace ipc {
+class BigBuffer;
+class IProtocol;
+}  
+
+namespace gfx {
+class DataSourceSurface;
+enum class SurfaceFormat : int8_t;
+}  
+
+class WindowRenderer;
+
+}  
+
+extern const char kLoadAsData[];
+
+const nsString& EmptyString();
+const nsCString& EmptyCString();
+
+enum EventNameType {
+  EventNameType_None = 0x0000,
+  EventNameType_HTML = 0x0001,
+  EventNameType_XUL = 0x0002,
+  EventNameType_SVGGraphic = 0x0004,  
+  EventNameType_SVGSVG = 0x0008,      
+  EventNameType_SMIL = 0x0010,        
+  EventNameType_HTMLBodyOrFramesetOnly = 0x0020,
+  EventNameType_HTMLMedia = 0x0040,
+
+  EventNameType_HTMLXUL = 0x0003,
+  EventNameType_All = 0xFFFF
+};
+
+enum class SerializeShadowRoots : uint8_t { Yes, No };
+
+struct EventNameMapping {
+  nsAtom* MOZ_NON_OWNING_REF mAtom;
+  int32_t mType;
+  mozilla::EventMessage mMessage;
+  mozilla::EventClassID mEventClassID;
+};
+
+enum class PropertiesFile : uint8_t {
+  CSS_PROPERTIES,
+  XUL_PROPERTIES,
+  LAYOUT_PROPERTIES,
+  FORMS_PROPERTIES,
+  PRINTING_PROPERTIES,
+  DOM_PROPERTIES,
+  HTMLPARSER_PROPERTIES,
+  SVG_PROPERTIES,
+  BRAND_PROPERTIES,
+  COMMON_DIALOG_PROPERTIES,
+  MATHML_PROPERTIES,
+  SECURITY_PROPERTIES,
+  NECKO_PROPERTIES,
+  FORMS_PROPERTIES_en_US,
+  DOM_PROPERTIES_en_US,
+  NECKO_PROPERTIES_en_US,
+  COUNT
+};
+
+namespace mozilla::dom {
+enum JSONBehavior { UndefinedIsNullStringLiteral, UndefinedIsVoidString };
+}  
+
+class nsContentUtils {
+  friend class nsAutoScriptBlockerSuppressNodeRemoved;
+  using Element = mozilla::dom::Element;
+  using Document = mozilla::dom::Document;
+  using Cancelable = mozilla::Cancelable;
+  using CanBubble = mozilla::CanBubble;
+  using Composed = mozilla::Composed;
+  using ChromeOnlyDispatch = mozilla::ChromeOnlyDispatch;
+  using EventMessage = mozilla::EventMessage;
+  using TimeDuration = mozilla::TimeDuration;
+  using Trusted = mozilla::Trusted;
+  using JSONBehavior = mozilla::dom::JSONBehavior;
+  using RFPTarget = mozilla::RFPTarget;
+  using SystemGroupOnly = mozilla::SystemGroupOnly;
+
+ public:
+  static nsresult Init();
+
+  static bool IsCallerChrome();
+  static bool ThreadsafeIsCallerChrome();
+  static bool IsCallerUAWidget();
+  static bool IsFuzzingEnabled()
+  {
+    return false;
+  }
+  static bool IsErrorPage(nsIURI* aURI);
+
+  static bool IsCallerChromeOrFuzzingEnabled(JSContext* aCx, JSObject*) {
+    return ThreadsafeIsSystemCaller(aCx) || IsFuzzingEnabled();
+  }
+
+  static bool IsCallerChromeOrElementTransformGettersEnabled(JSContext* aCx,
+                                                             JSObject*);
+
+
+  static bool IsSystemCaller(JSContext* aCx);
+
+  static bool ThreadsafeIsSystemCaller(JSContext* aCx);
+
+  static bool LegacyIsCallerNativeCode() { return !GetCurrentJSContext(); }
+  static bool LegacyIsCallerChromeOrNativeCode() {
+    return LegacyIsCallerNativeCode() || IsCallerChrome();
+  }
+  static nsIPrincipal* SubjectPrincipalOrSystemIfNativeCaller() {
+    if (!GetCurrentJSContext()) {
+      return GetSystemPrincipal();
+    }
+    return SubjectPrincipal();
+  }
+
+  static bool LookupBindingMember(
+      JSContext* aCx, nsIContent* aContent, JS::Handle<jsid> aId,
+      JS::MutableHandle<JS::PropertyDescriptor> aDesc);
+
+  static bool ShouldResistFingerprinting(bool aIsPrivateMode,
+                                         RFPTarget aTarget);
+  static bool ShouldResistFingerprinting(nsIGlobalObject* aGlobalObject,
+                                         RFPTarget aTarget);
+  static bool ShouldResistFingerprinting(mozilla::dom::CallerType aCallerType,
+                                         nsIGlobalObject* aGlobalObject,
+                                         RFPTarget aTarget);
+  static bool ShouldResistFingerprinting(nsIDocShell* aDocShell,
+                                         RFPTarget aTarget);
+  static bool ShouldResistFingerprinting(const Document* aDocument,
+                                         RFPTarget aTarget);
+  static bool ShouldResistFingerprinting(nsIChannel* aChannel,
+                                         RFPTarget aTarget);
+  static bool ShouldResistFingerprinting_dangerous(
+      nsIURI* aURI, const mozilla::OriginAttributes& aOriginAttributes,
+      const char* aJustification, RFPTarget aTarget);
+  static bool ShouldResistFingerprinting_dangerous(nsIPrincipal* aPrincipal,
+                                                   const char* aJustification,
+                                                   RFPTarget aTarget);
+
+  static bool ShouldResistFingerprinting(const char* aJustification,
+                                         RFPTarget aTarget);
+
+  static bool ETPSaysShouldNotResistFingerprinting(
+      nsICookieJarSettings* aCookieJarSettings, bool aIsPBM);
+
+  static bool ETPSaysShouldNotResistFingerprinting(nsIChannel* aChannel,
+                                                   nsILoadInfo* aLoadInfo);
+
+  static void CalcRoundedWindowSizeForResistingFingerprinting(
+      int32_t aChromeWidth, int32_t aChromeHeight, int32_t aScreenWidth,
+      int32_t aScreenHeight, int32_t aInputWidth, int32_t aInputHeight,
+      bool aSetOuterWidth, bool aSetOuterHeight, int32_t* aOutputWidth,
+      int32_t* aOutputHeight);
+
+  static nsINode* GetNearestInProcessCrossDocParentNode(nsINode* aChild);
+
+  static bool ContentIsHostIncludingDescendantOf(
+      const nsINode* aPossibleDescendant, const nsINode* aPossibleAncestor);
+
+  static bool ContentIsCrossDocDescendantOf(nsINode* aPossibleDescendant,
+                                            nsINode* aPossibleAncestor);
+
+  static bool ContentIsFlattenedTreeDescendantOf(
+      const nsINode* aPossibleDescendant, const nsINode* aPossibleAncestor);
+
+  static bool ContentIsFlattenedTreeDescendantOfForStyle(
+      const nsINode* aPossibleDescendant, const nsINode* aPossibleAncestor);
+
+  static nsINode* Retarget(nsINode* aTargetA, const nsINode* aTargetB);
+
+  static Element* GetAnElementForTiming(Element* aTarget,
+                                        const Document* aDocument,
+                                        nsIGlobalObject* aGlobal);
+
+  static nsresult GetInclusiveAncestors(nsINode* aNode,
+                                        nsTArray<nsINode*>& aArray);
+
+  static nsresult GetInclusiveAncestorsAndOffsets(
+      nsINode* aNode, uint32_t aOffset, nsTArray<nsIContent*>& aAncestorNodes,
+      nsTArray<mozilla::Maybe<uint32_t>>& aAncestorOffsets);
+
+  static nsresult GetFlattenedTreeAncestorsAndOffsetsForSelection(
+      nsINode* aNode, uint32_t aOffset, nsTArray<nsIContent*>& aAncestorNodes,
+      nsTArray<mozilla::Maybe<uint32_t>>& aAncestorOffsets);
+
+  static nsINode* GetClosestCommonInclusiveAncestor(nsINode* aNode1,
+                                                    nsINode* aNode2) {
+    if (aNode1 == aNode2) {
+      return aNode1;
+    }
+
+    return GetCommonAncestorHelper(aNode1, aNode2);
+  }
+
+  static nsINode* GetClosestCommonShadowIncludingInclusiveAncestor(
+      nsINode* aNode1, nsINode* aNode2);
+
+  static nsIContent* GetCommonFlattenedTreeAncestor(nsIContent* aContent1,
+                                                    nsIContent* aContent2) {
+    if (aContent1 == aContent2) {
+      return aContent1;
+    }
+
+    return GetCommonFlattenedTreeAncestorHelper(aContent1, aContent2);
+  }
+
+  static nsINode* GetCommonFlattenedTreeAncestorForSelection(nsINode* aNode1,
+                                                             nsINode* aNode2);
+
+  static Element* GetCommonFlattenedTreeAncestorForStyle(Element* aElement1,
+                                                         Element* aElement2);
+
+  static mozilla::dom::BrowserParent* GetCommonBrowserParentAncestor(
+      mozilla::dom::BrowserParent* aBrowserParent1,
+      mozilla::dom::BrowserParent* aBrowserParent2);
+
+  static Element* GetTargetElement(Document* aDocument,
+                                   const nsAString& aAnchorName);
+  static bool PositionIsBefore(const nsINode* aNode1, const nsINode* aNode2) {
+    return CompareTreePosition<TreeKind::DOM>(aNode1, aNode2, nullptr,
+                                              nullptr) < 0;
+  }
+
+  template <size_t cache_size = 100>
+  struct ResizableNodeIndexCache {
+    template <TreeKind aTreeKind>
+    void ComputeIndicesOf(const nsINode* aParent, const nsIContent* aChild1,
+                          const nsIContent* aChild2,
+                          mozilla::Maybe<int32_t>& aChild1Index,
+                          mozilla::Maybe<int32_t>& aChild2Index) {
+      AssertTreeKind(aTreeKind);
+      bool foundChild1 = false;
+      bool foundChild2 = false;
+      for (size_t cacheIndex = 0; cacheIndex < cache_size; ++cacheIndex) {
+        if (foundChild1 && foundChild2) {
+          return;
+        }
+        const nsINode* node = mNodes[cacheIndex];
+        if (!node) {
+          break;
+        }
+        if (!foundChild1 && node == aChild1) {
+          aChild1Index = mIndices[cacheIndex];
+          foundChild1 = true;
+          continue;
+        }
+        if (!foundChild2 && node == aChild2) {
+          aChild2Index = mIndices[cacheIndex];
+          foundChild2 = true;
+          continue;
+        }
+      }
+      if (!foundChild1) {
+        aChild1Index =
+            ComputeAndInsertIndexIntoCache<aTreeKind>(aParent, aChild1);
+      }
+      if (!foundChild2) {
+        aChild2Index =
+            ComputeAndInsertIndexIntoCache<aTreeKind>(aParent, aChild2);
+      }
+    }
+    template <TreeKind aTreeKind>
+    mozilla::Maybe<int32_t> ComputeIndexOf(const nsINode* aParent,
+                                           const nsIContent* aChild) {
+      AssertTreeKind(aTreeKind);
+      for (size_t cacheIndex = 0; cacheIndex < cache_size; ++cacheIndex) {
+        const nsINode* node = mNodes[cacheIndex];
+        if (!node) {
+          break;
+        }
+        if (node == aChild) {
+          return mIndices[cacheIndex];
+        }
+      }
+      return ComputeAndInsertIndexIntoCache<aTreeKind>(aParent, aChild);
+    }
+
+   private:
+    template <TreeKind aTreeKind>
+    mozilla::Maybe<int32_t> ComputeAndInsertIndexIntoCache(
+        const nsINode* aParent, const nsIContent* aChild) {
+      AssertTreeKind(aTreeKind);
+      mozilla::Maybe<int32_t> childIndex =
+          nsContentUtils::GetIndexInParent<aTreeKind>(aParent, aChild);
+
+      mNodes[mNext] = aChild;
+      mIndices[mNext] = childIndex;
+
+      ++mNext;
+      if (mNext == cache_size) {
+        mNext = 0;
+      }
+      return childIndex;
+    }
+
+    const nsINode* mNodes[cache_size]{};
+
+    mozilla::Maybe<int32_t> mIndices[cache_size];
+
+    size_t mNext{0};
+
+#if defined(DEBUG)
+    mozilla::Maybe<TreeKind> mTreeKind;
+#endif
+
+    void AssertTreeKind(TreeKind aKind) {
+#if defined(DEBUG)
+      const TreeKind kind =
+          aKind == TreeKind::DOM ? TreeKind::ShadowIncludingDOM : aKind;
+      MOZ_ASSERT(!mTreeKind || mTreeKind.value() == kind, "Mixing queries");
+      mTreeKind = mozilla::Some(kind);
+#endif
+    }
+  };
+
+  using NodeIndexCache = ResizableNodeIndexCache<100>;
+
+  template <TreeKind aKind, typename PT1, typename RT1, typename PT2,
+            typename RT2>
+  static mozilla::Maybe<int32_t> ComparePoints(
+      const mozilla::RangeBoundaryBase<PT1, RT1>& aBoundary1,
+      const mozilla::RangeBoundaryBase<PT2, RT2>& aBoundary2,
+      NodeIndexCache* aIndexCache = nullptr);
+
+  template <TreeKind aKind>
+  static mozilla::Maybe<int32_t> ComparePoints_AllowNegativeOffsets(
+      const nsINode* aParent1, int64_t aOffset1, const nsINode* aParent2,
+      int64_t aOffset2) {
+    if (MOZ_UNLIKELY(aOffset1 < 0 || aOffset2 < 0)) {
+      if (aParent1 == aParent2) {
+        const int32_t compOffsets =
+            aOffset1 == aOffset2 ? 0 : (aOffset1 < aOffset2 ? -1 : 1);
+        return mozilla::Some(compOffsets);
+      }
+      if (aOffset1 < 0 && aParent2->IsInclusiveDescendantOf(aParent1)) {
+        return mozilla::Some(-1);
+      }
+      if (aOffset2 < 0 && aParent1->IsInclusiveDescendantOf(aParent2)) {
+        return mozilla::Some(1);
+      }
+      return ComparePointsWithIndices<aKind>(
+          aParent1,
+          aOffset1 < 0 ? aParent1->GetChildCount()
+                       : std::min(static_cast<uint32_t>(aOffset1),
+                                  aParent1->GetChildCount()),
+          aParent2,
+          aOffset2 < 0 ? aParent2->GetChildCount()
+                       : std::min(static_cast<uint32_t>(aOffset2),
+                                  aParent2->GetChildCount()));
+    }
+    return ComparePointsWithIndices<aKind>(aParent1, aOffset1, aParent2,
+                                           aOffset2);
+  }
+
+  static Element* MatchElementId(nsIContent* aContent, const nsAString& aId);
+
+  static Element* MatchElementId(nsIContent* aContent, const nsAtom* aId);
+
+  static uint16_t ReverseDocumentPosition(uint16_t aDocumentPosition);
+
+  static const nsDependentSubstring TrimCharsInSet(const char* aSet,
+                                                   const nsAString& aValue);
+
+  template <bool IsWhitespace(char16_t)>
+  static const nsDependentSubstring TrimWhitespace(const nsAString& aStr,
+                                                   bool aTrimTrailing = true);
+
+  static bool IsAlphanumeric(uint32_t aChar);
+  static bool IsAlphanumericOrSymbol(uint32_t aChar);
+  static bool IsHyphen(uint32_t aChar);
+
+  static bool IsHTMLWhitespace(char16_t aChar);
+  static constexpr std::string_view kHTMLWhitespace{"\x09\x0a\x0c\x0d\x20"};
+
+  static bool IsHTMLWhitespaceOrNBSP(char16_t aChar);
+
+  static bool IsHTMLBlockLevelElement(nsIContent* aContent);
+
+  enum ParseHTMLIntegerResultFlags {
+    eParseHTMLInteger_NoFlags = 0,
+    eParseHTMLInteger_NonStandard = 1 << 0,
+    eParseHTMLInteger_DidNotConsumeAllInput = 1 << 1,
+    eParseHTMLInteger_Error = 1 << 2,
+    eParseHTMLInteger_ErrorNoValue = 1 << 3,
+    eParseHTMLInteger_ErrorOverflow = 1 << 4,
+    eParseHTMLInteger_Negative = 1 << 5,
+  };
+  static int32_t ParseHTMLInteger(const nsAString& aValue,
+                                  ParseHTMLIntegerResultFlags* aResult) {
+    return ParseHTMLInteger(aValue.BeginReading(), aValue.EndReading(),
+                            aResult);
+  }
+  static int32_t ParseHTMLInteger(const char16_t* aStart, const char16_t* aEnd,
+                                  ParseHTMLIntegerResultFlags* aResult);
+  static int32_t ParseHTMLInteger(const nsACString& aValue,
+                                  ParseHTMLIntegerResultFlags* aResult) {
+    return ParseHTMLInteger(aValue.BeginReading(), aValue.EndReading(),
+                            aResult);
+  }
+  static int32_t ParseHTMLInteger(const char* aStart, const char* aEnd,
+                                  ParseHTMLIntegerResultFlags* aResult);
+
+ private:
+  template <class CharT>
+  static int32_t ParseHTMLIntegerImpl(const CharT* aStart, const CharT* aEnd,
+                                      ParseHTMLIntegerResultFlags* aResult);
+
+ public:
+  static mozilla::Maybe<double> ParseHTMLFloatingPointNumber(const nsAString&);
+
+  static int32_t ParseLegacyFontSize(const nsAString& aValue);
+
+  static void Shutdown();
+
+  static nsresult CheckSameOrigin(const nsINode* aTrustedNode,
+                                  const nsINode* unTrustedNode);
+
+  static bool CanCallerAccess(const nsINode* aNode);
+
+  static bool CanCallerAccess(nsPIDOMWindowInner* aWindow);
+
+  static nsIPrincipal* GetAttrTriggeringPrincipal(
+      nsIContent* aContent, const nsAString& aAttrValue,
+      nsIPrincipal* aSubjectPrincipal);
+
+  static bool CanNavigate(mozilla::dom::BrowsingContext* aSource,
+                          mozilla::dom::BrowsingContext* aTarget,
+                          nsIPrincipal* aDocumentPrincipal,
+                          bool aConsiderOpener);
+
+  static bool IsAbsoluteURL(const nsACString& aURL);
+
+  static bool InProlog(nsINode* aNode);
+
+  static nsIBidiKeyboard* GetBidiKeyboard();
+
+  static nsIScriptSecurityManager* GetSecurityManager() {
+    return sSecurityManager;
+  }
+
+  static nsIPrincipal* SubjectPrincipal(JSContext* aCx);
+
+  static nsIPrincipal* SubjectPrincipal();
+
+  static nsIPrincipal* ObjectPrincipal(JSObject* aObj);
+
+  static void GenerateStateKey(nsIContent* aContent, Document* aDocument,
+                               nsACString& aKey);
+
+  static nsresult NewURIWithDocumentCharset(nsIURI** aResult,
+                                            const nsAString& aSpec,
+                                            Document* aDocument,
+                                            nsIURI* aBaseURI);
+
+  static bool ContainsChar(nsAtom* aAtom, char aChar);
+
+  static bool IsNameWithDash(nsAtom* aName);
+
+  static bool IsCustomElementName(nsAtom* aName, uint32_t aNameSpaceID);
+
+  static bool IsValidShadowHostName(nsAtom* aName,
+                                    uint32_t aNameSpaceID = kNameSpaceID_XHTML);
+
+  static nsresult CheckQName(const nsAString& aQualifiedName,
+                             bool aNamespaceAware = true,
+                             const char16_t** aColon = nullptr);
+
+  static bool IsValidElementLocalName(const nsAString& aName);
+
+  static bool IsValidAttributeLocalName(const nsAString& aName);
+
+  static bool IsValidNamespacePrefix(const nsAString& aPrefix);
+
+  static bool IsValidDoctypeName(const nsAString& aName);
+
+  static nsresult ParseQualifiedNameRelaxed(
+      const nsAString& aQualifiedName, uint16_t aNodeType,
+      const char16_t** aColon, const char16_t** aLocalNameEnd = nullptr);
+
+  static nsresult SplitQName(const nsIContent* aNamespaceResolver,
+                             const nsString& aQName, int32_t* aNamespace,
+                             nsAtom** aLocalName);
+
+  static nsresult GetNodeInfoFromQName(const nsAString& aNamespaceURI,
+                                       const nsAString& aQualifiedName,
+                                       nsNodeInfoManager* aNodeInfoManager,
+                                       uint16_t aNodeType,
+                                       mozilla::dom::NodeInfo** aNodeInfo);
+
+  static void SplitExpatName(const char16_t* aExpatName, nsAtom** aPrefix,
+                             nsAtom** aTagName, int32_t* aNameSpaceID);
+
+  static bool IsSitePermAllow(nsIPrincipal* aPrincipal,
+                              const nsACString& aType);
+
+  static bool IsSitePermDeny(nsIPrincipal* aPrincipal, const nsACString& aType);
+
+  static bool IsExactSitePermAllow(nsIPrincipal* aPrincipal,
+                                   const nsACString& aType);
+
+  static bool IsExactSitePermDeny(nsIPrincipal* aPrincipal,
+                                  const nsACString& aType);
+
+  static bool HasSitePerm(nsIPrincipal* aPrincipal, const nsACString& aType);
+
+  static bool HaveEqualPrincipals(Document* aDoc1, Document* aDoc2);
+
+  static void RegisterShutdownObserver(nsIObserver* aObserver);
+  static void UnregisterShutdownObserver(nsIObserver* aObserver);
+
+  static bool HasNonEmptyAttr(const nsIContent* aContent, int32_t aNameSpaceID,
+                              nsAtom* aName);
+
+  static nsPresContext* GetContextForContent(const nsIContent* aContent);
+
+  static mozilla::PresShell* GetPresShellForContent(const nsIContent* aContent);
+
+  static bool DocumentInactiveForImageLoads(Document* aDocument);
+
+  static int32_t CORSModeToLoadImageFlags(mozilla::CORSMode aMode);
+
+  static nsresult LoadImage(
+      nsIURI* aURI, nsINode* aContext, Document* aLoadingDocument,
+      nsIPrincipal* aLoadingPrincipal, uint64_t aRequestContextID,
+      nsIReferrerInfo* aReferrerInfo, imgINotificationObserver* aObserver,
+      int32_t aLoadFlags, const nsAString& initiatorType,
+      imgRequestProxy** aRequest,
+      nsContentPolicyType aContentPolicyType =
+          nsIContentPolicy::TYPE_INTERNAL_IMAGE,
+      bool aUseUrgentStartForChannel = false, bool aLinkPreload = false,
+      uint64_t aEarlyHintPreloaderId = 0,
+      mozilla::dom::FetchPriority aFetchPriority =
+          mozilla::dom::FetchPriority::Auto);
+
+  static imgLoader* GetImgLoaderForDocument(Document* aDoc);
+  static imgLoader* GetImgLoaderForChannel(nsIChannel* aChannel,
+                                           Document* aContext);
+
+  static already_AddRefed<imgIContainer> GetImageFromContent(
+      nsIImageLoadingContent* aContent, imgIRequest** aRequest = nullptr);
+
+  static bool ContentIsDraggable(nsIContent* aContent);
+
+  static bool IsDraggableImage(nsIContent* aContent);
+
+  static bool IsDraggableLink(const nsIContent* aContent);
+
+  static nsresult QNameChanged(mozilla::dom::NodeInfo* aNodeInfo, nsAtom* aName,
+                               mozilla::dom::NodeInfo** aResult);
+
+  static void GetEventArgNames(int32_t aNameSpaceID, nsAtom* aEventName,
+                               bool aIsForWindow, uint32_t* aArgCount,
+                               const char*** aArgNames);
+
+  static bool IsInPrivateBrowsing(nsILoadGroup* aLoadGroup);
+
+  static bool IsInSameAnonymousTree(const nsINode* aNode,
+                                    const nsINode* aOtherNode);
+
+  static bool IsInInteractiveHTMLContent(const Element* aElement,
+                                         const Element* aStop);
+
+  static nsIXPConnect* XPConnect() { return sXPConnect; }
+
+  static void LogSimpleConsoleError(
+      const nsAString& aErrorText, const nsACString& aCategory,
+      bool aFromPrivateWindow, bool aFromChromeContext,
+      uint32_t aErrorFlags = nsIScriptError::errorFlag);
+
+  static nsresult ReportToConsoleNonLocalized(
+      const nsAString& aErrorText, uint32_t aErrorFlags,
+      const nsACString& aCategory, const Document* aDocument,
+      const mozilla::SourceLocation& aLocation =
+          mozilla::JSCallingLocation::Get());
+
+  static nsresult ReportToConsoleByWindowID(
+      const nsAString& aErrorText, uint32_t aErrorFlags,
+      const nsACString& aCategory, uint64_t aInnerWindowID,
+      const mozilla::SourceLocation& aLocation =
+          mozilla::JSCallingLocation::Get());
+
+  static nsresult ReportToConsole(
+      uint32_t aErrorFlags, const nsACString& aCategory,
+      const Document* aDocument, PropertiesFile aFile, const char* aMessageName,
+      const nsTArray<nsString>& aParams = nsTArray<nsString>(),
+      const mozilla::SourceLocation& aLocation =
+          mozilla::JSCallingLocation::Get());
+
+  static void ReportDeprecation(nsIGlobalObject* aGlobal, const Document* aDoc,
+                                nsIURI* aURI,
+                                mozilla::dom::DeprecatedOperations aOperation,
+                                const mozilla::JSCallingLocation& aLocation);
+
+  static void ReportEmptyGetElementByIdArg(const Document* aDoc);
+
+  static void LogMessageToConsole(const char* aMsg);
+
+  static nsresult GetLocalizedString(PropertiesFile aFile, const char* aKey,
+                                     nsAString& aResult);
+
+  static nsresult GetMaybeLocalizedString(PropertiesFile aFile,
+                                          const char* aKey,
+                                          const Document* aDocument,
+                                          nsAString& aResult);
+
+  static uint32_t ParseSandboxAttributeToFlags(const nsAttrValue* aSandboxAttr);
+
+  static bool IsValidSandboxFlag(const nsAString& aFlag);
+
+  static void SandboxFlagsToString(uint32_t aFlags, nsAString& aString);
+
+  static bool PrefetchPreloadEnabled(nsIDocShell* aDocShell);
+
+  static bool ExtractExceptionValues(JSContext* aCx,
+                                     JS::Handle<JSObject*> aException,
+                                     nsACString& aFilename, uint32_t* aLineOut,
+                                     uint32_t* aColumnOut,
+                                     nsString& aMessageOut);
+
+  static void ExtractErrorValues(JSContext* aCx, JS::Handle<JS::Value> aValue,
+                                 nsACString& aSourceSpecOut, uint32_t* aLineOut,
+                                 uint32_t* aColumnOut, nsString& aMessageOut);
+
+  static nsresult CalculateBufferSizeForImage(
+      const uint32_t& aStride, const mozilla::gfx::IntSize& aImageSize,
+      const mozilla::gfx::SurfaceFormat& aFormat, size_t* aMaxBufferSize,
+      size_t* aUsedBufferSize);
+
+  static bool IsURIInList(nsIURI* aURI, const nsCString& aList);
+
+  static bool IsURIInPrefList(nsIURI* aURI, const char* aPrefName);
+
+  template <typename... T>
+  static nsresult FormatLocalizedString(nsAString& aResult,
+                                        PropertiesFile aFile, const char* aKey,
+                                        const T&... aParams) {
+    static_assert(sizeof...(aParams) != 0, "Use GetLocalizedString()");
+    AutoTArray<nsString, sizeof...(aParams)> params = {
+        aParams...,
+    };
+    return FormatLocalizedString(aFile, aKey, params, aResult);
+  }
+
+  template <typename... T>
+  static nsresult FormatMaybeLocalizedString(nsAString& aResult,
+                                             PropertiesFile aFile,
+                                             const char* aKey,
+                                             Document* aDocument,
+                                             const T&... aParams) {
+    static_assert(sizeof...(aParams) != 0, "Use GetMaybeLocalizedString()");
+    AutoTArray<nsString, sizeof...(aParams)> params = {
+        aParams...,
+    };
+    return FormatMaybeLocalizedString(aFile, aKey, aDocument, params, aResult);
+  }
+
+  static nsresult FormatLocalizedString(PropertiesFile aFile, const char* aKey,
+                                        const nsTArray<nsString>& aParamArray,
+                                        nsAString& aResult);
+
+  static nsresult FormatMaybeLocalizedString(
+      PropertiesFile aFile, const char* aKey, Document* aDocument,
+      const nsTArray<nsString>& aParamArray, nsAString& aResult);
+
+  static bool IsChromeDoc(const Document* aDocument);
+
+
+  static bool IsChildOfSameType(Document* aDoc);
+
+  static bool IsPlainTextType(const nsACString& aContentType);
+
+  static bool IsUtf8OnlyPlainTextType(const nsACString& aContentType);
+
+  static bool IsInChromeDocshell(const Document* aDocument);
+
+  static nsIContentPolicy* GetContentPolicy();
+
+  static inline ExtContentPolicyType InternalContentPolicyTypeToExternal(
+      nsContentPolicyType aType);
+
+  static bool LinkContextIsURI(const nsAString& aAnchor, nsIURI* aDocURI);
+
+  static bool IsPreloadType(nsContentPolicyType aType);
+
+  static bool IsImageType(ExtContentPolicy aType);
+
+  MOZ_CAN_RUN_SCRIPT static void NotifyDevToolsOfNodeRemoval(
+      nsINode& aRemovingNode);
+
+  [[nodiscard]] static nsIContent* GetEventTargetContent(
+      nsIContent* aExplicitEventTargetContent,
+      const mozilla::WidgetEvent* aEvent);
+
+  static nsresult DispatchTrustedEvent(
+      Document* aDoc, mozilla::dom::EventTarget* aTarget,
+      const nsAString& aEventName, CanBubble, Cancelable,
+      Composed aComposed = Composed::eDefault, bool* aDefaultAction = nullptr,
+      SystemGroupOnly aSystemGroupOnly = SystemGroupOnly::eNo);
+
+  static nsresult DispatchTrustedEvent(
+      Document* aDoc, mozilla::dom::EventTarget* aTarget,
+      const nsAString& aEventName, CanBubble aCanBubble, Cancelable aCancelable,
+      bool* aDefaultAction,
+      SystemGroupOnly aSystemGroupOnly = SystemGroupOnly::eNo) {
+    return DispatchTrustedEvent(aDoc, aTarget, aEventName, aCanBubble,
+                                aCancelable, Composed::eDefault, aDefaultAction,
+                                aSystemGroupOnly);
+  }
+
+  template <class WidgetEventType>
+  static nsresult DispatchTrustedEvent(
+      Document* aDoc, mozilla::dom::EventTarget* aTarget,
+      EventMessage aEventMessage, CanBubble aCanBubble, Cancelable aCancelable,
+      bool* aDefaultAction = nullptr,
+      ChromeOnlyDispatch aOnlyChromeDispatch = ChromeOnlyDispatch::eNo) {
+    WidgetEventType event(true, aEventMessage);
+    MOZ_ASSERT(GetEventClassIDFromMessage(aEventMessage) == event.mClass);
+    return DispatchEvent(aDoc, aTarget, event, aEventMessage, aCanBubble,
+                         aCancelable, Trusted::eYes, aDefaultAction,
+                         aOnlyChromeDispatch);
+  }
+
+  MOZ_CAN_RUN_SCRIPT static nsresult DispatchInputEvent(Element* aEventTarget);
+  MOZ_CAN_RUN_SCRIPT static nsresult DispatchInputEvent(
+      Element* aEventTarget, mozilla::EventMessage aEventMessage,
+      mozilla::EditorInputType aEditorInputType,
+      mozilla::EditorBase* aEditorBase, mozilla::InputEventOptions&& aOptions,
+      nsEventStatus* aEventStatus = nullptr);
+
+  static nsresult DispatchUntrustedEvent(Document* aDoc,
+                                         mozilla::dom::EventTarget* aTarget,
+                                         const nsAString& aEventName, CanBubble,
+                                         Cancelable,
+                                         bool* aDefaultAction = nullptr);
+
+  template <class WidgetEventType>
+  static nsresult DispatchUntrustedEvent(
+      Document* aDoc, mozilla::dom::EventTarget* aTarget,
+      EventMessage aEventMessage, CanBubble aCanBubble, Cancelable aCancelable,
+      bool* aDefaultAction = nullptr,
+      ChromeOnlyDispatch aOnlyChromeDispatch = ChromeOnlyDispatch::eNo) {
+    WidgetEventType event(false, aEventMessage);
+    MOZ_ASSERT(GetEventClassIDFromMessage(aEventMessage) == event.mClass);
+    return DispatchEvent(aDoc, aTarget, event, aEventMessage, aCanBubble,
+                         aCancelable, Trusted::eNo, aDefaultAction,
+                         aOnlyChromeDispatch);
+  }
+
+  static nsresult DispatchChromeEvent(Document* aDoc,
+                                      mozilla::dom::EventTarget* aTarget,
+                                      const nsAString& aEventName, CanBubble,
+                                      Cancelable,
+                                      bool* aDefaultAction = nullptr);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY static void RequestFrameFocus(
+      Element& aFrameElement, bool aCanRaise,
+      mozilla::dom::CallerType aCallerType);
+
+  static nsresult DispatchEventOnlyToChrome(
+      Document* aDoc, mozilla::dom::EventTarget* aTarget,
+      const nsAString& aEventName, CanBubble, Cancelable,
+      Composed aComposed = Composed::eDefault, bool* aDefaultAction = nullptr);
+
+  static nsresult DispatchEventOnlyToChrome(Document* aDoc,
+                                            mozilla::dom::EventTarget* aTarget,
+                                            const nsAString& aEventName,
+                                            CanBubble aCanBubble,
+                                            Cancelable aCancelable,
+                                            bool* aDefaultAction) {
+    return DispatchEventOnlyToChrome(aDoc, aTarget, aEventName, aCanBubble,
+                                     aCancelable, Composed::eDefault,
+                                     aDefaultAction);
+  }
+
+  static bool IsEventAttributeName(nsAtom* aName, int32_t aType);
+
+  static EventMessage GetEventMessage(nsAtom* aName);
+
+  static void ForEachEventAttributeName(
+      int32_t aType, const mozilla::FunctionRef<void(nsAtom*)> aFunc);
+
+  static nsAtom* GetEventTypeFromMessage(EventMessage aEventMessage);
+
+  static already_AddRefed<nsAtom> GetEventType(
+      const mozilla::WidgetEvent* aEvent);
+
+  static EventMessage GetEventMessageAndAtomForListener(const nsAString& aName,
+                                                        nsAtom** aOnName);
+
+  static mozilla::EventClassID GetEventClassID(const nsAString& aName);
+
+  static nsAtom* GetEventMessageAndAtom(const nsAString& aName,
+                                        mozilla::EventClassID aEventClassID,
+                                        EventMessage* aEventMessage);
+
+  static void TraverseListenerManager(nsINode* aNode,
+                                      nsCycleCollectionTraversalCallback& cb);
+
+  static mozilla::EventListenerManager* GetListenerManagerForNode(
+      nsINode* aNode);
+  static mozilla::EventListenerManager* GetExistingListenerManagerForNode(
+      const nsINode* aNode);
+
+  static void AddEntryToDOMArenaTable(nsINode* aNode,
+                                      mozilla::dom::DOMArena* aDOMArena);
+
+  static mozilla::dom::DOMArena* GetEntryFromDOMArenaTable(
+      const nsINode* aNode);
+
+  static already_AddRefed<mozilla::dom::DOMArena> TakeEntryFromDOMArenaTable(
+      const nsINode* aNode);
+
+  static void UnmarkGrayJSListenersInCCGenerationDocuments();
+
+  static void RemoveListenerManager(nsINode* aNode);
+
+  static bool IsInitialized() { return sInitialized; }
+
+  static bool IsValidNodeName(nsAtom* aLocalName, nsAtom* aPrefix,
+                              int32_t aNamespaceID);
+
+  static already_AddRefed<mozilla::dom::DocumentFragment>
+  CreateContextualFragment(nsINode* aContextNode, const nsAString& aFragment,
+                           bool aPreventScriptExecution,
+                           mozilla::ErrorResult& aRv);
+
+  static void SetHTML(mozilla::dom::FragmentOrElement* aTarget,
+                      Element* aContext, const nsAString& aHTML,
+                      const mozilla::dom::SetHTMLOptions& aOptions,
+                      mozilla::ErrorResult& aError);
+
+  MOZ_CAN_RUN_SCRIPT
+  static void SetHTMLUnsafe(mozilla::dom::FragmentOrElement* aTarget,
+                            Element* aContext,
+                            const mozilla::dom::TrustedHTMLOrString& aSource,
+                            const mozilla::dom::SetHTMLUnsafeOptions& aOptions,
+                            bool aIsShadowRoot, nsIPrincipal* aSubjectPrincipal,
+                            mozilla::ErrorResult& aError);
+
+  static const int32_t kParseFragmentPrivilegedDefaultSanitization = -1;
+  static const int32_t kParseFragmentNoSanitization = -2;
+
+  static nsresult ParseFragmentHTML(
+      const nsAString& aSourceBuffer, nsIContent* aTargetNode,
+      nsAtom* aContextLocalName, int32_t aContextNamespace, bool aQuirks,
+      bool aPreventScriptExecution,
+      int32_t aFlags = kParseFragmentPrivilegedDefaultSanitization);
+
+  static nsresult ParseFragmentXML(const nsAString& aSourceBuffer,
+                                   Document* aDocument,
+                                   nsTArray<nsString>& aTagStack,
+                                   bool aPreventScriptExecution, int32_t aFlags,
+                                   mozilla::dom::DocumentFragment** aReturn);
+
+  static nsresult ParseDocumentHTML(const nsAString& aSourceBuffer,
+                                    Document* aTargetDocument,
+                                    bool aScriptingEnabledForNoscriptParsing);
+
+  static nsresult ConvertToPlainText(const nsAString& aSourceBuffer,
+                                     nsAString& aResultBuffer, uint32_t aFlags,
+                                     uint32_t aWrapCol);
+
+  static already_AddRefed<Document> CreateInertHTMLDocument(
+      const Document* aTemplate);
+
+  static already_AddRefed<Document> CreateInertXMLDocument(
+      const Document* aTemplate);
+
+ public:
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY static nsresult SetNodeTextContent(
+      nsIContent* aContent, const nsAString& aValue, bool aTryReuse,
+      MutationEffectOnScript aMutationEffectOnScript =
+          MutationEffectOnScript::DropTrustWorthiness);
+
+  [[nodiscard]] static bool GetNodeTextContent(const nsINode* aNode, bool aDeep,
+                                               nsAString& aResult,
+                                               const mozilla::fallible_t&);
+
+  static void GetNodeTextContent(const nsINode* aNode, bool aDeep,
+                                 nsAString& aResult);
+
+  static bool AppendNodeTextContent(const nsINode* aNode, bool aDeep,
+                                    nsAString& aResult,
+                                    const mozilla::fallible_t&);
+
+  enum TextContentDiscoverMode : uint8_t {
+    eRecurseIntoChildren,
+    eDontRecurseIntoChildren
+  };
+
+  static bool HasNonEmptyTextContent(
+      nsINode* aNode,
+      TextContentDiscoverMode aDiscoverMode = eDontRecurseIntoChildren);
+
+  static void DestroyMatchString(void* aData);
+
+  MOZ_CAN_RUN_SCRIPT static void NotifyInstalledMenuKeyboardListener(
+      bool aInstalling);
+
+  static bool SchemeIs(nsIURI* aURI, const char* aScheme);
+
+  static bool IsExpandedPrincipal(nsIPrincipal* aPrincipal);
+
+  static bool IsSystemOrExpandedPrincipal(nsIPrincipal* aPrincipal);
+
+  static nsIPrincipal* GetSystemPrincipal();
+
+  static nsIPrincipal* GetNullSubjectPrincipal() {
+    return sNullSubjectPrincipal;
+  }
+
+  static nsIPrincipal* GetFingerprintingProtectionPrincipal() {
+    return sFingerprintingProtectionPrincipal;
+  }
+
+  static bool CombineResourcePrincipals(
+      nsCOMPtr<nsIPrincipal>* aResourcePrincipal,
+      nsIPrincipal* aExtraPrincipal);
+
+  MOZ_CAN_RUN_SCRIPT
+  static void TriggerLinkClick(
+      nsIContent* aContent, nsIURI* aLinkURI, const nsString& aTargetSpec,
+      mozilla::dom::UserNavigationInvolvement aUserInvolvement);
+
+  static void TriggerLinkMouseOver(nsIContent* aContent, nsIURI* aLinkURI,
+                                   const nsString& aTargetSpec);
+
+  static void GetLinkLocation(mozilla::dom::Element* aElement,
+                              nsString& aLocationString);
+
+  static nsIWidget* GetTopLevelWidget(nsIWidget* aWidget);
+
+  static const nsDependentString GetLocalizedEllipsis();
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY static void HidePopupsInDocument(
+      Document* aDocument);
+
+  static already_AddRefed<nsIDragSession> GetDragSession(nsIWidget* aWidget);
+
+  static already_AddRefed<nsIDragSession> GetDragSession(nsPresContext* aPC);
+
+  static nsresult SetDataTransferInEvent(mozilla::WidgetDragEvent* aDragEvent);
+
+  static uint32_t FilterDropEffect(uint32_t aAction, uint32_t aEffectAllowed);
+
+  static bool CheckForSubFrameDrop(nsIDragSession* aDragSession,
+                                   mozilla::WidgetDragEvent* aDropEvent);
+
+  static bool URIIsLocalFile(nsIURI* aURI);
+
+  static void GetOfflineAppManifest(Document* aDocument, nsIURI** aURI);
+
+  static bool OfflineAppAllowed(nsIURI* aURI);
+
+  static bool OfflineAppAllowed(nsIPrincipal* aPrincipal);
+
+  static void AddScriptBlocker();
+
+  static void RemoveScriptBlocker();
+
+  static void AddScriptRunner(already_AddRefed<nsIRunnable> aRunnable);
+  static void AddScriptRunner(nsIRunnable* aRunnable);
+
+  static bool IsSafeToRunScript();
+
+  static already_AddRefed<nsPIDOMWindowOuter> GetMostRecentNonPBWindow();
+
+  static already_AddRefed<nsPIDOMWindowOuter> GetMostRecentWindowBy(
+      WindowMediatorFilter aFilter);
+
+  static void WarnScriptWasIgnored(Document* aDocument);
+
+  static void RunInStableState(already_AddRefed<nsIRunnable> aRunnable);
+
+  static void AddPendingIDBTransaction(
+      already_AddRefed<nsIRunnable> aTransaction);
+
+  static bool IsInStableOrMetaStableState();
+
+  static JSContext* GetCurrentJSContext();
+
+  static bool EqualsIgnoreASCIICase(nsAtom* aAtom1, nsAtom* aAtom2);
+
+  static bool EqualsIgnoreASCIICase(const nsAString& aStr1,
+                                    const nsAString& aStr2);
+
+  static void ASCIIToLower(nsAString& aStr);
+  static void ASCIIToLower(nsACString& aStr);
+  static void ASCIIToLower(const nsAString& aSource, nsAString& aDest);
+  static void ASCIIToLower(const nsACString& aSource, nsACString& aDest);
+
+  static void ASCIIToUpper(nsAString& aStr);
+  static void ASCIIToUpper(nsACString& aStr);
+  static void ASCIIToUpper(const nsAString& aSource, nsAString& aDest);
+  static void ASCIIToUpper(const nsACString& aSource, nsACString& aDest);
+
+  static bool StringContainsASCIIUpper(const nsAString& aStr);
+
+  static nsresult CheckSameOrigin(nsIChannel* aOldChannel,
+                                  nsIChannel* aNewChannel);
+  static nsIInterfaceRequestor* SameOriginChecker();
+
+  static nsresult GetWebExposedOriginSerialization(nsIURI* aURI,
+                                                   nsACString& aOrigin);
+  static nsresult GetWebExposedOriginSerialization(nsIPrincipal* aPrincipal,
+                                                   nsAString& aOrigin);
+  static nsresult GetWebExposedOriginSerialization(nsIURI* aURI,
+                                                   nsAString& aOrigin);
+
+  MOZ_CAN_RUN_SCRIPT
+  static nsresult DispatchXULCommand(
+      nsIContent* aTarget, bool aTrusted,
+      mozilla::dom::Event* aSourceEvent = nullptr,
+      mozilla::PresShell* aPresShell = nullptr, bool aCtrl = false,
+      bool aAlt = false, bool aShift = false, bool aMeta = false,
+      uint16_t inputSource = 0 ,
+      int16_t aButton = 0);
+
+  static bool CheckMayLoad(nsIPrincipal* aPrincipal, nsIChannel* aChannel,
+                           bool aAllowIfInheritsPrincipal);
+
+  static bool CanAccessNativeAnon();
+
+  [[nodiscard]] static nsresult WrapNative(JSContext* cx, nsISupports* native,
+                                           const nsIID* aIID,
+                                           JS::MutableHandle<JS::Value> vp,
+                                           bool aAllowWrapping = true) {
+    return WrapNative(cx, native, nullptr, aIID, vp, aAllowWrapping);
+  }
+
+  [[nodiscard]] static nsresult WrapNative(JSContext* cx, nsISupports* native,
+                                           JS::MutableHandle<JS::Value> vp,
+                                           bool aAllowWrapping = true) {
+    return WrapNative(cx, native, nullptr, nullptr, vp, aAllowWrapping);
+  }
+
+  [[nodiscard]] static nsresult WrapNative(JSContext* cx, nsISupports* native,
+                                           nsWrapperCache* cache,
+                                           JS::MutableHandle<JS::Value> vp,
+                                           bool aAllowWrapping = true) {
+    return WrapNative(cx, native, cache, nullptr, vp, aAllowWrapping);
+  }
+
+  static void StripNullChars(const nsAString& aInStr, nsAString& aOutStr);
+
+  static void RemoveNewlines(nsAString& aString);
+
+  static void PlatformToDOMLineBreaks(nsAString& aString);
+  [[nodiscard]] static bool PlatformToDOMLineBreaks(nsAString& aString,
+                                                    const mozilla::fallible_t&);
+
+  static bool IsHandlingKeyBoardEvent() { return sIsHandlingKeyBoardEvent; }
+
+  static void SetIsHandlingKeyBoardEvent(bool aHandling) {
+    sIsHandlingKeyBoardEvent = aHandling;
+  }
+
+  static already_AddRefed<mozilla::dom::ContentList> GetElementsByClassName(
+      nsINode* aRootNode, const nsAString& aClasses);
+
+  static mozilla::PresShell* FindPresShellForDocument(
+      const Document* aDocument);
+
+  static nsPresContext* FindPresContextForDocument(const Document* aDocument);
+
+  static nsIWidget* WidgetForDocument(const Document* aDocument);
+
+  static nsIWidget* WidgetForContent(const nsIContent* aContent);
+
+  static mozilla::WindowRenderer* WindowRendererForDocument(
+      const Document* aDoc);
+
+  static mozilla::WindowRenderer* WindowRendererForContent(
+      const nsIContent* aContent);
+
+  static bool IsCutCopyAllowed(Document* aDocument,
+                               nsIPrincipal& aSubjectPrincipal);
+
+  static bool BypassCSSOMOriginCheck() {
+#if defined(RELEASE_OR_BETA)
+    return false;
+#else
+    return sBypassCSSOMOriginCheck;
+#endif
+  }
+
+  static Document* GetInProcessSubtreeRootDocument(Document* aDoc) {
+    return const_cast<Document*>(
+        GetInProcessSubtreeRootDocument(const_cast<const Document*>(aDoc)));
+  }
+  static const Document* GetInProcessSubtreeRootDocument(const Document* aDoc);
+
+  static void GetShiftText(nsAString& text);
+  static void GetControlText(nsAString& text);
+  static void GetCommandOrWinText(nsAString& text);
+  static void GetAltText(nsAString& text);
+  static void GetModifierSeparatorText(nsAString& text);
+
+  static void FlushLayoutForTree(nsPIDOMWindowOuter* aWindow);
+
+  static bool AllowXULXBLForPrincipal(nsIPrincipal* aPrincipal);
+
+  static void XPCOMShutdown();
+
+  static bool IsPDFJSEnabled();
+
+  static bool IsPDFJS(nsIPrincipal* aPrincipal);
+  static bool IsSystemOrPDFJS(JSContext*, JSObject*);
+
+  static bool IsSecureContext(JSContext*, JSObject*);
+
+  enum DocumentViewerType { TYPE_UNSUPPORTED, TYPE_CONTENT, TYPE_UNKNOWN };
+
+  static already_AddRefed<nsIDocumentLoaderFactory> FindInternalDocumentViewer(
+      const nsACString& aType, DocumentViewerType* aLoaderType = nullptr);
+
+  static mozilla::Maybe<bool> IsPatternMatching(
+      const nsAString& aValue, nsString&& aPattern, const Document* aDocument,
+      bool aHasMultiple = false,
+      JS::RegExpFlags aFlags = JS::RegExpFlag::UnicodeSets);
+
+  static void InitializeTouchEventTable();
+
+  static nsresult URIInheritsSecurityContext(nsIURI* aURI, bool* aResult);
+
+  static bool ChannelShouldInheritPrincipal(nsIPrincipal* aLoadingPrincipal,
+                                            nsIURI* aURI,
+                                            bool aInheritForAboutBlank,
+                                            bool aForceInherit);
+
+  static nsresult Btoa(const nsAString& aBinaryData,
+                       nsAString& aAsciiBase64String);
+
+  static nsresult Atob(const nsAString& aAsciiString, nsAString& aBinaryData);
+
+  static bool IsAutocompleteEnabled(mozilla::dom::Element* aElement);
+
+  enum AutocompleteAttrState : uint8_t {
+    eAutocompleteAttrState_Unknown = 1,
+    eAutocompleteAttrState_Invalid,
+    eAutocompleteAttrState_Valid,
+  };
+  static AutocompleteAttrState SerializeAutocompleteAttribute(
+      const nsAttrValue* aAttr, nsAString& aResult,
+      AutocompleteAttrState aCachedState = eAutocompleteAttrState_Unknown);
+
+  static AutocompleteAttrState SerializeAutocompleteAttribute(
+      const nsAttrValue* aAttr, mozilla::dom::AutocompleteInfo& aInfo,
+      AutocompleteAttrState aCachedState = eAutocompleteAttrState_Unknown,
+      bool aGrantAllValidValue = false);
+
+  static bool GetPseudoAttributeValue(const nsString& aSource, nsAtom* aName,
+                                      nsAString& aValue);
+
+  static bool IsJavaScriptLanguage(const nsString& aName);
+
+  static bool IsJavascriptMIMEType(const nsAString& aMIMEType);
+  static bool IsJavascriptMIMEType(const nsACString& aMIMEType);
+
+  static bool IsJsonMimeType(const nsAString& aMimeType);
+
+  static bool HasCssMimeTypeEssence(const nsAString& aMimeType);
+
+  static bool HasWasmMimeTypeEssence(const nsAString& aMimeType);
+
+  static void SplitMimeType(const nsAString& aValue, nsString& aType,
+                            nsString& aParams);
+
+  static bool IsPointInSelection(const mozilla::dom::Selection& aSelection,
+                                 const nsINode& aNode, const uint32_t aOffset,
+                                 const bool aAllowCrossShadowBoundary = false);
+
+  static void GetSelectionInTextControl(mozilla::dom::Selection* aSelection,
+                                        Element* aRoot,
+                                        uint32_t& aOutStartOffset,
+                                        uint32_t& aOutEndOffset);
+
+  static mozilla::HTMLEditor* GetHTMLEditor(nsPresContext* aPresContext);
+  static mozilla::HTMLEditor* GetHTMLEditor(nsDocShell* aDocShell);
+
+  static mozilla::EditorBase* GetActiveEditor(nsPresContext* aPresContext);
+  static mozilla::EditorBase* GetActiveEditor(nsPIDOMWindowOuter* aWindow);
+
+  static mozilla::TextEditor* GetExtantTextEditorFromAnonymousNode(
+      const nsIContent* aAnonymousContent);
+
+  static bool IsNodeInEditableRegion(nsINode* aNode);
+
+  static mozilla::LogModule* ResistFingerprintingLog();
+
+  static mozilla::LogModule* DOMDumpLog();
+
+  static bool IsForbiddenRequestHeader(const nsACString& aHeader,
+                                       const nsACString& aValue);
+
+  static bool IsForbiddenSystemRequestHeader(const nsACString& aHeader);
+
+  static bool IsOverrideMethodHeader(const nsACString& headerName);
+  static bool ContainsForbiddenMethod(const nsACString& headerValue);
+
+  class ParsedRange {
+   public:
+    explicit ParsedRange(mozilla::Maybe<uint64_t> aStart,
+                         mozilla::Maybe<uint64_t> aEnd)
+        : mStart(aStart), mEnd(aEnd) {}
+
+    mozilla::Maybe<uint64_t> Start() const { return mStart; }
+    mozilla::Maybe<uint64_t> End() const { return mEnd; }
+
+    bool operator==(const ParsedRange& aOther) const {
+      return Start() == aOther.Start() && End() == aOther.End();
+    }
+
+   private:
+    mozilla::Maybe<uint64_t> mStart;
+    mozilla::Maybe<uint64_t> mEnd;
+  };
+
+  static mozilla::Maybe<ParsedRange> ParseSingleRangeRequest(
+      const nsACString& aHeaderValue, bool aAllowWhitespace);
+
+  static bool IsCorsUnsafeRequestHeaderValue(const nsACString& aHeaderValue);
+
+  static bool IsAllowedNonCorsAccept(const nsACString& aHeaderValue);
+
+  static bool IsAllowedNonCorsContentType(const nsACString& aHeaderValue);
+
+  static bool IsAllowedNonCorsLanguage(const nsACString& aHeaderValue);
+
+  static bool IsAllowedNonCorsRange(const nsACString& aHeaderValue);
+
+  static bool IsCORSSafelistedRequestHeader(const nsACString& aName,
+                                            const nsACString& aValue);
+
+  static bool IsForbiddenResponseHeader(const nsACString& aHeader);
+
+  static uint64_t GetInnerWindowID(nsIRequest* aRequest);
+
+  static uint64_t GetInnerWindowID(nsILoadGroup* aLoadGroup);
+
+  static void MaybeFixIPv6Host(nsACString& aHost);
+
+  static nsresult GetHostOrIPv6WithBrackets(nsIURI* aURI, nsAString& aHost);
+  static nsresult GetHostOrIPv6WithBrackets(nsIURI* aURI, nsACString& aHost);
+  static nsresult GetHostOrIPv6WithBrackets(nsIPrincipal* aPrincipal,
+                                            nsACString& aHost);
+
+  static nsresult GetAsciiHostOrIPv6WithBrackets(nsIURI* aURI,
+                                                 nsACString& aHost);
+
+  static void CallOnAllRemoteChildren(
+      nsPIDOMWindowOuter* aWindow,
+      const std::function<mozilla::CallState(mozilla::dom::BrowserParent*)>&
+          aCallback);
+
+  static bool IsFlavorImage(const nsACString& aFlavor);
+
+  static bool IPCTransferableDataItemHasKnownFlavor(
+      const mozilla::dom::IPCTransferableDataItem& aItem);
+
+  static nsresult IPCTransferableDataToTransferable(
+      const mozilla::dom::IPCTransferableData& aTransferableData,
+      bool aAddDataFlavor, nsITransferable* aTransferable,
+      const bool aFilterUnknownFlavors);
+
+  static nsresult IPCTransferableToTransferable(
+      const mozilla::dom::IPCTransferable& aIPCTransferable,
+      bool aAddDataFlavor, nsITransferable* aTransferable,
+      const bool aFilterUnknownFlavors);
+
+  static nsresult IPCTransferableDataItemToVariant(
+      const mozilla::dom::IPCTransferableDataItem& aItem,
+      nsIWritableVariant* aVariant);
+
+  static void TransferablesToIPCTransferableDatas(
+      nsIArray* aTransferables,
+      nsTArray<mozilla::dom::IPCTransferableData>& aIPC, bool aInSyncMessage,
+      mozilla::dom::ContentParent* aParent);
+
+  static void TransferableToIPCTransferableData(
+      nsITransferable* aTransferable,
+      mozilla::dom::IPCTransferableData* aTransferableData, bool aInSyncMessage,
+      mozilla::dom::ContentParent* aParent);
+
+  static void TransferableToIPCTransferable(
+      nsITransferable* aTransferable,
+      mozilla::dom::IPCTransferable* aIPCTransferable, bool aInSyncMessage,
+      mozilla::dom::ContentParent* aParent);
+
+  static mozilla::Maybe<mozilla::ipc::BigBuffer> GetSurfaceData(
+      mozilla::gfx::DataSourceSurface&, size_t* aLength, int32_t* aStride);
+
+  static mozilla::Maybe<mozilla::dom::IPCImage> SurfaceToIPCImage(
+      mozilla::gfx::DataSourceSurface&);
+  static already_AddRefed<mozilla::gfx::DataSourceSurface> IPCImageToSurface(
+      const mozilla::dom::IPCImage&);
+  static already_AddRefed<imgIContainer> IPCImageToImage(
+      const mozilla::dom::IPCImage&);
+
+  static mozilla::Modifiers GetWidgetModifiers(int32_t aModifiers);
+  static nsIWidget* GetWidget(mozilla::PresShell* aPresShell, nsPoint* aOffset);
+  static int16_t GetButtonsFlagForButton(int32_t aButton);
+  static mozilla::LayoutDeviceIntPoint ToWidgetPoint(
+      const mozilla::CSSPoint& aPoint, const nsPoint& aOffset,
+      nsPresContext* aPresContext);
+
+  MOZ_CAN_RUN_SCRIPT
+  static mozilla::Result<bool, nsresult> SynthesizeMouseEvent(
+      mozilla::PresShell* aPresShell, nsIWidget* aWidget,
+      const nsAString& aType, mozilla::LayoutDeviceIntPoint& aRefPoint,
+      const mozilla::dom::SynthesizeMouseEventData& aMouseEventData,
+      const mozilla::dom::SynthesizeMouseEventOptions& aOptions,
+      const mozilla::dom::Optional<
+          mozilla::OwningNonNull<mozilla::dom::VoidFunction>>& aCallback);
+
+  MOZ_CAN_RUN_SCRIPT
+  static mozilla::Result<bool, nsresult> SynthesizeTouchEvent(
+      nsPresContext* aPresContext, nsIWidget* aWidget,
+      const nsPoint& aWidgetOffset, const nsAString& aType,
+      const nsTArray<mozilla::dom::SynthesizeTouchEventData>& aTouches,
+      const int32_t aModifiers,
+      const mozilla::dom::SynthesizeTouchEventOptions& aOptions,
+      const mozilla::dom::Optional<
+          mozilla::OwningNonNull<mozilla::dom::VoidFunction>>& aCallback);
+
+  static void FirePageShowEventForFrameLoaderSwap(
+      nsIDocShellTreeItem* aItem,
+      mozilla::dom::EventTarget* aChromeEventHandler, bool aFireIfShowing,
+      bool aOnlySystemGroup = false);
+
+  static void FirePageHideEventForFrameLoaderSwap(
+      nsIDocShellTreeItem* aItem,
+      mozilla::dom::EventTarget* aChromeEventHandler,
+      bool aOnlySystemGroup = false);
+
+  static already_AddRefed<nsPIWindowRoot> GetWindowRoot(Document* aDoc);
+
+  static mozilla::dom::ReferrerPolicy GetReferrerPolicyFromChannel(
+      nsIChannel* aChannel);
+
+  static bool IsNonSubresourceRequest(nsIChannel* aChannel);
+
+  static bool IsNonSubresourceInternalPolicyType(nsContentPolicyType aType);
+
+ public:
+  static bool IsThirdPartyTrackingResourceWindow(nsPIDOMWindowInner* aWindow);
+
+  static bool IsFirstPartyTrackingResourceWindow(nsPIDOMWindowInner* aWindow);
+
+  template <SerializeShadowRoots ShouldSerializeShadowRoots =
+                SerializeShadowRoots::No>
+  static bool SerializeNodeToMarkup(
+      nsINode* aRoot, bool aDescendantsOnly, nsAString& aOut,
+      bool aSerializableShadowRoots,
+      const mozilla::dom::Sequence<
+          mozilla::OwningNonNull<mozilla::dom::ShadowRoot>>& aShadowRoots);
+
+  static bool IsSpecificAboutPage(JSObject* aGlobal, const char* aUri);
+
+  static void SetScrollbarsVisibility(nsIDocShell* aDocShell, bool aVisible);
+
+  static nsIDocShell* GetDocShellForEventTarget(
+      mozilla::dom::EventTarget* aTarget);
+
+  static bool HttpsStateIsModern(Document* aDocument);
+
+  static bool ComputeIsSecureContext(nsIChannel* aChannel);
+
+  static void TryToUpgradeElement(Element* aElement);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY static nsresult NewXULOrHTMLElement(
+      Element** aResult, mozilla::dom::NodeInfo* aNodeInfo,
+      mozilla::dom::FromParser aFromParser, nsAtom* aIsAtom,
+      mozilla::dom::CustomElementDefinition* aDefinition,
+      mozilla::Maybe<RefPtr<mozilla::dom::CustomElementRegistry>>
+          aCustomElementRegistry);
+
+  static mozilla::dom::CustomElementRegistry* GetCustomElementRegistry(
+      nsINode*);
+
+  static mozilla::dom::CustomElementDefinition* LookupCustomElementDefinition(
+      mozilla::dom::DocumentOrShadowRoot* aDoc, nsAtom* aNameAtom,
+      uint32_t aNameSpaceID, nsAtom* aTypeAtom);
+
+  static void RegisterCallbackUpgradeElement(Element* aElement,
+                                             nsAtom* aTypeName);
+
+  static void RegisterUnresolvedElement(Element* aElement, nsAtom* aTypeName);
+  static void UnregisterUnresolvedElement(Element* aElement);
+
+  static void EnqueueUpgradeReaction(
+      Element* aElement, mozilla::dom::CustomElementDefinition* aDefinition);
+
+  static void EnqueueLifecycleCallback(
+      mozilla::dom::ElementCallbackType aType, Element* aCustomElement,
+      const mozilla::dom::LifecycleCallbackArgs& aArgs,
+      mozilla::dom::CustomElementDefinition* aDefinition = nullptr);
+
+  static mozilla::dom::CustomElementFormValue ConvertToCustomElementFormValue(
+      const mozilla::dom::Nullable<
+          mozilla::dom::OwningFileOrUSVStringOrFormData>& aState);
+
+  static mozilla::dom::Nullable<mozilla::dom::OwningFileOrUSVStringOrFormData>
+  ExtractFormAssociatedCustomElementValue(
+      nsIGlobalObject* aGlobal,
+      const mozilla::dom::CustomElementFormValue& aCEValue);
+
+  static void AppendDocumentLevelNativeAnonymousContentTo(
+      Document* aDocument, nsTArray<nsIContent*>& aElements);
+
+  /**
+   * Appends all native anonymous content subtree roots generated by `aContent`
+   * to `aKids`.
+   *
+   * See `AllChildrenIterator` for the description of the `aFlags` parameter.
+   */
+  static void AppendNativeAnonymousChildren(const nsIContent* aContent,
+                                            nsTArray<nsIContent*>& aKids,
+                                            uint32_t aFlags);
+
+  static bool QueryTriggeringPrincipal(nsIContent* aLoadingNode,
+                                       nsIPrincipal* aDefaultPrincipal,
+                                       nsIPrincipal** aTriggeringPrincipal);
+
+  static bool QueryTriggeringPrincipal(nsIContent* aLoadingNode,
+                                       nsIPrincipal** aTriggeringPrincipal) {
+    return QueryTriggeringPrincipal(aLoadingNode, nullptr,
+                                    aTriggeringPrincipal);
+  }
+
+  static bool IsImageAvailable(nsIContent*, nsIURI*,
+                               nsIPrincipal* aDefaultTriggeringPrincipal,
+                               mozilla::CORSMode);
+  static bool IsImageAvailable(nsIURI*, nsIPrincipal* aTriggeringPrincipal,
+                               mozilla::CORSMode, Document*);
+
+  static void GetContentPolicyTypeForUIImageLoading(
+      nsIContent* aLoadingNode, nsIPrincipal** aTriggeringPrincipal,
+      nsContentPolicyType& aContentPolicyType, uint64_t* aRequestContextID);
+
+  static nsresult CreateJSValueFromSequenceOfObject(
+      JSContext* aCx, const mozilla::dom::Sequence<JSObject*>& aTransfer,
+      JS::MutableHandle<JS::Value> aValue);
+
+  static void StructuredClone(
+      JSContext* aCx, nsIGlobalObject* aGlobal, JS::Handle<JS::Value> aValue,
+      const mozilla::dom::StructuredSerializeOptions& aOptions,
+      JS::MutableHandle<JS::Value> aRetval, mozilla::ErrorResult& aError);
+
+  static bool ShouldBlockReservedKeys(mozilla::WidgetKeyboardEvent* aKeyEvent);
+
+  static uint32_t HtmlObjectContentTypeForMIMEType(const nsCString& aMIMEType,
+                                                   bool aIsSandboxed);
+
+  static bool IsLocalRefURL(const nsAString& aString);
+
+  static uint64_t GenerateTabId();
+
+  static uint64_t GenerateBrowserId();
+
+  static uint64_t GenerateBrowsingContextId();
+
+  static uint64_t GenerateProcessSpecificId(uint64_t aId);
+
+  /**
+   * Split an id generated by GenerateProcessSpecificId back into the process id
+   * and the serial number it was composed from, returned in that order.
+   */
+  static std::tuple<uint64_t, uint64_t> SplitProcessSpecificId(uint64_t aId);
+
+  static uint64_t GenerateWindowId();
+
+  static uint64_t GenerateLoadIdentifier();
+
+  static bool GetUserIsInteracting();
+
+  [[nodiscard]] static bool InitJSBytecodeMimeType();
+  static nsCString& JSScriptBytecodeMimeType() {
+    MOZ_ASSERT(sJSScriptBytecodeMimeType);
+    return *sJSScriptBytecodeMimeType;
+  }
+  static nsCString& JSModuleBytecodeMimeType() {
+    MOZ_ASSERT(sJSModuleBytecodeMimeType);
+    return *sJSModuleBytecodeMimeType;
+  }
+
+  static bool IsSpecialName(const nsAString& aName);
+
+  static bool IsOverridingWindowName(const nsAString& aName);
+
+  static bool GetSourceMapURL(nsIHttpChannel* aChannel, nsACString& aResult);
+
+  static bool IsMessageInputEvent(const IPC::Message& aMsg);
+
+  static bool IsMessageCriticalInputEvent(const IPC::Message& aMsg);
+
+  static void AsyncPrecreateStringBundles();
+
+  static bool ContentIsLink(nsIContent* aContent);
+
+  static already_AddRefed<mozilla::dom::ContentFrameMessageManager>
+  TryGetBrowserChildGlobal(nsISupports* aFrom);
+
+  static Document* TryGetDocumentFromWindowGlobal(nsISupports* aFrom);
+
+  static uint32_t InnerOrOuterWindowCreated();
+  static void InnerOrOuterWindowDestroyed();
+  static int32_t GetCurrentInnerOrOuterWindowCount() {
+    return sInnerOrOuterWindowCount;
+  }
+
+  static bool StringifyJSON(JSContext* aCx, JS::Handle<JS::Value> aValue,
+                            nsAString& aOutStr, JSONBehavior aBehavior);
+
+  static bool HighPriorityEventPendingForTopLevelDocumentBeforeContentfulPaint(
+      Document* aDocument);
+
+  static nsGlobalWindowInner* IncumbentInnerWindow();
+
+  static nsGlobalWindowInner* EntryInnerWindow();
+
+  static mozilla::LayoutDeviceIntMargin GetWindowSafeAreaInsets(
+      nsIScreen* aScreen, const mozilla::LayoutDeviceIntMargin& aSafeareaInsets,
+      const mozilla::LayoutDeviceIntRect& aWindowRect);
+
+  struct SubresourceCacheValidationInfo {
+    mozilla::Maybe<CacheExpirationTime> mExpirationTime;
+    bool mMustRevalidate = false;
+  };
+
+  static SubresourceCacheValidationInfo GetSubresourceCacheValidationInfo(
+      nsIRequest*, nsIURI*);
+
+  static CacheExpirationTime GetSubresourceCacheExpirationTime(nsIRequest*,
+                                                               nsIURI*);
+
+  static bool ShouldBypassSubResourceCache(Document* aDoc);
+
+  static uint32_t SecondsFromPRTime(PRTime aTime) {
+    return uint32_t(int64_t(aTime) / int64_t(PR_USEC_PER_SEC));
+  }
+
+  static nsCString TruncatedURLForDisplay(nsIURI* aURL, size_t aMaxLen = 128);
+
+  enum class OriginFormat {
+    Base64,
+    Plain,
+  };
+
+  static nsresult AnonymizeId(nsAString& aId, const nsACString& aOriginKey,
+                              OriginFormat aFormat = OriginFormat::Base64);
+
+  static nsresult EnsureAndLoadStringBundle(PropertiesFile aFile);
+
+  static void RequestGeckoTaskBurst();
+
+  static nsIContent* GetClosestLinkInFlatTree(nsIContent* aContent);
+
+  static bool IsExternalProtocol(nsIURI* aURI);
+
+  template <TreeKind aKind>
+  static int32_t CompareTreePosition(const nsINode* aNode1,
+                                     const nsINode* aNode2,
+                                     const nsINode* aCommonAncestor,
+                                     NodeIndexCache* = nullptr);
+
+  template <TreeKind>
+  static mozilla::Maybe<int32_t> GetIndexInParent(
+      const nsINode* aParent, const nsIContent* aPossibleChild);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  static nsIContent* AttachDeclarativeShadowRoot(
+      nsIContent* aHost, mozilla::dom::ShadowRootMode aMode, bool aIsClonable,
+      bool aIsSerializable, bool aDelegatesFocus, bool aCustomElementRegistry,
+      mozilla::dom::SlotAssignmentMode aSlotAssignment,
+      const nsAString& aReferenceTarget);
+
+  static bool NavigationMustBeAReplace(nsIURI& aURI, const Document& aDocument);
+
+ private:
+  static bool InitializeEventTable();
+
+  static nsresult EnsureStringBundle(PropertiesFile aFile);
+
+  static bool CanCallerAccess(nsIPrincipal* aSubjectPrincipal,
+                              nsIPrincipal* aPrincipal);
+
+  static nsresult WrapNative(JSContext* cx, nsISupports* native,
+                             nsWrapperCache* cache, const nsIID* aIID,
+                             JS::MutableHandle<JS::Value> vp,
+                             bool aAllowWrapping);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY static nsresult DispatchEvent(
+      Document* aDoc, mozilla::dom::EventTarget* aTarget,
+      const nsAString& aEventName, CanBubble, Cancelable, Composed, Trusted,
+      bool* aDefaultAction = nullptr,
+      ChromeOnlyDispatch = ChromeOnlyDispatch::eNo,
+      SystemGroupOnly = SystemGroupOnly::eNo);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY static nsresult DispatchEvent(
+      Document* aDoc, mozilla::dom::EventTarget* aTarget,
+      mozilla::WidgetEvent& aWidgetEvent, EventMessage aEventMessage, CanBubble,
+      Cancelable, Trusted, bool* aDefaultAction = nullptr,
+      ChromeOnlyDispatch = ChromeOnlyDispatch::eNo);
+
+  static void InitializeModifierStrings();
+
+  static void DropFragmentParsers();
+
+  static bool MatchClassNames(mozilla::dom::Element* aElement,
+                              int32_t aNamespaceID, nsAtom* aAtom, void* aData);
+  static void DestroyClassNameArray(void* aData);
+  static void* AllocClassMatchingInfo(nsINode* aRootNode,
+                                      const nsString* aClasses);
+
+  static mozilla::EventClassID GetEventClassIDFromMessage(
+      EventMessage aEventMessage);
+
+  static AutocompleteAttrState InternalSerializeAutocompleteAttribute(
+      const nsAttrValue* aAttrVal, mozilla::dom::AutocompleteInfo& aInfo,
+      bool aGrantAllValidValue = false);
+
+  static mozilla::CallState CallOnAllRemoteChildren(
+      mozilla::dom::MessageBroadcaster* aManager,
+      const std::function<mozilla::CallState(mozilla::dom::BrowserParent*)>&
+          aCallback);
+
+  static nsINode* GetCommonAncestorHelper(nsINode* aNode1, nsINode* aNode2);
+  static nsIContent* GetCommonFlattenedTreeAncestorHelper(
+      nsIContent* aContent1, nsIContent* aContent2);
+
+  template <TreeKind aKind,
+            typename = std::enable_if_t<aKind != TreeKind::ShadowIncludingDOM>>
+  static mozilla::Maybe<int32_t> CompareChildNodes(
+      const nsINode& aParent, const nsIContent* aChild1,
+      const nsIContent* aChild2, NodeIndexCache* aIndexCache = nullptr);
+
+  template <TreeKind aKind,
+            typename = std::enable_if_t<aKind != TreeKind::ShadowIncludingDOM>>
+  static mozilla::Maybe<int32_t> CompareChildOffsetAndChildNode(
+      const nsINode& aParent, uint32_t aOffset1, const nsIContent& aChild2,
+      NodeIndexCache* aIndexCache = nullptr);
+
+  template <TreeKind aKind,
+            typename = std::enable_if_t<aKind != TreeKind::ShadowIncludingDOM>>
+  static mozilla::Maybe<int32_t> CompareChildNodeAndChildOffset(
+      const nsINode& aParent, const nsIContent& aChild1, uint32_t aOffset2,
+      NodeIndexCache* aIndexCache = nullptr);
+
+  template <TreeKind aKind>
+  static mozilla::Maybe<int32_t> ComparePointsWithIndices(
+      const nsINode* aParent1, uint32_t aOffset1, const nsINode* aParent2,
+      uint32_t aOffset2, NodeIndexCache* aIndexCache = nullptr);
+
+  template <TreeKind aKind,
+            typename = std::enable_if_t<aKind != TreeKind::ShadowIncludingDOM>>
+  static mozilla::Maybe<int32_t> CompareClosestCommonAncestorChildren(
+      const nsINode&, const nsIContent*, const nsIContent*,
+      NodeIndexCache* = nullptr);
+
+  static nsIXPConnect* sXPConnect;
+
+  static nsIScriptSecurityManager* sSecurityManager;
+  static nsIPrincipal* sSystemPrincipal;
+  static nsIPrincipal* sNullSubjectPrincipal;
+  static nsIPrincipal* sFingerprintingProtectionPrincipal;
+
+  static nsIConsoleService* sConsoleService;
+
+  static nsIStringBundleService* sStringBundleService;
+  class nsContentUtilsReporter;
+
+  static nsIContentPolicy* sContentPolicyService;
+  static bool sTriedToGetContentPolicy;
+
+  static mozilla::StaticRefPtr<nsIBidiKeyboard> sBidiKeyboard;
+
+  static bool sInitialized;
+  static uint32_t sScriptBlockerCount;
+  static uint32_t sDOMNodeRemovedSuppressCount;
+
+  static AutoTArray<nsCOMPtr<nsIRunnable>, 8>* sBlockedScriptRunners;
+  static uint32_t sRunnersCountAtFirstBlocker;
+  static uint32_t sScriptBlockerCountWhereRunnersPrevented;
+
+  static nsIInterfaceRequestor* sSameOriginChecker;
+
+  static bool sIsHandlingKeyBoardEvent;
+#if !defined(RELEASE_OR_BETA)
+  static bool sBypassCSSOMOriginCheck;
+#endif
+
+  class UserInteractionObserver;
+  static UserInteractionObserver* sUserInteractionObserver;
+
+  static nsHtml5StringParser* sHTMLFragmentParser;
+  static nsParser* sXMLFragmentParser;
+  static nsIFragmentContentSink* sXMLFragmentSink;
+
+  static bool sFragmentParsingActive;
+
+  static nsString* sShiftText;
+  static nsString* sControlText;
+  static nsString* sCommandOrWinText;
+  static nsString* sAltText;
+  static nsString* sModifierSeparator;
+
+  static nsCString* sJSScriptBytecodeMimeType;
+  static nsCString* sJSModuleBytecodeMimeType;
+
+  static mozilla::LazyLogModule gResistFingerprintingLog;
+  static mozilla::LazyLogModule sDOMDumpLog;
+
+  static int32_t sInnerOrOuterWindowCount;
+  static uint32_t sInnerOrOuterWindowSerialCounter;
+};
+
+ inline ExtContentPolicyType
+nsContentUtils::InternalContentPolicyTypeToExternal(nsContentPolicyType aType) {
+  switch (aType) {
+    case nsIContentPolicy::TYPE_INTERNAL_SCRIPT:
+    case nsIContentPolicy::TYPE_INTERNAL_SCRIPT_PRELOAD:
+    case nsIContentPolicy::TYPE_INTERNAL_MODULE:
+    case nsIContentPolicy::TYPE_INTERNAL_MODULE_PRELOAD:
+    case nsIContentPolicy::TYPE_INTERNAL_WORKER:
+    case nsIContentPolicy::TYPE_INTERNAL_SHARED_WORKER:
+    case nsIContentPolicy::TYPE_INTERNAL_SERVICE_WORKER:
+    case nsIContentPolicy::TYPE_INTERNAL_WORKER_IMPORT_SCRIPTS:
+    case nsIContentPolicy::TYPE_INTERNAL_WORKER_STATIC_MODULE:
+    case nsIContentPolicy::TYPE_INTERNAL_AUDIOWORKLET:
+    case nsIContentPolicy::TYPE_INTERNAL_PAINTWORKLET:
+    case nsIContentPolicy::TYPE_INTERNAL_CHROMEUTILS_COMPILED_SCRIPT:
+    case nsIContentPolicy::TYPE_INTERNAL_FRAME_MESSAGEMANAGER_SCRIPT:
+      return ExtContentPolicy::TYPE_SCRIPT;
+
+    case nsIContentPolicy::TYPE_INTERNAL_EMBED:
+    case nsIContentPolicy::TYPE_INTERNAL_OBJECT:
+      return ExtContentPolicy::TYPE_OBJECT;
+
+    case nsIContentPolicy::TYPE_INTERNAL_FRAME:
+    case nsIContentPolicy::TYPE_INTERNAL_IFRAME:
+      return ExtContentPolicy::TYPE_SUBDOCUMENT;
+
+    case nsIContentPolicy::TYPE_INTERNAL_AUDIO:
+    case nsIContentPolicy::TYPE_INTERNAL_VIDEO:
+    case nsIContentPolicy::TYPE_INTERNAL_TRACK:
+      return ExtContentPolicy::TYPE_MEDIA;
+
+    case nsIContentPolicy::TYPE_INTERNAL_XMLHTTPREQUEST_ASYNC:
+    case nsIContentPolicy::TYPE_INTERNAL_XMLHTTPREQUEST_SYNC:
+    case nsIContentPolicy::TYPE_INTERNAL_EVENTSOURCE:
+      return ExtContentPolicy::TYPE_XMLHTTPREQUEST;
+
+    case nsIContentPolicy::TYPE_INTERNAL_IMAGE:
+    case nsIContentPolicy::TYPE_INTERNAL_IMAGE_PRELOAD:
+    case nsIContentPolicy::TYPE_INTERNAL_IMAGE_FAVICON:
+    case nsIContentPolicy::TYPE_INTERNAL_IMAGE_NOTIFICATION:
+      return ExtContentPolicy::TYPE_IMAGE;
+
+    case nsIContentPolicy::TYPE_INTERNAL_STYLESHEET:
+    case nsIContentPolicy::TYPE_INTERNAL_STYLESHEET_PRELOAD:
+      return ExtContentPolicy::TYPE_STYLESHEET;
+
+    case nsIContentPolicy::TYPE_INTERNAL_DTD:
+    case nsIContentPolicy::TYPE_INTERNAL_FORCE_ALLOWED_DTD:
+      return ExtContentPolicy::TYPE_DTD;
+
+    case nsIContentPolicy::TYPE_INTERNAL_FONT_PRELOAD:
+      return ExtContentPolicy::TYPE_FONT;
+
+    case nsIContentPolicy::TYPE_INTERNAL_FETCH_PRELOAD:
+      return ExtContentPolicy::TYPE_FETCH;
+
+    case nsIContentPolicy::TYPE_INTERNAL_EXTERNAL_RESOURCE:
+      return ExtContentPolicy::TYPE_OTHER;
+
+    case nsIContentPolicy::TYPE_INTERNAL_JSON_PRELOAD:
+      return ExtContentPolicy::TYPE_JSON;
+
+    case nsIContentPolicy::TYPE_INTERNAL_TEXT_PRELOAD:
+      return ExtContentPolicy::TYPE_TEXT;
+
+    case nsIContentPolicy::TYPE_INVALID:
+    case nsIContentPolicy::TYPE_OTHER:
+    case nsIContentPolicy::TYPE_SCRIPT:
+    case nsIContentPolicy::TYPE_IMAGE:
+    case nsIContentPolicy::TYPE_STYLESHEET:
+    case nsIContentPolicy::TYPE_OBJECT:
+    case nsIContentPolicy::TYPE_DOCUMENT:
+    case nsIContentPolicy::TYPE_SUBDOCUMENT:
+    case nsIContentPolicy::TYPE_PING:
+    case nsIContentPolicy::TYPE_XMLHTTPREQUEST:
+    case nsIContentPolicy::TYPE_DTD:
+    case nsIContentPolicy::TYPE_FONT:
+    case nsIContentPolicy::TYPE_MEDIA:
+    case nsIContentPolicy::TYPE_WEBSOCKET:
+    case nsIContentPolicy::TYPE_CSP_REPORT:
+    case nsIContentPolicy::TYPE_XSLT:
+    case nsIContentPolicy::TYPE_BEACON:
+    case nsIContentPolicy::TYPE_FETCH:
+    case nsIContentPolicy::TYPE_IMAGESET:
+    case nsIContentPolicy::TYPE_WEB_MANIFEST:
+    case nsIContentPolicy::TYPE_SAVEAS_DOWNLOAD:
+    case nsIContentPolicy::TYPE_SPECULATIVE:
+    case nsIContentPolicy::TYPE_UA_FONT:
+    case nsIContentPolicy::TYPE_PROXIED_WEBRTC_MEDIA:
+    case nsIContentPolicy::TYPE_WEB_IDENTITY:
+    case nsIContentPolicy::TYPE_WEB_TRANSPORT:
+    case nsIContentPolicy::TYPE_JSON:
+    case nsIContentPolicy::TYPE_TEXT:
+      return static_cast<ExtContentPolicyType>(aType);
+
+  }
+
+  MOZ_ASSERT(false, "Unhandled nsContentPolicyType value");
+  return ExtContentPolicy::TYPE_INVALID;
+}
+
+class MOZ_RAII nsAutoScriptBlocker {
+ public:
+  explicit nsAutoScriptBlocker() { nsContentUtils::AddScriptBlocker(); }
+  ~nsAutoScriptBlocker() { nsContentUtils::RemoveScriptBlocker(); }
+
+ private:
+};
+
+class MOZ_STACK_CLASS nsAutoScriptBlockerSuppressNodeRemoved
+    : public nsAutoScriptBlocker {
+ public:
+  nsAutoScriptBlockerSuppressNodeRemoved() {
+    ++nsContentUtils::sDOMNodeRemovedSuppressCount;
+  }
+  ~nsAutoScriptBlockerSuppressNodeRemoved() {
+    --nsContentUtils::sDOMNodeRemovedSuppressCount;
+  }
+};
+
+namespace mozilla::dom {
+
+class TreeOrderComparator {
+ public:
+  bool Equals(nsINode* aElem1, nsINode* aElem2) const {
+    return aElem1 == aElem2;
+  }
+  bool LessThan(nsINode* aElem1, nsINode* aElem2) const {
+    return nsContentUtils::PositionIsBefore(aElem1, aElem2);
+  }
+};
+
+}  
+
+#define NS_INTERFACE_MAP_ENTRY_TEAROFF(_interface, _allocator) \
+  NS_INTERFACE_MAP_ENTRY_TEAROFF_AMBIGUOUS(_interface, _interface, _allocator)
+
+#define NS_INTERFACE_MAP_ENTRY_TEAROFF_AMBIGUOUS(_interface, _implClass, \
+                                                 _allocator)             \
+  if (aIID.Equals(NS_GET_IID(_interface))) {                             \
+    foundInterface = static_cast<_implClass*>(_allocator);               \
+    if (!foundInterface) {                                               \
+      *aInstancePtr = nullptr;                                           \
+      return NS_ERROR_OUT_OF_MEMORY;                                     \
+    }                                                                    \
+  } else
+
+#define NS_ENSURE_FINITE(f, rv) \
+  if (!std::isfinite(f)) {      \
+    return (rv);                \
+  }
+
+#define NS_ENSURE_FINITE2(f1, f2, rv) \
+  if (!std::isfinite((f1) + (f2))) {  \
+    return (rv);                      \
+  }
+
+#define NS_ENSURE_FINITE4(f1, f2, f3, f4, rv)      \
+  if (!std::isfinite((f1) + (f2) + (f3) + (f4))) { \
+    return (rv);                                   \
+  }
+
+#define NS_ENSURE_FINITE5(f1, f2, f3, f4, f5, rv)         \
+  if (!std::isfinite((f1) + (f2) + (f3) + (f4) + (f5))) { \
+    return (rv);                                          \
+  }
+
+#define NS_ENSURE_FINITE6(f1, f2, f3, f4, f5, f6, rv)            \
+  if (!std::isfinite((f1) + (f2) + (f3) + (f4) + (f5) + (f6))) { \
+    return (rv);                                                 \
+  }
+
+#define NS_CONTENT_DELETE_LIST_MEMBER(type_, ptr_, member_) \
+  {                                                         \
+    type_* cur = (ptr_)->member_;                           \
+    (ptr_)->member_ = nullptr;                              \
+    while (cur) {                                           \
+      type_* next = cur->member_;                           \
+      cur->member_ = nullptr;                               \
+      delete cur;                                           \
+      cur = next;                                           \
+    }                                                       \
+  }
+
+#endif

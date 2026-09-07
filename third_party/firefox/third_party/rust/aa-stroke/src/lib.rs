@@ -1,0 +1,928 @@
+
+use std::default::Default;
+
+use bezierflattener::CBezierFlattener;
+use tri_rasterize::rasterize_to_mask;
+
+use crate::{bezierflattener::{CFlatteningSink, GpPointR, HRESULT, S_OK, CBezier}};
+
+mod bezierflattener;
+pub mod tri_rasterize;
+#[cfg(feature = "c_bindings")]
+pub mod c_bindings;
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Winding {
+    EvenOdd,
+    NonZero,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum PathOp {
+    MoveTo(Point),
+    LineTo(Point),
+    QuadTo(Point, Point),
+    CubicTo(Point, Point, Point),
+    Close,
+}
+
+
+/// Represents a complete path usable for filling or stroking.
+#[derive(Clone, Debug)]
+pub struct Path {
+    pub ops: Vec<PathOp>,
+    pub winding: Winding,
+}
+
+pub type Point = euclid::default::Point2D<f32>;
+pub type Transform = euclid::default::Transform2D<f32>;
+pub type Vector = euclid::default::Vector2D<f32>;
+
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+#[repr(C)]
+pub enum LineCap {
+    Round,
+    Square,
+    Butt,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+#[repr(C)]
+pub enum LineJoin {
+    Round,
+    Miter,
+    Bevel,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+#[repr(C)]
+pub struct StrokeStyle {
+    pub width: f32,
+    pub cap: LineCap,
+    pub join: LineJoin,
+    pub miter_limit: f32,
+}
+
+impl Default for StrokeStyle {
+    fn default() -> Self {
+        StrokeStyle {
+            width: 1.,
+            cap: LineCap::Butt,
+            join: LineJoin::Miter,
+            miter_limit: 10.,
+        }
+    }
+}
+#[derive(Debug)]
+pub struct Vertex {
+    pub x: f32,
+    pub y: f32,
+    pub coverage: f32
+}
+
+/// A helper struct used for constructing a `Path`.
+pub struct PathBuilder<'z> {
+    output_buffer: Option<&'z mut [Vertex]>,
+    output_buffer_offset: usize,
+    vertices: Vec<Vertex>,
+    coverage: f32,
+    aa: bool
+}
+
+
+
+impl<'z> PathBuilder<'z> {
+    pub fn new(coverage: f32) -> PathBuilder<'z> {
+        PathBuilder {
+            output_buffer: None,
+            output_buffer_offset: 0,
+            vertices: Vec::new(),
+            coverage,
+            aa: true
+        }
+    }
+
+    pub fn set_output_buffer(&mut self, output_buffer: &'z mut [Vertex]) {
+        assert!(self.output_buffer.is_none());
+        self.output_buffer = Some(output_buffer);
+    }
+
+    pub fn push_tri_with_coverage(&mut self, x1: f32, y1: f32, c1: f32, x2: f32, y2: f32, c2: f32, x3: f32, y3: f32, c3: f32) {
+        let v1 = Vertex { x: x1, y: y1, coverage: c1 };
+        let v2 = Vertex { x: x2, y: y2, coverage: c2 };
+        let v3 = Vertex { x: x3, y: y3, coverage: c3 };
+        if let Some(output_buffer) = &mut self.output_buffer {
+            let offset = self.output_buffer_offset;
+            if offset + 3 <= output_buffer.len() {
+                output_buffer[offset] = v1;
+                output_buffer[offset + 1] = v2;
+                output_buffer[offset + 2] = v3;
+            }
+            self.output_buffer_offset = offset + 3;
+        } else {
+            self.vertices.push(v1);
+            self.vertices.push(v2);
+            self.vertices.push(v3);
+        }
+    }
+
+    pub fn push_tri(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x3: f32, y3: f32) {
+        self.push_tri_with_coverage(x1, y1, self.coverage, x2, y2, self.coverage, x3, y3, self.coverage);
+    }
+
+
+    pub fn tri_ramp(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x3: f32, y3: f32) {
+        self.push_tri_with_coverage(x1, y1, 0., x2, y2, 0., x3, y3, self.coverage);
+    }
+
+    pub fn quad(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x3: f32, y3: f32, x4: f32, y4: f32) {
+        self.push_tri(x1, y1, x2, y2, x3, y3);
+        self.push_tri(x3, y3, x4, y4, x1, y1);
+    }
+
+    pub fn ramp(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x3: f32, y3: f32, x4: f32, y4: f32) {
+        self.push_tri_with_coverage(x1, y1, self.coverage, x2, y2, 0., x3, y3, 0.);
+        self.push_tri_with_coverage(x3, y3, 0., x4, y4, self.coverage, x1, y1, self.coverage);
+    }
+
+    pub fn tri(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x3: f32, y3: f32) {
+        self.push_tri(x1, y1, x2, y2, x3, y3);
+    }
+
+    pub fn arc_wedge(&mut self, c: Point, radius: f32, a: Vector, b: Vector) {
+        arc(self, c.x, c.y, radius, a, b);
+    }
+
+    /// Completes the current path
+    pub fn finish(self) -> Box<[Vertex]> {
+        self.vertices.into_boxed_slice()
+    }
+
+    pub fn get_output_buffer_size(&self) -> Option<usize> {
+        if self.output_buffer.is_some() {
+            Some(self.output_buffer_offset)
+        } else {
+            None
+        }
+    }
+}
+
+
+
+fn compute_normal(p0: Point, p1: Point) -> Option<Vector> {
+    let ux = p1.x - p0.x;
+    let uy = p1.y - p0.y;
+
+    let ulen = ux.hypot(uy);
+    if ulen == 0. {
+        return None;
+    }
+    Some(Vector::new(-uy / ulen, ux / ulen))
+}
+
+fn flip(v: Vector) -> Vector {
+    Vector::new(-v.x, -v.y)
+}
+
+
+fn arc_segment_tri(path: &mut PathBuilder, xc: f32, yc: f32, radius: f32, a: Vector, b: Vector) {
+    let r_sin_a = radius * a.y;
+    let r_cos_a = radius * a.x;
+    let r_sin_b = radius * b.y;
+    let r_cos_b = radius * b.x;
+
+
+    let mut mid = a + b;
+    mid /= mid.length();
+
+    let mid2 = a + mid;
+
+    let h = (4. / 3.) * dot(perp(a), mid2) / dot(a, mid2);
+
+    let last_point = GpPointR { x: (xc + r_cos_a), y: (yc + r_sin_a) };
+    let initial_normal = GpPointR { x: a.x, y: a.y };
+
+
+    struct Target<'a, 'b> { last_point: GpPointR, last_normal: GpPointR, xc: f32, yc: f32, path: &'a mut PathBuilder<'b> }
+    impl<'a, 'b> CFlatteningSink for Target<'a, 'b> {
+        fn AcceptPointAndTangent(&mut self,
+            pt: &GpPointR,
+            vec: &GpPointR,
+            _last: bool
+            ) -> HRESULT {
+                if self.path.aa {
+                    let len = vec.Norm();
+                    let normal = *vec/len;
+                    let normal = GpPointR { x: -normal.y, y: normal.x };
+                    let width = 0.5; 
+
+                    self.path.ramp(
+                    pt.x - normal.x * width, 
+                    pt.y - normal.y * width,
+                    pt.x + normal.x * width, 
+                    pt.y + normal.y * width,
+                    self.last_point.x + self.last_normal.x * width,
+                    self.last_point.y + self.last_normal.y * width, 
+                    self.last_point.x - self.last_normal.x * width,
+                    self.last_point.y - self.last_normal.y * width, );
+                    self.path.push_tri(
+                        self.last_point.x - self.last_normal.x * 0.5,
+                        self.last_point.y - self.last_normal.y * 0.5, 
+                        pt.x - normal.x * 0.5, 
+                        pt.y - normal.y * 0.5,
+                         self.xc, self.yc);
+                    self.last_normal = normal;
+
+                } else {
+                    self.path.push_tri(self.last_point.x, self.last_point.y, pt.x, pt.y, self.xc, self.yc);
+                }
+                self.last_point = pt.clone();
+                return S_OK;
+        }
+
+        fn AcceptPoint(&mut self,
+            pt: &GpPointR,
+            _t: f32,
+            _aborted: &mut bool,
+            _last_point: bool) -> HRESULT {
+            self.path.push_tri(self.last_point.x, self.last_point.y, pt.x, pt.y, self.xc, self.yc);
+            self.last_point = pt.clone();
+            return S_OK;
+        }
+        fn FirstTangent(&mut self, _: Option<GpPointR>) { }
+    }
+    let bezier = CBezier::new([GpPointR { x: (xc + r_cos_a), y: (yc + r_sin_a),  },
+        GpPointR { x: (xc + r_cos_a - h * r_sin_a), y: (yc + r_sin_a + h * r_cos_a), },
+        GpPointR { x: (xc + r_cos_b + h * r_sin_b), y: (yc + r_sin_b - h * r_cos_b), },
+        GpPointR { x: (xc + r_cos_b), y: (yc + r_sin_b), }]);
+    if bezier.is_degenerate() {
+        return;
+    }
+    let mut t = Target{ last_point, last_normal: initial_normal, xc, yc, path };
+    let mut f = CBezierFlattener::new(&bezier, &mut t, 0.25);
+    if f.GetFirstTangent().is_none() {
+
+        let width = 0.5;
+        let next_point = GpPointR { x: (xc + r_cos_b), y: (yc + r_sin_b) };
+        if path.aa {
+            path.ramp(
+                next_point.x - b.x * width,
+                next_point.y - b.y * width,
+                next_point.x + b.x * width,
+                next_point.y + b.y * width,
+                last_point.x + a.x * width,
+                last_point.y + a.y * width,
+                last_point.x - a.x * width,
+                last_point.y - a.y * width);
+            path.push_tri(
+                last_point.x - a.x * 0.5,
+                last_point.y - a.y * 0.5,
+                next_point.x - b.x * 0.5,
+                next_point.y - b.y * 0.5,
+                xc, yc);
+        } else {
+            path.push_tri(last_point.x, last_point.y, next_point.x, next_point.y, xc, yc);
+        }
+    } else {
+        f.Flatten(true);
+    }
+
+}
+
+fn bisect(a: Vector, b: Vector) -> Vector {
+    let mut mid;
+    if dot(a, b) >= 0. {
+        mid = a + b;
+    } else {
+        mid = flip(a) + b;
+        mid = perp(mid);
+    }
+
+    let mid_len = mid.x * mid.x + mid.y * mid.y;
+    let len = mid_len.sqrt();
+    return mid / len;
+}
+
+fn arc(path: &mut PathBuilder, xc: f32, yc: f32, radius: f32, a: Vector, b: Vector) {
+    if dot(a, b) == 1.0 {
+    } else if dot(a, b) >= 0. {
+        arc_segment_tri(path, xc, yc, radius, a, b);
+    } else {
+        let mid_v = bisect(a, b);
+
+        arc_segment_tri(path, xc, yc, radius, a, mid_v);
+        arc_segment_tri(path, xc, yc, radius, mid_v, b);
+    }
+}
+
+
+fn cap_line(dest: &mut PathBuilder, style: &StrokeStyle, pt: Point, normal: Vector) {
+    let offset = style.width / 2.;
+    match style.cap {
+        LineCap::Butt => {
+            if dest.aa {
+                let half_width = offset;
+                let end = pt;
+                let v = Vector::new(normal.y, -normal.x);
+                dest.ramp(
+                    end.x - normal.x * (half_width - 0.5),
+                    end.y - normal.y * (half_width - 0.5),
+                    end.x + v.x - normal.x * (half_width - 0.5),
+                    end.y + v.y - normal.y * (half_width - 0.5),
+                    end.x + v.x + normal.x * (half_width - 0.5),
+                    end.y + v.y + normal.y * (half_width - 0.5),
+                    end.x + normal.x * (half_width - 0.5), 
+                    end.y + normal.y * (half_width - 0.5),
+                );
+                dest.tri_ramp(
+                    end.x + v.x - normal.x * (half_width - 0.5),
+                end.y + v.y - normal.y * (half_width - 0.5),
+                end.x - normal.x * (half_width + 0.5),
+                end.y - normal.y * (half_width + 0.5),
+                end.x - normal.x * (half_width - 0.5),
+                end.y - normal.y * (half_width - 0.5));
+                dest.tri_ramp(
+                    end.x + v.x + normal.x * (half_width - 0.5),
+                end.y + v.y + normal.y * (half_width - 0.5),
+                end.x + normal.x * (half_width + 0.5),
+                end.y + normal.y * (half_width + 0.5),
+                end.x + normal.x * (half_width - 0.5),
+                end.y + normal.y * (half_width - 0.5));
+            }
+         }
+        LineCap::Round => {
+            dest.arc_wedge(pt, offset, normal, flip(normal));
+        }
+        LineCap::Square => {
+            let v = Vector::new(normal.y, -normal.x);
+            let end = pt + v * offset;
+            if dest.aa {
+                let half_width = offset;
+                let offset = offset - 0.5;
+                dest.ramp(                        
+                    end.x + normal.x * (half_width - 0.5), 
+                    end.y + normal.y * (half_width - 0.5),
+                    end.x + normal.x * (half_width + 0.5),
+                    end.y + normal.y * (half_width + 0.5),
+                    pt.x + normal.x * (half_width + 0.5),
+                    pt.y + normal.y * (half_width + 0.5),
+                    pt.x + normal.x * (half_width - 0.5),
+                    pt.y + normal.y * (half_width - 0.5),
+                );
+                dest.quad(pt.x + normal.x * offset, pt.y + normal.y * offset,
+                    end.x + normal.x * offset, end.y + normal.y * offset,
+                    end.x + -normal.x * offset, end.y + -normal.y * offset,
+                    pt.x - normal.x * offset, pt.y - normal.y * offset);
+
+                dest.ramp(                        
+                    pt.x - normal.x * (half_width - 0.5),
+                    pt.y - normal.y * (half_width - 0.5),
+                    pt.x - normal.x * (half_width + 0.5),
+                    pt.y - normal.y * (half_width + 0.5),
+                    end.x - normal.x * (half_width + 0.5),
+                    end.y - normal.y * (half_width + 0.5),
+                    end.x - normal.x * (half_width - 0.5), 
+                    end.y - normal.y * (half_width - 0.5));
+
+                dest.ramp(                        
+                    end.x - normal.x * (half_width - 0.5),
+                    end.y - normal.y * (half_width - 0.5),
+                    end.x + v.x - normal.x * (half_width - 0.5),
+                    end.y + v.y - normal.y * (half_width - 0.5),
+                    end.x + v.x + normal.x * (half_width - 0.5),
+                    end.y + v.y + normal.y * (half_width - 0.5),
+                    end.x + normal.x * (half_width - 0.5), 
+                    end.y + normal.y * (half_width - 0.5),
+                );
+
+                dest.tri_ramp(
+                    end.x + v.x - normal.x * (half_width - 0.5),
+                end.y + v.y - normal.y * (half_width - 0.5),
+                end.x - normal.x * (half_width + 0.5),
+                end.y - normal.y * (half_width + 0.5),
+                end.x - normal.x * (half_width - 0.5),
+                end.y - normal.y * (half_width - 0.5));
+                dest.tri_ramp(
+                    end.x + v.x + normal.x * (half_width - 0.5),
+                end.y + v.y + normal.y * (half_width - 0.5),
+                end.x + normal.x * (half_width + 0.5),
+                end.y + normal.y * (half_width + 0.5),
+                end.x + normal.x * (half_width - 0.5),
+                end.y + normal.y * (half_width - 0.5));
+            } else {
+                dest.quad(pt.x + normal.x * offset, pt.y + normal.y * offset,
+                end.x + normal.x * offset, end.y + normal.y * offset,
+                end.x + -normal.x * offset, end.y + -normal.y * offset,
+                pt.x - normal.x * offset, pt.y - normal.y * offset);
+            }
+        }
+    }
+}
+
+fn bevel(
+    dest: &mut PathBuilder,
+    style: &StrokeStyle,
+    pt: Point,
+    s1_normal: Vector,
+    s2_normal: Vector,
+) {
+    let offset = style.width / 2.;
+    if dest.aa {
+        let width = 1.;
+        let offset = offset - width / 2.;
+        let diff = match (s2_normal - s1_normal).try_normalize() {
+            Some(diff) => diff,
+            None => return,
+        };
+        let edge_normal = perp(diff);
+
+        dest.tri(pt.x + s1_normal.x * offset, pt.y + s1_normal.y * offset,
+            pt.x + s2_normal.x * offset, pt.y + s2_normal.y * offset,
+            pt.x, pt.y);
+        
+        dest.tri_ramp(pt.x + s1_normal.x * (offset + width), pt.y + s1_normal.y * (offset + width),
+                  pt.x + s1_normal.x * offset + edge_normal.x, pt.y + s1_normal.y * offset + edge_normal.y,
+                  pt.x + s1_normal.x * offset, pt.y + s1_normal.y * offset);
+        dest.ramp(
+            pt.x + s2_normal.x * offset, pt.y + s2_normal.y * offset,
+            pt.x + s2_normal.x * offset + edge_normal.x, pt.y + s2_normal.y * offset + edge_normal.y,
+            pt.x + s1_normal.x * offset + edge_normal.x, pt.y + s1_normal.y * offset + edge_normal.y,
+            pt.x + s1_normal.x * offset, pt.y + s1_normal.y * offset,
+                );
+        dest.tri_ramp(pt.x + s2_normal.x * (offset + width), pt.y + s2_normal.y * (offset + width),
+                pt.x + s2_normal.x * offset + edge_normal.x, pt.y + s2_normal.y * offset + edge_normal.y,
+                pt.x + s2_normal.x * offset, pt.y + s2_normal.y * offset);
+    } else {
+        dest.tri(pt.x + s1_normal.x * offset, pt.y + s1_normal.y * offset,
+            pt.x + s2_normal.x * offset, pt.y + s2_normal.y * offset,
+            pt.x, pt.y);
+    }
+}
+
+fn swap(a: Vector) -> Vector {
+    Vector::new(a.y, -a.x)
+}
+
+fn unperp(a: Vector) -> Vector {
+    swap(a)
+}
+
+fn perp(v: Vector) -> Vector {
+    Vector::new(-v.y, v.x)
+}
+
+fn dot(a: Vector, b: Vector) -> f32 {
+    a.x * b.x + a.y * b.y
+}
+
+fn cross(a: Vector, b: Vector) -> f32 {
+    return a.x * b.y - a.y * b.x;
+}
+
+fn line_intersection(a: Point, a_perp: Vector, b: Point, b_perp: Vector) -> Option<Point> {
+    let a_parallel = unperp(a_perp);
+    let c = b - a;
+    let denom = dot(b_perp, a_parallel);
+    if denom == 0.0 {
+        return None;
+    }
+
+    let t = dot(b_perp, c) / denom;
+
+    let intersection = Point::new(a.x + t * (a_parallel.x), a.y + t * (a_parallel.y));
+
+    Some(intersection)
+}
+
+fn is_interior_angle(a: Vector, b: Vector) -> bool {
+    dot(perp(a), b) > 0. || a == b 
+}
+
+fn join_line(
+    dest: &mut PathBuilder,
+    style: &StrokeStyle,
+    pt: Point,
+    mut s1_normal: Vector,
+    mut s2_normal: Vector,
+) {
+    if is_interior_angle(s1_normal, s2_normal) {
+        s2_normal = flip(s2_normal);
+        s1_normal = flip(s1_normal);
+        std::mem::swap(&mut s1_normal, &mut s2_normal);
+    }
+
+    let mut offset = style.width / 2.;
+
+    match style.join {
+        LineJoin::Round => {
+            dest.arc_wedge(pt, offset, s1_normal, s2_normal);
+        }
+        LineJoin::Miter => {
+            if dest.aa {
+                offset -= 0.5;
+            }
+            let in_dot_out = -s1_normal.x * s2_normal.x + -s1_normal.y * s2_normal.y;
+            if 2. <= style.miter_limit * style.miter_limit * (1. - in_dot_out) {
+                let start = pt + s1_normal * offset;
+                let end = pt + s2_normal * offset;
+                if let Some(intersection) = line_intersection(start, s1_normal, end, s2_normal) {
+                    if dest.aa {
+                        let ramp_start = pt + s1_normal * (offset + 1.);
+                        let ramp_end = pt + s2_normal * (offset + 1.);
+
+
+                        let mid = bisect(s1_normal, s2_normal);
+
+                        let cos = dot(s1_normal, mid);
+                        let s = cross(mid, s1_normal)/(1. + cos);
+
+                        let intersection = pt + mid * (offset / cos);
+
+                        let ramp_s1 = intersection + s1_normal * 1. + unperp(s1_normal) * s;
+                        let ramp_s2 = intersection + s2_normal * 1. + perp(s2_normal) * s;
+
+                        dest.ramp(intersection.x, intersection.y,
+                            ramp_s1.x, ramp_s1.y,
+                            ramp_start.x, ramp_start.y,
+                            pt.x + s1_normal.x * offset, pt.y + s1_normal.y * offset,
+                        );
+                        dest.ramp(pt.x + s2_normal.x * offset, pt.y + s2_normal.y * offset,
+                            ramp_end.x, ramp_end.y,
+                            ramp_s2.x, ramp_s2.y,
+                            intersection.x, intersection.y);
+
+                        dest.tri_ramp(ramp_s1.x, ramp_s1.y, ramp_s2.x, ramp_s2.y, intersection.x, intersection.y);
+
+                        dest.quad(pt.x + s1_normal.x * offset, pt.y + s1_normal.y * offset,
+                            intersection.x, intersection.y,
+                            pt.x + s2_normal.x * offset, pt.y + s2_normal.y * offset,
+                            pt.x, pt.y);
+                    } else {
+                        dest.quad(pt.x + s1_normal.x * offset, pt.y + s1_normal.y * offset,
+                            intersection.x, intersection.y,
+                            pt.x + s2_normal.x * offset, pt.y + s2_normal.y * offset,
+                            pt.x, pt.y);
+                    }
+                }
+            } else {
+                bevel(dest, style, pt, s1_normal, s2_normal);
+            }
+        }
+        LineJoin::Bevel => {
+            bevel(dest, style, pt, s1_normal, s2_normal);
+        }
+    }
+}
+
+pub struct Stroker<'z> {
+    stroked_path: PathBuilder<'z>,
+    cur_pt: Option<Point>,
+    last_normal: Vector,
+    half_width: f32,
+    start_point: Option<(Point, Vector)>,
+    style: StrokeStyle,
+    closed_subpath: bool
+}
+
+impl<'z> Stroker<'z> {
+    pub fn new(style: &StrokeStyle) -> Self {
+        let mut style = style.clone();
+        let mut coverage = 1.;
+        if style.width < 1. {
+            coverage = style.width;
+            style.width = 1.;
+        }
+        Stroker {
+            stroked_path: PathBuilder::new(coverage),
+            cur_pt: None,
+            last_normal: Vector::zero(),
+            half_width: style.width / 2.,
+            start_point: None,
+            style,
+            closed_subpath: false,
+        }
+    }
+
+    pub fn set_output_buffer(&mut self, output_buffer: &'z mut [Vertex]) {
+        self.stroked_path.set_output_buffer(output_buffer);
+    }
+
+    pub fn line_to_capped(&mut self, pt: Point) {
+        if let Some(cur_pt) = self.cur_pt {
+            let normal = compute_normal(cur_pt, pt).unwrap_or(self.last_normal);
+            self.line_to(if self.stroked_path.aa && self.style.cap == LineCap::Butt { pt + perp(normal) * 0.5} else { pt });
+            if let Some(cur_pt) = self.cur_pt {
+                if let Some((_point, _normal)) = self.start_point {
+                    cap_line(&mut self.stroked_path, &self.style, cur_pt, self.last_normal);
+                } else {
+                    match self.style.cap {
+                        LineCap::Round | LineCap::Square => {
+                            cap_line(&mut self.stroked_path, &self.style, cur_pt, Vector::new(1., 0.));
+                            cap_line(&mut self.stroked_path, &self.style, cur_pt, Vector::new(-1., 0.));
+                        }
+                        LineCap::Butt => {}
+                    }
+                }
+            }
+        }
+        self.start_point = None;
+    }
+
+    pub fn move_to(&mut self, pt: Point, closed_subpath: bool) {
+
+        self.start_point = None;
+        self.cur_pt = Some(pt);
+        self.closed_subpath = closed_subpath;
+    }
+
+    pub fn line_to(&mut self, pt: Point) {
+
+        let cur_pt = self.cur_pt;
+        let stroked_path = &mut self.stroked_path;
+        let half_width = self.half_width;
+
+        if cur_pt.is_none() {
+            self.start_point = None;
+        } else if let Some(cur_pt) = cur_pt {
+            if let Some(normal) = compute_normal(cur_pt, pt) {
+                if self.start_point.is_none() {
+                    if !self.closed_subpath {
+                        let mut cur_pt = cur_pt;
+                        if stroked_path.aa && self.style.cap == LineCap::Butt {
+                            cur_pt += perp(flip(normal)) * 0.5;
+                        }
+                        cap_line(stroked_path, &self.style, cur_pt, flip(normal));
+                    }
+                    self.start_point = Some((cur_pt, normal));
+                } else {
+                    join_line(stroked_path, &self.style, cur_pt, self.last_normal, normal);
+                }
+                if stroked_path.aa { 
+                    stroked_path.ramp(                        
+                        pt.x + normal.x * (half_width - 0.5), 
+                        pt.y + normal.y * (half_width - 0.5),
+                        pt.x + normal.x * (half_width + 0.5),
+                        pt.y + normal.y * (half_width + 0.5),
+                        cur_pt.x + normal.x * (half_width + 0.5),
+                        cur_pt.y + normal.y * (half_width + 0.5),
+                        cur_pt.x + normal.x * (half_width - 0.5),
+                        cur_pt.y + normal.y * (half_width - 0.5),
+                    );
+                    stroked_path.quad(
+                        cur_pt.x + normal.x * (half_width - 0.5),
+                        cur_pt.y + normal.y * (half_width - 0.5),
+                        pt.x + normal.x * (half_width - 0.5), pt.y + normal.y * (half_width - 0.5),
+                        pt.x + -normal.x * (half_width - 0.5), pt.y + -normal.y * (half_width - 0.5),
+                        cur_pt.x - normal.x * (half_width - 0.5),
+                        cur_pt.y - normal.y * (half_width - 0.5),
+                    );
+                    stroked_path.ramp(                        
+                        cur_pt.x - normal.x * (half_width - 0.5),
+                        cur_pt.y - normal.y * (half_width - 0.5),
+                        cur_pt.x - normal.x * (half_width + 0.5),
+                        cur_pt.y - normal.y * (half_width + 0.5),
+                        pt.x - normal.x * (half_width + 0.5),
+                        pt.y - normal.y * (half_width + 0.5),
+                        pt.x - normal.x * (half_width - 0.5), 
+                        pt.y - normal.y * (half_width - 0.5),
+                    );
+                } else {
+                    stroked_path.quad(
+                        cur_pt.x + normal.x * half_width,
+                        cur_pt.y + normal.y * half_width,
+                        pt.x + normal.x * half_width, pt.y + normal.y * half_width,
+                        pt.x + -normal.x * half_width, pt.y + -normal.y * half_width,
+                        cur_pt.x - normal.x * half_width,
+                        cur_pt.y - normal.y * half_width,
+                    );
+                }
+
+                self.last_normal = normal;
+
+            }
+        }
+        self.cur_pt = Some(pt);
+    }
+
+    pub fn curve_to(&mut self, cx1: Point, cx2: Point, pt: Point) {
+        self.curve_to_direct(cx1, cx2, pt, false);
+    }
+
+    pub fn curve_to_capped(&mut self, cx1: Point, cx2: Point, pt: Point) {
+        self.curve_to_direct(cx1, cx2, pt, true);
+    }
+
+    pub fn curve_to_internal(&mut self, cx1: Point, cx2: Point, pt: Point, end: bool) {
+        struct Target<'a, 'b> { stroker: &'a mut Stroker<'b>, end: bool }
+        impl<'a, 'b> CFlatteningSink for Target<'a, 'b> {
+            fn AcceptPointAndTangent(&mut self, _: &GpPointR, _: &GpPointR, _: bool ) -> HRESULT {
+                panic!()
+            }
+            fn FirstTangent(&mut self, _tangent: Option<GpPointR>) { }
+
+            fn AcceptPoint(&mut self,
+                pt: &GpPointR,
+                _t: f32,
+                _aborted: &mut bool,
+                last_point: bool) -> HRESULT {
+                if last_point && self.end  {
+                    self.stroker.line_to_capped(Point::new(pt.x, pt.y));
+                } else {
+                    self.stroker.line_to(Point::new(pt.x, pt.y));
+                }
+                return S_OK;
+            }
+        }
+        let cur_pt = self.cur_pt.unwrap_or(cx1);
+        let bezier = CBezier::new([GpPointR { x: cur_pt.x, y: cur_pt.y,  },
+            GpPointR { x: cx1.x, y: cx1.y, },
+            GpPointR { x: cx2.x, y: cx2.y, },
+            GpPointR { x: pt.x, y: pt.y, }]);
+        let mut t = Target{ stroker: self, end };
+        let mut f = CBezierFlattener::new(&bezier, &mut t, 0.25);
+        f.Flatten(false);
+    }
+
+    pub fn curve_to_direct(&mut self, cx1: Point, cx2: Point, pt: Point, end: bool) {
+        struct Target<'a, 'b> { stroker: &'a mut Stroker<'b>, _end: bool, last_normal: Vector, last_point: GpPointR}
+        impl<'a, 'b> CFlatteningSink for Target<'a, 'b> {
+            fn FirstTangent(&mut self, tangent: Option<GpPointR>) {
+                let tangent = tangent.unwrap();
+                let last_normal = flip(Vector::new(tangent.y, -tangent.x).normalize());
+                let stroked_path = &mut self.stroker.stroked_path;
+                if self.stroker.start_point.is_some() {
+                    if let Some(cur_pt) = self.stroker.cur_pt {
+                        join_line(stroked_path, &self.stroker.style, cur_pt, self.stroker.last_normal, last_normal);
+                    }
+                }
+                self.last_normal = last_normal;
+            }
+            fn AcceptPointAndTangent(&mut self, pt: &GpPointR, tangent: &GpPointR, _last: bool) -> HRESULT {
+                let normal = flip(Vector::new(tangent.y, -tangent.x).normalize());
+                let last_normal = self.last_normal;
+                let cur_pt = Point::new(self.last_point.x, self.last_point.y);
+                let half_width = self.stroker.half_width;
+                let stroked_path = &mut self.stroker.stroked_path;
+
+                if self.stroker.start_point.is_none() {
+                    if !self.stroker.closed_subpath {
+                        let mut cur_pt = cur_pt;
+                        if stroked_path.aa && self.stroker.style.cap == LineCap::Butt {
+                            cur_pt += perp(flip(last_normal)) * 0.5;
+                        }
+                        cap_line(stroked_path, &self.stroker.style, cur_pt, flip(last_normal));
+                    }
+                    self.stroker.start_point = Some((cur_pt, last_normal));
+                } else {
+                }
+                if stroked_path.aa {
+                    stroked_path.ramp(
+                        pt.x + normal.x * (half_width - 0.5),
+                        pt.y + normal.y * (half_width - 0.5),
+                        pt.x + normal.x * (half_width + 0.5),
+                        pt.y + normal.y * (half_width + 0.5),
+                        cur_pt.x + last_normal.x * (half_width + 0.5),
+                        cur_pt.y + last_normal.y * (half_width + 0.5),
+                        cur_pt.x + last_normal.x * (half_width - 0.5),
+                        cur_pt.y + last_normal.y * (half_width - 0.5),
+                    );
+                    stroked_path.quad(
+                        cur_pt.x + last_normal.x * (half_width - 0.5),
+                        cur_pt.y + last_normal.y * (half_width - 0.5),
+                        pt.x + normal.x * (half_width - 0.5), pt.y + normal.y * (half_width - 0.5),
+                        pt.x + -normal.x * (half_width - 0.5), pt.y + -normal.y * (half_width - 0.5),
+                        cur_pt.x - last_normal.x * (half_width - 0.5),
+                        cur_pt.y - last_normal.y * (half_width - 0.5),
+                    );
+                    stroked_path.ramp(
+                        cur_pt.x - last_normal.x * (half_width - 0.5),
+                        cur_pt.y - last_normal.y * (half_width - 0.5),
+                        cur_pt.x - last_normal.x * (half_width + 0.5),
+                        cur_pt.y - last_normal.y * (half_width + 0.5),
+                        pt.x - normal.x * (half_width + 0.5),
+                        pt.y - normal.y * (half_width + 0.5),
+                        pt.x - normal.x * (half_width - 0.5),
+                        pt.y - normal.y * (half_width - 0.5),
+                    );
+                } else {
+                    self.stroker.stroked_path.quad(
+                        cur_pt.x + last_normal.x * half_width,
+                        cur_pt.y + last_normal.y * half_width,
+                        pt.x + normal.x * half_width, pt.y + normal.y * half_width,
+                        pt.x + -normal.x * half_width, pt.y + -normal.y * half_width,
+                        cur_pt.x - last_normal.x * half_width,
+                        cur_pt.y - last_normal.y * half_width,
+                    );
+                }
+                self.last_normal = normal;
+                self.last_point = *pt;
+                return S_OK;
+            }
+
+            fn AcceptPoint(&mut self, _p: &GpPointR,
+                _: f32, _: &mut bool, _: bool) -> HRESULT {
+                    panic!();
+            }
+        }
+        let cur_pt = self.cur_pt.unwrap_or(cx1);
+        let bezier = CBezier::new([GpPointR { x: cur_pt.x, y: cur_pt.y,  },
+            GpPointR { x: cx1.x, y: cx1.y, },
+            GpPointR { x: cx2.x, y: cx2.y, },
+            GpPointR { x: pt.x, y: pt.y, }]);
+
+        let mut t = Target{ stroker: self, _end: end,
+            last_normal: Vector::new(0., 0.),
+            last_point: GpPointR { x: cur_pt.x, y: cur_pt.y }
+        };
+        let mut f = CBezierFlattener::new(&bezier, &mut t, 0.25);
+        if f.GetFirstTangent().is_none() {
+            return if end { self.line_to_capped(pt) } else { self.line_to(pt) };
+        }
+        f.Flatten(true);
+
+        self.last_normal = t.last_normal;
+        self.cur_pt = Some(pt);
+    }
+
+    pub fn close(&mut self) {
+        let stroked_path = &mut self.stroked_path;
+        let half_width = self.half_width;
+        if let (Some(cur_pt), Some((end_point, start_normal))) = (self.cur_pt, self.start_point) {
+            if let Some(normal) = compute_normal(cur_pt, end_point) {
+                join_line(stroked_path, &self.style, cur_pt, self.last_normal, normal);
+                if stroked_path.aa { 
+                    stroked_path.ramp(                        
+                        end_point.x + normal.x * (half_width - 0.5), 
+                        end_point.y + normal.y * (half_width - 0.5),
+                        end_point.x + normal.x * (half_width + 0.5),
+                        end_point.y + normal.y * (half_width + 0.5),
+                        cur_pt.x + normal.x * (half_width + 0.5),
+                        cur_pt.y + normal.y * (half_width + 0.5),
+                        cur_pt.x + normal.x * (half_width - 0.5),
+                        cur_pt.y + normal.y * (half_width - 0.5),
+                    );
+                    stroked_path.quad(
+                        cur_pt.x + normal.x * (half_width - 0.5),
+                        cur_pt.y + normal.y * (half_width - 0.5),
+                        end_point.x + normal.x * (half_width - 0.5), end_point.y + normal.y * (half_width - 0.5),
+                        end_point.x + -normal.x * (half_width - 0.5), end_point.y + -normal.y * (half_width - 0.5),
+                        cur_pt.x - normal.x * (half_width - 0.5),
+                        cur_pt.y - normal.y * (half_width - 0.5),
+                    );
+                    stroked_path.ramp(                        
+                        cur_pt.x - normal.x * (half_width - 0.5),
+                        cur_pt.y - normal.y * (half_width - 0.5),
+                        cur_pt.x - normal.x * (half_width + 0.5),
+                        cur_pt.y - normal.y * (half_width + 0.5),
+                        end_point.x - normal.x * (half_width + 0.5),
+                        end_point.y - normal.y * (half_width + 0.5),
+                        end_point.x - normal.x * (half_width - 0.5), 
+                        end_point.y - normal.y * (half_width - 0.5),
+                    );
+                } else {
+                    stroked_path.quad(
+                        cur_pt.x + normal.x * half_width,
+                        cur_pt.y + normal.y * half_width,
+                        end_point.x + normal.x * half_width, end_point.y + normal.y * half_width,
+                        end_point.x + -normal.x * half_width, end_point.y + -normal.y * half_width,
+                        cur_pt.x - normal.x * half_width,
+                        cur_pt.y - normal.y * half_width,
+                    );
+                }
+                join_line(stroked_path, &self.style, end_point, normal, start_normal);
+            } else {
+                join_line(stroked_path, &self.style, end_point, self.last_normal, start_normal);
+            }
+        }
+        self.cur_pt = self.start_point.map(|x| x.0);
+        self.start_point = None;
+    }
+
+    pub fn get_stroked_path(&mut self) -> PathBuilder<'z> {
+        let mut stroked_path = std::mem::replace(&mut self.stroked_path, PathBuilder::new(1.));
+
+        if let (Some(cur_pt), Some((point, normal))) = (self.cur_pt, self.start_point) {
+            cap_line(&mut stroked_path, &self.style, cur_pt, self.last_normal);
+            cap_line(&mut stroked_path, &self.style, point, flip(normal));
+        }
+
+        stroked_path
+    }
+
+    pub fn finish(&mut self) -> Box<[Vertex]> {
+        self.get_stroked_path().finish()
+    }
+}
+
+fn filled_circle_with_path_builder(mut path_builder: &mut PathBuilder, center: Point, radius: f32) {
+    arc(&mut path_builder, center.x, center.y, radius, Vector::new(1., 0.), Vector::new(-1., 0.));
+    arc(&mut path_builder, center.x, center.y, radius, Vector::new(-1., 0.), Vector::new(1., 0.));
+}
+
+/// Returns an anti-aliased triangle mesh for a filled circle.
+pub fn filled_circle(center: Point, radius: f32) -> Box<[Vertex]> {
+    let mut path_builder = PathBuilder::new(1.);
+    filled_circle_with_path_builder(&mut path_builder, center, radius);
+    path_builder.finish()
+}

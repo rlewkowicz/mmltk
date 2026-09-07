@@ -1,0 +1,92 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef BaseMediaResource_h
+#define BaseMediaResource_h
+
+#include "MediaCache.h"
+#include "MediaResource.h"
+#include "MediaResourceCallback.h"
+#include "mozilla/dom/MediaDebugInfoBinding.h"
+#include "nsIChannel.h"
+#include "nsIStreamListener.h"
+#include "nsIURI.h"
+
+class nsIPrincipal;
+
+namespace mozilla {
+
+DDLoggedTypeDeclNameAndBase(BaseMediaResource, MediaResource);
+
+class BaseMediaResource : public MediaResource,
+                          public DecoderDoctorLifeLogger<BaseMediaResource> {
+ public:
+  static already_AddRefed<BaseMediaResource> Create(
+      MediaResourceCallback* aCallback, nsIChannel* aChannel,
+      bool aIsPrivateBrowsing);
+
+  virtual void ThrottleReadahead(bool bThrottle) {}
+
+  virtual void SetPlaybackRate(uint32_t aBytesPerSecond) = 0;
+
+  virtual double GetDownloadRate(bool* aIsReliable) = 0;
+
+  void SetLoadInBackground(bool aLoadInBackground);
+
+  virtual void Suspend(bool aCloseImmediately) = 0;
+
+  virtual void Resume() = 0;
+
+  virtual void SetReadMode(MediaCacheStream::ReadMode aMode) = 0;
+
+  virtual bool IsTransportSeekable() = 0;
+
+  virtual already_AddRefed<nsIPrincipal> GetCurrentPrincipal() = 0;
+
+  virtual bool HadCrossOriginRedirects() = 0;
+
+  virtual nsresult Open(nsIStreamListener** aStreamListener) = 0;
+
+  virtual bool CanClone() { return false; }
+
+  virtual already_AddRefed<BaseMediaResource> CloneData(
+      MediaResourceCallback* aCallback) {
+    return nullptr;
+  }
+
+  virtual bool IsLiveStream() const { return false; }
+
+  virtual size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const {
+    return 0;
+  }
+
+  virtual size_t SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const {
+    return aMallocSizeOf(this) + SizeOfExcludingThis(aMallocSizeOf);
+  }
+
+  virtual void GetDebugInfo(dom::MediaResourceDebugInfo& aInfo) {}
+
+ protected:
+  BaseMediaResource(MediaResourceCallback* aCallback, nsIChannel* aChannel,
+                    nsIURI* aURI)
+      : mCallback(aCallback),
+        mChannel(aChannel),
+        mURI(aURI),
+        mLoadInBackground(false) {}
+  virtual ~BaseMediaResource() = default;
+
+  nsresult ModifyLoadFlags(nsLoadFlags aFlags);
+
+  RefPtr<MediaResourceCallback> mCallback;
+
+  nsCOMPtr<nsIChannel> mChannel;
+
+  nsCOMPtr<nsIURI> mURI;
+
+  bool mLoadInBackground;
+};
+
+}  
+
+#endif  // BaseMediaResource_h

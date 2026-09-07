@@ -1,0 +1,744 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ImageDocument.h"
+
+#include <algorithm>
+
+#include "DocumentInlines.h"
+#include "ImageBlocker.h"
+#include "imgIContainer.h"
+#include "imgINotificationObserver.h"
+#include "imgIRequest.h"
+#include "mozilla/AutoRestore.h"
+#include "mozilla/ComputedStyle.h"
+#include "mozilla/LoadInfo.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/ScrollContainerFrame.h"
+#include "mozilla/StaticPrefs_browser.h"
+#include "mozilla/dom/BrowserChild.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/Event.h"
+#include "mozilla/dom/HTMLImageElement.h"
+#include "mozilla/dom/ImageDocumentBinding.h"
+#include "mozilla/dom/MouseEvent.h"
+#include "nsContentPolicyUtils.h"
+#include "nsContentUtils.h"
+#include "nsDOMCSSDeclaration.h"
+#include "nsDOMTokenList.h"
+#include "nsDocShell.h"
+#include "nsError.h"
+#include "nsGenericHTMLElement.h"
+#include "nsGkAtoms.h"
+#include "nsIChannel.h"
+#include "nsIContentPolicy.h"
+#include "nsIDOMEventListener.h"
+#include "nsIDocShell.h"
+#include "nsIDocumentViewer.h"
+#include "nsIFrame.h"
+#include "nsIImageLoadingContent.h"
+#include "nsObjectLoadingContent.h"
+#include "nsPIDOMWindow.h"
+#include "nsPresContext.h"
+#include "nsRect.h"
+#include "nsThreadUtils.h"
+#include "nsURILoader.h"
+
+namespace mozilla::dom {
+
+class ImageListener : public MediaDocumentStreamListener {
+ public:
+  NS_IMETHOD OnStartRequest(nsIRequest* aRequest) override;
+
+  explicit ImageListener(ImageDocument* aDocument);
+  virtual ~ImageListener();
+};
+
+ImageListener::ImageListener(ImageDocument* aDocument)
+    : MediaDocumentStreamListener(aDocument) {}
+
+ImageListener::~ImageListener() = default;
+
+NS_IMETHODIMP
+ImageListener::OnStartRequest(nsIRequest* request) {
+  NS_ENSURE_TRUE(mDocument, NS_ERROR_FAILURE);
+
+  ImageDocument* imgDoc = static_cast<ImageDocument*>(mDocument.get());
+  nsCOMPtr<nsIChannel> channel = do_QueryInterface(request);
+  if (!channel) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsCOMPtr<nsPIDOMWindowOuter> domWindow = imgDoc->GetWindow();
+  NS_ENSURE_TRUE(domWindow, NS_ERROR_UNEXPECTED);
+
+  nsCOMPtr<nsIURI> channelURI;
+  channel->GetURI(getter_AddRefs(channelURI));
+  if (image::ImageBlocker::ShouldBlock(channelURI)) {
+    request->Cancel(NS_ERROR_CONTENT_BLOCKED);
+    return NS_OK;
+  }
+
+  if (!imgDoc->mObservingImageLoader) {
+    NS_ENSURE_TRUE(imgDoc->mImageContent, NS_ERROR_UNEXPECTED);
+    imgDoc->mImageContent->AddNativeObserver(imgDoc);
+    imgDoc->mObservingImageLoader = true;
+    imgDoc->mImageContent->LoadImageWithChannel(channel,
+                                                getter_AddRefs(mNextStream));
+  }
+
+  return MediaDocumentStreamListener::OnStartRequest(request);
+}
+
+ImageDocument::ImageDocument()
+    : mVisibleWidth(0.0),
+      mVisibleHeight(0.0),
+      mImageWidth(0),
+      mImageHeight(0),
+      mImageIsResized(false),
+      mShouldResize(false),
+      mFirstResize(false),
+      mObservingImageLoader(false),
+      mTitleUpdateInProgress(false),
+      mHasCustomTitle(false),
+      mIsInObjectOrEmbed(false),
+      mOriginalZoomLevel(1.0),
+      mOriginalResolution(1.0) {}
+
+ImageDocument::~ImageDocument() = default;
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED(ImageDocument, MediaDocument, mImageContent)
+
+NS_IMPL_ISUPPORTS_CYCLE_COLLECTION_INHERITED(ImageDocument, MediaDocument,
+                                             imgINotificationObserver,
+                                             nsIDOMEventListener)
+
+nsresult ImageDocument::Init(nsIPrincipal* aPrincipal,
+                             nsIPrincipal* aPartitionedPrincipal) {
+  nsresult rv = MediaDocument::Init(aPrincipal, aPartitionedPrincipal);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  mShouldResize = StaticPrefs::browser_enable_automatic_image_resizing();
+  mFirstResize = true;
+
+  return NS_OK;
+}
+
+JSObject* ImageDocument::WrapNode(JSContext* aCx,
+                                  JS::Handle<JSObject*> aGivenProto) {
+  return ImageDocument_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+nsresult ImageDocument::StartDocumentLoad(
+    const char* aCommand, nsIChannel* aChannel, nsILoadGroup* aLoadGroup,
+    nsISupports* aContainer, nsIStreamListener** aDocListener, bool aReset) {
+  nsresult rv = MediaDocument::StartDocumentLoad(
+      aCommand, aChannel, aLoadGroup, aContainer, aDocListener, aReset);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  mOriginalZoomLevel = IsSiteSpecific() ? 1.0 : GetZoomLevel();
+  CheckFullZoom();
+  mOriginalResolution = GetResolution();
+
+  if (BrowsingContext* context = GetBrowsingContext()) {
+    mIsInObjectOrEmbed = context->IsEmbedderTypeObjectOrEmbed();
+  }
+
+  NS_ASSERTION(aDocListener, "null aDocListener");
+  *aDocListener = new ImageListener(this);
+  NS_ADDREF(*aDocListener);
+
+  return NS_OK;
+}
+
+void ImageDocument::Destroy() {
+  if (RefPtr<HTMLImageElement> img = std::move(mImageContent)) {
+    img->RemoveEventListener(u"load"_ns, this, false);
+    img->RemoveEventListener(u"click"_ns, this, false);
+
+    if (mObservingImageLoader) {
+      img->RemoveNativeObserver(this);
+    }
+  }
+
+  MediaDocument::Destroy();
+}
+
+void ImageDocument::SetScriptGlobalObject(
+    nsIScriptGlobalObject* aScriptGlobalObject) {
+  nsCOMPtr<EventTarget> target;
+  if (mScriptGlobalObject && aScriptGlobalObject != mScriptGlobalObject) {
+    target = do_QueryInterface(mScriptGlobalObject);
+    target->RemoveEventListener(u"resize"_ns, this, false);
+    target->RemoveEventListener(u"keypress"_ns, this, false);
+  }
+
+  MediaDocument::SetScriptGlobalObject(aScriptGlobalObject);
+
+  if (aScriptGlobalObject) {
+    if (!InitialSetupHasBeenDone()) {
+      MOZ_ASSERT(!GetRootElement(), "Where did the root element come from?");
+#ifdef DEBUG
+      nsresult rv =
+#endif
+          CreateSyntheticDocument();
+      NS_ASSERTION(NS_SUCCEEDED(rv), "failed to create synthetic document");
+
+      target = mImageContent;
+      target->AddEventListener(u"load"_ns, this, false);
+      target->AddEventListener(u"click"_ns, this, false);
+    }
+
+    target = do_QueryInterface(aScriptGlobalObject);
+    target->AddEventListener(u"resize"_ns, this, false);
+    target->AddEventListener(u"keypress"_ns, this, false);
+
+    if (!InitialSetupHasBeenDone()) {
+      LinkStylesheet(u"resource://content-accessible/ImageDocument.css"_ns);
+      if (!nsContentUtils::IsChildOfSameType(this)) {
+        LinkStylesheet(nsLiteralString(
+            u"resource://content-accessible/TopLevelImageDocument.css"));
+      }
+      InitialSetupDone();
+    }
+  }
+}
+
+void ImageDocument::OnPageShow(bool aPersisted,
+                               EventTarget* aDispatchStartTarget,
+                               bool aOnlySystemGroup) {
+  if (aPersisted) {
+    mOriginalZoomLevel = IsSiteSpecific() ? 1.0 : GetZoomLevel();
+    CheckFullZoom();
+    mOriginalResolution = GetResolution();
+  }
+  RefPtr<ImageDocument> kungFuDeathGrip(this);
+  UpdateSizeFromLayout();
+
+  MediaDocument::OnPageShow(aPersisted, aDispatchStartTarget, aOnlySystemGroup);
+}
+
+void ImageDocument::ShrinkToFit() {
+  if (!mImageContent) {
+    return;
+  }
+  if (GetZoomLevel() != mOriginalZoomLevel && mImageIsResized &&
+      !nsContentUtils::IsChildOfSameType(this)) {
+    RefPtr<HTMLImageElement> img = mImageContent;
+    uint32_t imageHeight = img->Height();
+    nsDOMTokenList* classList = img->ClassList();
+    if (imageHeight > mVisibleHeight) {
+      classList->Add(u"overflowingVertical"_ns, IgnoreErrors());
+    } else {
+      classList->Remove(u"overflowingVertical"_ns, IgnoreErrors());
+    }
+    return;
+  }
+  if (GetResolution() != mOriginalResolution && mImageIsResized) {
+    return;
+  }
+
+  RefPtr<HTMLImageElement> image = mImageContent;
+
+  uint32_t newWidth = std::max(1, NSToCoordFloor(GetRatio() * mImageWidth));
+  uint32_t newHeight = std::max(1, NSToCoordFloor(GetRatio() * mImageHeight));
+  image->SetWidth(newWidth, IgnoreErrors());
+  image->SetHeight(newHeight, IgnoreErrors());
+
+  ScrollImageTo(0, 0);
+
+  if (!mImageContent) {
+    return;
+  }
+
+  SetModeClass(eShrinkToFit);
+
+  mImageIsResized = true;
+
+  UpdateTitleAndCharset();
+}
+
+void ImageDocument::ScrollImageTo(int32_t aX, int32_t aY) {
+  RefPtr<PresShell> presShell = GetPresShell();
+  if (!presShell) {
+    return;
+  }
+
+  ScrollContainerFrame* sf = presShell->GetRootScrollContainerFrame();
+  if (!sf) {
+    return;
+  }
+
+  float ratio = GetRatio();
+  if (ratio <= 0.0) {
+    return;
+  }
+  nsRect portRect = sf->GetScrollPortRect();
+  sf->ScrollTo(
+      nsPoint(
+          nsPresContext::CSSPixelsToAppUnits(aX / ratio) - portRect.width / 2,
+          nsPresContext::CSSPixelsToAppUnits(aY / ratio) - portRect.height / 2),
+      ScrollMode::Instant);
+}
+
+void ImageDocument::RestoreImage() {
+  if (!mImageContent) {
+    return;
+  }
+  RefPtr<HTMLImageElement> imageContent = mImageContent;
+  imageContent->UnsetAttr(kNameSpaceID_None, nsGkAtoms::width, true);
+  imageContent->UnsetAttr(kNameSpaceID_None, nsGkAtoms::height, true);
+
+  if (mIsInObjectOrEmbed) {
+    SetModeClass(eIsInObjectOrEmbed);
+  } else if (ImageIsOverflowing()) {
+    if (!ImageIsOverflowingVertically()) {
+      SetModeClass(eOverflowingHorizontalOnly);
+    } else {
+      SetModeClass(eOverflowingVertical);
+    }
+  } else {
+    SetModeClass(eNone);
+  }
+
+  mImageIsResized = false;
+
+  UpdateTitleAndCharset();
+}
+
+void ImageDocument::NotifyPossibleTitleChange(bool aBoundTitleElement) {
+  if (!mHasCustomTitle && !mTitleUpdateInProgress) {
+    mHasCustomTitle = true;
+  }
+
+  Document::NotifyPossibleTitleChange(aBoundTitleElement);
+}
+
+void ImageDocument::Notify(imgIRequest* aRequest, int32_t aType,
+                           const nsIntRect* aData) {
+  if (aType == imgINotificationObserver::SIZE_AVAILABLE) {
+    nsCOMPtr<imgIContainer> image;
+    aRequest->GetImage(getter_AddRefs(image));
+    return OnSizeAvailable(aRequest, image);
+  }
+
+  if (aType == imgINotificationObserver::HAS_TRANSPARENCY) {
+    nsCOMPtr<nsIRunnable> runnable =
+        NewRunnableMethod("dom::ImageDocument::OnHasTransparency", this,
+                          &ImageDocument::OnHasTransparency);
+    nsContentUtils::AddScriptRunner(runnable);
+  }
+
+  if (aType == imgINotificationObserver::LOAD_COMPLETE) {
+    uint32_t reqStatus;
+    aRequest->GetImageStatus(&reqStatus);
+    nsresult status =
+        reqStatus & imgIRequest::STATUS_ERROR ? NS_ERROR_FAILURE : NS_OK;
+    return OnLoadComplete(aRequest, status);
+  }
+}
+
+void ImageDocument::OnHasTransparency() {
+  if (!mImageContent || nsContentUtils::IsChildOfSameType(this)) {
+    return;
+  }
+
+  nsDOMTokenList* classList = mImageContent->ClassList();
+  classList->Add(u"transparent"_ns, IgnoreErrors());
+}
+
+void ImageDocument::SetModeClass(eModeClasses mode) {
+  nsDOMTokenList* classList = mImageContent->ClassList();
+
+  if (mode == eShrinkToFit) {
+    classList->Add(u"shrinkToFit"_ns, IgnoreErrors());
+  } else {
+    classList->Remove(u"shrinkToFit"_ns, IgnoreErrors());
+  }
+
+  if (mode == eOverflowingVertical) {
+    classList->Add(u"overflowingVertical"_ns, IgnoreErrors());
+  } else {
+    classList->Remove(u"overflowingVertical"_ns, IgnoreErrors());
+  }
+
+  if (mode == eOverflowingHorizontalOnly) {
+    classList->Add(u"overflowingHorizontalOnly"_ns, IgnoreErrors());
+  } else {
+    classList->Remove(u"overflowingHorizontalOnly"_ns, IgnoreErrors());
+  }
+
+  if (mode == eIsInObjectOrEmbed) {
+    classList->Add(u"isInObjectOrEmbed"_ns, IgnoreErrors());
+  }
+}
+
+void ImageDocument::OnSizeAvailable(imgIRequest* aRequest,
+                                    imgIContainer* aImage) {
+  int32_t oldWidth = mImageWidth;
+  int32_t oldHeight = mImageHeight;
+
+  aImage->GetWidth(&mImageWidth);
+  aImage->GetHeight(&mImageHeight);
+
+  if (oldWidth == mImageWidth && oldHeight == mImageHeight) {
+    return;
+  }
+
+  nsCOMPtr<nsIRunnable> runnable =
+      NewRunnableMethod("dom::ImageDocument::DefaultCheckOverflowing", this,
+                        &ImageDocument::DefaultCheckOverflowing);
+  nsContentUtils::AddScriptRunner(runnable);
+  UpdateTitleAndCharset();
+}
+
+void ImageDocument::OnLoadComplete(imgIRequest* aRequest, nsresult aStatus) {
+  UpdateTitleAndCharset();
+
+  if (NS_FAILED(aStatus) && mImageContent) {
+    nsAutoCString src;
+    mDocumentURI->GetSpec(src);
+    AutoTArray<nsString, 1> formatString;
+    CopyUTF8toUTF16(src, *formatString.AppendElement());
+    nsAutoString errorMsg;
+    FormatStringFromName("InvalidImage", formatString, errorMsg);
+
+    mImageContent->SetAttr(kNameSpaceID_None, nsGkAtoms::alt, errorMsg, false);
+  }
+
+  MaybeSendResultToEmbedder(aStatus);
+}
+
+NS_IMETHODIMP
+ImageDocument::HandleEvent(Event* aEvent) {
+  nsAutoString eventType;
+  aEvent->GetType(eventType);
+  if (eventType.EqualsLiteral("resize")) {
+    CheckOverflowing(false);
+    CheckFullZoom();
+  } else if (eventType.EqualsLiteral("click") &&
+             StaticPrefs::browser_enable_click_image_resizing() &&
+             !mIsInObjectOrEmbed) {
+    ResetZoomLevel();
+    mShouldResize = true;
+    if (mImageIsResized) {
+      int32_t x = 0, y = 0;
+      MouseEvent* event = aEvent->AsMouseEvent();
+      if (event) {
+        RefPtr<HTMLImageElement> img = mImageContent;
+        x = event->ClientX() - img->OffsetLeft();
+        y = event->ClientY() - img->OffsetTop();
+      }
+      mShouldResize = false;
+      RestoreImage();
+      FlushPendingNotifications(FlushType::Layout);
+      ScrollImageTo(x, y);
+    } else if (ImageIsOverflowing()) {
+      ShrinkToFit();
+    }
+  } else if (eventType.EqualsLiteral("load")) {
+    UpdateSizeFromLayout();
+  }
+
+  return NS_OK;
+}
+
+void ImageDocument::UpdateSizeFromLayout() {
+  if (!mImageContent) {
+    return;
+  }
+
+  RefPtr<HTMLImageElement> imageContent = mImageContent;
+  nsIFrame* contentFrame = imageContent->GetPrimaryFrame(FlushType::Frames);
+  if (!contentFrame) {
+    return;
+  }
+
+  nsIntSize oldSize(mImageWidth, mImageHeight);
+  IntrinsicSize newSize = contentFrame->GetIntrinsicSize();
+
+  if (newSize.width) {
+    mImageWidth = nsPresContext::AppUnitsToFloatCSSPixels(*newSize.width);
+  }
+  if (newSize.height) {
+    mImageHeight = nsPresContext::AppUnitsToFloatCSSPixels(*newSize.height);
+  }
+
+  if (mImageWidth != oldSize.width || mImageHeight != oldSize.height) {
+    CheckOverflowing(false);
+  }
+}
+
+void ImageDocument::UpdateRemoteStyle(StyleImageRendering aImageRendering) {
+  if (!mImageContent) {
+    return;
+  }
+
+  if (!nsContentUtils::IsSafeToRunScript()) {
+    return nsContentUtils::AddScriptRunner(
+        NewRunnableMethod<StyleImageRendering>(
+            "UpdateRemoteStyle", this, &ImageDocument::UpdateRemoteStyle,
+            aImageRendering));
+  }
+
+  nsCOMPtr<nsDOMCSSDeclaration> style = mImageContent->Style();
+  switch (aImageRendering) {
+    case StyleImageRendering::Auto:
+    case StyleImageRendering::Smooth:
+    case StyleImageRendering::Optimizequality:
+      style->SetProperty("image-rendering"_ns, "auto"_ns, ""_ns,
+                         IgnoreErrors());
+      break;
+    case StyleImageRendering::Optimizespeed:
+    case StyleImageRendering::Pixelated:
+      style->SetProperty("image-rendering"_ns, "pixelated"_ns, ""_ns,
+                         IgnoreErrors());
+      break;
+    case StyleImageRendering::CrispEdges:
+      style->SetProperty("image-rendering"_ns, "crisp-edges"_ns, ""_ns,
+                         IgnoreErrors());
+      break;
+  }
+}
+
+nsresult ImageDocument::CreateSyntheticDocument() {
+  nsresult rv = MediaDocument::CreateSyntheticDocument();
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  RefPtr<Element> body = GetBodyElement();
+  if (!body) {
+    NS_WARNING("no body on image document!");
+    return NS_ERROR_FAILURE;
+  }
+
+  RefPtr<mozilla::dom::NodeInfo> nodeInfo;
+  nodeInfo = mNodeInfoManager->GetNodeInfo(
+      nsGkAtoms::img, nullptr, kNameSpaceID_XHTML, nsINode::ELEMENT_NODE);
+
+  RefPtr<Element> image = NS_NewHTMLImageElement(nodeInfo.forget());
+  mImageContent = HTMLImageElement::FromNodeOrNull(image);
+  if (!mImageContent) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+
+  nsAutoCString src;
+  mDocumentURI->GetSpec(src);
+
+  NS_ConvertUTF8toUTF16 srcString(src);
+  mImageContent->SetLoadingEnabled(false);
+  mImageContent->SetAttr(kNameSpaceID_None, nsGkAtoms::src, srcString, false);
+  mImageContent->SetAttr(kNameSpaceID_None, nsGkAtoms::alt, srcString, false);
+
+  if (mIsInObjectOrEmbed) {
+    SetModeClass(eIsInObjectOrEmbed);
+  }
+
+  body->AppendChildTo(mImageContent, false, IgnoreErrors());
+  mImageContent->SetLoadingEnabled(true);
+
+  return NS_OK;
+}
+
+void ImageDocument::DefaultCheckOverflowing() {
+  CheckOverflowing(StaticPrefs::browser_enable_automatic_image_resizing());
+}
+
+nsresult ImageDocument::CheckOverflowing(bool changeState) {
+  const bool imageWasOverflowing = ImageIsOverflowing();
+  const bool imageWasOverflowingVertically = ImageIsOverflowingVertically();
+
+  {
+    nsPresContext* context = GetPresContext();
+    if (!context) {
+      return NS_OK;
+    }
+
+    nsRect visibleArea = context->GetVisibleArea();
+
+    mVisibleWidth = nsPresContext::AppUnitsToFloatCSSPixels(visibleArea.width);
+    mVisibleHeight =
+        nsPresContext::AppUnitsToFloatCSSPixels(visibleArea.height);
+  }
+
+  const bool windowBecameBigEnough =
+      imageWasOverflowing && !ImageIsOverflowing();
+  const bool verticalOverflowChanged =
+      imageWasOverflowingVertically != ImageIsOverflowingVertically();
+
+  if (changeState || mShouldResize || mFirstResize || windowBecameBigEnough ||
+      verticalOverflowChanged) {
+    if (mIsInObjectOrEmbed) {
+      SetModeClass(eIsInObjectOrEmbed);
+    } else if (ImageIsOverflowing() && (changeState || mShouldResize)) {
+      ShrinkToFit();
+    } else if (mImageIsResized || mFirstResize || windowBecameBigEnough) {
+      RestoreImage();
+    } else if (!mImageIsResized && verticalOverflowChanged) {
+      if (ImageIsOverflowingVertically()) {
+        SetModeClass(eOverflowingVertical);
+      } else {
+        SetModeClass(eOverflowingHorizontalOnly);
+      }
+    }
+  }
+  mFirstResize = false;
+  return NS_OK;
+}
+
+void ImageDocument::UpdateTitleAndCharset() {
+  if (mHasCustomTitle) {
+    return;
+  }
+
+  AutoRestore<bool> restore(mTitleUpdateInProgress);
+  mTitleUpdateInProgress = true;
+
+  nsAutoCString typeStr;
+  nsCOMPtr<imgIRequest> imageRequest;
+  if (mImageContent) {
+    mImageContent->GetRequest(nsIImageLoadingContent::CURRENT_REQUEST,
+                              getter_AddRefs(imageRequest));
+  }
+
+  if (imageRequest) {
+    nsCString mimeType;
+    imageRequest->GetMimeType(getter_Copies(mimeType));
+    ToUpperCase(mimeType);
+    nsCString::const_iterator start, end;
+    mimeType.BeginReading(start);
+    mimeType.EndReading(end);
+    nsCString::const_iterator iter = end;
+    if (FindInReadable("IMAGE/"_ns, start, iter) && iter != end) {
+      if (*iter == 'X') {
+        ++iter;
+        if (iter != end && *iter == '-') {
+          ++iter;
+          if (iter == end) {
+            mimeType.BeginReading(iter);
+          }
+        } else {
+          --iter;
+        }
+      }
+      typeStr = Substring(iter, end);
+    } else {
+      typeStr = mimeType;
+    }
+  }
+
+  nsAutoString status;
+  if (mImageIsResized) {
+    AutoTArray<nsString, 1> formatString;
+    formatString.AppendElement()->AppendInt(NSToCoordFloor(GetRatio() * 100));
+
+    FormatStringFromName("ScaledImage", formatString, status);
+  }
+
+  static const char* const formatNames[4] = {
+      "ImageTitleWithNeitherDimensionsNorFile",
+      "ImageTitleWithoutDimensions",
+      "ImageTitleWithDimensions2",
+      "ImageTitleWithDimensions2AndFile",
+  };
+
+  MediaDocument::UpdateTitleAndCharset(typeStr, mChannel, formatNames,
+                                       mImageWidth, mImageHeight, status);
+}
+
+bool ImageDocument::IsSiteSpecific() {
+  return !ShouldResistFingerprinting(RFPTarget::SiteSpecificZoom) &&
+         StaticPrefs::browser_zoom_siteSpecific();
+}
+
+void ImageDocument::ResetZoomLevel() {
+  if (nsContentUtils::IsChildOfSameType(this)) {
+    return;
+  }
+
+  if (RefPtr<BrowsingContext> bc = GetBrowsingContext()) {
+    (void)bc->SetFullZoom(mOriginalZoomLevel);
+  }
+}
+
+float ImageDocument::GetZoomLevel() {
+  if (BrowsingContext* bc = GetBrowsingContext()) {
+    return bc->FullZoom();
+  }
+  return mOriginalZoomLevel;
+}
+
+void ImageDocument::CheckFullZoom() {
+  nsDOMTokenList* classList =
+      mImageContent ? mImageContent->ClassList() : nullptr;
+
+  if (!classList) {
+    return;
+  }
+
+  classList->Toggle(u"fullZoomOut"_ns,
+                    dom::Optional<bool>(GetZoomLevel() > mOriginalZoomLevel),
+                    IgnoreErrors());
+  classList->Toggle(u"fullZoomIn"_ns,
+                    dom::Optional<bool>(GetZoomLevel() < mOriginalZoomLevel),
+                    IgnoreErrors());
+}
+
+float ImageDocument::GetResolution() {
+  if (PresShell* presShell = GetPresShell()) {
+    return presShell->GetResolution();
+  }
+  return mOriginalResolution;
+}
+
+void ImageDocument::MaybeSendResultToEmbedder(nsresult aResult) {
+  if (!mIsInObjectOrEmbed) {
+    return;
+  }
+
+  BrowsingContext* context = GetBrowsingContext();
+
+  if (!context) {
+    return;
+  }
+
+  if (context->GetParent() && context->GetParent()->IsInProcess()) {
+    if (Element* embedder = context->GetEmbedderElement()) {
+      if (nsCOMPtr<nsIObjectLoadingContent> objectLoadingContent =
+              do_QueryInterface(embedder)) {
+        NS_DispatchToMainThread(NS_NewRunnableFunction(
+            "nsObjectLoadingContent::SubdocumentImageLoadComplete",
+            [objectLoadingContent, aResult]() {
+              static_cast<nsObjectLoadingContent*>(objectLoadingContent.get())
+                  ->SubdocumentImageLoadComplete(aResult);
+            }));
+      }
+      return;
+    }
+  }
+
+  if (BrowserChild* browserChild =
+          BrowserChild::GetFrom(context->GetDocShell())) {
+    browserChild->SendImageLoadComplete(aResult);
+  }
+}
+}  
+
+nsresult NS_NewImageDocument(mozilla::dom::Document** aResult,
+                             nsIPrincipal* aPrincipal,
+                             nsIPrincipal* aPartitionedPrincipal) {
+  auto* doc = new mozilla::dom::ImageDocument();
+  NS_ADDREF(doc);
+
+  nsresult rv = doc->Init(aPrincipal, aPartitionedPrincipal);
+  if (NS_FAILED(rv)) {
+    NS_RELEASE(doc);
+  }
+
+  *aResult = doc;
+
+  return rv;
+}

@@ -1,0 +1,1990 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+//! The high-level module responsible for managing the pipeline and preparing
+//! commands to be issued by the `Renderer`.
+//!
+//! See the comment at the top of the `renderer` module for a description of
+//! how these two pieces interact.
+
+use api::{DebugFlags, Parameter, BoolParameter, PrimitiveFlags, MinimapData};
+use api::{DocumentId, ExternalScrollId, HitTestResult};
+use api::{IdNamespace, PipelineId, RenderNotifier, SampledScrollOffset};
+use api::{NotificationRequest, Checkpoint, QualitySettings};
+use api::{FramePublishId, RenderReasons};
+use api::units::*;
+use api::channel::{single_msg_channel, Sender, Receiver};
+use crate::bump_allocator::ChunkPool;
+use crate::AsyncPropertySampler;
+use crate::box_shadow::BoxShadow;
+use crate::prim_store::rectangle::RectanglePrim;
+#[cfg(any(feature = "capture", feature = "replay"))]
+use crate::render_api::CaptureBits;
+#[cfg(feature = "replay")]
+use crate::render_api::CapturedDocument;
+use crate::render_api::{MemoryReport, TransactionMsg, ResourceUpdate, ApiMsg, FrameMsg, ClearCache, DebugCommand};
+use crate::clip::{ClipIntern, PolygonIntern, ClipStoreScratchBuffer};
+use crate::filterdata::FilterDataIntern;
+#[cfg(any(feature = "capture", feature = "replay"))]
+use crate::capture::CaptureConfig;
+use crate::composite::{CompositorKind, CompositeDescriptor};
+use crate::frame_builder::{FrameBuilder, FrameBuilderConfig, FrameScratchBuffer};
+use glyph_rasterizer::FontInstance;
+use crate::hit_test::{HitTest, HitTester, SharedHitTester};
+use crate::intern::DataStore;
+#[cfg(any(feature = "capture", feature = "replay"))]
+use crate::internal_types::DebugOutput;
+use crate::internal_types::{FastHashMap, FrameId, FrameStamp, RenderedDocument, ResultMsg};
+use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
+use crate::picture::{PictureScratchBuffer, SurfaceInfo, RasterConfig};
+use crate::tile_cache::{SliceId, TileCacheInstance, TileCacheParams};
+use crate::picture::PictureInstance;
+use crate::prim_store::{PrimitiveScratchBuffer, PrimitiveInstance};
+use crate::prim_store::{PrimitiveKind, PrimTemplateCommonData};
+use crate::prim_store::interned::*;
+use crate::render_stats::{self, TransactionProfile};
+use crate::render_task_graph::RenderTaskGraphBuilder;
+use crate::renderer::{FullFrameStats, PipelineInfo};
+use crate::resource_cache::ResourceCache;
+#[cfg(feature = "replay")]
+use crate::resource_cache::PlainCacheOwn;
+#[cfg(feature = "replay")]
+use crate::resource_cache::PlainResources;
+#[cfg(feature = "replay")]
+use crate::scene::Scene;
+use crate::scene::{BuiltScene, SceneProperties};
+use crate::scene_builder_thread::*;
+use crate::spatial_tree::SpatialTree;
+#[cfg(feature = "replay")]
+use crate::spatial_tree::SceneSpatialTree;
+#[cfg(feature = "capture")]
+use serde::Serialize;
+#[cfg(feature = "replay")]
+use serde::Deserialize;
+#[cfg(feature = "replay")]
+use std::collections::hash_map::Entry::{Occupied, Vacant};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{mem, u32};
+#[cfg(feature = "capture")]
+use std::path::PathBuf;
+#[cfg(feature = "replay")]
+use crate::frame_builder::Frame;
+use crate::util::{Recycler, VecHelper, drain_filter};
+#[cfg(feature = "debugger")]
+use crate::debugger::DebugQueryKind;
+
+#[cfg_attr(feature = "capture", derive(Serialize))]
+#[cfg_attr(feature = "replay", derive(Deserialize))]
+#[derive(Copy, Clone)]
+pub struct DocumentView {
+    scene: SceneView,
+}
+
+/// Some rendering parameters applying at the scene level.
+#[cfg_attr(feature = "capture", derive(Serialize))]
+#[cfg_attr(feature = "replay", derive(Deserialize))]
+#[derive(Copy, Clone)]
+pub struct SceneView {
+    pub device_rect: DeviceIntRect,
+    pub quality_settings: QualitySettings,
+}
+
+enum RenderBackendStatus {
+    Continue,
+    StopRenderBackend,
+    ShutDown(Option<Sender<()>>),
+}
+
+macro_rules! declare_data_stores {
+    ( $( $name:ident : $ty:ty, )+ ) => {
+        /// A collection of resources that are shared by clips, primitives
+        /// between display lists.
+        #[cfg_attr(feature = "capture", derive(Serialize))]
+        #[cfg_attr(feature = "replay", derive(Deserialize))]
+        #[derive(Default)]
+        pub struct DataStores {
+            $(
+                pub $name: DataStore<$ty>,
+            )+
+        }
+
+        impl DataStores {
+            /// Reports CPU heap usage.
+            fn report_memory(&self, ops: &mut MallocSizeOfOps, r: &mut MemoryReport) {
+                $(
+                    r.interning.data_stores.$name += self.$name.size_of(ops);
+                )+
+            }
+
+            fn apply_updates(
+                &mut self,
+                updates: InternerUpdates,
+                profile: &mut TransactionProfile,
+            ) {
+                $(
+                    self.$name.apply_updates(
+                        updates.$name,
+                        profile,
+                    );
+                )+
+            }
+        }
+    }
+}
+
+crate::enumerate_interners!(declare_data_stores);
+
+impl DataStores {
+    /// Returns the local rect for a primitive. For most primitives, this is
+    /// the device-snapped local rect carried on the per-draw header. For
+    /// pictures, the rect is reconstructed from the picture's raster surface
+    /// since it's only known during frame building.
+    pub fn get_local_prim_rect(
+        &self,
+        prim_instance: &PrimitiveInstance,
+        snapped_local_rect: LayoutRect,
+        pictures: &[PictureInstance],
+        surfaces: &[SurfaceInfo],
+    ) -> LayoutRect {
+        match prim_instance.kind {
+            PrimitiveKind::Picture { pic_index, .. } => {
+                let pic = &pictures[pic_index.0];
+
+                match pic.raster_config {
+                    Some(RasterConfig { surface_index, ref composite_mode, .. }) => {
+                        let surface = &surfaces[surface_index.0];
+
+                        composite_mode.get_rect(surface, None)
+                    }
+                    None => {
+                        panic!("bug: get_local_prim_rect should not be called for pass-through pictures");
+                    }
+                }
+            }
+            _ => snapped_local_rect,
+        }
+    }
+
+    /// Returns the local coverage (space occupied) for a primitive. For most
+    /// primitives, this is the device-snapped local rect carried on the
+    /// per-draw header. For pictures, the coverage is reconstructed from the
+    /// picture's raster surface since it's only known during frame building.
+    pub fn get_local_prim_coverage_rect(
+        &self,
+        prim_instance: &PrimitiveInstance,
+        snapped_local_rect: LayoutRect,
+        pictures: &[PictureInstance],
+        surfaces: &[SurfaceInfo],
+    ) -> LayoutRect {
+        match prim_instance.kind {
+            PrimitiveKind::Picture { pic_index, .. } => {
+                let pic = &pictures[pic_index.0];
+
+                match pic.raster_config {
+                    Some(RasterConfig { surface_index, ref composite_mode, .. }) => {
+                        let surface = &surfaces[surface_index.0];
+
+                        composite_mode.get_coverage(surface, None)
+                    }
+                    None => {
+                        panic!("bug: get_local_prim_coverage_rect should not be called for pass-through pictures");
+                    }
+                }
+            }
+            _ => snapped_local_rect,
+        }
+    }
+
+    /// Returns true if this primitive has anti-aliasing enabled.
+    pub fn prim_has_anti_aliasing(
+        &self,
+        prim_instance: &PrimitiveInstance,
+    ) -> bool {
+        match prim_instance.kind {
+            PrimitiveKind::Picture { .. } => {
+                false
+            }
+            _ => {
+                self.as_common_data(prim_instance).flags.contains(PrimitiveFlags::ANTIALISED)
+            }
+        }
+    }
+
+    pub fn as_common_data(
+        &self,
+        prim_inst: &PrimitiveInstance
+    ) -> &PrimTemplateCommonData {
+        match prim_inst.kind {
+            PrimitiveKind::Rectangle { data_handle, .. } => {
+                let prim_data = &self.prim[data_handle];
+                &prim_data.common
+            }
+            PrimitiveKind::Image { data_handle, .. } => {
+                let prim_data = &self.image[data_handle];
+                &prim_data.common
+            }
+            PrimitiveKind::ImageBorder { data_handle, .. } => {
+                let prim_data = &self.image_border[data_handle];
+                &prim_data.common
+            }
+            PrimitiveKind::LineDecoration { data_handle, .. } => {
+                let prim_data = &self.line_decoration[data_handle];
+                &prim_data.common
+            }
+            PrimitiveKind::LinearGradient { data_handle, .. } => {
+                let prim_data = &self.linear_grad[data_handle];
+                &prim_data.common
+            }
+            PrimitiveKind::NormalBorder { data_handle, .. } => {
+                let prim_data = &self.normal_border[data_handle];
+                &prim_data.common
+            }
+            PrimitiveKind::Picture { .. } => {
+                panic!("BUG: picture prims don't have common data!");
+            }
+            PrimitiveKind::RadialGradient { data_handle, .. } => {
+                let prim_data = &self.radial_grad[data_handle];
+                &prim_data.common
+            }
+            PrimitiveKind::ConicGradient { data_handle, .. } => {
+                let prim_data = &self.conic_grad[data_handle];
+                &prim_data.common
+            }
+            PrimitiveKind::TextRun { data_handle, .. }  => {
+                let prim_data = &self.text_run[data_handle];
+                &prim_data.common
+            }
+            PrimitiveKind::YuvImage { data_handle, .. } => {
+                let prim_data = &self.yuv_image[data_handle];
+                &prim_data.common
+            }
+            PrimitiveKind::BackdropCapture { data_handle, .. } => {
+                let prim_data = &self.backdrop_capture[data_handle];
+                &prim_data.common
+            }
+            PrimitiveKind::BackdropRender { data_handle, .. } => {
+                let prim_data = &self.backdrop_render[data_handle];
+                &prim_data.common
+            }
+            PrimitiveKind::BoxShadow { data_handle, .. } => {
+                let prim_data = &self.box_shadow[data_handle];
+                &prim_data.common
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct ScratchBuffer {
+    pub primitive: PrimitiveScratchBuffer,
+    pub picture: PictureScratchBuffer,
+    pub frame: FrameScratchBuffer,
+    pub clip_store: ClipStoreScratchBuffer,
+}
+
+impl ScratchBuffer {
+    pub fn begin_frame(&mut self) {
+        self.primitive.begin_frame();
+        self.picture.begin_frame();
+        self.frame.begin_frame();
+    }
+
+    pub fn end_frame(&mut self) {
+        self.primitive.end_frame();
+    }
+
+    pub fn recycle(&mut self, recycler: &mut Recycler) {
+        self.primitive.recycle(recycler);
+        self.picture.recycle(recycler);
+    }
+
+    pub fn memory_pressure(&mut self) {
+        self.picture = Default::default();
+        self.frame = Default::default();
+        self.clip_store = Default::default();
+    }
+}
+
+struct Document {
+    /// The id of this document
+    id: DocumentId,
+
+    /// Temporary list of removed pipelines received from the scene builder
+    /// thread and forwarded to the renderer.
+    removed_pipelines: Vec<(PipelineId, DocumentId)>,
+
+    view: DocumentView,
+
+    /// The id and time of the current frame.
+    stamp: FrameStamp,
+
+    /// The latest built scene, usable to build frames.
+    /// received from the scene builder thread.
+    scene: BuiltScene,
+
+    /// The builder object that prodces frames, kept around to preserve some retained state.
+    frame_builder: FrameBuilder,
+
+    /// Allows graphs of render tasks to be created, and then built into an immutable graph output.
+    rg_builder: RenderTaskGraphBuilder,
+
+    /// A data structure to allow hit testing against rendered frames. This is updated
+    /// every time we produce a fully rendered frame.
+    hit_tester: Option<Arc<HitTester>>,
+    /// To avoid synchronous messaging we update a shared hit-tester that other threads
+    /// can query.
+    shared_hit_tester: Arc<SharedHitTester>,
+
+    /// Properties that are resolved during frame building and can be changed at any time
+    /// without requiring the scene to be re-built.
+    dynamic_properties: SceneProperties,
+
+    /// Track whether the last built frame is up to date or if it will need to be re-built
+    /// before rendering again.
+    frame_is_valid: bool,
+    hit_tester_is_valid: bool,
+    rendered_frame_is_valid: bool,
+    /// We track this information to be able to display debugging information from the
+    /// renderer.
+    has_built_scene: bool,
+
+    data_stores: DataStores,
+
+    /// Retained frame-building version of the spatial tree
+    spatial_tree: SpatialTree,
+
+    minimap_data: FastHashMap<ExternalScrollId, MinimapData>,
+
+    /// Contains various vecs of data that is used only during frame building,
+    /// where we want to recycle the memory each new display list, to avoid constantly
+    /// re-allocating and moving memory around.
+    scratch: ScratchBuffer,
+
+    #[cfg(feature = "replay")]
+    loaded_scene: Scene,
+
+    /// Tracks the state of the picture cache tiles that were composited on the previous frame.
+    prev_composite_descriptor: CompositeDescriptor,
+
+    /// Tracks if we need to invalidate dirty rects for this document, due to the picture
+    /// cache slice configuration having changed when a new scene is swapped in.
+    dirty_rects_are_valid: bool,
+
+    profile: TransactionProfile,
+    frame_stats: Option<FullFrameStats>,
+}
+
+impl Document {
+    pub fn new(
+        id: DocumentId,
+        size: DeviceIntSize,
+    ) -> Self {
+        Document {
+            id,
+            removed_pipelines: Vec::new(),
+            view: DocumentView {
+                scene: SceneView {
+                    device_rect: size.into(),
+                    quality_settings: QualitySettings::default(),
+                },
+            },
+            stamp: FrameStamp::first(id),
+            scene: BuiltScene::empty(),
+            frame_builder: FrameBuilder::new(),
+            hit_tester: None,
+            shared_hit_tester: Arc::new(SharedHitTester::new()),
+            dynamic_properties: SceneProperties::new(),
+            frame_is_valid: false,
+            hit_tester_is_valid: false,
+            rendered_frame_is_valid: false,
+            has_built_scene: false,
+            data_stores: DataStores::default(),
+            spatial_tree: SpatialTree::new(),
+            minimap_data: FastHashMap::default(),
+            scratch: ScratchBuffer::default(),
+            #[cfg(feature = "replay")]
+            loaded_scene: Scene::new(),
+            prev_composite_descriptor: CompositeDescriptor::empty(),
+            dirty_rects_are_valid: true,
+            profile: TransactionProfile::new(),
+            rg_builder: RenderTaskGraphBuilder::new(),
+            frame_stats: None,
+        }
+    }
+
+    fn can_render(&self) -> bool {
+        self.scene.has_root_pipeline
+    }
+
+    fn has_pixels(&self) -> bool {
+        !self.view.scene.device_rect.is_empty()
+    }
+
+    fn process_frame_msg(
+        &mut self,
+        message: FrameMsg,
+    ) -> DocumentOps {
+        match message {
+            FrameMsg::UpdateEpoch(pipeline_id, epoch) => {
+                self.scene.pipeline_epochs.insert(pipeline_id, epoch);
+            }
+            FrameMsg::HitTest(point, tx) => {
+                if !self.hit_tester_is_valid {
+                    self.rebuild_hit_tester();
+                }
+
+                let result = match self.hit_tester {
+                    Some(ref hit_tester) => {
+                        hit_tester.hit_test(HitTest::new(point))
+                    }
+                    None => HitTestResult { items: Vec::new() },
+                };
+
+                tx.send(result).unwrap();
+            }
+            FrameMsg::RequestHitTester(tx) => {
+                tx.send(self.shared_hit_tester.clone()).unwrap();
+            }
+            FrameMsg::SetScrollOffsets(id, offset) => {
+
+                if self.set_scroll_offsets(id, offset) {
+                    self.hit_tester_is_valid = false;
+                    self.frame_is_valid = false;
+                }
+
+                return DocumentOps {
+                    scroll: true,
+                    ..DocumentOps::nop()
+                };
+            }
+            FrameMsg::ResetDynamicProperties => {
+                self.dynamic_properties.reset_properties();
+            }
+            FrameMsg::AppendDynamicProperties(property_bindings) => {
+                self.dynamic_properties.add_properties(property_bindings);
+            }
+            FrameMsg::AppendDynamicTransformProperties(property_bindings) => {
+                self.dynamic_properties.add_transforms(property_bindings);
+            }
+            FrameMsg::SetIsTransformAsyncZooming(is_zooming, animation_id) => {
+                if let Some(node_index) = self.spatial_tree.find_spatial_node_by_anim_id(animation_id) {
+                    let node = self.spatial_tree.get_spatial_node_mut(node_index);
+
+                    if node.is_async_zooming != is_zooming {
+                        node.is_async_zooming = is_zooming;
+                        self.frame_is_valid = false;
+                    }
+                }
+            }
+            FrameMsg::SetMinimapData(id, minimap_data) => {
+              self.minimap_data.insert(id, minimap_data);
+            }
+        }
+
+        DocumentOps::nop()
+    }
+
+    fn build_frame(
+        &mut self,
+        resource_cache: &mut ResourceCache,
+        debug_flags: DebugFlags,
+        tile_caches: &mut FastHashMap<SliceId, Box<TileCacheInstance>>,
+        frame_stats: Option<FullFrameStats>,
+        present: bool,
+        render_reasons: RenderReasons,
+        chunk_pool: Arc<ChunkPool>,
+    ) -> RenderedDocument {
+        let frame_build_start_time = zeitstempel::now();
+
+        self.stamp.advance();
+
+        assert!(self.stamp.frame_id() != FrameId::INVALID,
+                "First frame increment must happen before build_frame()");
+
+        let frame = {
+            let frame = self.frame_builder.build(
+                &mut self.scene,
+                present,
+                resource_cache,
+                &mut self.rg_builder,
+                self.stamp,
+                self.view.scene.device_rect.min,
+                &self.dynamic_properties,
+                &mut self.data_stores,
+                &mut self.scratch,
+                debug_flags,
+                tile_caches,
+                &mut self.spatial_tree,
+                self.dirty_rects_are_valid,
+                &mut self.profile,
+                mem::take(&mut self.minimap_data),
+                chunk_pool,
+            );
+
+            frame
+        };
+
+        self.frame_is_valid = true;
+        self.dirty_rects_are_valid = true;
+
+        self.has_built_scene = false;
+
+        let frame_build_time_ms =
+            render_stats::ns_to_ms(zeitstempel::now() - frame_build_start_time);
+        self.profile.set(render_stats::FRAME_BUILDING_TIME, frame_build_time_ms);
+        self.profile.start_time(render_stats::FRAME_SEND_TIME);
+
+        let frame_stats = frame_stats.map(|mut stats| {
+            stats.frame_build_time += frame_build_time_ms;
+            stats
+        });
+
+        RenderedDocument {
+            frame,
+            profile: self.profile.take_and_reset(),
+            frame_stats: frame_stats,
+            render_reasons,
+        }
+    }
+
+    /// Build a frame without changing the state of the current scene.
+    ///
+    /// This is useful to render arbitrary content into to images in
+    /// the resource cache for later use without affecting what is
+    /// currently being displayed.
+    fn process_offscreen_scene(
+        &mut self,
+        mut txn: OffscreenBuiltScene,
+        resource_cache: &mut ResourceCache,
+        chunk_pool: Arc<ChunkPool>,
+        debug_flags: DebugFlags,
+    ) -> RenderedDocument {
+        let mut profile = TransactionProfile::new();
+        self.stamp.advance();
+
+
+        let mut spatial_tree = SpatialTree::new();
+        spatial_tree.apply_updates(txn.spatial_tree_updates);
+
+        let mut tile_caches = FastHashMap::default();
+        self.update_tile_caches_for_new_scene(
+            mem::take(&mut txn.scene.tile_cache_config.tile_caches),
+            &mut tile_caches,
+            resource_cache,
+        );
+
+        let present = false;
+
+        let frame = self.frame_builder.build(
+            &mut txn.scene,
+            present,
+            resource_cache,
+            &mut self.rg_builder,
+            self.stamp, 
+            self.view.scene.device_rect.min,
+            &self.dynamic_properties,
+            &self.data_stores,
+            &mut self.scratch,
+            debug_flags,
+            &mut tile_caches,
+            &mut spatial_tree,
+            self.dirty_rects_are_valid,
+            &mut profile,
+            mem::take(&mut self.minimap_data),
+            chunk_pool,
+        );
+
+        RenderedDocument {
+            frame,
+            profile,
+            render_reasons: RenderReasons::SNAPSHOT,
+            frame_stats: None,
+        }
+    }
+
+
+    fn rebuild_hit_tester(&mut self) {
+        self.spatial_tree.update_tree(&self.dynamic_properties);
+
+        let hit_tester = Arc::new(self.scene.create_hit_tester(&self.spatial_tree));
+        self.hit_tester = Some(Arc::clone(&hit_tester));
+        self.shared_hit_tester.update(hit_tester);
+        self.hit_tester_is_valid = true;
+    }
+
+    pub fn updated_pipeline_info(&mut self) -> PipelineInfo {
+        let removed_pipelines = self.removed_pipelines.take_and_preallocate();
+        PipelineInfo {
+            epochs: self.scene.pipeline_epochs.iter()
+                .map(|(&pipeline_id, &epoch)| ((pipeline_id, self.id), epoch)).collect(),
+            removed_pipelines,
+        }
+    }
+
+    /// Returns true if the node actually changed position or false otherwise.
+    pub fn set_scroll_offsets(
+        &mut self,
+        id: ExternalScrollId,
+        offsets: Vec<SampledScrollOffset>,
+    ) -> bool {
+        self.spatial_tree.set_scroll_offsets(id, offsets)
+    }
+
+    /// Update the state of tile caches when a new scene is being swapped in to
+    /// the render backend. Retain / reuse existing caches if possible, and
+    /// destroy any now unused caches.
+    fn update_tile_caches_for_new_scene(
+        &mut self,
+        mut requested_tile_caches: FastHashMap<SliceId, TileCacheParams>,
+        tile_caches: &mut FastHashMap<SliceId, Box<TileCacheInstance>>,
+        resource_cache: &mut ResourceCache,
+    ) {
+        let mut new_tile_caches = FastHashMap::default();
+        new_tile_caches.reserve(requested_tile_caches.len());
+
+        for (slice_id, params) in requested_tile_caches.drain() {
+            let tile_cache = match tile_caches.remove(&slice_id) {
+                Some(mut existing_tile_cache) => {
+                    existing_tile_cache.prepare_for_new_scene(
+                        params,
+                        resource_cache,
+                    );
+                    existing_tile_cache
+                }
+                None => {
+                    Box::new(TileCacheInstance::new(params))
+                }
+            };
+
+            new_tile_caches.insert(slice_id, tile_cache);
+        }
+
+        let unused_tile_caches = mem::replace(
+            tile_caches,
+            new_tile_caches,
+        );
+
+        if !unused_tile_caches.is_empty() {
+            self.dirty_rects_are_valid = false;
+
+            for (_, tile_cache) in unused_tile_caches {
+                tile_cache.destroy(resource_cache);
+            }
+        }
+    }
+
+    pub fn new_async_scene_ready(
+        &mut self,
+        mut built_scene: BuiltScene,
+        recycler: &mut Recycler,
+        tile_caches: &mut FastHashMap<SliceId, Box<TileCacheInstance>>,
+        resource_cache: &mut ResourceCache,
+    ) {
+        self.frame_is_valid = false;
+        self.hit_tester_is_valid = false;
+
+        self.update_tile_caches_for_new_scene(
+            mem::replace(&mut built_scene.tile_cache_config.tile_caches, FastHashMap::default()),
+            tile_caches,
+            resource_cache,
+        );
+
+
+        let old_scene = std::mem::replace(&mut self.scene, built_scene);
+        old_scene.recycle();
+
+        self.scratch.recycle(recycler);
+    }
+}
+
+struct DocumentOps {
+    scroll: bool,
+}
+
+impl DocumentOps {
+    fn nop() -> Self {
+        DocumentOps {
+            scroll: false,
+        }
+    }
+}
+
+/// The unique id for WR resource identification.
+/// The namespace_id should start from 1.
+static NEXT_NAMESPACE_ID: AtomicUsize = AtomicUsize::new(1);
+
+#[cfg(any(feature = "capture", feature = "replay"))]
+#[cfg_attr(feature = "capture", derive(Serialize))]
+#[cfg_attr(feature = "replay", derive(Deserialize))]
+struct PlainRenderBackend {
+    frame_config: FrameBuilderConfig,
+    documents: FastHashMap<DocumentId, DocumentView>,
+    resource_sequence_id: u32,
+}
+
+/// The render backend is responsible for transforming high level display lists into
+/// GPU-friendly work which is then submitted to the renderer in the form of a frame::Frame.
+///
+/// The render backend operates on its own thread.
+pub struct RenderBackend {
+    api_rx: Receiver<ApiMsg>,
+    result_tx: Sender<ResultMsg>,
+    scene_tx: Sender<SceneBuilderRequest>,
+
+    resource_cache: ResourceCache,
+    chunk_pool: Arc<ChunkPool>,
+
+    frame_config: FrameBuilderConfig,
+    default_compositor_kind: CompositorKind,
+    documents: FastHashMap<DocumentId, Document>,
+
+    notifier: Box<dyn RenderNotifier>,
+    sampler: Option<Box<dyn AsyncPropertySampler + Send>>,
+    size_of_ops: Option<MallocSizeOfOps>,
+    debug_flags: DebugFlags,
+    namespace_alloc_by_client: bool,
+
+    recycler: Recycler,
+
+    #[cfg(feature = "capture")]
+    /// If `Some`, do 'sequence capture' logging, recording updated documents,
+    /// frames, etc. This is set only through messages from the scene builder,
+    /// so all control of sequence capture goes through there.
+    capture_config: Option<CaptureConfig>,
+
+    #[cfg(feature = "replay")]
+    loaded_resource_sequence_id: u32,
+
+    /// A map of tile caches. These are stored in the backend as they are
+    /// persisted between both frame and scenes.
+    tile_caches: FastHashMap<SliceId, Box<TileCacheInstance>>,
+
+    /// The id of the latest PublishDocument
+    frame_publish_id: FramePublishId,
+}
+
+impl RenderBackend {
+    pub fn new(
+        api_rx: Receiver<ApiMsg>,
+        result_tx: Sender<ResultMsg>,
+        scene_tx: Sender<SceneBuilderRequest>,
+        resource_cache: ResourceCache,
+        chunk_pool: Arc<ChunkPool>,
+        notifier: Box<dyn RenderNotifier>,
+        frame_config: FrameBuilderConfig,
+        sampler: Option<Box<dyn AsyncPropertySampler + Send>>,
+        size_of_ops: Option<MallocSizeOfOps>,
+        debug_flags: DebugFlags,
+        namespace_alloc_by_client: bool,
+    ) -> RenderBackend {
+        RenderBackend {
+            api_rx,
+            result_tx,
+            scene_tx,
+            resource_cache,
+            chunk_pool,
+            frame_config,
+            default_compositor_kind : frame_config.compositor_kind,
+            documents: FastHashMap::default(),
+            notifier,
+            sampler,
+            size_of_ops,
+            debug_flags,
+            namespace_alloc_by_client,
+            recycler: Recycler::new(),
+            #[cfg(feature = "capture")]
+            capture_config: None,
+            #[cfg(feature = "replay")]
+            loaded_resource_sequence_id: 0,
+            tile_caches: FastHashMap::default(),
+            frame_publish_id: FramePublishId::first(),
+        }
+    }
+
+    pub fn next_namespace_id() -> IdNamespace {
+        IdNamespace(NEXT_NAMESPACE_ID.fetch_add(1, Ordering::Relaxed) as u32)
+    }
+
+    pub fn run(&mut self) {
+        let mut frame_counter: u32 = 0;
+        let mut status = RenderBackendStatus::Continue;
+
+        if let Some(ref sampler) = self.sampler {
+            sampler.register();
+        }
+
+        while let RenderBackendStatus::Continue = status {
+            status = match self.api_rx.recv() {
+                Ok(msg) => {
+                    self.process_api_msg(msg, &mut frame_counter)
+                }
+                Err(..) => { RenderBackendStatus::ShutDown(None) }
+            };
+        }
+
+        if let RenderBackendStatus::StopRenderBackend = status {
+            while let Ok(msg) = self.api_rx.recv() {
+                match msg {
+                    ApiMsg::SceneBuilderResult(SceneBuilderResult::ExternalEvent(evt)) => {
+                        self.notifier.external_event(evt);
+                    }
+                    ApiMsg::SceneBuilderResult(SceneBuilderResult::FlushComplete(tx)) => {
+                        debug_assert!(false);
+                        tx.send(()).ok();
+                    }
+                    ApiMsg::SceneBuilderResult(SceneBuilderResult::ShutDown(sender)) => {
+                        info!("Recycling stats: {:?}", self.recycler);
+                        status = RenderBackendStatus::ShutDown(sender);
+                        break;
+                   }
+                    _ => {},
+                }
+            }
+        }
+
+        while let Ok(msg) = self.api_rx.try_recv() {
+            match msg {
+                ApiMsg::SceneBuilderResult(SceneBuilderResult::FlushComplete(tx)) => {
+                    debug_assert!(false);
+                    tx.send(()).ok();
+                }
+                _ => {},
+            }
+        }
+
+        self.documents.clear();
+
+        self.notifier.shut_down();
+
+        if let Some(ref sampler) = self.sampler {
+            sampler.deregister();
+        }
+
+
+        if let RenderBackendStatus::ShutDown(Some(sender)) = status {
+            let _ = sender.send(());
+        }
+    }
+
+    fn process_transaction(
+        &mut self,
+        mut txns: Vec<Box<BuiltTransaction>>,
+        result_tx: Option<Sender<SceneSwapResult>>,
+        frame_counter: &mut u32,
+    ) -> bool {
+        self.maybe_force_nop_documents(
+            frame_counter,
+            |document_id| txns.iter().any(|txn| txn.document_id == document_id));
+
+        let mut built_frame = false;
+        for mut txn in txns.drain(..) {
+           let has_built_scene = txn.built_scene.is_some();
+
+            if let Some(doc) = self.documents.get_mut(&txn.document_id) {
+                doc.removed_pipelines.append(&mut txn.removed_pipelines);
+                doc.view.scene = txn.view;
+                doc.profile.merge(&mut txn.profile);
+
+                doc.frame_stats = if let Some(stats) = &doc.frame_stats {
+                    Some(stats.merge(&txn.frame_stats))
+                } else {
+                    Some(txn.frame_stats)
+                };
+
+                let last_sampled_scroll_offsets = if self.sampler.is_some() {
+                    Some(doc.spatial_tree.get_last_sampled_scroll_offsets())
+                } else {
+                    None
+                };
+
+                if let Some(updates) = txn.spatial_tree_updates.take() {
+                    doc.spatial_tree.apply_updates(updates);
+                }
+
+                if let Some(built_scene) = txn.built_scene.take() {
+                    doc.new_async_scene_ready(
+                        built_scene,
+                        &mut self.recycler,
+                        &mut self.tile_caches,
+                        &mut self.resource_cache,
+                    );
+                }
+
+                if let Some(updates) = txn.interner_updates.take() {
+                    doc.data_stores.apply_updates(updates, &mut doc.profile);
+                }
+
+                if let Some(last_sampled) = last_sampled_scroll_offsets {
+                    doc.spatial_tree
+                        .apply_last_sampled_scroll_offsets(last_sampled);
+                }
+
+                if !doc.hit_tester_is_valid {
+                    doc.rebuild_hit_tester();
+                }
+
+                if let Some(ref tx) = result_tx {
+                    let (resume_tx, resume_rx) = single_msg_channel();
+                    tx.send(SceneSwapResult::Complete(resume_tx)).unwrap();
+                    resume_rx.recv().ok();
+                }
+
+                self.resource_cache.add_rasterized_blob_images(
+                    txn.rasterized_blobs.take(),
+                    &mut doc.profile,
+                );
+
+                for offscreen_scene in txn.offscreen_scenes.drain(..) {
+                    self.resource_cache.post_scene_building_update(
+                        txn.resource_updates.take(),
+                        &mut doc.profile,
+                    );
+
+                    let rendered_document = doc.process_offscreen_scene(
+                        offscreen_scene,
+                        &mut self.resource_cache,
+                        self.chunk_pool.clone(),
+                        self.debug_flags,
+                    );
+
+                    let pending_update = self.resource_cache.pending_updates();
+
+                    let msg = ResultMsg::PublishDocument(
+                        self.frame_publish_id,
+                        txn.document_id,
+                        rendered_document,
+                        pending_update,
+                    );
+                    self.result_tx.send(msg).unwrap();
+
+                    let params = api::FrameReadyParams {
+                        present: false,
+                        render: true,
+                        scrolled: false,
+                        tracked: false,
+                    };
+
+                    self.notifier.new_frame_ready(
+                        txn.document_id,
+                        self.frame_publish_id,
+                        &params
+                    );
+                }
+            } else {
+                if let Some(ref tx) = result_tx {
+                    tx.send(SceneSwapResult::Aborted).unwrap();
+                }
+                continue;
+            }
+
+            built_frame |= self.update_document(
+                txn.document_id,
+                txn.resource_updates.take(),
+                txn.frame_ops.take(),
+                txn.notifications.take(),
+                txn.render_frame,
+                txn.present,
+                txn.tracked,
+                RenderReasons::SCENE,
+                None,
+                txn.invalidate_rendered_frame,
+                frame_counter,
+                has_built_scene,
+            );
+
+            if self.debug_flags.contains(DebugFlags::DUMP_SPATIAL_TREE) {
+                if let Some(doc) = self.documents.get(&txn.document_id) {
+                    let spatial_tree = doc.spatial_tree.print_to_string();
+                    if !spatial_tree.is_empty() {
+                        eprintln!(
+                            "-- WebRender spatial tree ({:?}) --\n{}",
+                            txn.document_id, spatial_tree
+                        );
+                    }
+                }
+            }
+        }
+
+        built_frame
+    }
+
+    fn process_api_msg(
+        &mut self,
+        msg: ApiMsg,
+        frame_counter: &mut u32,
+    ) -> RenderBackendStatus {
+        match msg {
+            ApiMsg::CloneApi(sender) => {
+                assert!(!self.namespace_alloc_by_client);
+                sender.send(Self::next_namespace_id()).unwrap();
+            }
+            ApiMsg::CloneApiByClient(namespace_id) => {
+                assert!(self.namespace_alloc_by_client);
+                debug_assert!(!self.documents.iter().any(|(did, _doc)| did.namespace_id == namespace_id));
+            }
+            ApiMsg::AddDocument(document_id, initial_size) => {
+                let document = Document::new(
+                    document_id,
+                    initial_size,
+                );
+                let old = self.documents.insert(document_id, document);
+                debug_assert!(old.is_none());
+            }
+            ApiMsg::MemoryPressure => {
+                self.resource_cache.clear(ClearCache::all());
+
+                for (_, doc) in &mut self.documents {
+                    doc.scratch.memory_pressure();
+                    for tile_cache in self.tile_caches.values_mut() {
+                        tile_cache.memory_pressure(&mut self.resource_cache);
+                    }
+                }
+
+                let resource_updates = self.resource_cache.pending_updates();
+                let msg = ResultMsg::UpdateResources {
+                    resource_updates,
+                    memory_pressure: true,
+                };
+                self.result_tx.send(msg).unwrap();
+                self.notifier.wake_up(false);
+
+                self.chunk_pool.purge_all_chunks();
+            }
+            ApiMsg::ReportMemory(tx) => {
+                self.report_memory(tx);
+            }
+            ApiMsg::DebugCommand(option) => {
+                let msg = match option {
+                    DebugCommand::SetPictureTileSize(tile_size) => {
+                        self.frame_config.tile_size_override = tile_size;
+                        self.update_frame_builder_config();
+
+                        return RenderBackendStatus::Continue;
+                    }
+                    DebugCommand::SetMaximumSurfaceSize(surface_size) => {
+                        self.frame_config.max_surface_override = surface_size;
+                        self.update_frame_builder_config();
+
+                        return RenderBackendStatus::Continue;
+                    }
+                    DebugCommand::GenerateFrame => {
+                        let documents: Vec<DocumentId> = self.documents.keys()
+                            .cloned()
+                            .collect();
+                        for document_id in documents {
+                            let mut invalidation_config = false;
+                            if let Some(doc) = self.documents.get_mut(&document_id) {
+                                doc.frame_is_valid = false;
+                                invalidation_config = doc.scene.config.force_invalidation;
+                                doc.scene.config.force_invalidation = true;
+                            }
+
+                            self.update_document(
+                                document_id,
+                                Vec::default(),
+                                Vec::default(),
+                                Vec::default(),
+                                true,
+                                true,
+                                false,
+                                RenderReasons::empty(),
+                                None,
+                                true,
+                                frame_counter,
+                                false,
+                            );
+
+                            if let Some(doc) = self.documents.get_mut(&document_id) {
+                                doc.scene.config.force_invalidation = invalidation_config;
+                            }
+                        }
+
+                        return RenderBackendStatus::Continue;
+                    }
+                    #[cfg(feature = "debugger")]
+                    DebugCommand::CaptureRenderDoc(..) => {
+                        self.resource_cache.clear(ClearCache::all());
+
+                        let documents: Vec<DocumentId> = self.documents.keys()
+                            .cloned()
+                            .collect();
+                        for document_id in documents {
+                            let mut invalidation_config = false;
+                            if let Some(doc) = self.documents.get_mut(&document_id) {
+                                doc.frame_is_valid = false;
+                                invalidation_config = doc.scene.config.force_invalidation;
+                                doc.scene.config.force_invalidation = true;
+                            }
+
+                            self.update_document(
+                                document_id,
+                                Vec::default(),
+                                Vec::default(),
+                                Vec::default(),
+                                true,
+                                true,
+                                false,
+                                RenderReasons::empty(),
+                                None,
+                                true,
+                                frame_counter,
+                                false,
+                            );
+
+                            if let Some(doc) = self.documents.get_mut(&document_id) {
+                                doc.scene.config.force_invalidation = invalidation_config;
+                            }
+                        }
+
+                        ResultMsg::DebugCommand(option)
+                    }
+                    #[cfg(feature = "capture")]
+                    DebugCommand::SaveCapture(root, bits) => {
+                        let output = self.save_capture(root, bits);
+                        ResultMsg::DebugOutput(output)
+                    },
+                    #[cfg(feature = "capture")]
+                    DebugCommand::StartCaptureSequence(root, bits) => {
+                        self.start_capture_sequence(root, bits);
+                        return RenderBackendStatus::Continue;
+                    },
+                    #[cfg(feature = "capture")]
+                    DebugCommand::StopCaptureSequence => {
+                        self.stop_capture_sequence();
+                        return RenderBackendStatus::Continue;
+                    },
+                    #[cfg(feature = "replay")]
+                    DebugCommand::LoadCapture(path, ids, tx) => {
+                        NEXT_NAMESPACE_ID.fetch_add(1, Ordering::Relaxed);
+                        *frame_counter += 1;
+
+                        let mut config = CaptureConfig::new(path, CaptureBits::all());
+                        if let Some((scene_id, frame_id)) = ids {
+                            config.scene_id = scene_id;
+                            config.frame_id = frame_id;
+                        }
+
+                        self.load_capture(config);
+
+                        for (id, doc) in &self.documents {
+                            let captured = CapturedDocument {
+                                document_id: *id,
+                                root_pipeline_id: doc.loaded_scene.root_pipeline_id,
+                            };
+                            tx.send(captured).unwrap();
+                        }
+
+                        return RenderBackendStatus::Continue;
+                    }
+                    #[cfg(feature = "debugger")]
+                    DebugCommand::Query(ref query) => {
+                        match query.kind {
+                            DebugQueryKind::SpatialTree { .. } => {
+                                if let Some(doc) = self.documents.values().next() {
+                                    let result = doc.spatial_tree.print_to_string();
+                                    query.result.send(result).ok();
+                                }
+                                return RenderBackendStatus::Continue;
+                            }
+                            DebugQueryKind::CompositorView { .. } |
+                            DebugQueryKind::CompositorConfig { .. } |
+                            DebugQueryKind::Textures { .. } => {
+                                ResultMsg::DebugCommand(option)
+                            }
+                        }
+                    }
+                    DebugCommand::ClearCaches(mask) => {
+                        self.resource_cache.clear(mask);
+                        return RenderBackendStatus::Continue;
+                    }
+                    DebugCommand::EnableNativeCompositor(enable) => {
+                        if let CompositorKind::Draw { .. } = self.default_compositor_kind {
+                            unreachable!();
+                        }
+
+                        let compositor_kind = if enable {
+                            self.default_compositor_kind
+                        } else {
+                            CompositorKind::default()
+                        };
+
+                        for (_, doc) in &mut self.documents {
+                            doc.scene.config.compositor_kind = compositor_kind;
+                            doc.frame_is_valid = false;
+                        }
+
+                        self.frame_config.compositor_kind = compositor_kind;
+                        self.update_frame_builder_config();
+
+                        return RenderBackendStatus::Continue;
+                    }
+                    DebugCommand::SetBatchingLookback(count) => {
+                        self.frame_config.batch_lookback_count = count as usize;
+                        self.update_frame_builder_config();
+
+                        return RenderBackendStatus::Continue;
+                    }
+                    DebugCommand::SimulateLongSceneBuild(time_ms) => {
+                        let _ = self.scene_tx.send(SceneBuilderRequest::SimulateLongSceneBuild(time_ms));
+                        return RenderBackendStatus::Continue;
+                    }
+                    DebugCommand::SetFlags(flags) => {
+                        self.resource_cache.set_debug_flags(flags);
+
+                        let force_invalidation = flags.contains(DebugFlags::FORCE_PICTURE_INVALIDATION);
+                        if self.frame_config.force_invalidation != force_invalidation {
+                            self.frame_config.force_invalidation = force_invalidation;
+                            for doc in self.documents.values_mut() {
+                                doc.scene.config.force_invalidation = force_invalidation;
+                            }
+                            self.update_frame_builder_config();
+                        }
+
+                        self.debug_flags = flags;
+
+                        ResultMsg::DebugCommand(option)
+                    }
+                    _ => ResultMsg::DebugCommand(option),
+                };
+                self.result_tx.send(msg).unwrap();
+                self.notifier.wake_up(true);
+            }
+            ApiMsg::UpdateDocuments(transaction_msgs) => {
+                self.prepare_transactions(
+                    transaction_msgs,
+                    frame_counter,
+                );
+            }
+            ApiMsg::SceneBuilderResult(msg) => {
+                return self.process_scene_builder_result(msg, frame_counter);
+            }
+        }
+
+        self.chunk_pool.purge_chunks(2, 3);
+
+        RenderBackendStatus::Continue
+    }
+
+    fn process_scene_builder_result(
+        &mut self,
+        msg: SceneBuilderResult,
+        frame_counter: &mut u32,
+    ) -> RenderBackendStatus {
+
+        match msg {
+            SceneBuilderResult::Transactions(txns, result_tx) => {
+                self.process_transaction(
+                    txns,
+                    result_tx,
+                    frame_counter,
+                );
+            },
+            #[cfg(feature = "capture")]
+            SceneBuilderResult::CapturedTransactions(txns, capture_config, result_tx) => {
+                if let Some(ref mut old_config) = self.capture_config {
+                    assert!(old_config.scene_id <= capture_config.scene_id);
+                    if old_config.scene_id < capture_config.scene_id {
+                        old_config.scene_id = capture_config.scene_id;
+                        old_config.frame_id = 0;
+                    }
+                } else {
+                    self.capture_config = Some(capture_config);
+                }
+
+                let built_frame = self.process_transaction(
+                    txns,
+                    result_tx,
+                    frame_counter,
+                );
+
+                if built_frame {
+                    self.save_capture_sequence();
+                }
+            },
+            #[cfg(feature = "capture")]
+            SceneBuilderResult::StopCaptureSequence => {
+                self.capture_config = None;
+            }
+            SceneBuilderResult::GetGlyphDimensions(request) => {
+                let mut glyph_dimensions = Vec::with_capacity(request.glyph_indices.len());
+                let instance_key = self.resource_cache.map_font_instance_key(request.key);
+                if let Some(base) = self.resource_cache.get_font_instance(instance_key) {
+                    let font = FontInstance::from_base(Arc::clone(&base));
+                    for glyph_index in &request.glyph_indices {
+                        let glyph_dim = self.resource_cache.get_glyph_dimensions(&font, *glyph_index);
+                        glyph_dimensions.push(glyph_dim);
+                    }
+                }
+                request.sender.send(glyph_dimensions).unwrap();
+            }
+            SceneBuilderResult::GetGlyphIndices(request) => {
+                let mut glyph_indices = Vec::with_capacity(request.text.len());
+                let font_key = self.resource_cache.map_font_key(request.key);
+                for ch in request.text.chars() {
+                    let index = self.resource_cache.get_glyph_index(font_key, ch);
+                    glyph_indices.push(index);
+                }
+                request.sender.send(glyph_indices).unwrap();
+            }
+            SceneBuilderResult::FlushComplete(tx) => {
+                tx.send(()).ok();
+            }
+            SceneBuilderResult::ExternalEvent(evt) => {
+                self.notifier.external_event(evt);
+            }
+            SceneBuilderResult::ClearNamespace(id) => {
+                self.resource_cache.clear_namespace(id);
+                self.documents.retain(|doc_id, _doc| doc_id.namespace_id != id);
+            }
+            SceneBuilderResult::DeleteDocument(document_id) => {
+                self.documents.remove(&document_id);
+            }
+            SceneBuilderResult::SetParameter(param) => {
+                if let Parameter::Bool(BoolParameter::Multithreading, enabled) = param {
+                    self.resource_cache.enable_multithreading(enabled);
+                }
+                let _ = self.result_tx.send(ResultMsg::SetParameter(param));
+            }
+            SceneBuilderResult::StopRenderBackend => {
+                return RenderBackendStatus::StopRenderBackend;
+            }
+            SceneBuilderResult::ShutDown(sender) => {
+                info!("Recycling stats: {:?}", self.recycler);
+                return RenderBackendStatus::ShutDown(sender);
+            }
+        }
+
+        RenderBackendStatus::Continue
+    }
+
+    fn update_frame_builder_config(&self) {
+        self.send_backend_message(
+            SceneBuilderRequest::SetFrameBuilderConfig(
+                self.frame_config.clone()
+            )
+        );
+    }
+
+    fn requires_frame_build(&mut self) -> bool {
+        false 
+    }
+
+    fn prepare_transactions(
+        &mut self,
+        txns: Vec<Box<TransactionMsg>>,
+        frame_counter: &mut u32,
+    ) {
+        self.maybe_force_nop_documents(
+            frame_counter,
+            |document_id| txns.iter().any(|txn| txn.document_id == document_id));
+
+        let mut built_frame = false;
+        for mut txn in txns {
+            if txn.generate_frame.as_bool() {
+                txn.profile.end_time(render_stats::API_SEND_TIME);
+            }
+
+            self.documents.get_mut(&txn.document_id).unwrap().profile.merge(&mut txn.profile);
+
+            built_frame |= self.update_document(
+                txn.document_id,
+                txn.resource_updates.take(),
+                txn.frame_ops.take(),
+                txn.notifications.take(),
+                txn.generate_frame.as_bool(),
+                txn.generate_frame.present(),
+                txn.generate_frame.tracked(),
+                txn.render_reasons,
+                txn.generate_frame.id(),
+                txn.invalidate_rendered_frame,
+                frame_counter,
+                false,
+            );
+        }
+        if built_frame {
+            #[cfg(feature = "capture")]
+            self.save_capture_sequence();
+        }
+    }
+
+    /// In certain cases, resources shared by multiple documents have to run
+    /// maintenance operations, like cleaning up unused cache items. In those
+    /// cases, we are forced to build frames for all documents, however we
+    /// may not have a transaction ready for every document - this method
+    /// calls update_document with the details of a fake, nop transaction just
+    /// to force a frame build.
+    fn maybe_force_nop_documents<F>(&mut self,
+                                    frame_counter: &mut u32,
+                                    document_already_present: F) where
+        F: Fn(DocumentId) -> bool {
+        if self.requires_frame_build() {
+            let nop_documents : Vec<DocumentId> = self.documents.keys()
+                .cloned()
+                .filter(|key| !document_already_present(*key))
+                .collect();
+            let mut built_frame = false;
+            for &document_id in &nop_documents {
+                built_frame |= self.update_document(
+                    document_id,
+                    Vec::default(),
+                    Vec::default(),
+                    Vec::default(),
+                    false,
+                    false,
+                    false,
+                    RenderReasons::empty(),
+                    None,
+                    false,
+                    frame_counter,
+                    false);
+            }
+            match built_frame {
+                true =>
+                {
+                    #[cfg(feature = "capture")]
+                    self.save_capture_sequence()
+                }
+                _ => {},
+            }
+        }
+    }
+
+    fn update_document(
+        &mut self,
+        document_id: DocumentId,
+        resource_updates: Vec<ResourceUpdate>,
+        mut frame_ops: Vec<FrameMsg>,
+        mut notifications: Vec<NotificationRequest>,
+        mut render_frame: bool,
+        mut present: bool,
+        tracked: bool,
+        render_reasons: RenderReasons,
+        generated_frame_id: Option<u64>,
+        invalidate_rendered_frame: bool,
+        frame_counter: &mut u32,
+        has_built_scene: bool,
+    ) -> bool {
+        let update_doc_start = zeitstempel::now();
+
+        let requested_frame = render_frame || self.frame_config.force_invalidation;
+
+        let requires_frame_build = self.requires_frame_build();
+        let doc = self.documents.get_mut(&document_id).unwrap();
+
+        if requested_frame {
+            if let Some(ref sampler) = self.sampler {
+                frame_ops.append(&mut sampler.sample(document_id, generated_frame_id));
+            }
+        }
+
+        doc.has_built_scene |= has_built_scene;
+
+        let mut scroll = false;
+        for frame_msg in frame_ops {
+            let op = doc.process_frame_msg(frame_msg);
+            scroll |= op.scroll;
+        }
+
+        for update in &resource_updates {
+            if let ResourceUpdate::UpdateImage(..) = update {
+                doc.frame_is_valid = false;
+            }
+        }
+
+        self.resource_cache.post_scene_building_update(
+            resource_updates,
+            &mut doc.profile,
+        );
+
+        if doc.dynamic_properties.flush_pending_updates() {
+            doc.frame_is_valid = false;
+            doc.hit_tester_is_valid = false;
+        }
+
+        if !doc.can_render() {
+            render_frame = false;
+        }
+
+        let build_frame = (render_frame && !doc.frame_is_valid && doc.has_pixels()) ||
+            (requires_frame_build && doc.can_render());
+
+        if invalidate_rendered_frame {
+            doc.rendered_frame_is_valid = false;
+            if doc.scene.config.compositor_kind.should_redraw_on_invalidation() {
+                let msg = ResultMsg::ForceRedraw;
+                self.result_tx.send(msg).unwrap();
+            }
+        }
+
+        if build_frame {
+            if !requested_frame {
+                present = true;
+            }
+
+
+            *frame_counter += 1;
+
+            let (pending_update, mut rendered_document) = {
+                let frame_stats = doc.frame_stats.take();
+
+                let rendered_document = doc.build_frame(
+                    &mut self.resource_cache,
+                    self.debug_flags,
+                    &mut self.tile_caches,
+                    frame_stats,
+                    present,
+                    render_reasons,
+                    self.chunk_pool.clone(),
+                );
+
+                debug!("generated frame for document {:?} with {} passes",
+                    document_id, rendered_document.frame.passes.len());
+
+                let pending_update = self.resource_cache.pending_updates();
+                (pending_update, rendered_document)
+            };
+
+            rendered_document
+                .frame
+                .composite_state
+                .update_dirty_rect_validity(&doc.prev_composite_descriptor);
+
+            let composite_descriptor = rendered_document
+                .frame
+                .composite_state
+                .descriptor
+                .clone();
+
+            if !pending_update.is_nop() ||
+               !rendered_document.frame.is_nop() ||
+               composite_descriptor != doc.prev_composite_descriptor {
+                doc.rendered_frame_is_valid = false;
+            }
+            doc.prev_composite_descriptor = composite_descriptor;
+
+            #[cfg(feature = "capture")]
+            match self.capture_config {
+                Some(ref mut config) => {
+                    config.prepare_frame();
+
+                    if config.bits.contains(CaptureBits::FRAME) {
+                        let file_name = format!("frame-{}-{}", document_id.namespace_id.0, document_id.id);
+                        config.serialize_for_frame(&rendered_document.frame, file_name);
+                    }
+
+                    let data_stores_name = format!("data-stores-{}-{}", document_id.namespace_id.0, document_id.id);
+                    config.serialize_for_frame(&doc.data_stores, data_stores_name);
+
+                    let frame_spatial_tree_name = format!("frame-spatial-tree-{}-{}", document_id.namespace_id.0, document_id.id);
+                    config.serialize_for_frame::<SpatialTree, _>(&doc.spatial_tree, frame_spatial_tree_name);
+
+                    let properties_name = format!("properties-{}-{}", document_id.namespace_id.0, document_id.id);
+                    config.serialize_for_frame(&doc.dynamic_properties, properties_name);
+                },
+                None => {},
+            }
+
+            let update_doc_time = render_stats::ns_to_ms(zeitstempel::now() - update_doc_start);
+            rendered_document.profile.set(render_stats::UPDATE_DOCUMENT_TIME, update_doc_time);
+
+            let msg = ResultMsg::PublishPipelineInfo(doc.updated_pipeline_info());
+            self.result_tx.send(msg).unwrap();
+
+            self.frame_publish_id.advance();
+            let msg = ResultMsg::PublishDocument(
+                self.frame_publish_id,
+                document_id,
+                rendered_document,
+                pending_update,
+            );
+            self.result_tx.send(msg).unwrap();
+        } else if requested_frame {
+            let msg = ResultMsg::PublishPipelineInfo(doc.updated_pipeline_info());
+            self.result_tx.send(msg).unwrap();
+        }
+
+        drain_filter(
+            &mut notifications,
+            |n| { n.when() == Checkpoint::FrameBuilt },
+            |n| { n.notify(); },
+        );
+
+        if !notifications.is_empty() {
+            self.result_tx.send(ResultMsg::AppendNotificationRequests(notifications)).unwrap();
+        }
+
+        if requested_frame {
+            if doc.rendered_frame_is_valid {
+                render_frame = false;
+            } else if render_frame {
+                doc.rendered_frame_is_valid = true;
+            }
+            let params = api::FrameReadyParams {
+                present,
+                render: render_frame,
+                scrolled: scroll,
+                tracked,
+            };
+            self.notifier.new_frame_ready(document_id, self.frame_publish_id, &params);
+        }
+
+        if !doc.hit_tester_is_valid {
+            doc.rebuild_hit_tester();
+        }
+
+        build_frame
+    }
+
+    fn send_backend_message(&self, msg: SceneBuilderRequest) {
+        self.scene_tx.send(msg).unwrap();
+    }
+
+    fn report_memory(&mut self, tx: Sender<Box<MemoryReport>>) {
+        let mut report = Box::new(MemoryReport::default());
+        let ops = self.size_of_ops.as_mut().unwrap();
+        let op = ops.size_of_op;
+        for doc in self.documents.values() {
+            report.clip_stores += doc.scene.clip_store.size_of(ops);
+            report.hit_testers += match &doc.hit_tester {
+                Some(hit_tester) => hit_tester.size_of(ops),
+                None => 0,
+            };
+
+            doc.data_stores.report_memory(ops, &mut report)
+        }
+
+        (*report) += self.resource_cache.report_memory(op);
+        report.texture_cache_structures = self.resource_cache
+            .texture_cache
+            .report_memory(ops);
+
+        self.send_backend_message(
+            SceneBuilderRequest::ReportMemory(report, tx)
+        );
+    }
+
+    #[cfg(feature = "capture")]
+    fn save_capture_sequence(&mut self) {
+        if let Some(ref mut config) = self.capture_config {
+            let deferred = self.resource_cache.save_capture_sequence(config);
+
+            let backend = PlainRenderBackend {
+                frame_config: self.frame_config.clone(),
+                resource_sequence_id: config.resource_id,
+                documents: self.documents
+                    .iter()
+                    .map(|(id, doc)| (*id, doc.view))
+                    .collect(),
+            };
+            config.serialize_for_frame(&backend, "backend");
+
+            if !deferred.is_empty() {
+                let msg = ResultMsg::DebugOutput(DebugOutput::SaveCapture(config.clone(), deferred));
+                self.result_tx.send(msg).unwrap();
+            }
+        }
+    }
+}
+
+impl RenderBackend {
+    #[cfg(feature = "capture")]
+    fn save_capture(
+        &mut self,
+        root: PathBuf,
+        bits: CaptureBits,
+    ) -> DebugOutput {
+        use std::fs;
+        use crate::render_task_graph::dump_render_tasks_as_svg;
+
+        debug!("capture: saving {:?}", root);
+        if !root.is_dir() {
+            if let Err(e) = fs::create_dir_all(&root) {
+                panic!("Unable to create capture dir: {:?}", e);
+            }
+        }
+        let config = CaptureConfig::new(root, bits);
+
+        for (&id, doc) in &mut self.documents {
+            debug!("\tdocument {:?}", id);
+            if config.bits.contains(CaptureBits::FRAME) {
+                let force_invalidation = std::mem::replace(&mut doc.scene.config.force_invalidation, true);
+                let rendered_document = doc.build_frame(
+                    &mut self.resource_cache,
+                    self.debug_flags,
+                    &mut self.tile_caches,
+                    None,
+                    true,
+                    RenderReasons::empty(),
+                    self.chunk_pool.clone(),
+                );
+
+                doc.scene.config.force_invalidation = force_invalidation;
+
+                let file_name = format!("frame-{}-{}", id.namespace_id.0, id.id);
+                config.serialize_for_frame(&rendered_document.frame, file_name);
+                let file_name = format!("spatial-{}-{}", id.namespace_id.0, id.id);
+                config.serialize_tree_for_frame(&doc.spatial_tree, file_name);
+                let file_name = format!("built-primitives-{}-{}", id.namespace_id.0, id.id);
+                config.serialize_for_frame(&doc.scene.prim_store, file_name);
+                let file_name = format!("built-clips-{}-{}", id.namespace_id.0, id.id);
+                config.serialize_for_frame(&doc.scene.clip_store, file_name);
+                let file_name = format!("scratch-{}-{}", id.namespace_id.0, id.id);
+                config.serialize_for_frame(&doc.scratch.primitive, file_name);
+                let file_name = format!("render-tasks-{}-{}.svg", id.namespace_id.0, id.id);
+                let mut render_tasks_file = fs::File::create(&config.file_path_for_frame(file_name, "svg"))
+                    .expect("Failed to open the SVG file.");
+                dump_render_tasks_as_svg(
+                    &rendered_document.frame.render_tasks,
+                    &mut render_tasks_file
+                ).unwrap();
+
+                let file_name = format!("texture-cache-color-linear-{}-{}.svg", id.namespace_id.0, id.id);
+                let mut texture_file = fs::File::create(&config.file_path_for_frame(file_name, "svg"))
+                    .expect("Failed to open the SVG file.");
+                self.resource_cache.texture_cache.dump_color8_linear_as_svg(&mut texture_file).unwrap();
+
+                let file_name = format!("texture-cache-color8-glyphs-{}-{}.svg", id.namespace_id.0, id.id);
+                let mut texture_file = fs::File::create(&config.file_path_for_frame(file_name, "svg"))
+                    .expect("Failed to open the SVG file.");
+                self.resource_cache.texture_cache.dump_color8_glyphs_as_svg(&mut texture_file).unwrap();
+
+                let file_name = format!("texture-cache-alpha8-glyphs-{}-{}.svg", id.namespace_id.0, id.id);
+                let mut texture_file = fs::File::create(&config.file_path_for_frame(file_name, "svg"))
+                    .expect("Failed to open the SVG file.");
+                self.resource_cache.texture_cache.dump_alpha8_glyphs_as_svg(&mut texture_file).unwrap();
+
+                let file_name = format!("texture-cache-alpha8-linear-{}-{}.svg", id.namespace_id.0, id.id);
+                let mut texture_file = fs::File::create(&config.file_path_for_frame(file_name, "svg"))
+                    .expect("Failed to open the SVG file.");
+                self.resource_cache.texture_cache.dump_alpha8_linear_as_svg(&mut texture_file).unwrap();
+            }
+
+            let data_stores_name = format!("data-stores-{}-{}", id.namespace_id.0, id.id);
+            config.serialize_for_frame(&doc.data_stores, data_stores_name);
+
+            let frame_spatial_tree_name = format!("frame-spatial-tree-{}-{}", id.namespace_id.0, id.id);
+            config.serialize_for_frame::<SpatialTree, _>(&doc.spatial_tree, frame_spatial_tree_name);
+
+            let properties_name = format!("properties-{}-{}", id.namespace_id.0, id.id);
+            config.serialize_for_frame(&doc.dynamic_properties, properties_name);
+        }
+
+        if config.bits.contains(CaptureBits::FRAME) {
+            assert!(!self.requires_frame_build(), "Caches were cleared during a capture.");
+        }
+
+        debug!("\tscene builder");
+        self.send_backend_message(
+            SceneBuilderRequest::SaveScene(config.clone())
+        );
+
+        debug!("\tresource cache");
+        let (resources, deferred) = self.resource_cache.save_capture(&config.root);
+
+        info!("\tbackend");
+        let backend = PlainRenderBackend {
+            frame_config: self.frame_config.clone(),
+            resource_sequence_id: 0,
+            documents: self.documents
+                .iter()
+                .map(|(id, doc)| (*id, doc.view))
+                .collect(),
+        };
+
+        config.serialize_for_frame(&backend, "backend");
+        config.serialize_for_frame(&resources, "plain-resources");
+
+        if config.bits.contains(CaptureBits::FRAME) {
+            let msg_update_resources = ResultMsg::UpdateResources {
+                resource_updates: self.resource_cache.pending_updates(),
+                memory_pressure: false,
+            };
+            self.result_tx.send(msg_update_resources).unwrap();
+            info!("\tresource cache");
+            let caches = self.resource_cache.save_caches(&config.root);
+            config.serialize_for_resource(&caches, "resource_cache");
+        }
+
+        DebugOutput::SaveCapture(config, deferred)
+    }
+
+    #[cfg(feature = "capture")]
+    fn start_capture_sequence(
+        &mut self,
+        root: PathBuf,
+        bits: CaptureBits,
+    ) {
+        self.send_backend_message(
+            SceneBuilderRequest::StartCaptureSequence(CaptureConfig::new(root, bits))
+        );
+    }
+
+    #[cfg(feature = "capture")]
+    fn stop_capture_sequence(
+        &mut self,
+    ) {
+        self.send_backend_message(
+            SceneBuilderRequest::StopCaptureSequence
+        );
+    }
+
+    #[cfg(feature = "replay")]
+    fn load_capture(
+        &mut self,
+        mut config: CaptureConfig,
+    ) {
+        debug!("capture: loading {:?}", config.frame_root());
+        let backend = config.deserialize_for_frame::<PlainRenderBackend, _>("backend")
+            .expect("Unable to open backend.ron");
+
+        let first_load = backend.resource_sequence_id == 0;
+        if self.loaded_resource_sequence_id != backend.resource_sequence_id || first_load {
+            self.documents.clear();
+
+            config.resource_id = backend.resource_sequence_id;
+            self.loaded_resource_sequence_id = backend.resource_sequence_id;
+
+            let plain_resources = config.deserialize_for_resource::<PlainResources, _>("plain-resources")
+                .expect("Unable to open plain-resources.ron");
+            let caches_maybe = config.deserialize_for_resource::<PlainCacheOwn, _>("resource_cache");
+
+
+            let plain_externals = self.resource_cache.load_capture(
+                plain_resources,
+                caches_maybe,
+                &config,
+            );
+
+            let msg_load = ResultMsg::DebugOutput(
+                DebugOutput::LoadCapture(config.clone(), plain_externals)
+            );
+            self.result_tx.send(msg_load).unwrap();
+        }
+
+        self.frame_config = backend.frame_config;
+
+        let mut scenes_to_build = Vec::new();
+
+        for (id, view) in backend.documents {
+            debug!("\tdocument {:?}", id);
+            let scene_name = format!("scene-{}-{}", id.namespace_id.0, id.id);
+            let scene = config.deserialize_for_scene::<Scene, _>(&scene_name)
+                .expect(&format!("Unable to open {}.ron", scene_name));
+
+            let scene_spatial_tree_name = format!("scene-spatial-tree-{}-{}", id.namespace_id.0, id.id);
+            let scene_spatial_tree = config.deserialize_for_scene::<SceneSpatialTree, _>(&scene_spatial_tree_name)
+                .expect(&format!("Unable to open {}.ron", scene_spatial_tree_name));
+
+            let interners_name = format!("interners-{}-{}", id.namespace_id.0, id.id);
+            let interners = config.deserialize_for_scene::<Interners, _>(&interners_name)
+                .expect(&format!("Unable to open {}.ron", interners_name));
+
+            let data_stores_name = format!("data-stores-{}-{}", id.namespace_id.0, id.id);
+            let data_stores = config.deserialize_for_frame::<DataStores, _>(&data_stores_name)
+                .expect(&format!("Unable to open {}.ron", data_stores_name));
+
+            let properties_name = format!("properties-{}-{}", id.namespace_id.0, id.id);
+            let properties = config.deserialize_for_frame::<SceneProperties, _>(&properties_name)
+                .expect(&format!("Unable to open {}.ron", properties_name));
+
+            let frame_spatial_tree_name = format!("frame-spatial-tree-{}-{}", id.namespace_id.0, id.id);
+            let frame_spatial_tree = config.deserialize_for_frame::<SpatialTree, _>(&frame_spatial_tree_name)
+                .expect(&format!("Unable to open {}.ron", frame_spatial_tree_name));
+
+            match self.documents.entry(id) {
+                Occupied(entry) => {
+                    let doc = entry.into_mut();
+                    doc.view = view;
+                    doc.loaded_scene = scene.clone();
+                    doc.data_stores = data_stores;
+                    doc.spatial_tree = frame_spatial_tree;
+                    doc.dynamic_properties = properties;
+                    doc.frame_is_valid = false;
+                    doc.rendered_frame_is_valid = false;
+                    doc.has_built_scene = false;
+                    doc.hit_tester_is_valid = false;
+                }
+                Vacant(entry) => {
+                    let doc = Document {
+                        id,
+                        scene: BuiltScene::empty(),
+                        removed_pipelines: Vec::new(),
+                        view,
+                        stamp: FrameStamp::first(id),
+                        frame_builder: FrameBuilder::new(),
+                        dynamic_properties: properties,
+                        hit_tester: None,
+                        shared_hit_tester: Arc::new(SharedHitTester::new()),
+                        frame_is_valid: false,
+                        hit_tester_is_valid: false,
+                        rendered_frame_is_valid: false,
+                        has_built_scene: false,
+                        data_stores,
+                        scratch: ScratchBuffer::default(),
+                        spatial_tree: frame_spatial_tree,
+                        minimap_data: FastHashMap::default(),
+                        loaded_scene: scene.clone(),
+                        prev_composite_descriptor: CompositeDescriptor::empty(),
+                        dirty_rects_are_valid: false,
+                        profile: TransactionProfile::new(),
+                        rg_builder: RenderTaskGraphBuilder::new(),
+                        frame_stats: None,
+                    };
+                    entry.insert(doc);
+                }
+            };
+
+            let frame_name = format!("frame-{}-{}", id.namespace_id.0, id.id);
+            let frame = config.deserialize_for_frame::<Frame, _>(frame_name);
+            let build_frame = match frame {
+                Some(frame) => {
+                    info!("\tloaded a built frame with {} passes", frame.passes.len());
+
+                    self.frame_publish_id.advance();
+                    let msg_publish = ResultMsg::PublishDocument(
+                        self.frame_publish_id,
+                        id,
+                        RenderedDocument {
+                            frame,
+                            profile: TransactionProfile::new(),
+                            render_reasons: RenderReasons::empty(),
+                            frame_stats: None,
+                        },
+                        self.resource_cache.pending_updates(),
+                    );
+                    self.result_tx.send(msg_publish).unwrap();
+
+                    let params = api::FrameReadyParams {
+                        present: true,
+                        render: true,
+                        scrolled: false,
+                        tracked: false,
+                    };
+                    self.notifier.new_frame_ready(id, self.frame_publish_id, &params);
+
+                    false
+                }
+                None => true,
+            };
+
+            scenes_to_build.push(LoadScene {
+                document_id: id,
+                scene,
+                view: view.scene.clone(),
+                config: self.frame_config.clone(),
+                fonts: self.resource_cache.get_fonts(),
+                build_frame,
+                interners,
+                spatial_tree: scene_spatial_tree,
+            });
+        }
+
+        if !scenes_to_build.is_empty() {
+            self.send_backend_message(
+                SceneBuilderRequest::LoadScenes(scenes_to_build)
+            );
+        }
+    }
+}

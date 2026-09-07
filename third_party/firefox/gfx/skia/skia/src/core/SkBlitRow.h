@@ -1,0 +1,36 @@
+/*
+ * Copyright 2011 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkBlitRow_DEFINED)
+#define SkBlitRow_DEFINED
+
+#include "include/core/SkBitmap.h"
+#include "include/core/SkColor.h"
+
+class SkBlitRow {
+public:
+    enum Flags32 {
+        kGlobalAlpha_Flag32     = 1 << 0,
+        kSrcPixelAlpha_Flag32   = 1 << 1
+    };
+
+    typedef void (*Proc32)(uint32_t dst[], const SkPMColor src[], int count, U8CPU alpha);
+
+    static Proc32 Factory32(unsigned flags32);
+
+    static void Color32(SkPMColor dst[], int count, SkPMColor color);
+};
+
+namespace SkOpts {
+    extern void (*blit_row_color32)(SkPMColor* dst, int count, SkPMColor color);
+    extern void (*blit_row_s32a_opaque)(SkPMColor* dst, const SkPMColor* src,
+                                        int count, U8CPU alpha);
+
+    void Init_BlitRow();
+}  
+
+#endif

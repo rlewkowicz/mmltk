@@ -1,0 +1,167 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_net_CookiePersistentStorage_h
+#define mozilla_net_CookiePersistentStorage_h
+
+#include "Cookie.h"
+#include "CookieStorage.h"
+
+#include "mozilla/Atomics.h"
+#include "mozilla/Monitor.h"
+#include "mozilla/net/NeckoChannelParams.h"
+#include "mozIStorageBindingParamsArray.h"
+#include "mozIStorageCompletionCallback.h"
+#include "mozIStorageStatement.h"
+#include "mozIStorageStatementCallback.h"
+#include "nsIAsyncShutdown.h"
+
+class mozIStorageAsyncStatement;
+class mozIStorageService;
+class nsICookieTransactionCallback;
+class nsIEffectiveTLDService;
+class nsIURI;
+
+namespace mozilla {
+namespace net {
+
+class CookiePersistentStorage final : public CookieStorage,
+                                      public nsIAsyncShutdownBlocker {
+ public:
+  enum OpenDBResult { RESULT_OK, RESULT_RETRY, RESULT_FAILURE };
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_NSIASYNCSHUTDOWNBLOCKER
+
+  static already_AddRefed<CookiePersistentStorage> Create();
+
+  void HandleCorruptDB();
+
+  void RemoveCookiesWithOriginAttributes(
+      const OriginAttributesPattern& aPattern,
+      const nsACString& aBaseDomain) override;
+
+  void RemoveCookiesFromExactHost(
+      const nsACString& aHost, const nsACString& aBaseDomain,
+      const OriginAttributesPattern& aPattern) override;
+
+  void StaleCookies(const nsTArray<RefPtr<Cookie>>& aCookieList,
+                    int64_t aCurrentTimeInUsec) override;
+
+  void Close() override;
+
+  void EnsureInitialized() override;
+
+  void CleanupCachedStatements();
+  void CleanupDBConnection();
+
+  void Activate();
+
+  void RebuildCorruptDB();
+  void HandleDBClosed();
+
+  nsresult RunInTransaction(nsICookieTransactionCallback* aCallback) override;
+
+  enum CorruptFlag {
+    OK,                   
+    CLOSING_FOR_REBUILD,  
+    REBUILDING            
+  };
+
+  CorruptFlag GetCorruptFlag() const { return mCorruptFlag; }
+
+  void SetCorruptFlag(CorruptFlag aFlag) { mCorruptFlag = aFlag; }
+
+ protected:
+  const char* NotificationTopic() const override { return "cookie-changed"; }
+
+  void NotifyChangedInternal(nsICookieNotification* aNotification,
+                             bool aOldCookieIsSession) override;
+
+  void RemoveAllInternal() override;
+
+  void RemoveCookieFromDB(const Cookie& aCookie) override;
+
+  void StoreCookie(const nsACString& aBaseDomain,
+                   const OriginAttributes& aOriginAttributes,
+                   Cookie* aCookie) override;
+
+ private:
+  CookiePersistentStorage();
+  ~CookiePersistentStorage() = default;
+
+  static void UpdateCookieInList(Cookie* aCookie, int64_t aLastAccessed,
+                                 mozIStorageBindingParamsArray* aParamsArray);
+
+  void PrepareCookieRemoval(const Cookie& aCookie,
+                            mozIStorageBindingParamsArray* aParamsArray);
+
+  void InitDBConn();
+  nsresult InitDBConnInternal();
+
+  OpenDBResult TryInitDB(bool aRecreateDB);
+  OpenDBResult Read();
+  void MoveUnpartitionedChipsCookies();
+
+  void RecordValidationTelemetry();
+
+  nsresult CreateTableWorker(const char* aName);
+  nsresult CreateTable();
+  nsresult CreateTableForSchemaVersion6();
+  nsresult CreateTableForSchemaVersion5();
+
+  static UniquePtr<CookieStruct> GetCookieFromRow(mozIStorageStatement* aRow);
+
+  already_AddRefed<nsIArray> PurgeCookies(int64_t aCurrentTimeInUsec,
+                                          uint16_t aMaxNumberOfCookies,
+                                          int64_t aCookiePurgeAge) override;
+
+
+  void DeleteFromDB(mozIStorageBindingParamsArray* aParamsArray);
+
+  void MaybeStoreCookiesToDB(mozIStorageBindingParamsArray* aParamsArray);
+
+  nsCOMPtr<nsIThread> mThread;
+  nsCOMPtr<mozIStorageService> mStorageService;
+  nsCOMPtr<nsIEffectiveTLDService> mTLDService;
+  nsCOMPtr<nsIURI> mPlaceholderURI;
+
+  struct CookieDomainTuple {
+    CookieKey key;
+    OriginAttributes originAttributes;
+    RefPtr<Cookie> cookie;
+  };
+
+  TimeStamp mEndInitDBConn;
+  nsTArray<CookieDomainTuple> mReadArray;
+  nsTArray<CookieDomainTuple> mCleanupArray;
+
+  Monitor mMonitor MOZ_ANNOTATED;
+
+  Atomic<bool> mInitialized;
+  Atomic<bool> mInitializedDBConn;
+
+  nsCOMPtr<nsIFile> mCookieFile;
+  nsCOMPtr<mozIStorageConnection> mDBConn;
+  nsCOMPtr<mozIStorageAsyncStatement> mStmtInsert;
+  nsCOMPtr<mozIStorageAsyncStatement> mStmtDelete;
+  nsCOMPtr<mozIStorageAsyncStatement> mStmtUpdate;
+
+  Atomic<CorruptFlag, Relaxed> mCorruptFlag;
+
+  nsCOMPtr<mozIStorageConnection> mSyncConn;
+
+  nsCOMPtr<mozIStorageStatementCallback> mInsertListener;
+  nsCOMPtr<mozIStorageStatementCallback> mUpdateListener;
+  nsCOMPtr<mozIStorageStatementCallback> mRemoveListener;
+  nsCOMPtr<mozIStorageCompletionCallback> mCloseListener;
+
+  nsCOMPtr<nsIAsyncShutdownClient> mShutdownBarrier;
+  void RemoveShutdownBlocker();
+};
+
+}  
+}  
+
+#endif  // mozilla_net_CookiePersistentStorage_h

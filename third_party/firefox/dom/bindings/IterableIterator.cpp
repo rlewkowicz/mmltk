@@ -1,0 +1,254 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/IterableIterator.h"
+
+#include "mozilla/dom/Promise-inl.h"
+
+namespace mozilla::dom {
+
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(IterableIteratorBase)
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(IterableIteratorBase)
+  tmp->TraverseHelper(cb);
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(IterableIteratorBase)
+  tmp->UnlinkHelper();
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+namespace iterator_utils {
+
+void DictReturn(JSContext* aCx, JS::MutableHandle<JS::Value> aResult,
+                bool aDone, JS::Handle<JS::Value> aValue, ErrorResult& aRv) {
+  RootedDictionary<IterableKeyOrValueResult> dict(aCx);
+  dict.mDone = aDone;
+  dict.mValue = aValue;
+  JS::Rooted<JS::Value> dictValue(aCx);
+  if (!ToJSValue(aCx, dict, &dictValue)) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return;
+  }
+  aResult.set(dictValue);
+}
+
+void DictReturn(JSContext* aCx, JS::MutableHandle<JSObject*> aResult,
+                bool aDone, JS::Handle<JS::Value> aValue, ErrorResult& aRv) {
+  JS::Rooted<JS::Value> dictValue(aCx);
+  DictReturn(aCx, &dictValue, aDone, aValue, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+  aResult.set(&dictValue.toObject());
+}
+
+void KeyAndValueReturn(JSContext* aCx, JS::Handle<JS::Value> aKey,
+                       JS::Handle<JS::Value> aValue,
+                       JS::MutableHandle<JSObject*> aResult, ErrorResult& aRv) {
+  RootedDictionary<IterableKeyAndValueResult> dict(aCx);
+  dict.mDone = false;
+  if (!dict.mValue.AppendElement(aKey, mozilla::fallible)) {
+    aRv.Throw(NS_ERROR_OUT_OF_MEMORY);
+    return;
+  }
+  if (!dict.mValue.AppendElement(aValue, mozilla::fallible)) {
+    aRv.Throw(NS_ERROR_OUT_OF_MEMORY);
+    return;
+  }
+  JS::Rooted<JS::Value> dictValue(aCx);
+  if (!ToJSValue(aCx, dict, &dictValue)) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return;
+  }
+  aResult.set(&dictValue.toObject());
+}
+
+}  
+
+namespace binding_detail {
+
+static already_AddRefed<Promise> PromiseOrErr(
+    Result<RefPtr<Promise>, nsresult>&& aResult, ErrorResult& aError) {
+  if (aResult.isErr()) {
+    aError.Throw(aResult.unwrapErr());
+    return nullptr;
+  }
+
+  return aResult.unwrap().forget();
+}
+
+already_AddRefed<Promise> AsyncIterableNextImpl::NextSteps(
+    JSContext* aCx, AsyncIterableIteratorBase* aObject,
+    nsIGlobalObject* aGlobalObject, ErrorResult& aRv) {
+  if (aObject->mIsFinished) {
+    JS::Rooted<JS::Value> dict(aCx);
+    iterator_utils::DictReturn(aCx, &dict, true, JS::UndefinedHandleValue, aRv);
+    if (aRv.Failed()) {
+      return Promise::CreateRejectedWithErrorResult(aGlobalObject, aRv);
+    }
+
+    return Promise::Resolve(aGlobalObject, aCx, dict, aRv);
+  }
+
+  RefPtr<Promise> nextPromise;
+  {
+    ErrorResult error;
+    nextPromise = GetNextResult(error);
+
+    error.WouldReportJSException();
+    if (error.Failed()) {
+      nextPromise = Promise::Reject(aGlobalObject, std::move(error), aRv);
+    }
+  }
+
+  auto fulfillSteps = [](JSContext* aCx, JS::Handle<JS::Value> aNext,
+                         ErrorResult& aRv,
+                         const RefPtr<AsyncIterableIteratorBase>& aObject,
+                         const nsCOMPtr<nsIGlobalObject>& aGlobalObject)
+      -> already_AddRefed<Promise> {
+    aObject->mOngoingPromise = nullptr;
+
+    JS::Rooted<JS::Value> dict(aCx);
+    if (aNext.isMagic(binding_details::END_OF_ITERATION)) {
+      aObject->mIsFinished = true;
+      iterator_utils::DictReturn(aCx, &dict, true, JS::UndefinedHandleValue,
+                                 aRv);
+      if (aRv.Failed()) {
+        return nullptr;
+      }
+    } else {
+      iterator_utils::DictReturn(aCx, &dict, false, aNext, aRv);
+      if (aRv.Failed()) {
+        return nullptr;
+      }
+    }
+    return Promise::Resolve(aGlobalObject, aCx, dict, aRv);
+  };
+  auto rejectSteps = [](JSContext* aCx, JS::Handle<JS::Value> aReason,
+                        ErrorResult& aRv,
+                        const RefPtr<AsyncIterableIteratorBase>& aObject,
+                        const nsCOMPtr<nsIGlobalObject>& aGlobalObject) {
+    aObject->mOngoingPromise = nullptr;
+    aObject->mIsFinished = true;
+    return Promise::Reject(aGlobalObject, aCx, aReason, aRv);
+  };
+  Result<RefPtr<Promise>, nsresult> result =
+      nextPromise->ThenCatchWithCycleCollectedArgs(
+          std::move(fulfillSteps), std::move(rejectSteps), RefPtr{aObject},
+          nsCOMPtr{aGlobalObject});
+
+  return PromiseOrErr(std::move(result), aRv);
+}
+
+already_AddRefed<Promise> AsyncIterableNextImpl::Next(
+    JSContext* aCx, AsyncIterableIteratorBase* aObject,
+    nsISupports* aGlobalObject, ErrorResult& aRv) {
+  nsCOMPtr<nsIGlobalObject> globalObject = do_QueryInterface(aGlobalObject);
+
+  if (aObject->mOngoingPromise) {
+
+    auto onSettled = [this](JSContext* aCx, JS::Handle<JS::Value> aValue,
+                            ErrorResult& aRv,
+                            const RefPtr<AsyncIterableIteratorBase>& aObject,
+                            const nsCOMPtr<nsIGlobalObject>& aGlobalObject)
+                         MOZ_CAN_RUN_SCRIPT_FOR_DEFINITION {
+                           return NextSteps(aCx, aObject, aGlobalObject, aRv);
+                         };
+
+    Result<RefPtr<Promise>, nsresult> afterOngoingPromise =
+        aObject->mOngoingPromise->ThenCatchWithCycleCollectedArgs(
+            onSettled, onSettled, RefPtr{aObject}, std::move(globalObject));
+    if (afterOngoingPromise.isErr()) {
+      aRv.Throw(afterOngoingPromise.unwrapErr());
+      return nullptr;
+    }
+
+    aObject->mOngoingPromise = afterOngoingPromise.unwrap().forget();
+  } else {
+    aObject->mOngoingPromise = NextSteps(aCx, aObject, globalObject, aRv);
+  }
+
+  return do_AddRef(aObject->mOngoingPromise);
+}
+
+already_AddRefed<Promise> AsyncIterableReturnImpl::ReturnSteps(
+    JSContext* aCx, AsyncIterableIteratorBase* aObject,
+    nsIGlobalObject* aGlobalObject, JS::Handle<JS::Value> aValue,
+    ErrorResult& aRv) {
+  if (aObject->mIsFinished) {
+    JS::Rooted<JS::Value> dict(aCx);
+    iterator_utils::DictReturn(aCx, &dict, true, aValue, aRv);
+    if (aRv.Failed()) {
+      return Promise::CreateRejectedWithErrorResult(aGlobalObject, aRv);
+    }
+
+    return Promise::Resolve(aGlobalObject, aCx, dict, aRv);
+  }
+
+  aObject->mIsFinished = true;
+
+  ErrorResult error;
+  RefPtr<Promise> returnPromise = GetReturnPromise(aCx, aValue, error);
+
+  error.WouldReportJSException();
+  if (error.Failed()) {
+    return Promise::Reject(aGlobalObject, std::move(error), aRv);
+  }
+
+  return returnPromise.forget();
+}
+
+already_AddRefed<Promise> AsyncIterableReturnImpl::Return(
+    JSContext* aCx, AsyncIterableIteratorBase* aObject,
+    nsISupports* aGlobalObject, JS::Handle<JS::Value> aValue,
+    ErrorResult& aRv) {
+  nsCOMPtr<nsIGlobalObject> globalObject = do_QueryInterface(aGlobalObject);
+
+  RefPtr<Promise> returnStepsPromise;
+  if (aObject->mOngoingPromise) {
+
+    auto onSettled =
+        [this](JSContext* aCx, JS::Handle<JS::Value> aValue, ErrorResult& aRv,
+               const RefPtr<AsyncIterableIteratorBase>& aObject,
+               const nsCOMPtr<nsIGlobalObject>& aGlobalObject,
+               JS::Handle<JS::Value> aVal) MOZ_CAN_RUN_SCRIPT_FOR_DEFINITION {
+          return ReturnSteps(aCx, aObject, aGlobalObject, aVal, aRv);
+        };
+
+    Result<RefPtr<Promise>, nsresult> afterOngoingPromise =
+        aObject->mOngoingPromise->ThenCatchWithCycleCollectedArgsJS(
+            onSettled, onSettled,
+            std::make_tuple(RefPtr{aObject}, nsCOMPtr{globalObject}),
+            std::make_tuple(aValue));
+    if (afterOngoingPromise.isErr()) {
+      aRv.Throw(afterOngoingPromise.unwrapErr());
+      return nullptr;
+    }
+
+    returnStepsPromise = afterOngoingPromise.unwrap().forget();
+  } else {
+    returnStepsPromise = ReturnSteps(aCx, aObject, globalObject, aValue, aRv);
+  }
+
+  auto onFullFilled = [](JSContext* aCx, JS::Handle<JS::Value>,
+                         ErrorResult& aRv,
+                         const nsCOMPtr<nsIGlobalObject>& aGlobalObject,
+                         JS::Handle<JS::Value> aVal) {
+    JS::Rooted<JS::Value> dict(aCx);
+    iterator_utils::DictReturn(aCx, &dict, true, aVal, aRv);
+    return Promise::Resolve(aGlobalObject, aCx, dict, aRv);
+  };
+
+  Result<RefPtr<Promise>, nsresult> returnPromise =
+      returnStepsPromise->ThenWithCycleCollectedArgsJS(
+          onFullFilled, std::make_tuple(std::move(globalObject)),
+          std::make_tuple(aValue));
+
+  return PromiseOrErr(std::move(returnPromise), aRv);
+}
+
+}  
+
+}  

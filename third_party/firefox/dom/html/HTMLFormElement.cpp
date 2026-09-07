@@ -1,0 +1,1637 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/HTMLFormElement.h"
+
+#include <utility>
+
+#include "Attr.h"
+#include "jsapi.h"
+#include "mozilla/AutoRestore.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/BinarySearch.h"
+#include "mozilla/Components.h"
+#include "mozilla/ContentEvents.h"
+#include "mozilla/EventDispatcher.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/dom/BindContext.h"
+#include "mozilla/dom/BrowsingContext.h"
+#include "mozilla/dom/ContentList.h"
+#include "mozilla/dom/CustomEvent.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/HTMLFormControlsCollection.h"
+#include "mozilla/dom/HTMLFormElementBinding.h"
+#include "mozilla/dom/TreeOrderedArrayInlines.h"
+#include "mozilla/dom/nsCSPContext.h"
+#include "mozilla/dom/nsCSPUtils.h"
+#include "mozilla/dom/nsMixedContentBlocker.h"
+#include "nsCOMArray.h"
+#include "nsContentUtils.h"
+#include "nsDOMAttributeMap.h"
+#include "nsDocShell.h"
+#include "nsDocShellLoadState.h"
+#include "nsError.h"
+#include "nsFocusManager.h"
+#include "nsGkAtoms.h"
+#include "nsHTMLDocument.h"
+#include "nsInterfaceHashtable.h"
+#include "nsPresContext.h"
+#include "nsQueryObject.h"
+#include "nsStyleConsts.h"
+#include "nsTArray.h"
+
+#include "HTMLFormSubmissionConstants.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/StaticPrefs_prompts.h"
+#include "mozilla/dom/FormData.h"
+#include "mozilla/dom/FormDataEvent.h"
+#include "mozilla/dom/SubmitEvent.h"
+#include "mozilla/intl/Localization.h"
+#include "nsCategoryManagerUtils.h"
+#include "nsIContentInlines.h"
+#include "nsIDocShell.h"
+#include "nsIInterfaceRequestorUtils.h"
+#include "nsIPromptService.h"
+#include "nsIScriptError.h"
+#include "nsIScriptSecurityManager.h"
+#include "nsISimpleEnumerator.h"
+#include "nsNetUtil.h"
+#include "nsRange.h"
+
+#include "RadioNodeList.h"
+#include "mozAutoDocUpdate.h"
+#include "mozilla/dom/HTMLAnchorElement.h"
+#include "mozilla/dom/HTMLButtonElement.h"
+#include "mozilla/dom/HTMLInputElement.h"
+#include "mozilla/dom/HTMLSelectElement.h"
+#include "nsIConstraintValidation.h"
+#include "nsLayoutUtils.h"
+#include "nsSandboxFlags.h"
+
+#include "mozilla/dom/HTMLButtonElement.h"
+#include "mozilla/dom/HTMLImageElement.h"
+
+NS_IMPL_NS_NEW_HTML_ELEMENT(Form)
+
+namespace mozilla::dom {
+
+static const uint8_t NS_FORM_AUTOCOMPLETE_ON = 1;
+static const uint8_t NS_FORM_AUTOCOMPLETE_OFF = 0;
+
+static constexpr nsAttrValue::EnumTableEntry kFormAutocompleteTable[] = {
+    {"on", NS_FORM_AUTOCOMPLETE_ON},
+    {"off", NS_FORM_AUTOCOMPLETE_OFF},
+};
+static constexpr const nsAttrValue::EnumTableEntry* kFormDefaultAutocomplete =
+    &kFormAutocompleteTable[0];
+
+HTMLFormElement::HTMLFormElement(
+    already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo)
+    : nsGenericHTMLElement(std::move(aNodeInfo)),
+      mControls(new HTMLFormControlsCollection(this)),
+      mPendingSubmission(nullptr),
+      mDefaultSubmitElement(nullptr),
+      mFirstSubmitInElements(nullptr),
+      mFirstSubmitNotInElements(nullptr),
+      mImageNameLookupTable(FORM_CONTROL_LIST_HASHTABLE_LENGTH),
+      mPastNameLookupTable(FORM_CONTROL_LIST_HASHTABLE_LENGTH),
+      mSubmitPopupState(PopupBlocker::openAbused),
+      mInvalidElementsCount(0),
+      mFormNumber(-1),
+      mGeneratingSubmit(false),
+      mGeneratingReset(false),
+      mDeferSubmission(false),
+      mNotifiedObservers(false),
+      mNotifiedObserversResult(false),
+      mIsConstructingEntryList(false),
+      mIsFiringSubmissionEvents(false) {
+  AddStatesSilently(ElementState::VALID);
+}
+
+HTMLFormElement::~HTMLFormElement() {
+  if (mControls) {
+    mControls->DropFormReference();
+  }
+
+  Clear();
+}
+
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(HTMLFormElement)
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(HTMLFormElement,
+                                                  nsGenericHTMLElement)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mControls)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mImageNameLookupTable)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mPastNameLookupTable)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mRelList)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mTargetContext)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_INHERITED(HTMLFormElement,
+                                                nsGenericHTMLElement)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mRelList)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mTargetContext)
+  tmp->Clear();
+  tmp->mExpandoAndGeneration.OwnerUnlinked();
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_ISUPPORTS_CYCLE_COLLECTION_INHERITED_0(HTMLFormElement,
+                                               nsGenericHTMLElement)
+
+nsDOMTokenList* HTMLFormElement::RelList() {
+  if (!mRelList) {
+    mRelList =
+        new nsDOMTokenList(this, nsGkAtoms::rel, sAnchorAndFormRelValues);
+  }
+  return mRelList;
+}
+
+NS_IMPL_ELEMENT_CLONE(HTMLFormElement)
+
+HTMLFormControlsCollection* HTMLFormElement::Elements() { return mControls; }
+
+void HTMLFormElement::BeforeSetAttr(int32_t aNamespaceID, nsAtom* aName,
+                                    const nsAttrValue* aValue, bool aNotify) {
+  if (aNamespaceID == kNameSpaceID_None) {
+    if (aName == nsGkAtoms::action || aName == nsGkAtoms::target) {
+      bool notifiedObservers = mNotifiedObservers;
+      ForgetCurrentSubmission();
+      mNotifiedObservers = notifiedObservers;
+    }
+  }
+
+  return nsGenericHTMLElement::BeforeSetAttr(aNamespaceID, aName, aValue,
+                                             aNotify);
+}
+
+void HTMLFormElement::GetAutocomplete(nsAString& aValue) {
+  GetEnumAttr(nsGkAtoms::autocomplete, kFormDefaultAutocomplete->tag, aValue);
+}
+
+void HTMLFormElement::GetEnctype(nsAString& aValue) {
+  GetEnumAttr(nsGkAtoms::enctype, kFormDefaultEnctype->tag, aValue);
+}
+
+void HTMLFormElement::GetMethod(nsAString& aValue) {
+  GetEnumAttr(nsGkAtoms::method, kFormDefaultMethod->tag, aValue);
+}
+
+void HTMLFormElement::ReportInvalidUnfocusableElements(
+    const nsTArray<RefPtr<Element>>&& aInvalidElements) {
+  RefPtr<nsFocusManager> focusManager = nsFocusManager::GetFocusManager();
+  MOZ_ASSERT(focusManager);
+
+  for (const auto& element : aInvalidElements) {
+    bool isFocusable = false;
+    focusManager->ElementIsFocusable(MOZ_KnownLive(element), 0, &isFocusable);
+    if (!isFocusable) {
+      nsTArray<nsString> params;
+      nsAutoCString messageName("InvalidFormControlUnfocusable");
+
+      if (Attr* nameAttr = element->GetAttributes()->GetNamedItem(u"name"_ns)) {
+        nsAutoString name;
+        nameAttr->GetValue(name);
+        params.AppendElement(name);
+        messageName = "InvalidNamedFormControlUnfocusable";
+      }
+
+      nsContentUtils::ReportToConsole(
+          nsIScriptError::errorFlag, "DOM"_ns, element->GetOwnerDocument(),
+          PropertiesFile::DOM_PROPERTIES, messageName.get(), params,
+          SourceLocation(element->GetBaseURI()));
+    }
+  }
+}
+
+void HTMLFormElement::MaybeSubmit(Element* aSubmitter) {
+#ifdef DEBUG
+  if (aSubmitter) {
+    const auto* fc = nsIFormControl::FromNode(aSubmitter);
+    MOZ_ASSERT(fc);
+    MOZ_ASSERT(fc->IsSubmitControl(), "aSubmitter is not a submit control?");
+  }
+#endif
+
+  RefPtr<Document> doc = GetComposedDoc();
+  if (mIsConstructingEntryList || !doc ||
+      (doc->GetSandboxFlags() & SANDBOXED_FORMS)) {
+    return;
+  }
+
+  if (mIsFiringSubmissionEvents) {
+    return;
+  }
+
+  AutoRestore<bool> resetFiringSubmissionEventsFlag(mIsFiringSubmissionEvents);
+  mIsFiringSubmissionEvents = true;
+
+  {
+    for (nsGenericHTMLFormElement* el : mControls->mElements.AsSpan()) {
+      el->SetUserInteracted(true);
+    }
+    for (nsGenericHTMLFormElement* el : mControls->mNotInElements.AsSpan()) {
+      el->SetUserInteracted(true);
+    }
+  }
+
+  bool noValidateState =
+      HasAttr(nsGkAtoms::novalidate) ||
+      (aSubmitter && aSubmitter->HasAttr(nsGkAtoms::formnovalidate));
+  if (!noValidateState && !CheckValidFormSubmission()) {
+    return;
+  }
+
+  bool cancelSubmit = false;
+  nsresult rv = DispatchBeforeSubmitChromeOnlyEvent(&cancelSubmit);
+  if (NS_SUCCEEDED(rv)) {
+    mNotifiedObservers = true;
+    mNotifiedObserversResult = cancelSubmit;
+  }
+
+  RefPtr<PresShell> presShell = doc->GetPresShell();
+  if (!presShell) {
+    doc->FlushPendingNotifications(FlushType::EnsurePresShellInitAndFrames);
+    presShell = doc->GetPresShell();
+  }
+
+  if (!doc->IsCurrentActiveDocument()) {
+    return;
+  }
+
+  SubmitEventInit init;
+  init.mBubbles = true;
+  init.mCancelable = true;
+  init.mSubmitter =
+      aSubmitter ? nsGenericHTMLElement::FromNode(aSubmitter) : nullptr;
+  RefPtr<SubmitEvent> event =
+      SubmitEvent::Constructor(this, u"submit"_ns, init);
+  event->SetTrusted(true);
+  nsEventStatus status = nsEventStatus_eIgnore;
+  EventDispatcher::DispatchDOMEvent(this, nullptr, event, nullptr, &status);
+}
+
+void HTMLFormElement::MaybeReset(Element* aSubmitter) {
+  if (!OwnerDoc()->IsCurrentActiveDocument()) {
+    return;
+  }
+
+  InternalFormEvent event(true, eFormReset);
+  event.mOriginator = aSubmitter;
+  nsEventStatus status = nsEventStatus_eIgnore;
+  EventDispatcher::DispatchDOMEvent(this, &event, nullptr, nullptr, &status);
+}
+
+void HTMLFormElement::Submit(ErrorResult& aRv) { aRv = DoSubmit(); }
+
+void HTMLFormElement::RequestSubmit(nsGenericHTMLElement* aSubmitter,
+                                    ErrorResult& aRv) {
+  if (aSubmitter) {
+    const auto* fc = nsIFormControl::FromNodeOrNull(aSubmitter);
+
+    if (!fc || !fc->IsSubmitControl()) {
+      aRv.ThrowTypeError("The submitter is not a submit button.");
+      return;
+    }
+
+    if (fc->GetFormInternal() != this) {
+      aRv.ThrowNotFoundError("The submitter is not owned by this form.");
+      return;
+    }
+  }
+
+  MaybeSubmit(aSubmitter);
+}
+
+void HTMLFormElement::Reset() {
+  InternalFormEvent event(true, eFormReset);
+  EventDispatcher::Dispatch(this, nullptr, &event);
+}
+
+bool HTMLFormElement::ParseAttribute(int32_t aNamespaceID, nsAtom* aAttribute,
+                                     const nsAString& aValue,
+                                     nsIPrincipal* aMaybeScriptedPrincipal,
+                                     nsAttrValue& aResult) {
+  if (aNamespaceID == kNameSpaceID_None) {
+    if (aAttribute == nsGkAtoms::method) {
+      return aResult.ParseEnumValue(aValue, kFormMethodTable, false);
+    }
+    if (aAttribute == nsGkAtoms::enctype) {
+      return aResult.ParseEnumValue(aValue, kFormEnctypeTable, false);
+    }
+    if (aAttribute == nsGkAtoms::autocomplete) {
+      return aResult.ParseEnumValue(aValue, kFormAutocompleteTable, false);
+    }
+  }
+
+  return nsGenericHTMLElement::ParseAttribute(aNamespaceID, aAttribute, aValue,
+                                              aMaybeScriptedPrincipal, aResult);
+}
+
+nsresult HTMLFormElement::BindToTree(BindContext& aContext, nsINode& aParent) {
+  nsresult rv = nsGenericHTMLElement::BindToTree(aContext, aParent);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (IsInUncomposedDoc() && aContext.OwnerDoc().IsHTMLOrXHTML()) {
+    aContext.OwnerDoc().AsHTMLDocument()->AddedForm();
+  }
+
+  return rv;
+}
+
+template <typename T>
+static void MarkOrphans(Span<T*> aArray) {
+  for (auto* element : aArray) {
+    element->SetFlags(MAYBE_ORPHAN_FORM_ELEMENT);
+  }
+}
+
+static void CollectOrphans(
+    nsINode* aRemovalRoot,
+    TreeOrderedArray<nsGenericHTMLFormElement*, TreeKind::ShadowIncludingDOM>&
+        aArray
+#ifdef DEBUG
+    ,
+    HTMLFormElement* aThisForm
+#endif
+) {
+  nsAutoScriptBlocker scriptBlocker;
+
+  uint32_t length = aArray.Length();
+  for (uint32_t i = length; i > 0; --i) {
+    nsGenericHTMLFormElement* node = aArray[i - 1];
+
+#ifdef DEBUG
+    bool removed = false;
+#endif
+    if (node->HasFlag(MAYBE_ORPHAN_FORM_ELEMENT)) {
+      node->UnsetFlags(MAYBE_ORPHAN_FORM_ELEMENT);
+      if (!node->IsInclusiveDescendantOf(aRemovalRoot)) {
+        nsCOMPtr<nsIFormControl> fc = nsIFormControl::FromNode(node);
+        MOZ_ASSERT(fc);
+        fc->ClearForm(true, false);
+#ifdef DEBUG
+        removed = true;
+#endif
+      }
+    }
+
+#ifdef DEBUG
+    if (!removed) {
+      const auto* fc = nsIFormControl::FromNode(node);
+      MOZ_ASSERT(fc);
+      HTMLFormElement* form = fc->GetFormInternal();
+      NS_ASSERTION(form == aThisForm, "How did that happen?");
+    }
+#endif /* DEBUG */
+  }
+}
+
+static void CollectOrphans(nsINode* aRemovalRoot,
+                           const TreeOrderedArray<HTMLImageElement*>& aArray
+#ifdef DEBUG
+                           ,
+                           HTMLFormElement* aThisForm
+#endif
+) {
+  uint32_t length = aArray.Length();
+  for (uint32_t i = length; i > 0; --i) {
+    HTMLImageElement* node = aArray[i - 1];
+
+#ifdef DEBUG
+    bool removed = false;
+#endif
+    if (node->HasFlag(MAYBE_ORPHAN_FORM_ELEMENT)) {
+      node->UnsetFlags(MAYBE_ORPHAN_FORM_ELEMENT);
+      if (!node->IsInclusiveDescendantOf(aRemovalRoot)) {
+        node->ClearForm(true);
+
+#ifdef DEBUG
+        removed = true;
+#endif
+      }
+    }
+
+#ifdef DEBUG
+    if (!removed) {
+      HTMLFormElement* form = node->GetFormInternal();
+      NS_ASSERTION(form == aThisForm, "How did that happen?");
+    }
+#endif /* DEBUG */
+  }
+}
+
+void HTMLFormElement::UnbindFromTree(UnbindContext& aContext) {
+  MaybeFireFormRemoved();
+
+  RefPtr<Document> oldDocument = GetUncomposedDoc();
+
+  MarkOrphans(mControls->mElements.AsSpan());
+  MarkOrphans(mControls->mNotInElements.AsSpan());
+  MarkOrphans(mImageElements.AsSpan());
+
+  nsGenericHTMLElement::UnbindFromTree(aContext);
+
+  nsINode* ancestor = this;
+  nsINode* cur;
+  do {
+    cur = ancestor->GetParentNode();
+    if (!cur) {
+      break;
+    }
+    ancestor = cur;
+  } while (true);
+
+  CollectOrphans(ancestor, mControls->mElements
+#ifdef DEBUG
+                 ,
+                 this
+#endif
+  );
+  CollectOrphans(ancestor, mControls->mNotInElements
+#ifdef DEBUG
+                 ,
+                 this
+#endif
+  );
+  CollectOrphans(ancestor, mImageElements
+#ifdef DEBUG
+                 ,
+                 this
+#endif
+  );
+
+  if (oldDocument && oldDocument->IsHTMLOrXHTML()) {
+    oldDocument->AsHTMLDocument()->RemovedForm();
+  }
+  ForgetCurrentSubmission();
+}
+
+static bool CanSubmit(WidgetEvent& aEvent) {
+  return !StaticPrefs::dom_forms_submit_trusted_event_only() ||
+         aEvent.IsTrusted();
+}
+
+void HTMLFormElement::GetEventTargetParent(EventChainPreVisitor& aVisitor) {
+  aVisitor.mWantsWillHandleEvent = true;
+  if (aVisitor.mEvent->mOriginalTarget == static_cast<nsIContent*>(this) &&
+      CanSubmit(*aVisitor.mEvent)) {
+    uint32_t msg = aVisitor.mEvent->mMessage;
+    if (msg == eFormSubmit) {
+      if (mGeneratingSubmit) {
+        aVisitor.mCanHandle = false;
+        return;
+      }
+      mGeneratingSubmit = true;
+
+      if (!aVisitor.mEvent->IsTrusted()) {
+        mDeferSubmission = true;
+      }
+    } else if (msg == eFormReset) {
+      if (mGeneratingReset) {
+        aVisitor.mCanHandle = false;
+        return;
+      }
+      mGeneratingReset = true;
+    }
+  }
+  nsGenericHTMLElement::GetEventTargetParent(aVisitor);
+}
+
+void HTMLFormElement::WillHandleEvent(EventChainPostVisitor& aVisitor) {
+  if ((aVisitor.mEvent->mMessage == eFormSubmit ||
+       aVisitor.mEvent->mMessage == eFormReset) &&
+      aVisitor.mEvent->mFlags.mInBubblingPhase &&
+      aVisitor.mEvent->mOriginalTarget != static_cast<nsIContent*>(this)) {
+    aVisitor.mEvent->StopPropagation();
+  }
+}
+
+nsresult HTMLFormElement::PostHandleEvent(EventChainPostVisitor& aVisitor) {
+  if (aVisitor.mEvent->mOriginalTarget == static_cast<nsIContent*>(this) &&
+      CanSubmit(*aVisitor.mEvent)) {
+    EventMessage msg = aVisitor.mEvent->mMessage;
+    if (aVisitor.mEventStatus == nsEventStatus_eIgnore) {
+      switch (msg) {
+        case eFormReset: {
+          DoReset();
+          break;
+        }
+        case eFormSubmit: {
+          if (!aVisitor.mEvent->IsTrusted()) {
+            OwnerDoc()->WarnOnceAndReportAbout(
+                DeprecatedOperations::eFormSubmissionUntrustedEvent);
+          }
+          RefPtr<Event> event = aVisitor.mDOMEvent;
+          DoSubmit(event);
+          break;
+        }
+        default:
+          break;
+      }
+    }
+
+    if (msg == eFormSubmit && !aVisitor.mEvent->IsTrusted()) {
+      mDeferSubmission = false;
+      FlushPendingSubmission();
+    }
+
+    if (msg == eFormSubmit) {
+      mGeneratingSubmit = false;
+    } else if (msg == eFormReset) {
+      mGeneratingReset = false;
+    }
+  }
+  return NS_OK;
+}
+
+nsresult HTMLFormElement::DoReset() {
+  if (Document* doc = GetComposedDoc()) {
+    doc->FlushPendingNotifications(FlushType::ContentAndNotify);
+  }
+
+  uint32_t numElements = mControls->Length();
+  for (uint32_t elementX = 0; elementX < numElements; ++elementX) {
+    if (elementX >= mControls->mElements.Length()) {
+      continue;
+    }
+    nsCOMPtr<nsIFormControl> controlNode =
+        nsIFormControl::FromNode(mControls->mElements[elementX]);
+    if (controlNode) {
+      controlNode->Reset();
+    }
+  }
+
+  return NS_OK;
+}
+
+#define NS_ENSURE_SUBMIT_SUCCESS(rv) \
+  if (NS_FAILED(rv)) {               \
+    ForgetCurrentSubmission();       \
+    return rv;                       \
+  }
+
+nsresult HTMLFormElement::DoSubmit(Event* aEvent) {
+  Document* doc = GetComposedDoc();
+  NS_ASSERTION(doc, "Should never get here without a current doc");
+
+  if (doc) {
+    doc->FlushPendingNotifications(FlushType::ContentAndNotify);
+  }
+
+  if (mIsConstructingEntryList || !doc ||
+      (doc->GetSandboxFlags() & SANDBOXED_FORMS)) {
+    return NS_OK;
+  }
+
+  if (IsSubmitting()) {
+    NS_WARNING("Preventing double form submission");
+    return NS_OK;
+  }
+
+  mTargetContext = nullptr;
+  mCurrentLoadId = Nothing();
+
+  UniquePtr<HTMLFormSubmission> submission;
+
+  nsresult rv = BuildSubmission(getter_Transfers(submission), aEvent);
+
+  if (rv == NS_ERROR_NOT_AVAILABLE) {
+    return NS_OK;
+  }
+
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsPIDOMWindowOuter* window = OwnerDoc()->GetWindow();
+  if (window) {
+    mSubmitPopupState = PopupBlocker::GetPopupControlState();
+  } else {
+    mSubmitPopupState = PopupBlocker::openAbused;
+  }
+
+  if (!submission) {
+#ifdef DEBUG
+    HTMLDialogElement* dialog = nullptr;
+    for (nsIContent* parent = GetParent(); parent;
+         parent = parent->GetParent()) {
+      dialog = HTMLDialogElement::FromNodeOrNull(parent);
+      if (dialog) {
+        break;
+      }
+    }
+    MOZ_ASSERT(!dialog || !dialog->Open());
+#endif
+    return NS_OK;
+  }
+
+  if (DialogFormSubmission* dialogSubmission =
+          submission->GetAsDialogSubmission()) {
+    return SubmitDialog(dialogSubmission);
+  }
+
+  if (mDeferSubmission) {
+    mPendingSubmission = std::move(submission);
+    return NS_OK;
+  }
+
+  return SubmitSubmission(submission.get());
+}
+
+nsresult HTMLFormElement::BuildSubmission(HTMLFormSubmission** aFormSubmission,
+                                          Event* aEvent) {
+  nsGenericHTMLElement* submitter = nullptr;
+  if (aEvent) {
+    SubmitEvent* submitEvent = aEvent->AsSubmitEvent();
+    if (submitEvent) {
+      submitter = submitEvent->GetSubmitter();
+    }
+  }
+
+  nsresult rv;
+
+  auto encoding = GetSubmitEncoding()->OutputEncoding();
+  RefPtr<FormData> formData =
+      new FormData(GetRelevantGlobal(), encoding, submitter);
+  rv = ConstructEntryList(formData);
+  NS_ENSURE_SUBMIT_SUCCESS(rv);
+
+  if (!GetComposedDoc()) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  rv = HTMLFormSubmission::GetFromForm(this, submitter, encoding, formData,
+                                       aFormSubmission);
+  NS_ENSURE_SUBMIT_SUCCESS(rv);
+
+  if (!(*aFormSubmission)->GetAsDialogSubmission()) {
+    rv = formData->CopySubmissionDataTo(*aFormSubmission);
+    NS_ENSURE_SUBMIT_SUCCESS(rv);
+  }
+
+  return NS_OK;
+}
+
+nsresult HTMLFormElement::SubmitSubmission(
+    HTMLFormSubmission* aFormSubmission) {
+  MOZ_ASSERT(!mDeferSubmission);
+  MOZ_ASSERT(!mPendingSubmission);
+
+  nsCOMPtr<nsIURI> actionURI = aFormSubmission->GetActionURL();
+  if (!actionURI) {
+    return NS_OK;
+  }
+
+  Document* doc = GetComposedDoc();
+  RefPtr<nsDocShell> container =
+      doc ? nsDocShell::Cast(doc->GetDocShell()) : nullptr;
+  if (!container || IsEditable()) {
+    return NS_OK;
+  }
+
+  bool schemeIsJavaScript = actionURI->SchemeIs("javascript");
+
+  nsresult rv;
+  bool cancelSubmit = false;
+  if (mNotifiedObservers) {
+    cancelSubmit = mNotifiedObserversResult;
+  } else {
+    rv = DispatchBeforeSubmitChromeOnlyEvent(&cancelSubmit);
+    NS_ENSURE_SUBMIT_SUCCESS(rv);
+  }
+
+  if (cancelSubmit) {
+    return NS_OK;
+  }
+
+  cancelSubmit = false;
+  rv = DoSecureToInsecureSubmitCheck(actionURI, &cancelSubmit);
+  NS_ENSURE_SUBMIT_SUCCESS(rv);
+
+  if (cancelSubmit) {
+    return NS_OK;
+  }
+
+  uint64_t currentLoadId = 0;
+
+  {
+    AutoPopupStatePusher popupStatePusher(mSubmitPopupState);
+
+    AutoHandlingUserInputStatePusher userInpStatePusher(
+        aFormSubmission->IsInitiatedFromUserInput());
+
+    nsCOMPtr<nsIInputStream> postDataStream;
+    rv = aFormSubmission->GetEncodedSubmission(
+        actionURI, getter_AddRefs(postDataStream), actionURI);
+    NS_ENSURE_SUBMIT_SUCCESS(rv);
+
+    nsAutoString target;
+    aFormSubmission->GetTarget(target);
+
+    RefPtr<nsDocShellLoadState> loadState = new nsDocShellLoadState(actionURI);
+    loadState->SetTarget(target);
+    loadState->SetPostDataStream(postDataStream);
+    loadState->SetFirstParty(true);
+    loadState->SetIsFormSubmission(true);
+    loadState->SetTriggeringPrincipal(NodePrincipal());
+    loadState->SetPrincipalToInherit(NodePrincipal());
+    loadState->SetPolicyContainer(GetPolicyContainer());
+    loadState->SetAllowFocusMove(UserActivation::IsHandlingUserInput());
+
+    const bool hasValidUserGestureActivation =
+        doc->HasValidTransientUserGestureActivation();
+    loadState->SetHasValidUserGestureActivation(hasValidUserGestureActivation);
+    loadState->SetTextDirectiveUserActivation(
+        doc->ConsumeTextDirectiveUserActivation() ||
+        hasValidUserGestureActivation);
+    loadState->SetFormDataEntryList(aFormSubmission->GetFormData());
+    if (aFormSubmission->IsInitiatedFromUserInput()) {
+      loadState->SetUserNavigationInvolvement(
+          UserNavigationInvolvement::Activation);
+    }
+    if (Element* element = aFormSubmission->GetSubmitterElement()) {
+      loadState->SetSourceElement(element);
+    } else {
+      loadState->SetSourceElement(this);
+    }
+    nsresult rv = container->OnFormSubmit(this, loadState);
+    NS_ENSURE_SUBMIT_SUCCESS(rv);
+
+    mTargetContext = loadState->TargetBrowsingContext().GetMaybeDiscarded();
+    currentLoadId = loadState->GetLoadIdentifier();
+  }
+
+  if (mTargetContext && !mTargetContext->IsDiscarded() && !schemeIsJavaScript) {
+    mCurrentLoadId = Some(currentLoadId);
+  } else {
+    ForgetCurrentSubmission();
+  }
+
+  return rv;
+}
+
+nsresult HTMLFormElement::SubmitDialog(DialogFormSubmission* aFormSubmission) {
+  HTMLDialogElement* dialog = aFormSubmission->DialogElement();
+  MOZ_ASSERT(dialog);
+
+  Optional<nsAString> retValue;
+  retValue = &aFormSubmission->ReturnValue();
+  dialog->Close(retValue);
+
+  return NS_OK;
+}
+
+nsresult HTMLFormElement::DoSecureToInsecureSubmitCheck(nsIURI* aActionURL,
+                                                        bool* aCancelSubmit) {
+  *aCancelSubmit = false;
+
+  if (!StaticPrefs::security_warn_submit_secure_to_insecure()) {
+    return NS_OK;
+  }
+
+  if (!OwnerDoc()->IsTopLevelContentDocument()) {
+    return NS_OK;
+  }
+
+  if (nsMixedContentBlocker::IsPotentiallyTrustworthyLoopbackURL(aActionURL)) {
+    return NS_OK;
+  }
+
+  if (nsMixedContentBlocker::URISafeToBeLoadedInSecureContext(aActionURL)) {
+    return NS_OK;
+  }
+
+  if (nsMixedContentBlocker::IsPotentiallyTrustworthyOnion(aActionURL)) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsPIDOMWindowOuter> window = OwnerDoc()->GetWindow();
+  if (!window) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (nsCOMPtr<nsPIDOMWindowInner> innerWindow = OwnerDoc()->GetInnerWindow()) {
+    if (!innerWindow->IsSecureContext()) {
+      return NS_OK;
+    }
+  }
+
+  if (window->GetDocumentURI()->SchemeIs("file")) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIDocShell> docShell = window->GetDocShell();
+  if (!docShell) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsresult rv;
+  nsCOMPtr<nsIPromptService> promptSvc =
+      do_GetService("@mozilla.org/prompter;1", &rv);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  nsTArray<nsCString> resIds = {"toolkit/global/htmlForm.ftl"_ns};
+  RefPtr<intl::Localization> l10n = intl::Localization::Create(resIds, true);
+  nsAutoCString title;
+  nsAutoCString message;
+  nsAutoCString cont;
+  ErrorResult error;
+  l10n->FormatValueSync("form-post-secure-to-insecure-warning-title"_ns, {},
+                        title, error);
+  NS_ENSURE_TRUE(!error.Failed(), error.StealNSResult());
+  l10n->FormatValueSync("form-post-secure-to-insecure-warning-message"_ns, {},
+                        message, error);
+  NS_ENSURE_TRUE(!error.Failed(), error.StealNSResult());
+  l10n->FormatValueSync("form-post-secure-to-insecure-warning-continue"_ns, {},
+                        cont, error);
+  NS_ENSURE_TRUE(!error.Failed(), error.StealNSResult());
+  int32_t buttonPressed;
+  bool checkState =
+      false;  
+  rv = promptSvc->ConfirmExBC(
+      docShell->GetBrowsingContext(),
+      StaticPrefs::prompts_modalType_insecureFormSubmit(),
+      NS_ConvertUTF8toUTF16(title).get(), NS_ConvertUTF8toUTF16(message).get(),
+      (nsIPromptService::BUTTON_TITLE_IS_STRING *
+       nsIPromptService::BUTTON_POS_0) +
+          (nsIPromptService::BUTTON_TITLE_CANCEL *
+           nsIPromptService::BUTTON_POS_1),
+      NS_ConvertUTF8toUTF16(cont).get(), nullptr, nullptr, nullptr, &checkState,
+      &buttonPressed);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+  *aCancelSubmit = (buttonPressed == 1);
+  return NS_OK;
+}
+
+nsresult HTMLFormElement::DispatchBeforeSubmitChromeOnlyEvent(
+    bool* aCancelSubmit) {
+  bool defaultAction = true;
+  nsresult rv = nsContentUtils::DispatchEventOnlyToChrome(
+      OwnerDoc(), static_cast<nsINode*>(this), u"DOMFormBeforeSubmit"_ns,
+      CanBubble::eYes, Cancelable::eYes, &defaultAction);
+  *aCancelSubmit = !defaultAction;
+  if (*aCancelSubmit) {
+    return NS_OK;
+  }
+  return rv;
+}
+
+nsresult HTMLFormElement::ConstructEntryList(FormData* aFormData) {
+  MOZ_ASSERT(aFormData, "Must have FormData!");
+  if (mIsConstructingEntryList) {
+    return NS_ERROR_DOM_INVALID_STATE_ERR;
+  }
+
+  AutoRestore<bool> resetConstructingEntryList(mIsConstructingEntryList);
+  mIsConstructingEntryList = true;
+  AutoTArray<RefPtr<nsGenericHTMLFormElement>, 100> sortedControls;
+  nsresult rv = mControls->GetSortedControls(sortedControls);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  for (nsGenericHTMLFormElement* control : sortedControls) {
+    if (!control->IsDisabled()) {
+      nsCOMPtr<nsIFormControl> fc = nsIFormControl::FromNode(control);
+      MOZ_ASSERT(fc);
+      fc->SubmitNamesValues(aFormData);
+    }
+  }
+
+  FormDataEventInit init;
+  init.mBubbles = true;
+  init.mCancelable = false;
+  init.mFormData = aFormData;
+  RefPtr<FormDataEvent> event =
+      FormDataEvent::Constructor(this, u"formdata"_ns, init);
+  event->SetTrusted(true);
+
+  EventDispatcher::DispatchDOMEvent(this, nullptr, event, nullptr, nullptr);
+
+  return NS_OK;
+}
+
+NotNull<const Encoding*> HTMLFormElement::GetSubmitEncoding() {
+  nsAutoString acceptCharsetValue;
+  GetAttr(nsGkAtoms::acceptcharset, acceptCharsetValue);
+
+  int32_t charsetLen = acceptCharsetValue.Length();
+  if (charsetLen > 0) {
+    int32_t offset = 0;
+    int32_t spPos = 0;
+    do {
+      spPos = acceptCharsetValue.FindChar(char16_t(' '), offset);
+      int32_t cnt = ((-1 == spPos) ? (charsetLen - offset) : (spPos - offset));
+      if (cnt > 0) {
+        nsAutoString uCharset;
+        acceptCharsetValue.Mid(uCharset, offset, cnt);
+
+        auto encoding = Encoding::ForLabelNoReplacement(uCharset);
+        if (encoding) {
+          return WrapNotNull(encoding);
+        }
+      }
+      offset = spPos + 1;
+    } while (spPos != -1);
+  }
+  Document* doc = GetComposedDoc();
+  if (doc) {
+    return doc->GetDocumentCharacterSet();
+  }
+  return UTF_8_ENCODING;
+}
+
+Element* HTMLFormElement::IndexedGetter(uint32_t aIndex, bool& aFound) {
+  Element* element = mControls->mElements.SafeElementAt(aIndex, nullptr);
+  aFound = element != nullptr;
+  return element;
+}
+
+nsresult HTMLFormElement::AddElement(nsGenericHTMLFormElement* aChild,
+                                     bool aUpdateValidity, bool aNotify) {
+  NS_ASSERTION(aChild->HasAttr(nsGkAtoms::form) || aChild->GetParent(),
+               "Form control should have a parent");
+  nsCOMPtr<nsIFormControl> fc = nsIFormControl::FromNode(aChild);
+  MOZ_ASSERT(fc);
+  bool childInElements = HTMLFormControlsCollection::ShouldBeInElements(fc);
+  TreeOrderedArray<nsGenericHTMLFormElement*, TreeKind::ShadowIncludingDOM>&
+      controlList =
+          childInElements ? mControls->mElements : mControls->mNotInElements;
+
+  const size_t insertedIndex = controlList.Insert(*aChild, this);
+  const bool lastElement = controlList.Length() == insertedIndex + 1;
+
+  auto type = fc->ControlType();
+
+  if (fc->IsSubmitControl()) {
+
+    nsGenericHTMLFormElement** firstSubmitSlot =
+        childInElements ? &mFirstSubmitInElements : &mFirstSubmitNotInElements;
+
+    if (!*firstSubmitSlot ||
+        (!lastElement && nsContentUtils::CompareTreePosition<TreeKind::DOM>(
+                             aChild, *firstSubmitSlot, this) < 0)) {
+      if ((mDefaultSubmitElement ||
+           (!mFirstSubmitInElements && !mFirstSubmitNotInElements)) &&
+          (*firstSubmitSlot == mDefaultSubmitElement ||
+           nsContentUtils::CompareTreePosition<TreeKind::DOM>(
+               aChild, mDefaultSubmitElement, this) < 0)) {
+        SetDefaultSubmitElement(aChild);
+      }
+      *firstSubmitSlot = aChild;
+    }
+
+    MOZ_ASSERT(mDefaultSubmitElement == mFirstSubmitInElements ||
+                   mDefaultSubmitElement == mFirstSubmitNotInElements ||
+                   !mDefaultSubmitElement,
+               "What happened here?");
+  }
+
+  if (aUpdateValidity) {
+    nsCOMPtr<nsIConstraintValidation> cvElmt = do_QueryObject(aChild);
+    if (cvElmt && cvElmt->IsCandidateForConstraintValidation() &&
+        !cvElmt->IsValid()) {
+      UpdateValidity(false);
+    }
+  }
+
+  if (type == FormControlType::InputRadio) {
+    RefPtr<HTMLInputElement> radio = static_cast<HTMLInputElement*>(aChild);
+    radio->AddToRadioGroup();
+  }
+
+  return NS_OK;
+}
+
+nsresult HTMLFormElement::AddElementToTable(nsGenericHTMLFormElement* aChild,
+                                            const nsAString& aName) {
+  return mControls->AddElementToTable(aChild, aName);
+}
+
+void HTMLFormElement::SetDefaultSubmitElement(
+    nsGenericHTMLFormElement* aElement) {
+  if (mDefaultSubmitElement) {
+    mDefaultSubmitElement->RemoveStates(ElementState::DEFAULT);
+  }
+  mDefaultSubmitElement = aElement;
+  if (mDefaultSubmitElement) {
+    mDefaultSubmitElement->AddStates(ElementState::DEFAULT);
+  }
+}
+
+nsresult HTMLFormElement::RemoveElement(nsGenericHTMLFormElement* aChild,
+                                        bool aUpdateValidity) {
+  RemoveElementFromPastNamesMap(aChild);
+
+  nsresult rv = NS_OK;
+  nsCOMPtr<nsIFormControl> fc = nsIFormControl::FromNode(aChild);
+  MOZ_ASSERT(fc);
+  if (fc->ControlType() == FormControlType::InputRadio) {
+    RefPtr<HTMLInputElement> radio = static_cast<HTMLInputElement*>(aChild);
+    radio->RemoveFromRadioGroup();
+  }
+
+  bool childInElements = HTMLFormControlsCollection::ShouldBeInElements(fc);
+  TreeOrderedArray<nsGenericHTMLFormElement*, TreeKind::ShadowIncludingDOM>&
+      controls =
+          childInElements ? mControls->mElements : mControls->mNotInElements;
+
+  size_t index = controls.IndexOf(aChild);
+  NS_ENSURE_STATE(index != controls.NoIndex);
+
+  controls.RemoveElementAt(index);
+
+  nsGenericHTMLFormElement** firstSubmitSlot =
+      childInElements ? &mFirstSubmitInElements : &mFirstSubmitNotInElements;
+  if (aChild == *firstSubmitSlot) {
+    *firstSubmitSlot = nullptr;
+
+    uint32_t length = controls.Length();
+    for (uint32_t i = index; i < length; ++i) {
+      const auto* currentControl =
+          nsIFormControl::FromNode(controls.ElementAt(i));
+      MOZ_ASSERT(currentControl);
+      if (currentControl->IsSubmitControl()) {
+        *firstSubmitSlot = controls.ElementAt(i);
+        break;
+      }
+    }
+  }
+
+  if (aChild == mDefaultSubmitElement) {
+    SetDefaultSubmitElement(nullptr);
+    nsContentUtils::AddScriptRunner(MakeAndAddRef<RemoveElementRunnable>(this));
+
+  }
+
+  if (aUpdateValidity) {
+    nsCOMPtr<nsIConstraintValidation> cvElmt = do_QueryObject(aChild);
+    if (cvElmt && cvElmt->IsCandidateForConstraintValidation() &&
+        !cvElmt->IsValid()) {
+      UpdateValidity(true);
+    }
+  }
+
+  return rv;
+}
+
+void HTMLFormElement::HandleDefaultSubmitRemoval() {
+  if (mDefaultSubmitElement) {
+    return;
+  }
+
+  nsGenericHTMLFormElement* newDefaultSubmit;
+  if (!mFirstSubmitNotInElements) {
+    newDefaultSubmit = mFirstSubmitInElements;
+  } else if (!mFirstSubmitInElements) {
+    newDefaultSubmit = mFirstSubmitNotInElements;
+  } else {
+    NS_ASSERTION(mFirstSubmitInElements != mFirstSubmitNotInElements,
+                 "How did that happen?");
+    newDefaultSubmit =
+        nsContentUtils::CompareTreePosition<TreeKind::DOM>(
+            mFirstSubmitInElements, mFirstSubmitNotInElements, this) < 0
+            ? mFirstSubmitInElements
+            : mFirstSubmitNotInElements;
+  }
+  SetDefaultSubmitElement(newDefaultSubmit);
+
+  MOZ_ASSERT(mDefaultSubmitElement == mFirstSubmitInElements ||
+                 mDefaultSubmitElement == mFirstSubmitNotInElements,
+             "What happened here?");
+}
+
+nsresult HTMLFormElement::RemoveElementFromTableInternal(
+    nsInterfaceHashtable<nsStringHashKey, nsISupports>& aTable,
+    nsIContent* aChild, const nsAString& aName) {
+  auto entry = aTable.Lookup(aName);
+  if (!entry) {
+    return NS_OK;
+  }
+  if (entry.Data() == aChild) {
+    entry.Remove();
+    ++mExpandoAndGeneration.generation;
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIContent> content(do_QueryInterface(entry.Data()));
+  if (content) {
+    return NS_OK;
+  }
+
+  MOZ_ASSERT(nsCOMPtr<RadioNodeList>(do_QueryInterface(entry.Data())));
+  auto* list = static_cast<RadioNodeList*>(entry->get());
+
+  list->RemoveElement(aChild);
+
+  uint32_t length = list->Length();
+
+  if (!length) {
+    entry.Remove();
+    ++mExpandoAndGeneration.generation;
+  } else if (length == 1) {
+    nsIContent* node = list->Item(0);
+    if (node) {
+      entry.Data() = node;
+    }
+  }
+
+  return NS_OK;
+}
+
+nsresult HTMLFormElement::RemoveElementFromTable(
+    nsGenericHTMLFormElement* aElement, const nsAString& aName) {
+  return mControls->RemoveElementFromTable(aElement, aName);
+}
+
+already_AddRefed<nsISupports> HTMLFormElement::ResolveName(
+    const nsAString& aName) {
+  nsCOMPtr<nsISupports> result = mControls->NamedItemInternal(aName);
+  if (result) {
+    AddToPastNamesMap(aName, result);
+    return result.forget();
+  }
+
+  result = mImageNameLookupTable.GetWeak(aName);
+  if (result) {
+    AddToPastNamesMap(aName, result);
+    return result.forget();
+  }
+
+  result = mPastNameLookupTable.GetWeak(aName);
+  return result.forget();
+}
+
+already_AddRefed<nsISupports> HTMLFormElement::NamedGetter(
+    const nsAString& aName, bool& aFound) {
+  if (nsCOMPtr<nsISupports> result = ResolveName(aName)) {
+    aFound = true;
+    return result.forget();
+  }
+
+  aFound = false;
+  return nullptr;
+}
+
+void HTMLFormElement::GetSupportedNames(nsTArray<nsString>& aRetval) {
+}
+
+void HTMLFormElement::OnSubmitClickBegin() { mDeferSubmission = true; }
+
+void HTMLFormElement::OnSubmitClickEnd() { mDeferSubmission = false; }
+
+void HTMLFormElement::FlushPendingSubmission() {
+  MOZ_ASSERT(!mDeferSubmission);
+
+  if (mPendingSubmission) {
+    UniquePtr<HTMLFormSubmission> submission = std::move(mPendingSubmission);
+
+    SubmitSubmission(submission.get());
+  }
+}
+
+void HTMLFormElement::GetAction(nsString& aValue) {
+  if (!GetAttr(nsGkAtoms::action, aValue) || aValue.IsEmpty()) {
+    Document* document = OwnerDoc();
+    nsIURI* docURI = document->GetDocumentURI();
+    if (docURI) {
+      nsAutoCString spec;
+      nsresult rv = docURI->GetSpec(spec);
+      if (NS_FAILED(rv)) {
+        return;
+      }
+
+      CopyUTF8toUTF16(spec, aValue);
+    }
+  } else {
+    GetURIAttr(nsGkAtoms::action, nullptr, aValue);
+  }
+}
+
+nsresult HTMLFormElement::GetActionURL(nsIURI** aActionURL,
+                                       Element* aOriginatingElement) {
+  nsresult rv = NS_OK;
+
+  *aActionURL = nullptr;
+
+  nsAutoString action;
+
+  if (aOriginatingElement &&
+      aOriginatingElement->HasAttr(nsGkAtoms::formaction)) {
+#ifdef DEBUG
+    const auto* formControl = nsIFormControl::FromNode(aOriginatingElement);
+    NS_ASSERTION(formControl && formControl->IsSubmitControl(),
+                 "The originating element must be a submit form control!");
+#endif  // DEBUG
+
+    HTMLInputElement* inputElement =
+        HTMLInputElement::FromNode(aOriginatingElement);
+    if (inputElement) {
+      inputElement->GetFormAction(action);
+    } else {
+      auto buttonElement = HTMLButtonElement::FromNode(aOriginatingElement);
+      if (buttonElement) {
+        buttonElement->GetFormAction(action);
+      } else {
+        NS_ERROR("Originating element must be an input or button element!");
+        return NS_ERROR_UNEXPECTED;
+      }
+    }
+  } else {
+    GetAction(action);
+  }
+
+
+  if (!IsInComposedDoc()) {
+    return NS_OK;  
+  }
+
+  Document* document = OwnerDoc();
+  nsIURI* docURI = document->GetDocumentURI();
+  NS_ENSURE_TRUE(docURI, NS_ERROR_UNEXPECTED);
+
+
+  nsCOMPtr<nsIURI> actionURL;
+  if (action.IsEmpty()) {
+    if (!document->IsHTMLOrXHTML()) {
+      return NS_OK;
+    }
+
+    actionURL = docURI;
+  } else {
+    nsIURI* baseURL = GetBaseURI();
+    NS_ASSERTION(baseURL, "No Base URL found in Form Submit!\n");
+    if (!baseURL) {
+      return NS_OK;  
+    }
+    rv = NS_NewURI(getter_AddRefs(actionURL), action, nullptr, baseURL);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  nsIScriptSecurityManager* securityManager =
+      nsContentUtils::GetSecurityManager();
+  rv = securityManager->CheckLoadURIWithPrincipal(
+      NodePrincipal(), actionURL, nsIScriptSecurityManager::STANDARD,
+      OwnerDoc()->InnerWindowID());
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  bool needsUpgrade =
+      actionURL->SchemeIs("http") &&
+      !nsMixedContentBlocker::IsPotentiallyTrustworthyLoopbackURL(actionURL) &&
+      document->GetUpgradeInsecureRequests(false);
+  if (needsUpgrade) {
+    AutoTArray<nsString, 2> params;
+    nsAutoCString spec;
+    rv = actionURL->GetSpec(spec);
+    NS_ENSURE_SUCCESS(rv, rv);
+    CopyUTF8toUTF16(spec, *params.AppendElement());
+
+    nsCOMPtr<nsIURI> upgradedActionURL;
+    rv = NS_GetSecureUpgradedURI(actionURL, getter_AddRefs(upgradedActionURL));
+    NS_ENSURE_SUCCESS(rv, rv);
+    actionURL = std::move(upgradedActionURL);
+
+    nsAutoCString scheme;
+    rv = actionURL->GetScheme(scheme);
+    NS_ENSURE_SUCCESS(rv, rv);
+    CopyUTF8toUTF16(scheme, *params.AppendElement());
+
+    CSP_LogLocalizedStr(
+        "upgradeInsecureRequest", params,
+        ""_ns,   
+        u""_ns,  
+        0,       
+        1,       
+        nsIScriptError::warningFlag, "upgradeInsecureRequest"_ns,
+        document->InnerWindowID(),
+        document->NodePrincipal()->OriginAttributesRef().IsPrivateBrowsing());
+  }
+
+  actionURL.forget(aActionURL);
+
+  return rv;
+}
+
+void HTMLFormElement::GetSubmissionTarget(nsGenericHTMLElement* aSubmitter,
+                                          nsAString& aTarget) {
+  if (!(aSubmitter && aSubmitter->GetAttr(nsGkAtoms::formtarget, aTarget)) &&
+      !GetAttr(nsGkAtoms::target, aTarget)) {
+    GetBaseTarget(aTarget);
+  }
+  SanitizeLinkOrFormTarget(aTarget);
+}
+
+nsGenericHTMLFormElement* HTMLFormElement::GetDefaultSubmitElement() const {
+  MOZ_ASSERT(mDefaultSubmitElement == mFirstSubmitInElements ||
+                 mDefaultSubmitElement == mFirstSubmitNotInElements,
+             "What happened here?");
+
+  return mDefaultSubmitElement;
+}
+
+bool HTMLFormElement::ImplicitSubmissionIsDisabled() const {
+  uint32_t numDisablingControlsFound = 0;
+  for (auto* element : mControls->mElements.AsSpan()) {
+    const auto* fc = nsIFormControl::FromNode(element);
+    MOZ_ASSERT(fc);
+    if (fc->IsSingleLineTextControl(false)) {
+      numDisablingControlsFound++;
+      if (numDisablingControlsFound > 1) {
+        break;
+      }
+    }
+  }
+  return numDisablingControlsFound != 1;
+}
+
+bool HTMLFormElement::IsLastActiveElement(
+    const nsGenericHTMLFormElement* aElement) const {
+  MOZ_ASSERT(aElement, "Unexpected call");
+
+  Span elements = mControls->mElements.AsSpan();
+  for (auto* element : Reversed(elements)) {
+    const auto* fc = nsIFormControl::FromNode(element);
+    MOZ_ASSERT(fc);
+    if (fc->IsTextControl(false) && !element->IsDisabled()) {
+      return element == aElement;
+    }
+  }
+  return false;
+}
+
+int32_t HTMLFormElement::Length() { return mControls->Length(); }
+
+void HTMLFormElement::ForgetCurrentSubmission() {
+  mNotifiedObservers = false;
+  mTargetContext = nullptr;
+  mCurrentLoadId = Nothing();
+}
+
+bool HTMLFormElement::CheckFormValidity(
+    nsTArray<RefPtr<Element>>* aInvalidElements) const {
+  bool ret = true;
+
+  AutoTArray<RefPtr<nsGenericHTMLFormElement>, 100> sortedControls;
+  if (NS_FAILED(mControls->GetSortedControls(sortedControls))) {
+    return false;
+  }
+
+  uint32_t len = sortedControls.Length();
+
+  for (uint32_t i = 0; i < len; ++i) {
+    nsCOMPtr<nsIConstraintValidation> cvElmt =
+        do_QueryObject(sortedControls[i]);
+    bool defaultAction = true;
+    if (cvElmt && !cvElmt->CheckValidity(*sortedControls[i], &defaultAction)) {
+      ret = false;
+
+      if (defaultAction && aInvalidElements) {
+        aInvalidElements->AppendElement(sortedControls[i]);
+      }
+    }
+  }
+
+  return ret;
+}
+
+bool HTMLFormElement::CheckValidFormSubmission() {
+
+  AutoTArray<RefPtr<Element>, 32> invalidElements;
+  if (CheckFormValidity(&invalidElements)) {
+    return true;
+  }
+
+  AutoJSAPI jsapi;
+  if (!jsapi.Init(GetRelevantGlobal())) {
+    return false;
+  }
+  JS::Rooted<JS::Value> detail(jsapi.cx());
+  if (!ToJSValue(jsapi.cx(), invalidElements, &detail)) {
+    return false;
+  }
+
+  RefPtr<CustomEvent> event =
+      NS_NewDOMCustomEvent(OwnerDoc(), nullptr, nullptr);
+  event->InitCustomEvent(jsapi.cx(), u"MozInvalidForm"_ns,
+                          true,
+                          true, detail);
+  event->SetTrusted(true);
+  event->WidgetEventPtr()->mFlags.mOnlyChromeDispatch = true;
+
+  DispatchEvent(*event);
+
+  ReportInvalidUnfocusableElements(std::move(invalidElements));
+
+  return !event->DefaultPrevented();
+}
+
+void HTMLFormElement::UpdateValidity(bool aElementValidity) {
+  if (aElementValidity) {
+    --mInvalidElementsCount;
+  } else {
+    ++mInvalidElementsCount;
+  }
+
+  NS_ASSERTION(mInvalidElementsCount >= 0, "Something went seriously wrong!");
+
+  if (mInvalidElementsCount &&
+      (mInvalidElementsCount != 1 || aElementValidity)) {
+    return;
+  }
+
+  AutoStateChangeNotifier notifier(*this, true);
+  RemoveStatesSilently(ElementState::VALID | ElementState::INVALID);
+  AddStatesSilently(mInvalidElementsCount ? ElementState::INVALID
+                                          : ElementState::VALID);
+}
+
+int32_t HTMLFormElement::IndexOfContent(nsIContent* aContent) {
+  int32_t index = 0;
+  return mControls->IndexOfContent(aContent, &index) == NS_OK ? index : 0;
+}
+
+void HTMLFormElement::Clear() {
+  for (HTMLImageElement* image : mImageElements.AsSpan()) {
+    image->ClearForm(false);
+  }
+  mImageElements.Clear();
+  mImageNameLookupTable.Clear();
+  mPastNameLookupTable.Clear();
+}
+
+namespace {
+
+struct PositionComparator {
+  nsIContent* const mElement;
+  mutable nsContentUtils::NodeIndexCache mCache;
+  explicit PositionComparator(nsIContent* const aElement)
+      : mElement(aElement) {}
+
+  int operator()(nsIContent* aElement) const {
+    if (mElement == aElement) {
+      return 0;
+    }
+    return nsContentUtils::CompareTreePosition<TreeKind::DOM>(
+        mElement, aElement, nullptr, &mCache);
+  }
+};
+
+struct RadioNodeListAdaptor {
+  RadioNodeList* const mList;
+  explicit RadioNodeListAdaptor(RadioNodeList* aList) : mList(aList) {}
+  nsIContent* operator[](size_t aIdx) const { return mList->Item(aIdx); }
+};
+
+}  
+
+nsresult HTMLFormElement::AddElementToTableInternal(
+    nsInterfaceHashtable<nsStringHashKey, nsISupports>& aTable,
+    nsIContent* aChild, const nsAString& aName) {
+  return aTable.WithEntryHandle(aName, [&](auto&& entry) {
+    if (!entry) {
+      entry.Insert(aChild);
+      ++mExpandoAndGeneration.generation;
+    } else {
+      nsCOMPtr<nsIContent> content = do_QueryInterface(entry.Data());
+
+      if (content) {
+        if (content == aChild) {
+          return NS_OK;
+        }
+
+        RefPtr list = new RadioNodeList(this);
+
+        NS_ASSERTION(
+            (content->IsElement() && content->AsElement()->HasAttr(
+                                         kNameSpaceID_None, nsGkAtoms::form)) ||
+                content->GetParent(),
+            "Item in list without parent");
+
+        bool newFirst = nsContentUtils::PositionIsBefore(aChild, content);
+
+        list->AppendElement(newFirst ? aChild : content.get());
+        list->AppendElement(newFirst ? content.get() : aChild);
+
+        entry.Data() = std::move(list);
+      } else {
+        MOZ_ASSERT(nsCOMPtr<RadioNodeList>(do_QueryInterface(entry.Data())));
+        auto* list = static_cast<RadioNodeList*>(entry->get());
+
+        NS_ASSERTION(
+            list->Length() > 1,
+            "List should have been converted back to a single element");
+
+        PositionComparator cmp(aChild);
+
+        if (cmp(list->Item(list->Length() - 1)) > 0) {
+          list->AppendElement(aChild);
+          return NS_OK;
+        }
+
+        size_t idx;
+        const bool found = BinarySearchIf(RadioNodeListAdaptor(list), 0,
+                                          list->Length(), cmp, &idx);
+        if (found &&
+            (list->Item(idx) == aChild || list->IndexOf(aChild) != -1)) {
+          return NS_OK;
+        }
+        list->InsertElementAt(aChild, idx);
+      }
+    }
+
+    return NS_OK;
+  });
+}
+
+nsresult HTMLFormElement::AddImageElement(HTMLImageElement* aElement) {
+  mImageElements.Insert(*aElement, this);
+  return NS_OK;
+}
+
+nsresult HTMLFormElement::AddImageElementToTable(HTMLImageElement* aChild,
+                                                 const nsAString& aName) {
+  return AddElementToTableInternal(mImageNameLookupTable, aChild, aName);
+}
+
+nsresult HTMLFormElement::RemoveImageElement(HTMLImageElement* aElement) {
+  RemoveElementFromPastNamesMap(aElement);
+  mImageElements.RemoveElement(*aElement);
+  return NS_OK;
+}
+
+nsresult HTMLFormElement::RemoveImageElementFromTable(
+    HTMLImageElement* aElement, const nsAString& aName) {
+  return RemoveElementFromTableInternal(mImageNameLookupTable, aElement, aName);
+}
+
+void HTMLFormElement::AddToPastNamesMap(const nsAString& aName,
+                                        nsISupports* aChild) {
+  nsCOMPtr<nsIContent> node = do_QueryInterface(aChild);
+  if (node) {
+    mPastNameLookupTable.InsertOrUpdate(aName, ToSupports(node));
+    node->SetFlags(MAY_BE_IN_PAST_NAMES_MAP);
+  }
+}
+
+void HTMLFormElement::RemoveElementFromPastNamesMap(Element* aElement) {
+  if (!aElement->HasFlag(MAY_BE_IN_PAST_NAMES_MAP)) {
+    return;
+  }
+
+  aElement->UnsetFlags(MAY_BE_IN_PAST_NAMES_MAP);
+
+  uint32_t oldCount = mPastNameLookupTable.Count();
+  for (auto iter = mPastNameLookupTable.Iter(); !iter.Done(); iter.Next()) {
+    if (aElement == iter.Data()) {
+      iter.Remove();
+    }
+  }
+  if (oldCount != mPastNameLookupTable.Count()) {
+    ++mExpandoAndGeneration.generation;
+  }
+}
+
+JSObject* HTMLFormElement::WrapNode(JSContext* aCx,
+                                    JS::Handle<JSObject*> aGivenProto) {
+  return HTMLFormElement_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+int32_t HTMLFormElement::GetFormNumberForStateKey() {
+  if (mFormNumber == -1) {
+    mFormNumber = OwnerDoc()->GetNextFormNumber();
+  }
+  return mFormNumber;
+}
+
+void HTMLFormElement::NodeInfoChanged(Document* aOldDoc) {
+  nsGenericHTMLElement::NodeInfoChanged(aOldDoc);
+
+  mFormNumber = -1;
+}
+
+bool HTMLFormElement::IsSubmitting() const {
+  bool loading = mTargetContext && !mTargetContext->IsDiscarded() &&
+                 mCurrentLoadId &&
+                 mTargetContext->IsLoadingIdentifier(*mCurrentLoadId);
+  return loading;
+}
+
+void HTMLFormElement::MaybeFireFormRemoved() {
+  Document* doc = GetComposedDoc();
+  nsIDocShell* container = doc ? doc->GetDocShell() : nullptr;
+  if (!container) {
+    return;
+  }
+
+  if (!doc->ShouldNotifyFormOrPasswordRemoved()) {
+    return;
+  }
+
+  AsyncEventDispatcher::RunDOMEventWhenSafe(
+      *this, u"DOMFormRemoved"_ns, CanBubble::eNo, ChromeOnlyDispatch::eYes);
+}
+
+}  

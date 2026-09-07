@@ -1,0 +1,51 @@
+#pragma once
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <string_view>
+
+#include "src/controller/contracts/annotation.h"
+
+namespace mmltk::controller {
+struct AnnotationEdit;
+struct AnnotationPointer;
+}  // namespace mmltk::controller
+
+namespace mmltk::controller::subsystems::annotation {
+
+namespace domain = mmltk::controller::contracts;
+
+enum class DocumentOutcome : std::uint8_t { Applied, Rejected, Capacity };
+
+struct DocumentResult final {
+    DocumentOutcome outcome = DocumentOutcome::Rejected;
+    std::string detail;
+};
+
+enum class DocumentSaveEffect : std::uint8_t { NotApplied, Committed, Uncertain };
+[[nodiscard]] DocumentSaveEffect save_annotation_document(const contracts::AnnotationUiState&, std::string_view, std::uint64_t) noexcept;
+
+class AnnotationDocument final {
+   public:
+    AnnotationDocument();
+    ~AnnotationDocument();
+    AnnotationDocument(const AnnotationDocument&) = delete;
+    AnnotationDocument& operator=(const AnnotationDocument&) = delete;
+
+    [[nodiscard]] DocumentResult Open(contracts::AnnotationSceneContent);
+    [[nodiscard]] DocumentResult Pointer(const mmltk::controller::AnnotationPointer&);
+    void PeerClosed() noexcept;
+    [[nodiscard]] DocumentResult Edit(const mmltk::controller::AnnotationEdit&);
+    [[nodiscard]] DocumentResult Save(std::string_view);
+    [[nodiscard]] const contracts::AnnotationUiState& ui() const noexcept;
+    [[nodiscard]] bool ToolAvailable(contracts::AnnotationTool, std::optional<std::uint16_t>) const noexcept;
+    [[nodiscard]] std::size_t RenderObjectCount() const noexcept;
+    [[nodiscard]] const contracts::AnnotationObject& RenderObjectAt(std::size_t) const;
+
+   private:
+    class Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+}  // namespace mmltk::controller::subsystems::annotation

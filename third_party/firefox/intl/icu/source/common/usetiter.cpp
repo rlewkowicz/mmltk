@@ -1,0 +1,116 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+**********************************************************************
+* Copyright (c) 2002-2006, International Business Machines
+* Corporation and others.  All Rights Reserved.
+**********************************************************************
+*/
+#include "unicode/usetiter.h"
+#include "unicode/uniset.h"
+#include "unicode/unistr.h"
+#include "uvector.h"
+
+U_NAMESPACE_BEGIN
+
+UOBJECT_DEFINE_RTTI_IMPLEMENTATION(UnicodeSetIterator)
+
+UnicodeSetIterator::UnicodeSetIterator(const UnicodeSet& uSet) {
+    cpString  = nullptr;
+    reset(uSet);
+}
+
+UnicodeSetIterator::UnicodeSetIterator() {
+    this->set = nullptr;
+    cpString  = nullptr;
+    reset();
+}
+
+UnicodeSetIterator::~UnicodeSetIterator() {
+    delete cpString;
+}
+
+UBool UnicodeSetIterator::next() {
+    if (nextElement <= endElement) {
+        codepoint = codepointEnd = nextElement++;
+        string = nullptr;
+        return true;
+    }
+    if (range < endRange) {
+        loadRange(++range);
+        codepoint = codepointEnd = nextElement++;
+        string = nullptr;
+        return true;
+    }
+
+    if (nextString >= stringCount) return false;
+    codepoint = static_cast<UChar32>(IS_STRING); 
+    string = static_cast<const UnicodeString*>(set->strings_->elementAt(nextString++));
+    return true;
+}
+
+UBool UnicodeSetIterator::nextRange() {
+    string = nullptr;
+    if (nextElement <= endElement) {
+        codepointEnd = endElement;
+        codepoint = nextElement;
+        nextElement = endElement+1;
+        return true;
+    }
+    if (range < endRange) {
+        loadRange(++range);
+        codepointEnd = endElement;
+        codepoint = nextElement;
+        nextElement = endElement+1;
+        return true;
+    }
+
+    if (nextString >= stringCount) return false;
+    codepoint = static_cast<UChar32>(IS_STRING); 
+    string = static_cast<const UnicodeString*>(set->strings_->elementAt(nextString++));
+    return true;
+}
+
+void UnicodeSetIterator::reset(const UnicodeSet& uSet) {
+    this->set = &uSet;
+    reset();
+}
+
+void UnicodeSetIterator::reset() {
+    if (set == nullptr) {
+        endRange = -1;
+        stringCount = 0;
+    } else {
+        endRange = set->getRangeCount() - 1;
+        stringCount = set->stringsSize();
+    }
+    range = 0;
+    endElement = -1;
+    nextElement = 0;            
+    if (endRange >= 0) {
+        loadRange(range);
+    }
+    nextString = 0;
+    string = nullptr;
+}
+
+void UnicodeSetIterator::loadRange(int32_t iRange) {
+    nextElement = set->getRangeStart(iRange);
+    endElement = set->getRangeEnd(iRange);
+}
+
+
+const UnicodeString& UnicodeSetIterator::getString()  {
+    if (string == nullptr && codepoint != static_cast<UChar32>(IS_STRING)) {
+       if (cpString == nullptr) {
+          cpString = new UnicodeString();
+       }
+       if (cpString != nullptr) {
+          cpString->setTo(codepoint);
+       }
+       string = cpString;
+    }
+    return *string;
+}
+
+U_NAMESPACE_END
+

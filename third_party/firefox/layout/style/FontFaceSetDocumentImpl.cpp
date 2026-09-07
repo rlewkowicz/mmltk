@@ -1,0 +1,659 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "FontFaceSetDocumentImpl.h"
+
+#include "mozilla/FontLoaderUtils.h"
+#include "mozilla/LoadInfo.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/PresShellInlines.h"
+#include "mozilla/css/Loader.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/DocumentInlines.h"
+#include "mozilla/dom/Event.h"
+#include "mozilla/dom/FontFaceImpl.h"
+#include "mozilla/dom/FontFaceSet.h"
+#include "nsContentPolicyUtils.h"
+#include "nsDOMNavigationTiming.h"
+#include "nsFontFaceLoader.h"
+#include "nsIDocShell.h"
+#include "nsISupportsPriority.h"
+#include "nsIWebNavigation.h"
+#include "nsPresContext.h"
+
+using namespace mozilla;
+using namespace mozilla::css;
+using namespace mozilla::dom;
+
+#define LOG(args) \
+  MOZ_LOG(gfxUserFontSet::GetUserFontsLog(), mozilla::LogLevel::Debug, args)
+#define LOG_ENABLED() \
+  MOZ_LOG_TEST(gfxUserFontSet::GetUserFontsLog(), LogLevel::Debug)
+
+NS_IMPL_ISUPPORTS_INHERITED(FontFaceSetDocumentImpl, FontFaceSetImpl,
+                            nsIDOMEventListener, nsICSSLoaderObserver)
+
+FontFaceSetDocumentImpl::FontFaceSetDocumentImpl(FontFaceSet* aOwner,
+                                                 dom::Document* aDocument)
+    : FontFaceSetImpl(aOwner), mDocument(aDocument) {}
+
+FontFaceSetDocumentImpl::~FontFaceSetDocumentImpl() = default;
+
+void FontFaceSetDocumentImpl::Initialize() {
+  RecursiveMutexAutoLock lock(mMutex);
+
+  MOZ_ASSERT(mDocument, "We should get a valid document from the caller!");
+
+  if (nsCOMPtr<nsIDocShell> docShell = mDocument->GetDocShell()) {
+    uint32_t loadType;
+    uint32_t flags;
+    if ((NS_SUCCEEDED(docShell->GetLoadType(&loadType)) &&
+         ((loadType >> 16) & nsIWebNavigation::LOAD_FLAGS_BYPASS_CACHE)) ||
+        (NS_SUCCEEDED(docShell->GetDefaultLoadFlags(&flags)) &&
+         (flags & nsIRequest::LOAD_BYPASS_CACHE))) {
+      mBypassCache = true;
+    }
+  }
+
+  if (nsCOMPtr<nsILoadContext> loadContext = mDocument->GetLoadContext()) {
+    mPrivateBrowsing = loadContext->UsePrivateBrowsing();
+  }
+
+  if (!mDocument->DidFireDOMContentLoaded()) {
+    mDocument->AddSystemEventListener(u"DOMContentLoaded"_ns, this, false,
+                                      false);
+  } else {
+    CheckLoadingFinished();
+  }
+
+  mDocument->EnsureCSSLoader().AddObserver(this);
+
+  mStandardFontLoadPrincipal = MakeRefPtr<gfxFontSrcPrincipal>(
+      mDocument->NodePrincipal(), mDocument->PartitionedPrincipal());
+}
+
+void FontFaceSetDocumentImpl::Destroy() {
+  RemoveDOMContentLoadedListener();
+
+  if (mDocument && mDocument->GetExistingCSSLoader()) {
+    mDocument->GetExistingCSSLoader()->RemoveObserver(this);
+  }
+
+  mRuleFaces.Clear();
+
+  FontFaceSetImpl::Destroy();
+
+  mDocument = nullptr;
+}
+
+bool FontFaceSetDocumentImpl::IsOnOwningThread() { return NS_IsMainThread(); }
+
+#ifdef DEBUG
+void FontFaceSetDocumentImpl::AssertIsOnOwningThread() {
+  MOZ_ASSERT(NS_IsMainThread());
+}
+#endif
+
+void FontFaceSetDocumentImpl::DispatchToOwningThread(
+    const char* aName, std::function<void()>&& aFunc) {
+  class FontFaceSetDocumentRunnable final : public Runnable {
+   public:
+    FontFaceSetDocumentRunnable(const char* aName,
+                                std::function<void()>&& aFunc)
+        : Runnable(aName), mFunc(std::move(aFunc)) {}
+
+    NS_IMETHOD Run() final {
+      mFunc();
+      return NS_OK;
+    }
+
+   private:
+    std::function<void()> mFunc;
+  };
+
+  auto runnable =
+      MakeRefPtr<FontFaceSetDocumentRunnable>(aName, std::move(aFunc));
+  NS_DispatchToMainThread(runnable.forget());
+}
+
+uint64_t FontFaceSetDocumentImpl::GetInnerWindowID() {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (!mDocument) {
+    return 0;
+  }
+
+  return mDocument->InnerWindowID();
+}
+
+FontVisibilityProvider* FontFaceSetDocumentImpl::GetFontVisibilityProvider()
+    const {
+  mozilla::AssertIsMainThreadOrServoFontMetricsLocked();
+  if (!mDocument) {
+    return nullptr;
+  }
+
+  return mDocument->GetPresContext();
+}
+
+void FontFaceSetDocumentImpl::RefreshStandardFontLoadPrincipal() {
+  MOZ_ASSERT(NS_IsMainThread());
+  RecursiveMutexAutoLock lock(mMutex);
+  if (NS_WARN_IF(!mDocument)) {
+    return;
+  }
+  mStandardFontLoadPrincipal = MakeRefPtr<gfxFontSrcPrincipal>(
+      mDocument->NodePrincipal(), mDocument->PartitionedPrincipal());
+  FontFaceSetImpl::RefreshStandardFontLoadPrincipal();
+}
+
+already_AddRefed<URLExtraData> FontFaceSetDocumentImpl::GetURLExtraData() {
+  if (!mDocument) {
+    return nullptr;
+  }
+  return do_AddRef(mDocument->DefaultStyleAttrURLData());
+}
+
+void FontFaceSetDocumentImpl::RemoveDOMContentLoadedListener() {
+  if (mDocument) {
+    mDocument->RemoveSystemEventListener(u"DOMContentLoaded"_ns, this, false);
+  }
+}
+
+void FontFaceSetDocumentImpl::FindMatchingFontFaces(
+    const nsTHashSet<FontFace*>& aMatchingFaces,
+    nsTArray<FontFace*>& aFontFaces) {
+  FontFaceSetImpl::FindMatchingFontFaces(aMatchingFaces, aFontFaces);
+  for (FontFaceRecord& record : mRuleFaces) {
+    FontFace* owner = record.mFontFace->GetOwner();
+    if (owner && aMatchingFaces.Contains(owner)) {
+      aFontFaces.AppendElement(owner);
+    }
+  }
+}
+
+TimeStamp FontFaceSetDocumentImpl::GetNavigationStartTimeStamp() {
+  TimeStamp navStart;
+  RefPtr<nsDOMNavigationTiming> timing(mDocument->GetNavigationTiming());
+  if (timing) {
+    navStart = timing->GetNavigationStartTimeStamp();
+  }
+  return navStart;
+}
+
+void FontFaceSetDocumentImpl::EnsureReady() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (!ReadyPromiseIsPending() && mDocument) {
+    mDocument->FlushPendingNotifications(FlushType::Layout);
+  }
+}
+
+#ifdef DEBUG
+bool FontFaceSetDocumentImpl::HasRuleFontFace(FontFaceImpl* aFontFace) {
+  for (const auto& record : mRuleFaces) {
+    if (record.mFontFace == aFontFace) {
+      return true;
+    }
+  }
+  return false;
+}
+#endif
+
+bool FontFaceSetDocumentImpl::Add(FontFaceImpl* aFontFace, ErrorResult& aRv) {
+  if (NS_WARN_IF(!mDocument)) {
+    return false;
+  }
+
+  if (!FontFaceSetImpl::Add(aFontFace, aRv)) {
+    return false;
+  }
+
+  RefPtr<dom::Document> clonedDoc = mDocument->GetLatestStaticClone();
+  if (clonedDoc) {
+    nsCOMPtr<nsIPrincipal> principal = mDocument->GetPrincipal();
+    if (principal->IsSystemPrincipal() || nsContentUtils::IsPDFJS(principal)) {
+      ErrorResult rv;
+      clonedDoc->Fonts()->Add(*aFontFace->GetOwner(), rv);
+      MOZ_ASSERT(!rv.Failed());
+    }
+  }
+
+  return true;
+}
+
+nsresult FontFaceSetDocumentImpl::StartLoad(gfxUserFontEntry* aUserFontEntry,
+                                            uint32_t aSrcIndex) {
+  if (NS_WARN_IF(!mDocument)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsresult rv;
+
+  nsCOMPtr<nsIStreamLoader> streamLoader;
+  RefPtr<nsFontFaceLoader> fontLoader;
+
+  const gfxFontFaceSrc& src = aUserFontEntry->SourceAt(aSrcIndex);
+
+  auto preloadKey =
+      PreloadHashKey::CreateAsFont(src.mURI->get(), CORS_ANONYMOUS);
+  RefPtr<PreloaderBase> preload =
+      mDocument->Preloads().LookupPreload(preloadKey);
+
+  if (preload) {
+    fontLoader = new nsFontFaceLoader(aUserFontEntry, aSrcIndex, this,
+                                      preload->Channel());
+    rv = NS_NewStreamLoader(getter_AddRefs(streamLoader), fontLoader,
+                            fontLoader);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    rv = preload->AsyncConsume(streamLoader);
+
+    preload->RemoveSelf(mDocument);
+  } else {
+    rv = NS_ERROR_FAILURE;
+  }
+
+  nsCOMPtr<nsILoadGroup> loadGroup(mDocument->GetDocumentLoadGroup());
+  if (NS_FAILED(rv)) {
+    nsCOMPtr<nsIChannel> channel;
+    rv = FontLoaderUtils::BuildChannel(
+        getter_AddRefs(channel), src.mURI->get(), CORS_ANONYMOUS,
+        dom::ReferrerPolicy::_empty , aUserFontEntry, &src,
+        mDocument, loadGroup, nullptr, false,
+        nsISupportsPriority::PRIORITY_HIGH);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    fontLoader = new nsFontFaceLoader(aUserFontEntry, aSrcIndex, this, channel);
+
+    if (LOG_ENABLED()) {
+      nsCOMPtr<nsIURI> referrer = src.mReferrerInfo
+                                      ? src.mReferrerInfo->GetOriginalReferrer()
+                                      : nullptr;
+      LOG((
+          "userfonts (%p) download start - font uri: (%s) referrer uri: (%s)\n",
+          fontLoader.get(), src.mURI->GetSpecOrDefault().get(),
+          referrer ? referrer->GetSpecOrDefault().get() : ""));
+    }
+
+    rv = NS_NewStreamLoader(getter_AddRefs(streamLoader), fontLoader,
+                            fontLoader);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    rv = channel->AsyncOpen(streamLoader);
+    if (NS_FAILED(rv)) {
+      fontLoader->DropChannel();  
+    }
+  }
+
+  {
+    RecursiveMutexAutoLock lock(mMutex);
+    mLoaders.PutEntry(fontLoader);
+  }
+
+  if (NS_SUCCEEDED(rv)) {
+    fontLoader->StartedLoading(streamLoader);
+    aUserFontEntry->SetLoader(fontLoader);
+  }
+
+  return rv;
+}
+
+bool FontFaceSetDocumentImpl::IsFontLoadAllowed(const gfxFontFaceSrc& aSrc) {
+  MOZ_ASSERT(aSrc.mSourceType == gfxFontFaceSrc::eSourceType_URL);
+
+  if (ServoStyleSet::IsInServoTraversal()) {
+    RecursiveMutexAutoLock lock(mMutex);
+    auto entry = mAllowedFontLoads.Lookup(&aSrc);
+    MOZ_DIAGNOSTIC_ASSERT(entry, "Missed an update?");
+    return entry ? *entry : false;
+  }
+
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (aSrc.mUseOriginPrincipal) {
+    return true;
+  }
+
+  if (NS_WARN_IF(!mDocument)) {
+    return false;
+  }
+
+  RefPtr<gfxFontSrcPrincipal> gfxPrincipal =
+      aSrc.mURI->InheritsSecurityContext() ? nullptr
+                                           : aSrc.LoadPrincipal(*this);
+
+  nsIPrincipal* principal =
+      gfxPrincipal ? gfxPrincipal->NodePrincipal() : nullptr;
+
+  Result<RefPtr<net::LoadInfo>, nsresult> maybeLoadInfo = net::LoadInfo::Create(
+      mDocument->NodePrincipal(),  
+      principal,                   
+      mDocument, nsILoadInfo::SEC_ONLY_FOR_EXPLICIT_CONTENTSEC_CHECK,
+      nsIContentPolicy::TYPE_FONT);
+  if (NS_WARN_IF(maybeLoadInfo.isErr())) {
+    return false;
+  }
+  RefPtr<net::LoadInfo> secCheckLoadInfo = maybeLoadInfo.unwrap();
+
+  int16_t shouldLoad = nsIContentPolicy::ACCEPT;
+  nsresult rv =
+      NS_CheckContentLoadPolicy(aSrc.mURI->get(), secCheckLoadInfo, &shouldLoad,
+                                nsContentUtils::GetContentPolicy());
+
+  return NS_SUCCEEDED(rv) && NS_CP_ACCEPTED(shouldLoad);
+}
+
+nsresult FontFaceSetDocumentImpl::CreateChannelForSyncLoadFontData(
+    nsIChannel** aOutChannel, gfxUserFontEntry* aFontToLoad,
+    const gfxFontFaceSrc* aFontFaceSrc) {
+  gfxFontSrcPrincipal* principal = aFontToLoad->GetPrincipal();
+
+  return NS_NewChannelWithTriggeringPrincipal(
+      aOutChannel, aFontFaceSrc->mURI->get(), mDocument,
+      principal ? principal->NodePrincipal() : nullptr,
+      nsILoadInfo::SEC_REQUIRE_SAME_ORIGIN_INHERITS_SEC_CONTEXT,
+      aFontFaceSrc->mUseOriginPrincipal ? nsIContentPolicy::TYPE_UA_FONT
+                                        : nsIContentPolicy::TYPE_FONT);
+}
+
+bool FontFaceSetDocumentImpl::UpdateRules(
+    const nsTArray<nsFontFaceRuleContainer>& aRules) {
+  RecursiveMutexAutoLock lock(mMutex);
+
+  bool modified = mNonRuleFacesDirty;
+  mNonRuleFacesDirty = false;
+
+  nsTArray<FontFaceRecord> oldRecords = std::move(mRuleFaces);
+
+  oldRecords.Reverse();
+
+  for (const auto& fontFamily : mFontFamilies.Values()) {
+    fontFamily->DetachFontEntries();
+  }
+
+  nsTHashSet<StyleLockedFontFaceRule*> handledRules;
+
+  for (const nsFontFaceRuleContainer& container : aRules) {
+    StyleLockedFontFaceRule* rule = container.mRule;
+    if (!handledRules.EnsureInserted(rule)) {
+      continue;
+    }
+    modified |= InsertRuleFontFace(rule, container.mOrigin, oldRecords);
+  }
+
+  for (const FontFaceRecord& record : mNonRuleFaces) {
+    InsertNonRuleFontFace(record.mFontFace);
+  }
+
+  for (auto it = mFontFamilies.Iter(); !it.Done(); it.Next()) {
+    if (!it.Data()->FontListLength()) {
+      it.Remove();
+    }
+  }
+
+  if (!oldRecords.IsEmpty()) {
+    modified = true;
+    for (const FontFaceRecord& record : oldRecords) {
+      RefPtr<FontFaceImpl> f = record.mFontFace;
+      if (gfxUserFontEntry* userFontEntry = f->GetUserFontEntry()) {
+        if (nsFontFaceLoader* loader = userFontEntry->GetLoader()) {
+          loader->Cancel();
+        }
+      }
+
+      f->DisconnectFromRule();
+    }
+  }
+
+  if (modified) {
+    IncrementGenerationLocked(true);
+    mHasLoadingFontFacesIsDirty = true;
+    CheckLoadingStarted();
+    CheckLoadingFinished();
+  }
+
+  if (mRebuildLocalRules) {
+    mLocalRulesUsed = false;
+    mRebuildLocalRules = false;
+  }
+
+  if (LOG_ENABLED() && !mRuleFaces.IsEmpty()) {
+    LOG(("userfonts (%p) userfont rules update (%s) rule count: %d", this,
+         (modified ? "modified" : "not modified"), (int)(mRuleFaces.Length())));
+  }
+
+  return modified;
+}
+
+bool FontFaceSetDocumentImpl::InsertRuleFontFace(
+    StyleLockedFontFaceRule* aRule, StyleOrigin aSheetType,
+    nsTArray<FontFaceRecord>& aOldRecords) {
+  RecursiveMutexAutoLock lock(mMutex);
+
+  if (MOZ_UNLIKELY(!mOwner)) {
+    return false;
+  }
+
+  gfxUserFontAttributes attr;
+  if (!FontFaceImpl::GetAttributesFromRule(aRule, attr)) {
+    return false;
+  }
+
+  bool remove = false;
+  size_t removeIndex;
+
+  for (size_t i = aOldRecords.Length(); i > 0;) {
+    FontFaceRecord& rec = aOldRecords[--i];
+
+    const bool matches =
+        rec.mOrigin == Some(aSheetType) &&
+        Servo_FontFaceRule_Equals(rec.mFontFace->GetData(), aRule);
+    if (!matches) {
+      continue;
+    }
+
+    FontFace* owner = rec.mFontFace->GetOwner();
+    if (mLocalRulesUsed && mRebuildLocalRules) {
+      const bool hasLocalSource = [&] {
+        for (auto& source : attr.mSources) {
+          if (source.IsLocal()) {
+            return true;
+          }
+        }
+        return false;
+      }();
+
+      if (hasLocalSource) {
+        remove = true;
+        removeIndex = i;
+        break;
+      }
+    }
+
+    rec.mFontFace->SetRule(aRule);
+    gfxUserFontEntry* entry = rec.mFontFace->GetUserFontEntry();
+    MOZ_ASSERT(entry, "FontFace should have a gfxUserFontEntry by now");
+
+    AddUserFontEntry(attr.mFamilyName, entry);
+
+    MOZ_ASSERT(!HasRuleFontFace(rec.mFontFace),
+               "FontFace should not occur in mRuleFaces twice");
+
+    mRuleFaces.AppendElement(rec);
+    aOldRecords.RemoveElementAt(i);
+
+    if (owner) {
+      mOwner->InsertRuleFontFace(owner, aSheetType);
+    }
+
+    return i < aOldRecords.Length();
+  }
+
+  RefPtr<FontFace> fontFace =
+      FontFace::CreateForRule(mOwner->GetParentObject(), mOwner, aRule);
+  RefPtr<FontFaceImpl> impl = fontFace->GetImpl();
+  nsAutoCString family(attr.mFamilyName);
+  RefPtr<gfxUserFontEntry> entry =
+      FindOrCreateUserFontEntryFromFontFace(impl, std::move(attr), aSheetType);
+
+  if (!entry) {
+    return false;
+  }
+
+  if (remove) {
+    aOldRecords.RemoveElementAt(removeIndex);
+  }
+
+  FontFaceRecord rec;
+  rec.mFontFace = impl;
+  rec.mOrigin = Some(aSheetType);
+
+  impl->SetUserFontEntry(entry);
+
+  MOZ_ASSERT(!HasRuleFontFace(impl),
+             "FontFace should not occur in mRuleFaces twice");
+
+  mRuleFaces.AppendElement(rec);
+
+  mOwner->InsertRuleFontFace(fontFace, aSheetType);
+
+  AddUserFontEntry(family, entry);
+  return true;
+}
+
+StyleLockedFontFaceRule* FontFaceSetDocumentImpl::FindRuleForEntry(
+    gfxFontEntry* aFontEntry) {
+  NS_ASSERTION(!aFontEntry->mIsUserFontContainer, "only platform font entries");
+  for (uint32_t i = 0; i < mRuleFaces.Length(); ++i) {
+    FontFaceImpl* f = mRuleFaces[i].mFontFace;
+    gfxUserFontEntry* entry = f->GetUserFontEntry();
+    if (entry && entry->GetPlatformFontEntry() == aFontEntry) {
+      return f->GetRule();
+    }
+  }
+  return nullptr;
+}
+
+StyleLockedFontFaceRule* FontFaceSetDocumentImpl::FindRuleForUserFontEntry(
+    gfxUserFontEntry* aUserFontEntry) {
+  for (uint32_t i = 0; i < mRuleFaces.Length(); ++i) {
+    FontFaceImpl* f = mRuleFaces[i].mFontFace;
+    if (f->GetUserFontEntry() == aUserFontEntry) {
+      return f->GetRule();
+    }
+  }
+  return nullptr;
+}
+
+void FontFaceSetDocumentImpl::CacheFontLoadability() {
+  RecursiveMutexAutoLock lock(mMutex);
+
+  for (const auto& fontFamily : mFontFamilies.Values()) {
+    fontFamily->ReadLock();
+    for (const gfxFontEntry* entry : fontFamily->GetFontList()) {
+      if (!entry->mIsUserFontContainer) {
+        continue;
+      }
+
+      const auto& sourceList =
+          static_cast<const gfxUserFontEntry*>(entry)->SourceList();
+      for (const gfxFontFaceSrc& src : sourceList) {
+        if (src.mSourceType != gfxFontFaceSrc::eSourceType_URL) {
+          continue;
+        }
+        mAllowedFontLoads.LookupOrInsertWith(
+            &src, [&] { return IsFontLoadAllowed(src); });
+      }
+    }
+    fontFamily->ReadUnlock();
+  }
+}
+
+void FontFaceSetDocumentImpl::DidRefresh() { CheckLoadingFinished(); }
+
+void FontFaceSetDocumentImpl::UpdateHasLoadingFontFaces() {
+  RecursiveMutexAutoLock lock(mMutex);
+  FontFaceSetImpl::UpdateHasLoadingFontFaces();
+
+  if (mHasLoadingFontFaces) {
+    return;
+  }
+
+  for (size_t i = 0; i < mRuleFaces.Length(); i++) {
+    FontFaceImpl* f = mRuleFaces[i].mFontFace;
+    if (f->Status() == FontFaceLoadStatus::Loading) {
+      mHasLoadingFontFaces = true;
+      return;
+    }
+  }
+}
+
+bool FontFaceSetDocumentImpl::MightHavePendingFontLoads() {
+  if (FontFaceSetImpl::MightHavePendingFontLoads()) {
+    return true;
+  }
+
+  if (!mDocument) {
+    return false;
+  }
+
+  PresShell* ps = mDocument->GetPresShell();
+  if (ps && ps->MightHavePendingFontLoads()) {
+    return true;
+  }
+
+  if (!mDocument->DidFireDOMContentLoaded()) {
+    return true;
+  }
+
+  if (css::Loader* loader = mDocument->GetExistingCSSLoader()) {
+    if (loader->HasPendingLoads()) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+
+NS_IMETHODIMP
+FontFaceSetDocumentImpl::HandleEvent(Event* aEvent) {
+  nsString type;
+  aEvent->GetType(type);
+
+  if (!type.EqualsLiteral("DOMContentLoaded")) {
+    return NS_ERROR_FAILURE;
+  }
+
+  RemoveDOMContentLoadedListener();
+  CheckLoadingFinished();
+
+  return NS_OK;
+}
+
+
+NS_IMETHODIMP
+FontFaceSetDocumentImpl::StyleSheetLoaded(StyleSheet* aSheet, bool aWasDeferred,
+                                          nsresult aStatus) {
+  CheckLoadingFinished();
+  return NS_OK;
+}
+
+void FontFaceSetDocumentImpl::FlushUserFontSet() {
+  if (mDocument) {
+    mDocument->FlushUserFontSet();
+  }
+}
+
+void FontFaceSetDocumentImpl::MarkUserFontSetDirty() {
+  if (mDocument) {
+    if (PresShell* presShell = mDocument->GetPresShell()) {
+      presShell->EnsureStyleFlush();
+    }
+    mDocument->MarkUserFontSetDirty();
+  }
+}
+
+#undef LOG_ENABLED
+#undef LOG

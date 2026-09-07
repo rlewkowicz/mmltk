@@ -1,0 +1,64 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef IPC_GLUE_SERIALIZEDSTRUCTUREDCLONEBUFFER_H_
+#define IPC_GLUE_SERIALIZEDSTRUCTUREDCLONEBUFFER_H_
+
+#include "chrome/common/ipc_message.h"
+#include "chrome/common/ipc_message_utils.h"
+#include "ipc/IPCMessageUtils.h"
+#include "js/AllocPolicy.h"
+#include "js/StructuredClone.h"
+#include "mozilla/mozalloc.h"
+class PickleIterator;
+
+namespace mozilla {
+template <typename...>
+class Variant;
+
+namespace detail {
+template <typename...>
+struct VariantTag;
+}
+}  
+
+namespace mozilla {
+
+struct SerializedStructuredCloneBuffer final {
+  SerializedStructuredCloneBuffer() = default;
+
+  SerializedStructuredCloneBuffer(SerializedStructuredCloneBuffer&&) = default;
+  SerializedStructuredCloneBuffer& operator=(
+      SerializedStructuredCloneBuffer&&) = default;
+
+  SerializedStructuredCloneBuffer(const SerializedStructuredCloneBuffer&) =
+      delete;
+  SerializedStructuredCloneBuffer& operator=(
+      const SerializedStructuredCloneBuffer& aOther) = delete;
+
+  bool operator==(const SerializedStructuredCloneBuffer& aOther) const {
+    return false;
+  }
+
+  JSStructuredCloneData data{JS::StructuredCloneScope::Unassigned};
+};
+
+}  
+
+namespace IPC {
+template <>
+struct ParamTraits<JSStructuredCloneData> {
+  typedef JSStructuredCloneData paramType;
+
+  static void Write(MessageWriter* aWriter, const paramType& aParam);
+
+  static bool Read(MessageReader* aReader, paramType* aResult);
+};
+
+DEFINE_IPC_SERIALIZER_WITH_FIELDS(mozilla::SerializedStructuredCloneBuffer,
+                                  data);
+
+}  
+
+#endif /* IPC_GLUE_SERIALIZEDSTRUCTUREDCLONEBUFFER_H_ */

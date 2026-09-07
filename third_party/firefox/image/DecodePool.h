@@ -1,0 +1,65 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_image_DecodePool_h
+#define mozilla_image_DecodePool_h
+
+#include "mozilla/Mutex.h"
+#include "mozilla/StaticPtr.h"
+#include "nsCOMArray.h"
+#include "nsCOMPtr.h"
+#include "nsIEventTarget.h"
+#include "nsIObserver.h"
+#include "nsStringFwd.h"
+
+class nsIThread;
+class nsIThreadPool;
+
+namespace mozilla {
+namespace image {
+
+class Decoder;
+class DecodePoolImpl;
+class IDecodingTask;
+
+class DecodePool final : public nsIObserver {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+
+  static void Initialize();
+
+  static DecodePool* Singleton();
+
+  static uint32_t NumberOfCores();
+
+  static bool IsShuttingDown();
+
+  void AsyncRun(IDecodingTask* aTask);
+
+  bool SyncRunIfPreferred(IDecodingTask* aTask, const nsCString& aURI);
+
+  void SyncRunIfPossible(IDecodingTask* aTask, const nsCString& aURI);
+
+  already_AddRefed<nsISerialEventTarget> GetIOEventTarget();
+
+ private:
+  friend class DecodePoolWorker;
+
+  DecodePool();
+  virtual ~DecodePool();
+
+  static StaticRefPtr<DecodePool> sSingleton;
+  static uint32_t sNumCores;
+  bool mShuttingDown = false;
+
+  Mutex mMutex;
+  nsCOMPtr<nsIThread> mIOThread MOZ_GUARDED_BY(mMutex);
+};
+
+}  
+}  
+
+#endif  // mozilla_image_DecodePool_h

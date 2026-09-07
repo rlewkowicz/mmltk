@@ -1,0 +1,351 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ctypes/Library.h"
+
+#include "jsapi.h"
+#include "prerror.h"
+#include "prlink.h"
+
+#include "ctypes/CTypes.h"
+#include "js/CharacterEncoding.h"
+#include "js/ErrorReport.h"
+#include "js/experimental/CTypes.h"  // JS::CTypesCallbacks
+#include "js/MemoryFunctions.h"
+#include "js/Object.h"              // JS::GetReservedSlot
+#include "js/PropertyAndElement.h"  // JS_DefineFunctions
+#include "js/PropertySpec.h"
+#include "js/StableStringChars.h"
+#include "js/ValueArray.h"
+#include "vm/JSObject.h"
+
+
+using JS::AutoStableStringChars;
+
+namespace js::ctypes {
+
+
+namespace Library {
+static void Finalize(JS::GCContext* gcx, JSObject* obj);
+
+static bool Close(JSContext* cx, unsigned argc, Value* vp);
+static bool Declare(JSContext* cx, unsigned argc, Value* vp);
+}  
+
+
+static const JSClassOps sLibraryClassOps = {
+    .finalize = Library::Finalize,
+};
+
+static const JSClass sLibraryClass = {
+    "Library",
+    JSCLASS_HAS_RESERVED_SLOTS(LIBRARY_SLOTS) | JSCLASS_FOREGROUND_FINALIZE,
+    &sLibraryClassOps,
+};
+
+#define CTYPESFN_FLAGS (JSPROP_ENUMERATE | JSPROP_READONLY | JSPROP_PERMANENT)
+
+static const JSFunctionSpec sLibraryFunctions[] = {
+    JS_FN("close", Library::Close, 0, CTYPESFN_FLAGS),
+    JS_FN("declare", Library::Declare, 0, CTYPESFN_FLAGS),
+    JS_FS_END,
+};
+
+bool Library::Name(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  if (args.length() != 1) {
+    JS_ReportErrorASCII(cx, "libraryName takes one argument");
+    return false;
+  }
+
+  Value arg = args[0];
+  JSString* str = nullptr;
+  if (arg.isString()) {
+    str = arg.toString();
+  } else {
+    JS_ReportErrorASCII(cx, "name argument must be a string");
+    return false;
+  }
+
+  AutoString resultString;
+  AppendString(cx, resultString, MOZ_DLL_PREFIX);
+  AppendString(cx, resultString, str);
+  AppendString(cx, resultString, MOZ_DLL_SUFFIX);
+  if (!resultString) {
+    return false;
+  }
+  auto resultStr = resultString.finish();
+
+  JSString* result =
+      JS_NewUCStringCopyN(cx, resultStr.begin(), resultStr.length());
+  if (!result) {
+    return false;
+  }
+
+  args.rval().setString(result);
+  return true;
+}
+
+JSObject* Library::Create(JSContext* cx, HandleValue path,
+                          const JS::CTypesCallbacks* callbacks) {
+  RootedObject libraryObj(cx, JS_NewObject(cx, &sLibraryClass));
+  if (!libraryObj) {
+    return nullptr;
+  }
+
+  JS_SetReservedSlot(libraryObj, SLOT_LIBRARY, PrivateValue(nullptr));
+
+  if (!JS_DefineFunctions(cx, libraryObj, sLibraryFunctions)) {
+    return nullptr;
+  }
+
+  if (!path.isString()) {
+    JS_ReportErrorASCII(cx, "open takes a string argument");
+    return nullptr;
+  }
+
+  PRLibSpec libSpec;
+  Rooted<JSLinearString*> pathStr(cx,
+                                  JS_EnsureLinearString(cx, path.toString()));
+  if (!pathStr) {
+    return nullptr;
+  }
+  JS::UniqueChars pathBytes;
+  if (callbacks && callbacks->unicodeToNative) {
+    AutoStableStringChars pathStrChars(cx);
+    if (!pathStrChars.initTwoByte(cx, pathStr)) {
+      return nullptr;
+    }
+
+    pathBytes.reset(callbacks->unicodeToNative(cx, pathStrChars.twoByteChars(),
+                                               pathStr->length()));
+    if (!pathBytes) {
+      return nullptr;
+    }
+  } else {
+    if (!ReportErrorIfUnpairedSurrogatePresent(cx, pathStr)) {
+      return nullptr;
+    }
+
+    size_t nbytes = JS::GetDeflatedUTF8StringLength(pathStr);
+
+    pathBytes.reset(static_cast<char*>(JS_malloc(cx, nbytes + 1)));
+    if (!pathBytes) {
+      return nullptr;
+    }
+
+    nbytes = JS::DeflateStringToUTF8Buffer(
+        pathStr, mozilla::Span(pathBytes.get(), nbytes));
+    pathBytes[nbytes] = 0;
+  }
+
+  libSpec.value.pathname = pathBytes.get();
+  libSpec.type = PR_LibSpec_Pathname;
+
+  PRLibrary* library = PR_LoadLibraryWithFlags(libSpec, PR_LD_NOW);
+
+  if (!library) {
+    constexpr size_t MaxErrorLength = 1024;
+    char error[MaxErrorLength] = "Cannot get error from NSPR.";
+    uint32_t errorLen = PR_GetErrorTextLength();
+    if (errorLen && errorLen < MaxErrorLength) {
+      PR_GetErrorText(error);
+    }
+
+    if (JS::UniqueChars errorUtf8 = JS::EncodeNarrowToUtf8(cx, error)) {
+      if (JS::UniqueChars pathChars = JS_EncodeStringToUTF8(cx, pathStr)) {
+        JS_ReportErrorUTF8(cx, "couldn't open library %s: %s", pathChars.get(),
+                           errorUtf8.get());
+      }
+    }
+    return nullptr;
+  }
+
+  JS_SetReservedSlot(libraryObj, SLOT_LIBRARY, PrivateValue(library));
+
+  return libraryObj;
+}
+
+bool Library::IsLibrary(const JSObject* obj) {
+  return obj->hasClass(&sLibraryClass);
+}
+
+PRLibrary* Library::GetLibrary(JSObject* obj) {
+  MOZ_ASSERT(IsLibrary(obj));
+
+  Value slot = JS::GetReservedSlot(obj, SLOT_LIBRARY);
+  return static_cast<PRLibrary*>(slot.toPrivate());
+}
+
+static void UnloadLibrary(JSObject* obj) {
+  PRLibrary* library = Library::GetLibrary(obj);
+  if (library) {
+    PR_UnloadLibrary(library);
+  }
+}
+
+void Library::Finalize(JS::GCContext* gcx, JSObject* obj) {
+  UnloadLibrary(obj);
+}
+
+bool Library::Open(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  JSObject* ctypesObj = GetThisObject(cx, args, "ctypes.open");
+  if (!ctypesObj) {
+    return false;
+  }
+
+  if (!IsCTypesGlobal(ctypesObj)) {
+    JS_ReportErrorASCII(cx, "not a ctypes object");
+    return false;
+  }
+
+  if (args.length() != 1 || args[0].isUndefined()) {
+    JS_ReportErrorASCII(cx, "open requires a single argument");
+    return false;
+  }
+
+  JSObject* library = Create(cx, args[0], GetCallbacks(ctypesObj));
+  if (!library) {
+    return false;
+  }
+
+  args.rval().setObject(*library);
+  return true;
+}
+
+bool Library::Close(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  RootedObject obj(cx, GetThisObject(cx, args, "ctypes.close"));
+  if (!obj) {
+    return false;
+  }
+
+  if (!IsLibrary(obj)) {
+    JS_ReportErrorASCII(cx, "not a library");
+    return false;
+  }
+
+  if (args.length() != 0) {
+    JS_ReportErrorASCII(cx, "close doesn't take any arguments");
+    return false;
+  }
+
+  UnloadLibrary(obj);
+  JS_SetReservedSlot(obj, SLOT_LIBRARY, PrivateValue(nullptr));
+
+  args.rval().setUndefined();
+  return true;
+}
+
+bool Library::Declare(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  RootedObject obj(cx, GetThisObject(cx, args, "ctypes.declare"));
+  if (!obj) {
+    return false;
+  }
+
+  if (!IsLibrary(obj)) {
+    JS_ReportErrorASCII(cx, "not a library");
+    return false;
+  }
+
+  PRLibrary* library = GetLibrary(obj);
+  if (!library) {
+    JS_ReportErrorASCII(cx, "library not open");
+    return false;
+  }
+
+  if (args.length() < 2) {
+    JS_ReportErrorASCII(cx, "declare requires at least two arguments");
+    return false;
+  }
+
+  if (!args[0].isString()) {
+    JS_ReportErrorASCII(cx, "first argument must be a string");
+    return false;
+  }
+
+  RootedObject fnObj(cx, nullptr);
+  RootedObject typeObj(cx);
+  bool isFunction = args.length() > 2;
+  if (isFunction) {
+    fnObj = FunctionType::CreateInternal(
+        cx, args[1], args[2],
+        HandleValueArray::subarray(args, 3, args.length() - 3));
+    if (!fnObj) {
+      return false;
+    }
+
+    typeObj = PointerType::CreateInternal(cx, fnObj);
+    if (!typeObj) {
+      return false;
+    }
+  } else {
+    if (args[1].isPrimitive() || !CType::IsCType(args[1].toObjectOrNull()) ||
+        !CType::IsSizeDefined(args[1].toObjectOrNull())) {
+      JS_ReportErrorASCII(cx, "second argument must be a type of defined size");
+      return false;
+    }
+
+    typeObj = args[1].toObjectOrNull();
+    if (CType::GetTypeCode(typeObj) == TYPE_pointer) {
+      fnObj = PointerType::GetBaseType(typeObj);
+      isFunction = fnObj && CType::GetTypeCode(fnObj) == TYPE_function;
+    }
+  }
+
+  void* data;
+  PRFuncPtr fnptr;
+  RootedString nameStr(cx, args[0].toString());
+  AutoCString symbol;
+  if (isFunction) {
+    FunctionType::BuildSymbolName(cx, nameStr, fnObj, symbol);
+    AppendString(cx, symbol, "\0");
+    if (!symbol) {
+      return false;
+    }
+
+    fnptr = PR_FindFunctionSymbol(library, symbol.finish().begin());
+    if (!fnptr) {
+      JS_ReportErrorASCII(cx, "couldn't find function symbol in library");
+      return false;
+    }
+    data = &fnptr;
+
+  } else {
+    AppendString(cx, symbol, nameStr);
+    AppendString(cx, symbol, "\0");
+    if (!symbol) {
+      return false;
+    }
+
+    data = PR_FindSymbol(library, symbol.finish().begin());
+    if (!data) {
+      JS_ReportErrorASCII(cx, "couldn't find symbol in library");
+      return false;
+    }
+  }
+
+  RootedObject result(cx, CData::Create(cx, typeObj, obj, data, isFunction));
+  if (!result) {
+    return false;
+  }
+
+  if (isFunction) {
+    JS_SetReservedSlot(result, SLOT_FUNNAME, StringValue(nameStr));
+  }
+
+  args.rval().setObject(*result);
+
+  if (isFunction && !JS_FreezeObject(cx, result)) {
+    return false;
+  }
+
+  return true;
+}
+
+}  

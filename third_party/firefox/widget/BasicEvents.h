@@ -1,0 +1,953 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_BasicEvents_h_
+#define mozilla_BasicEvents_h_
+
+#include <stdint.h>
+
+#include "mozilla/EventForwards.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/dom/EventTarget.h"
+#include "mozilla/layers/LayersTypes.h"
+#include "nsCOMPtr.h"
+#include "nsAtom.h"
+#include "nsISupportsImpl.h"
+#include "nsIWidget.h"
+#include "nsString.h"
+#include "Units.h"
+
+#ifdef DEBUG
+#  include "nsXULAppAPI.h"
+#endif  // #ifdef DEBUG
+
+class nsIPrincipal;
+
+namespace IPC {
+template <typename T>
+struct ParamTraits;
+}  
+
+namespace mozilla {
+
+class EventTargetChainItem;
+
+enum class CrossProcessForwarding {
+  eStop,
+  eAllow,
+};
+
+
+struct BaseEventFlags {
+ public:
+  bool mIsTrusted : 1;
+  bool mInBubblingPhase : 1;
+  bool mInCapturePhase : 1;
+  bool mInTargetPhase : 1;
+  bool mInSystemGroup : 1;
+  bool mCancelable : 1;
+  bool mBubbles : 1;
+  bool mPropagationStopped : 1;
+  bool mImmediatePropagationStopped : 1;
+  bool mDefaultPrevented : 1;
+  bool mDefaultPreventedByContent : 1;
+  bool mDefaultPreventedByChrome : 1;
+  bool mMultipleActionsPrevented : 1;
+  bool mIsBeingDispatched : 1;
+  bool mDispatchedAtLeastOnce : 1;
+  bool mIsSynthesizedForTests : 1;
+  bool mIsAsyncSynthesizedForTests : 1;
+  bool mExceptionWasRaised : 1;
+  bool mRetargetToNonNativeAnonymous : 1;
+  bool mNoContentDispatch : 1;
+  bool mOnlyChromeDispatch : 1;
+  bool mIsReservedByChrome : 1;
+  bool mOnlySystemGroupDispatchInContent : 1;
+  bool mOnlySystemGroupDispatch : 1;
+  bool mHandledByAPZ : 1;
+  bool mInPassiveListener : 1;
+  bool mComposed : 1;
+  bool mComposedInNativeAnonymousContent : 1;
+  bool mIsSuppressedOrDelayed : 1;
+  bool mIsPositionless : 1;
+
+
+  bool mNoRemoteProcessDispatch : 1;
+  bool mWantReplyFromContentProcess : 1;
+  bool mPostedToRemoteProcess : 1;
+  bool mCameFromAnotherProcess : 1;
+
+  inline void StopPropagation() { mPropagationStopped = true; }
+  inline void StopImmediatePropagation() {
+    StopPropagation();
+    mImmediatePropagationStopped = true;
+  }
+  inline void PreventDefault(bool aCalledByDefaultHandler = true) {
+    if (!mCancelable) {
+      return;
+    }
+    mDefaultPrevented = true;
+    if (aCalledByDefaultHandler) {
+      StopCrossProcessForwarding();
+      mDefaultPreventedByChrome = true;
+    } else {
+      mDefaultPreventedByContent = true;
+    }
+  }
+  inline void PreventDefaultBeforeDispatch(
+      CrossProcessForwarding aCrossProcessForwarding) {
+    if (!mCancelable) {
+      return;
+    }
+    mDefaultPrevented = true;
+    if (aCrossProcessForwarding == CrossProcessForwarding::eStop) {
+      StopCrossProcessForwarding();
+    }
+  }
+  inline bool DefaultPrevented() const { return mDefaultPrevented; }
+  inline bool DefaultPreventedByContent() const {
+    MOZ_ASSERT(!mDefaultPreventedByContent || DefaultPrevented());
+    return mDefaultPreventedByContent;
+  }
+  inline bool IsTrusted() const { return mIsTrusted; }
+  inline bool PropagationStopped() const { return mPropagationStopped; }
+
+
+  inline void StopCrossProcessForwarding() {
+    MOZ_ASSERT(!mPostedToRemoteProcess);
+    mNoRemoteProcessDispatch = true;
+    mWantReplyFromContentProcess = false;
+  }
+  inline bool IsCrossProcessForwardingStopped() const {
+    return mNoRemoteProcessDispatch;
+  }
+  inline void MarkAsWaitingReplyFromRemoteProcess() {
+    MOZ_ASSERT(!mPostedToRemoteProcess);
+    mNoRemoteProcessDispatch = false;
+    mWantReplyFromContentProcess = true;
+  }
+  inline void ResetWaitingReplyFromRemoteProcessState() {
+    if (IsWaitingReplyFromRemoteProcess()) {
+      mWantReplyFromContentProcess = false;
+    }
+  }
+  inline bool IsWaitingReplyFromRemoteProcess() const {
+    return !mNoRemoteProcessDispatch && mWantReplyFromContentProcess;
+  }
+  inline void MarkAsHandledInRemoteProcess() {
+    mNoRemoteProcessDispatch = true;
+    mWantReplyFromContentProcess = true;
+    mPostedToRemoteProcess = false;
+  }
+  inline bool IsHandledInRemoteProcess() const {
+    return mNoRemoteProcessDispatch && mWantReplyFromContentProcess;
+  }
+  inline bool WantReplyFromContentProcess() const {
+    MOZ_ASSERT(!XRE_IsParentProcess());
+    return IsWaitingReplyFromRemoteProcess();
+  }
+  inline void MarkAsPostedToRemoteProcess() {
+    MOZ_ASSERT(!IsCrossProcessForwardingStopped());
+    mPostedToRemoteProcess = true;
+  }
+  inline void ResetCrossProcessDispatchingState() {
+    MOZ_ASSERT(!IsCrossProcessForwardingStopped());
+    mPostedToRemoteProcess = false;
+    if (!XRE_IsParentProcess() && IsWaitingReplyFromRemoteProcess()) {
+      mPropagationStopped = mImmediatePropagationStopped = false;
+    }
+    mDispatchedAtLeastOnce = false;
+  }
+  inline bool HasBeenPostedToRemoteProcess() const {
+    return mPostedToRemoteProcess;
+  }
+  inline bool CameFromAnotherProcess() const { return mCameFromAnotherProcess; }
+  inline void MarkAsComingFromAnotherProcess() {
+    mCameFromAnotherProcess = true;
+  }
+  inline void MarkAsReservedByChrome() {
+    MOZ_ASSERT(!mPostedToRemoteProcess);
+    mIsReservedByChrome = true;
+    StopCrossProcessForwarding();
+    mOnlySystemGroupDispatchInContent = true;
+  }
+  inline bool IsReservedByChrome() const {
+    MOZ_ASSERT(!mIsReservedByChrome || (IsCrossProcessForwardingStopped() &&
+                                        mOnlySystemGroupDispatchInContent));
+    return mIsReservedByChrome;
+  }
+
+  inline void Clear() { SetRawFlags(0); }
+  inline void Union(const BaseEventFlags& aOther) {
+    RawFlags rawFlags = GetRawFlags() | aOther.GetRawFlags();
+    SetRawFlags(rawFlags);
+  }
+
+ private:
+  typedef uint64_t RawFlags;
+
+  inline void SetRawFlags(RawFlags aRawFlags) {
+    static_assert(sizeof(BaseEventFlags) <= sizeof(RawFlags),
+                  "mozilla::EventFlags must not be bigger than the RawFlags");
+    memcpy(this, &aRawFlags, sizeof(BaseEventFlags));
+  }
+  inline RawFlags GetRawFlags() const {
+    RawFlags result = 0;
+    memcpy(&result, this, sizeof(BaseEventFlags));
+    return result;
+  }
+};
+
+
+struct EventFlags : public BaseEventFlags {
+  EventFlags() { Clear(); }
+};
+
+
+class WidgetEventTime {
+ public:
+  TimeStamp mTimeStamp;
+
+  WidgetEventTime() : mTimeStamp(TimeStamp::Now()) {}
+
+  explicit WidgetEventTime(const WidgetEventTime* aTime)
+      : mTimeStamp(aTime ? aTime->mTimeStamp : TimeStamp::Now()) {
+    MOZ_ASSERT(aTime != this);
+    MOZ_ASSERT_IF(aTime, !aTime->mTimeStamp.IsNull());
+  }
+
+  explicit WidgetEventTime(TimeStamp aTimeStamp) : mTimeStamp(aTimeStamp) {}
+
+  void AssignEventTime(const WidgetEventTime& aOther) {
+    mTimeStamp = aOther.mTimeStamp;
+  }
+};
+
+
+#ifdef DEBUG
+#  define NS_ASSERT_EVENT_CLASS_ID(aEventClassID, aBaseEventClassID)          \
+    if (mClass != eEventClassUninitialized) [[likely]] {                      \
+      MOZ_ASSERT(                                                             \
+          mClass == (aEventClassID),                                          \
+          "It's now allowed to initialize event class instance with copying " \
+          "or moving from a subclass instance without adjusting mClass");     \
+      mClass = aBaseEventClassID;                                             \
+    }
+#  define NS_DEFINE_VIRTUAL_DESTRUCTOR_CHECKING_CLASS_VALUE(     \
+      aClassType, aEventClassID, aBaseEventClassID)              \
+    virtual ~aClassType() {                                      \
+      NS_ASSERT_EVENT_CLASS_ID(aEventClassID, aBaseEventClassID) \
+    }
+#else
+#  define NS_ASSERT_EVENT_CLASS_ID(aEventClassID, aBaseEventClassID)
+#  define NS_DEFINE_VIRTUAL_DESTRUCTOR_CHECKING_CLASS_VALUE( \
+      aClassType, aEventClassID, aBaseEventClassID)
+#endif
+
+#define NS_DEFINE_AS_EVENT_OVERRIDE(aPrefix, aName)  \
+  aPrefix##aName* As##aName() final { return this; } \
+  using WidgetEvent::As##aName;  // expose the const version
+
+class WidgetEvent : public WidgetEventTime {
+ private:
+  void SetDefaultCancelableAndBubbles() {
+    switch (mClass) {
+      case eEditorInputEventClass:
+        mFlags.mCancelable = false;
+        mFlags.mBubbles = mFlags.mIsTrusted;
+        break;
+      case eLegacyTextEventClass:
+        mFlags.mCancelable = mFlags.mIsTrusted && mMessage == eLegacyTextInput;
+        mFlags.mBubbles = mFlags.mIsTrusted && mMessage == eLegacyTextInput;
+        break;
+      case eMouseEventClass:
+        mFlags.mCancelable =
+            (mMessage != eMouseEnter && mMessage != eMouseLeave);
+        mFlags.mBubbles = (mMessage != eMouseEnter && mMessage != eMouseLeave);
+        break;
+      case ePointerEventClass:
+        mFlags.mCancelable =
+            (mMessage != ePointerRawUpdate && mMessage != ePointerEnter &&
+             mMessage != ePointerLeave && mMessage != ePointerCancel &&
+             mMessage != ePointerGotCapture && mMessage != ePointerLostCapture);
+        mFlags.mBubbles =
+            (mMessage != ePointerEnter && mMessage != ePointerLeave);
+        break;
+      case eDragEventClass:
+        mFlags.mCancelable = (mMessage != eDragExit && mMessage != eDragLeave &&
+                              mMessage != eDragEnd);
+        mFlags.mBubbles = true;
+        break;
+      case eSMILTimeEventClass:
+        mFlags.mCancelable = false;
+        mFlags.mBubbles = false;
+        break;
+      case eTransitionEventClass:
+      case eAnimationEventClass:
+        mFlags.mCancelable = false;
+        mFlags.mBubbles = true;
+        break;
+      case eCompositionEventClass:
+        mFlags.mCancelable = false;
+        mFlags.mBubbles = true;
+        break;
+      default:
+        if (mMessage == eResize || mMessage == eMozVisualResize ||
+            mMessage == eMozVisualScroll || mMessage == eEditorInput ||
+            mMessage == eFormSelect) {
+          mFlags.mCancelable = false;
+        } else {
+          mFlags.mCancelable = true;
+        }
+        mFlags.mBubbles = true;
+        break;
+    }
+  }
+
+ protected:
+  WidgetEvent(bool aIsTrusted, EventMessage aMessage,
+              EventClassID aEventClassID,
+              const WidgetEventTime* aTime = nullptr)
+      : WidgetEventTime(aTime),
+        mClass(aEventClassID),
+        mMessage(aMessage),
+        mRefPoint(0, 0),
+        mLastRefPoint(0, 0),
+        mFocusSequenceNumber(0),
+        mSpecifiedEventType(nullptr),
+        mPath(nullptr),
+        mLayersId(layers::LayersId{0}) {
+    MOZ_COUNT_CTOR(WidgetEvent);
+    mFlags.Clear();
+    mFlags.mIsTrusted = aIsTrusted;
+    SetDefaultCancelableAndBubbles();
+    SetDefaultComposed();
+    SetDefaultComposedInNativeAnonymousContent();
+  }
+
+  WidgetEvent() : mPath(nullptr) { MOZ_COUNT_CTOR(WidgetEvent); }
+
+ public:
+  WidgetEvent(bool aIsTrusted, EventMessage aMessage,
+              const WidgetEventTime* aTime = nullptr)
+      : WidgetEvent(aIsTrusted, aMessage, eBasicEventClass, aTime) {}
+
+  virtual ~WidgetEvent() {
+    MOZ_COUNT_DTOR(WidgetEvent);
+    NS_ASSERT_EVENT_CLASS_ID(eBasicEventClass, eEventClassUninitialized);
+  }
+
+  WidgetEvent(const WidgetEvent& aOther) : WidgetEventTime(aOther) {
+    MOZ_COUNT_CTOR(WidgetEvent);
+    *this = aOther;
+  }
+  WidgetEvent& operator=(const WidgetEvent& aOther) = default;
+
+  WidgetEvent(WidgetEvent&& aOther)
+      : WidgetEventTime(std::move(aOther)),
+        mClass(aOther.mClass),
+        mMessage(aOther.mMessage),
+        mRefPoint(std::move(aOther.mRefPoint)),
+        mLastRefPoint(std::move(aOther.mLastRefPoint)),
+        mFocusSequenceNumber(aOther.mFocusSequenceNumber),
+        mFlags(std::move(aOther.mFlags)),
+        mSpecifiedEventType(std::move(aOther.mSpecifiedEventType)),
+        mSpecifiedEventTypeString(std::move(aOther.mSpecifiedEventTypeString)),
+        mTarget(std::move(aOther.mTarget)),
+        mCurrentTarget(std::move(aOther.mCurrentTarget)),
+        mOriginalTarget(std::move(aOther.mOriginalTarget)),
+        mRelatedTarget(std::move(aOther.mRelatedTarget)),
+        mOriginalRelatedTarget(std::move(aOther.mOriginalRelatedTarget)),
+        mPath(std::move(aOther.mPath)) {
+    MOZ_COUNT_CTOR(WidgetEvent);
+  }
+  WidgetEvent& operator=(WidgetEvent&& aOther) = default;
+
+  virtual WidgetEvent* Duplicate() const {
+    MOZ_ASSERT(mClass == eBasicEventClass,
+               "Duplicate() must be overridden by sub class");
+    WidgetEvent* result = new WidgetEvent(false, mMessage, this);
+    result->AssignEventData(*this, true);
+    result->mFlags = mFlags;
+    return result;
+  }
+
+  EventClassID mClass = eEventClassUninitialized;
+  EventMessage mMessage;
+  LayoutDeviceIntPoint mRefPoint;
+  LayoutDeviceIntPoint mLastRefPoint;
+  uint64_t mFocusSequenceNumber;
+  BaseEventFlags mFlags;
+
+  RefPtr<nsAtom> mSpecifiedEventType;
+
+  nsString mSpecifiedEventTypeString;
+
+  nsCOMPtr<dom::EventTarget> mTarget;
+  nsCOMPtr<dom::EventTarget> mCurrentTarget;
+  nsCOMPtr<dom::EventTarget> mOriginalTarget;
+
+  nsCOMPtr<dom::EventTarget> mRelatedTarget;
+  nsCOMPtr<dom::EventTarget> mOriginalRelatedTarget;
+
+  nsTArray<EventTargetChainItem>* mPath;
+
+  layers::LayersId mLayersId;
+
+  dom::EventTarget* GetDOMEventTarget() const;
+  dom::EventTarget* GetCurrentDOMEventTarget() const;
+  dom::EventTarget* GetOriginalDOMEventTarget() const;
+
+  void AssignEventData(const WidgetEvent& aEvent, bool aCopyTargets) {
+    mRefPoint = aEvent.mRefPoint;
+    mFocusSequenceNumber = aEvent.mFocusSequenceNumber;
+    AssignEventTime(aEvent);
+    mSpecifiedEventType = aEvent.mSpecifiedEventType;
+    mTarget = aCopyTargets ? aEvent.mTarget : nullptr;
+    mCurrentTarget = aCopyTargets ? aEvent.mCurrentTarget : nullptr;
+    mOriginalTarget = aCopyTargets ? aEvent.mOriginalTarget : nullptr;
+    mRelatedTarget = aCopyTargets ? aEvent.mRelatedTarget : nullptr;
+    mOriginalRelatedTarget =
+        aCopyTargets ? aEvent.mOriginalRelatedTarget : nullptr;
+  }
+
+  void StopPropagation() { mFlags.StopPropagation(); }
+  void StopImmediatePropagation() { mFlags.StopImmediatePropagation(); }
+  void PreventDefault(bool aCalledByDefaultHandler = true,
+                      nsIPrincipal* aPrincipal = nullptr);
+
+  void PreventDefaultBeforeDispatch(
+      CrossProcessForwarding aCrossProcessForwarding) {
+    mFlags.PreventDefaultBeforeDispatch(aCrossProcessForwarding);
+  }
+  bool DefaultPrevented() const { return mFlags.DefaultPrevented(); }
+  bool DefaultPreventedByContent() const {
+    return mFlags.DefaultPreventedByContent();
+  }
+  bool IsTrusted() const { return mFlags.IsTrusted(); }
+  bool PropagationStopped() const { return mFlags.PropagationStopped(); }
+
+  inline void StopCrossProcessForwarding() {
+    mFlags.StopCrossProcessForwarding();
+  }
+  inline bool IsCrossProcessForwardingStopped() const {
+    return mFlags.IsCrossProcessForwardingStopped();
+  }
+  inline void MarkAsWaitingReplyFromRemoteProcess() {
+    mFlags.MarkAsWaitingReplyFromRemoteProcess();
+  }
+  inline void ResetWaitingReplyFromRemoteProcessState() {
+    mFlags.ResetWaitingReplyFromRemoteProcessState();
+  }
+  inline bool IsWaitingReplyFromRemoteProcess() const {
+    return mFlags.IsWaitingReplyFromRemoteProcess();
+  }
+  inline void MarkAsHandledInRemoteProcess() {
+    mFlags.MarkAsHandledInRemoteProcess();
+  }
+  inline bool IsHandledInRemoteProcess() const {
+    return mFlags.IsHandledInRemoteProcess();
+  }
+  inline bool WantReplyFromContentProcess() const {
+    return mFlags.WantReplyFromContentProcess();
+  }
+  inline void MarkAsPostedToRemoteProcess() {
+    mFlags.MarkAsPostedToRemoteProcess();
+  }
+  inline void ResetCrossProcessDispatchingState() {
+    mFlags.ResetCrossProcessDispatchingState();
+  }
+  inline bool HasBeenPostedToRemoteProcess() const {
+    return mFlags.HasBeenPostedToRemoteProcess();
+  }
+  inline bool CameFromAnotherProcess() const {
+    return mFlags.CameFromAnotherProcess();
+  }
+  inline void MarkAsComingFromAnotherProcess() {
+    mFlags.MarkAsComingFromAnotherProcess();
+  }
+  inline void MarkAsReservedByChrome() { mFlags.MarkAsReservedByChrome(); }
+  inline bool IsReservedByChrome() const { return mFlags.IsReservedByChrome(); }
+
+  [[nodiscard]] inline bool DOMEventSupportsCoords() const {
+    switch (mClass) {
+      case eMouseEventClass:
+      case eMouseScrollEventClass:
+      case eWheelEventClass:
+      case eTouchEventClass:
+      case eDragEventClass:
+      case ePointerEventClass:
+      case eSimpleGestureEventClass:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+
+#define NS_ROOT_EVENT_CLASS(aPrefix, aName)
+#define NS_EVENT_CLASS(aPrefix, aName) \
+  virtual aPrefix##aName* As##aName(); \
+  const aPrefix##aName* As##aName() const;
+
+#include "mozilla/EventClassList.inc"
+
+#undef NS_EVENT_CLASS
+#undef NS_ROOT_EVENT_CLASS
+
+  bool IsQueryContentEvent() const;
+  bool IsSelectionEvent() const;
+  bool IsContentCommandEvent() const;
+
+  bool HasMouseEventMessage() const;
+
+  [[nodiscard]] bool IsMouseEventClassOrHasClickRelatedPointerEvent() const;
+
+  bool HasDragEventMessage() const;
+  static bool IsKeyEventMessage(EventMessage aMessage);
+  bool HasKeyEventMessage() const { return IsKeyEventMessage(mMessage); }
+  bool HasIMEEventMessage() const;
+
+  bool CanBeSentToRemoteProcess() const;
+  bool WillBeSentToRemoteProcess() const;
+  bool IsIMERelatedEvent() const;
+
+  bool IsUsingCoordinates() const;
+  bool IsTargetedAtFocusedWindow() const;
+  bool IsTargetedAtFocusedContent() const;
+  bool IsAllowedToDispatchDOMEvent() const;
+  bool IsAllowedToDispatchInSystemGroup() const;
+  bool IsBlockedForFingerprintingResistance() const;
+  bool AllowFlushingPendingNotifications() const;
+  void SetDefaultComposed() {
+    switch (mClass) {
+      case eClipboardEventClass:
+        mFlags.mComposed = true;
+        break;
+      case eCompositionEventClass:
+        mFlags.mComposed =
+            mMessage == eCompositionStart || mMessage == eCompositionUpdate ||
+            mMessage == eCompositionChange || mMessage == eCompositionEnd;
+        break;
+      case eDragEventClass:
+        mFlags.mComposed = mMessage == eDrag || mMessage == eDragEnd ||
+                           mMessage == eDragEnter || mMessage == eDragExit ||
+                           mMessage == eDragLeave || mMessage == eDragOver ||
+                           mMessage == eDragStart || mMessage == eDrop;
+        break;
+      case eEditorInputEventClass:
+        mFlags.mComposed =
+            mMessage == eEditorInput || mMessage == eEditorBeforeInput;
+        break;
+      case eFocusEventClass:
+        mFlags.mComposed = mMessage == eBlur || mMessage == eFocus ||
+                           mMessage == eFocusOut || mMessage == eFocusIn;
+        break;
+      case eKeyboardEventClass:
+        mFlags.mComposed =
+            mMessage == eKeyDown || mMessage == eKeyUp || mMessage == eKeyPress;
+        break;
+      case eMouseEventClass:
+        mFlags.mComposed =
+            mMessage == eMouseDoubleClick || mMessage == eMouseDown ||
+            mMessage == eMouseUp || mMessage == eMouseOver ||
+            mMessage == eMouseOut || mMessage == eMouseMove ||
+            mMessage == eXULPopupShowing || mMessage == eXULPopupHiding ||
+            mMessage == eXULPopupShown || mMessage == eXULPopupHidden ||
+            mMessage == ePointerClick || mMessage == ePointerAuxClick ||
+            mMessage == eContextMenu;
+        break;
+      case ePointerEventClass:
+        mFlags.mComposed =
+            mMessage == ePointerRawUpdate || mMessage == ePointerMove ||
+            mMessage == ePointerClick || mMessage == ePointerAuxClick ||
+            mMessage == eContextMenu || mMessage == ePointerDown ||
+            mMessage == ePointerUp || mMessage == ePointerCancel ||
+            mMessage == ePointerOver || mMessage == ePointerOut ||
+            mMessage == ePointerGotCapture || mMessage == ePointerLostCapture;
+        break;
+      case eTouchEventClass:
+        mFlags.mComposed = mMessage == eTouchStart || mMessage == eTouchEnd ||
+                           mMessage == eTouchMove || mMessage == eTouchCancel;
+        break;
+      case eUIEventClass:
+        mFlags.mComposed = mMessage == eLegacyDOMFocusIn ||
+                           mMessage == eLegacyDOMFocusOut ||
+                           mMessage == eLegacyDOMActivate;
+        break;
+      case eWheelEventClass:
+        mFlags.mComposed = mMessage == eWheel;
+        break;
+      case eMouseScrollEventClass:
+        mFlags.mComposed = mMessage == eLegacyMouseLineOrPageScroll ||
+                           mMessage == eLegacyMousePixelScroll;
+        break;
+      default:
+        mFlags.mComposed = false;
+        break;
+    }
+  }
+
+  void SetComposed(const nsAString& aEventTypeArg) {
+    mFlags.mComposed =  
+        aEventTypeArg.EqualsLiteral("compositionstart") ||
+        aEventTypeArg.EqualsLiteral("compositionupdate") ||
+        aEventTypeArg.EqualsLiteral("compositionend") ||
+        aEventTypeArg.EqualsLiteral("text") ||
+        aEventTypeArg.EqualsLiteral("dragstart") ||
+        aEventTypeArg.EqualsLiteral("drag") ||
+        aEventTypeArg.EqualsLiteral("dragenter") ||
+        aEventTypeArg.EqualsLiteral("dragexit") ||
+        aEventTypeArg.EqualsLiteral("dragleave") ||
+        aEventTypeArg.EqualsLiteral("dragover") ||
+        aEventTypeArg.EqualsLiteral("drop") ||
+        aEventTypeArg.EqualsLiteral("dropend") ||
+        aEventTypeArg.EqualsLiteral("input") ||
+        aEventTypeArg.EqualsLiteral("beforeinput") ||
+        aEventTypeArg.EqualsLiteral("blur") ||
+        aEventTypeArg.EqualsLiteral("focus") ||
+        aEventTypeArg.EqualsLiteral("focusin") ||
+        aEventTypeArg.EqualsLiteral("focusout") ||
+        aEventTypeArg.EqualsLiteral("keydown") ||
+        aEventTypeArg.EqualsLiteral("keyup") ||
+        aEventTypeArg.EqualsLiteral("keypress") ||
+        aEventTypeArg.EqualsLiteral("click") ||
+        aEventTypeArg.EqualsLiteral("dblclick") ||
+        aEventTypeArg.EqualsLiteral("mousedown") ||
+        aEventTypeArg.EqualsLiteral("mouseup") ||
+        aEventTypeArg.EqualsLiteral("mouseenter") ||
+        aEventTypeArg.EqualsLiteral("mouseleave") ||
+        aEventTypeArg.EqualsLiteral("mouseover") ||
+        aEventTypeArg.EqualsLiteral("mouseout") ||
+        aEventTypeArg.EqualsLiteral("mousemove") ||
+        aEventTypeArg.EqualsLiteral("contextmenu") ||
+        aEventTypeArg.EqualsLiteral("pointerdown") ||
+        aEventTypeArg.EqualsLiteral("pointermove") ||
+        aEventTypeArg.EqualsLiteral("pointerup") ||
+        aEventTypeArg.EqualsLiteral("pointercancel") ||
+        aEventTypeArg.EqualsLiteral("pointerover") ||
+        aEventTypeArg.EqualsLiteral("pointerout") ||
+        aEventTypeArg.EqualsLiteral("pointerenter") ||
+        aEventTypeArg.EqualsLiteral("pointerleave") ||
+        aEventTypeArg.EqualsLiteral("pointerrawupdate") ||
+        aEventTypeArg.EqualsLiteral("gotpointercapture") ||
+        aEventTypeArg.EqualsLiteral("lostpointercapture") ||
+        aEventTypeArg.EqualsLiteral("touchstart") ||
+        aEventTypeArg.EqualsLiteral("touchend") ||
+        aEventTypeArg.EqualsLiteral("touchmove") ||
+        aEventTypeArg.EqualsLiteral("touchcancel") ||
+        aEventTypeArg.EqualsLiteral("DOMFocusIn") ||
+        aEventTypeArg.EqualsLiteral("DOMFocusOut") ||
+        aEventTypeArg.EqualsLiteral("DOMActivate") ||
+        aEventTypeArg.EqualsLiteral("wheel");
+  }
+
+  void SetComposed(bool aComposed) { mFlags.mComposed = aComposed; }
+
+  void SetDefaultComposedInNativeAnonymousContent() {
+    mFlags.mComposedInNativeAnonymousContent =
+        mMessage != eLoad && mMessage != eLoadStart && mMessage != eLoadEnd &&
+        mMessage != eLoadError;
+  }
+
+  bool IsUserAction() const;
+
+  [[nodiscard]] bool ShouldIgnoreCapturingContent() const;
+};
+
+
+class WidgetGUIEvent : public WidgetEvent {
+ protected:
+  WidgetGUIEvent(bool aIsTrusted, EventMessage aMessage, nsIWidget* aWidget,
+                 EventClassID aEventClassID,
+                 const WidgetEventTime* aTime = nullptr)
+      : WidgetEvent(aIsTrusted, aMessage, aEventClassID, aTime),
+        mWidget(aWidget) {}
+
+  WidgetGUIEvent() = default;
+
+ public:
+  NS_DEFINE_AS_EVENT_OVERRIDE(Widget, GUIEvent);
+
+  WidgetGUIEvent(bool aIsTrusted, EventMessage aMessage, nsIWidget* aWidget,
+                 const WidgetEventTime* aTime = nullptr)
+      : WidgetEvent(aIsTrusted, aMessage, eGUIEventClass, aTime),
+        mWidget(aWidget) {}
+
+  WidgetGUIEvent(const WidgetGUIEvent&) = default;
+  WidgetGUIEvent(WidgetGUIEvent&&) = default;
+  WidgetGUIEvent& operator=(const WidgetGUIEvent&) = default;
+  WidgetGUIEvent& operator=(WidgetGUIEvent&&) = default;
+
+  NS_DEFINE_VIRTUAL_DESTRUCTOR_CHECKING_CLASS_VALUE(WidgetGUIEvent,
+                                                    eGUIEventClass,
+                                                    eBasicEventClass)
+
+  virtual WidgetEvent* Duplicate() const override {
+    MOZ_ASSERT(mClass == eGUIEventClass,
+               "Duplicate() must be overridden by sub class");
+    WidgetGUIEvent* result = new WidgetGUIEvent(false, mMessage, nullptr, this);
+    result->AssignGUIEventData(*this, true);
+    result->mFlags = mFlags;
+    return result;
+  }
+
+  nsCOMPtr<nsIWidget> mWidget;
+
+  void AssignGUIEventData(const WidgetGUIEvent& aEvent, bool aCopyTargets) {
+    AssignEventData(aEvent, aCopyTargets);
+  }
+};
+
+
+enum Modifier {
+  MODIFIER_NONE = 0x0000,
+  MODIFIER_ALT = 0x0001,
+  MODIFIER_ALTGRAPH = 0x0002,
+  MODIFIER_CAPSLOCK = 0x0004,
+  MODIFIER_CONTROL = 0x0008,
+  MODIFIER_FN = 0x0010,
+  MODIFIER_FNLOCK = 0x0020,
+  MODIFIER_META = 0x0040,
+  MODIFIER_NUMLOCK = 0x0080,
+  MODIFIER_SCROLLLOCK = 0x0100,
+  MODIFIER_SHIFT = 0x0200,
+  MODIFIER_SYMBOL = 0x0400,
+  MODIFIER_SYMBOLLOCK = 0x0800,
+};
+
+
+#define NS_DOM_KEYNAME_ALT "Alt"
+#define NS_DOM_KEYNAME_ALTGRAPH "AltGraph"
+#define NS_DOM_KEYNAME_CAPSLOCK "CapsLock"
+#define NS_DOM_KEYNAME_CONTROL "Control"
+#define NS_DOM_KEYNAME_FN "Fn"
+#define NS_DOM_KEYNAME_FNLOCK "FnLock"
+#define NS_DOM_KEYNAME_META "Meta"
+#define NS_DOM_KEYNAME_NUMLOCK "NumLock"
+#define NS_DOM_KEYNAME_SCROLLLOCK "ScrollLock"
+#define NS_DOM_KEYNAME_SHIFT "Shift"
+#define NS_DOM_KEYNAME_SYMBOL "Symbol"
+#define NS_DOM_KEYNAME_SYMBOLLOCK "SymbolLock"
+#define NS_DOM_KEYNAME_OS "OS"
+
+
+typedef uint16_t Modifiers;
+
+class MOZ_STACK_CLASS GetModifiersName final : public nsAutoCString {
+ public:
+  explicit GetModifiersName(Modifiers aModifiers) {
+    if (aModifiers & MODIFIER_ALT) {
+      AssignLiteral(NS_DOM_KEYNAME_ALT);
+    }
+    if (aModifiers & MODIFIER_ALTGRAPH) {
+      MaybeAppendSeparator();
+      AppendLiteral(NS_DOM_KEYNAME_ALTGRAPH);
+    }
+    if (aModifiers & MODIFIER_CAPSLOCK) {
+      MaybeAppendSeparator();
+      AppendLiteral(NS_DOM_KEYNAME_CAPSLOCK);
+    }
+    if (aModifiers & MODIFIER_CONTROL) {
+      MaybeAppendSeparator();
+      AppendLiteral(NS_DOM_KEYNAME_CONTROL);
+    }
+    if (aModifiers & MODIFIER_FN) {
+      MaybeAppendSeparator();
+      AppendLiteral(NS_DOM_KEYNAME_FN);
+    }
+    if (aModifiers & MODIFIER_FNLOCK) {
+      MaybeAppendSeparator();
+      AppendLiteral(NS_DOM_KEYNAME_FNLOCK);
+    }
+    if (aModifiers & MODIFIER_META) {
+      MaybeAppendSeparator();
+      AppendLiteral(NS_DOM_KEYNAME_META);
+    }
+    if (aModifiers & MODIFIER_NUMLOCK) {
+      MaybeAppendSeparator();
+      AppendLiteral(NS_DOM_KEYNAME_NUMLOCK);
+    }
+    if (aModifiers & MODIFIER_SCROLLLOCK) {
+      MaybeAppendSeparator();
+      AppendLiteral(NS_DOM_KEYNAME_SCROLLLOCK);
+    }
+    if (aModifiers & MODIFIER_SHIFT) {
+      MaybeAppendSeparator();
+      AppendLiteral(NS_DOM_KEYNAME_SHIFT);
+    }
+    if (aModifiers & MODIFIER_SYMBOL) {
+      MaybeAppendSeparator();
+      AppendLiteral(NS_DOM_KEYNAME_SYMBOL);
+    }
+    if (aModifiers & MODIFIER_SYMBOLLOCK) {
+      MaybeAppendSeparator();
+      AppendLiteral(NS_DOM_KEYNAME_SYMBOLLOCK);
+    }
+    if (IsEmpty()) {
+      AssignLiteral("none");
+    }
+  }
+
+ private:
+  void MaybeAppendSeparator() {
+    if (!IsEmpty()) {
+      AppendLiteral(" | ");
+    }
+  }
+};
+
+
+class WidgetInputEvent : public WidgetGUIEvent {
+ protected:
+  WidgetInputEvent(bool aIsTrusted, EventMessage aMessage, nsIWidget* aWidget,
+                   EventClassID aEventClassID,
+                   const WidgetEventTime* aTime = nullptr)
+      : WidgetGUIEvent(aIsTrusted, aMessage, aWidget, aEventClassID, aTime),
+        mModifiers(0) {}
+
+  WidgetInputEvent() : mModifiers(0) {}
+
+ public:
+  NS_DEFINE_AS_EVENT_OVERRIDE(Widget, InputEvent);
+
+  WidgetInputEvent(bool aIsTrusted, EventMessage aMessage, nsIWidget* aWidget,
+                   const WidgetEventTime* aTime = nullptr)
+      : WidgetGUIEvent(aIsTrusted, aMessage, aWidget, eInputEventClass, aTime),
+        mModifiers(0) {}
+
+  WidgetInputEvent(const WidgetInputEvent&) = default;
+  WidgetInputEvent(WidgetInputEvent&&) = default;
+  WidgetInputEvent& operator=(const WidgetInputEvent&) = default;
+  WidgetInputEvent& operator=(WidgetInputEvent&&) = default;
+
+  NS_DEFINE_VIRTUAL_DESTRUCTOR_CHECKING_CLASS_VALUE(WidgetInputEvent,
+                                                    eInputEventClass,
+                                                    eGUIEventClass)
+
+  virtual WidgetEvent* Duplicate() const override {
+    MOZ_ASSERT(mClass == eInputEventClass,
+               "Duplicate() must be overridden by sub class");
+    WidgetInputEvent* result =
+        new WidgetInputEvent(false, mMessage, nullptr, this);
+    result->AssignInputEventData(*this, true);
+    result->mFlags = mFlags;
+    return result;
+  }
+
+  static Modifier AccelModifier();
+
+  static Modifier GetModifier(const nsAString& aDOMKeyName);
+
+  bool IsAccel() const { return ((mModifiers & AccelModifier()) != 0); }
+
+  bool IsShift() const { return ((mModifiers & MODIFIER_SHIFT) != 0); }
+  bool IsControl() const { return ((mModifiers & MODIFIER_CONTROL) != 0); }
+  bool IsAlt() const { return ((mModifiers & MODIFIER_ALT) != 0); }
+  bool IsMeta() const { return ((mModifiers & MODIFIER_META) != 0); }
+  bool IsAltGraph() const { return ((mModifiers & MODIFIER_ALTGRAPH) != 0); }
+  bool IsCapsLocked() const { return ((mModifiers & MODIFIER_CAPSLOCK) != 0); }
+  bool IsNumLocked() const { return ((mModifiers & MODIFIER_NUMLOCK) != 0); }
+  bool IsScrollLocked() const {
+    return ((mModifiers & MODIFIER_SCROLLLOCK) != 0);
+  }
+
+  bool IsFn() const { return ((mModifiers & MODIFIER_FN) != 0); }
+  bool IsFnLocked() const { return ((mModifiers & MODIFIER_FNLOCK) != 0); }
+  bool IsSymbol() const { return ((mModifiers & MODIFIER_SYMBOL) != 0); }
+  bool IsSymbolLocked() const {
+    return ((mModifiers & MODIFIER_SYMBOLLOCK) != 0);
+  }
+
+  void InitBasicModifiers(bool aCtrlKey, bool aAltKey, bool aShiftKey,
+                          bool aMetaKey) {
+    mModifiers = 0;
+    if (aCtrlKey) {
+      mModifiers |= MODIFIER_CONTROL;
+    }
+    if (aAltKey) {
+      mModifiers |= MODIFIER_ALT;
+    }
+    if (aShiftKey) {
+      mModifiers |= MODIFIER_SHIFT;
+    }
+    if (aMetaKey) {
+      mModifiers |= MODIFIER_META;
+    }
+  }
+
+  Modifiers mModifiers;
+
+  void AssignInputEventData(const WidgetInputEvent& aEvent, bool aCopyTargets) {
+    AssignGUIEventData(aEvent, aCopyTargets);
+
+    mModifiers = aEvent.mModifiers;
+  }
+};
+
+
+class InternalUIEvent : public WidgetGUIEvent {
+ protected:
+  InternalUIEvent() : mDetail(0), mCausedByUntrustedEvent(false) {}
+
+  InternalUIEvent(bool aIsTrusted, EventMessage aMessage, nsIWidget* aWidget,
+                  EventClassID aEventClassID,
+                  const WidgetEventTime* aTime = nullptr)
+      : WidgetGUIEvent(aIsTrusted, aMessage, aWidget, aEventClassID, aTime),
+        mDetail(0),
+        mCausedByUntrustedEvent(false) {}
+
+  InternalUIEvent(bool aIsTrusted, EventMessage aMessage,
+                  EventClassID aEventClassID,
+                  const WidgetEventTime* aTime = nullptr)
+      : WidgetGUIEvent(aIsTrusted, aMessage, nullptr, aEventClassID, aTime),
+        mDetail(0),
+        mCausedByUntrustedEvent(false) {}
+
+ public:
+  NS_DEFINE_AS_EVENT_OVERRIDE(Internal, UIEvent);
+
+  InternalUIEvent(bool aIsTrusted, EventMessage aMessage,
+                  const WidgetEvent* aEventCausesThisEvent,
+                  const WidgetEventTime* aTime = nullptr)
+      : WidgetGUIEvent(aIsTrusted, aMessage, nullptr, eUIEventClass, aTime),
+        mDetail(0),
+        mCausedByUntrustedEvent(aEventCausesThisEvent &&
+                                !aEventCausesThisEvent->IsTrusted()) {}
+
+  InternalUIEvent(const InternalUIEvent&) = default;
+  InternalUIEvent(InternalUIEvent&&) = default;
+  InternalUIEvent& operator=(const InternalUIEvent&) = default;
+  InternalUIEvent& operator=(InternalUIEvent&&) = default;
+
+  NS_DEFINE_VIRTUAL_DESTRUCTOR_CHECKING_CLASS_VALUE(InternalUIEvent,
+                                                    eUIEventClass,
+                                                    eGUIEventClass)
+
+  virtual WidgetEvent* Duplicate() const override {
+    MOZ_ASSERT(mClass == eUIEventClass,
+               "Duplicate() must be overridden by sub class");
+    InternalUIEvent* result =
+        new InternalUIEvent(false, mMessage, nullptr, this);
+    result->AssignUIEventData(*this, true);
+    result->mFlags = mFlags;
+    return result;
+  }
+
+  int32_t mDetail;
+  bool mCausedByUntrustedEvent;
+
+  bool IsTrustable() const { return IsTrusted() && !mCausedByUntrustedEvent; }
+
+  void AssignUIEventData(const InternalUIEvent& aEvent, bool aCopyTargets) {
+    AssignGUIEventData(aEvent, aCopyTargets);
+
+    mDetail = aEvent.mDetail;
+    mCausedByUntrustedEvent = aEvent.mCausedByUntrustedEvent;
+  }
+};
+
+}  
+
+#endif  // mozilla_BasicEvents_h_

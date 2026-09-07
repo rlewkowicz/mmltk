@@ -1,0 +1,151 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_CanvasChild_h
+#define mozilla_layers_CanvasChild_h
+
+#include "mozilla/gfx/RecordedEvent.h"
+#include "mozilla/ipc/CrossProcessSemaphore.h"
+#include "mozilla/ipc/SharedMemoryMapping.h"
+#include "mozilla/layers/PCanvasChild.h"
+#include "mozilla/layers/SourceSurfaceSharedData.h"
+#include "mozilla/WeakPtr.h"
+
+class nsICanvasRenderingContextInternal;
+
+namespace mozilla {
+
+namespace dom {
+class ThreadSafeWorkerRef;
+}
+
+namespace gfx {
+class DrawTargetRecording;
+class SourceSurface;
+}  
+
+namespace layers {
+class CanvasDrawEventRecorder;
+struct RemoteTextureOwnerId;
+
+class CanvasChild final : public PCanvasChild, public SupportsWeakPtr {
+ public:
+  NS_INLINE_DECL_REFCOUNTING(CanvasChild)
+
+  explicit CanvasChild(dom::ThreadSafeWorkerRef* aWorkerRef);
+
+  static bool Deactivated() { return mDeactivated; }
+
+  void ClearCachedResources();
+
+  ipc::IPCResult RecvNotifyDeviceReset(
+      const nsTArray<RemoteTextureOwnerId>& aOwnerIds);
+
+  ipc::IPCResult RecvDeactivate();
+
+  ipc::IPCResult RecvBlockCanvas();
+
+  ipc::IPCResult RecvNotifyRequiresRefresh(
+      const RemoteTextureOwnerId aTextureOwnerId);
+
+  ipc::IPCResult RecvSnapshotShmem(
+      const RemoteTextureOwnerId aTextureOwnerId,
+      ipc::ReadOnlySharedMemoryHandle&& aShmemHandle,
+      SnapshotShmemResolver&& aResolve);
+
+  ipc::IPCResult RecvNotifyTextureDestruction(
+      const RemoteTextureOwnerId aTextureOwnerId);
+
+  bool EnsureRecorder(gfx::IntSize aSize, gfx::SurfaceFormat aFormat,
+                      TextureType aTextureType, TextureType aWebglTextureType);
+
+  void Destroy();
+
+  bool ShouldCacheDataSurface() const {
+    return mTransactionsSinceGetDataSurface < kCacheDataSurfaceThreshold;
+  }
+
+  bool EnsureBeginTransaction();
+
+  void EndTransaction();
+
+  bool ShouldBeCleanedUp() const;
+
+  already_AddRefed<gfx::DrawTargetRecording> CreateDrawTarget(
+      const RemoteTextureOwnerId& aTextureOwnerId, gfx::IntSize aSize,
+      gfx::SurfaceFormat aFormat);
+
+  void RecordEvent(const gfx::RecordedEvent& aEvent);
+
+  int64_t CreateCheckpoint();
+
+  already_AddRefed<gfx::SourceSurface> WrapSurface(
+      const RefPtr<gfx::SourceSurface>& aSurface,
+      const RemoteTextureOwnerId aTextureOwnerId);
+
+  void AttachSurface(const RefPtr<gfx::SourceSurface>& aSurface);
+
+  void DetachSurface(const RefPtr<gfx::SourceSurface>& aSurface,
+                     bool aInvalidate = false);
+
+  already_AddRefed<gfx::DataSourceSurface> GetDataSurface(
+      const RemoteTextureOwnerId aTextureOwnerId,
+      const gfx::SourceSurface* aSurface, bool aDetached, bool& aMayInvalidate);
+
+  bool RequiresRefresh(const RemoteTextureOwnerId aTextureOwnerId) const;
+
+  void ReturnDataSurfaceShmem(
+      std::shared_ptr<ipc::ReadOnlySharedMemoryMapping>&& aDataSurfaceShmem);
+
+  already_AddRefed<gfx::SourceSurface> SnapshotExternalCanvas(
+      gfx::DrawTargetRecording* aTarget,
+      nsICanvasRenderingContextInternal* aCanvas,
+      mozilla::ipc::IProtocol* aActor);
+
+ protected:
+  void ActorDestroy(ActorDestroyReason aWhy) final;
+
+ private:
+  DISALLOW_COPY_AND_ASSIGN(CanvasChild);
+
+  ~CanvasChild() final;
+
+  size_t SizeOfDataSurfaceShmem(gfx::IntSize, gfx::SurfaceFormat aFormat);
+  bool ShouldGrowDataSurfaceShmem(size_t aSizeRequired);
+  bool EnsureDataSurfaceShmem(size_t aSizeRequired);
+  bool EnsureDataSurfaceShmem(gfx::IntSize aSize, gfx::SurfaceFormat aFormat);
+
+  static void ReleaseDataShmemHolder(void* aClosure);
+
+  void DropFreeBuffersWhenDormant();
+
+  static const uint32_t kCacheDataSurfaceThreshold = 10;
+
+  static bool mDeactivated;
+
+  RefPtr<dom::ThreadSafeWorkerRef> mWorkerRef;
+  RefPtr<CanvasDrawEventRecorder> mRecorder;
+
+  std::shared_ptr<ipc::ReadOnlySharedMemoryMapping> mDataSurfaceShmem;
+  bool mDataSurfaceShmemAvailable = false;
+  uint32_t mNextDataSurfaceShmemId = 0;
+  int64_t mLastWriteLockCheckpoint = 0;
+  uint32_t mTransactionsSinceGetDataSurface = kCacheDataSurfaceThreshold;
+  struct TextureInfo {
+    std::shared_ptr<mozilla::ipc::ReadOnlySharedMemoryMapping> mSnapshotShmem;
+    bool mRequiresRefresh = false;
+  };
+  std::unordered_map<RemoteTextureOwnerId, TextureInfo,
+                     RemoteTextureOwnerId::HashFn>
+      mTextureInfo;
+  bool mIsInTransaction = false;
+  bool mDormant = false;
+  bool mBlocked = false;
+  uint64_t mLastSyncId = 0;
+};
+
+}  
+}  
+
+#endif  // mozilla_layers_CanvasChild_h

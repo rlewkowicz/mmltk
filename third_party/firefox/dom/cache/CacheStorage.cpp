@@ -1,0 +1,520 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/cache/CacheStorage.h"
+
+#include "js/Object.h"              // JS::GetClass
+#include "js/PropertyAndElement.h"  // JS_DefineProperty
+#include "mozilla/Preferences.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/dom/CacheBinding.h"
+#include "mozilla/dom/CacheStorageBinding.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/InternalRequest.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/Response.h"
+#include "mozilla/dom/WorkerPrivate.h"
+#include "mozilla/dom/cache/AutoUtils.h"
+#include "mozilla/dom/cache/Cache.h"
+#include "mozilla/dom/cache/CacheChild.h"
+#include "mozilla/dom/cache/CacheCommon.h"
+#include "mozilla/dom/cache/CacheStorageChild.h"
+#include "mozilla/dom/cache/CacheWorkerRef.h"
+#include "mozilla/dom/cache/PCacheChild.h"
+#include "mozilla/dom/cache/ReadStream.h"
+#include "mozilla/dom/cache/TypeUtils.h"
+#include "mozilla/dom/quota/PrincipalUtils.h"
+#include "mozilla/dom/quota/ResultExtensions.h"
+#include "mozilla/ipc/BackgroundChild.h"
+#include "mozilla/ipc/BackgroundUtils.h"
+#include "mozilla/ipc/PBackgroundChild.h"
+#include "mozilla/ipc/PBackgroundSharedTypes.h"
+#include "nsContentUtils.h"
+#include "nsIGlobalObject.h"
+#include "nsMixedContentBlocker.h"
+#include "nsURLParsers.h"
+
+namespace mozilla::dom::cache {
+
+using mozilla::ErrorResult;
+using mozilla::ipc::BackgroundChild;
+using mozilla::ipc::PBackgroundChild;
+using mozilla::ipc::PrincipalInfo;
+using mozilla::ipc::PrincipalToPrincipalInfo;
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(mozilla::dom::cache::CacheStorage);
+NS_IMPL_CYCLE_COLLECTING_RELEASE(mozilla::dom::cache::CacheStorage);
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(mozilla::dom::cache::CacheStorage,
+                                      mGlobal);
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(CacheStorage)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+struct CacheStorage::Entry final {
+  RefPtr<Promise> mPromise;
+  CacheOpArgs mArgs;
+  SafeRefPtr<InternalRequest> mRequest;
+};
+
+bool IsTrusted(const PrincipalInfo& aPrincipalInfo, bool aTestingPrefEnabled) {
+
+  if (aPrincipalInfo.type() == PrincipalInfo::TSystemPrincipalInfo) {
+    return true;
+  }
+
+  QM_TRY(OkIf(aPrincipalInfo.type() == PrincipalInfo::TContentPrincipalInfo),
+         false);
+
+  if (aTestingPrefEnabled) {
+    return true;
+  }
+
+
+  const nsCString& flatURL = aPrincipalInfo.get_ContentPrincipalInfo().spec();
+  const char* const url = flatURL.get();
+
+  const nsCOMPtr<nsIURLParser> urlParser = new nsStdURLParser();
+
+  uint32_t schemePos;
+  int32_t schemeLen;
+  uint32_t authPos;
+  int32_t authLen;
+  QM_TRY(MOZ_TO_RESULT(urlParser->ParseURL(url, flatURL.Length(), &schemePos,
+                                           &schemeLen, &authPos, &authLen,
+                                           nullptr, nullptr)),  
+         false);
+
+  const nsAutoCString scheme(Substring(flatURL, schemePos, schemeLen));
+  if (scheme.LowerCaseEqualsLiteral("https") ||
+      scheme.LowerCaseEqualsLiteral("file")) {
+    return true;
+  }
+
+  uint32_t hostPos;
+  int32_t hostLen;
+  QM_TRY(MOZ_TO_RESULT(
+             urlParser->ParseAuthority(url + authPos, authLen, nullptr,
+                                       nullptr,           
+                                       nullptr, nullptr,  
+                                       &hostPos, &hostLen,
+                                       nullptr)),  
+         false);
+
+  return nsMixedContentBlocker::IsPotentiallyTrustworthyLoopbackHost(
+      nsDependentCSubstring(url + authPos + hostPos, hostLen));
+}
+
+already_AddRefed<CacheStorage> CacheStorage::CreateOnMainThread(
+    Namespace aNamespace, nsIGlobalObject* aGlobal, nsIPrincipal* aPrincipal,
+    bool aForceTrustedOrigin, ErrorResult& aRv) {
+  MOZ_DIAGNOSTIC_ASSERT(aGlobal);
+  MOZ_DIAGNOSTIC_ASSERT(aPrincipal);
+  MOZ_ASSERT(NS_IsMainThread());
+
+  PrincipalInfo principalInfo;
+  QM_TRY(MOZ_TO_RESULT(PrincipalToPrincipalInfo(aPrincipal, &principalInfo)),
+         nullptr, [&aRv](const nsresult rv) { aRv.Throw(rv); });
+
+  QM_TRY(OkIf(quota::IsPrincipalInfoValid(principalInfo)),
+         RefPtr{new CacheStorage(NS_ERROR_DOM_SECURITY_ERR)}.forget(),
+         [](const auto) {
+           NS_WARNING("CacheStorage not supported on invalid origins.");
+         });
+
+  if (!IsTrusted(principalInfo, aForceTrustedOrigin)) {
+    NS_WARNING("CacheStorage not supported on untrusted origins.");
+    RefPtr<CacheStorage> ref = new CacheStorage(NS_ERROR_DOM_SECURITY_ERR);
+    return ref.forget();
+  }
+
+  RefPtr<CacheStorage> ref =
+      new CacheStorage(aNamespace, aGlobal, principalInfo, nullptr);
+  return ref.forget();
+}
+
+already_AddRefed<CacheStorage> CacheStorage::CreateOnWorker(
+    Namespace aNamespace, nsIGlobalObject* aGlobal,
+    WorkerPrivate* aWorkerPrivate, ErrorResult& aRv) {
+  MOZ_DIAGNOSTIC_ASSERT(aGlobal);
+  MOZ_DIAGNOSTIC_ASSERT(aWorkerPrivate);
+  aWorkerPrivate->AssertIsOnWorkerThread();
+
+  if (aWorkerPrivate->GetOriginAttributes().IsPrivateBrowsing() &&
+      !StaticPrefs::dom_cache_privateBrowsing_enabled()) {
+    NS_WARNING("CacheStorage not supported during private browsing.");
+    RefPtr<CacheStorage> ref = new CacheStorage(NS_ERROR_DOM_SECURITY_ERR);
+    return ref.forget();
+  }
+
+  SafeRefPtr<CacheWorkerRef> workerRef =
+      CacheWorkerRef::Create(aWorkerPrivate, CacheWorkerRef::eIPCWorkerRef);
+  if (!workerRef) {
+    NS_WARNING("Worker thread is shutting down.");
+    aRv.Throw(NS_ERROR_FAILURE);
+    return nullptr;
+  }
+
+  const PrincipalInfo& principalInfo =
+      aWorkerPrivate->GetEffectiveStoragePrincipalInfo();
+
+  QM_TRY(OkIf(quota::IsPrincipalInfoValid(principalInfo)), nullptr,
+         [&aRv](const auto) { aRv.Throw(NS_ERROR_FAILURE); });
+
+  const bool trustedByServiceWorker = aWorkerPrivate->IsServiceWorker();
+
+  if (!IsTrusted(principalInfo, trustedByServiceWorker)) {
+    NS_WARNING("CacheStorage not supported on untrusted origins.");
+    RefPtr<CacheStorage> ref = new CacheStorage(NS_ERROR_DOM_SECURITY_ERR);
+    return ref.forget();
+  }
+
+  RefPtr<CacheStorage> ref = new CacheStorage(
+      aNamespace, aGlobal, principalInfo, std::move(workerRef));
+  return ref.forget();
+}
+
+bool CacheStorage::DefineCachesForSandbox(JSContext* aCx,
+                                          JS::Handle<JSObject*> aGlobal) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_DIAGNOSTIC_ASSERT(JS::GetClass(aGlobal)->flags & JSCLASS_DOM_GLOBAL,
+                        "Passed object is not a global object!");
+  js::AssertSameCompartment(aCx, aGlobal);
+
+  if (NS_WARN_IF(!CacheStorage_Binding::CreateAndDefineOnGlobal(aCx) ||
+                 !Cache_Binding::CreateAndDefineOnGlobal(aCx))) {
+    return false;
+  }
+
+  nsIPrincipal* principal = nsContentUtils::ObjectPrincipal(aGlobal);
+  MOZ_DIAGNOSTIC_ASSERT(principal);
+
+  ErrorResult rv;
+  RefPtr<CacheStorage> storage =
+      CreateOnMainThread(DEFAULT_NAMESPACE, xpc::NativeGlobal(aGlobal),
+                         principal, true, 
+                         rv);
+  if (NS_WARN_IF(rv.MaybeSetPendingException(aCx))) {
+    return false;
+  }
+
+  JS::Rooted<JS::Value> caches(aCx);
+  if (NS_WARN_IF(!ToJSValue(aCx, storage, &caches))) {
+    return false;
+  }
+
+  return JS_DefineProperty(aCx, aGlobal, "caches", caches, JSPROP_ENUMERATE);
+}
+
+bool CacheStorage::CachesEnabled(JSContext* aCx, JSObject* aObj) {
+  return cache::Cache::CachesEnabled(aCx, aObj);
+}
+
+CacheStorage::CacheStorage(Namespace aNamespace, nsIGlobalObject* aGlobal,
+                           const PrincipalInfo& aPrincipalInfo,
+                           SafeRefPtr<CacheWorkerRef> aWorkerRef)
+    : mNamespace(aNamespace),
+      mGlobal(aGlobal),
+      mPrincipalInfo(MakeUnique<PrincipalInfo>(aPrincipalInfo)),
+      mActor(nullptr),
+      mStatus(NS_OK) {
+  MOZ_DIAGNOSTIC_ASSERT(mGlobal);
+
+  if (!BackgroundChild::ValidatePrincipalInfo(*mPrincipalInfo, {})) {
+    MOZ_ASSERT_UNREACHABLE(
+        "ValidatePrincipalInfo failed in CacheStorage constructor");
+    mStatus = NS_ERROR_UNEXPECTED;
+    return;
+  }
+
+  PBackgroundChild* actor = BackgroundChild::GetOrCreateForCurrentThread();
+  if (NS_WARN_IF(!actor)) {
+    mStatus = NS_ERROR_UNEXPECTED;
+    return;
+  }
+
+  CacheStorageChild* newActor =
+      new CacheStorageChild(this, std::move(aWorkerRef));
+  PCacheStorageChild* constructedActor = actor->SendPCacheStorageConstructor(
+      newActor, mNamespace, *mPrincipalInfo);
+
+  if (NS_WARN_IF(!constructedActor)) {
+    mStatus = NS_ERROR_UNEXPECTED;
+    return;
+  }
+
+  MOZ_DIAGNOSTIC_ASSERT(constructedActor == newActor);
+  mActor = newActor;
+}
+
+CacheStorage::CacheStorage(nsresult aFailureResult)
+    : mNamespace(INVALID_NAMESPACE), mActor(nullptr), mStatus(aFailureResult) {
+  MOZ_DIAGNOSTIC_ASSERT(NS_FAILED(mStatus));
+}
+
+already_AddRefed<Promise> CacheStorage::Match(
+    JSContext* aCx, const RequestOrUTF8String& aRequest,
+    const MultiCacheQueryOptions& aOptions, ErrorResult& aRv) {
+  NS_ASSERT_OWNINGTHREAD(CacheStorage);
+
+  if (!HasStorageAccess()) {
+    aRv.Throw(NS_ERROR_DOM_SECURITY_ERR);
+    return nullptr;
+  }
+
+  if (NS_WARN_IF(NS_FAILED(mStatus))) {
+    aRv.Throw(mStatus);
+    return nullptr;
+  }
+
+  SafeRefPtr<InternalRequest> request =
+      ToInternalRequest(aCx, aRequest, IgnoreBody, aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+
+  RefPtr<Promise> promise = Promise::Create(mGlobal, aRv);
+  if (NS_WARN_IF(!promise)) {
+    return nullptr;
+  }
+
+  CacheQueryParams params;
+  ToCacheQueryParams(params, aOptions);
+
+  auto entry = MakeUnique<Entry>();
+  entry->mPromise = promise;
+  entry->mArgs = StorageMatchArgs(CacheRequest(), params, GetOpenMode());
+  entry->mRequest = std::move(request);
+
+  RunRequest(std::move(entry));
+
+  return promise.forget();
+}
+
+already_AddRefed<Promise> CacheStorage::Has(const nsAString& aKey,
+                                            ErrorResult& aRv) {
+  NS_ASSERT_OWNINGTHREAD(CacheStorage);
+
+  if (!HasStorageAccess()) {
+    aRv.Throw(NS_ERROR_DOM_SECURITY_ERR);
+    return nullptr;
+  }
+
+  if (NS_WARN_IF(NS_FAILED(mStatus))) {
+    aRv.Throw(mStatus);
+    return nullptr;
+  }
+
+  RefPtr<Promise> promise = Promise::Create(mGlobal, aRv);
+  if (NS_WARN_IF(!promise)) {
+    return nullptr;
+  }
+
+  auto entry = MakeUnique<Entry>();
+  entry->mPromise = promise;
+  entry->mArgs = StorageHasArgs(nsString(aKey));
+
+  RunRequest(std::move(entry));
+
+  return promise.forget();
+}
+
+already_AddRefed<Promise> CacheStorage::Open(const nsAString& aKey,
+                                             ErrorResult& aRv) {
+  NS_ASSERT_OWNINGTHREAD(CacheStorage);
+
+  if (!HasStorageAccess()) {
+    aRv.Throw(NS_ERROR_DOM_SECURITY_ERR);
+    return nullptr;
+  }
+
+  if (NS_WARN_IF(NS_FAILED(mStatus))) {
+    aRv.Throw(mStatus);
+    return nullptr;
+  }
+
+  RefPtr<Promise> promise = Promise::Create(mGlobal, aRv);
+  if (NS_WARN_IF(!promise)) {
+    return nullptr;
+  }
+
+  auto entry = MakeUnique<Entry>();
+  entry->mPromise = promise;
+  entry->mArgs = StorageOpenArgs(nsString(aKey));
+
+  RunRequest(std::move(entry));
+
+  return promise.forget();
+}
+
+already_AddRefed<Promise> CacheStorage::Delete(const nsAString& aKey,
+                                               ErrorResult& aRv) {
+  NS_ASSERT_OWNINGTHREAD(CacheStorage);
+
+  if (!HasStorageAccess()) {
+    aRv.Throw(NS_ERROR_DOM_SECURITY_ERR);
+    return nullptr;
+  }
+
+  if (NS_WARN_IF(NS_FAILED(mStatus))) {
+    aRv.Throw(mStatus);
+    return nullptr;
+  }
+
+  RefPtr<Promise> promise = Promise::Create(mGlobal, aRv);
+  if (NS_WARN_IF(!promise)) {
+    return nullptr;
+  }
+
+  auto entry = MakeUnique<Entry>();
+  entry->mPromise = promise;
+  entry->mArgs = StorageDeleteArgs(nsString(aKey));
+
+  RunRequest(std::move(entry));
+
+  return promise.forget();
+}
+
+already_AddRefed<Promise> CacheStorage::Keys(ErrorResult& aRv) {
+  NS_ASSERT_OWNINGTHREAD(CacheStorage);
+
+  if (!HasStorageAccess()) {
+    aRv.Throw(NS_ERROR_DOM_SECURITY_ERR);
+    return nullptr;
+  }
+
+  if (NS_WARN_IF(NS_FAILED(mStatus))) {
+    aRv.Throw(mStatus);
+    return nullptr;
+  }
+
+  RefPtr<Promise> promise = Promise::Create(mGlobal, aRv);
+  if (NS_WARN_IF(!promise)) {
+    return nullptr;
+  }
+
+  auto entry = MakeUnique<Entry>();
+  entry->mPromise = promise;
+  entry->mArgs = StorageKeysArgs();
+
+  RunRequest(std::move(entry));
+
+  return promise.forget();
+}
+
+already_AddRefed<CacheStorage> CacheStorage::Constructor(
+    const GlobalObject& aGlobal, CacheStorageNamespace aNamespace,
+    nsIPrincipal* aPrincipal, ErrorResult& aRv) {
+  if (NS_WARN_IF(!NS_IsMainThread())) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return nullptr;
+  }
+
+  static_assert(DEFAULT_NAMESPACE == (uint32_t)CacheStorageNamespace::Content,
+                "Default namespace should match webidl Content enum");
+  static_assert(
+      CHROME_ONLY_NAMESPACE == (uint32_t)CacheStorageNamespace::Chrome,
+      "Chrome namespace should match webidl Chrome enum");
+  static_assert(
+      NUMBER_OF_NAMESPACES == ContiguousEnumSize<CacheStorageNamespace>::value,
+      "Number of namespace should match webidl count");
+
+  Namespace ns = static_cast<Namespace>(aNamespace);
+  nsCOMPtr<nsIGlobalObject> global = do_QueryInterface(aGlobal.GetAsSupports());
+
+  bool privateBrowsing = false;
+  if (nsCOMPtr<nsPIDOMWindowInner> window = do_QueryInterface(global)) {
+    RefPtr<Document> doc = window->GetExtantDoc();
+    if (doc) {
+      nsCOMPtr<nsILoadContext> loadContext = doc->GetLoadContext();
+      privateBrowsing = loadContext && loadContext->UsePrivateBrowsing();
+    }
+  }
+
+  if (privateBrowsing && !StaticPrefs::dom_cache_privateBrowsing_enabled()) {
+    RefPtr<CacheStorage> ref = new CacheStorage(NS_ERROR_DOM_SECURITY_ERR);
+    return ref.forget();
+  }
+
+  return CreateOnMainThread(ns, global, aPrincipal,
+                            true , aRv);
+}
+
+nsISupports* CacheStorage::GetParentObject() const { return mGlobal; }
+
+JSObject* CacheStorage::WrapObject(JSContext* aContext,
+                                   JS::Handle<JSObject*> aGivenProto) {
+  return mozilla::dom::CacheStorage_Binding::Wrap(aContext, this, aGivenProto);
+}
+
+void CacheStorage::OnActorDestroy(CacheStorageChild* aActor) {
+  NS_ASSERT_OWNINGTHREAD(CacheStorage);
+  MOZ_DIAGNOSTIC_ASSERT(mActor);
+  MOZ_DIAGNOSTIC_ASSERT(mActor == aActor);
+  MOZ_DIAGNOSTIC_ASSERT(!NS_FAILED(mStatus));
+  mActor->ClearListener();
+  mActor = nullptr;
+  mStatus = NS_ERROR_UNEXPECTED;
+
+}
+
+nsIGlobalObject* CacheStorage::GetGlobalObject() const { return mGlobal; }
+
+#ifdef DEBUG
+void CacheStorage::AssertOwningThread() const {
+  NS_ASSERT_OWNINGTHREAD(CacheStorage);
+}
+#endif
+
+CacheStorage::~CacheStorage() {
+  NS_ASSERT_OWNINGTHREAD(CacheStorage);
+  if (mActor) {
+    mActor->StartDestroyFromListener();
+    MOZ_DIAGNOSTIC_ASSERT(!mActor);
+  }
+}
+
+void CacheStorage::RunRequest(UniquePtr<Entry> aEntry) {
+  MOZ_ASSERT(mActor);
+
+  AutoChildOpArgs args(this, aEntry->mArgs, 1);
+
+  if (aEntry->mRequest) {
+    ErrorResult rv;
+    args.Add(*aEntry->mRequest, IgnoreBody, IgnoreInvalidScheme, rv);
+    if (NS_WARN_IF(rv.Failed())) {
+      aEntry->mPromise->MaybeReject(std::move(rv));
+      return;
+    }
+  }
+
+  mActor->ExecuteOp(mGlobal, aEntry->mPromise, this, args.SendAsOpArgs());
+}
+
+OpenMode CacheStorage::GetOpenMode() const {
+  return mNamespace == CHROME_ONLY_NAMESPACE ? OpenMode::Eager : OpenMode::Lazy;
+}
+
+bool CacheStorage::HasStorageAccess() const {
+  NS_ASSERT_OWNINGTHREAD(CacheStorage);
+  if (NS_WARN_IF(!mGlobal)) {
+    return false;
+  }
+
+  StorageAccess access = mGlobal->GetStorageAccess();
+
+  if (nsIPrincipal* principal = mGlobal->PrincipalOrNull()) {
+    if (!principal->IsSystemPrincipal() &&
+        principal->GetPrivateBrowsingId() !=
+            nsIScriptSecurityManager::DEFAULT_PRIVATE_BROWSING_ID &&
+        !StaticPrefs::dom_cache_privateBrowsing_enabled()) {
+      return false;
+    }
+  }
+
+  return access > StorageAccess::eDeny || ShouldPartitionStorage(access);
+}
+
+}  

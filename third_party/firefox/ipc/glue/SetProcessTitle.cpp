@@ -1,0 +1,43 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/ipc/SetProcessTitle.h"
+
+#include "nsString.h"
+
+#if defined(XP_LINUX)
+
+#  include "base/set_process_title_linux.h"
+#  define HAVE_SETPROCTITLE
+#  define HAVE_SETPROCTITLE_INIT
+
+#endif
+
+namespace mozilla {
+
+void SetProcessTitle(const std::vector<std::string>& aNewArgv) {
+#if defined(HAVE_SETPROCTITLE)
+  nsAutoCStringN<1024> buf;
+
+  bool firstArg = true;
+  for (const std::string& arg : aNewArgv) {
+    if (firstArg) {
+      firstArg = false;
+    } else {
+      buf.Append(' ');
+    }
+    buf.Append(arg.c_str());
+  }
+
+  setproctitle("-%s", buf.get());
+#endif
+}
+
+void SetProcessTitleInit(char** aOrigArgv) {
+#if defined(HAVE_SETPROCTITLE_INIT)
+  setproctitle_init(aOrigArgv);
+#endif
+}
+
+}  

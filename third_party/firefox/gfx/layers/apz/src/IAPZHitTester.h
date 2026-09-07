@@ -1,0 +1,68 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_IAPZHitTester_h
+#define mozilla_layers_IAPZHitTester_h
+
+#include "HitTestingTreeNode.h"  // for HitTestingTreeNodeAutoLock
+#include "mozilla/RefPtr.h"
+#include "mozilla/gfx/CompositorHitTestInfo.h"
+#include "mozilla/layers/LayersTypes.h"
+
+namespace mozilla {
+namespace layers {
+
+class AsyncPanZoomController;
+class APZCTreeManager;
+
+class IAPZHitTester {
+ public:
+  virtual ~IAPZHitTester() = default;
+
+  void Initialize(APZCTreeManager* aTreeManager) {
+    mTreeManager = aTreeManager;
+  }
+
+  struct HitTestResult {
+    RefPtr<AsyncPanZoomController> mTargetApzc;
+    gfx::CompositorHitTestInfo mHitResult;
+    LayersId mLayersId;
+    HitTestingTreeNodeAutoLock mScrollbarNode;
+    SideBits mFixedPosSides = SideBits::eNone;
+    HitTestingTreeNodeAutoLock mNode;
+    bool mHitOverscrollGutter = false;
+
+    HitTestResult() = default;
+    HitTestResult(HitTestResult&&) = default;
+    HitTestResult& operator=(HitTestResult&&) = default;
+  };
+
+  virtual HitTestResult GetAPZCAtPoint(
+      const ScreenPoint& aHitTestPoint,
+      const RecursiveMutexAutoLock& aProofOfTreeLock) = 0;
+
+  HitTestResult CloneHitTestResult(RecursiveMutexAutoLock& aProofOfTreeLock,
+                                   const HitTestResult& aHitTestResult) const;
+
+ protected:
+  APZCTreeManager* mTreeManager = nullptr;
+
+  RecursiveMutex& GetTreeLock();
+  LayersId GetRootLayersId() const;
+  HitTestingTreeNode* GetRootNode() const;
+  HitTestingTreeNode* FindRootNodeForLayersId(LayersId aLayersId) const;
+  AsyncPanZoomController* FindRootApzcForLayersId(LayersId aLayersId) const;
+  already_AddRefed<HitTestingTreeNode> GetTargetNode(
+      const ScrollableLayerGuid& aGuid,
+      ScrollableLayerGuid::Comparator aComparator);
+  void InitializeHitTestingTreeNodeAutoLock(
+      HitTestingTreeNodeAutoLock& aAutoLock,
+      const RecursiveMutexAutoLock& aProofOfTreeLock,
+      RefPtr<HitTestingTreeNode>& aNode) const;
+};
+
+}  
+}  
+
+#endif  // mozilla_layers_IAPZHitTester_h

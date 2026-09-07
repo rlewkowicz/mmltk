@@ -1,0 +1,112 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef CacheIOThread_h_
+#define CacheIOThread_h_
+
+#include "nsIThreadInternal.h"
+#include "nsISupportsImpl.h"
+#include "prthread.h"
+#include "nsTArray.h"
+#include "mozilla/Monitor.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/UniquePtr.h"
+
+class nsIRunnable;
+
+namespace mozilla {
+namespace net {
+
+namespace detail {
+class NativeThreadHandle;
+}  
+
+class CacheIOThread final : public nsIThreadObserver {
+  virtual ~CacheIOThread();
+
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSITHREADOBSERVER
+
+  CacheIOThread();
+
+  using EventQueue = AutoTArray<nsCOMPtr<nsIRunnable>, 32>;
+
+  enum ELevel : uint32_t {
+    OPEN_PRIORITY,
+    READ_PRIORITY,
+    MANAGEMENT,  
+    OPEN,
+    READ,
+    WRITE_PRIORITY,
+    WRITE,
+    INDEX,
+    EVICT,
+    LAST_LEVEL,
+
+    XPCOM_LEVEL
+  };
+
+  nsresult Init();
+  nsresult Dispatch(nsIRunnable* aRunnable, uint32_t aLevel);
+  nsresult Dispatch(already_AddRefed<nsIRunnable>, uint32_t aLevel);
+  nsresult DispatchAfterPendingOpens(nsIRunnable* aRunnable);
+  bool IsCurrentThread();
+
+  uint32_t QueueSize(bool highPriority);
+
+  uint32_t EventCounter() const { return mEventCounter; }
+
+  static bool YieldAndRerun() { return sSelf ? sSelf->YieldInternal() : false; }
+
+  void Shutdown();
+  void CancelBlockingIO();
+  already_AddRefed<nsIEventTarget> Target();
+
+  class Cancelable {
+    bool mCancelable;
+
+   public:
+    explicit Cancelable(bool aCancelable);
+    ~Cancelable();
+  };
+
+  size_t SizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+  size_t SizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+
+ private:
+  static void ThreadFunc(void* aClosure);
+  void ThreadFunc();
+  void LoopOneLevel(uint32_t aLevel) MOZ_REQUIRES(mMonitor);
+  bool EventsPending(uint32_t aLastLevel = LAST_LEVEL);
+  nsresult DispatchInternal(already_AddRefed<nsIRunnable> aRunnable,
+                            uint32_t aLevel);
+  bool YieldInternal();
+
+  static CacheIOThread* sSelf;
+
+  mozilla::Monitor mMonitor{"CacheIOThread"};
+  PRThread* mThread{nullptr};
+  UniquePtr<detail::NativeThreadHandle> mNativeThreadHandle;
+  Atomic<nsIThread*> mXPCOMThread{nullptr};
+  Atomic<uint32_t, Relaxed> mLowestLevelWaiting{LAST_LEVEL};
+  uint32_t mCurrentlyExecutingLevel{0};  
+
+  Atomic<int32_t> mQueueLength[LAST_LEVEL];
+
+  EventQueue mEventQueue[LAST_LEVEL] MOZ_GUARDED_BY(mMonitor);
+  Atomic<bool, Relaxed> mHasXPCOMEvents{false};
+  bool mRerunCurrentEvent{false};  
+  bool mShutdown MOZ_GUARDED_BY(mMonitor){false};
+  Atomic<uint32_t, Relaxed> mIOCancelableEvents{0};
+  Atomic<uint32_t, Relaxed> mEventCounter{0};
+#ifdef DEBUG
+  bool mInsideLoop MOZ_GUARDED_BY(mMonitor){true};
+#endif
+};
+
+}  
+}  
+
+#endif

@@ -1,0 +1,190 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+#ifndef __NUMPARSE_AFFIXES_H__
+#define __NUMPARSE_AFFIXES_H__
+
+#include "cmemory.h"
+
+#include "numparse_types.h"
+#include "numparse_symbols.h"
+#include "numparse_currency.h"
+#include "number_affixutils.h"
+#include "number_currencysymbols.h"
+
+U_NAMESPACE_BEGIN
+
+namespace numparse::impl {
+
+class AffixPatternMatcherBuilder;
+class AffixPatternMatcher;
+
+using ::icu::number::impl::AffixPatternProvider;
+using ::icu::number::impl::TokenConsumer;
+using ::icu::number::impl::CurrencySymbols;
+
+
+class CodePointMatcher : public NumberParseMatcher, public UMemory {
+  public:
+    CodePointMatcher() = default;  
+
+    CodePointMatcher(UChar32 cp);
+
+    bool match(StringSegment& segment, ParsedNumber& result, UErrorCode& status) const override;
+
+    bool smokeTest(const StringSegment& segment) const override;
+
+    UnicodeString toString() const override;
+
+  private:
+    UChar32 fCp;
+};
+
+
+struct AffixTokenMatcherSetupData {
+    const CurrencySymbols& currencySymbols;
+    const DecimalFormatSymbols& dfs;
+    IgnorablesMatcher& ignorables;
+    const Locale& locale;
+    parse_flags_t parseFlags;
+};
+
+
+class U_I18N_API_CLASS AffixTokenMatcherWarehouse : public UMemory {
+  public:
+    AffixTokenMatcherWarehouse() = default;  
+
+    U_I18N_API AffixTokenMatcherWarehouse(const AffixTokenMatcherSetupData* setupData);
+
+    NumberParseMatcher& minusSign();
+
+    NumberParseMatcher& plusSign();
+
+    NumberParseMatcher& approximatelySign();
+
+    NumberParseMatcher& percent();
+
+    NumberParseMatcher& permille();
+
+    U_I18N_API NumberParseMatcher& currency(UErrorCode& status);
+
+    IgnorablesMatcher& ignorables();
+
+    NumberParseMatcher* nextCodePointMatcher(UChar32 cp, UErrorCode& status);
+
+    bool hasEmptyCurrencySymbol() const;
+
+  private:
+    const AffixTokenMatcherSetupData* fSetupData;
+
+    MinusSignMatcher fMinusSign;
+    PlusSignMatcher fPlusSign;
+    ApproximatelySignMatcher fApproximatelySign;
+    PercentMatcher fPercent;
+    PermilleMatcher fPermille;
+    CombinedCurrencyMatcher fCurrency;
+
+    MemoryPool<CodePointMatcher> fCodePoints;
+
+    friend class AffixPatternMatcherBuilder;
+    friend class AffixPatternMatcher;
+};
+
+
+class AffixPatternMatcherBuilder : public TokenConsumer, public MutableMatcherCollection {
+  public:
+    AffixPatternMatcherBuilder(const UnicodeString& pattern, AffixTokenMatcherWarehouse& warehouse,
+                               IgnorablesMatcher* ignorables);
+
+    void consumeToken(::icu::number::impl::AffixPatternType type, UChar32 cp, UErrorCode& status) override;
+
+    AffixPatternMatcher build(UErrorCode& status);
+
+  private:
+    ArraySeriesMatcher::MatcherArray fMatchers;
+    int32_t fMatchersLen;
+    int32_t fLastTypeOrCp;
+
+    const UnicodeString& fPattern;
+    AffixTokenMatcherWarehouse& fWarehouse;
+    IgnorablesMatcher* fIgnorables;
+
+    void addMatcher(NumberParseMatcher& matcher) override;
+};
+
+
+class U_I18N_API_CLASS AffixPatternMatcher : public ArraySeriesMatcher {
+  public:
+    AffixPatternMatcher() = default;  
+
+    U_I18N_API static AffixPatternMatcher fromAffixPattern(const UnicodeString& affixPattern,
+                                                           AffixTokenMatcherWarehouse& warehouse,
+                                                           parse_flags_t parseFlags, bool* success,
+                                                           UErrorCode& status);
+
+    UnicodeString getPattern() const;
+
+    bool operator==(const AffixPatternMatcher& other) const;
+
+  private:
+    CompactUnicodeString<4> fPattern;
+
+    AffixPatternMatcher(MatcherArray& matchers, int32_t matchersLen, const UnicodeString& pattern,
+                        UErrorCode& status);
+
+    friend class AffixPatternMatcherBuilder;
+};
+
+
+class AffixMatcher : public NumberParseMatcher, public UMemory {
+  public:
+    AffixMatcher() = default;  
+
+    AffixMatcher(AffixPatternMatcher* prefix, AffixPatternMatcher* suffix, result_flags_t flags);
+
+    bool match(StringSegment& segment, ParsedNumber& result, UErrorCode& status) const override;
+
+    void postProcess(ParsedNumber& result) const override;
+
+    bool smokeTest(const StringSegment& segment) const override;
+
+    int8_t compareTo(const AffixMatcher& rhs) const;
+
+    UnicodeString toString() const override;
+
+  private:
+    AffixPatternMatcher* fPrefix;
+    AffixPatternMatcher* fSuffix;
+    result_flags_t fFlags;
+};
+
+
+class AffixMatcherWarehouse {
+  public:
+    AffixMatcherWarehouse() = default;  
+
+    AffixMatcherWarehouse(AffixTokenMatcherWarehouse* tokenWarehouse);
+
+    void createAffixMatchers(const AffixPatternProvider& patternInfo, MutableMatcherCollection& output,
+                             const IgnorablesMatcher& ignorables, parse_flags_t parseFlags,
+                             UErrorCode& status);
+
+  private:
+    AffixMatcher fAffixMatchers[18];
+    AffixPatternMatcher fAffixPatternMatchers[12];
+    AffixTokenMatcherWarehouse* fTokenWarehouse;
+
+    friend class AffixMatcher;
+
+    static bool isInteresting(const AffixPatternProvider& patternInfo, const IgnorablesMatcher& ignorables,
+                              parse_flags_t parseFlags, UErrorCode& status);
+};
+
+} 
+
+U_NAMESPACE_END
+
+#endif //__NUMPARSE_AFFIXES_H__
+#endif /* #if !UCONFIG_NO_FORMATTING */

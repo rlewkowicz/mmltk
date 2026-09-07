@@ -1,0 +1,105 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef nsAnimationManager_h_
+#define nsAnimationManager_h_
+
+#include "AnimationCommon.h"
+#include "mozilla/Keyframe.h"
+#include "mozilla/dom/CSSAnimation.h"
+#include "nsISupportsImpl.h"
+#include "nsTHashSet.h"
+
+class ServoCSSAnimationBuilder;
+
+struct nsStyleUIReset;
+
+namespace mozilla {
+class ComputedStyle;
+
+struct NonOwningAnimationTarget;
+struct PseudoStyleRequest;
+
+} 
+
+class nsAnimationManager final
+    : public mozilla::CommonAnimationManager<mozilla::dom::CSSAnimation> {
+ public:
+  using TimelineNamesToAnimationMap =
+      nsTHashMap<RefPtr<const nsAtom>,
+                 nsTArray<RefPtr<mozilla::dom::CSSAnimation>>>;
+
+  explicit nsAnimationManager(nsPresContext* aPresContext)
+      : mozilla::CommonAnimationManager<mozilla::dom::CSSAnimation>(
+            aPresContext) {}
+
+  typedef mozilla::AnimationCollection<mozilla::dom::CSSAnimation>
+      CSSAnimationCollection;
+  typedef nsTArray<RefPtr<mozilla::dom::CSSAnimation>>
+      OwningCSSAnimationPtrArray;
+
+  ~nsAnimationManager() override = default;
+
+  void UpdateAnimations(mozilla::dom::Element* aElement,
+                        const mozilla::PseudoStyleRequest& aPseudoRequest,
+                        const mozilla::ComputedStyle* aComputedValues);
+
+  void RemoveNamedTimelineAnimation(const nsAtom* aName,
+                                    mozilla::dom::CSSAnimation* aAnimation);
+
+  void UpdateDeferredTimelineChanges();
+  void UpdateNamedTimelineAnimations(
+      const nsTArray<RefPtr<const nsAtom>>& aChanged);
+  void UpdateAllNamedTimelineAnimations();
+
+  template <class IterType>
+  static bool FindMatchingKeyframe(
+      IterType&& aIter, const mozilla::Keyframe::OffsetType& aOffset,
+      const mozilla::StyleComputedTimingFunction& aTimingFunctionToMatch,
+      mozilla::dom::CompositeOperationOrAuto aCompositionToMatch,
+      size_t& aIndex) {
+    aIndex = 0;
+    for (mozilla::Keyframe& keyframe : aIter) {
+      if (keyframe.mOffset.value() != aOffset) {
+        if (aOffset.IsPercentageOffset()) {
+          break;
+        }
+
+        if (keyframe.mOffset->IsPercentageOffset()) {
+          break;
+        }
+        ++aIndex;
+        continue;
+      }
+
+      const bool matches = [&] {
+        if (keyframe.mComposite != aCompositionToMatch) {
+          return false;
+        }
+        return keyframe.mTimingFunction
+                   ? *keyframe.mTimingFunction == aTimingFunctionToMatch
+                   : aTimingFunctionToMatch.IsLinearKeyword();
+      }();
+      if (matches) {
+        return true;
+      }
+      ++aIndex;
+    }
+    return false;
+  }
+
+  bool AnimationMayBeReferenced(nsAtom* aName) const {
+    return mMaybeReferencedAnimations.Contains(aName);
+  }
+
+ private:
+  nsTHashSet<RefPtr<nsAtom>> mMaybeReferencedAnimations;
+  TimelineNamesToAnimationMap mAnimationsWithNamedTimeline;
+  nsTHashSet<RefPtr<mozilla::dom::CSSAnimation>> mAnimationsWithDeferredUpdate;
+
+  void DoUpdateAnimations(const mozilla::NonOwningAnimationTarget& aTarget,
+                          const nsStyleUIReset& aStyle,
+                          ServoCSSAnimationBuilder& aBuilder);
+};
+
+#endif /* !defined(nsAnimationManager_h_) */

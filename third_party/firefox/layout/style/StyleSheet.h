@@ -1,0 +1,456 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(mozilla_StyleSheet_h)
+#define mozilla_StyleSheet_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/CORSMode.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/ServoBindingTypes.h"
+#include "mozilla/ServoTypes.h"
+#include "mozilla/StyleSheetInfo.h"
+#include "mozilla/dom/CSSStyleSheetBinding.h"
+#include "mozilla/dom/SRIMetadata.h"
+#include "nsICSSLoaderObserver.h"
+#include "nsIPrincipal.h"
+#include "nsProxyRelease.h"
+#include "nsStringFwd.h"
+#include "nsWrapperCache.h"
+
+class nsIGlobalObject;
+class nsINode;
+class nsIPrincipal;
+struct StyleLockedCssRules;
+class nsIReferrerInfo;
+
+namespace mozilla {
+
+class ServoCSSRuleList;
+class ServoStyleSet;
+struct StyleLockedDeclarationBlock;
+
+using StyleSheetParsePromise = MozPromise< bool,
+                                           bool,
+                                           true>;
+
+enum class StyleRuleChangeKind : uint32_t;
+enum class StyleNonLocalUriDependency : uint8_t;
+
+struct StyleRuleChange {
+  StyleRuleChange() = delete;
+  MOZ_IMPLICIT StyleRuleChange(StyleRuleChangeKind aKind) : mKind(aKind) {}
+  StyleRuleChange(StyleRuleChangeKind aKind,
+                  const StyleLockedDeclarationBlock* aOldBlock,
+                  const StyleLockedDeclarationBlock* aNewBlock)
+      : mKind(aKind), mOldBlock(aOldBlock), mNewBlock(aNewBlock) {}
+
+  const StyleRuleChangeKind mKind;
+  const StyleLockedDeclarationBlock* const mOldBlock = nullptr;
+  const StyleLockedDeclarationBlock* const mNewBlock = nullptr;
+};
+
+namespace css {
+class GroupRule;
+class Loader;
+class LoaderReusableStyleSheets;
+class Rule;
+class SheetLoadData;
+using SheetLoadDataHolder = nsMainThreadPtrHolder<SheetLoadData>;
+}  
+
+namespace dom {
+class CSSImportRule;
+class CSSRuleList;
+class DocumentOrShadowRoot;
+class MediaList;
+class ShadowRoot;
+struct CSSStyleSheetInit;
+}  
+
+enum class StyleSheetState : uint8_t {
+  Disabled = 1 << 0,
+  Complete = 1 << 1,
+  ForcedUniqueInner = 1 << 2,
+  ModifiedRules = 1 << 3,
+  ModifiedRulesForDevtools = 1 << 4,
+  ModificationDisallowed = 1 << 5,
+};
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(StyleSheetState)
+
+class StyleSheet final : public nsICSSLoaderObserver, public nsWrapperCache {
+  StyleSheet(const StyleSheet& aCopy, StyleSheet* aParentSheetToUse,
+             dom::DocumentOrShadowRoot* aDocOrShadowRootToUse,
+             dom::Document* aConstructorDocToUse);
+
+  virtual ~StyleSheet();
+
+  using State = StyleSheetState;
+
+ public:
+  StyleSheet(StyleOrigin, CORSMode, const dom::SRIMetadata& aIntegrity);
+
+  static already_AddRefed<StyleSheet> Constructor(const dom::GlobalObject&,
+                                                  const dom::CSSStyleSheetInit&,
+                                                  ErrorResult&);
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(StyleSheet)
+
+  static already_AddRefed<StyleSheet> CreateConstructedSheet(
+      dom::Document& aConstructorDocument, nsIURI* aBaseURI,
+      const dom::CSSStyleSheetInit& aOptions, ErrorResult& aError);
+
+  already_AddRefed<StyleSheet> CreateEmptyChildSheet(
+      already_AddRefed<dom::MediaList> aMediaList) const;
+
+  bool HasRules() const;
+
+  RefPtr<StyleSheetParsePromise> ParseSheet(
+      css::Loader&, const nsACString& aBytes,
+      const RefPtr<css::SheetLoadDataHolder>& aLoadData);
+
+  void FinishAsyncParse(already_AddRefed<StyleStylesheetContents>);
+
+  void ParseSheetSync(
+      css::Loader* aLoader, const nsACString& aBytes,
+      css::SheetLoadData* aLoadData,
+      css::LoaderReusableStyleSheets* aReusableSheets = nullptr);
+
+  void ReparseSheet(const nsACString& aInput, ErrorResult& aRv);
+
+  const StyleStylesheetContents* RawContents() const {
+    return Inner().mContents;
+  }
+
+  const StyleUseCounters* UseCounters() const;
+
+  StyleNonLocalUriDependency OriginalContentsUriDependency() const;
+
+  URLExtraData* URLData() const { return mURLData.get(); }
+
+  NS_IMETHOD StyleSheetLoaded(StyleSheet* aSheet, bool aWasDeferred,
+                              nsresult aStatus) final;
+
+  ServoCSSRuleList* GetCssRulesInternal();
+
+  StyleOrigin GetOrigin() const;
+
+  void SetOwningNode(nsINode* aOwningNode) { mOwningNode = aOwningNode; }
+
+  dom::CSSStyleSheetParsingMode ParsingModeDOM();
+
+  bool IsComplete() const { return bool(mState & State::Complete); }
+
+  void SetComplete();
+
+  void SetEnabled(bool aEnabled) { SetDisabled(!aEnabled); }
+
+  bool IsInline() const { return !GetOriginalURI(); }
+  nsIURI* GetOriginalURI() const { return mOriginalSheetURI; }
+  nsIURI* GetBaseURI() const;
+
+  void SetURIs(nsIURI* aOriginalSheetURI, nsIURI* aBaseURI,
+               nsIReferrerInfo* aReferrerInfo, nsIPrincipal* aPrincipal);
+
+  void SetOriginClean(bool aValue) { Inner().mOriginClean = aValue; }
+  bool IsOriginClean() const { return Inner().mOriginClean; }
+
+  bool IsApplicable() const { return !Disabled() && IsComplete(); }
+
+  already_AddRefed<StyleSheet> Clone(
+      StyleSheet* aCloneParent,
+      dom::DocumentOrShadowRoot* aCloneDocumentOrShadowRoot) const;
+
+  already_AddRefed<StyleSheet> CloneAdoptedSheet(
+      dom::Document& aConstructorDocument) const;
+
+  bool HasForcedUniqueInner() const {
+    return bool(mState & State::ForcedUniqueInner);
+  }
+
+  bool HasModifiedRules() const { return bool(mState & State::ModifiedRules); }
+
+  bool HasModifiedRulesForDevtools() const {
+    return bool(mState & State::ModifiedRulesForDevtools);
+  }
+
+  bool HasUniqueInner() const { return Inner().mSheets.Length() == 1; }
+
+  void AssertHasUniqueInner() const { MOZ_ASSERT(HasUniqueInner()); }
+
+  void EnsureUniqueInner();
+
+  dom::DocumentOrShadowRoot* GetAssociatedDocumentOrShadowRoot() const;
+
+  dom::Document* GetKeptAliveByDocument() const;
+
+  dom::Document* GetAssociatedDocument() const;
+
+  void SetAssociatedDocumentOrShadowRoot(dom::DocumentOrShadowRoot*);
+  void ClearAssociatedDocumentOrShadowRoot() {
+    SetAssociatedDocumentOrShadowRoot(nullptr);
+  }
+
+  nsINode* GetOwnerNode() const { return mOwningNode; }
+
+  nsINode* GetOwnerNodeOfOutermostSheet() const {
+    return OutermostSheet().GetOwnerNode();
+  }
+
+  StyleSheet* GetParentSheet() const { return mParentSheet; }
+
+  void AddReferencingRule(dom::CSSImportRule& aRule) {
+    MOZ_ASSERT(!mReferencingRules.Contains(&aRule));
+    mReferencingRules.AppendElement(&aRule);
+  }
+
+  void RemoveReferencingRule(dom::CSSImportRule& aRule) {
+    MOZ_ASSERT(mReferencingRules.Contains(&aRule));
+    mReferencingRules.RemoveElement(&aRule);
+  }
+
+  dom::CSSImportRule* GetOwnerRule() const {
+    return mReferencingRules.SafeElementAt(0);
+  }
+
+  void AppendStyleSheet(StyleSheet&);
+
+  void AppendStyleSheetSilently(StyleSheet&);
+
+  const nsTArray<RefPtr<StyleSheet>>& ChildSheets() const {
+#if defined(DEBUG)
+    for (StyleSheet* child : Inner().mChildren) {
+      MOZ_ASSERT(child->GetParentSheet());
+      MOZ_ASSERT(child->GetParentSheet()->mInner == mInner);
+    }
+#endif
+    return Inner().mChildren;
+  }
+
+  nsIPrincipal* Principal() const;
+  void SetTitle(const nsAString& aTitle) { mTitle = aTitle; }
+  void SetMedia(already_AddRefed<dom::MediaList> aMedia);
+
+  CORSMode GetCORSMode() const { return Inner().mCORSMode; }
+
+  nsIReferrerInfo* GetReferrerInfo() const;
+
+  void GetIntegrity(dom::SRIMetadata& aResult) const {
+    aResult = Inner().mIntegrity;
+  }
+
+  size_t SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const;
+#if defined(DEBUG) || 0
+  void List(FILE* aOut = stdout, int32_t aIndex = 0);
+#endif
+
+  void GetType(nsAString& aType);
+  void GetHref(nsAString& aHref, ErrorResult& aRv);
+  StyleSheet* GetParentStyleSheet() const { return GetParentSheet(); }
+  void GetTitle(nsAString& aTitle);
+  dom::MediaList* Media();
+  bool Disabled() const { return bool(mState & State::Disabled); }
+  void SetDisabled(bool aDisabled);
+
+  void GetSourceMapURL(nsACString&);
+  void SetSourceMapURL(nsCString&&);
+  void GetSourceURL(nsACString& aSourceURL);
+
+  css::Rule* GetDOMOwnerRule() const;
+  dom::CSSRuleList* GetCssRules(nsIPrincipal& aSubjectPrincipal, ErrorResult&);
+  uint32_t InsertRule(const nsACString& aRule, uint32_t aIndex,
+                      nsIPrincipal& aSubjectPrincipal, ErrorResult& aRv);
+  void DeleteRule(uint32_t aIndex, nsIPrincipal& aSubjectPrincipal,
+                  ErrorResult& aRv);
+  int32_t AddRule(const nsACString& aSelector, const nsACString& aBlock,
+                  const dom::Optional<uint32_t>& aIndex,
+                  nsIPrincipal& aSubjectPrincipal, ErrorResult& aRv);
+  already_AddRefed<dom::Promise> Replace(const nsACString& aText, ErrorResult&);
+  void ReplaceSync(const nsACString& aText, ErrorResult&);
+  bool ModificationDisallowed() const {
+    return bool(mState & State::ModificationDisallowed);
+  }
+
+  void SetModificationDisallowed(bool aDisallowed) {
+    MOZ_ASSERT(IsConstructed());
+    MOZ_ASSERT(!IsReadOnly());
+    if (aDisallowed) {
+      mState |= State::ModificationDisallowed;
+      mState &= ~State::Complete;
+      if (!Disabled()) {
+        ApplicableStateChanged(false);
+      }
+    } else {
+      mState &= ~State::ModificationDisallowed;
+    }
+  }
+
+  bool IsConstructed() const { return !!mConstructorDocument; }
+
+  bool IsDirectlyAssociatedTo(dom::DocumentOrShadowRoot&) const;
+
+  bool ConstructorDocumentMatches(const dom::Document& aDocument) const {
+    return mConstructorDocument == &aDocument;
+  }
+
+  void AddAdopter(dom::DocumentOrShadowRoot& aAdopter) {
+    MOZ_ASSERT(!mAdopters.Contains(&aAdopter));
+    mAdopters.AppendElement(&aAdopter);
+  }
+
+  void RemoveAdopter(dom::DocumentOrShadowRoot& aAdopter) {
+    mAdopters.UnorderedRemoveElement(&aAdopter);
+  }
+
+  const nsTArray<dom::DocumentOrShadowRoot*>& SelfOrAncestorAdopters() const {
+    return OutermostSheet().mAdopters;
+  }
+
+  inline dom::ParentObject GetParentObject() const;
+  JSObject* WrapObject(JSContext* aCx, JS::Handle<JSObject*> aGivenProto) final;
+
+  void WillDirty();
+
+  void RuleChanged(css::Rule*, const StyleRuleChange&);
+
+  void AddStyleSet(ServoStyleSet* aStyleSet);
+  void DropStyleSet(ServoStyleSet* aStyleSet);
+
+  nsresult DeleteRuleFromGroup(css::GroupRule* aGroup, uint32_t aIndex);
+  nsresult InsertRuleIntoGroup(const nsACString& aRule, css::GroupRule* aGroup,
+                               uint32_t aIndex);
+
+  uint64_t FindOwningWindowInnerID() const;
+
+  const StyleLockedCssRules* ToShared(StyleSharedMemoryBuilder* aBuilder,
+                                      nsCString& aErrorMessage);
+
+  void SetSharedContents(const StyleLockedCssRules* aSharedRules);
+
+  bool IsReadOnly() const;
+
+  void RemoveFromParent();
+
+  void MaybeResolveReplacePromise();
+
+  void MaybeRejectReplacePromise();
+
+  nsISupports* GetRelevantGlobal() const;
+
+  void BlockParsePromise() {
+#if defined(MOZ_DIAGNOSTIC_ASSERT_ENABLED)
+    uint32_t count =
+#endif
+        ++mAsyncParseBlockers;
+    MOZ_DIAGNOSTIC_ASSERT(count);
+  }
+
+  void UnblockParsePromise() {
+    uint32_t count = --mAsyncParseBlockers;
+    MOZ_DIAGNOSTIC_ASSERT(count != UINT32_MAX);
+    if (!count && !mParsePromise.IsEmpty()) {
+      mParsePromise.Resolve(true, __func__);
+    }
+  }
+
+ private:
+  void SetModifiedRules() {
+    mState |= State::ModifiedRules | State::ModifiedRulesForDevtools;
+  }
+
+  const StyleSheet& OutermostSheet() const {
+    const auto* current = this;
+    while (current->mParentSheet) {
+      MOZ_ASSERT(!current->mDocumentOrShadowRoot,
+                 "Shouldn't be set on child sheets");
+      MOZ_ASSERT(!current->mConstructorDocument,
+                 "Shouldn't be set on child sheets");
+      current = current->mParentSheet;
+    }
+    return *current;
+  }
+
+  StyleSheetInfo& Inner() {
+    MOZ_ASSERT(mInner);
+    return *mInner;
+  }
+
+  const StyleSheetInfo& Inner() const {
+    MOZ_ASSERT(mInner);
+    return *mInner;
+  }
+
+  bool AreRulesAvailable(nsIPrincipal& aSubjectPrincipal, ErrorResult& aRv);
+
+ protected:
+  uint32_t InsertRuleInternal(const nsACString& aRule, uint32_t aIndex,
+                              ErrorResult&);
+  void DeleteRuleInternal(uint32_t aIndex, ErrorResult&);
+  nsresult InsertRuleIntoGroupInternal(const nsACString& aRule,
+                                       css::GroupRule* aGroup, uint32_t aIndex);
+
+  void FixUpAfterInnerClone();
+
+  void FixUpRuleListAfterContentsChangeIfNeeded(bool aFromClone = false);
+
+  void DropRuleList();
+
+  void RuleAdded(css::Rule&);
+
+  void RuleRemoved(css::Rule&);
+
+  void StyleSheetCloned(StyleSheet&);
+
+  void ApplicableStateChanged(bool aApplicable);
+
+  void LastRelease();
+
+  void SubjectSubsumesInnerPrincipal(nsIPrincipal& aSubjectPrincipal,
+                                     ErrorResult& aRv);
+
+  void DropMedia();
+  void UnlinkInner();
+  void TraverseInner(nsCycleCollectionTraversalCallback&);
+
+  static bool RuleHasPendingChildSheet(css::Rule* aRule);
+
+  StyleSheet* mParentSheet;  
+
+  RefPtr<dom::Document> mConstructorDocument;
+
+  RefPtr<dom::Promise> mReplacePromise;
+
+  nsString mTitle;
+
+  dom::DocumentOrShadowRoot* mDocumentOrShadowRoot;
+  nsINode* mOwningNode = nullptr;                   
+  nsTArray<dom::CSSImportRule*> mReferencingRules;  
+
+  RefPtr<dom::MediaList> mMedia;
+
+  RefPtr<URLExtraData> mURLData;
+  RefPtr<nsIURI> mOriginalSheetURI;
+  State mState;
+
+  Atomic<uint32_t, ReleaseAcquire> mAsyncParseBlockers{0};
+
+  StyleSheetInfo* mInner;
+
+  nsTArray<ServoStyleSet*> mStyleSets;
+
+  RefPtr<ServoCSSRuleList> mRuleList;
+
+  MozPromiseHolder<StyleSheetParsePromise> mParsePromise;
+
+  nsTArray<dom::DocumentOrShadowRoot*> mAdopters;
+
+  friend struct StyleSheetInfo;
+};
+
+}  
+
+#endif

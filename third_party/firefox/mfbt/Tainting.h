@@ -1,0 +1,96 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_Tainting_h
+#define mozilla_Tainting_h
+
+#include <utility>
+#include "mozilla/MacroArgs.h"
+
+namespace IPC {
+template <typename P>
+struct ParamTraits;
+}
+
+namespace mozilla {
+
+template <typename T>
+class Tainted;
+
+
+
+template <typename T>
+class Tainted {
+ private:
+  T mValue;
+
+ public:
+  explicit Tainted() = default;
+
+  template <typename U>
+  explicit Tainted(U&& aValue) : mValue(std::forward<U>(aValue)) {}
+
+  T& Coerce() { return this->mValue; }
+  const T& Coerce() const { return this->mValue; }
+
+  friend struct IPC::ParamTraits<Tainted<T>>;
+};
+
+#define MOZ_TAINT_GLUE(a, b) a b
+
+#define MOZ_VALIDATE_AND_GET_HELPER3(tainted_value, condition, \
+                                     assertionstring)          \
+  [&]() {                                                      \
+    auto& tmp = tainted_value.Coerce();                        \
+    auto& tainted_value = tmp;                                 \
+    bool test = (condition);                                   \
+    MOZ_RELEASE_ASSERT(test, assertionstring);                 \
+    return tmp;                                                \
+  }()
+
+#define MOZ_VALIDATE_AND_GET_HELPER2(tainted_value, condition)        \
+  MOZ_VALIDATE_AND_GET_HELPER3(tainted_value, condition,              \
+                               "MOZ_VALIDATE_AND_GET(" #tainted_value \
+                               ", " #condition ") has failed")
+
+
+#define MOZ_VALIDATE_AND_GET(...)                                            \
+  MOZ_TAINT_GLUE(MOZ_PASTE_PREFIX_AND_ARG_COUNT(MOZ_VALIDATE_AND_GET_HELPER, \
+                                                __VA_ARGS__),                \
+                 (__VA_ARGS__))
+
+#define MOZ_IS_VALID(tainted_value, condition) \
+  [&]() {                                      \
+    auto& tmp = tainted_value.Coerce();        \
+    auto& tainted_value = tmp;                 \
+    return (condition);                        \
+  }()
+
+#define MOZ_VALIDATE_OR(tainted_value, condition, alternate_value) \
+  (MOZ_IS_VALID(tainted_value, condition) ? tainted_value.Coerce() \
+                                          : alternate_value)
+
+#define MOZ_FIND_AND_VALIDATE(tainted_value, condition, validation_list) \
+  [&]() {                                                                \
+    auto& tmp = tainted_value.Coerce();                                  \
+    auto& tainted_value = tmp;                                           \
+    const auto macro_find_it =                                           \
+        std::find_if(validation_list.cbegin(), validation_list.cend(),   \
+                     [&](const auto& list_item) { return condition; });  \
+    return macro_find_it != validation_list.cend() ? &*macro_find_it     \
+                                                   : nullptr;            \
+  }()
+
+#define MOZ_NO_VALIDATE(tainted_value, justification)      \
+  [&tainted_value] {                                       \
+    static_assert(sizeof(justification) > 3,               \
+                  "Must provide a justification string."); \
+    return tainted_value.Coerce();                         \
+  }()
+
+
+}  
+
+#endif /* mozilla_Tainting_h */

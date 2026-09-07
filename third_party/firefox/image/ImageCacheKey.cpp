@@ -1,0 +1,109 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ImageCacheKey.h"
+
+#include "mozilla/AntiTrackingUtils.h"
+#include "mozilla/HashFunctions.h"
+#include "mozilla/StaticPrefs_privacy.h"
+#include "mozilla/StorageAccess.h"
+#include "mozilla/StoragePrincipalHelper.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/ServiceWorkerManager.h"
+#include "nsContentUtils.h"
+#include "nsHashKeys.h"
+#include "nsLayoutUtils.h"
+
+namespace mozilla {
+
+using namespace dom;
+
+namespace image {
+
+static nsIPrincipal* GetLoaderPrincipal(Document* aDocument) {
+  return aDocument ? aDocument->NodePrincipal()
+                   : nsContentUtils::GetSystemPrincipal();
+}
+
+static nsIPrincipal* GetPartitionPrincipal(Document* aDocument) {
+  return aDocument ? aDocument->PartitionedPrincipal()
+                   : nsContentUtils::GetSystemPrincipal();
+}
+
+ImageCacheKey::ImageCacheKey(nsIURI* aURI, CORSMode aCORSMode,
+                             Document* aDocument)
+    : mURI(aURI),
+      mControlledDocument(GetSpecialCaseDocumentToken(aDocument)),
+      mLoaderPrincipal(GetLoaderPrincipal(aDocument)),
+      mPartitionPrincipal(GetPartitionPrincipal(aDocument)),
+      mCORSMode(aCORSMode),
+      mAppType(GetAppType(aDocument)) {
+  MOZ_ASSERT(mLoaderPrincipal);
+  MOZ_ASSERT(mPartitionPrincipal);
+}
+
+ImageCacheKey::ImageCacheKey(const ImageCacheKey& aOther) = default;
+ImageCacheKey::ImageCacheKey(ImageCacheKey&& aOther) = default;
+
+bool ImageCacheKey::operator==(const ImageCacheKey& aOther) const {
+  if (mControlledDocument != aOther.mControlledDocument) {
+    return false;
+  }
+
+  if (!mPartitionPrincipal->Equals(aOther.mPartitionPrincipal)) {
+    return false;
+  }
+
+  if (mCORSMode != aOther.mCORSMode) {
+    return false;
+  }
+  if (mAppType != aOther.mAppType) {
+    return false;
+  }
+
+  bool equals = false;
+  nsresult rv = mURI->Equals(aOther.mURI, &equals);
+  return NS_SUCCEEDED(rv) && equals;
+}
+
+void ImageCacheKey::EnsureHash() const {
+  MOZ_ASSERT(mHash.isNothing());
+
+  mHash.emplace(
+      AddToHash(mURI->SpecHash(), mControlledDocument, mAppType, mCORSMode));
+}
+
+void* ImageCacheKey::GetSpecialCaseDocumentToken(Document* aDocument) {
+  if (!aDocument || aDocument->IsCookieAverse()) {
+    return nullptr;
+  }
+
+  RefPtr<ServiceWorkerManager> swm = ServiceWorkerManager::GetInstance();
+  if (swm && aDocument->GetController().isSome()) {
+    return aDocument;
+  }
+
+  return nullptr;
+}
+
+nsIDocShell::AppType ImageCacheKey::GetAppType(Document* aDocument) {
+  if (!aDocument) {
+    return nsIDocShell::APP_TYPE_UNKNOWN;
+  }
+
+  nsCOMPtr<nsIDocShellTreeItem> dsti = aDocument->GetDocShell();
+  if (!dsti) {
+    return nsIDocShell::APP_TYPE_UNKNOWN;
+  }
+
+  nsCOMPtr<nsIDocShellTreeItem> root;
+  dsti->GetInProcessRootTreeItem(getter_AddRefs(root));
+  if (nsCOMPtr<nsIDocShell> docShell = do_QueryInterface(root)) {
+    return docShell->GetAppType();
+  }
+  return nsIDocShell::APP_TYPE_UNKNOWN;
+}
+
+}  
+}  

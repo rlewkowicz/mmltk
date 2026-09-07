@@ -1,0 +1,161 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef js_ContextOptions_h
+#define js_ContextOptions_h
+
+#include "jstypes.h"  // JS_PUBLIC_API
+
+#include "js/CompileOptions.h"  // PrefableCompileOptions
+#include "js/WasmFeatures.h"
+
+struct JS_PUBLIC_API JSContext;
+
+namespace JS {
+
+class JS_PUBLIC_API ContextOptions {
+ public:
+  // clang-format off
+  ContextOptions()
+      : wasm_(true),
+        wasmForTrustedPrinciples_(true),
+        wasmBaseline_(true),
+        wasmIon_(true),
+        testWasmAwaitTier2_(false),
+        disableIon_(false),
+        disableEvalSecurityChecks_(false),
+        disableFilenameSecurityChecks_(false),
+        asyncStack_(true),
+        asyncStackCaptureDebuggeeOnly_(false),
+        throwOnDebuggeeWouldRun_(true),
+        dumpStackOnDebuggeeWouldRun_(false),
+        fuzzing_(false) {
+  }
+  // clang-format on
+
+  bool wasm() const { return wasm_; }
+  ContextOptions& setWasm(bool flag) {
+    wasm_ = flag;
+    return *this;
+  }
+  ContextOptions& toggleWasm() {
+    wasm_ = !wasm_;
+    return *this;
+  }
+
+  bool wasmForTrustedPrinciples() const { return wasmForTrustedPrinciples_; }
+  ContextOptions& setWasmForTrustedPrinciples(bool flag) {
+    wasmForTrustedPrinciples_ = flag;
+    return *this;
+  }
+
+  bool wasmBaseline() const { return wasmBaseline_; }
+  ContextOptions& setWasmBaseline(bool flag) {
+    wasmBaseline_ = flag;
+    return *this;
+  }
+
+  bool wasmIon() const { return wasmIon_; }
+  ContextOptions& setWasmIon(bool flag) {
+    wasmIon_ = flag;
+    return *this;
+  }
+
+  bool testWasmAwaitTier2() const { return testWasmAwaitTier2_; }
+  ContextOptions& setTestWasmAwaitTier2(bool flag) {
+    testWasmAwaitTier2_ = flag;
+    return *this;
+  }
+
+  bool disableIon() const { return disableIon_; }
+  ContextOptions& setDisableIon() {
+    disableIon_ = true;
+    return *this;
+  }
+
+
+  bool disableEvalSecurityChecks() const { return disableEvalSecurityChecks_; }
+  ContextOptions& setDisableEvalSecurityChecks() {
+    disableEvalSecurityChecks_ = true;
+    return *this;
+  }
+
+  bool disableFilenameSecurityChecks() const {
+    return disableFilenameSecurityChecks_;
+  }
+  ContextOptions& setDisableFilenameSecurityChecks() {
+    disableFilenameSecurityChecks_ = true;
+    return *this;
+  }
+
+  bool asyncStack() const { return asyncStack_; }
+  ContextOptions& setAsyncStack(bool flag) {
+    asyncStack_ = flag;
+    return *this;
+  }
+
+  bool asyncStackCaptureDebuggeeOnly() const {
+    return asyncStackCaptureDebuggeeOnly_;
+  }
+  ContextOptions& setAsyncStackCaptureDebuggeeOnly(bool flag) {
+    asyncStackCaptureDebuggeeOnly_ = flag;
+    return *this;
+  }
+
+  bool sourcePragmas() const { return compileOptions_.sourcePragmas(); }
+  ContextOptions& setSourcePragmas(bool flag) {
+    compileOptions_.setSourcePragmas(flag);
+    return *this;
+  }
+
+  bool throwOnDebuggeeWouldRun() const { return throwOnDebuggeeWouldRun_; }
+  ContextOptions& setThrowOnDebuggeeWouldRun(bool flag) {
+    throwOnDebuggeeWouldRun_ = flag;
+    return *this;
+  }
+
+  bool dumpStackOnDebuggeeWouldRun() const {
+    return dumpStackOnDebuggeeWouldRun_;
+  }
+  ContextOptions& setDumpStackOnDebuggeeWouldRun(bool flag) {
+    dumpStackOnDebuggeeWouldRun_ = flag;
+    return *this;
+  }
+
+  bool fuzzing() const { return fuzzing_; }
+  ContextOptions& setFuzzing(bool flag);
+
+  void disableOptionsForSafeMode() { setWasmBaseline(false); }
+
+  PrefableCompileOptions& compileOptions() { return compileOptions_; }
+  const PrefableCompileOptions& compileOptions() const {
+    return compileOptions_;
+  }
+
+ private:
+  bool wasm_ : 1;
+  bool wasmForTrustedPrinciples_ : 1;
+  bool wasmBaseline_ : 1;
+  bool wasmIon_ : 1;
+  bool testWasmAwaitTier2_ : 1;
+
+  bool disableIon_ : 1;
+
+  bool disableEvalSecurityChecks_ : 1;
+  bool disableFilenameSecurityChecks_ : 1;
+  bool asyncStack_ : 1;
+  bool asyncStackCaptureDebuggeeOnly_ : 1;
+  bool throwOnDebuggeeWouldRun_ : 1;
+  bool dumpStackOnDebuggeeWouldRun_ : 1;
+  bool fuzzing_ : 1;
+
+  PrefableCompileOptions compileOptions_;
+};
+
+JS_PUBLIC_API ContextOptions& ContextOptionsRef(JSContext* cx);
+
+}  
+
+#endif  // js_ContextOptions_h

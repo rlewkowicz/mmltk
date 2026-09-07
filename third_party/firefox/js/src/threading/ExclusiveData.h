@@ -1,0 +1,291 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef threading_ExclusiveData_h
+#define threading_ExclusiveData_h
+
+#include "mozilla/OperatorNewExtensions.h"
+
+#include <utility>
+
+#include "threading/ConditionVariable.h"
+#include "threading/Mutex.h"
+
+namespace js {
+
+template <typename T>
+class ExclusiveData {
+ protected:
+  mutable Mutex lock_ MOZ_UNANNOTATED;
+  mutable T value_;
+
+  ExclusiveData(const ExclusiveData&) = delete;
+  ExclusiveData& operator=(const ExclusiveData&) = delete;
+
+  void acquire() const { lock_.lock(); }
+  void release() const { lock_.unlock(); }
+
+ public:
+  template <typename U>
+  explicit ExclusiveData(const MutexId& id, U&& u)
+      : lock_(id), value_(std::forward<U>(u)) {}
+
+  template <typename... Args>
+  explicit ExclusiveData(const MutexId& id, Args&&... args)
+      : lock_(id), value_(std::forward<Args>(args)...) {}
+
+  ExclusiveData& operator=(ExclusiveData&& rhs) {
+    this->~ExclusiveData();
+    new (mozilla::KnownNotNull, this) ExclusiveData(std::move(rhs));
+    return *this;
+  }
+
+  class MOZ_STACK_CLASS Guard {
+   protected:
+    const ExclusiveData* parent_;
+    explicit Guard(std::nullptr_t) : parent_(nullptr) {}
+
+   private:
+    Guard(const Guard&) = delete;
+    Guard& operator=(const Guard&) = delete;
+
+   public:
+    explicit Guard(const ExclusiveData& parent) : parent_(&parent) {
+      parent_->acquire();
+    }
+
+    Guard(Guard&& rhs) : parent_(rhs.parent_) {
+      MOZ_ASSERT(&rhs != this, "self-move disallowed!");
+      rhs.parent_ = nullptr;
+    }
+
+    Guard& operator=(Guard&& rhs) {
+      this->~Guard();
+      new (this) Guard(std::move(rhs));
+      return *this;
+    }
+
+    T& get() const {
+      MOZ_ASSERT(parent_);
+      return parent_->value_;
+    }
+
+    operator T&() const { return get(); }
+    T* operator->() const { return &get(); }
+
+    const ExclusiveData<T>* parent() const {
+      MOZ_ASSERT(parent_);
+      return parent_;
+    }
+
+    ~Guard() {
+      if (parent_) {
+        parent_->release();
+      }
+    }
+  };
+
+  class MOZ_STACK_CLASS NullableGuard : public Guard {
+   public:
+    explicit NullableGuard(std::nullptr_t) : Guard((std::nullptr_t) nullptr) {}
+    explicit NullableGuard(const ExclusiveData& parent) : Guard(parent) {}
+    explicit NullableGuard(Guard&& rhs) : Guard(std::move(rhs)) {}
+
+    NullableGuard& operator=(Guard&& rhs) {
+      this->~NullableGuard();
+      new (this) NullableGuard(std::move(rhs));
+      return *this;
+    }
+
+    bool hasAccess() const { return this->parent_; }
+    explicit operator bool() const { return hasAccess(); }
+  };
+
+  Guard lock() const { return Guard(*this); }
+
+  NullableGuard noAccess() const {
+    return NullableGuard((std::nullptr_t) nullptr);
+  }
+};
+
+template <class T>
+class ExclusiveWaitableData : public ExclusiveData<T> {
+  using Base = ExclusiveData<T>;
+
+  mutable ConditionVariable condVar_;
+
+ public:
+  template <typename U>
+  explicit ExclusiveWaitableData(const MutexId& id, U&& u)
+      : Base(id, std::forward<U>(u)) {}
+
+  template <typename... Args>
+  explicit ExclusiveWaitableData(const MutexId& id, Args&&... args)
+      : Base(id, std::forward<Args>(args)...) {}
+
+  class MOZ_STACK_CLASS Guard : public ExclusiveData<T>::Guard {
+    using Base = typename ExclusiveData<T>::Guard;
+
+   public:
+    explicit Guard(const ExclusiveWaitableData& parent) : Base(parent) {}
+
+    Guard(Guard&& guard) : Base(std::move(guard)) {}
+
+    Guard& operator=(Guard&& rhs) { return Base::operator=(std::move(rhs)); }
+
+    void wait() {
+      auto* parent = static_cast<const ExclusiveWaitableData*>(this->parent());
+      parent->condVar_.wait(parent->lock_);
+    }
+
+    void notify_one() {
+      auto* parent = static_cast<const ExclusiveWaitableData*>(this->parent());
+      parent->condVar_.notify_one();
+    }
+
+    void notify_all() {
+      auto* parent = static_cast<const ExclusiveWaitableData*>(this->parent());
+      parent->condVar_.notify_all();
+    }
+  };
+
+  Guard lock() const { return Guard(*this); }
+};
+
+template <typename T>
+class RWExclusiveData {
+  mutable Mutex lock_ MOZ_UNANNOTATED;
+  mutable ConditionVariable cond_;
+  mutable T value_;
+  mutable int readers_;
+
+
+  void acquireReaderLock() const {
+    lock_.lock();
+    readers_++;
+    lock_.unlock();
+  }
+
+  void releaseReaderLock() const {
+    lock_.lock();
+    MOZ_ASSERT(readers_ > 0);
+    if (--readers_ == 0) {
+      cond_.notify_all();
+    }
+    lock_.unlock();
+  }
+
+  void acquireWriterLock() const {
+    lock_.lock();
+    while (readers_ > 0) {
+      cond_.wait(lock_);
+    }
+  }
+
+  void releaseWriterLock() const {
+    cond_.notify_all();
+    lock_.unlock();
+  }
+
+ public:
+  RWExclusiveData(const RWExclusiveData&) = delete;
+  RWExclusiveData& operator=(const RWExclusiveData&) = delete;
+
+  template <typename... Args>
+  explicit RWExclusiveData(const MutexId& id, Args&&... args)
+      : lock_(id), value_(std::forward<Args>(args)...), readers_(0) {}
+
+  class MOZ_STACK_CLASS ReadGuard {
+    const RWExclusiveData* parent_;
+    explicit ReadGuard(std::nullptr_t) : parent_(nullptr) {}
+
+   public:
+    ReadGuard(const ReadGuard&) = delete;
+    ReadGuard& operator=(const ReadGuard&) = delete;
+
+    explicit ReadGuard(const RWExclusiveData& parent) : parent_(&parent) {
+      parent_->acquireReaderLock();
+    }
+
+    ReadGuard(ReadGuard&& rhs) : parent_(rhs.parent_) {
+      MOZ_ASSERT(&rhs != this, "self-move disallowed!");
+      rhs.parent_ = nullptr;
+    }
+
+    ReadGuard& operator=(ReadGuard&& rhs) {
+      this->~ReadGuard();
+      new (this) ReadGuard(std::move(rhs));
+      return *this;
+    }
+
+    const T& get() const {
+      MOZ_ASSERT(parent_);
+      return parent_->value_;
+    }
+
+    operator const T&() const { return get(); }
+    const T* operator->() const { return &get(); }
+
+    const RWExclusiveData<T>* parent() const {
+      MOZ_ASSERT(parent_);
+      return parent_;
+    }
+
+    ~ReadGuard() {
+      if (parent_) {
+        parent_->releaseReaderLock();
+      }
+    }
+  };
+
+  class MOZ_STACK_CLASS WriteGuard {
+    const RWExclusiveData* parent_;
+    explicit WriteGuard(std::nullptr_t) : parent_(nullptr) {}
+
+   public:
+    WriteGuard(const WriteGuard&) = delete;
+    WriteGuard& operator=(const WriteGuard&) = delete;
+
+    explicit WriteGuard(const RWExclusiveData& parent) : parent_(&parent) {
+      parent_->acquireWriterLock();
+    }
+
+    WriteGuard(WriteGuard&& rhs) : parent_(rhs.parent_) {
+      MOZ_ASSERT(&rhs != this, "self-move disallowed!");
+      rhs.parent_ = nullptr;
+    }
+
+    WriteGuard& operator=(WriteGuard&& rhs) {
+      this->~WriteGuard();
+      new (this) WriteGuard(std::move(rhs));
+      return *this;
+    }
+
+    T& get() const {
+      MOZ_ASSERT(parent_);
+      return parent_->value_;
+    }
+
+    operator T&() const { return get(); }
+    T* operator->() const { return &get(); }
+
+    const RWExclusiveData<T>* parent() const {
+      MOZ_ASSERT(parent_);
+      return parent_;
+    }
+
+    ~WriteGuard() {
+      if (parent_) {
+        parent_->releaseWriterLock();
+      }
+    }
+  };
+
+  ReadGuard readLock() const { return ReadGuard(*this); }
+  WriteGuard writeLock() const { return WriteGuard(*this); }
+};
+
+}  
+
+#endif  // threading_ExclusiveData_h

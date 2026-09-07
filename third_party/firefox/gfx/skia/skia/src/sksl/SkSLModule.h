@@ -1,0 +1,54 @@
+/*
+ * Copyright 2024 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SKSL_MODULE)
+#define SKSL_MODULE
+
+#include "src/sksl/ir/SkSLProgramElement.h"
+#include "src/sksl/ir/SkSLSymbolTable.h"
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace SkSL {
+
+
+#define SKSL_MODULE_LIST(M)   \
+    M(sksl_shared)            \
+    M(sksl_compute)           \
+    M(sksl_frag)              \
+    M(sksl_gpu)               \
+    M(sksl_public)            \
+    M(sksl_rt_shader)         \
+    M(sksl_vert)              \
+    M(sksl_graphite_frag)     \
+    M(sksl_graphite_vert)
+
+enum class ModuleType : int8_t {
+    program = 0,
+    unknown = 1,
+#define M(type) type,
+    SKSL_MODULE_LIST(M)
+#undef M
+};
+
+struct Module {
+    const Module*                                fParent = nullptr;
+    std::unique_ptr<SymbolTable>                 fSymbols;
+    std::vector<std::unique_ptr<ProgramElement>> fElements;
+    ModuleType                                   fModuleType = ModuleType::unknown;
+};
+
+const char* ModuleTypeToString(ModuleType type);
+
+std::string GetModuleData(ModuleType type, const char* filename);
+
+}  
+
+#endif

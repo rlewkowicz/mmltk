@@ -1,0 +1,88 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef PreloadHashKey_h_
+#define PreloadHashKey_h_
+
+#include "mozilla/CORSMode.h"
+#include "js/loader/ScriptKind.h"
+#include "nsURIHashKey.h"
+
+class nsIPrincipal;
+
+namespace JS::loader {
+enum class ScriptKind : uint8_t;
+}
+
+namespace mozilla {
+
+enum class StyleOrigin : uint8_t;
+
+namespace css {
+class SheetLoadData;
+}
+
+class PreloadHashKey : public nsURIHashKey {
+ public:
+  enum class ResourceType : uint8_t { NONE, SCRIPT, STYLE, IMAGE, FONT, FETCH };
+
+  using KeyType = const PreloadHashKey&;
+  using KeyTypePointer = const PreloadHashKey*;
+
+  PreloadHashKey() = default;
+  PreloadHashKey(const nsIURI* aKey, ResourceType aAs);
+  explicit PreloadHashKey(const PreloadHashKey* aKey);
+  PreloadHashKey(PreloadHashKey&& aToMove);
+
+  PreloadHashKey& operator=(const PreloadHashKey& aOther);
+
+  static PreloadHashKey CreateAsScript(nsIURI* aURI, CORSMode aCORSMode,
+                                       JS::loader::ScriptKind aScriptKind);
+  static PreloadHashKey CreateAsScript(nsIURI* aURI,
+                                       const nsAString& aCrossOrigin,
+                                       const nsAString& aType);
+
+  static PreloadHashKey CreateAsStyle(nsIURI* aURI, nsIPrincipal* aPrincipal,
+                                      CORSMode aCORSMode);
+  static PreloadHashKey CreateAsStyle(css::SheetLoadData&);
+
+  static PreloadHashKey CreateAsImage(nsIURI* aURI, nsIPrincipal* aPrincipal,
+                                      CORSMode aCORSMode);
+
+  static PreloadHashKey CreateAsFetch(nsIURI* aURI, CORSMode aCORSMode);
+  static PreloadHashKey CreateAsFetch(nsIURI* aURI,
+                                      const nsAString& aCrossOrigin);
+
+  static PreloadHashKey CreateAsFont(nsIURI* aURI, CORSMode aCORSMode);
+
+  KeyType GetKey() const { return *this; }
+  KeyTypePointer GetKeyPointer() const { return this; }
+  static KeyTypePointer KeyToPointer(KeyType aKey) { return &aKey; }
+
+  bool KeyEquals(KeyTypePointer aOther) const;
+  static PLDHashNumber HashKey(KeyTypePointer aKey);
+  ResourceType As() const { return mAs; }
+
+#ifdef MOZILLA_INTERNAL_API
+  size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) const {
+    return 0;
+  }
+#endif
+
+  enum { ALLOW_MEMMOVE = true };
+
+ private:
+  ResourceType mAs = ResourceType::NONE;
+
+  CORSMode mCORSMode = CORS_NONE;
+  nsCOMPtr<nsIPrincipal> mPrincipal;
+
+  struct {
+    JS::loader::ScriptKind mScriptKind = JS::loader::ScriptKind::eClassic;
+  } mScript;
+};
+
+}  
+
+#endif

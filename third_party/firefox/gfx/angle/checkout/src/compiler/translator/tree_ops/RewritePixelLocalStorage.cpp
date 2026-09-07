@@ -1,0 +1,770 @@
+// Copyright 2022 The ANGLE Project Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include "compiler/translator/tree_ops/RewritePixelLocalStorage.h"
+
+#include "common/angleutils.h"
+#include "compiler/translator/StaticType.h"
+#include "compiler/translator/SymbolTable.h"
+#include "compiler/translator/tree_ops/MonomorphizeUnsupportedFunctions.h"
+#include "compiler/translator/tree_util/BuiltIn.h"
+#include "compiler/translator/tree_util/FindMain.h"
+#include "compiler/translator/tree_util/IntermNode_util.h"
+#include "compiler/translator/tree_util/IntermTraverse.h"
+
+namespace sh
+{
+namespace
+{
+constexpr static TBasicType DataTypeOfPLSType(TBasicType plsType)
+{
+    switch (plsType)
+    {
+        case EbtPixelLocalANGLE:
+            return EbtFloat;
+        case EbtIPixelLocalANGLE:
+            return EbtInt;
+        case EbtUPixelLocalANGLE:
+            return EbtUInt;
+        default:
+            UNREACHABLE();
+            return EbtVoid;
+    }
+}
+
+constexpr static TBasicType DataTypeOfImageType(TBasicType imageType)
+{
+    switch (imageType)
+    {
+        case EbtImage2D:
+            return EbtFloat;
+        case EbtIImage2D:
+            return EbtInt;
+        case EbtUImage2D:
+            return EbtUInt;
+        default:
+            UNREACHABLE();
+            return EbtVoid;
+    }
+}
+
+template <typename T>
+class PLSBackingStoreMap
+{
+  public:
+    void insertNew(TIntermSymbol *plsSymbol, const T &backingStore)
+    {
+        ASSERT(plsSymbol);
+        ASSERT(IsPixelLocal(plsSymbol->getBasicType()));
+        int binding = plsSymbol->getType().getLayoutQualifier().binding;
+        ASSERT(binding >= 0);
+        auto result = mMap.insert({binding, backingStore});
+        ASSERT(result.second);  
+    }
+
+    const T &find(TIntermSymbol *plsSymbol)
+    {
+        ASSERT(plsSymbol);
+        ASSERT(IsPixelLocal(plsSymbol->getBasicType()));
+        int binding = plsSymbol->getType().getLayoutQualifier().binding;
+        ASSERT(binding >= 0);
+        auto iter = mMap.find(binding);
+        ASSERT(iter != mMap.end());  
+        return iter->second;
+    }
+
+    const std::map<int, T> &bindingOrderedMap() const { return mMap; }
+
+  private:
+    std::map<int, T> mMap;
+};
+
+class RewritePLSTraverser : public TIntermTraverser
+{
+  public:
+    RewritePLSTraverser(TCompiler *compiler,
+                        TSymbolTable &symbolTable,
+                        const ShCompileOptions &compileOptions,
+                        int shaderVersion)
+        : TIntermTraverser(true, false, false, &symbolTable),
+          mCompiler(compiler),
+          mCompileOptions(&compileOptions),
+          mShaderVersion(shaderVersion)
+    {}
+
+    bool visitDeclaration(Visit, TIntermDeclaration *decl) override
+    {
+        TIntermTyped *declVariable = (decl->getSequence())->front()->getAsTyped();
+        ASSERT(declVariable);
+
+        if (!IsPixelLocal(declVariable->getBasicType()))
+        {
+            return true;
+        }
+
+        ASSERT(!declVariable->isArray());
+
+        ASSERT(declVariable->getQualifier() == EvqUniform);
+
+        TIntermSymbol *plsSymbol = declVariable->getAsSymbolNode();
+        ASSERT(plsSymbol);
+
+        visitPLSDeclaration(plsSymbol);
+
+        return false;
+    }
+
+    bool visitAggregate(Visit, TIntermAggregate *aggregate) override
+    {
+        if (!BuiltInGroup::IsPixelLocal(aggregate->getOp()))
+        {
+            return true;
+        }
+
+        const TIntermSequence &args = *aggregate->getSequence();
+        ASSERT(args.size() >= 1);
+        TIntermSymbol *plsSymbol = args[0]->getAsSymbolNode();
+
+        if (aggregate->getOp() == EOpPixelLocalLoadANGLE)
+        {
+            visitPLSLoad(plsSymbol);
+            return false;  
+        }
+
+        if (aggregate->getOp() == EOpPixelLocalStoreANGLE)
+        {
+            TType *valueType    = new TType(DataTypeOfPLSType(plsSymbol->getBasicType()),
+                                            plsSymbol->getPrecision(), EvqTemporary, 4);
+            TVariable *valueVar = CreateTempVariable(mSymbolTable, valueType);
+            TIntermDeclaration *valueDecl =
+                CreateTempInitDeclarationNode(valueVar, args[1]->getAsTyped());
+            valueDecl->traverse(this);  
+            insertStatementInParentBlock(valueDecl);
+
+            visitPLSStore(plsSymbol, valueVar);
+            return false;  
+        }
+
+        return true;
+    }
+
+    virtual void injectPrePLSCode(TCompiler *,
+                                  TSymbolTable &,
+                                  const ShCompileOptions &,
+                                  TIntermBlock *mainBody,
+                                  size_t plsBeginPosition)
+    {}
+
+    virtual void injectPostPLSCode(TCompiler *,
+                                   TSymbolTable &,
+                                   const ShCompileOptions &,
+                                   TIntermBlock *mainBody,
+                                   size_t plsEndPosition)
+    {}
+
+    void injectPixelCoordInitializationCodeIfNeeded(TCompiler *compiler,
+                                                    TIntermBlock *root,
+                                                    TIntermBlock *mainBody)
+    {
+        if (mGlobalPixelCoord)
+        {
+            TIntermTyped *exp;
+            exp = ReferenceBuiltInVariable(ImmutableString("gl_FragCoord"), *mSymbolTable,
+                                           mShaderVersion);
+            exp = CreateSwizzle(exp, 0, 1);
+            exp = CreateBuiltInFunctionCallNode("floor", {exp}, *mSymbolTable, mShaderVersion);
+            exp = TIntermAggregate::CreateConstructor(TType(EbtInt, 2), {exp});
+            exp = CreateTempAssignmentNode(mGlobalPixelCoord, exp);
+            mainBody->insertStatement(0, exp);
+        }
+    }
+
+  protected:
+    virtual void visitPLSDeclaration(TIntermSymbol *plsSymbol)             = 0;
+    virtual void visitPLSLoad(TIntermSymbol *plsSymbol)                    = 0;
+    virtual void visitPLSStore(TIntermSymbol *plsSymbol, TVariable *value) = 0;
+
+    void ensureGlobalPixelCoordDeclared()
+    {
+        if (!mGlobalPixelCoord)
+        {
+            TType *coordType  = new TType(EbtInt, EbpHigh, EvqGlobal, 2);
+            mGlobalPixelCoord = CreateTempVariable(mSymbolTable, coordType);
+            insertStatementInParentBlock(CreateTempDeclarationNode(mGlobalPixelCoord));
+        }
+    }
+
+    void clampPLSVarIfNeeded(TVariable *plsVar, TLayoutImageInternalFormat plsFormat)
+    {
+        switch (plsFormat)
+        {
+            case EiifRGBA8I:
+            {
+                TIntermTyped *newPLSValue = CreateBuiltInFunctionCallNode(
+                    "clamp",
+                    {new TIntermSymbol(plsVar), CreateIndexNode(-128), CreateIndexNode(127)},
+                    *mSymbolTable, mShaderVersion);
+                insertStatementInParentBlock(CreateTempAssignmentNode(plsVar, newPLSValue));
+                break;
+            }
+            case EiifRGBA8UI:
+            {
+                TIntermTyped *newPLSValue = CreateBuiltInFunctionCallNode(
+                    "min", {new TIntermSymbol(plsVar), CreateUIntNode(255)}, *mSymbolTable,
+                    mShaderVersion);
+                insertStatementInParentBlock(CreateTempAssignmentNode(plsVar, newPLSValue));
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+    static TIntermTyped *Expand(TIntermTyped *expr)
+    {
+        const TType &type = expr->getType();
+        ASSERT(type.getNominalSize() == 1 || type.getNominalSize() == 4);
+        if (type.getNominalSize() == 1)
+        {
+            switch (type.getBasicType())
+            {
+                case EbtFloat:
+                    expr = TIntermAggregate::CreateConstructor(  
+                        TType(EbtFloat, 4),
+                        {expr, CreateFloatNode(0, EbpLow), CreateFloatNode(0, EbpLow),
+                         CreateFloatNode(1, EbpLow)});
+                    break;
+                case EbtInt:
+                    expr = TIntermAggregate::CreateConstructor(  
+                        TType(EbtInt, 4),
+                        {expr, CreateIndexNode(0), CreateIndexNode(0), CreateIndexNode(1)});
+                    break;
+                case EbtUInt:
+                    expr = TIntermAggregate::CreateConstructor(  
+                        TType(EbtUInt, 4),
+                        {expr, CreateUIntNode(0), CreateUIntNode(0), CreateUIntNode(1)});
+                    break;
+                default:
+                    UNREACHABLE();
+                    break;
+            }
+        }
+        return expr;
+    }
+
+    static TIntermTyped *Expand(TVariable *var) { return Expand(new TIntermSymbol(var)); }
+
+    static TIntermTyped *Swizzle(TVariable *var, int n)
+    {
+        TIntermTyped *swizzled = new TIntermSymbol(var);
+        if (var->getType().getNominalSize() != n)
+        {
+            ASSERT(var->getType().getNominalSize() > n);
+            TVector<uint32_t> swizzleOffsets{0, 1, 2, 3};
+            swizzleOffsets.resize(n);
+            swizzled = new TIntermSwizzle(swizzled, swizzleOffsets);
+        }
+        return swizzled;
+    }
+
+    const TCompiler *const mCompiler;
+    const ShCompileOptions *const mCompileOptions;
+    const int mShaderVersion;
+
+    TVariable *mGlobalPixelCoord = nullptr;
+};
+
+class RewritePLSToImagesTraverser : public RewritePLSTraverser
+{
+  public:
+    RewritePLSToImagesTraverser(TCompiler *compiler,
+                                TSymbolTable &symbolTable,
+                                const ShCompileOptions &compileOptions,
+                                int shaderVersion)
+        : RewritePLSTraverser(compiler, symbolTable, compileOptions, shaderVersion)
+    {}
+
+  private:
+    void visitPLSDeclaration(TIntermSymbol *plsSymbol) override
+    {
+        ensureGlobalPixelCoordDeclared();
+        TVariable *image2D = createPLSImageReplacement(plsSymbol);
+        mImages.insertNew(plsSymbol, image2D);
+        queueReplacement(new TIntermDeclaration({new TIntermSymbol(image2D)}),
+                         OriginalNode::IS_DROPPED);
+    }
+
+    TVariable *createPLSImageReplacement(const TIntermSymbol *plsSymbol)
+    {
+        ASSERT(plsSymbol);
+        ASSERT(IsPixelLocal(plsSymbol->getBasicType()));
+
+        TType *imageType = new TType(plsSymbol->getType());
+
+        TLayoutQualifier imageLayoutQualifier = imageType->getLayoutQualifier();
+        switch (imageLayoutQualifier.imageInternalFormat)
+        {
+            case TLayoutImageInternalFormat::EiifRGBA8:
+                if (!mCompileOptions->pls.supportsNativeRGBA8ImageFormats)
+                {
+                    imageLayoutQualifier.imageInternalFormat = EiifR32UI;
+                    imageType->setPrecision(EbpHigh);
+                    imageType->setBasicType(EbtUImage2D);
+                }
+                else
+                {
+                    imageType->setBasicType(EbtImage2D);
+                }
+                break;
+            case TLayoutImageInternalFormat::EiifRGBA8I:
+                if (!mCompileOptions->pls.supportsNativeRGBA8ImageFormats)
+                {
+                    imageLayoutQualifier.imageInternalFormat = EiifR32I;
+                    imageType->setPrecision(EbpHigh);
+                }
+                imageType->setBasicType(EbtIImage2D);
+                break;
+            case TLayoutImageInternalFormat::EiifRGBA8UI:
+                if (!mCompileOptions->pls.supportsNativeRGBA8ImageFormats)
+                {
+                    imageLayoutQualifier.imageInternalFormat = EiifR32UI;
+                    imageType->setPrecision(EbpHigh);
+                }
+                imageType->setBasicType(EbtUImage2D);
+                break;
+            case TLayoutImageInternalFormat::EiifR32F:
+                imageType->setBasicType(EbtImage2D);
+                break;
+            case TLayoutImageInternalFormat::EiifR32I:
+                imageType->setBasicType(EbtIImage2D);
+                break;
+            case TLayoutImageInternalFormat::EiifR32UI:
+                imageType->setBasicType(EbtUImage2D);
+                break;
+            default:
+                UNREACHABLE();
+        }
+        ASSERT(mCompileOptions->pls.fragmentSyncType !=
+                   ShFragmentSynchronizationType::NotSupported ||
+               mCompileOptions->pls.supportsNoncoherent);
+        const bool wantsNoncoherent = mCompileOptions->pls.supportsNoncoherent &&
+                                      plsSymbol->getType().getLayoutQualifier().noncoherent;
+        imageLayoutQualifier.noncoherent   = false;
+        imageLayoutQualifier.rasterOrdered = false;
+        if (!wantsNoncoherent)
+        {
+            mAllPLSVarsNoncoherent = false;
+        }
+        imageType->setLayoutQualifier(imageLayoutQualifier);
+
+        TMemoryQualifier memoryQualifier{};
+        memoryQualifier.coherent          = true;
+        memoryQualifier.restrictQualifier = true;
+        memoryQualifier.volatileQualifier = false;
+        memoryQualifier.readonly  = false;
+        memoryQualifier.writeonly = false;
+        imageType->setMemoryQualifier(memoryQualifier);
+
+        const TVariable &plsVar = plsSymbol->variable();
+        return new TVariable(plsVar.uniqueId(), plsVar.name(), plsVar.symbolType(),
+                             plsVar.extensions(), imageType);
+    }
+
+    void visitPLSLoad(TIntermSymbol *plsSymbol) override
+    {
+        TVariable *image2D = mImages.find(plsSymbol);
+        ASSERT(mGlobalPixelCoord);
+        TIntermTyped *pls = CreateBuiltInFunctionCallNode(
+            "imageLoad", {new TIntermSymbol(image2D), new TIntermSymbol(mGlobalPixelCoord)},
+            *mSymbolTable, 310);
+        pls = unpackImageDataIfNecessary(pls, plsSymbol, image2D);
+        queueReplacement(pls, OriginalNode::IS_DROPPED);
+    }
+
+    TIntermTyped *unpackImageDataIfNecessary(TIntermTyped *data,
+                                             TIntermSymbol *plsSymbol,
+                                             TVariable *image2D)
+    {
+        TLayoutImageInternalFormat plsFormat =
+            plsSymbol->getType().getLayoutQualifier().imageInternalFormat;
+        TLayoutImageInternalFormat imageFormat =
+            image2D->getType().getLayoutQualifier().imageInternalFormat;
+        if (plsFormat == imageFormat)
+        {
+            return data;  
+        }
+        switch (plsFormat)
+        {
+            case EiifRGBA8:
+                ASSERT(!mCompileOptions->pls.supportsNativeRGBA8ImageFormats);
+                data = CreateBuiltInFunctionCallNode("unpackUnorm4x8", {CreateSwizzle(data, 0)},
+                                                     *mSymbolTable, 310);
+                break;
+            case EiifRGBA8I:
+            case EiifRGBA8UI:
+            {
+                ASSERT(!mCompileOptions->pls.supportsNativeRGBA8ImageFormats);
+                constexpr unsigned shifts[] = {24, 16, 8, 0};
+                data = CreateSwizzle(data, 0, 0, 0, 0);
+                data = new TIntermBinary(EOpBitShiftLeft, data, CreateUVecNode(shifts, 4, EbpLow));
+                data = new TIntermBinary(EOpBitShiftRight, data, CreateUIntNode(24));
+                break;
+            }
+            default:
+                UNREACHABLE();
+        }
+        return data;
+    }
+
+    void visitPLSStore(TIntermSymbol *plsSymbol, TVariable *value) override
+    {
+        TVariable *image2D       = mImages.find(plsSymbol);
+        TIntermTyped *packedData = clampAndPackPLSDataIfNecessary(value, plsSymbol, image2D);
+
+        insertStatementsInParentBlock(
+            {CreateBuiltInFunctionCallNode("memoryBarrierImage", {}, *mSymbolTable,
+                                           310)},  
+            {CreateBuiltInFunctionCallNode("memoryBarrierImage", {}, *mSymbolTable,
+                                           310)});  
+
+        ASSERT(mGlobalPixelCoord);
+        queueReplacement(
+            CreateBuiltInFunctionCallNode(
+                "imageStore",
+                {new TIntermSymbol(image2D), new TIntermSymbol(mGlobalPixelCoord), packedData},
+                *mSymbolTable, 310),
+            OriginalNode::IS_DROPPED);
+    }
+
+    TIntermTyped *clampAndPackPLSDataIfNecessary(TVariable *plsVar,
+                                                 TIntermSymbol *plsSymbol,
+                                                 TVariable *image2D)
+    {
+        TLayoutImageInternalFormat plsFormat =
+            plsSymbol->getType().getLayoutQualifier().imageInternalFormat;
+        clampPLSVarIfNeeded(plsVar, plsFormat);
+        TIntermTyped *result = new TIntermSymbol(plsVar);
+        TLayoutImageInternalFormat imageFormat =
+            image2D->getType().getLayoutQualifier().imageInternalFormat;
+        if (plsFormat == imageFormat)
+        {
+            return result;  
+        }
+        switch (plsFormat)
+        {
+            case EiifRGBA8:
+            {
+                ASSERT(!mCompileOptions->pls.supportsNativeRGBA8ImageFormats);
+                if (mCompileOptions->passHighpToPackUnormSnormBuiltins)
+                {
+                    TType *highpType              = new TType(EbtFloat, EbpHigh, EvqTemporary, 4);
+                    TVariable *workaroundHighpVar = CreateTempVariable(mSymbolTable, highpType);
+                    insertStatementInParentBlock(
+                        CreateTempInitDeclarationNode(workaroundHighpVar, result));
+                    result = new TIntermSymbol(workaroundHighpVar);
+                }
+
+                result =
+                    CreateBuiltInFunctionCallNode("packUnorm4x8", {result}, *mSymbolTable, 310);
+                break;
+            }
+            case EiifRGBA8I:
+            case EiifRGBA8UI:
+            {
+                ASSERT(!mCompileOptions->pls.supportsNativeRGBA8ImageFormats);
+                if (plsFormat == EiifRGBA8I)
+                {
+                    insertStatementInParentBlock(new TIntermBinary(
+                        EOpBitwiseAndAssign, new TIntermSymbol(plsVar), CreateIndexNode(0xff)));
+                }
+                auto shiftComponent = [=](int componentIdx) {
+                    return new TIntermBinary(EOpBitShiftLeft,
+                                             CreateSwizzle(new TIntermSymbol(plsVar), componentIdx),
+                                             CreateUIntNode(componentIdx * 8));
+                };
+                result = CreateSwizzle(result, 0);
+                result = new TIntermBinary(EOpBitwiseOr, result, shiftComponent(1));
+                result = new TIntermBinary(EOpBitwiseOr, result, shiftComponent(2));
+                result = new TIntermBinary(EOpBitwiseOr, result, shiftComponent(3));
+                break;
+            }
+            default:
+                UNREACHABLE();
+        }
+        TType imageStoreType(DataTypeOfImageType(image2D->getType().getBasicType()), 4);
+        return TIntermAggregate::CreateConstructor(imageStoreType, {result});
+    }
+
+    void injectPrePLSCode(TCompiler *compiler,
+                          TSymbolTable &symbolTable,
+                          const ShCompileOptions &compileOptions,
+                          TIntermBlock *mainBody,
+                          size_t plsBeginPosition) override
+    {
+        compiler->specifyEarlyFragmentTests();
+
+        if (!mAllPLSVarsNoncoherent)
+        {
+            switch (compileOptions.pls.fragmentSyncType)
+            {
+                case ShFragmentSynchronizationType::NotSupported:
+                    break;
+                case ShFragmentSynchronizationType::FragmentShaderInterlock_NV_GL:
+                    mainBody->insertStatement(
+                        plsBeginPosition,
+                        CreateBuiltInFunctionCallNode("beginInvocationInterlockNV", {}, symbolTable,
+                                                      kESSLInternalBackendBuiltIns));
+                    break;
+                case ShFragmentSynchronizationType::FragmentShaderOrdering_INTEL_GL:
+                    mainBody->insertStatement(
+                        plsBeginPosition,
+                        CreateBuiltInFunctionCallNode("beginFragmentShaderOrderingINTEL", {},
+                                                      symbolTable, kESSLInternalBackendBuiltIns));
+                    break;
+                case ShFragmentSynchronizationType::FragmentShaderInterlock_ARB_GL:
+                    mainBody->insertStatement(
+                        plsBeginPosition,
+                        CreateBuiltInFunctionCallNode("beginInvocationInterlockARB", {},
+                                                      symbolTable, kESSLInternalBackendBuiltIns));
+                    break;
+                default:
+                    UNREACHABLE();
+            }
+        }
+    }
+
+    void injectPostPLSCode(TCompiler *,
+                           TSymbolTable &symbolTable,
+                           const ShCompileOptions &compileOptions,
+                           TIntermBlock *mainBody,
+                           size_t plsEndPosition) override
+    {
+        if (!mAllPLSVarsNoncoherent)
+        {
+            switch (compileOptions.pls.fragmentSyncType)
+            {
+                case ShFragmentSynchronizationType::FragmentShaderOrdering_INTEL_GL:
+                case ShFragmentSynchronizationType::NotSupported:
+                    break;
+                case ShFragmentSynchronizationType::FragmentShaderInterlock_NV_GL:
+
+                    mainBody->insertStatement(
+                        plsEndPosition,
+                        CreateBuiltInFunctionCallNode("endInvocationInterlockNV", {}, symbolTable,
+                                                      kESSLInternalBackendBuiltIns));
+                    break;
+                case ShFragmentSynchronizationType::FragmentShaderInterlock_ARB_GL:
+                    mainBody->insertStatement(
+                        plsEndPosition,
+                        CreateBuiltInFunctionCallNode("endInvocationInterlockARB", {}, symbolTable,
+                                                      kESSLInternalBackendBuiltIns));
+                    break;
+                default:
+                    UNREACHABLE();
+            }
+        }
+    }
+
+    PLSBackingStoreMap<TVariable *> mImages;
+    bool mAllPLSVarsNoncoherent = true;
+};
+
+class RewritePLSToFramebufferFetchTraverser : public RewritePLSTraverser
+{
+  public:
+    RewritePLSToFramebufferFetchTraverser(TCompiler *compiler,
+                                          TSymbolTable &symbolTable,
+                                          const ShCompileOptions &compileOptions,
+                                          int shaderVersion)
+        : RewritePLSTraverser(compiler, symbolTable, compileOptions, shaderVersion)
+    {}
+
+    void visitPLSDeclaration(TIntermSymbol *plsSymbol) override
+    {
+        PLSAttachment attachment(mCompiler, mSymbolTable, *mCompileOptions, plsSymbol->variable());
+        mPLSAttachments.insertNew(plsSymbol, attachment);
+        insertStatementInParentBlock(
+            new TIntermDeclaration({new TIntermSymbol(attachment.fragmentVar)}));
+        queueReplacement(CreateTempDeclarationNode(attachment.accessVar), OriginalNode::IS_DROPPED);
+    }
+
+    void visitPLSLoad(TIntermSymbol *plsSymbol) override
+    {
+        const PLSAttachment &attachment = mPLSAttachments.find(plsSymbol);
+        queueReplacement(Expand(attachment.accessVar), OriginalNode::IS_DROPPED);
+    }
+
+    void visitPLSStore(TIntermSymbol *plsSymbol, TVariable *value) override
+    {
+        const PLSAttachment &attachment = mPLSAttachments.find(plsSymbol);
+        queueReplacement(CreateTempAssignmentNode(attachment.accessVar, attachment.swizzle(value)),
+                         OriginalNode::IS_DROPPED);
+    }
+
+    void injectPrePLSCode(TCompiler *compiler,
+                          TSymbolTable &symbolTable,
+                          const ShCompileOptions &compileOptions,
+                          TIntermBlock *mainBody,
+                          size_t plsBeginPosition) override
+    {
+        TIntermSequence plsPreloads;
+        plsPreloads.reserve(mPLSAttachments.bindingOrderedMap().size());
+        for (const auto &entry : mPLSAttachments.bindingOrderedMap())
+        {
+            const PLSAttachment &attachment = entry.second;
+            plsPreloads.push_back(
+                CreateTempAssignmentNode(attachment.accessVar, attachment.swizzleFragmentVar()));
+        }
+        mainBody->getSequence()->insert(mainBody->getSequence()->begin() + plsBeginPosition,
+                                        plsPreloads.begin(), plsPreloads.end());
+    }
+
+    void injectPostPLSCode(TCompiler *,
+                           TSymbolTable &symbolTable,
+                           const ShCompileOptions &compileOptions,
+                           TIntermBlock *mainBody,
+                           size_t plsEndPosition) override
+    {
+        TIntermSequence plsWrites;
+        plsWrites.reserve(mPLSAttachments.bindingOrderedMap().size());
+        for (const auto &entry : mPLSAttachments.bindingOrderedMap())
+        {
+            const PLSAttachment &attachment = entry.second;
+            plsWrites.push_back(new TIntermBinary(EOpAssign, attachment.swizzleFragmentVar(),
+                                                  new TIntermSymbol(attachment.accessVar)));
+        }
+        mainBody->getSequence()->insert(mainBody->getSequence()->begin() + plsEndPosition,
+                                        plsWrites.begin(), plsWrites.end());
+    }
+
+  private:
+    struct PLSAttachment
+    {
+        PLSAttachment(const TCompiler *compiler,
+                      TSymbolTable *symbolTable,
+                      const ShCompileOptions &compileOptions,
+                      const TVariable &plsVar)
+        {
+            const TType &plsType = plsVar.getType();
+
+            TType *accessVarType;
+            switch (plsType.getLayoutQualifier().imageInternalFormat)
+            {
+                default:
+                    UNREACHABLE();
+                    [[fallthrough]];
+                case EiifRGBA8:
+                    accessVarType = new TType(EbtFloat, 4);
+                    break;
+                case EiifRGBA8I:
+                    accessVarType = new TType(EbtInt, 4);
+                    break;
+                case EiifRGBA8UI:
+                    accessVarType = new TType(EbtUInt, 4);
+                    break;
+                case EiifR32F:
+                    accessVarType = new TType(EbtFloat, 1);
+                    break;
+                case EiifR32I:
+                    accessVarType = new TType(EbtInt, 1);
+                    break;
+                case EiifR32UI:
+                    accessVarType = new TType(EbtUInt, 1);
+                    break;
+            }
+            accessVarType->setPrecision(plsType.getPrecision());
+            accessVar = CreateTempVariable(symbolTable, accessVarType);
+
+            TType *fragmentVarType = new TType(accessVarType->getBasicType(), 4);
+            fragmentVarType->setPrecision(plsType.getPrecision());
+            fragmentVarType->setQualifier(EvqFragmentInOut);
+
+            TLayoutQualifier layoutQualifier = TLayoutQualifier::Create();
+            layoutQualifier.location =
+                compiler->getResources().MaxCombinedDrawBuffersAndPixelLocalStoragePlanes -
+                plsType.getLayoutQualifier().binding - 1;
+            layoutQualifier.locationsSpecified = 1;
+            ASSERT(compileOptions.pls.fragmentSyncType !=
+                       ShFragmentSynchronizationType::NotSupported ||
+                   compileOptions.pls.supportsNoncoherent);
+            if (compileOptions.pls.supportsNoncoherent)
+            {
+                layoutQualifier.noncoherent = plsType.getLayoutQualifier().noncoherent ||
+                                              compileOptions.pls.fragmentSyncType ==
+                                                  ShFragmentSynchronizationType::NotSupported;
+            }
+            fragmentVarType->setLayoutQualifier(layoutQualifier);
+
+            fragmentVar = new TVariable(plsVar.uniqueId(), plsVar.name(), plsVar.symbolType(),
+                                        plsVar.extensions(), fragmentVarType);
+        }
+
+        TIntermTyped *swizzle(TVariable *var) const
+        {
+            return Swizzle(var, accessVar->getType().getNominalSize());
+        }
+
+        TIntermTyped *swizzleFragmentVar() const { return swizzle(fragmentVar); }
+
+        TVariable *fragmentVar;
+        TVariable *accessVar;
+    };
+
+    PLSBackingStoreMap<PLSAttachment> mPLSAttachments;
+};
+
+}  
+
+bool RewritePixelLocalStorage(TCompiler *compiler,
+                              TIntermBlock *root,
+                              TSymbolTable &symbolTable,
+                              const ShCompileOptions &compileOptions,
+                              int shaderVersion)
+{
+    if (!MonomorphizeUnsupportedFunctions(
+            compiler, root, &symbolTable,
+            UnsupportedFunctionArgsBitSet{UnsupportedFunctionArgs::PixelLocalStorage}))
+    {
+        return false;
+    }
+
+    TIntermBlock *mainBody = FindMainBody(root);
+
+    std::unique_ptr<RewritePLSTraverser> traverser;
+    switch (compileOptions.pls.type)
+    {
+        case ShPixelLocalStorageType::ImageLoadStore:
+            traverser = std::make_unique<RewritePLSToImagesTraverser>(
+                compiler, symbolTable, compileOptions, shaderVersion);
+            break;
+        case ShPixelLocalStorageType::FramebufferFetch:
+            traverser = std::make_unique<RewritePLSToFramebufferFetchTraverser>(
+                compiler, symbolTable, compileOptions, shaderVersion);
+            break;
+        case ShPixelLocalStorageType::NotSupported:
+            UNREACHABLE();
+            return false;
+    }
+
+    root->traverse(traverser.get());
+    if (!traverser->updateTree(compiler, root))
+    {
+        return false;
+    }
+
+    const size_t plsBeginPos = 0;
+    traverser->injectPrePLSCode(compiler, symbolTable, compileOptions, mainBody, plsBeginPos);
+
+    size_t plsEndPos = mainBody->getChildCount();
+    if (plsEndPos > 0 && mainBody->getChildNode(plsEndPos - 1)->getAsBranchNode() != nullptr)
+    {
+        --plsEndPos;
+    }
+    traverser->injectPostPLSCode(compiler, symbolTable, compileOptions, mainBody, plsEndPos);
+
+    traverser->injectPixelCoordInitializationCodeIfNeeded(compiler, root, mainBody);
+
+    return compiler->validateAST(root);
+}
+}  

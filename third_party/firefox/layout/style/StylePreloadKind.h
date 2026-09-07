@@ -1,0 +1,41 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_css_StylePreloadKind_h
+#define mozilla_css_StylePreloadKind_h
+
+#include <stdint.h>
+
+namespace mozilla::css {
+
+enum class StylePreloadKind : uint8_t {
+  None,
+  FromParser,
+  FromLinkRelPreloadElement,
+  FromLinkRelPreloadHeader,
+  FromEarlyHintsHeader,
+};
+
+inline bool IsLinkRelPreloadOrEarlyHint(StylePreloadKind aKind) {
+  return aKind == StylePreloadKind::FromLinkRelPreloadElement ||
+         aKind == StylePreloadKind::FromLinkRelPreloadHeader ||
+         aKind == StylePreloadKind::FromEarlyHintsHeader;
+}
+
+inline bool ShouldAssumeStandardsMode(StylePreloadKind aKind) {
+  switch (aKind) {
+    case StylePreloadKind::FromLinkRelPreloadHeader:
+    case StylePreloadKind::FromEarlyHintsHeader:
+      return true;
+    case StylePreloadKind::None:
+    case StylePreloadKind::FromParser:
+    case StylePreloadKind::FromLinkRelPreloadElement:
+      break;
+  }
+  return false;
+}
+
+}  
+
+#endif  // mozilla_css_StylePreloadKind_h

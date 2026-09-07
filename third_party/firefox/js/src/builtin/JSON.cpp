@@ -1,0 +1,1801 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "builtin/JSON.h"
+
+#include "mozilla/CheckedInt.h"
+#include "mozilla/Range.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/Variant.h"
+
+#include <algorithm>
+
+#include "jstypes.h"
+
+#include "builtin/Array.h"
+#include "builtin/BigInt.h"
+#include "builtin/Number.h"
+#include "builtin/ParseRecordObject.h"
+#include "builtin/RawJSONObject.h"
+#include "js/friend/ErrorMessages.h"  // js::GetErrorMessage, JSMSG_*
+#include "js/friend/StackLimits.h"    // js::AutoCheckRecursionLimit
+#include "js/Object.h"                // JS::GetBuiltinClass
+#include "js/Prefs.h"                 // JS::Prefs
+#include "js/ProfilingCategory.h"
+#include "js/PropertySpec.h"
+#include "js/StableStringChars.h"
+#include "js/TypeDecls.h"
+#include "js/Value.h"
+#include "util/StringBuilder.h"
+#include "vm/BooleanObject.h"       // js::BooleanObject
+#include "vm/EqualityOperations.h"  // js::SameValue
+#include "vm/Interpreter.h"
+#include "vm/Iteration.h"
+#include "vm/JSAtomUtils.h"  // ToAtom
+#include "vm/JSContext.h"
+#include "vm/JSObject.h"
+#include "vm/JSONParser.h"
+#include "vm/NativeObject.h"
+#include "vm/NumberObject.h"  // js::NumberObject
+#include "vm/PlainObject.h"   // js::PlainObject
+#include "vm/StringObject.h"  // js::StringObject
+
+#include "builtin/Array-inl.h"
+#include "vm/GeckoProfiler-inl.h"
+#include "vm/JSAtomUtils-inl.h"  // AtomToId, PrimitiveValueToId, IndexToId, IdToString,
+#include "vm/NativeObject-inl.h"
+
+using namespace js;
+
+using mozilla::AsVariant;
+using mozilla::CheckedInt;
+using mozilla::Maybe;
+using mozilla::RangedPtr;
+using mozilla::Variant;
+
+using JS::AutoStableStringChars;
+
+template <typename SrcCharT, typename DstCharT>
+static MOZ_ALWAYS_INLINE RangedPtr<DstCharT> InfallibleQuoteJSONString(
+    RangedPtr<const SrcCharT> srcBegin, RangedPtr<const SrcCharT> srcEnd,
+    RangedPtr<DstCharT> dstPtr) {
+  static const Latin1Char escapeLookup[256] = {
+      // clang-format off
+        'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'b', 't',
+        'n', 'u', 'f', 'r', 'u', 'u', 'u', 'u', 'u', 'u',
+        'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u',
+        'u', 'u', 0,   0,  '\"', 0,   0,   0,   0,   0,
+        0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+        0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+        0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+        0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+        0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+        0,   0,  '\\', 
+      // clang-format on
+  };
+
+  *dstPtr++ = '"';
+
+  auto ToLowerHex = [](uint8_t u) {
+    MOZ_ASSERT(u <= 0xF);
+    return "0123456789abcdef"[u];
+  };
+
+  while (srcBegin != srcEnd) {
+    const SrcCharT c = *srcBegin++;
+
+    if (MOZ_LIKELY(c < sizeof(escapeLookup))) {
+      Latin1Char escaped = escapeLookup[c];
+
+      if (escaped == 0) {
+        *dstPtr++ = c;
+        continue;
+      }
+
+      *dstPtr++ = '\\';
+      *dstPtr++ = escaped;
+      if (escaped == 'u') {
+        *dstPtr++ = '0';
+        *dstPtr++ = '0';
+
+        uint8_t x = c >> 4;
+        MOZ_ASSERT(x < 10);
+        *dstPtr++ = '0' + x;
+
+        *dstPtr++ = ToLowerHex(c & 0xF);
+      }
+
+      continue;
+    }
+
+    if (!unicode::IsSurrogate(c)) {
+      *dstPtr++ = c;
+      continue;
+    }
+
+    if (MOZ_LIKELY(unicode::IsLeadSurrogate(c) && srcBegin < srcEnd &&
+                   unicode::IsTrailSurrogate(*srcBegin))) {
+      *dstPtr++ = c;
+      *dstPtr++ = *srcBegin++;
+      continue;
+    }
+
+    char32_t as32 = char32_t(c);
+    *dstPtr++ = '\\';
+    *dstPtr++ = 'u';
+    *dstPtr++ = ToLowerHex(as32 >> 12);
+    *dstPtr++ = ToLowerHex((as32 >> 8) & 0xF);
+    *dstPtr++ = ToLowerHex((as32 >> 4) & 0xF);
+    *dstPtr++ = ToLowerHex(as32 & 0xF);
+  }
+
+  *dstPtr++ = '"';
+  return dstPtr;
+}
+
+template <typename SrcCharT, typename DstCharT>
+static size_t QuoteJSONStringHelper(const JSLinearString& linear,
+                                    StringBuilder& sb, size_t sbOffset) {
+  size_t len = linear.length();
+
+  JS::AutoCheckCannotGC nogc;
+  RangedPtr<const SrcCharT> srcBegin{linear.chars<SrcCharT>(nogc), len};
+  RangedPtr<DstCharT> dstBegin{sb.begin<DstCharT>(), sb.begin<DstCharT>(),
+                               sb.end<DstCharT>()};
+  RangedPtr<DstCharT> dstEnd =
+      InfallibleQuoteJSONString(srcBegin, srcBegin + len, dstBegin + sbOffset);
+
+  return dstEnd - dstBegin;
+}
+
+static bool QuoteJSONString(JSContext* cx, StringBuilder& sb, JSString* str) {
+  JSLinearString* linear = str->ensureLinear(cx);
+  if (!linear) {
+    return false;
+  }
+
+  if (linear->hasTwoByteChars() && !sb.ensureTwoByteChars()) {
+    return false;
+  }
+
+
+  size_t len = linear->length();
+  size_t sbInitialLen = sb.length();
+
+  CheckedInt<size_t> reservedLen = CheckedInt<size_t>(len) * 6 + 2;
+  if (MOZ_UNLIKELY(!reservedLen.isValid())) {
+    ReportAllocationOverflow(cx);
+    return false;
+  }
+
+  if (!sb.growByUninitialized(reservedLen.value())) {
+    return false;
+  }
+
+  size_t newSize;
+
+  if (linear->hasTwoByteChars()) {
+    newSize =
+        QuoteJSONStringHelper<char16_t, char16_t>(*linear, sb, sbInitialLen);
+  } else if (sb.isUnderlyingBufferLatin1()) {
+    newSize = QuoteJSONStringHelper<Latin1Char, Latin1Char>(*linear, sb,
+                                                            sbInitialLen);
+  } else {
+    newSize =
+        QuoteJSONStringHelper<Latin1Char, char16_t>(*linear, sb, sbInitialLen);
+  }
+
+  sb.shrinkTo(newSize);
+
+  return true;
+}
+
+namespace {
+
+using ObjectVector = GCVector<JSObject*, 8>;
+
+class StringifyContext {
+ public:
+  StringifyContext(JSContext* cx, StringBuilder& sb, const StringBuilder& gap,
+                   HandleObject replacer, const RootedIdVector& propertyList,
+                   bool maybeSafely)
+      : sb(sb),
+        gap(gap),
+        replacer(cx, replacer),
+        stack(cx, ObjectVector(cx)),
+        propertyList(propertyList),
+        depth(0),
+        maybeSafely(maybeSafely) {
+    MOZ_ASSERT_IF(maybeSafely, !replacer);
+    MOZ_ASSERT_IF(maybeSafely, gap.empty());
+  }
+
+  StringBuilder& sb;
+  const StringBuilder& gap;
+  RootedObject replacer;
+  Rooted<ObjectVector> stack;
+  const RootedIdVector& propertyList;
+  uint32_t depth;
+  bool maybeSafely;
+};
+
+} 
+
+static bool SerializeJSONProperty(JSContext* cx, const Value& v,
+                                  StringifyContext* scx);
+
+static bool WriteIndent(StringifyContext* scx, uint32_t limit) {
+  if (!scx->gap.empty()) {
+    if (!scx->sb.append('\n')) {
+      return false;
+    }
+
+    if (scx->gap.isUnderlyingBufferLatin1()) {
+      for (uint32_t i = 0; i < limit; i++) {
+        if (!scx->sb.append(scx->gap.rawLatin1Begin(),
+                            scx->gap.rawLatin1End())) {
+          return false;
+        }
+      }
+    } else {
+      for (uint32_t i = 0; i < limit; i++) {
+        if (!scx->sb.append(scx->gap.rawTwoByteBegin(),
+                            scx->gap.rawTwoByteEnd())) {
+          return false;
+        }
+      }
+    }
+  }
+
+  return true;
+}
+
+namespace {
+
+template <typename KeyType>
+class KeyStringifier {};
+
+template <>
+class KeyStringifier<uint32_t> {
+ public:
+  static JSString* toString(JSContext* cx, uint32_t index) {
+    return IndexToString(cx, index);
+  }
+};
+
+template <>
+class KeyStringifier<HandleId> {
+ public:
+  static JSString* toString(JSContext* cx, HandleId id) {
+    return IdToString(cx, id);
+  }
+};
+
+} 
+
+template <typename KeyType>
+static bool PreprocessValue(JSContext* cx, HandleObject holder, KeyType key,
+                            MutableHandleValue vp, StringifyContext* scx) {
+  if (scx->maybeSafely) {
+    return true;
+  }
+
+  RootedString keyStr(cx);
+
+  if (vp.isObject() || vp.isBigInt()) {
+    RootedValue toJSON(cx);
+    RootedObject obj(cx, JS::ToObject(cx, vp));
+    if (!obj) {
+      return false;
+    }
+
+    if (!GetProperty(cx, obj, vp, cx->names().toJSON, &toJSON)) {
+      return false;
+    }
+
+    if (IsCallable(toJSON)) {
+      keyStr = KeyStringifier<KeyType>::toString(cx, key);
+      if (!keyStr) {
+        return false;
+      }
+
+      RootedValue arg0(cx, StringValue(keyStr));
+      if (!js::Call(cx, toJSON, vp, arg0, vp)) {
+        return false;
+      }
+    }
+  }
+
+  if (scx->replacer && scx->replacer->isCallable()) {
+    MOZ_ASSERT(holder != nullptr,
+               "holder object must be present when replacer is callable");
+
+    if (!keyStr) {
+      keyStr = KeyStringifier<KeyType>::toString(cx, key);
+      if (!keyStr) {
+        return false;
+      }
+    }
+
+    RootedValue arg0(cx, StringValue(keyStr));
+    RootedValue replacerVal(cx, ObjectValue(*scx->replacer));
+    if (!js::Call(cx, replacerVal, holder, arg0, vp, vp)) {
+      return false;
+    }
+  }
+
+  if (vp.get().isObject()) {
+    RootedObject obj(cx, &vp.get().toObject());
+
+    ESClass cls;
+    if (!JS::GetBuiltinClass(cx, obj, &cls)) {
+      return false;
+    }
+
+    if (cls == ESClass::Number) {
+      double d;
+      if (!ToNumber(cx, vp, &d)) {
+        return false;
+      }
+      vp.setNumber(d);
+    } else if (cls == ESClass::String) {
+      JSString* str = ToStringSlow<CanGC>(cx, vp);
+      if (!str) {
+        return false;
+      }
+      vp.setString(str);
+    } else if (cls == ESClass::Boolean || cls == ESClass::BigInt) {
+      if (!Unbox(cx, obj, vp)) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+static inline bool IsFilteredValue(const Value& v) {
+  MOZ_ASSERT_IF(v.isMagic(), v.isMagic(JS_ELEMENTS_HOLE));
+  return v.isUndefined() || v.isSymbol() || v.isMagic() || IsCallable(v);
+}
+
+class CycleDetector {
+ public:
+  CycleDetector(StringifyContext* scx, HandleObject obj)
+      : stack_(&scx->stack), obj_(obj), appended_(false) {}
+
+  MOZ_ALWAYS_INLINE bool foundCycle(JSContext* cx) {
+    JSObject* obj = obj_;
+    for (JSObject* obj2 : stack_) {
+      if (MOZ_UNLIKELY(obj == obj2)) {
+        JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                                  JSMSG_JSON_CYCLIC_VALUE);
+        return false;
+      }
+    }
+    appended_ = stack_.append(obj);
+    return appended_;
+  }
+
+  ~CycleDetector() {
+    if (MOZ_LIKELY(appended_)) {
+      MOZ_ASSERT(stack_.back() == obj_);
+      stack_.popBack();
+    }
+  }
+
+ private:
+  MutableHandle<ObjectVector> stack_;
+  HandleObject obj_;
+  bool appended_;
+};
+
+static inline JSString* MaybeGetRawJSON(JSContext* cx, JSObject* obj) {
+  auto* unwrappedObj = obj->maybeUnwrapIf<js::RawJSONObject>();
+  if (!unwrappedObj) {
+    return nullptr;
+  }
+  JSAutoRealm ar(cx, unwrappedObj);
+
+  JSString* rawJSON = unwrappedObj->rawJSON(cx);
+  MOZ_ASSERT(rawJSON);
+  return rawJSON;
+}
+
+static bool SerializeJSONObject(JSContext* cx, HandleObject obj,
+                                StringifyContext* scx) {
+
+  MOZ_ASSERT_IF(scx->maybeSafely, obj->is<PlainObject>());
+
+  CycleDetector detect(scx, obj);
+  if (!detect.foundCycle(cx)) {
+    return false;
+  }
+
+  if (!scx->sb.append('{')) {
+    return false;
+  }
+
+  Maybe<RootedIdVector> ids;
+  const RootedIdVector* props;
+  if (scx->replacer && !scx->replacer->isCallable()) {
+    props = &scx->propertyList;
+  } else {
+    MOZ_ASSERT_IF(scx->replacer, scx->propertyList.length() == 0);
+    ids.emplace(cx);
+    if (!GetPropertyKeys(cx, obj, JSITER_OWNONLY, ids.ptr())) {
+      return false;
+    }
+    props = ids.ptr();
+  }
+
+  const RootedIdVector& propertyList = *props;
+
+  bool wroteMember = false;
+  RootedTuple<jsid, Value, Value> roots(cx);
+  RootedField<jsid> id(roots);
+  RootedField<Value, 1> outputValue(roots);
+  RootedField<Value, 2> objValue(roots);
+  for (size_t i = 0, len = propertyList.length(); i < len; i++) {
+    if (!CheckForInterrupt(cx)) {
+      return false;
+    }
+
+    id = propertyList[i];
+#ifdef DEBUG
+    if (scx->maybeSafely) {
+      PropertyResult prop;
+      if (!NativeLookupOwnPropertyNoResolve(cx, &obj->as<NativeObject>(), id,
+                                            &prop)) {
+        return false;
+      }
+      MOZ_ASSERT(prop.isNativeProperty() &&
+                 prop.propertyInfo().isDataDescriptor());
+    }
+#endif  // DEBUG
+    objValue = ObjectValue(*obj);
+    if (!GetProperty(cx, obj, objValue, id, &outputValue)) {
+      return false;
+    }
+
+    if (!PreprocessValue(cx, obj, HandleId(id), &outputValue, scx)) {
+      return false;
+    }
+    if (IsFilteredValue(outputValue)) {
+      continue;
+    }
+
+    if (wroteMember && !scx->sb.append(',')) {
+      return false;
+    }
+    wroteMember = true;
+
+    if (!WriteIndent(scx, scx->depth)) {
+      return false;
+    }
+
+    JSString* s = IdToString(cx, id);
+    if (!s) {
+      return false;
+    }
+
+    if (!QuoteJSONString(cx, scx->sb, s) || !scx->sb.append(':') ||
+        !(scx->gap.empty() || scx->sb.append(' ')) ||
+        !SerializeJSONProperty(cx, outputValue, scx)) {
+      return false;
+    }
+  }
+
+  if (wroteMember && !WriteIndent(scx, scx->depth - 1)) {
+    return false;
+  }
+
+  return scx->sb.append('}');
+}
+
+static MOZ_ALWAYS_INLINE bool GetLengthPropertyForArrayLike(JSContext* cx,
+                                                            HandleObject obj,
+                                                            uint32_t* lengthp) {
+  if (MOZ_LIKELY(obj->is<ArrayObject>())) {
+    *lengthp = obj->as<ArrayObject>().length();
+    return true;
+  }
+
+  MOZ_ASSERT(obj->is<ProxyObject>());
+
+  uint64_t len = 0;
+  if (!GetLengthProperty(cx, obj, &len)) {
+    return false;
+  }
+
+  if (len > UINT32_MAX) {
+    ReportAllocationOverflow(cx);
+    return false;
+  }
+
+  *lengthp = uint32_t(len);
+  return true;
+}
+
+static bool SerializeJSONArray(JSContext* cx, HandleObject obj,
+                               StringifyContext* scx) {
+
+  CycleDetector detect(scx, obj);
+  if (!detect.foundCycle(cx)) {
+    return false;
+  }
+
+  if (!scx->sb.append('[')) {
+    return false;
+  }
+
+  uint32_t length;
+  if (!GetLengthPropertyForArrayLike(cx, obj, &length)) {
+    return false;
+  }
+
+  if (length != 0) {
+    if (!WriteIndent(scx, scx->depth)) {
+      return false;
+    }
+
+    RootedValue outputValue(cx);
+    for (uint32_t i = 0; i < length; i++) {
+      if (!CheckForInterrupt(cx)) {
+        return false;
+      }
+
+#ifdef DEBUG
+      if (scx->maybeSafely) {
+        MOZ_ASSERT(obj->is<ArrayObject>());
+        MOZ_ASSERT(obj->is<NativeObject>());
+        auto* nativeObj = &obj->as<NativeObject>();
+        if (i <= PropertyKey::IntMax) {
+          MOZ_ASSERT(
+              nativeObj->containsDenseElement(i) != nativeObj->isIndexed(),
+              "the array must either be small enough to remain "
+              "fully dense (and otherwise un-indexed), *or* "
+              "all its initially-dense elements were sparsified "
+              "and the object is indexed");
+        } else {
+          MOZ_ASSERT(nativeObj->isIndexed());
+        }
+      }
+#endif
+      if (!GetElement(cx, obj, i, &outputValue)) {
+        return false;
+      }
+      if (!PreprocessValue(cx, obj, i, &outputValue, scx)) {
+        return false;
+      }
+      if (IsFilteredValue(outputValue)) {
+        if (!scx->sb.append("null")) {
+          return false;
+        }
+      } else {
+        if (!SerializeJSONProperty(cx, outputValue, scx)) {
+          return false;
+        }
+      }
+
+      if (i < length - 1) {
+        if (!scx->sb.append(',')) {
+          return false;
+        }
+        if (!WriteIndent(scx, scx->depth)) {
+          return false;
+        }
+      }
+    }
+
+    if (!WriteIndent(scx, scx->depth - 1)) {
+      return false;
+    }
+  }
+
+  return scx->sb.append(']');
+}
+
+static bool SerializeJSONProperty(JSContext* cx, const Value& v,
+                                  StringifyContext* scx) {
+  MOZ_ASSERT(!IsFilteredValue(v));
+
+
+  if (v.isString()) {
+    return QuoteJSONString(cx, scx->sb, v.toString());
+  }
+
+  if (v.isNull()) {
+    return scx->sb.append("null");
+  }
+
+  if (v.isBoolean()) {
+    return v.toBoolean() ? scx->sb.append("true") : scx->sb.append("false");
+  }
+
+  if (v.isNumber()) {
+    if (v.isDouble()) {
+      if (!std::isfinite(v.toDouble())) {
+        MOZ_ASSERT(!scx->maybeSafely,
+                   "input JS::ToJSONMaybeSafely must not include "
+                   "reachable non-finite numbers");
+        return scx->sb.append("null");
+      }
+    }
+
+    return NumberValueToStringBuilder(v, scx->sb);
+  }
+
+  if (v.isBigInt()) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_BIGINT_NOT_SERIALIZABLE);
+    return false;
+  }
+
+  AutoCheckRecursionLimit recursion(cx);
+  if (!recursion.check(cx)) {
+    return false;
+  }
+
+  MOZ_ASSERT(v.isObject());
+  RootedObject obj(cx, &v.toObject());
+
+  if (JSString* rawJSON = MaybeGetRawJSON(cx, obj)) {
+    return scx->sb.append(rawJSON);
+  }
+
+  MOZ_ASSERT(
+      !scx->maybeSafely || obj->is<PlainObject>() || obj->is<ArrayObject>(),
+      "input to JS::ToJSONMaybeSafely must not include reachable "
+      "objects that are neither arrays nor plain objects");
+
+  scx->depth++;
+  auto dec = mozilla::MakeScopeExit([&] { scx->depth--; });
+
+  bool isArray;
+  if (!IsArray(cx, obj, &isArray)) {
+    return false;
+  }
+
+  return isArray ? SerializeJSONArray(cx, obj, scx)
+                 : SerializeJSONObject(cx, obj, scx);
+}
+
+static bool CanFastStringifyObject(NativeObject* obj) {
+  if (ClassCanHaveExtraEnumeratedProperties(obj->getClass())) {
+    return false;
+  }
+
+  if (obj->is<ArrayObject>()) {
+    if (!IsPackedArray(obj) && ObjectMayHaveExtraIndexedProperties(obj)) {
+      return false;
+    }
+  } else {
+    if (ObjectMayHaveExtraIndexedOwnProperties(obj)) {
+      return false;
+    }
+  }
+
+  MOZ_ASSERT(!obj->getOpsLookupProperty());
+
+  return true;
+}
+
+#define FOR_EACH_STRINGIFY_BAIL_REASON(MACRO) \
+  MACRO(NO_REASON)                            \
+  MACRO(INELIGIBLE_OBJECT)                    \
+  MACRO(DEEP_RECURSION)                       \
+  MACRO(NON_DATA_PROPERTY)                    \
+  MACRO(TOO_MANY_PROPERTIES)                  \
+  MACRO(BIGINT)                               \
+  MACRO(API)                                  \
+  MACRO(HAVE_REPLACER)                        \
+  MACRO(HAVE_SPACE)                           \
+  MACRO(PRIMITIVE)                            \
+  MACRO(HAVE_TOJSON)                          \
+  MACRO(IMPURE_LOOKUP)                        \
+  MACRO(INTERRUPT)
+
+enum class BailReason : uint8_t {
+#define DECLARE_ENUM(name) name,
+  FOR_EACH_STRINGIFY_BAIL_REASON(DECLARE_ENUM)
+#undef DECLARE_ENUM
+};
+
+static const char* DescribeStringifyBailReason(BailReason whySlow) {
+  switch (whySlow) {
+#define ENUM_NAME(name)  \
+  case BailReason::name: \
+    return #name;
+    FOR_EACH_STRINGIFY_BAIL_REASON(ENUM_NAME)
+#undef ENUM_NAME
+    default:
+      return "Unknown";
+  }
+}
+
+class DenseElementsIteratorForJSON {
+  HeapSlotArray elements;
+  uint32_t element;
+
+  uint32_t numElements;
+  uint32_t length;
+
+ public:
+  explicit DenseElementsIteratorForJSON(NativeObject* nobj)
+      : elements(nobj->getDenseElements()),
+        element(0),
+        numElements(nobj->getDenseInitializedLength()) {
+    length = nobj->is<ArrayObject>() ? nobj->as<ArrayObject>().length()
+                                     : numElements;
+  }
+
+  bool done() const { return element == length; }
+
+  Value next() {
+
+    MOZ_ASSERT(!done());
+    auto i = element++;
+    return i < numElements ? elements.begin()[i] : UndefinedValue();
+  }
+
+  uint32_t getIndex() const { return element; }
+};
+
+
+class ShapePropertyForwardIterNoGC {
+  PropMap* map_;
+  uint32_t mapLength_;
+  uint32_t i_ = 0;
+
+  mozilla::Vector<PropMap*> stack_;
+
+  const NativeShape* shape_;
+
+  MOZ_ALWAYS_INLINE void settle() {
+    while (true) {
+      if (MOZ_UNLIKELY(i_ == mapLength_)) {
+        i_ = 0;
+        if (stack_.empty()) {
+          mapLength_ = 0;  
+          return;
+        }
+        map_ = stack_.back();
+        stack_.popBack();
+        mapLength_ =
+            stack_.empty() ? shape_->propMapLength() : PropMap::Capacity;
+      } else if (MOZ_UNLIKELY(shape_->isDictionary() && !map_->hasKey(i_))) {
+        i_++;
+      } else {
+        return;
+      }
+    }
+  }
+
+ public:
+  explicit ShapePropertyForwardIterNoGC(NativeShape* shape) : shape_(shape) {
+    map_ = shape->propMap();
+    if (!map_) {
+      i_ = mapLength_ = 0;
+      return;
+    }
+    while (map_->hasPrevious()) {
+      if (!stack_.append(map_)) {
+        i_ = mapLength_ = UINT32_MAX;
+        return;
+      }
+      map_ = map_->asLinked()->previous();
+    }
+
+    mapLength_ = stack_.empty() ? shape_->propMapLength() : PropMap::Capacity;
+
+    settle();
+  }
+
+  bool done() const { return i_ == mapLength_; }
+  bool isOverflowed() const { return i_ == UINT32_MAX; }
+
+  void operator++(int) {
+    MOZ_ASSERT(!done());
+    i_++;
+    settle();
+  }
+
+  PropertyInfoWithKey get() const {
+    MOZ_ASSERT(!done());
+    return map_->getPropertyInfoWithKey(i_);
+  }
+
+  PropertyInfoWithKey operator*() const { return get(); }
+
+  struct FakePtr {
+    PropertyInfoWithKey val_;
+    const PropertyInfoWithKey* operator->() const { return &val_; }
+  };
+  FakePtr operator->() const { return {get()}; }
+};
+
+class OwnNonIndexKeysIterForJSON {
+  ShapePropertyForwardIterNoGC shapeIter;
+  bool done_ = false;
+  BailReason fastFailed_ = BailReason::NO_REASON;
+
+  void settle() {
+    for (; !shapeIter.done(); shapeIter++) {
+      if (!shapeIter->enumerable()) {
+        continue;
+      }
+      if (!shapeIter->isDataProperty()) {
+        fastFailed_ = BailReason::NON_DATA_PROPERTY;
+        done_ = true;
+        return;
+      }
+      PropertyKey id = shapeIter->key();
+      if (!id.isSymbol()) {
+        return;
+      }
+    }
+    done_ = true;
+  }
+
+ public:
+  explicit OwnNonIndexKeysIterForJSON(const NativeObject* nobj)
+      : shapeIter(nobj->shape()) {
+    if (MOZ_UNLIKELY(shapeIter.isOverflowed())) {
+      fastFailed_ = BailReason::TOO_MANY_PROPERTIES;
+      done_ = true;
+      return;
+    }
+    if (!nobj->hasEnumerableProperty()) {
+      MOZ_ASSERT(!nobj->is<ArrayObject>());
+      done_ = true;
+      return;
+    }
+    settle();
+  }
+
+  bool done() const { return done_ || shapeIter.done(); }
+  BailReason cannotFastStringify() const { return fastFailed_; }
+
+  PropertyInfoWithKey next() {
+    MOZ_ASSERT(!done());
+    PropertyInfoWithKey prop = shapeIter.get();
+    shapeIter++;
+    settle();
+    return prop;
+  }
+};
+
+static bool EmitSimpleValue(JSContext* cx, StringBuilder& sb, const Value& v) {
+  if (v.isString()) {
+    return QuoteJSONString(cx, sb, v.toString());
+  }
+
+  if (v.isNull()) {
+    return sb.append("null");
+  }
+
+  if (v.isBoolean()) {
+    return v.toBoolean() ? sb.append("true") : sb.append("false");
+  }
+
+  if (v.isNumber()) {
+    if (v.isDouble()) {
+      if (!std::isfinite(v.toDouble())) {
+        return sb.append("null");
+      }
+    }
+
+    return NumberValueToStringBuilder(v, sb);
+  }
+
+  if (v.isUndefined() || v.isMagic()) {
+    MOZ_ASSERT_IF(v.isMagic(), v.isMagic(JS_ELEMENTS_HOLE));
+    return sb.append("null");
+  }
+
+  MOZ_CRASH("should have validated printable simple value already");
+}
+
+static bool EmitQuotedIndexColon(StringBuilder& sb, uint32_t index) {
+  Int32ToCStringBuf cbuf;
+  size_t cstrlen;
+  const char* cstr = ::Int32ToCString(&cbuf, index, &cstrlen);
+  if (!sb.reserve(sb.length() + 1 + cstrlen + 1 + 1)) {
+    return false;
+  }
+  sb.infallibleAppend('"');
+  sb.infallibleAppend(cstr, cstrlen);
+  sb.infallibleAppend('"');
+  sb.infallibleAppend(':');
+  return true;
+}
+
+static bool PreprocessFastValue(JSContext* cx, Value* vp, StringifyContext* scx,
+                                BailReason* whySlow) {
+  MOZ_ASSERT(!scx->maybeSafely);
+
+
+  if (vp->isBigInt()) {
+    *whySlow = BailReason::BIGINT;
+    return true;
+  }
+
+  if (!vp->isObject()) {
+    return true;
+  }
+
+  if (!vp->toObject().is<NativeObject>()) {
+    *whySlow = BailReason::INELIGIBLE_OBJECT;
+    return true;
+  }
+
+  NativeObject* obj = &vp->toObject().as<NativeObject>();
+  PropertyResult toJSON;
+  NativeObject* holder;
+  PropertyKey id = NameToId(cx->names().toJSON);
+  if (!NativeLookupPropertyInline<NoGC, LookupResolveMode::CheckMayResolve>(
+          cx, obj, id, &holder, &toJSON)) {
+    *whySlow = BailReason::IMPURE_LOOKUP;
+    return true;
+  }
+  if (toJSON.isFound()) {
+    *whySlow = BailReason::HAVE_TOJSON;
+    return true;
+  }
+
+  if (obj->is<NumberObject>() || obj->is<StringObject>() ||
+      obj->is<BooleanObject>() || obj->is<BigIntObject>()) {
+    *whySlow = BailReason::INELIGIBLE_OBJECT;
+    return true;
+  }
+
+  if (obj->isCallable()) {
+    vp->setUndefined();
+    return true;
+  }
+
+  if (!CanFastStringifyObject(obj)) {
+    *whySlow = BailReason::INELIGIBLE_OBJECT;
+    return true;
+  }
+
+  return true;
+}
+
+struct FastStackEntry {
+  NativeObject* nobj;
+  Variant<DenseElementsIteratorForJSON, OwnNonIndexKeysIterForJSON> iter;
+  bool isArray;  
+
+  explicit FastStackEntry(NativeObject* obj)
+      : nobj(obj),
+        iter(AsVariant(DenseElementsIteratorForJSON(obj))),
+        isArray(obj->is<ArrayObject>()) {}
+
+  FastStackEntry(FastStackEntry&& other) noexcept
+      : nobj(other.nobj), iter(std::move(other.iter)), isArray(other.isArray) {}
+
+  void operator=(FastStackEntry&& other) noexcept {
+    nobj = other.nobj;
+    iter = std::move(other.iter);
+    isArray = other.isArray;
+  }
+
+  void advanceToProperties() {
+    iter = AsVariant(OwnNonIndexKeysIterForJSON(nobj));
+  }
+};
+
+static bool FastSerializeJSONProperty(JSContext* cx, Handle<Value> v,
+                                      StringifyContext* scx,
+                                      BailReason* whySlow) {
+  MOZ_ASSERT(*whySlow == BailReason::NO_REASON);
+  MOZ_ASSERT(v.isObject());
+
+  if (JSString* rawJSON = MaybeGetRawJSON(cx, &v.toObject())) {
+    return scx->sb.append(rawJSON);
+  }
+
+
+  if (!CheckForInterrupt(cx)) {
+    return false;
+  }
+
+  constexpr size_t MAX_STACK_DEPTH = 20;
+  Vector<FastStackEntry> stack(cx);
+  if (!stack.reserve(MAX_STACK_DEPTH - 1)) {
+    return false;
+  }
+  FastStackEntry top(&v.toObject().as<NativeObject>());
+  bool wroteMember = false;
+
+  if (!CanFastStringifyObject(top.nobj)) {
+    *whySlow = BailReason::INELIGIBLE_OBJECT;
+    return true;
+  }
+
+  while (true) {
+    if (!wroteMember) {
+      if (!scx->sb.append(top.isArray ? '[' : '{')) {
+        return false;
+      }
+    }
+
+    if (top.iter.is<DenseElementsIteratorForJSON>()) {
+      auto& iter = top.iter.as<DenseElementsIteratorForJSON>();
+      bool nestedObject = false;
+      while (!iter.done()) {
+        if (cx->hasPendingInterrupt(InterruptReason::CallbackUrgent) ||
+            cx->hasPendingInterrupt(InterruptReason::CallbackCanWait)) {
+          *whySlow = BailReason::INTERRUPT;
+          return true;
+        }
+
+        uint32_t index = iter.getIndex();
+        Value val = iter.next();
+
+        if (!PreprocessFastValue(cx, &val, scx, whySlow)) {
+          return false;
+        }
+        if (*whySlow != BailReason::NO_REASON) {
+          return true;
+        }
+        if (IsFilteredValue(val)) {
+          if (top.isArray) {
+            val = UndefinedValue();
+          } else {
+            continue;
+          }
+        }
+
+        if (wroteMember && !scx->sb.append(',')) {
+          return false;
+        }
+        wroteMember = true;
+
+        if (!top.isArray) {
+          if (!EmitQuotedIndexColon(scx->sb, index)) {
+            return false;
+          }
+        }
+
+        if (val.isObject()) {
+          if (JSString* rawJSON = MaybeGetRawJSON(cx, &val.toObject())) {
+            if (!scx->sb.append(rawJSON)) {
+              return false;
+            }
+          } else {
+            if (stack.length() >= MAX_STACK_DEPTH - 1) {
+              *whySlow = BailReason::DEEP_RECURSION;
+              return true;
+            }
+            stack.infallibleAppend(std::move(top));
+            top = FastStackEntry(&val.toObject().as<NativeObject>());
+            wroteMember = false;
+            nestedObject = true;  
+            break;
+          }
+        } else if (!EmitSimpleValue(cx, scx->sb, val)) {
+          return false;
+        }
+      }
+
+      if (nestedObject) {
+        continue;  
+      }
+
+      MOZ_ASSERT(iter.done());
+      if (top.isArray) {
+        MOZ_ASSERT(!top.nobj->isIndexed() || IsPackedArray(top.nobj));
+      } else {
+        top.advanceToProperties();
+      }
+    }
+
+    if (top.iter.is<OwnNonIndexKeysIterForJSON>()) {
+      auto& iter = top.iter.as<OwnNonIndexKeysIterForJSON>();
+      bool nesting = false;
+      while (!iter.done()) {
+        if (cx->hasPendingInterrupt(InterruptReason::CallbackUrgent) ||
+            cx->hasPendingInterrupt(InterruptReason::CallbackCanWait)) {
+          *whySlow = BailReason::INTERRUPT;
+          return true;
+        }
+
+        PropertyInfoWithKey prop = iter.next();
+
+        mozilla::DebugOnly<uint32_t> index = -1;
+        MOZ_ASSERT(!IdIsIndex(prop.key(), &index));
+
+        Value val = top.nobj->getSlot(prop.slot());
+        if (!PreprocessFastValue(cx, &val, scx, whySlow)) {
+          return false;
+        }
+        if (*whySlow != BailReason::NO_REASON) {
+          return true;
+        }
+        if (IsFilteredValue(val)) {
+          continue;
+        }
+
+        if (wroteMember && !scx->sb.append(",")) {
+          return false;
+        }
+        wroteMember = true;
+
+        MOZ_ASSERT(prop.key().isString());
+        if (!QuoteJSONString(cx, scx->sb, prop.key().toString())) {
+          return false;
+        }
+
+        if (!scx->sb.append(':')) {
+          return false;
+        }
+        if (val.isObject()) {
+          if (JSString* rawJSON = MaybeGetRawJSON(cx, &val.toObject())) {
+            if (!scx->sb.append(rawJSON)) {
+              return false;
+            }
+          } else {
+            if (stack.length() >= MAX_STACK_DEPTH - 1) {
+              *whySlow = BailReason::DEEP_RECURSION;
+              return true;
+            }
+            stack.infallibleAppend(std::move(top));
+            top = FastStackEntry(&val.toObject().as<NativeObject>());
+            wroteMember = false;
+            nesting = true;  
+            break;
+          }
+        } else if (!EmitSimpleValue(cx, scx->sb, val)) {
+          return false;
+        }
+      }
+      *whySlow = iter.cannotFastStringify();
+      if (*whySlow != BailReason::NO_REASON) {
+        return true;
+      }
+      if (nesting) {
+        continue;  
+      }
+      MOZ_ASSERT(iter.done());
+    }
+
+    if (!scx->sb.append(top.isArray ? ']' : '}')) {
+      return false;
+    }
+    if (stack.empty()) {
+      return true;  
+    }
+    top = std::move(stack.back());
+
+    stack.popBack();
+    wroteMember = true;
+  }
+}
+
+bool js::Stringify(JSContext* cx, MutableHandleValue vp, JSObject* replacer_,
+                   const Value& space_, StringBuilder& sb,
+                   StringifyBehavior stringifyBehavior) {
+  RootedObject replacer(cx, replacer_);
+  RootedValue space(cx, space_);
+
+  MOZ_ASSERT_IF(stringifyBehavior == StringifyBehavior::RestrictedSafe,
+                space.isNull());
+  MOZ_ASSERT_IF(stringifyBehavior == StringifyBehavior::RestrictedSafe,
+                vp.isObject());
+  MOZ_ASSERT(stringifyBehavior != StringifyBehavior::RestrictedSafe ||
+                 vp.toObject().is<PlainObject>() ||
+                 vp.toObject().is<ArrayObject>(),
+             "input to JS::ToJSONMaybeSafely must be a plain object or array");
+
+  RootedIdVector propertyList(cx);
+  BailReason whySlow = BailReason::NO_REASON;
+  if (stringifyBehavior == StringifyBehavior::SlowOnly ||
+      stringifyBehavior == StringifyBehavior::RestrictedSafe) {
+    whySlow = BailReason::API;
+  }
+  if (replacer) {
+    whySlow = BailReason::HAVE_REPLACER;
+    bool isArray;
+    if (replacer->isCallable()) {
+    } else if (!IsArray(cx, replacer, &isArray)) {
+      return false;
+    } else if (isArray) {
+
+      uint32_t len;
+      if (!GetLengthPropertyForArrayLike(cx, replacer, &len)) {
+        return false;
+      }
+
+      const uint32_t MaxInitialSize = 32;
+      Rooted<GCHashSet<jsid>> idSet(
+          cx, GCHashSet<jsid>(cx, std::min(len, MaxInitialSize)));
+
+      uint32_t k = 0;
+
+      RootedValue item(cx);
+      RootedId id(cx);
+      for (; k < len; k++) {
+        if (!CheckForInterrupt(cx)) {
+          return false;
+        }
+
+        if (!GetElement(cx, replacer, k, &item)) {
+          return false;
+        }
+
+        if (item.isNumber() || item.isString()) {
+          if (!PrimitiveValueToId<CanGC>(cx, item, &id)) {
+            return false;
+          }
+        } else {
+          ESClass cls;
+          if (!GetClassOfValue(cx, item, &cls)) {
+            return false;
+          }
+
+          if (cls != ESClass::String && cls != ESClass::Number) {
+            continue;
+          }
+
+          JSAtom* atom = ToAtom<CanGC>(cx, item);
+          if (!atom) {
+            return false;
+          }
+
+          id.set(AtomToId(atom));
+        }
+
+        auto p = idSet.lookupForAdd(id);
+        if (!p) {
+          if (!idSet.add(p, id) || !propertyList.append(id)) {
+            return false;
+          }
+        }
+      }
+    } else {
+      replacer = nullptr;
+    }
+  }
+
+  if (space.isObject()) {
+    RootedObject spaceObj(cx, &space.toObject());
+
+    ESClass cls;
+    if (!JS::GetBuiltinClass(cx, spaceObj, &cls)) {
+      return false;
+    }
+
+    if (cls == ESClass::Number) {
+      double d;
+      if (!ToNumber(cx, space, &d)) {
+        return false;
+      }
+      space = NumberValue(d);
+    } else if (cls == ESClass::String) {
+      JSString* str = ToStringSlow<CanGC>(cx, space);
+      if (!str) {
+        return false;
+      }
+      space = StringValue(str);
+    }
+  }
+
+  StringBuilder gap(cx);
+
+  if (space.isNumber()) {
+    double d;
+    MOZ_ALWAYS_TRUE(ToInteger(cx, space, &d));
+    d = std::min(10.0, d);
+    if (d >= 1 && !gap.appendN(' ', uint32_t(d))) {
+      return false;
+    }
+  } else if (space.isString()) {
+    JSLinearString* str = space.toString()->ensureLinear(cx);
+    if (!str) {
+      return false;
+    }
+    size_t len = std::min(size_t(10), str->length());
+    if (!gap.appendSubstring(str, 0, len)) {
+      return false;
+    }
+  } else {
+    MOZ_ASSERT(gap.empty());
+  }
+  if (!gap.empty()) {
+    whySlow = BailReason::HAVE_SPACE;
+  }
+
+  Rooted<PlainObject*> wrapper(cx);
+  RootedId emptyId(cx, NameToId(cx->names().empty_));
+  if (replacer && replacer->isCallable()) {
+
+    wrapper = NewPlainObject(cx);
+    if (!wrapper) {
+      return false;
+    }
+
+    if (!NativeDefineDataProperty(cx, wrapper, emptyId, vp, JSPROP_ENUMERATE)) {
+      return false;
+    }
+  }
+
+  Rooted<JSAtom*> fastJSON(cx);
+  if (whySlow == BailReason::NO_REASON) {
+    MOZ_ASSERT(propertyList.empty());
+    MOZ_ASSERT(stringifyBehavior != StringifyBehavior::RestrictedSafe);
+    StringifyContext scx(cx, sb, gap, nullptr, propertyList, false);
+    if (!PreprocessFastValue(cx, vp.address(), &scx, &whySlow)) {
+      return false;
+    }
+    if (!vp.isObject()) {
+      whySlow = BailReason::PRIMITIVE;
+    }
+    if (whySlow == BailReason::NO_REASON) {
+      if (!FastSerializeJSONProperty(cx, vp, &scx, &whySlow)) {
+        return false;
+      }
+      if (whySlow == BailReason::NO_REASON) {
+        if (stringifyBehavior != StringifyBehavior::Compare) {
+          return true;
+        }
+        fastJSON = scx.sb.finishAtom();
+        if (!fastJSON) {
+          return false;
+        }
+      }
+      scx.sb.clear();  
+    }
+  }
+
+  if (MOZ_UNLIKELY((stringifyBehavior == StringifyBehavior::FastOnly) &&
+                   (whySlow != BailReason::NO_REASON))) {
+    JS_ReportErrorASCII(cx, "JSON stringify failed mandatory fast path: %s",
+                        DescribeStringifyBailReason(whySlow));
+    return false;
+  }
+
+
+  StringifyContext scx(cx, sb, gap, replacer, propertyList,
+                       stringifyBehavior == StringifyBehavior::RestrictedSafe);
+  if (!PreprocessValue(cx, wrapper, HandleId(emptyId), vp, &scx)) {
+    return false;
+  }
+  if (IsFilteredValue(vp)) {
+    return true;
+  }
+
+  if (!SerializeJSONProperty(cx, vp, &scx)) {
+    return false;
+  }
+
+  if (MOZ_UNLIKELY(fastJSON)) {
+    JSAtom* slowJSON = scx.sb.finishAtom();
+    if (!slowJSON) {
+      return false;
+    }
+    if (fastJSON != slowJSON) {
+      MOZ_CRASH("JSON.stringify mismatch between fast and slow paths");
+    }
+    if (!sb.append(slowJSON)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static bool InternalizeJSONProperty(JSContext* cx, HandleObject holder,
+                                    HandleId name, HandleValue reviver,
+                                    Handle<ParseRecordObject*> parseRecord,
+                                    MutableHandleValue vp) {
+  AutoCheckRecursionLimit recursion(cx);
+  if (!recursion.check(cx)) {
+    return false;
+  }
+
+  RootedTuple<Value, JSObject*, ParseRecordObject*, JSObject*, JSString*, Value,
+              Value>
+      roots(cx);
+  RootedField<Value, 0> val(roots);
+  if (!GetProperty(cx, holder, holder, name, &val)) {
+    return false;
+  }
+
+  RootedField<JSObject*, 1> context(roots);
+  RootedField<ParseRecordObject*, 2> entries(roots);
+  if (parseRecord) {
+    bool sameVal = false;
+    if (!SameValue(cx, parseRecord->getValue(), val, &sameVal)) {
+      return false;
+    }
+    if (parseRecord->hasValue() && sameVal) {
+      if (parseRecord->getParseNode()) {
+        MOZ_ASSERT(!val.isObject());
+        Rooted<IdValueVector> props(cx, cx);
+        if (!props.emplaceBack(
+                IdValuePair(NameToId(cx->names().source),
+                            StringValue(parseRecord->getParseNode())))) {
+          return false;
+        }
+        context = NewPlainObjectWithUniqueNames(cx, props);
+        if (!context) {
+          return false;
+        }
+      }
+      entries.set(parseRecord);
+    }
+  }
+  if (!context) {
+    context = NewPlainObject(cx);
+    if (!context) {
+      return false;
+    }
+  }
+
+  if (val.isObject()) {
+    RootedField<JSObject*, 3> obj(roots, &val.toObject());
+
+    bool isArray;
+    if (!IsArray(cx, obj, &isArray)) {
+      return false;
+    }
+
+    if (isArray) {
+      uint32_t length;
+      if (!GetLengthPropertyForArrayLike(cx, obj, &length)) {
+        return false;
+      }
+
+      RootedTuple<jsid, Value, ParseRecordObject*, Value, PropertyDescriptor>
+          arrayRoots(cx);
+      RootedField<jsid> id(arrayRoots);
+      RootedField<Value, 1> newElement(arrayRoots);
+      RootedField<Value, 3> value(arrayRoots);
+      RootedField<PropertyDescriptor> desc(arrayRoots);
+      for (uint32_t i = 0; i < length; i++) {
+        if (!CheckForInterrupt(cx)) {
+          return false;
+        }
+
+        if (!IndexToId(cx, i, &id)) {
+          return false;
+        }
+
+        RootedField<ParseRecordObject*> elementRecord(arrayRoots);
+        if (entries) {
+          Rooted<Value> value(cx);
+          if (!JS_GetPropertyById(cx, entries, id, &value)) {
+            return false;
+          }
+          if (!value.isNullOrUndefined()) {
+            elementRecord = &value.toObject().as<ParseRecordObject>();
+          }
+        }
+        if (!InternalizeJSONProperty(cx, obj, id, reviver, elementRecord,
+                                     &newElement)) {
+          return false;
+        }
+
+        ObjectOpResult ignored;
+        if (newElement.isUndefined()) {
+          if (!DeleteProperty(cx, obj, id, ignored)) {
+            return false;
+          }
+        } else {
+          Rooted<PropertyDescriptor> desc(
+              cx, PropertyDescriptor::Data(newElement,
+                                           {JS::PropertyAttribute::Configurable,
+                                            JS::PropertyAttribute::Enumerable,
+                                            JS::PropertyAttribute::Writable}));
+          if (!DefineProperty(cx, obj, id, desc, ignored)) {
+            return false;
+          }
+        }
+      }
+    } else {
+      RootedIdVector keys(cx);
+      if (!GetPropertyKeys(cx, obj, JSITER_OWNONLY, &keys)) {
+        return false;
+      }
+
+      RootedTuple<jsid, Value, ParseRecordObject*, Value, PropertyDescriptor>
+          objRoots(cx);
+      RootedField<jsid> id(objRoots);
+      RootedField<Value, 1> newElement(objRoots);
+      RootedField<Value, 3> value(objRoots);
+      RootedField<PropertyDescriptor> desc(objRoots);
+      for (size_t i = 0, len = keys.length(); i < len; i++) {
+        if (!CheckForInterrupt(cx)) {
+          return false;
+        }
+
+        id = keys[i];
+        RootedField<ParseRecordObject*> entryRecord(objRoots);
+        if (entries) {
+          if (!JS_GetPropertyById(cx, entries, id, &value)) {
+            return false;
+          }
+          if (!value.isNullOrUndefined()) {
+            entryRecord = &value.toObject().as<ParseRecordObject>();
+          }
+        }
+        if (!InternalizeJSONProperty(cx, obj, id, reviver, entryRecord,
+                                     &newElement)) {
+          return false;
+        }
+
+        ObjectOpResult ignored;
+        if (newElement.isUndefined()) {
+          if (!DeleteProperty(cx, obj, id, ignored)) {
+            return false;
+          }
+        } else {
+          desc = PropertyDescriptor::Data(newElement,
+                                          {JS::PropertyAttribute::Configurable,
+                                           JS::PropertyAttribute::Enumerable,
+                                           JS::PropertyAttribute::Writable});
+          if (!DefineProperty(cx, obj, id, desc, ignored)) {
+            return false;
+          }
+        }
+      }
+    }
+  }
+
+  RootedField<JSString*, 4> key(roots, IdToString(cx, name));
+  if (!key) {
+    return false;
+  }
+
+  RootedField<Value, 5> keyVal(roots, StringValue(key));
+  RootedField<Value, 6> contextVal(roots, ObjectValue(*context));
+  return js::Call(cx, reviver, holder, keyVal, val, contextVal, vp);
+}
+
+static bool Revive(JSContext* cx, HandleValue reviver,
+                   Handle<ParseRecordObject*> pro, MutableHandleValue vp) {
+  Rooted<PlainObject*> obj(cx, NewPlainObject(cx));
+  if (!obj) {
+    return false;
+  }
+
+  if (!DefineDataProperty(cx, obj, cx->names().empty_, vp)) {
+    return false;
+  }
+
+  MOZ_ASSERT(pro->getValue() == vp.get());
+  Rooted<jsid> id(cx, NameToId(cx->names().empty_));
+  return InternalizeJSONProperty(cx, obj, id, reviver, pro, vp);
+}
+
+template <typename CharT>
+bool ParseJSON(JSContext* cx, const mozilla::Range<const CharT> chars,
+               MutableHandleValue vp) {
+  Rooted<JSONParser<CharT>> parser(cx, cx, chars,
+                                   JSONParser<CharT>::ParseType::JSONParse);
+  return parser.parse(vp);
+}
+
+template <typename CharT>
+bool js::ParseJSONWithReviver(JSContext* cx,
+                              const mozilla::Range<const CharT> chars,
+                              HandleValue reviver, MutableHandleValue vp) {
+  js::AutoGeckoProfilerEntry pseudoFrame(cx, "parse JSON",
+                                         JS::ProfilingCategoryPair::JS_Parsing);
+  Rooted<ParseRecordObject*> pro(cx);
+  if (IsCallable(reviver)) {
+    Rooted<JSONReviveParser<CharT>> parser(cx, cx, chars);
+    if (!parser.get().parse(vp, &pro)) {
+      return false;
+    }
+  } else if (!ParseJSON(cx, chars, vp)) {
+    return false;
+  }
+
+  if (IsCallable(reviver)) {
+    return Revive(cx, reviver, pro, vp);
+  }
+  return true;
+}
+
+template bool js::ParseJSONWithReviver(
+    JSContext* cx, const mozilla::Range<const Latin1Char> chars,
+    HandleValue reviver, MutableHandleValue vp);
+
+template bool js::ParseJSONWithReviver(
+    JSContext* cx, const mozilla::Range<const char16_t> chars,
+    HandleValue reviver, MutableHandleValue vp);
+
+static bool json_toSource(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  args.rval().setString(cx->names().JSON);
+  return true;
+}
+
+static bool json_parse(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "JSON", "parse");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  JSString* str = (args.length() >= 1) ? ToString<CanGC>(cx, args[0])
+                                       : cx->names().undefined;
+  if (!str) {
+    return false;
+  }
+
+  JSLinearString* linear = str->ensureLinear(cx);
+  if (!linear) {
+    return false;
+  }
+
+  AutoStableStringChars linearChars(cx);
+  if (!linearChars.init(cx, linear)) {
+    return false;
+  }
+
+  HandleValue reviver = args.get(1);
+
+  return linearChars.isLatin1()
+             ? ParseJSONWithReviver(cx, linearChars.latin1Range(), reviver,
+                                    args.rval())
+             : ParseJSONWithReviver(cx, linearChars.twoByteRange(), reviver,
+                                    args.rval());
+}
+
+static bool json_isRawJSON(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "JSON", "isRawJSON");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  if (args.get(0).isObject()) {
+    Rooted<JSObject*> obj(cx, &args[0].toObject());
+#ifdef DEBUG
+    if (obj->is<RawJSONObject>()) {
+      bool objIsFrozen = false;
+      MOZ_ASSERT(js::TestIntegrityLevel(cx, obj, IntegrityLevel::Frozen,
+                                        &objIsFrozen));
+      MOZ_ASSERT(objIsFrozen);
+    }
+#endif  // DEBUG
+    args.rval().setBoolean(obj->is<RawJSONObject>() ||
+                           obj->canUnwrapAs<RawJSONObject>());
+    return true;
+  }
+
+  args.rval().setBoolean(false);
+  return true;
+}
+
+static inline bool IsJSONWhitespace(char16_t ch) {
+  return ch == '\t' || ch == '\n' || ch == '\r' || ch == ' ';
+}
+
+static bool json_rawJSON(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "JSON", "rawJSON");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  JSString* jsonString = ToString<CanGC>(cx, args.get(0));
+  if (!jsonString) {
+    return false;
+  }
+
+  Rooted<JSLinearString*> linear(cx, jsonString->ensureLinear(cx));
+  if (!linear) {
+    return false;
+  }
+
+  AutoStableStringChars linearChars(cx);
+  if (!linearChars.init(cx, linear)) {
+    return false;
+  }
+
+  if (linear->empty()) {
+    JS_ReportErrorNumberASCII(cx, js::GetErrorMessage, nullptr,
+                              JSMSG_JSON_RAW_EMPTY);
+    return false;
+  }
+  if (IsJSONWhitespace(linear->latin1OrTwoByteChar(0)) ||
+      IsJSONWhitespace(linear->latin1OrTwoByteChar(linear->length() - 1))) {
+    JS_ReportErrorNumberASCII(cx, js::GetErrorMessage, nullptr,
+                              JSMSG_JSON_RAW_WHITESPACE);
+    return false;
+  }
+
+  RootedValue parsedValue(cx);
+  if (linearChars.isLatin1()) {
+    if (!ParseJSON(cx, linearChars.latin1Range(), &parsedValue)) {
+      return false;
+    }
+  } else {
+    if (!ParseJSON(cx, linearChars.twoByteRange(), &parsedValue)) {
+      return false;
+    }
+  }
+
+  if (parsedValue.isObject()) {
+    JS_ReportErrorNumberASCII(cx, js::GetErrorMessage, nullptr,
+                              JSMSG_JSON_RAW_ARRAY_OR_OBJECT);
+    return false;
+  }
+
+  Rooted<RawJSONObject*> obj(cx, RawJSONObject::create(cx, linear));
+  if (!obj) {
+    return false;
+  }
+
+  if (!js::FreezeObject(cx, obj)) {
+    return false;
+  }
+
+  args.rval().setObject(*obj);
+  return true;
+}
+
+bool json_stringify(JSContext* cx, unsigned argc, Value* vp) {
+  AutoJSMethodProfilerEntry pseudoFrame(cx, "JSON", "stringify");
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  RootedObject replacer(cx,
+                        args.get(1).isObject() ? &args[1].toObject() : nullptr);
+  RootedValue value(cx, args.get(0));
+  RootedValue space(cx, args.get(2));
+
+#ifdef DEBUG
+  StringifyBehavior behavior = StringifyBehavior::Compare;
+#else
+  StringifyBehavior behavior = StringifyBehavior::Normal;
+#endif
+
+  JSStringBuilder sb(cx);
+  if (!Stringify(cx, &value, replacer, space, sb, behavior)) {
+    return false;
+  }
+
+  if (!sb.empty()) {
+    JSString* str = sb.finishString();
+    if (!str) {
+      return false;
+    }
+    args.rval().setString(str);
+  } else {
+    args.rval().setUndefined();
+  }
+
+  return true;
+}
+
+static const JSFunctionSpec json_static_methods[] = {
+    JS_FN("toSource", json_toSource, 0, 0),
+    JS_FN("parse", json_parse, 2, 0),
+    JS_FN("stringify", json_stringify, 3, 0),
+    JS_FN("isRawJSON", json_isRawJSON, 1, 0),
+    JS_FN("rawJSON", json_rawJSON, 1, 0),
+    JS_FS_END,
+};
+
+static const JSPropertySpec json_static_properties[] = {
+    JS_STRING_SYM_PS(toStringTag, "JSON", JSPROP_READONLY),
+    JS_PS_END,
+};
+
+static JSObject* CreateJSONObject(JSContext* cx, JSProtoKey key) {
+  RootedObject proto(cx, &cx->global()->getObjectPrototype());
+  return NewObjectWithGivenProto(cx, &JSONClass, proto,
+                                 {.newKind = TenuredObject});
+}
+
+static const ClassSpec JSONClassSpec = {
+    CreateJSONObject,
+    nullptr,
+    json_static_methods,
+    json_static_properties,
+};
+
+const JSClass js::JSONClass = {
+    "JSON",
+    JSCLASS_HAS_CACHED_PROTO(JSProto_JSON),
+    JS_NULL_CLASS_OPS,
+    &JSONClassSpec,
+};

@@ -1,0 +1,18 @@
+/*
+ * Copyright 2023 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+#if !defined(SkTime_DEFINED)
+#define SkTime_DEFINED
+
+namespace SkTime {
+
+double GetNSecs();
+inline double GetSecs() { return GetNSecs() * 1e-9; }
+inline double GetMSecs() { return GetNSecs() * 1e-6; }
+
+} 
+
+#endif

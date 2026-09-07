@@ -1,0 +1,165 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef gc_FindSCCs_h
+#define gc_FindSCCs_h
+
+#include "mozilla/Assertions.h"  // MOZ_ASSERT
+
+#include <algorithm>  // std::min
+
+#include "js/AllocPolicy.h"         // js::SystemAllocPolicy
+#include "js/friend/StackLimits.h"  // js::AutoCheckRecursionLimit
+#include "js/HashTable.h"           // js::HashSet, js::DefaultHasher
+
+namespace js {
+namespace gc {
+
+template <typename Node>
+struct GraphNodeBase {
+  using NodeSet =
+      js::HashSet<Node*, js::DefaultHasher<Node*>, js::SystemAllocPolicy>;
+
+  NodeSet gcGraphEdges;
+  Node* gcNextGraphNode = nullptr;
+  Node* gcNextGraphComponent = nullptr;
+  unsigned gcDiscoveryTime = 0;
+  unsigned gcLowLink = 0;
+
+  Node* nextNodeInGroup() const {
+    if (gcNextGraphNode &&
+        gcNextGraphNode->gcNextGraphComponent == gcNextGraphComponent) {
+      return gcNextGraphNode;
+    }
+    return nullptr;
+  }
+
+  Node* nextGroup() const { return gcNextGraphComponent; }
+};
+
+
+template <typename Node>
+class ComponentFinder {
+ public:
+  explicit ComponentFinder(JSContext* cx) : cx(cx) {}
+
+  ~ComponentFinder() {
+    MOZ_ASSERT(!stack);
+    MOZ_ASSERT(!firstComponent);
+  }
+
+  void useOneComponent() { stackFull = true; }
+
+  void addNode(Node* v) {
+    if (v->gcDiscoveryTime == Undefined) {
+      MOZ_ASSERT(v->gcLowLink == Undefined);
+      processNode(v);
+    }
+  }
+
+  Node* getResultsList() {
+    if (stackFull) {
+      Node* firstGoodComponent = firstComponent;
+      for (Node* v = stack; v; v = stack) {
+        stack = v->gcNextGraphNode;
+        v->gcNextGraphComponent = firstGoodComponent;
+        v->gcNextGraphNode = firstComponent;
+        firstComponent = v;
+      }
+      stackFull = false;
+    }
+
+    MOZ_ASSERT(!stack);
+
+    Node* result = firstComponent;
+    firstComponent = nullptr;
+
+    for (Node* v = result; v; v = v->gcNextGraphNode) {
+      v->gcDiscoveryTime = Undefined;
+      v->gcLowLink = Undefined;
+    }
+
+    return result;
+  }
+
+  static void mergeGroups(Node* first) {
+    for (Node* v = first; v; v = v->gcNextGraphNode) {
+      v->gcNextGraphComponent = nullptr;
+    }
+  }
+
+ private:
+  static const unsigned Undefined = 0;
+
+  static const unsigned Finished = (unsigned)-1;
+
+  void addEdgeTo(Node* w) {
+    if (w->gcDiscoveryTime == Undefined) {
+      processNode(w);
+      cur->gcLowLink = std::min(cur->gcLowLink, w->gcLowLink);
+    } else if (w->gcDiscoveryTime != Finished) {
+      cur->gcLowLink = std::min(cur->gcLowLink, w->gcDiscoveryTime);
+    }
+  }
+
+  void processNode(Node* v) {
+    v->gcDiscoveryTime = clock;
+    v->gcLowLink = clock;
+    ++clock;
+
+    v->gcNextGraphNode = stack;
+    stack = v;
+
+    if (stackFull) {
+      return;
+    }
+
+    AutoCheckRecursionLimit recursion(cx);
+    if (!recursion.checkSystemDontReport(cx)) {
+      stackFull = true;
+      return;
+    }
+
+    Node* old = cur;
+    cur = v;
+    for (auto iter = cur->gcGraphEdges.iter(); !iter.done(); iter.next()) {
+      addEdgeTo(iter.get());
+    }
+    cur = old;
+
+    if (stackFull) {
+      return;
+    }
+
+    if (v->gcLowLink == v->gcDiscoveryTime) {
+      Node* nextComponent = firstComponent;
+      Node* w;
+      do {
+        MOZ_ASSERT(stack);
+        w = stack;
+        stack = w->gcNextGraphNode;
+
+        w->gcDiscoveryTime = Finished;
+
+        w->gcNextGraphComponent = nextComponent;
+
+        w->gcNextGraphNode = firstComponent;
+        firstComponent = w;
+      } while (w != v);
+    }
+  }
+
+ private:
+  unsigned clock = 1;
+  Node* stack = nullptr;
+  Node* firstComponent = nullptr;
+  Node* cur = nullptr;
+  JSContext* cx;
+  bool stackFull = false;
+};
+
+} 
+} 
+
+#endif /* gc_FindSCCs_h */

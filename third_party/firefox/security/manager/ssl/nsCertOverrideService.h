@@ -1,0 +1,137 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsCertOverrideService_h
+#define nsCertOverrideService_h
+
+#include <utility>
+
+#include "mozilla/HashFunctions.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/OriginAttributes.h"
+#include "mozilla/TaskQueue.h"
+#include "nsIAsyncShutdown.h"
+#include "nsICertOverrideService.h"
+#include "nsIFile.h"
+#include "nsIObserver.h"
+#include "nsString.h"
+#include "nsTHashtable.h"
+#include "nsWeakReference.h"
+#include "secoidt.h"
+
+class nsCertOverride final : public nsICertOverride {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSICERTOVERRIDE
+
+  nsCertOverride() : mPort(-1), mIsTemporary(false) {}
+
+  nsCString mAsciiHost;
+  int32_t mPort;
+  mozilla::OriginAttributes mOriginAttributes;
+  bool mIsTemporary;  
+  nsCString mFingerprint;
+
+ private:
+  ~nsCertOverride() = default;
+};
+
+class nsCertOverrideEntry final : public PLDHashEntryHdr {
+ public:
+  typedef const char* KeyType;
+  typedef const char* KeyTypePointer;
+
+  explicit nsCertOverrideEntry(KeyTypePointer aHostWithPortUTF8) {}
+
+  nsCertOverrideEntry(nsCertOverrideEntry&& toMove)
+      : PLDHashEntryHdr(std::move(toMove)),
+        mSettings(std::move(toMove.mSettings)),
+        mKeyString(std::move(toMove.mKeyString)) {}
+
+  ~nsCertOverrideEntry() = default;
+
+  KeyType GetKey() const { return KeyStringPtr(); }
+
+  KeyTypePointer GetKeyPointer() const { return KeyStringPtr(); }
+
+  bool KeyEquals(KeyTypePointer aKey) const {
+    return !strcmp(KeyStringPtr(), aKey);
+  }
+
+  static KeyTypePointer KeyToPointer(KeyType aKey) { return aKey; }
+
+  static PLDHashNumber HashKey(KeyTypePointer aKey) {
+    return mozilla::HashString(aKey, strlen(aKey));
+  }
+
+  enum { ALLOW_MEMMOVE = false };
+
+  inline const nsCString& KeyString() const { return mKeyString; }
+
+  inline KeyTypePointer KeyStringPtr() const { return mKeyString.get(); }
+
+  RefPtr<nsCertOverride> mSettings;
+  nsCString mKeyString;
+};
+
+class nsCertOverrideService final : public nsICertOverrideService,
+                                    public nsIObserver,
+                                    public nsSupportsWeakReference,
+                                    public nsIAsyncShutdownBlocker {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSICERTOVERRIDESERVICE
+  NS_DECL_NSIOBSERVER
+  NS_DECL_NSIASYNCSHUTDOWNBLOCKER
+
+  nsCertOverrideService();
+
+  nsresult Init();
+  void RemoveAllTemporaryOverrides();
+
+  static void GetHostWithPort(const nsACString& aHostName, int32_t aPort,
+                              nsACString& aRetval);
+
+  static void GetKeyString(const nsACString& aHostName, int32_t aPort,
+                           const mozilla::OriginAttributes& aOriginAttributes,
+                           nsACString& aRetval);
+
+  void AssertOnTaskQueue() const {
+    MOZ_ASSERT(mWriterTaskQueue->IsOnCurrentThread());
+  }
+
+  void RemoveShutdownBlocker();
+
+ private:
+  ~nsCertOverrideService();
+
+  mozilla::Mutex mMutex;
+  nsCOMPtr<nsIFile> mSettingsFile MOZ_GUARDED_BY(mMutex);
+  nsTHashtable<nsCertOverrideEntry> mSettingsTable MOZ_GUARDED_BY(mMutex);
+
+  nsresult Read(const mozilla::MutexAutoLock& aProofOfLock);
+  nsresult Write(const mozilla::MutexAutoLock& aProofOfLock);
+  nsresult AddEntryToList(const nsACString& host, int32_t port,
+                          const mozilla::OriginAttributes& aOriginAttributes,
+                          const bool aIsTemporary,
+                          const nsACString& fingerprint,
+                          const mozilla::MutexAutoLock& aProofOfLock);
+  already_AddRefed<nsCertOverride> GetOverrideFor(
+      const nsACString& aHostName, int32_t aPort,
+      const mozilla::OriginAttributes& aOriginAttributes);
+
+  RefPtr<mozilla::TaskQueue> mWriterTaskQueue;
+
+  uint64_t mPendingWriteCount;
+};
+
+#define NS_CERTOVERRIDE_CID                   \
+  { \
+   0x67ba681d,                                \
+   0x5485,                                    \
+   0x4fff,                                    \
+   {0x95, 0x2c, 0x2e, 0xe3, 0x37, 0xff, 0xdc, 0xd6}}
+
+#endif  // nsCertOverrideService_h

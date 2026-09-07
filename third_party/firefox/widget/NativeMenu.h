@@ -1,0 +1,85 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_widget_NativeMenu_h
+#define mozilla_widget_NativeMenu_h
+
+#include "nsISupportsImpl.h"
+#include "Units.h"
+
+class nsIURI;
+class nsIFrame;
+class nsMenuPopupFrame;
+class nsPresContext;
+
+namespace mozilla {
+using Modifiers = uint16_t;
+class ErrorResult;
+class ComputedStyle;
+
+namespace dom {
+class Element;
+}
+
+namespace widget {
+
+struct NativeMenuIcon {
+  RefPtr<nsIURI> mURI;
+  RefPtr<const ComputedStyle> mStyle;
+
+  explicit operator bool() const { return !!mURI; }
+};
+
+class NativeMenu {
+ public:
+  NS_INLINE_DECL_REFCOUNTING(NativeMenu)
+
+  static NativeMenuIcon GetIcon(dom::Element&);
+
+  virtual void ShowMenuAnchored(nsIFrame* aClickedFrame,
+                                const nsMenuPopupFrame* aPopupFrame) = 0;
+
+  virtual void ShowMenuAtPosition(nsIFrame* aClickedFrame,
+                                  const CSSIntPoint& aPosition,
+                                  bool aIsContextMenu) = 0;
+
+  virtual bool Close() = 0;
+
+  virtual void ActivateItem(dom::Element* aItemElement, Modifiers aModifiers,
+                            int16_t aButton, ErrorResult& aRv) = 0;
+
+  virtual void OpenSubmenu(dom::Element* aMenuElement) = 0;
+
+  virtual void CloseSubmenu(dom::Element* aMenuElement) = 0;
+
+  virtual RefPtr<dom::Element> Element() = 0;
+
+  class Observer {
+   public:
+    virtual void OnNativeMenuOpened() = 0;
+
+    virtual void OnNativeMenuClosed() = 0;
+
+    virtual void OnNativeSubMenuWillOpen(dom::Element* aPopupElement) = 0;
+
+    virtual void OnNativeSubMenuDidOpen(dom::Element* aPopupElement) = 0;
+
+    virtual void OnNativeSubMenuClosed(dom::Element* aPopupElement) = 0;
+
+    virtual void OnNativeMenuWillActivateItem(
+        dom::Element* aMenuItemElement) = 0;
+  };
+
+  virtual void AddObserver(Observer* aObserver) = 0;
+
+  virtual void RemoveObserver(Observer* aObserver) = 0;
+
+ protected:
+  virtual ~NativeMenu() = default;
+};
+
+}  
+}  
+
+#endif  // mozilla_widget_NativeMenu_h

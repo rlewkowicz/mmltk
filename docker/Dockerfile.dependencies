@@ -1,0 +1,164 @@
+# syntax=docker/dockerfile:1
+
+FROM mmltk_toolchain_base AS dependencies
+
+ARG MMLTK_ONNX_COMMIT=e709452ef2bbc1d113faf678c24e6d3467696e83
+ARG MMLTK_DUPLO_ARCHIVE_URL=https://github.com/dlidstrom/Duplo/releases/download/v2.1.5/duplo-linux.zip
+ARG MMLTK_DUPLO_SHA256=5b64b1b76cc62844596a808660c001f2461a0650b36ac8e0b3f84571dba1003d
+ARG MMLTK_PMD_ARCHIVE_URL=https://github.com/pmd/pmd/releases/download/pmd_releases/7.26.0/pmd-dist-7.26.0-bin.zip
+ARG MMLTK_PMD_SHA256=9f55cb7ff0e9f9a66dd2f005eaa370e84c8a4cd971b134aa14a930c4a283ebc9
+ARG MMLTK_PMD_VERSION=7.26.0
+ARG MMLTK_SIMDJSON_COMMIT=0c0ce1bd48baa0677dc7c0945ea7cd1e8b52b297
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# Build each static source dependency once with the application host compiler.
+RUN set -eux; \
+    git init /tmp/simdjson-src; \
+    git -C /tmp/simdjson-src remote add origin https://github.com/simdjson/simdjson.git; \
+    git -C /tmp/simdjson-src -c protocol.version=2 fetch \
+        --depth 1 --filter=blob:none origin "${MMLTK_SIMDJSON_COMMIT}"; \
+    git -C /tmp/simdjson-src checkout --force FETCH_HEAD; \
+    test "$(git -C /tmp/simdjson-src rev-parse HEAD)" = "${MMLTK_SIMDJSON_COMMIT}"; \
+    cmake -S /tmp/simdjson-src -B /tmp/simdjson-build -G Ninja \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+        -DCMAKE_C_COMPILER=/opt/gcc-16.2/bin/gcc \
+        -DCMAKE_CXX_COMPILER=/opt/gcc-16.2/bin/g++ \
+        -DCMAKE_CXX_EXTENSIONS=OFF \
+        -DCMAKE_CXX_STANDARD=26 \
+        -DCMAKE_CXX_STANDARD_REQUIRED=ON \
+        -DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG -fomit-frame-pointer -fno-plt -march=native -mtune=native -fno-semantic-interposition -ffunction-sections -fdata-sections -fhardened -Werror=hardened" \
+        -DCMAKE_CXX_SCAN_FOR_MODULES=OFF \
+        -DCMAKE_EXE_LINKER_FLAGS="-Wl,-O2 -Wl,--as-needed -Wl,--gc-sections -fuse-ld=mold" \
+        -DCMAKE_INSTALL_PREFIX=/opt/simdjson-gcc16 \
+        -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
+        -DCMAKE_MODULE_LINKER_FLAGS="-Wl,-O2 -Wl,--as-needed -Wl,--gc-sections -fuse-ld=mold" \
+        -DCMAKE_POLICY_DEFAULT_CMP0069=NEW \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+        -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-O2 -Wl,--as-needed -Wl,--gc-sections -fuse-ld=mold" \
+        -DSIMDJSON_CXX_STANDARD=26 \
+        -DSIMDJSON_DEVELOPER_MODE=OFF \
+        -DSIMDJSON_ENABLE_THREADS=ON \
+        -DSIMDJSON_SINGLEHEADER=ON; \
+    cmake --build /tmp/simdjson-build --parallel "$(nproc)"; \
+    cmake --install /tmp/simdjson-build; \
+    python3 /usr/local/libexec/mmltk/record_compiler_evidence.py \
+        --record-dependency simdjson --build-dir /tmp/simdjson-build; \
+    printf '%s\n' 'int main() { return 0; }' >/tmp/simdjson-lto-smoke.cpp; \
+    /opt/gcc-16.2/bin/g++ -std=c++26 -O3 -flto=auto -fno-fat-lto-objects -fuse-ld=mold \
+        /tmp/simdjson-lto-smoke.cpp \
+        -Wl,--whole-archive /opt/simdjson-gcc16/lib/libsimdjson.a -Wl,--no-whole-archive \
+        -pthread -o /tmp/simdjson-lto-smoke; \
+    rm -rf /opt/simdjson; \
+    mv /opt/simdjson-gcc16 /opt/simdjson; \
+    rm -rf /tmp/simdjson-src /tmp/simdjson-build \
+        /tmp/simdjson-lto-smoke /tmp/simdjson-lto-smoke.cpp
+
+RUN set -eux; \
+    git init /tmp/onnx-src; \
+    git -C /tmp/onnx-src remote add origin https://github.com/onnx/onnx.git; \
+    git -C /tmp/onnx-src -c protocol.version=2 fetch \
+        --depth 1 --filter=blob:none origin "${MMLTK_ONNX_COMMIT}"; \
+    git -C /tmp/onnx-src checkout --force FETCH_HEAD; \
+    test "$(git -C /tmp/onnx-src rev-parse HEAD)" = "${MMLTK_ONNX_COMMIT}"; \
+    cmake -S /tmp/onnx-src -B /tmp/onnx-build -G Ninja \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+        -DCMAKE_C_COMPILER=/opt/gcc-16.2/bin/gcc \
+        -DCMAKE_CXX_COMPILER=/opt/gcc-16.2/bin/g++ \
+        -DCMAKE_CXX_EXTENSIONS=OFF \
+        -DCMAKE_CXX_STANDARD=26 \
+        -DCMAKE_CXX_STANDARD_REQUIRED=ON \
+        -DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG -fomit-frame-pointer -fno-plt -march=native -mtune=native -fno-semantic-interposition -ffunction-sections -fdata-sections -fhardened -Werror=hardened" \
+        -DCMAKE_CXX_SCAN_FOR_MODULES=OFF \
+        -DCMAKE_EXE_LINKER_FLAGS="-Wl,-O2 -Wl,--as-needed -Wl,--gc-sections -fuse-ld=mold" \
+        -DCMAKE_INSTALL_PREFIX=/opt/onnx-gcc16 \
+        -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
+        -DCMAKE_MODULE_LINKER_FLAGS="-Wl,-O2 -Wl,--as-needed -Wl,--gc-sections -fuse-ld=mold" \
+        -DCMAKE_POLICY_DEFAULT_CMP0069=NEW \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+        -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-O2 -Wl,--as-needed -Wl,--gc-sections -fuse-ld=mold" \
+        -DONNX_BUILD_CUSTOM_PROTOBUF=OFF \
+        -DONNX_BUILD_PYTHON=OFF \
+        -DONNX_BUILD_TESTS=OFF \
+        -DONNX_CUSTOM_PROTOC_EXECUTABLE=/usr/bin/protoc \
+        -DONNX_ML=ON \
+        -DONNX_NAMESPACE=mmltk_onnx \
+        -DONNX_USE_LITE_PROTO=OFF \
+        -DONNX_USE_PROTOBUF_SHARED_LIBS=ON \
+        -DONNX_WERROR=OFF \
+        -DProtobuf_PROTOC_EXECUTABLE=/usr/bin/protoc; \
+    cmake --build /tmp/onnx-build --parallel "$(nproc)"; \
+    cmake --install /tmp/onnx-build; \
+    python3 /usr/local/libexec/mmltk/record_compiler_evidence.py \
+        --record-dependency onnx --build-dir /tmp/onnx-build; \
+    printf '%s\n' \
+        '#include <onnx/onnx_pb.h>' \
+        'int main() { mmltk_onnx::ModelProto model; return model.ir_version() != 0; }' \
+        >/tmp/onnx-lto-smoke.cpp; \
+    /opt/gcc-16.2/bin/g++ -std=c++26 -O3 -flto=auto -fno-fat-lto-objects \
+        -DONNX_ML=1 \
+        -fuse-ld=mold -I/opt/onnx-gcc16/include \
+        /tmp/onnx-lto-smoke.cpp \
+        /opt/onnx-gcc16/lib/libonnx.a \
+        /opt/onnx-gcc16/lib/libonnx_proto.a \
+        -lprotobuf -pthread -o /tmp/onnx-lto-smoke; \
+    rm -rf /opt/onnx; \
+    mv /opt/onnx-gcc16 /opt/onnx; \
+    rm -rf /tmp/onnx-src /tmp/onnx-build \
+        /tmp/onnx-lto-smoke /tmp/onnx-lto-smoke.cpp
+
+ARG MMLTK_CPPCHECK_COMMIT=e73bf44c3e49686b7495fab352d03a6c6075516b
+ARG MMLTK_CPPCHECK_VERSION=2.21.0
+RUN set -eux; \
+    git init /tmp/cppcheck-src; \
+    git -C /tmp/cppcheck-src remote add origin https://github.com/cppcheck-opensource/cppcheck.git; \
+    git -C /tmp/cppcheck-src -c protocol.version=2 fetch \
+        --depth 1 --filter=blob:none origin "${MMLTK_CPPCHECK_COMMIT}"; \
+    git -C /tmp/cppcheck-src checkout --force FETCH_HEAD; \
+    test "$(git -C /tmp/cppcheck-src rev-parse HEAD)" = "${MMLTK_CPPCHECK_COMMIT}"; \
+    cmake -S /tmp/cppcheck-src -B /tmp/cppcheck-build -G Ninja \
+        -DBUILD_CLI=ON \
+        -DBUILD_GUI=OFF \
+        -DBUILD_TESTING=OFF \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+        -DCMAKE_C_COMPILER=/opt/gcc-16.2/bin/gcc \
+        -DCMAKE_CXX_COMPILER=/opt/gcc-16.2/bin/g++ \
+        -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=mold \
+        -DCMAKE_INSTALL_PREFIX=/opt/cppcheck-${MMLTK_CPPCHECK_VERSION} \
+        -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
+        -DCMAKE_POLICY_DEFAULT_CMP0069=NEW \
+        -DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=mold \
+        -DUSE_MATCHCOMPILER=ON; \
+    cmake --build /tmp/cppcheck-build --parallel "$(nproc)"; \
+    cmake --install /tmp/cppcheck-build; \
+    python3 /usr/local/libexec/mmltk/record_compiler_evidence.py \
+        --record-dependency cppcheck --build-dir /tmp/cppcheck-build; \
+    test "$(/opt/cppcheck-${MMLTK_CPPCHECK_VERSION}/bin/cppcheck --version)" = "Cppcheck ${MMLTK_CPPCHECK_VERSION}"; \
+    rm -rf /tmp/cppcheck-src /tmp/cppcheck-build
+
+RUN ln -s /opt/cppcheck-${MMLTK_CPPCHECK_VERSION}/bin/cppcheck /usr/local/bin/cppcheck
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends openjdk-21-jre-headless; \
+    curl -fsSL "${MMLTK_DUPLO_ARCHIVE_URL}" -o /tmp/duplo.zip; \
+    echo "${MMLTK_DUPLO_SHA256}  /tmp/duplo.zip" | sha256sum -c -; \
+    unzip -q /tmp/duplo.zip -d /tmp/duplo-dist; \
+    install -Dm0755 /tmp/duplo-dist/duplo /bin/duplo; \
+    curl -fsSL "${MMLTK_PMD_ARCHIVE_URL}" -o /tmp/pmd.zip; \
+    echo "${MMLTK_PMD_SHA256}  /tmp/pmd.zip" | sha256sum -c -; \
+    unzip -q /tmp/pmd.zip -d /opt; \
+    ln -s "/opt/pmd-bin-${MMLTK_PMD_VERSION}/bin/pmd" /usr/local/bin/pmd; \
+    rm -rf /tmp/duplo.zip /tmp/duplo-dist /tmp/pmd.zip /var/lib/apt/lists/*; \
+    test -x /bin/duplo; \
+    test "$(pmd --version | sed -n 's/^PMD \([^ ]*\).*/\1/p')" = "${MMLTK_PMD_VERSION}"
+
+ARG MMLTK_IMAGE_FINGERPRINT=unlabeled
+ARG MMLTK_TOOLCHAIN_BASE_IDENTITY=unknown
+LABEL com.mmltk.input-fingerprint="${MMLTK_IMAGE_FINGERPRINT}" \
+      com.mmltk.toolchain-base-identity="${MMLTK_TOOLCHAIN_BASE_IDENTITY}"

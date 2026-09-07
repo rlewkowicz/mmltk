@@ -1,0 +1,96 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_ipc_IdleSchedulerParent_h_
+#define mozilla_ipc_IdleSchedulerParent_h_
+
+#include "mozilla/LinkedList.h"
+#include "mozilla/ipc/PIdleSchedulerParent.h"
+#include "mozilla/ipc/SharedMemoryMapping.h"
+#include <bitset>
+
+#define NS_IDLE_SCHEDULER_COUNTER_ARRAY_LENGHT 1024
+#define NS_IDLE_SCHEDULER_INDEX_OF_ACTIVITY_COUNTER 0
+#define NS_IDLE_SCHEDULER_INDEX_OF_CPU_COUNTER 1
+
+class nsITimer;
+
+namespace mozilla {
+
+namespace ipc {
+
+class BackgroundParentImpl;
+
+class IdleSchedulerParent final
+    : public PIdleSchedulerParent,
+      public LinkedListElement<IdleSchedulerParent> {
+ public:
+  NS_INLINE_DECL_REFCOUNTING(IdleSchedulerParent)
+
+  IPCResult RecvInitForIdleUse(InitForIdleUseResolver&& aResolve);
+  IPCResult RecvRequestIdleTime(uint64_t aId, TimeDuration aBudget);
+  IPCResult RecvIdleTimeUsed(uint64_t aId);
+  IPCResult RecvSchedule();
+  IPCResult RecvRunningPrioritizedOperation();
+  IPCResult RecvPrioritizedOperationDone();
+  IPCResult RecvRequestGC(RequestGCResolver&& aResolve);
+  IPCResult RecvStartedGC();
+  IPCResult RecvDoneGC();
+
+ private:
+  friend class BackgroundParentImpl;
+  IdleSchedulerParent();
+  ~IdleSchedulerParent();
+
+  static void CalculateNumIdleTasks();
+
+  static int32_t ActiveCount();
+  static void Schedule(IdleSchedulerParent* aRequester);
+  static bool HasSpareCycles(int32_t aActiveCount);
+  static bool HasSpareGCCycles();
+  using PIdleSchedulerParent::SendIdleTime;
+  void SendIdleTime();
+  void SendMayGC();
+
+  static void EnsureStarvationTimer();
+  static void StarvationCallback(nsITimer* aTimer, void* aData);
+
+  uint64_t mCurrentRequestId = 0;
+  TimeDuration mRequestedIdleBudget;
+
+  uint32_t mRunningPrioritizedOperation = 0;
+
+  Maybe<RequestGCResolver> mRequestingGC;
+  bool mDoingGC = false;
+
+  uint32_t mChildId = 0;
+
+  bool IsWaitingForIdle() const { return isInList() && mRequestedIdleBudget; }
+  bool IsDoingIdleTask() const { return !isInList() && mRequestedIdleBudget; }
+  bool IsNotDoingIdleTask() const { return !mRequestedIdleBudget; }
+
+  static std::bitset<NS_IDLE_SCHEDULER_COUNTER_ARRAY_LENGHT>
+      sInUseChildCounters;
+
+  static LinkedList<IdleSchedulerParent> sIdleAndGCRequests;
+
+  static int32_t sMaxConcurrentIdleTasksInChildProcesses;
+  static uint32_t sMaxConcurrentGCs;
+  static uint32_t sActiveGCs;
+
+  static uint32_t sChildProcessesRunningPrioritizedOperation;
+
+  static uint32_t sChildProcessesAlive;
+
+  static nsITimer* sStarvationPreventer;
+
+  static uint32_t sNumCPUs;
+  static uint32_t sPrefConcurrentGCsMax;
+  static uint32_t sPrefConcurrentGCsCPUDivisor;
+};
+
+}  
+}  
+
+#endif  // mozilla_ipc_IdleSchedulerParent_h_

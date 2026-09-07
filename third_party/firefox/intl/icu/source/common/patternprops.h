@@ -1,0 +1,48 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*******************************************************************************
+*   Copyright (C) 2011, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+*******************************************************************************
+*   file name:  patternprops.h
+*   encoding:   UTF-8
+*   tab size:   8 (not used)
+*   indentation:4
+*
+*   created on: 2011mar13
+*   created by: Markus W. Scherer
+*/
+
+#ifndef __PATTERNPROPS_H__
+#define __PATTERNPROPS_H__
+
+#include "unicode/unistr.h"
+#include "unicode/utypes.h"
+
+U_NAMESPACE_BEGIN
+
+class U_COMMON_API PatternProps {
+public:
+    static UBool isSyntax(UChar32 c);
+
+    static UBool isSyntaxOrWhiteSpace(UChar32 c);
+
+    static UBool isWhiteSpace(UChar32 c);
+
+    static const char16_t *skipWhiteSpace(const char16_t *s, int32_t length);
+
+    static int32_t skipWhiteSpace(const UnicodeString &s, int32_t start);
+
+    static const char16_t *trimWhiteSpace(const char16_t *s, int32_t &length);
+
+    static UBool isIdentifier(const char16_t *s, int32_t length);
+
+    static const char16_t *skipIdentifier(const char16_t *s, int32_t length);
+
+private:
+    PatternProps() = delete;  
+};
+
+U_NAMESPACE_END
+
+#endif  // __PATTERNPROPS_H__

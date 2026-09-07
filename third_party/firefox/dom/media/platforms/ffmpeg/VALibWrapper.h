@@ -1,0 +1,73 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_MEDIA_PLATFORMS_FFMPEG_VALIBWRAPPER_H_
+#define DOM_MEDIA_PLATFORMS_FFMPEG_VALIBWRAPPER_H_
+
+#include "mozilla/Attributes.h"
+#include "mozilla/ThreadSafeWeakPtr.h"
+#include "mozilla/UniquePtrExtensions.h"
+#include "nsISupportsImpl.h"
+
+struct PRLibrary;
+
+#ifdef MOZ_WIDGET_GTK
+
+typedef void* VADisplay;
+typedef int VAStatus;
+#  define VA_EXPORT_SURFACE_READ_ONLY 0x0001
+#  define VA_EXPORT_SURFACE_SEPARATE_LAYERS 0x0004
+#  define VA_STATUS_SUCCESS 0x00000000
+
+namespace mozilla {
+
+class MOZ_ONLY_USED_TO_AVOID_STATIC_CONSTRUCTORS VALibWrapper {
+ public:
+  VALibWrapper() = default;
+  ~VALibWrapper() = default;
+
+  static bool IsVAAPIAvailable();
+  static VALibWrapper sFuncs;
+
+ private:
+  void Link();
+  bool AreVAAPIFuncsAvailable();
+  bool LinkVAAPILibs();
+
+ public:
+  int (*vaExportSurfaceHandle)(void*, unsigned int, uint32_t, uint32_t, void*);
+  int (*vaSyncSurface)(void*, unsigned int);
+
+ private:
+  PRLibrary* mVALib;
+  PRLibrary* mVALibDrm;
+};
+
+class VADisplayHolder final
+    : public SupportsThreadSafeWeakPtr<VADisplayHolder> {
+ public:
+  MOZ_DECLARE_REFCOUNTED_TYPENAME(VADisplayHolder)
+
+  static RefPtr<VADisplayHolder> GetSingleton();
+
+  VADisplay Display() const { return mDisplay.get(); }
+  ~VADisplayHolder();
+
+ private:
+  struct VADisplayDeleter {
+    using pointer = VADisplay;
+    void operator()(VADisplay aDisplay);
+  };
+  using UniqueVADisplay = std::unique_ptr<VADisplay, VADisplayDeleter>;
+
+  VADisplayHolder(UniqueVADisplay aDisplay, UniqueFileHandle aDRMFd);
+
+  const UniqueFileHandle mDRMFd;
+  const UniqueVADisplay mDisplay;
+};
+
+}  
+#endif  // MOZ_WIDGET_GTK
+
+#endif  // DOM_MEDIA_PLATFORMS_FFMPEG_VALIBWRAPPER_H_

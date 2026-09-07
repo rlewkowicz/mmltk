@@ -1,0 +1,58 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_ipc_SharedMemoryCursor_h
+#define mozilla_ipc_SharedMemoryCursor_h
+
+#include "mozilla/ipc/SharedMemoryHandle.h"
+#include "mozilla/ipc/SharedMemoryMapping.h"
+
+namespace mozilla::ipc::shared_memory {
+
+class Cursor {
+ public:
+  Cursor() = default;
+
+  explicit Cursor(MutableHandle&& aHandle) : mHandle(std::move(aHandle)) {}
+
+  bool IsValid() const { return mHandle.IsValid(); }
+  uint64_t Size() const { return mHandle.Size(); }
+  uint64_t Offset() const { return mOffset; }
+  uint64_t Remaining() const { return Size() - Offset(); }
+
+  bool Read(void* aBuffer, size_t aCount);
+
+  bool Write(const void* aBuffer, size_t aCount);
+
+  void Seek(uint64_t aOffset);
+
+  MutableHandle TakeHandle();
+
+  void SetChunkSize(size_t aChunkSize);
+
+ private:
+#ifdef HAVE_64BIT_BUILD
+  static constexpr size_t kDefaultMaxChunkSize = size_t(1) << 30;  
+#else
+  static constexpr size_t kDefaultMaxChunkSize = size_t(1) << 28;  
+#endif
+
+  size_t ChunkSize() const { return mChunkSize; }
+  uint64_t ChunkOffsetMask() const { return uint64_t(ChunkSize()) - 1; }
+  uint64_t ChunkStartMask() const { return ~ChunkOffsetMask(); }
+  size_t ChunkOffset() const { return Offset() & ChunkOffsetMask(); }
+  uint64_t ChunkStart() const { return Offset() & ChunkStartMask(); }
+
+  bool Consume(void* aBuffer, size_t aCount, bool aWriteToShmem);
+  bool EnsureMapping();
+
+  MutableHandle mHandle;
+  MutableMapping mMapping;
+  uint64_t mOffset = 0;
+  size_t mChunkSize = kDefaultMaxChunkSize;
+};
+
+}  
+
+#endif  // mozilla_ipc_SharedMemoryCursor_h

@@ -1,0 +1,1050 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "frontend/UsingEmitter.h"
+
+#include "frontend/BytecodeEmitter.h"
+#include "frontend/EmitterScope.h"
+#include "frontend/IfEmitter.h"
+#include "frontend/TryEmitter.h"
+#include "frontend/WhileEmitter.h"
+
+using namespace js;
+using namespace js::frontend;
+
+UsingEmitter::UsingEmitter(BytecodeEmitter* bce) : bce_(bce) {}
+
+bool UsingEmitter::emitTakeDisposeCapability() {
+  if (!bce_->emit1(JSOp::TakeDisposeCapability)) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::IsNullOrUndefined)) {
+    return false;
+  }
+
+  InternalIfEmitter ifUndefined(bce_);
+
+  if (!ifUndefined.emitThenElse()) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Zero)) {
+    return false;
+  }
+
+  if (!ifUndefined.emitElse()) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Dup)) {
+    return false;
+  }
+
+  if (!bce_->emitAtomOp(JSOp::GetProp,
+                        TaggedParserAtomIndex::WellKnown::length())) {
+    return false;
+  }
+
+  if (!ifUndefined.emitEnd()) {
+    return false;
+  }
+
+  return true;
+}
+
+bool UsingEmitter::emitThrowIfException() {
+
+  InternalIfEmitter ifThrow(bce_);
+
+  if (!ifThrow.emitThenElse()) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Throw)) {
+    return false;
+  }
+
+  if (!ifThrow.emitElse()) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Pop)) {
+    return false;
+  }
+
+  if (!ifThrow.emitEnd()) {
+    return false;
+  }
+
+  return true;
+}
+
+bool DisposalEmitter::emitResourcePropertyAccess(TaggedParserAtomIndex prop,
+                                                 unsigned resourcesFromTop) {
+  MOZ_ASSERT(resourcesFromTop >= 1);
+
+  if (!bce_->emitDupAt(resourcesFromTop, 2)) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::GetElem)) {
+    return false;
+  }
+
+  if (!bce_->emitAtomOp(JSOp::GetProp, prop)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool DisposalEmitter::prepareForDisposeCapability() {
+  MOZ_ASSERT(state_ == State::Start);
+
+
+  if (hasAsyncDisposables_) {
+    if (!bce_->emit1(JSOp::False)) {
+      return false;
+    }
+
+    if (!bce_->emit1(JSOp::False)) {
+      return false;
+    }
+
+    if (!bce_->emitPickN(3)) {
+      return false;
+    }
+
+    if (!bce_->emitPickN(3)) {
+      return false;
+    }
+  }
+
+
+#ifdef DEBUG
+  state_ = State::DisposeCapability;
+#endif
+  return true;
+}
+
+bool DisposalEmitter::emitEnd(EmitterScope& es) {
+  MOZ_ASSERT(state_ == State::DisposeCapability);
+
+
+
+
+  if (!bce_->emit1(JSOp::Dec)) {
+    return false;
+  }
+
+  InternalWhileEmitter wh(bce_);
+
+  if (!wh.emitCond()) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Dup)) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Zero)) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Ge)) {
+    return false;
+  }
+
+  if (!wh.emitBody()) {
+    return false;
+  }
+
+
+  if (hasAsyncDisposables_) {
+
+    if (!emitResourcePropertyAccess(TaggedParserAtomIndex::WellKnown::hint())) {
+      return false;
+    }
+
+
+    static_assert(uint8_t(UsingHint::Sync) == 0, "Sync hint must be 0");
+    static_assert(uint8_t(UsingHint::Async) == 1, "Async hint must be 1");
+    if (!bce_->emit1(JSOp::Not)) {
+      return false;
+    }
+
+    if (!bce_->emitDupAt(6, 2)) {
+      return false;
+    }
+
+
+    if (!bce_->emit1(JSOp::Not)) {
+      return false;
+    }
+
+    if (!bce_->emit1(JSOp::BitAnd)) {
+      return false;
+    }
+
+    if (!bce_->emit1(JSOp::BitAnd)) {
+      return false;
+    }
+
+
+    InternalIfEmitter ifNeedsSyncDisposeUndefinedAwaited(bce_);
+
+    if (!ifNeedsSyncDisposeUndefinedAwaited.emitThen()) {
+      return false;
+    }
+
+    if (!bce_->emit1(JSOp::Undefined)) {
+      return false;
+    }
+
+    if (!bce_->emitAwaitInScope(es)) {
+      return false;
+    }
+
+    if (!bce_->emitPickN(6)) {
+      return false;
+    }
+
+    if (!bce_->emitPopN(2)) {
+      return false;
+    }
+
+    if (!bce_->emit1(JSOp::False)) {
+      return false;
+    }
+
+    if (!bce_->emitUnpickN(5)) {
+      return false;
+    }
+
+    if (!ifNeedsSyncDisposeUndefinedAwaited.emitEnd()) {
+      return false;
+    }
+  }
+
+
+  if (!emitResourcePropertyAccess(TaggedParserAtomIndex::WellKnown::method())) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::IsNullOrUndefined)) {
+    return false;
+  }
+
+  InternalIfEmitter ifMethodNotUndefined(bce_);
+
+  if (!ifMethodNotUndefined.emitThenElse(IfEmitter::ConditionKind::Negative)) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Pop)) {
+    return false;
+  }
+
+  TryEmitter tryCall(bce_, TryEmitter::Kind::TryCatch,
+                     TryEmitter::ControlKind::NonSyntactic);
+
+  if (!tryCall.emitTry()) {
+    return false;
+  }
+
+  if (!emitResourcePropertyAccess(TaggedParserAtomIndex::WellKnown::method())) {
+    return false;
+  }
+
+  if (!emitResourcePropertyAccess(TaggedParserAtomIndex::WellKnown::value(),
+                                  2)) {
+    return false;
+  }
+
+  if (!bce_->emitCall(JSOp::Call, 0)) {
+    return false;
+  }
+
+  if (hasAsyncDisposables_) {
+    if (!emitResourcePropertyAccess(TaggedParserAtomIndex::WellKnown::hint(),
+                                    2)) {
+      return false;
+    }
+
+
+    InternalIfEmitter ifAsyncDispose(bce_);
+
+    if (!ifAsyncDispose.emitThen()) {
+      return false;
+    }
+
+
+    if (!bce_->emitPickN(5)) {
+      return false;
+    }
+
+    if (!bce_->emit1(JSOp::Pop)) {
+      return false;
+    }
+
+    if (!bce_->emit1(JSOp::True)) {
+      return false;
+    }
+
+    if (!bce_->emitUnpickN(5)) {
+      return false;
+    }
+
+    if (!bce_->emitAwaitInScope(es)) {
+      return false;
+    }
+
+    if (!ifAsyncDispose.emitEnd()) {
+      return false;
+    }
+  }
+
+
+  if (!bce_->emit1(JSOp::Pop)) {
+    return false;
+  }
+
+  if (!tryCall.emitCatch()) {
+    return false;
+  }
+
+  if (!bce_->emitPickN(3)) {
+    return false;
+  }
+
+  if (bce_->sc->isSuspendableContext() &&
+      bce_->sc->asSuspendableContext()->isGenerator()) {
+
+    if (!bce_->emit1(JSOp::IsGenClosing)) {
+      return false;
+    }
+
+    if (!bce_->emit1(JSOp::Not)) {
+      return false;
+    }
+
+    if (!bce_->emitPickN(5)) {
+      return false;
+    }
+
+    if (!bce_->emit1(JSOp::BitAnd)) {
+      return false;
+    }
+  } else {
+    if (!bce_->emitPickN(4)) {
+      return false;
+    }
+  }
+
+
+  InternalIfEmitter ifException(bce_);
+
+  if (!ifException.emitThenElse()) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::CreateSuppressedError)) {
+    return false;
+  }
+
+  if (!bce_->emitUnpickN(2)) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::True)) {
+    return false;
+  }
+
+  if (!bce_->emitUnpickN(3)) {
+    return false;
+  }
+
+  if (!ifException.emitElse()) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Pop)) {
+    return false;
+  }
+
+  if (!bce_->emitUnpickN(2)) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::True)) {
+    return false;
+  }
+
+  if (!bce_->emitUnpickN(3)) {
+    return false;
+  }
+
+  if (!ifException.emitEnd()) {
+    return false;
+  }
+
+  if (!tryCall.emitEnd()) {
+    return false;
+  }
+
+
+  if (!ifMethodNotUndefined.emitElse()) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Pop)) {
+    return false;
+  }
+
+  if (hasAsyncDisposables_) {
+
+    if (!bce_->emitPickN(5)) {
+      return false;
+    }
+
+    if (!bce_->emit1(JSOp::Pop)) {
+      return false;
+    }
+
+    if (!bce_->emit1(JSOp::True)) {
+      return false;
+    }
+
+    if (!bce_->emitUnpickN(5)) {
+      return false;
+    }
+  }
+
+  if (!ifMethodNotUndefined.emitEnd()) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Dec)) {
+    return false;
+  }
+
+  if (!wh.emitEnd()) {
+    return false;
+  }
+
+  if (!bce_->emitPopN(2)) {
+    return false;
+  }
+
+  if (hasAsyncDisposables_) {
+    if (!bce_->emitPickN(3)) {
+      return false;
+    }
+
+    if (!bce_->emitPickN(3)) {
+      return false;
+    }
+
+    if (!bce_->emit1(JSOp::Not)) {
+      return false;
+    }
+
+    if (!bce_->emit1(JSOp::BitAnd)) {
+      return false;
+    }
+
+    InternalIfEmitter ifNeedsUndefinedAwait(bce_);
+
+    if (!ifNeedsUndefinedAwait.emitThen()) {
+      return false;
+    }
+
+    if (!bce_->emit1(JSOp::Undefined)) {
+      return false;
+    }
+
+    if (!bce_->emitAwaitInScope(es)) {
+      return false;
+    }
+
+    if (!bce_->emit1(JSOp::Pop)) {
+      return false;
+    }
+
+    if (!ifNeedsUndefinedAwait.emitEnd()) {
+      return false;
+    }
+  }
+
+  if (!bce_->emit1(JSOp::Swap)) {
+    return false;
+  }
+
+#ifdef DEBUG
+  state_ = State::End;
+#endif
+  return true;
+}
+
+bool UsingEmitter::emitDisposeResourcesForEnvironment(EmitterScope& es) {
+
+  DisposalEmitter de(bce_, hasAwaitUsing_);
+  if (!de.prepareForDisposeCapability()) {
+    return false;
+  }
+
+  if (!emitTakeDisposeCapability()) {
+    return false;
+  }
+
+  if (!de.emitEnd(es)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool UsingEmitter::prepareForDisposableScopeBody(BlockKind blockKind) {
+  MOZ_ASSERT(state_ == State::Start);
+
+  if (blockKind != BlockKind::ForOf) {
+    tryEmitter_ = bce_->fc->getAllocator()->make_unique<TryEmitter>(
+        bce_, TryEmitter::Kind::TryFinally, TryEmitter::ControlKind::Disposal);
+    if (!tryEmitter_) {
+      return false;
+    }
+
+    if (!tryEmitter_->emitTry()) {
+      return false;
+    }
+  }
+
+#ifdef DEBUG
+  state_ = State::DisposableScopeBody;
+#endif
+  return true;
+}
+
+bool UsingEmitter::emitGetDisposeMethod(UsingHint hint) {
+
+  if (hint == UsingHint::Async) {
+    if (!bce_->emit1(JSOp::Dup)) {
+      return false;
+    }
+
+    if (!bce_->emit1(JSOp::Dup)) {
+      return false;
+    }
+
+    if (!bce_->emit2(JSOp::Symbol, uint8_t(JS::SymbolCode::asyncDispose))) {
+      return false;
+    }
+
+    if (!bce_->emit1(JSOp::GetElem)) {
+      return false;
+    }
+
+    if (!bce_->emit1(JSOp::IsNullOrUndefined)) {
+      return false;
+    }
+
+    InternalIfEmitter ifAsyncDisposeNullOrUndefined(bce_);
+
+    if (!ifAsyncDisposeNullOrUndefined.emitThenElse()) {
+      return false;
+    }
+
+    if (!bce_->emit1(JSOp::Pop)) {
+      return false;
+    }
+
+    if (!bce_->emit1(JSOp::Dup)) {
+      return false;
+    }
+
+    if (!bce_->emit2(JSOp::Symbol, uint8_t(JS::SymbolCode::dispose))) {
+      return false;
+    }
+
+    if (!bce_->emit1(JSOp::GetElem)) {
+      return false;
+    }
+
+    if (!bce_->emit1(JSOp::True)) {
+      return false;
+    }
+
+    if (!ifAsyncDisposeNullOrUndefined.emitElse()) {
+      return false;
+    }
+
+    if (!bce_->emit1(JSOp::False)) {
+      return false;
+    }
+
+    if (!ifAsyncDisposeNullOrUndefined.emitEnd()) {
+      return false;
+    }
+
+  } else {
+    MOZ_ASSERT(hint == UsingHint::Sync);
+
+    if (!bce_->emit1(JSOp::Dup)) {
+      return false;
+    }
+
+    if (!bce_->emit1(JSOp::Dup)) {
+      return false;
+    }
+
+    if (!bce_->emit2(JSOp::Symbol, uint8_t(JS::SymbolCode::dispose))) {
+      return false;
+    }
+
+    if (!bce_->emit1(JSOp::GetElem)) {
+      return false;
+    }
+
+    if (!bce_->emit1(JSOp::False)) {
+      return false;
+    }
+  }
+
+  if (!bce_->emitDupAt(1)) {
+    return false;
+  }
+
+  if (!bce_->emitCheckIsCallable()) {
+    return false;
+  }
+
+  InternalIfEmitter ifMethodNotCallable(bce_);
+
+  if (!ifMethodNotCallable.emitThen(IfEmitter::ConditionKind::Negative)) {
+    return false;
+  }
+
+  if (!bce_->emit2(JSOp::ThrowMsg, uint8_t(ThrowMsgKind::DisposeNotCallable))) {
+    return false;
+  }
+
+  if (!ifMethodNotCallable.emitEnd()) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Pop)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool UsingEmitter::emitCreateDisposableResource(UsingHint hint) {
+
+  if (!bce_->emit1(JSOp::IsNullOrUndefined)) {
+    return false;
+  }
+
+  InternalIfEmitter ifNullUndefined(bce_);
+
+  if (!ifNullUndefined.emitThenElse()) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Undefined)) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Undefined)) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::False)) {
+    return false;
+  }
+
+  if (!ifNullUndefined.emitElse()) {
+    return false;
+  }
+
+  if (!bce_->emitCheckIsObj(CheckIsObjectKind::Disposable)) {
+    return false;
+  }
+
+  if (!emitGetDisposeMethod(hint)) {
+    return false;
+  }
+
+  if (!ifNullUndefined.emitEnd()) {
+    return false;
+  }
+
+  return true;
+}
+
+bool UsingEmitter::prepareForAssignment(UsingHint hint) {
+  MOZ_ASSERT(state_ == State::DisposableScopeBody);
+  MOZ_ASSERT(bce_->innermostEmitterScope()->hasDisposables());
+
+  if (hint == UsingHint::Async) {
+    setHasAwaitUsing(true);
+  }
+
+
+  if (hint == UsingHint::Sync) {
+    if (!bce_->emit1(JSOp::IsNullOrUndefined)) {
+      return false;
+    }
+
+    if (!bce_->emit1(JSOp::Not)) {
+      return false;
+    }
+  } else {
+    MOZ_ASSERT(hint == UsingHint::Async);
+    if (!bce_->emit1(JSOp::True)) {
+      return false;
+    }
+  }
+
+
+  InternalIfEmitter ifCreateResource(bce_);
+
+  if (!ifCreateResource.emitThen()) {
+    return false;
+  }
+
+  if (!emitCreateDisposableResource(hint)) {
+    return false;
+  }
+
+  if (!bce_->emit2(JSOp::AddDisposable, uint8_t(hint))) {
+    return false;
+  }
+
+  if (!ifCreateResource.emitEnd()) {
+    return false;
+  }
+
+  return true;
+}
+
+bool ForOfDisposalEmitter::prepareForForOfLoopIteration() {
+  MOZ_ASSERT(state_ == State::Start);
+  EmitterScope* es = bce_->innermostEmitterScopeNoCheck();
+  MOZ_ASSERT(es->hasDisposables());
+
+  if (!bce_->emit1(JSOp::False)) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Undefined)) {
+    return false;
+  }
+
+  if (!emitDisposeResourcesForEnvironment(*es)) {
+    return false;
+  }
+
+  if (!emitThrowIfException()) {
+    return false;
+  }
+
+#ifdef DEBUG
+  state_ = State::Iteration;
+#endif
+  return true;
+}
+
+bool ForOfDisposalEmitter::prepareForForOfIteratorClose() {
+  MOZ_ASSERT(state_ == State::Iteration);
+  EmitterScope* es = bce_->innermostEmitterScopeNoCheck();
+  MOZ_ASSERT(es->hasDisposables());
+
+
+  if (hasAwaitUsing()) {
+    if (!bce_->emit1(JSOp::GetRval)) {
+      return false;
+    }
+    if (!bce_->emitUnpickN(2)) {
+      return false;
+    }
+  }
+
+  if (!bce_->emit1(JSOp::Swap)) {
+    return false;
+  }
+
+  if (!emitDisposeResourcesForEnvironment(*es)) {
+    return false;
+  }
+
+  if (hasAwaitUsing()) {
+    if (!bce_->emitPickN(2)) {
+      return false;
+    }
+    if (!bce_->emit1(JSOp::SetRval)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool UsingEmitter::emitEnd() {
+  MOZ_ASSERT(state_ == State::DisposableScopeBody);
+  EmitterScope* es = bce_->innermostEmitterScopeNoCheck();
+  MOZ_ASSERT(es->hasDisposables());
+  MOZ_ASSERT(tryEmitter_.get() != nullptr);
+
+  if (!tryEmitter_->emitFinally()) {
+    return false;
+  }
+
+  if (!bce_->emitDupAt(tryEmitter_->shouldUpdateRval() ? 1 : 0)) {
+    return false;
+  }
+
+  InternalIfEmitter ifThrowing(bce_);
+
+  if (!ifThrowing.emitThenElse()) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::True)) {
+    return false;
+  }
+
+  if (!bce_->emitDupAt(tryEmitter_->shouldUpdateRval() ? 4 : 3)) {
+    return false;
+  }
+
+  if (!ifThrowing.emitElse()) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::False)) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Undefined)) {
+    return false;
+  }
+
+  if (!ifThrowing.emitEnd()) {
+    return false;
+  }
+
+  if (!emitDisposeResourcesForEnvironment(*es)) {
+    return false;
+  }
+
+  if (bce_->sc->isSuspendableContext() &&
+      bce_->sc->asSuspendableContext()->isGenerator()) {
+
+    if (!bce_->emit1(JSOp::Swap)) {
+      return false;
+    }
+
+    if (!bce_->emit1(JSOp::IsGenClosing)) {
+      return false;
+    }
+
+    if (!bce_->emit1(JSOp::Not)) {
+      return false;
+    }
+
+    if (!bce_->emitPickN(2)) {
+      return false;
+    }
+
+    if (!bce_->emit1(JSOp::BitAnd)) {
+      return false;
+    }
+  }
+
+  if (!emitThrowIfException()) {
+    return false;
+  }
+
+  if (!tryEmitter_->emitEnd()) {
+    return false;
+  }
+
+#ifdef DEBUG
+  state_ = State::End;
+#endif
+  return true;
+}
+
+bool NonLocalIteratorCloseUsingEmitter::prepareForIteratorClose(
+    EmitterScope& es) {
+  MOZ_ASSERT(state_ == State::Start);
+  if (!es.hasDisposables()) {
+#ifdef DEBUG
+    state_ = State::IteratorClose;
+#endif
+    return true;
+  }
+
+  setHasAwaitUsing(es.hasAsyncDisposables());
+
+
+  if (hasAwaitUsing()) {
+    if (!bce_->emit1(JSOp::GetRval)) {
+      return false;
+    }
+  }
+
+
+  if (!bce_->emit1(JSOp::False)) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Undefined)) {
+    return false;
+  }
+
+  if (!emitDisposeResourcesForEnvironment(es)) {
+    return false;
+  }
+
+  if (!bce_->emitPickN(hasAwaitUsing() ? 3 : 2)) {
+    return false;
+  }
+
+  if (hasAwaitUsing()) {
+    if (!bce_->emitPickN(3)) {
+      return false;
+    }
+
+    if (!bce_->emit1(JSOp::SetRval)) {
+      return false;
+    }
+  }
+
+  tryClosingIterator_ = bce_->fc->getAllocator()->make_unique<TryEmitter>(
+      bce_, TryEmitter::Kind::TryCatch, TryEmitter::ControlKind::NonSyntactic);
+  if (!tryClosingIterator_) {
+    return false;
+  }
+
+  if (!tryClosingIterator_->emitTry()) {
+    return false;
+  }
+
+#ifdef DEBUG
+  state_ = State::IteratorClose;
+#endif
+  return true;
+}
+
+bool NonLocalIteratorCloseUsingEmitter::emitEnd() {
+  MOZ_ASSERT(state_ == State::IteratorClose);
+
+  if (!tryClosingIterator_) {
+#ifdef DEBUG
+    state_ = State::End;
+#endif
+    return true;
+  }
+
+
+  if (!tryClosingIterator_->emitCatch()) {
+    return false;
+  }
+
+  if (!bce_->emitPickN(2)) {
+    return false;
+  }
+
+  InternalIfEmitter ifDisposeWasThrowing(bce_);
+
+  if (!ifDisposeWasThrowing.emitThenElse()) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Pop)) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::True)) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Swap)) {
+    return false;
+  }
+
+  if (!ifDisposeWasThrowing.emitElse()) {
+    return false;
+  }
+
+  if (!bce_->emitPickN(2)) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Pop)) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Swap)) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::True)) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Swap)) {
+    return false;
+  }
+
+  if (!ifDisposeWasThrowing.emitEnd()) {
+    return false;
+  }
+
+  if (!tryClosingIterator_->emitEnd()) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Swap)) {
+    return false;
+  }
+
+  InternalIfEmitter ifThrowing(bce_);
+
+  if (!ifThrowing.emitThenElse()) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Swap)) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Throw)) {
+    return false;
+  }
+
+  if (!ifThrowing.emitElse()) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Swap)) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Pop)) {
+    return false;
+  }
+
+  if (!ifThrowing.emitEnd()) {
+    return false;
+  }
+
+#ifdef DEBUG
+  state_ = State::End;
+#endif
+  return true;
+}

@@ -1,0 +1,199 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_MEDIA_MEDIACONTROL_MEDIACONTROLLER_H_
+#define DOM_MEDIA_MEDIACONTROL_MEDIACONTROLLER_H_
+
+#include "AudioSessionManager.h"
+#include "AudioSessionRecord.h"
+#include "MediaEventSource.h"
+#include "MediaPlaybackStatus.h"
+#include "MediaStatusManager.h"
+#include "mozilla/DOMEventTargetHelper.h"
+#include "mozilla/LinkedList.h"
+#include "mozilla/dom/AudioSessionBinding.h"
+#include "mozilla/dom/MediaControllerBinding.h"
+#include "mozilla/dom/MediaSession.h"
+#include "nsISupportsImpl.h"
+#include "nsITimer.h"
+
+namespace mozilla::dom {
+
+class BrowsingContext;
+enum class AudioFocusInterruptAction : uint8_t;
+
+class IMediaController {
+ public:
+  NS_INLINE_DECL_PURE_VIRTUAL_REFCOUNTING
+
+  virtual void Focus() = 0;
+  virtual void Play() = 0;
+  virtual void Pause() = 0;
+  virtual void Stop() = 0;
+  virtual void PrevTrack() = 0;
+  virtual void NextTrack() = 0;
+  virtual void SeekBackward(double aSeekOffset) = 0;
+  virtual void SeekForward(double aSeekOffset) = 0;
+  virtual void SkipAd() = 0;
+  virtual void SeekTo(double aSeekTime, bool aFastSeek) = 0;
+  virtual void SetVolume(double aVolume) = 0;
+  virtual void Mute() = 0;
+  virtual void Unmute() = 0;
+
+  virtual uint64_t Id() const = 0;
+  virtual bool IsAudible() const = 0;
+  virtual bool IsPlaying() const = 0;
+  virtual bool IsActive() const = 0;
+};
+
+class MediaController final : public DOMEventTargetHelper,
+                              public IMediaController,
+                              public LinkedListElement<RefPtr<MediaController>>,
+                              public MediaStatusManager,
+                              public nsITimerCallback,
+                              public nsINamed {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_NSITIMERCALLBACK
+  NS_DECL_NSINAMED
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_CLASS_INHERITED(MediaController,
+                                                         DOMEventTargetHelper)
+  explicit MediaController(uint64_t aBrowsingContextId);
+
+  nsISupports* GetParentObject() const;
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+  void GetSupportedKeys(nsTArray<MediaControlKey>& aRetVal) const;
+  void GetMetadata(MediaMetadataInit& aMetadata, ErrorResult& aRv);
+  IMPL_EVENT_HANDLER(activated);
+  IMPL_EVENT_HANDLER(deactivated);
+  IMPL_EVENT_HANDLER(audiblechange);
+  IMPL_EVENT_HANDLER(effectiveaudiosessiontypechange);
+  IMPL_EVENT_HANDLER(metadatachange);
+  IMPL_EVENT_HANDLER(supportedkeyschange);
+  IMPL_EVENT_HANDLER(playbackstatechange);
+  IMPL_EVENT_HANDLER(positionstatechange);
+
+  void Focus() override;
+  void Play() override;
+  void Pause() override;
+  void Stop() override;
+  void PrevTrack() override;
+  void NextTrack() override;
+  void SeekBackward(double aSeekOffset) override;
+  void SeekForward(double aSeekOffset) override;
+  void SkipAd() override;
+  void SeekTo(double aSeekTime, bool aFastSeek) override;
+  void SetVolume(double aVolume) override;
+  void Mute() override;
+  void Unmute() override;
+
+  void PauseWithReason(AudioFocusLossReason aReason);
+  void Resume();
+
+  uint64_t Id() const override;
+  bool IsAudible() const override;
+  bool IsPlaying() const override;
+  bool IsActive() const override;
+  bool IsMuted() const;
+
+  void NotifyMediaPlaybackChanged(uint64_t aBrowsingContextId,
+                                  MediaPlaybackState aState) override;
+  void NotifyMediaAudibleChanged(
+      uint64_t aBrowsingContextId, MediaAudibleState aState,
+      ControlType aType = ControlType::eControllable,
+      AudioSessionType aSessionType = AudioSessionType::Playback) override;
+  void NotifyBrowsingContextDiscarded(uint64_t aBrowsingContextId) override;
+  void NotifyMediaFullScreenState(uint64_t aBrowsingContextId,
+                                  bool aIsInFullScreen) override;
+
+  void Shutdown();
+
+  MediaEventSource<nsTArray<MediaControlKey>>& SupportedKeysChangedEvent() {
+    return mSupportedKeysChangedEvent;
+  }
+
+  MediaEventSource<bool>& FullScreenChangedEvent() {
+    return mFullScreenChangedEvent;
+  }
+
+  CopyableTArray<MediaControlKey> GetSupportedMediaKeys() const;
+
+  bool IsBeingUsedInFullscreen() const;
+
+  void Select() const;
+  void Unselect() const;
+
+  void SetAudioSessionTypeOverride(uint64_t aBrowsingContextId,
+                                   AudioSessionType aType);
+
+  void ClearAudioSessionFor(uint64_t aBrowsingContextId);
+
+  void InterruptAudioSession(AudioSessionInterruptKind aKind);
+  void RestoreAudioSession();
+
+  AudioSessionType GetEffectiveAudioSessionType() const;
+
+  const AudioSessionRecord* GetAudioSessionRecordForTesting(
+      uint64_t aBrowsingContextId) const;
+
+  const AudioSessionManager* GetAudioSessionManagerForTesting() const;
+
+ private:
+  friend class AudioSessionManager;
+
+  ~MediaController();
+  void HandleActualPlaybackStateChanged();
+  void UpdateMediaControlActionToContentMediaIfNeeded(
+      const MediaControlAction& aAction);
+  void UpdateMediaSessionInterruptToContentMediaIfNeeded(
+      AudioFocusInterruptAction aAction);
+  void HandleSupportedMediaSessionActionsChanged(
+      const nsTArray<MediaSessionAction>& aSupportedAction);
+
+  void HandlePositionStateChanged(const Maybe<PositionState>& aState);
+  void HandleMetadataChanged(const MediaMetadataBase& aMetadata);
+
+  void Activate();
+
+  void Deactivate();
+
+  void UpdateActivatedStateIfNeeded();
+  bool ShouldActivateController() const;
+  bool ShouldDeactivateController() const;
+
+  void UpdateDeactivationTimerIfNeeded();
+
+  void DispatchAsyncEvent(const nsAString& aName);
+  void DispatchAsyncEvent(already_AddRefed<Event> aEvent);
+
+  bool IsMainController() const;
+  void ForceToBecomeMainControllerIfNeeded();
+  bool ShouldRequestForMainController() const;
+
+  bool ShouldPropagateActionToAllContexts(
+      const MediaControlAction& aAction) const;
+
+  bool mIsActive = false;
+  bool mShutdown = false;
+  bool mIsMuted = false;
+  bool mIsInFullScreenMode = false;
+
+  MediaEventListener mSupportedActionsChangedListener;
+  MediaEventProducer<nsTArray<MediaControlKey>> mSupportedKeysChangedEvent;
+
+  MediaEventListener mPlaybackChangedListener;
+  MediaEventListener mPositionStateChangedListener;
+  MediaEventListener mMetadataChangedListener;
+
+  MediaEventProducer<bool> mFullScreenChangedEvent;
+  CopyableTArray<MediaControlKey> mSupportedKeys;
+  nsCOMPtr<nsITimer> mDeactivationTimer;
+
+  AudioSessionManager mAudioSessionManager;
+};
+
+}  
+
+#endif

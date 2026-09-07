@@ -1,0 +1,607 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#include "AudioStream.h"
+
+#include <math.h>
+#include <stdio.h>
+
+#include <algorithm>
+#include <mutex>
+
+#include "AudioConverter.h"
+#include "CubebUtils.h"
+#include "UnderrunHandler.h"
+#include "VideoUtils.h"
+#include "mozilla/Logging.h"
+#include "mozilla/Monitor.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/Sprintf.h"
+#include "mozilla/dom/AudioDeviceInfo.h"
+#include "nsNativeCharsetUtils.h"
+#include "nsPrintfCString.h"
+#include "prdtoa.h"
+#include "SoundTouchAdapter.h"
+#include "mozilla/StaticPrefs_media.h"
+#include "webaudio/blink/DenormalDisabler.h"
+
+namespace mozilla {
+
+LazyLogModule gAudioStreamLog("AudioStream");
+#define LOG(x, ...)                                               \
+  MOZ_LOG_FMT(gAudioStreamLog, mozilla::LogLevel::Debug, "{} " x, \
+              fmt::ptr(this), ##__VA_ARGS__)
+#define LOGW(x, ...)                                                \
+  MOZ_LOG_FMT(gAudioStreamLog, mozilla::LogLevel::Warning, "{} " x, \
+              fmt::ptr(this), ##__VA_ARGS__)
+#define LOGE(x, ...)                                                          \
+  NS_DebugBreak(NS_DEBUG_WARNING,                                             \
+                nsPrintfCString("%p " x, this, ##__VA_ARGS__).get(), nullptr, \
+                __FILE__, __LINE__)
+
+class FrameHistory {
+  struct Chunk {
+    uint32_t servicedFrames;
+    uint32_t totalFrames;
+    uint32_t rate;
+  };
+
+  template <typename T>
+  static T FramesToUs(uint32_t frames, uint32_t rate) {
+    return static_cast<T>(frames) * USECS_PER_S / rate;
+  }
+
+ public:
+  FrameHistory() : mBaseOffset(0), mBasePosition(0) {}
+
+  void Append(uint32_t aServiced, uint32_t aUnderrun, uint32_t aRate) {
+    if (!mChunks.IsEmpty()) {
+      Chunk& c = mChunks.LastElement();
+      if (c.rate == aRate &&
+          (c.servicedFrames == c.totalFrames || aServiced == 0)) {
+        c.servicedFrames += aServiced;
+        c.totalFrames += aServiced + aUnderrun;
+        return;
+      }
+    }
+    Chunk* p = mChunks.AppendElement();
+    p->servicedFrames = aServiced;
+    p->totalFrames = aServiced + aUnderrun;
+    p->rate = aRate;
+  }
+
+  int64_t GetPosition(int64_t frames) {
+    MOZ_ASSERT(frames >= mBaseOffset);
+    while (true) {
+      if (mChunks.IsEmpty()) {
+        return static_cast<int64_t>(mBasePosition);
+      }
+      const Chunk& c = mChunks[0];
+      if (frames <= mBaseOffset + c.totalFrames) {
+        uint32_t delta = frames - mBaseOffset;
+        delta = std::min(delta, c.servicedFrames);
+        return static_cast<int64_t>(mBasePosition) +
+               FramesToUs<int64_t>(delta, c.rate);
+      }
+      mBaseOffset += c.totalFrames;
+      mBasePosition += FramesToUs<double>(c.servicedFrames, c.rate);
+      mChunks.RemoveElementAt(0);
+    }
+  }
+
+ private:
+  AutoTArray<Chunk, 7> mChunks;
+  int64_t mBaseOffset;
+  double mBasePosition;
+};
+
+AudioStream::AudioStream(DataSource& aSource, uint32_t aInRate,
+                         uint32_t aOutputChannels,
+                         AudioConfig::ChannelLayout::ChannelMap aChannelMap)
+    : mTimeStretcher(nullptr),
+      mAudioClock(aInRate),
+      mChannelMap(aChannelMap),
+      mMonitor("AudioStream"),
+      mOutChannels(aOutputChannels),
+      mState(INITIALIZED),
+      mDataSource(aSource),
+      mAudioThreadId(std::thread::id()),
+      mPlaybackComplete(false),
+      mPlaybackRate(1.0f),
+      mPreservesPitch(true),
+      mCallbacksStarted(false) {}
+
+AudioStream::~AudioStream() {
+  LOG("deleted, state {}", static_cast<int>(mState.load()));
+  MOZ_ASSERT(mState == SHUTDOWN && !mCubebStream,
+             "Should've called ShutDown() before deleting an AudioStream");
+}
+
+size_t AudioStream::SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const {
+  size_t amount = aMallocSizeOf(this);
+
+
+  return amount;
+}
+
+nsresult AudioStream::EnsureTimeStretcherInitialized() {
+  AssertIsOnAudioThread();
+  if (!mTimeStretcher) {
+    auto timestretcher = MakeUnique<SoundTouchAdapter>();
+    if (!timestretcher || !timestretcher->Init()) {
+      return NS_ERROR_FAILURE;
+    }
+    mTimeStretcher = timestretcher.release();
+
+    mTimeStretcher->setSampleRate(mAudioClock.GetInputRate());
+    mTimeStretcher->setChannels(mOutChannels);
+    mTimeStretcher->setPitch(1.0);
+
+    mTimeStretcher->setSetting(
+        SETTING_SEQUENCE_MS,
+        StaticPrefs::media_audio_playbackrate_soundtouch_sequence_ms());
+    mTimeStretcher->setSetting(
+        SETTING_SEEKWINDOW_MS,
+        StaticPrefs::media_audio_playbackrate_soundtouch_seekwindow_ms());
+    mTimeStretcher->setSetting(
+        SETTING_OVERLAP_MS,
+        StaticPrefs::media_audio_playbackrate_soundtouch_overlap_ms());
+  }
+  return NS_OK;
+}
+
+nsresult AudioStream::SetPlaybackRate(double aPlaybackRate) {
+  NS_ASSERTION(
+      aPlaybackRate > 0.0,
+      "Can't handle negative or null playbackrate in the AudioStream.");
+  if (aPlaybackRate == mPlaybackRate) {
+    return NS_OK;
+  }
+
+  mPlaybackRate = static_cast<float>(aPlaybackRate);
+
+  return NS_OK;
+}
+
+nsresult AudioStream::SetPreservesPitch(bool aPreservesPitch) {
+  if (aPreservesPitch == mPreservesPitch) {
+    return NS_OK;
+  }
+
+  mPreservesPitch = aPreservesPitch;
+
+  return NS_OK;
+}
+
+template <typename Function, typename... Args>
+int AudioStream::InvokeCubeb(Function aFunction, Args&&... aArgs) {
+  mMonitor.AssertCurrentThreadOwns();
+  MonitorAutoUnlock mon(mMonitor);
+  return aFunction(mCubebStream.get(), std::forward<Args>(aArgs)...);
+}
+
+nsresult AudioStream::Init(AudioDeviceInfo* aSinkInfo)
+    MOZ_NO_THREAD_SAFETY_ANALYSIS {
+  auto startTime = TimeStamp::Now();
+
+  LOG("{} channels: {}, rate: {}", __FUNCTION__, mOutChannels,
+      mAudioClock.GetInputRate());
+
+  mSinkInfo = aSinkInfo;
+
+  cubeb_stream_params params;
+  params.rate = mAudioClock.GetInputRate();
+  params.channels = mOutChannels;
+  params.layout = static_cast<uint32_t>(mChannelMap);
+  params.format = CubebUtils::ToCubebFormat<AUDIO_OUTPUT_FORMAT>::value;
+  params.prefs = CubebUtils::GetDefaultStreamPrefs(CUBEB_DEVICE_TYPE_OUTPUT);
+  params.input_params = CUBEB_INPUT_PROCESSING_PARAM_NONE;
+
+  mDumpFile.Open("AudioStream", mOutChannels, mAudioClock.GetInputRate());
+
+  RefPtr<CubebUtils::CubebHandle> handle = CubebUtils::GetCubeb();
+  if (!handle) {
+    LOGE("Can't get cubeb context!");
+    return NS_ERROR_DOM_MEDIA_CUBEB_INITIALIZATION_ERR;
+  }
+
+  mCubeb = handle;
+  return OpenCubeb(handle->Context(), params, startTime,
+                   CubebUtils::GetFirstStream());
+}
+
+nsresult AudioStream::OpenCubeb(cubeb* aContext, cubeb_stream_params& aParams,
+                                TimeStamp aStartTime, bool aIsFirst) {
+  MOZ_ASSERT(aContext);
+
+  cubeb_stream* stream = nullptr;
+  uint32_t latency_frames =
+      CubebUtils::GetCubebPlaybackLatencyInMilliseconds() * aParams.rate / 1000;
+  cubeb_devid deviceID = nullptr;
+  if (mSinkInfo && mSinkInfo->DeviceID()) {
+    deviceID = mSinkInfo->DeviceID();
+  }
+  if (CubebUtils::CubebStreamInit(aContext, &stream, "AudioStream", nullptr,
+                                  nullptr, deviceID, &aParams, latency_frames,
+                                  DataCallback_S, StateCallback_S,
+                                  this) == CUBEB_OK) {
+    mCubebStream.reset(stream);
+  } else {
+    LOGE("OpenCubeb() failed to init cubeb");
+    return NS_ERROR_FAILURE;
+  }
+
+  TimeDuration timeDelta = TimeStamp::Now() - aStartTime;
+  LOG("creation time {}first: {} ms", aIsFirst ? "" : "not ",
+      (uint32_t)timeDelta.ToMilliseconds());
+
+  return NS_OK;
+}
+
+void AudioStream::SetVolume(double aVolume) {
+  MOZ_ASSERT(aVolume >= 0.0 && aVolume <= 1.0, "Invalid volume");
+
+  MOZ_ASSERT(mState != SHUTDOWN, "Don't set volume after shutdown.");
+  if (mState == ERRORED) {
+    return;
+  }
+
+  MonitorAutoLock mon(mMonitor);
+  if (InvokeCubeb(cubeb_stream_set_volume,
+                  aVolume * CubebUtils::GetVolumeScale()) != CUBEB_OK) {
+    LOGE("Could not change volume on cubeb stream.");
+  }
+}
+
+void AudioStream::SetStreamName(const nsAString& aStreamName) {
+
+  nsAutoCString aRawStreamName;
+  nsresult rv = NS_CopyUnicodeToNative(aStreamName, aRawStreamName);
+
+  if (NS_FAILED(rv) || aStreamName.IsEmpty()) {
+    return;
+  }
+
+  MonitorAutoLock mon(mMonitor);
+  int r = InvokeCubeb(cubeb_stream_set_name, aRawStreamName.get());
+  if (r && r != CUBEB_ERROR_NOT_SUPPORTED) {
+    LOGE("Could not set cubeb stream name.");
+  }
+}
+
+RefPtr<MediaSink::EndedPromise> AudioStream::Start() {
+  MOZ_ASSERT(mState == INITIALIZED);
+  mState = STARTED;
+  RefPtr<MediaSink::EndedPromise> promise;
+  {
+    MonitorAutoLock mon(mMonitor);
+    promise = mEndedPromise.Ensure(__func__);
+    mPlaybackComplete = false;
+
+    if (InvokeCubeb(cubeb_stream_start) != CUBEB_OK) {
+      mState = ERRORED;
+      mEndedPromise.RejectIfExists(NS_ERROR_FAILURE, __func__);
+    }
+
+    LOG("started, state {}", mState == STARTED   ? "STARTED"
+                             : mState == DRAINED ? "DRAINED"
+                                                 : "ERRORED");
+  }
+  return promise;
+}
+
+void AudioStream::Pause() {
+  MOZ_ASSERT(mState != INITIALIZED, "Must be Start()ed.");
+  MOZ_ASSERT(mState != STOPPED, "Already Pause()ed.");
+  MOZ_ASSERT(mState != SHUTDOWN, "Already ShutDown()ed.");
+
+  if (mState == DRAINED || mState == ERRORED) {
+    return;
+  }
+
+  MonitorAutoLock mon(mMonitor);
+  if (InvokeCubeb(cubeb_stream_stop) != CUBEB_OK) {
+    mState = ERRORED;
+  } else if (mState != DRAINED && mState != ERRORED) {
+    mState = STOPPED;
+  }
+}
+
+void AudioStream::Resume() {
+  MOZ_ASSERT(mState != INITIALIZED, "Must be Start()ed.");
+  MOZ_ASSERT(mState != STARTED, "Already Start()ed.");
+  MOZ_ASSERT(mState != SHUTDOWN, "Already ShutDown()ed.");
+
+  if (mState == DRAINED || mState == ERRORED) {
+    return;
+  }
+
+  MonitorAutoLock mon(mMonitor);
+  if (InvokeCubeb(cubeb_stream_start) != CUBEB_OK) {
+    mState = ERRORED;
+  } else if (mState != DRAINED && mState != ERRORED) {
+    mState = STARTED;
+  }
+}
+
+void AudioStream::ShutDown() {
+  LOG("ShutDown, state {}", static_cast<int>(mState.load()));
+
+  MonitorAutoLock mon(mMonitor);
+  if (mCubebStream) {
+    InvokeCubeb(cubeb_stream_stop);
+    cubeb_stream* cubeb = mCubebStream.release();
+    MonitorAutoUnlock unlock(mMonitor);
+    cubeb_stream_destroy(cubeb);
+  }
+
+  if (mTimeStretcher) {
+    delete mTimeStretcher;
+    mTimeStretcher = nullptr;
+  }
+
+  mState = SHUTDOWN;
+  mEndedPromise.ResolveIfExists(true, __func__);
+}
+
+int64_t AudioStream::GetPosition() {
+  MonitorAutoLock mon(mMonitor);
+  int64_t frames = GetPositionInFramesUnlocked();
+  return frames >= 0 ? mAudioClock.GetPosition(frames) : -1;
+}
+
+int64_t AudioStream::GetPositionInFrames() {
+  MonitorAutoLock mon(mMonitor);
+  int64_t frames = GetPositionInFramesUnlocked();
+
+  return frames >= 0 ? mAudioClock.GetPositionInFrames(frames) : -1;
+}
+
+int64_t AudioStream::GetPositionInFramesUnlocked() {
+  mMonitor.AssertCurrentThreadOwns();
+
+  if (mState == ERRORED) {
+    return -1;
+  }
+
+  uint64_t position = 0;
+  int rv;
+
+  rv = InvokeCubeb(cubeb_stream_get_position, &position);
+
+  if (rv != CUBEB_OK) {
+    return -1;
+  }
+  return static_cast<int64_t>(std::min<uint64_t>(position, INT64_MAX));
+}
+
+bool AudioStream::IsValidAudioFormat(Chunk* aChunk) {
+  if (aChunk->Rate() != mAudioClock.GetInputRate()) {
+    LOGW("mismatched sample {}, mInRate={}", aChunk->Rate(),
+         mAudioClock.GetInputRate());
+    return false;
+  }
+
+  return aChunk->Channels() <= 8;
+}
+
+void AudioStream::GetUnprocessed(AudioBufferWriter& aWriter) {
+  AssertIsOnAudioThread();
+  if (mTimeStretcher) {
+    auto numSamples = mTimeStretcher->numSamples();
+    if (numSamples) {
+      SoundTouchAdapter* timeStretcher = mTimeStretcher;
+      aWriter.Write(
+          [timeStretcher](AudioDataValue* aPtr, uint32_t aFrames) {
+            return timeStretcher->receiveSamples(aPtr, aFrames);
+          },
+          aWriter.Available());
+
+      NS_WARNING_ASSERTION(mTimeStretcher->numUnprocessedSamples() == 0,
+                           "no samples");
+    } else {
+      delete mTimeStretcher;
+      mTimeStretcher = nullptr;
+    }
+  }
+
+  while (aWriter.Available() > 0) {
+    uint32_t count = mDataSource.PopFrames(aWriter.Ptr(), aWriter.Available(),
+                                           mAudioThreadChanged);
+    if (count == 0) {
+      break;
+    }
+    aWriter.Advance(count);
+  }
+}
+
+void AudioStream::GetTimeStretched(AudioBufferWriter& aWriter) {
+  AssertIsOnAudioThread();
+  if (EnsureTimeStretcherInitialized() != NS_OK) {
+    return;
+  }
+
+  uint32_t toPopFrames =
+      ceil(aWriter.Available() * mAudioClock.GetPlaybackRate());
+
+  if (!mTimeStretcher) {
+    return;
+  }
+
+  while (mTimeStretcher->numSamples() < aWriter.Available()) {
+    AutoTArray<AudioDataValue, 1000> buf;
+    auto size = CheckedUint32(mOutChannels) * toPopFrames;
+    if (!size.isValid()) {
+      LOGW("Invalid member data: {} channels, {} frames", mOutChannels,
+           toPopFrames);
+      return;
+    }
+    buf.SetLength(size.value());
+    uint32_t count =
+        mDataSource.PopFrames(buf.Elements(), toPopFrames, mAudioThreadChanged);
+    if (count == 0) {
+      break;
+    }
+    mTimeStretcher->putSamples(buf.Elements(), count);
+  }
+
+  auto* timeStretcher = mTimeStretcher;
+  aWriter.Write(
+      [timeStretcher](AudioDataValue* aPtr, uint32_t aFrames) {
+        return timeStretcher->receiveSamples(aPtr, aFrames);
+      },
+      aWriter.Available());
+}
+
+bool AudioStream::CheckThreadIdChanged() {
+  const std::thread::id id = std::this_thread::get_id();
+  if (id != mAudioThreadId) {
+    mAudioThreadId = id;
+    mAudioThreadChanged = true;
+    return true;
+  }
+  mAudioThreadChanged = false;
+  return false;
+}
+
+void AudioStream::AssertIsOnAudioThread() const {
+  MOZ_ASSERT(mAudioThreadId.load() == std::this_thread::get_id());
+}
+
+void AudioStream::UpdatePlaybackRateIfNeeded() {
+  AssertIsOnAudioThread();
+  if (mAudioClock.GetPreservesPitch() == mPreservesPitch &&
+      mAudioClock.GetPlaybackRate() == mPlaybackRate) {
+    return;
+  }
+
+  EnsureTimeStretcherInitialized();
+
+  mAudioClock.SetPlaybackRate(mPlaybackRate);
+  mAudioClock.SetPreservesPitch(mPreservesPitch);
+
+  if (!mTimeStretcher) {
+    return;
+  }
+
+  if (mPreservesPitch) {
+    mTimeStretcher->setTempo(mPlaybackRate);
+    mTimeStretcher->setRate(1.0f);
+  } else {
+    mTimeStretcher->setTempo(1.0f);
+    mTimeStretcher->setRate(mPlaybackRate);
+  }
+}
+
+long AudioStream::DataCallback(void* aBuffer, long aFrames) {
+  CheckThreadIdChanged();
+  WebCore::DenormalDisabler disabler;
+  if (!mCallbacksStarted) {
+    mCallbacksStarted = true;
+  }
+
+  MOZ_ASSERT(mState != SHUTDOWN, "No data callback after shutdown");
+
+  if (SoftRealTimeLimitReached()) {
+    DemoteThreadFromRealTime();
+  }
+
+  UpdatePlaybackRateIfNeeded();
+
+  auto writer = AudioBufferWriter(
+      Span<AudioDataValue>(reinterpret_cast<AudioDataValue*>(aBuffer),
+                           mOutChannels * aFrames),
+      mOutChannels, aFrames);
+
+  if (mAudioClock.GetInputRate() == mAudioClock.GetOutputRate()) {
+    GetUnprocessed(writer);
+  } else {
+    GetTimeStretched(writer);
+  }
+
+  if (!mDataSource.Ended()) {
+    MonitorAutoLock mon(mMonitor);
+    mAudioClock.UpdateFrameHistory(aFrames - writer.Available(),
+                                   writer.Available(), mAudioThreadChanged);
+    if (writer.Available() > 0) {
+      LOGW("lost {} frames", writer.Available());
+      writer.WriteZeros(writer.Available());
+    }
+  } else {
+    if (mTimeStretcher && writer.Available()) {
+      delete mTimeStretcher;
+      mTimeStretcher = nullptr;
+    }
+    MonitorAutoLock mon(mMonitor);
+    mAudioClock.UpdateFrameHistory(aFrames - writer.Available(), 0,
+                                   mAudioThreadChanged);
+  }
+
+  mDumpFile.Write(static_cast<const AudioDataValue*>(aBuffer),
+                  aFrames * mOutChannels);
+
+  return aFrames - writer.Available();
+}
+
+void AudioStream::StateCallback(cubeb_state aState) {
+  MOZ_ASSERT(mState != SHUTDOWN, "No state callback after shutdown");
+  LOG("StateCallback, mState={} cubeb_state={}",
+      static_cast<int>(mState.load()), static_cast<int>(aState));
+
+  MonitorAutoLock mon(mMonitor);
+  if (aState == CUBEB_STATE_DRAINED) {
+    LOG("Drained");
+    mState = DRAINED;
+    mPlaybackComplete = true;
+    mEndedPromise.ResolveIfExists(true, __func__);
+  } else if (aState == CUBEB_STATE_ERROR) {
+    LOGE("StateCallback() state %d cubeb error", mState.load());
+    mState = ERRORED;
+    mPlaybackComplete = true;
+    mEndedPromise.RejectIfExists(NS_ERROR_FAILURE, __func__);
+  }
+}
+
+bool AudioStream::IsPlaybackCompleted() const { return mPlaybackComplete; }
+
+AudioClock::AudioClock(uint32_t aInRate)
+    : mOutRate(aInRate),
+      mInRate(aInRate),
+      mPreservesPitch(true),
+      mFrameHistory(new FrameHistory()) {}
+
+void AudioClock::UpdateFrameHistory(uint32_t aServiced, uint32_t aUnderrun,
+                                    bool aAudioThreadChanged) {
+  MutexAutoLock lock(mMutex);
+  mFrameHistory->Append(aServiced, aUnderrun, mOutRate);
+}
+
+int64_t AudioClock::GetPositionInFrames(int64_t aFrames) {
+  CheckedInt64 v = UsecsToFrames(GetPosition(aFrames), mInRate);
+  return v.isValid() ? v.value() : -1;
+}
+
+int64_t AudioClock::GetPosition(int64_t frames) {
+  MutexAutoLock lock(mMutex);
+  return mFrameHistory->GetPosition(frames);
+}
+
+void AudioClock::SetPlaybackRate(double aPlaybackRate) {
+  mOutRate = static_cast<uint32_t>(mInRate / aPlaybackRate);
+}
+
+double AudioClock::GetPlaybackRate() const {
+  return static_cast<double>(mInRate) / mOutRate;
+}
+
+void AudioClock::SetPreservesPitch(bool aPreservesPitch) {
+  mPreservesPitch = aPreservesPitch;
+}
+
+bool AudioClock::GetPreservesPitch() const { return mPreservesPitch; }
+
+#undef LOG
+#undef LOGW
+#undef LOGE
+
+}  

@@ -1,0 +1,115 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsCORSListenerProxy_h_
+#define nsCORSListenerProxy_h_
+
+#include "nsIStreamListener.h"
+#include "nsIInterfaceRequestor.h"
+#include "nsCOMPtr.h"
+#include "nsString.h"
+#include "nsIURI.h"
+#include "nsTArray.h"
+#include "nsIInterfaceRequestor.h"
+#include "nsIChannelEventSink.h"
+#include "nsICORSPreflightCache.h"
+#include "nsIThreadRetargetableStreamListener.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/Mutex.h"
+
+class nsIHttpChannel;
+class nsIURI;
+class nsIPrincipal;
+class nsINetworkInterceptController;
+class nsICorsPreflightCallback;
+
+namespace mozilla {
+namespace net {
+class HttpChannelParent;
+class nsHttpChannel;
+}  
+}  
+
+enum class DataURIHandling { Allow, Disallow };
+
+enum class UpdateType {
+  Default,
+  StripRequestBodyHeader,
+  InternalOrHSTSRedirect
+};
+
+class nsCORSListenerProxy final : public nsIInterfaceRequestor,
+                                  public nsIChannelEventSink,
+                                  public nsIThreadRetargetableStreamListener {
+ public:
+  nsCORSListenerProxy(nsIStreamListener* aOuter,
+                      nsIPrincipal* aRequestingPrincipal,
+                      bool aWithCredentials);
+
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIREQUESTOBSERVER
+  NS_DECL_NSISTREAMLISTENER
+  NS_DECL_NSIINTERFACEREQUESTOR
+  NS_DECL_NSICHANNELEVENTSINK
+  NS_DECL_NSITHREADRETARGETABLESTREAMLISTENER
+
+  static already_AddRefed<nsICORSPreflightCache> GetCORSPreflightSingleton();
+
+  static void Shutdown();
+  static void ClearCache();
+  static void ClearPrivateBrowsingCache();
+
+  [[nodiscard]] nsresult Init(nsIChannel* aChannel,
+                              DataURIHandling aAllowDataURI);
+
+  void SetInterceptController(
+      nsINetworkInterceptController* aInterceptController);
+
+  static void LogBlockedCORSRequest(uint64_t aInnerWindowID,
+                                    bool aPrivateBrowsing,
+                                    bool aFromChromeContext,
+                                    const nsAString& aMessage,
+                                    const nsACString& aCategory,
+                                    bool aIsWarning = false);
+
+ private:
+  friend class mozilla::net::HttpChannelParent;
+  friend class mozilla::net::nsHttpChannel;
+
+  static void RemoveFromCorsPreflightCache(
+      nsIURI* aURI, nsIPrincipal* aRequestingPrincipal,
+      const mozilla::OriginAttributes& aOriginAttributes);
+  [[nodiscard]] static nsresult StartCORSPreflight(
+      nsIChannel* aRequestChannel, nsICorsPreflightCallback* aCallback,
+      nsTArray<nsCString>& aUnsafeHeaders, nsIChannel** aPreflightChannel);
+
+  ~nsCORSListenerProxy() = default;
+
+  [[nodiscard]] nsresult UpdateChannel(nsIChannel* aChannel,
+                                       DataURIHandling aAllowDataURI,
+                                       UpdateType aUpdateType,
+                                       bool aStripAuthHeader);
+  [[nodiscard]] nsresult CheckRequestApproved(nsIRequest* aRequest);
+  [[nodiscard]] nsresult CheckPreflightNeeded(nsIChannel* aChannel,
+                                              UpdateType aUpdateType,
+                                              bool aStripAuthHeader);
+
+  nsCOMPtr<nsIStreamListener> mOuterListener MOZ_GUARDED_BY(mMutex);
+  nsCOMPtr<nsIPrincipal> mRequestingPrincipal;
+  nsCOMPtr<nsIPrincipal> mOriginHeaderPrincipal;
+  nsCOMPtr<nsIInterfaceRequestor> mOuterNotificationCallbacks;
+  nsCOMPtr<nsINetworkInterceptController> mInterceptController;
+  bool mWithCredentials;
+  mozilla::Atomic<bool, mozilla::Relaxed> mRequestApproved;
+  bool mHasBeenCrossSite;
+  bool mIsRedirect = false;
+  nsCOMPtr<nsIHttpChannel> mHttpChannel;
+#ifdef DEBUG
+  bool mInited;
+#endif
+
+  mutable mozilla::Mutex mMutex;
+};
+
+#endif

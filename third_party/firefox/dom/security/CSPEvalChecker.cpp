@@ -1,0 +1,154 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/CSPEvalChecker.h"
+
+#include "mozilla/ErrorResult.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/PolicyContainer.h"
+#include "mozilla/dom/WorkerPrivate.h"
+#include "mozilla/dom/WorkerRunnable.h"
+#include "nsCOMPtr.h"
+#include "nsContentSecurityUtils.h"
+#include "nsContentUtils.h"
+#include "nsGlobalWindowInner.h"
+
+using namespace mozilla;
+using namespace mozilla::dom;
+
+namespace {
+
+nsresult CheckInternal(nsIContentSecurityPolicy* aCSP,
+                       nsICSPEventListener* aCSPEventListener,
+                       nsIPrincipal* aSubjectPrincipal,
+                       const nsAString& aExpression,
+                       const JSCallingLocation& aCaller, bool* aAllowed) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aAllowed);
+
+  *aAllowed = false;
+
+  JSContext* cx = nsContentUtils::GetCurrentJSContext();
+  if (!nsContentSecurityUtils::IsEvalAllowed(
+          cx, aSubjectPrincipal->IsSystemPrincipal(), aExpression)) {
+    *aAllowed = false;
+    return NS_OK;
+  }
+
+  if (!aCSP) {
+    *aAllowed = true;
+    return NS_OK;
+  }
+
+  bool reportViolation = false;
+  nsresult rv = aCSP->GetAllowsEval(&reportViolation, aAllowed);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    *aAllowed = false;
+    return rv;
+  }
+
+  if (reportViolation) {
+    aCSP->LogViolationDetails(nsIContentSecurityPolicy::VIOLATION_TYPE_EVAL,
+                              nullptr,  
+                              aCSPEventListener, aCaller.FileName(),
+                              aExpression, aCaller.mLine, aCaller.mColumn,
+                              u""_ns, u""_ns);
+  }
+
+  return NS_OK;
+}
+
+class WorkerCSPCheckRunnable final : public WorkerMainThreadRunnable {
+ public:
+  WorkerCSPCheckRunnable(WorkerPrivate* aWorkerPrivate,
+                         const nsAString& aExpression,
+                         JSCallingLocation&& aCaller)
+      : WorkerMainThreadRunnable(aWorkerPrivate, "CSP Eval Check"_ns),
+        mExpression(aExpression),
+        mCaller(std::move(aCaller)),
+        mEvalAllowed(false) {}
+
+  bool MainThreadRun() override {
+    MOZ_ASSERT(mWorkerRef);
+    WorkerPrivate* workerPrivate = mWorkerRef->Private();
+    mResult = CheckInternal(workerPrivate->GetCsp(),
+                            workerPrivate->CSPEventListener(),
+                            workerPrivate->GetLoadingPrincipal(), mExpression,
+                            mCaller, &mEvalAllowed);
+    return true;
+  }
+
+  nsresult GetResult(bool* aAllowed) {
+    MOZ_ASSERT(aAllowed);
+    *aAllowed = mEvalAllowed;
+    return mResult;
+  }
+
+ private:
+  const nsString mExpression;
+  const JSCallingLocation mCaller;
+  bool mEvalAllowed;
+  nsresult mResult;
+};
+
+}  
+
+nsresult CSPEvalChecker::CheckForWindow(JSContext* aCx,
+                                        nsGlobalWindowInner* aWindow,
+                                        const nsAString& aExpression,
+                                        bool* aAllowEval) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aWindow);
+  MOZ_ASSERT(aAllowEval);
+
+  *aAllowEval = false;
+
+  nsCOMPtr<Document> doc = aWindow->GetExtantDoc();
+  if (!doc) {
+    *aAllowEval = true;
+    return NS_OK;
+  }
+
+  nsresult rv = NS_OK;
+
+  auto location = JSCallingLocation::Get(aCx);
+  nsCOMPtr<nsIContentSecurityPolicy> csp =
+      PolicyContainer::GetCSP(doc->GetPolicyContainer());
+  rv = CheckInternal(csp, nullptr ,
+                     doc->NodePrincipal(), aExpression, location, aAllowEval);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    *aAllowEval = false;
+    return rv;
+  }
+
+  return NS_OK;
+}
+
+nsresult CSPEvalChecker::CheckForWorker(JSContext* aCx,
+                                        WorkerPrivate* aWorkerPrivate,
+                                        const nsAString& aExpression,
+                                        bool* aAllowEval) {
+  MOZ_ASSERT(aWorkerPrivate);
+  aWorkerPrivate->AssertIsOnWorkerThread();
+  MOZ_ASSERT(aAllowEval);
+
+  *aAllowEval = false;
+
+  RefPtr<WorkerCSPCheckRunnable> r = new WorkerCSPCheckRunnable(
+      aWorkerPrivate, aExpression, JSCallingLocation::Get(aCx));
+  ErrorResult error;
+  r->Dispatch(aWorkerPrivate, Canceling, error);
+  if (NS_WARN_IF(error.Failed())) {
+    *aAllowEval = false;
+    return error.StealNSResult();
+  }
+
+  nsresult rv = r->GetResult(aAllowEval);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    *aAllowEval = false;
+    return rv;
+  }
+
+  return NS_OK;
+}

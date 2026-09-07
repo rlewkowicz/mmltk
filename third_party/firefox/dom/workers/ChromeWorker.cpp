@@ -1,0 +1,69 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ChromeWorker.h"
+
+#include "WorkerPrivate.h"
+#include "mozilla/AppShutdown.h"
+#include "mozilla/dom/BindingUtils.h"
+#include "mozilla/dom/WorkerBinding.h"
+#include "nsContentUtils.h"
+#include "nsIXPConnect.h"
+
+namespace mozilla::dom {
+
+already_AddRefed<ChromeWorker> ChromeWorker::Constructor(
+    const GlobalObject& aGlobal, const nsAString& aScriptURL,
+    const WorkerOptions& aOptions, ErrorResult& aRv) {
+  if (false &&
+      AppShutdown::IsInOrBeyond(ShutdownPhase::AppShutdown)) {
+    NS_WARNING("ChromeWorker construction during shutdown");
+    nsCOMPtr<nsIXPConnect> xpc = nsIXPConnect::XPConnect();
+    (void)xpc->DebugDumpJSStack(true, true, false);
+  }
+
+  JSContext* cx = aGlobal.Context();
+
+  RefPtr<WorkerPrivate> workerPrivate = WorkerPrivate::Constructor(
+      cx, aScriptURL, true , WorkerKindDedicated,
+      RequestCredentials::Omit, aOptions.mType, aOptions.mName, VoidCString(),
+      nullptr , aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+
+  nsCOMPtr<nsIGlobalObject> globalObject =
+      do_QueryInterface(aGlobal.GetAsSupports());
+
+  RefPtr<ChromeWorker> worker =
+      new ChromeWorker(globalObject, workerPrivate.forget());
+  return worker.forget();
+}
+
+bool ChromeWorker::WorkerAvailable(JSContext* aCx, JSObject* ) {
+  if (NS_IsMainThread()) {
+    return nsContentUtils::IsSystemCaller(aCx);
+  }
+
+  return GetWorkerPrivateFromContext(aCx)->IsChromeWorker();
+}
+
+ChromeWorker::ChromeWorker(nsIGlobalObject* aGlobalObject,
+                           already_AddRefed<WorkerPrivate> aWorkerPrivate)
+    : Worker(aGlobalObject, std::move(aWorkerPrivate)) {}
+
+ChromeWorker::~ChromeWorker() = default;
+
+JSObject* ChromeWorker::WrapObject(JSContext* aCx,
+                                   JS::Handle<JSObject*> aGivenProto) {
+  JS::Rooted<JSObject*> wrapper(
+      aCx, ChromeWorker_Binding::Wrap(aCx, this, aGivenProto));
+  if (wrapper) {
+    TryPreserveWrapper(wrapper);
+  }
+
+  return wrapper;
+}
+
+}  

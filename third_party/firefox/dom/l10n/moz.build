@@ -1,0 +1,24 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+EXPORTS.mozilla.dom += [
+    "DocumentL10n.h",
+    "DOMLocalization.h",
+    "L10nMutations.h",
+    "L10nOverlays.h",
+]
+
+UNIFIED_SOURCES += [
+    "DocumentL10n.cpp",
+    "DOMLocalization.cpp",
+    "L10nMutations.cpp",
+    "L10nOverlays.cpp",
+]
+
+LOCAL_INCLUDES += [
+    "/dom/base",
+    "/toolkit/components/jsoncpp/include",
+]
+
+FINAL_LIBRARY = "xul"

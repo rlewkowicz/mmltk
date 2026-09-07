@@ -1,0 +1,343 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+var CaptivePortalWatcher = {
+  PORTAL_NOTIFICATION_VALUE: "captive-portal-detected",
+
+  _captivePortalTab: null,
+
+  _delayedCaptivePortalDetectedInProgress: false,
+
+  _waitingForRecheck: false,
+
+  _previousCaptivePortalTab: null,
+
+  _bannerDisplayTime: Date.now(),
+
+  get _captivePortalNotification() {
+    return gNotificationBox.getNotificationWithValue(
+      this.PORTAL_NOTIFICATION_VALUE
+    );
+  },
+
+  get canonicalURL() {
+    return Services.prefs.getCharPref("captivedetect.canonicalURL");
+  },
+
+  get _browserBundle() {
+    delete this._browserBundle;
+    return (this._browserBundle = Services.strings.createBundle(
+      "chrome://browser/locale/browser.properties"
+    ));
+  },
+
+  init() {
+    Services.obs.addObserver(this, "captive-portal-login");
+    Services.obs.addObserver(this, "captive-portal-login-abort");
+    Services.obs.addObserver(this, "captive-portal-login-success");
+
+    this._cps = Cc["@mozilla.org/network/captive-portal-service;1"].getService(
+      Ci.nsICaptivePortalService
+    );
+
+    if (this._cps.state == this._cps.LOCKED_PORTAL) {
+      this._captivePortalDetected();
+
+      if (BrowserWindowTracker.windowCount == 1) {
+        this.ensureCaptivePortalTab();
+      }
+    } else if (this._cps.state == this._cps.UNKNOWN) {
+      this._delayedRecheckPending = true;
+    }
+
+    XPCOMUtils.defineLazyPreferenceGetter(
+      this,
+      "PORTAL_RECHECK_DELAY_MS",
+      "captivedetect.portalRecheckDelayMS",
+      500
+    );
+  },
+
+  uninit() {
+    Services.obs.removeObserver(this, "captive-portal-login");
+    Services.obs.removeObserver(this, "captive-portal-login-abort");
+    Services.obs.removeObserver(this, "captive-portal-login-success");
+
+    this._cancelDelayedCaptivePortal();
+  },
+
+  delayedStartup() {
+    if (this._delayedRecheckPending) {
+      delete this._delayedRecheckPending;
+      this._cps.recheckCaptivePortal();
+    }
+  },
+
+  observe(aSubject, aTopic) {
+    switch (aTopic) {
+      case "captive-portal-login":
+        this._captivePortalDetected();
+        break;
+      case "captive-portal-login-abort":
+        this._captivePortalGone(false);
+        break;
+      case "captive-portal-login-success":
+        this._captivePortalGone(true);
+        break;
+      case "delayed-captive-portal-handled":
+        this._cancelDelayedCaptivePortal();
+        break;
+    }
+  },
+
+  onLocationChange(browser) {
+    if (!this._previousCaptivePortalTab) {
+      return;
+    }
+
+    let tab = this._previousCaptivePortalTab.get();
+    if (!tab || !tab.linkedBrowser) {
+      return;
+    }
+
+    if (browser != tab.linkedBrowser) {
+      return;
+    }
+
+    Services.tm.dispatchToMainThread(() => {
+      if (!this._previousCaptivePortalTab) {
+        return;
+      }
+
+      tab = this._previousCaptivePortalTab.get();
+      let canonicalURI = Services.io.newURI(this.canonicalURL);
+      if (
+        tab &&
+        (tab.linkedBrowser.currentURI.equalsExceptRef(canonicalURI) ||
+          tab.linkedBrowser.currentURI.host == "support.mozilla.org") &&
+        (this._cps.state == this._cps.UNLOCKED_PORTAL ||
+          this._cps.state == this._cps.UNKNOWN)
+      ) {
+        gBrowser.removeTab(tab);
+      }
+    });
+  },
+
+  _captivePortalDetected() {
+    if (this._delayedCaptivePortalDetectedInProgress) {
+      return;
+    }
+
+    let canonicalURI = Services.io.newURI(this.canonicalURL);
+    let isPrivate = PrivateBrowsingUtils.isWindowPrivate(window);
+    let principal = Services.scriptSecurityManager.createContentPrincipal(
+      canonicalURI,
+      {
+        userContextId: gBrowser.contentPrincipal.userContextId,
+        privateBrowsingId: isPrivate ? 1 : 0,
+      }
+    );
+    Services.perms.addFromPrincipal(
+      principal,
+      "https-only-load-insecure",
+      Ci.nsIPermissionManager.ALLOW_ACTION,
+      Ci.nsIPermissionManager.EXPIRE_SESSION
+    );
+    let win = BrowserWindowTracker.getTopWindow();
+    if (win?.document.documentElement.getAttribute("ignorecaptiveportal")) {
+      win = null;
+    }
+
+    if (win != Services.focus.activeWindow) {
+      this._delayedCaptivePortalDetectedInProgress = true;
+      window.addEventListener("activate", this, { once: true });
+      Services.obs.addObserver(this, "delayed-captive-portal-handled");
+    }
+
+    this._showNotification();
+  },
+
+  _delayedCaptivePortalDetected() {
+    if (!this._delayedCaptivePortalDetectedInProgress) {
+      return;
+    }
+
+    if (window.document.documentElement.getAttribute("ignorecaptiveportal")) {
+      return;
+    }
+
+    Services.obs.notifyObservers(null, "delayed-captive-portal-handled");
+
+    this._cps.recheckCaptivePortal();
+    this._waitingForRecheck = true;
+    let requestTime = Date.now();
+
+    let observer = () => {
+      let time = Date.now() - requestTime;
+      Services.obs.removeObserver(observer, "captive-portal-check-complete");
+      this._waitingForRecheck = false;
+      if (this._cps.state != this._cps.LOCKED_PORTAL) {
+        return;
+      }
+
+      if (time <= this.PORTAL_RECHECK_DELAY_MS) {
+        this.ensureCaptivePortalTab();
+      }
+    };
+    Services.obs.addObserver(observer, "captive-portal-check-complete");
+  },
+
+  _captivePortalGone(aSuccess) {
+    this._cancelDelayedCaptivePortal();
+    this._removeNotification();
+
+    let durationInSeconds = Math.round(
+      (Date.now() - this._bannerDisplayTime) / 1000
+    );
+
+    if (aSuccess) {
+    } else {
+    }
+
+    if (!this._captivePortalTab) {
+      return;
+    }
+
+    let tab = this._captivePortalTab.get();
+    let canonicalURI = Services.io.newURI(this.canonicalURL);
+    if (
+      tab &&
+      tab.linkedBrowser &&
+      (tab.linkedBrowser.currentURI.equalsExceptRef(canonicalURI) ||
+        tab.linkedBrowser.currentURI.host == "support.mozilla.org")
+    ) {
+      this._previousCaptivePortalTab = null;
+      gBrowser.removeTab(tab);
+    }
+    this._captivePortalTab = null;
+  },
+
+  _cancelDelayedCaptivePortal() {
+    if (this._delayedCaptivePortalDetectedInProgress) {
+      this._delayedCaptivePortalDetectedInProgress = false;
+      Services.obs.removeObserver(this, "delayed-captive-portal-handled");
+      window.removeEventListener("activate", this);
+    }
+  },
+
+  async handleEvent(aEvent) {
+    switch (aEvent.type) {
+      case "activate":
+        this._delayedCaptivePortalDetected();
+        break;
+      case "TabSelect": {
+        if (this._notificationPromise) {
+          await this._notificationPromise;
+        }
+        if (!this._captivePortalTab || !this._captivePortalNotification) {
+          break;
+        }
+
+        let tab = this._captivePortalTab.get();
+        let n = this._captivePortalNotification;
+        if (!tab || !n) {
+          break;
+        }
+
+        let doc = tab.ownerDocument;
+        let button = n.buttonContainer.querySelector(
+          "button.notification-button"
+        );
+        if (doc.defaultView.gBrowser.selectedTab == tab) {
+          button.style.visibility = "hidden";
+        } else {
+          button.style.visibility = "visible";
+        }
+        break;
+      }
+    }
+  },
+
+  _showNotification() {
+    if (this._captivePortalNotification) {
+      return;
+    }
+
+    this._bannerDisplayTime = Date.now();
+
+    let buttons = [
+      {
+        label: this._browserBundle.GetStringFromName(
+          "captivePortal.showLoginPage2"
+        ),
+        callback: () => {
+          this.ensureCaptivePortalTab();
+
+          return true;
+        },
+      },
+    ];
+
+    let message = this._browserBundle.GetStringFromName(
+      "captivePortal.infoMessage3"
+    );
+
+    let closeHandler = aEventName => {
+      if (aEventName == "dismissed") {
+        let durationInSeconds = Math.round(
+          (Date.now() - this._bannerDisplayTime) / 1000
+        );
+
+      }
+
+      if (aEventName != "removed") {
+        return;
+      }
+      gBrowser.tabContainer.removeEventListener("TabSelect", this);
+    };
+
+    this._notificationPromise = gNotificationBox.appendNotification(
+      this.PORTAL_NOTIFICATION_VALUE,
+      {
+        label: message,
+        priority: gNotificationBox.PRIORITY_INFO_MEDIUM,
+        eventCallback: closeHandler,
+      },
+      buttons
+    );
+
+    gBrowser.tabContainer.addEventListener("TabSelect", this);
+  },
+
+  _removeNotification() {
+    let n = this._captivePortalNotification;
+    if (!n || !n.parentNode) {
+      return;
+    }
+    n.close();
+  },
+
+  ensureCaptivePortalTab() {
+    let tab;
+    if (this._captivePortalTab) {
+      tab = this._captivePortalTab.get();
+    }
+
+    if (!tab || tab.closing || !tab.parentNode) {
+      tab = gBrowser.addWebTab(this.canonicalURL, {
+        ownerTab: gBrowser.selectedTab,
+        triggeringPrincipal: Services.scriptSecurityManager.createNullPrincipal(
+          {
+            userContextId: gBrowser.contentPrincipal.userContextId,
+          }
+        ),
+        isCaptivePortalTab: true,
+      });
+      this._captivePortalTab = Cu.getWeakReference(tab);
+      this._previousCaptivePortalTab = Cu.getWeakReference(tab);
+    }
+
+    gBrowser.selectedTab = tab;
+  },
+};

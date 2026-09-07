@@ -1,0 +1,46 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef builtin_ParseRecordObject_h
+#define builtin_ParseRecordObject_h
+
+#include "js/HashTable.h"
+#include "js/TracingAPI.h"
+#include "vm/JSContext.h"
+
+namespace js {
+
+using JSONParseNode = JSString;
+
+class ParseRecordObject : public NativeObject {
+  enum { ParseNodeSlot, ValueSlot, SlotCount };
+
+ public:
+  static const JSClass class_;
+
+  static ParseRecordObject* create(JSContext* cx, const Value& val);
+  static ParseRecordObject* create(JSContext* cx,
+                                   Handle<js::JSONParseNode*> parseNode,
+                                   const Value& val);
+
+  JSONParseNode* getParseNode() const {
+    const Value& slot = getReservedSlot(ParseNodeSlot);
+    return slot.isUndefined() ? nullptr : slot.toString();
+  }
+
+  const Value& getValue() const { return getReservedSlot(ValueSlot); }
+
+  void setValue(JS::Handle<JS::Value> value) {
+    setReservedSlot(ValueSlot, value);
+  }
+
+  bool hasValue() const { return !getValue().isUndefined(); }
+
+  bool addEntries(JSContext* cx, Handle<JS::PropertyKey> key,
+                  Handle<ParseRecordObject*> parseRecord);
+};
+
+}  
+
+#endif

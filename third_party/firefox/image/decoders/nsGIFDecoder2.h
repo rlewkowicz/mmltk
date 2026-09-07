@@ -1,0 +1,135 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_image_decoders_nsGIFDecoder2_h
+#define mozilla_image_decoders_nsGIFDecoder2_h
+
+#include "Decoder.h"
+#include "GIF2.h"
+#include "StreamingLexer.h"
+#include "SurfacePipe.h"
+#include "mozilla/gfx/Swizzle.h"
+
+namespace mozilla {
+namespace image {
+class RasterImage;
+
+
+class nsGIFDecoder2 final : public Decoder {
+ public:
+  ~nsGIFDecoder2();
+
+  DecoderType GetType() const override { return DecoderType::GIF; }
+
+ protected:
+  LexerResult DoDecode(SourceBufferIterator& aIterator,
+                       IResumable* aOnResume) override;
+  nsresult FinishWithErrorInternal() override;
+  nsresult FinishInternal() override;
+
+ private:
+  friend class DecoderFactory;
+
+  explicit nsGIFDecoder2(RasterImage* aImage);
+
+  void BeginGIF();
+
+  nsresult BeginImageFrame(const OrientedIntRect& aFrameRect, uint16_t aDepth,
+                           bool aIsInterlaced);
+
+  void EndImageFrame();
+
+  void FlushImageData();
+
+  void ConvertColormap(uint32_t* aColormap, uint32_t aColors);
+
+  template <typename PixelSize>
+  PixelSize ColormapIndexToPixel(uint8_t aIndex);
+
+  template <typename PixelSize>
+  std::tuple<int32_t, Maybe<WriteState>> YieldPixels(const uint8_t* aData,
+                                                     size_t aLength,
+                                                     size_t* aBytesReadOut,
+                                                     PixelSize* aPixelBlock,
+                                                     int32_t aBlockSize);
+
+  bool CheckForTransparency(const OrientedIntRect& aFrameRect);
+
+  int ClearCode() const {
+    MOZ_ASSERT(mGIFStruct.datasize <= MAX_LZW_BITS);
+    return 1 << mGIFStruct.datasize;
+  }
+
+  enum class State {
+    FAILURE,
+    SUCCESS,
+    GIF_HEADER,
+    SCREEN_DESCRIPTOR,
+    GLOBAL_COLOR_TABLE,
+    FINISHED_GLOBAL_COLOR_TABLE,
+    BLOCK_HEADER,
+    EXTENSION_HEADER,
+    GRAPHIC_CONTROL_EXTENSION,
+    APPLICATION_IDENTIFIER,
+    NETSCAPE_EXTENSION_SUB_BLOCK,
+    NETSCAPE_EXTENSION_DATA,
+    IMAGE_DESCRIPTOR,
+    LOCAL_COLOR_TABLE,
+    FINISHED_LOCAL_COLOR_TABLE,
+    IMAGE_DATA_BLOCK,
+    IMAGE_DATA_SUB_BLOCK,
+    LZW_DATA,
+    SKIP_LZW_DATA,
+    FINISHED_LZW_DATA,
+    FINISH_END_IMAGE_FRAME,
+    SKIP_SUB_BLOCKS,
+    SKIP_DATA_THEN_SKIP_SUB_BLOCKS,
+    FINISHED_SKIPPING_DATA
+  };
+
+  LexerTransition<State> ReadGIFHeader(const char* aData);
+  LexerTransition<State> ReadScreenDescriptor(const char* aData);
+  LexerTransition<State> ReadGlobalColorTable(const char* aData,
+                                              size_t aLength);
+  LexerTransition<State> FinishedGlobalColorTable();
+  LexerTransition<State> ReadBlockHeader(const char* aData);
+  LexerTransition<State> ReadExtensionHeader(const char* aData);
+  LexerTransition<State> ReadGraphicControlExtension(const char* aData);
+  LexerTransition<State> ReadApplicationIdentifier(const char* aData);
+  LexerTransition<State> ReadNetscapeExtensionSubBlock(const char* aData);
+  LexerTransition<State> ReadNetscapeExtensionData(const char* aData);
+  LexerTransition<State> ReadImageDescriptor(const char* aData);
+  LexerTransition<State> FinishImageDescriptor(const char* aData);
+  LexerTransition<State> ReadLocalColorTable(const char* aData, size_t aLength);
+  LexerTransition<State> FinishedLocalColorTable();
+  LexerTransition<State> ReadImageDataBlock(const char* aData);
+  LexerTransition<State> ReadImageDataSubBlock(const char* aData);
+  LexerTransition<State> ReadLZWData(const char* aData, size_t aLength);
+  LexerTransition<State> SkipSubBlocks(const char* aData);
+
+  StreamingLexer<State, 16> mLexer;
+
+  uint32_t mOldColor;  
+
+  int32_t mCurrentFrameIndex;
+
+  size_t mColorTablePos;
+  uint32_t* mColormap;  
+  uint32_t mColormapSize;
+
+  uint8_t mColorMask;  
+  bool mGIFOpen;
+  bool mSawTransparency;
+
+  gif_struct mGIFStruct;
+
+  gfx::SwizzleRowFn mSwizzleFn;  
+  SurfacePipe mPipe;  
+};
+
+}  
+}  
+
+#endif  // mozilla_image_decoders_nsGIFDecoder2_h

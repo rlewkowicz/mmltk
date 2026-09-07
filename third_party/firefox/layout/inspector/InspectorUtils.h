@@ -1,0 +1,240 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+#ifndef mozilla_dom_InspectorUtils_h
+#define mozilla_dom_InspectorUtils_h
+
+#include "Units.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/InspectorUtilsBindingFwd.h"
+#include "nsTArray.h"
+
+class nsAtom;
+class nsINode;
+class nsRange;
+
+namespace mozilla {
+class ErrorResult;
+class StyleSheet;
+namespace css {
+class Rule;
+}  
+namespace dom {
+class BrowsingContext;
+enum class InspectorPropertyType : uint8_t;
+class CharacterData;
+class Document;
+class Element;
+class GlobalObject;
+class InspectorFontFace;
+class NodeList;
+class OwningCSSRuleOrInspectorDeclaration;
+}  
+}  
+
+namespace mozilla::dom {
+class InspectorUtils {
+ public:
+  static void GetAllStyleSheets(GlobalObject& aGlobal, Document& aDocument,
+                                bool aDocumentOnly,
+                                nsTArray<RefPtr<StyleSheet>>& aResult);
+  static void GetMatchingCSSRules(
+      GlobalObject& aGlobal, Element& aElement, const nsAString& aPseudo,
+      bool aIncludeVisitedStyle, bool aWithStartingStyle,
+      nsTArray<OwningCSSRuleOrInspectorDeclaration>& aResult);
+
+  static uint32_t GetRuleLine(GlobalObject& aGlobal, css::Rule& aRule);
+
+  static uint32_t GetRuleColumn(GlobalObject& aGlobal, css::Rule& aRule);
+
+  static uint32_t GetRelativeRuleLine(GlobalObject& aGlobal, css::Rule& aRule);
+
+  static void GetRuleIndex(GlobalObject& aGlobal, css::Rule& aRule,
+                           nsTArray<uint32_t>& aResult);
+
+  static bool HasRulesModifiedByCSSOM(GlobalObject& aGlobal,
+                                      StyleSheet& aSheet);
+
+  static void GetStyleSheetRuleCountAndAtRules(
+      GlobalObject& aGlobal, StyleSheet& aSheet,
+      InspectorStyleSheetRuleCountAndAtRulesResult& aResult);
+
+  static bool IsInheritedProperty(GlobalObject& aGlobal, Document& aDocument,
+                                  const nsACString& aPropertyName);
+
+  static void GetCSSPropertyNames(GlobalObject& aGlobal,
+                                  const PropertyNamesOptions& aOptions,
+                                  nsTArray<nsString>& aResult);
+
+  static void GetCSSPropertyPrefs(GlobalObject& aGlobal,
+                                  nsTArray<PropertyPref>& aResult);
+
+  static void GetCSSValuesForProperty(GlobalObject& aGlobal,
+                                      const nsACString& aPropertyName,
+                                      nsTArray<nsString>& aResult,
+                                      ErrorResult& aRv);
+
+  static void GetCSSWideKeywords(GlobalObject& aGlobal,
+                                 nsTArray<nsString>& aResult);
+
+  static void RgbToColorName(GlobalObject& aGlobal, uint8_t aR, uint8_t aG,
+                             uint8_t aB, nsACString& aResult);
+
+  static void RgbToNearestColorName(GlobalObject&, float aR, float aG, float aB,
+                                    InspectorNearestColor& aResult);
+
+  static void RgbToHsv(GlobalObject&, float aR, float aG, float aB,
+                       nsTArray<float>& aResult);
+
+  static void HsvToRgb(GlobalObject&, float aH, float aS, float aV,
+                       nsTArray<float>& aResult);
+
+  static float RelativeLuminance(GlobalObject&, float aR, float aG, float aB);
+
+  static void ColorToRGBA(GlobalObject&, const nsACString& aColorString,
+                          Nullable<InspectorRGBATuple>& aResult);
+
+  static void ColorTo(GlobalObject&, const nsACString& aFromColor,
+                      const nsACString& aToColorSpace,
+                      Nullable<InspectorColorToResult>& aResult);
+
+  static bool IsValidCSSColor(GlobalObject& aGlobal,
+                              const nsACString& aColorString);
+
+  static bool IsValidCSSImage(GlobalObject& aGlobal,
+                              const nsACString& aImageString);
+
+
+  static void GetSubpropertiesForCSSProperty(GlobalObject& aGlobal,
+                                             const nsACString& aProperty,
+                                             nsTArray<nsString>& aResult,
+                                             ErrorResult& aRv);
+
+  static bool CssPropertyIsShorthand(GlobalObject& aGlobal,
+                                     const nsACString& aProperty,
+                                     ErrorResult& aRv);
+
+  static bool CssPropertySupportsType(GlobalObject& aGlobal,
+                                      const nsACString& aProperty,
+                                      InspectorPropertyType, ErrorResult& aRv);
+
+  static bool Supports(GlobalObject&, const nsACString& aDeclaration,
+                       const SupportsOptions&);
+
+  static bool IsIgnorableWhitespace(GlobalObject& aGlobalObject,
+                                    CharacterData& aDataNode) {
+    return IsIgnorableWhitespace(aDataNode);
+  }
+  static bool IsIgnorableWhitespace(CharacterData& aDataNode);
+
+  static nsINode* GetParentForNode(nsINode& aNode,
+                                   bool aShowingAnonymousContent);
+  static nsINode* GetParentForNode(GlobalObject& aGlobalObject, nsINode& aNode,
+                                   bool aShowingAnonymousContent) {
+    return GetParentForNode(aNode, aShowingAnonymousContent);
+  }
+
+  static void GetChildrenForNode(GlobalObject&, nsINode& aNode,
+                                 bool aShowingAnonymousContent,
+                                 bool aIncludeAssignedNodes,
+                                 nsTArray<RefPtr<nsINode>>& aResult) {
+    return GetChildrenForNode(aNode, aShowingAnonymousContent,
+                              aIncludeAssignedNodes,
+                               true, aResult);
+  }
+  static void GetChildrenForNode(nsINode& aNode, bool aShowingAnonymousContent,
+                                 bool aIncludeAssignedNodes,
+                                 bool aIncludeSubdocuments,
+                                 nsTArray<RefPtr<nsINode>>& aResult);
+
+  static bool SetContentState(GlobalObject& aGlobal, Element& aElement,
+                              uint64_t aState, ErrorResult& aRv);
+  static bool RemoveContentState(GlobalObject& aGlobal, Element& aElement,
+                                 uint64_t aState, bool aClearActiveDocument,
+                                 ErrorResult& aRv);
+  static uint64_t GetContentState(GlobalObject& aGlobal, Element& aElement);
+
+  static void GetUsedFontFaces(GlobalObject& aGlobal, nsRange& aRange,
+                               uint32_t aMaxRanges,  
+                               bool aSkipCollapsedWhitespace,
+                               nsTArray<UniquePtr<InspectorFontFace>>& aResult,
+                               ErrorResult& aRv);
+
+  static void GetCSSPseudoElementNames(GlobalObject&,
+                                       nsTArray<nsString>& aResult);
+
+  static void AddPseudoClassLock(GlobalObject&, Element&,
+                                 const nsAString& aPseudoClass, bool aEnabled);
+  static void RemovePseudoClassLock(GlobalObject&, Element&,
+                                    const nsAString& aPseudoClass);
+  static bool HasPseudoClassLock(GlobalObject&, Element&,
+                                 const nsAString& aPseudoClass);
+  static void ClearPseudoClassLocks(GlobalObject&, Element&);
+
+  static bool IsElementThemed(GlobalObject&, Element&);
+
+  static bool IsUsedColorSchemeDark(GlobalObject&, Element&);
+
+  static Element* ContainingBlockOf(GlobalObject&, Element&);
+
+  static bool IsBlockContainer(GlobalObject&, Element&);
+
+  static void GetBlockLineCounts(GlobalObject&, Element&,
+                                 Nullable<nsTArray<uint32_t>>& aResult);
+
+  MOZ_CAN_RUN_SCRIPT
+  static already_AddRefed<NodeList> GetOverflowingChildrenOfElement(
+      GlobalObject& aGlobal, Element& element);
+
+  static void ParseStyleSheet(GlobalObject& aGlobal, StyleSheet& aSheet,
+                              const nsACString& aInput, ErrorResult& aRv);
+
+  static bool IsCustomElementName(GlobalObject&, const nsAString& aName,
+                                  const nsAString& aNamespaceURI);
+
+  static void GetRegisteredCssHighlights(GlobalObject& aGlobal,
+                                         Document& aDocument, bool aActiveOnly,
+                                         nsTArray<nsString>& aResult);
+  static void GetCSSRegisteredProperties(
+      GlobalObject& aGlobal, Document& aDocument,
+      nsTArray<InspectorCSSPropertyDefinition>& aResult);
+
+  static void GetCSSRegisteredProperty(
+      GlobalObject& aGlobal, Document& aDocument, const nsACString& aName,
+      Nullable<InspectorCSSPropertyDefinition>& aResult);
+
+  static bool ValueMatchesSyntax(GlobalObject&, Document& aDocument,
+                                 const nsACString& aValue,
+                                 const nsACString& aSyntax);
+
+  static void GetRuleBodyText(GlobalObject&, const nsACString& aInitialText,
+                              nsACString& aBodyText);
+
+  static void ReplaceBlockRuleBodyTextInStylesheet(
+      GlobalObject&, const nsACString& aStyleSheetText, uint32_t aLine,
+      uint32_t aColumn, const nsACString& aNewBodyText,
+      nsACString& aNewStyleSheetText);
+
+  static void SetVerticalClipping(GlobalObject&, BrowsingContext* aContext,
+                                  mozilla::CSSCoord aOffset);
+  static void SetDynamicToolbarMaxHeight(GlobalObject&,
+                                         BrowsingContext* aContext,
+                                         mozilla::CSSCoord aHeight);
+  static uint16_t GetGridContainerType(GlobalObject&, Element&);
+  static void GetAnchorFor(GlobalObject&, Element&, const nsAString& aName,
+                           Nullable<InspectorAnchorElement>&);
+  static void GetAnchorNamesFor(GlobalObject& aGlobal, Element&,
+                                nsTArray<nsString>& aResult);
+  static void GetComputationStepsSupportedCSSFunctions(
+      GlobalObject& aGlobal, nsTArray<nsCString>& aResult);
+  static void GetComputationSteps(GlobalObject& aGlobal,
+                                  const nsAString& aExpression, Element&,
+                                  const nsAString& aPseudo,
+                                  nsTArray<nsString>& aResult);
+};
+
+}  
+
+#endif  // mozilla_dom_InspectorUtils_h

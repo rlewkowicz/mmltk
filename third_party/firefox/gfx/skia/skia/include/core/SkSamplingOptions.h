@@ -1,0 +1,87 @@
+/*
+ * Copyright 2020 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkImageSampling_DEFINED)
+#define SkImageSampling_DEFINED
+
+#include "include/core/SkTypes.h"
+
+#include <algorithm>
+#include <new>
+
+enum class SkFilterMode {
+    kNearest,   
+    kLinear,    
+
+    kLast = kLinear,
+};
+static constexpr int kSkFilterModeCount = static_cast<int>(SkFilterMode::kLast) + 1;
+
+enum class SkMipmapMode {
+    kNone,      
+    kNearest,   
+    kLinear,    
+
+    kLast = kLinear,
+};
+static constexpr int kSkMipmapModeCount = static_cast<int>(SkMipmapMode::kLast) + 1;
+
+struct SkCubicResampler {
+    float B, C;
+
+    static constexpr SkCubicResampler Mitchell() { return {1/3.0f, 1/3.0f}; }
+    static constexpr SkCubicResampler CatmullRom() { return {0.0f, 1/2.0f}; }
+};
+
+struct SK_API SkSamplingOptions {
+    const int              maxAniso = 0;
+    const bool             useCubic = false;
+    const SkCubicResampler cubic    = {0, 0};
+    const SkFilterMode     filter   = SkFilterMode::kNearest;
+    const SkMipmapMode     mipmap   = SkMipmapMode::kNone;
+
+    constexpr SkSamplingOptions() = default;
+    SkSamplingOptions(const SkSamplingOptions&) = default;
+    SkSamplingOptions& operator=(const SkSamplingOptions& that) {
+        this->~SkSamplingOptions();   
+        new (this) SkSamplingOptions(that);
+        return *this;
+    }
+
+    constexpr SkSamplingOptions(SkFilterMode fm, SkMipmapMode mm)
+        : filter(fm)
+        , mipmap(mm) {}
+
+    constexpr SkSamplingOptions(SkFilterMode fm)
+        : filter(fm)
+        , mipmap(SkMipmapMode::kNone) {}
+
+    constexpr SkSamplingOptions(const SkCubicResampler& c)
+        : useCubic(true)
+        , cubic(c) {}
+
+    static constexpr SkSamplingOptions Aniso(int maxAniso) {
+        return SkSamplingOptions{std::max(maxAniso, 1)};
+    }
+
+    bool operator==(const SkSamplingOptions& other) const {
+        return maxAniso == other.maxAniso
+            && useCubic == other.useCubic
+            && cubic.B  == other.cubic.B
+            && cubic.C  == other.cubic.C
+            && filter   == other.filter
+            && mipmap   == other.mipmap;
+    }
+    bool operator!=(const SkSamplingOptions& other) const { return !(*this == other); }
+
+    bool isAniso() const { return maxAniso != 0; }
+
+private:
+    constexpr SkSamplingOptions(int maxAniso) : maxAniso(maxAniso) {}
+};
+
+#endif

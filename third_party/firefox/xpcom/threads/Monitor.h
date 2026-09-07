@@ -1,0 +1,177 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_Monitor_h
+#define mozilla_Monitor_h
+
+#include "mozilla/CondVar.h"
+#include "mozilla/Mutex.h"
+
+namespace mozilla {
+
+class MOZ_CAPABILITY("monitor") Monitor {
+ public:
+  explicit Monitor(const char* aName)
+      : mMutex(aName), mCondVar(mMutex, "[Monitor.mCondVar]") {}
+
+  ~Monitor() = default;
+
+  void Lock() MOZ_CAPABILITY_ACQUIRE() { mMutex.Lock(); }
+  [[nodiscard]] bool TryLock() MOZ_TRY_ACQUIRE(true) {
+    return mMutex.TryLock();
+  }
+  void Unlock() MOZ_CAPABILITY_RELEASE() { mMutex.Unlock(); }
+
+  void Wait() MOZ_REQUIRES(this) { mCondVar.Wait(); }
+  CVStatus Wait(TimeDuration aDuration) MOZ_REQUIRES(this) {
+    return mCondVar.Wait(aDuration);
+  }
+
+  void Notify() { mCondVar.Notify(); }
+  void NotifyAll() { mCondVar.NotifyAll(); }
+
+  void AssertCurrentThreadOwns() const MOZ_ASSERT_CAPABILITY(this) {
+    mMutex.AssertCurrentThreadOwns();
+  }
+  void AssertNotCurrentThreadOwns() const MOZ_ASSERT_CAPABILITY(!this) {
+    mMutex.AssertNotCurrentThreadOwns();
+  }
+
+ private:
+  Monitor() = delete;
+  Monitor(const Monitor&) = delete;
+  Monitor& operator=(const Monitor&) = delete;
+
+  Mutex mMutex;
+  CondVar mCondVar;
+};
+
+template <class MonitorType>
+class MOZ_SCOPED_CAPABILITY MOZ_STACK_CLASS MonitorAutoLockBase {
+ public:
+  explicit MonitorAutoLockBase(MonitorType& aMonitor)
+      MOZ_CAPABILITY_ACQUIRE(aMonitor)
+      : mMonitor(&aMonitor) {
+    mMonitor->Lock();
+  }
+
+  ~MonitorAutoLockBase() MOZ_CAPABILITY_RELEASE() { mMonitor->Unlock(); }
+  void Wait() {
+    mMonitor->AssertCurrentThreadOwns();
+    mMonitor->Wait();
+  }
+  CVStatus Wait(TimeDuration aDuration) {
+    mMonitor->AssertCurrentThreadOwns();
+    return mMonitor->Wait(aDuration);
+  }
+
+  void Notify() { mMonitor->Notify(); }
+  void NotifyAll() { mMonitor->NotifyAll(); }
+
+  void AssertOwns(const MonitorType& aMonitor) const
+      MOZ_ASSERT_CAPABILITY(aMonitor) {
+    MOZ_ASSERT(&aMonitor == mMonitor);
+    mMonitor->AssertCurrentThreadOwns();
+  }
+
+ private:
+  MonitorAutoLockBase() = delete;
+  MonitorAutoLockBase(const MonitorAutoLockBase&) = delete;
+  MonitorAutoLockBase& operator=(const MonitorAutoLockBase&) = delete;
+  static void* operator new(size_t) noexcept(true);
+
+ protected:
+  MonitorType* mMonitor;
+};
+
+using MonitorAutoLock = MonitorAutoLockBase<Monitor>;
+
+template <class MonitorType>
+class MOZ_STACK_CLASS MOZ_SCOPED_CAPABILITY MonitorAutoUnlockBase {
+ public:
+  explicit MonitorAutoUnlockBase(MonitorType& aMonitor)
+      MOZ_SCOPED_UNLOCK_RELEASE(aMonitor)
+      : mMonitor(&aMonitor) {
+    mMonitor->Unlock();
+  }
+
+  ~MonitorAutoUnlockBase() MOZ_SCOPED_UNLOCK_REACQUIRE() { mMonitor->Lock(); }
+
+ private:
+  MonitorAutoUnlockBase() = delete;
+  MonitorAutoUnlockBase(const MonitorAutoUnlockBase&) = delete;
+  MonitorAutoUnlockBase& operator=(const MonitorAutoUnlockBase&) = delete;
+  static void* operator new(size_t) noexcept(true);
+
+  MonitorType* mMonitor;
+};
+
+using MonitorAutoUnlock = MonitorAutoUnlockBase<Monitor>;
+
+template <class MonitorType>
+class MOZ_SCOPED_CAPABILITY MOZ_STACK_CLASS ReleasableMonitorAutoLockBase {
+ public:
+  explicit ReleasableMonitorAutoLockBase(MonitorType& aMonitor)
+      MOZ_CAPABILITY_ACQUIRE(aMonitor)
+      : mMonitor(&aMonitor) {
+    mMonitor->Lock();
+    mLocked = true;
+  }
+
+  ~ReleasableMonitorAutoLockBase() MOZ_CAPABILITY_RELEASE() {
+    if (mLocked) {
+      mMonitor->Unlock();
+    }
+  }
+
+  void Wait() {
+    mMonitor->AssertCurrentThreadOwns();  
+    mMonitor->Wait();
+  }
+  CVStatus Wait(TimeDuration aDuration) {
+    mMonitor->AssertCurrentThreadOwns();
+    return mMonitor->Wait(aDuration);
+  }
+
+  void Notify() {
+    MOZ_ASSERT(mLocked);
+    mMonitor->Notify();
+  }
+  void NotifyAll() {
+    MOZ_ASSERT(mLocked);
+    mMonitor->NotifyAll();
+  }
+
+  // clang-format off
+  // clang-format on
+  void Unlock() MOZ_CAPABILITY_RELEASE() {
+    MOZ_ASSERT(mLocked);
+    mMonitor->Unlock();
+    mLocked = false;
+  }
+  void Lock() MOZ_CAPABILITY_ACQUIRE() {
+    MOZ_ASSERT(!mLocked);
+    mMonitor->Lock();
+    mLocked = true;
+  }
+  void AssertCurrentThreadOwns() const MOZ_ASSERT_CAPABILITY() {
+    mMonitor->AssertCurrentThreadOwns();
+  }
+
+ private:
+  bool mLocked;
+  MonitorType* mMonitor;
+
+  ReleasableMonitorAutoLockBase() = delete;
+  ReleasableMonitorAutoLockBase(const ReleasableMonitorAutoLockBase&) = delete;
+  ReleasableMonitorAutoLockBase& operator=(
+      const ReleasableMonitorAutoLockBase&) = delete;
+  static void* operator new(size_t) noexcept(true);
+};
+
+using ReleasableMonitorAutoLock = ReleasableMonitorAutoLockBase<Monitor>;
+
+}  
+
+#endif  // mozilla_Monitor_h

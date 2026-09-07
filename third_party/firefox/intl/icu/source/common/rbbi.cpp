@@ -1,0 +1,971 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+***************************************************************************
+*   Copyright (C) 1999-2016 International Business Machines Corporation
+*   and others. All rights reserved.
+***************************************************************************
+*/
+
+#include "utypeinfo.h"  // for 'typeid' to work
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_BREAK_ITERATION
+
+#include <cinttypes>
+
+#include "unicode/rbbi.h"
+#include "unicode/schriter.h"
+#include "unicode/uchriter.h"
+#include "unicode/uclean.h"
+#include "unicode/udata.h"
+
+#include "brkeng.h"
+#include "ucln_cmn.h"
+#include "cmemory.h"
+#include "cstring.h"
+#include "localsvc.h"
+#include "rbbidata.h"
+#include "rbbi_cache.h"
+#include "rbbirb.h"
+#include "uassert.h"
+#include "umutex.h"
+#include "uvectr32.h"
+
+#ifdef RBBI_DEBUG
+static UBool gTrace = false;
+#endif
+
+U_NAMESPACE_BEGIN
+
+constexpr int32_t START_STATE = 1;
+
+constexpr int32_t STOP_STATE = 0;
+
+
+UOBJECT_DEFINE_RTTI_IMPLEMENTATION(RuleBasedBreakIterator)
+
+
+
+RuleBasedBreakIterator::RuleBasedBreakIterator(RBBIDataHeader* data, UErrorCode &status)
+ : RuleBasedBreakIterator(&status)
+{
+    fData = new RBBIDataWrapper(data, status); 
+    if (U_FAILURE(status)) {return;}
+    if(fData == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        return;
+    }
+    if (fData->fForwardTable->fLookAheadResultsSize > 0) {
+        fLookAheadMatches = static_cast<int32_t *>(
+            uprv_malloc(fData->fForwardTable->fLookAheadResultsSize * sizeof(int32_t)));
+        if (fLookAheadMatches == nullptr) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+            return;
+        }
+    }
+}
+
+RuleBasedBreakIterator::RuleBasedBreakIterator(UDataMemory* udm, UBool isPhraseBreaking,
+        UErrorCode &status) : RuleBasedBreakIterator(udm, status)
+{
+    fIsPhraseBreaking = isPhraseBreaking;
+}
+
+RuleBasedBreakIterator::RuleBasedBreakIterator(const uint8_t *compiledRules,
+                       uint32_t       ruleLength,
+                       UErrorCode     &status)
+ : RuleBasedBreakIterator(&status)
+{
+    if (U_FAILURE(status)) {
+        return;
+    }
+    if (compiledRules == nullptr || ruleLength < sizeof(RBBIDataHeader)) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return;
+    }
+    const RBBIDataHeader* data = reinterpret_cast<const RBBIDataHeader*>(compiledRules);
+    if (data->fLength > ruleLength) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return;
+    }
+    fData = new RBBIDataWrapper(data, RBBIDataWrapper::kDontAdopt, status);
+    if (U_FAILURE(status)) {return;}
+    if(fData == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        return;
+    }
+    if (fData->fForwardTable->fLookAheadResultsSize > 0) {
+        fLookAheadMatches = static_cast<int32_t *>(
+            uprv_malloc(fData->fForwardTable->fLookAheadResultsSize * sizeof(int32_t)));
+        if (fLookAheadMatches == nullptr) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+            return;
+        }
+    }
+}
+
+
+RuleBasedBreakIterator::RuleBasedBreakIterator(UDataMemory* udm, UErrorCode &status)
+ : RuleBasedBreakIterator(&status)
+{
+    fData = new RBBIDataWrapper(udm, status); 
+    if (U_FAILURE(status)) {return;}
+    if(fData == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        return;
+    }
+    if (fData->fForwardTable->fLookAheadResultsSize > 0) {
+        fLookAheadMatches = static_cast<int32_t *>(
+            uprv_malloc(fData->fForwardTable->fLookAheadResultsSize * sizeof(int32_t)));
+        if (fLookAheadMatches == nullptr) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+            return;
+        }
+    }
+}
+
+
+
+RuleBasedBreakIterator::RuleBasedBreakIterator( const UnicodeString  &rules,
+                                                UParseError          &parseError,
+                                                UErrorCode           &status)
+ : RuleBasedBreakIterator(&status)
+{
+    if (U_FAILURE(status)) {return;}
+    RuleBasedBreakIterator *bi = (RuleBasedBreakIterator *)
+        RBBIRuleBuilder::createRuleBasedBreakIterator(rules, &parseError, status);
+    if (U_SUCCESS(status)) {
+        *this = *bi;
+        delete bi;
+    }
+}
+
+
+RuleBasedBreakIterator::RuleBasedBreakIterator()
+ : RuleBasedBreakIterator(nullptr)
+{
+}
+
+RuleBasedBreakIterator::RuleBasedBreakIterator(UErrorCode *status) {
+    UErrorCode ec = U_ZERO_ERROR;
+    if (status == nullptr) {
+        status = &ec;
+    }
+    utext_openUChars(&fText, nullptr, 0, status);
+    LocalPointer<DictionaryCache> lpDictionaryCache(new DictionaryCache(this, *status), *status);
+    LocalPointer<BreakCache> lpBreakCache(new BreakCache(this, *status), *status);
+    if (U_FAILURE(*status)) {
+        fErrorCode = *status;
+        return;
+    }
+    fDictionaryCache = lpDictionaryCache.orphan();
+    fBreakCache = lpBreakCache.orphan();
+
+#ifdef RBBI_DEBUG
+    static UBool debugInitDone = false;
+    if (debugInitDone == false) {
+        char *debugEnv = getenv("U_RBBIDEBUG");
+        if (debugEnv && uprv_strstr(debugEnv, "trace")) {
+            gTrace = true;
+        }
+        debugInitDone = true;
+    }
+#endif
+}
+
+
+RuleBasedBreakIterator::RuleBasedBreakIterator(const RuleBasedBreakIterator& other)
+: RuleBasedBreakIterator()
+{
+    *this = other;
+}
+
+
+RuleBasedBreakIterator::~RuleBasedBreakIterator() {
+    if (fCharIter != &fSCharIter) {
+        delete fCharIter;
+    }
+    fCharIter = nullptr;
+
+    utext_close(&fText);
+
+    if (fData != nullptr) {
+        fData->removeReference();
+        fData = nullptr;
+    }
+    delete fBreakCache;
+    fBreakCache = nullptr;
+
+    delete fDictionaryCache;
+    fDictionaryCache = nullptr;
+
+    delete fLanguageBreakEngines;
+    fLanguageBreakEngines = nullptr;
+
+    delete fUnhandledBreakEngine;
+    fUnhandledBreakEngine = nullptr;
+
+    uprv_free(fLookAheadMatches);
+    fLookAheadMatches = nullptr;
+}
+
+RuleBasedBreakIterator&
+RuleBasedBreakIterator::operator=(const RuleBasedBreakIterator& that) {
+    if (this == &that) {
+        return *this;
+    }
+    BreakIterator::operator=(that);
+
+    if (fLanguageBreakEngines != nullptr) {
+        delete fLanguageBreakEngines;
+        fLanguageBreakEngines = nullptr;   
+    }
+    UErrorCode status = U_ZERO_ERROR;
+    utext_clone(&fText, &that.fText, false, true, &status);
+
+    if (fCharIter != &fSCharIter) {
+        delete fCharIter;
+    }
+    fCharIter = &fSCharIter;
+
+    if (that.fCharIter != nullptr && that.fCharIter != &that.fSCharIter) {
+        fCharIter = that.fCharIter->clone();
+    }
+    fSCharIter = that.fSCharIter;
+    if (fCharIter == nullptr) {
+        fCharIter = &fSCharIter;
+    }
+
+    if (fData != nullptr) {
+        fData->removeReference();
+        fData = nullptr;
+    }
+    if (that.fData != nullptr) {
+        fData = that.fData->addReference();
+    }
+
+    uprv_free(fLookAheadMatches);
+    fLookAheadMatches = nullptr;
+    if (fData && fData->fForwardTable->fLookAheadResultsSize > 0) {
+        fLookAheadMatches = static_cast<int32_t *>(
+            uprv_malloc(fData->fForwardTable->fLookAheadResultsSize * sizeof(int32_t)));
+    }
+
+
+    fPosition = that.fPosition;
+    fRuleStatusIndex = that.fRuleStatusIndex;
+    fDone = that.fDone;
+
+    fBreakCache->reset(fPosition, fRuleStatusIndex);
+    fDictionaryCache->reset();
+
+    return *this;
+}
+
+RuleBasedBreakIterator*
+RuleBasedBreakIterator::clone() const {
+    return new RuleBasedBreakIterator(*this);
+}
+
+bool
+RuleBasedBreakIterator::operator==(const BreakIterator& that) const {
+    if (typeid(*this) != typeid(that)) {
+        return false;
+    }
+    if (this == &that) {
+        return true;
+    }
+
+
+    const RuleBasedBreakIterator& that2 = static_cast<const RuleBasedBreakIterator&>(that);
+
+    if (!utext_equals(&fText, &that2.fText)) {
+        return false;
+    }
+
+    if (!(fPosition == that2.fPosition &&
+            fRuleStatusIndex == that2.fRuleStatusIndex &&
+            fDone == that2.fDone)) {
+        return false;
+    }
+
+    if (that2.fData == fData ||
+        (fData != nullptr && that2.fData != nullptr && *that2.fData == *fData)) {
+            return true;
+        }
+    return false;
+}
+
+int32_t
+RuleBasedBreakIterator::hashCode() const {
+    int32_t   hash = 0;
+    if (fData != nullptr) {
+        hash = fData->hashCode();
+    }
+    return hash;
+}
+
+
+void RuleBasedBreakIterator::setText(UText *ut, UErrorCode &status) {
+    if (U_FAILURE(status)) {
+        return;
+    }
+    fBreakCache->reset();
+    fDictionaryCache->reset();
+    utext_clone(&fText, ut, false, true, &status);
+
+    fSCharIter.setText(u"", 0);
+
+    if (fCharIter != &fSCharIter) {
+        delete fCharIter;
+    }
+    fCharIter = &fSCharIter;
+
+    this->first();
+}
+
+
+UText *RuleBasedBreakIterator::getUText(UText *fillIn, UErrorCode &status) const {
+    UText *result = utext_clone(fillIn, &fText, false, true, &status);
+    return result;
+}
+
+
+
+CharacterIterator&
+RuleBasedBreakIterator::getText() const {
+    return *fCharIter;
+}
+
+void
+RuleBasedBreakIterator::adoptText(CharacterIterator* newText) {
+    if (fCharIter != &fSCharIter) {
+        delete fCharIter;
+    }
+
+    fCharIter = newText;
+    UErrorCode status = U_ZERO_ERROR;
+    fBreakCache->reset();
+    fDictionaryCache->reset();
+    if (newText==nullptr || newText->startIndex() != 0) {
+        utext_openUChars(&fText, nullptr, 0, &status);
+    } else {
+        utext_openCharacterIterator(&fText, newText, &status);
+    }
+    this->first();
+}
+
+void
+RuleBasedBreakIterator::setText(const UnicodeString& newText) {
+    UErrorCode status = U_ZERO_ERROR;
+    fBreakCache->reset();
+    fDictionaryCache->reset();
+    utext_openConstUnicodeString(&fText, &newText, &status);
+
+    fSCharIter.setText(newText.getBuffer(), newText.length());
+
+    if (fCharIter != &fSCharIter) {
+        delete fCharIter;
+    }
+    fCharIter = &fSCharIter;
+
+    this->first();
+}
+
+
+RuleBasedBreakIterator &RuleBasedBreakIterator::refreshInputText(UText *input, UErrorCode &status) {
+    if (U_FAILURE(status)) {
+        return *this;
+    }
+    if (input == nullptr) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return *this;
+    }
+    int64_t pos = utext_getNativeIndex(&fText);
+    utext_clone(&fText, input, false, true, &status);
+    if (U_FAILURE(status)) {
+        return *this;
+    }
+    utext_setNativeIndex(&fText, pos);
+    if (utext_getNativeIndex(&fText) != pos) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+    }
+    return *this;
+}
+
+
+int32_t RuleBasedBreakIterator::first() {
+    UErrorCode status = U_ZERO_ERROR;
+    if (!fBreakCache->seek(0)) {
+        fBreakCache->populateNear(0, status);
+    }
+    fBreakCache->current();
+    U_ASSERT(fPosition == 0);
+    return 0;
+}
+
+int32_t RuleBasedBreakIterator::last() {
+    int32_t endPos = static_cast<int32_t>(utext_nativeLength(&fText));
+    UBool endShouldBeBoundary = isBoundary(endPos);      
+    (void)endShouldBeBoundary;
+    U_ASSERT(endShouldBeBoundary);
+    U_ASSERT(fPosition == endPos);
+    return endPos;
+}
+
+int32_t RuleBasedBreakIterator::next(int32_t n) {
+    int32_t result = 0;
+    if (n > 0) {
+        for (; n > 0 && result != UBRK_DONE; --n) {
+            result = next();
+        }
+    } else if (n < 0) {
+        for (; n < 0 && result != UBRK_DONE; ++n) {
+            result = previous();
+        }
+    } else {
+        result = current();
+    }
+    return result;
+}
+
+int32_t RuleBasedBreakIterator::next() {
+    fBreakCache->next();
+    return fDone ? UBRK_DONE : fPosition;
+}
+
+int32_t RuleBasedBreakIterator::previous() {
+    UErrorCode status = U_ZERO_ERROR;
+    fBreakCache->previous(status);
+    return fDone ? UBRK_DONE : fPosition;
+}
+
+int32_t RuleBasedBreakIterator::following(int32_t startPos) {
+    if (startPos < 0) {
+        return first();
+    }
+
+    utext_setNativeIndex(&fText, startPos);
+    startPos = static_cast<int32_t>(utext_getNativeIndex(&fText));
+
+    UErrorCode status = U_ZERO_ERROR;
+    fBreakCache->following(startPos, status);
+    return fDone ? UBRK_DONE : fPosition;
+}
+
+int32_t RuleBasedBreakIterator::preceding(int32_t offset) {
+    if (offset > utext_nativeLength(&fText)) {
+        return last();
+    }
+
+
+    utext_setNativeIndex(&fText, offset);
+    int32_t adjustedOffset = static_cast<int32_t>(utext_getNativeIndex(&fText));
+
+    UErrorCode status = U_ZERO_ERROR;
+    fBreakCache->preceding(adjustedOffset, status);
+    return fDone ? UBRK_DONE : fPosition;
+}
+
+UBool RuleBasedBreakIterator::isBoundary(int32_t offset) {
+    if (offset < 0) {
+        first();       
+        return false;
+    }
+
+
+    utext_setNativeIndex(&fText, offset);
+    int32_t adjustedOffset = static_cast<int32_t>(utext_getNativeIndex(&fText));
+
+    bool result = false;
+    UErrorCode status = U_ZERO_ERROR;
+    if (fBreakCache->seek(adjustedOffset) || fBreakCache->populateNear(adjustedOffset, status)) {
+        result = (fBreakCache->current() == offset);
+    }
+
+    if (result && adjustedOffset < offset && utext_char32At(&fText, offset) == U_SENTINEL) {
+        return false;
+    }
+    if (!result) {
+        next();
+    }
+    return result;
+}
+
+
+int32_t RuleBasedBreakIterator::current() const {
+    return fPosition;
+}
+
+
+
+enum RBBIRunMode {
+    RBBI_START,     
+    RBBI_RUN,       
+    RBBI_END        
+};
+
+
+static inline uint16_t TrieFunc8(const UCPTrie *trie, UChar32 c) {
+    return UCPTRIE_FAST_GET(trie, UCPTRIE_8, c);
+}
+
+static inline uint16_t TrieFunc16(const UCPTrie *trie, UChar32 c) {
+    return UCPTRIE_FAST_GET(trie, UCPTRIE_16, c);
+}
+
+int32_t RuleBasedBreakIterator::handleNext() {
+    const RBBIStateTable *statetable = fData->fForwardTable;
+    bool use8BitsTrie = ucptrie_getValueWidth(fData->fTrie) == UCPTRIE_VALUE_BITS_8;
+    if (statetable->fFlags & RBBI_8BITS_ROWS) {
+        if (use8BitsTrie) {
+            return handleNext<RBBIStateTableRow8, TrieFunc8>();
+        } else {
+            return handleNext<RBBIStateTableRow8, TrieFunc16>();
+        }
+    } else {
+        if (use8BitsTrie) {
+            return handleNext<RBBIStateTableRow16, TrieFunc8>();
+        } else {
+            return handleNext<RBBIStateTableRow16, TrieFunc16>();
+        }
+    }
+}
+
+int32_t RuleBasedBreakIterator::handleSafePrevious(int32_t fromPosition) {
+    const RBBIStateTable *statetable = fData->fReverseTable;
+    bool use8BitsTrie = ucptrie_getValueWidth(fData->fTrie) == UCPTRIE_VALUE_BITS_8;
+    if (statetable->fFlags & RBBI_8BITS_ROWS) {
+        if (use8BitsTrie) {
+            return handleSafePrevious<RBBIStateTableRow8, TrieFunc8>(fromPosition);
+        } else {
+            return handleSafePrevious<RBBIStateTableRow8, TrieFunc16>(fromPosition);
+        }
+    } else {
+        if (use8BitsTrie) {
+            return handleSafePrevious<RBBIStateTableRow16, TrieFunc8>(fromPosition);
+        } else {
+            return handleSafePrevious<RBBIStateTableRow16, TrieFunc16>(fromPosition);
+        }
+    }
+}
+
+
+template <typename RowType, RuleBasedBreakIterator::PTrieFunc trieFunc>
+int32_t RuleBasedBreakIterator::handleNext() {
+    int32_t             state;
+    uint16_t            category        = 0;
+    RBBIRunMode         mode;
+
+    RowType             *row;
+    UChar32             c;
+    int32_t             result             = 0;
+    int32_t             initialPosition    = 0;
+    const RBBIStateTable *statetable       = fData->fForwardTable;
+    const char         *tableData          = statetable->fTableData;
+    uint32_t            tableRowLen        = statetable->fRowLen;
+    uint32_t            dictStart          = statetable->fDictCategoriesStart;
+    #ifdef RBBI_DEBUG
+        if (gTrace) {
+            RBBIDebugPuts("Handle Next   pos   char  state category");
+        }
+    #endif
+
+    fRuleStatusIndex = 0;
+
+    fDictionaryCharCount = 0;
+
+    initialPosition = fPosition;
+    UTEXT_SETNATIVEINDEX(&fText, initialPosition);
+    result          = initialPosition;
+    c               = UTEXT_NEXT32(&fText);
+    if (c==U_SENTINEL) {
+        fDone = true;
+        return UBRK_DONE;
+    }
+
+    state = START_STATE;
+    row = (RowType *)
+            (tableData + tableRowLen * state);
+
+
+    mode     = RBBI_RUN;
+    if (statetable->fFlags & RBBI_BOF_REQUIRED) {
+        category = 2;
+        mode     = RBBI_START;
+    }
+
+
+    for (;;) {
+        if (c == U_SENTINEL) {
+            if (mode == RBBI_END) {
+                break;
+            }
+            mode = RBBI_END;
+            category = 1;
+        }
+
+        if (mode == RBBI_RUN) {
+            category = trieFunc(fData->fTrie, c);
+            fDictionaryCharCount += (category >= dictStart);
+        }
+
+       #ifdef RBBI_DEBUG
+            if (gTrace) {
+                RBBIDebugPrintf("             %4" PRId64 "   ", utext_getNativeIndex(&fText));
+                if (0x20<=c && c<0x7f) {
+                    RBBIDebugPrintf("\"%c\"  ", c);
+                } else {
+                    RBBIDebugPrintf("%5x  ", c);
+                }
+                RBBIDebugPrintf("%3d  %3d\n", state, category);
+            }
+        #endif
+
+
+        U_ASSERT(category<fData->fHeader->fCatCount);
+        state = row->fNextState[category];  
+        row = (RowType *)
+            (tableData + tableRowLen * state);
+
+
+        uint16_t accepting = row->fAccepting;
+        if (accepting == ACCEPTING_UNCONDITIONAL) {
+            if (mode != RBBI_START) {
+                result = static_cast<int32_t>(UTEXT_GETNATIVEINDEX(&fText));
+            }
+            fRuleStatusIndex = row->fTagsIdx;   
+        } else if (accepting > ACCEPTING_UNCONDITIONAL) {
+            U_ASSERT(accepting < fData->fForwardTable->fLookAheadResultsSize);
+            int32_t lookaheadResult = fLookAheadMatches[accepting];
+            if (lookaheadResult >= 0) {
+                fRuleStatusIndex = row->fTagsIdx;
+                fPosition = lookaheadResult;
+                return lookaheadResult;
+            }
+        }
+
+        uint16_t rule = row->fLookAhead;
+        U_ASSERT(rule == 0 || rule > ACCEPTING_UNCONDITIONAL);
+        U_ASSERT(rule == 0 || rule < fData->fForwardTable->fLookAheadResultsSize);
+        if (rule > ACCEPTING_UNCONDITIONAL) {
+            int32_t pos = static_cast<int32_t>(UTEXT_GETNATIVEINDEX(&fText));
+            fLookAheadMatches[rule] = pos;
+        }
+
+        if (state == STOP_STATE) {
+            break;
+        }
+
+        if (mode == RBBI_RUN) {
+            c = UTEXT_NEXT32(&fText);
+        } else {
+            if (mode == RBBI_START) {
+                mode = RBBI_RUN;
+            }
+        }
+    }
+
+
+    if (result == initialPosition) {
+        utext_setNativeIndex(&fText, initialPosition);
+        utext_next32(&fText);
+        result = static_cast<int32_t>(utext_getNativeIndex(&fText));
+        fRuleStatusIndex = 0;
+    }
+
+    fPosition = result;
+    #ifdef RBBI_DEBUG
+        if (gTrace) {
+            RBBIDebugPrintf("result = %d\n\n", result);
+        }
+    #endif
+    return result;
+}
+
+
+template <typename RowType, RuleBasedBreakIterator::PTrieFunc trieFunc>
+int32_t RuleBasedBreakIterator::handleSafePrevious(int32_t fromPosition) {
+
+    int32_t             state;
+    uint16_t            category        = 0;
+    RowType            *row;
+    UChar32             c;
+    int32_t             result          = 0;
+
+    const RBBIStateTable *stateTable = fData->fReverseTable;
+    UTEXT_SETNATIVEINDEX(&fText, fromPosition);
+    #ifdef RBBI_DEBUG
+        if (gTrace) {
+            RBBIDebugPuts("Handle Previous   pos   char  state category");
+        }
+    #endif
+
+    if (fData == nullptr || UTEXT_GETNATIVEINDEX(&fText)==0) {
+        return BreakIterator::DONE;
+    }
+
+    c = UTEXT_PREVIOUS32(&fText);
+    state = START_STATE;
+    row = (RowType *)
+            (stateTable->fTableData + (stateTable->fRowLen * state));
+
+    for (; c != U_SENTINEL; c = UTEXT_PREVIOUS32(&fText)) {
+
+        category = trieFunc(fData->fTrie, c);
+
+        #ifdef RBBI_DEBUG
+            if (gTrace) {
+                RBBIDebugPrintf("             %4d   ", (int32_t)utext_getNativeIndex(&fText));
+                if (0x20<=c && c<0x7f) {
+                    RBBIDebugPrintf("\"%c\"  ", c);
+                } else {
+                    RBBIDebugPrintf("%5x  ", c);
+                }
+                RBBIDebugPrintf("%3d  %3d\n", state, category);
+            }
+        #endif
+
+        U_ASSERT(category<fData->fHeader->fCatCount);
+        state = row->fNextState[category];  
+        row = (RowType *)
+            (stateTable->fTableData + (stateTable->fRowLen * state));
+
+        if (state == STOP_STATE) {
+            break;
+        }
+    }
+
+    result = static_cast<int32_t>(UTEXT_GETNATIVEINDEX(&fText));
+    #ifdef RBBI_DEBUG
+        if (gTrace) {
+            RBBIDebugPrintf("result = %d\n\n", result);
+        }
+    #endif
+    return result;
+}
+
+
+
+int32_t  RuleBasedBreakIterator::getRuleStatus() const {
+
+    int32_t  idx = fRuleStatusIndex + fData->fRuleStatusTable[fRuleStatusIndex];
+    int32_t  tagVal = fData->fRuleStatusTable[idx];
+
+    return tagVal;
+}
+
+
+int32_t RuleBasedBreakIterator::getRuleStatusVec(
+             int32_t *fillInVec, int32_t capacity, UErrorCode &status) {
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+
+    int32_t  numVals = fData->fRuleStatusTable[fRuleStatusIndex];
+    int32_t  numValsToCopy = numVals;
+    if (numVals > capacity) {
+        status = U_BUFFER_OVERFLOW_ERROR;
+        numValsToCopy = capacity;
+    }
+    int i;
+    for (i=0; i<numValsToCopy; i++) {
+        fillInVec[i] = fData->fRuleStatusTable[fRuleStatusIndex + i + 1];
+    }
+    return numVals;
+}
+
+
+
+const uint8_t  *RuleBasedBreakIterator::getBinaryRules(uint32_t &length) {
+    const uint8_t  *retPtr = nullptr;
+    length = 0;
+
+    if (fData != nullptr) {
+        retPtr = reinterpret_cast<const uint8_t*>(fData->fHeader);
+        length = fData->fHeader->fLength;
+    }
+    return retPtr;
+}
+
+
+RuleBasedBreakIterator *RuleBasedBreakIterator::createBufferClone(
+        void * , int32_t &bufferSize, UErrorCode &status) {
+    if (U_FAILURE(status)){
+        return nullptr;
+    }
+
+    if (bufferSize == 0) {
+        bufferSize = 1;  
+        return nullptr;
+    }
+
+    BreakIterator *clonedBI = clone();
+    if (clonedBI == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+    } else {
+        status = U_SAFECLONE_ALLOCATED_WARNING;
+    }
+    return (RuleBasedBreakIterator *)clonedBI;
+}
+
+U_NAMESPACE_END
+
+
+static icu::UStack *gLanguageBreakFactories = nullptr;
+static const icu::UnicodeString *gEmptyString = nullptr;
+static icu::UInitOnce gLanguageBreakFactoriesInitOnce {};
+static icu::UInitOnce gRBBIInitOnce {};
+static icu::ICULanguageBreakFactory *gICULanguageBreakFactory = nullptr;
+
+U_CDECL_BEGIN
+UBool U_CALLCONV rbbi_cleanup() {
+    delete gLanguageBreakFactories;
+    gLanguageBreakFactories = nullptr;
+    delete gEmptyString;
+    gEmptyString = nullptr;
+    gLanguageBreakFactoriesInitOnce.reset();
+    gRBBIInitOnce.reset();
+    return true;
+}
+U_CDECL_END
+
+U_CDECL_BEGIN
+static void U_CALLCONV _deleteFactory(void *obj) {
+    delete (icu::LanguageBreakFactory *) obj;
+}
+U_CDECL_END
+U_NAMESPACE_BEGIN
+
+static void U_CALLCONV rbbiInit() {
+    gEmptyString = new UnicodeString();
+    ucln_common_registerCleanup(UCLN_COMMON_RBBI, rbbi_cleanup);
+}
+
+static void U_CALLCONV initLanguageFactories(UErrorCode& status) {
+    U_ASSERT(gLanguageBreakFactories == nullptr);
+    gLanguageBreakFactories = new UStack(_deleteFactory, nullptr, status);
+    if (gLanguageBreakFactories != nullptr && U_SUCCESS(status)) {
+        LocalPointer<ICULanguageBreakFactory> factory(new ICULanguageBreakFactory(status), status);
+        if (U_SUCCESS(status)) {
+            gICULanguageBreakFactory = factory.orphan();
+            gLanguageBreakFactories->push(gICULanguageBreakFactory, status);
+#ifdef U_LOCAL_SERVICE_HOOK
+            LanguageBreakFactory *extra = (LanguageBreakFactory *)uprv_svc_hook("languageBreakFactory", &status);
+            if (extra != nullptr) {
+                gLanguageBreakFactories->push(extra, status);
+            }
+#endif
+        }
+    }
+    ucln_common_registerCleanup(UCLN_COMMON_RBBI, rbbi_cleanup);
+}
+
+void ensureLanguageFactories(UErrorCode& status) {
+    umtx_initOnce(gLanguageBreakFactoriesInitOnce, &initLanguageFactories, status);
+}
+
+static const LanguageBreakEngine*
+getLanguageBreakEngineFromFactory(UChar32 c, const char* locale)
+{
+    UErrorCode status = U_ZERO_ERROR;
+    ensureLanguageFactories(status);
+    if (U_FAILURE(status)) return nullptr;
+
+    int32_t i = gLanguageBreakFactories->size();
+    const LanguageBreakEngine *lbe = nullptr;
+    while (--i >= 0) {
+        LanguageBreakFactory* factory = static_cast<LanguageBreakFactory*>(gLanguageBreakFactories->elementAt(i));
+        lbe = factory->getEngineFor(c, locale);
+        if (lbe != nullptr) {
+            break;
+        }
+    }
+    return lbe;
+}
+
+
+const LanguageBreakEngine *
+RuleBasedBreakIterator::getLanguageBreakEngine(UChar32 c, const char* locale) {
+    const LanguageBreakEngine *lbe = nullptr;
+    UErrorCode status = U_ZERO_ERROR;
+
+    if (fLanguageBreakEngines == nullptr) {
+        fLanguageBreakEngines = new UStack(status);
+        if (fLanguageBreakEngines == nullptr || U_FAILURE(status)) {
+            delete fLanguageBreakEngines;
+            fLanguageBreakEngines = nullptr;
+            return nullptr;
+        }
+    }
+
+    int32_t i = fLanguageBreakEngines->size();
+    while (--i >= 0) {
+        lbe = static_cast<const LanguageBreakEngine*>(fLanguageBreakEngines->elementAt(i));
+        if (lbe->handles(c, locale)) {
+            return lbe;
+        }
+    }
+
+    lbe = getLanguageBreakEngineFromFactory(c, locale);
+
+    if (lbe != nullptr) {
+        fLanguageBreakEngines->push((void *)lbe, status);
+        return lbe;
+    }
+
+    if (fUnhandledBreakEngine == nullptr) {
+        fUnhandledBreakEngine = new UnhandledEngine(status);
+        if (U_SUCCESS(status) && fUnhandledBreakEngine == nullptr) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+            return nullptr;
+        }
+        fLanguageBreakEngines->insertElementAt(fUnhandledBreakEngine, 0, status);
+        U_ASSERT(!fLanguageBreakEngines->hasDeleter());
+        if (U_FAILURE(status)) {
+            delete fUnhandledBreakEngine;
+            fUnhandledBreakEngine = nullptr;
+            return nullptr;
+        }
+    }
+
+    fUnhandledBreakEngine->handleCharacter(c);
+
+    return fUnhandledBreakEngine;
+}
+
+#ifndef U_HIDE_DRAFT_API
+void U_EXPORT2 RuleBasedBreakIterator::registerExternalBreakEngine(
+                  ExternalBreakEngine* toAdopt, UErrorCode& status) {
+    LocalPointer<ExternalBreakEngine> engine(toAdopt, status);
+    if (U_FAILURE(status)) return;
+    ensureLanguageFactories(status);
+    if (U_FAILURE(status)) return;
+    gICULanguageBreakFactory->addExternalEngine(engine.orphan(), status);
+}
+#endif  /* U_HIDE_DRAFT_API */
+
+
+void RuleBasedBreakIterator::dumpCache() {
+    fBreakCache->dumpCache();
+}
+
+void RuleBasedBreakIterator::dumpTables() {
+    fData->printData();
+}
+
+
+const UnicodeString&
+RuleBasedBreakIterator::getRules() const {
+    if (fData != nullptr) {
+        return fData->getRuleSourceString();
+    } else {
+        umtx_initOnce(gRBBIInitOnce, &rbbiInit);
+        return *gEmptyString;
+    }
+}
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_BREAK_ITERATION */

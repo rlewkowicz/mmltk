@@ -1,0 +1,964 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+ ******************************************************************************
+ * Copyright (C) 2007-2014, International Business Machines Corporation
+ * and others. All Rights Reserved.
+ ******************************************************************************
+ *
+ * File CHNSECAL.CPP
+ *
+ * Modification History:
+ *
+ *   Date        Name        Description
+ *   9/18/2007  ajmacher         ported from java ChineseCalendar
+ *****************************************************************************
+ */
+
+#include "chnsecal.h"
+
+#include <cstdint>
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "umutex.h"
+#include <float.h>
+#include "gregoimp.h" // Math
+#include "astro.h" // CalendarAstronomer and CalendarCache
+#include "unicode/simpletz.h"
+#include "uhash.h"
+#include "ucln_in.h"
+#include "cstring.h"
+
+#ifdef U_DEBUG_CHNSECAL
+# include <stdio.h>
+# include <stdarg.h>
+static void debug_chnsecal_loc(const char *f, int32_t l)
+{
+    fprintf(stderr, "%s:%d: ", f, l);
+}
+
+static void debug_chnsecal_msg(const char *pat, ...)
+{
+    va_list ap;
+    va_start(ap, pat);
+    vfprintf(stderr, pat, ap);
+    fflush(stderr);
+}
+#define U_DEBUG_CHNSECAL_MSG(x) {debug_chnsecal_loc(__FILE__,__LINE__);debug_chnsecal_msg x;}
+#else
+#define U_DEBUG_CHNSECAL_MSG(x)
+#endif
+
+
+static icu::CalendarCache *gWinterSolsticeCache = nullptr;
+static icu::CalendarCache *gNewYearCache = nullptr;
+
+static icu::TimeZone *gAstronomerTimeZone = nullptr;
+static icu::UInitOnce gAstronomerTimeZoneInitOnce {};
+
+static const int32_t CHINESE_EPOCH_YEAR = 1; 
+static const int32_t CYCLE_EPOCH = -2636; 
+
+static const int32_t CHINA_OFFSET = 8 * kOneHour;
+
+static const int32_t SYNODIC_GAP = 25;
+
+
+U_CDECL_BEGIN
+static UBool calendar_chinese_cleanup() {
+    if (gWinterSolsticeCache) {
+        delete gWinterSolsticeCache;
+        gWinterSolsticeCache = nullptr;
+    }
+    if (gNewYearCache) {
+        delete gNewYearCache;
+        gNewYearCache = nullptr;
+    }
+    if (gAstronomerTimeZone) {
+        delete gAstronomerTimeZone;
+        gAstronomerTimeZone = nullptr;
+    }
+    gAstronomerTimeZoneInitOnce.reset();
+    return true;
+}
+U_CDECL_END
+
+U_NAMESPACE_BEGIN
+
+
+
+
+
+
+namespace {
+
+const TimeZone* getAstronomerTimeZone();
+int32_t newMoonNear(const TimeZone*, double, UBool, UErrorCode&);
+int32_t newYear(const icu::ChineseCalendar::Setting&, int32_t, UErrorCode&);
+UBool isLeapMonthBetween(const TimeZone*, int32_t, int32_t, UErrorCode&);
+
+} 
+
+ChineseCalendar* ChineseCalendar::clone() const {
+    return new ChineseCalendar(*this);
+}
+
+ChineseCalendar::ChineseCalendar(const Locale& aLocale, UErrorCode& success)
+:   Calendar(TimeZone::forLocaleOrDefault(aLocale), aLocale, success),
+    hasLeapMonthBetweenWinterSolstices(false)
+{
+}
+
+ChineseCalendar::ChineseCalendar(const ChineseCalendar& other) : Calendar(other) {
+    hasLeapMonthBetweenWinterSolstices = other.hasLeapMonthBetweenWinterSolstices;
+}
+
+ChineseCalendar::~ChineseCalendar()
+{
+}
+
+const char *ChineseCalendar::getType() const { 
+    return "chinese";
+}
+
+namespace { 
+
+static void U_CALLCONV initAstronomerTimeZone() {
+    gAstronomerTimeZone = new SimpleTimeZone(CHINA_OFFSET, UNICODE_STRING_SIMPLE("CHINA_ZONE") );
+    ucln_i18n_registerCleanup(UCLN_I18N_CHINESE_CALENDAR, calendar_chinese_cleanup);
+}
+
+const TimeZone* getAstronomerTimeZone() {
+    umtx_initOnce(gAstronomerTimeZoneInitOnce, &initAstronomerTimeZone);
+    return gAstronomerTimeZone;
+}
+
+} 
+
+
+
+static const int32_t LIMITS[UCAL_FIELD_COUNT][4] = {
+    {        1,        1,    83333,    83333}, 
+    {        1,        1,       60,       60}, 
+    {        0,        0,       11,       11}, 
+    {        1,        1,       50,       55}, 
+    {-1,-1,-1,-1}, 
+    {        1,        1,       29,       30}, 
+    {        1,        1,      353,      385}, 
+    {-1,-1,-1,-1}, 
+    {       -1,       -1,        5,        5}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    { -5000000, -5000000,  5000000,  5000000}, 
+    {-1,-1,-1,-1}, 
+    { -5000000, -5000000,  5000000,  5000000}, 
+    {-1,-1,-1,-1}, 
+    {-1,-1,-1,-1}, 
+    {        0,        0,        1,        1}, 
+    {        0,        0,       11,       12}, 
+};
+
+
+int32_t ChineseCalendar::handleGetLimit(UCalendarDateFields field, ELimitType limitType) const {
+    return LIMITS[field][limitType];
+}
+
+
+
+int32_t ChineseCalendar::handleGetExtendedYear(UErrorCode& status) {
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+
+    int32_t year;
+    if (newerField(UCAL_EXTENDED_YEAR, newerField(UCAL_ERA, UCAL_YEAR)) ==
+        UCAL_EXTENDED_YEAR) {
+        year = internalGet(UCAL_EXTENDED_YEAR, 1); 
+    } else {
+        int32_t cycle = internalGet(UCAL_ERA, 1);
+        year = internalGet(UCAL_YEAR, 1);
+        if (uprv_add32_overflow(cycle, -1, &cycle) || 
+            uprv_mul32_overflow(cycle, 60, &cycle) ||
+            uprv_add32_overflow(year, cycle, &year) ||
+            uprv_add32_overflow(year, CYCLE_EPOCH-CHINESE_EPOCH_YEAR,
+                                &year)) {
+            status = U_ILLEGAL_ARGUMENT_ERROR;
+            return 0;
+        }
+    }
+    return year;
+}
+
+int32_t ChineseCalendar::handleGetMonthLength(int32_t extendedYear, int32_t month, UErrorCode& status) const {
+    bool isLeapMonth = internalGet(UCAL_IS_LEAP_MONTH) == 1;
+    return handleGetMonthLengthWithLeap(extendedYear, month, isLeapMonth, status);
+}
+
+int32_t ChineseCalendar::handleGetMonthLengthWithLeap(int32_t extendedYear, int32_t month, bool leap, UErrorCode& status) const {
+    const Setting setting = getSetting(status);
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+    int32_t thisStart = handleComputeMonthStartWithLeap(extendedYear, month, leap, status);
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+    thisStart = thisStart -
+        kEpochStartAsJulianDay + 1; 
+    int32_t nextStart = newMoonNear(setting.zoneAstroCalc, thisStart + SYNODIC_GAP, true, status);
+    return nextStart - thisStart;
+}
+
+const UFieldResolutionTable ChineseCalendar::CHINESE_DATE_PRECEDENCE[] =
+{
+    {
+        { UCAL_DAY_OF_MONTH, kResolveSTOP },
+        { UCAL_WEEK_OF_YEAR, UCAL_DAY_OF_WEEK, kResolveSTOP },
+        { UCAL_WEEK_OF_MONTH, UCAL_DAY_OF_WEEK, kResolveSTOP },
+        { UCAL_DAY_OF_WEEK_IN_MONTH, UCAL_DAY_OF_WEEK, kResolveSTOP },
+        { UCAL_WEEK_OF_YEAR, UCAL_DOW_LOCAL, kResolveSTOP },
+        { UCAL_WEEK_OF_MONTH, UCAL_DOW_LOCAL, kResolveSTOP },
+        { UCAL_DAY_OF_WEEK_IN_MONTH, UCAL_DOW_LOCAL, kResolveSTOP },
+        { UCAL_DAY_OF_YEAR, kResolveSTOP },
+        { kResolveRemap | UCAL_DAY_OF_MONTH, UCAL_IS_LEAP_MONTH, kResolveSTOP },
+        { kResolveSTOP }
+    },
+    {
+        { UCAL_WEEK_OF_YEAR, kResolveSTOP },
+        { UCAL_WEEK_OF_MONTH, kResolveSTOP },
+        { UCAL_DAY_OF_WEEK_IN_MONTH, kResolveSTOP },
+        { kResolveRemap | UCAL_DAY_OF_WEEK_IN_MONTH, UCAL_DAY_OF_WEEK, kResolveSTOP },
+        { kResolveRemap | UCAL_DAY_OF_WEEK_IN_MONTH, UCAL_DOW_LOCAL, kResolveSTOP },
+        { kResolveSTOP }
+    },
+    {{kResolveSTOP}}
+};
+
+const UFieldResolutionTable* ChineseCalendar::getFieldResolutionTable() const {
+    return CHINESE_DATE_PRECEDENCE;
+}
+
+namespace {
+
+struct MonthInfo {
+  int32_t month;
+  int32_t ordinalMonth;
+  int32_t thisMoon;
+  bool isLeapMonth;
+  bool hasLeapMonthBetweenWinterSolstices;
+};
+struct MonthInfo computeMonthInfo(
+    const icu::ChineseCalendar::Setting& setting,
+    int32_t gyear, int32_t days, UErrorCode& status);
+
+}  
+
+int64_t ChineseCalendar::handleComputeMonthStart(int32_t eyear, int32_t month, UBool useMonth, UErrorCode& status) const {
+    bool isLeapMonth = false;
+    if (useMonth) {
+        isLeapMonth = internalGet(UCAL_IS_LEAP_MONTH) != 0;
+    }
+    return handleComputeMonthStartWithLeap(eyear, month, isLeapMonth, status);
+}
+
+int64_t ChineseCalendar::handleComputeMonthStartWithLeap(int32_t eyear, int32_t month, bool isLeapMonth, UErrorCode& status) const {
+    if (U_FAILURE(status)) {
+       return 0;
+    }
+    if (month < 0 || month > 11) {
+        if (uprv_add32_overflow(eyear, ClockMath::floorDivide(month, 12, &month), &eyear)) {
+            status = U_ILLEGAL_ARGUMENT_ERROR;
+            return 0;
+        }
+    }
+
+    const Setting setting = getSetting(status);
+    if (U_FAILURE(status)) {
+       return 0;
+    }
+    int32_t gyear = eyear;
+    int32_t theNewYear = newYear(setting, gyear, status);
+    int32_t newMoon = newMoonNear(setting.zoneAstroCalc, theNewYear + month * 29, true, status);
+    if (U_FAILURE(status)) {
+       return 0;
+    }
+
+    int32_t newMonthYear = Grego::dayToYear(newMoon, status);
+
+    struct MonthInfo monthInfo = computeMonthInfo(setting, newMonthYear, newMoon, status);
+    if (U_FAILURE(status)) {
+       return 0;
+    }
+    if (month != monthInfo.month-1 || isLeapMonth != monthInfo.isLeapMonth) {
+        newMoon = newMoonNear(setting.zoneAstroCalc, newMoon + SYNODIC_GAP, true, status);
+        if (U_FAILURE(status)) {
+           return 0;
+        }
+    }
+    int32_t julianDay;
+    if (uprv_add32_overflow(newMoon-1, kEpochStartAsJulianDay, &julianDay)) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return 0;
+    }
+
+    return julianDay;
+}
+
+
+void ChineseCalendar::add(UCalendarDateFields field, int32_t amount, UErrorCode& status) {
+    switch (field) {
+    case UCAL_MONTH:
+    case UCAL_ORDINAL_MONTH:
+        if (amount != 0) {
+            int32_t dom = get(UCAL_DAY_OF_MONTH, status);
+            if (U_FAILURE(status)) break;
+            int32_t day = get(UCAL_JULIAN_DAY, status) - kEpochStartAsJulianDay; 
+            if (U_FAILURE(status)) break;
+            int32_t moon = day - dom + 1; 
+            offsetMonth(moon, dom, amount, status);
+        }
+        break;
+    default:
+        Calendar::add(field, amount, status);
+        break;
+    }
+}
+
+void ChineseCalendar::add(EDateFields field, int32_t amount, UErrorCode& status) {
+    add(static_cast<UCalendarDateFields>(field), amount, status);
+}
+
+namespace {
+
+struct RollMonthInfo {
+    int32_t month;
+    int32_t newMoon;
+    int32_t thisMoon;
+};
+
+struct RollMonthInfo rollMonth(const TimeZone* timeZone, int32_t amount, int32_t day, int32_t month, int32_t dayOfMonth,
+                               bool isLeapMonth, bool hasLeapMonthBetweenWinterSolstices,
+                               UErrorCode& status) {
+    struct RollMonthInfo output = {0, 0, 0};
+    if (U_FAILURE(status)) {
+        return output;
+    }
+
+    output.thisMoon = day - dayOfMonth + 1; 
+
+
+    if (hasLeapMonthBetweenWinterSolstices) { 
+        if (isLeapMonth) {
+            ++month;
+        } else {
+            int prevMoon = output.thisMoon -
+                static_cast<int>(CalendarAstronomer::SYNODIC_MONTH * (month - 0.5));
+            prevMoon = newMoonNear(timeZone, prevMoon, true, status);
+            if (U_FAILURE(status)) {
+               return output;
+            }
+            if (isLeapMonthBetween(timeZone, prevMoon, output.thisMoon, status)) {
+                ++month;
+            }
+            if (U_FAILURE(status)) {
+               return output;
+            }
+        }
+    }
+    int32_t numberOfMonths = hasLeapMonthBetweenWinterSolstices ? 13 : 12; 
+    if (uprv_add32_overflow(amount, month, &amount)) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return output;
+    }
+    output.newMoon = amount % numberOfMonths;
+    if (output.newMoon < 0) {
+        output.newMoon += numberOfMonths;
+    }
+    output.month = month;
+    return output;
+}
+
+}  
+
+void ChineseCalendar::roll(UCalendarDateFields field, int32_t amount, UErrorCode& status) {
+    switch (field) {
+    case UCAL_MONTH:
+    case UCAL_ORDINAL_MONTH:
+        if (amount != 0) {
+            const Setting setting = getSetting(status);
+            int32_t day = get(UCAL_JULIAN_DAY, status) - kEpochStartAsJulianDay; 
+            int32_t month = get(UCAL_MONTH, status); 
+            int32_t dayOfMonth = get(UCAL_DAY_OF_MONTH, status);
+            bool isLeapMonth = get(UCAL_IS_LEAP_MONTH, status) == 1;
+            if (U_FAILURE(status)) break;
+            struct RollMonthInfo r = rollMonth(
+                setting.zoneAstroCalc, amount, day, month, dayOfMonth, isLeapMonth,
+                hasLeapMonthBetweenWinterSolstices, status);
+            if (U_FAILURE(status)) break;
+            if (r.newMoon != r.month) {
+                offsetMonth(r.thisMoon, dayOfMonth, r.newMoon - r.month, status);
+            }
+        }
+        break;
+    default:
+        Calendar::roll(field, amount, status);
+        break;
+    }
+}
+
+void ChineseCalendar::roll(EDateFields field, int32_t amount, UErrorCode& status) {
+    roll(static_cast<UCalendarDateFields>(field), amount, status);
+}
+
+
+
+namespace {
+double daysToMillis(const TimeZone* timeZone, double days, UErrorCode& status) {
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+    double millis = days * kOneDay;
+    if (timeZone != nullptr) {
+        int32_t rawOffset, dstOffset;
+        timeZone->getOffset(millis, false, rawOffset, dstOffset, status);
+        if (U_FAILURE(status)) {
+            return 0;
+        }
+        return millis - static_cast<double>(rawOffset + dstOffset);
+    }
+    return millis - static_cast<double>(CHINA_OFFSET);
+}
+
+double millisToDays(const TimeZone* timeZone, double millis, UErrorCode& status) {
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+    if (timeZone != nullptr) {
+        int32_t rawOffset, dstOffset;
+        timeZone->getOffset(millis, false, rawOffset, dstOffset, status);
+        if (U_FAILURE(status)) {
+            return 0;
+        }
+        return ClockMath::floorDivide(millis + static_cast<double>(rawOffset + dstOffset), kOneDay);
+    }
+    return ClockMath::floorDivide(millis + static_cast<double>(CHINA_OFFSET), kOneDay);
+}
+
+
+
+int32_t winterSolstice(const icu::ChineseCalendar::Setting& setting,
+                       int32_t gyear, UErrorCode& status) {
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+    const TimeZone* timeZone = setting.zoneAstroCalc;
+
+    int32_t cacheValue = CalendarCache::get(setting.winterSolsticeCache, gyear, status);
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+
+    if (cacheValue == 0) {
+        double ms = daysToMillis(timeZone, Grego::fieldsToDay(gyear, UCAL_DECEMBER, 1), status);
+        if (U_FAILURE(status)) {
+            return 0;
+        }
+
+        double days = millisToDays(timeZone,
+                                   CalendarAstronomer(ms)
+                                       .getSunTime(CalendarAstronomer::WINTER_SOLSTICE(), true),
+                                   status);
+        if (U_FAILURE(status)) {
+            return 0;
+        }
+        if (days < INT32_MIN || days > INT32_MAX) {
+            status = U_ILLEGAL_ARGUMENT_ERROR;
+            return 0;
+        }
+        cacheValue = static_cast<int32_t>(days);
+        CalendarCache::put(setting.winterSolsticeCache, gyear, cacheValue, status);
+    }
+    if(U_FAILURE(status)) {
+        cacheValue = 0;
+    }
+    return cacheValue;
+}
+
+int32_t newMoonNear(const TimeZone* timeZone, double days, UBool after, UErrorCode& status) {
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+    double ms = daysToMillis(timeZone, days, status);
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+    return static_cast<int32_t>(millisToDays(
+        timeZone,
+        CalendarAstronomer(ms)
+              .getMoonTime(CalendarAstronomer::NEW_MOON(), after),
+              status));
+}
+
+int32_t synodicMonthsBetween(int32_t day1, int32_t day2) {
+    double roundme = ((day2 - day1) / CalendarAstronomer::SYNODIC_MONTH);
+    return static_cast<int32_t>(roundme + (roundme >= 0 ? .5 : -.5));
+}
+
+int32_t majorSolarTerm(const TimeZone* timeZone, int32_t days, UErrorCode& status) {
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+    double ms = daysToMillis(timeZone, days, status);
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+    int32_t term = ((static_cast<int32_t>(6 * CalendarAstronomer(ms)
+                                .getSunLongitude() / CalendarAstronomer::PI)) + 2 ) % 12;
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+    if (term < 1) {
+        term += 12;
+    }
+    return term;
+}
+
+UBool hasNoMajorSolarTerm(const TimeZone* timeZone, int32_t newMoon, UErrorCode& status) {
+    if (U_FAILURE(status)) {
+        return false;
+    }
+    int32_t term1 = majorSolarTerm(timeZone, newMoon, status);
+    int32_t term2 = majorSolarTerm(
+        timeZone, newMoonNear(timeZone, newMoon + SYNODIC_GAP, true, status), status);
+    if (U_FAILURE(status)) {
+        return false;
+    }
+    return term1 == term2;
+}
+
+
+
+UBool isLeapMonthBetween(const TimeZone* timeZone, int32_t newMoon1, int32_t newMoon2, UErrorCode& status) {
+    if (U_FAILURE(status)) {
+        return false;
+    }
+
+#ifdef U_DEBUG_CHNSECAL
+    if (synodicMonthsBetween(newMoon1, newMoon2) >= 50) {
+        U_DEBUG_CHNSECAL_MSG((
+            "isLeapMonthBetween(%d, %d): Invalid parameters", newMoon1, newMoon2
+            ));
+    }
+#endif
+
+    while (newMoon2 >= newMoon1) {
+        if (hasNoMajorSolarTerm(timeZone, newMoon2, status)) {
+            return true;
+        }
+        newMoon2 = newMoonNear(timeZone, newMoon2 - SYNODIC_GAP, false, status);
+        if (U_FAILURE(status)) {
+            return false;
+        }
+    }
+    return false;
+}
+
+
+struct MonthInfo computeMonthInfo(
+    const icu::ChineseCalendar::Setting& setting,
+    int32_t gyear, int32_t days, UErrorCode& status) {
+    struct MonthInfo output = {0, 0, 0, false, false};
+    if (U_FAILURE(status)) {
+        return output;
+    }
+    int32_t solsticeBefore;
+    int32_t solsticeAfter = winterSolstice(setting, gyear, status);
+    if (U_FAILURE(status)) {
+        return output;
+    }
+    if (days < solsticeAfter) {
+        int32_t gprevious_year;
+        if (uprv_add32_overflow(gyear, -1, &gprevious_year)) {
+            status = U_ILLEGAL_ARGUMENT_ERROR;
+            return output;
+        }
+        solsticeBefore = winterSolstice(setting, gprevious_year, status);
+    } else {
+        solsticeBefore = solsticeAfter;
+        int32_t gnext_year;
+        if (uprv_add32_overflow(gyear, 1, &gnext_year)) {
+            status = U_ILLEGAL_ARGUMENT_ERROR;
+            return output;
+        }
+        solsticeAfter = winterSolstice(setting, gnext_year, status);
+    }
+    if (!(solsticeBefore <= days && days < solsticeAfter)) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+    }
+    if (U_FAILURE(status)) {
+        return output;
+    }
+
+    const TimeZone* timeZone = setting.zoneAstroCalc;
+    int32_t firstMoon = newMoonNear(timeZone, solsticeBefore + 1, true, status);
+    int32_t lastMoon = newMoonNear(timeZone, solsticeAfter + 1, false, status);
+    if (U_FAILURE(status)) {
+        return output;
+    }
+    output.thisMoon = newMoonNear(timeZone, days + 1, false, status); 
+    if (U_FAILURE(status)) {
+        return output;
+    }
+    output.hasLeapMonthBetweenWinterSolstices = synodicMonthsBetween(firstMoon, lastMoon) == 12;
+
+    output.month = synodicMonthsBetween(firstMoon, output.thisMoon);
+    int32_t theNewYear = newYear(setting, gyear, status);
+    if (U_FAILURE(status)) {
+        return output;
+    }
+    if (days < theNewYear) {
+        int32_t gprevious_year;
+        if (uprv_add32_overflow(gyear, -1, &gprevious_year)) {
+            status = U_ILLEGAL_ARGUMENT_ERROR;
+            return output;
+        }
+        theNewYear = newYear(setting, gprevious_year, status);
+        if (U_FAILURE(status)) {
+            return output;
+        }
+    }
+    if (output.hasLeapMonthBetweenWinterSolstices &&
+        isLeapMonthBetween(timeZone, firstMoon, output.thisMoon, status)) {
+        output.month--;
+    }
+    if (U_FAILURE(status)) {
+        return output;
+    }
+    if (output.month < 1) {
+        output.month += 12;
+    }
+    output.ordinalMonth = synodicMonthsBetween(theNewYear, output.thisMoon);
+    if (output.ordinalMonth < 0) {
+        output.ordinalMonth += 12;
+    }
+    output.isLeapMonth = output.hasLeapMonthBetweenWinterSolstices &&
+        hasNoMajorSolarTerm(timeZone, output.thisMoon, status) &&
+        !isLeapMonthBetween(timeZone, firstMoon,
+                            newMoonNear(timeZone, output.thisMoon - SYNODIC_GAP, false, status),
+                            status);
+    if (U_FAILURE(status)) {
+        return output;
+    }
+    return output;
+}
+
+}  
+
+void ChineseCalendar::handleComputeFields(int32_t julianDay, UErrorCode & status) {
+    if (U_FAILURE(status)) {
+        return;
+    }
+    int32_t days;
+    if (uprv_add32_overflow(julianDay, -kEpochStartAsJulianDay, &days)) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return;
+    }
+    int32_t gyear = getGregorianYear();
+    int32_t gmonth = getGregorianMonth();
+
+    const Setting setting = getSetting(status);
+    if (U_FAILURE(status)) {
+       return;
+    }
+    struct MonthInfo monthInfo = computeMonthInfo(setting, gyear, days, status);
+    if (U_FAILURE(status)) {
+       return;
+    }
+    hasLeapMonthBetweenWinterSolstices = monthInfo.hasLeapMonthBetweenWinterSolstices;
+
+    int32_t eyear;
+    int32_t cycle_year;
+    if (uprv_add32_overflow(gyear, -CHINESE_EPOCH_YEAR, &eyear) ||
+        uprv_add32_overflow(gyear, -CYCLE_EPOCH, &cycle_year)) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return;
+    }
+    if (monthInfo.month < 11 ||
+        gmonth >= UCAL_JULY) {
+        if (uprv_add32_overflow(eyear, 1, &eyear) ||
+            uprv_add32_overflow(cycle_year, 1, &cycle_year)) {
+            status = U_ILLEGAL_ARGUMENT_ERROR;
+            return;
+        }
+    }
+    int32_t dayOfMonth = days - monthInfo.thisMoon + 1;
+
+    int32_t yearOfCycle;
+    int32_t cycle = ClockMath::floorDivide(cycle_year - 1, 60, &yearOfCycle);
+
+    int32_t theNewYear = newYear(setting, gyear, status);
+    if (U_FAILURE(status)) {
+       return;
+    }
+    if (days < theNewYear) {
+        int32_t gprevious_year;
+        if (uprv_add32_overflow(gyear, -1, &gprevious_year)) {
+            status = U_ILLEGAL_ARGUMENT_ERROR;
+            return;
+        }
+        theNewYear = newYear(setting, gprevious_year, status);
+    }
+    if (U_FAILURE(status)) {
+       return;
+    }
+    cycle++;
+    yearOfCycle++;
+    int32_t dayOfYear = days - theNewYear + 1;
+
+    int32_t minYear = this->handleGetLimit(UCAL_EXTENDED_YEAR, UCAL_LIMIT_MINIMUM);
+    if (eyear < minYear) {
+        if (!isLenient()) {
+            status = U_ILLEGAL_ARGUMENT_ERROR;
+            return;
+        }
+        eyear = minYear;
+    }
+    int32_t maxYear = this->handleGetLimit(UCAL_EXTENDED_YEAR, UCAL_LIMIT_MAXIMUM);
+    if (maxYear < eyear) {
+        if (!isLenient()) {
+            status = U_ILLEGAL_ARGUMENT_ERROR;
+            return;
+        }
+        eyear = maxYear;
+    }
+
+    internalSet(UCAL_MONTH, monthInfo.month-1); 
+    internalSet(UCAL_ORDINAL_MONTH, monthInfo.ordinalMonth); 
+    internalSet(UCAL_IS_LEAP_MONTH, monthInfo.isLeapMonth?1:0);
+
+    internalSet(UCAL_EXTENDED_YEAR, eyear);
+    internalSet(UCAL_ERA, cycle);
+    internalSet(UCAL_YEAR, yearOfCycle);
+    internalSet(UCAL_DAY_OF_MONTH, dayOfMonth);
+    internalSet(UCAL_DAY_OF_YEAR, dayOfYear);
+}
+
+
+namespace {
+
+int32_t newYear(const icu::ChineseCalendar::Setting& setting,
+                int32_t gyear, UErrorCode& status) {
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+    const TimeZone* timeZone = setting.zoneAstroCalc;
+    int32_t cacheValue = CalendarCache::get(setting.newYearCache, gyear, status);
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+
+    if (cacheValue == 0) {
+
+        int32_t gprevious_year;
+        if (uprv_add32_overflow(gyear, -1, &gprevious_year)) {
+            status = U_ILLEGAL_ARGUMENT_ERROR;
+            return 0;
+        }
+        int32_t solsticeBefore= winterSolstice(setting, gprevious_year, status);
+        int32_t solsticeAfter = winterSolstice(setting, gyear, status);
+        int32_t newMoon1 = newMoonNear(timeZone, solsticeBefore + 1, true, status);
+        int32_t newMoon2 = newMoonNear(timeZone, newMoon1 + SYNODIC_GAP, true, status);
+        int32_t newMoon11 = newMoonNear(timeZone, solsticeAfter + 1, false, status);
+        if (U_FAILURE(status)) {
+            return 0;
+        }
+
+        if (synodicMonthsBetween(newMoon1, newMoon11) == 12 &&
+            (hasNoMajorSolarTerm(timeZone, newMoon1, status) ||
+             hasNoMajorSolarTerm(timeZone, newMoon2, status))) {
+            cacheValue = newMoonNear(timeZone, newMoon2 + SYNODIC_GAP, true, status);
+        } else {
+            cacheValue = newMoon2;
+        }
+        if (U_FAILURE(status)) {
+            return 0;
+        }
+
+        CalendarCache::put(setting.newYearCache, gyear, cacheValue, status);
+    }
+    if(U_FAILURE(status)) {
+        cacheValue = 0;
+    }
+    return cacheValue;
+}
+
+}  
+
+void ChineseCalendar::offsetMonth(int32_t newMoon, int32_t dayOfMonth, int32_t delta,
+                                  UErrorCode& status) {
+    const Setting setting = getSetting(status);
+    if (U_FAILURE(status)) {
+        return;
+    }
+
+    double value = newMoon;
+    value += (CalendarAstronomer::SYNODIC_MONTH *
+                          (static_cast<double>(delta) - 0.5));
+    if (value < INT32_MIN || value > INT32_MAX) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return;
+    }
+    newMoon = static_cast<int32_t>(value);
+
+    newMoon = newMoonNear(setting.zoneAstroCalc, newMoon, true, status);
+    if (U_FAILURE(status)) {
+        return;
+    }
+
+    int32_t jd;
+    if (uprv_add32_overflow(newMoon, kEpochStartAsJulianDay - 1, &jd) ||
+        uprv_add32_overflow(jd, dayOfMonth, &jd)) {
+        status = U_ILLEGAL_ARGUMENT_ERROR;
+        return;
+    }
+
+    if (dayOfMonth > 29) {
+        set(UCAL_JULIAN_DAY, jd-1);
+        complete(status);
+        if (U_FAILURE(status)) return;
+        if (getActualMaximum(UCAL_DAY_OF_MONTH, status) >= dayOfMonth) {
+            if (U_FAILURE(status)) return;
+            set(UCAL_JULIAN_DAY, jd);
+        }
+    } else {
+        set(UCAL_JULIAN_DAY, jd);
+    }
+}
+
+IMPL_SYSTEM_DEFAULT_CENTURY(ChineseCalendar, "@calendar=chinese")
+
+bool
+ChineseCalendar::inTemporalLeapYear(UErrorCode &status) const
+{
+    int32_t days = getActualMaximum(UCAL_DAY_OF_YEAR, status);
+    if (U_FAILURE(status)) return false;
+    return days > 360;
+}
+
+UOBJECT_DEFINE_RTTI_IMPLEMENTATION(ChineseCalendar)
+
+
+static const char * const gTemporalLeapMonthCodes[] = {
+    "M01L", "M02L", "M03L", "M04L", "M05L", "M06L",
+    "M07L", "M08L", "M09L", "M10L", "M11L", "M12L", nullptr
+};
+
+const char* ChineseCalendar::getTemporalMonthCode(UErrorCode &status) const {
+    int32_t is_leap = get(UCAL_IS_LEAP_MONTH, status);
+    if (U_FAILURE(status)) return nullptr;
+    if (is_leap != 0) {
+        int32_t month = get(UCAL_MONTH, status);
+        if (U_FAILURE(status)) return nullptr;
+        return gTemporalLeapMonthCodes[month];
+    }
+    return Calendar::getTemporalMonthCode(status);
+}
+
+void
+ChineseCalendar::setTemporalMonthCode(const char* code, UErrorCode& status )
+{
+    if (U_FAILURE(status)) return;
+    int32_t len = static_cast<int32_t>(uprv_strlen(code));
+    if (len != 4 || code[0] != 'M' || code[3] != 'L') {
+        set(UCAL_IS_LEAP_MONTH, 0);
+        return Calendar::setTemporalMonthCode(code, status);
+    }
+    for (int m = 0; gTemporalLeapMonthCodes[m] != nullptr; m++) {
+        if (uprv_strcmp(code, gTemporalLeapMonthCodes[m]) == 0) {
+            set(UCAL_MONTH, m);
+            set(UCAL_IS_LEAP_MONTH, 1);
+            return;
+        }
+    }
+    status = U_ILLEGAL_ARGUMENT_ERROR;
+}
+
+int32_t ChineseCalendar::internalGetMonth(UErrorCode& status) const {
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+    if (resolveFields(kMonthPrecedence) == UCAL_MONTH) {
+        return internalGet(UCAL_MONTH);
+    }
+    LocalPointer<Calendar> temp(this->clone());
+    temp->set(UCAL_MONTH, 0);
+    temp->set(UCAL_IS_LEAP_MONTH, 0);
+    temp->set(UCAL_DATE, 1);
+    temp->roll(UCAL_MONTH, internalGet(UCAL_ORDINAL_MONTH), status);
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+
+    ChineseCalendar* nonConstThis = const_cast<ChineseCalendar*>(this); 
+    nonConstThis->internalSet(UCAL_IS_LEAP_MONTH, temp->get(UCAL_IS_LEAP_MONTH, status));
+    int32_t month = temp->get(UCAL_MONTH, status);
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+    nonConstThis->internalSet(UCAL_MONTH, month);
+    return month;
+}
+
+int32_t ChineseCalendar::internalGetMonth(int32_t defaultValue, UErrorCode& status) const {
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+    switch (resolveFields(kMonthPrecedence)) {
+        case UCAL_MONTH:
+            return internalGet(UCAL_MONTH);
+        case UCAL_ORDINAL_MONTH:
+            return internalGetMonth(status);
+        default:
+            return defaultValue;
+    }
+}
+
+ChineseCalendar::Setting ChineseCalendar::getSetting(UErrorCode&) const {
+  return {
+        getAstronomerTimeZone(),
+        &gWinterSolsticeCache,
+        &gNewYearCache
+  };
+}
+
+int32_t
+ChineseCalendar::getActualMaximum(UCalendarDateFields field, UErrorCode& status) const
+{
+    if (U_FAILURE(status)) {
+       return 0;
+    }
+    if (field == UCAL_DATE) {
+        LocalPointer<ChineseCalendar> cal(clone(), status);
+        if(U_FAILURE(status)) {
+            return 0;
+        }
+        cal->setLenient(true);
+        cal->prepareGetActual(field,false,status);
+        int32_t year = cal->get(UCAL_EXTENDED_YEAR, status);
+        int32_t month = cal->get(UCAL_MONTH, status);
+        bool leap = cal->get(UCAL_IS_LEAP_MONTH, status) != 0;
+        return handleGetMonthLengthWithLeap(year, month, leap, status);
+    }
+    return Calendar::getActualMaximum(field, status);
+}
+
+U_NAMESPACE_END
+
+#endif
+

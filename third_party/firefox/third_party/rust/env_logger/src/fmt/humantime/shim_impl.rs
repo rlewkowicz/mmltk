@@ -1,0 +1,2 @@
+
+pub(in crate::fmt) mod glob {}

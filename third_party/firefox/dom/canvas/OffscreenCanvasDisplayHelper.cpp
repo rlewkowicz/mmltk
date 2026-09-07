@@ -1,0 +1,586 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "OffscreenCanvasDisplayHelper.h"
+
+#include "mozilla/SVGObserverUtils.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/StaticPrefs_gfx.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/WorkerRef.h"
+#include "mozilla/dom/WorkerRunnable.h"
+#include "mozilla/gfx/2D.h"
+#include "mozilla/gfx/CanvasManagerChild.h"
+#include "mozilla/gfx/DataSurfaceHelpers.h"
+#include "mozilla/gfx/Swizzle.h"
+#include "mozilla/layers/ImageBridgeChild.h"
+#include "mozilla/layers/PersistentBufferProvider.h"
+#include "mozilla/layers/TextureClientSharedSurface.h"
+#include "mozilla/layers/TextureWrapperImage.h"
+#include "nsICanvasRenderingContextInternal.h"
+#include "nsRFPService.h"
+
+namespace mozilla::dom {
+
+OffscreenCanvasDisplayHelper::OffscreenCanvasDisplayHelper(
+    HTMLCanvasElement* aCanvasElement, uint32_t aWidth, uint32_t aHeight)
+    : mMutex("mozilla::dom::OffscreenCanvasDisplayHelper"),
+      mCanvasElement(aCanvasElement),
+      mImageProducerID(layers::ImageContainer::AllocateProducerID()) {
+  mData.mSize.width = aWidth;
+  mData.mSize.height = aHeight;
+}
+
+OffscreenCanvasDisplayHelper::~OffscreenCanvasDisplayHelper() {
+  MutexAutoLock lock(mMutex);
+  NS_ReleaseOnMainThread("OffscreenCanvas::mExpandedReader",
+                         mExpandedReader.forget());
+}
+
+void OffscreenCanvasDisplayHelper::DestroyElement() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  MutexAutoLock lock(mMutex);
+  if (mImageContainer) {
+    mImageContainer->ClearImagesInHost(layers::ClearImagesType::All);
+    mImageContainer = nullptr;
+  }
+  mFrontBufferSurface = nullptr;
+  mCanvasElement = nullptr;
+}
+
+void OffscreenCanvasDisplayHelper::DestroyCanvas() {
+  if (auto* cm = gfx::CanvasManagerChild::Get()) {
+    cm->EndCanvasTransaction();
+  }
+
+  MutexAutoLock lock(mMutex);
+  if (mImageContainer) {
+    mImageContainer->ClearImagesInHost(layers::ClearImagesType::All);
+    mImageContainer = nullptr;
+  }
+  mFrontBufferSurface = nullptr;
+  mOffscreenCanvas = nullptr;
+  mWorkerRef = nullptr;
+}
+
+void OffscreenCanvasDisplayHelper::SetWriteOnly(nsIPrincipal* aExpandedReader) {
+  MutexAutoLock lock(mMutex);
+  NS_ReleaseOnMainThread("OffscreenCanvasDisplayHelper::mExpandedReader",
+                         mExpandedReader.forget());
+  mExpandedReader = aExpandedReader;
+  mIsWriteOnly = true;
+}
+
+bool OffscreenCanvasDisplayHelper::CallerCanRead(
+    nsIPrincipal& aPrincipal) const {
+  MutexAutoLock lock(mMutex);
+  if (!mIsWriteOnly) {
+    return true;
+  }
+
+  if (mExpandedReader && aPrincipal.Subsumes(mExpandedReader)) {
+    return true;
+  }
+
+  return aPrincipal.IsSystemPrincipal();
+}
+
+bool OffscreenCanvasDisplayHelper::CanElementCaptureStream() const {
+  MutexAutoLock lock(mMutex);
+  return !!mWorkerRef;
+}
+
+bool OffscreenCanvasDisplayHelper::UsingElementCaptureStream() const {
+  if (!NS_IsMainThread()) {
+    return false;
+  }
+
+  MutexAutoLock lock(mMutex);
+  return mCanvasElement && mCanvasElement->UsingCaptureStream();
+}
+
+CanvasContextType OffscreenCanvasDisplayHelper::GetContextType() const {
+  MutexAutoLock lock(mMutex);
+  return mType;
+}
+
+RefPtr<layers::ImageContainer> OffscreenCanvasDisplayHelper::GetImageContainer()
+    const {
+  MutexAutoLock lock(mMutex);
+  return mImageContainer;
+}
+
+void OffscreenCanvasDisplayHelper::UpdateContext(
+    OffscreenCanvas* aOffscreenCanvas, RefPtr<ThreadSafeWorkerRef>&& aWorkerRef,
+    CanvasContextType aType, const Maybe<mozilla::ipc::ActorId>& aChildId) {
+  MutexAutoLock lock(mMutex);
+
+  if (!mImageContainer) {
+    mImageContainer = MakeRefPtr<layers::ImageContainer>(
+        layers::ImageUsageType::OffscreenCanvas,
+        layers::ImageContainer::ASYNCHRONOUS);
+  }
+
+  mOffscreenCanvas = aOffscreenCanvas;
+  mWorkerRef = std::move(aWorkerRef);
+  mType = aType;
+  mContextChildId = aChildId;
+
+  if (aChildId) {
+    mContextManagerId = Some(gfx::CanvasManagerChild::Get()->Id());
+  } else {
+    mContextManagerId.reset();
+  }
+
+  MaybeQueueInvalidateElement();
+}
+
+void OffscreenCanvasDisplayHelper::FlushForDisplay() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  MutexAutoLock lock(mMutex);
+
+  if (!mOffscreenCanvas) {
+    return;
+  }
+
+  if (!mWorkerRef) {
+    mOffscreenCanvas->QueueCommitToCompositor();
+    return;
+  }
+
+  class FlushWorkerRunnable final : public MainThreadWorkerRunnable {
+   public:
+    explicit FlushWorkerRunnable(OffscreenCanvasDisplayHelper* aDisplayHelper)
+        : MainThreadWorkerRunnable("FlushWorkerRunnable"),
+          mDisplayHelper(aDisplayHelper) {}
+
+    bool WorkerRun(JSContext*, WorkerPrivate*) override {
+      RefPtr<OffscreenCanvas> canvas;
+      {
+        MutexAutoLock lock(mDisplayHelper->mMutex);
+        canvas = mDisplayHelper->mOffscreenCanvas;
+      }
+
+      if (canvas) {
+        canvas->CommitFrameToCompositor();
+      }
+      return true;
+    }
+
+   private:
+    RefPtr<OffscreenCanvasDisplayHelper> mDisplayHelper;
+  };
+
+  auto task = MakeRefPtr<FlushWorkerRunnable>(this);
+  task->Dispatch(mWorkerRef->Private());
+}
+
+bool OffscreenCanvasDisplayHelper::CommitFrameToCompositor(
+    nsICanvasRenderingContextInternal* aContext,
+    const Maybe<OffscreenCanvasDisplayData>& aData) {
+  auto endTransaction = MakeScopeExit([&]() {
+    if (auto* cm = gfx::CanvasManagerChild::Get()) {
+      cm->EndCanvasTransaction();
+    }
+  });
+
+  MutexAutoLock lock(mMutex);
+
+  gfx::SurfaceFormat format = gfx::SurfaceFormat::B8G8R8A8;
+  layers::TextureFlags flags = layers::TextureFlags::IMMUTABLE;
+
+  if (!mCanvasElement) {
+    return false;
+  }
+
+  if (aData) {
+    mData = aData.ref();
+    MaybeQueueInvalidateElement();
+  }
+
+  if (!mImageContainer) {
+    return false;
+  }
+
+  if (mData.mIsOpaque) {
+    flags |= layers::TextureFlags::IS_OPAQUE;
+    format = gfx::SurfaceFormat::B8G8R8X8;
+  } else if (!mData.mIsAlphaPremult) {
+    flags |= layers::TextureFlags::NON_PREMULTIPLIED;
+  }
+
+  switch (mData.mOriginPos) {
+    case gl::OriginPos::BottomLeft:
+      flags |= layers::TextureFlags::ORIGIN_BOTTOM_LEFT;
+      break;
+    case gl::OriginPos::TopLeft:
+      break;
+    default:
+      MOZ_ASSERT_UNREACHABLE("Unhandled origin position!");
+      break;
+  }
+
+  auto imageBridge = layers::ImageBridgeChild::GetSingleton();
+  if (!imageBridge) {
+    return false;
+  }
+
+  bool paintCallbacks = mData.mDoPaintCallbacks;
+  bool hasRemoteTextureDesc = false;
+  RefPtr<layers::Image> image;
+  RefPtr<layers::TextureClient> texture;
+  RefPtr<gfx::SourceSurface> surface;
+  Maybe<layers::SurfaceDescriptor> desc;
+  RefPtr<layers::FwdTransactionTracker> tracker;
+
+  {
+    MutexAutoUnlock unlock(mMutex);
+    if (paintCallbacks) {
+      aContext->OnBeforePaintTransaction();
+    }
+
+    desc = aContext->PresentFrontBuffer(nullptr);
+    if (desc) {
+      hasRemoteTextureDesc =
+          desc->type() ==
+          layers::SurfaceDescriptor::TSurfaceDescriptorRemoteTexture;
+      if (hasRemoteTextureDesc) {
+        tracker = aContext->UseCompositableForwarder(imageBridge);
+        if (tracker) {
+          flags |= layers::TextureFlags::WAIT_FOR_REMOTE_TEXTURE_OWNER;
+        }
+      }
+    } else {
+      if (layers::PersistentBufferProvider* provider =
+              aContext->GetBufferProvider()) {
+        texture = provider->GetTextureClient();
+      }
+
+      if (!texture) {
+        surface =
+            aContext->GetFrontBufferSnapshot( false);
+        if (surface && surface->GetType() == gfx::SurfaceType::WEBGL) {
+          gfx::DataSourceSurface::ScopedMap map(
+              static_cast<gfx::DataSourceSurface*>(surface.get()),
+              gfx::DataSourceSurface::READ);
+          if (!map.IsMapped()) {
+            surface = nullptr;
+          }
+        }
+      }
+    }
+
+    if (paintCallbacks) {
+      aContext->OnDidPaintTransaction();
+    }
+  }
+
+  if (!mCanvasElement || !mImageContainer) {
+    return false;
+  }
+
+  mFrontBufferSurface = surface;
+
+  if (hasRemoteTextureDesc) {
+    const auto& textureDesc = desc->get_SurfaceDescriptorRemoteTexture();
+    imageBridge->UpdateCompositable(mImageContainer, textureDesc.textureId(),
+                                    textureDesc.ownerId(), mData.mSize, flags,
+                                    tracker);
+    return true;
+  }
+
+  if (surface) {
+    auto surfaceImage = MakeRefPtr<layers::SourceSurfaceImage>(surface);
+    surfaceImage->SetTextureFlags(flags);
+    image = surfaceImage;
+  } else {
+    if (desc && !texture) {
+      texture = layers::SharedSurfaceTextureData::CreateTextureClient(
+          *desc, format, mData.mSize, flags, imageBridge);
+    }
+    if (texture) {
+      image = new layers::TextureWrapperImage(
+          texture, gfx::IntRect(gfx::IntPoint(0, 0), texture->GetSize()));
+    }
+  }
+
+  if (image) {
+    AutoTArray<layers::ImageContainer::NonOwningImage, 1> imageList;
+    imageList.AppendElement(layers::ImageContainer::NonOwningImage(
+        image, TimeStamp(), mLastFrameID++, mImageProducerID));
+    mImageContainer->SetCurrentImages(imageList);
+  } else {
+    mImageContainer->ClearImagesInHost(layers::ClearImagesType::All);
+  }
+
+  return true;
+}
+
+void OffscreenCanvasDisplayHelper::MaybeQueueInvalidateElement() {
+  if (!mPendingInvalidate) {
+    mPendingInvalidate = true;
+    NS_DispatchToMainThread(NS_NewRunnableFunction(
+        "OffscreenCanvasDisplayHelper::InvalidateElement",
+        [self = RefPtr{this}] { self->InvalidateElement(); }));
+  }
+}
+
+void OffscreenCanvasDisplayHelper::InvalidateElement() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  HTMLCanvasElement* canvasElement;
+  gfx::IntSize size;
+
+  {
+    MutexAutoLock lock(mMutex);
+    MOZ_ASSERT(mPendingInvalidate);
+    mPendingInvalidate = false;
+    canvasElement = mCanvasElement;
+    size = mData.mSize;
+  }
+
+  if (canvasElement) {
+    SVGObserverUtils::InvalidateDirectRenderingObservers(canvasElement);
+    canvasElement->InvalidateCanvasPlaceholder(size.width, size.height);
+    canvasElement->InvalidateCanvasContent(nullptr);
+  }
+}
+
+already_AddRefed<gfx::SourceSurface>
+OffscreenCanvasDisplayHelper::TransformSurface(gfx::SourceSurface* aSurface,
+                                               bool aHasAlpha,
+                                               bool aIsAlphaPremult,
+                                               gl::OriginPos aOriginPos) const {
+  if (!aSurface) {
+    return nullptr;
+  }
+
+  if (aOriginPos == gl::OriginPos::TopLeft && (!aHasAlpha || aIsAlphaPremult)) {
+    return do_AddRef(aSurface);
+  }
+
+  RefPtr<gfx::DataSourceSurface> srcSurface = aSurface->GetDataSurface();
+  if (!srcSurface) {
+    return nullptr;
+  }
+
+  const auto size = srcSurface->GetSize();
+  const auto format = srcSurface->GetFormat();
+
+  RefPtr<gfx::DataSourceSurface> dstSurface =
+      gfx::Factory::CreateDataSourceSurface(size, format,  false);
+  if (!dstSurface) {
+    return nullptr;
+  }
+
+  gfx::DataSourceSurface::ScopedMap srcMap(srcSurface,
+                                           gfx::DataSourceSurface::READ);
+  gfx::DataSourceSurface::ScopedMap dstMap(dstSurface,
+                                           gfx::DataSourceSurface::WRITE);
+  if (!srcMap.IsMapped() || !dstMap.IsMapped()) {
+    return nullptr;
+  }
+
+  bool success;
+  switch (aOriginPos) {
+    case gl::OriginPos::BottomLeft:
+      if (aHasAlpha && !aIsAlphaPremult) {
+        success = gfx::PremultiplyYFlipData(
+            srcMap.GetData(), srcMap.GetStride(), format, dstMap.GetData(),
+            dstMap.GetStride(), format, size);
+      } else {
+        success = gfx::SwizzleYFlipData(srcMap.GetData(), srcMap.GetStride(),
+                                        format, dstMap.GetData(),
+                                        dstMap.GetStride(), format, size);
+      }
+      break;
+    case gl::OriginPos::TopLeft:
+      if (aHasAlpha && !aIsAlphaPremult) {
+        success = gfx::PremultiplyData(srcMap.GetData(), srcMap.GetStride(),
+                                       format, dstMap.GetData(),
+                                       dstMap.GetStride(), format, size);
+      } else {
+        success = gfx::SwizzleData(srcMap.GetData(), srcMap.GetStride(), format,
+                                   dstMap.GetData(), dstMap.GetStride(), format,
+                                   size);
+      }
+      break;
+    default:
+      MOZ_ASSERT_UNREACHABLE("Unhandled origin position!");
+      success = false;
+      break;
+  }
+
+  if (!success) {
+    return nullptr;
+  }
+
+  return dstSurface.forget();
+}
+
+already_AddRefed<gfx::SourceSurface>
+OffscreenCanvasDisplayHelper::GetSurfaceSnapshot() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  class SnapshotWorkerRunnable final : public MainThreadWorkerRunnable {
+   public:
+    explicit SnapshotWorkerRunnable(
+        OffscreenCanvasDisplayHelper* aDisplayHelper)
+        : MainThreadWorkerRunnable("SnapshotWorkerRunnable"),
+          mMonitor("SnapshotWorkerRunnable::mMonitor"),
+          mDisplayHelper(aDisplayHelper) {}
+
+    bool WorkerRun(JSContext*, WorkerPrivate*) override {
+      RefPtr<OffscreenCanvas> canvas;
+      {
+        MutexAutoLock lock(mDisplayHelper->mMutex);
+        canvas = mDisplayHelper->mOffscreenCanvas;
+      }
+
+      RefPtr<gfx::SourceSurface> surface;
+      if (canvas) {
+        if (auto* context = canvas->GetContext()) {
+          surface =
+              context->GetFrontBufferSnapshot( false);
+          if (surface && surface->GetType() == gfx::SurfaceType::SKIA) {
+            surface = gfx::Factory::CopyDataSourceSurface(
+                static_cast<gfx::DataSourceSurface*>(surface.get()));
+          }
+        }
+      }
+
+      MonitorAutoLock lock(mMonitor);
+      mSurface = std::move(surface);
+      mComplete = true;
+      lock.NotifyAll();
+      return true;
+    }
+
+    already_AddRefed<gfx::SourceSurface> Wait(int32_t aTimeoutMs) {
+      MonitorAutoLock lock(mMonitor);
+
+      TimeDuration timeout = TimeDuration::FromMilliseconds(aTimeoutMs);
+      while (!mComplete) {
+        if (lock.Wait(timeout) == CVStatus::Timeout) {
+          return nullptr;
+        }
+      }
+
+      return mSurface.forget();
+    }
+
+   private:
+    Monitor mMonitor;
+    RefPtr<OffscreenCanvasDisplayHelper> mDisplayHelper;
+    RefPtr<gfx::SourceSurface> mSurface MOZ_GUARDED_BY(mMonitor);
+    bool mComplete MOZ_GUARDED_BY(mMonitor) = false;
+  };
+
+  bool hasAlpha;
+  bool isAlphaPremult;
+  gl::OriginPos originPos;
+  HTMLCanvasElement* canvasElement;
+  RefPtr<gfx::SourceSurface> surface;
+  RefPtr<SnapshotWorkerRunnable> workerRunnable;
+
+  {
+    MutexAutoLock lock(mMutex);
+
+    hasAlpha = !mData.mIsOpaque;
+    isAlphaPremult = mData.mIsAlphaPremult;
+    originPos = mData.mOriginPos;
+    canvasElement = mCanvasElement;
+    if (mWorkerRef) {
+      workerRunnable = MakeRefPtr<SnapshotWorkerRunnable>(this);
+      workerRunnable->Dispatch(mWorkerRef->Private());
+    }
+  }
+
+  if (workerRunnable) {
+    surface = workerRunnable->Wait(
+        StaticPrefs::gfx_offscreencanvas_snapshot_timeout_ms());
+  } else if (canvasElement) {
+    const auto* offscreenCanvas = canvasElement->GetOffscreenCanvas();
+    if (nsICanvasRenderingContextInternal* context =
+            offscreenCanvas->GetContext()) {
+      surface =
+          context->GetFrontBufferSnapshot( false);
+    }
+  }
+
+  return TransformSurface(surface, hasAlpha, isAlphaPremult, originPos);
+}
+
+already_AddRefed<layers::Image> OffscreenCanvasDisplayHelper::GetAsImage() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  RefPtr<gfx::SourceSurface> surface = GetSurfaceSnapshot();
+  if (!surface) {
+    return nullptr;
+  }
+  return MakeAndAddRef<layers::SourceSurfaceImage>(surface);
+}
+
+void OffscreenCanvasDisplayHelper::MaybeRandomizePixels(
+    CanvasUtils::ImageExtraction aExtractionBehavior, uint8_t* aData,
+    gfx::IntSize aSize) {
+  nsIPrincipal* principal = nullptr;
+  nsICookieJarSettings* cookieJarSettings = nullptr;
+  {
+    MutexAutoLock lock(mMutex);
+    if (mCanvasElement) {
+      principal = mCanvasElement->NodePrincipal();
+      cookieJarSettings = mCanvasElement->OwnerDoc()->CookieJarSettings();
+    } else if (mOffscreenCanvas) {
+      principal = mOffscreenCanvas->GetParentObject()
+                      ? mOffscreenCanvas->GetParentObject()->PrincipalOrNull()
+                      : nullptr;
+      cookieJarSettings =
+          mOffscreenCanvas->GetParentObject()
+              ? mOffscreenCanvas->GetParentObject()->GetCookieJarSettings()
+              : nullptr;
+    }
+  }
+
+  nsRFPService::PotentiallyDumpImage(principal, aData, aSize.width,
+                                     aSize.height,
+                                     aSize.width * aSize.height * 4);
+
+  if (aExtractionBehavior == CanvasUtils::ImageExtraction::Randomize) {
+    nsRFPService::RandomizePixels(
+        cookieJarSettings, principal, aData, aSize.width, aSize.height,
+        aSize.width * aSize.height * 4, gfx::SurfaceFormat::A8R8G8B8_UINT32);
+  }
+}
+
+UniquePtr<uint8_t[]> OffscreenCanvasDisplayHelper::GetImageBuffer(
+    CanvasUtils::ImageExtraction aExtractionBehavior, int32_t* aOutFormat,
+    gfx::IntSize* aOutImageSize) {
+  RefPtr<gfx::SourceSurface> surface = GetSurfaceSnapshot();
+  if (!surface) {
+    return nullptr;
+  }
+
+  RefPtr<gfx::DataSourceSurface> dataSurface = surface->GetDataSurface();
+  if (!dataSurface) {
+    return nullptr;
+  }
+
+  *aOutFormat = imgIEncoder::INPUT_FORMAT_HOSTARGB;
+  *aOutImageSize = dataSurface->GetSize();
+
+  UniquePtr<uint8_t[]> imageBuffer = gfx::SurfaceToPackedBGRA(dataSurface);
+  if (!imageBuffer) {
+    return nullptr;
+  }
+
+  MaybeRandomizePixels(aExtractionBehavior, imageBuffer.get(),
+                       dataSurface->GetSize());
+
+  return imageBuffer;
+}
+
+}  

@@ -1,0 +1,65 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SMIL_SMILINTERVAL_H_
+#define DOM_SMIL_SMILINTERVAL_H_
+
+#include "mozilla/SMILInstanceTime.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+
+
+class SMILInterval {
+ public:
+  SMILInterval();
+  SMILInterval(const SMILInterval& aOther);
+  ~SMILInterval();
+  void Unlink(bool aFiltered = false);
+
+  const SMILInstanceTime* Begin() const {
+    MOZ_ASSERT(mBegin && mEnd,
+               "Requesting Begin() on un-initialized instance time");
+    return mBegin;
+  }
+  SMILInstanceTime* Begin();
+
+  const SMILInstanceTime* End() const {
+    MOZ_ASSERT(mBegin && mEnd,
+               "Requesting End() on un-initialized instance time");
+    return mEnd;
+  }
+  SMILInstanceTime* End();
+
+  void SetBegin(SMILInstanceTime& aBegin);
+  void SetEnd(SMILInstanceTime& aEnd);
+  void Set(SMILInstanceTime& aBegin, SMILInstanceTime& aEnd) {
+    SetBegin(aBegin);
+    SetEnd(aEnd);
+  }
+
+  void FixBegin();
+  void FixEnd();
+
+  using InstanceTimeList = nsTArray<RefPtr<SMILInstanceTime>>;
+
+  void AddDependentTime(SMILInstanceTime& aTime);
+  void RemoveDependentTime(const SMILInstanceTime& aTime);
+  void GetDependentTimes(InstanceTimeList& aTimes);
+
+  bool IsDependencyChainLink() const;
+
+ private:
+  RefPtr<SMILInstanceTime> mBegin;
+  RefPtr<SMILInstanceTime> mEnd;
+
+  InstanceTimeList mDependentTimes;
+
+  bool mBeginFixed;
+  bool mEndFixed;
+};
+
+}  
+
+#endif  // DOM_SMIL_SMILINTERVAL_H_

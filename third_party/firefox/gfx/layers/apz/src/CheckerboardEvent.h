@@ -1,0 +1,107 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_CheckerboardEvent_h
+#define mozilla_layers_CheckerboardEvent_h
+
+#include "mozilla/DefineEnum.h"
+#include "mozilla/Monitor.h"
+#include "mozilla/TimeStamp.h"
+#include <sstream>
+#include "Units.h"
+#include <vector>
+
+namespace mozilla {
+namespace layers {
+
+class CheckerboardEvent final {
+ public:
+  // clang-format off
+  MOZ_DEFINE_ENUM_AT_CLASS_SCOPE(
+    RendertraceProperty, (
+      Page,
+      PaintedDisplayPort,
+      RequestedDisplayPort,
+      UserVisible
+  ));
+  // clang-format on
+
+  static const char* sDescriptions[sRendertracePropertyCount];
+  static const char* sColors[sRendertracePropertyCount];
+
+ public:
+  explicit CheckerboardEvent(bool aRecordTrace);
+
+  uint32_t GetSeverity();
+
+  uint32_t GetPeak();
+
+  TimeDuration GetDuration();
+
+  std::string GetLog();
+
+  bool IsRecordingTrace();
+
+  void UpdateRendertraceProperty(RendertraceProperty aProperty,
+                                 const CSSRect& aRect,
+                                 const std::string& aExtraInfo = std::string());
+
+  bool RecordFrameInfo(uint32_t aCssPixelsCheckerboarded);
+
+ private:
+  void StartEvent();
+  void StopEvent();
+
+  void LogInfo(RendertraceProperty aProperty, const TimeStamp& aTimestamp,
+               const CSSRect& aRect, const std::string& aExtraInfo,
+               const MonitorAutoLock& aProofOfLock)
+      MOZ_REQUIRES(mRendertraceLock);
+
+  struct PropertyValue {
+    RendertraceProperty mProperty;
+    TimeStamp mTimeStamp;
+    CSSRect mRect;
+    std::string mExtraInfo;
+
+    bool operator<(const PropertyValue& aOther) const;
+  };
+
+  class PropertyBuffer {
+   public:
+    PropertyBuffer();
+    void Update(RendertraceProperty aProperty, const CSSRect& aRect,
+                const std::string& aExtraInfo,
+                const MonitorAutoLock& aProofOfLock);
+    void Flush(std::vector<PropertyValue>& aOut,
+               const MonitorAutoLock& aProofOfLock);
+
+   private:
+    static const uint32_t BUFFER_SIZE = 5;
+
+    uint32_t mIndex;
+    PropertyValue mValues[BUFFER_SIZE];
+  };
+
+ private:
+  const bool mRecordTrace;
+  const TimeStamp mOriginTime;
+  bool mCheckerboardingActive;
+
+  TimeStamp mStartTime;
+  TimeStamp mEndTime;
+  TimeStamp mLastSampleTime;
+  uint32_t mFrameCount;
+  uint64_t mTotalPixelMs;
+  uint32_t mPeakPixels;
+
+  mutable Monitor mRendertraceLock;
+  PropertyBuffer mBufferedProperties[sRendertracePropertyCount] MOZ_GUARDED_BY(
+      mRendertraceLock);
+  std::ostringstream mRendertraceInfo MOZ_GUARDED_BY(mRendertraceLock);
+};
+
+}  
+}  
+
+#endif  // mozilla_layers_CheckerboardEvent_h

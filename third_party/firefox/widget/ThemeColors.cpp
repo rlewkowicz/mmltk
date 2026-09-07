@@ -1,0 +1,235 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ThemeColors.h"
+
+#include "mozilla/RelativeLuminanceUtils.h"
+#include "mozilla/StaticPrefs_layout.h"
+#include "mozilla/StaticPrefs_widget.h"
+#include "ThemeDrawing.h"
+#include "nsNativeTheme.h"
+
+using namespace mozilla::gfx;
+
+namespace mozilla::widget {
+
+struct ColorPalette {
+  ColorPalette(nscolor aAccent, nscolor aForeground);
+
+  constexpr ColorPalette(sRGBColor aAccent, sRGBColor aForeground,
+                         sRGBColor aLight, sRGBColor aDark, sRGBColor aDarker)
+      : mAccent(aAccent),
+        mForeground(aForeground),
+        mAccentLight(aLight),
+        mAccentDark(aDark),
+        mAccentDarker(aDarker) {}
+
+  constexpr static ColorPalette Default() {
+    return ColorPalette(
+        sDefaultAccent, sDefaultAccentText,
+        sRGBColor::UnusualFromARGB(0x4d008deb),  
+        sRGBColor::UnusualFromARGB(0xff0250bb),  
+        sRGBColor::UnusualFromARGB(0xff054096)   
+    );
+  }
+
+  static nscolor EnsureOpaque(nscolor aAccent) {
+    if (NS_GET_A(aAccent) != 0xff) {
+      return NS_ComposeColors(NS_RGB(0xff, 0xff, 0xff), aAccent);
+    }
+    return aAccent;
+  }
+
+  static nscolor GetLight(nscolor aAccent) {
+    constexpr float kLightLuminanceScale = 25.048f / 13.693f;
+    const float lightLuminanceAdjust = ThemeColors::ScaleLuminanceBy(
+        RelativeLuminanceUtils::Compute(aAccent), kLightLuminanceScale);
+    nscolor lightColor =
+        RelativeLuminanceUtils::Adjust(aAccent, lightLuminanceAdjust);
+    return NS_RGBA(NS_GET_R(lightColor), NS_GET_G(lightColor),
+                   NS_GET_B(lightColor), 0x4d);
+  }
+
+  static nscolor GetDark(nscolor aAccent) {
+    constexpr float kDarkLuminanceScale = 9.338f / 13.693f;
+    const float darkLuminanceAdjust = ThemeColors::ScaleLuminanceBy(
+        RelativeLuminanceUtils::Compute(aAccent), kDarkLuminanceScale);
+    return RelativeLuminanceUtils::Adjust(aAccent, darkLuminanceAdjust);
+  }
+
+  static nscolor GetDarker(nscolor aAccent) {
+    constexpr float kDarkerLuminanceScale = 5.901f / 13.693f;
+    const float darkerLuminanceAdjust = ThemeColors::ScaleLuminanceBy(
+        RelativeLuminanceUtils::Compute(aAccent), kDarkerLuminanceScale);
+    return RelativeLuminanceUtils::Adjust(aAccent, darkerLuminanceAdjust);
+  }
+
+  sRGBColor mAccent;
+  sRGBColor mForeground;
+
+  sRGBColor mAccentLight;
+  sRGBColor mAccentDark;
+  sRGBColor mAccentDarker;
+};
+
+static nscolor GetAccentColor(bool aBackground, ColorScheme aScheme) {
+  auto useStandins = LookAndFeel::UseStandins(
+      !StaticPrefs::widget_non_native_theme_use_theme_accent());
+  return ColorPalette::EnsureOpaque(
+      LookAndFeel::Color(aBackground ? LookAndFeel::ColorID::Accentcolor
+                                     : LookAndFeel::ColorID::Accentcolortext,
+                         aScheme, useStandins));
+}
+
+static ColorPalette sDefaultLightPalette = ColorPalette::Default();
+static ColorPalette sDefaultDarkPalette = ColorPalette::Default();
+
+ColorPalette::ColorPalette(nscolor aAccent, nscolor aForeground) {
+  mAccent = sRGBColor::FromABGR(aAccent);
+  mForeground = sRGBColor::FromABGR(aForeground);
+  mAccentLight = sRGBColor::FromABGR(GetLight(aAccent));
+  mAccentDark = sRGBColor::FromABGR(GetDark(aAccent));
+  mAccentDarker = sRGBColor::FromABGR(GetDarker(aAccent));
+}
+
+ThemeAccentColor::ThemeAccentColor(const ComputedStyle& aStyle,
+                                   ColorScheme aScheme)
+    : mDefaultPalette(aScheme == ColorScheme::Light ? &sDefaultLightPalette
+                                                    : &sDefaultDarkPalette) {
+  const auto& color = aStyle.StyleUI()->mAccentColor;
+  if (color.IsAuto()) {
+    return;
+  }
+  MOZ_ASSERT(color.IsColor());
+  nscolor accentColor =
+      ColorPalette::EnsureOpaque(color.AsColor().CalcColor(aStyle));
+  if (sRGBColor::FromABGR(accentColor) == mDefaultPalette->mAccent) {
+    return;
+  }
+  mAccentColor.emplace(accentColor);
+}
+
+sRGBColor ThemeAccentColor::Get() const {
+  if (!mAccentColor) {
+    return mDefaultPalette->mAccent;
+  }
+  return sRGBColor::FromABGR(*mAccentColor);
+}
+
+sRGBColor ThemeAccentColor::GetForeground() const {
+  if (!mAccentColor) {
+    return mDefaultPalette->mForeground;
+  }
+  return sRGBColor::FromABGR(
+      ThemeColors::ComputeCustomAccentForeground(*mAccentColor));
+}
+
+sRGBColor ThemeAccentColor::GetLight() const {
+  if (!mAccentColor) {
+    return mDefaultPalette->mAccentLight;
+  }
+  return sRGBColor::FromABGR(ColorPalette::GetLight(*mAccentColor));
+}
+
+sRGBColor ThemeAccentColor::GetDark() const {
+  if (!mAccentColor) {
+    return mDefaultPalette->mAccentDark;
+  }
+  return sRGBColor::FromABGR(ColorPalette::GetDark(*mAccentColor));
+}
+
+sRGBColor ThemeAccentColor::GetDarker() const {
+  if (!mAccentColor) {
+    return mDefaultPalette->mAccentDarker;
+  }
+  return sRGBColor::FromABGR(ColorPalette::GetDarker(*mAccentColor));
+}
+
+auto ThemeColors::ShouldBeHighContrast(const nsIFrame* aFrame)
+    -> HighContrastInfo {
+  auto* pc = aFrame->PresContext();
+  if (!pc->GetBackgroundColorDraw()) {
+    return {};
+  }
+  const bool highContrast = [&] {
+    if (StaticPrefs::widget_non_native_theme_always_high_contrast()) {
+      return true;
+    }
+    switch (pc->ForcedColors()) {
+      case StyleForcedColors::None:
+        break;
+      case StyleForcedColors::Requested:
+        return aFrame->StyleUI()->mAccentColor.IsAuto();
+      case StyleForcedColors::Active:
+        return true;
+    }
+    return false;
+  }();
+  const bool mustUseLight =
+      PreferenceSheet::PrefsFor(*pc->Document()).mMustUseLightSystemColors;
+  return {highContrast, mustUseLight};
+}
+
+ColorScheme ThemeColors::ColorSchemeForWidget(const nsIFrame* aFrame,
+                                              StyleAppearance aAppearance,
+                                              const HighContrastInfo& aInfo) {
+  if (aInfo.mMustUseLightSystemColors) {
+    return ColorScheme::Light;
+  }
+  if (!nsNativeTheme::IsWidgetScrollbarPart(aAppearance)) {
+    return LookAndFeel::ColorSchemeForFrame(aFrame);
+  }
+  if (StaticPrefs::widget_disable_dark_scrollbar()) {
+    return ColorScheme::Light;
+  }
+  return nsNativeTheme::IsDarkBackgroundForScrollbar(
+             const_cast<nsIFrame*>(aFrame))
+             ? ColorScheme::Dark
+             : ColorScheme::Light;
+}
+
+void ThemeColors::RecomputeAccentColors() {
+  MOZ_RELEASE_ASSERT(NS_IsMainThread());
+
+  sDefaultLightPalette =
+      ColorPalette(GetAccentColor(true, ColorScheme::Light),
+                   GetAccentColor(false, ColorScheme::Light));
+
+  sDefaultDarkPalette = ColorPalette(GetAccentColor(true, ColorScheme::Dark),
+                                     GetAccentColor(false, ColorScheme::Dark));
+}
+
+nscolor ThemeColors::ComputeCustomAccentForeground(nscolor aColor) {
+  const float luminance = RelativeLuminanceUtils::Compute(aColor);
+
+  const float ratioWithWhite = 1.05f / (luminance + 0.05f);
+  const bool canBeWhite =
+      ratioWithWhite >=
+      StaticPrefs::layout_css_accent_color_min_contrast_ratio();
+  if (canBeWhite) {
+    return NS_RGB(0xff, 0xff, 0xff);
+  }
+  const float targetRatio =
+      StaticPrefs::layout_css_accent_color_darkening_target_contrast_ratio();
+  const float targetLuminance = (luminance + 0.05f) / targetRatio - 0.05f;
+  return RelativeLuminanceUtils::Adjust(aColor, targetLuminance);
+}
+
+nscolor ThemeColors::AdjustUnthemedScrollbarThumbColor(
+    nscolor aFaceColor, dom::ElementState aStates) {
+  bool isActive = aStates.HasState(dom::ElementState::ACTIVE);
+  bool isHover = aStates.HasState(dom::ElementState::HOVER);
+  if (!isActive && !isHover) {
+    return aFaceColor;
+  }
+  float luminance = RelativeLuminanceUtils::Compute(aFaceColor);
+  if (isActive) {
+    luminance = ScaleLuminanceBy(luminance, 0.192f);
+  } else {
+    luminance = ScaleLuminanceBy(luminance, 0.625f);
+  }
+  return RelativeLuminanceUtils::Adjust(aFaceColor, luminance);
+}
+
+}  

@@ -1,0 +1,208 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+***************************************************************************
+*   Copyright (C) 2002-2014 International Business Machines Corporation
+*   and others. All rights reserved.
+***************************************************************************
+*/
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_BREAK_ITERATION
+
+#include "unicode/unistr.h"
+#include "unicode/uniset.h"
+#include "unicode/uchar.h"
+#include "unicode/parsepos.h"
+
+#include "cstr.h"
+#include "rbbinode.h"
+#include "rbbirb.h"
+#include "umutex.h"
+
+
+U_CDECL_BEGIN
+static void U_CALLCONV RBBISymbolTableEntry_deleter(void *p) {
+    icu::RBBISymbolTableEntry *px = (icu::RBBISymbolTableEntry *)p;
+    delete px;
+}
+U_CDECL_END
+
+
+
+U_NAMESPACE_BEGIN
+
+RBBISymbolTable::RBBISymbolTable(RBBIRuleScanner *rs, const UnicodeString &rules, UErrorCode &status)
+    : fRules(rules), fRuleScanner(rs), ffffString(static_cast<char16_t>(0xffff))
+{
+    fHashTable       = nullptr;
+    fCachedSetLookup = nullptr;
+    
+    fHashTable = uhash_open(uhash_hashUnicodeString, uhash_compareUnicodeString, nullptr, &status);
+    if (U_FAILURE(status)) {
+        return;
+    }
+    uhash_setValueDeleter(fHashTable, RBBISymbolTableEntry_deleter);
+}
+
+
+
+RBBISymbolTable::~RBBISymbolTable()
+{
+    uhash_close(fHashTable);
+}
+
+
+const UnicodeString  *RBBISymbolTable::lookup(const UnicodeString& s) const
+{
+    RBBISymbolTableEntry  *el;
+    RBBINode              *varRefNode;
+    RBBINode              *exprNode;
+    RBBINode              *usetNode;
+    const UnicodeString   *retString;
+    RBBISymbolTable       *This = const_cast<RBBISymbolTable*>(this); 
+
+    el = static_cast<RBBISymbolTableEntry*>(uhash_get(fHashTable, &s));
+    if (el == nullptr) {
+        return nullptr;
+    }
+
+    varRefNode = el->val;
+    exprNode   = varRefNode->fLeftChild;     
+    if (exprNode->fType == RBBINode::setRef) {
+        usetNode = exprNode->fLeftChild;
+        This->fCachedSetLookup = usetNode->fInputSet;
+        retString = &ffffString;
+    }
+    else
+    {
+        retString = &exprNode->fText;
+        This->fCachedSetLookup = nullptr;
+    }
+    return retString;
+}
+
+
+
+const UnicodeFunctor *RBBISymbolTable::lookupMatcher(UChar32 ch) const
+{
+    UnicodeSet *retVal = nullptr;
+    RBBISymbolTable *This = const_cast<RBBISymbolTable*>(this); 
+    if (ch == 0xffff) {
+        retVal = fCachedSetLookup;
+        This->fCachedSetLookup = nullptr;
+    }
+    return retVal;
+}
+
+UnicodeString   RBBISymbolTable::parseReference(const UnicodeString& text,
+                                                ParsePosition& pos, int32_t limit) const
+{
+    int32_t start = pos.getIndex();
+    int32_t i = start;
+    UnicodeString result;
+    while (i < limit) {
+        char16_t c = text.charAt(i);
+        if ((i==start && !u_isIDStart(c)) || !u_isIDPart(c)) {
+            break;
+        }
+        ++i;
+    }
+    if (i == start) { 
+        return result; 
+    }
+    pos.setIndex(i);
+    text.extractBetween(start, i, result);
+    return result;
+}
+
+
+
+RBBINode       *RBBISymbolTable::lookupNode(const UnicodeString &key) const{
+
+    RBBINode             *retNode = nullptr;
+    RBBISymbolTableEntry *el;
+
+    el = static_cast<RBBISymbolTableEntry*>(uhash_get(fHashTable, &key));
+    if (el != nullptr) {
+        retNode = el->val;
+    }
+    return retNode;
+}
+
+
+void            RBBISymbolTable::addEntry  (const UnicodeString &key, RBBINode *val, UErrorCode &err) {
+    RBBISymbolTableEntry *e;
+    if (U_FAILURE(err)) {
+        return;
+    }
+    e = static_cast<RBBISymbolTableEntry*>(uhash_get(fHashTable, &key));
+    if (e != nullptr) {
+        err = U_BRK_VARIABLE_REDFINITION;
+        return;
+    }
+
+    e = new RBBISymbolTableEntry;
+    if (e == nullptr) {
+        err = U_MEMORY_ALLOCATION_ERROR;
+        return;
+    }
+    e->key = key;
+    e->val = val;
+    uhash_put( fHashTable, &e->key, e, &err);
+}
+
+
+RBBISymbolTableEntry::RBBISymbolTableEntry() : UMemory(), key(), val(nullptr) {}
+
+RBBISymbolTableEntry::~RBBISymbolTableEntry() {
+    delete val->fLeftChild;
+    val->fLeftChild = nullptr;
+
+    delete  val;
+
+}
+
+
+#ifdef RBBI_DEBUG
+void RBBISymbolTable::rbbiSymtablePrint() const {
+    RBBIDebugPrintf("Variable Definitions Symbol Table\n"
+           "Name                  Node         serial  String Val\n"
+           "-------------------------------------------------------------------\n");
+
+    int32_t pos = UHASH_FIRST;
+    const UHashElement  *e   = nullptr;
+    for (;;) {
+        e = uhash_nextElement(fHashTable,  &pos);
+        if (e == nullptr ) {
+            break;
+        }
+        RBBISymbolTableEntry  *s   = (RBBISymbolTableEntry *)e->value.pointer;
+
+        RBBIDebugPrintf("%-19s   %8p %7d ", CStr(s->key)(), (void *)s->val, s->val->fSerialNum);
+        RBBIDebugPrintf(" %s\n", CStr(s->val->fLeftChild->fText)());
+    }
+
+    RBBIDebugPrintf("\nParsed Variable Definitions\n");
+    pos = -1;
+    for (;;) {
+        e = uhash_nextElement(fHashTable,  &pos);
+        if (e == nullptr ) {
+            break;
+        }
+        RBBISymbolTableEntry  *s   = (RBBISymbolTableEntry *)e->value.pointer;
+        RBBIDebugPrintf("%s\n", CStr(s->key)());
+        RBBINode::printTree(s->val, true);
+        RBBINode::printTree(s->val->fLeftChild, false);
+        RBBIDebugPrintf("\n");
+    }
+}
+#endif
+
+
+
+
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_BREAK_ITERATION */

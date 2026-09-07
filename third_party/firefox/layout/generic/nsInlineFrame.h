@@ -1,0 +1,177 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsInlineFrame_h_
+#define nsInlineFrame_h_
+
+#include "nsContainerFrame.h"
+
+class nsLineLayout;
+
+namespace mozilla {
+class PresShell;
+}  
+
+class nsInlineFrame : public nsContainerFrame {
+ public:
+  NS_DECL_QUERYFRAME
+  NS_DECL_FRAMEARENA_HELPERS(nsInlineFrame)
+
+  friend nsInlineFrame* NS_NewInlineFrame(mozilla::PresShell* aPresShell,
+                                          ComputedStyle* aStyle);
+
+  void BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                        const nsDisplayListSet& aLists) override;
+
+#ifdef ACCESSIBILITY
+  mozilla::a11y::AccType AccessibleType() override;
+#endif
+
+#ifdef DEBUG_FRAME_DUMP
+  nsresult GetFrameName(nsAString& aResult) const override;
+#endif
+
+  void InvalidateFrame(uint32_t aDisplayItemKey = 0,
+                       bool aRebuildDisplayItems = true) override;
+  void InvalidateFrameWithRect(const nsRect& aRect,
+                               uint32_t aDisplayItemKey = 0,
+                               bool aRebuildDisplayItems = true) override;
+
+  bool IsEmpty() override;
+  bool IsSelfEmpty() override;
+
+  nscoord GetCaretBaseline() const override;
+
+  FrameSearchResult PeekOffsetCharacter(
+      bool aForward, int32_t* aOffset,
+      PeekOffsetCharacterOptions aOptions =
+          PeekOffsetCharacterOptions()) override;
+
+  void Destroy(DestroyContext&) override;
+
+  void StealFrame(nsIFrame* aChild) override;
+
+  void AddInlineMinISize(const mozilla::IntrinsicSizeInput& aInput,
+                         InlineMinISizeData* aData) override;
+  void AddInlinePrefISize(const mozilla::IntrinsicSizeInput& aInput,
+                          InlinePrefISizeData* aData) override;
+  SizeComputationResult ComputeSize(
+      const SizeComputationInput& aSizingInput, mozilla::WritingMode aWM,
+      const mozilla::LogicalSize& aCBSize, nscoord aAvailableISize,
+      const mozilla::LogicalSize& aMargin,
+      const mozilla::LogicalSize& aBorderPadding,
+      const mozilla::StyleSizeOverrides& aSizeOverrides,
+      mozilla::ComputeSizeFlags aFlags) override;
+  nsRect ComputeTightBounds(DrawTarget* aDrawTarget) const override;
+
+  void Reflow(nsPresContext* aPresContext, ReflowOutput& aReflowOutput,
+              const ReflowInput& aReflowInput,
+              nsReflowStatus& aStatus) override;
+
+  nsresult AttributeChanged(int32_t aNameSpaceID, nsAtom* aAttribute,
+                            AttrModType aModType) override;
+
+  bool CanContinueTextRun() const override;
+
+  void PullOverflowsFromPrevInFlow() override;
+
+  Maybe<nscoord> GetNaturalBaselineBOffset(
+      mozilla::WritingMode aWM, BaselineSharingGroup aBaselineGroup,
+      BaselineExportContext) const override;
+  bool DrainSelfOverflowList() override;
+
+  bool IsFirst() const {
+    return HasAnyStateBits(NS_INLINE_FRAME_BIDI_VISUAL_STATE_IS_SET)
+               ? HasAnyStateBits(NS_INLINE_FRAME_BIDI_VISUAL_IS_FIRST)
+               : !GetPrevInFlow();
+  }
+
+  bool IsLast() const {
+    return HasAnyStateBits(NS_INLINE_FRAME_BIDI_VISUAL_STATE_IS_SET)
+               ? HasAnyStateBits(NS_INLINE_FRAME_BIDI_VISUAL_IS_LAST)
+               : !GetNextInFlow();
+  }
+
+  void UpdateStyleOfOwnedAnonBoxesForIBSplit(
+      mozilla::ServoRestyleState& aRestyleState);
+
+ protected:
+  enum class SetParentDuringReflow : bool { No, Yes };
+
+  struct InlineReflowInput {
+    nsIFrame* mPrevFrame = nullptr;
+    nsInlineFrame* mNextInFlow = nullptr;
+    nsIFrame* mLineContainer = nullptr;
+    nsLineLayout* mLineLayout = nullptr;
+
+    SetParentDuringReflow mSetParentDuringReflow = SetParentDuringReflow::No;
+
+    InlineReflowInput(const ReflowInput& aReflowInput,
+                      SetParentDuringReflow aSetParentDuringReflow);
+  };
+
+  nsInlineFrame(ComputedStyle* aStyle, nsPresContext* aPresContext, ClassID aID)
+      : nsContainerFrame(aStyle, aPresContext, aID),
+        mBaseline(NS_INTRINSIC_ISIZE_UNKNOWN) {}
+
+  LogicalSides GetLogicalSkipSides() const override;
+
+  void ReflowFrames(nsPresContext* aPresContext,
+                    const ReflowInput& aReflowInput, InlineReflowInput& rs,
+                    ReflowOutput& aMetrics, nsReflowStatus& aStatus);
+
+  void ReflowInlineFrame(nsPresContext* aPresContext,
+                         const ReflowInput& aReflowInput, InlineReflowInput& rs,
+                         nsIFrame* aFrame, nsReflowStatus& aStatus);
+
+  static bool HasFramesToPull(nsInlineFrame* aNextInFlow);
+
+  virtual nsIFrame* PullOneFrame(nsPresContext*, InlineReflowInput&);
+
+  virtual void PushFrames(nsPresContext* aPresContext, nsIFrame* aFromChild,
+                          nsIFrame* aPrevSibling, InlineReflowInput& aState);
+
+  void MarkBlockAncestorHavingAbsoluteDescendants(
+      const ReflowInput& aReflowInput) const;
+
+ private:
+  explicit nsInlineFrame(ComputedStyle* aStyle, nsPresContext* aPresContext)
+      : nsInlineFrame(aStyle, aPresContext, kClassID) {}
+
+  bool DrainSelfOverflowListInternal(bool aInFirstLine);
+
+ protected:
+  nscoord mBaseline;
+};
+
+
+class nsFirstLineFrame final : public nsInlineFrame {
+ public:
+  NS_DECL_FRAMEARENA_HELPERS(nsFirstLineFrame)
+
+  friend nsFirstLineFrame* NS_NewFirstLineFrame(mozilla::PresShell* aPresShell,
+                                                ComputedStyle* aStyle);
+
+#ifdef DEBUG_FRAME_DUMP
+  nsresult GetFrameName(nsAString& aResult) const override;
+#endif
+
+  void Reflow(nsPresContext* aPresContext, ReflowOutput& aReflowOutput,
+              const ReflowInput& aReflowInput,
+              nsReflowStatus& aStatus) override;
+
+  void Init(nsIContent* aContent, nsContainerFrame* aParent,
+            nsIFrame* aPrevInFlow) override;
+  void PullOverflowsFromPrevInFlow() override;
+  bool DrainSelfOverflowList() override;
+
+ protected:
+  explicit nsFirstLineFrame(ComputedStyle* aStyle, nsPresContext* aPresContext)
+      : nsInlineFrame(aStyle, aPresContext, kClassID) {}
+
+  nsIFrame* PullOneFrame(nsPresContext*, InlineReflowInput&) override;
+};
+
+#endif /* nsInlineFrame_h_ */

@@ -1,0 +1,307 @@
+/*
+ * Copyright 2021 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "wasm/WasmBinary.h"
+
+#include "js/Printf.h"
+#include "wasm/WasmMetadata.h"
+
+using namespace js;
+using namespace js::wasm;
+
+
+bool Decoder::failf(const char* msg, ...) {
+  va_list ap;
+  va_start(ap, msg);
+  UniqueChars str(JS_vsmprintf(msg, ap));
+  va_end(ap);
+  if (!str) {
+    return false;
+  }
+
+  return fail(str.get());
+}
+
+void Decoder::warnf(const char* msg, ...) {
+  if (!warnings_) {
+    return;
+  }
+
+  va_list ap;
+  va_start(ap, msg);
+  UniqueChars str(JS_vsmprintf(msg, ap));
+  va_end(ap);
+  if (!str) {
+    return;
+  }
+
+  (void)warnings_->append(std::move(str));
+}
+
+bool Decoder::fail(size_t errorOffset, const char* msg) {
+  MOZ_ASSERT(error_);
+  UniqueChars strWithOffset(JS_smprintf("at offset %zu: %s", errorOffset, msg));
+  if (!strWithOffset) {
+    return false;
+  }
+
+  *error_ = std::move(strWithOffset);
+  return false;
+}
+
+bool Decoder::readSectionHeader(uint8_t* id, BytecodeRange* range) {
+  if (!readFixedU8(id)) {
+    return false;
+  }
+
+  uint32_t size;
+  if (!readVarU32(&size)) {
+    return false;
+  }
+
+  return BytecodeRange::fromStartAndSize(currentOffset(), size, range);
+}
+
+bool Decoder::startSection(SectionId id, CodeMetadata* codeMeta,
+                           MaybeBytecodeRange* range, const char* sectionName) {
+  MOZ_ASSERT(!*range);
+
+  const uint8_t* const initialCur = cur_;
+  const size_t initialCustomSectionsLength =
+      codeMeta->customSectionRanges.length();
+
+  const uint8_t* currentSectionStart = cur_;
+
+
+  uint8_t idValue;
+  if (!readFixedU8(&idValue)) {
+    goto rewind;
+  }
+
+  while (idValue != uint8_t(id)) {
+    if (idValue != uint8_t(SectionId::Custom)) {
+      goto rewind;
+    }
+
+    cur_ = currentSectionStart;
+    if (!skipCustomSection(codeMeta)) {
+      return false;
+    }
+
+    currentSectionStart = cur_;
+    if (!readFixedU8(&idValue)) {
+      goto rewind;
+    }
+  }
+
+
+  uint32_t size;
+  if (!readVarU32(&size)) {
+    goto fail;
+  }
+
+  range->emplace();
+  if (!BytecodeRange::fromStartAndSize(currentOffset(), size, range->ptr())) {
+    goto fail;
+  }
+  return true;
+
+rewind:
+  cur_ = initialCur;
+  codeMeta->customSectionRanges.shrinkTo(initialCustomSectionsLength);
+  return true;
+
+fail:
+  return failf("failed to start %s section", sectionName);
+}
+
+bool Decoder::finishSection(const BytecodeRange& range,
+                            const char* sectionName) {
+  if (range.end != currentOffset()) {
+    return failf("byte size mismatch in %s section", sectionName);
+  }
+  return true;
+}
+
+bool Decoder::startCustomSection(const char* expected, size_t expectedLength,
+                                 CodeMetadata* codeMeta,
+                                 MaybeBytecodeRange* range) {
+  const uint8_t* const initialCur = cur_;
+  const size_t initialCustomSectionsLength =
+      codeMeta->customSectionRanges.length();
+
+  while (true) {
+    if (!startSection(SectionId::Custom, codeMeta, range, "custom")) {
+      return false;
+    }
+    if (!*range) {
+      goto rewind;
+    }
+
+    if (bytesRemain() < (*range)->size()) {
+      goto fail;
+    }
+
+    uint32_t sectionNameSize;
+    if (!readVarU32(&sectionNameSize) || sectionNameSize > bytesRemain()) {
+      goto fail;
+    }
+
+    if (!IsUtf8(AsChars(mozilla::Span(cur_, sectionNameSize)))) {
+      goto fail;
+    }
+
+    CustomSectionRange secRange;
+    secRange.name = BytecodeRange(currentOffset(), sectionNameSize);
+    if (secRange.name.end > (*range)->end) {
+      goto fail;
+    }
+    secRange.payload.start = secRange.name.end;
+    secRange.payload.end = (*range)->end;
+
+    if (!codeMeta->customSectionRanges.append(secRange)) {
+      return false;
+    }
+
+    if (!expected || (expectedLength == secRange.name.size() &&
+                      !memcmp(cur_, expected, secRange.name.size()))) {
+      cur_ += secRange.name.size();
+      return true;
+    }
+
+    skipAndFinishCustomSection(**range);
+    range->reset();
+  }
+  MOZ_CRASH("unreachable");
+
+rewind:
+  cur_ = initialCur;
+  codeMeta->customSectionRanges.shrinkTo(initialCustomSectionsLength);
+  return true;
+
+fail:
+  return fail("failed to start custom section");
+}
+
+bool Decoder::finishCustomSection(const char* name,
+                                  const BytecodeRange& range) {
+  MOZ_ASSERT(cur_ >= beg_);
+  MOZ_ASSERT(cur_ <= end_);
+
+  if (error_ && *error_) {
+    warnf("in the '%s' custom section: %s", name, error_->get());
+    skipAndFinishCustomSection(range);
+    return false;
+  }
+
+  uint32_t actualSize = currentOffset() - range.start;
+  if (range.size() != actualSize) {
+    if (actualSize < range.size()) {
+      warnf("in the '%s' custom section: %" PRIu32 " unconsumed bytes", name,
+            uint32_t(range.size() - actualSize));
+    } else {
+      warnf("in the '%s' custom section: %" PRIu32
+            " bytes consumed past the end",
+            name, uint32_t(actualSize - range.size()));
+    }
+    skipAndFinishCustomSection(range);
+    return false;
+  }
+
+  return true;
+}
+
+void Decoder::skipAndFinishCustomSection(const BytecodeRange& range) {
+  MOZ_ASSERT(cur_ >= beg_);
+  MOZ_ASSERT(cur_ <= end_);
+  cur_ = beg_ + (range.end - offsetInModule_);
+  MOZ_ASSERT(cur_ <= end_);
+  clearError();
+}
+
+bool Decoder::skipCustomSection(CodeMetadata* codeMeta) {
+  MaybeBytecodeRange range;
+  if (!startCustomSection(nullptr, 0, codeMeta, &range)) {
+    return false;
+  }
+  if (!range) {
+    return fail("expected custom section");
+  }
+
+  skipAndFinishCustomSection(*range);
+  return true;
+}
+
+bool Decoder::startNameSubsection(NameType nameType,
+                                  mozilla::Maybe<uint32_t>* endOffset) {
+  MOZ_ASSERT(!*endOffset);
+
+  const uint8_t* const initialPosition = cur_;
+
+  uint8_t nameTypeValue;
+  if (!readFixedU8(&nameTypeValue)) {
+    goto rewind;
+  }
+
+  if (nameTypeValue != uint8_t(nameType)) {
+    goto rewind;
+  }
+
+  uint32_t payloadLength;
+  if (!readVarU32(&payloadLength) || payloadLength > bytesRemain()) {
+    return fail("bad name subsection payload length");
+  }
+
+  *endOffset = mozilla::Some(currentOffset() + payloadLength);
+  return true;
+
+rewind:
+  cur_ = initialPosition;
+  return true;
+}
+
+bool Decoder::finishNameSubsection(uint32_t endOffset) {
+  uint32_t actual = currentOffset();
+  if (endOffset != actual) {
+    return failf("bad name subsection length (endOffset: %" PRIu32
+                 ", actual: %" PRIu32 ")",
+                 endOffset, actual);
+  }
+
+  return true;
+}
+
+bool Decoder::skipNameSubsection() {
+  uint8_t nameTypeValue;
+  if (!readFixedU8(&nameTypeValue)) {
+    return fail("unable to read name subsection id");
+  }
+
+  switch (nameTypeValue) {
+    case uint8_t(NameType::Module):
+    case uint8_t(NameType::Function):
+      return fail("out of order name subsections");
+    default:
+      break;
+  }
+
+  uint32_t payloadLength;
+  if (!readVarU32(&payloadLength) || !readBytes(payloadLength)) {
+    return fail("bad name subsection payload length");
+  }
+
+  return true;
+}

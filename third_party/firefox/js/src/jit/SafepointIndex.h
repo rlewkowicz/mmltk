@@ -1,0 +1,63 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_SafepointIndex_h
+#define jit_SafepointIndex_h
+
+#include <stdint.h>
+
+#include "jit/IonTypes.h"
+
+namespace js {
+namespace jit {
+
+class LSafepoint;
+class CodegenSafepointIndex;
+
+class SafepointIndex {
+  uint32_t displacement_ = 0;
+
+  uint32_t safepointOffset_ = 0;
+
+ public:
+  inline explicit SafepointIndex(const CodegenSafepointIndex& csi);
+
+  uint32_t displacement() const { return displacement_; }
+  uint32_t safepointOffset() const { return safepointOffset_; }
+};
+
+class CodegenSafepointIndex {
+  uint32_t displacement_ = 0;
+
+  LSafepoint* safepoint_ = nullptr;
+
+ public:
+  CodegenSafepointIndex(uint32_t displacement, LSafepoint* safepoint)
+      : displacement_(displacement), safepoint_(safepoint) {}
+
+  LSafepoint* safepoint() const { return safepoint_; }
+  uint32_t displacement() const { return displacement_; }
+
+  inline SnapshotOffset snapshotOffset() const;
+  inline bool hasSnapshotOffset() const;
+};
+
+class OsiIndex {
+  uint32_t callPointDisplacement_;
+  uint32_t snapshotOffset_;
+
+ public:
+  OsiIndex(uint32_t callPointDisplacement, uint32_t snapshotOffset)
+      : callPointDisplacement_(callPointDisplacement),
+        snapshotOffset_(snapshotOffset) {}
+
+  uint32_t returnPointDisplacement() const;
+  uint32_t callPointDisplacement() const { return callPointDisplacement_; }
+  uint32_t snapshotOffset() const { return snapshotOffset_; }
+};
+
+} 
+} 
+
+#endif /* jit_SafepointIndex_h */

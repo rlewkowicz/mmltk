@@ -1,0 +1,6 @@
+#include <linux/rtnetlink.h>
+
+struct nlmsghdr __nlmsghdr;
+struct rtattr __rtattr;
+struct rtmsg __rtmsg;
+struct ifinfomsg __ifinfomsg;

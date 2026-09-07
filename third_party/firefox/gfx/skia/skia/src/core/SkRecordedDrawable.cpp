@@ -1,0 +1,97 @@
+/*
+ * Copyright 2016 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "src/core/SkRecordedDrawable.h"
+
+#include "include/core/SkPicture.h"
+#include "include/core/SkPictureRecorder.h"
+#include "include/core/SkSize.h"
+#include "src/core/SkBigPicture.h"
+#include "src/core/SkPictureData.h"
+#include "src/core/SkPicturePlayback.h"
+#include "src/core/SkPictureRecord.h"
+#include "src/core/SkReadBuffer.h"
+#include "src/core/SkRecordDraw.h"
+#include "src/core/SkWriteBuffer.h"
+
+class SkCanvas;
+
+size_t SkRecordedDrawable::onApproximateBytesUsed() {
+    size_t drawablesSize = 0;
+    if (fDrawableList) {
+        for (auto&& drawable : *fDrawableList) {
+            drawablesSize += drawable->approximateBytesUsed();
+        }
+    }
+    return sizeof(*this) +
+           (fRecord ? fRecord->bytesUsed() : 0) +
+           (fBBH ? fBBH->bytesUsed() : 0) +
+           drawablesSize;
+}
+
+void SkRecordedDrawable::onDraw(SkCanvas* canvas) {
+    SkDrawable* const* drawables = nullptr;
+    int drawableCount = 0;
+    if (fDrawableList) {
+        drawables = fDrawableList->begin();
+        drawableCount = fDrawableList->count();
+    }
+    SkRecordDraw(*fRecord, canvas, nullptr, drawables, drawableCount, fBBH.get(), nullptr);
+}
+
+sk_sp<SkPicture> SkRecordedDrawable::onMakePictureSnapshot() {
+    std::unique_ptr<SkBigPicture::SnapshotArray> pictList{
+        fDrawableList ? fDrawableList->newDrawableSnapshot() : nullptr
+    };
+
+    size_t subPictureBytes = 0;
+    for (int i = 0; pictList && i < pictList->count(); i++) {
+        subPictureBytes += pictList->begin()[i]->approximateBytesUsed();
+    }
+    return sk_make_sp<SkBigPicture>(fBounds, fRecord, std::move(pictList), fBBH, subPictureBytes);
+}
+
+void SkRecordedDrawable::flatten(SkWriteBuffer& buffer) const {
+    buffer.writeRect(fBounds);
+
+    SkPictInfo info;
+    SkPictureRecord pictureRecord(SkISize::Make(fBounds.width(), fBounds.height()), 0);
+
+    SkBBoxHierarchy* bbh;
+    if (pictureRecord.getLocalClipBounds().contains(fBounds)) {
+        bbh = nullptr;
+    } else {
+        bbh = fBBH.get();
+    }
+
+    SkDrawable* const* drawables = fDrawableList ? fDrawableList->begin() : nullptr;
+    int drawableCount            = fDrawableList ? fDrawableList->count() : 0;
+    pictureRecord.beginRecording();
+    SkRecordDraw(*fRecord, &pictureRecord, nullptr, drawables, drawableCount, bbh, nullptr);
+    pictureRecord.endRecording();
+
+    SkPictureData pictureData(pictureRecord, info);
+    pictureData.flatten(buffer);
+}
+
+sk_sp<SkFlattenable> SkRecordedDrawable::CreateProc(SkReadBuffer& buffer) {
+    SkRect bounds;
+    buffer.readRect(&bounds);
+
+    SkPictInfo info;
+    info.setVersion(buffer.getVersion());
+    info.fCullRect = bounds;
+    std::unique_ptr<SkPictureData> pictureData(SkPictureData::CreateFromBuffer(buffer, info));
+    if (!pictureData) {
+        return nullptr;
+    }
+
+    SkPicturePlayback playback(pictureData.get());
+    SkPictureRecorder recorder;
+    playback.draw(recorder.beginRecording(bounds), nullptr, &buffer);
+    return recorder.finishRecordingAsDrawable();
+}

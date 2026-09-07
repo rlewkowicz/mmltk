@@ -1,0 +1,607 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+#include "EditContext.h"
+
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/EventDispatcher.h"
+#include "mozilla/HTMLEditor.h"
+#include "mozilla/IMEContentObserver.h"
+#include "mozilla/IMEStateManager.h"
+#include "mozilla/InputEventOptions.h"
+#include "mozilla/MiscEvents.h"
+#include "mozilla/TextEvents.h"
+#include "mozilla/dom/AnonymousContent.h"
+#include "mozilla/dom/CharacterBoundsUpdateEvent.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/DocumentInlines.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/Text.h"
+#include "mozilla/dom/TextFormatUpdateEvent.h"
+#include "mozilla/dom/TextUpdateEvent.h"
+#include "mozilla/intl/Segmenter.h"
+#include "nsDOMCSSDeclaration.h"
+#include "nsGenericHTMLElement.h"
+#include "nsLayoutUtils.h"
+#include "nsTextNode.h"
+
+namespace mozilla::dom {
+
+using InlineDir = WritingMode::InlineDir;
+using LineStyle = TextRangeStyle::LineStyle;
+
+NS_IMPL_ADDREF_INHERITED(EditContext, DOMEventTargetHelper)
+NS_IMPL_RELEASE_INHERITED(EditContext, DOMEventTargetHelper)
+NS_IMPL_CYCLE_COLLECTION_INHERITED(EditContext, DOMEventTargetHelper,
+                                   mAssociatedElement, mText, mTextContainer)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(EditContext)
+NS_INTERFACE_MAP_END_INHERITING(DOMEventTargetHelper)
+
+already_AddRefed<EditContext> EditContext::Constructor(
+    const GlobalObject& aGlobal, const EditContextInit& aInit,
+    ErrorResult& aRv) {
+  nsCOMPtr<nsIGlobalObject> global = do_QueryInterface(aGlobal.GetAsSupports());
+  if (!global) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return nullptr;
+  }
+  RefPtr<EditContext> context = new EditContext(global, aInit, aRv);
+  if (aRv.Failed()) {
+    return nullptr;
+  }
+  return context.forget();
+}
+
+JSObject* EditContext::WrapObject(JSContext* aCx,
+                                  JS::Handle<JSObject*> aGivenProto) {
+  return EditContext_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+static StaticAutoPtr<nsTHashMap<const Element*, RefPtr<EditContext>>>
+    sEditContextHashMap;
+
+EditContext* EditContext::GetForElement(const Element& aElement) {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (!sEditContextHashMap || !aElement.HasFlag(ELEMENT_HAS_EDIT_CONTEXT)) {
+    return nullptr;
+  }
+  auto entry = sEditContextHashMap->Lookup(&aElement);
+  MOZ_ASSERT(entry,
+             "Should be in hash map if ELEMENT_HAS_EDIT_CONTEXT is set.");
+  return entry.Data();
+}
+
+void EditContext::SetForElement(const Element& aElement,
+                                mozilla::dom::EditContext* aEditContext) {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (!sEditContextHashMap) {
+    if (!aEditContext) {
+      return;
+    }
+    sEditContextHashMap = new nsTHashMap<const Element*, RefPtr<EditContext>>;
+    ClearOnShutdown(&sEditContextHashMap);
+  }
+  if (aEditContext) {
+    sEditContextHashMap->InsertOrUpdate(&aElement, aEditContext);
+  } else {
+    sEditContextHashMap->Remove(&aElement);
+  }
+}
+
+void EditContext::Deactivate() {
+
+  if (!mIsComposing) {
+    return;
+  }
+
+}
+
+bool EditContext::IsActive() const {
+  return mAssociatedElement &&
+         mAssociatedElement->OwnerDoc()->GetActiveEditContext() == this;
+}
+
+bool EditContext::IsAnyAttached() {
+  MOZ_ASSERT(NS_IsMainThread());
+  return sEditContextHashMap && !sEditContextHashMap->IsEmpty();
+}
+
+EditContext::EditContext(nsIGlobalObject* aGlobalObject,
+                         const EditContextInit& aInit, ErrorResult& aRv)
+    : DOMEventTargetHelper(aGlobalObject) {
+  auto window = aGlobalObject->GetAsInnerWindow();
+  MOZ_ASSERT(window);
+  auto* document = window->GetDoc();
+  MOZ_ASSERT(document);
+  RefPtr<AnonymousContent> anonymousContent =
+      document->InsertAnonymousContent(aRv);
+  if (NS_WARN_IF(!anonymousContent)) {
+    return;
+  }
+  RefPtr<Element> textContainer =
+      document->CreateElem(u"div"_ns, nullptr, kNameSpaceID_XHTML);
+  if (NS_WARN_IF(!textContainer)) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return;
+  }
+  mTextContainer = nsGenericHTMLElement::FromNode(textContainer);
+  MOZ_ASSERT(mTextContainer);
+  mText = document->CreateTextNode(u""_ns);
+  mText->MarkAsMaybeModifiedFrequently();
+  mTextContainer->AppendChild(*mText, IgnoreErrors());
+  anonymousContent->Root()->AppendChild(*mTextContainer, IgnoreErrors());
+  mText->SetEditableFlag(true);
+  mTextContainer->SetEditableFlag(true);
+  mTextContainer->Style()->SetProperty("visibility"_ns, "hidden"_ns, ""_ns,
+                                       IgnoreErrors());
+  UpdateSelection(aInit.mSelectionStart, aInit.mSelectionEnd);
+  UpdateText(0, 0, aInit.mText, aRv);
+}
+
+void EditContext::SetAssociatedElement(nsGenericHTMLElement* aElement) {
+  mAssociatedElement = aElement;
+}
+
+void EditContext::GetText(nsAString& aText) const { mText->GetData(aText); }
+
+void EditContext::GetTextSubstring(uint32_t aStart, uint32_t aEnd,
+                                   nsAString& aText) {
+  mText->SubstringData(aStart, aEnd - aStart, aText, IgnoreErrors());
+}
+
+RefPtr<DOMRect> EditContext::ToDOMRect(const Rect& aCopy) const {
+  return MakeRefPtr<DOMRect>(GetRelevantGlobal(), aCopy.x, aCopy.y, aCopy.width,
+                             aCopy.height);
+}
+
+auto EditContext::ToRect(const DOMRect& aRect) const -> Rect {
+  return Rect(aRect.X(), aRect.Y(), aRect.Width(), aRect.Height());
+}
+
+LayoutDeviceIntRect EditContext::ToRootRelativeDeviceRect(
+    const nsPresContext& aPresContext, const Rect& aRect) {
+  CSSIntRect cssRect;
+  aRect.ToIntRect(&cssRect);
+  return ToRootRelativeDeviceRect(aPresContext, Rect::ToAppUnits(cssRect));
+}
+
+LayoutDeviceIntRect EditContext::ToRootRelativeDeviceRect(
+    const nsPresContext& aPresContext, const nsRect& aRect) {
+  nsRect rect = aRect;
+  if (!aPresContext.IsRoot()) {
+    nsPresContext* rootPC = aPresContext.GetRootPresContext();
+    if (NS_WARN_IF(!rootPC)) {
+      return {0, 0, 1, 1};
+    }
+    nsIFrame* documentRootFrame = aPresContext.PresShell()->GetRootFrame();
+    nsIFrame* topLevelRootFrame = rootPC->PresShell()->GetRootFrame();
+    if (NS_WARN_IF(!documentRootFrame) || NS_WARN_IF(!topLevelRootFrame)) {
+      return {0, 0, 1, 1};
+    }
+    rect = nsLayoutUtils::TransformFrameRectToAncestor(documentRootFrame, rect,
+                                                       topLevelRootFrame);
+  }
+  LayoutDeviceIntRect deviceRect = LayoutDeviceIntRect::FromAppUnitsToOutside(
+      rect, aPresContext.AppUnitsPerDevPixel());
+  deviceRect.width = std::max(1, deviceRect.width);
+  deviceRect.height = std::max(1, deviceRect.height);
+  return deviceRect;
+}
+
+void EditContext::UpdateSelection(uint32_t aStart, uint32_t aEnd) {
+  if (aStart == mSelectionStart && aEnd == mSelectionEnd) {
+    return;
+  }
+  mSelectionStart = aStart;
+  mSelectionEnd = aEnd;
+  mTextNextToCaretChangedByTextUpdateHandler = true;
+
+  if (IsActive()) {
+    if (IMEContentObserver* observer =
+            IMEStateManager::GetActiveContentObserver()) {
+      observer->EditContextSelectionChanged();
+    }
+  }
+}
+
+void EditContext::UpdateCharacterBounds(
+    uint32_t aRangeStart,
+    const Sequence<OwningNonNull<DOMRect>>& aCharacterBounds) {
+  mCodepointRectsStartIndex = aRangeStart;
+  mCodepointRects.Clear();
+  mCodepointRects.SetCapacity(aCharacterBounds.Length());
+  for (const auto& rect : aCharacterBounds) {
+    mCodepointRects.AppendElement(ToRect(rect));
+  }
+  if (!mExpectingCharacterBounds && IsActive()) {
+    if (IMEContentObserver* observer =
+            IMEStateManager::GetActiveContentObserver()) {
+      observer->EditContextPositionChanged();
+    }
+  }
+}
+
+void EditContext::CharacterBounds(nsTArray<RefPtr<DOMRect>>& aRetVal) const {
+  aRetVal.SetCapacity(mCodepointRects.Length());
+  for (const Rect& rect : mCodepointRects) {
+    aRetVal.AppendElement(ToDOMRect(rect));
+  }
+}
+
+uint32_t EditContext::TextLength() const { return mText->TextLength(); }
+
+WritingMode EditContext::WritingMode() const {
+  if (!mAssociatedElement) {
+    return mozilla::WritingMode();
+  }
+  nsIFrame* frame = mAssociatedElement->GetPrimaryFrame();
+  if (!frame) {
+    return mozilla::WritingMode();
+  }
+  return frame->GetWritingMode();
+}
+
+void EditContext::UpdateText(uint32_t aRangeStart, uint32_t aRangeEnd,
+                             const nsAString& aText, ErrorResult& aRv) {
+  if (NS_WARN_IF(!mText->DataBuffer().CanGrowBy(aText.Length()))) {
+    aRv.Throw(NS_ERROR_OUT_OF_MEMORY);
+    return;
+  }
+  const uint32_t prevSelectionStart = SelectionStartClamped();
+  const uint32_t prevSelectionEnd = SelectionEndClamped();
+  uint32_t start = std::min(aRangeStart, aRangeEnd);
+  start = std::min(start, TextLength());
+  uint32_t end = std::max(aRangeStart, aRangeEnd);
+  end = std::min(end, TextLength());
+  if (mSelectionStart == mSelectionEnd && start <= mSelectionStart &&
+      end >= mSelectionStart) {
+    mTextNextToCaretChangedByTextUpdateHandler = true;
+  }
+  mText->ReplaceData(start, end - start, aText, IgnoreErrors());
+  if (IsActive()) {
+    if (IMEContentObserver* observer =
+            IMEStateManager::GetActiveContentObserver()) {
+      if (SelectionStartClamped() != prevSelectionStart ||
+          SelectionEndClamped() != prevSelectionEnd) {
+        observer->EditContextSelectionChanged();
+      }
+      observer->EditContextTextChanged(aRangeStart, aRangeEnd, aText);
+    }
+  }
+}
+
+void EditContext::UpdateControlBounds(DOMRect& aControlBounds) {
+  mControlBounds = Some(ToRect(aControlBounds));
+}
+
+void EditContext::UpdateSelectionBounds(DOMRect& aSelectionBounds) {
+  mSelectionBounds = Some(ToRect(aSelectionBounds));
+}
+
+void EditContext::UpdateTextAndFireEvent(
+    uint32_t aStart, uint32_t aEnd, const nsAString& aString,
+    PreventSetSelection aPreventSetSelection) {
+  aStart = std::min(aStart, TextLength());
+  aEnd = std::min(aEnd, TextLength());
+  if (aStart == aEnd && aString.IsEmpty()) {
+    return;
+  }
+  if (aStart > aEnd) {
+    std::swap(aStart, aEnd);
+  }
+  IgnoredErrorResult rv;
+  UpdateText(aStart, aEnd, aString, rv);
+  if (rv.Failed()) {
+    return;
+  }
+  if (aPreventSetSelection == PreventSetSelection::Yes) {
+    for (uint32_t* offset : {&mSelectionStart, &mSelectionEnd}) {
+      if (*offset >= aStart && *offset < aEnd) {
+        *offset = aStart;
+      } else if (*offset >= aEnd) {
+        *offset += aString.Length() - (aEnd - aStart);
+      }
+    }
+  } else {
+    mSelectionStart = mSelectionEnd = aStart + aString.Length();
+  }
+  TextUpdateEventInit options;
+  options.mText = aString;
+  options.mSelectionStart = mSelectionStart;
+  options.mSelectionEnd = mSelectionEnd;
+  options.mUpdateRangeStart = aStart;
+  options.mUpdateRangeEnd = aEnd;
+  options.mBubbles = false;
+  options.mCancelable = true;
+  RefPtr<TextUpdateEvent> e =
+      TextUpdateEvent::Constructor(this, u"textupdate"_ns, options);
+  e->SetTrusted(true);
+  mTextNextToCaretChangedByTextUpdateHandler = false;
+  AutoRestore restore(mIsFiringTextUpdate);
+  mIsFiringTextUpdate = true;
+  DispatchEvent(*e);
+}
+
+void EditContext::StartComposition(const WidgetCompositionEvent& aEvent) {
+  MOZ_ASSERT(!mIsComposing);
+  WidgetCompositionEvent event(aEvent);
+  RefPtr presContext = mText->OwnerDoc()->GetPresContext();
+  EventDispatcher::Dispatch(this, presContext, &event);
+  mIsComposing = true;
+}
+
+void EditContext::EndComposition(const WidgetCompositionEvent& aEvent) {
+  MOZ_ASSERT(mIsComposing);
+  WidgetCompositionEvent event(aEvent);
+  RefPtr presContext = mText->OwnerDoc()->GetPresContext();
+  EventDispatcher::Dispatch(this, presContext, &event);
+  mIsComposing = false;
+}
+
+void EditContext::DoContentCommandReplaceText(
+    WidgetContentCommandEvent& aEvent) {
+  MOZ_ASSERT(aEvent.mMessage == eContentCommandReplaceText);
+  MOZ_ASSERT(aEvent.mString);
+  if (!aEvent.mString) {
+    aEvent.mSucceeded = false;
+    return;
+  }
+  MOZ_ASSERT(IsActive(), "Should be the active EditContext.");
+  nsAutoString text;
+  const uint32_t replaceOffset = aEvent.mSelection.mOffset;
+  const uint32_t replaceLength = aEvent.mSelection.mReplaceSrcString.Length();
+  mText->SubstringData(replaceOffset, replaceLength, text, IgnoreErrors());
+  if (text != aEvent.mSelection.mReplaceSrcString) {
+    aEvent.mSucceeded = false;
+    return;
+  }
+  InputEventOptions options(*aEvent.mString,
+                            InputEventOptions::NeverCancelable::No);
+  nsEventStatus status = nsEventStatus_eIgnore;
+  RefPtr<nsGenericHTMLElement> associatedElement = GetAssociatedElement();
+  MOZ_ASSERT(associatedElement);
+  RefPtr<HTMLEditor> htmlEditor =
+      associatedElement->OwnerDoc()->GetHTMLEditor();
+  MOZ_ASSERT(htmlEditor);
+  nsresult rv = nsContentUtils::DispatchInputEvent(
+      associatedElement, eEditorBeforeInput, EditorInputType::eInsertText,
+      htmlEditor, std::move(options), &status);
+  if (NS_FAILED(rv) || status == nsEventStatus_eConsumeNoDefault ||
+      !IsActive()) {
+    aEvent.mSucceeded = false;
+    return;
+  }
+  UpdateTextAndFireEvent(
+      replaceOffset, replaceOffset + replaceLength, *aEvent.mString,
+      aEvent.mSelection.mPreventSetSelection ? PreventSetSelection::Yes
+                                             : PreventSetSelection::No);
+  aEvent.mSucceeded = true;
+}
+
+static UnderlineStyle ToDOMStyle(LineStyle aStyle) {
+  switch (aStyle) {
+    case LineStyle::None:
+      return UnderlineStyle::None;
+    case LineStyle::Dashed:
+      return UnderlineStyle::Dashed;
+    case LineStyle::Dotted:
+      return UnderlineStyle::Dotted;
+    case LineStyle::Wavy:
+      return UnderlineStyle::Wavy;
+    case LineStyle::Solid:
+      return UnderlineStyle::Solid;
+    case LineStyle::Double:
+      return UnderlineStyle::Solid;
+  }
+  MOZ_CRASH("Invalid LineStyle.");
+  return UnderlineStyle::None;
+}
+
+void EditContext::FireTextFormatUpdate(const TextRangeArray* aRanges,
+                                       uint32_t aCompositionOffset) {
+  TextFormatUpdateEventInit eventOptions;
+  eventOptions.mBubbles = false;
+  eventOptions.mCancelable = true;
+  if (aRanges) {
+    for (const TextRange& range : *aRanges) {
+      if (range.Length() == 0) {
+        continue;
+      }
+      TextFormatInit formatOptions;
+      formatOptions.mRangeStart = range.mStartOffset + aCompositionOffset;
+      formatOptions.mRangeEnd = range.mEndOffset + aCompositionOffset;
+      if (mText->OwnerDoc()->ShouldResistFingerprinting(RFPTarget::IMEStyle)) {
+        formatOptions.mUnderlineStyle = UnderlineStyle::Solid;
+        formatOptions.mUnderlineThickness =
+            range.mRangeType == TextRangeType::eSelectedClause ||
+                    range.mRangeType == TextRangeType::eSelectedRawClause
+                ? UnderlineThickness::Thick
+                : UnderlineThickness::Thin;
+      } else if (range.mRangeStyle.IsLineStyleDefined() &&
+                 range.mRangeStyle.mLineStyle != LineStyle::None) {
+        formatOptions.mUnderlineStyle =
+            ToDOMStyle(range.mRangeStyle.mLineStyle);
+        formatOptions.mUnderlineThickness = range.mRangeStyle.mIsBoldLine
+                                                ? UnderlineThickness::Thick
+                                                : UnderlineThickness::Thin;
+      }
+      OwningNonNull<TextFormat> format =
+          MakeRefPtr<TextFormat>(GetRelevantGlobal(), formatOptions);
+      [[maybe_unused]] auto* element =
+          eventOptions.mTextFormats.AppendElement(std::move(format), fallible);
+      NS_WARNING_ASSERTION(element, "TextFormat array allocation failed");
+    }
+  }
+  RefPtr<TextFormatUpdateEvent> e = MakeRefPtr<TextFormatUpdateEvent>(
+      this, u"textformatupdate"_ns, eventOptions);
+  e->SetTrusted(true);
+  DispatchEvent(*e);
+}
+
+static InlineDir ReverseInlineDir(InlineDir dir) {
+  switch (dir) {
+    case InlineDir::LTR:
+      return InlineDir::RTL;
+    case InlineDir::RTL:
+      return InlineDir::LTR;
+    case InlineDir::BTT:
+      return InlineDir::TTB;
+    case InlineDir::TTB:
+      return InlineDir::BTT;
+  }
+  MOZ_ASSERT(false, "invalid InlineDir");
+  return InlineDir::LTR;
+}
+
+nsresult EditContext::FireCharacterBoundsUpdateAndGetRects(
+    uint32_t aStart, uint32_t aEnd, nsTArray<LayoutDeviceIntRect>& aRects) {
+  MOZ_ASSERT(aRects.IsEmpty());
+  aStart = std::min(aStart, TextLength());
+  aEnd = std::min(aEnd, TextLength());
+  enum class CollapseDirection {
+    None,
+    Previous,
+    Next,
+  };
+  CollapseDirection collapse = CollapseDirection::None;
+  if (aStart == aEnd) {
+    if (TextLength() == 0) {
+      aRects.AppendElement(FallbackBounds());
+      return NS_OK;
+    }
+    if (aEnd < TextLength()) {
+      aEnd++;
+      collapse = CollapseDirection::Previous;
+    } else {
+      MOZ_ASSERT(aStart > 0);
+      aStart--;
+      collapse = CollapseDirection::Next;
+    }
+  }
+  MOZ_ASSERT(aStart < aEnd);
+
+  uint32_t startExtendedToGraphemeCluster = aStart;
+  constexpr uint32_t kContext = 16;
+  {
+    nsAutoString startText;
+    uint32_t startTextOffset = std::max(aStart, kContext) - kContext;
+    GetTextSubstring(startTextOffset, std::min(aStart + kContext, TextLength()),
+                     startText);
+    intl::GraphemeClusterBreakIteratorUtf16 iter(startText);
+    while (Maybe<uint32_t> i = iter.Next()) {
+      if (startTextOffset + *i > aStart) {
+        break;
+      }
+      startExtendedToGraphemeCluster = startTextOffset + *i;
+    }
+  }
+  uint32_t endExtendedToGraphemeCluster = aEnd;
+  {
+    nsAutoString endText;
+    uint32_t endTextOffset = std::max(aEnd, kContext) - kContext;
+    GetTextSubstring(endTextOffset, std::min(aEnd + kContext, TextLength()),
+                     endText);
+    intl::GraphemeClusterBreakIteratorUtf16 iter(endText);
+    while (Maybe<uint32_t> i = iter.Next()) {
+      if (endTextOffset + *i >= aEnd) {
+        endExtendedToGraphemeCluster = endTextOffset + *i;
+        break;
+      }
+    }
+  }
+
+  RefPtr<nsPresContext> presContext = mText->OwnerDoc()->GetPresContext();
+
+  CharacterBoundsUpdateEventInit eventOptions;
+  eventOptions.mBubbles = false;
+  eventOptions.mCancelable = true;
+  eventOptions.mRangeStart = startExtendedToGraphemeCluster;
+  eventOptions.mRangeEnd = endExtendedToGraphemeCluster;
+  {
+    AutoRestore restore(mExpectingCharacterBounds);
+    mExpectingCharacterBounds = true;
+    RefPtr event = CharacterBoundsUpdateEvent::Constructor(
+        this, u"characterboundsupdate"_ns, eventOptions);
+    event->SetTrusted(true);
+    DispatchEvent(*event);
+  }
+  aRects.SetCapacity(aEnd - aStart);
+  for (uint32_t i = aStart; i < aEnd; i++) {
+    CheckedUint32 indexInCodepointRects =
+        CheckedUint32(i) - mCodepointRectsStartIndex;
+    if (!indexInCodepointRects.isValid() ||
+        indexInCodepointRects.value() >= mCodepointRects.Length()) {
+      return NS_ERROR_FAILURE;
+    }
+    Rect cssRect = mCodepointRects[indexInCodepointRects.value()];
+    LayoutDeviceIntRect deviceRect =
+        ToRootRelativeDeviceRect(*presContext, cssRect);
+    aRects.AppendElement(deviceRect);
+  }
+  if (collapse != CollapseDirection::None) {
+    MOZ_ASSERT(aRects.Length() == 1);
+    if (aRects.IsEmpty()) {
+      return NS_ERROR_FAILURE;
+    }
+    LayoutDeviceIntRect& rect = aRects[0];
+    InlineDir dir = WritingMode().GetInlineDir();
+    if (collapse == CollapseDirection::Next) {
+      dir = ReverseInlineDir(dir);
+    }
+    switch (dir) {
+      case InlineDir::LTR:
+        rect.width = 1;
+        break;
+      case InlineDir::RTL:
+        rect.x += rect.width;
+        rect.width = 1;
+        break;
+      case InlineDir::BTT:
+        rect.y += rect.height;
+        rect.height = 1;
+        break;
+      case InlineDir::TTB:
+        rect.height = 1;
+        break;
+    }
+  }
+  return NS_OK;
+}
+
+Maybe<LayoutDeviceIntRect> EditContext::GetControlBounds() const {
+  nsPresContext* presContext = mText->OwnerDoc()->GetPresContext();
+  if (!presContext || !mControlBounds) {
+    return Nothing();
+  }
+  return Some(ToRootRelativeDeviceRect(*presContext, *mControlBounds));
+}
+
+Maybe<LayoutDeviceIntRect> EditContext::GetSelectionBounds() const {
+  nsPresContext* presContext = mText->OwnerDoc()->GetPresContext();
+  if (!presContext || !mSelectionBounds) {
+    return Nothing();
+  }
+  return Some(ToRootRelativeDeviceRect(*presContext, *mSelectionBounds));
+}
+
+LayoutDeviceIntRect EditContext::FallbackBounds() const {
+  if (Maybe<LayoutDeviceIntRect> bounds = GetSelectionBounds()) {
+    return *bounds;
+  }
+  if (Maybe<LayoutDeviceIntRect> bounds = GetControlBounds()) {
+    return *bounds;
+  }
+  if (NS_WARN_IF(!mAssociatedElement) ||
+      NS_WARN_IF(!mAssociatedElement->GetPrimaryFrame())) {
+    return {0, 0, 1, 1};
+  }
+  nsPresContext* presContext =
+      mAssociatedElement->GetPrimaryFrame()->PresContext();
+  nsRect appUnitsRect = mAssociatedElement->GetPrimaryFrame()->GetRect();
+  return ToRootRelativeDeviceRect(*presContext, appUnitsRect);
+}
+
+}  

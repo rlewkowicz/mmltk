@@ -1,0 +1,74 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_dom_Record_h
+#define mozilla_dom_Record_h
+
+#include <utility>
+
+#include "nsHashKeys.h"
+#include "nsString.h"
+#include "nsTArray.h"
+#include "nsTHashtable.h"
+
+namespace mozilla::dom {
+
+namespace binding_detail {
+template <typename KeyType, typename ValueType>
+class RecordEntry {
+ public:
+  RecordEntry() = default;
+
+  RecordEntry(RecordEntry<KeyType, ValueType>&& aOther)
+      : mKey(std::move(aOther.mKey)), mValue(std::move(aOther.mValue)) {}
+
+  KeyType mKey;
+  ValueType mValue;
+};
+
+template <typename KeyType>
+class RecordEntry<KeyType, JSObject*> {
+ public:
+  RecordEntry() : mValue(nullptr) {}
+
+  RecordEntry(RecordEntry<KeyType, JSObject*>&& aOther)
+      : mKey(std::move(aOther.mKey)), mValue(std::move(aOther.mValue)) {}
+
+  KeyType mKey;
+  JSObject* mValue;
+};
+
+}  
+
+template <typename KeyType, typename ValueType>
+class Record {
+ public:
+  typedef typename binding_detail::RecordEntry<KeyType, ValueType> EntryType;
+  typedef Record<KeyType, ValueType> SelfType;
+
+  Record() = default;
+
+  Record(SelfType&& aOther) : mEntries(std::move(aOther.mEntries)) {}
+
+  const nsTArray<EntryType>& Entries() const { return mEntries; }
+
+  nsTArray<EntryType>& Entries() { return mEntries; }
+
+ private:
+  nsTArray<EntryType> mEntries;
+};
+
+}  
+
+template <typename K, typename V>
+class nsDefaultComparator<mozilla::dom::binding_detail::RecordEntry<K, V>, K> {
+ public:
+  bool Equals(const mozilla::dom::binding_detail::RecordEntry<K, V>& aEntry,
+              const K& aKey) const {
+    return aEntry.mKey == aKey;
+  }
+};
+
+#endif  // mozilla_dom_Record_h

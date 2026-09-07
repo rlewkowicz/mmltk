@@ -1,0 +1,67 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_CONTAINERPARSER_H_
+#define MOZILLA_CONTAINERPARSER_H_
+
+#include "MediaContainerType.h"
+#include "MediaResource.h"
+#include "MediaResult.h"
+#include "MediaSpan.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/UniquePtr.h"
+
+namespace mozilla {
+
+class MediaByteBuffer;
+class SourceBufferResource;
+
+DDLoggedTypeDeclName(ContainerParser);
+
+class ContainerParser : public DecoderDoctorLifeLogger<ContainerParser> {
+ public:
+  explicit ContainerParser(const MediaContainerType& aType);
+  virtual ~ContainerParser();
+
+  virtual MediaResult IsInitSegmentPresent(const MediaSpan& aData);
+
+  virtual MediaResult IsMediaSegmentPresent(const MediaSpan& aData);
+
+  virtual MediaResult ParseStartAndEndTimestamps(const MediaSpan& aData,
+                                                 media::TimeUnit& aStart,
+                                                 media::TimeUnit& aEnd);
+
+  bool TimestampsFuzzyEqual(int64_t aLhs, int64_t aRhs);
+
+  virtual int64_t GetRoundingError();
+
+  MediaByteBuffer* InitData();
+
+  bool HasInitData() { return mHasInitData; }
+
+  bool HasCompleteInitData();
+  MediaByteRange InitSegmentRange();
+  MediaByteRange MediaHeaderRange();
+  MediaByteRange MediaSegmentRange();
+
+  static UniquePtr<ContainerParser> CreateForMIMEType(
+      const MediaContainerType& aType);
+
+  const MediaContainerType& ContainerType() const { return mType; }
+
+ protected:
+  RefPtr<MediaByteBuffer> mInitData;
+  RefPtr<SourceBufferResource> mResource;
+  bool mHasInitData;
+  uint64_t mTotalParsed;
+  uint64_t mGlobalOffset;
+  MediaByteRange mCompleteInitSegmentRange;
+  MediaByteRange mCompleteMediaHeaderRange;
+  MediaByteRange mCompleteMediaSegmentRange;
+  const MediaContainerType mType;
+};
+
+}  
+
+#endif /* MOZILLA_CONTAINERPARSER_H_ */

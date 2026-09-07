@@ -1,0 +1,62 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef intl_components_DateIntervalFormat_h_
+#define intl_components_DateIntervalFormat_h_
+
+#include "mozilla/intl/Calendar.h"
+#include "mozilla/intl/DateTimePart.h"
+#include "mozilla/intl/ICU4CGlue.h"
+#include "mozilla/intl/ICUError.h"
+#include "mozilla/Result.h"
+#include "mozilla/Span.h"
+#include "mozilla/UniquePtr.h"
+
+#include "unicode/udateintervalformat.h"
+#include "unicode/utypes.h"
+
+namespace mozilla::intl {
+class Calendar;
+class DateTimeFormat;
+
+using AutoFormattedDateInterval =
+    AutoFormattedResult<UFormattedDateInterval, udtitvfmt_openResult,
+                        udtitvfmt_resultAsValue, udtitvfmt_closeResult>;
+
+class DateIntervalFormat final {
+ public:
+  static Result<UniquePtr<DateIntervalFormat>, ICUError> TryCreate(
+      Span<const char> aLocale, Span<const char16_t> aSkeleton,
+      Span<const char16_t> aTimeZone);
+
+  ~DateIntervalFormat();
+
+  ICUResult TryFormatCalendar(const Calendar& aStart, const Calendar& aEnd,
+                              AutoFormattedDateInterval& aFormatted,
+                              bool* aPracticallyEqual) const;
+
+  ICUResult TryFormatDateTime(double aStart, double aEnd,
+                              AutoFormattedDateInterval& aFormatted,
+                              bool* aPracticallyEqual) const;
+
+  ICUResult TryFormatDateTime(double aStart, double aEnd,
+                              const DateTimeFormat* aDateTimeFormat,
+                              AutoFormattedDateInterval& aFormatted,
+                              bool* aPracticallyEqual) const;
+
+  ICUResult TryFormattedToParts(const AutoFormattedDateInterval& aFormatted,
+                                DateTimePartVector& aParts) const;
+
+ private:
+  DateIntervalFormat() = delete;
+  explicit DateIntervalFormat(UDateIntervalFormat* aDif)
+      : mDateIntervalFormat(aDif) {}
+  DateIntervalFormat(const DateIntervalFormat&) = delete;
+  DateIntervalFormat& operator=(const DateIntervalFormat&) = delete;
+
+  ICUPointer<UDateIntervalFormat> mDateIntervalFormat =
+      ICUPointer<UDateIntervalFormat>(nullptr);
+};
+}  
+
+#endif

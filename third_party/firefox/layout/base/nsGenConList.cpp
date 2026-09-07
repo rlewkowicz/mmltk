@@ -1,0 +1,201 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "nsGenConList.h"
+
+#include "nsContentUtils.h"
+#include "nsIContent.h"
+#include "nsIFrame.h"
+
+void nsGenConNode::CheckFrameAssertions() {
+  NS_ASSERTION(mContentIndex < int32_t(mPseudoFrame->StyleContent()
+                                           ->NonAltContentItems()
+                                           .Length()) ||
+                   mContentIndex == 0,
+               "index out of range");
+
+  NS_ASSERTION(mContentIndex < 0 ||
+                   mPseudoFrame->Style()->GetPseudoType() ==
+                       mozilla::PseudoStyleType::Before ||
+                   mPseudoFrame->Style()->GetPseudoType() ==
+                       mozilla::PseudoStyleType::After ||
+                   mPseudoFrame->Style()->GetPseudoType() ==
+                       mozilla::PseudoStyleType::Marker ||
+                   mPseudoFrame->Style()->GetPseudoType() ==
+                       mozilla::PseudoStyleType::PickerIcon,
+               "not CSS generated content and not counter change");
+  NS_ASSERTION(mContentIndex < 0 ||
+                   mPseudoFrame->HasAnyStateBits(NS_FRAME_GENERATED_CONTENT),
+               "not generated content and not counter change");
+}
+
+void nsGenConList::Clear() {
+  mNodes.Clear();
+  while (nsGenConNode* node = mList.popFirst()) {
+    delete node;
+  }
+  mSize = 0;
+  mLastInserted = nullptr;
+}
+
+bool nsGenConList::DestroyNodesFor(nsIFrame* aFrame) {
+  nsGenConNode* node = mNodes.Extract(aFrame).valueOr(nullptr);
+  if (!node) {
+    return false;
+  }
+  MOZ_ASSERT(node->mPseudoFrame == aFrame);
+
+  while (node && node->mPseudoFrame == aFrame) {
+    nsGenConNode* nextNode = Next(node);
+    Destroy(node);
+    node = nextNode;
+  }
+
+  mLastInserted = nullptr;
+
+  return true;
+}
+
+inline int32_t PseudoCompareType(nsIFrame* aFrame, nsIContent** aContent) {
+  auto pseudo = aFrame->Style()->GetPseudoType();
+  if (pseudo == mozilla::PseudoStyleType::Marker) {
+    *aContent = aFrame->GetContent()->GetParent();
+    return -2;
+  }
+  if (pseudo == mozilla::PseudoStyleType::Before) {
+    *aContent = aFrame->GetContent()->GetParent();
+    return -1;
+  }
+  if (pseudo == mozilla::PseudoStyleType::After) {
+    *aContent = aFrame->GetContent()->GetParent();
+    return 1;
+  }
+  *aContent = aFrame->GetContent();
+  return 0;
+}
+
+bool nsGenConList::NodeAfter(const nsGenConNode* aNode1,
+                             const nsGenConNode* aNode2) {
+  nsIFrame* frame1 = aNode1->mPseudoFrame;
+  nsIFrame* frame2 = aNode2->mPseudoFrame;
+  if (frame1 == frame2) {
+    NS_ASSERTION(aNode2->mContentIndex != aNode1->mContentIndex, "identical");
+    return aNode1->mContentIndex > aNode2->mContentIndex;
+  }
+  nsIContent* content1;
+  nsIContent* content2;
+  int32_t pseudoType1 = PseudoCompareType(frame1, &content1);
+  int32_t pseudoType2 = PseudoCompareType(frame2, &content2);
+  if (content1 == content2) {
+    NS_ASSERTION(pseudoType1 != pseudoType2, "identical");
+    if (pseudoType1 == 0 || pseudoType2 == 0) {
+      return pseudoType2 == 0;
+    }
+    return pseudoType1 > pseudoType2;
+  }
+
+  content1 = frame1->GetContent();
+  content2 = frame2->GetContent();
+
+  int32_t cmp = nsContentUtils::CompareTreePosition<TreeKind::Flat>(
+      content1, content2,  nullptr);
+  MOZ_ASSERT(cmp != 0, "same content, different frames");
+  return cmp > 0;
+}
+
+nsGenConNode* nsGenConList::BinarySearch(
+    const mozilla::FunctionRef<bool(nsGenConNode*)>& aIsAfter) {
+  if (mList.isEmpty()) {
+    return nullptr;
+  }
+
+  uint32_t first = 0, last = mSize - 1;
+
+  nsGenConNode* curNode = mList.getLast();
+  uint32_t curIndex = mSize - 1;
+
+  while (first != last) {
+    uint32_t test = first + (last - first) / 2;
+    if (last == curIndex) {
+      for (; curIndex != test; --curIndex) {
+        curNode = Prev(curNode);
+      }
+    } else {
+      for (; curIndex != test; ++curIndex) {
+        curNode = Next(curNode);
+      }
+    }
+
+    if (aIsAfter(curNode)) {
+      first = test + 1;
+      ++curIndex;
+      curNode = Next(curNode);
+    } else {
+      last = test;
+    }
+  }
+
+  return curNode;
+}
+
+void nsGenConList::Insert(nsGenConNode* aNode) {
+  if (mList.isEmpty() || NodeAfter(aNode, mList.getLast())) {
+    mList.insertBack(aNode);
+  } else if (mLastInserted && mLastInserted != mList.getLast() &&
+             NodeAfter(aNode, mLastInserted) &&
+             NodeAfter(Next(mLastInserted), aNode)) {
+    mLastInserted->setNext(aNode);
+  } else {
+    auto IsAfter = [aNode](nsGenConNode* curNode) {
+      return NodeAfter(aNode, curNode);
+    };
+    auto* insertionNode = BinarySearch(IsAfter);
+    insertionNode->setPrevious(aNode);
+  }
+  ++mSize;
+
+  mLastInserted = aNode;
+
+  if (IsFirst(aNode) || Prev(aNode)->mPseudoFrame != aNode->mPseudoFrame) {
+#ifdef DEBUG
+    if (nsGenConNode* oldFrameFirstNode = mNodes.Get(aNode->mPseudoFrame)) {
+      MOZ_ASSERT(Next(aNode) == oldFrameFirstNode,
+                 "oldFrameFirstNode should now be immediately after "
+                 "the newly-inserted one.");
+    } else {
+      if (!IsFirst(aNode) || !IsLast(aNode)) {
+        nsGenConNode* nextNode = Next(aNode);
+        MOZ_ASSERT(!nextNode || nextNode->mPseudoFrame != aNode->mPseudoFrame,
+                   "There shouldn't exist any node for this frame.");
+        if (!IsFirst(aNode) && !IsLast(aNode)) {
+          MOZ_ASSERT(Prev(aNode)->mPseudoFrame != nextNode->mPseudoFrame,
+                     "New node should not break contiguity of nodes of "
+                     "the same frame.");
+        }
+      }
+    }
+#endif
+    mNodes.InsertOrUpdate(aNode->mPseudoFrame, aNode);
+  } else {
+#ifdef DEBUG
+    nsGenConNode* frameFirstNode = mNodes.Get(aNode->mPseudoFrame);
+    MOZ_ASSERT(frameFirstNode, "There should exist node map for the frame.");
+    for (nsGenConNode* curNode = Prev(aNode); curNode != frameFirstNode;
+         curNode = Prev(curNode)) {
+      MOZ_ASSERT(curNode->mPseudoFrame == aNode->mPseudoFrame,
+                 "Every node between frameFirstNode and the new node inserted "
+                 "should refer to the same frame.");
+      MOZ_ASSERT(!IsFirst(curNode),
+                 "The newly-inserted node should be in a contiguous run after "
+                 "frameFirstNode, thus frameFirstNode should be reached before "
+                 "the first node of mList.");
+    }
+#endif
+  }
+
+  NS_ASSERTION(IsFirst(aNode) || NodeAfter(aNode, Prev(aNode)),
+               "sorting error");
+  NS_ASSERTION(IsLast(aNode) || NodeAfter(Next(aNode), aNode), "sorting error");
+}

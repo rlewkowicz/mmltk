@@ -1,0 +1,235 @@
+// Copyright 2013 The ANGLE Project Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(GLSLANG_SHADERVARS_H_)
+#define GLSLANG_SHADERVARS_H_
+
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace sh
+{
+typedef unsigned int GLenum;
+
+enum InterpolationType
+{
+    INTERPOLATION_SMOOTH,
+    INTERPOLATION_FLAT,
+    INTERPOLATION_NOPERSPECTIVE,
+    INTERPOLATION_CENTROID,
+    INTERPOLATION_SAMPLE,
+    INTERPOLATION_NOPERSPECTIVE_CENTROID,
+    INTERPOLATION_NOPERSPECTIVE_SAMPLE
+};
+
+const char *InterpolationTypeToString(InterpolationType type);
+
+bool InterpolationTypesMatch(InterpolationType a, InterpolationType b);
+
+enum BlockLayoutType
+{
+    BLOCKLAYOUT_STANDARD,
+    BLOCKLAYOUT_STD140 = BLOCKLAYOUT_STANDARD,
+    BLOCKLAYOUT_STD430,  
+    BLOCKLAYOUT_PACKED,
+    BLOCKLAYOUT_SHARED
+};
+
+const char *BlockLayoutTypeToString(BlockLayoutType type);
+
+enum class BlockType
+{
+    kBlockUniform,
+    kBlockBuffer,
+};
+
+const char *BlockTypeToString(BlockType type);
+
+struct ShaderVariable
+{
+    ShaderVariable();
+    ShaderVariable(GLenum typeIn);
+    ShaderVariable(GLenum typeIn, unsigned int arraySizeIn);
+    ~ShaderVariable();
+    ShaderVariable(const ShaderVariable &other);
+    ShaderVariable &operator=(const ShaderVariable &other);
+    bool operator==(const ShaderVariable &other) const;
+    bool operator!=(const ShaderVariable &other) const { return !operator==(other); }
+
+    bool isArrayOfArrays() const { return arraySizes.size() >= 2u; }
+    bool isArray() const { return !arraySizes.empty(); }
+    unsigned int getArraySizeProduct() const;
+    unsigned int getInnerArraySizeProduct() const;
+
+    unsigned int getOutermostArraySize() const { return isArray() ? arraySizes.back() : 0; }
+    void setArraySize(unsigned int size);
+
+    void indexIntoArray(unsigned int arrayIndex);
+
+    unsigned int getNestedArraySize(unsigned int arrayNestingIndex) const;
+
+    unsigned int getBasicTypeElementCount() const;
+
+    unsigned int getExternalSize() const;
+
+    bool isStruct() const { return !fields.empty(); }
+    const std::string &getStructName() const { return structOrBlockName; }
+    void setStructName(const std::string &newName) { structOrBlockName = newName; }
+
+    bool findInfoByMappedName(const std::string &mappedFullName,
+                              const ShaderVariable **leafVar,
+                              std::string *originalFullName) const;
+
+    const sh::ShaderVariable *findField(const std::string &fullName, uint32_t *fieldIndexOut) const;
+
+    bool isBuiltIn() const;
+    bool isEmulatedBuiltIn() const;
+
+    int parentArrayIndex() const
+    {
+        return hasParentArrayIndex() ? flattenedOffsetInParentArrays : 0;
+    }
+
+    int getFlattenedOffsetInParentArrays() const { return flattenedOffsetInParentArrays; }
+    void setParentArrayIndex(int indexIn) { flattenedOffsetInParentArrays = indexIn; }
+
+    bool hasParentArrayIndex() const { return flattenedOffsetInParentArrays != -1; }
+
+    void resetEffectiveLocation();
+    void updateEffectiveLocation(const sh::ShaderVariable &parent);
+
+    bool isSameUniformAtLinkTime(const ShaderVariable &other) const;
+
+    bool isSameInterfaceBlockFieldAtLinkTime(const ShaderVariable &other) const;
+
+    bool isSameVaryingAtLinkTime(const ShaderVariable &other, int shaderVersion) const;
+    bool isSameVaryingAtLinkTime(const ShaderVariable &other) const;
+
+    bool isSameNameAtLinkTime(const ShaderVariable &other) const;
+
+
+    GLenum type;
+    GLenum precision;
+    std::string name;
+    std::string mappedName;
+
+    std::vector<unsigned int> arraySizes;
+
+    bool staticUse;
+    bool active;
+    std::vector<ShaderVariable> fields;
+    std::string structOrBlockName;
+    std::string mappedStructOrBlockName;
+
+    bool isRowMajorLayout;
+
+    int location;
+
+    bool hasImplicitLocation;
+
+    int binding;
+    GLenum imageUnitFormat;
+    int offset;
+    bool rasterOrdered;
+    bool readonly;
+    bool writeonly;
+
+    bool isFragmentInOut;
+
+    int index;
+
+    bool yuv;
+
+    InterpolationType interpolation;
+    bool isInvariant;
+    bool isShaderIOBlock;
+    bool isPatch;
+
+    bool texelFetchStaticUse;
+
+    uint32_t id;
+
+    bool isFloat16;
+
+  protected:
+    bool isSameVariableAtLinkTime(const ShaderVariable &other,
+                                  bool matchPrecision,
+                                  bool matchName) const;
+
+
+    int flattenedOffsetInParentArrays;
+};
+
+using Uniform             = ShaderVariable;
+using Attribute           = ShaderVariable;
+using OutputVariable      = ShaderVariable;
+using InterfaceBlockField = ShaderVariable;
+using Varying             = ShaderVariable;
+
+struct InterfaceBlock
+{
+    InterfaceBlock();
+    ~InterfaceBlock();
+    InterfaceBlock(const InterfaceBlock &other);
+    InterfaceBlock &operator=(const InterfaceBlock &other);
+
+    std::string fieldPrefix() const;
+    std::string fieldMappedPrefix() const;
+
+    bool isSameInterfaceBlockAtLinkTime(const InterfaceBlock &other) const;
+
+    bool isBuiltIn() const;
+
+    bool isArray() const { return arraySize > 0; }
+    unsigned int elementCount() const { return std::max(1u, arraySize); }
+
+    std::string name;
+    std::string mappedName;
+    std::string instanceName;
+    unsigned int arraySize;
+    BlockLayoutType layout;
+
+    int binding;
+    bool staticUse;
+    bool active;
+    bool isReadOnly;
+    BlockType blockType;
+    std::vector<ShaderVariable> fields;
+
+    uint32_t id;
+};
+
+struct WorkGroupSize
+{
+    inline WorkGroupSize() = default;
+    inline explicit constexpr WorkGroupSize(int initialSize);
+
+    void fill(int fillValue);
+    void setLocalSize(int localSizeX, int localSizeY, int localSizeZ);
+
+    int &operator[](size_t index);
+    int operator[](size_t index) const;
+    size_t size() const;
+
+    bool isWorkGroupSizeMatching(const WorkGroupSize &right) const;
+
+    bool isAnyValueSet() const;
+
+    bool isDeclared() const;
+
+    bool isLocalSizeValid() const;
+
+    int localSizeQualifiers[3];
+};
+
+inline constexpr WorkGroupSize::WorkGroupSize(int initialSize)
+    : localSizeQualifiers{initialSize, initialSize, initialSize}
+{}
+
+}  
+
+#endif

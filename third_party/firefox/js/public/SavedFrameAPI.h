@@ -1,0 +1,77 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef js_SavedFrameAPI_h
+#define js_SavedFrameAPI_h
+
+#include "jstypes.h"  // JS_PUBLIC_API
+
+#include "js/ColumnNumber.h"  // JS::TaggedColumnNumberOneOrigin
+#include "js/TypeDecls.h"
+
+struct JSPrincipals;
+
+namespace JS {
+
+
+enum class SavedFrameResult { Ok, AccessDenied };
+
+enum class SavedFrameSelfHosted { Include, Exclude };
+
+extern JS_PUBLIC_API SavedFrameResult GetSavedFrameSource(
+    JSContext* cx, JSPrincipals* principals, Handle<JSObject*> savedFrame,
+    MutableHandle<JSString*> sourcep,
+    SavedFrameSelfHosted selfHosted = SavedFrameSelfHosted::Include);
+
+extern JS_PUBLIC_API SavedFrameResult GetSavedFrameSourceId(
+    JSContext* cx, JSPrincipals* principals, Handle<JSObject*> savedFrame,
+    uint32_t* sourceIdp,
+    SavedFrameSelfHosted selfHosted = SavedFrameSelfHosted::Include);
+
+extern JS_PUBLIC_API SavedFrameResult GetSavedFrameLine(
+    JSContext* cx, JSPrincipals* principals, Handle<JSObject*> savedFrame,
+    uint32_t* linep,
+    SavedFrameSelfHosted selfHosted = SavedFrameSelfHosted::Include);
+
+extern JS_PUBLIC_API SavedFrameResult GetSavedFrameColumn(
+    JSContext* cx, JSPrincipals* principals, Handle<JSObject*> savedFrame,
+    JS::TaggedColumnNumberOneOrigin* columnp,
+    SavedFrameSelfHosted selfHosted = SavedFrameSelfHosted::Include);
+
+extern JS_PUBLIC_API SavedFrameResult GetSavedFrameFunctionDisplayName(
+    JSContext* cx, JSPrincipals* principals, Handle<JSObject*> savedFrame,
+    MutableHandle<JSString*> namep,
+    SavedFrameSelfHosted selfHosted = SavedFrameSelfHosted::Include);
+
+extern JS_PUBLIC_API SavedFrameResult GetSavedFrameAsyncCause(
+    JSContext* cx, JSPrincipals* principals, Handle<JSObject*> savedFrame,
+    MutableHandle<JSString*> asyncCausep,
+    SavedFrameSelfHosted selfHosted = SavedFrameSelfHosted::Include);
+
+extern JS_PUBLIC_API SavedFrameResult GetSavedFrameAsyncParent(
+    JSContext* cx, JSPrincipals* principals, Handle<JSObject*> savedFrame,
+    MutableHandle<JSObject*> asyncParentp,
+    SavedFrameSelfHosted selfHosted = SavedFrameSelfHosted::Include);
+
+extern JS_PUBLIC_API SavedFrameResult GetSavedFrameParent(
+    JSContext* cx, JSPrincipals* principals, Handle<JSObject*> savedFrame,
+    MutableHandle<JSObject*> parentp,
+    SavedFrameSelfHosted selfHosted = SavedFrameSelfHosted::Include);
+
+JS_PUBLIC_API JSObject* ConvertSavedFrameToPlainObject(
+    JSContext* cx, JS::HandleObject savedFrame,
+    JS::SavedFrameSelfHosted selfHosted);
+
+}  
+
+namespace js {
+
+extern JS_PUBLIC_API JSObject* GetFirstSubsumedSavedFrame(
+    JSContext* cx, JSPrincipals* principals, JS::Handle<JSObject*> savedFrame,
+    JS::SavedFrameSelfHosted selfHosted);
+
+}  
+
+#endif /* js_SavedFrameAPI_h */

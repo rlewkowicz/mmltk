@@ -1,0 +1,1306 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef WSRunScanner_h
+#define WSRunScanner_h
+
+#include "EditorBase.h"
+#include "EditorForwards.h"
+#include "EditorDOMPoint.h"   // for EditorDOMPoint
+#include "EditorLineBreak.h"  // for EditorLineBreakBase
+#include "HTMLEditor.h"
+#include "HTMLEditUtils.h"
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/Result.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/HTMLBRElement.h"
+#include "mozilla/dom/Text.h"
+#include "nsCOMPtr.h"
+#include "nsIContent.h"
+
+namespace mozilla {
+
+class MOZ_STACK_CLASS WSScanResult final {
+ private:
+  using Element = dom::Element;
+  using HTMLBRElement = dom::HTMLBRElement;
+  using Text = dom::Text;
+
+  enum class WSType : uint8_t {
+    NotInitialized,
+    UnexpectedError,
+    InUncomposedDoc,
+    LeadingWhiteSpaces,
+    TrailingWhiteSpaces,
+    CollapsibleWhiteSpaces,
+    NonCollapsibleCharacters,
+    EmptyInlineContainerElement,
+    SpecialContent,
+    BRElement,
+    PreformattedLineBreak,
+    OtherBlockBoundary,
+    CurrentBlockBoundary,
+    InlineEditingHostBoundary,
+  };
+
+  friend std::ostream& operator<<(std::ostream& aStream, const WSType& aType) {
+    switch (aType) {
+      case WSType::NotInitialized:
+        return aStream << "WSType::NotInitialized";
+      case WSType::UnexpectedError:
+        return aStream << "WSType::UnexpectedError";
+      case WSType::InUncomposedDoc:
+        return aStream << "WSType::InUncomposedDoc";
+      case WSType::LeadingWhiteSpaces:
+        return aStream << "WSType::LeadingWhiteSpaces";
+      case WSType::TrailingWhiteSpaces:
+        return aStream << "WSType::TrailingWhiteSpaces";
+      case WSType::CollapsibleWhiteSpaces:
+        return aStream << "WSType::CollapsibleWhiteSpaces";
+      case WSType::NonCollapsibleCharacters:
+        return aStream << "WSType::NonCollapsibleCharacters";
+      case WSType::EmptyInlineContainerElement:
+        return aStream << "WSType::EmptyInlineContainerElement";
+      case WSType::SpecialContent:
+        return aStream << "WSType::SpecialContent";
+      case WSType::BRElement:
+        return aStream << "WSType::BRElement";
+      case WSType::PreformattedLineBreak:
+        return aStream << "WSType::PreformattedLineBreak";
+      case WSType::OtherBlockBoundary:
+        return aStream << "WSType::OtherBlockBoundary";
+      case WSType::CurrentBlockBoundary:
+        return aStream << "WSType::CurrentBlockBoundary";
+      case WSType::InlineEditingHostBoundary:
+        return aStream << "WSType::InlineEditingHostBoundary";
+    }
+    return aStream << "<Illegal value>";
+  }
+
+  friend class WSRunScanner;  
+
+  explicit WSScanResult(WSType aReason) : mReason(aReason) {
+    MOZ_ASSERT(mReason == WSType::UnexpectedError ||
+               mReason == WSType::NotInitialized);
+  }
+
+ public:
+  WSScanResult() = delete;
+  enum class ScanDirection : bool { Backward, Forward };
+  WSScanResult(const WSRunScanner& aScanner, ScanDirection aScanDirection,
+               nsIContent& aContent, WSType aReason)
+      : mContent(&aContent), mReason(aReason), mDirection(aScanDirection) {
+    MOZ_ASSERT(aReason != WSType::CollapsibleWhiteSpaces &&
+               aReason != WSType::NonCollapsibleCharacters &&
+               aReason != WSType::PreformattedLineBreak);
+    AssertIfInvalidData(aScanner);
+    MaybeSetEditingHost(aScanner);
+  }
+  WSScanResult(const WSRunScanner& aScanner, ScanDirection aScanDirection,
+               const EditorDOMPoint& aPoint, WSType aReason)
+      : mContent(aPoint.GetContainerAs<nsIContent>()),
+        mOffset(Some(aPoint.Offset())),
+        mReason(aReason),
+        mDirection(aScanDirection) {
+    AssertIfInvalidData(aScanner);
+    MaybeSetEditingHost(aScanner);
+  }
+
+  WSScanResult(WSScanResult&& aResult, EditorLineBreak&& aIgnoredLineBreak,
+               const Element& aEditingHost)
+      : WSScanResult(std::forward<WSScanResult>(aResult)) {
+    MOZ_ASSERT(ReachedBlockBoundary());
+    mIgnoredLineBreak.emplace(std::forward<EditorLineBreak>(aIgnoredLineBreak));
+    Element* const contentEditingHost = mContent->GetEditingHost();
+    if (contentEditingHost && contentEditingHost != &aEditingHost) {
+      mEditingHost = const_cast<Element*>(&aEditingHost);
+    }
+  }
+
+  static WSScanResult Error() { return WSScanResult(WSType::UnexpectedError); }
+
+  void AssertIfInvalidData(const WSRunScanner& aScanner) const;
+
+  bool Failed() const {
+    return mReason == WSType::NotInitialized ||
+           mReason == WSType::UnexpectedError;
+  }
+
+  nsIContent* GetContent() const { return mContent; }
+
+  [[nodiscard]] bool ContentIsElement() const {
+    return mContent && mContent->IsElement();
+  }
+
+  [[nodiscard]] bool ContentIsText() const {
+    return mContent && mContent->IsText();
+  }
+
+  MOZ_NEVER_INLINE_DEBUG Element* ElementPtr() const {
+    MOZ_DIAGNOSTIC_ASSERT(mContent->IsElement());
+    return mContent->AsElement();
+  }
+  MOZ_NEVER_INLINE_DEBUG HTMLBRElement* BRElementPtr() const {
+    MOZ_DIAGNOSTIC_ASSERT(mContent->IsHTMLElement(nsGkAtoms::br));
+    return static_cast<HTMLBRElement*>(mContent.get());
+  }
+  MOZ_NEVER_INLINE_DEBUG Text* TextPtr() const {
+    MOZ_DIAGNOSTIC_ASSERT(mContent->IsText());
+    return mContent->AsText();
+  }
+
+  template <typename EditorLineBreakType>
+  MOZ_NEVER_INLINE_DEBUG EditorLineBreakType CreateEditorLineBreak() const {
+    if (ReachedBRElement()) {
+      return EditorLineBreakType(*BRElementPtr());
+    }
+    if (ReachedPreformattedLineBreak()) {
+      MOZ_ASSERT_IF(mDirection == ScanDirection::Backward, *mOffset > 0);
+      return EditorLineBreakType(*TextPtr(),
+                                 mDirection == ScanDirection::Forward
+                                     ? mOffset.valueOr(0)
+                                     : std::max(mOffset.valueOr(1), 1u) - 1);
+    }
+    MOZ_CRASH("Didn't reach a line break");
+    return EditorLineBreakType(*BRElementPtr());
+  }
+
+  [[nodiscard]] bool ContentIsEditable() const {
+    return mContent && HTMLEditUtils::IsSimplyEditableNode(*mContent);
+  }
+
+  [[nodiscard]] bool ContentIsRemovable() const {
+    return mContent && HTMLEditUtils::IsRemovableNode(*mContent);
+  }
+
+  [[nodiscard]] bool ContentIsEditableRoot() const {
+    return ContentIsElement() &&
+           HTMLEditUtils::ElementIsEditableRoot(*ElementPtr());
+  }
+
+  [[nodiscard]] bool ReachedOutsideEditingHost() const {
+    return !!mEditingHost;
+  }
+
+  MOZ_NEVER_INLINE_DEBUG uint32_t Offset_Deprecated() const {
+    NS_ASSERTION(mOffset.isSome(), "Retrieved non-meaningful offset");
+    return mOffset.valueOr(0);
+  }
+
+  template <typename EditorDOMPointType>
+  EditorDOMPointType Point_Deprecated() const {
+    NS_ASSERTION(mOffset.isSome(), "Retrieved non-meaningful point");
+    return EditorDOMPointType(mContent, mOffset.valueOr(0));
+  }
+
+  template <typename EditorDOMPointType>
+  EditorDOMPointType PointAtReachedContent() const {
+    MOZ_ASSERT(mContent);
+    switch (mReason) {
+      case WSType::CollapsibleWhiteSpaces:
+      case WSType::NonCollapsibleCharacters:
+      case WSType::PreformattedLineBreak:
+        MOZ_DIAGNOSTIC_ASSERT(mOffset.isSome());
+        return mDirection == ScanDirection::Forward
+                   ? EditorDOMPointType(mContent, mOffset.valueOr(0))
+                   : EditorDOMPointType(mContent,
+                                        std::max(mOffset.valueOr(1), 1u) - 1);
+      default:
+        MOZ_ASSERT_IF(mContent == mEditingHost, !ReachedCurrentBlockBoundary());
+        MOZ_ASSERT_IF(mContent == mEditingHost,
+                      !ReachedInlineEditingHostBoundary());
+        return EditorDOMPointType(mContent);
+    }
+  }
+
+  template <typename EditorDOMPointType>
+  EditorDOMPointType PointAtReachedContentOrEditingHostBoundary() const {
+    if (mEditingHost) {
+      MOZ_ASSERT(mContent);
+      MOZ_ASSERT_IF(mContent == mEditingHost, !ReachedCurrentBlockBoundary());
+      MOZ_ASSERT_IF(mContent == mEditingHost,
+                    !ReachedInlineEditingHostBoundary());
+      return mDirection == ScanDirection::Forward
+                 ? EditorDOMPointType::AtEndOf(*mEditingHost)
+                 : EditorDOMPointType(mEditingHost, 0u);
+    }
+    return PointAtReachedContent<EditorDOMPointType>();
+  }
+
+  template <typename EditorDOMPointType>
+  EditorDOMPointType PointAfterReachedContent() const {
+    MOZ_ASSERT(mContent);
+    MOZ_ASSERT_IF(mContent == mEditingHost, !ReachedCurrentBlockBoundary());
+    MOZ_ASSERT_IF(mContent == mEditingHost,
+                  !ReachedInlineEditingHostBoundary());
+    return PointAtReachedContent<EditorDOMPointType>()
+        .template NextPointOrAfterContainer<EditorDOMPointType>();
+  }
+
+  template <typename EditorDOMPointType>
+  EditorDOMPointType PointAfterReachedContentOrEditingHostBoundary() const {
+    if (mEditingHost) {
+      MOZ_ASSERT(mContent);
+      MOZ_ASSERT_IF(mContent == mEditingHost, !ReachedCurrentBlockBoundary());
+      MOZ_ASSERT_IF(mContent == mEditingHost,
+                    !ReachedInlineEditingHostBoundary());
+      return mDirection == ScanDirection::Forward
+                 ? EditorDOMPointType::AtEndOf(*mEditingHost)
+                 : EditorDOMPointType(mEditingHost, 0u);
+    }
+    return PointAfterReachedContent<EditorDOMPointType>();
+  }
+
+  template <typename EditorDOMPointType>
+  EditorDOMPointType PointAfterReachedContentNode() const {
+    MOZ_ASSERT(mContent);
+    MOZ_ASSERT_IF(mContent == mEditingHost, !ReachedCurrentBlockBoundary());
+    MOZ_ASSERT_IF(mContent == mEditingHost,
+                  !ReachedInlineEditingHostBoundary());
+    return EditorDOMPointType::After(*mContent);
+  }
+
+  template <typename EditorDOMPointType>
+  EditorDOMPointType PointAfterReachedContentNodeOrEditingHostBoundary() const {
+    MOZ_ASSERT(mContent);
+    if (mEditingHost) {
+      MOZ_ASSERT_IF(mContent == mEditingHost, !ReachedCurrentBlockBoundary());
+      MOZ_ASSERT_IF(mContent == mEditingHost,
+                    !ReachedInlineEditingHostBoundary());
+      return mDirection == ScanDirection::Forward
+                 ? EditorDOMPointType::AtEndOf(*mEditingHost)
+                 : EditorDOMPointType(mEditingHost, 0u);
+    }
+    return PointAfterReachedContentNode<EditorDOMPointType>();
+  }
+
+  template <typename EditorDOMPointType>
+  EditorDOMPointType PointAtReachedBlockBoundary() const {
+    MOZ_ASSERT(ReachedBlockBoundary());
+    if (mDirection == ScanDirection::Forward) {
+      return ReachedCurrentBlockBoundary()
+                 ? EditorDOMPointType::AtEndOf(*mContent)
+                 : EditorDOMPointType(mContent);
+    }
+    return ReachedCurrentBlockBoundary() ? EditorDOMPointType(mContent, 0u)
+                                         : EditorDOMPointType::After(*mContent);
+  }
+
+  template <typename EditorDOMPointType>
+  EditorDOMPointType PointAtReachedBlockBoundaryOrEditingHostBoundary() const {
+    MOZ_ASSERT(ReachedBlockBoundary());
+    if (mEditingHost) {
+      return mDirection == ScanDirection::Forward
+                 ? EditorDOMPointType::AtEndOf(*mEditingHost)
+                 : EditorDOMPointType(mEditingHost, 0u);
+    }
+    return PointAtReachedBlockBoundary<EditorDOMPointType>();
+  }
+
+  template <typename EditorDOMPointType>
+  EditorDOMPointType PointAtReachedLineBoundary() const {
+    MOZ_ASSERT(ReachedLineBoundary());
+    if (ReachedBlockBoundary()) {
+      return PointAtReachedBlockBoundary<EditorDOMPointType>();
+    }
+    if (mDirection == ScanDirection::Forward) {
+      return PointAtReachedContent<EditorDOMPointType>();
+    }
+    return PointAfterReachedContent<EditorDOMPointType>();
+  }
+
+  template <typename EditorDOMPointType>
+  EditorDOMPointType PointAtReachedLineBoundaryOrEditingHostBoundary() const {
+    MOZ_ASSERT(ReachedLineBoundary());
+    if (ReachedBlockBoundary()) {
+      return PointAtReachedBlockBoundaryOrEditingHostBoundary<
+          EditorDOMPointType>();
+    }
+    if (mDirection == ScanDirection::Forward) {
+      return PointAtReachedContentOrEditingHostBoundary<EditorDOMPointType>();
+    }
+    return PointAfterReachedContentOrEditingHostBoundary<EditorDOMPointType>();
+  }
+
+  [[nodiscard]] constexpr bool ReachedEmptyInlineContainerElement() const {
+    return mReason == WSType::EmptyInlineContainerElement;
+  }
+  [[nodiscard]] bool ReachedEditableEmptyInlineContainerElement() const {
+    return ReachedEmptyInlineContainerElement() && ContentIsEditable();
+  }
+  [[nodiscard]] bool ReachedRemovableEmptyInlineContainerElement() const {
+    return ReachedEmptyInlineContainerElement() && ContentIsRemovable();
+  }
+
+  [[nodiscard]] bool ReachedVisibleEmptyInlineContainerElement(
+      const nsIContent* aAncestorLimiterToCheckDisplayNone = nullptr) const {
+    return ReachedEmptyInlineContainerElement() &&
+           HTMLEditUtils::IsVisibleElementEvenIfLeafNode(*ElementPtr()) &&
+           !HTMLEditUtils::IsInclusiveAncestorCSSDisplayNone(
+               *ElementPtr(), aAncestorLimiterToCheckDisplayNone);
+  }
+  [[nodiscard]] bool ReachedEditableEmptyInlineContainerElement(
+      const nsIContent* aAncestorLimiterToCheckDisplayNone = nullptr) const {
+    return ReachedVisibleEmptyInlineContainerElement(
+               aAncestorLimiterToCheckDisplayNone) &&
+           ContentIsEditable();
+  }
+  [[nodiscard]] bool ReachedRemovableEmptyInlineContainerElement(
+      const nsIContent* aAncestorLimiterToCheckDisplayNone = nullptr) const {
+    return ReachedVisibleEmptyInlineContainerElement(
+               aAncestorLimiterToCheckDisplayNone) &&
+           ContentIsRemovable();
+  }
+
+  [[nodiscard]] bool ReachedInvisibleEmptyInlineContainerElement(
+      const nsIContent* aAncestorLimiterToCheckDisplayNone = nullptr) const {
+    return ReachedEmptyInlineContainerElement() &&
+           (!HTMLEditUtils::IsVisibleElementEvenIfLeafNode(*ElementPtr()) ||
+            HTMLEditUtils::IsInclusiveAncestorCSSDisplayNone(
+                *ElementPtr(), aAncestorLimiterToCheckDisplayNone));
+  }
+  [[nodiscard]] bool ReachedEditableInvisibleEmptyInlineContainerElement(
+      const nsIContent* aAncestorLimiterToCheckDisplayNone = nullptr) const {
+    return ReachedInvisibleEmptyInlineContainerElement(
+               aAncestorLimiterToCheckDisplayNone) &&
+           ContentIsEditable();
+  }
+  [[nodiscard]] bool ReachedRemovableInvisibleEmptyInlineContainerElement(
+      const nsIContent* aAncestorLimiterToCheckDisplayNone = nullptr) const {
+    return ReachedEditableInvisibleEmptyInlineContainerElement(
+               aAncestorLimiterToCheckDisplayNone) &&
+           ContentIsRemovable();
+  }
+
+  [[nodiscard]] constexpr bool ReachedSpecialContent() const {
+    return mReason == WSType::SpecialContent;
+  }
+
+  bool InVisibleOrCollapsibleCharacters() const {
+    return mReason == WSType::CollapsibleWhiteSpaces ||
+           mReason == WSType::NonCollapsibleCharacters;
+  }
+
+  bool InCollapsibleWhiteSpaces() const {
+    return mReason == WSType::CollapsibleWhiteSpaces;
+  }
+
+  bool InNonCollapsibleCharacters() const {
+    return mReason == WSType::NonCollapsibleCharacters;
+  }
+
+  bool ReachedBRElement() const { return mReason == WSType::BRElement; }
+  bool ReachedBRElementNotFollowedByBlockBoundary() const {
+    return ReachedBRElement() &&
+           !HTMLEditUtils::IsBRElementFollowedByBlockBoundary(*BRElementPtr());
+  }
+  bool ReachedBRElementFollowedByBlockBoundary() const {
+    return ReachedBRElement() &&
+           HTMLEditUtils::IsBRElementFollowedByBlockBoundary(*BRElementPtr());
+  }
+
+  bool ReachedPreformattedLineBreak() const {
+    return mReason == WSType::PreformattedLineBreak;
+  }
+
+  [[nodiscard]] bool ReachedLineBreak() const {
+    return ReachedBRElement() || ReachedPreformattedLineBreak();
+  }
+
+  bool ReachedHRElement() const {
+    return mContent && mContent->IsHTMLElement(nsGkAtoms::hr);
+  }
+
+  bool ReachedBlockBoundary() const {
+    return mReason == WSType::CurrentBlockBoundary ||
+           mReason == WSType::OtherBlockBoundary;
+  }
+
+  bool ReachedCurrentBlockBoundary() const {
+    return mReason == WSType::CurrentBlockBoundary;
+  }
+
+  bool ReachedOtherBlockElement() const {
+    return mReason == WSType::OtherBlockBoundary;
+  }
+
+  bool ReachedNonEditableOtherBlockElement() const {
+    return ReachedOtherBlockElement() && !GetContent()->IsEditable();
+  }
+
+  [[nodiscard]] bool ReachedInlineEditingHostBoundary() const {
+    return mReason == WSType::InlineEditingHostBoundary;
+  }
+
+  bool ReachedSomethingNonTextContent() const {
+    return !InVisibleOrCollapsibleCharacters();
+  }
+
+  [[nodiscard]] bool ReachedLineBoundary() const {
+    switch (mReason) {
+      case WSType::CurrentBlockBoundary:
+      case WSType::OtherBlockBoundary:
+      case WSType::BRElement:
+      case WSType::PreformattedLineBreak:
+        return true;
+      default:
+        return ReachedHRElement();
+    }
+  }
+
+  [[nodiscard]] const Maybe<EditorLineBreak>& MaybeIgnoredLineBreak() const {
+    return mIgnoredLineBreak;
+  }
+
+  friend std::ostream& operator<<(std::ostream& aStream,
+                                  const ScanDirection& aDirection) {
+    return aStream << (aDirection == ScanDirection::Backward
+                           ? "ScanDirection::Backward"
+                           : "ScanDirection::Forward");
+  }
+
+  friend std::ostream& operator<<(std::ostream& aStream,
+                                  const WSScanResult& aResult) {
+    aStream << "{ mReason: " << aResult.mReason;
+    if (aResult.mReason == WSType::NotInitialized ||
+        aResult.mReason == WSType::InUncomposedDoc) {
+      return aStream << " }";
+    }
+    return aStream << ", mContent: " << aResult.mContent
+                   << ", mEditingHost: " << aResult.mEditingHost
+                   << ", mIgnoredLineBreak: " << aResult.mIgnoredLineBreak
+                   << ", mOffset: " << aResult.mOffset
+                   << ", mDirection: " << aResult.mDirection << " }";
+  }
+
+ private:
+  void MaybeSetEditingHost(const WSRunScanner& aScanner);
+
+  nsCOMPtr<nsIContent> mContent;
+  RefPtr<Element> mEditingHost;
+  Maybe<EditorLineBreak> mIgnoredLineBreak;
+  Maybe<uint32_t> mOffset;
+  WSType mReason = WSType::NotInitialized;
+  ScanDirection mDirection = ScanDirection::Backward;
+};
+
+class MOZ_STACK_CLASS WSRunScanner final {
+ private:
+  using Element = dom::Element;
+  using HTMLBRElement = dom::HTMLBRElement;
+  using Text = dom::Text;
+
+ public:
+  using WSType = WSScanResult::WSType;
+
+  enum class IgnoreNonEditableNodes : bool { No, Yes };
+  enum class StopAtNonEditableNode : bool { No, Yes };
+  enum class ReferHTMLDefaultStyle : bool { No, Yes };
+  enum class Option {
+    OnlyEditableNodes,
+    ReferHTMLDefaultStyle,
+    StopAtComment,
+    StopAtAnyEmptyInlineContainers,
+    StopAtVisibleEmptyInlineContainers,
+  };
+  using Options = EnumSet<Option>;
+
+  [[nodiscard]] constexpr static IgnoreNonEditableNodes
+  ShouldIgnoreNonEditableSiblingsOrDescendants(
+      Options aOptions  // NOLINT(performance-unnecessary-value-param)
+  ) {
+    return static_cast<IgnoreNonEditableNodes>(
+        aOptions.contains(Option::OnlyEditableNodes));
+  }
+  [[nodiscard]] constexpr static StopAtNonEditableNode
+  ShouldStopAtNonEditableNode(
+      Options aOptions  // NOLINT(performance-unnecessary-value-param)
+  ) {
+    return static_cast<StopAtNonEditableNode>(
+        aOptions.contains(Option::OnlyEditableNodes));
+  }
+
+  [[nodiscard]] constexpr static ReferHTMLDefaultStyle
+  ShouldReferHTMLDefaultStyle(
+      Options aOptions  // NOLINT(performance-unnecessary-value-param)
+  ) {
+    return static_cast<ReferHTMLDefaultStyle>(
+        aOptions.contains(Option::ReferHTMLDefaultStyle));
+  }
+
+ private:
+  [[nodiscard]] static HTMLEditUtils::LeafNodeOptions ToLeafNodeOptions(
+      const Options& aOptions) {
+    using LeafNodeOption = HTMLEditUtils::LeafNodeOption;
+    using LeafNodeOptions = HTMLEditUtils::LeafNodeOptions;
+    auto types =
+        aOptions.contains(Option::OnlyEditableNodes)
+            ? LeafNodeOptions{LeafNodeOption::TreatNonEditableNodeAsLeafNode}
+            : LeafNodeOptions{};
+    if (aOptions.contains(Option::StopAtComment)) {
+      types += LeafNodeOption::TreatCommentAsLeafNode;
+    }
+    if (aOptions.contains(Option::StopAtVisibleEmptyInlineContainers)) {
+      MOZ_ASSERT(!aOptions.contains(Option::StopAtAnyEmptyInlineContainers));
+      types +=
+          LeafNodeOptions{LeafNodeOption::IgnoreInvisibleEmptyInlineContainers,
+                          LeafNodeOption::IgnoreInvisibleInlineVoidElements,
+                          LeafNodeOption::IgnoreInvisibleText};
+    } else if (!aOptions.contains(Option::StopAtAnyEmptyInlineContainers)) {
+      types += LeafNodeOptions{LeafNodeOption::IgnoreAnyEmptyInlineContainers,
+                               LeafNodeOption::IgnoreEmptyText};
+    }
+    return types;
+  }
+
+ public:
+  template <typename EditorDOMPointType>
+  WSRunScanner(Options aOptions,  // NOLINT(performance-unnecessary-value-param)
+               const EditorDOMPointType& aScanStartPoint,
+               const Element* aAncestorLimiter = nullptr)
+      : mScanStartPoint(aScanStartPoint.template To<EditorDOMPoint>()),
+        mTextFragmentDataAtStart(aOptions, mScanStartPoint, aAncestorLimiter) {}
+
+  template <typename PT, typename CT>
+  WSScanResult ScanInclusiveNextVisibleNodeOrBlockBoundaryFrom(
+      const EditorDOMPointBase<PT, CT>& aPoint) const;
+  template <typename PT, typename CT>
+  static WSScanResult ScanInclusiveNextVisibleNodeOrBlockBoundary(
+      Options aOptions,  // NOLINT(performance-unnecessary-value-param)
+      const EditorDOMPointBase<PT, CT>& aPoint,
+      const Element* aAncestorLimiter = nullptr) {
+    return WSRunScanner(aOptions, aPoint, aAncestorLimiter)
+        .ScanInclusiveNextVisibleNodeOrBlockBoundaryFrom(aPoint);
+  }
+
+  template <typename PT, typename CT>
+  WSScanResult ScanPreviousVisibleNodeOrBlockBoundaryFrom(
+      const EditorDOMPointBase<PT, CT>& aPoint) const;
+  template <typename PT, typename CT>
+  static WSScanResult ScanPreviousVisibleNodeOrBlockBoundary(
+      Options aOptions,  // NOLINT(performance-unnecessary-value-param)
+      const EditorDOMPointBase<PT, CT>& aPoint,
+      const Element* aAncestorLimiter = nullptr) {
+    return WSRunScanner(aOptions, aPoint, aAncestorLimiter)
+        .ScanPreviousVisibleNodeOrBlockBoundaryFrom(aPoint);
+  }
+
+  template <typename EditorDOMPointType, typename PT, typename CT>
+  static EditorDOMPointType GetInclusiveNextCharPoint(
+      Options aOptions,  // NOLINT(performance-unnecessary-value-param)
+      const EditorDOMPointBase<PT, CT>& aPoint,
+      const Element* aAncestorLimiter = nullptr) {
+    if (aPoint.IsInTextNode() && !aPoint.IsEndOfContainer() &&
+        (!aOptions.contains(Option::OnlyEditableNodes) ||
+         HTMLEditUtils::IsSimplyEditableNode(
+             *aPoint.template ContainerAs<Text>()))) {
+      return EditorDOMPointType(aPoint.template ContainerAs<Text>(),
+                                aPoint.Offset());
+    }
+    return WSRunScanner(aOptions, aPoint, aAncestorLimiter)
+        .GetInclusiveNextCharPoint<EditorDOMPointType>(aPoint);
+  }
+
+  template <typename EditorDOMPointType, typename PT, typename CT>
+  static EditorDOMPointType GetPreviousCharPoint(
+      Options aOptions,  // NOLINT(performance-unnecessary-value-param)
+      const EditorDOMPointBase<PT, CT>& aPoint,
+      const Element* aAncestorLimiter = nullptr) {
+    if (aPoint.IsInTextNode() && !aPoint.IsStartOfContainer() &&
+        (!aOptions.contains(Option::OnlyEditableNodes) ||
+         HTMLEditUtils::IsSimplyEditableNode(
+             *aPoint.template ContainerAs<Text>()))) {
+      return EditorDOMPointType(aPoint.template ContainerAs<Text>(),
+                                aPoint.Offset() - 1);
+    }
+    return WSRunScanner(aOptions, aPoint, aAncestorLimiter)
+        .GetPreviousCharPoint<EditorDOMPointType>(aPoint);
+  }
+
+  template <typename EditorDOMPointType>
+  static EditorDOMPointType GetAfterLastVisiblePoint(
+      Options aOptions,  // NOLINT(performance-unnecessary-value-param)
+      Text& aTextNode, const Element* aAncestorLimiter = nullptr);
+  template <typename EditorDOMPointType>
+  static EditorDOMPointType GetFirstVisiblePoint(
+      Options aOptions,  // NOLINT(performance-unnecessary-value-param)
+      Text& aTextNode, const Element* aAncestorLimiter = nullptr);
+
+  static Result<EditorDOMRangeInTexts, nsresult>
+  GetRangeInTextNodesToForwardDeleteFrom(
+      Options aOptions,  // NOLINT(performance-unnecessary-value-param)
+      const EditorDOMPoint& aPoint, const Element* aAncestorLimiter = nullptr);
+
+  static Result<EditorDOMRangeInTexts, nsresult>
+  GetRangeInTextNodesToBackspaceFrom(
+      Options aOptions,  // NOLINT(performance-unnecessary-value-param)
+      const EditorDOMPoint& aPoint, const Element* aAncestorLimiter = nullptr);
+
+  static EditorDOMRange GetRangesForDeletingAtomicContent(
+      Options aOptions,  // NOLINT(performance-unnecessary-value-param)
+      const nsIContent& aAtomicContent,
+      const Element* aAncestorLimiter = nullptr);
+
+  static EditorDOMRange GetRangeForDeletingBlockElementBoundaries(
+      Options aOptions,  // NOLINT(performance-unnecessary-value-param)
+      const Element& aLeftBlockElement, const Element& aRightBlockElement,
+      const EditorDOMPoint& aPointContainingTheOtherBlock,
+      const Element* aAncestorLimiter = nullptr);
+
+  static Result<bool, nsresult> ShrinkRangeIfStartsFromOrEndsAfterAtomicContent(
+      Options aOptions,  // NOLINT(performance-unnecessary-value-param)
+      nsRange& aRange, const Element* aAncestorLimiter = nullptr);
+
+  static EditorDOMRange GetRangeContainingInvisibleWhiteSpacesAtRangeBoundaries(
+      Options aOptions,  // NOLINT(performance-unnecessary-value-param)
+      const EditorDOMRange& aRange, const Element* aAncestorLimiter = nullptr);
+
+  template <typename EditorDOMPointType>
+  MOZ_NEVER_INLINE_DEBUG static HTMLBRElement*
+  GetPrecedingBRElementUnlessVisibleContentFound(
+      Options aOptions,  // NOLINT(performance-unnecessary-value-param)
+      const EditorDOMPointType& aPoint,
+      const Element* aAncestorLimiter = nullptr) {
+    MOZ_ASSERT(aPoint.IsSetAndValid());
+    if (aPoint.IsStartOfContainer()) {
+      return nullptr;
+    }
+    TextFragmentData textFragmentData(aOptions, aPoint, aAncestorLimiter);
+    return textFragmentData.StartsFromBRElement()
+               ? textFragmentData.StartReasonBRElementPtr()
+               : nullptr;
+  }
+
+  [[nodiscard]] constexpr Options ScanOptions() const {
+    return mTextFragmentDataAtStart.ScanOptions();
+  }
+  [[nodiscard]] bool ReferredHTMLDefaultStyle() const {
+    return mTextFragmentDataAtStart.ReferredHTMLDefaultStyle();
+  }
+
+  const EditorDOMPoint& ScanStartRef() const { return mScanStartPoint; }
+
+ protected:
+  using EditorType = EditorBase::EditorType;
+
+  class TextFragmentData;
+
+  class MOZ_STACK_CLASS VisibleWhiteSpacesData final {
+   public:
+    bool IsInitialized() const {
+      return mLeftWSType != WSType::NotInitialized ||
+             mRightWSType != WSType::NotInitialized;
+    }
+
+    EditorDOMPoint StartRef() const { return mStartPoint; }
+    EditorDOMPoint EndRef() const { return mEndPoint; }
+
+    bool StartsFromNonCollapsibleCharacters() const {
+      return mLeftWSType == WSType::NonCollapsibleCharacters;
+    }
+    [[nodiscard]] constexpr bool StartsFromSpecialContent() const {
+      return mLeftWSType == WSType::SpecialContent;
+    }
+    [[nodiscard]] constexpr bool StartsFromEmptyInlineContainerElement() const {
+      return mLeftWSType == WSType::EmptyInlineContainerElement;
+    }
+    bool StartsFromPreformattedLineBreak() const {
+      return mLeftWSType == WSType::PreformattedLineBreak;
+    }
+
+    bool EndsByNonCollapsibleCharacters() const {
+      return mRightWSType == WSType::NonCollapsibleCharacters;
+    }
+    bool EndsByTrailingWhiteSpaces() const {
+      return mRightWSType == WSType::TrailingWhiteSpaces;
+    }
+    [[nodiscard]] constexpr bool EndsBySpecialContent() const {
+      return mRightWSType == WSType::SpecialContent;
+    }
+    [[nodiscard]] constexpr bool EndsByEmptyInlineContainerElement() const {
+      return mRightWSType == WSType::EmptyInlineContainerElement;
+    }
+    bool EndsByBRElement() const { return mRightWSType == WSType::BRElement; }
+    bool EndsByPreformattedLineBreak() const {
+      return mRightWSType == WSType::PreformattedLineBreak;
+    }
+    bool EndsByBlockBoundary() const {
+      return mRightWSType == WSType::CurrentBlockBoundary ||
+             mRightWSType == WSType::OtherBlockBoundary;
+    }
+    bool EndsByInlineEditingHostBoundary() const {
+      return mRightWSType == WSType::InlineEditingHostBoundary;
+    }
+
+    enum class PointPosition {
+      BeforeStartOfFragment,
+      StartOfFragment,
+      MiddleOfFragment,
+      EndOfFragment,
+      AfterEndOfFragment,
+      NotInSameDOMTree,
+    };
+    template <typename EditorDOMPointType>
+    PointPosition ComparePoint(const EditorDOMPointType& aPoint) const {
+      MOZ_ASSERT(aPoint.IsSetAndValid());
+      if (StartRef() == aPoint) {
+        return PointPosition::StartOfFragment;
+      }
+      if (EndRef() == aPoint) {
+        return PointPosition::EndOfFragment;
+      }
+      const bool startIsBeforePoint = StartRef().IsBefore(aPoint);
+      const bool pointIsBeforeEnd = aPoint.IsBefore(EndRef());
+      if (startIsBeforePoint && pointIsBeforeEnd) {
+        return PointPosition::MiddleOfFragment;
+      }
+      if (startIsBeforePoint) {
+        return PointPosition::AfterEndOfFragment;
+      }
+      if (pointIsBeforeEnd) {
+        return PointPosition::BeforeStartOfFragment;
+      }
+      return PointPosition::NotInSameDOMTree;
+    }
+
+   private:
+    friend class WSRunScanner::TextFragmentData;
+    VisibleWhiteSpacesData()
+        : mLeftWSType(WSType::NotInitialized),
+          mRightWSType(WSType::NotInitialized) {}
+
+    template <typename EditorDOMPointType>
+    void SetStartPoint(const EditorDOMPointType& aStartPoint) {
+      mStartPoint = aStartPoint;
+    }
+    template <typename EditorDOMPointType>
+    void SetEndPoint(const EditorDOMPointType& aEndPoint) {
+      mEndPoint = aEndPoint;
+    }
+    void SetStartFrom(WSType aLeftWSType) { mLeftWSType = aLeftWSType; }
+    void SetStartFromLeadingWhiteSpaces() {
+      mLeftWSType = WSType::LeadingWhiteSpaces;
+    }
+    void SetEndBy(WSType aRightWSType) { mRightWSType = aRightWSType; }
+    void SetEndByTrailingWhiteSpaces() {
+      mRightWSType = WSType::TrailingWhiteSpaces;
+    }
+
+    EditorDOMPoint mStartPoint;
+    EditorDOMPoint mEndPoint;
+    WSType mLeftWSType, mRightWSType;
+  };
+
+  using PointPosition = VisibleWhiteSpacesData::PointPosition;
+
+  template <typename EditorDOMPointType, typename PT, typename CT>
+  EditorDOMPointType GetInclusiveNextCharPoint(
+      const EditorDOMPointBase<PT, CT>& aPoint) const {
+    return TextFragmentDataAtStartRef()
+        .GetInclusiveNextCharPoint<EditorDOMPointType>(
+            aPoint, ShouldIgnoreNonEditableSiblingsOrDescendants(
+                        mTextFragmentDataAtStart.ScanOptions()));
+  }
+
+  template <typename EditorDOMPointType, typename PT, typename CT>
+  EditorDOMPointType GetPreviousCharPoint(
+      const EditorDOMPointBase<PT, CT>& aPoint) const {
+    return TextFragmentDataAtStartRef()
+        .GetPreviousCharPoint<EditorDOMPointType>(
+            aPoint, ShouldIgnoreNonEditableSiblingsOrDescendants(
+                        mTextFragmentDataAtStart.ScanOptions()));
+  }
+
+  template <typename EditorDOMPointType>
+  EditorDOMPointType GetEndOfCollapsibleASCIIWhiteSpaces(
+      const EditorDOMPointInText& aPointAtASCIIWhiteSpace,
+      nsIEditor::EDirection aDirectionToDelete) const {
+    MOZ_ASSERT(aDirectionToDelete == nsIEditor::eNone ||
+               aDirectionToDelete == nsIEditor::eNext ||
+               aDirectionToDelete == nsIEditor::ePrevious);
+    return TextFragmentDataAtStartRef()
+        .GetEndOfCollapsibleASCIIWhiteSpaces<EditorDOMPointType>(
+            aPointAtASCIIWhiteSpace, aDirectionToDelete);
+  }
+
+  template <typename EditorDOMPointType>
+  EditorDOMPointType GetFirstASCIIWhiteSpacePointCollapsedTo(
+      const EditorDOMPointInText& aPointAtASCIIWhiteSpace,
+      nsIEditor::EDirection aDirectionToDelete) const {
+    MOZ_ASSERT(aDirectionToDelete == nsIEditor::eNone ||
+               aDirectionToDelete == nsIEditor::eNext ||
+               aDirectionToDelete == nsIEditor::ePrevious);
+    return TextFragmentDataAtStartRef()
+        .GetFirstASCIIWhiteSpacePointCollapsedTo<EditorDOMPointType>(
+            aPointAtASCIIWhiteSpace, aDirectionToDelete);
+  }
+
+  class MOZ_STACK_CLASS TextFragmentData final {
+   private:
+    class NoBreakingSpaceData;
+    class MOZ_STACK_CLASS BoundaryData final {
+     public:
+      using NoBreakingSpaceData =
+          WSRunScanner::TextFragmentData::NoBreakingSpaceData;
+
+      template <typename EditorDOMPointType>
+      static BoundaryData ScanCollapsibleWhiteSpaceStartFrom(
+          Options aOptions,  // NOLINT(performance-unnecessary-value-param)
+          const EditorDOMPointType& aPoint, NoBreakingSpaceData* aNBSPData,
+          const Element& aAncestorLimiter);
+
+      template <typename EditorDOMPointType>
+      static BoundaryData ScanCollapsibleWhiteSpaceEndFrom(
+          Options aOptions,  // NOLINT(performance-unnecessary-value-param)
+          const EditorDOMPointType& aPoint, NoBreakingSpaceData* aNBSPData,
+          const Element& aAncestorLimiter);
+
+      BoundaryData() = default;
+      template <typename EditorDOMPointType>
+      BoundaryData(const EditorDOMPointType& aPoint, nsIContent& aReasonContent,
+                   WSType aReason)
+          : mReasonContent(&aReasonContent),
+            mPoint(aPoint.template To<EditorDOMPoint>()),
+            mReason(aReason) {}
+      bool Initialized() const { return mReasonContent && mPoint.IsSet(); }
+
+      nsIContent* GetReasonContent() const { return mReasonContent; }
+      const EditorDOMPoint& PointRef() const { return mPoint; }
+      WSType RawReason() const { return mReason; }
+
+      bool IsNonCollapsibleCharacters() const {
+        return mReason == WSType::NonCollapsibleCharacters;
+      }
+      [[nodiscard]] constexpr bool IsSpecialContent() const {
+        return mReason == WSType::SpecialContent;
+      }
+      [[nodiscard]] constexpr bool IsEmptyInlineContainerElement() const {
+        return mReason == WSType::EmptyInlineContainerElement;
+      }
+      bool IsBRElement() const { return mReason == WSType::BRElement; }
+      bool IsPreformattedLineBreak() const {
+        return mReason == WSType::PreformattedLineBreak;
+      }
+      bool IsCurrentBlockBoundary() const {
+        return mReason == WSType::CurrentBlockBoundary;
+      }
+      bool IsOtherBlockBoundary() const {
+        return mReason == WSType::OtherBlockBoundary;
+      }
+      bool IsBlockBoundary() const {
+        return mReason == WSType::CurrentBlockBoundary ||
+               mReason == WSType::OtherBlockBoundary;
+      }
+      bool IsInlineEditingHostBoundary() const {
+        return mReason == WSType::InlineEditingHostBoundary;
+      }
+      bool IsHardLineBreak() const {
+        return mReason == WSType::CurrentBlockBoundary ||
+               mReason == WSType::OtherBlockBoundary ||
+               mReason == WSType::BRElement ||
+               mReason == WSType::PreformattedLineBreak;
+      }
+      MOZ_NEVER_INLINE_DEBUG Element* OtherBlockElementPtr() const {
+        MOZ_DIAGNOSTIC_ASSERT(mReasonContent->IsElement());
+        return mReasonContent->AsElement();
+      }
+      MOZ_NEVER_INLINE_DEBUG HTMLBRElement* BRElementPtr() const {
+        MOZ_DIAGNOSTIC_ASSERT(mReasonContent->IsHTMLElement(nsGkAtoms::br));
+        return static_cast<HTMLBRElement*>(mReasonContent.get());
+      }
+
+     private:
+      template <typename EditorDOMPointType>
+      static Maybe<BoundaryData> ScanCollapsibleWhiteSpaceStartInTextNode(
+          const EditorDOMPointType& aPoint, NoBreakingSpaceData* aNBSPData);
+      template <typename EditorDOMPointType>
+      static Maybe<BoundaryData> ScanCollapsibleWhiteSpaceEndInTextNode(
+          const EditorDOMPointType& aPoint, NoBreakingSpaceData* aNBSPData);
+
+      nsCOMPtr<nsIContent> mReasonContent;
+      EditorDOMPoint mPoint;
+      WSType mReason = WSType::NotInitialized;
+    };
+
+    class MOZ_STACK_CLASS NoBreakingSpaceData final {
+     public:
+      enum class Scanning { Forward, Backward };
+      void NotifyNBSP(const EditorDOMPointInText& aPoint,
+                      Scanning aScanningDirection) {
+        MOZ_ASSERT(aPoint.IsSetAndValid());
+        MOZ_ASSERT(aPoint.IsCharNBSP());
+        if (!mFirst.IsSet() || aScanningDirection == Scanning::Backward) {
+          mFirst = aPoint;
+        }
+        if (!mLast.IsSet() || aScanningDirection == Scanning::Forward) {
+          mLast = aPoint;
+        }
+      }
+
+      const EditorDOMPointInText& FirstPointRef() const { return mFirst; }
+      const EditorDOMPointInText& LastPointRef() const { return mLast; }
+
+      bool FoundNBSP() const {
+        MOZ_ASSERT(mFirst.IsSet() == mLast.IsSet());
+        return mFirst.IsSet();
+      }
+
+     private:
+      EditorDOMPointInText mFirst;
+      EditorDOMPointInText mLast;
+    };
+
+   public:
+    TextFragmentData() = delete;
+
+    template <typename EditorDOMPointType>
+    TextFragmentData(
+        Options aOptions,  // NOLINT(performance-unnecessary-value-param)
+        const EditorDOMPointType& aPoint,
+        const Element* aAncestorLimiter = nullptr);
+
+    bool IsInitialized() const {
+      return mStart.Initialized() && mEnd.Initialized();
+    }
+
+    [[nodiscard]] constexpr Options ScanOptions() const { return mOptions; }
+    [[nodiscard]] bool ReferredHTMLDefaultStyle() const {
+      return mOptions.contains(Option::ReferHTMLDefaultStyle);
+    }
+
+    const Element* GetAncestorLimiter() const { return mAncestorLimiter; }
+
+    nsIContent* GetStartReasonContent() const {
+      return mStart.GetReasonContent();
+    }
+    nsIContent* GetEndReasonContent() const { return mEnd.GetReasonContent(); }
+
+    bool StartsFromNonCollapsibleCharacters() const {
+      return mStart.IsNonCollapsibleCharacters();
+    }
+    [[nodiscard]] bool StartsFromSpecialContent() const {
+      return mStart.IsSpecialContent();
+    }
+    [[nodiscard]] bool StartsFromEmptyInlineContainerElement() const {
+      return mStart.IsEmptyInlineContainerElement();
+    }
+    bool StartsFromBRElement() const { return mStart.IsBRElement(); }
+    bool StartsFromBRElementNotFollowedByBlockBoundary() const {
+      return StartsFromBRElement() &&
+             !HTMLEditUtils::IsBRElementFollowedByBlockBoundary(
+                 static_cast<HTMLBRElement&>(*GetStartReasonContent()));
+    }
+    bool StartsFromBRElementFollowedByBlockBoundary() const {
+      return StartsFromBRElement() &&
+             HTMLEditUtils::IsBRElementFollowedByBlockBoundary(
+                 static_cast<HTMLBRElement&>(*GetStartReasonContent()));
+    }
+    bool StartsFromPreformattedLineBreak() const {
+      return mStart.IsPreformattedLineBreak();
+    }
+    bool StartsFromCurrentBlockBoundary() const {
+      return mStart.IsCurrentBlockBoundary();
+    }
+    bool StartsFromOtherBlockElement() const {
+      return mStart.IsOtherBlockBoundary();
+    }
+    bool StartsFromBlockBoundary() const { return mStart.IsBlockBoundary(); }
+    bool StartsFromInlineEditingHostBoundary() const {
+      return mStart.IsInlineEditingHostBoundary();
+    }
+    bool StartsFromHardLineBreak() const { return mStart.IsHardLineBreak(); }
+    bool EndsByNonCollapsibleCharacters() const {
+      return mEnd.IsNonCollapsibleCharacters();
+    }
+    [[nodiscard]] bool EndsBySpecialContent() const {
+      return mEnd.IsSpecialContent();
+    }
+    [[nodiscard]] bool EndsByEmptyInlineContainerElement() const {
+      return mEnd.IsEmptyInlineContainerElement();
+    }
+    bool EndsByBRElement() const { return mEnd.IsBRElement(); }
+    bool EndsByBRElementNotFollowedByBlockBoundary() const {
+      return EndsByBRElement() &&
+             !HTMLEditUtils::IsBRElementFollowedByBlockBoundary(
+                 static_cast<HTMLBRElement&>(*GetEndReasonContent()));
+    }
+    bool EndsByBRElementFollowedByBlockBoundary() const {
+      return EndsByBRElement() &&
+             HTMLEditUtils::IsBRElementFollowedByBlockBoundary(
+                 static_cast<HTMLBRElement&>(*GetEndReasonContent()));
+    }
+    bool EndsByPreformattedLineBreak() const {
+      return mEnd.IsPreformattedLineBreak();
+    }
+    bool EndsByPreformattedLineBreakFollowedByBlockBoundary() const {
+      return mEnd.IsPreformattedLineBreak() &&
+             HTMLEditUtils::IsPreformattedLineBreakFollowedByBlockBoundary(
+                 mEnd.PointRef(), HTMLEditUtils::SkipWhiteSpaceStyleCheck::Yes);
+    }
+    bool EndsByCurrentBlockBoundary() const {
+      return mEnd.IsCurrentBlockBoundary();
+    }
+    bool EndsByOtherBlockElement() const { return mEnd.IsOtherBlockBoundary(); }
+    bool EndsByBlockBoundary() const { return mEnd.IsBlockBoundary(); }
+    bool EndsByInlineEditingHostBoundary() const {
+      return mEnd.IsInlineEditingHostBoundary();
+    }
+
+    WSType StartRawReason() const { return mStart.RawReason(); }
+    WSType EndRawReason() const { return mEnd.RawReason(); }
+
+    MOZ_NEVER_INLINE_DEBUG Element* StartReasonOtherBlockElementPtr() const {
+      return mStart.OtherBlockElementPtr();
+    }
+    MOZ_NEVER_INLINE_DEBUG HTMLBRElement* StartReasonBRElementPtr() const {
+      return mStart.BRElementPtr();
+    }
+    MOZ_NEVER_INLINE_DEBUG Element* EndReasonOtherBlockElementPtr() const {
+      return mEnd.OtherBlockElementPtr();
+    }
+    MOZ_NEVER_INLINE_DEBUG HTMLBRElement* EndReasonBRElementPtr() const {
+      return mEnd.BRElementPtr();
+    }
+
+    const EditorDOMPoint& StartRef() const { return mStart.PointRef(); }
+    const EditorDOMPoint& EndRef() const { return mEnd.PointRef(); }
+
+    const EditorDOMPoint& ScanStartRef() const { return mScanStartPoint; }
+
+    bool FoundNoBreakingWhiteSpaces() const { return mNBSPData.FoundNBSP(); }
+    const EditorDOMPointInText& FirstNBSPPointRef() const {
+      return mNBSPData.FirstPointRef();
+    }
+    const EditorDOMPointInText& LastNBSPPointRef() const {
+      return mNBSPData.LastPointRef();
+    }
+
+    template <typename EditorDOMPointType, typename PT, typename CT>
+    [[nodiscard]] static EditorDOMPointType GetInclusiveNextCharPoint(
+        const EditorDOMPointBase<PT, CT>& aPoint,
+        Options aOptions,  // NOLINT(performance-unnecessary-value-param)
+        IgnoreNonEditableNodes aIgnoreNonEditableNodes,
+        const nsIContent* aFollowingLimiterContent = nullptr);
+
+    template <typename EditorDOMPointType, typename PT, typename CT>
+    [[nodiscard]] EditorDOMPointType GetInclusiveNextCharPoint(
+        const EditorDOMPointBase<PT, CT>& aPoint,
+        IgnoreNonEditableNodes aIgnoreNonEditableNodes) const {
+      return GetInclusiveNextCharPoint<EditorDOMPointType>(
+          aPoint, mOptions, aIgnoreNonEditableNodes, GetEndReasonContent());
+    }
+
+    template <typename EditorDOMPointType, typename PT, typename CT>
+    [[nodiscard]] static EditorDOMPointType GetPreviousCharPoint(
+        const EditorDOMPointBase<PT, CT>& aPoint,
+        Options aOptions,  // NOLINT(performance-unnecessary-value-param)
+        IgnoreNonEditableNodes aIgnoreNonEditableNodes,
+        const nsIContent* aPrecedingLimiterContent = nullptr);
+
+    template <typename EditorDOMPointType, typename PT, typename CT>
+    [[nodiscard]] EditorDOMPointType GetPreviousCharPoint(
+        const EditorDOMPointBase<PT, CT>& aPoint,
+        IgnoreNonEditableNodes aIgnoreNonEditableNodes) const {
+      return GetPreviousCharPoint<EditorDOMPointType>(
+          aPoint, mOptions, aIgnoreNonEditableNodes, GetStartReasonContent());
+    }
+
+    template <typename EditorDOMPointType>
+    [[nodiscard]] static EditorDOMPointType GetEndOfCollapsibleASCIIWhiteSpaces(
+        const EditorDOMPointInText& aPointAtASCIIWhiteSpace,
+        nsIEditor::EDirection aDirectionToDelete,
+        Options aOptions,  // NOLINT(performance-unnecessary-value-param)
+        IgnoreNonEditableNodes aIgnoreNonEditableNodes,
+        const nsIContent* aFollowingLimiterContent = nullptr);
+
+    template <typename EditorDOMPointType>
+    [[nodiscard]] EditorDOMPointType GetEndOfCollapsibleASCIIWhiteSpaces(
+        const EditorDOMPointInText& aPointAtASCIIWhiteSpace,
+        nsIEditor::EDirection aDirectionToDelete,
+        IgnoreNonEditableNodes aIgnoreNonEditableNodes) const {
+      return GetEndOfCollapsibleASCIIWhiteSpaces<EditorDOMPointType>(
+          aPointAtASCIIWhiteSpace, aDirectionToDelete, mOptions,
+          aIgnoreNonEditableNodes, GetEndReasonContent());
+    }
+
+    template <typename EditorDOMPointType>
+    [[nodiscard]] static EditorDOMPointType
+    GetFirstASCIIWhiteSpacePointCollapsedTo(
+        const EditorDOMPointInText& aPointAtASCIIWhiteSpace,
+        nsIEditor::EDirection aDirectionToDelete,
+        Options aOptions,  // NOLINT(performance-unnecessary-value-param)
+        IgnoreNonEditableNodes aIgnoreNonEditableNodes,
+        const nsIContent* aPrecedingLimiterContent = nullptr);
+
+    template <typename EditorDOMPointType>
+    [[nodiscard]] EditorDOMPointType GetFirstASCIIWhiteSpacePointCollapsedTo(
+        const EditorDOMPointInText& aPointAtASCIIWhiteSpace,
+        nsIEditor::EDirection aDirectionToDelete,
+        IgnoreNonEditableNodes aIgnoreNonEditableNodes) const {
+      return GetFirstASCIIWhiteSpacePointCollapsedTo<EditorDOMPointType>(
+          aPointAtASCIIWhiteSpace, aDirectionToDelete, mOptions,
+          aIgnoreNonEditableNodes, GetStartReasonContent());
+    }
+
+    EditorDOMRangeInTexts GetNonCollapsedRangeInTexts(
+        const EditorDOMRange& aRange) const;
+
+    const EditorDOMRange& InvisibleLeadingWhiteSpaceRangeRef() const;
+
+    const EditorDOMRange& InvisibleTrailingWhiteSpaceRangeRef() const;
+
+    template <typename EditorDOMPointType>
+    EditorDOMRange GetNewInvisibleLeadingWhiteSpaceRangeIfSplittingAt(
+        const EditorDOMPointType& aPointToSplit) const {
+      const EditorDOMRange& trailingWhiteSpaceRange =
+          InvisibleTrailingWhiteSpaceRangeRef();
+      if (!trailingWhiteSpaceRange.IsPositioned()) {
+        return trailingWhiteSpaceRange;
+      }
+      if (aPointToSplit.IsBefore(trailingWhiteSpaceRange.StartRef())) {
+        return EditorDOMRange();
+      }
+      if (aPointToSplit.EqualsOrIsBefore(trailingWhiteSpaceRange.EndRef())) {
+        return EditorDOMRange(trailingWhiteSpaceRange.StartRef(),
+                              aPointToSplit);
+      }
+      return EditorDOMRange(trailingWhiteSpaceRange.EndRef());
+    }
+
+    template <typename EditorDOMPointType>
+    EditorDOMRange GetNewInvisibleTrailingWhiteSpaceRangeIfSplittingAt(
+        const EditorDOMPointType& aPointToSplit) const {
+      const EditorDOMRange& leadingWhiteSpaceRange =
+          InvisibleLeadingWhiteSpaceRangeRef();
+      if (!leadingWhiteSpaceRange.IsPositioned()) {
+        return leadingWhiteSpaceRange;
+      }
+      if (leadingWhiteSpaceRange.EndRef().IsBefore(aPointToSplit)) {
+        return EditorDOMRange();
+      }
+      if (leadingWhiteSpaceRange.StartRef().EqualsOrIsBefore(aPointToSplit)) {
+        return EditorDOMRange(aPointToSplit, leadingWhiteSpaceRange.EndRef());
+      }
+      return EditorDOMRange(leadingWhiteSpaceRange.StartRef());
+    }
+
+    template <typename EditorDOMPointType>
+    bool FollowingContentMayBecomeFirstVisibleContent(
+        const EditorDOMPointType& aPoint) const {
+      MOZ_ASSERT(aPoint.IsSetAndValid());
+      if (!mStart.IsHardLineBreak() && !mStart.IsInlineEditingHostBoundary()) {
+        return false;
+      }
+      if (aPoint.EqualsOrIsBefore(mStart.PointRef())) {
+        return true;
+      }
+      const EditorDOMRange& leadingWhiteSpaceRange =
+          InvisibleLeadingWhiteSpaceRangeRef();
+      if (!leadingWhiteSpaceRange.StartRef().IsSet()) {
+        return false;
+      }
+      if (aPoint.EqualsOrIsBefore(leadingWhiteSpaceRange.StartRef())) {
+        return true;
+      }
+      if (!leadingWhiteSpaceRange.EndRef().IsSet()) {
+        return false;
+      }
+      return aPoint.EqualsOrIsBefore(leadingWhiteSpaceRange.EndRef());
+    }
+
+    template <typename EditorDOMPointType>
+    bool PrecedingContentMayBecomeInvisible(
+        const EditorDOMPointType& aPoint) const {
+      MOZ_ASSERT(aPoint.IsSetAndValid());
+      if (mEnd.IsBlockBoundary() || mEnd.IsInlineEditingHostBoundary()) {
+        return true;
+      }
+
+      const VisibleWhiteSpacesData& visibleWhiteSpaces =
+          VisibleWhiteSpacesDataRef();
+      if (!visibleWhiteSpaces.IsInitialized()) {
+        return false;
+      }
+      if (!visibleWhiteSpaces.StartRef().IsSet()) {
+        return true;
+      }
+      if (!visibleWhiteSpaces.StartRef().EqualsOrIsBefore(aPoint)) {
+        return false;
+      }
+      if (visibleWhiteSpaces.EndsByTrailingWhiteSpaces()) {
+        return true;
+      }
+      if (visibleWhiteSpaces.StartRef() == visibleWhiteSpaces.EndRef()) {
+        return true;
+      }
+      return aPoint.IsBefore(visibleWhiteSpaces.EndRef());
+    }
+
+    EditorDOMPointInText GetPreviousNBSPPointIfNeedToReplaceWithASCIIWhiteSpace(
+        const EditorDOMPoint& aPointToInsert) const;
+
+    EditorDOMPointInText
+    GetInclusiveNextNBSPPointIfNeedToReplaceWithASCIIWhiteSpace(
+        const EditorDOMPoint& aPointToInsert) const;
+
+    ReplaceRangeData GetReplaceRangeDataAtEndOfDeletionRange(
+        const TextFragmentData& aTextFragmentDataAtStartToDelete) const;
+    ReplaceRangeData GetReplaceRangeDataAtStartOfDeletionRange(
+        const TextFragmentData& aTextFragmentDataAtEndToDelete) const;
+
+    const VisibleWhiteSpacesData& VisibleWhiteSpacesDataRef() const;
+
+   private:
+    EditorDOMPoint mScanStartPoint;
+    RefPtr<const Element> mAncestorLimiter;
+    BoundaryData mStart;
+    BoundaryData mEnd;
+    NoBreakingSpaceData mNBSPData;
+    mutable Maybe<EditorDOMRange> mLeadingWhiteSpaceRange;
+    mutable Maybe<EditorDOMRange> mTrailingWhiteSpaceRange;
+    mutable Maybe<VisibleWhiteSpacesData> mVisibleWhiteSpacesData;
+    const Options mOptions;
+  };
+
+  const TextFragmentData& TextFragmentDataAtStartRef() const {
+    return mTextFragmentDataAtStart;
+  }
+
+  EditorDOMPoint mScanStartPoint;
+
+ private:
+  static EditorDOMRangeInTexts
+  ComputeRangeInTextNodesContainingInvisibleWhiteSpaces(
+      const TextFragmentData& aStart, const TextFragmentData& aEnd);
+
+  TextFragmentData mTextFragmentDataAtStart;
+
+  friend class WhiteSpaceVisibilityKeeper;
+  friend class WSScanResult;
+};
+
+inline void WSScanResult::MaybeSetEditingHost(const WSRunScanner& aScanner) {
+  if (!mContent ||
+      aScanner.ScanOptions().contains(
+          WSRunScanner::Option::OnlyEditableNodes) ||
+      MOZ_UNLIKELY(!aScanner.mScanStartPoint.IsInContentNode()) ||
+      !HTMLEditUtils::IsSimplyEditableNode(
+          *aScanner.mScanStartPoint.GetContainer())) {
+    return;
+  }
+  Element* const editingHost =
+      aScanner.mScanStartPoint.ContainerAs<nsIContent>()->GetEditingHost();
+  if (editingHost) {
+    Element* const contentEditingHost = mContent->GetEditingHost();
+    if (editingHost != contentEditingHost) {
+      mEditingHost = editingHost;
+    }
+  }
+}
+
+}  
+
+#endif  // #ifndef WSRunScanner_h

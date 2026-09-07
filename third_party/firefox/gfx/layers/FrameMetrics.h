@@ -1,0 +1,737 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef GFX_FRAMEMETRICS_H
+#define GFX_FRAMEMETRICS_H
+
+#include <stdint.h>  // for uint8_t, uint32_t, uint64_t
+#include <iosfwd>
+
+#include "Units.h"                  // for CSSRect, CSSPixel, etc
+#include "UnitTransforms.h"         // for ViewAs
+#include "mozilla/DefineEnum.h"     // for MOZ_DEFINE_ENUM
+#include "mozilla/HashFunctions.h"  // for HashGeneric
+#include "mozilla/Maybe.h"
+#include "mozilla/dom/InteractiveWidget.h"
+#include "mozilla/gfx/BasePoint.h"               // for BasePoint
+#include "mozilla/gfx/Rect.h"                    // for RoundedIn
+#include "mozilla/gfx/ScaleFactor.h"             // for ScaleFactor
+#include "mozilla/gfx/Logging.h"                 // for Log
+#include "mozilla/layers/LayersTypes.h"          // for ScrollDirection
+#include "mozilla/layers/ScrollableLayerGuid.h"  // for ScrollableLayerGuid
+#include "mozilla/ScrollPositionUpdate.h"        // for ScrollPositionUpdate
+#include "mozilla/ScrollSnapInfo.h"
+#include "mozilla/ScrollSnapTargetId.h"
+#include "mozilla/StaticPtr.h"  // for StaticAutoPtr
+#include "mozilla/TimeStamp.h"  // for TimeStamp
+#include "mozilla/WritingModes.h"
+#include "nsTHashMap.h"  // for nsTHashMap
+#include "nsString.h"
+#include "PLDHashTable.h"  // for PLDHashNumber
+
+struct nsStyleDisplay;
+namespace mozilla {
+enum class StyleOverscrollBehavior : uint8_t;
+}  
+
+namespace IPC {
+template <typename T>
+struct ParamTraits;
+}  
+
+namespace mozilla {
+namespace layers {
+
+// clang-format off
+MOZ_DEFINE_ENUM_CLASS_WITH_BASE(
+  ScrollOffsetUpdateType, uint8_t, (
+    None,          
+    MainThread,    
+    Restore        
+));
+// clang-format on
+
+struct FrameMetrics {
+  friend struct IPC::ParamTraits<mozilla::layers::FrameMetrics>;
+  friend std::ostream& operator<<(std::ostream& aStream,
+                                  const FrameMetrics& aMetrics);
+
+  typedef ScrollableLayerGuid::ViewID ViewID;
+
+ public:
+  FrameMetrics()
+      : mScrollId(ScrollableLayerGuid::NULL_SCROLL_ID),
+        mPresShellResolution(1),
+        mCompositionBounds(0, 0, 0, 0),
+        mCompositionBoundsWidthIgnoringScrollbars(0),
+        mDisplayPort(0, 0, 0, 0),
+        mScrollableRect(0, 0, 0, 0),
+        mDevPixelsPerCSSPixel(1),
+        mScrollOffset(0, 0),
+        mBoundingCompositionSize(0, 0),
+        mPresShellId(-1),
+        mLayoutViewport(0, 0, 0, 0),
+        mVisualDestination(0, 0),
+        mVisualScrollUpdateType(ScrollOffsetUpdateType::None),
+        mInteractiveWidget(
+            dom::InteractiveWidgetUtils::DefaultInteractiveWidgetMode()),
+        mIsRootContent(false),
+        mIsScrollInfoLayer(false),
+        mHasNonZeroDisplayPortMargins(false),
+        mMinimalDisplayPort(false),
+        mIsSoftwareKeyboardVisible(false) {}
+
+
+  bool operator==(const FrameMetrics& aOther) const {
+    return mScrollId == aOther.mScrollId &&
+           mPresShellResolution == aOther.mPresShellResolution &&
+           mCompositionBounds.IsEqualEdges(aOther.mCompositionBounds) &&
+           mCompositionBoundsWidthIgnoringScrollbars ==
+               aOther.mCompositionBoundsWidthIgnoringScrollbars &&
+           mDisplayPort.IsEqualEdges(aOther.mDisplayPort) &&
+           mScrollableRect.IsEqualEdges(aOther.mScrollableRect) &&
+           mCumulativeResolution == aOther.mCumulativeResolution &&
+           mDevPixelsPerCSSPixel == aOther.mDevPixelsPerCSSPixel &&
+           mScrollOffset == aOther.mScrollOffset &&
+           mScrollGeneration == aOther.mScrollGeneration &&
+           mBoundingCompositionSize == aOther.mBoundingCompositionSize &&
+           mPresShellId == aOther.mPresShellId &&
+           mLayoutViewport.IsEqualEdges(aOther.mLayoutViewport) &&
+           mTransformToAncestorScale == aOther.mTransformToAncestorScale &&
+           mPaintRequestTime == aOther.mPaintRequestTime &&
+           mVisualDestination == aOther.mVisualDestination &&
+           mVisualScrollUpdateType == aOther.mVisualScrollUpdateType &&
+           mInteractiveWidget == aOther.mInteractiveWidget &&
+           mIsRootContent == aOther.mIsRootContent &&
+           mIsScrollInfoLayer == aOther.mIsScrollInfoLayer &&
+           mHasNonZeroDisplayPortMargins ==
+               aOther.mHasNonZeroDisplayPortMargins &&
+           mMinimalDisplayPort == aOther.mMinimalDisplayPort &&
+           mFixedLayerMargins == aOther.mFixedLayerMargins &&
+           mCompositionSizeWithoutDynamicToolbar ==
+               aOther.mCompositionSizeWithoutDynamicToolbar &&
+           mIsSoftwareKeyboardVisible == aOther.mIsSoftwareKeyboardVisible;
+  }
+
+  bool operator!=(const FrameMetrics& aOther) const {
+    return !operator==(aOther);
+  }
+
+  bool IsScrollable() const {
+    return mScrollId != ScrollableLayerGuid::NULL_SCROLL_ID;
+  }
+
+  CSSToScreenScale2D DisplayportPixelsPerCSSPixel() const {
+    return mZoom * mTransformToAncestorScale;
+  }
+
+  CSSToLayerScale LayersPixelsPerCSSPixel() const {
+    return mDevPixelsPerCSSPixel * mCumulativeResolution;
+  }
+
+  LayerToParentLayerScale GetAsyncZoom() const {
+    return mZoom / LayersPixelsPerCSSPixel();
+  }
+
+  CSSRect GetExpandedScrollableRect() const {
+    CSSRect scrollableRect = mScrollableRect;
+    CSSSize compSize = CalculateCompositedSizeInCssPixels();
+    if (scrollableRect.Width() < compSize.width) {
+      scrollableRect.SetRectX(
+          std::max(0.f, scrollableRect.X() -
+                            (compSize.width - scrollableRect.Width())),
+          compSize.width);
+    }
+
+    if (scrollableRect.Height() < compSize.height) {
+      scrollableRect.SetRectY(
+          std::max(0.f, scrollableRect.Y() -
+                            (compSize.height - scrollableRect.Height())),
+          compSize.height);
+    }
+
+    return scrollableRect;
+  }
+
+  CSSSize CalculateCompositedSizeInCssPixels() const {
+    return CalculateCompositedSizeInCssPixels(mCompositionBounds, mZoom);
+  }
+
+  OuterCSSRect CalculateCompositionBoundsInOuterCssPixels() const {
+    if (GetZoom() == CSSToParentLayerScale(0)) {
+      return OuterCSSRect();  
+    }
+    return mCompositionBounds / GetZoom() * GetCSSToOuterCSSScale();
+  }
+
+  CSSSize CalculateBoundedCompositedSizeInCssPixels() const {
+    CSSSize size = CalculateCompositedSizeInCssPixels();
+    size.width = std::min(size.width, mBoundingCompositionSize.width);
+    size.height = std::min(size.height, mBoundingCompositionSize.height);
+    return size;
+  }
+
+  CSSRect CalculateScrollRange() const {
+    return CalculateScrollRange(mScrollableRect, mCompositionBounds, mZoom);
+  }
+
+  void ScrollBy(const CSSPoint& aPoint) {
+    SetVisualScrollOffset(GetVisualScrollOffset() + aPoint);
+  }
+
+  void ZoomBy(float aScale) { mZoom.scale *= aScale; }
+
+  bool ApplyScrollUpdateFrom(const ScrollPositionUpdate& aUpdate);
+
+  enum class IsDefaultApzc {
+    No,
+    Yes,
+  };
+  CSSPoint ApplyRelativeScrollUpdateFrom(const ScrollPositionUpdate& aUpdate,
+                                         IsDefaultApzc aIsDefaultApzc);
+
+  CSSPoint ApplyPureRelativeScrollUpdateFrom(
+      const ScrollPositionUpdate& aUpdate);
+
+  void UpdatePendingScrollInfo(const ScrollPositionUpdate& aInfo);
+
+  bool ScrollLayoutViewportTo(const CSSPoint& aDestination);
+
+ public:
+  void SetPresShellResolution(float aPresShellResolution) {
+    mPresShellResolution = aPresShellResolution;
+  }
+
+  float GetPresShellResolution() const { return mPresShellResolution; }
+
+  void SetCompositionBounds(const ParentLayerRect& aCompositionBounds) {
+    mCompositionBounds = aCompositionBounds;
+  }
+
+  const ParentLayerRect& GetCompositionBounds() const {
+    return mCompositionBounds;
+  }
+
+  void SetCompositionBoundsWidthIgnoringScrollbars(
+      const ParentLayerCoord aCompositionBoundsWidthIgnoringScrollbars) {
+    mCompositionBoundsWidthIgnoringScrollbars =
+        aCompositionBoundsWidthIgnoringScrollbars;
+  }
+
+  const ParentLayerCoord GetCompositionBoundsWidthIgnoringScrollbars() const {
+    return mCompositionBoundsWidthIgnoringScrollbars;
+  }
+
+  void SetDisplayPort(const CSSRect& aDisplayPort) {
+    mDisplayPort = aDisplayPort;
+  }
+
+  const CSSRect& GetDisplayPort() const { return mDisplayPort; }
+
+  void SetCumulativeResolution(
+      const LayoutDeviceToLayerScale& aCumulativeResolution) {
+    mCumulativeResolution = aCumulativeResolution;
+  }
+
+  const LayoutDeviceToLayerScale& GetCumulativeResolution() const {
+    return mCumulativeResolution;
+  }
+
+  void SetDevPixelsPerCSSPixel(
+      const CSSToLayoutDeviceScale& aDevPixelsPerCSSPixel) {
+    mDevPixelsPerCSSPixel = aDevPixelsPerCSSPixel;
+  }
+
+  const CSSToLayoutDeviceScale& GetDevPixelsPerCSSPixel() const {
+    return mDevPixelsPerCSSPixel;
+  }
+
+  CSSToOuterCSSScale GetCSSToOuterCSSScale() const {
+    return CSSToOuterCSSScale(mPresShellResolution);
+  }
+
+  void SetIsRootContent(bool aIsRootContent) {
+    mIsRootContent = aIsRootContent;
+  }
+
+  bool IsRootContent() const { return mIsRootContent; }
+
+  bool ClampAndSetVisualScrollOffset(const CSSPoint& aScrollOffset) {
+    CSSPoint offsetBefore = GetVisualScrollOffset();
+    SetVisualScrollOffset(CalculateScrollRange().ClampPoint(aScrollOffset));
+    return (offsetBefore != GetVisualScrollOffset());
+  }
+
+  CSSPoint GetLayoutScrollOffset() const { return mLayoutViewport.TopLeft(); }
+  bool SetLayoutScrollOffset(const CSSPoint& aLayoutScrollOffset) {
+    CSSPoint offsetBefore = GetLayoutScrollOffset();
+    mLayoutViewport.MoveTo(aLayoutScrollOffset);
+    return (offsetBefore != GetLayoutScrollOffset());
+  }
+
+  const CSSPoint& GetVisualScrollOffset() const { return mScrollOffset; }
+  void SetVisualScrollOffset(const CSSPoint& aVisualScrollOffset) {
+    mScrollOffset = aVisualScrollOffset;
+  }
+
+  void SetZoom(const CSSToParentLayerScale& aZoom) { mZoom = aZoom; }
+
+  const CSSToParentLayerScale& GetZoom() const { return mZoom; }
+
+  void SetScrollGeneration(
+      const MainThreadScrollGeneration& aScrollGeneration) {
+    mScrollGeneration = aScrollGeneration;
+  }
+
+  MainThreadScrollGeneration GetScrollGeneration() const {
+    return mScrollGeneration;
+  }
+
+  ViewID GetScrollId() const { return mScrollId; }
+
+  void SetScrollId(ViewID scrollId) { mScrollId = scrollId; }
+
+  void SetBoundingCompositionSize(const CSSSize& aBoundingCompositionSize) {
+    mBoundingCompositionSize = aBoundingCompositionSize;
+  }
+
+  const CSSSize& GetBoundingCompositionSize() const {
+    return mBoundingCompositionSize;
+  }
+
+  uint32_t GetPresShellId() const { return mPresShellId; }
+
+  void SetPresShellId(uint32_t aPresShellId) { mPresShellId = aPresShellId; }
+
+  void SetLayoutViewport(const CSSRect& aLayoutViewport) {
+    mLayoutViewport = aLayoutViewport;
+  }
+
+  const CSSRect& GetLayoutViewport() const { return mLayoutViewport; }
+
+  CSSRect GetVisualViewport() const {
+    return CSSRect(GetVisualScrollOffset(),
+                   CalculateCompositedSizeInCssPixels());
+  }
+
+  CSSRect GetVisualViewportForLayoutViewportContainment(
+      ScreenCoord aFixedLayerBottomMargin = 0) const;
+
+  void SetTransformToAncestorScale(
+      const ParentLayerToScreenScale2D& aTransformToAncestorScale) {
+    mTransformToAncestorScale = aTransformToAncestorScale;
+  }
+
+  const ParentLayerToScreenScale2D& GetTransformToAncestorScale() const {
+    return mTransformToAncestorScale;
+  }
+
+  const CSSRect& GetScrollableRect() const { return mScrollableRect; }
+
+  void SetScrollableRect(const CSSRect& aScrollableRect) {
+    mScrollableRect = aScrollableRect;
+  }
+
+  bool IsHorizontalContentRightToLeft() const { return mScrollableRect.x < 0; }
+
+  void SetPaintRequestTime(const TimeStamp& aTime) {
+    mPaintRequestTime = aTime;
+  }
+  const TimeStamp& GetPaintRequestTime() const { return mPaintRequestTime; }
+
+  void SetIsScrollInfoLayer(bool aIsScrollInfoLayer) {
+    mIsScrollInfoLayer = aIsScrollInfoLayer;
+  }
+  bool IsScrollInfoLayer() const { return mIsScrollInfoLayer; }
+
+  void SetHasNonZeroDisplayPortMargins(bool aHasNonZeroDisplayPortMargins) {
+    mHasNonZeroDisplayPortMargins = aHasNonZeroDisplayPortMargins;
+  }
+  bool HasNonZeroDisplayPortMargins() const {
+    return mHasNonZeroDisplayPortMargins;
+  }
+
+  void SetMinimalDisplayPort(bool aMinimalDisplayPort) {
+    mMinimalDisplayPort = aMinimalDisplayPort;
+  }
+  bool IsMinimalDisplayPort() const { return mMinimalDisplayPort; }
+
+  void SetIsSoftwareKeyboardVisible(bool aValue) {
+    mIsSoftwareKeyboardVisible = aValue;
+  }
+  bool IsSoftwareKeyboardVisible() const { return mIsSoftwareKeyboardVisible; }
+
+  void SetInteractiveWidget(dom::InteractiveWidget aInteractiveWidget) {
+    mInteractiveWidget = aInteractiveWidget;
+  }
+  dom::InteractiveWidget GetInteractiveWidget() const {
+    return mInteractiveWidget;
+  }
+
+  void SetVisualDestination(const CSSPoint& aVisualDestination) {
+    mVisualDestination = aVisualDestination;
+  }
+  const CSSPoint& GetVisualDestination() const { return mVisualDestination; }
+
+  void SetVisualScrollUpdateType(ScrollOffsetUpdateType aUpdateType) {
+    mVisualScrollUpdateType = aUpdateType;
+  }
+  ScrollOffsetUpdateType GetVisualScrollUpdateType() const {
+    return mVisualScrollUpdateType;
+  }
+
+  void RecalculateLayoutViewportOffset(ScreenCoord aFixedLayerBottomMargin = 0);
+
+  void SetFixedLayerMargins(const ScreenMargin& aFixedLayerMargins) {
+    mFixedLayerMargins = aFixedLayerMargins;
+  }
+  const ScreenMargin& GetFixedLayerMargins() const {
+    return mFixedLayerMargins;
+  }
+
+  void SetCompositionSizeWithoutDynamicToolbar(const ParentLayerSize& aSize) {
+    MOZ_ASSERT(mIsRootContent);
+    mCompositionSizeWithoutDynamicToolbar = aSize;
+  }
+  const ParentLayerSize& GetCompositionSizeWithoutDynamicToolbar() const {
+    MOZ_ASSERT(mIsRootContent);
+    return mCompositionSizeWithoutDynamicToolbar;
+  }
+
+  static void KeepLayoutViewportEnclosingVisualViewport(
+      const CSSRect& aVisualViewport, const CSSRect& aScrollableRect,
+      CSSRect& aLayoutViewport);
+
+  static CSSRect CalculateScrollRange(const CSSRect& aScrollableRect,
+                                      const ParentLayerRect& aCompositionBounds,
+                                      const CSSToParentLayerScale& aZoom);
+  static CSSSize CalculateCompositedSizeInCssPixels(
+      const ParentLayerRect& aCompositionBounds,
+      const CSSToParentLayerScale& aZoom);
+
+ private:
+  ViewID mScrollId;
+
+  float mPresShellResolution;
+
+  ParentLayerRect mCompositionBounds;
+
+  ParentLayerCoord mCompositionBoundsWidthIgnoringScrollbars;
+
+  CSSRect mDisplayPort;
+
+  CSSRect mScrollableRect;
+
+  LayoutDeviceToLayerScale mCumulativeResolution;
+
+  CSSToLayoutDeviceScale mDevPixelsPerCSSPixel;
+
+  CSSPoint mScrollOffset;
+
+  CSSToParentLayerScale mZoom;
+
+  MainThreadScrollGeneration mScrollGeneration;
+
+  CSSSize mBoundingCompositionSize;
+
+  uint32_t mPresShellId;
+
+  CSSRect mLayoutViewport;
+
+  ParentLayerToScreenScale2D mTransformToAncestorScale;
+
+  TimeStamp mPaintRequestTime;
+
+  CSSPoint mVisualDestination;
+  ScrollOffsetUpdateType mVisualScrollUpdateType;
+
+  ScreenMargin mFixedLayerMargins;
+
+  ParentLayerSize mCompositionSizeWithoutDynamicToolbar;
+
+  dom::InteractiveWidget mInteractiveWidget;
+
+  bool mIsRootContent : 1;
+
+  bool mIsScrollInfoLayer : 1;
+
+  bool mHasNonZeroDisplayPortMargins : 1;
+
+  bool mMinimalDisplayPort : 1;
+
+  bool mIsSoftwareKeyboardVisible : 1;
+
+};
+
+// clang-format off
+MOZ_DEFINE_ENUM_CLASS_WITH_BASE(
+  OverscrollBehavior, uint8_t, (
+    Auto,
+    Contain,
+    None
+));
+// clang-format on
+
+std::ostream& operator<<(std::ostream& aStream,
+                         const OverscrollBehavior& aBehavior);
+
+struct OverscrollBehaviorInfo final {
+  OverscrollBehaviorInfo();
+
+  static OverscrollBehaviorInfo FromStyleConstants(
+      StyleOverscrollBehavior aBehaviorX, StyleOverscrollBehavior aBehaviorY);
+
+  bool operator==(const OverscrollBehaviorInfo& aOther) const;
+  friend std::ostream& operator<<(std::ostream& aStream,
+                                  const OverscrollBehaviorInfo& aInfo);
+
+  auto MutTiedFields() { return std::tie(mBehaviorX, mBehaviorY); }
+
+  OverscrollBehavior mBehaviorX;
+  OverscrollBehavior mBehaviorY;
+};
+
+struct OverflowInfo final {
+  StyleOverflow mOverflowX = StyleOverflow::Visible;
+  StyleOverflow mOverflowY = StyleOverflow::Visible;
+
+  bool operator==(const OverflowInfo& aOther) const;
+
+  auto MutTiedFields() { return std::tie(mOverflowX, mOverflowY); }
+};
+
+struct ScrollMetadata {
+  friend struct IPC::ParamTraits<mozilla::layers::ScrollMetadata>;
+  friend std::ostream& operator<<(std::ostream& aStream,
+                                  const ScrollMetadata& aMetadata);
+
+  typedef ScrollableLayerGuid::ViewID ViewID;
+
+ public:
+  static StaticAutoPtr<const ScrollMetadata>
+      sNullMetadata;  
+
+  ScrollMetadata()
+      : mScrollParentId(ScrollableLayerGuid::NULL_SCROLL_ID),
+        mLineScrollAmount(0, 0),
+        mPageScrollAmount(0, 0),
+        mIsLayersIdRoot(false),
+        mIsAutoDirRootContentRTL(false),
+        mForceDisableApz(false),
+        mResolutionUpdated(false),
+        mIsRDMTouchSimulationActive(false),
+        mDidContentGetPainted(true),
+        mForceMousewheelAutodir(false),
+        mForceMousewheelAutodirHonourRoot(false),
+        mIsPaginatedPresentation(false) {}
+
+  bool operator==(const ScrollMetadata& aOther) const {
+    return mMetrics == aOther.mMetrics && mSnapInfo == aOther.mSnapInfo &&
+           mScrollParentId == aOther.mScrollParentId &&
+           mLineScrollAmount == aOther.mLineScrollAmount &&
+           mPageScrollAmount == aOther.mPageScrollAmount &&
+           mIsLayersIdRoot == aOther.mIsLayersIdRoot &&
+           mIsAutoDirRootContentRTL == aOther.mIsAutoDirRootContentRTL &&
+           mForceDisableApz == aOther.mForceDisableApz &&
+           mResolutionUpdated == aOther.mResolutionUpdated &&
+           mIsRDMTouchSimulationActive == aOther.mIsRDMTouchSimulationActive &&
+           mDidContentGetPainted == aOther.mDidContentGetPainted &&
+           mForceMousewheelAutodir == aOther.mForceMousewheelAutodir &&
+           mForceMousewheelAutodirHonourRoot ==
+               aOther.mForceMousewheelAutodirHonourRoot &&
+           mIsPaginatedPresentation == aOther.mIsPaginatedPresentation &&
+           mDisregardedDirection == aOther.mDisregardedDirection &&
+           mOverscrollBehavior == aOther.mOverscrollBehavior &&
+           mOverflow == aOther.mOverflow &&
+           mScrollUpdates == aOther.mScrollUpdates &&
+           mWritingMode == aOther.mWritingMode &&
+           mScrollGenerationOnApz == aOther.mScrollGenerationOnApz;
+  }
+
+  bool operator!=(const ScrollMetadata& aOther) const {
+    return !operator==(aOther);
+  }
+
+  bool IsDefault() const {
+    ScrollMetadata def;
+
+    def.mMetrics.SetPresShellId(mMetrics.GetPresShellId());
+    return (def == *this);
+  }
+
+  FrameMetrics& GetMetrics() { return mMetrics; }
+  const FrameMetrics& GetMetrics() const { return mMetrics; }
+
+  void SetSnapInfo(ScrollSnapInfo&& aSnapInfo) {
+    mSnapInfo = std::move(aSnapInfo);
+  }
+  const ScrollSnapInfo& GetSnapInfo() const { return mSnapInfo; }
+
+  ViewID GetScrollParentId() const { return mScrollParentId; }
+
+  void SetScrollParentId(ViewID aParentId) { mScrollParentId = aParentId; }
+  const nsCString& GetContentDescription() const { return mContentDescription; }
+  void SetContentDescription(const nsCString& aContentDescription) {
+    mContentDescription = aContentDescription;
+  }
+  const LayoutDeviceIntSize& GetLineScrollAmount() const {
+    return mLineScrollAmount;
+  }
+  void SetLineScrollAmount(const LayoutDeviceIntSize& size) {
+    mLineScrollAmount = size;
+  }
+  const LayoutDeviceIntSize& GetPageScrollAmount() const {
+    return mPageScrollAmount;
+  }
+  void SetPageScrollAmount(const LayoutDeviceIntSize& size) {
+    mPageScrollAmount = size;
+  }
+  void SetIsLayersIdRoot(bool aValue) { mIsLayersIdRoot = aValue; }
+  bool IsLayersIdRoot() const { return mIsLayersIdRoot; }
+  void SetIsAutoDirRootContentRTL(bool aValue) {
+    mIsAutoDirRootContentRTL = aValue;
+  }
+  bool IsAutoDirRootContentRTL() const { return mIsAutoDirRootContentRTL; }
+  void SetForceDisableApz(bool aForceDisable) {
+    mForceDisableApz = aForceDisable;
+  }
+  bool IsApzForceDisabled() const { return mForceDisableApz; }
+  void SetResolutionUpdated(bool aUpdated) { mResolutionUpdated = aUpdated; }
+  bool IsResolutionUpdated() const { return mResolutionUpdated; }
+
+  void SetIsRDMTouchSimulationActive(bool aValue) {
+    mIsRDMTouchSimulationActive = aValue;
+  }
+  bool GetIsRDMTouchSimulationActive() const {
+    return mIsRDMTouchSimulationActive;
+  }
+
+  void SetForceMousewheelAutodir(bool aValue) {
+    mForceMousewheelAutodir = aValue;
+  }
+  bool ForceMousewheelAutodir() const { return mForceMousewheelAutodir; }
+
+  void SetForceMousewheelAutodirHonourRoot(bool aValue) {
+    mForceMousewheelAutodirHonourRoot = aValue;
+  }
+  bool ForceMousewheelAutodirHonourRoot() const {
+    return mForceMousewheelAutodirHonourRoot;
+  }
+
+  void SetIsPaginatedPresentation(bool aValue) {
+    mIsPaginatedPresentation = aValue;
+  }
+  bool IsPaginatedPresentation() const { return mIsPaginatedPresentation; }
+
+  bool DidContentGetPainted() const { return mDidContentGetPainted; }
+
+ private:
+  void SetDidContentGetPainted(bool aValue) { mDidContentGetPainted = aValue; }
+
+ public:
+  Maybe<ScrollDirection> GetDisregardedDirection() const {
+    return mDisregardedDirection;
+  }
+  void SetDisregardedDirection(const Maybe<ScrollDirection>& aValue) {
+    mDisregardedDirection = aValue;
+  }
+
+  void SetOverscrollBehavior(
+      const OverscrollBehaviorInfo& aOverscrollBehavior) {
+    mOverscrollBehavior = aOverscrollBehavior;
+  }
+  const OverscrollBehaviorInfo& GetOverscrollBehavior() const {
+    return mOverscrollBehavior;
+  }
+
+  void SetOverflow(const OverflowInfo& aOverflow) { mOverflow = aOverflow; }
+  const OverflowInfo& GetOverflow() const { return mOverflow; }
+
+  void SetScrollUpdates(const nsTArray<ScrollPositionUpdate>& aUpdates) {
+    mScrollUpdates = aUpdates;
+  }
+
+  const nsTArray<ScrollPositionUpdate>& GetScrollUpdates() const {
+    return mScrollUpdates;
+  }
+
+  void SetWritingMode(const WritingMode aWritingMode) {
+    mWritingMode = aWritingMode;
+  }
+  const WritingMode GetWritingMode() const { return mWritingMode; }
+
+  void SetScrollGenerationOnApz(const APZScrollGeneration& aGeneration) {
+    mScrollGenerationOnApz = aGeneration;
+  }
+  const APZScrollGeneration& GetScrollGenerationOnApz() const {
+    return mScrollGenerationOnApz;
+  }
+
+  void UpdatePendingScrollInfo(nsTArray<ScrollPositionUpdate>&& aUpdates) {
+    MOZ_ASSERT(!aUpdates.IsEmpty());
+    mMetrics.UpdatePendingScrollInfo(aUpdates.LastElement());
+
+    mDidContentGetPainted = false;
+    mScrollUpdates.Clear();
+    mScrollUpdates.AppendElements(std::move(aUpdates));
+  }
+
+  void PrependUpdates(const nsTArray<ScrollPositionUpdate>& aUpdates) {
+    MOZ_ASSERT(!aUpdates.IsEmpty());
+
+    mScrollUpdates.InsertElementsAt(0, aUpdates);
+  }
+
+ private:
+  FrameMetrics mMetrics;
+
+  ScrollSnapInfo mSnapInfo;
+
+  ViewID mScrollParentId;
+
+  nsCString mContentDescription;
+
+  LayoutDeviceIntSize mLineScrollAmount;
+
+  LayoutDeviceIntSize mPageScrollAmount;
+
+  bool mIsLayersIdRoot : 1;
+
+  bool mIsAutoDirRootContentRTL : 1;
+
+  bool mForceDisableApz : 1;
+
+  bool mResolutionUpdated : 1;
+
+  bool mIsRDMTouchSimulationActive : 1;
+
+  bool mDidContentGetPainted : 1;
+
+  bool mForceMousewheelAutodir : 1;
+  bool mForceMousewheelAutodirHonourRoot : 1;
+
+  bool mIsPaginatedPresentation : 1;
+
+  Maybe<ScrollDirection> mDisregardedDirection;
+
+  OverscrollBehaviorInfo mOverscrollBehavior;
+
+  OverflowInfo mOverflow;
+
+  CopyableTArray<ScrollPositionUpdate> mScrollUpdates;
+
+  WritingMode mWritingMode;
+
+  APZScrollGeneration mScrollGenerationOnApz;
+
+};
+
+typedef nsTHashMap<ScrollableLayerGuid::ViewIDHashKey,
+                   nsTArray<ScrollPositionUpdate>>
+    ScrollUpdatesMap;
+
+}  
+}  
+
+#endif /* GFX_FRAMEMETRICS_H */

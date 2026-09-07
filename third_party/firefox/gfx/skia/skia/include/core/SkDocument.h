@@ -1,0 +1,58 @@
+/*
+ * Copyright 2013 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkDocument_DEFINED)
+#define SkDocument_DEFINED
+
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkScalar.h"
+#include "include/private/base/SkAPI.h"
+
+class SkCanvas;
+class SkWStream;
+struct SkRect;
+
+static constexpr SkScalar SK_ScalarDefaultRasterDPI = 72.0f;
+
+class SK_API SkDocument : public SkRefCnt {
+public:
+
+    SkCanvas* beginPage(SkScalar width, SkScalar height, const SkRect* content = nullptr);
+
+    void endPage();
+
+    void close();
+
+    void abort();
+
+protected:
+    explicit SkDocument(SkWStream*);
+
+    ~SkDocument() override;
+
+    virtual SkCanvas* onBeginPage(SkScalar width, SkScalar height) = 0;
+    virtual void onEndPage() = 0;
+    virtual void onClose(SkWStream*) = 0;
+    virtual void onAbort() = 0;
+
+    SkWStream* getStream() { return fStream; }
+
+    enum State {
+        kBetweenPages_State,
+        kInPage_State,
+        kClosed_State
+    };
+    State getState() const { return fState; }
+
+private:
+    SkWStream* fStream;
+    State      fState;
+
+    using INHERITED = SkRefCnt;
+};
+
+#endif

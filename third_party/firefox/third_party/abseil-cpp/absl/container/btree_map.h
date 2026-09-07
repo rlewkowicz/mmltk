@@ -1,0 +1,270 @@
+// Copyright 2018 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef ABSL_CONTAINER_BTREE_MAP_H_
+#define ABSL_CONTAINER_BTREE_MAP_H_
+
+#include <functional>
+#include <memory>
+#include <type_traits>
+#include <utility>
+
+#include "absl/base/attributes.h"
+#include "absl/container/internal/btree.h"  // IWYU pragma: export
+#include "absl/container/internal/btree_container.h"  // IWYU pragma: export
+#include "absl/container/internal/common.h"
+#include "absl/container/internal/container_memory.h"
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+
+namespace container_internal {
+
+template <typename Key, typename Data, typename... Params>
+struct map_params_impl;
+
+template <typename Key, typename Data>
+struct btree_map_defaults {
+  using Compare = std::less<Key>;
+  using Alloc = std::allocator<std::pair<const Key, Data>>;
+  using TargetNodeSize = std::integral_constant<int, 256>;
+  using IsMulti = std::false_type;
+};
+
+template <typename Key, typename Data, typename Compare, typename Alloc,
+          int TargetNodeSize, bool IsMulti>
+using map_params = typename ApplyWithoutDefaultSuffix<
+    map_params_impl,
+    TypeList<void, void, typename btree_map_defaults<Key, Data>::Compare,
+             typename btree_map_defaults<Key, Data>::Alloc,
+             typename btree_map_defaults<Key, Data>::TargetNodeSize,
+             typename btree_map_defaults<Key, Data>::IsMulti>,
+    TypeList<Key, Data, Compare, Alloc,
+             std::integral_constant<int, TargetNodeSize>,
+             std::integral_constant<bool, IsMulti>>>::type;
+
+}  
+
+template <typename Key, typename Value, typename Compare = std::less<Key>,
+          typename Alloc = std::allocator<std::pair<const Key, Value>>>
+class ABSL_ATTRIBUTE_OWNER btree_map
+    : public container_internal::btree_map_container<
+          container_internal::btree<container_internal::map_params<
+              Key, Value, Compare, Alloc, 256,
+              false>>> {
+  using Base = typename btree_map::btree_map_container;
+
+ public:
+  btree_map() {}
+  using Base::Base;
+
+  using Base::begin;
+
+  using Base::cbegin;
+
+  using Base::end;
+
+  using Base::cend;
+
+  using Base::empty;
+
+  using Base::max_size;
+
+  using Base::size;
+
+  using Base::clear;
+
+  using Base::erase;
+
+  using Base::insert;
+
+  using Base::insert_or_assign;
+
+  using Base::emplace;
+
+  using Base::emplace_hint;
+
+  using Base::try_emplace;
+
+  using Base::extract;
+
+  using Base::extract_and_get_next;
+
+  using Base::merge;
+
+  using Base::swap;
+
+  using Base::at;
+
+  using Base::contains;
+
+  using Base::count;
+
+  using Base::equal_range;
+
+  using Base::find;
+
+  using Base::lower_bound;
+
+  using Base::upper_bound;
+
+  using Base::operator[];
+
+  using Base::get_allocator;
+
+  using Base::key_comp;
+
+  using Base::value_comp;
+};
+
+template <typename K, typename V, typename C, typename A>
+void swap(btree_map<K, V, C, A> &x, btree_map<K, V, C, A> &y) {
+  return x.swap(y);
+}
+
+template <typename K, typename V, typename C, typename A, typename Pred>
+typename btree_map<K, V, C, A>::size_type erase_if(
+    btree_map<K, V, C, A> &map, Pred pred) {
+  return container_internal::btree_access::erase_if(map, std::move(pred));
+}
+
+template <typename Key, typename Value, typename Compare = std::less<Key>,
+          typename Alloc = std::allocator<std::pair<const Key, Value>>>
+class ABSL_ATTRIBUTE_OWNER btree_multimap
+    : public container_internal::btree_multimap_container<
+          container_internal::btree<container_internal::map_params<
+              Key, Value, Compare, Alloc, 256,
+              true>>> {
+  using Base = typename btree_multimap::btree_multimap_container;
+
+ public:
+  btree_multimap() {}
+  using Base::Base;
+
+  using Base::begin;
+
+  using Base::cbegin;
+
+  using Base::end;
+
+  using Base::cend;
+
+  using Base::empty;
+
+  using Base::max_size;
+
+  using Base::size;
+
+  using Base::clear;
+
+  using Base::erase;
+
+  using Base::insert;
+
+  using Base::emplace;
+
+  using Base::emplace_hint;
+
+  using Base::extract;
+
+  using Base::extract_and_get_next;
+
+  using Base::merge;
+
+  using Base::swap;
+
+  using Base::contains;
+
+  using Base::count;
+
+  using Base::equal_range;
+
+  using Base::find;
+
+  using Base::lower_bound;
+
+  using Base::upper_bound;
+
+  using Base::get_allocator;
+
+  using Base::key_comp;
+
+  using Base::value_comp;
+};
+
+template <typename K, typename V, typename C, typename A>
+void swap(btree_multimap<K, V, C, A> &x, btree_multimap<K, V, C, A> &y) {
+  return x.swap(y);
+}
+
+template <typename K, typename V, typename C, typename A, typename Pred>
+typename btree_multimap<K, V, C, A>::size_type erase_if(
+    btree_multimap<K, V, C, A> &map, Pred pred) {
+  return container_internal::btree_access::erase_if(map, std::move(pred));
+}
+
+namespace container_internal {
+
+template <typename Key, typename Data, typename... Params>
+struct map_params_impl
+    : common_params<
+          Key,
+          GetFromListOr<typename btree_map_defaults<Key, Data>::Compare, 0,
+                        Params...>,
+          GetFromListOr<typename btree_map_defaults<Key, Data>::Alloc, 1,
+                        Params...>,
+          GetFromListOr<typename btree_map_defaults<Key, Data>::TargetNodeSize,
+                        2, Params...>::value,
+          GetFromListOr<typename btree_map_defaults<Key, Data>::IsMulti, 3,
+                        Params...>::value,
+          true, map_slot_policy<Key, Data>> {
+  using super_type = typename map_params_impl::common_params;
+  using mapped_type = Data;
+  using slot_policy = typename super_type::slot_policy;
+  using slot_type = typename super_type::slot_type;
+  using value_type = typename super_type::value_type;
+  using init_type = typename super_type::init_type;
+
+  static_assert(
+      std::is_same_v<
+          map_params<
+              Key, Data,
+              GetFromListOr<typename btree_map_defaults<Key, Data>::Compare, 0,
+                            Params...>,
+              GetFromListOr<typename btree_map_defaults<Key, Data>::Alloc, 1,
+                            Params...>,
+              GetFromListOr<
+                  typename btree_map_defaults<Key, Data>::TargetNodeSize, 2,
+                  Params...>::value,
+              GetFromListOr<typename btree_map_defaults<Key, Data>::IsMulti, 3,
+                            Params...>::value>,
+          map_params_impl>);
+
+  template <typename V>
+  static auto key(const V &value ABSL_ATTRIBUTE_LIFETIME_BOUND)
+      -> decltype((value.first)) {
+    return value.first;
+  }
+  static const Key &key(const slot_type *s) { return slot_policy::key(s); }
+  static const Key &key(slot_type *s) { return slot_policy::key(s); }
+  static auto mutable_key(slot_type *s)
+      -> decltype(slot_policy::mutable_key(s)) {
+    return slot_policy::mutable_key(s);
+  }
+  static mapped_type &value(value_type *value) { return value->second; }
+};
+
+}  
+
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_CONTAINER_BTREE_MAP_H_

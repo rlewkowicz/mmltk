@@ -1,0 +1,147 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef wasm_WasmStructLayout_h
+#define wasm_WasmStructLayout_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Vector.h"
+
+#include <stdint.h>
+
+#include "vm/MallocProvider.h"
+#include "wasm/WasmConstants.h"  // MaxStructFields
+
+
+namespace js::wasm {
+
+const size_t WasmStructObject_Size_ASSUMED = 16;
+
+#ifdef JS_64BIT
+const size_t WasmStructObject_MaxInlineBytes_ASSUMED = 136;
+#else
+const size_t WasmStructObject_MaxInlineBytes_ASSUMED = 128;
+#endif
+
+
+
+class FieldAccessPath {
+  uint32_t path_;
+  static constexpr uint32_t ILBits = 9;
+  static constexpr uint32_t OOLBits = 32 - ILBits;
+  static constexpr uint32_t MaxValidILOffset = (1 << ILBits) - 1;
+  static constexpr uint32_t MaxValidOOLOffset = (1 << OOLBits) - 1 - 1;
+  static constexpr uint32_t InvalidOOLOffset = MaxValidOOLOffset + 1;
+  uint32_t getIL() const { return path_ & MaxValidILOffset; }
+  uint32_t getOOL() const { return path_ >> ILBits; }
+  static_assert((WasmStructObject_Size_ASSUMED +
+                 WasmStructObject_MaxInlineBytes_ASSUMED) < MaxValidILOffset);
+  static_assert(js::wasm::MaxStructFields * 64 < MaxValidOOLOffset);
+
+ public:
+  FieldAccessPath() : path_(0) {}
+  explicit FieldAccessPath(uint32_t offsetIL)
+      : path_((InvalidOOLOffset << ILBits) | offsetIL) {
+    MOZ_ASSERT(offsetIL <= MaxValidILOffset);
+  }
+  FieldAccessPath(uint32_t offsetIL, uint32_t offsetOOL)
+      : path_((offsetOOL << ILBits) | offsetIL) {
+    MOZ_ASSERT(offsetIL <= MaxValidILOffset);
+    MOZ_ASSERT(offsetOOL <= MaxValidOOLOffset);
+  }
+  bool hasOOL() const { return getOOL() != InvalidOOLOffset; }
+  uint32_t ilOffset() const { return getIL(); }
+  uint32_t oolOffset() const {
+    MOZ_ASSERT(hasOOL());
+    return getOOL();
+  }
+};
+
+static_assert(sizeof(FieldAccessPath) == sizeof(uint32_t));
+
+
+
+
+class BitVector {
+ public:
+  enum class Result { OOM, OK, Fail };
+
+ private:
+  static const uint32_t LookbackLimit = 24;
+  static_assert(LookbackLimit > (2 * 3));
+  static_assert(LookbackLimit > WasmStructObject_MaxInlineBytes_ASSUMED / 8);
+
+ public:
+  mozilla::Vector<uint8_t, 64, SystemAllocPolicy> chunks_;
+
+  uint32_t hashNonZero() const;
+
+  uint32_t totalOffset() const;
+
+  Result addMoreChunks();
+
+  Result init(uint32_t chunksReserved, uint32_t chunksTotal);
+
+  Result allocate(uint32_t size, uint32_t firstChunk, uint32_t lastChunkPlus1,
+                  uint32_t* offset);
+
+  void deallocate(uint32_t offset, uint32_t size);
+};
+
+
+
+class FixedSizeBitVector : public BitVector {
+  uint32_t chunksTotal_ = 0;
+  uint32_t chunksReserved_ = 0;
+
+ public:
+  Result init(uint32_t layoutBytesReserved, uint32_t layoutBytesTotal);
+
+  Result allocate(uint32_t size, uint32_t* offset);
+};
+
+
+
+class VariableSizeBitVector : public BitVector {
+  bool used_ = false;
+
+ public:
+  Result init();
+
+  Result allocate(uint32_t size, uint32_t* offset);
+
+  bool unused() const;
+
+  uint32_t totalOffset() const;
+};
+
+
+class StructLayout {
+ public:
+  bool init(uint32_t firstUsableILOffset, uint32_t usableILSize);
+
+  bool addField(uint32_t fieldSize, FieldAccessPath* path);
+
+  uint32_t totalSizeIL() const;
+
+  bool hasOOL() const;
+
+  uint32_t totalSizeOOL() const;
+
+  FieldAccessPath oolPointerPath() const;
+
+ private:
+  static const uint32_t InvalidOffset = 0xFFFFFFFF;
+
+  FixedSizeBitVector ilBitVector_;
+  VariableSizeBitVector oolBitVector_;
+  uint32_t oolptrILO_ = InvalidOffset;
+  uint32_t numFieldsProcessed_ = 0;
+
+  uint32_t hash() const;
+};
+
+}  
+
+#endif /* wasm_WasmStructLayout_h */

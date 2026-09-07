@@ -1,0 +1,103 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef VIDEOFRAMECONTAINER_H_
+#define VIDEOFRAMECONTAINER_H_
+
+#include "ImageContainer.h"
+#include "MediaSegment.h"
+#include "VideoSegment.h"
+#include "gfxPoint.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/TimeStamp.h"
+#include "nsCOMPtr.h"
+
+namespace mozilla {
+
+class MediaDecoderOwner;
+
+class VideoFrameContainer {
+  virtual ~VideoFrameContainer();
+
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(VideoFrameContainer)
+
+ public:
+  typedef layers::ImageContainer ImageContainer;
+  typedef layers::Image Image;
+
+  VideoFrameContainer(MediaDecoderOwner* aOwner,
+                      already_AddRefed<ImageContainer> aContainer);
+
+  void SetCurrentFrame(const gfx::IntSize& aIntrinsicSize, Image* aImage,
+                       const TimeStamp& aTargetTime,
+                       const media::TimeUnit& aProcessingDuration,
+                       const media::TimeUnit& aMediaTime);
+  PrincipalHandle GetLastPrincipalHandle();
+  PrincipalHandle GetLastPrincipalHandleLocked() MOZ_REQUIRES(mMutex);
+  void UpdatePrincipalHandleForFrameID(const PrincipalHandle& aPrincipalHandle,
+                                       const ImageContainer::FrameID& aFrameID);
+  void UpdatePrincipalHandleForFrameIDLocked(
+      const PrincipalHandle& aPrincipalHandle,
+      const ImageContainer::FrameID& aFrameID) MOZ_REQUIRES(mMutex);
+  void SetCurrentFrames(
+      const gfx::IntSize& aIntrinsicSize,
+      const nsTArray<ImageContainer::NonOwningImage>& aImages);
+
+  void ClearFutureFrames(TimeStamp aNow = TimeStamp::Now());
+  double GetFrameDelay();
+
+  void ClearCachedResources();
+
+  void ClearImagesInHost(layers::ClearImagesType aType);
+
+  ImageContainer::FrameID NewFrameID() { return ++mFrameID; }
+
+  enum { INVALIDATE_DEFAULT, INVALIDATE_FORCE };
+  void Invalidate() { InvalidateWithFlags(INVALIDATE_DEFAULT); }
+  void InvalidateWithFlags(uint32_t aFlags);
+  ImageContainer* GetImageContainer();
+  void ForgetElement() { mOwner = nullptr; }
+
+  uint32_t GetDroppedImageCount() {
+    MutexAutoLock lock(mMutex);
+    return mImageContainer->GetDroppedImageCount();
+  }
+
+  Maybe<gfx::IntSize> CurrentIntrinsicSize() {
+    MutexAutoLock lock(mMutex);
+    return mIntrinsicSize;
+  }
+
+  bool SupportsOnly8BitImage() const { return mSupportsOnly8BitImage; }
+
+ protected:
+  void SetCurrentFramesLocked(
+      const gfx::IntSize& aIntrinsicSize,
+      const nsTArray<ImageContainer::NonOwningImage>& aImages)
+      MOZ_REQUIRES(mMutex);
+
+  MediaDecoderOwner* mOwner;
+  RefPtr<ImageContainer> mImageContainer;
+
+  struct {
+    bool mImageSizeChanged = false;
+    Maybe<gfx::IntSize> mNewIntrinsicSize;
+  } mMainThreadState;
+
+  Mutex mMutex;
+  Maybe<gfx::IntSize> mIntrinsicSize MOZ_GUARDED_BY(mMutex);
+  ImageContainer::FrameID mFrameID;
+  PrincipalHandle mLastPrincipalHandle MOZ_GUARDED_BY(mMutex);
+  PrincipalHandle mPendingPrincipalHandle MOZ_GUARDED_BY(mMutex);
+  ImageContainer::FrameID mFrameIDForPendingPrincipalHandle
+      MOZ_GUARDED_BY(mMutex);
+
+  const RefPtr<AbstractThread> mMainThread;
+
+  const bool mSupportsOnly8BitImage;
+};
+
+}  
+
+#endif /* VIDEOFRAMECONTAINER_H_ */

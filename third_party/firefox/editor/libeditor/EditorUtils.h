@@ -1,0 +1,418 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_EditorUtils_h
+#define mozilla_EditorUtils_h
+
+#include "mozilla/EditorBase.h"      // for EditorBase
+#include "mozilla/EditorDOMPoint.h"  // for EditorDOMPoint, EditorDOMRange, etc
+#include "mozilla/EditorForwards.h"
+#include "mozilla/IntegerRange.h"       // for IntegerRange
+#include "mozilla/Maybe.h"              // for Maybe
+#include "mozilla/Result.h"             // for Result<>
+#include "mozilla/dom/DataTransfer.h"   // for dom::DataTransfer
+#include "mozilla/dom/Element.h"        // for dom::Element
+#include "mozilla/dom/HTMLBRElement.h"  // for dom::HTMLBRElement
+#include "mozilla/dom/Selection.h"      // for dom::Selection
+#include "mozilla/dom/Text.h"           // for dom::Text
+
+#include "nsAtom.h"          // for nsStaticAtom
+#include "nsCOMPtr.h"        // for nsCOMPtr
+#include "nsContentUtils.h"  // for nsContentUtils
+#include "nsDebug.h"         // for NS_WARNING, etc
+#include "nsError.h"         // for NS_SUCCESS_* and NS_ERROR_*
+#include "nsRange.h"         // for nsRange
+#include "nsString.h"        // for nsAString, nsString, etc
+
+class nsITransferable;
+
+namespace mozilla {
+
+enum class StyleWhiteSpace : uint8_t;
+
+enum class SuggestCaret {
+  OnlyIfHasSuggestion,
+  OnlyIfTransactionsAllowedToDoIt,
+  AndIgnoreTrivialError,
+};
+
+class MOZ_STACK_CLASS CaretPoint {
+ public:
+  explicit CaretPoint(const EditorDOMPoint& aPointToPutCaret)
+      : mCaretPoint(aPointToPutCaret) {}
+  explicit CaretPoint(EditorDOMPoint&& aPointToPutCaret)
+      : mCaretPoint(std::move(aPointToPutCaret)) {}
+
+  CaretPoint(const CaretPoint&) = delete;
+  CaretPoint& operator=(const CaretPoint&) = delete;
+  CaretPoint(CaretPoint&&) = default;
+  CaretPoint& operator=(CaretPoint&&) = default;
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult SuggestCaretPointTo(
+      EditorBase& aEditorBase, const SuggestCaretOptions& aOptions) const;
+
+  void IgnoreCaretPointSuggestion() const { mHandledCaretPoint = true; }
+
+  void ForgetCaretPointSuggestion() { mCaretPoint.Clear(); }
+
+  bool HasCaretPointSuggestion() const { return mCaretPoint.IsSet(); }
+  constexpr const EditorDOMPoint& CaretPointRef() const { return mCaretPoint; }
+  constexpr EditorDOMPoint&& UnwrapCaretPoint() {
+    mHandledCaretPoint = true;
+    return std::move(mCaretPoint);
+  }
+  bool CopyCaretPointTo(EditorDOMPoint& aPointToPutCaret,
+                        const SuggestCaretOptions& aOptions) const {
+    MOZ_ASSERT(!aOptions.contains(SuggestCaret::AndIgnoreTrivialError));
+    MOZ_ASSERT(
+        !aOptions.contains(SuggestCaret::OnlyIfTransactionsAllowedToDoIt));
+    mHandledCaretPoint = true;
+    if (aOptions.contains(SuggestCaret::OnlyIfHasSuggestion) &&
+        !mCaretPoint.IsSet()) {
+      return false;
+    }
+    aPointToPutCaret = mCaretPoint;
+    return true;
+  }
+  bool CopyCaretPointTo(CaretPoint& aCaretPoint,
+                        const SuggestCaretOptions& aOptions) const {
+    return CopyCaretPointTo(aCaretPoint.mCaretPoint, aOptions);
+  }
+  bool MoveCaretPointTo(EditorDOMPoint& aPointToPutCaret,
+                        const SuggestCaretOptions& aOptions) {
+    MOZ_ASSERT(!aOptions.contains(SuggestCaret::AndIgnoreTrivialError));
+    MOZ_ASSERT(
+        !aOptions.contains(SuggestCaret::OnlyIfTransactionsAllowedToDoIt));
+    if (aOptions.contains(SuggestCaret::OnlyIfHasSuggestion) &&
+        !mCaretPoint.IsSet()) {
+      return false;
+    }
+    aPointToPutCaret = UnwrapCaretPoint();
+    return true;
+  }
+  bool MoveCaretPointTo(CaretPoint& aCaretPoint,
+                        const SuggestCaretOptions& aOptions) {
+    return MoveCaretPointTo(aCaretPoint.mCaretPoint, aOptions);
+  }
+  bool CopyCaretPointTo(EditorDOMPoint& aPointToPutCaret,
+                        const EditorBase& aEditorBase,
+                        const SuggestCaretOptions& aOptions) const;
+  bool MoveCaretPointTo(EditorDOMPoint& aPointToPutCaret,
+                        const EditorBase& aEditorBase,
+                        const SuggestCaretOptions& aOptions);
+
+ protected:
+  constexpr bool CaretPointHandled() const { return mHandledCaretPoint; }
+
+  void SetCaretPoint(const EditorDOMPoint& aCaretPoint) {
+    mHandledCaretPoint = false;
+    mCaretPoint = aCaretPoint;
+  }
+  void SetCaretPoint(EditorDOMPoint&& aCaretPoint) {
+    mHandledCaretPoint = false;
+    mCaretPoint = std::move(aCaretPoint);
+  }
+
+  void UnmarkAsHandledCaretPoint() { mHandledCaretPoint = true; }
+
+  CaretPoint() = default;
+
+ private:
+  EditorDOMPoint mCaretPoint;
+  bool mutable mHandledCaretPoint = false;
+
+  friend class AutoTrackDOMPoint;
+};
+
+class MOZ_STACK_CLASS EditActionResult {
+ public:
+  bool Canceled() const { return mCanceled; }
+  bool Handled() const { return mHandled; }
+  bool Ignored() const { return !mCanceled && !mHandled; }
+
+  void MarkAsCanceled() { mCanceled = true; }
+  void MarkAsHandled() { mHandled = true; }
+
+  EditActionResult& operator|=(const EditActionResult& aOther) {
+    mCanceled |= aOther.mCanceled;
+    mHandled |= aOther.mHandled;
+    return *this;
+  }
+
+  static EditActionResult IgnoredResult() {
+    return EditActionResult(false, false);
+  }
+  static EditActionResult HandledResult() {
+    return EditActionResult(false, true);
+  }
+  static EditActionResult CanceledResult() {
+    return EditActionResult(true, true);
+  }
+
+  EditActionResult(const EditActionResult&) = delete;
+  EditActionResult& operator=(const EditActionResult&) = delete;
+  EditActionResult(EditActionResult&&) = default;
+  EditActionResult& operator=(EditActionResult&&) = default;
+
+ protected:
+  EditActionResult(bool aCanceled, bool aHandled)
+      : mCanceled(aCanceled), mHandled(aHandled) {}
+
+  EditActionResult() : mCanceled(false), mHandled(false) {}
+
+  void UnmarkAsCanceled() { mCanceled = false; }
+
+ private:
+  bool mCanceled = false;
+  bool mHandled = false;
+};
+
+template <typename NodeType>
+class MOZ_STACK_CLASS CreateNodeResultBase final : public CaretPoint {
+  using SelfType = CreateNodeResultBase<NodeType>;
+
+ public:
+  bool Handled() const { return mNode; }
+  NodeType* GetNewNode() const { return mNode; }
+  RefPtr<NodeType> UnwrapNewNode() { return std::move(mNode); }
+
+  CreateNodeResultBase() = delete;
+  explicit CreateNodeResultBase(NodeType& aNode) : mNode(&aNode) {}
+  explicit CreateNodeResultBase(NodeType& aNode,
+                                const EditorDOMPoint& aCandidateCaretPoint)
+      : CaretPoint(aCandidateCaretPoint), mNode(&aNode) {}
+  explicit CreateNodeResultBase(NodeType& aNode,
+                                EditorDOMPoint&& aCandidateCaretPoint)
+      : CaretPoint(std::move(aCandidateCaretPoint)), mNode(&aNode) {}
+
+  template <typename NT>
+  explicit CreateNodeResultBase(RefPtr<NT>&& aNode)
+      : mNode(std::forward<RefPtr<NT>>(aNode)) {}
+  template <typename NT>
+  explicit CreateNodeResultBase(RefPtr<NT>&& aNode,
+                                const EditorDOMPoint& aCandidateCaretPoint)
+      : CaretPoint(aCandidateCaretPoint),
+        mNode(std::forward<RefPtr<NT>>(aNode)) {
+    MOZ_ASSERT(mNode);
+  }
+  template <typename NT>
+  explicit CreateNodeResultBase(RefPtr<NT>&& aNode,
+                                EditorDOMPoint&& aCandidateCaretPoint)
+      : CaretPoint(std::move(aCandidateCaretPoint)),
+        mNode(std::forward<RefPtr<NT>>(aNode)) {
+    MOZ_ASSERT(mNode);
+  }
+
+  [[nodiscard]] static SelfType NotHandled() {
+    return SelfType(EditorDOMPoint());
+  }
+  [[nodiscard]] static SelfType NotHandled(
+      const EditorDOMPoint& aPointToPutCaret) {
+    SelfType result(aPointToPutCaret);
+    return result;
+  }
+  [[nodiscard]] static SelfType NotHandled(EditorDOMPoint&& aPointToPutCaret) {
+    SelfType result(std::move(aPointToPutCaret));
+    return result;
+  }
+
+#ifdef DEBUG
+  ~CreateNodeResultBase() {
+    MOZ_ASSERT(!HasCaretPointSuggestion() || CaretPointHandled());
+  }
+#endif
+
+  CreateNodeResultBase(const SelfType& aOther) = delete;
+  SelfType& operator=(const SelfType& aOther) = delete;
+  CreateNodeResultBase(SelfType&& aOther) = default;
+  SelfType& operator=(SelfType&& aOther) = default;
+
+ private:
+  explicit CreateNodeResultBase(const EditorDOMPoint& aCandidateCaretPoint)
+      : CaretPoint(aCandidateCaretPoint) {}
+  explicit CreateNodeResultBase(EditorDOMPoint&& aCandidateCaretPoint)
+      : CaretPoint(std::move(aCandidateCaretPoint)) {}
+
+  RefPtr<NodeType> mNode;
+};
+
+class MOZ_STACK_CLASS InsertTextResult final : public CaretPoint {
+ public:
+  InsertTextResult() : CaretPoint(EditorDOMPoint()) {}
+  template <typename EditorDOMPointType>
+  explicit InsertTextResult(const EditorDOMPointType& aEndOfInsertedText)
+      : CaretPoint(EditorDOMPoint()),
+        mEndOfInsertedText(aEndOfInsertedText.template To<EditorDOMPoint>()) {}
+  explicit InsertTextResult(EditorDOMPoint&& aEndOfInsertedText)
+      : CaretPoint(EditorDOMPoint()),
+        mEndOfInsertedText(std::move(aEndOfInsertedText)) {}
+  template <typename PT, typename CT>
+  InsertTextResult(EditorDOMPoint&& aEndOfInsertedText,
+                   const EditorDOMPointBase<PT, CT>& aCaretPoint)
+      : CaretPoint(aCaretPoint.template To<EditorDOMPoint>()),
+        mEndOfInsertedText(std::move(aEndOfInsertedText)) {}
+  InsertTextResult(EditorDOMPoint&& aEndOfInsertedText,
+                   CaretPoint&& aCaretPoint)
+      : CaretPoint(std::move(aCaretPoint)),
+        mEndOfInsertedText(std::move(aEndOfInsertedText)) {
+    UnmarkAsHandledCaretPoint();
+  }
+  InsertTextResult(InsertTextResult&& aOther, EditorDOMPoint&& aCaretPoint)
+      : CaretPoint(std::move(aCaretPoint)),
+        mEndOfInsertedText(std::move(aOther.mEndOfInsertedText)) {}
+
+  [[nodiscard]] bool Handled() const { return mEndOfInsertedText.IsSet(); }
+  const EditorDOMPoint& EndOfInsertedTextRef() const {
+    return mEndOfInsertedText;
+  }
+
+ private:
+  EditorDOMPoint mEndOfInsertedText;
+};
+
+class MOZ_RAII AutoTransactionBatchExternal final {
+ public:
+  MOZ_CAN_RUN_SCRIPT explicit AutoTransactionBatchExternal(
+      EditorBase& aEditorBase)
+      : mEditorBase(aEditorBase) {
+    MOZ_KnownLive(mEditorBase).BeginTransaction();
+  }
+
+  MOZ_CAN_RUN_SCRIPT ~AutoTransactionBatchExternal() {
+    MOZ_KnownLive(mEditorBase).EndTransaction();
+  }
+
+ private:
+  EditorBase& mEditorBase;
+};
+
+class MOZ_STACK_CLASS AutoSelectionRangeArray final {
+ public:
+  explicit AutoSelectionRangeArray(dom::Selection& aSelection) {
+    for (const uint32_t i : IntegerRange(aSelection.RangeCount())) {
+      MOZ_ASSERT(aSelection.GetRangeAt(i));
+      mRanges.AppendElement(*aSelection.GetRangeAt(i));
+    }
+  }
+
+  AutoTArray<mozilla::OwningNonNull<nsRange>, 8> mRanges;
+};
+
+class MOZ_STACK_CLASS AutoTrackDataTransferForPaste {
+ public:
+  MOZ_CAN_RUN_SCRIPT AutoTrackDataTransferForPaste(
+      const EditorBase& aEditorBase,
+      RefPtr<dom::DataTransfer>& aDataTransferForPaste)
+      : mEditorBase(aEditorBase),
+        mDataTransferForPaste(aDataTransferForPaste.get_address()) {
+    mEditorBase.GetDocument()->ClearClipboardCopyTriggered();
+  }
+
+  ~AutoTrackDataTransferForPaste() { FlushAndStopTracking(); }
+
+ private:
+  void FlushAndStopTracking() {
+    if (!mDataTransferForPaste ||
+        !mEditorBase.GetDocument()->IsClipboardCopyTriggered()) {
+      return;
+    }
+    if (*mDataTransferForPaste) {
+      (*mDataTransferForPaste)->ClearForPaste();
+    }
+    *mDataTransferForPaste = nullptr;
+    mDataTransferForPaste = nullptr;
+  }
+
+  MOZ_KNOWN_LIVE const EditorBase& mEditorBase;
+  RefPtr<dom::DataTransfer>* mDataTransferForPaste;
+};
+
+class EditorUtils final {
+ public:
+  using EditorType = EditorBase::EditorType;
+  using Selection = dom::Selection;
+
+  static bool IsDescendantOf(const nsINode& aNode, const nsINode& aParent,
+                             EditorRawDOMPoint* aOutPoint = nullptr);
+  static bool IsDescendantOf(const nsINode& aNode, const nsINode& aParent,
+                             EditorDOMPoint* aOutPoint);
+
+  static bool IsPaddingBRElementForEmptyEditor(const nsIContent& aContent) {
+    const dom::HTMLBRElement* brElement =
+        dom::HTMLBRElement::FromNode(&aContent);
+    return brElement && brElement->IsPaddingForEmptyEditor();
+  }
+
+  static bool IsPaddingBRElementForEmptyLastLine(const nsIContent& aContent) {
+    const dom::HTMLBRElement* brElement =
+        dom::HTMLBRElement::FromNode(&aContent);
+    return brElement && brElement->IsPaddingForEmptyLastLine();
+  }
+
+  static bool IsEditableContent(const nsIContent& aContent,
+                                EditorType aEditorType) {
+    if (aEditorType == EditorType::HTML &&
+        (!aContent.IsEditable() || !aContent.IsInComposedDoc())) {
+      return false;
+    }
+    return IsElementOrText(aContent);
+  }
+
+  static bool IsElementOrText(const nsIContent& aContent) {
+    if (aContent.IsText()) {
+      return true;
+    }
+    return aContent.IsElement() && !IsPaddingBRElementForEmptyEditor(aContent);
+  }
+
+  static Maybe<std::pair<StyleWhiteSpaceCollapse, StyleTextWrapMode>>
+  GetComputedWhiteSpaceStyles(const nsIContent& aContent);
+
+  static bool IsWhiteSpacePreformatted(const nsIContent& aContent);
+
+  static bool IsNewLinePreformatted(const nsIContent& aContent);
+
+  static bool IsOnlyNewLinePreformatted(const nsIContent& aContent);
+
+  static nsStaticAtom* GetTagNameAtom(const nsAString& aTagName) {
+    if (aTagName.IsEmpty()) {
+      return nullptr;
+    }
+    nsAutoString lowerTagName;
+    nsContentUtils::ASCIIToLower(aTagName, lowerTagName);
+    return NS_GetStaticAtom(lowerTagName);
+  }
+
+  static nsStaticAtom* GetAttributeAtom(const nsAString& aAttribute) {
+    if (aAttribute.IsEmpty()) {
+      return nullptr;  
+    }
+    return NS_GetStaticAtom(aAttribute);
+  }
+
+  template <typename SelectionOrAutoClonedRangeArray>
+  static bool IsFrameSelectionRequiredToExtendSelection(
+      nsIEditor::EDirection aDirectionAndAmount,
+      SelectionOrAutoClonedRangeArray& aSelectionOrAutoClonedRangeArray) {
+    switch (aDirectionAndAmount) {
+      case nsIEditor::eNextWord:
+      case nsIEditor::ePreviousWord:
+      case nsIEditor::eToBeginningOfLine:
+      case nsIEditor::eToEndOfLine:
+        return true;
+      case nsIEditor::ePrevious:
+      case nsIEditor::eNext:
+        return aSelectionOrAutoClonedRangeArray.IsCollapsed();
+      default:
+        return false;
+    }
+  }
+
+  static Result<nsCOMPtr<nsITransferable>, nsresult>
+  CreateTransferableForPlainText(const dom::Document& aDocument);
+};
+
+}  
+
+#endif  // #ifndef mozilla_EditorUtils_h

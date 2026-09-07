@@ -1,0 +1,87 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SECURITY_TRUSTED_TYPES_TRUSTEDTYPEPOLICY_H_
+#define DOM_SECURITY_TRUSTED_TYPES_TRUSTEDTYPEPOLICY_H_
+
+#include "js/TypeDecls.h"
+#include "js/Value.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/TrustedHTML.h"
+#include "mozilla/dom/TrustedScript.h"
+#include "mozilla/dom/TrustedScriptURL.h"
+#include "nsISupportsImpl.h"
+#include "nsString.h"
+#include "nsWrapperCache.h"
+
+template <typename T>
+class nsTArray;
+
+namespace mozilla::dom {
+
+class DOMString;
+class TrustedTypePolicyFactory;
+
+class TrustedTypePolicy : public nsWrapperCache {
+ public:
+  NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(TrustedTypePolicy)
+  NS_DECL_CYCLE_COLLECTION_NATIVE_WRAPPERCACHE_CLASS(TrustedTypePolicy)
+
+  struct Options {
+    RefPtr<CreateHTMLCallback> mCreateHTMLCallback;
+    RefPtr<CreateScriptCallback> mCreateScriptCallback;
+    RefPtr<CreateScriptURLCallback> mCreateScriptURLCallback;
+  };
+
+  TrustedTypePolicy(TrustedTypePolicyFactory* aParentObject,
+                    const nsAString& aName, Options&& aOptions);
+
+  TrustedTypePolicyFactory* GetParentObject() const { return mParentObject; }
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  void GetName(DOMString& aResult) const;
+
+  MOZ_CAN_RUN_SCRIPT already_AddRefed<TrustedHTML> CreateHTML(
+      JSContext* aJSContext, const nsAString& aInput,
+      const Sequence<JS::Value>& aArguments, ErrorResult& aErrorResult) const;
+
+  MOZ_CAN_RUN_SCRIPT already_AddRefed<TrustedScript> CreateScript(
+      JSContext* aJSContext, const nsAString& aInput,
+      const Sequence<JS::Value>& aArguments, ErrorResult& aErrorResult) const;
+
+  MOZ_CAN_RUN_SCRIPT already_AddRefed<TrustedScriptURL> CreateScriptURL(
+      JSContext* aJSContext, const nsAString& aInput,
+      const Sequence<JS::Value>& aArguments, ErrorResult& aErrorResult) const;
+
+  template <typename CallbackObject>
+  MOZ_CAN_RUN_SCRIPT void DetermineTrustedPolicyValue(
+      const RefPtr<CallbackObject>& aCallbackObject, const nsAString& aValue,
+      const nsTArray<JS::Value>& aArguments, bool aThrowIfMissing,
+      ErrorResult& aErrorResult, nsAString& aResult) const;
+
+  const Options& GetOptions() const { return mOptions; }
+
+ private:
+  virtual ~TrustedTypePolicy() = default;
+
+  template <typename T, typename CallbackObject>
+  MOZ_CAN_RUN_SCRIPT already_AddRefed<T> CreateTrustedType(
+      const RefPtr<CallbackObject>& aCallbackObject, const nsAString& aValue,
+      const Sequence<JS::Value>& aArguments, ErrorResult& aErrorResult) const;
+
+  RefPtr<TrustedTypePolicyFactory> mParentObject;
+
+  const nsString mName;
+
+  Options mOptions;
+};
+
+}  
+
+#endif  // DOM_SECURITY_TRUSTED_TYPES_TRUSTEDTYPEPOLICY_H_

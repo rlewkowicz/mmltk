@@ -1,0 +1,392 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef vm_RegExpShared_h
+#define vm_RegExpShared_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/MemoryReporting.h"
+
+#include "gc/Barrier.h"
+#include "gc/Policy.h"
+#include "gc/ZoneAllocator.h"
+#include "irregexp/RegExpTypes.h"
+#include "jit/JitCode.h"
+#include "jit/JitOptions.h"
+#include "js/AllocPolicy.h"
+#include "js/RegExpFlags.h"  // JS::RegExpFlag, JS::RegExpFlags
+#include "js/UbiNode.h"
+#include "js/Vector.h"
+#include "vm/ArrayObject.h"
+
+namespace js {
+
+class ArrayObject;
+class PlainObject;
+class RegExpRealm;
+class RegExpShared;
+class RegExpStatics;
+class VectorMatchPairs;
+
+using RootedRegExpShared = JS::Rooted<RegExpShared*>;
+using HandleRegExpShared = JS::Handle<RegExpShared*>;
+using MutableHandleRegExpShared = JS::MutableHandle<RegExpShared*>;
+
+enum class RegExpRunStatus : int32_t {
+  Error = -1,
+  Success = 1,
+  Success_NotFound = 0,
+};
+
+inline bool IsNativeRegExpEnabled() {
+  return jit::HasJitBackend() && jit::JitOptions.nativeRegExp;
+}
+
+class RegExpShared
+    : public gc::CellWithTenuredGCPointer<gc::TenuredCell, JSAtom> {
+  friend class js::gc::CellAllocator;
+
+ public:
+  enum class Kind : uint32_t { Unparsed, Atom, RegExp };
+  enum class CodeKind { Bytecode, Jitcode, Any };
+
+  using ByteCode = js::irregexp::ByteArrayData;
+  using JitCodeTable = js::irregexp::ByteArray;
+  using JitCodeTables = Vector<JitCodeTable, 0, SystemAllocPolicy>;
+
+ private:
+  friend class RegExpStatics;
+  friend class RegExpZone;
+
+  struct RegExpCompilation {
+    GCPtr<jit::JitCode*> jitCode;
+    ByteCode* byteCode = nullptr;
+
+    bool compiled(CodeKind kind = CodeKind::Any) const {
+      switch (kind) {
+        case CodeKind::Bytecode:
+          return !!byteCode;
+        case CodeKind::Jitcode:
+          return !!jitCode;
+        case CodeKind::Any:
+          return !!byteCode || !!jitCode;
+      }
+      MOZ_CRASH("Unreachable");
+    }
+
+    size_t byteCodeLength() const {
+      MOZ_ASSERT(byteCode);
+      return byteCode->length();
+    }
+  };
+
+ public:
+  JSAtom* getSource() const { return headerPtr(); }
+
+ private:
+  RegExpCompilation compilationArray[2];
+
+  uint32_t pairCount_;
+  JS::RegExpFlags flags;
+
+  RegExpShared::Kind kind_ = Kind::Unparsed;
+  GCPtr<JSAtom*> patternAtom_;
+  uint32_t maxRegisters_ = 0;
+  uint32_t ticks_ = 0;
+
+  uint32_t numNamedCaptures_ = {};
+  uint32_t numDistinctNamedCaptures_ = {};
+  uint32_t* namedCaptureIndices_ = {};
+  uint32_t* namedCaptureSliceIndices_ = {};
+  GCPtr<PlainObject*> groupsTemplate_ = {};
+
+  static int CompilationIndex(bool latin1) { return latin1 ? 0 : 1; }
+
+  JitCodeTables tables;
+
+  RegExpShared(JSAtom* source, JS::RegExpFlags flags);
+
+  const RegExpCompilation& compilation(bool latin1) const {
+    return compilationArray[CompilationIndex(latin1)];
+  }
+
+  RegExpCompilation& compilation(bool latin1) {
+    return compilationArray[CompilationIndex(latin1)];
+  }
+
+ public:
+  ~RegExpShared() = delete;
+
+  static bool compileIfNecessary(JSContext* cx, MutableHandleRegExpShared res,
+                                 Handle<JSLinearString*> input, CodeKind code);
+
+  static RegExpRunStatus executeAtom(MutableHandleRegExpShared re,
+                                     Handle<JSLinearString*> input,
+                                     size_t start, VectorMatchPairs* matches);
+
+  static RegExpRunStatus execute(JSContext* cx, MutableHandleRegExpShared res,
+                                 Handle<JSLinearString*> input,
+                                 size_t searchIndex, VectorMatchPairs* matches);
+
+  bool addTable(JitCodeTable table) { return tables.append(std::move(table)); }
+
+
+  size_t pairCount() const {
+    MOZ_ASSERT(kind() != Kind::Unparsed);
+    return pairCount_;
+  }
+
+  RegExpShared::Kind kind() const { return kind_; }
+
+  void useAtomMatch(Handle<JSAtom*> pattern);
+
+  void useRegExpMatch(size_t parenCount);
+
+  static void InitializeNamedCaptures(JSContext* cx, HandleRegExpShared re,
+                                      uint32_t numNamedCaptures,
+                                      uint32_t numDistinctNamedCaptures,
+                                      Handle<PlainObject*> templateObject,
+                                      uint32_t* captureIndices,
+                                      uint32_t* captureSliceIndices);
+  PlainObject* getGroupsTemplate() { return groupsTemplate_; }
+
+  void tierUpTick();
+  bool markedForTierUp() const;
+
+  void setByteCode(ByteCode* code, bool latin1) {
+    compilation(latin1).byteCode = code;
+  }
+  ByteCode* getByteCode(bool latin1) const {
+    return compilation(latin1).byteCode;
+  }
+  void setJitCode(jit::JitCode* code, bool latin1) {
+    compilation(latin1).jitCode = code;
+  }
+  jit::JitCode* getJitCode(bool latin1) const {
+    return compilation(latin1).jitCode;
+  }
+  uint32_t getMaxRegisters() const { return maxRegisters_; }
+  void updateMaxRegisters(uint32_t numRegisters) {
+    maxRegisters_ = std::max(maxRegisters_, numRegisters);
+  }
+
+  uint32_t numNamedCaptures() const { return numNamedCaptures_; }
+  uint32_t numDistinctNamedCaptures() const {
+    return numDistinctNamedCaptures_;
+  }
+  int32_t getNamedCaptureIndex(uint32_t idx) const {
+    MOZ_ASSERT(idx < numNamedCaptures());
+    MOZ_ASSERT(namedCaptureIndices_);
+    MOZ_ASSERT(!namedCaptureSliceIndices_);
+    return namedCaptureIndices_[idx];
+  }
+
+  mozilla::Span<uint32_t> getNamedCaptureIndices(uint32_t idx) const {
+    MOZ_ASSERT(idx < numDistinctNamedCaptures());
+    MOZ_ASSERT(namedCaptureIndices_);
+    MOZ_ASSERT(namedCaptureSliceIndices_);
+    uint32_t* start = &namedCaptureIndices_[namedCaptureSliceIndices_[idx]];
+    size_t length = 0;
+    if (idx + 1 < numDistinctNamedCaptures()) {
+      length =
+          namedCaptureSliceIndices_[idx + 1] - namedCaptureSliceIndices_[idx];
+    } else {
+      length = numNamedCaptures() - namedCaptureSliceIndices_[idx];
+    }
+    return mozilla::Span<uint32_t>(start, length);
+  }
+
+  JSAtom* patternAtom() const { return patternAtom_; }
+
+  JS::RegExpFlags getFlags() const { return flags; }
+
+  bool hasIndices() const { return flags.hasIndices(); }
+  bool global() const { return flags.global(); }
+  bool ignoreCase() const { return flags.ignoreCase(); }
+  bool multiline() const { return flags.multiline(); }
+  bool dotAll() const { return flags.dotAll(); }
+  bool unicode() const { return flags.unicode(); }
+  bool unicodeSets() const { return flags.unicodeSets(); }
+  bool sticky() const { return flags.sticky(); }
+
+  bool isCompiled(bool latin1, CodeKind codeKind = CodeKind::Any) const {
+    return compilation(latin1).compiled(codeKind);
+  }
+  bool isCompiled() const { return isCompiled(true) || isCompiled(false); }
+
+  void traceChildren(JSTracer* trc);
+  void discardJitCode();
+  void finalize(JS::GCContext* gcx);
+
+  static size_t offsetOfSource() { return offsetOfHeaderPtr(); }
+
+  static size_t offsetOfPatternAtom() {
+    return offsetof(RegExpShared, patternAtom_);
+  }
+
+  static size_t offsetOfFlags() { return offsetof(RegExpShared, flags); }
+
+  static size_t offsetOfPairCount() {
+    return offsetof(RegExpShared, pairCount_);
+  }
+
+  static size_t offsetOfKind() { return offsetof(RegExpShared, kind_); }
+
+  static size_t offsetOfJitCode(bool latin1) {
+    return offsetof(RegExpShared, compilationArray) +
+           (CompilationIndex(latin1) * sizeof(RegExpCompilation)) +
+           offsetof(RegExpCompilation, jitCode);
+  }
+
+  static size_t offsetOfGroupsTemplate() {
+    return offsetof(RegExpShared, groupsTemplate_);
+  }
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf);
+
+ public:
+  static const JS::TraceKind TraceKind = JS::TraceKind::RegExpShared;
+};
+
+class RegExpZone {
+  struct Key {
+    JSAtom* atom = nullptr;
+    JS::RegExpFlags flags = JS::RegExpFlag::NoFlags;
+
+    Key() = default;
+    Key(JSAtom* atom, JS::RegExpFlags flags) : atom(atom), flags(flags) {}
+    MOZ_IMPLICIT Key(const WeakHeapPtr<RegExpShared*>& shared)
+        : atom(shared.unbarrieredGet()->getSource()),
+          flags(shared.unbarrieredGet()->getFlags()) {}
+
+    using Lookup = Key;
+    static HashNumber hash(const Lookup& l) {
+      HashNumber hash = DefaultHasher<JSAtom*>::hash(l.atom);
+      return mozilla::AddToHash(hash, l.flags.value());
+    }
+    static bool match(Key l, Key r) {
+      return l.atom == r.atom && l.flags == r.flags;
+    }
+  };
+
+  using Set = JS::WeakCache<
+      JS::GCHashSet<WeakHeapPtr<RegExpShared*>, Key, ZoneAllocPolicy>>;
+  Set set_;
+
+ public:
+  explicit RegExpZone(Zone* zone);
+
+  ~RegExpZone() { MOZ_ASSERT(set_.empty()); }
+
+  bool empty() const { return set_.empty(); }
+
+  RegExpShared* maybeGet(JSAtom* source, JS::RegExpFlags flags) const {
+    Set::Ptr p = set_.lookup(Key(source, flags));
+    if (!p) {
+      return nullptr;
+    }
+
+    return *p;
+  }
+
+  RegExpShared* get(JSContext* cx, Handle<JSAtom*> source,
+                    JS::RegExpFlags flags);
+
+#ifdef DEBUG
+  void clear() { set_.clear(); }
+#endif
+
+  size_t sizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf) const;
+};
+
+class RegExpRealm {
+ public:
+  enum ResultShapeKind { Normal, WithIndices, Indices, NumKinds };
+
+  UniquePtr<RegExpStatics> regExpStatics;
+
+ private:
+  GCPtr<SharedShape*> matchResultShapes_[ResultShapeKind::NumKinds];
+
+  SharedShape* createMatchResultShape(JSContext* cx, ResultShapeKind kind);
+
+ public:
+  explicit RegExpRealm();
+
+  void trace(JSTracer* trc);
+
+  static const size_t MatchResultObjectIndexSlot = 0;
+  static const size_t MatchResultObjectInputSlot = 1;
+  static const size_t MatchResultObjectGroupsSlot = 2;
+  static const size_t MatchResultObjectIndicesSlot = 3;
+
+  static const size_t MatchResultObjectSlotSpan = 3;
+  static const size_t MatchResultObjectNumDynamicSlots = 6;
+
+  static const size_t IndicesGroupsSlot = 0;
+
+  static size_t offsetOfMatchResultObjectIndexSlot() {
+    return sizeof(Value) * MatchResultObjectIndexSlot;
+  }
+  static size_t offsetOfMatchResultObjectInputSlot() {
+    return sizeof(Value) * MatchResultObjectInputSlot;
+  }
+  static size_t offsetOfMatchResultObjectGroupsSlot() {
+    return sizeof(Value) * MatchResultObjectGroupsSlot;
+  }
+  static size_t offsetOfMatchResultObjectIndicesSlot() {
+    return sizeof(Value) * MatchResultObjectIndicesSlot;
+  }
+
+  SharedShape* getOrCreateMatchResultShape(
+      JSContext* cx, ResultShapeKind kind = ResultShapeKind::Normal) {
+    if (matchResultShapes_[kind]) {
+      return matchResultShapes_[kind];
+    }
+    return createMatchResultShape(cx, kind);
+  }
+
+  static constexpr size_t offsetOfRegExpStatics() {
+    return offsetof(RegExpRealm, regExpStatics);
+  }
+  static constexpr size_t offsetOfNormalMatchResultShape() {
+    static_assert(sizeof(GCPtr<SharedShape*>) == sizeof(uintptr_t));
+    return offsetof(RegExpRealm, matchResultShapes_) +
+           ResultShapeKind::Normal * sizeof(uintptr_t);
+  }
+};
+
+RegExpRunStatus ExecuteRegExpAtomRaw(RegExpShared* re,
+                                     const JSLinearString* input, size_t start,
+                                     MatchPairs* matchPairs);
+
+} 
+
+namespace JS {
+namespace ubi {
+
+template <>
+class Concrete<js::RegExpShared> : TracerConcrete<js::RegExpShared> {
+ protected:
+  explicit Concrete(js::RegExpShared* ptr)
+      : TracerConcrete<js::RegExpShared>(ptr) {}
+
+ public:
+  static void construct(void* storage, js::RegExpShared* ptr) {
+    new (storage) Concrete(ptr);
+  }
+
+  CoarseType coarseType() const final { return CoarseType::Other; }
+
+  Size size(mozilla::MallocSizeOf mallocSizeOf) const override;
+
+  const char16_t* typeName() const override { return concreteTypeName; }
+  static const char16_t concreteTypeName[];
+};
+
+}  
+}  
+
+#endif /* vm_RegExpShared_h */

@@ -1,0 +1,29 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef NSTLSSOCKETPROVIDER_H_
+#define NSTLSSOCKETPROVIDER_H_
+
+#include "nsISocketProvider.h"
+
+#define NS_STARTTLSSOCKETPROVIDER_CID         \
+  { \
+   0xb9507aec,                                \
+   0x1dd1,                                    \
+   0x11b2,                                    \
+   {0x8c, 0xd5, 0xc4, 0x8e, 0xe0, 0xc5, 0x03, 0x07}}
+
+class nsTLSSocketProvider : public nsISocketProvider {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSISOCKETPROVIDER
+
+  nsTLSSocketProvider();
+
+ protected:
+  virtual ~nsTLSSocketProvider();
+};
+
+#endif /* NSTLSSOCKETPROVIDER_H_ */

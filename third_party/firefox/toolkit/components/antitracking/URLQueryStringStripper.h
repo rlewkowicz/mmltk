@@ -1,0 +1,69 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_URLQueryStringStripper_h
+#define mozilla_URLQueryStringStripper_h
+
+#include "nsIURLQueryStringStripper.h"
+#include "nsIURLQueryStrippingListService.h"
+#include "nsIObserver.h"
+#include "mozilla/dom/StripOnShareRuleBinding.h"
+#include "nsStringFwd.h"
+#include "nsTHashSet.h"
+#include "nsTHashMap.h"
+
+class nsIURI;
+
+namespace mozilla {
+
+class URLQueryStringStripper final : public nsIObserver,
+                                     public nsIURLQueryStringStripper,
+                                     public nsIURLQueryStrippingListObserver {
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+  NS_DECL_NSIURLQUERYSTRIPPINGLISTOBSERVER
+
+  NS_DECL_NSIURLQUERYSTRINGSTRIPPER
+
+ public:
+  static already_AddRefed<URLQueryStringStripper> GetSingleton();
+
+ private:
+  URLQueryStringStripper();
+  ~URLQueryStringStripper() = default;
+
+  static void OnPrefChange(const char* aPref, void* aData);
+  nsresult ManageObservers();
+
+  [[nodiscard]] nsresult Init();
+  [[nodiscard]] nsresult Shutdown();
+
+  [[nodiscard]] nsresult StripQueryString(nsIURI* aURI, nsIURI** aOutput,
+                                          uint32_t* aStripCount);
+
+  bool CheckAllowList(nsIURI* aURI);
+
+  void PopulateStripList(const nsACString& aList);
+  void PopulateAllowList(const nsACString& aList);
+
+  bool ShouldStripParam(const nsACString& aHost, const nsACString& aName);
+  int TryStripValue(const nsACString& aHost, nsACString& aValue, bool aDry);
+
+  nsresult StripForCopyOrShareInternal(nsIURI* aURI, nsIURI** aStrippedURI,
+                                       int& aStripCount, bool aDry,
+                                       bool aStripNestedURIs);
+
+  nsTHashSet<nsCString> mList;
+  nsTHashSet<nsCString> mAllowList;
+  nsCOMPtr<nsIURLQueryStrippingListService> mListService;
+  nsTHashMap<nsCString, dom::StripRule> mStripOnShareMap;
+  Maybe<dom::StripRule> mStripOnShareGlobal;
+  bool mIsInitialized;
+  bool mObservingQPS = false;
+  bool mObservingStripOnShare = false;
+};
+
+}  
+
+#endif  // mozilla_URLQueryStringStripper_h

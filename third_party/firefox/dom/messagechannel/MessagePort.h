@@ -1,0 +1,179 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(mozilla_dom_MessagePort_h)
+#define mozilla_dom_MessagePort_h
+
+#include "mozilla/DOMEventTargetHelper.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/dom/DOMTypes.h"
+#include "nsTArray.h"
+
+
+class nsIGlobalObject;
+
+namespace mozilla::dom {
+
+class MessagePortChild;
+class PostMessageRunnable;
+class RefMessageBodyService;
+class SharedMessageBody;
+class StrongWorkerRef;
+struct StructuredSerializeOptions;
+
+class UniqueMessagePortId final {
+ public:
+  UniqueMessagePortId() { mIdentifier.neutered() = true; }
+  explicit UniqueMessagePortId(const MessagePortIdentifier& aIdentifier)
+      : mIdentifier(aIdentifier) {}
+  UniqueMessagePortId(UniqueMessagePortId&& aOther) noexcept
+      : mIdentifier(aOther.mIdentifier) {
+    aOther.mIdentifier.neutered() = true;
+  }
+  ~UniqueMessagePortId() { ForceClose(); };
+  void ForceClose();
+
+  [[nodiscard]] MessagePortIdentifier release() {
+    MessagePortIdentifier id = mIdentifier;
+    mIdentifier.neutered() = true;
+    return id;
+  }
+  nsID& uuid() { return mIdentifier.uuid(); }
+  nsID& destinationUuid() { return mIdentifier.destinationUuid(); }
+  uint32_t& sequenceId() { return mIdentifier.sequenceId(); }
+  bool& neutered() { return mIdentifier.neutered(); }
+
+  UniqueMessagePortId(const UniqueMessagePortId& aOther) = delete;
+  void operator=(const UniqueMessagePortId& aOther) = delete;
+
+ private:
+  MessagePortIdentifier mIdentifier;
+};
+
+class MessagePort final : public DOMEventTargetHelper {
+  friend class PostMessageRunnable;
+
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(MessagePort, DOMEventTargetHelper)
+
+  static already_AddRefed<MessagePort> Create(nsIGlobalObject* aGlobal,
+                                              const nsID& aUUID,
+                                              const nsID& aDestinationUUID,
+                                              ErrorResult& aRv);
+
+  static already_AddRefed<MessagePort> Create(nsIGlobalObject* aGlobal,
+                                              UniqueMessagePortId& aIdentifier,
+                                              ErrorResult& aRv);
+
+  static void ForceClose(const MessagePortIdentifier& aIdentifier);
+
+  virtual JSObject* WrapObject(JSContext* aCx,
+                               JS::Handle<JSObject*> aGivenProto) override;
+
+  void PostMessage(JSContext* aCx, JS::Handle<JS::Value> aMessage,
+                   const Sequence<JSObject*>& aTransferable, ErrorResult& aRv);
+
+  void PostMessage(JSContext* aCx, JS::Handle<JS::Value> aMessage,
+                   const StructuredSerializeOptions& aOptions,
+                   ErrorResult& aRv);
+
+  void Start();
+
+  void Close();
+
+  EventHandlerNonNull* GetOnmessage();
+
+  void SetOnmessage(EventHandlerNonNull* aCallback);
+
+  IMPL_EVENT_HANDLER(messageerror)
+
+
+  void UnshippedEntangle(RefPtr<MessagePort>& aEntangledPort);
+
+  bool CanBeCloned() const { return !mHasBeenTransferredOrClosed; }
+
+  void CloneAndDisentangle(UniqueMessagePortId& aIdentifier);
+
+  void CloseForced();
+
+
+  void Entangled(nsTArray<NotNull<RefPtr<SharedMessageBody>>>& aMessages);
+  void MessagesReceived(
+      nsTArray<NotNull<RefPtr<SharedMessageBody>>>& aMessages);
+  void StopSendingDataConfirmed();
+  void Closed();
+
+ private:
+  enum State {
+    eStateInitializingUnshippedEntangled,
+
+    eStateUnshippedEntangled,
+
+    eStateEntangling,
+
+    eStateEntanglingForDisentangle,
+
+    eStateEntanglingForClose,
+
+    eStateEntangled,
+
+    eStateDisentangling,
+
+    eStateDisentangled,
+
+    eStateDisentangledForClose
+  };
+
+  explicit MessagePort(nsIGlobalObject* aGlobal, State aState);
+  ~MessagePort();
+
+  void DisconnectFromOwner() override;
+
+  void Initialize(const nsID& aUUID, const nsID& aDestinationUUID,
+                  uint32_t aSequenceID, bool aNeutered, ErrorResult& aRv);
+
+  bool ConnectToPBackground();
+
+  void Dispatch();
+
+  void DispatchError();
+
+  void StartDisentangling();
+  void Disentangle();
+
+  void RemoveDocFromBFCache();
+
+  void CloseInternal(bool aSoftly);
+
+  void UpdateMustKeepAlive();
+
+  bool IsCertainlyAliveForCC() const override { return mIsKeptAlive; }
+
+  RefPtr<StrongWorkerRef> mWorkerRef;
+
+  RefPtr<PostMessageRunnable> mPostMessageRunnable;
+
+  RefPtr<MessagePortChild> mActor;
+
+  RefPtr<MessagePort> mUnshippedEntangledPort;
+
+  RefPtr<RefMessageBodyService> mRefMessageBodyService;
+
+  nsTArray<NotNull<RefPtr<SharedMessageBody>>> mMessages;
+
+  UniquePtr<MessagePortIdentifier> mIdentifier;
+
+  State mState;
+
+  bool mMessageQueueEnabled;
+
+  bool mIsKeptAlive;
+
+  bool mHasBeenTransferredOrClosed;
+};
+
+}  
+
+#endif

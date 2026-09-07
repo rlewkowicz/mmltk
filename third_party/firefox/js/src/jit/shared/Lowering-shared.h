@@ -1,0 +1,292 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_shared_Lowering_shared_h
+#define jit_shared_Lowering_shared_h
+
+
+#include "jit/LIR.h"
+#include "jit/MIRGenerator.h"
+
+namespace js {
+namespace jit {
+
+class MIRGenerator;
+class MIRGraph;
+class MDefinition;
+class MInstruction;
+class LOsiPoint;
+
+class LIRGeneratorShared {
+ protected:
+  MIRGenerator* gen;
+  MIRGraph& graph;
+  LIRGraph& lirGraph_;
+  LBlock* current;
+  MResumePoint* lastResumePoint_;
+  LRecoverInfo* cachedRecoverInfo_;
+  LOsiPoint* osiPoint_;
+
+  LIRGeneratorShared(MIRGenerator* gen, MIRGraph& graph, LIRGraph& lirGraph)
+      : gen(gen),
+        graph(graph),
+        lirGraph_(lirGraph),
+        current(nullptr),
+        lastResumePoint_(nullptr),
+        cachedRecoverInfo_(nullptr),
+        osiPoint_(nullptr) {}
+
+  MIRGenerator* mir() { return gen; }
+
+  bool errored() { return gen->getOffThreadStatus().isErr(); }
+  void abort(AbortReason r, const char* message, ...) MOZ_FORMAT_PRINTF(3, 4) {
+    if (errored()) {
+      return;
+    }
+
+    va_list ap;
+    va_start(ap, message);
+    auto reason_ = gen->abortFmt(r, message, ap);
+    va_end(ap);
+    gen->setOffThreadStatus(reason_);
+  }
+  void abort(AbortReason r) {
+    if (errored()) {
+      return;
+    }
+
+    auto reason_ = gen->abort(r);
+    gen->setOffThreadStatus(reason_);
+  }
+
+  static void ReorderCommutative(MDefinition** lhsp, MDefinition** rhsp,
+                                 MInstruction* ins);
+  static bool ShouldReorderCommutative(MDefinition* lhs, MDefinition* rhs,
+                                       MInstruction* ins);
+
+  inline void emitAtUses(MInstruction* mir);
+
+  inline void ensureDefined(MDefinition* mir);
+
+  void visitEmittedAtUses(MInstruction* ins);
+
+  inline LUse use(MDefinition* mir, LUse policy);
+  inline LUse use(MDefinition* mir);
+  inline LUse useAtStart(MDefinition* mir);
+  inline LUse useRegister(MDefinition* mir);
+  inline LUse useRegisterAtStart(MDefinition* mir);
+  inline LUse useFixed(MDefinition* mir, Register reg);
+  inline LUse useFixed(MDefinition* mir, FloatRegister reg);
+  inline LUse useFixed(MDefinition* mir, AnyRegister reg);
+  inline LUse useFixedAtStart(MDefinition* mir, Register reg);
+  inline LUse useFixedAtStart(MDefinition* mir, AnyRegister reg);
+  inline LAllocation useOrConstant(MDefinition* mir);
+  inline LAllocation useOrConstantAtStart(MDefinition* mir);
+  inline LAllocation useAny(MDefinition* mir);
+  inline LAllocation useAnyAtStart(MDefinition* mir);
+  inline LAllocation useAnyOrConstant(MDefinition* mir);
+  inline LAllocation useStorable(MDefinition* mir);
+  inline LAllocation useStorableAtStart(MDefinition* mir);
+  inline LAllocation useKeepalive(MDefinition* mir);
+  inline LAllocation useKeepaliveOrConstant(MDefinition* mir);
+  inline LAllocation useRegisterOrConstant(MDefinition* mir);
+  inline LAllocation useRegisterOrConstantAtStart(MDefinition* mir);
+  inline LAllocation useRegisterOrZeroAtStart(MDefinition* mir);
+  inline LAllocation useRegisterOrZero(MDefinition* mir);
+  inline LAllocation useRegisterOrNonDoubleConstant(MDefinition* mir);
+
+  inline LAllocation useRegisterOrInt32Constant(MDefinition* mir);
+  inline LAllocation useAnyOrInt32Constant(MDefinition* mir);
+  inline LAllocation useAnyOrInt32ConstantAtStart(MDefinition* mir);
+
+  LAllocation useRegisterOrIndexConstant(MDefinition* mir, Scalar::Type type);
+
+  inline LUse useRegisterForTypedLoad(MDefinition* mir, MIRType type);
+
+#ifdef JS_NUNBOX32
+  inline LUse useType(MDefinition* mir, LUse::Policy policy);
+  inline LUse usePayload(MDefinition* mir, LUse::Policy policy);
+  inline LUse usePayloadAtStart(MDefinition* mir, LUse::Policy policy);
+  inline LUse usePayloadInRegisterAtStart(MDefinition* mir);
+
+  inline void fillBoxUses(LInstruction* lir, size_t n, MDefinition* mir);
+#endif
+
+  inline bool willHaveDifferentLIRNodes(MDefinition* mir1, MDefinition* mir2);
+
+  inline LDefinition temp(LDefinition::Type type = LDefinition::GENERAL,
+                          LDefinition::Policy policy = LDefinition::REGISTER);
+  inline LInt64Definition tempInt64(
+      LDefinition::Policy policy = LDefinition::REGISTER);
+  inline LBoxDefinition tempBox();
+  inline LDefinition tempFloat32();
+  inline LDefinition tempDouble();
+#ifdef ENABLE_WASM_SIMD
+  inline LDefinition tempSimd128();
+#endif
+  inline LDefinition tempCopy(MDefinition* input, uint32_t reusedInput);
+
+  inline LDefinition tempFixed(Register reg);
+  inline LDefinition tempFixed(FloatRegister reg);
+  inline LInt64Definition tempInt64Fixed(Register64 reg);
+
+  template <size_t Ops, size_t Temps>
+  inline void defineFixed(LInstructionHelper<1, Ops, Temps>* lir,
+                          MDefinition* mir, const LAllocation& output);
+
+  template <size_t Temps>
+  inline void defineBox(
+      details::LInstructionFixedDefsTempsHelper<BOX_PIECES, Temps>* lir,
+      MDefinition* mir, LDefinition::Policy policy = LDefinition::REGISTER);
+
+  template <size_t Ops, size_t Temps>
+  inline void defineInt64(LInstructionHelper<INT64_PIECES, Ops, Temps>* lir,
+                          MDefinition* mir,
+                          LDefinition::Policy policy = LDefinition::REGISTER);
+
+  template <size_t Ops, size_t Temps>
+  inline void defineInt64Fixed(
+      LInstructionHelper<INT64_PIECES, Ops, Temps>* lir, MDefinition* mir,
+      const LInt64Allocation& output);
+
+  inline void defineReturn(LInstruction* lir, MDefinition* mir);
+
+  template <size_t X>
+  inline void define(details::LInstructionFixedDefsTempsHelper<1, X>* lir,
+                     MDefinition* mir,
+                     LDefinition::Policy policy = LDefinition::REGISTER);
+  template <size_t X>
+  inline void define(details::LInstructionFixedDefsTempsHelper<1, X>* lir,
+                     MDefinition* mir, const LDefinition& def);
+
+  template <size_t Ops, size_t Temps>
+  inline void defineReuseInput(LInstructionHelper<1, Ops, Temps>* lir,
+                               MDefinition* mir, uint32_t operand);
+
+  template <size_t Ops, size_t Temps>
+  inline void defineBoxReuseInput(
+      LInstructionHelper<BOX_PIECES, Ops, Temps>* lir, MDefinition* mir,
+      uint32_t operand);
+
+  template <size_t Ops, size_t Temps>
+  inline void defineInt64ReuseInput(
+      LInstructionHelper<INT64_PIECES, Ops, Temps>* lir, MDefinition* mir,
+      uint32_t operand);
+
+  inline LBoxAllocation useBox(MDefinition* mir,
+                               LUse::Policy policy = LUse::REGISTER,
+                               bool useAtStart = false);
+
+  inline LBoxAllocation useBoxOrTypedOrConstant(MDefinition* mir,
+                                                bool useConstant,
+                                                bool useAtStart = false);
+  inline LBoxAllocation useBoxOrTyped(MDefinition* mir,
+                                      bool useAtStart = false);
+
+  inline LInt64Allocation useInt64(MDefinition* mir, LUse::Policy policy,
+                                   bool useAtStart = false);
+  inline LInt64Allocation useInt64(MDefinition* mir, bool useAtStart = false);
+  inline LInt64Allocation useInt64AtStart(MDefinition* mir);
+  inline LInt64Allocation useInt64OrConstant(MDefinition* mir,
+                                             bool useAtStart = false);
+  inline LInt64Allocation useInt64Register(MDefinition* mir,
+                                           bool useAtStart = false);
+  inline LInt64Allocation useInt64RegisterOrConstant(MDefinition* mir,
+                                                     bool useAtStart = false);
+  inline LInt64Allocation useInt64Fixed(MDefinition* mir, Register64 regs,
+                                        bool useAtStart = false);
+  inline LInt64Allocation useInt64FixedAtStart(MDefinition* mir,
+                                               Register64 regs);
+
+  inline LInt64Allocation useInt64RegisterAtStart(MDefinition* mir);
+  inline LInt64Allocation useInt64RegisterOrConstantAtStart(MDefinition* mir);
+  inline LInt64Allocation useInt64RegisterOrZeroAtStart(MDefinition* mir);
+  inline LInt64Allocation useInt64OrConstantAtStart(MDefinition* mir);
+
+#ifdef JS_NUNBOX32
+  inline LUse useLowWord(MDefinition* mir, LUse policy);
+  inline LUse useLowWordRegister(MDefinition* mir);
+  inline LUse useLowWordRegisterAtStart(MDefinition* mir);
+  inline LUse useLowWordFixed(MDefinition* mir, Register reg);
+#endif
+
+  inline void redefine(MDefinition* ins, MDefinition* as);
+
+  template <typename LClass, typename... Args>
+  inline LClass* allocateVariadic(uint32_t numOperands, Args&&... args);
+
+  TempAllocator& alloc() const { return graph.alloc(); }
+
+  uint32_t getVirtualRegister() {
+    uint32_t vreg = lirGraph_.getVirtualRegister();
+
+    if (vreg + 1 >= MAX_VIRTUAL_REGISTERS) {
+      abort(AbortReason::Alloc, "max virtual registers");
+      return 1;
+    }
+    return vreg;
+  }
+
+  inline void annotate(LNode* ins);
+  inline void addUnchecked(LInstruction* ins, MInstruction* mir = nullptr);
+
+  template <size_t Temps>
+  void add(details::LInstructionFixedDefsTempsHelper<0, Temps>* ins,
+           MInstruction* mir = nullptr) {
+    addUnchecked(ins, mir);
+  }
+
+  void lowerTypedPhiInput(MPhi* phi, uint32_t inputPosition, LBlock* block,
+                          size_t lirIndex);
+
+  void definePhiOneRegister(MPhi* phi, size_t lirIndex);
+#ifdef JS_NUNBOX32
+  void definePhiTwoRegisters(MPhi* phi, size_t lirIndex);
+#endif
+
+  void defineTypedPhi(MPhi* phi, size_t lirIndex) {
+    definePhiOneRegister(phi, lirIndex);
+  }
+  void defineUntypedPhi(MPhi* phi, size_t lirIndex) {
+#ifdef JS_NUNBOX32
+    definePhiTwoRegisters(phi, lirIndex);
+#else
+    definePhiOneRegister(phi, lirIndex);
+#endif
+  }
+
+  LOsiPoint* popOsiPoint() {
+    LOsiPoint* tmp = osiPoint_;
+    osiPoint_ = nullptr;
+    return tmp;
+  }
+
+  LRecoverInfo* getRecoverInfo(MResumePoint* rp);
+  LSnapshot* buildSnapshot(MResumePoint* rp, BailoutKind kind);
+  bool assignPostSnapshot(MInstruction* mir, LInstruction* ins);
+
+  void assignSnapshot(LInstruction* ins, BailoutKind kind);
+
+  void assignSafepoint(LInstruction* ins, MInstruction* mir,
+                       BailoutKind kind = BailoutKind::DuringVMCall);
+
+  void assignWasmSafepoint(LInstruction* ins);
+
+  inline void lowerConstantDouble(double d, MInstruction* mir);
+  inline void lowerConstantFloat32(float f, MInstruction* mir);
+
+  bool canSpecializeWasmCompareAndSelect(MCompare::CompareType compTy,
+                                         MIRType insTy);
+  void lowerWasmCompareAndSelect(MWasmSelect* ins, MDefinition* lhs,
+                                 MDefinition* rhs, MCompare::CompareType compTy,
+                                 JSOp jsop);
+
+ public:
+  static bool allowTypedElementHoleCheck() { return false; }
+};
+
+}  
+}  
+
+#endif /* jit_shared_Lowering_shared_h */

@@ -1,0 +1,14 @@
+
+[package]
+name = "iovec"
+version = "0.1.4"
+authors = ["Carl Lerche <me@carllerche.com>"]
+description = "Portable buffer type for scatter/gather I/O operations\n"
+homepage = "https://github.com/carllerche/iovec"
+documentation = "https://docs.rs/iovec"
+keywords = ["scatter", "gather", "vectored", "io", "networking"]
+categories = ["network-programming", "api-bindings"]
+license = "MIT/Apache-2.0"
+repository = "https://github.com/carllerche/iovec"
+[target."cfg(unix)".dependencies.libc]
+version = "0.2"

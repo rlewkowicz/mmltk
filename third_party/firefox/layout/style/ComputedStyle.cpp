@@ -1,0 +1,389 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "mozilla/ComputedStyle.h"
+
+#include "PseudoStyleType.h"
+#include "mozilla/ComputedStyleInlines.h"
+#include "mozilla/DebugOnly.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/ToString.h"
+#include "nsCOMPtr.h"
+#include "nsCSSVisitedDependentPropList.h"
+#include "nsCoord.h"
+#include "nsLayoutUtils.h"
+#include "nsPrintfCString.h"
+#include "nsStyleConsts.h"
+#include "nsStyleStruct.h"
+#include "nsStyleStructInlines.h"
+#include "nsStyleStructList.h"
+#include "nsWindowSizes.h"
+
+#include "mozilla/ServoBindings.h"
+
+namespace mozilla {
+
+ComputedStyle::ComputedStyle(ServoComputedDataForgotten aComputedValues)
+    : mSource(aComputedValues) {}
+
+static bool ContainingBlockMayHaveChanged(const ComputedStyle& aOldStyle,
+                                          const ComputedStyle& aNewStyle) {
+  const auto& oldDisp = *aOldStyle.StyleDisplay();
+  const auto& newDisp = *aNewStyle.StyleDisplay();
+
+  if (oldDisp.IsPositionedStyle() != newDisp.IsPositionedStyle()) {
+    return true;
+  }
+
+  const bool fixedCB = aOldStyle.IsFixedPosContainingBlockForNonSVGTextFrames();
+  if (fixedCB != aNewStyle.IsFixedPosContainingBlockForNonSVGTextFrames()) {
+    return true;
+  }
+  if (fixedCB) {
+    return false;
+  }
+
+  if (oldDisp.IsFixedPosContainingBlockForTransformSupportingFrames() !=
+      newDisp.IsFixedPosContainingBlockForTransformSupportingFrames()) {
+    return true;
+  }
+  if (oldDisp
+          .IsFixedPosContainingBlockForContainLayoutAndPaintSupportingFrames() !=
+      newDisp
+          .IsFixedPosContainingBlockForContainLayoutAndPaintSupportingFrames()) {
+    return true;
+  }
+  return false;
+}
+
+nsChangeHint ComputedStyle::CalcStyleDifference(const ComputedStyle& aNewStyle,
+                                                uint32_t* aEqualStructs) const {
+  static_assert(StyleStructConstants::kStyleStructCount <= 32,
+                "aEqualStructs is not big enough");
+
+  *aEqualStructs = 0;
+
+  nsChangeHint hint = nsChangeHint(0);
+
+  DebugOnly<uint32_t> structsFound = 0;
+
+  DebugOnly<int> styleStructCount = 0;
+
+#define STYLE_STRUCT_BIT(name_) \
+  StyleStructConstants::BitFor(StyleStructID::name_)
+
+#define EXPAND(...) __VA_ARGS__
+#define DO_STRUCT_DIFFERENCE_WITH_ARGS(struct_, extra_args_)               \
+  PR_BEGIN_MACRO                                                           \
+  const nsStyle##struct_* this##struct_ = Style##struct_();                \
+  structsFound |= STYLE_STRUCT_BIT(struct_);                               \
+                                                                           \
+  const nsStyle##struct_* other##struct_ = aNewStyle.Style##struct_();     \
+  if (this##struct_ == other##struct_) {                                   \
+               \
+               \
+    *aEqualStructs |= STYLE_STRUCT_BIT(struct_);                           \
+  } else {                                                                 \
+    nsChangeHint difference =                                              \
+        this##struct_->CalcDifference(*other##struct_ EXPAND extra_args_); \
+    hint |= difference;                                                    \
+    if (!difference) {                                                     \
+      *aEqualStructs |= STYLE_STRUCT_BIT(struct_);                         \
+    }                                                                      \
+  }                                                                        \
+  styleStructCount++;                                                      \
+  PR_END_MACRO
+#define DO_STRUCT_DIFFERENCE(struct_) \
+  DO_STRUCT_DIFFERENCE_WITH_ARGS(struct_, ())
+
+  DO_STRUCT_DIFFERENCE_WITH_ARGS(Display, (, *this));
+  DO_STRUCT_DIFFERENCE(XUL);
+  DO_STRUCT_DIFFERENCE(Column);
+  DO_STRUCT_DIFFERENCE(Content);
+  DO_STRUCT_DIFFERENCE(UI);
+  DO_STRUCT_DIFFERENCE(Visibility);
+  DO_STRUCT_DIFFERENCE(Outline);
+  DO_STRUCT_DIFFERENCE(TableBorder);
+  DO_STRUCT_DIFFERENCE(Table);
+  DO_STRUCT_DIFFERENCE(UIReset);
+  DO_STRUCT_DIFFERENCE(Text);
+  DO_STRUCT_DIFFERENCE_WITH_ARGS(List, (, *this));
+  DO_STRUCT_DIFFERENCE(SVGReset);
+  DO_STRUCT_DIFFERENCE(SVG);
+  DO_STRUCT_DIFFERENCE_WITH_ARGS(Position, (, *this));
+  DO_STRUCT_DIFFERENCE(Font);
+  DO_STRUCT_DIFFERENCE(Margin);
+  DO_STRUCT_DIFFERENCE(Padding);
+  DO_STRUCT_DIFFERENCE(Border);
+  DO_STRUCT_DIFFERENCE(TextReset);
+  DO_STRUCT_DIFFERENCE(Effects);
+  DO_STRUCT_DIFFERENCE(Background);
+  DO_STRUCT_DIFFERENCE(Page);
+
+#undef DO_STRUCT_DIFFERENCE
+#undef DO_STRUCT_DIFFERENCE_WITH_ARGS
+#undef EXPAND
+
+  MOZ_ASSERT(styleStructCount == StyleStructConstants::kStyleStructCount,
+             "missing a call to DO_STRUCT_DIFFERENCE");
+
+  const ComputedStyle* thisVis = GetStyleIfVisited();
+  const ComputedStyle* otherVis = aNewStyle.GetStyleIfVisited();
+  if (!thisVis != !otherVis) {
+#define CLEAR_STRUCT_BIT(name_, fields_) \
+  *aEqualStructs &= ~STYLE_STRUCT_BIT(name_);
+    FOR_EACH_VISITED_DEPENDENT_STYLE_STRUCT(CLEAR_STRUCT_BIT)
+#undef CLEAR_STRUCT_BIT
+    hint |= nsChangeHint_RepaintFrame;
+  } else if (thisVis) {
+    bool change = false;
+
+#define STYLE_FIELD(name_) thisVisStruct->name_ != otherVisStruct->name_
+#define CHECK_VISITED_STYLE_STRUCT(name_, fields_)                   \
+  {                                                                  \
+    const nsStyle##name_* thisVisStruct = thisVis->Style##name_();   \
+    const nsStyle##name_* otherVisStruct = otherVis->Style##name_(); \
+    if (MOZ_FOR_EACH_SEPARATED(STYLE_FIELD, (||), (), fields_)) {    \
+      *aEqualStructs &= ~STYLE_STRUCT_BIT(name_);                    \
+      change = true;                                                 \
+    }                                                                \
+  }
+    FOR_EACH_VISITED_DEPENDENT_STYLE_STRUCT(CHECK_VISITED_STYLE_STRUCT)
+#undef CHECK_VISITED_STYLE_STRUCT
+#undef STYLE_FIELD
+#undef STYLE_STRUCT_BIT
+
+    if (change) {
+      hint |= nsChangeHint_RepaintFrame;
+    }
+  }
+
+  if (hint & nsChangeHint_UpdateContainingBlock) {
+    if (!ContainingBlockMayHaveChanged(*this, aNewStyle)) {
+      hint &= ~nsChangeHint_UpdateContainingBlock;
+    }
+  }
+
+  if (HasAuthorSpecifiedBorderOrBackground() !=
+      aNewStyle.HasAuthorSpecifiedBorderOrBackground()) {
+    const StyleAppearance appearance = StyleDisplay()->EffectiveAppearance();
+    if (appearance != StyleAppearance::None &&
+        nsLayoutUtils::AuthorSpecifiedBorderBackgroundDisablesTheming(
+            appearance)) {
+      hint |= nsChangeHint_AllReflowHints | nsChangeHint_RepaintFrame;
+    }
+  }
+
+  MOZ_ASSERT(NS_IsHintSubset(hint, nsChangeHint_AllHints),
+             "Added a new hint without bumping AllHints?");
+  return hint & ~nsChangeHint_NeutralChange;
+}
+
+#ifdef DEBUG
+void ComputedStyle::List(FILE* out, int32_t aIndent) {
+  nsAutoCString str;
+  int32_t ix;
+  for (ix = aIndent; --ix >= 0;) {
+    str.AppendLiteral("  ");
+  }
+  str.Append(nsPrintfCString("%p(%d) parent=%p ", (void*)this, 0, nullptr));
+  if (GetPseudoType() != PseudoStyleType::NotPseudo) {
+    str.Append(nsPrintfCString("%s ", ToString(GetPseudoType()).c_str()));
+  }
+
+  fprintf_stderr(out, "%s{ServoComputedData}\n", str.get());
+}
+#endif
+
+template <typename Func>
+static nscolor GetVisitedDependentColorInternal(const ComputedStyle& aStyle,
+                                                Func aColorFunc) {
+  nscolor colors[2];
+  colors[0] = aColorFunc(aStyle);
+  if (const ComputedStyle* visitedStyle = aStyle.GetStyleIfVisited()) {
+    colors[1] = aColorFunc(*visitedStyle);
+    return ComputedStyle::CombineVisitedColors(colors,
+                                               aStyle.RelevantLinkVisited());
+  }
+  return colors[0];
+}
+
+static nscolor ExtractColor(const ComputedStyle& aStyle,
+                            const StyleAbsoluteColor& aColor) {
+  return aColor.ToColor();
+}
+
+static nscolor ExtractColor(const ComputedStyle& aStyle,
+                            const StyleColor& aColor) {
+  return aColor.CalcColor(aStyle);
+}
+
+static nscolor ExtractColor(const ComputedStyle& aStyle,
+                            const StyleColorOrAuto& aColor) {
+  if (aColor.IsAuto()) {
+    return ExtractColor(aStyle, StyleColor::CurrentColor());
+  }
+  return ExtractColor(aStyle, aColor.AsColor());
+}
+
+static nscolor ExtractColor(const ComputedStyle& aStyle,
+                            const StyleSVGPaint& aPaintServer) {
+  return aPaintServer.kind.IsColor()
+             ? ExtractColor(aStyle, aPaintServer.kind.AsColor())
+             : NS_RGBA(0, 0, 0, 0);
+}
+
+#define STYLE_FIELD(struct_, field_) aField == &struct_::field_ ||
+#define GENERATE_VISITED_COLOR_TEMPLATE(name_, fields_)                        \
+  template <>                                                                  \
+  nscolor ComputedStyle::GetVisitedDependentColor(                             \
+      decltype(nsStyle##name_::MOZ_ARG_1 fields_) nsStyle##name_::* aField)    \
+      const {                                                                  \
+    MOZ_ASSERT(MOZ_FOR_EACH(STYLE_FIELD, (nsStyle##name_, ), fields_) false,   \
+               "Getting visited-dependent color for a field in nsStyle" #name_ \
+               " which is not listed in nsCSSVisitedDependentPropList.h");     \
+    return GetVisitedDependentColorInternal(                                   \
+        *this, [aField](const ComputedStyle& aStyle) {                         \
+          return ExtractColor(aStyle, aStyle.Style##name_()->*aField);         \
+        });                                                                    \
+  }
+FOR_EACH_VISITED_DEPENDENT_STYLE_STRUCT(GENERATE_VISITED_COLOR_TEMPLATE)
+#undef GENERATE_VISITED_COLOR_TEMPLATE
+#undef STYLE_FIELD
+
+struct ColorIndexSet {
+  uint8_t colorIndex, alphaIndex;
+};
+
+static const ColorIndexSet gVisitedIndices[2] = {{0, 0}, {1, 0}};
+
+nscolor ComputedStyle::CombineVisitedColors(nscolor* aColors,
+                                            bool aLinkIsVisited) {
+  if (NS_GET_A(aColors[1]) == 0) {
+    aLinkIsVisited = false;
+  }
+
+  const ColorIndexSet& set = gVisitedIndices[aLinkIsVisited ? 1 : 0];
+
+  nscolor colorColor = aColors[set.colorIndex];
+  nscolor alphaColor = aColors[set.alphaIndex];
+  return NS_RGBA(NS_GET_R(colorColor), NS_GET_G(colorColor),
+                 NS_GET_B(colorColor), NS_GET_A(alphaColor));
+}
+
+#ifdef DEBUG
+ const char* ComputedStyle::StructName(StyleStructID aSID) {
+  switch (aSID) {
+#  define CASE_STRUCT(name_)   \
+    case StyleStructID::name_: \
+      return #name_;
+    FOR_EACH_STYLE_STRUCT(CASE_STRUCT, CASE_STRUCT)
+#  undef CASE_STRUCT
+    default:
+      return "Unknown";
+  }
+}
+
+Maybe<StyleStructID> ComputedStyle::LookupStruct(const nsACString& aName) {
+#  define CHECK_STRUCT(name_) \
+    if (aName.EqualsLiteral(#name_)) return Some(StyleStructID::name_);
+  FOR_EACH_STYLE_STRUCT(CHECK_STRUCT, CHECK_STRUCT)
+#  undef CHECK_STRUCT
+  return Nothing();
+}
+#endif  // DEBUG
+
+ComputedStyle* ComputedStyle::GetCachedLazyPseudoStyle(
+    const PseudoStyleRequest& aRequest) const {
+  MOZ_ASSERT(PseudoStyle::IsPseudoElement(aRequest.mType));
+
+  if (PseudoStyle::SupportsUserActionState(aRequest.mType)) {
+    return nullptr;
+  }
+
+  return mCachedInheritingStyles.Lookup(aRequest);
+}
+
+MOZ_DEFINE_MALLOC_ENCLOSING_SIZE_OF(ServoComputedValuesMallocEnclosingSizeOf)
+
+void ComputedStyle::AddSizeOfIncludingThis(nsWindowSizes& aSizes,
+                                           size_t* aCVsSize) const {
+  *aCVsSize += ServoComputedValuesMallocEnclosingSizeOf(this);
+  mSource.AddSizeOfExcludingThis(aSizes);
+  mCachedInheritingStyles.AddSizeOfIncludingThis(aSizes, aCVsSize);
+}
+
+#ifdef DEBUG
+bool ComputedStyle::EqualForCachedAnonymousContentStyle(
+    const ComputedStyle& aOther) const {
+  return Servo_ComputedValues_EqualForCachedAnonymousContentStyle(this,
+                                                                  &aOther);
+}
+
+void ComputedStyle::DumpMatchedRules() const {
+  Servo_ComputedValues_DumpMatchedRules(this);
+}
+#endif
+
+bool ComputedStyle::HasAnchorPosReference() const {
+  const auto* pos = StylePosition();
+  if (pos->mPositionAnchor.value.IsIdent()) {
+    return true;
+  }
+
+  if (pos->CanHaveDefaultAnchor()) {
+    if (!pos->mPositionArea.IsNone()) {
+      return true;
+    }
+
+    const auto alignSelfValue =
+        pos->mAlignSelf._0 & ~StyleAlignFlags::FLAG_BITS;
+    const auto justifySelfValue =
+        pos->mJustifySelf._0 & ~StyleAlignFlags::FLAG_BITS;
+    if (alignSelfValue == StyleAlignFlags::ANCHOR_CENTER ||
+        justifySelfValue == StyleAlignFlags::ANCHOR_CENTER) {
+      return true;
+    }
+  }
+
+  return pos->mOffset.Any([](const StyleInset& aInset) {
+    return aInset.HasAnchorPositioningFunction();
+  }) || pos->mWidth.HasAnchorPositioningFunction() ||
+         pos->mHeight.HasAnchorPositioningFunction() ||
+         pos->mMinWidth.HasAnchorPositioningFunction() ||
+         pos->mMinHeight.HasAnchorPositioningFunction() ||
+         pos->mMaxWidth.HasAnchorPositioningFunction() ||
+         pos->mMaxHeight.HasAnchorPositioningFunction() ||
+         StyleMargin()->mMargin.Any([](const ::mozilla::StyleMargin& aMargin) {
+           return aMargin.HasAnchorPositioningFunction();
+         });
+}
+
+bool ComputedStyle::MaybeAnchorPosReferencesDiffer(
+    const ComputedStyle* aOther) const {
+  if (!HasAnchorPosReference() || !aOther->HasAnchorPosReference()) {
+    return true;
+  }
+
+  const auto* pos = StylePosition();
+  const auto* otherPos = aOther->StylePosition();
+  if (pos->mOffset != otherPos->mOffset || pos->mWidth != otherPos->mWidth ||
+      pos->mHeight != otherPos->mHeight ||
+      pos->mMinWidth != otherPos->mMinWidth ||
+      pos->mMinHeight != otherPos->mMinHeight ||
+      pos->mMaxWidth != otherPos->mMaxWidth ||
+      pos->mMaxHeight != otherPos->mMaxHeight ||
+      pos->mPositionAnchor != otherPos->mPositionAnchor) {
+    return true;
+  }
+
+  if (StyleMargin()->mMargin != aOther->StyleMargin()->mMargin) {
+    return true;
+  }
+
+  return false;
+}
+
+}  

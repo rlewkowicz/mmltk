@@ -1,0 +1,62 @@
+mmltk
+Copyright 2026 Ryan Michael Lewkowicz
+
+This repository is licensed under the Apache License, Version 2.0.
+
+Vendored third-party code under third_party/ and bundled font assets under
+src/frontend/iced/assets/fonts/ retain their respective upstream licenses and
+notices.
+
+Explore upscaler model assets
+-----------------------------
+
+ShiftLUT_fp32.onnx implements ShiftLUT: Spatial Shift Enhanced Look-Up Tables
+for Efficient Image Restoration by Xiaolong Zeng, Yitong Yu, Shiyao Xiong,
+Jinhua Hao, Ming Sun, Chao Zhou, and Bin Wang.
+
+Upstream source: https://github.com/Sailor-t/ShiftLUT
+Source revision: c5db332fa168386296a1b05fd443a70d0ccae184
+Packaged SHA-256:
+3bbae4b359cf7c063e87d9f8b8cb82bad989936313295ad753842b0270338484
+
+RealPLKSR_fp16.onnx is an FP16 ONNX deployment conversion of
+4xNomosWebPhoto_RealPLKSR by Philip Hofmann, based on the RealPLKSR/PLKSR
+architecture by Dongheon Lee, Seokju Yun, and Youngmin Ro. The deployment
+graph was corrected for this application.
+
+Model source: https://huggingface.co/Phips/4xNomosWebPhoto_RealPLKSR
+Architecture source: https://github.com/dslisleedh/PLKSR
+Model license: Creative Commons Attribution 4.0 International
+https://creativecommons.org/licenses/by/4.0/
+Architecture license: MIT
+Packaged SHA-256:
+294d117eb8e7093417cc972d41c7c5b84f3d452193c952e58bc7c94e2143692d
+
+NVIDIA Image Scaling coefficient data
+-------------------------------------
+
+The fallback coefficient tables retained in
+src/backend/imaging/upscale/detail/image_upscaler_nis_coefficients.h are
+derived from NVIDIA Image Scaling.
+
+The MIT License (MIT)
+
+Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

@@ -1,0 +1,138 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(_nsNSSComponent_h_)
+#define _nsNSSComponent_h_
+
+#include "nsINSSComponent.h"
+
+#include "EnterpriseRoots.h"
+#include "ScopedNSSTypes.h"
+#include "SharedCertVerifier.h"
+#include "mozilla/Monitor.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/RefPtr.h"
+#include "nsCOMPtr.h"
+#include "nsIObserver.h"
+#include "nsISerialEventTarget.h"
+#include "nsNSSCallbacks.h"
+#include "nsServiceManagerUtils.h"
+#include "prerror.h"
+#include "sslt.h"
+
+
+class nsIDOMWindow;
+class nsIPrompt;
+class nsITimer;
+
+namespace mozilla {
+namespace psm {
+
+[[nodiscard]] ::already_AddRefed<mozilla::psm::SharedCertVerifier>
+GetDefaultCertVerifier();
+UniqueCERTCertList FindClientCertificatesWithPrivateKeys();
+CertVerifier::CertificateTransparencyMode GetCertificateTransparencyMode();
+
+}  
+}  
+
+#define NS_NSSCOMPONENT_CID \
+  {0x4cb64dfd, 0xca98, 0x4e24, {0xbe, 0xfd, 0x0d, 0x92, 0x85, 0xa3, 0x3b, 0xcb}}
+
+bool EnsureNSSInitializedChromeOrContent();
+bool HandleTLSPrefChange(const nsCString& aPref);
+void SetValidationOptionsCommon();
+void PrepareForShutdownInSocketProcess();
+
+class AutoSearchingForClientAuthCertificates {
+ public:
+  AutoSearchingForClientAuthCertificates();
+  ~AutoSearchingForClientAuthCertificates();
+};
+
+class nsNSSComponent final : public nsINSSComponent,
+                             public nsIObserver
+{
+ public:
+  friend class LoadLoadableCertsTask;
+  friend class BackgroundImportEnterpriseCertsTask;
+
+  nsNSSComponent();
+
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSINSSCOMPONENT
+  NS_DECL_NSIOBSERVER
+
+  nsresult Init();
+
+  static nsresult GetNewPrompter(nsIPrompt** result);
+
+  static void FillTLSVersionRange(SSLVersionRange& rangeOut,
+                                  uint32_t minFromPrefs, uint32_t maxFromPrefs,
+                                  SSLVersionRange defaults);
+
+  static nsresult SetEnabledTLSVersions();
+
+  static void DoClearSSLExternalAndInternalSessionCache();
+
+ protected:
+  ~nsNSSComponent();
+
+ private:
+  nsresult InitializeNSS();
+  void PrepareForShutdown();
+
+  void setValidationOptions(const mozilla::MutexAutoLock& proofOfLock);
+  void GetRevocationBehaviorFromPrefs(
+       mozilla::psm::CertVerifier::OcspDownloadConfig* odc,
+       mozilla::psm::CertVerifier::OcspStrictConfig* osc,
+       uint32_t* certShortLifetimeInDays,
+       TimeDuration& softTimeout,
+       TimeDuration& hardTimeout);
+  void UpdateCertVerifierWithEnterpriseRoots();
+  nsresult RegisterObservers();
+
+  void MaybeImportEnterpriseRoots();
+  void ImportEnterpriseRoots();
+  void UnloadEnterpriseRoots();
+  nsresult CommonGetEnterpriseCerts(
+      nsTArray<nsTArray<uint8_t>>& enterpriseCerts, bool getRoots);
+
+  mozilla::Monitor mLoadableCertsLoadedMonitor;
+  bool mLoadableCertsLoaded MOZ_GUARDED_BY(mLoadableCertsLoadedMonitor);
+  nsresult mLoadableCertsLoadedResult
+      MOZ_GUARDED_BY(mLoadableCertsLoadedMonitor);
+
+  mozilla::Mutex mMutex;
+
+
+#if defined(DEBUG)
+  nsCString mTestBuiltInRootHash MOZ_GUARDED_BY(mMutex);
+#endif
+  RefPtr<mozilla::psm::SharedCertVerifier> mDefaultCertVerifier
+      MOZ_GUARDED_BY(mMutex);
+  nsString mMitmCanaryIssuer MOZ_GUARDED_BY(mMutex);
+  bool mMitmDetecionEnabled MOZ_GUARDED_BY(mMutex);
+  nsTArray<EnterpriseCert> mEnterpriseCerts MOZ_GUARDED_BY(mMutex);
+
+  static int mInstanceCount;
+  nsCOMPtr<nsISerialEventTarget> mNSSTaskQueue;
+};
+
+inline nsresult BlockUntilLoadableCertsLoaded() {
+  nsCOMPtr<nsINSSComponent> component(do_GetService(PSM_COMPONENT_CONTRACTID));
+  if (!component) {
+    return NS_ERROR_FAILURE;
+  }
+  return component->BlockUntilLoadableCertsLoaded();
+}
+
+nsresult CheckForSmartCardChanges();
+
+nsresult GetNSSProfilePath(nsAutoCString& aProfilePath);
+
+bool GetInSafeMode();
+
+#endif

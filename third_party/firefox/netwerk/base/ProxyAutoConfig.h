@@ -1,0 +1,114 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef ProxyAutoConfig_h_
+#define ProxyAutoConfig_h_
+
+#include <functional>
+#include "nsString.h"
+#include "nsCOMPtr.h"
+#include "nsTArray.h"
+
+class nsIEventTarget;
+class nsITimer;
+class nsIThread;
+namespace JS {
+class CallArgs;
+}  
+
+namespace mozilla {
+namespace net {
+
+class JSContextWrapper;
+class ProxyAutoConfigParent;
+union NetAddr;
+
+class ProxyAutoConfigBase {
+ public:
+  virtual ~ProxyAutoConfigBase() = default;
+  virtual nsresult Init(nsIThread* aPACThread) { return NS_OK; }
+  virtual nsresult ConfigurePAC(const nsACString& aPACURI,
+                                const nsACString& aPACScriptData,
+                                bool aIncludePath, uint32_t aExtraHeapSize,
+                                nsISerialEventTarget* aEventTarget) = 0;
+  virtual void SetThreadLocalIndex(uint32_t index) {}
+  virtual void Shutdown() = 0;
+  virtual void GC() = 0;
+  virtual void GetProxyForURIWithCallback(
+      const nsACString& aTestURI, const nsACString& aTestHost,
+      std::function<void(nsresult aStatus, const nsACString& aResult)>&&
+          aCallback) = 0;
+};
+
+
+class ProxyAutoConfig : public ProxyAutoConfigBase {
+ public:
+  ProxyAutoConfig();
+  virtual ~ProxyAutoConfig();
+
+  nsresult ConfigurePAC(const nsACString& aPACURI,
+                        const nsACString& aPACScriptData, bool aIncludePath,
+                        uint32_t aExtraHeapSize,
+                        nsISerialEventTarget* aEventTarget) override;
+  void SetThreadLocalIndex(uint32_t index) override;
+  void Shutdown() override;
+  void GC() override;
+  bool MyIPAddress(const JS::CallArgs& aArgs);
+  bool ResolveAddress(const nsACString& aHostName, NetAddr* aNetAddr,
+                      unsigned int aTimeout);
+
+  nsresult GetProxyForURI(const nsACString& aTestURI,
+                          const nsACString& aTestHost, nsACString& result);
+
+  void GetProxyForURIWithCallback(
+      const nsACString& aTestURI, const nsACString& aTestHost,
+      std::function<void(nsresult aStatus, const nsACString& aResult)>&&
+          aCallback) override;
+
+ private:
+  const static unsigned int kTimeout = 665;
+
+  nsresult SetupJS();
+
+  bool SrcAddress(const NetAddr* remoteAddress, nsCString& localAddress);
+  bool MyIPAddressTryHost(const nsACString& hostName, unsigned int timeout,
+                          const JS::CallArgs& aArgs, bool* aResult);
+
+  JSContextWrapper* mJSContext{nullptr};
+  bool mJSNeedsSetup{false};
+  bool mShutdown{true};
+  nsCString mConcatenatedPACData;
+  nsCString mPACURI;
+  bool mIncludePath{false};
+  uint32_t mExtraHeapSize{0};
+  nsCString mRunningHost;
+  nsCOMPtr<nsITimer> mTimer;
+  nsCOMPtr<nsISerialEventTarget> mMainThreadEventTarget;
+};
+
+class RemoteProxyAutoConfig : public ProxyAutoConfigBase {
+ public:
+  RemoteProxyAutoConfig();
+  virtual ~RemoteProxyAutoConfig();
+
+  nsresult Init(nsIThread* aPACThread) override;
+  nsresult ConfigurePAC(const nsACString& aPACURI,
+                        const nsACString& aPACScriptData, bool aIncludePath,
+                        uint32_t aExtraHeapSize,
+                        nsISerialEventTarget* aEventTarget) override;
+  void Shutdown() override;
+  void GC() override;
+  void GetProxyForURIWithCallback(
+      const nsACString& aTestURI, const nsACString& aTestHost,
+      std::function<void(nsresult aStatus, const nsACString& aResult)>&&
+          aCallback) override;
+
+ private:
+  RefPtr<ProxyAutoConfigParent> mProxyAutoConfigParent;
+};
+
+}  
+}  
+
+#endif  // ProxyAutoConfig_h_

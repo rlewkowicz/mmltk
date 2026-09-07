@@ -1,0 +1,54 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+#ifndef __NUMPARSE_CURRENCY_H__
+#define __NUMPARSE_CURRENCY_H__
+
+#include "numparse_types.h"
+#include "numparse_compositions.h"
+#include "charstr.h"
+#include "number_currencysymbols.h"
+#include "unicode/uniset.h"
+
+U_NAMESPACE_BEGIN
+namespace numparse::impl {
+
+using ::icu::number::impl::CurrencySymbols;
+
+class U_I18N_API_CLASS CombinedCurrencyMatcher : public NumberParseMatcher, public UMemory {
+  public:
+    CombinedCurrencyMatcher() = default;  
+
+    CombinedCurrencyMatcher(const CurrencySymbols& currencySymbols, const DecimalFormatSymbols& dfs,
+                            parse_flags_t parseFlags, UErrorCode& status);
+
+    bool match(StringSegment& segment, ParsedNumber& result, UErrorCode& status) const override;
+
+    bool smokeTest(const StringSegment& segment) const override;
+
+    UnicodeString toString() const override;
+
+  private:
+    char16_t fCurrencyCode[4];
+    UnicodeString fCurrency1;
+    UnicodeString fCurrency2;
+
+    bool fUseFullCurrencyData;
+    UnicodeString fLocalLongNames[StandardPlural::COUNT];
+
+    UnicodeString afterPrefixInsert;
+    UnicodeString beforeSuffixInsert;
+
+    CharString fLocaleName;
+
+
+    bool matchCurrency(StringSegment& segment, ParsedNumber& result, UErrorCode& status) const;
+};
+
+} 
+U_NAMESPACE_END
+
+#endif //__NUMPARSE_CURRENCY_H__
+#endif /* #if !UCONFIG_NO_FORMATTING */

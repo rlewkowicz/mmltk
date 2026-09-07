@@ -1,0 +1,181 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+#ifndef __NUMBER_ROUNDINGUTILS_H__
+#define __NUMBER_ROUNDINGUTILS_H__
+
+#include "number_types.h"
+#include "string_segment.h"
+
+U_NAMESPACE_BEGIN
+namespace number::impl {
+namespace roundingutils {
+
+enum Section {
+    SECTION_LOWER_EDGE = -1,
+    SECTION_UPPER_EDGE = -2,
+    SECTION_LOWER = 1,
+    SECTION_MIDPOINT = 2,
+    SECTION_UPPER = 3
+};
+
+inline bool
+getRoundingDirection(bool isEven, bool isNegative, Section section, RoundingMode roundingMode,
+                     UErrorCode &status) {
+    if (U_FAILURE(status)) {
+        return false;
+    }
+    switch (roundingMode) {
+        case RoundingMode::UNUM_ROUND_UP:
+            return false;
+
+        case RoundingMode::UNUM_ROUND_DOWN:
+            return true;
+
+        case RoundingMode::UNUM_ROUND_CEILING:
+            return isNegative;
+
+        case RoundingMode::UNUM_ROUND_FLOOR:
+            return !isNegative;
+
+        case RoundingMode::UNUM_ROUND_HALFUP:
+            switch (section) {
+                case SECTION_MIDPOINT:
+                    return false;
+                case SECTION_LOWER:
+                    return true;
+                case SECTION_UPPER:
+                    return false;
+                default:
+                    break;
+            }
+            break;
+
+        case RoundingMode::UNUM_ROUND_HALFDOWN:
+            switch (section) {
+                case SECTION_MIDPOINT:
+                    return true;
+                case SECTION_LOWER:
+                    return true;
+                case SECTION_UPPER:
+                    return false;
+                default:
+                    break;
+            }
+            break;
+
+        case RoundingMode::UNUM_ROUND_HALFEVEN:
+            switch (section) {
+                case SECTION_MIDPOINT:
+                    return isEven;
+                case SECTION_LOWER:
+                    return true;
+                case SECTION_UPPER:
+                    return false;
+                default:
+                    break;
+            }
+            break;
+
+        case RoundingMode::UNUM_ROUND_HALF_ODD:
+            switch (section) {
+                case SECTION_MIDPOINT:
+                    return !isEven;
+                case SECTION_LOWER:
+                    return true;
+                case SECTION_UPPER:
+                    return false;
+                default:
+                    break;
+            }
+            break;
+
+        case RoundingMode::UNUM_ROUND_HALF_CEILING:
+            switch (section) {
+                case SECTION_MIDPOINT:
+                    return isNegative;
+                case SECTION_LOWER:
+                    return true;
+                case SECTION_UPPER:
+                    return false;
+                default:
+                    break;
+            }
+            break;
+
+        case RoundingMode::UNUM_ROUND_HALF_FLOOR:
+            switch (section) {
+                case SECTION_MIDPOINT:
+                    return !isNegative;
+                case SECTION_LOWER:
+                    return true;
+                case SECTION_UPPER:
+                    return false;
+                default:
+                    break;
+            }
+            break;
+
+        default:
+            break;
+    }
+
+    status = U_FORMAT_INEXACT_ERROR;
+    return false;
+}
+
+inline bool roundsAtMidpoint(int roundingMode) {
+    switch (roundingMode) {
+        case RoundingMode::UNUM_ROUND_UP:
+        case RoundingMode::UNUM_ROUND_DOWN:
+        case RoundingMode::UNUM_ROUND_CEILING:
+        case RoundingMode::UNUM_ROUND_FLOOR:
+            return false;
+
+        default:
+            return true;
+    }
+}
+
+} 
+
+
+class RoundingImpl {
+  public:
+    RoundingImpl() = default;  
+
+    RoundingImpl(const Precision& precision, UNumberFormatRoundingMode roundingMode,
+                 const CurrencyUnit& currency, UErrorCode& status);
+
+    static RoundingImpl passThrough();
+
+    bool isSignificantDigits() const;
+
+    int32_t
+    chooseMultiplierAndApply(impl::DecimalQuantity &input, const impl::MultiplierProducer &producer,
+                             UErrorCode &status);
+
+    void apply(impl::DecimalQuantity &value, UErrorCode &status) const;
+
+    void apply(impl::DecimalQuantity &value, int32_t minInt, UErrorCode status);
+
+  private:
+    Precision fPrecision;
+    UNumberFormatRoundingMode fRoundingMode;
+    bool fPassThrough = true;  
+
+    friend class units::UnitsRouter;
+
+    friend class UnitConversionHandler;
+};
+
+void parseIncrementOption(const StringSegment &segment, Precision &outPrecision, UErrorCode &status);
+
+} 
+U_NAMESPACE_END
+
+#endif //__NUMBER_ROUNDINGUTILS_H__
+
+#endif /* #if !UCONFIG_NO_FORMATTING */

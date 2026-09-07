@@ -1,0 +1,128 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_MEDIA_MP4_SAMPLE_ITERATOR_H_
+#define DOM_MEDIA_MP4_SAMPLE_ITERATOR_H_
+
+#include "ByteStream.h"
+#include "MP4Interval.h"
+#include "MediaData.h"
+#include "MediaResource.h"
+#include "MoofParser.h"
+#include "TimeUnits.h"
+#include "mozilla/ResultVariant.h"
+#include "nsISupportsImpl.h"
+
+namespace mozilla {
+
+struct CencSampleEncryptionInfoEntry;
+class IndiceWrapper;
+class MP4SampleIndex;
+struct Sample;
+
+class SampleIterator {
+ public:
+  explicit SampleIterator(MP4SampleIndex* aIndex);
+  ~SampleIterator();
+  bool HasNext();
+  already_AddRefed<mozilla::MediaRawData> GetNextHeader();
+  Result<already_AddRefed<mozilla::MediaRawData>, MediaResult> GetNext();
+
+  enum class SyncSampleMode { Closest, First };
+  void Seek(const media::TimeUnit& aTime,
+            SyncSampleMode aMode = SyncSampleMode::Closest);
+
+  media::TimeUnit GetNextKeyframeTime();
+
+ private:
+  Result<Sample*, nsresult> Get();
+
+  SampleDescriptionEntry* GetSampleDescriptionEntry();
+  const CencSampleEncryptionInfoEntry* GetSampleEncryptionEntry() const;
+
+  Result<CryptoScheme, nsCString> GetEncryptionScheme();
+
+  void Next();
+  RefPtr<MP4SampleIndex> mIndex;
+  friend class MP4SampleIndex;
+  size_t mCurrentMoof;
+  size_t mCurrentSample;
+};
+
+class MP4SampleIndex {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(MP4SampleIndex)
+
+  struct Indice {
+    uint64_t start_offset;
+    uint64_t end_offset;
+    int64_t start_composition;
+    int64_t end_composition;
+    int64_t start_decode;
+    bool sync;
+  };
+
+  struct MP4DataOffset {
+    MP4DataOffset(uint32_t aIndex, int64_t aStartOffset)
+        : mIndex(aIndex), mStartOffset(aStartOffset), mEndOffset(0) {}
+
+    bool operator==(int64_t aStartOffset) const {
+      return mStartOffset == aStartOffset;
+    }
+
+    bool operator!=(int64_t aStartOffset) const {
+      return mStartOffset != aStartOffset;
+    }
+
+    bool operator<(int64_t aStartOffset) const {
+      return mStartOffset < aStartOffset;
+    }
+
+    struct EndOffsetComparator {
+      bool Equals(const MP4DataOffset& a, const int64_t& b) const {
+        return a.mEndOffset == b;
+      }
+
+      bool LessThan(const MP4DataOffset& a, const int64_t& b) const {
+        return a.mEndOffset < b;
+      }
+    };
+
+    uint32_t mIndex;
+    int64_t mStartOffset;
+    int64_t mEndOffset;
+    MP4Interval<media::TimeUnit> mTime;
+  };
+
+  MP4SampleIndex(const mozilla::IndiceWrapper& aIndices, ByteStream* aSource,
+                 uint32_t aTrackId, bool aIsAudio, uint32_t aTimeScale);
+
+  void UpdateMoofIndex(const mozilla::MediaByteRangeSet& aByteRanges,
+                       bool aCanEvict);
+  void UpdateMoofIndex(const mozilla::MediaByteRangeSet& aByteRanges);
+  mozilla::media::TimeIntervals ConvertByteRangesToTimeRanges(
+      const mozilla::MediaByteRangeSet& aByteRanges);
+  uint64_t GetEvictionOffset(const media::TimeUnit& aTime);
+  bool IsFragmented() { return !!mMoofParser; }
+
+  friend class SampleIterator;
+
+ private:
+  ~MP4SampleIndex();
+  void RegisterIterator(SampleIterator* aIterator);
+  void UnregisterIterator(SampleIterator* aIterator);
+
+  ByteStream* mSource;
+  FallibleTArray<Sample> mIndex;
+  FallibleTArray<MP4DataOffset> mDataOffset;
+  UniquePtr<MoofParser> mMoofParser;
+  nsTArray<SampleIterator*> mIterators;
+
+  mozilla::MediaByteRangeSet mLastCachedRanges;
+  mozilla::media::TimeIntervals mLastBufferedRanges;
+  bool mIsAudio;
+};
+}  
+
+#endif

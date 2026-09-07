@@ -1,0 +1,57 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsMathMLmrowFrame.h"
+
+#include "mozilla/PresShell.h"
+#include "mozilla/gfx/2D.h"
+
+using namespace mozilla;
+
+
+nsIFrame* NS_NewMathMLmrowFrame(PresShell* aPresShell, ComputedStyle* aStyle) {
+  return new (aPresShell)
+      nsMathMLmrowFrame(aStyle, aPresShell->GetPresContext());
+}
+
+NS_IMPL_FRAMEARENA_HELPERS(nsMathMLmrowFrame)
+
+nsMathMLmrowFrame::~nsMathMLmrowFrame() = default;
+
+NS_IMETHODIMP
+nsMathMLmrowFrame::InheritAutomaticData(nsIFrame* aParent) {
+  nsMathMLContainerFrame::InheritAutomaticData(aParent);
+
+  mPresentationData.flags +=
+      MathMLPresentationFlag::StretchAllChildrenVertically;
+
+  return NS_OK;
+}
+
+nsresult nsMathMLmrowFrame::AttributeChanged(int32_t aNameSpaceID,
+                                             nsAtom* aAttribute,
+                                             AttrModType aModType) {
+  if (mContent->IsMathMLElement(nsGkAtoms::mtable)) {
+    nsIFrame* frame = mFrames.FirstChild();
+    for (; frame; frame = frame->PrincipalChildList().FirstChild()) {
+      if (frame->IsTableWrapperFrame()) {
+        return frame->AttributeChanged(aNameSpaceID, aAttribute, aModType);
+      }
+    }
+    MOZ_ASSERT_UNREACHABLE("mtable wrapper without the real table frame");
+  }
+
+  return nsMathMLContainerFrame::AttributeChanged(aNameSpaceID, aAttribute,
+                                                  aModType);
+}
+
+MathMLFrameType nsMathMLmrowFrame::GetMathMLFrameType() {
+  if (!IsMrowLike()) {
+    nsIMathMLFrame* child = do_QueryFrame(mFrames.FirstChild());
+    if (child) {
+      return child->GetMathMLFrameType();
+    }
+  }
+  return nsMathMLFrame::GetMathMLFrameType();
+}

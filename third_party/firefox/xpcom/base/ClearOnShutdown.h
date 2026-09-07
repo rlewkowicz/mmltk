@@ -1,0 +1,106 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_ClearOnShutdown_h
+#define mozilla_ClearOnShutdown_h
+
+#include "mozilla/LinkedList.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/Array.h"
+#include "ShutdownPhase.h"
+#include "MainThreadUtils.h"
+
+#include <functional>
+
+
+namespace mozilla {
+
+namespace ClearOnShutdown_Internal {
+
+class ShutdownObserver : public LinkedListElement<ShutdownObserver> {
+ public:
+  virtual void Shutdown() = 0;
+  virtual ~ShutdownObserver() = default;
+};
+
+template <class SmartPtr>
+class PointerClearer : public ShutdownObserver {
+ public:
+  explicit PointerClearer(SmartPtr* aPtr) : mPtr(aPtr) {}
+
+  virtual void Shutdown() override {
+    if (mPtr) {
+      *mPtr = nullptr;
+    }
+  }
+
+ private:
+  SmartPtr* mPtr;
+};
+
+class FunctionInvoker : public ShutdownObserver {
+ public:
+  template <typename CallableT>
+  explicit FunctionInvoker(CallableT&& aCallable)
+      : mCallable(std::forward<CallableT>(aCallable)) {}
+
+  virtual void Shutdown() override {
+    if (!mCallable) {
+      return;
+    }
+
+    mCallable();
+  }
+
+ private:
+  std::function<void()> mCallable;
+};
+
+void InsertIntoShutdownList(ShutdownObserver* aShutdownObserver,
+                            ShutdownPhase aPhase);
+
+typedef LinkedList<ShutdownObserver> ShutdownList;
+extern Array<StaticAutoPtr<ShutdownList>,
+             static_cast<size_t>(ShutdownPhase::ShutdownPhase_Length)>
+    sShutdownObservers;
+extern ShutdownPhase sCurrentClearOnShutdownPhase;
+
+}  
+
+template <class SmartPtr>
+inline void ClearOnShutdown(
+    SmartPtr* aPtr, ShutdownPhase aPhase = ShutdownPhase::XPCOMShutdownFinal) {
+  using namespace ClearOnShutdown_Internal;
+
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aPhase != ShutdownPhase::ShutdownPhase_Length);
+
+  InsertIntoShutdownList(new PointerClearer<SmartPtr>(aPtr), aPhase);
+}
+
+template <typename CallableT>
+inline void RunOnShutdown(
+    CallableT&& aCallable,
+    ShutdownPhase aPhase = ShutdownPhase::XPCOMShutdownFinal) {
+  using namespace ClearOnShutdown_Internal;
+
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aPhase != ShutdownPhase::ShutdownPhase_Length);
+
+  InsertIntoShutdownList(
+      new FunctionInvoker(std::forward<CallableT>(aCallable)), aPhase);
+}
+
+inline bool PastShutdownPhase(ShutdownPhase aPhase) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  return size_t(ClearOnShutdown_Internal::sCurrentClearOnShutdownPhase) >=
+         size_t(aPhase);
+}
+
+void KillClearOnShutdown(ShutdownPhase aPhase);
+
+}  
+
+#endif

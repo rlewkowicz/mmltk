@@ -1,0 +1,79 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef JoinNodesTransaction_h
+#define JoinNodesTransaction_h
+
+#include "EditTransactionBase.h"  // for EditTransactionBase, etc.
+
+#include "EditorDOMPoint.h"  // for EditorDOMPoint, etc.
+#include "EditorForwards.h"
+
+#include "nsCOMPtr.h"  // for nsCOMPtr
+#include "nsCycleCollectionParticipant.h"
+#include "nsID.h"    // for REFNSIID
+#include "nscore.h"  // for NS_IMETHOD
+
+class nsIContent;
+class nsINode;
+
+namespace mozilla {
+
+class JoinNodesTransaction final : public EditTransactionBase {
+ protected:
+  JoinNodesTransaction(HTMLEditor& aHTMLEditor, nsIContent& aLeftContent,
+                       nsIContent& aRightContent);
+
+ public:
+  static already_AddRefed<JoinNodesTransaction> MaybeCreate(
+      HTMLEditor& aHTMLEditor, nsIContent& aLeftContent,
+      nsIContent& aRightContent);
+
+  bool CanDoIt() const;
+
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(JoinNodesTransaction,
+                                           EditTransactionBase)
+  NS_IMETHOD QueryInterface(REFNSIID aIID, void** aInstancePtr) override;
+
+  NS_DECL_EDITTRANSACTIONBASE
+  NS_DECL_EDITTRANSACTIONBASE_GETASMETHODS_OVERRIDE(JoinNodesTransaction)
+
+  MOZ_CAN_RUN_SCRIPT NS_IMETHOD RedoTransaction() override;
+
+  nsIContent* GetExistingContent() const { return mKeepingContent; }
+  nsIContent* GetRemovedContent() const { return mRemovedContent; }
+  nsINode* GetParentNode() const { return mParentNode; }
+
+  template <typename EditorDOMPointType>
+  EditorDOMPointType CreateJoinedPoint() const {
+    if (MOZ_UNLIKELY(!mKeepingContent)) {
+      return EditorDOMPointType();
+    }
+    return EditorDOMPointType(
+        mKeepingContent, std::min(mJoinedOffset, mKeepingContent->Length()));
+  }
+
+  friend std::ostream& operator<<(std::ostream& aStream,
+                                  const JoinNodesTransaction& aTransaction);
+
+ protected:
+  virtual ~JoinNodesTransaction() = default;
+
+  enum class RedoingTransaction { No, Yes };
+  MOZ_CAN_RUN_SCRIPT nsresult DoTransactionInternal(RedoingTransaction);
+
+  RefPtr<HTMLEditor> mHTMLEditor;
+
+  nsCOMPtr<nsINode> mParentNode;
+
+  nsCOMPtr<nsIContent> mRemovedContent;
+
+  nsCOMPtr<nsIContent> mKeepingContent;
+
+  uint32_t mJoinedOffset = 0u;
+};
+
+}  
+
+#endif  // #ifndef JoinNodesTransaction_h

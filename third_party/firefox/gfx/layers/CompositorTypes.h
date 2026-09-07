@@ -1,0 +1,204 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_LAYERS_COMPOSITORTYPES_H
+#define MOZILLA_LAYERS_COMPOSITORTYPES_H
+
+#include <iosfwd>
+#include <stdint.h>       // for uint32_t
+#include <sys/types.h>    // for int32_t
+#include "LayersTypes.h"  // for LayersBackend, etc
+#include "nsXULAppAPI.h"  // for GeckoProcessType, etc
+#include "mozilla/gfx/Types.h"
+#include "mozilla/layers/SyncObject.h"
+
+#include "mozilla/TypedEnumBits.h"
+
+namespace mozilla {
+namespace layers {
+
+enum class TextureFlags : uint32_t {
+  NO_FLAGS = 0,
+  USE_NEAREST_FILTER = 1 << 0,
+  ORIGIN_BOTTOM_LEFT = 1 << 1,
+  DISALLOW_BIGIMAGE = 1 << 2,
+  RB_SWAPPED = 1 << 3,
+  NON_PREMULTIPLIED = 1 << 4,
+  RECYCLE = 1 << 5,
+  DEALLOCATE_CLIENT = 1 << 6,
+  DEALLOCATE_SYNC = 1 << 6,  
+  IMMUTABLE = 1 << 9,
+  IMMEDIATE_UPLOAD = 1 << 10,
+  COMPONENT_ALPHA = 1 << 11,
+  INVALID_COMPOSITOR = 1 << 12,
+  RGB_FROM_YCBCR = 1 << 13,
+  SNAPSHOT = 1 << 14,
+  NON_BLOCKING_READ_LOCK = 1 << 15,
+  BLOCKING_READ_LOCK = 1 << 16,
+  WAIT_HOST_USAGE_END = 1 << 17,
+  IS_OPAQUE = 1 << 18,
+  BORROWED_EXTERNAL_ID = 1 << 19,
+  REMOTE_TEXTURE = 1 << 20,
+  DRM_SOURCE = 1 << 21,
+  DUMMY_TEXTURE = 1 << 22,
+  SOFTWARE_DECODED_VIDEO = 1 << 23,
+  WAIT_FOR_REMOTE_TEXTURE_OWNER = 1 << 24,
+  ALLOC_BY_BUFFER_PROVIDER = 1 << 25,
+
+  ALL_BITS = (1 << 26) - 1,
+  DEFAULT = NO_FLAGS
+};
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(TextureFlags)
+
+std::ostream& operator<<(std::ostream& aStream, const TextureFlags& aFlags);
+
+static inline bool TextureRequiresLocking(TextureFlags aFlags) {
+  return !(aFlags & TextureFlags::IMMUTABLE);
+}
+
+enum class DiagnosticTypes : uint8_t {
+  NO_DIAGNOSTIC = 0,
+  TILE_BORDERS = 1 << 0,
+  LAYER_BORDERS = 1 << 1,
+  BIGIMAGE_BORDERS = 1 << 2,
+  FLASH_BORDERS = 1 << 3,
+  ALL_BITS = (1 << 4) - 1
+};
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(DiagnosticTypes)
+
+enum class EffectTypes : uint8_t {
+  ROUNDED_CLIP,
+  RGB,
+  YCBCR,
+  NV12,
+  MAX  
+};
+
+enum class CompositableType : uint8_t {
+  UNKNOWN,
+  IMAGE,  
+  COUNT
+};
+
+enum class ImageUsageType : uint8_t {
+  UNKNOWN,
+  WebRenderImageData,
+  WebRenderFallbackData,
+  Canvas,
+  OffscreenCanvas,
+  VideoFrameContainer,
+  RemoteVideoDecoder,
+  BlackImage,
+  Webrtc,
+  WebCodecs,
+  COUNT
+};
+
+struct TextureFactoryIdentifier {
+  LayersBackend mParentBackend;
+  WebRenderBackend mWebRenderBackend;
+  WebRenderCompositor mWebRenderCompositor;
+  GeckoProcessType mParentProcessType;
+  int32_t mMaxTextureSize;
+  bool mCompositorUseANGLE;
+  bool mCompositorUseDComp;
+  bool mUseLayerCompositor;
+  bool mUseCompositorWnd;
+  bool mSupportsTextureBlitting;
+  bool mSupportsPartialUploads;
+  bool mSupportsComponentAlpha;
+  bool mSupportsD3D11NV12;
+  SyncHandle mSyncHandle;
+
+  explicit TextureFactoryIdentifier(
+      LayersBackend aLayersBackend = LayersBackend::LAYERS_NONE,
+      GeckoProcessType aParentProcessType = GeckoProcessType_Default,
+      int32_t aMaxTextureSize = 4096, bool aCompositorUseANGLE = false,
+      bool aCompositorUseDComp = false, bool aUseLayerCompositor = false,
+      bool aUseCompositorWnd = false, bool aSupportsTextureBlitting = false,
+      bool aSupportsPartialUploads = false, bool aSupportsComponentAlpha = true,
+      bool aSupportsD3D11NV12 = false, SyncHandle aSyncHandle = {})
+      : mParentBackend(aLayersBackend),
+        mWebRenderBackend(WebRenderBackend::HARDWARE),
+        mWebRenderCompositor(WebRenderCompositor::DRAW),
+        mParentProcessType(aParentProcessType),
+        mMaxTextureSize(aMaxTextureSize),
+        mCompositorUseANGLE(aCompositorUseANGLE),
+        mCompositorUseDComp(aCompositorUseDComp),
+        mUseLayerCompositor(aUseLayerCompositor),
+        mUseCompositorWnd(aUseCompositorWnd),
+        mSupportsTextureBlitting(aSupportsTextureBlitting),
+        mSupportsPartialUploads(aSupportsPartialUploads),
+        mSupportsComponentAlpha(aSupportsComponentAlpha),
+        mSupportsD3D11NV12(aSupportsD3D11NV12),
+        mSyncHandle(aSyncHandle) {}
+
+  explicit TextureFactoryIdentifier(
+      WebRenderBackend aWebRenderBackend,
+      WebRenderCompositor aWebRenderCompositor,
+      GeckoProcessType aParentProcessType = GeckoProcessType_Default,
+      int32_t aMaxTextureSize = 4096, bool aCompositorUseANGLE = false,
+      bool aCompositorUseDComp = false, bool aUseLayerCompositor = false,
+      bool aUseCompositorWnd = false, bool aSupportsTextureBlitting = false,
+      bool aSupportsPartialUploads = false, bool aSupportsComponentAlpha = true,
+      bool aSupportsD3D11NV12 = false, SyncHandle aSyncHandle = {})
+      : mParentBackend(LayersBackend::LAYERS_WR),
+        mWebRenderBackend(aWebRenderBackend),
+        mWebRenderCompositor(aWebRenderCompositor),
+        mParentProcessType(aParentProcessType),
+        mMaxTextureSize(aMaxTextureSize),
+        mCompositorUseANGLE(aCompositorUseANGLE),
+        mCompositorUseDComp(aCompositorUseDComp),
+        mUseLayerCompositor(aUseLayerCompositor),
+        mUseCompositorWnd(aUseCompositorWnd),
+        mSupportsTextureBlitting(aSupportsTextureBlitting),
+        mSupportsPartialUploads(aSupportsPartialUploads),
+        mSupportsComponentAlpha(aSupportsComponentAlpha),
+        mSupportsD3D11NV12(aSupportsD3D11NV12),
+        mSyncHandle(aSyncHandle) {}
+};
+
+struct TextureInfo {
+  CompositableType mCompositableType;
+  ImageUsageType mUsageType;
+  TextureFlags mTextureFlags;
+
+  TextureInfo()
+      : mCompositableType(CompositableType::UNKNOWN),
+        mUsageType(ImageUsageType::UNKNOWN),
+        mTextureFlags(TextureFlags::NO_FLAGS) {}
+
+  TextureInfo(CompositableType aType, ImageUsageType aUsageType,
+              TextureFlags aTextureFlags)
+      : mCompositableType(aType),
+        mUsageType(aUsageType),
+        mTextureFlags(aTextureFlags) {}
+
+  bool operator==(const TextureInfo& aOther) const {
+    return mCompositableType == aOther.mCompositableType &&
+           mTextureFlags == aOther.mTextureFlags;
+  }
+};
+
+enum class OpenMode : uint8_t {
+  OPEN_NONE = 0,
+  OPEN_READ = 0x1,
+  OPEN_WRITE = 0x2,
+
+  OPEN_READ_WRITE = OPEN_READ | OPEN_WRITE,
+  OPEN_READ_ONLY = OPEN_READ,
+  OPEN_WRITE_ONLY = OPEN_WRITE,
+};
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(OpenMode)
+
+enum class ClipType : uint8_t {
+  ClipNone = 0,  
+  RoundedRect,
+  NumClipTypes
+};
+
+}  
+}  
+
+#endif

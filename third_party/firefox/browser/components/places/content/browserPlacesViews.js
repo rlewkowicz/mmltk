@@ -1,0 +1,2163 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+class PlacesViewBase {
+  constructor(placesUrl, rootElt, viewElt) {
+    this._rootElt = rootElt;
+    this._viewElt = viewElt;
+    this._init?.();
+    this._controller = new PlacesController(this);
+    this.place = placesUrl;
+    this._viewElt.controllers.appendController(this._controller);
+  }
+
+  _viewElt = null;
+
+  get associatedElement() {
+    return this._viewElt;
+  }
+
+  get controllers() {
+    return this._viewElt.controllers;
+  }
+
+  _rootElt = null;
+
+  get rootElement() {
+    return this._rootElt;
+  }
+
+  _nativeView = false;
+
+  static interfaces = [
+    Ci.nsINavHistoryResultObserver,
+    Ci.nsISupportsWeakReference,
+  ];
+
+  QueryInterface = ChromeUtils.generateQI(PlacesViewBase.interfaces);
+
+  _place = "";
+  get place() {
+    return this._place;
+  }
+  set place(val) {
+    this._place = val;
+
+    let history = PlacesUtils.history;
+    let query = {},
+      options = {};
+    history.queryStringToQuery(val, query, options);
+    let result = history.executeQuery(query.value, options.value);
+    result.addObserver(this);
+  }
+
+  _result = null;
+  get result() {
+    return this._result;
+  }
+  set result(val) {
+    if (this._result == val) {
+      return;
+    }
+
+    if (this._result) {
+      this._result.removeObserver(this);
+      this._resultNode.containerOpen = false;
+    }
+
+    if (this._rootElt.localName == "menupopup") {
+      this._rootElt._built = false;
+    }
+
+    this._result = val;
+    if (val) {
+      this._resultNode = val.root;
+      this._rootElt._placesNode = this._resultNode;
+      this._domNodes = new Map();
+      this._domNodes.set(this._resultNode, this._rootElt);
+
+      this._resultNode.containerOpen = true;
+    } else {
+      this._resultNode = null;
+      delete this._domNodes;
+    }
+  }
+
+  _getDOMNodeForPlacesNode(aPlacesNode, aAllowMissing = false) {
+    let node = this._domNodes.get(aPlacesNode, null);
+    if (!node && !aAllowMissing) {
+      throw new Error(
+        "No DOM node set for aPlacesNode.\nnode.type: " +
+          aPlacesNode.type +
+          ". node.parent: " +
+          aPlacesNode
+      );
+    }
+    return node;
+  }
+
+  get controller() {
+    return this._controller;
+  }
+
+  get selType() {
+    return "single";
+  }
+  selectItems() {}
+  selectAll() {}
+
+  get selectedNode() {
+    if (this._contextMenuShown) {
+      let anchor = this._contextMenuShown.triggerNode;
+      if (!anchor) {
+        return null;
+      }
+
+      if (anchor._placesNode) {
+        return this._rootElt == anchor ? null : anchor._placesNode;
+      }
+
+      anchor = anchor.parentNode;
+      return this._rootElt == anchor ? null : anchor._placesNode || null;
+    }
+    return null;
+  }
+
+  get hasSelection() {
+    return this.selectedNode != null;
+  }
+
+  get selectedNodes() {
+    let selectedNode = this.selectedNode;
+    return selectedNode ? [selectedNode] : [];
+  }
+
+  get singleClickOpens() {
+    return true;
+  }
+
+  get removableSelectionRanges() {
+    let popupNode = PlacesUIUtils.lastContextMenuTriggerNode;
+    if (
+      popupNode &&
+      (popupNode.localName == "menupopup" || !popupNode._placesNode)
+    ) {
+      return [];
+    }
+
+    return [this.selectedNodes];
+  }
+
+  get draggableSelection() {
+    return [this._draggedElt];
+  }
+
+  get insertionPoint() {
+    let resultNode = this._resultNode;
+    if (
+      PlacesUtils.nodeIsQuery(resultNode) &&
+      PlacesUtils.asQuery(resultNode).queryOptions.queryType ==
+        Ci.nsINavHistoryQueryOptions.QUERY_TYPE_HISTORY
+    ) {
+      return null;
+    }
+
+    let index = PlacesUtils.bookmarks.DEFAULT_INDEX;
+    let container = this._resultNode;
+    let orientation = Ci.nsITreeView.DROP_BEFORE;
+    let tagName = null;
+
+    let selectedNode = this.selectedNode;
+    if (selectedNode) {
+      let popupNode = PlacesUIUtils.lastContextMenuTriggerNode;
+      if (
+        !popupNode._placesNode ||
+        popupNode._placesNode == this._resultNode ||
+        popupNode._placesNode.itemId == -1 ||
+        !selectedNode.parent
+      ) {
+        container = selectedNode;
+        orientation = Ci.nsITreeView.DROP_ON;
+      } else {
+        container = selectedNode.parent;
+        index = container.getChildIndex(selectedNode);
+        if (PlacesUtils.nodeIsTagQuery(container)) {
+          tagName = PlacesUtils.asQuery(container).query.tags[0];
+        }
+      }
+    }
+
+    if (this.controller.disallowInsertion(container)) {
+      return null;
+    }
+
+    return new PlacesInsertionPoint({
+      parentGuid: PlacesUtils.getConcreteItemGuid(container),
+      index,
+      orientation,
+      tagName,
+    });
+  }
+
+  buildContextMenu(aPopup) {
+    let triggerNode = aPopup.triggerNode;
+    if (
+      triggerNode?.localName == "menupopup" &&
+      triggerNode._placesNode?.childCount > 0
+    ) {
+      return false;
+    }
+
+    this._contextMenuShown = aPopup;
+    window.updateCommands("places");
+
+    let existingOtherBookmarksItem = aPopup.querySelector(
+      "#show-other-bookmarks_PersonalToolbar"
+    );
+    existingOtherBookmarksItem?.remove();
+
+    let manageBookmarksMenu = aPopup.querySelector(
+      "#placesContext_showAllBookmarks"
+    );
+    let existingSubmenu = aPopup.querySelector("#toggle_PersonalToolbar");
+    existingSubmenu?.remove();
+    let bookmarksToolbar = document.getElementById("PersonalToolbar");
+    if (bookmarksToolbar?.contains(aPopup.triggerNode)) {
+      manageBookmarksMenu.removeAttribute("hidden");
+
+      let menu = BookmarkingUI.buildBookmarksToolbarSubmenu(bookmarksToolbar);
+      aPopup.insertBefore(menu, manageBookmarksMenu);
+
+      if (
+        aPopup.triggerNode.id === "OtherBookmarks" ||
+        aPopup.triggerNode.id === "PlacesChevron" ||
+        aPopup.triggerNode.id === "PlacesToolbarItems" ||
+        aPopup.triggerNode.parentNode.id === "PlacesToolbarItems"
+      ) {
+        let otherBookmarksMenuItem =
+          BookmarkingUI.buildShowOtherBookmarksMenuItem();
+
+        if (otherBookmarksMenuItem) {
+          aPopup.insertBefore(otherBookmarksMenuItem, menu.nextElementSibling);
+        }
+      }
+    } else {
+      manageBookmarksMenu.setAttribute("hidden", "true");
+    }
+
+    return this.controller.buildContextMenu(aPopup);
+  }
+
+  destroyContextMenu() {
+    this._contextMenuShown = null;
+  }
+
+  clearAllContents(aPopup) {
+    let kid = aPopup.firstElementChild;
+    while (kid) {
+      let next = kid.nextElementSibling;
+      if (!kid.classList.contains("panel-header")) {
+        kid.remove();
+      }
+      kid = next;
+    }
+    aPopup._emptyMenuitem = aPopup._startMarker = aPopup._endMarker = null;
+  }
+
+  _cleanPopup(aPopup, aDelay) {
+    this._ensureMarkers(aPopup);
+    let child = aPopup._startMarker;
+    while (child.nextElementSibling != aPopup._endMarker) {
+      let sibling = child.nextElementSibling;
+      if (sibling._placesNode && !aDelay) {
+        aPopup.removeChild(sibling);
+      } else if (sibling._placesNode && aDelay) {
+        if (!aPopup._delayedRemovals) {
+          aPopup._delayedRemovals = [];
+        }
+        aPopup._delayedRemovals.push(sibling);
+        child = child.nextElementSibling;
+      } else {
+        child = child.nextElementSibling;
+      }
+    }
+  }
+
+  _rebuildPopup(aPopup) {
+    let resultNode = aPopup._placesNode;
+    if (!resultNode.containerOpen) {
+      return;
+    }
+
+    this._cleanPopup(aPopup);
+
+    let cc = resultNode.childCount;
+    if (cc > 0) {
+      this._setEmptyPopupStatus(aPopup, false);
+      let fragment = document.createDocumentFragment();
+      for (let i = 0; i < cc; ++i) {
+        let child = resultNode.getChild(i);
+        this._insertNewItemToPopup(child, fragment);
+      }
+      aPopup.insertBefore(fragment, aPopup._endMarker);
+    } else {
+      this._setEmptyPopupStatus(aPopup, true);
+    }
+    aPopup._built = true;
+  }
+
+  _removeChild(aChild) {
+    aChild.remove();
+  }
+
+  _setEmptyPopupStatus(aPopup, aEmpty) {
+    if (!aPopup._emptyMenuitem) {
+      aPopup._emptyMenuitem = document.createXULElement("menuitem");
+      aPopup._emptyMenuitem.setAttribute("disabled", true);
+      aPopup._emptyMenuitem.className = "bookmark-item";
+      document.l10n.setAttributes(
+        aPopup._emptyMenuitem,
+        "places-empty-bookmarks-folder"
+      );
+    }
+
+    if (aEmpty) {
+      aPopup.setAttribute("emptyplacesresult", "true");
+      if (
+        !aPopup._startMarker.previousElementSibling &&
+        !aPopup._endMarker.nextElementSibling
+      ) {
+        aPopup.insertBefore(aPopup._emptyMenuitem, aPopup._endMarker);
+      }
+    } else {
+      aPopup.removeAttribute("emptyplacesresult");
+      try {
+        aPopup.removeChild(aPopup._emptyMenuitem);
+      } catch (ex) {}
+    }
+  }
+
+  _createDOMNodeForPlacesNode(aPlacesNode) {
+    this._domNodes.delete(aPlacesNode);
+
+    let element;
+    let type = aPlacesNode.type;
+    if (type == Ci.nsINavHistoryResultNode.RESULT_TYPE_SEPARATOR) {
+      element = document.createXULElement("menuseparator");
+    } else {
+      if (type == Ci.nsINavHistoryResultNode.RESULT_TYPE_URI) {
+        element = document.createXULElement("menuitem");
+        element.className =
+          "menuitem-iconic bookmark-item menuitem-with-favicon";
+        element.setAttribute(
+          "scheme",
+          PlacesUIUtils.guessUrlSchemeForUI(aPlacesNode.uri)
+        );
+      } else if (PlacesUtils.containerTypes.includes(type)) {
+        element = document.createXULElement("menu");
+        element.setAttribute("container", "true");
+
+        if (aPlacesNode.type == Ci.nsINavHistoryResultNode.RESULT_TYPE_QUERY) {
+          element.setAttribute("query", "true");
+          if (PlacesUtils.nodeIsTagQuery(aPlacesNode)) {
+            element.setAttribute("tagContainer", "true");
+          } else if (PlacesUtils.nodeIsDay(aPlacesNode)) {
+            element.setAttribute("dayContainer", "true");
+          } else if (PlacesUtils.nodeIsHost(aPlacesNode)) {
+            element.setAttribute("hostContainer", "true");
+          }
+        }
+
+        let popup = document.createXULElement("menupopup", {
+          is: "places-popup",
+        });
+        popup._placesNode = PlacesUtils.asContainer(aPlacesNode);
+
+        if (!this._nativeView) {
+          popup.setAttribute("placespopup", "true");
+          popup.toggleAttribute("nonnative", true);
+        }
+
+        element.appendChild(popup);
+        element.className = "menu-iconic bookmark-item";
+
+        this._domNodes.set(aPlacesNode, popup);
+      } else {
+        throw new Error("Unexpected node");
+      }
+
+      element.setAttribute("label", PlacesUIUtils.getBestTitle(aPlacesNode));
+
+      let icon = aPlacesNode.icon;
+      if (icon) {
+        element.setAttribute("image", ChromeUtils.encodeURIForSrcset(icon));
+      }
+    }
+
+    element._placesNode = aPlacesNode;
+    if (!this._domNodes.has(aPlacesNode)) {
+      this._domNodes.set(aPlacesNode, element);
+    }
+
+    return element;
+  }
+
+  _insertNewItemToPopup(aNewChild, aInsertionNode, aBefore = null) {
+    let element = this._createDOMNodeForPlacesNode(aNewChild);
+
+    aInsertionNode.insertBefore(element, aBefore);
+    return element;
+  }
+
+  toggleCutNode(aPlacesNode, aValue) {
+    let elt = this._getDOMNodeForPlacesNode(aPlacesNode);
+
+    if (elt.localName == "menupopup") {
+      elt = elt.parentNode;
+    }
+    if (aValue) {
+      elt.setAttribute("cutting", "true");
+    } else {
+      elt.removeAttribute("cutting");
+    }
+  }
+
+  nodeURIChanged(aPlacesNode) {
+    let elt = this._getDOMNodeForPlacesNode(aPlacesNode, true);
+
+    if (!elt) {
+      return;
+    }
+
+    if (elt.localName == "menupopup") {
+      elt = elt.parentNode;
+    }
+
+    elt.setAttribute(
+      "scheme",
+      PlacesUIUtils.guessUrlSchemeForUI(aPlacesNode.uri)
+    );
+  }
+
+  nodeIconChanged(aPlacesNode) {
+    let elt = this._getDOMNodeForPlacesNode(aPlacesNode, true);
+
+    if (!elt || elt == this._rootElt) {
+      return;
+    }
+
+    if (elt.localName == "menupopup") {
+      elt = elt.parentNode;
+    }
+    elt.removeAttribute("image");
+    elt.setAttribute("image", ChromeUtils.encodeURIForSrcset(aPlacesNode.icon));
+  }
+
+  nodeTitleChanged(aPlacesNode, aNewTitle) {
+    let elt = this._getDOMNodeForPlacesNode(aPlacesNode);
+
+    if (elt == this._rootElt) {
+      return;
+    }
+
+    if (elt.localName == "menupopup") {
+      elt = elt.parentNode;
+    }
+
+    if (!aNewTitle && elt.localName != "toolbarbutton") {
+      elt.setAttribute("label", PlacesUIUtils.getBestTitle(aPlacesNode));
+    } else {
+      elt.setAttribute("label", aNewTitle);
+    }
+  }
+
+  nodeRemoved(aParentPlacesNode, aPlacesNode) {
+    let parentElt = this._getDOMNodeForPlacesNode(aParentPlacesNode);
+    let elt = this._getDOMNodeForPlacesNode(aPlacesNode);
+
+    if (elt.localName == "menupopup") {
+      elt = elt.parentNode;
+    }
+
+    if (parentElt._built) {
+      parentElt.removeChild(elt);
+
+      if (parentElt._startMarker.nextElementSibling == parentElt._endMarker) {
+        this._mayAddCommandsItems(parentElt);
+        this._setEmptyPopupStatus(parentElt, true);
+      }
+    }
+  }
+
+  skipHistoryDetailsNotifications = true;
+  nodeHistoryDetailsChanged() {}
+  nodeTagsChanged() {}
+  nodeDateAddedChanged() {}
+  nodeLastModifiedChanged() {}
+  nodeKeywordChanged() {}
+  sortingChanged() {}
+  batching() {}
+
+  nodeInserted(aParentPlacesNode, aPlacesNode, aIndex) {
+    let parentElt = this._getDOMNodeForPlacesNode(aParentPlacesNode);
+    if (!parentElt._built) {
+      return;
+    }
+
+    let index =
+      Array.prototype.indexOf.call(parentElt.children, parentElt._startMarker) +
+      aIndex +
+      1;
+    this._insertNewItemToPopup(
+      aPlacesNode,
+      parentElt,
+      parentElt.children[index] || parentElt._endMarker
+    );
+    this._mayAddCommandsItems(parentElt);
+    this._setEmptyPopupStatus(parentElt, false);
+  }
+
+  nodeMoved(
+    aPlacesNode,
+    aOldParentPlacesNode,
+    aOldIndex,
+    aNewParentPlacesNode,
+    aNewIndex
+  ) {
+    let elt = this._getDOMNodeForPlacesNode(aPlacesNode);
+
+    if (elt.localName == "menupopup") {
+      elt = elt.parentNode;
+    }
+
+    if (elt == this._rootElt) {
+      return;
+    }
+
+    let parentElt = this._getDOMNodeForPlacesNode(aNewParentPlacesNode);
+    if (parentElt._built) {
+      parentElt.removeChild(elt);
+      let index =
+        Array.prototype.indexOf.call(
+          parentElt.children,
+          parentElt._startMarker
+        ) +
+        aNewIndex +
+        1;
+      parentElt.insertBefore(elt, parentElt.children[index]);
+    }
+  }
+
+  containerStateChanged(aPlacesNode, aOldState, aNewState) {
+    if (
+      aNewState == Ci.nsINavHistoryContainerResultNode.STATE_OPENED ||
+      aNewState == Ci.nsINavHistoryContainerResultNode.STATE_CLOSED
+    ) {
+      this.invalidateContainer(aPlacesNode);
+    }
+  }
+
+  _isPopupOpen(elt) {
+    return !!elt.parentNode.open;
+  }
+
+  invalidateContainer(aPlacesNode) {
+    let elt = this._getDOMNodeForPlacesNode(aPlacesNode);
+    elt._built = false;
+
+    if (this._isPopupOpen(elt)) {
+      this._rebuildPopup(elt);
+    }
+  }
+
+  uninit() {
+    if (this._result) {
+      this._result.removeObserver(this);
+      this._resultNode.containerOpen = false;
+      this._resultNode = null;
+      this._result = null;
+    }
+
+    if (this._controller) {
+      this._controller.terminate();
+      try {
+        this._viewElt.controllers.removeController(this._controller);
+      } catch (ex) {
+      } finally {
+        this._controller = null;
+      }
+    }
+
+    delete this._viewElt._placesView;
+  }
+
+  get isRTL() {
+    if ("_isRTL" in this) {
+      return this._isRTL;
+    }
+
+    return (this._isRTL =
+      document.defaultView.getComputedStyle(this._viewElt).direction == "rtl");
+  }
+
+  get ownerWindow() {
+    return window;
+  }
+
+  _mayAddCommandsItems(aPopup) {
+    if (aPopup == this._rootElt) {
+      return;
+    }
+
+    let hasMultipleURIs = false;
+    let numURINodes = 0;
+
+    if (aPopup._placesNode.childCount > 0) {
+      let currentChild = aPopup.firstElementChild;
+      while (currentChild) {
+        if (currentChild.localName == "menuitem" && currentChild._placesNode) {
+          if (++numURINodes == 2) {
+            break;
+          }
+        }
+        currentChild = currentChild.nextElementSibling;
+      }
+      hasMultipleURIs = numURINodes > 1;
+    }
+
+    if (!hasMultipleURIs) {
+      if (aPopup._endOptOpenAllInTabs) {
+        aPopup.removeChild(aPopup._endOptOpenAllInTabs);
+        aPopup._endOptOpenAllInTabs = null;
+
+        aPopup.removeChild(aPopup._endOptSeparator);
+        aPopup._endOptSeparator = null;
+      }
+    } else if (!aPopup._endOptOpenAllInTabs) {
+      aPopup._endOptSeparator = document.createXULElement("menuseparator");
+      aPopup._endOptSeparator.className = "bookmarks-actions-menuseparator";
+      aPopup.appendChild(aPopup._endOptSeparator);
+
+      aPopup._endOptOpenAllInTabs = document.createXULElement("menuitem");
+      aPopup._endOptOpenAllInTabs.className = "openintabs-menuitem";
+      aPopup._endOptOpenAllInTabs.setAttribute(
+        "label",
+        gNavigatorBundle.getString("menuOpenAllInTabs.label")
+      );
+      aPopup._endOptOpenAllInTabs.addEventListener("command", event => {
+        PlacesUIUtils.openMultipleLinksInTabs(
+          event.currentTarget.parentNode._placesNode,
+          event,
+          PlacesUIUtils.getViewForNode(event.currentTarget)
+        );
+      });
+      aPopup.appendChild(aPopup._endOptOpenAllInTabs);
+    }
+
+    if (
+      numURINodes > 0 &&
+      ContentSharingUtils.isEnabled &&
+      !aPopup._endOptShareFolder
+    ) {
+      aPopup._endOptShareFolder = document.createXULElement("menuitem");
+      aPopup._endOptShareFolder.className = "openintabs-menuitem badge-new";
+      aPopup._endOptShareFolder.setAttribute(
+        "data-l10n-id",
+        "places-share-folder2"
+      );
+      aPopup._endOptShareFolder.setAttribute("data-l10n-attrs", "badge");
+
+      aPopup._endOptShareFolder.addEventListener("command", event => {
+        ContentSharingUtils.createShareableLinkFromBookmarkFolders([
+          PlacesUtils.getConcreteItemGuid(
+            event.currentTarget.parentNode._placesNode
+          ),
+        ]);
+      });
+      aPopup.appendChild(aPopup._endOptShareFolder);
+    } else if (
+      aPopup._endOptShareFolder &&
+      (!ContentSharingUtils.isEnabled || !numURINodes)
+    ) {
+      aPopup.removeChild(aPopup._endOptShareFolder);
+      aPopup._endOptShareFolder = null;
+    }
+  }
+
+  _ensureMarkers(aPopup) {
+    if (aPopup._startMarker) {
+      return;
+    }
+
+    aPopup._startMarker = document.createXULElement("menuseparator");
+    aPopup._startMarker.hidden = true;
+    aPopup.insertBefore(aPopup._startMarker, aPopup.firstElementChild);
+    aPopup._endMarker = document.createXULElement("menuseparator");
+    aPopup._endMarker.hidden = true;
+    aPopup.appendChild(aPopup._endMarker);
+
+    let firstNonStaticNodeFound = false;
+    for (let child of aPopup.children) {
+      if (child.hasAttribute("afterplacescontent")) {
+        aPopup.insertBefore(aPopup._endMarker, child);
+        break;
+      }
+
+      if (child._placesNode && !child._placesView && !firstNonStaticNodeFound) {
+        firstNonStaticNodeFound = true;
+        aPopup.insertBefore(aPopup._startMarker, child);
+      }
+    }
+    if (!firstNonStaticNodeFound) {
+      aPopup.insertBefore(aPopup._startMarker, aPopup._endMarker);
+    }
+  }
+
+  _onPopupShowing(aEvent) {
+    let popup = aEvent.originalTarget;
+
+    this._ensureMarkers(popup);
+
+    if ("_delayedRemovals" in popup) {
+      while (popup._delayedRemovals.length) {
+        popup.removeChild(popup._delayedRemovals.shift());
+      }
+    }
+
+    if (popup._placesNode && PlacesUIUtils.getViewForNode(popup) == this) {
+      if (this.#isPopupForRecursiveFolderShortcut(popup)) {
+        this._setEmptyPopupStatus(popup, true);
+        popup._built = true;
+        return;
+      }
+
+      if (!popup._placesNode.containerOpen) {
+        popup._placesNode.containerOpen = true;
+      }
+      if (!popup._built) {
+        this._rebuildPopup(popup);
+      }
+
+      this._mayAddCommandsItems(popup);
+    }
+  }
+
+  _addEventListeners(aObject, aEventNames, aCapturing = false) {
+    for (let i = 0; i < aEventNames.length; i++) {
+      aObject.addEventListener(aEventNames[i], this, aCapturing);
+    }
+  }
+
+  _removeEventListeners(aObject, aEventNames, aCapturing = false) {
+    for (let i = 0; i < aEventNames.length; i++) {
+      aObject.removeEventListener(aEventNames[i], this, aCapturing);
+    }
+  }
+
+  #isPopupForRecursiveFolderShortcut(popup) {
+    if (
+      !popup._placesNode ||
+      !PlacesUtils.nodeIsFolderOrShortcut(popup._placesNode)
+    ) {
+      return false;
+    }
+    let guid = PlacesUtils.getConcreteItemGuid(popup._placesNode);
+    for (
+      let parentView = popup.parentNode?.parentNode;
+      parentView?._placesNode;
+      parentView = parentView.parentNode?.parentNode
+    ) {
+      if (PlacesUtils.getConcreteItemGuid(parentView._placesNode) == guid) {
+        return true;
+      }
+    }
+    return false;
+  }
+}
+
+class PlacesToolbar extends PlacesViewBase {
+  #pendingVisibilityRetry = false;
+  #updatingNodesVisibility = false;
+
+  constructor(placesUrl, rootElt, viewElt) {
+    super(placesUrl, rootElt, viewElt);
+    this._addEventListeners(this._dragRoot, this._cbEvents, false);
+    this._addEventListeners(
+      this._rootElt,
+      ["popupshowing", "popuphidden"],
+      true
+    );
+    this._addEventListeners(this._rootElt, ["overflow", "underflow"], true);
+    this._addEventListeners(window, ["unload"], false);
+
+    this._resizeObserver = new ResizeObserver(() => {
+      this.updateNodesVisibility();
+    });
+    this._resizeObserver.observe(this._rootElt);
+
+    if (
+      this._viewElt.parentNode.parentNode ==
+      document.getElementById("TabsToolbar")
+    ) {
+      this._addEventListeners(
+        gBrowser.tabContainer,
+        ["TabOpen", "TabClose"],
+        false
+      );
+    }
+
+  }
+
+  _init() {
+    this._overFolder = {
+      elt: null,
+      openTimer: null,
+      hoverTime: 350,
+      closeTimer: null,
+    };
+
+    let thisView = this;
+    [
+      ["_dropIndicator", "PlacesToolbarDropIndicator"],
+      ["_chevron", "PlacesChevron"],
+      ["_chevronPopup", "PlacesChevronPopup"],
+    ].forEach(function (elementGlobal) {
+      let [name, id] = elementGlobal;
+      thisView.__defineGetter__(name, function () {
+        let element = document.getElementById(id);
+        if (!element) {
+          return null;
+        }
+
+        delete thisView[name];
+        return (thisView[name] = element);
+      });
+    });
+
+    this._viewElt._placesView = this;
+
+    this._dragRoot = BookmarkingUI.toolbar.contains(this._viewElt)
+      ? BookmarkingUI.toolbar
+      : this._viewElt;
+  }
+
+  _cbEvents = [
+    "dragstart",
+    "dragover",
+    "dragleave",
+    "dragend",
+    "drop",
+    "mousemove",
+    "mouseover",
+    "mouseout",
+    "mousedown",
+  ];
+
+  QueryInterface = ChromeUtils.generateQI([
+    "nsINamed",
+    "nsITimerCallback",
+    ...PlacesViewBase.interfaces,
+  ]);
+
+  uninit() {
+    if (this._dragRoot) {
+      this._removeEventListeners(this._dragRoot, this._cbEvents, false);
+    }
+    this._removeEventListeners(
+      this._rootElt,
+      ["popupshowing", "popuphidden"],
+      true
+    );
+    this._removeEventListeners(this._rootElt, ["overflow", "underflow"], true);
+    this._removeEventListeners(window, ["unload"], false);
+
+    if (this._resizeObserver) {
+      this._resizeObserver.disconnect();
+      this._resizeObserver = null;
+    }
+    this._removeEventListeners(
+      gBrowser.tabContainer,
+      ["TabOpen", "TabClose"],
+      false
+    );
+
+    if (this._chevron._placesView) {
+      this._chevron._placesView.uninit();
+    }
+
+    this._chevronPopup.uninit();
+
+    if (this._otherBookmarks?._placesView) {
+      this._otherBookmarks._placesView.uninit();
+    }
+
+    super.uninit();
+  }
+
+  _openedMenuButton = null;
+  _allowPopupShowing = true;
+
+  promiseRebuilt() {
+    return this._rebuilding?.promise;
+  }
+
+  get _isAlive() {
+    return this._resultNode && this._rootElt;
+  }
+
+  _runBeforeFrameRender(callback) {
+    return new Promise((resolve, reject) => {
+      window.requestAnimationFrame(() => {
+        try {
+          resolve(callback());
+        } catch (err) {
+          reject(err);
+        }
+      });
+    });
+  }
+
+  async _rebuild() {
+    if (this._overFolder.elt) {
+      this._clearOverFolder();
+    }
+
+    this._openedMenuButton = null;
+    while (this._rootElt.hasChildNodes()) {
+      this._rootElt.firstChild.remove();
+    }
+
+    let cc = this._resultNode.childCount;
+    if (cc > 0) {
+      let startIndex = 0;
+      let limit = await this._runBeforeFrameRender(() => {
+        if (!this._isAlive) {
+          return cc;
+        }
+
+        let elt;
+        while (startIndex < cc) {
+          elt = this._insertNewItem(
+            this._resultNode.getChild(startIndex),
+            this._rootElt
+          );
+          ++startIndex;
+          if (elt.localName != "toolbarseparator") {
+            break;
+          }
+        }
+        if (!elt) {
+          return cc;
+        }
+
+        return window.promiseDocumentFlushed(() => {
+          let size = elt.clientHeight || 1; 
+          return Math.min(cc, parseInt((window.screen.width * 1.5) / size));
+        });
+      });
+
+      if (!this._isAlive) {
+        return;
+      }
+
+      let fragment = document.createDocumentFragment();
+      for (let i = startIndex; i < limit; ++i) {
+        this._insertNewItem(this._resultNode.getChild(i), fragment);
+      }
+      await new Promise(resolve => window.requestAnimationFrame(resolve));
+      if (!this._isAlive) {
+        return;
+      }
+      this._rootElt.appendChild(fragment);
+      this.updateNodesVisibility();
+    }
+
+    if (this._chevronPopup.hasAttribute("type")) {
+      this._chevronPopup.place = this.place;
+    }
+
+    let otherBookmarks = document.getElementById("OtherBookmarks");
+    otherBookmarks?.remove();
+
+    BookmarkingUI.maybeShowOtherBookmarksFolder().catch(console.error);
+  }
+
+  _insertNewItem(aChild, aInsertionNode, aBefore = null) {
+    this._domNodes.delete(aChild);
+
+    let type = aChild.type;
+    let button;
+    if (type == Ci.nsINavHistoryResultNode.RESULT_TYPE_SEPARATOR) {
+      button = document.createXULElement("toolbarseparator");
+    } else {
+      button = document.createXULElement("toolbarbutton");
+      button.className = "bookmark-item";
+      button.setAttribute("label", aChild.title || "");
+
+      if (PlacesUtils.containerTypes.includes(type)) {
+        button.setAttribute("type", "menu");
+        button.setAttribute("container", "true");
+
+        if (PlacesUtils.nodeIsQuery(aChild)) {
+          button.setAttribute("query", "true");
+          if (PlacesUtils.nodeIsTagQuery(aChild)) {
+            button.setAttribute("tagContainer", "true");
+          }
+        }
+
+        let popup = document.createXULElement("menupopup", {
+          is: "places-popup",
+        });
+        popup.setAttribute("placespopup", "true");
+        popup.toggleAttribute("nonnative", true);
+        popup.classList.add("toolbar-menupopup");
+        button.appendChild(popup);
+        popup._placesNode = PlacesUtils.asContainer(aChild);
+        popup.setAttribute("context", "placesContext");
+
+        this._domNodes.set(aChild, popup);
+      } else if (PlacesUtils.nodeIsURI(aChild)) {
+        button.setAttribute(
+          "scheme",
+          PlacesUIUtils.guessUrlSchemeForUI(aChild.uri)
+        );
+      }
+    }
+
+    button._placesNode = aChild;
+    let { icon } = button._placesNode;
+    if (icon) {
+      button.setAttribute("image", icon);
+    }
+    if (!this._domNodes.has(aChild)) {
+      this._domNodes.set(aChild, button);
+    }
+
+    if (aBefore) {
+      aInsertionNode.insertBefore(button, aBefore);
+    } else {
+      aInsertionNode.appendChild(button);
+    }
+    return button;
+  }
+
+  _updateChevronPopupNodesVisibility() {
+    for (
+      let toolbarNode = this._rootElt.firstElementChild,
+        node = this._chevronPopup._startMarker.nextElementSibling;
+      toolbarNode && node;
+      toolbarNode = toolbarNode.nextElementSibling,
+        node = node.nextElementSibling
+    ) {
+      node.hidden = toolbarNode.style.visibility != "hidden";
+    }
+  }
+
+  _onChevronPopupShowing(aEvent) {
+    if (aEvent.target != this._chevronPopup) {
+      return;
+    }
+
+    if (!this._chevron._placesView) {
+      this._chevron._placesView = new PlacesMenu(aEvent, this.place);
+    }
+
+    this._updateChevronPopupNodesVisibility();
+  }
+
+  _onOtherBookmarksPopupShowing(aEvent) {
+    if (aEvent.target != this._otherBookmarksPopup) {
+      return;
+    }
+
+    if (!this._otherBookmarks._placesView) {
+      this._otherBookmarks._placesView = new PlacesMenu(
+        aEvent,
+        "place:parent=" + PlacesUtils.bookmarks.unfiledGuid
+      );
+    }
+  }
+
+  handleEvent(aEvent) {
+    switch (aEvent.type) {
+      case "unload":
+        this.uninit();
+        break;
+      case "overflow":
+        if (!this._isOverflowStateEventRelevant(aEvent)) {
+          return;
+        }
+        aEvent.stopPropagation();
+        this._onOverflow();
+        break;
+      case "underflow":
+        if (!this._isOverflowStateEventRelevant(aEvent)) {
+          return;
+        }
+        aEvent.stopPropagation();
+        this._onUnderflow();
+        break;
+      case "TabOpen":
+      case "TabClose":
+        this.updateNodesVisibility();
+        break;
+      case "dragstart":
+        this._onDragStart(aEvent);
+        break;
+      case "dragover":
+        this._onDragOver(aEvent);
+        break;
+      case "dragleave":
+        this._onDragLeave(aEvent);
+        break;
+      case "dragend":
+        this._onDragEnd(aEvent);
+        break;
+      case "drop":
+        this._onDrop(aEvent);
+        break;
+      case "mouseover":
+        this._onMouseOver(aEvent);
+        break;
+      case "mousemove":
+        this._onMouseMove(aEvent);
+        break;
+      case "mouseout":
+        this._onMouseOut(aEvent);
+        break;
+      case "mousedown":
+        this._onMouseDown(aEvent);
+        break;
+      case "popupshowing":
+        this._onPopupShowing(aEvent);
+        break;
+      case "popuphidden":
+        this._onPopupHidden(aEvent);
+        break;
+      default:
+        throw new Error("Trying to handle unexpected event.");
+    }
+  }
+
+  _isOverflowStateEventRelevant(aEvent) {
+    return aEvent.target == aEvent.currentTarget && aEvent.detail > 0;
+  }
+
+  _onOverflow() {
+    if (!this._chevronPopup.hasAttribute("type")) {
+      this._chevronPopup.setAttribute("place", this.place);
+      this._chevronPopup.setAttribute("type", "places");
+    }
+    this._chevron.collapsed = false;
+    this.updateNodesVisibility();
+  }
+
+  _onUnderflow() {
+    this.updateNodesVisibility();
+    this._chevron.collapsed = true;
+  }
+
+  updateNodesVisibility() {
+    if (this._updateNodesVisibilityTimer) {
+      this._updateNodesVisibilityTimer.cancel();
+    }
+
+    this._updateNodesVisibilityTimer = this._setTimer(100);
+  }
+
+  async _updateNodesVisibilityTimerCallback() {
+    if (this.#updatingNodesVisibility || window.closed || !this._isAlive) {
+      return;
+    }
+    this.#updatingNodesVisibility = true;
+
+    let dwu = window.windowUtils;
+
+    let { visibleCount, scrollWidth } = await window.promiseDocumentFlushed(
+      () => {
+        let scrollRect = dwu.getBoundsWithoutFlushing(this._rootElt);
+        let count = 0;
+        for (let child of this._rootElt.children) {
+          let childRect = dwu.getBoundsWithoutFlushing(child);
+          let overflowed = this.isRTL
+            ? childRect.left < scrollRect.left
+            : childRect.right > scrollRect.right;
+          if (overflowed) {
+            break;
+          }
+          count++;
+        }
+        return { visibleCount: count, scrollWidth: scrollRect.width };
+      }
+    );
+
+    this.#updatingNodesVisibility = false;
+    if (!this._isAlive) {
+      return;
+    }
+
+    if (!scrollWidth) {
+      if (!this.#pendingVisibilityRetry) {
+        this.#pendingVisibilityRetry = true;
+        window.requestAnimationFrame(() => {
+          if (this._isAlive) {
+            this.updateNodesVisibility();
+          }
+        });
+      }
+      return;
+    }
+
+    this.#pendingVisibilityRetry = false;
+    window.requestAnimationFrame(() => {
+      if (!this._isAlive) {
+        return;
+      }
+      this._applyChildVisibility(visibleCount);
+    });
+  }
+
+  _applyChildVisibility(visibleCount) {
+    let children = this._rootElt.children;
+    for (let i = 0; i < children.length; i++) {
+      let child = children[i];
+      if (i < visibleCount) {
+        let icon = child._placesNode.icon;
+        if (icon) {
+          child.setAttribute("image", icon);
+        }
+        child.style.removeProperty("visibility");
+      } else {
+        child.removeAttribute("image");
+        child.style.visibility = "hidden";
+      }
+    }
+
+    if (!this._chevron.collapsed && this._chevron.open) {
+      this._updateChevronPopupNodesVisibility();
+    }
+
+    let event = new CustomEvent("BookmarksToolbarVisibilityUpdated", {
+      bubbles: true,
+    });
+    this._viewElt.dispatchEvent(event);
+  }
+
+  nodeInserted(aParentPlacesNode, aPlacesNode, aIndex) {
+    let parentElt = this._getDOMNodeForPlacesNode(aParentPlacesNode);
+    if (parentElt == this._rootElt) {
+      let children = this._rootElt.children;
+      if (aIndex > children.length) {
+        return;
+      }
+
+      if (this._resultNode.childCount - 1 > children.length) {
+        if (aIndex == children.length) {
+          return;
+        }
+        this._rootElt.removeChild(this._rootElt.lastElementChild);
+      }
+
+      let button = this._insertNewItem(
+        aPlacesNode,
+        this._rootElt,
+        children[aIndex] || null
+      );
+      let prevSiblingOverflowed =
+        aIndex > 0 &&
+        aIndex <= children.length &&
+        children[aIndex - 1].style.visibility == "hidden";
+      if (prevSiblingOverflowed) {
+        button.style.visibility = "hidden";
+      } else {
+        let icon = aPlacesNode.icon;
+        if (icon) {
+          button.setAttribute("image", ChromeUtils.encodeURIForSrcset(icon));
+        }
+        this.updateNodesVisibility();
+      }
+      return;
+    }
+
+    super.nodeInserted(aParentPlacesNode, aPlacesNode, aIndex);
+  }
+
+  nodeRemoved(aParentPlacesNode, aPlacesNode, aIndex) {
+    let parentElt = this._getDOMNodeForPlacesNode(aParentPlacesNode);
+    if (parentElt == this._rootElt) {
+      let elt = this._getDOMNodeForPlacesNode(aPlacesNode, true);
+      if (!elt) {
+        return;
+      }
+
+      if (elt.localName == "menupopup") {
+        elt = elt.parentNode;
+      }
+
+      let overflowed = elt.style.visibility == "hidden";
+      this._removeChild(elt);
+      if (this._resultNode.childCount > this._rootElt.children.length) {
+        this._insertNewItem(
+          this._resultNode.getChild(this._rootElt.children.length),
+          this._rootElt
+        );
+      }
+      if (!overflowed) {
+        this.updateNodesVisibility();
+      }
+      return;
+    }
+
+    super.nodeRemoved(aParentPlacesNode, aPlacesNode, aIndex);
+  }
+
+  nodeMoved(
+    aPlacesNode,
+    aOldParentPlacesNode,
+    aOldIndex,
+    aNewParentPlacesNode,
+    aNewIndex
+  ) {
+    let parentElt = this._getDOMNodeForPlacesNode(aNewParentPlacesNode);
+    if (parentElt == this._rootElt) {
+      let lastBuiltIndex = this._rootElt.children.length - 1;
+      if (aOldIndex > lastBuiltIndex && aNewIndex > lastBuiltIndex + 1) {
+        return;
+      }
+
+      let elt = this._getDOMNodeForPlacesNode(aPlacesNode, true);
+      if (elt) {
+        if (elt.localName == "menupopup") {
+          elt = elt.parentNode;
+        }
+        this._removeChild(elt);
+      }
+
+      if (aNewIndex > lastBuiltIndex + 1) {
+        if (this._resultNode.childCount > this._rootElt.children.length) {
+          this._insertNewItem(
+            this._resultNode.getChild(this._rootElt.children.length),
+            this._rootElt
+          );
+        }
+        return;
+      }
+
+      if (!elt) {
+        elt = this._insertNewItem(
+          aPlacesNode,
+          this._rootElt,
+          this._rootElt.children[aNewIndex]
+        );
+        let icon = aPlacesNode.icon;
+        if (icon) {
+          elt.setAttribute("image", ChromeUtils.encodeURIForSrcset(icon));
+        }
+      } else {
+        this._rootElt.insertBefore(elt, this._rootElt.children[aNewIndex]);
+      }
+
+
+      this.updateNodesVisibility();
+      return;
+    }
+
+    super.nodeMoved(
+      aPlacesNode,
+      aOldParentPlacesNode,
+      aOldIndex,
+      aNewParentPlacesNode,
+      aNewIndex
+    );
+  }
+
+  nodeTitleChanged(aPlacesNode, aNewTitle) {
+    let elt = this._getDOMNodeForPlacesNode(aPlacesNode, true);
+
+    if (!elt || elt == this._rootElt) {
+      return;
+    }
+
+    super.nodeTitleChanged(aPlacesNode, aNewTitle);
+
+    if (elt.localName == "menupopup") {
+      elt = elt.parentNode;
+    }
+
+    if (elt.parentNode == this._rootElt) {
+      if (elt.style.visibility != "hidden") {
+        this.updateNodesVisibility();
+      }
+    }
+  }
+
+  invalidateContainer(aPlacesNode) {
+    let elt = this._getDOMNodeForPlacesNode(aPlacesNode, true);
+    if (!elt) {
+      return;
+    }
+
+    if (elt == this._rootElt) {
+      let instance = (this._rebuildingInstance = {});
+      if (!this._rebuilding) {
+        this._rebuilding = Promise.withResolvers();
+      }
+      this._rebuild()
+        .catch(console.error)
+        .finally(() => {
+          if (instance == this._rebuildingInstance) {
+            this._rebuilding.resolve();
+            this._rebuilding = null;
+          }
+        });
+      return;
+    }
+
+    super.invalidateContainer(aPlacesNode);
+  }
+
+  _clearOverFolder() {
+    if (this._overFolder.elt && this._overFolder.elt.menupopup) {
+      if (!this._overFolder.elt.menupopup.hasAttribute("dragover")) {
+        this._overFolder.elt.menupopup.hidePopup();
+      }
+      this._overFolder.elt.removeAttribute("dragover");
+      this._overFolder.elt = null;
+    }
+    if (this._overFolder.openTimer) {
+      this._overFolder.openTimer.cancel();
+      this._overFolder.openTimer = null;
+    }
+    if (this._overFolder.closeTimer) {
+      this._overFolder.closeTimer.cancel();
+      this._overFolder.closeTimer = null;
+    }
+  }
+
+  _getDropPoint(aEvent) {
+    if (!PlacesUtils.nodeIsFolderOrShortcut(this._resultNode)) {
+      return null;
+    }
+
+    let dropPoint = { ip: null, beforeIndex: null, folderElt: null };
+    let elt = aEvent.target;
+    if (
+      elt._placesNode &&
+      elt != this._rootElt &&
+      elt.localName != "menupopup"
+    ) {
+      let eltRect = elt.getBoundingClientRect();
+      let eltIndex = Array.prototype.indexOf.call(this._rootElt.children, elt);
+      if (
+        PlacesUtils.nodeIsFolderOrShortcut(elt._placesNode) &&
+        !PlacesUIUtils.isFolderReadOnly(elt._placesNode)
+      ) {
+        let threshold = eltRect.width * 0.25;
+        if (
+          this.isRTL
+            ? aEvent.clientX > eltRect.right - threshold
+            : aEvent.clientX < eltRect.left + threshold
+        ) {
+          dropPoint.ip = new PlacesInsertionPoint({
+            parentGuid: PlacesUtils.getConcreteItemGuid(this._resultNode),
+            index: eltIndex,
+            orientation: Ci.nsITreeView.DROP_BEFORE,
+          });
+          dropPoint.beforeIndex = eltIndex;
+        } else if (
+          this.isRTL
+            ? aEvent.clientX > eltRect.left + threshold
+            : aEvent.clientX < eltRect.right - threshold
+        ) {
+          let tagName = PlacesUtils.nodeIsTagQuery(elt._placesNode)
+            ? elt._placesNode.title
+            : null;
+          dropPoint.ip = new PlacesInsertionPoint({
+            parentGuid: PlacesUtils.getConcreteItemGuid(elt._placesNode),
+            tagName,
+          });
+          dropPoint.beforeIndex = eltIndex;
+          dropPoint.folderElt = elt;
+        } else {
+          let beforeIndex =
+            eltIndex == this._rootElt.children.length - 1 ? -1 : eltIndex + 1;
+
+          dropPoint.ip = new PlacesInsertionPoint({
+            parentGuid: PlacesUtils.getConcreteItemGuid(this._resultNode),
+            index: beforeIndex,
+            orientation: Ci.nsITreeView.DROP_BEFORE,
+          });
+          dropPoint.beforeIndex = beforeIndex;
+        }
+      } else {
+        let threshold = eltRect.width * 0.5;
+        if (
+          this.isRTL
+            ? aEvent.clientX > eltRect.left + threshold
+            : aEvent.clientX < eltRect.left + threshold
+        ) {
+          dropPoint.ip = new PlacesInsertionPoint({
+            parentGuid: PlacesUtils.getConcreteItemGuid(this._resultNode),
+            index: eltIndex,
+            orientation: Ci.nsITreeView.DROP_BEFORE,
+          });
+          dropPoint.beforeIndex = eltIndex;
+        } else {
+          let beforeIndex =
+            eltIndex == this._rootElt.children.length - 1 ? -1 : eltIndex + 1;
+          dropPoint.ip = new PlacesInsertionPoint({
+            parentGuid: PlacesUtils.getConcreteItemGuid(this._resultNode),
+            index: beforeIndex,
+            orientation: Ci.nsITreeView.DROP_BEFORE,
+          });
+          dropPoint.beforeIndex = beforeIndex;
+        }
+      }
+    } else if (elt == this._chevron) {
+      dropPoint.ip = new PlacesInsertionPoint({
+        parentGuid: PlacesUtils.getConcreteItemGuid(this._resultNode),
+        orientation: Ci.nsITreeView.DROP_BEFORE,
+      });
+      dropPoint.beforeIndex = -1;
+    } else {
+      dropPoint.ip = new PlacesInsertionPoint({
+        parentGuid: PlacesUtils.getConcreteItemGuid(this._resultNode),
+        orientation: Ci.nsITreeView.DROP_BEFORE,
+      });
+
+      dropPoint.beforeIndex = -1;
+
+      let canInsertHere = this.isRTL
+        ? (x, rect) => x >= Math.round(rect.right)
+        : (x, rect) => x <= Math.round(rect.left);
+
+      for (let i = 0; i < this._rootElt.children.length; i++) {
+        let childRect = window.windowUtils.getBoundsWithoutFlushing(
+          this._rootElt.children[i]
+        );
+        if (canInsertHere(aEvent.clientX, childRect)) {
+          dropPoint.beforeIndex = i;
+          dropPoint.ip.index = i;
+          break;
+        }
+      }
+    }
+
+    return dropPoint;
+  }
+
+  _setTimer(aTime) {
+    let timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+    timer.initWithCallback(this, aTime, timer.TYPE_ONE_SHOT);
+    return timer;
+  }
+
+  get name() {
+    return "PlacesToolbar";
+  }
+
+  notify(aTimer) {
+    if (aTimer == this._updateNodesVisibilityTimer) {
+      this._updateNodesVisibilityTimer = null;
+      this._updateNodesVisibilityTimerCallback();
+    } else if (aTimer == this._overFolder.openTimer) {
+      this._overFolder.elt.menupopup.setAttribute("autoopened", "true");
+      this._overFolder.elt.open = true;
+      this._overFolder.openTimer = null;
+    } else if (aTimer == this._overFolder.closeTimer) {
+      let currentPlacesNode = PlacesControllerDragHelper.currentDropTarget;
+      let inHierarchy = false;
+      while (currentPlacesNode) {
+        if (currentPlacesNode == this._rootElt) {
+          inHierarchy = true;
+          break;
+        }
+        currentPlacesNode = currentPlacesNode.parentNode;
+      }
+      if (inHierarchy) {
+        this._overFolder.elt = null;
+      }
+
+      this._clearOverFolder();
+    }
+  }
+
+  _onMouseOver(aEvent) {
+    let button = aEvent.target;
+    if (
+      button.parentNode == this._rootElt &&
+      button._placesNode &&
+      PlacesUtils.nodeIsURI(button._placesNode)
+    ) {
+      window.XULBrowserWindow.setOverLink(aEvent.target._placesNode.uri);
+    }
+  }
+
+  _onMouseOut() {
+    window.XULBrowserWindow.setOverLink("");
+  }
+
+  _onMouseDown(aEvent) {
+    let target = aEvent.target;
+    if (
+      aEvent.button == 0 &&
+      target.localName == "toolbarbutton" &&
+      target.getAttribute("type") == "menu"
+    ) {
+      let modifKey = aEvent.shiftKey || aEvent.getModifierState("Accel");
+      if (modifKey) {
+        this._allowPopupShowing = false;
+      }
+    }
+    PlacesUIUtils.maybeSpeculativeConnectOnMouseDown(aEvent);
+  }
+
+  _cleanupDragDetails() {
+    PlacesControllerDragHelper.currentDropTarget = null;
+    this._draggedElt = null;
+    this._dropIndicator.collapsed = true;
+  }
+
+  _onDragStart(aEvent) {
+    let draggedElt = aEvent.target;
+    if (draggedElt.parentNode != this._rootElt || !draggedElt._placesNode) {
+      return;
+    }
+
+    if (
+      draggedElt.localName == "toolbarbutton" &&
+      draggedElt.getAttribute("type") == "menu"
+    ) {
+      let translateY = this._cachedMouseMoveEvent.clientY - aEvent.clientY;
+      let translateX = this._cachedMouseMoveEvent.clientX - aEvent.clientX;
+      if (translateY >= Math.abs(translateX / 2)) {
+        aEvent.preventDefault();
+        draggedElt.open = true;
+        return;
+      }
+
+      if (draggedElt.open) {
+        draggedElt.menupopup.hidePopup();
+        draggedElt.open = false;
+      }
+    }
+
+    this._draggedElt = draggedElt._placesNode;
+    this._rootElt.focus();
+
+    this._controller.setDataTransfer(aEvent);
+    aEvent.stopPropagation();
+  }
+
+  #findPrecedingToolbarWidget() {
+    let toolbar = this._rootElt.closest("toolbar");
+    if (!toolbar) {
+      return null;
+    }
+    let placesContainer = this._rootElt.closest("toolbaritem");
+    let lastWidget = null;
+    for (let child of toolbar.children) {
+      if (child == placesContainer) {
+        break;
+      }
+      if (
+        !child.hidden &&
+        !child.collapsed &&
+        child.getBoundingClientRect().width > 0
+      ) {
+        lastWidget = child;
+      }
+    }
+    return lastWidget;
+  }
+
+  _onDragOver(aEvent) {
+    PlacesControllerDragHelper.currentDropTarget = aEvent.target;
+    let dt = aEvent.dataTransfer;
+
+    let dropPoint = this._getDropPoint(aEvent);
+    if (
+      !dropPoint ||
+      !dropPoint.ip ||
+      !PlacesControllerDragHelper.canDrop(dropPoint.ip, dt)
+    ) {
+      this._dropIndicator.collapsed = true;
+      aEvent.stopPropagation();
+      return;
+    }
+
+    if (dropPoint.folderElt || aEvent.originalTarget == this._chevron) {
+      let overElt = dropPoint.folderElt || this._chevron;
+      if (this._overFolder.elt != overElt) {
+        this._clearOverFolder();
+        this._overFolder.elt = overElt;
+        this._overFolder.openTimer = this._setTimer(this._overFolder.hoverTime);
+      }
+      if (!this._overFolder.elt.hasAttribute("dragover")) {
+        this._overFolder.elt.setAttribute("dragover", "true");
+      }
+
+      this._dropIndicator.collapsed = true;
+    } else {
+      let ind = this._dropIndicator;
+      ind.parentNode.collapsed = false;
+      let halfInd = ind.clientWidth / 2;
+      let translateX;
+
+      if (this.isRTL) {
+        halfInd = Math.ceil(halfInd);
+        translateX = 0 - this._rootElt.getBoundingClientRect().right - halfInd;
+        if (this._rootElt.firstElementChild) {
+          if (dropPoint.beforeIndex == -1) {
+            translateX +=
+              this._rootElt.lastElementChild.getBoundingClientRect().left;
+          } else {
+            translateX +=
+              this._rootElt.children[
+                dropPoint.beforeIndex
+              ].getBoundingClientRect().right;
+          }
+        } else {
+          let prevWidget = this.#findPrecedingToolbarWidget();
+          if (prevWidget) {
+            translateX += prevWidget.getBoundingClientRect().left;
+          }
+        }
+      } else {
+        halfInd = Math.floor(halfInd);
+        translateX = 0 - this._rootElt.getBoundingClientRect().left + halfInd;
+        if (this._rootElt.firstElementChild) {
+          if (dropPoint.beforeIndex == -1) {
+            translateX +=
+              this._rootElt.lastElementChild.getBoundingClientRect().right;
+          } else {
+            translateX +=
+              this._rootElt.children[
+                dropPoint.beforeIndex
+              ].getBoundingClientRect().left;
+          }
+        } else {
+          let prevWidget = this.#findPrecedingToolbarWidget();
+          if (prevWidget) {
+            translateX += prevWidget.getBoundingClientRect().right;
+          }
+        }
+      }
+
+      ind.style.transform = "translate(" + Math.round(translateX) + "px)";
+      ind.style.marginInlineStart = -ind.clientWidth + "px";
+      ind.collapsed = false;
+
+      this._clearOverFolder();
+    }
+
+    aEvent.preventDefault();
+    aEvent.stopPropagation();
+  }
+
+  _onDrop(aEvent) {
+    PlacesControllerDragHelper.currentDropTarget = aEvent.target;
+
+    let dropPoint = this._getDropPoint(aEvent);
+    if (dropPoint && dropPoint.ip) {
+      PlacesControllerDragHelper.onDrop(
+        dropPoint.ip,
+        aEvent.dataTransfer
+      ).catch(console.error);
+      aEvent.preventDefault();
+    }
+
+    this._cleanupDragDetails();
+    aEvent.stopPropagation();
+  }
+
+  _onDragLeave() {
+    PlacesControllerDragHelper.currentDropTarget = null;
+
+    this._dropIndicator.collapsed = true;
+
+    if (this._overFolder.elt) {
+      this._overFolder.closeTimer = this._setTimer(this._overFolder.hoverTime);
+    }
+  }
+
+  _onDragEnd() {
+    this._cleanupDragDetails();
+  }
+
+  _onPopupShowing(aEvent) {
+    if (!this._allowPopupShowing) {
+      this._allowPopupShowing = true;
+      aEvent.preventDefault();
+      return;
+    }
+
+    let parent = aEvent.target.parentNode;
+    if (parent.localName == "toolbarbutton") {
+      this._openedMenuButton = parent;
+    }
+
+    super._onPopupShowing(aEvent);
+  }
+
+  _onPopupHidden(aEvent) {
+    let popup = aEvent.target;
+    let placesNode = popup._placesNode;
+    if (
+      placesNode &&
+      PlacesUIUtils.getViewForNode(popup) == this &&
+      !PlacesUtils.nodeIsFolderOrShortcut(placesNode)
+    ) {
+      placesNode.containerOpen = false;
+    }
+
+    let parent = popup.parentNode;
+    if (parent.localName == "toolbarbutton") {
+      this._openedMenuButton = null;
+      if (parent.hasAttribute("dragover")) {
+        parent.removeAttribute("dragover");
+      }
+    }
+  }
+
+  _onMouseMove(aEvent) {
+    this._cachedMouseMoveEvent = aEvent;
+
+    if (
+      this._openedMenuButton == null ||
+      PlacesControllerDragHelper.getSession()
+    ) {
+      return;
+    }
+
+    let target = aEvent.originalTarget;
+    if (
+      this._openedMenuButton != target &&
+      target.localName == "toolbarbutton" &&
+      target.type == "menu"
+    ) {
+      this._openedMenuButton.open = false;
+      target.open = true;
+    }
+  }
+}
+
+class PlacesMenu extends PlacesViewBase {
+  constructor(popupShowingEvent, placesUrl) {
+    super(
+      placesUrl,
+      popupShowingEvent.target, 
+      popupShowingEvent.target.parentNode 
+    );
+
+    this._addEventListeners(
+      this._rootElt,
+      ["popupshowing", "popuphidden"],
+      true
+    );
+    this._addEventListeners(window, ["unload"], false);
+    this._addEventListeners(this._rootElt, ["mousedown"], false);
+    if (AppConstants.platform === "macosx") {
+      for (let elt = this._viewElt.parentNode; elt; elt = elt.parentNode) {
+        if (elt.localName == "menubar") {
+          this._nativeView = true;
+          break;
+        }
+      }
+    }
+
+    this._onPopupShowing(popupShowingEvent);
+  }
+
+  _init() {
+    this._viewElt._placesView = this;
+  }
+
+  _removeChild(aChild) {
+    super._removeChild(aChild);
+  }
+
+  uninit() {
+    this._removeEventListeners(
+      this._rootElt,
+      ["popupshowing", "popuphidden"],
+      true
+    );
+    this._removeEventListeners(window, ["unload"], false);
+    this._removeEventListeners(this._rootElt, ["mousedown"], false);
+
+    super.uninit();
+  }
+
+  handleEvent(aEvent) {
+    switch (aEvent.type) {
+      case "unload":
+        this.uninit();
+        break;
+      case "popupshowing":
+        this._onPopupShowing(aEvent);
+        break;
+      case "popuphidden":
+        this._onPopupHidden(aEvent);
+        break;
+      case "mousedown":
+        this._onMouseDown(aEvent);
+        break;
+    }
+  }
+
+  _onPopupHidden(aEvent) {
+    let popup = aEvent.originalTarget;
+    let placesNode = popup._placesNode;
+    if (!placesNode || PlacesUIUtils.getViewForNode(popup) != this) {
+      return;
+    }
+
+    if (!PlacesUtils.nodeIsFolderOrShortcut(placesNode)) {
+      placesNode.containerOpen = false;
+    }
+
+    popup.removeAttribute("autoopened");
+    popup.removeAttribute("dragstart");
+  }
+
+  _onMouseDown(aEvent) {
+    PlacesUIUtils.maybeSpeculativeConnectOnMouseDown(aEvent);
+  }
+}
+
+this.PlacesPanelview = class PlacesPanelview extends PlacesViewBase {
+  constructor(placeUrl, rootElt, viewElt) {
+    super(placeUrl, rootElt, viewElt);
+    this._viewElt._placesView = this;
+    this._onPopupShowing({ originalTarget: this._rootElt });
+    this._addEventListeners(window, ["unload"]);
+    this._rootElt.setAttribute("context", "placesContext");
+  }
+
+  get events() {
+    if (this._events) {
+      return this._events;
+    }
+    return (this._events = [
+      "click",
+      "command",
+      "dragend",
+      "dragstart",
+      "ViewHiding",
+      "ViewShown",
+      "mousedown",
+    ]);
+  }
+
+  handleEvent(event) {
+    switch (event.type) {
+      case "click":
+        // For middle clicks, fall through to the command handler.
+        if (event.button != 1) {
+          break;
+        }
+      // fall through
+      case "command":
+        this._onCommand(event);
+        break;
+      case "dragend":
+        this._onDragEnd(event);
+        break;
+      case "dragstart":
+        this._onDragStart(event);
+        break;
+      case "unload":
+        this.uninit(event);
+        break;
+      case "ViewHiding":
+        this._onPopupHidden(event);
+        break;
+      case "ViewShown":
+        this._onViewShown(event);
+        break;
+      case "mousedown":
+        this._onMouseDown(event);
+        break;
+    }
+  }
+
+  _onCommand(event) {
+    event = BrowserUtils.getRootEvent(event);
+    let button = event.originalTarget;
+    if (!button._placesNode) {
+      return;
+    }
+
+    let modifKey =
+      AppConstants.platform === "macosx" ? event.metaKey : event.ctrlKey;
+    if (!PlacesUIUtils.openInTabClosesMenu && modifKey) {
+      if (button.parentNode.id == "panelMenu_bookmarksMenu") {
+        button.setAttribute("closemenu", "none");
+      }
+    } else {
+      button.removeAttribute("closemenu");
+    }
+    PlacesUIUtils.openNodeWithEvent(button._placesNode, event);
+    if (
+      button.parentNode.id != "panelMenu_bookmarksMenu" ||
+      (event.type == "click" &&
+        event.button == 1 &&
+        PlacesUIUtils.openInTabClosesMenu)
+    ) {
+      this.panelMultiView.closest("panel").hidePopup();
+    }
+  }
+
+  destroyContextMenu() {
+    super.destroyContextMenu();
+    this.maybeClosePanel(PlacesUIUtils.lastContextMenuCommand);
+  }
+
+  maybeClosePanel(command) {
+    switch (command) {
+      case "placesCmd_open:newcontainertab":
+      case "placesCmd_open:tab":
+        if (
+          this._viewElt.id != "PanelUI-bookmarks" ||
+          PlacesUIUtils.openInTabClosesMenu
+        ) {
+          this.panelMultiView.closest("panel").hidePopup();
+        }
+        break;
+      case "placesCmd_createBookmark":
+      case "placesCmd_deleteDataHost":
+        this.panelMultiView.closest("panel").hidePopup();
+        break;
+    }
+  }
+
+  _onDragEnd() {
+    this._draggedElt = null;
+  }
+
+  _onDragStart(event) {
+    let draggedElt = event.originalTarget;
+    if (draggedElt.parentNode != this._rootElt || !draggedElt._placesNode) {
+      return;
+    }
+
+    this._draggedElt = draggedElt._placesNode;
+    this._rootElt.focus();
+
+    this._controller.setDataTransfer(event);
+    event.stopPropagation();
+  }
+
+  uninit(event) {
+    this._removeEventListeners(this.panelMultiView, this.events);
+    this._removeEventListeners(window, ["unload"]);
+    delete this.panelMultiView;
+    super.uninit(event);
+  }
+
+  _createDOMNodeForPlacesNode(placesNode) {
+    this._domNodes.delete(placesNode);
+
+    let element;
+    let type = placesNode.type;
+    if (type == Ci.nsINavHistoryResultNode.RESULT_TYPE_SEPARATOR) {
+      element = document.createXULElement("toolbarseparator");
+    } else {
+      if (type != Ci.nsINavHistoryResultNode.RESULT_TYPE_URI) {
+        throw new Error("Unexpected node");
+      }
+
+      element = document.createXULElement("toolbarbutton");
+      element.classList.add(
+        "subviewbutton",
+        "subviewbutton-iconic",
+        "bookmark-item"
+      );
+      element.setAttribute(
+        "scheme",
+        PlacesUIUtils.guessUrlSchemeForUI(placesNode.uri)
+      );
+      element.setAttribute("label", PlacesUIUtils.getBestTitle(placesNode));
+
+      let icon = placesNode.icon;
+      if (icon) {
+        element.setAttribute("image", icon);
+      }
+    }
+
+    element._placesNode = placesNode;
+    if (!this._domNodes.has(placesNode)) {
+      this._domNodes.set(placesNode, element);
+    }
+
+    return element;
+  }
+
+  _setEmptyPopupStatus(panelview, empty = false) {
+    if (!panelview._emptyMenuitem) {
+      panelview._emptyMenuitem = document.createXULElement("toolbarbutton");
+      panelview._emptyMenuitem.setAttribute("disabled", true);
+      panelview._emptyMenuitem.className = "subviewbutton";
+      document.l10n.setAttributes(
+        panelview._emptyMenuitem,
+        "places-empty-bookmarks-folder"
+      );
+    }
+
+    if (empty) {
+      panelview.setAttribute("emptyplacesresult", "true");
+      if (
+        !panelview._startMarker ||
+        (!panelview._startMarker.previousElementSibling &&
+          !panelview._endMarker.nextElementSibling)
+      ) {
+        panelview.insertBefore(panelview._emptyMenuitem, panelview._endMarker);
+      }
+    } else {
+      panelview.removeAttribute("emptyplacesresult");
+      try {
+        panelview.removeChild(panelview._emptyMenuitem);
+      } catch (ex) {}
+    }
+  }
+
+  _isPopupOpen() {
+    return PanelView.forNode(this._viewElt).active;
+  }
+
+  _onPopupHidden(event) {
+    let panelview = event.originalTarget;
+    let placesNode = panelview._placesNode;
+    if (
+      placesNode &&
+      PlacesUIUtils.getViewForNode(panelview) == this &&
+      !PlacesUtils.nodeIsFolderOrShortcut(placesNode)
+    ) {
+      placesNode.containerOpen = false;
+    }
+  }
+
+  _onPopupShowing(event) {
+    if (event.originalTarget == this._rootElt) {
+      this.panelMultiView = this._viewElt.panelMultiView;
+      this._addEventListeners(this.panelMultiView, this.events);
+    }
+    super._onPopupShowing(event);
+  }
+
+  _onViewShown(event) {
+    if (event.originalTarget != this._viewElt) {
+      return;
+    }
+
+    if (!this.controllers.getControllerCount() && this._controller) {
+      this.controllers.appendController(this._controller);
+    }
+  }
+
+  _onMouseDown(aEvent) {
+    PlacesUIUtils.maybeSpeculativeConnectOnMouseDown(aEvent);
+  }
+};

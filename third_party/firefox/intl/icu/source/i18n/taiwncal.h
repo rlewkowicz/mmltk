@@ -1,0 +1,70 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+ ********************************************************************************
+ * Copyright (C) 2003-2013, International Business Machines Corporation
+ * and others. All Rights Reserved.
+ ********************************************************************************
+ *
+ * File BUDDHCAL.H
+ *
+ * Modification History:
+ *
+ *   Date        Name        Description
+ *   05/13/2003  srl          copied from gregocal.h
+ *   06/29/2007  srl          copied from buddhcal.h
+ ********************************************************************************
+ */
+
+#ifndef TAIWNCAL_H
+#define TAIWNCAL_H
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/calendar.h"
+#include "unicode/gregocal.h"
+
+U_NAMESPACE_BEGIN
+
+class TaiwanCalendar : public GregorianCalendar {
+public:
+
+    enum EEras {
+       BEFORE_MINGUO = 0,
+       MINGUO  = 1
+    };
+
+    TaiwanCalendar(const Locale& aLocale, UErrorCode& success);
+
+
+    virtual ~TaiwanCalendar();
+
+    TaiwanCalendar(const TaiwanCalendar& source);
+
+    virtual TaiwanCalendar* clone() const override;
+
+public:
+    virtual UClassID getDynamicClassID() const override;
+
+    U_I18N_API static UClassID U_EXPORT2 getStaticClassID();
+
+    virtual const char * getType() const override;
+
+private:
+    TaiwanCalendar(); 
+
+ protected:
+    virtual int32_t handleGetExtendedYear(UErrorCode& status) override;
+    virtual void handleComputeFields(int32_t julianDay, UErrorCode& status) override;
+    virtual int32_t handleGetLimit(UCalendarDateFields field, ELimitType limitType) const override;
+
+    DECLARE_OVERRIDE_SYSTEM_DEFAULT_CENTURY
+};
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+
+#endif // _TAIWNCAL
+

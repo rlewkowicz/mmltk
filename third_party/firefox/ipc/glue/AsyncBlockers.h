@@ -1,0 +1,65 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_ipc_AsyncBlockers_h
+#define mozilla_ipc_AsyncBlockers_h
+
+#include "mozilla/MozPromise.h"
+#include "mozilla/ThreadSafety.h"
+#include "nsTArray.h"
+
+
+namespace mozilla::ipc {
+
+class AsyncBlockers {
+ public:
+  AsyncBlockers()
+      : mLock("AsyncRegistrar"),
+        mPromise(new GenericPromise::Private(__func__)) {}
+  void Register(void* aBlocker) {
+    MutexAutoLock lock(mLock);
+    mBlockers.InsertElementSorted(aBlocker);
+  }
+  void Deregister(void* aBlocker) {
+    MutexAutoLock lock(mLock);
+    MOZ_ASSERT(mBlockers.ContainsSorted(aBlocker));
+    MOZ_ALWAYS_TRUE(mBlockers.RemoveElementSorted(aBlocker));
+    MaybeResolve();
+  }
+  RefPtr<GenericPromise> WaitUntilClear(uint32_t aTimeOutInMs = 0) {
+    {
+      MutexAutoLock lock(mLock);
+      MaybeResolve();
+    }
+
+    if (aTimeOutInMs > 0) {
+      GetCurrentSerialEventTarget()->DelayedDispatch(
+          NS_NewRunnableFunction("AsyncBlockers::WaitUntilClear",
+                                 [promise = mPromise]() {
+                                   promise->Resolve(true, __func__);
+                                 }),
+          aTimeOutInMs);
+    }
+
+    return mPromise;
+  }
+
+  virtual ~AsyncBlockers() { mPromise->Resolve(true, __func__); }
+
+ private:
+  void MaybeResolve() MOZ_REQUIRES(mLock) {
+    mLock.AssertCurrentThreadOwns();
+    if (!mBlockers.IsEmpty()) {
+      return;
+    }
+    mPromise->Resolve(true, __func__);
+  }
+  Mutex mLock;
+  nsTArray<void*> mBlockers MOZ_GUARDED_BY(mLock);
+  const RefPtr<GenericPromise::Private> mPromise;
+};
+
+}  
+
+#endif  // mozilla_ipc_AsyncBlockers_h

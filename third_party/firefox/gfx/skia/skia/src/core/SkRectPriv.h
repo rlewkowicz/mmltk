@@ -1,0 +1,88 @@
+/*
+ * Copyright 2018 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkRectPriv_DEFINED)
+#define SkRectPriv_DEFINED
+
+#include "include/core/SkRect.h"
+#include "src/base/SkMathPriv.h"
+#include "src/base/SkVx.h"
+
+class SkM44;
+class SkMatrix;
+
+class SkRectPriv {
+public:
+    static SkIRect MakeILarge() {
+        const int32_t large = 1 << 29;
+        return { -large, -large, large, large };
+    }
+
+    static SkIRect MakeILargestInverted() {
+        return { SK_MaxS32, SK_MaxS32, SK_MinS32, SK_MinS32 };
+    }
+
+    static SkRect MakeLargeS32() {
+        SkRect r;
+        r.set(MakeILarge());
+        return r;
+    }
+
+    static SkRect MakeLargest() {
+        return { SK_ScalarMin, SK_ScalarMin, SK_ScalarMax, SK_ScalarMax };
+    }
+
+    static constexpr SkRect MakeLargestInverted() {
+        return { SK_ScalarMax, SK_ScalarMax, SK_ScalarMin, SK_ScalarMin };
+    }
+
+    static void GrowToInclude(SkRect* r, const SkPoint& pt) {
+        r->fLeft  =  std::min(pt.fX, r->fLeft);
+        r->fRight =  std::max(pt.fX, r->fRight);
+        r->fTop    = std::min(pt.fY, r->fTop);
+        r->fBottom = std::max(pt.fY, r->fBottom);
+    }
+
+    static bool FitsInFixed(const SkRect& r) {
+        return SkFitsInFixed(r.fLeft) && SkFitsInFixed(r.fTop) &&
+               SkFitsInFixed(r.fRight) && SkFitsInFixed(r.fBottom);
+    }
+
+    static constexpr float HalfWidth(const SkRect& r) {
+        return sk_float_midpoint(-r.fLeft, r.fRight);
+    }
+    static constexpr float HalfHeight(const SkRect& r) {
+        return sk_float_midpoint(-r.fTop, r.fBottom);
+    }
+
+    static bool Subtract(const SkRect& a, const SkRect& b, SkRect* out);
+    static bool Subtract(const SkIRect& a, const SkIRect& b, SkIRect* out);
+
+    static SkRect Subtract(const SkRect& a, const SkRect& b) {
+        SkRect diff;
+        Subtract(a, b, &diff);
+        return diff;
+    }
+    static SkIRect Subtract(const SkIRect& a, const SkIRect& b) {
+        SkIRect diff;
+        Subtract(a, b, &diff);
+        return diff;
+    }
+
+    static bool QuadContainsRect(const SkMatrix& m,
+                                 const SkIRect& a,
+                                 const SkIRect& b,
+                                 float tol=0.f);
+    static bool QuadContainsRect(const SkM44& m, const SkRect& a, const SkRect& b, float tol=0.f);
+    static skvx::int4 QuadContainsRectMask(const SkM44& m, const SkRect& a, const SkRect& b,
+                                           float tol=0.f);
+
+    static SkIRect ClosestDisjointEdge(const SkIRect& src, const SkIRect& dst);
+};
+
+
+#endif

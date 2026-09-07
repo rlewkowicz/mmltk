@@ -1,0 +1,110 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+function FUNC_NAME(
+  rx,
+  S,
+  lengthS,
+  replaceValue,
+#ifdef SUBSTITUTION
+  firstDollarIndex
+#endif
+) {
+  var lastIndex = ToLength(rx.lastIndex);
+
+  var flags = UnsafeGetInt32FromReservedSlot(rx, REGEXP_FLAGS_SLOT);
+
+  var globalOrSticky = !!(flags & (REGEXP_GLOBAL_FLAG | REGEXP_STICKY_FLAG));
+
+  if (globalOrSticky) {
+    if (lastIndex > lengthS) {
+      if (globalOrSticky) {
+        rx.lastIndex = 0;
+      }
+
+      return S;
+    }
+  } else {
+    lastIndex = 0;
+  }
+
+#if !defined(SIMPLE)
+  var result = RegExpMatcher(rx, S, lastIndex);
+
+  if (result === null) {
+    if (globalOrSticky) {
+      rx.lastIndex = 0;
+    }
+
+    return S;
+  }
+#else
+  var position = RegExpSearcher(rx, S, lastIndex);
+
+  if (position === -1) {
+    if (globalOrSticky) {
+      rx.lastIndex = 0;
+    }
+
+    return S;
+  }
+#endif
+
+
+#if !defined(SIMPLE)
+  assert(result.length >= 1, "RegExpMatcher doesn't return an empty array");
+
+  var matched = result[0];
+
+  var matchLength = matched.length;
+
+  var position = result.index;
+
+  var nextSourcePosition = position + matchLength;
+#else
+
+  var nextSourcePosition = RegExpSearcherLastLimit(S);
+#endif
+
+  if (globalOrSticky) {
+    rx.lastIndex = nextSourcePosition;
+  }
+
+  var replacement;
+#if defined(FUNCTIONAL)
+  replacement = RegExpGetFunctionalReplacement(
+    result,
+    S,
+    position,
+    replaceValue
+  );
+#elif defined(SUBSTITUTION)
+  var namedCaptures = result.groups;
+  if (namedCaptures !== undefined) {
+    namedCaptures = ToObject(namedCaptures);
+  }
+  replacement = RegExpGetSubstitution(
+    result,
+    S,
+    position,
+    replaceValue,
+    firstDollarIndex,
+    namedCaptures
+  );
+#else
+  replacement = replaceValue;
+#endif
+
+  var accumulatedResult = Substring(S, 0, position) + replacement;
+
+  if (nextSourcePosition >= lengthS) {
+    return accumulatedResult;
+  }
+
+  return (
+    accumulatedResult +
+    Substring(S, nextSourcePosition, lengthS - nextSourcePosition)
+  );
+}

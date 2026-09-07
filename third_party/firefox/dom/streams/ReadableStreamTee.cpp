@@ -1,0 +1,831 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ReadableStreamTee.h"
+
+#include "ReadIntoRequest.h"
+#include "ReadableByteStreamControllerAbstract.h"
+#include "ReadableStreamAbstract.h"
+#include "ReadableStreamBYOBReaderAbstract.h"
+#include "ReadableStreamDefaultControllerAbstract.h"
+#include "ReadableStreamDefaultReaderAbstract.h"
+#include "TeeState.h"
+#include "js/Exception.h"
+#include "js/TypeDecls.h"
+#include "js/experimental/TypedData.h"
+#include "mozilla/CycleCollectedJSContext.h"
+#include "mozilla/dom/ByteStreamHelpers.h"
+#include "mozilla/dom/Promise-inl.h"
+#include "mozilla/dom/ReadableStreamGenericReader.h"
+#include "mozilla/dom/UnderlyingSourceBinding.h"
+#include "mozilla/dom/UnderlyingSourceCallbackHelpers.h"
+#include "nsCycleCollectionParticipant.h"
+
+namespace mozilla::dom {
+
+using namespace streams_abstract;
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED(ReadableStreamDefaultTeeSourceAlgorithms,
+                                   UnderlyingSourceAlgorithmsBase, mTeeState)
+NS_IMPL_ADDREF_INHERITED(ReadableStreamDefaultTeeSourceAlgorithms,
+                         UnderlyingSourceAlgorithmsBase)
+NS_IMPL_RELEASE_INHERITED(ReadableStreamDefaultTeeSourceAlgorithms,
+                          UnderlyingSourceAlgorithmsBase)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(
+    ReadableStreamDefaultTeeSourceAlgorithms)
+NS_INTERFACE_MAP_END_INHERITING(UnderlyingSourceAlgorithmsBase)
+
+already_AddRefed<Promise>
+ReadableStreamDefaultTeeSourceAlgorithms::PullCallback(
+    JSContext* aCx, ReadableStreamControllerBase& aController,
+    ErrorResult& aRv) {
+  nsCOMPtr<nsIGlobalObject> global = aController.GetParentObject();
+  mTeeState->PullCallback(aCx, global, aRv);
+  if (!aRv.Failed()) {
+    return Promise::CreateResolvedWithUndefined(global, aRv);
+  }
+  return nullptr;
+}
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(ReadableStreamDefaultTeeReadRequest)
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_INHERITED(
+    ReadableStreamDefaultTeeReadRequest, ReadRequest)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mTeeState)
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(
+    ReadableStreamDefaultTeeReadRequest, ReadRequest)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mTeeState)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_ADDREF_INHERITED(ReadableStreamDefaultTeeReadRequest, ReadRequest)
+NS_IMPL_RELEASE_INHERITED(ReadableStreamDefaultTeeReadRequest, ReadRequest)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(ReadableStreamDefaultTeeReadRequest)
+NS_INTERFACE_MAP_END_INHERITING(ReadRequest)
+
+void ReadableStreamDefaultTeeReadRequest::ChunkSteps(
+    JSContext* aCx, JS::Handle<JS::Value> aChunk, ErrorResult& aRv) {
+  class ReadableStreamDefaultTeeReadRequestChunkSteps
+      : public MicroTaskRunnable {
+    MOZ_KNOWN_LIVE RefPtr<TeeState> mTeeState;
+    JS::PersistentRooted<JS::Value> mChunk;
+
+   public:
+    ReadableStreamDefaultTeeReadRequestChunkSteps(JSContext* aCx,
+                                                  TeeState* aTeeState,
+                                                  JS::Handle<JS::Value> aChunk)
+        : mTeeState(aTeeState), mChunk(aCx, aChunk) {}
+
+    MOZ_CAN_RUN_SCRIPT
+    void Run(AutoSlowOperation& aAso) override {
+      AutoJSAPI jsapi;
+      if (NS_WARN_IF(!jsapi.Init(mTeeState->GetStream()->GetParentObject()))) {
+        return;
+      }
+      JSContext* cx = jsapi.cx();
+      mTeeState->SetReadAgain(false);
+
+      JS::Rooted<JS::Value> chunk1(cx, mChunk);
+      JS::Rooted<JS::Value> chunk2(cx, mChunk);
+
+      MOZ_RELEASE_ASSERT(!mTeeState->CloneForBranch2());
+
+      if (!mTeeState->Canceled1()) {
+        IgnoredErrorResult rv;
+        RefPtr<ReadableStreamDefaultController> controller(
+            mTeeState->Branch1()->DefaultController());
+        ReadableStreamDefaultControllerEnqueue(cx, controller, chunk1, rv);
+        (void)NS_WARN_IF(rv.Failed());
+      }
+
+      if (!mTeeState->Canceled2()) {
+        IgnoredErrorResult rv;
+        RefPtr<ReadableStreamDefaultController> controller(
+            mTeeState->Branch2()->DefaultController());
+        ReadableStreamDefaultControllerEnqueue(cx, controller, chunk2, rv);
+        (void)NS_WARN_IF(rv.Failed());
+      }
+
+      mTeeState->SetReading(false);
+
+      if (mTeeState->ReadAgain()) {
+        IgnoredErrorResult rv;
+        nsCOMPtr<nsIGlobalObject> global(
+            mTeeState->GetStream()->GetParentObject());
+        mTeeState->PullCallback(cx, global, rv);
+        (void)NS_WARN_IF(rv.Failed());
+      }
+    }
+
+    bool Suppressed() override {
+      nsIGlobalObject* global = mTeeState->GetStream()->GetParentObject();
+      return global && global->IsInSyncOperation();
+    }
+  };
+
+  RefPtr<ReadableStreamDefaultTeeReadRequestChunkSteps> task =
+      MakeRefPtr<ReadableStreamDefaultTeeReadRequestChunkSteps>(aCx, mTeeState,
+                                                                aChunk);
+  CycleCollectedJSContext::Get()->DispatchToMicroTask(task.forget());
+}
+
+void ReadableStreamDefaultTeeReadRequest::CloseSteps(JSContext* aCx,
+                                                     ErrorResult& aRv) {
+  mTeeState->SetReading(false);
+
+  if (!mTeeState->Canceled1()) {
+    RefPtr<ReadableStreamDefaultController> controller(
+        mTeeState->Branch1()->DefaultController());
+    ReadableStreamDefaultControllerClose(aCx, controller, aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+  }
+
+  if (!mTeeState->Canceled2()) {
+    RefPtr<ReadableStreamDefaultController> controller(
+        mTeeState->Branch2()->DefaultController());
+    ReadableStreamDefaultControllerClose(aCx, controller, aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+  }
+
+  if (!mTeeState->Canceled1() || !mTeeState->Canceled2()) {
+    mTeeState->CancelPromise()->MaybeResolveWithUndefined();
+  }
+}
+
+void ReadableStreamDefaultTeeReadRequest::ErrorSteps(
+    JSContext* aCx, JS::Handle<JS::Value> aError, ErrorResult& aRv) {
+  mTeeState->SetReading(false);
+}
+
+MOZ_CAN_RUN_SCRIPT void PullWithDefaultReader(JSContext* aCx,
+                                              TeeState* aTeeState,
+                                              ErrorResult& aRv);
+MOZ_CAN_RUN_SCRIPT void PullWithBYOBReader(JSContext* aCx, TeeState* aTeeState,
+                                           JS::Handle<JSObject*> aView,
+                                           TeeBranch aForBranch,
+                                           ErrorResult& aRv);
+
+MOZ_CAN_RUN_SCRIPT void ByteStreamTeePullAlgorithm(JSContext* aCx,
+                                                   TeeBranch aForBranch,
+                                                   TeeState* aTeeState,
+                                                   ErrorResult& aRv) {
+  if (aTeeState->Reading()) {
+    aTeeState->SetReadAgainForBranch(aForBranch, true);
+
+    return;
+  }
+
+  aTeeState->SetReading(true);
+
+  RefPtr<ReadableStreamBYOBRequest> byobRequest =
+      ReadableByteStreamControllerGetBYOBRequest(
+          aCx, aTeeState->Branch(aForBranch)->Controller()->AsByte(), aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  if (!byobRequest) {
+    PullWithDefaultReader(aCx, aTeeState, aRv);
+  } else {
+    JS::Rooted<JSObject*> view(aCx, byobRequest->View());
+    PullWithBYOBReader(aCx, aTeeState, view, aForBranch, aRv);
+  }
+
+}
+
+class ByteStreamTeeSourceAlgorithms final
+    : public UnderlyingSourceAlgorithmsBase {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(ByteStreamTeeSourceAlgorithms,
+                                           UnderlyingSourceAlgorithmsBase)
+
+  ByteStreamTeeSourceAlgorithms(TeeState* aTeeState, TeeBranch aBranch)
+      : mTeeState(aTeeState), mBranch(aBranch) {}
+
+  MOZ_CAN_RUN_SCRIPT void StartCallback(
+      JSContext* aCx, ReadableStreamControllerBase& aController,
+      JS::MutableHandle<JS::Value> aRetVal, ErrorResult& aRv) override {
+    aRetVal.setUndefined();
+  }
+
+  MOZ_CAN_RUN_SCRIPT already_AddRefed<Promise> PullCallback(
+      JSContext* aCx, ReadableStreamControllerBase& aController,
+      ErrorResult& aRv) override {
+    ByteStreamTeePullAlgorithm(aCx, mBranch, MOZ_KnownLive(mTeeState), aRv);
+
+    return Promise::CreateResolvedWithUndefined(
+        mTeeState->GetStream()->GetParentObject(), aRv);
+  }
+
+  MOZ_CAN_RUN_SCRIPT already_AddRefed<Promise> CancelCallback(
+      JSContext* aCx, const Optional<JS::Handle<JS::Value>>& aReason,
+      ErrorResult& aRv) override {
+    mTeeState->SetCanceled(mBranch, true);
+
+    mTeeState->SetReason(mBranch, aReason.Value());
+
+    if (mTeeState->Canceled(otherStream())) {
+      JS::Rooted<JSObject*> compositeReason(aCx, JS::NewArrayObject(aCx, 2));
+      if (!compositeReason) {
+        aRv.StealExceptionFromJSContext(aCx);
+        return nullptr;
+      }
+
+      JS::Rooted<JS::Value> reason1(aCx);
+      mTeeState->GetReason1(aCx, &reason1, aRv);
+      if (aRv.Failed()) {
+        return nullptr;
+      }
+      if (!JS_SetElement(aCx, compositeReason, 0, reason1)) {
+        aRv.StealExceptionFromJSContext(aCx);
+        return nullptr;
+      }
+
+      JS::Rooted<JS::Value> reason2(aCx);
+      mTeeState->GetReason2(aCx, &reason2, aRv);
+      if (aRv.Failed()) {
+        return nullptr;
+      }
+      if (!JS_SetElement(aCx, compositeReason, 1, reason2)) {
+        aRv.StealExceptionFromJSContext(aCx);
+        return nullptr;
+      }
+
+      JS::Rooted<JS::Value> compositeReasonValue(
+          aCx, JS::ObjectValue(*compositeReason));
+      RefPtr<ReadableStream> stream(mTeeState->GetStream());
+      RefPtr<Promise> cancelResult =
+          ReadableStreamCancel(aCx, stream, compositeReasonValue, aRv);
+      if (aRv.Failed()) {
+        return nullptr;
+      }
+
+      mTeeState->CancelPromise()->MaybeResolve(cancelResult);
+    }
+
+    return do_AddRef(mTeeState->CancelPromise());
+  };
+
+ protected:
+  ~ByteStreamTeeSourceAlgorithms() override = default;
+
+ private:
+  TeeBranch otherStream() { return OtherTeeBranch(mBranch); }
+
+  RefPtr<TeeState> mTeeState;
+  TeeBranch mBranch;
+};
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED(ByteStreamTeeSourceAlgorithms,
+                                   UnderlyingSourceAlgorithmsBase, mTeeState)
+NS_IMPL_ADDREF_INHERITED(ByteStreamTeeSourceAlgorithms,
+                         UnderlyingSourceAlgorithmsBase)
+NS_IMPL_RELEASE_INHERITED(ByteStreamTeeSourceAlgorithms,
+                          UnderlyingSourceAlgorithmsBase)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(ByteStreamTeeSourceAlgorithms)
+NS_INTERFACE_MAP_END_INHERITING(UnderlyingSourceAlgorithmsBase)
+
+struct PullWithDefaultReaderReadRequest final : public ReadRequest {
+  RefPtr<TeeState> mTeeState;
+
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(PullWithDefaultReaderReadRequest,
+                                           ReadRequest)
+
+  explicit PullWithDefaultReaderReadRequest(TeeState* aTeeState)
+      : mTeeState(aTeeState) {}
+
+  void ChunkSteps(JSContext* aCx, JS::Handle<JS::Value> aChunk,
+                  ErrorResult& aRv) override {
+    class PullWithDefaultReaderChunkStepMicrotask : public MicroTaskRunnable {
+      RefPtr<TeeState> mTeeState;
+      JS::PersistentRooted<JSObject*> mChunk;
+
+     public:
+      PullWithDefaultReaderChunkStepMicrotask(JSContext* aCx,
+                                              TeeState* aTeeState,
+                                              JS::Handle<JSObject*> aChunk)
+          : mTeeState(aTeeState), mChunk(aCx, aChunk) {}
+
+      MOZ_CAN_RUN_SCRIPT
+      void Run(AutoSlowOperation& aAso) override {
+        AutoJSAPI jsapi;
+        if (NS_WARN_IF(
+                !jsapi.Init(mTeeState->GetStream()->GetParentObject()))) {
+          return;
+        }
+        JSContext* cx = jsapi.cx();
+
+        mTeeState->SetReadAgainForBranch1(false);
+
+        mTeeState->SetReadAgainForBranch2(false);
+
+        JS::Rooted<JSObject*> chunk1(cx, mChunk);
+        JS::Rooted<JSObject*> chunk2(cx, mChunk);
+
+        ErrorResult rv;
+        if (!mTeeState->Canceled1() && !mTeeState->Canceled2()) {
+          JS::Rooted<JSObject*> cloneResult(cx, CloneAsUint8Array(cx, mChunk));
+
+          if (!cloneResult) {
+            JS::Rooted<JS::Value> exceptionValue(cx);
+            if (!JS_GetPendingException(cx, &exceptionValue)) {
+              return;
+            }
+            JS_ClearPendingException(cx);
+
+            ErrorResult rv;
+            ReadableByteStreamControllerError(
+                mTeeState->Branch1()->Controller()->AsByte(), exceptionValue,
+                rv);
+            if (rv.MaybeSetPendingException(
+                    cx, "Error during ReadableByteStreamControllerError")) {
+              return;
+            }
+
+            ReadableByteStreamControllerError(
+                mTeeState->Branch2()->Controller()->AsByte(), exceptionValue,
+                rv);
+            if (rv.MaybeSetPendingException(
+                    cx, "Error during ReadableByteStreamControllerError")) {
+              return;
+            }
+
+            RefPtr<ReadableStream> stream(mTeeState->GetStream());
+            RefPtr<Promise> promise =
+                ReadableStreamCancel(cx, stream, exceptionValue, rv);
+            if (rv.MaybeSetPendingException(
+                    cx, "Error during ReadableByteStreamControllerError")) {
+              return;
+            }
+            mTeeState->CancelPromise()->MaybeResolve(promise);
+
+            return;
+          }
+
+          chunk2 = cloneResult;
+        }
+
+        if (!mTeeState->Canceled1()) {
+          ErrorResult rv;
+          RefPtr<ReadableByteStreamController> controller(
+              mTeeState->Branch1()->Controller()->AsByte());
+          ReadableByteStreamControllerEnqueue(cx, controller, chunk1, rv);
+          if (rv.MaybeSetPendingException(
+                  cx, "Error during ReadableByteStreamControllerEnqueue")) {
+            return;
+          }
+        }
+
+        if (!mTeeState->Canceled2()) {
+          ErrorResult rv;
+          RefPtr<ReadableByteStreamController> controller(
+              mTeeState->Branch2()->Controller()->AsByte());
+          ReadableByteStreamControllerEnqueue(cx, controller, chunk2, rv);
+          if (rv.MaybeSetPendingException(
+                  cx, "Error during ReadableByteStreamControllerEnqueue")) {
+            return;
+          }
+        }
+
+        mTeeState->SetReading(false);
+
+        if (mTeeState->ReadAgainForBranch1()) {
+          ByteStreamTeePullAlgorithm(cx, TeeBranch::Branch1,
+                                     MOZ_KnownLive(mTeeState), rv);
+        } else if (mTeeState->ReadAgainForBranch2()) {
+          ByteStreamTeePullAlgorithm(cx, TeeBranch::Branch2,
+                                     MOZ_KnownLive(mTeeState), rv);
+        }
+      }
+
+      bool Suppressed() override {
+        nsIGlobalObject* global = mTeeState->GetStream()->GetParentObject();
+        return global && global->IsInSyncOperation();
+      }
+    };
+
+    MOZ_ASSERT(aChunk.isObjectOrNull());
+    MOZ_ASSERT(aChunk.toObjectOrNull() != nullptr);
+    JS::Rooted<JSObject*> chunk(aCx, &aChunk.toObject());
+    RefPtr<PullWithDefaultReaderChunkStepMicrotask> task =
+        MakeRefPtr<PullWithDefaultReaderChunkStepMicrotask>(aCx, mTeeState,
+                                                            chunk);
+    CycleCollectedJSContext::Get()->DispatchToMicroTask(task.forget());
+  }
+
+  MOZ_CAN_RUN_SCRIPT void CloseSteps(JSContext* aCx,
+                                     ErrorResult& aRv) override {
+
+    mTeeState->SetReading(false);
+
+    RefPtr<ReadableByteStreamController> branch1Controller =
+        mTeeState->Branch1()->Controller()->AsByte();
+    if (!mTeeState->Canceled1()) {
+      ReadableByteStreamControllerClose(aCx, branch1Controller, aRv);
+      if (aRv.Failed()) {
+        return;
+      }
+    }
+
+    RefPtr<ReadableByteStreamController> branch2Controller =
+        mTeeState->Branch2()->Controller()->AsByte();
+    if (!mTeeState->Canceled2()) {
+      ReadableByteStreamControllerClose(aCx, branch2Controller, aRv);
+      if (aRv.Failed()) {
+        return;
+      }
+    }
+
+    if (!branch1Controller->PendingPullIntos().isEmpty()) {
+      ReadableByteStreamControllerRespond(aCx, branch1Controller, 0, aRv);
+      if (aRv.Failed()) {
+        return;
+      }
+    }
+
+    if (!branch2Controller->PendingPullIntos().isEmpty()) {
+      ReadableByteStreamControllerRespond(aCx, branch2Controller, 0, aRv);
+      if (aRv.Failed()) {
+        return;
+      }
+    }
+
+    if (!mTeeState->Canceled1() || !mTeeState->Canceled2()) {
+      mTeeState->CancelPromise()->MaybeResolveWithUndefined();
+    }
+  }
+
+  void ErrorSteps(JSContext* aCx, JS::Handle<JS::Value> aError,
+                  ErrorResult& aRv) override {
+    mTeeState->SetReading(false);
+  }
+
+ protected:
+  ~PullWithDefaultReaderReadRequest() override = default;
+};
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED(PullWithDefaultReaderReadRequest,
+                                   ReadRequest, mTeeState)
+NS_IMPL_ADDREF_INHERITED(PullWithDefaultReaderReadRequest, ReadRequest)
+NS_IMPL_RELEASE_INHERITED(PullWithDefaultReaderReadRequest, ReadRequest)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(PullWithDefaultReaderReadRequest)
+NS_INTERFACE_MAP_END_INHERITING(ReadRequest)
+
+void ForwardReaderError(TeeState* aTeeState,
+                        ReadableStreamGenericReader* aThisReader);
+
+void PullWithDefaultReader(JSContext* aCx, TeeState* aTeeState,
+                           ErrorResult& aRv) {
+  RefPtr<ReadableStreamGenericReader> reader = aTeeState->GetReader();
+
+  if (reader->IsBYOB()) {
+    MOZ_ASSERT(reader->AsBYOB()->ReadIntoRequests().length() == 0);
+
+    ReadableStreamBYOBReaderRelease(aCx, reader->AsBYOB(), aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+
+    reader = AcquireReadableStreamDefaultReader(aTeeState->GetStream(), aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+    aTeeState->SetReader(reader);
+
+    ForwardReaderError(aTeeState, reader);
+  }
+
+  RefPtr<ReadRequest> readRequest =
+      new PullWithDefaultReaderReadRequest(aTeeState);
+
+  ReadableStreamDefaultReaderRead(aCx, reader, readRequest, aRv);
+}
+
+class PullWithBYOBReader_ReadIntoRequest final : public ReadIntoRequest {
+  RefPtr<TeeState> mTeeState;
+  const TeeBranch mForBranch;
+  ~PullWithBYOBReader_ReadIntoRequest() override = default;
+
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(PullWithBYOBReader_ReadIntoRequest,
+                                           ReadIntoRequest)
+
+  explicit PullWithBYOBReader_ReadIntoRequest(TeeState* aTeeState,
+                                              TeeBranch aForBranch)
+      : mTeeState(aTeeState), mForBranch(aForBranch) {}
+
+  void ChunkSteps(JSContext* aCx, JS::Handle<JS::Value> aChunk,
+                  ErrorResult& aRv) override {
+    class PullWithBYOBReaderChunkMicrotask : public MicroTaskRunnable {
+      RefPtr<TeeState> mTeeState;
+      JS::PersistentRooted<JSObject*> mChunk;
+      const TeeBranch mForBranch;
+
+     public:
+      PullWithBYOBReaderChunkMicrotask(JSContext* aCx, TeeState* aTeeState,
+                                       JS::Handle<JSObject*> aChunk,
+                                       TeeBranch aForBranch)
+          : mTeeState(aTeeState), mChunk(aCx, aChunk), mForBranch(aForBranch) {}
+
+      MOZ_CAN_RUN_SCRIPT
+      void Run(AutoSlowOperation& aAso) override {
+        AutoJSAPI jsapi;
+        if (NS_WARN_IF(
+                !jsapi.Init(mTeeState->GetStream()->GetParentObject()))) {
+          return;
+        }
+        JSContext* cx = jsapi.cx();
+        ErrorResult rv;
+
+        mTeeState->SetReadAgainForBranch1(false);
+
+        mTeeState->SetReadAgainForBranch2(false);
+
+        bool byobCanceled = mTeeState->Canceled(mForBranch);
+        bool otherCanceled = mTeeState->Canceled(OtherTeeBranch(mForBranch));
+
+        ReadableStream* byobBranch = mTeeState->Branch(mForBranch);
+        ReadableStream* otherBranch =
+            mTeeState->Branch(OtherTeeBranch(mForBranch));
+
+        if (!otherCanceled) {
+          JS::Rooted<JSObject*> clonedChunk(cx, CloneAsUint8Array(cx, mChunk));
+
+          if (!clonedChunk) {
+            JS::Rooted<JS::Value> exception(cx);
+            if (!JS_GetPendingException(cx, &exception)) {
+              return;
+            }
+
+            JS_ClearPendingException(cx);
+
+
+            ReadableByteStreamControllerError(
+                byobBranch->Controller()->AsByte(), exception, rv);
+            if (rv.MaybeSetPendingException(cx)) {
+              return;
+            }
+
+            ReadableByteStreamControllerError(
+                otherBranch->Controller()->AsByte(), exception, rv);
+            if (rv.MaybeSetPendingException(cx)) {
+              return;
+            }
+
+            RefPtr<ReadableStream> stream = mTeeState->GetStream();
+            RefPtr<Promise> cancelPromise =
+                ReadableStreamCancel(cx, stream, exception, rv);
+            if (rv.MaybeSetPendingException(cx)) {
+              return;
+            }
+            mTeeState->CancelPromise()->MaybeResolve(cancelPromise);
+
+            return;
+          }
+
+          if (!byobCanceled) {
+            RefPtr<ReadableByteStreamController> controller(
+                byobBranch->Controller()->AsByte());
+            ReadableByteStreamControllerRespondWithNewView(cx, controller,
+                                                           mChunk, rv);
+            if (rv.MaybeSetPendingException(cx)) {
+              return;
+            }
+          }
+
+          RefPtr<ReadableByteStreamController> otherController =
+              otherBranch->Controller()->AsByte();
+          ReadableByteStreamControllerEnqueue(cx, otherController, clonedChunk,
+                                              rv);
+          if (rv.MaybeSetPendingException(cx)) {
+            return;
+          }
+        } else if (!byobCanceled) {
+          RefPtr<ReadableByteStreamController> byobController =
+              byobBranch->Controller()->AsByte();
+          ReadableByteStreamControllerRespondWithNewView(cx, byobController,
+                                                         mChunk, rv);
+          if (rv.MaybeSetPendingException(cx)) {
+            return;
+          }
+        }
+
+        mTeeState->SetReading(false);
+
+        if (mTeeState->ReadAgainForBranch1()) {
+          ByteStreamTeePullAlgorithm(cx, TeeBranch::Branch1,
+                                     MOZ_KnownLive(mTeeState), rv);
+          if (rv.MaybeSetPendingException(cx)) {
+            return;
+          }
+        } else if (mTeeState->ReadAgainForBranch2()) {
+          ByteStreamTeePullAlgorithm(cx, TeeBranch::Branch2,
+                                     MOZ_KnownLive(mTeeState), rv);
+          if (rv.MaybeSetPendingException(cx)) {
+            return;
+          }
+        }
+      }
+
+      bool Suppressed() override {
+        nsIGlobalObject* global = mTeeState->GetStream()->GetParentObject();
+        return global && global->IsInSyncOperation();
+      }
+    };
+
+    MOZ_ASSERT(aChunk.isObjectOrNull());
+    MOZ_ASSERT(aChunk.toObjectOrNull());
+    JS::Rooted<JSObject*> chunk(aCx, aChunk.toObjectOrNull());
+    RefPtr<PullWithBYOBReaderChunkMicrotask> task =
+        MakeRefPtr<PullWithBYOBReaderChunkMicrotask>(aCx, mTeeState, chunk,
+                                                     mForBranch);
+    CycleCollectedJSContext::Get()->DispatchToMicroTask(task.forget());
+  }
+
+  MOZ_CAN_RUN_SCRIPT
+  void CloseSteps(JSContext* aCx, JS::Handle<JS::Value> aChunk,
+                  ErrorResult& aRv) override {
+    mTeeState->SetReading(false);
+
+    bool byobCanceled = mTeeState->Canceled(mForBranch);
+
+    bool otherCanceled = mTeeState->Canceled(OtherTeeBranch(mForBranch));
+
+    ReadableStream* byobBranch = mTeeState->Branch(mForBranch);
+    ReadableStream* otherBranch = mTeeState->Branch(OtherTeeBranch(mForBranch));
+
+    if (!byobCanceled) {
+      RefPtr<ReadableByteStreamController> controller =
+          byobBranch->Controller()->AsByte();
+      ReadableByteStreamControllerClose(aCx, controller, aRv);
+      if (aRv.Failed()) {
+        return;
+      }
+    }
+    if (!otherCanceled) {
+      RefPtr<ReadableByteStreamController> controller =
+          otherBranch->Controller()->AsByte();
+      ReadableByteStreamControllerClose(aCx, controller, aRv);
+      if (aRv.Failed()) {
+        return;
+      }
+    }
+
+    if (!aChunk.isUndefined()) {
+      MOZ_ASSERT(aChunk.isObject());
+      MOZ_ASSERT(aChunk.toObjectOrNull());
+
+      JS::Rooted<JSObject*> chunkObject(aCx, &aChunk.toObject());
+      MOZ_ASSERT(JS_IsArrayBufferViewObject(chunkObject));
+      MOZ_ASSERT(JS_GetArrayBufferViewByteLength(chunkObject) == 0);
+
+      if (!byobCanceled) {
+        RefPtr<ReadableByteStreamController> byobController(
+            byobBranch->Controller()->AsByte());
+        ReadableByteStreamControllerRespondWithNewView(aCx, byobController,
+                                                       chunkObject, aRv);
+        if (aRv.Failed()) {
+          return;
+        }
+      }
+
+      if (!otherCanceled &&
+          !otherBranch->Controller()->AsByte()->PendingPullIntos().isEmpty()) {
+        RefPtr<ReadableByteStreamController> otherController(
+            otherBranch->Controller()->AsByte());
+        ReadableByteStreamControllerRespond(aCx, otherController, 0, aRv);
+        if (aRv.Failed()) {
+          return;
+        }
+      }
+    }
+
+    if (!byobCanceled || !otherCanceled) {
+      mTeeState->CancelPromise()->MaybeResolveWithUndefined();
+    }
+  }
+
+  void ErrorSteps(JSContext* aCx, JS::Handle<JS::Value> e,
+                  ErrorResult& aRv) override {
+    mTeeState->SetReading(false);
+  }
+};
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED(PullWithBYOBReader_ReadIntoRequest,
+                                   ReadIntoRequest, mTeeState)
+NS_IMPL_ADDREF_INHERITED(PullWithBYOBReader_ReadIntoRequest, ReadIntoRequest)
+NS_IMPL_RELEASE_INHERITED(PullWithBYOBReader_ReadIntoRequest, ReadIntoRequest)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(PullWithBYOBReader_ReadIntoRequest)
+NS_INTERFACE_MAP_END_INHERITING(ReadIntoRequest)
+
+void PullWithBYOBReader(JSContext* aCx, TeeState* aTeeState,
+                        JS::Handle<JSObject*> aView, TeeBranch aForBranch,
+                        ErrorResult& aRv) {
+  if (aTeeState->GetReader()->IsDefault()) {
+    MOZ_ASSERT(aTeeState->GetDefaultReader()->ReadRequests().isEmpty());
+
+    ReadableStreamDefaultReaderRelease(aCx, aTeeState->GetDefaultReader(), aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+
+    RefPtr<ReadableStreamBYOBReader> reader =
+        AcquireReadableStreamBYOBReader(aTeeState->GetStream(), aRv);
+    if (aRv.Failed()) {
+      return;
+    }
+    aTeeState->SetReader(reader);
+
+    ForwardReaderError(aTeeState, reader);
+  }
+
+
+  RefPtr<ReadIntoRequest> readIntoRequest =
+      new PullWithBYOBReader_ReadIntoRequest(aTeeState, aForBranch);
+
+  RefPtr<ReadableStreamBYOBReader> byobReader =
+      aTeeState->GetReader()->AsBYOB();
+  ReadableStreamBYOBReaderRead(aCx, byobReader, aView, 1, readIntoRequest, aRv);
+}
+
+void ForwardReaderError(TeeState* aTeeState,
+                        ReadableStreamGenericReader* aThisReader) {
+  aThisReader->ClosedPromise()->AddCallbacksWithCycleCollectedArgs(
+      [](JSContext* aCx, JS::Handle<JS::Value> aValue, ErrorResult& aRv,
+         TeeState* aTeeState, ReadableStreamGenericReader* aThisReader) {},
+      [](JSContext* aCx, JS::Handle<JS::Value> aValue, ErrorResult& aRv,
+         TeeState* aTeeState, ReadableStreamGenericReader* aReader) {
+        if (aTeeState->GetReader() != aReader) {
+          return;
+        }
+
+        ErrorResult rv;
+        MOZ_ASSERT(aTeeState->Branch1()->Controller()->IsByte());
+        ReadableByteStreamControllerError(
+            aTeeState->Branch1()->Controller()->AsByte(), aValue, aRv);
+        if (aRv.Failed()) {
+          return;
+        }
+
+        MOZ_ASSERT(aTeeState->Branch2()->Controller()->IsByte());
+        ReadableByteStreamControllerError(
+            aTeeState->Branch2()->Controller()->AsByte(), aValue, aRv);
+        if (aRv.Failed()) {
+          return;
+        }
+
+        if (!aTeeState->Canceled1() || !aTeeState->Canceled2()) {
+          aTeeState->CancelPromise()->MaybeResolveWithUndefined();
+        }
+      },
+      RefPtr(aTeeState), RefPtr(aThisReader));
+}
+
+namespace streams_abstract {
+void ReadableByteStreamTee(JSContext* aCx, ReadableStream* aStream,
+                           nsTArray<RefPtr<ReadableStream>>& aResult,
+                           ErrorResult& aRv) {
+  MOZ_ASSERT(aStream->Controller()->IsByte());
+
+  RefPtr<TeeState> teeState = TeeState::Create(aStream, false, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  nsCOMPtr<nsIGlobalObject> global = aStream->GetParentObject();
+  auto branch1Algorithms =
+      MakeRefPtr<ByteStreamTeeSourceAlgorithms>(teeState, TeeBranch::Branch1);
+  teeState->SetBranch1(
+      ReadableStream::CreateByteAbstract(aCx, global, branch1Algorithms, aRv));
+  if (aRv.Failed()) {
+    return;
+  }
+
+  auto branch2Algorithms =
+      MakeRefPtr<ByteStreamTeeSourceAlgorithms>(teeState, TeeBranch::Branch2);
+  teeState->SetBranch2(
+      ReadableStream::CreateByteAbstract(aCx, global, branch2Algorithms, aRv));
+  if (aRv.Failed()) {
+    return;
+  }
+
+  ForwardReaderError(teeState, teeState->GetReader());
+
+  aResult.AppendElement(teeState->Branch1());
+  aResult.AppendElement(teeState->Branch2());
+}
+}  
+
+}  

@@ -1,0 +1,211 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef StaticComponents_h
+#define StaticComponents_h
+
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Module.h"
+#include "mozilla/Span.h"
+#include "nsID.h"
+#include "nsStringFwd.h"
+#include "nscore.h"
+
+#include "mozilla/Components.h"
+#include "StaticComponentData.h"
+
+class nsIFactory;
+class nsIUTF8StringEnumerator;
+class nsISupports;
+template <typename T, size_t N>
+class AutoTArray;
+
+namespace mozilla {
+namespace xpcom {
+
+struct ContractEntry;
+struct StaticModule;
+
+struct StaticCategoryEntry;
+struct StaticCategory;
+
+struct StaticProtocolHandler;
+
+extern const StaticModule gStaticModules[kStaticModuleCount];
+
+extern const ContractEntry gContractEntries[kContractCount];
+extern uint8_t gInvalidContracts[kContractCount / 8 + 1];
+
+extern const StaticCategory gStaticCategories[kStaticCategoryCount];
+extern const StaticCategoryEntry gStaticCategoryEntries[];
+
+extern const StaticProtocolHandler
+    gStaticProtocolHandlers[kStaticProtocolHandlerCount];
+
+template <size_t N>
+static inline bool GetBit(const uint8_t (&aBits)[N], size_t aBit) {
+  static constexpr size_t width = sizeof(aBits[0]) * 8;
+
+  size_t idx = aBit / width;
+  MOZ_ASSERT(idx < N);
+  return aBits[idx] & (1 << (aBit % width));
+}
+
+template <size_t N>
+static inline void SetBit(uint8_t (&aBits)[N], size_t aBit,
+                          bool aValue = true) {
+  static constexpr size_t width = sizeof(aBits[0]) * 8;
+
+  size_t idx = aBit / width;
+  MOZ_ASSERT(idx < N);
+  if (aValue) {
+    aBits[idx] |= 1 << (aBit % width);
+  } else {
+    aBits[idx] &= ~(1 << (aBit % width));
+  }
+}
+
+struct StringOffset final {
+  uint32_t mOffset;
+};
+
+struct InterfaceOffset final {
+  uint16_t mOffset;
+};
+
+struct StaticModule {
+  nsID mCID;
+  StringOffset mContractID;
+  Module::ProcessSelector mProcessSelector;
+
+  const nsID& CID() const { return mCID; }
+
+  ModuleID ID() const { return ModuleID(this - gStaticModules); }
+
+  size_t Idx() const { return size_t(ID()); }
+
+  bool Overridable() const;
+
+  nsCString ContractID() const;
+
+  bool Active() const;
+
+  already_AddRefed<nsIFactory> GetFactory() const;
+
+  nsresult CreateInstance(const nsIID& aIID, void** aResult) const;
+
+  GetServiceHelper GetService() const;
+  GetServiceHelper GetService(nsresult*) const;
+
+  nsISupports* ServiceInstance() const;
+  void SetServiceInstance(already_AddRefed<nsISupports> aInst) const;
+};
+
+struct ContractEntry final {
+  StringOffset mContractID;
+  ModuleID mModuleID;
+
+  size_t Idx() const { return this - gContractEntries; }
+
+  nsCString ContractID() const;
+
+  const StaticModule& Module() const {
+    return gStaticModules[size_t(mModuleID)];
+  }
+
+  bool Matches(const nsACString& aContractID) const;
+
+  bool Invalid() const { return GetBit(gInvalidContracts, Idx()); }
+
+  void SetInvalid(bool aInvalid = true) const {
+    return SetBit(gInvalidContracts, Idx(), aInvalid);
+  }
+};
+
+struct StaticCategoryEntry final {
+  StringOffset mEntry;
+  StringOffset mValue;
+  Module::BackgroundTasksSelector mBackgroundTasksSelector;
+  Module::ProcessSelector mProcessSelector;
+
+  nsCString Entry() const;
+  nsCString Value() const;
+  bool Active() const;
+};
+
+struct StaticCategory final {
+  StringOffset mName;
+  uint16_t mStart;
+  uint16_t mCount;
+
+  nsCString Name() const;
+
+  const StaticCategoryEntry* begin() const {
+    return &gStaticCategoryEntries[mStart];
+  }
+  const StaticCategoryEntry* end() const {
+    return &gStaticCategoryEntries[mStart + mCount];
+  }
+};
+
+struct JSServiceEntry final {
+  using InterfaceList = AutoTArray<const nsIID*, 4>;
+
+  static const JSServiceEntry* Lookup(const nsACString& aName);
+
+  StringOffset mName;
+  ModuleID mModuleID;
+
+  InterfaceOffset mInterfaceOffset;
+
+  uint8_t mInterfaceCount;
+
+  nsCString Name() const;
+
+  const StaticModule& Module() const {
+    return gStaticModules[size_t(mModuleID)];
+  }
+
+  InterfaceList Interfaces() const;
+};
+
+struct StaticProtocolHandler final {
+  static const StaticProtocolHandler* Lookup(const nsACString& aScheme);
+  static const StaticProtocolHandler& Default() {
+    return gStaticProtocolHandlers[kDefaultProtocolHandlerIndex];
+  }
+
+  StringOffset mScheme;
+  uint32_t mProtocolFlags;
+  int32_t mDefaultPort;
+  ModuleID mModuleID;
+  bool mHasDynamicFlags;
+
+  nsCString Scheme() const;
+
+  const StaticModule& Module() const {
+    return gStaticModules[size_t(mModuleID)];
+  }
+};
+
+class StaticComponents final {
+ public:
+  static const StaticModule* LookupByCID(const nsID& aCID);
+
+  static const StaticModule* LookupByContractID(const nsACString& aContractID);
+
+  static bool InvalidateContractID(const nsACString& aContractID,
+                                   bool aInvalid = true);
+
+  static already_AddRefed<nsIUTF8StringEnumerator> GetComponentESModules();
+
+  static Span<const JSServiceEntry> GetJSServices();
+
+  static void Shutdown();
+};
+
+}  
+}  
+
+#endif  // defined StaticComponents_h

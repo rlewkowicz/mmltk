@@ -1,0 +1,155 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_WEBTRANSPORT_API_WEBTRANSPORT_H_
+#define DOM_WEBTRANSPORT_API_WEBTRANSPORT_H_
+
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/WebTransportBinding.h"
+#include "mozilla/dom/WebTransportChild.h"
+#include "mozilla/dom/WebTransportReceiveStream.h"
+#include "mozilla/dom/WebTransportSendStream.h"
+#include "mozilla/dom/WebTransportStreams.h"
+#include "mozilla/ipc/DataPipe.h"
+#include "mozilla/net/WebTransportEventService.h"
+#include "nsCOMPtr.h"
+#include "nsISupports.h"
+#include "nsPIDOMWindow.h"
+#include "nsTArray.h"
+#include "nsTHashMap.h"
+#include "nsWrapperCache.h"
+
+namespace mozilla::dom {
+
+class WebTransportError;
+class WebTransportDatagramDuplexStream;
+class WebTransportIncomingStreamsAlgorithms;
+class ReadableStream;
+class WritableStream;
+using BidirectionalPair = std::pair<RefPtr<mozilla::ipc::DataPipeReceiver>,
+                                    RefPtr<mozilla::ipc::DataPipeSender>>;
+
+struct DatagramEntry {
+  DatagramEntry(nsTArray<uint8_t>&& aData, const mozilla::TimeStamp& aTimeStamp)
+      : mBuffer(std::move(aData)), mTimeStamp(aTimeStamp) {}
+  DatagramEntry(Span<uint8_t>& aData, const mozilla::TimeStamp& aTimeStamp)
+      : mBuffer(aData), mTimeStamp(aTimeStamp) {}
+
+  nsTArray<uint8_t> mBuffer;
+  mozilla::TimeStamp mTimeStamp;
+};
+
+class WebTransport final : public nsISupports, public nsWrapperCache {
+  friend class WebTransportIncomingStreamsAlgorithms;
+  friend class WebTransportSendStream;
+  friend class WebTransportReceiveStream;
+
+ public:
+  explicit WebTransport(nsIGlobalObject* aGlobal);
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(WebTransport)
+
+  enum class WebTransportState { CONNECTING, CONNECTED, CLOSED, FAILED };
+
+  static void NotifyBFCacheOnMainThread(nsPIDOMWindowInner* aInner,
+                                        bool aCreated);
+  void NotifyToWindow(bool aCreated) const;
+
+  void Init(const GlobalObject& aGlobal, const nsAString& aUrl,
+            const WebTransportOptions& aOptions, ErrorResult& aError);
+  void ResolveWaitingConnection(WebTransportReliabilityMode aReliability);
+  void RejectWaitingConnection(nsresult aRv);
+  bool ParseURL(const nsAString& aURL) const;
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void Cleanup(
+      WebTransportError* aError, const WebTransportCloseInfo* aCloseInfo,
+      ErrorResult& aRv);
+
+  void NewBidirectionalStream(
+      uint64_t aStreamId,
+      const RefPtr<mozilla::ipc::DataPipeReceiver>& aIncoming,
+      const RefPtr<mozilla::ipc::DataPipeSender>& aOutgoing);
+
+  void NewUnidirectionalStream(
+      uint64_t aStreamId,
+      const RefPtr<mozilla::ipc::DataPipeReceiver>& aStream);
+
+  void NewDatagramReceived(nsTArray<uint8_t>&& aData,
+                           const mozilla::TimeStamp& aTimeStamp);
+
+  void RemoteClosed(bool aCleanly, const uint32_t& aCode,
+                    const nsACString& aReason);
+
+  void OnStreamResetOrStopSending(uint64_t aStreamId,
+                                  const StreamResetOrStopSendingError& aError);
+  nsIGlobalObject* GetParentObject() const;
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  static already_AddRefed<WebTransport> Constructor(
+      const GlobalObject& aGlobal, const nsAString& aUrl,
+      const WebTransportOptions& aOptions, ErrorResult& aError);
+
+  already_AddRefed<Promise> GetStats(ErrorResult& aError);
+
+  already_AddRefed<Promise> Ready() { return do_AddRef(mReady); }
+  WebTransportReliabilityMode Reliability();
+  WebTransportCongestionControl CongestionControl();
+  already_AddRefed<Promise> Closed() { return do_AddRef(mClosed); }
+  MOZ_CAN_RUN_SCRIPT void Close(const WebTransportCloseInfo& aOptions,
+                                ErrorResult& aRv);
+  already_AddRefed<WebTransportDatagramDuplexStream> GetDatagrams(
+      ErrorResult& aRv);
+  already_AddRefed<Promise> CreateBidirectionalStream(
+      const WebTransportSendStreamOptions& aOptions, ErrorResult& aRv);
+  already_AddRefed<Promise> CreateUnidirectionalStream(
+      const WebTransportSendStreamOptions& aOptions, ErrorResult& aRv);
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY already_AddRefed<ReadableStream>
+  IncomingBidirectionalStreams();
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY already_AddRefed<ReadableStream>
+  IncomingUnidirectionalStreams();
+
+  void SendSetSendOrder(uint64_t aStreamId, Maybe<int64_t> aSendOrder);
+
+  void Shutdown() {}
+
+ private:
+  ~WebTransport();
+
+  template <typename Stream>
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void PropagateError(Stream* aStream,
+                                                  WebTransportError* aError);
+
+  nsCOMPtr<nsIGlobalObject> mGlobal;
+  RefPtr<WebTransportChild> mChild;
+
+
+  nsTHashMap<uint64_t, RefPtr<WebTransportSendStream>> mSendStreams;
+  nsTHashMap<uint64_t, RefPtr<WebTransportReceiveStream>> mReceiveStreams;
+
+  WebTransportState mState;
+  RefPtr<Promise> mReady;
+  uint64_t mInnerWindowID = 0;
+  uint64_t mHttpChannelID = 0;
+  uint64_t mBrowsingContextID = 0;
+  RefPtr<mozilla::net::WebTransportEventService> mService;
+  RefPtr<WebTransportIncomingStreamsAlgorithms> mIncomingBidirectionalAlgorithm;
+  RefPtr<WebTransportIncomingStreamsAlgorithms>
+      mIncomingUnidirectionalAlgorithm;
+  WebTransportReliabilityMode mReliability;
+  nsTArray<std::tuple<uint64_t, RefPtr<mozilla::ipc::DataPipeReceiver>>>
+      mUnidirectionalStreams;
+  nsTArray<std::tuple<uint64_t, UniquePtr<BidirectionalPair>>>
+      mBidirectionalStreams;
+
+  RefPtr<ReadableStream> mIncomingUnidirectionalStreams;
+  RefPtr<ReadableStream> mIncomingBidirectionalStreams;
+  RefPtr<WebTransportDatagramDuplexStream> mDatagrams;
+  RefPtr<Promise> mClosed;
+};
+
+}  
+
+#endif  // DOM_WEBTRANSPORT_API_WEBTRANSPORT_H_

@@ -1,0 +1,591 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+#include "MediaCapabilitiesValidation.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+
+#include "AOMDecoder.h"
+#include "MediaCapabilities.h"
+#include "MediaInfo.h"
+#include "MediaMIMETypes.h"
+#include "VPXDecoder.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/Logging.h"
+#include "mozilla/Result.h"
+#include "mozilla/Variant.h"
+#include "mozilla/dom/MediaCapabilitiesBinding.h"
+#include "mozilla/dom/Promise.h"
+#include "nsReadableUtils.h"
+
+extern mozilla::LazyLogModule sMediaCapabilitiesLog;
+#define LOG(args) \
+  MOZ_LOG_FMT(sMediaCapabilitiesLog, LogLevel::Debug, MOZ_LOG_EXPAND_ARGS args)
+
+namespace mozilla::mediacaps {
+using dom::AudioConfiguration;
+using dom::MediaConfiguration;
+using dom::MediaDecodingConfiguration;
+using dom::MediaDecodingType;
+using dom::MediaEncodingConfiguration;
+using dom::MediaEncodingType;
+using dom::MSG_INVALID_MEDIA_AUDIO_CONFIGURATION;
+using dom::MSG_INVALID_MEDIA_VIDEO_CONFIGURATION;
+using dom::MSG_MISSING_REQUIRED_DICTIONARY_MEMBER;
+using dom::Promise;
+using dom::VideoConfiguration;
+
+static nsAutoCString GetMIMEDebugString(const MediaConfiguration& aConfig);
+static bool IsContainerType(const MediaExtendedMIMEType& aMime);
+static bool IsSingleCodecType(const MediaExtendedMIMEType& aMime);
+static bool ValidateMatchingCodecColorSpace(
+    const MediaExtendedMIMEType& aMime, const Maybe<dom::ColorGamut>& aGamut,
+    const Maybe<dom::TransferFunction>& aTransfer);
+
+static const std::array kSingleWebRTCCodecTypes = {
+    "audio/g711-alaw"_ns, "audio/g711-mlaw"_ns, "audio/g722"_ns,
+    "audio/opus"_ns,      "audio/pcma"_ns,      "audio/pcmu"_ns,
+    "video/av1"_ns,       "video/h264"_ns,      "video/vp8"_ns,
+    "video/vp9"_ns,
+};
+
+static const std::array kContainerTypes = {
+    "video/mkv"_ns, "video/mp4"_ns, "video/webm"_ns, "video/mpeg"_ns,
+    "audio/mp4"_ns, "audio/webm"_ns, "audio/mpeg"_ns};
+
+ValidationResult CheckMIMETypeSupport(
+    const MediaExtendedMIMEType& aMime,
+    const MediaType& aEncodingOrDecodingType,
+    const Maybe<dom::ColorGamut>& aColorGamut,
+    const Maybe<dom::TransferFunction>& aTransferFunction,
+    const BehaviorConfig& aBehavior) {
+  if (IsMediaTypeWebRTC(aEncodingOrDecodingType) && !IsSingleCodecType(aMime)) {
+    ValidationResult err = Err(ValidationError::InvalidMIMEType);
+    LOG(
+        ("[CheckMIMETypeSupport (encodingOrDecodingType is webrtc, "
+         "but MIME type is not one used with RTP, {}) #1] Rejecting '{}'\n",
+         EnumValueToString(err.unwrapErr()), aMime.OriginalString().get()));
+    return err;
+  }
+
+  if ((aColorGamut || aTransferFunction) && !aBehavior.mLegacy) {
+    MOZ_ASSERT_IF(aMime.Type().HasAudioMajorType(), !aColorGamut);
+    MOZ_ASSERT_IF(aMime.Type().HasAudioMajorType(), !aTransferFunction);
+    if (!aEncodingOrDecodingType.is<MediaDecodingType>()) {
+      ValidationResult err = Err(ValidationError::InapplicableMember);
+      LOG(
+          ("[CheckMIMETypeSupport (colorGamut/transferFunction are decode "
+           "only, {}), #2, #3] Rejecting '{}'\n",
+           EnumValueToString(err.unwrapErr()), aMime.OriginalString().get()));
+      return err;
+    }
+    const MediaDecodingType& dType =
+        aEncodingOrDecodingType.as<MediaDecodingType>();
+    if (dType != MediaDecodingType::Media_source &&
+        dType != MediaDecodingType::File) {
+      ValidationResult err = Err(ValidationError::InapplicableMember);
+      LOG(
+          ("[CheckMIMETypeSupport #3 (colorGamut/transferFunction only for "
+           "media-source, file; got {}, {}), #2, #3] Rejecting '{}'\n",
+           GetEnumString(dType).get(), EnumValueToString(err.unwrapErr()),
+           aMime.OriginalString().get()));
+      return err;
+    }
+    if (!ValidateMatchingCodecColorSpace(aMime, aColorGamut,
+                                         aTransferFunction)) {
+      ValidationResult err = Err(ValidationError::InvalidVideoType);
+      LOG(
+          ("[CheckMIMETypeSupport #3 (color coding space does not match, {}), "
+           "#2, #3] Rejecting '{}'\n",
+           EnumValueToString(err.unwrapErr()), aMime.OriginalString().get()));
+      return err;
+    }
+  }
+
+  return Ok();
+}
+
+static ValidationResult CheckMIMETypeValidity(
+    const MediaExtendedMIMEType& aMime, const AVType& aAVType,
+    const MediaType& aMediaType) {
+  const MediaMIMEType& mimetype = aMime.Type();
+  if (!mimetype.HasAudioMajorType() && !mimetype.HasVideoMajorType() &&
+      !mimetype.HasApplicationMajorType()) {
+    ValidationResult err =
+        Err(aAVType == AVType::AUDIO ? ValidationError::InvalidAudioType
+                                     : ValidationError::InvalidVideoType);
+    LOG(
+        ("[Invalid MIME Validity #1, {}] Rejecting - not media, not "
+         "application {}",
+         EnumValueToString(err.unwrapErr()), aMime.OriginalString().get()));
+    return err;
+  }
+
+
+  if (aAVType == AVType::AUDIO && !aMime.Type().HasAudioMajorType()) {
+    ValidationResult err = Err(ValidationError::InvalidAudioType);
+    LOG(("[Invalid MIME Validity #1a?, {}] Rejecting '{}'",
+         EnumValueToString(err.unwrapErr()), aMime.OriginalString().get()));
+    return err;
+  }
+
+  if (aAVType == AVType::VIDEO && !aMime.Type().HasVideoMajorType()) {
+    ValidationResult err = Err(ValidationError::InvalidVideoType);
+    LOG(("[Invalid MIME Validity #1b?, {}] Rejecting '{}'",
+         EnumValueToString(err.unwrapErr()), aMime.OriginalString().get()));
+    return err;
+  }
+
+  const size_t numParams = aMime.GetParameterCount();
+  if (IsSingleCodecType(aMime) && numParams != 0 &&
+      !IsMediaTypeWebRTC(aMediaType)) {
+    ValidationResult err = Err(ValidationError::SingleCodecHasParams);
+    LOG(
+        ("[Invalid MIME Validity #2, {}] Rejecting '{}' (single codec type "
+         "has params)",
+         EnumValueToString(err.unwrapErr()), aMime.OriginalString().get()));
+    return err;
+  }
+
+  if (IsContainerType(aMime)) {
+    if ((numParams != 1) || !aMime.HaveCodecs()) {
+      ValidationResult err = Err(ValidationError::ContainerMissingCodecsParam);
+      LOG(("[Invalid MIME Validity #3.1, {}] Rejecting '{}'",
+           EnumValueToString(err.unwrapErr()), aMime.OriginalString().get()));
+      return err;
+    }
+
+    const auto& codecs = aMime.Codecs();
+    if (!aMime.HaveCodecs() || codecs.IsEmpty() ||
+        codecs.AsString().FindChar(',') != kNotFound) {
+      ValidationResult err = Err(ValidationError::ContainerCodecsNotSingle);
+      LOG(("[Invalid MIME #3.2, {}] Rejecting '{}'",
+           EnumValueToString(err.unwrapErr()), aMime.OriginalString().get()));
+      return err;
+    }
+  }
+
+  return Ok();
+}
+
+ValidationResult IsValidAudioConfiguration(const AudioConfiguration& aConfig,
+                                           const MediaType& aType) {
+  const Maybe<MediaExtendedMIMEType> mime =
+      MakeMediaExtendedMIMEType(aConfig.mContentType);
+
+  if (!mime) {
+    ValidationResult err = Err(ValidationError::InvalidAudioType);
+    LOG(("[Invalid AudioConfiguration #2, {}] Rejecting '{}'\n",
+         EnumValueToString(err.unwrapErr()),
+         NS_ConvertUTF16toUTF8(aConfig.mContentType).get()));
+    return err;
+  }
+
+  return CheckMIMETypeValidity(mime.ref(), AVType::AUDIO, aType);
+}
+
+template <typename CodingType>
+ValidationResult IsValidVideoConfiguration(const VideoConfiguration& aConfig,
+                                           const CodingType& aType,
+                                           const BehaviorConfig& aBehavior) {
+  static_assert(std::is_same_v<std::decay_t<CodingType>, MediaEncodingType> ||
+                    std::is_same_v<CodingType, MediaDecodingType>,
+                "tType must be MediaEncodingType or MediaDecodingType");
+
+  if (!isfinite(aConfig.mFramerate) || !(aConfig.mFramerate > 0)) {
+    ValidationResult err = Err(ValidationError::FramerateInvalid);
+    LOG(("[Invalid VideoConfiguration (Framerate, {}) #1] Rejecting '{}'\n",
+         EnumValueToString(err.unwrapErr()),
+         NS_ConvertUTF16toUTF8(aConfig.mContentType).get()));
+    return err;
+  }
+
+  if (aConfig.mWidth <= 0 || aConfig.mHeight <= 0) {
+    ValidationResult err = Err(ValidationError::InvalidVideoConfiguration);
+    LOG(
+        ("[Invalid VideoConfiguration (Dimensions, {}) #1] Rejecting '{}' "
+         "(width={}, height={})\n",
+         EnumValueToString(err.unwrapErr()),
+         NS_ConvertUTF16toUTF8(aConfig.mContentType).get(), aConfig.mWidth,
+         aConfig.mHeight));
+    return err;
+  }
+
+  if constexpr (std::is_same_v<CodingType, MediaDecodingType>) {
+    if (aConfig.mHdrMetadataType.WasPassed() &&
+        aType != MediaDecodingType::File &&
+        aType != MediaDecodingType::Media_source) {
+      ValidationResult err = Err(ValidationError::InapplicableMember);
+      LOG(("[Invalid VideoConfiguration (HDR, {}) #2] Rejecting '{}'\n",
+           EnumValueToString(err.unwrapErr()),
+           NS_ConvertUTF16toUTF8(aConfig.mContentType).get()));
+      return err;
+    }
+    if (aConfig.mColorGamut.WasPassed() && aType != MediaDecodingType::File &&
+        aType != MediaDecodingType::Media_source) {
+      ValidationResult err = Err(ValidationError::InapplicableMember);
+      LOG(("[Invalid VideoConfiguration (Color Gamut, {}) #2] Rejecting '{}'\n",
+           EnumValueToString(err.unwrapErr()),
+           NS_ConvertUTF16toUTF8(aConfig.mContentType).get()));
+      return err;
+    }
+
+    if (aConfig.mTransferFunction.WasPassed() &&
+        aType != MediaDecodingType::File &&
+        aType != MediaDecodingType::Media_source) {
+      ValidationResult err = Err(ValidationError::InapplicableMember);
+      LOG(
+          ("[Invalid VideoConfiguration (Transfer Function, {}) #2] Rejecting "
+           "'{}'\n",
+           EnumValueToString(err.unwrapErr()),
+           NS_ConvertUTF16toUTF8(aConfig.mContentType).get()));
+      return err;
+    }
+  }
+
+  if constexpr (std::is_same_v<CodingType, MediaEncodingType>) {
+    if (aConfig.mScalabilityMode.WasPassed() &&
+        (aType == MediaEncodingType::Webrtc || !aBehavior.mLegacy)) {
+      ValidationResult err = Err(ValidationError::InapplicableMember);
+      LOG(
+          ("[Invalid VideoConfiguration (Scalability Mode, {}) #2] Rejecting "
+           "'{}'\n",
+           EnumValueToString(err.unwrapErr()),
+           NS_ConvertUTF16toUTF8(aConfig.mContentType).get()));
+      return err;
+    }
+    if (aConfig.mColorGamut.WasPassed() && !aBehavior.mLegacy) {
+      ValidationResult err = Err(ValidationError::InapplicableMember);
+      LOG(("[Invalid VideoConfiguration (Color Gamut, {}) #2] Rejecting '{}'\n",
+           EnumValueToString(err.unwrapErr()),
+           NS_ConvertUTF16toUTF8(aConfig.mContentType).get()));
+      return err;
+    }
+    if (aConfig.mTransferFunction.WasPassed() && !aBehavior.mLegacy) {
+      ValidationResult err = Err(ValidationError::InapplicableMember);
+      LOG(
+          ("[Invalid VideoConfiguration (Transfer Function, {}) #2] Rejecting "
+           "'{}'\n",
+           EnumValueToString(err.unwrapErr()),
+           NS_ConvertUTF16toUTF8(aConfig.mContentType).get()));
+      return err;
+    }
+  }
+
+  const Maybe<MediaExtendedMIMEType> mime =
+      MakeMediaExtendedMIMEType(aConfig.mContentType);
+
+  if (!mime) {
+    ValidationResult err = Err(ValidationError::InvalidVideoType);
+    LOG(("[Invalid VideoConfiguration (MIME failure, {}) #4] Rejecting '{}'\n",
+         EnumValueToString(err.unwrapErr()),
+         NS_ConvertUTF16toUTF8(aConfig.mContentType).get()));
+    return err;
+  }
+
+  return CheckMIMETypeValidity(mime.ref(), AVType::VIDEO, AsVariant(aType));
+}
+
+template ValidationResult IsValidVideoConfiguration<MediaEncodingType>(
+    const VideoConfiguration&, const MediaEncodingType&, const BehaviorConfig&);
+template ValidationResult IsValidVideoConfiguration<MediaDecodingType>(
+    const VideoConfiguration&, const MediaDecodingType&, const BehaviorConfig&);
+
+ValidationResult IsValidVideoConfiguration(const VideoConfiguration& aConfig,
+                                           const MediaType& aType,
+                                           const BehaviorConfig& aBehavior) {
+  return aType.match(
+      [&](const MediaEncodingType& t) {
+        return IsValidVideoConfiguration(aConfig, t, aBehavior);
+      },
+      [&](const MediaDecodingType& t) {
+        return IsValidVideoConfiguration(aConfig, t, aBehavior);
+      });
+}
+
+ValidationResult IsValidMediaConfiguration(const MediaConfiguration& aConfig,
+                                           const MediaType& aType,
+                                           const BehaviorConfig& aBehavior) {
+  if (!aConfig.mVideo.WasPassed() && !aConfig.mAudio.WasPassed()) {
+    ValidationResult err = Err(ValidationError::MissingType);
+    LOG(("[Invalid Media Configuration (No A/V, {}) #1] '{}'",
+         EnumValueToString(err.unwrapErr()),
+         GetMIMEDebugString(aConfig).get()));
+    return err;
+  }
+
+  if (aConfig.mAudio.WasPassed()) {
+    auto rv = IsValidAudioConfiguration(aConfig.mAudio.Value(), aType);
+    if (rv.isErr()) {
+      LOG(("[Invalid Media Configuration (Invalid Audio, {}) #2] '{}'",
+           EnumValueToString(rv.unwrapErr()),
+           GetMIMEDebugString(aConfig).get()));
+      return rv;
+    }
+  }
+
+  if (aConfig.mVideo.WasPassed()) {
+    auto rv =
+        IsValidVideoConfiguration(aConfig.mVideo.Value(), aType, aBehavior);
+    if (rv.isErr()) {
+      LOG(("[Invalid Media Configuration (Invalid Video, {}) #3] '{}'",
+           EnumValueToString(rv.unwrapErr()),
+           GetMIMEDebugString(aConfig).get()));
+      return rv;
+    }
+  }
+  return Ok();
+}
+
+ValidationResult IsValidMediaEncodingConfiguration(
+    const MediaEncodingConfiguration& aConfig,
+    const BehaviorConfig& aBehavior) {
+  return IsValidMediaConfiguration(aConfig, AsVariant(aConfig.mType),
+                                   aBehavior);
+}
+
+ValidationResult IsValidMediaDecodingConfiguration(
+    const MediaDecodingConfiguration& aConfig,
+    const BehaviorConfig& aBehavior) {
+
+  auto base =
+      IsValidMediaConfiguration(aConfig, AsVariant(aConfig.mType), aBehavior);
+  if (base.isErr()) {
+    LOG(
+        ("[Invalid MediaDecodingConfiguration (Invalid MediaConfiguration, {}) "
+         "#1]",
+         EnumValueToString(base.unwrapErr())));
+    return base;
+  }
+  if (aConfig.mKeySystemConfiguration.WasPassed()) {
+    const auto& keySystemConfig = aConfig.mKeySystemConfiguration.Value();
+
+    if (aConfig.mType != MediaDecodingType::File &&
+        aConfig.mType != MediaDecodingType::Media_source) {
+      ValidationResult err = Err(ValidationError::KeySystemWrongType);
+      LOG(("[Invalid MediaDecodingConfiguration (keysystem, {}) #2.1]",
+           EnumValueToString(err.unwrapErr())));
+      return err;
+    }
+
+    if (keySystemConfig.mAudio.WasPassed() && !aConfig.mAudio.WasPassed()) {
+      ValidationResult err = Err(ValidationError::KeySystemAudioMissing);
+      LOG(("[Invalid MediaDecodingConfiguration (keysystem, {}) #2.2]",
+           EnumValueToString(err.unwrapErr())));
+      return err;
+    }
+
+    if (keySystemConfig.mVideo.WasPassed() && !aConfig.mVideo.WasPassed()) {
+      ValidationResult err = Err(ValidationError::KeySystemVideoMissing);
+      LOG(("[Invalid MediaDecodingConfiguration (keysystem, {}) #2.3]",
+           EnumValueToString(err.unwrapErr())));
+      return err;
+    }
+  }
+  return Ok();
+}
+
+static bool ValidateMatchingCodecColorSpace(
+    const MediaExtendedMIMEType& aMime, const Maybe<dom::ColorGamut>& aGamut,
+    const Maybe<dom::TransferFunction>& aTransfer) {
+  if (!aGamut && !aTransfer) {
+    return true;
+  }
+
+  for (const auto& codec : aMime.Codecs().Range()) {
+    if (codec.IsEmpty()) {
+      continue;
+    }
+    VideoInfo vi;
+    bool parsed = false;
+    // fall through to the permissive default at the end of this function.
+#ifdef MOZ_AV1
+    if (!parsed && AOMDecoder::SetVideoInfo(&vi, codec)) {
+      parsed = true;
+    }
+#endif
+    if (!parsed && VPXDecoder::SetVideoInfo(&vi, codec)) {
+      parsed = true;
+    }
+    if (!parsed) {
+      continue;
+    }
+    Maybe<dom::ColorGamut> gotGamut;
+    if (vi.mColorPrimaries) {
+      switch (*vi.mColorPrimaries) {
+        case gfx::ColorSpace2::SRGB:
+        case gfx::ColorSpace2::BT709:
+        case gfx::ColorSpace2::BT601_525:
+          gotGamut = Some(dom::ColorGamut::Srgb);
+          break;
+        case gfx::ColorSpace2::DISPLAY_P3:
+          gotGamut = Some(dom::ColorGamut::P3);
+          break;
+        case gfx::ColorSpace2::BT2020:
+          gotGamut = Some(dom::ColorGamut::Rec2020);
+          break;
+        default:
+          break;
+      }
+    }
+    if (!gotGamut && vi.mColorSpace) {
+      switch (*vi.mColorSpace) {
+        case gfx::YUVColorSpace::BT2020:
+          gotGamut = Some(dom::ColorGamut::Rec2020);
+          break;
+        default:
+          break;
+      }
+    }
+    Maybe<dom::TransferFunction> gotTF;
+    if (vi.mTransferFunction) {
+      switch (*vi.mTransferFunction) {
+        case gfx::TransferFunction::SRGB:
+        case gfx::TransferFunction::BT709:
+          gotTF = Some(dom::TransferFunction::Srgb);
+          break;
+        case gfx::TransferFunction::PQ:
+          gotTF = Some(dom::TransferFunction::Pq);
+          break;
+        case gfx::TransferFunction::HLG:
+          gotTF = Some(dom::TransferFunction::Hlg);
+          break;
+        default:
+          break;
+      }
+    }
+    const bool gamutOK = !aGamut || (gotGamut && *aGamut == *gotGamut);
+    const bool transferOK = !aTransfer || (gotTF && *aTransfer == *gotTF);
+    return gamutOK && transferOK;
+  }
+
+  return true;
+}
+
+
+void RejectWithValidationResult(Promise* aPromise, const ValidationError aErr) {
+  switch (aErr) {
+    case ValidationError::MissingType:
+      aPromise->MaybeRejectWithTypeError(
+          "'audio' or 'video' member of argument of MediaCapabilities");
+      return;
+    case ValidationError::InvalidAudioConfiguration:
+      aPromise->MaybeRejectWithTypeError("Invalid AudioConfiguration!");
+      return;
+    case ValidationError::InvalidAudioType:
+      aPromise->MaybeRejectWithTypeError(
+          "Invalid AudioConfiguration MIME type");
+      return;
+    case ValidationError::InvalidVideoConfiguration:
+      aPromise->MaybeRejectWithTypeError("Invalid VideoConfiguration!");
+      return;
+    case ValidationError::InvalidVideoType:
+      aPromise->MaybeRejectWithTypeError("Invalid Video MIME type");
+      return;
+    case ValidationError::SingleCodecHasParams:
+      aPromise->MaybeRejectWithTypeError("Single codec has parameters");
+      return;
+    case ValidationError::ContainerMissingCodecsParam:
+      aPromise->MaybeRejectWithTypeError("Container missing codec parameters");
+      return;
+    case ValidationError::ContainerCodecsNotSingle:
+      aPromise->MaybeRejectWithTypeError("Container has more than one codec");
+      return;
+    case ValidationError::FramerateInvalid:
+      aPromise->MaybeRejectWithTypeError("Invalid frame rate");
+      return;
+    case ValidationError::InapplicableMember:
+      aPromise->MaybeRejectWithTypeError("Inapplicable member");
+      return;
+    case ValidationError::KeySystemWrongType:
+    case ValidationError::KeySystemAudioMissing:
+    case ValidationError::KeySystemVideoMissing:
+      aPromise->MaybeRejectWithTypeError("Invalid keysystem configuration");
+      return;
+    default:
+      MOZ_ASSERT_UNREACHABLE("Unhandled MediaCapabilities validation error!");
+      return;
+  }
+}
+
+void ThrowWithValidationResult(ErrorResult& aRv, const ValidationError aErr) {
+  switch (aErr) {
+    case ValidationError::MissingType:
+      aRv.ThrowTypeError<MSG_MISSING_REQUIRED_DICTIONARY_MEMBER>(
+          "'audio' or 'video' member of argument of MediaCapabilities");
+      return;
+    case ValidationError::InvalidAudioConfiguration:
+      aRv.ThrowTypeError<MSG_INVALID_MEDIA_AUDIO_CONFIGURATION>();
+      return;
+    case ValidationError::InvalidAudioType:
+    case ValidationError::KeySystemAudioMissing:
+      aRv.ThrowTypeError<MSG_INVALID_MEDIA_AUDIO_CONFIGURATION>();
+      return;
+    case ValidationError::InvalidVideoConfiguration:
+    case ValidationError::InvalidVideoType:
+    case ValidationError::SingleCodecHasParams:
+    case ValidationError::ContainerMissingCodecsParam:
+    case ValidationError::ContainerCodecsNotSingle:
+    case ValidationError::FramerateInvalid:
+    case ValidationError::InapplicableMember:
+      aRv.ThrowTypeError<MSG_INVALID_MEDIA_VIDEO_CONFIGURATION>();
+      return;
+    case ValidationError::KeySystemWrongType:
+    case ValidationError::KeySystemVideoMissing:
+      aRv.ThrowTypeError<MSG_INVALID_MEDIA_VIDEO_CONFIGURATION>();
+      return;
+    default:
+      MOZ_ASSERT_UNREACHABLE("Unhandled MediaCapabilities validation error!");
+      return;
+  }
+}
+
+template <size_t N>
+static bool MimePrefixStartsWith(
+    const MediaExtendedMIMEType& aMime,
+    const std::array<nsLiteralCString, N>& aPrefixes) {
+  const nsACString& s = aMime.OriginalString();
+  return std::any_of(aPrefixes.begin(), aPrefixes.end(), [&](const auto& p) {
+    return StringBeginsWith(s, p, nsCaseInsensitiveCStringComparator);
+  });
+}
+static bool IsContainerType(const MediaExtendedMIMEType& aMime) {
+  return MimePrefixStartsWith(aMime, kContainerTypes);
+}
+static bool IsSingleCodecType(const MediaExtendedMIMEType& aMime) {
+  return MimePrefixStartsWith(aMime, kSingleWebRTCCodecTypes);
+}
+
+bool IsMediaTypeWebRTC(const MediaType& aType) {
+  return aType.match(
+      [&](const MediaEncodingType& aType) {
+        return aType == MediaEncodingType::Webrtc;
+      },
+      [&](const MediaDecodingType& aType) {
+        return aType == MediaDecodingType::Webrtc;
+      });
+}
+
+static nsAutoCString GetMIMEDebugString(const MediaConfiguration& aConfig) {
+  nsAutoCString result;
+  result.SetCapacity(64);
+  result.AssignLiteral("Audio MIME: ");
+  if (aConfig.mAudio.WasPassed()) {
+    result.Append(NS_ConvertUTF16toUTF8(aConfig.mAudio.Value().mContentType));
+  } else {
+    result.AppendLiteral("(none)");
+  }
+  result.AppendLiteral(" Video MIME: ");
+  if (aConfig.mVideo.WasPassed()) {
+    result.Append(NS_ConvertUTF16toUTF8(aConfig.mVideo.Value().mContentType));
+  } else {
+    result.AppendLiteral("(none)");
+  }
+  return result;
+}
+
+}  
+#undef LOG

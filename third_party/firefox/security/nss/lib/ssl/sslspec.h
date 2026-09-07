@@ -1,0 +1,167 @@
+/*
+ * This file is PRIVATE to SSL.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef __sslspec_h_
+#define __sslspec_h_
+
+#include "sslexp.h"
+#include "prclist.h"
+
+typedef enum {
+    TrafficKeyClearText = 0,
+    TrafficKeyEarlyApplicationData = 1,
+    TrafficKeyHandshake = 2,
+    TrafficKeyApplicationData = 3
+} TrafficKeyType;
+
+#define SPEC_DIR(spec) \
+    ((spec->direction == ssl_secret_read) ? "read" : "write")
+
+typedef struct ssl3CipherSpecStr ssl3CipherSpec;
+typedef struct ssl3BulkCipherDefStr ssl3BulkCipherDef;
+typedef struct ssl3MACDefStr ssl3MACDef;
+typedef struct ssl3CipherSuiteDefStr ssl3CipherSuiteDef;
+typedef PRUint64 sslSequenceNumber;
+typedef PRUint16 DTLSEpoch;
+
+typedef enum {
+    cipher_null,
+    cipher_rc4,
+    cipher_des,
+    cipher_3des,
+    cipher_aes_128,
+    cipher_aes_256,
+    cipher_camellia_128,
+    cipher_camellia_256,
+    cipher_seed,
+    cipher_aes_128_gcm,
+    cipher_aes_256_gcm,
+    cipher_chacha20,
+    cipher_missing 
+} SSL3BulkCipher;
+
+typedef enum {
+    type_stream,
+    type_block,
+    type_aead
+} CipherType;
+
+struct ssl3BulkCipherDefStr {
+    SSL3BulkCipher cipher;
+    SSLCipherAlgorithm calg;
+    unsigned int key_size;
+    unsigned int secret_key_size;
+    CipherType type;
+    unsigned int iv_size;
+    unsigned int block_size;
+    unsigned int tag_size;            
+    unsigned int explicit_nonce_size; 
+    SECOidTag oid;
+    const char *short_name;
+    PRUint64 max_records;
+};
+
+typedef SSLMACAlgorithm SSL3MACAlgorithm;
+
+struct ssl3MACDefStr {
+    SSL3MACAlgorithm mac;
+    CK_MECHANISM_TYPE mmech;
+    int pad_size;
+    int mac_size;
+    SECOidTag oid;
+};
+
+#define MAX_IV_LENGTH 24
+
+typedef struct {
+    PK11SymKey *key;
+    PK11SymKey *macKey;
+    PK11Context *macContext;
+    PRUint8 iv[MAX_IV_LENGTH];
+} ssl3KeyMaterial;
+
+typedef SECStatus (*SSLCipher)(void *context,
+                               unsigned char *out,
+                               unsigned int *outlen,
+                               unsigned int maxout,
+                               const unsigned char *in,
+                               unsigned int inlen);
+typedef SECStatus (*SSLAEADCipher)(PK11Context *context,
+                                   CK_GENERATOR_FUNCTION ivGen,
+                                   unsigned int fixedbits,
+                                   unsigned char *iv, unsigned int ivlen,
+                                   const unsigned char *aad,
+                                   unsigned int aadlen,
+                                   unsigned char *out, unsigned int *outlen,
+                                   unsigned int maxout, unsigned char *tag,
+                                   unsigned int taglen,
+                                   const unsigned char *in, unsigned int inlen);
+
+#define DTLS_RECVD_RECORDS_WINDOW 1024
+#define RECORD_SEQ_MASK ((1ULL << 48) - 1)
+#define RECORD_SEQ_MAX RECORD_SEQ_MASK
+PR_STATIC_ASSERT(DTLS_RECVD_RECORDS_WINDOW % 8 == 0);
+
+typedef struct DTLSRecvdRecordsStr {
+    unsigned char data[DTLS_RECVD_RECORDS_WINDOW / 8];
+    sslSequenceNumber left;
+    sslSequenceNumber right;
+} DTLSRecvdRecords;
+
+struct ssl3CipherSpecStr {
+    PRCList link;
+    PRUint8 refCt;
+
+    SSLSecretDirection direction;
+    SSL3ProtocolVersion version;
+    SSL3ProtocolVersion recordVersion;
+
+    const ssl3BulkCipherDef *cipherDef;
+    const ssl3MACDef *macDef;
+
+    SSLCipher cipher;
+    void *cipherContext;
+
+    PK11SymKey *masterSecret;
+    ssl3KeyMaterial keyMaterial;
+
+    DTLSEpoch epoch;
+    const char *phase;
+
+    sslSequenceNumber nextSeqNum;
+    DTLSRecvdRecords recvdRecords;
+
+    PRUint32 earlyDataRemaining;
+    PRUint16 recordSizeLimit;
+
+    SSLMaskingContext *maskContext;
+
+    PRUint64 deprotectionFailures;
+};
+
+typedef void (*sslCipherSpecChangedFunc)(void *arg,
+                                         PRBool sending,
+                                         ssl3CipherSpec *newSpec);
+
+const ssl3BulkCipherDef *ssl_GetBulkCipherDef(const ssl3CipherSuiteDef *cipher_def);
+const ssl3MACDef *ssl_GetMacDefByAlg(SSL3MACAlgorithm mac);
+const ssl3MACDef *ssl_GetMacDef(const sslSocket *ss, const ssl3CipherSuiteDef *suiteDef);
+
+ssl3CipherSpec *ssl_CreateCipherSpec(sslSocket *ss, SSLSecretDirection direction);
+void ssl_SaveCipherSpec(sslSocket *ss, ssl3CipherSpec *spec);
+void ssl_CipherSpecAddRef(ssl3CipherSpec *spec);
+void ssl_CipherSpecRelease(ssl3CipherSpec *spec);
+void ssl_DestroyCipherSpecs(PRCList *list);
+SECStatus ssl_SetupNullCipherSpec(sslSocket *ss, SSLSecretDirection dir);
+
+ssl3CipherSpec *ssl_FindCipherSpecByEpoch(sslSocket *ss,
+                                          SSLSecretDirection direction,
+                                          DTLSEpoch epoch);
+void ssl_CipherSpecReleaseByEpoch(sslSocket *ss, SSLSecretDirection direction,
+                                  DTLSEpoch epoch);
+
+#endif /* __sslspec_h_ */

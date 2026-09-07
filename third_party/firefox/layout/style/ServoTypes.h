@@ -1,0 +1,106 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_ServoTypes_h
+#define mozilla_ServoTypes_h
+
+#include "NonCustomCSSPropertyId.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/TypedEnumBits.h"
+#include "nsCoord.h"
+
+namespace mozilla {
+struct StyleLockedFontFaceRule;
+enum class StyleOrigin : uint8_t;
+struct LangGroupFontPrefs;
+}  
+
+struct nsFontFaceRuleContainer {
+  RefPtr<mozilla::StyleLockedFontFaceRule> mRule;
+  mozilla::StyleOrigin mOrigin;
+};
+
+namespace mozilla {
+
+enum class LazyComputeBehavior {
+  Allow,
+  Assert,
+};
+
+enum class ServoTraversalFlags : uint32_t {
+  Empty = 0,
+  AnimationOnly = 1 << 0,
+  ForCSSRuleChanges = 1 << 1,
+  FinalAnimationTraversal = 1 << 2,
+  ParallelTraversal = 1 << 7,
+  FlushThrottledAnimations = 1 << 8,
+};
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(ServoTraversalFlags)
+
+enum class StyleRuleInclusion {
+  All,
+  DefaultOnly,
+};
+
+enum class UpdateAnimationsTasks : uint8_t {
+  CSSAnimations = 1 << 0,
+  CSSTransitions = 1 << 1,
+  EffectProperties = 1 << 2,
+  CascadeResults = 1 << 3,
+  DisplayChangedFromNone = 1 << 4,
+  ScrollTimelines = 1 << 5,
+  ViewTimelines = 1 << 6,
+  TimelineScopes = 1 << 7,
+};
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(UpdateAnimationsTasks)
+
+enum class InheritTarget {
+  Text,
+  FirstLetterContinuation,
+  PlaceholderFrame,
+};
+
+enum class PointerCapabilities : uint8_t {
+  None = 0,
+  Coarse = 1 << 0,
+  Fine = 1 << 1,
+  Hover = 1 << 2,
+};
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(PointerCapabilities)
+
+class ServoStyleSetSizes {
+ public:
+  size_t mRuleTree;               
+  size_t mPrecomputedPseudos;     
+  size_t mElementAndPseudosMaps;  
+  size_t mInvalidationMap;        
+  size_t mRevalidationSelectors;  
+  size_t mOther;                  
+
+  ServoStyleSetSizes()
+      : mRuleTree(0),
+        mPrecomputedPseudos(0),
+        mElementAndPseudosMaps(0),
+        mInvalidationMap(0),
+        mRevalidationSelectors(0),
+        mOther(0) {}
+};
+
+struct DeclarationBlockMutationClosure {
+  void (*function)(void*, NonCustomCSSPropertyId) = nullptr;
+  void* data = nullptr;
+};
+
+struct MediumFeaturesChangedResult {
+  bool mAffectsDocumentRules;
+  bool mAffectsNonDocumentRules;
+};
+
+}  
+
+#endif  // mozilla_ServoTypes_h

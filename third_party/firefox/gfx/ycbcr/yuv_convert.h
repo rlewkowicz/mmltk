@@ -1,0 +1,128 @@
+// Copyright (c) 2010 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+// clang-format off
+
+#if !defined(MEDIA_BASE_YUV_CONVERT_H_)
+#define MEDIA_BASE_YUV_CONVERT_H_
+
+#include "ErrorList.h"
+#include "chromium_types.h"
+#include "mozilla/gfx/Types.h"
+
+namespace mozilla {
+
+namespace gfx {
+
+enum YUVType {
+  YV12 = 0,           
+  YV16 = 1,           
+  YV24 = 2,           
+  Y8 = 3              
+};
+
+enum Rotate {
+  ROTATE_0,           
+  ROTATE_90,          
+  ROTATE_180,         
+  ROTATE_270,         
+  MIRROR_ROTATE_0,    
+  MIRROR_ROTATE_90,   
+  MIRROR_ROTATE_180,  
+  MIRROR_ROTATE_270   
+};
+
+enum ScaleFilter {
+  FILTER_NONE = 0,        
+  FILTER_BILINEAR_H = 1,  
+  FILTER_BILINEAR_V = 2,  
+  FILTER_BILINEAR = 3     
+};
+
+nsresult ToNSResult(int aLibyuvResult);
+
+enum RGB32Type {
+  ARGB = 0,
+  ABGR = 1
+};
+nsresult
+ConvertYCbCrToRGB32(const uint8_t* yplane,
+                    const uint8_t* uplane,
+                    const uint8_t* vplane,
+                    uint8_t* rgbframe,
+                    int pic_x,
+                    int pic_y,
+                    int pic_width,
+                    int pic_height,
+                    int ystride,
+                    int uvstride,
+                    int rgbstride,
+                    YUVType yuv_type,
+                    YUVColorSpace yuv_color_space,
+                    ColorRange color_range,
+                    RGB32Type rgb32_type);
+
+nsresult
+ConvertYCbCrToRGB32_deprecated(const uint8_t* yplane,
+                               const uint8_t* uplane,
+                               const uint8_t* vplane,
+                               uint8_t* rgbframe,
+                               int pic_x,
+                               int pic_y,
+                               int pic_width,
+                               int pic_height,
+                               int ystride,
+                               int uvstride,
+                               int rgbstride,
+                               YUVType yuv_type,
+                              RGB32Type rgb32_type);
+
+nsresult
+ScaleYCbCrToRGB32(const uint8_t* yplane,
+                  const uint8_t* uplane,
+                  const uint8_t* vplane,
+                  uint8_t* rgbframe,
+                  int source_width,
+                  int source_height,
+                  int width,
+                  int height,
+                  int ystride,
+                  int uvstride,
+                  int rgbstride,
+                  YUVType yuv_type,
+                  YUVColorSpace yuv_color_space,
+                  ScaleFilter filter);
+
+nsresult
+ScaleYCbCrToRGB32_deprecated(const uint8_t* yplane,
+                             const uint8_t* uplane,
+                             const uint8_t* vplane,
+                             uint8_t* rgbframe,
+                             int source_width,
+                             int source_height,
+                             int width,
+                             int height,
+                             int ystride,
+                             int uvstride,
+                             int rgbstride,
+                             YUVType yuv_type,
+                             Rotate view_rotate,
+                             ScaleFilter filter);
+
+nsresult
+ConvertI420AlphaToARGB32(const uint8_t* yplane,
+                         const uint8_t* uplane,
+                         const uint8_t* vplane,
+                         const uint8_t* aplane,
+                         uint8_t* argbframe,
+                         int pic_width,
+                         int pic_height,
+                         int yastride,
+                         int uvstride,
+                         int argbstride);
+
+} 
+} 
+
+#endif

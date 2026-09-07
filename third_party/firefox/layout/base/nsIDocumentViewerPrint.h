@@ -1,0 +1,48 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsIDocumentViewerPrint_h_
+#define nsIDocumentViewerPrint_h_
+
+#include "nsISupports.h"
+
+namespace mozilla {
+class PresShell;
+class ServoStyleSet;
+}  
+class nsPresContext;
+class nsViewManager;
+
+#define NS_IDOCUMENT_VIEWER_PRINT_IID \
+  {0xc6f255cf, 0xcadd, 0x4382, {0xb5, 0x7f, 0xcd, 0x2a, 0x98, 0x74, 0x16, 0x9b}}
+
+class nsIDocumentViewerPrint : public nsISupports {
+ public:
+  NS_INLINE_DECL_STATIC_IID(NS_IDOCUMENT_VIEWER_PRINT_IID)
+
+  virtual bool GetIsPrinting() const = 0;
+
+  virtual void SetIsPrintPreview(bool aIsPrintPreview) = 0;
+  virtual bool GetIsPrintPreview() const = 0;
+
+  virtual void IncrementDestroyBlockedCount() = 0;
+  virtual void DecrementDestroyBlockedCount() = 0;
+
+  virtual void OnDonePrinting() = 0;
+
+  virtual void SetPrintPreviewPresentation(nsPresContext* aPresContext,
+                                           mozilla::PresShell* aPresShell) = 0;
+};
+
+#define NS_DECL_NSIDOCUMENTVIEWERPRINT                          \
+  bool GetIsPrinting() const override;                          \
+  void SetIsPrintPreview(bool aIsPrintPreview) override;        \
+  bool GetIsPrintPreview() const override;                      \
+  void IncrementDestroyBlockedCount() override;                 \
+  void DecrementDestroyBlockedCount() override;                 \
+  void OnDonePrinting() override;                               \
+  void SetPrintPreviewPresentation(nsPresContext* aPresContext, \
+                                   mozilla::PresShell* aPresShell) override;
+
+#endif /* nsIDocumentViewerPrint_h_ */

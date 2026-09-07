@@ -1,0 +1,129 @@
+// Copyright 2022 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef ABSL_LOG_LOG_STREAMER_H_
+#define ABSL_LOG_LOG_STREAMER_H_
+
+#include <ios>
+#include <memory>
+#include <optional>
+#include <ostream>
+#include <string>
+#include <utility>
+
+#include "absl/base/config.h"
+#include "absl/base/log_severity.h"
+#include "absl/log/absl_log.h"
+#include "absl/strings/internal/ostringstream.h"
+#include "absl/strings/string_view.h"
+#include "absl/types/optional.h"
+#include "absl/types/source_location.h"
+#include "absl/utility/utility.h"
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+
+class LogStreamer final {
+ public:
+  explicit LogStreamer(absl::LogSeverity severity, absl::string_view file,
+                       int line)
+      : severity_(severity),
+        line_(line),
+        file_(file),
+        stream_(std::in_place, &buf_) {
+    stream_->setf(std::ios_base::showbase | std::ios_base::boolalpha);
+  }
+  explicit LogStreamer(
+      absl::LogSeverity severity,
+      absl::SourceLocation loc = absl::SourceLocation::current())
+      : LogStreamer(severity, loc.file_name(), static_cast<int>(loc.line())) {}
+
+  LogStreamer(LogStreamer&& that) noexcept
+      : severity_(that.severity_),
+        line_(that.line_),
+        file_(std::move(that.file_)),
+        buf_(std::move(that.buf_)),
+        stream_(std::move(that.stream_)) {
+    if (stream_.has_value()) stream_->str(&buf_);
+    that.stream_.reset();
+  }
+  LogStreamer& operator=(LogStreamer&& that) {
+    ABSL_LOG_IF(LEVEL(severity_), stream_).AtLocation(file_, line_) << buf_;
+    severity_ = that.severity_;
+    file_ = std::move(that.file_);
+    line_ = that.line_;
+    buf_ = std::move(that.buf_);
+    stream_ = std::move(that.stream_);
+    if (stream_.has_value()) stream_->str(&buf_);
+    that.stream_.reset();
+    return *this;
+  }
+
+  ~LogStreamer() {
+    ABSL_LOG_IF(LEVEL(severity_), stream_.has_value()).AtLocation(file_, line_)
+        << buf_;
+  }
+
+  std::ostream& stream() { return *stream_; }
+
+ private:
+  absl::LogSeverity severity_;
+  int line_;
+  std::string file_;
+  std::string buf_;
+  std::optional<absl::strings_internal::OStringStream> stream_;
+};
+
+inline LogStreamer LogInfoStreamer(absl::string_view file, int line) {
+  return absl::LogStreamer(absl::LogSeverity::kInfo, file, line);
+}
+
+inline LogStreamer LogWarningStreamer(absl::string_view file, int line) {
+  return absl::LogStreamer(absl::LogSeverity::kWarning, file, line);
+}
+
+inline LogStreamer LogErrorStreamer(absl::string_view file, int line) {
+  return absl::LogStreamer(absl::LogSeverity::kError, file, line);
+}
+
+inline LogStreamer LogFatalStreamer(absl::string_view file, int line) {
+  return absl::LogStreamer(absl::LogSeverity::kFatal, file, line);
+}
+
+inline LogStreamer LogDebugFatalStreamer(absl::string_view file, int line) {
+  return absl::LogStreamer(absl::kLogDebugFatal, file, line);
+}
+
+inline LogStreamer LogInfoStreamer(
+    absl::SourceLocation loc = absl::SourceLocation::current()) {
+  return absl::LogStreamer(absl::LogSeverity::kInfo, loc);
+}
+inline LogStreamer LogWarningStreamer(
+    absl::SourceLocation loc = absl::SourceLocation::current()) {
+  return absl::LogStreamer(absl::LogSeverity::kWarning, loc);
+}
+inline LogStreamer LogErrorStreamer(
+    absl::SourceLocation loc = absl::SourceLocation::current()) {
+  return absl::LogStreamer(absl::LogSeverity::kError, loc);
+}
+inline LogStreamer LogFatalStreamer(
+    absl::SourceLocation loc = absl::SourceLocation::current()) {
+  return absl::LogStreamer(absl::LogSeverity::kFatal, loc);
+}
+inline LogStreamer LogDebugFatalStreamer(
+    absl::SourceLocation loc = absl::SourceLocation::current()) {
+  return absl::LogStreamer(absl::kLogDebugFatal, loc);
+}
+
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_LOG_LOG_STREAMER_H_

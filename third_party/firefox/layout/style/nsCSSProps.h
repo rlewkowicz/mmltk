@@ -1,0 +1,190 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsCSSProps_h_
+#define nsCSSProps_h_
+
+#include <ostream>
+
+#include "NonCustomCSSPropertyId.h"
+#include "mozilla/CSSEnabledState.h"
+#include "mozilla/CSSPropFlags.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/Preferences.h"
+#include "nsString.h"
+#include "nsStyleStructFwd.h"
+
+#define CSS_CUSTOM_NAME_PREFIX_LENGTH 2
+
+namespace mozilla {
+class ComputedStyle;
+namespace gfx {
+class gfxVarReceiver;
+}
+}  
+
+extern "C" {
+NonCustomCSSPropertyId Servo_ResolveLogicalProperty(
+    NonCustomCSSPropertyId, const mozilla::ComputedStyle*);
+NonCustomCSSPropertyId Servo_Property_LookupEnabledForAllContent(
+    const nsACString*);
+const uint8_t* Servo_Property_GetName(NonCustomCSSPropertyId,
+                                      uint32_t* aLength);
+}
+
+class nsCSSProps {
+ public:
+  using EnabledState = mozilla::CSSEnabledState;
+  using Flags = mozilla::CSSPropFlags;
+
+  static void Init();
+
+  static NonCustomCSSPropertyId LookupProperty(const nsACString& aProperty) {
+    return Servo_Property_LookupEnabledForAllContent(&aProperty);
+  }
+
+  static NonCustomCSSPropertyId LookupPropertyByIDLName(
+      const nsACString& aPropertyIDLName, EnabledState aEnabled);
+
+  static bool IsCustomPropertyName(const nsACString& aProperty);
+
+  static bool IsShorthand(NonCustomCSSPropertyId aProperty) {
+    if (aProperty == eCSSPropertyExtra_variable) {
+      return false;
+    }
+    MOZ_ASSERT(
+        aProperty != eCSSProperty_UNKNOWN && aProperty < eCSSProperty_COUNT,
+        "out of range");
+    return aProperty >= eCSSProperty_COUNT_no_shorthands;
+  }
+
+  static mozilla::Maybe<mozilla::FontFaceDescriptorId> LookupFontDesc(
+      const nsACString&);
+  static mozilla::Maybe<mozilla::CounterStyleDescriptorId>
+  LookupCounterStyleDesc(const nsACString&);
+
+  static nsDependentCSubstring GetStringValue(
+      NonCustomCSSPropertyId aProperty) {
+    uint32_t len;
+    const uint8_t* chars = Servo_Property_GetName(aProperty, &len);
+    return nsDependentCSubstring(reinterpret_cast<const char*>(chars), len);
+  }
+
+  static const nsCString& GetStringValue(mozilla::FontFaceDescriptorId);
+  static const nsCString& GetStringValue(mozilla::CounterStyleDescriptorId);
+
+  static Flags PropFlags(NonCustomCSSPropertyId);
+  static bool PropHasFlags(NonCustomCSSPropertyId aProperty, Flags aFlags) {
+    return (PropFlags(aProperty) & aFlags) == aFlags;
+  }
+
+  static NonCustomCSSPropertyId Physicalize(
+      NonCustomCSSPropertyId aProperty, const mozilla::ComputedStyle& aStyle) {
+    MOZ_ASSERT(!IsShorthand(aProperty));
+    if (PropHasFlags(aProperty, Flags::IsLogical)) {
+      return Servo_ResolveLogicalProperty(aProperty, &aStyle);
+    }
+    return aProperty;
+  }
+
+ private:
+  static const NonCustomCSSPropertyId* const
+      kSubpropertyTable[eCSSProperty_COUNT - eCSSProperty_COUNT_no_shorthands];
+
+ public:
+  static bool IsBackdropFilterAvailable(JSContext*, JSObject*) {
+    return IsEnabled(eCSSProperty_backdrop_filter, EnabledState::ForAllContent);
+  }
+
+  static void RecomputeEnabledState(const char* aPrefName,
+                                    void* aClosure = nullptr);
+
+  static mozilla::gfx::gfxVarReceiver& GfxVarReceiver();
+
+  static const NonCustomCSSPropertyId* SubpropertyEntryFor(
+      NonCustomCSSPropertyId aProperty) {
+    MOZ_ASSERT(eCSSProperty_COUNT_no_shorthands <= aProperty &&
+                   aProperty < eCSSProperty_COUNT,
+               "out of range");
+    return kSubpropertyTable[aProperty - eCSSProperty_COUNT_no_shorthands];
+  }
+
+ private:
+  static bool gPropertyEnabled[eCSSProperty_COUNT_with_aliases];
+  static const char* const kIDLNameTable[eCSSProperty_COUNT];
+  static const int32_t kIDLNameSortPositionTable[eCSSProperty_COUNT];
+
+ public:
+  static const char* PropertyIDLName(NonCustomCSSPropertyId aProperty) {
+    MOZ_ASSERT(
+        aProperty != eCSSProperty_UNKNOWN && aProperty < eCSSProperty_COUNT,
+        "out of range");
+    return kIDLNameTable[aProperty];
+  }
+
+  static int32_t PropertyIDLNameSortPosition(NonCustomCSSPropertyId aProperty) {
+    MOZ_ASSERT(
+        aProperty != eCSSProperty_UNKNOWN && aProperty < eCSSProperty_COUNT,
+        "out of range");
+    return kIDLNameSortPositionTable[aProperty];
+  }
+
+  static bool IsEnabled(NonCustomCSSPropertyId aProperty,
+                        EnabledState aEnabled) {
+    MOZ_ASSERT(aProperty != eCSSProperty_UNKNOWN &&
+                   aProperty < eCSSProperty_COUNT_with_aliases,
+               "out of range");
+    MOZ_ASSERT_IF(!XRE_IsParentProcess(),
+                  mozilla::Preferences::ArePrefsInitedInContentProcess());
+    if (gPropertyEnabled[aProperty]) {
+      return true;
+    }
+    if (aEnabled == EnabledState::IgnoreEnabledState) {
+      return true;
+    }
+    if ((aEnabled & EnabledState::InUASheets) &&
+        PropHasFlags(aProperty, Flags::EnabledInUASheets)) {
+      return true;
+    }
+    if ((aEnabled & EnabledState::InChrome) &&
+        PropHasFlags(aProperty, Flags::EnabledInChrome)) {
+      return true;
+    }
+    return false;
+  }
+
+  struct PropertyPref {
+    NonCustomCSSPropertyId mPropId;
+    const char* mPref;
+  };
+  static const PropertyPref kPropertyPrefTable[];
+
+  template <typename Id>
+  struct DescriptorTableEntry {
+    Id mId;
+    nsLiteralCString mName;
+  };
+
+  static const DescriptorTableEntry<mozilla::FontFaceDescriptorId>
+      kFontFaceDescs[mozilla::kFontFaceDescriptorCount];
+  static const DescriptorTableEntry<mozilla::CounterStyleDescriptorId>
+      kCounterStyleDescs[mozilla::kCounterStyleDescriptorCount];
+
+#define CSSPROPS_FOR_SHORTHAND_SUBPROPERTIES(it_, prop_, enabledstate_)       \
+  for (const NonCustomCSSPropertyId *                                         \
+           it_ = nsCSSProps::SubpropertyEntryFor(prop_),                      \
+          es_ =                                                               \
+              (NonCustomCSSPropertyId)((enabledstate_) | CSSEnabledState(0)); \
+       *it_ != eCSSProperty_UNKNOWN; ++it_)                                   \
+    if (nsCSSProps::IsEnabled(*it_, (mozilla::CSSEnabledState)es_))
+};
+
+
+inline std::ostream& operator<<(std::ostream& aOut,
+                                NonCustomCSSPropertyId aProperty) {
+  return aOut << nsCSSProps::GetStringValue(aProperty);
+}
+
+#endif /* nsCSSProps_h_ */

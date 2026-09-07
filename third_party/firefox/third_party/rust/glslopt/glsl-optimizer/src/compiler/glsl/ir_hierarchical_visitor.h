@@ -1,0 +1,111 @@
+/*
+ * Copyright © 2010 Intel Corporation
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice (including the next
+ * paragraph) shall be included in all copies or substantial portions of the
+ * Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ * DEALINGS IN THE SOFTWARE.
+ */
+
+#ifndef IR_HIERARCHICAL_VISITOR_H
+#define IR_HIERARCHICAL_VISITOR_H
+
+enum ir_visitor_status {
+   visit_continue,		
+   visit_continue_with_parent,	
+   visit_stop			
+};
+
+
+#ifdef __cplusplus
+
+class ir_hierarchical_visitor {
+public:
+   ir_hierarchical_visitor();
+
+   virtual ir_visitor_status visit(class ir_rvalue *);
+   virtual ir_visitor_status visit(class ir_variable *);
+   virtual ir_visitor_status visit(class ir_constant *);
+   virtual ir_visitor_status visit(class ir_loop_jump *);
+   virtual ir_visitor_status visit(class ir_precision_statement *);
+   virtual ir_visitor_status visit(class ir_typedecl_statement *);
+   virtual ir_visitor_status visit(class ir_barrier *);
+
+   virtual ir_visitor_status visit(class ir_dereference_variable *);
+
+   virtual ir_visitor_status visit_enter(class ir_loop *);
+   virtual ir_visitor_status visit_leave(class ir_loop *);
+   virtual ir_visitor_status visit_enter(class ir_function_signature *);
+   virtual ir_visitor_status visit_leave(class ir_function_signature *);
+   virtual ir_visitor_status visit_enter(class ir_function *);
+   virtual ir_visitor_status visit_leave(class ir_function *);
+   virtual ir_visitor_status visit_enter(class ir_expression *);
+   virtual ir_visitor_status visit_leave(class ir_expression *);
+   virtual ir_visitor_status visit_enter(class ir_texture *);
+   virtual ir_visitor_status visit_leave(class ir_texture *);
+   virtual ir_visitor_status visit_enter(class ir_swizzle *);
+   virtual ir_visitor_status visit_leave(class ir_swizzle *);
+   virtual ir_visitor_status visit_enter(class ir_dereference_array *);
+   virtual ir_visitor_status visit_leave(class ir_dereference_array *);
+   virtual ir_visitor_status visit_enter(class ir_dereference_record *);
+   virtual ir_visitor_status visit_leave(class ir_dereference_record *);
+   virtual ir_visitor_status visit_enter(class ir_assignment *);
+   virtual ir_visitor_status visit_leave(class ir_assignment *);
+   virtual ir_visitor_status visit_enter(class ir_call *);
+   virtual ir_visitor_status visit_leave(class ir_call *);
+   virtual ir_visitor_status visit_enter(class ir_return *);
+   virtual ir_visitor_status visit_leave(class ir_return *);
+   virtual ir_visitor_status visit_enter(class ir_discard *);
+   virtual ir_visitor_status visit_leave(class ir_discard *);
+   virtual ir_visitor_status visit_enter(class ir_demote *);
+   virtual ir_visitor_status visit_leave(class ir_demote *);
+   virtual ir_visitor_status visit_enter(class ir_if *);
+   virtual ir_visitor_status visit_leave(class ir_if *);
+   virtual ir_visitor_status visit_enter(class ir_emit_vertex *);
+   virtual ir_visitor_status visit_leave(class ir_emit_vertex *);
+   virtual ir_visitor_status visit_enter(class ir_end_primitive *);
+   virtual ir_visitor_status visit_leave(class ir_end_primitive *);
+
+
+   void run(struct exec_list *instructions);
+
+   void call_enter_leave_callbacks(class ir_instruction *ir);
+
+   class ir_instruction *base_ir;
+
+   void (*callback_enter)(class ir_instruction *ir, void *data);
+
+   void (*callback_leave)(class ir_instruction *ir, void *data);
+
+   void *data_enter;
+
+   void *data_leave;
+
+   bool in_assignee;
+};
+
+void visit_tree(ir_instruction *ir,
+		void (*callback_enter)(class ir_instruction *ir, void *data),
+		void *data_enter,
+		void (*callback_leave)(class ir_instruction *ir, void *data) = NULL,
+		void *data_leave = NULL);
+
+ir_visitor_status visit_list_elements(ir_hierarchical_visitor *v, exec_list *l,
+                                      bool statement_list = true);
+#endif /* __cplusplus */
+
+#endif /* IR_HIERARCHICAL_VISITOR_H */

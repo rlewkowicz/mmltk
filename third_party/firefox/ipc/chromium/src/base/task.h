@@ -1,0 +1,175 @@
+// Copyright (c) 2006-2008 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(BASE_TASK_H_)
+#define BASE_TASK_H_
+
+#include "base/revocable_store.h"
+#include "base/tuple.h"
+
+#include "nsISupportsImpl.h"
+#include "nsThreadUtils.h"
+
+#include <type_traits>
+#include <utility>
+
+
+namespace details {
+
+template <size_t... Indices, class ObjT, class Method, typename... Args>
+void CallMethod(std::index_sequence<Indices...>, ObjT* obj, Method method,
+                std::tuple<Args...>& arg) {
+  (obj->*method)(std::move(std::get<Indices>(arg))...);
+}
+
+template <size_t... Indices, typename Function, typename... Args>
+void CallFunction(std::index_sequence<Indices...>, Function function,
+                  std::tuple<Args...>& arg) {
+  (*function)(std::move(std::get<Indices>(arg))...);
+}
+
+}  
+
+template <class ObjT, class Method, typename... Args>
+void DispatchTupleToMethod(ObjT* obj, Method method, std::tuple<Args...>& arg) {
+  details::CallMethod(std::index_sequence_for<Args...>{}, obj, method, arg);
+}
+
+template <typename Function, typename... Args>
+void DispatchTupleToFunction(Function function, std::tuple<Args...>& arg) {
+  details::CallFunction(std::index_sequence_for<Args...>{}, function, arg);
+}
+
+
+template <class T>
+class DeleteTask : public mozilla::CancelableRunnable {
+ public:
+  explicit DeleteTask(T* obj)
+      : mozilla::CancelableRunnable("DeleteTask"), obj_(obj) {}
+  NS_IMETHOD Run() override {
+    delete obj_;
+    return NS_OK;
+  }
+  virtual nsresult Cancel() override {
+    obj_ = NULL;
+    return NS_OK;
+  }
+
+ private:
+  T* MOZ_UNSAFE_REF(
+      "The validity of this pointer must be enforced by "
+      "external factors.") obj_;
+};
+
+
+template <class T>
+struct RunnableMethodTraits {
+  static void RetainCallee(T* obj) { obj->AddRef(); }
+  static void ReleaseCallee(T* obj) { obj->Release(); }
+};
+
+template <class T>
+struct RunnableMethodTraits<const T> {
+  static void RetainCallee(const T* obj) { const_cast<T*>(obj)->AddRef(); }
+  static void ReleaseCallee(const T* obj) { const_cast<T*>(obj)->Release(); }
+};
+
+
+
+template <class T, class Method, class Params>
+class RunnableMethod : public mozilla::CancelableRunnable,
+                       public RunnableMethodTraits<T> {
+ public:
+  RunnableMethod(T* obj, Method meth, Params&& params)
+      : mozilla::CancelableRunnable("RunnableMethod"),
+        obj_(obj),
+        meth_(meth),
+        params_(std::forward<Params>(params)) {
+    this->RetainCallee(obj_);
+  }
+  ~RunnableMethod() { ReleaseCallee(); }
+
+  NS_IMETHOD Run() override {
+    if (obj_) DispatchTupleToMethod(obj_, meth_, params_);
+    return NS_OK;
+  }
+
+  virtual nsresult Cancel() override {
+    ReleaseCallee();
+    return NS_OK;
+  }
+
+ private:
+  void ReleaseCallee() {
+    if (obj_) {
+      RunnableMethodTraits<T>::ReleaseCallee(obj_);
+      obj_ = nullptr;
+    }
+  }
+
+  T* MOZ_OWNING_REF obj_;
+  Method meth_;
+  Params params_;
+};
+
+namespace dont_add_new_uses_of_this {
+
+template <class T, class Method, typename... Args>
+inline already_AddRefed<mozilla::Runnable> NewRunnableMethod(T* object,
+                                                             Method method,
+                                                             Args&&... args) {
+  typedef std::tuple<std::decay_t<Args>...> ArgsTuple;
+  RefPtr<mozilla::Runnable> t = new RunnableMethod<T, Method, ArgsTuple>(
+      object, method, std::make_tuple(std::forward<Args>(args)...));
+  return t.forget();
+}
+
+}  
+
+
+template <class Function, class Params>
+class RunnableFunction : public mozilla::CancelableRunnable {
+ public:
+  RunnableFunction(const char* name, Function function, Params&& params)
+      : mozilla::CancelableRunnable(name),
+        function_(function),
+        params_(std::forward<Params>(params)) {}
+
+  ~RunnableFunction() {}
+
+  NS_IMETHOD Run() override {
+    if (function_) DispatchTupleToFunction(function_, params_);
+    return NS_OK;
+  }
+
+  virtual nsresult Cancel() override {
+    function_ = nullptr;
+    return NS_OK;
+  }
+
+  Function function_;
+  Params params_;
+};
+
+template <class Function, typename... Args>
+inline already_AddRefed<mozilla::CancelableRunnable>
+NewCancelableRunnableFunction(const char* name, Function function,
+                              Args&&... args) {
+  typedef std::tuple<std::decay_t<Args>...> ArgsTuple;
+  RefPtr<mozilla::CancelableRunnable> t =
+      new RunnableFunction<Function, ArgsTuple>(
+          name, function, std::make_tuple(std::forward<Args>(args)...));
+  return t.forget();
+}
+
+template <class Function, typename... Args>
+inline already_AddRefed<mozilla::Runnable> NewRunnableFunction(
+    const char* name, Function function, Args&&... args) {
+  typedef std::tuple<std::decay_t<Args>...> ArgsTuple;
+  RefPtr<mozilla::Runnable> t = new RunnableFunction<Function, ArgsTuple>(
+      name, function, std::make_tuple(std::forward<Args>(args)...));
+  return t.forget();
+}
+
+#endif

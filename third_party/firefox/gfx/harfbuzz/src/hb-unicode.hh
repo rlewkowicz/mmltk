@@ -1,0 +1,348 @@
+/*
+ * Copyright © 2009  Red Hat, Inc.
+ * Copyright © 2011  Codethink Limited
+ * Copyright © 2010,2011,2012  Google, Inc.
+ *
+ *  This is part of HarfBuzz, a text shaping library.
+ *
+ * Permission is hereby granted, without written agreement and without
+ * license or royalty fees, to use, copy, modify, and distribute this
+ * software and its documentation for any purpose, provided that the
+ * above copyright notice and the following two paragraphs appear in
+ * all copies of this software.
+ *
+ * IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE TO ANY PARTY FOR
+ * DIRECT, INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES
+ * ARISING OUT OF THE USE OF THIS SOFTWARE AND ITS DOCUMENTATION, EVEN
+ * IF THE COPYRIGHT HOLDER HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH
+ * DAMAGE.
+ *
+ * THE COPYRIGHT HOLDER SPECIFICALLY DISCLAIMS ANY WARRANTIES, INCLUDING,
+ * BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
+ * FITNESS FOR A PARTICULAR PURPOSE.  THE SOFTWARE PROVIDED HEREUNDER IS
+ * ON AN "AS IS" BASIS, AND THE COPYRIGHT HOLDER HAS NO OBLIGATION TO
+ * PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
+ *
+ * Red Hat Author(s): Behdad Esfahbod
+ * Codethink Author(s): Ryan Lortie
+ * Google Author(s): Behdad Esfahbod
+ */
+
+#ifndef HB_UNICODE_HH
+#define HB_UNICODE_HH
+
+#include "hb.hh"
+
+
+extern HB_INTERNAL const uint8_t _hb_modified_combining_class[256];
+
+
+#define HB_UNICODE_FUNCS_IMPLEMENT_CALLBACKS \
+  HB_UNICODE_FUNC_IMPLEMENT (combining_class) \
+  HB_IF_NOT_DEPRECATED (HB_UNICODE_FUNC_IMPLEMENT (eastasian_width)) \
+  HB_UNICODE_FUNC_IMPLEMENT (general_category) \
+  HB_UNICODE_FUNC_IMPLEMENT (mirroring) \
+  HB_UNICODE_FUNC_IMPLEMENT (script) \
+  HB_UNICODE_FUNC_IMPLEMENT (compose) \
+  HB_UNICODE_FUNC_IMPLEMENT (decompose) \
+  HB_IF_NOT_DEPRECATED (HB_UNICODE_FUNC_IMPLEMENT (decompose_compatibility)) \
+
+#define HB_UNICODE_FUNCS_IMPLEMENT_CALLBACKS_SIMPLE \
+  HB_UNICODE_FUNC_IMPLEMENT (hb_unicode_combining_class_t, combining_class) \
+  HB_IF_NOT_DEPRECATED (HB_UNICODE_FUNC_IMPLEMENT (unsigned int, eastasian_width)) \
+  HB_UNICODE_FUNC_IMPLEMENT (hb_unicode_general_category_t, general_category) \
+  HB_UNICODE_FUNC_IMPLEMENT (hb_codepoint_t, mirroring) \
+  HB_UNICODE_FUNC_IMPLEMENT (hb_script_t, script) \
+
+struct hb_unicode_funcs_t
+{
+  hb_object_header_t header;
+
+  hb_unicode_funcs_t *parent;
+
+#define HB_UNICODE_FUNC_IMPLEMENT(return_type, name) \
+  return_type name (hb_codepoint_t unicode) { return func.name (this, unicode, user_data.name); }
+HB_UNICODE_FUNCS_IMPLEMENT_CALLBACKS_SIMPLE
+#undef HB_UNICODE_FUNC_IMPLEMENT
+
+  hb_bool_t compose (hb_codepoint_t a, hb_codepoint_t b,
+		     hb_codepoint_t *ab)
+  {
+    *ab = 0;
+    if (unlikely (!a || !b)) return false;
+    return func.compose (this, a, b, ab, user_data.compose);
+  }
+
+  hb_bool_t decompose (hb_codepoint_t ab,
+		       hb_codepoint_t *a, hb_codepoint_t *b)
+  {
+    *a = ab; *b = 0;
+    return func.decompose (this, ab, a, b, user_data.decompose);
+  }
+
+  unsigned int decompose_compatibility (hb_codepoint_t  u,
+					hb_codepoint_t *decomposed)
+  {
+#ifdef HB_DISABLE_DEPRECATED
+    unsigned int ret  = 0;
+#else
+    unsigned int ret = func.decompose_compatibility (this, u, decomposed, user_data.decompose_compatibility);
+#endif
+    if (ret == 1 && u == decomposed[0]) {
+      decomposed[0] = 0;
+      return 0;
+    }
+    decomposed[ret] = 0;
+    return ret;
+  }
+
+  unsigned int
+  modified_combining_class (hb_codepoint_t u)
+  {
+    if (unlikely (u == 0x1A60u)) return 254;
+    if (unlikely (u == 0x0FC6u)) return 254;
+    if (unlikely (u == 0x0F39u)) return 127;
+
+    return _hb_modified_combining_class[combining_class (u)];
+  }
+
+  static hb_bool_t
+  is_variation_selector (hb_codepoint_t unicode)
+  {
+    return unlikely (hb_in_ranges<hb_codepoint_t> (unicode,
+						   0xFE00u, 0xFE0Fu, 
+						   0xE0100u, 0xE01EFu));  
+  }
+
+  static hb_bool_t
+  is_default_ignorable (hb_codepoint_t ch)
+  {
+    hb_codepoint_t plane = ch >> 16;
+    if (likely (plane == 0))
+    {
+      hb_codepoint_t page = ch >> 8;
+      switch (page) {
+	case 0x00: return unlikely (ch == 0x00ADu);
+	case 0x03: return unlikely (ch == 0x034Fu);
+	case 0x06: return unlikely (ch == 0x061Cu);
+	case 0x17: return hb_in_range<hb_codepoint_t> (ch, 0x17B4u, 0x17B5u);
+	case 0x18: return hb_in_range<hb_codepoint_t> (ch, 0x180Bu, 0x180Eu);
+	case 0x20: return hb_in_ranges<hb_codepoint_t> (ch, 0x200Bu, 0x200Fu,
+					    0x202Au, 0x202Eu,
+					    0x2060u, 0x206Fu);
+	case 0xFE: return hb_in_range<hb_codepoint_t> (ch, 0xFE00u, 0xFE0Fu) || ch == 0xFEFFu;
+	case 0xFF: return hb_in_range<hb_codepoint_t> (ch, 0xFFF0u, 0xFFF8u);
+	default: return false;
+      }
+    }
+    else
+    {
+      switch (plane) {
+	case 0x01: return hb_in_range<hb_codepoint_t> (ch, 0x1D173u, 0x1D17Au);
+	case 0x0E: return hb_in_range<hb_codepoint_t> (ch, 0xE0000u, 0xE0FFFu);
+	default: return false;
+      }
+    }
+  }
+
+  enum space_t {
+    NOT_SPACE = 0,
+    SPACE_EM   = 1,
+    SPACE_EM_2 = 2,
+    SPACE_EM_3 = 3,
+    SPACE_EM_4 = 4,
+    SPACE_EM_5 = 5,
+    SPACE_EM_6 = 6,
+    SPACE_EM_16 = 16,
+    SPACE_4_EM_18,	
+    SPACE,
+    SPACE_FIGURE,
+    SPACE_PUNCTUATION,
+    SPACE_NARROW,
+  };
+  static space_t
+  space_fallback_type (hb_codepoint_t u)
+  {
+    switch (u)
+    {
+      default:	    return NOT_SPACE;	
+      case 0x0020u: return SPACE;	
+      case 0x00A0u: return SPACE;	
+      case 0x2000u: return SPACE_EM_2;	
+      case 0x2001u: return SPACE_EM;	
+      case 0x2002u: return SPACE_EM_2;	
+      case 0x2003u: return SPACE_EM;	
+      case 0x2004u: return SPACE_EM_3;	
+      case 0x2005u: return SPACE_EM_4;	
+      case 0x2006u: return SPACE_EM_6;	
+      case 0x2007u: return SPACE_FIGURE;	
+      case 0x2008u: return SPACE_PUNCTUATION;	
+      case 0x2009u: return SPACE_EM_5;		
+      case 0x200Au: return SPACE_EM_16;		
+      case 0x202Fu: return SPACE_NARROW;	
+      case 0x205Fu: return SPACE_4_EM_18;	
+      case 0x3000u: return SPACE_EM;		
+    }
+  }
+
+  static hb_codepoint_t
+  vertical_char_for (hb_codepoint_t u)
+  {
+    switch (u >> 8)
+    {
+      case 0x20: switch (u) {
+	case 0x2013u: return 0xfe32u; 
+	case 0x2014u: return 0xfe31u; 
+	case 0x2025u: return 0xfe30u; 
+	case 0x2026u: return 0xfe19u; 
+      } break;
+      case 0x30: switch (u) {
+	case 0x3001u: return 0xfe11u; 
+	case 0x3002u: return 0xfe12u; 
+	case 0x3008u: return 0xfe3fu; 
+	case 0x3009u: return 0xfe40u; 
+	case 0x300au: return 0xfe3du; 
+	case 0x300bu: return 0xfe3eu; 
+	case 0x300cu: return 0xfe41u; 
+	case 0x300du: return 0xfe42u; 
+	case 0x300eu: return 0xfe43u; 
+	case 0x300fu: return 0xfe44u; 
+	case 0x3010u: return 0xfe3bu; 
+	case 0x3011u: return 0xfe3cu; 
+	case 0x3014u: return 0xfe39u; 
+	case 0x3015u: return 0xfe3au; 
+	case 0x3016u: return 0xfe17u; 
+	case 0x3017u: return 0xfe18u; 
+      } break;
+      case 0xfe: switch (u) {
+	case 0xfe4fu: return 0xfe34u; 
+      } break;
+      case 0xff: switch (u) {
+	case 0xff01u: return 0xfe15u; 
+	case 0xff08u: return 0xfe35u; 
+	case 0xff09u: return 0xfe36u; 
+	case 0xff0cu: return 0xfe10u; 
+	case 0xff1au: return 0xfe13u; 
+	case 0xff1bu: return 0xfe14u; 
+	case 0xff1fu: return 0xfe16u; 
+	case 0xff3bu: return 0xfe47u; 
+	case 0xff3du: return 0xfe48u; 
+	case 0xff3fu: return 0xfe33u; 
+	case 0xff5bu: return 0xfe37u; 
+	case 0xff5du: return 0xfe38u; 
+      } break;
+    }
+
+    return u;
+  }
+
+  struct {
+#define HB_UNICODE_FUNC_IMPLEMENT(name) hb_unicode_##name##_func_t name;
+    HB_UNICODE_FUNCS_IMPLEMENT_CALLBACKS
+#undef HB_UNICODE_FUNC_IMPLEMENT
+  } func;
+
+  struct {
+#define HB_UNICODE_FUNC_IMPLEMENT(name) void *name;
+    HB_UNICODE_FUNCS_IMPLEMENT_CALLBACKS
+#undef HB_UNICODE_FUNC_IMPLEMENT
+  } user_data;
+
+  struct {
+#define HB_UNICODE_FUNC_IMPLEMENT(name) hb_destroy_func_t name;
+    HB_UNICODE_FUNCS_IMPLEMENT_CALLBACKS
+#undef HB_UNICODE_FUNC_IMPLEMENT
+  } destroy;
+};
+DECLARE_NULL_INSTANCE (hb_unicode_funcs_t);
+
+
+
+#define HB_MODIFIED_COMBINING_CLASS_CCC10 22 /* sheva */
+#define HB_MODIFIED_COMBINING_CLASS_CCC11 15 /* hataf segol */
+#define HB_MODIFIED_COMBINING_CLASS_CCC12 16 /* hataf patah */
+#define HB_MODIFIED_COMBINING_CLASS_CCC13 17 /* hataf qamats */
+#define HB_MODIFIED_COMBINING_CLASS_CCC14 23 /* hiriq */
+#define HB_MODIFIED_COMBINING_CLASS_CCC15 18 /* tsere */
+#define HB_MODIFIED_COMBINING_CLASS_CCC16 19 /* segol */
+#define HB_MODIFIED_COMBINING_CLASS_CCC17 20 /* patah */
+#define HB_MODIFIED_COMBINING_CLASS_CCC18 21 /* qamats & qamats qatan */
+#define HB_MODIFIED_COMBINING_CLASS_CCC19 14 /* holam & holam haser for vav*/
+#define HB_MODIFIED_COMBINING_CLASS_CCC20 24 /* qubuts */
+#define HB_MODIFIED_COMBINING_CLASS_CCC21 12 /* dagesh */
+#define HB_MODIFIED_COMBINING_CLASS_CCC22 25 /* meteg */
+#define HB_MODIFIED_COMBINING_CLASS_CCC23 13 /* rafe */
+#define HB_MODIFIED_COMBINING_CLASS_CCC24 10 /* shin dot */
+#define HB_MODIFIED_COMBINING_CLASS_CCC25 11 /* sin dot */
+#define HB_MODIFIED_COMBINING_CLASS_CCC26 26 /* point varika */
+
+#define HB_MODIFIED_COMBINING_CLASS_CCC27 28 /* fathatan */
+#define HB_MODIFIED_COMBINING_CLASS_CCC28 29 /* dammatan */
+#define HB_MODIFIED_COMBINING_CLASS_CCC29 30 /* kasratan */
+#define HB_MODIFIED_COMBINING_CLASS_CCC30 31 /* fatha */
+#define HB_MODIFIED_COMBINING_CLASS_CCC31 32 /* damma */
+#define HB_MODIFIED_COMBINING_CLASS_CCC32 33 /* kasra */
+#define HB_MODIFIED_COMBINING_CLASS_CCC33 27 /* shadda */
+#define HB_MODIFIED_COMBINING_CLASS_CCC34 34 /* sukun */
+#define HB_MODIFIED_COMBINING_CLASS_CCC35 35 /* superscript alef */
+
+#define HB_MODIFIED_COMBINING_CLASS_CCC36 36 /* superscript alaph */
+
+#define HB_MODIFIED_COMBINING_CLASS_CCC84 4 /* length mark */
+#define HB_MODIFIED_COMBINING_CLASS_CCC91 5 /* ai length mark */
+
+#define HB_MODIFIED_COMBINING_CLASS_CCC103 3 /* sara u / sara uu */
+#define HB_MODIFIED_COMBINING_CLASS_CCC107 107 /* mai * */
+
+#define HB_MODIFIED_COMBINING_CLASS_CCC118 118 /* sign u / sign uu */
+#define HB_MODIFIED_COMBINING_CLASS_CCC122 122 /* mai * */
+
+#define HB_MODIFIED_COMBINING_CLASS_CCC129 129 /* sign aa */
+#define HB_MODIFIED_COMBINING_CLASS_CCC130 132 /* sign i */
+#define HB_MODIFIED_COMBINING_CLASS_CCC132 131 /* sign u */
+
+
+#define HB_UNICODE_GENERAL_CATEGORY_IS_MARK(gen_cat) \
+	(FLAG_UNSAFE (gen_cat) & \
+	 (FLAG (HB_UNICODE_GENERAL_CATEGORY_SPACING_MARK) | \
+	  FLAG (HB_UNICODE_GENERAL_CATEGORY_ENCLOSING_MARK) | \
+	  FLAG (HB_UNICODE_GENERAL_CATEGORY_NON_SPACING_MARK)))
+
+#define HB_UNICODE_GENERAL_CATEGORY_IS_LETTER(gen_cat) \
+	(FLAG_UNSAFE (gen_cat) & \
+	 (FLAG (HB_UNICODE_GENERAL_CATEGORY_LOWERCASE_LETTER) | \
+	  FLAG (HB_UNICODE_GENERAL_CATEGORY_MODIFIER_LETTER) | \
+	  FLAG (HB_UNICODE_GENERAL_CATEGORY_OTHER_LETTER) | \
+	  FLAG (HB_UNICODE_GENERAL_CATEGORY_TITLECASE_LETTER) | \
+	  FLAG (HB_UNICODE_GENERAL_CATEGORY_UPPERCASE_LETTER)))
+
+
+struct hb_unicode_range_t
+{
+  static int
+  cmp (const void *_key, const void *_item)
+  {
+    hb_codepoint_t cp = *((hb_codepoint_t *) _key);
+    const hb_unicode_range_t *range = (hb_unicode_range_t *) _item;
+
+    if (cp < range->start)
+      return -1;
+    else if (cp <= range->end)
+      return 0;
+    else
+      return +1;
+  }
+
+  hb_codepoint_t start;
+  hb_codepoint_t end;
+};
+
+
+HB_INTERNAL bool
+_hb_unicode_is_emoji_Extended_Pictographic (hb_codepoint_t cp);
+
+
+extern "C" HB_INTERNAL hb_unicode_funcs_t *hb_ucd_get_unicode_funcs ();
+
+
+#endif /* HB_UNICODE_HH */

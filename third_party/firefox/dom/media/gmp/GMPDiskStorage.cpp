@@ -1,0 +1,409 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "GMPLog.h"
+#include "GMPParent.h"
+#include "gmp-storage.h"
+#include "mozilla/EndianUtils.h"
+#include "nsAppDirectoryServiceDefs.h"
+#include "nsClassHashtable.h"
+#include "nsDirectoryServiceDefs.h"
+#include "nsDirectoryServiceUtils.h"
+#include "nsHashKeys.h"
+#include "nsServiceManagerUtils.h"
+#include "plhash.h"
+#include "prio.h"
+
+namespace mozilla::gmp {
+
+#define LOG(msg, ...)                                                  \
+  MOZ_LOG_FMT(GetGMPLog(), LogLevel::Debug, "GMPDiskStorage={}, " msg, \
+              fmt::ptr(this), ##__VA_ARGS__)
+
+static nsresult GetGMPStorageDir(nsIFile** aTempDir, const nsAString& aGMPName,
+                                 const nsACString& aNodeId) {
+  if (NS_WARN_IF(!aTempDir)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  nsCOMPtr<mozIGeckoMediaPluginChromeService> mps =
+      do_GetService("@mozilla.org/gecko-media-plugin-service;1");
+  if (NS_WARN_IF(!mps)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsCOMPtr<nsIFile> tmpFile;
+  nsresult rv = mps->GetStorageDir(getter_AddRefs(tmpFile));
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  rv = tmpFile->Append(aGMPName);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  rv = tmpFile->AppendNative("storage"_ns);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  rv = tmpFile->AppendNative(aNodeId);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  rv = tmpFile->Create(nsIFile::DIRECTORY_TYPE, 0700);
+  if (rv != NS_ERROR_FILE_ALREADY_EXISTS && NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  tmpFile.forget(aTempDir);
+
+  return NS_OK;
+}
+
+class GMPDiskStorage : public GMPStorage {
+ public:
+  explicit GMPDiskStorage(const nsACString& aNodeId, const nsAString& aGMPName)
+      : mNodeId(aNodeId), mGMPName(aGMPName) {
+    LOG("Created GMPDiskStorage, nodeId={}, gmpName={}", mNodeId.get(),
+        NS_ConvertUTF16toUTF8(mGMPName).get());
+  }
+
+  ~GMPDiskStorage() {
+    for (const auto& record : mRecords.Values()) {
+      if (record->mFileDesc) {
+        PR_Close(record->mFileDesc);
+        record->mFileDesc = nullptr;
+      }
+    }
+    LOG("Destroyed GMPDiskStorage");
+  }
+
+  nsresult Init() {
+    nsCOMPtr<nsIFile> storageDir;
+    nsresult rv =
+        GetGMPStorageDir(getter_AddRefs(storageDir), mGMPName, mNodeId);
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      return NS_ERROR_FAILURE;
+    }
+
+    DirectoryEnumerator iter(storageDir, DirectoryEnumerator::FilesAndDirs);
+    for (nsCOMPtr<nsIFile> dirEntry; (dirEntry = iter.Next()) != nullptr;) {
+      PRFileDesc* fd = nullptr;
+      if (NS_WARN_IF(
+              NS_FAILED(dirEntry->OpenNSPRFileDesc(PR_RDONLY, 0, &fd)))) {
+        continue;
+      }
+      int32_t recordLength = 0;
+      nsCString recordName;
+      nsresult err = ReadRecordMetadata(fd, recordLength, recordName);
+      PR_Close(fd);
+      if (NS_WARN_IF(NS_FAILED(err))) {
+        dirEntry->Remove(false);
+        continue;
+      }
+
+      nsAutoString filename;
+      rv = dirEntry->GetLeafName(filename);
+      if (NS_WARN_IF(NS_FAILED(rv))) {
+        continue;
+      }
+
+      mRecords.InsertOrUpdate(recordName,
+                              MakeUnique<Record>(filename, recordName));
+    }
+
+    return NS_OK;
+  }
+
+  GMPErr Open(const nsACString& aRecordName) override {
+    MOZ_ASSERT(!IsOpen(aRecordName));
+
+    Record* const record =
+        mRecords.WithEntryHandle(aRecordName, [&](auto&& entry) -> Record* {
+          if (!entry) {
+            nsAutoString filename;
+            nsresult rv = GetUnusedFilename(aRecordName, filename);
+            if (NS_WARN_IF(NS_FAILED(rv))) {
+              return nullptr;
+            }
+            return entry.Insert(MakeUnique<Record>(filename, aRecordName))
+                .get();
+          }
+
+          return entry->get();
+        });
+    if (!record) {
+      return GMPGenericErr;
+    }
+
+    MOZ_ASSERT(record);
+    if (record->mFileDesc) {
+      NS_WARNING("Tried to open already open record");
+      return GMPRecordInUse;
+    }
+
+    nsresult rv =
+        OpenStorageFile(record->mFilename, ReadWrite, &record->mFileDesc);
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      return GMPGenericErr;
+    }
+
+    MOZ_ASSERT(IsOpen(aRecordName));
+
+    return GMPNoErr;
+  }
+
+  bool IsOpen(const nsACString& aRecordName) const override {
+    const Record* record = mRecords.Get(aRecordName);
+    return record && !!record->mFileDesc;
+  }
+
+  GMPErr Read(const nsACString& aRecordName,
+              nsTArray<uint8_t>& aOutBytes) override {
+    if (!IsOpen(aRecordName)) {
+      return GMPClosedErr;
+    }
+
+    Record* record = nullptr;
+    mRecords.Get(aRecordName, &record);
+    MOZ_ASSERT(record && !!record->mFileDesc);  
+
+    aOutBytes.SetLength(0);
+
+    int32_t recordLength = 0;
+    nsCString recordName;
+    nsresult err =
+        ReadRecordMetadata(record->mFileDesc, recordLength, recordName);
+    if (NS_WARN_IF(NS_FAILED(err) || recordLength == 0)) {
+      return GMPNoErr;
+    }
+
+    if (!aRecordName.Equals(recordName)) {
+      NS_WARNING("Record file contains some other record's contents!");
+      return GMPRecordCorrupted;
+    }
+
+    if (PR_Available(record->mFileDesc) != recordLength) {
+      NS_WARNING("Record file length mismatch!");
+      return GMPRecordCorrupted;
+    }
+
+    aOutBytes.SetLength(recordLength);
+    int32_t bytesRead =
+        PR_Read(record->mFileDesc, aOutBytes.Elements(), recordLength);
+    return (bytesRead == recordLength) ? GMPNoErr : GMPRecordCorrupted;
+  }
+
+  GMPErr Write(const nsACString& aRecordName,
+               const nsTArray<uint8_t>& aBytes) override {
+    if (!IsOpen(aRecordName)) {
+      return GMPClosedErr;
+    }
+
+    Record* record = nullptr;
+    mRecords.Get(aRecordName, &record);
+    MOZ_ASSERT(record && !!record->mFileDesc);  
+
+    PR_Close(record->mFileDesc);
+    record->mFileDesc = nullptr;
+
+    if (aBytes.Length() == 0) {
+      nsresult rv = RemoveStorageFile(record->mFilename);
+      if (NS_WARN_IF(NS_FAILED(rv))) {
+      } else {
+        return GMPNoErr;
+      }
+    }
+
+    if (NS_WARN_IF(NS_FAILED(OpenStorageFile(record->mFilename, Truncate,
+                                             &record->mFileDesc)))) {
+      return GMPGenericErr;
+    }
+
+    int32_t bytesWritten = 0;
+    char buf[sizeof(uint32_t)] = {0};
+    LittleEndian::writeUint32(buf, aRecordName.Length());
+    bytesWritten = PR_Write(record->mFileDesc, buf, std::size(buf));
+    if (bytesWritten != std::size(buf)) {
+      NS_WARNING("Failed to write GMPStorage record name length.");
+      return GMPRecordCorrupted;
+    }
+    bytesWritten = PR_Write(record->mFileDesc, aRecordName.BeginReading(),
+                            aRecordName.Length());
+    if (bytesWritten != (int32_t)aRecordName.Length()) {
+      NS_WARNING("Failed to write GMPStorage record name.");
+      return GMPRecordCorrupted;
+    }
+
+    bytesWritten =
+        PR_Write(record->mFileDesc, aBytes.Elements(), aBytes.Length());
+    if (bytesWritten != (int32_t)aBytes.Length()) {
+      NS_WARNING("Failed to write GMPStorage record data.");
+      return GMPRecordCorrupted;
+    }
+
+    PR_Sync(record->mFileDesc);
+
+    return GMPNoErr;
+  }
+
+  void Close(const nsACString& aRecordName) override {
+    Record* record = nullptr;
+    mRecords.Get(aRecordName, &record);
+    if (record && !!record->mFileDesc) {
+      PR_Close(record->mFileDesc);
+      record->mFileDesc = nullptr;
+    }
+    MOZ_ASSERT(!IsOpen(aRecordName));
+  }
+
+ private:
+  nsresult GetUnusedFilename(const nsACString& aRecordName,
+                             nsString& aOutFilename) {
+    nsCOMPtr<nsIFile> storageDir;
+    nsresult rv =
+        GetGMPStorageDir(getter_AddRefs(storageDir), mGMPName, mNodeId);
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      return rv;
+    }
+
+    uint64_t recordNameHash = HashString(aRecordName);
+    for (int i = 0; i < 1000000; i++) {
+      nsCOMPtr<nsIFile> f;
+      rv = storageDir->Clone(getter_AddRefs(f));
+      if (NS_WARN_IF(NS_FAILED(rv))) {
+        return rv;
+      }
+      nsAutoString hashStr;
+      hashStr.AppendInt(recordNameHash);
+      rv = f->Append(hashStr);
+      if (NS_WARN_IF(NS_FAILED(rv))) {
+        return rv;
+      }
+      bool exists = false;
+      f->Exists(&exists);
+      if (!exists) {
+        aOutFilename = std::move(hashStr);
+        return NS_OK;
+      } else {
+        ++recordNameHash;
+        continue;
+      }
+    }
+    NS_WARNING("GetUnusedFilename had extreme hash collision!");
+    return NS_ERROR_FAILURE;
+  }
+
+  enum OpenFileMode { ReadWrite, Truncate };
+
+  nsresult OpenStorageFile(const nsAString& aFileLeafName,
+                           const OpenFileMode aMode, PRFileDesc** aOutFD) {
+    MOZ_ASSERT(aOutFD);
+
+    nsCOMPtr<nsIFile> f;
+    nsresult rv = GetGMPStorageDir(getter_AddRefs(f), mGMPName, mNodeId);
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      return rv;
+    }
+    f->Append(aFileLeafName);
+
+    auto mode = PR_RDWR | PR_CREATE_FILE;
+    if (aMode == Truncate) {
+      mode |= PR_TRUNCATE;
+    }
+
+    return f->OpenNSPRFileDesc(mode, PR_IRWXU, aOutFD);
+  }
+
+  nsresult ReadRecordMetadata(PRFileDesc* aFd, int32_t& aOutRecordLength,
+                              nsACString& aOutRecordName) {
+    int32_t offset = PR_Seek(aFd, 0, PR_SEEK_END);
+    PR_Seek(aFd, 0, PR_SEEK_SET);
+
+    if (offset < 0 || offset > GMP_MAX_RECORD_SIZE) {
+      return NS_ERROR_FAILURE;
+    }
+    const uint32_t fileLength = static_cast<uint32_t>(offset);
+
+
+    if (fileLength < sizeof(uint32_t)) {
+      return NS_ERROR_FAILURE;
+    }
+
+    uint32_t recordNameLength = 0;
+    char buf[sizeof(recordNameLength)] = {0};
+    int32_t bytesRead = PR_Read(aFd, &buf, sizeof(recordNameLength));
+    recordNameLength = LittleEndian::readUint32(buf);
+    if (sizeof(recordNameLength) != bytesRead || recordNameLength == 0 ||
+        recordNameLength + sizeof(recordNameLength) > fileLength ||
+        recordNameLength > GMP_MAX_RECORD_NAME_SIZE) {
+      return NS_ERROR_FAILURE;
+    }
+
+    nsCString recordName;
+    recordName.SetLength(recordNameLength);
+    bytesRead = PR_Read(aFd, recordName.BeginWriting(), recordNameLength);
+    if ((uint32_t)bytesRead != recordNameLength) {
+      return NS_ERROR_FAILURE;
+    }
+
+    MOZ_ASSERT(fileLength >= sizeof(recordNameLength) + recordNameLength);
+    int32_t recordLength =
+        fileLength - (sizeof(recordNameLength) + recordNameLength);
+
+    aOutRecordLength = recordLength;
+    aOutRecordName = recordName;
+
+    if (PR_Seek(aFd, 0, PR_SEEK_CUR) !=
+        (int32_t)(sizeof(recordNameLength) + recordNameLength)) {
+      NS_WARNING("Read cursor mismatch after ReadRecordMetadata()");
+      return NS_ERROR_FAILURE;
+    }
+
+    return NS_OK;
+  }
+
+  nsresult RemoveStorageFile(const nsAString& aFilename) {
+    nsCOMPtr<nsIFile> f;
+    nsresult rv = GetGMPStorageDir(getter_AddRefs(f), mGMPName, mNodeId);
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      return rv;
+    }
+    rv = f->Append(aFilename);
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      return rv;
+    }
+    return f->Remove( false);
+  }
+
+  struct Record {
+    Record(const nsAString& aFilename, const nsACString& aRecordName)
+        : mFilename(aFilename), mRecordName(aRecordName), mFileDesc(nullptr) {}
+    ~Record() { MOZ_ASSERT(!mFileDesc); }
+    nsString mFilename;
+    nsCString mRecordName;
+    PRFileDesc* mFileDesc;
+  };
+
+  nsClassHashtable<nsCStringHashKey, Record> mRecords;
+  const nsCString mNodeId;
+  const nsString mGMPName;
+};
+
+already_AddRefed<GMPStorage> CreateGMPDiskStorage(const nsACString& aNodeId,
+                                                  const nsAString& aGMPName) {
+  RefPtr<GMPDiskStorage> storage(new GMPDiskStorage(aNodeId, aGMPName));
+  if (NS_FAILED(storage->Init())) {
+    NS_WARNING("Failed to initialize on disk GMP storage");
+    return nullptr;
+  }
+  return storage.forget();
+}
+
+#undef LOG
+
+}  

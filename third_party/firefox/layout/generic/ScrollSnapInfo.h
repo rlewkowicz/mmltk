@@ -1,0 +1,147 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layout_ScrollSnapInfo_h_
+#define mozilla_layout_ScrollSnapInfo_h_
+
+#include <iosfwd>
+
+#include "mozilla/AppUnits.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/ScrollSnapTargetId.h"
+#include "mozilla/ScrollTypes.h"
+#include "mozilla/ServoStyleConsts.h"
+#include "mozilla/WritingModes.h"
+#include "mozilla/layers/LayersTypes.h"
+#include "nsPoint.h"
+
+class nsIContent;
+class nsIFrame;
+struct nsRect;
+struct nsSize;
+struct nsStyleDisplay;
+
+namespace mozilla {
+
+enum class StyleScrollSnapStrictness : uint8_t;
+class WritingMode;
+
+struct SnapPoint {
+  SnapPoint() = default;
+  explicit SnapPoint(const nsPoint& aPoint)
+      : mX(Some(aPoint.x)), mY(Some(aPoint.y)) {}
+  SnapPoint(Maybe<nscoord>&& aX, Maybe<nscoord>&& aY)
+      : mX(std::move(aX)), mY(std::move(aY)) {}
+
+  bool operator==(const SnapPoint&) const = default;
+
+  Maybe<nscoord> mX;
+  Maybe<nscoord> mY;
+
+  const Maybe<nscoord>& I(WritingMode aWM) const {
+    return aWM.IsVertical() ? mY : mX;
+  }
+  const Maybe<nscoord>& B(WritingMode aWM) const {
+    return aWM.IsVertical() ? mX : mY;
+  }
+};
+
+struct ScrollSnapRange {
+  using ScrollDirection = layers::ScrollDirection;
+  ScrollSnapRange() = default;
+
+  ScrollSnapRange(const nsRect& aSnapArea, ScrollDirection aDirection,
+                  ScrollSnapTargetId aTargetId)
+      : mSnapArea(aSnapArea), mDirection(aDirection), mTargetId(aTargetId) {}
+
+  nsRect mSnapArea;
+  ScrollDirection mDirection;
+  ScrollSnapTargetId mTargetId;
+
+  bool operator==(const ScrollSnapRange& aOther) const = default;
+
+  nscoord Start() const {
+    return mDirection == ScrollDirection::eHorizontal ? mSnapArea.X()
+                                                      : mSnapArea.Y();
+  }
+
+  nscoord End() const {
+    return mDirection == ScrollDirection::eHorizontal ? mSnapArea.XMost()
+                                                      : mSnapArea.YMost();
+  }
+
+  bool IsValid(nscoord aPoint, nscoord aSnapportSize) const {
+    MOZ_ASSERT(End() - Start() > aSnapportSize);
+    return Start() <= aPoint && aPoint <= End();
+  }
+
+  nscoord FindNearestSnapPoint(nscoord aDestination,
+                               nscoord aSnapportSize) const;
+};
+
+struct ScrollSnapInfo {
+  using ScrollSnapRange = mozilla::ScrollSnapRange;
+  ScrollSnapInfo();
+
+  bool operator==(const ScrollSnapInfo&) const = default;
+
+  bool HasScrollSnapping() const;
+  bool HasSnapPositions() const;
+
+  void InitializeScrollSnapStrictness(WritingMode aWritingMode,
+                                      const nsStyleDisplay* aDisplay);
+
+  StyleScrollSnapStrictness mScrollSnapStrictnessX;
+  StyleScrollSnapStrictness mScrollSnapStrictnessY;
+
+  StyleScrollSnapStrictness StrictnessInline(WritingMode aWM) const {
+    return aWM.IsVertical() ? mScrollSnapStrictnessY : mScrollSnapStrictnessX;
+  }
+  StyleScrollSnapStrictness StrictnessBlock(WritingMode aWM) const {
+    return aWM.IsVertical() ? mScrollSnapStrictnessX : mScrollSnapStrictnessY;
+  }
+
+  struct SnapTarget {
+    SnapPoint mSnapPoint;
+
+    nsRect mSnapArea;
+
+    StyleScrollSnapStop mScrollSnapStop = StyleScrollSnapStop::Normal;
+
+    ScrollSnapTargetId mTargetId = ScrollSnapTargetId::None;
+
+    SnapTarget() = default;
+
+    SnapTarget(Maybe<nscoord>&& aSnapPositionX, Maybe<nscoord>&& aSnapPositionY,
+               const nsRect& aSnapArea, StyleScrollSnapStop aScrollSnapStop,
+               ScrollSnapTargetId aTargetId)
+        : mSnapPoint(std::move(aSnapPositionX), std::move(aSnapPositionY)),
+          mSnapArea(aSnapArea),
+          mScrollSnapStop(aScrollSnapStop),
+          mTargetId(aTargetId) {}
+
+    bool operator==(const SnapTarget& aOther) const = default;
+  };
+
+  CopyableTArray<SnapTarget> mSnapTargets;
+
+  void ForEachValidTargetFor(
+      const nsPoint& aDestination,
+      const std::function<bool(const SnapTarget&)>& aFunc) const;
+
+  CopyableTArray<ScrollSnapRange> mXRangeWiderThanSnapport;
+  CopyableTArray<ScrollSnapRange> mYRangeWiderThanSnapport;
+
+  nsSize mSnapportSize;
+};
+
+std::ostream& operator<<(std::ostream& aStream,
+                         const ScrollSnapInfo::SnapTarget& aTarget);
+
+std::ostream& operator<<(std::ostream& aStream,
+                         const ScrollSnapInfo::SnapTarget* aTarget);
+
+}  
+
+#endif  // mozilla_layout_ScrollSnapInfo_h_

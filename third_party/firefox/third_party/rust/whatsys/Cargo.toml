@@ -1,0 +1,22 @@
+
+[package]
+edition = "2018"
+name = "whatsys"
+version = "0.3.2"
+authors = ["Jan-Erik Rediger <janerik@fnordig.de>"]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Determine the kernel version"
+license = "MIT"
+repository = "https://github.com/badboy/whatsys"
+
+[lib]
+name = "whatsys"
+path = "src/lib.rs"
+
+[dependencies.libc]
+version = "0.2"

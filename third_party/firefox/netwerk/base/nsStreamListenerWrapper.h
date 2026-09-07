@@ -1,0 +1,57 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsStreamListenerWrapper_h_
+#define nsStreamListenerWrapper_h_
+
+#include "nsCOMPtr.h"
+#include "nsIRequest.h"
+#include "nsIStreamListener.h"
+#include "nsIThreadRetargetableStreamListener.h"
+#include "nsIMultiPartChannel.h"
+
+namespace mozilla {
+namespace net {
+
+class nsStreamListenerWrapper final
+    : public nsIMultiPartChannelListener,
+      public nsIThreadRetargetableStreamListener {
+ public:
+  explicit nsStreamListenerWrapper(nsIStreamListener* listener)
+      : mListener(listener) {
+    MOZ_ASSERT(mListener, "no stream listener specified");
+  }
+
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_FORWARD_SAFE_NSISTREAMLISTENER(mListener)
+  NS_DECL_NSIMULTIPARTCHANNELLISTENER
+  NS_DECL_NSITHREADRETARGETABLESTREAMLISTENER
+
+  NS_IMETHOD OnStartRequest(nsIRequest* aRequest) override {
+    nsCOMPtr<nsIMultiPartChannel> multiPartChannel =
+        do_QueryInterface(aRequest);
+    if (multiPartChannel) {
+      mIsMulti = true;
+    }
+    return mListener->OnStartRequest(aRequest);
+  }
+  NS_IMETHOD OnStopRequest(nsIRequest* aRequest,
+                           nsresult aStatusCode) override {
+    nsresult rv = mListener->OnStopRequest(aRequest, aStatusCode);
+    if (!mIsMulti) {
+      mListener = nullptr;
+    }
+    return rv;
+  }
+
+ private:
+  bool mIsMulti{false};
+  ~nsStreamListenerWrapper() = default;
+  nsCOMPtr<nsIStreamListener> mListener;
+};
+
+}  
+}  
+
+#endif  // nsStreamListenerWrapper_h_

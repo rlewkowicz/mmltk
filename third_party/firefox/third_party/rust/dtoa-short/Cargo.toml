@@ -1,0 +1,18 @@
+
+[package]
+name = "dtoa-short"
+version = "0.3.3"
+authors = ["Xidorn Quan <me@upsuper.org>"]
+include = ["src/*.rs", "Cargo.toml", "LICENSE"]
+description = "Serialize float number and truncate to certain precision"
+keywords = ["float"]
+categories = ["value-formatting"]
+license = "MPL-2.0"
+repository = "https://github.com/upsuper/dtoa-short"
+[dependencies.dtoa]
+version = "0.4.1"
+[badges.codecov]
+repository = "upsuper/dtoa-short"
+
+[badges.travis-ci]
+repository = "upsuper/dtoa-short"

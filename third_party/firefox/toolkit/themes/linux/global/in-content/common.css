@@ -1,0 +1,29 @@
+/* - This Source Code Form is subject to the terms of the Mozilla Public
+   - License, v. 2.0. If a copy of the MPL was not distributed with this file,
+   - You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+@import url("chrome://global/skin/in-content/common-shared.css");
+
+@namespace html "http://www.w3.org/1999/xhtml";
+@namespace xul "http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul";
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    scrollbar-color: initial;
+  }
+}
+
+xul|menulist::part(label-box),
+xul|*.radio-label-box,
+xul|*.checkbox-label-box,
+xul|*.button-menu-dropmarker {
+  appearance: none;
+}
+
+xul|menulist {
+  font-size: inherit;
+}
+
+html|button {
+  min-width: 6.3em;
+}

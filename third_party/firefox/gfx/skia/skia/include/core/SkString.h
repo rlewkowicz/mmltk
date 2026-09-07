@@ -1,0 +1,247 @@
+/*
+ * Copyright 2006 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkString_DEFINED)
+#define SkString_DEFINED
+
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkScalar.h"
+#include "include/core/SkTypes.h"
+#include "include/private/base/SkTo.h"
+#include "include/private/base/SkTypeTraits.h"
+
+#include <atomic>
+#include <cstdarg>
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <string_view>
+#include <type_traits>
+
+static inline bool SkStrStartsWith(const char string[], const char prefixStr[]) {
+    SkASSERT(string);
+    SkASSERT(prefixStr);
+    return !strncmp(string, prefixStr, strlen(prefixStr));
+}
+static inline bool SkStrStartsWith(const char string[], char prefixChar) {
+    SkASSERT(string);
+    return (prefixChar == *string);
+}
+
+bool SkStrEndsWith(const char string[], const char suffixStr[]);
+bool SkStrEndsWith(const char string[], char suffixChar);
+
+int SkStrStartsWithOneOf(const char string[], const char prefixes[]);
+
+static inline int SkStrFind(const char string[], const char substring[]) {
+    const char *first = strstr(string, substring);
+    if (nullptr == first) return -1;
+    return SkToInt(first - &string[0]);
+}
+
+static inline int SkStrFindLastOf(const char string[], char subchar) {
+    const char* last = strrchr(string, subchar);
+    if (nullptr == last) return -1;
+    return SkToInt(last - &string[0]);
+}
+
+static inline bool SkStrContains(const char string[], const char substring[]) {
+    SkASSERT(string);
+    SkASSERT(substring);
+    return (-1 != SkStrFind(string, substring));
+}
+static inline bool SkStrContains(const char string[], char subchar) {
+    SkASSERT(string);
+    char tmp[2];
+    tmp[0] = subchar;
+    tmp[1] = '\0';
+    return (-1 != SkStrFind(string, tmp));
+}
+
+
+static constexpr int kSkStrAppendU32_MaxSize = 10;
+char* SkStrAppendU32(char buffer[], uint32_t);
+static constexpr int kSkStrAppendU64_MaxSize = 20;
+char* SkStrAppendU64(char buffer[], uint64_t, int minDigits);
+
+static constexpr int kSkStrAppendS32_MaxSize = kSkStrAppendU32_MaxSize + 1;
+char* SkStrAppendS32(char buffer[], int32_t);
+static constexpr int kSkStrAppendS64_MaxSize = kSkStrAppendU64_MaxSize + 1;
+char* SkStrAppendS64(char buffer[], int64_t, int minDigits);
+
+static constexpr int kSkStrAppendScalar_MaxSize = 15;
+
+char* SkStrAppendScalar(char buffer[], SkScalar);
+
+class SK_API SkString {
+public:
+                SkString();
+    explicit    SkString(size_t len);
+    explicit    SkString(const char text[]);
+                SkString(const char text[], size_t len);
+                SkString(const SkString&);
+                SkString(SkString&&);
+    explicit    SkString(const std::string&);
+    explicit    SkString(std::string_view);
+                ~SkString();
+
+    bool        isEmpty() const { return 0 == fRec->fLength; }
+    size_t      size() const { return (size_t) fRec->fLength; }
+    const char* data() const { return fRec->data(); }
+    const char* c_str() const { return fRec->data(); }
+    char operator[](size_t n) const { return this->c_str()[n]; }
+    const char* begin() const { return data(); }
+    const char* end() const { return data() + size(); }
+
+    bool equals(const SkString&) const;
+    bool equals(const char text[]) const;
+    bool equals(const char text[], size_t len) const;
+
+    bool startsWith(const char prefixStr[]) const {
+        return SkStrStartsWith(fRec->data(), prefixStr);
+    }
+    bool startsWith(char prefixChar) const {
+        return SkStrStartsWith(fRec->data(), prefixChar);
+    }
+    bool endsWith(const char suffixStr[]) const {
+        return SkStrEndsWith(fRec->data(), suffixStr);
+    }
+    bool endsWith(char suffixChar) const {
+        return SkStrEndsWith(fRec->data(), suffixChar);
+    }
+    bool contains(const char substring[]) const {
+        return SkStrContains(fRec->data(), substring);
+    }
+    bool contains(char subchar) const {
+        return SkStrContains(fRec->data(), subchar);
+    }
+    int find(const char substring[]) const {
+        return SkStrFind(fRec->data(), substring);
+    }
+    int findLastOf(char subchar) const {
+        return SkStrFindLastOf(fRec->data(), subchar);
+    }
+
+    friend bool operator==(const SkString& a, const SkString& b) {
+        return a.equals(b);
+    }
+    friend bool operator!=(const SkString& a, const SkString& b) {
+        return !a.equals(b);
+    }
+
+
+    SkString& operator=(const SkString&);
+    SkString& operator=(SkString&&);
+    SkString& operator=(const char text[]);
+
+    char* data();
+    char& operator[](size_t n) { return this->data()[n]; }
+    char* begin() { return data(); }
+    char* end() { return data() + size(); }
+
+    void reset();
+    void resize(size_t len);
+    void set(const SkString& src) { *this = src; }
+    void set(const char text[]);
+    void set(const char text[], size_t len);
+    void set(std::string_view str) { this->set(str.data(), str.size()); }
+
+    void insert(size_t offset, const char text[]);
+    void insert(size_t offset, const char text[], size_t len);
+    void insert(size_t offset, const SkString& str) { this->insert(offset, str.c_str(), str.size()); }
+    void insert(size_t offset, std::string_view str) { this->insert(offset, str.data(), str.size()); }
+    void insertUnichar(size_t offset, SkUnichar);
+    void insertS32(size_t offset, int32_t value);
+    void insertS64(size_t offset, int64_t value, int minDigits = 0);
+    void insertU32(size_t offset, uint32_t value);
+    void insertU64(size_t offset, uint64_t value, int minDigits = 0);
+    void insertHex(size_t offset, uint32_t value, int minDigits = 0);
+    void insertScalar(size_t offset, SkScalar);
+
+    void append(const char text[]) { this->insert((size_t)-1, text); }
+    void append(const char text[], size_t len) { this->insert((size_t)-1, text, len); }
+    void append(const SkString& str) { this->insert((size_t)-1, str.c_str(), str.size()); }
+    void append(std::string_view str) { this->insert((size_t)-1, str.data(), str.size()); }
+    void appendUnichar(SkUnichar uni) { this->insertUnichar((size_t)-1, uni); }
+    void appendS32(int32_t value) { this->insertS32((size_t)-1, value); }
+    void appendS64(int64_t value, int minDigits = 0) { this->insertS64((size_t)-1, value, minDigits); }
+    void appendU32(uint32_t value) { this->insertU32((size_t)-1, value); }
+    void appendU64(uint64_t value, int minDigits = 0) { this->insertU64((size_t)-1, value, minDigits); }
+    void appendHex(uint32_t value, int minDigits = 0) { this->insertHex((size_t)-1, value, minDigits); }
+    void appendScalar(SkScalar value) { this->insertScalar((size_t)-1, value); }
+
+    void prepend(const char text[]) { this->insert(0, text); }
+    void prepend(const char text[], size_t len) { this->insert(0, text, len); }
+    void prepend(const SkString& str) { this->insert(0, str.c_str(), str.size()); }
+    void prepend(std::string_view str) { this->insert(0, str.data(), str.size()); }
+    void prependUnichar(SkUnichar uni) { this->insertUnichar(0, uni); }
+    void prependS32(int32_t value) { this->insertS32(0, value); }
+    void prependS64(int32_t value, int minDigits = 0) { this->insertS64(0, value, minDigits); }
+    void prependHex(uint32_t value, int minDigits = 0) { this->insertHex(0, value, minDigits); }
+    void prependScalar(SkScalar value) { this->insertScalar((size_t)-1, value); }
+
+    void printf(const char format[], ...) SK_PRINTF_LIKE(2, 3);
+    void printVAList(const char format[], va_list) SK_PRINTF_LIKE(2, 0);
+    void appendf(const char format[], ...) SK_PRINTF_LIKE(2, 3);
+    void appendVAList(const char format[], va_list) SK_PRINTF_LIKE(2, 0);
+    void prependf(const char format[], ...) SK_PRINTF_LIKE(2, 3);
+    void prependVAList(const char format[], va_list) SK_PRINTF_LIKE(2, 0);
+
+    void remove(size_t offset, size_t length);
+
+    SkString& operator+=(const SkString& s) { this->append(s); return *this; }
+    SkString& operator+=(const char text[]) { this->append(text); return *this; }
+    SkString& operator+=(char c) { this->append(&c, 1); return *this; }
+
+    void swap(SkString& other);
+
+    using sk_is_trivially_relocatable = std::true_type;
+
+private:
+    struct Rec {
+    public:
+        constexpr Rec(uint32_t len, int32_t refCnt) : fLength(len), fRefCnt(refCnt) {}
+        static sk_sp<Rec> Make(const char text[], size_t len);
+        char* data() { return fBeginningOfData; }
+        const char* data() const { return fBeginningOfData; }
+        void ref() const;
+        void unref() const;
+        bool unique() const;
+#if defined(SK_DEBUG)
+        int32_t getRefCnt() const;
+#endif
+        uint32_t fLength; 
+
+    private:
+        mutable std::atomic<int32_t> fRefCnt;
+        char fBeginningOfData[1] = {'\0'};
+
+        void operator delete(void* p) { ::operator delete(p); }
+    };
+    sk_sp<Rec> fRec;
+
+    static_assert(::sk_is_trivially_relocatable<decltype(fRec)>::value);
+
+#if defined(SK_DEBUG)
+          SkString& validate();
+    const SkString& validate() const;
+#else
+          SkString& validate()       { return *this; }
+    const SkString& validate() const { return *this; }
+#endif
+
+    static const Rec gEmptyRec;
+};
+
+SK_API SkString SkStringPrintf(const char* format, ...) SK_PRINTF_LIKE(1, 2);
+static inline SkString SkStringPrintf() { return SkString(); }
+
+static inline void swap(SkString& a, SkString& b) {
+    a.swap(b);
+}
+
+#endif

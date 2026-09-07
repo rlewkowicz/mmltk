@@ -1,0 +1,55 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_MatrixMessage_h
+#define mozilla_layers_MatrixMessage_h
+
+#include "mozilla/Maybe.h"
+#include "mozilla/gfx/Matrix.h"
+#include "mozilla/layers/LayersTypes.h"
+#include "Units.h"  // for ScreenRect
+#include "UnitTransforms.h"
+
+namespace mozilla {
+namespace layers {
+class MatrixMessage {
+ public:
+  MatrixMessage() = default;
+
+  MatrixMessage(const Maybe<LayerToScreenMatrix4x4>& aMatrix,
+                const ScreenRect& aTopLevelViewportVisibleRectInBrowserCoords,
+                const LayersId& aLayersId)
+      : mMatrix(ToUnknownMatrix(aMatrix)),
+        mTopLevelViewportVisibleRectInBrowserCoords(
+            aTopLevelViewportVisibleRectInBrowserCoords),
+        mLayersId(aLayersId) {}
+
+  inline Maybe<LayerToScreenMatrix4x4> GetMatrix() const {
+    return LayerToScreenMatrix4x4::FromUnknownMatrix(mMatrix);
+  }
+
+  inline ScreenRect GetTopLevelViewportVisibleRectInBrowserCoords() const {
+    return mTopLevelViewportVisibleRectInBrowserCoords;
+  }
+
+  inline const LayersId& GetLayersId() const { return mLayersId; }
+
+  bool operator==(const MatrixMessage& aOther) const {
+    return aOther.mMatrix == mMatrix &&
+           aOther.mTopLevelViewportVisibleRectInBrowserCoords ==
+               mTopLevelViewportVisibleRectInBrowserCoords &&
+           aOther.mLayersId == mLayersId;
+  }
+
+  bool operator!=(const MatrixMessage& aOther) const {
+    return !(*this == aOther);
+  }
+  Maybe<gfx::Matrix4x4> mMatrix;  
+  ScreenRect mTopLevelViewportVisibleRectInBrowserCoords;
+  LayersId mLayersId;
+};
+};  
+};  
+
+#endif  // mozilla_layers_MatrixMessage_h

@@ -1,0 +1,264 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsAppFileLocationProvider.h"
+#include "nsAppDirectoryServiceDefs.h"
+#include "nsDirectoryServiceDefs.h"
+#include "nsEnumeratorUtils.h"
+#include "nsAtom.h"
+#include "nsIDirectoryService.h"
+#include "nsIFile.h"
+#include "nsString.h"
+#include "nsSimpleEnumerator.h"
+#include "nsXREDirProvider.h"
+#include "prenv.h"
+#include "nsCRT.h"
+#if defined(XP_UNIX)
+#  include <unistd.h>
+#  include <sys/param.h>
+#endif
+
+
+#  define APP_REGISTRY_NAME "appreg"_ns
+
+#define DEFAULT_PRODUCT_DIR nsLiteralCString(MOZ_USER_DIR)
+
+#define DEFAULTS_DIR_NAME "defaults"_ns
+#define DEFAULTS_PREF_DIR_NAME "pref"_ns
+#define RES_DIR_NAME "res"_ns
+#define CHROME_DIR_NAME "chrome"_ns
+
+
+nsAppFileLocationProvider::nsAppFileLocationProvider() = default;
+
+
+NS_IMPL_ISUPPORTS(nsAppFileLocationProvider, nsIDirectoryServiceProvider)
+
+
+NS_IMETHODIMP
+nsAppFileLocationProvider::GetFile(const char* aProp, bool* aPersistent,
+                                   nsIFile** aResult) {
+  if (NS_WARN_IF(!aProp)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  nsCOMPtr<nsIFile> localFile;
+  nsresult rv = NS_ERROR_FAILURE;
+
+  *aResult = nullptr;
+  *aPersistent = true;
+
+  if (nsCRT::strcmp(aProp, NS_APP_APPLICATION_REGISTRY_DIR) == 0) {
+    rv = GetProductDirectory(getter_AddRefs(localFile));
+  } else if (nsCRT::strcmp(aProp, NS_APP_APPLICATION_REGISTRY_FILE) == 0) {
+    rv = GetProductDirectory(getter_AddRefs(localFile));
+    if (NS_SUCCEEDED(rv)) {
+      rv = localFile->AppendNative(APP_REGISTRY_NAME);
+    }
+  } else if (nsCRT::strcmp(aProp, NS_APP_DEFAULTS_50_DIR) == 0) {
+    rv = CloneMozBinDirectory(getter_AddRefs(localFile));
+    if (NS_SUCCEEDED(rv)) {
+      rv = localFile->AppendRelativeNativePath(DEFAULTS_DIR_NAME);
+    }
+  } else if (nsCRT::strcmp(aProp, NS_APP_PREF_DEFAULTS_50_DIR) == 0) {
+    rv = CloneMozBinDirectory(getter_AddRefs(localFile));
+    if (NS_SUCCEEDED(rv)) {
+      rv = localFile->AppendRelativeNativePath(DEFAULTS_DIR_NAME);
+      if (NS_SUCCEEDED(rv)) {
+        rv = localFile->AppendRelativeNativePath(DEFAULTS_PREF_DIR_NAME);
+      }
+    }
+  } else if (nsCRT::strcmp(aProp, NS_APP_USER_PROFILES_ROOT_DIR) == 0) {
+    rv = GetDefaultUserProfileRoot(getter_AddRefs(localFile));
+  } else if (nsCRT::strcmp(aProp, NS_APP_USER_PROFILES_LOCAL_ROOT_DIR) == 0) {
+    rv = GetDefaultUserProfileRoot(getter_AddRefs(localFile), true);
+  } else if (nsCRT::strcmp(aProp, NS_APP_RES_DIR) == 0) {
+    rv = CloneMozBinDirectory(getter_AddRefs(localFile));
+    if (NS_SUCCEEDED(rv)) {
+      rv = localFile->AppendRelativeNativePath(RES_DIR_NAME);
+    }
+  } else if (nsCRT::strcmp(aProp, NS_APP_CHROME_DIR) == 0) {
+    rv = CloneMozBinDirectory(getter_AddRefs(localFile));
+    if (NS_SUCCEEDED(rv)) {
+      rv = localFile->AppendRelativeNativePath(CHROME_DIR_NAME);
+    }
+  } else if (nsCRT::strcmp(aProp, NS_APP_INSTALL_CLEANUP_DIR) == 0) {
+    rv = CloneMozBinDirectory(getter_AddRefs(localFile));
+  }
+
+  if (localFile && NS_SUCCEEDED(rv)) {
+    localFile.forget(aResult);
+    return NS_OK;
+  }
+
+  return rv;
+}
+
+nsresult nsAppFileLocationProvider::CloneMozBinDirectory(nsIFile** aLocalFile) {
+  if (NS_WARN_IF(!aLocalFile)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+  nsresult rv;
+
+  if (!mMozBinDirectory) {
+    nsCOMPtr<nsIProperties> directoryService(
+        do_GetService(NS_DIRECTORY_SERVICE_CONTRACTID, &rv));
+    if (NS_FAILED(rv)) {
+      return rv;
+    }
+
+    rv =
+        directoryService->Get(NS_XPCOM_CURRENT_PROCESS_DIR, NS_GET_IID(nsIFile),
+                              getter_AddRefs(mMozBinDirectory));
+    if (NS_FAILED(rv)) {
+      rv = directoryService->Get(NS_OS_CURRENT_PROCESS_DIR, NS_GET_IID(nsIFile),
+                                 getter_AddRefs(mMozBinDirectory));
+      if (NS_FAILED(rv)) {
+        return rv;
+      }
+    }
+  }
+
+  nsCOMPtr<nsIFile> aFile;
+  rv = mMozBinDirectory->Clone(getter_AddRefs(aFile));
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  NS_IF_ADDREF(*aLocalFile = aFile);
+  return NS_OK;
+}
+
+nsresult nsAppFileLocationProvider::GetProductDirectory(nsIFile** aLocalFile,
+                                                        bool aLocal) {
+  if (NS_WARN_IF(!aLocalFile)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  nsresult rv;
+  bool exists;
+  nsCOMPtr<nsIFile> localDir;
+
+#if defined(XP_UNIX)
+  const char* homeDir = PR_GetEnv("HOME");
+  rv = NS_NewNativeLocalFile(nsDependentCString(homeDir),
+                             getter_AddRefs(localDir));
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+#if defined(MOZ_WIDGET_GTK)
+  rv = nsXREDirProvider::GetLegacyOrXDGHomePath(homeDir,
+                                                getter_AddRefs(localDir));
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+#endif
+
+#else
+#  error dont_know_how_to_get_product_dir_on_your_platform
+#endif
+
+#if defined(MOZ_WIDGET_GTK)
+  bool legacyExists = nsXREDirProvider::LegacyHomeExists(nullptr);
+  if (legacyExists || nsXREDirProvider::IsForceLegacyHome()) {
+    nsAutoCString productDir;
+    nsAutoCString mozUserDir;
+    mozUserDir = nsLiteralCString(MOZ_USER_DIR);
+    if (mozUserDir.get()[0] != '.') {
+      productDir = "."_ns + DEFAULT_PRODUCT_DIR;
+    } else {
+      productDir = DEFAULT_PRODUCT_DIR;
+    }
+    rv = localDir->AppendNative(productDir);
+  } else {
+    rv = localDir->AppendNative(DEFAULT_PRODUCT_DIR);
+  }
+#else
+  rv = localDir->AppendNative(DEFAULT_PRODUCT_DIR);
+#endif
+
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  rv = localDir->Exists(&exists);
+  if (NS_SUCCEEDED(rv) && !exists) {
+    rv = localDir->Create(nsIFile::DIRECTORY_TYPE, 0700);
+  }
+
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  localDir.forget(aLocalFile);
+
+  return rv;
+}
+
+nsresult nsAppFileLocationProvider::GetDefaultUserProfileRoot(
+    nsIFile** aLocalFile, bool aLocal) {
+  if (NS_WARN_IF(!aLocalFile)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  nsresult rv;
+  nsCOMPtr<nsIFile> localDir;
+
+  rv = GetProductDirectory(getter_AddRefs(localDir), aLocal);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+
+  localDir.forget(aLocalFile);
+
+  return rv;
+}
+
+
+class nsAppDirectoryEnumerator : public nsSimpleEnumerator {
+ public:
+  nsAppDirectoryEnumerator(nsIDirectoryServiceProvider* aProvider,
+                           const char* aKeyList[])
+      : mProvider(aProvider), mCurrentKey(aKeyList) {}
+
+  const nsID& DefaultInterface() override { return NS_GET_IID(nsIFile); }
+
+  NS_IMETHOD HasMoreElements(bool* aResult) override {
+    while (!mNext && *mCurrentKey) {
+      bool dontCare;
+      nsCOMPtr<nsIFile> testFile;
+      (void)mProvider->GetFile(*mCurrentKey++, &dontCare,
+                               getter_AddRefs(testFile));
+      mNext = testFile;
+    }
+    *aResult = mNext != nullptr;
+    return NS_OK;
+  }
+
+  NS_IMETHOD GetNext(nsISupports** aResult) override {
+    if (NS_WARN_IF(!aResult)) {
+      return NS_ERROR_INVALID_ARG;
+    }
+    *aResult = nullptr;
+
+    bool hasMore;
+    HasMoreElements(&hasMore);
+    if (!hasMore) {
+      return NS_ERROR_FAILURE;
+    }
+
+    *aResult = mNext;
+    NS_IF_ADDREF(*aResult);
+    mNext = nullptr;
+
+    return *aResult ? NS_OK : NS_ERROR_FAILURE;
+  }
+
+ protected:
+  nsCOMPtr<nsIDirectoryServiceProvider> mProvider;
+  const char** mCurrentKey;
+  nsCOMPtr<nsIFile> mNext;
+};

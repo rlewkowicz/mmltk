@@ -1,0 +1,105 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_net_SocketProcessHost_h
+#define mozilla_net_SocketProcessHost_h
+
+#include "mozilla/Maybe.h"
+#include "mozilla/ipc/GeckoChildProcessHost.h"
+#include "mozilla/MemoryReportingProcess.h"
+#include "mozilla/ipc/TaskFactory.h"
+
+namespace mozilla {
+
+
+namespace net {
+
+class SocketProcessParent;
+
+class SocketProcessHost final : public mozilla::ipc::GeckoChildProcessHost {
+  friend class SocketProcessParent;
+
+ public:
+  class Listener {
+   public:
+    NS_INLINE_DECL_THREADSAFE_REFCOUNTING(Listener)
+
+    virtual void OnProcessLaunchComplete(SocketProcessHost* aHost,
+                                         bool aSucceeded) = 0;
+
+    virtual void OnProcessUnexpectedShutdown(SocketProcessHost* aHost) = 0;
+
+   protected:
+    virtual ~Listener() = default;
+  };
+
+  explicit SocketProcessHost(Listener* listener);
+
+  bool Launch();
+
+  void Shutdown();
+
+  SocketProcessParent* GetActor() const {
+    MOZ_ASSERT(NS_IsMainThread());
+
+    return mSocketProcessParent.get();
+  }
+
+  bool IsConnected() const {
+    MOZ_ASSERT(NS_IsMainThread());
+
+    return !!mSocketProcessParent;
+  }
+
+  void OnChannelConnected(base::ProcessId peer_pid) override;
+
+
+ private:
+  ~SocketProcessHost();
+
+  void OnChannelConnectedTask();
+
+  void InitAfterConnect(bool aSucceeded);
+
+  void OnChannelClosed();
+
+  void DestroyProcess();
+
+
+  DISALLOW_COPY_AND_ASSIGN(SocketProcessHost);
+
+  RefPtr<Listener> mListener;
+  mozilla::Maybe<mozilla::ipc::TaskFactory<SocketProcessHost>> mTaskFactory;
+
+  enum class LaunchPhase { Unlaunched, Waiting, Complete };
+  LaunchPhase mLaunchPhase;
+
+  RefPtr<SocketProcessParent> mSocketProcessParent;
+  bool mShutdownRequested;
+  bool mChannelClosed;
+};
+
+class SocketProcessMemoryReporter : public MemoryReportingProcess {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(SocketProcessMemoryReporter, override)
+
+  SocketProcessMemoryReporter() = default;
+
+  bool IsAlive() const override;
+
+  bool SendRequestMemoryReport(
+      const uint32_t& aGeneration, const bool& aAnonymize,
+      const bool& aMinimizeMemoryUsage,
+      const Maybe<mozilla::ipc::FileDescriptor>& aDMDFile) override;
+
+  int32_t Pid() const override;
+
+ protected:
+  virtual ~SocketProcessMemoryReporter() = default;
+};
+
+}  
+}  
+
+#endif  // mozilla_net_SocketProcessHost_h

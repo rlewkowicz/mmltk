@@ -1,0 +1,68 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "builtin/temporal/Int96.h"
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Casting.h"
+#include "mozilla/FloatingPoint.h"
+#include "mozilla/Maybe.h"
+
+#include <cmath>
+#include <stdint.h>
+
+#include "builtin/Number.h"
+
+using namespace js;
+using namespace js::temporal;
+
+mozilla::Maybe<Int96> Int96::fromInteger(double value) {
+  MOZ_ASSERT(IsInteger(value));
+
+  int64_t intValue;
+  if (mozilla::NumberEqualsInt64(value, &intValue)) {
+    return mozilla::Some(Int96{intValue});
+  }
+
+  constexpr double maximum = 0x1p+96;
+
+  if (std::abs(value) >= maximum) {
+    return mozilla::Nothing();
+  }
+
+  constexpr int DigitBits = 32;
+
+  Int96::Digits digits = {};
+
+  int exponent = int(mozilla::ExponentComponent(value));
+  MOZ_ASSERT(0 <= exponent && exponent <= 95,
+             "exponent is lower than exponent of 0x1p+96");
+
+  int length = exponent / DigitBits + 1;
+  MOZ_ASSERT(1 <= length && length <= 3);
+
+  using Double = mozilla::FloatingPoint<double>;
+  uint64_t mantissa =
+      mozilla::BitwiseCast<uint64_t>(value) & Double::kSignificandBits;
+
+  mantissa |= 1ull << Double::kSignificandWidth;
+
+  int msdTopBit = exponent % DigitBits;
+
+  int remainingMantissaBits = int(Double::kSignificandWidth - msdTopBit);
+  digits[--length] = mantissa >> remainingMantissaBits;
+
+  mantissa = mantissa << (64 - remainingMantissaBits);
+  if (mantissa) {
+    MOZ_ASSERT(length > 0);
+    digits[--length] = uint32_t(mantissa >> 32);
+
+    if (uint32_t(mantissa)) {
+      MOZ_ASSERT(length > 0);
+      digits[--length] = uint32_t(mantissa);
+    }
+  }
+
+  return mozilla::Some(Int96{digits, value < 0});
+}

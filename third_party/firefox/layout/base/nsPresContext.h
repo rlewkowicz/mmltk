@@ -1,0 +1,1018 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#if !defined(nsPresContext_h_)
+#define nsPresContext_h_
+
+#include "FontVisibilityProvider.h"
+#include "Units.h"
+#include "gfxRect.h"
+#include "gfxTypes.h"
+#include "mozilla/AppUnits.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/DepthOrderedFrameList.h"
+#include "mozilla/EnumeratedArray.h"
+#include "mozilla/MediaEmulationData.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/NotNull.h"
+#include "mozilla/PreferenceSheet.h"
+#include "mozilla/PresShellForwards.h"
+#include "mozilla/ScrollStyles.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/WeakPtr.h"
+#include "mozilla/intl/Bidi.h"
+#include "mozilla/widget/ThemeChangeKind.h"
+#include "nsAtom.h"
+#include "nsCOMPtr.h"
+#include "nsChangeHint.h"
+#include "nsColor.h"
+#include "nsCompatibility.h"
+#include "nsCoord.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsFontMetrics.h"
+#include "nsGkAtoms.h"
+#include "nsHashKeys.h"
+#include "nsIWidgetListener.h"  // for nsSizeMode
+#include "nsRect.h"
+#include "nsStringFwd.h"
+#include "nsTArray.h"
+#include "nsTHashSet.h"
+#include "nsTHashtable.h"
+#include "nsThreadUtils.h"
+
+class nsIPrintSettings;
+class nsDocShell;
+class nsIDocShell;
+class nsITheme;
+class nsITimer;
+class nsIContent;
+class nsIFrame;
+class nsFrameManager;
+class nsAtom;
+class nsIRunnable;
+class gfxFontFamily;
+class gfxFontFeatureValueSet;
+class gfxUserFontEntry;
+class gfxUserFontSet;
+class gfxTextPerfMetrics;
+class nsCSSFontFeatureValuesRule;
+class nsCSSFrameConstructor;
+class nsFontCache;
+class nsTransitionManager;
+class nsAnimationManager;
+class nsRefreshDriver;
+class nsIWidget;
+class nsDeviceContext;
+class gfxMissingFontRecorder;
+
+namespace mozilla {
+class AnimationEventDispatcher;
+class EffectCompositor;
+class Encoding;
+class EventStateManager;
+class CounterStyleManager;
+class ManagedPostRefreshObserver;
+class PresShell;
+class RestyleManager;
+class ServoStyleSet;
+class StaticPresData;
+class TimelineManager;
+struct MediaFeatureChange;
+enum class MediaFeatureChangePropagation : uint8_t;
+enum class ColorScheme : uint8_t;
+enum class StyleForcedColors : uint8_t;
+namespace layers {
+class ContainerLayer;
+class LayerManager;
+}  
+namespace dom {
+class Document;
+class Element;
+class PerformanceMainThread;
+enum class PrefersColorSchemeOverride : uint8_t;
+}  
+namespace gfx {
+class FontPaletteValueSet;
+class PaletteCache;
+}  
+}  
+
+const uint8_t kPresContext_DefaultVariableFont_ID = 0x00;
+const uint8_t kPresContext_DefaultFixedFont_ID = 0x01;
+
+#if defined(DEBUG)
+struct nsAutoLayoutPhase;
+
+enum class nsLayoutPhase : uint8_t {
+  Paint,
+  DisplayListBuilding,  
+  Reflow,
+  FrameC,
+  COUNT
+};
+#endif
+
+class nsRootPresContext;
+
+
+class nsPresContext : public nsISupports,
+                      public mozilla::SupportsWeakPtr,
+                      public FontVisibilityProvider {
+ public:
+  using Encoding = mozilla::Encoding;
+  template <typename T>
+  using NotNull = mozilla::NotNull<T>;
+  template <typename T>
+  using Maybe = mozilla::Maybe<T>;
+  using MediaEmulationData = mozilla::MediaEmulationData;
+
+  typedef mozilla::ScrollStyles ScrollStyles;
+  using TransactionId = mozilla::layers::TransactionId;
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_CLASS(nsPresContext)
+
+  FONT_VISIBILITY_PROVIDER_IMPL
+
+  enum nsPresContextType : uint8_t {
+    eContext_Galley,        
+    eContext_PrintPreview,  
+    eContext_Print,         
+    eContext_PageLayout     
+  };
+
+  nsPresContext(mozilla::dom::Document* aDocument, nsPresContextType aType);
+
+  void Init(nsDeviceContext*);
+
+  void InitFontCache();
+
+  void UpdateFontCacheUserFonts(gfxUserFontSet* aUserFontSet);
+
+  already_AddRefed<nsFontMetrics> GetMetricsFor(
+      const nsFont& aFont, const nsFontMetrics::Params& aParams);
+
+  nsresult FontMetricsDeleted(const nsFontMetrics* aFontMetrics);
+
+  nsresult FlushFontCache();
+
+  void AttachPresShell(mozilla::PresShell* aPresShell);
+  void DetachPresShell();
+
+  nsPresContextType Type() const { return mType; }
+
+  mozilla::PresShell* PresShell() const {
+    NS_ASSERTION(mPresShell, "Null pres shell");
+    return mPresShell;
+  }
+
+  mozilla::PresShell* GetPresShell() const { return mPresShell; }
+
+  void DocumentCharSetChanged(NotNull<const Encoding*> aCharSet);
+
+  mozilla::dom::PerformanceMainThread* GetPerformanceMainThread() const;
+  nsPresContext* GetParentPresContext() const;
+
+  nsPresContext* GetInProcessRootContentDocumentPresContext();
+
+  nsIWidget* GetNearestWidget() const;
+
+  nsIWidget* GetRootWidget() const;
+
+  nsIWidget* GetTextInputHandlingWidget() const {
+    return GetRootWidget();
+  }
+
+  nsRootPresContext* GetRootPresContext() const;
+
+  virtual bool IsRoot() const { return false; }
+
+  mozilla::dom::Document* Document() const {
+#if defined(DEBUG)
+    ValidatePresShellAndDocumentReleation();
+#endif
+    return mDocument;
+  }
+
+  inline mozilla::ServoStyleSet* StyleSet() const;
+
+  bool HasPendingMediaQueryUpdates() const {
+    return !!mPendingMediaFeatureValuesChange;
+  }
+
+  inline nsCSSFrameConstructor* FrameConstructor() const;
+
+  mozilla::AnimationEventDispatcher* AnimationEventDispatcher() {
+    return mAnimationEventDispatcher;
+  }
+
+  mozilla::EffectCompositor* EffectCompositor() { return mEffectCompositor; }
+  nsTransitionManager* TransitionManager() { return mTransitionManager.get(); }
+  nsAnimationManager* AnimationManager() { return mAnimationManager.get(); }
+  const nsAnimationManager* AnimationManager() const {
+    return mAnimationManager.get();
+  }
+  mozilla::TimelineManager* TimelineManager() { return mTimelineManager.get(); }
+
+  nsRefreshDriver* RefreshDriver() { return mRefreshDriver; }
+
+  mozilla::RestyleManager* RestyleManager() {
+    MOZ_ASSERT(mRestyleManager);
+    return mRestyleManager.get();
+  }
+
+  mozilla::CounterStyleManager* CounterStyleManager() const {
+    return mCounterStyleManager;
+  }
+
+  void RebuildAllStyleData(nsChangeHint, const mozilla::RestyleHint&);
+  void PostRebuildAllStyleDataEvent(nsChangeHint, const mozilla::RestyleHint&);
+
+  void ContentLanguageChanged();
+
+  bool FlushPendingMediaFeatureValuesChanged();
+
+  void MediaFeatureValuesChanged(const mozilla::MediaFeatureChange&,
+                                 mozilla::MediaFeatureChangePropagation);
+
+  void SizeModeChanged(nsSizeMode aSizeMode);
+
+  nsCompatibility CompatibilityMode() const;
+
+  uint16_t ImageAnimationMode() const { return mImageAnimationMode; }
+  void SetImageAnimationMode(uint16_t aMode);
+
+  const nsAtom* Medium() const {
+    MOZ_ASSERT(mMedium);
+    return mMediaEmulationData.mMedium ? mMediaEmulationData.mMedium.get()
+                                       : mMedium;
+  }
+
+  void EmulateMedium(nsAtom* aMediaType);
+
+  const mozilla::PreferenceSheet::Prefs& PrefSheetPrefs() const {
+    return mozilla::PreferenceSheet::PrefsFor(*mDocument);
+  }
+
+  mozilla::StyleForcedColors ForcedColors() const { return mForcedColors; }
+  bool ForcingColors() const;
+
+  mozilla::ColorScheme DefaultBackgroundColorScheme() const;
+  nscolor DefaultBackgroundColor() const;
+
+  nsISupports* GetContainerWeak() const;
+
+  nsDocShell* GetDocShell() const;
+
+  nsRect GetVisibleArea() const { return mVisibleArea; }
+
+  void SetVisibleArea(const nsRect& aRect);
+
+  void SetInitialVisibleArea(const nsRect& aRect);
+
+  nsSize GetSizeForViewportUnits() const { return mSizeForViewportUnits; }
+
+  MOZ_CAN_RUN_SCRIPT
+  void SetDynamicToolbarMaxHeight(mozilla::ScreenIntCoord aHeight);
+
+  bool HasDynamicToolbar() const { return GetDynamicToolbarMaxHeight() > 0; }
+
+  void UpdateDynamicToolbarOffset(mozilla::ScreenIntCoord aOffset);
+
+  mozilla::ScreenIntCoord GetDynamicToolbarMaxHeight() const {
+    MOZ_ASSERT_IF(mDynamicToolbarMaxHeight > 0,
+                  IsRootContentDocumentCrossProcess());
+    return mDynamicToolbarMaxHeight;
+  }
+
+  nscoord GetDynamicToolbarMaxHeightInAppUnits() const;
+
+  mozilla::ScreenIntCoord GetDynamicToolbarHeight() const {
+    MOZ_ASSERT_IF(mDynamicToolbarHeight > 0,
+                  IsRootContentDocumentCrossProcess());
+    return mDynamicToolbarHeight;
+  }
+
+  void UpdateKeyboardHeight(mozilla::ScreenIntCoord aHeight);
+
+  mozilla::ScreenIntCoord GetKeyboardHeight() const;
+
+  bool IsKeyboardHiddenOrResizesContentMode() const;
+
+  nscoord GetBimodalDynamicToolbarHeightInAppUnits() const;
+
+  nscoord GetBimodalDynamicToolbarHeightForFixedPosInAppUnits() const;
+
+  mozilla::DynamicToolbarState GetDynamicToolbarState() const;
+
+  bool IsPaginated() const { return mPaginated; }
+
+  void SetPaginatedScrolling(bool aResult);
+
+  bool HasPaginatedScrolling() const { return mCanPaginatedScroll; }
+
+  uint32_t LastScrollGeneration() { return mLastScrollGeneration; }
+  void UpdateLastScrollGeneration() { mLastScrollGeneration += 1; }
+  bool HasBeenScrolledSince(const uint32_t& mPreviousScrollGeneration) const {
+    return mPreviousScrollGeneration < mLastScrollGeneration;
+  }
+
+  const nsSize& GetPageSize() const { return mPageSize; }
+  const nsMargin& GetDefaultPageMargin() const { return mDefaultPageMargin; }
+  void SetPageSize(nsSize aSize) { mPageSize = aSize; }
+
+  bool IsRootPaginatedDocument() { return mIsRootPaginatedDocument; }
+  void SetIsRootPaginatedDocument(bool aIsRootPaginatedDocument) {
+    mIsRootPaginatedDocument = aIsRootPaginatedDocument;
+  }
+
+
+  float GetPageScale() { return mPageScale; }
+  void SetPageScale(float aScale) { mPageScale = aScale; }
+
+  float GetPrintPreviewScaleForSequenceFrameOrScrollbars() const {
+    return mPPScale;
+  }
+  void SetPrintPreviewScale(float aScale) { mPPScale = aScale; }
+
+  nsDeviceContext* DeviceContext() const { return mDeviceContext; }
+  mozilla::EventStateManager* EventStateManager() { return mEventManager; }
+
+  bool UserInputEventsAllowed();
+
+  void MaybeIncreaseMeasuredTicksSinceLoading();
+
+  bool NeedsMoreTicksForUserInput() const;
+
+  void ResetUserInputEventsAllowed() {
+    MOZ_ASSERT(IsRoot());
+    mMeasuredTicksSinceLoading = 0;
+    mUserInputEventsAllowed = false;
+  }
+
+  float TextZoom() const { return mTextZoom; }
+
+  void SetSafeAreaInsets(const mozilla::LayoutDeviceIntMargin& aInsets);
+
+  const mozilla::LayoutDeviceIntMargin& GetSafeAreaInsets() const {
+    return mSafeAreaInsets;
+  }
+
+  void RegisterManagedPostRefreshObserver(mozilla::ManagedPostRefreshObserver*);
+  void UnregisterManagedPostRefreshObserver(
+      mozilla::ManagedPostRefreshObserver*);
+
+ protected:
+  void CancelManagedPostRefreshObservers();
+
+#if defined(DEBUG)
+  void ValidatePresShellAndDocumentReleation() const;
+#endif
+
+  void SetTextZoom(float aZoom);
+  void SetFullZoom(float aZoom);
+  void SetOverrideDPPX(float);
+  void SetInRDMPane(bool aInRDMPane);
+  void UpdateInnerSizeSpoofedForRFP();
+  void UpdateForcedColors(bool aNotify = true);
+
+ public:
+  float GetFullZoom() { return mFullZoom; }
+  float GetDeviceFullZoom();
+
+  float GetOverrideDPPX() const { return mMediaEmulationData.mDPPX; }
+
+  Maybe<mozilla::ColorScheme> GetOverriddenOrEmbedderColorScheme() const;
+
+  void RecomputeBrowsingContextDependentData();
+
+  void SetColorSchemeOverride(mozilla::dom::PrefersColorSchemeOverride);
+
+  void SetLinkParametersOverride(
+      const mozilla::StyleLinkParameters& aLinkParameters);
+
+  gfxSize ScreenSizeInchesForFontInflation(bool* aChanged = nullptr);
+
+  int32_t AppUnitsPerDevPixel() const { return mCurAppUnitsPerDevPixel; }
+
+  static nscoord CSSPixelsToAppUnits(int32_t aPixels) {
+    return NSToCoordRoundWithClamp(float(aPixels) *
+                                   float(mozilla::AppUnitsPerCSSPixel()));
+  }
+
+  static nscoord CSSPixelsToAppUnits(float aPixels) {
+    return NSToCoordRoundWithClamp(aPixels *
+                                   float(mozilla::AppUnitsPerCSSPixel()));
+  }
+
+  static int32_t AppUnitsToIntCSSPixels(nscoord aAppUnits) {
+    return NSAppUnitsToIntPixels(aAppUnits,
+                                 float(mozilla::AppUnitsPerCSSPixel()));
+  }
+
+  static float AppUnitsToFloatCSSPixels(nscoord aAppUnits) {
+    return NSAppUnitsToFloatPixels(aAppUnits,
+                                   float(mozilla::AppUnitsPerCSSPixel()));
+  }
+
+  static double AppUnitsToDoubleCSSPixels(nscoord aAppUnits) {
+    return NSAppUnitsToDoublePixels(aAppUnits,
+                                    double(mozilla::AppUnitsPerCSSPixel()));
+  }
+
+  nscoord DevPixelsToAppUnits(int32_t aPixels) const {
+    return NSIntPixelsToAppUnits(aPixels, AppUnitsPerDevPixel());
+  }
+
+  int32_t AppUnitsToDevPixels(nscoord aAppUnits) const {
+    return NSAppUnitsToIntPixels(aAppUnits, float(AppUnitsPerDevPixel()));
+  }
+
+  float AppUnitsToFloatDevPixels(nscoord aAppUnits) const {
+    return aAppUnits / float(AppUnitsPerDevPixel());
+  }
+
+  int32_t CSSPixelsToDevPixels(int32_t aPixels) const {
+    return AppUnitsToDevPixels(CSSPixelsToAppUnits(aPixels));
+  }
+
+  float CSSPixelsToDevPixels(float aPixels) const {
+    return NSAppUnitsToFloatPixels(CSSPixelsToAppUnits(aPixels),
+                                   float(AppUnitsPerDevPixel()));
+  }
+
+  int32_t DevPixelsToIntCSSPixels(int32_t aPixels) const {
+    return AppUnitsToIntCSSPixels(DevPixelsToAppUnits(aPixels));
+  }
+
+  static nscoord RoundDownAppUnitsToCSSPixel(nscoord aAppUnits) {
+    return mozilla::RoundDownToMultiple(aAppUnits,
+                                        mozilla::AppUnitsPerCSSPixel());
+  }
+  static nscoord RoundUpAppUnitsToCSSPixel(nscoord aAppUnits) {
+    return mozilla::RoundUpToMultiple(aAppUnits,
+                                      mozilla::AppUnitsPerCSSPixel());
+  }
+  static nscoord RoundAppUnitsToCSSPixel(nscoord aAppUnits) {
+    return mozilla::RoundToMultiple(aAppUnits, mozilla::AppUnitsPerCSSPixel());
+  }
+
+  nscoord RoundDownAppUnitsToDevPixel(nscoord aAppUnits) const {
+    return mozilla::RoundDownToMultiple(aAppUnits, AppUnitsPerDevPixel());
+  }
+  nscoord RoundUpAppUnitsToDevPixel(nscoord aAppUnits) const {
+    return mozilla::RoundUpToMultiple(aAppUnits, AppUnitsPerDevPixel());
+  }
+  nscoord RoundAppUnitsToDevPixel(nscoord aAppUnits) const {
+    return mozilla::RoundToMultiple(aAppUnits, AppUnitsPerDevPixel());
+  }
+
+  mozilla::CSSIntPoint DevPixelsToIntCSSPixels(
+      const mozilla::LayoutDeviceIntPoint& aPoint) {
+    return mozilla::CSSIntPoint(
+        AppUnitsToIntCSSPixels(DevPixelsToAppUnits(aPoint.x)),
+        AppUnitsToIntCSSPixels(DevPixelsToAppUnits(aPoint.y)));
+  }
+
+  float DevPixelsToFloatCSSPixels(int32_t aPixels) const {
+    return AppUnitsToFloatCSSPixels(DevPixelsToAppUnits(aPixels));
+  }
+
+  mozilla::CSSToLayoutDeviceScale CSSToDevPixelScale() const {
+    return mozilla::CSSToLayoutDeviceScale(
+        float(mozilla::AppUnitsPerCSSPixel()) / float(AppUnitsPerDevPixel()));
+  }
+
+  nscoord GfxUnitsToAppUnits(gfxFloat aGfxUnits) const;
+
+  gfxFloat AppUnitsToGfxUnits(nscoord aAppUnits) const;
+
+  gfxRect AppUnitsToGfxUnits(const nsRect& aAppRect) const {
+    return gfxRect(AppUnitsToGfxUnits(aAppRect.x),
+                   AppUnitsToGfxUnits(aAppRect.y),
+                   AppUnitsToGfxUnits(aAppRect.Width()),
+                   AppUnitsToGfxUnits(aAppRect.Height()));
+  }
+
+  static nscoord CSSTwipsToAppUnits(float aTwips) {
+    return NSToCoordRoundWithClamp(mozilla::AppUnitsPerCSSInch() *
+                                   NS_TWIPS_TO_INCHES(aTwips));
+  }
+
+  static nsMargin CSSTwipsToAppUnits(const nsIntMargin& marginInTwips) {
+    return nsMargin(CSSTwipsToAppUnits(float(marginInTwips.top)),
+                    CSSTwipsToAppUnits(float(marginInTwips.right)),
+                    CSSTwipsToAppUnits(float(marginInTwips.bottom)),
+                    CSSTwipsToAppUnits(float(marginInTwips.left)));
+  }
+
+  static nscoord CSSPointsToAppUnits(float aPoints) {
+    return NSToCoordRound(aPoints * mozilla::AppUnitsPerCSSInch() /
+                          POINTS_PER_INCH_FLOAT);
+  }
+
+  nscoord PhysicalMillimetersToAppUnits(float aMM) const;
+
+  nscoord RoundAppUnitsToNearestDevPixels(nscoord aAppUnits) const {
+    return DevPixelsToAppUnits(AppUnitsToDevPixels(aAppUnits));
+  }
+
+  mozilla::dom::Element* UpdateViewportScrollStylesOverride(
+      const mozilla::dom::Element* aRemovedChild = nullptr);
+
+  mozilla::dom::Element* GetViewportScrollStylesOverrideElement() const {
+    return mViewportScrollOverrideElement;
+  }
+
+  const ScrollStyles& GetViewportScrollStylesOverride() const {
+    return mViewportScrollStyles;
+  }
+
+  bool ElementWouldPropagateScrollStyles(const mozilla::dom::Element&);
+
+  bool GetBackgroundImageDraw() const { return mDrawImageBackground; }
+  bool GetBackgroundColorDraw() const { return mDrawColorBackground; }
+
+  bool BidiEnabled() const;
+
+  void SetBidiEnabled() const;
+
+  void SetVisualMode(bool aIsVisual) { mIsVisual = aIsVisual; }
+
+  bool IsVisualMode() const { return mIsVisual; }
+
+
+  void SetBidi(uint32_t aBidiOptions);
+
+  uint32_t GetBidi() const;
+
+  nsITheme* Theme() const MOZ_NONNULL_RETURN;
+
+  void RecomputeTheme();
+
+  bool UseOverlayScrollbars() const;
+
+  void ThemeChanged(mozilla::widget::ThemeChangeKind);
+
+  void UIResolutionChanged();
+
+  void UIResolutionChangedSync();
+
+  void SetPrintSettings(nsIPrintSettings* aPrintSettings);
+
+  nsIPrintSettings* GetPrintSettings() { return mPrintSettings; }
+
+  bool EnsureVisible();
+
+
+  void ConstructedFrame() { ++mFramesConstructed; }
+  void ReflowedFrame() { ++mFramesReflowed; }
+  void TriggeredAnimationRestyle() { ++mAnimationTriggeredRestyles; }
+
+  uint64_t FramesConstructedCount() const { return mFramesConstructed; }
+  uint64_t FramesReflowedCount() const { return mFramesReflowed; }
+  uint64_t AnimationTriggeredRestylesCount() const {
+    return mAnimationTriggeredRestyles;
+  }
+
+  static nscoord GetBorderWidthForKeyword(unsigned int aBorderWidthKeyword) {
+    static const nscoord kBorderWidths[] = {
+        CSSPixelsToAppUnits(1), CSSPixelsToAppUnits(3), CSSPixelsToAppUnits(5)};
+    MOZ_ASSERT(size_t(aBorderWidthKeyword) < std::size(kBorderWidths));
+
+    return kBorderWidths[aBorderWidthKeyword];
+  }
+
+  gfxTextPerfMetrics* GetTextPerfMetrics() { return mTextPerf.get(); }
+
+  bool IsDynamic() const {
+    return mType == eContext_PageLayout || mType == eContext_Galley;
+  }
+  bool IsScreen() const {
+    return mMedium == nsGkAtoms::screen || mType == eContext_PageLayout ||
+           mType == eContext_PrintPreview;
+  }
+  bool IsPrintingOrPrintPreview() const {
+    return mType == eContext_Print || mType == eContext_PrintPreview;
+  }
+
+  bool IsPrintPreview() const { return mType == eContext_PrintPreview; }
+
+  gfxUserFontSet* GetUserFontSet();
+
+  gfxMissingFontRecorder* MissingFontRecorder() { return mMissingFonts.get(); }
+
+  void NotifyMissingFonts();
+
+  void FlushCounterStyles();
+  void MarkCounterStylesDirty();
+
+  void FlushFontFeatureValues();
+  void MarkFontFeatureValuesDirty() { mFontFeatureValuesDirty = true; }
+
+  void FlushFontPaletteValues();
+  void MarkFontPaletteValuesDirty() { mFontPaletteValuesDirty = true; }
+
+  mozilla::gfx::PaletteCache& FontPaletteCache();
+
+  void EnsureSafeToHandOutCSSRules();
+
+  void NotifyInvalidation(TransactionId aTransactionId, const nsRect& aRect);
+  void NotifyDidPaintForSubtree(
+      TransactionId aTransactionId = TransactionId{0},
+      const mozilla::TimeStamp& aTimeStamp = mozilla::TimeStamp());
+  void NotifyRevokingDidPaint(TransactionId aTransactionId);
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void FireDOMPaintEvent(
+      nsTArray<nsRect>* aList, TransactionId aTransactionId,
+      mozilla::TimeStamp aTimeStamp = mozilla::TimeStamp());
+
+  bool IsDOMPaintEventPending();
+
+  uint64_t GetRestyleGeneration() const;
+  uint64_t GetUndisplayedRestyleGeneration() const;
+
+  void ReflowStarted(bool aInterruptible);
+
+  class InterruptPreventer;
+  friend class InterruptPreventer;
+  class MOZ_STACK_CLASS InterruptPreventer {
+   public:
+    explicit InterruptPreventer(nsPresContext* aCtx)
+        : mCtx(aCtx),
+          mInterruptsEnabled(aCtx->mInterruptsEnabled),
+          mHasPendingInterrupt(aCtx->mHasPendingInterrupt) {
+      mCtx->mInterruptsEnabled = false;
+      mCtx->mHasPendingInterrupt = false;
+    }
+    ~InterruptPreventer() {
+      mCtx->mInterruptsEnabled = mInterruptsEnabled;
+      mCtx->mHasPendingInterrupt = mHasPendingInterrupt;
+    }
+
+   private:
+    nsPresContext* mCtx;
+    bool mInterruptsEnabled;
+    bool mHasPendingInterrupt;
+  };
+
+  bool CheckForInterrupt(nsIFrame* aFrame);
+  bool HasPendingInterrupt() const { return mHasPendingInterrupt; }
+  void SetPendingInterruptFromTest() { mPendingInterruptFromTest = true; }
+
+  nsIFrame* GetPrimaryFrameFor(nsIContent* aContent);
+
+  virtual size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) const;
+  virtual size_t SizeOfIncludingThis(
+      mozilla::MallocSizeOf aMallocSizeOf) const {
+    return aMallocSizeOf(this) + SizeOfExcludingThis(aMallocSizeOf);
+  }
+
+  bool IsRootContentDocumentInProcess() const;
+
+  bool IsRootContentDocumentCrossProcess() const;
+
+  bool HadNonBlankPaint() const { return mHadNonBlankPaint; }
+  bool HadFirstContentfulPaint() const { return mHadFirstContentfulPaint; }
+  bool HasStoppedGeneratingLCP() const;
+  void NotifyNonBlankPaint();
+  void NotifyContentfulPaint();
+  void NotifyPaintStatusReset();
+
+  bool HasEverBuiltInvisibleText() const { return mHasEverBuiltInvisibleText; }
+  void SetBuiltInvisibleText() { mHasEverBuiltInvisibleText = true; }
+
+  bool HasWarnedAboutTooLargeDashedOrDottedRadius() const {
+    return mHasWarnedAboutTooLargeDashedOrDottedRadius;
+  }
+
+  void SetHasWarnedAboutTooLargeDashedOrDottedRadius() {
+    mHasWarnedAboutTooLargeDashedOrDottedRadius = true;
+  }
+
+  void RegisterContainerQueryFrame(nsIFrame* aFrame);
+  void UnregisterContainerQueryFrame(nsIFrame* aFrame);
+  bool HasContainerQueryFrames() const {
+    return !mContainerQueryFrames.IsEmpty();
+  }
+
+  void FinishedContainerQueryUpdate();
+
+  void UpdateContainerQueryStylesAndAnchorPosLayout();
+
+  mozilla::intl::Bidi& BidiEngine();
+
+  gfxFontFeatureValueSet* GetFontFeatureValuesLookup() const {
+    return mFontFeatureValuesLookup;
+  }
+
+  mozilla::gfx::FontPaletteValueSet* GetFontPaletteValueSet() const {
+    return mFontPaletteValueSet;
+  }
+
+  bool NeedsToUpdateHiddenByContentVisibilityForAnimations() const {
+    return mNeedsToUpdateHiddenByContentVisibilityForAnimations;
+  }
+  void SetNeedsToUpdateHiddenByContentVisibilityForAnimations() {
+    mNeedsToUpdateHiddenByContentVisibilityForAnimations = true;
+  }
+  void UpdateHiddenByContentVisibilityForAnimationsIfNeeded() {
+    if (mNeedsToUpdateHiddenByContentVisibilityForAnimations) {
+      DoUpdateHiddenByContentVisibilityForAnimations();
+    }
+  }
+
+ protected:
+  void DoUpdateHiddenByContentVisibilityForAnimations();
+  friend class nsRunnableMethod<nsPresContext>;
+  void ThemeChangedInternal();
+  void RefreshSystemMetrics();
+
+  void UIResolutionChangedInternal();
+
+  void SetImgAnimations(nsIContent* aParent, uint16_t aMode);
+  void SetSMILAnimations(mozilla::dom::Document* aDoc, uint16_t aNewMode,
+                         uint16_t aOldMode);
+
+  static void PreferenceChanged(const char* aPrefName, void* aSelf);
+  void PreferenceChanged(const char* aPrefName);
+
+  void GetUserPreferences();
+
+  void UpdateCharSet(NotNull<const Encoding*> aCharSet);
+
+  void DoForceReflowForFontInfoUpdateFromStyle();
+
+  void UpdateAnimationsPlayBackRateMultiplier(double aMultiplier);
+
+ public:
+  void ForceReflowForFontInfoUpdate(bool aNeedsReframe);
+  void ForceReflowForFontInfoUpdateFromStyle();
+
+  void InvalidatePaintedLayers();
+
+  uint32_t GetNextFrameRateMultiplier() const {
+    return mNextFrameRateMultiplier;
+  }
+
+  void DidUseFrameRateMultiplier() {
+    if (mNextFrameRateMultiplier < 8) {
+      ++mNextFrameRateMultiplier;
+    }
+  }
+
+  mozilla::TimeStamp GetMarkPaintTimingStart() const {
+    return mMarkPaintTimingStart;
+  }
+
+  bool NormalizeRubyMetrics();
+
+  float RubyPositioningFactor() const {
+    MOZ_ASSERT(mRubyPositioningFactor > 0.0f);
+    return mRubyPositioningFactor;
+  }
+
+  double AnimationsPlayBackRateMultiplier() const {
+    return mAnimationsPlayBackRateMultiplier;
+  }
+
+ protected:
+  void Destroy();
+
+  void AppUnitsPerDevPixelChanged();
+
+  bool HavePendingInputEvent();
+
+  already_AddRefed<nsITimer> CreateTimer(nsTimerCallbackFunc aCallback,
+                                         const nsACString& aName,
+                                         uint32_t aDelay);
+
+  struct TransactionInvalidations {
+    TransactionId mTransactionId;
+    nsTArray<nsRect> mInvalidations;
+    bool mIsWaitingForPreviousTransaction = false;
+  };
+  TransactionInvalidations* GetInvalidations(TransactionId aTransactionId);
+
+  void AdjustSizeForViewportUnits();
+
+  bool UpdateFontVisibility();
+
+
+  mozilla::PresShell* MOZ_NON_OWNING_REF mPresShell;  
+  RefPtr<mozilla::dom::Document> mDocument;
+  RefPtr<nsDeviceContext> mDeviceContext;  
+  RefPtr<nsFontCache> mFontCache;
+  RefPtr<mozilla::EventStateManager> mEventManager;
+  RefPtr<nsRefreshDriver> mRefreshDriver;
+  RefPtr<mozilla::AnimationEventDispatcher> mAnimationEventDispatcher;
+  RefPtr<mozilla::EffectCompositor> mEffectCompositor;
+  mozilla::UniquePtr<nsTransitionManager> mTransitionManager;
+  mozilla::UniquePtr<nsAnimationManager> mAnimationManager;
+  mozilla::UniquePtr<mozilla::TimelineManager> mTimelineManager;
+  mozilla::UniquePtr<mozilla::RestyleManager> mRestyleManager;
+  RefPtr<mozilla::CounterStyleManager> mCounterStyleManager;
+  const nsStaticAtom* mMedium;
+  RefPtr<gfxFontFeatureValueSet> mFontFeatureValuesLookup;
+  RefPtr<mozilla::gfx::FontPaletteValueSet> mFontPaletteValueSet;
+
+  mozilla::UniquePtr<mozilla::gfx::PaletteCache> mFontPaletteCache;
+
+  MediaEmulationData mMediaEmulationData;
+
+  float mTextZoom;  
+  float mFullZoom;  
+
+  gfxSize mLastFontInflationScreenSize;
+
+  int32_t mCurAppUnitsPerDevPixel;
+  int32_t mAutoQualityMinFontSizePixelsPref;
+
+  float mRubyPositioningFactor = -1.0f;  
+
+  nsCOMPtr<nsITheme> mTheme;
+  nsCOMPtr<nsIPrintSettings> mPrintSettings;
+
+  mozilla::UniquePtr<mozilla::intl::Bidi> mBidiEngine;
+
+  AutoTArray<TransactionInvalidations, 4> mTransactions;
+
+  mozilla::UniquePtr<gfxTextPerfMetrics> mTextPerf;
+
+  mozilla::UniquePtr<gfxMissingFontRecorder> mMissingFonts;
+
+  nsRect mVisibleArea;
+  nsSize mSizeForViewportUnits;
+  mozilla::ScreenIntCoord mDynamicToolbarMaxHeight;
+  mozilla::ScreenIntCoord mDynamicToolbarHeight;
+  mozilla::LayoutDeviceIntMargin mSafeAreaInsets;
+  nsSize mPageSize;
+
+  nsMargin mDefaultPageMargin;
+  float mPageScale;
+  float mPPScale;
+
+  mozilla::dom::Element* MOZ_NON_OWNING_REF mViewportScrollOverrideElement;
+
+  uint64_t mElementsRestyled;
+  uint64_t mFramesConstructed;
+  uint64_t mFramesReflowed;
+  uint64_t mAnimationTriggeredRestyles;
+
+  mozilla::TimeStamp mReflowStartTime;
+
+  mozilla::TimeStamp mMarkPaintTimingStart;
+
+  Maybe<TransactionId> mFirstContentfulPaintTransactionId;
+
+  mozilla::UniquePtr<mozilla::MediaFeatureChange>
+      mPendingMediaFeatureValuesChange;
+
+  mozilla::TimeStamp mLastStyleUpdateForAllAnimations;
+
+  uint32_t mLastScrollGeneration;
+
+  uint32_t mInterruptChecksToSkip;
+
+  uint32_t mNextFrameRateMultiplier;
+
+  uint32_t mMeasuredTicksSinceLoading;
+
+  nsTArray<RefPtr<mozilla::ManagedPostRefreshObserver>>
+      mManagedPostRefreshObservers;
+
+  nsTHashSet<nsCString> mBlockedFonts;
+
+  mozilla::DepthOrderedFrameList mContainerQueryFrames;
+  nsTHashSet<nsIContent*> mUpdatedContainerQueryContents;
+
+  double mAnimationsPlayBackRateMultiplier = 1.0;
+
+  ScrollStyles mViewportScrollStyles;
+
+  uint16_t mImageAnimationMode;
+  uint16_t mImageAnimationModePref;
+
+  nsPresContextType mType;
+
+ public:
+
+  bool mInflationDisabledForShrinkWrap;
+
+ protected:
+  static constexpr size_t kThemeChangeKindBits = 2;
+  static_assert(unsigned(mozilla::widget::ThemeChangeKind::AllBits) <=
+                    (1u << kThemeChangeKindBits) - 1,
+                "theme change kind doesn't fit");
+
+  unsigned mHasPendingInterrupt : 1;
+  unsigned mHasEverBuiltInvisibleText : 1;
+  unsigned mPendingInterruptFromTest : 1;
+  unsigned mInterruptsEnabled : 1;
+  unsigned mDrawImageBackground : 1;
+  unsigned mDrawColorBackground : 1;
+  unsigned mNeverAnimate : 1;
+  unsigned mPaginated : 1;
+  unsigned mCanPaginatedScroll : 1;
+  unsigned mDoScaledTwips : 1;
+  unsigned mIsRootPaginatedDocument : 1;
+  unsigned mPendingThemeChanged : 1;
+  unsigned mPendingThemeChangeKind : kThemeChangeKindBits;
+  unsigned mPendingUIResolutionChanged : 1;
+  unsigned mPendingFontInfoUpdateReflowFromStyle : 1;
+
+  unsigned mIsGlyph : 1;
+
+  unsigned mCounterStylesDirty : 1;
+
+  unsigned mFontFeatureValuesDirty : 1;
+
+  unsigned mFontPaletteValuesDirty : 1;
+
+  unsigned mIsVisual : 1;
+
+  unsigned mInRDMPane : 1;
+
+  unsigned mHasWarnedAboutTooLargeDashedOrDottedRadius : 1;
+
+  unsigned mQuirkSheetAdded : 1;
+
+  unsigned mHadNonBlankPaint : 1;
+  unsigned mHadFirstContentfulPaint : 1;
+  unsigned mHadNonTickContentfulPaint : 1;
+
+  unsigned mHadContentfulPaintComposite : 1;
+
+  unsigned mNeedsToUpdateHiddenByContentVisibilityForAnimations : 1;
+
+  unsigned mUserInputEventsAllowed : 1;
+
+#if defined(DEBUG)
+  unsigned mInitialized : 1;
+#endif
+
+  FontVisibility mFontVisibility = FontVisibility::Unknown;
+  mozilla::dom::PrefersColorSchemeOverride mOverriddenOrEmbedderColorScheme;
+  mozilla::StyleForcedColors mForcedColors;
+  mozilla::StyleLinkParameters mLinkParameters;
+
+ protected:
+  virtual ~nsPresContext();
+
+  void LastRelease();
+
+  void EnsureTheme();
+
+#if defined(DEBUG)
+ private:
+  friend struct nsAutoLayoutPhase;
+  mozilla::EnumeratedArray<nsLayoutPhase, uint32_t,
+                           size_t(nsLayoutPhase::COUNT)>
+      mLayoutPhaseCount;
+
+ public:
+  uint32_t LayoutPhaseCount(nsLayoutPhase aPhase) {
+    return mLayoutPhaseCount[aPhase];
+  }
+#endif
+};
+
+class nsRootPresContext final : public nsPresContext {
+ public:
+  nsRootPresContext(mozilla::dom::Document* aDocument, nsPresContextType aType);
+  virtual bool IsRoot() const override { return true; }
+
+  void AddWillPaintObserver(nsIRunnable* aRunnable);
+
+  void FlushWillPaintObservers();
+
+  virtual size_t SizeOfExcludingThis(
+      mozilla::MallocSizeOf aMallocSizeOf) const override;
+
+ protected:
+  class RunWillPaintObservers : public mozilla::Runnable {
+   public:
+    explicit RunWillPaintObservers(nsRootPresContext* aPresContext)
+        : Runnable("nsPresContextType::RunWillPaintObservers"),
+          mPresContext(aPresContext) {}
+    void Revoke() { mPresContext = nullptr; }
+    NS_IMETHOD Run() override {
+      if (mPresContext) {
+        mPresContext->FlushWillPaintObservers();
+      }
+      return NS_OK;
+    }
+    nsRootPresContext* MOZ_NON_OWNING_REF mPresContext;
+  };
+
+  friend class nsPresContext;
+
+  nsTArray<nsCOMPtr<nsIRunnable>> mWillPaintObservers;
+  nsRevocableEventPtr<RunWillPaintObservers> mWillPaintFallbackEvent;
+};
+
+#  define DO_GLOBAL_REFLOW_COUNT(_name)
+
+#endif

@@ -1,0 +1,344 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsHttpConnectionMgr_h_
+#define nsHttpConnectionMgr_h_
+
+#include "DnsAndConnectSocket.h"
+#include "HttpConnectionMgrShell.h"
+#include "nsHttpConnection.h"
+#include "nsHttpTransaction.h"
+#include "nsTArray.h"
+#include "nsTHashSet.h"
+#include "nsThreadUtils.h"
+#include "nsClassHashtable.h"
+#include "mozilla/DataMutex.h"
+#include "mozilla/TimeStamp.h"
+#include "ARefBase.h"
+#include "nsWeakReference.h"
+#include "ConnectionEntry.h"
+
+#include "nsINamed.h"
+#include "nsIObserver.h"
+#include "nsITimer.h"
+
+class nsIHttpUpgradeListener;
+
+namespace mozilla::net {
+class EventTokenBucket;
+class HttpConnectionBase;
+class NullHttpTransaction;
+struct HttpRetParams;
+struct Http3ConnectionStatsParams;
+
+
+class nsHttpConnectionMgr;
+using nsConnEventHandler = void (nsHttpConnectionMgr::*)(int32_t, ARefBase*);
+
+class nsHttpConnectionMgr final : public HttpConnectionMgrShell,
+                                  public nsIObserver,
+                                  nsINamed {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_HTTPCONNECTIONMGRSHELL
+  NS_DECL_NSIOBSERVER
+  NS_DECL_NSINAMED
+
+
+  nsHttpConnectionMgr();
+
+
+  [[nodiscard]] nsresult CancelTransactions(nsHttpConnectionInfo*,
+                                            nsresult code);
+
+  nsresult StoreServerCertHashes(
+      nsHttpConnectionInfo* aConnInfo, bool aNoSpdy, bool aNoHttp3,
+      nsTArray<RefPtr<nsIWebTransportHash>>&& aServerCertHashes);
+
+
+  void MoveToWildCardConnEntry(nsHttpConnectionInfo* specificCI,
+                               nsHttpConnectionInfo* wildcardCI,
+                               HttpConnectionBase* conn);
+
+  bool RemoveTransFromConnEntry(nsHttpTransaction* aTrans,
+                                const nsACString& aHashKey);
+
+  [[nodiscard]] nsresult ProcessNewTransaction(nsHttpTransaction* aTrans);
+
+  [[nodiscard]] nsresult CloseIdleConnection(nsHttpConnection*);
+  [[nodiscard]] nsresult RemoveIdleConnection(nsHttpConnection*);
+
+  [[nodiscard]] nsresult DoSingleConnectionCleanup(
+      nsHttpConnectionInfo*,
+      uint32_t aPriority = nsIRunnablePriority::PRIORITY_NORMAL);
+
+  void ReportSpdyConnection(nsHttpConnection*, bool usingSpdy,
+                            bool disallowHttp3);
+
+  void ReportHttp3Connection(HttpConnectionBase* conn,
+                             ConnectionEntry* entry = nullptr);
+
+  bool GetConnectionData(nsTArray<HttpRetParams>*);
+  bool GetHttp3ConnectionStatsData(nsTArray<Http3ConnectionStatsParams>*);
+
+  void ResetIPFamilyPreference(nsHttpConnectionInfo*);
+
+  uint16_t MaxRequestDelay() { return mMaxRequestDelay; }
+
+  void AddActiveTransaction(nsHttpTransaction* aTrans);
+  void RemoveActiveTransaction(nsHttpTransaction* aTrans,
+                               Maybe<bool> const& aOverride = Nothing());
+  void UpdateActiveTransaction(nsHttpTransaction* aTrans);
+
+  bool ShouldThrottle(nsHttpTransaction* aTrans);
+
+  void TouchThrottlingTimeWindow(bool aEnsureTicker = true);
+
+  bool IsConnEntryUnderPressure(nsHttpConnectionInfo*);
+
+  uint64_t CurrentBrowserId() { return mCurrentBrowserId; }
+
+  void DoFallbackConnection(SpeculativeTransaction* aTrans, bool aFetchHTTPSRR);
+  void DoSpeculativeConnection(SpeculativeTransaction* aTrans,
+                               bool aFetchHTTPSRR);
+
+  HttpConnectionBase* GetH2orH3ActiveConn(ConnectionEntry* ent, bool aNoHttp2,
+                                          bool aNoHttp3);
+
+  void IncreaseNumDnsAndConnectSockets();
+  void DecreaseNumDnsAndConnectSockets();
+
+  void NewIdleConnectionAdded(uint32_t timeToLive);
+  void DecrementNumIdleConns();
+
+  const nsTArray<RefPtr<nsIWebTransportHash>>* GetServerCertHashes(
+      nsHttpConnectionInfo* aConnInfo);
+
+ private:
+  virtual ~nsHttpConnectionMgr();
+
+
+  void PruneDeadConnectionsAfter(uint32_t time);
+
+  void ConditionallyStopPruneDeadConnectionsTimer();
+
+  void ConditionallyStopTimeoutTick();
+
+  [[nodiscard]] nsresult PruneNoTraffic();
+
+
+  [[nodiscard]] bool ProcessPendingQForEntry(nsHttpConnectionInfo*);
+  void ProcessPendingQForEntry(ConnectionEntry*);
+
+  void ActivateTimeoutTick();
+
+  already_AddRefed<PendingTransactionInfo> FindTransactionHelper(
+      bool removeWhenFound, ConnectionEntry* aEnt, nsAHttpTransaction* aTrans);
+
+  void DoSpeculativeConnectionInternal(ConnectionEntry* aEnt,
+                                       SpeculativeTransaction* aTrans,
+                                       bool aFetchHTTPSRR);
+
+  already_AddRefed<ConnectionEntry> FindConnectionEntry(
+      const nsHttpConnectionInfo* ci);
+
+  void MaybeRemoveEntryFromPendingSet(ConnectionEntry* ent);
+
+ public:
+  void RegisterOriginCoalescingKey(HttpConnectionBase*, const nsACString& host,
+                                   int32_t port);
+  bool BeConservativeIfProxied(nsIProxyInfo* proxy);
+
+  bool AllowToRetryDifferentIPFamilyForHttp3(nsHttpConnectionInfo* ci,
+                                             nsresult aError);
+  void SetRetryDifferentIPFamilyForHttp3(nsHttpConnectionInfo* ci,
+                                         uint16_t aIPFamily);
+
+ protected:
+  friend class ConnectionEntry;
+  void IncrementActiveConnCount();
+  void DecrementActiveConnCount(HttpConnectionBase*);
+
+ private:
+  friend class ConnectionAttemptPool;
+  friend class DnsAndConnectSocket;
+  friend class HappyEyeballsConnectionAttempt;
+  friend class DefaultHappyEyeballsConnMgrDelegate;
+  friend class PendingTransactionInfo;
+  friend class ConnectionEstablisher;
+  friend class TCPConnectionEstablisher;
+
+
+  DataMutex<nsCOMPtr<nsIEventTarget>> mSocketThreadTarget{
+      "nsHttpConnectionMgr.mSocketThreadTarget"};
+
+  Atomic<bool, mozilla::Relaxed> mIsShuttingDown{false};
+
+  uint16_t mMaxUrgentExcessiveConns{0};
+  uint16_t mMaxConns{0};
+  uint16_t mMaxPersistConnsPerHost{0};
+  uint16_t mMaxPersistConnsPerProxy{0};
+  uint16_t mMaxRequestDelay{0};  
+  bool mThrottleEnabled{false};
+  uint32_t mThrottleSuspendFor{0};
+  uint32_t mThrottleResumeFor{0};
+  uint32_t mThrottleHoldTime{0};
+  TimeDuration mThrottleMaxTime;
+  bool mBeConservativeForProxy{true};
+
+  [[nodiscard]] bool ProcessPendingQForEntry(ConnectionEntry*,
+                                             bool considerAll);
+  bool DispatchPendingQ(nsTArray<RefPtr<PendingTransactionInfo>>& pendingQ,
+                        ConnectionEntry* ent, bool considerAll);
+
+  void PreparePendingQForDispatching(
+      ConnectionEntry* ent, nsTArray<RefPtr<PendingTransactionInfo>>& pendingQ,
+      bool considerAll);
+
+  uint32_t MaxPersistConnections(ConnectionEntry* ent) const;
+
+  bool AtActiveConnectionLimit(ConnectionEntry*, uint32_t caps,
+                               bool forInnerConn = false);
+  [[nodiscard]] nsresult TryDispatchTransaction(
+      ConnectionEntry* ent, bool onlyReusedConnection,
+      PendingTransactionInfo* pendingTransInfo);
+  [[nodiscard]] nsresult TryDispatchTransactionOnIdleConn(
+      ConnectionEntry* ent, PendingTransactionInfo* pendingTransInfo,
+      bool respectUrgency, bool* allUrgent = nullptr);
+  [[nodiscard]] nsresult DispatchTransaction(ConnectionEntry*,
+                                             nsHttpTransaction*,
+                                             HttpConnectionBase*);
+  [[nodiscard]] nsresult DispatchAbstractTransaction(ConnectionEntry*,
+                                                     nsAHttpTransaction*,
+                                                     uint32_t,
+                                                     HttpConnectionBase*,
+                                                     int32_t);
+  [[nodiscard]] nsresult EnsureSocketThreadTarget();
+  [[nodiscard]] nsresult TryDispatchExtendedCONNECTransaction(
+      ConnectionEntry* aEnt, nsHttpTransaction* aTrans,
+      nsHttpConnection* aConn);
+  void StartedConnect();
+  void RecvdConnect();
+
+  ConnectionEntry* GetOrCreateConnectionEntry(
+      nsHttpConnectionInfo*, bool prohibitWildCard, bool aNoHttp2,
+      bool aNoHttp3, bool* aIsWildcard,
+      bool* aAvailableForDispatchNow = nullptr);
+
+  [[nodiscard]] nsresult MakeNewConnection(
+      ConnectionEntry* ent, PendingTransactionInfo* pendingTransInfo);
+
+  nsClassHashtable<nsUint32HashKey, nsTArray<nsWeakPtr>> mCoalescingHash;
+
+  HttpConnectionBase* FindCoalescableConnection(ConnectionEntry* ent,
+                                                bool justKidding, bool aNoHttp2,
+                                                bool aNoHttp3);
+  HttpConnectionBase* FindCoalescableConnectionByHashKey(ConnectionEntry* ent,
+                                                         HashNumber key,
+                                                         bool justKidding,
+                                                         bool aNoHttp2,
+                                                         bool aNoHttp3);
+  void UpdateCoalescingForNewConn(HttpConnectionBase* conn,
+                                  ConnectionEntry* ent, bool aNoHttp3);
+
+  void ProcessSpdyPendingQ(ConnectionEntry* ent);
+  void DispatchSpdyPendingQ(nsTArray<RefPtr<PendingTransactionInfo>>& pendingQ,
+                            ConnectionEntry* ent, HttpConnectionBase* connH2,
+                            HttpConnectionBase* connH3);
+  [[nodiscard]] nsresult PostEvent(
+      nsConnEventHandler handler, int32_t iparam = 0,
+      ARefBase* vparam = nullptr,
+      uint32_t priority = nsIRunnablePriority::PRIORITY_NORMAL);
+
+  void OnMsgReclaimConnection(HttpConnectionBase*);
+
+  void OnMsgShutdown(int32_t, ARefBase*);
+  void OnMsgShutdownConfirm(int32_t, ARefBase*);
+  void OnMsgNewTransaction(int32_t, ARefBase*);
+  void OnMsgNewTransactionWithStickyConn(int32_t, ARefBase*);
+  void OnMsgReschedTransaction(int32_t, ARefBase*);
+  void OnMsgUpdateClassOfServiceOnTransaction(ClassOfService, ARefBase*);
+  void OnMsgCancelTransaction(int32_t, ARefBase*);
+  void OnMsgCancelTransactions(int32_t, ARefBase*);
+  void OnMsgProcessPendingQ(int32_t, ARefBase*);
+  void OnMsgPruneDeadConnections(int32_t, ARefBase*);
+  void OnMsgSpeculativeConnect(int32_t, ARefBase*);
+  void OnMsgCompleteUpgrade(int32_t, ARefBase*);
+  void OnMsgUpdateParam(int32_t, ARefBase*);
+  void OnMsgDoShiftReloadConnectionCleanup(int32_t, ARefBase*);
+  void OnMsgDoSingleConnectionCleanup(int32_t, ARefBase*);
+  void OnMsgProcessFeedback(int32_t, ARefBase*);
+  void OnMsgProcessAllSpdyPendingQ(int32_t, ARefBase*);
+  void OnMsgUpdateRequestTokenBucket(int32_t, ARefBase*);
+  void OnMsgVerifyTraffic(int32_t, ARefBase*);
+  void OnMsgPruneNoTraffic(int32_t, ARefBase*);
+  void OnMsgUpdateCurrentBrowserId(int32_t, ARefBase*);
+  void OnMsgClearConnectionHistory(int32_t, ARefBase*);
+  void OnMsgStoreServerCertHashes(int32_t, ARefBase*);
+
+  uint16_t mNumActiveConns{0};
+  uint16_t mNumIdleConns{0};
+  uint16_t mNumSpdyHttp3ActiveConns{0};
+  uint32_t mNumDnsAndConnectSockets{0};
+
+  uint64_t mTimeOfNextWakeUp{UINT64_MAX};
+  nsCOMPtr<nsITimer> mTimer;
+  nsCOMPtr<nsITimer> mTrafficTimer;
+  bool mPruningNoTraffic{false};
+
+  nsCOMPtr<nsITimer> mTimeoutTick;
+  bool mTimeoutTickArmed{false};
+  uint32_t mTimeoutTickNext{1};
+
+  nsRefPtrHashtable<nsCStringHashKey, ConnectionEntry> mCT;
+
+  nsTHashSet<ConnectionEntry*> mPendingQEntries;
+
+  void TimeoutTick();
+
+  void OnMsgPrintDiagnostics(int32_t, ARefBase*);
+
+  nsCString mLogData;
+  uint64_t mCurrentBrowserId{0};
+
+  void SetThrottlingEnabled(bool aEnable);
+
+  bool InThrottlingTimeWindow();
+
+  nsClassHashtable<nsUint64HashKey, nsTArray<RefPtr<nsHttpTransaction>>>
+      mActiveTransactions[2];
+
+  bool mThrottlingInhibitsReading{false};
+
+  TimeStamp mThrottlingWindowEndsAt;
+
+  nsCOMPtr<nsITimer> mThrottleTicker;
+  bool IsThrottleTickerNeeded();
+  void EnsureThrottleTickerIfNeeded();
+  void DestroyThrottleTicker();
+  void ThrottlerTick();
+
+  nsCOMPtr<nsITimer> mDelayedResumeReadTimer;
+  void DelayedResumeBackgroundThrottledTransactions();
+  void CancelDelayedResumeBackgroundThrottledTransactions();
+  void ResumeBackgroundThrottledTransactions();
+
+  void ResumeReadOf(
+      nsClassHashtable<nsUint64HashKey, nsTArray<RefPtr<nsHttpTransaction>>>&,
+      bool excludeForActiveTab = false);
+  void ResumeReadOf(nsTArray<RefPtr<nsHttpTransaction>>*);
+
+  bool mActiveTabTransactionsExist{false};
+  bool mActiveTabUnthrottledTransactionsExist{false};
+
+  void LogActiveTransactions(char);
+
+  void NotifyConnectionOfBrowserIdChange(uint64_t previousId);
+
+  void CheckTransInPendingQueue(nsHttpTransaction* aTrans);
+};
+
+}  
+
+#endif  // !nsHttpConnectionMgr_h_

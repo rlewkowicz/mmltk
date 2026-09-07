@@ -1,0 +1,84 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef SharedThreadPool_h_
+#define SharedThreadPool_h_
+
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/MaybeLeakRefPtr.h"
+#include "nsCOMPtr.h"
+#include "nsID.h"
+#include "nsIThreadPool.h"
+#include "nsString.h"
+#include "nscore.h"
+
+class nsIRunnable;
+
+namespace mozilla {
+
+class SharedThreadPool final : public nsIThreadPool {
+ public:
+  static already_AddRefed<SharedThreadPool> Get(StaticString aName,
+                                                uint32_t aThreadLimit = 4);
+
+  NS_DECL_THREADSAFE_ISUPPORTS
+
+  NS_FORWARD_SAFE_NSITHREADPOOL(mPool);
+
+  nsresult DispatchFromEndOfTaskInThisPool(nsIRunnable* event) {
+    return Dispatch(event, NS_DISPATCH_AT_END);
+  }
+
+  NS_IMETHOD DispatchFromScript(nsIRunnable* event,
+                                DispatchFlags flags) override {
+    return Dispatch(event, flags);
+  }
+
+  NS_IMETHOD Dispatch(already_AddRefed<nsIRunnable> event,
+                      DispatchFlags flags = NS_DISPATCH_NORMAL) override {
+    nsCOMPtr<nsIRunnable> runnable(event);
+    return NS_WARN_IF(!mPool) ? NS_ERROR_NULL_POINTER
+                              : mPool->Dispatch(runnable.forget(), flags);
+  }
+
+  NS_IMETHOD DelayedDispatch(already_AddRefed<nsIRunnable>, uint32_t) override {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+
+  using nsIEventTarget::Dispatch;
+
+  NS_IMETHOD RegisterShutdownTask(nsITargetShutdownTask* task) override {
+    return !mPool ? NS_ERROR_UNEXPECTED : mPool->RegisterShutdownTask(task);
+  }
+
+  NS_IMETHOD UnregisterShutdownTask(nsITargetShutdownTask* task) override {
+    return !mPool ? NS_ERROR_UNEXPECTED : mPool->UnregisterShutdownTask(task);
+  }
+
+  NS_IMETHOD IsOnCurrentThread(bool* _retval) override {
+    return !mPool ? NS_ERROR_UNEXPECTED : mPool->IsOnCurrentThread(_retval);
+  }
+
+  NS_IMETHOD_(bool) IsOnCurrentThreadInfallible() override {
+    return mPool && mPool->IsOnCurrentThread();
+  }
+
+  static void InitStatics();
+
+  NS_IMETHOD_(FeatureFlags) GetFeatures() override {
+    return SUPPORTS_SHUTDOWN_TASKS | SUPPORTS_SHUTDOWN_TASK_DISPATCH;
+  }
+
+ private:
+  explicit SharedThreadPool(nsIThreadPool* aPool);
+  ~SharedThreadPool();
+
+  nsresult EnsureThreadLimitIsAtLeast(uint32_t aThreadLimit);
+
+  const nsCOMPtr<nsIThreadPool> mPool;
+};
+
+}  
+
+#endif  // SharedThreadPool_h_

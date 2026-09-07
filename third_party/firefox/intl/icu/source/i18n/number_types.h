@@ -1,0 +1,241 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+#ifndef __NUMBER_TYPES_H__
+#define __NUMBER_TYPES_H__
+
+#include <cstdint>
+#include "unicode/decimfmt.h"
+#include "unicode/unum.h"
+#include "unicode/numsys.h"
+#include "unicode/numberformatter.h"
+#include "unicode/utf16.h"
+#include "uassert.h"
+#include "unicode/platform.h"
+#include "unicode/uniset.h"
+#include "standardplural.h"
+#include "formatted_string_builder.h"
+
+U_NAMESPACE_BEGIN
+namespace number::impl {
+
+typedef FormattedStringBuilder::Field Field;
+
+
+typedef UNumberFormatRoundingMode RoundingMode;
+
+typedef UNumberFormatPadPosition PadPosition;
+
+typedef UNumberCompactStyle CompactStyle;
+
+static constexpr int32_t kMaxIntFracSig = 999;
+
+static constexpr RoundingMode kDefaultMode = RoundingMode::UNUM_FOUND_HALFEVEN;
+
+static constexpr char16_t kFallbackPaddingString[] = u" ";
+
+
+class Modifier;
+class MutablePatternModifier;
+class DecimalQuantity;
+class ModifierStore;
+struct MicroProps;
+
+
+enum AffixPatternType {
+            TYPE_CODEPOINT = 0,
+
+            TYPE_MINUS_SIGN = -1,
+
+            TYPE_PLUS_SIGN = -2,
+
+            TYPE_APPROXIMATELY_SIGN = -3,
+
+            TYPE_PERCENT = -4,
+
+            TYPE_PERMILLE = -5,
+
+            TYPE_CURRENCY_SINGLE = -6,
+
+            TYPE_CURRENCY_DOUBLE = -7,
+
+            TYPE_CURRENCY_TRIPLE = -8,
+
+            TYPE_CURRENCY_QUAD = -9,
+
+            TYPE_CURRENCY_QUINT = -10,
+
+            TYPE_CURRENCY_OVERFLOW = -15
+};
+
+enum CompactType {
+    TYPE_DECIMAL, TYPE_CURRENCY
+};
+
+enum Signum {
+    SIGNUM_NEG = 0,
+    SIGNUM_NEG_ZERO = 1,
+    SIGNUM_POS_ZERO = 2,
+    SIGNUM_POS = 3,
+    SIGNUM_COUNT = 4,
+};
+
+
+class U_I18N_API AffixPatternProvider {
+  public:
+    static const int32_t AFFIX_PLURAL_MASK = 0xff;
+    static const int32_t AFFIX_PREFIX = 0x100;
+    static const int32_t AFFIX_NEGATIVE_SUBPATTERN = 0x200;
+    static const int32_t AFFIX_PADDING = 0x400;
+
+    static const int32_t AFFIX_POS_PREFIX = AFFIX_PREFIX;
+    static const int32_t AFFIX_POS_SUFFIX = 0;
+    static const int32_t AFFIX_NEG_PREFIX = AFFIX_PREFIX | AFFIX_NEGATIVE_SUBPATTERN;
+    static const int32_t AFFIX_NEG_SUFFIX = AFFIX_NEGATIVE_SUBPATTERN;
+
+    virtual ~AffixPatternProvider();
+
+    virtual char16_t charAt(int flags, int i) const = 0;
+
+    virtual int length(int flags) const = 0;
+
+    virtual UnicodeString getString(int flags) const = 0;
+
+    virtual bool hasCurrencySign() const = 0;
+
+    virtual bool positiveHasPlusSign() const = 0;
+
+    virtual bool hasNegativeSubpattern() const = 0;
+
+    virtual bool negativeHasMinusSign() const = 0;
+
+    virtual bool containsSymbolType(AffixPatternType, UErrorCode&) const = 0;
+
+    virtual bool hasBody() const = 0;
+
+    virtual bool currencyAsDecimal() const = 0;
+};
+
+
+class U_I18N_API Modifier {
+  public:
+    virtual ~Modifier();
+
+    virtual int32_t apply(FormattedStringBuilder& output, int leftIndex, int rightIndex,
+                          UErrorCode& status) const = 0;
+
+    virtual int32_t getPrefixLength() const = 0;
+
+    virtual int32_t getCodePointCount() const = 0;
+
+    virtual bool isStrong() const = 0;
+
+    virtual bool containsField(Field field) const = 0;
+
+    struct U_I18N_API Parameters {
+        const ModifierStore* obj = nullptr;
+        Signum signum;
+        StandardPlural::Form plural;
+
+        Parameters();
+        Parameters(const ModifierStore* _obj, Signum _signum, StandardPlural::Form _plural);
+    };
+
+    virtual void getParameters(Parameters& output) const = 0;
+
+    virtual bool strictEquals(const Modifier& other) const = 0;
+
+    bool semanticallyEquivalent(const Modifier& other) const;
+};
+
+
+class U_I18N_API ModifierStore {
+  public:
+    virtual ~ModifierStore();
+
+    virtual const Modifier* getModifier(Signum signum, StandardPlural::Form plural) const = 0;
+};
+
+
+class U_I18N_API MicroPropsGenerator {
+  public:
+    virtual ~MicroPropsGenerator() = default;
+
+    virtual void processQuantity(DecimalQuantity& quantity, MicroProps& micros,
+                                 UErrorCode& status) const = 0;
+};
+
+class MultiplierProducer {
+  public:
+    virtual ~MultiplierProducer();
+
+    virtual int32_t getMultiplier(int32_t magnitude) const = 0;
+};
+
+template<typename T>
+class U_I18N_API NullableValue {
+  public:
+    NullableValue()
+            : fNull(true) {}
+
+    NullableValue(const NullableValue<T>& other) = default;
+
+    explicit NullableValue(const T& other) {
+        fValue = other;
+        fNull = false;
+    }
+
+    NullableValue<T>& operator=(const NullableValue<T>& other) {
+        fNull = other.fNull;
+        if (!fNull) {
+            fValue = other.fValue;
+        }
+        return *this;
+    }
+
+    NullableValue<T>& operator=(const T& other) {
+        fValue = other;
+        fNull = false;
+        return *this;
+    }
+
+    bool operator==(const NullableValue& other) const {
+        return fNull ? other.fNull : (other.fNull ? false : static_cast<bool>(fValue == other.fValue));
+    }
+
+    void nullify() {
+        fNull = true;
+    }
+
+    bool isNull() const {
+        return fNull;
+    }
+
+    T get(UErrorCode& status) const {
+        if (fNull) {
+            status = U_UNDEFINED_VARIABLE;
+        }
+        return fValue;
+    }
+
+    T getNoError() const {
+        return fValue;
+    }
+
+    T getOrDefault(T defaultValue) const {
+        return fNull ? defaultValue : fValue;
+    }
+
+  private:
+    bool fNull;
+    T fValue;
+};
+
+} 
+U_NAMESPACE_END
+
+#endif //__NUMBER_TYPES_H__
+
+#endif /* #if !UCONFIG_NO_FORMATTING */

@@ -1,0 +1,82 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_MEDIA_WEBCODECS_EncoderAgent_H
+#define DOM_MEDIA_WEBCODECS_EncoderAgent_H
+
+#include "MediaResult.h"
+#include "PEMFactory.h"
+#include "PlatformEncoderModule.h"
+#include "WebCodecsUtils.h"
+#include "mozilla/DefineEnum.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/TaskQueue.h"
+
+class nsISerialEventTarget;
+
+namespace mozilla {
+
+class PDMFactory;
+class TrackInfo;
+
+namespace layers {
+class ImageContainer;
+}  
+
+class EncoderAgent final {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(EncoderAgent);
+
+  explicit EncoderAgent(WebCodecsId aId);
+
+
+  using ConfigurePromise = MozPromise<bool, MediaResult, true >;
+  using ReconfigurationPromise = MediaDataEncoder::ReconfigurationPromise;
+  RefPtr<ConfigurePromise> Configure(const EncoderConfig& aConfig);
+  RefPtr<ReconfigurationPromise> Reconfigure(
+      const RefPtr<const EncoderConfigurationChangeList>& aConfigChange);
+  RefPtr<ShutdownPromise> Shutdown();
+  using EncodePromise = MediaDataEncoder::EncodePromise;
+  RefPtr<EncodePromise> Encode(nsTArray<RefPtr<MediaData>>&& aInputs);
+  RefPtr<EncodePromise> Drain();
+
+  const WebCodecsId mId;
+
+ private:
+  ~EncoderAgent();
+
+  void Dry(MediaDataEncoder::EncodedData&& aPendingOutputs);
+
+  MOZ_DEFINE_ENUM_CLASS_WITH_TOSTRING_AT_CLASS_SCOPE(
+      State, (Unconfigured, Configuring, Configured, Encoding, Draining,
+              ShuttingDown, Error));
+  void SetState(State aState);
+
+  const RefPtr<nsISerialEventTarget> mOwnerThread;
+  const RefPtr<PEMFactory> mPEMFactory;
+  RefPtr<MediaDataEncoder> mEncoder;
+  State mState;
+
+  MozPromiseHolder<ConfigurePromise> mConfigurePromise;
+  using CreateEncoderPromise = PlatformEncoderModule::CreateEncoderPromise;
+  MozPromiseRequestHolder<CreateEncoderPromise> mCreateRequest;
+  using InitPromise = MediaDataEncoder::InitPromise;
+  MozPromiseRequestHolder<InitPromise> mInitRequest;
+
+  MozPromiseHolder<ReconfigurationPromise> mReconfigurationPromise;
+  using ReconfigureEncoderRequest = ReconfigurationPromise;
+  MozPromiseRequestHolder<ReconfigureEncoderRequest> mReconfigurationRequest;
+
+  MozPromiseHolder<ShutdownPromise> mShutdownWhileCreationPromise;
+
+  MozPromiseHolder<EncodePromise> mEncodePromise;
+  MozPromiseRequestHolder<EncodePromise> mEncodeRequest;
+
+  MozPromiseRequestHolder<EncodePromise> mDrainRequest;
+  MozPromiseHolder<EncodePromise> mDrainPromise;
+};
+
+}  
+
+#endif  // DOM_MEDIA_WEBCODECS_EncoderAgent_H

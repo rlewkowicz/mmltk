@@ -1,0 +1,113 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_PopoverData_h
+#define mozilla_dom_PopoverData_h
+
+#include "Element.h"
+#include "nsINode.h"
+#include "nsIRunnable.h"
+#include "nsIWeakReferenceUtils.h"
+#include "nsStringFwd.h"
+#include "nsThreadUtils.h"
+
+namespace mozilla::dom {
+
+class CloseWatcher;
+
+enum class PopoverAttributeState : uint8_t {
+  None,
+  Auto,    
+  Manual,  
+  Hint,    
+};
+
+enum class PopoverVisibilityState : uint8_t {
+  Hidden,
+  Showing,
+};
+
+class PopoverToggleEventTask : public Runnable {
+ public:
+  explicit PopoverToggleEventTask(nsWeakPtr aElement, nsWeakPtr aSource,
+                                  PopoverVisibilityState aOldState,
+                                  PopoverVisibilityState aNewState);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY NS_IMETHOD Run() override;
+
+  PopoverVisibilityState GetOldState() const { return mOldState; }
+  PopoverVisibilityState GetNewState() const { return mNewState; }
+
+  Element* GetSource() const;
+
+ private:
+  nsWeakPtr mElement;
+  nsWeakPtr mSource;
+  PopoverVisibilityState mOldState;
+  PopoverVisibilityState mNewState;
+};
+
+class PopoverData {
+ public:
+  PopoverData() = default;
+  ~PopoverData() = default;
+
+  void EnsureCloseWatcher(nsGenericHTMLElement* aElement);
+  CloseWatcher* GetCloseWatcher();
+  void DestroyCloseWatcher();
+
+  PopoverAttributeState GetPopoverAttributeState() const { return mState; }
+  void SetPopoverAttributeState(PopoverAttributeState aState) {
+    mState = aState;
+  }
+
+  PopoverAttributeState GetOpenedInMode() const { return mOpenedInMode; }
+  void SetOpenedInMode(PopoverAttributeState aMode) { mOpenedInMode = aMode; }
+
+  PopoverVisibilityState GetPopoverVisibilityState() const {
+    return mVisibilityState;
+  }
+  void SetPopoverVisibilityState(PopoverVisibilityState aVisibilityState) {
+    mVisibilityState = aVisibilityState;
+  }
+
+  nsWeakPtr GetPreviouslyFocusedElement() const {
+    return mPreviouslyFocusedElement;
+  }
+  void SetPreviouslyFocusedElement(nsWeakPtr aPreviouslyFocusedElement) {
+    mPreviouslyFocusedElement = aPreviouslyFocusedElement;
+  }
+
+  RefPtr<Element> GetInvoker() const {
+    return do_QueryReferent(mInvokerElement);
+  }
+  void SetInvoker(Element* aInvokerElement) {
+    mInvokerElement =
+        do_GetWeakReference(static_cast<nsINode*>(aInvokerElement));
+  }
+
+  PopoverToggleEventTask* GetToggleEventTask() const { return mTask; }
+  void SetToggleEventTask(PopoverToggleEventTask* aTask) { mTask = aTask; }
+  void ClearToggleEventTask() { mTask = nullptr; }
+
+  bool IsPopoverHiding() const { return mIsPopoverHiding; }
+  void SetIsPopoverHiding(bool aIsPopoverHiding) {
+    mIsPopoverHiding = aIsPopoverHiding;
+  }
+
+ private:
+  PopoverVisibilityState mVisibilityState = PopoverVisibilityState::Hidden;
+  PopoverAttributeState mState = PopoverAttributeState::None;
+  PopoverAttributeState mOpenedInMode = PopoverAttributeState::None;
+  nsWeakPtr mPreviouslyFocusedElement = nullptr;
+
+  nsWeakPtr mInvokerElement;
+  bool mIsPopoverHiding = false;
+  RefPtr<PopoverToggleEventTask> mTask;
+
+  RefPtr<CloseWatcher> mCloseWatcher;
+};
+}  
+
+#endif

@@ -1,0 +1,822 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "SelectionMovementUtils.h"
+
+#include "ErrorList.h"
+#include "WordMovementType.h"
+#include "mozilla/CaretAssociationHint.h"
+#include "mozilla/ContentIterator.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/Selection.h"
+#include "mozilla/dom/ShadowRoot.h"
+#include "mozilla/intl/BidiEmbeddingLevel.h"
+#include "nsBidiPresUtils.h"
+#include "nsBlockFrame.h"
+#include "nsCOMPtr.h"
+#include "nsCaret.h"
+#include "nsFrameSelection.h"
+#include "nsFrameTraversal.h"
+#include "nsIContent.h"
+#include "nsIFrame.h"
+#include "nsIFrameInlines.h"
+#include "nsLayoutUtils.h"
+#include "nsPresContext.h"
+#include "nsTextFrame.h"
+
+namespace mozilla {
+using namespace dom;
+template Result<RangeBoundary, nsresult>
+SelectionMovementUtils::MoveRangeBoundaryToSomewhere(
+    const RangeBoundary& aRangeBoundary, nsDirection aDirection,
+    CaretAssociationHint aHint, intl::BidiEmbeddingLevel aCaretBidiLevel,
+    nsSelectionAmount aAmount, PeekOffsetOptions aOptions,
+    const dom::Element* aAncestorLimiter);
+
+template Result<RawRangeBoundary, nsresult>
+SelectionMovementUtils::MoveRangeBoundaryToSomewhere(
+    const RawRangeBoundary& aRangeBoundary, nsDirection aDirection,
+    CaretAssociationHint aHint, intl::BidiEmbeddingLevel aCaretBidiLevel,
+    nsSelectionAmount aAmount, PeekOffsetOptions aOptions,
+    const dom::Element* aAncestorLimiter);
+
+template <typename ParentType, typename RefType>
+Result<RangeBoundaryBase<ParentType, RefType>, nsresult>
+SelectionMovementUtils::MoveRangeBoundaryToSomewhere(
+    const RangeBoundaryBase<ParentType, RefType>& aRangeBoundary,
+    nsDirection aDirection, CaretAssociationHint aHint,
+    intl::BidiEmbeddingLevel aCaretBidiLevel, nsSelectionAmount aAmount,
+    PeekOffsetOptions aOptions, const dom::Element* aAncestorLimiter) {
+  MOZ_ASSERT(aDirection == eDirNext || aDirection == eDirPrevious);
+  MOZ_ASSERT(aAmount == eSelectCharacter || aAmount == eSelectCluster ||
+             aAmount == eSelectWord || aAmount == eSelectBeginLine ||
+             aAmount == eSelectEndLine || aAmount == eSelectParagraph);
+
+  if (!aRangeBoundary.IsSetAndValid()) {
+    return Err(NS_ERROR_FAILURE);
+  }
+  if (!aRangeBoundary.GetContainer()->IsContent()) {
+    return Err(NS_ERROR_FAILURE);
+  }
+  Result<PeekOffsetStruct, nsresult> result = PeekOffsetForCaretMove(
+      aRangeBoundary.GetContainer()->AsContent(),
+      *aRangeBoundary.Offset(
+          RangeBoundaryBase<ParentType,
+                            RefType>::OffsetFilter::kValidOrInvalidOffsets),
+      aDirection, aHint, aCaretBidiLevel, aAmount, nsPoint{0, 0}, aOptions,
+      aAncestorLimiter);
+  if (result.isErr()) {
+    return Err(NS_ERROR_FAILURE);
+  }
+  const PeekOffsetStruct& pos = result.unwrap();
+  if (NS_WARN_IF(!pos.mResultContent)) {
+    return RangeBoundaryBase<ParentType, RefType>{};
+  }
+
+  return RangeBoundaryBase<ParentType, RefType>{
+      pos.mResultContent, static_cast<uint32_t>(pos.mContentOffset)};
+}
+
+
+Result<PeekOffsetStruct, nsresult>
+SelectionMovementUtils::PeekOffsetForCaretMove(
+    nsIContent* aContent, uint32_t aOffset, nsDirection aDirection,
+    CaretAssociationHint aHint, intl::BidiEmbeddingLevel aCaretBidiLevel,
+    const nsSelectionAmount aAmount, const nsPoint& aDesiredCaretPos,
+    PeekOffsetOptions aOptions, const Element* aAncestorLimiter) {
+  const PrimaryFrameData frameForFocus =
+      SelectionMovementUtils::GetPrimaryFrameForCaret(
+          aContent, aOffset, aOptions.contains(PeekOffsetOption::Visual), aHint,
+          aCaretBidiLevel);
+  if (!frameForFocus) {
+    return Err(NS_ERROR_FAILURE);
+  }
+
+  aOptions += {PeekOffsetOption::JumpLines, PeekOffsetOption::IsKeyboardSelect};
+  PeekOffsetStruct pos(
+      aAmount, aDirection,
+      static_cast<int32_t>(frameForFocus.mOffsetInFrameContent),
+      aDesiredCaretPos, aOptions, eDefaultBehavior, aAncestorLimiter);
+  nsresult rv = frameForFocus->PeekOffset(&pos);
+  if (NS_FAILED(rv)) {
+    return Err(rv);
+  }
+  return pos;
+}
+
+nsPrevNextBidiLevels SelectionMovementUtils::GetPrevNextBidiLevels(
+    nsIContent* aNode, uint32_t aContentOffset, CaretAssociationHint aHint,
+    bool aJumpLines, const Element* aAncestorLimiter) {
+  nsDirection direction;
+
+  nsPrevNextBidiLevels levels{};
+  levels.SetData(nullptr, nullptr, intl::BidiEmbeddingLevel::LTR(),
+                 intl::BidiEmbeddingLevel::LTR());
+
+  FrameAndOffset currentFrameAndOffset =
+      SelectionMovementUtils::GetFrameForNodeOffset(aNode, aContentOffset,
+                                                    aHint);
+  if (!currentFrameAndOffset) {
+    return levels;
+  }
+
+  auto [frameStart, frameEnd] = currentFrameAndOffset->GetOffsets();
+
+  if (0 == frameStart && 0 == frameEnd) {
+    direction = eDirPrevious;
+  } else if (static_cast<uint32_t>(frameStart) ==
+             currentFrameAndOffset.mOffsetInFrameContent) {
+    direction = eDirPrevious;
+  } else if (static_cast<uint32_t>(frameEnd) ==
+             currentFrameAndOffset.mOffsetInFrameContent) {
+    direction = eDirNext;
+  } else {
+    intl::BidiEmbeddingLevel currentLevel =
+        currentFrameAndOffset->GetEmbeddingLevel();
+    levels.SetData(currentFrameAndOffset.mFrame, currentFrameAndOffset.mFrame,
+                   currentLevel, currentLevel);
+    return levels;
+  }
+
+  PeekOffsetOptions peekOffsetOptions{PeekOffsetOption::StopAtScroller};
+  if (aJumpLines) {
+    peekOffsetOptions += PeekOffsetOption::JumpLines;
+  }
+  nsIFrame* newFrame = currentFrameAndOffset
+                           ->GetFrameFromDirection(direction, peekOffsetOptions,
+                                                   aAncestorLimiter)
+                           .mFrame;
+
+  FrameBidiData currentBidi = currentFrameAndOffset->GetBidiData();
+  intl::BidiEmbeddingLevel currentLevel = currentBidi.embeddingLevel;
+  intl::BidiEmbeddingLevel newLevel =
+      newFrame ? newFrame->GetEmbeddingLevel() : currentBidi.baseLevel;
+
+  if (!aJumpLines) {
+    if (currentFrameAndOffset->IsBrFrame()) {
+      currentFrameAndOffset = {nullptr, 0u};
+      currentLevel = currentBidi.baseLevel;
+    }
+    if (newFrame && newFrame->IsBrFrame()) {
+      newFrame = nullptr;
+      newLevel = currentBidi.baseLevel;
+    }
+  }
+
+  if (direction == eDirNext) {
+    levels.SetData(currentFrameAndOffset.mFrame, newFrame, currentLevel,
+                   newLevel);
+  } else {
+    levels.SetData(newFrame, currentFrameAndOffset.mFrame, newLevel,
+                   currentLevel);
+  }
+
+  return levels;
+}
+
+Result<nsIFrame*, nsresult> SelectionMovementUtils::GetFrameFromLevel(
+    nsIFrame* aFrameIn, nsDirection aDirection,
+    intl::BidiEmbeddingLevel aBidiLevel) {
+  if (!aFrameIn) {
+    return Err(NS_ERROR_NULL_POINTER);
+  }
+
+  intl::BidiEmbeddingLevel foundLevel = intl::BidiEmbeddingLevel::LTR();
+
+  nsFrameIterator frameIterator(aFrameIn->PresContext(), aFrameIn,
+                                nsFrameIterator::Type::Leaf,
+                                false,  
+                                false,  
+                                false,  
+                                false   
+  );
+
+  nsIFrame* foundFrame = aFrameIn;
+  nsIFrame* theFrame = nullptr;
+  do {
+    theFrame = foundFrame;
+    foundFrame = frameIterator.Traverse(aDirection == eDirNext);
+    if (!foundFrame) {
+      return Err(NS_ERROR_FAILURE);
+    }
+    foundLevel = foundFrame->GetEmbeddingLevel();
+
+  } while (foundLevel > aBidiLevel);
+
+  MOZ_ASSERT(theFrame);
+  return theFrame;
+}
+
+bool SelectionMovementUtils::AdjustFrameForLineStart(nsIFrame*& aFrame,
+                                                     uint32_t& aFrameOffset) {
+  if (!aFrame->HasSignificantTerminalNewline()) {
+    return false;
+  }
+
+  auto [start, end] = aFrame->GetOffsets();
+  if (aFrameOffset != static_cast<uint32_t>(end)) {
+    return false;
+  }
+
+  nsIFrame* nextSibling = aFrame->GetNextSibling();
+  if (!nextSibling) {
+    return false;
+  }
+
+  aFrame = nextSibling;
+  std::tie(start, end) = aFrame->GetOffsets();
+  aFrameOffset = start;
+  return true;
+}
+
+static bool IsDisplayContents(const nsIContent* aContent) {
+  return aContent->IsElement() && aContent->AsElement()->IsDisplayContents();
+}
+
+FrameAndOffset SelectionMovementUtils::GetFrameForNodeOffset(
+    const nsIContent* aNode, uint32_t aOffset, CaretAssociationHint aHint) {
+  if (!aNode) {
+    return {};
+  }
+
+  if (static_cast<int32_t>(aOffset) < 0) {
+    return {};
+  }
+
+  if (!aNode->GetPrimaryFrame() && !IsDisplayContents(aNode)) {
+    return {};
+  }
+
+  nsIFrame *returnFrame = nullptr, *lastFrame = aNode->GetPrimaryFrame();
+  const nsIContent* theNode = nullptr;
+  uint32_t offsetInFrameContent, offsetInLastFrameContent = aOffset;
+
+  while (true) {
+    if (returnFrame) {
+      lastFrame = returnFrame;
+      offsetInLastFrameContent = offsetInFrameContent;
+    }
+    offsetInFrameContent = aOffset;
+
+    theNode = aNode;
+
+    if (aNode->IsElement()) {
+      uint32_t childIndex = 0;
+      uint32_t numChildren = theNode->GetChildCount();
+
+      if (aHint == CaretAssociationHint::Before) {
+        if (aOffset > 0) {
+          childIndex = aOffset - 1;
+        } else {
+          childIndex = aOffset;
+        }
+      } else {
+        MOZ_ASSERT(aHint == CaretAssociationHint::After);
+        if (aOffset >= numChildren) {
+          if (numChildren > 0) {
+            childIndex = numChildren - 1;
+          } else {
+            childIndex = 0;
+          }
+        } else {
+          childIndex = aOffset;
+        }
+      }
+
+      if (childIndex > 0 || numChildren > 0) {
+        nsCOMPtr<nsIContent> childNode =
+            theNode->GetChildAt_Deprecated(childIndex);
+
+        if (!childNode) {
+          break;
+        }
+
+        theNode = childNode;
+      }
+
+      if (theNode->IsElement() && theNode->GetChildCount() &&
+          !theNode->HasIndependentSelection()) {
+        aNode = theNode;
+        aOffset = aOffset > childIndex ? theNode->GetChildCount() : 0;
+        continue;
+      }
+
+      if (const Text* textNode = Text::FromNode(theNode)) {
+        if (theNode->GetPrimaryFrame()) {
+          if (aOffset > childIndex) {
+            uint32_t textLength = textNode->Length();
+
+            offsetInFrameContent = textLength;
+          } else {
+            offsetInFrameContent = 0;
+          }
+        } else {
+          uint32_t numChildren = aNode->GetChildCount();
+          uint32_t newChildIndex = aHint == CaretAssociationHint::Before
+                                       ? childIndex - 1
+                                       : childIndex + 1;
+
+          if (newChildIndex < numChildren) {
+            nsCOMPtr<nsIContent> newChildNode =
+                aNode->GetChildAt_Deprecated(newChildIndex);
+            if (!newChildNode) {
+              return {};
+            }
+
+            aNode = newChildNode;
+            aOffset = aHint == CaretAssociationHint::Before
+                          ? aNode->GetChildCount()
+                          : 0;
+            continue;
+          }  
+          theNode = aNode;
+        }
+      }
+    }
+
+    if (const ShadowRoot* shadow = ShadowRoot::FromNode(theNode)) {
+      theNode = shadow->GetHost();
+    }
+
+    returnFrame = theNode->GetPrimaryFrame();
+    if (returnFrame) {
+      break;
+    }
+
+    if (aHint == CaretAssociationHint::Before) {
+      if (aOffset > 0) {
+        --aOffset;
+        continue;
+      }
+      break;
+    }
+    if (aOffset < theNode->GetChildCount()) {
+      ++aOffset;
+      continue;
+    }
+    break;
+  }  
+
+  if (!returnFrame) {
+    if (!lastFrame) {
+      return {};
+    }
+    returnFrame = lastFrame;
+    offsetInFrameContent = offsetInLastFrameContent;
+  }
+
+  if (aOffset > 0 && (uint32_t)aOffset >= aNode->Length() &&
+      theNode == aNode->GetLastChild()) {
+    nsIFrame* newFrame;
+    nsLayoutUtils::IsInvisibleBreak(theNode, &newFrame);
+    if (newFrame) {
+      returnFrame = newFrame;
+      offsetInFrameContent = 0;
+    }
+  }
+
+  int32_t unused = 0;
+  returnFrame->GetChildFrameContainingOffset(
+      static_cast<int32_t>(offsetInFrameContent),
+      aHint == CaretAssociationHint::After, &unused, &returnFrame);
+  return {returnFrame, offsetInFrameContent};
+}
+
+RawRangeBoundary SelectionMovementUtils::GetFirstVisiblePointAtLeaf(
+    const AbstractRange& aRange) {
+  MOZ_ASSERT(aRange.IsPositioned());
+  MOZ_ASSERT_IF(aRange.IsStaticRange(), aRange.AsStaticRange()->IsValid());
+
+  MOZ_ASSERT(!aRange.Collapsed());
+
+
+
+  if (Text* const text = Text::FromNode(aRange.GetStartContainer())) {
+    nsIFrame* const textFrame = text->GetPrimaryFrame();
+    if (textFrame && textFrame->IsSelectable()) {
+      return aRange.StartRef().AsRaw();
+    }
+  }
+
+  UnsafePreContentIterator iter;
+  if (aRange.IsDynamicRange()) {
+    if (NS_WARN_IF(NS_FAILED(iter.InitWithoutValidatingPoints(
+            aRange.StartRef().AsRaw(), aRange.EndRef().AsRaw())))) {
+      return {nullptr, nullptr};
+    }
+  } else {
+    if (NS_WARN_IF(NS_FAILED(
+            iter.Init(aRange.StartRef().AsRaw(), aRange.EndRef().AsRaw())))) {
+      return {nullptr, nullptr};
+    }
+  }
+
+  bool foundSelectableContainer = [&]() {
+    nsIContent* const startContainer =
+        nsIContent::FromNode(aRange.GetStartContainer());
+    return startContainer && startContainer->IsSelectable();
+  }();
+  for (iter.First(); !iter.IsDone(); iter.Next()) {
+    nsIContent* const content =
+        nsIContent::FromNodeOrNull(iter.GetCurrentNode());
+    if (MOZ_UNLIKELY(!content)) {
+      break;
+    }
+    nsIFrame* const primaryFrame = content->GetPrimaryFrame();
+    if (!primaryFrame) {
+      continue;
+    }
+
+
+    if (!primaryFrame->IsSelectable()) {
+      if (!foundSelectableContainer) {
+        continue;
+      }
+      return {content->GetParentNode(), content->GetPreviousSibling()};
+    }
+    if (content->IsText()) {
+      return {content, 0u};
+    }
+    if (primaryFrame->IsReplaced()) {
+      return {content->GetParentNode(), content->GetPreviousSibling()};
+    }
+    if (content->IsHTMLElement(nsGkAtoms::button)) {
+      return {content->GetParentNode(), content->GetPreviousSibling()};
+    }
+    if (!content->HasChildren()) {
+      return {content, 0u};
+    }
+    foundSelectableContainer = true;
+  }
+  if (foundSelectableContainer) {
+    return aRange.StartRef().AsRaw();
+  }
+  return {nullptr, nullptr};
+}
+
+RawRangeBoundary SelectionMovementUtils::GetLastVisiblePointAtLeaf(
+    const AbstractRange& aRange) {
+  MOZ_ASSERT(aRange.IsPositioned());
+  MOZ_ASSERT_IF(aRange.IsStaticRange(), aRange.AsStaticRange()->IsValid());
+
+  MOZ_ASSERT(!aRange.Collapsed());
+
+
+
+  if (Text* const text = Text::FromNode(aRange.GetEndContainer())) {
+    nsIFrame* const textFrame = text->GetPrimaryFrame();
+    if (textFrame && textFrame->IsSelectable()) {
+      return aRange.EndRef().AsRaw();
+    }
+  }
+
+  UnsafePostContentIterator iter;
+  if (aRange.IsDynamicRange()) {
+    if (NS_WARN_IF(NS_FAILED(iter.InitWithoutValidatingPoints(
+            aRange.StartRef().AsRaw(), aRange.EndRef().AsRaw())))) {
+      return {nullptr, nullptr};
+    }
+  } else {
+    if (NS_WARN_IF(NS_FAILED(
+            iter.Init(aRange.StartRef().AsRaw(), aRange.EndRef().AsRaw())))) {
+      return {nullptr, nullptr};
+    }
+  }
+
+  bool foundSelectableContainer = [&]() {
+    nsIContent* const endContainer =
+        nsIContent::FromNode(aRange.GetEndContainer());
+    return endContainer && endContainer->IsSelectable();
+  }();
+  for (iter.Last(); !iter.IsDone(); iter.Prev()) {
+    nsIContent* const content =
+        nsIContent::FromNodeOrNull(iter.GetCurrentNode());
+    if (!content) {
+      break;
+    }
+    nsIFrame* const primaryFrame = content->GetPrimaryFrame();
+    if (!primaryFrame) {
+      continue;
+    }
+    if (nsLayoutUtils::IsInvisibleBreak(content)) {
+      if (primaryFrame->IsSelectable()) {
+        foundSelectableContainer = true;
+      }
+      continue;
+    }
+    if (!primaryFrame->IsSelectable()) {
+      if (!foundSelectableContainer) {
+        continue;
+      }
+      return {content->GetParentNode(), content};
+    }
+    if (Text* const text = Text::FromNode(content)) {
+      return {text, text->TextDataLength()};
+    }
+    if (primaryFrame->IsReplaced()) {
+      return {content->GetParentNode(), content};
+    }
+    if (content->IsHTMLElement(nsGkAtoms::button)) {
+      return {content->GetParentNode(), content};
+    }
+    if (!content->HasChildren()) {
+      return {content, 0u};
+    }
+    foundSelectableContainer = true;
+  }
+  if (foundSelectableContainer) {
+    return aRange.EndRef().AsRaw();
+  }
+  return {nullptr, nullptr};
+}
+
+static nsIFrame* CheckForTrailingTextFrameRecursive(nsIFrame* aFrame,
+                                                    nsIFrame* aStopAtFrame) {
+  if (aFrame == aStopAtFrame ||
+      ((aFrame->IsTextFrame() &&
+        (static_cast<nsTextFrame*>(aFrame))->IsAtEndOfLine()))) {
+    return aFrame;
+  }
+  if (!aFrame->IsLineParticipant()) {
+    return nullptr;
+  }
+
+  for (nsIFrame* f : aFrame->PrincipalChildList()) {
+    if (nsIFrame* r = CheckForTrailingTextFrameRecursive(f, aStopAtFrame)) {
+      return r;
+    }
+  }
+  return nullptr;
+}
+
+static nsLineBox* FindContainingLine(nsIFrame* aFrame) {
+  while (aFrame && aFrame->IsLineParticipant()) {
+    nsIFrame* parent = aFrame->GetParent();
+    nsBlockFrame* blockParent = do_QueryFrame(parent);
+    if (blockParent) {
+      bool isValid;
+      nsBlockInFlowLineIterator iter(blockParent, aFrame, &isValid);
+      return isValid ? iter.GetLine().get() : nullptr;
+    }
+    aFrame = parent;
+  }
+  return nullptr;
+}
+
+static void AdjustCaretFrameForLineEnd(nsIFrame** aFrame, uint32_t* aOffset,
+                                       bool aEditableOnly) {
+  nsLineBox* line = FindContainingLine(*aFrame);
+  if (!line) {
+    return;
+  }
+  for (nsIFrame* f : line->ChildFrames()) {
+    nsIFrame* r = CheckForTrailingTextFrameRecursive(f, *aFrame);
+    if (r == *aFrame) {
+      return;
+    }
+    if (!r) {
+      continue;
+    }
+    if (aEditableOnly && !r->GetContent()->IsEditable()) {
+      return;
+    }
+    MOZ_ASSERT(r->IsTextFrame(), "Expected text frame");
+    *aFrame = r;
+    *aOffset = (static_cast<nsTextFrame*>(r))->GetContentEnd();
+    return;
+  }
+}
+
+CaretFrameData SelectionMovementUtils::GetCaretFrameForNodeOffset(
+    const nsFrameSelection* aFrameSelection, nsIContent* aContentNode,
+    uint32_t aOffset, CaretAssociationHint aFrameHint,
+    intl::BidiEmbeddingLevel aBidiLevel,
+    ForceEditableRegion aForceEditableRegion) {
+  if (!aContentNode || !aContentNode->IsInComposedDoc()) {
+    return {};
+  }
+
+  CaretFrameData result;
+  result.mHint = aFrameHint;
+  if (aFrameSelection) {
+    PresShell* presShell = aFrameSelection->GetPresShell();
+    if (!presShell) {
+      return {};
+    }
+
+    if (!aContentNode || !aContentNode->IsInComposedDoc() ||
+        presShell->GetDocument() != aContentNode->GetComposedDoc()) {
+      return {};
+    }
+
+    result.mHint = aFrameSelection->GetHint();
+  }
+
+  MOZ_ASSERT_IF(aForceEditableRegion == ForceEditableRegion::Yes,
+                aContentNode->IsEditable());
+
+  const FrameAndOffset frameAndOffset =
+      SelectionMovementUtils::GetFrameForNodeOffset(aContentNode, aOffset,
+                                                    aFrameHint);
+  if (!frameAndOffset) {
+    return {};
+  }
+  result.mFrame = result.mUnadjustedFrame = frameAndOffset.mFrame;
+  result.mOffsetInFrameContent = frameAndOffset.mOffsetInFrameContent;
+
+  if (SelectionMovementUtils::AdjustFrameForLineStart(
+          result.mFrame, result.mOffsetInFrameContent)) {
+    result.mHint = CaretAssociationHint::After;
+  } else {
+    AdjustCaretFrameForLineEnd(
+        &result.mFrame, &result.mOffsetInFrameContent,
+        aForceEditableRegion == ForceEditableRegion::Yes);
+  }
+
+  if (!result->PresContext()->BidiEnabled()) {
+    return result;
+  }
+
+  if (aBidiLevel & BIDI_LEVEL_UNDEFINED) {
+    aBidiLevel = result->GetEmbeddingLevel();
+  }
+
+  nsIFrame* frameBefore;
+  nsIFrame* frameAfter;
+  intl::BidiEmbeddingLevel
+      levelBefore;  
+  intl::BidiEmbeddingLevel
+      levelAfter;  
+
+  auto [start, end] = result->GetOffsets();
+  if (start == 0 || end == 0 ||
+      static_cast<uint32_t>(start) == result.mOffsetInFrameContent ||
+      static_cast<uint32_t>(end) == result.mOffsetInFrameContent) {
+    nsPrevNextBidiLevels levels = SelectionMovementUtils::GetPrevNextBidiLevels(
+        aContentNode, aOffset, result.mHint, false,
+        aFrameSelection
+            ? aFrameSelection
+                  ->GetAncestorLimiterOrIndependentSelectionRootElement()
+            : nullptr);
+
+    if (levels.mFrameBefore || levels.mFrameAfter) {
+      frameBefore = levels.mFrameBefore;
+      frameAfter = levels.mFrameAfter;
+      levelBefore = levels.mLevelBefore;
+      levelAfter = levels.mLevelAfter;
+
+      if ((levelBefore != levelAfter) || (aBidiLevel != levelBefore)) {
+        aBidiLevel =
+            std::max(aBidiLevel, std::min(levelBefore, levelAfter));  
+        aBidiLevel =
+            std::min(aBidiLevel, std::max(levelBefore, levelAfter));  
+        if (aBidiLevel == levelBefore ||                              
+            (aBidiLevel > levelBefore && aBidiLevel < levelAfter &&
+             aBidiLevel.IsSameDirection(levelBefore)) ||  
+            (aBidiLevel < levelBefore && aBidiLevel > levelAfter &&
+             aBidiLevel.IsSameDirection(levelBefore)))  
+        {
+          if (result.mFrame != frameBefore) {
+            if (frameBefore) {  
+              result.mFrame = frameBefore;
+              std::tie(start, end) = result->GetOffsets();
+              result.mOffsetInFrameContent = end;
+            } else {
+              intl::BidiEmbeddingLevel baseLevel = frameAfter->GetBaseLevel();
+              if (baseLevel != levelAfter) {
+                PeekOffsetStruct pos(eSelectBeginLine, eDirPrevious, 0,
+                                     nsPoint(0, 0),
+                                     {PeekOffsetOption::StopAtScroller,
+                                      PeekOffsetOption::Visual});
+                if (NS_SUCCEEDED(frameAfter->PeekOffset(&pos))) {
+                  result.mFrame = pos.mResultFrame;
+                  result.mOffsetInFrameContent = pos.mContentOffset;
+                }
+              }
+            }
+          }
+        } else if (aBidiLevel == levelAfter ||  
+                   (aBidiLevel > levelBefore && aBidiLevel < levelAfter &&
+                    aBidiLevel.IsSameDirection(levelAfter)) ||  
+                   (aBidiLevel < levelBefore && aBidiLevel > levelAfter &&
+                    aBidiLevel.IsSameDirection(levelAfter)))  
+        {
+          if (result.mFrame != frameAfter) {
+            if (frameAfter) {
+              result.mFrame = frameAfter;
+              std::tie(start, end) = result->GetOffsets();
+              result.mOffsetInFrameContent = start;
+            } else {
+              intl::BidiEmbeddingLevel baseLevel = frameBefore->GetBaseLevel();
+              if (baseLevel != levelBefore) {
+                PeekOffsetStruct pos(eSelectEndLine, eDirNext, 0, nsPoint(0, 0),
+                                     {PeekOffsetOption::StopAtScroller,
+                                      PeekOffsetOption::Visual});
+                if (NS_SUCCEEDED(frameBefore->PeekOffset(&pos))) {
+                  result.mFrame = pos.mResultFrame;
+                  result.mOffsetInFrameContent = pos.mContentOffset;
+                }
+              }
+            }
+          }
+        } else if (aBidiLevel > levelBefore &&
+                   aBidiLevel < levelAfter &&  
+                   levelBefore.IsSameDirection(levelAfter) &&
+                   !aBidiLevel.IsSameDirection(levelAfter)) {
+          MOZ_ASSERT_IF(aFrameSelection && aFrameSelection->GetPresShell(),
+                        aFrameSelection->GetPresShell()->GetPresContext() ==
+                            frameAfter->PresContext());
+          Result<nsIFrame*, nsresult> frameOrError =
+              SelectionMovementUtils::GetFrameFromLevel(frameAfter, eDirNext,
+                                                        aBidiLevel);
+          if (MOZ_LIKELY(frameOrError.isOk())) {
+            result.mFrame = frameOrError.unwrap();
+            std::tie(start, end) = result->GetOffsets();
+            levelAfter = result->GetEmbeddingLevel();
+            if (aBidiLevel.IsRTL()) {
+              result.mOffsetInFrameContent = levelAfter.IsRTL() ? start : end;
+            } else {
+              result.mOffsetInFrameContent = levelAfter.IsRTL() ? end : start;
+            }
+          }
+        } else if (aBidiLevel < levelBefore &&
+                   aBidiLevel > levelAfter &&  
+                   levelBefore.IsSameDirection(levelAfter) &&
+                   !aBidiLevel.IsSameDirection(levelAfter)) {
+          MOZ_ASSERT_IF(aFrameSelection && aFrameSelection->GetPresShell(),
+                        aFrameSelection->GetPresShell()->GetPresContext() ==
+                            frameBefore->PresContext());
+          Result<nsIFrame*, nsresult> frameOrError =
+              SelectionMovementUtils::GetFrameFromLevel(
+                  frameBefore, eDirPrevious, aBidiLevel);
+          if (MOZ_LIKELY(frameOrError.isOk())) {
+            result.mFrame = frameOrError.unwrap();
+            std::tie(start, end) = result->GetOffsets();
+            levelBefore = result->GetEmbeddingLevel();
+            if (aBidiLevel.IsRTL()) {
+              result.mOffsetInFrameContent = levelBefore.IsRTL() ? end : start;
+            } else {
+              result.mOffsetInFrameContent = levelBefore.IsRTL() ? start : end;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return result;
+}
+
+PrimaryFrameData SelectionMovementUtils::GetPrimaryFrameForCaret(
+    nsIContent* aContent, uint32_t aOffset, bool aVisual,
+    CaretAssociationHint aHint, intl::BidiEmbeddingLevel aCaretBidiLevel) {
+  MOZ_ASSERT(aContent);
+
+  {
+    const PrimaryFrameData result =
+        SelectionMovementUtils::GetPrimaryOrCaretFrameForNodeOffset(
+            aContent, aOffset, aVisual, aHint, aCaretBidiLevel);
+    if (result) {
+      return result;
+    }
+  }
+
+
+  if (!aContent->TextIsOnlyWhitespace()) {
+    return {};
+  }
+
+  nsIContent* parent = aContent->GetParent();
+  if (NS_WARN_IF(!parent)) {
+    return {};
+  }
+  const Maybe<uint32_t> offset = parent->ComputeIndexOf(aContent);
+  if (NS_WARN_IF(offset.isNothing())) {
+    return {};
+  }
+  return SelectionMovementUtils::GetPrimaryOrCaretFrameForNodeOffset(
+      parent, *offset, aVisual, aHint, aCaretBidiLevel);
+}
+
+PrimaryFrameData SelectionMovementUtils::GetPrimaryOrCaretFrameForNodeOffset(
+    nsIContent* aContent, uint32_t aOffset, bool aVisual,
+    CaretAssociationHint aHint, intl::BidiEmbeddingLevel aCaretBidiLevel) {
+  if (aVisual) {
+    const CaretFrameData result =
+        SelectionMovementUtils::GetCaretFrameForNodeOffset(
+            nullptr, aContent, aOffset, aHint, aCaretBidiLevel,
+            aContent && aContent->IsEditable() ? ForceEditableRegion::Yes
+                                               : ForceEditableRegion::No);
+    return result;
+  }
+
+  return {
+      SelectionMovementUtils::GetFrameForNodeOffset(aContent, aOffset, aHint),
+      aHint};
+}
+
+}  

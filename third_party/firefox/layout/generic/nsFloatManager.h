@@ -1,0 +1,250 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsFloatManager_h_
+#define nsFloatManager_h_
+
+#include "mozilla/TypedEnumBits.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/WritingModes.h"
+#include "nsCoord.h"
+#include "nsFrameList.h"  // for DEBUG_FRAME_DUMP
+#include "nsIntervalSet.h"
+#include "nsPoint.h"
+#include "nsTArray.h"
+
+class nsIFrame;
+class nsPresContext;
+namespace mozilla {
+struct ReflowInput;
+class PresShell;
+}  
+
+enum class nsFlowAreaRectFlags : uint32_t {
+  NoFlags = 0,
+  HasFloats = 1 << 0,
+  MayWiden = 1 << 1,
+  ISizeIsActuallyNegative = 1 << 2,
+};
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(nsFlowAreaRectFlags)
+
+struct nsFlowAreaRect {
+  mozilla::LogicalRect mRect;
+
+  nsFlowAreaRectFlags mAreaFlags;
+
+  nsFlowAreaRect(mozilla::WritingMode aWritingMode, nscoord aICoord,
+                 nscoord aBCoord, nscoord aISize, nscoord aBSize,
+                 nsFlowAreaRectFlags aAreaFlags)
+      : mRect(aWritingMode, aICoord, aBCoord, aISize, aBSize),
+        mAreaFlags(aAreaFlags) {}
+
+  bool HasFloats() const {
+    return (bool)(mAreaFlags & nsFlowAreaRectFlags::HasFloats);
+  }
+  bool MayWiden() const {
+    return (bool)(mAreaFlags & nsFlowAreaRectFlags::MayWiden);
+  }
+  bool ISizeIsActuallyNegative() const {
+    return (bool)(mAreaFlags & nsFlowAreaRectFlags::ISizeIsActuallyNegative);
+  }
+};
+
+#define NS_FLOAT_MANAGER_CACHE_SIZE 64
+
+class nsFloatManager {
+ public:
+  explicit nsFloatManager(mozilla::PresShell* aPresShell,
+                          mozilla::WritingMode aWM);
+  ~nsFloatManager();
+
+  nsFloatManager(const nsFloatManager&) = delete;
+  void operator=(const nsFloatManager&) = delete;
+
+  void* operator new(size_t aSize) noexcept(true);
+  void operator delete(void* aPtr, size_t aSize);
+
+  static void Shutdown();
+
+  static mozilla::LogicalRect GetRegionFor(mozilla::WritingMode aWM,
+                                           nsIFrame* aFloatFrame,
+                                           const nsSize& aContainerSize);
+  static mozilla::LogicalRect CalculateRegionFor(
+      mozilla::WritingMode aWM, nsIFrame* aFloatFrame,
+      const mozilla::LogicalMargin& aMargin, const nsSize& aContainerSize);
+  static void StoreRegionFor(mozilla::WritingMode aWM, nsIFrame* aFloat,
+                             const mozilla::LogicalRect& aRegion,
+                             const nsSize& aContainerSize);
+
+  struct SavedState {
+    explicit SavedState()
+        : mFloatInfoCount(0),
+          mLineLeft(0),
+          mBlockStart(0),
+          mPushedLeftFloatPastBreak(false),
+          mPushedRightFloatPastBreak(false),
+          mSplitLeftFloatAcrossBreak(false),
+          mSplitRightFloatAcrossBreak(false) {}
+
+   private:
+    uint32_t mFloatInfoCount;
+    nscoord mLineLeft, mBlockStart;
+    bool mPushedLeftFloatPastBreak;
+    bool mPushedRightFloatPastBreak;
+    bool mSplitLeftFloatAcrossBreak;
+    bool mSplitRightFloatAcrossBreak;
+
+    friend class nsFloatManager;
+  };
+
+  void Translate(nscoord aLineLeft, nscoord aBlockStart) {
+    mLineLeft += aLineLeft;
+    mBlockStart += aBlockStart;
+  }
+
+  void GetTranslation(nscoord& aLineLeft, nscoord& aBlockStart) const {
+    aLineLeft = mLineLeft;
+    aBlockStart = mBlockStart;
+  }
+
+  enum class BandInfoType { BandFromPoint, WidthWithinHeight };
+  enum class ShapeType { Margin, ShapeOutside };
+  nsFlowAreaRect GetFlowArea(mozilla::WritingMode aCBWM,
+                             mozilla::WritingMode aWM, nscoord aBCoord,
+                             nscoord aBSize, BandInfoType aBandInfoType,
+                             ShapeType aShapeType,
+                             mozilla::LogicalRect aContentArea,
+                             SavedState* aState,
+                             const nsSize& aContainerSize) const;
+
+  void AddFloat(nsIFrame* aFloatFrame, const mozilla::LogicalRect& aMarginRect,
+                mozilla::WritingMode aWM, const nsSize& aContainerSize);
+
+  void SetPushedLeftFloatPastBreak() { mPushedLeftFloatPastBreak = true; }
+  void SetPushedRightFloatPastBreak() { mPushedRightFloatPastBreak = true; }
+
+  void SetSplitLeftFloatAcrossBreak() { mSplitLeftFloatAcrossBreak = true; }
+  void SetSplitRightFloatAcrossBreak() { mSplitRightFloatAcrossBreak = true; }
+
+  nsresult RemoveTrailingRegions(nsIFrame* aFrameList);
+
+  bool HasAnyFloats() const { return !mFloats.IsEmpty(); }
+
+  bool HasFloatDamage() const { return !mFloatDamage.IsEmpty(); }
+
+  void IncludeInDamage(nscoord aIntervalBegin, nscoord aIntervalEnd) {
+    mFloatDamage.IncludeInterval(aIntervalBegin + mBlockStart,
+                                 aIntervalEnd + mBlockStart);
+  }
+
+  bool IntersectsDamage(nscoord aIntervalBegin, nscoord aIntervalEnd) const {
+    return mFloatDamage.Intersects(aIntervalBegin + mBlockStart,
+                                   aIntervalEnd + mBlockStart);
+  }
+
+  void PushState(SavedState* aState);
+
+  void PopState(SavedState* aState);
+
+  nscoord LowestFloatBStart() const;
+
+  nscoord ClearFloats(nscoord aBCoord, mozilla::UsedClear aClearType) const;
+
+  bool ClearContinues(mozilla::UsedClear aClearType) const;
+
+  void AssertStateMatches(SavedState* aState) const {
+    NS_ASSERTION(
+        aState->mLineLeft == mLineLeft && aState->mBlockStart == mBlockStart &&
+            aState->mPushedLeftFloatPastBreak == mPushedLeftFloatPastBreak &&
+            aState->mPushedRightFloatPastBreak == mPushedRightFloatPastBreak &&
+            aState->mSplitLeftFloatAcrossBreak == mSplitLeftFloatAcrossBreak &&
+            aState->mSplitRightFloatAcrossBreak ==
+                mSplitRightFloatAcrossBreak &&
+            aState->mFloatInfoCount == mFloats.Length(),
+        "float manager state should match saved state");
+  }
+
+#ifdef DEBUG_FRAME_DUMP
+  nsresult List(FILE* out) const;
+#endif
+
+ private:
+  class ShapeInfo;
+  class RoundedBoxShapeInfo;
+  class EllipseShapeInfo;
+  class PolygonShapeInfo;
+  class ImageShapeInfo;
+
+  struct FloatInfo {
+    nsIFrame* const mFrame;
+    nscoord mLeftBEnd, mRightBEnd;
+
+    FloatInfo(nsIFrame* aFrame, nscoord aLineLeft, nscoord aBlockStart,
+              const mozilla::LogicalRect& aMarginRect, mozilla::WritingMode aWM,
+              const nsSize& aContainerSize);
+
+    nscoord LineLeft() const { return mRect.x; }
+    nscoord LineRight() const { return mRect.XMost(); }
+    nscoord ISize() const { return mRect.width; }
+    nscoord BStart() const { return mRect.y; }
+    nscoord BEnd() const { return mRect.YMost(); }
+    nscoord BSize() const { return mRect.height; }
+    bool IsEmpty() const { return mRect.IsEmpty(); }
+
+    nscoord LineLeft(ShapeType aShapeType, const nscoord aBStart,
+                     const nscoord aBEnd) const;
+    nscoord LineRight(ShapeType aShapeType, const nscoord aBStart,
+                      const nscoord aBEnd) const;
+    nscoord BStart(ShapeType aShapeType) const;
+    nscoord BEnd(ShapeType aShapeType) const;
+    bool IsEmpty(ShapeType aShapeType) const;
+    bool MayNarrowInBlockDirection(ShapeType aShapeType) const;
+
+#ifdef NS_BUILD_REFCNT_LOGGING
+    FloatInfo(FloatInfo&& aOther);
+    ~FloatInfo();
+#endif
+
+    nsRect mRect;
+    mozilla::UniquePtr<ShapeInfo> mShapeInfo;
+  };
+
+#ifdef DEBUG
+  mozilla::WritingMode mWritingMode;
+#endif
+
+  nscoord mLineLeft, mBlockStart;
+  AutoTArray<FloatInfo, 11> mFloats;
+  nsIntervalSet mFloatDamage;
+
+  bool mPushedLeftFloatPastBreak;
+  bool mPushedRightFloatPastBreak;
+
+  bool mSplitLeftFloatAcrossBreak;
+  bool mSplitRightFloatAcrossBreak;
+
+  static int32_t sCachedFloatManagerCount;
+  static void* sCachedFloatManagers[NS_FLOAT_MANAGER_CACHE_SIZE];
+};
+
+class nsAutoFloatManager {
+  using ReflowInput = mozilla::ReflowInput;
+
+ public:
+  explicit nsAutoFloatManager(ReflowInput& aReflowInput)
+      : mReflowInput(aReflowInput), mOld(nullptr) {}
+
+  ~nsAutoFloatManager();
+
+  void CreateFloatManager(nsPresContext* aPresContext);
+
+ protected:
+  ReflowInput& mReflowInput;
+  mozilla::UniquePtr<nsFloatManager> mNew;
+
+  nsFloatManager* mOld;
+};
+
+#endif /* !defined(nsFloatManager_h_) */

@@ -1,0 +1,110 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsPrefetchService_h_
+#define nsPrefetchService_h_
+
+#include "nsIObserver.h"
+#include "nsIInterfaceRequestor.h"
+#include "nsIChannelEventSink.h"
+#include "nsIPrefetchService.h"
+#include "nsIRedirectResultListener.h"
+#include "nsIWebProgressListener.h"
+#include "nsIStreamListener.h"
+#include "nsIChannel.h"
+#include "nsIURI.h"
+#include "nsWeakReference.h"
+#include "nsCOMPtr.h"
+#include <deque>
+
+class nsPrefetchService;
+class nsPrefetchNode;
+class nsIReferrerInfo;
+
+
+class nsPrefetchService final : public nsIPrefetchService,
+                                public nsIWebProgressListener,
+                                public nsIObserver,
+                                public nsSupportsWeakReference {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIPREFETCHSERVICE
+  NS_DECL_NSIWEBPROGRESSLISTENER
+  NS_DECL_NSIOBSERVER
+
+  nsPrefetchService();
+
+  nsresult Init();
+  void RemoveNodeAndMaybeStartNextPrefetchURI(nsPrefetchNode* aFinished);
+  void ProcessNextPrefetchURI();
+
+  void NotifyLoadRequested(nsPrefetchNode* node);
+  void NotifyLoadCompleted(nsPrefetchNode* node);
+  void DispatchEvent(nsPrefetchNode* node, bool aSuccess);
+
+ private:
+  ~nsPrefetchService();
+
+  nsresult Prefetch(nsIURI* aURI, nsIReferrerInfo* aReferrerInfo,
+                    nsINode* aSource, bool aExplicit);
+
+  void AddProgressListener();
+  void RemoveProgressListener();
+  nsresult EnqueueURI(nsIURI* aURI, nsIReferrerInfo* aReferrerInfo,
+                      nsINode* aSource, nsPrefetchNode** node);
+  void EmptyPrefetchQueue();
+
+  void StartPrefetching();
+  void StopPrefetching();
+  void StopCurrentPrefetchsPreloads(bool aPreload);
+  void StopAll();
+  nsresult CheckURIScheme(nsIURI* aURI, nsIReferrerInfo* aReferrerInfo);
+
+  std::deque<RefPtr<nsPrefetchNode>> mPrefetchQueue;
+  nsTArray<RefPtr<nsPrefetchNode>> mCurrentNodes;
+  int32_t mMaxParallelism;
+  int32_t mStopCount;
+  bool mPrefetchDisabled;
+
+  bool mAggressive;
+};
+
+
+class nsPrefetchNode final : public nsIStreamListener,
+                             public nsIInterfaceRequestor,
+                             public nsIChannelEventSink,
+                             public nsIRedirectResultListener {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIREQUESTOBSERVER
+  NS_DECL_NSISTREAMLISTENER
+  NS_DECL_NSIINTERFACEREQUESTOR
+  NS_DECL_NSICHANNELEVENTSINK
+  NS_DECL_NSIREDIRECTRESULTLISTENER
+
+  nsPrefetchNode(nsPrefetchService* aPrefetchService, nsIURI* aURI,
+                 nsIReferrerInfo* aReferrerInfo, nsINode* aSource,
+                 nsContentPolicyType aPolicyType, bool aPreload);
+
+  nsresult OpenChannel();
+  nsresult CancelChannel(nsresult error);
+
+  nsCOMPtr<nsIURI> mURI;
+  nsCOMPtr<nsIReferrerInfo> mReferrerInfo;
+  nsTArray<nsWeakPtr> mSources;
+
+  nsContentPolicyType mPolicyType;
+  bool mPreload;
+
+ private:
+  ~nsPrefetchNode() = default;
+
+  RefPtr<nsPrefetchService> mService;
+  nsCOMPtr<nsIChannel> mChannel;
+  nsCOMPtr<nsIChannel> mRedirectChannel;
+  int64_t mBytesRead;
+  bool mShouldFireLoadEvent;
+};
+
+#endif  // !nsPrefetchService_h_

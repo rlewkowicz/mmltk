@@ -1,0 +1,11 @@
+[package]
+name = "static_prefs"
+version = "0.1.0"
+authors = ["Nicholas Nethercote <nnethercote@mozilla.com>"]
+edition = "2018"
+license = "MPL-2.0"
+
+
+[dependencies]
+mozbuild = "0.1"
+nsstring = { path = "../../../../xpcom/rust/nsstring" }

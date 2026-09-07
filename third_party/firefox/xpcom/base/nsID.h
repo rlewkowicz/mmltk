@@ -1,0 +1,98 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsID_h_
+#define nsID_h_
+
+#include <string.h>
+
+#include "nscore.h"
+
+#define NSID_LENGTH 39
+
+#ifndef XPCOM_GLUE_AVOID_NSPR
+class nsIDToCString;
+#endif
+
+
+struct nsID {
+  uint32_t m0;
+  uint16_t m1;
+  uint16_t m2;
+  uint8_t m3[8];
+
+  [[nodiscard]] static nsresult GenerateUUIDInPlace(nsID& aId);
+  static nsID GenerateUUID();
+
+  void Clear();
+
+
+  inline bool Equals(const nsID& aOther) const {
+#if defined(__x86_64__) || defined(__i386__)
+    return !memcmp(this, &aOther, sizeof *this);
+#else
+    return (((uint32_t*)&m0)[0] == ((uint32_t*)&aOther.m0)[0]) &&
+           (((uint32_t*)&m0)[1] == ((uint32_t*)&aOther.m0)[1]) &&
+           (((uint32_t*)&m0)[2] == ((uint32_t*)&aOther.m0)[2]) &&
+           (((uint32_t*)&m0)[3] == ((uint32_t*)&aOther.m0)[3]);
+#endif
+  }
+
+  inline bool operator==(const nsID& aOther) const { return Equals(aOther); }
+
+  bool Parse(const char* aIDStr);
+
+#ifndef XPCOM_GLUE_AVOID_NSPR
+  nsIDToCString ToString() const;
+
+  void ToProvidedString(char (&aDest)[NSID_LENGTH]) const;
+
+#endif  // XPCOM_GLUE_AVOID_NSPR
+
+  nsID* Clone() const;
+};
+
+#ifndef XPCOM_GLUE_AVOID_NSPR
+class nsIDToCString {
+ public:
+  explicit nsIDToCString(const nsID& aID) {
+    aID.ToProvidedString(mStringBytes);
+  }
+
+  const char* get() const { return mStringBytes; }
+
+ protected:
+  char mStringBytes[NSID_LENGTH];
+};
+#endif
+
+
+typedef nsID nsCID;
+
+#define NS_DEFINE_CID(_name, _cidspec) const nsCID _name = _cidspec
+
+#define NS_DEFINE_NAMED_CID(_name) static const nsCID k##_name = _name
+
+#define REFNSCID const nsCID&
+
+
+typedef nsID nsIID;
+
+
+#define REFNSIID const nsIID&
+
+
+#define NS_INLINE_DECL_STATIC_IID(the_iid) \
+  static constexpr nsIID kIID NS_HIDDEN = the_iid;
+
+
+#define NS_DEFINE_STATIC_CID_ACCESSOR(the_cid) \
+  static const nsID& GetCID() {                \
+    static constexpr nsID cid = the_cid;       \
+    return cid;                                \
+  }
+
+#define NS_GET_IID(T) (T::kIID)
+
+#endif

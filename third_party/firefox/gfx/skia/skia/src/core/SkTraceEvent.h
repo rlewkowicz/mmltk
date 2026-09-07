@@ -1,0 +1,298 @@
+// Copyright (c) 2014 Google Inc.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+
+#if !defined(SkTraceEvent_DEFINED)
+#define SkTraceEvent_DEFINED
+
+#include "include/utils/SkEventTracer.h"
+#include "src/base/SkUtils.h"
+#include "src/core/SkTraceEventCommon.h" // IWYU pragma: export
+#include <atomic>
+
+#if defined(SK_ANDROID_FRAMEWORK_USE_PERFETTO)
+    #include <string>
+    #include <utility>
+#endif
+
+
+#if defined(_MSC_VER)
+    #define TRACE_FUNC __FUNCSIG__
+#else
+    #define TRACE_FUNC __PRETTY_FUNCTION__
+#endif
+
+
+#if defined(SK_ANDROID_FRAMEWORK_USE_PERFETTO)
+    #define TRACE_STR_COPY(str) (::perfetto::DynamicString{str})
+
+    #define TRACE_STR_STATIC(str) (::perfetto::StaticString{str})
+#else
+    #define TRACE_STR_COPY(str) (::skia_private::TraceStringWithCopy(str))
+
+    #define TRACE_STR_STATIC(str) (str)
+#endif
+
+#define INTERNAL_TRACE_EVENT_CATEGORY_GROUP_ENABLED_FOR_RECORDING_MODE() \
+    *INTERNAL_TRACE_EVENT_UID(category_group_enabled) & \
+        (SkEventTracer::kEnabledForRecording_CategoryGroupEnabledFlags | \
+         SkEventTracer::kEnabledForEventCallback_CategoryGroupEnabledFlags)
+
+#define TRACE_EVENT_API_GET_CATEGORY_GROUP_ENABLED \
+    SkEventTracer::GetInstance()->getCategoryGroupEnabled
+
+#define TRACE_EVENT_API_ADD_TRACE_EVENT \
+    SkEventTracer::GetInstance()->addTraceEvent
+
+#define TRACE_EVENT_API_UPDATE_TRACE_EVENT_DURATION \
+    SkEventTracer::GetInstance()->updateTraceEventDuration
+
+#if defined(SK_ANDROID_FRAMEWORK_USE_PERFETTO)
+    #define TRACE_EVENT_API_NEW_TRACE_SECTION(...) do {} while (0)
+#else
+    #define TRACE_EVENT_API_NEW_TRACE_SECTION \
+        SkEventTracer::GetInstance()->newTracingSection
+#endif
+
+#define TRACE_EVENT_API_CLASS_EXPORT SK_API
+
+#define TRACE_CATEGORY_PREFIX "disabled-by-default-"
+
+
+#define INTERNAL_TRACE_EVENT_UID3(a,b) \
+    trace_event_unique_##a##b
+#define INTERNAL_TRACE_EVENT_UID2(a,b) \
+    INTERNAL_TRACE_EVENT_UID3(a,b)
+#define INTERNAL_TRACE_EVENT_UID(name_prefix) \
+    INTERNAL_TRACE_EVENT_UID2(name_prefix, __LINE__)
+
+#define INTERNAL_TRACE_EVENT_GET_CATEGORY_INFO_CUSTOM_VARIABLES( \
+    category_group, atomic, category_group_enabled) \
+    category_group_enabled = \
+        reinterpret_cast<const uint8_t*>(atomic.load(std::memory_order_relaxed)); \
+    if (!category_group_enabled) { \
+      category_group_enabled = TRACE_EVENT_API_GET_CATEGORY_GROUP_ENABLED(category_group); \
+      atomic.store(reinterpret_cast<intptr_t>(category_group_enabled), \
+                   std::memory_order_relaxed); \
+    }
+
+#define INTERNAL_TRACE_EVENT_GET_CATEGORY_INFO(category_group) \
+    static std::atomic<intptr_t> INTERNAL_TRACE_EVENT_UID(atomic){0}; \
+    const uint8_t* INTERNAL_TRACE_EVENT_UID(category_group_enabled); \
+    INTERNAL_TRACE_EVENT_GET_CATEGORY_INFO_CUSTOM_VARIABLES( \
+        TRACE_CATEGORY_PREFIX category_group, \
+        INTERNAL_TRACE_EVENT_UID(atomic), \
+        INTERNAL_TRACE_EVENT_UID(category_group_enabled));
+
+#define INTERNAL_TRACE_EVENT_ADD(phase, category_group, name, flags, ...) \
+    do { \
+      INTERNAL_TRACE_EVENT_GET_CATEGORY_INFO(category_group); \
+      if (INTERNAL_TRACE_EVENT_CATEGORY_GROUP_ENABLED_FOR_RECORDING_MODE()) { \
+        skia_private::AddTraceEvent( \
+            phase, INTERNAL_TRACE_EVENT_UID(category_group_enabled), name, \
+            skia_private::kNoEventId, flags, ##__VA_ARGS__); \
+      } \
+    } while (0)
+
+#define INTERNAL_TRACE_EVENT_ADD_WITH_ID(phase, category_group, name, id, \
+                                         flags, ...) \
+    do { \
+      INTERNAL_TRACE_EVENT_GET_CATEGORY_INFO(category_group); \
+      if (INTERNAL_TRACE_EVENT_CATEGORY_GROUP_ENABLED_FOR_RECORDING_MODE()) { \
+        unsigned char trace_event_flags = flags | TRACE_EVENT_FLAG_HAS_ID; \
+        skia_private::TraceID trace_event_trace_id( \
+            id, &trace_event_flags); \
+        skia_private::AddTraceEvent( \
+            phase, INTERNAL_TRACE_EVENT_UID(category_group_enabled), \
+            name, trace_event_trace_id.data(), trace_event_flags, \
+            ##__VA_ARGS__); \
+      } \
+    } while (0)
+
+#define INTERNAL_TRACE_EVENT_ADD_SCOPED(category_group, name, ...) \
+    INTERNAL_TRACE_EVENT_GET_CATEGORY_INFO(category_group); \
+    skia_private::ScopedTracer INTERNAL_TRACE_EVENT_UID(tracer); \
+    do { \
+        if (INTERNAL_TRACE_EVENT_CATEGORY_GROUP_ENABLED_FOR_RECORDING_MODE()) { \
+          SkEventTracer::Handle h = skia_private::AddTraceEvent( \
+              TRACE_EVENT_PHASE_COMPLETE, \
+              INTERNAL_TRACE_EVENT_UID(category_group_enabled), \
+              name, skia_private::kNoEventId, \
+              TRACE_EVENT_FLAG_NONE, ##__VA_ARGS__); \
+          INTERNAL_TRACE_EVENT_UID(tracer).Initialize( \
+              INTERNAL_TRACE_EVENT_UID(category_group_enabled), name, h); \
+        } \
+    } while (0)
+
+namespace skia_private {
+
+const int kZeroNumArgs = 0;
+const uint64_t kNoEventId = 0;
+
+class TraceID {
+public:
+    TraceID(const void* id, unsigned char* flags)
+            : data_(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(id))) {
+        *flags |= TRACE_EVENT_FLAG_MANGLE_ID;
+    }
+    TraceID(uint64_t id, unsigned char* flags)
+        : data_(id) { (void)flags; }
+    TraceID(unsigned int id, unsigned char* flags)
+        : data_(id) { (void)flags; }
+    TraceID(unsigned short id, unsigned char* flags)
+        : data_(id) { (void)flags; }
+    TraceID(unsigned char id, unsigned char* flags)
+        : data_(id) { (void)flags; }
+    TraceID(long long id, unsigned char* flags)
+        : data_(static_cast<uint64_t>(id)) { (void)flags; }
+    TraceID(long id, unsigned char* flags)
+        : data_(static_cast<uint64_t>(id)) { (void)flags; }
+    TraceID(int id, unsigned char* flags)
+        : data_(static_cast<uint64_t>(id)) { (void)flags; }
+    TraceID(short id, unsigned char* flags)
+        : data_(static_cast<uint64_t>(id)) { (void)flags; }
+    TraceID(signed char id, unsigned char* flags)
+        : data_(static_cast<uint64_t>(id)) { (void)flags; }
+
+    uint64_t data() const { return data_; }
+
+private:
+    uint64_t data_;
+};
+
+class TraceStringWithCopy {
+ public:
+  explicit TraceStringWithCopy(const char* str) : str_(str) {}
+  operator const char* () const { return str_; }
+ private:
+  const char* str_;
+};
+
+template <typename T>
+static inline void SetTraceValue(const T& arg, unsigned char* type, uint64_t* value) {
+    static_assert(sizeof(T) <= sizeof(uint64_t), "Trace value is larger than uint64_t");
+
+    if constexpr (std::is_same<bool, T>::value) {
+        *type = TRACE_VALUE_TYPE_BOOL;
+        *value = arg;
+    } else if constexpr (std::is_same<const char*, T>::value) {
+        *type = TRACE_VALUE_TYPE_STRING;
+        *value = reinterpret_cast<uintptr_t>(arg);
+    } else if constexpr (std::is_same<TraceStringWithCopy, T>::value) {
+        *type = TRACE_VALUE_TYPE_COPY_STRING;
+        *value = reinterpret_cast<uintptr_t>(static_cast<const char*>(arg));
+    } else if constexpr (std::is_pointer<T>::value) {
+        *type = TRACE_VALUE_TYPE_POINTER;
+        *value = reinterpret_cast<uintptr_t>(arg);
+    } else if constexpr (std::is_unsigned_v<T>) {
+        *type = TRACE_VALUE_TYPE_UINT;
+        *value = arg;
+    } else if constexpr (std::is_signed_v<T>) {
+        *type = TRACE_VALUE_TYPE_INT;
+        *value = static_cast<uint64_t>(arg);
+    } else if constexpr (std::is_floating_point_v<T>) {
+        *type = TRACE_VALUE_TYPE_DOUBLE;
+        *value = sk_bit_cast<uint64_t>(arg);
+    } else {
+        static_assert(!sizeof(T), "Unsupported type for trace argument");
+    }
+}
+
+static inline const char* TraceValueAsString(uint64_t value) {
+    return reinterpret_cast<const char*>(static_cast<uintptr_t>(value));
+}
+static inline const void* TraceValueAsPointer(uint64_t value) {
+    return reinterpret_cast<const void*>(static_cast<uintptr_t>(value));
+}
+
+
+static inline SkEventTracer::Handle
+AddTraceEvent(
+    char phase,
+    const uint8_t* category_group_enabled,
+    const char* name,
+    uint64_t id,
+    unsigned char flags) {
+  return TRACE_EVENT_API_ADD_TRACE_EVENT(
+      phase, category_group_enabled, name, id,
+      kZeroNumArgs, nullptr, nullptr, nullptr, flags);
+}
+
+template<class ARG1_TYPE>
+static inline SkEventTracer::Handle
+AddTraceEvent(
+    char phase,
+    const uint8_t* category_group_enabled,
+    const char* name,
+    uint64_t id,
+    unsigned char flags,
+    const char* arg1_name,
+    const ARG1_TYPE& arg1_val) {
+  const int num_args = 1;
+  uint8_t arg_types[1];
+  uint64_t arg_values[1];
+  SetTraceValue(arg1_val, &arg_types[0], &arg_values[0]);
+  return TRACE_EVENT_API_ADD_TRACE_EVENT(
+      phase, category_group_enabled, name, id,
+      num_args, &arg1_name, arg_types, arg_values, flags);
+}
+
+template<class ARG1_TYPE, class ARG2_TYPE>
+static inline SkEventTracer::Handle
+AddTraceEvent(
+    char phase,
+    const uint8_t* category_group_enabled,
+    const char* name,
+    uint64_t id,
+    unsigned char flags,
+    const char* arg1_name,
+    const ARG1_TYPE& arg1_val,
+    const char* arg2_name,
+    const ARG2_TYPE& arg2_val) {
+  const int num_args = 2;
+  const char* arg_names[2] = { arg1_name, arg2_name };
+  unsigned char arg_types[2];
+  uint64_t arg_values[2];
+  SetTraceValue(arg1_val, &arg_types[0], &arg_values[0]);
+  SetTraceValue(arg2_val, &arg_types[1], &arg_values[1]);
+  return TRACE_EVENT_API_ADD_TRACE_EVENT(
+      phase, category_group_enabled, name, id,
+      num_args, arg_names, arg_types, arg_values, flags);
+}
+
+class TRACE_EVENT_API_CLASS_EXPORT ScopedTracer {
+ public:
+  ScopedTracer() : p_data_(nullptr) {}
+
+  ~ScopedTracer() {
+    if (p_data_ && *data_.category_group_enabled)
+      TRACE_EVENT_API_UPDATE_TRACE_EVENT_DURATION(
+          data_.category_group_enabled, data_.name, data_.event_handle);
+  }
+
+  void Initialize(const uint8_t* category_group_enabled,
+                  const char* name,
+                  SkEventTracer::Handle event_handle) {
+    data_.category_group_enabled = category_group_enabled;
+    data_.name = name;
+    data_.event_handle = event_handle;
+    p_data_ = &data_;
+  }
+
+ private:
+    ScopedTracer(const ScopedTracer&) = delete;
+    ScopedTracer& operator=(const ScopedTracer&) = delete;
+
+  struct Data {
+    const uint8_t* category_group_enabled;
+    const char* name;
+    SkEventTracer::Handle event_handle;
+  };
+  Data* p_data_;
+  Data data_;
+};
+
+}  
+
+#endif

@@ -1,0 +1,38 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_QUOTA_QUOTADATABASEHELPER_H
+#define DOM_QUOTA_QUOTADATABASEHELPER_H
+
+#include "mozIStorageConnection.h"
+#include "mozilla/dom/quota/QuotaCommon.h"
+#include "nsCOMPtr.h"
+#include "nsString.h"
+
+namespace mozilla::dom::quota {
+
+class MOZ_STACK_CLASS AutoDatabaseAttacher final {
+ public:
+  explicit AutoDatabaseAttacher(nsCOMPtr<mozIStorageConnection> aConnection,
+                                nsCOMPtr<nsIFile> aDatabaseFile,
+                                const nsLiteralCString& aSchemaName);
+
+  ~AutoDatabaseAttacher();
+
+  AutoDatabaseAttacher() = delete;
+
+  [[nodiscard]] nsresult Attach();
+
+  [[nodiscard]] nsresult Detach();
+
+ private:
+  nsCOMPtr<mozIStorageConnection> mConnection;
+  nsCOMPtr<nsIFile> mDatabaseFile;
+  const nsLiteralCString mSchemaName;
+  bool mAttached;
+};
+
+}  
+
+#endif  // DOM_QUOTA_QUOTADATABASEHELPER_H

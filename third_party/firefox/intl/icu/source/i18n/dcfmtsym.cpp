@@ -1,0 +1,530 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*******************************************************************************
+* Copyright (C) 1997-2016, International Business Machines Corporation and
+* others. All Rights Reserved.
+*******************************************************************************
+*
+* File DCFMTSYM.CPP
+*
+* Modification History:
+*
+*   Date        Name        Description
+*   02/19/97    aliu        Converted from java.
+*   03/18/97    clhuang     Implemented with C++ APIs.
+*   03/27/97    helena      Updated to pass the simple test after code review.
+*   08/26/97    aliu        Added currency/intl currency symbol support.
+*   07/20/98    stephen     Slightly modified initialization of monetarySeparator
+********************************************************************************
+*/
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/dcfmtsym.h"
+#include "unicode/ures.h"
+#include "unicode/decimfmt.h"
+#include "unicode/ucurr.h"
+#include "unicode/choicfmt.h"
+#include "unicode/unistr.h"
+#include "unicode/numsys.h"
+#include "unicode/unum.h"
+#include "unicode/utf16.h"
+#include "ucurrimp.h"
+#include "cstring.h"
+#include "locbased.h"
+#include "uresimp.h"
+#include "ureslocs.h"
+#include "charstr.h"
+#include "uassert.h"
+
+
+U_NAMESPACE_BEGIN
+
+UOBJECT_DEFINE_RTTI_IMPLEMENTATION(DecimalFormatSymbols)
+
+static const char gNumberElements[] = "NumberElements";
+static const char gCurrencySpacingTag[] = "currencySpacing";
+static const char gBeforeCurrencyTag[] = "beforeCurrency";
+static const char gAfterCurrencyTag[] = "afterCurrency";
+static const char gCurrencyMatchTag[] = "currencyMatch";
+static const char gCurrencySudMatchTag[] = "surroundingMatch";
+static const char gCurrencyInsertBtnTag[] = "insertBetween";
+static const char gLatn[] =  "latn";
+static const char gSymbols[] = "symbols";
+static const char gNumberElementsLatnSymbols[] = "NumberElements/latn/symbols";
+
+static const char16_t INTL_CURRENCY_SYMBOL_STR[] = {0xa4, 0xa4, 0};
+
+static const char *gNumberElementKeys[DecimalFormatSymbols::kFormatSymbolCount] = {
+    "decimal",
+    "group",
+    nullptr, 
+    "percentSign",
+    nullptr, 
+    nullptr, 
+    "minusSign",
+    "plusSign",
+    nullptr, 
+    nullptr, 
+    "currencyDecimal",
+    "exponential",
+    "perMille",
+    nullptr, 
+    "infinity",
+    "nan",
+    nullptr, 
+    "currencyGroup",
+    nullptr, 
+    nullptr, 
+    nullptr, 
+    nullptr, 
+    nullptr, 
+    nullptr, 
+    nullptr, 
+    nullptr, 
+    nullptr, 
+    "superscriptingExponent", 
+    "approximatelySign" 
+};
+
+
+DecimalFormatSymbols::DecimalFormatSymbols(UErrorCode& status)
+        : UObject(), locale() {
+    initialize(locale, status, true);
+}
+
+
+DecimalFormatSymbols::DecimalFormatSymbols(const Locale& loc, UErrorCode& status)
+        : UObject(), locale(loc) {
+    initialize(locale, status);
+}
+
+DecimalFormatSymbols::DecimalFormatSymbols(const Locale& loc, const NumberingSystem& ns, UErrorCode& status)
+        : UObject(), locale(loc) {
+    initialize(locale, status, false, &ns);
+}
+
+DecimalFormatSymbols::DecimalFormatSymbols()
+    : UObject(),
+      locale(Locale::getRoot()),
+      actualLocale(Locale::getRoot()),
+      validLocale(Locale::getRoot()) {
+    initialize();
+}
+
+DecimalFormatSymbols*
+DecimalFormatSymbols::createWithLastResortData(UErrorCode& status) {
+    if (U_FAILURE(status)) { return nullptr; }
+    DecimalFormatSymbols* sym = new DecimalFormatSymbols();
+    if (sym == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+    }
+    return sym;
+}
+
+
+DecimalFormatSymbols::~DecimalFormatSymbols()
+{
+}
+
+
+DecimalFormatSymbols::DecimalFormatSymbols(const DecimalFormatSymbols &source)
+    : UObject(source)
+{
+    *this = source;
+}
+
+
+DecimalFormatSymbols&
+DecimalFormatSymbols::operator=(const DecimalFormatSymbols& rhs)
+{
+    if (this != &rhs) {
+        for (int32_t i = 0; i < static_cast<int32_t>(kFormatSymbolCount); ++i) {
+            fSymbols[static_cast<ENumberFormatSymbol>(i)].fastCopyFrom(rhs.fSymbols[static_cast<ENumberFormatSymbol>(i)]);
+        }
+        for (int32_t i = 0; i < static_cast<int32_t>(UNUM_CURRENCY_SPACING_COUNT); ++i) {
+            currencySpcBeforeSym[i].fastCopyFrom(rhs.currencySpcBeforeSym[i]);
+            currencySpcAfterSym[i].fastCopyFrom(rhs.currencySpcAfterSym[i]);
+        }
+        locale = rhs.locale;
+        actualLocale = rhs.actualLocale;
+        validLocale = rhs.validLocale;
+        fIsCustomCurrencySymbol = rhs.fIsCustomCurrencySymbol; 
+        fIsCustomIntlCurrencySymbol = rhs.fIsCustomIntlCurrencySymbol; 
+        fCodePointZero = rhs.fCodePointZero;
+        currPattern = rhs.currPattern;
+        uprv_strcpy(nsName, rhs.nsName);
+    }
+    return *this;
+}
+
+
+bool
+DecimalFormatSymbols::operator==(const DecimalFormatSymbols& that) const
+{
+    if (this == &that) {
+        return true;
+    }
+    if (fIsCustomCurrencySymbol != that.fIsCustomCurrencySymbol) { 
+        return false;
+    } 
+    if (fIsCustomIntlCurrencySymbol != that.fIsCustomIntlCurrencySymbol) { 
+        return false;
+    } 
+    for (int32_t i = 0; i < static_cast<int32_t>(kFormatSymbolCount); ++i) {
+        if (fSymbols[static_cast<ENumberFormatSymbol>(i)] != that.fSymbols[static_cast<ENumberFormatSymbol>(i)]) {
+            return false;
+        }
+    }
+    for (int32_t i = 0; i < static_cast<int32_t>(UNUM_CURRENCY_SPACING_COUNT); ++i) {
+        if(currencySpcBeforeSym[i] != that.currencySpcBeforeSym[i]) {
+            return false;
+        }
+        if(currencySpcAfterSym[i] != that.currencySpcAfterSym[i]) {
+            return false;
+        }
+    }
+    return locale == that.locale &&
+           actualLocale == that.actualLocale &&
+           validLocale == that.validLocale;
+}
+
+
+namespace {
+
+struct DecFmtSymDataSink : public ResourceSink {
+
+    DecimalFormatSymbols& dfs;
+    UBool seenSymbol[DecimalFormatSymbols::kFormatSymbolCount];
+
+    DecFmtSymDataSink(DecimalFormatSymbols& _dfs) : dfs(_dfs) {
+        uprv_memset(seenSymbol, false, sizeof(seenSymbol));
+    }
+    virtual ~DecFmtSymDataSink();
+
+    virtual void put(const char *key, ResourceValue &value, UBool ,
+            UErrorCode &errorCode) override {
+        ResourceTable symbolsTable = value.getTable(errorCode);
+        if (U_FAILURE(errorCode)) { return; }
+        for (int32_t j = 0; symbolsTable.getKeyAndValue(j, key, value); ++j) {
+            for (int32_t i=0; i<DecimalFormatSymbols::kFormatSymbolCount; i++) {
+                if (gNumberElementKeys[i] != nullptr && uprv_strcmp(key, gNumberElementKeys[i]) == 0) {
+                    if (!seenSymbol[i]) {
+                        seenSymbol[i] = true;
+                        dfs.setSymbol(
+                            static_cast<DecimalFormatSymbols::ENumberFormatSymbol>(i),
+                            value.getUnicodeString(errorCode));
+                        if (U_FAILURE(errorCode)) { return; }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    UBool seenAll() {
+        for (int32_t i=0; i<DecimalFormatSymbols::kFormatSymbolCount; i++) {
+            if (!seenSymbol[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void resolveMissingMonetarySeparators(const UnicodeString* fSymbols) {
+        if (!seenSymbol[DecimalFormatSymbols::kMonetarySeparatorSymbol]) {
+            dfs.setSymbol(
+                DecimalFormatSymbols::kMonetarySeparatorSymbol,
+                fSymbols[DecimalFormatSymbols::kDecimalSeparatorSymbol]);
+        }
+        if (!seenSymbol[DecimalFormatSymbols::kMonetaryGroupingSeparatorSymbol]) {
+            dfs.setSymbol(
+                DecimalFormatSymbols::kMonetaryGroupingSeparatorSymbol,
+                fSymbols[DecimalFormatSymbols::kGroupingSeparatorSymbol]);
+        }
+    }
+};
+
+struct CurrencySpacingSink : public ResourceSink {
+    DecimalFormatSymbols& dfs;
+    UBool hasBeforeCurrency;
+    UBool hasAfterCurrency;
+
+    CurrencySpacingSink(DecimalFormatSymbols& _dfs)
+        : dfs(_dfs), hasBeforeCurrency(false), hasAfterCurrency(false) {}
+    virtual ~CurrencySpacingSink();
+
+    virtual void put(const char *key, ResourceValue &value, UBool ,
+            UErrorCode &errorCode) override {
+        ResourceTable spacingTypesTable = value.getTable(errorCode);
+        for (int32_t i = 0; spacingTypesTable.getKeyAndValue(i, key, value); ++i) {
+            UBool beforeCurrency;
+            if (uprv_strcmp(key, gBeforeCurrencyTag) == 0) {
+                beforeCurrency = true;
+                hasBeforeCurrency = true;
+            } else if (uprv_strcmp(key, gAfterCurrencyTag) == 0) {
+                beforeCurrency = false;
+                hasAfterCurrency = true;
+            } else {
+                continue;
+            }
+
+            ResourceTable patternsTable = value.getTable(errorCode);
+            for (int32_t j = 0; patternsTable.getKeyAndValue(j, key, value); ++j) {
+                UCurrencySpacing pattern;
+                if (uprv_strcmp(key, gCurrencyMatchTag) == 0) {
+                    pattern = UNUM_CURRENCY_MATCH;
+                } else if (uprv_strcmp(key, gCurrencySudMatchTag) == 0) {
+                    pattern = UNUM_CURRENCY_SURROUNDING_MATCH;
+                } else if (uprv_strcmp(key, gCurrencyInsertBtnTag) == 0) {
+                    pattern = UNUM_CURRENCY_INSERT;
+                } else {
+                    continue;
+                }
+
+                const UnicodeString& current = dfs.getPatternForCurrencySpacing(
+                    pattern, beforeCurrency, errorCode);
+                if (current.isEmpty()) {
+                    dfs.setPatternForCurrencySpacing(
+                        pattern, beforeCurrency, value.getUnicodeString(errorCode));
+                }
+            }
+        }
+    }
+
+    void resolveMissing() {
+        static const char* defaults[] = { "[:letter:]", "[:digit:]", " " };
+        if (!hasBeforeCurrency || !hasAfterCurrency) {
+            for (int32_t pattern = 0; pattern < UNUM_CURRENCY_SPACING_COUNT; pattern++) {
+                dfs.setPatternForCurrencySpacing(static_cast<UCurrencySpacing>(pattern),
+                    false, UnicodeString(defaults[pattern], -1, US_INV));
+            }
+            for (int32_t pattern = 0; pattern < UNUM_CURRENCY_SPACING_COUNT; pattern++) {
+                dfs.setPatternForCurrencySpacing(static_cast<UCurrencySpacing>(pattern),
+                    true, UnicodeString(defaults[pattern], -1, US_INV));
+            }
+        }
+    }
+};
+
+DecFmtSymDataSink::~DecFmtSymDataSink() {}
+CurrencySpacingSink::~CurrencySpacingSink() {}
+
+} 
+
+void
+DecimalFormatSymbols::initialize(const Locale& loc, UErrorCode& status,
+    UBool useLastResortData, const NumberingSystem* ns)
+{
+    if (U_FAILURE(status)) { return; }
+
+    initialize();
+
+    LocalPointer<NumberingSystem> nsLocal;
+    if (ns == nullptr) {
+        nsLocal.adoptInstead(NumberingSystem::createInstance(loc, status));
+        ns = nsLocal.getAlias();
+    }
+    const char *nsName;
+    if (U_SUCCESS(status) && ns->getRadix() == 10 && !ns->isAlgorithmic()) {
+        nsName = ns->getName();
+        UnicodeString digitString(ns->getDescription());
+        int32_t digitIndex = 0;
+        UChar32 digit = digitString.char32At(0);
+        fSymbols[kZeroDigitSymbol].setTo(digit);
+        for (int32_t i = kOneDigitSymbol; i <= kNineDigitSymbol; ++i) {
+            digitIndex += U16_LENGTH(digit);
+            digit = digitString.char32At(digitIndex);
+            fSymbols[i].setTo(digit);
+        }
+    } else {
+        nsName = gLatn;
+    }
+    uprv_strcpy(this->nsName, nsName);
+
+    const char* locStr = loc.getName();
+    LocalUResourceBundlePointer resource(ures_open(nullptr, locStr, &status));
+    LocalUResourceBundlePointer numberElementsRes(
+        ures_getByKeyWithFallback(resource.getAlias(), gNumberElements, nullptr, &status));
+
+    if (U_FAILURE(status)) {
+        if ( useLastResortData ) {
+            status = U_USING_DEFAULT_WARNING;
+            initialize();
+        }
+        return;
+    }
+
+    actualLocale = Locale(
+        ures_getLocaleByType(numberElementsRes.getAlias(), ULOC_ACTUAL_LOCALE, &status));
+    validLocale = Locale(
+        ures_getLocaleByType(numberElementsRes.getAlias(), ULOC_VALID_LOCALE, &status));
+
+    DecFmtSymDataSink sink(*this);
+    if (uprv_strcmp(nsName, gLatn) != 0) {
+        CharString path;
+        path.append(gNumberElements, status)
+            .append('/', status)
+            .append(nsName, status)
+            .append('/', status)
+            .append(gSymbols, status);
+        ures_getAllItemsWithFallback(resource.getAlias(), path.data(), sink, status);
+
+        if (status == U_MISSING_RESOURCE_ERROR) {
+            status = U_ZERO_ERROR;
+        } else if (U_FAILURE(status)) {
+            return;
+        }
+    }
+
+    if (!sink.seenAll()) {
+        ures_getAllItemsWithFallback(resource.getAlias(), gNumberElementsLatnSymbols, sink, status);
+        if (U_FAILURE(status)) { return; }
+    }
+
+    sink.resolveMissingMonetarySeparators(fSymbols);
+
+    UChar32 tempCodePointZero = -1;
+    for (int32_t i=0; i<=9; i++) {
+        const UnicodeString& stringDigit = getConstDigitSymbol(i);
+        if (stringDigit.countChar32() != 1) {
+            tempCodePointZero = -1;
+            break;
+        }
+        UChar32 cp = stringDigit.char32At(0);
+        if (i == 0) {
+            tempCodePointZero = cp;
+        } else if (cp != tempCodePointZero + i) {
+            tempCodePointZero = -1;
+            break;
+        }
+    }
+    fCodePointZero = tempCodePointZero;
+
+    UErrorCode internalStatus = U_ZERO_ERROR; 
+    char16_t curriso[4];
+    UnicodeString tempStr;
+    int32_t currisoLength = ucurr_forLocale(locStr, curriso, UPRV_LENGTHOF(curriso), &internalStatus);
+    if (U_SUCCESS(internalStatus) && currisoLength == 3) {
+        setCurrency(curriso, status);
+    } else {
+        setCurrency(nullptr, status);
+    }
+
+    LocalUResourceBundlePointer currencyResource(ures_open(U_ICUDATA_CURR, locStr, &status));
+    CurrencySpacingSink currencySink(*this);
+    ures_getAllItemsWithFallback(currencyResource.getAlias(), gCurrencySpacingTag, currencySink, status);
+    currencySink.resolveMissing();
+    if (U_FAILURE(status)) { return; }
+}
+
+void
+DecimalFormatSymbols::initialize() {
+    fSymbols[kDecimalSeparatorSymbol] = static_cast<char16_t>(0x2e); 
+    fSymbols[kGroupingSeparatorSymbol].remove();        
+    fSymbols[kPatternSeparatorSymbol] = static_cast<char16_t>(0x3b); 
+    fSymbols[kPercentSymbol] = static_cast<char16_t>(0x25);          
+    fSymbols[kZeroDigitSymbol] = static_cast<char16_t>(0x30);        
+    fSymbols[kOneDigitSymbol] = static_cast<char16_t>(0x31);         
+    fSymbols[kTwoDigitSymbol] = static_cast<char16_t>(0x32);         
+    fSymbols[kThreeDigitSymbol] = static_cast<char16_t>(0x33);       
+    fSymbols[kFourDigitSymbol] = static_cast<char16_t>(0x34);        
+    fSymbols[kFiveDigitSymbol] = static_cast<char16_t>(0x35);        
+    fSymbols[kSixDigitSymbol] = static_cast<char16_t>(0x36);         
+    fSymbols[kSevenDigitSymbol] = static_cast<char16_t>(0x37);       
+    fSymbols[kEightDigitSymbol] = static_cast<char16_t>(0x38);       
+    fSymbols[kNineDigitSymbol] = static_cast<char16_t>(0x39);        
+    fSymbols[kDigitSymbol] = static_cast<char16_t>(0x23);            
+    fSymbols[kPlusSignSymbol] = static_cast<char16_t>(0x002b);       
+    fSymbols[kMinusSignSymbol] = static_cast<char16_t>(0x2d);        
+    fSymbols[kCurrencySymbol] = static_cast<char16_t>(0xa4);         
+    fSymbols[kIntlCurrencySymbol].setTo(true, INTL_CURRENCY_SYMBOL_STR, 2);
+    fSymbols[kMonetarySeparatorSymbol] = static_cast<char16_t>(0x2e);  
+    fSymbols[kExponentialSymbol] = static_cast<char16_t>(0x45);        
+    fSymbols[kPerMillSymbol] = static_cast<char16_t>(0x2030);          
+    fSymbols[kPadEscapeSymbol] = static_cast<char16_t>(0x2a);          
+    fSymbols[kInfinitySymbol] = static_cast<char16_t>(0x221e);         
+    fSymbols[kNaNSymbol] = static_cast<char16_t>(0xfffd);              
+    fSymbols[kSignificantDigitSymbol] = static_cast<char16_t>(0x0040); 
+    fSymbols[kMonetaryGroupingSeparatorSymbol].remove(); 
+    fSymbols[kExponentMultiplicationSymbol] = static_cast<char16_t>(0xd7); 
+    fSymbols[kApproximatelySignSymbol] = u'~';          
+    fIsCustomCurrencySymbol = false; 
+    fIsCustomIntlCurrencySymbol = false;
+    fCodePointZero = 0x30;
+    U_ASSERT(fCodePointZero == fSymbols[kZeroDigitSymbol].char32At(0));
+    currPattern = nullptr;
+    nsName[0] = 0;
+}
+
+void DecimalFormatSymbols::setCurrency(const char16_t* currency, UErrorCode& status) {
+    if (!currency) {
+        return;
+    }
+
+    UnicodeString tempStr;
+    uprv_getStaticCurrencyName(currency, locale.getName(), tempStr, status);
+    if (U_SUCCESS(status)) {
+        fSymbols[kIntlCurrencySymbol].setTo(currency, 3);
+        fSymbols[kCurrencySymbol] = tempStr;
+    }
+
+    char cc[4]={0};
+    u_UCharsToChars(currency, cc, 3);
+
+    UErrorCode localStatus = U_ZERO_ERROR;
+    LocalUResourceBundlePointer rbTop(ures_open(U_ICUDATA_CURR, locale.getName(), &localStatus));
+    LocalUResourceBundlePointer rb(
+        ures_getByKeyWithFallback(rbTop.getAlias(), "Currencies", nullptr, &localStatus));
+    ures_getByKeyWithFallback(rb.getAlias(), cc, rb.getAlias(), &localStatus);
+    if(U_SUCCESS(localStatus) && ures_getSize(rb.getAlias())>2) { 
+        ures_getByIndex(rb.getAlias(), 2, rb.getAlias(), &localStatus);
+        int32_t currPatternLen = 0;
+        currPattern =
+            ures_getStringByIndex(rb.getAlias(), static_cast<int32_t>(0), &currPatternLen, &localStatus);
+        UnicodeString decimalSep =
+            ures_getUnicodeStringByIndex(rb.getAlias(), static_cast<int32_t>(1), &localStatus);
+        UnicodeString groupingSep =
+            ures_getUnicodeStringByIndex(rb.getAlias(), static_cast<int32_t>(2), &localStatus);
+        if(U_SUCCESS(localStatus)){
+            fSymbols[kMonetaryGroupingSeparatorSymbol] = groupingSep;
+            fSymbols[kMonetarySeparatorSymbol] = decimalSep;
+        }
+    }
+}
+
+Locale
+DecimalFormatSymbols::getLocale(ULocDataLocaleType type, UErrorCode& status) const {
+    return LocaleBased::getLocale(validLocale, actualLocale, type, status);
+}
+
+const UnicodeString&
+DecimalFormatSymbols::getPatternForCurrencySpacing(UCurrencySpacing type,
+                                                 UBool beforeCurrency,
+                                                 UErrorCode& status) const {
+    if (U_FAILURE(status)) {
+      return fNoSymbol;  
+    }
+    if (beforeCurrency) {
+      return currencySpcBeforeSym[static_cast<int32_t>(type)];
+    } else {
+      return currencySpcAfterSym[static_cast<int32_t>(type)];
+    }
+}
+
+void
+DecimalFormatSymbols::setPatternForCurrencySpacing(UCurrencySpacing type,
+                                                   UBool beforeCurrency,
+                                             const UnicodeString& pattern) {
+  if (beforeCurrency) {
+    currencySpcBeforeSym[static_cast<int32_t>(type)] = pattern;
+  } else {
+    currencySpcAfterSym[static_cast<int32_t>(type)] = pattern;
+  }
+}
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+

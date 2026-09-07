@@ -1,0 +1,17 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+set_config("MOZ_UPDATER", False)
+set_config("MOZ_VERIFY_MAR_SIGNATURE", False)
+set_config("DISABLE_UPDATER_AUTHENTICODE_CHECK", False)
+set_config("MOZ_SMAUTHORIZEDCLIENTS_REQUIREMENTS", False)
+set_config("MOZ_SMPRIVILEGEDEXECUTABLES_REQUIREMENTS", False)
+set_config("MAR_CHANNEL_ID", False)
+set_config("ACCEPTED_MAR_CHANNEL_IDS", False)
+set_config("MOZ_USE_NSS_FOR_MAR", False)
+set_config("MOZ_MAINTENANCE_SERVICE", False)
+set_config("MOZ_UPDATE_AGENT", False)
+set_config("MOZ_DEFAULT_BROWSER_AGENT", False)
+set_config("MOZ_NOTIFICATION_SERVER", False)
+set_config("MOZ_BSPATCH", False)

@@ -1,0 +1,93 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_loader_SyncModuleLoader_h
+#define mozilla_loader_SyncModuleLoader_h
+
+#include "js/loader/LoadContextBase.h"
+#include "js/loader/ModuleLoaderBase.h"
+
+class mozJSModuleLoader;
+
+namespace mozilla {
+namespace loader {
+
+class SyncScriptLoader : public JS::loader::ScriptLoaderInterface {
+ public:
+  NS_DECL_ISUPPORTS
+
+ private:
+  ~SyncScriptLoader() = default;
+
+  nsIURI* GetBaseURI() const override;
+
+  void ReportErrorToConsole(ScriptLoadRequest* aRequest,
+                            nsresult aResult) const override;
+
+  void ReportWarningToConsole(ScriptLoadRequest* aRequest,
+                              const char* aMessageName,
+                              const nsTArray<nsString>& aParams) const override;
+
+  nsresult FillCompileOptionsForRequest(
+      JSContext* cx, ScriptLoadRequest* aRequest, JS::CompileOptions* aOptions,
+      JS::MutableHandle<JSScript*> aIntroductionScript) override;
+};
+
+class SyncModuleLoader : public JS::loader::ModuleLoaderBase {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(SyncModuleLoader,
+                                           JS::loader::ModuleLoaderBase)
+
+  SyncModuleLoader(SyncScriptLoader* aScriptLoader,
+                   nsIGlobalObject* aGlobalObject);
+
+  [[nodiscard]] nsresult ProcessRequests();
+
+  void MaybeReportLoadError(JSContext* aCx);
+
+ private:
+  ~SyncModuleLoader();
+
+  already_AddRefed<ModuleLoadRequest> CreateRequest(
+      JSContext* aCx, nsIURI* aURI, JS::Handle<JSObject*> aModuleRequest,
+      JS::Handle<JS::Value> aHostDefined, JS::Handle<JS::Value> aPayload,
+      bool aIsDynamicImport, JS::loader::ScriptFetchOptions* aOptions,
+      dom::ReferrerPolicy aReferrerPolicy, nsIURI* aBaseURL,
+      const dom::SRIMetadata& aSriMetadata) override;
+
+  void OnDynamicImportStarted(ModuleLoadRequest* aRequest) override;
+
+  bool CanStartLoad(ModuleLoadRequest* aRequest, nsresult* aRvOut) override;
+
+  nsresult StartFetch(ModuleLoadRequest* aRequest) override;
+
+  nsresult CompileFetchedModule(
+      JSContext* aCx, JS::Handle<JSObject*> aGlobal,
+      JS::CompileOptions& aOptions, ModuleLoadRequest* aRequest,
+      JS::MutableHandle<JSObject*> aModuleScript) override;
+
+  void OnModuleLoadComplete(ModuleLoadRequest* aRequest) override;
+
+  JS::loader::ScriptLoadRequestList mLoadRequests;
+
+  JS::PersistentRooted<JS::Value> mLoadException;
+};
+
+class SyncLoadContext : public JS::loader::LoadContextBase {
+ public:
+  SyncLoadContext() : LoadContextBase(JS::loader::ContextKind::Sync) {}
+
+ public:
+  nsresult mRv = NS_OK;
+
+  JS::PersistentRooted<JS::Value> mExceptionValue;
+
+  JS::PersistentRooted<JSObject*> mModule;
+};
+
+}  
+}  
+
+#endif  // mozilla_loader_SyncModuleLoader_h

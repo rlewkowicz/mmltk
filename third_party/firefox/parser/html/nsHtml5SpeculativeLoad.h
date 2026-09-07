@@ -1,0 +1,318 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsHtml5SpeculativeLoad_h
+#define nsHtml5SpeculativeLoad_h
+
+#include "nsString.h"
+#include "nsContentUtils.h"
+#include "nsHtml5DocumentMode.h"
+#include "nsHtml5String.h"
+#include "ReferrerInfo.h"
+
+class nsHtml5TreeOpExecutor;
+
+enum eHtml5SpeculativeLoad {
+  eSpeculativeLoadUninitialized,
+  eSpeculativeLoadBase,
+  eSpeculativeLoadCSP,
+  eSpeculativeLoadMetaReferrer,
+  eSpeculativeLoadImage,
+  eSpeculativeLoadOpenPicture,
+  eSpeculativeLoadEndPicture,
+  eSpeculativeLoadPictureSource,
+  eSpeculativeLoadScript,
+  eSpeculativeLoadScriptFromHead,
+  eSpeculativeLoadStyle,
+  eSpeculativeLoadManifest,
+  eSpeculativeLoadSetDocumentCharset,
+  eSpeculativeLoadSetDocumentMode,
+  eSpeculativeLoadPreconnect,
+  eSpeculativeLoadFont,
+  eSpeculativeLoadFetch,
+  eSpeculativeLoadMaybeComplainAboutCharset
+};
+
+class nsHtml5SpeculativeLoad {
+  using Encoding = mozilla::Encoding;
+  template <typename T>
+  using NotNull = mozilla::NotNull<T>;
+
+ public:
+  nsHtml5SpeculativeLoad();
+  ~nsHtml5SpeculativeLoad();
+
+  nsHtml5SpeculativeLoad(const nsHtml5SpeculativeLoad&) = delete;
+  nsHtml5SpeculativeLoad& operator=(const nsHtml5SpeculativeLoad&) = delete;
+
+  inline void InitBase(nsHtml5String aUrl) {
+    MOZ_ASSERT(mOpCode == eSpeculativeLoadUninitialized,
+               "Trying to reinitialize a speculative load!");
+    mOpCode = eSpeculativeLoadBase;
+    aUrl.ToString(mUrlOrSizes);
+  }
+
+  inline void InitMetaCSP(nsHtml5String aCSP) {
+    MOZ_ASSERT(mOpCode == eSpeculativeLoadUninitialized,
+               "Trying to reinitialize a speculative load!");
+    mOpCode = eSpeculativeLoadCSP;
+    nsString csp;  
+    aCSP.ToString(csp);
+    mTypeOrCharsetSourceOrDocumentModeOrMetaCSPOrSizesOrIntegrity.Assign(
+        nsContentUtils::TrimWhitespace<nsContentUtils::IsHTMLWhitespace>(csp));
+  }
+
+  inline void InitMetaReferrerPolicy(nsHtml5String aReferrerPolicy) {
+    MOZ_ASSERT(mOpCode == eSpeculativeLoadUninitialized,
+               "Trying to reinitialize a speculative load!");
+    mOpCode = eSpeculativeLoadMetaReferrer;
+    nsString
+        referrerPolicy;  
+    aReferrerPolicy.ToString(referrerPolicy);
+    mReferrerPolicyOrIntegrity.Assign(
+        nsContentUtils::TrimWhitespace<nsContentUtils::IsHTMLWhitespace>(
+            referrerPolicy));
+  }
+
+  inline void InitImage(nsHtml5String aUrl, nsHtml5String aCrossOrigin,
+                        nsHtml5String aMedia, nsHtml5String aReferrerPolicy,
+                        nsHtml5String aSrcset, nsHtml5String aSizes,
+                        bool aLinkPreload, nsHtml5String aFetchPriority,
+                        nsHtml5String aType) {
+    MOZ_ASSERT(mOpCode == eSpeculativeLoadUninitialized,
+               "Trying to reinitialize a speculative load!");
+    mOpCode = eSpeculativeLoadImage;
+    aUrl.ToString(mUrlOrSizes);
+    aCrossOrigin.ToString(mCrossOrigin);
+    aMedia.ToString(mMedia);
+    nsString
+        referrerPolicy;  
+    aReferrerPolicy.ToString(referrerPolicy);
+    mReferrerPolicyOrIntegrity.Assign(
+        nsContentUtils::TrimWhitespace<nsContentUtils::IsHTMLWhitespace>(
+            referrerPolicy));
+    aSrcset.ToString(mCharsetOrSrcset);
+    aSizes.ToString(
+        mTypeOrCharsetSourceOrDocumentModeOrMetaCSPOrSizesOrIntegrity);
+    mIsLinkPreload = aLinkPreload;
+    aFetchPriority.ToString(mFetchPriority);
+    aType.ToString(mNonceOrType);
+  }
+
+  inline void InitFont(nsHtml5String aUrl, nsHtml5String aCrossOrigin,
+                       nsHtml5String aMedia, nsHtml5String aReferrerPolicy,
+                       nsHtml5String aFetchPriority) {
+    MOZ_ASSERT(mOpCode == eSpeculativeLoadUninitialized,
+               "Trying to reinitialize a speculative load!");
+    mOpCode = eSpeculativeLoadFont;
+    aUrl.ToString(mUrlOrSizes);
+    aCrossOrigin.ToString(mCrossOrigin);
+    aMedia.ToString(mMedia);
+    nsString
+        referrerPolicy;  
+    aReferrerPolicy.ToString(referrerPolicy);
+    mReferrerPolicyOrIntegrity.Assign(
+        nsContentUtils::TrimWhitespace<nsContentUtils::IsHTMLWhitespace>(
+            referrerPolicy));
+    aFetchPriority.ToString(mFetchPriority);
+    mIsLinkPreload = true;
+  }
+
+  inline void InitFetch(nsHtml5String aUrl, nsHtml5String aCrossOrigin,
+                        nsHtml5String aMedia, nsHtml5String aReferrerPolicy,
+                        nsHtml5String aFetchPriority) {
+    MOZ_ASSERT(mOpCode == eSpeculativeLoadUninitialized,
+               "Trying to reinitialize a speculative load!");
+    mOpCode = eSpeculativeLoadFetch;
+    aUrl.ToString(mUrlOrSizes);
+    aCrossOrigin.ToString(mCrossOrigin);
+    aMedia.ToString(mMedia);
+    nsString
+        referrerPolicy;  
+    aReferrerPolicy.ToString(referrerPolicy);
+    mReferrerPolicyOrIntegrity.Assign(
+        nsContentUtils::TrimWhitespace<nsContentUtils::IsHTMLWhitespace>(
+            referrerPolicy));
+    aFetchPriority.ToString(mFetchPriority);
+
+    mIsLinkPreload = true;
+  }
+
+  inline void InitOpenPicture() {
+    MOZ_ASSERT(mOpCode == eSpeculativeLoadUninitialized,
+               "Trying to reinitialize a speculative load!");
+    mOpCode = eSpeculativeLoadOpenPicture;
+  }
+
+  inline void InitEndPicture() {
+    MOZ_ASSERT(mOpCode == eSpeculativeLoadUninitialized,
+               "Trying to reinitialize a speculative load!");
+    mOpCode = eSpeculativeLoadEndPicture;
+  }
+
+  inline void InitPictureSource(nsHtml5String aSrcset, nsHtml5String aSizes,
+                                nsHtml5String aType, nsHtml5String aMedia) {
+    MOZ_ASSERT(mOpCode == eSpeculativeLoadUninitialized,
+               "Trying to reinitialize a speculative load!");
+    mOpCode = eSpeculativeLoadPictureSource;
+    aSrcset.ToString(mCharsetOrSrcset);
+    aSizes.ToString(mUrlOrSizes);
+    aType.ToString(
+        mTypeOrCharsetSourceOrDocumentModeOrMetaCSPOrSizesOrIntegrity);
+    aMedia.ToString(mMedia);
+  }
+
+  inline void InitScript(nsHtml5String aUrl, nsHtml5String aCharset,
+                         nsHtml5String aType, nsHtml5String aCrossOrigin,
+                         nsHtml5String aMedia, nsHtml5String aNonce,
+                         nsHtml5String aFetchPriority, nsHtml5String aIntegrity,
+                         nsHtml5String aReferrerPolicy, bool aParserInHead,
+                         bool aAsync, bool aDefer, bool aLinkPreload) {
+    MOZ_ASSERT(mOpCode == eSpeculativeLoadUninitialized,
+               "Trying to reinitialize a speculative load!");
+    mOpCode =
+        aParserInHead ? eSpeculativeLoadScriptFromHead : eSpeculativeLoadScript;
+    aUrl.ToString(mUrlOrSizes);
+    aCharset.ToString(mCharsetOrSrcset);
+    aType.ToString(
+        mTypeOrCharsetSourceOrDocumentModeOrMetaCSPOrSizesOrIntegrity);
+    aCrossOrigin.ToString(mCrossOrigin);
+    aMedia.ToString(mMedia);
+    aNonce.ToString(mNonceOrType);
+    aFetchPriority.ToString(mFetchPriority);
+    aIntegrity.ToString(mReferrerPolicyOrIntegrity);
+    nsAutoString referrerPolicy;
+    aReferrerPolicy.ToString(referrerPolicy);
+    referrerPolicy =
+        nsContentUtils::TrimWhitespace<nsContentUtils::IsHTMLWhitespace>(
+            referrerPolicy);
+    mScriptReferrerPolicy =
+        mozilla::dom::ReferrerInfo::ReferrerPolicyAttributeFromString(
+            referrerPolicy);
+
+    mIsAsync = aAsync;
+    mIsDefer = aDefer;
+    mIsLinkPreload = aLinkPreload;
+  }
+
+  inline void InitImportStyle(nsString&& aUrl) {
+    MOZ_ASSERT(mOpCode == eSpeculativeLoadUninitialized,
+               "Trying to reinitialize a speculative load!");
+    mOpCode = eSpeculativeLoadStyle;
+    mUrlOrSizes = std::move(aUrl);
+    mCharsetOrSrcset.SetIsVoid(true);
+    mCrossOrigin.SetIsVoid(true);
+    mMedia.SetIsVoid(true);
+    mReferrerPolicyOrIntegrity.SetIsVoid(true);
+    mNonceOrType.SetIsVoid(true);
+    mTypeOrCharsetSourceOrDocumentModeOrMetaCSPOrSizesOrIntegrity.SetIsVoid(
+        true);
+  }
+
+  inline void InitStyle(nsHtml5String aUrl, nsHtml5String aCharset,
+                        nsHtml5String aCrossOrigin, nsHtml5String aMedia,
+                        nsHtml5String aReferrerPolicy, nsHtml5String aNonce,
+                        nsHtml5String aIntegrity, bool aLinkPreload,
+                        nsHtml5String aFetchPriority) {
+    MOZ_ASSERT(mOpCode == eSpeculativeLoadUninitialized,
+               "Trying to reinitialize a speculative load!");
+    mOpCode = eSpeculativeLoadStyle;
+    aUrl.ToString(mUrlOrSizes);
+    aCharset.ToString(mCharsetOrSrcset);
+    aCrossOrigin.ToString(mCrossOrigin);
+    aMedia.ToString(mMedia);
+    nsString
+        referrerPolicy;  
+    aReferrerPolicy.ToString(referrerPolicy);
+    mReferrerPolicyOrIntegrity.Assign(
+        nsContentUtils::TrimWhitespace<nsContentUtils::IsHTMLWhitespace>(
+            referrerPolicy));
+    aNonce.ToString(mNonceOrType);
+    aIntegrity.ToString(
+        mTypeOrCharsetSourceOrDocumentModeOrMetaCSPOrSizesOrIntegrity);
+    mIsLinkPreload = aLinkPreload;
+    aFetchPriority.ToString(mFetchPriority);
+  }
+
+  inline void InitManifest(nsHtml5String aUrl) {
+    MOZ_ASSERT(mOpCode == eSpeculativeLoadUninitialized,
+               "Trying to reinitialize a speculative load!");
+    mOpCode = eSpeculativeLoadManifest;
+    aUrl.ToString(mUrlOrSizes);
+  }
+
+  inline void InitSetDocumentCharset(NotNull<const Encoding*> aEncoding,
+                                     int32_t aCharsetSource,
+                                     bool aCommitEncodingSpeculation) {
+    MOZ_ASSERT(mOpCode == eSpeculativeLoadUninitialized,
+               "Trying to reinitialize a speculative load!");
+    mOpCode = eSpeculativeLoadSetDocumentCharset;
+    mCharsetOrSrcset.~nsString();
+    mEncoding = aEncoding;
+    mTypeOrCharsetSourceOrDocumentModeOrMetaCSPOrSizesOrIntegrity.Assign(
+        (char16_t)aCharsetSource);
+    mCommitEncodingSpeculation = aCommitEncodingSpeculation;
+  }
+
+  inline void InitMaybeComplainAboutCharset(const char* aMsgId, bool aError,
+                                            int32_t aLineNumber) {
+    MOZ_ASSERT(mOpCode == eSpeculativeLoadUninitialized,
+               "Trying to reinitialize a speculative load!");
+    mOpCode = eSpeculativeLoadMaybeComplainAboutCharset;
+    mCharsetOrSrcset.~nsString();
+    mMsgId = aMsgId;
+    mIsError = aError;
+    char16_t high = (char16_t)(((uint32_t)aLineNumber) >> 16);
+    char16_t low = (char16_t)(((uint32_t)aLineNumber) & 0xFFFF);
+    mTypeOrCharsetSourceOrDocumentModeOrMetaCSPOrSizesOrIntegrity.Assign(high);
+    mTypeOrCharsetSourceOrDocumentModeOrMetaCSPOrSizesOrIntegrity.Append(low);
+  }
+
+  inline void InitSetDocumentMode(nsHtml5DocumentMode aMode) {
+    MOZ_ASSERT(mOpCode == eSpeculativeLoadUninitialized,
+               "Trying to reinitialize a speculative load!");
+    mOpCode = eSpeculativeLoadSetDocumentMode;
+    mTypeOrCharsetSourceOrDocumentModeOrMetaCSPOrSizesOrIntegrity.Assign(
+        (char16_t)aMode);
+  }
+
+  inline void InitPreconnect(nsHtml5String aUrl, nsHtml5String aCrossOrigin) {
+    MOZ_ASSERT(mOpCode == eSpeculativeLoadUninitialized,
+               "Trying to reinitialize a speculative load!");
+    mOpCode = eSpeculativeLoadPreconnect;
+    aUrl.ToString(mUrlOrSizes);
+    aCrossOrigin.ToString(mCrossOrigin);
+  }
+
+  void Perform(nsHtml5TreeOpExecutor* aExecutor);
+
+ private:
+  eHtml5SpeculativeLoad mOpCode;
+
+  bool mIsAsync;
+
+  bool mIsDefer;
+
+  bool mIsLinkPreload;
+
+  bool mIsError;
+
+  bool mCommitEncodingSpeculation;
+
+  nsString mUrlOrSizes;
+  nsString mReferrerPolicyOrIntegrity;
+  union {
+    nsString mCharsetOrSrcset;
+    const Encoding* mEncoding;
+    const char* mMsgId;
+  };
+  nsString mTypeOrCharsetSourceOrDocumentModeOrMetaCSPOrSizesOrIntegrity;
+  nsString mCrossOrigin;
+  nsString mMedia;
+  nsString mNonceOrType;
+  nsString mFetchPriority;
+  mozilla::dom::ReferrerPolicy mScriptReferrerPolicy;
+};
+
+#endif  // nsHtml5SpeculativeLoad_h

@@ -1,0 +1,364 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef LAYOUT_SVG_SVGUTILS_H_
+#define LAYOUT_SVG_SVGUTILS_H_
+
+#include <math.h>
+
+#include <algorithm>
+
+#include "DrawMode.h"
+#include "ImgDrawResult.h"
+#include "gfx2DGlue.h"
+#include "gfxMatrix.h"
+#include "gfxPoint.h"
+#include "gfxRect.h"
+#include "mozilla/EnumSet.h"
+#include "mozilla/ISVGDisplayableFrame.h"
+#include "mozilla/gfx/Rect.h"
+#include "nsCOMPtr.h"
+#include "nsChangeHint.h"
+#include "nsColor.h"
+#include "nsID.h"
+#include "nsIFrame.h"
+#include "nsISupports.h"
+#include "nsMathUtils.h"
+#include "nsStyleStruct.h"
+
+class gfxContext;
+class nsFrameList;
+class nsIContent;
+
+class nsPresContext;
+class nsTextFrame;
+
+struct nsStyleSVG;
+struct nsRect;
+
+namespace mozilla {
+class SVGAnimatedEnumeration;
+class SVGAnimatedLength;
+class SVGContextPaint;
+class SVGDisplayContainerFrame;
+class SVGGeometryFrame;
+class SVGOuterSVGFrame;
+namespace dom {
+class Element;
+class SVGElement;
+class UserSpaceMetrics;
+}  
+namespace gfx {
+class DrawTarget;
+class GeneralPattern;
+}  
+}  
+
+bool NS_SVGNewGetBBoxEnabled();
+
+namespace mozilla {
+
+enum class SVGHitTestFlag { Fill, Stroke };
+using SVGHitTestFlags = EnumSet<SVGHitTestFlag>;
+
+class SVGBBox final {
+  using Rect = gfx::Rect;
+
+ public:
+  SVGBBox() : mIsEmpty(true) {}
+
+  MOZ_IMPLICIT SVGBBox(const Rect& aRect) : mBBox(aRect), mIsEmpty(false) {}
+
+  MOZ_IMPLICIT SVGBBox(const gfxRect& aRect)
+      : mBBox(ToRect(aRect)), mIsEmpty(false) {}
+
+  operator const Rect&() { return mBBox; }
+
+  gfxRect ToThebesRect() const { return ThebesRect(mBBox); }
+
+  bool IsEmpty() const { return mIsEmpty; }
+
+  bool IsFinite() const { return mBBox.IsFinite(); }
+
+  void Scale(float aScale) { mBBox.Scale(aScale); }
+
+  void UnionEdges(const SVGBBox& aSVGBBox) {
+    if (aSVGBBox.mIsEmpty) {
+      return;
+    }
+    mBBox = mIsEmpty ? aSVGBBox.mBBox : mBBox.UnionEdges(aSVGBBox.mBBox);
+    mIsEmpty = false;
+  }
+
+  void Intersect(const SVGBBox& aSVGBBox) {
+    if (!mIsEmpty && !aSVGBBox.mIsEmpty) {
+      mBBox = mBBox.Intersect(aSVGBBox.mBBox);
+      if (mBBox.IsEmpty()) {
+        mIsEmpty = true;
+        mBBox = Rect(0, 0, 0, 0);
+      }
+    } else {
+      mIsEmpty = true;
+      mBBox = Rect(0, 0, 0, 0);
+    }
+  }
+
+ private:
+  Rect mBBox;
+  bool mIsEmpty;
+};
+
+#undef CLIP_MASK
+
+class MOZ_RAII SVGAutoRenderState final {
+  using DrawTarget = gfx::DrawTarget;
+
+ public:
+  explicit SVGAutoRenderState(DrawTarget* aDrawTarget);
+  ~SVGAutoRenderState();
+
+  void SetPaintingToWindow(bool aPaintingToWindow);
+
+  static bool IsPaintingToWindow(DrawTarget* aDrawTarget);
+
+ private:
+  DrawTarget* mDrawTarget;
+  void* mOriginalRenderState;
+  bool mPaintingToWindow;
+};
+
+class SVGUtils final {
+ public:
+  using Element = dom::Element;
+  using SVGElement = dom::SVGElement;
+  using AntialiasMode = gfx::AntialiasMode;
+  using DrawTarget = gfx::DrawTarget;
+  using FillRule = gfx::FillRule;
+  using GeneralPattern = gfx::GeneralPattern;
+  using Size = gfx::Size;
+  using imgDrawingParams = image::imgDrawingParams;
+
+  NS_DECLARE_FRAME_PROPERTY_DELETABLE(ObjectBoundingBoxProperty, gfxRect)
+
+  static nsRect GetPostFilterInkOverflowRect(nsIFrame* aFrame,
+                                             const nsRect& aPreFilterRect);
+
+  static void ScheduleReflowSVG(nsIFrame* aFrame);
+
+  static bool NeedsReflowSVG(const nsIFrame* aFrame);
+
+  static Size GetContextSize(const nsIFrame* aFrame);
+
+  static float ObjectSpace(const gfxRect& aRect,
+                           const dom::UserSpaceMetrics& aMetrics,
+                           const SVGAnimatedLength* aLength);
+
+  static float UserSpace(nsIFrame* aNonSVGContext,
+                         const SVGAnimatedLength* aLength);
+  static float UserSpace(const dom::UserSpaceMetrics& aMetrics,
+                         const SVGAnimatedLength* aLength);
+
+  static SVGOuterSVGFrame* GetOuterSVGFrame(nsIFrame* aFrame);
+
+  static nsIFrame* GetOuterSVGFrameAndCoveredRegion(nsIFrame* aFrame,
+                                                    nsRect* aRect);
+
+  static void PaintFrameWithEffects(nsIFrame* aFrame, gfxContext& aContext,
+                                    const gfxMatrix& aTransform,
+                                    imgDrawingParams& aImgParams);
+
+  static bool HitTestClip(nsIFrame* aFrame, const gfxPoint& aPoint);
+
+  static gfxMatrix GetCanvasTM(nsIFrame* aFrame);
+
+  static bool GetParentSVGTransforms(const nsIFrame* aFrame,
+                                     gfx::Matrix* aFromParentTransform);
+
+  static void NotifyChildrenOfSVGChange(
+      nsIFrame* aFrame, ISVGDisplayableFrame::ChangeFlags aFlags);
+
+  static gfx::IntSize ConvertToSurfaceSize(const gfxSize& aSize,
+                                           bool* aResultOverflows);
+
+  static bool HitTestRect(const gfx::Matrix& aMatrix, float aRX, float aRY,
+                          float aRWidth, float aRHeight, float aX, float aY);
+
+  static gfxRect GetClipRectForFrame(const nsIFrame* aFrame, float aX, float aY,
+                                     float aWidth, float aHeight,
+                                     SVGBBoxFlags aFlags = {});
+
+  static bool CanOptimizeOpacity(const nsIFrame* aFrame);
+
+  static gfxMatrix AdjustMatrixForUnits(const gfxMatrix& aMatrix,
+                                        const SVGAnimatedEnumeration* aUnits,
+                                        nsIFrame* aFrame, SVGBBoxFlags aFlags);
+
+  static gfxRect GetBBox(nsIFrame* aFrame,
+                         SVGBBoxFlags aFlags = SVGBBoxFlag::IncludeFillGeometry,
+                         const gfxMatrix* aToBoundsSpace = nullptr);
+
+  static gfxPoint FrameSpaceInCSSPxToUserSpaceOffset(const nsIFrame* aFrame);
+
+  static gfxRect GetRelativeRect(uint16_t aUnits,
+                                 const SVGAnimatedLength* aXYWH,
+                                 const gfxRect& aBBox, nsIFrame* aFrame);
+
+  static gfxRect GetRelativeRect(uint16_t aUnits,
+                                 const SVGAnimatedLength* aXYWH,
+                                 const gfxRect& aBBox,
+                                 const SVGElement* aElement,
+                                 const dom::UserSpaceMetrics& aMetrics);
+
+  static bool OuterSVGIsCallingReflowSVG(nsIFrame* aFrame);
+  static bool AnyOuterSVGIsCallingReflowSVG(nsIFrame* aFrame);
+
+  static bool GetNonScalingStrokeTransform(const nsIFrame* aFrame,
+                                           gfxMatrix* aUserToOuterSVG);
+
+  static void UpdateNonScalingStrokeStateBit(nsIFrame* aFrame);
+
+  static gfxRect PathExtentsToMaxStrokeExtents(const gfxRect& aPathExtents,
+                                               const nsTextFrame* aFrame,
+                                               const gfxMatrix& aMatrix);
+  static gfxRect PathExtentsToMaxStrokeExtents(const gfxRect& aPathExtents,
+                                               const SVGGeometryFrame* aFrame,
+                                               const gfxMatrix& aMatrix);
+
+  static int32_t ClampToInt(double aVal) {
+    return NS_lround(std::clamp(aVal, double(INT32_MIN), double(INT32_MAX)));
+  }
+
+  static int64_t ClampToInt64(double aVal) {
+    return static_cast<int64_t>(
+        std::clamp<double>(aVal, INT64_MIN, std::nexttoward(INT64_MAX, 0)));
+  }
+
+  static nscolor GetFallbackOrPaintColor(
+      const ComputedStyle&, StyleSVGPaint nsStyleSVG::* aFillOrStroke,
+      nscolor aDefaultContextFallbackColor);
+
+  static void MakeFillPatternFor(nsIFrame* aFrame, gfxContext* aContext,
+                                 GeneralPattern* aOutPattern,
+                                 imgDrawingParams& aImgParams,
+                                 SVGContextPaint* aContextPaint = nullptr);
+
+  static void MakeStrokePatternFor(nsIFrame* aFrame, gfxContext* aContext,
+                                   GeneralPattern* aOutPattern,
+                                   imgDrawingParams& aImgParams,
+                                   SVGContextPaint* aContextPaint = nullptr);
+
+  static float GetOpacity(const StyleSVGOpacity&, const SVGContextPaint*);
+
+  static bool HasStroke(const nsIFrame* aFrame,
+                        const SVGContextPaint* aContextPaint = nullptr);
+
+  static float GetStrokeWidth(const nsIFrame* aFrame,
+                              const SVGContextPaint* aContextPaint = nullptr);
+
+  static void SetupStrokeGeometry(nsIFrame* aFrame, gfxContext* aContext,
+                                  SVGContextPaint* aContextPaint = nullptr);
+
+  static SVGHitTestFlags GetGeometryHitTestFlags(const nsIFrame* aFrame);
+
+  static FillRule ToFillRule(StyleFillRule aFillRule) {
+    return aFillRule == StyleFillRule::Evenodd ? FillRule::FILL_EVEN_ODD
+                                               : FillRule::FILL_WINDING;
+  }
+
+  static AntialiasMode ToAntialiasMode(StyleTextRendering aTextRendering) {
+    return aTextRendering == StyleTextRendering::Optimizespeed
+               ? AntialiasMode::NONE
+               : AntialiasMode::SUBPIXEL;
+  }
+
+  static AntialiasMode ToAntialiasMode(StyleShapeRendering aShapeRendering) {
+    return (aShapeRendering == StyleShapeRendering::Optimizespeed ||
+            aShapeRendering == StyleShapeRendering::Crispedges)
+               ? AntialiasMode::NONE
+               : AntialiasMode::SUBPIXEL;
+  }
+
+  static void PaintSVGGlyph(Element* aElement, gfxContext* aContext,
+                            imgDrawingParams& aImgParams);
+
+  static bool GetSVGGlyphExtents(const Element* aElement,
+                                 const gfxMatrix& aSVGToAppSpace,
+                                 gfxRect* aResult);
+
+  static nsRect ToCanvasBounds(const gfxRect& aUserspaceRect,
+                               const gfxMatrix& aToCanvas,
+                               const nsPresContext* presContext);
+
+  struct MaskUsage;
+  static MaskUsage DetermineMaskUsage(const nsIFrame* aFrame,
+                                      bool aHandleOpacity);
+
+  struct MOZ_STACK_CLASS MaskUsage {
+    friend MaskUsage SVGUtils::DetermineMaskUsage(const nsIFrame* aFrame,
+                                                  bool aHandleOpacity);
+
+    bool ShouldGenerateMaskLayer() const { return mShouldGenerateMaskLayer; }
+
+    bool ShouldGenerateClipMaskLayer() const {
+      return mShouldGenerateClipMaskLayer;
+    }
+
+    bool ShouldGenerateLayer() const {
+      return mShouldGenerateMaskLayer || mShouldGenerateClipMaskLayer;
+    }
+
+    bool ShouldGenerateMask() const {
+      return mShouldGenerateMaskLayer || mShouldGenerateClipMaskLayer ||
+             !IsOpaque();
+    }
+
+    bool ShouldApplyClipPath() const { return mShouldApplyClipPath; }
+
+    bool HasSVGClip() const {
+      return mShouldGenerateClipMaskLayer || mShouldApplyClipPath;
+    }
+
+    bool ShouldApplyBasicShapeOrPath() const {
+      return mShouldApplyBasicShapeOrPath;
+    }
+
+    bool IsSimpleClipShape() const { return mIsSimpleClipShape; }
+
+    bool IsOpaque() const { return mOpacity == 1.0f; }
+
+    bool IsTransparent() const { return mOpacity == 0.0f; }
+
+    float Opacity() const { return mOpacity; }
+
+    bool UsingMaskOrClipPath() const {
+      return mShouldGenerateMaskLayer || mShouldGenerateClipMaskLayer ||
+             mShouldApplyClipPath || mShouldApplyBasicShapeOrPath;
+    }
+
+    bool ShouldDoSomething() const {
+      return mShouldGenerateMaskLayer || mShouldGenerateClipMaskLayer ||
+             mShouldApplyClipPath || mShouldApplyBasicShapeOrPath ||
+             mOpacity != 1.0f;
+    }
+
+   private:
+    MaskUsage() = default;
+
+    float mOpacity = 0.0f;
+    bool mShouldGenerateMaskLayer = false;
+    bool mShouldGenerateClipMaskLayer = false;
+    bool mShouldApplyClipPath = false;
+    bool mShouldApplyBasicShapeOrPath = false;
+    bool mIsSimpleClipShape = false;
+  };
+
+  static float ComputeOpacity(const nsIFrame* aFrame, bool aHandleOpacity);
+
+  static gfxMatrix GetCSSPxToDevPxMatrix(const nsIFrame* aNonSVGFrame);
+  static gfxMatrix GetTransformMatrixInUserSpace(const nsIFrame* aFrame);
+};
+
+}  
+
+#endif  // LAYOUT_SVG_SVGUTILS_H_

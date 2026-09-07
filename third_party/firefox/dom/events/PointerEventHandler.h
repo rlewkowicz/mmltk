@@ -1,0 +1,386 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_PointerEventHandler_h
+#define mozilla_PointerEventHandler_h
+
+#include "LayoutConstants.h"
+#include "mozilla/EventForwards.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/MouseEvents.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/TouchEvents.h"
+#include "mozilla/WeakPtr.h"
+
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/layers/InputAPZContext.h"
+
+class AutoWeakFrame;
+class nsIFrame;
+class nsIContent;
+class nsPresContext;
+
+namespace mozilla {
+
+class PresShell;
+
+namespace dom {
+class BrowserParent;
+class Document;
+class Element;
+};  
+
+class PointerCaptureInfo final {
+ public:
+  RefPtr<dom::Element> mPendingElement;
+  RefPtr<dom::Element> mOverrideElement;
+
+  explicit PointerCaptureInfo(dom::Element* aPendingElement)
+      : mPendingElement(aPendingElement) {
+    MOZ_COUNT_CTOR(PointerCaptureInfo);
+  }
+
+  MOZ_COUNTED_DTOR(PointerCaptureInfo)
+
+  bool Empty() { return !(mPendingElement || mOverrideElement); }
+};
+
+struct PointerInfo final {
+  using Document = dom::Document;
+  enum class Active : bool { No, Yes };
+  enum class Primary : bool { No, Yes };
+  enum class FromTouchEvent : bool { No, Yes };
+  enum class SynthesizeForTests : bool { No, Yes };
+  PointerInfo()
+      : mIsActive(false),
+        mIsPrimary(false),
+        mFromTouchEvent(false),
+        mPreventMouseEventByContent(false),
+        mIsSynthesizedForTests(false) {}
+  PointerInfo(const PointerInfo&) = default;
+  explicit PointerInfo(
+      Active aActiveState, uint16_t aInputSource, Primary aPrimaryState,
+      FromTouchEvent aFromTouchEvent, Document* aActiveDocument,
+      const PointerInfo* aLastPointerInfo = nullptr,
+      SynthesizeForTests aIsSynthesizedForTests = SynthesizeForTests::No)
+      : mActiveDocument(aActiveDocument),
+        mInputSource(aInputSource),
+        mIsActive(static_cast<bool>(aActiveState)),
+        mIsPrimary(static_cast<bool>(aPrimaryState)),
+        mFromTouchEvent(static_cast<bool>(aFromTouchEvent)),
+        mPreventMouseEventByContent(false),
+        mIsSynthesizedForTests(static_cast<bool>(aIsSynthesizedForTests)) {
+    if (aLastPointerInfo) {
+      TakeOverLastState(*aLastPointerInfo);
+    }
+  }
+  explicit PointerInfo(Active aActiveState,
+                       const WidgetPointerEvent& aPointerEvent,
+                       Document* aActiveDocument,
+                       const PointerInfo* aLastPointerInfo = nullptr)
+      : mActiveDocument(aActiveDocument),
+        mInputSource(aPointerEvent.mInputSource),
+        mIsActive(static_cast<bool>(aActiveState)),
+        mIsPrimary(aPointerEvent.mIsPrimary),
+        mFromTouchEvent(aPointerEvent.mFromTouchEvent),
+        mPreventMouseEventByContent(false),
+        mIsSynthesizedForTests(aPointerEvent.mFlags.mIsSynthesizedForTests) {
+    if (aLastPointerInfo) {
+      TakeOverLastState(*aLastPointerInfo);
+    }
+  }
+
+  [[nodiscard]] bool InputSourceSupportsHover() const {
+    return WidgetMouseEventBase::InputSourceSupportsHover(mInputSource);
+  }
+
+  [[nodiscard]] bool HasLastState() const {
+    return mLastRefPointInRootDoc !=
+           nsPoint(NS_UNCONSTRAINEDSIZE, NS_UNCONSTRAINEDSIZE);
+  }
+
+  void RecordLastState(const nsPoint& aRefPointInRootDoc,
+                       const WidgetMouseEvent& aMouseOrPointerEvent) {
+    MOZ_ASSERT_IF(aMouseOrPointerEvent.mMessage == eMouseMove ||
+                      aMouseOrPointerEvent.mMessage == ePointerMove,
+                  aMouseOrPointerEvent.IsReal());
+
+    mLastRefPointInRootDoc = aRefPointInRootDoc;
+    mLastTargetGuid = layers::InputAPZContext::GetTargetLayerGuid();
+    if (aMouseOrPointerEvent.mClass != eDragEventClass) {
+      mLastTiltX = aMouseOrPointerEvent.ComputeTiltX();
+      mLastTiltY = aMouseOrPointerEvent.ComputeTiltY();
+      mLastButtons = aMouseOrPointerEvent.mButtons;
+      mLastPressure = aMouseOrPointerEvent.mPressure;
+    }
+  }
+
+  void TakeOverLastState(const PointerInfo& aPointerInfo) {
+    mLastRefPointInRootDoc = aPointerInfo.mLastRefPointInRootDoc;
+    mLastTargetGuid = aPointerInfo.mLastTargetGuid;
+    mLastTiltX = aPointerInfo.mLastTiltX;
+    mLastTiltY = aPointerInfo.mLastTiltY;
+    mLastButtons = aPointerInfo.mLastButtons;
+    mLastPressure = aPointerInfo.mLastPressure;
+  }
+
+  void ClearLastState() {
+    mLastRefPointInRootDoc =
+        nsPoint(NS_UNCONSTRAINEDSIZE, NS_UNCONSTRAINEDSIZE);
+    mLastTargetGuid = layers::ScrollableLayerGuid();
+    mLastTiltX = 0;
+    mLastTiltY = 0;
+    mLastButtons = 0;
+    mLastPressure = 0.0f;
+  }
+
+  [[nodiscard]] bool EqualsBasicPointerData(const PointerInfo& aOther) const {
+    return mInputSource == aOther.mInputSource &&
+           mIsActive == aOther.mIsActive && mIsPrimary == aOther.mIsPrimary &&
+           mFromTouchEvent == aOther.mFromTouchEvent &&
+           mIsSynthesizedForTests == aOther.mIsSynthesizedForTests;
+  }
+
+  nsPoint mLastRefPointInRootDoc =
+      nsPoint(NS_UNCONSTRAINEDSIZE, NS_UNCONSTRAINEDSIZE);
+  layers::ScrollableLayerGuid mLastTargetGuid;
+  WeakPtr<Document> mActiveDocument;
+  uint16_t mInputSource = 0;
+  int32_t mLastTiltX = 0;
+  int32_t mLastTiltY = 0;
+  int16_t mLastButtons = 0;
+  float mLastPressure = 0.0f;
+  bool mIsActive : 1;
+  bool mIsPrimary : 1;
+  bool mFromTouchEvent : 1;
+  bool mPreventMouseEventByContent : 1;
+  bool mIsSynthesizedForTests : 1;
+};
+
+class PointerEventHandler final {
+ public:
+  static void InitializeStatics();
+  static void ReleaseStatics();
+
+  static bool IsPointerEventImplicitCaptureForTouchEnabled();
+
+  MOZ_CAN_RUN_SCRIPT static nsresult DispatchPointerEventWithTarget(
+      EventMessage aPointerEventMessage,
+      const WidgetMouseEvent& aMouseOrPointerEvent,
+      const AutoWeakFrame& aTargetWeakFrame, nsIContent* aTargetContent,
+      nsEventStatus* aStatus = nullptr);
+
+  MOZ_CAN_RUN_SCRIPT static nsresult DispatchPointerEventWithTarget(
+      EventMessage aPointerEventMessage, const WidgetTouchEvent& aTouchEvent,
+      size_t aTouchIndex, const AutoWeakFrame& aTargetWeakFrame,
+      nsIContent* aTargetContent, nsEventStatus* aStatus = nullptr);
+
+  MOZ_CAN_RUN_SCRIPT static nsresult DispatchPointerEventWithTarget(
+      WidgetPointerEvent& aPointerEvent, const AutoWeakFrame& aTargetWeakFrame,
+      nsIContent* aTargetContent, nsEventStatus* aStatus = nullptr);
+
+  [[nodiscard]] static bool ShouldDispatchClickEventOnCapturingElement(
+      const WidgetGUIEvent* aSourceEvent = nullptr);
+
+  static void UpdatePointerActiveState(WidgetMouseEvent* aEvent,
+                                       nsIContent* aTargetContent = nullptr);
+
+  static void RecordPointerState(const nsPoint& aRefPointInRootPresShell,
+                                 const WidgetMouseEvent& aMouseEvent);
+
+  static void RecordMouseState(PresShell& aRootPresShell,
+                               const WidgetMouseEvent& aMouseEvent);
+
+  static void WillDispatchMouseEventToDOM(const WidgetMouseEvent& aMouseEvent);
+
+  static void RecordMouseButtons(const WidgetMouseEvent& aMouseEvent) {
+    if (sLastMouseInfo) {
+      sLastMouseInfo->mLastButtons = aMouseEvent.mButtons;
+    }
+  }
+
+  static void ClearMouseState(PresShell& aRootPresShell,
+                              const WidgetMouseEvent& aMouseEvent);
+
+  static void RequestPointerCaptureById(uint32_t aPointerId,
+                                        dom::Element* aElement);
+  static void ReleasePointerCaptureById(uint32_t aPointerId);
+  static void ReleaseAllPointerCapture();
+
+  static bool SetPointerCaptureRemoteTarget(uint32_t aPointerId,
+                                            dom::BrowserParent* aBrowserParent);
+  static void ReleasePointerCaptureRemoteTarget(
+      dom::BrowserParent* aBrowserParent);
+  static void ReleasePointerCaptureRemoteTarget(uint32_t aPointerId);
+  static void ReleaseAllPointerCaptureRemoteTarget();
+
+  static dom::BrowserParent* GetPointerCapturingRemoteTarget(
+      uint32_t aPointerId);
+
+  static PointerCaptureInfo* GetPointerCaptureInfo(uint32_t aPointerId);
+
+  static const PointerInfo* GetPointerInfo(uint32_t aPointerId);
+
+  [[nodiscard]] static const PointerInfo* GetLastMouseInfo(
+      const PresShell* aRootPresShell = nullptr);
+
+  [[nodiscard]] static Maybe<uint32_t> GetLastPointerId() {
+    return sLastPointerId;
+  }
+
+  [[nodiscard]] static Maybe<uint32_t> TryClaimOrphanedLastMouseInfo(
+      PresShell& aRootPresShell);
+
+  [[nodiscard]] static bool IsLastPointerId(uint32_t aPointerId) {
+    return sLastPointerId && *sLastPointerId == aPointerId;
+  }
+
+  MOZ_CAN_RUN_SCRIPT
+  static void MaybeProcessPointerCapture(WidgetGUIEvent* aEvent);
+  MOZ_CAN_RUN_SCRIPT
+  static void ProcessPointerCaptureForMouse(WidgetMouseEvent* aEvent);
+  MOZ_CAN_RUN_SCRIPT
+  static void ProcessPointerCaptureForTouch(WidgetTouchEvent* aEvent);
+  MOZ_CAN_RUN_SCRIPT
+  static void CheckPointerCaptureState(WidgetPointerEvent* aEvent);
+
+  static void ImplicitlyCapturePointer(nsIFrame* aFrame,
+                                       const WidgetEvent& aEvent);
+  MOZ_CAN_RUN_SCRIPT
+  static void ImplicitlyReleasePointerCapture(WidgetEvent* aEvent);
+  MOZ_CAN_RUN_SCRIPT static void MaybeImplicitlyReleasePointerCapture(
+      WidgetGUIEvent* aEvent);
+
+  static dom::Element* GetPointerCapturingElement(const WidgetGUIEvent* aEvent);
+
+  static dom::Element* GetPointerCapturingElement(uint32_t aPointerId);
+
+  static dom::Element* GetPendingPointerCapturingElement(
+      const WidgetGUIEvent* aEvent);
+  static dom::Element* GetPendingPointerCapturingElement(uint32_t aPointerId);
+
+  [[nodiscard]] static RefPtr<dom::Element>
+  GetPointerCapturingElementAtLastPointerUp();
+
+  static void ReleasePointerCapturingElementAtLastPointerUp();
+
+  static void ReleaseIfCaptureByDescendant(nsIContent* aContent);
+
+  static void PreHandlePointerEventsPreventDefault(
+      WidgetPointerEvent* aPointerEvent, WidgetGUIEvent* aMouseOrTouchEvent);
+
+  static void PostHandlePointerEventsPreventDefault(
+      PresShell* aPresShell, WidgetPointerEvent* aPointerEvent,
+      WidgetGUIEvent* aMouseOrTouchEvent);
+
+  MOZ_CAN_RUN_SCRIPT static void DispatchPointerFromMouseOrTouch(
+      PresShell* aShell, nsIFrame* aEventTargetFrame,
+      nsIContent* aEventTargetContent, dom::Element* aPointerCapturingElement,
+      WidgetGUIEvent* aMouseOrTouchEvent, bool aDontRetargetEvents,
+      nsEventStatus* aStatus, nsIContent** aMouseOrTouchEventTarget = nullptr);
+
+  MOZ_CAN_RUN_SCRIPT static void SynthesizeMoveToDispatchBoundaryEvents(
+      const WidgetMouseEvent* aEvent);
+
+  static void InitPointerEventFromMouse(WidgetPointerEvent* aPointerEvent,
+                                        const WidgetMouseEvent* aMouseEvent,
+                                        EventMessage aMessage);
+
+  static void InitPointerEventFromTouch(WidgetPointerEvent& aPointerEvent,
+                                        const WidgetTouchEvent& aTouchEvent,
+                                        const mozilla::dom::Touch& aTouch);
+
+  static void InitCoalescedEventFromPointerEvent(
+      WidgetPointerEvent& aCoalescedEvent,
+      const WidgetPointerEvent& aSourceEvent);
+
+  static bool ShouldGeneratePointerEventFromMouse(WidgetGUIEvent* aEvent) {
+    return aEvent->mMessage == eMouseRawUpdate ||
+           aEvent->mMessage == eMouseDown || aEvent->mMessage == eMouseUp ||
+           (aEvent->mMessage == eMouseMove &&
+            aEvent->AsMouseEvent()->IsReal()) ||
+           aEvent->mMessage == eMouseExitFromWidget;
+  }
+
+  static bool ShouldGeneratePointerEventFromTouch(WidgetGUIEvent* aEvent) {
+    return aEvent->mMessage == eTouchRawUpdate ||
+           aEvent->mMessage == eTouchStart || aEvent->mMessage == eTouchMove ||
+           aEvent->mMessage == eTouchEnd || aEvent->mMessage == eTouchCancel ||
+           aEvent->mMessage == eTouchPointerCancel;
+  }
+
+  static MOZ_ALWAYS_INLINE int32_t GetSpoofedPointerIdForRFP() {
+    return sSpoofedPointerId.valueOr(0);
+  }
+
+  static void NotifyDestroyPresContext(nsPresContext* aPresContext);
+
+  static bool IsDragAndDropEnabled(WidgetMouseEvent& aEvent);
+
+  [[nodiscard]] static EventMessage ToPointerEventMessage(
+      const WidgetGUIEvent* aMouseOrTouchEvent);
+
+  [[nodiscard]] static bool NeedToDispatchPointerRawUpdate(
+      const dom::Document* aDocument);
+
+  [[nodiscard]] static LazyLogModule& MouseLocationLogRef();
+
+  [[nodiscard]] static LazyLogModule& PointerLocationLogRef();
+
+ private:
+  static void SetPointerCaptureById(uint32_t aPointerId,
+                                    dom::Element* aElement);
+
+  static uint16_t GetPointerType(uint32_t aPointerId);
+
+  static bool GetPointerPrimaryState(uint32_t aPointerId);
+
+  static bool HasActiveTouchPointer();
+
+  MOZ_CAN_RUN_SCRIPT
+  static void DispatchGotOrLostPointerCaptureEvent(
+      bool aIsGotCapture, const WidgetPointerEvent* aPointerEvent,
+      dom::Element* aCaptureTarget);
+
+  enum class CapturingState { Pending, Override };
+  static dom::Element* GetPointerCapturingElementInternal(
+      CapturingState aCapturingState, const WidgetGUIEvent* aEvent);
+
+  static Maybe<int32_t> sSpoofedPointerId;
+
+  static void MaybeCacheSpoofedPointerID(uint16_t aInputSource,
+                                         uint32_t aPointerId);
+
+  static void SetPointerCapturingElementAtLastPointerUp(
+      nsWeakPtr&& aPointerCapturingElement);
+
+  static const UniquePtr<PointerInfo>& InsertOrUpdateActivePointer(
+      uint32_t aPointerId, UniquePtr<PointerInfo>&& aNewPointerInfo,
+      EventMessage aEventMessage, const char* aCallerName);
+
+  static void RemoveActivePointer(uint32_t aPointerId,
+                                  EventMessage aEventMessage,
+                                  const char* aCallerName);
+
+  static void UpdateLastPointerId(uint32_t aPointerId,
+                                  EventMessage aEventMessage);
+
+  static void MaybeForgetLastPointerId(uint32_t aPointerId,
+                                       EventMessage aEventMessage);
+
+  static StaticAutoPtr<PointerInfo> sLastMouseInfo;
+
+  static StaticRefPtr<nsIWeakReference> sLastMousePresShell;
+
+  static StaticRefPtr<nsIWeakReference> sLastMouseWidget;
+
+  static Maybe<uint32_t> sLastMousePointerId;
+
+  static Maybe<uint32_t> sLastPointerId;
+};
+
+}  
+
+#endif  // mozilla_PointerEventHandler_h

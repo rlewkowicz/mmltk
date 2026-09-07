@@ -1,0 +1,128 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_cache_QuotaClientImpl_h
+#define mozilla_dom_cache_QuotaClientImpl_h
+
+#include "CacheCipherKeyManager.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/QMResult.h"
+#include "mozilla/dom/cache/FileUtils.h"
+#include "mozilla/dom/cache/QuotaClient.h"
+#include "mozilla/dom/cache/Types.h"
+#include "mozilla/dom/quota/ResultExtensions.h"
+
+namespace mozilla::dom::cache {
+
+class CacheQuotaClient final : public quota::Client {
+  static CacheQuotaClient* sInstance;
+
+ public:
+  using OriginMetadata = quota::OriginMetadata;
+  using PersistenceType = quota::PersistenceType;
+  using UsageInfo = quota::UsageInfo;
+
+  CacheQuotaClient();
+
+  static CacheQuotaClient* Get();
+
+  virtual Type GetType() override;
+
+  virtual Result<UsageInfo, nsresult> InitOrigin(
+      PersistenceType aPersistenceType, const OriginMetadata& aOriginMetadata,
+      const AtomicBool& aCanceled) override;
+
+  virtual nsresult InitOriginWithoutTracking(
+      PersistenceType aPersistenceType, const OriginMetadata& aOriginMetadata,
+      const AtomicBool& aCanceled) override;
+
+  virtual Result<UsageInfo, nsresult> GetUsageForOrigin(
+      PersistenceType aPersistenceType, const OriginMetadata& aOriginMetadata,
+      const AtomicBool& aCanceled) override;
+
+  virtual void OnOriginClearCompleted(
+      const OriginMetadata& aOriginMetadata) override;
+
+  void OnRepositoryClearCompleted(PersistenceType aPersistenceType) override;
+
+  virtual void ReleaseIOThreadObjects() override;
+
+  void AbortOperationsForLocks(
+      const DirectoryLockIdTable& aDirectoryLockIds) override;
+
+  virtual void AbortOperationsForProcess(
+      ContentParentId aContentParentId) override;
+
+  virtual void AbortAllOperations() override;
+
+  virtual void StartIdleMaintenance() override;
+
+  virtual void StopIdleMaintenance() override;
+
+  nsresult UpgradeStorageFrom2_0To2_1(nsIFile* aDirectory) override;
+
+  template <typename Callable>
+  nsresult MaybeUpdatePaddingFileInternal(nsIFile& aBaseDir,
+                                          mozIStorageConnection& aConn,
+                                          const int64_t aIncreaseSize,
+                                          const int64_t aDecreaseSize,
+                                          Callable&& aCommitHook) {
+    MOZ_ASSERT(!NS_IsMainThread());
+    MOZ_DIAGNOSTIC_ASSERT(aIncreaseSize >= 0);
+    MOZ_DIAGNOSTIC_ASSERT(aDecreaseSize >= 0);
+
+    const bool temporaryPaddingFileExist =
+        DirectoryPaddingFileExists(aBaseDir, DirPaddingFile::TMP_FILE);
+
+    if (aIncreaseSize == aDecreaseSize && !temporaryPaddingFileExist) {
+      QM_TRY(MOZ_TO_RESULT(aCommitHook()));
+
+      return NS_OK;
+    }
+
+    QM_TRY(MOZ_TO_RESULT(
+        UpdateDirectoryPaddingFile(aBaseDir, aConn, aIncreaseSize,
+                                   aDecreaseSize, temporaryPaddingFileExist)));
+
+    QM_TRY(MOZ_TO_RESULT(aCommitHook()));
+
+    QM_WARNONLY_TRY(MOZ_TO_RESULT(DirectoryPaddingFinalizeWrite(aBaseDir)),
+                    ([&aBaseDir](const nsresult) {
+                      QM_WARNONLY_TRY(QM_TO_RESULT(DirectoryPaddingDeleteFile(
+                          aBaseDir, DirPaddingFile::FILE)));
+
+                      MOZ_ASSERT(DirectoryPaddingFileExists(
+                          aBaseDir, DirPaddingFile::TMP_FILE));
+
+                    }));
+
+    return NS_OK;
+  }
+
+  nsresult RestorePaddingFileInternal(nsIFile* aBaseDir,
+                                      mozIStorageConnection* aConn);
+
+  nsresult WipePaddingFileInternal(
+      const CacheDirectoryMetadata& aDirectoryMetadata, nsIFile* aBaseDir);
+
+  RefPtr<CipherKeyManager> GetOrCreateCipherKeyManager(
+      const quota::PrincipalMetadata& aMetadata);
+
+ private:
+  ~CacheQuotaClient();
+
+  void InitiateShutdown() override;
+  bool IsShutdownCompleted() const override;
+  nsCString GetShutdownStatus() const override;
+  void ForceKillActors() override;
+  void FinalizeShutdown() override;
+
+  nsTHashMap<nsCStringHashKey, RefPtr<CipherKeyManager>> mCipherKeyManagers;
+
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(CacheQuotaClient, override)
+};
+
+}  
+
+#endif  // mozilla_dom_cache_QuotaClientImpl_h

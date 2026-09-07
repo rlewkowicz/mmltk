@@ -1,0 +1,63 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsHTMLTags_h_
+#define nsHTMLTags_h_
+
+#include "nsAtomHashKeys.h"
+#include "nsString.h"
+#include "nsTHashMap.h"
+#include "nsHashKeys.h"
+
+#define HTML_TAG(_tag, _classname, _interfacename) eHTMLTag_##_tag,
+#define HTML_OTHER(_tag) eHTMLTag_##_tag,
+enum nsHTMLTag {
+  eHTMLTag_unknown = 0,
+#include "nsHTMLTagList.inc"
+
+  eHTMLTag_userdefined
+};
+#undef HTML_TAG
+#undef HTML_OTHER
+
+#define NS_HTML_TAG_MAX int32_t(eHTMLTag_text - 1)
+
+class nsHTMLTags {
+ public:
+  using TagStringHash = nsTHashMap<nsStringHashKey, nsHTMLTag>;
+  using TagAtomHash = nsTHashMap<nsAtom*, nsHTMLTag>;
+
+  static nsresult AddRefTable(void);
+  static void ReleaseTable(void);
+
+  static nsHTMLTag StringTagToId(const nsAString& aTagName);
+  static nsHTMLTag AtomTagToId(nsAtom* aTagName) {
+    return StringTagToId(nsDependentAtomString(aTagName));
+  }
+
+  static nsHTMLTag CaseSensitiveStringTagToId(const nsAString& aTagName) {
+    NS_ASSERTION(gTagTable, "no lookup table, needs addref");
+
+    return gTagTable->MaybeGet(aTagName).valueOr(eHTMLTag_userdefined);
+  }
+  static nsHTMLTag CaseSensitiveAtomTagToId(nsAtom* aTagName) {
+    NS_ASSERTION(gTagAtomTable, "no lookup table, needs addref");
+    NS_ASSERTION(aTagName, "null tagname!");
+
+    return gTagAtomTable->MaybeGet(aTagName).valueOr(eHTMLTag_userdefined);
+  }
+
+#ifdef DEBUG
+  static void TestTagTable();
+#endif
+
+ private:
+  static const char16_t* const sTagNames[];
+
+  static int32_t gTableRefCount;
+  static TagStringHash* gTagTable;
+  static TagAtomHash* gTagAtomTable;
+};
+
+#endif /* nsHTMLTags_h_ */

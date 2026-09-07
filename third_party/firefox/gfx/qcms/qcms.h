@@ -1,0 +1,208 @@
+#if !defined(QCMS_H)
+#define QCMS_H
+
+/* clang-format off */
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+#if !defined(ICC_H)
+
+/*****************************************************************
+ Copyright (c) 1994-1996 SunSoft, Inc.
+
+                    Rights Reserved
+
+Permission is hereby granted, free of charge, to any person
+obtaining a copy of this software and associated documentation
+files (the "Software"), to deal in the Software without restrict-
+ion, including without limitation the rights to use, copy, modify,
+merge, publish distribute, sublicense, and/or sell copies of the
+Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
+OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-
+INFRINGEMENT.  IN NO EVENT SHALL SUNSOFT, INC. OR ITS PARENT
+COMPANY BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+OTHER DEALINGS IN THE SOFTWARE.
+
+Except as contained in this notice, the name of SunSoft, Inc.
+shall not be used in advertising or otherwise to promote the
+sale, use or other dealings in this Software without written
+authorization from SunSoft Inc.
+******************************************************************/
+
+
+typedef enum {
+    icSigXYZData                        = 0x58595A20L,  
+    icSigLabData                        = 0x4C616220L,  
+    icSigLuvData                        = 0x4C757620L,  
+    icSigYCbCrData                      = 0x59436272L,  
+    icSigYxyData                        = 0x59787920L,  
+    icSigRgbData                        = 0x52474220L,  
+    icSigGrayData                       = 0x47524159L,  
+    icSigHsvData                        = 0x48535620L,  
+    icSigHlsData                        = 0x484C5320L,  
+    icSigCmykData                       = 0x434D594BL,  
+    icSigCmyData                        = 0x434D5920L,  
+    icSig2colorData                     = 0x32434C52L,  
+    icSig3colorData                     = 0x33434C52L,  
+    icSig4colorData                     = 0x34434C52L,  
+    icSig5colorData                     = 0x35434C52L,  
+    icSig6colorData                     = 0x36434C52L,  
+    icSig7colorData                     = 0x37434C52L,  
+    icSig8colorData                     = 0x38434C52L,  
+    icSig9colorData                     = 0x39434C52L,  
+    icSig10colorData                    = 0x41434C52L,  
+    icSig11colorData                    = 0x42434C52L,  
+    icSig12colorData                    = 0x43434C52L,  
+    icSig13colorData                    = 0x44434C52L,  
+    icSig14colorData                    = 0x45434C52L,  
+    icSig15colorData                    = 0x46434C52L,  
+    icMaxEnumData                       = 0xFFFFFFFFL
+} icColorSpaceSignature;
+#endif
+
+#include <stdio.h>
+#include <stdbool.h>
+#include <cstdint>
+
+struct _qcms_transform;
+typedef struct _qcms_transform qcms_transform;
+
+struct _qcms_profile;
+typedef struct _qcms_profile qcms_profile;
+
+typedef enum {
+	QCMS_INTENT_MIN = 0,
+	QCMS_INTENT_PERCEPTUAL = 0,
+	QCMS_INTENT_RELATIVE_COLORIMETRIC = 1,
+	QCMS_INTENT_SATURATION = 2,
+	QCMS_INTENT_ABSOLUTE_COLORIMETRIC = 3,
+	QCMS_INTENT_MAX = 3,
+
+	QCMS_INTENT_DEFAULT = QCMS_INTENT_PERCEPTUAL,
+} qcms_intent;
+
+typedef enum {
+	QCMS_DATA_RGB_8,
+	QCMS_DATA_RGBA_8,
+	QCMS_DATA_BGRA_8,
+	QCMS_DATA_GRAY_8,
+	QCMS_DATA_GRAYA_8,
+	QCMS_DATA_CMYK
+} qcms_data_type;
+
+typedef struct
+{
+	double x;
+	double y;
+	double Y;
+} qcms_CIE_xyY;
+
+typedef struct
+{
+	qcms_CIE_xyY red;
+	qcms_CIE_xyY green;
+	qcms_CIE_xyY blue;
+} qcms_CIE_xyYTRIPLE;
+
+qcms_profile* qcms_profile_create_rgb_with_gamma_set(
+                qcms_CIE_xyY white_point,
+                qcms_CIE_xyYTRIPLE primaries,
+                float redGamma,
+                float blueGamma,
+                float greenGamma);
+
+qcms_profile* qcms_profile_create_rgb_with_gamma(
+                qcms_CIE_xyY white_point,
+                qcms_CIE_xyYTRIPLE primaries,
+                float gamma);
+
+void qcms_data_create_rgb_with_gamma(
+                qcms_CIE_xyY white_point,
+                qcms_CIE_xyYTRIPLE primaries,
+                float gamma,
+                void **mem,
+                size_t *size);
+
+qcms_profile* qcms_profile_create_cicp(uint8_t colour_primaries,
+                                       uint8_t transfer_characteristics);
+
+qcms_profile* qcms_profile_from_memory(const void *mem, size_t size);
+qcms_profile* qcms_profile_from_memory_curves_only(const void *mem, size_t size);
+
+qcms_profile* qcms_profile_from_file(FILE *file);
+qcms_profile* qcms_profile_from_path(const char *path);
+
+void qcms_data_from_path(const char *path, void **mem, size_t *size);
+
+
+qcms_CIE_xyY qcms_white_point_sRGB(void);
+qcms_profile* qcms_profile_sRGB(void);
+qcms_profile* qcms_profile_displayP3(void);
+
+void qcms_profile_release(qcms_profile *profile);
+
+bool qcms_profile_is_bogus(qcms_profile *profile);
+qcms_intent qcms_profile_get_rendering_intent(qcms_profile *profile);
+icColorSpaceSignature qcms_profile_get_color_space(qcms_profile *profile);
+bool qcms_profile_is_sRGB(qcms_profile *profile);
+
+void qcms_profile_precache_output_transform(qcms_profile *profile);
+
+qcms_transform* qcms_transform_create(
+		qcms_profile *in, qcms_data_type in_type,
+		qcms_profile* out, qcms_data_type out_type,
+		qcms_intent intent);
+
+void qcms_transform_release(qcms_transform *);
+
+void qcms_transform_data(qcms_transform *transform, const void *src, void *dest, size_t length);
+
+void qcms_transform_data_rgba_f16_to_rgba_u8(qcms_transform *transform, const uint16_t *src, uint8_t *dst, size_t num_pixels);
+
+void qcms_enable_iccv4();
+void qcms_enable_neon();
+void qcms_enable_avx();
+
+
+
+struct qcms_profile_data {
+    uint32_t class_type;
+    uint32_t color_space;
+    uint32_t pcs;
+    qcms_intent rendering_intent;
+    float red_colorant_xyzd50[3];
+    float blue_colorant_xyzd50[3];
+    float green_colorant_xyzd50[3];
+    int32_t linear_from_trc_red_samples;
+    int32_t linear_from_trc_blue_samples;
+    int32_t linear_from_trc_green_samples;
+};
+
+void qcms_profile_get_data(const qcms_profile*, qcms_profile_data* out_data);
+
+
+enum class qcms_color_channel : uint8_t {
+    Red,
+    Green,
+    Blue,
+};
+
+void qcms_profile_get_lut(const qcms_profile*, qcms_color_channel,
+    float* begin, float* end);
+
+#if defined(__cplusplus)
+}
+#endif
+
+#endif

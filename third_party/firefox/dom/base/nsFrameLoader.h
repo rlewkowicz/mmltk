@@ -1,0 +1,399 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsFrameLoader_h_
+#define nsFrameLoader_h_
+
+#include <cstdint>
+
+#include "ErrorList.h"
+#include "Units.h"
+#include "js/RootingAPI.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/LinkedList.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/BrowsingContext.h"
+#include "mozilla/dom/MessageManagerCallback.h"
+#include "mozilla/dom/Nullable.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/ReferrerPolicyBinding.h"
+#include "mozilla/dom/WindowProxyHolder.h"
+#include "mozilla/dom/ipc/IdType.h"
+#include "mozilla/layers/LayersTypes.h"
+#include "nsCOMPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsDocShell.h"
+#include "nsID.h"
+#include "nsIFrame.h"
+#include "nsIMutationObserver.h"
+#include "nsISupports.h"
+#include "nsRect.h"
+#include "nsStringFwd.h"
+#include "nsStubMutationObserver.h"
+#include "nsWrapperCache.h"
+
+class nsIURI;
+class nsSubDocumentFrame;
+class AutoResetInShow;
+class AutoResetInFrameSwap;
+class nsFrameLoaderOwner;
+class nsIRemoteTab;
+class nsIDocShellTreeItem;
+class nsIDocShellTreeOwner;
+class nsILoadContext;
+class nsIWebBrowserPersistDocumentReceiver;
+class nsIWebProgressListener;
+class nsIOpenWindowInfo;
+
+namespace mozilla {
+
+class OriginAttributes;
+
+namespace dom {
+class ChromeMessageSender;
+class ContentParent;
+class Document;
+class Element;
+class InProcessBrowserChildMessageManager;
+class MessageSender;
+class ProcessMessageManager;
+class BrowserParent;
+class MutableTabContext;
+class BrowserBridgeChild;
+class RemoteBrowser;
+struct RemotenessOptions;
+struct NavigationIsolationOptions;
+class SessionStoreChild;
+class SessionStoreParent;
+
+struct LazyLoadFrameResumptionState {
+  RefPtr<nsIURI> mBaseURI;
+  ReferrerPolicy mReferrerPolicy = ReferrerPolicy::_empty;
+
+  void Clear() {
+    mBaseURI = nullptr;
+    mReferrerPolicy = ReferrerPolicy::_empty;
+  }
+};
+
+namespace ipc {
+class StructuredCloneData;
+}  
+
+}  
+
+namespace ipc {
+class MessageChannel;
+}  
+}  
+
+#if defined(MOZ_WIDGET_GTK)
+typedef struct _GtkWidget GtkWidget;
+#endif
+
+#define NS_FRAMELOADER_IID \
+  {0x297fd0ea, 0x1b4a, 0x4c9a, {0xa4, 0x04, 0xe5, 0x8b, 0xe8, 0x95, 0x10, 0x50}}
+
+class nsFrameLoader final : public nsStubMutationObserver,
+                            public mozilla::dom::ipc::MessageManagerCallback,
+                            public nsWrapperCache,
+                            public mozilla::LinkedListElement<nsFrameLoader> {
+  friend class AutoResetInShow;
+  friend class AutoResetInFrameSwap;
+  friend class nsFrameLoaderOwner;
+  using Document = mozilla::dom::Document;
+  using Element = mozilla::dom::Element;
+  using BrowserParent = mozilla::dom::BrowserParent;
+  using BrowserBridgeChild = mozilla::dom::BrowserBridgeChild;
+  using BrowsingContext = mozilla::dom::BrowsingContext;
+  using BrowsingContextGroup = mozilla::dom::BrowsingContextGroup;
+  using Promise = mozilla::dom::Promise;
+
+ public:
+  static already_AddRefed<nsFrameLoader> Create(
+      Element* aOwner, bool aNetworkCreated,
+      nsIOpenWindowInfo* aOpenWindowInfo = nullptr);
+
+  static already_AddRefed<nsFrameLoader> Recreate(
+      Element* aOwner, BrowsingContext* aContext, BrowsingContextGroup* aGroup,
+      const mozilla::dom::NavigationIsolationOptions& aRemotenessOptions,
+      bool aIsRemote, bool aNetworkCreated, bool aPreserveContext);
+
+  NS_INLINE_DECL_STATIC_IID(NS_FRAMELOADER_IID)
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(nsFrameLoader)
+
+  NS_DECL_NSIMUTATIONOBSERVER_ATTRIBUTECHANGED
+  nsresult CheckForRecursiveLoad(nsIURI* aURI);
+  nsresult ReallyStartLoading();
+  void StartDestroy(bool aForProcessSwitch);
+  void DestroyDocShell();
+  void DestroyComplete();
+  nsDocShell* GetExistingDocShell() const { return mDocShell; }
+  mozilla::dom::InProcessBrowserChildMessageManager*
+  GetBrowserChildMessageManager() const {
+    return mChildMessageManager;
+  }
+  nsresult UpdatePositionAndSize(nsSubDocumentFrame* aFrame);
+  void PropagateIsUnderHiddenEmbedderElement(
+      bool aIsUnderHiddenEmbedderElement);
+
+  void UpdateRemoteStyle(mozilla::StyleImageRendering aImageRendering);
+
+
+  nsDocShell* GetDocShell(mozilla::ErrorResult& aRv);
+
+  already_AddRefed<nsIRemoteTab> GetRemoteTab();
+
+  already_AddRefed<nsILoadContext> GetLoadContext();
+
+  mozilla::dom::BrowsingContext* GetBrowsingContext();
+  mozilla::dom::BrowsingContext* GetExtantBrowsingContext();
+  mozilla::dom::BrowsingContext* GetMaybePendingBrowsingContext() {
+    return mPendingBrowsingContext;
+  }
+
+  void LoadFrame(bool aOriginalSrc, bool aShouldCheckForRecursion);
+
+  nsresult LoadURI(nsIURI* aURI, nsIPrincipal* aTriggeringPrincipal,
+                   nsIPolicyContainer* aPolicyContainer, bool aOriginalSrc,
+                   bool aShouldCheckForRecursion);
+
+  void ResumeLoad(uint64_t aPendingSwitchID);
+
+  void Destroy(bool aForProcessSwitch = false);
+
+  void AsyncDestroy() {
+    mNeedsAsyncDestroy = true;
+    Destroy();
+  }
+
+  void RequestUpdatePosition(mozilla::ErrorResult& aRv);
+
+  already_AddRefed<Promise> RequestTabStateFlush(mozilla::ErrorResult& aRv);
+
+  void RequestEpochUpdate(uint32_t aEpoch);
+
+  void RequestSHistoryUpdate();
+
+  void StartPersistence(BrowsingContext* aContext,
+                        nsIWebBrowserPersistDocumentReceiver* aRecv,
+                        mozilla::ErrorResult& aRv);
+
+
+  already_AddRefed<mozilla::dom::MessageSender> GetMessageManager();
+
+  already_AddRefed<Element> GetOwnerElement();
+
+  uint32_t LazyWidth() const;
+
+  uint32_t LazyHeight() const;
+
+  uint64_t ChildID() const { return mChildID; }
+
+  bool DepthTooGreat() const { return mDepthTooGreat; }
+
+  bool IsDead() const { return mDestroyCalled; }
+
+  bool IsNetworkCreated() const { return mNetworkCreated; }
+
+  nsISupports* GetParentObject() const;
+
+  virtual bool DoLoadMessageManagerScript(const nsAString& aURL,
+                                          bool aRunInGlobalScope) override;
+  virtual nsresult DoSendAsyncMessage(
+      const nsAString& aMessage,
+      mozilla::NotNull<mozilla::dom::ipc::StructuredCloneData*> aData) override;
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY bool Show(nsSubDocumentFrame*);
+
+  void MaybeShowFrame();
+
+  void MarginsChanged();
+
+  void Hide();
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void ForceLayoutIfNecessary();
+
+  nsresult SwapWithOtherLoader(nsFrameLoader* aOther,
+                               nsFrameLoaderOwner* aThisOwner,
+                               nsFrameLoaderOwner* aOtherOwner);
+
+  nsresult SwapWithOtherRemoteLoader(nsFrameLoader* aOther,
+                                     nsFrameLoaderOwner* aThisOwner,
+                                     nsFrameLoaderOwner* aOtherOwner);
+
+  nsIFrame* GetPrimaryFrameOfOwningContent() const;
+
+  Document* GetOwnerDoc() const;
+
+  bool IsRemoteFrame() const {
+    MOZ_ASSERT_IF(mIsRemoteFrame, !GetDocShell());
+    return mIsRemoteFrame;
+  }
+
+  mozilla::dom::RemoteBrowser* GetRemoteBrowser() const {
+    return mRemoteBrowser;
+  }
+
+  bool HasRemoteBrowserBeenSized() const { return mRemoteBrowserSized; }
+
+  BrowserParent* GetBrowserParent() const;
+
+  BrowserBridgeChild* GetBrowserBridgeChild() const;
+
+  mozilla::layers::LayersId GetLayersId() const;
+
+  mozilla::dom::ChromeMessageSender* GetFrameMessageManager() {
+    return mMessageManager;
+  }
+
+  mozilla::dom::Element* GetOwnerContent() { return mOwnerContent; }
+
+  using WeakPresShellArray = nsTArray<nsWeakPtr>;
+  void SetDetachedSubdocs(WeakPresShellArray&&);
+  WeakPresShellArray TakeDetachedSubdocs();
+  const WeakPresShellArray& GetDetachedSubdocs() const {
+    return mDetachedSubdocs;
+  }
+
+  void ApplySandboxFlags(uint32_t sandboxFlags);
+
+  void GetURL(nsString& aURL, nsIPrincipal** aTriggeringPrincipal,
+              nsIPolicyContainer** aPolicyContainer);
+
+  nsresult GetWindowDimensions(mozilla::LayoutDeviceIntRect& aRect);
+
+  virtual mozilla::dom::ProcessMessageManager* GetProcessMessageManager()
+      const override;
+
+  RefPtr<mozilla::dom::ChromeMessageSender> mMessageManager;
+  RefPtr<mozilla::dom::InProcessBrowserChildMessageManager>
+      mChildMessageManager;
+
+  virtual JSObject* WrapObject(JSContext* cx,
+                               JS::Handle<JSObject*> aGivenProto) override;
+
+  void SetWillChangeProcess();
+
+  void ConfigRemoteProcess(const nsACString& aRemoteType,
+                           mozilla::dom::ContentParent* aContentParent);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void MaybeNotifyCrashed(
+      mozilla::dom::BrowsingContext* aBrowsingContext,
+      mozilla::dom::ContentParentId aChildID,
+      mozilla::ipc::MessageChannel* aChannel);
+
+  void FireErrorEvent();
+
+  mozilla::dom::SessionStoreChild* GetSessionStoreChild() {
+    return mSessionStoreChild;
+  }
+
+  mozilla::dom::SessionStoreParent* GetSessionStoreParent();
+
+ private:
+  nsFrameLoader(mozilla::dom::Element* aOwner,
+                mozilla::dom::BrowsingContext* aBrowsingContext, bool aIsRemote,
+                bool aNetworkCreated);
+  ~nsFrameLoader();
+
+  void SetOwnerContent(mozilla::dom::Element* aContent);
+
+  void GetOwnerAppManifestURL(nsAString& aOut);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY nsresult MaybeCreateDocShell();
+  nsresult EnsureMessageManager();
+  nsresult ReallyLoadFrameScripts();
+  nsDocShell* GetDocShell() const { return mDocShell; }
+
+  void AssertSafeToInit();
+
+  nsresult CheckURILoad(nsIURI* aURI, nsIPrincipal* aTriggeringPrincipal);
+  nsresult ReallyStartLoadingInternal();
+
+  bool EnsureRemoteBrowser();
+
+  bool TryRemoteBrowser();
+  bool TryRemoteBrowserInternal();
+
+  bool ShowRemoteFrame(nsSubDocumentFrame* aFrame);
+
+  void AddTreeItemToTreeOwner(nsIDocShellTreeItem* aItem,
+                              nsIDocShellTreeOwner* aOwner);
+
+  nsresult GetNewTabContext(mozilla::dom::MutableTabContext* aTabContext,
+                            nsIURI* aURI = nullptr);
+
+  enum BrowserParentChange { eBrowserParentRemoved, eBrowserParentChanged };
+  void MaybeUpdatePrimaryBrowserParent(BrowserParentChange aChange);
+
+  nsresult PopulateOriginContextIdsFromAttributes(
+      mozilla::OriginAttributes& aAttr);
+
+  bool EnsureBrowsingContextAttached();
+
+  void InvokeBrowsingContextReadyCallback();
+
+  void RequestFinalTabStateFlush();
+
+  const mozilla::dom::LazyLoadFrameResumptionState&
+  GetLazyLoadFrameResumptionState();
+
+  RefPtr<mozilla::dom::BrowsingContext> mPendingBrowsingContext;
+  nsCOMPtr<nsIURI> mURIToLoad;
+  nsCOMPtr<nsIPrincipal> mTriggeringPrincipal;
+  nsCOMPtr<nsIPolicyContainer> mPolicyContainer;
+  nsCOMPtr<nsIOpenWindowInfo> mOpenWindowInfo;
+  mozilla::dom::Element* mOwnerContent;  
+
+  RefPtr<mozilla::dom::Element> mOwnerContentStrong;
+
+  WeakPresShellArray mDetachedSubdocs;
+
+  uint64_t mPendingSwitchID;
+
+  uint64_t mChildID;
+  RefPtr<mozilla::dom::RemoteBrowser> mRemoteBrowser;
+  RefPtr<nsDocShell> mDocShell;
+
+  mozilla::LayoutDeviceIntSize mLazySize;
+
+  RefPtr<mozilla::dom::SessionStoreChild> mSessionStoreChild;
+
+  nsCString mRemoteType;
+
+  bool mInitialized : 1;
+  bool mDepthTooGreat : 1;
+  bool mIsTopLevelContent : 1;
+  bool mDestroyCalled : 1;
+  bool mNeedsAsyncDestroy : 1;
+  bool mInSwap : 1;
+  bool mInShow : 1;
+  bool mHideCalled : 1;
+  bool mNetworkCreated : 1;
+
+  bool mLoadingOriginalSrc : 1;
+
+  bool mShouldCheckForRecursion : 1;
+
+  bool mRemoteBrowserShown : 1;
+  bool mRemoteBrowserSized : 1;
+  bool mIsRemoteFrame : 1;
+  bool mWillChangeProcess : 1;
+  bool mObservingOwnerContent : 1;
+  bool mHadDetachedFrame : 1;
+
+  bool mTabProcessCrashFired : 1;
+};
+
+inline nsISupports* ToSupports(nsFrameLoader* aFrameLoader) {
+  return aFrameLoader;
+}
+
+#endif

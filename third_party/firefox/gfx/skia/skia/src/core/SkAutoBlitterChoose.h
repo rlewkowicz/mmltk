@@ -1,0 +1,61 @@
+/*
+ * Copyright 2017 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkAutoBlitterChoose_DEFINED)
+#define SkAutoBlitterChoose_DEFINED
+
+#include "include/private/base/SkMacros.h"
+#include "src/base/SkArenaAlloc.h"
+#include "src/core/SkBlitter.h"
+#include "src/core/SkDraw.h"
+#include "src/core/SkRasterClip.h"
+#include "src/core/SkSurfacePriv.h"
+
+class SkMatrix;
+class SkPaint;
+class SkPixmap;
+
+using SkBlitterSizedArena = SkSTArenaAlloc<2736>;
+
+class [[nodiscard]] SkAutoBlitterChoose : SkNoncopyable {
+public:
+    SkAutoBlitterChoose() {}
+    SkAutoBlitterChoose(const skcpu::Draw& draw,
+                        const SkMatrix* ctm,
+                        const SkPaint& paint,
+                        const SkRect& devBounds,
+                        SkDrawCoverage drawCoverage = SkDrawCoverage::kNo) {
+        this->choose(draw, ctm, paint, devBounds, drawCoverage);
+    }
+
+    SkBlitter*  operator->() { return fBlitter; }
+    SkBlitter*  get() const { return fBlitter; }
+
+    SkBlitter* choose(const skcpu::Draw& draw,
+                      const SkMatrix* ctm,
+                      const SkPaint& paint,
+                      const SkRect& devBounds,
+                      SkDrawCoverage drawCoverage = SkDrawCoverage::kNo) {
+        SkASSERT(!fBlitter);
+        fBlitter = draw.fBlitterChooser(draw.fDst,
+                                        ctm ? *ctm : *draw.fCTM,
+                                        paint,
+                                        &fAlloc,
+                                        drawCoverage,
+                                        draw.fRC->clipShader(),
+                                        SkSurfacePropsCopyOrDefault(draw.fProps),
+                                        devBounds);
+        return fBlitter;
+    }
+
+private:
+    SkBlitter* fBlitter = nullptr;
+
+    SkBlitterSizedArena fAlloc;
+};
+
+#endif

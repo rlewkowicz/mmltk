@@ -1,0 +1,82 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef _zipstruct_h
+#define _zipstruct_h
+
+
+typedef struct ZipLocal_ {
+  unsigned char signature[4];
+  unsigned char word[2];
+  unsigned char bitflag[2];
+  unsigned char method[2];
+  unsigned char time[2];
+  unsigned char date[2];
+  unsigned char crc32[4];
+  unsigned char size[4];
+  unsigned char orglen[4];
+  unsigned char filename_len[2];
+  unsigned char extrafield_len[2];
+} ZipLocal;
+
+#define ZIPLOCAL_SIZE (4 + 2 + 2 + 2 + 2 + 2 + 4 + 4 + 4 + 2 + 2)
+
+typedef struct ZipCentral_ {
+  unsigned char signature[4];
+  unsigned char version_made_by[2];
+  unsigned char version[2];
+  unsigned char bitflag[2];
+  unsigned char method[2];
+  unsigned char time[2];
+  unsigned char date[2];
+  unsigned char crc32[4];
+  unsigned char size[4];
+  unsigned char orglen[4];
+  unsigned char filename_len[2];
+  unsigned char extrafield_len[2];
+  unsigned char commentfield_len[2];
+  unsigned char diskstart_number[2];
+  unsigned char internal_attributes[2];
+  unsigned char external_attributes[4];
+  unsigned char localhdr_offset[4];
+} ZipCentral;
+
+#define ZIPCENTRAL_SIZE \
+  (4 + 2 + 2 + 2 + 2 + 2 + 2 + 4 + 4 + 4 + 2 + 2 + 2 + 2 + 2 + 4 + 4)
+
+typedef struct ZipEnd_ {
+  unsigned char signature[4];
+  unsigned char disk_nr[2];
+  unsigned char start_central_dir[2];
+  unsigned char total_entries_disk[2];
+  unsigned char total_entries_archive[2];
+  unsigned char central_dir_size[4];
+  unsigned char offset_central_dir[4];
+  unsigned char commentfield_len[2];
+} ZipEnd;
+
+#define ZIPEND_SIZE (4 + 2 + 2 + 2 + 2 + 4 + 4 + 2)
+
+#define LOCALSIG 0x04034B50l
+#define CENTRALSIG 0x02014B50l
+#define ENDSIG 0x06054B50l
+#define ENDSIG64 0x6064B50l
+
+#define EXTENDED_TIMESTAMP_FIELD 0x5455
+#define EXTENDED_TIMESTAMP_MODTIME 0x01
+
+enum ZipCompressionMethod {
+  STORED = 0,
+  SHRUNK = 1,
+  REDUCED1 = 2,
+  REDUCED2 = 3,
+  REDUCED3 = 4,
+  REDUCED4 = 5,
+  IMPLODED = 6,
+  TOKENIZED = 7,
+  DEFLATED = 8,
+  UNSUPPORTED = 0xFF
+};
+
+#endif /* _zipstruct_h */

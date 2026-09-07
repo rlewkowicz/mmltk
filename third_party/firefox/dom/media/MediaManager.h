@@ -1,0 +1,403 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_MEDIAMANAGER_H
+#define MOZILLA_MEDIAMANAGER_H
+
+#include "DOMMediaStream.h"
+#include "MediaEnginePrefs.h"
+#include "MediaEventSource.h"
+#include "PerformanceRecorder.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/Logging.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/dom/GetUserMediaRequest.h"
+#include "mozilla/dom/MediaStreamBinding.h"
+#include "mozilla/dom/MediaStreamError.h"
+#include "mozilla/dom/MediaStreamTrackBinding.h"
+#include "mozilla/dom/MediaTrackCapabilitiesBinding.h"
+#include "mozilla/dom/NavigatorBinding.h"
+#include "mozilla/media/MediaChild.h"
+#include "mozilla/media/MediaParent.h"
+#include "nsClassHashtable.h"
+#include "nsHashKeys.h"
+#include "nsIMediaDevice.h"
+#include "nsIMediaManager.h"
+#include "nsIMemoryReporter.h"
+#include "nsIObserver.h"
+#include "nsRefPtrHashtable.h"
+#include "nsXULAppAPI.h"
+
+
+class AudioDeviceInfo;
+class nsIPrefBranch;
+
+
+namespace mozilla {
+class MediaEngine;
+class MediaEngineSource;
+class TaskQueue;
+class MediaTrack;
+template <typename T>
+class MediaTimer;
+namespace dom {
+struct AudioOutputOptions;
+struct MediaStreamConstraints;
+struct MediaTrackConstraints;
+struct MediaTrackConstraintSet;
+struct MediaTrackSettings;
+enum class CallerType : uint32_t;
+enum class MediaDeviceKind : uint8_t;
+}  
+
+namespace ipc {
+class PrincipalInfo;
+}
+
+class GetUserMediaTask;
+class GetUserMediaWindowListener;
+class MediaManager;
+class DeviceListener;
+
+class MediaDevice final {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(MediaDevice)
+
+  enum class IsScary { No, Yes };
+
+  enum class OsPromptable { No, Yes };
+
+  MediaDevice(MediaEngine* aEngine, dom::MediaSourceEnum aMediaSource,
+              const nsString& aRawName, const nsString& aRawID,
+              const nsString& aRawGroupID, IsScary aIsScary,
+              const OsPromptable canRequestOsLevelPrompt);
+
+  MediaDevice(MediaEngine* aEngine,
+              const RefPtr<AudioDeviceInfo>& aAudioDeviceInfo,
+              const nsString& aRawID);
+
+  static RefPtr<MediaDevice> CopyWithNewRawGroupId(
+      const RefPtr<MediaDevice>& aOther, const nsString& aRawGroupID);
+
+  dom::MediaSourceEnum GetMediaSource() const;
+
+ protected:
+  ~MediaDevice();
+
+ public:
+  const RefPtr<MediaEngine> mEngine;
+  const RefPtr<AudioDeviceInfo> mAudioDeviceInfo;
+  const dom::MediaSourceEnum mMediaSource;
+  const dom::MediaDeviceKind mKind;
+  const bool mScary;
+  const bool mCanRequestOsLevelPrompt;
+  const bool mIsFake;
+  const nsString mType;
+  const nsString mRawID;
+  const nsString mRawGroupID;
+  const nsString mRawName;
+};
+
+class LocalMediaDevice final : public nsIMediaDevice {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIMEDIADEVICE
+
+  LocalMediaDevice(RefPtr<const MediaDevice> aRawDevice, const nsString& aID,
+                   const nsString& aGroupID, const nsString& aName);
+
+  uint32_t GetBestFitnessDistance(
+      const nsTArray<const NormalizedConstraintSet*>& aConstraintSets,
+      const MediaEnginePrefs& aPrefs, dom::CallerType aCallerType);
+
+  nsresult Allocate(const dom::MediaTrackConstraints& aConstraints,
+                    const MediaEnginePrefs& aPrefs, uint64_t aWindowId,
+                    const char** aOutBadConstraint);
+  void SetTrack(const RefPtr<mozilla::MediaTrack>& aTrack,
+                const nsMainThreadPtrHandle<nsIPrincipal>& aPrincipal);
+  nsresult Start();
+  nsresult Reconfigure(const dom::MediaTrackConstraints& aConstraints,
+                       const MediaEnginePrefs& aPrefs,
+                       const char** aOutBadConstraint);
+  nsresult FocusOnSelectedSource();
+  nsresult Stop();
+  nsresult Deallocate();
+
+  already_AddRefed<LocalMediaDevice> Clone() const;
+
+  void GetSettings(dom::MediaTrackSettings& aOutSettings);
+  void GetCapabilities(dom::MediaTrackCapabilities& aOutCapabilities);
+  MediaEngineSource* Source();
+  const TrackingId& GetTrackingId() const;
+  AudioDeviceInfo* GetAudioDeviceInfo() const {
+    return mRawDevice->mAudioDeviceInfo;
+  }
+  dom::MediaSourceEnum GetMediaSource() const {
+    return mRawDevice->GetMediaSource();
+  }
+  dom::MediaDeviceKind Kind() const { return mRawDevice->mKind; }
+  bool IsFake() const { return mRawDevice->mIsFake; }
+  const nsString& RawID() { return mRawDevice->mRawID; }
+  const dom::MediaTrackConstraints& Constraints() const;
+
+ private:
+  virtual ~LocalMediaDevice() = default;
+
+  static uint32_t FitnessDistance(
+      nsString aN,
+      const dom::OwningStringOrStringSequenceOrConstrainDOMStringParameters&
+          aConstraint);
+
+  static bool StringsContain(const dom::OwningStringOrStringSequence& aStrings,
+                             nsString aN);
+  static uint32_t FitnessDistance(
+      nsString aN, const dom::ConstrainDOMStringParameters& aParams);
+
+ public:
+  const RefPtr<const MediaDevice> mRawDevice;
+  const nsString mName;
+  const nsString mID;
+  const nsString mGroupID;
+
+ private:
+  RefPtr<MediaEngineSource> mSource;
+  dom::MediaTrackConstraints mConstraints;
+};
+
+typedef nsRefPtrHashtable<nsUint64HashKey, GetUserMediaWindowListener>
+    WindowTable;
+
+class MediaManager final : public nsIMediaManagerService,
+                           public nsIMemoryReporter,
+                           public nsIObserver {
+  friend DeviceListener;
+
+ public:
+  static already_AddRefed<MediaManager> GetInstance();
+
+  static MediaManager* Get();
+  static MediaManager* GetIfExists();
+  static void Dispatch(already_AddRefed<Runnable> task);
+
+  template <typename MozPromiseType, typename FunctionType>
+  static RefPtr<MozPromiseType> Dispatch(StaticString aName,
+                                         FunctionType&& aFunction);
+
+#ifdef DEBUG
+  static bool IsInMediaThread();
+#endif
+
+  static bool Exists() { return !!GetIfExists(); }
+
+  static nsresult NotifyRecordingStatusChange(nsPIDOMWindowInner* aWindow);
+
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+  NS_DECL_NSIMEMORYREPORTER
+  NS_DECL_NSIMEDIAMANAGERSERVICE
+
+  media::Parent<media::NonE10s>* GetNonE10sParent();
+
+  RefPtr<GetUserMediaWindowListener> GetOrMakeWindowListener(
+      nsPIDOMWindowInner* aWindow);
+  WindowTable* GetActiveWindows() {
+    MOZ_ASSERT(NS_IsMainThread());
+    return &mActiveWindows;
+  }
+  GetUserMediaWindowListener* GetWindowListener(uint64_t aWindowId) {
+    MOZ_ASSERT(NS_IsMainThread());
+    return mActiveWindows.GetWeak(aWindowId);
+  }
+  void AddWindowID(uint64_t aWindowId,
+                   RefPtr<GetUserMediaWindowListener> aListener);
+  void RemoveWindowID(uint64_t aWindowId);
+  void SendPendingGUMRequest();
+  bool IsWindowStillActive(uint64_t aWindowId) {
+    return !!GetWindowListener(aWindowId);
+  }
+  bool IsWindowListenerStillActive(
+      const RefPtr<GetUserMediaWindowListener>& aListener);
+
+  static bool IsOn(const dom::OwningBooleanOrMediaTrackConstraints& aUnion) {
+    return !aUnion.IsBoolean() || aUnion.GetAsBoolean();
+  }
+  using GetUserMediaSuccessCallback = dom::NavigatorUserMediaSuccessCallback;
+  using GetUserMediaErrorCallback = dom::NavigatorUserMediaErrorCallback;
+
+  MOZ_CAN_RUN_SCRIPT
+  static void CallOnError(GetUserMediaErrorCallback& aCallback,
+                          dom::MediaStreamError& aError);
+  MOZ_CAN_RUN_SCRIPT
+  static void CallOnSuccess(GetUserMediaSuccessCallback& aCallback,
+                            DOMMediaStream& aTrack);
+
+  using MediaDeviceSet = nsTArray<RefPtr<MediaDevice>>;
+  using MediaDeviceSetRefCnt = media::Refcountable<MediaDeviceSet>;
+  using LocalMediaDeviceSet = nsTArray<RefPtr<LocalMediaDevice>>;
+  using LocalMediaDeviceSetRefCnt = media::Refcountable<LocalMediaDeviceSet>;
+
+  using StreamPromise =
+      MozPromise<RefPtr<DOMMediaStream>, RefPtr<MediaMgrError>, true>;
+  using DeviceSetPromise =
+      MozPromise<RefPtr<MediaDeviceSetRefCnt>, RefPtr<MediaMgrError>, true>;
+  using ConstDeviceSetPromise = MozPromise<RefPtr<const MediaDeviceSetRefCnt>,
+                                           RefPtr<MediaMgrError>, true>;
+  using LocalDevicePromise =
+      MozPromise<RefPtr<LocalMediaDevice>, RefPtr<MediaMgrError>, true>;
+  using LocalDeviceSetPromise = MozPromise<RefPtr<LocalMediaDeviceSetRefCnt>,
+                                           RefPtr<MediaMgrError>, true>;
+  using MgrPromise = MozPromise<bool, RefPtr<MediaMgrError>, true>;
+
+  RefPtr<StreamPromise> GetUserMedia(
+      nsPIDOMWindowInner* aWindow,
+      const dom::MediaStreamConstraints& aConstraints,
+      dom::CallerType aCallerType);
+
+  RefPtr<LocalDevicePromise> SelectAudioOutput(
+      nsPIDOMWindowInner* aWindow, const dom::AudioOutputOptions& aOptions,
+      dom::CallerType aCallerType);
+
+  RefPtr<ConstDeviceSetPromise> GetPhysicalDevices();
+
+  void OnNavigation(uint64_t aWindowID);
+  void OnCameraMute(bool aMute);
+  void OnMicrophoneMute(bool aMute);
+  bool IsActivelyCapturingOrHasAPermission(uint64_t aWindowId);
+
+  MediaEventSource<void>& DeviceListChangeEvent() {
+    return mDeviceListChangeEvent;
+  }
+  RefPtr<LocalDeviceSetPromise> AnonymizeDevices(
+      nsPIDOMWindowInner* aWindow, RefPtr<const MediaDeviceSetRefCnt> aDevices);
+
+  MediaEnginePrefs mPrefs;
+
+ private:
+  static nsresult GenerateUUID(nsAString& aResult);
+
+ public:
+  static void GuessVideoDeviceGroupIDs(MediaDeviceSet& aDevices,
+                                       const MediaDeviceSet& aAudios);
+
+ private:
+  enum class EnumerationFlag {
+    AllowPermissionRequest,
+    EnumerateAudioOutputs,
+    ForceFakes,
+  };
+  using EnumerationFlags = EnumSet<EnumerationFlag>;
+
+  enum class DeviceType { Real, Fake };
+
+  struct DeviceEnumerationParams {
+    DeviceEnumerationParams(dom::MediaSourceEnum aInputType, DeviceType aType,
+                            nsAutoCString aForcedDeviceName);
+    dom::MediaSourceEnum mInputType;
+    DeviceType mType;
+    nsAutoCString mForcedDeviceName;
+  };
+
+  struct VideoDeviceEnumerationParams : public DeviceEnumerationParams {
+    VideoDeviceEnumerationParams(dom::MediaSourceEnum aInputType,
+                                 DeviceType aType,
+                                 nsAutoCString aForcedDeviceName,
+                                 nsAutoCString aForcedMicrophoneName);
+
+    nsAutoCString mForcedMicrophoneName;
+  };
+
+  struct EnumerationParams {
+    EnumerationParams(EnumerationFlags aFlags,
+                      Maybe<VideoDeviceEnumerationParams> aVideo,
+                      Maybe<DeviceEnumerationParams> aAudio);
+    bool HasFakeCams() const;
+    bool HasFakeMics() const;
+    bool RealDeviceRequested() const;
+    dom::MediaSourceEnum VideoInputType() const;
+    dom::MediaSourceEnum AudioInputType() const;
+    EnumerationFlags mFlags;
+    Maybe<VideoDeviceEnumerationParams> mVideo;
+    Maybe<DeviceEnumerationParams> mAudio;
+  };
+
+  static EnumerationParams CreateEnumerationParams(
+      dom::MediaSourceEnum aVideoInputType,
+      dom::MediaSourceEnum aAudioInputType, EnumerationFlags aFlags);
+
+  RefPtr<LocalDeviceSetPromise> EnumerateDevicesImpl(
+      nsPIDOMWindowInner* aWindow, EnumerationParams aParams);
+
+  RefPtr<DeviceSetPromise> MaybeRequestPermissionAndEnumerateRawDevices(
+      EnumerationParams aParams);
+
+  static RefPtr<MediaDeviceSetRefCnt> EnumerateRawDevices(
+      EnumerationParams aParams);
+
+  RefPtr<LocalDeviceSetPromise> SelectSettings(
+      const dom::MediaStreamConstraints& aConstraints,
+      dom::CallerType aCallerType, RefPtr<LocalMediaDeviceSetRefCnt> aDevices);
+
+  nsresult GetPref(nsIPrefBranch* aBranch, const char* aPref, const char* aData,
+                   int32_t* aVal);
+  nsresult GetPrefBool(nsIPrefBranch* aBranch, const char* aPref,
+                       const char* aData, bool* aVal);
+  void GetPrefs(nsIPrefBranch* aBranch, const char* aData);
+
+  explicit MediaManager(already_AddRefed<TaskQueue> aMediaThread);
+
+  ~MediaManager() = default;
+  void Shutdown();
+
+  void StopScreensharing(uint64_t aWindowID);
+
+  void RemoveMediaDevicesCallback(uint64_t aWindowID);
+  void DeviceListChanged();
+  void EnsureNoPlaceholdersInDeviceCache();
+  void InvalidateDeviceCache();
+  void HandleDeviceListChanged();
+
+  size_t AddTaskAndGetCount(uint64_t aWindowID, const nsAString& aCallID,
+                            RefPtr<GetUserMediaTask> aTask);
+  RefPtr<GetUserMediaTask> TakeGetUserMediaTask(const nsAString& aCallID);
+  void NotifyAllowed(const nsString& aCallID,
+                     const LocalMediaDeviceSet& aDevices);
+
+  MediaEngine* GetBackend();
+
+  MOZ_DEFINE_MALLOC_SIZE_OF(MallocSizeOf);
+
+  WindowTable mActiveWindows;
+  nsRefPtrHashtable<nsStringHashKey, GetUserMediaTask> mActiveCallbacks;
+  nsClassHashtable<nsUint64HashKey, nsTArray<nsString>> mCallIds;
+  nsTArray<RefPtr<dom::GetUserMediaRequest>> mPendingGUMRequest;
+  RefPtr<media::Refcountable<nsTArray<MozPromiseHolder<ConstDeviceSetPromise>>>>
+      mPendingDevicesPromises;
+  RefPtr<MediaDeviceSetRefCnt> mPhysicalDevices;
+  TimeStamp mUnhandledDeviceChangeTime;
+  RefPtr<MediaTimer<TimeStamp>> mDeviceChangeTimer;
+  bool mCamerasMuted = false;
+  bool mMicrophonesMuted = false;
+
+ public:
+  const RefPtr<TaskQueue> mMediaThread;
+
+ private:
+  nsCOMPtr<nsIAsyncShutdownBlocker> mShutdownBlocker;
+
+  RefPtr<MediaEngine> mBackend;
+
+  static StaticRefPtr<MediaManager> sSingleton;
+
+  MediaEventListener mDeviceListChangeListener;
+
+  MediaEventProducer<void> mDeviceListChangeEvent;
+
+ public:
+  RefPtr<media::Parent<media::NonE10s>> mNonE10sParent;
+};
+
+}  
+
+#endif  // MOZILLA_MEDIAMANAGER_H

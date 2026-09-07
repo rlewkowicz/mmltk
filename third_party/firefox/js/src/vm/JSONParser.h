@@ -1,0 +1,628 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef vm_JSONParser_h
+#define vm_JSONParser_h
+
+#include "mozilla/Assertions.h"  // MOZ_ASSERT
+#include "mozilla/Attributes.h"  // MOZ_STACK_CLASS
+#include "mozilla/Maybe.h"       // mozilla::{Maybe,Some}
+#include "mozilla/Range.h"       // mozilla::Range
+#include "mozilla/RangedPtr.h"   // mozilla::RangedPtr
+
+#include <stddef.h>  // size_t
+#include <stdint.h>  // uint32_t
+#include <utility>   // std::move
+
+#include "builtin/ParseRecordObject.h"  // js::ParseRecordObject
+#include "ds/IdValuePair.h"             // IdValuePair
+#include "gc/GC.h"                      // AutoSelectGCHeap
+#include "js/GCVector.h"                // JS::GCVector
+#include "js/RootingAPI.h"  // JS::Handle, JS::MutableHandle, MutableWrappedPtrOperations
+#include "js/Value.h"            // JS::Value, JS::BooleanValue, JS::NullValue
+#include "js/Vector.h"           // Vector
+#include "util/StringBuilder.h"  // JSStringBuilder
+#include "vm/StringType.h"       // JSString, JSAtom
+
+struct JSContext;
+class JSTracer;
+
+namespace js {
+
+class FrontendContext;
+
+enum class JSONToken {
+  String,
+  Number,
+  True,
+  False,
+  Null,
+  ArrayOpen,
+  ArrayClose,
+  ObjectOpen,
+  ObjectClose,
+  Colon,
+  Comma,
+  OOM,
+  Error
+};
+
+enum class JSONStringType { PropertyName, LiteralValue };
+
+template <typename CharT, typename ParserT>
+class MOZ_STACK_CLASS JSONTokenizer {
+ public:
+  using CharPtr = mozilla::RangedPtr<const CharT>;
+
+  using JSONStringBuilder = typename ParserT::JSONStringBuilder;
+
+ protected:
+  CharPtr sourceStart;
+  CharPtr current;
+  const CharPtr begin, end;
+
+  ParserT* parser = nullptr;
+
+  JSONTokenizer(CharPtr sourceStart, CharPtr current, const CharPtr begin,
+                const CharPtr end, ParserT* parser)
+      : sourceStart(sourceStart),
+        current(current),
+        begin(begin),
+        end(end),
+        parser(parser) {
+    MOZ_ASSERT(current <= end);
+    MOZ_ASSERT(parser);
+  }
+
+ public:
+  JSONTokenizer(CharPtr current, const CharPtr begin, const CharPtr end,
+                ParserT* parser)
+      : JSONTokenizer(current, current, begin, end, parser) {}
+
+  explicit JSONTokenizer(mozilla::Range<const CharT> data, ParserT* parser)
+      : JSONTokenizer(data.begin(), data.begin(), data.end(), parser) {}
+
+  JSONTokenizer(JSONTokenizer<CharT, ParserT>&& other) noexcept
+      : JSONTokenizer(other.sourceStart, other.current, other.begin, other.end,
+                      other.parser) {}
+
+  JSONTokenizer(const JSONTokenizer<CharT, ParserT>& other) = delete;
+  void operator=(const JSONTokenizer<CharT, ParserT>& other) = delete;
+
+  void fixupParser(ParserT* newParser) { parser = newParser; }
+
+  void getTextPosition(uint32_t* column, uint32_t* line);
+
+  bool consumeTrailingWhitespaces();
+
+  JSONToken advance();
+  JSONToken advancePropertyName();
+  JSONToken advancePropertyColon();
+  JSONToken advanceAfterProperty();
+  JSONToken advanceAfterObjectOpen();
+  JSONToken advanceAfterArrayElement();
+
+  void unget() { --current; }
+
+#ifdef DEBUG
+  bool finished() { return end == current; }
+#endif
+
+  JSONToken token(JSONToken t) {
+    MOZ_ASSERT(t != JSONToken::String);
+    MOZ_ASSERT(t != JSONToken::Number);
+    return t;
+  }
+
+  template <JSONStringType ST>
+  JSONToken stringToken(const CharPtr start, size_t length);
+  template <JSONStringType ST>
+  JSONToken stringToken(JSONStringBuilder& builder);
+
+  JSONToken numberToken(double d);
+
+  template <JSONStringType ST>
+  JSONToken readString();
+
+  JSONToken readNumber();
+
+  void error(const char* msg);
+
+ protected:
+  inline mozilla::Span<const CharT> getSource() const {
+    return mozilla::Span<const CharT>(sourceStart.get(), current.get());
+  }
+};
+
+enum class JSONParserState {
+  FinishArrayElement,
+
+  FinishObjectMember,
+
+  JSONValue
+};
+
+class MOZ_STACK_CLASS JSONFullParseHandlerAnyChar {
+ public:
+
+  using ElementVector = JS::GCVector<JS::Value, 20>;
+
+  using PropertyVector = IdValueVector;
+
+  enum class ParseType {
+    JSONParse,
+    AttemptForEval,
+  };
+
+  struct StackEntry {
+    ElementVector& elements() {
+      MOZ_ASSERT(state == JSONParserState::FinishArrayElement);
+      return *static_cast<ElementVector*>(vector);
+    }
+
+    PropertyVector& properties() {
+      MOZ_ASSERT(state == JSONParserState::FinishObjectMember);
+      return *static_cast<PropertyVector*>(vector);
+    }
+
+    explicit StackEntry(JSContext* cx, ElementVector* elements)
+        : state(JSONParserState::FinishArrayElement), vector(elements) {}
+
+    explicit StackEntry(JSContext* cx, PropertyVector* properties)
+        : state(JSONParserState::FinishObjectMember), vector(properties) {}
+
+    JSONParserState state;
+
+   private:
+    void* vector;
+  };
+
+ public:
+
+  JSContext* cx;
+
+  bool reportLineNumbersFromParsedData = false;
+
+  mozilla::Maybe<JS::ConstUTF8CharsZ> filename;
+
+  JS::Value v;
+
+  ParseType parseType = ParseType::JSONParse;
+
+  AutoSelectGCHeap gcHeap;
+
+ private:
+  Vector<ElementVector*, 5> freeElements;
+  Vector<PropertyVector*, 5> freeProperties;
+
+ public:
+  explicit JSONFullParseHandlerAnyChar(JSContext* cx);
+  ~JSONFullParseHandlerAnyChar();
+
+  JSONFullParseHandlerAnyChar(JSONFullParseHandlerAnyChar&& other) noexcept;
+
+  JSONFullParseHandlerAnyChar(const JSONFullParseHandlerAnyChar& other) =
+      delete;
+  void operator=(const JSONFullParseHandlerAnyChar& other) = delete;
+
+  JSContext* context() { return cx; }
+
+  JS::Value numberValue() const {
+    MOZ_ASSERT(v.isNumber());
+    return v;
+  }
+
+  JS::Value stringValue() const {
+    MOZ_ASSERT(v.isString());
+    return v;
+  }
+
+  JSAtom* atomValue() const {
+    JS::Value strval = stringValue();
+    return &strval.toString()->asAtom();
+  }
+
+  inline JS::Value booleanValue(bool value) { return JS::BooleanValue(value); }
+  inline JS::Value nullValue() { return JS::NullValue(); }
+
+  inline bool objectOpen(Vector<StackEntry, 10>& stack,
+                         PropertyVector** properties);
+  inline bool objectPropertyName(Vector<StackEntry, 10>& stack,
+                                 bool* isProtoInEval);
+  inline bool finishObjectMember(Vector<StackEntry, 10>& stack,
+                                 JS::Handle<JS::Value> value,
+                                 PropertyVector** properties);
+  inline bool finishObject(Vector<StackEntry, 10>& stack,
+                           JS::MutableHandle<JS::Value> vp,
+                           PropertyVector* properties);
+
+  inline bool arrayOpen(Vector<StackEntry, 10>& stack,
+                        ElementVector** elements);
+  inline bool arrayElement(Vector<StackEntry, 10>& stack,
+                           JS::Handle<JS::Value> value,
+                           ElementVector** elements);
+  inline bool finishArray(Vector<StackEntry, 10>& stack,
+                          JS::MutableHandle<JS::Value> vp,
+                          ElementVector* elements);
+
+  inline bool errorReturn() const {
+    return parseType == ParseType::AttemptForEval;
+  }
+
+  inline bool ignoreError() const {
+    return parseType == ParseType::AttemptForEval;
+  }
+
+  inline void freeStackEntry(StackEntry& entry);
+
+  void trace(JSTracer* trc);
+};
+
+template <typename CharT>
+class MOZ_STACK_CLASS JSONFullParseHandler
+    : public JSONFullParseHandlerAnyChar {
+  using Base = JSONFullParseHandlerAnyChar;
+  using CharPtr = mozilla::RangedPtr<const CharT>;
+
+ public:
+  using ContextT = JSContext;
+
+  class JSONStringBuilder {
+   public:
+    JSStringBuilder buffer;
+
+    explicit JSONStringBuilder(JSContext* cx) : buffer(cx) {}
+
+    bool append(char16_t c);
+    bool append(const CharT* begin, const CharT* end);
+  };
+
+  explicit JSONFullParseHandler(JSContext* cx) : Base(cx) {}
+
+  JSONFullParseHandler(JSONFullParseHandler&& other) noexcept
+      : Base(std::move(other)) {}
+
+  JSONFullParseHandler(const JSONFullParseHandler& other) = delete;
+  void operator=(const JSONFullParseHandler& other) = delete;
+
+  template <JSONStringType ST>
+  inline bool setStringValue(CharPtr start, size_t length,
+                             mozilla::Span<const CharT>&& source);
+  template <JSONStringType ST>
+  inline bool setStringValue(JSONStringBuilder& builder,
+                             mozilla::Span<const CharT>&& source);
+  inline bool setNumberValue(double d, mozilla::Span<const CharT>&& source);
+  inline bool setBooleanValue(bool value, mozilla::Span<const CharT>&& source);
+  inline bool setNullValue(mozilla::Span<const CharT>&& source);
+
+  void reportError(const char* msg, uint32_t line, uint32_t column);
+};
+
+template <typename CharT>
+class MOZ_STACK_CLASS JSONReviveHandler : public JSONFullParseHandler<CharT> {
+  using CharPtr = mozilla::RangedPtr<const CharT>;
+  using Base = JSONFullParseHandler<CharT>;
+
+ public:
+  using SourceT = mozilla::Span<const CharT>;
+
+  using JSONStringBuilder = typename Base::JSONStringBuilder;
+  using StackEntry = typename Base::StackEntry;
+  using PropertyVector = typename Base::PropertyVector;
+  using ElementVector = typename Base::ElementVector;
+
+ public:
+  explicit JSONReviveHandler(JSContext* cx) : Base(cx), parseRecordStack(cx) {}
+
+  JSONReviveHandler(JSONReviveHandler&& other) noexcept
+      : Base(std::move(other)),
+        parseRecordStack(std::move(other.parseRecordStack)) {}
+
+  JSONReviveHandler(const JSONReviveHandler& other) = delete;
+  void operator=(const JSONReviveHandler& other) = delete;
+
+  JSContext* context() { return this->cx; }
+
+  template <JSONStringType ST>
+  inline bool setStringValue(CharPtr start, size_t length, SourceT&& source) {
+    if (!Base::template setStringValue<ST>(start, length,
+                                           std::forward<SourceT&&>(source))) {
+      return false;
+    }
+    if constexpr (ST == JSONStringType::PropertyName) {
+      return true;
+    }
+    return finishPrimitiveParseRecord(this->v, source);
+  }
+
+  template <JSONStringType ST>
+  inline bool setStringValue(JSONStringBuilder& builder, SourceT&& source) {
+    if (!Base::template setStringValue<ST>(builder,
+                                           std::forward<SourceT&&>(source))) {
+      return false;
+    }
+    if constexpr (ST == JSONStringType::PropertyName) {
+      return true;
+    }
+    return finishPrimitiveParseRecord(this->v, source);
+  }
+
+  inline bool setNumberValue(double d, SourceT&& source) {
+    if (!Base::setNumberValue(d, std::forward<SourceT&&>(source))) {
+      return false;
+    }
+    return finishPrimitiveParseRecord(this->v, source);
+  }
+
+  inline bool setBooleanValue(bool value, SourceT&& source) {
+    return finishPrimitiveParseRecord(JS::BooleanValue(value), source);
+  }
+  inline bool setNullValue(SourceT&& source) {
+    return finishPrimitiveParseRecord(JS::NullValue(), source);
+  }
+
+  inline bool objectOpen(Vector<StackEntry, 10>& stack,
+                         PropertyVector** properties);
+  inline bool finishObjectMember(Vector<StackEntry, 10>& stack,
+                                 JS::Handle<JS::Value> value,
+                                 PropertyVector** properties);
+  inline bool finishObject(Vector<StackEntry, 10>& stack,
+                           JS::MutableHandle<JS::Value> vp,
+                           PropertyVector* properties);
+
+  inline bool arrayOpen(Vector<StackEntry, 10>& stack,
+                        ElementVector** elements);
+  inline bool arrayElement(Vector<StackEntry, 10>& stack,
+                           JS::Handle<JS::Value> value,
+                           ElementVector** elements);
+  inline bool finishArray(Vector<StackEntry, 10>& stack,
+                          JS::MutableHandle<JS::Value> vp,
+                          ElementVector* elements);
+
+  void trace(JSTracer* trc);
+
+  inline ParseRecordObject* getParseRecordObject() {
+    return parseRecordStack.back();
+  };
+
+ private:
+  inline bool finishPrimitiveParseRecord(const Value& value, SourceT source);
+
+  GCVector<ParseRecordObject*, 10> parseRecordStack;
+};
+
+template <typename CharT>
+class MOZ_STACK_CLASS JSONSyntaxParseHandler {
+ private:
+  using CharPtr = mozilla::RangedPtr<const CharT>;
+
+ public:
+
+  using ContextT = FrontendContext;
+
+  class DummyValue {};
+
+  struct ElementVector {};
+  struct PropertyVector {};
+
+  class JSONStringBuilder {
+   public:
+    explicit JSONStringBuilder(FrontendContext* fc) {}
+
+    bool append(char16_t c) { return true; }
+    bool append(const CharT* begin, const CharT* end) { return true; }
+  };
+
+  struct StackEntry {
+    JSONParserState state;
+  };
+
+ public:
+  FrontendContext* fc;
+
+
+  explicit JSONSyntaxParseHandler(FrontendContext* fc) : fc(fc) {}
+
+  JSONSyntaxParseHandler(JSONSyntaxParseHandler&& other) noexcept
+      : fc(other.fc) {}
+
+  JSONSyntaxParseHandler(const JSONSyntaxParseHandler& other) = delete;
+  void operator=(const JSONSyntaxParseHandler& other) = delete;
+
+  FrontendContext* context() { return fc; }
+
+  template <JSONStringType ST>
+  inline bool setStringValue(CharPtr start, size_t length,
+                             mozilla::Span<const CharT>&& source) {
+    return true;
+  }
+
+  template <JSONStringType ST>
+  inline bool setStringValue(JSONStringBuilder& builder,
+                             mozilla::Span<const CharT>&& source) {
+    return true;
+  }
+
+  inline bool setNumberValue(double d, mozilla::Span<const CharT>&& source) {
+    return true;
+  }
+  inline bool setBooleanValue(bool value, mozilla::Span<const CharT>&& source) {
+    return true;
+  }
+  inline bool setNullValue(mozilla::Span<const CharT>&& source) { return true; }
+
+  inline DummyValue numberValue() const { return DummyValue(); }
+
+  inline DummyValue stringValue() const { return DummyValue(); }
+
+  inline DummyValue booleanValue(bool value) { return DummyValue(); }
+  inline DummyValue nullValue() { return DummyValue(); }
+
+  inline bool objectOpen(Vector<StackEntry, 10>& stack,
+                         PropertyVector** properties);
+  inline bool objectPropertyName(Vector<StackEntry, 10>& stack,
+                                 bool* isProtoInEval) {
+    *isProtoInEval = false;
+    return true;
+  }
+  inline bool finishObjectMember(Vector<StackEntry, 10>& stack,
+                                 DummyValue& value,
+                                 PropertyVector** properties) {
+    return true;
+  }
+  inline bool finishObject(Vector<StackEntry, 10>& stack, DummyValue* vp,
+                           PropertyVector* properties);
+
+  inline bool arrayOpen(Vector<StackEntry, 10>& stack,
+                        ElementVector** elements);
+  inline bool arrayElement(Vector<StackEntry, 10>& stack, DummyValue& value,
+                           ElementVector** elements) {
+    return true;
+  }
+  inline bool finishArray(Vector<StackEntry, 10>& stack, DummyValue* vp,
+                          ElementVector* elements);
+
+  inline bool errorReturn() const { return false; }
+
+  inline bool ignoreError() const { return false; }
+
+  inline void freeStackEntry(StackEntry& entry) {}
+
+  void reportError(const char* msg, uint32_t line, uint32_t column);
+};
+
+template <typename CharT, typename HandlerT>
+class MOZ_STACK_CLASS JSONPerHandlerParser {
+  using ContextT = typename HandlerT::ContextT;
+
+  using Tokenizer = JSONTokenizer<CharT, JSONPerHandlerParser<CharT, HandlerT>>;
+
+ public:
+  using JSONStringBuilder = typename HandlerT::JSONStringBuilder;
+
+ public:
+  HandlerT handler;
+  Tokenizer tokenizer;
+
+  Vector<typename HandlerT::StackEntry, 10> stack;
+
+ public:
+  JSONPerHandlerParser(ContextT* context, mozilla::Range<const CharT> data)
+      : handler(context), tokenizer(data, this), stack(context) {}
+
+  JSONPerHandlerParser(JSONPerHandlerParser&& other) noexcept
+      : handler(std::move(other.handler)),
+        tokenizer(std::move(other.tokenizer)),
+        stack(handler.context()) {
+    tokenizer.fixupParser(this);
+  }
+
+  ~JSONPerHandlerParser();
+
+  JSONPerHandlerParser(const JSONPerHandlerParser<CharT, HandlerT>& other) =
+      delete;
+  void operator=(const JSONPerHandlerParser<CharT, HandlerT>& other) = delete;
+
+  template <typename TempValueT, typename ResultSetter>
+  inline bool parseImpl(TempValueT& value, ResultSetter setResult);
+
+  void outOfMemory();
+
+  void error(const char* msg);
+};
+
+template <typename CharT>
+class MOZ_STACK_CLASS JSONParser
+    : JSONPerHandlerParser<CharT, JSONFullParseHandler<CharT>> {
+  using Base = JSONPerHandlerParser<CharT, JSONFullParseHandler<CharT>>;
+
+ public:
+  using ParseType = JSONFullParseHandlerAnyChar::ParseType;
+
+
+  JSONParser(JSContext* cx, mozilla::Range<const CharT> data,
+             ParseType parseType)
+      : Base(cx, data) {
+    this->handler.parseType = parseType;
+  }
+
+  JSONParser(JSONParser&& other) noexcept : Base(std::move(other)) {}
+
+  JSONParser(const JSONParser& other) = delete;
+  void operator=(const JSONParser& other) = delete;
+
+  bool parse(JS::MutableHandle<JS::Value> vp);
+
+  void reportLineNumbersFromParsedData(bool b) {
+    this->handler.reportLineNumbersFromParsedData = b;
+  }
+
+  void setFilename(JS::ConstUTF8CharsZ filename) {
+    this->handler.filename = mozilla::Some(filename);
+  }
+
+  void trace(JSTracer* trc);
+};
+
+template <typename CharT>
+class MOZ_STACK_CLASS JSONReviveParser
+    : JSONPerHandlerParser<CharT, JSONReviveHandler<CharT>> {
+  using Base = JSONPerHandlerParser<CharT, JSONReviveHandler<CharT>>;
+
+ public:
+  using ParseType = JSONFullParseHandlerAnyChar::ParseType;
+
+
+  JSONReviveParser(JSContext* cx, mozilla::Range<const CharT> data)
+      : Base(cx, data) {}
+
+  JSONReviveParser(JSONReviveParser&& other) noexcept
+      : Base(std::move(other)) {}
+
+  JSONReviveParser(const JSONReviveParser& other) = delete;
+  void operator=(const JSONReviveParser& other) = delete;
+
+  bool parse(JS::MutableHandle<JS::Value> vp,
+             JS::MutableHandle<ParseRecordObject*> pro);
+
+  void trace(JSTracer* trc);
+};
+
+template <typename CharT, typename Wrapper>
+class MutableWrappedPtrOperations<JSONParser<CharT>, Wrapper>
+    : public WrappedPtrOperations<JSONParser<CharT>, Wrapper> {
+ public:
+  bool parse(JS::MutableHandle<JS::Value> vp) {
+    return static_cast<Wrapper*>(this)->get().parse(vp);
+  }
+  void setFilename(JS::ConstUTF8CharsZ filename) {
+    static_cast<Wrapper*>(this)->get().setFilename(filename);
+  }
+  void reportLineNumbersFromParsedData(bool b) {
+    static_cast<Wrapper*>(this)->get().reportLineNumbersFromParsedData(b);
+  }
+};
+
+template <typename CharT>
+class MOZ_STACK_CLASS JSONSyntaxParser
+    : JSONPerHandlerParser<CharT, JSONSyntaxParseHandler<CharT>> {
+  using HandlerT = JSONSyntaxParseHandler<CharT>;
+  using Base = JSONPerHandlerParser<CharT, HandlerT>;
+
+ public:
+  JSONSyntaxParser(FrontendContext* fc, mozilla::Range<const CharT> data)
+      : Base(fc, data) {}
+
+  JSONSyntaxParser(JSONSyntaxParser<CharT>&& other) noexcept
+      : Base(std::move(other)) {}
+
+  JSONSyntaxParser(const JSONSyntaxParser& other) = delete;
+  void operator=(const JSONSyntaxParser& other) = delete;
+
+  bool parse();
+};
+
+} 
+
+#endif /* vm_JSONParser_h */

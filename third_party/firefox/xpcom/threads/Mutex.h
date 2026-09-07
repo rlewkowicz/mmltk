@@ -1,0 +1,261 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_Mutex_h
+#define mozilla_Mutex_h
+
+#include "mozilla/BlockingResourceBase.h"
+#include "mozilla/ThreadSafety.h"
+#include "mozilla/PlatformMutex.h"
+#include "mozilla/Maybe.h"
+#include "nsISupports.h"
+
+namespace mozilla {
+
+class MOZ_CAPABILITY("mutex") OffTheBooksMutex : public detail::MutexImpl,
+                                                 BlockingResourceBase {
+ public:
+  explicit OffTheBooksMutex(const char* aName)
+      : BlockingResourceBase(aName, eMutex)
+#ifdef DEBUG
+        ,
+        mOwningThread(nullptr)
+#endif
+  {
+  }
+
+  ~OffTheBooksMutex() {
+#ifdef DEBUG
+    MOZ_ASSERT(!mOwningThread, "destroying a still-owned lock!");
+#endif
+  }
+
+#ifndef DEBUG
+  void Lock() MOZ_CAPABILITY_ACQUIRE() { this->lock(); }
+
+  [[nodiscard]] bool TryLock() MOZ_TRY_ACQUIRE(true) { return this->tryLock(); }
+
+  void Unlock() MOZ_CAPABILITY_RELEASE() { this->unlock(); }
+
+  void AssertCurrentThreadOwns() const MOZ_ASSERT_CAPABILITY(this) {}
+
+  void AssertNotCurrentThreadOwns() const MOZ_ASSERT_CAPABILITY(!this) {}
+
+#else
+  void Lock() MOZ_CAPABILITY_ACQUIRE();
+
+  [[nodiscard]] bool TryLock() MOZ_TRY_ACQUIRE(true);
+  void Unlock() MOZ_CAPABILITY_RELEASE();
+
+  void AssertCurrentThreadOwns() const MOZ_ASSERT_CAPABILITY(this);
+  void AssertNotCurrentThreadOwns() const MOZ_ASSERT_CAPABILITY(!this) {
+  }
+#endif  // ifndef DEBUG
+
+ private:
+  OffTheBooksMutex() = delete;
+  OffTheBooksMutex(const OffTheBooksMutex&) = delete;
+  OffTheBooksMutex& operator=(const OffTheBooksMutex&) = delete;
+
+  friend class OffTheBooksCondVar;
+
+#ifdef DEBUG
+  PRThread* mOwningThread;
+#endif
+};
+
+class Mutex : public OffTheBooksMutex {
+ public:
+  explicit Mutex(const char* aName) : OffTheBooksMutex(aName) {
+    MOZ_COUNT_CTOR(Mutex);
+  }
+
+  MOZ_COUNTED_DTOR(Mutex)
+
+ private:
+  Mutex() = delete;
+  Mutex(const Mutex&) = delete;
+  Mutex& operator=(const Mutex&) = delete;
+};
+
+namespace detail {
+template <typename T>
+class MOZ_RAII BaseAutoUnlock;
+
+template <typename T>
+class MOZ_RAII MOZ_SCOPED_CAPABILITY BaseAutoLock {
+ public:
+  explicit BaseAutoLock(T aLock) MOZ_CAPABILITY_ACQUIRE(aLock) : mLock(aLock) {
+    mLock.Lock();
+  }
+
+  ~BaseAutoLock(void) MOZ_CAPABILITY_RELEASE() { mLock.Unlock(); }
+
+  void AssertOwns(const T& aMutex) const MOZ_ASSERT_CAPABILITY(aMutex) {
+    MOZ_ASSERT(&aMutex == &mLock);
+    mLock.AssertCurrentThreadOwns();
+  }
+
+ private:
+  BaseAutoLock() = delete;
+  BaseAutoLock(BaseAutoLock&) = delete;
+  BaseAutoLock& operator=(BaseAutoLock&) = delete;
+  static void* operator new(size_t) noexcept(true);
+
+  friend class BaseAutoUnlock<T>;
+
+  T mLock;
+};
+
+template <typename MutexType>
+BaseAutoLock(MutexType&) -> BaseAutoLock<MutexType&>;
+}  
+
+typedef detail::BaseAutoLock<Mutex&> MutexAutoLock;
+typedef detail::BaseAutoLock<OffTheBooksMutex&> OffTheBooksMutexAutoLock;
+
+template <class MutexType>
+class Maybe<detail::BaseAutoLock<MutexType&>> {
+ public:
+  Maybe() : mLock(nullptr) {}
+  ~Maybe() MOZ_NO_THREAD_SAFETY_ANALYSIS {
+    if (mLock) {
+      mLock->Unlock();
+    }
+  }
+
+  constexpr bool isSome() const { return mLock; }
+  constexpr bool isNothing() const { return !mLock; }
+
+  void emplace(MutexType& aMutex) MOZ_NO_THREAD_SAFETY_ANALYSIS {
+    MOZ_RELEASE_ASSERT(!mLock);
+    mLock = &aMutex;
+    mLock->Lock();
+  }
+
+  void reset() MOZ_NO_THREAD_SAFETY_ANALYSIS {
+    if (mLock) {
+      mLock->Unlock();
+      mLock = nullptr;
+    }
+  }
+
+ private:
+  MutexType* mLock;
+};
+
+namespace detail {
+template <typename T>
+class MOZ_RAII MOZ_SCOPED_CAPABILITY ReleasableBaseAutoLock {
+ public:
+  explicit ReleasableBaseAutoLock(T aLock) MOZ_CAPABILITY_ACQUIRE(aLock)
+      : mLock(aLock) {
+    mLock.Lock();
+    mLocked = true;
+  }
+
+  ~ReleasableBaseAutoLock(void) MOZ_CAPABILITY_RELEASE() {
+    if (mLocked) {
+      Unlock();
+    }
+  }
+
+  void AssertOwns(const T& aMutex) const MOZ_ASSERT_CAPABILITY(aMutex) {
+    MOZ_ASSERT(&aMutex == &mLock);
+    mLock.AssertCurrentThreadOwns();
+  }
+
+  // clang-format off
+  // clang-format on
+  void Unlock() MOZ_CAPABILITY_RELEASE() {
+    MOZ_ASSERT(mLocked);
+    mLock.Unlock();
+    mLocked = false;
+  }
+  void Lock() MOZ_CAPABILITY_ACQUIRE() {
+    MOZ_ASSERT(!mLocked);
+    mLock.Lock();
+    mLocked = true;
+  }
+
+ private:
+  ReleasableBaseAutoLock() = delete;
+  ReleasableBaseAutoLock(ReleasableBaseAutoLock&) = delete;
+  ReleasableBaseAutoLock& operator=(ReleasableBaseAutoLock&) = delete;
+  static void* operator new(size_t) noexcept(true);
+
+  bool mLocked;
+  T mLock;
+};
+
+template <typename MutexType>
+ReleasableBaseAutoLock(MutexType&) -> ReleasableBaseAutoLock<MutexType&>;
+}  
+
+typedef detail::ReleasableBaseAutoLock<Mutex&> ReleasableMutexAutoLock;
+
+namespace detail {
+template <typename T>
+class MOZ_RAII MOZ_SCOPED_CAPABILITY BaseAutoUnlock {
+ public:
+  explicit BaseAutoUnlock(T aLock) MOZ_SCOPED_UNLOCK_RELEASE(aLock)
+      : mLock(aLock) {
+    mLock.Unlock();
+  }
+
+  explicit BaseAutoUnlock(BaseAutoLock<T>& aAutoLock)
+      : mLock(aAutoLock.mLock) {
+    NS_ASSERTION(mLock, "null lock");
+    mLock->Unlock();
+  }
+
+  ~BaseAutoUnlock() MOZ_SCOPED_UNLOCK_REACQUIRE() { mLock.Lock(); }
+
+ private:
+  BaseAutoUnlock() = delete;
+  BaseAutoUnlock(BaseAutoUnlock&) = delete;
+  BaseAutoUnlock& operator=(BaseAutoUnlock&) = delete;
+  static void* operator new(size_t) noexcept(true);
+
+  T mLock;
+};
+
+template <typename MutexType>
+BaseAutoUnlock(MutexType&) -> BaseAutoUnlock<MutexType&>;
+}  
+
+typedef detail::BaseAutoUnlock<Mutex&> MutexAutoUnlock;
+typedef detail::BaseAutoUnlock<OffTheBooksMutex&> OffTheBooksMutexAutoUnlock;
+
+namespace detail {
+template <typename T>
+class MOZ_RAII MOZ_SCOPED_CAPABILITY BaseAutoTryLock {
+ public:
+  explicit BaseAutoTryLock(T& aLock) MOZ_CAPABILITY_ACQUIRE(aLock)
+      : mLock(aLock.TryLock() ? &aLock : nullptr) {}
+
+  ~BaseAutoTryLock() MOZ_CAPABILITY_RELEASE() {
+    if (mLock) {
+      mLock->Unlock();
+      mLock = nullptr;
+    }
+  }
+
+  explicit operator bool() const { return mLock; }
+
+ private:
+  BaseAutoTryLock(BaseAutoTryLock&) = delete;
+  BaseAutoTryLock& operator=(BaseAutoTryLock&) = delete;
+  static void* operator new(size_t) noexcept(true);
+
+  T* mLock;
+};
+}  
+
+typedef detail::BaseAutoTryLock<Mutex> MutexAutoTryLock;
+typedef detail::BaseAutoTryLock<OffTheBooksMutex> OffTheBooksMutexAutoTryLock;
+
+}  
+
+#endif  // ifndef mozilla_Mutex_h

@@ -1,0 +1,1148 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+const { PictureInPicture } = ChromeUtils.importESModule(
+  "resource://gre/modules/PictureInPicture.sys.mjs"
+);
+const { ShortcutUtils } = ChromeUtils.importESModule(
+  "resource://gre/modules/ShortcutUtils.sys.mjs"
+);
+const { DeferredTask } = ChromeUtils.importESModule(
+  "resource://gre/modules/DeferredTask.sys.mjs"
+);
+const { AppConstants } = ChromeUtils.importESModule(
+  "resource://gre/modules/AppConstants.sys.mjs"
+);
+
+const AUDIO_TOGGLE_ENABLED_PREF =
+  "media.videocontrols.picture-in-picture.audio-toggle.enabled";
+const KEYBOARD_CONTROLS_ENABLED_PREF =
+  "media.videocontrols.picture-in-picture.keyboard-controls.enabled";
+const CAPTIONS_ENABLED_PREF =
+  "media.videocontrols.picture-in-picture.display-text-tracks.enabled";
+const CAPTIONS_TOGGLE_ENABLED_PREF =
+  "media.videocontrols.picture-in-picture.display-text-tracks.toggle.enabled";
+const TEXT_TRACK_FONT_SIZE_PREF =
+  "media.videocontrols.picture-in-picture.display-text-tracks.size";
+const IMPROVED_CONTROLS_ENABLED_PREF =
+  "media.videocontrols.picture-in-picture.improved-video-controls.enabled";
+const SEETHROUGH_MODE_ENABLED_PREF =
+  "media.videocontrols.picture-in-picture.seethrough-mode.enabled";
+
+const SHOWING_ATTRIBUTE = "showing";
+const KEYING_ATTRIBUTE = "keying";
+const DONTHIDE_ATTRIBUTE = "donthide";
+
+const CONTROLS_FADE_TIMEOUT_MS = 3000;
+const RESIZE_DEBOUNCE_RATE_MS = 500;
+
+const TOP_RIGHT_QUADRANT = 1;
+const TOP_LEFT_QUADRANT = 2;
+const BOTTOM_LEFT_QUADRANT = 3;
+const BOTTOM_RIGHT_QUADRANT = 4;
+
+function setupPlayer(id, wgp, videoRef, isPipApiRequest, autoFocus) {
+  return Player.init(id, wgp, videoRef, isPipApiRequest, autoFocus);
+}
+
+function setIsPlayingState(isPlaying) {
+  Player.isPlaying = isPlaying;
+}
+
+function setIsMutedState(isMuted) {
+  Player.isMuted = isMuted;
+}
+
+function resizeToVideo(rect) {
+  Player.resizeToVideo(rect);
+}
+
+function getDeferredResize() {
+  return Player.deferredResize;
+}
+
+function enableSubtitlesButton() {
+  Player.enableSubtitlesButton();
+}
+
+function disableSubtitlesButton() {
+  Player.disableSubtitlesButton();
+}
+
+function setScrubberPosition(position) {
+  Player.setScrubberPosition(position);
+}
+
+function setTimestamp(timeString) {
+  Player.setTimestamp(timeString);
+}
+
+function setVolume(volume) {
+  Player.setVolume(volume);
+}
+
+function closeFromForeground() {
+  Player.closeFromForeground();
+}
+
+let Player = {
+  _isInitialized: false,
+  WINDOW_EVENTS: [
+    "click",
+    "contextmenu",
+    "command",
+    "dblclick",
+    "keydown",
+    "mouseup",
+    "mousemove",
+    "MozDOMFullscreen:Entered",
+    "MozDOMFullscreen:Exited",
+    "resize",
+    "unload",
+    "draggableregionleftmousedown",
+  ],
+  actor: null,
+  resizeDebouncer: null,
+  id: -1,
+
+  showingTimeout: null,
+
+  oldMouseUpWindowX: window.screenX,
+  oldMouseUpWindowY: window.screenY,
+
+  isCurrentHover: false,
+
+  deferredResize: null,
+
+  isUnpipWithoutPauseShortcut: e => e.shiftKey === true,
+
+  init(id, wgp, videoRef, isPipApiRequest, autoFocus) {
+    this.id = id;
+
+    this.scrubbing = false;
+
+    let holder = document.querySelector(".player-holder");
+    let browser = document.getElementById("browser");
+    browser.remove();
+
+    browser.setAttribute("nodefaultsrc", "true");
+
+    this.setupTooltip("close", "pictureinpicture-close-btn", "closeShortcut");
+    let strId = this.isFullscreen
+      ? `pictureinpicture-exit-fullscreen-btn2`
+      : `pictureinpicture-fullscreen-btn2`;
+    this.setupTooltip("fullscreen", strId, "fullscreenToggleShortcut");
+
+    browser.setAttribute("remoteType", wgp.domProcess.remoteType);
+    browser.setAttribute(
+      "initialBrowsingContextGroupId",
+      wgp.browsingContext.group.id
+    );
+    holder.appendChild(browser);
+
+    const initDimension = {
+      width: window.innerWidth,
+      height: window.innerHeight,
+    };
+
+    this.actor =
+      browser.browsingContext.currentWindowGlobal.getActor("PictureInPicture");
+    const setupPromise = this.actor.sendQuery("PictureInPicture:SetupPlayer", {
+      videoRef,
+      isPipApiRequest,
+      initDimension,
+    });
+
+    PictureInPicture.weakPipToWin.set(this.actor, window);
+
+    for (let eventType of this.WINDOW_EVENTS) {
+      addEventListener(eventType, this);
+    }
+
+    this.controls.addEventListener("mouseleave", () => {
+      this.onMouseLeave();
+    });
+    this.controls.addEventListener("mouseenter", () => {
+      this.onMouseEnter();
+    });
+
+    this.scrubber.addEventListener("input", event => {
+      this.handleScrubbing(event);
+    });
+    this.scrubber.addEventListener("change", event => {
+      this.handleScrubbingDone(event);
+    });
+
+    this.audioScrubber.addEventListener("input", event => {
+      this.audioScrubbing = true;
+      this.handleAudioScrubbing(event.target.value);
+    });
+    this.audioScrubber.addEventListener("change", () => {
+      this.audioScrubbing = false;
+    });
+    this.audioScrubber.addEventListener("pointerdown", () => {
+      if (this.isMuted) {
+        this.audioScrubber.max = 1;
+      }
+    });
+
+    for (let radio of document.querySelectorAll(
+      'input[type=radio][name="cc-size"]'
+    )) {
+      radio.addEventListener("change", event => {
+        this.onSubtitleChange(event.target.id);
+      });
+    }
+
+    document
+      .querySelector("#subtitles-toggle")
+      .addEventListener("change", () => {
+        this.onToggleChange();
+      });
+
+    browser.addEventListener("oop-browser-crashed", this);
+
+    this.revealControls(false);
+
+    if (Services.prefs.getBoolPref(AUDIO_TOGGLE_ENABLED_PREF, false)) {
+      const audioButton = document.getElementById("audio");
+      audioButton.hidden = false;
+
+      const audioScrubber = document.getElementById("audio-scrubber");
+      audioScrubber.hidden = false;
+    }
+
+    if (Services.prefs.getBoolPref(CAPTIONS_ENABLED_PREF, false)) {
+      this.closedCaptionButton.hidden = false;
+    }
+
+    if (Services.prefs.getBoolPref(IMPROVED_CONTROLS_ENABLED_PREF, false)) {
+      const fullscreenButton = document.getElementById("fullscreen");
+      fullscreenButton.hidden = false;
+
+      const seekBackwardButton = document.getElementById("seekBackward");
+      seekBackwardButton.hidden = false;
+
+      const seekForwardButton = document.getElementById("seekForward");
+      seekForwardButton.hidden = false;
+
+      this.scrubber.hidden = false;
+      this.timestamp.hidden = false;
+
+      const controlsBottomGradient = document.getElementById(
+        "controls-bottom-gradient"
+      );
+      controlsBottomGradient.hidden = false;
+    }
+
+    this.alignEndControlsButtonTooltips();
+
+    this.resizeDebouncer = new DeferredTask(() => {
+      this.alignEndControlsButtonTooltips();
+      this.recordEvent("resize", {
+        width: window.outerWidth,
+        height: window.outerHeight,
+      });
+    }, RESIZE_DEBOUNCE_RATE_MS);
+
+    this.computeAndSetMinimumSize(window.outerWidth, window.outerHeight);
+
+    if (autoFocus) {
+      window.requestAnimationFrame(() => {
+        window.focus();
+      });
+    }
+
+    let fontSize = Services.prefs.getCharPref(
+      TEXT_TRACK_FONT_SIZE_PREF,
+      "medium"
+    );
+
+    if (fontSize === "small" || fontSize === "large") {
+      document.querySelector(`#${fontSize}`).checked = "true";
+    } else {
+      document.querySelector("#medium").checked = "true";
+    }
+
+    if (Services.prefs.getBoolPref(SEETHROUGH_MODE_ENABLED_PREF, false)) {
+      document.documentElement.classList.add("seethrough-mode");
+    }
+
+    this._isInitialized = true;
+
+    return { actor: this.actor, setupPromise };
+  },
+
+  uninit() {
+    this.resizeDebouncer.disarm();
+    PictureInPicture.unload(window, this.actor);
+  },
+
+  setupTooltip(elId, l10nId, shortcutId) {
+    const el = document.getElementById(elId);
+    const shortcut = document.getElementById(shortcutId);
+    let l10nObj = shortcut
+      ? { shortcut: ShortcutUtils.prettifyShortcut(shortcut) }
+      : {};
+    document.l10n.setAttributes(el, l10nId, l10nObj);
+  },
+
+  handleEvent(event) {
+    switch (event.type) {
+      case "click": {
+        if (event.button !== 1 && event.button !== 2) {
+          this.onClick(event);
+          this.controls.removeAttribute(KEYING_ATTRIBUTE);
+        }
+        break;
+      }
+
+      case "command":
+        switch (event.target.id) {
+          case "View:PictureInPicture":
+            this.onCommand(event);
+            break;
+          case "View:Fullscreen":
+            this.fullscreenModeToggle(event);
+            break;
+        }
+        break;
+
+      case "contextmenu": {
+        event.preventDefault();
+        break;
+      }
+
+      case "dblclick": {
+        this.onDblClick(event);
+        break;
+      }
+
+      case "keydown": {
+        if (event.keyCode == KeyEvent.DOM_VK_TAB) {
+          this.controls.setAttribute(KEYING_ATTRIBUTE, true);
+          this.showVideoControls();
+        } else if (event.keyCode == KeyEvent.DOM_VK_ESCAPE) {
+          let isSettingsPanelInFocus = this.settingsPanel.contains(
+            document.activeElement
+          );
+
+          event.preventDefault();
+
+          if (!this.settingsPanel.classList.contains("hide")) {
+            this.toggleSubtitlesSettingsPanel({ forceHide: true });
+            if (isSettingsPanelInFocus) {
+              document.getElementById("closed-caption").focus();
+            }
+          } else if (this.isFullscreen) {
+            document.exitFullscreen();
+          } else {
+            this.onClose(this.isUnpipWithoutPauseShortcut(event));
+          }
+        } else if (
+          Services.prefs.getBoolPref(KEYBOARD_CONTROLS_ENABLED_PREF, false) &&
+          (event.keyCode != KeyEvent.DOM_VK_SPACE || !event.target.id)
+        ) {
+          this.onKeyDown(event);
+        }
+
+        break;
+      }
+
+      case "mouseup": {
+        this.onMouseUp(event);
+        break;
+      }
+
+      case "mousemove": {
+        this.onMouseMove();
+        break;
+      }
+
+      case "MozDOMFullscreen:Entered":
+      case "MozDOMFullscreen:Exited": {
+        let { lastTransactionId } = window.windowUtils;
+        window.addEventListener("MozAfterPaint", function onPainted(event) {
+          if (event.transactionId > lastTransactionId) {
+            window.removeEventListener("MozAfterPaint", onPainted);
+            Services.obs.notifyObservers(window, "fullscreen-painted");
+          }
+        });
+
+        if (this.deferredResize && event.type === "MozDOMFullscreen:Exited") {
+          this.resizeToVideo(this.deferredResize);
+          this.deferredResize = null;
+        }
+
+        let strId = this.isFullscreen
+          ? `pictureinpicture-exit-fullscreen-btn2`
+          : `pictureinpicture-fullscreen-btn2`;
+        this.setupTooltip("fullscreen", strId, "fullscreenToggleShortcut");
+
+        window.focus();
+
+        if (this.isFullscreen) {
+          this.actor.sendAsyncMessage("PictureInPicture:EnterFullscreen", {
+            isFullscreen: true,
+            isVideoControlsShowing: null,
+            playerBottomControlsDOMRect: null,
+          });
+        } else {
+          this.actor.sendAsyncMessage("PictureInPicture:ExitFullscreen", {
+            isFullscreen: this.isFullscreen,
+            isVideoControlsShowing:
+              this.controls.hasAttribute(SHOWING_ATTRIBUTE) ||
+              this.controls.hasAttribute(KEYING_ATTRIBUTE),
+            playerBottomControlsDOMRect:
+              this.controlsBottom.getBoundingClientRect(),
+          });
+        }
+        let selection = window.getSelection();
+        selection.removeAllRanges();
+        break;
+      }
+
+      case "oop-browser-crashed": {
+        this.closePipWindow({ reason: "BrowserCrash" });
+        break;
+      }
+
+      case "resize": {
+        this.onResize(event);
+        break;
+      }
+
+      case "unload": {
+        this.uninit();
+        break;
+      }
+
+      case "draggableregionleftmousedown": {
+        this.toggleSubtitlesSettingsPanel({ forceHide: true });
+        break;
+      }
+    }
+  },
+
+  handleScrubbing(event) {
+    if (this.preventNextInputEvent) {
+      this.preventNextInputEvent = false;
+      return;
+    }
+    if (!this.scrubbing) {
+      this.wasPlaying = this.isPlaying;
+      if (this.isPlaying) {
+        this.actor.sendAsyncMessage("PictureInPicture:Pause");
+      }
+      this.scrubbing = true;
+    }
+    let scrubberPosition = this.getScrubberPositionFromEvent(event);
+    this.setVideoTime(scrubberPosition);
+  },
+
+  handleScrubbingDone(event) {
+    if (!this.scrubbing) {
+      return;
+    }
+    let scrubberPosition = this.getScrubberPositionFromEvent(event);
+    this.setVideoTime(scrubberPosition);
+    if (this.wasPlaying) {
+      this.actor.sendAsyncMessage("PictureInPicture:Play");
+    }
+    this.scrubbing = false;
+  },
+
+  handleAudioScrubbing(volume) {
+    if (this.preventNextInputEvent) {
+      this.preventNextInputEvent = false;
+      return;
+    }
+
+    if (this.isMuted) {
+      this.isMuted = false;
+      this.actor.sendAsyncMessage("PictureInPicture:Unmute");
+    }
+
+    if (volume == 0) {
+      this.actor.sendAsyncMessage("PictureInPicture:Mute");
+    }
+
+    this.actor.sendAsyncMessage("PictureInPicture:SetVolume", {
+      volume,
+    });
+  },
+
+  getScrubberPositionFromEvent(event) {
+    return event.target.value;
+  },
+
+  setVideoTime(scrubberPosition) {
+    let wasPlaying = this.scrubbing ? this.wasPlaying : this.isPlaying;
+    this.setScrubberPosition(scrubberPosition);
+    this.actor.sendAsyncMessage("PictureInPicture:SetVideoTime", {
+      scrubberPosition,
+      wasPlaying,
+    });
+  },
+
+  setScrubberPosition(value) {
+    this.scrubber.value = value;
+    this.scrubber.hidden = value === undefined;
+
+    this.seekBackward.hidden = value === undefined;
+    this.seekForward.hidden = value === undefined;
+  },
+
+  setTimestamp(timestamp) {
+    this.timestamp.textContent = timestamp;
+    this.timestamp.hidden = timestamp === undefined;
+  },
+
+  setVolume(volume) {
+    if (volume < Number.EPSILON) {
+      this.actor.sendAsyncMessage("PictureInPicture:Mute");
+    }
+
+    this.audioScrubber.value = volume;
+  },
+
+  closePipWindow(closeData) {
+    Services.prefs.setBoolPref(
+      CAPTIONS_TOGGLE_ENABLED_PREF,
+      document.querySelector("#subtitles-toggle").checked
+    );
+    for (let radio of document.querySelectorAll(
+      'input[type=radio][name="cc-size"]'
+    )) {
+      if (radio.checked) {
+        Services.prefs.setCharPref(TEXT_TRACK_FONT_SIZE_PREF, radio.id);
+        break;
+      }
+    }
+    const { reason } = closeData;
+    PictureInPicture.closeSinglePipWindow({ reason, actorRef: this.actor });
+  },
+
+  onDblClick(event) {
+    if (event.target.id == "controls") {
+      this.fullscreenModeToggle();
+      event.preventDefault();
+    }
+  },
+
+  onClick(event) {
+    switch (event.target.id) {
+      case "audio": {
+        this.toggleMute();
+        break;
+      }
+
+      case "close": {
+        this.onClose(this.isUnpipWithoutPauseShortcut(event));
+        break;
+      }
+
+      case "playpause": {
+        if (!this.isPlaying) {
+          this.actor.sendAsyncMessage("PictureInPicture:Play");
+          this.revealControls(false);
+        } else {
+          this.actor.sendAsyncMessage("PictureInPicture:Pause");
+          this.revealControls(true);
+        }
+
+        break;
+      }
+
+      case "seekBackward": {
+        this.actor.sendAsyncMessage("PictureInPicture:SeekBackward");
+        break;
+      }
+
+      case "seekForward": {
+        this.actor.sendAsyncMessage("PictureInPicture:SeekForward");
+        break;
+      }
+
+      case "unpip": {
+        PictureInPicture.focusTabAndClosePip(window, this.actor);
+        break;
+      }
+
+      case "closed-caption": {
+        let options = {};
+        if (event.inputSource == MouseEvent.MOZ_SOURCE_KEYBOARD) {
+          options.isKeyboard = true;
+        }
+        this.toggleSubtitlesSettingsPanel(options);
+        return;
+      }
+
+      case "fullscreen": {
+        this.fullscreenModeToggle();
+        this.recordEvent("fullscreen", {
+          enter: !this.isFullscreen,
+        });
+        break;
+      }
+
+      case "font-size-selection-radio-small": {
+        document.getElementById("small").click();
+        break;
+      }
+
+      case "font-size-selection-radio-medium": {
+        document.getElementById("medium").click();
+        break;
+      }
+
+      case "font-size-selection-radio-large": {
+        document.getElementById("large").click();
+        break;
+      }
+    }
+    if (!this.settingsPanel.contains(event.target)) {
+      this.toggleSubtitlesSettingsPanel({ forceHide: true });
+    }
+  },
+
+  toggleSubtitlesSettingsPanel(options) {
+    let settingsPanelVisible = !this.settingsPanel.classList.contains("hide");
+    if (options?.forceHide || settingsPanelVisible) {
+      this.settingsPanel.classList.add("hide");
+      this.closedCaptionButton.setAttribute("aria-expanded", false);
+      this.controls.removeAttribute(DONTHIDE_ATTRIBUTE);
+
+      if (
+        this.controls.hasAttribute(KEYING_ATTRIBUTE) ||
+        this.isCurrentHover ||
+        this.controls.hasAttribute(SHOWING_ATTRIBUTE)
+      ) {
+        return;
+      }
+
+      this.hideVideoControls();
+    } else {
+      this.settingsPanel.classList.remove("hide");
+      this.closedCaptionButton.setAttribute("aria-expanded", true);
+      this.controls.setAttribute(DONTHIDE_ATTRIBUTE, true);
+      this.showVideoControls();
+
+      if (options?.isKeyboard) {
+        document.querySelector("#subtitles-toggle").focus();
+      }
+    }
+  },
+
+  onClose(bypassPause = false) {
+    if (!bypassPause) {
+      this.actor.sendAsyncMessage("PictureInPicture:Pause", {
+        reason: "pip-closed",
+      });
+    }
+
+    this.closePipWindow({ reason: "CloseButton" });
+  },
+
+  closeFromForeground() {
+    PictureInPicture.closeSinglePipWindow({
+      reason: "Foregrounded",
+      actorRef: this.actor,
+    });
+  },
+
+  fullscreenModeToggle() {
+    if (this.isFullscreen) {
+      document.exitFullscreen();
+    } else {
+      this.deferredResize = {
+        left: window.screenX,
+        top: window.screenY,
+        width: window.outerWidth,
+        height: window.outerHeight,
+      };
+      document.body.requestFullscreen();
+    }
+  },
+
+  toggleMute() {
+    if (this.isMuted) {
+      this.audioScrubber.max = 1;
+      this.handleAudioScrubbing(this.lastVolume ?? 1);
+    } else {
+      this.lastVolume = this.audioScrubber.value;
+      this.actor.sendAsyncMessage("PictureInPicture:Mute");
+    }
+  },
+
+  resizeToVideo(rect) {
+    if (this.isFullscreen) {
+      this.deferredResize = rect;
+    } else {
+      let { left, top, width, height } = rect;
+      window.resizeTo(width, height);
+      window.moveTo(left, top);
+    }
+  },
+
+  onKeyDown(event) {
+    if (
+      event.target.parentElement?.parentElement?.classList?.contains(
+        "font-size-selection"
+      )
+    ) {
+      return;
+    }
+
+    let eventKeys = {
+      altKey: event.altKey,
+      shiftKey: event.shiftKey,
+      metaKey: event.metaKey,
+      ctrlKey: event.ctrlKey,
+      keyCode: event.keyCode,
+    };
+
+    if (
+      event.target.id === "scrubber" &&
+      event.keyCode === window.KeyEvent.DOM_VK_UP
+    ) {
+      eventKeys.keyCode = window.KeyEvent.DOM_VK_RIGHT;
+    } else if (
+      event.target.id === "scrubber" &&
+      event.keyCode === window.KeyEvent.DOM_VK_DOWN
+    ) {
+      eventKeys.keyCode = window.KeyEvent.DOM_VK_LEFT;
+    }
+
+    if (
+      event.target.id === "audio-scrubber" &&
+      event.keyCode === window.KeyEvent.DOM_VK_RIGHT
+    ) {
+      eventKeys.keyCode = window.KeyEvent.DOM_VK_UP;
+    } else if (
+      event.target.id === "audio-scrubber" &&
+      event.keyCode === window.KeyEvent.DOM_VK_LEFT
+    ) {
+      eventKeys.keyCode = window.KeyEvent.DOM_VK_DOWN;
+    }
+
+    if (
+      event.target.id === "audio-scrubber" ||
+      (event.target.id === "scrubber" &&
+        [
+          window.KeyEvent.DOM_VK_LEFT,
+          window.KeyEvent.DOM_VK_RIGHT,
+          window.KeyEvent.DOM_VK_UP,
+          window.KeyEvent.DOM_VK_DOWN,
+        ].includes(event.keyCode))
+    ) {
+      this.preventNextInputEvent = true;
+    }
+
+    this.actor.sendAsyncMessage("PictureInPicture:KeyDown", eventKeys);
+  },
+
+  onSubtitleChange(size) {
+    Services.prefs.setCharPref(TEXT_TRACK_FONT_SIZE_PREF, size);
+
+    this.actor.sendAsyncMessage("PictureInPicture:ChangeFontSizeTextTracks");
+  },
+
+  onToggleChange() {
+    document
+      .querySelector(".font-size-selection")
+      .classList.toggle("font-size-overlay");
+    this.actor.sendAsyncMessage("PictureInPicture:ToggleTextTracks");
+
+    this.captionsToggleEnabled = !this.captionsToggleEnabled;
+    Services.prefs.setBoolPref(
+      CAPTIONS_TOGGLE_ENABLED_PREF,
+      this.captionsToggleEnabled
+    );
+  },
+
+  determineCurrentQuadrant() {
+    let windowCenterX = window.screenX + window.outerWidth / 2;
+    let windowCenterY = window.screenY + window.outerHeight / 2;
+    let quadrant = null;
+    let halfWidth = window.screen.availLeft + window.screen.availWidth / 2;
+    let halfHeight = window.screen.availTop + window.screen.availHeight / 2;
+
+    let leftHalf = windowCenterX < halfWidth;
+    let rightHalf = windowCenterX > halfWidth;
+    let topHalf = windowCenterY < halfHeight;
+    let bottomHalf = windowCenterY > halfHeight;
+
+    if (leftHalf && topHalf) {
+      quadrant = TOP_LEFT_QUADRANT;
+    } else if (rightHalf && topHalf) {
+      quadrant = TOP_RIGHT_QUADRANT;
+    } else if (leftHalf && bottomHalf) {
+      quadrant = BOTTOM_LEFT_QUADRANT;
+    } else if (rightHalf && bottomHalf) {
+      quadrant = BOTTOM_RIGHT_QUADRANT;
+    }
+    return quadrant;
+  },
+
+  moveToTopRight() {
+    window.moveTo(
+      window.screen.availLeft + window.screen.availWidth - window.innerWidth,
+      window.screen.availTop
+    );
+  },
+
+  moveToTopLeft() {
+    window.moveTo(window.screen.availLeft, window.screen.availTop);
+  },
+
+  moveToBottomRight() {
+    window.moveTo(
+      window.screen.availLeft + window.screen.availWidth - window.innerWidth,
+      window.screen.availTop + window.screen.availHeight - window.innerHeight
+    );
+  },
+
+  moveToBottomLeft() {
+    window.moveTo(
+      window.screen.availLeft,
+      window.screen.availTop + window.screen.availHeight - window.innerHeight
+    );
+  },
+
+  determineDirectionDragged() {
+    let deltaX = this.oldMouseUpWindowX - window.screenX;
+    let deltaY = this.oldMouseUpWindowY - window.screenY;
+    let dragDirection = "";
+
+    if (Math.abs(deltaX) > Math.abs(deltaY) && deltaX < 0) {
+      dragDirection = "draggedRight";
+    } else if (Math.abs(deltaX) > Math.abs(deltaY) && deltaX > 0) {
+      dragDirection = "draggedLeft";
+    } else if (Math.abs(deltaX) < Math.abs(deltaY) && deltaY < 0) {
+      dragDirection = "draggedDown";
+    } else if (Math.abs(deltaX) < Math.abs(deltaY) && deltaY > 0) {
+      dragDirection = "draggedUp";
+    }
+    return dragDirection;
+  },
+
+  onMouseUp(event) {
+    let quadrant = this.determineCurrentQuadrant();
+    let dragAction = this.determineDirectionDragged();
+
+    if (
+      ((event.ctrlKey && AppConstants.platform !== "macosx") ||
+        (event.metaKey && AppConstants.platform === "macosx")) &&
+      dragAction
+    ) {
+      switch (quadrant) {
+        case TOP_RIGHT_QUADRANT:
+          switch (dragAction) {
+            case "draggedRight":
+              this.moveToTopRight();
+              break;
+            case "draggedLeft":
+              this.moveToTopLeft();
+              break;
+            case "draggedDown":
+              this.moveToBottomRight();
+              break;
+            case "draggedUp":
+              this.moveToTopRight();
+              break;
+          }
+          break;
+        case TOP_LEFT_QUADRANT:
+          switch (dragAction) {
+            case "draggedRight":
+              this.moveToTopRight();
+              break;
+            case "draggedLeft":
+              this.moveToTopLeft();
+              break;
+            case "draggedDown":
+              this.moveToBottomLeft();
+              break;
+            case "draggedUp":
+              this.moveToTopLeft();
+              break;
+          }
+          break;
+        case BOTTOM_LEFT_QUADRANT:
+          switch (dragAction) {
+            case "draggedRight":
+              this.moveToBottomRight();
+              break;
+            case "draggedLeft":
+              this.moveToBottomLeft();
+              break;
+            case "draggedDown":
+              this.moveToBottomLeft();
+              break;
+            case "draggedUp":
+              this.moveToTopLeft();
+              break;
+          }
+          break;
+        case BOTTOM_RIGHT_QUADRANT:
+          switch (dragAction) {
+            case "draggedRight":
+              this.moveToBottomRight();
+              break;
+            case "draggedLeft":
+              this.moveToBottomLeft();
+              break;
+            case "draggedDown":
+              this.moveToBottomRight();
+              break;
+            case "draggedUp":
+              this.moveToTopRight();
+              break;
+          }
+          break;
+      } 
+    } 
+    this.oldMouseUpWindowX = window.screenX;
+    this.oldMouseUpWindowY = window.screenY;
+  },
+
+  onMouseMove() {
+    if (this.isFullscreen) {
+      this.revealControls(false);
+    }
+  },
+
+  onMouseEnter() {
+    if (!this.isFullscreen) {
+      this.isCurrentHover = true;
+      this.showVideoControls();
+    }
+  },
+
+  onMouseLeave() {
+    if (!this.isFullscreen) {
+      this.isCurrentHover = false;
+      if (
+        !this.controls.hasAttribute(SHOWING_ATTRIBUTE) &&
+        !this.controls.hasAttribute(KEYING_ATTRIBUTE) &&
+        !this.controls.hasAttribute(DONTHIDE_ATTRIBUTE)
+      ) {
+        this.hideVideoControls();
+      }
+    }
+  },
+
+  enableSubtitlesButton() {
+    this.closedCaptionButton.disabled = false;
+
+    this.alignEndControlsButtonTooltips();
+    this.captionsToggleEnabled = true;
+    if (!Services.prefs.getBoolPref(CAPTIONS_TOGGLE_ENABLED_PREF, true)) {
+      document.querySelector("#subtitles-toggle").click();
+    }
+  },
+
+  disableSubtitlesButton() {
+    this.closedCaptionButton.disabled = true;
+
+    this.alignEndControlsButtonTooltips();
+  },
+
+  alignEndControlsButtonTooltips() {
+    let audioBtn = document.getElementById("audio");
+    let width = window.outerWidth;
+
+    if (300 < width && width <= 400) {
+      audioBtn.classList.replace("center-tooltip", "inline-end-tooltip");
+    } else {
+      audioBtn.classList.replace("inline-end-tooltip", "center-tooltip");
+    }
+  },
+
+  onResize() {
+    this.toggleSubtitlesSettingsPanel({ forceHide: true });
+    this.resizeDebouncer.disarm();
+    this.resizeDebouncer.arm();
+  },
+
+  onCommand() {
+    this.closePipWindow({ reason: "Shortcut" });
+  },
+
+  get controls() {
+    delete this.controls;
+    return (this.controls = document.getElementById("controls"));
+  },
+
+  get scrubber() {
+    delete this.scrubber;
+    return (this.scrubber = document.getElementById("scrubber"));
+  },
+
+  get audioScrubber() {
+    delete this.audioScrubber;
+    return (this.audioScrubber = document.getElementById("audio-scrubber"));
+  },
+
+  get timestamp() {
+    delete this.timestamp;
+    return (this.timestamp = document.getElementById("timestamp"));
+  },
+
+  get controlsBottom() {
+    delete this.controlsBottom;
+    return (this.controlsBottom = document.getElementById("controls-bottom"));
+  },
+
+  get seekBackward() {
+    delete this.seekBackward;
+    return (this.seekBackward = document.getElementById("seekBackward"));
+  },
+
+  get seekForward() {
+    delete this.seekForward;
+    return (this.seekForward = document.getElementById("seekForward"));
+  },
+
+  get closedCaptionButton() {
+    delete this.closedCaptionButton;
+    return (this.closedCaptionButton =
+      document.getElementById("closed-caption"));
+  },
+
+  get settingsPanel() {
+    delete this.settingsPanel;
+    return (this.settingsPanel = document.getElementById("settings"));
+  },
+
+  _isPlaying: false,
+  get isPlaying() {
+    return this._isPlaying;
+  },
+
+  set isPlaying(isPlaying) {
+    this._isPlaying = isPlaying;
+    this.controls.classList.toggle("playing", isPlaying);
+    let strId = isPlaying
+      ? `pictureinpicture-pause-btn`
+      : `pictureinpicture-play-btn`;
+    this.setupTooltip("playpause", strId);
+
+    if (
+      !this._isInitialized ||
+      (!this.isFullscreen && this.isCurrentHover) ||
+      this.controls.hasAttribute(KEYING_ATTRIBUTE)
+    ) {
+      return;
+    }
+
+    if (!isPlaying) {
+      this.revealControls(true);
+    } else {
+      this.revealControls(false);
+    }
+  },
+
+  _isMuted: false,
+  get isMuted() {
+    return this._isMuted;
+  },
+
+  set isMuted(isMuted) {
+    this._isMuted = isMuted;
+    if (!isMuted) {
+      this.audioScrubber.max = 1;
+    } else if (!this.audioScrubbing) {
+      this.audioScrubber.max = 0;
+    }
+    this.controls.classList.toggle("muted", isMuted);
+    let strId = isMuted
+      ? `pictureinpicture-unmute-btn`
+      : `pictureinpicture-mute-btn`;
+    let shortcutId = isMuted ? "unMuteShortcut" : "muteShortcut";
+    this.setupTooltip("audio", strId, shortcutId);
+  },
+
+  get isFullscreen() {
+    return document.fullscreenElement == document.body;
+  },
+
+  recordEvent(type, args) {
+    args.value = this.id;
+  },
+
+  showVideoControls() {
+    this.actor.sendAsyncMessage("PictureInPicture:ShowVideoControls", {
+      isFullscreen: this.isFullscreen,
+      isVideoControlsShowing: true,
+      playerBottomControlsDOMRect: this.controlsBottom.getBoundingClientRect(),
+      isScrubberShowing: !!this.scrubber.offsetParent,
+    });
+  },
+
+  hideVideoControls() {
+    this.actor.sendAsyncMessage("PictureInPicture:HideVideoControls", {
+      isFullscreen: this.isFullscreen,
+      isVideoControlsShowing: false,
+      playerBottomControlsDOMRect: null,
+    });
+  },
+
+  revealControls(revealIndefinitely) {
+    clearTimeout(this.showingTimeout);
+    this.showingTimeout = null;
+
+    this.controls.setAttribute(SHOWING_ATTRIBUTE, true);
+
+    if (!this.isFullscreen) {
+      this.showVideoControls();
+    }
+
+    if (!revealIndefinitely) {
+      this.showingTimeout = setTimeout(() => {
+        const isHoverOverControlItem = this.controls.querySelector(
+          ".control-item:hover"
+        );
+        if (this.isFullscreen && isHoverOverControlItem) {
+          return;
+        }
+        this.controls.removeAttribute(SHOWING_ATTRIBUTE);
+
+        if (
+          !this.isFullscreen &&
+          !this.isCurrentHover &&
+          !this.controls.hasAttribute(KEYING_ATTRIBUTE) &&
+          !this.controls.hasAttribute(DONTHIDE_ATTRIBUTE)
+        ) {
+          this.hideVideoControls();
+        }
+      }, CONTROLS_FADE_TIMEOUT_MS);
+    }
+  },
+
+  computeAndSetMinimumSize(width, height) {
+    if (!AppConstants.MOZ_WIDGET_GTK) {
+      return;
+    }
+
+    const MIN_WIDTH = 120;
+    const MIN_HEIGHT = 80;
+
+    let resultWidth = width;
+    let resultHeight = height;
+    let aspectRatio = width / height;
+
+    if (width < height) {
+      resultWidth = MIN_WIDTH;
+      resultHeight = Math.round(MIN_WIDTH / aspectRatio);
+    } else {
+      resultHeight = MIN_HEIGHT;
+      resultWidth = Math.round(MIN_HEIGHT * aspectRatio);
+    }
+
+    document.documentElement.style.minWidth = resultWidth + "px";
+    document.documentElement.style.minHeight = resultHeight + "px";
+  },
+};

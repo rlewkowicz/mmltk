@@ -1,0 +1,96 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "jit/IonOptimizationLevels.h"
+
+#include "jit/Ion.h"
+#include "jit/JitHints.h"
+#include "jit/JitRuntime.h"
+#include "js/Prefs.h"
+#include "vm/JSScript.h"
+
+#include "vm/JSScript-inl.h"
+
+using namespace js;
+using namespace js::jit;
+
+namespace js {
+namespace jit {
+
+uint32_t OptimizationInfo::baseWarmUpThresholdForScript(JSContext* cx,
+                                                        JSScript* script) {
+  if (MOZ_LIKELY(cx->runtime()->hasJitRuntime()) &&
+      cx->runtime()->jitRuntime()->hasJitHintsMap()) {
+    JitHintsMap* jitHints = cx->runtime()->jitRuntime()->getJitHintsMap();
+    uint32_t hintThreshold;
+    if (jitHints->getIonThresholdHint(script, hintThreshold)) {
+      return hintThreshold;
+    }
+  }
+  return JitOptions.normalIonWarmUpThreshold;
+}
+
+uint32_t OptimizationInfo::warmUpThresholdForPC(JSScript* script,
+                                                jsbytecode* pc,
+                                                uint32_t baseThreshold) {
+  MOZ_ASSERT(pc == nullptr || pc == script->code() ||
+             JSOp(*pc) == JSOp::LoopHead);
+
+  MOZ_ASSERT_IF(pc && JSOp(*pc) == JSOp::LoopHead, pc > script->code());
+
+  uint32_t warmUpThreshold = baseThreshold;
+
+  if (pc == script->code()) {
+    pc = nullptr;
+  }
+
+
+  if (script->length() > JitOptions.ionMaxScriptSizeMainThread) {
+    warmUpThreshold *=
+        (script->length() / double(JitOptions.ionMaxScriptSizeMainThread));
+  }
+
+  uint32_t numLocalsAndArgs = NumLocalsAndArgs(script);
+  if (numLocalsAndArgs > JitOptions.ionMaxLocalsAndArgsMainThread) {
+    warmUpThreshold *=
+        (numLocalsAndArgs / double(JitOptions.ionMaxLocalsAndArgsMainThread));
+  }
+
+  if (!pc || JitOptions.eagerIonCompilation()) {
+    return warmUpThreshold;
+  }
+
+  uint32_t loopDepth = LoopHeadDepthHint(pc);
+  MOZ_ASSERT(loopDepth > 0);
+  return warmUpThreshold + loopDepth * (baseThreshold / 10);
+}
+
+OptimizationLevel OptimizationLevelInfo::levelForScript(JSContext* cx,
+                                                        JSScript* script,
+                                                        jsbytecode* pc) const {
+  uint32_t baseThreshold =
+      OptimizationInfo::baseWarmUpThresholdForScript(cx, script);
+  if (script->getWarmUpCount() <
+      OptimizationInfo::warmUpThresholdForPC(script, pc, baseThreshold)) {
+    return OptimizationLevel::DontCompile;
+  }
+
+  return OptimizationLevel::Normal;
+}
+
+IonRegisterAllocator OptimizationInfo::registerAllocator() const {
+  switch (JS::Prefs::ion_regalloc()) {
+    case 0:
+    default:
+      return registerAllocator_;
+    case 1:
+      return RegisterAllocator_Backtracking;
+    case 2:
+      return RegisterAllocator_Simple;
+  }
+  MOZ_CRASH("Unreachable");
+}
+
+}  
+}  

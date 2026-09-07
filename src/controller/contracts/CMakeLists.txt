@@ -1,0 +1,85 @@
+include(MmltkComponent)
+
+add_library(mmltk_controller_application_boundary INTERFACE)
+add_library(mmltk::controller::application_boundary ALIAS
+    mmltk_controller_application_boundary)
+mmltk_register_public_headers(
+    mmltk_controller_application_boundary
+    BASE_DIRS ${CMAKE_SOURCE_DIR}
+    FILES
+        application_boundary.h
+        visual_source.h)
+target_link_libraries(mmltk_controller_application_boundary INTERFACE
+    mmltk::frameworks::reflection)
+
+add_library(mmltk_controller_application_systems_projection INTERFACE)
+add_library(mmltk::controller::application_systems_projection ALIAS
+    mmltk_controller_application_systems_projection)
+mmltk_register_public_headers(
+    mmltk_controller_application_systems_projection
+    BASE_DIRS ${CMAKE_SOURCE_DIR}
+    FILES application_systems.h)
+target_link_libraries(mmltk_controller_application_systems_projection INTERFACE
+    mmltk::controller::application_boundary
+    mmltk::frameworks::reflection
+    mmltk::frameworks::serialization)
+target_include_directories(
+    mmltk_controller_application_systems_projection SYSTEM INTERFACE
+    ${CUDAToolkit_INCLUDE_DIRS})
+
+add_library(mmltk_controller_contracts STATIC)
+add_library(mmltk::controller::contracts ALIAS mmltk_controller_contracts)
+mmltk_configure_component(mmltk_controller_contracts PUBLIC_DECLARATIONS)
+
+mmltk_register_public_headers(
+    mmltk_controller_contracts
+    BASE_DIRS ${CMAKE_SOURCE_DIR}
+    FILES
+        annotation.h
+        artifact.h
+        artifact_catalog.h
+        compute.h
+        default_state.h
+        diagnostic_context.h
+        explore_filter.h
+        gui_settings.h
+        gui_settings_mutation.h
+        gui_settings_states.h
+        model.h
+        model_selection.h
+        model_selection_types.h
+        provider.h
+        settings.h
+        settings_commands.h
+        settings_vocabulary.h
+        terminal_presentation.h
+        view_state.h
+        workflows.h
+        workspace.h)
+
+mmltk_register_ordinary_sources(
+    mmltk_controller_contracts
+    annotation_serialization.cpp
+    gui_settings_mutation.cpp
+    gui_settings_states.cpp
+)
+mmltk_register_retained_module_importers(
+    mmltk_controller_contracts
+    gui_settings.cpp)
+target_include_directories(mmltk_controller_contracts PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+)
+target_link_libraries(mmltk_controller_contracts
+    PUBLIC
+        mmltk::backend::data
+        mmltk::controller::application_boundary
+        mmltk::backend::models::catalog
+        mmltk::backend::models::rfdetr::contract
+        mmltk::common::types
+        mmltk::frameworks::reflection
+    PRIVATE
+        mmltk::common::io
+        mmltk::common::logging
+        mmltk::frameworks::serialization
+        nlohmann_json
+)

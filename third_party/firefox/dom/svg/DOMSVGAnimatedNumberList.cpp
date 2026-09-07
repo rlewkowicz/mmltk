@@ -1,0 +1,108 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "DOMSVGAnimatedNumberList.h"
+
+#include "DOMSVGNumberList.h"
+#include "SVGAnimatedNumberList.h"
+#include "SVGAttrTearoffTable.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/SVGAnimatedNumberListBinding.h"
+#include "mozilla/dom/SVGElement.h"
+
+
+namespace mozilla::dom {
+
+static inline SVGAttrTearoffTable<SVGAnimatedNumberList,
+                                  DOMSVGAnimatedNumberList>&
+SVGAnimatedNumberListTearoffTable() {
+  static SVGAttrTearoffTable<SVGAnimatedNumberList, DOMSVGAnimatedNumberList>
+      sSVGAnimatedNumberListTearoffTable;
+  return sSVGAnimatedNumberListTearoffTable;
+}
+
+NS_SVG_VAL_IMPL_CYCLE_COLLECTION_WRAPPERCACHED(DOMSVGAnimatedNumberList,
+                                               mElement)
+
+JSObject* DOMSVGAnimatedNumberList::WrapObject(
+    JSContext* aCx, JS::Handle<JSObject*> aGivenProto) {
+  return mozilla::dom::SVGAnimatedNumberList_Binding::Wrap(aCx, this,
+                                                           aGivenProto);
+}
+
+already_AddRefed<DOMSVGNumberList> DOMSVGAnimatedNumberList::BaseVal() {
+  if (!mBaseVal) {
+    mBaseVal = new DOMSVGNumberList(this, InternalAList().GetBaseValue());
+  }
+  RefPtr<DOMSVGNumberList> baseVal = mBaseVal;
+  return baseVal.forget();
+}
+
+already_AddRefed<DOMSVGNumberList> DOMSVGAnimatedNumberList::AnimVal() {
+  if (!mAnimVal) {
+    mAnimVal = new DOMSVGNumberList(this, InternalAList().GetAnimValue());
+  }
+  RefPtr<DOMSVGNumberList> animVal = mAnimVal;
+  return animVal.forget();
+}
+
+already_AddRefed<DOMSVGAnimatedNumberList>
+DOMSVGAnimatedNumberList::GetDOMWrapper(SVGAnimatedNumberList* aList,
+                                        dom::SVGElement* aElement,
+                                        uint8_t aAttrEnum) {
+  RefPtr<DOMSVGAnimatedNumberList> wrapper =
+      SVGAnimatedNumberListTearoffTable().GetTearoff(aList);
+  if (!wrapper) {
+    wrapper = new DOMSVGAnimatedNumberList(aElement, aAttrEnum);
+    SVGAnimatedNumberListTearoffTable().AddTearoff(aList, wrapper);
+  }
+  return wrapper.forget();
+}
+
+DOMSVGAnimatedNumberList* DOMSVGAnimatedNumberList::GetDOMWrapperIfExists(
+    SVGAnimatedNumberList* aList) {
+  return SVGAnimatedNumberListTearoffTable().GetTearoff(aList);
+}
+
+DOMSVGAnimatedNumberList::~DOMSVGAnimatedNumberList() {
+  SVGAnimatedNumberListTearoffTable().RemoveTearoff(&InternalAList());
+}
+
+void DOMSVGAnimatedNumberList::InternalBaseValListWillChangeTo(
+    const SVGNumberList& aNewValue) {
+
+  RefPtr<DOMSVGAnimatedNumberList> kungFuDeathGrip;
+  if (mBaseVal) {
+    if (aNewValue.Length() < mBaseVal->LengthNoFlush()) {
+      kungFuDeathGrip = this;
+    }
+    mBaseVal->InternalListLengthWillChange(aNewValue.Length());
+  }
+
+
+  if (!IsAnimating()) {
+    InternalAnimValListWillChangeTo(aNewValue);
+  }
+}
+
+void DOMSVGAnimatedNumberList::InternalAnimValListWillChangeTo(
+    const SVGNumberList& aNewValue) {
+  if (mAnimVal) {
+    mAnimVal->InternalListLengthWillChange(aNewValue.Length());
+  }
+}
+
+bool DOMSVGAnimatedNumberList::IsAnimating() const {
+  return InternalAList().IsAnimating();
+}
+
+SVGAnimatedNumberList& DOMSVGAnimatedNumberList::InternalAList() {
+  return *mElement->GetAnimatedNumberList(mAttrEnum);
+}
+
+const SVGAnimatedNumberList& DOMSVGAnimatedNumberList::InternalAList() const {
+  return *mElement->GetAnimatedNumberList(mAttrEnum);
+}
+
+}  

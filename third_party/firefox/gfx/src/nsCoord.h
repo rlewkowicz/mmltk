@@ -1,0 +1,291 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef NSCOORD_H
+#define NSCOORD_H
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdlib>
+#include <math.h>
+
+#include "mozilla/Assertions.h"
+#include "mozilla/gfx/Coord.h"
+#include "nsMathUtils.h"
+
+
+using nscoord = int32_t;
+inline constexpr nscoord nscoord_MAX = (1 << 30) - 1;
+inline constexpr nscoord nscoord_MIN = -nscoord_MAX;
+
+namespace mozilla {
+struct AppUnit {};
+
+template <>
+struct IsPixel<AppUnit> : std::true_type {};
+
+namespace detail {
+template <typename Rep>
+struct AuCoordImpl : public gfx::IntCoordTyped<AppUnit, Rep> {
+  using Super = gfx::IntCoordTyped<AppUnit, Rep>;
+
+  constexpr AuCoordImpl() : Super() {}
+  constexpr MOZ_IMPLICIT AuCoordImpl(Rep aValue) : Super(aValue) {}
+  constexpr MOZ_IMPLICIT AuCoordImpl(Super aValue) : Super(aValue) {}
+
+  template <typename F>
+  static AuCoordImpl FromRound(F aValue) {
+    return AuCoordImpl(std::floor(aValue + 0.5f));
+  }
+
+  template <typename F>
+  static AuCoordImpl FromTruncate(F aValue) {
+    return AuCoordImpl(std::trunc(aValue));
+  }
+
+  template <typename F>
+  static AuCoordImpl FromCeil(F aValue) {
+    return AuCoordImpl(std::ceil(aValue));
+  }
+
+  template <typename F>
+  static AuCoordImpl FromFloor(F aValue) {
+    return AuCoordImpl(std::floor(aValue));
+  }
+
+  [[nodiscard]] AuCoordImpl ToMinMaxClamped() const {
+    return std::clamp(this->value, kMin, kMax);
+  }
+
+  static constexpr Rep kMax = nscoord_MAX;
+  static constexpr Rep kMin = nscoord_MIN;
+};
+}  
+
+using AuCoord = detail::AuCoordImpl<int32_t>;
+using AuCoord64 = detail::AuCoordImpl<int64_t>;
+
+}  
+
+inline nscoord NSCoordDivRem(nscoord aSpace, size_t aN, nscoord* aQuotient) {
+  div_t result = div(aSpace, aN);
+  *aQuotient = nscoord(result.quot);
+  return nscoord(result.rem);
+}
+
+inline nscoord NSCoordMulDiv(nscoord aMult1, nscoord aMult2, nscoord aDiv) {
+  return int64_t(aMult1) * int64_t(aMult2) / int64_t(aDiv);
+}
+
+inline nscoord NSToCoordRound(float aValue) {
+  return nscoord(floorf(aValue + 0.5f));
+}
+
+inline nscoord NSToCoordRound(double aValue) {
+  return nscoord(floor(aValue + 0.5f));
+}
+
+inline nscoord NSToCoordRoundWithClamp(float aValue) {
+  if (aValue >= float(nscoord_MAX)) {
+    return nscoord_MAX;
+  }
+  if (aValue <= float(nscoord_MIN)) {
+    return nscoord_MIN;
+  }
+  return NSToCoordRound(aValue);
+}
+
+inline nscoord NSToCoordRoundWithClamp(double aValue) {
+  if (aValue >= double(nscoord_MAX)) {
+    return nscoord_MAX;
+  }
+  if (aValue <= double(nscoord_MIN)) {
+    return nscoord_MIN;
+  }
+  return NSToCoordRound(aValue);
+}
+
+inline nscoord _nscoordSaturatingMultiply(nscoord aCoord, float aScale,
+                                          bool requireNotNegative) {
+  if (requireNotNegative) {
+    MOZ_ASSERT(aScale >= 0.0f,
+               "negative scaling factors must be handled manually");
+  }
+  float product = aCoord * aScale;
+  if (requireNotNegative ? aCoord > 0 : (aCoord > 0) == (aScale > 0))
+    return NSToCoordRoundWithClamp(
+        std::min<float>((float)nscoord_MAX, product));
+  return NSToCoordRoundWithClamp(std::max<float>((float)nscoord_MIN, product));
+}
+
+inline nscoord NSCoordSaturatingNonnegativeMultiply(nscoord aCoord,
+                                                    float aScale) {
+  return _nscoordSaturatingMultiply(aCoord, aScale, true);
+}
+
+inline nscoord NSCoordSaturatingMultiply(nscoord aCoord, float aScale) {
+  return _nscoordSaturatingMultiply(aCoord, aScale, false);
+}
+
+inline nscoord NSCoordSaturatingAdd(nscoord a, nscoord b) {
+  if (a == nscoord_MAX || b == nscoord_MAX) {
+    return nscoord_MAX;
+  } else {
+    return std::min(nscoord_MAX, a + b);
+  }
+}
+
+inline nscoord NSCoordSaturatingSubtract(nscoord a, nscoord b,
+                                         nscoord infMinusInfResult) {
+  if (b == nscoord_MAX) {
+    if (a == nscoord_MAX) {
+      return infMinusInfResult;
+    } else {
+      return 0;
+    }
+  } else {
+    if (a == nscoord_MAX) {
+      return nscoord_MAX;
+    } else {
+      return std::min(nscoord_MAX, a - b);
+    }
+  }
+}
+
+inline float NSCoordToFloat(nscoord aCoord) { return (float)aCoord; }
+
+inline nscoord NSToCoordFloor(float aValue) { return nscoord(floorf(aValue)); }
+
+inline nscoord NSToCoordFloor(double aValue) { return nscoord(floor(aValue)); }
+
+inline nscoord NSToCoordFloorClamped(float aValue) {
+  if (aValue >= float(nscoord_MAX)) {
+    return nscoord_MAX;
+  }
+  if (aValue <= float(nscoord_MIN)) {
+    return nscoord_MIN;
+  }
+  return NSToCoordFloor(aValue);
+}
+
+inline nscoord NSToCoordCeil(float aValue) { return nscoord(ceilf(aValue)); }
+
+inline nscoord NSToCoordCeil(double aValue) { return nscoord(ceil(aValue)); }
+
+inline nscoord NSToCoordCeilClamped(double aValue) {
+  if (aValue >= nscoord_MAX) {
+    return nscoord_MAX;
+  }
+  if (aValue <= nscoord_MIN) {
+    return nscoord_MIN;
+  }
+  return NSToCoordCeil(aValue);
+}
+
+
+inline nscoord NSToCoordTrunc(float aValue) {
+  return nscoord(aValue);
+}
+
+inline nscoord NSToCoordTrunc(double aValue) {
+  return nscoord(aValue);
+}
+
+inline nscoord NSToCoordTruncClamped(float aValue) {
+  if (aValue >= float(nscoord_MAX)) {
+    return nscoord_MAX;
+  }
+  if (aValue <= float(nscoord_MIN)) {
+    return nscoord_MIN;
+  }
+  return NSToCoordTrunc(aValue);
+}
+
+inline nscoord NSToCoordTruncClamped(double aValue) {
+  if (aValue >= float(nscoord_MAX)) {
+    return nscoord_MAX;
+  }
+  if (aValue <= float(nscoord_MIN)) {
+    return nscoord_MIN;
+  }
+  return NSToCoordTrunc(aValue);
+}
+
+inline int32_t NSToIntFloor(float aValue) { return int32_t(floorf(aValue)); }
+
+inline int32_t NSToIntCeil(float aValue) { return int32_t(ceilf(aValue)); }
+
+inline int32_t NSToIntRound(float aValue) { return NS_lroundf(aValue); }
+
+inline int32_t NSToIntRound(double aValue) { return NS_lround(aValue); }
+
+inline int32_t NSToIntRoundUp(double aValue) {
+  return int32_t(floor(aValue + 0.5));
+}
+
+inline nscoord NSFloatPixelsToAppUnits(float aPixels, float aAppUnitsPerPixel) {
+  return NSToCoordRoundWithClamp(aPixels * aAppUnitsPerPixel);
+}
+
+inline nscoord NSDoublePixelsToAppUnits(double aPixels,
+                                        double aAppUnitsPerPixel) {
+  return NSToCoordRoundWithClamp(aPixels * aAppUnitsPerPixel);
+}
+
+inline nscoord NSIntPixelsToAppUnits(int32_t aPixels,
+                                     int32_t aAppUnitsPerPixel) {
+  nscoord r = aPixels * (nscoord)aAppUnitsPerPixel;
+  return r;
+}
+
+inline float NSAppUnitsToFloatPixels(nscoord aAppUnits,
+                                     float aAppUnitsPerPixel) {
+  return float(aAppUnits) / aAppUnitsPerPixel;
+}
+
+inline double NSAppUnitsToDoublePixels(nscoord aAppUnits,
+                                       double aAppUnitsPerPixel) {
+  return double(aAppUnits) / aAppUnitsPerPixel;
+}
+
+inline int32_t NSAppUnitsToIntPixels(nscoord aAppUnits,
+                                     float aAppUnitsPerPixel) {
+  return NSToIntRound(float(aAppUnits) / aAppUnitsPerPixel);
+}
+
+inline float NSCoordScale(nscoord aCoord, int32_t aFromAPP, int32_t aToAPP) {
+  return (NSCoordToFloat(aCoord) * aToAPP) / aFromAPP;
+}
+
+#define TWIPS_PER_POINT_INT 20
+#define TWIPS_PER_POINT_FLOAT 20.0f
+#define POINTS_PER_INCH_INT 72
+#define POINTS_PER_INCH_FLOAT 72.0f
+#define CM_PER_INCH_FLOAT 2.54f
+#define MM_PER_INCH_FLOAT 25.4f
+
+inline float NSUnitsToTwips(float aValue, float aPointsPerUnit) {
+  return aValue * aPointsPerUnit * TWIPS_PER_POINT_FLOAT;
+}
+
+inline float NSTwipsToUnits(float aTwips, float aUnitsPerPoint) {
+  return aTwips * (aUnitsPerPoint / TWIPS_PER_POINT_FLOAT);
+}
+
+#define NS_POINTS_TO_TWIPS(x) NSUnitsToTwips((x), 1.0f)
+#define NS_INCHES_TO_TWIPS(x) \
+  NSUnitsToTwips((x), POINTS_PER_INCH_FLOAT)  // 72 points per inch
+
+#define NS_MILLIMETERS_TO_TWIPS(x) \
+  NSUnitsToTwips((x), (POINTS_PER_INCH_FLOAT * 0.03937f))
+
+#define NS_POINTS_TO_INT_TWIPS(x) NSToIntRound(NS_POINTS_TO_TWIPS(x))
+#define NS_INCHES_TO_INT_TWIPS(x) NSToIntRound(NS_INCHES_TO_TWIPS(x))
+
+#define NS_TWIPS_TO_INCHES(x) NSTwipsToUnits((x), 1.0f / POINTS_PER_INCH_FLOAT)
+
+#define NS_TWIPS_TO_MILLIMETERS(x) \
+  NSTwipsToUnits((x), 1.0f / (POINTS_PER_INCH_FLOAT * 0.03937f))
+
+#endif /* NSCOORD_H */

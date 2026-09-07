@@ -1,0 +1,63 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsTreeStyleCache_h_
+#define nsTreeStyleCache_h_
+
+#include "mozilla/AtomArray.h"
+#include "mozilla/ComputedStyle.h"
+#include "mozilla/UniquePtr.h"
+#include "nsCOMArray.h"
+#include "nsRefPtrHashtable.h"
+#include "nsTHashMap.h"
+
+class nsIContent;
+
+namespace mozilla {
+enum class PseudoStyleType : uint8_t;
+}
+
+class nsTreeStyleCache {
+ public:
+  nsTreeStyleCache() : mNextState(0) {}
+
+  ~nsTreeStyleCache() { Clear(); }
+
+  void Clear() {
+    mTransitionTable = nullptr;
+    mCache = nullptr;
+    mNextState = 0;
+  }
+
+  mozilla::ComputedStyle* GetComputedStyle(
+      nsPresContext* aPresContext, nsIContent* aContent,
+      mozilla::ComputedStyle* aStyle, mozilla::PseudoStyleType aPseudoType,
+      const mozilla::AtomArray& aInputWord);
+
+ protected:
+  typedef uint32_t DFAState;
+
+  class Transition final {
+   public:
+    Transition(DFAState aState, nsAtom* aSymbol);
+    bool operator==(const Transition& aOther) const;
+    uint32_t Hash() const;
+
+   private:
+    DFAState mState;
+    RefPtr<nsAtom> mInputSymbol;
+  };
+
+  typedef nsTHashMap<nsGenericHashKey<Transition>, DFAState> TransitionTable;
+
+  mozilla::UniquePtr<TransitionTable> mTransitionTable;
+
+  typedef nsRefPtrHashtable<nsUint32HashKey, mozilla::ComputedStyle>
+      ComputedStyleCache;
+  mozilla::UniquePtr<ComputedStyleCache> mCache;
+
+  DFAState mNextState;
+};
+
+#endif  // nsTreeStyleCache_h_

@@ -1,0 +1,85 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef GFX_VSYNCSOURCE_H
+#define GFX_VSYNCSOURCE_H
+
+#include "nsTArray.h"
+#include "mozilla/DataMutex.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/TimeStamp.h"
+#include "nsISupportsImpl.h"
+#include "mozilla/layers/LayersTypes.h"
+
+namespace mozilla {
+class VsyncDispatcher;
+class VsyncObserver;
+struct VsyncEvent;
+
+class VsyncIdType {};
+typedef layers::BaseTransactionId<VsyncIdType> VsyncId;
+
+namespace gfx {
+
+class VsyncSource {
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(VsyncSource)
+
+  typedef mozilla::VsyncDispatcher VsyncDispatcher;
+
+ public:
+  VsyncSource();
+
+  virtual void NotifyVsync(const TimeStamp& aVsyncTimestamp,
+                           const TimeStamp& aOutputTimestamp);
+
+  void AddVsyncDispatcher(VsyncDispatcher* aDispatcher);
+  void RemoveVsyncDispatcher(VsyncDispatcher* aDispatcher);
+
+  virtual TimeDuration GetVsyncRate();
+
+  virtual void EnableVsync() = 0;
+  virtual void DisableVsync() = 0;
+  virtual bool IsVsyncEnabled() = 0;
+  virtual void Shutdown() = 0;
+
+  static Maybe<TimeDuration> GetFastestVsyncRate();
+
+ protected:
+  virtual ~VsyncSource();
+
+ private:
+  void UpdateVsyncStatus();
+
+  struct DispatcherRefWithCount {
+    RefPtr<VsyncDispatcher> mDispatcher;
+    size_t mCount = 0;
+  };
+
+  struct State {
+    nsTArray<DispatcherRefWithCount> mDispatchers;
+
+    VsyncId mVsyncId;
+  };
+
+  DataMutex<State> mState;
+};
+
+}  
+
+struct VsyncEvent {
+  VsyncId mId;
+  TimeStamp mTime;
+  TimeStamp mOutputTime;  
+
+  VsyncEvent(const VsyncId& aId, const TimeStamp& aVsyncTime,
+             const TimeStamp& aOutputTime)
+      : mId(aId), mTime(aVsyncTime), mOutputTime(aOutputTime) {}
+  VsyncEvent() = default;
+};
+
+}  
+
+#endif /* GFX_VSYNCSOURCE_H */

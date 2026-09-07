@@ -1,0 +1,134 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*******************************************************************************
+*
+*   Copyright (C) 1999-2015, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+*
+*******************************************************************************
+*   file name:  uinvchar.h
+*   encoding:   UTF-8
+*   tab size:   8 (not used)
+*   indentation:2
+*
+*   created on: 2004sep14
+*   created by: Markus W. Scherer
+*
+*   Definitions for handling invariant characters, moved here from putil.c
+*   for better modularization.
+*/
+
+#ifndef __UINVCHAR_H__
+#define __UINVCHAR_H__
+
+#include "unicode/utypes.h"
+#ifdef __cplusplus
+#include "unicode/unistr.h"
+#endif
+
+U_CAPI UBool U_EXPORT2
+uprv_isInvariantString(const char *s, int32_t length);
+
+U_CAPI UBool U_EXPORT2
+uprv_isInvariantUString(const UChar *s, int32_t length);
+
+#if U_CHARSET_FAMILY==U_ASCII_FAMILY
+#   define U_UPPER_ORDINAL(x) ((x)-'A')
+#elif U_CHARSET_FAMILY==U_EBCDIC_FAMILY
+#   define U_UPPER_ORDINAL(x) (((x) < 'J') ? ((x)-'A') : \
+                              (((x) < 'S') ? ((x)-'J'+9) : \
+                               ((x)-'S'+18)))
+#else
+#   error Unknown charset family!
+#endif
+
+#ifdef __cplusplus
+
+U_NAMESPACE_BEGIN
+
+inline int32_t uprv_upperOrdinal(int32_t c) {
+#if U_CHARSET_FAMILY==U_ASCII_FAMILY
+    return c - 'A';
+#elif U_CHARSET_FAMILY==U_EBCDIC_FAMILY
+    if (c <= 'I') { return c - 'A'; }  
+    if (c < 'J') { return -1; }
+    if (c <= 'R') { return c - 'J' + 9; }  
+    if (c < 'S') { return -1; }
+    return c - 'S' + 18;  
+#else
+#   error Unknown charset family!
+#endif
+}
+
+inline int32_t uprv_lowerOrdinal(int32_t c) {
+#if U_CHARSET_FAMILY==U_ASCII_FAMILY
+    return c - 'a';
+#elif U_CHARSET_FAMILY==U_EBCDIC_FAMILY
+    if (c <= 'i') { return c - 'a'; }  
+    if (c < 'j') { return -1; }
+    if (c <= 'r') { return c - 'j' + 9; }  
+    if (c < 's') { return -1; }
+    return c - 's' + 18;  
+#else
+#   error Unknown charset family!
+#endif
+}
+
+U_NAMESPACE_END
+
+#endif
+
+U_CAPI UBool
+uprv_isEbcdicAtSign(char c);
+
+#if U_CHARSET_FAMILY==U_ASCII_FAMILY
+#   define uprv_isAtSign(c) ((c)=='@')
+#elif U_CHARSET_FAMILY==U_EBCDIC_FAMILY
+#   define uprv_isAtSign(c) uprv_isEbcdicAtSign(c)
+#else
+#   error Unknown charset family!
+#endif
+
+U_CAPI int32_t U_EXPORT2
+uprv_compareInvEbcdicAsAscii(const char *s1, const char *s2);
+
+#if U_CHARSET_FAMILY==U_ASCII_FAMILY
+#   define uprv_compareInvCharsAsAscii(s1, s2) uprv_strcmp(s1, s2)
+#elif U_CHARSET_FAMILY==U_EBCDIC_FAMILY
+#   define uprv_compareInvCharsAsAscii(s1, s2) uprv_compareInvEbcdicAsAscii(s1, s2)
+#else
+#   error Unknown charset family!
+#endif
+
+U_CAPI char U_EXPORT2
+uprv_ebcdicToAscii(char c);
+
+#if U_CHARSET_FAMILY==U_ASCII_FAMILY
+#   define uprv_invCharToAscii(c) (c)
+#elif U_CHARSET_FAMILY==U_EBCDIC_FAMILY
+#   define uprv_invCharToAscii(c) uprv_ebcdicToAscii(c)
+#else
+#   error Unknown charset family!
+#endif
+
+U_CAPI char U_EXPORT2
+uprv_ebcdicToLowercaseAscii(char c);
+
+#if U_CHARSET_FAMILY==U_ASCII_FAMILY
+#   define uprv_invCharToLowercaseAscii uprv_asciitolower
+#elif U_CHARSET_FAMILY==U_EBCDIC_FAMILY
+#   define uprv_invCharToLowercaseAscii uprv_ebcdicToLowercaseAscii
+#else
+#   error Unknown charset family!
+#endif
+
+U_CAPI uint8_t* U_EXPORT2
+uprv_aestrncpy(uint8_t *dst, const uint8_t *src, int32_t n);
+
+
+U_CAPI uint8_t* U_EXPORT2
+uprv_eastrncpy(uint8_t *dst, const uint8_t *src, int32_t n);
+
+
+
+#endif

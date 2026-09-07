@@ -1,0 +1,274 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef js_ProfilingFrameIterator_h
+#define js_ProfilingFrameIterator_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/Maybe.h"
+
+#include "jstypes.h"
+
+#include "js/GCAnnotations.h"
+#include "js/ProfilingCategory.h"
+#include "js/TypeDecls.h"
+
+namespace js {
+class Activation;
+namespace jit {
+class JitActivation;
+class JSJitProfilingFrameIterator;
+class JitcodeGlobalEntry;
+
+struct CallStackFrameInfo {
+  const char* label;
+  uint32_t sourceId;
+  uint32_t line;
+  uint32_t column;
+};
+
+}  
+namespace wasm {
+class ProfilingFrameIterator;
+}  
+}  
+
+namespace JS {
+
+class MOZ_NON_PARAM JS_PUBLIC_API ProfilingFrameIterator {
+ public:
+  enum class Kind : bool { JSJit, Wasm };
+
+ private:
+  JSContext* cx_;
+  mozilla::Maybe<uint64_t> samplePositionInProfilerBuffer_;
+  js::Activation* activation_;
+  void* endStackAddress_ = nullptr;
+  Kind kind_ = Kind::JSJit;
+
+  static const unsigned StorageSpace = 9 * sizeof(void*);
+  alignas(void*) unsigned char storage_[StorageSpace];
+
+  void* storage() { return storage_; }
+  const void* storage() const { return storage_; }
+
+  js::wasm::ProfilingFrameIterator& wasmIter() {
+    MOZ_ASSERT(!done());
+    MOZ_ASSERT(isWasm());
+    return *static_cast<js::wasm::ProfilingFrameIterator*>(storage());
+  }
+  const js::wasm::ProfilingFrameIterator& wasmIter() const {
+    MOZ_ASSERT(!done());
+    MOZ_ASSERT(isWasm());
+    return *static_cast<const js::wasm::ProfilingFrameIterator*>(storage());
+  }
+
+  js::jit::JSJitProfilingFrameIterator& jsJitIter() {
+    MOZ_ASSERT(!done());
+    MOZ_ASSERT(isJSJit());
+    return *static_cast<js::jit::JSJitProfilingFrameIterator*>(storage());
+  }
+
+  const js::jit::JSJitProfilingFrameIterator& jsJitIter() const {
+    MOZ_ASSERT(!done());
+    MOZ_ASSERT(isJSJit());
+    return *static_cast<const js::jit::JSJitProfilingFrameIterator*>(storage());
+  }
+
+  void maybeSetEndStackAddress(void* addr) {
+    if (!endStackAddress_) {
+      endStackAddress_ = addr;
+    }
+  }
+
+  void settleFrames();
+  void settle();
+
+ public:
+  struct RegisterState {
+    RegisterState()
+        : pc(nullptr),
+          sp(nullptr),
+          fp(nullptr),
+          unused1(nullptr),
+          unused2(nullptr) {}
+    void* pc;
+    void* sp;
+    void* fp;
+    union {
+      void* lr;
+      void* tempRA;
+      void* unused1;
+    };
+    union {
+      void* tempFP;
+      void* unused2;
+    };
+  };
+
+  ProfilingFrameIterator(
+      JSContext* cx, const RegisterState& state,
+      const mozilla::Maybe<uint64_t>& samplePositionInProfilerBuffer =
+          mozilla::Nothing());
+  ~ProfilingFrameIterator();
+  void operator++();
+  bool done() const { return !activation_; }
+
+  void* stackAddress() const;
+
+  enum FrameKind {
+    Frame_BaselineInterpreter,
+    Frame_Baseline,
+    Frame_Ion,
+    Frame_WasmBaseline,
+    Frame_WasmIon,
+    Frame_WasmOther,
+  };
+
+  struct Frame {
+    FrameKind kind;
+    void* stackAddress;
+    union {
+      void* returnAddress_;
+      jsbytecode* interpreterPC_;
+    };
+    void* activation;
+    void* endStackAddress;
+    const char* label;
+    JSScript* interpreterScript;
+    uint64_t realmID;
+    uint32_t sourceId;
+    uint32_t line;
+    uint32_t column;
+
+   public:
+    void* returnAddress() const {
+      MOZ_ASSERT(kind != Frame_BaselineInterpreter);
+      return returnAddress_;
+    }
+    jsbytecode* interpreterPC() const {
+      MOZ_ASSERT(kind == Frame_BaselineInterpreter);
+      return interpreterPC_;
+    }
+    ProfilingCategoryPair profilingCategory() const {
+      switch (kind) {
+        case FrameKind::Frame_BaselineInterpreter:
+          return JS::ProfilingCategoryPair::JS_BaselineInterpret;
+        case FrameKind::Frame_Baseline:
+          return JS::ProfilingCategoryPair::JS_Baseline;
+        case FrameKind::Frame_Ion:
+          return JS::ProfilingCategoryPair::JS_IonMonkey;
+        case FrameKind::Frame_WasmBaseline:
+          return JS::ProfilingCategoryPair::JS_WasmBaseline;
+        case FrameKind::Frame_WasmIon:
+          return JS::ProfilingCategoryPair::JS_WasmIon;
+        case FrameKind::Frame_WasmOther:
+          return JS::ProfilingCategoryPair::JS_WasmOther;
+      }
+      MOZ_CRASH();
+    }
+  } JS_HAZ_GC_INVALIDATED;
+
+  bool isWasm() const;
+  bool isJSJit() const;
+
+  uint32_t extractStack(Frame* frames, uint32_t offset, uint32_t end) const;
+
+  mozilla::Maybe<Frame> getPhysicalFrameWithoutLabel() const;
+
+  mozilla::Maybe<RegisterState> getCppEntryRegisters() const;
+
+ private:
+  mozilla::Maybe<Frame> getPhysicalFrameAndEntry(
+      const js::jit::JitcodeGlobalEntry** entry) const;
+
+  void iteratorConstruct(const RegisterState& state);
+  void iteratorConstruct();
+  void iteratorDestroy();
+  bool iteratorDone();
+} JS_HAZ_GC_INVALIDATED;
+
+JS_PUBLIC_API bool IsProfilingEnabledForContext(JSContext* cx);
+
+JS_PUBLIC_API void SetJSContextProfilerSampleBufferRangeStart(
+    JSContext* cx, uint64_t rangeStart);
+
+class ProfiledFrameRange;
+
+class MOZ_STACK_CLASS ProfiledFrameHandle {
+  friend class ProfiledFrameRange;
+
+  JSRuntime* rt_;
+  js::jit::JitcodeGlobalEntry& entry_;
+  void* addr_;
+  void* canonicalAddr_;
+  js::jit::CallStackFrameInfo frameInfo_;
+  uint32_t depth_;
+
+  ProfiledFrameHandle(JSRuntime* rt, js::jit::JitcodeGlobalEntry& entry,
+                      void* addr, const js::jit::CallStackFrameInfo& frameInfo,
+                      uint32_t depth);
+
+ public:
+  const char* label() const { return frameInfo_.label; }
+  uint32_t depth() const { return depth_; }
+  void* canonicalAddress() const { return canonicalAddr_; }
+
+  JS_PUBLIC_API ProfilingFrameIterator::FrameKind frameKind() const;
+
+  JS_PUBLIC_API uint64_t realmID() const;
+
+  JS_PUBLIC_API uint32_t sourceId() const { return frameInfo_.sourceId; }
+
+  JS_PUBLIC_API uint32_t line() const { return frameInfo_.line; }
+
+  JS_PUBLIC_API uint32_t column() const { return frameInfo_.column; }
+};
+
+class ProfiledFrameRange {
+ public:
+  class Iter final {
+   public:
+    Iter(const ProfiledFrameRange& range, uint32_t index)
+        : range_(range), index_(index) {}
+
+    JS_PUBLIC_API ProfiledFrameHandle operator*() const;
+
+    Iter& operator++() {
+      ++index_;
+      return *this;
+    }
+    bool operator==(const Iter& rhs) const { return index_ == rhs.index_; }
+    bool operator!=(const Iter& rhs) const { return !(*this == rhs); }
+
+   private:
+    const ProfiledFrameRange& range_;
+    uint32_t index_;
+  };
+
+  Iter begin() const { return Iter(*this, 0); }
+  Iter end() const { return Iter(*this, depth_); }
+
+ private:
+  friend JS_PUBLIC_API ProfiledFrameRange GetProfiledFrames(JSContext* cx,
+                                                            void* addr);
+
+  ProfiledFrameRange(JSRuntime* rt, void* addr,
+                     js::jit::JitcodeGlobalEntry* entry)
+      : rt_(rt), addr_(addr), entry_(entry), depth_(0) {}
+
+  JSRuntime* rt_;
+  void* addr_;
+  js::jit::JitcodeGlobalEntry* entry_;
+  static constexpr uint32_t MaxInliningDepth = 8;
+  js::jit::CallStackFrameInfo frames_[MaxInliningDepth];
+  uint32_t depth_;
+};
+
+JS_PUBLIC_API ProfiledFrameRange GetProfiledFrames(JSContext* cx, void* addr);
+
+}  
+
+#endif /* js_ProfilingFrameIterator_h */

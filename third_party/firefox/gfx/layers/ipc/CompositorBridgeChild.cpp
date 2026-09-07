@@ -1,0 +1,540 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/layers/CompositorBridgeChild.h"
+#include "mozilla/layers/CompositorBridgeParent.h"
+#include "mozilla/layers/CompositorThread.h"
+#include <stddef.h>     // for size_t
+#include "base/task.h"  // for NewRunnableMethod, etc
+#include "mozilla/StaticPrefs_layers.h"
+#include "mozilla/layers/CompositorManagerChild.h"
+#include "mozilla/layers/ImageBridgeChild.h"
+#include "mozilla/layers/APZChild.h"
+#include "mozilla/layers/IAPZCTreeManager.h"
+#include "mozilla/layers/APZCTreeManagerChild.h"
+#include "mozilla/layers/CanvasChild.h"
+#include "mozilla/layers/WebRenderLayerManager.h"
+#include "mozilla/layers/PTextureChild.h"
+#include "mozilla/layers/TextureClient.h"  // for TextureClient
+#include "mozilla/layers/WebRenderBridgeChild.h"
+#include "mozilla/layers/SyncObject.h"  // for SyncObjectClient
+#include "mozilla/gfx/CanvasManagerChild.h"
+#include "mozilla/gfx/gfxVars.h"
+#include "mozilla/gfx/GPUProcessManager.h"
+#include "mozilla/gfx/Logging.h"
+#include "mozilla/ipc/Endpoint.h"
+#include "mozilla/mozalloc.h"  // for operator new, etc
+#include "gfxConfig.h"
+#include "nsDebug.h"          // for NS_WARNING
+#include "nsISupportsImpl.h"  // for MOZ_COUNT_CTOR, etc
+#include "nsTArray.h"         // for nsTArray, nsTArray_Impl
+#include "mozilla/dom/BrowserChild.h"
+#include "mozilla/dom/BrowserParent.h"
+#include "mozilla/dom/ContentChild.h"
+#include "mozilla/SpinEventLoopUntil.h"
+#include "nsThreadUtils.h"
+#include "mozilla/widget/CompositorWidget.h"
+#if defined(MOZ_WIDGET_SUPPORTS_OOP_COMPOSITING)
+#  include "mozilla/widget/CompositorWidgetChild.h"
+#endif
+#include "VsyncSource.h"
+
+using mozilla::gfx::GPUProcessManager;
+
+namespace mozilla {
+namespace layers {
+
+static int sShmemCreationCounter = 0;
+
+static void ResetShmemCounter() { sShmemCreationCounter = 0; }
+
+static void ShmemAllocated(CompositorBridgeChild* aProtocol) {
+  sShmemCreationCounter++;
+  if (sShmemCreationCounter > 256) {
+    aProtocol->SendSyncWithCompositor();
+    ResetShmemCounter();
+    MOZ_PERFORMANCE_WARNING(
+        "gfx", "The number of shmem allocations is too damn high!");
+  }
+}
+
+static StaticRefPtr<CompositorBridgeChild> sCompositorBridge;
+
+Atomic<int32_t> KnowsCompositor::sSerialCounter(0);
+
+CompositorBridgeChild::CompositorBridgeChild(CompositorManagerChild* aManager)
+    : mCompositorManager(aManager),
+      mIdNamespace(0),
+      mResourceId(0),
+      mCanSend(false),
+      mActorDestroyed(false),
+      mPaused(false),
+      mForceSyncFlushRendering(false),
+      mThread(NS_GetCurrentThread()),
+      mProcessToken(0),
+      mSectionAllocator(nullptr) {
+  MOZ_ASSERT(NS_IsMainThread());
+}
+
+CompositorBridgeChild::~CompositorBridgeChild() {
+  if (mCanSend) {
+    gfxCriticalError() << "CompositorBridgeChild was not deinitialized";
+  }
+}
+
+bool CompositorBridgeChild::IsSameProcess() const {
+  return OtherPid() == base::GetCurrentProcId();
+}
+
+void CompositorBridgeChild::PrepareFinalDestroy() {
+  nsCOMPtr<nsIRunnable> runnable =
+      NewRunnableMethod("CompositorBridgeChild::AfterDestroy", this,
+                        &CompositorBridgeChild::AfterDestroy);
+  NS_DispatchToCurrentThreadQueue(runnable.forget(),
+                                  EventQueuePriority::MediumHigh);
+}
+
+void CompositorBridgeChild::AfterDestroy() {
+  if (!mActorDestroyed) {
+    if (GetIPCChannel()->CanSend()) {
+      Send__delete__(this);
+    }
+    mActorDestroyed = true;
+  }
+
+  if (sCompositorBridge == this) {
+    sCompositorBridge = nullptr;
+  }
+}
+
+void CompositorBridgeChild::Destroy() {
+  mTexturesWaitingNotifyNotUsed.clear();
+
+  RefPtr<CompositorBridgeChild> selfRef = this;
+
+  if (mSectionAllocator) {
+    delete mSectionAllocator;
+    mSectionAllocator = nullptr;
+  }
+
+  if (mLayerManager) {
+    mLayerManager->Destroy();
+    mLayerManager = nullptr;
+  }
+
+  if (!mCanSend) {
+    NS_GetCurrentThread()->Dispatch(
+        NewRunnableMethod("CompositorBridgeChild::PrepareFinalDestroy", selfRef,
+                          &CompositorBridgeChild::PrepareFinalDestroy));
+    return;
+  }
+
+  AutoTArray<PWebRenderBridgeChild*, 16> wrBridges;
+  ManagedPWebRenderBridgeChild(wrBridges);
+  for (int i = wrBridges.Length() - 1; i >= 0; --i) {
+    RefPtr<WebRenderBridgeChild> wrBridge =
+        static_cast<WebRenderBridgeChild*>(wrBridges[i]);
+    wrBridge->Destroy( false);
+  }
+
+  AutoTArray<PAPZChild*, 16> apzChildren;
+  ManagedPAPZChild(apzChildren);
+  for (PAPZChild* child : apzChildren) {
+    (void)child->SendDestroy();
+  }
+
+  const ManagedContainer<PTextureChild>& textures = ManagedPTextureChild();
+  for (const auto& key : textures) {
+    RefPtr<TextureClient> texture = TextureClient::AsTextureClient(key);
+
+    if (texture) {
+      texture->Destroy();
+    }
+  }
+
+  SendWillClose();
+  mCanSend = false;
+
+  mProcessToken = 0;
+
+
+  NS_GetCurrentThread()->Dispatch(
+      NewRunnableMethod("CompositorBridgeChild::PrepareFinalDestroy", selfRef,
+                        &CompositorBridgeChild::PrepareFinalDestroy));
+}
+
+void CompositorBridgeChild::ShutDown() {
+  if (sCompositorBridge) {
+    sCompositorBridge->Destroy();
+    SpinEventLoopUntil("CompositorBridgeChild::ShutDown"_ns,
+                       [&]() { return !sCompositorBridge; });
+  }
+}
+
+void CompositorBridgeChild::InitForContent(uint32_t aNamespace) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aNamespace);
+
+  if (RefPtr<CompositorBridgeChild> old = sCompositorBridge.forget()) {
+    old->Destroy();
+  }
+
+  mCanSend = true;
+  mIdNamespace = aNamespace;
+
+  sCompositorBridge = this;
+}
+
+void CompositorBridgeChild::InitForWidget(uint64_t aProcessToken,
+                                          uint32_t aNamespace) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aProcessToken);
+  MOZ_ASSERT(aNamespace);
+
+  mCanSend = true;
+  mProcessToken = aProcessToken;
+  mIdNamespace = aNamespace;
+}
+
+RefPtr<WebRenderLayerManager> CompositorBridgeChild::CreateLayerManager(
+    nsIWidget* aWidget, wr::PipelineId aPipelineId, nsCString& aError) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(XRE_IsParentProcess(),
+             "Must only be called for widget CompositorBridgeChild");
+  MOZ_ASSERT(!mLayerManager, "Must only be called once");
+
+  mLayerManager =
+      WebRenderLayerManager::Create(aWidget, this, aPipelineId, aError);
+  return mLayerManager;
+}
+
+CompositorBridgeChild* CompositorBridgeChild::Get() {
+  MOZ_ASSERT(!XRE_IsParentProcess());
+  return sCompositorBridge;
+}
+
+bool CompositorBridgeChild::CompositorIsInGPUProcess() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (XRE_IsParentProcess()) {
+    return !!GPUProcessManager::Get()->GetGPUChild();
+  }
+
+  MOZ_ASSERT(XRE_IsContentProcess());
+  CompositorBridgeChild* bridge = CompositorBridgeChild::Get();
+  if (!bridge) {
+    return false;
+  }
+
+  return bridge->OtherPid() != dom::ContentChild::GetSingleton()->OtherPid();
+}
+
+mozilla::ipc::IPCResult CompositorBridgeChild::RecvDidComposite(
+    const LayersId& aId, const nsTArray<TransactionId>& aTransactionIds,
+    const TimeStamp& aCompositeStart, const TimeStamp& aCompositeEnd) {
+  for (const auto& id : aTransactionIds) {
+    if (mLayerManager) {
+      MOZ_ASSERT(!aId.IsValid());
+      MOZ_ASSERT(mLayerManager->GetBackendType() == LayersBackend::LAYERS_WR);
+      RefPtr<WebRenderLayerManager> m = mLayerManager;
+      m->DidComposite(id, aCompositeStart, aCompositeEnd);
+    } else if (aId.IsValid()) {
+      RefPtr<dom::BrowserChild> child = dom::BrowserChild::GetFrom(aId);
+      if (child) {
+        child->DidComposite(id, aCompositeStart, aCompositeEnd);
+      }
+    }
+  }
+
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult CompositorBridgeChild::RecvNotifyFrameStats(
+    nsTArray<FrameStats>&& aFrameStats) {
+  gfxPlatform::GetPlatform()->NotifyFrameStats(std::move(aFrameStats));
+  return IPC_OK();
+}
+
+void CompositorBridgeChild::ActorDestroy(ActorDestroyReason aWhy) {
+  if (aWhy == AbnormalShutdown) {
+    gfxCriticalNote << "CompositorBridgeChild receives IPC close with "
+                       "reason=AbnormalShutdown";
+  }
+
+  mCanSend = false;
+  mActorDestroyed = true;
+
+  if (mProcessToken && XRE_IsParentProcess()) {
+    GPUProcessManager::Get()->NotifyRemoteActorDestroyed(mProcessToken);
+  }
+}
+
+bool CompositorBridgeChild::SendWillClose() {
+  MOZ_RELEASE_ASSERT(mCanSend);
+  return PCompositorBridgeChild::SendWillClose();
+}
+
+bool CompositorBridgeChild::SendPause() {
+  if (!mCanSend) {
+    return false;
+  }
+  mPaused = true;
+  return PCompositorBridgeChild::SendPause();
+}
+
+bool CompositorBridgeChild::SendResume() {
+  if (!mCanSend) {
+    return false;
+  }
+  mPaused = false;
+  return PCompositorBridgeChild::SendResume();
+}
+
+bool CompositorBridgeChild::SendResumeAsync() {
+  if (!mCanSend) {
+    return false;
+  }
+  mPaused = false;
+  return PCompositorBridgeChild::SendResumeAsync();
+}
+
+bool CompositorBridgeChild::SendAdoptChild(const LayersId& id) {
+  if (!mCanSend) {
+    return false;
+  }
+  return PCompositorBridgeChild::SendAdoptChild(id);
+}
+
+bool CompositorBridgeChild::SendFlushRendering(
+    const wr::RenderReasons& aReasons) {
+  if (!mCanSend) {
+    return false;
+  }
+  return PCompositorBridgeChild::SendFlushRendering(aReasons);
+}
+
+bool CompositorBridgeChild::SendFlushRenderingAsync(
+    const wr::RenderReasons& aReasons) {
+  if (mForceSyncFlushRendering) {
+    return SendFlushRendering(aReasons);
+  }
+  if (!mCanSend) {
+    return false;
+  }
+  return PCompositorBridgeChild::SendFlushRenderingAsync(aReasons);
+}
+
+void CompositorBridgeChild::SetForceSyncFlushRendering(
+    bool aForceSyncFlushRendering) {
+  mForceSyncFlushRendering = aForceSyncFlushRendering;
+}
+
+bool CompositorBridgeChild::SendStartFrameTimeRecording(
+    const int32_t& bufferSize, uint32_t* startIndex) {
+  if (!mCanSend) {
+    return false;
+  }
+  return PCompositorBridgeChild::SendStartFrameTimeRecording(bufferSize,
+                                                             startIndex);
+}
+
+bool CompositorBridgeChild::SendStopFrameTimeRecording(
+    const uint32_t& startIndex, nsTArray<float>* intervals) {
+  if (!mCanSend) {
+    return false;
+  }
+  return PCompositorBridgeChild::SendStopFrameTimeRecording(startIndex,
+                                                            intervals);
+}
+
+mozilla::ipc::IPCResult CompositorBridgeChild::RecvParentAsyncMessages(
+    nsTArray<AsyncParentMessageData>&& aMessages) {
+  for (AsyncParentMessageArray::index_type i = 0; i < aMessages.Length(); ++i) {
+    const AsyncParentMessageData& message = aMessages[i];
+
+    switch (message.type()) {
+      case AsyncParentMessageData::TOpNotifyNotUsed: {
+        const OpNotifyNotUsed& op = message.get_OpNotifyNotUsed();
+        NotifyNotUsed(op.TextureId(), op.fwdTransactionId());
+        break;
+      }
+      default:
+        NS_ERROR("unknown AsyncParentMessageData type");
+        return IPC_FAIL_NO_REASON(this);
+    }
+  }
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult CompositorBridgeChild::RecvObserveLayersUpdate(
+    const LayersId& aLayersId, const bool& aActive) {
+  MOZ_ASSERT(aLayersId.IsValid());
+  MOZ_ASSERT(XRE_IsParentProcess());
+
+  if (RefPtr<dom::BrowserParent> tab =
+          dom::BrowserParent::GetBrowserParentFromLayersId(aLayersId)) {
+    tab->LayerTreeUpdate(aActive);
+  }
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult CompositorBridgeChild::RecvCompositorOptionsChanged(
+    const LayersId& aLayersId, const CompositorOptions& aNewOptions) {
+  MOZ_ASSERT(aLayersId.IsValid());
+  MOZ_ASSERT(XRE_IsParentProcess());
+
+  if (RefPtr<dom::BrowserParent> tab =
+          dom::BrowserParent::GetBrowserParentFromLayersId(aLayersId)) {
+    (void)tab->SendCompositorOptionsChanged(aNewOptions);
+  }
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult CompositorBridgeChild::RecvNotifyJankedAnimations(
+    const LayersId& aLayersId, nsTArray<uint64_t>&& aJankedAnimations) {
+  if (mLayerManager) {
+    MOZ_ASSERT(!aLayersId.IsValid());
+    mLayerManager->UpdatePartialPrerenderedAnimations(aJankedAnimations);
+  } else if (aLayersId.IsValid()) {
+    RefPtr<dom::BrowserChild> child = dom::BrowserChild::GetFrom(aLayersId);
+    if (child) {
+      child->NotifyJankedAnimations(aJankedAnimations);
+    }
+  }
+
+  return IPC_OK();
+}
+
+void CompositorBridgeChild::HoldUntilCompositableRefReleasedIfNecessary(
+    TextureClient* aClient) {
+  if (!aClient) {
+    return;
+  }
+
+  bool waitNotifyNotUsed =
+      aClient->GetFlags() & TextureFlags::RECYCLE ||
+      aClient->GetFlags() & TextureFlags::WAIT_HOST_USAGE_END;
+  if (!waitNotifyNotUsed) {
+    return;
+  }
+
+  aClient->SetLastFwdTransactionId(
+      GetFwdTransactionCounter().mFwdTransactionId);
+  mTexturesWaitingNotifyNotUsed.emplace(aClient->GetSerial(), aClient);
+}
+
+void CompositorBridgeChild::NotifyNotUsed(uint64_t aTextureId,
+                                          uint64_t aFwdTransactionId) {
+  auto it = mTexturesWaitingNotifyNotUsed.find(aTextureId);
+  if (it != mTexturesWaitingNotifyNotUsed.end()) {
+    if (aFwdTransactionId < it->second->GetLastFwdTransactionId()) {
+      return;
+    }
+    mTexturesWaitingNotifyNotUsed.erase(it);
+  }
+}
+
+void CompositorBridgeChild::CancelWaitForNotifyNotUsed(uint64_t aTextureId) {
+  mTexturesWaitingNotifyNotUsed.erase(aTextureId);
+}
+
+FixedSizeSmallShmemSectionAllocator*
+CompositorBridgeChild::GetTileLockAllocator() {
+  if (!IPCOpen()) {
+    return nullptr;
+  }
+
+  if (!mSectionAllocator) {
+    mSectionAllocator = new FixedSizeSmallShmemSectionAllocator(this);
+  }
+  return mSectionAllocator;
+}
+
+already_AddRefed<PTextureChild> CompositorBridgeChild::CreateTexture(
+    const SurfaceDescriptor& aSharedData, ReadLockDescriptor&& aReadLock,
+    LayersBackend aLayersBackend, TextureFlags aFlags,
+    const dom::ContentParentId& aContentId, uint64_t aSerial,
+    wr::MaybeExternalImageId& aExternalImageId) {
+  RefPtr actor = TextureClient::CreateIPDLActor();
+  if (!SendPTextureConstructor(actor, aSharedData, std::move(aReadLock),
+                               aLayersBackend, aFlags, aSerial,
+                               aExternalImageId)) {
+    return nullptr;
+  }
+  return actor.forget();
+}
+
+already_AddRefed<CanvasChild> CompositorBridgeChild::GetCanvasChild() {
+  MOZ_ASSERT(gfxPlatform::UseRemoteCanvas());
+  if (auto* cm = gfx::CanvasManagerChild::Get()) {
+    return cm->GetCanvasChild().forget();
+  }
+  return nullptr;
+}
+
+void CompositorBridgeChild::EndCanvasTransaction() {
+  if (auto* cm = gfx::CanvasManagerChild::Get()) {
+    cm->EndCanvasTransaction();
+  }
+}
+
+void CompositorBridgeChild::ClearCachedResources() {
+  if (auto* cm = gfx::CanvasManagerChild::Get()) {
+    cm->ClearCachedResources();
+  }
+}
+
+bool CompositorBridgeChild::AllocUnsafeShmem(size_t aSize, ipc::Shmem* aShmem) {
+  ShmemAllocated(this);
+  return PCompositorBridgeChild::AllocUnsafeShmem(aSize, aShmem);
+}
+
+bool CompositorBridgeChild::AllocShmem(size_t aSize, ipc::Shmem* aShmem) {
+  ShmemAllocated(this);
+  return PCompositorBridgeChild::AllocShmem(aSize, aShmem);
+}
+
+bool CompositorBridgeChild::DeallocShmem(ipc::Shmem& aShmem) {
+  if (!mCanSend) {
+    return false;
+  }
+  return PCompositorBridgeChild::DeallocShmem(aShmem);
+}
+
+already_AddRefed<PAPZCTreeManagerChild>
+CompositorBridgeChild::AllocPAPZCTreeManagerChild(const LayersId& aLayersId) {
+  return MakeAndAddRef<APZCTreeManagerChild>();
+}
+
+already_AddRefed<PAPZChild> CompositorBridgeChild::AllocPAPZChild(
+    const LayersId& aLayersId) {
+  MOZ_CRASH("Should not be called");
+  return nullptr;
+}
+
+
+uint64_t CompositorBridgeChild::GetNextResourceId() {
+  ++mResourceId;
+  MOZ_RELEASE_ASSERT(mResourceId != UINT32_MAX);
+
+  uint64_t id = mIdNamespace;
+  id = (id << 32) | mResourceId;
+
+  return id;
+}
+
+wr::MaybeExternalImageId CompositorBridgeChild::GetNextExternalImageId() {
+  return Some(wr::ToExternalImageId(GetNextResourceId()));
+}
+
+wr::PipelineId CompositorBridgeChild::GetNextPipelineId() {
+  return wr::AsPipelineId(GetNextResourceId());
+}
+
+FwdTransactionCounter& CompositorBridgeChild::GetFwdTransactionCounter() {
+  return mCompositorManager->GetFwdTransactionCounter();
+}
+
+}  
+}  

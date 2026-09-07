@@ -1,0 +1,1025 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_AsyncPanZoomController_h
+#define mozilla_layers_AsyncPanZoomController_h
+
+#include "Units.h"
+#include "apz/public/APZPublicUtils.h"
+#include "mozilla/layers/CompositorScrollUpdate.h"
+#include "mozilla/layers/GeckoContentController.h"
+#include "mozilla/layers/RepaintRequest.h"
+#include "mozilla/layers/SampleTime.h"
+#include "mozilla/layers/ScrollbarData.h"
+#include "mozilla/layers/ZoomConstraints.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/EventForwards.h"
+#include "mozilla/Monitor.h"
+#include "mozilla/RecursiveMutex.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/ScrollTypes.h"
+#include "mozilla/StaticPrefs_apz.h"
+#include "mozilla/UniquePtr.h"
+#include "InputData.h"
+#include "Axis.h"  // for Axis, Side, etc.
+#include "ExpectedGeckoMetrics.h"
+#include "FlingAccelerator.h"
+#include "InputQueue.h"
+#include "APZUtils.h"
+#include "LayersTypes.h"
+#include "mozilla/gfx/Matrix.h"
+#include "nsRegion.h"
+#include "nsTArray.h"
+#include "RecentEventsBuffer.h"  // for RecentEventsBuffer
+#include "SampledAPZCState.h"
+
+#include <iosfwd>
+
+namespace mozilla {
+
+namespace ipc {
+
+class SharedMemory;
+
+}  
+
+namespace wr {
+struct MinimapData;
+struct SampledScrollOffset;
+}  
+
+namespace layers {
+
+class AsyncDragMetrics;
+class APZCTreeManager;
+struct ScrollableLayerGuid;
+class CompositorController;
+class GestureEventListener;
+struct AsyncTransform;
+class AsyncPanZoomAnimation;
+class StackScrollerFlingAnimation;
+template <typename FlingPhysics>
+class GenericFlingAnimation;
+class AndroidFlingPhysics;
+class DesktopFlingPhysics;
+class InputBlockState;
+struct FlingHandoffState;
+class TouchBlockState;
+class PanGestureBlockState;
+class OverscrollHandoffChain;
+struct OverscrollHandoffState;
+class StateChangeNotificationBlocker;
+class CheckerboardEvent;
+class OverscrollEffectBase;
+class WidgetOverscrollEffect;
+class GenericOverscrollEffect;
+class AndroidSpecificState;
+struct KeyboardScrollAction;
+struct ZoomTarget;
+
+namespace apz {
+struct AsyncScrollThumbTransformer;
+}
+
+class PlatformSpecificStateBase {
+ public:
+  virtual ~PlatformSpecificStateBase() = default;
+  virtual AndroidSpecificState* AsAndroidSpecificState() { return nullptr; }
+  virtual AsyncPanZoomAnimation* CreateFlingAnimation(
+      AsyncPanZoomController& aApzc, const FlingHandoffState& aHandoffState,
+      float aPLPPI);
+  virtual UniquePtr<VelocityTracker> CreateVelocityTracker(Axis* aAxis);
+
+  static void InitializeGlobalState() {}
+};
+
+struct AncestorTransform {
+  gfx::Matrix4x4 mTransform;
+  gfx::Matrix4x4 mPerspectiveTransform;
+
+  AncestorTransform() = default;
+
+  AncestorTransform(const gfx::Matrix4x4& aTransform,
+                    bool aTransformIsPerspective) {
+    (aTransformIsPerspective ? mPerspectiveTransform : mTransform) = aTransform;
+  }
+
+  AncestorTransform(const gfx::Matrix4x4& aTransform,
+                    const gfx::Matrix4x4& aPerspectiveTransform)
+      : mTransform(aTransform), mPerspectiveTransform(aPerspectiveTransform) {}
+
+  gfx::Matrix4x4 CombinedTransform() const {
+    return mTransform * mPerspectiveTransform;
+  }
+
+  bool ContainsPerspectiveTransform() const {
+    return !mPerspectiveTransform.IsIdentity();
+  }
+
+  gfx::Matrix4x4 GetPerspectiveTransform() const {
+    return mPerspectiveTransform;
+  }
+
+  friend AncestorTransform operator*(const AncestorTransform& aA,
+                                     const AncestorTransform& aB) {
+    return AncestorTransform{
+        aA.mTransform * aB.mTransform,
+        aA.mPerspectiveTransform * aB.mPerspectiveTransform};
+  }
+};
+
+struct PointerEventsConsumableFlags {
+  bool mHasRoom = false;
+
+  bool mAllowedByTouchAction = false;
+
+  bool IsConsumable() const { return mHasRoom && mAllowedByTouchAction; }
+  friend bool operator==(const PointerEventsConsumableFlags& aLhs,
+                         const PointerEventsConsumableFlags& aRhs);
+  friend std::ostream& operator<<(std::ostream& aOut,
+                                  const PointerEventsConsumableFlags& aFlags);
+};
+
+class AsyncPanZoomController {
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(AsyncPanZoomController)
+
+  using MonitorAutoLock = mozilla::MonitorAutoLock;
+  using Matrix4x4 = mozilla::gfx::Matrix4x4;
+  using RepaintUpdateType =
+      mozilla::layers::RepaintRequest::ScrollOffsetUpdateType;
+  using ScrollAnimationKind = apz::ScrollAnimationKind;
+
+ public:
+  enum GestureBehavior {
+    DEFAULT_GESTURES,
+    USE_GESTURE_DETECTOR
+  };
+
+  float GetDPI() const;
+
+  ScreenCoord GetTouchStartTolerance() const;
+  ScreenCoord GetTouchMoveTolerance() const;
+  ScreenCoord GetSecondTapTolerance() const;
+
+  AsyncPanZoomController(LayersId aLayersId, APZCTreeManager* aTreeManager,
+                         const RefPtr<InputQueue>& aInputQueue,
+                         GeckoContentController* aController,
+                         GestureBehavior aGestures = DEFAULT_GESTURES);
+
+
+  static void InitializeGlobalState();
+
+
+  void ZoomToRect(const ZoomTarget& aZoomTarget, const uint32_t aFlags);
+
+  void UpdateZoomConstraints(const ZoomConstraints& aConstraints);
+
+  void PostDelayedTask(already_AddRefed<Runnable> aTask, int aDelayMs);
+
+
+  bool AdvanceAnimations(const SampleTime& aSampleTime);
+
+  bool UpdateAnimation(const RecursiveMutexAutoLock& aProofOfLock,
+                       const SampleTime& aSampleTime,
+                       nsTArray<RefPtr<Runnable>>* aOutDeferredTasks);
+
+
+  struct LayersUpdateFlags {
+    bool mIsFirstPaint : 1;
+    bool mThisLayerTreeUpdated : 1;
+  };
+  void NotifyMainThreadTransaction(const ScrollMetadata& aScrollMetadata,
+                                   LayersUpdateFlags aLayersUpdateFlags);
+
+  void SetCompositorController(CompositorController* aCompositorController);
+
+
+  void Destroy();
+
+  bool IsDestroyed() const;
+
+  Matrix4x4 GetTransformToLastDispatchedPaint(
+      const AsyncTransformComponents& aComponents, LayersId aForLayersId) const;
+
+  uint32_t GetCheckerboardMagnitude(
+      const ParentLayerRect& aClippedCompositionBounds) const;
+
+  void ReportCheckerboard(const SampleTime& aSampleTime,
+                          const ParentLayerRect& aClippedCompositionBounds);
+
+  void FlushActiveCheckerboardReport();
+
+  static gfx::Size GetDisplayportAlignmentMultiplier(
+      const ScreenSize& aBaseSize);
+
+  enum class ZoomInProgress {
+    No,
+    Yes,
+  };
+
+  static CSSSize CalculateDisplayPortSize(
+      const CSSSize& aCompositionSize, const CSSPoint& aVelocity,
+      AsyncPanZoomController::ZoomInProgress aZoomInProgress,
+      const CSSToScreenScale2D& aDpPerCSS);
+
+  static const ScreenMargin CalculatePendingDisplayPort(
+      const FrameMetrics& aFrameMetrics, const ParentLayerPoint& aVelocity,
+      ZoomInProgress aZoomInProgress);
+
+  nsEventStatus HandleDragEvent(const MouseInput& aEvent,
+                                const AsyncDragMetrics& aDragMetrics,
+                                OuterCSSCoord aInitialThumbPos,
+                                const CSSRect& aInitialScrollableRect);
+
+  nsEventStatus HandleInputEvent(
+      const InputData& aEvent,
+      const ScreenToParentLayerMatrix4x4& aTransformToApzc);
+
+  nsEventStatus HandleGestureEvent(const InputData& aEvent);
+
+  void StartAutoscroll(const ScreenPoint& aAnchorLocation);
+
+  void StopAutoscroll();
+
+  void GetGuid(ScrollableLayerGuid* aGuidOut) const;
+
+  ScrollableLayerGuid GetGuid() const;
+
+  bool Matches(const ScrollableLayerGuid& aGuid);
+
+  bool HasTreeManager(const APZCTreeManager* aTreeManager) const;
+
+  void StartAnimation(already_AddRefed<AsyncPanZoomAnimation> aAnimation);
+
+  void CancelAnimation(CancelAnimationFlags aFlags = Default);
+
+  void ClearOverscroll();
+  void ClearPhysicalOverscroll();
+
+  bool HasScrollSnapping() const {
+    return mScrollMetadata.GetSnapInfo().HasScrollSnapping();
+  }
+
+  bool IsPannable() const;
+
+  bool IsScrollInfoLayer() const;
+
+  bool IsFlingingFast() const;
+
+  bool IsAutoscroll() const {
+    RecursiveMutexAutoLock lock(mRecursiveMutex);
+    return mState == AUTOSCROLL;
+  }
+
+  int32_t GetLastTouchIdentifier() const;
+
+  ScreenToParentLayerMatrix4x4 GetTransformToThis() const;
+
+  ScreenPoint ToScreenCoordinates(const ParentLayerPoint& aVector,
+                                  const ParentLayerPoint& aAnchor) const;
+
+  ParentLayerPoint ToParentLayerCoordinates(const ScreenPoint& aVector,
+                                            const ScreenPoint& aAnchor) const;
+
+  ParentLayerPoint ToParentLayerCoordinates(const ScreenPoint& aVector,
+                                            const ExternalPoint& aAnchor) const;
+
+  static ExternalPoint ToExternalPoint(const ExternalPoint& aScreenOffset,
+                                       const ScreenPoint& aScreenPoint);
+
+  ScreenPoint PanVector(const ExternalPoint& aPos) const;
+
+  bool CanScroll(const InputData& aEvent) const;
+
+  ScrollDirections GetAllowedHandoffDirections(
+      HandoffConsumer aConsumer = HandoffConsumer::Scrolling) const;
+
+  ScrollDirections GetOverscrollableDirections() const;
+
+  bool CanScroll(const ParentLayerPoint& aDelta) const;
+
+  bool CanScrollOrOverscroll(const ParentLayerPoint& aDelta) const;
+
+  bool CanScrollWithWheel(const ParentLayerPoint& aDelta) const;
+
+  bool CanScroll(ScrollDirection aDirection) const;
+
+  SideBits ScrollableDirections() const;
+
+  bool CanVerticalScrollWithDynamicToolbar() const;
+
+  bool CanScrollDownwards() const;
+
+  bool CanOverscrollUpwards(
+      HandoffConsumer aConsumer = HandoffConsumer::Scrolling) const;
+
+  OuterCSSCoord ConvertScrollbarPoint(const ParentLayerPoint& aScrollbarPoint,
+                                      const ScrollbarData& aThumbData) const;
+
+  void NotifyMozMouseScrollEvent(const nsString& aString) const;
+
+  bool OverscrollBehaviorAllowsSwipe() const;
+
+
+  const FrameMetrics& Metrics() const;
+  FrameMetrics& Metrics();
+
+  class AutoRecordCompositorScrollUpdate;
+  std::vector<CompositorScrollUpdate> GetCompositorScrollUpdates();
+
+ private:
+  std::vector<CompositorScrollUpdate> mUpdatesSinceLastSample;
+
+  CompositorScrollUpdate::Metrics GetCurrentMetricsForCompositorScrollUpdate(
+      const RecursiveMutexAutoLock& aProofOfApzcLock) const;
+
+ public:
+  wr::MinimapData GetMinimapData() const;
+
+  SampleTime GetFrameTime() const;
+
+  bool IsZero(const ParentLayerPoint& aPoint) const;
+  bool IsZero(ParentLayerCoord aCoord) const;
+
+  bool FuzzyGreater(ParentLayerCoord aCoord1, ParentLayerCoord aCoord2) const;
+
+  template <typename T>
+  ParentLayerPoint GetScrollWheelDelta(ScrollWheelInput&, T, T, T, T) = delete;
+
+ private:
+  bool IsContentOfHonouredTargetRightToLeft(bool aHonoursRoot) const;
+
+ protected:
+  virtual ~AsyncPanZoomController();
+
+  nsEventStatus OnTouchStart(const MultiTouchInput& aEvent);
+
+  nsEventStatus OnTouchMove(const MultiTouchInput& aEvent);
+
+  nsEventStatus OnTouchEnd(const MultiTouchInput& aEvent);
+
+  nsEventStatus OnTouchCancel(const MultiTouchInput& aEvent);
+
+  nsEventStatus OnScaleBegin(const PinchGestureInput& aEvent);
+
+  nsEventStatus OnScale(const PinchGestureInput& aEvent);
+
+  nsEventStatus OnScaleEnd(const PinchGestureInput& aEvent);
+
+  nsEventStatus OnPanMayBegin(const PanGestureInput& aEvent);
+  nsEventStatus OnPanCancelled(const PanGestureInput& aEvent);
+  nsEventStatus OnPanBegin(const PanGestureInput& aEvent);
+  enum class FingersOnTouchpad {
+    Yes,
+    No,
+  };
+  nsEventStatus OnPan(const PanGestureInput& aEvent,
+                      FingersOnTouchpad aFingersOnTouchpad);
+  nsEventStatus OnPanEnd(const PanGestureInput& aEvent);
+  nsEventStatus OnPanMomentumStart(const PanGestureInput& aEvent);
+  nsEventStatus OnPanMomentumEnd(const PanGestureInput& aEvent);
+  nsEventStatus HandleEndOfPan();
+  nsEventStatus OnPanInterrupted(const PanGestureInput& aEvent);
+
+  nsEventStatus OnScrollWheel(const ScrollWheelInput& aEvent);
+
+  ParentLayerPoint GetScrollWheelDelta(const ScrollWheelInput& aEvent) const;
+
+  ParentLayerPoint GetScrollWheelDelta(const ScrollWheelInput& aEvent,
+                                       double aDeltaX, double aDeltaY,
+                                       double aMultiplierX,
+                                       double aMultiplierY) const;
+
+  nsEventStatus OnKeyboard(const KeyboardInput& aEvent);
+
+  CSSPoint GetKeyboardDestination(const KeyboardScrollAction& aAction) const;
+
+  ScrollSnapFlags GetScrollSnapFlagsForKeyboardAction(
+      const KeyboardScrollAction& aAction) const;
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  nsEventStatus OnLongPress(const TapGestureInput& aEvent);
+  nsEventStatus OnLongPressUp(const TapGestureInput& aEvent);
+
+  nsEventStatus OnSingleTapUp(const TapGestureInput& aEvent);
+
+  nsEventStatus OnSingleTapConfirmed(const TapGestureInput& aEvent);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  nsEventStatus OnDoubleTap(const TapGestureInput& aEvent);
+
+  nsEventStatus OnSecondTap(const TapGestureInput& aEvent);
+
+  nsEventStatus OnCancelTap(const TapGestureInput& aEvent);
+
+
+  void SetVisualScrollOffset(const CSSPoint& aOffset);
+
+  void ClampAndSetVisualScrollOffset(const CSSPoint& aOffset);
+
+  void ScrollBy(const CSSPoint& aOffset);
+
+  void ScrollByAndClamp(const CSSPoint& aOffset);
+
+  void ScrollByAndClamp(ViewportType aViewportToScroll,
+                        const CSSPoint& aOffset);
+
+  void ScrollToAndClamp(ViewportType aViewportToScroll,
+                        const CSSPoint& aDestination);
+
+  void ScaleWithFocus(float aScale, const CSSPoint& aFocus);
+
+  void ScheduleComposite();
+
+  void ScheduleCompositeAndMaybeRepaint();
+
+  ParentLayerPoint PanStart() const;
+
+  const ParentLayerPoint GetVelocityVector() const;
+
+  void SetVelocityVector(const ParentLayerPoint& aVelocityVector);
+
+  ParentLayerPoint GetFirstTouchPoint(const MultiTouchInput& aEvent);
+
+  ExternalPoint GetExternalPoint(const InputData& aEvent);
+
+  static ExternalPoint GetFirstExternalTouchPoint(
+      const MultiTouchInput& aEvent);
+
+  ParentLayerPoint GetOverscrollAmount() const;
+
+ private:
+  ParentLayerPoint GetOverscrollAmountInternal() const;
+
+  bool BlocksPullToRefreshForOverflowHidden() const;
+
+ protected:
+  SideBits GetOverscrollSideBits() const;
+
+  void RestoreOverscrollAmount(const ParentLayerPoint& aOverscroll);
+
+  void HandlePanningWithTouchAction(const ParentLayerPoint& aVector);
+
+  void HandlePanning(const ParentLayerPoint& aVector);
+
+  void HandlePanningUpdate(const ScreenPoint& aDelta);
+
+  void HandlePinchLocking(const PinchGestureInput& aEvent);
+
+  nsEventStatus StartPanning(const ExternalPoint& aStartPoint,
+                             const TimeStamp& aEventTime);
+
+  void UpdateWithTouchAtDevicePoint(const MultiTouchInput& aEvent);
+
+  void TrackTouch(const MultiTouchInput& aEvent);
+
+  void StartTouch(const ParentLayerPoint& aPoint, TimeStamp aTimestamp);
+
+  void EndTouch(TimeStamp aTimestamp, Axis::ClearAxisLock aClearAxisLock);
+
+  void RequestContentRepaint(
+      RepaintUpdateType aUpdateType = RepaintUpdateType::eUserAction);
+
+  void RequestContentRepaint(const ParentLayerPoint& aVelocity,
+                             const ScreenMargin& aDisplayportMargins,
+                             RepaintUpdateType aUpdateType);
+
+  const FrameMetrics& GetFrameMetrics() const;
+
+  const ScrollMetadata& GetScrollMetadata() const;
+
+  APZCTreeManager* GetApzcTreeManager() const;
+
+  void AssertOnSamplerThread() const;
+  void AssertOnUpdaterThread() const;
+
+  Maybe<LayoutDevicePoint> ConvertToGecko(const ScreenIntPoint& aPoint);
+
+  enum class AxisLockMode {
+    FREE,     
+    STANDARD, 
+    STICKY,   
+    DOMINANT_AXIS, 
+    BREAKABLE,     
+  };
+
+  static AxisLockMode GetAxisLockMode();
+
+  bool UsingStatefulAxisLock() const;
+
+  enum PinchLockMode {
+    PINCH_FREE,     
+    PINCH_STANDARD, 
+    PINCH_STICKY,   
+  };
+
+  static PinchLockMode GetPinchLockMode();
+
+  nsEventStatus GenerateSingleTap(GeckoContentController::TapType aType,
+                                  const ScreenIntPoint& aPoint,
+                                  mozilla::Modifiers aModifiers);
+
+  void OnTouchEndOrCancel();
+
+  LayersId mLayersId;
+  RefPtr<CompositorController> mCompositorController;
+
+  RefPtr<GeckoContentController> mGeckoContentController
+      MOZ_GUARDED_BY(mRefPtrMonitor);
+  RefPtr<GestureEventListener> mGestureEventListener
+      MOZ_GUARDED_BY(mRefPtrMonitor);
+  mutable Monitor mRefPtrMonitor;
+
+  Atomic<APZCTreeManager*> mTreeManager;
+
+  already_AddRefed<GeckoContentController> GetGeckoContentController() const;
+  already_AddRefed<GestureEventListener> GetGestureEventListener() const;
+
+  PlatformSpecificStateBase* GetPlatformSpecificState();
+
+  bool ZoomConstraintsAllowZoom() const;
+  bool ZoomConstraintsAllowDoubleTapZoom() const;
+
+ protected:
+  ScrollMetadata mScrollMetadata;
+
+  mutable RecursiveMutex mRecursiveMutex;
+
+ private:
+  ScrollMetadata mLastContentPaintMetadata;
+  FrameMetrics& mLastContentPaintMetrics;  
+  RepaintRequest mLastPaintRequestMetrics;
+  ExpectedGeckoMetrics mExpectedGeckoMetrics;
+
+  std::deque<SampledAPZCState> mSampledState;
+
+  UniquePtr<PlatformSpecificStateBase> mPlatformSpecificState;
+
+  bool mPanDirRestricted;
+
+  bool mPinchLocked;
+
+  RecentEventsBuffer<PinchGestureInput> mPinchEventBuffer;
+
+  RecentEventsBuffer<MultiTouchInput> mTouchScrollEventBuffer;
+
+  ZoomConstraints mZoomConstraints;
+
+  SampleTime mLastSampleTime;
+
+  SampleTime mLastCheckerboardReport;
+
+  ParentLayerPoint mLastZoomFocus;
+
+  CSSToParentLayerScale mLastNotifiedZoom;
+
+  RefPtr<AsyncPanZoomAnimation> mAnimation;
+
+  UniquePtr<OverscrollEffectBase> mOverscrollEffect;
+
+  Maybe<uint64_t> mZoomAnimationId;
+
+  ExternalPoint mStartTouch;
+
+  Maybe<CompositionPayload> mScrollPayload;
+
+  APZScrollGeneration mScrollGeneration;
+
+  friend class Axis;
+
+ public:
+  Maybe<CompositionPayload> NotifyScrollSampling();
+
+  template <typename Callable>
+  auto CallWithLastContentPaintMetrics(const Callable& callable) const
+      -> decltype(callable(mLastContentPaintMetrics)) {
+    RecursiveMutexAutoLock lock(mRecursiveMutex);
+    return callable(mLastContentPaintMetrics);
+  }
+
+  void SetZoomAnimationId(const Maybe<uint64_t>& aZoomAnimationId);
+  Maybe<uint64_t> GetZoomAnimationId() const;
+
+ public:
+  static const AsyncTransformConsumer eForEventHandling =
+      AsyncTransformConsumer::eForEventHandling;
+  static const AsyncTransformConsumer eForCompositing =
+      AsyncTransformConsumer::eForCompositing;
+
+  ParentLayerPoint GetCurrentAsyncScrollOffset(
+      AsyncTransformConsumer aMode) const;
+
+  CSSRect GetCurrentAsyncVisualViewport(AsyncTransformConsumer aMode) const;
+
+  AsyncTransformComponentMatrix GetOverscrollTransform(
+      AsyncTransformConsumer aMode) const;
+
+  AsyncTransform GetCurrentAsyncTransform(
+      AsyncTransformConsumer aMode,
+      AsyncTransformComponents aComponents = LayoutAndVisual,
+      std::size_t aSampleIndex = 0) const;
+
+  AsyncTransformComponentMatrix GetAsyncTransformForInputTransformation(
+      AsyncTransformComponents aComponents, LayersId aForLayersId) const;
+
+  Matrix4x4 GetPaintedResolutionTransform() const;
+
+  AutoTArray<wr::SampledScrollOffset, 2> GetSampledScrollOffsets() const;
+
+  LayoutDeviceToParentLayerScale GetCurrentPinchZoomScale(
+      AsyncTransformConsumer aMode) const;
+
+  ParentLayerRect GetCompositionBounds() const {
+    RecursiveMutexAutoLock lock(mRecursiveMutex);
+    return mScrollMetadata.GetMetrics().GetCompositionBounds();
+  }
+
+  LayoutDeviceToLayerScale GetCumulativeResolution() const {
+    RecursiveMutexAutoLock lock(mRecursiveMutex);
+    return mScrollMetadata.GetMetrics().GetCumulativeResolution();
+  }
+
+  CSSRect GetScrollableRect() const {
+    RecursiveMutexAutoLock lock(mRecursiveMutex);
+    return mScrollMetadata.GetMetrics().GetScrollableRect();
+  }
+
+  CSSToParentLayerScale GetZoom() const {
+    RecursiveMutexAutoLock lock(mRecursiveMutex);
+    return Metrics().GetZoom();
+  }
+
+  CSSRect GetVisualViewport() const {
+    MOZ_ASSERT(IsRootContent());
+    RecursiveMutexAutoLock lock(mRecursiveMutex);
+    return Metrics().GetVisualViewport();
+  }
+
+  CSSPoint GetLayoutScrollOffset() const {
+    RecursiveMutexAutoLock lock(mRecursiveMutex);
+    return Metrics().GetLayoutScrollOffset();
+  }
+
+  ParentLayerPoint GetDeltaForEvent(const InputData& aEvent) const;
+
+  CSSRect GetCurrentScrollRangeInCssPixels() const;
+
+  bool AllowOneTouchPinch() const;
+
+ private:
+  void AdvanceToNextSample();
+
+  bool HavePendingFrameDelayedOffset() const;
+
+  bool SampleCompositedAsyncTransform(
+      const RecursiveMutexAutoLock& aProofOfLock);
+
+  void ResampleCompositedAsyncTransform(
+      const RecursiveMutexAutoLock& aProofOfLock);
+
+  CSSRect GetEffectiveLayoutViewport(AsyncTransformConsumer aMode,
+                                     const RecursiveMutexAutoLock& aProofOfLock,
+                                     std::size_t aSampleIndex = 0) const;
+  CSSPoint GetEffectiveScrollOffset(AsyncTransformConsumer aMode,
+                                    const RecursiveMutexAutoLock& aProofOfLock,
+                                    std::size_t aSampleIndex = 0) const;
+  CSSToParentLayerScale GetEffectiveZoom(
+      AsyncTransformConsumer aMode, const RecursiveMutexAutoLock& aProofOfLock,
+      std::size_t aSampleIndex = 0) const;
+
+  CSSRect GetVisibleRect(const RecursiveMutexAutoLock& aProofOfLock) const;
+
+  std::tuple<ParentLayerPoint, ScreenPoint> GetDisplacementsForPanGesture(
+      const PanGestureInput& aEvent);
+
+  CSSPoint ToCSSPixels(ParentLayerPoint value) const;
+  CSSCoord ToCSSPixels(ParentLayerCoord value) const;
+
+ private:
+  friend class AutoApplyAsyncTestAttributes;
+  friend class AutoDynamicToolbarHider;
+
+  bool SuppressAsyncScrollOffset() const;
+
+  void ApplyAsyncTestAttributes(const RecursiveMutexAutoLock& aProofOfLock);
+
+  void UnapplyAsyncTestAttributes(const RecursiveMutexAutoLock& aProofOfLock,
+                                  const FrameMetrics& aPrevFrameMetrics,
+                                  const ParentLayerPoint& aPrevOverscroll);
+
+ protected:
+  enum PanZoomState {
+    NOTHING,  
+    FLING,    
+    TOUCHING, 
+
+    PANNING,          
+    PANNING_LOCKED_X, 
+    PANNING_LOCKED_Y, 
+
+    PAN_MOMENTUM, 
+
+    PINCHING, 
+    ANIMATING_ZOOM,       
+    OVERSCROLL_ANIMATION, 
+    SMOOTH_SCROLL,        
+    AUTOSCROLL,           
+    SCROLLBAR_DRAG        
+  };
+  PanZoomState mState;
+
+  AxisX mX;
+  AxisY mY;
+
+  static bool IsPanningState(PanZoomState aState);
+
+  bool IsDelayedTransformEndSet();
+
+  void SetDelayedTransformEnd(bool aDelayedTransformEnd);
+
+  bool InScrollAnimation(ScrollAnimationKind aKind) const;
+
+  bool InScrollAnimationTriggeredByScript() const;
+
+  static bool CanHandleScrollOffsetUpdate(PanZoomState aState);
+
+  bool ShouldCancelAnimationForScrollUpdate(
+      const Maybe<CSSPoint>& aRelativeDelta);
+
+ private:
+  friend class StateChangeNotificationBlocker;
+  friend class ThreadSafeStateChangeNotificationBlocker;
+  int mNotificationBlockers;
+
+  PanZoomState SetStateNoContentControllerDispatch(PanZoomState aNewState);
+
+  void SetState(PanZoomState aNewState);
+  PanZoomState GetState() const;
+  void DispatchStateChangeNotification(PanZoomState aOldState,
+                                       PanZoomState aNewState);
+
+  void SendTransformBeginAndEnd();
+
+  bool IsInTransformingState() const;
+  static bool IsTransformingState(PanZoomState aState);
+
+ public:
+  void FlushRepaintForNewInputBlock();
+
+  PointerEventsConsumableFlags ArePointerEventsConsumable(
+      const TouchBlockState* aBlock, const MultiTouchInput& aInput) const;
+
+  void ResetTouchInputState();
+
+  void ResetPanGestureInputState();
+
+  const RefPtr<InputQueue>& GetInputQueue() const;
+
+ private:
+  void CancelAnimationAndGestureState();
+
+  RefPtr<InputQueue> mInputQueue;
+  InputBlockState* GetCurrentInputBlock() const;
+  TouchBlockState* GetCurrentTouchBlock() const;
+  bool HasReadyTouchBlock() const;
+
+  PanGestureBlockState* GetCurrentPanGestureBlock() const;
+  PinchGestureBlockState* GetCurrentPinchGestureBlock() const;
+
+ private:
+ public:
+  ParentLayerPoint AttemptFling(const FlingHandoffState& aHandoffState);
+
+  ParentLayerPoint AdjustHandoffVelocityForOverscrollBehavior(
+      ParentLayerPoint& aHandoffVelocity) const;
+
+ private:
+  friend class StackScrollerFlingAnimation;
+  friend class AutoscrollAnimation;
+  template <typename FlingPhysics>
+  friend class GenericFlingAnimation;
+  friend class AndroidFlingPhysics;
+  friend class DesktopFlingPhysics;
+  friend class OverscrollAnimation;
+  friend class GenericScrollAnimation;
+  friend class SmoothScrollAnimation;
+  friend class ZoomAnimation;
+
+  friend class GenericOverscrollEffect;
+  friend class WidgetOverscrollEffect;
+  friend struct apz::AsyncScrollThumbTransformer;
+
+  FlingAccelerator mFlingAccelerator;
+
+  bool mPinchPaintTimerSet;
+
+  bool mDelayedTransformEnd;
+
+  void HandleFlingOverscroll(
+      const ParentLayerPoint& aVelocity, SideBits aOverscrollSideBits,
+      const RefPtr<const OverscrollHandoffChain>& aOverscrollHandoffChain,
+      const RefPtr<const AsyncPanZoomController>& aScrolledApzc);
+
+  void StartOverscrollAnimation(const ParentLayerPoint& aVelocity,
+                                SideBits aOverscrollSideBits);
+
+  void SmoothScrollTo(CSSSnapDestination&& aDestination,
+                      ScrollTriggeredByScript aTriggeredByScript,
+                      ScrollAnimationKind aAnimationKind,
+                      ViewportType aViewportToScroll, ScrollOrigin aOrigin,
+                      TimeStamp aStartTime);
+
+  ParentLayerPoint ConvertDestinationToDelta(CSSPoint& aDestination) const;
+
+  bool AllowScrollHandoffInCurrentBlock() const;
+
+  void DoDelayedRequestContentRepaint();
+
+  void DoDelayedTransformEndNotification(PanZoomState aOldState);
+
+  float ComputePLPPI(ParentLayerPoint aPoint,
+                     ParentLayerPoint aDirection) const;
+
+  Maybe<CSSPoint> GetCurrentAnimationDestination(
+      const RecursiveMutexAutoLock& aProofOfLock) const;
+
+ public:
+  void SetParent(AsyncPanZoomController* aParent) { mParent = aParent; }
+
+  AsyncPanZoomController* GetParent() const { return mParent; }
+
+  bool HasNoParentWithSameLayersId() const {
+    return !mParent || (mParent->mLayersId != mLayersId);
+  }
+
+  bool IsRootForLayersId() const {
+    RecursiveMutexAutoLock lock(mRecursiveMutex);
+    return mScrollMetadata.IsLayersIdRoot();
+  }
+
+  bool IsRootContent() const {
+    RecursiveMutexAutoLock lock(mRecursiveMutex);
+    return Metrics().IsRootContent();
+  }
+
+ private:
+
+  RefPtr<AsyncPanZoomController> mParent;
+
+
+  ScrollableLayerGuid::ViewID GetScrollId() const {
+    RecursiveMutexAutoLock lock(mRecursiveMutex);
+    return Metrics().GetScrollId();
+  }
+
+ public:
+  ScrollableLayerGuid::ViewID GetScrollHandoffParentId() const {
+    return mScrollMetadata.GetScrollParentId();
+  }
+
+  bool AttemptScroll(ParentLayerPoint& aStartPoint, ParentLayerPoint& aEndPoint,
+                     OverscrollHandoffState& aOverscrollHandoffState);
+
+  void FlushRepaintForOverscrollHandoff();
+
+  bool SnapBackIfOverscrolled();
+
+  bool SnapBackIfOverscrolledForMomentum(const ParentLayerPoint& aVelocity);
+
+  RefPtr<const OverscrollHandoffChain> BuildOverscrollHandoffChain();
+
+ private:
+  bool CallDispatchScroll(ParentLayerPoint& aStartPoint,
+                          ParentLayerPoint& aEndPoint,
+                          OverscrollHandoffState& aOverscrollHandoffState);
+
+  void RecordScrollPayload(const TimeStamp& aTimeStamp);
+
+  void OverscrollForPanning(ParentLayerPoint& aOverscroll,
+                            const ScreenPoint& aPanDistance);
+
+  void OverscrollBy(ParentLayerPoint& aOverscroll);
+
+ public:
+  void SetAncestorTransform(const AncestorTransform& aAncestorTransform) {
+    mAncestorTransform = aAncestorTransform;
+  }
+
+  Matrix4x4 GetAncestorTransform() const {
+    return mAncestorTransform.CombinedTransform();
+  }
+
+  bool AncestorTransformContainsPerspective() const {
+    return mAncestorTransform.ContainsPerspectiveTransform();
+  }
+
+  Matrix4x4 GetAncestorTransformPerspective() const {
+    return mAncestorTransform.GetPerspectiveTransform();
+  }
+
+  bool Contains(const ScreenIntPoint& aPoint) const;
+
+  bool IsInOverscrollGutter(const ScreenPoint& aHitTestPoint) const;
+  bool IsInOverscrollGutter(const ParentLayerPoint& aHitTestPoint) const;
+
+  bool IsOverscrolled() const;
+
+  bool IsOverscrollAnimationRunning() const {
+    RecursiveMutexAutoLock lock(mRecursiveMutex);
+    return mState == OVERSCROLL_ANIMATION;
+  }
+
+  bool IsPhysicallyOverscrolled() const;
+
+ private:
+  bool IsInInvalidOverscroll() const;
+
+ public:
+  bool IsInPanningState() const;
+
+  bool IsInScrollingGesture() const;
+
+ private:
+  AncestorTransform mAncestorTransform;
+
+ public:
+  bool TestHasAsyncKeyScrolled() const { return mTestHasAsyncKeyScrolled; }
+
+  void SetTestAsyncScrollOffset(const CSSPoint& aPoint);
+  void SetTestAsyncZoom(const LayerToParentLayerScale& aZoom);
+
+  LayersId GetLayersId() const { return mLayersId; }
+
+  bool IsAsyncZooming() const {
+    RecursiveMutexAutoLock lock(mRecursiveMutex);
+    return mState == PINCHING || mState == ANIMATING_ZOOM;
+  }
+
+  void SetFixedLayerMargins(const ScreenMargin& aMargins);
+
+ private:
+  TimeStamp mTouchStartTime;
+  TimeStamp mAutoscrollStartTime;
+  struct TouchSample {
+    ExternalPoint mPosition;
+    TimeStamp mTimeStamp;
+  };
+  TouchSample mLastTouch;
+  TimeDuration mTouchStartRestingTimeBeforePan;
+  Maybe<ParentLayerCoord> mMinimumVelocityDuringPan;
+  ScrollSnapTargetIds mLastSnapTargetIds;
+  ScreenMargin mCompositorFixedLayerMargins;
+  CSSPoint mTestAsyncScrollOffset;
+  LayerToParentLayerScale mTestAsyncZoom;
+  uint8_t mTestAttributeAppliers;
+  bool mTestHasAsyncKeyScrolled;
+
+ private:
+  void UpdateCheckerboardEvent(const MutexAutoLock& aProofOfLock,
+                               uint32_t aMagnitude);
+
+  Mutex mCheckerboardEventLock;
+  UniquePtr<CheckerboardEvent> mCheckerboardEvent;
+
+  Maybe<CSSSnapDestination> MaybeAdjustDeltaForScrollSnapping(
+      ScrollUnit aUnit, ScrollSnapFlags aSnapFlags, ParentLayerPoint& aDelta,
+      const CSSPoint& aStartPosition);
+
+  Maybe<CSSSnapDestination> MaybeAdjustDeltaForScrollSnappingOnWheelInput(
+      const ScrollWheelInput& aEvent, ParentLayerPoint& aDelta,
+      const CSSPoint& aStartPosition);
+
+  Maybe<CSSSnapDestination> MaybeAdjustDestinationForScrollSnapping(
+      const KeyboardInput& aEvent, CSSPoint& aDestination,
+      ScrollSnapFlags aSnapFlags);
+
+  void ScrollSnap(ScrollSnapFlags aSnapFlags);
+
+  void ScrollSnapToDestination();
+
+  void ScrollSnapNear(const CSSPoint& aDestination, ScrollSnapFlags aSnapFlags);
+
+  Maybe<CSSSnapDestination> FindSnapPointNear(const CSSPoint& aDestination,
+                                              ScrollUnit aUnit,
+                                              ScrollSnapFlags aSnapFlags);
+
+  Maybe<std::pair<MultiTouchInput, MultiTouchInput>> MaybeSplitTouchMoveEvent(
+      const MultiTouchInput& aOriginalEvent, ScreenCoord aPanThreshold,
+      float aVectorLength, ExternalPoint& aExtPoint);
+
+  CSSPoint MaybeFillOutOverscrollGutter(
+      const RecursiveMutexAutoLock& aProofOfLock);
+
+  ScreenMargin GetFixedLayerMargins(
+      const RecursiveMutexAutoLock& aProofOfLock) const;
+
+  friend std::ostream& operator<<(
+      std::ostream& aOut, const AsyncPanZoomController::PanZoomState& aState);
+};
+
+}  
+}  
+
+#endif  // mozilla_layers_PanZoomController_h

@@ -1,0 +1,617 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef frontend_SharedContext_h
+#define frontend_SharedContext_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/Maybe.h"
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include "jstypes.h"
+
+#include "frontend/FunctionSyntaxKind.h"  // FunctionSyntaxKind
+#include "frontend/ParserAtom.h"          // TaggedParserAtomIndex
+#include "frontend/ScopeIndex.h"          // ScopeIndex
+#include "frontend/ScriptIndex.h"         // ScriptIndex
+#include "js/ColumnNumber.h"              // JS::LimitedColumnNumberOneOrigin
+#include "vm/FunctionFlags.h"             // js::FunctionFlags
+#include "vm/GeneratorAndAsyncKind.h"  // js::GeneratorKind, js::FunctionAsyncKind
+#include "vm/Scope.h"
+#include "vm/ScopeKind.h"
+#include "vm/SharedStencil.h"
+#include "vm/StencilEnums.h"
+
+namespace JS {
+class JS_PUBLIC_API ReadOnlyCompileOptions;
+struct WasmModule;
+}  
+
+namespace js {
+
+class FrontendContext;
+
+namespace frontend {
+
+struct CompilationState;
+class FunctionBox;
+class FunctionNode;
+class ParseContext;
+class ScriptStencil;
+class ScriptStencilExtra;
+struct ScopeContext;
+
+enum class StatementKind : uint8_t {
+  Label,
+  Block,
+  If,
+  Switch,
+  With,
+  Catch,
+  Try,
+  Finally,
+  ForLoopLexicalHead,
+  ForLoop,
+  ForInLoop,
+  ForOfLoop,
+  DoLoop,
+  WhileLoop,
+  Class,
+
+  Spread,
+  YieldStar,
+};
+
+static inline bool StatementKindIsLoop(StatementKind kind) {
+  return kind == StatementKind::ForLoop || kind == StatementKind::ForInLoop ||
+         kind == StatementKind::ForOfLoop || kind == StatementKind::DoLoop ||
+         kind == StatementKind::WhileLoop || kind == StatementKind::Spread ||
+         kind == StatementKind::YieldStar;
+}
+
+static inline bool StatementKindIsUnlabeledBreakTarget(StatementKind kind) {
+  return StatementKindIsLoop(kind) || kind == StatementKind::Switch;
+}
+
+class Directives {
+  bool strict_;
+
+ public:
+  explicit Directives(bool strict) : strict_(strict) {}
+  explicit Directives(ParseContext* parent);
+
+  void setStrict() { strict_ = true; }
+  bool strict() const { return strict_; }
+
+  Directives& operator=(Directives rhs) {
+    strict_ = rhs.strict_;
+    return *this;
+  }
+  bool operator==(const Directives& rhs) const {
+    return strict_ == rhs.strict_;
+  }
+  bool operator!=(const Directives& rhs) const { return !(*this == rhs); }
+};
+
+enum class ThisBinding : uint8_t {
+  Global,
+  Module,
+  Function,
+  DerivedConstructor
+};
+
+enum class InheritThis { No, Yes };
+
+class GlobalSharedContext;
+class EvalSharedContext;
+class ModuleSharedContext;
+class SuspendableContext;
+
+#define IMMUTABLE_FLAG_GETTER_SETTER(lowerName, name) \
+  GENERIC_FLAG_GETTER_SETTER(ImmutableFlags, lowerName, name)
+
+#define IMMUTABLE_FLAG_GETTER(lowerName, name) \
+  GENERIC_FLAG_GETTER(ImmutableFlags, lowerName, name)
+
+class SharedContext {
+ public:
+  FrontendContext* const fc_;
+
+ protected:
+  ImmutableScriptFlags immutableFlags_ = {};
+
+  SourceExtent extent_ = {};
+
+ protected:
+  ThisBinding thisBinding_ = ThisBinding::Global;
+
+  bool allowNewTarget_ : 1;
+  bool allowSuperProperty_ : 1;
+  bool allowSuperCall_ : 1;
+  bool allowArguments_ : 1;
+  bool inWith_ : 1;
+  bool inClass_ : 1;
+
+  bool localStrict : 1;
+
+  bool hasExplicitUseStrict_ : 1;
+
+  bool isScriptExtraFieldCopiedToStencil : 1;
+
+  bool eligibleForArgumentsLength : 1;
+
+
+  enum class Kind : uint8_t { FunctionBox, Global, Eval, Module };
+
+  using ImmutableFlags = ImmutableScriptFlagsEnum;
+
+  [[nodiscard]] bool hasFlag(ImmutableFlags flag) const {
+    return immutableFlags_.hasFlag(flag);
+  }
+  void setFlag(ImmutableFlags flag, bool b = true) {
+    MOZ_ASSERT(!isScriptExtraFieldCopiedToStencil);
+    immutableFlags_.setFlag(flag, b);
+  }
+  void clearFlag(ImmutableFlags flag) {
+    MOZ_ASSERT(!isScriptExtraFieldCopiedToStencil);
+    immutableFlags_.clearFlag(flag);
+  }
+
+ public:
+  SharedContext(FrontendContext* fc, Kind kind,
+                const JS::ReadOnlyCompileOptions& options,
+                Directives directives, SourceExtent extent);
+
+  IMMUTABLE_FLAG_GETTER_SETTER(isForEval, IsForEval)
+  IMMUTABLE_FLAG_GETTER_SETTER(isModule, IsModule)
+  IMMUTABLE_FLAG_GETTER_SETTER(isFunction, IsFunction)
+  IMMUTABLE_FLAG_GETTER_SETTER(selfHosted, SelfHosted)
+  IMMUTABLE_FLAG_GETTER_SETTER(forceStrict, ForceStrict)
+  IMMUTABLE_FLAG_GETTER_SETTER(hasNonSyntacticScope, HasNonSyntacticScope)
+  IMMUTABLE_FLAG_GETTER_SETTER(noScriptRval, NoScriptRval)
+  IMMUTABLE_FLAG_GETTER(treatAsRunOnce, TreatAsRunOnce)
+  IMMUTABLE_FLAG_GETTER_SETTER(hasModuleGoal, HasModuleGoal)
+  IMMUTABLE_FLAG_GETTER_SETTER(hasInnerFunctions, HasInnerFunctions)
+  IMMUTABLE_FLAG_GETTER_SETTER(hasDirectEval, HasDirectEval)
+  IMMUTABLE_FLAG_GETTER_SETTER(bindingsAccessedDynamically,
+                               BindingsAccessedDynamically)
+  IMMUTABLE_FLAG_GETTER_SETTER(hasCallSiteObj, HasCallSiteObj)
+
+  const SourceExtent& extent() const { return extent_; }
+
+  bool isFunctionBox() const { return isFunction(); }
+  inline FunctionBox* asFunctionBox();
+  bool isModuleContext() const { return isModule(); }
+  inline ModuleSharedContext* asModuleContext();
+  bool isSuspendableContext() const { return isFunction() || isModule(); }
+  inline SuspendableContext* asSuspendableContext();
+  bool isGlobalContext() const {
+    return !(isFunction() || isModule() || isForEval());
+  }
+  inline GlobalSharedContext* asGlobalContext();
+  bool isEvalContext() const { return isForEval(); }
+  inline EvalSharedContext* asEvalContext();
+
+  bool isTopLevelContext() const { return !isFunction(); }
+
+  ThisBinding thisBinding() const { return thisBinding_; }
+  bool hasFunctionThisBinding() const {
+    return thisBinding() == ThisBinding::Function ||
+           thisBinding() == ThisBinding::DerivedConstructor;
+  }
+  bool needsThisTDZChecks() const {
+    return thisBinding() == ThisBinding::DerivedConstructor;
+  }
+
+  bool isSelfHosted() const { return selfHosted(); }
+  bool allowNewTarget() const { return allowNewTarget_; }
+  bool allowSuperProperty() const { return allowSuperProperty_; }
+  bool allowSuperCall() const { return allowSuperCall_; }
+  bool allowArguments() const { return allowArguments_; }
+  bool inWith() const { return inWith_; }
+  bool inClass() const { return inClass_; }
+
+  bool hasExplicitUseStrict() const { return hasExplicitUseStrict_; }
+  void setExplicitUseStrict() { hasExplicitUseStrict_ = true; }
+
+  ImmutableScriptFlags immutableFlags() const { return immutableFlags_; }
+
+  bool allBindingsClosedOver() const { return bindingsAccessedDynamically(); }
+
+  bool strict() const { return hasFlag(ImmutableFlags::Strict) || localStrict; }
+  void setStrictScript() { setFlag(ImmutableFlags::Strict); }
+  bool setLocalStrictMode(bool strict) {
+    bool retVal = localStrict;
+    localStrict = strict;
+    return retVal;
+  }
+
+  bool isEligibleForArgumentsLength() const {
+    return eligibleForArgumentsLength && !bindingsAccessedDynamically();
+  }
+  void setIneligibleForArgumentsLength() { eligibleForArgumentsLength = false; }
+
+  void copyScriptExtraFields(ScriptStencilExtra& scriptExtra);
+};
+
+class MOZ_STACK_CLASS GlobalSharedContext : public SharedContext {
+  ScopeKind scopeKind_;
+
+ public:
+  GlobalScope::ParserData* bindings;
+
+  GlobalSharedContext(FrontendContext* fc, ScopeKind scopeKind,
+                      const JS::ReadOnlyCompileOptions& options,
+                      Directives directives, SourceExtent extent);
+
+  ScopeKind scopeKind() const { return scopeKind_; }
+};
+
+inline GlobalSharedContext* SharedContext::asGlobalContext() {
+  MOZ_ASSERT(isGlobalContext());
+  return static_cast<GlobalSharedContext*>(this);
+}
+
+class MOZ_STACK_CLASS EvalSharedContext : public SharedContext {
+ public:
+  EvalScope::ParserData* bindings;
+
+  EvalSharedContext(FrontendContext* fc, CompilationState& compilationState,
+                    SourceExtent extent);
+};
+
+inline EvalSharedContext* SharedContext::asEvalContext() {
+  MOZ_ASSERT(isEvalContext());
+  return static_cast<EvalSharedContext*>(this);
+}
+
+enum class HasHeritage { No, Yes };
+
+class SuspendableContext : public SharedContext {
+ public:
+  SuspendableContext(FrontendContext* fc, Kind kind,
+                     const JS::ReadOnlyCompileOptions& options,
+                     Directives directives, SourceExtent extent,
+                     bool isGenerator, bool isAsync);
+
+  IMMUTABLE_FLAG_GETTER_SETTER(isAsync, IsAsync)
+  IMMUTABLE_FLAG_GETTER_SETTER(isGenerator, IsGenerator)
+
+  bool needsFinalYield() const { return isGenerator() || isAsync(); }
+  bool needsDotGeneratorName() const { return isGenerator() || isAsync(); }
+  bool needsClearSlotsOnExit() const { return isGenerator() || isAsync(); }
+  bool needsIteratorResult() const { return isGenerator() && !isAsync(); }
+  bool needsPromiseResult() const { return isAsync() && !isGenerator(); }
+};
+
+class FunctionBox : public SuspendableContext {
+  friend struct GCThingList;
+
+  CompilationState& compilationState_;
+
+  mozilla::Maybe<ScopeIndex> enclosingScopeIndex_;
+
+  LexicalScope::ParserData* namedLambdaBindings_ = nullptr;
+
+  FunctionScope::ParserData* functionScopeBindings_ = nullptr;
+
+  VarScope::ParserData* extraVarScopeBindings_ = nullptr;
+
+  TaggedParserAtomIndex atom_;
+
+  ScriptIndex funcDataIndex_ = ScriptIndex(-1);
+
+  FunctionFlags flags_ = {};
+
+  uint16_t length_ = 0;
+
+  uint16_t nargs_ = 0;
+
+  MemberInitializers memberInitializers_ = MemberInitializers::Invalid();
+
+ public:
+  bool emitBytecode : 1;
+
+  bool wasEmittedByEnclosingScript_ : 1;
+
+  bool isAnnexB : 1;
+
+  bool hasParameterExprs : 1;
+  bool hasDestructuringArgs : 1;
+  bool hasDuplicateParameters : 1;
+
+  bool hasExprBody_ : 1;
+
+  bool allowReturn_ : 1;
+
+  bool isFunctionFieldCopiedToStencil : 1;
+
+  bool isInitialCompilation : 1;
+
+  bool isStandalone : 1;
+
+
+  FunctionBox(FrontendContext* fc, SourceExtent extent,
+              CompilationState& compilationState, Directives directives,
+              GeneratorKind generatorKind, FunctionAsyncKind asyncKind,
+              bool isInitialCompilation, TaggedParserAtomIndex atom,
+              FunctionFlags flags, ScriptIndex index);
+
+  ScriptStencil& functionStencil() const;
+  ScriptStencilExtra& functionExtraStencil() const;
+
+  LexicalScope::ParserData* namedLambdaBindings() {
+    return namedLambdaBindings_;
+  }
+  void setNamedLambdaBindings(LexicalScope::ParserData* bindings) {
+    namedLambdaBindings_ = bindings;
+  }
+
+  FunctionScope::ParserData* functionScopeBindings() {
+    return functionScopeBindings_;
+  }
+  void setFunctionScopeBindings(FunctionScope::ParserData* bindings) {
+    functionScopeBindings_ = bindings;
+  }
+
+  VarScope::ParserData* extraVarScopeBindings() {
+    return extraVarScopeBindings_;
+  }
+  void setExtraVarScopeBindings(VarScope::ParserData* bindings) {
+    extraVarScopeBindings_ = bindings;
+  }
+
+  void initFromLazyFunction(const ScriptStencilExtra& extra,
+                            ScopeContext& scopeContext,
+                            FunctionSyntaxKind kind);
+  void initFromScriptStencilExtra(const ScriptStencilExtra& extra);
+  void initStandalone(ScopeContext& scopeContext, FunctionSyntaxKind kind);
+
+ private:
+  void initStandaloneOrLazy(ScopeContext& scopeContext,
+                            FunctionSyntaxKind kind);
+
+ public:
+  void initWithEnclosingParseContext(ParseContext* enclosing,
+                                     FunctionSyntaxKind kind);
+
+  void setEnclosingScopeForInnerLazyFunction(ScopeIndex scopeIndex);
+
+  bool wasEmittedByEnclosingScript() const {
+    return wasEmittedByEnclosingScript_;
+  }
+  void setWasEmittedByEnclosingScript(bool wasEmitted) {
+    wasEmittedByEnclosingScript_ = wasEmitted;
+    if (isFunctionFieldCopiedToStencil) {
+      copyUpdatedWasEmitted();
+    }
+  }
+
+  bool hasEnclosingScopeIndex() const { return enclosingScopeIndex_.isSome(); }
+  ScopeIndex getEnclosingScopeIndex() const { return *enclosingScopeIndex_; }
+
+  IMMUTABLE_FLAG_GETTER_SETTER(isAsync, IsAsync)
+  IMMUTABLE_FLAG_GETTER_SETTER(isGenerator, IsGenerator)
+  IMMUTABLE_FLAG_GETTER_SETTER(funHasExtensibleScope, FunHasExtensibleScope)
+  IMMUTABLE_FLAG_GETTER_SETTER(functionHasThisBinding, FunctionHasThisBinding)
+  IMMUTABLE_FLAG_GETTER_SETTER(functionHasNewTargetBinding,
+                               FunctionHasNewTargetBinding)
+  IMMUTABLE_FLAG_GETTER(useMemberInitializers, UseMemberInitializers)
+  IMMUTABLE_FLAG_GETTER_SETTER(hasRest, HasRest)
+  IMMUTABLE_FLAG_GETTER_SETTER(needsFunctionEnvironmentObjects,
+                               NeedsFunctionEnvironmentObjects)
+  IMMUTABLE_FLAG_GETTER_SETTER(functionHasExtraBodyVarScope,
+                               FunctionHasExtraBodyVarScope)
+  IMMUTABLE_FLAG_GETTER_SETTER(shouldDeclareArguments, ShouldDeclareArguments)
+  IMMUTABLE_FLAG_GETTER_SETTER(needsArgsObj, NeedsArgsObj)
+
+  bool needsCallObjectRegardlessOfBindings() const {
+
+    return funHasExtensibleScope() || isGenerator() || isAsync();
+  }
+
+  bool needsExtraBodyVarEnvironmentRegardlessOfBindings() const {
+    MOZ_ASSERT(hasParameterExprs);
+    return funHasExtensibleScope();
+  }
+
+  GeneratorKind generatorKind() const {
+    return isGenerator() ? GeneratorKind::Generator
+                         : GeneratorKind::NotGenerator;
+  }
+
+  FunctionAsyncKind asyncKind() const {
+    return isAsync() ? FunctionAsyncKind::AsyncFunction
+                     : FunctionAsyncKind::SyncFunction;
+  }
+
+  bool needsFinalYield() const { return isGenerator() || isAsync(); }
+  bool needsDotGeneratorName() const { return isGenerator() || isAsync(); }
+  bool needsClearSlotsOnExit() const { return isGenerator() || isAsync(); }
+  bool needsIteratorResult() const { return isGenerator() && !isAsync(); }
+  bool needsPromiseResult() const { return isAsync() && !isGenerator(); }
+
+  bool isArrow() const { return flags_.isArrow(); }
+  bool isLambda() const { return flags_.isLambda(); }
+
+  bool hasExprBody() const { return hasExprBody_; }
+  void setHasExprBody() {
+    MOZ_ASSERT(isArrow());
+    hasExprBody_ = true;
+  }
+
+  bool allowReturn() const { return allowReturn_; }
+
+  bool isNamedLambda() const { return flags_.isNamedLambda(!!explicitName()); }
+  bool isGetter() const { return flags_.isGetter(); }
+  bool isSetter() const { return flags_.isSetter(); }
+  bool isMethod() const { return flags_.isMethod(); }
+  bool isClassConstructor() const { return flags_.isClassConstructor(); }
+
+  bool isInterpreted() const { return flags_.hasBaseScript(); }
+
+  FunctionFlags::FunctionKind kind() const { return flags_.kind(); }
+
+  bool hasInferredName() const { return flags_.hasInferredName(); }
+  bool hasGuessedAtom() const { return flags_.hasGuessedAtom(); }
+
+  TaggedParserAtomIndex displayAtom() const { return atom_; }
+  TaggedParserAtomIndex explicitName() const {
+    return (hasInferredName() || hasGuessedAtom())
+               ? TaggedParserAtomIndex::null()
+               : atom_;
+  }
+
+  void setInferredName(TaggedParserAtomIndex atom) {
+    atom_ = atom;
+    flags_.setInferredName();
+    if (isFunctionFieldCopiedToStencil) {
+      copyUpdatedAtomAndFlags();
+    }
+  }
+  void setGuessedAtom(TaggedParserAtomIndex atom) {
+    atom_ = atom;
+    flags_.setGuessedAtom();
+    if (isFunctionFieldCopiedToStencil) {
+      copyUpdatedAtomAndFlags();
+    }
+  }
+
+  bool needsHomeObject() const {
+    return hasFlag(ImmutableFlags::NeedsHomeObject);
+  }
+  void setNeedsHomeObject() {
+    MOZ_ASSERT(flags_.allowSuperProperty());
+    setFlag(ImmutableFlags::NeedsHomeObject);
+    flags_.setIsExtended();
+  }
+
+  bool isDerivedClassConstructor() const {
+    return hasFlag(ImmutableFlags::IsDerivedClassConstructor);
+  }
+  void setDerivedClassConstructor() {
+    MOZ_ASSERT(flags_.isClassConstructor());
+    setFlag(ImmutableFlags::IsDerivedClassConstructor);
+  }
+
+  bool isSyntheticFunction() const {
+    return hasFlag(ImmutableFlags::IsSyntheticFunction);
+  }
+  void setSyntheticFunction() {
+    MOZ_ASSERT(flags_.isMethod() || flags_.isGetter() || flags_.isSetter());
+    setFlag(ImmutableFlags::IsSyntheticFunction);
+  }
+
+  bool hasSimpleParameterList() const {
+    return !hasRest() && !hasParameterExprs && !hasDestructuringArgs;
+  }
+
+  bool hasMappedArgsObj() const {
+    return !strict() && hasSimpleParameterList();
+  }
+
+  void setStart(uint32_t offset, uint32_t line,
+                JS::LimitedColumnNumberOneOrigin column) {
+    MOZ_ASSERT(!isScriptExtraFieldCopiedToStencil);
+    extent_.sourceStart = offset;
+    extent_.lineno = line;
+    extent_.column = column;
+  }
+
+  void setEnd(uint32_t end) {
+    MOZ_ASSERT(!isScriptExtraFieldCopiedToStencil);
+    extent_.sourceEnd = end;
+    extent_.toStringEnd = end;
+  }
+
+  void setCtorToStringEnd(uint32_t end) {
+    extent_.toStringEnd = end;
+    if (isScriptExtraFieldCopiedToStencil) {
+      copyUpdatedExtent();
+    }
+  }
+
+  void setCtorFunctionHasThisBinding() {
+    immutableFlags_.setFlag(ImmutableFlags::FunctionHasThisBinding, true);
+    if (isScriptExtraFieldCopiedToStencil) {
+      copyUpdatedImmutableFlags();
+    }
+  }
+
+  void setIsInlinableLargeFunction() {
+    immutableFlags_.setFlag(ImmutableFlags::IsInlinableLargeFunction, true);
+    if (isScriptExtraFieldCopiedToStencil) {
+      copyUpdatedImmutableFlags();
+    }
+  }
+
+  void setUsesArgumentsIntrinsics() {
+    immutableFlags_.setFlag(ImmutableFlags::UsesArgumentsIntrinsics, true);
+    if (isScriptExtraFieldCopiedToStencil) {
+      copyUpdatedImmutableFlags();
+    }
+  }
+
+  uint16_t length() const { return length_; }
+  void setLength(uint16_t length) { length_ = length; }
+
+  void setArgCount(uint16_t args) {
+    MOZ_ASSERT(!isFunctionFieldCopiedToStencil);
+    nargs_ = args;
+  }
+
+  size_t nargs() const { return nargs_; }
+
+  const MemberInitializers& memberInitializers() const {
+    MOZ_ASSERT(useMemberInitializers());
+    return memberInitializers_;
+  }
+  void setMemberInitializers(MemberInitializers memberInitializers) {
+    immutableFlags_.setFlag(ImmutableFlags::UseMemberInitializers, true);
+    memberInitializers_ = memberInitializers;
+    if (isScriptExtraFieldCopiedToStencil) {
+      copyUpdatedImmutableFlags();
+      copyUpdatedMemberInitializers();
+    }
+  }
+
+  ScriptIndex index() const { return funcDataIndex_; }
+
+  void finishScriptFlags();
+  void copyFunctionFields(ScriptStencil& script);
+  void copyFunctionExtraFields(ScriptStencilExtra& scriptExtra);
+
+  void copyUpdatedImmutableFlags();
+
+  void copyUpdatedExtent();
+
+  void copyUpdatedMemberInitializers();
+
+  void copyUpdatedEnclosingScopeIndex();
+
+  void copyUpdatedAtomAndFlags();
+
+  void copyUpdatedWasEmitted();
+};
+
+#undef FLAG_GETTER_SETTER
+#undef IMMUTABLE_FLAG_GETTER_SETTER
+
+inline FunctionBox* SharedContext::asFunctionBox() {
+  MOZ_ASSERT(isFunctionBox());
+  return static_cast<FunctionBox*>(this);
+}
+
+inline SuspendableContext* SharedContext::asSuspendableContext() {
+  MOZ_ASSERT(isSuspendableContext());
+  return static_cast<SuspendableContext*>(this);
+}
+
+}  
+}  
+
+#endif /* frontend_SharedContext_h */

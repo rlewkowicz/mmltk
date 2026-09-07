@@ -1,0 +1,100 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "js/Iterator.h"
+
+#include "js/Conversions.h"
+#include "vm/Interpreter.h"
+#include "vm/JSAtomState.h"
+#include "vm/JSContext.h"
+#include "vm/ObjectOperations.h"
+#include "vm/SelfHosting.h"
+#include "vm/StringType.h"
+#include "vm/JSContext-inl.h"  // JSContext::check
+#include "vm/JSObject-inl.h"
+
+using namespace js;
+
+namespace JS {
+
+JSObject* GetIteratorObject(JSContext* cx, HandleValue obj, bool isAsync) {
+  cx->check(obj);
+
+  FixedInvokeArgs<3> args(cx);
+  args[0].set(obj);
+  args[1].setBoolean(isAsync);
+  args[2].setUndefined();  
+
+  RootedValue rval(cx);
+  if (!CallSelfHostedFunction(cx, cx->names().GetIterator, UndefinedHandleValue,
+                              args, &rval)) {
+    return nullptr;
+  }
+
+  MOZ_ASSERT(rval.isObject());
+  return &rval.toObject();
+}
+
+bool IteratorNext(JSContext* cx, HandleObject iteratorRecord,
+                  MutableHandleValue result) {
+  cx->check(iteratorRecord);
+
+  FixedInvokeArgs<1> args(cx);
+  args[0].setObject(*iteratorRecord);
+  return CallSelfHostedFunction(cx, cx->names().IteratorNext,
+                                UndefinedHandleValue, args, result);
+}
+
+bool IteratorComplete(JSContext* cx, HandleObject iterResult, bool* done) {
+  cx->check(iterResult);
+
+  RootedValue doneV(cx);
+  if (!GetProperty(cx, iterResult, iterResult, cx->names().done, &doneV)) {
+    return false;
+  }
+
+  *done = ToBoolean(doneV);
+  return true;
+}
+
+bool IteratorValue(JSContext* cx, HandleObject iterResult,
+                   MutableHandleValue value) {
+  cx->check(iterResult);
+  return GetProperty(cx, iterResult, iterResult, cx->names().value, value);
+}
+
+bool GetIteratorRecordIterator(JSContext* cx, HandleObject iteratorRecord,
+                               MutableHandleValue iterator) {
+  cx->check(iteratorRecord);
+  return GetProperty(cx, iteratorRecord, iteratorRecord, cx->names().iterator,
+                     iterator);
+}
+
+static bool GetMethod(JSContext* cx, HandleValue v, Handle<PropertyName*> name,
+                      MutableHandleValue result) {
+  RootedValue func(cx);
+  if (!GetProperty(cx, v, name, &func)) {
+    return false;
+  }
+
+  if (func.isNullOrUndefined()) {
+    result.setUndefined();
+    return true;
+  }
+
+  if (!IsCallable(func)) {
+    return ReportIsNotFunction(cx, func, -1);
+  }
+
+  result.set(func);
+  return true;
+}
+
+bool GetReturnMethod(JSContext* cx, HandleValue iterator,
+                     MutableHandleValue result) {
+  cx->check(iterator);
+  return GetMethod(cx, iterator, cx->names().return_, result);
+}
+
+}  

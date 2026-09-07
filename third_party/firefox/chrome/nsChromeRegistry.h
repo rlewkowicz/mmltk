@@ -1,0 +1,110 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsChromeRegistry_h
+#define nsChromeRegistry_h
+
+#include "nsIToolkitChromeRegistry.h"
+#include "nsIObserver.h"
+#include "nsWeakReference.h"
+
+#include "nsString.h"
+#include "nsURIHashKey.h"
+#include "nsInterfaceHashtable.h"
+#include "nsXULAppAPI.h"
+
+#include "mozilla/FileLocation.h"
+#include "mozilla/intl/LocaleService.h"
+
+class nsPIDOMWindowOuter;
+class nsIPrefBranch;
+class nsIURL;
+
+
+#define NS_CHROMEREGISTRY_CID \
+  {0x47049e42, 0x1d87, 0x482a, {0x98, 0x4d, 0x56, 0xae, 0x18, 0x5e, 0x36, 0x7a}}
+
+class nsChromeRegistry : public nsIToolkitChromeRegistry,
+                         public nsIObserver,
+                         public nsSupportsWeakReference {
+ public:
+  NS_DECL_ISUPPORTS
+
+  NS_IMETHOD AllowScriptsForPackage(nsIURI* url, bool* _retval) override;
+  NS_IMETHOD AllowContentToAccess(nsIURI* url, bool* _retval) override;
+
+  NS_IMETHOD ConvertChromeURL(nsIURI* aChromeURI, nsIURI** aResult) override;
+
+  nsChromeRegistry() : mInitialized(false) {}
+
+  virtual nsresult Init();
+
+  static already_AddRefed<nsIChromeRegistry> GetService();
+
+  static nsChromeRegistry* gChromeRegistry;
+
+  static nsresult Canonify(nsCOMPtr<nsIURI>& aChromeURL);
+
+ protected:
+  virtual ~nsChromeRegistry();
+
+  void FlushSkinCaches();
+  void FlushAllCaches();
+
+  static void LogMessage(const char* aMsg, ...) MOZ_FORMAT_PRINTF(1, 2);
+  static void LogMessageWithContext(nsIURI* aURL, uint32_t aLineNumber,
+                                    uint32_t flags, const char* aMsg, ...)
+      MOZ_FORMAT_PRINTF(4, 5);
+
+  virtual nsIURI* GetBaseURIFromPackage(const nsCString& aPackage,
+                                        const nsCString& aProvider,
+                                        const nsCString& aPath) = 0;
+  virtual nsresult GetFlagsFromPackage(const nsCString& aPackage,
+                                       uint32_t* aFlags) = 0;
+
+  static nsresult RefreshWindow(nsPIDOMWindowOuter* aWindow);
+  static nsresult GetProviderAndPath(nsIURI* aChromeURL, nsACString& aProvider,
+                                     nsACString& aPath);
+
+ public:
+  static already_AddRefed<nsChromeRegistry> GetSingleton();
+
+  struct ManifestProcessingContext {
+    ManifestProcessingContext(NSLocationType aType,
+                              mozilla::FileLocation& aFile)
+        : mType(aType), mFile(aFile) {}
+
+    ~ManifestProcessingContext() = default;
+
+    nsIURI* GetManifestURI();
+    already_AddRefed<nsIURI> ResolveURI(const char* uri);
+
+    NSLocationType mType;
+    mozilla::FileLocation mFile;
+    nsCOMPtr<nsIURI> mManifestURI;
+  };
+
+  virtual void ManifestContent(ManifestProcessingContext& cx, int lineno,
+                               char* const* argv, int flags) = 0;
+  virtual void ManifestLocale(ManifestProcessingContext& cx, int lineno,
+                              char* const* argv, int flags) = 0;
+  virtual void ManifestSkin(ManifestProcessingContext& cx, int lineno,
+                            char* const* argv, int flags) = 0;
+  virtual void ManifestOverride(ManifestProcessingContext& cx, int lineno,
+                                char* const* argv, int flags) = 0;
+  virtual void ManifestResource(ManifestProcessingContext& cx, int lineno,
+                                char* const* argv, int flags) = 0;
+
+  enum {
+    XPCNATIVEWRAPPERS = 1 << 1,
+
+    CONTENT_ACCESSIBLE = 1 << 2,
+  };
+
+  bool mInitialized;
+
+  nsInterfaceHashtable<nsURIHashKey, nsIURI> mOverrideTable;
+};
+
+#endif  // nsChromeRegistry_h

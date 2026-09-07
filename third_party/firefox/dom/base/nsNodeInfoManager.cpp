@@ -1,0 +1,374 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "nsNodeInfoManager.h"
+
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/DebugOnly.h"
+#include "mozilla/NullPrincipal.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/dom/DocGroup.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/NodeInfo.h"
+#include "mozilla/dom/NodeInfoInlines.h"
+#include "nsAtom.h"
+#include "nsCCUncollectableMarker.h"
+#include "nsCOMPtr.h"
+#include "nsComponentManagerUtils.h"
+#include "nsContentUtils.h"
+#include "nsGkAtoms.h"
+#include "nsHashKeys.h"
+#include "nsIPrincipal.h"
+#include "nsLayoutStatics.h"
+#include "nsNameSpaceManager.h"
+#include "nsReadableUtils.h"
+#include "nsString.h"
+#include "nsWindowSizes.h"
+
+using namespace mozilla;
+using mozilla::dom::NodeInfo;
+
+#include "mozilla/Logging.h"
+
+static LazyLogModule gNodeInfoManagerLeakPRLog("NodeInfoManagerLeak");
+static const uint32_t kInitialNodeInfoHashSize = 32;
+
+nsNodeInfoManager::nsNodeInfoManager(mozilla::dom::Document* aDocument,
+                                     nsIPrincipal* aPrincipal)
+    : mNodeInfoHash(kInitialNodeInfoHashSize), mDocument(aDocument) {
+  nsLayoutStatics::AddRef();
+
+  if (aPrincipal) {
+    mPrincipal = aPrincipal;
+  } else {
+    mPrincipal = NullPrincipal::CreateWithoutOriginAttributes();
+  }
+  mDefaultPrincipal = mPrincipal;
+
+  if (gNodeInfoManagerLeakPRLog) {
+    MOZ_LOG(gNodeInfoManagerLeakPRLog, LogLevel::Debug,
+            ("NODEINFOMANAGER %p created,  document=%p", this, aDocument));
+  }
+}
+
+nsNodeInfoManager::~nsNodeInfoManager() {
+  mPrincipal = nullptr;
+
+  mArena = nullptr;
+
+  if (gNodeInfoManagerLeakPRLog)
+    MOZ_LOG(gNodeInfoManagerLeakPRLog, LogLevel::Debug,
+            ("NODEINFOMANAGER %p destroyed", this));
+
+  nsLayoutStatics::Release();
+}
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(nsNodeInfoManager)
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_0(nsNodeInfoManager)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsNodeInfoManager)
+  if (tmp->mNonDocumentNodeInfos) {
+    NS_IMPL_CYCLE_COLLECTION_TRAVERSE_RAWPTR(mDocument)
+  }
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_BEGIN(nsNodeInfoManager)
+  if (tmp->mDocument) {
+    return NS_CYCLE_COLLECTION_PARTICIPANT(mozilla::dom::Document)
+        ->CanSkip(tmp->mDocument, aRemovingAllowed);
+  }
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_END
+
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_IN_CC_BEGIN(nsNodeInfoManager)
+  if (tmp->mDocument) {
+    return NS_CYCLE_COLLECTION_PARTICIPANT(mozilla::dom::Document)
+        ->CanSkipInCC(tmp->mDocument);
+  }
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_IN_CC_END
+
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_THIS_BEGIN(nsNodeInfoManager)
+  if (tmp->mDocument) {
+    return NS_CYCLE_COLLECTION_PARTICIPANT(mozilla::dom::Document)
+        ->CanSkipThis(tmp->mDocument);
+  }
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_THIS_END
+
+void nsNodeInfoManager::DropDocumentReference() {
+  for (const auto& entry : mNodeInfoHash.Values()) {
+    entry->mDocument = nullptr;
+  }
+
+  NS_ASSERTION(!mNonDocumentNodeInfos,
+               "Shouldn't have non-document nodeinfos!");
+  mDocument = nullptr;
+}
+
+already_AddRefed<mozilla::dom::NodeInfo> nsNodeInfoManager::GetNodeInfo(
+    nsAtom* aName, nsAtom* aPrefix, int32_t aNamespaceID, uint16_t aNodeType,
+    nsAtom* aExtraName ) {
+  CheckValidNodeInfo(aNodeType, aName, aNamespaceID, aExtraName);
+
+  NodeInfo::NodeInfoInner tmpKey(aName, aPrefix, aNamespaceID, aNodeType,
+                                 aExtraName);
+
+  auto p = mRecentlyUsedNodeInfos.Lookup(tmpKey);
+  if (p) {
+    RefPtr<NodeInfo> nodeInfo = p.Data();
+    return nodeInfo.forget();
+  }
+
+  RefPtr<NodeInfo> nodeInfo = mNodeInfoHash.Get(&tmpKey);
+  if (!nodeInfo) {
+    ++mNonDocumentNodeInfos;
+    if (mNonDocumentNodeInfos == 1) {
+      NS_IF_ADDREF(mDocument);
+    }
+
+    nodeInfo =
+        new NodeInfo(aName, aPrefix, aNamespaceID, aNodeType, aExtraName, this);
+    mNodeInfoHash.InsertOrUpdate(&nodeInfo->mInner, nodeInfo);
+  }
+
+  p.Set(nodeInfo);
+  return nodeInfo.forget();
+}
+
+nsresult nsNodeInfoManager::GetNodeInfo(const nsAString& aName, nsAtom* aPrefix,
+                                        int32_t aNamespaceID,
+                                        uint16_t aNodeType,
+                                        NodeInfo** aNodeInfo) {
+#if defined(DEBUG)
+  {
+    RefPtr<nsAtom> nameAtom = NS_Atomize(aName);
+    CheckValidNodeInfo(aNodeType, nameAtom, aNamespaceID, nullptr);
+  }
+#endif
+
+  NodeInfo::NodeInfoInner tmpKey(aName, aPrefix, aNamespaceID, aNodeType);
+
+  auto p = mRecentlyUsedNodeInfos.Lookup(tmpKey);
+  if (p) {
+    RefPtr<NodeInfo> nodeInfo = p.Data();
+    nodeInfo.forget(aNodeInfo);
+    return NS_OK;
+  }
+
+  RefPtr<NodeInfo> nodeInfo = mNodeInfoHash.Get(&tmpKey);
+  if (!nodeInfo) {
+    ++mNonDocumentNodeInfos;
+    if (mNonDocumentNodeInfos == 1) {
+      NS_IF_ADDREF(mDocument);
+    }
+
+    RefPtr<nsAtom> nameAtom = NS_Atomize(aName);
+    nodeInfo =
+        new NodeInfo(nameAtom, aPrefix, aNamespaceID, aNodeType, nullptr, this);
+    mNodeInfoHash.InsertOrUpdate(&nodeInfo->mInner, nodeInfo);
+  }
+
+  p.Set(nodeInfo);
+  nodeInfo.forget(aNodeInfo);
+
+  return NS_OK;
+}
+
+nsresult nsNodeInfoManager::GetNodeInfo(const nsAString& aName, nsAtom* aPrefix,
+                                        const nsAString& aNamespaceURI,
+                                        uint16_t aNodeType,
+                                        NodeInfo** aNodeInfo) {
+  int32_t nsid = kNameSpaceID_None;
+
+  if (!aNamespaceURI.IsEmpty()) {
+    nsresult rv = nsNameSpaceManager::GetInstance()->RegisterNameSpace(
+        aNamespaceURI, nsid);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+
+  return GetNodeInfo(aName, aPrefix, nsid, aNodeType, aNodeInfo);
+}
+
+already_AddRefed<NodeInfo> nsNodeInfoManager::GetTextNodeInfo() {
+  RefPtr<mozilla::dom::NodeInfo> nodeInfo;
+
+  if (!mTextNodeInfo) {
+    nodeInfo = GetNodeInfo(nsGkAtoms::textTagName, nullptr, kNameSpaceID_None,
+                           nsINode::TEXT_NODE, nullptr);
+    mTextNodeInfo = nodeInfo;
+  } else {
+    nodeInfo = mTextNodeInfo;
+  }
+
+  return nodeInfo.forget();
+}
+
+already_AddRefed<NodeInfo> nsNodeInfoManager::GetDocumentFragmentNodeInfo() {
+  RefPtr<NodeInfo> nodeInfo = mDocumentFragmentNodeInfo;
+  if (!nodeInfo) {
+    nodeInfo = GetNodeInfo(nsGkAtoms::documentFragmentNodeName, nullptr,
+                           kNameSpaceID_None, nsINode::DOCUMENT_FRAGMENT_NODE);
+    mDocumentFragmentNodeInfo = nodeInfo;
+  }
+  return nodeInfo.forget();
+}
+
+already_AddRefed<NodeInfo> nsNodeInfoManager::GetCommentNodeInfo() {
+  RefPtr<NodeInfo> nodeInfo;
+
+  if (!mCommentNodeInfo) {
+    nodeInfo = GetNodeInfo(nsGkAtoms::commentTagName, nullptr,
+                           kNameSpaceID_None, nsINode::COMMENT_NODE, nullptr);
+    mCommentNodeInfo = nodeInfo;
+  } else {
+    nodeInfo = mCommentNodeInfo;
+  }
+
+  return nodeInfo.forget();
+}
+
+already_AddRefed<NodeInfo> nsNodeInfoManager::GetDocumentNodeInfo() {
+  RefPtr<NodeInfo> nodeInfo;
+
+  if (!mDocumentNodeInfo) {
+    NS_ASSERTION(mDocument, "Should have mDocument!");
+    nodeInfo = GetNodeInfo(nsGkAtoms::documentNodeName, nullptr,
+                           kNameSpaceID_None, nsINode::DOCUMENT_NODE, nullptr);
+    mDocumentNodeInfo = nodeInfo;
+
+    --mNonDocumentNodeInfos;
+    if (!mNonDocumentNodeInfos) {
+      mDocument->Release();  
+    }
+  } else {
+    nodeInfo = mDocumentNodeInfo;
+  }
+
+  return nodeInfo.forget();
+}
+
+void* nsNodeInfoManager::Allocate(size_t aSize) {
+  if (!mHasAllocated) {
+    if (!mArena) {
+      mozilla::dom::DocGroup* docGroup = GetDocument()->GetDocGroupOrCreate();
+      if (docGroup) {
+        MOZ_ASSERT(!GetDocument()->HasChildren());
+        mArena = docGroup->ArenaAllocator();
+      }
+    }
+#if defined(DEBUG)
+    else {
+      mozilla::dom::DocGroup* docGroup = GetDocument()->GetDocGroup();
+      MOZ_ASSERT(docGroup);
+      MOZ_ASSERT(mArena == docGroup->ArenaAllocator());
+    }
+#endif
+    mHasAllocated = true;
+  }
+
+  if (mArena) {
+    return mArena->Allocate(aSize);
+  }
+  return malloc(aSize);
+}
+
+void nsNodeInfoManager::SetArenaAllocator(mozilla::dom::DOMArena* aArena) {
+  MOZ_DIAGNOSTIC_ASSERT_IF(mArena, mArena == aArena);
+  MOZ_DIAGNOSTIC_ASSERT(!mHasAllocated);
+  if (!mArena) {
+    mArena = aArena;
+  }
+}
+
+void nsNodeInfoManager::SetDocumentPrincipal(nsIPrincipal* aPrincipal) {
+  mPrincipal = nullptr;
+  if (!aPrincipal) {
+    aPrincipal = mDefaultPrincipal;
+  }
+
+  NS_ASSERTION(aPrincipal, "Must have principal by this point!");
+  MOZ_DIAGNOSTIC_ASSERT(!nsContentUtils::IsExpandedPrincipal(aPrincipal),
+                        "Documents shouldn't have an expanded principal");
+
+  mPrincipal = aPrincipal;
+}
+
+void nsNodeInfoManager::RemoveNodeInfo(NodeInfo* aNodeInfo) {
+  MOZ_ASSERT(aNodeInfo, "Trying to remove null nodeinfo from manager!");
+
+  if (aNodeInfo == mDocumentNodeInfo) {
+    mDocumentNodeInfo = nullptr;
+    mDocument = nullptr;
+  } else {
+    if (--mNonDocumentNodeInfos == 0) {
+      if (mDocument) {
+        mDocument->Release();
+      }
+    }
+    if (aNodeInfo == mTextNodeInfo) {
+      mTextNodeInfo = nullptr;
+    } else if (aNodeInfo == mCommentNodeInfo) {
+      mCommentNodeInfo = nullptr;
+    } else if (aNodeInfo == mDocumentFragmentNodeInfo) {
+      mDocumentFragmentNodeInfo = nullptr;
+    }
+  }
+
+  mRecentlyUsedNodeInfos.Remove(aNodeInfo->mInner);
+  DebugOnly<bool> ret = mNodeInfoHash.Remove(&aNodeInfo->mInner);
+  MOZ_ASSERT(ret, "Can't find mozilla::dom::NodeInfo to remove!!!");
+}
+
+static bool IsSystemOrAboutPrincipal(nsIPrincipal* aPrincipal) {
+  return aPrincipal->IsSystemPrincipal() ||
+         aPrincipal->SchemeIs("about");
+}
+
+static bool IsAndroidResource(nsIURI* aURI) {
+  return false;
+}
+
+bool nsNodeInfoManager::InternalSVGEnabled() {
+  MOZ_ASSERT(!mSVGEnabled, "Caller should use the cached mSVGEnabled!");
+
+  nsNameSpaceManager* nsmgr = nsNameSpaceManager::GetInstance();
+  nsCOMPtr<nsILoadInfo> loadInfo;
+  bool SVGEnabled = false;
+
+  if (nsmgr && !nsmgr->mSVGDisabled) {
+    SVGEnabled = true;
+  } else {
+    nsCOMPtr<nsIChannel> channel = mDocument->GetChannel();
+    if (channel) {
+      loadInfo = channel->LoadInfo();
+    }
+  }
+
+  bool conclusion =
+      (SVGEnabled || IsSystemOrAboutPrincipal(mPrincipal) ||
+       IsAndroidResource(mDocument->GetDocumentURI()) ||
+       (loadInfo &&
+        (loadInfo->GetExternalContentPolicyType() ==
+             ExtContentPolicy::TYPE_IMAGE ||
+         loadInfo->GetExternalContentPolicyType() ==
+             ExtContentPolicy::TYPE_OTHER) &&
+        (IsSystemOrAboutPrincipal(loadInfo->GetLoadingPrincipal()) ||
+         IsSystemOrAboutPrincipal(loadInfo->TriggeringPrincipal()))));
+  mSVGEnabled = Some(conclusion);
+  return conclusion;
+}
+
+bool nsNodeInfoManager::InternalMathMLEnabled() {
+  MOZ_ASSERT(!mMathMLEnabled, "Caller should use the cached mMathMLEnabled!");
+
+  nsNameSpaceManager* nsmgr = nsNameSpaceManager::GetInstance();
+  bool conclusion =
+      ((nsmgr && !nsmgr->mMathMLDisabled) || mPrincipal->IsSystemPrincipal());
+  mMathMLEnabled = Some(conclusion);
+  return conclusion;
+}
+
+void nsNodeInfoManager::AddSizeOfIncludingThis(nsWindowSizes& aSizes) const {
+  aSizes.mDOMSizes.mDOMOtherSize += aSizes.mState.mMallocSizeOf(this);
+
+}

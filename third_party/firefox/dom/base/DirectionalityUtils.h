@@ -1,0 +1,75 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DirectionalityUtils_h_
+#define DirectionalityUtils_h_
+
+#include "nsStringFwd.h"
+#include "nscore.h"
+
+class nsIContent;
+class nsINode;
+class nsAttrValue;
+
+namespace mozilla::dom {
+class Element;
+class HTMLSlotElement;
+class ShadowRoot;
+class Text;
+struct UnbindContext;
+}  
+
+namespace mozilla {
+
+enum class Directionality : uint8_t { Unset, Rtl, Ltr, Auto };
+
+Directionality GetDirectionFromText(const char16_t* aText,
+                                    const uint32_t aLength,
+                                    uint32_t* aFirstStrong = nullptr);
+
+Directionality RecomputeDirectionality(mozilla::dom::Element* aElement,
+                                       bool aNotify = true);
+
+Directionality GetParentDirectionality(const mozilla::dom::Element* aElement);
+
+void SetDirectionalityOnDescendants(mozilla::dom::Element* aElement,
+                                    Directionality aDir, bool aNotify = true);
+
+void SlotAssignedNodeAdded(dom::HTMLSlotElement* aSlot,
+                           nsIContent& aAssignedNode);
+
+void SlotAssignedNodeRemoved(dom::HTMLSlotElement* aSlot,
+                             nsIContent& aUnassignedNode);
+
+void WalkDescendantsSetDirAuto(mozilla::dom::Element* aElement,
+                               bool aNotify = true);
+
+void WalkDescendantsClearAncestorDirAuto(nsIContent* aContent);
+
+bool TextNodeWillChangeDirection(dom::Text* aTextNode, Directionality* aOldDir,
+                                 uint32_t aOffset);
+
+void TextNodeChangedDirection(dom::Text* aTextNode, Directionality aOldDir,
+                              bool aNotify);
+
+void SetDirectionFromNewTextNode(dom::Text* aTextNode);
+
+void ResetDirectionSetByTextNode(dom::Text*, dom::UnbindContext&);
+
+void ResetDirectionSetBySlotHost(dom::HTMLSlotElement*, dom::UnbindContext&,
+                                 dom::ShadowRoot*);
+
+void ResetDirFormAssociatedElement(mozilla::dom::Element* aElement,
+                                   bool aNotify, bool aHasDirAuto,
+                                   const nsAString* aKnownValue = nullptr);
+
+void OnSetDirAttr(mozilla::dom::Element* aElement, const nsAttrValue* aNewValue,
+                  bool hadValidDir, bool hadDirAuto, bool aNotify);
+
+void SetDirOnBind(mozilla::dom::Element* aElement, nsIContent* aParent);
+
+void ResetDir(mozilla::dom::Element* aElement);
+}  
+
+#endif /* DirectionalityUtils_h_ */

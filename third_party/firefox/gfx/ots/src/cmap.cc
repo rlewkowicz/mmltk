@@ -1,0 +1,962 @@
+// Copyright (c) 2009-2017 The OTS Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include "cmap.h"
+
+#include <algorithm>
+#include <set>
+#include <utility>
+#include <vector>
+
+#include "maxp.h"
+#include "os2.h"
+
+
+namespace {
+
+struct CMAPSubtableHeader {
+  uint16_t platform;
+  uint16_t encoding;
+  uint32_t offset;
+  uint16_t format;
+  uint32_t length;
+  uint32_t language;
+};
+
+struct Subtable314Range {
+  uint16_t start_range;
+  uint16_t end_range;
+  int16_t id_delta;
+  uint16_t id_range_offset;
+  uint32_t id_range_offset_offset;
+};
+
+const size_t kFormat0ArraySize = 256;
+
+const uint32_t kUnicodeUpperLimit = 0x10FFFF;
+
+const uint32_t kMaxCMAPSelectorRecords = 259;
+const uint32_t kMongolianVSStart = 0x180B;
+const uint32_t kMongolianVSEnd = 0x180D;
+const uint32_t kVSStart = 0xFE00;
+const uint32_t kVSEnd = 0xFE0F;
+const uint32_t kIVSStart = 0xE0100;
+const uint32_t kIVSEnd = 0xE01EF;
+const uint32_t kUVSUpperLimit = 0xFFFFFF;
+
+} 
+
+namespace ots {
+
+bool OpenTypeCMAP::ParseFormat4(int platform, int encoding,
+              const uint8_t *data, size_t length, uint16_t num_glyphs) {
+  ots::Buffer subtable(data, length);
+
+
+  OpenTypeOS2 *os2 = static_cast<OpenTypeOS2*>(
+      GetFont()->GetTypedTable(OTS_TAG_OS2));
+  if (!os2) {
+    return Error("Required OS/2 table missing");
+  }
+
+  if (!subtable.Skip(4)) {
+    return Error("Can't read 4 bytes at start of cmap format 4 subtable");
+  }
+  uint16_t language = 0;
+  if (!subtable.ReadU16(&language)) {
+    return Error("Can't read language");
+  }
+  if (language) {
+    return Error("Languages should be 0 (%d)", language);
+  }
+
+  uint16_t segcountx2, search_range, entry_selector, range_shift;
+  segcountx2 = search_range = entry_selector = range_shift = 0;
+  if (!subtable.ReadU16(&segcountx2) ||
+      !subtable.ReadU16(&search_range) ||
+      !subtable.ReadU16(&entry_selector) ||
+      !subtable.ReadU16(&range_shift)) {
+    return Error("Failed to read subcmap structure");
+  }
+
+  if (segcountx2 & 1 || search_range & 1) {
+    return Error("Bad subcmap structure");
+  }
+  const uint16_t segcount = segcountx2 >> 1;
+  if (segcount < 1) {
+    return Error("Segcount < 1 (%d)", segcount);
+  }
+
+  unsigned log2segcount = 0;
+  while (1u << (log2segcount + 1) <= segcount) {
+    log2segcount++;
+  }
+
+  const uint16_t expected_search_range = 2 * 1u << log2segcount;
+  if (expected_search_range != search_range) {
+    return Error("expected search range != search range (%d != %d)", expected_search_range, search_range);
+  }
+
+  if (entry_selector != log2segcount) {
+    return Error("entry selector != log2(segement count) (%d != %d)", entry_selector, log2segcount);
+  }
+
+  const uint16_t expected_range_shift = segcountx2 - search_range;
+  if (range_shift != expected_range_shift) {
+    return Error("unexpected range shift (%d != %d)", range_shift, expected_range_shift);
+  }
+
+  std::vector<Subtable314Range> ranges(segcount);
+
+  for (unsigned i = 0; i < segcount; ++i) {
+    if (!subtable.ReadU16(&ranges[i].end_range)) {
+      return Error("Failed to read segment %d", i);
+    }
+  }
+
+  uint16_t padding;
+  if (!subtable.ReadU16(&padding)) {
+    return Error("Failed to read cmap subtable segment padding");
+  }
+  if (padding) {
+    return Error("Non zero cmap subtable segment padding (%d)", padding);
+  }
+
+  for (unsigned i = 0; i < segcount; ++i) {
+    if (!subtable.ReadU16(&ranges[i].start_range)) {
+      return Error("Failed to read segment start range %d", i);
+    }
+  }
+  for (unsigned i = 0; i < segcount; ++i) {
+    if (!subtable.ReadS16(&ranges[i].id_delta)) {
+      return Error("Failed to read segment delta %d", i);
+    }
+  }
+  for (unsigned i = 0; i < segcount; ++i) {
+    ranges[i].id_range_offset_offset = subtable.offset();
+    if (!subtable.ReadU16(&ranges[i].id_range_offset)) {
+      return Error("Failed to read segment range offset %d", i);
+    }
+
+    if (ranges[i].id_range_offset & 1) {
+      if (i == segcount - 1u) {
+        Warning("bad id_range_offset");
+        ranges[i].id_range_offset = 0;
+      } else {
+        return Error("Bad segment offset (%d)", ranges[i].id_range_offset);
+      }
+    }
+  }
+
+  for (unsigned i = 1; i < segcount; ++i) {
+    if ((i == segcount - 1u) &&
+        (ranges[i - 1].start_range == 0xffff) &&
+        (ranges[i - 1].end_range == 0xffff) &&
+        (ranges[i].start_range == 0xffff) &&
+        (ranges[i].end_range == 0xffff)) {
+      Warning("multiple 0xffff terminators found");
+      continue;
+    }
+
+    if (ranges[i].end_range <= ranges[i - 1].end_range) {
+      return Error("Out of order end range (%d <= %d)", ranges[i].end_range, ranges[i-1].end_range);
+    }
+    if (ranges[i].start_range <= ranges[i - 1].end_range) {
+      return Error("out of order start range (%d <= %d)", ranges[i].start_range, ranges[i-1].end_range);
+    }
+
+    if (os2->table.first_char_index != 0xFFFF &&
+        ranges[i].start_range != 0xFFFF &&
+        os2->table.first_char_index > ranges[i].start_range) {
+      os2->table.first_char_index = ranges[i].start_range;
+    }
+    if (os2->table.last_char_index != 0xFFFF &&
+        ranges[i].end_range != 0xFFFF &&
+        os2->table.last_char_index < ranges[i].end_range) {
+      os2->table.last_char_index = ranges[i].end_range;
+    }
+  }
+
+  if (ranges[segcount - 1].start_range != 0xffff || ranges[segcount - 1].end_range != 0xffff) {
+    return Error("Final segment start and end must be 0xFFFF (0x%04X-0x%04X)",
+                           ranges[segcount - 1].start_range, ranges[segcount - 1].end_range);
+  }
+
+  for (unsigned i = 0; i < segcount; ++i) {
+    for (unsigned cp = ranges[i].start_range; cp <= ranges[i].end_range; ++cp) {
+      const uint16_t code_point = static_cast<uint16_t>(cp);
+      if (ranges[i].id_range_offset == 0) {
+        const uint16_t glyph = code_point + ranges[i].id_delta;
+        if (glyph >= num_glyphs) {
+          return Error("Range glyph reference too high (%d > %d)", glyph, num_glyphs - 1);
+        }
+      } else {
+        const uint16_t range_delta = code_point - ranges[i].start_range;
+        const uint32_t glyph_id_offset = ranges[i].id_range_offset_offset +
+                                         ranges[i].id_range_offset +
+                                         range_delta * 2;
+        if (glyph_id_offset + 1 >= length) {
+          return Error("bad glyph id offset (%d > %ld)", glyph_id_offset, length);
+        }
+        uint16_t glyph;
+        std::memcpy(&glyph, data + glyph_id_offset, 2);
+        glyph = ots_ntohs(glyph);
+        if (glyph >= num_glyphs) {
+          return Error("Range glyph reference too high (%d > %d)", glyph, num_glyphs - 1);
+        }
+      }
+    }
+  }
+
+  if (platform == 3 && encoding == 0) {
+    this->subtable_3_0_4_data = data;
+    this->subtable_3_0_4_length = length;
+  } else if (platform == 3 && encoding == 1) {
+    this->subtable_3_1_4_data = data;
+    this->subtable_3_1_4_length = length;
+  } else if (platform == 0 && encoding == 3) {
+    this->subtable_0_3_4_data = data;
+    this->subtable_0_3_4_length = length;
+  } else {
+    return Error("Unknown cmap subtable type (platform=%d, encoding=%d)", platform, encoding);
+  }
+
+  return true;
+}
+
+bool OpenTypeCMAP::Parse31012(const uint8_t *data, size_t length,
+                              uint16_t num_glyphs) {
+  ots::Buffer subtable(data, length);
+
+
+  if (!subtable.Skip(8)) {
+    return Error("failed to skip the first 8 bytes of format 12 subtable");
+  }
+  uint32_t language = 0;
+  if (!subtable.ReadU32(&language)) {
+    return Error("can't read format 12 subtable language");
+  }
+  if (language) {
+    return Error("format 12 subtable language should be zero (%d)", language);
+  }
+
+  uint32_t num_groups = 0;
+  if (!subtable.ReadU32(&num_groups)) {
+    return Error("can't read number of format 12 subtable groups");
+  }
+  if (num_groups == 0 || subtable.remaining() / 12 < num_groups) {
+    return Error("Bad format 12 subtable group count %d", num_groups);
+  }
+
+  std::vector<ots::OpenTypeCMAPSubtableRange> &groups
+      = this->subtable_3_10_12;
+  groups.resize(num_groups);
+
+  for (unsigned i = 0; i < num_groups; ++i) {
+    if (!subtable.ReadU32(&groups[i].start_range) ||
+        !subtable.ReadU32(&groups[i].end_range) ||
+        !subtable.ReadU32(&groups[i].start_glyph_id)) {
+      return Error("can't read format 12 subtable group");
+    }
+
+    if (groups[i].start_range > kUnicodeUpperLimit ||
+        groups[i].end_range > kUnicodeUpperLimit ||
+        groups[i].start_glyph_id > 0xFFFF) {
+      return Error("bad format 12 subtable group (startCharCode=0x%4X, endCharCode=0x%4X, startGlyphID=%d)",
+                             groups[i].start_range, groups[i].end_range, groups[i].start_glyph_id);
+    }
+
+    if (groups[i].end_range < groups[i].start_range) {
+      return Error("format 12 subtable group endCharCode before startCharCode (0x%4X < 0x%4X)",
+                             groups[i].end_range, groups[i].start_range);
+    }
+    if ((groups[i].end_range - groups[i].start_range) +
+        groups[i].start_glyph_id >= num_glyphs) {
+      return Error("bad format 12 subtable group startGlyphID (%d)", groups[i].start_glyph_id);
+    }
+  }
+
+  for (unsigned i = 1; i < num_groups; ++i) {
+    if (groups[i].start_range <= groups[i - 1].start_range) {
+      return Error("out of order format 12 subtable group (startCharCode=0x%4X <= startCharCode=0x%4X of previous group)",
+                             groups[i].start_range, groups[i-1].start_range);
+    }
+    if (groups[i].start_range <= groups[i - 1].end_range) {
+      return Error("overlapping format 12 subtable groups (startCharCode=0x%4X <= endCharCode=0x%4X of previous group)",
+                             groups[i].start_range, groups[i-1].end_range);
+    }
+  }
+
+  return true;
+}
+
+bool OpenTypeCMAP::Parse31013(const uint8_t *data, size_t length,
+                              uint16_t num_glyphs) {
+  ots::Buffer subtable(data, length);
+
+
+  if (!subtable.Skip(8)) {
+    return Error("Bad cmap subtable length");
+  }
+  uint32_t language = 0;
+  if (!subtable.ReadU32(&language)) {
+    return Error("Can't read cmap subtable language");
+  }
+  if (language) {
+    return Error("Cmap subtable language should be zero but is %d", language);
+  }
+
+  uint32_t num_groups = 0;
+  if (!subtable.ReadU32(&num_groups)) {
+    return Error("Can't read number of groups in a cmap subtable");
+  }
+
+  if (num_groups == 0 || subtable.remaining() / 12 < num_groups) {
+    return Error("Bad format 13 subtable group count %d", num_groups);
+  }
+
+  std::vector<ots::OpenTypeCMAPSubtableRange> &groups = this->subtable_3_10_13;
+  groups.resize(num_groups);
+
+  for (unsigned i = 0; i < num_groups; ++i) {
+    if (!subtable.ReadU32(&groups[i].start_range) ||
+        !subtable.ReadU32(&groups[i].end_range) ||
+        !subtable.ReadU32(&groups[i].start_glyph_id)) {
+      return Error("Can't read subrange structure in a cmap subtable");
+    }
+
+    if (groups[i].start_range > kUnicodeUpperLimit ||
+        groups[i].end_range > kUnicodeUpperLimit ||
+        groups[i].start_glyph_id > 0xFFFF) {
+      return Error("Bad subrange with start_range=%d, end_range=%d, start_glyph_id=%d", groups[i].start_range, groups[i].end_range, groups[i].start_glyph_id);
+    }
+
+    if (groups[i].start_glyph_id >= num_glyphs) {
+      return Error("Subrange starting glyph id too high (%d > %d)", groups[i].start_glyph_id, num_glyphs);
+    }
+  }
+
+  for (unsigned i = 1; i < num_groups; ++i) {
+    if (groups[i].start_range <= groups[i - 1].start_range) {
+      return Error("Overlapping subrange starts (%d >= %d)", groups[i]. start_range, groups[i-1].start_range);
+    }
+    if (groups[i].start_range <= groups[i - 1].end_range) {
+      return Error("Overlapping subranges (%d <= %d)", groups[i].start_range, groups[i-1].end_range);
+    }
+  }
+
+  return true;
+}
+
+bool OpenTypeCMAP::Parse0514(const uint8_t *data, size_t length) {
+  ots::Buffer subtable(data, length);
+
+
+  if (!subtable.Skip(6)) {
+    return Error("Can't read start of cmap subtable");
+  }
+
+  uint32_t num_records = 0;
+  if (!subtable.ReadU32(&num_records)) {
+    return Error("Can't read number of records in cmap subtable");
+  }
+  if (num_records == 0 || num_records > kMaxCMAPSelectorRecords) {
+    return Error("Bad format 14 subtable records count %d", num_records);
+  }
+
+  std::vector<ots::OpenTypeCMAPSubtableVSRecord>& records
+      = this->subtable_0_5_14;
+  records.resize(num_records);
+
+  for (unsigned i = 0; i < num_records; ++i) {
+    if (!subtable.ReadU24(&records[i].var_selector) ||
+        !subtable.ReadU32(&records[i].default_offset) ||
+        !subtable.ReadU32(&records[i].non_default_offset)) {
+      return Error("Can't read record structure of record %d in cmap subtale", i);
+    }
+    if (!((records[i].var_selector >= kMongolianVSStart &&
+           records[i].var_selector <= kMongolianVSEnd) ||
+          (records[i].var_selector >= kVSStart &&
+           records[i].var_selector <= kVSEnd) ||
+          (records[i].var_selector >= kIVSStart &&
+           records[i].var_selector <= kIVSEnd))) {
+      return Error("Bad record variation selector (%04X) in record %i", records[i].var_selector, i);
+    }
+    if (i > 0 &&
+        records[i-1].var_selector >= records[i].var_selector) {
+      return Error("Out of order variation selector (%04X >= %04X) in record %d", records[i-1].var_selector, records[i].var_selector, i);
+    }
+
+    if (!records[i].default_offset && !records[i].non_default_offset) {
+      return Error("No default aoffset in variation selector record %d", i);
+    }
+    if (records[i].default_offset &&
+        records[i].default_offset >= length) {
+      return Error("Default offset too high (%d >= %ld) in record %d", records[i].default_offset, length, i);
+    }
+    if (records[i].non_default_offset &&
+        records[i].non_default_offset >= length) {
+      return Error("Non default offset too high (%d >= %ld) in record %d", records[i].non_default_offset, length, i);
+    }
+  }
+
+  for (unsigned i = 0; i < num_records; ++i) {
+    if (records[i].default_offset) {
+      subtable.set_offset(records[i].default_offset);
+      uint32_t num_ranges = 0;
+      if (!subtable.ReadU32(&num_ranges)) {
+        return Error("Can't read number of ranges in record %d", i);
+      }
+      if (num_ranges == 0 || subtable.remaining() / 4 < num_ranges) {
+        return Error("Bad number of ranges (%d) in record %d", num_ranges, i);
+      }
+
+      uint32_t last_unicode_value = 0;
+      std::vector<ots::OpenTypeCMAPSubtableVSRange>& ranges
+          = records[i].ranges;
+      ranges.resize(num_ranges);
+
+      for (unsigned j = 0; j < num_ranges; ++j) {
+        if (!subtable.ReadU24(&ranges[j].unicode_value) ||
+            !subtable.ReadU8(&ranges[j].additional_count)) {
+          return Error("Can't read range info in variation selector record %d", i);
+        }
+        const uint32_t check_value =
+            ranges[j].unicode_value + ranges[j].additional_count;
+        if (ranges[j].unicode_value == 0 ||
+            ranges[j].unicode_value > kUnicodeUpperLimit ||
+            check_value > kUVSUpperLimit ||
+            (last_unicode_value &&
+             ranges[j].unicode_value <= last_unicode_value)) {
+          return Error("Bad Unicode value *%04X) in variation selector range %d record %d", ranges[j].unicode_value, j, i);
+        }
+        last_unicode_value = check_value;
+      }
+    }
+
+    if (records[i].non_default_offset) {
+      subtable.set_offset(records[i].non_default_offset);
+      uint32_t num_mappings = 0;
+      if (!subtable.ReadU32(&num_mappings)) {
+        return Error("Can't read number of mappings in variation selector record %d", i);
+      }
+      if (num_mappings == 0 || subtable.remaining() / 5 < num_mappings) {
+        return Error("Bad number of mappings (%d) in variation selector record %d", num_mappings, i);
+      }
+
+      uint32_t last_unicode_value = 0;
+      std::vector<ots::OpenTypeCMAPSubtableVSMapping>& mappings
+          = records[i].mappings;
+      mappings.resize(num_mappings);
+
+      for (unsigned j = 0; j < num_mappings; ++j) {
+        if (!subtable.ReadU24(&mappings[j].unicode_value) ||
+            !subtable.ReadU16(&mappings[j].glyph_id)) {
+          return Error("Can't read mapping %d in variation selector record %d", j, i);
+        }
+        if (mappings[j].glyph_id == 0 || mappings[j].unicode_value == 0) {
+          return Error("Bad mapping (%04X -> %d) in mapping %d of variation selector %d", mappings[j].unicode_value, mappings[j].glyph_id, j, i);
+        }
+        if (mappings[j].unicode_value > kUnicodeUpperLimit) {
+          return Error("Invalid Unicode value (%04X > %04X) in mapping %d of variation selector %d", mappings[j].unicode_value, kUnicodeUpperLimit, j, i);
+        }
+        if (last_unicode_value &&
+            mappings[j].unicode_value <= last_unicode_value) {
+          return Error("Out of order Unicode value (%04X <= %04X) in mapping %d of variation selector %d", mappings[j].unicode_value, last_unicode_value, j, i);
+        }
+        last_unicode_value = mappings[j].unicode_value;
+      }
+    }
+  }
+
+  if (subtable.offset() != length) {
+    return Error("Bad subtable offset (%ld != %ld)", subtable.offset(), length);
+  }
+  this->subtable_0_5_14_length = subtable.offset();
+  return true;
+}
+
+bool OpenTypeCMAP::Parse100(const uint8_t *data, size_t length) {
+  ots::Buffer subtable(data, length);
+
+  if (!subtable.Skip(4)) {
+    return Error("Bad cmap subtable");
+  }
+  uint16_t language = 0;
+  if (!subtable.ReadU16(&language)) {
+    return Error("Can't read language in cmap subtable");
+  }
+  if (language) {
+    Warning("language id should be zero: %u", language);
+  }
+
+  this->subtable_1_0_0.reserve(kFormat0ArraySize);
+  for (size_t i = 0; i < kFormat0ArraySize; ++i) {
+    uint8_t glyph_id = 0;
+    if (!subtable.ReadU8(&glyph_id)) {
+      return Error("Can't read glyph id at array[%ld] in cmap subtable", i);
+    }
+    this->subtable_1_0_0.push_back(glyph_id);
+  }
+
+  return true;
+}
+
+bool OpenTypeCMAP::Parse(const uint8_t *data, size_t length) {
+  Buffer table(data, length);
+
+  uint16_t version = 0;
+  uint16_t num_tables = 0;
+  if (!table.ReadU16(&version) ||
+      !table.ReadU16(&num_tables)) {
+    return Error("Can't read structure of cmap");
+  }
+
+  if (version != 0) {
+    return Error("Non zero cmap version (%d)", version);
+  }
+  if (!num_tables) {
+    return Error("No subtables in cmap!");
+  }
+
+  std::vector<CMAPSubtableHeader> subtable_headers;
+
+  subtable_headers.reserve(num_tables);
+  for (unsigned i = 0; i < num_tables; ++i) {
+    CMAPSubtableHeader subt;
+
+    if (!table.ReadU16(&subt.platform) ||
+        !table.ReadU16(&subt.encoding) ||
+        !table.ReadU32(&subt.offset)) {
+      return Error("Can't read subtable information cmap subtable %d", i);
+    }
+
+    subtable_headers.push_back(subt);
+  }
+
+  const size_t data_offset = table.offset();
+
+  for (unsigned i = 0; i < num_tables; ++i) {
+    if (subtable_headers[i].offset > 1024 * 1024 * 1024) {
+      return Error("Bad subtable offset in cmap subtable %d", i);
+    }
+    if (subtable_headers[i].offset < data_offset ||
+        subtable_headers[i].offset >= length) {
+      return Error("Bad subtable offset (%d) in cmap subtable %d", subtable_headers[i].offset, i);
+    }
+  }
+
+  for (unsigned i = 0; i < num_tables; ++i) {
+    table.set_offset(subtable_headers[i].offset);
+    if (!table.ReadU16(&subtable_headers[i].format)) {
+      return Error("Can't read cmap subtable header format %d", i);
+    }
+
+    uint16_t len = 0;
+    uint16_t lang = 0;
+    switch (subtable_headers[i].format) {
+      case 0:
+      case 4:
+        if (!table.ReadU16(&len)) {
+          return Error("Can't read cmap subtable %d length", i);
+        }
+        if (!table.ReadU16(&lang)) {
+          return Error("Can't read cmap subtable %d language", i);
+        }
+        subtable_headers[i].length = len;
+        subtable_headers[i].language = lang;
+        break;
+      case 12:
+      case 13:
+        if (!table.Skip(2)) {
+          return Error("Bad cmap subtable %d structure", i);
+        }
+        if (!table.ReadU32(&subtable_headers[i].length)) {
+          return Error("Can read cmap subtable %d length", i);
+        }
+        if (!table.ReadU32(&subtable_headers[i].language)) {
+          return Error("Can't read cmap subtable %d language", i);
+        }
+        break;
+      case 14:
+        if (!table.ReadU32(&subtable_headers[i].length)) {
+          return Error("Can't read cmap subtable %d length", i);
+        }
+        subtable_headers[i].language = 0;
+        break;
+      default:
+        subtable_headers[i].length = 0;
+        subtable_headers[i].language = 0;
+        break;
+    }
+  }
+
+  for (unsigned i = 1; i < num_tables; ++i) {
+    if (subtable_headers[i - 1].platform > subtable_headers[i].platform ||
+        (subtable_headers[i - 1].platform == subtable_headers[i].platform &&
+         (subtable_headers[i - 1].encoding > subtable_headers[i].encoding ||
+          (subtable_headers[i - 1].encoding == subtable_headers[i].encoding &&
+           subtable_headers[i - 1].language > subtable_headers[i].language))))
+      Warning("subtable %d with platform ID %d, encoding ID %d, language ID %d "
+                  "following subtable with platform ID %d, encoding ID %d, language ID %d",
+                  i,
+                  subtable_headers[i].platform,
+                  subtable_headers[i].encoding,
+                  subtable_headers[i].language,
+                  subtable_headers[i - 1].platform,
+                  subtable_headers[i - 1].encoding,
+                  subtable_headers[i - 1].language);
+  }
+
+  for (unsigned i = 0; i < num_tables; ++i) {
+    if (!subtable_headers[i].length) continue;
+    if (subtable_headers[i].length > 1024 * 1024 * 1024) {
+      return Error("Bad cmap subtable %d length", i);
+    }
+    const uint32_t end_byte
+        = subtable_headers[i].offset + subtable_headers[i].length;
+    if (end_byte > length) {
+      return Error("Over long cmap subtable %d @ %d for %d", i, subtable_headers[i].offset, subtable_headers[i].length);
+    }
+  }
+
+  std::set<std::pair<uint32_t, uint32_t> > uniq_checker;
+  std::vector<std::pair<uint32_t, uint8_t> > overlap_checker;
+  for (unsigned i = 0; i < num_tables; ++i) {
+    const uint32_t end_byte
+        = subtable_headers[i].offset + subtable_headers[i].length;
+
+    if (!uniq_checker.insert(std::make_pair(subtable_headers[i].offset,
+                                            end_byte)).second) {
+      continue;
+    }
+    overlap_checker.push_back(
+        std::make_pair(subtable_headers[i].offset,
+                       static_cast<uint8_t>(1) ));
+    overlap_checker.push_back(
+        std::make_pair(end_byte, static_cast<uint8_t>(0) ));
+  }
+  std::sort(overlap_checker.begin(), overlap_checker.end());
+  int overlap_count = 0;
+  for (unsigned i = 0; i < overlap_checker.size(); ++i) {
+    overlap_count += (overlap_checker[i].second ? 1 : -1);
+    if (overlap_count > 1) {
+      return Error("Excessive overlap count %d", overlap_count);
+    }
+  }
+
+  OpenTypeMAXP *maxp = static_cast<OpenTypeMAXP*>(
+      GetFont()->GetTypedTable(OTS_TAG_MAXP));
+  if (!maxp) {
+    return Error("No maxp table in font! Needed by cmap.");
+  }
+  const uint16_t num_glyphs = maxp->num_glyphs;
+
+
+  for (unsigned i = 0; i < num_tables; ++i) {
+    if (subtable_headers[i].platform == 0) {
+
+      if ((subtable_headers[i].encoding == 0 || subtable_headers[i].encoding == 1) &&
+          (subtable_headers[i].format == 4)) {
+        if (!ParseFormat4(3, 1, data + subtable_headers[i].offset,
+                      subtable_headers[i].length, num_glyphs)) {
+          return Error("Failed to parse format 4 cmap subtable %d", i);
+        }
+      } else if ((subtable_headers[i].encoding == 3) &&
+                 (subtable_headers[i].format == 4)) {
+        if (!ParseFormat4(0, 3, data + subtable_headers[i].offset,
+                      subtable_headers[i].length, num_glyphs)) {
+          return Error("Failed to parse format 4 cmap subtable %d", i);
+        }
+      } else if ((subtable_headers[i].encoding == 3 ||
+                  subtable_headers[i].encoding == 4) &&
+                 (subtable_headers[i].format == 12)) {
+        if (!Parse31012(data + subtable_headers[i].offset,
+                        subtable_headers[i].length, num_glyphs)) {
+          return Error("Failed to parse format 12 cmap subtable %d", i);
+        }
+      } else if ((subtable_headers[i].encoding == 5) &&
+                 (subtable_headers[i].format == 14)) {
+        if (!Parse0514(data + subtable_headers[i].offset,
+                       subtable_headers[i].length)) {
+          return Error("Failed to parse format 14 cmap subtable %d", i);
+        }
+      }
+    } else if (subtable_headers[i].platform == 1) {
+
+      if ((subtable_headers[i].encoding == 0) &&
+          (subtable_headers[i].format == 0)) {
+        if (!Parse100(data + subtable_headers[i].offset,
+                      subtable_headers[i].length)) {
+          return OTS_FAILURE();
+        }
+      }
+    } else if (subtable_headers[i].platform == 3) {
+
+      switch (subtable_headers[i].encoding) {
+        case 0:
+        case 1:
+          if (subtable_headers[i].format == 4) {
+            if (!ParseFormat4(subtable_headers[i].platform,
+                          subtable_headers[i].encoding,
+                          data + subtable_headers[i].offset,
+                          subtable_headers[i].length, num_glyphs)) {
+              return OTS_FAILURE();
+            }
+          }
+          break;
+        case 10:
+          if (subtable_headers[i].format == 12) {
+            this->subtable_3_10_12.clear();
+            if (!Parse31012(data + subtable_headers[i].offset,
+                            subtable_headers[i].length, num_glyphs)) {
+              return OTS_FAILURE();
+            }
+          } else if (subtable_headers[i].format == 13) {
+            this->subtable_3_10_13.clear();
+            if (!Parse31013(data + subtable_headers[i].offset,
+                            subtable_headers[i].length, num_glyphs)) {
+              return OTS_FAILURE();
+            }
+          }
+          break;
+      }
+    }
+  }
+
+  return true;
+}
+
+bool OpenTypeCMAP::Serialize(OTSStream *out) {
+  const bool have_034 = this->subtable_0_3_4_data != NULL;
+  const bool have_0514 = this->subtable_0_5_14.size() != 0;
+  const bool have_100 = this->subtable_1_0_0.size() != 0;
+  const bool have_304 = this->subtable_3_0_4_data != NULL;
+  const bool have_314 = (!have_304) && this->subtable_3_1_4_data;
+  const bool have_31012 = this->subtable_3_10_12.size() != 0;
+  const bool have_31013 = this->subtable_3_10_13.size() != 0;
+  const uint16_t num_subtables = static_cast<uint16_t>(have_034) +
+                                 static_cast<uint16_t>(have_0514) +
+                                 static_cast<uint16_t>(have_100) +
+                                 static_cast<uint16_t>(have_304) +
+                                 static_cast<uint16_t>(have_314) +
+                                 static_cast<uint16_t>(have_31012) +
+                                 static_cast<uint16_t>(have_31013);
+  const off_t table_start = out->Tell();
+
+  if (!have_304 && !have_314 && !have_034 && !have_31012 && !have_31013) {
+    return Error("no supported subtables were found");
+  }
+
+  if (!out->WriteU16(0) ||
+      !out->WriteU16(num_subtables)) {
+    return OTS_FAILURE();
+  }
+
+  const off_t record_offset = out->Tell();
+  if (!out->Pad(num_subtables * 8)) {
+    return OTS_FAILURE();
+  }
+
+  const off_t offset_034 = out->Tell();
+  if (have_034) {
+    if (!out->Write(this->subtable_0_3_4_data,
+                    this->subtable_0_3_4_length)) {
+      return OTS_FAILURE();
+    }
+  }
+
+  const off_t offset_0514 = out->Tell();
+  if (have_0514) {
+    const std::vector<ots::OpenTypeCMAPSubtableVSRecord> &records
+        = this->subtable_0_5_14;
+    const unsigned num_records = records.size();
+    if (!out->WriteU16(14) ||
+        !out->WriteU32(this->subtable_0_5_14_length) ||
+        !out->WriteU32(num_records)) {
+      return OTS_FAILURE();
+    }
+    for (unsigned i = 0; i < num_records; ++i) {
+      if (!out->WriteU24(records[i].var_selector) ||
+          !out->WriteU32(records[i].default_offset) ||
+          !out->WriteU32(records[i].non_default_offset)) {
+        return OTS_FAILURE();
+      }
+    }
+    for (unsigned i = 0; i < num_records; ++i) {
+      if (records[i].default_offset) {
+        const std::vector<ots::OpenTypeCMAPSubtableVSRange> &ranges
+            = records[i].ranges;
+        const unsigned num_ranges = ranges.size();
+        if (!out->Seek(records[i].default_offset + offset_0514) ||
+            !out->WriteU32(num_ranges)) {
+          return OTS_FAILURE();
+        }
+        for (unsigned j = 0; j < num_ranges; ++j) {
+          if (!out->WriteU24(ranges[j].unicode_value) ||
+              !out->WriteU8(ranges[j].additional_count)) {
+            return OTS_FAILURE();
+          }
+        }
+      }
+      if (records[i].non_default_offset) {
+        const std::vector<ots::OpenTypeCMAPSubtableVSMapping> &mappings
+            = records[i].mappings;
+        const unsigned num_mappings = mappings.size();
+        if (!out->Seek(records[i].non_default_offset + offset_0514) ||
+            !out->WriteU32(num_mappings)) {
+          return OTS_FAILURE();
+        }
+        for (unsigned j = 0; j < num_mappings; ++j) {
+          if (!out->WriteU24(mappings[j].unicode_value) ||
+              !out->WriteU16(mappings[j].glyph_id)) {
+            return OTS_FAILURE();
+          }
+        }
+      }
+    }
+  }
+
+  const off_t offset_100 = out->Tell();
+  if (have_100) {
+    if (!out->WriteU16(0) ||  
+        !out->WriteU16(6 + kFormat0ArraySize) ||  
+        !out->WriteU16(0)) {  
+      return OTS_FAILURE();
+    }
+    if (!out->Write(&(this->subtable_1_0_0[0]), kFormat0ArraySize)) {
+      return OTS_FAILURE();
+    }
+  }
+
+  const off_t offset_304 = out->Tell();
+  if (have_304) {
+    if (!out->Write(this->subtable_3_0_4_data,
+                    this->subtable_3_0_4_length)) {
+      return OTS_FAILURE();
+    }
+  }
+
+  const off_t offset_314 = out->Tell();
+  if (have_314) {
+    if (!out->Write(this->subtable_3_1_4_data,
+                    this->subtable_3_1_4_length)) {
+      return OTS_FAILURE();
+    }
+  }
+
+  const off_t offset_31012 = out->Tell();
+  if (have_31012) {
+    std::vector<OpenTypeCMAPSubtableRange> &groups
+        = this->subtable_3_10_12;
+    const unsigned num_groups = groups.size();
+    if (!out->WriteU16(12) ||
+        !out->WriteU16(0) ||
+        !out->WriteU32(num_groups * 12 + 16) ||
+        !out->WriteU32(0) ||
+        !out->WriteU32(num_groups)) {
+      return OTS_FAILURE();
+    }
+
+    for (unsigned i = 0; i < num_groups; ++i) {
+      if (!out->WriteU32(groups[i].start_range) ||
+          !out->WriteU32(groups[i].end_range) ||
+          !out->WriteU32(groups[i].start_glyph_id)) {
+        return OTS_FAILURE();
+      }
+    }
+  }
+
+  const off_t offset_31013 = out->Tell();
+  if (have_31013) {
+    std::vector<OpenTypeCMAPSubtableRange> &groups
+        = this->subtable_3_10_13;
+    const unsigned num_groups = groups.size();
+    if (!out->WriteU16(13) ||
+        !out->WriteU16(0) ||
+        !out->WriteU32(num_groups * 12 + 16) ||
+        !out->WriteU32(0) ||
+        !out->WriteU32(num_groups)) {
+      return OTS_FAILURE();
+    }
+
+    for (unsigned i = 0; i < num_groups; ++i) {
+      if (!out->WriteU32(groups[i].start_range) ||
+          !out->WriteU32(groups[i].end_range) ||
+          !out->WriteU32(groups[i].start_glyph_id)) {
+        return OTS_FAILURE();
+      }
+    }
+  }
+
+  const off_t table_end = out->Tell();
+
+  if (!out->Seek(record_offset)) {
+    return OTS_FAILURE();
+  }
+
+  if (have_034) {
+    if (!out->WriteU16(0) ||
+        !out->WriteU16(3) ||
+        !out->WriteU32(offset_034 - table_start)) {
+      return OTS_FAILURE();
+    }
+  }
+
+  if (have_0514) {
+    if (!out->WriteU16(0) ||
+        !out->WriteU16(5) ||
+        !out->WriteU32(offset_0514 - table_start)) {
+      return OTS_FAILURE();
+    }
+  }
+
+  if (have_100) {
+    if (!out->WriteU16(1) ||
+        !out->WriteU16(0) ||
+        !out->WriteU32(offset_100 - table_start)) {
+      return OTS_FAILURE();
+    }
+  }
+
+  if (have_304) {
+    if (!out->WriteU16(3) ||
+        !out->WriteU16(0) ||
+        !out->WriteU32(offset_304 - table_start)) {
+      return OTS_FAILURE();
+    }
+  }
+
+  if (have_314) {
+    if (!out->WriteU16(3) ||
+        !out->WriteU16(1) ||
+        !out->WriteU32(offset_314 - table_start)) {
+      return OTS_FAILURE();
+    }
+  }
+
+  if (have_31012) {
+    if (!out->WriteU16(3) ||
+        !out->WriteU16(10) ||
+        !out->WriteU32(offset_31012 - table_start)) {
+      return OTS_FAILURE();
+    }
+  }
+
+  if (have_31013) {
+    if (!out->WriteU16(3) ||
+        !out->WriteU16(10) ||
+        !out->WriteU32(offset_31013 - table_start)) {
+      return OTS_FAILURE();
+    }
+  }
+
+  if (!out->Seek(table_end)) {
+    return OTS_FAILURE();
+  }
+
+  return true;
+}
+
+}  

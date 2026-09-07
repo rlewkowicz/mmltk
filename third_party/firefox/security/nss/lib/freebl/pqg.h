@@ -1,0 +1,16 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef _PQG_H_
+#define _PQG_H_ 1
+
+SECStatus
+PQG_HashBuf(HASH_HashType type, unsigned char *dest,
+            const unsigned char *src, PRUint32 src_len);
+unsigned int PQG_GetLength(const SECItem *obj);
+SECStatus PQG_Check(const PQGParams *params);
+HASH_HashType PQG_GetHashType(const PQGParams *params);
+
+#endif /* _PQG_H_ */

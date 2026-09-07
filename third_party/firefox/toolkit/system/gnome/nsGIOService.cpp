@@ -1,0 +1,1076 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsGIOService.h"
+#include "nsString.h"
+#include "nsIURI.h"
+#include "nsIFile.h"
+#include "nsTArray.h"
+#include "nsStringEnumerator.h"
+#include "nsIMIMEInfo.h"
+#include "nsComponentManagerUtils.h"
+#include "nsArray.h"
+#include "nsPrintfCString.h"
+#include "mozilla/GRefPtr.h"
+#include "mozilla/GUniquePtr.h"
+#include "mozilla/WidgetUtilsGtk.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/StaticPrefs_widget.h"
+#include "mozilla/net/DNS.h"
+#include "prenv.h"
+
+#include <gio/gio.h>
+#include <glib.h>
+#include <gtk/gtk.h>
+#include <gio/gdesktopappinfo.h>
+#if defined(MOZ_ENABLE_DBUS)
+#  include <fcntl.h>
+#  include <dlfcn.h>
+#  include "mozilla/widget/AsyncDBus.h"
+#  include "mozilla/WidgetUtilsGtk.h"
+#  include "nsAppShell.h"
+#endif
+
+using namespace mozilla;
+
+#if defined(MOZ_LOGGING)
+#  include "mozilla/Logging.h"
+LazyLogModule gGIOServiceLog("GIOService");
+#  define LOG(...) \
+    MOZ_LOG(gGIOServiceLog, mozilla::LogLevel::Debug, (__VA_ARGS__))
+#else
+#  define LOG(...)
+#endif
+
+#define MOZ_TYPE_APP_LAUNCH_CONTEXT (moz_app_launch_context_get_type())
+#define MOZ_APP_LAUNCH_CONTEXT(obj)                               \
+  (G_TYPE_CHECK_INSTANCE_CAST((obj), MOZ_TYPE_APP_LAUNCH_CONTEXT, \
+                              MozAppLaunchContext))
+#define MOZ_APP_LAUNCH_CONTEXT_CLASS(klass)                      \
+  (G_TYPE_CHECK_CLASS_CAST((klass), MOZ_TYPE_APP_LAUNCH_CONTEXT, \
+                           MozAppLaunchContextClass))
+#define MOZ_IS_APP_LAUNCH_CONTEXT(obj) \
+  (G_TYPE_CHECK_INSTANCE_TYPE((obj), MOZ_TYPE_APP_LAUNCH_CONTEXT))
+#define MOZ_IS_APP_LAUNCH_CONTEXT_CLASS(klass) \
+  (G_TYPE_CHECK_CLASS_TYPE((klass), MOZ_TYPE_APP_LAUNCH_CONTEXT))
+#define MOZ_APP_LAUNCH_CONTEXT_GET_CLASS(obj)                    \
+  (G_TYPE_INSTANCE_GET_CLASS((obj), MOZ_TYPE_APP_LAUNCH_CONTEXT, \
+                             MozAppLaunchContextClass))
+
+typedef struct {
+  GAppLaunchContext parent_instance;
+  char* activation_token;
+} MozAppLaunchContext;
+
+typedef struct {
+  GAppLaunchContextClass parent_class;
+} MozAppLaunchContextClass;
+
+#if !GLIB_CHECK_VERSION(2, 67, 1)
+#if defined(__clang__)
+#    pragma clang diagnostic push
+#    pragma clang diagnostic ignored "-Wdeprecated-volatile"
+#elif defined(__GNUC__)
+#    pragma GCC diagnostic push
+#    pragma GCC diagnostic ignored "-Wvolatile"
+#endif
+#endif
+
+G_DEFINE_TYPE(MozAppLaunchContext, moz_app_launch_context,
+              G_TYPE_APP_LAUNCH_CONTEXT)
+
+#if !GLIB_CHECK_VERSION(2, 67, 1)
+#if defined(__clang__)
+#    pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#    pragma GCC diagnostic pop
+#endif
+#endif
+
+static char* moz_app_launch_context_get_startup_notify_id(
+    GAppLaunchContext* context, GAppInfo* info, GList* files) {
+  MozAppLaunchContext* self = MOZ_APP_LAUNCH_CONTEXT(context);
+
+  return g_strdup(self->activation_token);
+}
+
+static void moz_app_launch_context_finalize(GObject* object) {
+  MozAppLaunchContext* self = MOZ_APP_LAUNCH_CONTEXT(object);
+  g_clear_pointer(&self->activation_token, g_free);
+  G_OBJECT_CLASS(moz_app_launch_context_parent_class)->finalize(object);
+}
+
+static void moz_app_launch_context_class_init(MozAppLaunchContextClass* klass) {
+  GAppLaunchContextClass* launch_class = G_APP_LAUNCH_CONTEXT_CLASS(klass);
+  GObjectClass* object_class = G_OBJECT_CLASS(klass);
+
+  launch_class->get_startup_notify_id =
+      moz_app_launch_context_get_startup_notify_id;
+  object_class->finalize = moz_app_launch_context_finalize;
+}
+
+static void moz_app_launch_context_init(MozAppLaunchContext* self) {
+  GAppLaunchContext* context = G_APP_LAUNCH_CONTEXT(self);
+
+  if (self->activation_token && glib_check_version(2, 76, 0)) {
+    g_app_launch_context_setenv(context, "XDG_ACTIVATION_TOKEN",
+                                self->activation_token);
+  }
+
+  g_app_launch_context_unsetenv(context, "MOZ_APP_LAUNCHER");
+}
+
+MozAppLaunchContext* moz_app_launch_context_new(const char* activation_token) {
+  MozAppLaunchContext* self = MOZ_APP_LAUNCH_CONTEXT(
+      g_object_new(MOZ_TYPE_APP_LAUNCH_CONTEXT, nullptr));
+  self->activation_token = g_strdup(activation_token);
+  return self;
+}
+
+class nsFlatpakHandlerApp : public nsIHandlerApp {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIHANDLERAPP
+  nsFlatpakHandlerApp() = default;
+
+ private:
+  virtual ~nsFlatpakHandlerApp() = default;
+};
+
+NS_IMPL_ISUPPORTS(nsFlatpakHandlerApp, nsIHandlerApp)
+
+NS_IMETHODIMP
+nsFlatpakHandlerApp::GetName(nsAString& aName) {
+  aName.AssignLiteral("System Handler");
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsFlatpakHandlerApp::SetName(const nsAString& aName) {
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsFlatpakHandlerApp::GetDetailedDescription(nsAString& aDetailedDescription) {
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+NS_IMETHODIMP
+nsFlatpakHandlerApp::SetDetailedDescription(
+    const nsAString& aDetailedDescription) {
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+NS_IMETHODIMP
+nsFlatpakHandlerApp::Equals(nsIHandlerApp* aHandlerApp, bool* _retval) {
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+NS_IMETHODIMP
+nsFlatpakHandlerApp::LaunchWithURI(
+    nsIURI* aUri, mozilla::dom::BrowsingContext* aBrowsingContext) {
+  nsCString spec;
+  aUri->GetSpec(spec);
+  GUniquePtr<GError> error;
+
+  gtk_show_uri(nullptr, spec.get(), GDK_CURRENT_TIME, getter_Transfers(error));
+  if (error) {
+    NS_WARNING(
+        nsPrintfCString("Cannot launch flatpak handler: %s", error->message)
+            .get());
+    return NS_ERROR_FAILURE;
+  }
+  return NS_OK;
+}
+
+static nsresult GetCommandFromCommandline(
+    nsACString const& aCommandWithArguments, nsACString& aCommand) {
+  GUniquePtr<GError> error;
+  gchar** argv = nullptr;
+  if (!g_shell_parse_argv(PromiseFlatCString(aCommandWithArguments).get(),
+                          nullptr, &argv, getter_Transfers(error)) ||
+      !argv[0]) {
+    g_warning("Cannot parse command with arguments: %s", error->message);
+    g_strfreev(argv);
+    return NS_ERROR_FAILURE;
+  }
+  aCommand.Assign(argv[0]);
+  g_strfreev(argv);
+  return NS_OK;
+}
+
+class nsGIOHandlerApp final : public nsIGIOHandlerApp {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIHANDLERAPP
+  NS_DECL_NSIGIOHANDLERAPP
+
+  explicit nsGIOHandlerApp(already_AddRefed<GAppInfo> aApp) : mApp(aApp) {}
+
+ private:
+  ~nsGIOHandlerApp() = default;
+  RefPtr<GAppInfo> mApp;
+};
+
+NS_IMPL_ISUPPORTS(nsGIOHandlerApp, nsIGIOHandlerApp, nsIHandlerApp)
+
+NS_IMETHODIMP
+nsGIOHandlerApp::GetId(nsACString& aId) {
+  aId.Assign(g_app_info_get_id(mApp));
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsGIOHandlerApp::GetName(nsAString& aName) {
+  aName.Assign(NS_ConvertUTF8toUTF16(g_app_info_get_name(mApp)));
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsGIOHandlerApp::SetName(const nsAString& aName) {
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsGIOHandlerApp::GetDetailedDescription(nsAString& aDetailedDescription) {
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+NS_IMETHODIMP
+nsGIOHandlerApp::SetDetailedDescription(const nsAString& aDetailedDescription) {
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+NS_IMETHODIMP
+nsGIOHandlerApp::Equals(nsIHandlerApp* aHandlerApp, bool* _retval) {
+  nsCOMPtr<nsIGIOHandlerApp> gioMimeApp = do_QueryInterface(aHandlerApp);
+  *_retval = false;
+  if (!gioMimeApp) {
+    return NS_OK;
+  }
+
+  nsAutoCString thisId;
+  nsresult rv = GetId(thisId);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsAutoCString theirId;
+  gioMimeApp->GetId(theirId);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  *_retval = thisId.Equals(theirId);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsGIOHandlerApp::LaunchFile(const nsACString& aFileName) {
+  GFile* gfile = g_file_new_for_path(PromiseFlatCString(aFileName).get());
+  GList* fileList = nullptr;
+  fileList = g_list_append(fileList, gfile);
+  bool retval = g_app_info_launch(mApp, fileList, nullptr, nullptr);
+  g_list_foreach(fileList, (GFunc)g_object_unref, nullptr);
+  g_list_free(fileList);
+  return retval ? NS_OK : NS_ERROR_FAILURE;
+}
+
+NS_IMETHODIMP
+nsGIOHandlerApp::LaunchWithURI(
+    nsIURI* aUri, mozilla::dom::BrowsingContext* aBrowsingContext) {
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+NS_IMETHODIMP
+nsGIOHandlerApp::GetMozIconURL(nsACString& _retval) {
+  GIcon* icon = g_app_info_get_icon(mApp);
+  _retval.Assign(g_icon_to_string(icon));
+  return NS_OK;
+}
+
+class nsGIOMimeApp final : public nsIGIOMimeApp {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIHANDLERAPP
+  NS_DECL_NSIGIOMIMEAPP
+
+  explicit nsGIOMimeApp(already_AddRefed<GAppInfo> aApp) : mApp(aApp) {}
+
+ private:
+  ~nsGIOMimeApp() = default;
+
+  RefPtr<GAppInfo> mApp;
+};
+
+NS_IMPL_ISUPPORTS(nsGIOMimeApp, nsIGIOMimeApp, nsIHandlerApp)
+
+NS_IMETHODIMP
+nsGIOMimeApp::GetId(nsACString& aId) {
+  aId.Assign(g_app_info_get_id(mApp));
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsGIOMimeApp::GetName(nsAString& aName) {
+  aName.Assign(NS_ConvertUTF8toUTF16(g_app_info_get_name(mApp)));
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsGIOMimeApp::SetName(const nsAString& aName) {
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsGIOMimeApp::GetCommand(nsACString& aCommand) {
+  const char* cmd = g_app_info_get_commandline(mApp);
+  if (!cmd) return NS_ERROR_FAILURE;
+  aCommand.Assign(cmd);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsGIOMimeApp::GetExpectsURIs(int32_t* aExpects) {
+  *aExpects = g_app_info_supports_uris(mApp);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsGIOMimeApp::GetDetailedDescription(nsAString& aDetailedDescription) {
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+NS_IMETHODIMP
+nsGIOMimeApp::SetDetailedDescription(const nsAString& aDetailedDescription) {
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+NS_IMETHODIMP
+nsGIOMimeApp::Equals(nsIHandlerApp* aHandlerApp, bool* _retval) {
+  if (!aHandlerApp) return NS_ERROR_FAILURE;
+
+  nsCOMPtr<nsILocalHandlerApp> localHandlerApp = do_QueryInterface(aHandlerApp);
+  if (localHandlerApp) {
+    nsAutoString theirName;
+    nsAutoString thisName;
+    GetName(thisName);
+    localHandlerApp->GetName(theirName);
+    *_retval = thisName.Equals(theirName);
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIGIOMimeApp> gioMimeApp = do_QueryInterface(aHandlerApp);
+  if (gioMimeApp) {
+    nsAutoCString thisCommandline, thisCommand;
+    nsresult rv = GetCommand(thisCommandline);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    rv = GetCommandFromCommandline(thisCommandline, thisCommand);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    nsAutoCString theirCommandline, theirCommand;
+    gioMimeApp->GetCommand(theirCommandline);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    rv = GetCommandFromCommandline(theirCommandline, theirCommand);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    *_retval = thisCommand.Equals(theirCommand);
+    return NS_OK;
+  }
+
+  *_retval = false;
+  return NS_OK;
+}
+
+static RefPtr<GAppLaunchContext> GetLaunchContext(
+    const char* aXDGToken = nullptr) {
+  RefPtr<GAppLaunchContext> context =
+      dont_AddRef(G_APP_LAUNCH_CONTEXT(moz_app_launch_context_new(aXDGToken)));
+  return context;
+}
+
+
+static NS_IMETHODIMP LaunchWithURIImpl(RefPtr<GAppInfo> aInfo, nsIURI* aUri,
+                                       const char* aXDGToken = nullptr) {
+  GList uris = {nullptr};
+  nsCString spec;
+  aUri->GetSpec(spec);
+  uris.data = const_cast<char*>(spec.get());
+
+  GUniquePtr<GError> error;
+  gboolean result = g_app_info_launch_uris(
+      aInfo, &uris, GetLaunchContext(aXDGToken).get(), getter_Transfers(error));
+  if (!result) {
+    g_warning("Cannot launch application: %s", error->message);
+    return NS_ERROR_FAILURE;
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsGIOMimeApp::LaunchWithURI(nsIURI* aUri,
+                            mozilla::dom::BrowsingContext* aBrowsingContext) {
+  auto promise = mozilla::widget::RequestWaylandFocusPromise();
+  if (!promise) {
+    return LaunchWithURIImpl(mApp, aUri);
+  }
+  promise->Then(
+      GetMainThreadSerialEventTarget(), __func__,
+      [app = RefPtr{mApp}, uri = RefPtr{aUri}](nsCString token) {
+        LaunchWithURIImpl(app, uri, token.get());
+      },
+      [app = RefPtr{mApp}, uri = RefPtr{aUri}](bool state) {
+        LaunchWithURIImpl(app, uri);
+      });
+  return NS_OK;
+}
+
+class GIOUTF8StringEnumerator final : public nsStringEnumeratorBase {
+  ~GIOUTF8StringEnumerator() = default;
+
+ public:
+  GIOUTF8StringEnumerator() : mIndex(0) {}
+
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIUTF8STRINGENUMERATOR
+
+  using nsStringEnumeratorBase::GetNext;
+
+  nsTArray<nsCString> mStrings;
+  uint32_t mIndex;
+};
+
+NS_IMPL_ISUPPORTS(GIOUTF8StringEnumerator, nsIUTF8StringEnumerator,
+                  nsIStringEnumerator)
+
+NS_IMETHODIMP
+GIOUTF8StringEnumerator::HasMore(bool* aResult) {
+  *aResult = mIndex < mStrings.Length();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+GIOUTF8StringEnumerator::GetNext(nsACString& aResult) {
+  if (mIndex >= mStrings.Length()) return NS_ERROR_UNEXPECTED;
+
+  aResult.Assign(mStrings[mIndex]);
+  ++mIndex;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsGIOMimeApp::GetSupportedURISchemes(nsIUTF8StringEnumerator** aSchemes) {
+  *aSchemes = nullptr;
+
+  RefPtr<GIOUTF8StringEnumerator> array = new GIOUTF8StringEnumerator();
+
+  GVfs* gvfs = g_vfs_get_default();
+
+  if (!gvfs) {
+    g_warning("Cannot get GVfs object.");
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+
+  const gchar* const* uri_schemes = g_vfs_get_supported_uri_schemes(gvfs);
+
+  while (*uri_schemes != nullptr) {
+    array->mStrings.AppendElement(*uri_schemes);
+    uri_schemes++;
+  }
+
+  array.forget(aSchemes);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsGIOMimeApp::SetAsDefaultForMimeType(nsACString const& aMimeType) {
+  GUniquePtr<char> content_type(
+      g_content_type_from_mime_type(PromiseFlatCString(aMimeType).get()));
+  if (!content_type) return NS_ERROR_FAILURE;
+  GUniquePtr<GError> error;
+  g_app_info_set_as_default_for_type(mApp, content_type.get(),
+                                     getter_Transfers(error));
+  if (error) {
+    g_warning("Cannot set application as default for MIME type (%s): %s",
+              PromiseFlatCString(aMimeType).get(), error->message);
+    return NS_ERROR_FAILURE;
+  }
+  return NS_OK;
+}
+NS_IMETHODIMP
+nsGIOMimeApp::SetAsDefaultForFileExtensions(nsACString const& fileExts) {
+  GUniquePtr<GError> error;
+  GUniquePtr<char> extensions(g_strdup(PromiseFlatCString(fileExts).get()));
+  char* ext_pos = extensions.get();
+  char* space_pos;
+
+  while ((space_pos = strchr(ext_pos, ' ')) || (*ext_pos != '\0')) {
+    if (space_pos) {
+      *space_pos = '\0';
+    }
+    g_app_info_set_as_default_for_extension(mApp, ext_pos,
+                                            getter_Transfers(error));
+    if (error) {
+      g_warning("Cannot set application as default for extension (%s): %s",
+                ext_pos, error->message);
+      return NS_ERROR_FAILURE;
+    }
+    if (space_pos) {
+      ext_pos = space_pos + 1;
+    } else {
+      *ext_pos = '\0';
+    }
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsGIOMimeApp::SetAsDefaultForURIScheme(nsACString const& aURIScheme) {
+  GUniquePtr<GError> error;
+  nsAutoCString contentType("x-scheme-handler/");
+  contentType.Append(aURIScheme);
+
+  g_app_info_set_as_default_for_type(mApp, contentType.get(),
+                                     getter_Transfers(error));
+  if (error) {
+    g_warning("Cannot set application as default for URI scheme (%s): %s",
+              PromiseFlatCString(aURIScheme).get(), error->message);
+    return NS_ERROR_FAILURE;
+  }
+
+  g_app_info_set_as_last_used_for_type(mApp, contentType.get(),
+                                       getter_Transfers(error));
+  if (error) {
+    g_warning("Cannot register as compatible URI scheme handler for %s: %s",
+              PromiseFlatCString(aURIScheme).get(), error->message);
+    return NS_ERROR_FAILURE;
+  }
+
+  return NS_OK;
+}
+
+NS_IMPL_ISUPPORTS(nsGIOService, nsIGIOService)
+
+NS_IMETHODIMP
+nsGIOService::GetMimeTypeFromExtension(const nsACString& aExtension,
+                                       nsACString& aMimeType) {
+  nsAutoCString fileExtToUse("file.");
+  fileExtToUse.Append(aExtension);
+
+  gboolean result_uncertain;
+  GUniquePtr<char> content_type(
+      g_content_type_guess(fileExtToUse.get(), nullptr, 0, &result_uncertain));
+  if (!content_type) {
+    return NS_ERROR_FAILURE;
+  }
+
+  GUniquePtr<char> mime_type(g_content_type_get_mime_type(content_type.get()));
+  if (!mime_type) {
+    return NS_ERROR_FAILURE;
+  }
+
+  aMimeType.Assign(mime_type.get());
+  return NS_OK;
+}
+#define OPENURI_BUS_NAME "org.freedesktop.portal.Desktop"
+#define OPENURI_OBJECT_PATH "/org/freedesktop/portal/desktop"
+#define OPENURI_INTERFACE_NAME "org.freedesktop.portal.OpenURI"
+#define SCHEME_SUPPORTED_METHOD "SchemeSupported"
+
+NS_IMETHODIMP
+nsGIOService::GetAppForURIScheme(const nsACString& aURIScheme,
+                                 nsIHandlerApp** aApp) {
+  *aApp = nullptr;
+
+  LOG("nsGIOService::GetAppForURIScheme() %s",
+      PromiseFlatCString(aURIScheme).get());
+
+#if defined(MOZ_ENABLE_DBUS)
+  if (widget::ShouldUsePortal(widget::PortalKind::MimeHandler)) {
+    LOG("  using portal");
+    if (mozilla::net::IsLoopbackHostname(aURIScheme)) {
+      LOG("  quit, IsLoopbackHostname");
+      return NS_ERROR_FAILURE;
+    }
+    GUniquePtr<GError> error;
+
+    nsAppShell::DBusConnectionCheck();
+    RefPtr<GDBusProxy> proxy = dont_AddRef(g_dbus_proxy_new_for_bus_sync(
+        G_BUS_TYPE_SESSION, G_DBUS_PROXY_FLAGS_NONE, nullptr, OPENURI_BUS_NAME,
+        OPENURI_OBJECT_PATH, OPENURI_INTERFACE_NAME,
+        nullptr,  
+        getter_Transfers(error)));
+    if (error) {
+      g_warning("Failed to create proxy: %s\n", error->message);
+      return NS_ERROR_FAILURE;
+    }
+    GVariantBuilder builder;
+    g_variant_builder_init(&builder, G_VARIANT_TYPE_VARDICT);
+
+    RefPtr<GVariant> result = dont_AddRef(g_dbus_proxy_call_sync(
+        proxy, SCHEME_SUPPORTED_METHOD,
+        g_variant_new("(sa{sv})", PromiseFlatCString(aURIScheme).get(),
+                      &builder),
+        G_DBUS_CALL_FLAGS_NONE,
+        -1,       
+        nullptr,  
+        getter_Transfers(error)));
+    if (error) {
+      if (error->code == G_DBUS_ERROR_UNKNOWN_METHOD) {
+        LOG("  SchemeSupported method not found, fallback to flatpak handler");
+        RefPtr<nsFlatpakHandlerApp> mozApp = new nsFlatpakHandlerApp();
+        mozApp.forget(aApp);
+        return NS_OK;
+      }
+      g_warning("Failed to call SchemeSupported method: %s\n", error->message);
+      return NS_ERROR_FAILURE;
+    }
+
+    gboolean supported;
+    g_variant_get(result, "(b)", &supported);
+    if (!supported) {
+      LOG("  Scheme '%s' is NOT supported.",
+          PromiseFlatCString(aURIScheme).get());
+      return NS_ERROR_FAILURE;
+    }
+    LOG("  Scheme '%s' is supported.", PromiseFlatCString(aURIScheme).get());
+    RefPtr<nsFlatpakHandlerApp> mozApp = new nsFlatpakHandlerApp();
+    mozApp.forget(aApp);
+    return NS_OK;
+  }
+#endif
+
+  RefPtr<GAppInfo> app_info = dont_AddRef(g_app_info_get_default_for_uri_scheme(
+      PromiseFlatCString(aURIScheme).get()));
+  if (!app_info) {
+    LOG("  Failed to get info from g_app_info_get_default_for_uri_scheme()");
+    return NS_ERROR_FAILURE;
+  }
+  LOG("  g_app_info_get_default_for_uri_scheme() provides %s : %s",
+      g_app_info_get_name(app_info), g_app_info_get_executable(app_info));
+  RefPtr<nsGIOMimeApp> mozApp = new nsGIOMimeApp(app_info.forget());
+  mozApp.forget(aApp);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsGIOService::GetAppsForURIScheme(const nsACString& aURIScheme,
+                                  nsIMutableArray** aResult) {
+  nsCOMPtr<nsIMutableArray> handlersArray =
+      do_CreateInstance(NS_ARRAY_CONTRACTID);
+
+  nsAutoCString contentType("x-scheme-handler/");
+  contentType.Append(aURIScheme);
+
+  LOG("nsGIOService::GetAppsForURIScheme() %s", contentType.get());
+
+  GList* appInfoList = g_app_info_get_all_for_type(contentType.get());
+  if (appInfoList) {
+    GList* appInfo = appInfoList;
+    while (appInfo) {
+      nsCOMPtr<nsIGIOMimeApp> mimeApp =
+          new nsGIOMimeApp(dont_AddRef(G_APP_INFO(appInfo->data)));
+      handlersArray->AppendElement(mimeApp);
+      LOG("  adding %s : %s", g_app_info_get_name(G_APP_INFO(appInfo->data)),
+          g_app_info_get_executable(G_APP_INFO(appInfo->data)));
+      appInfo = appInfo->next;
+    }
+    g_list_free(appInfoList);
+  } else {
+    LOG("  g_app_info_get_all_for_type() is empty");
+  }
+  handlersArray.forget(aResult);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsGIOService::GetAppForMimeType(const nsACString& aMimeType,
+                                nsIHandlerApp** aApp) {
+  *aApp = nullptr;
+
+  LOG("nsGIOService::GetAppForMimeType() %s",
+      PromiseFlatCString(aMimeType).get());
+
+  if (widget::ShouldUsePortal(widget::PortalKind::MimeHandler)) {
+    LOG("  using portal");
+    RefPtr<nsFlatpakHandlerApp> mozApp = new nsFlatpakHandlerApp();
+    mozApp.forget(aApp);
+    return NS_OK;
+  }
+
+  LOG("  g_content_type_from_mime_type(%s)",
+      PromiseFlatCString(aMimeType).get());
+  GUniquePtr<char> content_type(
+      g_content_type_from_mime_type(PromiseFlatCString(aMimeType).get()));
+  if (!content_type) {
+    LOG("  g_content_type_from_mime_type() failed.");
+    return NS_ERROR_FAILURE;
+  }
+
+  if (g_content_type_is_unknown(content_type.get())) {
+    LOG("  g_content_type_from_mime_type() return unknown app.");
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  RefPtr<GAppInfo> app_info =
+      dont_AddRef(g_app_info_get_default_for_type(content_type.get(), false));
+  if (!app_info) {
+    LOG("  g_app_info_get_default_for_type() failed.");
+    return NS_ERROR_FAILURE;
+  }
+  LOG("  g_app_info_get_default_for_type() gives us %s : %s",
+      g_app_info_get_name(app_info), g_app_info_get_executable(app_info));
+  RefPtr<nsGIOMimeApp> mozApp = new nsGIOMimeApp(app_info.forget());
+  mozApp.forget(aApp);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsGIOService::GetDescriptionForMimeType(const nsACString& aMimeType,
+                                        nsACString& aDescription) {
+  GUniquePtr<char> content_type(
+      g_content_type_from_mime_type(PromiseFlatCString(aMimeType).get()));
+  if (!content_type) {
+    return NS_ERROR_FAILURE;
+  }
+
+  GUniquePtr<char> desc(g_content_type_get_description(content_type.get()));
+  if (!desc) {
+    return NS_ERROR_FAILURE;
+  }
+
+  aDescription.Assign(desc.get());
+  return NS_OK;
+}
+
+static nsresult ShowURIImpl(nsIURI* aURI, const char* aXDGToken = nullptr) {
+  nsAutoCString spec;
+  MOZ_TRY(aURI->GetSpec(spec));
+  GUniquePtr<GError> error;
+  LOG("ShowURIImpl() spec %s : aXDGToken %s", spec.get(),
+      aXDGToken ? aXDGToken : "none");
+  if (!g_app_info_launch_default_for_uri(spec.get(),
+                                         GetLaunchContext(aXDGToken).get(),
+          getter_Transfers(error))) {
+    g_warning("Could not launch default application for URI: %s",
+              error->message);
+    return NS_ERROR_FAILURE;
+  }
+  return NS_OK;
+}
+
+nsresult nsGIOService::ShowURI(nsIURI* aURI) {
+  auto promise = mozilla::widget::RequestWaylandFocusPromise();
+  if (!promise) {
+    LOG("nsGIOService::ShowURI() failed to get focus promise, fallback to "
+        "ShowURIImpl()");
+    return ShowURIImpl(aURI);
+  }
+  promise->Then(
+      GetMainThreadSerialEventTarget(), __func__,
+      [uri = RefPtr{aURI}](nsCString token) {
+        LOG("nsGIOService::ShowURI() received XDG focus token");
+        ShowURIImpl(uri, token.get());
+      },
+      [uri = RefPtr{aURI}](bool state) {
+        LOG("nsGIOService::ShowURI() without XDG focus token");
+        ShowURIImpl(uri);
+      });
+  return NS_OK;
+}
+
+static nsresult LaunchPathImpl(const nsACString& aPath,
+                               const char* aXDGToken = nullptr) {
+  RefPtr<GFile> file = dont_AddRef(
+      g_file_new_for_commandline_arg(PromiseFlatCString(aPath).get()));
+  GUniquePtr<char> spec(g_file_get_uri(file));
+  LOG("LaunchPathImpl() file %s : aXDGToken %s",
+      PromiseFlatCString(aPath).get(), aXDGToken ? aXDGToken : "none");
+  GUniquePtr<GError> error;
+  g_app_info_launch_default_for_uri(spec.get(),
+                                    GetLaunchContext(aXDGToken).get(),
+                                            getter_Transfers(error));
+  if (error) {
+    g_warning("Cannot launch default application: %s", error->message);
+    return NS_ERROR_FAILURE;
+  }
+  return NS_OK;
+}
+
+static nsresult LaunchPath(const nsACString& aPath) {
+  auto promise = mozilla::widget::RequestWaylandFocusPromise();
+  if (!promise) {
+    LOG("LaunchPath() failed to get focus promise, fallback to "
+        "LaunchPathImpl()");
+    return LaunchPathImpl(aPath);
+  }
+  promise->Then(
+      GetMainThreadSerialEventTarget(), __func__,
+      [path = nsCString{aPath}](nsCString token) {
+        LOG("LaunchPath() received XDG focus token");
+        LaunchPathImpl(path, token.get());
+      },
+      [path = nsCString{aPath}](bool state) {
+        LOG("LaunchPath() without XDG focus token");
+        LaunchPathImpl(path);
+      });
+  return NS_OK;
+}
+
+nsresult nsGIOService::LaunchFile(const nsACString& aPath) {
+  return LaunchPath(aPath);
+}
+
+nsresult nsGIOService::GetIsRunningUnderFlatpak(bool* aResult) {
+  *aResult = mozilla::widget::IsRunningUnderFlatpak();
+  LOG("nsGIOService::GetIsRunningUnderFlatpak() %d", *aResult);
+  return NS_OK;
+}
+
+nsresult nsGIOService::GetIsRunningUnderSnap(bool* aResult) {
+  *aResult = mozilla::widget::IsRunningUnderSnap();
+  LOG("nsGIOService::IsRunningUnderSnap() %d", *aResult);
+  return NS_OK;
+}
+
+static nsresult RevealDirectory(nsIFile* aFile, bool aForce) {
+  nsAutoCString path;
+  if (bool isDir; NS_SUCCEEDED(aFile->IsDirectory(&isDir)) && isDir) {
+    MOZ_TRY(aFile->GetNativePath(path));
+    return LaunchPath(path);
+  }
+
+  if (!aForce) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsCOMPtr<nsIFile> parentDir;
+  MOZ_TRY(aFile->GetParent(getter_AddRefs(parentDir)));
+  MOZ_TRY(parentDir->GetNativePath(path));
+  return LaunchPath(path);
+}
+
+#if defined(MOZ_ENABLE_DBUS)
+const char kFreedesktopFileManagerName[] = "org.freedesktop.FileManager1";
+const char kFreedesktopFileManagerPath[] = "/org/freedesktop/FileManager1";
+const char kMethodShowItems[] = "ShowItems";
+
+const char kFreedesktopPortalName[] = "org.freedesktop.portal.Desktop";
+const char kFreedesktopPortalPath[] = "/org/freedesktop/portal/desktop";
+const char kFreedesktopPortalOpenURI[] = "org.freedesktop.portal.OpenURI";
+const char kMethodOpenDirectory[] = "OpenDirectory";
+
+static nsresult RevealFileViaDBusWithProxy(GDBusProxy* aProxy, nsIFile* aFile,
+                                           const char* aMethod) {
+  nsAutoCString path;
+  MOZ_TRY(aFile->GetNativePath(path));
+
+  RefPtr<mozilla::widget::DBusCallPromise> dbusPromise;
+
+  char* activationToken = nullptr;
+  auto releaseActivationToken = MakeScopeExit([&] { g_free(activationToken); });
+
+  if (GdkDisplay* display = gdk_display_get_default()) {
+    if (GdkAppLaunchContext* context =
+            gdk_display_get_app_launch_context(display)) {
+      activationToken = g_app_launch_context_get_startup_notify_id(
+          G_APP_LAUNCH_CONTEXT(context), nullptr, nullptr);
+      g_object_unref(context);
+    }
+  }
+
+  const int32_t timeout =
+      StaticPrefs::widget_gtk_file_manager_show_items_timeout_ms();
+
+  nsAppShell::DBusConnectionCheck();
+  if (!(strcmp(aMethod, kMethodOpenDirectory) == 0)) {
+    GUniquePtr<gchar> uri(g_filename_to_uri(path.get(), nullptr, nullptr));
+    if (!uri) {
+      RevealDirectory(aFile,  true);
+      return NS_ERROR_FAILURE;
+    }
+
+    GVariantBuilder builder;
+    g_variant_builder_init(&builder, G_VARIANT_TYPE_STRING_ARRAY);
+    g_variant_builder_add(&builder, "s", uri.get());
+
+    RefPtr<GVariant> variant = dont_AddRef(g_variant_ref_sink(g_variant_new(
+        "(ass)", &builder, activationToken ? activationToken : "")));
+    g_variant_builder_clear(&builder);
+
+    dbusPromise = widget::DBusProxyCall(aProxy, aMethod, variant,
+                                        G_DBUS_CALL_FLAGS_NONE, timeout);
+  } else {
+    int fd = open(path.get(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+      g_printerr("Failed to open file: %s returned %d\n", path.get(), errno);
+      RevealDirectory(aFile,  true);
+      return NS_ERROR_FAILURE;
+    }
+
+    GVariantBuilder options;
+    g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
+
+    static auto g_unix_fd_list_new_from_array =
+        (GUnixFDList * (*)(const gint* fds, gint n_fds))
+            dlsym(RTLD_DEFAULT, "g_unix_fd_list_new_from_array");
+
+    RefPtr<GUnixFDList> fd_list =
+        dont_AddRef(g_unix_fd_list_new_from_array(&fd, 1));
+
+    RefPtr<GVariant> variant = dont_AddRef(g_variant_ref_sink(g_variant_new(
+        "(sha{sv})", activationToken ? activationToken : "", 0, &options)));
+    g_variant_builder_clear(&options);
+
+    dbusPromise = widget::DBusProxyCallWithUnixFDList(
+        aProxy, aMethod, variant, G_DBUS_CALL_FLAGS_NONE, timeout, fd_list);
+  }
+
+  dbusPromise->Then(
+      GetCurrentSerialEventTarget(), __func__,
+      [](RefPtr<GVariant>&& aResult) {
+      },
+      [file = RefPtr{aFile}, aMethod](GUniquePtr<GError>&& aError) {
+        g_printerr("Failed to query file manager via %s: %s\n", aMethod,
+                   aError->message);
+        RevealDirectory(file,  true);
+      });
+  return NS_OK;
+}
+
+static void RevealFileViaDBus(nsIFile* aFile, const char* aName,
+                              const char* aPath, const char* aCall,
+                              const char* aMethod) {
+  widget::CreateDBusProxyForBus(
+      G_BUS_TYPE_SESSION,
+      GDBusProxyFlags(G_DBUS_PROXY_FLAGS_DO_NOT_CONNECT_SIGNALS |
+                      G_DBUS_PROXY_FLAGS_DO_NOT_LOAD_PROPERTIES),
+       nullptr, aName, aPath, aCall)
+      ->Then(
+          GetCurrentSerialEventTarget(), __func__,
+          [file = RefPtr{aFile}, aMethod](RefPtr<GDBusProxy>&& aProxy) {
+            RevealFileViaDBusWithProxy(aProxy.get(), file, aMethod);
+          },
+          [file = RefPtr{aFile}, aName](GUniquePtr<GError>&& aError) {
+            g_printerr("Failed to create DBUS proxy for %s: %s\n", aName,
+                       aError->message);
+            RevealDirectory(file,  true);
+          });
+}
+
+static void RevealFileViaDBusClassic(nsIFile* aFile) {
+  RevealFileViaDBus(aFile, kFreedesktopFileManagerName,
+                    kFreedesktopFileManagerPath, kFreedesktopFileManagerName,
+                    kMethodShowItems);
+}
+
+static void RevealFileViaDBusPortal(nsIFile* aFile) {
+  RevealFileViaDBus(aFile, kFreedesktopPortalName, kFreedesktopPortalPath,
+                    kFreedesktopPortalOpenURI, kMethodOpenDirectory);
+}
+#endif
+
+nsresult nsGIOService::RevealFile(nsIFile* aFile) {
+#if defined(MOZ_ENABLE_DBUS)
+  if (ShouldUsePortal(widget::PortalKind::OpenUri)) {
+    RevealFileViaDBusPortal(aFile);
+  } else if (NS_SUCCEEDED(RevealDirectory(aFile,  false))) {
+    return NS_OK;
+  } else {
+    RevealFileViaDBusClassic(aFile);
+  }
+  return NS_OK;
+#else
+  return RevealDirectory(aFile,  true);
+#endif
+}
+
+NS_IMETHODIMP
+nsGIOService::FindAppFromCommand(nsACString const& aCmd,
+                                 nsIGIOMimeApp** aAppInfo) {
+  RefPtr<GAppInfo> app_info;
+
+  LOG("nsGIOService::FindAppFromCommand() %s", PromiseFlatCString(aCmd).get());
+
+  GList* apps = g_app_info_get_all();
+
+  for (GList* node = apps; node; node = node->next) {
+    RefPtr<GAppInfo> app_info_from_list = dont_AddRef((GAppInfo*)node->data);
+    LOG("  checking %s : %s", g_app_info_get_name(app_info_from_list),
+        g_app_info_get_executable(app_info_from_list));
+    node->data = nullptr;
+    if (!app_info) {
+      GUniquePtr<char> executable(g_find_program_in_path(
+          g_app_info_get_executable(app_info_from_list)));
+
+      if (executable &&
+          strcmp(executable.get(), PromiseFlatCString(aCmd).get()) == 0) {
+        app_info = std::move(app_info_from_list);
+        LOG("  found %s : %s", g_app_info_get_name(app_info),
+            g_app_info_get_executable(app_info));
+      }
+    }
+  }
+
+  g_list_free(apps);
+  if (!app_info) {
+    LOG("  failed to get application");
+    *aAppInfo = nullptr;
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+  RefPtr<nsGIOMimeApp> app = new nsGIOMimeApp(app_info.forget());
+  app.forget(aAppInfo);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsGIOService::CreateHandlerAppFromAppId(const char* aAppId,
+                                        nsIGIOHandlerApp** aResult) {
+  LOG("nsGIOService::CreateHandlerAppFromAppId() %s", aAppId);
+
+  RefPtr<GAppInfo> appInfo =
+      dont_AddRef((GAppInfo*)g_desktop_app_info_new(aAppId));
+  if (!appInfo) {
+    LOG("  Appinfo not found");
+    g_warning("Appinfo not found for: %s", aAppId);
+    return NS_ERROR_FAILURE;
+  }
+  nsCOMPtr<nsIGIOHandlerApp> mozApp = new nsGIOHandlerApp(appInfo.forget());
+
+  mozApp.forget(aResult);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsGIOService::CreateAppFromCommand(nsACString const& cmd,
+                                   nsACString const& appName,
+                                   nsIGIOMimeApp** appInfo) {
+  *appInfo = nullptr;
+
+  LOG("nsGIOService::CreateAppFromCommand() %s : %s",
+      PromiseFlatCString(appName).get(), PromiseFlatCString(cmd).get());
+
+  nsAutoCString commandWithoutArgs;
+  nsresult rv = GetCommandFromCommandline(cmd, commandWithoutArgs);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  GUniquePtr<GError> error;
+  RefPtr<GAppInfo> app_info = dont_AddRef(g_app_info_create_from_commandline(
+      commandWithoutArgs.get(), PromiseFlatCString(appName).get(),
+      G_APP_INFO_CREATE_SUPPORTS_URIS, getter_Transfers(error)));
+  if (!app_info) {
+    g_warning("Cannot create application info from command: %s",
+              error->message);
+    return NS_ERROR_FAILURE;
+  }
+
+  GUniquePtr<gchar> executableWithFullPath(
+      g_find_program_in_path(commandWithoutArgs.get()));
+  if (!executableWithFullPath) {
+    LOG("  quit, program not found in path");
+    return NS_ERROR_FILE_NOT_FOUND;
+  }
+  RefPtr<nsGIOMimeApp> mozApp = new nsGIOMimeApp(app_info.forget());
+  mozApp.forget(appInfo);
+  return NS_OK;
+}

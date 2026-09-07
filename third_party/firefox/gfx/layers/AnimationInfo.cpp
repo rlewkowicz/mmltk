@@ -1,0 +1,883 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "AnimationInfo.h"
+#include "mozilla/LayerAnimationInfo.h"
+#include "mozilla/gfx/Matrix.h"
+#include "mozilla/layers/AnimationStorageData.h"
+#include "mozilla/layers/WebRenderLayerManager.h"
+#include "mozilla/layers/AnimationHelper.h"
+#include "mozilla/layers/CompositorThread.h"
+#include "mozilla/dom/Animation.h"
+#include "mozilla/dom/CSSTransition.h"
+#include "mozilla/dom/KeyframeEffect.h"
+#include "mozilla/EffectSet.h"
+#include "mozilla/MotionPathUtils.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/ScrollContainerFrame.h"
+#include "nsIContent.h"
+#include "nsLayoutUtils.h"
+#include "nsRefreshDriver.h"
+#include "nsStyleTransformMatrix.h"
+#include "PuppetWidget.h"
+
+namespace mozilla::layers {
+
+using TransformReferenceBox = nsStyleTransformMatrix::TransformReferenceBox;
+
+AnimationInfo::AnimationInfo() : mCompositorAnimationsId(0), mMutated(false) {}
+
+AnimationInfo::~AnimationInfo() = default;
+
+void AnimationInfo::EnsureAnimationsId() {
+  if (!mCompositorAnimationsId) {
+    mCompositorAnimationsId = AnimationHelper::GetNextCompositorAnimationsId();
+  }
+}
+
+Animation* AnimationInfo::AddAnimation() {
+  MOZ_ASSERT(!CompositorThreadHolder::IsInCompositorThread());
+  EnsureAnimationsId();
+
+  MOZ_ASSERT(!mPendingAnimations, "should have called ClearAnimations first");
+
+  Animation* anim = mAnimations.AppendElement();
+
+  mMutated = true;
+
+  return anim;
+}
+
+Animation* AnimationInfo::AddAnimationForNextTransaction() {
+  MOZ_ASSERT(!CompositorThreadHolder::IsInCompositorThread());
+  MOZ_ASSERT(mPendingAnimations,
+             "should have called ClearAnimationsForNextTransaction first");
+
+  Animation* anim = mPendingAnimations->AppendElement();
+
+  return anim;
+}
+
+void AnimationInfo::ClearAnimations() {
+  mPendingAnimations = nullptr;
+
+  if (mAnimations.IsEmpty() && mStorageData.IsEmpty()) {
+    return;
+  }
+
+  mAnimations.Clear();
+  mStorageData.Clear();
+
+  mMutated = true;
+}
+
+void AnimationInfo::ClearAnimationsForNextTransaction() {
+  if (!mPendingAnimations) {
+    mPendingAnimations = MakeUnique<AnimationArray>();
+  }
+
+  mPendingAnimations->Clear();
+}
+
+void AnimationInfo::MaybeStartPendingAnimation(Animation& aAnimation,
+                                               const TimeStamp& aReadyTime) {
+  if (!std::isnan(aAnimation.previousPlaybackRate()) &&
+      aAnimation.startTime().isSome() && !aAnimation.originTime().IsNull() &&
+      !aAnimation.isNotPlaying()) {
+    TimeDuration readyTime = aReadyTime - aAnimation.originTime();
+    aAnimation.holdTime() = dom::Animation::CurrentTimeFromTimelineTime(
+        readyTime, aAnimation.startTime().ref(),
+        aAnimation.previousPlaybackRate());
+    aAnimation.startTime() = Nothing();
+  }
+
+  if (aAnimation.startTime().isNothing() && !aAnimation.originTime().IsNull() &&
+      !aAnimation.isNotPlaying()) {
+    const TimeDuration readyTime = aReadyTime - aAnimation.originTime();
+    aAnimation.startTime() = Some(dom::Animation::StartTimeFromTimelineTime(
+        readyTime, aAnimation.holdTime(), aAnimation.playbackRate()));
+  }
+}
+
+bool AnimationInfo::ApplyPendingUpdatesForThisTransaction() {
+  if (mPendingAnimations) {
+    mAnimations = std::move(*mPendingAnimations);
+    mPendingAnimations = nullptr;
+    return true;
+  }
+
+  return false;
+}
+
+bool AnimationInfo::HasTransformAnimation() const {
+  const nsCSSPropertyIDSet& transformSet =
+      LayerAnimationInfo::GetCSSPropertiesFor(DisplayItemType::TYPE_TRANSFORM);
+  for (const auto& animation : mAnimations) {
+    if (transformSet.HasProperty(animation.property())) {
+      return true;
+    }
+  }
+  return false;
+}
+
+Maybe<uint64_t> AnimationInfo::GetGenerationFromFrame(
+    nsIFrame* aFrame, DisplayItemType aDisplayItemKey) {
+  MOZ_ASSERT(aFrame->IsPrimaryFrame() ||
+             nsLayoutUtils::IsFirstContinuationOrIBSplitSibling(aFrame));
+
+  if (nsLayoutUtils::IsFirstContinuationOrIBSplitSibling(aFrame)) {
+    aFrame = nsLayoutUtils::LastContinuationOrIBSplitSibling(aFrame);
+  }
+  RefPtr<WebRenderAnimationData> animationData =
+      GetWebRenderUserData<WebRenderAnimationData>(aFrame,
+                                                   (uint32_t)aDisplayItemKey);
+  if (animationData) {
+    return animationData->GetAnimationInfo().GetAnimationGeneration();
+  }
+
+  return Nothing();
+}
+
+void AnimationInfo::EnumerateGenerationOnFrame(
+    const nsIFrame* aFrame, const nsIContent* aContent,
+    const CompositorAnimatableDisplayItemTypes& aDisplayItemTypes,
+    AnimationGenerationCallback aCallback) {
+  nsIWidget* widget = nsContentUtils::WidgetForContent(aContent);
+  if (!widget) {
+    return;
+  }
+  if (!widget->HasWindowRenderer()) {
+    for (auto displayItem : LayerAnimationInfo::sDisplayItemTypes) {
+      aCallback(Nothing(), displayItem);
+    }
+    return;
+  }
+  WindowRenderer* renderer = widget->GetWindowRenderer();
+  MOZ_ASSERT(renderer);
+  if (!renderer->AsWebRender()) {
+    return;
+  }
+
+  if (nsLayoutUtils::IsFirstContinuationOrIBSplitSibling(aFrame)) {
+    aFrame = nsLayoutUtils::LastContinuationOrIBSplitSibling(aFrame);
+  }
+
+  for (auto displayItem : LayerAnimationInfo::sDisplayItemTypes) {
+    const nsIFrame* frameToQuery =
+        displayItem == DisplayItemType::TYPE_TRANSFORM
+            ? nsLayoutUtils::GetPrimaryFrameFromStyleFrame(aFrame)
+            : aFrame;
+    RefPtr<WebRenderAnimationData> animationData =
+        GetWebRenderUserData<WebRenderAnimationData>(frameToQuery,
+                                                     (uint32_t)displayItem);
+    Maybe<uint64_t> generation;
+    if (animationData) {
+      generation = animationData->GetAnimationInfo().GetAnimationGeneration();
+    }
+    aCallback(generation, displayItem);
+  }
+}
+
+static StyleTransformOperation ResolveTranslate(
+    TransformReferenceBox& aRefBox, const LengthPercentage& aX,
+    const LengthPercentage& aY = LengthPercentage::Zero(),
+    const Length& aZ = Length{0}) {
+  float x = nsStyleTransformMatrix::ProcessTranslatePart(
+      aX, &aRefBox, &TransformReferenceBox::Width);
+  float y = nsStyleTransformMatrix::ProcessTranslatePart(
+      aY, &aRefBox, &TransformReferenceBox::Height);
+  return StyleTransformOperation::Translate3D(
+      LengthPercentage::FromPixels(x), LengthPercentage::FromPixels(y), aZ);
+}
+
+static StyleTranslate ResolveTranslate(const StyleTranslate& aValue,
+                                       TransformReferenceBox& aRefBox) {
+  if (aValue.IsTranslate()) {
+    const auto& t = aValue.AsTranslate();
+    float x = nsStyleTransformMatrix::ProcessTranslatePart(
+        t._0, &aRefBox, &TransformReferenceBox::Width);
+    float y = nsStyleTransformMatrix::ProcessTranslatePart(
+        t._1, &aRefBox, &TransformReferenceBox::Height);
+    return StyleTranslate::Translate(LengthPercentage::FromPixels(x),
+                                     LengthPercentage::FromPixels(y), t._2);
+  }
+
+  MOZ_ASSERT(aValue.IsNone());
+  return StyleTranslate::None();
+}
+
+static StyleTransform ResolveTransformOperations(
+    const StyleTransform& aTransform, TransformReferenceBox& aRefBox,
+    mozilla::StyleZoom aEffectiveZoom) {
+  auto convertMatrix = [](const gfx::Matrix4x4& aM) {
+    return StyleTransformOperation::Matrix3D(StyleGenericMatrix3D<StyleNumber>{
+        aM._11, aM._12, aM._13, aM._14, aM._21, aM._22, aM._23, aM._24, aM._31,
+        aM._32, aM._33, aM._34, aM._41, aM._42, aM._43, aM._44});
+  };
+
+  Vector<StyleTransformOperation> result;
+  MOZ_RELEASE_ASSERT(
+      result.initCapacity(aTransform.Operations().Length()),
+      "Allocating vector of transform operations should be successful.");
+
+  for (const StyleTransformOperation& op : aTransform.Operations()) {
+    switch (op.tag) {
+      case StyleTransformOperation::Tag::TranslateX:
+        result.infallibleAppend(ResolveTranslate(aRefBox, op.AsTranslateX()));
+        break;
+      case StyleTransformOperation::Tag::TranslateY:
+        result.infallibleAppend(ResolveTranslate(
+            aRefBox, LengthPercentage::Zero(), op.AsTranslateY()));
+        break;
+      case StyleTransformOperation::Tag::TranslateZ:
+        result.infallibleAppend(
+            ResolveTranslate(aRefBox, LengthPercentage::Zero(),
+                             LengthPercentage::Zero(), op.AsTranslateZ()));
+        break;
+      case StyleTransformOperation::Tag::Translate: {
+        const auto& translate = op.AsTranslate();
+        result.infallibleAppend(
+            ResolveTranslate(aRefBox, translate._0, translate._1));
+        break;
+      }
+      case StyleTransformOperation::Tag::Translate3D: {
+        const auto& translate = op.AsTranslate3D();
+        result.infallibleAppend(ResolveTranslate(aRefBox, translate._0,
+                                                 translate._1, translate._2));
+        break;
+      }
+      case StyleTransformOperation::Tag::InterpolateMatrix: {
+        gfx::Matrix4x4 matrix;
+        nsStyleTransformMatrix::ProcessInterpolateMatrix(matrix, op, aRefBox,
+                                                         aEffectiveZoom);
+        result.infallibleAppend(convertMatrix(matrix));
+        break;
+      }
+      case StyleTransformOperation::Tag::AccumulateMatrix: {
+        gfx::Matrix4x4 matrix;
+        nsStyleTransformMatrix::ProcessAccumulateMatrix(matrix, op, aRefBox,
+                                                        aEffectiveZoom);
+        result.infallibleAppend(convertMatrix(matrix));
+        break;
+      }
+      case StyleTransformOperation::Tag::Matrix: {
+        auto matrix = op.AsMatrix();
+
+        matrix.e = aEffectiveZoom.Zoom(matrix.e);
+        matrix.f = aEffectiveZoom.Zoom(matrix.f);
+
+        result.infallibleAppend(StyleTransformOperation::Matrix(matrix));
+        break;
+      }
+      case StyleTransformOperation::Tag::Matrix3D: {
+        auto matrix3d = op.AsMatrix3D();
+
+        matrix3d.m41 = aEffectiveZoom.Zoom(matrix3d.m41);
+        matrix3d.m42 = aEffectiveZoom.Zoom(matrix3d.m42);
+        matrix3d.m43 = aEffectiveZoom.Zoom(matrix3d.m43);
+
+        result.infallibleAppend(StyleTransformOperation::Matrix3D(matrix3d));
+        break;
+      }
+      case StyleTransformOperation::Tag::RotateX:
+      case StyleTransformOperation::Tag::RotateY:
+      case StyleTransformOperation::Tag::RotateZ:
+      case StyleTransformOperation::Tag::Rotate:
+      case StyleTransformOperation::Tag::Rotate3D:
+      case StyleTransformOperation::Tag::ScaleX:
+      case StyleTransformOperation::Tag::ScaleY:
+      case StyleTransformOperation::Tag::ScaleZ:
+      case StyleTransformOperation::Tag::Scale:
+      case StyleTransformOperation::Tag::Scale3D:
+      case StyleTransformOperation::Tag::SkewX:
+      case StyleTransformOperation::Tag::SkewY:
+      case StyleTransformOperation::Tag::Skew:
+      case StyleTransformOperation::Tag::Perspective:
+        result.infallibleAppend(op);
+        break;
+      default:
+        MOZ_ASSERT_UNREACHABLE("Function not handled yet!");
+    }
+  }
+
+  auto transform = StyleTransform{
+      StyleOwnedSlice<StyleTransformOperation>(std::move(result))};
+  MOZ_ASSERT(!transform.HasPercent());
+  MOZ_ASSERT(transform.Operations().Length() ==
+             aTransform.Operations().Length());
+  return transform;
+}
+
+static Maybe<ScrollTimelineOptions> GetScrollTimelineOptions(
+    dom::AnimationTimeline* aTimeline) {
+  if (!aTimeline || !aTimeline->IsScrollTimeline()) {
+    return Nothing();
+  }
+
+  const dom::ScrollTimeline* timeline = aTimeline->AsScrollTimeline();
+  const auto state = timeline->GetSnapshot();
+  MOZ_ASSERT(state.IsActive(),
+             "We send scroll animation to the compositor only if its timeline "
+             "is active");
+
+  ScrollableLayerGuid::ViewID source = ScrollableLayerGuid::NULL_SCROLL_ID;
+  DebugOnly<bool> success =
+      nsLayoutUtils::FindIDFor(state.SourceElement(), &source);
+  MOZ_ASSERT(success, "We should have a valid ViewID for the scroller");
+
+  return Some(ScrollTimelineOptions(source, state.Axis()));
+}
+
+static void SetAnimatable(NonCustomCSSPropertyId aProperty,
+                          const AnimationValue& aAnimationValue,
+                          nsIFrame* aFrame, TransformReferenceBox& aRefBox,
+                          layers::Animatable& aAnimatable) {
+  MOZ_ASSERT(aFrame);
+
+  if (aAnimationValue.IsNull()) {
+    aAnimatable = null_t();
+    return;
+  }
+
+  switch (aProperty) {
+    case eCSSProperty_background_color: {
+      nscolor foreground =
+          aFrame->Style()->GetVisitedDependentColor(&nsStyleText::mColor);
+      aAnimatable = aAnimationValue.GetColor(foreground);
+      break;
+    }
+    case eCSSProperty_opacity:
+      aAnimatable = aAnimationValue.GetOpacity();
+      break;
+    case eCSSProperty_rotate:
+      aAnimatable = aAnimationValue.GetRotateProperty();
+      break;
+    case eCSSProperty_scale:
+      aAnimatable = aAnimationValue.GetScaleProperty();
+      break;
+    case eCSSProperty_translate:
+      aAnimatable =
+          ResolveTranslate(aAnimationValue.GetTranslateProperty(), aRefBox);
+      break;
+    case eCSSProperty_transform:
+      aAnimatable =
+          ResolveTransformOperations(aAnimationValue.GetTransformProperty(),
+                                     aRefBox, aFrame->Style()->EffectiveZoom());
+      break;
+    case eCSSProperty_offset_path:
+      aAnimatable = StyleOffsetPath::None();
+      aAnimationValue.GetOffsetPathProperty(aAnimatable.get_StyleOffsetPath());
+      break;
+    case eCSSProperty_offset_distance:
+      aAnimatable = aAnimationValue.GetOffsetDistanceProperty();
+      break;
+    case eCSSProperty_offset_rotate:
+      aAnimatable = aAnimationValue.GetOffsetRotateProperty();
+      break;
+    case eCSSProperty_offset_anchor:
+      aAnimatable = aAnimationValue.GetOffsetAnchorProperty();
+      break;
+    case eCSSProperty_offset_position:
+      aAnimatable = aAnimationValue.GetOffsetPositionProperty();
+      break;
+    default:
+      MOZ_ASSERT_UNREACHABLE("Unsupported property");
+  }
+}
+
+void AnimationInfo::AddAnimationForProperty(
+    nsIFrame* aFrame, const AnimationProperty& aProperty,
+    dom::Animation* aAnimation, const Maybe<TransformData>& aTransformData,
+    Send aSendFlag) {
+  MOZ_ASSERT(aAnimation->GetEffect(),
+             "Should not be adding an animation without an effect");
+  MOZ_ASSERT(!aAnimation->GetStartTime().IsNull() || !aAnimation->IsPlaying() ||
+                 (aAnimation->GetTimeline() &&
+                  aAnimation->GetTimeline()->TracksWallclockTime()),
+             "If the animation has an unresolved start time it should either"
+             " be static (so we don't need a start time) or else have a"
+             " timeline capable of converting TimeStamps (so we can calculate"
+             " one later");
+
+  Animation* animation = (aSendFlag == Send::NextTransaction)
+                             ? AddAnimationForNextTransaction()
+                             : AddAnimation();
+
+  const TimingParams& timing = aAnimation->GetEffect()->NormalizedTiming();
+
+  bool needReplaceTransition = false;
+  if (dom::CSSTransition* cssTransition = aAnimation->AsCSSTransition()) {
+    needReplaceTransition =
+        cssTransition->UpdateStartValueFromReplacedTransition();
+  }
+
+  animation->originTime() =
+      !aAnimation->GetTimeline()
+          ? TimeStamp()
+          : aAnimation->GetTimeline()->ToTimeStamp(TimeDuration());
+
+  dom::Nullable<TimeDuration> startTime = aAnimation->GetStartTime();
+  if (startTime.IsNull()) {
+    animation->startTime() = Nothing();
+  } else {
+    animation->startTime() = Some(startTime.Value());
+  }
+
+  animation->holdTime() = aAnimation->GetCurrentTimeAsDuration().Value();
+
+  const ComputedTiming computedTiming =
+      aAnimation->GetEffect()->GetComputedTiming();
+  animation->delay() = timing.Delay();
+  animation->endDelay() = timing.EndDelay();
+  animation->duration() = computedTiming.mDuration;
+  animation->iterations() = static_cast<float>(computedTiming.mIterations);
+  animation->iterationStart() =
+      static_cast<float>(computedTiming.mIterationStart);
+  animation->direction() = static_cast<uint8_t>(timing.Direction());
+  animation->fillMode() = static_cast<uint8_t>(computedTiming.mFill);
+  MOZ_ASSERT(!aProperty.mProperty.IsCustom(),
+             "We don't animate custom properties in the compositor");
+  animation->property() = aProperty.mProperty.mId;
+  animation->playbackRate() =
+      static_cast<float>(aAnimation->CurrentOrPendingPlaybackRate());
+  animation->previousPlaybackRate() =
+      aAnimation->HasPendingPlaybackRate()
+          ? static_cast<float>(aAnimation->PlaybackRateInternal())
+          : std::numeric_limits<float>::quiet_NaN();
+  animation->transformData() = aTransformData;
+  animation->easingFunction() = timing.TimingFunction();
+  animation->iterationComposite() = static_cast<uint8_t>(
+      aAnimation->GetEffect()->AsKeyframeEffect()->IterationComposite());
+  animation->isNotPlaying() = !aAnimation->IsPlaying();
+  animation->isNotAnimating() = false;
+  animation->scrollTimelineOptions() =
+      GetScrollTimelineOptions(aAnimation->GetTimeline());
+  animation->replacedTransitionId() =
+      needReplaceTransition ? Some(GetCompositorAnimationsId()) : Nothing();
+
+  TransformReferenceBox refBox(aFrame);
+
+
+  AnimationValue baseStyle =
+      aAnimation->GetEffect()->AsKeyframeEffect()->BaseStyle(
+          aProperty.mProperty);
+  if (!baseStyle.IsNull()) {
+    SetAnimatable(aProperty.mProperty.mId, baseStyle, aFrame, refBox,
+                  animation->baseStyle());
+  } else {
+    animation->baseStyle() = null_t();
+  }
+
+  for (const AnimationPropertySegment& segment : aProperty.mSegments) {
+    AnimationSegment* animSegment = animation->segments().AppendElement();
+    SetAnimatable(aProperty.mProperty.mId, segment.mFromValue, aFrame, refBox,
+                  animSegment->startState());
+    SetAnimatable(aProperty.mProperty.mId, segment.mToValue, aFrame, refBox,
+                  animSegment->endState());
+
+    animSegment->startPortion() = segment.mFromKey;
+    animSegment->endPortion() = segment.mToKey;
+    animSegment->startComposite() =
+        static_cast<uint8_t>(segment.mFromComposite);
+    animSegment->endComposite() = static_cast<uint8_t>(segment.mToComposite);
+    animSegment->sampleFn() = segment.mTimingFunction;
+  }
+
+  if (aAnimation->Pending()) {
+    TimeStamp readyTime = aAnimation->GetPendingReadyTime();
+    if (readyTime.IsNull()) {
+      readyTime = aFrame->PresContext()->RefreshDriver()->MostRecentRefresh();
+      MOZ_ASSERT(!readyTime.IsNull());
+      aAnimation->SetPendingReadyTime(readyTime);
+    }
+    MaybeStartPendingAnimation(*animation, readyTime);
+  }
+}
+
+static HashMap<NonCustomCSSPropertyId, nsTArray<RefPtr<dom::Animation>>>
+GroupAnimationsByProperty(const nsTArray<RefPtr<dom::Animation>>& aAnimations,
+                          const nsCSSPropertyIDSet& aPropertySet) {
+  HashMap<NonCustomCSSPropertyId, nsTArray<RefPtr<dom::Animation>>>
+      groupedAnims;
+  for (const RefPtr<dom::Animation>& anim : aAnimations) {
+    const dom::KeyframeEffect* effect = anim->GetEffect()->AsKeyframeEffect();
+    MOZ_ASSERT(effect);
+    for (const AnimationProperty& property : effect->Properties()) {
+      if (!aPropertySet.HasProperty(property.mProperty)) {
+        continue;
+      }
+
+      auto animsForPropertyPtr =
+          groupedAnims.lookupForAdd(property.mProperty.mId);
+      if (!animsForPropertyPtr) {
+        DebugOnly<bool> rv =
+            groupedAnims.add(animsForPropertyPtr, property.mProperty.mId,
+                             nsTArray<RefPtr<dom::Animation>>());
+        MOZ_ASSERT(rv, "Should have enough memory");
+      }
+      animsForPropertyPtr->value().AppendElement(anim);
+    }
+  }
+  return groupedAnims;
+}
+
+bool AnimationInfo::AddAnimationsForProperty(
+    nsIFrame* aFrame, const EffectSet* aEffects,
+    const nsTArray<RefPtr<dom::Animation>>& aCompositorAnimations,
+    const Maybe<TransformData>& aTransformData,
+    NonCustomCSSPropertyId aProperty, Send aSendFlag,
+    WebRenderLayerManager* aLayerManager) {
+  bool addedAny = false;
+  for (dom::Animation* anim : aCompositorAnimations) {
+    if (!anim->IsRelevant()) {
+      continue;
+    }
+
+    MOZ_ASSERT(anim->GetEffect() && anim->GetEffect()->AsKeyframeEffect(),
+               "A playing animation should have a keyframe effect");
+    dom::KeyframeEffect* keyframeEffect = anim->GetEffect()->AsKeyframeEffect();
+    const AnimationProperty* property =
+        keyframeEffect->GetEffectiveAnimationOfProperty(
+            CSSPropertyId(aProperty), *aEffects);
+    if (!property) {
+      continue;
+    }
+
+    MOZ_ASSERT(
+        anim->CascadeLevel() != EffectCompositor::CascadeLevel::Animations ||
+            !aEffects->PropertiesWithImportantRules().HasProperty(aProperty),
+        "GetEffectiveAnimationOfProperty already tested the property "
+        "is not overridden by !important rules");
+
+    if (anim->Pending() && anim->GetTimeline() &&
+        !anim->GetTimeline()->TracksWallclockTime()) {
+      continue;
+    }
+
+    AddAnimationForProperty(aFrame, *property, anim, aTransformData, aSendFlag);
+    keyframeEffect->SetIsRunningOnCompositor(aProperty, true);
+    addedAny = true;
+    if (aTransformData && aTransformData->partialPrerenderData() &&
+        aLayerManager) {
+      aLayerManager->AddPartialPrerenderedAnimation(GetCompositorAnimationsId(),
+                                                    anim);
+    }
+  }
+  return addedAny;
+}
+
+static SideBits GetOverflowedSides(const nsRect& aOverflow,
+                                   const nsRect& aPartialPrerenderArea) {
+  SideBits sides = SideBits::eNone;
+  if (aOverflow.X() < aPartialPrerenderArea.X()) {
+    sides |= SideBits::eLeft;
+  }
+  if (aOverflow.Y() < aPartialPrerenderArea.Y()) {
+    sides |= SideBits::eTop;
+  }
+  if (aOverflow.XMost() > aPartialPrerenderArea.XMost()) {
+    sides |= SideBits::eRight;
+  }
+  if (aOverflow.YMost() > aPartialPrerenderArea.YMost()) {
+    sides |= SideBits::eBottom;
+  }
+  return sides;
+}
+
+static std::pair<ParentLayerRect, gfx::Matrix4x4>
+GetClipRectAndTransformForPartialPrerender(
+    const nsIFrame* aFrame, int32_t aDevPixelsToAppUnits,
+    const nsIFrame* aClipFrame,
+    const ScrollContainerFrame* aScrollContainerFrame) {
+  MOZ_ASSERT(aClipFrame);
+
+  gfx::Matrix4x4 transformInClip =
+      nsLayoutUtils::GetTransformToAncestor(RelativeTo{aFrame->GetParent()},
+                                            RelativeTo{aClipFrame})
+          .GetMatrix();
+  if (aScrollContainerFrame) {
+    transformInClip.PostTranslate(
+        LayoutDevicePoint::FromAppUnits(
+            aScrollContainerFrame->GetScrollPosition(), aDevPixelsToAppUnits)
+            .ToUnknownPoint());
+  }
+
+  return std::make_pair(
+      LayoutDeviceRect::FromAppUnits(
+          aScrollContainerFrame ? aScrollContainerFrame->GetScrollPortRect()
+                                : aClipFrame->GetRectRelativeToSelf(),
+          aDevPixelsToAppUnits) *
+          LayoutDeviceToLayerScale2D() * LayerToParentLayerScale(),
+      transformInClip);
+}
+
+static PartialPrerenderData GetPartialPrerenderData(
+    const nsIFrame* aFrame, const nsDisplayItem* aItem) {
+  const nsRect& partialPrerenderedRect = aItem->GetUntransformedPaintRect();
+  nsRect overflow = aFrame->InkOverflowRectRelativeToSelf();
+
+  ScrollableLayerGuid::ViewID scrollId = ScrollableLayerGuid::NULL_SCROLL_ID;
+
+  const nsIFrame* clipFrame =
+      nsLayoutUtils::GetNearestOverflowClipFrame(aFrame->GetParent());
+  const ScrollContainerFrame* scrollContainerFrame = do_QueryFrame(clipFrame);
+
+  if (!clipFrame) {
+    scrollContainerFrame = aFrame->PresShell()->GetRootScrollContainerFrame();
+    if (scrollContainerFrame) {
+      clipFrame = scrollContainerFrame;
+    } else {
+      clipFrame = aFrame->PresShell()->GetRootFrame();
+    }
+  }
+
+  if (scrollContainerFrame &&
+      !scrollContainerFrame->GetScrollStyles().IsHiddenInBothDirections() &&
+      nsLayoutUtils::AsyncPanZoomEnabled(aFrame)) {
+    const bool isInPositionFixed =
+        nsLayoutUtils::IsInPositionFixedSubtree(aFrame);
+    const ActiveScrolledRoot* asr = aItem->GetNearestScrollASR();
+    if (!isInPositionFixed && asr &&
+        aFrame->PresContext() == asr->ScrollFrame()->PresContext()) {
+      scrollId = asr->GetViewId();
+      MOZ_ASSERT(clipFrame == asr->ScrollFrame());
+    } else {
+      scrollId =
+          nsLayoutUtils::ScrollIdForRootScrollFrame(aFrame->PresContext());
+      MOZ_ASSERT(clipFrame ==
+                 aFrame->PresShell()->GetRootScrollContainerFrame());
+    }
+  }
+
+  int32_t devPixelsToAppUnits = aFrame->PresContext()->AppUnitsPerDevPixel();
+
+  auto [clipRect, transformInClip] = GetClipRectAndTransformForPartialPrerender(
+      aFrame, devPixelsToAppUnits, clipFrame, scrollContainerFrame);
+
+  return PartialPrerenderData{
+      LayoutDeviceRect::FromAppUnits(partialPrerenderedRect,
+                                     devPixelsToAppUnits),
+      GetOverflowedSides(overflow, partialPrerenderedRect),
+      scrollId,
+      clipRect,
+      transformInClip,
+      LayoutDevicePoint()};  
+}
+
+enum class AnimationDataType {
+  WithMotionPath,
+  WithoutMotionPath,
+};
+static Maybe<TransformData> CreateAnimationData(
+    nsIFrame* aFrame, nsDisplayItem* aItem, DisplayItemType aType,
+    layers::LayersBackend aLayersBackend, AnimationDataType aDataType,
+    const Maybe<LayoutDevicePoint>& aPosition) {
+  if (aType != DisplayItemType::TYPE_TRANSFORM) {
+    return Nothing();
+  }
+
+  TransformReferenceBox refBox(aFrame);
+  const nsRect bounds(0, 0, refBox.Width(), refBox.Height());
+
+  int32_t devPixelsToAppUnits = aFrame->PresContext()->AppUnitsPerDevPixel();
+  float scale = devPixelsToAppUnits;
+  gfx::Point3D offsetToTransformOrigin =
+      nsDisplayTransform::GetDeltaToTransformOrigin(aFrame, refBox, scale);
+  nsPoint origin;
+  if (aLayersBackend == layers::LayersBackend::LAYERS_WR) {
+  } else if (aItem) {
+    origin = aItem->ToReferenceFrame();
+  } else {
+    nsIFrame* referenceFrame = nsLayoutUtils::GetReferenceFrame(
+        nsLayoutUtils::GetCrossDocParentFrameInProcess(aFrame));
+    origin = aFrame->GetOffsetToCrossDoc(referenceFrame);
+  }
+
+  Maybe<MotionPathData> motionPathData;
+  if (aDataType == AnimationDataType::WithMotionPath) {
+    const StyleTransformOrigin& styleOrigin =
+        aFrame->StyleDisplay()->mTransformOrigin;
+    CSSPoint motionPathOrigin = nsStyleTransformMatrix::Convert2DPosition(
+        styleOrigin.horizontal, styleOrigin.vertical, refBox);
+    CSSPoint anchorAdjustment =
+        MotionPathUtils::ComputeAnchorPointAdjustment(*aFrame);
+    nsRect coordBox;
+    const nsIFrame* containingBlockFrame =
+        MotionPathUtils::GetOffsetPathReferenceBox(aFrame, coordBox);
+    nsTArray<nscoord> radii;
+    if (containingBlockFrame) {
+      radii = MotionPathUtils::ComputeBorderRadii(
+          containingBlockFrame->StyleBorder()->mBorderRadius, coordBox);
+    }
+    motionPathData.emplace(
+        std::move(motionPathOrigin), std::move(anchorAdjustment),
+        std::move(coordBox),
+        containingBlockFrame ? aFrame->GetOffsetTo(containingBlockFrame)
+                             : aFrame->GetPosition(),
+        MotionPathUtils::GetRayContainReferenceSize(aFrame), std::move(radii));
+  }
+
+  Maybe<PartialPrerenderData> partialPrerenderData;
+  if (aItem && static_cast<nsDisplayTransform*>(aItem)->IsPartialPrerender()) {
+    partialPrerenderData = Some(GetPartialPrerenderData(aFrame, aItem));
+
+    if (aLayersBackend == layers::LayersBackend::LAYERS_WR) {
+      MOZ_ASSERT(aPosition);
+      partialPrerenderData->position() = *aPosition;
+    }
+  }
+
+  return Some(TransformData(origin, offsetToTransformOrigin, bounds,
+                            devPixelsToAppUnits, motionPathData,
+                            partialPrerenderData));
+}
+
+void AnimationInfo::AddNonAnimatingTransformLikePropertiesStyles(
+    const nsCSSPropertyIDSet& aNonAnimatingProperties, nsIFrame* aFrame,
+    Send aSendFlag) {
+  auto appendFakeAnimation = [this, aSendFlag](NonCustomCSSPropertyId aProperty,
+                                               Animatable&& aBaseStyle) {
+    layers::Animation* animation = (aSendFlag == Send::NextTransaction)
+                                       ? AddAnimationForNextTransaction()
+                                       : AddAnimation();
+    animation->property() = aProperty;
+    animation->baseStyle() = std::move(aBaseStyle);
+    animation->easingFunction() = Nothing();
+    animation->isNotAnimating() = true;
+  };
+
+  const nsStyleDisplay* display = aFrame->StyleDisplay();
+  bool hasMotion =
+      !display->mOffsetPath.IsNone() ||
+      !aNonAnimatingProperties.HasProperty(eCSSProperty_offset_path);
+
+  for (NonCustomCSSPropertyId id : aNonAnimatingProperties) {
+    switch (id) {
+      case eCSSProperty_transform:
+        if (!display->mTransform.IsNone()) {
+          TransformReferenceBox refBox(aFrame);
+          appendFakeAnimation(
+              id, ResolveTransformOperations(display->mTransform, refBox,
+                                             aFrame->Style()->EffectiveZoom()));
+        }
+        break;
+      case eCSSProperty_translate:
+        if (!display->mTranslate.IsNone()) {
+          TransformReferenceBox refBox(aFrame);
+          appendFakeAnimation(id,
+                              ResolveTranslate(display->mTranslate, refBox));
+        }
+        break;
+      case eCSSProperty_rotate:
+        if (!display->mRotate.IsNone()) {
+          appendFakeAnimation(id, display->mRotate);
+        }
+        break;
+      case eCSSProperty_scale:
+        if (!display->mScale.IsNone()) {
+          appendFakeAnimation(id, display->mScale);
+        }
+        break;
+      case eCSSProperty_offset_path:
+        if (!display->mOffsetPath.IsNone()) {
+          appendFakeAnimation(id, display->mOffsetPath);
+        }
+        break;
+      case eCSSProperty_offset_distance:
+        if (hasMotion && !display->mOffsetDistance.IsDefinitelyZero()) {
+          appendFakeAnimation(id, display->mOffsetDistance);
+        }
+        break;
+      case eCSSProperty_offset_rotate:
+        if (hasMotion && (!display->mOffsetRotate.auto_ ||
+                          display->mOffsetRotate.angle.ToDegrees() != 0.0)) {
+          appendFakeAnimation(id, display->mOffsetRotate);
+        }
+        break;
+      case eCSSProperty_offset_anchor:
+        if (hasMotion && !display->mOffsetAnchor.IsAuto()) {
+          appendFakeAnimation(id, display->mOffsetAnchor);
+        }
+        break;
+      case eCSSProperty_offset_position:
+        if (hasMotion && !display->mOffsetPosition.IsAuto()) {
+          appendFakeAnimation(id, display->mOffsetPosition);
+        }
+        break;
+      default:
+        MOZ_ASSERT_UNREACHABLE("Unsupported transform-like properties");
+    }
+  }
+}
+
+void AnimationInfo::AddAnimationsForDisplayItem(
+    nsIFrame* aFrame, nsDisplayListBuilder* aBuilder, nsDisplayItem* aItem,
+    DisplayItemType aType, WebRenderLayerManager* aLayerManager,
+    const Maybe<LayoutDevicePoint>& aPosition) {
+  Send sendFlag = !aBuilder ? Send::NextTransaction : Send::Immediate;
+  if (sendFlag == Send::NextTransaction) {
+    ClearAnimationsForNextTransaction();
+  } else {
+    ClearAnimations();
+  }
+
+  EffectSet* effects = EffectSet::GetForFrame(aFrame, aType);
+  uint64_t animationGeneration =
+      effects ? effects->GetAnimationGeneration() : 0;
+  SetAnimationGeneration(animationGeneration);
+  if (!effects || effects->IsEmpty()) {
+    return;
+  }
+
+  EffectCompositor::ClearIsRunningOnCompositor(aFrame, aType);
+  const nsCSSPropertyIDSet& propertySet =
+      LayerAnimationInfo::GetCSSPropertiesFor(aType);
+  const nsTArray<RefPtr<dom::Animation>> matchedAnimations =
+      EffectCompositor::GetAnimationsForCompositor(aFrame, propertySet);
+  if (matchedAnimations.IsEmpty()) {
+    return;
+  }
+
+  if (aItem && !aItem->CanUseAsyncAnimations()) {
+    aFrame->SetProperty(nsIFrame::RefusedAsyncAnimationProperty(), true);
+    return;
+  }
+
+  const HashMap<NonCustomCSSPropertyId, nsTArray<RefPtr<dom::Animation>>>
+      compositorAnimations =
+          GroupAnimationsByProperty(matchedAnimations, propertySet);
+  Maybe<TransformData> transformData =
+      CreateAnimationData(aFrame, aItem, aType, aLayerManager->GetBackendType(),
+                          compositorAnimations.has(eCSSProperty_offset_path) ||
+                                  !aFrame->StyleDisplay()->mOffsetPath.IsNone()
+                              ? AnimationDataType::WithMotionPath
+                              : AnimationDataType::WithoutMotionPath,
+                          aPosition);
+  const bool hasMultipleTransformLikeProperties =
+      aType == DisplayItemType::TYPE_TRANSFORM;
+  nsCSSPropertyIDSet nonAnimatingProperties =
+      nsCSSPropertyIDSet::TransformLikeProperties();
+  for (auto iter = compositorAnimations.iter(); !iter.done(); iter.next()) {
+    bool added = AddAnimationsForProperty(aFrame, effects, iter.get().value(),
+                                          transformData, iter.get().key(),
+                                          sendFlag, aLayerManager);
+    if (added && transformData) {
+      transformData.reset();
+    }
+
+    if (hasMultipleTransformLikeProperties && added) {
+      nonAnimatingProperties.RemoveProperty(iter.get().key());
+    }
+  }
+
+  if (hasMultipleTransformLikeProperties &&
+      !nonAnimatingProperties.Equals(
+          nsCSSPropertyIDSet::TransformLikeProperties()) &&
+      !nonAnimatingProperties.IsEmpty()) {
+    AddNonAnimatingTransformLikePropertiesStyles(nonAnimatingProperties, aFrame,
+                                                 sendFlag);
+  }
+}
+
+}  

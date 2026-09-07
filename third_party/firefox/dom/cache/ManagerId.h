@@ -1,0 +1,49 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_cache_ManagerId_h
+#define mozilla_dom_cache_ManagerId_h
+
+#include "mozilla/dom/SafeRefPtr.h"
+#include "mozilla/dom/cache/Types.h"
+#include "nsCOMPtr.h"
+#include "nsError.h"
+#include "nsISupportsImpl.h"
+#include "nsString.h"
+
+class nsIPrincipal;
+
+namespace mozilla::dom::cache {
+
+class ManagerId final : public AtomicSafeRefCounted<ManagerId> {
+ public:
+  static Result<SafeRefPtr<ManagerId>, nsresult> Create(
+      nsIPrincipal* aPrincipal);
+
+  already_AddRefed<nsIPrincipal> Principal() const;
+
+  const nsACString& QuotaOrigin() const { return mQuotaOrigin; }
+
+  bool operator==(const ManagerId& aOther) const {
+    return mQuotaOrigin == aOther.mQuotaOrigin;
+  }
+
+ private:
+  nsCOMPtr<nsIPrincipal> mPrincipal;
+
+  const nsCString mQuotaOrigin;
+
+  struct ConstructorGuard {};
+
+ public:
+  ManagerId(nsIPrincipal* aPrincipal, const nsACString& aOrigin,
+            ConstructorGuard);
+  ~ManagerId();
+
+  MOZ_DECLARE_REFCOUNTED_TYPENAME(mozilla::dom::cache::ManagerId)
+};
+
+}  
+
+#endif  // mozilla_dom_cache_ManagerId_h

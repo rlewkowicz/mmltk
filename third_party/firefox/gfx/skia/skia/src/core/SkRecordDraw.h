@@ -1,0 +1,62 @@
+/*
+ * Copyright 2014 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkRecordDraw_DEFINED)
+#define SkRecordDraw_DEFINED
+
+#include "include/core/SkBBHFactory.h"
+#include "include/core/SkCanvas.h"
+#include "include/core/SkM44.h"
+#include "include/core/SkPicture.h"
+#include "include/private/base/SkNoncopyable.h"
+
+class SkDrawable;
+class SkRecord;
+struct SkRect;
+
+void SkRecordFillBounds(const SkRect& cullRect, const SkRecord&,
+                        SkRect bounds[], SkBBoxHierarchy::Metadata[]);
+
+void SkRecordDraw(const SkRecord&, SkCanvas*, SkPicture const* const drawablePicts[],
+                  SkDrawable* const drawables[], int drawableCount,
+                  const SkBBoxHierarchy*, SkPicture::AbortCallback*);
+
+namespace SkRecords {
+
+class Draw : SkNoncopyable {
+public:
+    explicit Draw(SkCanvas* canvas, SkPicture const* const drawablePicts[],
+                  SkDrawable* const drawables[], int drawableCount,
+                  const SkM44* initialCTM = nullptr)
+        : fInitialCTM(initialCTM ? *initialCTM : canvas->getLocalToDevice())
+        , fCanvas(canvas)
+        , fDrawablePicts(drawablePicts)
+        , fDrawables(drawables)
+        , fDrawableCount(drawableCount)
+    {}
+
+    template <typename T> void operator()(const T& r) {
+        this->draw(r);
+    }
+
+protected:
+    SkPicture const* const* drawablePicts() const { return fDrawablePicts; }
+    int drawableCount() const { return fDrawableCount; }
+
+private:
+    template <typename T> void draw(const T&);
+
+    const SkM44 fInitialCTM;
+    SkCanvas* fCanvas;
+    SkPicture const* const* fDrawablePicts;
+    SkDrawable* const* fDrawables;
+    int fDrawableCount;
+};
+
+}  
+
+#endif

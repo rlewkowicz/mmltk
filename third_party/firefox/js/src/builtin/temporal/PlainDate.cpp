@@ -1,0 +1,1333 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "builtin/temporal/PlainDate.h"
+
+#include "mozilla/Assertions.h"
+#include "mozilla/CheckedInt.h"
+
+#include <cmath>
+#include <cstdlib>
+#include <stdint.h>
+
+#include "jspubtd.h"
+#include "jstypes.h"
+#include "NamespaceImports.h"
+
+#include "builtin/Date.h"
+#include "builtin/intl/DateTimeFormat.h"
+#include "builtin/Number.h"
+#include "builtin/temporal/Calendar.h"
+#include "builtin/temporal/CalendarFields.h"
+#include "builtin/temporal/Duration.h"
+#include "builtin/temporal/Instant.h"
+#include "builtin/temporal/PlainDateTime.h"
+#include "builtin/temporal/PlainMonthDay.h"
+#include "builtin/temporal/PlainTime.h"
+#include "builtin/temporal/PlainYearMonth.h"
+#include "builtin/temporal/Temporal.h"
+#include "builtin/temporal/TemporalParser.h"
+#include "builtin/temporal/TemporalRoundingMode.h"
+#include "builtin/temporal/TemporalTypes.h"
+#include "builtin/temporal/TemporalUnit.h"
+#include "builtin/temporal/TimeZone.h"
+#include "builtin/temporal/ToString.h"
+#include "builtin/temporal/ZonedDateTime.h"
+#include "gc/AllocKind.h"
+#include "gc/Barrier.h"
+#include "gc/GCEnum.h"
+#include "js/CallArgs.h"
+#include "js/CallNonGenericMethod.h"
+#include "js/Class.h"
+#include "js/ErrorReport.h"
+#include "js/friend/ErrorMessages.h"
+#include "js/PropertyDescriptor.h"
+#include "js/PropertySpec.h"
+#include "js/RootingAPI.h"
+#include "js/TypeDecls.h"
+#include "js/Value.h"
+#include "vm/BytecodeUtil.h"
+#include "vm/GlobalObject.h"
+#include "vm/JSAtomState.h"
+#include "vm/JSContext.h"
+#include "vm/JSObject.h"
+#include "vm/PlainObject.h"
+#include "vm/StringType.h"
+
+#include "vm/JSObject-inl.h"
+#include "vm/NativeObject-inl.h"
+#include "vm/ObjectOperations-inl.h"
+
+using namespace js;
+using namespace js::temporal;
+
+static inline bool IsPlainDate(Handle<Value> v) {
+  return v.isObject() && v.toObject().is<PlainDateObject>();
+}
+
+#ifdef DEBUG
+bool js::temporal::IsValidISODate(const ISODate& date) {
+  const auto& [year, month, day] = date;
+
+  if (month < 1 || month > 12) {
+    return false;
+  }
+
+  int32_t daysInMonth = js::temporal::ISODaysInMonth(year, month);
+
+  return 1 <= day && day <= daysInMonth;
+}
+#endif
+
+bool js::temporal::ISODateWithinLimits(const ISODate& isoDate) {
+  MOZ_ASSERT(IsValidISODate(isoDate));
+
+  constexpr auto min = ISODate::min();
+  constexpr auto max = ISODate::max();
+
+  const auto& year = isoDate.year;
+
+  if (min.year < year && year < max.year) {
+    return true;
+  }
+
+  if (year < 0) {
+    return isoDate >= min;
+  }
+  return isoDate <= max;
+}
+
+static void ReportInvalidDateValue(JSContext* cx, const char* name, int32_t min,
+                                   int32_t max, double num) {
+  Int32ToCStringBuf minCbuf;
+  const char* minStr = Int32ToCString(&minCbuf, min);
+
+  Int32ToCStringBuf maxCbuf;
+  const char* maxStr = Int32ToCString(&maxCbuf, max);
+
+  ToCStringBuf numCbuf;
+  const char* numStr = NumberToCString(&numCbuf, num);
+
+  JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                            JSMSG_TEMPORAL_PLAIN_DATE_INVALID_VALUE, name,
+                            minStr, maxStr, numStr);
+}
+
+template <typename T>
+static inline bool ThrowIfInvalidDateValue(JSContext* cx, const char* name,
+                                           int32_t min, int32_t max, T num) {
+  if (min <= num && num <= max) {
+    return true;
+  }
+  ReportInvalidDateValue(cx, name, min, max, num);
+  return false;
+}
+
+template <typename T>
+static bool ThrowIfInvalidISODate(JSContext* cx, T year, T month, T day) {
+  static_assert(std::is_same_v<T, int32_t> || std::is_same_v<T, double>);
+
+  MOZ_ASSERT(IsInteger(year));
+  MOZ_ASSERT(IsInteger(month));
+  MOZ_ASSERT(IsInteger(day));
+
+  if constexpr (std::is_same_v<T, double>) {
+    if (!ThrowIfInvalidDateValue(cx, "year", INT32_MIN, INT32_MAX, year)) {
+      return false;
+    }
+  }
+
+  if (!ThrowIfInvalidDateValue(cx, "month", 1, 12, month)) {
+    return false;
+  }
+
+  int32_t daysInMonth =
+      js::temporal::ISODaysInMonth(int32_t(year), int32_t(month));
+
+  return ThrowIfInvalidDateValue(cx, "day", 1, daysInMonth, day);
+}
+
+bool js::temporal::ThrowIfInvalidISODate(JSContext* cx, const ISODate& date) {
+  const auto& [year, month, day] = date;
+  return ::ThrowIfInvalidISODate(cx, year, month, day);
+}
+
+bool js::temporal::ThrowIfInvalidISODate(JSContext* cx, double year,
+                                         double month, double day) {
+  return ::ThrowIfInvalidISODate(cx, year, month, day);
+}
+
+static PlainDateObject* CreateTemporalDate(JSContext* cx, const CallArgs& args,
+                                           const ISODate& isoDate,
+                                           Handle<CalendarValue> calendar) {
+  MOZ_ASSERT(IsValidISODate(isoDate));
+
+  if (!ISODateWithinLimits(isoDate)) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_TEMPORAL_PLAIN_DATE_INVALID);
+    return nullptr;
+  }
+
+  Rooted<JSObject*> proto(cx);
+  if (!GetPrototypeFromBuiltinConstructor(cx, args, JSProto_PlainDate,
+                                          &proto)) {
+    return nullptr;
+  }
+
+  auto* object = NewObjectWithClassProto<PlainDateObject>(cx, proto);
+  if (!object) {
+    return nullptr;
+  }
+
+  auto packedDate = PackedDate::pack(isoDate);
+  object->initFixedSlot(PlainDateObject::PACKED_DATE_SLOT,
+                        PrivateUint32Value(packedDate.value));
+
+  object->initFixedSlot(PlainDateObject::CALENDAR_SLOT, calendar.toSlotValue());
+
+  return object;
+}
+
+PlainDateObject* js::temporal::CreateTemporalDate(
+    JSContext* cx, const ISODate& isoDate, Handle<CalendarValue> calendar) {
+  MOZ_ASSERT(IsValidISODate(isoDate));
+
+  if (!ISODateWithinLimits(isoDate)) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_TEMPORAL_PLAIN_DATE_INVALID);
+    return nullptr;
+  }
+
+  auto* object = NewBuiltinClassInstance<PlainDateObject>(cx);
+  if (!object) {
+    return nullptr;
+  }
+
+  auto packedDate = PackedDate::pack(isoDate);
+  object->initFixedSlot(PlainDateObject::PACKED_DATE_SLOT,
+                        PrivateUint32Value(packedDate.value));
+
+  object->initFixedSlot(PlainDateObject::CALENDAR_SLOT, calendar.toSlotValue());
+
+  return object;
+}
+
+PlainDateObject* js::temporal::CreateTemporalDate(JSContext* cx,
+                                                  Handle<PlainDate> date) {
+  MOZ_ASSERT(ISODateWithinLimits(date));
+  return CreateTemporalDate(cx, date, date.calendar());
+}
+
+bool js::temporal::CreateTemporalDate(JSContext* cx, const ISODate& isoDate,
+                                      Handle<CalendarValue> calendar,
+                                      MutableHandle<PlainDate> result) {
+  MOZ_ASSERT(IsValidISODate(isoDate));
+
+  if (!ISODateWithinLimits(isoDate)) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_TEMPORAL_PLAIN_DATE_INVALID);
+    return false;
+  }
+
+  result.set(PlainDate{isoDate, calendar});
+  return true;
+}
+
+struct DateOptions {
+  TemporalOverflow overflow = TemporalOverflow::Constrain;
+};
+
+static bool ToTemporalDateOptions(JSContext* cx, Handle<Value> options,
+                                  DateOptions* result) {
+  if (options.isUndefined()) {
+    *result = {};
+    return true;
+  }
+
+
+  Rooted<JSObject*> resolvedOptions(
+      cx, RequireObjectArg(cx, "options", "from", options));
+  if (!resolvedOptions) {
+    return false;
+  }
+
+  auto overflow = TemporalOverflow::Constrain;
+  if (!GetTemporalOverflowOption(cx, resolvedOptions, &overflow)) {
+    return false;
+  }
+
+  *result = {overflow};
+  return true;
+}
+
+static bool ToTemporalDate(JSContext* cx, Handle<JSObject*> item,
+                           Handle<Value> options,
+                           MutableHandle<PlainDate> result) {
+
+  if (auto* plainDate = item->maybeUnwrapIf<PlainDateObject>()) {
+    auto date = plainDate->date();
+    Rooted<CalendarValue> calendar(cx, plainDate->calendar());
+    if (!calendar.wrap(cx)) {
+      return false;
+    }
+
+    DateOptions ignoredOptions;
+    if (!ToTemporalDateOptions(cx, options, &ignoredOptions)) {
+      return false;
+    }
+
+    result.set(PlainDate{date, calendar});
+    return true;
+  }
+
+  if (auto* zonedDateTime = item->maybeUnwrapIf<ZonedDateTimeObject>()) {
+    auto epochNs = zonedDateTime->epochNanoseconds();
+    Rooted<TimeZoneValue> timeZone(cx, zonedDateTime->timeZone());
+    Rooted<CalendarValue> calendar(cx, zonedDateTime->calendar());
+
+    if (!timeZone.wrap(cx)) {
+      return false;
+    }
+    if (!calendar.wrap(cx)) {
+      return false;
+    }
+
+    ISODateTime isoDateTime;
+    if (!GetISODateTimeFor(cx, timeZone, epochNs, &isoDateTime)) {
+      return false;
+    }
+
+    DateOptions ignoredOptions;
+    if (!ToTemporalDateOptions(cx, options, &ignoredOptions)) {
+      return false;
+    }
+
+    result.set(PlainDate{isoDateTime.date, calendar});
+    return true;
+  }
+
+  if (auto* dateTime = item->maybeUnwrapIf<PlainDateTimeObject>()) {
+    auto date = dateTime->date();
+    Rooted<CalendarValue> calendar(cx, dateTime->calendar());
+    if (!calendar.wrap(cx)) {
+      return false;
+    }
+
+    DateOptions ignoredOptions;
+    if (!ToTemporalDateOptions(cx, options, &ignoredOptions)) {
+      return false;
+    }
+
+    result.set(PlainDate{date, calendar});
+    return true;
+  }
+
+  Rooted<CalendarValue> calendar(cx);
+  if (!GetTemporalCalendarWithISODefault(cx, item, &calendar)) {
+    return false;
+  }
+
+  Rooted<CalendarFields> fields(cx);
+  if (!PrepareCalendarFields(cx, calendar, item,
+                             {
+                                 CalendarField::Year,
+                                 CalendarField::Month,
+                                 CalendarField::MonthCode,
+                                 CalendarField::Day,
+                             },
+                             &fields)) {
+    return false;
+  }
+
+  DateOptions resolvedOptions;
+  if (!ToTemporalDateOptions(cx, options, &resolvedOptions)) {
+    return false;
+  }
+  auto [overflow] = resolvedOptions;
+
+  return CalendarDateFromFields(cx, calendar, fields, overflow, result);
+}
+
+static bool ToTemporalDate(JSContext* cx, Handle<Value> item,
+                           Handle<Value> options,
+                           MutableHandle<PlainDate> result) {
+
+  if (item.isObject()) {
+    Rooted<JSObject*> itemObj(cx, &item.toObject());
+    return ToTemporalDate(cx, itemObj, options, result);
+  }
+
+  if (!item.isString()) {
+    ReportValueError(cx, JSMSG_UNEXPECTED_TYPE, JSDVG_IGNORE_STACK, item,
+                     nullptr, "not a string");
+    return false;
+  }
+  Rooted<JSString*> string(cx, item.toString());
+
+  ISODateTime dateTime;
+  Rooted<JSString*> calendarString(cx);
+  if (!ParseTemporalDateTimeString(cx, string, &dateTime, &calendarString)) {
+    return false;
+  }
+  MOZ_ASSERT(IsValidISODate(dateTime.date));
+
+  Rooted<CalendarValue> calendar(cx, CalendarValue(CalendarId::ISO8601));
+  if (calendarString) {
+    if (!CanonicalizeCalendar(cx, calendarString, &calendar)) {
+      return false;
+    }
+  }
+
+  DateOptions ignoredOptions;
+  if (!ToTemporalDateOptions(cx, options, &ignoredOptions)) {
+    return false;
+  }
+
+  return CreateTemporalDate(cx, dateTime.date, calendar, result);
+}
+
+static bool ToTemporalDate(JSContext* cx, Handle<Value> item,
+                           MutableHandle<PlainDate> result) {
+  return ToTemporalDate(cx, item, UndefinedHandleValue, result);
+}
+
+static bool IsValidISODateEpochMilliseconds(int64_t epochMilliseconds) {
+  constexpr auto oneDay = EpochDuration::fromDays(1);
+  constexpr auto min = EpochNanoseconds::min() - oneDay;
+  constexpr auto max = EpochNanoseconds::max() + oneDay;
+
+  auto epochNs = EpochNanoseconds::fromMilliseconds(epochMilliseconds);
+  return min <= epochNs && epochNs < max;
+}
+
+bool js::temporal::BalanceISODate(JSContext* cx, const ISODate& date,
+                                  int64_t days, ISODate* result) {
+  MOZ_ASSERT(IsValidISODate(date));
+  MOZ_ASSERT(ISODateWithinLimits(date));
+
+  auto epochDays = MakeDay(date) + mozilla::CheckedInt64{days};
+
+  auto epochMilliseconds = epochDays * ToMilliseconds(TemporalUnit::Day);
+  if (!epochMilliseconds.isValid() ||
+      !IsValidISODateEpochMilliseconds(epochMilliseconds.value())) {
+    JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                              JSMSG_TEMPORAL_PLAIN_DATE_INVALID);
+    return false;
+  }
+
+  auto [year, month, day] = ToYearMonthDay(epochMilliseconds.value());
+
+  *result = ISODate{year, month + 1, day};
+  MOZ_ASSERT(IsValidISODate(*result));
+  MOZ_ASSERT(ISODateWithinLimits(*result));
+
+  return true;
+}
+
+ISODate js::temporal::BalanceISODate(const ISODate& date, int32_t days) {
+  MOZ_ASSERT(IsValidISODate(date));
+  MOZ_ASSERT(ISODateWithinLimits(date));
+  MOZ_ASSERT(std::abs(days) <= 400'000'000, "days limit for ToYearMonthDay");
+
+  int32_t epochDays = MakeDay(date) + days;
+
+  int64_t epochMilliseconds = epochDays * ToMilliseconds(TemporalUnit::Day);
+
+  auto [year, month, day] = ToYearMonthDay(epochMilliseconds);
+
+  auto result = ISODate{year, month + 1, day};
+  MOZ_ASSERT(IsValidISODate(result));
+
+  return result;
+}
+
+int32_t js::temporal::CompareISODate(const ISODate& one, const ISODate& two) {
+  if (one.year != two.year) {
+    return one.year < two.year ? -1 : 1;
+  }
+
+  if (one.month != two.month) {
+    return one.month < two.month ? -1 : 1;
+  }
+
+  if (one.day != two.day) {
+    return one.day < two.day ? -1 : 1;
+  }
+
+  return 0;
+}
+
+static bool DifferenceTemporalPlainDate(JSContext* cx,
+                                        TemporalDifference operation,
+                                        const CallArgs& args) {
+  Rooted<PlainDate> temporalDate(
+      cx, &args.thisv().toObject().as<PlainDateObject>());
+
+  Rooted<PlainDate> other(cx);
+  if (!ToTemporalDate(cx, args.get(0), &other)) {
+    return false;
+  }
+
+  if (!CalendarEquals(temporalDate.calendar(), other.calendar())) {
+    JS_ReportErrorNumberASCII(
+        cx, GetErrorMessage, nullptr, JSMSG_TEMPORAL_CALENDAR_INCOMPATIBLE,
+        CalendarIdentifier(temporalDate.calendar()).data(),
+        CalendarIdentifier(other.calendar()).data());
+    return false;
+  }
+
+  DifferenceSettings settings;
+  if (args.hasDefined(1)) {
+    Rooted<JSObject*> options(
+        cx, RequireObjectArg(cx, "options", ToName(operation), args[1]));
+    if (!options) {
+      return false;
+    }
+
+    if (!GetDifferenceSettings(cx, operation, options, TemporalUnitGroup::Date,
+                               TemporalUnit::Day, TemporalUnit::Day,
+                               &settings)) {
+      return false;
+    }
+  } else {
+    settings = {
+        TemporalUnit::Day,
+        TemporalUnit::Day,
+        TemporalRoundingMode::Trunc,
+        Increment{1},
+    };
+  }
+
+  if (temporalDate.date() == other.date()) {
+    auto* obj = CreateTemporalDuration(cx, {});
+    if (!obj) {
+      return false;
+    }
+
+    args.rval().setObject(*obj);
+    return true;
+  }
+
+  DateDuration dateDifference;
+  if (!CalendarDateUntil(cx, temporalDate.calendar(), temporalDate.date(),
+                         other.date(), settings.largestUnit, &dateDifference)) {
+    return false;
+  }
+
+  auto duration = InternalDuration{dateDifference, {}};
+
+  if (settings.smallestUnit != TemporalUnit::Day ||
+      settings.roundingIncrement != Increment{1}) {
+    auto isoDateTime = ISODateTime{temporalDate.date(), {}};
+
+    auto originEpochNs = GetUTCEpochNanoseconds(isoDateTime);
+
+    auto isoDateTimeOther = ISODateTime{other.date(), {}};
+
+    auto destEpochNs = GetUTCEpochNanoseconds(isoDateTimeOther);
+
+    Rooted<TimeZoneValue> timeZone(cx, TimeZoneValue{});
+    if (!RoundRelativeDuration(cx, duration, originEpochNs, destEpochNs,
+                               isoDateTime, timeZone, temporalDate.calendar(),
+                               settings.largestUnit, settings.roundingIncrement,
+                               settings.smallestUnit, settings.roundingMode,
+                               &duration)) {
+      return false;
+    }
+  }
+  MOZ_ASSERT(IsValidDuration(duration));
+  MOZ_ASSERT(duration.time == TimeDuration{});
+
+  auto result = duration.date.toDuration();
+
+  if (operation == TemporalDifference::Since) {
+    result = result.negate();
+  }
+  MOZ_ASSERT(IsValidDuration(result));
+
+  auto* obj = CreateTemporalDuration(cx, result);
+  if (!obj) {
+    return false;
+  }
+
+  args.rval().setObject(*obj);
+  return true;
+}
+
+static bool AddDurationToDate(JSContext* cx, TemporalAddDuration operation,
+                              const CallArgs& args) {
+  Rooted<PlainDate> temporalDate(
+      cx, &args.thisv().toObject().as<PlainDateObject>());
+
+  auto calendar = temporalDate.calendar();
+
+  Duration duration;
+  if (!ToTemporalDuration(cx, args.get(0), &duration)) {
+    return false;
+  }
+
+  if (operation == TemporalAddDuration::Subtract) {
+    duration = duration.negate();
+  }
+
+  auto dateDuration = ToDateDurationRecordWithoutTime(duration);
+
+  auto overflow = TemporalOverflow::Constrain;
+  if (args.hasDefined(1)) {
+    Rooted<JSObject*> options(
+        cx, RequireObjectArg(cx, "options", ToName(operation), args[1]));
+    if (!options) {
+      return false;
+    }
+
+    if (!GetTemporalOverflowOption(cx, options, &overflow)) {
+      return false;
+    }
+  }
+
+  ISODate result;
+  if (!CalendarDateAdd(cx, calendar, temporalDate.date(), dateDuration,
+                       overflow, &result)) {
+    return false;
+  }
+
+  auto* obj = CreateTemporalDate(cx, result, calendar);
+  if (!obj) {
+    return false;
+  }
+
+  args.rval().setObject(*obj);
+  return true;
+}
+
+static bool PlainDateConstructor(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  if (!ThrowIfNotConstructing(cx, args, "Temporal.PlainDate")) {
+    return false;
+  }
+
+  double isoYear;
+  if (!ToIntegerWithTruncation(cx, args.get(0), "year", &isoYear)) {
+    return false;
+  }
+
+  double isoMonth;
+  if (!ToIntegerWithTruncation(cx, args.get(1), "month", &isoMonth)) {
+    return false;
+  }
+
+  double isoDay;
+  if (!ToIntegerWithTruncation(cx, args.get(2), "day", &isoDay)) {
+    return false;
+  }
+
+  Rooted<CalendarValue> calendar(cx, CalendarValue(CalendarId::ISO8601));
+  if (args.hasDefined(3)) {
+    if (!args[3].isString()) {
+      ReportValueError(cx, JSMSG_UNEXPECTED_TYPE, JSDVG_IGNORE_STACK, args[3],
+                       nullptr, "not a string");
+      return false;
+    }
+
+    Rooted<JSString*> calendarString(cx, args[3].toString());
+    if (!CanonicalizeCalendar(cx, calendarString, &calendar)) {
+      return false;
+    }
+  }
+
+  if (!ThrowIfInvalidISODate(cx, isoYear, isoMonth, isoDay)) {
+    return false;
+  }
+
+  auto isoDate = ISODate{int32_t(isoYear), int32_t(isoMonth), int32_t(isoDay)};
+
+  auto* temporalDate = CreateTemporalDate(cx, args, isoDate, calendar);
+  if (!temporalDate) {
+    return false;
+  }
+
+  args.rval().setObject(*temporalDate);
+  return true;
+}
+
+static bool PlainDate_from(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  Rooted<PlainDate> date(cx);
+  if (!ToTemporalDate(cx, args.get(0), args.get(1), &date)) {
+    return false;
+  }
+
+  auto* result = CreateTemporalDate(cx, date);
+  if (!result) {
+    return false;
+  }
+
+  args.rval().setObject(*result);
+  return true;
+}
+
+static bool PlainDate_compare(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+
+  Rooted<PlainDate> one(cx);
+  if (!ToTemporalDate(cx, args.get(0), &one)) {
+    return false;
+  }
+
+  Rooted<PlainDate> two(cx);
+  if (!ToTemporalDate(cx, args.get(1), &two)) {
+    return false;
+  }
+
+  args.rval().setInt32(CompareISODate(one, two));
+  return true;
+}
+
+static bool PlainDate_calendarId(JSContext* cx, const CallArgs& args) {
+  auto* temporalDate = &args.thisv().toObject().as<PlainDateObject>();
+
+  auto* str =
+      NewStringCopy<CanGC>(cx, CalendarIdentifier(temporalDate->calendar()));
+  if (!str) {
+    return false;
+  }
+
+  args.rval().setString(str);
+  return true;
+}
+
+static bool PlainDate_calendarId(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainDate, PlainDate_calendarId>(cx, args);
+}
+
+static bool PlainDate_era(JSContext* cx, const CallArgs& args) {
+  auto* temporalDate = &args.thisv().toObject().as<PlainDateObject>();
+  Rooted<CalendarValue> calendar(cx, temporalDate->calendar());
+
+  return CalendarEra(cx, calendar, temporalDate->date(), args.rval());
+}
+
+static bool PlainDate_era(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainDate, PlainDate_era>(cx, args);
+}
+
+static bool PlainDate_eraYear(JSContext* cx, const CallArgs& args) {
+  auto* temporalDate = &args.thisv().toObject().as<PlainDateObject>();
+  Rooted<CalendarValue> calendar(cx, temporalDate->calendar());
+
+  return CalendarEraYear(cx, calendar, temporalDate->date(), args.rval());
+}
+
+static bool PlainDate_eraYear(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainDate, PlainDate_eraYear>(cx, args);
+}
+
+static bool PlainDate_year(JSContext* cx, const CallArgs& args) {
+  auto* temporalDate = &args.thisv().toObject().as<PlainDateObject>();
+  Rooted<CalendarValue> calendar(cx, temporalDate->calendar());
+
+  return CalendarYear(cx, calendar, temporalDate->date(), args.rval());
+}
+
+static bool PlainDate_year(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainDate, PlainDate_year>(cx, args);
+}
+
+static bool PlainDate_month(JSContext* cx, const CallArgs& args) {
+  auto* temporalDate = &args.thisv().toObject().as<PlainDateObject>();
+  Rooted<CalendarValue> calendar(cx, temporalDate->calendar());
+
+  return CalendarMonth(cx, calendar, temporalDate->date(), args.rval());
+}
+
+static bool PlainDate_month(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainDate, PlainDate_month>(cx, args);
+}
+
+static bool PlainDate_monthCode(JSContext* cx, const CallArgs& args) {
+  auto* temporalDate = &args.thisv().toObject().as<PlainDateObject>();
+  Rooted<CalendarValue> calendar(cx, temporalDate->calendar());
+
+  return CalendarMonthCode(cx, calendar, temporalDate->date(), args.rval());
+}
+
+static bool PlainDate_monthCode(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainDate, PlainDate_monthCode>(cx, args);
+}
+
+static bool PlainDate_day(JSContext* cx, const CallArgs& args) {
+  auto* temporalDate = &args.thisv().toObject().as<PlainDateObject>();
+  Rooted<CalendarValue> calendar(cx, temporalDate->calendar());
+
+  return CalendarDay(cx, calendar, temporalDate->date(), args.rval());
+}
+
+static bool PlainDate_day(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainDate, PlainDate_day>(cx, args);
+}
+
+static bool PlainDate_dayOfWeek(JSContext* cx, const CallArgs& args) {
+  auto* temporalDate = &args.thisv().toObject().as<PlainDateObject>();
+  Rooted<CalendarValue> calendar(cx, temporalDate->calendar());
+
+  return CalendarDayOfWeek(cx, calendar, temporalDate->date(), args.rval());
+}
+
+static bool PlainDate_dayOfWeek(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainDate, PlainDate_dayOfWeek>(cx, args);
+}
+
+static bool PlainDate_dayOfYear(JSContext* cx, const CallArgs& args) {
+  auto* temporalDate = &args.thisv().toObject().as<PlainDateObject>();
+  Rooted<CalendarValue> calendar(cx, temporalDate->calendar());
+
+  return CalendarDayOfYear(cx, calendar, temporalDate->date(), args.rval());
+}
+
+static bool PlainDate_dayOfYear(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainDate, PlainDate_dayOfYear>(cx, args);
+}
+
+static bool PlainDate_weekOfYear(JSContext* cx, const CallArgs& args) {
+  auto* temporalDate = &args.thisv().toObject().as<PlainDateObject>();
+  Rooted<CalendarValue> calendar(cx, temporalDate->calendar());
+
+  return CalendarWeekOfYear(cx, calendar, temporalDate->date(), args.rval());
+}
+
+static bool PlainDate_weekOfYear(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainDate, PlainDate_weekOfYear>(cx, args);
+}
+
+static bool PlainDate_yearOfWeek(JSContext* cx, const CallArgs& args) {
+  auto* temporalDate = &args.thisv().toObject().as<PlainDateObject>();
+  Rooted<CalendarValue> calendar(cx, temporalDate->calendar());
+
+  return CalendarYearOfWeek(cx, calendar, temporalDate->date(), args.rval());
+}
+
+static bool PlainDate_yearOfWeek(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainDate, PlainDate_yearOfWeek>(cx, args);
+}
+
+static bool PlainDate_daysInWeek(JSContext* cx, const CallArgs& args) {
+  auto* temporalDate = &args.thisv().toObject().as<PlainDateObject>();
+  Rooted<CalendarValue> calendar(cx, temporalDate->calendar());
+
+  return CalendarDaysInWeek(cx, calendar, temporalDate->date(), args.rval());
+}
+
+static bool PlainDate_daysInWeek(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainDate, PlainDate_daysInWeek>(cx, args);
+}
+
+static bool PlainDate_daysInMonth(JSContext* cx, const CallArgs& args) {
+  auto* temporalDate = &args.thisv().toObject().as<PlainDateObject>();
+  Rooted<CalendarValue> calendar(cx, temporalDate->calendar());
+
+  return CalendarDaysInMonth(cx, calendar, temporalDate->date(), args.rval());
+}
+
+static bool PlainDate_daysInMonth(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainDate, PlainDate_daysInMonth>(cx, args);
+}
+
+static bool PlainDate_daysInYear(JSContext* cx, const CallArgs& args) {
+  auto* temporalDate = &args.thisv().toObject().as<PlainDateObject>();
+  Rooted<CalendarValue> calendar(cx, temporalDate->calendar());
+
+  return CalendarDaysInYear(cx, calendar, temporalDate->date(), args.rval());
+}
+
+static bool PlainDate_daysInYear(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainDate, PlainDate_daysInYear>(cx, args);
+}
+
+static bool PlainDate_monthsInYear(JSContext* cx, const CallArgs& args) {
+  auto* temporalDate = &args.thisv().toObject().as<PlainDateObject>();
+  Rooted<CalendarValue> calendar(cx, temporalDate->calendar());
+
+  return CalendarMonthsInYear(cx, calendar, temporalDate->date(), args.rval());
+}
+
+static bool PlainDate_monthsInYear(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainDate, PlainDate_monthsInYear>(cx, args);
+}
+
+static bool PlainDate_inLeapYear(JSContext* cx, const CallArgs& args) {
+  auto* temporalDate = &args.thisv().toObject().as<PlainDateObject>();
+  Rooted<CalendarValue> calendar(cx, temporalDate->calendar());
+
+  return CalendarInLeapYear(cx, calendar, temporalDate->date(), args.rval());
+}
+
+static bool PlainDate_inLeapYear(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainDate, PlainDate_inLeapYear>(cx, args);
+}
+
+static bool PlainDate_toPlainYearMonth(JSContext* cx, const CallArgs& args) {
+  Rooted<PlainDate> temporalDate(
+      cx, &args.thisv().toObject().as<PlainDateObject>());
+
+  auto calendar = temporalDate.calendar();
+
+  Rooted<CalendarFields> fields(cx);
+  if (!ISODateToFields(cx, temporalDate, &fields)) {
+    return false;
+  }
+
+  Rooted<PlainYearMonth> result(cx);
+  if (!CalendarYearMonthFromFields(cx, calendar, fields,
+                                   TemporalOverflow::Constrain, &result)) {
+    return false;
+  }
+
+  auto* obj = CreateTemporalYearMonth(cx, result);
+  if (!obj) {
+    return false;
+  }
+
+  args.rval().setObject(*obj);
+  return true;
+}
+
+static bool PlainDate_toPlainYearMonth(JSContext* cx, unsigned argc,
+                                       Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainDate, PlainDate_toPlainYearMonth>(cx,
+                                                                       args);
+}
+
+static bool PlainDate_toPlainMonthDay(JSContext* cx, const CallArgs& args) {
+  Rooted<PlainDate> temporalDate(
+      cx, &args.thisv().toObject().as<PlainDateObject>());
+
+  auto calendar = temporalDate.calendar();
+
+  Rooted<CalendarFields> fields(cx);
+  if (!ISODateToFields(cx, temporalDate, &fields)) {
+    return false;
+  }
+
+  Rooted<PlainMonthDay> result(cx);
+  if (!CalendarMonthDayFromFields(cx, calendar, fields,
+                                  TemporalOverflow::Constrain, &result)) {
+    return false;
+  }
+
+  auto* obj = CreateTemporalMonthDay(cx, result);
+  if (!obj) {
+    return false;
+  }
+
+  args.rval().setObject(*obj);
+  return true;
+}
+
+static bool PlainDate_toPlainMonthDay(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainDate, PlainDate_toPlainMonthDay>(cx, args);
+}
+
+static bool PlainDate_toPlainDateTime(JSContext* cx, const CallArgs& args) {
+  auto* temporalDate = &args.thisv().toObject().as<PlainDateObject>();
+  Rooted<CalendarValue> calendar(cx, temporalDate->calendar());
+
+  auto isoDateTime = ISODateTime{temporalDate->date(), {}};
+
+  if (args.hasDefined(0)) {
+    if (!ToTemporalTime(cx, args[0], &isoDateTime.time)) {
+      return false;
+    }
+  }
+
+
+  auto* obj = CreateTemporalDateTime(cx, isoDateTime, calendar);
+  if (!obj) {
+    return false;
+  }
+
+  args.rval().setObject(*obj);
+  return true;
+}
+
+static bool PlainDate_toPlainDateTime(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainDate, PlainDate_toPlainDateTime>(cx, args);
+}
+
+static bool PlainDate_add(JSContext* cx, const CallArgs& args) {
+  return AddDurationToDate(cx, TemporalAddDuration::Add, args);
+}
+
+static bool PlainDate_add(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainDate, PlainDate_add>(cx, args);
+}
+
+static bool PlainDate_subtract(JSContext* cx, const CallArgs& args) {
+  return AddDurationToDate(cx, TemporalAddDuration::Subtract, args);
+}
+
+static bool PlainDate_subtract(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainDate, PlainDate_subtract>(cx, args);
+}
+
+static bool PlainDate_with(JSContext* cx, const CallArgs& args) {
+  Rooted<PlainDate> temporalDate(
+      cx, &args.thisv().toObject().as<PlainDateObject>());
+
+  Rooted<JSObject*> temporalDateLike(
+      cx, RequireObjectArg(cx, "temporalDateLike", "with", args.get(0)));
+  if (!temporalDateLike) {
+    return false;
+  }
+  if (!ThrowIfTemporalLikeObject(cx, temporalDateLike)) {
+    return false;
+  }
+
+  auto calendar = temporalDate.calendar();
+
+  Rooted<CalendarFields> fields(cx);
+  if (!ISODateToFields(cx, temporalDate, &fields)) {
+    return false;
+  }
+
+  Rooted<CalendarFields> partialDate(cx);
+  if (!PreparePartialCalendarFields(cx, calendar, temporalDateLike,
+                                    {
+                                        CalendarField::Year,
+                                        CalendarField::Month,
+                                        CalendarField::MonthCode,
+                                        CalendarField::Day,
+                                    },
+                                    &partialDate)) {
+    return false;
+  }
+  MOZ_ASSERT(!partialDate.keys().isEmpty());
+
+  fields = CalendarMergeFields(calendar, fields, partialDate);
+
+  auto overflow = TemporalOverflow::Constrain;
+  if (args.hasDefined(1)) {
+    Rooted<JSObject*> options(cx,
+                              RequireObjectArg(cx, "options", "with", args[1]));
+    if (!options) {
+      return false;
+    }
+
+    if (!GetTemporalOverflowOption(cx, options, &overflow)) {
+      return false;
+    }
+  }
+
+  Rooted<PlainDate> date(cx);
+  if (!CalendarDateFromFields(cx, calendar, fields, overflow, &date)) {
+    return false;
+  }
+
+  auto* result = CreateTemporalDate(cx, date);
+  if (!result) {
+    return false;
+  }
+
+  args.rval().setObject(*result);
+  return true;
+}
+
+static bool PlainDate_with(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainDate, PlainDate_with>(cx, args);
+}
+
+static bool PlainDate_withCalendar(JSContext* cx, const CallArgs& args) {
+  auto* temporalDate = &args.thisv().toObject().as<PlainDateObject>();
+  auto date = temporalDate->date();
+
+  Rooted<CalendarValue> calendar(cx);
+  if (!ToTemporalCalendar(cx, args.get(0), &calendar)) {
+    return false;
+  }
+
+  auto* result = CreateTemporalDate(cx, date, calendar);
+  if (!result) {
+    return false;
+  }
+
+  args.rval().setObject(*result);
+  return true;
+}
+
+static bool PlainDate_withCalendar(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainDate, PlainDate_withCalendar>(cx, args);
+}
+
+static bool PlainDate_until(JSContext* cx, const CallArgs& args) {
+  return DifferenceTemporalPlainDate(cx, TemporalDifference::Until, args);
+}
+
+static bool PlainDate_until(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainDate, PlainDate_until>(cx, args);
+}
+
+static bool PlainDate_since(JSContext* cx, const CallArgs& args) {
+  return DifferenceTemporalPlainDate(cx, TemporalDifference::Since, args);
+}
+
+static bool PlainDate_since(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainDate, PlainDate_since>(cx, args);
+}
+
+static bool PlainDate_equals(JSContext* cx, const CallArgs& args) {
+  auto* temporalDate = &args.thisv().toObject().as<PlainDateObject>();
+  auto date = temporalDate->date();
+  Rooted<CalendarValue> calendar(cx, temporalDate->calendar());
+
+  Rooted<PlainDate> other(cx);
+  if (!ToTemporalDate(cx, args.get(0), &other)) {
+    return false;
+  }
+
+  bool equals =
+      date == other.date() && CalendarEquals(calendar, other.calendar());
+
+  args.rval().setBoolean(equals);
+  return true;
+}
+
+static bool PlainDate_equals(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainDate, PlainDate_equals>(cx, args);
+}
+
+static bool PlainDate_toZonedDateTime(JSContext* cx, const CallArgs& args) {
+  auto* temporalDate = &args.thisv().toObject().as<PlainDateObject>();
+  auto date = temporalDate->date();
+  Rooted<CalendarValue> calendar(cx, temporalDate->calendar());
+
+  Rooted<TimeZoneValue> timeZone(cx);
+  Rooted<Value> temporalTime(cx);
+  if (args.get(0).isObject()) {
+    Rooted<JSObject*> item(cx, &args[0].toObject());
+
+    Rooted<Value> timeZoneLike(cx);
+    if (!GetProperty(cx, item, item, cx->names().timeZone, &timeZoneLike)) {
+      return false;
+    }
+
+    if (timeZoneLike.isUndefined()) {
+      if (!ToTemporalTimeZone(cx, args[0], &timeZone)) {
+        return false;
+      }
+
+      MOZ_ASSERT(temporalTime.isUndefined());
+    } else {
+      if (!ToTemporalTimeZone(cx, timeZoneLike, &timeZone)) {
+        return false;
+      }
+
+      if (!GetProperty(cx, item, item, cx->names().plainTime, &temporalTime)) {
+        return false;
+      }
+    }
+  } else {
+    if (!ToTemporalTimeZone(cx, args.get(0), &timeZone)) {
+      return false;
+    }
+
+    MOZ_ASSERT(temporalTime.isUndefined());
+  }
+
+  EpochNanoseconds epochNs;
+  if (temporalTime.isUndefined()) {
+    if (!GetStartOfDay(cx, timeZone, date, &epochNs)) {
+      return false;
+    }
+  } else {
+    Time time;
+    if (!ToTemporalTime(cx, temporalTime, &time)) {
+      return false;
+    }
+
+    auto isoDateTime = ISODateTime{date, time};
+
+    if (!ISODateTimeWithinLimits(isoDateTime)) {
+      JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                                JSMSG_TEMPORAL_PLAIN_DATE_TIME_INVALID);
+      return false;
+    }
+
+    if (!GetEpochNanosecondsFor(cx, timeZone, isoDateTime,
+                                TemporalDisambiguation::Compatible, &epochNs)) {
+      return false;
+    }
+  }
+
+  auto* result = CreateTemporalZonedDateTime(cx, epochNs, timeZone, calendar);
+  if (!result) {
+    return false;
+  }
+
+  args.rval().setObject(*result);
+  return true;
+}
+
+static bool PlainDate_toZonedDateTime(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainDate, PlainDate_toZonedDateTime>(cx, args);
+}
+
+static bool PlainDate_toString(JSContext* cx, const CallArgs& args) {
+  Rooted<PlainDateObject*> temporalDate(
+      cx, &args.thisv().toObject().as<PlainDateObject>());
+
+  auto showCalendar = ShowCalendar::Auto;
+  if (args.hasDefined(0)) {
+    Rooted<JSObject*> options(
+        cx, RequireObjectArg(cx, "options", "toString", args[0]));
+    if (!options) {
+      return false;
+    }
+
+    if (!GetTemporalShowCalendarNameOption(cx, options, &showCalendar)) {
+      return false;
+    }
+  }
+
+  JSString* str = TemporalDateToString(cx, temporalDate, showCalendar);
+  if (!str) {
+    return false;
+  }
+
+  args.rval().setString(str);
+  return true;
+}
+
+static bool PlainDate_toString(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainDate, PlainDate_toString>(cx, args);
+}
+
+static bool PlainDate_toLocaleString(JSContext* cx, const CallArgs& args) {
+  return intl::TemporalObjectToLocaleString(cx, args,
+                                            intl::DateTimeFormatKind::Date);
+}
+
+static bool PlainDate_toLocaleString(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainDate, PlainDate_toLocaleString>(cx, args);
+}
+
+static bool PlainDate_toJSON(JSContext* cx, const CallArgs& args) {
+  Rooted<PlainDateObject*> temporalDate(
+      cx, &args.thisv().toObject().as<PlainDateObject>());
+
+  JSString* str = TemporalDateToString(cx, temporalDate, ShowCalendar::Auto);
+  if (!str) {
+    return false;
+  }
+
+  args.rval().setString(str);
+  return true;
+}
+
+static bool PlainDate_toJSON(JSContext* cx, unsigned argc, Value* vp) {
+  CallArgs args = CallArgsFromVp(argc, vp);
+  return CallNonGenericMethod<IsPlainDate, PlainDate_toJSON>(cx, args);
+}
+
+static bool PlainDate_valueOf(JSContext* cx, unsigned argc, Value* vp) {
+  JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr, JSMSG_CANT_CONVERT_TO,
+                            "PlainDate", "primitive type");
+  return false;
+}
+
+const JSClass PlainDateObject::class_ = {
+    "Temporal.PlainDate",
+    JSCLASS_HAS_RESERVED_SLOTS(PlainDateObject::SLOT_COUNT) |
+        JSCLASS_HAS_CACHED_PROTO(JSProto_PlainDate),
+    JS_NULL_CLASS_OPS,
+    &PlainDateObject::classSpec_,
+};
+
+const JSClass& PlainDateObject::protoClass_ = PlainObject::class_;
+
+static const JSFunctionSpec PlainDate_methods[] = {
+    JS_FN("from", PlainDate_from, 1, 0),
+    JS_FN("compare", PlainDate_compare, 2, 0),
+    JS_FS_END,
+};
+
+static const JSFunctionSpec PlainDate_prototype_methods[] = {
+    JS_FN("toPlainMonthDay", PlainDate_toPlainMonthDay, 0, 0),
+    JS_FN("toPlainYearMonth", PlainDate_toPlainYearMonth, 0, 0),
+    JS_FN("toPlainDateTime", PlainDate_toPlainDateTime, 0, 0),
+    JS_FN("add", PlainDate_add, 1, 0),
+    JS_FN("subtract", PlainDate_subtract, 1, 0),
+    JS_FN("with", PlainDate_with, 1, 0),
+    JS_FN("withCalendar", PlainDate_withCalendar, 1, 0),
+    JS_FN("until", PlainDate_until, 1, 0),
+    JS_FN("since", PlainDate_since, 1, 0),
+    JS_FN("equals", PlainDate_equals, 1, 0),
+    JS_FN("toZonedDateTime", PlainDate_toZonedDateTime, 1, 0),
+    JS_FN("toString", PlainDate_toString, 0, 0),
+    JS_FN("toLocaleString", PlainDate_toLocaleString, 0, 0),
+    JS_FN("toJSON", PlainDate_toJSON, 0, 0),
+    JS_FN("valueOf", PlainDate_valueOf, 0, 0),
+    JS_FS_END,
+};
+
+static const JSPropertySpec PlainDate_prototype_properties[] = {
+    JS_PSG("calendarId", PlainDate_calendarId, 0),
+    JS_PSG("era", PlainDate_era, 0),
+    JS_PSG("eraYear", PlainDate_eraYear, 0),
+    JS_PSG("year", PlainDate_year, 0),
+    JS_PSG("month", PlainDate_month, 0),
+    JS_PSG("monthCode", PlainDate_monthCode, 0),
+    JS_PSG("day", PlainDate_day, 0),
+    JS_PSG("dayOfWeek", PlainDate_dayOfWeek, 0),
+    JS_PSG("dayOfYear", PlainDate_dayOfYear, 0),
+    JS_PSG("weekOfYear", PlainDate_weekOfYear, 0),
+    JS_PSG("yearOfWeek", PlainDate_yearOfWeek, 0),
+    JS_PSG("daysInWeek", PlainDate_daysInWeek, 0),
+    JS_PSG("daysInMonth", PlainDate_daysInMonth, 0),
+    JS_PSG("daysInYear", PlainDate_daysInYear, 0),
+    JS_PSG("monthsInYear", PlainDate_monthsInYear, 0),
+    JS_PSG("inLeapYear", PlainDate_inLeapYear, 0),
+    JS_STRING_SYM_PS(toStringTag, "Temporal.PlainDate", JSPROP_READONLY),
+    JS_PS_END,
+};
+
+const ClassSpec PlainDateObject::classSpec_ = {
+    GenericCreateConstructor<PlainDateConstructor, 3, gc::AllocKind::FUNCTION>,
+    GenericCreatePrototype<PlainDateObject>,
+    PlainDate_methods,
+    nullptr,
+    PlainDate_prototype_methods,
+    PlainDate_prototype_properties,
+    nullptr,
+    ClassSpec::DontDefineConstructor,
+};

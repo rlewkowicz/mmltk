@@ -1,0 +1,1015 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+#ifndef __NUMBERFORMATTER_H__
+#define __NUMBERFORMATTER_H__
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/appendable.h"
+#include "unicode/bytestream.h"
+#include "unicode/currunit.h"
+#include "unicode/dcfmtsym.h"
+#include "unicode/displayoptions.h"
+#include "unicode/fieldpos.h"
+#include "unicode/fpositer.h"
+#include "unicode/measunit.h"
+#include "unicode/nounit.h"
+#include "unicode/parseerr.h"
+#include "unicode/plurrule.h"
+#include "unicode/ucurr.h"
+#include "unicode/unum.h"
+#include "unicode/unumberformatter.h"
+#include "unicode/uobject.h"
+#include "unicode/unumberoptions.h"
+#include "unicode/formattednumber.h"
+
+
+U_NAMESPACE_BEGIN
+
+class IFixedDecimal;
+class FieldPositionIteratorHandler;
+class FormattedStringBuilder;
+
+namespace numparse::impl {
+
+class NumberParserImpl;
+class MultiplierParseHandler;
+
+} 
+
+namespace units {
+
+class UnitsRouter;
+
+} 
+
+namespace number {  
+
+class UnlocalizedNumberFormatter;
+class LocalizedNumberFormatter;
+class SimpleNumberFormatter;
+class FormattedNumber;
+class Notation;
+class ScientificNotation;
+class Precision;
+class FractionPrecision;
+class CurrencyPrecision;
+class IncrementPrecision;
+class IntegerWidth;
+
+namespace impl {
+
+typedef int16_t digits_t;
+
+static constexpr int32_t kInternalDefaultThreshold = 3;
+
+class Padder;
+struct MacroProps;
+struct MicroProps;
+class DecimalQuantity;
+class UFormattedNumberData;
+class NumberFormatterImpl;
+struct ParsedPatternInfo;
+class ScientificModifier;
+class MultiplierProducer;
+class RoundingImpl;
+class ScientificHandler;
+class Modifier;
+class AffixPatternProvider;
+class NumberPropertyMapper;
+struct DecimalFormatProperties;
+class MultiplierFormatHandler;
+class CurrencySymbols;
+class GeneratorHelpers;
+class DecNum;
+class NumberRangeFormatterImpl;
+struct RangeMacroProps;
+struct UFormattedNumberImpl;
+class MutablePatternModifier;
+class ImmutablePatternModifier;
+struct DecimalFormatWarehouse;
+struct SimpleMicroProps;
+class AdoptingSignumModifierStore;
+
+void touchRangeLocales(impl::RangeMacroProps& macros);
+
+} 
+
+typedef Notation CompactNotation;
+
+typedef Notation SimpleNotation;
+
+class U_I18N_API Notation : public UMemory {
+  public:
+    static ScientificNotation scientific();
+
+    static ScientificNotation engineering();
+
+    static CompactNotation compactShort();
+
+    static CompactNotation compactLong();
+
+    static SimpleNotation simple();
+
+  private:
+    enum NotationType {
+        NTN_SCIENTIFIC, NTN_COMPACT, NTN_SIMPLE, NTN_ERROR
+    } fType;
+
+    union NotationUnion {
+        struct ScientificSettings {
+            int8_t fEngineeringInterval;
+            bool fRequireMinInt;
+            impl::digits_t fMinExponentDigits;
+            UNumberSignDisplay fExponentSignDisplay;
+        } scientific;
+
+        UNumberCompactStyle compactStyle;
+
+        UErrorCode errorCode;
+    } fUnion;
+
+    typedef NotationUnion::ScientificSettings ScientificSettings;
+
+    Notation(const NotationType &type, const NotationUnion &union_) : fType(type), fUnion(union_) {}
+
+    Notation(UErrorCode errorCode) : fType(NTN_ERROR) {
+        fUnion.errorCode = errorCode;
+    }
+
+    Notation() : fType(NTN_SIMPLE), fUnion() {}
+
+    UBool copyErrorTo(UErrorCode &status) const {
+        if (fType == NTN_ERROR) {
+            status = fUnion.errorCode;
+            return true;
+        }
+        return false;
+    }
+
+    friend struct impl::MacroProps;
+    friend class ScientificNotation;
+
+    friend class impl::NumberFormatterImpl;
+    friend class impl::ScientificModifier;
+    friend class impl::ScientificHandler;
+
+    friend class impl::GeneratorHelpers;
+};
+
+class U_I18N_API ScientificNotation : public Notation {
+  public:
+    ScientificNotation withMinExponentDigits(int32_t minExponentDigits) const;
+
+    ScientificNotation withExponentSignDisplay(UNumberSignDisplay exponentSignDisplay) const;
+
+  private:
+    using Notation::Notation;
+
+    ScientificNotation(int8_t fEngineeringInterval, bool fRequireMinInt, impl::digits_t fMinExponentDigits,
+                       UNumberSignDisplay fExponentSignDisplay);
+
+    friend class Notation;
+
+    friend class impl::NumberPropertyMapper;
+};
+
+typedef Precision SignificantDigitsPrecision;
+
+class U_I18N_API Precision : public UMemory {
+
+  public:
+    static Precision unlimited();
+
+    static FractionPrecision integer();
+
+    static FractionPrecision fixedFraction(int32_t minMaxFractionPlaces);
+
+    static FractionPrecision minFraction(int32_t minFractionPlaces);
+
+    static FractionPrecision maxFraction(int32_t maxFractionPlaces);
+
+    static FractionPrecision minMaxFraction(int32_t minFractionPlaces, int32_t maxFractionPlaces);
+
+    static SignificantDigitsPrecision fixedSignificantDigits(int32_t minMaxSignificantDigits);
+
+    static SignificantDigitsPrecision minSignificantDigits(int32_t minSignificantDigits);
+
+    static SignificantDigitsPrecision maxSignificantDigits(int32_t maxSignificantDigits);
+
+    static SignificantDigitsPrecision minMaxSignificantDigits(int32_t minSignificantDigits,
+                                                              int32_t maxSignificantDigits);
+
+    static IncrementPrecision increment(double roundingIncrement);
+
+    static IncrementPrecision incrementExact(uint64_t mantissa, int16_t magnitude);
+
+    static CurrencyPrecision currency(UCurrencyUsage currencyUsage);
+
+    Precision trailingZeroDisplay(UNumberTrailingZeroDisplay trailingZeroDisplay) const;
+
+  private:
+    enum PrecisionType {
+        RND_BOGUS,
+        RND_NONE,
+        RND_FRACTION,
+        RND_SIGNIFICANT,
+        RND_FRACTION_SIGNIFICANT,
+
+        RND_INCREMENT,
+
+        RND_INCREMENT_ONE,
+
+        RND_INCREMENT_FIVE,
+
+        RND_CURRENCY,
+        RND_ERROR
+    } fType;
+
+    union PrecisionUnion {
+        struct FractionSignificantSettings {
+            impl::digits_t fMinFrac;
+            impl::digits_t fMaxFrac;
+            impl::digits_t fMinSig;
+            impl::digits_t fMaxSig;
+            UNumberRoundingPriority fPriority;
+            bool fRetain;
+        } fracSig;
+        struct IncrementSettings {
+            uint64_t fIncrement;
+            impl::digits_t fIncrementMagnitude;
+            impl::digits_t fMinFrac;
+        } increment;
+        UCurrencyUsage currencyUsage; 
+        UErrorCode errorCode; 
+    } fUnion;
+
+    UNumberTrailingZeroDisplay fTrailingZeroDisplay = UNUM_TRAILING_ZERO_AUTO;
+
+    typedef PrecisionUnion::FractionSignificantSettings FractionSignificantSettings;
+    typedef PrecisionUnion::IncrementSettings IncrementSettings;
+
+    Precision(const PrecisionType& type, const PrecisionUnion& union_)
+            : fType(type), fUnion(union_) {}
+
+    Precision(UErrorCode errorCode) : fType(RND_ERROR) {
+        fUnion.errorCode = errorCode;
+    }
+
+    Precision() : fType(RND_BOGUS) {}
+
+    bool isBogus() const {
+        return fType == RND_BOGUS;
+    }
+
+    UBool copyErrorTo(UErrorCode &status) const {
+        if (fType == RND_ERROR) {
+            status = fUnion.errorCode;
+            return true;
+        }
+        return false;
+    }
+
+    Precision withCurrency(const CurrencyUnit &currency, UErrorCode &status) const;
+
+    static FractionPrecision constructFraction(int32_t minFrac, int32_t maxFrac);
+
+    static Precision constructSignificant(int32_t minSig, int32_t maxSig);
+
+    static Precision constructFractionSignificant(
+        const FractionPrecision &base,
+        int32_t minSig,
+        int32_t maxSig,
+        UNumberRoundingPriority priority,
+        bool retain);
+
+    static IncrementPrecision constructIncrement(uint64_t increment, impl::digits_t magnitude);
+
+    static CurrencyPrecision constructCurrency(UCurrencyUsage usage);
+
+    friend struct impl::MacroProps;
+    friend struct impl::MicroProps;
+
+    friend class impl::NumberFormatterImpl;
+
+    friend class impl::NumberPropertyMapper;
+
+    friend class impl::RoundingImpl;
+
+    friend class FractionPrecision;
+    friend class CurrencyPrecision;
+    friend class IncrementPrecision;
+
+    friend class impl::GeneratorHelpers;
+
+    friend class units::UnitsRouter;
+};
+
+class U_I18N_API FractionPrecision : public Precision {
+  public:
+    Precision withSignificantDigits(
+        int32_t minSignificantDigits,
+        int32_t maxSignificantDigits,
+        UNumberRoundingPriority priority) const;
+
+    Precision withMinDigits(int32_t minSignificantDigits) const;
+
+    Precision withMaxDigits(int32_t maxSignificantDigits) const;
+
+  private:
+    using Precision::Precision;
+
+    friend class Precision;
+};
+
+class U_I18N_API CurrencyPrecision : public Precision {
+  public:
+    Precision withCurrency(const CurrencyUnit &currency) const;
+
+  private:
+    using Precision::Precision;
+
+    friend class Precision;
+};
+
+class U_I18N_API IncrementPrecision : public Precision {
+  public:
+    Precision withMinFraction(int32_t minFrac) const;
+
+  private:
+    using Precision::Precision;
+
+    friend class Precision;
+};
+
+class U_I18N_API IntegerWidth : public UMemory {
+  public:
+    static IntegerWidth zeroFillTo(int32_t minInt);
+
+    IntegerWidth truncateAt(int32_t maxInt);
+
+  private:
+    union {
+        struct {
+            impl::digits_t fMinInt;
+            impl::digits_t fMaxInt;
+            bool fFormatFailIfMoreThanMaxDigits;
+        } minMaxInt;
+        UErrorCode errorCode;
+    } fUnion;
+    bool fHasError = false;
+
+    IntegerWidth(impl::digits_t minInt, impl::digits_t maxInt, bool formatFailIfMoreThanMaxDigits);
+
+    IntegerWidth(UErrorCode errorCode) { // NOLINT
+        fUnion.errorCode = errorCode;
+        fHasError = true;
+    }
+
+    IntegerWidth() { // NOLINT
+        fUnion.minMaxInt.fMinInt = -1;
+    }
+
+    static IntegerWidth standard() {
+        return IntegerWidth::zeroFillTo(1);
+    }
+
+    bool isBogus() const {
+        return !fHasError && fUnion.minMaxInt.fMinInt == -1;
+    }
+
+    UBool copyErrorTo(UErrorCode &status) const {
+        if (fHasError) {
+            status = fUnion.errorCode;
+            return true;
+        }
+        return false;
+    }
+
+    void apply(impl::DecimalQuantity &quantity, UErrorCode &status) const;
+
+    bool operator==(const IntegerWidth& other) const;
+
+    friend struct impl::MacroProps;
+    friend struct impl::MicroProps;
+
+    friend class impl::NumberFormatterImpl;
+
+    friend class impl::MutablePatternModifier;
+    friend class impl::ImmutablePatternModifier;
+
+    friend class impl::NumberPropertyMapper;
+
+    friend class impl::GeneratorHelpers;
+};
+
+class U_I18N_API Scale : public UMemory {
+  public:
+    static Scale none();
+
+    static Scale powerOfTen(int32_t power);
+
+    static Scale byDecimal(StringPiece multiplicand);
+
+    static Scale byDouble(double multiplicand);
+
+    static Scale byDoubleAndPowerOfTen(double multiplicand, int32_t power);
+
+
+    Scale(const Scale& other);
+
+    Scale& operator=(const Scale& other);
+
+    Scale(Scale&& src) noexcept;
+
+    Scale& operator=(Scale&& src) noexcept;
+
+    ~Scale();
+
+#ifndef U_HIDE_INTERNAL_API
+    Scale(int32_t magnitude, impl::DecNum* arbitraryToAdopt);
+#endif  /* U_HIDE_INTERNAL_API */
+
+  private:
+    int32_t fMagnitude;
+    impl::DecNum* fArbitrary;
+    UErrorCode fError;
+
+    Scale(UErrorCode error) : fMagnitude(0), fArbitrary(nullptr), fError(error) {}
+
+    Scale() : fMagnitude(0), fArbitrary(nullptr), fError(U_ZERO_ERROR) {}
+
+    bool isValid() const {
+        return fMagnitude != 0 || fArbitrary != nullptr;
+    }
+
+    UBool copyErrorTo(UErrorCode &status) const {
+        if (U_FAILURE(fError)) {
+            status = fError;
+            return true;
+        }
+        return false;
+    }
+
+    void applyTo(impl::DecimalQuantity& quantity) const;
+
+    void applyReciprocalTo(impl::DecimalQuantity& quantity) const;
+
+    friend struct impl::MacroProps;
+    friend struct impl::MicroProps;
+
+    friend class impl::NumberFormatterImpl;
+
+    friend class impl::MultiplierFormatHandler;
+
+    friend class impl::GeneratorHelpers;
+
+    friend class ::icu::numparse::impl::NumberParserImpl;
+    friend class ::icu::numparse::impl::MultiplierParseHandler;
+};
+
+namespace impl {
+
+class U_I18N_API StringProp : public UMemory {
+
+  public:
+    ~StringProp();
+
+    StringProp(const StringProp &other);
+
+    StringProp &operator=(const StringProp &other);
+
+#ifndef U_HIDE_INTERNAL_API
+
+    StringProp(StringProp &&src) noexcept;
+
+    StringProp &operator=(StringProp &&src) noexcept;
+
+    int16_t length() const {
+        return fLength;
+    }
+
+    void set(StringPiece value);
+
+    bool isSet() const {
+        return fLength > 0;
+    }
+
+#endif // U_HIDE_INTERNAL_API
+
+  private:
+    char *fValue;
+    int16_t fLength;
+    UErrorCode fError;
+
+    StringProp() : fValue(nullptr), fLength(0), fError(U_ZERO_ERROR) {
+    }
+
+    UBool copyErrorTo(UErrorCode &status) const {
+        if (U_FAILURE(fError)) {
+            status = fError;
+            return true;
+        }
+        return false;
+    }
+
+    friend class impl::NumberFormatterImpl;
+
+    friend class impl::GeneratorHelpers;
+
+    friend struct impl::MacroProps;
+};
+
+class U_I18N_API SymbolsWrapper : public UMemory {
+  public:
+    SymbolsWrapper() : fType(SYMPTR_NONE), fPtr{nullptr} {}
+
+    SymbolsWrapper(const SymbolsWrapper &other);
+
+    SymbolsWrapper &operator=(const SymbolsWrapper &other);
+
+    SymbolsWrapper(SymbolsWrapper&& src) noexcept;
+
+    SymbolsWrapper &operator=(SymbolsWrapper&& src) noexcept;
+
+    ~SymbolsWrapper();
+
+#ifndef U_HIDE_INTERNAL_API
+
+    void setTo(const DecimalFormatSymbols &dfs);
+
+    void setTo(const NumberingSystem *ns);
+
+    bool isDecimalFormatSymbols() const;
+
+    bool isNumberingSystem() const;
+
+    const DecimalFormatSymbols *getDecimalFormatSymbols() const;
+
+    const NumberingSystem *getNumberingSystem() const;
+
+#endif  // U_HIDE_INTERNAL_API
+
+    UBool copyErrorTo(UErrorCode &status) const {
+        if (fType == SYMPTR_DFS && fPtr.dfs == nullptr) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+            return true;
+        } else if (fType == SYMPTR_NS && fPtr.ns == nullptr) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+            return true;
+        }
+        return false;
+    }
+
+  private:
+    enum SymbolsPointerType {
+        SYMPTR_NONE, SYMPTR_DFS, SYMPTR_NS
+    } fType;
+
+    union {
+        const DecimalFormatSymbols *dfs;
+        const NumberingSystem *ns;
+    } fPtr;
+
+    void doCopyFrom(const SymbolsWrapper &other);
+
+    void doMoveFrom(SymbolsWrapper&& src);
+
+    void doCleanup();
+};
+
+class U_I18N_API Grouper : public UMemory {
+  public:
+#ifndef U_HIDE_INTERNAL_API
+    static Grouper forStrategy(UNumberGroupingStrategy grouping);
+
+    static Grouper forProperties(const DecimalFormatProperties& properties);
+
+
+    Grouper(int16_t grouping1, int16_t grouping2, int16_t minGrouping, UNumberGroupingStrategy strategy)
+            : fGrouping1(grouping1),
+              fGrouping2(grouping2),
+              fMinGrouping(minGrouping),
+              fStrategy(strategy) {}
+
+    int16_t getPrimary() const;
+
+    int16_t getSecondary() const;
+#endif  // U_HIDE_INTERNAL_API
+
+  private:
+    int16_t fGrouping1;
+    int16_t fGrouping2;
+
+    int16_t fMinGrouping;
+
+    UNumberGroupingStrategy fStrategy;
+
+    Grouper() : fGrouping1(-3) {}
+
+    bool isBogus() const {
+        return fGrouping1 == -3;
+    }
+
+    void setLocaleData(const impl::ParsedPatternInfo &patternInfo, const Locale& locale);
+
+    bool groupAtPosition(int32_t position, const impl::DecimalQuantity &value) const;
+
+    friend struct MacroProps;
+    friend struct MicroProps;
+    friend struct SimpleMicroProps;
+
+    friend class NumberFormatterImpl;
+    friend class ::icu::number::SimpleNumberFormatter;
+
+    friend class ::icu::numparse::impl::NumberParserImpl;
+
+    friend class impl::GeneratorHelpers;
+};
+
+class U_I18N_API Padder : public UMemory {
+  public:
+#ifndef U_HIDE_INTERNAL_API
+    static Padder none();
+
+    static Padder codePoints(UChar32 cp, int32_t targetWidth, UNumberFormatPadPosition position);
+
+    static Padder forProperties(const DecimalFormatProperties& properties);
+#endif  // U_HIDE_INTERNAL_API
+
+  private:
+    UChar32 fWidth;  
+    union {
+        struct {
+            int32_t fCp;
+            UNumberFormatPadPosition fPosition;
+        } padding;
+        UErrorCode errorCode;
+    } fUnion;
+
+    Padder(UChar32 cp, int32_t width, UNumberFormatPadPosition position);
+
+    Padder(int32_t width);
+
+    Padder(UErrorCode errorCode) : fWidth(-3) { // NOLINT
+        fUnion.errorCode = errorCode;
+    }
+
+    Padder() : fWidth(-2) {} // NOLINT
+
+    bool isBogus() const {
+        return fWidth == -2;
+    }
+
+    UBool copyErrorTo(UErrorCode &status) const {
+        if (fWidth == -3) {
+            status = fUnion.errorCode;
+            return true;
+        }
+        return false;
+    }
+
+    bool isValid() const {
+        return fWidth > 0;
+    }
+
+    int32_t padAndApply(const impl::Modifier &mod1, const impl::Modifier &mod2,
+                        FormattedStringBuilder &string, int32_t leftIndex, int32_t rightIndex,
+                        UErrorCode &status) const;
+
+    friend struct MacroProps;
+    friend struct MicroProps;
+
+    friend class impl::NumberFormatterImpl;
+
+    friend class impl::GeneratorHelpers;
+};
+
+struct U_I18N_API_CLASS MacroProps : public UMemory {
+    Notation notation;
+
+    MeasureUnit unit;  
+
+    MeasureUnit perUnit;  
+
+    Precision precision;  
+
+    UNumberFormatRoundingMode roundingMode = UNUM_ROUND_HALFEVEN;
+
+    Grouper grouper;  
+
+    Padder padder;    
+
+    IntegerWidth integerWidth; 
+
+    SymbolsWrapper symbols;
+
+
+    UNumberUnitWidth unitWidth = UNUM_UNIT_WIDTH_COUNT;
+
+    UNumberSignDisplay sign = UNUM_SIGN_COUNT;
+
+    bool approximately = false;
+
+    UNumberDecimalSeparatorDisplay decimal = UNUM_DECIMAL_SEPARATOR_COUNT;
+
+    Scale scale;  
+
+    StringProp usage;  
+
+    StringProp unitDisplayCase;  
+
+    const AffixPatternProvider* affixProvider = nullptr;  
+
+    const PluralRules* rules = nullptr;  
+
+    int32_t threshold = kInternalDefaultThreshold;
+
+    Locale locale;
+
+
+    U_I18N_API bool copyErrorTo(UErrorCode &status) const {
+        return notation.copyErrorTo(status) || precision.copyErrorTo(status) ||
+               padder.copyErrorTo(status) || integerWidth.copyErrorTo(status) ||
+               symbols.copyErrorTo(status) || scale.copyErrorTo(status) || usage.copyErrorTo(status) ||
+               unitDisplayCase.copyErrorTo(status);
+    }
+};
+
+} 
+
+#if (U_PF_WINDOWS <= U_PLATFORM && U_PLATFORM <= U_PF_CYGWIN) && defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable: 4661)
+#endif
+
+template<typename Derived>
+class U_I18N_API NumberFormatterSettings {
+  public:
+    Derived notation(const Notation &notation) const &;
+
+    Derived notation(const Notation &notation) &&;
+
+    Derived unit(const icu::MeasureUnit &unit) const &;
+
+    Derived unit(const icu::MeasureUnit &unit) &&;
+
+    Derived adoptUnit(icu::MeasureUnit *unit) const &;
+
+    Derived adoptUnit(icu::MeasureUnit *unit) &&;
+
+    Derived perUnit(const icu::MeasureUnit &perUnit) const &;
+
+    Derived perUnit(const icu::MeasureUnit &perUnit) &&;
+
+    Derived adoptPerUnit(icu::MeasureUnit *perUnit) const &;
+
+    Derived adoptPerUnit(icu::MeasureUnit *perUnit) &&;
+
+    Derived precision(const Precision& precision) const &;
+
+    Derived precision(const Precision& precision) &&;
+
+    Derived roundingMode(UNumberFormatRoundingMode roundingMode) const &;
+
+    Derived roundingMode(UNumberFormatRoundingMode roundingMode) &&;
+
+    Derived grouping(UNumberGroupingStrategy strategy) const &;
+
+    Derived grouping(UNumberGroupingStrategy strategy) &&;
+
+    Derived integerWidth(const IntegerWidth &style) const &;
+
+    Derived integerWidth(const IntegerWidth &style) &&;
+
+    Derived symbols(const DecimalFormatSymbols &symbols) const &;
+
+    Derived symbols(const DecimalFormatSymbols &symbols) &&;
+
+    Derived adoptSymbols(NumberingSystem *symbols) const &;
+
+    Derived adoptSymbols(NumberingSystem *symbols) &&;
+
+    Derived unitWidth(UNumberUnitWidth width) const &;
+
+    Derived unitWidth(UNumberUnitWidth width) &&;
+
+    Derived sign(UNumberSignDisplay style) const &;
+
+    Derived sign(UNumberSignDisplay style) &&;
+
+    Derived decimal(UNumberDecimalSeparatorDisplay style) const &;
+
+    Derived decimal(UNumberDecimalSeparatorDisplay style) &&;
+
+    Derived scale(const Scale &scale) const &;
+
+    Derived scale(const Scale &scale) &&;
+
+    Derived usage(StringPiece usage) const &;
+
+    Derived usage(StringPiece usage) &&;
+
+    Derived displayOptions(const DisplayOptions &displayOptions) const &;
+
+    Derived displayOptions(const DisplayOptions &displayOptions) &&;
+
+#ifndef U_HIDE_INTERNAL_API
+    Derived unitDisplayCase(StringPiece unitDisplayCase) const &;
+
+    Derived unitDisplayCase(StringPiece unitDisplayCase) &&;
+#endif // U_HIDE_INTERNAL_API
+
+#ifndef U_HIDE_INTERNAL_API
+
+    Derived padding(const impl::Padder &padder) const &;
+
+    Derived padding(const impl::Padder &padder) &&;
+
+    Derived threshold(int32_t threshold) const &;
+
+    Derived threshold(int32_t threshold) &&;
+
+    Derived macros(const impl::MacroProps& macros) const &;
+
+    Derived macros(const impl::MacroProps& macros) &&;
+
+    Derived macros(impl::MacroProps&& macros) const &;
+
+    Derived macros(impl::MacroProps&& macros) &&;
+
+#endif  /* U_HIDE_INTERNAL_API */
+
+    UnicodeString toSkeleton(UErrorCode& status) const;
+
+    LocalPointer<Derived> clone() const &;
+
+    LocalPointer<Derived> clone() &&;
+
+    UBool copyErrorTo(UErrorCode &outErrorCode) const {
+        if (U_FAILURE(outErrorCode)) {
+            return true;
+        }
+        fMacros.copyErrorTo(outErrorCode);
+        return U_FAILURE(outErrorCode);
+    }
+
+
+  private:
+    impl::MacroProps fMacros;
+
+    NumberFormatterSettings() = default;
+
+    friend class LocalizedNumberFormatter;
+    friend class UnlocalizedNumberFormatter;
+
+    friend void impl::touchRangeLocales(impl::RangeMacroProps& macros);
+    friend class impl::NumberRangeFormatterImpl;
+};
+
+#ifndef _MSC_VER
+extern template class NumberFormatterSettings<UnlocalizedNumberFormatter>;
+extern template class NumberFormatterSettings<LocalizedNumberFormatter>;
+#endif
+
+class U_I18N_API UnlocalizedNumberFormatter
+        : public NumberFormatterSettings<UnlocalizedNumberFormatter>, public UMemory {
+
+  public:
+    LocalizedNumberFormatter locale(const icu::Locale &locale) const &;
+
+    LocalizedNumberFormatter locale(const icu::Locale &locale) &&;
+
+    UnlocalizedNumberFormatter() = default;
+
+    UnlocalizedNumberFormatter(const UnlocalizedNumberFormatter &other);
+
+    UnlocalizedNumberFormatter(UnlocalizedNumberFormatter&& src) noexcept;
+
+    UnlocalizedNumberFormatter& operator=(const UnlocalizedNumberFormatter& other);
+
+    UnlocalizedNumberFormatter& operator=(UnlocalizedNumberFormatter&& src) noexcept;
+
+  private:
+    explicit UnlocalizedNumberFormatter(const NumberFormatterSettings<UnlocalizedNumberFormatter>& other);
+
+    explicit UnlocalizedNumberFormatter(
+            NumberFormatterSettings<UnlocalizedNumberFormatter>&& src) noexcept;
+
+    explicit UnlocalizedNumberFormatter(const impl::MacroProps &macros);
+
+    explicit UnlocalizedNumberFormatter(impl::MacroProps &&macros);
+
+    friend class NumberFormatterSettings<UnlocalizedNumberFormatter>;
+
+    friend class NumberFormatter;
+
+    friend class LocalizedNumberFormatter;
+};
+
+class U_I18N_API LocalizedNumberFormatter
+        : public NumberFormatterSettings<LocalizedNumberFormatter>, public UMemory {
+  public:
+    FormattedNumber formatInt(int64_t value, UErrorCode &status) const;
+
+    FormattedNumber formatDouble(double value, UErrorCode &status) const;
+
+    FormattedNumber formatDecimal(StringPiece value, UErrorCode& status) const;
+
+#ifndef U_HIDE_INTERNAL_API
+
+            
+    const DecimalFormatSymbols* getDecimalFormatSymbols() const;
+    
+    FormattedNumber formatDecimalQuantity(const impl::DecimalQuantity& dq, UErrorCode& status) const;
+
+    void getAffixImpl(bool isPrefix, bool isNegative, UnicodeString& result, UErrorCode& status) const;
+
+    const impl::NumberFormatterImpl* getCompiled() const;
+
+    int32_t getCallCount() const;
+
+#endif  /* U_HIDE_INTERNAL_API */
+
+    Format* toFormat(UErrorCode& status) const;
+
+    UnlocalizedNumberFormatter withoutLocale() const &;
+
+    UnlocalizedNumberFormatter withoutLocale() &&;
+
+    LocalizedNumberFormatter() = default;
+
+    LocalizedNumberFormatter(const LocalizedNumberFormatter &other);
+
+    LocalizedNumberFormatter(LocalizedNumberFormatter&& src) noexcept;
+
+    LocalizedNumberFormatter& operator=(const LocalizedNumberFormatter& other);
+
+    LocalizedNumberFormatter& operator=(LocalizedNumberFormatter&& src) noexcept;
+
+#ifndef U_HIDE_INTERNAL_API
+
+    void formatImpl(impl::UFormattedNumberData *results, UErrorCode &status) const;
+
+#endif  /* U_HIDE_INTERNAL_API */
+
+    ~LocalizedNumberFormatter();
+
+  private:
+    const impl::NumberFormatterImpl* fCompiled {nullptr};
+    char fUnsafeCallCount[8] {};  
+
+    const impl::DecimalFormatWarehouse* fWarehouse {nullptr};
+
+    explicit LocalizedNumberFormatter(const NumberFormatterSettings<LocalizedNumberFormatter>& other);
+
+    explicit LocalizedNumberFormatter(NumberFormatterSettings<LocalizedNumberFormatter>&& src) noexcept;
+
+    LocalizedNumberFormatter(const impl::MacroProps &macros, const Locale &locale);
+
+    LocalizedNumberFormatter(impl::MacroProps &&macros, const Locale &locale);
+
+    void resetCompiled();
+
+    void lnfMoveHelper(LocalizedNumberFormatter&& src);
+
+    void lnfCopyHelper(const LocalizedNumberFormatter& src, UErrorCode& status);
+
+    bool computeCompiled(UErrorCode& status) const;
+
+    friend class NumberFormatterSettings<UnlocalizedNumberFormatter>;
+    friend class NumberFormatterSettings<LocalizedNumberFormatter>;
+
+    friend class UnlocalizedNumberFormatter;
+};
+
+#if (U_PF_WINDOWS <= U_PLATFORM && U_PLATFORM <= U_PF_CYGWIN) && defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+
+class U_I18N_API NumberFormatter final {
+  public:
+    static UnlocalizedNumberFormatter with();
+
+    static LocalizedNumberFormatter withLocale(const Locale &locale);
+
+    static UnlocalizedNumberFormatter forSkeleton(const UnicodeString& skeleton, UErrorCode& status);
+
+    static UnlocalizedNumberFormatter forSkeleton(const UnicodeString& skeleton,
+                                                  UParseError& perror, UErrorCode& status);
+
+    NumberFormatter() = delete;
+};
+
+}  
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif // __NUMBERFORMATTER_H__

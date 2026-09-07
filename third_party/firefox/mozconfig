@@ -1,0 +1,41 @@
+ac_add_options --enable-application=browser
+ac_add_options --enable-minimal-browser
+ac_add_options --enable-bootstrap
+ac_add_options --enable-default-toolkit=cairo-gtk3-wayland-only
+ac_add_options --with-ccache=sccache
+ac_add_options --enable-linker=mold
+ac_add_options --enable-host-linker=mold
+ac_add_options --enable-warnings-as-errors
+ac_add_options --enable-lto=full
+
+ac_add_options --disable-ffmpeg
+ac_add_options --disable-jxl
+
+export MMLTK_FIREFOX_CACHE_ROOT="${MMLTK_FIREFOX_CACHE_ROOT:-/workspace/.cache/firefox}"
+export MOZBUILD_STATE_PATH="${MOZBUILD_STATE_PATH:-${MMLTK_FIREFOX_CACHE_ROOT}/mozbuild}"
+export SCCACHE_DIR="${SCCACHE_DIR:-${MMLTK_FIREFOX_CACHE_ROOT}/sccache}"
+export MOZ_OPTIMIZE_FLAGS="-O3 -march=alderlake -mtune=alderlake"
+export LDFLAGS="${LDFLAGS:+${LDFLAGS} }-Wl,--lto-partitions=${MMLTK_JOBS:-$(nproc)}"
+export RUSTC_OPT_LEVEL=3
+export extra_rustflags="-C target-cpu=alderlake -C link-arg=-fuse-ld=mold"
+
+case "${MINIMAL_BUILD_MODE:-opt}" in
+  opt)
+    mk_add_options MOZ_OBJDIR="${MMLTK_FIREFOX_CACHE_ROOT}/obj-minimal-opt"
+    ac_add_options --disable-debug
+    ac_add_options --disable-debug-symbols
+    ac_add_options --enable-optimize
+    ac_add_options --enable-strip
+    ;;
+  debug)
+    mk_add_options MOZ_OBJDIR="${MMLTK_FIREFOX_CACHE_ROOT}/obj-minimal-debug"
+    ac_add_options --disable-strip
+    ac_add_options --enable-debug
+    ac_add_options --enable-debug-symbols
+    ac_add_options --enable-optimize
+    ;;
+  *)
+    echo "Unknown MINIMAL_BUILD_MODE: $MINIMAL_BUILD_MODE" >&2
+    return 1
+    ;;
+esac

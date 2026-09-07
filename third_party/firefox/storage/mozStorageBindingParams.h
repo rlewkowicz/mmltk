@@ -1,0 +1,67 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozStorageBindingParams_h
+#define mozStorageBindingParams_h
+
+#include "nsIVariant.h"
+
+#include "mozStorageStatement.h"
+#include "mozStorageAsyncStatement.h"
+#include "Variant.h"
+#include "nsTHashMap.h"
+#include "mozIStorageBindingParams.h"
+#include "IStorageBindingParamsInternal.h"
+
+namespace mozilla::storage {
+
+class BindingParams : public mozIStorageBindingParams,
+                      public IStorageBindingParamsInternal {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_MOZISTORAGEBINDINGPARAMS
+  NS_DECL_ISTORAGEBINDINGPARAMSINTERNAL
+
+  void lock();
+
+  void unlock(Statement* aOwningStatement);
+
+  const mozIStorageBindingParamsArray* getOwner() const;
+
+  BindingParams(mozIStorageBindingParamsArray* aOwningArray,
+                Statement* aOwningStatement);
+
+ protected:
+  virtual ~BindingParams() = default;
+
+  explicit BindingParams(mozIStorageBindingParamsArray* aOwningArray);
+
+  nsTArray<RefPtr<Variant_base>> mParameters;
+
+  bool mLocked;
+
+ private:
+  nsCOMPtr<mozIStorageBindingParamsArray> mOwningArray;
+  Statement* mOwningStatement;
+  uint32_t mParamCount;
+};
+
+class AsyncBindingParams : public BindingParams {
+ public:
+  NS_IMETHOD BindByName(const nsACString& aName, nsIVariant* aValue) override;
+  NS_IMETHOD BindByIndex(uint32_t aIndex, nsIVariant* aValue) override;
+
+  virtual already_AddRefed<mozIStorageError> bind(
+      sqlite3_stmt* aStatement) override;
+
+  explicit AsyncBindingParams(mozIStorageBindingParamsArray* aOwningArray);
+  virtual ~AsyncBindingParams() = default;
+
+ private:
+  nsTHashMap<nsCStringHashKey, RefPtr<Variant_base>> mNamedParameters;
+};
+
+}  
+
+#endif  // mozStorageBindingParams_h

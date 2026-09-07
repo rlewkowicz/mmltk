@@ -1,0 +1,65 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_GFX_RENDERCOMPOSITOR_EGL_H
+#define MOZILLA_GFX_RENDERCOMPOSITOR_EGL_H
+
+#include "GLTypes.h"
+#include "mozilla/webrender/RenderCompositor.h"
+
+namespace mozilla {
+
+namespace wr {
+
+class RenderCompositorEGL : public RenderCompositor {
+ public:
+  static UniquePtr<RenderCompositor> Create(
+      const RefPtr<widget::CompositorWidget>& aWidget, nsACString& aError);
+
+  explicit RenderCompositorEGL(const RefPtr<widget::CompositorWidget>& aWidget,
+                               RefPtr<gl::GLContext>&& aGL);
+  virtual ~RenderCompositorEGL();
+
+  bool BeginFrame() override;
+  RenderedFrameId EndFrame(const nsTArray<DeviceIntRect>& aDirtyRects) final;
+  void Pause() override;
+  bool Resume() override;
+  bool IsPaused() override;
+
+  gl::GLContext* gl() const override { return mGL; }
+
+  bool MakeCurrent() override;
+
+  bool UseANGLE() const override { return false; }
+
+  LayoutDeviceIntSize GetBufferSize() override;
+
+  bool UsePartialPresent() override;
+  bool RequestFullRender() override;
+  uint32_t GetMaxPartialPresentRects() override;
+  bool ShouldDrawPreviousPartialPresentRegions() override;
+  size_t GetBufferAge() const override;
+  void SetBufferDamageRegion(const wr::DeviceIntRect* aRects,
+                             size_t aNumRects) override;
+
+  RefPtr<layers::Fence> GetAndResetReleaseFence() override;
+
+ protected:
+  EGLSurface CreateEGLSurface();
+
+  void DestroyEGLSurface();
+
+  RefPtr<gl::GLContext> mGL;
+
+  EGLSurface mEGLSurface;
+
+  bool mHandlingNewSurfaceError = false;
+
+  RefPtr<layers::Fence> mReleaseFence;
+};
+
+}  
+}  
+
+#endif  // MOZILLA_GFX_RENDERCOMPOSITOR_EGL_H

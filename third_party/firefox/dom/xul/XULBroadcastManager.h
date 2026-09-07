@@ -1,0 +1,79 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_XULBroadcastManager_h
+#define mozilla_dom_XULBroadcastManager_h
+
+#include "nsAtom.h"
+#include "nsIWeakReferenceUtils.h"
+#include "nsTArray.h"
+#include "nsTHashMap.h"
+
+class nsXULElement;
+
+namespace mozilla {
+
+class ErrorResult;
+
+namespace dom {
+
+class Document;
+class Element;
+
+class XULBroadcastManager final {
+ public:
+  explicit XULBroadcastManager(Document* aDocument);
+
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(XULBroadcastManager)
+
+  static bool MayNeedListener(const Element& aElement);
+
+  nsresult AddListener(Element* aElement);
+  nsresult RemoveListener(Element* aElement);
+  void AttributeChanged(Element* aElement, int32_t aNameSpaceID,
+                        nsAtom* aAttribute);
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void MaybeBroadcast();
+  void DropDocumentReference();  
+ protected:
+  enum HookupAction { eHookupAdd = 0, eHookupRemove };
+
+  nsresult UpdateListenerHookup(Element* aElement, HookupAction aAction);
+
+  void RemoveListenerFor(Element& aBroadcaster, Element& aListener,
+                         const nsAString& aAttr);
+  void AddListenerFor(Element& aBroadcaster, Element& aListener,
+                      const nsAString& aAttr, ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT nsresult ExecuteOnBroadcastHandlerFor(
+      Element* aBroadcaster, Element* aListener, nsAtom* aAttr);
+  nsresult FindBroadcaster(Element* aElement, Element** aListener,
+                           nsString& aBroadcasterID, nsString& aAttribute,
+                           Element** aBroadcaster);
+
+  void SynchronizeBroadcastListener(Element* aBroadcaster, Element* aListener,
+                                    const nsAString& aAttr);
+
+  Document* MOZ_NON_OWNING_REF mDocument;
+
+  struct BroadcastListener {
+    nsWeakPtr mListener;
+    RefPtr<nsAtom> mAttribute;
+  };
+
+  nsTHashMap<Element*, nsTArray<BroadcastListener>> mBroadcasterMap;
+
+  class nsDelayedBroadcastUpdate;
+  nsTArray<nsDelayedBroadcastUpdate> mDelayedBroadcasters;
+  nsTArray<nsDelayedBroadcastUpdate> mDelayedAttrChangeBroadcasts;
+  bool mHandlingDelayedAttrChange;
+  bool mHandlingDelayedBroadcasters;
+
+ private:
+  ~XULBroadcastManager();
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_XULBroadcastManager_h

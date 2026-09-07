@@ -1,0 +1,188 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "FramingChecker.h"
+
+#include <stdint.h>  // uint32_t
+
+#include "mozilla/Assertions.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/Services.h"
+#include "mozilla/dom/WindowGlobalParent.h"
+#include "mozilla/net/HttpBaseChannel.h"
+#include "nsCOMPtr.h"
+#include "nsContentSecurityUtils.h"
+#include "nsContentUtils.h"
+#include "nsDebug.h"
+#include "nsError.h"
+#include "nsGlobalWindowOuter.h"
+#include "nsHttpChannel.h"
+#include "nsIContentPolicy.h"
+#include "nsIObserverService.h"
+#include "nsIScriptError.h"
+#include "nsLiteralString.h"
+#include "nsStringFwd.h"
+#include "nsTArray.h"
+
+using namespace mozilla;
+using namespace mozilla::dom;
+
+void FramingChecker::ReportError(const char* aMessageTag,
+                                 nsIHttpChannel* aChannel, nsIURI* aURI,
+                                 const nsAString& aPolicy) {
+  MOZ_ASSERT(aChannel);
+  MOZ_ASSERT(aURI);
+
+  nsCOMPtr<net::HttpBaseChannel> httpChannel = do_QueryInterface(aChannel);
+  if (!httpChannel) {
+    return;
+  }
+
+  nsAutoCString spec;
+  nsresult rv = aURI->GetAsciiSpec(spec);
+  if (NS_FAILED(rv)) {
+    return;
+  }
+
+  nsTArray<nsString> params;
+  params.AppendElement(aPolicy);
+  params.AppendElement(NS_ConvertUTF8toUTF16(spec));
+
+  httpChannel->AddConsoleReport(nsIScriptError::errorFlag, "X-Frame-Options"_ns,
+                                PropertiesFile::SECURITY_PROPERTIES, spec, 0, 0,
+                                nsDependentCString(aMessageTag), params);
+
+  nsCOMPtr<nsIObserverService> observerService =
+      mozilla::services::GetObserverService();
+  nsAutoString policy(aPolicy);
+  observerService->NotifyObservers(aURI, "xfo-on-violate-policy", policy.get());
+}
+
+static bool ShouldIgnoreFrameOptions(nsIChannel* aChannel,
+                                     nsIContentSecurityPolicy* aCSP) {
+  NS_ENSURE_TRUE(aChannel, false);
+  if (!aCSP) {
+    return false;
+  }
+
+  bool enforcesFrameAncestors = false;
+  aCSP->GetEnforcesFrameAncestors(&enforcesFrameAncestors);
+  if (!enforcesFrameAncestors) {
+    return false;
+  }
+
+  return true;
+}
+
+bool FramingChecker::CheckFrameOptions(nsIChannel* aChannel,
+                                       nsIContentSecurityPolicy* aCsp,
+                                       bool& outIsFrameCheckingSkipped) {
+  if (!aChannel) {
+    return true;
+  }
+
+  nsCOMPtr<nsILoadInfo> loadInfo = aChannel->LoadInfo();
+  ExtContentPolicyType contentType = loadInfo->GetExternalContentPolicyType();
+  if (contentType != ExtContentPolicy::TYPE_SUBDOCUMENT &&
+      contentType != ExtContentPolicy::TYPE_OBJECT) {
+    return true;
+  }
+
+  nsCOMPtr<nsIHttpChannel> httpChannel;
+  nsresult rv = nsContentSecurityUtils::GetHttpChannelFromPotentialMultiPart(
+      aChannel, getter_AddRefs(httpChannel));
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return true;
+  }
+  if (!httpChannel) {
+    return true;
+  }
+
+  uint32_t responseStatus;
+  rv = httpChannel->GetResponseStatus(&responseStatus);
+  if (NS_FAILED(rv)) {
+    return true;
+  }
+  if (mozilla::net::nsHttpChannel::IsRedirectStatus(responseStatus)) {
+    return true;
+  }
+
+  nsAutoCString xfoHeaderValue;
+  (void)httpChannel->GetResponseHeader("X-Frame-Options"_ns, xfoHeaderValue);
+
+  if (xfoHeaderValue.IsEmpty()) {
+    return true;
+  }
+
+  if (ShouldIgnoreFrameOptions(aChannel, aCsp)) {
+    outIsFrameCheckingSkipped = true;
+    return true;
+  }
+
+  static const char kASCIIWhitespace[] = "\t ";
+
+  XFOHeader xfoOptions;
+  for (const nsACString& next : xfoHeaderValue.Split(',')) {
+    nsAutoCString option(next);
+    option.Trim(kASCIIWhitespace);
+
+    if (option.LowerCaseEqualsLiteral("allowall")) {
+      xfoOptions.ALLOWALL = true;
+    } else if (option.LowerCaseEqualsLiteral("sameorigin")) {
+      xfoOptions.SAMEORIGIN = true;
+    } else if (option.LowerCaseEqualsLiteral("deny")) {
+      xfoOptions.DENY = true;
+    } else {
+      xfoOptions.INVALID = true;
+    }
+  }
+
+  nsCOMPtr<nsIURI> uri;
+  httpChannel->GetURI(getter_AddRefs(uri));
+
+  uint32_t xfoUniqueOptions = xfoOptions.DENY + xfoOptions.ALLOWALL +
+                              xfoOptions.SAMEORIGIN + xfoOptions.INVALID;
+  if (xfoUniqueOptions > 1 &&
+      (xfoOptions.DENY || xfoOptions.ALLOWALL || xfoOptions.SAMEORIGIN)) {
+    ReportError("XFrameOptionsInvalid", httpChannel, uri, u"invalid"_ns);
+    return false;
+  }
+
+  if (xfoOptions.INVALID) {
+    ReportError("XFrameOptionsInvalid", httpChannel, uri, u"invalid"_ns);
+    return true;
+  }
+
+  if (xfoOptions.DENY) {
+    ReportError("XFrameOptionsDeny", httpChannel, uri, u"deny"_ns);
+    return false;
+  }
+
+  RefPtr<mozilla::dom::BrowsingContext> ctx;
+  loadInfo->GetBrowsingContext(getter_AddRefs(ctx));
+
+  while (ctx && xfoOptions.SAMEORIGIN) {
+    nsCOMPtr<nsIPrincipal> principal;
+    if (XRE_IsParentProcess()) {
+      WindowGlobalParent* window = ctx->Canonical()->GetCurrentWindowGlobal();
+      if (window) {
+        principal = window->DocumentPrincipal();
+      }
+    } else if (nsPIDOMWindowOuter* windowOuter = ctx->GetDOMWindow()) {
+      principal = nsGlobalWindowOuter::Cast(windowOuter)->GetPrincipal();
+    }
+
+    if (principal && principal->IsSystemPrincipal()) {
+      return true;
+    }
+
+    if (!principal || !principal->IsSameOrigin(uri)) {
+      ReportError("XFrameOptionsDeny", httpChannel, uri, u"sameorigin"_ns);
+      return false;
+    }
+    ctx = ctx->GetParent();
+  }
+
+  return true;
+}

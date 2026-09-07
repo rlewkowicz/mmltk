@@ -1,0 +1,26 @@
+/*
+ * Copyright 2011 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+#if !defined(SkLineClipper_DEFINED)
+#define SkLineClipper_DEFINED
+
+struct SkPoint;
+struct SkRect;
+
+class SkLineClipper {
+public:
+    enum {
+        kMaxPoints = 4,
+        kMaxClippedLineSegments = kMaxPoints - 1
+    };
+
+    static int ClipLine(const SkPoint pts[2], const SkRect& clip,
+                        SkPoint lines[kMaxPoints], bool canCullToTheRight);
+
+    static bool IntersectLine(const SkPoint src[2], const SkRect& clip, SkPoint dst[2]);
+};
+
+#endif

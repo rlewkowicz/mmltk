@@ -1,0 +1,134 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef nsListControlFrame_h_
+#define nsListControlFrame_h_
+
+#include "mozilla/Attributes.h"
+#include "mozilla/ScrollContainerFrame.h"
+
+class nsComboboxControlFrame;
+class nsPresContext;
+
+namespace mozilla {
+class PresShell;
+
+namespace dom {
+class HTMLOptionElement;
+class HTMLSelectElement;
+}  
+}  
+
+
+class nsListControlFrame final : public mozilla::ScrollContainerFrame {
+ public:
+  using HTMLOptionElement = mozilla::dom::HTMLOptionElement;
+
+  friend nsListControlFrame* NS_NewListControlFrame(
+      mozilla::PresShell* aPresShell, ComputedStyle* aStyle);
+
+  NS_DECL_QUERYFRAME
+  NS_DECL_FRAMEARENA_HELPERS(nsListControlFrame)
+
+  Maybe<nscoord> GetNaturalBaselineBOffset(
+      mozilla::WritingMode aWM, BaselineSharingGroup aBaselineGroup,
+      BaselineExportContext) const override;
+
+  nsresult HandleEvent(nsPresContext* aPresContext,
+                       mozilla::WidgetGUIEvent* aEvent,
+                       nsEventStatus* aEventStatus) final;
+
+  nscoord IntrinsicISize(const mozilla::IntrinsicSizeInput& aInput,
+                         mozilla::IntrinsicISizeType aType) final;
+
+  void Reflow(nsPresContext* aCX, ReflowOutput& aDesiredSize,
+              const ReflowInput& aReflowInput, nsReflowStatus& aStatus) final;
+
+  void Init(nsIContent* aContent, nsContainerFrame* aParent,
+            nsIFrame* aPrevInFlow) final;
+
+  bool ReflowFinished() final;
+
+  mozilla::dom::HTMLOptionElement* GetCurrentOption() const;
+
+#ifdef DEBUG_FRAME_DUMP
+  nsresult GetFrameName(nsAString& aResult) const final;
+#endif
+
+  void ElementStateChanged(mozilla::dom::ElementState aStates) final;
+
+#ifdef ACCESSIBILITY
+  mozilla::a11y::AccType AccessibleType() final;
+#endif
+
+  void GetOptionText(uint32_t aIndex, nsAString& aStr);
+
+  nscoord GetBSizeOfARow();
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void OnSelectionReset();
+  void OptionsAdded();
+
+  MOZ_CAN_RUN_SCRIPT void ScrollToIndex(int32_t aIndex);
+
+  HTMLOptionElement* GetOption(uint32_t aIndex) const;
+
+  bool IsFocused() const;
+
+  void PaintFocus(mozilla::gfx::DrawTarget* aDrawTarget, nsPoint aPt);
+
+  void InvalidateFocus();
+
+  nscoord CalcBSizeOfARow();
+
+  bool MightNeedSecondPass() const { return mMightNeedSecondPass; }
+
+  uint32_t GetNumDisplayRows() const { return mNumDisplayRows; }
+
+#ifdef ACCESSIBILITY
+  void FireMenuItemActiveEvent(
+      nsIContent* aPreviousOption);  
+#endif
+
+ protected:
+  mozilla::dom::HTMLSelectElement& Select() const;
+
+  bool IsOptionInteractivelySelectable(int32_t aIndex) const;
+  static bool IsOptionInteractivelySelectable(
+      mozilla::dom::HTMLSelectElement* aSelect,
+      mozilla::dom::HTMLOptionElement* aOption);
+
+  MOZ_CAN_RUN_SCRIPT void ScrollToFrame(HTMLOptionElement& aOptElement);
+
+ protected:
+  explicit nsListControlFrame(ComputedStyle* aStyle,
+                              nsPresContext* aPresContext);
+  virtual ~nsListControlFrame();
+
+  bool CheckIfAllFramesHere();
+
+  nscoord CalcFallbackRowBSize(float aFontSizeInflation);
+
+  nscoord CalcIntrinsicBSize(nscoord aBSizeOfARow, int32_t aNumberOfOptions);
+
+  void SetComboboxItem(int32_t aIndex);
+
+ public:
+  static constexpr int32_t kNothingSelected = -1;
+
+ protected:
+  nscoord BSizeOfARow() const { return mBSizeOfARow; }
+
+  uint32_t GetNumberOfRows();
+
+  uint32_t mNumDisplayRows = 0;
+  nscoord mBSizeOfARow = -1;
+
+  bool mNeedToReset : 1;
+  bool mPostChildrenLoadedReset : 1;
+
+  bool mMightNeedSecondPass : 1;
+
+  bool mReflowWasInterrupted : 1;
+};
+
+#endif /* nsListControlFrame_h_ */

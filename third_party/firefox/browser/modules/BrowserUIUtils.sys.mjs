@@ -1,0 +1,100 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+import { UrlbarPrefs } from "moz-src:///browser/components/urlbar/UrlbarPrefs.sys.mjs";
+import { XPCOMUtils } from "resource://gre/modules/XPCOMUtils.sys.mjs";
+
+export var BrowserUIUtils = {
+  checkEmptyPageOrigin(browser, uri = browser.currentURI) {
+    if (browser.hasContentOpener) {
+      return false;
+    }
+    let contentPrincipal = browser.contentPrincipal;
+    let uriToCheck = browser.documentURI || uri;
+    if (
+      (uriToCheck.spec == "about:blank" && contentPrincipal.isNullPrincipal) ||
+      contentPrincipal.spec == "about:blank"
+    ) {
+      return true;
+    }
+    if (contentPrincipal.isContentPrincipal) {
+      return contentPrincipal.equalsURI(uri);
+    }
+    return contentPrincipal.isSystemPrincipal;
+  },
+
+  getLocalizedFragment(doc, msg, ...nodesOrStrings) {
+    for (let i = 1; i <= nodesOrStrings.length; i++) {
+      if (!msg.includes("%" + i + "$S")) {
+        msg = msg.replace(/%S/, "%" + i + "$S");
+      }
+    }
+    let numberOfInsertionPoints = msg.match(/%\d+\$S/g).length;
+    if (numberOfInsertionPoints != nodesOrStrings.length) {
+      console.error(
+        `Message has ${numberOfInsertionPoints} insertion points, ` +
+          `but got ${nodesOrStrings.length} replacement parameters!`
+      );
+    }
+
+    let fragment = doc.createDocumentFragment();
+    let parts = [msg];
+    let insertionPoint = 1;
+    for (let replacement of nodesOrStrings) {
+      let insertionString = "%" + insertionPoint++ + "$S";
+      let partIndex = parts.findIndex(
+        part => typeof part == "string" && part.includes(insertionString)
+      );
+      if (partIndex == -1) {
+        fragment.appendChild(doc.createTextNode(msg));
+        return fragment;
+      }
+
+      if (typeof replacement == "string") {
+        parts[partIndex] = parts[partIndex].replace(
+          insertionString,
+          replacement
+        );
+      } else {
+        let [firstBit, lastBit] = parts[partIndex].split(insertionString);
+        parts.splice(partIndex, 1, firstBit, replacement, lastBit);
+      }
+    }
+
+    for (let part of parts) {
+      if (typeof part == "string") {
+        if (part) {
+          fragment.appendChild(doc.createTextNode(part));
+        }
+      } else {
+        fragment.appendChild(part);
+      }
+    }
+    return fragment;
+  },
+
+  removeSingleTrailingSlashFromURL(aURL) {
+    return aURL.replace(/^((?:http|https|ftp):\/\/[^/]+)\/$/, "$1");
+  },
+
+  get trimURLProtocol() {
+    return UrlbarPrefs.get("trimHttps")
+      ? "https://"
+      : "http://";
+  },
+
+  trimURL(aURL) {
+    let url = this.removeSingleTrailingSlashFromURL(aURL);
+    return url.startsWith(this.trimURLProtocol)
+      ? url.substring(this.trimURLProtocol.length)
+      : url;
+  },
+};
+
+XPCOMUtils.defineLazyPreferenceGetter(
+  BrowserUIUtils,
+  "quitShortcutDisabled",
+  "browser.quitShortcut.disabled",
+  false
+);

@@ -1,0 +1,56 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_WindowNamedPropertiesHandler_h
+#define mozilla_dom_WindowNamedPropertiesHandler_h
+
+#include "mozilla/dom/DOMJSProxyHandler.h"
+
+namespace mozilla::dom {
+
+class WindowNamedPropertiesHandler : public BaseDOMProxyHandler {
+ public:
+  constexpr WindowNamedPropertiesHandler()
+      : BaseDOMProxyHandler(nullptr,  true) {}
+  virtual bool getOwnPropDescriptor(
+      JSContext* aCx, JS::Handle<JSObject*> aProxy, JS::Handle<jsid> aId,
+      bool ,
+      JS::MutableHandle<Maybe<JS::PropertyDescriptor>> aDesc) const override;
+  virtual bool defineProperty(JSContext* aCx, JS::Handle<JSObject*> aProxy,
+                              JS::Handle<jsid> aId,
+                              JS::Handle<JS::PropertyDescriptor> aDesc,
+                              JS::ObjectOpResult& result) const override;
+  virtual bool ownPropNames(
+      JSContext* aCx, JS::Handle<JSObject*> aProxy, unsigned flags,
+      JS::MutableHandleVector<jsid> aProps) const override;
+  virtual bool delete_(JSContext* aCx, JS::Handle<JSObject*> aProxy,
+                       JS::Handle<jsid> aId,
+                       JS::ObjectOpResult& aResult) const override;
+
+
+  virtual bool preventExtensions(JSContext* aCx, JS::Handle<JSObject*> aProxy,
+                                 JS::ObjectOpResult& aResult) const override {
+    return aResult.failCantPreventExtensions();
+  }
+  virtual bool isExtensible(JSContext* aCx, JS::Handle<JSObject*> aProxy,
+                            bool* aIsExtensible) const override {
+    *aIsExtensible = true;
+    return true;
+  }
+  virtual const char* className(JSContext* aCx,
+                                JS::Handle<JSObject*> aProxy) const override {
+    return "WindowProperties";
+  }
+
+  static const WindowNamedPropertiesHandler* getInstance() {
+    static const WindowNamedPropertiesHandler instance;
+    return &instance;
+  }
+
+  static JSObject* Create(JSContext* aCx, JS::Handle<JSObject*> aProto);
+};
+
+}  
+
+#endif /* mozilla_dom_WindowNamedPropertiesHandler_h */

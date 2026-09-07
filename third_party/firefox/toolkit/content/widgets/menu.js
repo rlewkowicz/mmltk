@@ -1,0 +1,345 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+"use strict";
+
+{
+  let imports = {};
+  ChromeUtils.defineESModuleGetters(imports, {
+    ShortcutUtils: "resource://gre/modules/ShortcutUtils.sys.mjs",
+  });
+
+  const MozMenuItemBaseMixin = Base => {
+    class MozMenuItemBase extends MozElements.BaseTextMixin(Base) {
+      set value(val) {
+        this.setAttribute("value", val);
+      }
+      get value() {
+        return this.getAttribute("value") || "";
+      }
+
+      get selected() {
+        return this.hasAttribute("selected");
+      }
+
+      get control() {
+        var parent = this.parentNode;
+        if (parent && XULMenuElement.isInstance(parent.parentNode)) {
+          return parent.parentNode;
+        }
+        return null;
+      }
+
+      get parentContainer() {
+        for (var parent = this.parentNode; parent; parent = parent.parentNode) {
+          if (XULMenuElement.isInstance(parent)) {
+            return parent;
+          }
+        }
+        return null;
+      }
+    }
+    MozXULElement.implementCustomInterface(MozMenuItemBase, [
+      Ci.nsIDOMXULSelectControlItemElement,
+      Ci.nsIDOMXULContainerItemElement,
+    ]);
+    return MozMenuItemBase;
+  };
+
+  const MozMenuBaseMixin = Base => {
+    class MozMenuBase extends MozMenuItemBaseMixin(Base) {
+      set open(val) {
+        this.openMenu(val);
+      }
+
+      get open() {
+        return this.hasAttribute("open");
+      }
+
+      get itemCount() {
+        var menupopup = this.menupopup;
+        return menupopup ? menupopup.children.length : 0;
+      }
+
+      get menupopup() {
+        const XUL_NS =
+          "http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul";
+
+        for (
+          var child = this.firstElementChild;
+          child;
+          child = child.nextElementSibling
+        ) {
+          if (child.namespaceURI == XUL_NS && child.localName == "menupopup") {
+            return child;
+          }
+        }
+        return null;
+      }
+
+      appendItem(aLabel, aValue) {
+        var menupopup = this.menupopup;
+        if (!menupopup) {
+          menupopup = this.ownerDocument.createXULElement("menupopup");
+          this.appendChild(menupopup);
+        }
+
+        var menuitem = this.ownerDocument.createXULElement("menuitem");
+        menuitem.setAttribute("label", aLabel);
+        menuitem.setAttribute("value", aValue);
+
+        return menupopup.appendChild(menuitem);
+      }
+
+      getIndexOfItem(aItem) {
+        var menupopup = this.menupopup;
+        if (menupopup) {
+          var items = menupopup.children;
+          var length = items.length;
+          for (var index = 0; index < length; ++index) {
+            if (items[index] == aItem) {
+              return index;
+            }
+          }
+        }
+        return -1;
+      }
+
+      getItemAtIndex(aIndex) {
+        var menupopup = this.menupopup;
+        if (!menupopup || aIndex < 0 || aIndex >= menupopup.children.length) {
+          return null;
+        }
+
+        return menupopup.children[aIndex];
+      }
+    }
+    MozXULElement.implementCustomInterface(MozMenuBase, [
+      Ci.nsIDOMXULContainerElement,
+    ]);
+    return MozMenuBase;
+  };
+
+  class MozMenuCaption extends MozMenuBaseMixin(MozXULElement) {
+    static get inheritedAttributes() {
+      return {
+        ".menu-text": "value=label,crop",
+      };
+    }
+
+    connectedCallback() {
+      this.textContent = "";
+      this.appendChild(
+        MozXULElement.parseXULToFragment(`
+      <label class="menu-text" crop="end" aria-hidden="true"/>
+    `)
+      );
+      this.initializeAttributeInheritance();
+    }
+  }
+
+  customElements.define("menucaption", MozMenuCaption);
+
+  window.addEventListener(
+    "popupshowing",
+    e => {
+      if (e.originalTarget.ownerDocument != document) {
+        return;
+      }
+      e.originalTarget.setAttribute("hasbeenopened", "true");
+      for (let el of e.originalTarget.querySelectorAll("menuitem, menu")) {
+        el.render();
+      }
+    },
+    { capture: true }
+  );
+
+  class MozMenuItem extends MozMenuItemBaseMixin(MozXULElement) {
+    static get observedAttributes() {
+      return super.observedAttributes.concat("acceltext", "key");
+    }
+
+    attributeChangedCallback(name, oldValue, newValue) {
+      if (name == "acceltext" && this.renderedOnce) {
+        if (this._ignoreAccelTextChange) {
+          this._ignoreAccelTextChange = false;
+        } else {
+          this._accelTextIsDerived = false;
+          this._computeAccelTextFromKeyIfNeeded();
+        }
+      }
+      if (name == "key" && this.renderedOnce) {
+        this._computeAccelTextFromKeyIfNeeded();
+      }
+      super.attributeChangedCallback(name, oldValue, newValue);
+    }
+
+    static get inheritedAttributes() {
+      return {
+        ".menu-text": "value=label,crop,accesskey",
+        ".menu-highlightable-text": "text=label,crop,accesskey",
+        ".menu-icon": "srcset=image",
+        ".menu-accel": "value=acceltext",
+      };
+    }
+
+    static get fragment() {
+      let frag = document.importNode(
+        MozXULElement.parseXULToFragment(`
+      <html:img loading="lazy" class="menu-icon" aria-hidden="true"/>
+      <label class="menu-text" crop="end" aria-hidden="true"/>
+      <label class="menu-highlightable-text" crop="end" aria-hidden="true"/>
+      <label class="menu-accel" aria-hidden="true"/>
+    `),
+        true
+      );
+      Object.defineProperty(this, "fragment", { value: frag });
+      return frag;
+    }
+
+    get isMenulistChild() {
+      return this.matches("menulist > menupopup > menuitem");
+    }
+
+    get isInHiddenMenupopup() {
+      return this.matches("menupopup:not([hasbeenopened]) menuitem");
+    }
+
+    _computeAccelTextFromKeyIfNeeded() {
+      if (!this._accelTextIsDerived && this.getAttribute("acceltext")) {
+        return;
+      }
+      let accelText = (() => {
+        if (!document.contains(this)) {
+          return null;
+        }
+        let keyId = this.getAttribute("key");
+        if (!keyId) {
+          return null;
+        }
+        let key = document.getElementById(keyId);
+        if (!key) {
+          let msg =
+            `Key ${keyId} of menuitem ${this.getAttribute("label")} ` +
+            `could not be found`;
+          if (keyId.startsWith("ext-key-id-")) {
+            console.info(msg);
+          } else {
+            console.error(msg);
+          }
+          return null;
+        }
+        return imports.ShortcutUtils.prettifyShortcut(key);
+      })();
+
+      this._accelTextIsDerived = true;
+      this._ignoreAccelTextChange = true;
+      if (accelText) {
+        this.setAttribute("acceltext", accelText);
+      } else {
+        this.removeAttribute("acceltext");
+      }
+    }
+
+    render() {
+      if (this.renderedOnce) {
+        return;
+      }
+      this.renderedOnce = true;
+      this.textContent = "";
+      this.append(this.constructor.fragment.cloneNode(true));
+
+      this._computeAccelTextFromKeyIfNeeded();
+      this.initializeAttributeInheritance();
+    }
+
+    connectedCallback() {
+      if (this.renderedOnce) {
+        this._computeAccelTextFromKeyIfNeeded();
+      }
+      if (
+        this.isMenulistChild ||
+        (this.isConnectedAndReady && !this.isInHiddenMenupopup)
+      ) {
+        this.render();
+      }
+    }
+  }
+
+  customElements.define("menuitem", MozMenuItem);
+
+  const isHiddenWindow =
+    document.documentURI == "chrome://browser/content/hiddenWindowMac.xhtml";
+
+  class MozMenu extends MozMenuBaseMixin(
+    MozElements.MozElementMixin(XULMenuElement)
+  ) {
+    static get inheritedAttributes() {
+      return {
+        ".menu-text": "value=label,accesskey,crop",
+        ".menu-icon": "srcset=image",
+        ".menu-accel": "value=acceltext",
+      };
+    }
+
+    get needsEagerRender() {
+      return (
+        this.isMenubarChild || this.isMenulistChild || !this.isInHiddenMenupopup
+      );
+    }
+
+    get isMenubarChild() {
+      return this.matches("menubar > menu");
+    }
+
+    get isMenulistChild() {
+      return this.matches("menulist > menupopup > menu");
+    }
+
+    get isInHiddenMenupopup() {
+      return this.matches("menupopup:not([hasbeenopened]) menu");
+    }
+
+    get fragment() {
+      let frag = document.importNode(
+        MozXULElement.parseXULToFragment(`
+      <html:img loading="lazy" class="menu-icon" aria-hidden="true"/>
+      <label class="menu-text" flex="1" crop="end" aria-hidden="true"/>
+      <label class="menu-accel" aria-hidden="true"/>
+    `),
+        true
+      );
+      Object.defineProperty(this, "fragment", { value: frag });
+      return frag;
+    }
+
+    render() {
+      if (this.renderedOnce) {
+        return;
+      }
+      this.renderedOnce = true;
+
+      this.prepend(this.fragment);
+      this.initializeAttributeInheritance();
+    }
+
+    connectedCallback() {
+      if (isHiddenWindow) {
+        return;
+      }
+
+      if (this.delayConnectedCallback()) {
+        return;
+      }
+
+      if (!this.needsEagerRender) {
+        return;
+      }
+
+      this.render();
+    }
+  }
+
+  customElements.define("menu", MozMenu);
+}

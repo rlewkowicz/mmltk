@@ -1,0 +1,227 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "FormatZlib.h"
+
+#include "BaseAlgorithms.h"
+#include "mozilla/dom/CompressionStreamBinding.h"
+#include "mozilla/dom/TransformStreamDefaultController.h"
+
+namespace mozilla::dom::compression {
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED(ZLibCompressionStreamAlgorithms,
+                                   TransformerAlgorithmsBase)
+NS_IMPL_ADDREF_INHERITED(ZLibCompressionStreamAlgorithms,
+                         TransformerAlgorithmsBase)
+NS_IMPL_RELEASE_INHERITED(ZLibCompressionStreamAlgorithms,
+                          TransformerAlgorithmsBase)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(ZLibCompressionStreamAlgorithms)
+NS_INTERFACE_MAP_END_INHERITING(TransformerAlgorithmsBase)
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED(ZLibDecompressionStreamAlgorithms,
+                                   TransformerAlgorithmsBase)
+NS_IMPL_ADDREF_INHERITED(ZLibDecompressionStreamAlgorithms,
+                         TransformerAlgorithmsBase)
+NS_IMPL_RELEASE_INHERITED(ZLibDecompressionStreamAlgorithms,
+                          TransformerAlgorithmsBase)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(ZLibDecompressionStreamAlgorithms)
+NS_INTERFACE_MAP_END_INHERITING(TransformerAlgorithmsBase)
+
+inline uint8_t intoZLibFlush(Flush aFlush) {
+  switch (aFlush) {
+    case Flush::No: {
+      return Z_NO_FLUSH;
+    }
+    case Flush::Yes: {
+      return Z_FINISH;
+    }
+    default: {
+      MOZ_ASSERT_UNREACHABLE("Unknown flush mode");
+      return Z_NO_FLUSH;
+    }
+  }
+}
+
+inline int8_t ZLibWindowBits(CompressionFormat format) {
+  switch (format) {
+    case CompressionFormat::Deflate:
+      return 15;
+    case CompressionFormat::Deflate_raw:
+      return -15;
+    case CompressionFormat::Gzip:
+      return 31;
+    default:
+      MOZ_ASSERT_UNREACHABLE("Unknown compression format");
+      return 0;
+  }
+}
+
+Result<already_AddRefed<ZLibCompressionStreamAlgorithms>, nsresult>
+ZLibCompressionStreamAlgorithms::Create(CompressionFormat format) {
+  RefPtr<ZLibCompressionStreamAlgorithms> alg =
+      new ZLibCompressionStreamAlgorithms();
+  MOZ_TRY(alg->Init(format));
+  return alg.forget();
+}
+
+[[nodiscard]] nsresult ZLibCompressionStreamAlgorithms::Init(
+    CompressionFormat format) {
+  int8_t err = deflateInit2(&mZStream, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
+                            ZLibWindowBits(format), 8 ,
+                            Z_DEFAULT_STRATEGY);
+  if (err == Z_MEM_ERROR) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+  MOZ_ASSERT(err == Z_OK);
+  return NS_OK;
+}
+
+void ZLibCompressionStreamAlgorithms::Compress(
+    JSContext* aCx, Span<const uint8_t> aInput,
+    JS::MutableHandleVector<JSObject*> aOutput, Flush aFlush,
+    ErrorResult& aRv) {
+  mZStream.avail_in = aInput.Length();
+  mZStream.next_in = const_cast<uint8_t*>(aInput.Elements());
+
+  do {
+    static uint16_t kBufferSize = 16384;
+    UniquePtr<uint8_t[], JS::FreePolicy> buffer(
+        static_cast<uint8_t*>(JS_malloc(aCx, kBufferSize)));
+    if (!buffer) {
+      aRv.ThrowTypeError("Out of memory");
+      return;
+    }
+
+    mZStream.avail_out = kBufferSize;
+    mZStream.next_out = buffer.get();
+
+    int8_t err = deflate(&mZStream, intoZLibFlush(aFlush));
+
+    switch (err) {
+      case Z_OK:
+      case Z_STREAM_END:
+      case Z_BUF_ERROR:
+        break;
+      case Z_STREAM_ERROR:
+      default:
+        MOZ_ASSERT_UNREACHABLE("Unexpected compression error code");
+        aRv.ThrowTypeError("Unexpected compression error");
+        return;
+    }
+
+    MOZ_ASSERT_IF(err == Z_STREAM_END, aFlush == Flush::Yes);
+
+    MOZ_ASSERT(!mZStream.avail_in || !mZStream.avail_out);
+
+    size_t written = kBufferSize - mZStream.avail_out;
+    if (!written) {
+      break;
+    }
+
+
+
+    JS::Rooted<JSObject*> view(aCx, nsJSUtils::MoveBufferAsUint8Array(
+                                        aCx, written, std::move(buffer)));
+    if (!view || !aOutput.append(view)) {
+      JS_ClearPendingException(aCx);
+      aRv.ThrowTypeError("Out of memory");
+      return;
+    }
+  } while (mZStream.avail_out == 0);
+}
+
+ZLibCompressionStreamAlgorithms::~ZLibCompressionStreamAlgorithms() {
+  deflateEnd(&mZStream);
+};
+
+Result<already_AddRefed<ZLibDecompressionStreamAlgorithms>, nsresult>
+ZLibDecompressionStreamAlgorithms::Create(CompressionFormat format) {
+  RefPtr<ZLibDecompressionStreamAlgorithms> alg =
+      new ZLibDecompressionStreamAlgorithms();
+  MOZ_TRY(alg->Init(format));
+  return alg.forget();
+}
+
+[[nodiscard]] nsresult ZLibDecompressionStreamAlgorithms::Init(
+    CompressionFormat format) {
+  int8_t err = inflateInit2(&mZStream, ZLibWindowBits(format));
+  if (err == Z_MEM_ERROR) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+  MOZ_ASSERT(err == Z_OK);
+  return NS_OK;
+}
+
+bool ZLibDecompressionStreamAlgorithms::Decompress(
+    JSContext* aCx, Span<const uint8_t> aInput,
+    JS::MutableHandleVector<JSObject*> aOutput, Flush aFlush,
+    ErrorResult& aRv) {
+  mZStream.avail_in = aInput.Length();
+  mZStream.next_in = const_cast<uint8_t*>(aInput.Elements());
+
+  do {
+    UniquePtr<uint8_t[], JS::FreePolicy> buffer(
+        static_cast<uint8_t*>(JS_malloc(aCx, kBufferSize)));
+    if (!buffer) {
+      aRv.ThrowTypeError("Out of memory");
+      return false;
+    }
+
+    mZStream.avail_out = kBufferSize;
+    mZStream.next_out = buffer.get();
+
+    int8_t err = inflate(&mZStream, intoZLibFlush(aFlush));
+
+    switch (err) {
+      case Z_DATA_ERROR:
+        aRv.ThrowTypeError("The input data is corrupted: "_ns +
+                           nsDependentCString(mZStream.msg));
+        return false;
+      case Z_MEM_ERROR:
+        aRv.ThrowTypeError("Out of memory");
+        return false;
+      case Z_NEED_DICT:
+        aRv.ThrowTypeError(
+            "The stream needs a preset dictionary but such setup is "
+            "unsupported");
+        return false;
+      case Z_STREAM_END:
+        mObservedStreamEnd = true;
+        break;
+      case Z_OK:
+      case Z_BUF_ERROR:
+        break;
+      case Z_STREAM_ERROR:
+      default:
+        MOZ_ASSERT_UNREACHABLE("Unexpected decompression error code");
+        aRv.ThrowTypeError("Unexpected decompression error");
+        return false;
+    }
+
+    MOZ_ASSERT(!mZStream.avail_in || !mZStream.avail_out || mObservedStreamEnd);
+
+    size_t written = kBufferSize - mZStream.avail_out;
+    if (!written) {
+      break;
+    }
+
+
+
+    JS::Rooted<JSObject*> view(aCx, nsJSUtils::MoveBufferAsUint8Array(
+                                        aCx, written, std::move(buffer)));
+    if (!view || !aOutput.append(view)) {
+      JS_ClearPendingException(aCx);
+      aRv.ThrowTypeError("Out of memory");
+      return false;
+    }
+  } while (mZStream.avail_out == 0 && !mObservedStreamEnd);
+
+  return mZStream.avail_in == 0;
+}
+
+ZLibDecompressionStreamAlgorithms::~ZLibDecompressionStreamAlgorithms() {
+  inflateEnd(&mZStream);
+}
+
+}  

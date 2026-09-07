@@ -1,0 +1,88 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+ *******************************************************************************
+ * Copyright (C) 2014-2016, International Business Machines Corporation and others.
+ * All Rights Reserved.
+ *******************************************************************************
+ */
+
+#ifndef REGION_H
+#define REGION_H
+
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/uregion.h"
+#include "unicode/uobject.h"
+#include "unicode/uniset.h"
+#include "unicode/unistr.h"
+#include "unicode/strenum.h"
+
+U_NAMESPACE_BEGIN
+
+
+class U_I18N_API Region : public UObject {
+public:
+    virtual ~Region();
+
+    bool operator==(const Region &that) const;
+
+    bool operator!=(const Region &that) const;
+ 
+    static const Region* U_EXPORT2 getInstance(const char *region_code, UErrorCode &status);
+
+    static const Region* U_EXPORT2 getInstance (int32_t code, UErrorCode &status);
+
+    static StringEnumeration* U_EXPORT2 getAvailable(URegionType type, UErrorCode &status);
+   
+    const Region* getContainingRegion() const;
+
+    const Region* getContainingRegion(URegionType type) const;
+
+    StringEnumeration* getContainedRegions(UErrorCode &status) const;
+
+    StringEnumeration* getContainedRegions( URegionType type, UErrorCode &status ) const;
+ 
+    UBool contains(const Region &other) const;
+
+    StringEnumeration* getPreferredValues(UErrorCode &status) const;
+
+    const char* getRegionCode() const;
+
+    int32_t getNumericCode() const;
+
+    URegionType getType() const;
+
+#ifndef U_HIDE_INTERNAL_API
+    static void cleanupRegionData();
+#endif  /* U_HIDE_INTERNAL_API */
+
+private:
+    char id[4];
+    UnicodeString idStr;
+    int32_t code;
+    URegionType fType;
+    Region *containingRegion;
+    UVector *containedRegions;
+    UVector *preferredValues;
+
+    Region();
+
+
+
+    static void U_CALLCONV loadRegionData(UErrorCode &status);
+
+};
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif // REGION_H
+

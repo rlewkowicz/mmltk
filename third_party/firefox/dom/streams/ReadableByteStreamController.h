@@ -1,0 +1,143 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_ReadableByteStreamController_h
+#define mozilla_dom_ReadableByteStreamController_h
+
+#include <cstddef>
+
+#include "UnderlyingSourceCallbackHelpers.h"
+#include "js/RootingAPI.h"
+#include "js/TypeDecls.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/Nullable.h"
+#include "mozilla/dom/QueueWithSizes.h"
+#include "mozilla/dom/QueuingStrategyBinding.h"
+#include "mozilla/dom/ReadRequest.h"
+#include "mozilla/dom/ReadableStream.h"
+#include "mozilla/dom/ReadableStreamBYOBRequest.h"
+#include "mozilla/dom/ReadableStreamControllerBase.h"
+#include "mozilla/dom/TypedArray.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsISupportsImpl.h"
+#include "nsTArray.h"
+#include "nsWrapperCache.h"
+
+namespace mozilla::dom {
+
+enum ReaderType { Default, BYOB, None };
+
+struct PullIntoDescriptor;
+struct ReadableByteStreamQueueEntry;
+struct ReadIntoRequest;
+
+class ReadableByteStreamController final : public ReadableStreamControllerBase,
+                                           public nsWrapperCache {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_CLASS_INHERITED(
+      ReadableByteStreamController, ReadableStreamControllerBase)
+
+ public:
+  explicit ReadableByteStreamController(nsIGlobalObject* aGlobal);
+
+ protected:
+  ~ReadableByteStreamController() override;
+
+ public:
+  bool IsDefault() override { return false; }
+  bool IsByte() override { return true; }
+  ReadableStreamDefaultController* AsDefault() override { return nullptr; }
+  ReadableByteStreamController* AsByte() override { return this; }
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  already_AddRefed<ReadableStreamBYOBRequest> GetByobRequest(JSContext* aCx,
+                                                             ErrorResult& aRv);
+
+  Nullable<double> GetDesiredSize() const;
+
+  MOZ_CAN_RUN_SCRIPT void Close(JSContext* aCx, ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT void Enqueue(JSContext* aCx, const ArrayBufferView& aChunk,
+                                  ErrorResult& aRv);
+
+  void Error(JSContext* aCx, JS::Handle<JS::Value> aErrorValue,
+             ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT already_AddRefed<Promise> CancelSteps(
+      JSContext* aCx, JS::Handle<JS::Value> aReason, ErrorResult& aRv) override;
+  MOZ_CAN_RUN_SCRIPT void PullSteps(JSContext* aCx, ReadRequest* aReadRequest,
+                                    ErrorResult& aRv) override;
+  void ReleaseSteps() override;
+
+  Maybe<uint64_t> AutoAllocateChunkSize() { return mAutoAllocateChunkSize; }
+  void SetAutoAllocateChunkSize(Maybe<uint64_t>& aSize) {
+    mAutoAllocateChunkSize = aSize;
+  }
+
+  ReadableStreamBYOBRequest* GetByobRequest() const { return mByobRequest; }
+  void SetByobRequest(ReadableStreamBYOBRequest* aByobRequest) {
+    mByobRequest = aByobRequest;
+  }
+
+  LinkedList<RefPtr<PullIntoDescriptor>>& PendingPullIntos() {
+    return mPendingPullIntos;
+  }
+  void ClearPendingPullIntos();
+
+  double QueueTotalSize() const { return mQueueTotalSize; }
+  void SetQueueTotalSize(double aQueueTotalSize) {
+    mQueueTotalSize = aQueueTotalSize;
+  }
+  void AddToQueueTotalSize(double aLength) { mQueueTotalSize += aLength; }
+
+  double StrategyHWM() const { return mStrategyHWM; }
+  void SetStrategyHWM(double aStrategyHWM) { mStrategyHWM = aStrategyHWM; }
+
+  bool CloseRequested() const { return mCloseRequested; }
+  void SetCloseRequested(bool aCloseRequested) {
+    mCloseRequested = aCloseRequested;
+  }
+
+  LinkedList<RefPtr<ReadableByteStreamQueueEntry>>& Queue() { return mQueue; }
+  void ClearQueue();
+
+  bool Started() const { return mStarted; }
+  void SetStarted(bool aStarted) { mStarted = aStarted; }
+
+  bool Pulling() const { return mPulling; }
+  void SetPulling(bool aPulling) { mPulling = aPulling; }
+
+  bool PullAgain() const { return mPullAgain; }
+  void SetPullAgain(bool aPullAgain) { mPullAgain = aPullAgain; }
+
+ private:
+  bool mCloseRequested = false;
+
+  bool mPullAgain = false;
+
+  bool mStarted = false;
+
+  bool mPulling = false;
+
+  Maybe<uint64_t> mAutoAllocateChunkSize;
+
+  RefPtr<ReadableStreamBYOBRequest> mByobRequest;
+
+  LinkedList<RefPtr<PullIntoDescriptor>> mPendingPullIntos;
+
+  LinkedList<RefPtr<ReadableByteStreamQueueEntry>> mQueue;
+
+  double mQueueTotalSize = 0.0;
+
+  double mStrategyHWM = 0.0;
+};
+
+}  
+
+#endif

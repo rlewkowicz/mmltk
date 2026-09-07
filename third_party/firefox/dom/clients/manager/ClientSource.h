@@ -1,0 +1,158 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#if !defined(_mozilla_dom_ClientSource_h)
+#define _mozilla_dom_ClientSource_h
+
+#include "mozilla/ResultVariant.h"
+#include "mozilla/Variant.h"
+#include "mozilla/dom/ClientInfo.h"
+#include "mozilla/dom/ClientOpPromise.h"
+#include "mozilla/dom/ClientThing.h"
+#include "mozilla/dom/ServiceWorkerDescriptor.h"
+
+
+class nsIContentSecurityPolicy;
+class nsIPolicyContainer;
+class nsIDocShell;
+class nsIGlobalObject;
+class nsISerialEventTarget;
+class nsPIDOMWindowInner;
+
+namespace mozilla {
+class ErrorResult;
+
+namespace dom {
+
+class ClientControlledArgs;
+class ClientFocusArgs;
+class ClientGetInfoAndStateArgs;
+class ClientManager;
+class ClientPostMessageArgs;
+class ClientSourceChild;
+class ClientSourceConstructorArgs;
+class ClientSourceExecutionReadyArgs;
+class ClientState;
+class ClientWindowState;
+class PClientManagerChild;
+class WorkerPrivate;
+
+class ClientSource final : public ClientThing<ClientSourceChild> {
+  friend class ClientManager;
+
+  NS_DECL_OWNINGTHREAD
+
+  RefPtr<ClientManager> mManager;
+  nsCOMPtr<nsISerialEventTarget> mEventTarget;
+
+  Variant<Nothing, RefPtr<nsPIDOMWindowInner>, nsCOMPtr<nsIDocShell>,
+          WorkerPrivate*>
+      mOwner;
+
+  ClientInfo mClientInfo;
+  Maybe<ServiceWorkerDescriptor> mController;
+  Maybe<nsCOMPtr<nsIPrincipal>> mPrincipal;
+
+  AutoTArray<nsCString, 1> mRegisteringScopeList;
+
+  void Shutdown();
+
+  void ExecutionReady(const ClientSourceExecutionReadyArgs& aArgs);
+
+  WorkerPrivate* GetWorkerPrivate() const;
+
+  nsIDocShell* GetDocShell() const;
+
+  nsIGlobalObject* GetGlobal() const;
+
+  Result<bool, ErrorResult> MaybeCreateInitialDocument();
+
+  Result<ClientState, ErrorResult> SnapshotWindowState();
+
+  ClientSource(ClientManager* aManager, nsISerialEventTarget* aEventTarget,
+               const ClientSourceConstructorArgs& aArgs);
+
+  void Activate(PClientManagerChild* aActor);
+
+ public:
+  ~ClientSource();
+
+  nsPIDOMWindowInner* GetInnerWindow() const;
+
+  void WorkerExecutionReady(WorkerPrivate* aWorkerPrivate);
+
+  nsresult WindowExecutionReady(nsPIDOMWindowInner* aInnerWindow);
+
+  nsresult DocShellExecutionReady(nsIDocShell* aDocShell);
+
+  void Freeze();
+
+  void Thaw();
+
+  void EvictFromBFCache();
+
+  RefPtr<ClientOpPromise> EvictFromBFCacheOp();
+
+  const ClientInfo& Info() const;
+
+  void WorkerSyncPing(WorkerPrivate* aWorkerPrivate);
+
+  void SetController(const ServiceWorkerDescriptor& aServiceWorker);
+
+  RefPtr<ClientOpPromise> Control(const ClientControlledArgs& aArgs);
+
+  void InheritController(const ServiceWorkerDescriptor& aServiceWorker);
+
+  const Maybe<ServiceWorkerDescriptor>& GetController() const;
+
+  void NoteDOMContentLoaded();
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY RefPtr<ClientOpPromise> Focus(
+      const ClientFocusArgs& aArgs);
+
+  RefPtr<ClientOpPromise> PostMessage(const ClientPostMessageArgs& aArgs);
+
+  RefPtr<ClientOpPromise> GetInfoAndState(
+      const ClientGetInfoAndStateArgs& aArgs);
+
+  Result<ClientState, ErrorResult> SnapshotState();
+
+  nsISerialEventTarget* EventTarget() const;
+
+  void SetPreloadCsp(nsIContentSecurityPolicy* aPreloadCSP);
+
+  void SetPolicyContainer(nsIPolicyContainer* aPolicyContainer);
+  void SetPolicyContainerArgs(
+      const mozilla::ipc::PolicyContainerArgs& aPolicyContainer);
+  const Maybe<mozilla::ipc::PolicyContainerArgs>& GetPolicyContainerArgs();
+
+  void SetAgentClusterId(const nsID& aId) {
+    mClientInfo.SetAgentClusterId(aId);
+  }
+
+  void Traverse(nsCycleCollectionTraversalCallback& aCallback,
+                const char* aName, uint32_t aFlags);
+
+  void NoteCalledRegisterForServiceWorkerScope(const nsACString& aScope);
+
+  bool CalledRegisterForServiceWorkerScope(const nsACString& aScope);
+
+  nsIPrincipal* GetPrincipal();
+};
+
+inline void ImplCycleCollectionUnlink(UniquePtr<ClientSource>& aField) {
+  aField.reset();
+}
+
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback,
+    UniquePtr<ClientSource>& aField, const char* aName, uint32_t aFlags) {
+  if (aField) {
+    aField->Traverse(aCallback, aName, aFlags);
+  }
+}
+
+}  
+}  
+
+#endif

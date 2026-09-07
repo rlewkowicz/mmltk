@@ -1,0 +1,208 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_image_SurfaceCache_h
+#define mozilla_image_SurfaceCache_h
+
+#include "ImageRegion.h"
+#include "PlaybackType.h"
+#include "SurfaceFlags.h"
+#include "gfx2DGlue.h"
+#include "gfxPoint.h"                 // for gfxSize
+#include "mozilla/HashFunctions.h"    // for HashGeneric and AddToHash
+#include "mozilla/Maybe.h"            // for Maybe
+#include "mozilla/MemoryReporting.h"  // for MallocSizeOf
+#include "mozilla/NotNull.h"
+#include "mozilla/SVGImageContext.h"  // for SVGImageContext
+#include "mozilla/gfx/2D.h"           // for SourceSurface
+#include "mozilla/gfx/Point.h"        // for mozilla::gfx::IntSize
+#include "nsCOMPtr.h"                 // for already_AddRefed
+
+namespace mozilla {
+namespace image {
+
+class ImageResource;
+class ISurfaceProvider;
+class LookupResult;
+class SurfaceCacheImpl;
+struct SurfaceMemoryCounter;
+
+using ImageKey = ImageResource*;
+
+class SurfaceKey {
+  typedef gfx::IntSize IntSize;
+
+ public:
+  bool operator==(const SurfaceKey& aOther) const {
+    return aOther.mSize == mSize && aOther.mRegion == mRegion &&
+           aOther.mSVGContext == mSVGContext && aOther.mPlayback == mPlayback &&
+           aOther.mFlags == mFlags;
+  }
+
+  PLDHashNumber Hash() const {
+    PLDHashNumber hash = HashGeneric(mSize.width, mSize.height);
+    hash = AddToHash(hash, mRegion.map(HashIIR).valueOr(0));
+    hash = AddToHash(hash, HashSIC(mSVGContext));
+    hash = AddToHash(hash, uint8_t(mPlayback), uint32_t(mFlags));
+    return hash;
+  }
+
+  SurfaceKey CloneWithSize(const IntSize& aSize) const {
+    return SurfaceKey(aSize, mRegion, mSVGContext, mPlayback, mFlags);
+  }
+
+  const IntSize& Size() const { return mSize; }
+  const Maybe<ImageIntRegion>& Region() const { return mRegion; }
+  const SVGImageContext& SVGContext() const { return mSVGContext; }
+  PlaybackType Playback() const { return mPlayback; }
+  SurfaceFlags Flags() const { return mFlags; }
+
+ private:
+  SurfaceKey(const IntSize& aSize, const Maybe<ImageIntRegion>& aRegion,
+             const SVGImageContext& aSVGContext, PlaybackType aPlayback,
+             SurfaceFlags aFlags)
+      : mSize(aSize),
+        mRegion(aRegion),
+        mSVGContext(aSVGContext),
+        mPlayback(aPlayback),
+        mFlags(aFlags) {}
+
+  static PLDHashNumber HashIIR(const ImageIntRegion& aIIR) {
+    return aIIR.Hash();
+  }
+
+  static PLDHashNumber HashSIC(const SVGImageContext& aSIC) {
+    return aSIC.Hash();
+  }
+
+  friend SurfaceKey RasterSurfaceKey(const IntSize&, SurfaceFlags,
+                                     PlaybackType);
+  friend SurfaceKey VectorSurfaceKey(const IntSize&, const SVGImageContext&);
+  friend SurfaceKey VectorSurfaceKey(const IntSize&,
+                                     const Maybe<ImageIntRegion>&,
+                                     const SVGImageContext&, SurfaceFlags,
+                                     PlaybackType);
+
+  IntSize mSize;
+  Maybe<ImageIntRegion> mRegion;
+  SVGImageContext mSVGContext;
+  PlaybackType mPlayback;
+  SurfaceFlags mFlags;
+};
+
+inline SurfaceKey RasterSurfaceKey(const gfx::IntSize& aSize,
+                                   SurfaceFlags aFlags,
+                                   PlaybackType aPlayback) {
+  return SurfaceKey(aSize, Nothing(), SVGImageContext(), aPlayback, aFlags);
+}
+
+inline SurfaceKey VectorSurfaceKey(const gfx::IntSize& aSize,
+                                   const Maybe<ImageIntRegion>& aRegion,
+                                   const SVGImageContext& aSVGContext,
+                                   SurfaceFlags aFlags,
+                                   PlaybackType aPlayback) {
+  return SurfaceKey(aSize, aRegion, aSVGContext, aPlayback, aFlags);
+}
+
+inline SurfaceKey VectorSurfaceKey(const gfx::IntSize& aSize,
+                                   const SVGImageContext& aSVGContext) {
+  return SurfaceKey(aSize, Nothing(), aSVGContext, PlaybackType::eStatic,
+                    DefaultSurfaceFlags());
+}
+
+class AvailabilityState {
+ public:
+  static AvailabilityState StartAvailable() { return AvailabilityState(true); }
+  static AvailabilityState StartAsPlaceholder() {
+    return AvailabilityState(false);
+  }
+
+  bool IsAvailable() const { return mIsAvailable; }
+  bool IsPlaceholder() const { return !mIsAvailable; }
+  bool CannotSubstitute() const { return mCannotSubstitute; }
+
+  void SetCannotSubstitute() { mCannotSubstitute = true; }
+
+ private:
+  friend class SurfaceCacheImpl;
+
+  explicit AvailabilityState(bool aIsAvailable)
+      : mIsAvailable(aIsAvailable), mCannotSubstitute(false) {}
+
+  void SetAvailable() { mIsAvailable = true; }
+
+  bool mIsAvailable : 1;
+  bool mCannotSubstitute : 1;
+};
+
+enum class InsertOutcome : uint8_t {
+  SUCCESS,                 
+  FAILURE,                 
+  FAILURE_ALREADY_PRESENT  
+};
+
+struct SurfaceCache {
+  typedef gfx::IntSize IntSize;
+
+  static void Initialize();
+
+  static void Shutdown();
+
+  static LookupResult Lookup(const ImageKey aImageKey,
+                             const SurfaceKey& aSurfaceKey, bool aMarkUsed);
+
+  static LookupResult LookupBestMatch(const ImageKey aImageKey,
+                                      const SurfaceKey& aSurfaceKey,
+                                      bool aMarkUsed);
+
+  static InsertOutcome Insert(NotNull<ISurfaceProvider*> aProvider);
+
+  static void SurfaceAvailable(NotNull<ISurfaceProvider*> aProvider);
+
+  static bool CanHold(const IntSize& aSize, uint32_t aBytesPerPixel = 4);
+  static bool CanHold(size_t aSize);
+
+  static void LockImage(const ImageKey aImageKey);
+
+  static void UnlockImage(const ImageKey aImageKey);
+
+  static void UnlockEntries(const ImageKey aImageKey);
+
+  static void RemoveImage(const ImageKey aImageKey);
+
+  static void PruneImage(const ImageKey aImageKey);
+
+  static bool InvalidateImage(const ImageKey aImageKey);
+
+  static void DiscardAll();
+
+  static void ResetAnimation(const ImageKey aImageKey,
+                             const SurfaceKey& aSurfaceKey);
+
+  static void CollectSizeOfSurfaces(const ImageKey aImageKey,
+                                    nsTArray<SurfaceMemoryCounter>& aCounters,
+                                    MallocSizeOf aMallocSizeOf);
+
+  static size_t MaximumCapacity();
+
+  static bool IsLegalSize(const IntSize& aSize);
+
+  static IntSize ClampVectorSize(const IntSize& aSize);
+
+  static IntSize ClampSize(const ImageKey aImageKey, const IntSize& aSize);
+
+  static void ReleaseImageOnMainThread(already_AddRefed<image::Image> aImage,
+                                       bool aAlwaysProxy = false);
+
+  static void ClearReleasingImages();
+
+ private:
+  virtual ~SurfaceCache() = 0;  
+};
+
+}  
+}  
+
+#endif  // mozilla_image_SurfaceCache_h

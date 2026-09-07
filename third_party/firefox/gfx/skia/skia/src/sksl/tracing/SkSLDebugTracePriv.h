@@ -1,0 +1,85 @@
+/*
+ * Copyright 2021 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SKSLDEBUGTRACEPRIV)
+#define SKSLDEBUGTRACEPRIV
+
+#include "include/core/SkPoint.h"
+#include "include/sksl/SkSLDebugTrace.h"
+#include "src/sksl/SkSLPosition.h"
+#include "src/sksl/ir/SkSLType.h"
+#include "src/sksl/tracing/SkSLTraceHook.h"
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
+
+class SkWStream;
+
+namespace SkSL {
+
+struct TraceInfo {
+    enum class Op {
+        kLine,  
+        kVar,   
+        kEnter, 
+        kExit,  
+        kScope, 
+    };
+    Op op;
+    int32_t data[2];
+};
+
+struct SlotDebugInfo {
+    std::string             name;
+    uint8_t                 columns = 1, rows = 1;
+    uint8_t                 componentIndex = 0;
+    int                     groupIndex = 0;
+    SkSL::Type::NumberKind  numberKind = SkSL::Type::NumberKind::kNonnumeric;
+    int                     line = 0;
+    Position                pos = {};
+    int                     fnReturnValue = -1;
+};
+
+struct FunctionDebugInfo {
+    std::string             name;
+};
+
+class DebugTracePriv : public DebugTrace {
+public:
+    void setTraceCoord(const SkIPoint& coord);
+
+    void setSource(const std::string& source);
+
+    void dump(SkWStream* o) const override;
+
+    std::string getSlotComponentSuffix(int slotIndex) const;
+
+    std::string getSlotValue(int slotIndex, int32_t value) const;
+
+    double interpretValueBits(int slotIndex, int32_t valueBits) const;
+
+    std::string slotValueToString(int slotIndex, double value) const;
+
+    SkIPoint fTraceCoord = {};
+
+    std::vector<SlotDebugInfo> fUniformInfo;
+
+    std::vector<SlotDebugInfo> fSlotInfo;
+    std::vector<FunctionDebugInfo> fFuncInfo;
+
+    std::vector<TraceInfo> fTraceInfo;
+
+    std::vector<std::string> fSource;
+
+    std::unique_ptr<SkSL::TraceHook> fTraceHook;
+};
+
+}  
+
+#endif

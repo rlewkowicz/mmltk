@@ -1,0 +1,225 @@
+// Copyright 2002 The ANGLE Project Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include "ValidateVaryingLocations.h"
+
+#include "compiler/translator/Diagnostics.h"
+#include "compiler/translator/SymbolTable.h"
+#include "compiler/translator/tree_util/IntermTraverse.h"
+#include "compiler/translator/util.h"
+
+namespace sh
+{
+
+namespace
+{
+
+int GetStructLocationCount(const TStructure *structure);
+
+int GetFieldLocationCount(const TField *field)
+{
+    int field_size         = 0;
+    const TType *fieldType = field->type();
+
+    if (fieldType->getStruct() != nullptr)
+    {
+        field_size = GetStructLocationCount(fieldType->getStruct());
+    }
+    else if (fieldType->isMatrix())
+    {
+        field_size = fieldType->getNominalSize();
+    }
+    else
+    {
+        ASSERT(fieldType->getSecondarySize() == 1);
+        field_size = 1;
+    }
+
+    if (fieldType->isArray())
+    {
+        field_size *= fieldType->getArraySizeProduct();
+    }
+
+    return field_size;
+}
+
+int GetStructLocationCount(const TStructure *structure)
+{
+    int totalLocation = 0;
+    for (const TField *field : structure->fields())
+    {
+        totalLocation += GetFieldLocationCount(field);
+    }
+    return totalLocation;
+}
+
+int GetInterfaceBlockLocationCount(const TType &varyingType, bool ignoreVaryingArraySize)
+{
+    int totalLocation = 0;
+    for (const TField *field : varyingType.getInterfaceBlock()->fields())
+    {
+        totalLocation += GetFieldLocationCount(field);
+    }
+
+    if (!ignoreVaryingArraySize && varyingType.isArray())
+    {
+        totalLocation *= varyingType.getArraySizeProduct();
+    }
+    return totalLocation;
+}
+
+int GetLocationCount(const TType &varyingType, bool ignoreVaryingArraySize)
+{
+    ASSERT(!varyingType.isInterfaceBlock());
+
+    if (varyingType.getStruct() != nullptr)
+    {
+        int totalLocation = 0;
+        for (const TField *field : varyingType.getStruct()->fields())
+        {
+            const TType *fieldType = field->type();
+            ASSERT(fieldType->getStruct() == nullptr && !fieldType->isArray());
+
+            totalLocation += GetFieldLocationCount(field);
+        }
+        return totalLocation;
+    }
+
+    ASSERT(varyingType.isMatrix() || varyingType.getSecondarySize() == 1);
+    int elementLocationCount = varyingType.isMatrix() ? varyingType.getNominalSize() : 1;
+
+    if (ignoreVaryingArraySize)
+    {
+        ASSERT(!varyingType.isArrayOfArrays());
+        return elementLocationCount;
+    }
+
+    return elementLocationCount * varyingType.getArraySizeProduct();
+}
+
+bool ShouldIgnoreVaryingArraySize(TQualifier qualifier, GLenum shaderType)
+{
+    bool isVaryingIn = IsShaderIn(qualifier) && qualifier != EvqPatchIn;
+
+    switch (shaderType)
+    {
+        case GL_GEOMETRY_SHADER:
+        case GL_TESS_EVALUATION_SHADER:
+            return isVaryingIn;
+        case GL_TESS_CONTROL_SHADER:
+            return (IsShaderOut(qualifier) && qualifier != EvqPatchOut) || isVaryingIn;
+        default:
+            return false;
+    }
+}
+
+bool MarkVaryingLocations(const TVariable *variable,
+                          const TField *field,
+                          int location,
+                          int elementCount,
+                          LocationValidationMap *locationMap,
+                          VariableAndField *conflictingSymbolOut,
+                          const TField **conflictingFieldInNewSymbolOut)
+{
+    for (int elementIndex = 0; elementIndex < elementCount; ++elementIndex)
+    {
+        const int offsetLocation = location + elementIndex;
+        auto conflict            = locationMap->find(offsetLocation);
+        if (conflict != locationMap->end())
+        {
+            *conflictingSymbolOut           = conflict->second;
+            *conflictingFieldInNewSymbolOut = field;
+            return false;
+        }
+        else
+        {
+            (*locationMap)[offsetLocation] = {variable, field};
+        }
+    }
+
+    return true;
+}
+
+}  
+
+unsigned int CalculateVaryingLocationCount(const TType &varyingType, GLenum shaderType)
+{
+    const TQualifier qualifier        = varyingType.getQualifier();
+    const bool ignoreVaryingArraySize = ShouldIgnoreVaryingArraySize(qualifier, shaderType);
+
+    if (varyingType.isInterfaceBlock())
+    {
+        return GetInterfaceBlockLocationCount(varyingType, ignoreVaryingArraySize);
+    }
+
+    return GetLocationCount(varyingType, ignoreVaryingArraySize);
+}
+
+bool ValidateVaryingLocation(const TVariable *newVariable,
+                             LocationValidationMap *locationMap,
+                             GLenum shaderType,
+                             VariableAndField *conflictingSymbolOut,
+                             const TField **conflictingFieldInNewSymbolOut)
+{
+    const TType &type  = newVariable->getType();
+    const int location = type.getLayoutQualifier().location;
+    ASSERT(location >= 0);
+
+    bool ignoreVaryingArraySize = ShouldIgnoreVaryingArraySize(type.getQualifier(), shaderType);
+
+
+    if (type.isInterfaceBlock())
+    {
+        const int startLocation   = location;
+        int currentLocation       = location;
+        bool anyFieldWithLocation = false;
+
+        for (const TField *field : type.getInterfaceBlock()->fields())
+        {
+            const int fieldLocation = field->type()->getLayoutQualifier().location;
+            if (fieldLocation >= 0)
+            {
+                currentLocation      = fieldLocation;
+                anyFieldWithLocation = true;
+            }
+
+            const int fieldLocationCount = GetFieldLocationCount(field);
+            if (!MarkVaryingLocations(newVariable, field, currentLocation, fieldLocationCount,
+                                      locationMap, conflictingSymbolOut,
+                                      conflictingFieldInNewSymbolOut))
+            {
+                return false;
+            }
+
+            currentLocation += fieldLocationCount;
+        }
+
+        ASSERT(ignoreVaryingArraySize || !anyFieldWithLocation || !type.isArray());
+
+        if (!ignoreVaryingArraySize && type.isArray())
+        {
+            int remainingLocations =
+                (currentLocation - startLocation) * (type.getArraySizeProduct() - 1);
+            if (!MarkVaryingLocations(newVariable, nullptr, currentLocation, remainingLocations,
+                                      locationMap, conflictingSymbolOut,
+                                      conflictingFieldInNewSymbolOut))
+            {
+                return false;
+            }
+        }
+    }
+    else
+    {
+        const int elementCount = GetLocationCount(type, ignoreVaryingArraySize);
+        if (!MarkVaryingLocations(newVariable, nullptr, location, elementCount, locationMap,
+                                  conflictingSymbolOut, conflictingFieldInNewSymbolOut))
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+}  

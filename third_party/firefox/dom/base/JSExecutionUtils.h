@@ -1,0 +1,24 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_BASE_JSEXECUTIONUTILS_H_
+#define DOM_BASE_JSEXECUTIONUTILS_H_
+
+#include "js/CompileOptions.h"          // JS::CompileOptions
+#include "js/TypeDecls.h"               // JSScript
+#include "js/experimental/JSStencil.h"  // JS::Stencil
+#include "mozilla/ErrorResult.h"        // ErrorResult
+#include "nsStringFwd.h"                // nsAString
+
+namespace mozilla::dom {
+
+nsresult EvaluationExceptionToNSResult(ErrorResult& aRv);
+
+void Compile(JSContext* aCx, JS::CompileOptions& aCompileOptions,
+             const nsAString& aScript, RefPtr<JS::Stencil>& aStencil,
+             ErrorResult& aRv);
+
+}  
+
+#endif /* DOM_BASE_JSEXECUTIONUTILS_H_ */

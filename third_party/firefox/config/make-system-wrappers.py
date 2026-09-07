@@ -1,0 +1,25 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+import os
+
+from mozbuild.util import FileAvoidWrite
+
+header_template = """#pragma GCC system_header
+#pragma GCC visibility push(default)
+{includes}
+#pragma GCC visibility pop
+"""
+
+include_next_template = "#include_next <{header}>"
+
+
+def gen_wrappers(unused, outdir, *header_list):
+    for header in header_list:
+        with FileAvoidWrite(os.path.join(outdir, header)) as f:
+            includes = include_next_template.format(header=header)
+            if header in {"wayland-util.h", "pipewire/pipewire.h"}:
+                includes = "#include <math.h>\n" + includes
+            elif header == "wayland-client.h":
+                includes = '#include "wayland-util.h"\n' + includes
+            f.write(header_template.format(includes=includes))

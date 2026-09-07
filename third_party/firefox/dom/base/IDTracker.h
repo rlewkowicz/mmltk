@@ -1,0 +1,139 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_IDTracker_h_
+#define mozilla_dom_IDTracker_h_
+
+#include "nsIObserver.h"
+#include "nsThreadUtils.h"
+
+class nsAtom;
+class nsIContent;
+class nsINode;
+class nsIURI;
+class nsIReferrerInfo;
+
+namespace mozilla::dom {
+
+class Document;
+class DocumentOrShadowRoot;
+class Element;
+
+class IDTracker {
+ public:
+  using Element = mozilla::dom::Element;
+
+  IDTracker();
+
+  ~IDTracker();
+
+  Element* get() const { return mElement; }
+
+  void ResetToURIWithFragmentID(Element& aFrom, nsIURI* aURI,
+                                nsIReferrerInfo* aReferrerInfo,
+                                bool aReferenceImage = false);
+
+  void ResetToLocalFragmentID(Element& aFrom, const nsAString& aLocalRef,
+                              nsIURI* aBaseURI = nullptr,
+                              nsIReferrerInfo* aReferrerInfo = nullptr,
+                              bool aReferenceImage = false);
+
+  void ResetToID(Element& aFrom, nsAtom* aID, bool aReferenceImage = false);
+
+  void Unlink();
+
+  void Traverse(nsCycleCollectionTraversalCallback* aCB);
+
+ protected:
+  void ResetToExternalResource(nsIURI* aURI, nsIReferrerInfo* aReferrerInfo,
+                               nsAtom* aRef, Element& aFrom,
+                               bool aReferenceImage);
+
+  virtual void ElementChanged(Element* aFrom, Element* aTo);
+
+  virtual bool IsPersistent() { return false; }
+
+  void HaveNewDocumentOrShadowRoot(DocumentOrShadowRoot*, bool aWatch,
+                                   nsAtom* aID);
+
+ private:
+  static bool Observe(Element* aOldElement, Element* aNewElement, void* aData);
+
+  class Notification : public nsISupports {
+   public:
+    virtual void SetTo(Element* aTo) = 0;
+    virtual void Clear() { mTarget = nullptr; }
+    virtual ~Notification() = default;
+
+   protected:
+    explicit Notification(IDTracker* aTarget) : mTarget(aTarget) {
+      MOZ_ASSERT(aTarget, "Must have a target");
+    }
+    IDTracker* mTarget;
+  };
+
+  class ChangeNotification : public mozilla::Runnable, public Notification {
+   public:
+    ChangeNotification(IDTracker* aTarget, Element* aFrom, Element* aTo);
+
+    NS_DECL_ISUPPORTS_INHERITED
+    NS_IMETHOD Run() override {
+      if (mTarget) {
+        mTarget->mPendingNotification = nullptr;
+        mTarget->ElementChanged(mFrom, mTo);
+      }
+      return NS_OK;
+    }
+    void SetTo(Element* aTo) override;
+    void Clear() override;
+
+   protected:
+    virtual ~ChangeNotification();
+
+    RefPtr<Element> mFrom;
+    RefPtr<Element> mTo;
+  };
+  friend class ChangeNotification;
+
+  class DocumentLoadNotification : public Notification, public nsIObserver {
+   public:
+    DocumentLoadNotification(IDTracker* aTarget, nsAtom* aRef)
+        : Notification(aTarget) {
+      if (!mTarget->IsPersistent()) {
+        mRef = aRef;
+      }
+    }
+
+    NS_DECL_ISUPPORTS
+    NS_DECL_NSIOBSERVER
+   private:
+    virtual ~DocumentLoadNotification() = default;
+
+    virtual void SetTo(Element* aTo) override {}
+
+    RefPtr<nsAtom> mRef;
+  };
+  friend class DocumentLoadNotification;
+
+  DocumentOrShadowRoot* GetWatchDocOrShadowRoot() const;
+
+  RefPtr<nsAtom> mWatchID;
+  nsCOMPtr<nsINode>
+      mWatchDocumentOrShadowRoot;  
+  RefPtr<Element> mElement;
+  RefPtr<Notification> mPendingNotification;
+  bool mReferencingImage = false;
+};
+
+inline void ImplCycleCollectionUnlink(IDTracker& aField) { aField.Unlink(); }
+
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback, IDTracker& aField,
+    const char* aName, uint32_t aFlags = 0) {
+  aField.Traverse(&aCallback);
+}
+
+}  
+
+#endif /* mozilla_dom_IDTracker_h_ */

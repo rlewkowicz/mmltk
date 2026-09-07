@@ -1,0 +1,23 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_QUOTA_CONDITIONALCOMPILATION_H_
+#define DOM_QUOTA_CONDITIONALCOMPILATION_H_
+
+#include "mozilla/dom/quota/RemoveParen.h"
+
+
+#ifdef DEBUG
+#  define DEBUGONLY(expr) MOZ_REMOVE_PAREN(expr)
+#else
+#  define DEBUGONLY(expr)
+#endif
+
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+#  define DIAGNOSTICONLY(expr) MOZ_REMOVE_PAREN(expr)
+#else
+#  define DIAGNOSTICONLY(expr)
+#endif
+
+#endif  // DOM_QUOTA_CONDITIONALCOMPILATION_H_

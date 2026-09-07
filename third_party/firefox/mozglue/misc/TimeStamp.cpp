@@ -1,0 +1,80 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "mozilla/TimeStamp.h"
+#include "mozilla/Uptime.h"
+#include <string.h>
+#include <stdlib.h>
+
+namespace mozilla {
+
+struct TimeStampInitialization {
+  TimeStamp mFirstTimeStamp;
+
+  TimeStamp mProcessCreation;
+
+  TimeStampInitialization() {
+    TimeStamp::Startup();
+    mFirstTimeStamp = TimeStamp::Now();
+    mozilla::InitializeUptime();
+  }
+
+  ~TimeStampInitialization() { TimeStamp::Shutdown(); }
+};
+
+MOZ_RUNINIT static TimeStampInitialization sInitOnce;
+
+MFBT_API TimeStamp TimeStamp::ProcessCreation() {
+  if (sInitOnce.mProcessCreation.IsNull()) {
+    char* mozAppRestart = getenv("MOZ_APP_RESTART");
+    TimeStamp ts;
+
+    if (mozAppRestart && (strcmp(mozAppRestart, "") != 0)) {
+      ts = sInitOnce.mFirstTimeStamp;
+    } else {
+      TimeStamp now = Now();
+      uint64_t uptime = ComputeProcessUptime();
+
+      ts = now - TimeDuration::FromMicroseconds(static_cast<double>(uptime));
+
+      if ((ts > sInitOnce.mFirstTimeStamp) || (uptime == 0)) {
+        ts = sInitOnce.mFirstTimeStamp;
+      }
+    }
+
+    sInitOnce.mProcessCreation = ts;
+  }
+
+  return sInitOnce.mProcessCreation;
+}
+
+void TimeStamp::RecordProcessRestart() {
+  sInitOnce.mProcessCreation = TimeStamp();
+}
+
+MFBT_API TimeStamp TimeStamp::FirstTimeStamp() {
+  return sInitOnce.mFirstTimeStamp;
+}
+
+class TimeStampTests {
+  static_assert(TimeStamp{TimeStampValue{0}}.IsNull());
+  static_assert(!TimeStamp{TimeStampValue{1}}.IsNull());
+
+  static constexpr uint64_t sMidTime = (uint64_t)1 << 63;
+  static_assert(TimeStampValue{sMidTime + 5} > TimeStampValue{sMidTime - 5});
+  static_assert(TimeStampValue{sMidTime + 5} >= TimeStampValue{sMidTime - 5});
+  static_assert(TimeStampValue{sMidTime - 5} < TimeStampValue{sMidTime + 5});
+  static_assert(TimeStampValue{sMidTime - 5} <= TimeStampValue{sMidTime + 5});
+  static_assert(TimeStampValue{sMidTime} == TimeStampValue{sMidTime});
+  static_assert(TimeStampValue{sMidTime} >= TimeStampValue{sMidTime});
+  static_assert(TimeStampValue{sMidTime} <= TimeStampValue{sMidTime});
+  static_assert(TimeStampValue{sMidTime - 5} != TimeStampValue{sMidTime + 5});
+
+  static_assert(TimeStampValue{UINT64_MAX} > TimeStampValue{1});
+  static_assert(TimeStampValue{1} < TimeStampValue{UINT64_MAX});
+
+};
+
+}  

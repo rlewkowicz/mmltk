@@ -1,0 +1,1184 @@
+/*
+ * Various SSL functions.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#include "cert.h"
+#include "secitem.h"
+#include "keyhi.h"
+#include "ssl.h"
+#include "sslimpl.h"
+#include "sslproto.h"
+#include "secoid.h"   /* for SECOID_GetALgorithmTag */
+#include "pk11func.h" /* for PK11_GenerateRandom */
+#include "nss.h"      /* for NSS_RegisterShutdown */
+#include "prinit.h"   /* for PR_CallOnceWithArg */
+#include "tls13ech.h"
+#include "tls13psk.h"
+
+SECStatus
+ssl_Do1stHandshake(sslSocket *ss)
+{
+    SECStatus rv = SECSuccess;
+
+    while (ss->handshake && rv == SECSuccess) {
+        PORT_Assert(ss->opt.noLocks || ssl_Have1stHandshakeLock(ss));
+        PORT_Assert(ss->opt.noLocks || !ssl_HaveRecvBufLock(ss));
+        PORT_Assert(ss->opt.noLocks || !ssl_HaveXmitBufLock(ss));
+        PORT_Assert(ss->opt.noLocks || !ssl_HaveSSL3HandshakeLock(ss));
+
+        rv = (*ss->handshake)(ss);
+    };
+
+    PORT_Assert(ss->opt.noLocks || !ssl_HaveRecvBufLock(ss));
+    PORT_Assert(ss->opt.noLocks || !ssl_HaveXmitBufLock(ss));
+    PORT_Assert(ss->opt.noLocks || !ssl_HaveSSL3HandshakeLock(ss));
+
+    return rv;
+}
+
+SECStatus
+ssl_FinishHandshake(sslSocket *ss)
+{
+    PORT_Assert(ss->opt.noLocks || ssl_Have1stHandshakeLock(ss));
+    PORT_Assert(ss->opt.noLocks || ssl_HaveRecvBufLock(ss));
+    PORT_Assert(ss->ssl3.hs.echAccepted ||
+                (ss->opt.enableTls13BackendEch &&
+                 ss->xtnData.ech &&
+                 ss->xtnData.ech->receivedInnerXtn) ==
+                    ssl3_ExtensionNegotiated(ss, ssl_tls13_encrypted_client_hello_xtn));
+
+    if (!ss->sec.isServer && ss->ssl3.hs.echHpkeCtx && !ss->ssl3.hs.echAccepted) {
+        SSL3_SendAlert(ss, alert_fatal, ech_required);
+        if (ss->xtnData.ech && ss->xtnData.ech->retryConfigs.len) {
+            PORT_SetError(SSL_ERROR_ECH_RETRY_WITH_ECH);
+            ss->xtnData.ech->retryConfigsValid = PR_TRUE;
+        } else {
+            PORT_SetError(SSL_ERROR_ECH_RETRY_WITHOUT_ECH);
+        }
+        return SECFailure;
+    }
+
+    SSL_TRC(3, ("%d: SSL[%d]: handshake is completed", SSL_GETPID(), ss->fd));
+
+    ss->firstHsDone = PR_TRUE;
+    ss->enoughFirstHsDone = PR_TRUE;
+    ss->gs.writeOffset = 0;
+    ss->gs.readOffset = 0;
+
+    if (ss->handshakeCallback) {
+        PORT_Assert((ss->ssl3.hs.preliminaryInfo & ssl_preinfo_all) ==
+                    ssl_preinfo_all);
+        (ss->handshakeCallback)(ss->fd, ss->handshakeCallbackData);
+    }
+
+    ssl_FreeEphemeralKeyPairs(ss);
+
+    return SECSuccess;
+}
+
+static SECStatus
+ssl3_AlwaysBlock(sslSocket *ss)
+{
+    PORT_SetError(PR_WOULD_BLOCK_ERROR);
+    return SECFailure;
+}
+
+void
+ssl3_SetAlwaysBlock(sslSocket *ss)
+{
+    if (!ss->firstHsDone) {
+        ss->handshake = ssl3_AlwaysBlock;
+    }
+}
+
+static SECStatus
+ssl_SetTimeout(PRFileDesc *fd, PRIntervalTime timeout)
+{
+    sslSocket *ss;
+
+    ss = ssl_FindSocket(fd);
+    if (!ss) {
+        SSL_DBG(("%d: SSL[%d]: bad socket in SetTimeout", SSL_GETPID(), fd));
+        return SECFailure;
+    }
+    SSL_LOCK_READER(ss);
+    ss->rTimeout = timeout;
+    if (ss->opt.fdx) {
+        SSL_LOCK_WRITER(ss);
+    }
+    ss->wTimeout = timeout;
+    if (ss->opt.fdx) {
+        SSL_UNLOCK_WRITER(ss);
+    }
+    SSL_UNLOCK_READER(ss);
+    return SECSuccess;
+}
+
+SECStatus
+SSL_ResetHandshake(PRFileDesc *s, PRBool asServer)
+{
+    sslSocket *ss;
+    SECStatus status;
+    PRNetAddr addr;
+
+    ss = ssl_FindSocket(s);
+    if (!ss) {
+        SSL_DBG(("%d: SSL[%d]: bad socket in ResetHandshake", SSL_GETPID(), s));
+        return SECFailure;
+    }
+
+    if (!ss->opt.useSecurity)
+        return SECSuccess;
+
+    SSL_LOCK_READER(ss);
+    SSL_LOCK_WRITER(ss);
+
+    ssl_Get1stHandshakeLock(ss);
+
+    ss->firstHsDone = PR_FALSE;
+    ss->enoughFirstHsDone = PR_FALSE;
+    if (asServer) {
+        ss->handshake = ssl_BeginServerHandshake;
+        ss->handshaking = sslHandshakingAsServer;
+    } else {
+        ss->handshake = ssl_BeginClientHandshake;
+        ss->handshaking = sslHandshakingAsClient;
+    }
+
+    ssl_GetRecvBufLock(ss);
+    status = ssl3_InitGather(&ss->gs);
+    ssl_ReleaseRecvBufLock(ss);
+    if (status != SECSuccess) {
+        ssl_Release1stHandshakeLock(ss);
+        goto loser;
+    }
+
+    ssl_GetSSL3HandshakeLock(ss);
+    ss->ssl3.hs.canFalseStart = PR_FALSE;
+    ss->ssl3.hs.restartTarget = NULL;
+
+    ssl_GetXmitBufLock(ss);
+    ssl_ResetSecurityInfo(&ss->sec, PR_TRUE);
+    status = ssl_CreateSecurityInfo(ss);
+    ssl_ReleaseXmitBufLock(ss);
+
+    ssl_ReleaseSSL3HandshakeLock(ss);
+    ssl_Release1stHandshakeLock(ss);
+
+    ssl3_DestroyRemoteExtensions(&ss->ssl3.hs.remoteExtensions);
+    ssl3_DestroyRemoteExtensions(&ss->ssl3.hs.echOuterExtensions);
+    ssl3_ResetExtensionData(&ss->xtnData, ss);
+    tls13_ResetHandshakePsks(ss, &ss->ssl3.hs.psks);
+
+    if (ss->ssl3.hs.echHpkeCtx) {
+        PK11_HPKE_DestroyContext(ss->ssl3.hs.echHpkeCtx, PR_TRUE);
+        ss->ssl3.hs.echHpkeCtx = NULL;
+        PORT_Assert(ss->ssl3.hs.echPublicName);
+        PORT_Free((void *)ss->ssl3.hs.echPublicName); 
+        ss->ssl3.hs.echPublicName = NULL;
+    }
+    if (ss->ssl3.hs.echHpkeCtx ||
+        ss->opt.enableTls13BackendEch ||
+        ss->opt.enableTls13GreaseEch) {
+        sslBuffer_Clear(&ss->ssl3.hs.greaseEchBuf);
+    }
+
+    tls13_ClientGreaseDestroy(ss);
+
+    tls_ClientHelloExtensionPermutationDestroy(ss);
+
+    if (!ss->TCPconnected)
+        ss->TCPconnected = (PR_SUCCESS == ssl_DefGetpeername(ss, &addr));
+
+loser:
+    SSL_UNLOCK_WRITER(ss);
+    SSL_UNLOCK_READER(ss);
+
+    return status;
+}
+
+SECStatus
+SSL_ReHandshake(PRFileDesc *fd, PRBool flushCache)
+{
+    sslSocket *ss;
+    SECStatus rv;
+
+    ss = ssl_FindSocket(fd);
+    if (!ss) {
+        SSL_DBG(("%d: SSL[%d]: bad socket in RedoHandshake", SSL_GETPID(), fd));
+        return SECFailure;
+    }
+
+    if (!ss->opt.useSecurity)
+        return SECSuccess;
+
+    ssl_Get1stHandshakeLock(ss);
+
+    ssl_GetSSL3HandshakeLock(ss);
+    rv = ssl3_RedoHandshake(ss, flushCache); 
+    ssl_ReleaseSSL3HandshakeLock(ss);
+
+    ssl_Release1stHandshakeLock(ss);
+
+    return rv;
+}
+
+SSL_IMPORT SECStatus
+SSL_ReHandshakeWithTimeout(PRFileDesc *fd,
+                           PRBool flushCache,
+                           PRIntervalTime timeout)
+{
+    if (SECSuccess != ssl_SetTimeout(fd, timeout)) {
+        return SECFailure;
+    }
+    return SSL_ReHandshake(fd, flushCache);
+}
+
+SECStatus
+SSL_RedoHandshake(PRFileDesc *fd)
+{
+    return SSL_ReHandshake(fd, PR_TRUE);
+}
+
+SECStatus
+SSL_HandshakeCallback(PRFileDesc *fd, SSLHandshakeCallback cb,
+                      void *client_data)
+{
+    sslSocket *ss;
+
+    ss = ssl_FindSocket(fd);
+    if (!ss) {
+        SSL_DBG(("%d: SSL[%d]: bad socket in HandshakeCallback",
+                 SSL_GETPID(), fd));
+        return SECFailure;
+    }
+
+    if (!ss->opt.useSecurity) {
+        PORT_SetError(SEC_ERROR_INVALID_ARGS);
+        return SECFailure;
+    }
+
+    ssl_Get1stHandshakeLock(ss);
+    ssl_GetSSL3HandshakeLock(ss);
+
+    ss->handshakeCallback = cb;
+    ss->handshakeCallbackData = client_data;
+
+    ssl_ReleaseSSL3HandshakeLock(ss);
+    ssl_Release1stHandshakeLock(ss);
+
+    return SECSuccess;
+}
+
+SECStatus
+SSL_SetCanFalseStartCallback(PRFileDesc *fd, SSLCanFalseStartCallback cb,
+                             void *arg)
+{
+    sslSocket *ss;
+
+    ss = ssl_FindSocket(fd);
+    if (!ss) {
+        SSL_DBG(("%d: SSL[%d]: bad socket in SSL_SetCanFalseStartCallback",
+                 SSL_GETPID(), fd));
+        return SECFailure;
+    }
+
+    if (!ss->opt.useSecurity) {
+        PORT_SetError(SEC_ERROR_INVALID_ARGS);
+        return SECFailure;
+    }
+
+    ssl_Get1stHandshakeLock(ss);
+    ssl_GetSSL3HandshakeLock(ss);
+
+    ss->canFalseStartCallback = cb;
+    ss->canFalseStartCallbackData = arg;
+
+    ssl_ReleaseSSL3HandshakeLock(ss);
+    ssl_Release1stHandshakeLock(ss);
+
+    return SECSuccess;
+}
+
+SECStatus
+SSL_RecommendedCanFalseStart(PRFileDesc *fd, PRBool *canFalseStart)
+{
+    sslSocket *ss;
+
+    *canFalseStart = PR_FALSE;
+    ss = ssl_FindSocket(fd);
+    if (!ss) {
+        SSL_DBG(("%d: SSL[%d]: bad socket in SSL_RecommendedCanFalseStart",
+                 SSL_GETPID(), fd));
+        return SECFailure;
+    }
+
+    *canFalseStart = ss->ssl3.hs.kea_def->kea == kea_dhe_dss ||
+                     ss->ssl3.hs.kea_def->kea == kea_dhe_rsa ||
+                     ss->ssl3.hs.kea_def->kea == kea_ecdhe_ecdsa ||
+                     ss->ssl3.hs.kea_def->kea == kea_ecdhe_rsa;
+
+    return SECSuccess;
+}
+
+SECStatus
+SSL_ForceHandshake(PRFileDesc *fd)
+{
+    sslSocket *ss;
+    SECStatus rv = SECFailure;
+
+    ss = ssl_FindSocket(fd);
+    if (!ss) {
+        SSL_DBG(("%d: SSL[%d]: bad socket in ForceHandshake",
+                 SSL_GETPID(), fd));
+        return rv;
+    }
+
+    if (!ss->opt.useSecurity)
+        return SECSuccess;
+
+    if (!ssl_SocketIsBlocking(ss)) {
+        ssl_GetXmitBufLock(ss);
+        if (ss->pendingBuf.len != 0) {
+            int sent = ssl_SendSavedWriteData(ss);
+            if ((sent < 0) && (PORT_GetError() != PR_WOULD_BLOCK_ERROR)) {
+                ssl_ReleaseXmitBufLock(ss);
+                return SECFailure;
+            }
+        }
+        ssl_ReleaseXmitBufLock(ss);
+    }
+
+    ssl_Get1stHandshakeLock(ss);
+
+    if (ss->version >= SSL_LIBRARY_VERSION_3_0) {
+        int gatherResult;
+
+        ssl_GetRecvBufLock(ss);
+        gatherResult = ssl3_GatherCompleteHandshake(ss, 0);
+        ssl_ReleaseRecvBufLock(ss);
+        if (gatherResult > 0) {
+            rv = SECSuccess;
+        } else {
+            if (gatherResult == 0) {
+                PORT_SetError(PR_END_OF_FILE_ERROR);
+            }
+            rv = SECFailure;
+        }
+    } else {
+        PORT_Assert(!ss->firstHsDone);
+        rv = ssl_Do1stHandshake(ss);
+    }
+
+    ssl_Release1stHandshakeLock(ss);
+
+    return rv;
+}
+
+SSL_IMPORT SECStatus
+SSL_ForceHandshakeWithTimeout(PRFileDesc *fd,
+                              PRIntervalTime timeout)
+{
+    if (SECSuccess != ssl_SetTimeout(fd, timeout)) {
+        return SECFailure;
+    }
+    return SSL_ForceHandshake(fd);
+}
+
+
+SECStatus
+ssl_SaveWriteData(sslSocket *ss, const void *data, unsigned int len)
+{
+    SECStatus rv;
+
+    PORT_Assert(ss->opt.noLocks || ssl_HaveXmitBufLock(ss));
+    rv = sslBuffer_Append(&ss->pendingBuf, data, len);
+    SSL_TRC(5, ("%d: SSL[%d]: saving %u bytes of data (%u total saved so far)",
+                SSL_GETPID(), ss->fd, len, ss->pendingBuf.len));
+    return rv;
+}
+
+int
+ssl_SendSavedWriteData(sslSocket *ss)
+{
+    int rv = 0;
+
+    PORT_Assert(ss->opt.noLocks || ssl_HaveXmitBufLock(ss));
+    if (ss->pendingBuf.len != 0) {
+        SSL_TRC(5, ("%d: SSL[%d]: sending %d bytes of saved data",
+                    SSL_GETPID(), ss->fd, ss->pendingBuf.len));
+        rv = ssl_DefSend(ss, ss->pendingBuf.buf, ss->pendingBuf.len, 0);
+        if (rv < 0) {
+            return rv;
+        }
+        if (rv > ss->pendingBuf.len) {
+            PORT_Assert(0); 
+            ss->pendingBuf.len = 0;
+        } else {
+            ss->pendingBuf.len -= rv;
+        }
+        if (ss->pendingBuf.len > 0 && rv > 0) {
+            PORT_Memmove(ss->pendingBuf.buf, ss->pendingBuf.buf + rv,
+                         ss->pendingBuf.len);
+        }
+    }
+    return rv;
+}
+
+
+static int
+DoRecv(sslSocket *ss, unsigned char *out, int len, int flags)
+{
+    int rv;
+    int amount;
+    int available;
+
+    ssl_Get1stHandshakeLock(ss);
+    ssl_GetRecvBufLock(ss);
+
+    available = ss->gs.writeOffset - ss->gs.readOffset;
+    if (available == 0) {
+        rv = ssl3_GatherAppDataRecord(ss, 0);
+        if (rv <= 0) {
+            if (rv == 0) {
+                SSL_TRC(10, ("%d: SSL[%d]: ssl_recv EOF",
+                             SSL_GETPID(), ss->fd));
+                goto done;
+            }
+            if (PR_GetError() != PR_WOULD_BLOCK_ERROR) {
+                goto done;
+            }
+
+        } else {
+        }
+
+        available = ss->gs.writeOffset - ss->gs.readOffset;
+        if (available == 0) {
+            PORT_SetError(PR_WOULD_BLOCK_ERROR);
+            rv = SECFailure;
+            goto done;
+        }
+        SSL_TRC(30, ("%d: SSL[%d]: partial data ready, available=%d",
+                     SSL_GETPID(), ss->fd, available));
+    }
+
+    if (IS_DTLS(ss) && (len < available)) {
+        SSL_TRC(30, ("%d: SSL[%d]: DTLS short read. len=%d available=%d",
+                     SSL_GETPID(), ss->fd, len, available));
+        ss->gs.readOffset += available;
+        PORT_SetError(SSL_ERROR_RX_SHORT_DTLS_READ);
+        rv = SECFailure;
+        goto done;
+    }
+
+    amount = PR_MIN(len, available);
+    PORT_Memcpy(out, ss->gs.buf.buf + ss->gs.readOffset, amount);
+    if (!(flags & PR_MSG_PEEK)) {
+        ss->gs.readOffset += amount;
+    }
+    PORT_Assert(ss->gs.readOffset <= ss->gs.writeOffset);
+    rv = amount;
+
+#ifdef DEBUG
+    if (ss->gs.writeOffset == ss->gs.readOffset) {
+        sslBuffer_Clear(&ss->gs.buf);
+    }
+#endif
+
+    SSL_TRC(30, ("%d: SSL[%d]: amount=%d available=%d",
+                 SSL_GETPID(), ss->fd, amount, available));
+    PRINT_BUF(4, (ss, "DoRecv receiving plaintext:", out, amount));
+
+done:
+    ssl_ReleaseRecvBufLock(ss);
+    ssl_Release1stHandshakeLock(ss);
+    return rv;
+}
+
+
+SECStatus
+ssl_CreateSecurityInfo(sslSocket *ss)
+{
+    SECStatus status;
+
+    ssl_GetXmitBufLock(ss);
+    status = sslBuffer_Grow(&ss->sec.writeBuf, 4096);
+    ssl_ReleaseXmitBufLock(ss);
+
+    return status;
+}
+
+SECStatus
+ssl_CopySecurityInfo(sslSocket *ss, sslSocket *os)
+{
+    ss->sec.isServer = os->sec.isServer;
+
+    ss->sec.peerCert = CERT_DupCertificate(os->sec.peerCert);
+    if (os->sec.peerCert && !ss->sec.peerCert)
+        goto loser;
+
+    return SECSuccess;
+
+loser:
+    return SECFailure;
+}
+
+void
+ssl_ResetSecurityInfo(sslSecurityInfo *sec, PRBool doMemset)
+{
+    if (sec->localCert) {
+        CERT_DestroyCertificate(sec->localCert);
+        sec->localCert = NULL;
+    }
+    if (sec->peerCert) {
+        CERT_DestroyCertificate(sec->peerCert);
+        sec->peerCert = NULL;
+    }
+    if (sec->peerKey) {
+        SECKEY_DestroyPublicKey(sec->peerKey);
+        sec->peerKey = NULL;
+    }
+
+    if (sec->ci.sid != NULL) {
+        ssl_FreeSID(sec->ci.sid);
+    }
+    PORT_ZFree(sec->ci.sendBuf.buf, sec->ci.sendBuf.space);
+    if (doMemset) {
+        memset(&sec->ci, 0, sizeof sec->ci);
+    }
+}
+
+void
+ssl_DestroySecurityInfo(sslSecurityInfo *sec)
+{
+    ssl_ResetSecurityInfo(sec, PR_FALSE);
+
+    PORT_ZFree(sec->writeBuf.buf, sec->writeBuf.space);
+    sec->writeBuf.buf = 0;
+
+    memset(sec, 0, sizeof *sec);
+}
+
+
+int
+ssl_SecureConnect(sslSocket *ss, const PRNetAddr *sa)
+{
+    PRFileDesc *osfd = ss->fd->lower;
+    int rv;
+
+    if (ss->opt.handshakeAsServer) {
+        ss->handshake = ssl_BeginServerHandshake;
+        ss->handshaking = sslHandshakingAsServer;
+    } else {
+        ss->handshake = ssl_BeginClientHandshake;
+        ss->handshaking = sslHandshakingAsClient;
+    }
+
+    rv = osfd->methods->connect(osfd, sa, ss->cTimeout);
+    if (rv == PR_SUCCESS) {
+        ss->TCPconnected = 1;
+    } else {
+        int err = PR_GetError();
+        SSL_DBG(("%d: SSL[%d]: connect failed, errno=%d",
+                 SSL_GETPID(), ss->fd, err));
+        if (err == PR_IS_CONNECTED_ERROR) {
+            ss->TCPconnected = 1;
+        }
+    }
+
+    SSL_TRC(5, ("%d: SSL[%d]: secure connect completed, rv == %d",
+                SSL_GETPID(), ss->fd, rv));
+    return rv;
+}
+
+
+int
+ssl_SecureClose(sslSocket *ss)
+{
+    int rv;
+
+    if (!(ss->shutdownHow & ssl_SHUTDOWN_SEND) &&
+        ss->firstHsDone) {
+
+        if (!ss->delayDisabled) {
+            ssl_EnableNagleDelay(ss, PR_FALSE);
+            ss->delayDisabled = 1;
+        }
+
+        (void)SSL3_SendAlert(ss, alert_warning, close_notify);
+    }
+    rv = ssl_DefClose(ss);
+    return rv;
+}
+
+int
+ssl_SecureShutdown(sslSocket *ss, int nsprHow)
+{
+    PRFileDesc *osfd = ss->fd->lower;
+    int rv;
+    PRIntn sslHow = nsprHow + 1;
+
+    if ((unsigned)nsprHow > PR_SHUTDOWN_BOTH) {
+        PORT_SetError(PR_INVALID_ARGUMENT_ERROR);
+        return PR_FAILURE;
+    }
+
+    if ((sslHow & ssl_SHUTDOWN_SEND) != 0 &&
+        !(ss->shutdownHow & ssl_SHUTDOWN_SEND) &&
+        ss->firstHsDone) {
+
+        (void)SSL3_SendAlert(ss, alert_warning, close_notify);
+    }
+
+    rv = osfd->methods->shutdown(osfd, nsprHow);
+
+    ss->shutdownHow |= sslHow;
+
+    return rv;
+}
+
+
+static SECStatus
+tls13_CheckKeyUpdate(sslSocket *ss, SSLSecretDirection dir)
+{
+    PRBool keyUpdate;
+    ssl3CipherSpec *spec;
+    sslSequenceNumber seqNum;
+    sslSequenceNumber margin;
+    tls13KeyUpdateRequest keyUpdateRequest;
+    SECStatus rv = SECSuccess;
+
+    if (ss->version < SSL_LIBRARY_VERSION_TLS_1_3) {
+        return SECSuccess;
+    }
+
+    ssl_GetSpecReadLock(ss);
+    if (dir == ssl_secret_read) {
+        spec = ss->ssl3.crSpec;
+        margin = spec->cipherDef->max_records / 8;
+    } else {
+        spec = ss->ssl3.cwSpec;
+        margin = spec->cipherDef->max_records / 4;
+    }
+    seqNum = spec->nextSeqNum;
+    keyUpdate = seqNum > spec->cipherDef->max_records - margin;
+    ssl_ReleaseSpecReadLock(ss);
+    if (!keyUpdate) {
+        return SECSuccess;
+    }
+
+    SSL_TRC(5, ("%d: SSL[%d]: automatic key update at %llx for %s cipher spec",
+                SSL_GETPID(), ss->fd, seqNum,
+                (dir == ssl_secret_read) ? "read" : "write"));
+    keyUpdateRequest = (dir == ssl_secret_read) ? update_requested : update_not_requested;
+    ssl_GetSSL3HandshakeLock(ss);
+    if (ss->ssl3.clientCertRequested) {
+        ss->ssl3.hs.keyUpdateDeferred = PR_TRUE;
+        ss->ssl3.hs.deferredKeyUpdateRequest = keyUpdateRequest;
+    } else {
+        rv = tls13_SendKeyUpdate(ss, keyUpdateRequest,
+                                 dir == ssl_secret_write );
+    }
+    ssl_ReleaseSSL3HandshakeLock(ss);
+    return rv;
+}
+
+int
+ssl_SecureRecv(sslSocket *ss, unsigned char *buf, int len, int flags)
+{
+    int rv = 0;
+
+    if (ss->shutdownHow & ssl_SHUTDOWN_RCV) {
+        PORT_SetError(PR_SOCKET_SHUTDOWN_ERROR);
+        return PR_FAILURE;
+    }
+    if (flags & ~PR_MSG_PEEK) {
+        PORT_SetError(PR_INVALID_ARGUMENT_ERROR);
+        return PR_FAILURE;
+    }
+
+    if (!ssl_SocketIsBlocking(ss) && !ss->opt.fdx) {
+        ssl_GetXmitBufLock(ss);
+        if (ss->pendingBuf.len != 0) {
+            rv = ssl_SendSavedWriteData(ss);
+            if ((rv < 0) && (PORT_GetError() != PR_WOULD_BLOCK_ERROR)) {
+                ssl_ReleaseXmitBufLock(ss);
+                return SECFailure;
+            }
+        }
+        ssl_ReleaseXmitBufLock(ss);
+    }
+
+    rv = 0;
+    if (!PR_CLIST_IS_EMPTY(&ss->ssl3.hs.bufferedEarlyData)) {
+        PORT_Assert(ss->version >= SSL_LIBRARY_VERSION_TLS_1_3);
+        return tls13_Read0RttData(ss, buf, len);
+    }
+
+    if (!ss->firstHsDone) {
+        ssl_Get1stHandshakeLock(ss);
+        if (ss->handshake) {
+            rv = ssl_Do1stHandshake(ss);
+        }
+        ssl_Release1stHandshakeLock(ss);
+    } else {
+        if (tls13_CheckKeyUpdate(ss, ssl_secret_read) != SECSuccess) {
+            rv = PR_FAILURE;
+        }
+    }
+    if (rv < 0) {
+        if (PORT_GetError() == PR_WOULD_BLOCK_ERROR &&
+            !PR_CLIST_IS_EMPTY(&ss->ssl3.hs.bufferedEarlyData)) {
+            PORT_Assert(ss->version >= SSL_LIBRARY_VERSION_TLS_1_3);
+            return tls13_Read0RttData(ss, buf, len);
+        }
+        return rv;
+    }
+
+    if (len == 0)
+        return 0;
+
+    rv = DoRecv(ss, (unsigned char *)buf, len, flags);
+    SSL_TRC(2, ("%d: SSL[%d]: recving %d bytes securely (errno=%d)",
+                SSL_GETPID(), ss->fd, rv, PORT_GetError()));
+    return rv;
+}
+
+int
+ssl_SecureRead(sslSocket *ss, unsigned char *buf, int len)
+{
+    return ssl_SecureRecv(ss, buf, len, 0);
+}
+
+int
+ssl_SecureSend(sslSocket *ss, const unsigned char *buf, int len, int flags)
+{
+    int rv = 0;
+    PRBool zeroRtt = PR_FALSE;
+
+    SSL_TRC(2, ("%d: SSL[%d]: SecureSend: sending %d bytes",
+                SSL_GETPID(), ss->fd, len));
+
+    if (ss->shutdownHow & ssl_SHUTDOWN_SEND) {
+        PORT_SetError(PR_SOCKET_SHUTDOWN_ERROR);
+        rv = PR_FAILURE;
+        goto done;
+    }
+    if (flags) {
+        PORT_SetError(PR_INVALID_ARGUMENT_ERROR);
+        rv = PR_FAILURE;
+        goto done;
+    }
+
+    ssl_GetXmitBufLock(ss);
+    if (ss->pendingBuf.len != 0) {
+        PORT_Assert(ss->pendingBuf.len > 0);
+        rv = ssl_SendSavedWriteData(ss);
+        if (rv >= 0 && ss->pendingBuf.len != 0) {
+            PORT_Assert(ss->pendingBuf.len > 0);
+            PORT_SetError(PR_WOULD_BLOCK_ERROR);
+            rv = SECFailure;
+        }
+    }
+    ssl_ReleaseXmitBufLock(ss);
+    if (rv < 0) {
+        goto done;
+    }
+
+    if (len > 0)
+        ss->writerThread = PR_GetCurrentThread();
+
+    if (!ss->firstHsDone) {
+        PRBool allowEarlySend = PR_FALSE;
+        PRBool firstClientWrite = PR_FALSE;
+
+        ssl_Get1stHandshakeLock(ss);
+        if (!ss->sec.isServer &&
+            (ss->opt.enableFalseStart || ss->opt.enable0RttData)) {
+            ssl_GetSSL3HandshakeLock(ss);
+            zeroRtt = ss->ssl3.hs.zeroRttState == ssl_0rtt_sent ||
+                      ss->ssl3.hs.zeroRttState == ssl_0rtt_accepted;
+            allowEarlySend = ss->ssl3.hs.canFalseStart || zeroRtt;
+            firstClientWrite = ss->ssl3.hs.ws == idle_handshake;
+            ssl_ReleaseSSL3HandshakeLock(ss);
+        }
+        if (ss->sec.isServer &&
+            ss->version >= SSL_LIBRARY_VERSION_TLS_1_3 &&
+            !tls13_ShouldRequestClientAuth(ss)) {
+            ssl_GetSSL3HandshakeLock(ss);
+            allowEarlySend = TLS13_IN_HS_STATE(ss, wait_finished);
+            ssl_ReleaseSSL3HandshakeLock(ss);
+        }
+        if (!allowEarlySend && ss->handshake) {
+            rv = ssl_Do1stHandshake(ss);
+        }
+        if (firstClientWrite) {
+            ssl_GetSSL3HandshakeLock(ss);
+            zeroRtt = ss->ssl3.hs.zeroRttState == ssl_0rtt_sent ||
+                      ss->ssl3.hs.zeroRttState == ssl_0rtt_accepted;
+            ssl_ReleaseSSL3HandshakeLock(ss);
+        }
+        ssl_Release1stHandshakeLock(ss);
+    }
+
+    if (rv < 0) {
+        ss->writerThread = NULL;
+        goto done;
+    }
+
+    if (ss->firstHsDone) {
+        if (tls13_CheckKeyUpdate(ss, ssl_secret_write) != SECSuccess) {
+            rv = PR_FAILURE;
+            goto done;
+        }
+    }
+
+    if (zeroRtt) {
+        ssl_GetSpecReadLock(ss);
+        len = tls13_LimitEarlyData(ss, ssl_ct_application_data, len);
+        ssl_ReleaseSpecReadLock(ss);
+    }
+
+    if (len == 0) {
+        rv = 0;
+        goto done;
+    }
+    PORT_Assert(buf != NULL);
+    if (!buf) {
+        PORT_SetError(PR_INVALID_ARGUMENT_ERROR);
+        rv = PR_FAILURE;
+        goto done;
+    }
+
+    ssl_GetXmitBufLock(ss);
+    rv = ssl3_SendApplicationData(ss, buf, len, flags);
+    ssl_ReleaseXmitBufLock(ss);
+    ss->writerThread = NULL;
+done:
+    if (rv < 0) {
+        SSL_TRC(2, ("%d: SSL[%d]: SecureSend: returning %d count, error %d",
+                    SSL_GETPID(), ss->fd, rv, PORT_GetError()));
+    } else {
+        SSL_TRC(2, ("%d: SSL[%d]: SecureSend: returning %d count",
+                    SSL_GETPID(), ss->fd, rv));
+    }
+    return rv;
+}
+
+int
+ssl_SecureWrite(sslSocket *ss, const unsigned char *buf, int len)
+{
+    return ssl_SecureSend(ss, buf, len, 0);
+}
+
+SECStatus
+SSLExp_RecordLayerWriteCallback(PRFileDesc *fd, SSLRecordWriteCallback cb,
+                                void *arg)
+{
+    sslSocket *ss = ssl_FindSocket(fd);
+    if (!ss) {
+        SSL_DBG(("%d: SSL[%d]: invalid socket for SSL_RecordLayerWriteCallback",
+                 SSL_GETPID(), fd));
+        return SECFailure;
+    }
+    if (IS_DTLS(ss)) {
+        SSL_DBG(("%d: SSL[%d]: DTLS socket for SSL_RecordLayerWriteCallback",
+                 SSL_GETPID(), fd));
+        PORT_SetError(SEC_ERROR_INVALID_ARGS);
+        return SECFailure;
+    }
+
+    ssl_GetSSL3HandshakeLock(ss);
+    ssl_GetXmitBufLock(ss);
+    ss->recordWriteCallback = cb;
+    ss->recordWriteCallbackArg = arg;
+    ssl_ReleaseXmitBufLock(ss);
+    ssl_ReleaseSSL3HandshakeLock(ss);
+    return SECSuccess;
+}
+
+SECStatus
+SSL_AlertReceivedCallback(PRFileDesc *fd, SSLAlertCallback cb, void *arg)
+{
+    sslSocket *ss;
+
+    ss = ssl_FindSocket(fd);
+    if (!ss) {
+        SSL_DBG(("%d: SSL[%d]: unable to find socket in SSL_AlertReceivedCallback",
+                 SSL_GETPID(), fd));
+        return SECFailure;
+    }
+
+    ss->alertReceivedCallback = cb;
+    ss->alertReceivedCallbackArg = arg;
+
+    return SECSuccess;
+}
+
+SECStatus
+SSL_AlertSentCallback(PRFileDesc *fd, SSLAlertCallback cb, void *arg)
+{
+    sslSocket *ss;
+
+    ss = ssl_FindSocket(fd);
+    if (!ss) {
+        SSL_DBG(("%d: SSL[%d]: unable to find socket in SSL_AlertSentCallback",
+                 SSL_GETPID(), fd));
+        return SECFailure;
+    }
+
+    ss->alertSentCallback = cb;
+    ss->alertSentCallbackArg = arg;
+
+    return SECSuccess;
+}
+
+SECStatus
+SSL_BadCertHook(PRFileDesc *fd, SSLBadCertHandler f, void *arg)
+{
+    sslSocket *ss;
+
+    ss = ssl_FindSocket(fd);
+    if (!ss) {
+        SSL_DBG(("%d: SSL[%d]: bad socket in SSLBadCertHook",
+                 SSL_GETPID(), fd));
+        return SECFailure;
+    }
+
+    ss->handleBadCert = f;
+    ss->badCertArg = arg;
+
+    return SECSuccess;
+}
+
+SECStatus
+SSL_SetURL(PRFileDesc *fd, const char *url)
+{
+    sslSocket *ss = ssl_FindSocket(fd);
+    SECStatus rv = SECSuccess;
+
+    if (!ss) {
+        SSL_DBG(("%d: SSL[%d]: bad socket in SSLSetURL",
+                 SSL_GETPID(), fd));
+        return SECFailure;
+    }
+    ssl_Get1stHandshakeLock(ss);
+    ssl_GetSSL3HandshakeLock(ss);
+
+    if (ss->url) {
+        PORT_Free((void *)ss->url); 
+    }
+
+    ss->url = (const char *)PORT_Strdup(url);
+    if (ss->url == NULL) {
+        rv = SECFailure;
+    }
+
+    ssl_ReleaseSSL3HandshakeLock(ss);
+    ssl_Release1stHandshakeLock(ss);
+
+    return rv;
+}
+
+SECStatus
+SSL_SetTrustAnchors(PRFileDesc *fd, CERTCertList *certList)
+{
+    sslSocket *ss = ssl_FindSocket(fd);
+    CERTDistNames *names = NULL;
+
+    if (!certList) {
+        PORT_SetError(SEC_ERROR_INVALID_ARGS);
+        return SECFailure;
+    }
+    if (!ss) {
+        SSL_DBG(("%d: SSL[%d]: bad socket in SSL_SetTrustAnchors",
+                 SSL_GETPID(), fd));
+        return SECFailure;
+    }
+
+    names = CERT_DistNamesFromCertList(certList);
+    if (names == NULL) {
+        return SECFailure;
+    }
+    ssl_Get1stHandshakeLock(ss);
+    ssl_GetSSL3HandshakeLock(ss);
+    if (ss->ssl3.ca_list) {
+        CERT_FreeDistNames(ss->ssl3.ca_list);
+    }
+    ss->ssl3.ca_list = names;
+    ssl_ReleaseSSL3HandshakeLock(ss);
+    ssl_Release1stHandshakeLock(ss);
+
+    return SECSuccess;
+}
+
+int
+SSL_DataPending(PRFileDesc *fd)
+{
+    sslSocket *ss;
+    int rv = 0;
+
+    ss = ssl_FindSocket(fd);
+
+    if (ss && ss->opt.useSecurity) {
+        ssl_GetRecvBufLock(ss);
+        rv = ss->gs.writeOffset - ss->gs.readOffset;
+        ssl_ReleaseRecvBufLock(ss);
+    }
+
+    return rv;
+}
+
+SECStatus
+SSL_InvalidateSession(PRFileDesc *fd)
+{
+    sslSocket *ss = ssl_FindSocket(fd);
+    SECStatus rv = SECFailure;
+
+    if (ss) {
+        ssl_Get1stHandshakeLock(ss);
+        ssl_GetSSL3HandshakeLock(ss);
+
+        if (ss->sec.ci.sid) {
+            ssl_UncacheSessionID(ss);
+            rv = SECSuccess;
+        }
+
+        ssl_ReleaseSSL3HandshakeLock(ss);
+        ssl_Release1stHandshakeLock(ss);
+    }
+    return rv;
+}
+
+SECItem *
+SSL_GetSessionID(PRFileDesc *fd)
+{
+    sslSocket *ss;
+    SECItem *item = NULL;
+
+    ss = ssl_FindSocket(fd);
+    if (ss) {
+        ssl_Get1stHandshakeLock(ss);
+        ssl_GetSSL3HandshakeLock(ss);
+
+        if (ss->opt.useSecurity && ss->firstHsDone && ss->sec.ci.sid) {
+            item = (SECItem *)PORT_Alloc(sizeof(SECItem));
+            if (item) {
+                sslSessionID *sid = ss->sec.ci.sid;
+                item->len = sid->u.ssl3.sessionIDLength;
+                item->data = (unsigned char *)PORT_Alloc(item->len);
+                PORT_Memcpy(item->data, sid->u.ssl3.sessionID, item->len);
+            }
+        }
+
+        ssl_ReleaseSSL3HandshakeLock(ss);
+        ssl_Release1stHandshakeLock(ss);
+    }
+    return item;
+}
+
+SECStatus
+SSL_CertDBHandleSet(PRFileDesc *fd, CERTCertDBHandle *dbHandle)
+{
+    sslSocket *ss;
+
+    ss = ssl_FindSocket(fd);
+    if (!ss)
+        return SECFailure;
+    if (!dbHandle) {
+        PORT_SetError(SEC_ERROR_INVALID_ARGS);
+        return SECFailure;
+    }
+    ss->dbHandle = dbHandle;
+    return SECSuccess;
+}
+
+int
+SSL_RestartHandshakeAfterCertReq(sslSocket *ss,
+                                 CERTCertificate *cert,
+                                 SECKEYPrivateKey *key,
+                                 CERTCertificateList *certChain)
+{
+    PORT_SetError(PR_NOT_IMPLEMENTED_ERROR);
+    return -1;
+}
+
+int
+SSL_RestartHandshakeAfterServerCert(sslSocket *ss)
+{
+    PORT_SetError(PR_NOT_IMPLEMENTED_ERROR);
+    return -1;
+}
+
+SECStatus
+SSL_AuthCertificateComplete(PRFileDesc *fd, PRErrorCode error)
+{
+    SECStatus rv;
+    sslSocket *ss = ssl_FindSocket(fd);
+
+    if (!ss) {
+        SSL_DBG(("%d: SSL[%d]: bad socket in SSL_AuthCertificateComplete",
+                 SSL_GETPID(), fd));
+        return SECFailure;
+    }
+
+    ssl_Get1stHandshakeLock(ss);
+    rv = ssl3_AuthCertificateComplete(ss, error);
+    ssl_Release1stHandshakeLock(ss);
+
+    return rv;
+}
+
+SECStatus
+SSL_ClientCertCallbackComplete(PRFileDesc *fd, SECStatus outcome, SECKEYPrivateKey *clientPrivateKey,
+                               CERTCertificate *clientCertificate)
+{
+    SECStatus rv;
+    sslSocket *ss = ssl_FindSocket(fd);
+
+    if (!ss) {
+        SSL_DBG(("%d: SSL[%d]: bad socket in SSL_ClientCertCallbackComplete",
+                 SSL_GETPID(), fd));
+        return SECFailure;
+    }
+
+    ssl_Get1stHandshakeLock(ss);
+    ssl_GetRecvBufLock(ss);
+    ssl_GetSSL3HandshakeLock(ss);
+
+    if (!ss->ssl3.hs.clientCertificatePending) {
+        SSL_DBG(("%d: SSL[%d]: socket not waiting for SSL_ClientCertCallbackComplete",
+                 SSL_GETPID(), fd));
+        PORT_SetError(PR_INVALID_STATE_ERROR);
+        rv = SECFailure;
+        goto cleanup;
+    }
+
+    rv = ssl3_ClientCertCallbackComplete(ss, outcome, clientPrivateKey, clientCertificate);
+
+cleanup:
+    ssl_ReleaseRecvBufLock(ss);
+    ssl_ReleaseSSL3HandshakeLock(ss);
+    ssl_Release1stHandshakeLock(ss);
+    return rv;
+}
+
+SECStatus
+SSL_SNISocketConfigHook(PRFileDesc *fd, SSLSNISocketConfig func,
+                        void *arg)
+{
+    sslSocket *ss;
+
+    ss = ssl_FindSocket(fd);
+    if (!ss) {
+        SSL_DBG(("%d: SSL[%d]: bad socket in SNISocketConfigHook",
+                 SSL_GETPID(), fd));
+        return SECFailure;
+    }
+
+    ss->sniSocketConfig = func;
+    ss->sniSocketConfigArg = arg;
+    return SECSuccess;
+}

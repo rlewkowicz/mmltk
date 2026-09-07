@@ -1,0 +1,509 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "wasm/WasmGcObject-inl.h"
+
+#include "mozilla/DebugOnly.h"
+
+#include "gc/Tracer.h"
+#include "js/CharacterEncoding.h"
+#include "js/friend/ErrorMessages.h"  // js::GetErrorMessage, JSMSG_*
+#include "js/PropertySpec.h"
+#include "js/ScalarType.h"  // js::Scalar::Type
+#include "js/Vector.h"
+#include "util/StringBuilder.h"
+#include "vm/GlobalObject.h"
+#include "vm/JSFunction.h"
+#include "vm/JSObject.h"
+#include "vm/PlainObject.h"  // js::PlainObject
+#include "vm/PropertyResult.h"
+#include "vm/Realm.h"
+#include "vm/SelfHosting.h"
+#include "vm/StringType.h"
+#include "vm/TypedArrayObject.h"
+#include "vm/Uint8Clamped.h"
+
+#include "gc/BufferAllocator-inl.h"
+#include "gc/GCContext-inl.h"  // GCContext::removeCellMemory
+#include "gc/ObjectKind-inl.h"
+#include "vm/JSContext-inl.h"
+
+using namespace js;
+using namespace wasm;
+
+
+
+const ObjectOps WasmGcObject::objectOps_ = {
+    WasmGcObject::obj_lookupProperty,            
+    WasmGcObject::obj_defineProperty,            
+    WasmGcObject::obj_hasProperty,               
+    WasmGcObject::obj_getProperty,               
+    WasmGcObject::obj_setProperty,               
+    WasmGcObject::obj_getOwnPropertyDescriptor,  
+    WasmGcObject::obj_deleteProperty,            
+    nullptr,                                     
+    nullptr,                                     
+};
+
+bool WasmGcObject::obj_lookupProperty(JSContext* cx, HandleObject obj,
+                                      HandleId id, MutableHandleObject objp,
+                                      PropertyResult* propp) {
+  objp.set(nullptr);
+  propp->setNotFound();
+  return true;
+}
+
+bool WasmGcObject::obj_defineProperty(JSContext* cx, HandleObject obj,
+                                      HandleId id,
+                                      Handle<PropertyDescriptor> desc,
+                                      ObjectOpResult& result) {
+  result.failReadOnly();
+  return true;
+}
+
+bool WasmGcObject::obj_hasProperty(JSContext* cx, HandleObject obj, HandleId id,
+                                   bool* foundp) {
+  *foundp = false;
+  return true;
+}
+
+bool WasmGcObject::obj_getProperty(JSContext* cx, HandleObject obj,
+                                   HandleValue receiver, HandleId id,
+                                   MutableHandleValue vp) {
+  vp.setUndefined();
+  return true;
+}
+
+bool WasmGcObject::obj_setProperty(JSContext* cx, HandleObject obj, HandleId id,
+                                   HandleValue v, HandleValue receiver,
+                                   ObjectOpResult& result) {
+  JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                            JSMSG_WASM_MODIFIED_GC_OBJECT);
+  return false;
+}
+
+bool WasmGcObject::obj_getOwnPropertyDescriptor(
+    JSContext* cx, HandleObject obj, HandleId id,
+    MutableHandle<mozilla::Maybe<PropertyDescriptor>> desc) {
+  desc.reset();
+  return true;
+}
+
+bool WasmGcObject::obj_deleteProperty(JSContext* cx, HandleObject obj,
+                                      HandleId id, ObjectOpResult& result) {
+  JS_ReportErrorNumberASCII(cx, GetErrorMessage, nullptr,
+                            JSMSG_WASM_MODIFIED_GC_OBJECT);
+  return false;
+}
+
+bool WasmGcObject::lookUpProperty(JSContext* cx, Handle<WasmGcObject*> obj,
+                                  jsid id, WasmGcObject::PropOffset* offset,
+                                  StorageType* type) {
+  switch (obj->kind()) {
+    case wasm::TypeDefKind::Struct: {
+      const auto& structType = obj->typeDef().structType();
+      uint32_t index;
+      if (!IdIsIndex(id, &index)) {
+        return false;
+      }
+      MOZ_ASSERT(structType.fields_.length() ==
+                 structType.fieldAccessPaths_.length());
+      if (index >= structType.fields_.length()) {
+        JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                                 JSMSG_WASM_OUT_OF_BOUNDS);
+        return false;
+      }
+      offset->set(index);
+      *type = structType.fields_[index].type;
+      return true;
+    }
+    case wasm::TypeDefKind::Array: {
+      const auto& arrayType = obj->typeDef().arrayType();
+
+      uint32_t index;
+      if (!IdIsIndex(id, &index)) {
+        return false;
+      }
+      uint32_t numElements = obj->as<WasmArrayObject>().numElements_;
+      if (index >= numElements) {
+        JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                                 JSMSG_WASM_OUT_OF_BOUNDS);
+        return false;
+      }
+      uint64_t scaledIndex =
+          uint64_t(index) * uint64_t(arrayType.elementType().size());
+      if (scaledIndex >= uint64_t(UINT32_MAX)) {
+        JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                                 JSMSG_WASM_OUT_OF_BOUNDS);
+        return false;
+      }
+      offset->set(uint32_t(scaledIndex));
+      *type = arrayType.elementType();
+      return true;
+    }
+    default:
+      MOZ_ASSERT_UNREACHABLE();
+      return false;
+  }
+}
+
+bool WasmGcObject::loadValue(JSContext* cx, Handle<WasmGcObject*> obj, jsid id,
+                             MutableHandleValue vp) {
+  WasmGcObject::PropOffset offset;
+  StorageType type;
+  if (!lookUpProperty(cx, obj, id, &offset, &type)) {
+    return false;
+  }
+
+#ifdef ENABLE_WASM_JSPI
+  if (type.isTypeRef() &&
+      type.refType().hierarchy() == RefTypeHierarchy::Cont) {
+    JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                             JSMSG_WASM_BAD_VAL_TYPE);
+    return false;
+  }
+#endif
+
+  if (!type.isExposable()) {
+    JS_ReportErrorNumberUTF8(cx, GetErrorMessage, nullptr,
+                             JSMSG_WASM_BAD_VAL_TYPE);
+    return false;
+  }
+
+  if (obj->is<WasmStructObject>()) {
+    WasmStructObject& structObj = obj->as<WasmStructObject>();
+    MOZ_RELEASE_ASSERT(structObj.kind() == TypeDefKind::Struct);
+    return ToJSValue(cx, structObj.fieldIndexToAddress(offset.get()), type, vp);
+  }
+
+  MOZ_ASSERT(obj->is<WasmArrayObject>());
+  const WasmArrayObject& arrayObj = obj->as<WasmArrayObject>();
+  return ToJSValue(cx, arrayObj.data_ + offset.get(), type, vp);
+}
+
+bool WasmGcObject::isRuntimeSubtypeOf(
+    const wasm::TypeDef* parentTypeDef) const {
+  return TypeDef::isSubTypeOf(&typeDef(), parentTypeDef);
+}
+
+bool WasmGcObject::obj_newEnumerate(JSContext* cx, HandleObject obj,
+                                    MutableHandleIdVector properties,
+                                    bool enumerableOnly) {
+  return true;
+}
+
+static void WriteValTo(WasmGcObject* owner, const Val& val, StorageType ty,
+                       void* dest) {
+  switch (ty.kind()) {
+    case StorageType::I8:
+      *((uint8_t*)dest) = val.i32();
+      break;
+    case StorageType::I16:
+      *((uint16_t*)dest) = val.i32();
+      break;
+    case StorageType::I32:
+      *((uint32_t*)dest) = val.i32();
+      break;
+    case StorageType::I64:
+      *((uint64_t*)dest) = val.i64();
+      break;
+    case StorageType::F32:
+      *((float*)dest) = val.f32();
+      break;
+    case StorageType::F64:
+      *((double*)dest) = val.f64();
+      break;
+    case StorageType::V128:
+      *((V128*)dest) = val.v128();
+      break;
+    case StorageType::Ref:
+      BarrieredSet(owner, dest, val.ref());
+      break;
+  }
+}
+
+
+size_t js::WasmArrayObject::sizeOfExcludingThis() const {
+  if (isDataInline()) {
+    return 0;
+  }
+  OOLDataHeader* oolHeader = oolDataHeaderFromDataPointer(data_);
+  if (!gc::IsBufferAlloc(oolHeader)) {
+    return 0;
+  }
+
+  return gc::GetAllocSize(zone(), oolHeader);
+}
+
+void WasmArrayObject::obj_trace(JSTracer* trc, JSObject* object) {
+  WasmArrayObject& arrayObj = object->as<WasmArrayObject>();
+  uint8_t* data = arrayObj.data_;
+
+  if (!data) {
+    MOZ_ASSERT(arrayObj.numElements_ == 0);
+    return;
+  }
+
+  if (!arrayObj.isDataInline()) {
+    OOLDataHeader* oolHeader = oolDataHeaderFromDataPointer(arrayObj.data_);
+    OOLDataHeader* prior = oolHeader;
+    TraceBufferEdge(trc, &oolHeader, "WasmArrayObject storage");
+    if (oolHeader != prior) {
+      arrayObj.data_ = oolDataHeaderToDataPointer(oolHeader);
+    }
+  }
+
+  const auto& typeDef = arrayObj.typeDef();
+  const auto& arrayType = typeDef.arrayType();
+  if (!arrayType.elementType().isRefRepr()) {
+    return;
+  }
+
+  uint32_t numElements = arrayObj.numElements_;
+  uint32_t elemSize = arrayType.elementType().size();
+  for (uint32_t i = 0; i < numElements; i++) {
+    AnyRef* elementPtr = reinterpret_cast<AnyRef*>(data + i * elemSize);
+    TraceManuallyBarrieredEdge(trc, elementPtr, "wasm-array-element");
+  }
+}
+
+size_t WasmArrayObject::obj_moved(JSObject* objNew, JSObject* objOld) {
+  MOZ_ASSERT(objNew != objOld);
+
+  WasmArrayObject& arrayNew = objNew->as<WasmArrayObject>();
+  WasmArrayObject& arrayOld = objOld->as<WasmArrayObject>();
+
+  const TypeDef* typeDefNew = &arrayNew.typeDef();
+  mozilla::DebugOnly<const TypeDef*> typeDefOld = &arrayOld.typeDef();
+  MOZ_ASSERT(typeDefNew->isArrayType());
+  MOZ_ASSERT(typeDefOld == typeDefNew);
+
+  MOZ_ASSERT(arrayNew.data_ == arrayOld.data_);
+
+  if (arrayOld.isDataInline()) {
+    arrayNew.data_ = WasmArrayObject::addressOfInlineArrayData(&arrayNew);
+    MOZ_ASSERT(arrayNew.isDataInline());
+    return 0;
+  }
+
+
+  bool newIsInNursery = IsInsideNursery(objNew);
+  bool oldIsInNursery = IsInsideNursery(objOld);
+
+  if (!oldIsInNursery && !newIsInNursery) {
+    return 0;
+  }
+
+  MOZ_RELEASE_ASSERT(oldIsInNursery);
+
+
+  size_t oolBlockSize = calcArrayDataBytesUnchecked(
+      typeDefNew->arrayType().elementType().size(), arrayNew.numElements_);
+  MOZ_RELEASE_ASSERT(oolBlockSize <= size_t(MaxArrayPayloadBytes));
+  oolBlockSize += sizeof(WasmArrayObject::OOLDataHeader);
+
+  OOLDataHeader* oolHeaderOld = oolDataHeaderFromDataPointer(arrayNew.data_);
+  OOLDataHeader* oolHeaderNew = oolHeaderOld;
+  Nursery& nursery = objNew->runtimeFromMainThread()->gc.nursery();
+  nursery.maybeMoveBufferOnPromotion(&oolHeaderNew, objNew, oolBlockSize);
+
+  if (oolHeaderNew != oolHeaderOld) {
+    arrayNew.data_ = oolDataHeaderToDataPointer(oolHeaderNew);
+    MOZ_RELEASE_ASSERT(oolBlockSize > sizeof(OOLDataHeader));
+    if (nursery.isInside(oolHeaderOld)) {
+      MOZ_ASSERT((uintptr_t(oolHeaderNew) & 1) == 0);
+      oolHeaderOld->word = uintptr_t(oolHeaderNew) | 1;
+      oolHeaderNew->word = WasmArrayObject::OOLDataHeader_Magic;
+    }
+  }
+
+  return 0;
+}
+
+void WasmArrayObject::storeVal(const Val& val, uint32_t itemIndex) {
+  const ArrayType& arrayType = typeDef().arrayType();
+  size_t elementSize = arrayType.elementType().size();
+  MOZ_ASSERT(itemIndex < numElements_);
+  uint8_t* data = data_ + elementSize * itemIndex;
+  WriteValTo(this, val, arrayType.elementType(), data);
+}
+
+void WasmArrayObject::fillVal(const Val& val, uint32_t itemIndex,
+                              uint32_t len) {
+  const ArrayType& arrayType = typeDef().arrayType();
+  size_t elementSize = arrayType.elementType().size();
+  uint8_t* data = data_ + elementSize * itemIndex;
+  MOZ_ASSERT(itemIndex <= numElements_ && len <= numElements_ - itemIndex);
+  for (uint32_t i = 0; i < len; i++) {
+    WriteValTo(this, val, arrayType.elementType(), data);
+    data += elementSize;
+  }
+}
+
+static const JSClassOps WasmArrayObjectClassOps = {
+    .newEnumerate = WasmGcObject::obj_newEnumerate,
+    .trace = WasmArrayObject::obj_trace,
+};
+static const ClassExtension WasmArrayObjectClassExt = {
+    WasmArrayObject::obj_moved, 
+};
+const JSClass WasmArrayObject::class_ = {
+    "WasmArrayObject",
+    JSClass::NON_NATIVE | JSCLASS_DELAY_METADATA_BUILDER,
+    &WasmArrayObjectClassOps,
+    JS_NULL_CLASS_SPEC,
+    &WasmArrayObjectClassExt,
+    &WasmGcObject::objectOps_,
+};
+
+
+size_t js::WasmStructObject::sizeOfExcludingThis() const {
+  if (!hasOOLPointer()) {
+    return 0;
+  }
+  const uint8_t* oolPointer = getOOLPointer();
+  if (!gc::IsBufferAlloc((void*)oolPointer)) {
+    return 0;
+  }
+
+  return gc::GetAllocSize(zone(), oolPointer);
+}
+
+bool WasmStructObject::getField(JSContext* cx, uint32_t index,
+                                MutableHandle<Value> val) {
+  const StructType& resultType = typeDef().structType();
+  MOZ_ASSERT(index <= resultType.fields_.length());
+  const FieldType& field = resultType.fields_[index];
+  StorageType ty = field.type.storageType();
+  return ToJSValue(cx, fieldIndexToAddress(index), ty, val);
+}
+
+uint8_t* WasmStructObject::fieldIndexToAddress(uint32_t fieldIndex) {
+  const wasm::SuperTypeVector* stv = superTypeVector_;
+  const wasm::TypeDef* typeDef = stv->typeDef();
+  MOZ_ASSERT(typeDef->superTypeVector() == stv);
+  const wasm::StructType& structType = typeDef->structType();
+  const wasm::FieldAccessPathVector& fieldAccessPaths =
+      structType.fieldAccessPaths_;
+  MOZ_RELEASE_ASSERT(fieldIndex < fieldAccessPaths.length());
+  wasm::FieldAccessPath path = fieldAccessPaths[fieldIndex];
+  uint32_t ilOffset = path.ilOffset();
+  MOZ_RELEASE_ASSERT(ilOffset != wasm::StructType::InvalidOffset);
+  if (MOZ_LIKELY(!path.hasOOL())) {
+    return (uint8_t*)this + ilOffset;
+  }
+  uint8_t* oolBlock = *(uint8_t**)((uint8_t*)this + ilOffset);
+  uint32_t oolOffset = path.oolOffset();
+  MOZ_RELEASE_ASSERT(oolOffset != wasm::StructType::InvalidOffset);
+  return oolBlock + oolOffset;
+}
+
+void WasmStructObject::obj_trace(JSTracer* trc, JSObject* object) {
+  WasmStructObject& structObj = object->as<WasmStructObject>();
+
+  const auto& structType = structObj.typeDef().structType();
+  for (uint32_t offset : structType.inlineTraceOffsets_) {
+    AnyRef* fieldPtr = reinterpret_cast<AnyRef*>((uint8_t*)&structObj + offset);
+    TraceManuallyBarrieredEdge(trc, fieldPtr, "wasm-struct-field");
+  }
+  if (MOZ_UNLIKELY(structType.totalSizeOOL_ > 0)) {
+    uint8_t** addressOfOOLPtr = structObj.addressOfOOLPointer();
+    if (MOZ_LIKELY(*addressOfOOLPtr)) {
+      TraceBufferEdge(trc, addressOfOOLPtr, "WasmStructObject outline data");
+      uint8_t* oolBase = *addressOfOOLPtr;
+      for (uint32_t offset : structType.outlineTraceOffsets_) {
+        AnyRef* fieldPtr = reinterpret_cast<AnyRef*>(oolBase + offset);
+        TraceManuallyBarrieredEdge(trc, fieldPtr, "wasm-struct-field");
+      }
+    }
+  }
+}
+
+size_t WasmStructObject::obj_moved(JSObject* objNew, JSObject* objOld) {
+  MOZ_ASSERT(objNew != objOld);
+
+  WasmStructObject& structNew = objNew->as<WasmStructObject>();
+  WasmStructObject& structOld = objOld->as<WasmStructObject>();
+  MOZ_ASSERT(structNew.hasOOLPointer() && structOld.hasOOLPointer());
+
+  const TypeDef* typeDefNew = &structNew.typeDef();
+  mozilla::DebugOnly<const TypeDef*> typeDefOld = &structOld.typeDef();
+  MOZ_ASSERT(typeDefNew == typeDefOld);
+  MOZ_ASSERT(typeDefNew->isStructType());
+  MOZ_ASSERT(typeDefOld == typeDefNew);
+
+  MOZ_ASSERT(structNew.getOOLPointer() == structOld.getOOLPointer());
+
+  bool newIsInNursery = IsInsideNursery(objNew);
+  bool oldIsInNursery = IsInsideNursery(objOld);
+
+  if (!oldIsInNursery && !newIsInNursery) {
+    return 0;
+  }
+
+  MOZ_RELEASE_ASSERT(oldIsInNursery);
+
+
+  const StructType& structType = typeDefNew->structType();
+  uint32_t outlineBytes = structType.totalSizeOOL_;
+  MOZ_ASSERT((outlineBytes > 0) == structNew.hasOOLPointer());
+  MOZ_ASSERT(outlineBytes > 0);
+
+  Nursery& nursery = structNew.runtimeFromMainThread()->gc.nursery();
+  uint8_t** addressOfOOLPointerNew = structNew.addressOfOOLPointer();
+  nursery.maybeMoveBufferOnPromotion(addressOfOOLPointerNew, objNew,
+                                     outlineBytes);
+
+  uint8_t* oolPointerOld = structOld.getOOLPointer();
+  uint8_t* oolPointerNew = structNew.getOOLPointer();
+  MOZ_RELEASE_ASSERT(outlineBytes >= sizeof(uintptr_t));
+  if (oolPointerOld != oolPointerNew) {
+    nursery.setForwardingPointerWhileTenuring(oolPointerOld, oolPointerNew,
+                                              true);
+  }
+
+  return 0;
+}
+
+void WasmStructObject::storeVal(const Val& val, uint32_t fieldIndex) {
+  const StructType& structType = typeDef().structType();
+  MOZ_ASSERT(fieldIndex < structType.fields_.length());
+
+  StorageType fieldType = structType.fields_[fieldIndex].type;
+  uint8_t* data = fieldIndexToAddress(fieldIndex);
+
+  WriteValTo(this, val, fieldType, data);
+}
+
+static const JSClassOps WasmStructObjectOutlineClassOps = {
+    .newEnumerate = WasmGcObject::obj_newEnumerate,
+    .trace = WasmStructObject::obj_trace,
+};
+static const ClassExtension WasmStructObjectOutlineClassExt = {
+    WasmStructObject::obj_moved, 
+};
+const JSClass WasmStructObject::classOutline_ = {
+    "WasmStructObject",
+    JSClass::NON_NATIVE | JSCLASS_DELAY_METADATA_BUILDER,
+    &WasmStructObjectOutlineClassOps,
+    JS_NULL_CLASS_SPEC,
+    &WasmStructObjectOutlineClassExt,
+    &WasmGcObject::objectOps_,
+};
+
+static const JSClassOps WasmStructObjectInlineClassOps = {
+    .newEnumerate = WasmGcObject::obj_newEnumerate,
+    .trace = WasmStructObject::obj_trace,
+};
+static const ClassExtension WasmStructObjectInlineClassExt = {
+    nullptr, 
+};
+const JSClass WasmStructObject::classInline_ = {
+    "WasmStructObject",
+    JSClass::NON_NATIVE | JSCLASS_DELAY_METADATA_BUILDER,
+    &WasmStructObjectInlineClassOps,
+    JS_NULL_CLASS_SPEC,
+    &WasmStructObjectInlineClassExt,
+    &WasmGcObject::objectOps_,
+};

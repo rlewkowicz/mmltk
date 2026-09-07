@@ -1,0 +1,136 @@
+// Copyright 2017 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef ABSL_BASE_INTERNAL_LOW_LEVEL_SCHEDULING_H_
+#define ABSL_BASE_INTERNAL_LOW_LEVEL_SCHEDULING_H_
+
+#include <atomic>
+
+#include "absl/base/internal/raw_logging.h"
+#include "absl/base/internal/scheduling_mode.h"
+#include "absl/base/internal/thread_identity.h"
+#include "absl/base/macros.h"
+
+extern "C" bool __google_disable_rescheduling(void);
+extern "C" void __google_enable_rescheduling(bool disable_result);
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+class CondVar;
+class Mutex;
+
+namespace synchronization_internal {
+int MutexDelay(int32_t c, int mode);
+}  
+
+namespace base_internal {
+
+class SchedulingHelper;  
+class SpinLock;          
+
+class SchedulingGuard {
+ public:
+  static bool ReschedulingIsAllowed();
+  SchedulingGuard(const SchedulingGuard&) = delete;
+  SchedulingGuard& operator=(const SchedulingGuard&) = delete;
+
+  static bool DisableRescheduling();
+
+  static void EnableRescheduling(bool disable_result);
+
+  struct ScopedDisable {
+    ScopedDisable() { disabled = SchedulingGuard::DisableRescheduling(); }
+    ~ScopedDisable() { SchedulingGuard::EnableRescheduling(disabled); }
+
+    bool disabled;
+  };
+
+  class ScopedEnable {
+   public:
+    ScopedEnable();
+    ~ScopedEnable();
+
+   private:
+    int scheduling_disabled_depth_;
+  };
+};
+
+
+inline bool SchedulingGuard::ReschedulingIsAllowed() {
+  ThreadIdentity* identity = CurrentThreadIdentityIfPresent();
+  if (identity != nullptr) {
+    ThreadIdentity::SchedulerState* state = &identity->scheduler_state;
+    return state->bound_schedulable.load(std::memory_order_relaxed) !=
+               nullptr &&
+           state->scheduling_disabled_depth.load(std::memory_order_relaxed) ==
+               0;
+  } else {
+    return false;
+  }
+}
+
+inline bool SchedulingGuard::DisableRescheduling() {
+  ThreadIdentity* identity;
+  identity = CurrentThreadIdentityIfPresent();
+  if (identity != nullptr) {
+    int old_val = identity->scheduler_state.scheduling_disabled_depth.load(
+        std::memory_order_relaxed);
+    identity->scheduler_state.scheduling_disabled_depth.store(
+        old_val + 1, std::memory_order_relaxed);
+    return true;
+  } else {
+    return false;
+  }
+}
+
+inline void SchedulingGuard::EnableRescheduling(bool disable_result) {
+  if (!disable_result) {
+    return;
+  }
+
+  ThreadIdentity* identity;
+  identity = CurrentThreadIdentityIfPresent();
+  int old_val = identity->scheduler_state.scheduling_disabled_depth.load(
+      std::memory_order_relaxed);
+  identity->scheduler_state.scheduling_disabled_depth.store(
+      old_val - 1, std::memory_order_relaxed);
+}
+
+inline SchedulingGuard::ScopedEnable::ScopedEnable() {
+  ThreadIdentity* identity;
+  identity = CurrentThreadIdentityIfPresent();
+  if (identity != nullptr) {
+    scheduling_disabled_depth_ =
+        identity->scheduler_state.scheduling_disabled_depth.load(
+            std::memory_order_relaxed);
+    if (scheduling_disabled_depth_ != 0) {
+      identity->scheduler_state.scheduling_disabled_depth.store(
+          0, std::memory_order_relaxed);
+    }
+  } else {
+    scheduling_disabled_depth_ = 0;
+  }
+}
+
+inline SchedulingGuard::ScopedEnable::~ScopedEnable() {
+  if (scheduling_disabled_depth_ == 0) {
+    return;
+  }
+  ThreadIdentity* identity = CurrentThreadIdentityIfPresent();
+  identity->scheduler_state.scheduling_disabled_depth.store(
+      scheduling_disabled_depth_, std::memory_order_relaxed);
+}
+
+}  
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_BASE_INTERNAL_LOW_LEVEL_SCHEDULING_H_

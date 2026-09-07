@@ -1,0 +1,114 @@
+/*
+ * Copyright 2024 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkKnownRuntimeEffects_DEFINED)
+#define SkKnownRuntimeEffects_DEFINED
+
+#include "include/core/SkRefCnt.h"
+#include <cstdint>
+
+class SkRuntimeEffect;
+
+namespace SkKnownRuntimeEffects {
+
+static constexpr int kSkiaBuiltInReservedCnt = 500;
+static constexpr int kSkiaKnownRuntimeEffectsReservedCnt = 500;
+static constexpr int kUserDefinedKnownRuntimeEffectsReservedCnt = 100;
+
+static constexpr int kSkiaKnownRuntimeEffectsStart = kSkiaBuiltInReservedCnt;
+static constexpr int kSkiaKnownRuntimeEffectsEnd = kSkiaKnownRuntimeEffectsStart +
+                                                   kSkiaKnownRuntimeEffectsReservedCnt;
+
+static constexpr int kUserDefinedKnownRuntimeEffectsStart = kSkiaKnownRuntimeEffectsEnd;
+static constexpr int kUserDefinedKnownRuntimeEffectsEnd =
+        kUserDefinedKnownRuntimeEffectsStart + kUserDefinedKnownRuntimeEffectsReservedCnt;
+
+static constexpr int kUnknownRuntimeEffectIDStart = kUserDefinedKnownRuntimeEffectsEnd;
+
+#define SK_ALL_STABLEKEYS(M, M1, M2) \
+    M2(Invalid, Start)      \
+    M1(1DBlurBase)          \
+    M2(1DBlur4, 1DBlurBase) \
+    M(1DBlur8)              \
+    M(1DBlur12)             \
+    M(1DBlur16)             \
+    M(1DBlur20)             \
+    M(1DBlur28)             \
+    M1(2DBlurBase)          \
+    M2(2DBlur4, 2DBlurBase) \
+    M(2DBlur8)              \
+    M(2DBlur12)             \
+    M(2DBlur16)             \
+    M(2DBlur20)             \
+    M(2DBlur28)             \
+    M(Blend)                \
+    M(Decal)                \
+    M(Displacement)         \
+    M(Lighting)             \
+    M(LinearMorphology)     \
+    M(Magnifier)            \
+    M(MatrixConvUniforms)   \
+    M(MatrixConvTexSm)      \
+    M(MatrixConvTexLg)      \
+    M(Normal)               \
+    M(SparseMorphology)     \
+    M(Arithmetic)           \
+    M(HighContrast)         \
+    M(Lerp)                 \
+    M(Luma)                 \
+    M(Overdraw)
+
+enum class StableKey : uint32_t {
+    kStart =   kSkiaKnownRuntimeEffectsStart,
+
+#define M(type) k##type,
+#define M1(type) k##type,
+#define M2(type, initializer) k##type = k##initializer,
+    SK_ALL_STABLEKEYS(M, M1, M2)
+#undef M2
+#undef M1
+#undef M
+
+    kLast =    kOverdraw,
+};
+
+static const int kStableKeyCnt = static_cast<int>(StableKey::kLast) -
+                                 static_cast<int>(StableKey::kStart) + 1;
+
+static_assert(static_cast<uint32_t>(StableKey::kStart) != 0);
+
+static_assert(static_cast<int>(StableKey::kLast) < kSkiaKnownRuntimeEffectsEnd);
+
+bool IsSkiaKnownRuntimeEffect(int candidate);
+
+bool IsUserDefinedRuntimeEffect(int candidate);
+
+bool IsViableUserDefinedKnownRuntimeEffect(int candidate);
+
+sk_sp<SkRuntimeEffect> MaybeGetKnownRuntimeEffect(uint32_t candidate);
+
+const SkRuntimeEffect* GetKnownRuntimeEffect(StableKey);
+
+static_assert(static_cast<int>(StableKey::kInvalid)  == static_cast<int>(StableKey::kStart));
+
+static_assert(static_cast<int>(StableKey::k1DBlur4)  == static_cast<int>(StableKey::k1DBlurBase));
+static_assert(static_cast<int>(StableKey::k1DBlur8)  == static_cast<int>(StableKey::k1DBlurBase)+1);
+static_assert(static_cast<int>(StableKey::k1DBlur12) == static_cast<int>(StableKey::k1DBlurBase)+2);
+static_assert(static_cast<int>(StableKey::k1DBlur16) == static_cast<int>(StableKey::k1DBlurBase)+3);
+static_assert(static_cast<int>(StableKey::k1DBlur20) == static_cast<int>(StableKey::k1DBlurBase)+4);
+static_assert(static_cast<int>(StableKey::k1DBlur28) == static_cast<int>(StableKey::k1DBlurBase)+5);
+
+static_assert(static_cast<int>(StableKey::k2DBlur4)  == static_cast<int>(StableKey::k2DBlurBase));
+static_assert(static_cast<int>(StableKey::k2DBlur8)  == static_cast<int>(StableKey::k2DBlurBase)+1);
+static_assert(static_cast<int>(StableKey::k2DBlur12) == static_cast<int>(StableKey::k2DBlurBase)+2);
+static_assert(static_cast<int>(StableKey::k2DBlur16) == static_cast<int>(StableKey::k2DBlurBase)+3);
+static_assert(static_cast<int>(StableKey::k2DBlur20) == static_cast<int>(StableKey::k2DBlurBase)+4);
+static_assert(static_cast<int>(StableKey::k2DBlur28) == static_cast<int>(StableKey::k2DBlurBase)+5);
+
+} 
+
+#endif

@@ -1,0 +1,134 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_BounceTrackingState_h
+#define mozilla_BounceTrackingState_h
+
+#include "BounceTrackingRecord.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/WeakPtr.h"
+#include "mozilla/OriginAttributes.h"
+#include "nsIPrincipal.h"
+#include "nsStringFwd.h"
+#include "nsIWebProgressListener.h"
+#include "nsWeakReference.h"
+#include "fmt/format.h"
+
+class nsIChannel;
+class nsITimer;
+class nsIPrincipal;
+
+namespace mozilla {
+
+class BounceTrackingProtection;
+
+namespace dom {
+class CanonicalBrowsingContext;
+class BrowsingContext;
+class BrowsingContextWebProgress;
+}  
+
+class BounceTrackingState : public nsIWebProgressListener,
+                            public nsSupportsWeakReference,
+                            public SupportsWeakPtr {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIWEBPROGRESSLISTENER
+
+  static already_AddRefed<BounceTrackingState> GetOrCreate(
+      dom::BrowsingContextWebProgress* aWebProgress, nsresult& aRv);
+
+  static void ResetAll();
+
+  static void DestroyAll();
+
+  static void ResetAllForOriginAttributes(
+      const OriginAttributes& aOriginAttributes);
+  static void ResetAllForOriginAttributesPattern(
+      const OriginAttributesPattern& aPattern);
+
+  BounceTrackingRecord* GetBounceTrackingRecord();
+
+  void ResetBounceTrackingRecord();
+
+  void OnBrowsingContextDiscarded();
+
+  [[nodiscard]] nsresult OnDocumentStartRequest(nsIChannel* aChannel);
+
+  [[nodiscard]] nsresult OnStartNavigation(
+      nsIPrincipal* aTriggeringPrincipal,
+      const bool aHasValidUserGestureActivation);
+
+  static bool ShouldCreateBounceTrackingStateForBC(
+      dom::CanonicalBrowsingContext* aBrowsingContext);
+
+  static bool ShouldTrackPrincipal(nsIPrincipal* aPrincipal);
+
+  [[nodiscard]] static nsresult HasBounceTrackingStateForSite(
+      const nsACString& aSiteHost, const OriginAttributes& aOriginAttributes,
+      bool& aResult);
+
+  already_AddRefed<dom::BrowsingContext> CurrentBrowsingContext();
+
+  uint64_t GetBrowserId() { return mBrowserId; }
+
+  const OriginAttributes& OriginAttributesRef();
+
+  [[nodiscard]] nsresult OnUserActivation(const nsACString& aSiteHost);
+
+ private:
+  explicit BounceTrackingState();
+  virtual ~BounceTrackingState();
+
+  bool mIsInitialized{false};
+
+  uint64_t mBrowserId{};
+
+  OriginAttributes mOriginAttributes;
+
+  RefPtr<BounceTrackingProtection> mBounceTrackingProtection;
+
+  RefPtr<BounceTrackingRecord> mBounceTrackingRecord;
+
+  RefPtr<nsITimer> mClientBounceDetectionTimeout;
+
+  static void Reset(const OriginAttributes* aOriginAttributes,
+                    const OriginAttributesPattern* aPattern);
+
+  static bool ShouldCreateBounceTrackingStateForWebProgress(
+      dom::BrowsingContextWebProgress* aWebProgress);
+
+  [[nodiscard]] nsresult Init(dom::BrowsingContextWebProgress* aWebProgress);
+
+  [[nodiscard]] nsresult OnResponseReceived(
+      const nsTArray<nsCString>& aSiteList);
+
+  [[nodiscard]] nsresult OnDocumentLoaded(nsIPrincipal* aDocumentPrincipal);
+
+  friend struct fmt::formatter<BounceTrackingState>;
+};
+
+}  
+
+template <>
+struct fmt::formatter<mozilla::BounceTrackingState>
+    : fmt::formatter<std::string_view> {
+  auto format(const mozilla::BounceTrackingState& aState,
+              fmt::format_context& aCtx) const {
+    nsAutoCString oaSuffix;
+    aState.mOriginAttributes.CreateSuffix(oaSuffix);
+
+    auto out = aCtx.out();
+    out = fmt::format_to(out, "{{ mBounceTrackingRecord: ");
+    if (aState.mBounceTrackingRecord) {
+      out = fmt::format_to(out, "{}", *aState.mBounceTrackingRecord);
+    } else {
+      out = fmt::format_to(out, "null");
+    }
+    return fmt::format_to(out, ", mOriginAttributes: {}, mBrowserId: {} }}",
+                          oaSuffix, aState.mBrowserId);
+  }
+};
+
+#endif

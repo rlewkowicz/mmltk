@@ -1,0 +1,148 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef js_ArrayBuffer_h
+#define js_ArrayBuffer_h
+
+#include "mozilla/UniquePtr.h"
+
+#include <stddef.h>  // size_t
+#include <stdint.h>  // uint32_t
+
+#include "jstypes.h"  // JS_PUBLIC_API
+#include "js/TypeDecls.h"
+#include "js/Utility.h"
+
+struct JS_PUBLIC_API JSContext;
+class JS_PUBLIC_API JSObject;
+
+namespace JS {
+
+class JS_PUBLIC_API AutoRequireNoGC;
+
+
+extern JS_PUBLIC_API JSObject* NewArrayBuffer(JSContext* cx, size_t nbytes);
+
+extern JS_PUBLIC_API JSObject* NewArrayBufferWithContents(
+    JSContext* cx, size_t nbytes,
+    mozilla::UniquePtr<void, JS::FreePolicy> contents);
+
+inline JS_PUBLIC_API JSObject* NewArrayBufferWithContents(
+    JSContext* cx, size_t nbytes,
+    mozilla::UniquePtr<char[], JS::FreePolicy> contents) {
+  mozilla::UniquePtr<void, JS::FreePolicy> ptr{contents.release()};
+  return NewArrayBufferWithContents(cx, nbytes, std::move(ptr));
+}
+
+inline JS_PUBLIC_API JSObject* NewArrayBufferWithContents(
+    JSContext* cx, size_t nbytes,
+    mozilla::UniquePtr<uint8_t[], JS::FreePolicy> contents) {
+  mozilla::UniquePtr<void, JS::FreePolicy> ptr{contents.release()};
+  return NewArrayBufferWithContents(cx, nbytes, std::move(ptr));
+}
+
+enum class NewArrayBufferOutOfMemory { CallerMustFreeMemory };
+
+extern JS_PUBLIC_API JSObject* NewArrayBufferWithContents(
+    JSContext* cx, size_t nbytes, void* contents, NewArrayBufferOutOfMemory);
+
+extern JS_PUBLIC_API JSObject* CopyArrayBuffer(
+    JSContext* cx, JS::Handle<JSObject*> maybeArrayBuffer);
+
+using BufferContentsFreeFunc = void (*)(void* contents, void* userData);
+
+class JS_PUBLIC_API BufferContentsDeleter {
+  BufferContentsFreeFunc freeFunc_ = nullptr;
+  void* userData_ = nullptr;
+
+ public:
+  MOZ_IMPLICIT BufferContentsDeleter(BufferContentsFreeFunc freeFunc,
+                                     void* userData = nullptr)
+      : freeFunc_(freeFunc), userData_(userData) {}
+
+  void operator()(void* contents) const { freeFunc_(contents, userData_); }
+
+  BufferContentsFreeFunc freeFunc() const { return freeFunc_; }
+  void* userData() const { return userData_; }
+};
+
+extern JS_PUBLIC_API JSObject* NewExternalArrayBuffer(
+    JSContext* cx, size_t nbytes,
+    mozilla::UniquePtr<void, BufferContentsDeleter> contents);
+
+extern JS_PUBLIC_API JSObject* NewArrayBufferWithUserOwnedContents(
+    JSContext* cx, size_t nbytes, void* contents);
+
+extern JS_PUBLIC_API JSObject* NewMappedArrayBufferWithContents(JSContext* cx,
+                                                                size_t nbytes,
+                                                                void* contents);
+
+extern JS_PUBLIC_API void* CreateMappedArrayBufferContents(int fd,
+                                                           size_t offset,
+                                                           size_t length);
+
+extern JS_PUBLIC_API void ReleaseMappedArrayBufferContents(void* contents,
+                                                           size_t length);
+
+
+extern JS_PUBLIC_API bool IsArrayBufferObject(JSObject* obj);
+
+
+extern JS_PUBLIC_API bool IsDetachedArrayBufferObject(JSObject* obj);
+
+extern JS_PUBLIC_API bool IsMappedArrayBufferObject(JSObject* obj);
+
+extern JS_PUBLIC_API bool ArrayBufferHasData(JSObject* obj);
+
+
+extern JS_PUBLIC_API JSObject* UnwrapArrayBuffer(JSObject* obj);
+
+/**
+ * Attempt to unwrap |obj| as an ArrayBuffer.
+ *
+ * If |obj| *is* an ArrayBuffer, return it unwrapped and set |*length| and
+ * |*data| to weakly refer to the ArrayBuffer's contents.
+ *
+ * If |obj| isn't an ArrayBuffer, return nullptr and do not modify |*length| or
+ * |*data|.
+ */
+extern JS_PUBLIC_API JSObject* GetObjectAsArrayBuffer(JSObject* obj,
+                                                      size_t* length,
+                                                      uint8_t** data);
+
+extern JS_PUBLIC_API size_t GetArrayBufferByteLength(JSObject* obj);
+
+extern JS_PUBLIC_API void GetArrayBufferLengthAndData(JSObject* obj,
+                                                      size_t* length,
+                                                      bool* isSharedMemory,
+                                                      uint8_t** data);
+
+extern JS_PUBLIC_API uint8_t* GetArrayBufferData(JSObject* obj,
+                                                 bool* isSharedMemory,
+                                                 const AutoRequireNoGC&);
+
+
+extern JS_PUBLIC_API bool DetachArrayBuffer(JSContext* cx,
+                                            Handle<JSObject*> obj);
+
+extern JS_PUBLIC_API bool HasDefinedArrayBufferDetachKey(JSContext* cx,
+                                                         Handle<JSObject*> obj,
+                                                         bool* isDefined);
+
+extern JS_PUBLIC_API void* StealArrayBufferContents(JSContext* cx,
+                                                    Handle<JSObject*> obj);
+
+[[nodiscard]] extern JS_PUBLIC_API bool ArrayBufferCopyData(
+    JSContext* cx, Handle<JSObject*> toBlock, size_t toIndex,
+    Handle<JSObject*> fromBlock, size_t fromIndex, size_t count);
+
+extern JS_PUBLIC_API JSObject* ArrayBufferClone(JSContext* cx,
+                                                Handle<JSObject*> srcBuffer,
+                                                size_t srcByteOffset,
+                                                size_t srcLength);
+
+}  
+
+#endif /* js_ArrayBuffer_h */

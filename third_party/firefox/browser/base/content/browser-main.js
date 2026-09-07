@@ -1,0 +1,41 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+// prettier-ignore
+// eslint-disable-next-line no-lone-blocks
+{
+  Services.scriptloader.loadSubScript("chrome://browser/content/browser-init.js", this);
+  Services.scriptloader.loadSubScript("chrome://global/content/contentAreaUtils.js", this);
+  Services.scriptloader.loadSubScript("chrome://browser/content/browser-pageActions.js", this);
+  Services.scriptloader.loadSubScript("chrome://browser/content/browser-customtitlebar.js", this);
+  Services.scriptloader.loadSubScript("chrome://browser/content/tabbrowser/drag-and-drop.js", this);
+  Services.scriptloader.loadSubScript("chrome://browser/content/tabbrowser/split-view-footer.js", this);
+  Services.scriptloader.loadSubScript("chrome://browser/content/tabbrowser/tab.js", this);
+  Services.scriptloader.loadSubScript("chrome://browser/content/tabbrowser/tabbrowser.js", this);
+  Services.scriptloader.loadSubScript("chrome://browser/content/tabbrowser/tab-context-menu.js", this);
+  Services.scriptloader.loadSubScript("chrome://browser/content/tabbrowser/tabgroup.js", this);
+  Services.scriptloader.loadSubScript("chrome://browser/content/tabbrowser/tabgroup-menu.js", this);
+  Services.scriptloader.loadSubScript("chrome://browser/content/tabbrowser/tabs.js", this);
+  Services.scriptloader.loadSubScript("chrome://browser/content/tabbrowser/tabsplitview.js", this);
+  if (AppConstants.MOZ_PLACES) {
+    Services.scriptloader.loadSubScript("chrome://browser/content/places/places-menupopup.js", this);
+  }
+  ChromeUtils.importESModule("chrome://browser/content/urlbar/UrlbarInput.mjs", { global: "current" });
+}
+
+window.onload = gBrowserInit.onLoad.bind(gBrowserInit);
+window.onunload = gBrowserInit.onUnload.bind(gBrowserInit);
+window.onclose = WindowIsClosing;
+
+window.addEventListener(
+  "MozBeforeInitialXULLayout",
+  gBrowserInit.onBeforeInitialXULLayout.bind(gBrowserInit),
+  { once: true }
+);
+
+window.addEventListener(
+  "DOMContentLoaded",
+  gBrowserInit.onDOMContentLoaded.bind(gBrowserInit),
+  { once: true }
+);

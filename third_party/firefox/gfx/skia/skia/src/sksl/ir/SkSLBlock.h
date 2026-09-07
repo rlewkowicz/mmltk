@@ -1,0 +1,100 @@
+/*
+ * Copyright 2016 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SKSL_BLOCK)
+#define SKSL_BLOCK
+
+#include "src/sksl/SkSLDefines.h"
+#include "src/sksl/SkSLPosition.h"
+#include "src/sksl/ir/SkSLIRNode.h"
+#include "src/sksl/ir/SkSLStatement.h"
+#include "src/sksl/ir/SkSLSymbolTable.h"
+
+#include <memory>
+#include <string>
+#include <utility>
+
+namespace SkSL {
+
+class Block final : public Statement {
+public:
+    inline static constexpr Kind kIRNodeKind = Kind::kBlock;
+
+    enum class Kind {
+        kUnbracedBlock,      
+        kBracedScope,        
+        kCompoundStatement,  
+    };
+
+    Block(Position pos,
+          StatementArray statements,
+          Kind kind = Kind::kBracedScope,
+          std::unique_ptr<SymbolTable> symbols = nullptr)
+            : INHERITED(pos, kIRNodeKind)
+            , fSymbolTable(std::move(symbols))
+            , fChildren(std::move(statements))
+            , fBlockKind(kind) {}
+
+    static std::unique_ptr<Statement> Make(Position pos,
+                                           StatementArray statements,
+                                           Kind kind = Kind::kBracedScope,
+                                           std::unique_ptr<SymbolTable> symbols = nullptr);
+
+    static std::unique_ptr<Statement> MakeCompoundStatement(std::unique_ptr<Statement> existing,
+                                                            std::unique_ptr<Statement> additional);
+
+    static std::unique_ptr<Block> MakeBlock(Position pos,
+                                            StatementArray statements,
+                                            Kind kind = Kind::kBracedScope,
+                                            std::unique_ptr<SymbolTable> symbols = nullptr);
+
+    const StatementArray& children() const {
+        return fChildren;
+    }
+
+    StatementArray& children() {
+        return fChildren;
+    }
+
+    bool isScope() const {
+        return fBlockKind == Kind::kBracedScope;
+    }
+
+    Kind blockKind() const {
+        return fBlockKind;
+    }
+
+    void setBlockKind(Kind kind) {
+        fBlockKind = kind;
+    }
+
+    SymbolTable* symbolTable() const {
+        return fSymbolTable.get();
+    }
+
+    bool isEmpty() const override {
+        for (const std::unique_ptr<Statement>& stmt : this->children()) {
+            if (!stmt->isEmpty()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    std::string description() const override;
+
+private:
+    std::unique_ptr<SymbolTable> fSymbolTable;
+    StatementArray fChildren;
+    Kind fBlockKind;
+
+    using INHERITED = Statement;
+};
+
+}  
+
+#endif

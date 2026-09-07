@@ -1,0 +1,698 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "PersistentBufferProvider.h"
+
+#include "mozilla/layers/KnowsCompositor.h"
+#include "mozilla/layers/RemoteTextureMap.h"
+#include "mozilla/layers/TextureClient.h"
+#include "mozilla/layers/TextureForwarder.h"
+#include "mozilla/layers/TextureRecorded.h"
+#include "mozilla/gfx/gfxVars.h"
+#include "mozilla/gfx/CanvasManagerChild.h"
+#include "mozilla/gfx/DrawTargetWebgl.h"
+#include "mozilla/gfx/Logging.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/StaticPrefs_layers.h"
+#include "pratom.h"
+#include "gfxPlatform.h"
+
+namespace mozilla {
+
+using namespace gfx;
+
+namespace layers {
+
+PersistentBufferProviderBasic::PersistentBufferProviderBasic(DrawTarget* aDt)
+    : mDrawTarget(aDt) {
+  MOZ_COUNT_CTOR(PersistentBufferProviderBasic);
+}
+
+PersistentBufferProviderBasic::~PersistentBufferProviderBasic() {
+  MOZ_COUNT_DTOR(PersistentBufferProviderBasic);
+  Destroy();
+}
+
+already_AddRefed<gfx::DrawTarget>
+PersistentBufferProviderBasic::BorrowDrawTarget(
+    const gfx::IntRect& aPersistedRect) {
+  MOZ_ASSERT(!mSnapshot);
+  RefPtr<gfx::DrawTarget> dt(mDrawTarget);
+  return dt.forget();
+}
+
+bool PersistentBufferProviderBasic::ReturnDrawTarget(
+    already_AddRefed<gfx::DrawTarget> aDT) {
+  RefPtr<gfx::DrawTarget> dt(aDT);
+  MOZ_ASSERT(mDrawTarget == dt);
+  if (dt) {
+    dt->Flush();
+  }
+  return true;
+}
+
+already_AddRefed<gfx::SourceSurface>
+PersistentBufferProviderBasic::BorrowSnapshot(gfx::DrawTarget* aTarget) {
+  mSnapshot = mDrawTarget->Snapshot();
+  RefPtr<SourceSurface> snapshot = mSnapshot;
+  return snapshot.forget();
+}
+
+void PersistentBufferProviderBasic::ReturnSnapshot(
+    already_AddRefed<gfx::SourceSurface> aSnapshot) {
+  RefPtr<SourceSurface> snapshot = aSnapshot;
+  MOZ_ASSERT(!snapshot || snapshot == mSnapshot);
+  mSnapshot = nullptr;
+}
+
+void PersistentBufferProviderBasic::Destroy() {
+  mSnapshot = nullptr;
+  mDrawTarget = nullptr;
+}
+
+already_AddRefed<PersistentBufferProviderBasic>
+PersistentBufferProviderBasic::Create(gfx::IntSize aSize,
+                                      gfx::SurfaceFormat aFormat,
+                                      gfx::BackendType aBackend) {
+  RefPtr<DrawTarget> dt =
+      gfxPlatform::GetPlatform()->CreateDrawTargetForBackend(aBackend, aSize,
+                                                             aFormat);
+
+  if (dt) {
+    dt->ClearRect(Rect(0, 0, 0, 0));
+  }
+
+  if (!dt || !dt->IsValid()) {
+    return nullptr;
+  }
+
+  RefPtr provider = MakeRefPtr<PersistentBufferProviderBasic>(dt);
+
+  return provider.forget();
+}
+
+static already_AddRefed<TextureClient> CreateTexture(
+    KnowsCompositor* aKnowsCompositor, gfx::SurfaceFormat aFormat,
+    gfx::IntSize aSize, bool aWillReadFrequently = false,
+    bool aUseRemoteTexture = false) {
+  TextureAllocationFlags flags = ALLOC_DEFAULT;
+  if (aWillReadFrequently) {
+    flags = TextureAllocationFlags(flags | ALLOC_DO_NOT_ACCELERATE);
+  }
+  if (aUseRemoteTexture) {
+    flags = TextureAllocationFlags(flags | ALLOC_FORCE_REMOTE);
+  }
+  RefPtr<TextureClient> tc = TextureClient::CreateForDrawing(
+      aKnowsCompositor, aFormat, aSize, BackendSelector::Canvas,
+      TextureFlags::DEFAULT | TextureFlags::NON_BLOCKING_READ_LOCK, flags);
+  return tc.forget();
+}
+
+already_AddRefed<PersistentBufferProviderAccelerated>
+PersistentBufferProviderAccelerated::Create(gfx::IntSize aSize,
+                                            gfx::SurfaceFormat aFormat,
+                                            KnowsCompositor* aKnowsCompositor) {
+  if (!aKnowsCompositor || !aKnowsCompositor->GetTextureForwarder() ||
+      !aKnowsCompositor->GetTextureForwarder()->IPCOpen()) {
+    return nullptr;
+  }
+
+  if (!DrawTargetWebgl::CanCreate(aSize, aFormat)) {
+    return nullptr;
+  }
+
+  RefPtr<TextureClient> texture = CreateTexture(
+      aKnowsCompositor, aFormat, aSize, false,  true);
+  if (!texture) {
+    return nullptr;
+  }
+
+  auto* recordedTextureData =
+      texture->GetInternalData()->AsRecordedTextureData();
+  if (!recordedTextureData) {
+    MOZ_ASSERT_UNREACHABLE("unexpected to be called");
+    gfxCriticalNoteOnce << "Expected RecordedTextureData";
+    return nullptr;
+  }
+
+  RefPtr<PersistentBufferProviderAccelerated> provider =
+      new PersistentBufferProviderAccelerated(
+          recordedTextureData->mRemoteTextureOwnerId, texture);
+  return provider.forget();
+}
+
+PersistentBufferProviderAccelerated::PersistentBufferProviderAccelerated(
+    RemoteTextureOwnerId aRemoteTextureOwnerId,
+    const RefPtr<TextureClient>& aTexture)
+    : mRemoteTextureOwnerId(aRemoteTextureOwnerId), mTexture(aTexture) {
+  MOZ_COUNT_CTOR(PersistentBufferProviderAccelerated);
+}
+
+PersistentBufferProviderAccelerated::~PersistentBufferProviderAccelerated() {
+  MOZ_COUNT_DTOR(PersistentBufferProviderAccelerated);
+  Destroy();
+}
+
+void PersistentBufferProviderAccelerated::Destroy() {
+  mSnapshot = nullptr;
+  mDrawTarget = nullptr;
+
+  if (mTexture) {
+    if (mTexture->IsLocked()) {
+      MOZ_ASSERT(false);
+      mTexture->Unlock();
+    }
+    mTexture = nullptr;
+  }
+}
+
+already_AddRefed<gfx::DrawTarget>
+PersistentBufferProviderAccelerated::BorrowDrawTarget(
+    const gfx::IntRect& aPersistedRect) {
+  if (!mDrawTarget) {
+    if (aPersistedRect.IsEmpty()) {
+      mTexture->GetInternalData()->InvalidateContents();
+    }
+    if (!mTexture->Lock(OpenMode::OPEN_READ_WRITE)) {
+      return nullptr;
+    }
+    mDrawTarget = mTexture->BorrowDrawTarget();
+    if (!mDrawTarget || !mDrawTarget->IsValid()) {
+      mDrawTarget = nullptr;
+      mTexture->Unlock();
+      return nullptr;
+    }
+  }
+  return do_AddRef(mDrawTarget);
+}
+
+bool PersistentBufferProviderAccelerated::ReturnDrawTarget(
+    already_AddRefed<gfx::DrawTarget> aDT) {
+  {
+    RefPtr<gfx::DrawTarget> dt(aDT);
+    MOZ_ASSERT(mDrawTarget == dt);
+    if (!mDrawTarget) {
+      return false;
+    }
+    mDrawTarget = nullptr;
+  }
+  mTexture->Unlock();
+  return true;
+}
+
+already_AddRefed<gfx::SourceSurface>
+PersistentBufferProviderAccelerated::BorrowSnapshot(gfx::DrawTarget* aTarget) {
+  if (mDrawTarget) {
+    MOZ_ASSERT(mTexture->IsLocked());
+  } else {
+    if (mTexture->IsLocked()) {
+      MOZ_ASSERT(false);
+      return nullptr;
+    }
+    if (!mTexture->Lock(OpenMode::OPEN_READ)) {
+      return nullptr;
+    }
+  }
+  mSnapshot = mTexture->BorrowSnapshot();
+  return do_AddRef(mSnapshot);
+}
+
+void PersistentBufferProviderAccelerated::ReturnSnapshot(
+    already_AddRefed<gfx::SourceSurface> aSnapshot) {
+  RefPtr<SourceSurface> snapshot = aSnapshot;
+  MOZ_ASSERT(!snapshot || snapshot == mSnapshot);
+  snapshot = nullptr;
+  mTexture->ReturnSnapshot(mSnapshot.forget());
+  if (!mDrawTarget) {
+    mTexture->Unlock();
+  }
+}
+
+Maybe<SurfaceDescriptor> PersistentBufferProviderAccelerated::GetFrontBuffer() {
+  SurfaceDescriptor desc;
+  if (mTexture->GetInternalData()->Serialize(desc)) {
+    return Some(desc);
+  }
+  return Nothing();
+}
+
+bool PersistentBufferProviderAccelerated::RequiresRefresh() const {
+  return mTexture->GetInternalData()->RequiresRefresh();
+}
+
+already_AddRefed<FwdTransactionTracker>
+PersistentBufferProviderAccelerated::UseCompositableForwarder(
+    CompositableForwarder* aForwarder) {
+  return mTexture->GetInternalData()->UseCompositableForwarder(aForwarder);
+}
+
+already_AddRefed<PersistentBufferProviderShared>
+PersistentBufferProviderShared::Create(gfx::IntSize aSize,
+                                       gfx::SurfaceFormat aFormat,
+                                       KnowsCompositor* aKnowsCompositor,
+                                       bool aWillReadFrequently,
+                                       const Maybe<uint64_t>& aWindowID) {
+  if (!aKnowsCompositor || !aKnowsCompositor->GetTextureForwarder() ||
+      !aKnowsCompositor->GetTextureForwarder()->IPCOpen()) {
+    return nullptr;
+  }
+
+  if (!StaticPrefs::layers_shared_buffer_provider_enabled()) {
+    return nullptr;
+  }
+
+
+  RefPtr<TextureClient> texture =
+      CreateTexture(aKnowsCompositor, aFormat, aSize, aWillReadFrequently);
+  if (!texture) {
+    return nullptr;
+  }
+
+  RefPtr<PersistentBufferProviderShared> provider =
+      new PersistentBufferProviderShared(aSize, aFormat, aKnowsCompositor,
+                                         texture, aWillReadFrequently,
+                                         aWindowID);
+  return provider.forget();
+}
+
+PersistentBufferProviderShared::PersistentBufferProviderShared(
+    gfx::IntSize aSize, gfx::SurfaceFormat aFormat,
+    KnowsCompositor* aKnowsCompositor, RefPtr<TextureClient>& aTexture,
+    bool aWillReadFrequently, const Maybe<uint64_t>& aWindowID)
+    : mSize(aSize),
+      mFormat(aFormat),
+      mKnowsCompositor(aKnowsCompositor),
+      mFront(Nothing()),
+      mWillReadFrequently(aWillReadFrequently),
+      mWindowID(aWindowID) {
+  MOZ_ASSERT(aKnowsCompositor);
+  if (mTextures.append(aTexture)) {
+    mBack = Some<uint32_t>(0);
+  }
+
+  if (gfxVars::UseWebRenderTripleBufferingWin()) {
+    ++mMaxAllowedTextures;
+  }
+
+  MOZ_COUNT_CTOR(PersistentBufferProviderShared);
+}
+
+PersistentBufferProviderShared::~PersistentBufferProviderShared() {
+  MOZ_COUNT_DTOR(PersistentBufferProviderShared);
+
+  if (IsActivityTracked()) {
+    if (auto* cm = CanvasManagerChild::Get()) {
+      cm->GetActiveResourceTracker()->RemoveObject(this);
+    } else {
+      MOZ_ASSERT_UNREACHABLE("Tracked but no CanvasManagerChild!");
+    }
+  }
+
+  Destroy();
+}
+
+bool PersistentBufferProviderShared::SetKnowsCompositor(
+    KnowsCompositor* aKnowsCompositor, bool& aOutLostFrontTexture) {
+  MOZ_ASSERT(aKnowsCompositor);
+  MOZ_ASSERT(!aOutLostFrontTexture);
+  if (!aKnowsCompositor) {
+    return false;
+  }
+
+  if (mKnowsCompositor == aKnowsCompositor) {
+    return true;
+  }
+
+  if (IsActivityTracked()) {
+    if (auto* cm = CanvasManagerChild::Get()) {
+      cm->GetActiveResourceTracker()->RemoveObject(this);
+    } else {
+      MOZ_ASSERT_UNREACHABLE("Tracked but no CanvasManagerChild!");
+    }
+  }
+
+  if (mKnowsCompositor->GetTextureForwarder() !=
+          aKnowsCompositor->GetTextureForwarder() ||
+      mKnowsCompositor->GetCompositorBackendType() !=
+          aKnowsCompositor->GetCompositorBackendType()) {
+
+    RefPtr<TextureClient> prevTexture = GetTexture(mFront);
+
+    Destroy();
+
+    if (prevTexture && !prevTexture->IsValid()) {
+      aOutLostFrontTexture = true;
+    } else if (prevTexture && prevTexture->IsValid()) {
+      RefPtr<TextureClient> newTexture =
+          CreateTexture(aKnowsCompositor, mFormat, mSize, mWillReadFrequently);
+
+      MOZ_ASSERT(newTexture);
+      if (!newTexture) {
+        return false;
+      }
+
+
+      if (!newTexture->Lock(OpenMode::OPEN_WRITE)) {
+        return false;
+      }
+
+      if (!prevTexture->Lock(OpenMode::OPEN_READ)) {
+        newTexture->Unlock();
+        return false;
+      }
+
+      bool success =
+          prevTexture->CopyToTextureClient(newTexture, nullptr, nullptr);
+
+      prevTexture->Unlock();
+      newTexture->Unlock();
+
+      if (!success) {
+        return false;
+      }
+
+      if (!mTextures.append(newTexture)) {
+        return false;
+      }
+      mFront = Some<uint32_t>(mTextures.length() - 1);
+      mBack = mFront;
+    }
+  }
+
+  mKnowsCompositor = aKnowsCompositor;
+
+  return true;
+}
+
+TextureClient* PersistentBufferProviderShared::GetTexture(
+    const Maybe<uint32_t>& aIndex) {
+  if (aIndex.isNothing() || !CheckIndex(aIndex.value())) {
+    return nullptr;
+  }
+  return mTextures[aIndex.value()];
+}
+
+already_AddRefed<gfx::DrawTarget>
+PersistentBufferProviderShared::BorrowDrawTarget(
+    const gfx::IntRect& aPersistedRect) {
+  if (!mKnowsCompositor->GetTextureForwarder() ||
+      !mKnowsCompositor->GetTextureForwarder()->IPCOpen()) {
+    return nullptr;
+  }
+
+  auto* cm = CanvasManagerChild::Get();
+  if (NS_WARN_IF(!cm)) {
+    return nullptr;
+  }
+
+  MOZ_ASSERT(!mSnapshot);
+
+  if (IsActivityTracked()) {
+    cm->GetActiveResourceTracker()->MarkUsed(this);
+  } else {
+    cm->GetActiveResourceTracker()->AddObject(this);
+  }
+
+  if (mDrawTarget) {
+    RefPtr<gfx::DrawTarget> dt(mDrawTarget);
+    return dt.forget();
+  }
+
+  auto previousBackBuffer = mBack;
+
+  TextureClient* tex = GetTexture(mBack);
+
+  if (tex && tex->IsReadLocked()) {
+    tex = nullptr;
+  }
+
+  if (!tex) {
+    for (uint32_t i = 0; i < mTextures.length(); ++i) {
+      if (!mTextures[i]->IsReadLocked()) {
+        mBack = Some(i);
+        tex = mTextures[i];
+        break;
+      }
+    }
+  }
+
+  if (!tex) {
+    if (mTextures.length() >= mMaxAllowedTextures) {
+      mKnowsCompositor->SyncWithCompositor(mWindowID);
+      for (uint32_t i = 0; i < mTextures.length(); ++i) {
+        if (!mTextures[i]->IsReadLocked()) {
+          gfxCriticalNote << "Managed to allocate after flush.";
+          mBack = Some(i);
+          tex = mTextures[i];
+          break;
+        }
+      }
+
+      if (!tex) {
+        gfxCriticalNote << "Unexpected BufferProvider over-production.";
+        NotifyInactive();
+        return nullptr;
+      }
+    }
+
+    RefPtr<TextureClient> newTexture =
+        CreateTexture(mKnowsCompositor, mFormat, mSize, mWillReadFrequently);
+
+    MOZ_ASSERT(newTexture);
+    if (newTexture) {
+      if (mTextures.append(newTexture)) {
+        tex = newTexture;
+        mBack = Some<uint32_t>(mTextures.length() - 1);
+      }
+    }
+  }
+
+  if (!tex) {
+    return nullptr;
+  }
+
+  if (mPermanentBackBuffer) {
+    if (!tex->Lock(OpenMode::OPEN_WRITE)) {
+      return nullptr;
+    }
+    tex = mPermanentBackBuffer;
+  } else {
+    Maybe<TextureClientAutoLock> autoReadLock;
+    TextureClient* previous = nullptr;
+    if (mBack != previousBackBuffer && !aPersistedRect.IsEmpty()) {
+      if (tex->HasSynchronization()) {
+        mPermanentBackBuffer = CreateTexture(mKnowsCompositor, mFormat, mSize,
+                                             mWillReadFrequently);
+        if (!mPermanentBackBuffer) {
+          return nullptr;
+        }
+        if (!tex->Lock(OpenMode::OPEN_WRITE)) {
+          return nullptr;
+        }
+        tex = mPermanentBackBuffer;
+      }
+
+      previous = GetTexture(previousBackBuffer);
+      if (previous) {
+        autoReadLock.emplace(previous, OpenMode::OPEN_READ);
+      }
+    }
+
+    if (!tex->Lock(OpenMode::OPEN_READ_WRITE)) {
+      return nullptr;
+    }
+
+    if (autoReadLock.isSome() && autoReadLock->Succeeded() && previous) {
+      DebugOnly<bool> success =
+          previous->CopyToTextureClient(tex, &aPersistedRect, nullptr);
+      MOZ_ASSERT(success);
+    }
+  }
+
+  mDrawTarget = tex->BorrowDrawTarget();
+  if (mDrawTarget) {
+    mDrawTarget->ClearRect(Rect(0, 0, 0, 0));
+
+    if (!mDrawTarget->IsValid()) {
+      mDrawTarget = nullptr;
+    }
+  }
+
+  RefPtr<gfx::DrawTarget> dt(mDrawTarget);
+  return dt.forget();
+}
+
+bool PersistentBufferProviderShared::ReturnDrawTarget(
+    already_AddRefed<gfx::DrawTarget> aDT) {
+  RefPtr<gfx::DrawTarget> dt(aDT);
+  MOZ_ASSERT(mDrawTarget == dt);
+  MOZ_ASSERT(!mSnapshot);
+
+  TextureClient* back = GetTexture(mBack);
+  MOZ_ASSERT(back);
+
+  mDrawTarget = nullptr;
+  dt = nullptr;
+
+  if (mPermanentBackBuffer && back) {
+    DebugOnly<bool> success =
+        mPermanentBackBuffer->CopyToTextureClient(back, nullptr, nullptr);
+    MOZ_ASSERT(success);
+
+    mPermanentBackBuffer->EndDraw();
+  }
+
+  if (back) {
+    back->Unlock();
+    mFront = mBack;
+  }
+
+  return !!back;
+}
+
+TextureClient* PersistentBufferProviderShared::GetTextureClient() {
+  MOZ_ASSERT(!mDrawTarget);
+  TextureClient* texture = GetTexture(mFront);
+  if (!texture) {
+    gfxCriticalNote
+        << "PersistentBufferProviderShared: front buffer unavailable";
+    return nullptr;
+  }
+
+  if (texture->IsReadLocked()) {
+    RefPtr<DrawTarget> dt =
+        BorrowDrawTarget(IntRect(0, 0, mSize.width, mSize.height));
+
+    if (dt) {
+      ReturnDrawTarget(dt.forget());
+      texture = GetTexture(mFront);
+      if (!texture) {
+        gfxCriticalNote
+            << "PersistentBufferProviderShared: front buffer unavailable";
+        return nullptr;
+      }
+    }
+  } else {
+    texture->SetUpdated();
+  }
+
+  return texture;
+}
+
+already_AddRefed<gfx::SourceSurface>
+PersistentBufferProviderShared::BorrowSnapshot(gfx::DrawTarget* aTarget) {
+  if (mPermanentBackBuffer) {
+    mSnapshot = mPermanentBackBuffer->BorrowSnapshot();
+    return do_AddRef(mSnapshot);
+  }
+
+  if (mDrawTarget) {
+    auto back = GetTexture(mBack);
+    if (NS_WARN_IF(!back) || NS_WARN_IF(!back->IsLocked())) {
+      return nullptr;
+    }
+    mSnapshot = back->BorrowSnapshot();
+    return do_AddRef(mSnapshot);
+  }
+
+  auto front = GetTexture(mFront);
+  if (NS_WARN_IF(!front) || NS_WARN_IF(front->IsLocked())) {
+    return nullptr;
+  }
+
+  if (front->IsReadLocked() && front->HasSynchronization()) {
+    mPermanentBackBuffer =
+        CreateTexture(mKnowsCompositor, mFormat, mSize, mWillReadFrequently);
+    if (!mPermanentBackBuffer ||
+        !mPermanentBackBuffer->Lock(OpenMode::OPEN_READ_WRITE)) {
+      return nullptr;
+    }
+
+    if (!front->Lock(OpenMode::OPEN_READ)) {
+      return nullptr;
+    }
+
+    DebugOnly<bool> success =
+        front->CopyToTextureClient(mPermanentBackBuffer, nullptr, nullptr);
+    MOZ_ASSERT(success);
+    front->Unlock();
+    mSnapshot = mPermanentBackBuffer->BorrowSnapshot();
+    return do_AddRef(mSnapshot);
+  }
+
+  if (!front->Lock(OpenMode::OPEN_READ)) {
+    return nullptr;
+  }
+
+  mSnapshot = front->BorrowSnapshot();
+
+  return do_AddRef(mSnapshot);
+}
+
+void PersistentBufferProviderShared::ReturnSnapshot(
+    already_AddRefed<gfx::SourceSurface> aSnapshot) {
+  RefPtr<SourceSurface> snapshot = aSnapshot;
+  MOZ_ASSERT(!snapshot || snapshot == mSnapshot);
+
+  mSnapshot = nullptr;
+  snapshot = nullptr;
+
+  if (mDrawTarget || mPermanentBackBuffer) {
+    return;
+  }
+
+  auto front = GetTexture(mFront);
+  if (front) {
+    front->Unlock();
+  }
+}
+
+void PersistentBufferProviderShared::NotifyInactive() {
+  ClearCachedResources();
+}
+
+void PersistentBufferProviderShared::ClearCachedResources() {
+  RefPtr<TextureClient> front = GetTexture(mFront);
+  RefPtr<TextureClient> back = GetTexture(mBack);
+
+  mTextures.clear();
+  mPermanentBackBuffer = nullptr;
+
+  if (back) {
+    if (mTextures.append(back)) {
+      mBack = Some<uint32_t>(0);
+    }
+    if (front == back) {
+      mFront = mBack;
+    }
+  }
+
+  if (front && front != back) {
+    if (mTextures.append(front)) {
+      mFront = Some<uint32_t>(mTextures.length() - 1);
+    }
+  }
+}
+
+void PersistentBufferProviderShared::Destroy() {
+  mSnapshot = nullptr;
+  mDrawTarget = nullptr;
+
+  if (mPermanentBackBuffer) {
+    mPermanentBackBuffer->Unlock();
+    mPermanentBackBuffer = nullptr;
+  }
+
+  for (auto& texture : mTextures) {
+    if (texture && texture->IsLocked()) {
+      MOZ_ASSERT(false);
+      texture->Unlock();
+    }
+  }
+
+  mTextures.clear();
+}
+
+}  
+}  

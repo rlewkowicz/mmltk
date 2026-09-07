@@ -1,0 +1,202 @@
+/*
+ * Copyright 2011 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "include/effects/SkImageFilters.h"
+
+#include "include/core/SkFlattenable.h"
+#include "include/core/SkImageFilter.h"
+#include "include/core/SkRect.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkScalar.h"
+#include "include/core/SkSize.h"
+#include "include/core/SkTileMode.h"
+#include "include/core/SkTypes.h"
+#include "include/private/base/SkFloatingPoint.h"
+#include "src/core/SkBlurEngine.h"
+#include "src/core/SkImageFilterTypes.h"
+#include "src/core/SkImageFilter_Base.h"
+#include "src/core/SkReadBuffer.h"
+#include "src/core/SkWriteBuffer.h"
+
+#include <algorithm>
+#include <optional>
+#include <utility>
+
+namespace {
+
+class SkBlurImageFilter final : public SkImageFilter_Base {
+public:
+    SkBlurImageFilter(SkSize sigma, sk_sp<SkImageFilter> input)
+            : SkImageFilter_Base(&input, 1)
+            , fSigma{sigma} {}
+
+    SkBlurImageFilter(SkSize sigma, SkTileMode legacyTileMode, sk_sp<SkImageFilter> input)
+            : SkImageFilter_Base(&input, 1)
+            , fSigma(sigma)
+            , fLegacyTileMode(legacyTileMode) {}
+
+    SkRect computeFastBounds(const SkRect&) const override;
+
+protected:
+    void flatten(SkWriteBuffer&) const override;
+
+private:
+    friend void ::SkRegisterBlurImageFilterFlattenable();
+    SK_FLATTENABLE_HOOKS(SkBlurImageFilter)
+
+    skif::FilterResult onFilterImage(const skif::Context& context) const override;
+
+    skif::LayerSpace<SkIRect> onGetInputLayerBounds(
+            const skif::Mapping& mapping,
+            const skif::LayerSpace<SkIRect>& desiredOutput,
+            std::optional<skif::LayerSpace<SkIRect>> contentBounds) const override;
+
+    std::optional<skif::LayerSpace<SkIRect>> onGetOutputLayerBounds(
+            const skif::Mapping& mapping,
+            std::optional<skif::LayerSpace<SkIRect>> contentBounds) const override;
+
+    skif::LayerSpace<SkSize> mapSigma(const skif::Mapping& mapping) const;
+
+    skif::LayerSpace<SkIRect> kernelBounds(const skif::Mapping& mapping,
+                                           skif::LayerSpace<SkIRect> bounds) const {
+        skif::LayerSpace<SkSize> sigma = this->mapSigma(mapping);
+        bounds.outset(skif::LayerSpace<SkSize>({3 * sigma.width(), 3 * sigma.height()}).ceil());
+        return bounds;
+    }
+
+    skif::ParameterSpace<SkSize> fSigma;
+    SkTileMode fLegacyTileMode = SkTileMode::kDecal;
+};
+
+} 
+
+sk_sp<SkImageFilter> SkImageFilters::Blur(
+        SkScalar sigmaX, SkScalar sigmaY, SkTileMode tileMode, sk_sp<SkImageFilter> input,
+        const CropRect& cropRect) {
+    if (!SkIsFinite(sigmaX, sigmaY) || sigmaX < 0.f || sigmaY < 0.f) {
+        return nullptr;
+    }
+
+    if (tileMode != SkTileMode::kDecal && !cropRect) {
+        return sk_make_sp<SkBlurImageFilter>(SkSize{sigmaX, sigmaY}, tileMode, std::move(input));
+    }
+
+    sk_sp<SkImageFilter> filter = std::move(input);
+    if (tileMode != SkTileMode::kDecal && cropRect) {
+        filter = SkImageFilters::Crop(*cropRect, tileMode, std::move(filter));
+    }
+
+    filter = sk_make_sp<SkBlurImageFilter>(SkSize{sigmaX, sigmaY}, std::move(filter));
+    if (cropRect) {
+        filter = SkImageFilters::Crop(*cropRect, SkTileMode::kDecal, std::move(filter));
+    }
+    return filter;
+}
+
+void SkRegisterBlurImageFilterFlattenable() {
+    SK_REGISTER_FLATTENABLE(SkBlurImageFilter);
+    SkFlattenable::Register("SkBlurImageFilterImpl", SkBlurImageFilter::CreateProc);
+}
+
+sk_sp<SkFlattenable> SkBlurImageFilter::CreateProc(SkReadBuffer& buffer) {
+    SK_IMAGEFILTER_UNFLATTEN_COMMON(common, 1);
+    SkScalar sigmaX = buffer.readScalar();
+    SkScalar sigmaY = buffer.readScalar();
+    SkTileMode tileMode = buffer.read32LE(SkTileMode::kLastTileMode);
+
+    return SkImageFilters::Blur(
+          sigmaX, sigmaY, tileMode, common.getInput(0), common.cropRect());
+}
+
+void SkBlurImageFilter::flatten(SkWriteBuffer& buffer) const {
+    this->SkImageFilter_Base::flatten(buffer);
+
+    buffer.writeScalar(SkSize(fSigma).fWidth);
+    buffer.writeScalar(SkSize(fSigma).fHeight);
+    buffer.writeInt(static_cast<int>(fLegacyTileMode));
+}
+
+
+namespace {
+
+static constexpr SkScalar kMaxSigma = 532.f;
+
+}  
+
+skif::FilterResult SkBlurImageFilter::onFilterImage(const skif::Context& ctx) const {
+    skif::Context inputCtx = ctx.withNewDesiredOutput(
+            this->kernelBounds(ctx.mapping(), ctx.desiredOutput()));
+
+    skif::FilterResult childOutput = this->getChildOutput(0, inputCtx);
+    skif::LayerSpace<SkSize> sigma = this->mapSigma(ctx.mapping());
+    if (sigma.width() == 0.f && sigma.height() == 0.f) {
+        return childOutput;
+    }
+
+    SkASSERT(sigma.width() >= 0.f && sigma.width() <= kMaxSigma &&
+             sigma.height() >= 0.f && sigma.height() <= kMaxSigma);
+
+    skif::LayerSpace<SkIRect> maxOutput = ctx.desiredOutput();
+    if (fLegacyTileMode != SkTileMode::kDecal) {
+        maxOutput = this->kernelBounds(ctx.mapping(), childOutput.layerBounds());
+        if (!maxOutput.intersect(ctx.desiredOutput())) {
+            return {};
+        }
+    }
+    if (fLegacyTileMode != SkTileMode::kDecal) {
+        childOutput = childOutput.applyCrop(inputCtx,
+                                            childOutput.layerBounds(),
+                                            fLegacyTileMode);
+    }
+
+    skif::Context croppedOutput = ctx.withNewDesiredOutput(maxOutput);
+    skif::FilterResult::Builder builder{croppedOutput};
+    builder.add(childOutput);
+    return builder.blur(sigma);
+}
+
+skif::LayerSpace<SkSize> SkBlurImageFilter::mapSigma(const skif::Mapping& mapping) const {
+    skif::LayerSpace<SkSize> sigma = mapping.paramToLayer(fSigma);
+    sigma = skif::LayerSpace<SkSize>({std::min(sigma.width(), kMaxSigma),
+                                      std::min(sigma.height(), kMaxSigma)});
+
+    if (!SkIsFinite(sigma.width()) || SkBlurEngine::IsEffectivelyIdentity(sigma.width())) {
+        sigma = skif::LayerSpace<SkSize>({0.f, sigma.height()});
+    }
+
+    if (!SkIsFinite(sigma.height()) || SkBlurEngine::IsEffectivelyIdentity(sigma.height())) {
+        sigma = skif::LayerSpace<SkSize>({sigma.width(), 0.f});
+    }
+
+    return sigma;
+}
+
+skif::LayerSpace<SkIRect> SkBlurImageFilter::onGetInputLayerBounds(
+        const skif::Mapping& mapping,
+        const skif::LayerSpace<SkIRect>& desiredOutput,
+        std::optional<skif::LayerSpace<SkIRect>> contentBounds) const {
+    skif::LayerSpace<SkIRect> requiredInput =
+            this->kernelBounds(mapping, desiredOutput);
+    return this->getChildInputLayerBounds(0, mapping, requiredInput, contentBounds);
+}
+
+std::optional<skif::LayerSpace<SkIRect>> SkBlurImageFilter::onGetOutputLayerBounds(
+        const skif::Mapping& mapping,
+        std::optional<skif::LayerSpace<SkIRect>> contentBounds) const {
+    auto childOutput = this->getChildOutputLayerBounds(0, mapping, contentBounds);
+    if (childOutput) {
+        return this->kernelBounds(mapping, *childOutput);
+    } else {
+        return skif::LayerSpace<SkIRect>::Unbounded();
+    }
+}
+
+SkRect SkBlurImageFilter::computeFastBounds(const SkRect& src) const {
+    SkRect bounds = this->getInput(0) ? this->getInput(0)->computeFastBounds(src) : src;
+    bounds.outset(SkSize(fSigma).width() * 3, SkSize(fSigma).height() * 3);
+    return bounds;
+}

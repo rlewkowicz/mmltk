@@ -1,0 +1,162 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_indexeddatabasemanager_h_
+#define mozilla_dom_indexeddatabasemanager_h_
+
+#include "MainThreadUtils.h"
+#include "SafeRefPtr.h"
+#include "js/TypeDecls.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/Logging.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/dom/quota/PersistenceType.h"
+#include "nsClassHashtable.h"
+#include "nsHashKeys.h"
+#include "nsIIndexedDatabaseManager.h"
+
+namespace mozilla {
+
+class EventChainPostVisitor;
+
+namespace dom {
+
+class IDBFactory;
+
+namespace indexedDB {
+
+class BackgroundUtilsChild;
+class DatabaseFileManager;
+class FileManagerInfo;
+
+}  
+
+class IndexedDatabaseManager final : public nsIIndexedDatabaseManager {
+  using PersistenceType = mozilla::dom::quota::PersistenceType;
+  using DatabaseFileManager = mozilla::dom::indexedDB::DatabaseFileManager;
+  using FileManagerInfo = mozilla::dom::indexedDB::FileManagerInfo;
+
+ public:
+  enum LoggingMode {
+    Logging_Disabled = 0,
+    Logging_Concise,
+    Logging_Detailed
+  };
+
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIINDEXEDDATABASEMANAGER
+
+  static IndexedDatabaseManager* GetOrCreate();
+
+  static IndexedDatabaseManager* Get();
+
+  static already_AddRefed<IndexedDatabaseManager> FactoryCreate();
+
+  static bool IsClosed();
+
+  static bool IsMainProcess()
+#ifdef DEBUG
+      ;
+#else
+  {
+    return sIsMainProcess;
+  }
+#endif
+
+  static bool FullSynchronous();
+
+  static LoggingMode GetLoggingMode()
+#ifdef DEBUG
+      ;
+#else
+  {
+    return sLoggingMode;
+  }
+#endif
+
+  static mozilla::LogModule* GetLoggingModule()
+#ifdef DEBUG
+      ;
+#else
+  {
+    return sLoggingModule;
+  }
+#endif
+
+  static uint32_t DataThreshold();
+
+  static uint32_t MaxStructuredCloneSize();
+
+  static uint32_t MaxSerializedMsgSize();
+
+  static int32_t MaxPreloadExtraRecords();
+
+  void ClearBackgroundActor();
+
+  [[nodiscard]] SafeRefPtr<DatabaseFileManager> GetFileManager(
+      PersistenceType aPersistenceType, const nsACString& aOrigin,
+      const nsAString& aDatabaseName);
+
+  [[nodiscard]] SafeRefPtr<DatabaseFileManager>
+  GetFileManagerByDatabaseFilePath(PersistenceType aPersistenceType,
+                                   const nsACString& aOrigin,
+                                   const nsAString& aDatabaseFilePath);
+
+  const nsTArray<SafeRefPtr<DatabaseFileManager>>& GetFileManagers(
+      PersistenceType aPersistenceType, const nsACString& aOrigin);
+
+  void AddFileManager(SafeRefPtr<DatabaseFileManager> aFileManager);
+
+  void InvalidateAllFileManagers();
+
+  void InvalidateFileManagers(PersistenceType aPersistenceType);
+
+  void InvalidateFileManagers(PersistenceType aPersistenceType,
+                              const nsACString& aOrigin);
+
+  void InvalidateFileManager(PersistenceType aPersistenceType,
+                             const nsACString& aOrigin,
+                             const nsAString& aDatabaseName);
+
+  nsresult EnsureLocale();
+
+  static const nsCString& GetLocale();
+
+  static bool ResolveSandboxBinding(JSContext* aCx);
+
+  static bool DefineIndexedDB(JSContext* aCx, JS::Handle<JSObject*> aGlobal);
+
+ private:
+  IndexedDatabaseManager();
+  ~IndexedDatabaseManager();
+
+  nsresult Init();
+
+  void Destroy();
+
+  nsresult EnsureBackgroundActor();
+
+  static void LoggingModePrefChangedCallback(const char* aPrefName,
+                                             void* aClosure);
+
+  nsClassHashtable<nsCStringHashKey, FileManagerInfo> mFileManagerInfos;
+
+  nsClassHashtable<nsRefPtrHashKey<DatabaseFileManager>, nsTArray<int64_t>>
+      mPendingDeleteInfos;
+
+  nsCString mLocale;
+  bool mLocaleInitialized MOZ_GUARDED_BY(sMainThreadCapability);
+
+  indexedDB::BackgroundUtilsChild* mBackgroundActor;
+
+  static bool sIsMainProcess;
+  static bool sFullSynchronousMode;
+  static LazyLogModule sLoggingModule;
+  static Atomic<LoggingMode> sLoggingMode;
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_indexeddatabasemanager_h_

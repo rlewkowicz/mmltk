@@ -1,0 +1,202 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef js_TraceKind_h
+#define js_TraceKind_h
+
+#include "mozilla/UniquePtr.h"
+
+#include "js/TypeDecls.h"
+
+class JSLinearString;
+
+namespace js {
+class BaseScript;
+class BaseShape;
+class GetterSetter;
+class PropMap;
+class RegExpShared;
+class Shape;
+class Scope;
+namespace jit {
+class JitCode;
+}  
+}  
+
+namespace JS {
+
+enum class TraceKind {
+  Object = 0x00,
+  BigInt = 0x01,
+  String = 0x02,
+  GetterSetter = 0x03,
+  Symbol = 0x04,
+
+  Shape = 0x05,
+
+  Null = 0x06,
+
+  BaseShape,
+  JitCode,
+  Script,
+  Scope,
+  RegExpShared,
+  PropMap
+};
+
+const static uintptr_t OutOfLineTraceKindMask = 0x07;
+static_assert(uintptr_t(JS::TraceKind::Null) < OutOfLineTraceKindMask,
+              "GCCellPtr requires an inline representation for nullptr");
+
+template <typename T>
+struct MapTypeToTraceKind {
+  static const JS::TraceKind kind = T::TraceKind;
+};
+
+
+// clang-format off
+#define JS_FOR_EACH_TRACEKIND(D)                               \
+   \
+  D(BaseShape,    js::BaseShape,       true,      false)       \
+  D(JitCode,      js::jit::JitCode,    true,      false)       \
+  D(Scope,        js::Scope,           true,      true)        \
+  D(Object,       JSObject,            true,      true)        \
+  D(Script,       js::BaseScript,      true,      true)        \
+  D(Shape,        js::Shape,           true,      false)       \
+  D(String,       JSString,            false,     false)       \
+  D(Symbol,       JS::Symbol,          true,      true)        \
+  D(BigInt,       JS::BigInt,          false,     false)       \
+  D(RegExpShared, js::RegExpShared,    true,      true)        \
+  D(GetterSetter, js::GetterSetter,    true,      true)        \
+  D(PropMap,      js::PropMap,         true,      false)
+// clang-format on
+
+inline constexpr bool IsCCTraceKind(JS::TraceKind aKind) {
+  switch (aKind) {
+#define JS_EXPAND_DEF(name, _1, _2, inCCGraph) \
+  case JS::TraceKind::name:                    \
+    return inCCGraph;
+    JS_FOR_EACH_TRACEKIND(JS_EXPAND_DEF);
+#undef JS_EXPAND_DEF
+    default:
+      return false;
+  }
+}
+
+template <typename T>
+struct IsBaseTraceType : std::false_type {};
+
+#define JS_EXPAND_DEF(_, type, _1, _2) \
+  template <>                          \
+  struct IsBaseTraceType<type> : std::true_type {};
+JS_FOR_EACH_TRACEKIND(JS_EXPAND_DEF);
+#undef JS_EXPAND_DEF
+
+template <typename T>
+inline constexpr bool IsBaseTraceType_v = IsBaseTraceType<T>::value;
+
+#define JS_EXPAND_DEF(name, type, _, _1)                   \
+  template <>                                              \
+  struct MapTypeToTraceKind<type> {                        \
+    static const JS::TraceKind kind = JS::TraceKind::name; \
+  };
+JS_FOR_EACH_TRACEKIND(JS_EXPAND_DEF);
+#undef JS_EXPAND_DEF
+
+template <>
+struct MapTypeToTraceKind<JSLinearString> {
+  static const JS::TraceKind kind = JS::TraceKind::String;
+};
+template <>
+struct MapTypeToTraceKind<JSFunction> {
+  static const JS::TraceKind kind = JS::TraceKind::Object;
+};
+template <>
+struct MapTypeToTraceKind<JSScript> {
+  static const JS::TraceKind kind = JS::TraceKind::Script;
+};
+
+enum class RootKind : int8_t {
+#define EXPAND_ROOT_KIND(name, _0, _1, _2) name,
+  JS_FOR_EACH_TRACEKIND(EXPAND_ROOT_KIND)
+#undef EXPAND_ROOT_KIND
+
+  Id,
+  Value,
+
+  Traceable,
+
+  Limit
+};
+
+template <TraceKind traceKind>
+struct MapTraceKindToRootKind {};
+#define JS_EXPAND_DEF(name, _0, _1, _2)                  \
+  template <>                                            \
+  struct MapTraceKindToRootKind<JS::TraceKind::name> {   \
+    static const JS::RootKind kind = JS::RootKind::name; \
+  };
+JS_FOR_EACH_TRACEKIND(JS_EXPAND_DEF)
+#undef JS_EXPAND_DEF
+
+template <typename T>
+struct MapTypeToRootKind {
+  static const JS::RootKind kind = JS::RootKind::Traceable;
+};
+template <typename T>
+struct MapTypeToRootKind<T*> {
+  static const JS::RootKind kind =
+      JS::MapTraceKindToRootKind<JS::MapTypeToTraceKind<T>::kind>::kind;
+};
+template <>
+struct MapTypeToRootKind<JS::Realm*> {
+  static const JS::RootKind kind = JS::RootKind::Traceable;
+};
+template <typename T>
+struct MapTypeToRootKind<mozilla::UniquePtr<T>> {
+  static const JS::RootKind kind = JS::MapTypeToRootKind<T>::kind;
+};
+template <>
+struct MapTypeToRootKind<JS::Value> {
+  static const JS::RootKind kind = JS::RootKind::Value;
+};
+template <>
+struct MapTypeToRootKind<jsid> {
+  static const JS::RootKind kind = JS::RootKind::Id;
+};
+
+template <typename F, typename... Args>
+auto DispatchTraceKindTyped(F f, JS::TraceKind traceKind, Args&&... args) {
+  switch (traceKind) {
+#define JS_EXPAND_DEF(name, type, _, _1) \
+  case JS::TraceKind::name:              \
+    return f.template operator()<type>(std::forward<Args>(args)...);
+    JS_FOR_EACH_TRACEKIND(JS_EXPAND_DEF);
+#undef JS_EXPAND_DEF
+    default:
+      MOZ_CRASH("Invalid trace kind in DispatchTraceKindTyped.");
+  }
+}
+
+template <typename F>
+auto MapGCThingTyped(void* thing, JS::TraceKind traceKind, F&& f) {
+  switch (traceKind) {
+#define JS_EXPAND_DEF(name, type, _, _1) \
+  case JS::TraceKind::name:              \
+    return f(static_cast<type*>(thing));
+    JS_FOR_EACH_TRACEKIND(JS_EXPAND_DEF);
+#undef JS_EXPAND_DEF
+    default:
+      MOZ_CRASH("Invalid trace kind in MapGCThingTyped.");
+  }
+}
+
+template <typename F>
+void ApplyGCThingTyped(void* thing, JS::TraceKind traceKind, F&& f) {
+  MapGCThingTyped(thing, traceKind, std::move(f));
+}
+
+}  
+
+#endif  // js_TraceKind_h

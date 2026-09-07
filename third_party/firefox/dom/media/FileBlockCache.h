@@ -1,0 +1,109 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef FILE_BLOCK_CACHE_H_
+#define FILE_BLOCK_CACHE_H_
+
+#include <deque>
+
+#include "MediaBlockCacheBase.h"
+#include "mozilla/AbstractThread.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/UniquePtr.h"
+#include "nsDeque.h"
+#include "nsTArray.h"
+#include "nsThreadUtils.h"
+
+struct PRFileDesc;
+
+namespace mozilla {
+
+class FileBlockCache : public MediaBlockCacheBase {
+ public:
+  FileBlockCache();
+
+ protected:
+  virtual ~FileBlockCache();
+
+ public:
+  nsresult Init() override;
+
+  void Flush() override;
+
+  size_t GetMaxBlocks(size_t aCacheSizeInKB) const override;
+
+  nsresult WriteBlock(uint32_t aBlockIndex, Span<const uint8_t> aData1,
+                      Span<const uint8_t> aData2) override;
+
+  nsresult Read(int64_t aOffset, uint8_t* aData, int32_t aLength) override;
+
+  nsresult MoveBlock(int32_t aSourceBlockIndex,
+                     int32_t aDestBlockIndex) override;
+
+  struct BlockChange final {
+    NS_INLINE_DECL_THREADSAFE_REFCOUNTING(BlockChange)
+
+    explicit BlockChange(const uint8_t* aData) : mSourceBlockIndex(-1) {
+      mData = MakeUnique<uint8_t[]>(BLOCK_SIZE);
+      memcpy(mData.get(), aData, BLOCK_SIZE);
+    }
+
+    BlockChange(Span<const uint8_t> aData1, Span<const uint8_t> aData2)
+        : mSourceBlockIndex(-1) {
+      MOZ_ASSERT(aData1.Length() + aData2.Length() == BLOCK_SIZE);
+      mData = MakeUnique<uint8_t[]>(BLOCK_SIZE);
+      memcpy(mData.get(), aData1.Elements(), aData1.Length());
+      memcpy(mData.get() + aData1.Length(), aData2.Elements(), aData2.Length());
+    }
+
+    explicit BlockChange(int32_t aSourceBlockIndex)
+        : mSourceBlockIndex(aSourceBlockIndex) {}
+
+    UniquePtr<uint8_t[]> mData;
+    const int32_t mSourceBlockIndex;
+
+    bool IsMove() const { return mSourceBlockIndex != -1; }
+    bool IsWrite() const {
+      return mSourceBlockIndex == -1 && mData.get() != nullptr;
+    }
+
+   private:
+    ~BlockChange() = default;
+  };
+
+ private:
+  int64_t BlockIndexToOffset(int32_t aBlockIndex) {
+    return static_cast<int64_t>(aBlockIndex) * BLOCK_SIZE;
+  }
+
+  void SetCacheFile(PRFileDesc* aFD);
+
+  void Close();
+
+  void PerformBlockIOs();
+
+  Mutex mFileMutex;
+  nsresult MoveBlockInFile(int32_t aSourceBlockIndex, int32_t aDestBlockIndex);
+  nsresult Seek(int64_t aOffset);
+  nsresult ReadFromFile(int64_t aOffset, uint8_t* aDest, int32_t aBytesToRead,
+                        int32_t& aBytesRead);
+  nsresult WriteBlockToFile(int32_t aBlockIndex, const uint8_t* aBlockData);
+  PRFileDesc* mFD MOZ_PT_GUARDED_BY(mFileMutex);
+  int64_t mFDCurrentPos MOZ_GUARDED_BY(mFileMutex);
+
+  Mutex mDataMutex;
+  void EnsureWriteScheduled();
+
+  nsTArray<RefPtr<BlockChange> > mBlockChanges MOZ_GUARDED_BY(mDataMutex);
+  nsCOMPtr<nsISerialEventTarget> mBackgroundET MOZ_GUARDED_BY(mDataMutex);
+  std::deque<int32_t> mChangeIndexList MOZ_GUARDED_BY(mDataMutex);
+  bool mIsWriteScheduled MOZ_GUARDED_BY(mDataMutex);
+  bool mIsReading MOZ_GUARDED_BY(mDataMutex);
+  bool mInitialized MOZ_GUARDED_BY(mDataMutex) = false;
+};
+
+}  
+
+#endif /* FILE_BLOCK_CACHE_H_ */

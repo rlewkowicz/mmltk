@@ -1,0 +1,220 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "gc/PublicIterators.h"
+#include "gc/Zone.h"
+#include "jit/JitRuntime.h"
+#include "jit/JitZone.h"
+#include "jit/Linker.h"
+#include "vm/Interpreter.h"
+
+#include "gc/Marking-inl.h"
+#include "gc/WeakMap-inl.h"
+#include "jit/MacroAssembler-inl.h"
+
+using namespace js;
+using namespace js::jit;
+
+EntryTrampolineMap* JitZone::getOrCreateInterpreterEntryMap(JS::Zone* zone) {
+  if (!interpreterEntryMap) {
+    interpreterEntryMap = js::MakeUnique<EntryTrampolineMap>(zone);
+  }
+
+  return interpreterEntryMap.get();
+}
+
+void JitRuntime::generateBaselineInterpreterEntryTrampoline(
+    MacroAssembler& masm) {
+  AutoCreatedBy acb(masm,
+                    "JitRuntime::generateBaselineInterpreterEntryTrampoline");
+
+#ifdef JS_USE_LINK_REGISTER
+  masm.pushReturnAddress();
+#endif
+  masm.push(FramePointer);
+  masm.moveStackPtrTo(FramePointer);
+
+  AllocatableGeneralRegisterSet regs(GeneralRegisterSet::All());
+  Register nargs = regs.takeAny();
+  Register callee = regs.takeAny();
+  Register scratch = regs.takeAny();
+
+  Address calleeTokenAddr(
+      FramePointer, BaselineInterpreterEntryFrameLayout::offsetOfCalleeToken());
+  masm.loadPtr(calleeTokenAddr, callee);
+
+  masm.loadNumActualArgs(FramePointer, nargs);
+
+  Label notFunction;
+  {
+    masm.branchTestPtr(Assembler::NonZero, callee, Imm32(CalleeTokenScriptBit),
+                       &notFunction);
+
+    masm.andPtr(Imm32(uint32_t(CalleeTokenMask)), callee, scratch);
+    masm.loadFunctionArgCount(scratch, scratch);
+
+    Label noUnderflow;
+    masm.branch32(Assembler::AboveOrEqual, nargs, scratch, &noUnderflow);
+    {
+      masm.movePtr(scratch, nargs);
+    }
+    masm.bind(&noUnderflow);
+
+    static_assert(
+        CalleeToken_FunctionConstructing == 1,
+        "Ensure that we can use the constructing bit to count the value");
+    masm.movePtr(callee, scratch);
+    masm.and32(Imm32(uint32_t(CalleeToken_FunctionConstructing)), scratch);
+    masm.addPtr(scratch, nargs);
+  }
+  masm.bind(&notFunction);
+
+  masm.alignJitStackBasedOnNArgs(nargs,  false);
+
+  static_assert(sizeof(Value) == 8,
+                "Using TimesEight for scale of sizeof(Value).");
+  BaseIndex topPtrAddr(FramePointer, nargs, TimesEight,
+                       sizeof(BaselineInterpreterEntryFrameLayout));
+  Register argPtr = nargs;
+  masm.computeEffectiveAddress(topPtrAddr, argPtr);
+
+  masm.computeEffectiveAddress(calleeTokenAddr, scratch);
+
+  Label loop;
+  masm.bind(&loop);
+  {
+    masm.pushValue(Address(argPtr, 0));
+    masm.subPtr(Imm32(sizeof(Value)), argPtr);
+    masm.branchPtr(Assembler::Above, argPtr, scratch, &loop);
+  }
+
+  masm.push(callee);
+
+  masm.loadNumActualArgs(FramePointer, scratch);
+  masm.pushFrameDescriptorForJitCall(FrameType::BaselineInterpreterEntry,
+                                     scratch, scratch);
+
+  uint8_t* blinterpAddr = baselineInterpreter().codeRaw();
+  masm.assertStackAlignment(JitStackAlignment, 2 * sizeof(uintptr_t));
+  masm.call(ImmPtr(blinterpAddr));
+
+  masm.moveToStackPtr(FramePointer);
+  masm.pop(FramePointer);
+  masm.ret();
+}
+
+void JitRuntime::generateInterpreterEntryTrampoline(MacroAssembler& masm) {
+  AutoCreatedBy acb(masm, "JitRuntime::generateInterpreterEntryTrampoline");
+
+  if (IsBaselineInterpreterEnabled()) {
+    uint32_t offset = startTrampolineCode(masm);
+    if (!vmInterpreterEntryOffset_) {
+      vmInterpreterEntryOffset_ = offset;
+    }
+  }
+
+#ifdef JS_CODEGEN_ARM64
+  masm.SetStackPointer64(sp);
+
+  masm.push(lr, FramePointer);
+  masm.moveStackPtrTo(FramePointer);
+
+  masm.push(r19, r20);
+
+  masm.SetStackPointer64(PseudoStackPointer64);
+  masm.initPseudoStackPtr();
+
+  Register arg0 = IntArgReg0;
+  Register arg1 = IntArgReg1;
+  Register scratch = r19;
+#elif defined(JS_CODEGEN_X86)
+  masm.push(FramePointer);
+  masm.moveStackPtrTo(FramePointer);
+
+  AllocatableRegisterSet regs(RegisterSet::Volatile());
+  Register arg0 = regs.takeAnyGeneral();
+  Register arg1 = regs.takeAnyGeneral();
+  Register scratch = regs.takeAnyGeneral();
+
+  Address cxAddr(FramePointer, 2 * sizeof(void*));
+  Address stateAddr(FramePointer, 3 * sizeof(void*));
+  masm.loadPtr(cxAddr, arg0);
+  masm.loadPtr(stateAddr, arg1);
+#else
+#  ifdef JS_USE_LINK_REGISTER
+  masm.pushReturnAddress();
+#  endif
+  masm.push(FramePointer);
+  masm.moveStackPtrTo(FramePointer);
+
+  AllocatableRegisterSet regs(RegisterSet::Volatile());
+  regs.take(IntArgReg0);
+  regs.take(IntArgReg1);
+  Register arg0 = IntArgReg0;
+  Register arg1 = IntArgReg1;
+  Register scratch = regs.takeAnyGeneral();
+#endif
+
+  using Fn = bool (*)(JSContext* cx, js::RunState& state);
+  masm.setupUnalignedABICall(scratch);
+  masm.passABIArg(arg0);  
+  masm.passABIArg(arg1);  
+  masm.callWithABI<Fn, Interpret>(
+      ABIType::General, CheckUnsafeCallWithABI::DontCheckHasExitFrame);
+
+#ifdef JS_CODEGEN_ARM64
+  masm.syncStackPtr();
+  masm.SetStackPointer64(sp);
+
+  masm.pop(r20, r19);
+
+  masm.pop(FramePointer, lr);
+  masm.abiret();
+
+  masm.SetStackPointer64(PseudoStackPointer64);
+#else
+  masm.moveToStackPtr(FramePointer);
+  masm.pop(FramePointer);
+  masm.ret();
+#endif
+}
+
+JitCode* JitRuntime::generateEntryTrampolineForScript(JSContext* cx,
+                                                      JSScript* script) {
+  if (JitSpewEnabled(JitSpew_Codegen)) {
+    UniqueChars funName;
+    if (script->function() && script->function()->fullDisplayAtom()) {
+      funName =
+          AtomToPrintableString(cx, script->function()->fullDisplayAtom());
+    }
+
+    JitSpew(JitSpew_Codegen,
+            "# Emitting Interpreter Entry Trampoline for %s (%s:%u:%u)",
+            funName ? funName.get() : "*", script->filename(), script->lineno(),
+            script->column().oneOriginValue());
+  }
+
+  TempAllocator temp(&cx->tempLifoAlloc());
+  JitContext jctx(cx);
+  StackMacroAssembler masm(cx, temp);
+  AutoCreatedBy acb(masm, "JitRuntime::generateEntryTrampolineForScript");
+  PerfSpewerRangeRecorder rangeRecorder(masm);
+
+  if (IsBaselineInterpreterEnabled()) {
+    generateBaselineInterpreterEntryTrampoline(masm);
+    rangeRecorder.recordOffset("BaselineInterpreter", cx, script);
+  }
+
+  generateInterpreterEntryTrampoline(masm);
+  rangeRecorder.recordOffset("Interpreter", cx, script);
+
+  Linker linker(masm);
+  JitCode* code = linker.newCode(cx, CodeKind::Other);
+  if (!code) {
+    return nullptr;
+  }
+  rangeRecorder.collectRangesForJitCode(code);
+  JitSpew(JitSpew_Codegen, "# code = %p", code->raw());
+  return code;
+}

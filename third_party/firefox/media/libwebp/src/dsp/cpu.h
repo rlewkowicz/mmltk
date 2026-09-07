@@ -1,0 +1,233 @@
+// Copyright 2022 Google Inc. All Rights Reserved.
+// Use of this source code is governed by a BSD-style license
+
+#if !defined(WEBP_DSP_CPU_H_)
+#define WEBP_DSP_CPU_H_
+
+#include <stddef.h>
+
+#if defined(HAVE_CONFIG_H)
+#include "src/webp/config.h"
+#endif
+
+#include "src/webp/types.h"
+
+#if defined(__GNUC__)
+#define LOCAL_GCC_VERSION ((__GNUC__ << 8) | __GNUC_MINOR__)
+#define LOCAL_GCC_PREREQ(maj, min) (LOCAL_GCC_VERSION >= (((maj) << 8) | (min)))
+#else
+#define LOCAL_GCC_VERSION 0
+#define LOCAL_GCC_PREREQ(maj, min) 0
+#endif
+
+#if defined(__clang__)
+#define LOCAL_CLANG_VERSION ((__clang_major__ << 8) | __clang_minor__)
+#define LOCAL_CLANG_PREREQ(maj, min) \
+  (LOCAL_CLANG_VERSION >= (((maj) << 8) | (min)))
+#else
+#define LOCAL_CLANG_VERSION 0
+#define LOCAL_CLANG_PREREQ(maj, min) 0
+#endif
+
+#if !defined(__has_builtin)
+#define __has_builtin(x) 0
+#endif
+
+
+#if !defined(HAVE_CONFIG_H)
+#if defined(_MSC_VER) && _MSC_VER > 1310 && \
+    (defined(_M_X64) || defined(_M_IX86))
+#define WEBP_MSC_SSE2  // Visual C++ SSE2 targets
+#endif
+
+#if defined(_MSC_VER) && _MSC_VER >= 1500 && \
+    (defined(_M_X64) || defined(_M_IX86))
+#define WEBP_MSC_SSE41  // Visual C++ SSE4.1 targets
+#endif
+
+#if defined(_MSC_VER) && _MSC_VER >= 1700 && \
+    (defined(_M_X64) || defined(_M_IX86))
+#define WEBP_MSC_AVX2  // Visual C++ AVX2 targets
+#endif
+#endif
+
+#if (defined(__SSE2__) || defined(WEBP_MSC_SSE2)) && \
+    (!defined(HAVE_CONFIG_H) || defined(WEBP_HAVE_SSE2))
+#define WEBP_USE_SSE2
+#endif
+
+#if defined(WEBP_USE_SSE2) && !defined(WEBP_HAVE_SSE2)
+#define WEBP_HAVE_SSE2
+#endif
+
+#if (defined(__SSE4_1__) || defined(WEBP_MSC_SSE41)) && \
+    (!defined(HAVE_CONFIG_H) || defined(WEBP_HAVE_SSE41))
+#define WEBP_USE_SSE41
+#endif
+
+#if defined(WEBP_USE_SSE41) && !defined(WEBP_HAVE_SSE41)
+#define WEBP_HAVE_SSE41
+#endif
+
+#if (defined(__AVX2__) || defined(WEBP_MSC_AVX2)) && \
+    (!defined(HAVE_CONFIG_H) || defined(WEBP_HAVE_AVX2))
+#define WEBP_USE_AVX2
+#endif
+
+#if defined(WEBP_USE_AVX2) && !defined(WEBP_HAVE_AVX2)
+#define WEBP_HAVE_AVX2
+#endif
+
+#undef WEBP_MSC_AVX2
+#undef WEBP_MSC_SSE41
+#undef WEBP_MSC_SSE2
+
+
+#if ((defined(__ARM_NEON__) || defined(__aarch64__)) &&       \
+     (!defined(HAVE_CONFIG_H) || defined(WEBP_HAVE_NEON))) && \
+    !defined(__native_client__)
+#define WEBP_USE_NEON
+#endif
+
+
+#if defined(_MSC_VER) && \
+    ((_MSC_VER >= 1700 && defined(_M_ARM)) || \
+     (_MSC_VER >= 1926 && (defined(_M_ARM64) || defined(_M_ARM64EC))))
+#define WEBP_USE_NEON
+#define WEBP_USE_INTRINSICS
+#endif
+
+#if defined(__aarch64__) || defined(_M_ARM64) || defined(_M_ARM64EC)
+#define WEBP_AARCH64 1
+#else
+#define WEBP_AARCH64 0
+#endif
+
+#if defined(WEBP_USE_NEON) && !defined(WEBP_HAVE_NEON)
+#define WEBP_HAVE_NEON
+#endif
+
+
+#if defined(__mips__) && !defined(__mips64) && defined(__mips_isa_rev) && \
+    (__mips_isa_rev >= 1) && (__mips_isa_rev < 6)
+#define WEBP_USE_MIPS32
+#if (__mips_isa_rev >= 2)
+#define WEBP_USE_MIPS32_R2
+#if defined(__mips_dspr2) || (defined(__mips_dsp_rev) && __mips_dsp_rev >= 2)
+#define WEBP_USE_MIPS_DSP_R2
+#endif
+#endif
+#endif
+
+#if defined(__mips_msa) && defined(__mips_isa_rev) && (__mips_isa_rev >= 5)
+#define WEBP_USE_MSA
+#endif
+
+
+#if !defined(WEBP_DSP_OMIT_C_CODE)
+#define WEBP_DSP_OMIT_C_CODE 1
+#endif
+
+#if defined(WEBP_USE_NEON) && WEBP_DSP_OMIT_C_CODE
+#define WEBP_NEON_OMIT_C_CODE 1
+#else
+#define WEBP_NEON_OMIT_C_CODE 0
+#endif
+
+#if !(LOCAL_CLANG_PREREQ(3, 8) || LOCAL_GCC_PREREQ(4, 8) || WEBP_AARCH64)
+#define WEBP_NEON_WORK_AROUND_GCC 1
+#else
+#define WEBP_NEON_WORK_AROUND_GCC 0
+#endif
+
+
+#define WEBP_TSAN_IGNORE_FUNCTION
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#undef WEBP_TSAN_IGNORE_FUNCTION
+#define WEBP_TSAN_IGNORE_FUNCTION __attribute__((no_sanitize_thread))
+#endif
+#endif
+
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer)
+#define WEBP_MSAN
+#endif
+#endif
+
+#if defined(WEBP_USE_THREAD)
+// NOLINTNEXTLINE
+#include <pthread.h>
+
+#define WEBP_DSP_INIT_VARS(func)               \
+  static VP8CPUInfo func##_last_cpuinfo_used = \
+      (VP8CPUInfo)&func##_last_cpuinfo_used;   \
+  static pthread_mutex_t func##_lock = PTHREAD_MUTEX_INITIALIZER
+#define WEBP_DSP_INIT(func)                                \
+  do {                                                     \
+    if (pthread_mutex_lock(&func##_lock)) break;           \
+    if (func##_last_cpuinfo_used != VP8GetCPUInfo) func(); \
+    func##_last_cpuinfo_used = VP8GetCPUInfo;              \
+    (void)pthread_mutex_unlock(&func##_lock);              \
+  } while (0)
+#else
+#define WEBP_DSP_INIT_VARS(func)                        \
+  static volatile VP8CPUInfo func##_last_cpuinfo_used = \
+      (VP8CPUInfo)&func##_last_cpuinfo_used
+#define WEBP_DSP_INIT(func)                               \
+  do {                                                    \
+    if (func##_last_cpuinfo_used == VP8GetCPUInfo) break; \
+    func();                                               \
+    func##_last_cpuinfo_used = VP8GetCPUInfo;             \
+  } while (0)
+#endif
+
+#define WEBP_DSP_INIT_FUNC(name)                                            \
+  WEBP_DSP_INIT_VARS(name##_body);                                          \
+  static WEBP_TSAN_IGNORE_FUNCTION void name##_body(void);                  \
+  WEBP_TSAN_IGNORE_FUNCTION void name(void) { WEBP_DSP_INIT(name##_body); } \
+  static WEBP_TSAN_IGNORE_FUNCTION void name##_body(void)
+
+#define WEBP_UBSAN_IGNORE_UNDEF
+#define WEBP_UBSAN_IGNORE_UNSIGNED_OVERFLOW
+#if defined(__clang__) && defined(__has_attribute)
+#if __has_attribute(no_sanitize)
+#undef WEBP_UBSAN_IGNORE_UNDEF
+#define WEBP_UBSAN_IGNORE_UNDEF __attribute__((no_sanitize("undefined")))
+
+#undef WEBP_UBSAN_IGNORE_UNSIGNED_OVERFLOW
+#define WEBP_UBSAN_IGNORE_UNSIGNED_OVERFLOW \
+  __attribute__((no_sanitize("unsigned-integer-overflow")))
+#endif
+#endif
+
+#if !defined(WEBP_OFFSET_PTR)
+#define WEBP_OFFSET_PTR(ptr, off) (((ptr) == NULL) ? NULL : ((ptr) + (off)))
+#endif
+
+#if !defined(WEBP_SWAP_16BIT_CSP)
+#define WEBP_SWAP_16BIT_CSP 0
+#endif
+
+#if !defined(WORDS_BIGENDIAN) &&                   \
+    (defined(__BIG_ENDIAN__) || defined(_M_PPC) || \
+     (defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)))
+#define WORDS_BIGENDIAN
+#endif
+
+typedef enum {
+  kSSE2,
+  kSSE3,
+  kSlowSSSE3,  
+  kSSE4_1,
+  kAVX,
+  kAVX2,
+  kNEON,
+  kMIPS32,
+  kMIPSdspR2,
+  kMSA
+} CPUFeature;
+
+typedef int (*VP8CPUInfo)(CPUFeature feature);
+
+#endif

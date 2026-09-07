@@ -1,0 +1,72 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsTPromiseFlatString_h
+#define nsTPromiseFlatString_h
+
+#include "mozilla/Attributes.h"
+#include "nsTString.h"
+
+
+template <typename T>
+class MOZ_STACK_CLASS nsTPromiseFlatString : public nsTString<T> {
+ public:
+  typedef nsTPromiseFlatString<T> self_type;
+  typedef nsTString<T> base_string_type;
+  typedef typename base_string_type::substring_type substring_type;
+  typedef typename base_string_type::string_type string_type;
+  typedef typename base_string_type::substring_tuple_type substring_tuple_type;
+  typedef typename base_string_type::char_type char_type;
+  typedef typename base_string_type::size_type size_type;
+
+  typedef typename base_string_type::DataFlags DataFlags;
+  typedef typename base_string_type::ClassFlags ClassFlags;
+
+  void operator=(const self_type&) = delete;
+  nsTPromiseFlatString(const self_type&) = delete;
+  nsTPromiseFlatString() = delete;
+  nsTPromiseFlatString(const string_type& aStr) = delete;
+
+ private:
+  void Init(const substring_type&);
+
+ public:
+  explicit nsTPromiseFlatString(const substring_type& aStr) : string_type() {
+    Init(aStr);
+  }
+
+  explicit nsTPromiseFlatString(const substring_tuple_type& aTuple)
+      : string_type() {
+    this->Assign(aTuple);
+  }
+};
+
+extern template class nsTPromiseFlatString<char>;
+extern template class nsTPromiseFlatString<char16_t>;
+
+template <typename Char>
+struct fmt::formatter<nsTPromiseFlatString<Char>, Char>
+    : fmt::formatter<nsTString<Char>, Char> {};
+
+template <class T>
+const nsTPromiseFlatString<T> TPromiseFlatString(
+    const typename nsTPromiseFlatString<T>::substring_type& aString) {
+  return nsTPromiseFlatString<T>(aString);
+}
+
+template <class T>
+const nsTPromiseFlatString<T> TPromiseFlatString(
+    const typename nsTPromiseFlatString<T>::substring_tuple_type& aString) {
+  return nsTPromiseFlatString<T>(aString);
+}
+
+#ifndef PromiseFlatCString
+#  define PromiseFlatCString TPromiseFlatString<char>
+#endif
+
+#ifndef PromiseFlatString
+#  define PromiseFlatString TPromiseFlatString<char16_t>
+#endif
+
+#endif

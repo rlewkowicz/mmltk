@@ -1,0 +1,229 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "jit/Jit.h"
+
+#include "jit/BaselineJIT.h"
+#include "jit/CalleeToken.h"
+#include "jit/Ion.h"
+#include "jit/JitCommon.h"
+#include "jit/JitRuntime.h"
+#include "js/friend/StackLimits.h"  // js::AutoCheckRecursionLimit
+#include "vm/Interpreter.h"
+#include "vm/JitActivation.h"
+#include "vm/JSContext.h"
+#include "vm/PortableBaselineInterpret.h"
+#include "vm/Realm.h"
+
+#include "vm/Activation-inl.h"
+#include "vm/JSScript-inl.h"
+
+using namespace js;
+using namespace js::jit;
+
+static EnterJitStatus JS_HAZ_JSNATIVE_CALLER EnterJit(JSContext* cx,
+                                                      RunState& state,
+                                                      uint8_t* code) {
+  MOZ_ASSERT(code);
+#ifndef ENABLE_PORTABLE_BASELINE_INTERP
+  MOZ_ASSERT(code != cx->runtime()->jitRuntime()->interpreterStub().value);
+  MOZ_ASSERT(IsBaselineInterpreterEnabled());
+#else
+  MOZ_ASSERT(IsBaselineInterpreterEnabled() ||
+             IsPortableBaselineInterpreterEnabled());
+#endif
+
+  AutoCheckRecursionLimit recursion(cx);
+  if (!recursion.check(cx)) {
+    return EnterJitStatus::Error;
+  }
+
+  MOZ_ASSERT(!cx->isInUnsafeRegion());
+
+#ifdef DEBUG
+  mozilla::Maybe<JS::AutoAssertNoGC> nogc;
+  nogc.emplace(cx);
+#endif
+
+  size_t numActualArgs;
+  bool constructing;
+  size_t maxArgc;
+  Value* maxArgv;
+  JSObject* envChain;
+  CalleeToken calleeToken;
+
+  if (state.isInvoke()) {
+    const CallArgs& args = state.asInvoke()->args();
+    numActualArgs = args.length();
+
+    if (TooManyActualArguments(numActualArgs)) {
+      return EnterJitStatus::NotEntered;
+    }
+
+    constructing = state.asInvoke()->constructing();
+
+    MOZ_ASSERT_IF(constructing,
+                  args.thisv().isObject() ||
+                      args.thisv().isMagic(JS_UNINITIALIZED_LEXICAL));
+
+    maxArgc = args.length();
+    maxArgv = args.array();
+    envChain = nullptr;
+    calleeToken = CalleeToToken(&args.callee().as<JSFunction>(), constructing);
+  } else {
+    numActualArgs = 0;
+    constructing = false;
+    maxArgc = 0;
+    maxArgv = nullptr;
+    envChain = state.asExecute()->environmentChain();
+    calleeToken = CalleeToToken(state.script());
+  }
+
+  RootedValue result(cx, Int32Value(numActualArgs));
+  {
+    AssertRealmUnchanged aru(cx);
+    JitActivation activation(cx);
+
+#ifndef ENABLE_PORTABLE_BASELINE_INTERP
+    EnterJitCode enter = cx->runtime()->jitRuntime()->enterJit();
+
+#  ifdef DEBUG
+    nogc.reset();
+#  endif
+    CALL_GENERATED_CODE(enter, code, maxArgc, maxArgv,  nullptr,
+                        calleeToken, envChain,  0,
+                        result.address());
+#else  // !ENABLE_PORTABLE_BASELINE_INTERP
+    (void)code;
+#  ifdef DEBUG
+    nogc.reset();
+#  endif
+    if (!pbl::PortablebaselineInterpreterStackCheck(cx, state, numActualArgs)) {
+      return EnterJitStatus::NotEntered;
+    }
+    unsigned numFormals =
+        state.isInvoke() ? state.script()->function()->nargs() : 0;
+    if (!pbl::PortableBaselineTrampoline(cx, maxArgc, maxArgv, numFormals,
+                                         calleeToken, envChain,
+                                         result.address())) {
+      return EnterJitStatus::Error;
+    }
+#endif  // ENABLE_PORTABLE_BASELINE_INTERP
+  }
+
+  MOZ_ASSERT(!cx->isInUnsafeRegion());
+
+  if (!IsPortableBaselineInterpreterEnabled()) {
+    cx->runtime()->jitRuntime()->freeIonOsrTempData();
+  }
+
+  if (result.isMagic()) {
+    MOZ_ASSERT(result.isMagic(JS_ION_ERROR));
+    return EnterJitStatus::Error;
+  }
+
+  if (constructing && result.isPrimitive()) {
+    result = state.asInvoke()->args().thisv();
+    MOZ_ASSERT(result.isObject());
+  }
+
+  state.setReturnValue(result);
+  return EnterJitStatus::Ok;
+}
+
+bool js::jit::EnterInterpreterEntryTrampoline(uint8_t* code, JSContext* cx,
+                                              RunState* state) {
+  using EnterTrampolineCodePtr = bool (*)(JSContext* cx, RunState*);
+  auto funcPtr = JS_DATA_TO_FUNC_PTR(EnterTrampolineCodePtr, code);
+  return CALL_GENERATED_2(funcPtr, cx, state);
+}
+
+EnterJitStatus js::jit::MaybeEnterJit(JSContext* cx, RunState& state) {
+  if (!IsBaselineInterpreterEnabled()
+#ifdef ENABLE_PORTABLE_BASELINE_INTERP
+      && !IsPortableBaselineInterpreterEnabled()
+#endif
+  ) {
+    return EnterJitStatus::NotEntered;
+  }
+
+  if (cx->realm()->debuggerObservesNativeCall()) {
+    return EnterJitStatus::NotEntered;
+  }
+
+  JSScript* script = state.script();
+
+  uint8_t* code = script->jitCodeRaw();
+
+#ifdef JS_CACHEIR_SPEW
+  cx->spewer().enableSpewing();
+#endif
+
+  do {
+    if (script->hasJitScript() && code) {
+      break;
+    }
+
+    script->incWarmUpCounter();
+
+#ifndef ENABLE_PORTABLE_BASELINE_INTERP
+    if (jit::IsIonEnabled(cx)) {
+      jit::MethodStatus status = jit::CanEnterIon(cx, state);
+      if (status == jit::Method_Error) {
+        return EnterJitStatus::Error;
+      }
+      if (status == jit::Method_Compiled) {
+        code = script->jitCodeRaw();
+        break;
+      }
+    }
+
+    if (jit::IsBaselineJitEnabled(cx)) {
+      jit::MethodStatus status =
+          jit::CanEnterBaselineMethod<BaselineTier::Compiler>(cx, state);
+      if (status == jit::Method_Error) {
+        return EnterJitStatus::Error;
+      }
+      if (status == jit::Method_Compiled) {
+        code = script->jitCodeRaw();
+        break;
+      }
+    }
+
+    if (IsBaselineInterpreterEnabled()) {
+      jit::MethodStatus status =
+          jit::CanEnterBaselineMethod<BaselineTier::Interpreter>(cx, state);
+      if (status == jit::Method_Error) {
+        return EnterJitStatus::Error;
+      }
+      if (status == jit::Method_Compiled) {
+        code = script->jitCodeRaw();
+        break;
+      }
+    }
+
+#else  // !ENABLE_PORTABLE_BASELINE_INTERP
+
+    if (IsPortableBaselineInterpreterEnabled()) {
+      jit::MethodStatus status =
+          pbl::CanEnterPortableBaselineInterpreter(cx, state);
+      if (status == jit::Method_Error) {
+        return EnterJitStatus::Error;
+      }
+      if (status == jit::Method_Compiled) {
+        code = script->jitCodeRaw();
+        break;
+      }
+    }
+#endif
+
+    return EnterJitStatus::NotEntered;
+  } while (false);
+
+#ifdef JS_CACHEIR_SPEW
+  cx->spewer().disableSpewing();
+#endif
+
+  return EnterJit(cx, state, code);
+}

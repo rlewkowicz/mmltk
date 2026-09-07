@@ -1,0 +1,1378 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "VectorImage.h"
+
+#include "AutoRestoreSVGState.h"
+#include "BlobSurfaceProvider.h"
+#include "ISurfaceProvider.h"
+#include "ImageRegion.h"
+#include "LookupResult.h"
+#include "Orientation.h"
+#include "SVGDocumentWrapper.h"
+#include "SVGDrawingCallback.h"
+#include "SVGDrawingParameters.h"
+#include "SurfaceCache.h"
+#include "WindowRenderer.h"
+#include "gfx2DGlue.h"
+#include "gfxContext.h"
+#include "gfxDrawable.h"
+#include "gfxPlatform.h"
+#include "gfxUtils.h"
+#include "imgFrame.h"
+#include "mozilla/MediaFeatureChange.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/SVGObserverUtils.h"  // for SVGRenderingObserver
+#include "mozilla/SVGUtils.h"
+#include "mozilla/StaticPrefs_image.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/DocumentInlines.h"
+#include "mozilla/dom/Event.h"
+#include "mozilla/dom/SVGDocument.h"
+#include "mozilla/dom/SVGSVGElement.h"
+#include "mozilla/gfx/2D.h"
+#include "mozilla/image/Resolution.h"
+#include "nsIDOMEventListener.h"
+#include "nsIStreamListener.h"
+#include "nsMimeTypes.h"
+#include "nsPresContext.h"
+#include "nsRect.h"
+#include "nsString.h"
+#include "nsStubDocumentObserver.h"
+#include "nsWindowSizes.h"
+
+namespace mozilla {
+
+using namespace dom;
+using namespace dom::SVGPreserveAspectRatio_Binding;
+using namespace gfx;
+using namespace layers;
+
+namespace image {
+
+class SVGRootRenderingObserver final : public SVGRenderingObserver {
+ public:
+  NS_DECL_ISUPPORTS
+
+  SVGRootRenderingObserver(SVGDocumentWrapper* aDocWrapper,
+                           VectorImage* aVectorImage)
+      : mDocWrapper(aDocWrapper),
+        mVectorImage(aVectorImage),
+        mHonoringInvalidations(true) {
+    MOZ_ASSERT(mDocWrapper, "Need a non-null SVG document wrapper");
+    MOZ_ASSERT(mVectorImage, "Need a non-null VectorImage");
+
+    StartObserving();
+    Element* elem = GetReferencedElementWithoutObserving();
+    MOZ_ASSERT(elem, "no root SVG node for us to observe");
+
+    SVGObserverUtils::AddRenderingObserver(elem, this);
+    mInObserverSet = true;
+  }
+
+  void ResumeHonoringInvalidations() { mHonoringInvalidations = true; }
+
+ protected:
+  virtual ~SVGRootRenderingObserver() {
+    StopObserving();
+  }
+
+  Element* GetReferencedElementWithoutObserving() const final {
+    return mDocWrapper->GetSVGRootElement();
+  }
+
+  virtual void OnRenderingChange() override {
+    Element* elem = GetReferencedElementWithoutObserving();
+    MOZ_ASSERT(elem, "missing root SVG node");
+
+    if (mHonoringInvalidations && !mDocWrapper->ShouldIgnoreInvalidation()) {
+      nsIFrame* frame = elem->GetPrimaryFrame();
+      if (!frame || frame->PresShell()->IsDestroying()) {
+        return;
+      }
+
+      mHonoringInvalidations = false;
+
+      mVectorImage->InvalidateObserversOnNextRefreshDriverTick();
+    }
+
+    if (!mInObserverSet) {
+      SVGObserverUtils::AddRenderingObserver(elem, this);
+      mInObserverSet = true;
+    }
+  }
+
+  const RefPtr<SVGDocumentWrapper> mDocWrapper;
+  VectorImage* const mVectorImage;  
+  bool mHonoringInvalidations;
+};
+
+NS_IMPL_ISUPPORTS(SVGRootRenderingObserver, nsIMutationObserver)
+
+class SVGParseCompleteListener final : public nsStubDocumentObserver {
+ public:
+  NS_DECL_ISUPPORTS
+
+  SVGParseCompleteListener(SVGDocument* aDocument, VectorImage* aImage)
+      : mDocument(aDocument), mImage(aImage) {
+    MOZ_ASSERT(mDocument, "Need an SVG document");
+    MOZ_ASSERT(mImage, "Need an image");
+
+    mDocument->AddObserver(this);
+  }
+
+ private:
+  ~SVGParseCompleteListener() {
+    if (mDocument) {
+      Cancel();
+    }
+  }
+
+ public:
+  void EndLoad(Document* aDocument) override {
+    MOZ_ASSERT(aDocument == mDocument, "Got EndLoad for wrong document?");
+
+    RefPtr<SVGParseCompleteListener> kungFuDeathGrip(this);
+
+    mImage->OnSVGDocumentParsed();
+  }
+
+  void Cancel() {
+    MOZ_ASSERT(mDocument, "Duplicate call to Cancel");
+    if (mDocument) {
+      mDocument->RemoveObserver(this);
+      mDocument = nullptr;
+    }
+  }
+
+ private:
+  RefPtr<SVGDocument> mDocument;
+  VectorImage* const mImage;  
+};
+
+NS_IMPL_ISUPPORTS(SVGParseCompleteListener, nsIDocumentObserver)
+
+class SVGLoadEventListener final : public nsIDOMEventListener {
+ public:
+  NS_DECL_ISUPPORTS
+
+  SVGLoadEventListener(Document* aDocument, VectorImage* aImage)
+      : mDocument(aDocument), mImage(aImage) {
+    MOZ_ASSERT(mDocument, "Need an SVG document");
+    MOZ_ASSERT(mImage, "Need an image");
+
+    mDocument->AddEventListener(u"MozSVGAsImageDocumentLoad"_ns, this, true,
+                                false);
+  }
+
+ private:
+  ~SVGLoadEventListener() {
+    if (mDocument) {
+      Cancel();
+    }
+  }
+
+ public:
+  NS_IMETHOD HandleEvent(Event* aEvent) override {
+    MOZ_ASSERT(mDocument, "Need an SVG document. Received multiple events?");
+
+    RefPtr<SVGLoadEventListener> kungFuDeathGrip(this);
+
+#ifdef DEBUG
+    nsAutoString eventType;
+    aEvent->GetType(eventType);
+    MOZ_ASSERT(eventType.EqualsLiteral("MozSVGAsImageDocumentLoad"),
+               "Received unexpected event");
+#endif
+
+    mImage->OnSVGDocumentLoaded();
+
+    return NS_OK;
+  }
+
+  void Cancel() {
+    MOZ_ASSERT(mDocument, "Duplicate call to Cancel");
+    if (mDocument) {
+      mDocument->RemoveEventListener(u"MozSVGAsImageDocumentLoad"_ns, this,
+                                     true);
+      mDocument = nullptr;
+    }
+  }
+
+ private:
+  nsCOMPtr<Document> mDocument;
+  VectorImage* const mImage;  
+};
+
+NS_IMPL_ISUPPORTS(SVGLoadEventListener, nsIDOMEventListener)
+
+SVGDrawingCallback::SVGDrawingCallback(SVGDocumentWrapper* aSVGDocumentWrapper,
+                                       const IntSize& aViewportSize,
+                                       const IntSize& aSize,
+                                       uint32_t aImageFlags)
+    : mSVGDocumentWrapper(aSVGDocumentWrapper),
+      mViewportSize(aViewportSize),
+      mSize(aSize),
+      mImageFlags(aImageFlags) {}
+
+SVGDrawingCallback::~SVGDrawingCallback() = default;
+
+bool SVGDrawingCallback::operator()(gfxContext* aContext,
+                                    const gfxRect& aFillRect,
+                                    const SamplingFilter aSamplingFilter,
+                                    const gfxMatrix& aTransform) {
+  MOZ_ASSERT(mSVGDocumentWrapper, "need an SVGDocumentWrapper");
+
+  RefPtr<PresShell> presShell = mSVGDocumentWrapper->GetPresShell();
+  MOZ_ASSERT(presShell, "GetPresShell returned null for an SVG image?");
+
+  gfxContextAutoSaveRestore contextRestorer(aContext);
+
+  aContext->Clip(aFillRect);
+
+  gfxMatrix matrix = aTransform;
+  if (!matrix.Invert()) {
+    return false;
+  }
+  aContext->SetMatrixDouble(
+      aContext->CurrentMatrixDouble().PreMultiply(matrix).PreScale(
+          double(mSize.width) / mViewportSize.width,
+          double(mSize.height) / mViewportSize.height));
+
+  nsPresContext* presContext = presShell->GetPresContext();
+  MOZ_ASSERT(presContext, "pres shell w/out pres context");
+
+  nsRect svgRect(0, 0, presContext->DevPixelsToAppUnits(mViewportSize.width),
+                 presContext->DevPixelsToAppUnits(mViewportSize.height));
+
+  RenderDocumentFlags renderDocFlags =
+      RenderDocumentFlags::IgnoreViewportScrolling;
+  if (!(mImageFlags & imgIContainer::FLAG_SYNC_DECODE)) {
+    renderDocFlags |= RenderDocumentFlags::AsyncDecodeImages;
+  }
+  if (mImageFlags & imgIContainer::FLAG_HIGH_QUALITY_SCALING) {
+    renderDocFlags |= RenderDocumentFlags::UseHighQualityScaling;
+  }
+
+  presShell->RenderDocument(svgRect, renderDocFlags,
+                            NS_RGBA(0, 0, 0, 0),  
+                            aContext);
+
+  return true;
+}
+
+NS_IMPL_ISUPPORTS(VectorImage, imgIContainer, nsIStreamListener,
+                  nsIRequestObserver)
+
+
+VectorImage::VectorImage(nsIURI* aURI )
+    : ImageResource(aURI),  
+      mLockCount(0),
+      mIsInitialized(false),
+      mDiscardable(false),
+      mIsFullyLoaded(false),
+      mHaveAnimations(false),
+      mHasPendingInvalidation(false) {}
+
+VectorImage::~VectorImage() {
+  CancelAllListeners();
+  SurfaceCache::RemoveImage(ImageKey(this));
+}
+
+
+nsresult VectorImage::Init(const char* aMimeType, uint32_t aFlags) {
+  if (mIsInitialized) {
+    return NS_ERROR_ILLEGAL_VALUE;
+  }
+
+  MOZ_ASSERT(!mIsFullyLoaded && !mHaveAnimations && !mError,
+             "Flags unexpectedly set before initialization");
+  MOZ_ASSERT(!strcmp(aMimeType, IMAGE_SVG_XML), "Unexpected mimetype");
+
+  mDiscardable = !!(aFlags & INIT_FLAG_DISCARDABLE);
+
+  if (!mDiscardable) {
+    mLockCount++;
+    SurfaceCache::LockImage(ImageKey(this));
+  }
+
+  mIsInitialized = true;
+  return NS_OK;
+}
+
+size_t VectorImage::SizeOfSourceWithComputedFallback(
+    SizeOfState& aState) const {
+  if (!mSVGDocumentWrapper) {
+    return 0;  
+  }
+
+  RefPtr<SVGDocument> doc = mSVGDocumentWrapper->GetDocument();
+  if (!doc) {
+    return 0;  
+  }
+
+  nsWindowSizes windowSizes(aState);
+  doc->DocAddSizeOfIncludingThis(windowSizes);
+
+  if (windowSizes.getTotalSize() == 0) {
+    return 100 * 1024;
+  }
+
+  return windowSizes.getTotalSize();
+}
+
+nsresult VectorImage::OnImageDataComplete(nsIRequest* aRequest,
+                                          nsresult aStatus, bool aLastPart) {
+  nsresult finalStatus = OnStopRequest(aRequest, aStatus);
+
+  if (NS_FAILED(aStatus)) {
+    finalStatus = aStatus;
+  }
+
+  Progress loadProgress = LoadCompleteProgress(aLastPart, mError, finalStatus);
+
+  if (mIsFullyLoaded || mError) {
+    mProgressTracker->SyncNotifyProgress(loadProgress);
+  } else {
+    mLoadProgress = Some(loadProgress);
+  }
+
+  return finalStatus;
+}
+
+nsresult VectorImage::OnImageDataAvailable(nsIRequest* aRequest,
+                                           nsIInputStream* aInStr,
+                                           uint64_t aSourceOffset,
+                                           uint32_t aCount) {
+  return OnDataAvailable(aRequest, aInStr, aSourceOffset, aCount);
+}
+
+nsresult VectorImage::StartAnimation() {
+  if (mError) {
+    return NS_ERROR_FAILURE;
+  }
+
+  MOZ_ASSERT(ShouldAnimate(), "Should not animate!");
+
+  mSVGDocumentWrapper->StartAnimation();
+  return NS_OK;
+}
+
+nsresult VectorImage::StopAnimation() {
+  nsresult rv = NS_OK;
+  if (mError) {
+    rv = NS_ERROR_FAILURE;
+  } else {
+    MOZ_ASSERT(mIsFullyLoaded && mHaveAnimations,
+               "Should not have been animating!");
+
+    mSVGDocumentWrapper->StopAnimation();
+  }
+
+  mAnimating = false;
+  return rv;
+}
+
+bool VectorImage::ShouldAnimate() {
+  return ImageResource::ShouldAnimate() && mIsFullyLoaded && mHaveAnimations;
+}
+
+static Maybe<int32_t> ClampedPxLengthOrNothing(
+    const LengthPercentage& aLenPct) {
+  if (!aLenPct.IsLength()) {
+    return Nothing();
+  }
+  auto lenInPx = SVGUtils::ClampToInt(aLenPct.AsLength().ToCSSPixels());
+  return Some(std::max(0, lenInPx));
+}
+
+
+
+NS_IMETHODIMP
+VectorImage::GetWidth(int32_t* aWidth) {
+  if (mError || !mIsFullyLoaded) {
+    *aWidth = 0;
+    return NS_ERROR_FAILURE;
+  }
+
+  SVGSVGElement* rootElem = mSVGDocumentWrapper->GetSVGRootElement();
+  if (MOZ_UNLIKELY(!rootElem)) {
+    *aWidth = 0;
+    return NS_ERROR_FAILURE;
+  }
+
+  auto widthFromSVG = ClampedPxLengthOrNothing(rootElem->GetIntrinsicWidth());
+  if (!widthFromSVG) {
+    *aWidth = 0;
+    return NS_ERROR_FAILURE;
+  }
+
+  *aWidth = *widthFromSVG;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+VectorImage::GetHeight(int32_t* aHeight) {
+  if (mError || !mIsFullyLoaded) {
+    *aHeight = 0;
+    return NS_ERROR_FAILURE;
+  }
+
+  SVGSVGElement* rootElem = mSVGDocumentWrapper->GetSVGRootElement();
+  if (MOZ_UNLIKELY(!rootElem)) {
+    *aHeight = 0;
+    return NS_ERROR_FAILURE;
+  }
+  auto heightFromSVG = ClampedPxLengthOrNothing(rootElem->GetIntrinsicHeight());
+  if (!heightFromSVG) {
+    *aHeight = 0;
+    return NS_ERROR_FAILURE;
+  }
+
+  *aHeight = *heightFromSVG;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+VectorImage::GetIntrinsicSize(ImageIntrinsicSize* aIntrinsicSize) {
+  if (mError || !mIsFullyLoaded) {
+    return NS_ERROR_FAILURE;
+  }
+  SVGSVGElement* rootElem = mSVGDocumentWrapper->GetSVGRootElement();
+  if (MOZ_UNLIKELY(!rootElem)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  aIntrinsicSize->mWidth =
+      ClampedPxLengthOrNothing(rootElem->GetIntrinsicWidth());
+  aIntrinsicSize->mHeight =
+      ClampedPxLengthOrNothing(rootElem->GetIntrinsicHeight());
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+VectorImage::GetIntrinsicSizeInAppUnits(nsSize* aSize) {
+  if (mError || !mIsFullyLoaded) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsIFrame* rootFrame = mSVGDocumentWrapper->GetRootLayoutFrame();
+  if (!rootFrame) {
+    return NS_ERROR_FAILURE;
+  }
+
+  *aSize = nsSize(-1, -1);
+  IntrinsicSize rfSize = rootFrame->GetIntrinsicSize();
+  if (rfSize.width) {
+    aSize->width = *rfSize.width;
+  }
+  if (rfSize.height) {
+    aSize->height = *rfSize.height;
+  }
+  return NS_OK;
+}
+
+AspectRatio VectorImage::GetIntrinsicRatio() {
+  if (mError || !mIsFullyLoaded) {
+    return {};
+  }
+  nsIFrame* rootFrame = mSVGDocumentWrapper->GetRootLayoutFrame();
+  if (!rootFrame) {
+    return {};
+  }
+  return rootFrame->GetIntrinsicRatio();
+}
+
+nsresult VectorImage::GetHotspotX(int32_t* aX) {
+  return Image::GetHotspotX(aX);
+}
+
+nsresult VectorImage::GetHotspotY(int32_t* aY) {
+  return Image::GetHotspotY(aY);
+}
+
+nsIntSize VectorImage::OptimalImageSizeForDest(const gfxSize& aDest,
+                                               uint32_t aWhichFrame,
+                                               SamplingFilter aSamplingFilter,
+                                               uint32_t aFlags) {
+  MOZ_ASSERT(aDest.width >= 0 || ceil(aDest.width) <= INT32_MAX ||
+                 aDest.height >= 0 || ceil(aDest.height) <= INT32_MAX,
+             "Unexpected destination size");
+
+  return nsIntSize::Ceil(aDest.width, aDest.height);
+}
+
+NS_IMETHODIMP
+VectorImage::GetType(uint16_t* aType) {
+  NS_ENSURE_ARG_POINTER(aType);
+
+  *aType = imgIContainer::TYPE_VECTOR;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+VectorImage::GetAnimated(bool* aAnimated) {
+  if (mError || !mIsFullyLoaded) {
+    return NS_ERROR_FAILURE;
+  }
+
+  *aAnimated = mSVGDocumentWrapper->IsAnimated();
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+VectorImage::GetProviderId(uint32_t* aId) {
+  NS_ENSURE_ARG_POINTER(aId);
+
+  *aId = ImageResource::GetImageProviderId();
+  return NS_OK;
+}
+
+NS_IMETHODIMP_(already_AddRefed<SourceSurface>)
+VectorImage::GetFrame(uint32_t aWhichFrame, uint32_t aFlags) {
+  if (mError) {
+    return nullptr;
+  }
+
+  SVGSVGElement* svgElem = mSVGDocumentWrapper->GetSVGRootElement();
+  MOZ_ASSERT(svgElem,
+             "Should have a root SVG elem, since we finished "
+             "loading without errors");
+  LengthPercentage width = svgElem->GetIntrinsicWidth();
+  LengthPercentage height = svgElem->GetIntrinsicHeight();
+  if (!width.IsLength() || !height.IsLength()) {
+    NS_WARNING(
+        "VectorImage::GetFrame called on image without an intrinsic width or "
+        "height");
+    return nullptr;
+  }
+
+  nsIntSize imageIntSize(SVGUtils::ClampToInt(width.AsLength().ToCSSPixels()),
+                         SVGUtils::ClampToInt(height.AsLength().ToCSSPixels()));
+
+  return GetFrameAtSize(imageIntSize, aWhichFrame, aFlags);
+}
+
+NS_IMETHODIMP_(already_AddRefed<SourceSurface>)
+VectorImage::GetFrameAtSize(const IntSize& aSize, uint32_t aWhichFrame,
+                            uint32_t aFlags) {
+  MOZ_ASSERT(aWhichFrame <= FRAME_MAX_VALUE);
+#ifdef DEBUG
+  NotifyDrawingObservers();
+#endif
+
+  if (aSize.IsEmpty() || aWhichFrame > FRAME_MAX_VALUE || mError ||
+      !mIsFullyLoaded) {
+    return nullptr;
+  }
+
+  uint32_t whichFrame = mHaveAnimations ? aWhichFrame : FRAME_FIRST;
+
+  auto [sourceSurface, decodeSize] =
+      LookupCachedSurface(aSize, SVGImageContext(), aFlags);
+  if (sourceSurface) {
+    return sourceSurface.forget();
+  }
+
+  if (mSVGDocumentWrapper->IsDrawing()) {
+    NS_WARNING("Refusing to make re-entrant call to VectorImage::Draw");
+    return nullptr;
+  }
+
+  float animTime = (whichFrame == FRAME_FIRST)
+                       ? 0.0f
+                       : mSVGDocumentWrapper->GetCurrentTimeAsFloat();
+
+  SVGImageContext svgContext;
+  SVGDrawingParameters params(
+      nullptr, decodeSize, aSize, ImageRegion::Create(decodeSize),
+      SamplingFilter::POINT, svgContext, animTime, aFlags, 1.0);
+
+  bool didCache;  
+
+  AutoRestoreSVGState autoRestore(params, mSVGDocumentWrapper,
+                                   false);
+
+  RefPtr<gfxDrawable> svgDrawable = CreateSVGDrawable(params);
+  RefPtr<SourceSurface> surface = CreateSurface(params, svgDrawable, didCache);
+  if (!surface) {
+    MOZ_ASSERT(!didCache);
+    return nullptr;
+  }
+
+  SendFrameComplete(didCache, params.flags);
+  return surface.forget();
+}
+
+NS_IMETHODIMP_(bool)
+VectorImage::WillDrawOpaqueNow() {
+  return false;  
+}
+
+bool VectorImage::HasDecodedPixels() {
+  MOZ_ASSERT_UNREACHABLE("calling VectorImage::HasDecodedPixels");
+  return mIsFullyLoaded;
+}
+
+NS_IMETHODIMP_(bool)
+VectorImage::IsImageContainerAvailable(WindowRenderer* aRenderer,
+                                       uint32_t aFlags) {
+  if (mError || !mIsFullyLoaded ||
+      aRenderer->GetBackendType() != LayersBackend::LAYERS_WR) {
+    return false;
+  }
+
+  if (mHaveAnimations && !StaticPrefs::image_svg_blob_image()) {
+    return false;
+  }
+
+  return true;
+}
+
+NS_IMETHODIMP_(ImgDrawResult)
+VectorImage::GetImageProvider(WindowRenderer* aRenderer,
+                              const gfx::IntSize& aSize,
+                              const SVGImageContext& aSVGContext,
+                              const Maybe<ImageIntRegion>& aRegion,
+                              uint32_t aFlags,
+                              WebRenderImageProvider** aProvider) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aRenderer);
+  MOZ_ASSERT(!(aFlags & FLAG_BYPASS_SURFACE_CACHE), "Unsupported flags");
+
+  if (aSize.IsEmpty()) {
+    return ImgDrawResult::BAD_ARGS;
+  }
+
+  if (mError) {
+    return ImgDrawResult::BAD_IMAGE;
+  }
+
+  if (!mIsFullyLoaded) {
+    return ImgDrawResult::NOT_READY;
+  }
+
+  if (mHaveAnimations && !(aFlags & FLAG_RECORD_BLOB)) {
+    return ImgDrawResult::NOT_SUPPORTED;
+  }
+#ifdef DEBUG
+  NotifyDrawingObservers();
+#endif
+
+  const bool blobRecording = aFlags & FLAG_RECORD_BLOB;
+  MOZ_ASSERT_IF(!blobRecording, aRegion.isNothing());
+
+  LookupResult result(MatchType::NOT_FOUND);
+  auto playbackType =
+      mHaveAnimations ? PlaybackType::eAnimated : PlaybackType::eStatic;
+  auto surfaceFlags = ToSurfaceFlags(aFlags);
+
+  SVGImageContext newSVGContext = aSVGContext;
+  bool contextPaint = MaybeRestrictSVGContext(newSVGContext, aFlags);
+
+  SurfaceKey surfaceKey = VectorSurfaceKey(aSize, aRegion, newSVGContext,
+                                           surfaceFlags, playbackType);
+  if ((aFlags & FLAG_SYNC_DECODE) || !(aFlags & FLAG_HIGH_QUALITY_SCALING)) {
+    result = SurfaceCache::Lookup(ImageKey(this), surfaceKey,
+                                   true);
+  } else {
+    result = SurfaceCache::LookupBestMatch(ImageKey(this), surfaceKey,
+                                            true);
+  }
+
+  if (result && (result.Type() == MatchType::EXACT ||
+                 result.Type() == MatchType::SUBSTITUTE_BECAUSE_BEST)) {
+    result.Surface().TakeProvider(aProvider);
+    return ImgDrawResult::SUCCESS;
+  }
+
+  IntSize rasterSize(aSize);
+  if (!result.SuggestedSize().IsEmpty()) {
+    rasterSize = result.SuggestedSize();
+    surfaceKey = surfaceKey.CloneWithSize(rasterSize);
+  }
+
+  bool mayCache = SurfaceCache::CanHold(rasterSize);
+  if (mayCache) {
+    SurfaceCache::UnlockEntries(ImageKey(this));
+  }
+
+  RefPtr<ISurfaceProvider> provider;
+  if (blobRecording) {
+    provider = MakeRefPtr<BlobSurfaceProvider>(ImageKey(this), surfaceKey,
+                                               mSVGDocumentWrapper, aFlags);
+  } else {
+    if (mSVGDocumentWrapper->IsDrawing()) {
+      NS_WARNING("Refusing to make re-entrant call to VectorImage::Draw");
+      return ImgDrawResult::TEMPORARY_ERROR;
+    }
+
+    if (!SurfaceCache::IsLegalSize(rasterSize) ||
+        !Factory::AllowedSurfaceSize(rasterSize)) {
+      return ImgDrawResult::NOT_SUPPORTED;
+    }
+
+    float animTime =
+        mHaveAnimations ? mSVGDocumentWrapper->GetCurrentTimeAsFloat() : 0.0f;
+
+    SVGDrawingParameters params(
+        nullptr, rasterSize, aSize, ImageRegion::Create(rasterSize),
+        SamplingFilter::POINT, newSVGContext, animTime, aFlags, 1.0);
+
+    RefPtr<gfxDrawable> svgDrawable = CreateSVGDrawable(params);
+    AutoRestoreSVGState autoRestore(params, mSVGDocumentWrapper, contextPaint);
+
+    mSVGDocumentWrapper->UpdateViewportBounds(params.viewportSize);
+    mSVGDocumentWrapper->FlushImageTransformInvalidation();
+
+    BackendType backend =
+        gfxPlatform::GetPlatform()->GetDefaultContentBackend();
+
+    auto frame = MakeNotNull<RefPtr<imgFrame>>();
+    nsresult rv = frame->InitWithDrawable(
+        svgDrawable, params.size, SurfaceFormat::OS_RGBA, SamplingFilter::POINT,
+        params.flags, backend);
+
+    if (NS_FAILED(rv)) {
+      return ImgDrawResult::TEMPORARY_ERROR;
+    }
+
+    provider =
+        MakeRefPtr<SimpleSurfaceProvider>(ImageKey(this), surfaceKey, frame);
+  }
+
+  if (mayCache) {
+    if (SurfaceCache::Insert(WrapNotNull(provider)) == InsertOutcome::SUCCESS) {
+      if (rasterSize != aSize) {
+        SurfaceCache::PruneImage(ImageKey(this));
+      }
+
+      SendFrameComplete( true, aFlags);
+    }
+  }
+
+  MOZ_ASSERT(provider);
+  provider.forget(aProvider);
+  return ImgDrawResult::SUCCESS;
+}
+
+NS_IMETHODIMP_(ImgDrawResult)
+VectorImage::Draw(gfxContext* aContext, const nsIntSize& aSize,
+                  const ImageRegion& aRegion, uint32_t aWhichFrame,
+                  SamplingFilter aSamplingFilter,
+                  const SVGImageContext& aSVGContext, uint32_t aFlags,
+                  float aOpacity) {
+  if (aWhichFrame > FRAME_MAX_VALUE) {
+    return ImgDrawResult::BAD_ARGS;
+  }
+
+  if (!aContext) {
+    return ImgDrawResult::BAD_ARGS;
+  }
+
+  if (mError) {
+    return ImgDrawResult::BAD_IMAGE;
+  }
+
+  if (!mIsFullyLoaded) {
+    return ImgDrawResult::NOT_READY;
+  }
+
+  if (mAnimationConsumers == 0 && mHaveAnimations) {
+    SendOnUnlockedDraw(aFlags);
+  }
+
+  if (aContext->GetDrawTarget()->GetBackendType() == BackendType::RECORDING) {
+    aFlags |= FLAG_BYPASS_SURFACE_CACHE;
+  }
+
+  MOZ_ASSERT(!(aFlags & FLAG_FORCE_PRESERVEASPECTRATIO_NONE) ||
+                 aSVGContext.GetViewportSize(),
+             "Viewport size is required when using "
+             "FLAG_FORCE_PRESERVEASPECTRATIO_NONE");
+
+  uint32_t whichFrame = mHaveAnimations ? aWhichFrame : FRAME_FIRST;
+
+  float animTime = (whichFrame == FRAME_FIRST)
+                       ? 0.0f
+                       : mSVGDocumentWrapper->GetCurrentTimeAsFloat();
+
+  SVGImageContext newSVGContext = aSVGContext;
+  bool contextPaint = MaybeRestrictSVGContext(newSVGContext, aFlags);
+
+  SVGDrawingParameters params(aContext, aSize, aSize, aRegion, aSamplingFilter,
+                              newSVGContext, animTime, aFlags, aOpacity);
+
+  RefPtr<SourceSurface> sourceSurface;
+  std::tie(sourceSurface, params.size) =
+      LookupCachedSurface(aSize, params.svgContext, aFlags);
+  if (sourceSurface) {
+    auto drawable = MakeRefPtr<gfxSurfaceDrawable>(sourceSurface, params.size);
+    Show(drawable, params);
+    return ImgDrawResult::SUCCESS;
+  }
+
+
+  if (mSVGDocumentWrapper->IsDrawing()) {
+    NS_WARNING("Refusing to make re-entrant call to VectorImage::Draw");
+    return ImgDrawResult::TEMPORARY_ERROR;
+  }
+
+  AutoRestoreSVGState autoRestore(params, mSVGDocumentWrapper, contextPaint);
+
+  bool didCache;  
+  RefPtr<gfxDrawable> svgDrawable = CreateSVGDrawable(params);
+  sourceSurface = CreateSurface(params, svgDrawable, didCache);
+  if (!sourceSurface) {
+    MOZ_ASSERT(!didCache);
+    Show(svgDrawable, params);
+    return ImgDrawResult::SUCCESS;
+  }
+
+  auto drawable = MakeRefPtr<gfxSurfaceDrawable>(sourceSurface, params.size);
+  Show(drawable, params);
+  SendFrameComplete(didCache, params.flags);
+  return ImgDrawResult::SUCCESS;
+}
+
+NS_IMETHODIMP
+VectorImage::StartDecoding(uint32_t aFlags, uint32_t aWhichFrame) {
+  return NS_OK;
+}
+
+bool VectorImage::StartDecodingWithResult(uint32_t aFlags,
+                                          uint32_t aWhichFrame) {
+  return mIsFullyLoaded;
+}
+
+imgIContainer::DecodeResult VectorImage::RequestDecodeWithResult(
+    uint32_t aFlags, uint32_t aWhichFrame) {
+
+  if (mError) {
+    return imgIContainer::DECODE_REQUEST_FAILED;
+  }
+
+  if (!mIsFullyLoaded) {
+    return imgIContainer::DECODE_REQUESTED;
+  }
+
+  return imgIContainer::DECODE_SURFACE_AVAILABLE;
+}
+
+NS_IMETHODIMP
+VectorImage::RequestDecodeForSize(const nsIntSize& aSize, uint32_t aFlags,
+                                  uint32_t aWhichFrame) {
+  if (mError) {
+    return NS_ERROR_FAILURE;
+  }
+
+  return NS_OK;
+}
+
+
+NS_IMETHODIMP
+VectorImage::LockImage() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (mError) {
+    return NS_ERROR_FAILURE;
+  }
+
+  mLockCount++;
+
+  if (mLockCount == 1) {
+    SurfaceCache::LockImage(ImageKey(this));
+  }
+
+  return NS_OK;
+}
+
+
+NS_IMETHODIMP
+VectorImage::UnlockImage() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (mError) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (mLockCount == 0) {
+    MOZ_ASSERT_UNREACHABLE("Calling UnlockImage with a zero lock count");
+    return NS_ERROR_ABORT;
+  }
+
+  mLockCount--;
+
+  if (mLockCount == 0) {
+    SurfaceCache::UnlockImage(ImageKey(this));
+  }
+
+  return NS_OK;
+}
+
+
+NS_IMETHODIMP
+VectorImage::RequestDiscard() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (mDiscardable && mLockCount == 0) {
+    SurfaceCache::RemoveImage(ImageKey(this));
+    mProgressTracker->OnDiscard();
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP_(void)
+VectorImage::RequestRefresh(const TimeStamp& aTime) {
+  if (HadRecentRefresh(aTime)) {
+    return;
+  }
+
+  Document* doc = mSVGDocumentWrapper->GetDocument();
+  if (!doc) {
+    return;
+  }
+
+  EvaluateAnimation();
+
+  mSVGDocumentWrapper->TickRefreshDriver();
+
+  if (mHasPendingInvalidation) {
+    SendInvalidationNotifications();
+  }
+}
+
+NS_IMETHODIMP
+VectorImage::ResetAnimation() {
+  if (mError) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (!mIsFullyLoaded || !mHaveAnimations) {
+    return NS_OK;  
+  }
+
+  mSVGDocumentWrapper->ResetAnimation();
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP_(float)
+VectorImage::GetFrameIndex(uint32_t aWhichFrame) {
+  MOZ_ASSERT(aWhichFrame <= FRAME_MAX_VALUE, "Invalid argument");
+  return aWhichFrame == FRAME_FIRST
+             ? 0.0f
+             : mSVGDocumentWrapper->GetCurrentTimeAsFloat();
+}
+
+NS_IMETHODIMP_(Orientation)
+VectorImage::GetOrientation() { return Orientation(); }
+
+NS_IMETHODIMP_(Resolution)
+VectorImage::GetResolution() { return {}; }
+
+int32_t VectorImage::GetFirstFrameDelay() {
+  if (mError) {
+    return -1;
+  }
+
+  if (!mSVGDocumentWrapper->IsAnimated()) {
+    return -1;
+  }
+
+  return 0;
+}
+
+NS_IMETHODIMP_(void)
+VectorImage::SetAnimationStartTime(const TimeStamp& aTime) {
+}
+
+NS_IMETHODIMP_(IntRect)
+VectorImage::GetImageSpaceInvalidationRect(const IntRect& aRect) {
+  return aRect;
+}
+
+already_AddRefed<imgIContainer> VectorImage::Unwrap() {
+  nsCOMPtr<imgIContainer> self(this);
+  return self.forget();
+}
+
+void VectorImage::MediaFeatureValuesChangedAllDocuments(
+    const MediaFeatureChange& aChange) {
+  if (!mSVGDocumentWrapper) {
+    return;
+  }
+
+  if (!mIsFullyLoaded) {
+    return;
+  }
+
+  if (Document* doc = mSVGDocumentWrapper->GetDocument()) {
+    if (RefPtr<nsPresContext> presContext = doc->GetPresContext()) {
+      presContext->MediaFeatureValuesChanged(
+          aChange, MediaFeatureChangePropagation::All);
+      if (presContext->FlushPendingMediaFeatureValuesChanged()) {
+        SendInvalidationNotifications();
+      }
+    }
+  }
+}
+
+nsresult VectorImage::GetNativeSizes(nsTArray<IntSize>& aNativeSizes) {
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+size_t VectorImage::GetNativeSizesLength() { return 0; }
+
+bool VectorImage::MaybeRestrictSVGContext(SVGImageContext& aSVGContext,
+                                          uint32_t aFlags) {
+  bool overridePAR = (aFlags & FLAG_FORCE_PRESERVEASPECTRATIO_NONE);
+
+  bool haveContextPaint = aSVGContext.GetContextPaint();
+  bool blockContextPaint =
+      haveContextPaint && !SVGContextPaint::IsAllowedForImageFromURI(mURI);
+
+  if (overridePAR || blockContextPaint) {
+    if (overridePAR) {
+      MOZ_ASSERT(!aSVGContext.GetPreserveAspectRatio(),
+                 "FLAG_FORCE_PRESERVEASPECTRATIO_NONE is not expected if a "
+                 "preserveAspectRatio override is supplied");
+      Maybe<SVGPreserveAspectRatio> aspectRatio = Some(SVGPreserveAspectRatio(
+          SVG_PRESERVEASPECTRATIO_NONE, SVG_MEETORSLICE_UNKNOWN));
+      aSVGContext.SetPreserveAspectRatio(aspectRatio);
+    }
+
+    if (blockContextPaint) {
+      aSVGContext.ClearContextPaint();
+    }
+  }
+
+  return haveContextPaint && !blockContextPaint;
+}
+
+already_AddRefed<gfxDrawable> VectorImage::CreateSVGDrawable(
+    const SVGDrawingParameters& aParams) {
+  auto cb = MakeRefPtr<SVGDrawingCallback>(
+      mSVGDocumentWrapper, aParams.viewportSize, aParams.size, aParams.flags);
+
+  auto svgDrawable = MakeRefPtr<gfxCallbackDrawable>(cb, aParams.size);
+  return svgDrawable.forget();
+}
+
+std::tuple<RefPtr<SourceSurface>, IntSize> VectorImage::LookupCachedSurface(
+    const IntSize& aSize, const SVGImageContext& aSVGContext, uint32_t aFlags) {
+  if (aFlags & (FLAG_BYPASS_SURFACE_CACHE | FLAG_RECORD_BLOB) ||
+      mHaveAnimations) {
+    return std::make_tuple(RefPtr<SourceSurface>(), aSize);
+  }
+
+  LookupResult result(MatchType::NOT_FOUND);
+  SurfaceKey surfaceKey = VectorSurfaceKey(aSize, aSVGContext);
+  if ((aFlags & FLAG_SYNC_DECODE) || !(aFlags & FLAG_HIGH_QUALITY_SCALING)) {
+    result = SurfaceCache::Lookup(ImageKey(this), surfaceKey,
+                                   true);
+  } else {
+    result = SurfaceCache::LookupBestMatch(ImageKey(this), surfaceKey,
+                                            true);
+  }
+
+  IntSize rasterSize =
+      result.SuggestedSize().IsEmpty() ? aSize : result.SuggestedSize();
+  MOZ_ASSERT(result.Type() != MatchType::SUBSTITUTE_BECAUSE_PENDING);
+  if (!result || result.Type() == MatchType::SUBSTITUTE_BECAUSE_NOT_FOUND) {
+    return std::make_tuple(RefPtr<SourceSurface>(), rasterSize);
+  }
+
+  RefPtr<SourceSurface> sourceSurface = result.Surface()->GetSourceSurface();
+  if (!sourceSurface) {
+    RecoverFromLossOfSurfaces();
+    return std::make_tuple(RefPtr<SourceSurface>(), rasterSize);
+  }
+
+  return std::make_tuple(std::move(sourceSurface), rasterSize);
+}
+
+already_AddRefed<SourceSurface> VectorImage::CreateSurface(
+    const SVGDrawingParameters& aParams, gfxDrawable* aSVGDrawable,
+    bool& aWillCache) {
+  MOZ_ASSERT(mSVGDocumentWrapper->IsDrawing());
+  MOZ_ASSERT(!(aParams.flags & FLAG_RECORD_BLOB));
+
+  mSVGDocumentWrapper->UpdateViewportBounds(aParams.viewportSize);
+  mSVGDocumentWrapper->FlushImageTransformInvalidation();
+
+  aWillCache = !(aParams.flags & FLAG_BYPASS_SURFACE_CACHE) &&
+               !mHaveAnimations &&
+               SurfaceCache::CanHold(aParams.size);
+
+  if (!aWillCache && aParams.context) {
+    return nullptr;
+  }
+
+  if (aWillCache) {
+    SurfaceCache::UnlockEntries(ImageKey(this));
+  }
+
+  BackendType backend =
+      aParams.context ? aParams.context->GetDrawTarget()->GetBackendType()
+                      : gfxPlatform::GetPlatform()->GetDefaultContentBackend();
+
+  auto frame = MakeNotNull<RefPtr<imgFrame>>();
+  nsresult rv = frame->InitWithDrawable(
+      aSVGDrawable, aParams.size, SurfaceFormat::OS_RGBA, SamplingFilter::POINT,
+      aParams.flags, backend);
+
+  if (NS_FAILED(rv)) {
+    aWillCache = false;
+    return nullptr;
+  }
+
+  RefPtr<SourceSurface> surface = frame->GetSourceSurface();
+  if (!surface) {
+    aWillCache = false;
+    return nullptr;
+  }
+
+  if (!aWillCache) {
+    return surface.forget();
+  }
+
+  SurfaceKey surfaceKey = VectorSurfaceKey(aParams.size, aParams.svgContext);
+  NotNull<RefPtr<ISurfaceProvider>> provider =
+      MakeNotNull<SimpleSurfaceProvider*>(ImageKey(this), surfaceKey, frame);
+
+  if (SurfaceCache::Insert(provider) == InsertOutcome::SUCCESS) {
+    if (aParams.size != aParams.drawSize) {
+      SurfaceCache::PruneImage(ImageKey(this));
+    }
+  } else {
+    aWillCache = false;
+  }
+
+  return surface.forget();
+}
+
+void VectorImage::SendFrameComplete(bool aDidCache, uint32_t aFlags) {
+  if (!aDidCache) {
+    return;
+  }
+
+  if (!(aFlags & FLAG_ASYNC_NOTIFY)) {
+    mProgressTracker->SyncNotifyProgress(FLAG_FRAME_COMPLETE,
+                                         GetMaxSizedIntRect());
+  } else {
+    NotNull<RefPtr<VectorImage>> image = WrapNotNull(this);
+    NS_DispatchToMainThread(CreateRenderBlockingRunnable(NS_NewRunnableFunction(
+        "ProgressTracker::SyncNotifyProgress", [=]() -> void {
+          RefPtr<ProgressTracker> tracker = image->GetProgressTracker();
+          if (tracker) {
+            tracker->SyncNotifyProgress(FLAG_FRAME_COMPLETE,
+                                        GetMaxSizedIntRect());
+          }
+        })));
+  }
+}
+
+void VectorImage::Show(gfxDrawable* aDrawable,
+                       const SVGDrawingParameters& aParams) {
+  gfxContextMatrixAutoSaveRestore saveMatrix(aParams.context);
+  ImageRegion region(aParams.region);
+  if (aParams.drawSize != aParams.size) {
+    gfx::MatrixScales scale(
+        double(aParams.drawSize.width) / aParams.size.width,
+        double(aParams.drawSize.height) / aParams.size.height);
+    aParams.context->Multiply(gfx::Matrix::Scaling(scale));
+    region.Scale(1.0 / scale.xScale, 1.0 / scale.yScale);
+  }
+
+  MOZ_ASSERT(aDrawable, "Should have a gfxDrawable by now");
+  gfxUtils::DrawPixelSnapped(aParams.context, aDrawable,
+                             SizeDouble(aParams.size), region,
+                             SurfaceFormat::OS_RGBA, aParams.samplingFilter,
+                             aParams.flags, aParams.opacity);
+#ifdef DEBUG
+  NotifyDrawingObservers();
+#endif
+
+  MOZ_ASSERT(mRenderingObserver, "Should have a rendering observer by now");
+  mRenderingObserver->ResumeHonoringInvalidations();
+}
+
+void VectorImage::RecoverFromLossOfSurfaces() {
+  NS_WARNING("An imgFrame became invalid. Attempting to recover...");
+
+  SurfaceCache::RemoveImage(ImageKey(this));
+}
+
+void VectorImage::OnSurfaceDiscarded(const SurfaceKey& aSurfaceKey) {
+  MOZ_ASSERT(mProgressTracker);
+
+  NS_DispatchToMainThread(NewRunnableMethod("ProgressTracker::OnDiscard",
+                                            mProgressTracker,
+                                            &ProgressTracker::OnDiscard));
+}
+
+
+NS_IMETHODIMP
+VectorImage::OnStartRequest(nsIRequest* aRequest) {
+  MOZ_ASSERT(!mSVGDocumentWrapper,
+             "Repeated call to OnStartRequest -- can this happen?");
+
+  mSVGDocumentWrapper = new SVGDocumentWrapper();
+  RefPtr<SVGDocumentWrapper> wrapper = mSVGDocumentWrapper;
+  nsresult rv = wrapper->OnStartRequest(aRequest);
+  if (NS_FAILED(rv)) {
+    mSVGDocumentWrapper = nullptr;
+    mError = true;
+    return rv;
+  }
+
+  SVGDocument* document = mSVGDocumentWrapper->GetDocument();
+  mLoadEventListener = new SVGLoadEventListener(document, this);
+  mParseCompleteListener = new SVGParseCompleteListener(document, this);
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+VectorImage::OnStopRequest(nsIRequest* aRequest, nsresult aStatus) {
+  if (mError) {
+    return NS_ERROR_FAILURE;
+  }
+
+  RefPtr<SVGDocumentWrapper> wrapper = mSVGDocumentWrapper;
+  return wrapper->OnStopRequest(aRequest, aStatus);
+}
+
+void VectorImage::OnSVGDocumentParsed() {
+  MOZ_ASSERT(mParseCompleteListener, "Should have the parse complete listener");
+  MOZ_ASSERT(mLoadEventListener, "Should have the load event listener");
+
+  if (!mSVGDocumentWrapper->GetSVGRootElement()) {
+    OnSVGDocumentError();
+  }
+}
+
+void VectorImage::CancelAllListeners() {
+  if (mParseCompleteListener) {
+    mParseCompleteListener->Cancel();
+    mParseCompleteListener = nullptr;
+  }
+  if (mLoadEventListener) {
+    mLoadEventListener->Cancel();
+    mLoadEventListener = nullptr;
+  }
+}
+
+void VectorImage::SendInvalidationNotifications() {
+
+  mHasPendingInvalidation = false;
+
+  if (SurfaceCache::InvalidateImage(ImageKey(this))) {
+    MOZ_ASSERT(mRenderingObserver, "Should have a rendering observer by now");
+    mRenderingObserver->ResumeHonoringInvalidations();
+  }
+
+  if (mProgressTracker) {
+    mProgressTracker->SyncNotifyProgress(FLAG_FRAME_COMPLETE,
+                                         GetMaxSizedIntRect());
+  }
+}
+
+void VectorImage::OnSVGDocumentLoaded() {
+  MOZ_ASSERT(mSVGDocumentWrapper->GetSVGRootElement(),
+             "Should have parsed successfully");
+  MOZ_ASSERT(!mIsFullyLoaded && !mHaveAnimations,
+             "These flags shouldn't get set until OnSVGDocumentLoaded. "
+             "Duplicate calls to OnSVGDocumentLoaded?");
+
+  CancelAllListeners();
+
+  mSVGDocumentWrapper->FlushLayout();
+
+  mIsFullyLoaded = true;
+  mHaveAnimations = mSVGDocumentWrapper->IsAnimated();
+
+  mRenderingObserver = new SVGRootRenderingObserver(mSVGDocumentWrapper, this);
+
+  RefPtr<VectorImage> kungFuDeathGrip(this);
+
+  if (mProgressTracker) {
+    Progress progress = FLAG_SIZE_AVAILABLE | FLAG_HAS_TRANSPARENCY |
+                        FLAG_FRAME_COMPLETE | FLAG_DECODE_COMPLETE;
+
+    if (mHaveAnimations) {
+      progress |= FLAG_IS_ANIMATED;
+    }
+
+    if (mLoadProgress) {
+      progress |= *mLoadProgress;
+      mLoadProgress = Nothing();
+    }
+
+    mProgressTracker->SyncNotifyProgress(progress, GetMaxSizedIntRect());
+  }
+
+  EvaluateAnimation();
+}
+
+void VectorImage::OnSVGDocumentError() {
+  CancelAllListeners();
+
+  mError = true;
+
+  RefPtr<VectorImage> kungFuDeathGrip(this);
+
+  if (mProgressTracker) {
+    Progress progress = FLAG_HAS_ERROR;
+
+    if (mLoadProgress) {
+      progress |= *mLoadProgress;
+      mLoadProgress = Nothing();
+    }
+
+    mProgressTracker->SyncNotifyProgress(progress);
+  }
+}
+
+
+NS_IMETHODIMP
+VectorImage::OnDataAvailable(nsIRequest* aRequest, nsIInputStream* aInStr,
+                             uint64_t aSourceOffset, uint32_t aCount) {
+  if (mError) {
+    return NS_ERROR_FAILURE;
+  }
+
+  RefPtr<SVGDocumentWrapper> wrapper = mSVGDocumentWrapper;
+  return wrapper->OnDataAvailable(aRequest, aInStr, aSourceOffset, aCount);
+}
+
+
+void VectorImage::InvalidateObserversOnNextRefreshDriverTick() {
+  if (mHasPendingInvalidation) {
+    return;
+  }
+
+  mHasPendingInvalidation = true;
+
+  if (mHaveAnimations) {
+    return;
+  }
+
+  nsCOMPtr<nsIEventTarget> eventTarget = do_GetMainThread();
+
+  RefPtr<VectorImage> self(this);
+  nsCOMPtr<nsIRunnable> ev(NS_NewRunnableFunction(
+      "VectorImage::SendInvalidationNotifications",
+      [=]() -> void { self->SendInvalidationNotifications(); }));
+  eventTarget->Dispatch(CreateRenderBlockingRunnable(ev.forget()),
+                        NS_DISPATCH_NORMAL);
+}
+
+}  
+}  

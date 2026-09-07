@@ -1,0 +1,50 @@
+/*
+ * Copyright 2006 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkPathEffect_DEFINED)
+#define SkPathEffect_DEFINED
+
+#include "include/core/SkFlattenable.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkTypes.h"
+
+#include "include/core/SkPath.h"  // IWYU pragma: keep
+
+#include <cstddef>
+
+class SkMatrix;
+class SkPathBuilder;
+class SkStrokeRec;
+struct SkDeserialProcs;
+struct SkRect;
+
+class SK_API SkPathEffect : public SkFlattenable {
+public:
+    static sk_sp<SkPathEffect> MakeSum(sk_sp<SkPathEffect> first, sk_sp<SkPathEffect> second);
+
+    static sk_sp<SkPathEffect> MakeCompose(sk_sp<SkPathEffect> outer, sk_sp<SkPathEffect> inner);
+
+    static SkFlattenable::Type GetFlattenableType() {
+        return kSkPathEffect_Type;
+    }
+
+    bool filterPath(SkPathBuilder* dst, const SkPath& src, SkStrokeRec*, const SkRect* cullR,
+                    const SkMatrix& ctm) const;
+    bool filterPath(SkPathBuilder* dst, const SkPath& src, SkStrokeRec*) const;
+
+    bool needsCTM() const;
+
+    static sk_sp<SkPathEffect> Deserialize(const void* data, size_t size,
+                                           const SkDeserialProcs* procs = nullptr);
+private:
+    SkPathEffect() = default;
+    friend class SkPathEffectBase;
+
+    using INHERITED = SkFlattenable;
+};
+
+#endif

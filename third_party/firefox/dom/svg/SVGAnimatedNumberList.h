@@ -1,0 +1,88 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SVG_SVGANIMATEDNUMBERLIST_H_
+#define DOM_SVG_SVGANIMATEDNUMBERLIST_H_
+
+#include <memory>
+
+#include "SVGNumberList.h"
+#include "mozilla/SMILAttr.h"
+
+namespace mozilla {
+
+class SMILValue;
+
+namespace dom {
+class SVGAnimationElement;
+class SVGElement;
+}  
+
+class SVGAnimatedNumberList {
+  friend class dom::DOMSVGNumber;
+  friend class dom::DOMSVGNumberList;
+
+ public:
+  SVGAnimatedNumberList() = default;
+
+  SVGAnimatedNumberList& operator=(const SVGAnimatedNumberList& aOther) {
+    mIsBaseSet = aOther.mIsBaseSet;
+    mBaseVal = aOther.mBaseVal;
+    if (aOther.mAnimVal) {
+      mAnimVal = std::make_unique<SVGNumberList>(*aOther.mAnimVal);
+    }
+    return *this;
+  }
+
+  const SVGNumberList& GetBaseValue() const { return mBaseVal; }
+
+  nsresult SetBaseValueString(const nsAString& aValue);
+
+  void ClearBaseValue(uint32_t aAttrEnum);
+
+  const SVGNumberList& GetAnimValue() const {
+    return mAnimVal ? *mAnimVal : mBaseVal;
+  }
+
+  nsresult SetAnimValue(const SVGNumberList& aNewAnimValue,
+                        dom::SVGElement* aElement, uint32_t aAttrEnum);
+
+  void ClearAnimValue(dom::SVGElement* aElement, uint32_t aAttrEnum);
+
+  bool IsExplicitlySet() const { return !!mAnimVal || mIsBaseSet; }
+
+  bool IsAnimating() const { return !!mAnimVal; }
+
+  std::unique_ptr<SMILAttr> ToSMILAttr(dom::SVGElement* aSVGElement,
+                                       uint8_t aAttrEnum);
+
+ private:
+
+  SVGNumberList mBaseVal;
+  std::unique_ptr<SVGNumberList> mAnimVal;
+  bool mIsBaseSet = false;
+
+  struct SMILAnimatedNumberList : public SMILAttr {
+   public:
+    SMILAnimatedNumberList(SVGAnimatedNumberList* aVal,
+                           dom::SVGElement* aSVGElement, uint8_t aAttrEnum)
+        : mVal(aVal), mElement(aSVGElement), mAttrEnum(aAttrEnum) {}
+
+    SVGAnimatedNumberList* mVal;
+    dom::SVGElement* mElement;
+    uint8_t mAttrEnum;
+
+    nsresult ValueFromString(const nsAString& aStr,
+                             const dom::SVGAnimationElement* aSrcElement,
+                             SMILValue& aValue,
+                             bool& aPreventCachingOfSandwich) const override;
+    SMILValue GetBaseValue() const override;
+    void ClearAnimValue() override;
+    nsresult SetAnimValue(const SMILValue& aValue) override;
+  };
+};
+
+}  
+
+#endif  // DOM_SVG_SVGANIMATEDNUMBERLIST_H_

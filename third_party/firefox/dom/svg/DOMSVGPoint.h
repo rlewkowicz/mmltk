@@ -1,0 +1,133 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SVG_DOMSVGPOINT_H_
+#define DOM_SVG_DOMSVGPOINT_H_
+
+#include "DOMSVGPointList.h"
+#include "mozilla/dom/SVGSVGElement.h"
+#include "mozilla/gfx/2D.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsDebug.h"
+#include "nsWrapperCache.h"
+
+#define MOZ_SVG_LIST_INDEX_BIT_COUNT 29
+
+namespace mozilla::dom {
+struct DOMMatrix2DInit;
+
+class DOMSVGPoint final : public nsWrapperCache {
+  template <class T>
+  friend class AutoChangePointListNotifier;
+
+  using Point = gfx::Point;
+
+ public:
+  DOMSVGPoint(DOMSVGPointList* aList, uint32_t aListIndex, bool aIsAnimValItem)
+      : mVal(nullptr),
+        mOwner(aList),
+        mListIndex(aListIndex),
+        mIsAnimValItem(aIsAnimValItem),
+        mIsTranslatePoint(false),
+        mIsInTearoffTable(false) {
+    MOZ_ASSERT(aList && aListIndex <= MaxListIndex(), "bad arg");
+
+    MOZ_ASSERT(IndexIsValid(), "Bad index for DOMSVGPoint!");
+  }
+
+  explicit DOMSVGPoint(const Point& aPt)
+      : mListIndex(0),
+        mIsAnimValItem(false),
+        mIsTranslatePoint(false),
+        mIsInTearoffTable(false) {
+    mVal = new Point(aPt);
+  }
+
+ private:
+  DOMSVGPoint(Point* aPt, SVGSVGElement* aSVGSVGElement)
+      : mVal(aPt),
+        mOwner(ToSupports(aSVGSVGElement)),
+        mListIndex(0),
+        mIsAnimValItem(false),
+        mIsTranslatePoint(true),
+        mIsInTearoffTable(false) {}
+
+  virtual ~DOMSVGPoint() { CleanupWeakRefs(); }
+
+ public:
+  NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(DOMSVGPoint)
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_NATIVE_CLASS(DOMSVGPoint)
+
+  static already_AddRefed<DOMSVGPoint> GetTranslateTearOff(
+      Point* aVal, SVGSVGElement* aSVGSVGElement);
+
+  bool IsInList() const { return HasOwner() && !IsTranslatePoint(); }
+
+  bool HasOwner() const { return !!mOwner; }
+
+  bool IsTranslatePoint() const { return mIsTranslatePoint; }
+
+  void DidChangeTranslate();
+
+  void InsertingIntoList(DOMSVGPointList* aList, uint32_t aListIndex,
+                         bool aIsAnimValItem);
+
+  static uint32_t MaxListIndex() {
+    return (1U << MOZ_SVG_LIST_INDEX_BIT_COUNT) - 1;
+  }
+
+  void UpdateListIndex(uint32_t aListIndex) {
+    MOZ_RELEASE_ASSERT(aListIndex <= MaxListIndex());
+    mListIndex = aListIndex;
+  }
+
+  void RemovingFromList();
+
+  Point ToPoint() { return InternalItem(); }
+
+  float X();
+  void SetX(float aX, ErrorResult& rv);
+  float Y();
+  void SetY(float aY, ErrorResult& rv);
+  already_AddRefed<DOMSVGPoint> MatrixTransform(const DOMMatrix2DInit& aMatrix,
+                                                ErrorResult& aRv);
+
+  nsISupports* GetParentObject() { return Element(); }
+
+  bool AttrIsAnimating() const;
+
+  JSObject* WrapObject(JSContext* cx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  already_AddRefed<DOMSVGPoint> Copy() {
+    return MakeAndAddRef<DOMSVGPoint>(InternalItem());
+  }
+
+ private:
+#ifdef DEBUG
+  bool IndexIsValid();
+#endif
+
+  SVGElement* Element();
+
+  void CleanupWeakRefs();
+
+  Point& InternalItem();
+
+  Point* mVal;                 
+  RefPtr<nsISupports> mOwner;  
+
+
+  uint32_t mListIndex : MOZ_SVG_LIST_INDEX_BIT_COUNT;
+  uint32_t mIsAnimValItem : 1;     
+  uint32_t mIsTranslatePoint : 1;  
+
+  uint32_t mIsInTearoffTable : 1;
+};
+
+}  
+
+#undef MOZ_SVG_LIST_INDEX_BIT_COUNT
+
+#endif  // DOM_SVG_DOMSVGPOINT_H_

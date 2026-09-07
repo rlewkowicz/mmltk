@@ -1,0 +1,350 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/MaybeCrossOriginObject.h"
+
+#include "AccessCheck.h"
+#include "js/CallAndConstruct.h"    // JS::Call
+#include "js/Object.h"              // JS::GetClass
+#include "js/PropertyAndElement.h"  // JS_DefineFunctions, JS_DefineProperties
+#include "js/PropertyDescriptor.h"  // JS::PropertyDescriptor, JS_GetOwnPropertyDescriptorById
+#include "js/Proxy.h"
+#include "js/RootingAPI.h"
+#include "js/WeakMap.h"
+#include "js/Wrapper.h"
+#include "js/friend/WindowProxy.h"  // js::IsWindowProxy
+#include "jsfriendapi.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/dom/BindingUtils.h"
+#include "mozilla/dom/DOMJSProxyHandler.h"
+#include "mozilla/dom/RemoteObjectProxy.h"
+#include "nsContentUtils.h"
+
+#ifdef DEBUG
+static bool IsLocation(JSObject* obj) {
+  return strcmp(JS::GetClass(obj)->name, "Location") == 0;
+}
+#endif  // DEBUG
+
+namespace mozilla::dom {
+
+bool MaybeCrossOriginObjectMixins::IsPlatformObjectSameOrigin(JSContext* cx,
+                                                              JSObject* obj) {
+  MOZ_ASSERT(!js::IsCrossCompartmentWrapper(obj));
+  MOZ_ASSERT(js::GetNonCCWObjectRealm(obj) ==
+                 js::GetNonCCWObjectRealm(js::UncheckedUnwrap(obj, true)),
+             "WindowProxy not same-Realm as Window?");
+
+  BasePrincipal* subjectPrincipal =
+      BasePrincipal::Cast(nsContentUtils::SubjectPrincipal(cx));
+  BasePrincipal* objectPrincipal =
+      BasePrincipal::Cast(nsContentUtils::ObjectPrincipal(obj));
+
+  MOZ_ASSERT(
+      subjectPrincipal->FastEqualsConsideringDomain(objectPrincipal) ==
+          subjectPrincipal->FastSubsumesConsideringDomain(objectPrincipal),
+      "Why are we in an asymmetric case here?");
+  if (OriginAttributes::IsRestrictOpenerAccessForFPI()) {
+    return subjectPrincipal->FastEqualsConsideringDomain(objectPrincipal);
+  }
+
+  return subjectPrincipal->FastSubsumesConsideringDomainIgnoringFPD(
+             objectPrincipal) &&
+         objectPrincipal->FastSubsumesConsideringDomainIgnoringFPD(
+             subjectPrincipal);
+}
+
+bool MaybeCrossOriginObjectMixins::CrossOriginGetOwnPropertyHelper(
+    JSContext* cx, JS::Handle<JSObject*> obj, JS::Handle<jsid> id,
+    JS::MutableHandle<Maybe<JS::PropertyDescriptor>> desc) const {
+  MOZ_ASSERT(!IsPlatformObjectSameOrigin(cx, obj) || IsRemoteObjectProxy(obj),
+             "Why did we get called?");
+  JS::Rooted<JSObject*> holder(cx);
+  if (!EnsureHolder(cx, obj, &holder)) {
+    return false;
+  }
+
+  return JS_GetOwnPropertyDescriptorById(cx, holder, id, desc);
+}
+
+bool MaybeCrossOriginObjectMixins::CrossOriginPropertyFallback(
+    JSContext* cx, JS::Handle<JSObject*> obj, JS::Handle<jsid> id,
+    JS::MutableHandle<Maybe<JS::PropertyDescriptor>> desc) {
+  MOZ_ASSERT(desc.isNothing(), "Why are we being called?");
+
+  if (xpc::IsCrossOriginWhitelistedProp(cx, id)) {
+    desc.set(Some(JS::PropertyDescriptor::Data(
+        JS::UndefinedValue(), {JS::PropertyAttribute::Configurable})));
+    return true;
+  }
+
+  return ReportCrossOriginDenial(cx, id, "access"_ns);
+}
+
+bool MaybeCrossOriginObjectMixins::CrossOriginGet(
+    JSContext* cx, JS::Handle<JSObject*> obj, JS::Handle<JS::Value> receiver,
+    JS::Handle<jsid> id, JS::MutableHandle<JS::Value> vp) {
+
+  MOZ_ASSERT(js::IsProxy(obj), "How did we get a bogus object here?");
+  MOZ_ASSERT(
+      js::IsWindowProxy(obj) || IsLocation(obj) || IsRemoteObjectProxy(obj),
+      "Unexpected proxy");
+  MOZ_ASSERT(!IsPlatformObjectSameOrigin(cx, obj) || IsRemoteObjectProxy(obj),
+             "Why did we get called?");
+  js::AssertSameCompartment(cx, receiver);
+
+  JS::Rooted<Maybe<JS::PropertyDescriptor>> desc(cx);
+  if (!js::GetProxyHandler(obj)->getOwnPropertyDescriptor(cx, obj, id, &desc)) {
+    return false;
+  }
+
+  MOZ_ASSERT(desc.isSome(),
+             "Callees should throw in all cases when they are not finding a "
+             "property decriptor");
+  desc->assertComplete();
+
+  if (desc->isDataDescriptor()) {
+    vp.set(desc->value());
+    return true;
+  }
+
+  MOZ_ASSERT(desc->isAccessorDescriptor());
+
+  JS::Rooted<JSObject*> getter(cx);
+  if (!desc->hasGetter() || !(getter = desc->getter())) {
+    return ReportCrossOriginDenial(cx, id, "get"_ns);
+  }
+
+  return JS::Call(cx, receiver, getter, JS::HandleValueArray::empty(), vp);
+}
+
+bool MaybeCrossOriginObjectMixins::CrossOriginSet(
+    JSContext* cx, JS::Handle<JSObject*> obj, JS::Handle<jsid> id,
+    JS::Handle<JS::Value> v, JS::Handle<JS::Value> receiver,
+    JS::ObjectOpResult& result) {
+  MOZ_ASSERT(js::IsProxy(obj), "How did we get a bogus object here?");
+  MOZ_ASSERT(
+      js::IsWindowProxy(obj) || IsLocation(obj) || IsRemoteObjectProxy(obj),
+      "Unexpected proxy");
+  MOZ_ASSERT(!IsPlatformObjectSameOrigin(cx, obj) || IsRemoteObjectProxy(obj),
+             "Why did we get called?");
+  js::AssertSameCompartment(cx, receiver);
+  js::AssertSameCompartment(cx, v);
+
+  JS::Rooted<Maybe<JS::PropertyDescriptor>> desc(cx);
+  if (!js::GetProxyHandler(obj)->getOwnPropertyDescriptor(cx, obj, id, &desc)) {
+    return false;
+  }
+
+  MOZ_ASSERT(desc.isSome(),
+             "Callees should throw in all cases when they are not finding a "
+             "property decriptor");
+  desc->assertComplete();
+
+  JS::Rooted<JSObject*> setter(cx);
+  if (desc->hasSetter() && (setter = desc->setter())) {
+    JS::Rooted<JS::Value> ignored(cx);
+    if (!JS::Call(cx, receiver, setter, JS::HandleValueArray(v), &ignored)) {
+      return false;
+    }
+
+    return result.succeed();
+  }
+
+  return ReportCrossOriginDenial(cx, id, "set"_ns);
+}
+
+bool MaybeCrossOriginObjectMixins::EnsureHolder(
+    JSContext* cx, JS::Handle<JSObject*> obj, size_t slot,
+    const CrossOriginProperties& properties,
+    JS::MutableHandle<JSObject*> holder) {
+  MOZ_ASSERT(!IsPlatformObjectSameOrigin(cx, obj) || IsRemoteObjectProxy(obj),
+             "Why are we calling this at all in same-origin cases?");
+  JS::Rooted<JS::Value> weakMapVal(cx, js::GetProxyReservedSlot(obj, slot));
+  if (weakMapVal.isUndefined()) {
+    JSAutoRealm ar(cx, obj);
+    JSObject* newMap = JS::NewWeakMapObject(cx);
+    if (!newMap) {
+      return false;
+    }
+    weakMapVal.setObject(*newMap);
+    js::SetProxyReservedSlot(obj, slot, weakMapVal);
+  }
+  MOZ_ASSERT(weakMapVal.isObject(),
+             "How did a non-object else end up in this slot?");
+
+  JS::Rooted<JSObject*> map(cx, &weakMapVal.toObject());
+  MOZ_ASSERT(JS::IsWeakMapObject(map),
+             "How did something else end up in this slot?");
+
+  JS::Rooted<JSObject*> key(cx, JS::GetRealmKeyObject(cx));
+  if (!key) {
+    return false;
+  }
+
+  JS::Rooted<JS::Value> holderVal(cx);
+  {  
+    JSAutoRealm ar(cx, map);
+    if (!MaybeWrapObject(cx, &key)) {
+      return false;
+    }
+
+    JS::Rooted<JS::Value> keyVal(cx, JS::ObjectValue(*key));
+    if (!JS::GetWeakMapEntry(cx, map, keyVal, &holderVal)) {
+      return false;
+    }
+  }
+
+  if (holderVal.isObject()) {
+    holder.set(js::UncheckedUnwrap(&holderVal.toObject()));
+
+    if (!JS_IsDeadWrapper(holder)) {
+      MOZ_ASSERT(js::GetContextRealm(cx) == js::GetNonCCWObjectRealm(holder),
+                 "How did we end up with a key/value mismatch?");
+      return true;
+    }
+  }
+
+  bool isChrome = xpc::AccessCheck::isChrome(js::GetContextRealm(cx));
+  holder.set(JS_NewObjectWithGivenProto(cx, nullptr, nullptr));
+  if (!holder || !JS_DefineProperties(cx, holder, properties.mAttributes) ||
+      !JS_DefineFunctions(cx, holder, properties.mMethods) ||
+      (isChrome && properties.mChromeOnlyAttributes &&
+       !JS_DefineProperties(cx, holder, properties.mChromeOnlyAttributes)) ||
+      (isChrome && properties.mChromeOnlyMethods &&
+       !JS_DefineFunctions(cx, holder, properties.mChromeOnlyMethods))) {
+    return false;
+  }
+
+  holderVal.setObject(*holder);
+  {  
+    JSAutoRealm ar(cx, map);
+
+    if (!MaybeWrapValue(cx, &holderVal)) {
+      return false;
+    }
+
+    JS::Rooted<JS::Value> keyVal(cx, JS::ObjectValue(*key));
+    if (!JS::SetWeakMapEntry(cx, map, keyVal, holderVal)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool MaybeCrossOriginObjectMixins::ReportCrossOriginDenial(
+    JSContext* aCx, JS::Handle<jsid> aId, const nsACString& aAccessType) {
+  xpc::AccessCheck::reportCrossOriginDenial(aCx, aId, aAccessType);
+  return false;
+}
+
+template <typename Base>
+bool MaybeCrossOriginObject<Base>::getPrototype(
+    JSContext* cx, JS::Handle<JSObject*> proxy,
+    JS::MutableHandle<JSObject*> protop) const {
+  if (!IsPlatformObjectSameOrigin(cx, proxy)) {
+    protop.set(nullptr);
+    return true;
+  }
+
+  {  
+    JSAutoRealm ar(cx, proxy);
+    protop.set(getSameOriginPrototype(cx));
+    if (!protop) {
+      return false;
+    }
+  }
+
+  return MaybeWrapObject(cx, protop);
+}
+
+template <typename Base>
+bool MaybeCrossOriginObject<Base>::setPrototype(
+    JSContext* cx, JS::Handle<JSObject*> proxy, JS::Handle<JSObject*> proto,
+    JS::ObjectOpResult& result) const {
+  js::AssertSameCompartment(cx, proto);
+
+  JS::Rooted<JSObject*> wrappedProxy(cx, proxy);
+  if (!MaybeWrapObject(cx, &wrappedProxy)) {
+    return false;
+  }
+
+  JS::Rooted<JSObject*> currentProto(cx);
+  if (!js::GetObjectProto(cx, wrappedProxy, &currentProto)) {
+    return false;
+  }
+
+  if (currentProto != proto) {
+    return result.failCantSetProto();
+  }
+
+  return result.succeed();
+}
+
+template <typename Base>
+bool MaybeCrossOriginObject<Base>::getPrototypeIfOrdinary(
+    JSContext* cx, JS::Handle<JSObject*> proxy, bool* isOrdinary,
+    JS::MutableHandle<JSObject*> protop) const {
+  *isOrdinary = false;
+  return true;
+}
+
+template <typename Base>
+bool MaybeCrossOriginObject<Base>::setImmutablePrototype(
+    JSContext* cx, JS::Handle<JSObject*> proxy, bool* succeeded) const {
+  *succeeded = false;
+  return true;
+}
+
+template <typename Base>
+bool MaybeCrossOriginObject<Base>::isExtensible(JSContext* cx,
+                                                JS::Handle<JSObject*> proxy,
+                                                bool* extensible) const {
+  *extensible = true;
+  return true;
+}
+
+template <typename Base>
+bool MaybeCrossOriginObject<Base>::preventExtensions(
+    JSContext* cx, JS::Handle<JSObject*> proxy,
+    JS::ObjectOpResult& result) const {
+  return result.failCantPreventExtensions();
+}
+
+template <typename Base>
+bool MaybeCrossOriginObject<Base>::defineProperty(
+    JSContext* cx, JS::Handle<JSObject*> proxy, JS::Handle<jsid> id,
+    JS::Handle<JS::PropertyDescriptor> desc, JS::ObjectOpResult& result) const {
+  if (!IsPlatformObjectSameOrigin(cx, proxy)) {
+    return ReportCrossOriginDenial(cx, id, "define"_ns);
+  }
+
+  JSAutoRealm ar(cx, proxy);
+  JS::Rooted<JS::PropertyDescriptor> descCopy(cx, desc);
+  if (!JS_WrapPropertyDescriptor(cx, &descCopy)) {
+    return false;
+  }
+
+  JS_MarkCrossZoneId(cx, id);
+
+  return definePropertySameOrigin(cx, proxy, id, descCopy, result);
+}
+
+template <typename Base>
+bool MaybeCrossOriginObject<Base>::enumerate(
+    JSContext* cx, JS::Handle<JSObject*> proxy,
+    JS::MutableHandleVector<jsid> props) const {
+  JS::Rooted<JSObject*> self(cx, proxy);
+  if (!MaybeWrapObject(cx, &self)) {
+    return false;
+  }
+
+  return js::GetPropertyKeys(cx, self, 0, props);
+}
+
+template class MaybeCrossOriginObject<js::Wrapper>;
+template class MaybeCrossOriginObject<DOMProxyHandler>;
+
+}  

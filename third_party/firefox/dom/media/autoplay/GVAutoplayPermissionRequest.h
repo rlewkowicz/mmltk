@@ -1,0 +1,59 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_MEDIA_GVAUTOPLAYPERMISSIONREQUEST_H_
+#define DOM_MEDIA_GVAUTOPLAYPERMISSIONREQUEST_H_
+
+#include "GVAutoplayRequestUtils.h"
+#include "nsContentPermissionHelper.h"
+
+class nsGlobalWindowInner;
+
+namespace mozilla::dom {
+inline constexpr const char kGVAutoplayRequestStatusChangedTopic[] =
+    "geckoview-autoplay-request-status-changed";
+
+class GVAutoplayPermissionRequest : public ContentPermissionRequestBase {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(GVAutoplayPermissionRequest,
+                                           ContentPermissionRequestBase)
+
+  NS_IMETHOD Cancel(void) override;
+  NS_IMETHOD Allow(JS::Handle<JS::Value> choices) override;
+
+ private:
+  friend class GVAutoplayPermissionRequestor;
+  static void CreateRequest(nsGlobalWindowInner* aWindow,
+                            BrowsingContext* aContext,
+                            GVAutoplayRequestType aType);
+
+  GVAutoplayPermissionRequest(nsGlobalWindowInner* aWindow,
+                              BrowsingContext* aContext,
+                              GVAutoplayRequestType aType);
+  ~GVAutoplayPermissionRequest();
+
+  void SetRequestStatus(GVAutoplayRequestStatus aStatus);
+
+  GVAutoplayRequestType mType;
+  RefPtr<BrowsingContext> mContext;
+};
+
+class GVAutoplayPermissionRequestor final {
+ public:
+  static void AskForPermissionIfNeeded(nsPIDOMWindowInner* aWindow);
+
+  static bool HasUnresolvedRequest(nsPIDOMWindowInner* aWindow);
+
+ private:
+  static bool HasEverAskForRequest(BrowsingContext* aContext,
+                                   GVAutoplayRequestType aType);
+  static void CreateAsyncRequest(nsPIDOMWindowInner* aWindow,
+                                 BrowsingContext* aContext,
+                                 GVAutoplayRequestType aType);
+};
+
+}  
+
+#endif

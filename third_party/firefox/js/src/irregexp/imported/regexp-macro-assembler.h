@@ -1,0 +1,353 @@
+// Copyright 2012 the V8 project authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(V8_REGEXP_REGEXP_MACRO_ASSEMBLER_H_)
+#define V8_REGEXP_REGEXP_MACRO_ASSEMBLER_H_
+
+#include <string_view>
+
+#include "irregexp/imported/regexp-ast.h"
+#include "irregexp/imported/regexp.h"
+#include "irregexp/RegExpShim.h"
+
+namespace v8 {
+namespace internal {
+
+class ByteArray;
+class JSRegExp;
+class Label;
+class String;
+
+namespace regexp {
+
+static const base::uc32 kLeadSurrogateStart = 0xd800;
+static const base::uc32 kLeadSurrogateEnd = 0xdbff;
+static const base::uc32 kTrailSurrogateStart = 0xdc00;
+static const base::uc32 kTrailSurrogateEnd = 0xdfff;
+static const base::uc32 kNonBmpStart = 0x10000;
+static const base::uc32 kNonBmpEnd = 0x10ffff;
+
+class RegExpMacroAssembler {
+ public:
+  static constexpr int kMaxRegisterCount = (1 << 16);
+  static constexpr int kMaxRegister = kMaxRegisterCount - 1;
+  static constexpr int kMaxCaptures = (kMaxRegister - 1) / 2;
+  static constexpr int kMaxCPOffset = (1 << 15) - 1;
+  static constexpr int kMinCPOffset = -kMaxCPOffset;
+
+  static constexpr int kTableSizeBits = 7;
+  static constexpr int kTableSize = 1 << kTableSizeBits;
+  static constexpr int kTableMask = kTableSize - 1;
+
+  static constexpr int kUseCharactersValue = -1;
+
+  enum Mode { LATIN1 = 1, UC16 = 2 };
+
+  RegExpMacroAssembler(Isolate* isolate, Zone* zone, Mode mode);
+  RegExpMacroAssembler(const RegExpMacroAssembler& other) V8_NOEXCEPT = default;
+  virtual ~RegExpMacroAssembler() = default;
+
+  virtual DirectHandle<HeapObject> GetCode(DirectHandle<RegExpData> re_data,
+                                           Flags flags) = 0;
+
+  void LogCode(Isolate* isolate, DirectHandle<Code> code,
+               DirectHandle<RegExpData> re_data, Flags flags);
+
+  virtual void AbortedCodeGeneration() {}
+  int stack_limit_slack_slot_count() const;
+  bool CanReadUnaligned() const;
+
+  virtual void AdvanceCurrentPosition(int by) = 0;  
+  virtual void AdvanceRegister(int reg, int by) = 0;  
+  virtual void Backtrack() = 0;
+  virtual void Bind(Label* label) = 0;
+  virtual void CheckCharacter(unsigned c, Label* on_equal) = 0;
+  virtual void CheckCharacterAfterAnd(unsigned c,
+                                      unsigned and_with,
+                                      Label* on_equal) = 0;
+  virtual void CheckCharacterGT(base::uc16 limit, Label* on_greater) = 0;
+  virtual void CheckCharacterLT(base::uc16 limit, Label* on_less) = 0;
+  virtual void CheckFixedLengthLoop(Label* on_tos_equals_current_position) = 0;
+  virtual void CheckAtStart(int cp_offset, Label* on_at_start) = 0;
+  virtual void CheckNotAtStart(int cp_offset, Label* on_not_at_start) = 0;
+  virtual void CheckNotBackReference(int start_reg, bool read_backward,
+                                     Label* on_no_match) = 0;
+  virtual void CheckNotBackReferenceIgnoreCase(int start_reg,
+                                               bool read_backward, bool unicode,
+                                               Label* on_no_match) = 0;
+  virtual void CheckNotCharacter(unsigned c, Label* on_not_equal) = 0;
+  virtual void CheckNotCharacterAfterAnd(unsigned c,
+                                         unsigned and_with,
+                                         Label* on_not_equal) = 0;
+  virtual void CheckNotCharacterAfterMinusAnd(base::uc16 c, base::uc16 minus,
+                                              base::uc16 and_with,
+                                              Label* on_not_equal) = 0;
+  virtual void CheckCharacterInRange(base::uc16 from,
+                                     base::uc16 to,  
+                                     Label* on_in_range) = 0;
+  virtual void CheckCharacterNotInRange(base::uc16 from,
+                                        base::uc16 to,  
+                                        Label* on_not_in_range) = 0;
+  virtual bool CheckCharacterInRangeArray(
+      const ZoneList<CharacterRange>* ranges, Label* on_in_range) = 0;
+  virtual bool CheckCharacterNotInRangeArray(
+      const ZoneList<CharacterRange>* ranges, Label* on_not_in_range) = 0;
+
+  virtual void CheckBitInTable(Handle<ByteArray> table, Label* on_bit_set) = 0;
+
+  virtual void SkipUntilBitInTable(int cp_offset, Handle<ByteArray> table,
+                                   Handle<ByteArray> nibble_table,
+                                   int advance_by, Label* on_match,
+                                   Label* on_no_match) = 0;
+  virtual bool SkipUntilBitInTableUseSimd(int advance_by) { return false; }
+
+  virtual void SkipUntilCharAnd(int cp_offset, int advance_by,
+                                unsigned character, unsigned mask,
+                                int eats_at_least, Label* on_match,
+                                Label* on_no_match);
+  virtual void SkipUntilChar(int cp_offset, int advance_by, unsigned character,
+                             Label* on_match, Label* on_no_match);
+  virtual void SkipUntilCharPosChecked(int cp_offset, int advance_by,
+                                       unsigned character, int eats_at_least,
+                                       Label* on_match, Label* on_no_match);
+  virtual void SkipUntilCharOrChar(int cp_offset, int advance_by,
+                                   unsigned char1, unsigned char2,
+                                   Label* on_match, Label* on_no_match);
+  virtual void SkipUntilGtOrNotBitInTable(int cp_offset, int advance_by,
+                                          unsigned character,
+                                          Handle<ByteArray> table,
+                                          Label* on_match, Label* on_no_match);
+  virtual void SkipUntilOneOfMasked(int cp_offset, int advance_by,
+                                    unsigned both_chars, unsigned both_mask,
+                                    int max_offset, unsigned chars1,
+                                    unsigned mask1, unsigned chars2,
+                                    unsigned mask2, Label* on_match1,
+                                    Label* on_match2, Label* on_failure);
+  struct SkipUntilOneOfMasked3Args {
+    int bc0_cp_offset;
+    int bc0_advance_by;
+    Handle<ByteArray> bc0_table;
+    Handle<ByteArray> bc0_nibble_table;
+    int bc1_cp_offset;
+    Label* bc1_on_failure;
+    int bc2_cp_offset;
+    unsigned bc3_characters;
+    unsigned bc3_mask;
+    int bc4_by;
+    int bc5_cp_offset;
+    unsigned bc6_characters;
+    unsigned bc6_mask;
+    Label* bc6_on_equal;
+    unsigned bc7_characters;
+    unsigned bc7_mask;
+    Label* bc7_on_equal;
+    unsigned bc8_characters;
+    unsigned bc8_mask;
+    Label* fallthrough_jump_target;
+  };
+  virtual bool SkipUntilOneOfMasked3UseSimd(
+      const SkipUntilOneOfMasked3Args& args) {
+    return false;
+  }
+  virtual void SkipUntilOneOfMasked3(const SkipUntilOneOfMasked3Args& args);
+
+  virtual void CheckPosition(int cp_offset, Label* on_outside_input) = 0;
+  bool CanOptimizeSpecialClassRanges(StandardCharacterSet) const;
+  virtual void CheckSpecialClassRanges(StandardCharacterSet type,
+                                       Label* on_no_match) = 0;
+
+  virtual void BindJumpTarget(Label* label) { Bind(label); }
+
+  virtual void Fail() = 0;
+  virtual void GoTo(Label* label) = 0;
+  virtual void IfRegisterGE(int reg, int comparand, Label* if_ge) = 0;
+  virtual void IfRegisterLT(int reg, int comparand, Label* if_lt) = 0;
+  virtual void IfRegisterEqPos(int reg, Label* if_eq) = 0;
+  V8_EXPORT_PRIVATE void LoadCurrentCharacter(
+      int cp_offset, Label* on_end_of_input, bool check_bounds = true,
+      int characters = 1, int eats_at_least = kUseCharactersValue);
+  virtual void LoadCurrentCharacterImpl(int cp_offset, Label* on_end_of_input,
+                                        bool check_bounds, int characters,
+                                        int eats_at_least) = 0;
+  virtual void PopCurrentPosition() = 0;
+  virtual void PopRegister(int register_index) = 0;
+  virtual void PushBacktrack(Label* label) = 0;
+  virtual void PushCurrentPosition() = 0;
+  enum class StackCheckFlag : uint8_t {
+    kNoStackLimitCheck = false,
+    kCheckStackLimit = true
+  };
+  virtual void PushRegister(int register_index,
+                            StackCheckFlag check_stack_limit) = 0;
+  virtual void ReadCurrentPositionFromRegister(int reg) = 0;
+  virtual void ReadStackPointerFromRegister(int reg) = 0;
+  virtual void SetCurrentPositionFromEnd(int by) = 0;
+  virtual void SetRegister(int register_index, int to) = 0;
+  virtual bool Succeed() = 0;
+  virtual void WriteCurrentPositionToRegister(int reg, int cp_offset) = 0;
+  virtual void ClearRegisters(int reg_from, int reg_to) = 0;
+  virtual void WriteStackPointerToRegister(int reg) = 0;
+  virtual void RecordComment(std::string_view comment) = 0;
+  virtual MacroAssembler* masm() = 0;
+
+  void CheckNotInSurrogatePair(int cp_offset, Label* on_failure);
+
+  void UnanchoredAdvance(bool unicode, Label* on_failure);
+
+#define IMPLEMENTATIONS_LIST(V) \
+  V(IA32)                       \
+  V(ARM)                        \
+  V(ARM64)                      \
+  V(MIPS)                       \
+  V(LOONG64)                    \
+  V(RISCV)                      \
+  V(RISCV32)                    \
+  V(S390)                       \
+  V(PPC)                        \
+  V(X64)                        \
+  V(Bytecode)
+
+  enum IrregexpImplementation {
+#define V(Name) k##Name##Implementation,
+    IMPLEMENTATIONS_LIST(V)
+#undef V
+  };
+
+  inline const char* ImplementationToString(IrregexpImplementation impl) {
+    static const char* const kNames[] = {
+#define V(Name) #Name,
+        IMPLEMENTATIONS_LIST(V)
+#undef V
+    };
+    return kNames[impl];
+  }
+#undef IMPLEMENTATIONS_LIST
+  virtual IrregexpImplementation Implementation() = 0;
+
+  static int CaseInsensitiveCompareNonUnicode(Address byte_offset1,
+                                              Address byte_offset2,
+                                              size_t byte_length,
+                                              Isolate* isolate);
+  static int CaseInsensitiveCompareUnicode(Address byte_offset1,
+                                           Address byte_offset2,
+                                           size_t byte_length,
+                                           Isolate* isolate);
+
+  static uint32_t IsCharacterInRangeArray(uint32_t current_char,
+                                          Address raw_byte_array);
+
+  virtual void set_backtrack_limit(uint32_t backtrack_limit) {
+    backtrack_limit_ = backtrack_limit;
+  }
+
+  virtual void set_can_fallback(bool val) { can_fallback_ = val; }
+
+  enum GlobalMode {
+    NOT_GLOBAL,
+    GLOBAL_NO_ZERO_LENGTH_CHECK,
+    GLOBAL,
+    GLOBAL_UNICODE
+  };
+  inline virtual void set_global_mode(GlobalMode mode) { global_mode_ = mode; }
+  inline bool global() const { return global_mode_ != NOT_GLOBAL; }
+  inline bool global_with_zero_length_check() const {
+    return global_mode_ == GLOBAL || global_mode_ == GLOBAL_UNICODE;
+  }
+  inline bool global_unicode() const { return global_mode_ == GLOBAL_UNICODE; }
+
+  static Address word_character_map_address() {
+    return reinterpret_cast<Address>(&word_character_map_[0]);
+  }
+
+  static const base::Vector<const uint8_t> word_character_map() {
+    return base::ArrayVector(word_character_map_);
+  }
+
+  Isolate* isolate() const { return isolate_; }
+  Zone* zone() const { return zone_; }
+
+ protected:
+  inline int char_size() const {
+    static_assert(static_cast<int>(Mode::LATIN1) == sizeof(uint8_t));
+    static_assert(static_cast<int>(Mode::UC16) == sizeof(uint16_t));
+    return static_cast<int>(mode());
+  }
+
+  bool has_backtrack_limit() const;
+  uint32_t backtrack_limit() const { return backtrack_limit_; }
+
+  bool can_fallback() const { return can_fallback_; }
+
+  Mode mode() const { return mode_; }
+
+  static constexpr size_t kWordCharacterMapSize = 256;
+  static const uint8_t word_character_map_[kWordCharacterMapSize];
+
+ private:
+  uint32_t backtrack_limit_;
+  bool can_fallback_ = false;
+  GlobalMode global_mode_;
+  Isolate* const isolate_;
+  Zone* const zone_;
+  const Mode mode_;
+};
+
+class NativeRegExpMacroAssembler : public RegExpMacroAssembler {
+ public:
+  enum Result {
+    FAILURE = RegExp::kInternalRegExpFailure,
+    SUCCESS = RegExp::kInternalRegExpSuccess,
+    EXCEPTION = RegExp::kInternalRegExpException,
+    RETRY = RegExp::kInternalRegExpRetry,
+    FALLBACK_TO_EXPERIMENTAL = RegExp::kInternalRegExpFallbackToExperimental,
+    SMALLEST_REGEXP_RESULT = RegExp::kInternalRegExpSmallestResult,
+  };
+
+  NativeRegExpMacroAssembler(Isolate* isolate, Zone* zone, Mode mode)
+      : RegExpMacroAssembler(isolate, zone, mode), range_array_cache_(zone) {}
+  ~NativeRegExpMacroAssembler() override = default;
+
+  static int Match(DirectHandle<IrRegExpData> regexp_data,
+                   DirectHandle<String> subject, int* offsets_vector,
+                   int offsets_vector_length, int previous_index,
+                   Isolate* isolate);
+
+  V8_EXPORT_PRIVATE static int ExecuteForTesting(
+      Tagged<String> input, int start_offset, const uint8_t* input_start,
+      const uint8_t* input_end, int* output, int output_size, Isolate* isolate,
+      Tagged<JSRegExp> regexp);
+
+  void LoadCurrentCharacterImpl(int cp_offset, Label* on_end_of_input,
+                                bool check_bounds, int characters,
+                                int eats_at_least) override;
+  virtual void LoadCurrentCharacterUnchecked(int cp_offset,
+                                             int character_count) = 0;
+
+  static Address GrowStack(Isolate* isolate);
+
+  static int CheckStackGuardState(Isolate* isolate, int start_index,
+                                  RegExp::CallOrigin call_origin,
+                                  Address* return_address,
+                                  Tagged<InstructionStream> re_code,
+                                  Address* subject, const uint8_t** input_start,
+                                  const uint8_t** input_end, uintptr_t gap);
+
+ protected:
+  Handle<ByteArray> GetOrAddRangeArray(const ZoneList<CharacterRange>* ranges);
+
+ private:
+  static int Execute(Tagged<String> input, int start_offset,
+                     const uint8_t* input_start, const uint8_t* input_end,
+                     int* output, int output_size, Isolate* isolate,
+                     Tagged<IrRegExpData> regexp_data);
+
+  ZoneUnorderedMap<uint32_t, IndirectHandle<FixedUInt16Array>>
+      range_array_cache_;
+};
+
+}  
+}  
+}  
+
+#endif

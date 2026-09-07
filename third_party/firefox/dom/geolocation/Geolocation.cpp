@@ -1,0 +1,1366 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "Geolocation.h"
+#include "mozilla/ScopeExit.h"
+
+#include "GeolocationIPCUtils.h"
+#include "GeolocationSystem.h"
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/CycleCollectedJSContext.h"  // for nsAutoMicroTask
+#include "mozilla/EventStateManager.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/Services.h"
+#include "mozilla/StaticPrefs_geo.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/WeakPtr.h"
+#include "mozilla/dom/BrowserChild.h"
+#include "mozilla/dom/ContentChild.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/GeolocationPositionError.h"
+#include "mozilla/dom/GeolocationPositionErrorBinding.h"
+#include "mozilla/dom/PermissionMessageUtils.h"
+#include "mozilla/ipc/MessageChannel.h"
+#include "nsComponentManagerUtils.h"
+#include "nsContentPermissionHelper.h"
+#include "nsContentUtils.h"
+#include "nsGlobalWindowInner.h"
+#include "nsINamed.h"
+#include "nsIObserverService.h"
+#include "nsIPromptService.h"
+#include "nsIScriptError.h"
+#include "nsPIDOMWindow.h"
+#include "nsPIDOMWindowInlines.h"
+#include "nsServiceManagerUtils.h"
+#include "nsThreadUtils.h"
+#include "nsXULAppAPI.h"
+
+class nsIPrincipal;
+
+
+#if defined(MOZ_ENABLE_DBUS)
+#  include "GeoclueLocationProvider.h"
+#  include "PortalLocationProvider.h"
+#  include "mozilla/WidgetUtilsGtk.h"
+#endif
+
+
+
+#define MAX_GEO_REQUESTS_PER_WINDOW 1500
+
+#define PREF_GEO_SECURITY_ALLOWINSECURE "geo.security.allowinsecure"
+
+using namespace mozilla;
+using namespace mozilla::dom;
+using namespace mozilla::dom::geolocation;
+
+mozilla::LazyLogModule gGeolocationLog("Geolocation");
+
+class nsGeolocationRequest final : public ContentPermissionRequestBase,
+                                   public nsIGeolocationUpdate,
+                                   public SupportsWeakPtr {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_NSIGEOLOCATIONUPDATE
+
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(nsGeolocationRequest,
+                                           ContentPermissionRequestBase)
+
+  nsGeolocationRequest(Geolocation* aLocator, GeoPositionCallback aCallback,
+                       GeoPositionErrorCallback aErrorCallback,
+                       UniquePtr<PositionOptions>&& aOptions,
+                       nsIEventTarget* aMainThreadSerialEventTarget,
+                       bool aWatchPositionRequest = false,
+                       int32_t aWatchId = 0);
+
+  MOZ_CAN_RUN_SCRIPT NS_IMETHOD Cancel(void) override;
+  MOZ_CAN_RUN_SCRIPT NS_IMETHOD Allow(JS::Handle<JS::Value> choices) override;
+  NS_IMETHOD GetTypes(nsIArray** aTypes) override;
+
+  void Shutdown();
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  void SendLocation(nsIDOMGeoPosition* aLocation);
+  bool WantsHighAccuracy() {
+    return !mShutdown && mOptions && mOptions->mEnableHighAccuracy;
+  }
+  void SetTimeoutTimer();
+  void StopTimeoutTimer();
+  MOZ_CAN_RUN_SCRIPT
+  void NotifyErrorAndShutdown(uint16_t);
+  using ContentPermissionRequestBase::GetPrincipal;
+  nsIPrincipal* GetPrincipal();
+
+  bool IsWatch() { return mIsWatchPositionRequest; }
+  int32_t WatchId() { return mWatchId; }
+
+  void SetPromptBehavior(
+      geolocation::SystemGeolocationPermissionBehavior aBehavior) {
+    mBehavior = aBehavior;
+  }
+
+  NS_IMETHOD GetIgnoreAllowSitePermission(
+      bool* aIgnoreAllowSitePermission) override {
+    *aIgnoreAllowSitePermission =
+        mBehavior != geolocation::SystemGeolocationPermissionBehavior::NoPrompt;
+    return NS_OK;
+  }
+
+ private:
+  virtual ~nsGeolocationRequest();
+
+  class TimerCallbackHolder final : public nsITimerCallback, public nsINamed {
+   public:
+    NS_DECL_ISUPPORTS
+    NS_DECL_NSITIMERCALLBACK
+
+    explicit TimerCallbackHolder(nsGeolocationRequest* aRequest)
+        : mRequest(aRequest) {}
+
+    NS_IMETHOD GetName(nsACString& aName) override {
+      aName.AssignLiteral("nsGeolocationRequest::TimerCallbackHolder");
+      return NS_OK;
+    }
+
+   private:
+    ~TimerCallbackHolder() = default;
+    WeakPtr<nsGeolocationRequest> mRequest;
+  };
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void Notify();
+
+  bool mIsWatchPositionRequest;
+
+  nsCOMPtr<nsITimer> mTimeoutTimer;
+  GeoPositionCallback mCallback;
+  GeoPositionErrorCallback mErrorCallback;
+  UniquePtr<PositionOptions> mOptions;
+
+  RefPtr<Geolocation> mLocator;
+
+  int32_t mWatchId;
+  bool mShutdown;
+  nsCOMPtr<nsIEventTarget> mMainThreadSerialEventTarget;
+
+  SystemGeolocationPermissionBehavior mBehavior;
+};
+
+static UniquePtr<PositionOptions> CreatePositionOptionsCopy(
+    const PositionOptions& aOptions) {
+  UniquePtr<PositionOptions> geoOptions = MakeUnique<PositionOptions>();
+
+  geoOptions->mEnableHighAccuracy = aOptions.mEnableHighAccuracy;
+  geoOptions->mMaximumAge = aOptions.mMaximumAge;
+  geoOptions->mTimeout = aOptions.mTimeout;
+
+  return geoOptions;
+}
+
+class RequestSendLocationEvent : public Runnable {
+ public:
+  RequestSendLocationEvent(nsIDOMGeoPosition* aPosition,
+                           nsGeolocationRequest* aRequest)
+      : mozilla::Runnable("RequestSendLocationEvent"),
+        mPosition(aPosition),
+        mRequest(aRequest) {}
+
+  NS_IMETHOD Run() override {
+    mRequest->SendLocation(mPosition);
+    return NS_OK;
+  }
+
+ private:
+  nsCOMPtr<nsIDOMGeoPosition> mPosition;
+  RefPtr<nsGeolocationRequest> mRequest;
+  RefPtr<Geolocation> mLocator;
+};
+
+
+static nsPIDOMWindowInner* ConvertWeakReferenceToWindow(
+    nsIWeakReference* aWeakPtr) {
+  nsCOMPtr<nsPIDOMWindowInner> window = do_QueryReferent(aWeakPtr);
+  nsPIDOMWindowInner* raw = window.get();
+  return raw;
+}
+
+nsGeolocationRequest::nsGeolocationRequest(
+    Geolocation* aLocator, GeoPositionCallback aCallback,
+    GeoPositionErrorCallback aErrorCallback,
+    UniquePtr<PositionOptions>&& aOptions,
+    nsIEventTarget* aMainThreadSerialEventTarget, bool aWatchPositionRequest,
+    int32_t aWatchId)
+    : ContentPermissionRequestBase(
+          aLocator->GetPrincipal(),
+          ConvertWeakReferenceToWindow(aLocator->GetOwner()), "geo"_ns,
+          "geolocation"_ns),
+      mIsWatchPositionRequest(aWatchPositionRequest),
+      mCallback(std::move(aCallback)),
+      mErrorCallback(std::move(aErrorCallback)),
+      mOptions(std::move(aOptions)),
+      mLocator(aLocator),
+      mWatchId(aWatchId),
+      mShutdown(false),
+      mMainThreadSerialEventTarget(aMainThreadSerialEventTarget),
+      mBehavior(SystemGeolocationPermissionBehavior::NoPrompt) {}
+
+nsGeolocationRequest::~nsGeolocationRequest() { StopTimeoutTimer(); }
+
+NS_IMPL_QUERY_INTERFACE_CYCLE_COLLECTION_INHERITED(nsGeolocationRequest,
+                                                   ContentPermissionRequestBase,
+                                                   nsIGeolocationUpdate)
+
+NS_IMPL_ADDREF_INHERITED(nsGeolocationRequest, ContentPermissionRequestBase)
+NS_IMPL_RELEASE_INHERITED(nsGeolocationRequest, ContentPermissionRequestBase)
+NS_IMPL_CYCLE_COLLECTION_WEAK_PTR_INHERITED(nsGeolocationRequest,
+                                            ContentPermissionRequestBase,
+                                            mCallback, mErrorCallback, mLocator)
+
+void nsGeolocationRequest::Notify() {
+  MOZ_LOG(gGeolocationLog, LogLevel::Debug, ("nsGeolocationRequest::Notify"));
+  NotifyErrorAndShutdown(GeolocationPositionError_Binding::TIMEOUT);
+}
+
+void nsGeolocationRequest::NotifyErrorAndShutdown(uint16_t aErrorCode) {
+  MOZ_LOG(gGeolocationLog, LogLevel::Debug,
+          ("nsGeolocationRequest::NotifyErrorAndShutdown with error code: %u",
+           aErrorCode));
+  MOZ_ASSERT(!mShutdown, "timeout after shutdown");
+  if (!mIsWatchPositionRequest) {
+    Shutdown();
+    mLocator->RemoveRequest(this);
+  }
+
+  NotifyError(aErrorCode);
+}
+
+NS_IMETHODIMP
+nsGeolocationRequest::Cancel() {
+  if (mLocator->ClearPendingRequest(this)) {
+    return NS_OK;
+  }
+
+  NotifyError(GeolocationPositionError_Binding::PERMISSION_DENIED);
+  return NS_OK;
+}
+
+class CancelSystemGeolocationPermissionRequest : public PromiseNativeHandler {
+ public:
+  NS_DECL_ISUPPORTS
+
+  explicit CancelSystemGeolocationPermissionRequest(
+      SystemGeolocationPermissionRequest* aRequest)
+      : mRequest(aRequest) {}
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  void ResolvedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue,
+                        ErrorResult& aRv) override {
+    mRequest->Stop();
+  }
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  void RejectedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue,
+                        ErrorResult& aRv) override {
+    mRequest->Stop();
+  }
+
+ private:
+  ~CancelSystemGeolocationPermissionRequest() = default;
+  RefPtr<SystemGeolocationPermissionRequest> mRequest;
+};
+
+NS_IMPL_ISUPPORTS0(CancelSystemGeolocationPermissionRequest)
+
+void Geolocation::ReallowWithSystemPermissionOrCancel(
+    BrowsingContext* aBrowsingContext,
+    geolocation::ParentRequestResolver&& aResolver) {
+  auto denyPermissionOnError =
+      MakeScopeExit([&aResolver]() MOZ_CAN_RUN_SCRIPT_BOUNDARY_LAMBDA {
+        aResolver(GeolocationPermissionStatus::Error);
+      });
+
+  NS_ENSURE_TRUE_VOID(aBrowsingContext);
+
+  nsCOMPtr<nsIStringBundle> bundle;
+  nsCOMPtr<nsIStringBundleService> sbs =
+      do_GetService(NS_STRINGBUNDLE_CONTRACTID);
+  NS_ENSURE_TRUE_VOID(sbs);
+
+  sbs->CreateBundle("chrome://browser/locale/browser.properties",
+                    getter_AddRefs(bundle));
+  NS_ENSURE_TRUE_VOID(bundle);
+
+  nsAutoString title;
+  nsresult rv =
+      bundle->GetStringFromName("geolocation.systemSettingsTitle", title);
+  NS_ENSURE_SUCCESS_VOID(rv);
+
+  nsAutoString brandName;
+  rv = nsContentUtils::GetLocalizedString(PropertiesFile::BRAND_PROPERTIES,
+                                          "brandShortName", brandName);
+  NS_ENSURE_SUCCESS_VOID(rv);
+  AutoTArray<nsString, 1> formatParams;
+  formatParams.AppendElement(brandName);
+  nsAutoString message;
+  rv = bundle->FormatStringFromName("geolocation.systemSettingsMessage",
+                                    formatParams, message);
+  NS_ENSURE_SUCCESS_VOID(rv);
+
+  denyPermissionOnError.release();
+
+  RefPtr<SystemGeolocationPermissionRequest> permissionRequest =
+      geolocation::RequestLocationPermissionFromUser(aBrowsingContext,
+                                                     std::move(aResolver));
+  NS_ENSURE_TRUE_VOID(permissionRequest);
+
+  auto cancelRequestOnError = MakeScopeExit([&]() {
+    permissionRequest->Stop();
+  });
+
+  nsCOMPtr<nsIPromptService> promptSvc =
+      do_GetService("@mozilla.org/prompter;1", &rv);
+  NS_ENSURE_SUCCESS_VOID(rv);
+
+  bool geckoWillPrompt =
+      GetLocationOSPermission() ==
+      geolocation::SystemGeolocationPermissionBehavior::GeckoWillPromptUser;
+  const auto kSpinnerNoButtonFlags =
+      nsIPromptService::BUTTON_NONE | nsIPromptService::SHOW_SPINNER;
+  const auto kCancelButtonFlags =
+      nsIPromptService::BUTTON_TITLE_CANCEL * nsIPromptService::BUTTON_POS_0;
+  RefPtr<mozilla::dom::Promise> tabBlockingDialogPromise;
+  rv = promptSvc->AsyncConfirmEx(
+      aBrowsingContext, nsIPromptService::MODAL_TYPE_TAB, title.get(),
+      message.get(),
+      geckoWillPrompt ? kCancelButtonFlags : kSpinnerNoButtonFlags, nullptr,
+      nullptr, nullptr, nullptr, false, JS::UndefinedHandleValue,
+      getter_AddRefs(tabBlockingDialogPromise));
+  NS_ENSURE_SUCCESS_VOID(rv);
+  MOZ_ASSERT(tabBlockingDialogPromise);
+
+  tabBlockingDialogPromise->AppendNativeHandler(
+      new CancelSystemGeolocationPermissionRequest(permissionRequest));
+
+  cancelRequestOnError.release();
+}
+
+NS_IMETHODIMP
+nsGeolocationRequest::Allow(JS::Handle<JS::Value> aChoices) {
+  MOZ_ASSERT(aChoices.isUndefined());
+
+  if (mLocator->ClearPendingRequest(this)) {
+    return NS_OK;
+  }
+
+  auto onSystemPermissionResult =
+      [self = RefPtr{this}](GeolocationPermissionStatus
+                                aResult) MOZ_CAN_RUN_SCRIPT_BOUNDARY_LAMBDA {
+        if (aResult == GeolocationPermissionStatus::Granted ||
+            !StaticPrefs::dom_geolocation_require_system_permission_enabled()) {
+          self->Allow(JS::UndefinedHandleValue);
+          return;
+        }
+        self->Cancel();
+      };
+
+  if (mBehavior != SystemGeolocationPermissionBehavior::NoPrompt) {
+    mBehavior = SystemGeolocationPermissionBehavior::NoPrompt;
+    RefPtr<BrowsingContext> browsingContext = mWindow->GetBrowsingContext();
+    if (ContentChild* cc = ContentChild::GetSingleton()) {
+      cc->SendRequestGeolocationPermissionFromUser(
+          browsingContext, onSystemPermissionResult,
+          [onSystemPermissionResult](
+              mozilla::ipc::ResponseRejectReason aReason) {
+            onSystemPermissionResult(GeolocationPermissionStatus::Canceled);
+          });
+      return NS_OK;
+    }
+
+    Geolocation::ReallowWithSystemPermissionOrCancel(browsingContext,
+                                                     onSystemPermissionResult);
+    return NS_OK;
+  }
+
+  RefPtr<nsGeolocationService> gs = nsGeolocationService::GetGeolocationService(
+      mLocator->GetBrowsingContext());
+  bool canUseCache = false;
+  CachedPositionAndAccuracy lastPosition = gs->GetCachedPosition();
+  if (lastPosition.position) {
+    EpochTimeStamp cachedPositionTime_ms;
+    lastPosition.position->GetTimestamp(&cachedPositionTime_ms);
+    if (mOptions && mOptions->mMaximumAge > 0) {
+      uint32_t maximumAge_ms = mOptions->mMaximumAge;
+      bool isCachedWithinRequestedAccuracy =
+          WantsHighAccuracy() <= lastPosition.isHighAccuracy;
+      bool isCachedWithinRequestedTime =
+          EpochTimeStamp(PR_Now() / PR_USEC_PER_MSEC - maximumAge_ms) <=
+          cachedPositionTime_ms;
+      canUseCache =
+          isCachedWithinRequestedAccuracy && isCachedWithinRequestedTime;
+    }
+  }
+
+  if (!canUseCache && gs != nsGeolocationService::sService.get()) {
+    canUseCache = true;
+  }
+
+  if (XRE_IsParentProcess()) {
+    gs->UpdateAccuracy(WantsHighAccuracy());
+  }
+
+  if (canUseCache) {
+    Update(lastPosition.position);
+
+    if (!mIsWatchPositionRequest) {
+      return NS_OK;
+    }
+  } else {
+    if (mOptions && mOptions->mTimeout == 0 && !mIsWatchPositionRequest) {
+      NotifyError(GeolocationPositionError_Binding::TIMEOUT);
+      return NS_OK;
+    }
+  }
+
+  bool allowedRequest = mIsWatchPositionRequest || !canUseCache;
+  if (allowedRequest) {
+    mLocator->NotifyAllowedRequest(this);
+  }
+
+  nsresult rv = gs->StartDevice();
+
+  if (NS_FAILED(rv)) {
+    if (allowedRequest) {
+      mLocator->RemoveRequest(this);
+    }
+    NotifyError(GeolocationPositionError_Binding::POSITION_UNAVAILABLE);
+    return NS_OK;
+  }
+
+  SetTimeoutTimer();
+
+  return NS_OK;
+}
+
+void nsGeolocationRequest::SetTimeoutTimer() {
+  MOZ_ASSERT(!mShutdown, "set timeout after shutdown");
+
+  StopTimeoutTimer();
+
+  if (mOptions && mOptions->mTimeout != 0 && mOptions->mTimeout != 0x7fffffff) {
+    RefPtr<TimerCallbackHolder> holder = new TimerCallbackHolder(this);
+    NS_NewTimerWithCallback(getter_AddRefs(mTimeoutTimer), holder,
+                            mOptions->mTimeout, nsITimer::TYPE_ONE_SHOT);
+  }
+}
+
+void nsGeolocationRequest::StopTimeoutTimer() {
+  if (mTimeoutTimer) {
+    mTimeoutTimer->Cancel();
+    mTimeoutTimer = nullptr;
+  }
+}
+
+void nsGeolocationRequest::SendLocation(nsIDOMGeoPosition* aPosition) {
+  if (mShutdown) {
+    return;
+  }
+
+  if (mOptions && mOptions->mMaximumAge > 0) {
+    EpochTimeStamp positionTime_ms;
+    aPosition->GetTimestamp(&positionTime_ms);
+    const uint32_t maximumAge_ms = mOptions->mMaximumAge;
+    const bool isTooOld = EpochTimeStamp(PR_Now() / PR_USEC_PER_MSEC -
+                                         maximumAge_ms) > positionTime_ms;
+    if (isTooOld) {
+      return;
+    }
+  }
+
+  RefPtr<mozilla::dom::GeolocationPosition> wrapped;
+
+  if (aPosition) {
+    nsCOMPtr<nsIDOMGeoPositionCoords> coords;
+    aPosition->GetCoords(getter_AddRefs(coords));
+    if (coords) {
+      wrapped = new mozilla::dom::GeolocationPosition(ToSupports(mLocator),
+                                                      aPosition);
+    }
+  }
+
+  if (!wrapped) {
+    NotifyError(GeolocationPositionError_Binding::POSITION_UNAVAILABLE);
+    return;
+  }
+
+  if (mIsWatchPositionRequest) {
+    StopTimeoutTimer();
+  } else {
+    Shutdown();
+  }
+
+  nsCOMPtr<nsIObserverService> obs = services::GetObserverService();
+  obs->NotifyObservers(wrapped, "geolocation-position-events",
+                       u"location-updated");
+
+  nsAutoMicroTask mt;
+  if (mCallback.HasWebIDLCallback()) {
+    RefPtr<PositionCallback> callback = mCallback.GetWebIDLCallback();
+
+    MOZ_ASSERT(callback);
+    callback->Call(*wrapped);
+  } else {
+    nsIDOMGeoPositionCallback* callback = mCallback.GetXPCOMCallback();
+    MOZ_ASSERT(callback);
+    callback->HandleEvent(aPosition);
+  }
+
+  MOZ_ASSERT(mShutdown || mIsWatchPositionRequest,
+             "non-shutdown getCurrentPosition request after callback!");
+}
+
+nsIPrincipal* nsGeolocationRequest::GetPrincipal() {
+  if (!mLocator) {
+    return nullptr;
+  }
+  return mLocator->GetPrincipal();
+}
+
+NS_IMETHODIMP
+nsGeolocationRequest::Update(nsIDOMGeoPosition* aPosition) {
+  nsCOMPtr<nsIRunnable> ev = new RequestSendLocationEvent(aPosition, this);
+  mMainThreadSerialEventTarget->Dispatch(ev.forget());
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsGeolocationRequest::NotifyError(uint16_t aErrorCode) {
+  MOZ_LOG(
+      gGeolocationLog, LogLevel::Debug,
+      ("nsGeolocationRequest::NotifyError with error code: %u", aErrorCode));
+  MOZ_ASSERT(NS_IsMainThread());
+  RefPtr<GeolocationPositionError> positionError =
+      new GeolocationPositionError(mLocator, static_cast<int16_t>(aErrorCode));
+  positionError->NotifyCallback(mErrorCallback);
+  return NS_OK;
+}
+
+void nsGeolocationRequest::Shutdown() {
+  MOZ_ASSERT(!mShutdown, "request shutdown twice");
+  mShutdown = true;
+
+  StopTimeoutTimer();
+
+  if (mOptions && mOptions->mEnableHighAccuracy) {
+    RefPtr<nsGeolocationService> gs =
+        nsGeolocationService::GetGeolocationService(
+            mLocator->GetBrowsingContext());
+    if (gs) {
+      gs->UpdateAccuracy();
+    }
+  }
+}
+
+NS_IMETHODIMP
+nsGeolocationRequest::GetTypes(nsIArray** aTypes) {
+  AutoTArray<nsString, 2> options;
+
+  switch (mBehavior) {
+    case SystemGeolocationPermissionBehavior::SystemWillPromptUser:
+      options.AppendElement(u"sysdlg"_ns);
+      break;
+    case SystemGeolocationPermissionBehavior::GeckoWillPromptUser:
+      options.AppendElement(u"syssetting"_ns);
+      break;
+    default:
+      break;
+  }
+  return nsContentPermissionUtils::CreatePermissionArray(mType, options,
+                                                         aTypes);
+}
+
+
+NS_IMPL_ISUPPORTS(nsGeolocationRequest::TimerCallbackHolder, nsITimerCallback,
+                  nsINamed)
+
+NS_IMETHODIMP
+nsGeolocationRequest::TimerCallbackHolder::Notify(nsITimer*) {
+  if (mRequest && mRequest->mLocator) {
+    RefPtr<nsGeolocationRequest> request(mRequest);
+    request->Notify();
+  }
+
+  return NS_OK;
+}
+
+NS_INTERFACE_MAP_BEGIN(nsGeolocationService)
+  NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIGeolocationUpdate)
+  NS_INTERFACE_MAP_ENTRY(nsIGeolocationUpdate)
+  NS_INTERFACE_MAP_ENTRY(nsIObserver)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_ADDREF(nsGeolocationService)
+NS_IMPL_RELEASE(nsGeolocationService)
+
+nsresult nsGeolocationService::Init() {
+  if (!StaticPrefs::geo_enabled()) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (XRE_IsContentProcess()) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIObserverService> obs = services::GetObserverService();
+  if (!obs) {
+    return NS_ERROR_FAILURE;
+  }
+
+  obs->AddObserver(this, "xpcom-shutdown", false);
+
+
+#if defined(MOZ_WIDGET_GTK)
+#if defined(MOZ_ENABLE_DBUS)
+  if (!mProvider && widget::ShouldUsePortal(widget::PortalKind::Location)) {
+    mProvider = new PortalLocationProvider();
+    MOZ_LOG(gGeolocationLog, LogLevel::Debug,
+            ("Selected PortalLocationProvider"));
+  }
+
+  if (!mProvider && StaticPrefs::geo_provider_use_geoclue()) {
+    nsCOMPtr<nsIGeolocationProvider> gcProvider = new GeoclueLocationProvider();
+    MOZ_LOG(gGeolocationLog, LogLevel::Debug,
+            ("Checking GeoclueLocationProvider"));
+    if (NS_SUCCEEDED(gcProvider->Startup())) {
+      gcProvider->Shutdown();
+      mProvider = std::move(gcProvider);
+      MOZ_LOG(gGeolocationLog, LogLevel::Debug,
+              ("Selected GeoclueLocationProvider"));
+    }
+  }
+#endif
+#endif
+
+
+
+  if (Preferences::GetBool("geo.provider.use_mls", false)) {
+    mProvider = do_CreateInstance("@mozilla.org/geolocation/mls-provider;1");
+  }
+
+  if (!mProvider || Preferences::GetBool("geo.provider.testing", false)) {
+    nsCOMPtr<nsIGeolocationProvider> geoTestProvider =
+        do_GetService(NS_GEOLOCATION_PROVIDER_CONTRACTID);
+
+    if (geoTestProvider) {
+      mProvider = std::move(geoTestProvider);
+    }
+  }
+
+  return NS_OK;
+}
+
+nsGeolocationService::~nsGeolocationService() = default;
+
+NS_IMETHODIMP
+nsGeolocationService::Observe(nsISupports* aSubject, const char* aTopic,
+                              const char16_t* aData) {
+  if (!strcmp("xpcom-shutdown", aTopic)) {
+    nsCOMPtr<nsIObserverService> obs = services::GetObserverService();
+    if (obs) {
+      obs->RemoveObserver(this, "xpcom-shutdown");
+    }
+
+    for (uint32_t i = 0; i < mGeolocators.Length(); i++) {
+      mGeolocators[i]->Shutdown();
+    }
+    StopDevice();
+
+    return NS_OK;
+  }
+
+  if (!strcmp("timer-callback", aTopic)) {
+    for (uint32_t i = 0; i < mGeolocators.Length(); i++)
+      if (mGeolocators[i]->HasActiveCallbacks()) {
+        SetDisconnectTimer();
+        return NS_OK;
+      }
+
+    StopDevice();
+    Update(nullptr);
+    return NS_OK;
+  }
+
+  return NS_ERROR_FAILURE;
+}
+
+NS_IMETHODIMP
+nsGeolocationService::Update(nsIDOMGeoPosition* aSomewhere) {
+  if (aSomewhere) {
+    mStarting.reset();
+    SetCachedPosition(aSomewhere);
+  }
+
+  for (uint32_t i = 0; i < mGeolocators.Length(); i++) {
+    mGeolocators[i]->Update(aSomewhere);
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsGeolocationService::NotifyError(uint16_t aErrorCode) {
+  MOZ_LOG(
+      gGeolocationLog, LogLevel::Debug,
+      ("nsGeolocationService::NotifyError with error code: %u", aErrorCode));
+  nsTArray<RefPtr<Geolocation>> geolocators;
+  geolocators.AppendElements(mGeolocators);
+  for (uint32_t i = 0; i < geolocators.Length(); i++) {
+    MOZ_KnownLive(geolocators[i])->NotifyError(aErrorCode);
+  }
+  return NS_OK;
+}
+
+void nsGeolocationService::SetCachedPosition(nsIDOMGeoPosition* aPosition) {
+  mLastPosition.position = aPosition;
+  mLastPosition.isHighAccuracy = mHigherAccuracy;
+}
+
+CachedPositionAndAccuracy nsGeolocationService::GetCachedPosition() {
+  return mLastPosition;
+}
+
+nsresult nsGeolocationService::StartDevice() {
+  if (!StaticPrefs::geo_enabled()) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  SetDisconnectTimer();
+
+  if (XRE_IsContentProcess()) {
+    bool highAccuracyRequested = HighAccuracyRequested();
+    if (mStarting.isSome() && *mStarting == highAccuracyRequested) {
+      return NS_OK;
+    }
+    mStarting = Some(highAccuracyRequested);
+    ContentChild* cpc = ContentChild::GetSingleton();
+    if (!cpc->SendAddGeolocationListener(highAccuracyRequested)) {
+      return NS_ERROR_NOT_AVAILABLE;
+    }
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIObserverService> obs = services::GetObserverService();
+  if (!obs) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (!mProvider) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsresult rv;
+
+  if (NS_FAILED(rv = mProvider->Startup()) ||
+      NS_FAILED(rv = mProvider->Watch(this))) {
+    NotifyError(GeolocationPositionError_Binding::POSITION_UNAVAILABLE);
+    return rv;
+  }
+
+  obs->NotifyObservers(mProvider, "geolocation-device-events", u"starting");
+
+  return NS_OK;
+}
+
+void nsGeolocationService::SetDisconnectTimer() {
+  if (!mDisconnectTimer) {
+    mDisconnectTimer = NS_NewTimer();
+  } else {
+    mDisconnectTimer->Cancel();
+  }
+
+  mDisconnectTimer->Init(this, StaticPrefs::geo_timeout(),
+                         nsITimer::TYPE_ONE_SHOT);
+}
+
+bool nsGeolocationService::HighAccuracyRequested() {
+  for (uint32_t i = 0; i < mGeolocators.Length(); i++) {
+    if (mGeolocators[i]->HighAccuracyRequested()) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+void nsGeolocationService::UpdateAccuracy(bool aForceHigh) {
+  bool highRequired = aForceHigh || HighAccuracyRequested();
+
+  if (XRE_IsContentProcess()) {
+    ContentChild* cpc = ContentChild::GetSingleton();
+    if (cpc->IsAlive()) {
+      cpc->SendSetGeolocationHigherAccuracy(highRequired);
+    }
+
+    return;
+  }
+
+  mProvider->SetHighAccuracy(!mHigherAccuracy && highRequired);
+  mHigherAccuracy = highRequired;
+}
+
+void nsGeolocationService::StopDevice() {
+  if (mDisconnectTimer) {
+    mDisconnectTimer->Cancel();
+    mDisconnectTimer = nullptr;
+  }
+
+  if (XRE_IsContentProcess()) {
+    mStarting.reset();
+    ContentChild* cpc = ContentChild::GetSingleton();
+    cpc->SendRemoveGeolocationListener();
+
+    return;  
+  }
+
+  nsCOMPtr<nsIObserverService> obs = services::GetObserverService();
+  if (!obs) {
+    return;
+  }
+
+  if (!mProvider) {
+    return;
+  }
+
+  mHigherAccuracy = false;
+
+  mProvider->Shutdown();
+  obs->NotifyObservers(mProvider, "geolocation-device-events", u"shutdown");
+}
+
+StaticRefPtr<nsGeolocationService> nsGeolocationService::sService;
+
+already_AddRefed<nsGeolocationService>
+nsGeolocationService::GetGeolocationService(
+    mozilla::dom::BrowsingContext* aBrowsingContext) {
+  RefPtr<nsGeolocationService> result;
+  if (aBrowsingContext) {
+    result = aBrowsingContext->GetGeolocationServiceOverride();
+
+    if (result) {
+      return result.forget();
+    }
+  }
+  if (nsGeolocationService::sService) {
+    result = nsGeolocationService::sService;
+
+    return result.forget();
+  }
+
+  result = new nsGeolocationService();
+  if (NS_FAILED(result->Init())) {
+    return nullptr;
+  }
+
+  ClearOnShutdown(&nsGeolocationService::sService);
+  nsGeolocationService::sService = result;
+  return result.forget();
+}
+
+void nsGeolocationService::AddLocator(Geolocation* aLocator) {
+  mGeolocators.AppendElement(aLocator);
+}
+
+void nsGeolocationService::RemoveLocator(Geolocation* aLocator) {
+  mGeolocators.RemoveElement(aLocator);
+}
+
+void nsGeolocationService::MoveLocators(nsGeolocationService* aService) {
+  for (Geolocation* loc : mGeolocators) {
+    aService->AddLocator(loc);
+    loc->SetService(aService);
+  }
+
+  mGeolocators.Clear();
+}
+
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(Geolocation)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+  NS_INTERFACE_MAP_ENTRY(nsIGeolocationUpdate)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(Geolocation)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(Geolocation)
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(Geolocation)
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(Geolocation)
+  tmp->Shutdown();
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mPendingCallbacks, mWatchingCallbacks,
+                                  mBrowsingContext, mPendingRequests)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_PRESERVED_WRAPPER
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_WEAK_PTR
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(Geolocation)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mPendingCallbacks, mWatchingCallbacks,
+                                    mBrowsingContext, mPendingRequests)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+Geolocation::Geolocation()
+    : mProtocolType(ProtocolType::OTHER), mLastWatchId(1) {}
+
+Geolocation::~Geolocation() {
+  if (mService) {
+    Shutdown();
+  }
+}
+
+StaticRefPtr<Geolocation> Geolocation::sNonWindowSingleton;
+
+already_AddRefed<Geolocation> Geolocation::NonWindowSingleton() {
+  if (sNonWindowSingleton) {
+    return do_AddRef(sNonWindowSingleton);
+  }
+
+  RefPtr<Geolocation> result = new Geolocation();
+  DebugOnly<nsresult> rv = result->Init();
+  MOZ_ASSERT(NS_SUCCEEDED(rv), "How can this fail?");
+
+  ClearOnShutdown(&sNonWindowSingleton);
+  sNonWindowSingleton = result;
+  return result.forget();
+}
+
+nsresult Geolocation::Init(nsPIDOMWindowInner* aContentDom) {
+  nsCOMPtr<Document> doc = aContentDom ? aContentDom->GetExtantDoc() : nullptr;
+
+  if (aContentDom) {
+    mOwner = do_GetWeakReference(aContentDom);
+    if (!mOwner) {
+      return NS_ERROR_FAILURE;
+    }
+
+    if (!doc) {
+      return NS_ERROR_FAILURE;
+    }
+
+    mPrincipal = doc->NodePrincipal();
+    if (mPrincipal->SchemeIs("http")) {
+      mProtocolType = ProtocolType::HTTP;
+    } else if (mPrincipal->SchemeIs("https")) {
+      mProtocolType = ProtocolType::HTTPS;
+    }
+  }
+
+  mBrowsingContext =
+      doc ? RefPtr<BrowsingContext>(doc->GetBrowsingContext()) : nullptr;
+
+  mService = nsGeolocationService::GetGeolocationService(mBrowsingContext);
+
+  if (mService) {
+    mService->AddLocator(this);
+  }
+
+  return NS_OK;
+}
+
+void Geolocation::Shutdown() {
+  mPendingCallbacks.Clear();
+  mWatchingCallbacks.Clear();
+
+  if (mService) {
+    mService->RemoveLocator(this);
+    mService->UpdateAccuracy();
+  }
+
+  mService = nullptr;
+  mPrincipal = nullptr;
+}
+
+nsPIDOMWindowInner* Geolocation::GetParentObject() const {
+  nsCOMPtr<nsPIDOMWindowInner> window = do_QueryReferent(mOwner);
+  return window.get();
+}
+
+bool Geolocation::HasActiveCallbacks() {
+  return mPendingCallbacks.Length() || mWatchingCallbacks.Length();
+}
+
+bool Geolocation::HighAccuracyRequested() {
+  for (uint32_t i = 0; i < mWatchingCallbacks.Length(); i++) {
+    if (mWatchingCallbacks[i]->WantsHighAccuracy()) {
+      return true;
+    }
+  }
+
+  for (uint32_t i = 0; i < mPendingCallbacks.Length(); i++) {
+    if (mPendingCallbacks[i]->WantsHighAccuracy()) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+void Geolocation::RemoveRequest(nsGeolocationRequest* aRequest) {
+  bool requestWasKnown = (mPendingCallbacks.RemoveElement(aRequest) !=
+                          mWatchingCallbacks.RemoveElement(aRequest));
+
+  (void)requestWasKnown;
+}
+
+NS_IMETHODIMP
+Geolocation::Update(nsIDOMGeoPosition* aSomewhere) {
+  if (!WindowOwnerStillExists()) {
+    Shutdown();
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsPIDOMWindowInner> window = do_QueryReferent(this->GetOwner());
+  if (window) {
+    nsCOMPtr<Document> document = window->GetDoc();
+    bool isHidden = document && document->Hidden();
+    if (isHidden || !window->IsFullyActive()) {
+      return NS_OK;
+    }
+  }
+
+  for (uint32_t i = mPendingCallbacks.Length(); i > 0; i--) {
+    mPendingCallbacks[i - 1]->Update(aSomewhere);
+    RemoveRequest(mPendingCallbacks[i - 1]);
+  }
+
+  for (uint32_t i = 0; i < mWatchingCallbacks.Length(); i++) {
+    mWatchingCallbacks[i]->Update(aSomewhere);
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+Geolocation::NotifyError(uint16_t aErrorCode) {
+  MOZ_LOG(gGeolocationLog, LogLevel::Debug,
+          ("Geolocation::NotifyError with error code: %u", aErrorCode));
+  if (!WindowOwnerStillExists()) {
+    Shutdown();
+    return NS_OK;
+  }
+
+  for (uint32_t i = mPendingCallbacks.Length(); i > 0; i--) {
+    RefPtr<nsGeolocationRequest> request = mPendingCallbacks[i - 1];
+    request->NotifyErrorAndShutdown(aErrorCode);
+  }
+
+  for (uint32_t i = 0; i < mWatchingCallbacks.Length(); i++) {
+    RefPtr<nsGeolocationRequest> request = mWatchingCallbacks[i];
+    request->NotifyErrorAndShutdown(aErrorCode);
+  }
+
+  return NS_OK;
+}
+
+bool Geolocation::IsFullyActiveOrChrome() {
+  if (nsPIDOMWindowInner* window = this->GetParentObject()) {
+    return window->IsFullyActive();
+  }
+  return true;
+}
+
+bool Geolocation::IsAlreadyCleared(nsGeolocationRequest* aRequest) {
+  for (uint32_t i = 0, length = mClearedWatchIDs.Length(); i < length; ++i) {
+    if (mClearedWatchIDs[i] == aRequest->WatchId()) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool Geolocation::ShouldBlockInsecureRequests() const {
+  if (Preferences::GetBool(PREF_GEO_SECURITY_ALLOWINSECURE, false)) {
+    return false;
+  }
+
+  nsCOMPtr<nsPIDOMWindowInner> win = do_QueryReferent(mOwner);
+  if (!win) {
+    return false;
+  }
+
+  nsCOMPtr<Document> doc = win->GetDoc();
+  if (!doc) {
+    return false;
+  }
+
+  if (!nsGlobalWindowInner::Cast(win)->IsSecureContext()) {
+    nsContentUtils::ReportToConsole(nsIScriptError::errorFlag, "DOM"_ns, doc,
+                                    PropertiesFile::DOM_PROPERTIES,
+                                    "GeolocationInsecureRequestIsForbidden");
+    return true;
+  }
+
+  return false;
+}
+
+bool Geolocation::ClearPendingRequest(nsGeolocationRequest* aRequest) {
+  if (aRequest->IsWatch() && this->IsAlreadyCleared(aRequest)) {
+    this->NotifyAllowedRequest(aRequest);
+    this->ClearWatch(aRequest->WatchId());
+    return true;
+  }
+
+  return false;
+}
+
+void Geolocation::GetCurrentPosition(PositionCallback& aCallback,
+                                     PositionErrorCallback* aErrorCallback,
+                                     const PositionOptions& aOptions,
+                                     CallerType aCallerType, ErrorResult& aRv) {
+  nsresult rv = GetCurrentPosition(
+      GeoPositionCallback(&aCallback), GeoPositionErrorCallback(aErrorCallback),
+      CreatePositionOptionsCopy(aOptions), aCallerType);
+
+  if (NS_FAILED(rv)) {
+    aRv.Throw(rv);
+  }
+}
+
+nsresult Geolocation::GetCurrentPosition(GeoPositionCallback callback,
+                                         GeoPositionErrorCallback errorCallback,
+                                         UniquePtr<PositionOptions>&& options,
+                                         CallerType aCallerType) {
+  if (!IsFullyActiveOrChrome()) {
+    RefPtr<GeolocationPositionError> positionError =
+        new GeolocationPositionError(
+            this, GeolocationPositionError_Binding::POSITION_UNAVAILABLE);
+    positionError->NotifyCallback(errorCallback);
+    return NS_OK;
+  }
+
+  if (mPendingCallbacks.Length() > MAX_GEO_REQUESTS_PER_WINDOW) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+
+  nsIEventTarget* target = GetMainThreadSerialEventTarget();
+  RefPtr<nsGeolocationRequest> request = new nsGeolocationRequest(
+      this, std::move(callback), std::move(errorCallback), std::move(options),
+      target);
+
+  if (!StaticPrefs::geo_enabled() || ShouldBlockInsecureRequests() ||
+      !request->CheckPermissionDelegate()) {
+    request->RequestDelayedTask(target,
+                                nsGeolocationRequest::DelayedTaskType::Deny);
+    return NS_OK;
+  }
+
+  if (!mOwner && aCallerType != CallerType::System) {
+    return NS_ERROR_FAILURE;
+  }
+
+  if (mOwner) {
+    RequestIfPermitted(request);
+    return NS_OK;
+  }
+
+  if (aCallerType != CallerType::System) {
+    return NS_ERROR_FAILURE;
+  }
+
+  request->RequestDelayedTask(target,
+                              nsGeolocationRequest::DelayedTaskType::Allow);
+
+  return NS_OK;
+}
+
+int32_t Geolocation::WatchPosition(PositionCallback& aCallback,
+                                   PositionErrorCallback* aErrorCallback,
+                                   const PositionOptions& aOptions,
+                                   CallerType aCallerType, ErrorResult& aRv) {
+  return WatchPosition(GeoPositionCallback(&aCallback),
+                       GeoPositionErrorCallback(aErrorCallback),
+                       CreatePositionOptionsCopy(aOptions), aCallerType, aRv);
+}
+
+int32_t Geolocation::WatchPosition(
+    nsIDOMGeoPositionCallback* aCallback,
+    nsIDOMGeoPositionErrorCallback* aErrorCallback,
+    UniquePtr<PositionOptions>&& aOptions) {
+  MOZ_ASSERT(aCallback);
+
+  return WatchPosition(GeoPositionCallback(aCallback),
+                       GeoPositionErrorCallback(aErrorCallback),
+                       std::move(aOptions), CallerType::System, IgnoreErrors());
+}
+
+int32_t Geolocation::WatchPosition(GeoPositionCallback aCallback,
+                                   GeoPositionErrorCallback aErrorCallback,
+                                   UniquePtr<PositionOptions>&& aOptions,
+                                   CallerType aCallerType, ErrorResult& aRv) {
+  if (!IsFullyActiveOrChrome()) {
+    RefPtr<GeolocationPositionError> positionError =
+        new GeolocationPositionError(
+            this, GeolocationPositionError_Binding::POSITION_UNAVAILABLE);
+    positionError->NotifyCallback(aErrorCallback);
+    return 0;
+  }
+
+  if (mWatchingCallbacks.Length() > MAX_GEO_REQUESTS_PER_WINDOW) {
+    aRv.Throw(NS_ERROR_NOT_AVAILABLE);
+    return 0;
+  }
+
+  int32_t watchId = mLastWatchId++;
+
+  nsIEventTarget* target = GetMainThreadSerialEventTarget();
+  RefPtr<nsGeolocationRequest> request = new nsGeolocationRequest(
+      this, std::move(aCallback), std::move(aErrorCallback),
+      std::move(aOptions), target, true, watchId);
+
+  if (!StaticPrefs::geo_enabled() || ShouldBlockInsecureRequests() ||
+      !request->CheckPermissionDelegate()) {
+    request->RequestDelayedTask(target,
+                                nsGeolocationRequest::DelayedTaskType::Deny);
+    return watchId;
+  }
+
+  if (!mOwner && aCallerType != CallerType::System) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return 0;
+  }
+
+  if (mOwner) {
+    RequestIfPermitted(request);
+    return watchId;
+  }
+
+  if (aCallerType != CallerType::System) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return 0;
+  }
+
+  request->Allow(JS::UndefinedHandleValue);
+  return watchId;
+}
+
+void Geolocation::ClearWatch(int32_t aWatchId) {
+  if (aWatchId < 1) {
+    return;
+  }
+
+  if (!mClearedWatchIDs.Contains(aWatchId)) {
+    mClearedWatchIDs.AppendElement(aWatchId);
+  }
+
+  for (uint32_t i = 0, length = mWatchingCallbacks.Length(); i < length; ++i) {
+    if (mWatchingCallbacks[i]->WatchId() == aWatchId) {
+      mWatchingCallbacks[i]->Shutdown();
+      RemoveRequest(mWatchingCallbacks[i]);
+      mClearedWatchIDs.RemoveElement(aWatchId);
+      break;
+    }
+  }
+
+  for (uint32_t i = 0, length = mPendingRequests.Length(); i < length; ++i) {
+    if (mPendingRequests[i]->IsWatch() &&
+        (mPendingRequests[i]->WatchId() == aWatchId)) {
+      mPendingRequests[i]->Shutdown();
+      mPendingRequests.RemoveElementAt(i);
+      break;
+    }
+  }
+}
+
+bool Geolocation::WindowOwnerStillExists() {
+  if (mOwner == nullptr) {
+    return true;
+  }
+
+  nsCOMPtr<nsPIDOMWindowInner> window = do_QueryReferent(mOwner);
+
+  if (window) {
+    nsPIDOMWindowOuter* outer = window->GetOuterWindow();
+    if (!outer || outer->GetCurrentInnerWindow() != window || outer->Closed()) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+void Geolocation::NotifyAllowedRequest(nsGeolocationRequest* aRequest) {
+  if (aRequest->IsWatch()) {
+    mWatchingCallbacks.AppendElement(aRequest);
+  } else {
+    mPendingCallbacks.AppendElement(aRequest);
+  }
+}
+
+ bool Geolocation::RegisterRequestWithPrompt(
+    nsGeolocationRequest* request) {
+  nsIEventTarget* target = GetMainThreadSerialEventTarget();
+  ContentPermissionRequestBase::PromptResult pr = request->CheckPromptPrefs();
+  if (pr == ContentPermissionRequestBase::PromptResult::Granted) {
+    request->RequestDelayedTask(target,
+                                nsGeolocationRequest::DelayedTaskType::Allow);
+    return true;
+  }
+  if (pr == ContentPermissionRequestBase::PromptResult::Denied) {
+    request->RequestDelayedTask(target,
+                                nsGeolocationRequest::DelayedTaskType::Deny);
+    return true;
+  }
+
+  request->RequestDelayedTask(target,
+                              nsGeolocationRequest::DelayedTaskType::Request);
+  return true;
+}
+
+ geolocation::SystemGeolocationPermissionBehavior
+Geolocation::GetLocationOSPermission() {
+  auto permission = geolocation::GetGeolocationPermissionBehavior();
+
+  if (!StaticPrefs::geo_prompt_open_system_prefs() &&
+      permission == geolocation::SystemGeolocationPermissionBehavior::
+                        GeckoWillPromptUser) {
+    return geolocation::SystemGeolocationPermissionBehavior::NoPrompt;
+  }
+  return permission;
+}
+
+void Geolocation::RequestIfPermitted(nsGeolocationRequest* request) {
+  auto getPermission = [request = RefPtr{request}](auto aPermission) {
+    switch (aPermission) {
+      case geolocation::SystemGeolocationPermissionBehavior::
+          SystemWillPromptUser:
+      case geolocation::SystemGeolocationPermissionBehavior::
+          GeckoWillPromptUser:
+        request->SetPromptBehavior(aPermission);
+        break;
+      case geolocation::SystemGeolocationPermissionBehavior::NoPrompt:
+        break;
+      default:
+        MOZ_ASSERT_UNREACHABLE(
+            "unexpected GeolocationPermissionBehavior value");
+        break;
+    }
+    RegisterRequestWithPrompt(request);
+  };
+
+  if (auto* contentChild = ContentChild::GetSingleton()) {
+    contentChild->SendGetSystemGeolocationPermissionBehavior(
+        std::move(getPermission),
+        [request =
+             RefPtr{request}](mozilla::ipc::ResponseRejectReason aReason) {
+          NS_WARNING("Error sending GetSystemGeolocationPermissionBehavior");
+          RegisterRequestWithPrompt(request);
+        });
+  } else {
+    MOZ_ASSERT(XRE_IsParentProcess());
+    getPermission(GetLocationOSPermission());
+  }
+}
+
+JSObject* Geolocation::WrapObject(JSContext* aCtx,
+                                  JS::Handle<JSObject*> aGivenProto) {
+  return Geolocation_Binding::Wrap(aCtx, this, aGivenProto);
+}

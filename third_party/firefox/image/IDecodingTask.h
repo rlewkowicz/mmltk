@@ -1,0 +1,85 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_image_IDecodingTask_h
+#define mozilla_image_IDecodingTask_h
+
+#include "SourceBuffer.h"
+#include "imgFrame.h"
+#include "mozilla/NotNull.h"
+#include "mozilla/RefPtr.h"
+#include "nsIEventTarget.h"
+
+namespace mozilla {
+namespace image {
+
+class Decoder;
+class RasterImage;
+
+enum class TaskPriority : uint8_t { eLow, eHigh };
+
+class IDecodingTask : public IResumable {
+ public:
+  virtual void Run() = 0;
+
+  virtual bool ShouldPreferSyncRun() const = 0;
+
+  virtual TaskPriority Priority() const = 0;
+
+  void Resume() override;
+
+ protected:
+  virtual ~IDecodingTask() = default;
+
+  void NotifyProgress(NotNull<RasterImage*> aImage, NotNull<Decoder*> aDecoder);
+
+  void NotifyDecodeComplete(NotNull<RasterImage*> aImage,
+                            NotNull<Decoder*> aDecoder);
+};
+
+class MetadataDecodingTask final : public IDecodingTask {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(MetadataDecodingTask, override)
+
+  explicit MetadataDecodingTask(NotNull<Decoder*> aDecoder);
+
+  void Run() override;
+
+  bool ShouldPreferSyncRun() const override { return true; }
+
+  TaskPriority Priority() const override { return TaskPriority::eHigh; }
+
+ private:
+  virtual ~MetadataDecodingTask() = default;
+
+  Mutex mMutex MOZ_UNANNOTATED;
+
+  NotNull<RefPtr<Decoder>> mDecoder;
+};
+
+class AnonymousDecodingTask : public IDecodingTask {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(AnonymousDecodingTask, override)
+
+  explicit AnonymousDecodingTask(NotNull<Decoder*> aDecoder, bool aResumable);
+
+  void Run() override;
+
+  bool ShouldPreferSyncRun() const override { return true; }
+  TaskPriority Priority() const override { return TaskPriority::eLow; }
+
+  void Resume() override;
+
+ protected:
+  virtual ~AnonymousDecodingTask() = default;
+
+  NotNull<RefPtr<Decoder>> mDecoder;
+  bool mResumable;
+};
+
+}  
+}  
+
+#endif  // mozilla_image_IDecodingTask_h

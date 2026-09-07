@@ -1,0 +1,427 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "DocumentChannelChild.h"
+
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/PolicyContainer.h"
+#include "mozilla/dom/RemoteType.h"
+#include "mozilla/ipc/Endpoint.h"
+#include "mozilla/net/HttpBaseChannel.h"
+#include "mozilla/net/NeckoChild.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/StaticPrefs_fission.h"
+#include "nsHashPropertyBag.h"
+#include "nsIHttpChannelInternal.h"
+#include "nsIObjectLoadingContent.h"
+#include "nsIXULRuntime.h"
+#include "nsIWritablePropertyBag.h"
+#include "nsFrameLoader.h"
+#include "nsFrameLoaderOwner.h"
+#include "nsQueryObject.h"
+#include "nsDocShellLoadState.h"
+
+using namespace mozilla::dom;
+using namespace mozilla::ipc;
+
+extern mozilla::LazyLogModule gDocumentChannelLog;
+#define LOG(fmt) MOZ_LOG(gDocumentChannelLog, mozilla::LogLevel::Verbose, fmt)
+
+namespace mozilla {
+namespace net {
+
+
+NS_INTERFACE_MAP_BEGIN(DocumentChannelChild)
+  NS_INTERFACE_MAP_ENTRY(nsIAsyncVerifyRedirectCallback)
+NS_INTERFACE_MAP_END_INHERITING(DocumentChannel)
+
+NS_IMPL_ADDREF_INHERITED(DocumentChannelChild, DocumentChannel)
+NS_IMPL_RELEASE_INHERITED(DocumentChannelChild, DocumentChannel)
+
+DocumentChannelChild::DocumentChannelChild(nsDocShellLoadState* aLoadState,
+                                           net::LoadInfo* aLoadInfo,
+                                           nsLoadFlags aLoadFlags,
+                                           uint32_t aCacheKey,
+                                           bool aUriModified,
+                                           bool aIsEmbeddingBlockedError)
+    : DocumentChannel(aLoadState, aLoadInfo, aLoadFlags, aCacheKey,
+                      aUriModified, aIsEmbeddingBlockedError) {
+  mLoadingContext = nullptr;
+  LOG(("DocumentChannelChild ctor [this=%p, uri=%s]", this,
+       aLoadState->URI()->GetSpecOrDefault().get()));
+}
+
+DocumentChannelChild::~DocumentChannelChild() {
+  LOG(("DocumentChannelChild dtor [this=%p]", this));
+}
+
+NS_IMETHODIMP
+DocumentChannelChild::AsyncOpen(nsIStreamListener* aListener) {
+  nsresult rv = NS_OK;
+
+  nsCOMPtr<nsIStreamListener> listener = aListener;
+
+  NS_ENSURE_TRUE(gNeckoChild, NS_ERROR_FAILURE);
+  NS_ENSURE_ARG_POINTER(listener);
+  NS_ENSURE_TRUE(!mIsPending, NS_ERROR_IN_PROGRESS);
+  NS_ENSURE_TRUE(!mWasOpened, NS_ERROR_ALREADY_OPENED);
+
+  rv = NS_CheckPortSafety(mURI);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  bool isNotDownload = mLoadState->FileName().IsVoid();
+
+  if (isNotDownload && mLoadGroup) {
+    mLoadGroup->AddRequest(this, nullptr);
+  }
+
+  if (mCanceled) {
+    return mStatus;
+  }
+
+  gHttpHandler->OnOpeningDocumentRequest(this);
+
+  RefPtr<nsDocShell> docShell = GetDocShell();
+  if (!docShell) {
+    return NS_ERROR_FAILURE;
+  }
+
+  RefPtr<BrowsingContext> loadingContext = docShell->GetBrowsingContext();
+  if (!loadingContext || loadingContext->IsDiscarded()) {
+    return NS_ERROR_FAILURE;
+  }
+  mLoadingContext = loadingContext;
+
+  Maybe<IPCClientInfo> ipcClientInfo;
+  if (mInitialClientInfo.isSome()) {
+    ipcClientInfo.emplace(mInitialClientInfo.ref().ToIPC());
+  }
+
+  DocumentChannelElementCreationArgs ipcElementCreationArgs;
+  switch (mLoadInfo->GetExternalContentPolicyType()) {
+    case ExtContentPolicy::TYPE_DOCUMENT:
+    case ExtContentPolicy::TYPE_SUBDOCUMENT: {
+      DocumentCreationArgs docArgs;
+      docArgs.loadFlags() = mLoadFlags;
+      docArgs.uriModified() = mUriModified;
+      docArgs.isEmbeddingBlockedError() = mIsEmbeddingBlockedError;
+
+      ipcElementCreationArgs = docArgs;
+      break;
+    }
+
+    case ExtContentPolicy::TYPE_OBJECT: {
+      ObjectCreationArgs objectArgs;
+      objectArgs.embedderInnerWindowId() = InnerWindowIDForExtantDoc(docShell);
+      objectArgs.loadFlags() = mLoadFlags;
+      objectArgs.contentPolicyType() = mLoadInfo->InternalContentPolicyType();
+      objectArgs.isUrgentStart() = UserActivation::IsHandlingUserInput();
+
+      ipcElementCreationArgs = objectArgs;
+      break;
+    }
+
+    default:
+      MOZ_ASSERT_UNREACHABLE("unsupported content policy type");
+      return NS_ERROR_FAILURE;
+  }
+
+  switch (mLoadInfo->GetExternalContentPolicyType()) {
+    case ExtContentPolicy::TYPE_DOCUMENT:
+    case ExtContentPolicy::TYPE_SUBDOCUMENT:
+      MOZ_ALWAYS_SUCCEEDS(loadingContext->SetCurrentLoadIdentifier(
+          Some(mLoadState->GetLoadIdentifier())));
+      break;
+
+    default:
+      break;
+  }
+
+  mLoadState->AssertProcessCouldTriggerLoadIfSystem();
+
+  DocumentChannelCreationArgs args(
+      mozilla::WrapNotNull(mLoadState), TimeStamp::Now(), mChannelId, mCacheKey,
+      mTiming, ipcClientInfo, ipcElementCreationArgs,
+      loadingContext->GetParentInitiatedNavigationEpoch());
+
+  gNeckoChild->SendPDocumentChannelConstructor(this, loadingContext, args);
+
+  mIsPending = true;
+  mWasOpened = true;
+  mListener = std::move(listener);
+
+  return NS_OK;
+}
+
+IPCResult DocumentChannelChild::RecvFailedAsyncOpen(
+    const nsresult& aStatusCode) {
+  if (aStatusCode == NS_ERROR_RECURSIVE_DOCUMENT_LOAD) {
+    MOZ_DIAGNOSTIC_ASSERT(mLoadingContext);
+    if (RefPtr<Element> embedder = mLoadingContext->GetEmbedderElement()) {
+      if (RefPtr<nsFrameLoaderOwner> flo = do_QueryObject(embedder)) {
+        if (RefPtr<nsFrameLoader> fl = flo->GetFrameLoader()) {
+          fl->FireErrorEvent();
+        }
+      }
+    }
+  }
+  ShutdownListeners(aStatusCode);
+  return IPC_OK();
+}
+
+IPCResult DocumentChannelChild::RecvDisconnectChildListeners(
+    const nsresult& aStatus, const nsresult& aLoadGroupStatus,
+    bool aContinueNavigating) {
+  if (!aContinueNavigating) {
+    DisconnectChildListeners(aStatus, aLoadGroupStatus);
+    return IPC_OK();
+  }
+
+  nsDocShell* shell = GetDocShell();
+  if (mLoadInfo->GetExternalContentPolicyType() ==
+          ExtContentPolicy::TYPE_DOCUMENT &&
+      shell) {
+    MOZ_ASSERT(shell->GetBrowsingContext()->IsTop());
+    if (shell->GetBrowsingContext()->IsInBFCache()) {
+      DisconnectChildListeners(aStatus, aLoadGroupStatus);
+    } else {
+      shell->SetChannelToDisconnectOnPageHide(mChannelId);
+    }
+  }
+
+  return IPC_OK();
+}
+
+IPCResult DocumentChannelChild::RecvRedirectToRealChannel(
+    RedirectToRealChannelArgs&& aArgs,
+    RedirectToRealChannelResolver&& aResolve) {
+  LOG(("DocumentChannelChild RecvRedirectToRealChannel [this=%p, uri=%s]", this,
+       aArgs.uri()->GetSpecOrDefault().get()));
+
+  RefPtr<dom::Document> cspToInheritLoadingDocument;
+  nsCOMPtr<nsIContentSecurityPolicy> csp =
+      PolicyContainer::GetCSP(mLoadState->PolicyContainer());
+  if (csp) {
+    nsWeakPtr ctx = nsCSPContext::Cast(csp.get())->GetLoadingContext();
+    cspToInheritLoadingDocument = do_QueryReferent(ctx);
+  }
+  nsCOMPtr<nsILoadInfo> loadInfo;
+  MOZ_ALWAYS_SUCCEEDS(LoadInfoArgsToLoadInfo(aArgs.loadInfo(), NOT_REMOTE_TYPE,
+                                             cspToInheritLoadingDocument,
+                                             getter_AddRefs(loadInfo)));
+
+  mRedirectResolver = std::move(aResolve);
+
+  nsCOMPtr<nsIChannel> newChannel;
+  MOZ_ASSERT((aArgs.loadStateInternalLoadFlags() &
+              nsDocShell::InternalLoad::INTERNAL_LOAD_FLAGS_IS_SRCDOC) ||
+             aArgs.srcdocData().IsVoid());
+  nsresult rv = nsDocShell::CreateRealChannelForDocument(
+      getter_AddRefs(newChannel), aArgs.uri(), loadInfo, nullptr,
+      aArgs.newLoadFlags(), aArgs.srcdocData(), aArgs.baseUri());
+  if (newChannel) {
+    newChannel->SetLoadGroup(mLoadGroup);
+  }
+
+  if (RefPtr<HttpBaseChannel> httpChannel = do_QueryObject(newChannel)) {
+    httpChannel->SetEarlyHints(std::move(aArgs.earlyHints()));
+    httpChannel->SetEarlyHintLinkType(aArgs.earlyHintLinkType());
+  }
+
+  auto scopeExit = MakeScopeExit([&]() {
+    mRedirectResolver(rv);
+    mRedirectResolver = nullptr;
+  });
+
+  if (NS_FAILED(rv)) {
+    return IPC_OK();
+  }
+
+  if (nsCOMPtr<nsIHttpChannel> httpChannel = do_QueryInterface(newChannel)) {
+    rv = httpChannel->SetChannelId(aArgs.channelId());
+    if (aArgs.referrerInfo()) {
+      rv = httpChannel->SetReferrerInfo(aArgs.referrerInfo());
+    }
+  }
+  if (NS_FAILED(rv)) {
+    return IPC_OK();
+  }
+
+  rv = newChannel->SetOriginalURI(aArgs.originalURI());
+  if (NS_FAILED(rv)) {
+    return IPC_OK();
+  }
+
+  if (nsCOMPtr<nsIHttpChannelInternal> httpChannelInternal =
+          do_QueryInterface(newChannel)) {
+    rv = httpChannelInternal->SetRedirectMode(aArgs.redirectMode());
+  }
+  if (NS_FAILED(rv)) {
+    return IPC_OK();
+  }
+
+  newChannel->SetNotificationCallbacks(mCallbacks);
+
+  if (aArgs.init()) {
+    HttpBaseChannel::ReplacementChannelConfig config(*aArgs.init());
+    HttpBaseChannel::ConfigureReplacementChannel(
+        newChannel, config,
+        HttpBaseChannel::ReplacementReason::DocumentChannel);
+  }
+
+  if (aArgs.contentDisposition()) {
+    newChannel->SetContentDisposition(*aArgs.contentDisposition());
+  }
+
+  if (aArgs.contentDispositionFilename()) {
+    newChannel->SetContentDispositionFilename(
+        *aArgs.contentDispositionFilename());
+  }
+
+  nsDocShell* docShell = GetDocShell();
+  if (docShell && aArgs.loadingSessionHistoryInfo().isSome()) {
+    docShell->SetLoadingSessionHistoryInfo(
+        aArgs.loadingSessionHistoryInfo().ref());
+  }
+
+  if (nsCOMPtr<nsIWritablePropertyBag> bag = do_QueryInterface(newChannel)) {
+    nsHashPropertyBag::CopyFrom(bag, aArgs.properties());
+  }
+
+  if (aArgs.channelHandle()) {
+    rv = newChannel->SetParentProcessChannelHandle(aArgs.channelHandle());
+    if (NS_FAILED(rv)) {
+      return IPC_OK();
+    }
+  }
+
+  nsCOMPtr<nsIChildChannel> childChannel = do_QueryInterface(newChannel);
+  if (childChannel) {
+    rv = childChannel->ConnectParent(
+        aArgs.registrarId());  
+    if (NS_FAILED(rv)) {
+      return IPC_OK();
+    }
+  }
+  mRedirectChannel = newChannel;
+
+  rv = gHttpHandler->AsyncOnChannelRedirect(this, newChannel,
+                                            aArgs.redirectFlags(),
+                                            GetMainThreadSerialEventTarget());
+
+  if (NS_SUCCEEDED(rv)) {
+    scopeExit.release();
+  }
+
+  return IPC_OK();
+}
+
+IPCResult DocumentChannelChild::RecvUpgradeObjectLoad(
+    UpgradeObjectLoadResolver&& aResolve) {
+  MOZ_ASSERT(mLoadFlags & nsIRequest::LOAD_HTML_OBJECT_DATA,
+             "Should have LOAD_HTML_OBJECT_DATA set");
+  MOZ_ASSERT(!(mLoadFlags & nsIChannel::LOAD_DOCUMENT_URI),
+             "Shouldn't be a LOAD_DOCUMENT_URI load yet");
+  MOZ_ASSERT(mLoadInfo->GetExternalContentPolicyType() ==
+                 ExtContentPolicy::TYPE_OBJECT,
+             "Should have the TYPE_OBJECT content policy type");
+
+  if (NS_FAILED(mStatus)) {
+    aResolve(nullptr);
+    return IPC_OK();
+  }
+
+  nsCOMPtr<nsIObjectLoadingContent> loadingContent;
+  NS_QueryNotificationCallbacks(this, loadingContent);
+  if (!loadingContent) {
+    return IPC_FAIL(this, "Channel is not for ObjectLoadingContent!");
+  }
+
+  mLoadFlags |= nsIChannel::LOAD_DOCUMENT_URI;
+
+  RefPtr<BrowsingContext> browsingContext;
+  nsresult rv = loadingContent->UpgradeLoadToDocument(
+      this, getter_AddRefs(browsingContext));
+  if (NS_FAILED(rv) || !browsingContext) {
+    mLoadFlags &= ~nsIChannel::LOAD_DOCUMENT_URI;
+    aResolve(nullptr);
+    return IPC_OK();
+  }
+
+  aResolve(browsingContext);
+  return IPC_OK();
+}
+
+NS_IMETHODIMP
+DocumentChannelChild::OnRedirectVerifyCallback(nsresult aStatusCode) {
+  LOG(
+      ("DocumentChannelChild OnRedirectVerifyCallback [this=%p, "
+       "aRv=0x%08" PRIx32 " ]",
+       this, static_cast<uint32_t>(aStatusCode)));
+  nsCOMPtr<nsIChannel> redirectChannel = std::move(mRedirectChannel);
+  RedirectToRealChannelResolver redirectResolver = std::move(mRedirectResolver);
+
+  if (NS_FAILED(mStatus)) {
+    redirectChannel->SetNotificationCallbacks(nullptr);
+    redirectResolver(aStatusCode);
+    return NS_OK;
+  }
+
+  nsresult rv = aStatusCode;
+  if (NS_SUCCEEDED(rv)) {
+    if (nsCOMPtr<nsIChildChannel> childChannel =
+            do_QueryInterface(redirectChannel)) {
+      rv = childChannel->CompleteRedirectSetup(mListener);
+    } else {
+      rv = redirectChannel->AsyncOpen(mListener);
+    }
+  } else {
+    redirectChannel->SetNotificationCallbacks(nullptr);
+  }
+
+  redirectResolver(rv);
+
+  if (NS_FAILED(rv)) {
+    ShutdownListeners(rv);
+    return NS_OK;
+  }
+
+  if (mLoadGroup) {
+    mLoadGroup->RemoveRequest(this, nullptr, NS_BINDING_REDIRECTED);
+  }
+  mCallbacks = nullptr;
+  mListener = nullptr;
+
+  if (CanSend()) {
+    Send__delete__(this);
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+DocumentChannelChild::Cancel(nsresult aStatusCode) {
+  return CancelWithReason(aStatusCode, "DocumentChannelChild::Cancel"_ns);
+}
+
+NS_IMETHODIMP DocumentChannelChild::CancelWithReason(
+    nsresult aStatusCode, const nsACString& aReason) {
+  if (mCanceled) {
+    return NS_OK;
+  }
+
+  mCanceled = true;
+  if (CanSend()) {
+    SendCancel(aStatusCode, aReason);
+  }
+
+  ShutdownListeners(aStatusCode);
+
+  return NS_OK;
+}
+
+}  
+}  
+
+#undef LOG

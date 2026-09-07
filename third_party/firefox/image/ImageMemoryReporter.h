@@ -1,0 +1,57 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_image_ImageMemoryReporter_h
+#define mozilla_image_ImageMemoryReporter_h
+
+#include <cstdint>
+
+#include "mozilla/layers/SharedSurfacesMemoryReport.h"
+#include "nsString.h"
+
+class nsISupports;
+class nsIHandleReportCallback;
+
+namespace mozilla {
+namespace image {
+struct ImageMemoryCounter;
+struct SurfaceMemoryCounter;
+
+class ImageMemoryReporter final {
+ public:
+  static void InitForWebRender();
+
+  static void ShutdownForWebRender();
+
+  static void ReportSharedSurfaces(
+      nsIHandleReportCallback* aHandleReport, nsISupports* aData,
+      const layers::SharedSurfacesMemoryReport& aSharedSurfaces);
+
+  static void AppendSharedSurfacePrefix(
+      nsACString& aPathPrefix, const SurfaceMemoryCounter& aCounter,
+      layers::SharedSurfacesMemoryReport& aSharedSurfaces);
+
+  static void TrimSharedSurfaces(
+      const ImageMemoryCounter& aCounter,
+      layers::SharedSurfacesMemoryReport& aSharedSurfaces);
+
+ private:
+  static void ReportSharedSurfaces(
+      nsIHandleReportCallback* aHandleReport, nsISupports* aData,
+      bool aIsForCompositor,
+      const layers::SharedSurfacesMemoryReport& aSharedSurfaces);
+
+  static void ReportSharedSurface(
+      nsIHandleReportCallback* aHandleReport, nsISupports* aData,
+      bool aIsForCompositor, uint64_t aExternalId,
+      const layers::SharedSurfacesMemoryReport::SurfaceEntry& aEntry);
+
+  class WebRenderReporter;
+  static WebRenderReporter* sWrReporter;
+};
+
+}  
+}  
+
+#endif  // mozilla_image_ImageMemoryReporter_h

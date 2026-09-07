@@ -1,0 +1,210 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/HTMLSharedElement.h"
+
+#include "mozilla/AsyncEventDispatcher.h"
+#include "mozilla/dom/BindContext.h"
+#include "mozilla/dom/HTMLBaseElementBinding.h"
+#include "mozilla/dom/HTMLDirectoryElementBinding.h"
+#include "mozilla/dom/HTMLHeadElementBinding.h"
+#include "mozilla/dom/HTMLHtmlElementBinding.h"
+#include "mozilla/dom/HTMLParamElementBinding.h"
+#include "mozilla/dom/HTMLQuoteElementBinding.h"
+#include "mozilla/dom/PolicyContainer.h"
+#include "nsContentUtils.h"
+#include "nsIContentSecurityPolicy.h"
+#include "nsIURI.h"
+
+NS_IMPL_NS_NEW_HTML_ELEMENT(Shared)
+
+namespace mozilla::dom {
+
+HTMLSharedElement::~HTMLSharedElement() = default;
+
+NS_IMPL_ELEMENT_CLONE(HTMLSharedElement)
+
+void HTMLSharedElement::GetHref(nsAString& aValue) {
+  MOZ_ASSERT(mNodeInfo->Equals(nsGkAtoms::base),
+             "This should only get called for <base> elements");
+  nsAutoString href;
+  GetAttr(nsGkAtoms::href, href);
+
+  nsCOMPtr<nsIURI> uri;
+  Document* doc = OwnerDoc();
+  nsContentUtils::NewURIWithDocumentCharset(getter_AddRefs(uri), href, doc,
+                                            doc->GetFallbackBaseURI());
+
+  if (!uri) {
+    aValue = std::move(href);
+    return;
+  }
+
+  nsAutoCString spec;
+  uri->GetSpec(spec);
+  CopyUTF8toUTF16(spec, aValue);
+}
+
+void HTMLSharedElement::DoneAddingChildren(bool aHaveNotified) {
+  if (mNodeInfo->Equals(nsGkAtoms::head)) {
+    if (nsCOMPtr<Document> doc = GetUncomposedDoc()) {
+      doc->OnL10nResourceContainerParsed();
+      if (!doc->IsLoadedAsData()) {
+        RefPtr<AsyncEventDispatcher> asyncDispatcher =
+            new AsyncEventDispatcher(this, u"DOMHeadElementParsed"_ns,
+                                     CanBubble::eYes, ChromeOnlyDispatch::eYes);
+        asyncDispatcher->PostDOMEvent();
+      }
+    }
+  }
+}
+
+static void SetBaseURIUsingFirstBaseWithHref(Document* aDocument,
+                                             nsIContent* aMustMatch) {
+  MOZ_ASSERT(aDocument, "Need a document!");
+
+  for (nsIContent* child = aDocument->GetFirstChild(); child;
+       child = child->GetNextNode()) {
+    if (child->IsHTMLElement(nsGkAtoms::base) &&
+        child->AsElement()->HasAttr(nsGkAtoms::href)) {
+      if (aMustMatch && child != aMustMatch) {
+        return;
+      }
+
+      nsAutoString href;
+      child->AsElement()->GetAttr(nsGkAtoms::href, href);
+
+      nsCOMPtr<nsIURI> newBaseURI;
+      nsContentUtils::NewURIWithDocumentCharset(
+          getter_AddRefs(newBaseURI), href, aDocument,
+          aDocument->GetFallbackBaseURI());
+
+
+      if (newBaseURI && (newBaseURI->SchemeIs("data") ||
+                         newBaseURI->SchemeIs("javascript"))) {
+        newBaseURI = nullptr;
+      }
+
+      nsCOMPtr<nsIContentSecurityPolicy> csp =
+          PolicyContainer::GetCSP(aDocument->GetPolicyContainer());
+      if (csp && newBaseURI) {
+        bool cspPermitsBaseURI = true;
+        nsresult rv = csp->Permits(
+            child->AsElement(), nullptr , newBaseURI,
+            nsIContentSecurityPolicy::BASE_URI_DIRECTIVE, true ,
+            true , &cspPermitsBaseURI);
+        if (NS_FAILED(rv) || !cspPermitsBaseURI) {
+          newBaseURI = nullptr;
+        }
+      }
+
+      aDocument->SetBaseURI(newBaseURI);
+      aDocument->SetChromeXHRDocBaseURI(nullptr);
+      return;
+    }
+  }
+
+  aDocument->SetBaseURI(nullptr);
+}
+
+static void SetBaseTargetUsingFirstBaseWithTarget(Document* aDocument,
+                                                  nsIContent* aMustMatch) {
+  MOZ_ASSERT(aDocument, "Need a document!");
+
+  for (nsIContent* child = aDocument->GetFirstChild(); child;
+       child = child->GetNextNode()) {
+    if (child->IsHTMLElement(nsGkAtoms::base) &&
+        child->AsElement()->HasAttr(nsGkAtoms::target)) {
+      if (aMustMatch && child != aMustMatch) {
+        return;
+      }
+
+      nsString target;
+      child->AsElement()->GetAttr(nsGkAtoms::target, target);
+      aDocument->SetBaseTarget(target);
+      return;
+    }
+  }
+
+  aDocument->SetBaseTarget(u""_ns);
+}
+
+void HTMLSharedElement::AfterSetAttr(int32_t aNamespaceID, nsAtom* aName,
+                                     const nsAttrValue* aValue,
+                                     const nsAttrValue* aOldValue,
+                                     nsIPrincipal* aSubjectPrincipal,
+                                     bool aNotify) {
+  if (aNamespaceID == kNameSpaceID_None) {
+    if (aName == nsGkAtoms::href) {
+      if (mNodeInfo->Equals(nsGkAtoms::base) && IsInUncomposedDoc()) {
+        SetBaseURIUsingFirstBaseWithHref(GetUncomposedDoc(),
+                                         aValue ? this : nullptr);
+      }
+    } else if (aName == nsGkAtoms::target) {
+      if (mNodeInfo->Equals(nsGkAtoms::base) && IsInUncomposedDoc()) {
+        SetBaseTargetUsingFirstBaseWithTarget(GetUncomposedDoc(),
+                                              aValue ? this : nullptr);
+      }
+    }
+  }
+
+  return nsGenericHTMLElement::AfterSetAttr(
+      aNamespaceID, aName, aValue, aOldValue, aSubjectPrincipal, aNotify);
+}
+
+nsresult HTMLSharedElement::BindToTree(BindContext& aContext,
+                                       nsINode& aParent) {
+  nsresult rv = nsGenericHTMLElement::BindToTree(aContext, aParent);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (mNodeInfo->Equals(nsGkAtoms::base) && IsInUncomposedDoc()) {
+    if (HasAttr(nsGkAtoms::href)) {
+      SetBaseURIUsingFirstBaseWithHref(&aContext.OwnerDoc(), this);
+    }
+    if (HasAttr(nsGkAtoms::target)) {
+      SetBaseTargetUsingFirstBaseWithTarget(&aContext.OwnerDoc(), this);
+    }
+  }
+
+  return NS_OK;
+}
+
+void HTMLSharedElement::UnbindFromTree(UnbindContext& aContext) {
+  Document* doc = GetUncomposedDoc();
+
+  nsGenericHTMLElement::UnbindFromTree(aContext);
+
+  if (doc && mNodeInfo->Equals(nsGkAtoms::base)) {
+    if (HasAttr(nsGkAtoms::href)) {
+      SetBaseURIUsingFirstBaseWithHref(doc, nullptr);
+    }
+    if (HasAttr(nsGkAtoms::target)) {
+      SetBaseTargetUsingFirstBaseWithTarget(doc, nullptr);
+    }
+  }
+}
+
+JSObject* HTMLSharedElement::WrapNode(JSContext* aCx,
+                                      JS::Handle<JSObject*> aGivenProto) {
+  if (mNodeInfo->Equals(nsGkAtoms::param)) {
+    return HTMLParamElement_Binding::Wrap(aCx, this, aGivenProto);
+  }
+  if (mNodeInfo->Equals(nsGkAtoms::base)) {
+    return HTMLBaseElement_Binding::Wrap(aCx, this, aGivenProto);
+  }
+  if (mNodeInfo->Equals(nsGkAtoms::dir)) {
+    return HTMLDirectoryElement_Binding::Wrap(aCx, this, aGivenProto);
+  }
+  if (mNodeInfo->Equals(nsGkAtoms::q) ||
+      mNodeInfo->Equals(nsGkAtoms::blockquote)) {
+    return HTMLQuoteElement_Binding::Wrap(aCx, this, aGivenProto);
+  }
+  if (mNodeInfo->Equals(nsGkAtoms::head)) {
+    return HTMLHeadElement_Binding::Wrap(aCx, this, aGivenProto);
+  }
+  MOZ_ASSERT(mNodeInfo->Equals(nsGkAtoms::html));
+  return HTMLHtmlElement_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+}  

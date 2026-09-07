@@ -1,0 +1,258 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+"use strict";
+
+{
+  const { AppConstants } = ChromeUtils.importESModule(
+    "resource://gre/modules/AppConstants.sys.mjs"
+  );
+
+  const ITEM_NEEDS_GUTTER_SELECTOR = (() => {
+    if (AppConstants.platform == "macosx") {
+      return "[checked], [selected]";
+    }
+    if (AppConstants.platform == "win") {
+      return "[checked]";
+    }
+    return "[type=checkbox], [type=radio]";
+  })();
+
+  const GUTTER_SELECTOR = `:scope > menuitem:not([hidden]):is(${ITEM_NEEDS_GUTTER_SELECTOR})`;
+
+  document.addEventListener(
+    "popupshowing",
+    function (e) {
+      if (
+        e.target.nodeName == "menupopup" &&
+        e.target.getAttribute("needsgutter") != "always"
+      ) {
+        e.target.toggleAttribute(
+          "needsgutter",
+          !!e.target.querySelector(GUTTER_SELECTOR)
+        );
+      }
+    },
+    { mozSystemGroup: true }
+  );
+
+  class MozMenuPopup extends MozElements.MozElementMixin(XULPopupElement) {
+    constructor() {
+      super();
+
+      this.AUTOSCROLL_INTERVAL = 25;
+      this.NOT_DRAGGING = 0;
+      this.DRAG_OVER_BUTTON = -1;
+      this.DRAG_OVER_POPUP = 1;
+      this._draggingState = this.NOT_DRAGGING;
+      this._scrollTimer = 0;
+
+      this.attachShadow({ mode: "open" });
+
+      this.addEventListener("popupshowing", event => {
+        if (event.target != this) {
+          return;
+        }
+
+        this.ensureInitialized();
+      });
+
+      this.addEventListener("DOMMenuItemActive", this);
+    }
+
+    connectedCallback() {
+      if (this.delayConnectedCallback() || this.hasConnected) {
+        return;
+      }
+
+      this.hasConnected = true;
+      if (this.parentNode?.localName == "menulist") {
+        this._setUpMenulistPopup();
+      }
+    }
+
+    initShadowDOM() {
+      this.scrollBox.addEventListener("scroll", () =>
+        this.dispatchEvent(new Event("scroll"))
+      );
+      this.scrollBox.addEventListener("overflow", () =>
+        this.dispatchEvent(new Event("overflow"))
+      );
+      this.scrollBox.addEventListener("underflow", () =>
+        this.dispatchEvent(new Event("underflow"))
+      );
+    }
+
+    ensureInitialized() {
+      this.shadowRoot;
+    }
+
+    get shadowRoot() {
+      if (!super.shadowRoot.firstChild) {
+        super.shadowRoot.appendChild(this.fragment);
+        this.initShadowDOM();
+      }
+      return super.shadowRoot;
+    }
+
+    get fragment() {
+      if (!this.constructor.hasOwnProperty("_fragment")) {
+        this.constructor._fragment = MozXULElement.parseXULToFragment(
+          this.markup
+        );
+      }
+      return document.importNode(this.constructor._fragment, true);
+    }
+
+    get markup() {
+      return `
+        <html:link rel="stylesheet" href="chrome://global/skin/global.css"/>
+        <html:link rel="stylesheet" href="chrome://global/content/elements/menupopup.css"/>
+        <arrowscrollbox class="menupopup-arrowscrollbox"
+                        part="arrowscrollbox content"
+                        exportparts="scrollbox: arrowscrollbox-scrollbox"
+                        flex="1"
+                        orient="vertical"
+                        smoothscroll="false">
+          <html:slot></html:slot>
+        </arrowscrollbox>
+      `;
+    }
+
+    get scrollBox() {
+      if (!this._scrollBox) {
+        this._scrollBox = this.shadowRoot.querySelector("arrowscrollbox");
+      }
+      return this._scrollBox;
+    }
+
+    _setUpMenulistPopup() {
+      this.ensureInitialized();
+      this.classList.add("in-menulist");
+
+      this.addEventListener("popupshown", () => {
+        this._enableDragScrolling(false);
+      });
+
+      this.addEventListener("popuphidden", () => {
+        this._draggingState = this.NOT_DRAGGING;
+        this._clearScrollTimer();
+        this.releaseCapture();
+        this.scrollBox.scrollbox.scrollTop = 0;
+      });
+
+      this.addEventListener("mousedown", event => {
+        if (event.button != 0) {
+          return;
+        }
+
+        if (
+          this.state == "open" &&
+          (event.target.localName == "menuitem" ||
+            event.target.localName == "menu" ||
+            event.target.localName == "menucaption")
+        ) {
+          this._enableDragScrolling(true);
+        }
+      });
+
+      this.addEventListener("mouseup", event => {
+        if (event.button != 0) {
+          return;
+        }
+
+        this._draggingState = this.NOT_DRAGGING;
+        this._clearScrollTimer();
+      });
+
+      this.addEventListener("mousemove", event => {
+        if (!this._draggingState) {
+          return;
+        }
+
+        this._clearScrollTimer();
+
+        if (!(event.buttons & 1)) {
+          this._draggingState = this.NOT_DRAGGING;
+          this.releaseCapture();
+          return;
+        }
+
+        let popupRect = this.getOuterScreenRect();
+        if (
+          event.screenX >= popupRect.left &&
+          event.screenX <= popupRect.right
+        ) {
+          if (this._draggingState == this.DRAG_OVER_BUTTON) {
+            if (
+              event.screenY > popupRect.top &&
+              event.screenY < popupRect.bottom
+            ) {
+              this._draggingState = this.DRAG_OVER_POPUP;
+            }
+          }
+
+          if (
+            this._draggingState == this.DRAG_OVER_POPUP &&
+            (event.screenY <= popupRect.top ||
+              event.screenY >= popupRect.bottom)
+          ) {
+            let scrollAmount = event.screenY <= popupRect.top ? -1 : 1;
+            this.scrollBox.scrollByIndex(scrollAmount, true);
+
+            let win = this.documentGlobal;
+            this._scrollTimer = win.setInterval(() => {
+              this.scrollBox.scrollByIndex(scrollAmount, true);
+            }, this.AUTOSCROLL_INTERVAL);
+          }
+        }
+      });
+
+      this._menulistPopupIsSetUp = true;
+    }
+
+    _enableDragScrolling(overItem) {
+      if (!this._draggingState) {
+        this.setCaptureAlways();
+        this._draggingState = overItem
+          ? this.DRAG_OVER_POPUP
+          : this.DRAG_OVER_BUTTON;
+      }
+    }
+
+    _clearScrollTimer() {
+      if (this._scrollTimer) {
+        this.documentGlobal.clearInterval(this._scrollTimer);
+        this._scrollTimer = 0;
+      }
+    }
+
+    on_DOMMenuItemActive(event) {
+      if (
+        this.parentNode?.localName == "menulist" ||
+        !this.scrollBox.overflowing
+      ) {
+        return;
+      }
+      let item = event.target;
+      if (item.parentNode != this) {
+        return;
+      }
+      let itemRect = item.getBoundingClientRect();
+      let buttonRect = this.scrollBox._scrollButtonUp.getBoundingClientRect();
+      if (buttonRect.bottom > itemRect.top) {
+        this.scrollBox.scrollByPixels(itemRect.top - buttonRect.bottom, true);
+      } else {
+        buttonRect = this.scrollBox._scrollButtonDown.getBoundingClientRect();
+        if (buttonRect.top < itemRect.bottom) {
+          this.scrollBox.scrollByPixels(itemRect.bottom - buttonRect.top, true);
+        }
+      }
+    }
+  }
+
+  customElements.define("menupopup", MozMenuPopup);
+
+  MozElements.MozMenuPopup = MozMenuPopup;
+}

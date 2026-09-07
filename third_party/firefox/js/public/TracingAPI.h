@@ -1,0 +1,340 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef js_TracingAPI_h
+#define js_TracingAPI_h
+
+#include "js/GCTypeMacros.h"
+#include "js/HeapAPI.h"
+#include "js/TraceKind.h"
+
+class JS_PUBLIC_API JSTracer;
+
+namespace JS {
+class JS_PUBLIC_API CallbackTracer;
+template <typename T>
+class Heap;
+template <typename T>
+class TenuredHeap;
+
+JS_PUBLIC_API const char* GCTraceKindToAscii(JS::TraceKind kind);
+
+JS_PUBLIC_API size_t GCTraceKindSize(JS::TraceKind kind);
+
+enum class TracerKind : uint8_t {
+  Marking,
+  Tenuring,
+  Moving,
+  ClearEdges,
+  Sweeping,
+  MinorSweeping,
+  Barrier,
+
+  Callback,
+
+  UnmarkGray,
+  VerifyTraceProtoAndIface,
+  CompartmentCheck,
+  HeapCheck
+};
+
+enum class WeakMapTraceAction : uint8_t {
+  Skip,
+
+  Expand,
+
+  TraceValues,
+
+  TraceKeysAndValues
+};
+
+enum class WeakEdgeTraceAction : bool { Skip, Trace };
+
+struct TraceOptions {
+  JS::WeakMapTraceAction weakMapAction = WeakMapTraceAction::TraceValues;
+  JS::WeakEdgeTraceAction weakEdgeAction = WeakEdgeTraceAction::Trace;
+
+  TraceOptions() = default;
+  TraceOptions(JS::WeakMapTraceAction weakMapActionArg,
+               JS::WeakEdgeTraceAction weakEdgeActionArg)
+      : weakMapAction(weakMapActionArg), weakEdgeAction(weakEdgeActionArg) {}
+  MOZ_IMPLICIT TraceOptions(JS::WeakMapTraceAction weakMapActionArg)
+      : weakMapAction(weakMapActionArg) {}
+  MOZ_IMPLICIT TraceOptions(JS::WeakEdgeTraceAction weakEdgeActionArg)
+      : weakEdgeAction(weakEdgeActionArg) {}
+};
+
+class AutoTracingIndex;
+
+class TracingContext {
+ public:
+
+  constexpr static size_t InvalidIndex = size_t(-1);
+  size_t index() const { return index_; }
+
+  size_t nesting() const { return nesting_; }
+
+  void getEdgeName(const char* name, char* buffer, size_t bufferSize);
+
+  class Functor {
+   public:
+    virtual void operator()(TracingContext* tcx, const char* name, char* buf,
+                            size_t bufsize) = 0;
+  };
+
+ private:
+  friend class AutoTracingIndex;
+  size_t index_ = InvalidIndex;
+
+  friend class AutoClearTracingContext;
+  size_t nesting_ = 0;
+
+  friend class AutoTracingDetails;
+  Functor* functor_ = nullptr;
+
+  friend class AutoTracingWeakEdge;
+  bool weak_ = false;
+};
+
+}  
+
+class JS_PUBLIC_API JSTracer {
+ public:
+  JSRuntime* runtime() const { return runtime_; }
+
+  JS::TracerKind kind() const { return kind_; }
+  bool isGenericTracer() const { return kind_ < JS::TracerKind::Callback; }
+  bool isCallbackTracer() const { return kind_ >= JS::TracerKind::Callback; }
+  bool isMarkingTracer() const { return kind_ == JS::TracerKind::Marking; }
+  bool isTenuringTracer() const { return kind_ == JS::TracerKind::Tenuring; }
+
+  inline JS::CallbackTracer* asCallbackTracer();
+
+  JS::WeakMapTraceAction weakMapAction() const {
+    return options_.weakMapAction;
+  }
+  bool traceWeakEdges() const {
+    return options_.weakEdgeAction == JS::WeakEdgeTraceAction::Trace;
+  }
+
+  JS::TracingContext& context() { return context_; }
+
+#define DEFINE_ON_EDGE_METHOD(name, type, _1, _2) \
+  virtual bool on##name##Edge(type** thingp, const char* name) = 0;
+  JS_FOR_EACH_TRACEKIND(DEFINE_ON_EDGE_METHOD)
+#undef DEFINE_ON_EDGE_METHOD
+
+ protected:
+  JSTracer(JSRuntime* rt, JS::TracerKind kind,
+           JS::TraceOptions options = JS::TraceOptions())
+      : runtime_(rt), kind_(kind), options_(options) {}
+
+ private:
+  JSRuntime* const runtime_;
+  JS::TracingContext context_;
+  const JS::TracerKind kind_;
+  const JS::TraceOptions options_;
+};
+
+namespace js {
+
+template <typename T>
+class GenericTracerImpl : public JSTracer {
+ public:
+  GenericTracerImpl(JSRuntime* rt, JS::TracerKind kind,
+                    JS::TraceOptions options)
+      : JSTracer(rt, kind, options) {}
+
+ private:
+  T* derived() { return static_cast<T*>(this); }
+
+#define DEFINE_ON_EDGE_METHOD(name, type, _1, _2)              \
+  bool on##name##Edge(type** thingp, const char* name) final { \
+    return derived()->onEdge(thingp, name);                    \
+  }
+  JS_FOR_EACH_TRACEKIND(DEFINE_ON_EDGE_METHOD)
+#undef DEFINE_ON_EDGE_METHOD
+};
+
+}  
+
+namespace JS {
+
+class JS_PUBLIC_API CallbackTracer
+    : public js::GenericTracerImpl<CallbackTracer> {
+ public:
+  CallbackTracer(JSRuntime* rt, JS::TracerKind kind = JS::TracerKind::Callback,
+                 JS::TraceOptions options = JS::TraceOptions())
+      : GenericTracerImpl(rt, kind, options) {
+    MOZ_ASSERT(isCallbackTracer());
+  }
+  CallbackTracer(JSContext* cx, JS::TracerKind kind = JS::TracerKind::Callback,
+                 JS::TraceOptions options = JS::TraceOptions());
+
+  virtual bool onChild(JS::GCCellPtr thing, const char* name) = 0;
+
+ private:
+  template <typename T>
+  bool onEdge(T** thingp, const char* name) {
+    T* thing = *thingp;
+    if (!thing) {
+      return true;
+    }
+    return onChild(JS::GCCellPtr(thing), name);
+  }
+  friend class js::GenericTracerImpl<CallbackTracer>;
+};
+
+class MOZ_RAII AutoTracingIndex {
+  JSTracer* trc_;
+
+ public:
+  explicit AutoTracingIndex(JSTracer* trc, size_t initial = 0) : trc_(trc) {
+    MOZ_ASSERT(trc_->context().index_ == TracingContext::InvalidIndex);
+    trc_->context().index_ = initial;
+  }
+  ~AutoTracingIndex() {
+    MOZ_ASSERT(trc_->context().index_ != TracingContext::InvalidIndex);
+    trc_->context().index_ = TracingContext::InvalidIndex;
+  }
+
+  void operator++() {
+    MOZ_ASSERT(trc_->context().index_ != TracingContext::InvalidIndex);
+    ++trc_->context().index_;
+  }
+};
+
+class MOZ_RAII AutoTracingWeakEdge {
+  JSTracer* trc_;
+
+ public:
+  explicit AutoTracingWeakEdge(JSTracer* trc) : trc_(trc) {
+    MOZ_ASSERT(!trc_->context().weak_);
+    trc_->context().weak_ = true;
+  }
+  ~AutoTracingWeakEdge() {
+    MOZ_ASSERT(trc_->context().weak_);
+    trc_->context().weak_ = false;
+  }
+};
+
+class MOZ_RAII AutoTracingDetails {
+  JSTracer* trc_;
+
+ public:
+  AutoTracingDetails(JSTracer* trc, TracingContext::Functor& func) : trc_(trc) {
+    MOZ_ASSERT(trc_->context().functor_ == nullptr);
+    trc_->context().functor_ = &func;
+  }
+  ~AutoTracingDetails() {
+    MOZ_ASSERT(trc_->context().functor_);
+    trc_->context().functor_ = nullptr;
+  }
+};
+
+class MOZ_RAII AutoClearTracingContext {
+  JSTracer* trc_;
+  TracingContext prev_;
+
+ public:
+  explicit AutoClearTracingContext(JSTracer* trc)
+      : trc_(trc), prev_(trc->context()) {
+    trc_->context() = TracingContext();
+    trc_->context().nesting_ = prev_.nesting_ + 1;
+  }
+
+  ~AutoClearTracingContext() { trc_->context() = prev_; }
+};
+
+}  
+
+JS::CallbackTracer* JSTracer::asCallbackTracer() {
+  MOZ_ASSERT(isCallbackTracer());
+  return static_cast<JS::CallbackTracer*>(this);
+}
+
+namespace js {
+
+class AbstractGeneratorObject;
+class SavedFrame;
+namespace wasm {
+class AnyRef;
+}  
+
+namespace gc {
+
+#define JS_DECLARE_TRACE_EXTERNAL_EDGE(type)                               \
+  extern JS_PUBLIC_API void TraceExternalEdge(JSTracer* trc, type* thingp, \
+                                              const char* name);
+
+JS_FOR_EACH_PUBLIC_GC_POINTER_TYPE(JS_DECLARE_TRACE_EXTERNAL_EDGE)
+JS_FOR_EACH_PUBLIC_TAGGED_GC_POINTER_TYPE(JS_DECLARE_TRACE_EXTERNAL_EDGE)
+
+#undef JS_DECLARE_TRACE_EXTERNAL_EDGE
+
+}  
+}  
+
+namespace JS {
+
+
+template <typename T>
+inline void TraceEdge(JSTracer* trc, JS::Heap<T>* thingp, const char* name) {
+  MOZ_ASSERT(thingp);
+  if (*thingp) {
+    js::gc::TraceExternalEdge(trc, thingp->unsafeAddress(), name);
+  }
+}
+
+template <typename T>
+inline void TraceEdge(JSTracer* trc, JS::TenuredHeap<T>* thingp,
+                      const char* name) {
+  MOZ_ASSERT(thingp);
+  if (T ptr = thingp->unbarrieredGetPtr()) {
+    js::gc::TraceExternalEdge(trc, &ptr, name);
+    thingp->unbarrieredSetPtr(ptr);
+  }
+}
+
+#define JS_DECLARE_TRACE_ROOT(type)                               \
+  extern JS_PUBLIC_API void TraceRoot(JSTracer* trc, type* edgep, \
+                                      const char* name);
+
+JS_FOR_EACH_PUBLIC_GC_POINTER_TYPE(JS_DECLARE_TRACE_ROOT)
+JS_FOR_EACH_PUBLIC_TAGGED_GC_POINTER_TYPE(JS_DECLARE_TRACE_ROOT)
+
+JS_DECLARE_TRACE_ROOT(js::AbstractGeneratorObject*)
+JS_DECLARE_TRACE_ROOT(js::SavedFrame*)
+JS_DECLARE_TRACE_ROOT(js::wasm::AnyRef)
+
+#undef JS_DECLARE_TRACE_ROOT
+
+extern JS_PUBLIC_API void TraceChildren(JSTracer* trc, GCCellPtr thing);
+
+}  
+
+namespace js {
+
+inline bool IsTracerKind(JSTracer* trc, JS::TracerKind kind) {
+  return trc->kind() == kind;
+}
+
+extern JS_PUBLIC_API void UnsafeTraceManuallyBarrieredEdge(JSTracer* trc,
+                                                           JSObject** thingp,
+                                                           const char* name);
+
+namespace gc {
+
+template <typename T>
+extern JS_PUBLIC_API bool TraceWeakEdge(JSTracer* trc, JS::Heap<T>* thingp);
+
+}  
+
+#ifdef DEBUG
+extern JS_PUBLIC_API bool RuntimeIsBeingDestroyed();
+#endif
+
+}  
+
+#endif /* js_TracingAPI_h */

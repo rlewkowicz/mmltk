@@ -1,0 +1,130 @@
+/*
+ * Copyright 2017 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkFrameHolder_DEFINED)
+#define SkFrameHolder_DEFINED
+
+#include "include/codec/SkCodec.h"
+#include "include/codec/SkCodecAnimation.h"
+#include "include/core/SkRect.h"
+#include "include/core/SkTypes.h"
+#include "include/private/SkEncodedInfo.h"
+#include "include/private/base/SkNoncopyable.h"
+
+class SkFrame : public SkNoncopyable {
+public:
+    explicit SkFrame(int id)
+            : fId(id)
+            , fHasAlpha(false)
+            , fRequiredFrame(kUninitialized)
+            , fDisposalMethod(SkCodecAnimation::DisposalMethod::kKeep)
+            , fDuration(0)
+            , fBlend(SkCodecAnimation::Blend::kSrcOver) {
+        fRect.setEmpty();
+    }
+
+    virtual ~SkFrame() {}
+
+    SkFrame(SkFrame&&) = default;
+
+    int frameId() const { return fId; }
+
+    SkEncodedInfo::Alpha reportedAlpha() const {
+        return this->onReportedAlpha();
+    }
+
+    bool hasAlpha() const { return fHasAlpha; }
+
+    void setHasAlpha(bool alpha) { fHasAlpha = alpha; }
+
+    bool reachedStartOfData() const { return fRequiredFrame != kUninitialized; }
+
+    int getRequiredFrame() const {
+        SkASSERT(this->reachedStartOfData());
+        return fRequiredFrame;
+    }
+
+    void setRequiredFrame(int req) { fRequiredFrame = req; }
+
+    void setXYWH(int x, int y, int width, int height) {
+        fRect.setXYWH(x, y, width, height);
+    }
+
+    SkIRect frameRect() const { return fRect; }
+
+    int xOffset() const { return fRect.x(); }
+    int yOffset() const { return fRect.y(); }
+    int width()   const { return fRect.width(); }
+    int height()  const { return fRect.height(); }
+
+    SkCodecAnimation::DisposalMethod getDisposalMethod() const {
+        return fDisposalMethod;
+    }
+
+    void setDisposalMethod(SkCodecAnimation::DisposalMethod disposalMethod) {
+        fDisposalMethod = disposalMethod;
+    }
+
+    void setDuration(int duration) {
+        fDuration = duration;
+    }
+
+    int getDuration() const {
+        return fDuration;
+    }
+
+    void setBlend(SkCodecAnimation::Blend blend) {
+        fBlend = blend;
+    }
+
+    SkCodecAnimation::Blend getBlend() const {
+        return fBlend;
+    }
+
+    void fillIn(SkCodec::FrameInfo*, bool fullyReceived) const;
+
+protected:
+    virtual SkEncodedInfo::Alpha onReportedAlpha() const = 0;
+
+private:
+    inline static constexpr int kUninitialized = -2;
+
+    const int                           fId;
+    bool                                fHasAlpha;
+    int                                 fRequiredFrame;
+    SkIRect                             fRect;
+    SkCodecAnimation::DisposalMethod    fDisposalMethod;
+    int                                 fDuration;
+    SkCodecAnimation::Blend             fBlend;
+};
+
+class SkFrameHolder : public SkNoncopyable {
+public:
+    SkFrameHolder()
+        : fScreenWidth(0)
+        , fScreenHeight(0)
+    {}
+
+    virtual ~SkFrameHolder() {}
+
+    int screenWidth() const { return fScreenWidth; }
+    int screenHeight() const { return fScreenHeight; }
+
+    void setAlphaAndRequiredFrame(SkFrame*);
+
+    const SkFrame* getFrame(int i) const {
+        return this->onGetFrame(i);
+    }
+
+protected:
+    int fScreenWidth;
+    int fScreenHeight;
+
+    virtual const SkFrame* onGetFrame(int i) const = 0;
+};
+
+#endif

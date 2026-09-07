@@ -1,0 +1,67 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef js_StreamConsumer_h
+#define js_StreamConsumer_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/RefCountType.h"
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include "jstypes.h"
+
+#include "js/AllocPolicy.h"
+#include "js/TypeDecls.h"
+#include "js/UniquePtr.h"
+#include "js/Vector.h"
+
+namespace JS {
+
+
+class OptimizedEncodingListener {
+ protected:
+  virtual ~OptimizedEncodingListener() = default;
+
+ public:
+  virtual MozExternalRefCountType MOZ_XPCOM_ABI AddRef() = 0;
+  virtual MozExternalRefCountType MOZ_XPCOM_ABI Release() = 0;
+
+  virtual void storeOptimizedEncoding(const uint8_t* bytes, size_t length) = 0;
+};
+
+class JS_PUBLIC_API StreamConsumer {
+ protected:
+  StreamConsumer() = default;
+  virtual ~StreamConsumer() = default;
+
+ public:
+  virtual bool consumeChunk(const uint8_t* begin, size_t length) = 0;
+
+  virtual void streamEnd(OptimizedEncodingListener* listener = nullptr) = 0;
+
+  virtual void streamError(size_t errorCode) = 0;
+
+  virtual void consumeOptimizedEncoding(const uint8_t* begin,
+                                        size_t length) = 0;
+
+  virtual void noteResponseURLs(const char* maybeUrl,
+                                const char* maybeSourceMapUrl) = 0;
+};
+
+enum class MimeType { Wasm };
+
+using ConsumeStreamCallback = bool (*)(JSContext*, JS::HandleObject, MimeType,
+                                       StreamConsumer*);
+
+using ReportStreamErrorCallback = void (*)(JSContext*, size_t);
+
+extern JS_PUBLIC_API void InitConsumeStreamCallback(
+    JSContext* cx, ConsumeStreamCallback consume,
+    ReportStreamErrorCallback report);
+
+}  
+
+#endif  // js_StreamConsumer_h

@@ -1,0 +1,78 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef CacheFileContextEvictor_h_
+#define CacheFileContextEvictor_h_
+
+#include "mozilla/UniquePtr.h"
+#include "nsCOMPtr.h"
+#include "nsString.h"
+#include "nsTArray.h"
+
+class nsIFile;
+class nsILoadContextInfo;
+
+namespace mozilla {
+namespace net {
+
+class CacheIndexIterator;
+
+struct CacheFileContextEvictorEntry {
+  nsCOMPtr<nsILoadContextInfo> mInfo;
+  bool mPinned = false;
+  nsString mOrigin;       
+  nsString mBaseDomain;   
+  PRTime mTimeStamp = 0;  
+  RefPtr<CacheIndexIterator> mIterator;
+};
+
+class CacheFileContextEvictor {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(CacheFileContextEvictor)
+
+  CacheFileContextEvictor();
+
+ private:
+  virtual ~CacheFileContextEvictor();
+
+ public:
+  nsresult Init(nsIFile* aCacheDirectory);
+  void Shutdown();
+
+  uint32_t ContextsCount();
+  nsresult AddContext(nsILoadContextInfo* aLoadContextInfo, bool aPinned,
+                      const nsAString& aOrigin, const nsAString& aBaseDomain);
+  void CacheIndexStateChanged();
+  void WasEvicted(const nsACString& aKey, nsIFile* aFile,
+                  bool* aEvictedAsPinned, bool* aEvictedAsNonPinned);
+
+ private:
+  nsresult PersistEvictionInfoToDisk(nsILoadContextInfo* aLoadContextInfo,
+                                     bool aPinned, const nsAString& aOrigin,
+                                     const nsAString& aBaseDomain);
+  nsresult RemoveEvictInfoFromDisk(nsILoadContextInfo* aLoadContextInfo,
+                                   bool aPinned, const nsAString& aOrigin,
+                                   const nsAString& aBaseDomain);
+  nsresult LoadEvictInfoFromDisk();
+  nsresult GetContextFile(nsILoadContextInfo* aLoadContextInfo, bool aPinned,
+                          const nsAString& aOrigin,
+                          const nsAString& aBaseDomain, nsIFile** _retval);
+
+  void CreateIterators();
+  void CloseIterators();
+  void StartEvicting();
+  void EvictEntries();
+
+  bool mEvicting{false};
+  bool mIndexIsUpToDate{false};
+  static bool sDiskAlreadySearched;
+  nsTArray<UniquePtr<CacheFileContextEvictorEntry>> mEntries;
+  nsCOMPtr<nsIFile> mCacheDirectory;
+  nsCOMPtr<nsIFile> mEntriesDir;
+};
+
+}  
+}  
+
+#endif

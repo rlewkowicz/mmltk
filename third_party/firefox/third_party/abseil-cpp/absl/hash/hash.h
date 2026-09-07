@@ -1,0 +1,163 @@
+// Copyright 2018 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+#ifndef ABSL_HASH_HASH_H_
+#define ABSL_HASH_HASH_H_
+
+#include <cstddef>
+#include <cstdint>
+#include <tuple>
+#include <type_traits>
+#include <utility>
+
+#include "absl/base/config.h"
+#include "absl/functional/function_ref.h"
+#include "absl/hash/internal/hash.h"
+#include "absl/hash/internal/weakly_mixed_integer.h"
+#include "absl/meta/type_traits.h"
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+
+template <typename T>
+using Hash = absl::hash_internal::Hash<T>;
+
+template <int&... ExplicitArgumentBarrier, typename... Types>
+size_t HashOf(const Types&... values) {
+  auto tuple = std::tie(values...);
+  return absl::Hash<decltype(tuple)>{}(tuple);
+}
+
+class HashState : public hash_internal::HashStateBase<HashState> {
+ public:
+  template <typename T,
+            std::enable_if_t<
+                std::is_base_of_v<hash_internal::HashStateBase<T>, T>, int> = 0>
+  static HashState Create(T* state) {
+    HashState s;
+    s.Init(state);
+    return s;
+  }
+
+  HashState(const HashState&) = delete;
+  HashState& operator=(const HashState&) = delete;
+  HashState(HashState&&) = default;
+  HashState& operator=(HashState&&) = default;
+
+  using HashState::HashStateBase::combine;
+
+  static HashState combine_contiguous(HashState hash_state,
+                                      const unsigned char* first, size_t size) {
+    hash_state.combine_contiguous_(hash_state.state_, first, size);
+    return hash_state;
+  }
+
+  static HashState combine_weakly_mixed_integer(
+      HashState hash_state, hash_internal::WeaklyMixedInteger value) {
+    hash_state.combine_weakly_mixed_integer_(hash_state.state_, value);
+    return hash_state;
+  }
+  using HashState::HashStateBase::combine_contiguous;
+
+ private:
+  HashState() = default;
+
+  friend class HashState::HashStateBase;
+  friend struct hash_internal::CombineRaw;
+
+  template <typename T>
+  static void CombineContiguousImpl(void* p, const unsigned char* first,
+                                    size_t size) {
+    T& state = *static_cast<T*>(p);
+    state = T::combine_contiguous(std::move(state), first, size);
+  }
+
+  template <typename T>
+  static void CombineWeaklyMixedIntegerImpl(
+      void* p, hash_internal::WeaklyMixedInteger value) {
+    T& state = *static_cast<T*>(p);
+    state = T::combine_weakly_mixed_integer(std::move(state), value);
+  }
+
+  static HashState combine_raw(HashState hash_state, uint64_t value) {
+    hash_state.combine_raw_(hash_state.state_, value);
+    return hash_state;
+  }
+
+  template <typename T>
+  static void CombineRawImpl(void* p, uint64_t value) {
+    T& state = *static_cast<T*>(p);
+    state = hash_internal::CombineRaw()(std::move(state), value);
+  }
+
+  template <typename T>
+  void Init(T* state) {
+    state_ = state;
+    combine_weakly_mixed_integer_ = &CombineWeaklyMixedIntegerImpl<T>;
+    combine_contiguous_ = &CombineContiguousImpl<T>;
+    combine_raw_ = &CombineRawImpl<T>;
+    run_combine_unordered_ = &RunCombineUnorderedImpl<T>;
+  }
+
+  template <typename HS>
+  struct CombineUnorderedInvoker {
+    template <typename T, typename ConsumerT>
+    void operator()(T inner_state, ConsumerT inner_cb) {
+      f(HashState::Create(&inner_state),
+        [&](HashState& inner_erased) { inner_cb(inner_erased.Real<T>()); });
+    }
+
+    absl::FunctionRef<void(HS, absl::FunctionRef<void(HS&)>)> f;
+  };
+
+  template <typename T>
+  static HashState RunCombineUnorderedImpl(
+      HashState state,
+      absl::FunctionRef<void(HashState, absl::FunctionRef<void(HashState&)>)>
+          f) {
+    T& real_state = state.Real<T>();
+    real_state = T::RunCombineUnordered(
+        std::move(real_state), CombineUnorderedInvoker<HashState>{f});
+    return state;
+  }
+
+  template <typename CombinerT>
+  static HashState RunCombineUnordered(HashState state, CombinerT combiner) {
+    auto* run = state.run_combine_unordered_;
+    return run(std::move(state), std::ref(combiner));
+  }
+
+  void Init(HashState* state) {
+    state_ = state->state_;
+    combine_weakly_mixed_integer_ = state->combine_weakly_mixed_integer_;
+    combine_contiguous_ = state->combine_contiguous_;
+    combine_raw_ = state->combine_raw_;
+    run_combine_unordered_ = state->run_combine_unordered_;
+  }
+
+  template <typename T>
+  T& Real() {
+    return *static_cast<T*>(state_);
+  }
+
+  void* state_;
+  void (*combine_weakly_mixed_integer_)(
+      void*, absl::hash_internal::WeaklyMixedInteger);
+  void (*combine_contiguous_)(void*, const unsigned char*, size_t);
+  void (*combine_raw_)(void*, uint64_t);
+  HashState (*run_combine_unordered_)(
+      HashState state,
+      absl::FunctionRef<void(HashState, absl::FunctionRef<void(HashState&)>)>);
+};
+
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_HASH_HASH_H_

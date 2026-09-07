@@ -1,0 +1,188 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/WindowGlobalActor.h"
+
+#include "AutoplayPolicy.h"
+#include "mozilla/Components.h"
+#include "mozilla/ContentBlockingAllowList.h"
+#include "mozilla/Logging.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/JSActorService.h"
+#include "mozilla/dom/JSWindowActorChild.h"
+#include "mozilla/dom/JSWindowActorParent.h"
+#include "mozilla/dom/JSWindowActorProtocol.h"
+#include "mozilla/dom/ParentProcessChannelHandle.h"
+#include "mozilla/dom/PopupBlocker.h"
+#include "mozilla/dom/WindowContext.h"
+#include "mozilla/dom/WindowGlobalChild.h"
+#include "mozilla/dom/WindowGlobalParent.h"
+#include "mozilla/net/CookieJarSettings.h"
+#include "nsContentUtils.h"
+#include "nsGlobalWindowInner.h"
+#include "nsNetUtil.h"
+#include "nsPIDOMWindowInlines.h"
+
+namespace mozilla::dom {
+
+static nsILoadInfo::CrossOriginEmbedderPolicy InheritedPolicy(
+    dom::BrowsingContext* aBrowsingContext) {
+  WindowContext* inherit = aBrowsingContext->GetParentWindowContext();
+  if (inherit) {
+    return inherit->GetEmbedderPolicy();
+  }
+
+  return nsILoadInfo::EMBEDDER_POLICY_NULL;
+}
+
+WindowGlobalInit WindowGlobalActor::BaseInitializer(
+    dom::BrowsingContext* aBrowsingContext, uint64_t aInnerWindowId,
+    uint64_t aOuterWindowId) {
+  MOZ_DIAGNOSTIC_ASSERT(aBrowsingContext);
+
+  using Indexes = WindowContext::FieldIndexes;
+
+  WindowGlobalInit init;
+  auto& ctx = init.context();
+  ctx.mInnerWindowId = aInnerWindowId;
+  ctx.mOuterWindowId = aOuterWindowId;
+  ctx.mBrowsingContextId = aBrowsingContext->Id();
+
+  auto& fields = ctx.mFields;
+  fields.Get<Indexes::IDX_EmbedderPolicy>() = InheritedPolicy(aBrowsingContext);
+  fields.Get<Indexes::IDX_AutoplayPermission>() =
+      nsIPermissionManager::UNKNOWN_ACTION;
+  fields.Get<Indexes::IDX_AllowJavascript>() = true;
+  fields.Get<Indexes::IDX_IsFramebustingAllowed>() = aBrowsingContext->IsTop();
+  return init;
+}
+
+WindowGlobalInit WindowGlobalActor::AboutBlankInitializer(
+    dom::BrowsingContext* aBrowsingContext, nsIPrincipal* aPrincipal) {
+  MOZ_DIAGNOSTIC_ASSERT(
+      aPrincipal && aPrincipal->GetIsNullPrincipal(),
+      "AboutBlankInitializer is a dummy that should not be web-exposed");
+
+  WindowGlobalInit init =
+      BaseInitializer(aBrowsingContext, nsContentUtils::GenerateWindowId(),
+                      nsContentUtils::GenerateWindowId());
+
+  init.principal() = aPrincipal;
+  init.storagePrincipal() = aPrincipal;
+  (void)NS_NewURI(getter_AddRefs(init.documentURI()), "about:blank");
+  init.isInitialDocument() = true;
+  init.isUncommittedInitialDocument() = true;
+
+  return init;
+}
+
+WindowGlobalInit WindowGlobalActor::WindowInitializer(
+    nsGlobalWindowInner* aWindow) {
+  WindowGlobalInit init =
+      BaseInitializer(aWindow->GetBrowsingContext(), aWindow->WindowID(),
+                      aWindow->GetOuterWindow()->WindowID());
+
+  init.principal() = aWindow->GetPrincipal();
+  init.storagePrincipal() = aWindow->GetEffectiveStoragePrincipal();
+  init.documentURI() = aWindow->GetDocumentURI();
+
+  Document* doc = aWindow->GetDocument();
+
+  init.isInitialDocument() = doc->IsInitialDocument();
+  if (Document* original = doc->GetOriginalDocument()) {
+    init.staticCloneOf() = original->GetWindowContext();
+  }
+  init.isUncommittedInitialDocument() = doc->IsUncommittedInitialDocument();
+  init.isVideoDocument() =
+      doc->MediaDocumentKind() == Document::MediaDocumentKind::Video;
+  init.blockAllMixedContent() = doc->GetBlockAllMixedContent(false);
+  init.upgradeInsecureRequests() = doc->GetUpgradeInsecureRequests(false);
+  init.sandboxFlags() = doc->GetSandboxFlags();
+  net::CookieJarSettings::Cast(doc->CookieJarSettings())
+      ->Serialize(init.cookieJarSettings());
+  init.httpsOnlyStatus() = doc->HttpsOnlyStatus();
+
+  if (nsIChannel* chan = doc->GetChannel()) {
+    (void)chan->GetParentProcessChannelHandle(
+        getter_AddRefs(init.documentChannelHandle()));
+  }
+  if (nsIChannel* chan = doc->GetFailedChannel()) {
+    (void)chan->GetParentProcessChannelHandle(
+        getter_AddRefs(init.failedChannelHandle()));
+  }
+
+  using Indexes = WindowContext::FieldIndexes;
+
+  auto& fields = init.context().mFields;
+  fields.Get<Indexes::IDX_CookieBehavior>() =
+      Some(doc->CookieJarSettings()->GetCookieBehavior());
+  fields.Get<Indexes::IDX_IsOnContentBlockingAllowList>() =
+      doc->CookieJarSettings()->GetIsOnContentBlockingAllowList();
+  fields.Get<Indexes::IDX_IsThirdPartyWindow>() = doc->HasThirdPartyChannel();
+  fields.Get<Indexes::IDX_IsThirdPartyTrackingResourceWindow>() =
+      nsContentUtils::IsThirdPartyTrackingResourceWindow(aWindow);
+  fields.Get<Indexes::IDX_ShouldResistFingerprinting>() =
+      doc->ShouldResistFingerprinting(RFPTarget::IsAlwaysEnabledForPrecompute);
+  fields.Get<Indexes::IDX_OverriddenFingerprintingSettings>() =
+      doc->GetOverriddenFingerprintingSettings();
+  fields.Get<Indexes::IDX_IsSecureContext>() = aWindow->IsSecureContext();
+  fields.Get<Indexes::IDX_IsFramebustingAllowed>() =
+      aWindow->GetBrowsingContext()->ComputeIsFramebustingAllowed();
+
+  fields.Get<Indexes::IDX_AutoplayPermission>() =
+      media::AutoplayPolicy::GetSiteAutoplayPermission(init.principal());
+  fields.Get<Indexes::IDX_PopupPermission>() =
+      PopupBlocker::GetPopupPermission(init.principal());
+
+  if (aWindow->GetBrowsingContext()->IsTop()) {
+    fields.Get<Indexes::IDX_ShortcutsPermission>() =
+        nsGlobalWindowInner::GetShortcutsPermission(init.principal());
+  }
+
+  if (auto policy = doc->GetEmbedderPolicy()) {
+    fields.Get<Indexes::IDX_EmbedderPolicy>() = *policy;
+  }
+
+  nsCOMPtr<nsIURI> innerDocURI = NS_GetInnermostURI(doc->GetDocumentURI());
+  fields.Get<Indexes::IDX_IsSecure>() =
+      innerDocURI && innerDocURI->SchemeIs("https");
+
+  if (nsCOMPtr<nsIChannel> channel = doc->GetChannel()) {
+    nsCOMPtr<nsILoadInfo> loadInfo(channel->LoadInfo());
+    fields.Get<Indexes::IDX_IsOriginalFrameSource>() =
+        loadInfo->GetOriginalFrameSrcLoad();
+
+    nsILoadInfo::StoragePermissionState storageAccess =
+        loadInfo->GetStoragePermission();
+    fields.Get<Indexes::IDX_UsingStorageAccess>() =
+        storageAccess == nsILoadInfo::HasStoragePermission ||
+        storageAccess == nsILoadInfo::StoragePermissionAllowListed;
+  }
+
+  fields.Get<Indexes::IDX_IsLocalIP>() =
+      init.principal()->GetIsLocalIpAddress();
+
+  return init;
+}
+
+already_AddRefed<JSActorProtocol> WindowGlobalActor::MatchingJSActorProtocol(
+    JSActorService* aActorSvc, const nsACString& aName, ErrorResult& aRv) {
+  RefPtr<JSWindowActorProtocol> proto =
+      aActorSvc->GetJSWindowActorProtocol(aName);
+  if (!proto) {
+    aRv.ThrowNotFoundError(nsPrintfCString("No such JSWindowActor '%s'",
+                                           PromiseFlatCString(aName).get()));
+    return nullptr;
+  }
+
+  if (!proto->Matches(BrowsingContext(), GetDocumentURI(), GetRemoteType(),
+                      aRv)) {
+    MOZ_ASSERT(aRv.Failed());
+    return nullptr;
+  }
+  MOZ_ASSERT(!aRv.Failed());
+  return proto.forget();
+}
+
+}  

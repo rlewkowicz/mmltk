@@ -1,0 +1,58 @@
+/* Copyright 2017 Google Inc. All Rights Reserved.
+
+   Distributed under MIT license.
+   See file LICENSE for detail or copy at https://opensource.org/licenses/MIT
+*/
+
+
+#ifndef BROTLI_COMMON_SHARED_DICTIONARY_INTERNAL_H_
+#define BROTLI_COMMON_SHARED_DICTIONARY_INTERNAL_H_
+
+#include <brotli/shared_dictionary.h>
+
+#include "dictionary.h"
+#include "platform.h"
+#include "transform.h"
+
+#if defined(__cplusplus) || defined(c_plusplus)
+extern "C" {
+#endif
+
+struct BrotliSharedDictionaryStruct {
+  uint32_t num_prefix;  
+  size_t prefix_size[SHARED_BROTLI_MAX_COMPOUND_DICTS];
+  const uint8_t* prefix[SHARED_BROTLI_MAX_COMPOUND_DICTS];
+
+  BROTLI_BOOL context_based;
+
+  uint8_t context_map[SHARED_BROTLI_NUM_DICTIONARY_CONTEXTS];
+
+  uint8_t num_dictionaries;
+
+  const BrotliDictionary* words[SHARED_BROTLI_NUM_DICTIONARY_CONTEXTS];
+
+  const BrotliTransforms* transforms[SHARED_BROTLI_NUM_DICTIONARY_CONTEXTS];
+
+  uint8_t num_word_lists;
+
+  BrotliDictionary* words_instances;
+
+  uint8_t num_transform_lists;
+
+  BrotliTransforms* transforms_instances;
+
+  uint16_t* prefix_suffix_maps;
+
+  brotli_alloc_func alloc_func;
+  brotli_free_func free_func;
+  void* memory_manager_opaque;
+};
+
+typedef struct BrotliSharedDictionaryStruct BrotliSharedDictionaryInternal;
+#define BrotliSharedDictionary BrotliSharedDictionaryInternal
+
+#if defined(__cplusplus) || defined(c_plusplus)
+}  
+#endif
+
+#endif  /* BROTLI_COMMON_SHARED_DICTIONARY_INTERNAL_H_ */

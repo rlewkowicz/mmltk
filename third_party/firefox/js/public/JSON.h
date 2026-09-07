@@ -1,0 +1,105 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef js_JSON_h
+#define js_JSON_h
+
+#include <stdint.h>  // uint32_t
+
+#include "jstypes.h"  // JS_PUBLIC_API
+
+#include "js/TypeDecls.h"
+
+using JSONWriteCallback = bool (*)(const char16_t* buf, uint32_t len,
+                                   void* data);
+
+extern JS_PUBLIC_API bool JS_Stringify(JSContext* cx,
+                                       JS::MutableHandle<JS::Value> value,
+                                       JS::Handle<JSObject*> replacer,
+                                       JS::Handle<JS::Value> space,
+                                       JSONWriteCallback callback, void* data);
+extern JS_PUBLIC_API bool JS_StringifyWithLengthHint(
+    JSContext* cx, JS::MutableHandle<JS::Value> value,
+    JS::Handle<JSObject*> replacer, JS::Handle<JS::Value> space,
+    JSONWriteCallback callback, void* data, size_t lengthHint);
+
+namespace JS {
+
+extern JS_PUBLIC_API bool ToJSONMaybeSafely(JSContext* cx,
+                                            JS::Handle<JSObject*> input,
+                                            JSONWriteCallback callback,
+                                            void* data);
+
+extern JS_PUBLIC_API bool ToJSON(JSContext* cx, Handle<Value> value,
+                                 Handle<JSObject*> replacer,
+                                 Handle<Value> space,
+                                 JSONWriteCallback callback, void* data);
+
+} 
+
+extern JS_PUBLIC_API bool JS_ParseJSON(JSContext* cx, const char16_t* chars,
+                                       uint32_t len,
+                                       JS::MutableHandle<JS::Value> vp);
+
+extern JS_PUBLIC_API bool JS_ParseJSON(JSContext* cx, JS::Handle<JSString*> str,
+                                       JS::MutableHandle<JS::Value> vp);
+
+extern JS_PUBLIC_API bool JS_ParseJSON(JSContext* cx,
+                                       const JS::Latin1Char* chars,
+                                       uint32_t len,
+                                       JS::MutableHandle<JS::Value> vp);
+
+extern JS_PUBLIC_API bool JS_ParseJSONWithReviver(
+    JSContext* cx, const char16_t* chars, uint32_t len,
+    JS::Handle<JS::Value> reviver, JS::MutableHandle<JS::Value> vp);
+
+extern JS_PUBLIC_API bool JS_ParseJSONWithReviver(
+    JSContext* cx, JS::Handle<JSString*> str, JS::Handle<JS::Value> reviver,
+    JS::MutableHandle<JS::Value> vp);
+
+namespace JS {
+
+extern JS_PUBLIC_API bool IsValidJSON(const JS::Latin1Char* chars,
+                                      uint32_t len);
+extern JS_PUBLIC_API bool IsValidJSON(const char16_t* chars, uint32_t len);
+
+class JSONParseHandler {
+ public:
+  JSONParseHandler() {}
+  virtual ~JSONParseHandler() {}
+
+  virtual bool startObject() = 0;
+
+  virtual bool propertyName(const JS::Latin1Char* name, size_t length) = 0;
+  virtual bool propertyName(const char16_t* name, size_t length) = 0;
+
+  virtual bool endObject() = 0;
+
+  virtual bool startArray() = 0;
+
+  virtual bool endArray() = 0;
+
+  virtual bool stringValue(const JS::Latin1Char* str, size_t length) = 0;
+  virtual bool stringValue(const char16_t* str, size_t length) = 0;
+
+  virtual bool numberValue(double d) = 0;
+
+  virtual bool booleanValue(bool v) = 0;
+
+  virtual bool nullValue() = 0;
+
+  virtual void error(const char* msg, uint32_t line, uint32_t column) = 0;
+};
+
+extern JS_PUBLIC_API bool ParseJSONWithHandler(const JS::Latin1Char* chars,
+                                               uint32_t len,
+                                               JSONParseHandler* handler);
+extern JS_PUBLIC_API bool ParseJSONWithHandler(const char16_t* chars,
+                                               uint32_t len,
+                                               JSONParseHandler* handler);
+
+}  
+
+#endif /* js_JSON_h */

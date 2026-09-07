@@ -1,0 +1,403 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifdef MOZ_VALGRIND
+#  include <valgrind/memcheck.h>
+#endif
+
+#include "jstypes.h"
+
+#include "debugger/DebugAPI.h"
+#include "gc/ClearEdgesTracer.h"
+#include "gc/GCInternals.h"
+#include "gc/PublicIterators.h"
+#include "jit/JitFrames.h"
+#include "jit/JitRuntime.h"
+#include "js/ValueArray.h"
+#include "vm/BigIntType.h"
+#include "vm/Compartment.h"
+#include "vm/HelperThreadState.h"
+#include "vm/JSContext.h"
+
+using namespace js;
+using namespace js::gc;
+
+using mozilla::LinkedList;
+
+using JS::AutoGCRooter;
+using JS::SliceBudget;
+
+using RootEntry = RootedValueMap::Entry;
+
+template <typename Base, typename T>
+inline void TypedRootedGCThingBase<Base, T>::trace(JSTracer* trc,
+                                                   const char* name) {
+  auto* self = this->template derived<T>();
+  TraceRoot(trc, self->address(), name);
+}
+
+template <typename T>
+static inline void TraceExactStackRootList(JSTracer* trc,
+                                           StackRootedBase* listHead,
+                                           const char* name) {
+  static_assert(sizeof(Rooted<T>) == sizeof(T) + 2 * sizeof(uintptr_t));
+
+  for (StackRootedBase* root = listHead; root; root = root->previous()) {
+    static_cast<Rooted<T>*>(root)->trace(trc, name);
+  }
+}
+
+static inline void TraceExactStackRootTraceableList(JSTracer* trc,
+                                                    StackRootedBase* listHead,
+                                                    const char* name) {
+  for (StackRootedBase* root = listHead; root; root = root->previous()) {
+    static_cast<StackRootedTraceableBase*>(root)->trace(trc, name);
+  }
+}
+
+static inline void TraceStackRoots(JSTracer* trc,
+                                   JS::RootedListHeads& stackRoots) {
+#define TRACE_ROOTS(name, type, _, _1)                                \
+  TraceExactStackRootList<type*>(trc, stackRoots[JS::RootKind::name], \
+                                 "exact-" #name);
+  JS_FOR_EACH_TRACEKIND(TRACE_ROOTS)
+#undef TRACE_ROOTS
+  TraceExactStackRootList<jsid>(trc, stackRoots[JS::RootKind::Id], "exact-id");
+  TraceExactStackRootList<Value>(trc, stackRoots[JS::RootKind::Value],
+                                 "exact-value");
+
+  JS::AutoSuppressGCAnalysis nogc;
+
+  TraceExactStackRootTraceableList(trc, stackRoots[JS::RootKind::Traceable],
+                                   "Traceable");
+}
+
+void JS::RootingContext::traceStackRoots(JSTracer* trc) {
+  TraceStackRoots(trc, stackRoots_);
+}
+
+static void TraceExactStackRoots(JSContext* cx, JSTracer* trc) {
+  cx->traceStackRoots(trc);
+}
+
+template <typename T>
+static inline void TracePersistentRootedList(
+    JSTracer* trc, LinkedList<PersistentRootedBase>& list, const char* name) {
+  for (PersistentRootedBase* root : list) {
+    static_cast<PersistentRooted<T>*>(root)->trace(trc, name);
+  }
+}
+
+static inline void TracePersistentRootedTraceableList(
+    JSTracer* trc, LinkedList<PersistentRootedBase>& list, const char* name) {
+  for (PersistentRootedBase* root : list) {
+    static_cast<PersistentRootedTraceableBase*>(root)->trace(trc, name);
+  }
+}
+
+void GCRuntime::tracePersistentRoots(JSTracer* trc) {
+#define TRACE_ROOTS(name, type, _, _1)                                         \
+  TracePersistentRootedList<type*>(trc, persistentRoots()[JS::RootKind::name], \
+                                   "persistent-" #name);
+  JS_FOR_EACH_TRACEKIND(TRACE_ROOTS)
+#undef TRACE_ROOTS
+  TracePersistentRootedList<jsid>(trc, persistentRoots()[JS::RootKind::Id],
+                                  "persistent-id");
+  TracePersistentRootedList<Value>(trc, persistentRoots()[JS::RootKind::Value],
+                                   "persistent-value");
+
+  JS::AutoSuppressGCAnalysis nogc;
+
+  TracePersistentRootedTraceableList(
+      trc, persistentRoots()[JS::RootKind::Traceable], "persistent-traceable");
+}
+
+static void TracePersistentRooted(JSRuntime* rt, JSTracer* trc) {
+  rt->gc.tracePersistentRoots(trc);
+}
+
+template <typename T>
+static void FinishPersistentRootedChain(
+    LinkedList<PersistentRootedBase>& list) {
+  while (!list.isEmpty()) {
+    static_cast<PersistentRooted<T>*>(list.getFirst())->reset();
+  }
+}
+
+void GCRuntime::finishPersistentRoots() {
+#define FINISH_ROOT_LIST(name, type, _, _1) \
+  FinishPersistentRootedChain<type*>(persistentRoots()[JS::RootKind::name]);
+  JS_FOR_EACH_TRACEKIND(FINISH_ROOT_LIST)
+#undef FINISH_ROOT_LIST
+  FinishPersistentRootedChain<jsid>(persistentRoots()[JS::RootKind::Id]);
+  FinishPersistentRootedChain<Value>(persistentRoots()[JS::RootKind::Value]);
+
+}
+
+JS_PUBLIC_API void js::TraceValueArray(JSTracer* trc, size_t length,
+                                       Value* elements) {
+  TraceRootRange(trc, length, elements, "JS::RootedValueArray");
+}
+
+void AutoGCRooter::trace(JSTracer* trc) {
+  switch (kind_) {
+    case Kind::Wrapper:
+      static_cast<AutoWrapperRooter*>(this)->trace(trc);
+      break;
+
+    case Kind::WrapperVector:
+      static_cast<AutoWrapperVector*>(this)->trace(trc);
+      break;
+
+    case Kind::Custom:
+      static_cast<JS::CustomAutoRooter*>(this)->trace(trc);
+      break;
+
+    default:
+      MOZ_CRASH("Bad AutoGCRooter::Kind");
+      break;
+  }
+}
+
+void AutoWrapperRooter::trace(JSTracer* trc) {
+  TraceManuallyBarrieredEdge(trc, &value.get(), "js::AutoWrapperRooter.value");
+}
+
+void AutoWrapperVector::trace(JSTracer* trc) {
+  for (WrapperValue& value : *this) {
+    TraceManuallyBarrieredEdge(trc, &value.get(),
+                               "js::AutoWrapperVector.vector");
+  }
+}
+
+void JS::RootingContext::traceAllGCRooters(JSTracer* trc) {
+  for (AutoGCRooter* list : autoGCRooters_) {
+    traceGCRooterList(trc, list);
+  }
+}
+
+void JS::RootingContext::traceWrapperGCRooters(JSTracer* trc) {
+  traceGCRooterList(trc, autoGCRooters_[AutoGCRooter::Kind::Wrapper]);
+  traceGCRooterList(trc, autoGCRooters_[AutoGCRooter::Kind::WrapperVector]);
+}
+
+inline void JS::RootingContext::traceGCRooterList(JSTracer* trc,
+                                                  AutoGCRooter* head) {
+  for (AutoGCRooter* rooter = head; rooter; rooter = rooter->down) {
+    rooter->trace(trc);
+  }
+}
+
+void PropertyDescriptor::trace(JSTracer* trc) {
+  TraceRoot(trc, &value_, "Descriptor::value");
+  if (getter_) {
+    TraceRoot(trc, &getter_, "Descriptor::getter");
+  }
+  if (setter_) {
+    TraceRoot(trc, &setter_, "Descriptor::setter");
+  }
+}
+
+void js::gc::GCRuntime::traceRuntimeForMajorGC(JSTracer* trc,
+                                               AutoGCSession& session) {
+  MOZ_ASSERT(!TlsContext.get()->suppressGC);
+
+  gcstats::AutoPhase ap(stats(), gcstats::PhaseKind::MARK_ROOTS);
+
+  if (atomsZone()->isGCMarking()) {
+    traceRuntimeAtoms(trc);
+  }
+
+  {
+    gcstats::AutoPhase ap(stats(), gcstats::PhaseKind::MARK_CCWS);
+    Compartment::traceIncomingCrossCompartmentEdgesForZoneGC(
+        trc, Compartment::NonGrayEdges);
+  }
+
+  traceRuntimeCommon(trc, MarkRuntime);
+}
+
+void js::gc::GCRuntime::traceRuntimeForMinorGC(JSTracer* trc,
+                                               AutoGCSession& session) {
+  MOZ_ASSERT(!TlsContext.get()->suppressGC);
+
+  gcstats::AutoPhase ap(stats(), gcstats::PhaseKind::MARK_ROOTS);
+
+  traceRuntimeCommon(trc, TraceRuntime);
+}
+
+void js::TraceRuntime(JSTracer* trc) {
+  MOZ_ASSERT(!trc->isMarkingTracer());
+
+  JSRuntime* rt = trc->runtime();
+  AutoEmptyNurseryAndPrepareForTracing prep(rt->mainContextFromOwnThread());
+  gcstats::AutoPhase ap(rt->gc.stats(), gcstats::PhaseKind::TRACE_HEAP);
+  rt->gc.traceRuntime(trc, prep);
+}
+
+void js::TraceRuntimeWithoutEviction(JSTracer* trc) {
+  MOZ_ASSERT(!trc->isMarkingTracer());
+
+  JSRuntime* rt = trc->runtime();
+  AutoTraceSession session(rt);
+  gcstats::AutoPhase ap(rt->gc.stats(), gcstats::PhaseKind::TRACE_HEAP);
+  rt->gc.traceRuntime(trc, session);
+}
+
+void js::gc::GCRuntime::traceRuntime(JSTracer* trc, AutoHeapSession& session) {
+  MOZ_ASSERT(!rt->isBeingDestroyed());
+
+  gcstats::AutoPhase ap(stats(), gcstats::PhaseKind::MARK_ROOTS);
+
+  traceRuntimeAtoms(trc);
+  traceRuntimeCommon(trc, TraceRuntime);
+}
+
+void js::gc::GCRuntime::traceRuntimeAtoms(JSTracer* trc) {
+  gcstats::AutoPhase ap(stats(), gcstats::PhaseKind::MARK_RUNTIME_DATA);
+  TraceAtoms(trc);
+  jit::JitRuntime::TraceAtomZoneRoots(trc);
+}
+
+void js::gc::GCRuntime::traceRuntimeCommon(JSTracer* trc,
+                                           TraceOrMarkRuntime traceOrMark) {
+  {
+    gcstats::AutoPhase ap(stats(), gcstats::PhaseKind::MARK_STACK);
+
+    JSContext* cx = rt->mainContextFromOwnThread();
+
+    TraceActivations(cx, trc);
+#ifdef ENABLE_WASM_JSPI
+    jit::TraceWasmSuspendedContStacks(cx, trc);
+#endif
+
+    cx->traceAllGCRooters(trc);
+
+    TraceExactStackRoots(cx, trc);
+
+    for (auto iter = rootsHash.ref().iter(); !iter.done(); iter.next()) {
+      const RootEntry& entry = iter.get();
+      TraceRoot(trc, entry.key(), entry.value());
+    }
+  }
+
+  TracePersistentRooted(rt, trc);
+
+#ifdef JS_HAS_INTL_API
+  rt->traceSharedIntlData(trc);
+#endif
+
+  rt->mainContextFromOwnThread()->trace(trc);
+
+  for (RealmsIter r(rt); !r.done(); r.next()) {
+    r->traceRoots(trc, traceOrMark);
+  }
+
+  if (!JS::RuntimeHeapIsMinorCollecting()) {
+    rt->traceSelfHostingStencil(trc);
+
+    for (ZonesIter zone(this, ZoneSelector::SkipAtoms); !zone.done();
+         zone.next()) {
+      zone->traceRootsInMajorGC(trc);
+    }
+  }
+
+  HelperThreadState().trace(trc);
+
+  DebugAPI::traceFramesWithLiveHooks(trc);
+
+  if (!JS::RuntimeHeapIsMinorCollecting()) {
+    gcstats::AutoPhase ap(stats(), gcstats::PhaseKind::MARK_EMBEDDING);
+
+    traceEmbeddingBlackRoots(trc);
+
+    if (traceOrMark == TraceRuntime) {
+      traceEmbeddingGrayRoots(trc);
+    }
+  }
+
+  traceKeptObjects(trc);
+}
+
+void GCRuntime::traceEmbeddingBlackRoots(JSTracer* trc) {
+  JS::AutoSuppressGCAnalysis nogc;
+
+  for (const auto& callback : blackRootTracers.ref()) {
+    (*callback.op)(trc, callback.data);
+  }
+}
+
+void GCRuntime::traceEmbeddingGrayRoots(JSTracer* trc) {
+  SliceBudget budget = SliceBudget::unlimited();
+  MOZ_ALWAYS_TRUE(traceEmbeddingGrayRoots(trc, budget) == Finished);
+}
+
+IncrementalProgress GCRuntime::traceEmbeddingGrayRoots(JSTracer* trc,
+                                                       SliceBudget& budget) {
+  JS::AutoSuppressGCAnalysis nogc;
+
+  const auto& callback = grayRootTracer.ref();
+  if (!callback.op) {
+    return Finished;
+  }
+
+  return callback.op(trc, budget, callback.data) ? Finished : NotFinished;
+}
+
+#ifdef DEBUG
+class AssertNoRootsTracer final : public JS::CallbackTracer {
+  bool onChild(JS::GCCellPtr thing, const char* name) override {
+    MOZ_CRASH("There should not be any roots during runtime shutdown");
+  }
+
+ public:
+  explicit AssertNoRootsTracer(JSRuntime* rt)
+      : JS::CallbackTracer(rt, JS::TracerKind::Callback,
+                           JS::WeakMapTraceAction::Skip) {}
+};
+#endif  // DEBUG
+
+void js::gc::GCRuntime::finishRoots() {
+  AutoNoteSingleThreadedRegion anstr;
+
+  rt->finishAtoms();
+  restoreSharedAtomsZone();
+
+  rootsHash.ref().clear();
+
+  finishPersistentRoots();
+
+  rt->finishSelfHosting();
+
+  for (ZonesIter zone(rt, WithAtoms); !zone.done(); zone.next()) {
+    zone->finishRoots();
+  }
+
+#ifdef JS_GC_ZEAL
+  clearSelectedForMarking();
+#endif
+
+  ClearEdgesTracer trc(rt);
+  traceEmbeddingBlackRoots(&trc);
+  traceEmbeddingGrayRoots(&trc);
+  clearBlackAndGrayRootTracers();
+}
+
+void js::gc::GCRuntime::checkNoRuntimeRoots(AutoGCSession& session) {
+#ifdef DEBUG
+  AssertNoRootsTracer trc(rt);
+  traceRuntimeForMajorGC(&trc, session);
+#endif  // DEBUG
+}
+
+JS_PUBLIC_API void JS::AddPersistentRoot(JS::RootingContext* cx, RootKind kind,
+                                         PersistentRootedBase* root) {
+  JSRuntime* rt = static_cast<JSContext*>(cx)->runtime();
+  rt->gc.persistentRoots()[kind].insertBack(root);
+}
+
+JS_PUBLIC_API void JS::AddPersistentRoot(JSRuntime* rt, RootKind kind,
+                                         PersistentRootedBase* root) {
+  rt->gc.persistentRoots()[kind].insertBack(root);
+}

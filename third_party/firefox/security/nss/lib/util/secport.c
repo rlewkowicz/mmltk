@@ -1,0 +1,757 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "seccomon.h"
+#include "prmem.h"
+#include "prerror.h"
+#include "plarena.h"
+#include "secerr.h"
+#include "prmon.h"
+#include "prlock.h"
+#include "secport.h"
+#include "prenv.h"
+#include "prinit.h"
+
+#include <stdint.h>
+
+#if defined(DEBUG)
+#define THREADMARK
+#endif
+
+#if defined(THREADMARK)
+#include "prthread.h"
+#endif
+
+#if defined(XP_UNIX)
+#include <stdlib.h>
+#else
+#include "wtypes.h"
+#endif
+
+#define SET_ERROR_CODE /* place holder for code to set PR error code. */
+
+#if defined(THREADMARK)
+typedef struct threadmark_mark_str {
+    struct threadmark_mark_str *next;
+    void *mark;
+} threadmark_mark;
+
+#endif
+
+#define ARENAPOOL_MAGIC 0xB8AC9BDF
+
+#define CHEAP_ARENAPOOL_MAGIC 0x3F16BB09
+
+typedef struct PORTArenaPool_str {
+    PLArenaPool arena;
+    PRUint32 magic;
+    PRLock *lock;
+#if defined(THREADMARK)
+    PRThread *marking_thread;
+    threadmark_mark *first_mark;
+#endif
+} PORTArenaPool;
+
+PORTCharConversionFunc ucs4Utf8ConvertFunc;
+PORTCharConversionFunc ucs2Utf8ConvertFunc;
+PORTCharConversionWSwapFunc ucs2AsciiConvertFunc;
+
+#define MAX_SIZE (PR_UINT32_MAX >> 1)
+
+void *
+PORT_Alloc(size_t bytes)
+{
+    void *rv = NULL;
+
+    if (bytes <= MAX_SIZE) {
+        rv = PR_Malloc(bytes ? bytes : 1);
+    }
+    if (!rv) {
+        PORT_SetError(SEC_ERROR_NO_MEMORY);
+    }
+    return rv;
+}
+
+void *
+PORT_Realloc(void *oldptr, size_t bytes)
+{
+    void *rv = NULL;
+
+    if (bytes <= MAX_SIZE) {
+        rv = PR_Realloc(oldptr, bytes);
+    }
+    if (!rv) {
+        PORT_SetError(SEC_ERROR_NO_MEMORY);
+    }
+    return rv;
+}
+
+void *
+PORT_ZAlloc(size_t bytes)
+{
+    void *rv = NULL;
+
+    if (bytes <= MAX_SIZE) {
+        rv = PR_Calloc(1, bytes ? bytes : 1);
+    }
+    if (!rv) {
+        PORT_SetError(SEC_ERROR_NO_MEMORY);
+    }
+    return rv;
+}
+
+void *
+PORT_ZAllocAligned(size_t bytes, size_t alignment, void **mem)
+{
+    size_t x = alignment - 1;
+
+    if ((alignment == 0) || (alignment & (alignment - 1))) {
+        PORT_SetError(SEC_ERROR_INVALID_ARGS);
+        return NULL;
+    }
+
+    if (!mem) {
+        return NULL;
+    }
+
+    *mem = PORT_ZAlloc((bytes ? bytes : 1) + x);
+    if (!*mem) {
+        PORT_SetError(SEC_ERROR_NO_MEMORY);
+        return NULL;
+    }
+
+    return (void *)(((uintptr_t)*mem + x) & ~(uintptr_t)x);
+}
+
+void *
+PORT_ZAllocAlignedOffset(size_t size, size_t alignment, size_t offset)
+{
+    PORT_Assert(offset < size);
+    if (offset > size) {
+        return NULL;
+    }
+
+    void *mem = NULL;
+    void *v = PORT_ZAllocAligned(size, alignment, &mem);
+    if (!v) {
+        return NULL;
+    }
+
+    PORT_Assert(mem);
+    *((void **)((uintptr_t)v + offset)) = mem;
+    return v;
+}
+
+void
+PORT_Free(void *ptr)
+{
+    if (ptr) {
+        PR_Free(ptr);
+    }
+}
+
+void
+PORT_ZFree(void *ptr, size_t len)
+{
+    if (ptr) {
+        memset(ptr, 0, len);
+        PR_Free(ptr);
+    }
+}
+
+char *
+PORT_Strdup(const char *str)
+{
+    size_t len = PORT_Strlen(str) + 1;
+    char *newstr;
+
+    newstr = (char *)PORT_Alloc(len);
+    if (newstr) {
+        PORT_Memcpy(newstr, str, len);
+    }
+    return newstr;
+}
+
+void
+PORT_SetError(int value)
+{
+    PR_SetError(value, 0);
+    return;
+}
+
+int
+PORT_GetError(void)
+{
+    return (PR_GetError());
+}
+
+void
+PORT_SafeZero(void *p, size_t n)
+{
+#if defined(__STDC_LIB_EXT1__)
+    memset_s(p, n, 0, n);
+#else
+#if (defined(_DEFAULT_SOURCE) || defined(_BSD_SOURCE)) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 25))
+    explicit_bzero(p, n);
+#else
+    if (p != NULL) {
+        volatile unsigned char *__vl = (unsigned char *)p;
+        size_t __nl = n;
+        while (__nl--)
+            *__vl++ = 0;
+    }
+#endif
+#endif
+}
+
+PLArenaPool *
+PORT_NewArena(unsigned long chunksize)
+{
+    PORTArenaPool *pool;
+
+    if (chunksize > MAX_SIZE) {
+        PORT_SetError(SEC_ERROR_NO_MEMORY);
+        return NULL;
+    }
+    pool = PORT_ZNew(PORTArenaPool);
+    if (!pool) {
+        return NULL;
+    }
+    pool->magic = ARENAPOOL_MAGIC;
+    pool->lock = PR_NewLock();
+    if (!pool->lock) {
+        PORT_Free(pool);
+        return NULL;
+    }
+    PL_InitArenaPool(&pool->arena, "security", chunksize, sizeof(double));
+    return (&pool->arena);
+}
+
+void
+PORT_InitCheapArena(PORTCheapArenaPool *pool, unsigned long chunksize)
+{
+    pool->magic = CHEAP_ARENAPOOL_MAGIC;
+    PL_InitArenaPool(&pool->arena, "security", chunksize, sizeof(double));
+}
+
+void *
+PORT_ArenaAlloc(PLArenaPool *arena, size_t size)
+{
+    void *p = NULL;
+
+    PORTArenaPool *pool = (PORTArenaPool *)arena;
+
+    if (size <= 0) {
+        size = 1;
+    }
+
+    if (size > MAX_SIZE) {
+    } else
+        if (ARENAPOOL_MAGIC == pool->magic) {
+            PR_Lock(pool->lock);
+#if defined(THREADMARK)
+            if (pool->marking_thread &&
+                pool->marking_thread != PR_GetCurrentThread()) {
+                PR_Unlock(pool->lock);
+                PORT_SetError(SEC_ERROR_NO_MEMORY);
+                PORT_Assert(0);
+                return NULL;
+            } 
+#endif
+            PL_ARENA_ALLOCATE(p, arena, size);
+            PR_Unlock(pool->lock);
+        } else {
+            PL_ARENA_ALLOCATE(p, arena, size);
+        }
+
+    if (!p) {
+        PORT_SetError(SEC_ERROR_NO_MEMORY);
+    }
+
+    return (p);
+}
+
+void *
+PORT_ArenaZAlloc(PLArenaPool *arena, size_t size)
+{
+    void *p;
+
+    if (size <= 0)
+        size = 1;
+
+    p = PORT_ArenaAlloc(arena, size);
+
+    if (p) {
+        PORT_Memset(p, 0, size);
+    }
+
+    return (p);
+}
+
+static PRCallOnceType setupUseFreeListOnce;
+static PRBool useFreeList;
+
+static PRStatus
+SetupUseFreeList(void)
+{
+    useFreeList = (PR_GetEnvSecure("NSS_DISABLE_ARENA_FREE_LIST") == NULL);
+    return PR_SUCCESS;
+}
+
+void
+PORT_FreeArena(PLArenaPool *arena, PRBool zero)
+{
+    PORTArenaPool *pool = (PORTArenaPool *)arena;
+    PRLock *lock = (PRLock *)0;
+    size_t len = sizeof *arena;
+
+    if (!pool)
+        return;
+    if (ARENAPOOL_MAGIC == pool->magic) {
+        len = sizeof *pool;
+        lock = pool->lock;
+        PR_Lock(lock);
+    }
+    if (zero) {
+        PL_ClearArenaPool(arena, 0);
+    }
+    (void)PR_CallOnce(&setupUseFreeListOnce, &SetupUseFreeList);
+    if (useFreeList) {
+        PL_FreeArenaPool(arena);
+    } else {
+        PL_FinishArenaPool(arena);
+    }
+    PORT_ZFree(arena, len);
+    if (lock) {
+        PR_Unlock(lock);
+        PR_DestroyLock(lock);
+    }
+}
+
+void
+PORT_DestroyCheapArena(PORTCheapArenaPool *pool)
+{
+    (void)PR_CallOnce(&setupUseFreeListOnce, &SetupUseFreeList);
+    if (useFreeList) {
+        PL_FreeArenaPool(&pool->arena);
+    } else {
+        PL_FinishArenaPool(&pool->arena);
+    }
+}
+
+void *
+PORT_ArenaGrow(PLArenaPool *arena, void *ptr, size_t oldsize, size_t newsize)
+{
+    PORTArenaPool *pool = (PORTArenaPool *)arena;
+    PORT_Assert(newsize >= oldsize);
+
+    if (newsize > MAX_SIZE) {
+        PORT_SetError(SEC_ERROR_NO_MEMORY);
+        return NULL;
+    }
+
+    if (ARENAPOOL_MAGIC == pool->magic) {
+        PR_Lock(pool->lock);
+        PL_ARENA_GROW(ptr, arena, oldsize, (newsize - oldsize));
+        PR_Unlock(pool->lock);
+    } else {
+        PL_ARENA_GROW(ptr, arena, oldsize, (newsize - oldsize));
+    }
+
+    return (ptr);
+}
+
+void *
+PORT_ArenaMark(PLArenaPool *arena)
+{
+    void *result;
+
+    PORTArenaPool *pool = (PORTArenaPool *)arena;
+    if (ARENAPOOL_MAGIC == pool->magic) {
+        PR_Lock(pool->lock);
+#if defined(THREADMARK)
+        {
+            threadmark_mark *tm, **pw;
+            PRThread *currentThread = PR_GetCurrentThread();
+
+            if (!pool->marking_thread) {
+                pool->marking_thread = currentThread;
+            } else if (currentThread != pool->marking_thread) {
+                PR_Unlock(pool->lock);
+                PORT_SetError(SEC_ERROR_NO_MEMORY);
+                PORT_Assert(0);
+                return NULL;
+            }
+
+            result = PL_ARENA_MARK(arena);
+            PL_ARENA_ALLOCATE(tm, arena, sizeof(threadmark_mark));
+            if (!tm) {
+                PR_Unlock(pool->lock);
+                PORT_SetError(SEC_ERROR_NO_MEMORY);
+                return NULL;
+            }
+
+            tm->mark = result;
+            tm->next = (threadmark_mark *)NULL;
+
+            pw = &pool->first_mark;
+            while (*pw) {
+                pw = &(*pw)->next;
+            }
+
+            *pw = tm;
+        }
+#else
+        result = PL_ARENA_MARK(arena);
+#endif
+        PR_Unlock(pool->lock);
+    } else {
+        result = PL_ARENA_MARK(arena);
+    }
+    return result;
+}
+
+static void
+port_ArenaZeroAfterMark(PLArenaPool *arena, void *mark)
+{
+    PLArena *a = arena->current;
+    if (a->base <= (PRUword)mark && (PRUword)mark <= a->avail) {
+#if defined(PL_MAKE_MEM_UNDEFINED)
+        PL_MAKE_MEM_UNDEFINED(mark, a->avail - (PRUword)mark);
+#endif
+        memset(mark, 0, a->avail - (PRUword)mark);
+    } else {
+        for (a = arena->first.next; a; a = a->next) {
+            PR_ASSERT(a->base <= a->avail && a->avail <= a->limit);
+            if (a->base <= (PRUword)mark && (PRUword)mark <= a->avail) {
+#if defined(PL_MAKE_MEM_UNDEFINED)
+                PL_MAKE_MEM_UNDEFINED(mark, a->avail - (PRUword)mark);
+#endif
+                memset(mark, 0, a->avail - (PRUword)mark);
+                a = a->next;
+                break;
+            }
+        }
+        for (; a; a = a->next) {
+            PR_ASSERT(a->base <= a->avail && a->avail <= a->limit);
+#if defined(PL_MAKE_MEM_UNDEFINED)
+            PL_MAKE_MEM_UNDEFINED((void *)a->base, a->avail - a->base);
+#endif
+            memset((void *)a->base, 0, a->avail - a->base);
+        }
+    }
+}
+
+static void
+port_ArenaRelease(PLArenaPool *arena, void *mark, PRBool zero)
+{
+    PORTArenaPool *pool = (PORTArenaPool *)arena;
+    if (ARENAPOOL_MAGIC == pool->magic) {
+        PR_Lock(pool->lock);
+#if defined(THREADMARK)
+        {
+            threadmark_mark **pw;
+
+            if (PR_GetCurrentThread() != pool->marking_thread) {
+                PR_Unlock(pool->lock);
+                PORT_SetError(SEC_ERROR_NO_MEMORY);
+                PORT_Assert(0);
+                return ;
+            }
+
+            pw = &pool->first_mark;
+            while (*pw && (mark != (*pw)->mark)) {
+                pw = &(*pw)->next;
+            }
+
+            if (!*pw) {
+                PR_Unlock(pool->lock);
+                PORT_SetError(SEC_ERROR_NO_MEMORY);
+                PORT_Assert(0);
+                return ;
+            }
+
+            *pw = (threadmark_mark *)NULL;
+
+            if (zero) {
+                port_ArenaZeroAfterMark(arena, mark);
+            }
+            PL_ARENA_RELEASE(arena, mark);
+
+            if (!pool->first_mark) {
+                pool->marking_thread = (PRThread *)NULL;
+            }
+        }
+#else
+        if (zero) {
+            port_ArenaZeroAfterMark(arena, mark);
+        }
+        PL_ARENA_RELEASE(arena, mark);
+#endif
+        PR_Unlock(pool->lock);
+    } else {
+        if (zero) {
+            port_ArenaZeroAfterMark(arena, mark);
+        }
+        PL_ARENA_RELEASE(arena, mark);
+    }
+}
+
+void
+PORT_ArenaRelease(PLArenaPool *arena, void *mark)
+{
+    port_ArenaRelease(arena, mark, PR_FALSE);
+}
+
+void
+PORT_ArenaZRelease(PLArenaPool *arena, void *mark)
+{
+    port_ArenaRelease(arena, mark, PR_TRUE);
+}
+
+void
+PORT_ArenaUnmark(PLArenaPool *arena, void *mark)
+{
+#if defined(THREADMARK)
+    PORTArenaPool *pool = (PORTArenaPool *)arena;
+    if (ARENAPOOL_MAGIC == pool->magic) {
+        threadmark_mark **pw;
+
+        PR_Lock(pool->lock);
+
+        if (PR_GetCurrentThread() != pool->marking_thread) {
+            PR_Unlock(pool->lock);
+            PORT_SetError(SEC_ERROR_NO_MEMORY);
+            PORT_Assert(0);
+            return ;
+        }
+
+        pw = &pool->first_mark;
+        while (((threadmark_mark *)NULL != *pw) && (mark != (*pw)->mark)) {
+            pw = &(*pw)->next;
+        }
+
+        if ((threadmark_mark *)NULL == *pw) {
+            PR_Unlock(pool->lock);
+            PORT_SetError(SEC_ERROR_NO_MEMORY);
+            PORT_Assert(0);
+            return ;
+        }
+
+        *pw = (threadmark_mark *)NULL;
+
+        if (!pool->first_mark) {
+            pool->marking_thread = (PRThread *)NULL;
+        }
+
+        PR_Unlock(pool->lock);
+    }
+#endif
+}
+
+char *
+PORT_ArenaStrdup(PLArenaPool *arena, const char *str)
+{
+    int len = PORT_Strlen(str) + 1;
+    char *newstr;
+
+    newstr = (char *)PORT_ArenaAlloc(arena, len);
+    if (newstr) {
+        PORT_Memcpy(newstr, str, len);
+    }
+    return newstr;
+}
+
+
+
+void
+PORT_SetUCS4_UTF8ConversionFunction(PORTCharConversionFunc convFunc)
+{
+    ucs4Utf8ConvertFunc = convFunc;
+}
+
+void
+PORT_SetUCS2_ASCIIConversionFunction(PORTCharConversionWSwapFunc convFunc)
+{
+    ucs2AsciiConvertFunc = convFunc;
+}
+
+void
+PORT_SetUCS2_UTF8ConversionFunction(PORTCharConversionFunc convFunc)
+{
+    ucs2Utf8ConvertFunc = convFunc;
+}
+
+PRBool
+PORT_UCS4_UTF8Conversion(PRBool toUnicode, unsigned char *inBuf,
+                         unsigned int inBufLen, unsigned char *outBuf,
+                         unsigned int maxOutBufLen, unsigned int *outBufLen)
+{
+    if (!ucs4Utf8ConvertFunc) {
+        return sec_port_ucs4_utf8_conversion_function(toUnicode,
+                                                      inBuf, inBufLen, outBuf, maxOutBufLen, outBufLen);
+    }
+
+    return (*ucs4Utf8ConvertFunc)(toUnicode, inBuf, inBufLen, outBuf,
+                                  maxOutBufLen, outBufLen);
+}
+
+PRBool
+PORT_UCS2_UTF8Conversion(PRBool toUnicode, unsigned char *inBuf,
+                         unsigned int inBufLen, unsigned char *outBuf,
+                         unsigned int maxOutBufLen, unsigned int *outBufLen)
+{
+    if (!ucs2Utf8ConvertFunc) {
+        return sec_port_ucs2_utf8_conversion_function(toUnicode,
+                                                      inBuf, inBufLen, outBuf, maxOutBufLen, outBufLen);
+    }
+
+    return (*ucs2Utf8ConvertFunc)(toUnicode, inBuf, inBufLen, outBuf,
+                                  maxOutBufLen, outBufLen);
+}
+
+PRBool
+PORT_ISO88591_UTF8Conversion(const unsigned char *inBuf,
+                             unsigned int inBufLen, unsigned char *outBuf,
+                             unsigned int maxOutBufLen, unsigned int *outBufLen)
+{
+    return sec_port_iso88591_utf8_conversion_function(inBuf, inBufLen,
+                                                      outBuf, maxOutBufLen, outBufLen);
+}
+
+PRBool
+PORT_UCS2_ASCIIConversion(PRBool toUnicode, unsigned char *inBuf,
+                          unsigned int inBufLen, unsigned char *outBuf,
+                          unsigned int maxOutBufLen, unsigned int *outBufLen,
+                          PRBool swapBytes)
+{
+    if (!ucs2AsciiConvertFunc) {
+        return PR_FALSE;
+    }
+
+    return (*ucs2AsciiConvertFunc)(toUnicode, inBuf, inBufLen, outBuf,
+                                   maxOutBufLen, outBufLen, swapBytes);
+}
+
+int
+NSS_PutEnv(const char *envVarName, const char *envValue)
+{
+    SECStatus result = SECSuccess;
+#if defined(__GNUC__) && __GNUC__ >= 7
+    int setEnvFailed;
+    setEnvFailed = setenv(envVarName, envValue, 1);
+    if (setEnvFailed) {
+        SET_ERROR_CODE
+        return SECFailure;
+    }
+#else
+    char *encoded = (char *)PORT_ZAlloc(strlen(envVarName) + 2 + strlen(envValue));
+    if (!encoded) {
+        return SECFailure;
+    }
+    strcpy(encoded, envVarName);
+    strcat(encoded, "=");
+    strcat(encoded, envValue);
+    int putEnvFailed = putenv(encoded); 
+
+    if (putEnvFailed) {
+        SET_ERROR_CODE
+        result = SECFailure;
+        PORT_Free(encoded);
+    }
+#endif
+    return result;
+}
+
+int
+NSS_SecureMemcmp(const void *ia, const void *ib, size_t n)
+{
+    const unsigned char *a = (const unsigned char *)ia;
+    const unsigned char *b = (const unsigned char *)ib;
+    int r = 0;
+
+    for (size_t i = 0; i < n; ++i) {
+        r |= a[i] ^ b[i];
+    }
+
+    return 1 & (-r >> 8);
+}
+
+unsigned int
+NSS_SecureMemcmpZero(const void *mem, size_t n)
+{
+    const unsigned char *a = (const unsigned char *)mem;
+    int r = 0;
+
+    for (size_t i = 0; i < n; ++i) {
+        r |= a[i];
+    }
+
+    return 1 & (-r >> 8);
+}
+
+static inline int
+value_barrier_int(int x)
+{
+#if defined(__GNUC__) || defined(__clang__)
+    __asm__(""
+            : "+r"(x)
+            : );
+    return x;
+#else
+    volatile int y = x;
+    return y;
+#endif
+}
+
+void
+NSS_SecureSelect(void *dest, const void *src0, const void *src1, size_t n, unsigned char b)
+
+{
+    int w = value_barrier_int(b);
+
+    unsigned char mask = 0xff & (-w >> 8);
+
+    for (size_t i = 0; i < n; ++i) {
+        unsigned char s0i = ((unsigned char *)src0)[i];
+        unsigned char s1i = ((unsigned char *)src1)[i];
+        ((unsigned char *)dest)[i] = s0i ^ (mask & (s0i ^ s1i));
+    }
+}
+
+PRBool
+NSS_GetSystemFIPSEnabled(void)
+{
+#if !defined(NSS_FIPS_DISABLED)
+    const char *env;
+
+    env = PR_GetEnvSecure("NSS_FIPS");
+    if (env && (*env == 'y' || *env == '1' || *env == 'Y' ||
+                (PORT_Strcasecmp(env, "fips") == 0) ||
+                (PORT_Strcasecmp(env, "true") == 0) ||
+                (PORT_Strcasecmp(env, "on") == 0))) {
+        return PR_TRUE;
+    }
+
+#if defined(LINUX)
+    {
+        FILE *f;
+        char d;
+        size_t size;
+        f = fopen("/proc/sys/crypto/fips_enabled", "r");
+        if (!f)
+            return PR_FALSE;
+
+        size = fread(&d, 1, 1, f);
+        fclose(f);
+        if (size != 1)
+            return PR_FALSE;
+        if (d == '1')
+            return PR_TRUE;
+    }
+#endif
+#endif
+    return PR_FALSE;
+}

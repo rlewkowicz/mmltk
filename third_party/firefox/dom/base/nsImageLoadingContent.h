@@ -1,0 +1,294 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsImageLoadingContent_h_
+#define nsImageLoadingContent_h_
+
+#include "Units.h"
+#include "imgINotificationObserver.h"
+#include "mozilla/CORSMode.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/RustTypes.h"
+#include "nsAttrValue.h"
+#include "nsCOMPtr.h"
+#include "nsIContentPolicy.h"
+#include "nsIImageLoadingContent.h"
+#include "nsIRequest.h"
+
+class nsINode;
+class nsIURI;
+class nsPresContext;
+class nsIContent;
+class imgRequestProxy;
+class ImageLoadTask;
+
+namespace mozilla {
+class AsyncEventDispatcher;
+class ErrorResult;
+
+namespace dom {
+struct BindContext;
+class Document;
+class Element;
+enum class FetchPriority : uint8_t;
+}  
+}  
+
+#ifdef LoadImage
+#  undef LoadImage
+#endif
+
+class nsImageLoadingContent : public nsIImageLoadingContent {
+ protected:
+  friend class ImageLoadTask;
+  template <typename T>
+  using Maybe = mozilla::Maybe<T>;
+  using Nothing = mozilla::Nothing;
+  using OnNonvisible = mozilla::OnNonvisible;
+  using Visibility = mozilla::Visibility;
+
+ public:
+  nsImageLoadingContent();
+  virtual ~nsImageLoadingContent();
+
+  NS_DECL_IMGINOTIFICATIONOBSERVER
+  NS_DECL_NSIIMAGELOADINGCONTENT
+
+
+  bool LoadingEnabled() const { return mLoadingEnabled; }
+  void AddObserver(imgINotificationObserver* aObserver);
+  void RemoveObserver(imgINotificationObserver* aObserver);
+  already_AddRefed<imgIRequest> GetRequest(int32_t aRequestType,
+                                           mozilla::ErrorResult& aError);
+  int32_t GetRequestType(imgIRequest* aRequest, mozilla::ErrorResult& aError);
+  already_AddRefed<nsIURI> GetCurrentURI();
+  already_AddRefed<nsIURI> GetCurrentRequestFinalURI();
+  void ForceReload(bool aNotify, mozilla::ErrorResult& aError);
+
+  mozilla::dom::Element* FindImageMap();
+  static mozilla::dom::Element* FindImageMap(mozilla::dom::Element*);
+
+  void SetSyncDecodingHint(bool aHint);
+
+  void NotifyOwnerDocumentActivityChanged();
+
+  already_AddRefed<mozilla::dom::Promise> RecognizeCurrentImageText(
+      mozilla::ErrorResult&);
+
+ protected:
+  enum ImageLoadType {
+    eImageLoadType_Normal,
+    eImageLoadType_Imageset
+  };
+
+  nsresult LoadImage(const nsAString& aNewURI, bool aForce, bool aNotify,
+                     ImageLoadType aImageLoadType,
+                     nsIPrincipal* aTriggeringPrincipal = nullptr);
+
+  mozilla::dom::ElementState ImageState() const;
+
+  nsresult LoadImage(nsIURI* aNewURI, bool aForce, bool aNotify,
+                     ImageLoadType aImageLoadType, nsLoadFlags aLoadFlags,
+                     mozilla::dom::Document* aDocument = nullptr,
+                     nsIPrincipal* aTriggeringPrincipal = nullptr);
+
+  nsresult LoadImage(nsIURI* aNewURI, bool aForce, bool aNotify,
+                     ImageLoadType aImageLoadType,
+                     nsIPrincipal* aTriggeringPrincipal) {
+    return LoadImage(aNewURI, aForce, aNotify, aImageLoadType, LoadFlags(),
+                     nullptr, aTriggeringPrincipal);
+  }
+
+  mozilla::dom::Document* GetOurOwnerDoc();
+  mozilla::dom::Document* GetOurCurrentDoc();
+
+  nsIFrame* GetOurPrimaryImageFrame();
+
+  nsPresContext* GetFramePresContext();
+
+  void CancelImageRequests(bool aNotify);
+
+  void Destroy();
+
+  virtual mozilla::CORSMode GetCORSMode();
+
+  void BindToTree(mozilla::dom::BindContext&, nsINode& aParent);
+  void UnbindFromTree();
+
+  void OnLoadComplete(imgIRequest* aRequest, uint32_t aImageStatus);
+  void OnUnlockedDraw();
+  void OnImageIsAnimated(imgIRequest* aRequest);
+
+  static nsContentPolicyType PolicyTypeForLoad(ImageLoadType aImageLoadType);
+
+  void AsyncEventRunning(mozilla::AsyncEventDispatcher* aEvent);
+
+  virtual nsIContent* AsContent() = 0;
+
+  virtual mozilla::dom::FetchPriority GetFetchPriorityForImage() const;
+
+  enum class DoDensityCorrection : bool { No, Yes };
+  mozilla::CSSIntSize NaturalSize(
+      DoDensityCorrection = DoDensityCorrection::Yes);
+
+  MOZ_CAN_RUN_SCRIPT mozilla::CSSIntSize GetWidthHeightForImage();
+
+  already_AddRefed<mozilla::dom::Promise> QueueDecodeAsync(
+      mozilla::ErrorResult& aRv);
+
+  enum class ImageDecodingType : uint8_t {
+    Auto,
+    Async,
+    Sync,
+  };
+
+  static constexpr nsAttrValue::EnumTableEntry kDecodingTable[] = {
+      {"auto", nsImageLoadingContent::ImageDecodingType::Auto},
+      {"async", nsImageLoadingContent::ImageDecodingType::Async},
+      {"sync", nsImageLoadingContent::ImageDecodingType::Sync},
+  };
+  static constexpr const nsAttrValue::EnumTableEntry* kDecodingTableDefault =
+      &nsImageLoadingContent::kDecodingTable[0];
+
+ private:
+  void DecodeAsync(RefPtr<mozilla::dom::Promise>&& aPromise,
+                   uint32_t aRequestGeneration);
+
+  void MaybeResolveDecodePromises();
+
+  void RejectDecodePromises(nsresult aStatus);
+
+  void MaybeAgeRequestGeneration(nsIURI* aNewURI);
+
+  void MaybeDeregisterActivityObserver();
+
+  struct ImageObserver {
+    explicit ImageObserver(imgINotificationObserver* aObserver);
+    ~ImageObserver();
+
+    nsCOMPtr<imgINotificationObserver> mObserver;
+    ImageObserver* mNext;
+  };
+
+  class ScriptedImageObserver final {
+   public:
+    NS_INLINE_DECL_REFCOUNTING(ScriptedImageObserver)
+
+    ScriptedImageObserver(imgINotificationObserver* aObserver,
+                          RefPtr<imgRequestProxy>&& aCurrentRequest,
+                          RefPtr<imgRequestProxy>&& aPendingRequest);
+    bool CancelRequests();
+
+    nsCOMPtr<imgINotificationObserver> mObserver;
+    RefPtr<imgRequestProxy> mCurrentRequest;
+    RefPtr<imgRequestProxy> mPendingRequest;
+
+   private:
+    ~ScriptedImageObserver();
+  };
+
+  nsresult FireEvent(const nsAString& aEventType, bool aIsCancelable = false);
+
+  void CancelPendingEvent();
+
+  RefPtr<mozilla::AsyncEventDispatcher> mPendingEvent;
+
+ protected:
+  void UpdateImageState(bool aNotify);
+
+  nsresult StringToURI(const nsAString& aSpec,
+                       mozilla::dom::Document* aDocument, nsIURI** aURI);
+
+  RefPtr<imgRequestProxy>& PrepareNextRequest(ImageLoadType, nsIURI* aNewURI);
+
+  RefPtr<imgRequestProxy>& PrepareCurrentRequest(ImageLoadType,
+                                                 nsIURI* aNewURI);
+  RefPtr<imgRequestProxy>& PreparePendingRequest(ImageLoadType);
+
+  void MakePendingRequestCurrent();
+
+  void ClearCurrentRequest(
+      nsresult aReason,
+      const Maybe<OnNonvisible>& aNonvisibleAction = Nothing());
+  void ClearPendingRequest(
+      nsresult aReason,
+      const Maybe<OnNonvisible>& aNonvisibleAction = Nothing());
+
+  static bool HaveSize(imgIRequest* aImage);
+
+  void TrackImage(imgIRequest* aImage, nsIFrame* aFrame = nullptr);
+  void UntrackImage(imgIRequest* aImage,
+                    const Maybe<OnNonvisible>& aNonvisibleAction = Nothing());
+
+  nsLoadFlags LoadFlags();
+
+ private:
+  void CloneScriptedRequests(imgRequestProxy* aRequest);
+
+  void ClearScriptedRequests(int32_t aRequestType, nsresult aReason);
+
+  void MakePendingScriptedRequestsCurrent();
+
+  void MaybeForceSyncDecoding(bool aPrepareNextRequest,
+                              nsIFrame* aFrame = nullptr);
+
+ protected:
+  void QueueImageTask(nsIURI* aURI, nsIPrincipal* aSrcTriggeringPrincipal,
+                      bool aForceAsync, bool aAlwaysLoad, bool aNotify);
+  void QueueImageTask(nsIURI* aURI, bool aAlwaysLoad, bool aNotify) {
+    QueueImageTask(aURI, nullptr, false, aAlwaysLoad, aNotify);
+  }
+
+  void ClearImageLoadTask();
+
+  virtual void LoadSelectedImage(bool aAlwaysLoad, bool aStopLazyLoading) = 0;
+
+  RefPtr<ImageLoadTask> mPendingImageLoadTask;
+
+  RefPtr<imgRequestProxy> mCurrentRequest;
+  RefPtr<imgRequestProxy> mPendingRequest;
+
+ private:
+  ImageObserver mObserverList;
+
+  nsTArray<RefPtr<ScriptedImageObserver>> mScriptedObservers;
+
+  nsCOMPtr<nsIURI> mCurrentURI;
+
+  mozilla::TimeStamp mMostRecentRequestChange;
+
+  nsTArray<RefPtr<mozilla::dom::Promise>> mDecodePromises;
+
+  size_t mOutstandingDecodePromises = 0;
+
+  uint32_t mRequestGeneration = 0;
+
+ protected:
+  bool mLoadingEnabled : 1 = true;
+  bool mUseUrgentStartForChannel : 1 = false;
+
+  bool mLazyLoading : 1 = false;
+
+  bool mSyncDecodingHint : 1 = false;
+
+  bool mInDocResponsiveContent : 1 = false;
+
+  bool mObservingResize : 1 = false;
+
+ private:
+  bool mCurrentRequestRegistered = false;
+  bool mPendingRequestRegistered = false;
+
+  enum {
+    REQUEST_IS_TRACKED = 1 << 0,
+    REQUEST_IS_IMAGESET = 1 << 1,
+  };
+  uint8_t mCurrentRequestFlags = 0;
+  uint8_t mPendingRequestFlags = 0;
+};
+
+#endif  // nsImageLoadingContent_h_

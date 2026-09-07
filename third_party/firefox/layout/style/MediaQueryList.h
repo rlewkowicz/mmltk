@@ -1,0 +1,77 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_dom_MediaQueryList_h
+#define mozilla_dom_MediaQueryList_h
+
+#include "mozilla/DOMEventTargetHelper.h"
+#include "mozilla/LinkedList.h"
+#include "mozilla/dom/MediaQueryListBinding.h"
+#include "nsCOMPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsISupports.h"
+#include "nsTArray.h"
+#include "nsWrapperCache.h"
+
+namespace mozilla::dom {
+
+class MediaList;
+
+class MediaQueryList final : public DOMEventTargetHelper,
+                             public LinkedListElement<MediaQueryList> {
+ public:
+  MediaQueryList(Document* aDocument, const nsACString& aMediaQueryList,
+                 CallerType);
+
+ private:
+  ~MediaQueryList();
+
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(MediaQueryList, DOMEventTargetHelper)
+
+  nsISupports* GetParentObject() const;
+
+  void MediaFeatureValuesChanged();
+
+  [[nodiscard]] bool EvaluateOnRenderingUpdate();
+  void FireChangeEvent();
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  void GetMedia(nsACString& aMedia) const;
+  bool Matches();
+  void AddListener(EventListener* aListener);
+  void RemoveListener(EventListener* aListener);
+
+  IMPL_EVENT_HANDLER(change)
+
+  bool HasListeners() const;
+
+  void Disconnect();
+
+  size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const;
+
+ private:
+  void LastRelease() final {
+    auto* listElement = static_cast<LinkedListElement<MediaQueryList>*>(this);
+    if (listElement->isInList()) {
+      listElement->remove();
+    }
+  }
+
+  void RecomputeMatches();
+
+  RefPtr<Document> mDocument;
+  const RefPtr<const MediaList> mMediaList;
+  const bool mViewportDependent : 1;
+  bool mMatches : 1;
+  bool mMatchesOnRenderingUpdate : 1;
+};
+
+}  
+
+#endif /* !defined(mozilla_dom_MediaQueryList_h) */

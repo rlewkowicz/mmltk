@@ -1,0 +1,412 @@
+// Copyright 2017 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// IWYU pragma: private, include "absl/strings/str_split.h"
+
+#ifndef ABSL_STRINGS_INTERNAL_STR_SPLIT_INTERNAL_H_
+#define ABSL_STRINGS_INTERNAL_STR_SPLIT_INTERNAL_H_
+
+#include <array>
+#include <cassert>
+#include <cstddef>
+#include <initializer_list>
+#include <iterator>
+#include <tuple>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+#include "absl/base/macros.h"
+#include "absl/base/port.h"
+#include "absl/meta/type_traits.h"
+#include "absl/strings/string_view.h"
+
+#ifdef _GLIBCXX_DEBUG
+#include "absl/strings/internal/stl_type_traits.h"
+#endif  // _GLIBCXX_DEBUG
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace strings_internal {
+
+class ConvertibleToStringView {
+ public:
+  ConvertibleToStringView(const char* s)  // NOLINT(runtime/explicit)
+      : value_(s) {
+    assert(s != nullptr);
+  }
+  ConvertibleToStringView(char* s) : value_(s) {  // NOLINT(runtime/explicit)
+    assert(s != nullptr);
+  }
+  ConvertibleToStringView(absl::string_view s)     // NOLINT(runtime/explicit)
+      : value_(s) {}
+  ConvertibleToStringView(const std::string& s)  // NOLINT(runtime/explicit)
+      : value_(s) {}
+
+  ConvertibleToStringView(std::string&& s) = delete;
+  ConvertibleToStringView(const std::string&& s) = delete;
+
+  absl::string_view value() const { return value_; }
+
+ private:
+  absl::string_view value_;
+};
+
+template <typename Splitter>
+class SplitIterator {
+ public:
+  using iterator_category = std::input_iterator_tag;
+  using value_type = absl::string_view;
+  using difference_type = ptrdiff_t;
+  using pointer = const value_type*;
+  using reference = const value_type&;
+
+  enum State { kInitState, kLastState, kEndState };
+  SplitIterator(State state, const Splitter* splitter)
+      : pos_(0),
+        state_(state),
+        splitter_(splitter),
+        delimiter_(splitter->delimiter()),
+        predicate_(splitter->predicate()) {
+    if (splitter_->text().data() == nullptr) {
+      state_ = kEndState;
+      pos_ = splitter_->text().size();
+      return;
+    }
+
+    if (state_ == kEndState) {
+      pos_ = splitter_->text().size();
+    } else {
+      ++(*this);
+    }
+  }
+
+  bool at_end() const { return state_ == kEndState; }
+
+  reference operator*() const { return curr_; }
+  pointer operator->() const { return &curr_; }
+
+  SplitIterator& operator++() {
+    do {
+      if (state_ == kLastState) {
+        state_ = kEndState;
+        return *this;
+      }
+      const absl::string_view text = splitter_->text();
+      const absl::string_view d = delimiter_.Find(text, pos_);
+      if (d.data() == text.data() + text.size()) state_ = kLastState;
+      curr_ = text.substr(pos_,
+                          static_cast<size_t>(d.data() - (text.data() + pos_)));
+      pos_ += curr_.size() + d.size();
+    } while (!predicate_(curr_));
+    return *this;
+  }
+
+  SplitIterator operator++(int) {
+    SplitIterator old(*this);
+    ++(*this);
+    return old;
+  }
+
+  friend bool operator==(const SplitIterator& a, const SplitIterator& b) {
+    return a.state_ == b.state_ && a.pos_ == b.pos_;
+  }
+
+  friend bool operator!=(const SplitIterator& a, const SplitIterator& b) {
+    return !(a == b);
+  }
+
+ private:
+  size_t pos_;
+  State state_;
+  absl::string_view curr_;
+  const Splitter* splitter_;
+  typename Splitter::DelimiterType delimiter_;
+  typename Splitter::PredicateType predicate_;
+};
+
+template <typename T, typename = void>
+struct HasMappedType : std::false_type {};
+template <typename T>
+struct HasMappedType<T, std::void_t<typename T::mapped_type>> : std::true_type {
+};
+
+template <typename T, typename = void>
+struct HasValueType : std::false_type {};
+template <typename T>
+struct HasValueType<T, std::void_t<typename T::value_type>> : std::true_type {};
+
+template <typename T, typename = void>
+struct HasConstIterator : std::false_type {};
+template <typename T>
+struct HasConstIterator<T, std::void_t<typename T::const_iterator>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct HasEmplace : std::false_type {};
+template <typename T>
+struct HasEmplace<T, std::void_t<decltype(std::declval<T>().emplace())>>
+    : std::true_type {};
+
+std::false_type IsInitializerListDispatch(...);  
+template <typename T>
+std::true_type IsInitializerListDispatch(std::initializer_list<T>*);
+template <typename T>
+struct IsInitializerList
+    : decltype(IsInitializerListDispatch(static_cast<T*>(nullptr))){};
+
+
+template <typename C, bool has_value_type, bool has_mapped_type>
+struct SplitterIsConvertibleToImpl : std::false_type {};
+
+template <typename C>
+struct SplitterIsConvertibleToImpl<C, true, false>
+    : std::is_constructible<typename C::value_type, absl::string_view> {};
+
+template <typename C>
+struct SplitterIsConvertibleToImpl<C, true, true>
+    : std::conjunction<
+          std::is_constructible<typename C::key_type, absl::string_view>,
+          std::is_constructible<typename C::mapped_type, absl::string_view>> {};
+
+template <typename C>
+struct SplitterIsConvertibleTo
+    : SplitterIsConvertibleToImpl<
+          C,
+#ifdef _GLIBCXX_DEBUG
+          !IsStrictlyBaseOfAndConvertibleToSTLContainer<C>::value &&
+#endif  // _GLIBCXX_DEBUG
+              !IsInitializerList<std::remove_reference_t<C>>::value &&
+              HasValueType<C>::value && HasConstIterator<C>::value,
+          HasMappedType<C>::value> {
+};
+
+template <typename StringType, typename Container, typename = void>
+struct ShouldUseLifetimeBound : std::false_type {};
+
+template <typename StringType, typename Container>
+struct ShouldUseLifetimeBound<
+    StringType, Container,
+    std::enable_if_t<
+        std::is_same_v<StringType, std::string> &&
+        std::is_same_v<typename Container::value_type, absl::string_view>>>
+    : std::true_type {};
+
+template <typename StringType, typename First, typename Second>
+using ShouldUseLifetimeBoundForPair =
+    std::integral_constant<bool,
+                           std::is_same_v<StringType, std::string> &&
+                               (std::is_same_v<First, absl::string_view> ||
+                                std::is_same_v<Second, absl::string_view>)>;
+
+template <typename StringType, typename ElementType, std::size_t Size>
+using ShouldUseLifetimeBoundForArray =
+    std::integral_constant<bool,
+                           std::is_same_v<StringType, std::string> &&
+                               std::is_same_v<ElementType, absl::string_view>>;
+
+template <typename Delimiter, typename Predicate, typename StringType>
+class Splitter {
+ public:
+  using DelimiterType = Delimiter;
+  using PredicateType = Predicate;
+  using const_iterator = strings_internal::SplitIterator<Splitter>;
+  using value_type = typename std::iterator_traits<const_iterator>::value_type;
+
+  Splitter(StringType input_text, Delimiter d, Predicate p)
+      : text_(std::move(input_text)),
+        delimiter_(std::move(d)),
+        predicate_(std::move(p)) {}
+
+  absl::string_view text() const { return text_; }
+  const Delimiter& delimiter() const { return delimiter_; }
+  const Predicate& predicate() const { return predicate_; }
+
+  const_iterator begin() const { return {const_iterator::kInitState, this}; }
+  const_iterator end() const { return {const_iterator::kEndState, this}; }
+
+  template <
+      typename Container,
+      std::enable_if_t<ShouldUseLifetimeBound<StringType, Container>::value &&
+                           SplitterIsConvertibleTo<Container>::value,
+                       std::nullptr_t> = nullptr>
+  // NOLINTNEXTLINE(google-explicit-constructor)
+  operator Container() const ABSL_ATTRIBUTE_LIFETIME_BOUND {
+    return ConvertToContainer<Container, typename Container::value_type,
+                              HasMappedType<Container>::value>()(*this);
+  }
+
+  template <
+      typename Container,
+      std::enable_if_t<!ShouldUseLifetimeBound<StringType, Container>::value &&
+                           SplitterIsConvertibleTo<Container>::value,
+                       std::nullptr_t> = nullptr>
+  // NOLINTNEXTLINE(google-explicit-constructor)
+  operator Container() const {
+    return ConvertToContainer<Container, typename Container::value_type,
+                              HasMappedType<Container>::value>()(*this);
+  }
+
+  template <typename First, typename Second,
+            std::enable_if_t<
+                ShouldUseLifetimeBoundForPair<StringType, First, Second>::value,
+                std::nullptr_t> = nullptr>
+  // NOLINTNEXTLINE(google-explicit-constructor)
+  operator std::pair<First, Second>() const ABSL_ATTRIBUTE_LIFETIME_BOUND {
+    return ConvertToPair<First, Second>();
+  }
+
+  template <typename First, typename Second,
+            std::enable_if_t<!ShouldUseLifetimeBoundForPair<StringType, First,
+                                                            Second>::value,
+                             std::nullptr_t> = nullptr>
+  // NOLINTNEXTLINE(google-explicit-constructor)
+  operator std::pair<First, Second>() const {
+    return ConvertToPair<First, Second>();
+  }
+
+  template <typename ElementType, std::size_t Size,
+            std::enable_if_t<ShouldUseLifetimeBoundForArray<
+                                 StringType, ElementType, Size>::value,
+                             std::nullptr_t> = nullptr>
+  // NOLINTNEXTLINE(google-explicit-constructor)
+  operator std::array<ElementType, Size>() const ABSL_ATTRIBUTE_LIFETIME_BOUND {
+    return ConvertToArray<ElementType, Size>();
+  }
+
+  template <typename ElementType, std::size_t Size,
+            std::enable_if_t<!ShouldUseLifetimeBoundForArray<
+                                 StringType, ElementType, Size>::value,
+                             std::nullptr_t> = nullptr>
+  // NOLINTNEXTLINE(google-explicit-constructor)
+  operator std::array<ElementType, Size>() const {
+    return ConvertToArray<ElementType, Size>();
+  }
+
+ private:
+  template <typename ElementType, std::size_t Size>
+  std::array<ElementType, Size> ConvertToArray() const {
+    std::array<ElementType, Size> a;
+    auto it = begin();
+    for (std::size_t i = 0; i < Size && it != end(); ++i, ++it) {
+      a[i] = ElementType(*it);
+    }
+    return a;
+  }
+
+  template <typename First, typename Second>
+  std::pair<First, Second> ConvertToPair() const {
+    absl::string_view first, second;
+    auto it = begin();
+    if (it != end()) {
+      first = *it;
+      if (++it != end()) {
+        second = *it;
+      }
+    }
+    return {First(first), Second(second)};
+  }
+
+  template <typename Container, typename ValueType, bool is_map = false>
+  struct ConvertToContainer {
+    Container operator()(const Splitter& splitter) const {
+      Container c;
+      auto it = std::inserter(c, c.end());
+      for (const auto& sp : splitter) {
+        *it++ = ValueType(sp);
+      }
+      return c;
+    }
+  };
+
+  template <typename A>
+  struct ConvertToContainer<std::vector<absl::string_view, A>,
+                            absl::string_view, false> {
+    std::vector<absl::string_view, A> operator()(
+        const Splitter& splitter) const {
+      struct raw_view {
+        const char* data;
+        size_t size;
+        operator absl::string_view() const {  // NOLINT(runtime/explicit)
+          return {data, size};
+        }
+      };
+      std::vector<absl::string_view, A> v;
+      std::array<raw_view, 16> ar;
+      for (auto it = splitter.begin(); !it.at_end();) {
+        size_t index = 0;
+        do {
+          ar[index].data = it->data();
+          ar[index].size = it->size();
+          ++it;
+        } while (++index != ar.size() && !it.at_end());
+        v.insert(v.end(), ar.begin(),
+                 ar.begin() + static_cast<ptrdiff_t>(index));
+      }
+      return v;
+    }
+  };
+
+  template <typename A>
+  struct ConvertToContainer<std::vector<std::string, A>, std::string, false> {
+    std::vector<std::string, A> operator()(const Splitter& splitter) const {
+      const std::vector<absl::string_view> v = splitter;
+      return std::vector<std::string, A>(v.begin(), v.end());
+    }
+  };
+
+  template <typename Container, typename First, typename Second>
+  struct ConvertToContainer<Container, std::pair<const First, Second>, true> {
+    using iterator = typename Container::iterator;
+
+    Container operator()(const Splitter& splitter) const {
+      Container m;
+      iterator it;
+      bool insert = true;
+      for (const absl::string_view sv : splitter) {
+        if (insert) {
+          it = InsertOrEmplace(&m, sv);
+        } else {
+          it->second = Second(sv);
+        }
+        insert = !insert;
+      }
+      return m;
+    }
+
+    template <typename M>
+    static std::enable_if_t<HasEmplace<M>::value, iterator> InsertOrEmplace(
+        M* m, absl::string_view key) {
+      return ToIter(m->emplace(std::piecewise_construct, std::make_tuple(key),
+                               std::tuple<>()));
+    }
+    template <typename M>
+    static std::enable_if_t<!HasEmplace<M>::value, iterator> InsertOrEmplace(
+        M* m, absl::string_view key) {
+      return ToIter(m->insert(std::make_pair(First(key), Second(""))));
+    }
+
+    static iterator ToIter(std::pair<iterator, bool> pair) {
+      return pair.first;
+    }
+    static iterator ToIter(iterator iter) { return iter; }
+  };
+
+  StringType text_;
+  Delimiter delimiter_;
+  Predicate predicate_;
+};
+
+}  
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_STRINGS_INTERNAL_STR_SPLIT_INTERNAL_H_

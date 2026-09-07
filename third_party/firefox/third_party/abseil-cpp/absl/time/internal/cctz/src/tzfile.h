@@ -1,0 +1,43 @@
+
+#ifndef TZFILE_H
+
+#define TZFILE_H
+
+
+
+
+
+#define TZ_MAGIC "TZif"
+
+struct tzhead {
+  char tzh_magic[4];      
+  char tzh_version[1];    
+  char tzh_reserved[15];  
+  char tzh_ttisutcnt[4];  
+  char tzh_ttisstdcnt[4]; 
+  char tzh_leapcnt[4];    
+  char tzh_timecnt[4];    
+  char tzh_typecnt[4];    
+  char tzh_charcnt[4];    
+};
+
+
+
+
+#ifndef TZ_MAX_TIMES
+#define TZ_MAX_TIMES 2000
+#endif /* !defined TZ_MAX_TIMES */
+
+#ifndef TZ_MAX_TYPES
+#define TZ_MAX_TYPES 256 /* Limited to 256 by Internet RFC 9636.  */
+#endif                   /* !defined TZ_MAX_TYPES */
+
+#ifndef TZ_MAX_CHARS
+#define TZ_MAX_CHARS 256 /* Maximum number of abbreviation characters */
+#endif                   /* !defined TZ_MAX_CHARS */
+
+#ifndef TZ_MAX_LEAPS
+#define TZ_MAX_LEAPS 50 /* Maximum number of leap second corrections */
+#endif                  /* !defined TZ_MAX_LEAPS */
+
+#endif /* !defined TZFILE_H */

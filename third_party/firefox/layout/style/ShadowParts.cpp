@@ -1,0 +1,119 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ShadowParts.h"
+
+#include "nsContentUtils.h"
+#include "nsString.h"
+
+namespace mozilla {
+
+static bool IsSpace(char16_t aChar) {
+  return nsContentUtils::IsHTMLWhitespace(aChar);
+};
+
+using SingleMapping = std::pair<RefPtr<nsAtom>, RefPtr<nsAtom>>;
+
+static SingleMapping ParseSingleMapping(const nsAString& aString) {
+  const char16_t* c = aString.BeginReading();
+  const char16_t* end = aString.EndReading();
+
+  const auto CollectASequenceOfSpaces = [&c, end]() {
+    while (c != end && IsSpace(*c)) {
+      ++c;
+    }
+  };
+
+  const auto CollectToken = [&c, end]() -> RefPtr<nsAtom> {
+    const char16_t* t = c;
+    while (c != end && !IsSpace(*c) && *c != ':') {
+      ++c;
+    }
+    if (c == t) {
+      return nullptr;
+    }
+    return NS_AtomizeMainThread(Substring(t, c));
+  };
+
+  CollectASequenceOfSpaces();
+
+  RefPtr<nsAtom> firstToken = CollectToken();
+
+  if (!firstToken) {
+    return {nullptr, nullptr};
+  }
+
+  CollectASequenceOfSpaces();
+
+  if (c == end) {
+    return {firstToken, firstToken};
+  }
+
+  if (*c != ':') {
+    return {nullptr, nullptr};
+  }
+
+  ++c;
+
+  CollectASequenceOfSpaces();
+
+  RefPtr<nsAtom> secondToken = CollectToken();
+
+  if (!secondToken) {
+    return {nullptr, nullptr};
+  }
+
+  CollectASequenceOfSpaces();
+
+  if (c != end) {
+    return {nullptr, nullptr};
+  }
+
+  return {std::move(firstToken), std::move(secondToken)};
+}
+
+ShadowParts ShadowParts::Parse(const nsAString& aString) {
+  ShadowParts parts;
+
+  for (const auto& substring : aString.Split(',')) {
+    auto mapping = ParseSingleMapping(substring);
+    if (!mapping.first) {
+      MOZ_ASSERT(!mapping.second);
+      continue;
+    }
+    nsAtom* second = mapping.second.get();
+    parts.mMappings.GetOrInsertNew(mapping.first)
+        ->AppendElement(std::move(mapping.second));
+    parts.mReverseMappings.InsertOrUpdate(second, std::move(mapping.first));
+  }
+
+  return parts;
+}
+
+#ifdef DEBUG
+void ShadowParts::Dump() const {
+  if (mMappings.IsEmpty()) {
+    printf("  (empty)\n");
+    return;
+  }
+  for (auto& entry : mMappings) {
+    nsAutoCString key;
+    entry.GetKey()->ToUTF8String(key);
+    printf("  %s: ", key.get());
+
+    bool first = true;
+    for (nsAtom* part : *entry.GetData()) {
+      if (!first) {
+        printf(", ");
+      }
+      first = false;
+      nsAutoCString value;
+      part->ToUTF8String(value);
+      printf("%s", value.get());
+    }
+    printf("\n");
+  }
+}
+#endif
+}  

@@ -1,0 +1,354 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#include "AvailableMemoryWatcher.h"
+#include "AvailableMemoryWatcherUtils.h"
+#include "mozilla/FileUtils.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/Services.h"
+#include "mozilla/StaticPrefs_browser.h"
+#include "nsAppRunner.h"
+#include "nsIObserverService.h"
+#include "nsISupports.h"
+#include "nsITimer.h"
+#include "nsIThread.h"
+#include "nsMemoryPressure.h"
+#include "nsString.h"
+#include <cstring>
+#include <cstdio>
+#  include "nsIPSIProvider.h"
+
+namespace mozilla {
+
+static nsresult ReadPSIFile(const char* aPSIPath, PSIInfo& aResult) {
+  ScopedCloseFile file(fopen(aPSIPath, "r"));
+  if (NS_WARN_IF(!file)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  char buff[256];
+  aResult = {};
+
+  float avg10, avg60, avg300, total;
+  while ((fgets(buff, sizeof(buff), file.get())) != nullptr) {
+    if (strcmp(buff, "\n") == 0) {
+      continue;
+    }
+
+    if (strstr(buff, "some")) {
+      if (sscanf(buff, "some avg10=%f avg60=%f avg300=%f total=%f", &avg10,
+                 &avg60, &avg300, &total) != 4) {
+        return NS_ERROR_FAILURE;
+      }
+      if (avg10 < 0 || avg60 < 0 || avg300 < 0 || total < 0) {
+        return NS_ERROR_FAILURE;
+      }
+      aResult.some_avg10 = avg10;
+      aResult.some_avg60 = avg60;
+      aResult.some_avg300 = avg300;
+      aResult.some_total = total;
+    } else if (strstr(buff, "full")) {
+      if (sscanf(buff, "full avg10=%f avg60=%f avg300=%f total=%f", &avg10,
+                 &avg60, &avg300, &total) != 4) {
+        return NS_ERROR_FAILURE;
+      }
+      if (avg10 < 0 || avg60 < 0 || avg300 < 0 || total < 0) {
+        return NS_ERROR_FAILURE;
+      }
+      aResult.full_avg10 = avg10;
+      aResult.full_avg60 = avg60;
+      aResult.full_avg300 = avg300;
+      aResult.full_total = total;
+    } else {
+      return NS_ERROR_FAILURE;
+    }
+  }
+
+  if (aResult.some_avg10 > 100UL || aResult.some_avg60 > 100UL ||
+      aResult.some_avg300 > 100UL) {
+    return NS_ERROR_FAILURE;
+  }
+
+  aResult.psi_available = true;
+
+  return NS_OK;
+}
+
+class nsAvailableMemoryWatcher final
+    : public nsITimerCallback,
+      public nsINamed,
+      public nsAvailableMemoryWatcherBase,
+      public nsIPSIProvider
+      {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_NSITIMERCALLBACK
+  NS_DECL_NSIOBSERVER
+  NS_DECL_NSINAMED
+
+  nsresult Init() override;
+  nsAvailableMemoryWatcher();
+
+  void HandleLowMemory();
+  void MaybeHandleHighMemory();
+
+  NS_IMETHOD GetCachedPSIInfo(mozilla::PSIInfo& aResult) override;
+
+  void StartNonOOMPSISampling() override {}
+
+ private:
+  ~nsAvailableMemoryWatcher();
+  void StartPolling(const MutexAutoLock&);
+  void StopPolling(const MutexAutoLock&);
+  void ShutDown();
+  void UpdatePSIInfo(const MutexAutoLock&);
+  static bool IsMemoryLow();
+
+  nsCOMPtr<nsITimer> mTimer MOZ_GUARDED_BY(mMutex);
+  nsCOMPtr<nsIThread> mThread MOZ_GUARDED_BY(mMutex);
+
+  bool mPolling MOZ_GUARDED_BY(mMutex);
+  bool mUnderMemoryPressure MOZ_GUARDED_BY(mMutex);
+  PSIInfo mPSIInfo MOZ_GUARDED_BY(mMutex);
+
+  bool mPSIReadFailed MOZ_GUARDED_BY(mMutex);
+
+  static const uint32_t kHighMemoryPollingIntervalMS = 5000;
+
+  static const uint32_t kLowMemoryPollingIntervalMS = 1000;
+};
+
+static const char* kMeminfoPath = "/proc/meminfo";
+
+static const auto kPSIPath = "/proc/pressure/memory"_ns;
+
+nsAvailableMemoryWatcher::nsAvailableMemoryWatcher()
+    : mPolling(false),
+      mUnderMemoryPressure(false),
+      mPSIInfo{},
+      mPSIReadFailed(false) {}
+
+nsAvailableMemoryWatcher::~nsAvailableMemoryWatcher() = default;
+
+NS_IMETHODIMP
+nsAvailableMemoryWatcher::GetCachedPSIInfo(mozilla::PSIInfo& aResult) {
+  MutexAutoLock lock(mMutex);
+  aResult = mPSIInfo;
+  return NS_OK;
+}
+
+nsresult GetLastPSISnapshot(PSIInfo& aResult) {
+  RefPtr<nsIAvailableMemoryWatcherBase> watcher =
+      nsAvailableMemoryWatcherBase::GetSingleton();
+  if (!watcher) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  nsCOMPtr<nsIPSIProvider> provider = do_QueryInterface(watcher);
+
+  if (!provider) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  return provider->GetCachedPSIInfo(aResult);
+}
+
+void StartNonOOMPSISampling() {
+  RefPtr<nsIAvailableMemoryWatcherBase> watcher =
+      nsAvailableMemoryWatcherBase::GetSingleton();
+  if (!watcher) {
+    return;
+  }
+
+  nsCOMPtr<nsIPSIProvider> provider = do_QueryInterface(watcher);
+  if (provider) {
+    provider->StartNonOOMPSISampling();
+  }
+}
+
+nsresult nsAvailableMemoryWatcher::Init() {
+  nsresult rv = nsAvailableMemoryWatcherBase::Init();
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+  MutexAutoLock lock(mMutex);
+  mTimer = NS_NewTimer();
+  nsCOMPtr<nsIThread> thread;
+  rv = NS_NewNamedThread("MemoryPoller", getter_AddRefs(thread));
+  if (NS_FAILED(rv)) {
+    NS_WARNING("Couldn't make a thread for nsAvailableMemoryWatcher.");
+    return rv;
+  }
+  mThread = std::move(thread);
+
+  UpdatePSIInfo(lock);
+
+  StartPolling(lock);
+
+  return NS_OK;
+}
+
+already_AddRefed<nsAvailableMemoryWatcherBase> CreateAvailableMemoryWatcher() {
+  RefPtr watcher(new nsAvailableMemoryWatcher);
+
+  if (NS_FAILED(watcher->Init())) {
+    return do_AddRef(new nsAvailableMemoryWatcherBase);
+  }
+
+  return watcher.forget();
+}
+
+NS_IMPL_ISUPPORTS_INHERITED(nsAvailableMemoryWatcher,
+                            nsAvailableMemoryWatcherBase, nsITimerCallback,
+                            nsIObserver, nsINamed, nsIPSIProvider);
+
+void nsAvailableMemoryWatcher::StopPolling(const MutexAutoLock&)
+    MOZ_REQUIRES(mMutex) {
+  if (mPolling && mTimer) {
+    mTimer->Cancel();
+    mPolling = false;
+  }
+}
+
+bool nsAvailableMemoryWatcher::IsMemoryLow() {
+  MemoryInfo memInfo{0, 0};
+  nsresult rv = ReadMemoryFile(kMeminfoPath, memInfo);
+
+  if (NS_FAILED(rv) || (memInfo.memAvailable == 0) || (memInfo.memTotal == 0)) {
+    return false;
+  }
+
+  unsigned long memoryAsPercentage =
+      (memInfo.memAvailable * 100) / memInfo.memTotal;
+
+  return memoryAsPercentage <=
+             StaticPrefs::browser_low_commit_space_threshold_percent() ||
+         memInfo.memAvailable <
+             StaticPrefs::browser_low_commit_space_threshold_mb() * 1024;
+}
+
+void nsAvailableMemoryWatcher::ShutDown() {
+  nsCOMPtr<nsIThread> thread;
+  {
+    MutexAutoLock lock(mMutex);
+    if (mTimer) {
+      mTimer->Cancel();
+      mTimer = nullptr;
+    }
+    thread = mThread.forget();
+  }
+  if (thread) {
+    thread->Shutdown();
+  }
+}
+
+NS_IMETHODIMP
+nsAvailableMemoryWatcher::Notify(nsITimer* aTimer) {
+  MutexAutoLock lock(mMutex);
+  if (!mThread) {
+    MOZ_ASSERT(mThread);
+    return NS_ERROR_FAILURE;
+  }
+  nsresult rv = mThread->Dispatch(NS_NewRunnableFunction(
+      "MemoryPoller", [self = RefPtr{this}]() {
+        if (self->IsMemoryLow()) {
+          self->HandleLowMemory();
+        } else {
+          self->MaybeHandleHighMemory();
+        }
+      }));
+
+  if NS_FAILED (rv) {
+    NS_WARNING("Cannot dispatch memory polling event.");
+  }
+  return NS_OK;
+}
+
+void nsAvailableMemoryWatcher::HandleLowMemory() {
+  MutexAutoLock lock(mMutex);
+  if (!mTimer) {
+    return;
+  }
+  if (!mUnderMemoryPressure) {
+    mUnderMemoryPressure = true;
+    StartPolling(lock);
+  }
+  UpdatePSIInfo(lock);
+  UpdateLowMemoryTimeStamp();
+  NS_DispatchToMainThread(NS_NewRunnableFunction(
+      "nsAvailableMemoryWatcher::OnLowMemory",
+      [self = RefPtr{this}]() { self->mTabUnloader->UnloadTabAsync(); }));
+}
+
+void nsAvailableMemoryWatcher::UpdatePSIInfo(const MutexAutoLock&)
+    MOZ_REQUIRES(mMutex) {
+  if (mPSIReadFailed) {
+    return;
+  }
+
+  nsresult rv = ReadPSIFile(kPSIPath.get(), mPSIInfo);
+  if (NS_FAILED(rv)) {
+    mPSIInfo = {};
+    mPSIReadFailed = true;
+  }
+}
+
+void nsAvailableMemoryWatcher::MaybeHandleHighMemory() {
+  MutexAutoLock lock(mMutex);
+  if (!mTimer) {
+    return;
+  }
+  if (mUnderMemoryPressure) {
+    RecordTelemetryEventOnHighMemory(lock);
+    NS_NotifyOfEventualMemoryPressure(MemoryPressureState::NoPressure);
+    mUnderMemoryPressure = false;
+  }
+  UpdatePSIInfo(lock);
+  StartPolling(lock);
+}
+
+void nsAvailableMemoryWatcher::StartPolling(const MutexAutoLock& aLock)
+    MOZ_REQUIRES(mMutex) {
+  uint32_t pollingInterval = mUnderMemoryPressure
+                                 ? kLowMemoryPollingIntervalMS
+                                 : kHighMemoryPollingIntervalMS;
+  if (!mPolling) {
+    if (NS_SUCCEEDED(mTimer->InitWithCallback(
+            this, pollingInterval, nsITimer::TYPE_REPEATING_SLACK))) {
+      mPolling = true;
+    }
+  } else {
+    mTimer->SetDelay(pollingInterval);
+  }
+}
+
+NS_IMETHODIMP
+nsAvailableMemoryWatcher::Observe(nsISupports* aSubject, const char* aTopic,
+                                  const char16_t* aData) {
+  nsresult rv = nsAvailableMemoryWatcherBase::Observe(aSubject, aTopic, aData);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  if (strcmp(aTopic, "xpcom-shutdown") == 0) {
+    ShutDown();
+  } else {
+    MutexAutoLock lock(mMutex);
+    if (mTimer) {
+      if (strcmp(aTopic, "user-interaction-active") == 0) {
+        StartPolling(lock);
+      } else if (strcmp(aTopic, "user-interaction-inactive") == 0) {
+        StopPolling(lock);
+      }
+    }
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP nsAvailableMemoryWatcher::GetName(nsACString& aName) {
+  aName.AssignLiteral("nsAvailableMemoryWatcher");
+  return NS_OK;
+}
+
+}  

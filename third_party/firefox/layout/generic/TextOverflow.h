@@ -1,0 +1,204 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef TextOverflow_h_
+#define TextOverflow_h_
+
+#include <algorithm>
+
+#include "mozilla/Likely.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/WritingModes.h"
+#include "nsDisplayList.h"
+#include "nsTHashSet.h"
+
+class nsBlockFrame;
+class nsLineBox;
+
+namespace mozilla {
+class ScrollContainerFrame;
+
+namespace css {
+
+class TextOverflow final {
+ private:
+  TextOverflow(nsDisplayListBuilder* aBuilder, nsBlockFrame*);
+
+ public:
+  ~TextOverflow() = default;
+
+  static UniquePtr<TextOverflow> WillProcessLines(
+      nsDisplayListBuilder* aBuilder, nsBlockFrame*);
+
+  TextOverflow(TextOverflow&&) = default;
+
+  TextOverflow() = delete;
+  TextOverflow(const TextOverflow&) = delete;
+  TextOverflow& operator=(const TextOverflow&) = delete;
+  TextOverflow& operator=(TextOverflow&&) = delete;
+
+  void ProcessLine(const nsDisplayListSet& aLists, nsLineBox* aLine,
+                   uint32_t aLineNumber);
+
+  nsDisplayList& GetMarkers() { return mMarkerList; }
+
+  static bool HasClippedTextOverflow(nsIFrame* aBlockFrame);
+
+  static bool HasBlockEllipsis(nsIFrame* aBlockFrame);
+
+  enum class BeforeReflow : bool { No, Yes };
+  static bool CanHaveOverflowMarkers(nsBlockFrame*,
+                                     BeforeReflow = BeforeReflow::No);
+
+  typedef nsTHashSet<nsIFrame*> FrameHashtable;
+
+ private:
+  typedef mozilla::WritingMode WritingMode;
+  typedef mozilla::LogicalRect LogicalRect;
+
+  struct AlignmentEdges {
+    AlignmentEdges()
+        : mIStart(0), mIEnd(0), mIEndOuter(0), mAssignedInner(false) {}
+    void AccumulateInner(WritingMode aWM, const LogicalRect& aRect) {
+      if (MOZ_LIKELY(mAssignedInner)) {
+        mIStart = std::min(mIStart, aRect.IStart(aWM));
+        mIEnd = std::max(mIEnd, aRect.IEnd(aWM));
+      } else {
+        mIStart = aRect.IStart(aWM);
+        mIEnd = aRect.IEnd(aWM);
+        mAssignedInner = true;
+      }
+    }
+    void AccumulateOuter(WritingMode aWM, const LogicalRect& aRect) {
+      mIEndOuter = std::max(mIEndOuter, aRect.IEnd(aWM));
+    }
+    nscoord ISize() { return mIEnd - mIStart; }
+
+    nscoord mIStart;
+    nscoord mIEnd;
+
+    nscoord mIEndOuter;
+
+    bool mAssignedInner;
+  };
+
+  struct InnerClipEdges {
+    InnerClipEdges()
+        : mIStart(0), mIEnd(0), mAssignedIStart(false), mAssignedIEnd(false) {}
+    void AccumulateIStart(WritingMode aWM, const LogicalRect& aRect) {
+      if (MOZ_LIKELY(mAssignedIStart)) {
+        mIStart = std::max(mIStart, aRect.IStart(aWM));
+      } else {
+        mIStart = aRect.IStart(aWM);
+        mAssignedIStart = true;
+      }
+    }
+    void AccumulateIEnd(WritingMode aWM, const LogicalRect& aRect) {
+      if (MOZ_LIKELY(mAssignedIEnd)) {
+        mIEnd = std::min(mIEnd, aRect.IEnd(aWM));
+      } else {
+        mIEnd = aRect.IEnd(aWM);
+        mAssignedIEnd = true;
+      }
+    }
+    nscoord mIStart;
+    nscoord mIEnd;
+    bool mAssignedIStart;
+    bool mAssignedIEnd;
+  };
+
+  LogicalRect GetLogicalScrollableOverflowRectRelativeToBlock(
+      nsIFrame* aFrame) const {
+    return LogicalRect(
+        mBlockWM,
+        aFrame->ScrollableOverflowRect() + aFrame->GetOffsetTo(mBlock),
+        mBlockSize);
+  }
+
+  LogicalRect ExamineLineFrames(nsLineBox* aLine, FrameHashtable* aFramesToHide,
+                                AlignmentEdges* aAlignmentEdges);
+
+  void ExamineFrameSubtree(nsIFrame* aFrame, const LogicalRect& aContentArea,
+                           const LogicalRect& aInsideMarkersArea,
+                           FrameHashtable* aFramesToHide,
+                           AlignmentEdges* aAlignmentEdges,
+                           bool* aFoundVisibleTextOrAtomic,
+                           InnerClipEdges* aClippedMarkerEdges);
+
+  void AnalyzeMarkerEdges(nsIFrame* aFrame, mozilla::LayoutFrameType aFrameType,
+                          const LogicalRect& aInsideMarkersArea,
+                          FrameHashtable* aFramesToHide,
+                          AlignmentEdges* aAlignmentEdges,
+                          bool* aFoundVisibleTextOrAtomic,
+                          InnerClipEdges* aClippedMarkerEdges);
+
+  void PruneDisplayListContents(nsDisplayList* aList,
+                                const FrameHashtable& aFramesToHide,
+                                const LogicalRect& aInsideMarkersArea);
+
+  void CreateMarkers(const nsLineBox* aLine, bool aCreateIStart,
+                     bool aCreateIEnd, const LogicalRect& aInsideMarkersArea,
+                     const LogicalRect& aContentArea, uint32_t aLineNumber);
+
+  gfxTextRun* GetEllipsisTextRun();
+
+  LogicalRect mContentArea;
+  nsDisplayListBuilder* mBuilder;
+  nsIFrame* mBlock;
+  ScrollContainerFrame* mScrollContainerFrame;
+  nsDisplayList mMarkerList;
+  nsSize mBlockSize;
+  WritingMode mBlockWM;
+  bool mCanHaveInlineAxisScrollbar;
+  const bool mInLineClampContext;
+  bool mAdjustForPixelSnapping;
+
+  class Marker {
+   public:
+    void Init(const StyleTextOverflowSide& aStyle) {
+      mInitialized = false;
+      mISize = 0;
+      mStyle = &aStyle;
+      mIntrinsicISize = 0;
+      mHasOverflow = false;
+      mHasBlockEllipsis = false;
+      mActive = false;
+      mEdgeAligned = false;
+    }
+
+    void SetupString(nsIFrame* aFrame);
+
+    bool IsSuppressed(bool aInLineClampContext) const {
+      if (aInLineClampContext) {
+        return !mHasBlockEllipsis;
+      }
+      return mStyle->IsClip();
+    }
+    bool IsNeeded() const { return mHasOverflow || mHasBlockEllipsis; }
+    void Reset() {
+      mHasOverflow = false;
+      mHasBlockEllipsis = false;
+      mEdgeAligned = false;
+    }
+
+    nscoord mISize;
+    nscoord mIntrinsicISize;
+    const StyleTextOverflowSide* mStyle;
+    bool mHasOverflow;
+    bool mHasBlockEllipsis;
+    bool mInitialized;
+    bool mActive;
+    bool mEdgeAligned;
+  };
+
+  Marker mIStart;  
+  Marker mIEnd;    
+
+  RefPtr<gfxTextRun> mEllipsisTextRun;
+};
+
+}  
+}  
+
+#endif /* !defined(TextOverflow_h_) */

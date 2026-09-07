@@ -1,0 +1,54 @@
+// Copyright 2014 The Rust Project Developers. See the COPYRIGHT
+// file at the top-level directory of this distribution and at
+// http://rust-lang.org/COPYRIGHT.
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+pub use bitflags::bitflags as bitflags2;
+pub use bitflags::parser;
+
+#[macro_export(local_inner_macros)]
+macro_rules! bitflags {
+    (
+        $(#[$($outer:tt)+])*
+        $vis:vis struct $BitFlags:ident: $T:ty {
+            $(
+                $(#[$inner:ident $($args:tt)*])*
+                const $Flag:ident = $value:expr;
+            )*
+        }
+
+        $($t:tt)*
+    ) => {
+        $(#[$($outer)+])*
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        $vis struct $BitFlags($T);
+
+        impl core::fmt::Debug for $BitFlags {
+            fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+                if self.is_empty() {
+                    core::write!(f, "{:#x}", Self::empty().bits())
+                } else {
+                    $crate::parser::to_writer(self, f)
+                }
+            }
+        }
+
+        bitflags2! {
+            impl $BitFlags: $T {
+                $(
+                    $(#[$inner $($args)*])*
+                    const $Flag = $value;
+                )*
+            }
+        }
+
+        bitflags! {
+            $($t)*
+        }
+    };
+    () => {};
+}

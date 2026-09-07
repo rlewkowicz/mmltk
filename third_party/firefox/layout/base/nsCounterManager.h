@@ -1,0 +1,260 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#if !defined(nsCounterManager_h_)
+#define nsCounterManager_h_
+
+#include "CounterStyleManager.h"
+#include "mozilla/Likely.h"
+#include "nsClassHashtable.h"
+#include "nsGenConList.h"
+
+class nsCounterList;
+struct nsCounterUseNode;
+struct nsCounterChangeNode;
+
+namespace mozilla {
+
+class ContainStyleScope;
+
+}  
+
+struct nsCounterNode : public nsGenConNode {
+  enum Type {
+    RESET,      
+    INCREMENT,  
+    SET,        
+    USE         
+  };
+
+  Type mType;
+
+  int32_t mValueAfter = 0;
+
+
+  nsCounterNode* mScopeStart = nullptr;
+
+
+  nsCounterNode* mScopePrev = nullptr;
+
+  bool mCrossesContainStyleBoundaries = false;
+
+  inline nsCounterUseNode* UseNode();
+  inline nsCounterChangeNode* ChangeNode();
+
+  nsCounterNode(int32_t aContentIndex, Type aType)
+      : nsGenConNode(aContentIndex), mType(aType) {}
+
+  inline void Calc(nsCounterList* aList, bool aNotify);
+
+  inline bool IsContentBasedReset();
+
+  inline bool IsReversed();
+
+  inline bool IsUnitializedIncrementNode();
+};
+
+struct nsCounterUseNode : public nsCounterNode {
+  mozilla::StyleCounterStyle mCounterStyle;
+  nsString mSeparator;
+
+  bool mAllCounters = false;
+
+  bool mForLegacyBullet = false;
+
+  enum ForLegacyBullet { ForLegacyBullet };
+  nsCounterUseNode(enum ForLegacyBullet,
+                   const mozilla::StyleCounterStyle& aCounterStyle)
+      : nsCounterNode(0, USE),
+        mCounterStyle(aCounterStyle),
+        mForLegacyBullet(true) {}
+
+  nsCounterUseNode(const mozilla::StyleCounterStyle& aCounterStyle,
+                   nsString aSeparator, uint32_t aContentIndex,
+                   bool aAllCounters)
+      : nsCounterNode(aContentIndex, USE),
+        mCounterStyle(aCounterStyle),
+        mSeparator(std::move(aSeparator)),
+        mAllCounters(aAllCounters) {
+    NS_ASSERTION(aContentIndex <= INT32_MAX, "out of range");
+  }
+
+  bool InitTextFrame(nsGenConList* aList, nsIFrame* aPseudoFrame,
+                     nsIFrame* aTextFrame) override;
+
+  void Calc(nsCounterList* aList, bool aNotify);
+
+  void GetText(nsString& aResult);
+  void GetText(mozilla::WritingMode aWM, mozilla::CounterStyle* aStyle,
+               nsString& aResult);
+};
+
+struct nsCounterChangeNode : public nsCounterNode {
+  nsCounterChangeNode(nsIFrame* aPseudoFrame, nsCounterNode::Type aChangeType,
+                      int32_t aChangeValue, int32_t aPropIndex,
+                      bool aIsReversed)
+      : nsCounterNode(  
+            aPropIndex + (aChangeType == RESET ? (INT32_MIN)
+                                               : (aChangeType == INCREMENT
+                                                      ? ((INT32_MIN / 3) * 2)
+                                                      : INT32_MIN / 3)),
+            aChangeType),
+        mChangeValue(aChangeValue),
+        mIsReversed(aIsReversed),
+        mSeenSetNode(false) {
+    NS_ASSERTION(aPropIndex >= 0, "out of range");
+    NS_ASSERTION(
+        aChangeType == INCREMENT || aChangeType == SET || aChangeType == RESET,
+        "bad type");
+    mPseudoFrame = aPseudoFrame;
+    CheckFrameAssertions();
+  }
+
+  void Calc(nsCounterList* aList);
+
+  int32_t mChangeValue;
+
+  bool mIsReversed : 1;
+  bool mSeenSetNode : 1;
+};
+
+inline nsCounterUseNode* nsCounterNode::UseNode() {
+  NS_ASSERTION(mType == USE, "wrong type");
+  return static_cast<nsCounterUseNode*>(this);
+}
+
+inline nsCounterChangeNode* nsCounterNode::ChangeNode() {
+  MOZ_ASSERT(mType == INCREMENT || mType == SET || mType == RESET);
+  return static_cast<nsCounterChangeNode*>(this);
+}
+
+inline void nsCounterNode::Calc(nsCounterList* aList, bool aNotify) {
+  if (mType == USE) {
+    UseNode()->Calc(aList, aNotify);
+  } else {
+    ChangeNode()->Calc(aList);
+  }
+}
+
+inline bool nsCounterNode::IsContentBasedReset() {
+  return mType == RESET &&
+         ChangeNode()->mChangeValue == std::numeric_limits<int32_t>::min();
+}
+
+inline bool nsCounterNode::IsReversed() {
+  return mType == RESET && ChangeNode()->mIsReversed;
+}
+
+inline bool nsCounterNode::IsUnitializedIncrementNode() {
+  return mType == INCREMENT &&
+         ChangeNode()->mChangeValue == std::numeric_limits<int32_t>::min();
+}
+
+class nsCounterList : public nsGenConList {
+ public:
+  nsCounterList(nsAtom* aCounterName, mozilla::ContainStyleScope* aScope)
+      : mCounterName(aCounterName), mScope(aScope) {
+    MOZ_ASSERT(aScope);
+  }
+
+#if defined(DEBUG) || 0
+  void Dump();
+#endif
+
+  nsCounterNode* GetFirstNodeFor(nsIFrame* aFrame) const {
+    return static_cast<nsCounterNode*>(nsGenConList::GetFirstNodeFor(aFrame));
+  }
+
+  void Insert(nsCounterNode* aNode) {
+    nsGenConList::Insert(aNode);
+    if (MOZ_LIKELY(!IsDirty())) {
+      SetScope(aNode);
+    }
+  }
+
+  nsCounterNode* First() {
+    return static_cast<nsCounterNode*>(mList.getFirst());
+  }
+
+  static nsCounterNode* Next(nsCounterNode* aNode) {
+    return static_cast<nsCounterNode*>(nsGenConList::Next(aNode));
+  }
+  static nsCounterNode* Prev(nsCounterNode* aNode) {
+    return static_cast<nsCounterNode*>(nsGenConList::Prev(aNode));
+  }
+
+  static int32_t ValueBefore(nsCounterNode* aNode) {
+    if (!aNode->mScopePrev) {
+      return 0;
+    }
+
+    if (aNode->mType != nsCounterNode::USE &&
+        aNode->mScopePrev->mCrossesContainStyleBoundaries) {
+      return 0;
+    }
+
+    return aNode->mScopePrev->mValueAfter;
+  }
+
+  void SetScope(nsCounterNode* aNode);
+
+  void RecalcAll();
+
+  bool IsDirty() const;
+  void SetDirty();
+  bool IsRecalculatingAll() const { return mRecalculatingAll; }
+
+ private:
+  bool SetScopeByWalkingBackwardThroughList(
+      nsCounterNode* aNodeToSetScopeFor, const nsIContent* aNodeContent,
+      nsCounterNode* aNodeToBeginLookingAt);
+
+  RefPtr<nsAtom> mCounterName;
+  mozilla::ContainStyleScope* mScope;
+  bool mRecalculatingAll = false;
+};
+
+class nsCounterManager {
+ public:
+  explicit nsCounterManager(mozilla::ContainStyleScope* scope)
+      : mScope(scope) {}
+
+  bool AddCounterChanges(nsIFrame* aFrame);
+
+  nsCounterList* GetOrCreateCounterList(nsAtom* aCounterName);
+
+  nsCounterList* GetCounterList(nsAtom* aCounterName);
+
+  void RecalcAll();
+
+  void SetAllDirty();
+
+  bool DestroyNodesFor(nsIFrame* aFrame);
+
+  void Clear() { mNames.Clear(); }
+
+#if defined(ACCESSIBILITY)
+  bool GetFirstCounterValueForFrame(nsIFrame* aFrame,
+                                    mozilla::CounterValue& aOrdinal) const;
+#endif
+
+#if defined(DEBUG) || 0
+  void Dump() const;
+#endif
+
+  static int32_t IncrementCounter(int32_t aOldValue, int32_t aIncrement) {
+    int32_t newValue = int32_t(uint32_t(aOldValue) + uint32_t(aIncrement));
+    if ((aIncrement > 0) != (newValue > aOldValue)) {
+      newValue = aOldValue;
+    }
+    return newValue;
+  }
+
+ private:
+  mozilla::ContainStyleScope* mScope;
+  nsClassHashtable<nsAtomHashKey, nsCounterList> mNames;
+};
+
+#endif

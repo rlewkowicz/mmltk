@@ -1,0 +1,65 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_AnimationPerformanceWarning_h
+#define mozilla_dom_AnimationPerformanceWarning_h
+
+#include <initializer_list>
+
+#include "mozilla/Maybe.h"
+#include "nsStringFwd.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+
+struct AnimationPerformanceWarning {
+  enum class Type : uint8_t {
+    None,
+    ContentTooLarge,
+    ContentTooLargeArea,
+    NonScalingStroke,
+    TransformSVG,
+    TransformFrameInactive,
+    TransformIsBlockedByImportantRules,
+    OpacityFrameInactive,
+    HasRenderingObserver,
+    HasCurrentColor,
+  };
+
+  explicit AnimationPerformanceWarning(Type aType) : mType(aType) {
+    MOZ_ASSERT(mType != Type::None);
+  }
+
+  AnimationPerformanceWarning(Type aType,
+                              std::initializer_list<int32_t> aParams)
+      : mType(aType) {
+    MOZ_ASSERT(mType != Type::None);
+    MOZ_ASSERT(aParams.size() <= kMaxParamsForLocalization,
+               "The length of parameters should be less than "
+               "kMaxParamsForLocalization");
+    mParams.emplace(aParams);
+  }
+
+  static constexpr uint8_t kMaxParamsForLocalization = 10;
+
+  Type mType;
+
+  Maybe<CopyableTArray<int32_t>> mParams;
+
+  bool ToLocalizedString(nsAString& aLocalizedString) const;
+  template <uint32_t N>
+  nsresult ToLocalizedStringWithIntParams(const char* aKey,
+                                          nsAString& aLocalizedString) const;
+
+  bool operator==(const AnimationPerformanceWarning& aOther) const {
+    return mType == aOther.mType && mParams == aOther.mParams;
+  }
+  bool operator!=(const AnimationPerformanceWarning& aOther) const {
+    return !(*this == aOther);
+  }
+};
+
+}  
+
+#endif  // mozilla_dom_AnimationPerformanceWarning_h

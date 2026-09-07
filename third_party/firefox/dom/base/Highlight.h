@@ -1,0 +1,104 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_Highlight_h
+#define mozilla_dom_Highlight_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/HighlightBinding.h"
+#include "nsAtomHashKeys.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsTArray.h"
+#include "nsTHashSet.h"
+#include "nsWrapperCache.h"
+
+class nsFrameSelection;
+class nsPIDOMWindowInner;
+namespace mozilla {
+class ErrorResult;
+}
+
+namespace mozilla::dom {
+class AbstractRange;
+class Document;
+class Element;
+class HighlightRegistry;
+class Selection;
+class ShadowRoot;
+
+struct HighlightSelectionData {
+  RefPtr<nsAtom> mHighlightName;
+  RefPtr<Highlight> mHighlight;
+};
+
+class Highlight final : public nsISupports, public nsWrapperCache {
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(Highlight)
+
+ protected:
+  MOZ_CAN_RUN_SCRIPT Highlight(
+      const Sequence<OwningNonNull<AbstractRange>>& aInitialRanges,
+      nsPIDOMWindowInner* aWindow, ErrorResult& aRv);
+  ~Highlight() = default;
+
+ public:
+  void AddToHighlightRegistry(HighlightRegistry& aHighlightRegistry,
+                              nsAtom& aHighlightName);
+
+  void RemoveFromHighlightRegistry(HighlightRegistry& aHighlightRegistry,
+                                   nsAtom& aHighlightName);
+
+  nsPIDOMWindowInner* GetParentObject() const { return mWindow; }
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  static MOZ_CAN_RUN_SCRIPT_BOUNDARY already_AddRefed<Highlight> Constructor(
+      const GlobalObject& aGlobal,
+      const Sequence<OwningNonNull<AbstractRange>>& aInitialRanges,
+      ErrorResult& aRv);
+
+  int32_t Priority() const { return mPriority; }
+
+  void SetPriority(int32_t aPriority);
+
+  HighlightType Type() const { return mHighlightType; }
+
+  void SetType(HighlightType aHighlightType);
+
+  uint32_t Size() const { return mRanges.Length(); }
+
+  const nsTArray<RefPtr<AbstractRange>>& Ranges() const { return mRanges; }
+
+  MOZ_CAN_RUN_SCRIPT Highlight* Add(AbstractRange& aRange, ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT void Clear(ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT bool Delete(AbstractRange& aRange, ErrorResult& aRv);
+
+  nsTArray<RefPtr<AbstractRange>> RangesAtPoint(
+      float aX, float aY,
+      const Sequence<OwningNonNull<mozilla::dom::ShadowRoot>>& aShadowRoots,
+      mozilla::dom::Element* aElementAtPoint) const;
+
+ private:
+  void Repaint();
+
+  RefPtr<nsPIDOMWindowInner> mWindow;
+
+  nsTArray<RefPtr<AbstractRange>> mRanges;
+
+  HighlightType mHighlightType{HighlightType::Highlight};
+
+  int32_t mPriority{0};
+
+  nsTHashMap<nsPtrHashKey<HighlightRegistry>, nsTHashSet<RefPtr<nsAtom>>>
+      mHighlightRegistries;
+};
+
+}  
+
+#endif  // mozilla_dom_Highlight_h

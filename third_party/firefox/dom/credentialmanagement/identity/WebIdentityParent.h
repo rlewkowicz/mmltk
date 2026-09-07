@@ -1,0 +1,164 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_WebIdentityParent_h
+#define mozilla_dom_WebIdentityParent_h
+
+#include "mozilla/dom/PWebIdentity.h"
+#include "mozilla/dom/PWebIdentityParent.h"
+#include "mozilla/dom/WindowGlobalParent.h"
+
+namespace mozilla::dom {
+
+class WebIdentityParent final : public PWebIdentityParent {
+  NS_INLINE_DECL_REFCOUNTING(WebIdentityParent, override);
+
+ public:
+  WebIdentityParent() = default;
+  virtual void ActorDestroy(ActorDestroyReason aWhy) override;
+
+  CanonicalBrowsingContext* MaybeBrowsingContext() {
+    WindowGlobalParent* manager = static_cast<WindowGlobalParent*>(Manager());
+    if (!manager) {
+      return nullptr;
+    }
+    return manager->BrowsingContext();
+  }
+
+  mozilla::ipc::IPCResult RecvGetIdentityCredential(
+      IdentityCredentialRequestOptions&& aOptions,
+      const CredentialMediationRequirement& aMediationRequirement,
+      bool aHasUserActivation, const GetIdentityCredentialResolver& aResolver);
+
+  mozilla::ipc::IPCResult RecvRequestCancel();
+
+  mozilla::ipc::IPCResult RecvDisconnectIdentityCredential(
+      const IdentityCredentialDisconnectOptions& aOptions,
+      const DisconnectIdentityCredentialResolver& aResolver);
+
+  mozilla::ipc::IPCResult RecvSetLoginStatus(
+      LoginStatus aStatus, const SetLoginStatusResolver& aResolver);
+
+  mozilla::ipc::IPCResult RecvPreventSilentAccess(
+      const PreventSilentAccessResolver& aResolver);
+
+  mozilla::ipc::IPCResult RecvResolveContinuationWindow(
+      nsCString&& aToken, IdentityResolveOptions&& aOptions,
+      const ResolveContinuationWindowResolver& aResolver);
+
+  mozilla::ipc::IPCResult RecvIsActiveContinuationWindow(
+      const IsActiveContinuationWindowResolver& aResolver);
+
+ private:
+  ~WebIdentityParent() = default;
+};
+
+namespace identity {
+using GetIdentityCredentialPromise =
+    MozPromise<RefPtr<IdentityCredential>, nsresult, true>;
+using GetIdentityCredentialsPromise =
+    MozPromise<nsTArray<RefPtr<IdentityCredential>>, nsresult, true>;
+using GetIPCIdentityCredentialPromise =
+    MozPromise<IPCIdentityCredential, nsresult, true>;
+using GetIPCIdentityCredentialsPromise =
+    MozPromise<CopyableTArray<IPCIdentityCredential>, nsresult, true>;
+using GetIdentityProviderRequestOptionsPromise =
+    MozPromise<IdentityProviderRequestOptions, nsresult, true>;
+using ValidationPromise = MozPromise<bool, nsresult, true>;
+using GetRootManifestPromise =
+    MozPromise<Maybe<IdentityProviderWellKnown>, nsresult, true>;
+using GetManifestPromise =
+    MozPromise<IdentityProviderAPIConfig, nsresult, true>;
+using IdentityProviderRequestOptionsWithManifest =
+    std::tuple<IdentityProviderRequestOptions, IdentityProviderAPIConfig>;
+using GetIdentityProviderRequestOptionsWithManifestPromise =
+    MozPromise<IdentityProviderRequestOptionsWithManifest, nsresult, true>;
+using GetAccountListPromise = MozPromise<
+    std::tuple<IdentityProviderAPIConfig, IdentityProviderAccountList>,
+    nsresult, true>;
+using GetIdentityAssertionPromise =
+    MozPromise<std::tuple<IdentityAssertionResponse, IdentityProviderAccount>,
+               nsresult, true>;
+using GetTokenPromise =
+    MozPromise<std::tuple<nsCString, nsCString, const bool>, nsresult, true>;
+using GetAccountPromise = MozPromise<
+    std::tuple<IdentityProviderAPIConfig, IdentityProviderAccount, const bool>,
+    nsresult, true>;
+using GetMetadataPromise =
+    MozPromise<IdentityProviderClientMetadata, nsresult, true>;
+
+RefPtr<GetIPCIdentityCredentialPromise> GetCredentialInMainProcess(
+    nsIPrincipal* aPrincipal, WebIdentityParent* aRelyingParty,
+    IdentityCredentialRequestOptions&& aOptions,
+    const CredentialMediationRequirement& aMediationRequirement,
+    bool aHasUserActivation);
+
+nsresult CanSilentlyCollect(nsIPrincipal* aPrincipal,
+                            nsIPrincipal* aIDPPrincipal, bool* aResult);
+
+Maybe<IdentityProviderAccount> FindAccountToReauthenticate(
+    const IdentityProviderRequestOptions& aProvider, nsIPrincipal* aRPPrincipal,
+    const IdentityProviderAccountList& aAccountList);
+
+Maybe<IdentityProviderRequestOptionsWithManifest> SkipAccountChooser(
+    const Sequence<IdentityProviderRequestOptions>& aProviders,
+    const Sequence<GetManifestPromise::ResolveOrRejectValue>& aManifests);
+
+RefPtr<GetIPCIdentityCredentialPromise> DiscoverFromExternalSourceInMainProcess(
+    nsIPrincipal* aPrincipal, WebIdentityParent* aRelyingParty,
+    const IdentityCredentialRequestOptions& aOptions,
+    const CredentialMediationRequirement& aMediationRequirement);
+
+RefPtr<GetIPCIdentityCredentialPromise> CreateCredentialDuringDiscovery(
+    nsIPrincipal* aPrincipal, WebIdentityParent* aRelyingParty,
+    const IdentityProviderRequestOptions& aProvider,
+    const IdentityProviderAPIConfig& aManifest,
+    const CredentialMediationRequirement& aMediationRequirement);
+
+RefPtr<GetRootManifestPromise> FetchRootManifest(
+    nsIPrincipal* aPrincipal, const IdentityProviderConfig& aProvider);
+
+RefPtr<GetManifestPromise> FetchManifest(
+    nsIPrincipal* aPrincipal, const IdentityProviderConfig& aProvider);
+
+RefPtr<GetAccountListPromise> FetchAccountList(
+    nsIPrincipal* aPrincipal, const IdentityProviderRequestOptions& aProvider,
+    const IdentityProviderAPIConfig& aManifest);
+
+RefPtr<GetTokenPromise> FetchToken(
+    nsIPrincipal* aPrincipal, WebIdentityParent* aRelyingParty,
+    const IdentityProviderRequestOptions& aProvider,
+    const IdentityProviderAPIConfig& aManifest,
+    const IdentityProviderAccount& aAccount, const bool aIsAutoSelected);
+
+RefPtr<GetIdentityProviderRequestOptionsWithManifestPromise>
+PromptUserToSelectProvider(
+    BrowsingContext* aBrowsingContext,
+    const Sequence<IdentityProviderRequestOptions>& aProviders,
+    const Sequence<GetManifestPromise::ResolveOrRejectValue>& aManifests);
+
+RefPtr<GetAccountPromise> PromptUserToSelectAccount(
+    BrowsingContext* aBrowsingContext,
+    const IdentityProviderAccountList& aAccounts,
+    const IdentityProviderRequestOptions& aProvider,
+    const IdentityProviderAPIConfig& aManifest);
+
+nsresult LinkAccount(nsIPrincipal* aPrincipal, const nsCString& aAccountId,
+                     const IdentityProviderRequestOptions& aProvider);
+
+void CloseUserInterface(BrowsingContext* aBrowsingContext);
+
+RefPtr<MozPromise<bool, nsresult, true>> DisconnectInMainProcess(
+    nsIPrincipal* aDocumentPrincipal,
+    const IdentityCredentialDisconnectOptions& aOptions);
+
+RefPtr<GetTokenPromise> AuthorizationPopupForToken(
+    nsIURI* aContinueURI, WebIdentityParent* aRelyingParty,
+    const IdentityProviderAccount& aAccount, const bool isAutoSelected);
+
+}  
+
+}  
+
+#endif  // mozilla_dom_WebIdentityParent_h

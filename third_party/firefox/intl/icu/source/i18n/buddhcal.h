@@ -1,0 +1,70 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+ ********************************************************************************
+ * Copyright (C) 2003-2013, International Business Machines Corporation
+ * and others. All Rights Reserved.
+ ********************************************************************************
+ *
+ * File BUDDHCAL.H
+ *
+ * Modification History:
+ *
+ *   Date        Name        Description
+ *   05/13/2003  srl          copied from gregocal.h
+ ********************************************************************************
+ */
+
+#ifndef BUDDHCAL_H
+#define BUDDHCAL_H
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/calendar.h"
+#include "unicode/gregocal.h"
+
+U_NAMESPACE_BEGIN
+
+class BuddhistCalendar : public GregorianCalendar {
+public:
+
+    enum EEras {
+       BE
+    };
+
+    BuddhistCalendar(const Locale& aLocale, UErrorCode& success);
+
+
+    virtual ~BuddhistCalendar();
+
+    BuddhistCalendar(const BuddhistCalendar& source);
+
+    virtual BuddhistCalendar* clone() const override;
+
+public:
+    virtual UClassID getDynamicClassID() const override;
+
+    U_I18N_API static UClassID U_EXPORT2 getStaticClassID();
+
+    virtual const char * getType() const override;
+
+private:
+    BuddhistCalendar(); 
+
+ protected:
+    virtual int32_t handleGetExtendedYear(UErrorCode& status) override;
+    virtual void handleComputeFields(int32_t julianDay, UErrorCode& status) override;
+    virtual int32_t handleGetLimit(UCalendarDateFields field, ELimitType limitType) const override;
+
+    virtual bool isEra0CountingBackward() const override { return false; }
+
+    DECLARE_OVERRIDE_SYSTEM_DEFAULT_CENTURY
+};
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+
+#endif // _GREGOCAL
+

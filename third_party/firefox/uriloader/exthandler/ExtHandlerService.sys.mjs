@@ -1,0 +1,652 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
+import { XPCOMUtils } from "resource://gre/modules/XPCOMUtils.sys.mjs";
+
+const {
+  saveToDisk,
+  alwaysAsk,
+  useHelperApp,
+  handleInternally,
+  useSystemDefault,
+} = Ci.nsIHandlerInfo;
+
+const TOPIC_PDFJS_HANDLER_CHANGED = "pdfjs:handlerChanged";
+
+const lazy = {};
+
+ChromeUtils.defineESModuleGetters(lazy, {
+  kHandlerList: "resource://gre/modules/handlers/HandlerList.sys.mjs",
+  kHandlerListVersion: "resource://gre/modules/handlers/HandlerList.sys.mjs",
+  FileUtils: "resource://gre/modules/FileUtils.sys.mjs",
+  JSONFile: "resource://gre/modules/JSONFile.sys.mjs",
+  NimbusFeatures: "resource://nimbus/ExperimentAPI.sys.mjs",
+});
+
+XPCOMUtils.defineLazyServiceGetter(
+  lazy,
+  "externalProtocolService",
+  "@mozilla.org/uriloader/external-protocol-service;1",
+  Ci.nsIExternalProtocolService
+);
+XPCOMUtils.defineLazyServiceGetter(
+  lazy,
+  "MIMEService",
+  "@mozilla.org/mime;1",
+  Ci.nsIMIMEService
+);
+
+export function HandlerService() {
+  Services.obs.addObserver(this, "handlersvc-json-replace", true);
+}
+
+HandlerService.prototype = {
+  QueryInterface: ChromeUtils.generateQI([
+    "nsISupportsWeakReference",
+    "nsIHandlerService",
+    "nsIObserver",
+  ]),
+
+  __store: null,
+  get _store() {
+    if (!this.__store) {
+      this.__store = new lazy.JSONFile({
+        path: PathUtils.join(
+          Services.dirsvc.get("ProfD", Ci.nsIFile).path,
+          "handlers.json"
+        ),
+        dataPostProcessor: this._dataPostProcessor.bind(this),
+      });
+    }
+
+    this._ensureStoreInitialized();
+    return this.__store;
+  },
+
+  __storeInitialized: false,
+  _ensureStoreInitialized() {
+    if (!this.__storeInitialized) {
+      this.__storeInitialized = true;
+      this.__store.ensureDataReady();
+
+      this._injectDefaultProtocolHandlersIfNeeded();
+      this._migrateProtocolHandlersIfNeeded();
+
+      Services.obs.notifyObservers(null, "handlersvc-store-initialized");
+    }
+  },
+
+  _dataPostProcessor(data) {
+    return data.defaultHandlersVersion
+      ? data
+      : {
+          defaultHandlersVersion: {},
+          mimeTypes: {},
+          schemes: {},
+          isDownloadsImprovementsAlreadyMigrated: false,
+        };
+  },
+
+  _injectDefaultProtocolHandlersIfNeeded() {
+    try {
+      let defaultHandlersVersion = Services.prefs.getIntPref(
+        "gecko.handlerService.defaultHandlersVersion",
+        0
+      );
+      if (defaultHandlersVersion < lazy.kHandlerListVersion) {
+        this._injectDefaultProtocolHandlers();
+        Services.prefs.setIntPref(
+          "gecko.handlerService.defaultHandlersVersion",
+          lazy.kHandlerListVersion
+        );
+        this._store.saveSoon();
+      }
+    } catch (ex) {
+      console.error(ex);
+    }
+  },
+
+  _injectDefaultProtocolHandlers() {
+    let locale = Services.locale.appLocaleAsBCP47;
+
+    let localeHandlers = lazy.kHandlerList.default;
+    if (lazy.kHandlerList[locale]) {
+      for (let scheme in lazy.kHandlerList[locale].schemes) {
+        localeHandlers.schemes[scheme] =
+          lazy.kHandlerList[locale].schemes[scheme];
+      }
+    }
+
+    for (let scheme of Object.keys(localeHandlers.schemes)) {
+      if (scheme == "mailto" && AppConstants.MOZ_APP_NAME == "thunderbird") {
+        continue;
+      }
+
+      let existingSchemeInfo = this._store.data.schemes[scheme];
+      if (!existingSchemeInfo) {
+        existingSchemeInfo = {
+          stubEntry: true,
+          handlers: [null],
+        };
+        this._store.data.schemes[scheme] = existingSchemeInfo;
+      }
+      let { handlers } = existingSchemeInfo;
+      for (let newHandler of localeHandlers.schemes[scheme].handlers) {
+        if (!newHandler.uriTemplate) {
+          console.error(
+            `Ignoring protocol handler for ${scheme} without a uriTemplate!`
+          );
+          continue;
+        }
+        if (!newHandler.uriTemplate.startsWith("https://")) {
+          console.error(
+            `Ignoring protocol handler for ${scheme} with insecure template URL ${newHandler.uriTemplate}.`
+          );
+          continue;
+        }
+        if (!newHandler.uriTemplate.toLowerCase().includes("%s")) {
+          console.error(
+            `Ignoring protocol handler for ${scheme} with invalid template URL ${newHandler.uriTemplate}.`
+          );
+          continue;
+        }
+        let matchingTemplate = handler =>
+          handler && handler.uriTemplate == newHandler.uriTemplate;
+        if (!handlers.some(matchingTemplate)) {
+          handlers.push(newHandler);
+        }
+      }
+    }
+  },
+
+  _migrateProtocolHandlersIfNeeded() {
+    function removeMatchingHandlers(info, regex) {
+      let matches = app =>
+        app instanceof Ci.nsIWebHandlerApp && regex.test(app.uriTemplate);
+      let shouldStore = false;
+      let handlers = info.possibleApplicationHandlers;
+      for (let i = handlers.length - 1; i >= 0; i--) {
+        let app = handlers.queryElementAt(i, Ci.nsIHandlerApp);
+        if (matches(app)) {
+          shouldStore = true;
+          handlers.removeElementAt(i);
+        }
+      }
+      if (info.preferredApplicationHandler) {
+        let app = info.preferredApplicationHandler;
+        if (matches(app)) {
+          info.preferredApplicationHandler = null;
+          shouldStore = true;
+        }
+      }
+      return shouldStore;
+    }
+    const kMigrations = {
+      "30boxes": () => {
+        const k30BoxesRegex =
+          /^https?:\/\/(?:www\.)?30boxes.com\/external\/widget/i;
+        let webcalHandler =
+          lazy.externalProtocolService.getProtocolHandlerInfo("webcal");
+        if (this.exists(webcalHandler)) {
+          this.fillHandlerInfo(webcalHandler, "");
+          if (removeMatchingHandlers(webcalHandler, k30BoxesRegex)) {
+            this.store(webcalHandler);
+          }
+        }
+      },
+      "secure-mail": () => {
+        const kSubstitutions = new Map([
+          [
+            "http://compose.mail.yahoo.co.jp/ym/Compose?To=%s",
+            "https://mail.yahoo.co.jp/compose/?To=%s",
+          ],
+          [
+            "http://www.inbox.lv/rfc2368/?value=%s",
+            "https://mail.inbox.lv/compose?to=%s",
+          ],
+          [
+            "http://poczta.interia.pl/mh/?mailto=%s",
+            "https://poczta.interia.pl/mh/?mailto=%s",
+          ],
+          [
+            "http://win.mail.ru/cgi-bin/sentmsg?mailto=%s",
+            "https://e.mail.ru/cgi-bin/sentmsg?mailto=%s",
+          ],
+        ]);
+
+        function maybeReplaceURL(app) {
+          if (app instanceof Ci.nsIWebHandlerApp) {
+            let { uriTemplate } = app;
+            let sub = kSubstitutions.get(uriTemplate);
+            if (sub) {
+              app.uriTemplate = sub;
+              return true;
+            }
+          }
+          return false;
+        }
+        let mailHandler =
+          lazy.externalProtocolService.getProtocolHandlerInfo("mailto");
+        if (this.exists(mailHandler)) {
+          this.fillHandlerInfo(mailHandler, "");
+          let handlers = mailHandler.possibleApplicationHandlers;
+          let shouldStore = false;
+          for (let i = handlers.length - 1; i >= 0; i--) {
+            let app = handlers.queryElementAt(i, Ci.nsIHandlerApp);
+            shouldStore |= maybeReplaceURL(app);
+          }
+          if (mailHandler.preferredApplicationHandler) {
+            shouldStore |= maybeReplaceURL(
+              mailHandler.preferredApplicationHandler
+            );
+          }
+          if (shouldStore) {
+            this.store(mailHandler);
+          }
+        }
+      },
+      mibbit: () => {
+        const mibbitRegex = /^https?:\/\/(?:www\.)?mibbit\.com/i;
+        for (let prot of ["irc", "ircs"]) {
+          let protInfo =
+            lazy.externalProtocolService.getProtocolHandlerInfo(prot);
+          if (this.exists(protInfo)) {
+            this.fillHandlerInfo(protInfo, "");
+            if (removeMatchingHandlers(protInfo, mibbitRegex)) {
+              this.store(protInfo);
+            }
+          }
+        }
+      },
+    };
+    let migrationsToRun = Services.prefs.getCharPref(
+      "browser.handlers.migrations",
+      ""
+    );
+    migrationsToRun = migrationsToRun ? migrationsToRun.split(",") : [];
+    for (let migration of migrationsToRun) {
+      migration.trim();
+      try {
+        kMigrations[migration]();
+      } catch (ex) {
+        console.error(ex);
+      }
+    }
+
+    if (migrationsToRun.length) {
+      Services.prefs.clearUserPref("browser.handlers.migrations");
+    }
+  },
+
+  _onDBChange() {
+    return (async () => {
+      if (this.__store) {
+        await this.__store.finalize();
+      }
+      this.__store = null;
+      this.__storeInitialized = false;
+    })().catch(console.error);
+  },
+
+  observe(subject, topic) {
+    if (topic != "handlersvc-json-replace") {
+      return;
+    }
+    let promise = this._onDBChange();
+    promise.then(() => {
+      Services.obs.notifyObservers(null, "handlersvc-json-replace-complete");
+    });
+  },
+
+  asyncInit() {
+    if (!this.__store) {
+      this.__store = new lazy.JSONFile({
+        path: PathUtils.join(
+          Services.dirsvc.get("ProfD", Ci.nsIFile).path,
+          "handlers.json"
+        ),
+        dataPostProcessor: this._dataPostProcessor.bind(this),
+      });
+      this.__store
+        .load()
+        .then(() => {
+          if (this.__store) {
+            this._ensureStoreInitialized();
+          }
+        })
+        .catch(console.error);
+    }
+  },
+
+  enumerate() {
+    let handlers = Cc["@mozilla.org/array;1"].createInstance(
+      Ci.nsIMutableArray
+    );
+    for (let [type, typeInfo] of Object.entries(this._store.data.mimeTypes)) {
+      let primaryExtension = typeInfo.extensions?.[0] ?? null;
+      let handler = lazy.MIMEService.getFromTypeAndExtension(
+        type,
+        primaryExtension
+      );
+      handlers.appendElement(handler);
+    }
+    for (let type of Object.keys(this._store.data.schemes)) {
+      let handler = new Proxy(
+        {
+          QueryInterface: ChromeUtils.generateQI(["nsIHandlerInfo"]),
+          type,
+          get _handlerInfo() {
+            delete this._handlerInfo;
+            return (this._handlerInfo =
+              lazy.externalProtocolService.getProtocolHandlerInfo(type));
+          },
+        },
+        {
+          get(target, name) {
+            return target[name] || target._handlerInfo[name];
+          },
+          set(target, name, value) {
+            target._handlerInfo[name] = value;
+          },
+        }
+      );
+      handlers.appendElement(handler);
+    }
+    return handlers.enumerate(Ci.nsIHandlerInfo);
+  },
+
+  store(handlerInfo) {
+    let handlerList = this._getHandlerListByHandlerInfoType(handlerInfo);
+
+    let storedHandlerInfo = handlerList[handlerInfo.type];
+    if (!storedHandlerInfo) {
+      storedHandlerInfo = {};
+      handlerList[handlerInfo.type] = storedHandlerInfo;
+    }
+
+    if (
+      handlerInfo.preferredAction == saveToDisk ||
+      handlerInfo.preferredAction == useSystemDefault ||
+      handlerInfo.preferredAction == handleInternally ||
+      (handlerInfo.preferredAction == alwaysAsk &&
+        this._isMIMEInfo(handlerInfo))
+    ) {
+      storedHandlerInfo.action = handlerInfo.preferredAction;
+    } else {
+      storedHandlerInfo.action = useHelperApp;
+    }
+
+    if (handlerInfo.alwaysAskBeforeHandling) {
+      storedHandlerInfo.ask = true;
+    } else {
+      delete storedHandlerInfo.ask;
+    }
+
+    let handlers = [];
+    if (handlerInfo.preferredApplicationHandler) {
+      handlers.push(handlerInfo.preferredApplicationHandler);
+    }
+    for (let handler of handlerInfo.possibleApplicationHandlers.enumerate(
+      Ci.nsIHandlerApp
+    )) {
+      if (!handlers.some(h => h.equals(handler))) {
+        handlers.push(handler);
+      }
+    }
+
+    let serializableHandlers = handlers
+      .map(h => this.handlerAppToSerializable(h))
+      .filter(h => h);
+    if (serializableHandlers.length) {
+      if (!handlerInfo.preferredApplicationHandler) {
+        serializableHandlers.unshift(null);
+      }
+      storedHandlerInfo.handlers = serializableHandlers;
+    } else {
+      delete storedHandlerInfo.handlers;
+    }
+
+    if (this._isMIMEInfo(handlerInfo)) {
+      let extensions = storedHandlerInfo.extensions || [];
+      for (let extension of handlerInfo.getFileExtensions()) {
+        extension = extension.toLowerCase();
+        if (!extensions.includes(extension)) {
+          extensions.push(extension);
+        }
+      }
+      if (extensions.length) {
+        storedHandlerInfo.extensions = extensions;
+      } else {
+        delete storedHandlerInfo.extensions;
+      }
+    }
+
+    delete storedHandlerInfo.stubEntry;
+
+    this._store.saveSoon();
+
+    if (handlerInfo.type == "application/pdf") {
+      Services.obs.notifyObservers(null, TOPIC_PDFJS_HANDLER_CHANGED);
+    }
+
+    if (handlerInfo.type == "mailto") {
+      Services.obs.notifyObservers(null, "mailto::onClearCache");
+    }
+  },
+
+  fillHandlerInfo(handlerInfo, overrideType) {
+    let type = overrideType || handlerInfo.type;
+    let storedHandlerInfo =
+      this._getHandlerListByHandlerInfoType(handlerInfo)[type];
+    if (!storedHandlerInfo) {
+      throw new Components.Exception(
+        "handlerSvc fillHandlerInfo: don't know this type",
+        Cr.NS_ERROR_NOT_AVAILABLE
+      );
+    }
+
+    let isStub = !!storedHandlerInfo.stubEntry;
+    if (!isStub) {
+      handlerInfo.preferredAction = storedHandlerInfo.action;
+      handlerInfo.alwaysAskBeforeHandling = !!storedHandlerInfo.ask;
+    } else {
+      lazy.externalProtocolService.setProtocolHandlerDefaults(
+        handlerInfo,
+        handlerInfo.hasDefaultHandler
+      );
+      if (
+        handlerInfo.preferredAction == alwaysAsk &&
+        handlerInfo.alwaysAskBeforeHandling
+      ) {
+        handlerInfo.preferredAction = useHelperApp;
+      }
+      if (
+        type == "mailto" &&
+        lazy.NimbusFeatures.mailto.getVariable("dialog")
+      ) {
+        handlerInfo.alwaysAskBeforeHandling = true;
+      }
+    }
+    this._appendStoredHandlers(handlerInfo, storedHandlerInfo.handlers, isStub);
+
+    if (this._isMIMEInfo(handlerInfo) && storedHandlerInfo.extensions) {
+      for (let extension of storedHandlerInfo.extensions) {
+        handlerInfo.appendExtension(extension);
+      }
+    } else if (this._mockedHandler) {
+      this._insertMockedHandler(handlerInfo);
+    }
+  },
+
+  _appendStoredHandlers(handlerInfo, storedHandlers, keepPreferredApp) {
+    let isFirstItem = true;
+    for (let handler of storedHandlers || [null]) {
+      let handlerApp = this.handlerAppFromSerializable(handler || {});
+      if (isFirstItem) {
+        isFirstItem = false;
+        if (!keepPreferredApp) {
+          handlerInfo.preferredApplicationHandler = handlerApp;
+        }
+      }
+      if (handlerApp) {
+        handlerInfo.possibleApplicationHandlers.appendElement(handlerApp);
+      }
+    }
+  },
+
+  handlerAppToSerializable(handler) {
+    if (handler instanceof Ci.nsILocalHandlerApp) {
+      return {
+        name: handler.name,
+        path: handler.executable.path,
+      };
+    } else if (handler instanceof Ci.nsIWebHandlerApp) {
+      return {
+        name: handler.name,
+        uriTemplate: handler.uriTemplate,
+      };
+    } else if (handler instanceof Ci.nsIGIOMimeApp) {
+      return {
+        name: handler.name,
+        command: handler.command,
+      };
+    } else if (handler instanceof Ci.nsIGIOHandlerApp) {
+      return {
+        name: handler.name,
+        id: handler.id,
+      };
+    }
+    return null;
+  },
+
+  handlerAppFromSerializable(handlerObj) {
+    let handlerApp;
+    if ("path" in handlerObj) {
+      try {
+        let file = new lazy.FileUtils.File(handlerObj.path);
+        if (!file.exists()) {
+          return null;
+        }
+        handlerApp = Cc[
+          "@mozilla.org/uriloader/local-handler-app;1"
+        ].createInstance(Ci.nsILocalHandlerApp);
+        handlerApp.executable = file;
+      } catch (ex) {
+        return null;
+      }
+    } else if ("uriTemplate" in handlerObj) {
+      handlerApp = Cc[
+        "@mozilla.org/uriloader/web-handler-app;1"
+      ].createInstance(Ci.nsIWebHandlerApp);
+      handlerApp.uriTemplate = handlerObj.uriTemplate;
+    } else if ("command" in handlerObj && "@mozilla.org/gio-service;1" in Cc) {
+      try {
+        handlerApp = Cc["@mozilla.org/gio-service;1"]
+          .getService(Ci.nsIGIOService)
+          .createAppFromCommand(handlerObj.command, handlerObj.name);
+      } catch (ex) {
+        return null;
+      }
+    } else if ("id" in handlerObj && "@mozilla.org/gio-service;1" in Cc) {
+      try {
+        handlerApp = Cc["@mozilla.org/gio-service;1"]
+          .getService(Ci.nsIGIOService)
+          .createHandlerAppFromAppId(handlerObj.id);
+      } catch (ex) {
+        return null;
+      }
+    } else {
+      return null;
+    }
+
+    handlerApp.name = handlerObj.name;
+    return handlerApp;
+  },
+
+  _getHandlerListByHandlerInfoType(handlerInfo) {
+    return this._isMIMEInfo(handlerInfo)
+      ? this._store.data.mimeTypes
+      : this._store.data.schemes;
+  },
+
+  _isMIMEInfo(handlerInfo) {
+    return (
+      handlerInfo instanceof Ci.nsIMIMEInfo && handlerInfo.type.includes("/")
+    );
+  },
+
+  exists(handlerInfo) {
+    return (
+      handlerInfo.type in this._getHandlerListByHandlerInfoType(handlerInfo)
+    );
+  },
+
+  remove(handlerInfo) {
+    delete this._getHandlerListByHandlerInfoType(handlerInfo)[handlerInfo.type];
+    this._store.saveSoon();
+  },
+
+  getTypeFromExtension(fileExtension) {
+    let extension = fileExtension.toLowerCase();
+    let mimeTypes = this._store.data.mimeTypes;
+    for (let type of Object.keys(mimeTypes)) {
+      if (
+        mimeTypes[type].extensions &&
+        mimeTypes[type].extensions.includes(extension)
+      ) {
+        return type;
+      }
+    }
+    return "";
+  },
+
+  _mockedHandler: null,
+  _mockedProtocol: null,
+
+  _insertMockedHandler(handlerInfo) {
+    if (handlerInfo.type == this._mockedProtocol) {
+      handlerInfo.preferredApplicationHandler = this._mockedHandler;
+      handlerInfo.possibleApplicationHandlers.insertElementAt(
+        this._mockedHandler,
+        0
+      );
+    }
+  },
+
+  mockProtocolHandler(protocol) {
+    if (!protocol) {
+      this._mockedProtocol = null;
+      this._mockedHandler = null;
+      return;
+    }
+    this._mockedProtocol = protocol;
+    this._mockedHandler = {
+      QueryInterface: ChromeUtils.generateQI([Ci.nsILocalHandlerApp]),
+      launchWithURI(uri) {
+        Services.obs.notifyObservers(uri, "mocked-protocol-handler");
+      },
+      name: "Mocked handler",
+      detailedDescription: "Mocked handler for tests",
+      equals(x) {
+        return x == this;
+      },
+      get executable() {
+        if (AppConstants.platform == "macosx") {
+          let f = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+          f.initWithPath("/Applications/Safari.app");
+          return f;
+        }
+        return Services.dirsvc.get("XCurProcD", Ci.nsIFile);
+      },
+      parameterCount: 0,
+      clearParameters() {},
+      appendParameter() {},
+      getParameter() {},
+      parameterExists() {
+        return false;
+      },
+    };
+  },
+};

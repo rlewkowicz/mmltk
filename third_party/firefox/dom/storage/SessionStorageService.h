@@ -1,0 +1,49 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_STORAGE_SESSIONSTORAGESERVICE_H_
+#define DOM_STORAGE_SESSIONSTORAGESERVICE_H_
+
+#include "mozilla/Result.h"
+#include "mozilla/dom/FlippedOnce.h"
+#include "mozilla/dom/PBackgroundSessionStorageServiceChild.h"
+#include "nsISessionStorageService.h"
+
+namespace mozilla {
+
+struct CreateIfNonExistent;
+
+namespace dom {
+
+class SessionStorageService final
+    : public nsISessionStorageService,
+      public PBackgroundSessionStorageServiceChild {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSISESSIONSTORAGESERVICE
+
+  SessionStorageService();
+
+  static mozilla::Result<RefPtr<SessionStorageService>, nsresult> Acquire(
+      const CreateIfNonExistent&);
+
+  static RefPtr<SessionStorageService> Acquire();
+
+ private:
+  ~SessionStorageService();
+
+  mozilla::Result<Ok, nsresult> Init();
+
+  void Shutdown();
+
+  void ActorDestroy(ActorDestroyReason aWhy) override;
+
+  FlippedOnce<false> mInitialized;
+  FlippedOnce<false> mActorDestroyed;
+};
+
+}  
+}  
+
+#endif /* DOM_STORAGE_SESSIONSTORAGESERVICE_H_ */

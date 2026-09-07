@@ -1,0 +1,99 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef dom_ipc_StringTable_h
+#define dom_ipc_StringTable_h
+
+#include "mozilla/RangedPtr.h"
+#include "nsTHashMap.h"
+
+
+namespace mozilla::dom::ipc {
+
+struct StringTableEntry {
+  uint32_t mOffset;
+  uint32_t mLength;
+
+  uint32_t Hash() const { return mOffset; }
+
+  bool operator==(const StringTableEntry& aOther) const {
+    return mOffset == aOther.mOffset;
+  }
+};
+
+template <typename StringType>
+class StringTable {
+  using ElemType = typename StringType::char_type;
+
+ public:
+  MOZ_IMPLICIT StringTable(const RangedPtr<uint8_t>& aBuffer)
+      : mBuffer(aBuffer.ReinterpretCast<ElemType>()) {
+    MOZ_ASSERT(uintptr_t(aBuffer.get()) % alignof(ElemType) == 0,
+               "Got misalinged buffer");
+  }
+
+  StringType Get(const StringTableEntry& aEntry) const {
+    StringType res;
+    res.AssignLiteral(GetBare(aEntry), aEntry.mLength);
+    return res;
+  }
+
+  const ElemType* GetBare(const StringTableEntry& aEntry) const {
+    return &mBuffer[aEntry.mOffset];
+  }
+
+ private:
+  RangedPtr<ElemType> mBuffer;
+};
+
+template <typename KeyType, typename StringType>
+class StringTableBuilder {
+ public:
+  using ElemType = typename StringType::char_type;
+
+  StringTableEntry Add(const StringType& aKey) {
+    return mEntries.WithEntryHandle(aKey,
+                                    [&](auto&& entry) -> StringTableEntry {
+                                      auto length = uint32_t(aKey.Length());
+                                      entry.OrInsertWith([&]() {
+                                        Entry newEntry{mSize, aKey};
+                                        mSize += length + 1;
+
+                                        return newEntry;
+                                      });
+
+                                      return {entry->mOffset, length};
+                                    });
+  }
+
+  void Write(const RangedPtr<uint8_t>& aBuffer) {
+    auto buffer = aBuffer.ReinterpretCast<ElemType>();
+
+    for (const auto& entry : mEntries.Values()) {
+      memcpy(&buffer[entry.mOffset], entry.mValue.BeginReading(),
+             sizeof(ElemType) * (entry.mValue.Length() + 1));
+    }
+  }
+
+  uint32_t Count() const { return mEntries.Count(); }
+
+  uint32_t Size() const { return mSize * sizeof(ElemType); }
+
+  void Clear() { mEntries.Clear(); }
+
+  static constexpr size_t Alignment() { return alignof(ElemType); }
+
+ private:
+  struct Entry {
+    uint32_t mOffset;
+    StringType mValue;
+  };
+
+  nsTHashMap<KeyType, Entry> mEntries;
+  uint32_t mSize = 0;
+};
+
+}  
+
+#endif

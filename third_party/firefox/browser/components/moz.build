@@ -1,0 +1,47 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+DIRS += [
+    "about",
+    "contextualidentity",
+    "controlcenter",
+    "customizableui",
+    "downloads",
+    "originattributes",
+    "places",
+    "permissions",
+    "privatebrowsing",
+    "prompts",
+    "protections",
+    "protocolhandler",
+    "resistfingerprinting",
+    "search",
+    "sessionstore",
+    "tabbrowser",
+    "tabunloader",
+    "urlbar",
+]
+
+DIRS += ["build"]
+
+XPIDL_SOURCES += [
+    "nsIBrowserHandler.idl",
+]
+
+XPIDL_MODULE = "browsercompsbase"
+
+XPCOM_MANIFESTS += [
+    "components.conf",
+]
+
+EXTRA_PP_COMPONENTS += [
+    "BrowserComponents.manifest",
+]
+
+EXTRA_JS_MODULES += [
+    "BrowserContentHandler.sys.mjs",
+    "BrowserGlue.sys.mjs",
+]
+
+MOZ_SRC_FILES += ["DesktopActorRegistry.sys.mjs"]

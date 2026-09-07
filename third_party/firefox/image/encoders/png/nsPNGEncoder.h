@@ -1,0 +1,84 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_image_encoders_png_nsPNGEncoder_h
+#define mozilla_image_encoders_png_nsPNGEncoder_h
+
+#include <png.h>
+
+#include "imgIEncoder.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/ReentrantMonitor.h"
+#include "mozilla/gfx/Types.h"
+#include "nsCOMPtr.h"
+
+#define NS_PNGENCODER_CID                     \
+  { \
+   0x38d1592e,                                \
+   0xb81e,                                    \
+   0x432b,                                    \
+   {0x86, 0xf8, 0x47, 0x18, 0x78, 0xbb, 0xfe, 0x07}}
+
+
+class nsPNGEncoder final : public imgIEncoder {
+  typedef mozilla::ReentrantMonitor ReentrantMonitor;
+
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_IMGIENCODER
+  NS_DECL_NSIINPUTSTREAM
+  NS_DECL_NSIASYNCINPUTSTREAM
+
+  nsPNGEncoder();
+
+ protected:
+  ~nsPNGEncoder();
+  nsresult ParseOptions(const nsAString& aOptions, bool* useTransparency,
+                        bool* skipFirstFrame, uint32_t* numAnimatedFrames,
+                        uint32_t* numIterations, int* zlibLevel, int* filters,
+                        uint32_t* frameDispose, uint32_t* frameBlend,
+                        uint32_t* frameDelay, uint32_t* offsetX,
+                        uint32_t* offsetY);
+  void ConvertHostARGBRow(const uint8_t* aSrc, uint8_t* aDest,
+                          uint32_t aPixelWidth, bool aUseTransparency);
+  void StripAlpha(const uint8_t* aSrc, uint8_t* aDest, uint32_t aPixelWidth);
+  static void WarningCallback(png_structp png_ptr, png_const_charp warning_msg);
+  static void ErrorCallback(png_structp png_ptr, png_const_charp error_msg);
+  static void WriteCallback(png_structp png, png_bytep data, png_size_t size);
+  void NullOutImageBuffer();
+  void NotifyListener();
+  nsresult MaybeAddCustomMetadata(const nsACString& aRandomizationKey);
+
+  png_struct* mPNG;
+  png_info* mPNGinfo;
+
+  bool mAddCustomMetadata;
+  bool mIsAnimation;
+  bool mFinished;
+
+  uint32_t mBitDepth = 8;
+  uint32_t mInputBitDepth = 0;
+  bool mHasCICP = false;
+  mozilla::gfx::CICP::ColourPrimaries mColourPrimaries =
+      mozilla::gfx::CICP::CP_BT709;
+  mozilla::gfx::CICP::TransferCharacteristics mTransferCharacteristics =
+      mozilla::gfx::CICP::TC_SRGB;
+  mozilla::gfx::CICP::MatrixCoefficients mMatrixCoefficients =
+      mozilla::gfx::CICP::MC_IDENTITY;
+  bool mFullRange = true;
+
+  uint8_t* mImageBuffer;
+  uint32_t mImageBufferSize;
+  uint32_t mImageBufferUsed;
+  uint32_t mImageBufferHash;
+
+  uint32_t mImageBufferReadPoint;
+
+  nsCOMPtr<nsIInputStreamCallback> mCallback;
+  nsCOMPtr<nsIEventTarget> mCallbackTarget;
+  uint32_t mNotifyThreshold;
+
+  ReentrantMonitor mReentrantMonitor MOZ_UNANNOTATED;
+};
+#endif  // mozilla_image_encoders_png_nsPNGEncoder_h

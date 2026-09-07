@@ -1,0 +1,76 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsHtml5StringParser_h
+#define nsHtml5StringParser_h
+
+#include "mozilla/UniquePtr.h"
+#include "nsHtml5AtomTable.h"
+#include "nsParserBase.h"
+
+class nsHtml5OplessBuilder;
+class nsHtml5TreeBuilder;
+class nsHtml5Tokenizer;
+class nsIContent;
+namespace mozilla {
+namespace dom {
+class Document;
+}
+}  
+
+class nsHtml5StringParser : public nsParserBase {
+ public:
+  NS_DECL_ISUPPORTS
+
+  nsHtml5StringParser();
+
+  nsresult ParseFragment(const nsAString& aSourceBuffer,
+                         nsIContent* aTargetNode, nsAtom* aContextLocalName,
+                         int32_t aContextNamespace, bool aQuirks,
+                         bool aPreventScriptExecution,
+                         bool aAllowDeclarativeShadowRoots);
+
+  nsresult ParseDocument(const nsAString& aSourceBuffer,
+                         mozilla::dom::Document* aTargetDoc,
+                         bool aScriptingEnabledForNoscriptParsing);
+
+ private:
+  virtual ~nsHtml5StringParser();
+
+  nsresult Tokenize(const nsAString& aSourceBuffer,
+                    mozilla::dom::Document* aDocument,
+                    bool aScriptingEnabledForNoscriptParsing,
+                    bool aDeclarativeShadowRootsAllowed);
+
+  void TryCache();
+  void ClearCaches();
+
+  RefPtr<nsHtml5OplessBuilder> mBuilder;
+
+  const mozilla::UniquePtr<nsHtml5TreeBuilder> mTreeBuilder;
+
+  const mozilla::UniquePtr<nsHtml5Tokenizer> mTokenizer;
+
+  nsHtml5AtomTable mAtomTable;
+
+  class CacheClearer : public mozilla::Runnable {
+   public:
+    explicit CacheClearer(nsHtml5StringParser* aParser)
+        : Runnable("CacheClearer"), mParser(aParser) {}
+    NS_IMETHOD Run() {
+      if (mParser) {
+        mParser->ClearCaches();
+      }
+      return NS_OK;
+    }
+    void Disconnect() { mParser = nullptr; }
+
+   private:
+    nsHtml5StringParser* mParser;
+  };
+
+  RefPtr<CacheClearer> mCacheClearer;
+};
+
+#endif  // nsHtml5StringParser_h

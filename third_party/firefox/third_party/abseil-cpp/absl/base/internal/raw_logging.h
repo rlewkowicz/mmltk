@@ -1,0 +1,130 @@
+// Copyright 2017 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef ABSL_BASE_INTERNAL_RAW_LOGGING_H_
+#define ABSL_BASE_INTERNAL_RAW_LOGGING_H_
+
+#include <string>
+
+#include "absl/base/attributes.h"
+#include "absl/base/config.h"
+#include "absl/base/internal/atomic_hook.h"
+#include "absl/base/log_severity.h"
+#include "absl/base/macros.h"
+#include "absl/base/optimization.h"
+#include "absl/base/port.h"
+
+
+#define ABSL_RAW_LOG(severity, ...)                                            \
+  do {                                                                         \
+    constexpr const char* absl_raw_log_internal_basename =                     \
+        ::absl::raw_log_internal::Basename(__FILE__, sizeof(__FILE__) - 1);    \
+    ::absl::raw_log_internal::RawLog(ABSL_RAW_LOG_INTERNAL_##severity,         \
+                                     absl_raw_log_internal_basename, __LINE__, \
+                                     __VA_ARGS__);                             \
+    ABSL_RAW_LOG_INTERNAL_MAYBE_UNREACHABLE_##severity;                        \
+  } while (0)
+
+#define ABSL_RAW_CHECK(condition, message)                             \
+  do {                                                                 \
+    if (ABSL_PREDICT_FALSE(!(condition))) {                            \
+      ABSL_RAW_LOG(FATAL, "Check %s failed: %s", #condition, message); \
+    }                                                                  \
+  } while (0)
+
+#define ABSL_INTERNAL_LOG(severity, message)                              \
+  do {                                                                    \
+    constexpr const char* absl_raw_log_internal_filename = __FILE__;      \
+    ::absl::raw_log_internal::internal_log_function(                      \
+        ABSL_RAW_LOG_INTERNAL_##severity, absl_raw_log_internal_filename, \
+        __LINE__, message);                                               \
+    ABSL_RAW_LOG_INTERNAL_MAYBE_UNREACHABLE_##severity;                   \
+  } while (0)
+
+#define ABSL_INTERNAL_CHECK(condition, message)                    \
+  do {                                                             \
+    if (ABSL_PREDICT_FALSE(!(condition))) {                        \
+      std::string death_message = "Check " #condition " failed: "; \
+      death_message += std::string(message);                       \
+      ABSL_INTERNAL_LOG(FATAL, death_message);                     \
+    }                                                              \
+  } while (0)
+
+#ifndef NDEBUG
+
+#define ABSL_RAW_DLOG(severity, ...) ABSL_RAW_LOG(severity, __VA_ARGS__)
+#define ABSL_RAW_DCHECK(condition, message) ABSL_RAW_CHECK(condition, message)
+
+#else  // NDEBUG
+
+#define ABSL_RAW_DLOG(severity, ...)                   \
+  while (false) ABSL_RAW_LOG(severity, __VA_ARGS__)
+#define ABSL_RAW_DCHECK(condition, message) \
+  while (false) ABSL_RAW_CHECK(condition, message)
+
+#endif  // NDEBUG
+
+#define ABSL_RAW_LOG_INTERNAL_INFO ::absl::LogSeverity::kInfo
+#define ABSL_RAW_LOG_INTERNAL_WARNING ::absl::LogSeverity::kWarning
+#define ABSL_RAW_LOG_INTERNAL_ERROR ::absl::LogSeverity::kError
+#define ABSL_RAW_LOG_INTERNAL_FATAL ::absl::LogSeverity::kFatal
+#define ABSL_RAW_LOG_INTERNAL_DFATAL ::absl::kLogDebugFatal
+#define ABSL_RAW_LOG_INTERNAL_LEVEL(severity) \
+  ::absl::NormalizeLogSeverity(severity)
+
+#define ABSL_RAW_LOG_INTERNAL_MAYBE_UNREACHABLE_INFO
+#define ABSL_RAW_LOG_INTERNAL_MAYBE_UNREACHABLE_WARNING
+#define ABSL_RAW_LOG_INTERNAL_MAYBE_UNREACHABLE_ERROR
+#define ABSL_RAW_LOG_INTERNAL_MAYBE_UNREACHABLE_FATAL ABSL_UNREACHABLE()
+#define ABSL_RAW_LOG_INTERNAL_MAYBE_UNREACHABLE_DFATAL
+#define ABSL_RAW_LOG_INTERNAL_MAYBE_UNREACHABLE_LEVEL(severity)
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace raw_log_internal {
+
+void RawLog(absl::LogSeverity severity, const char* file, int line,
+            const char* format, ...) ABSL_PRINTF_ATTRIBUTE(4, 5);
+
+void AsyncSignalSafeWriteError(const char* s, size_t len);
+
+constexpr const char* Basename(const char* fname, int offset) {
+  return offset == 0 || fname[offset - 1] == '/' || fname[offset - 1] == '\\'
+             ? fname + offset
+             : Basename(fname, offset - 1);
+}
+
+bool RawLoggingFullySupported();
+
+using LogFilterAndPrefixHook = bool (*)(absl::LogSeverity severity,
+                                        const char* file, int line, char** buf,
+                                        int* buf_size);
+
+using AbortHook = void (*)(const char* file, int line, const char* buf_start,
+                           const char* prefix_end, const char* buf_end);
+
+using InternalLogFunction = void (*)(absl::LogSeverity severity,
+                                     const char* file, int line,
+                                     const std::string& message);
+
+ABSL_INTERNAL_ATOMIC_HOOK_ATTRIBUTES ABSL_DLL extern base_internal::AtomicHook<
+    InternalLogFunction>
+    internal_log_function;
+
+void RegisterLogFilterAndPrefixHook(LogFilterAndPrefixHook func);
+void RegisterAbortHook(AbortHook func);
+void RegisterInternalLogFunction(InternalLogFunction func);
+
+}  
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_BASE_INTERNAL_RAW_LOGGING_H_

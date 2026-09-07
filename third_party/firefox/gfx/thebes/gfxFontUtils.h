@@ -1,0 +1,651 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(GFX_FONT_UTILS_H)
+#define GFX_FONT_UTILS_H
+
+#include "gfxPlatform.h"
+#include "harfbuzz/hb.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/EndianUtils.h"
+#include "nsStringFwd.h"
+#include "nsTArray.h"
+#include "nscore.h"
+
+class PickleIterator;
+class gfxFontEntry;
+struct gfxFontVariationAxis;
+struct gfxFontVariationInstance;
+class gfxSparseBitSet;
+
+namespace mozilla {
+class Encoding;
+class ServoStyleSet;
+class SlantStyleRange;
+class StretchRange;
+class WeightRange;
+struct StyleFontStyle;
+struct StyleFontStretch;
+struct StyleFontWeight;
+}  
+
+#if defined(__MINGW32__)
+#  undef min
+#  undef max
+#endif
+
+#undef ERROR /* defined by Windows.h, conflicts with some generated bindings \
+                code when this gets indirectly included via shared font list \
+              */
+
+typedef struct hb_blob_t hb_blob_t;
+
+#define TRUETYPE_TAG(a, b, c, d) ((a) << 24 | (b) << 16 | (c) << 8 | (d))
+
+namespace mozilla {
+
+#pragma pack(1)
+
+struct AutoSwap_PRUint16 {
+#if defined(__SUNPRO_CC)
+  AutoSwap_PRUint16& operator=(const uint16_t aValue) {
+    this->value = mozilla::NativeEndian::swapToBigEndian(aValue);
+    return *this;
+  }
+#else
+  MOZ_IMPLICIT AutoSwap_PRUint16(uint16_t aValue) {
+    value = mozilla::NativeEndian::swapToBigEndian(aValue);
+  }
+#endif
+  operator uint16_t() const {
+    return mozilla::NativeEndian::swapFromBigEndian(value);
+  }
+
+  operator uint32_t() const {
+    return mozilla::NativeEndian::swapFromBigEndian(value);
+  }
+
+  operator uint64_t() const {
+    return mozilla::NativeEndian::swapFromBigEndian(value);
+  }
+
+ private:
+  uint16_t value;
+};
+
+struct AutoSwap_PRInt16 {
+#if defined(__SUNPRO_CC)
+  AutoSwap_PRInt16& operator=(const int16_t aValue) {
+    this->value = mozilla::NativeEndian::swapToBigEndian(aValue);
+    return *this;
+  }
+#else
+  MOZ_IMPLICIT AutoSwap_PRInt16(int16_t aValue) {
+    value = mozilla::NativeEndian::swapToBigEndian(aValue);
+  }
+#endif
+  operator int16_t() const {
+    return mozilla::NativeEndian::swapFromBigEndian(value);
+  }
+
+  operator uint32_t() const {
+    return mozilla::NativeEndian::swapFromBigEndian(value);
+  }
+
+ private:
+  int16_t value;
+};
+
+struct AutoSwap_PRUint32 {
+#if defined(__SUNPRO_CC)
+  AutoSwap_PRUint32& operator=(const uint32_t aValue) {
+    this->value = mozilla::NativeEndian::swapToBigEndian(aValue);
+    return *this;
+  }
+#else
+  MOZ_IMPLICIT AutoSwap_PRUint32(uint32_t aValue) {
+    value = mozilla::NativeEndian::swapToBigEndian(aValue);
+  }
+#endif
+  operator uint32_t() const {
+    return mozilla::NativeEndian::swapFromBigEndian(value);
+  }
+
+ private:
+  uint32_t value;
+};
+
+struct AutoSwap_PRInt32 {
+#if defined(__SUNPRO_CC)
+  AutoSwap_PRInt32& operator=(const int32_t aValue) {
+    this->value = mozilla::NativeEndian::swapToBigEndian(aValue);
+    return *this;
+  }
+#else
+  MOZ_IMPLICIT AutoSwap_PRInt32(int32_t aValue) {
+    value = mozilla::NativeEndian::swapToBigEndian(aValue);
+  }
+#endif
+  operator int32_t() const {
+    return mozilla::NativeEndian::swapFromBigEndian(value);
+  }
+
+ private:
+  int32_t value;
+};
+
+struct AutoSwap_PRUint64 {
+#if defined(__SUNPRO_CC)
+  AutoSwap_PRUint64& operator=(const uint64_t aValue) {
+    this->value = mozilla::NativeEndian::swapToBigEndian(aValue);
+    return *this;
+  }
+#else
+  MOZ_IMPLICIT AutoSwap_PRUint64(uint64_t aValue) {
+    value = mozilla::NativeEndian::swapToBigEndian(aValue);
+  }
+#endif
+  operator uint64_t() const {
+    return mozilla::NativeEndian::swapFromBigEndian(value);
+  }
+
+ private:
+  uint64_t value;
+};
+
+struct AutoSwap_PRUint24 {
+  operator uint32_t() const {
+    return value[0] << 16 | value[1] << 8 | value[2];
+  }
+
+ private:
+  AutoSwap_PRUint24() = default;
+  uint8_t value[3];
+};
+
+struct SFNTHeader {
+  AutoSwap_PRUint32 sfntVersion;    
+  AutoSwap_PRUint16 numTables;      
+  AutoSwap_PRUint16 searchRange;    
+  AutoSwap_PRUint16 entrySelector;  
+  AutoSwap_PRUint16 rangeShift;     
+};
+
+struct TTCHeader {
+  AutoSwap_PRUint32 ttcTag;  
+  AutoSwap_PRUint16 majorVersion;
+  AutoSwap_PRUint16 minorVersion;
+  AutoSwap_PRUint32 numFonts;
+};
+
+struct TableDirEntry {
+  AutoSwap_PRUint32 tag;       
+  AutoSwap_PRUint32 checkSum;  
+  AutoSwap_PRUint32 offset;    
+  AutoSwap_PRUint32 length;    
+};
+
+struct HeadTable {
+  enum {
+    HEAD_VERSION = 0x00010000,
+    HEAD_MAGIC_NUMBER = 0x5F0F3CF5,
+    HEAD_CHECKSUM_CALC_CONST = 0xB1B0AFBA
+  };
+
+  AutoSwap_PRUint32 tableVersionNumber;  
+  AutoSwap_PRUint32 fontRevision;        
+  AutoSwap_PRUint32
+      checkSumAdjustment;  
+  AutoSwap_PRUint32 magicNumber;  
+  AutoSwap_PRUint16 flags;
+  AutoSwap_PRUint16
+      unitsPerEm;  
+  AutoSwap_PRUint64 created;  
+  AutoSwap_PRUint64 modified;       
+  AutoSwap_PRInt16 xMin;            
+  AutoSwap_PRInt16 yMin;            
+  AutoSwap_PRInt16 xMax;            
+  AutoSwap_PRInt16 yMax;            
+  AutoSwap_PRUint16 macStyle;       
+  AutoSwap_PRUint16 lowestRecPPEM;  
+  AutoSwap_PRInt16 fontDirectionHint;
+  AutoSwap_PRInt16 indexToLocFormat;
+  AutoSwap_PRInt16 glyphDataFormat;
+};
+
+struct OS2Table {
+  AutoSwap_PRUint16 version;  
+  AutoSwap_PRInt16 xAvgCharWidth;
+  AutoSwap_PRUint16 usWeightClass;
+  AutoSwap_PRUint16 usWidthClass;
+  AutoSwap_PRUint16 fsType;
+  AutoSwap_PRInt16 ySubscriptXSize;
+  AutoSwap_PRInt16 ySubscriptYSize;
+  AutoSwap_PRInt16 ySubscriptXOffset;
+  AutoSwap_PRInt16 ySubscriptYOffset;
+  AutoSwap_PRInt16 ySuperscriptXSize;
+  AutoSwap_PRInt16 ySuperscriptYSize;
+  AutoSwap_PRInt16 ySuperscriptXOffset;
+  AutoSwap_PRInt16 ySuperscriptYOffset;
+  AutoSwap_PRInt16 yStrikeoutSize;
+  AutoSwap_PRInt16 yStrikeoutPosition;
+  AutoSwap_PRInt16 sFamilyClass;
+  uint8_t panose[10];
+  AutoSwap_PRUint32 unicodeRange1;
+  AutoSwap_PRUint32 unicodeRange2;
+  AutoSwap_PRUint32 unicodeRange3;
+  AutoSwap_PRUint32 unicodeRange4;
+  uint8_t achVendID[4];
+  AutoSwap_PRUint16 fsSelection;
+  AutoSwap_PRUint16 usFirstCharIndex;
+  AutoSwap_PRUint16 usLastCharIndex;
+  AutoSwap_PRInt16 sTypoAscender;
+  AutoSwap_PRInt16 sTypoDescender;
+  AutoSwap_PRInt16 sTypoLineGap;
+  AutoSwap_PRUint16 usWinAscent;
+  AutoSwap_PRUint16 usWinDescent;
+  AutoSwap_PRUint32 codePageRange1;
+  AutoSwap_PRUint32 codePageRange2;
+  AutoSwap_PRInt16 sxHeight;
+  AutoSwap_PRInt16 sCapHeight;
+  AutoSwap_PRUint16 usDefaultChar;
+  AutoSwap_PRUint16 usBreakChar;
+  AutoSwap_PRUint16 usMaxContext;
+};
+
+struct PostTable {
+  AutoSwap_PRUint32 version;
+  AutoSwap_PRInt32 italicAngle;
+  AutoSwap_PRInt16 underlinePosition;
+  AutoSwap_PRUint16 underlineThickness;
+  AutoSwap_PRUint32 isFixedPitch;
+  AutoSwap_PRUint32 minMemType42;
+  AutoSwap_PRUint32 maxMemType42;
+  AutoSwap_PRUint32 minMemType1;
+  AutoSwap_PRUint32 maxMemType1;
+};
+
+struct MetricsHeader {
+  AutoSwap_PRUint32 version;
+  AutoSwap_PRInt16 ascender;
+  AutoSwap_PRInt16 descender;
+  AutoSwap_PRInt16 lineGap;
+  AutoSwap_PRUint16 advanceWidthMax;
+  AutoSwap_PRInt16 minLeftSideBearing;
+  AutoSwap_PRInt16 minRightSideBearing;
+  AutoSwap_PRInt16 xMaxExtent;
+  AutoSwap_PRInt16 caretSlopeRise;
+  AutoSwap_PRInt16 caretSlopeRun;
+  AutoSwap_PRInt16 caretOffset;
+  AutoSwap_PRInt16 reserved1;
+  AutoSwap_PRInt16 reserved2;
+  AutoSwap_PRInt16 reserved3;
+  AutoSwap_PRInt16 reserved4;
+  AutoSwap_PRInt16 metricDataFormat;
+  AutoSwap_PRUint16 numOfLongMetrics;
+};
+
+struct MaxpTableHeader {
+  AutoSwap_PRUint32 version;  
+  AutoSwap_PRUint16 numGlyphs;
+};
+
+struct KernTableVersion0 {
+  AutoSwap_PRUint16 version;  
+  AutoSwap_PRUint16 nTables;
+};
+
+struct KernTableSubtableHeaderVersion0 {
+  AutoSwap_PRUint16 version;
+  AutoSwap_PRUint16 length;
+  AutoSwap_PRUint16 coverage;
+};
+
+struct KernTableVersion1 {
+  AutoSwap_PRUint32 version;  
+  AutoSwap_PRUint32 nTables;
+};
+
+struct KernTableSubtableHeaderVersion1 {
+  AutoSwap_PRUint32 length;
+  AutoSwap_PRUint16 coverage;
+  AutoSwap_PRUint16 tupleIndex;
+};
+
+#pragma pack()
+
+inline uint32_t FindHighestBit(uint32_t value) {
+  value |= (value >> 1);
+  value |= (value >> 2);
+  value |= (value >> 4);
+  value |= (value >> 8);
+  value |= (value >> 16);
+  return (value & ~(value >> 1));
+}
+
+}  
+
+struct FontDataOverlay {
+  uint32_t overlaySrc;     
+  uint32_t overlaySrcLen;  
+  uint32_t overlayDest;    
+};
+
+enum gfxUserFontType {
+  GFX_USERFONT_UNKNOWN = 0,
+  GFX_USERFONT_OPENTYPE = 1,
+  GFX_USERFONT_SVG = 2,
+  GFX_USERFONT_WOFF = 3,
+  GFX_USERFONT_WOFF2 = 4
+};
+
+extern const uint8_t sCJKCompatSVSTable[];
+
+class gfxFontUtils {
+ public:
+  enum {
+    NAME_ID_FAMILY = 1,
+    NAME_ID_STYLE = 2,
+    NAME_ID_UNIQUE = 3,
+    NAME_ID_FULL = 4,
+    NAME_ID_VERSION = 5,
+    NAME_ID_POSTSCRIPT = 6,
+    NAME_ID_PREFERRED_FAMILY = 16,
+    NAME_ID_PREFERRED_STYLE = 17,
+
+    PLATFORM_ALL = -1,
+    PLATFORM_ID_UNICODE = 0,  
+    PLATFORM_ID_MAC = 1,
+    PLATFORM_ID_ISO = 2,
+    PLATFORM_ID_MICROSOFT = 3,
+
+    ENCODING_ID_MAC_ROMAN = 0,  
+    ENCODING_ID_MAC_JAPANESE =
+        1,  
+    ENCODING_ID_MAC_TRAD_CHINESE =
+        2,  
+    ENCODING_ID_MAC_KOREAN = 3,  
+    ENCODING_ID_MAC_ARABIC = 4,
+    ENCODING_ID_MAC_HEBREW = 5,
+    ENCODING_ID_MAC_GREEK = 6,
+    ENCODING_ID_MAC_CYRILLIC = 7,
+    ENCODING_ID_MAC_DEVANAGARI = 9,
+    ENCODING_ID_MAC_GURMUKHI = 10,
+    ENCODING_ID_MAC_GUJARATI = 11,
+    ENCODING_ID_MAC_SIMP_CHINESE = 25,
+
+    ENCODING_ID_MICROSOFT_SYMBOL = 0,  
+    ENCODING_ID_MICROSOFT_UNICODEBMP = 1,
+    ENCODING_ID_MICROSOFT_SHIFTJIS = 2,
+    ENCODING_ID_MICROSOFT_PRC = 3,
+    ENCODING_ID_MICROSOFT_BIG5 = 4,
+    ENCODING_ID_MICROSOFT_WANSUNG = 5,
+    ENCODING_ID_MICROSOFT_JOHAB = 6,
+    ENCODING_ID_MICROSOFT_UNICODEFULL = 10,
+
+    LANG_ALL = -1,
+    LANG_ID_MAC_ENGLISH = 0,  
+    LANG_ID_MAC_HEBREW =
+        10,  
+    LANG_ID_MAC_JAPANESE = 11,  
+    LANG_ID_MAC_ARABIC = 12,
+    LANG_ID_MAC_ICELANDIC = 15,
+    LANG_ID_MAC_TURKISH = 17,
+    LANG_ID_MAC_TRAD_CHINESE = 19,
+    LANG_ID_MAC_URDU = 20,
+    LANG_ID_MAC_KOREAN = 23,
+    LANG_ID_MAC_POLISH = 25,
+    LANG_ID_MAC_FARSI = 31,
+    LANG_ID_MAC_SIMP_CHINESE = 33,
+    LANG_ID_MAC_ROMANIAN = 37,
+    LANG_ID_MAC_CZECH = 38,
+    LANG_ID_MAC_SLOVAK = 39,
+
+    LANG_ID_MICROSOFT_EN_US =
+        0x0409,  
+
+    CMAP_MAX_CODEPOINT = 0x10ffff  
+  };
+
+  struct NameHeader {
+    mozilla::AutoSwap_PRUint16 format;        
+    mozilla::AutoSwap_PRUint16 count;         
+    mozilla::AutoSwap_PRUint16 stringOffset;  
+  };
+
+  struct NameRecord {
+    mozilla::AutoSwap_PRUint16 platformID;  
+    mozilla::AutoSwap_PRUint16 encodingID;  
+    mozilla::AutoSwap_PRUint16 languageID;  
+    mozilla::AutoSwap_PRUint16 nameID;      
+    mozilla::AutoSwap_PRUint16 length;      
+    mozilla::AutoSwap_PRUint16 offset;  
+  };
+
+  class AutoHBBlob {
+   public:
+    explicit AutoHBBlob(hb_blob_t* aBlob) : mBlob(aBlob) {}
+
+    ~AutoHBBlob() { hb_blob_destroy(mBlob); }
+
+    operator hb_blob_t*() { return mBlob; }
+
+   private:
+    hb_blob_t* const mBlob;
+  };
+
+
+  static inline uint16_t ReadShortAt(const uint8_t* aBuf, uint32_t aIndex) {
+    return static_cast<uint16_t>(aBuf[aIndex] << 8) | aBuf[aIndex + 1];
+  }
+
+  static inline uint16_t ReadShortAt16(const uint16_t* aBuf, uint32_t aIndex) {
+    const uint8_t* buf = reinterpret_cast<const uint8_t*>(aBuf);
+    uint32_t index = aIndex << 1;
+    return static_cast<uint16_t>(buf[index] << 8) | buf[index + 1];
+  }
+
+  static inline uint32_t ReadUint24At(const uint8_t* aBuf, uint32_t aIndex) {
+    return ((aBuf[aIndex] << 16) | (aBuf[aIndex + 1] << 8) |
+            (aBuf[aIndex + 2]));
+  }
+
+  static inline uint32_t ReadLongAt(const uint8_t* aBuf, uint32_t aIndex) {
+    return ((aBuf[aIndex] << 24) | (aBuf[aIndex + 1] << 16) |
+            (aBuf[aIndex + 2] << 8) | (aBuf[aIndex + 3]));
+  }
+
+  static nsresult ReadCMAPTableFormat10(const uint8_t* aBuf, uint32_t aLength,
+                                        gfxSparseBitSet& aCharacterMap);
+
+  static nsresult ReadCMAPTableFormat12or13(const uint8_t* aBuf,
+                                            uint32_t aLength,
+                                            gfxSparseBitSet& aCharacterMap);
+
+  static nsresult ReadCMAPTableFormat4(const uint8_t* aBuf, uint32_t aLength,
+                                       gfxSparseBitSet& aCharacterMap,
+                                       bool aIsSymbolFont);
+
+  static nsresult ReadCMAPTableFormat14(const uint8_t* aBuf, uint32_t aLength,
+                                        const uint8_t*& aTable);
+
+  static uint32_t FindPreferredSubtable(const uint8_t* aBuf,
+                                        uint32_t aBufLength,
+                                        uint32_t* aTableOffset,
+                                        uint32_t* aUVSTableOffset,
+                                        bool* aIsSymbolFont);
+
+  static nsresult ReadCMAP(const uint8_t* aBuf, uint32_t aBufLength,
+                           gfxSparseBitSet& aCharacterMap,
+                           uint32_t& aUVSOffset);
+
+  static uint32_t MapCharToGlyphFormat4(const uint8_t* aBuf, uint32_t aLength,
+                                        char16_t aCh);
+
+  static uint32_t MapCharToGlyphFormat10(const uint8_t* aBuf, uint32_t aCh);
+
+  static uint32_t MapCharToGlyphFormat12or13(const uint8_t* aBuf, uint32_t aCh);
+
+  static uint16_t MapUVSToGlyphFormat14(const uint8_t* aBuf, uint32_t aCh,
+                                        uint32_t aVS);
+
+  static bool IsDefaultUVSSequence(const uint8_t* aBuf, uint32_t aCh,
+                                   uint32_t aVS);
+
+  static MOZ_ALWAYS_INLINE uint32_t GetUVSFallback(uint32_t aCh, uint32_t aVS) {
+    aCh = MapUVSToGlyphFormat14(sCJKCompatSVSTable, aCh, aVS);
+    return aCh >= 0xFB00 ? aCh + (0x2F800 - 0xFB00) : aCh;
+  }
+
+  static uint32_t MapCharToGlyph(const uint8_t* aCmapBuf, uint32_t aBufLength,
+                                 uint32_t aUnicode, uint32_t aVarSelector = 0);
+
+  static MOZ_ALWAYS_INLINE uint32_t MapLegacySymbolFontCharToPUA(uint32_t aCh) {
+    return aCh >= 0x20 && aCh <= 0xff ? 0xf000 + aCh : 0;
+  }
+
+
+  static gfxUserFontType DetermineFontDataType(const uint8_t* aFontData,
+                                               uint32_t aFontDataLength);
+
+  static nsresult GetFullNameFromSFNT(const uint8_t* aFontData,
+                                      uint32_t aLength, nsACString& aFullName);
+
+  static nsresult GetFullNameFromTable(hb_blob_t* aNameTable,
+                                       nsACString& aFullName);
+
+  static nsresult GetFamilyNameFromTable(hb_blob_t* aNameTable,
+                                         nsACString& aFamilyName);
+
+  static mozilla::TableDirEntry* FindTableDirEntry(const void* aFontData,
+                                                   uint32_t aTableTag);
+
+  static hb_blob_t* GetTableFromFontData(const void* aFontData,
+                                         uint32_t aTableTag);
+
+  static nsresult RenameFont(const nsAString& aName, const uint8_t* aFontData,
+                             uint32_t aFontDataLength,
+                             FallibleTArray<uint8_t>* aNewFont);
+
+  static nsresult ReadNames(const char* aNameData, uint32_t aDataLen,
+                            uint32_t aNameID, int32_t aPlatformID,
+                            nsTArray<nsCString>& aNames);
+
+  static nsresult ReadCanonicalName(hb_blob_t* aNameTable, uint32_t aNameID,
+                                    nsCString& aName);
+
+  static nsresult ReadCanonicalName(const char* aNameData, uint32_t aDataLen,
+                                    uint32_t aNameID, nsCString& aName);
+
+  static bool DecodeFontName(const char* aBuf, int32_t aLength,
+                             uint32_t aPlatformCode, uint32_t aScriptCode,
+                             uint32_t aLangCode, nsACString& dest);
+
+  static inline bool IsJoinCauser(uint32_t ch) { return (ch == 0x200D); }
+
+  static inline bool IsJoinControl(uint32_t ch) {
+    return (ch == 0x200C || ch == 0x200D || ch == 0x034f);
+  }
+
+  enum {
+    kUnicodeVS1 = 0xFE00,
+    kUnicodeVS16 = 0xFE0F,
+    kUnicodeVS17 = 0xE0100,
+    kUnicodeVS256 = 0xE01EF
+  };
+
+  static inline bool IsVarSelector(uint32_t ch) {
+    return (ch >= kUnicodeVS1 && ch <= kUnicodeVS16) ||
+           (ch >= kUnicodeVS17 && ch <= kUnicodeVS256);
+  }
+
+  enum {
+    kUnicodeRegionalIndicatorA = 0x1F1E6,
+    kUnicodeRegionalIndicatorZ = 0x1F1FF
+  };
+
+  static inline bool IsRegionalIndicator(uint32_t aCh) {
+    return aCh >= kUnicodeRegionalIndicatorA &&
+           aCh <= kUnicodeRegionalIndicatorZ;
+  }
+
+  static inline bool IsEmojiFlagAndTag(uint32_t aCh, uint32_t aNext) {
+    constexpr uint32_t kBlackFlag = 0x1F3F4;
+    constexpr uint32_t kTagLetterA = 0xE0061;
+    constexpr uint32_t kTagLetterZ = 0xE007A;
+
+    return aCh == kBlackFlag && aNext >= kTagLetterA && aNext <= kTagLetterZ;
+  }
+
+  static void ParseFontList(const nsACString& aFamilyList,
+                            nsTArray<nsCString>& aFontList);
+
+  static void GetPrefsFontList(const char* aPrefName,
+                               nsTArray<nsCString>& aFontList);
+
+  static nsresult MakeUniqueUserFontName(nsAString& aName);
+
+  static void GetVariationData(gfxFontEntry* aFontEntry,
+                               nsTArray<gfxFontVariationAxis>* aAxes,
+                               nsTArray<gfxFontVariationInstance>* aInstances);
+
+  static void ReadOtherFamilyNamesForFace(
+      const nsACString& aFamilyName, const char* aNameData,
+      uint32_t aDataLength, nsTArray<nsCString>& aOtherFamilyNames,
+      bool useFullName);
+
+  static bool IsInServoTraversal();
+
+  static mozilla::ServoStyleSet* CurrentServoStyleSet();
+
+  static void AssertSafeThreadOrServoFontMetricsLocked()
+#if defined(DEBUG)
+      ;
+#else
+  {
+  }
+#endif
+
+ protected:
+  friend struct MacCharsetMappingComparator;
+
+  static nsresult ReadNames(const char* aNameData, uint32_t aDataLen,
+                            uint32_t aNameID, int32_t aLangID,
+                            int32_t aPlatformID, nsTArray<nsCString>& aNames);
+
+  static const mozilla::Encoding* GetCharsetForFontName(uint16_t aPlatform,
+                                                        uint16_t aScript,
+                                                        uint16_t aLanguage);
+
+  struct MacFontNameCharsetMapping {
+    uint16_t mScript;
+    uint16_t mLanguage;
+    const mozilla::Encoding* mEncoding;
+
+    bool operator<(const MacFontNameCharsetMapping& rhs) const {
+      return (mScript < rhs.mScript) ||
+             ((mScript == rhs.mScript) && (mLanguage < rhs.mLanguage));
+    }
+  };
+  static const MacFontNameCharsetMapping gMacFontNameCharsets[];
+  static const mozilla::Encoding* gISOFontNameCharsets[];
+  static const mozilla::Encoding* gMSFontNameCharsets[];
+};
+
+constexpr double kPresentationMismatch = 1.0e12;
+constexpr double kStretchFactor = 1.0e8;
+constexpr double kStyleFactor = 1.0e4;
+constexpr double kWeightFactor = 1.0e0;
+
+double StyleDistance(const mozilla::SlantStyleRange& aRange,
+                     const mozilla::StyleFontStyle& aTargetStyle,
+                     bool aItalicToObliqueFallback);
+
+double StretchDistance(const mozilla::StretchRange& aRange,
+                       const mozilla::StyleFontStretch& aTargetStretch);
+
+double WeightDistance(const mozilla::WeightRange& aRange,
+                      const mozilla::StyleFontWeight& aTargetWeight);
+
+#endif

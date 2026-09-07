@@ -1,0 +1,195 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "MP4Decoder.h"
+
+#include "AOMDecoder.h"
+#include "H264.h"
+#include "MP4Demuxer.h"
+#include "MediaContainerType.h"
+#include "PDMFactorySupport.h"
+#include "PlatformDecoderModule.h"
+#include "VPXDecoder.h"
+#include "VideoUtils.h"
+#include "mozilla/StaticPrefs_media.h"
+#include "mozilla/gfx/Tools.h"
+#include "nsMimeTypes.h"
+#include "nsReadableUtils.h"
+
+namespace mozilla {
+
+static bool IsTypeValid(const MediaContainerType& aType) {
+  return aType.Type() == MEDIAMIMETYPE("audio/mp4") ||
+         aType.Type() == MEDIAMIMETYPE("audio/x-m4a") ||
+         aType.Type() == MEDIAMIMETYPE("video/mp4") ||
+         aType.Type() == MEDIAMIMETYPE("video/quicktime") ||
+         aType.Type() == MEDIAMIMETYPE("video/x-m4v");
+}
+
+nsTArray<UniquePtr<TrackInfo>> MP4Decoder::GetTracksInfo(
+    const MediaContainerType& aType, MediaResult& aError) {
+  nsTArray<UniquePtr<TrackInfo>> tracks;
+
+  if (!IsTypeValid(aType)) {
+    aError = MediaResult(
+        NS_ERROR_DOM_MEDIA_FATAL_ERR,
+        RESULT_DETAIL("Invalid type:%s", aType.Type().AsString().get()));
+    return tracks;
+  }
+
+  aError = NS_OK;
+
+  const MediaCodecs& codecs = aType.ExtendedType().Codecs();
+  if (codecs.IsEmpty()) {
+    return tracks;
+  }
+
+  const bool isVideo = aType.Type() == MEDIAMIMETYPE("video/mp4") ||
+                       aType.Type() == MEDIAMIMETYPE("video/quicktime") ||
+                       aType.Type() == MEDIAMIMETYPE("video/x-m4v");
+
+  for (const auto& codec : codecs.Range()) {
+    if (IsAACCodecString(codec)) {
+      tracks.AppendElement(
+          CreateTrackInfoWithMIMETypeAndContainerTypeExtraParameters(
+              "audio/mp4a-latm"_ns, aType));
+      continue;
+    }
+    if (codec.EqualsLiteral("mp3")) {
+      tracks.AppendElement(
+          CreateTrackInfoWithMIMETypeAndContainerTypeExtraParameters(
+              "audio/mpeg"_ns, aType));
+      continue;
+    }
+    if (codec.EqualsLiteral("opus") || codec.EqualsLiteral("Opus") ||
+        codec.EqualsLiteral("flac") || codec.EqualsLiteral("fLaC")) {
+      NS_ConvertUTF16toUTF8 c(codec);
+      ToLowerCase(c);
+      tracks.AppendElement(
+          CreateTrackInfoWithMIMETypeAndContainerTypeExtraParameters(
+              "audio/"_ns + c, aType));
+      continue;
+    }
+    if (IsVP9CodecString(codec)) {
+      auto trackInfo =
+          CreateTrackInfoWithMIMETypeAndContainerTypeExtraParameters(
+              "video/vp9"_ns, aType);
+      VPXDecoder::SetVideoInfo(trackInfo->GetAsVideoInfo(), codec);
+      tracks.AppendElement(std::move(trackInfo));
+      continue;
+    }
+    if (StaticPrefs::media_av1_enabled() && IsAV1CodecString(codec)) {
+      auto trackInfo =
+          CreateTrackInfoWithMIMETypeAndContainerTypeExtraParameters(
+              "video/av1"_ns, aType);
+      AOMDecoder::SetVideoInfo(trackInfo->GetAsVideoInfo(), codec);
+      tracks.AppendElement(std::move(trackInfo));
+      continue;
+    }
+    if (StaticPrefs::media_hevc_enabled() && IsH265CodecString(codec)) {
+      auto trackInfo =
+          CreateTrackInfoWithMIMETypeAndContainerTypeExtraParameters(
+              "video/hevc"_ns, aType);
+      tracks.AppendElement(std::move(trackInfo));
+      continue;
+    }
+    if (isVideo && IsAllowedH264Codec(codec)) {
+      auto trackInfo =
+          CreateTrackInfoWithMIMETypeAndContainerTypeExtraParameters(
+              "video/avc"_ns, aType);
+      uint8_t profile = 0, constraint = 0;
+      H264_LEVEL level;
+      MOZ_ALWAYS_TRUE(
+          ExtractH264CodecDetails(codec, profile, constraint, level,
+                                  H264CodecStringStrictness::Lenient));
+      uint32_t width = aType.ExtendedType().GetWidth().refOr(1280);
+      uint32_t height = aType.ExtendedType().GetHeight().refOr(720);
+      trackInfo->GetAsVideoInfo()->mExtraData =
+          H264::CreateExtraData(profile, constraint, level, {width, height});
+      tracks.AppendElement(std::move(trackInfo));
+      continue;
+    }
+    aError = MediaResult(
+        NS_ERROR_DOM_MEDIA_FATAL_ERR,
+        RESULT_DETAIL("Unknown codec:%s", NS_ConvertUTF16toUTF8(codec).get()));
+  }
+  return tracks;
+}
+
+bool MP4Decoder::IsSupportedType(const MediaContainerType& aType,
+                                 DecoderDoctorDiagnostics* aDiagnostics) {
+  if (!IsEnabled()) {
+    return false;
+  }
+
+  MediaResult rv = NS_OK;
+  auto tracks = GetTracksInfo(aType, rv);
+  if (NS_FAILED(rv)) {
+    return false;
+  }
+
+  if (!tracks.IsEmpty()) {
+    for (const auto& track : tracks) {
+      if (!track || PDMFactorySupport::IsSupported(SupportDecoderParams(*track),
+                                                   aDiagnostics)
+                        .isEmpty()) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  if (aType.Type() == MEDIAMIMETYPE("audio/mp4") ||
+      aType.Type() == MEDIAMIMETYPE("audio/x-m4a")) {
+    tracks.AppendElement(
+        CreateTrackInfoWithMIMETypeAndContainerTypeExtraParameters(
+            "audio/mp4a-latm"_ns, aType));
+  } else {
+    tracks.AppendElement(
+        CreateTrackInfoWithMIMETypeAndContainerTypeExtraParameters(
+            "video/avc"_ns, aType));
+    if (StaticPrefs::media_av1_enabled()) {
+      tracks.AppendElement(
+          CreateTrackInfoWithMIMETypeAndContainerTypeExtraParameters(
+              "video/av1"_ns, aType));
+    }
+    if (StaticPrefs::media_hevc_enabled()) {
+      tracks.AppendElement(
+          CreateTrackInfoWithMIMETypeAndContainerTypeExtraParameters(
+              "video/hevc"_ns, aType));
+    }
+  }
+
+  for (const auto& track : tracks) {
+    if (track && !PDMFactorySupport::IsSupported(SupportDecoderParams(*track),
+                                                 aDiagnostics)
+                      .isEmpty()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool MP4Decoder::IsH264(const nsACString& aMimeType) {
+  return aMimeType.EqualsLiteral("video/mp4") ||
+         aMimeType.EqualsLiteral("video/avc");
+}
+
+bool MP4Decoder::IsAAC(const nsACString& aMimeType) {
+  return aMimeType.EqualsLiteral("audio/mp4a-latm");
+}
+
+bool MP4Decoder::IsHEVC(const nsACString& aMimeType) {
+  return aMimeType.EqualsLiteral("video/hevc");
+}
+
+bool MP4Decoder::IsEnabled() { return StaticPrefs::media_mp4_enabled(); }
+
+nsTArray<UniquePtr<TrackInfo>> MP4Decoder::GetTracksInfo(
+    const MediaContainerType& aType) {
+  MediaResult rv = NS_OK;
+  return GetTracksInfo(aType, rv);
+}
+
+}  

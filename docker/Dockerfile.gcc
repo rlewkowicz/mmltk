@@ -1,0 +1,122 @@
+# syntax=docker/dockerfile:1
+
+ARG MMLTK_GCC_BUILD_IMAGE=ubuntu:24.04
+FROM ${MMLTK_GCC_BUILD_IMAGE} AS gcc16
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG MMLTK_GCC_VERSION=16.2.0
+ARG MMLTK_GCC_SHA512=c51c30ca7422d0cbecf504b2e0f33c3aca31e0f90a76b65217f465163fa6fa17b3f5de39e145c47e5bab90ac0ce7fff3b03c8d553ae36e01faaea5a50f8648d1
+ARG MMLTK_GCC_SIGNATURE_SHA512=542cadd460fb0f566c0e677838d8921bbac8765f8612e04cb1f645448f5e4aa6d1ef91f915534e9a1ef3dec0449faaebd4b73c7793f17a5feb5826cdbcb9030f
+ARG MMLTK_GCC_CONFIG_COMMIT=7d3d27baf8107b630586c962c057e22149653deb
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# Keep this bootstrap structurally aligned with docker-library/gcc's GCC 16
+# recipe, while retaining the system GCC 14 toolchain from Ubuntu 24.04.
+ENV GPG_KEYS="B215C1633BCA0477615F1B35A5B3A004745C015A \
+    B3C42148A44E6983B3E4CC0793FA9B1AB75C61B8 \
+    90AA470469D3965A87A5DCB494D03953902C9419 \
+    80F98B2E0DAB6C8281BDF541A7C8C3B2F71EDF1C \
+    7F74F97C103468EE5D750B583AB00996FC26A641 \
+    33C235A34C46AA3FFB293709A328C3A2C3C45C06 \
+    D3A93CAD751C2AF4F8C7AD516C35B99309B5FA62" \
+    GCC_MIRRORS="https://ftpmirror.gnu.org/gcc \
+    https://mirrors.kernel.org/gnu/gcc \
+    https://bigsearcher.com/mirrors/gcc/releases \
+    http://www.netgull.com/gcc/releases \
+    https://sourceware.org/pub/gcc/releases \
+    ftp://ftp.gnu.org/gnu/gcc"
+
+# GCC 16.2 predates PR126783; backport
+# a03b3ab4b0a6a446fe9a1d7e6e82967a8dd3edcf during source preparation.
+RUN set -eux; \
+    savedAptMark="$(apt-mark showmanual)"; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        abigail-tools \
+        bison \
+        build-essential \
+        ca-certificates \
+        dpkg-dev \
+        flex \
+        g++-14 \
+        gcc-14 \
+        git \
+        gnupg \
+        wget \
+        xz-utils; \
+    rm -rf /var/lib/apt/lists/*; \
+    _fetch() { \
+        local fetch="$1"; \
+        local file="$2"; \
+        local mirror; \
+        for mirror in ${GCC_MIRRORS}; do \
+            if wget -q -O "${file}" "${mirror}/${fetch}"; then \
+                return 0; \
+            fi; \
+        done; \
+        echo >&2 "error: failed to download '${fetch}' from every GCC mirror"; \
+        return 1; \
+    }; \
+    _fetch "gcc-${MMLTK_GCC_VERSION}/gcc-${MMLTK_GCC_VERSION}.tar.xz.sig" gcc.tar.xz.sig; \
+    _fetch "gcc-${MMLTK_GCC_VERSION}/gcc-${MMLTK_GCC_VERSION}.tar.xz" gcc.tar.xz; \
+    echo "${MMLTK_GCC_SHA512}  gcc.tar.xz" | sha512sum -c -; \
+    echo "${MMLTK_GCC_SIGNATURE_SHA512}  gcc.tar.xz.sig" | sha512sum -c -; \
+    export GNUPGHOME="$(mktemp -d)"; \
+    for key in ${GPG_KEYS}; do \
+        gpg --batch --keyserver keyserver.ubuntu.com --recv-keys "${key}"; \
+    done; \
+    gpg --batch --verify gcc.tar.xz.sig gcc.tar.xz; \
+    gpgconf --kill all; \
+    rm -rf "${GNUPGHOME}"; \
+    mkdir -p /usr/src/gcc; \
+    tar -xf gcc.tar.xz -C /usr/src/gcc --strip-components=1; \
+    rm -f gcc.tar.xz gcc.tar.xz.sig; \
+    cd /usr/src/gcc; \
+    test "$(grep -Fc 'gcc_checking_assert (DECL_LANG_SPECIFIC (old_inner));' \
+        gcc/cp/module.cc)" = 1; \
+    sed -i \
+        's/gcc_checking_assert (DECL_LANG_SPECIFIC (old_inner));/retrofit_lang_decl (old_inner);/' \
+        gcc/cp/module.cc; \
+    ./contrib/download_prerequisites; \
+    rm -f ./*.tar.*; \
+    config_source_dir="$(mktemp -d)"; \
+    git -C "${config_source_dir}" init; \
+    git -C "${config_source_dir}" remote add origin \
+        https://git.savannah.gnu.org/git/config.git; \
+    git -C "${config_source_dir}" \
+        -c http.lowSpeedLimit=1 \
+        -c http.lowSpeedTime=30 \
+        fetch --depth 1 origin "${MMLTK_GCC_CONFIG_COMMIT}"; \
+    test "$(git -C "${config_source_dir}" rev-parse FETCH_HEAD)" = \
+        "${MMLTK_GCC_CONFIG_COMMIT}"; \
+    git -C "${config_source_dir}" checkout --detach FETCH_HEAD; \
+    for config_file in config.guess config.sub; do \
+        cp "${config_source_dir}/${config_file}" "${config_file}"; \
+        find -mindepth 2 -name "${config_file}" -exec cp -v "${config_file}" '{}' ';'; \
+    done; \
+    rm -rf "${config_source_dir}"; \
+    build_dir="$(mktemp -d)"; \
+    cd "${build_dir}"; \
+    gnuArch="$(dpkg-architecture --query DEB_BUILD_GNU_TYPE)"; \
+    CC=/usr/bin/gcc-14 CXX=/usr/bin/g++-14 /usr/src/gcc/configure \
+        --build="${gnuArch}" \
+        --disable-multilib \
+        --enable-languages=c,c++ \
+        --prefix=/opt/gcc-16.2; \
+    make -j "$(nproc)"; \
+    make install-strip; \
+    deb_libstdcxx="$(readlink -ve /usr/lib/*/libstdc++.so.6 | head -n 1)"; \
+    gcc_libstdcxx="$(readlink -ve /opt/gcc-16.2/lib64/libstdc++.so.6)"; \
+    LD_PRELOAD="${deb_libstdcxx}" abidiff --no-added-syms "${deb_libstdcxx}" "${gcc_libstdcxx}"; \
+    test "$(/opt/gcc-16.2/bin/gcc -dumpfullversion -dumpversion)" = "${MMLTK_GCC_VERSION}"; \
+    cd /; \
+    rm -rf "${build_dir}" /usr/src/gcc; \
+    apt-mark auto '.*' >/dev/null; \
+    test -z "${savedAptMark}" || apt-mark manual ${savedAptMark}; \
+    apt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false; \
+    rm -rf /var/lib/apt/lists/*
+
+ARG MMLTK_IMAGE_FINGERPRINT=unlabeled
+LABEL com.mmltk.input-fingerprint="${MMLTK_IMAGE_FINGERPRINT}" \
+      com.mmltk.gcc-version="${MMLTK_GCC_VERSION}"

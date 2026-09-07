@@ -1,0 +1,103 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_FontFaceSetDocumentImpl_h
+#define mozilla_dom_FontFaceSetDocumentImpl_h
+
+#include "mozilla/dom/FontFaceSetImpl.h"
+#include "nsICSSLoaderObserver.h"
+#include "nsIDOMEventListener.h"
+
+namespace mozilla::dom {
+
+class FontFaceSetDocumentImpl final : public FontFaceSetImpl,
+                                      public nsIDOMEventListener,
+                                      public nsICSSLoaderObserver {
+  NS_DECL_ISUPPORTS_INHERITED
+
+ public:
+  NS_DECL_NSIDOMEVENTLISTENER
+
+  FontFaceSetDocumentImpl(FontFaceSet* aOwner, dom::Document* aDocument);
+
+  void Initialize();
+  void Destroy() override;
+
+  bool IsOnOwningThread() override;
+#ifdef DEBUG
+  void AssertIsOnOwningThread() override;
+#endif
+  void DispatchToOwningThread(const char* aName,
+                              std::function<void()>&& aFunc) override;
+
+  void RefreshStandardFontLoadPrincipal() override;
+
+  dom::Document* GetDocument() const override { return mDocument; }
+
+  already_AddRefed<URLExtraData> GetURLExtraData() override;
+
+
+  nsresult StartLoad(gfxUserFontEntry* aUserFontEntry,
+                     uint32_t aSrcIndex) override;
+
+  bool IsFontLoadAllowed(const gfxFontFaceSrc&) override;
+
+  FontVisibilityProvider* GetFontVisibilityProvider() const override;
+
+  bool UpdateRules(const nsTArray<nsFontFaceRuleContainer>& aRules) override;
+
+  StyleLockedFontFaceRule* FindRuleForEntry(gfxFontEntry* aFontEntry) override;
+
+  void DidRefresh() override;
+
+  NS_IMETHOD StyleSheetLoaded(StyleSheet* aSheet, bool aWasDeferred,
+                              nsresult aStatus) override;
+
+  void CacheFontLoadability() override;
+
+  void EnsureReady() override;
+
+  bool Add(FontFaceImpl* aFontFace, ErrorResult& aRv) override;
+
+  void FlushUserFontSet() override;
+  void MarkUserFontSetDirty() override;
+
+ private:
+  ~FontFaceSetDocumentImpl() override;
+
+  uint64_t GetInnerWindowID() override;
+
+  void RemoveDOMContentLoadedListener();
+
+  nsresult CreateChannelForSyncLoadFontData(
+      nsIChannel** aOutChannel, gfxUserFontEntry* aFontToLoad,
+      const gfxFontFaceSrc* aFontFaceSrc) override;
+
+  StyleLockedFontFaceRule* FindRuleForUserFontEntry(
+      gfxUserFontEntry* aUserFontEntry) override;
+
+  void FindMatchingFontFaces(const nsTHashSet<FontFace*>& aMatchingFaces,
+                             nsTArray<FontFace*>& aFontFaces) override;
+
+  bool InsertRuleFontFace(StyleLockedFontFaceRule*, StyleOrigin,
+                          nsTArray<FontFaceRecord>& aOldRecords);
+
+  void UpdateHasLoadingFontFaces() override;
+
+  bool MightHavePendingFontLoads() override;
+
+#ifdef DEBUG
+  bool HasRuleFontFace(FontFaceImpl* aFontFace);
+#endif
+
+  TimeStamp GetNavigationStartTimeStamp() override;
+
+  RefPtr<dom::Document> mDocument;
+
+  nsTArray<FontFaceRecord> mRuleFaces;
+};
+
+}  
+
+#endif  // !defined(mozilla_dom_FontFaceSetDocumentImpl_h)

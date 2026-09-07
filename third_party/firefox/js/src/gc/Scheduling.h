@@ -1,0 +1,438 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef gc_Scheduling_h
+#define gc_Scheduling_h
+
+#include "mozilla/Atomics.h"
+#include "mozilla/DebugOnly.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/TimeStamp.h"
+
+#include "gc/GCEnum.h"
+#include "js/AllocPolicy.h"
+#include "js/GCAPI.h"
+#include "js/HashTable.h"
+#include "js/HeapAPI.h"
+#include "threading/LockGuard.h"
+#include "threading/Mutex.h"
+#include "threading/ProtectedData.h"
+
+#define FOR_EACH_GC_TUNABLE(_)                                                 \
+                                                                            \
+  _(JSGC_MAX_BYTES, size_t, gcMaxBytes, ConvertSize, NoCheck, 0xffffffff)      \
+                                                                               \
+                                                                            \
+  _(JSGC_MIN_NURSERY_BYTES, size_t, gcMinNurseryBytes, ConvertNurseryBytes,    \
+    CheckNurserySize, 256 * 1024)                                              \
+  _(JSGC_MAX_NURSERY_BYTES, size_t, gcMaxNurseryBytes, ConvertNurseryBytes,    \
+    CheckNurserySize, JS::DefaultNurseryMaxBytes)                              \
+                                                                               \
+                                                                            \
+  _(JSGC_ALLOCATION_THRESHOLD, size_t, gcZoneAllocThresholdBase, ConvertMB,    \
+    NoCheck, 27 * 1024 * 1024)                                                 \
+                                                                               \
+                                                                            \
+  _(JSGC_SMALL_HEAP_SIZE_MAX, size_t, smallHeapSizeMaxBytes, ConvertMB,        \
+    NoCheck, 100 * 1024 * 1024)                                                \
+  _(JSGC_LARGE_HEAP_SIZE_MIN, size_t, largeHeapSizeMinBytes, ConvertMB,        \
+    CheckNonZero, 500 * 1024 * 1024)                                           \
+                                                                               \
+                                                                            \
+  _(JSGC_SMALL_HEAP_INCREMENTAL_LIMIT, double, smallHeapIncrementalLimit,      \
+    ConvertTimes100, CheckIncrementalLimit, 1.70)                              \
+  _(JSGC_LARGE_HEAP_INCREMENTAL_LIMIT, double, largeHeapIncrementalLimit,      \
+    ConvertTimes100, CheckIncrementalLimit, 1.10)                              \
+                                                                               \
+                                                                            \
+  _(JSGC_HIGH_FREQUENCY_TIME_LIMIT, mozilla::TimeDuration,                     \
+    highFrequencyThreshold, ConvertMillis, NoCheck,                            \
+    mozilla::TimeDuration::FromSeconds(1))                                     \
+                                                                               \
+                                                                            \
+  _(JSGC_LOW_FREQUENCY_HEAP_GROWTH, double, lowFrequencyHeapGrowth,            \
+    ConvertTimes100, CheckHeapGrowth, 1.5)                                     \
+                                                                               \
+                                                                            \
+  _(JSGC_HIGH_FREQUENCY_SMALL_HEAP_GROWTH, double,                             \
+    highFrequencySmallHeapGrowth, ConvertTimes100, CheckHeapGrowth, 3.0)       \
+  _(JSGC_HIGH_FREQUENCY_LARGE_HEAP_GROWTH, double,                             \
+    highFrequencyLargeHeapGrowth, ConvertTimes100, CheckHeapGrowth, 1.5)       \
+                                                                               \
+                                                                            \
+  _(JSGC_MALLOC_THRESHOLD_BASE, size_t, mallocThresholdBase, ConvertMB,        \
+    NoCheck, 38 * 1024 * 1024)                                                 \
+                                                                               \
+                                                                            \
+  _(JSGC_ZONE_ALLOC_DELAY_KB, size_t, zoneAllocDelayBytes, ConvertKB,          \
+    CheckNonZero, 1024 * 1024)                                                 \
+                                                                               \
+                                                                            \
+  _(JSGC_URGENT_THRESHOLD_MB, size_t, urgentThresholdBytes, ConvertMB,         \
+    NoCheck, 16 * 1024 * 1024)                                                 \
+                                                                               \
+                                                                            \
+  _(JSGC_NURSERY_EAGER_COLLECTION_THRESHOLD_KB, size_t,                        \
+    nurseryEagerCollectionThresholdBytes, ConvertKB, NoCheck, ChunkSize / 4)   \
+  _(JSGC_NURSERY_EAGER_COLLECTION_THRESHOLD_PERCENT, double,                   \
+    nurseryEagerCollectionThresholdPercent, ConvertTimes100,                   \
+    CheckNonZeroUnitRange, 0.25)                                               \
+  _(JSGC_NURSERY_EAGER_COLLECTION_TIMEOUT_MS, mozilla::TimeDuration,           \
+    nurseryEagerCollectionTimeout, ConvertMillis, NoCheck,                     \
+    mozilla::TimeDuration::FromSeconds(5))                                     \
+                                                                               \
+                                                                            \
+  _(JSGC_BALANCED_HEAP_LIMITS_ENABLED, bool, balancedHeapLimitsEnabled,        \
+    ConvertBool, NoCheck, false)                                               \
+  _(JSGC_HEAP_GROWTH_FACTOR, double, heapGrowthFactor, ConvertDouble, NoCheck, \
+    50.0)                                                                      \
+                                                                               \
+                                                                            \
+  _(JSGC_MIN_LAST_DITCH_GC_PERIOD, mozilla::TimeDuration,                      \
+    minLastDitchGCPeriod, ConvertSeconds, NoCheck,                             \
+    TimeDuration::FromSeconds(60))                                             \
+                                                                               \
+                                                                            \
+  _(JSGC_PARALLEL_MARKING_THRESHOLD_MB, size_t, parallelMarkingThresholdBytes, \
+    ConvertMB, NoCheck, 4 * 1024 * 1024)                                       \
+                                                                               \
+                                                                            \
+  _(JSGC_GENERATE_MISSING_ALLOC_SITES, bool, generateMissingAllocSites,        \
+    ConvertBool, NoCheck, false)                                               \
+                                                                               \
+                                                                            \
+  _(JSGC_NURSERY_MAX_TIME_GOAL_MS, mozilla::TimeDuration,                      \
+    nurseryMaxTimeGoalMS, ConvertMillis, NoCheck,                              \
+    mozilla::TimeDuration::FromMilliseconds(4))                                \
+                                                                               \
+                                                                            \
+  _(JSGC_STORE_BUFFER_ENTRIES, size_t, storeBufferEntries, ConvertSize,        \
+    CheckNonZero, 16384)                                                       \
+  _(JSGC_STORE_BUFFER_SCALING, double, storeBufferScaling, ConvertTimes100,    \
+    CheckNonZeroUnitRange, 0.25)
+
+namespace js {
+
+class ZoneAllocator;
+
+namespace gc {
+
+class Cell;
+
+namespace TuningDefaults {
+
+static const uint32_t MinEmptyChunkCount = 1;
+
+static const int64_t DefaultTimeBudgetMS = 0;  
+
+static const bool IncrementalGCEnabled = false;
+
+static const bool PerZoneGCEnabled = false;
+
+static const bool CompactingEnabled = true;
+
+static const bool NurseryEnabled = true;
+
+static const bool ParallelMarkingEnabled = false;
+
+static const bool ConcurrentMarkingEnabled = false;
+
+static const bool IncrementalWeakMapMarkingEnabled = true;
+
+static const bool SemispaceNurseryEnabled = false;
+
+static const double HelperThreadRatio = 0.5;
+
+static const size_t MaxHelperThreads = 8;
+
+static const size_t MaxMarkingThreads = 2;
+
+}  
+
+class GCSchedulingTunables {
+#define DEFINE_TUNABLE_FIELD(key, type, name, convert, check, default) \
+  MainThreadOrGCTaskData<type> name##_;
+  FOR_EACH_GC_TUNABLE(DEFINE_TUNABLE_FIELD)
+#undef DEFINE_TUNABLE_FIELD
+
+ public:
+  GCSchedulingTunables();
+
+#define DEFINE_TUNABLE_ACCESSOR(key, type, name, convert, check, default) \
+  type name() const { return name##_; }
+  FOR_EACH_GC_TUNABLE(DEFINE_TUNABLE_ACCESSOR)
+#undef DEFINE_TUNABLE_ACCESSOR
+
+  uint32_t getParameter(JSGCParamKey key);
+  [[nodiscard]] bool setParameter(JSGCParamKey key, uint32_t value);
+  void resetParameter(JSGCParamKey key);
+
+ private:
+  void maintainInvariantsAfterUpdate(JSGCParamKey updated);
+  void checkInvariants();
+};
+
+class GCSchedulingState {
+  mozilla::Atomic<bool, mozilla::Relaxed> inHighFrequencyGCMode_;
+
+ public:
+  GCSchedulingState() : inHighFrequencyGCMode_(false) {}
+
+  bool inHighFrequencyGCMode() const { return inHighFrequencyGCMode_; }
+
+  void updateHighFrequencyModeOnGCStart(JS::GCOptions options,
+                                        const mozilla::TimeStamp& lastGCTime,
+                                        const mozilla::TimeStamp& currentTime,
+                                        const GCSchedulingTunables& tunables);
+  void updateHighFrequencyModeOnSliceStart(JS::GCOptions options,
+                                           JS::GCReason reason);
+};
+
+struct TriggerResult {
+  bool shouldTrigger;
+  size_t usedBytes;
+  size_t thresholdBytes;
+};
+
+using AtomicByteCount = mozilla::Atomic<size_t, mozilla::Relaxed>;
+
+class HeapSize {
+  AtomicByteCount bytes_;
+
+  MainThreadData<size_t> initialBytes_;
+
+  AtomicByteCount retainedBytes_;
+
+ public:
+  explicit HeapSize() {
+    MOZ_ASSERT(bytes_ == 0);
+    MOZ_ASSERT(retainedBytes_ == 0);
+  }
+
+  size_t bytes() const { return bytes_; }
+  size_t initialBytes() const { return initialBytes_; }
+  size_t retainedBytes() const { return retainedBytes_; }
+
+  void updateOnGCStart() { retainedBytes_ = initialBytes_ = bytes(); }
+
+  void addGCArena() { addBytes(ArenaSize); }
+  void removeGCArena() {
+    MOZ_ASSERT(retainedBytes_ >= ArenaSize);
+    removeBytes(ArenaSize, true );
+    MOZ_ASSERT(retainedBytes_ <= bytes_);
+  }
+
+  void addBytes(size_t nbytes, bool updateRetainedSize = false) {
+    mozilla::DebugOnly<size_t> initialBytes(bytes_);
+    MOZ_ASSERT(initialBytes + nbytes > initialBytes);
+    bytes_ += nbytes;
+    if (updateRetainedSize) {
+      retainedBytes_ += nbytes;
+    }
+  }
+  void removeBytes(size_t nbytes, bool updateRetainedSize) {
+    if (updateRetainedSize) {
+      MOZ_ASSERT(retainedBytes_ >= nbytes);
+      retainedBytes_ -= nbytes;
+    }
+    MOZ_ASSERT(bytes_ >= nbytes);
+    bytes_ -= nbytes;
+  }
+};
+
+class HeapSizeChild : public HeapSize {
+ public:
+  void addGCArena(HeapSize& parent) {
+    HeapSize::addGCArena();
+    parent.addGCArena();
+  }
+
+  void removeGCArena(HeapSize& parent) {
+    HeapSize::removeGCArena();
+    parent.removeGCArena();
+  }
+
+  void addBytes(size_t nbytes, HeapSize& parent) {
+    HeapSize::addBytes(nbytes);
+    parent.addBytes(nbytes);
+  }
+
+  void removeBytes(size_t nbytes, bool updateRetainedSize, HeapSize& parent) {
+    HeapSize::removeBytes(nbytes, updateRetainedSize);
+    parent.removeBytes(nbytes, updateRetainedSize);
+  }
+};
+
+class PerZoneGCHeapSize : public HeapSizeChild {
+ public:
+  size_t freedBytes() const { return freedBytes_; }
+  void clearFreedBytes() { freedBytes_ = 0; }
+
+  void removeGCArena(HeapSize& parent) {
+    HeapSizeChild::removeGCArena(parent);
+    freedBytes_ += ArenaSize;
+  }
+
+  void removeBytes(size_t nbytes, bool updateRetainedSize, HeapSize& parent) {
+    HeapSizeChild::removeBytes(nbytes, updateRetainedSize, parent);
+    freedBytes_ += nbytes;
+  }
+
+ private:
+  AtomicByteCount freedBytes_;
+};
+
+class HeapThreshold {
+ protected:
+  HeapThreshold()
+      : startBytes_(SIZE_MAX),
+        incrementalLimitBytes_(SIZE_MAX),
+        sliceBytes_(SIZE_MAX) {}
+
+  MainThreadOrGCTaskData<size_t> startBytes_;
+
+  MainThreadData<size_t> incrementalLimitBytes_;
+
+  MainThreadData<size_t> sliceBytes_;
+
+ public:
+  size_t startBytes() const { return startBytes_; }
+  size_t sliceBytes() const { return sliceBytes_; }
+  size_t incrementalLimitBytes() const { return incrementalLimitBytes_; }
+  size_t eagerAllocTrigger(bool highFrequencyGC) const;
+  size_t incrementalBytesRemaining(const HeapSize& heapSize) const;
+
+  void setSliceThreshold(ZoneAllocator* zone, const HeapSize& heapSize,
+                         const GCSchedulingTunables& tunables,
+                         bool waitingOnBGTask);
+  void clearSliceThreshold() { sliceBytes_ = SIZE_MAX; }
+  bool hasSliceThreshold() const { return sliceBytes_ != SIZE_MAX; }
+
+ protected:
+  static double computeZoneHeapGrowthFactorForHeapSize(
+      size_t lastBytes, const GCSchedulingTunables& tunables,
+      const GCSchedulingState& state);
+
+  void setIncrementalLimitFromStartBytes(size_t retainedBytes,
+                                         const GCSchedulingTunables& tunables);
+};
+
+class GCHeapThreshold : public HeapThreshold {
+ public:
+  void updateStartThreshold(size_t lastBytes,
+                            mozilla::Maybe<double> allocationRate,
+                            mozilla::Maybe<double> collectionRate,
+                            const GCSchedulingTunables& tunables,
+                            const GCSchedulingState& state, bool isAtomsZone);
+
+ private:
+  static size_t computeZoneTriggerBytes(double growthFactor, size_t lastBytes,
+                                        const GCSchedulingTunables& tunables);
+
+  static double computeBalancedHeapLimit(size_t lastBytes,
+                                         double allocationRate,
+                                         double collectionRate,
+                                         const GCSchedulingTunables& tunables);
+};
+
+class MallocHeapThreshold : public HeapThreshold {
+ public:
+  void updateStartThreshold(size_t lastBytes,
+                            const GCSchedulingTunables& tunables,
+                            const GCSchedulingState& state);
+
+ private:
+  static size_t computeZoneTriggerBytes(double growthFactor, size_t lastBytes,
+                                        size_t baseBytes);
+};
+
+class JitHeapThreshold : public HeapThreshold {
+ public:
+  explicit JitHeapThreshold(size_t bytes) { startBytes_ = bytes; }
+};
+
+#ifdef DEBUG
+
+class MemoryTracker {
+ public:
+  MemoryTracker();
+  void fixupAfterMovingGC();
+  void checkEmptyOnDestroy();
+
+  void trackGCMemory(Cell* cell, size_t nbytes, MemoryUse use);
+  void untrackGCMemory(Cell* cell, size_t nbytes, MemoryUse use);
+  void swapGCMemory(Cell* a, Cell* b, MemoryUse use);
+
+  void registerNonGCMemory(void* mem, MemoryUse use);
+  void unregisterNonGCMemory(void* mem, MemoryUse use);
+  void moveNonGCMemory(void* dst, void* src, MemoryUse use);
+  void incNonGCMemory(void* mem, size_t nbytes, MemoryUse use);
+  void decNonGCMemory(void* mem, size_t nbytes, MemoryUse use);
+
+ private:
+  template <typename Ptr>
+  struct Key {
+    Key(Ptr* ptr, MemoryUse use);
+    Ptr* ptr() const;
+    MemoryUse use() const;
+
+   private:
+#  ifdef JS_64BIT
+    uintptr_t ptr_ : 56;
+    uintptr_t use_ : 8;
+#  else
+    uintptr_t ptr_ : 32;
+    uintptr_t use_ : 8;
+#  endif
+  };
+
+  template <typename Ptr>
+  struct Hasher {
+    using KeyT = Key<Ptr>;
+    using Lookup = KeyT;
+    static HashNumber hash(const Lookup& l);
+    static bool match(const KeyT& key, const Lookup& l);
+    static void rekey(KeyT& k, const KeyT& newKey);
+  };
+
+  template <typename Ptr>
+  using Map = HashMap<Key<Ptr>, size_t, Hasher<Ptr>, SystemAllocPolicy>;
+  using GCMap = Map<Cell>;
+  using NonGCMap = Map<void>;
+
+  static bool isGCMemoryUse(MemoryUse use);
+  static bool isNonGCMemoryUse(MemoryUse use);
+  static bool allowMultipleAssociations(MemoryUse use);
+
+  size_t getAndRemoveEntry(const Key<Cell>& key, LockGuard<Mutex>& lock);
+
+  Mutex mutex MOZ_UNANNOTATED;
+
+  GCMap gcMap;
+
+  NonGCMap nonGCMap;
+};
+
+#endif  // DEBUG
+
+static inline double LinearInterpolate(double x, double x0, double y0,
+                                       double x1, double y1) {
+  MOZ_ASSERT(x0 < x1);
+
+  if (x < x0) {
+    return y0;
+  }
+
+  if (x < x1) {
+    return y0 + (y1 - y0) * ((x - x0) / (x1 - x0));
+  }
+
+  return y1;
+}
+
+}  
+}  
+
+#endif  // gc_Scheduling_h

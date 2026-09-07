@@ -1,0 +1,403 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_WindowGlobalParent_h
+#define mozilla_dom_WindowGlobalParent_h
+
+#include "mozilla/ContentBlockingLog.h"
+#include "mozilla/ContentBlockingNotifier.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/dom/CanonicalBrowsingContext.h"
+#include "mozilla/dom/ClientIPCTypes.h"
+#include "mozilla/dom/ClientInfo.h"
+#include "mozilla/dom/DOMRect.h"
+#include "mozilla/dom/PWindowGlobalParent.h"
+#include "mozilla/dom/WindowContext.h"
+#include "mozilla/dom/WindowGlobalActor.h"
+#include "mozilla/dom/WindowGlobalActorsBinding.h"
+#include "mozilla/net/CookieJarSettings.h"
+#include "nsIDOMProcessParent.h"
+#include "nsISupports.h"
+#include "nsRefPtrHashtable.h"
+#include "nsTHashMap.h"
+#include "nsTHashtable.h"
+#include "nsURIHashKey.h"
+#include "nsWrapperCache.h"
+
+class nsIPrincipal;
+class nsIURI;
+class nsFrameLoader;
+
+namespace mozilla {
+
+namespace gfx {
+class CrossProcessPaint;
+}  
+
+namespace dom {
+
+class BrowserParent;
+class WindowGlobalChild;
+class JSWindowActorParent;
+class JSActorMessageMeta;
+class WindowSessionStoreState;
+struct WindowSessionStoreUpdate;
+class SSCacheQueryResult;
+enum class FullscreenKeyboardLock : uint8_t;
+
+enum class NoCorsMediaRequestState : uint8_t {
+  NotAvailable,
+  Initial,
+  Subsequent,
+};
+
+class WindowGlobalParent final : public WindowContext,
+                                 public WindowGlobalActor,
+                                 public PWindowGlobalParent {
+  friend class gfx::CrossProcessPaint;
+  friend class PWindowGlobalParent;
+
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_CLASS_INHERITED(WindowGlobalParent,
+                                                         WindowContext)
+
+  static already_AddRefed<WindowGlobalParent> GetByInnerWindowId(
+      uint64_t aInnerWindowId);
+
+  static already_AddRefed<WindowGlobalParent> GetByInnerWindowId(
+      const GlobalObject& aGlobal, uint64_t aInnerWindowId) {
+    return GetByInnerWindowId(aInnerWindowId);
+  }
+
+  WindowGlobalParent* GetParentWindowContext() {
+    return static_cast<WindowGlobalParent*>(
+        WindowContext::GetParentWindowContext());
+  }
+  WindowGlobalParent* TopWindowContext() {
+    return static_cast<WindowGlobalParent*>(WindowContext::TopWindowContext());
+  }
+  CanonicalBrowsingContext* GetBrowsingContext() const {
+    return CanonicalBrowsingContext::Cast(WindowContext::GetBrowsingContext());
+  }
+
+  Element* GetRootOwnerElement();
+
+  bool IsClosed() { return !CanSend(); }
+
+  already_AddRefed<WindowGlobalChild> GetChildActor();
+
+  already_AddRefed<JSWindowActorParent> GetActor(JSContext* aCx,
+                                                 const nsACString& aName,
+                                                 ErrorResult& aRv);
+  already_AddRefed<JSWindowActorParent> GetExistingActor(
+      const nsACString& aName);
+
+  BrowserParent* GetBrowserParent() const;
+
+  ContentParent* GetContentParent();
+
+  nsIPrincipal* DocumentPrincipal() { return mDocumentPrincipal; }
+
+  nsIPrincipal* DocumentStoragePrincipal() { return mDocumentStoragePrincipal; }
+
+  CanonicalBrowsingContext* BrowsingContext() override {
+    return GetBrowsingContext();
+  }
+
+  already_AddRefed<nsFrameLoader> GetRootFrameLoader();
+
+  nsIURI* GetDocumentURI() override { return mDocumentURI; }
+
+  void GetDocumentTitle(nsAString& aTitle) const {
+    aTitle = mDocumentTitle.valueOr(nsString());
+  }
+
+  nsIPrincipal* GetContentBlockingAllowListPrincipal() const {
+    return mDocContentBlockingAllowListPrincipal;
+  }
+
+  Maybe<ClientInfo> GetClientInfo() { return mClientInfo; }
+
+  uint64_t ContentParentId();
+
+  int32_t OsPid();
+
+  bool IsCurrentGlobal();
+
+  bool IsActiveInTab();
+
+  bool IsProcessRoot();
+
+  uint32_t ContentBlockingEvents();
+
+  void GetContentBlockingLog(nsAString& aLog);
+
+  bool IsInitialDocument() {
+    return mIsInitialDocument.isSome() && mIsInitialDocument.value();
+  }
+
+  bool IsUncommittedInitialDocument() { return mIsUncommittedInitialDocument; }
+
+  already_AddRefed<mozilla::dom::Promise> PermitUnload(
+      PermitUnloadAction aAction, uint32_t aTimeout, mozilla::ErrorResult& aRv);
+
+  void PermitUnload(
+      std::function<void(nsIDocumentViewer::PermitUnloadResult)>&& aResolver);
+
+  void CheckIfUnloadingIsCanceledForTraversable(
+      nsDocShellLoadState* aDocShellLoadState,
+      nsIDocumentViewer::PermitUnloadAction aAction,
+      std::function<void(nsIDocumentViewer::PermitUnloadResult)>&& aResolver);
+
+  void PermitUnloadChildNavigables(
+      nsIDocumentViewer::PermitUnloadAction aAction,
+      std::function<void(nsIDocumentViewer::PermitUnloadResult)>&& aResolver);
+
+  already_AddRefed<mozilla::dom::Promise> DrawSnapshot(
+      const DOMRect* aRect, double aScale, const nsACString& aBackgroundColor,
+      bool aResetScrollPosition, mozilla::ErrorResult& aRv);
+
+  static already_AddRefed<WindowGlobalParent> CreateDisconnected(
+      const WindowGlobalInit& aInit, ContentParent* aForProcess);
+
+  void Init() final;
+
+  nsIGlobalObject* GetParentObject();
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  void NotifyContentBlockingEvent(
+      uint32_t aEvent, nsIRequest* aRequest, bool aBlocked,
+      const nsACString& aTrackingOrigin,
+      const nsTArray<nsCString>& aTrackingFullHashes,
+      const Maybe<
+          ContentBlockingNotifier::StorageAccessPermissionGrantedReason>&
+          aReason,
+      const Maybe<CanvasFingerprintingEvent>& aCanvasFingerprintingEvent);
+
+  ContentBlockingLog* GetContentBlockingLog() { return &mContentBlockingLog; }
+
+  nsIDOMProcessParent* GetDomProcess();
+
+  nsICookieJarSettings* CookieJarSettings() { return mCookieJarSettings; }
+
+  nsICookieJarSettings* GetCookieJarSettings() const {
+    return mCookieJarSettings;
+  }
+
+  bool DocumentHasLoaded() { return mDocumentHasLoaded; }
+
+  bool DocumentHasUserInteracted() { return mDocumentHasUserInteracted; }
+
+  uint32_t SandboxFlags() { return mSandboxFlags; }
+
+  bool GetDocumentBlockAllMixedContent() { return mBlockAllMixedContent; }
+
+  bool GetDocumentUpgradeInsecureRequests() { return mUpgradeInsecureRequests; }
+
+  void DidBecomeCurrentWindowGlobal(bool aCurrent);
+
+  uint32_t HttpsOnlyStatus() { return mHttpsOnlyStatus; }
+
+  void AddSecurityState(uint32_t aStateFlags);
+  uint32_t GetSecurityFlags() { return mSecurityState; }
+
+  const nsACString& GetRemoteType() const override;
+  void GetRemoteType(nsACString& aRemoteType) const;
+
+  void NotifySessionStoreUpdatesComplete(Element* aEmbedder);
+
+  Maybe<uint64_t> GetSingleChannelId() { return mSingleChannelId; }
+
+  uint32_t GetBFCacheStatus() { return mBFCacheStatus; }
+
+  bool Fullscreen() { return mFullscreen; }
+  void SetFullscreen(bool aFullscreen) { mFullscreen = aFullscreen; }
+
+  void ExitTopChromeDocumentFullscreen();
+
+  void SetShouldReportHasBlockedOpaqueResponse(
+      nsContentPolicyType aContentPolicy);
+
+  already_AddRefed<nsIChannel> GetDocumentChannel();
+
+  already_AddRefed<nsIChannel> GetFailedChannel();
+
+  dom::NoCorsMediaRequestState NoCorsMediaRequestState(nsIURI* aURI) const;
+
+  void RecordSubsequentNoCorsRequestState(nsIURI* aURI);
+
+ protected:
+  already_AddRefed<JSActor> InitJSActor(JS::Handle<JSObject*> aMaybeActor,
+                                        const nsACString& aName,
+                                        ErrorResult& aRv) override;
+  mozilla::ipc::IProtocol* AsNativeActor() override { return this; }
+
+  mozilla::ipc::IPCResult RecvLoadURI(
+      const MaybeDiscarded<dom::BrowsingContext>& aTargetBC,
+      nsDocShellLoadState* aLoadState, bool aSetNavigating);
+  mozilla::ipc::IPCResult RecvInternalLoad(nsDocShellLoadState* aLoadState);
+  mozilla::ipc::IPCResult RecvUpdateDocumentURI(NotNull<nsIURI*> aURI);
+  mozilla::ipc::IPCResult RecvUpdateDocumentPrincipal(
+      nsIPrincipal* aNewDocumentPrincipal,
+      nsIPrincipal* aNewDocumentStoragePrincipal);
+  mozilla::ipc::IPCResult RecvUpdateDocumentHasLoaded(bool aDocumentHasLoaded);
+  mozilla::ipc::IPCResult RecvUpdateDocumentHasUserInteracted(
+      bool aDocumentHasUserInteracted);
+  mozilla::ipc::IPCResult RecvUpdateSandboxFlags(uint32_t aSandboxFlags);
+  mozilla::ipc::IPCResult RecvUpdateDocumentCspSettings(
+      bool aBlockAllMixedContent, bool aUpgradeInsecureRequests);
+  mozilla::ipc::IPCResult RecvUpdateDocumentTitle(const nsString& aTitle);
+  mozilla::ipc::IPCResult RecvUpdateHttpsOnlyStatus(uint32_t aHttpsOnlyStatus);
+  mozilla::ipc::IPCResult RecvSetIsInitialDocument(bool aIsInitialDocument) {
+    if (aIsInitialDocument && mIsInitialDocument.isSome() &&
+        (mIsInitialDocument.value() != aIsInitialDocument)) {
+      return IPC_FAIL_NO_REASON(this);
+    }
+
+    mIsInitialDocument = Some(aIsInitialDocument);
+    mIsUncommittedInitialDocument = aIsInitialDocument;
+    return IPC_OK();
+  }
+  mozilla::ipc::IPCResult RecvCommitToInitialDocument() {
+    MOZ_ASSERT(mIsInitialDocument.isSome() && mIsInitialDocument.value());
+    mIsUncommittedInitialDocument = false;
+    return IPC_OK();
+  }
+  mozilla::ipc::IPCResult RecvUpdateChannels(
+      ParentProcessChannelHandle* aDocumentHandle,
+      ParentProcessChannelHandle* aFailedHandle);
+  mozilla::ipc::IPCResult RecvSetClientInfo(
+      const IPCClientInfo& aIPCClientInfo);
+  mozilla::ipc::IPCResult RecvDestroy();
+  mozilla::ipc::IPCResult RecvRawMessage(const JSActorMessageMeta& aMeta,
+                                         JSIPCValue&& aData,
+                                         StructuredCloneData* aStack);
+
+  mozilla::ipc::IPCResult RecvGetContentBlockingEvents(
+      GetContentBlockingEventsResolver&& aResolver);
+  mozilla::ipc::IPCResult RecvUpdateCookieJarSettings(
+      const CookieJarSettingsArgs& aCookieJarSettingsArgs);
+
+  void ActorDestroy(ActorDestroyReason aWhy) override;
+
+  void DrawSnapshotInternal(gfx::CrossProcessPaint* aPaint,
+                            const Maybe<IntRect>& aRect, float aScale,
+                            nscolor aBackgroundColor,
+                            gfx::CrossProcessPaintFlags aFlags);
+
+  mozilla::ipc::IPCResult RecvCheckPermitUnload(
+      bool aHasInProcessBlocker, XPCOMPermitUnloadAction aAction,
+      CheckPermitUnloadResolver&& aResolver);
+
+  mozilla::ipc::IPCResult RecvRequestRestoreTabContent();
+
+  mozilla::ipc::IPCResult RecvUpdateBFCacheStatus(const uint32_t& aOnFlags,
+                                                  const uint32_t& aOffFlags);
+
+ public:
+  mozilla::ipc::IPCResult RecvSetSingleChannelId(
+      const Maybe<uint64_t>& aSingleChannelId);
+
+  mozilla::ipc::IPCResult RecvSetDocumentDomain(NotNull<nsIURI*> aDomain);
+
+  mozilla::ipc::IPCResult RecvSetSiteIntegrityProtected(
+      NotNull<nsIURI*> aSourceURI, uint64_t aMaxAge);
+
+  nsresult DoAddCertException(bool aTemporary);
+  mozilla::ipc::IPCResult RecvAddCertException(
+      bool aTemporary, AddCertExceptionResolver&& aResolver);
+
+  mozilla::ipc::IPCResult RecvReloadWithHttpsOnlyException();
+
+  mozilla::ipc::IPCResult RecvGetStorageAccessPermission(
+      GetStorageAccessPermissionResolver&& aResolve);
+
+  mozilla::ipc::IPCResult RecvSetCookies(
+      const nsCString& aBaseDomain, const OriginAttributes& aOriginAttributes,
+      nsIURI* aHost, bool aIsThirdParty,
+      const nsTArray<CookieStruct>& aCookies);
+
+  mozilla::ipc::IPCResult RecvRecordUserActivationForBTP();
+
+  mozilla::ipc::IPCResult RecvRecordUserInteractionForPermissions();
+
+  mozilla::ipc::IPCResult RecvNotifyAudioSessionTypeOverride(
+      const dom::AudioSessionType& aType);
+
+  void UpdateFullscreenKeyboardLockStatus(FullscreenKeyboardLock aStatus);
+
+ private:
+  WindowGlobalParent(CanonicalBrowsingContext* aBrowsingContext,
+                     uint64_t aInnerWindowId, uint64_t aOuterWindowId,
+                     FieldValues&& aInit);
+
+  ~WindowGlobalParent();
+
+  nsresult SetDocumentStoragePrincipal(
+      nsIPrincipal* aNewDocumentStoragePrincipal);
+
+  nsCOMPtr<nsIPrincipal> mDocumentPrincipal;
+  nsCOMPtr<nsIPrincipal> mDocumentStoragePrincipal;
+
+  nsCOMPtr<nsIPrincipal> mDocContentBlockingAllowListPrincipal;
+
+  nsCOMPtr<nsIURI> mDocumentURI;
+  Maybe<nsString> mDocumentTitle;
+
+  RefPtr<WindowGlobalParent> mStaticCloneOf;
+
+  Maybe<bool> mIsInitialDocument;
+
+  bool mIsUncommittedInitialDocument;
+
+  bool mHasBeforeUnload;
+
+  ContentBlockingLog mContentBlockingLog;
+
+  uint32_t mSecurityState = 0;
+
+  Maybe<ClientInfo> mClientInfo;
+  nsCOMPtr<nsICookieJarSettings> mCookieJarSettings;
+
+  nsCOMPtr<nsIChannel> mDocumentChannel;
+
+  nsCOMPtr<nsIChannel> mFailedChannel;
+
+  uint32_t mSandboxFlags;
+
+  bool mDocumentHasLoaded;
+  bool mDocumentHasUserInteracted;
+  bool mDocumentTreeWouldPreloadResources = false;
+  bool mBlockAllMixedContent;
+  bool mUpgradeInsecureRequests;
+
+  uint32_t mHttpsOnlyStatus;
+
+  uint32_t mBFCacheStatus = 0;
+
+
+  Maybe<uint64_t> mSingleChannelId;
+
+  bool mFullscreen = false;
+
+  bool mShouldReportHasBlockedOpaqueResponse = false;
+
+  nsTHashtable<nsCStringHashKey> mNoCorsMediaRequestURIs;
+};
+
+nsCString BFCacheStatusToString(uint32_t aFlags);
+
+}  
+}  
+
+inline nsISupports* ToSupports(
+    mozilla::dom::WindowGlobalParent* aWindowGlobal) {
+  return static_cast<mozilla::dom::WindowContext*>(aWindowGlobal);
+}
+
+#endif  // !defined(mozilla_dom_WindowGlobalParent_h)

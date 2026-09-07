@@ -1,0 +1,596 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#include "vm/RealmFuses.h"
+
+#include <array>
+
+#include "builtin/MapObject.h"
+#include "builtin/Promise.h"
+#include "builtin/RegExp.h"
+#include "builtin/WeakMapObject.h"
+#include "builtin/WeakSetObject.h"
+#include "debugger/DebugScript.h"
+#include "js/experimental/TypedData.h"
+#include "vm/GlobalObject.h"
+#include "vm/NativeObject.h"
+#include "vm/ObjectOperations.h"
+#include "vm/Realm.h"
+#include "vm/SelfHosting.h"
+
+#include "vm/JSObject-inl.h"
+
+using namespace js;
+
+void js::InvalidatingRealmFuse::popFuse(JSContext* cx, RealmFuses& realmFuses) {
+  if (!intact()) {
+    return;
+  }
+
+  InvalidatingFuse::popFuse(cx);
+
+  for (auto& fd : realmFuses.fuseDependencies) {
+    fd.invalidateForFuse(cx, this);
+  }
+}
+
+bool js::InvalidatingRealmFuse::addFuseDependency(
+    JSContext* cx, const jit::IonScriptKey& ionScript) {
+  MOZ_ASSERT(ionScript.script()->realm() == cx->realm());
+  auto* scriptSet =
+      cx->realm()->realmFuses.fuseDependencies.getOrCreateDependentScriptSet(
+          cx, this);
+  if (!scriptSet) {
+    return false;
+  }
+
+  return scriptSet->addScriptForFuse(this, ionScript);
+}
+
+void js::PopsOptimizedGetIteratorFuse::popFuse(JSContext* cx,
+                                               RealmFuses& realmFuses) {
+  RealmFuse::popFuse(cx);
+
+  realmFuses.optimizeGetIteratorFuse.popFuse(cx, realmFuses);
+}
+
+void js::PopsOptimizedArrayIteratorPrototypeFuse::popFuse(
+    JSContext* cx, RealmFuses& realmFuses) {
+  RealmFuse::popFuse(cx);
+
+  realmFuses.optimizeArrayIteratorPrototypeFuse.popFuse(cx, realmFuses);
+}
+
+int32_t js::RealmFuses::fuseOffsets[uint8_t(
+    RealmFuses::FuseIndex::LastFuseIndex)] = {
+#define FUSE(Name, LowerName) offsetof(RealmFuses, LowerName),
+    FOR_EACH_REALM_FUSE(FUSE)
+#undef FUSE
+};
+
+int32_t js::RealmFuses::offsetOfFuseWordRelativeToRealm(
+    RealmFuses::FuseIndex index) {
+  int32_t base_offset = offsetof(Realm, realmFuses);
+  int32_t fuse_offset = RealmFuses::fuseOffsets[uint8_t(index)];
+  int32_t fuseWordOffset = GuardFuse::fuseOffset();
+
+  return base_offset + fuse_offset + fuseWordOffset;
+}
+
+const char* js::RealmFuses::fuseNames[] = {
+#define FUSE(Name, LowerName) #LowerName,
+    FOR_EACH_REALM_FUSE(FUSE)
+#undef FUSE
+};
+
+const char* js::RealmFuses::getFuseName(RealmFuses::FuseIndex index) {
+  uint8_t rawIndex = uint8_t(index);
+  MOZ_ASSERT(index < RealmFuses::FuseIndex::LastFuseIndex);
+  return fuseNames[rawIndex];
+}
+
+bool js::OptimizeGetIteratorFuse::checkInvariant(JSContext* cx) {
+  auto& realmFuses = cx->realm()->realmFuses;
+  return realmFuses.arrayPrototypeIteratorFuse.intact() &&
+         realmFuses.optimizeArrayIteratorPrototypeFuse.intact();
+}
+
+void js::OptimizeGetIteratorFuse::popFuse(JSContext* cx,
+                                          RealmFuses& realmFuses) {
+  RealmFuse::popFuse(cx, realmFuses);
+  realmFuses.optimizeGetIteratorBytecodeFuse.popFuse(cx, realmFuses);
+}
+
+bool js::OptimizeGetIteratorBytecodeFuse::checkInvariant(JSContext* cx) {
+  auto& realmFuses = cx->realm()->realmFuses;
+  if (!realmFuses.optimizeGetIteratorFuse.intact()) {
+    return false;
+  }
+  if (DebugScriptMap* map = cx->zone()->debugScriptMap) {
+    for (auto iter = map->iter(); !iter.done(); iter.next()) {
+      JSScript* script = iter.get().key();
+      if (script->realm() == cx->realm()) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool js::OptimizeArrayIteratorPrototypeFuse::checkInvariant(JSContext* cx) {
+  auto& realmFuses = cx->realm()->realmFuses;
+  return realmFuses.arrayPrototypeIteratorNextFuse.intact() &&
+         realmFuses.arrayIteratorPrototypeHasNoReturnProperty.intact() &&
+         realmFuses.iteratorPrototypeHasNoReturnProperty.intact() &&
+         realmFuses.arrayIteratorPrototypeHasIteratorProto.intact() &&
+         realmFuses.iteratorPrototypeHasObjectProto.intact() &&
+         realmFuses.objectPrototypeHasNoReturnProperty.intact();
+}
+
+static bool ObjectHasDataProperty(NativeObject* obj, PropertyKey key,
+                                  Value* val) {
+  mozilla::Maybe<PropertyInfo> prop = obj->lookupPure(key);
+  if (prop.isNothing() || !prop->isDataProperty()) {
+    return false;
+  }
+  *val = obj->getSlot(prop->slot());
+  return true;
+}
+
+static bool ObjectHasDataPropertyValue(NativeObject* obj, PropertyKey key,
+                                       const Value& expectedValue) {
+  Value v;
+  if (!ObjectHasDataProperty(obj, key, &v)) {
+    return false;
+  }
+  return v == expectedValue;
+}
+
+static bool ObjectHasDataPropertyFunction(NativeObject* obj, PropertyKey key,
+                                          JSNative expectedFunction) {
+  Value v;
+  if (!ObjectHasDataProperty(obj, key, &v)) {
+    return false;
+  }
+  if (!IsNativeFunction(v, expectedFunction)) {
+    return false;
+  }
+  if (obj->realm() != v.toObject().as<JSFunction>().realm()) {
+    return false;
+  }
+  return true;
+}
+
+static bool ObjectHasDataPropertyFunction(NativeObject* obj, PropertyKey key,
+                                          PropertyName* selfHostedName) {
+  Value v;
+  if (!ObjectHasDataProperty(obj, key, &v)) {
+    return false;
+  }
+  if (!IsSelfHostedFunctionWithName(v, selfHostedName)) {
+    return false;
+  }
+  if (obj->realm() != v.toObject().as<JSFunction>().realm()) {
+    return false;
+  }
+  return true;
+}
+
+static bool ObjectHasGetterProperty(NativeObject* obj, PropertyKey key,
+                                    JSFunction** getter) {
+  mozilla::Maybe<PropertyInfo> prop = obj->lookupPure(key);
+  if (prop.isNothing() || !prop->isAccessorProperty()) {
+    return false;
+  }
+  JSObject* getterObject = obj->getGetter(*prop);
+  if (!getterObject || !getterObject->is<JSFunction>()) {
+    return false;
+  }
+  if (obj->realm() != getterObject->as<JSFunction>().realm()) {
+    return false;
+  }
+  *getter = &getterObject->as<JSFunction>();
+  return true;
+}
+
+static bool ObjectHasGetterFunction(NativeObject* obj, PropertyKey key,
+                                    JSNative expectedGetter) {
+  JSFunction* getter;
+  if (!ObjectHasGetterProperty(obj, key, &getter)) {
+    return false;
+  }
+  return IsNativeFunction(getter, expectedGetter);
+}
+
+static bool ObjectHasGetterFunction(NativeObject* obj, PropertyKey key,
+                                    PropertyName* selfHostedName) {
+  JSFunction* getter;
+  if (!ObjectHasGetterProperty(obj, key, &getter)) {
+    return false;
+  }
+  return IsSelfHostedFunctionWithName(getter, selfHostedName);
+}
+
+bool js::ArrayPrototypeIteratorFuse::checkInvariant(JSContext* cx) {
+  auto* proto = cx->global()->maybeGetArrayPrototype();
+  if (!proto) {
+    return true;
+  }
+
+  PropertyKey iteratorKey =
+      PropertyKey::Symbol(cx->wellKnownSymbols().iterator);
+
+  return ObjectHasDataPropertyFunction(proto, iteratorKey,
+                                       cx->names().dollar_ArrayValues_);
+}
+
+bool js::ArrayPrototypeIteratorNextFuse::checkInvariant(JSContext* cx) {
+  auto* proto = cx->global()->maybeGetArrayIteratorPrototype();
+
+  if (!proto) {
+    return true;
+  }
+
+  return ObjectHasDataPropertyFunction(proto, NameToId(cx->names().next),
+                                       cx->names().ArrayIteratorNext);
+}
+
+static bool HasNoReturnName(JSContext* cx, JS::HandleObject proto) {
+  if (!proto) {
+    return true;
+  }
+
+  JS::RootedId returnName(cx, NameToId(cx->names().return_));
+
+  bool found = true;
+  if (!HasOwnProperty(cx, proto, returnName, &found)) {
+    cx->recoverFromOutOfMemory();
+    return true;
+  }
+
+  return !found;
+}
+
+bool js::ArrayIteratorPrototypeHasNoReturnProperty::checkInvariant(
+    JSContext* cx) {
+  RootedObject proto(cx, cx->global()->maybeGetArrayIteratorPrototype());
+
+  if (!proto) {
+    return true;
+  }
+
+  return HasNoReturnName(cx, proto);
+}
+
+bool js::IteratorPrototypeHasNoReturnProperty::checkInvariant(JSContext* cx) {
+  RootedObject proto(cx, cx->global()->maybeGetIteratorPrototype());
+
+  if (!proto) {
+    return true;
+  }
+
+  return HasNoReturnName(cx, proto);
+}
+
+bool js::ArrayIteratorPrototypeHasIteratorProto::checkInvariant(JSContext* cx) {
+  RootedObject proto(cx, cx->global()->maybeGetArrayIteratorPrototype());
+  if (!proto) {
+    return true;
+  }
+
+  RootedObject iterProto(cx, cx->global()->maybeGetIteratorPrototype());
+  if (!iterProto) {
+    MOZ_CRASH("Can we have the array iter proto without the iterator proto?");
+    return true;
+  }
+
+  return proto->staticPrototype() == iterProto;
+}
+
+bool js::IteratorPrototypeHasObjectProto::checkInvariant(JSContext* cx) {
+  RootedObject proto(cx, cx->global()->maybeGetIteratorPrototype());
+  if (!proto) {
+    return true;
+  }
+
+  return proto->staticPrototype() == &cx->global()->getObjectPrototype();
+}
+
+bool js::ObjectPrototypeHasNoReturnProperty::checkInvariant(JSContext* cx) {
+  RootedObject proto(cx, &cx->global()->getObjectPrototype());
+  return HasNoReturnName(cx, proto);
+}
+
+void js::OptimizeArraySpeciesFuse::popFuse(JSContext* cx,
+                                           RealmFuses& realmFuses) {
+  InvalidatingRealmFuse::popFuse(cx, realmFuses);
+}
+
+static bool SpeciesFuseCheckInvariant(JSContext* cx, JSProtoKey protoKey,
+                                      PropertyName* selfHostedSpeciesAccessor) {
+  auto* proto = cx->global()->maybeGetPrototype<NativeObject>(protoKey);
+  if (!proto) {
+    return true;
+  }
+
+  auto* ctor = cx->global()->maybeGetConstructor<NativeObject>(protoKey);
+  MOZ_ASSERT(ctor);
+
+  if (!ObjectHasDataPropertyValue(proto, NameToId(cx->names().constructor),
+                                  ObjectValue(*ctor))) {
+    return false;
+  }
+
+  PropertyKey speciesKey = PropertyKey::Symbol(cx->wellKnownSymbols().species);
+  return ObjectHasGetterFunction(ctor, speciesKey, selfHostedSpeciesAccessor);
+}
+
+bool js::OptimizeArraySpeciesFuse::checkInvariant(JSContext* cx) {
+  return SpeciesFuseCheckInvariant(cx, JSProto_Array,
+                                   cx->names().dollar_ArraySpecies_);
+}
+
+bool js::OptimizeArrayBufferSpeciesFuse::checkInvariant(JSContext* cx) {
+  return SpeciesFuseCheckInvariant(cx, JSProto_ArrayBuffer,
+                                   cx->names().dollar_ArrayBufferSpecies_);
+}
+
+bool js::OptimizeSharedArrayBufferSpeciesFuse::checkInvariant(JSContext* cx) {
+  return SpeciesFuseCheckInvariant(
+      cx, JSProto_SharedArrayBuffer,
+      cx->names().dollar_SharedArrayBufferSpecies_);
+}
+
+bool js::OptimizeTypedArraySpeciesFuse::checkInvariant(JSContext* cx) {
+  if (!SpeciesFuseCheckInvariant(cx, JSProto_TypedArray,
+                                 cx->names().dollar_TypedArraySpecies_)) {
+    return false;
+  }
+
+  auto typedArrayProtoKeys = std::array{
+#define PROTO_KEY(_, T, N) JSProto_##N##Array,
+      JS_FOR_EACH_TYPED_ARRAY(PROTO_KEY)
+#undef PROTO_KEY
+  };
+
+  auto* typedArrayProto =
+      cx->global()->maybeGetPrototype<NativeObject>(JSProto_TypedArray);
+
+  for (auto protoKey : typedArrayProtoKeys) {
+    auto* proto = cx->global()->maybeGetPrototype<NativeObject>(protoKey);
+    if (!proto) {
+      continue;
+    }
+    MOZ_ASSERT(typedArrayProto,
+               "%TypedArray%.prototype must be initialized when TypedArray "
+               "subclass is initialized");
+
+    if (proto->staticPrototype() != typedArrayProto) {
+      return false;
+    }
+
+    auto* ctor = cx->global()->maybeGetConstructor<NativeObject>(protoKey);
+    MOZ_ASSERT(ctor);
+
+    if (!ObjectHasDataPropertyValue(proto, NameToId(cx->names().constructor),
+                                    ObjectValue(*ctor))) {
+      return false;
+    }
+  }
+
+  auto* typedArrayCtor =
+      cx->global()->maybeGetConstructor<NativeObject>(JSProto_TypedArray);
+
+  for (auto protoKey : typedArrayProtoKeys) {
+    NativeObject* ctor =
+        cx->global()->maybeGetConstructor<NativeObject>(protoKey);
+    if (!ctor) {
+      continue;
+    }
+    MOZ_ASSERT(typedArrayCtor,
+               "%TypedArray% must be initialized when TypedArray subclass is "
+               "initialized");
+
+    if (ctor->staticPrototype() != typedArrayCtor) {
+      return false;
+    }
+
+    auto speciesKey = PropertyKey::Symbol(cx->wellKnownSymbols().species);
+    if (ctor->lookupPure(speciesKey).isSome()) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+void js::OptimizePromiseLookupFuse::popFuse(JSContext* cx,
+                                            RealmFuses& realmFuses) {
+  RealmFuse::popFuse(cx, realmFuses);
+}
+
+bool js::OptimizePromiseLookupFuse::checkInvariant(JSContext* cx) {
+  auto* proto = cx->global()->maybeGetPrototype<NativeObject>(JSProto_Promise);
+  if (!proto) {
+    return true;
+  }
+
+  auto* ctor = cx->global()->maybeGetConstructor<NativeObject>(JSProto_Promise);
+  MOZ_ASSERT(ctor);
+
+  if (!ObjectHasDataPropertyValue(proto, NameToId(cx->names().constructor),
+                                  ObjectValue(*ctor))) {
+    return false;
+  }
+
+  if (!ObjectHasDataPropertyFunction(proto, NameToId(cx->names().then),
+                                     js::Promise_then)) {
+    return false;
+  }
+
+  PropertyKey speciesKey = PropertyKey::Symbol(cx->wellKnownSymbols().species);
+  if (!ObjectHasGetterFunction(ctor, speciesKey, js::Promise_static_species)) {
+    return false;
+  }
+
+  if (!ObjectHasDataPropertyFunction(ctor, NameToId(cx->names().resolve),
+                                     js::Promise_static_resolve)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool js::OptimizeRegExpPrototypeFuse::checkInvariant(JSContext* cx) {
+  auto* proto = cx->global()->maybeGetPrototype<NativeObject>(JSProto_RegExp);
+  if (!proto) {
+    return true;
+  }
+
+  if (!ObjectHasGetterFunction(proto, NameToId(cx->names().flags),
+                               cx->names().dollar_RegExpFlagsGetter_)) {
+    return false;
+  }
+  if (!ObjectHasGetterFunction(proto, NameToId(cx->names().global),
+                               regexp_global)) {
+    return false;
+  }
+  if (!ObjectHasGetterFunction(proto, NameToId(cx->names().hasIndices),
+                               regexp_hasIndices)) {
+    return false;
+  }
+  if (!ObjectHasGetterFunction(proto, NameToId(cx->names().ignoreCase),
+                               regexp_ignoreCase)) {
+    return false;
+  }
+  if (!ObjectHasGetterFunction(proto, NameToId(cx->names().multiline),
+                               regexp_multiline)) {
+    return false;
+  }
+  if (!ObjectHasGetterFunction(proto, NameToId(cx->names().sticky),
+                               regexp_sticky)) {
+    return false;
+  }
+  if (!ObjectHasGetterFunction(proto, NameToId(cx->names().unicode),
+                               regexp_unicode)) {
+    return false;
+  }
+  if (!ObjectHasGetterFunction(proto, NameToId(cx->names().unicodeSets),
+                               regexp_unicodeSets)) {
+    return false;
+  }
+  if (!ObjectHasGetterFunction(proto, NameToId(cx->names().dotAll),
+                               regexp_dotAll)) {
+    return false;
+  }
+
+  if (!ObjectHasDataPropertyFunction(proto, NameToId(cx->names().exec),
+                                     cx->names().RegExp_prototype_Exec)) {
+    return false;
+  }
+  if (!ObjectHasDataPropertyFunction(
+          proto, PropertyKey::Symbol(cx->wellKnownSymbols().match),
+          cx->names().RegExpMatch)) {
+    return false;
+  }
+  if (!ObjectHasDataPropertyFunction(
+          proto, PropertyKey::Symbol(cx->wellKnownSymbols().matchAll),
+          cx->names().RegExpMatchAll)) {
+    return false;
+  }
+  if (!ObjectHasDataPropertyFunction(
+          proto, PropertyKey::Symbol(cx->wellKnownSymbols().replace),
+          cx->names().RegExpReplace)) {
+    return false;
+  }
+  if (!ObjectHasDataPropertyFunction(
+          proto, PropertyKey::Symbol(cx->wellKnownSymbols().search),
+          cx->names().RegExpSearch)) {
+    return false;
+  }
+  if (!ObjectHasDataPropertyFunction(
+          proto, PropertyKey::Symbol(cx->wellKnownSymbols().split),
+          cx->names().RegExpSplit)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool js::OptimizeMapObjectIteratorFuse::checkInvariant(JSContext* cx) {
+  auto* proto = cx->global()->maybeGetPrototype<NativeObject>(JSProto_Map);
+  if (!proto) {
+    return true;
+  }
+  PropertyKey iteratorKey =
+      PropertyKey::Symbol(cx->wellKnownSymbols().iterator);
+  if (!ObjectHasDataPropertyFunction(proto, iteratorKey, MapObject::entries)) {
+    return false;
+  }
+
+  auto* iterProto = cx->global()->maybeBuiltinProto(
+      GlobalObject::ProtoKind::MapIteratorProto);
+  if (!iterProto) {
+    return true;
+  }
+  return ObjectHasDataPropertyFunction(&iterProto->as<NativeObject>(),
+                                       NameToId(cx->names().next),
+                                       cx->names().MapIteratorNext);
+}
+
+bool js::OptimizeSetObjectIteratorFuse::checkInvariant(JSContext* cx) {
+  auto* proto = cx->global()->maybeGetPrototype<NativeObject>(JSProto_Set);
+  if (!proto) {
+    return true;
+  }
+  PropertyKey iteratorKey =
+      PropertyKey::Symbol(cx->wellKnownSymbols().iterator);
+  if (!ObjectHasDataPropertyFunction(proto, iteratorKey, SetObject::values)) {
+    return false;
+  }
+
+  auto* iterProto = cx->global()->maybeBuiltinProto(
+      GlobalObject::ProtoKind::SetIteratorProto);
+  if (!iterProto) {
+    return true;
+  }
+  return ObjectHasDataPropertyFunction(&iterProto->as<NativeObject>(),
+                                       NameToId(cx->names().next),
+                                       cx->names().SetIteratorNext);
+}
+
+bool js::OptimizeMapPrototypeSetFuse::checkInvariant(JSContext* cx) {
+  auto* proto = cx->global()->maybeGetPrototype<NativeObject>(JSProto_Map);
+  if (!proto) {
+    return true;
+  }
+  return ObjectHasDataPropertyFunction(proto, NameToId(cx->names().set),
+                                       MapObject::set);
+}
+
+bool js::OptimizeSetPrototypeAddFuse::checkInvariant(JSContext* cx) {
+  auto* proto = cx->global()->maybeGetPrototype<NativeObject>(JSProto_Set);
+  if (!proto) {
+    return true;
+  }
+  return ObjectHasDataPropertyFunction(proto, NameToId(cx->names().add),
+                                       SetObject::add);
+}
+
+bool js::OptimizeWeakMapPrototypeSetFuse::checkInvariant(JSContext* cx) {
+  auto* proto = cx->global()->maybeGetPrototype<NativeObject>(JSProto_WeakMap);
+  if (!proto) {
+    return true;
+  }
+  return ObjectHasDataPropertyFunction(proto, NameToId(cx->names().set),
+                                       WeakMapObject::set);
+}
+
+bool js::OptimizeWeakSetPrototypeAddFuse::checkInvariant(JSContext* cx) {
+  auto* proto = cx->global()->maybeGetPrototype<NativeObject>(JSProto_WeakSet);
+  if (!proto) {
+    return true;
+  }
+  return ObjectHasDataPropertyFunction(proto, NameToId(cx->names().add),
+                                       WeakSetObject::add);
+}

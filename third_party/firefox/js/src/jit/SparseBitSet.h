@@ -1,0 +1,159 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_SparseBitSet_h
+#define jit_SparseBitSet_h
+
+#include "mozilla/Assertions.h"
+
+#include <bit>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "ds/InlineTable.h"
+#include "ds/LifoAlloc.h"
+
+namespace js::jit {
+
+template <typename AllocPolicy, typename Owner>
+class SparseBitSet {
+  using WordType = uint32_t;
+  static constexpr size_t BitsPerWord = 8 * sizeof(WordType);
+
+  static constexpr size_t NumEntries = 8;
+  using Map = InlineMap<uint32_t, WordType, NumEntries, DefaultHasher<uint32_t>,
+                        AllocPolicy>;
+  Map map_;
+
+  static_assert(std::has_single_bit(BitsPerWord),
+                "Must be power-of-two for fast division/modulo");
+  static_assert((sizeof(uint32_t) + sizeof(WordType)) * NumEntries ==
+                    Map::SizeOfInlineEntries,
+                "Array of inline entries must not have unused padding bytes");
+
+  static WordType bitMask(size_t bit) {
+    return WordType(1) << (bit % BitsPerWord);
+  }
+
+ public:
+  class Iterator;
+
+  bool contains(size_t bit) {
+    uint32_t word = bit / BitsPerWord;
+    if (auto p = map_.lookup(word)) {
+      return p->value() & bitMask(bit);
+    }
+    return false;
+  }
+  void remove(size_t bit) {
+    uint32_t word = bit / BitsPerWord;
+    if (auto p = map_.lookup(word)) {
+      WordType value = p->value() & ~bitMask(bit);
+      if (value != 0) {
+        p->value() = value;
+      } else {
+        map_.remove(p);
+      }
+    }
+  }
+  [[nodiscard]] bool insert(size_t bit) {
+    uint32_t word = bit / BitsPerWord;
+    WordType mask = bitMask(bit);
+    auto p = map_.lookupForAdd(word);
+    if (p) {
+      p->value() |= mask;
+      return true;
+    }
+    return map_.add(p, word, mask);
+  }
+
+  bool empty() const { return map_.empty(); }
+
+  [[nodiscard]] bool insertAll(const SparseBitSet& other) {
+    for (auto iter = other.map_.iter(); !iter.done(); iter.next()) {
+      auto index = iter.get().key();
+      WordType bits = iter.get().value();
+      MOZ_ASSERT(bits);
+      auto p = map_.lookupForAdd(index);
+      if (p) {
+        p->value() |= bits;
+      } else {
+        if (!map_.add(p, index, bits)) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+};
+
+template <typename AllocPolicy, typename Owner>
+class SparseBitSet<AllocPolicy, Owner>::Iterator {
+#ifdef DEBUG
+  SparseBitSet& bitSet_;
+#endif
+  typename SparseBitSet::Map::Iterator iter_;
+  WordType currentWord_ = 0;
+  size_t index_ = 0;
+
+  bool done() const { return iter_.done(); }
+
+  void skipZeroBits() {
+    MOZ_ASSERT(!done());
+    MOZ_ASSERT(currentWord_ != 0);
+    auto numZeroes = std::countr_zero(currentWord_);
+    index_ += numZeroes;
+    currentWord_ >>= numZeroes;
+  }
+
+ public:
+  explicit Iterator(SparseBitSet& bitSet)
+      :
+#ifdef DEBUG
+        bitSet_(bitSet),
+#endif
+        iter_(bitSet.map_.iter()) {
+    if (!iter_.done()) {
+      index_ = iter_.get().key() * BitsPerWord;
+      currentWord_ = iter_.get().value();
+      skipZeroBits();
+    }
+  }
+
+  size_t operator*() const {
+    MOZ_ASSERT(!done());
+    MOZ_ASSERT(bitSet_.contains(index_));
+    return index_;
+  }
+
+  explicit operator bool() const { return !done(); }
+
+  void operator++() {
+    MOZ_ASSERT(!done());
+    currentWord_ >>= 1;
+    if (currentWord_ == 0) {
+      iter_.next();
+      if (iter_.done()) {
+        return;
+      }
+      index_ = iter_.get().key() * BitsPerWord;
+      currentWord_ = iter_.get().value();
+    } else {
+      index_++;
+    }
+    skipZeroBits();
+  }
+};
+
+}  
+
+namespace js {
+
+template <typename T, typename Owner>
+struct CanLifoAlloc<js::jit::SparseBitSet<T, Owner>> : Owner::IsStackAllocated {
+};
+
+}  
+
+#endif /* jit_SparseBitSet_h */

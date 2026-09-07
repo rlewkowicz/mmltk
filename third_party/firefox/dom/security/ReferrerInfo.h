@@ -1,0 +1,216 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_ReferrerInfo_h
+#define mozilla_dom_ReferrerInfo_h
+
+#include "mozilla/HashFunctions.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/dom/ReferrerPolicyBinding.h"
+#include "nsCOMPtr.h"
+#include "nsIReferrerInfo.h"
+#include "nsReadableUtils.h"
+
+namespace IPC {
+class MessageReader;
+class MessageWriter;
+}  
+
+#define REFERRERINFO_CONTRACTID "@mozilla.org/referrer-info;1"
+#define REFERRERINFO_CID \
+  {0x041a129f, 0x10ce, 0x4bda, {0xa6, 0x0d, 0xe0, 0x27, 0xa2, 0x6d, 0x5e, 0xd0}}
+
+class nsIHttpChannel;
+class nsIURI;
+class nsIChannel;
+class nsILoadInfo;
+class nsINode;
+class nsIPrincipal;
+
+namespace mozilla {
+class StyleSheet;
+class URLAndReferrerInfo;
+
+namespace net {
+class HttpBaseChannel;
+class nsHttpChannel;
+}  
+}  
+
+namespace mozilla::dom {
+
+
+class ReferrerInfo : public nsIReferrerInfo {
+ public:
+  typedef enum ReferrerPolicy ReferrerPolicyEnum;
+  ReferrerInfo();
+
+  explicit ReferrerInfo(
+      nsIURI* aOriginalReferrer,
+      ReferrerPolicyEnum aPolicy = ReferrerPolicy::_empty,
+      bool aSendReferrer = true,
+      const Maybe<nsCString>& aComputedReferrer = Maybe<nsCString>());
+
+  explicit ReferrerInfo(const Element&);
+  explicit ReferrerInfo(const Document&, const bool = true);
+
+  ReferrerInfo(const Element&, ReferrerPolicyEnum);
+
+  already_AddRefed<ReferrerInfo> Clone() const;
+
+  void Serialize(IPC::MessageWriter* aWriter) const;
+  static bool Deserialize(IPC::MessageReader* aReader,
+                          RefPtr<nsIReferrerInfo>* aResult);
+
+  already_AddRefed<ReferrerInfo> CloneWithNewPolicy(
+      ReferrerPolicyEnum aPolicy) const;
+
+  already_AddRefed<ReferrerInfo> CloneWithNewOriginalReferrer(
+      nsIURI* aOriginalReferrer) const;
+
+  static already_AddRefed<nsIReferrerInfo> CreateFromDocumentAndPolicyOverride(
+      Document* aDoc, ReferrerPolicyEnum aPolicyOverride);
+
+  static already_AddRefed<nsIReferrerInfo> CreateForFetch(
+      nsIPrincipal* aPrincipal, Document* aDoc);
+
+  static already_AddRefed<nsIReferrerInfo> CreateForExternalCSSResources(
+      StyleSheet* aExternalSheet, nsIURI* aExternalSheetURI,
+      ReferrerPolicyEnum aPolicy = ReferrerPolicy::_empty);
+
+  static already_AddRefed<nsIReferrerInfo> CreateForInternalCSSAndSVGResources(
+      Document* aDocument);
+
+  static bool IsReferrerSchemeAllowed(nsIURI* aReferrer);
+
+  static bool ShouldResponseInheritReferrerInfo(nsIChannel* aChannel);
+
+  static nsresult HandleSecureToInsecureReferral(nsIURI* aOriginalURI,
+                                                 nsIURI* aURI,
+                                                 ReferrerPolicyEnum aPolicy,
+                                                 bool& aAllowed);
+
+  static bool IsCrossOriginRequest(nsIHttpChannel* aChannel);
+
+  static bool IsReferrerCrossOrigin(nsIHttpChannel* aChannel,
+                                    nsIURI* aReferrer);
+
+  static bool IsCrossSiteRequest(nsIHttpChannel* aChannel);
+
+  static bool ShouldSetNullOriginHeader(net::HttpBaseChannel* aChannel,
+                                        nsIURI* aOriginURI);
+
+  static uint32_t GetUserReferrerSendingPolicy();
+
+  static uint32_t GetUserXOriginSendingPolicy();
+
+  static uint32_t GetUserTrimmingPolicy();
+
+  static uint32_t GetUserXOriginTrimmingPolicy();
+
+  static ReferrerPolicyEnum GetDefaultReferrerPolicy(
+      nsIHttpChannel* aChannel = nullptr, nsIURI* aURI = nullptr,
+      bool aPrivateBrowsing = false);
+
+  static ReferrerPolicyEnum GetDefaultThirdPartyReferrerPolicy(
+      bool aPrivateBrowsing = false);
+
+  static ReferrerPolicyEnum ReferrerPolicyFromMetaString(
+      const nsAString& aContent);
+
+  static ReferrerPolicyEnum ReferrerPolicyAttributeFromString(
+      const nsAString& aContent);
+
+  static ReferrerPolicyEnum ReferrerPolicyFromHeaderString(
+      const nsAString& aContent);
+
+  HashNumber Hash() const;
+
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIREFERRERINFO
+  NS_DECL_NSISERIALIZABLE
+
+ private:
+  virtual ~ReferrerInfo() = default;
+
+  ReferrerInfo(const ReferrerInfo& rhs);
+
+  enum TrimmingPolicy : uint32_t {
+    ePolicyFullURI = 0,
+    ePolicySchemeHostPortPath = 1,
+    ePolicySchemeHostPort = 2,
+  };
+
+  enum ReferrerSendingPolicy : uint32_t {
+    ePolicyNotSend = 0,
+    ePolicySendWhenUserTrigger = 1,
+    ePolicySendInlineContent = 2,
+  };
+
+  enum XOriginSendingPolicy : uint32_t {
+    ePolicyAlwaysSend = 0,
+    ePolicySendWhenSameDomain = 1,
+    ePolicySendWhenSameHost = 2,
+  };
+
+  nsresult HandleUserXOriginSendingPolicy(nsIURI* aURI, nsIURI* aReferrer,
+                                          bool& aAllowed) const;
+
+  nsresult HandleUserReferrerSendingPolicy(nsIHttpChannel* aChannel,
+                                           bool& aAllowed) const;
+
+  TrimmingPolicy ComputeTrimmingPolicy(nsIHttpChannel* aChannel,
+                                       nsIURI* aReferrer) const;
+
+  friend class mozilla::net::HttpBaseChannel;
+
+  nsresult ComputeReferrer(nsIHttpChannel* aChannel);
+
+  bool IsInitialized() { return mInitialized; }
+
+  friend class mozilla::net::nsHttpChannel;
+  friend class mozilla::dom::Document;
+  bool IsPolicyOverrided() { return mOverridePolicyByDefault; }
+
+  nsresult GetOriginFromReferrerURI(nsIURI* aReferrer,
+                                    nsACString& aResult) const;
+
+  nsresult TrimReferrerWithPolicy(nsIURI* aReferrer,
+                                  TrimmingPolicy aTrimmingPolicy,
+                                  nsACString& aResult) const;
+
+  bool ShouldIgnoreLessRestrictedPolicies(
+      nsIHttpChannel* aChannel, const ReferrerPolicyEnum aPolicy) const;
+
+  nsresult LimitReferrerLength(nsIHttpChannel* aChannel, nsIURI* aReferrer,
+                               TrimmingPolicy aTrimmingPolicy,
+                               nsACString& aInAndOutTrimmedReferrer) const;
+
+  nsresult ReadTailDataBeforeGecko100(const uint32_t& aData,
+                                      nsIObjectInputStream* aInputStream);
+
+  void LogMessageToConsole(nsIHttpChannel* aChannel, const char* aMsg,
+                           const nsTArray<nsString>& aParams) const;
+
+  friend class mozilla::URLAndReferrerInfo;
+
+  nsCOMPtr<nsIURI> mOriginalReferrer;
+
+  ReferrerPolicyEnum mPolicy;
+
+  ReferrerPolicyEnum mOriginalPolicy;
+
+  bool mSendReferrer;
+
+  bool mInitialized;
+
+  bool mOverridePolicyByDefault;
+
+  Maybe<nsCString> mComputedReferrer;
+
+};
+
+}  
+
+#endif  // mozilla_dom_ReferrerInfo_h

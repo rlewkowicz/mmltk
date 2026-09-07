@@ -1,0 +1,49 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DecoderTraits_h_
+#define DecoderTraits_h_
+
+#include "mozilla/UniquePtr.h"
+#include "nsStringFwd.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+
+class DecoderDoctorDiagnostics;
+class MediaContainerType;
+class MediaDataDemuxer;
+struct MediaFormatReaderInit;
+class MediaFormatReader;
+class MediaResource;
+class TrackInfo;
+
+enum CanPlayStatus { CANPLAY_NO, CANPLAY_MAYBE, CANPLAY_YES };
+
+class DecoderTraits {
+ public:
+  static CanPlayStatus CanHandleContainerType(
+      const MediaContainerType& aContainerType,
+      DecoderDoctorDiagnostics* aDiagnostics);
+
+  static bool ShouldHandleMediaType(const nsACString& aMIMEType,
+                                    DecoderDoctorDiagnostics* aDiagnostics);
+
+  static already_AddRefed<MediaDataDemuxer> CreateDemuxer(
+      const MediaContainerType& aType, MediaResource* aResource);
+
+  static MediaFormatReader* CreateReader(const MediaContainerType& aType,
+                                         MediaFormatReaderInit& aInit);
+
+  static bool IsSupportedInVideoDocument(const nsACString& aType);
+
+  static bool IsHttpLiveStreamingType(const MediaContainerType& aType);
+
+  static nsTArray<UniquePtr<TrackInfo>> GetTracksInfo(
+      const MediaContainerType& aType);
+};
+
+}  
+
+#endif

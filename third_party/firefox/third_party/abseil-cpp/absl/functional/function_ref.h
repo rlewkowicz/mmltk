@@ -1,0 +1,175 @@
+// Copyright 2019 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+#ifndef ABSL_FUNCTIONAL_FUNCTION_REF_H_
+#define ABSL_FUNCTIONAL_FUNCTION_REF_H_
+
+#include <cassert>
+#include <type_traits>
+#include <utility>
+
+#include "absl/base/attributes.h"
+#include "absl/base/config.h"
+#include "absl/functional/internal/function_ref.h"
+#include "absl/meta/type_traits.h"
+#include "absl/utility/utility.h"
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+
+template <typename T>
+class FunctionRef;
+
+template <typename R, typename... Args>
+class ABSL_ATTRIBUTE_VIEW FunctionRef<R(Args...)> {
+ protected:
+  template <typename F, typename... U>
+  using EnableIfCompatible =
+      std::enable_if_t<std::is_invocable_r_v<R, F, U..., Args...>>;
+
+  template <typename F>
+  // NOLINTNEXTLINE(google-explicit-constructor)
+  FunctionRef(std::in_place_t, F&& f ABSL_ATTRIBUTE_LIFETIME_BOUND) noexcept
+      : invoker_(&absl::functional_internal::InvokeObject<F&, R, Args...>) {
+    absl::functional_internal::AssertNonNull(f);
+    ptr_.obj = &f;
+  }
+
+ public:
+  template <typename F,
+            typename = EnableIfCompatible<std::enable_if_t<
+                !std::is_same_v<FunctionRef, absl::remove_cvref_t<F>>, F&>>>
+  // NOLINTNEXTLINE(google-explicit-constructor)
+  FunctionRef(F&& f ABSL_ATTRIBUTE_LIFETIME_BOUND) noexcept
+      : FunctionRef(std::in_place, std::forward<F>(f)) {}
+
+  template <typename F, typename = EnableIfCompatible<F*>,
+            absl::functional_internal::EnableIf<std::is_function_v<F>> = 0>
+  // NOLINTNEXTLINE(google-explicit-constructor)
+  FunctionRef(F* f ABSL_ATTRIBUTE_LIFETIME_BOUND) noexcept
+      : invoker_(&absl::functional_internal::InvokeFunction<F*, R, Args...>) {
+    assert(f != nullptr);
+    ptr_.fun = reinterpret_cast<decltype(ptr_.fun)>(f);
+  }
+
+#if ABSL_INTERNAL_CPLUSPLUS_LANG >= 202002L
+  template <auto F, typename = EnableIfCompatible<decltype(F)>>
+  FunctionRef(nontype_t<F>) noexcept  // NOLINT(google-explicit-constructor)
+      : invoker_(&absl::functional_internal::InvokeFunction<decltype(F), F, R,
+                                                            Args...>) {}
+
+  template <
+      auto F, typename Obj,
+      typename = EnableIfCompatible<decltype(F), std::remove_reference_t<Obj>&>,
+      absl::functional_internal::EnableIf<!std::is_rvalue_reference_v<Obj&&>> =
+          0>
+  // NOLINTNEXTLINE(google-explicit-constructor)
+  FunctionRef(nontype_t<F>, Obj&& obj ABSL_ATTRIBUTE_LIFETIME_BOUND) noexcept
+      : invoker_(&absl::functional_internal::InvokeObject<Obj&, decltype(F), F,
+                                                          R, Args...>) {
+    ptr_.obj = std::addressof(obj);
+  }
+
+  template <auto F, typename Obj,
+            typename = EnableIfCompatible<decltype(F), Obj*>>
+  // NOLINTNEXTLINE(google-explicit-constructor)
+  FunctionRef(nontype_t<F>, Obj* obj ABSL_ATTRIBUTE_LIFETIME_BOUND) noexcept
+      : invoker_(&absl::functional_internal::InvokePtr<Obj, decltype(F), F, R,
+                                                       Args...>) {
+    ptr_.obj = obj;
+  }
+#endif
+
+  using absl_internal_is_view = std::true_type;
+
+  R operator()(Args... args) const {
+    return invoker_(ptr_, std::forward<Args>(args)...);
+  }
+
+ private:
+  absl::functional_internal::VoidPtr ptr_;
+  absl::functional_internal::Invoker<R, Args...> invoker_;
+};
+
+template <typename R, typename... Args>
+class ABSL_ATTRIBUTE_VIEW
+    FunctionRef<R(Args...) const> : private FunctionRef<R(Args...)> {
+  using Base = FunctionRef<R(Args...)>;
+
+  template <typename F, typename... U>
+  using EnableIfCompatible =
+      typename Base::template EnableIfCompatible<F, U...>;
+
+ public:
+  template <
+      typename F,
+      typename = EnableIfCompatible<std::enable_if_t<
+          !std::is_same_v<FunctionRef, absl::remove_cvref_t<F>>, const F&>>>
+  // NOLINTNEXTLINE(google-explicit-constructor)
+  FunctionRef(const F& f ABSL_ATTRIBUTE_LIFETIME_BOUND) noexcept
+      : Base(std::in_place_t(), f) {}
+
+  template <typename F, typename = EnableIfCompatible<F*>,
+            absl::functional_internal::EnableIf<std::is_function_v<F>> = 0>
+  // NOLINTNEXTLINE(google-explicit-constructor)
+  FunctionRef(F* f ABSL_ATTRIBUTE_LIFETIME_BOUND) noexcept : Base(f) {}
+
+#if ABSL_INTERNAL_CPLUSPLUS_LANG >= 202002L
+  template <auto F, typename = EnableIfCompatible<decltype(F)>>
+  // NOLINTNEXTLINE(google-explicit-constructor)
+  FunctionRef(nontype_t<F> arg) noexcept : Base(arg) {}
+
+  template <auto F, typename Obj,
+            typename = EnableIfCompatible<decltype(F),
+                                          const std::remove_reference_t<Obj>&>,
+            absl::functional_internal::EnableIf<
+                !std::is_rvalue_reference_v<Obj&&>> = 0>
+  // NOLINTNEXTLINE(google-explicit-constructor)
+  FunctionRef(nontype_t<F> arg,
+              Obj&& obj ABSL_ATTRIBUTE_LIFETIME_BOUND) noexcept
+      : Base(arg, std::forward<Obj>(obj)) {}
+
+  template <auto F, typename Obj,
+            typename = EnableIfCompatible<decltype(F), const Obj*>>
+  // NOLINTNEXTLINE(google-explicit-constructor)
+  FunctionRef(nontype_t<F> arg,
+              const Obj* obj ABSL_ATTRIBUTE_LIFETIME_BOUND) noexcept
+      : Base(arg, obj) {}
+#endif
+
+  using absl_internal_is_view = std::true_type;
+
+  using Base::operator();
+};
+
+template <class F>
+FunctionRef(F*) -> FunctionRef<F>;
+
+#if ABSL_INTERNAL_CPLUSPLUS_LANG >= 202002L
+template <auto Func>
+FunctionRef(nontype_t<Func>)
+    -> FunctionRef<std::remove_pointer_t<decltype(Func)>>;
+
+template <class M, class T, M T::* Func, class U>
+FunctionRef(nontype_t<Func>, U&&)
+    -> FunctionRef<std::enable_if_t<std::is_member_pointer_v<M T::*>, M>>;
+
+template <class M, class T, M T::* Func, class U>
+FunctionRef(nontype_t<Func>, U&&) -> FunctionRef<std::enable_if_t<
+    std::is_object_v<M>, std::invoke_result_t<decltype(Func), U&>()>>;
+
+template <class R, class T, class... Args, R (*Func)(T, Args...), class U>
+FunctionRef(nontype_t<Func>, U&&) -> FunctionRef<R(Args...)>;
+#endif
+
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_FUNCTIONAL_FUNCTION_REF_H_

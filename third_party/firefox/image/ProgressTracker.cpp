@@ -1,0 +1,456 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ProgressTracker.h"
+
+#include "Image.h"
+#include "ImageLogging.h"
+#include "imgINotificationObserver.h"
+#include "imgIRequest.h"
+#include "mozilla/AppShutdown.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/SchedulerGroup.h"
+#include "mozilla/Services.h"
+#include "nsIObserverService.h"
+#include "nsNetUtil.h"
+
+using mozilla::WeakPtr;
+
+namespace mozilla {
+namespace image {
+
+static void CheckProgressConsistency(Progress aOldProgress,
+                                     Progress aNewProgress, bool aIsMultipart) {
+
+
+  if (aNewProgress & FLAG_SIZE_AVAILABLE) {
+  }
+  if (aNewProgress & FLAG_DECODE_COMPLETE) {
+    MOZ_ASSERT(aNewProgress & FLAG_SIZE_AVAILABLE);
+    MOZ_ASSERT(aIsMultipart ||
+               aNewProgress & (FLAG_FRAME_COMPLETE | FLAG_HAS_ERROR));
+  }
+  if (aNewProgress & FLAG_FRAME_COMPLETE) {
+    MOZ_ASSERT(aNewProgress & FLAG_SIZE_AVAILABLE);
+  }
+  if (aNewProgress & FLAG_LOAD_COMPLETE) {
+    MOZ_ASSERT(aIsMultipart ||
+               aNewProgress & (FLAG_SIZE_AVAILABLE | FLAG_HAS_ERROR));
+  }
+  if (aNewProgress & FLAG_IS_ANIMATED) {
+  }
+  if (aNewProgress & FLAG_HAS_TRANSPARENCY) {
+  }
+  if (aNewProgress & FLAG_LAST_PART_COMPLETE) {
+    MOZ_ASSERT(aNewProgress & FLAG_LOAD_COMPLETE);
+  }
+  if (aNewProgress & FLAG_HAS_ERROR) {
+  }
+}
+
+ProgressTracker::ProgressTracker()
+    : mMutex("ProgressTracker::mMutex"),
+      mImage(nullptr),
+      mObservers(new ObserverTable),
+      mProgress(NoProgress),
+      mIsMultipart(false) {}
+
+void ProgressTracker::SetImage(Image* aImage) {
+  MutexAutoLock lock(mMutex);
+  MOZ_ASSERT(aImage, "Setting null image");
+  MOZ_ASSERT(!mImage, "Setting image when we already have one");
+  mImage = aImage;
+}
+
+void ProgressTracker::ResetImage() {
+  MutexAutoLock lock(mMutex);
+  MOZ_ASSERT(mImage, "Resetting image when it's already null!");
+  mImage = nullptr;
+}
+
+uint32_t ProgressTracker::GetImageStatus() const {
+  uint32_t status = imgIRequest::STATUS_NONE;
+
+  if (mProgress & FLAG_SIZE_AVAILABLE) {
+    status |= imgIRequest::STATUS_SIZE_AVAILABLE;
+  }
+  if (mProgress & FLAG_DECODE_COMPLETE) {
+    status |= imgIRequest::STATUS_DECODE_COMPLETE;
+  }
+  if (mProgress & FLAG_FRAME_COMPLETE) {
+    status |= imgIRequest::STATUS_FRAME_COMPLETE;
+  }
+  if (mProgress & FLAG_LOAD_COMPLETE) {
+    status |= imgIRequest::STATUS_LOAD_COMPLETE;
+  }
+  if (mProgress & FLAG_IS_ANIMATED) {
+    status |= imgIRequest::STATUS_IS_ANIMATED;
+  }
+  if (mProgress & FLAG_HAS_TRANSPARENCY) {
+    status |= imgIRequest::STATUS_HAS_TRANSPARENCY;
+  }
+  if (mProgress & FLAG_HAS_ERROR) {
+    status |= imgIRequest::STATUS_ERROR;
+  }
+
+  return status;
+}
+
+class AsyncNotifyRunnable : public Runnable {
+ public:
+  AsyncNotifyRunnable(ProgressTracker* aTracker, IProgressObserver* aObserver)
+      : Runnable("ProgressTracker::AsyncNotifyRunnable"), mTracker(aTracker) {
+    MOZ_ASSERT(NS_IsMainThread(), "Should be created on the main thread");
+    MOZ_ASSERT(aTracker, "aTracker should not be null");
+    MOZ_ASSERT(aObserver, "aObserver should not be null");
+    mObservers.AppendElement(aObserver);
+  }
+
+  NS_IMETHOD Run() override {
+    MOZ_ASSERT(NS_IsMainThread(), "Should be running on the main thread");
+    MOZ_ASSERT(mTracker, "mTracker should not be null");
+    for (uint32_t i = 0; i < mObservers.Length(); ++i) {
+      mObservers[i]->ClearPendingNotify();
+      mTracker->SyncNotify(mObservers[i]);
+    }
+
+    mTracker->mRunnable = nullptr;
+    return NS_OK;
+  }
+
+  void AddObserver(IProgressObserver* aObserver) {
+    mObservers.AppendElement(aObserver);
+  }
+
+  void RemoveObserver(IProgressObserver* aObserver) {
+    mObservers.RemoveElement(aObserver);
+  }
+
+ private:
+  friend class ProgressTracker;
+
+  RefPtr<ProgressTracker> mTracker;
+  nsTArray<RefPtr<IProgressObserver>> mObservers;
+};
+
+ProgressTracker::RenderBlockingRunnable::RenderBlockingRunnable(
+    already_AddRefed<AsyncNotifyRunnable> aEvent)
+    : PrioritizableRunnable(std::move(aEvent),
+                            nsIRunnablePriority::PRIORITY_RENDER_BLOCKING) {}
+
+void ProgressTracker::RenderBlockingRunnable::AddObserver(
+    IProgressObserver* aObserver) {
+  static_cast<AsyncNotifyRunnable*>(mRunnable.get())->AddObserver(aObserver);
+}
+
+void ProgressTracker::RenderBlockingRunnable::RemoveObserver(
+    IProgressObserver* aObserver) {
+  static_cast<AsyncNotifyRunnable*>(mRunnable.get())->RemoveObserver(aObserver);
+}
+
+already_AddRefed<ProgressTracker::RenderBlockingRunnable>
+ProgressTracker::RenderBlockingRunnable::Create(
+    already_AddRefed<AsyncNotifyRunnable> aEvent) {
+  MOZ_ASSERT(NS_IsMainThread());
+  RefPtr<ProgressTracker::RenderBlockingRunnable> event(
+      new ProgressTracker::RenderBlockingRunnable(std::move(aEvent)));
+  return event.forget();
+}
+
+void ProgressTracker::Notify(IProgressObserver* aObserver) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (aObserver->NotificationsDeferred()) {
+    return;
+  }
+
+  if (MOZ_LOG_TEST(gImgLog, LogLevel::Debug)) {
+    RefPtr<Image> image = GetImage();
+    LOG_FUNC_WITH_PARAM(gImgLog, "ProgressTracker::Notify async", "uri", image);
+  }
+
+  aObserver->MarkPendingNotify();
+
+  if (mRunnable) {
+    mRunnable->AddObserver(aObserver);
+  } else if (!AppShutdown::IsInOrBeyond(ShutdownPhase::XPCOMShutdownThreads)) {
+    auto ev = MakeRefPtr<AsyncNotifyRunnable>(this, aObserver);
+    mRunnable = ProgressTracker::RenderBlockingRunnable::Create(ev.forget());
+    SchedulerGroup::Dispatch(do_AddRef(mRunnable));
+  }
+}
+
+class AsyncNotifyCurrentStateRunnable : public Runnable {
+ public:
+  AsyncNotifyCurrentStateRunnable(ProgressTracker* aProgressTracker,
+                                  IProgressObserver* aObserver)
+      : Runnable("image::AsyncNotifyCurrentStateRunnable"),
+        mProgressTracker(aProgressTracker),
+        mObserver(aObserver) {
+    MOZ_ASSERT(NS_IsMainThread(), "Should be created on the main thread");
+    MOZ_ASSERT(mProgressTracker, "mProgressTracker should not be null");
+    MOZ_ASSERT(mObserver, "mObserver should not be null");
+    mImage = mProgressTracker->GetImage();
+  }
+
+  NS_IMETHOD Run() override {
+    MOZ_ASSERT(NS_IsMainThread(), "Should be running on the main thread");
+    mObserver->ClearPendingNotify();
+
+    mProgressTracker->SyncNotify(mObserver);
+    return NS_OK;
+  }
+
+ private:
+  RefPtr<ProgressTracker> mProgressTracker;
+  RefPtr<IProgressObserver> mObserver;
+
+  RefPtr<Image> mImage;
+};
+
+void ProgressTracker::NotifyCurrentState(IProgressObserver* aObserver) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (aObserver->NotificationsDeferred()) {
+    return;
+  }
+
+  if (MOZ_LOG_TEST(gImgLog, LogLevel::Debug)) {
+    RefPtr<Image> image = GetImage();
+    LOG_FUNC_WITH_PARAM(gImgLog, "ProgressTracker::NotifyCurrentState", "uri",
+                        image);
+  }
+
+  aObserver->MarkPendingNotify();
+
+  if (!AppShutdown::IsInOrBeyond(ShutdownPhase::XPCOMShutdownThreads)) {
+    nsCOMPtr<nsIRunnable> ev =
+        new AsyncNotifyCurrentStateRunnable(this, aObserver);
+    SchedulerGroup::Dispatch(ev.forget());
+  }
+}
+
+template <typename T>
+struct ImageObserverNotifier;
+
+template <>
+struct MOZ_STACK_CLASS ImageObserverNotifier<const ObserverTable*> {
+  explicit ImageObserverNotifier(const ObserverTable* aObservers,
+                                 bool aIgnoreDeferral = false)
+      : mObservers(aObservers), mIgnoreDeferral(aIgnoreDeferral) {}
+
+  template <typename Lambda>
+  void operator()(Lambda aFunc) {
+    for (const auto& weakObserver : mObservers->Values()) {
+      RefPtr<IProgressObserver> observer = weakObserver.get();
+      if (observer && (mIgnoreDeferral || !observer->NotificationsDeferred())) {
+        aFunc(observer);
+      }
+    }
+  }
+
+ private:
+  const ObserverTable* mObservers;
+  const bool mIgnoreDeferral;
+};
+
+template <>
+struct MOZ_STACK_CLASS ImageObserverNotifier<IProgressObserver*> {
+  explicit ImageObserverNotifier(IProgressObserver* aObserver)
+      : mObserver(aObserver) {}
+
+  template <typename Lambda>
+  void operator()(Lambda aFunc) {
+    if (mObserver && !mObserver->NotificationsDeferred()) {
+      aFunc(mObserver);
+    }
+  }
+
+ private:
+  IProgressObserver* mObserver;
+};
+
+template <typename T>
+void SyncNotifyInternal(const T& aObservers, bool aHasImage, Progress aProgress,
+                        const nsIntRect& aDirtyRect) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  typedef imgINotificationObserver I;
+  ImageObserverNotifier<T> notify(aObservers);
+
+  if (aProgress & FLAG_SIZE_AVAILABLE) {
+    notify([](IProgressObserver* aObs) { aObs->Notify(I::SIZE_AVAILABLE); });
+  }
+
+  if (aHasImage) {
+    if (!aDirtyRect.IsEmpty()) {
+      notify([&](IProgressObserver* aObs) {
+        aObs->Notify(I::FRAME_UPDATE, &aDirtyRect);
+      });
+    }
+
+    if (aProgress & FLAG_FRAME_COMPLETE) {
+      notify([](IProgressObserver* aObs) { aObs->Notify(I::FRAME_COMPLETE); });
+    }
+
+    if (aProgress & FLAG_HAS_TRANSPARENCY) {
+      notify(
+          [](IProgressObserver* aObs) { aObs->Notify(I::HAS_TRANSPARENCY); });
+    }
+
+    if (aProgress & FLAG_IS_ANIMATED) {
+      notify([](IProgressObserver* aObs) { aObs->Notify(I::IS_ANIMATED); });
+    }
+  }
+
+  if (aProgress & FLAG_DECODE_COMPLETE) {
+    MOZ_ASSERT(aHasImage, "Stopped decoding without ever having an image?");
+    notify([](IProgressObserver* aObs) { aObs->Notify(I::DECODE_COMPLETE); });
+  }
+
+  if (aProgress & FLAG_LOAD_COMPLETE) {
+    notify([=](IProgressObserver* aObs) {
+      aObs->OnLoadComplete(aProgress & FLAG_LAST_PART_COMPLETE);
+    });
+  }
+}
+
+void ProgressTracker::SyncNotifyProgress(Progress aProgress,
+                                         const nsIntRect& aInvalidRect
+                                         ) {
+  MOZ_ASSERT(NS_IsMainThread(), "Use mObservers on main thread only");
+
+  Progress progress = Difference(aProgress);
+  CheckProgressConsistency(mProgress, mProgress | progress, mIsMultipart);
+
+  mProgress |= progress;
+
+  mObservers.Read([&](const ObserverTable* aTable) {
+    SyncNotifyInternal(aTable, HasImage(), progress, aInvalidRect);
+  });
+
+  if (progress & FLAG_HAS_ERROR) {
+    FireFailureNotification();
+  }
+}
+
+void ProgressTracker::SyncNotify(IProgressObserver* aObserver) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  RefPtr<Image> image = GetImage();
+  LOG_SCOPE_WITH_PARAM(gImgLog, "ProgressTracker::SyncNotify", "uri", image);
+
+  nsIntRect rect;
+  if (image) {
+    int32_t width, height;
+    if (NS_FAILED(image->GetWidth(&width)) ||
+        NS_FAILED(image->GetHeight(&height))) {
+      rect = GetMaxSizedIntRect();
+    } else {
+      rect.SizeTo(width, height);
+    }
+  }
+
+  SyncNotifyInternal(aObserver, !!image, mProgress, rect);
+}
+
+void ProgressTracker::EmulateRequestFinished(IProgressObserver* aObserver) {
+  MOZ_ASSERT(NS_IsMainThread(),
+             "SyncNotifyState and mObservers are not threadsafe");
+  RefPtr<IProgressObserver> kungFuDeathGrip(aObserver);
+
+  if (!(mProgress & FLAG_LOAD_COMPLETE)) {
+    aObserver->OnLoadComplete(true);
+  }
+}
+
+void ProgressTracker::AddObserver(IProgressObserver* aObserver) {
+  MOZ_ASSERT(NS_IsMainThread());
+  RefPtr<IProgressObserver> observer = aObserver;
+  mObservers.Write([=](ObserverTable* aTable) {
+    MOZ_ASSERT(!aTable->Contains(observer),
+               "Adding duplicate entry for image observer");
+
+    WeakPtr<IProgressObserver> weakPtr = observer.get();
+    aTable->InsertOrUpdate(observer, weakPtr);
+  });
+}
+
+bool ProgressTracker::RemoveObserver(IProgressObserver* aObserver) {
+  MOZ_ASSERT(NS_IsMainThread());
+  RefPtr<IProgressObserver> observer = aObserver;
+
+  bool removed = mObservers.Write(
+      [observer](ObserverTable* aTable) { return aTable->Remove(observer); });
+
+  if (removed && !aObserver->NotificationsDeferred()) {
+    EmulateRequestFinished(aObserver);
+  }
+
+  if (aObserver->NotificationsDeferred() && mRunnable) {
+    mRunnable->RemoveObserver(aObserver);
+    aObserver->ClearPendingNotify();
+  }
+
+  return removed;
+}
+
+uint32_t ProgressTracker::ObserverCount() const {
+  MOZ_ASSERT(NS_IsMainThread());
+  return mObservers.Read(
+      [](const ObserverTable* aTable) { return aTable->Count(); });
+}
+
+void ProgressTracker::OnUnlockedDraw() {
+  MOZ_ASSERT(NS_IsMainThread());
+  mObservers.Read([](const ObserverTable* aTable) {
+    ImageObserverNotifier<const ObserverTable*> notify(aTable);
+    notify([](IProgressObserver* aObs) {
+      aObs->Notify(imgINotificationObserver::UNLOCKED_DRAW);
+    });
+  });
+}
+
+void ProgressTracker::ResetForNewRequest() {
+  MOZ_ASSERT(NS_IsMainThread());
+  mProgress = NoProgress;
+}
+
+void ProgressTracker::OnDiscard() {
+  MOZ_ASSERT(NS_IsMainThread());
+  mObservers.Read([](const ObserverTable* aTable) {
+    ImageObserverNotifier<const ObserverTable*> notify(aTable);
+    notify([](IProgressObserver* aObs) {
+      aObs->Notify(imgINotificationObserver::DISCARD);
+    });
+  });
+}
+
+void ProgressTracker::OnImageAvailable() {
+  MOZ_ASSERT(NS_IsMainThread());
+  mObservers.Read([](const ObserverTable* aTable) {
+    ImageObserverNotifier<const ObserverTable*> notify(
+        aTable,  true);
+    notify([](IProgressObserver* aObs) { aObs->SetHasImage(); });
+  });
+}
+
+void ProgressTracker::FireFailureNotification() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  RefPtr<Image> image = GetImage();
+  if (image) {
+    nsCOMPtr<nsIURI> uri = image->GetURI();
+    if (uri) {
+      nsCOMPtr<nsIObserverService> os = mozilla::services::GetObserverService();
+      if (os) {
+        os->NotifyObservers(uri, "net:failed-to-process-uri-content", nullptr);
+      }
+    }
+  }
+}
+
+}  
+}  

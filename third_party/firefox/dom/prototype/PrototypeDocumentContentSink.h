@@ -1,0 +1,183 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_PrototypeDocumentContentSink_h_
+#define mozilla_dom_PrototypeDocumentContentSink_h_
+
+#include "js/experimental/JSStencil.h"
+#include "mozilla/Logging.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/FromParser.h"
+#include "nsCOMPtr.h"
+#include "nsCRT.h"
+#include "nsCycleCollectionNoteChild.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsICSSLoaderObserver.h"
+#include "nsIContentSink.h"
+#include "nsIScriptContext.h"
+#include "nsIStreamLoader.h"
+#include "nsTArray.h"
+#include "nsXULPrototypeDocument.h"
+
+class nsIURI;
+class nsIChannel;
+class nsIContent;
+class nsIParser;
+class nsTextNode;
+class nsINode;
+class nsXULPrototypeElement;
+class nsXULPrototypePI;
+class nsXULPrototypeScript;
+
+namespace mozilla::dom {
+class Element;
+class ScriptLoader;
+class Document;
+class XMLStylesheetProcessingInstruction;
+}  
+
+nsresult NS_NewPrototypeDocumentContentSink(nsIContentSink** aResult,
+                                            mozilla::dom::Document* aDoc,
+                                            nsIURI* aURI,
+                                            nsISupports* aContainer,
+                                            nsIChannel* aChannel);
+
+namespace mozilla::dom {
+
+class PrototypeDocumentContentSink final : public nsIStreamLoaderObserver,
+                                           public nsIContentSink,
+                                           public nsICSSLoaderObserver,
+                                           public nsIOffThreadScriptReceiver {
+ public:
+  PrototypeDocumentContentSink();
+
+  nsresult Init(Document* aDoc, nsIURI* aURL, nsISupports* aContainer,
+                nsIChannel* aChannel);
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_NSISTREAMLOADEROBSERVER
+
+  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(PrototypeDocumentContentSink,
+                                           nsIContentSink)
+
+  NS_IMETHOD WillParse(void) override { return NS_OK; };
+  NS_IMETHOD WillInterrupt(void) override { return NS_OK; };
+  void WillResume() override {};
+  NS_IMETHOD SetParser(nsParserBase* aParser) override;
+  virtual void InitialTranslationCompleted() override;
+  virtual void FlushPendingNotifications(FlushType aType) override {};
+  virtual void SetDocumentCharset(NotNull<const Encoding*> aEncoding) override;
+  virtual nsISupports* GetTarget() override;
+  virtual bool IsScriptExecuting() override;
+  virtual void ContinueInterruptedParsingAsync() override;
+
+  NS_IMETHOD StyleSheetLoaded(StyleSheet* aSheet, bool aWasDeferred,
+                              nsresult aStatus) override;
+
+  NS_IMETHOD OnScriptCompileComplete(JS::Stencil* aStencil,
+                                     nsresult aStatus) override;
+
+  nsresult OnPrototypeLoadDone(nsXULPrototypeDocument* aPrototype);
+
+ protected:
+  virtual ~PrototypeDocumentContentSink();
+
+  static LazyLogModule gLog;
+
+  nsIParser* GetParser();
+
+  void ContinueInterruptedParsingIfEnabled();
+  void StartLayout();
+
+  virtual nsresult AddAttributes(nsXULPrototypeElement* aPrototype,
+                                 Element* aElement);
+
+  RefPtr<nsParserBase> mParser;
+  nsCOMPtr<nsIURI> mDocumentURI;
+  RefPtr<Document> mDocument;
+  RefPtr<ScriptLoader> mScriptLoader;
+
+  PrototypeDocumentContentSink* mNextSrcLoadWaiter;  
+
+  nsXULPrototypeScript* mCurrentScriptProto;
+
+  bool mOffThreadCompiling;
+
+  bool mStillWalking;
+
+  uint32_t mPendingSheets;
+
+  class ContextStack {
+   protected:
+    struct Entry {
+      nsXULPrototypeElement* mPrototype;
+      nsIContent* mElement;
+      int32_t mIndex;
+      Entry* mNext;
+    };
+
+    Entry* mTop;
+    int32_t mDepth;
+
+   public:
+    ContextStack();
+    ~ContextStack();
+
+    int32_t Depth() { return mDepth; }
+
+    nsresult Push(nsXULPrototypeElement* aPrototype, nsIContent* aElement);
+    nsresult Pop();
+    nsresult Peek(nsXULPrototypeElement** aPrototype, nsIContent** aElement,
+                  int32_t* aIndex);
+
+    nsresult SetTopIndex(int32_t aIndex);
+
+    void Traverse(nsCycleCollectionTraversalCallback& aCallback,
+                  const char* aName, uint32_t aFlags = 0);
+    void Clear();
+
+    friend void ImplCycleCollectionUnlink(
+        PrototypeDocumentContentSink::ContextStack& aField) {
+      aField.Clear();
+    }
+
+    friend void ImplCycleCollectionTraverse(
+        nsCycleCollectionTraversalCallback& aCallback,
+        PrototypeDocumentContentSink::ContextStack& aField, const char* aName,
+        uint32_t aFlags = 0) {
+      aField.Traverse(aCallback, aName, aFlags);
+    }
+  };
+
+  friend class ContextStack;
+  ContextStack mContextStack;
+
+  RefPtr<nsXULPrototypeDocument> mCurrentPrototype;
+  nsresult CreateAndInsertPI(const nsXULPrototypePI* aProtoPI);
+  nsresult ExecuteScript(nsXULPrototypeScript* aScript);
+  nsresult LoadScript(nsXULPrototypeScript* aScriptProto, bool* aBlock);
+
+  nsresult ResumeWalk();
+
+  nsresult ResumeWalkInternal();
+
+  nsresult MaybeDoneWalking();
+
+  nsresult DoneWalking();
+
+  nsresult CreateElementFromPrototype(nsXULPrototypeElement* aPrototype,
+                                      Element** aResult, nsIContent* aParent);
+  nsresult PrepareToWalk();
+  nsresult CreateAndInsertPI(const nsXULPrototypePI* aProtoPI, nsINode* aParent,
+                             bool aInProlog);
+
+  nsresult InsertXMLStylesheetPI(const nsXULPrototypePI* aProtoPI,
+                                 nsINode* aParent,
+                                 XMLStylesheetProcessingInstruction* aPINode);
+  void CloseElement(Element* aElement);
+};
+
+}  
+
+#endif  // mozilla_dom_PrototypeDocumentContentSink_h_

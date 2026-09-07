@@ -1,0 +1,123 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef _nsSiteSecurityService_h_
+#define _nsSiteSecurityService_h_
+
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/Dafsa.h"
+#include "nsCOMPtr.h"
+#include "nsIDataStorage.h"
+#include "nsISiteSecurityService.h"
+#include "nsString.h"
+#include "nsTArray.h"
+#include "mozpkix/pkixtypes.h"
+#include "prtime.h"
+
+class nsIURI;
+
+using mozilla::OriginAttributes;
+
+#define NS_SITE_SECURITY_SERVICE_CID \
+  {0x16955eee, 0x6c48, 0x4152, {0x93, 0x09, 0xc4, 0x2a, 0x46, 0x51, 0x38, 0xa1}}
+
+enum SecurityPropertyState {
+  SecurityPropertyUnset = 0,
+  SecurityPropertySet = 1,
+  SecurityPropertyKnockout = 2,
+};
+
+class SiteHSTSState {
+ public:
+  SiteHSTSState(const nsCString& aHost,
+                const OriginAttributes& aOriginAttributes,
+                const nsCString& aStateString);
+  SiteHSTSState(const nsCString& aHost,
+                const OriginAttributes& aOriginAttributes,
+                PRTime aHSTSExpireTime, SecurityPropertyState aHSTSState,
+                bool aHSTSIncludeSubdomains);
+
+  nsCString mHostname;
+  OriginAttributes mOriginAttributes;
+  PRTime mHSTSExpireTime;
+  SecurityPropertyState mHSTSState;
+  bool mHSTSIncludeSubdomains;
+
+  bool IsExpired() {
+    if (mHSTSExpireTime == 0) {
+      return false;
+    }
+
+    PRTime now = PR_Now() / PR_USEC_PER_MSEC;
+    if (now > mHSTSExpireTime) {
+      return true;
+    }
+
+    return false;
+  }
+
+  void ToString(nsCString& aString);
+};
+
+struct nsSTSPreload;
+
+class nsSiteSecurityService : public nsISiteSecurityService {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSISITESECURITYSERVICE
+
+  nsSiteSecurityService();
+  nsresult Init();
+
+  static nsresult GetHost(nsIURI* aURI, nsACString& aResult);
+  static bool HostIsIPAddress(const nsCString& hostname);
+
+ protected:
+  virtual ~nsSiteSecurityService();
+
+ private:
+  nsresult SetHSTSState(const char* aHost, int64_t maxage,
+                        bool includeSubdomains,
+                        SecurityPropertyState aHSTSState,
+                        const OriginAttributes& aOriginAttributes);
+  nsresult ProcessHeaderInternal(nsIURI* aSourceURI, const nsCString& aHeader,
+                                 const OriginAttributes& aOriginAttributes,
+                                 uint64_t* aMaxAge, bool* aIncludeSubdomains,
+                                 uint32_t* aFailureResult);
+  nsresult ProcessSTSHeader(nsIURI* aSourceURI, const nsCString& aHeader,
+                            const OriginAttributes& aOriginAttributes,
+                            uint64_t* aMaxAge, bool* aIncludeSubdomains,
+                            uint32_t* aFailureResult);
+  nsresult MarkHostAsNotHSTS(const nsAutoCString& aHost,
+                             const OriginAttributes& aOriginAttributes);
+  nsresult ResetStateInternal(nsIURI* aURI,
+                              const OriginAttributes& aOriginAttributes,
+                              nsISiteSecurityService::ResetStateBy aScope);
+  void ResetStateForExactDomain(const nsCString& aHostname,
+                                const OriginAttributes& aOriginAttributes);
+  nsresult HostMatchesHSTSEntry(const nsAutoCString& aHost,
+                                bool aRequireIncludeSubdomains,
+                                const OriginAttributes& aOriginAttributes,
+                                bool& aHostMatchesHSTSEntry);
+  bool GetPreloadStatus(
+      const nsACString& aHost,
+       bool* aIncludeSubdomains = nullptr) const;
+
+  nsresult GetWithMigration(const nsACString& aHostname,
+                            const OriginAttributes& aOriginAttributes,
+                            nsIDataStorage::DataType aDataStorageType,
+                            nsACString& aValue);
+  nsresult PutWithMigration(const nsACString& aHostname,
+                            const OriginAttributes& aOriginAttributes,
+                            nsIDataStorage::DataType aDataStorageType,
+                            const nsACString& aStateString);
+  nsresult RemoveWithMigration(const nsACString& aHostname,
+                               const OriginAttributes& aOriginAttributes,
+                               nsIDataStorage::DataType aDataStorageType);
+
+  nsCOMPtr<nsIDataStorage> mSiteStateStorage;
+  const mozilla::Dafsa mDafsa;
+};
+
+#endif  // _nsSiteSecurityService_h_

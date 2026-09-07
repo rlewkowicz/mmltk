@@ -1,0 +1,49 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef mozilla_intl_LineBreaker_h_
+#define mozilla_intl_LineBreaker_h_
+
+#include <cstdint>
+
+#define NS_LINEBREAKER_NEED_MORE_TEXT -1
+
+namespace mozilla {
+namespace intl {
+enum class LineBreakRule : uint8_t;
+enum class WordBreakRule : uint8_t;
+
+class LineBreaker final {
+ public:
+  LineBreaker() = delete;
+  ~LineBreaker() = delete;
+
+  static void ComputeBreakPositions(const char16_t* aText, uint32_t aLength,
+                                    WordBreakRule aWordBreak,
+                                    LineBreakRule aLevel,
+                                    bool aIsChineseOrJapanese,
+                                    uint8_t* aBreakBefore);
+  static void ComputeBreakPositions(const uint8_t* aText, uint32_t aLength,
+                                    WordBreakRule aWordBreak,
+                                    LineBreakRule aLevel,
+                                    bool aIsChineseOrJapanese,
+                                    uint8_t* aBreakBefore);
+
+  static void Shutdown();
+};
+
+static inline bool NS_IsSpace(char16_t u) {
+  return u == 0x0020 ||                   
+         u == 0x0009 ||                   
+         u == 0x000D ||                   
+         (0x2000 <= u && u <= 0x2006) ||  
+         (0x2008 <= u && u <= 0x200B) ||  
+         u == 0x1361 ||                   
+         u == 0x1680 ||                   
+         u == 0x205F;                     
+}
+
+}  
+}  
+
+#endif /* mozilla_intl_LineBreaker_h_ */

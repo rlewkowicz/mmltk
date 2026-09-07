@@ -1,0 +1,310 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "PlaceholderTransaction.h"
+
+#include <utility>
+
+#include "CompositionTransaction.h"
+#include "mozilla/EditorBase.h"
+#include "mozilla/Logging.h"
+#include "mozilla/dom/Selection.h"
+#include "nsGkAtoms.h"
+#include "nsQueryObject.h"
+
+namespace mozilla {
+
+using namespace dom;
+
+PlaceholderTransaction::PlaceholderTransaction(
+    EditorBase& aEditorBase, nsStaticAtom& aName,
+    Maybe<SelectionState>&& aSelState)
+    : mEditorBase(&aEditorBase),
+      mCompositionTransaction(nullptr),
+      mStartSel(*std::move(aSelState)),
+      mAbsorb(true),
+      mCommitted(false) {
+  mName = &aName;
+}
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(PlaceholderTransaction)
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_INHERITED(PlaceholderTransaction,
+                                                EditAggregateTransaction)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mEditorBase);
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mStartSel);
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mEndSel);
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_WEAK_PTR
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(PlaceholderTransaction,
+                                                  EditAggregateTransaction)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mEditorBase);
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mStartSel);
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mEndSel);
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(PlaceholderTransaction)
+NS_INTERFACE_MAP_END_INHERITING(EditAggregateTransaction)
+
+NS_IMPL_ADDREF_INHERITED(PlaceholderTransaction, EditAggregateTransaction)
+NS_IMPL_RELEASE_INHERITED(PlaceholderTransaction, EditAggregateTransaction)
+
+void PlaceholderTransaction::AppendChild(EditTransactionBase& aTransaction) {
+  mChildren.AppendElement(aTransaction);
+}
+
+NS_IMETHODIMP PlaceholderTransaction::DoTransaction() {
+  MOZ_LOG(
+      GetLogModule(), LogLevel::Info,
+      ("%p PlaceholderTransaction::%s this={ mName=%s }", this, __FUNCTION__,
+       nsAtomCString(mName ? mName.get() : nsGkAtoms::_empty).get()));
+  return NS_OK;
+}
+
+NS_IMETHODIMP PlaceholderTransaction::UndoTransaction() {
+  MOZ_LOG(GetLogModule(), LogLevel::Info,
+          ("%p PlaceholderTransaction::%s this={ mName=%s } "
+           "Start==============================",
+           this, __FUNCTION__,
+           nsAtomCString(mName ? mName.get() : nsGkAtoms::_empty).get()));
+
+  if (NS_WARN_IF(!mEditorBase)) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  nsresult rv = EditAggregateTransaction::UndoTransaction();
+  if (NS_FAILED(rv)) {
+    NS_WARNING("EditAggregateTransaction::UndoTransaction() failed");
+    return rv;
+  }
+
+  RefPtr<Selection> selection = mEditorBase->GetSelection();
+  if (NS_WARN_IF(!selection)) {
+    return NS_ERROR_FAILURE;
+  }
+  rv = mStartSel.RestoreSelection(*selection);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "SelectionState::RestoreSelection() failed");
+
+  MOZ_LOG(GetLogModule(), LogLevel::Info,
+          ("%p PlaceholderTransaction::%s this={ mName=%s } "
+           "End==============================",
+           this, __FUNCTION__,
+           nsAtomCString(mName ? mName.get() : nsGkAtoms::_empty).get()));
+  return rv;
+}
+
+NS_IMETHODIMP PlaceholderTransaction::RedoTransaction() {
+  MOZ_LOG(GetLogModule(), LogLevel::Info,
+          ("%p PlaceholderTransaction::%s this={ mName=%s } "
+           "Start==============================",
+           this, __FUNCTION__,
+           nsAtomCString(mName ? mName.get() : nsGkAtoms::_empty).get()));
+
+  if (NS_WARN_IF(!mEditorBase)) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  nsresult rv = EditAggregateTransaction::RedoTransaction();
+  if (NS_FAILED(rv)) {
+    NS_WARNING("EditAggregateTransaction::RedoTransaction() failed");
+    return rv;
+  }
+
+  RefPtr<Selection> selection = mEditorBase->GetSelection();
+  if (NS_WARN_IF(!selection)) {
+    return NS_ERROR_FAILURE;
+  }
+  rv = mEndSel.RestoreSelection(*selection);
+  NS_WARNING_ASSERTION(NS_SUCCEEDED(rv),
+                       "SelectionState::RestoreSelection() failed");
+  MOZ_LOG(GetLogModule(), LogLevel::Info,
+          ("%p PlaceholderTransaction::%s this={ mName=%s } "
+           "End==============================",
+           this, __FUNCTION__,
+           nsAtomCString(mName ? mName.get() : nsGkAtoms::_empty).get()));
+  return rv;
+}
+
+NS_IMETHODIMP PlaceholderTransaction::Merge(nsITransaction* aOtherTransaction,
+                                            bool* aDidMerge) {
+  if (NS_WARN_IF(!aDidMerge) || NS_WARN_IF(!aOtherTransaction)) {
+    return NS_ERROR_INVALID_ARG;
+  }
+
+  *aDidMerge = false;
+
+  if (mForwardingTransaction) {
+    MOZ_ASSERT_UNREACHABLE(
+        "tried to merge into a placeholder that was in "
+        "forwarding mode!");
+    return NS_ERROR_FAILURE;
+  }
+
+  RefPtr<EditTransactionBase> otherTransactionBase =
+      aOtherTransaction->GetAsEditTransactionBase();
+  if (!otherTransactionBase) {
+    MOZ_LOG(GetLogModule(), LogLevel::Debug,
+            ("%p PlaceholderTransaction::%s(aOtherTransaction=%p) this={ "
+             "mName=%s } returned false due to non edit transaction",
+             this, __FUNCTION__, aOtherTransaction,
+             nsAtomCString(mName ? mName.get() : nsGkAtoms::_empty).get()));
+    return NS_OK;
+  }
+
+  if (mAbsorb) {
+    if (CompositionTransaction* otherCompositionTransaction =
+            otherTransactionBase->GetAsCompositionTransaction()) {
+      if (!mCompositionTransaction) {
+        mCompositionTransaction = otherCompositionTransaction;
+        AppendChild(*otherCompositionTransaction);
+      } else {
+        bool didMerge;
+        mCompositionTransaction->Merge(otherCompositionTransaction, &didMerge);
+        if (!didMerge) {
+          mCompositionTransaction = otherCompositionTransaction;
+          AppendChild(*otherCompositionTransaction);
+        }
+      }
+    } else {
+      PlaceholderTransaction* otherPlaceholderTransaction =
+          otherTransactionBase->GetAsPlaceholderTransaction();
+      if (!otherPlaceholderTransaction) {
+        AppendChild(*otherTransactionBase);
+      }
+    }
+    *aDidMerge = true;
+    return NS_OK;
+  }
+
+  if (mCommitted ||
+      (mName != nsGkAtoms::TypingTxnName && mName != nsGkAtoms::IMETxnName &&
+       mName != nsGkAtoms::DeleteTxnName)) {
+    MOZ_LOG(GetLogModule(), LogLevel::Debug,
+            ("%p PlaceholderTransaction::%s(aOtherTransaction=%p) this={ "
+             "mName=%s } returned false due to non mergable transaction",
+             this, __FUNCTION__, aOtherTransaction,
+             nsAtomCString(mName ? mName.get() : nsGkAtoms::_empty).get()));
+    return NS_OK;
+  }
+
+  PlaceholderTransaction* otherPlaceholderTransaction =
+      otherTransactionBase->GetAsPlaceholderTransaction();
+  if (!otherPlaceholderTransaction) {
+    MOZ_LOG(GetLogModule(), LogLevel::Debug,
+            ("%p PlaceholderTransaction::%s(aOtherTransaction=%p) this={ "
+             "mName=%s } returned false due to non placeholder transaction",
+             this, __FUNCTION__, aOtherTransaction,
+             nsAtomCString(mName ? mName.get() : nsGkAtoms::_empty).get()));
+    return NS_OK;
+  }
+
+  RefPtr<nsAtom> otherTransactionName = otherPlaceholderTransaction->GetName();
+  if (!otherTransactionName || otherTransactionName == nsGkAtoms::_empty ||
+      otherTransactionName != mName) {
+    MOZ_LOG(GetLogModule(), LogLevel::Debug,
+            ("%p PlaceholderTransaction::%s(aOtherTransaction=%p) this={ "
+             "mName=%s } returned false due to non mergable placeholder "
+             "transaction",
+             this, __FUNCTION__, aOtherTransaction,
+             nsAtomCString(mName ? mName.get() : nsGkAtoms::_empty).get()));
+    return NS_OK;
+  }
+
+
+  if (!otherPlaceholderTransaction->mStartSel.HasOnlyCollapsedRange()) {
+    MOZ_LOG(GetLogModule(), LogLevel::Debug,
+            ("%p PlaceholderTransaction::%s(aOtherTransaction=%p) this={ "
+             "mName=%s } returned false due to not collapsed selection at "
+             "start of new transactions",
+             this, __FUNCTION__, aOtherTransaction,
+             nsAtomCString(mName ? mName.get() : nsGkAtoms::_empty).get()));
+    return NS_OK;
+  }
+
+  if (!mEndSel.HasOnlyCollapsedRange()) {
+    MOZ_LOG(GetLogModule(), LogLevel::Debug,
+            ("%p PlaceholderTransaction::%s(aOtherTransaction=%p) this={ "
+             "mName=%s } returned false due to not collapsed selection at end "
+             "of previous transactions",
+             this, __FUNCTION__, aOtherTransaction,
+             nsAtomCString(mName ? mName.get() : nsGkAtoms::_empty).get()));
+    return NS_OK;
+  }
+
+  const bool isPreviousCaretPointInSameRootOfNewCaretPoint = [&]() {
+    nsINode* previousRootInCurrentDOMTree = mEndSel.GetCommonRootNode();
+    return previousRootInCurrentDOMTree &&
+           previousRootInCurrentDOMTree ==
+               otherPlaceholderTransaction->mStartSel.GetCommonRootNode();
+  }();
+  if (!isPreviousCaretPointInSameRootOfNewCaretPoint) {
+    MOZ_LOG(GetLogModule(), LogLevel::Debug,
+            ("%p PlaceholderTransaction::%s(aOtherTransaction=%p) this={ "
+             "mName=%s } returned false due to the caret points are in "
+             "different root nodes",
+             this, __FUNCTION__, aOtherTransaction,
+             nsAtomCString(mName ? mName.get() : nsGkAtoms::_empty).get()));
+    return NS_OK;
+  }
+
+  if (!otherPlaceholderTransaction->mStartSel.Equals(mEndSel)) {
+    MOZ_LOG(GetLogModule(), LogLevel::Debug,
+            ("%p PlaceholderTransaction::%s(aOtherTransaction=%p) this={ "
+             "mName=%s } returned false due to caret positions were different",
+             this, __FUNCTION__, aOtherTransaction,
+             nsAtomCString(mName ? mName.get() : nsGkAtoms::_empty).get()));
+    return NS_OK;
+  }
+
+  mAbsorb = true;  
+  otherPlaceholderTransaction->ForwardEndBatchTo(*this);
+  DebugOnly<nsresult> rvIgnored = RememberEndingSelection();
+  NS_WARNING_ASSERTION(
+      NS_SUCCEEDED(rvIgnored),
+      "PlaceholderTransaction::RememberEndingSelection() failed, but "
+      "ignored");
+  *aDidMerge = true;
+  MOZ_LOG(GetLogModule(), LogLevel::Debug,
+          ("%p PlaceholderTransaction::%s(aOtherTransaction=%p) this={ "
+           "mName=%s } returned true",
+           this, __FUNCTION__, aOtherTransaction,
+           nsAtomCString(mName ? mName.get() : nsGkAtoms::_empty).get()));
+  return NS_OK;
+}
+
+nsresult PlaceholderTransaction::EndPlaceHolderBatch() {
+  mAbsorb = false;
+
+  if (mForwardingTransaction) {
+    if (mForwardingTransaction) {
+      DebugOnly<nsresult> rvIgnored =
+          mForwardingTransaction->EndPlaceHolderBatch();
+      NS_WARNING_ASSERTION(
+          NS_SUCCEEDED(rvIgnored),
+          "PlaceholderTransaction::EndPlaceHolderBatch() failed, but ignored");
+    }
+  }
+  nsresult rv = RememberEndingSelection();
+  NS_WARNING_ASSERTION(
+      NS_SUCCEEDED(rv),
+      "PlaceholderTransaction::RememberEndingSelection() failed");
+  return rv;
+}
+
+nsresult PlaceholderTransaction::RememberEndingSelection() {
+  if (NS_WARN_IF(!mEditorBase)) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  RefPtr<Selection> selection = mEditorBase->GetSelection();
+  if (NS_WARN_IF(!selection)) {
+    return NS_ERROR_FAILURE;
+  }
+  mEndSel.SaveSelection(*selection);
+  return NS_OK;
+}
+
+}  

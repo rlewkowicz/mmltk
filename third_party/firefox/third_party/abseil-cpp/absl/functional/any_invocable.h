@@ -1,0 +1,139 @@
+// Copyright 2022 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef ABSL_FUNCTIONAL_ANY_INVOCABLE_H_
+#define ABSL_FUNCTIONAL_ANY_INVOCABLE_H_
+
+#include <cstddef>
+#include <functional>
+#include <initializer_list>
+#include <type_traits>
+#include <utility>
+
+#include "absl/base/attributes.h"
+#include "absl/base/config.h"
+#include "absl/base/nullability.h"
+#include "absl/functional/internal/any_invocable.h"
+#include "absl/meta/type_traits.h"
+#include "absl/utility/utility.h"
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+
+template <class Sig>
+class ABSL_NULLABILITY_COMPATIBLE ABSL_ATTRIBUTE_OWNER AnyInvocable
+    : private internal_any_invocable::Impl<Sig> {
+ private:
+  static_assert(
+      std::is_function_v<Sig>,
+      "The template argument of AnyInvocable must be a function type.");
+
+  using Impl = internal_any_invocable::Impl<Sig>;
+
+ public:
+  using result_type = typename Impl::result_type;
+  using absl_internal_is_view = std::false_type;
+
+
+  AnyInvocable() noexcept = default;
+  AnyInvocable(std::nullptr_t) noexcept {}  // NOLINT
+
+  AnyInvocable(AnyInvocable&& ) noexcept = default;
+
+  template <class F, typename = std::enable_if_t<
+                         internal_any_invocable::CanConvert<Sig, F>::value>>
+  AnyInvocable(F&& f)  // NOLINT
+      : Impl(internal_any_invocable::ConversionConstruct(),
+             std::forward<F>(f)) {}
+
+  template <class T, class... Args,
+            typename = std::enable_if_t<
+                internal_any_invocable::CanEmplace<Sig, T, Args...>::value>>
+  explicit AnyInvocable(std::in_place_type_t<T>, Args&&... args)
+      : Impl(std::in_place_type<std::decay_t<T>>, std::forward<Args>(args)...) {
+    static_assert(std::is_same_v<T, std::decay_t<T>>,
+                  "The explicit template argument of in_place_type is required "
+                  "to be an unqualified object type.");
+  }
+
+  template <class T, class U, class... Args,
+            typename = std::enable_if_t<internal_any_invocable::CanEmplace<
+                Sig, T, std::initializer_list<U>&, Args...>::value>>
+  explicit AnyInvocable(std::in_place_type_t<T>, std::initializer_list<U> ilist,
+                        Args&&... args)
+      : Impl(std::in_place_type<std::decay_t<T>>, ilist,
+             std::forward<Args>(args)...) {
+    static_assert(std::is_same_v<T, std::decay_t<T>>,
+                  "The explicit template argument of in_place_type is required "
+                  "to be an unqualified object type.");
+  }
+
+
+  AnyInvocable& operator=(AnyInvocable&& ) noexcept = default;
+
+  AnyInvocable& operator=(std::nullptr_t) noexcept {
+    this->Clear();
+    return *this;
+  }
+
+  template <class F, typename = std::enable_if_t<
+                         internal_any_invocable::CanAssign<Sig, F>::value>>
+  AnyInvocable& operator=(F&& f) {
+    *this = AnyInvocable(std::forward<F>(f));
+    return *this;
+  }
+
+  template <
+      class F,
+      typename = std::enable_if_t<
+          internal_any_invocable::CanAssignReferenceWrapper<Sig, F>::value>>
+  AnyInvocable& operator=(std::reference_wrapper<F> f) noexcept {
+    *this = AnyInvocable(f);
+    return *this;
+  }
+
+
+  ~AnyInvocable() = default;
+
+  void swap(AnyInvocable& other) noexcept { std::swap(*this, other); }
+
+  explicit operator bool() const noexcept { return this->HasValue(); }
+
+  using Impl::operator();
+
+
+  friend bool operator==(const AnyInvocable& f, std::nullptr_t) noexcept {
+    return !f.HasValue();
+  }
+
+  friend bool operator==(std::nullptr_t, const AnyInvocable& f) noexcept {
+    return !f.HasValue();
+  }
+
+  friend bool operator!=(const AnyInvocable& f, std::nullptr_t) noexcept {
+    return f.HasValue();
+  }
+
+  friend bool operator!=(std::nullptr_t, const AnyInvocable& f) noexcept {
+    return f.HasValue();
+  }
+
+  friend void swap(AnyInvocable& f1, AnyInvocable& f2) noexcept { f1.swap(f2); }
+
+ private:
+  template <bool , class , class... >
+  friend class internal_any_invocable::CoreImpl;
+};
+
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_FUNCTIONAL_ANY_INVOCABLE_H_

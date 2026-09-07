@@ -1,0 +1,387 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/StaticPrefs_page_load.h"
+#include "mozilla/StaticPrefs_javascript.h"
+#include "mozilla/ipc/IdleSchedulerParent.h"
+#include "mozilla/AppShutdown.h"
+#include "mozilla/NeverDestroyed.h"
+#include "mozilla/ipc/SharedMemoryHandle.h"
+#include "mozilla/ipc/SharedMemoryMapping.h"
+#include "nsSystemInfo.h"
+#include "nsThreadUtils.h"
+#include "nsITimer.h"
+#include "nsIThread.h"
+
+namespace mozilla::ipc {
+
+static SharedMemoryMappingWithHandle& sActiveChildCounter() {
+  static NeverDestroyed<SharedMemoryMappingWithHandle> mapping;
+  return *mapping;
+}
+
+std::bitset<NS_IDLE_SCHEDULER_COUNTER_ARRAY_LENGHT>
+    IdleSchedulerParent::sInUseChildCounters;
+constinit LinkedList<IdleSchedulerParent>
+    IdleSchedulerParent::sIdleAndGCRequests;
+int32_t IdleSchedulerParent::sMaxConcurrentIdleTasksInChildProcesses = 1;
+uint32_t IdleSchedulerParent::sMaxConcurrentGCs = 1;
+uint32_t IdleSchedulerParent::sActiveGCs = 0;
+uint32_t IdleSchedulerParent::sChildProcessesRunningPrioritizedOperation = 0;
+uint32_t IdleSchedulerParent::sChildProcessesAlive = 0;
+nsITimer* IdleSchedulerParent::sStarvationPreventer = nullptr;
+
+uint32_t IdleSchedulerParent::sNumCPUs = 0;
+uint32_t IdleSchedulerParent::sPrefConcurrentGCsMax = 0;
+uint32_t IdleSchedulerParent::sPrefConcurrentGCsCPUDivisor = 0;
+
+IdleSchedulerParent::IdleSchedulerParent() {
+  sChildProcessesAlive++;
+
+  uint32_t max_gcs_pref =
+      StaticPrefs::javascript_options_concurrent_multiprocess_gcs_max();
+  uint32_t cpu_divisor_pref =
+      StaticPrefs::javascript_options_concurrent_multiprocess_gcs_cpu_divisor();
+  if (!max_gcs_pref) {
+    max_gcs_pref = UINT32_MAX;
+  }
+  if (!cpu_divisor_pref) {
+    cpu_divisor_pref = 4;
+  }
+
+  if (!sNumCPUs) {
+    sNumCPUs = 1;
+
+    if (MOZ_LIKELY(!AppShutdown::IsInOrBeyond(ShutdownPhase::XPCOMShutdown))) {
+      nsCOMPtr<nsIThread> thread = do_GetCurrentThread();
+      nsCOMPtr<nsIRunnable> runnable =
+          NS_NewRunnableFunction("cpucount getter", [thread]() {
+            ProcessInfo processInfo = {};
+            if (NS_SUCCEEDED(CollectProcessInfo(processInfo))) {
+              uint32_t num_cpus = processInfo.cpuCount;
+              if (MOZ_LIKELY(!AppShutdown::IsInOrBeyond(
+                      ShutdownPhase::XPCOMShutdownThreads))) {
+                nsCOMPtr<nsIRunnable> runnable = NS_NewRunnableFunction(
+                    "IdleSchedulerParent::CalculateNumIdleTasks", [num_cpus]() {
+                      sNumCPUs = num_cpus;
+
+                      CalculateNumIdleTasks();
+                    });
+
+                thread->Dispatch(runnable, NS_DISPATCH_NORMAL);
+              }
+            }
+          });
+      NS_DispatchBackgroundTask(runnable.forget(), NS_DISPATCH_EVENT_MAY_BLOCK);
+    }
+  }
+
+  if (sPrefConcurrentGCsMax != max_gcs_pref ||
+      sPrefConcurrentGCsCPUDivisor != cpu_divisor_pref) {
+    sPrefConcurrentGCsMax = max_gcs_pref;
+    sPrefConcurrentGCsCPUDivisor = cpu_divisor_pref;
+
+    CalculateNumIdleTasks();
+  }
+}
+
+void IdleSchedulerParent::CalculateNumIdleTasks() {
+  MOZ_ASSERT(sNumCPUs);
+  MOZ_ASSERT(sPrefConcurrentGCsMax);
+  MOZ_ASSERT(sPrefConcurrentGCsCPUDivisor);
+
+  sMaxConcurrentIdleTasksInChildProcesses = int32_t(std::max(sNumCPUs, 1u));
+  sMaxConcurrentGCs = std::clamp(sNumCPUs / sPrefConcurrentGCsCPUDivisor, 1u,
+                                 sPrefConcurrentGCsMax);
+
+  if (sActiveChildCounter()) {
+    sActiveChildCounter()
+        .DataAsSpan<Atomic<int32_t>>()[NS_IDLE_SCHEDULER_INDEX_OF_CPU_COUNTER] =
+        static_cast<int32_t>(sMaxConcurrentIdleTasksInChildProcesses);
+  }
+  IdleSchedulerParent::Schedule(nullptr);
+}
+
+IdleSchedulerParent::~IdleSchedulerParent() {
+  if (mChildId) {
+    sInUseChildCounters[mChildId] = false;
+    if (sActiveChildCounter()) {
+      auto counters = sActiveChildCounter().DataAsSpan<Atomic<int32_t>>();
+      if (counters[mChildId]) {
+        --counters[NS_IDLE_SCHEDULER_INDEX_OF_ACTIVITY_COUNTER];
+        counters[mChildId] = 0;
+      }
+    }
+  }
+
+  if (mRunningPrioritizedOperation) {
+    --sChildProcessesRunningPrioritizedOperation;
+  }
+
+  if (mDoingGC) {
+    sActiveGCs--;
+  }
+
+  if (mRequestingGC) {
+    mRequestingGC.value()(false);
+    mRequestingGC = Nothing();
+  }
+
+  if (isInList()) {
+    remove();
+  }
+
+  MOZ_ASSERT(sChildProcessesAlive > 0);
+  sChildProcessesAlive--;
+  if (sChildProcessesAlive == 0) {
+    MOZ_ASSERT(sIdleAndGCRequests.isEmpty());
+    sActiveChildCounter() = nullptr;
+
+    if (sStarvationPreventer) {
+      sStarvationPreventer->Cancel();
+      NS_RELEASE(sStarvationPreventer);
+    }
+  }
+
+  Schedule(nullptr);
+}
+
+IPCResult IdleSchedulerParent::RecvInitForIdleUse(
+    InitForIdleUseResolver&& aResolve) {
+  MOZ_ASSERT(sChildProcessesAlive > 0);
+
+  MOZ_ASSERT(IsNotDoingIdleTask());
+
+  if (!sActiveChildCounter()) {
+    size_t shmemSize = NS_IDLE_SCHEDULER_COUNTER_ARRAY_LENGHT * sizeof(int32_t);
+    sActiveChildCounter() = shared_memory::Create(shmemSize).MapWithHandle();
+    if (sActiveChildCounter()) {
+      memset(sActiveChildCounter().Address(), 0, shmemSize);
+      sInUseChildCounters[NS_IDLE_SCHEDULER_INDEX_OF_ACTIVITY_COUNTER] = true;
+      sInUseChildCounters[NS_IDLE_SCHEDULER_INDEX_OF_CPU_COUNTER] = true;
+      sActiveChildCounter().DataAsSpan<Atomic<int32_t>>()
+          [NS_IDLE_SCHEDULER_INDEX_OF_CPU_COUNTER] =
+          static_cast<int32_t>(sMaxConcurrentIdleTasksInChildProcesses);
+    } else {
+      sActiveChildCounter() = nullptr;
+    }
+  }
+  MutableSharedMemoryHandle activeCounter =
+      sActiveChildCounter() ? sActiveChildCounter().Handle().Clone() : nullptr;
+
+  uint32_t unusedId = 0;
+  for (uint32_t i = 0; i < NS_IDLE_SCHEDULER_COUNTER_ARRAY_LENGHT; ++i) {
+    if (!sInUseChildCounters[i]) {
+      sInUseChildCounters[i] = true;
+      unusedId = i;
+      break;
+    }
+  }
+
+  mChildId = unusedId;
+
+  aResolve(
+      std::tuple<mozilla::Maybe<MutableSharedMemoryHandle>&&, const uint32_t&>(
+          Some(std::move(activeCounter)), mChildId));
+  return IPC_OK();
+}
+
+IPCResult IdleSchedulerParent::RecvRequestIdleTime(uint64_t aId,
+                                                   TimeDuration aBudget) {
+  MOZ_ASSERT(aBudget);
+  MOZ_ASSERT(IsNotDoingIdleTask());
+
+  mCurrentRequestId = aId;
+  mRequestedIdleBudget = aBudget;
+
+  if (!isInList()) {
+    sIdleAndGCRequests.insertBack(this);
+  }
+
+  Schedule(this);
+  return IPC_OK();
+}
+
+IPCResult IdleSchedulerParent::RecvIdleTimeUsed(uint64_t aId) {
+  MOZ_ASSERT(IsWaitingForIdle() || IsDoingIdleTask());
+
+  MOZ_ASSERT(mCurrentRequestId == aId);
+
+  if (IsWaitingForIdle() && !mRequestingGC) {
+    remove();
+  }
+  mRequestedIdleBudget = TimeDuration();
+  Schedule(nullptr);
+  return IPC_OK();
+}
+
+IPCResult IdleSchedulerParent::RecvSchedule() {
+  Schedule(nullptr);
+  return IPC_OK();
+}
+
+IPCResult IdleSchedulerParent::RecvRunningPrioritizedOperation() {
+  ++mRunningPrioritizedOperation;
+  if (mRunningPrioritizedOperation == 1) {
+    ++sChildProcessesRunningPrioritizedOperation;
+  }
+  return IPC_OK();
+}
+
+IPCResult IdleSchedulerParent::RecvPrioritizedOperationDone() {
+  MOZ_ASSERT(mRunningPrioritizedOperation);
+
+  --mRunningPrioritizedOperation;
+  if (mRunningPrioritizedOperation == 0) {
+    --sChildProcessesRunningPrioritizedOperation;
+    Schedule(nullptr);
+  }
+  return IPC_OK();
+}
+
+IPCResult IdleSchedulerParent::RecvRequestGC(RequestGCResolver&& aResolver) {
+  MOZ_ASSERT(!mDoingGC);
+  MOZ_ASSERT(!mRequestingGC);
+
+  mRequestingGC = Some(aResolver);
+  if (!isInList()) {
+    sIdleAndGCRequests.insertBack(this);
+  }
+
+  Schedule(nullptr);
+  return IPC_OK();
+}
+
+IPCResult IdleSchedulerParent::RecvStartedGC() {
+  if (mDoingGC) {
+    return IPC_OK();
+  }
+
+  mDoingGC = true;
+  sActiveGCs++;
+
+  if (mRequestingGC) {
+    mRequestingGC.value()(true);
+    mRequestingGC = Nothing();
+    if (!IsWaitingForIdle()) {
+      remove();
+    }
+  }
+
+  return IPC_OK();
+}
+
+IPCResult IdleSchedulerParent::RecvDoneGC() {
+  MOZ_ASSERT(mDoingGC);
+  sActiveGCs--;
+  mDoingGC = false;
+  Schedule(nullptr);
+  return IPC_OK();
+}
+
+int32_t IdleSchedulerParent::ActiveCount() {
+  if (sActiveChildCounter()) {
+    return sActiveChildCounter().DataAsSpan<Atomic<int32_t>>()
+        [NS_IDLE_SCHEDULER_INDEX_OF_ACTIVITY_COUNTER];
+  }
+  return 0;
+}
+
+bool IdleSchedulerParent::HasSpareCycles(int32_t aActiveCount) {
+  MOZ_ASSERT(sMaxConcurrentIdleTasksInChildProcesses > 0);
+  return sChildProcessesRunningPrioritizedOperation
+             ? sMaxConcurrentIdleTasksInChildProcesses / 2 > aActiveCount
+             : sMaxConcurrentIdleTasksInChildProcesses > aActiveCount;
+}
+
+bool IdleSchedulerParent::HasSpareGCCycles() {
+  return sMaxConcurrentGCs > sActiveGCs;
+}
+
+void IdleSchedulerParent::SendIdleTime() {
+  MOZ_ASSERT(mRequestedIdleBudget);
+  (void)SendIdleTime(mCurrentRequestId, mRequestedIdleBudget);
+}
+
+void IdleSchedulerParent::SendMayGC() {
+  MOZ_ASSERT(mRequestingGC);
+  mRequestingGC.value()(true);
+  mRequestingGC = Nothing();
+  mDoingGC = true;
+  sActiveGCs++;
+}
+
+void IdleSchedulerParent::Schedule(IdleSchedulerParent* aRequester) {
+  int32_t activeCount = ActiveCount();
+
+  if (aRequester && aRequester->mRunningPrioritizedOperation) {
+    MOZ_ASSERT(aRequester->IsWaitingForIdle());
+
+    if (aRequester->isInList() && !aRequester->mRequestingGC) {
+      aRequester->remove();
+    }
+    aRequester->SendIdleTime();
+    activeCount++;
+  }
+
+  RefPtr<IdleSchedulerParent> idleRequester = sIdleAndGCRequests.getFirst();
+
+  bool has_spare_cycles = HasSpareCycles(activeCount);
+  bool has_spare_gc_cycles = HasSpareGCCycles();
+
+  while (idleRequester && (has_spare_cycles || has_spare_gc_cycles)) {
+    RefPtr<IdleSchedulerParent> next = idleRequester->getNext();
+
+    if (has_spare_cycles && idleRequester->IsWaitingForIdle()) {
+      activeCount++;
+      if (!idleRequester->mRequestingGC) {
+        idleRequester->remove();
+      }
+      idleRequester->SendIdleTime();
+      has_spare_cycles = HasSpareCycles(activeCount);
+    }
+
+    if (has_spare_gc_cycles && idleRequester->mRequestingGC) {
+      if (!idleRequester->IsWaitingForIdle()) {
+        idleRequester->remove();
+      }
+      idleRequester->SendMayGC();
+      has_spare_gc_cycles = HasSpareGCCycles();
+    }
+
+    idleRequester = next;
+  }
+
+  if (!sIdleAndGCRequests.isEmpty() && HasSpareCycles(activeCount)) {
+    EnsureStarvationTimer();
+  }
+}
+
+void IdleSchedulerParent::EnsureStarvationTimer() {
+  if (!sStarvationPreventer) {
+    NS_NewTimerWithFuncCallback(
+        &sStarvationPreventer, StarvationCallback, nullptr,
+        StaticPrefs::page_load_deprioritization_period(),
+        nsITimer::TYPE_ONE_SHOT_LOW_PRIORITY, "StarvationCallback"_ns);
+  }
+}
+
+void IdleSchedulerParent::StarvationCallback(nsITimer* aTimer, void* aData) {
+  RefPtr<IdleSchedulerParent> idleRequester = sIdleAndGCRequests.getFirst();
+  while (idleRequester) {
+    if (idleRequester->IsWaitingForIdle()) {
+      ++idleRequester->mRunningPrioritizedOperation;
+      ++sChildProcessesRunningPrioritizedOperation;
+      Schedule(idleRequester);
+      --idleRequester->mRunningPrioritizedOperation;
+      --sChildProcessesRunningPrioritizedOperation;
+      break;
+    }
+
+    idleRequester = idleRequester->getNext();
+  }
+  NS_RELEASE(sStarvationPreventer);
+}
+
+}  

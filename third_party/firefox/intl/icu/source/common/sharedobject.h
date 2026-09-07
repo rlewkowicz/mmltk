@@ -1,0 +1,102 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+******************************************************************************
+* Copyright (C) 2015-2016, International Business Machines
+* Corporation and others.  All Rights Reserved.
+******************************************************************************
+* sharedobject.h
+*/
+
+#ifndef __SHAREDOBJECT_H__
+#define __SHAREDOBJECT_H__
+
+
+#include "unicode/uobject.h"
+#include "umutex.h"
+
+U_NAMESPACE_BEGIN
+
+class SharedObject;
+
+class U_COMMON_API UnifiedCacheBase : public UObject {
+public:
+    UnifiedCacheBase() { }
+
+    virtual void handleUnreferencedObject() const = 0;
+
+    virtual ~UnifiedCacheBase();
+private:
+    UnifiedCacheBase(const UnifiedCacheBase &) = delete;
+    UnifiedCacheBase &operator=(const UnifiedCacheBase &) = delete;
+};
+
+class U_COMMON_API_CLASS SharedObject : public UObject {
+public:
+    U_COMMON_API SharedObject() :
+            softRefCount(0),
+            hardRefCount(0),
+            cachePtr(nullptr) {}
+
+    U_COMMON_API SharedObject(const SharedObject &other) :
+            UObject(other),
+            softRefCount(0),
+            hardRefCount(0),
+            cachePtr(nullptr) {}
+
+    U_COMMON_API virtual ~SharedObject();
+
+    U_COMMON_API void addRef() const;
+
+    U_COMMON_API void removeRef() const;
+
+    U_COMMON_API int32_t getRefCount() const;
+
+    U_COMMON_API inline UBool noHardReferences() const { return getRefCount() == 0; }
+
+    U_COMMON_API inline UBool hasHardReferences() const { return getRefCount() != 0; }
+
+    U_COMMON_API void deleteIfZeroRefCount() const;
+
+        
+    template<typename T>
+    static T *copyOnWrite(const T *&ptr) {
+        const T *p = ptr;
+        if(p->getRefCount() <= 1) { return const_cast<T *>(p); }
+        T *p2 = new T(*p);
+        if(p2 == nullptr) { return nullptr; }
+        p->removeRef();
+        ptr = p2;
+        p2->addRef();
+        return p2;
+    }
+
+    template<typename T>
+    static void copyPtr(const T *src, const T *&dest) {
+        if(src != dest) {
+            if(dest != nullptr) { dest->removeRef(); }
+            dest = src;
+            if(src != nullptr) { src->addRef(); }
+        }
+    }
+
+    template<typename T>
+    static void clearPtr(const T *&ptr) {
+        if (ptr != nullptr) {
+            ptr->removeRef();
+            ptr = nullptr;
+        }
+    }
+
+private:
+    mutable int32_t softRefCount;
+    friend class UnifiedCache;
+
+    mutable u_atomic_int32_t hardRefCount;
+    
+    mutable const UnifiedCacheBase *cachePtr;
+
+};
+
+U_NAMESPACE_END
+
+#endif

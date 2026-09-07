@@ -1,0 +1,263 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef VideoOutput_h
+#define VideoOutput_h
+
+#include "MediaTrackListener.h"
+#include "VideoFrameContainer.h"
+
+namespace mozilla {
+
+static bool SetImageToBlackPixel(layers::PlanarYCbCrImage* aImage) {
+  uint8_t blackPixel[] = {0x10, 0x80, 0x80};
+
+  layers::PlanarYCbCrData data;
+  data.mYChannel = blackPixel;
+  data.mCbChannel = blackPixel + 1;
+  data.mCrChannel = blackPixel + 2;
+  data.mYStride = data.mCbCrStride = 1;
+  data.mPictureRect = gfx::IntRect(0, 0, 1, 1);
+  data.mYUVColorSpace = gfx::YUVColorSpace::BT601;
+  data.mColorRange = gfx::ColorRange::LIMITED;
+
+  return NS_SUCCEEDED(aImage->CopyData(data));
+}
+
+class VideoOutput : public DirectMediaTrackListener {
+ protected:
+  typedef layers::Image Image;
+  typedef layers::ImageContainer ImageContainer;
+  typedef layers::ImageContainer::FrameID FrameID;
+  typedef layers::ImageContainer::ProducerID ProducerID;
+
+  virtual ~VideoOutput() = default;
+
+  void DropPastFrames() {
+    TimeStamp now = TimeStamp::Now();
+    size_t nrChunksInPast = 0;
+    for (const auto& idChunkPair : mFrames) {
+      const VideoChunk& chunk = idChunkPair.second;
+      if (chunk.mTimeStamp > now) {
+        break;
+      }
+      ++nrChunksInPast;
+    }
+    if (nrChunksInPast > 1) {
+      mFrames.RemoveElementsAt(0, nrChunksInPast - 1);
+    }
+  }
+
+  void SendFramesEnsureLocked() {
+    mMutex.AssertCurrentThreadOwns();
+    SendFrames();
+  }
+
+  void SendFrames() {
+    DropPastFrames();
+
+    if (mFrames.IsEmpty()) {
+      return;
+    }
+
+    if (!mEnabled && mDisabledBlackImageSent) {
+      return;
+    }
+
+    AutoTArray<ImageContainer::NonOwningImage, 16> images;
+    PrincipalHandle lastPrincipalHandle = PRINCIPAL_HANDLE_NONE;
+
+    for (const auto& idChunkPair : mFrames) {
+      ImageContainer::FrameID frameId = idChunkPair.first;
+      const VideoChunk& chunk = idChunkPair.second;
+      const VideoFrame& frame = chunk.mFrame;
+      Image* image = frame.GetImage();
+      if (frame.GetForceBlack() || !mEnabled) {
+        if (!mBlackImage) {
+          RefPtr<Image> blackImage = mVideoFrameContainer->GetImageContainer()
+                                         ->CreatePlanarYCbCrImage();
+          if (blackImage) {
+            if (SetImageToBlackPixel(blackImage->AsPlanarYCbCrImage())) {
+              mBlackImage = blackImage;
+            }
+          }
+        }
+        if (mBlackImage) {
+          image = mBlackImage;
+        }
+      }
+      if (!image) {
+        continue;
+      }
+      ImageContainer::NonOwningImage nonOwningImage(
+          image, chunk.mTimeStamp, frameId, mProducerID,
+          chunk.mProcessingDuration, chunk.mMediaTime, chunk.mWebrtcCaptureTime,
+          chunk.mWebrtcReceiveTime, chunk.mRtpTimestamp);
+      images.AppendElement(std::move(nonOwningImage));
+
+      lastPrincipalHandle = chunk.GetPrincipalHandle();
+
+      if (!mEnabled && mBlackImage) {
+        MOZ_ASSERT(images.Length() == 1);
+        mDisabledBlackImageSent = true;
+        break;
+      }
+    }
+
+    if (images.IsEmpty()) {
+      mVideoFrameContainer->ClearFutureFrames();
+      return;
+    }
+
+    bool principalHandleChanged =
+        lastPrincipalHandle != PRINCIPAL_HANDLE_NONE &&
+        lastPrincipalHandle != mVideoFrameContainer->GetLastPrincipalHandle();
+
+    if (principalHandleChanged) {
+      mVideoFrameContainer->UpdatePrincipalHandleForFrameID(
+          lastPrincipalHandle, images.LastElement().mFrameID);
+    }
+
+    mVideoFrameContainer->SetCurrentFrames(
+        mFrames[0].second.mFrame.GetIntrinsicSize(), images);
+    mMainThread->Dispatch(NewRunnableMethod("VideoFrameContainer::Invalidate",
+                                            mVideoFrameContainer,
+                                            &VideoFrameContainer::Invalidate));
+  }
+
+  FrameID NewFrameID() {
+    mMutex.AssertCurrentThreadOwns();
+    return ++mFrameID;
+  }
+
+ public:
+  VideoOutput(VideoFrameContainer* aContainer, AbstractThread* aMainThread)
+      : mMutex("VideoOutput::mMutex"),
+        mVideoFrameContainer(aContainer),
+        mMainThread(aMainThread) {}
+  void NotifyRealtimeTrackData(MediaTrackGraph* aGraph, TrackTime aTrackOffset,
+                               const MediaSegment& aMedia) override {
+    MOZ_ASSERT(aMedia.GetType() == MediaSegment::VIDEO);
+    const VideoSegment& video = static_cast<const VideoSegment&>(aMedia);
+    MutexAutoLock lock(mMutex);
+    for (VideoSegment::ConstChunkIterator i(video); !i.IsEnded(); i.Next()) {
+      if (!mLastFrameTime.IsNull() && i->mTimeStamp < mLastFrameTime) {
+        mFrames.ClearAndRetainStorage();
+      }
+      mFrames.AppendElement(std::make_pair(NewFrameID(), *i));
+      mLastFrameTime = i->mTimeStamp;
+    }
+
+    SendFramesEnsureLocked();
+  }
+  void NotifyRemoved(MediaTrackGraph* aGraph) override {
+    if (NS_IsMainThread()) {
+      mAttachment = State::Detached;
+    } else {
+      aGraph->DispatchToMainThreadStableState(NS_NewRunnableFunction(
+          "VideoOutput::NotifyRemoved",
+          [this, self = RefPtr(this)] { mAttachment = State::Detached; }));
+    }
+    if (mFrames.Length() <= 1) {
+      mFrames.ClearAndRetainStorage();
+      mVideoFrameContainer->ClearFutureFrames();
+      return;
+    }
+
+    DropPastFrames();
+    mFrames.RemoveLastElements(mFrames.Length() - 1);
+    SendFrames();
+    mFrames.ClearAndRetainStorage();
+  }
+  void NotifyEnded(MediaTrackGraph* aGraph) override {
+    if (mFrames.IsEmpty()) {
+      return;
+    }
+
+    mFrames.RemoveElementsAt(0, mFrames.Length() - 1);
+    SendFrames();
+    mFrames.ClearAndRetainStorage();
+  }
+  void NotifyEnabledStateChanged(MediaTrackGraph* aGraph,
+                                 bool aEnabled) override {
+    MutexAutoLock lock(mMutex);
+    mEnabled = aEnabled;
+    DropPastFrames();
+    if (mEnabled) {
+      mDisabledBlackImageSent = false;
+    }
+    if (!mEnabled || mFrames.Length() > 1) {
+      for (auto& idChunkPair : mFrames) {
+        idChunkPair.first = NewFrameID();
+      }
+      if (mFrames.IsEmpty()) {
+        VideoSegment v;
+        v.AppendFrame(nullptr, gfx::IntSize(640, 480), PRINCIPAL_HANDLE_NONE,
+                      true, TimeStamp::Now());
+        mFrames.AppendElement(std::make_pair(NewFrameID(), *v.GetLastChunk()));
+      }
+      SendFramesEnsureLocked();
+    }
+  }
+
+  Mutex mMutex MOZ_UNANNOTATED;
+  TimeStamp mLastFrameTime;
+  RefPtr<Image> mBlackImage;
+  bool mDisabledBlackImageSent = false;
+  bool mEnabled = true;
+  nsTArray<std::pair<ImageContainer::FrameID, VideoChunk>> mFrames;
+  FrameID mFrameID = 0;
+  const RefPtr<VideoFrameContainer> mVideoFrameContainer;
+  const RefPtr<AbstractThread> mMainThread;
+  const ProducerID mProducerID = ImageContainer::AllocateProducerID();
+
+  enum class State : uint8_t { Attached, Detaching, Detached };
+  Watchable<State> mAttachment = {State::Detached, "VideoOutput::mAttachment"};
+};
+
+class FirstFrameVideoOutput : public VideoOutput {
+ public:
+  FirstFrameVideoOutput(VideoFrameContainer* aContainer,
+                        AbstractThread* aMainThread)
+      : VideoOutput(aContainer, aMainThread) {
+    MOZ_ASSERT(NS_IsMainThread());
+  }
+
+  void NotifyRealtimeTrackData(MediaTrackGraph* aGraph, TrackTime aTrackOffset,
+                               const MediaSegment& aMedia) override {
+    MOZ_ASSERT(aMedia.GetType() == MediaSegment::VIDEO);
+
+    if (mInitialSizeFound) {
+      return;
+    }
+
+    const VideoSegment& video = static_cast<const VideoSegment&>(aMedia);
+    for (VideoSegment::ConstChunkIterator c(video); !c.IsEnded(); c.Next()) {
+      if (c->mFrame.GetIntrinsicSize() != gfx::IntSize(0, 0)) {
+        mInitialSizeFound = true;
+
+        mMainThread->Dispatch(NS_NewRunnableFunction(
+            "FirstFrameVideoOutput::FirstFrameRenderedSetter",
+            [self = RefPtr<FirstFrameVideoOutput>(this)] {
+              self->mFirstFrameRendered = true;
+            }));
+
+        VideoSegment segment;
+        segment.AppendFrame(*c);
+        VideoOutput::NotifyRealtimeTrackData(aGraph, aTrackOffset, segment);
+        return;
+      }
+    }
+  }
+
+  Watchable<bool> mFirstFrameRendered = {
+      false, "FirstFrameVideoOutput::mFirstFrameRendered"};
+
+ private:
+  bool mInitialSizeFound = false;
+};
+
+}  
+
+#endif  // VideoOutput_h

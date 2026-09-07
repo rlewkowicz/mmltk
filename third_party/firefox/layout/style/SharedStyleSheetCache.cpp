@@ -1,0 +1,277 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "SharedStyleSheetCache.h"
+
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/ServoBindings.h"
+#include "mozilla/StoragePrincipalHelper.h"
+#include "mozilla/StyleSheet.h"
+#include "mozilla/css/SheetLoadData.h"
+#include "mozilla/dom/ContentParent.h"
+#include "mozilla/dom/Document.h"
+#include "nsContentUtils.h"
+#include "nsXULPrototypeCache.h"
+
+extern mozilla::LazyLogModule sCssLoaderLog;
+
+#define LOG(...) MOZ_LOG(sCssLoaderLog, mozilla::LogLevel::Debug, (__VA_ARGS__))
+
+namespace mozilla {
+
+NS_IMPL_ISUPPORTS(SharedStyleSheetCache, nsIMemoryReporter, nsIObserver)
+
+MOZ_DEFINE_MALLOC_SIZE_OF(SharedStyleSheetCacheMallocSizeOf)
+
+SharedStyleSheetCache::SharedStyleSheetCache() = default;
+
+void SharedStyleSheetCache::Init() {
+  RegisterWeakMemoryReporter(this);
+  auto ClearCache = [](const char*, void*) { Clear(); };
+  Preferences::RegisterPrefixCallback(ClearCache, "layout.css.");
+}
+
+SharedStyleSheetCache::~SharedStyleSheetCache() {
+  UnregisterWeakMemoryReporter(this);
+}
+
+void SharedStyleSheetCache::LoadCompleted(SharedStyleSheetCache* aCache,
+                                          StyleSheetLoadData& aData,
+                                          nsresult aStatus) {
+  nsresult cancelledStatus = aStatus;
+  if (NS_FAILED(aStatus)) {
+    css::Loader::MarkLoadTreeFailed(aData);
+  } else {
+    cancelledStatus = NS_BINDING_ABORTED;
+    css::SheetLoadData* data = &aData;
+    do {
+      if (data->IsCancelled()) {
+        css::Loader::MarkLoadTreeFailed(*data, data->mLoader);
+      }
+    } while ((data = data->mNext));
+  }
+
+  AutoTArray<RefPtr<css::SheetLoadData>, 8> datasToNotify;
+  LoadCompletedInternal(aCache, aData, datasToNotify);
+
+  for (RefPtr<css::SheetLoadData>& data : datasToNotify) {
+    auto status = data->IsCancelled() ? cancelledStatus : aStatus;
+    data->mLoader->NotifyObservers(*data, status);
+  }
+}
+
+void SharedStyleSheetCache::InsertIfNeeded(css::SheetLoadData& aData) {
+  MOZ_ASSERT(aData.mLoader->IsDocumentAssociated(),
+             "We only cache document-associated sheets");
+  LOG("SharedStyleSheetCache::InsertIfNeeded");
+  if (aData.mLoadFailed) {
+    LOG("  Load failed, bailing");
+    return;
+  }
+
+  if (aData.mSheetAlreadyComplete) {
+    LOG("  Sheet came from the cache, bailing");
+    return;
+  }
+
+  if (!aData.mURI) {
+    LOG("  Inline or constructable style sheet, bailing");
+    return;
+  }
+
+  LOG("  Putting style sheet in shared cache: %s",
+      aData.mURI->GetSpecOrDefault().get());
+  Insert(aData);
+}
+
+void SharedStyleSheetCache::LoadCompletedInternal(
+    SharedStyleSheetCache* aCache, css::SheetLoadData& aData,
+    nsTArray<RefPtr<css::SheetLoadData>>& aDatasToNotify) {
+  if (aCache) {
+    aCache->LoadCompleted(aData);
+  }
+
+  auto* data = &aData;
+  auto* networkMetadata = aData.GetNetworkMetadata();
+  do {
+    MOZ_RELEASE_ASSERT(!data->mSheetCompleteCalled);
+    data->mSheetCompleteCalled = true;
+
+    if (!data->mNetworkMetadata) {
+      data->mNetworkMetadata = networkMetadata;
+    }
+
+    if (!data->mSheetAlreadyComplete) {
+
+      MOZ_ASSERT(data->mSheet->IsConstructed() ||
+                     !data->mSheet->HasForcedUniqueInner(),
+                 "should not get a forced unique inner during parsing");
+      const bool needInsertIntoTree = [&] {
+        if (!data->mLoader->GetDocument()) {
+          return false;
+        }
+        if (data->IsPreload()) {
+          return false;
+        }
+        if (data->mSheet->IsConstructed()) {
+          return false;
+        }
+        if (data->mIsChildSheet) {
+          return false;
+        }
+        if (data->mHadOwnerNode != !!data->mSheet->GetOwnerNode()) {
+          return false;
+        }
+        return true;
+      }();
+
+      if (needInsertIntoTree) {
+        data->mLoader->InsertSheetInTree(*data->mSheet);
+      }
+      data->mSheet->SetComplete();
+    } else if (data->mSheet->IsApplicable()) {
+      if (dom::Document* doc = data->mLoader->GetDocument()) {
+        doc->PostStyleSheetApplicableStateChangeEvent(*data->mSheet);
+      }
+    }
+    aDatasToNotify.AppendElement(data);
+
+    NS_ASSERTION(!data->mParentData || data->mParentData->mPendingChildren != 0,
+                 "Broken pending child count on our parent");
+
+    if (data->mParentData && --(data->mParentData->mPendingChildren) == 0 &&
+        !data->mParentData->mIsBeingParsed) {
+      LoadCompletedInternal(aCache, *data->mParentData, aDatasToNotify);
+    }
+
+    data = data->mNext;
+  } while (data);
+
+  if (aCache) {
+    aCache->InsertIfNeeded(aData);
+  }
+}
+
+size_t SharedStyleSheetCache::SizeOfIncludingThis(
+    MallocSizeOf aMallocSizeOf) const {
+  size_t n = aMallocSizeOf(this);
+  n += Base::SizeOfExcludingThis(aMallocSizeOf);
+  n += mInlineSheets.ShallowSizeOfExcludingThis(aMallocSizeOf);
+  for (const auto& sheetMap : mInlineSheets) {
+    for (const auto& entry : sheetMap.GetData()) {
+      n += entry.GetKey().SizeOfExcludingThisIfUnshared(aMallocSizeOf);
+      n += entry.GetData().ShallowSizeOfExcludingThis(aMallocSizeOf);
+      for (const auto& candidate : entry.GetData()) {
+        n += candidate.mSheet->SizeOfIncludingThis(aMallocSizeOf);
+      }
+    }
+  }
+  return n;
+}
+
+NS_IMETHODIMP
+SharedStyleSheetCache::CollectReports(nsIHandleReportCallback* aHandleReport,
+                                      nsISupports* aData, bool aAnonymize) {
+  MOZ_COLLECT_REPORT("explicit/layout/style-sheet-cache/document-shared",
+                     KIND_HEAP, UNITS_BYTES,
+                     SizeOfIncludingThis(SharedStyleSheetCacheMallocSizeOf),
+                     "Memory used for SharedStyleSheetCache to share style "
+                     "sheets across documents (not to be confused with "
+                     "GlobalStyleSheetCache)");
+  return NS_OK;
+}
+
+void SharedStyleSheetCache::ClearInProcess(
+    const Maybe<bool>& aChrome, const Maybe<nsCOMPtr<nsIPrincipal>>& aPrincipal,
+    const Maybe<nsCString>& aSchemelessSite,
+    const Maybe<OriginAttributesPattern>& aPattern,
+    const Maybe<nsCString>& aURL) {
+  Base::ClearInProcess(aChrome, aPrincipal, aSchemelessSite, aPattern, aURL);
+  if (!aChrome && !aPrincipal && !aSchemelessSite && !aURL) {
+    mInlineSheets.Clear();
+  }
+  if (aURL) {
+    return;
+  }
+
+  for (auto iter = mInlineSheets.Iter(); !iter.Done(); iter.Next()) {
+    if (SharedSubResourceCacheUtils::ShouldClearEntry(
+            nullptr, iter.Key(), aChrome, aPrincipal, aSchemelessSite, aPattern,
+            aURL)) {
+      iter.Remove();
+    }
+  }
+}
+
+void SharedStyleSheetCache::Clear(
+    const Maybe<bool>& aChrome, const Maybe<nsCOMPtr<nsIPrincipal>>& aPrincipal,
+    const Maybe<nsCString>& aSchemelessSite,
+    const Maybe<OriginAttributesPattern>& aPattern,
+    const Maybe<nsCString>& aURL) {
+  using ContentParent = dom::ContentParent;
+
+  if (XRE_IsParentProcess()) {
+    for (auto* cp : ContentParent::AllProcesses(ContentParent::eLive)) {
+      (void)cp->SendClearStyleSheetCache(aChrome, aPrincipal, aSchemelessSite,
+                                         aPattern, aURL);
+    }
+  }
+
+  if (sSingleton) {
+    sSingleton->ClearInProcess(aChrome, aPrincipal, aSchemelessSite, aPattern,
+                               aURL);
+  }
+}
+
+void SharedStyleSheetCache::GC() {
+  MOZ_ASSERT(mGCScheduled);
+  for (auto iter = mInlineSheets.Iter(); !iter.Done(); iter.Next()) {
+    for (auto subiter = iter.Data().Iter(); !subiter.Done(); subiter.Next()) {
+      subiter.Data().RemoveElementsBy([](InlineSheetEntry& aEntry) {
+        return aEntry.mSheet->HasUniqueInner();
+      });
+      if (subiter.Data().IsEmpty()) {
+        subiter.Remove();
+      }
+    }
+    if (iter.Data().IsEmpty()) {
+      iter.Remove();
+    }
+  }
+
+  for (auto iter = mComplete.Iter(); !iter.Done(); iter.Next()) {
+    if (iter.Data().mResource->HasUniqueInner()) {
+      iter.Remove();
+    }
+  }
+  mGCScheduled = false;
+}
+
+void SharedStyleSheetCache::DoScheduleGC() {
+  MOZ_ASSERT(!mGCScheduled);
+  if (!mGCTimer) {
+    mGCTimer = NS_NewTimer();
+  }
+  mGCScheduled = NS_SUCCEEDED(mGCTimer->InitWithNamedFuncCallback(
+      [](nsITimer*, void*) {
+        if (sSingleton) {
+          sSingleton->mGCScheduled =
+              NS_SUCCEEDED(NS_DispatchToCurrentThreadQueue(
+                  NS_NewRunnableFunction("SharedStyleSheetCache GC Idle",
+                                         [] {
+                                           if (sSingleton) {
+                                             sSingleton->GC();
+                                           }
+                                         }),
+                  EventQueuePriority::Idle));
+        }
+      },
+      nullptr, StaticPrefs::layout_css_stylesheet_cache_timeout_ms(),
+      nsITimer::TYPE_ONE_SHOT_LOW_PRIORITY,
+      "SharedStyleSheetCache::GC timer"_ns));
+}
+
+}  
+
+#undef LOG

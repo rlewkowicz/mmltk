@@ -1,0 +1,144 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_KeyEventHandler_h_
+#define mozilla_KeyEventHandler_h_
+
+#include "js/TypeDecls.h"
+#include "mozilla/EventForwards.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/ShortcutKeys.h"
+#include "nsAtom.h"
+#include "nsCOMPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsIController.h"
+#include "nsIWeakReference.h"
+#include "nsString.h"
+
+namespace mozilla {
+
+namespace layers {
+class KeyboardShortcut;
+}  
+
+struct IgnoreModifierState;
+
+namespace dom {
+class Event;
+class UIEvent;
+class Element;
+class EventTarget;
+class KeyboardEvent;
+class Element;
+}  
+
+enum ReservedKey : uint8_t {
+  ReservedKey_False = 0,
+  ReservedKey_True = 1,
+  ReservedKey_Unset = 2,
+};
+
+class KeyEventHandler final {
+ public:
+  explicit KeyEventHandler(dom::Element* aHandlerElement,
+                           ReservedKey aReserved);
+
+  explicit KeyEventHandler(ShortcutKeyData* aKeyData);
+
+  ~KeyEventHandler();
+
+  bool TryConvertToKeyboardShortcut(layers::KeyboardShortcut* aOut) const;
+
+  bool EventTypeEquals(nsAtom* aEventType) const {
+    return mEventName == aEventType;
+  }
+
+  bool KeyEventMatched(dom::KeyboardEvent* aDomKeyboardEvent,
+                       uint32_t aCharCode,
+                       const IgnoreModifierState& aIgnoreModifierState);
+
+  bool KeyElementIsDisabled() const;
+
+  already_AddRefed<dom::Element> GetHandlerElement() const;
+
+  ReservedKey GetIsReserved() { return mReserved; }
+
+  KeyEventHandler* GetNextHandler() { return mNextHandler; }
+  void SetNextHandler(KeyEventHandler* aHandler) { mNextHandler = aHandler; }
+
+  MOZ_CAN_RUN_SCRIPT
+  nsresult ExecuteHandler(dom::EventTarget* aTarget, dom::Event* aEvent);
+
+  size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf) const;
+
+  void GetCommand(nsAString& aCommand) const;
+
+ public:
+  static uint32_t gRefCnt;
+
+ protected:
+  void Init() { ++gRefCnt; }
+
+  already_AddRefed<nsIController> GetController(dom::EventTarget* aTarget);
+
+  inline int32_t GetMatchingKeyCode(const nsAString& aKeyName);
+  void ConstructPrototype(dom::Element* aKeyElement,
+                          const char16_t* aEvent = nullptr,
+                          const char16_t* aCommand = nullptr,
+                          const char16_t* aKeyCode = nullptr,
+                          const char16_t* aCharCode = nullptr,
+                          const char16_t* aModifiers = nullptr);
+  void BuildModifiers(nsAString& aModifiers);
+
+  void ReportKeyConflict(const char16_t* aKey, const char16_t* aModifiers,
+                         dom::Element* aKeyElement, const char* aMessageName);
+  void GetEventType(nsAString& aEvent);
+  bool ModifiersMatchMask(dom::UIEvent* aEvent,
+                          const IgnoreModifierState& aIgnoreModifierState);
+  MOZ_CAN_RUN_SCRIPT
+  nsresult DispatchXBLCommand(dom::EventTarget* aTarget, dom::Event* aEvent);
+  MOZ_CAN_RUN_SCRIPT
+  nsresult DispatchXULKeyCommand(dom::Event* aEvent);
+
+  Modifiers GetModifiers() const;
+  Modifiers GetModifiersMask() const;
+
+  static int32_t KeyToMask(uint32_t aKey);
+  static int32_t AccelKeyMask();
+
+  static const int32_t cShift;
+  static const int32_t cAlt;
+  static const int32_t cControl;
+  static const int32_t cMeta;
+
+  static const int32_t cShiftMask;
+  static const int32_t cAltMask;
+  static const int32_t cControlMask;
+  static const int32_t cMetaMask;
+
+  static const int32_t cAllModifiers;
+
+ protected:
+  union {
+    nsIWeakReference*
+        mHandlerElement;  
+    char16_t* mCommand;   
+  };
+
+  bool mIsXULKey;  
+  uint8_t mMisc;   
+
+  ReservedKey mReserved;  
+
+  int32_t mKeyMask;  
+
+  int32_t mDetail;  
+
+  KeyEventHandler* mNextHandler;
+  RefPtr<nsAtom> mEventName;  
+};
+
+}  
+
+#endif

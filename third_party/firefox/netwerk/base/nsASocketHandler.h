@@ -1,0 +1,49 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsASocketHandler_h_
+#define nsASocketHandler_h_
+
+#include "mozilla/OriginAttributes.h"
+#include "nsError.h"
+#include "nsINetAddr.h"
+#include "nsISupports.h"
+#include "prio.h"
+
+
+class nsASocketHandler : public nsISupports {
+ public:
+  nsASocketHandler() = default;
+
+  nsresult mCondition{NS_OK};
+
+  uint16_t mPollFlags{0};
+
+  uint16_t mPollTimeout{UINT16_MAX};
+
+  mozilla::OriginAttributes mOriginAttributes;
+
+  virtual void OnSocketReady(PRFileDesc* fd, int16_t outFlags) = 0;
+
+  virtual void OnSocketDetached(PRFileDesc* fd) = 0;
+
+  virtual void IsLocal(bool* aIsLocal) = 0;
+
+  virtual void KeepWhenOffline(bool* aKeepWhenOffline) {
+    *aKeepWhenOffline = false;
+  }
+
+  virtual void OnKeepaliveEnabledPrefChange(bool aEnabled) {}
+
+  virtual nsresult GetRemoteAddr(mozilla::net::NetAddr* addr) {
+    return NS_ERROR_NOT_IMPLEMENTED;
+  }
+
+  virtual uint64_t ByteCountSent() = 0;
+  virtual uint64_t ByteCountReceived() = 0;
+
+  virtual bool IsTRRConnection() { return false; }
+};
+
+#endif  // !nsASocketHandler_h_

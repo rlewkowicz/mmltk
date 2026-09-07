@@ -1,0 +1,144 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_SharedWorkerManager_h
+#define mozilla_dom_SharedWorkerManager_h
+
+#include "SharedWorkerParent.h"
+#include "mozilla/dom/RemoteWorkerController.h"
+#include "mozilla/dom/quota/CheckedUnsafePtr.h"
+#include "nsISupportsImpl.h"
+#include "nsTArray.h"
+
+class nsIPrincipal;
+
+namespace mozilla::dom {
+
+class UniqueMessagePortId;
+class RemoteWorkerData;
+class SharedWorkerManager;
+class SharedWorkerService;
+
+class SharedWorkerManagerHolder final
+    : public SupportsCheckedUnsafePtr<CheckIf<DiagnosticAssertEnabled>> {
+ public:
+  NS_INLINE_DECL_REFCOUNTING(SharedWorkerManagerHolder);
+
+  SharedWorkerManagerHolder(SharedWorkerManager* aManager,
+                            SharedWorkerService* aService);
+
+  SharedWorkerManager* Manager() const { return mManager; }
+
+  SharedWorkerService* Service() const { return mService; }
+
+ private:
+  ~SharedWorkerManagerHolder();
+
+  const RefPtr<SharedWorkerManager> mManager;
+  const RefPtr<SharedWorkerService> mService;
+};
+
+class SharedWorkerManagerWrapper final {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(SharedWorkerManagerWrapper);
+
+  explicit SharedWorkerManagerWrapper(
+      already_AddRefed<SharedWorkerManagerHolder> aHolder);
+
+  SharedWorkerManager* Manager() const { return mHolder->Manager(); }
+
+ private:
+  ~SharedWorkerManagerWrapper();
+
+  RefPtr<SharedWorkerManagerHolder> mHolder;
+};
+
+class SharedWorkerManager final : public RemoteWorkerObserver {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(SharedWorkerManager, override);
+
+
+  static already_AddRefed<SharedWorkerManagerHolder> Create(
+      SharedWorkerService* aService, nsIEventTarget* aPBackgroundEventTarget,
+      const RemoteWorkerData& aData, nsIPrincipal* aLoadingPrincipal,
+      const OriginAttributes& aEffectiveStoragePrincipalAttrs);
+
+  already_AddRefed<SharedWorkerManagerHolder> MatchOnMainThread(
+      SharedWorkerService* aService, const RemoteWorkerData& aData,
+      nsIURI* aScriptURL, nsIPrincipal* aLoadingPrincipal,
+      const OriginAttributes& aEffectiveStoragePrincipalAttrs,
+      bool* aMatchNameButNotOptions);
+
+
+  void CreationFailed() override;
+
+  void CreationSucceeded() override;
+
+  void ErrorReceived(const ErrorValue& aValue) override;
+
+  void LockNotified(bool aCreated) final;
+
+  void WebTransportNotified(bool aCreated) final;
+
+  void Terminated() override;
+
+
+  bool MaybeCreateRemoteWorker(const RemoteWorkerData& aData,
+                               uint64_t aWindowID,
+                               UniqueMessagePortId& aPortIdentifier,
+                               base::ProcessId aProcessId);
+
+  void AddActor(SharedWorkerParent* aParent);
+
+  void RemoveActor(SharedWorkerParent* aParent);
+
+  void UpdateSuspend();
+
+  void UpdateFrozen();
+
+  void SetLocaleOverride(const nsACString& aLanguageOverride,
+                         const nsTArray<nsString>& aLanguages);
+
+  void UpdateTimezoneOverride(const nsAString& aTimezoneOverride);
+
+  bool IsSecureContext() const;
+
+  void Terminate();
+
+
+  void RegisterHolder(SharedWorkerManagerHolder* aHolder);
+
+  void UnregisterHolder(SharedWorkerManagerHolder* aHolder);
+
+ private:
+  SharedWorkerManager(nsIEventTarget* aPBackgroundEventTarget,
+                      const RemoteWorkerData& aData,
+                      nsIPrincipal* aLoadingPrincipal,
+                      const OriginAttributes& aEffectiveStoragePrincipalAttrs);
+
+  ~SharedWorkerManager();
+
+  nsCOMPtr<nsIEventTarget> mPBackgroundEventTarget;
+
+  nsCOMPtr<nsIPrincipal> mLoadingPrincipal;
+  const nsCString mDomain;
+  const OriginAttributes mEffectiveStoragePrincipalAttrs;
+  const nsCOMPtr<nsIURI> mResolvedScriptURL;
+  const WorkerOptions mWorkerOptions;
+  const bool mIsSecureContext;
+  bool mSuspended;
+  bool mFrozen;
+  uint32_t mLockCount = 0;
+  uint32_t mWebTransportCount = 0;
+
+  nsTArray<CheckedUnsafePtr<SharedWorkerParent>> mActors;
+
+  RefPtr<RemoteWorkerController> mRemoteWorkerController;
+
+  nsTArray<CheckedUnsafePtr<SharedWorkerManagerHolder>> mHolders;
+};
+
+}  
+
+#endif  // mozilla_dom_SharedWorkerManager_h

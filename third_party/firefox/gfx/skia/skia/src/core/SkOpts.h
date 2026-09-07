@@ -1,0 +1,42 @@
+/*
+ * Copyright 2015 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkOpts_DEFINED)
+#define SkOpts_DEFINED
+
+#include "include/private/base/SkSpan_impl.h"
+#include "src/core/SkRasterPipelineOpList.h"
+
+#include <cstddef>
+#include <cstdint>
+
+namespace SkRasterPipelineContexts {
+struct MemoryCtxPatch;
+}
+
+
+struct SkRasterPipelineStage;
+
+namespace SkOpts {
+    void Init();
+
+    using StageFn = void(*)(void);
+    extern StageFn ops_highp[kNumRasterPipelineHighpOps], just_return_highp;
+    extern StageFn ops_lowp [kNumRasterPipelineLowpOps ], just_return_lowp;
+
+    extern void (*start_pipeline_highp)(size_t,size_t,size_t,size_t, SkRasterPipelineStage*,
+                                        SkSpan<SkRasterPipelineContexts::MemoryCtxPatch>,
+                                        uint8_t*);
+    extern void (*start_pipeline_lowp )(size_t,size_t,size_t,size_t, SkRasterPipelineStage*,
+                                        SkSpan<SkRasterPipelineContexts::MemoryCtxPatch>,
+                                        uint8_t*);
+
+    extern size_t raster_pipeline_lowp_stride;
+    extern size_t raster_pipeline_highp_stride;
+}  
+
+#endif

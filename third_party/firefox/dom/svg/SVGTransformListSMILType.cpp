@@ -1,0 +1,240 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "SVGTransformListSMILType.h"
+
+#include <math.h>
+
+#include "SVGTransform.h"
+#include "SVGTransformList.h"
+#include "mozilla/SMILValue.h"
+#include "nsCRT.h"
+
+using namespace mozilla::dom::SVGTransform_Binding;
+
+namespace mozilla {
+
+using TransformArray = FallibleTArray<SVGTransformSMILData>;
+
+
+void SVGTransformListSMILType::InitValue(SMILValue& aValue) const {
+  MOZ_ASSERT(aValue.IsNull(), "Unexpected value type");
+
+  aValue.mU.mPtr = new TransformArray(1);
+  aValue.mType = this;
+}
+
+void SVGTransformListSMILType::DestroyValue(SMILValue& aValue) const {
+  MOZ_ASSERT(aValue.mType == this, "Unexpected SMIL value type");
+  TransformArray* params = static_cast<TransformArray*>(aValue.mU.mPtr);
+  delete params;
+  aValue.mU.mPtr = nullptr;
+  aValue.mType = SMILNullType::Singleton();
+}
+
+nsresult SVGTransformListSMILType::Assign(SMILValue& aDest,
+                                          const SMILValue& aSrc) const {
+  MOZ_ASSERT(aDest.mType == aSrc.mType, "Incompatible SMIL types");
+  MOZ_ASSERT(aDest.mType == this, "Unexpected SMIL value");
+
+  const TransformArray* srcTransforms =
+      static_cast<const TransformArray*>(aSrc.mU.mPtr);
+  TransformArray* dstTransforms = static_cast<TransformArray*>(aDest.mU.mPtr);
+  if (!dstTransforms->Assign(*srcTransforms, fallible)) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+
+  return NS_OK;
+}
+
+bool SVGTransformListSMILType::IsEqual(const SMILValue& aLeft,
+                                       const SMILValue& aRight) const {
+  MOZ_ASSERT(aLeft.mType == aRight.mType, "Incompatible SMIL types");
+  MOZ_ASSERT(aLeft.mType == this, "Unexpected SMIL type");
+
+  const TransformArray& leftArr(
+      *static_cast<const TransformArray*>(aLeft.mU.mPtr));
+  const TransformArray& rightArr(
+      *static_cast<const TransformArray*>(aRight.mU.mPtr));
+
+  return leftArr == rightArr;
+}
+
+nsresult SVGTransformListSMILType::Add(SMILValue& aDest,
+                                       const SMILValue& aValueToAdd,
+                                       uint32_t aCount) const {
+  MOZ_ASSERT(aDest.mType == this, "Unexpected SMIL type");
+  MOZ_ASSERT(aDest.mType == aValueToAdd.mType, "Incompatible SMIL types");
+
+  TransformArray& dstTransforms(*static_cast<TransformArray*>(aDest.mU.mPtr));
+  const TransformArray& srcTransforms(
+      *static_cast<const TransformArray*>(aValueToAdd.mU.mPtr));
+
+  NS_ASSERTION(srcTransforms.Length() == 1,
+               "Invalid source transform list to add");
+
+  NS_ASSERTION(dstTransforms.Length() < 2,
+               "Invalid dest transform list to add to");
+
+  const SVGTransformSMILData& srcTransform = srcTransforms[0];
+  if (dstTransforms.IsEmpty()) {
+    SVGTransformSMILData* result = dstTransforms.AppendElement(
+        SVGTransformSMILData(srcTransform.TransformType()), fallible);
+    NS_ENSURE_TRUE(result, NS_ERROR_OUT_OF_MEMORY);
+  }
+  SVGTransformSMILData& dstTransform = dstTransforms[0];
+
+  NS_ASSERTION(srcTransform.TransformType() == dstTransform.TransformType(),
+               "Trying to perform simple add of different transform types");
+
+  NS_ASSERTION(srcTransform.TransformType() != SVG_TRANSFORM_MATRIX,
+               "Trying to perform simple add with matrix transform");
+
+  for (size_t i = 0; i < SVGTransformSMILData::kNumSimpleParams; ++i) {
+    dstTransform[i] += srcTransform[i] * aCount;
+  }
+
+  return NS_OK;
+}
+
+nsresult SVGTransformListSMILType::SandwichAdd(
+    SMILValue& aDest, const SMILValue& aValueToAdd) const {
+  MOZ_ASSERT(aDest.mType == this, "Unexpected SMIL type");
+  MOZ_ASSERT(aDest.mType == aValueToAdd.mType, "Incompatible SMIL types");
+
+
+  TransformArray& dstTransforms(*static_cast<TransformArray*>(aDest.mU.mPtr));
+  const TransformArray& srcTransforms(
+      *static_cast<const TransformArray*>(aValueToAdd.mU.mPtr));
+
+  NS_ASSERTION(srcTransforms.Length() < 2,
+               "Trying to do sandwich add of more than one value");
+
+  if (srcTransforms.IsEmpty()) return NS_OK;
+
+  const SVGTransformSMILData& srcTransform = srcTransforms[0];
+  SVGTransformSMILData* result =
+      dstTransforms.AppendElement(srcTransform, fallible);
+  NS_ENSURE_TRUE(result, NS_ERROR_OUT_OF_MEMORY);
+
+  return NS_OK;
+}
+
+nsresult SVGTransformListSMILType::ComputeDistance(const SMILValue& aFrom,
+                                                   const SMILValue& aTo,
+                                                   double& aDistance) const {
+  MOZ_ASSERT(aFrom.mType == aTo.mType,
+             "Can't compute difference between different SMIL types");
+  MOZ_ASSERT(aFrom.mType == this, "Unexpected SMIL type");
+
+  const TransformArray* fromTransforms =
+      static_cast<const TransformArray*>(aFrom.mU.mPtr);
+  const TransformArray* toTransforms =
+      static_cast<const TransformArray*>(aTo.mU.mPtr);
+
+  NS_ASSERTION(fromTransforms->Length() == 1,
+               "Wrong number of elements in from value");
+  NS_ASSERTION(toTransforms->Length() == 1,
+               "Wrong number of elements in to value");
+
+  return (*fromTransforms)[0].Distance((*toTransforms)[0], aDistance);
+}
+
+nsresult SVGTransformListSMILType::Interpolate(const SMILValue& aStartVal,
+                                               const SMILValue& aEndVal,
+                                               double aUnitDistance,
+                                               SMILValue& aResult) const {
+  MOZ_ASSERT(aStartVal.mType == aEndVal.mType,
+             "Can't interpolate between different SMIL types");
+  MOZ_ASSERT(aStartVal.mType == this, "Unexpected type for interpolation");
+  MOZ_ASSERT(aResult.mType == this, "Unexpected result type");
+
+  const TransformArray& startTransforms =
+      (*static_cast<const TransformArray*>(aStartVal.mU.mPtr));
+  const TransformArray& endTransforms(
+      *static_cast<const TransformArray*>(aEndVal.mU.mPtr));
+
+  NS_ASSERTION(endTransforms.Length() == 1,
+               "Invalid end-point for interpolating between transform values");
+
+  const SVGTransformSMILData& endTransform = endTransforms[0];
+  NS_ASSERTION(endTransform.TransformType() != SVG_TRANSFORM_MATRIX,
+               "End point for interpolation should not be a matrix transform");
+
+  bool transformed = false;
+  SVGTransformSMILData::SimpleParams newParams;
+
+  if (startTransforms.Length() == 1) {
+    const SVGTransformSMILData& startTransform = startTransforms[0];
+    if (startTransform.TransformType() == endTransform.TransformType()) {
+      for (size_t i = 0; i < newParams.size(); ++i) {
+        newParams[i] =
+            std::lerp(startTransform[i], endTransform[i], aUnitDistance);
+      }
+      transformed = true;
+    }
+  }
+  if (!transformed) {
+    for (size_t i = 0; i < newParams.size(); ++i) {
+      newParams[i] = endTransform[i] * aUnitDistance;
+    }
+  }
+
+  SVGTransformSMILData resultTransform(endTransform.TransformType(), newParams);
+
+  TransformArray& dstTransforms =
+      (*static_cast<TransformArray*>(aResult.mU.mPtr));
+  dstTransforms.Clear();
+
+  SVGTransformSMILData* transform =
+      dstTransforms.AppendElement(resultTransform, fallible);
+  NS_ENSURE_TRUE(transform, NS_ERROR_OUT_OF_MEMORY);
+
+  return NS_OK;
+}
+
+
+nsresult SVGTransformListSMILType::AppendTransform(
+    const SVGTransformSMILData& aTransform, SMILValue& aValue) {
+  MOZ_ASSERT(aValue.mType == Singleton(), "Unexpected SMIL value type");
+
+  TransformArray& transforms = *static_cast<TransformArray*>(aValue.mU.mPtr);
+  return transforms.AppendElement(aTransform, fallible)
+             ? NS_OK
+             : NS_ERROR_OUT_OF_MEMORY;
+}
+
+bool SVGTransformListSMILType::AppendTransforms(const SVGTransformList& aList,
+                                                SMILValue& aValue) {
+  MOZ_ASSERT(aValue.mType == Singleton(), "Unexpected SMIL value type");
+
+  TransformArray& transforms = *static_cast<TransformArray*>(aValue.mU.mPtr);
+
+  if (!transforms.SetCapacity(transforms.Length() + aList.Length(), fallible))
+    return false;
+
+  for (uint32_t i = 0; i < aList.Length(); ++i) {
+    MOZ_ALWAYS_TRUE(
+        transforms.AppendElement(SVGTransformSMILData(aList[i]), fallible));
+  }
+  return true;
+}
+
+bool SVGTransformListSMILType::GetTransforms(
+    const SMILValue& aValue, FallibleTArray<SVGTransform>& aTransforms) {
+  MOZ_ASSERT(aValue.mType == Singleton(), "Unexpected SMIL value type");
+
+  const TransformArray& smilTransforms =
+      *static_cast<const TransformArray*>(aValue.mU.mPtr);
+
+  aTransforms.Clear();
+  if (!aTransforms.SetCapacity(smilTransforms.Length(), fallible)) return false;
+
+  for (const auto& smilTransform : smilTransforms) {
+    (void)aTransforms.AppendElement(smilTransform.ToSVGTransform(), fallible);
+  }
+  return true;
+}
+
+}  

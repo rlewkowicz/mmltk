@@ -1,0 +1,264 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SVG_SVGGEOMETRYPROPERTY_H_
+#define DOM_SVG_SVGGEOMETRYPROPERTY_H_
+
+#include <type_traits>
+
+#include "ComputedStyle.h"
+#include "SVGAnimatedLength.h"
+#include "mozilla/SVGImageFrame.h"
+#include "mozilla/dom/SVGElement.h"
+#include "nsComputedDOMStyle.h"
+#include "nsGkAtoms.h"
+#include "nsIFrame.h"
+
+namespace mozilla::dom::SVGGeometryProperty {
+namespace ResolverTypes {
+struct LengthPercentNoAuto {};
+struct LengthPercentRXY {};
+struct LengthPercentWidthHeight {};
+}  
+
+namespace Tags {
+
+#define SVGGEOMETRYPROPERTY_GENERATETAG(tagName, resolver, axis, styleStruct) \
+  struct tagName {                                                            \
+    using ResolverType = ResolverTypes::resolver;                             \
+    constexpr static auto Axis = SVGLength::Axis::axis;                       \
+    constexpr static auto Getter = &styleStruct::m##tagName;                  \
+  }
+
+SVGGEOMETRYPROPERTY_GENERATETAG(X, LengthPercentNoAuto, X, nsStyleSVGReset);
+SVGGEOMETRYPROPERTY_GENERATETAG(Y, LengthPercentNoAuto, Y, nsStyleSVGReset);
+SVGGEOMETRYPROPERTY_GENERATETAG(Cx, LengthPercentNoAuto, X, nsStyleSVGReset);
+SVGGEOMETRYPROPERTY_GENERATETAG(Cy, LengthPercentNoAuto, Y, nsStyleSVGReset);
+SVGGEOMETRYPROPERTY_GENERATETAG(R, LengthPercentNoAuto, XY, nsStyleSVGReset);
+
+#undef SVGGEOMETRYPROPERTY_GENERATETAG
+
+using StyleSizeGetter = AnchorResolvedSize (nsStylePosition::*)(
+    const AnchorPosResolutionParams& aParams) const;
+
+struct Height;
+struct Width {
+  using ResolverType = ResolverTypes::LengthPercentWidthHeight;
+  constexpr static auto Axis = SVGLength::Axis::X;
+  constexpr static StyleSizeGetter Getter = &nsStylePosition::GetWidth;
+  constexpr static auto SizeGetter = &gfx::Size::width;
+  static AspectRatio AspectRatioRelative(AspectRatio aAspectRatio) {
+    return aAspectRatio.Inverted();
+  }
+  constexpr static uint32_t DefaultObjectSize = kFallbackIntrinsicWidthInPixels;
+  using CounterPart = Height;
+};
+struct Height {
+  using ResolverType = ResolverTypes::LengthPercentWidthHeight;
+  constexpr static auto Axis = SVGLength::Axis::Y;
+  constexpr static StyleSizeGetter Getter = &nsStylePosition::GetHeight;
+  constexpr static auto SizeGetter = &gfx::Size::height;
+  static AspectRatio AspectRatioRelative(AspectRatio aAspectRatio) {
+    return aAspectRatio;
+  }
+  constexpr static uint32_t DefaultObjectSize =
+      kFallbackIntrinsicHeightInPixels;
+  using CounterPart = Width;
+};
+
+struct Ry;
+struct Rx {
+  using ResolverType = ResolverTypes::LengthPercentRXY;
+  constexpr static auto Axis = SVGLength::Axis::X;
+  constexpr static auto Getter = &nsStyleSVGReset::mRx;
+  using CounterPart = Ry;
+};
+struct Ry {
+  using ResolverType = ResolverTypes::LengthPercentRXY;
+  constexpr static auto Axis = SVGLength::Axis::Y;
+  constexpr static auto Getter = &nsStyleSVGReset::mRy;
+  using CounterPart = Rx;
+};
+
+}  
+
+namespace details {
+template <class T>
+using AlwaysFloat = float;
+using dummy = int[];
+
+using AxisType = decltype(SVGLength::Axis::X);
+
+template <AxisType CTD>
+float ResolvePureLengthPercentage(const SVGElement* aElement,
+                                  const LengthPercentage& aLP) {
+  return aLP.ResolveToCSSPixelsWith(
+      [&] { return CSSCoord{SVGElementMetrics(aElement).GetAxisLength(CTD)}; });
+}
+
+template <class Tag>
+float ResolveImpl(ComputedStyle const& aStyle, const SVGElement* aElement,
+                  ResolverTypes::LengthPercentNoAuto) {
+  auto const& value = aStyle.StyleSVGReset()->*Tag::Getter;
+  return ResolvePureLengthPercentage<Tag::Axis>(aElement, value);
+}
+
+template <class Tag>
+float ResolveImpl(ComputedStyle const& aStyle, const SVGElement* aElement,
+                  ResolverTypes::LengthPercentWidthHeight) {
+  static_assert(
+      std::is_same<Tag, Tags::Width>{} || std::is_same<Tag, Tags::Height>{},
+      "Wrong tag");
+
+  auto const value = std::invoke(
+      Tag::Getter, aStyle.StylePosition(),
+      AnchorPosResolutionParams{nullptr, aStyle.StyleDisplay()->mPosition});
+  if (value->IsLengthPercentage()) {
+    return ResolvePureLengthPercentage<Tag::Axis>(aElement,
+                                                  value->AsLengthPercentage());
+  }
+
+  if (aElement->IsSVGElement(nsGkAtoms::image)) {
+
+    SVGImageFrame* imgf = do_QueryFrame(aElement->GetPrimaryFrame());
+    if (!imgf) {
+      return 0.f;
+    }
+
+    using Other = typename Tag::CounterPart;
+    auto const valueOther = std::invoke(
+        Other::Getter, aStyle.StylePosition(),
+        AnchorPosResolutionParams{nullptr, aStyle.StyleDisplay()->mPosition});
+
+    gfx::Size intrinsicImageSize;
+    AspectRatio aspectRatio;
+    if (!imgf->GetIntrinsicImageDimensions(intrinsicImageSize, aspectRatio)) {
+      return 0.f;
+    }
+
+    if (valueOther->IsLengthPercentage()) {
+      float lengthOther = ResolvePureLengthPercentage<Other::Axis>(
+          aElement, valueOther->AsLengthPercentage());
+
+      if (aspectRatio) {
+        return Other::AspectRatioRelative(aspectRatio)
+            .ApplyToFloat(lengthOther);
+      }
+
+      float intrinsicLength = intrinsicImageSize.*Tag::SizeGetter;
+      if (intrinsicLength >= 0) {
+        return intrinsicLength;
+      }
+
+      return Tag::DefaultObjectSize;
+    }
+
+    if (intrinsicImageSize.*Tag::SizeGetter >= 0) {
+      return intrinsicImageSize.*Tag::SizeGetter;
+    }
+
+    if (intrinsicImageSize.*Other::SizeGetter >= 0 && aspectRatio) {
+      return Other::AspectRatioRelative(aspectRatio)
+          .ApplyTo(intrinsicImageSize.*Other::SizeGetter);
+    }
+
+    if (aspectRatio) {
+      auto defaultAspectRatioRelative =
+          AspectRatio{float(Other::DefaultObjectSize) / Tag::DefaultObjectSize};
+      auto aspectRatioRelative = Tag::AspectRatioRelative(aspectRatio);
+
+      if (defaultAspectRatioRelative < aspectRatioRelative) {
+        return aspectRatioRelative.Inverted().ApplyTo(Other::DefaultObjectSize);
+      }
+
+      return Tag::DefaultObjectSize;
+    }
+
+    return Tag::DefaultObjectSize;
+  }
+
+  return 0.f;
+}
+
+template <class Tag>
+float ResolveImpl(ComputedStyle const& aStyle, const SVGElement* aElement,
+                  ResolverTypes::LengthPercentRXY) {
+  static_assert(std::is_same<Tag, Tags::Rx>{} || std::is_same<Tag, Tags::Ry>{},
+                "Wrong tag");
+
+  auto const& value = aStyle.StyleSVGReset()->*Tag::Getter;
+  if (value.IsLengthPercentage()) {
+    return ResolvePureLengthPercentage<Tag::Axis>(aElement,
+                                                  value.AsLengthPercentage());
+  }
+
+  MOZ_ASSERT(value.IsAuto());
+  using Rother = typename Tag::CounterPart;
+  auto const& valueOther = aStyle.StyleSVGReset()->*Rother::Getter;
+
+  if (valueOther.IsAuto()) {
+    return 0.f;
+  }
+
+  return ResolvePureLengthPercentage<Rother::Axis>(
+      aElement, valueOther.AsLengthPercentage());
+}
+
+}  
+
+template <class Tag>
+float ResolveWith(const ComputedStyle& aStyle, const SVGElement* aElement) {
+  return details::ResolveImpl<Tag>(aStyle, aElement,
+                                   typename Tag::ResolverType{});
+}
+
+template <class Func>
+bool DoForComputedStyle(const Element* aElement, Func aFunc) {
+  if (!aElement) {
+    return false;
+  }
+  if (const nsIFrame* f = aElement->GetPrimaryFrame()) {
+    aFunc(f->Style());
+    return true;
+  }
+
+  if (RefPtr<const ComputedStyle> computedStyle =
+          nsComputedDOMStyle::GetComputedStyleNoFlush(aElement)) {
+    aFunc(computedStyle.get());
+    return true;
+  }
+
+  return false;
+}
+
+#define SVGGEOMETRYPROPERTY_EVAL_ALL(expr) \
+  (void)details::dummy { 0, (static_cast<void>(expr), 0)... }
+
+template <class... Tags>
+bool ResolveAll(const SVGElement* aElement,
+                details::AlwaysFloat<Tags>*... aRes) {
+  bool res = DoForComputedStyle(aElement, [&](auto const* style) {
+    SVGGEOMETRYPROPERTY_EVAL_ALL(*aRes = ResolveWith<Tags>(*style, aElement));
+  });
+
+  if (res) {
+    return true;
+  }
+
+  SVGGEOMETRYPROPERTY_EVAL_ALL(*aRes = 0);
+  return false;
+}
+
+#undef SVGGEOMETRYPROPERTY_EVAL_ALL
+
+nsCSSUnit SpecifiedUnitTypeToCSSUnit(uint16_t aSpecifiedUnit);
+NonCustomCSSPropertyId AttrEnumToCSSPropId(const SVGElement* aElement,
+                                           uint8_t aAttrEnum);
+
+bool IsNonNegativeGeometryProperty(NonCustomCSSPropertyId aProp);
+bool ElementMapsLengthsToStyle(SVGElement const* aElement);
+
+}  
+
+#endif  // DOM_SVG_SVGGEOMETRYPROPERTY_H_

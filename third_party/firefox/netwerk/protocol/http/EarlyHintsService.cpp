@@ -1,0 +1,105 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "EarlyHintsService.h"
+#include "EarlyHintPreconnect.h"
+#include "EarlyHintPreloader.h"
+#include "mozilla/dom/LinkStyle.h"
+#include "mozilla/PreloadHashKey.h"
+#include "mozilla/StoragePrincipalHelper.h"
+#include "nsContentUtils.h"
+#include "nsIChannel.h"
+#include "nsICookieJarSettings.h"
+#include "nsILoadInfo.h"
+#include "nsIPrincipal.h"
+#include "nsNetUtil.h"
+#include "nsString.h"
+
+namespace mozilla::net {
+
+EarlyHintsService::EarlyHintsService()
+    : mOngoingEarlyHints(new OngoingEarlyHints()) {}
+
+EarlyHintsService::~EarlyHintsService() = default;
+
+void EarlyHintsService::EarlyHint(
+    const nsACString& aLinkHeader, nsIURI* aBaseURI, nsIChannel* aChannel,
+    const nsACString& aReferrerPolicy, const nsACString& aCSPHeader,
+    dom::CanonicalBrowsingContext* aLoadingBrowsingContext) {
+  mEarlyHintsCount++;
+  if (mFirstEarlyHint.isNothing()) {
+    mFirstEarlyHint.emplace(TimeStamp::NowLoRes());
+  } else {
+    return;
+  }
+
+  nsCOMPtr<nsILoadInfo> loadInfo = aChannel->LoadInfo();
+  if (loadInfo->GetExternalContentPolicyType() !=
+      ExtContentPolicy::TYPE_DOCUMENT) {
+    MOZ_ASSERT(false, "Early Hint on non-document channel");
+    return;
+  }
+  nsCOMPtr<nsIPrincipal> principal;
+  nsresult rv = nsContentUtils::GetSecurityManager()->GetChannelResultPrincipal(
+      aChannel, getter_AddRefs(principal));
+  NS_ENSURE_SUCCESS_VOID(rv);
+
+  nsCOMPtr<nsICookieJarSettings> cookieJarSettings;
+  if (NS_FAILED(
+          loadInfo->GetCookieJarSettings(getter_AddRefs(cookieJarSettings)))) {
+    return;
+  }
+
+  auto linkHeaders = ParseLinkHeader(NS_ConvertUTF8toUTF16(aLinkHeader));
+
+  for (auto& linkHeader : linkHeaders) {
+    if (linkHeader.mRel.LowerCaseEqualsLiteral("preconnect")) {
+      mLinkType |= dom::LinkStyle::ePRECONNECT;
+      OriginAttributes originAttributes;
+      StoragePrincipalHelper::GetOriginAttributesForNetworkState(
+          aChannel, originAttributes);
+      EarlyHintPreconnect::MaybePreconnect(linkHeader, aBaseURI,
+                                           std::move(originAttributes));
+    } else if (linkHeader.mRel.LowerCaseEqualsLiteral("preload")) {
+      mLinkType |= dom::LinkStyle::ePRELOAD;
+      EarlyHintPreloader::MaybeCreateAndInsertPreload(
+          mOngoingEarlyHints, linkHeader, aBaseURI, principal,
+          cookieJarSettings, aReferrerPolicy, aCSPHeader,
+          loadInfo->GetBrowsingContextID(), aLoadingBrowsingContext, false);
+    } else if (linkHeader.mRel.LowerCaseEqualsLiteral("modulepreload")) {
+      mLinkType |= dom::LinkStyle::eMODULE_PRELOAD;
+      EarlyHintPreloader::MaybeCreateAndInsertPreload(
+          mOngoingEarlyHints, linkHeader, aBaseURI, principal,
+          cookieJarSettings, aReferrerPolicy, aCSPHeader,
+          loadInfo->GetBrowsingContextID(), aLoadingBrowsingContext, true);
+    } else if (linkHeader.mRel.LowerCaseEqualsLiteral(
+                   "compression-dictionary")) {
+      mLinkType |= dom::LinkStyle::eCOMPRESSION_DICTIONARY;
+      EarlyHintPreloader::MaybeCreateAndInsertPreload(
+          mOngoingEarlyHints, linkHeader, aBaseURI, principal,
+          cookieJarSettings, aReferrerPolicy, aCSPHeader,
+          loadInfo->GetBrowsingContextID(), aLoadingBrowsingContext, true);
+    }
+  }
+}
+
+void EarlyHintsService::Cancel(const nsACString& aReason) {
+  Reset();
+  mOngoingEarlyHints->CancelAll(aReason);
+}
+
+void EarlyHintsService::RegisterLinksAndGetConnectArgs(
+    dom::ContentParentId aCpId, nsTArray<EarlyHintConnectArgs>& aOutLinks) {
+  mOngoingEarlyHints->RegisterLinksAndGetConnectArgs(aCpId, aOutLinks);
+}
+
+void EarlyHintsService::Reset() {
+  if (mEarlyHintsCount == 0) {
+    return;
+  }
+  mEarlyHintsCount = 0;
+  mFirstEarlyHint = Nothing();
+}
+
+}  

@@ -1,0 +1,69 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_GFX_SWIZZLE_H_
+#define MOZILLA_GFX_SWIZZLE_H_
+
+#include "Point.h"
+#include "Rect.h"
+
+namespace mozilla {
+namespace image {
+struct Orientation;
+}
+
+namespace gfx {
+
+GFX2D_API bool PremultiplyData(const uint8_t* aSrc, int32_t aSrcStride,
+                               SurfaceFormat aSrcFormat, uint8_t* aDst,
+                               int32_t aDstStride, SurfaceFormat aDstFormat,
+                               const IntSize& aSize);
+
+GFX2D_API bool UnpremultiplyData(const uint8_t* aSrc, int32_t aSrcStride,
+                                 SurfaceFormat aSrcFormat, uint8_t* aDst,
+                                 int32_t aDstStride, SurfaceFormat aDstFormat,
+                                 const IntSize& aSize);
+
+GFX2D_API bool SwizzleData(const uint8_t* aSrc, int32_t aSrcStride,
+                           SurfaceFormat aSrcFormat, uint8_t* aDst,
+                           int32_t aDstStride, SurfaceFormat aDstFormat,
+                           const IntSize& aSize);
+
+GFX2D_API bool SwizzleYFlipData(const uint8_t* aSrc, int32_t aSrcStride,
+                                SurfaceFormat aSrcFormat, uint8_t* aDst,
+                                int32_t aDstStride, SurfaceFormat aDstFormat,
+                                const IntSize& aSize);
+
+GFX2D_API bool PremultiplyYFlipData(const uint8_t* aSrc, int32_t aSrcStride,
+                                    SurfaceFormat aSrcFormat, uint8_t* aDst,
+                                    int32_t aDstStride,
+                                    SurfaceFormat aDstFormat,
+                                    const IntSize& aSize);
+
+typedef void (*SwizzleRowFn)(const uint8_t* aSrc, uint8_t* aDst,
+                             int32_t aLength);
+
+GFX2D_API SwizzleRowFn PremultiplyRow(SurfaceFormat aSrcFormat,
+                                      SurfaceFormat aDstFormat);
+
+GFX2D_API SwizzleRowFn UnpremultiplyRow(SurfaceFormat aSrcFormat,
+                                        SurfaceFormat aDstFormat);
+
+GFX2D_API SwizzleRowFn SwizzleRow(SurfaceFormat aSrcFormat,
+                                  SurfaceFormat aDstFormat);
+
+typedef IntRect (*ReorientRowFn)(const uint8_t* aSrc, int32_t aSrcRow,
+                                 uint8_t* aDst, const IntSize& aDstSize,
+                                 int32_t aDstStride);
+
+GFX2D_API ReorientRowFn
+ReorientRow(const struct image::Orientation& aOrientation);
+
+GFX2D_API void ConvertFloat16RowToUint16(const uint16_t* aSrc, uint16_t* aDst,
+                                         uint32_t aWidth, uint32_t aChannels);
+
+}  
+}  
+
+#endif /* MOZILLA_GFX_SWIZZLE_H_ */

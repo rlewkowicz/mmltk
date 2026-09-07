@@ -1,0 +1,79 @@
+// Copyright 2017 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef ABSL_STRINGS_INTERNAL_RESIZE_UNINITIALIZED_H_
+#define ABSL_STRINGS_INTERNAL_RESIZE_UNINITIALIZED_H_
+
+#include <algorithm>
+#include <string>
+#include <type_traits>
+#include <utility>
+
+#include "absl/base/optimization.h"
+#include "absl/base/port.h"
+#include "absl/strings/resize_and_overwrite.h"
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace strings_internal {
+
+template <typename string_type, typename = void>
+struct ResizeUninitializedTraits {
+  using HasMember = std::false_type;
+  static void Resize(string_type* s, size_t new_size) { s->resize(new_size); }
+};
+
+template <typename string_type>
+struct ResizeUninitializedTraits<
+    string_type, std::void_t<decltype(std::declval<string_type&>()
+                                          .__resize_default_init(237))> > {
+  using HasMember = std::true_type;
+  static void Resize(string_type* s, size_t new_size) {
+    s->__resize_default_init(new_size);
+  }
+};
+
+template <typename string_type>
+inline constexpr bool STLStringSupportsNontrashingResize(string_type*) {
+  return ResizeUninitializedTraits<string_type>::HasMember::value;
+}
+
+template <typename string_type, typename = void>
+inline void STLStringResizeUninitialized(string_type* s, size_t new_size) {
+  ResizeUninitializedTraits<string_type>::Resize(s, new_size);
+}
+
+template <typename string_type>
+[[deprecated]]
+void STLStringResizeUninitializedAmortized(string_type* s, size_t new_size) {
+  if (new_size > s->size()) {
+    if (new_size > s->capacity()) {
+      const auto min_growth = s->capacity();
+      if (ABSL_PREDICT_FALSE(s->capacity() > s->max_size() - min_growth)) {
+        s->reserve(s->max_size());
+      } else if (new_size < s->capacity() + min_growth) {
+        s->reserve(s->capacity() + min_growth);
+      }
+    }
+    absl::strings_internal::StringResizeAndOverwriteImpl(
+        *s, new_size, [](typename string_type::value_type*, size_t buf_size) {
+          return buf_size;
+        });
+  } else {
+    s->erase(new_size);
+  }
+}
+
+}  
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_STRINGS_INTERNAL_RESIZE_UNINITIALIZED_H_

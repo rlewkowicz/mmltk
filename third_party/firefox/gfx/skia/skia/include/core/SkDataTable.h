@@ -1,0 +1,79 @@
+/*
+ * Copyright 2013 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkDataTable_DEFINED)
+#define SkDataTable_DEFINED
+
+#include "include/core/SkRefCnt.h"
+#include "include/private/base/SkAPI.h"
+#include "include/private/base/SkAssert.h"
+
+#include <cstdint>
+#include <cstring>
+
+class SK_API SkDataTable : public SkRefCnt {
+public:
+    bool isEmpty() const { return 0 == fCount; }
+
+    int count() const { return fCount; }
+
+    size_t atSize(int index) const;
+
+    const void* at(int index, size_t* size = nullptr) const;
+
+    template <typename T>
+    const T* atT(int index, size_t* size = nullptr) const {
+        return reinterpret_cast<const T*>(this->at(index, size));
+    }
+
+    const char* atStr(int index) const {
+        size_t size;
+        const char* str = this->atT<const char>(index, &size);
+        SkASSERT(strlen(str) + 1 == size);
+        return str;
+    }
+
+    typedef void (*FreeProc)(void* context);
+
+    static sk_sp<SkDataTable> MakeEmpty();
+
+    static sk_sp<SkDataTable> MakeCopyArrays(const void * const * ptrs,
+                                             const size_t sizes[], int count);
+
+    static sk_sp<SkDataTable> MakeCopyArray(const void* array, size_t elemSize, int count);
+
+    static sk_sp<SkDataTable> MakeArrayProc(const void* array, size_t elemSize, int count,
+                                            FreeProc proc, void* context);
+
+private:
+    struct Dir {
+        const void* fPtr;
+        uintptr_t   fSize;
+    };
+
+    int         fCount;
+    size_t      fElemSize;
+    union {
+        const Dir*  fDir;
+        const char* fElems;
+    } fU;
+
+    FreeProc    fFreeProc;
+    void*       fFreeProcContext;
+
+    SkDataTable();
+    SkDataTable(const void* array, size_t elemSize, int count,
+                FreeProc, void* context);
+    SkDataTable(const Dir*, int count, FreeProc, void* context);
+    ~SkDataTable() override;
+
+    friend class SkDataTableBuilder;    
+
+    using INHERITED = SkRefCnt;
+};
+
+#endif

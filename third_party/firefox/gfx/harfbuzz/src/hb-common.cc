@@ -1,0 +1,800 @@
+/*
+ * Copyright © 2009,2010  Red Hat, Inc.
+ * Copyright © 2011,2012  Google, Inc.
+ *
+ *  This is part of HarfBuzz, a text shaping library.
+ *
+ * Permission is hereby granted, without written agreement and without
+ * license or royalty fees, to use, copy, modify, and distribute this
+ * software and its documentation for any purpose, provided that the
+ * above copyright notice and the following two paragraphs appear in
+ * all copies of this software.
+ *
+ * IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE TO ANY PARTY FOR
+ * DIRECT, INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES
+ * ARISING OUT OF THE USE OF THIS SOFTWARE AND ITS DOCUMENTATION, EVEN
+ * IF THE COPYRIGHT HOLDER HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH
+ * DAMAGE.
+ *
+ * THE COPYRIGHT HOLDER SPECIFICALLY DISCLAIMS ANY WARRANTIES, INCLUDING,
+ * BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
+ * FITNESS FOR A PARTICULAR PURPOSE.  THE SOFTWARE PROVIDED HEREUNDER IS
+ * ON AN "AS IS" BASIS, AND THE COPYRIGHT HOLDER HAS NO OBLIGATION TO
+ * PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
+ *
+ * Red Hat Author(s): Behdad Esfahbod
+ * Google Author(s): Behdad Esfahbod
+ */
+
+#include "hb.hh"
+#include "hb-machinery.hh"
+
+
+
+
+
+hb_tag_t
+hb_tag_from_string (const char *str, int len)
+{
+  char tag[4];
+  unsigned int i;
+
+  if (!str || !len || !*str)
+    return HB_TAG_NONE;
+
+  if (len < 0 || len > 4)
+    len = 4;
+  for (i = 0; i < (unsigned) len && str[i]; i++)
+    tag[i] = str[i];
+  for (; i < 4; i++)
+    tag[i] = ' ';
+
+  return HB_TAG (tag[0], tag[1], tag[2], tag[3]);
+}
+
+void
+hb_tag_to_string (hb_tag_t tag, char *buf)
+{
+  buf[0] = (char) (uint8_t) (tag >> 24);
+  buf[1] = (char) (uint8_t) (tag >> 16);
+  buf[2] = (char) (uint8_t) (tag >>  8);
+  buf[3] = (char) (uint8_t) (tag >>  0);
+}
+
+
+
+static const char direction_strings[][4] = {
+  "ltr",
+  "rtl",
+  "ttb",
+  "btt"
+};
+
+hb_direction_t
+hb_direction_from_string (const char *str, int len)
+{
+  if (unlikely (!str || !len || !*str))
+    return HB_DIRECTION_INVALID;
+
+  char c = TOLOWER (str[0]);
+  for (unsigned int i = 0; i < ARRAY_LENGTH (direction_strings); i++)
+    if (c == direction_strings[i][0])
+      return (hb_direction_t) (HB_DIRECTION_LTR + i);
+
+  return HB_DIRECTION_INVALID;
+}
+
+const char *
+hb_direction_to_string (hb_direction_t direction)
+{
+  if (likely ((unsigned int) (direction - HB_DIRECTION_LTR)
+	      < ARRAY_LENGTH (direction_strings)))
+    return direction_strings[direction - HB_DIRECTION_LTR];
+
+  return "invalid";
+}
+
+
+
+struct hb_language_impl_t {
+  const char s[1];
+};
+
+static const char canon_map[256] = {
+   0,   0,   0,   0,   0,   0,   0,   0,    0,   0,   0,   0,   0,   0,   0,   0,
+   0,   0,   0,   0,   0,   0,   0,   0,    0,   0,   0,   0,   0,   0,   0,   0,
+   0,   0,   0,   0,   0,   0,   0,   0,    0,   0,   0,   0,   0,  '-',  0,   0,
+  '0', '1', '2', '3', '4', '5', '6', '7',  '8', '9',  0,   0,   0,   0,   0,   0,
+   0,  'a', 'b', 'c', 'd', 'e', 'f', 'g',  'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o',
+  'p', 'q', 'r', 's', 't', 'u', 'v', 'w',  'x', 'y', 'z',  0,   0,   0,   0,  '-',
+   0,  'a', 'b', 'c', 'd', 'e', 'f', 'g',  'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o',
+  'p', 'q', 'r', 's', 't', 'u', 'v', 'w',  'x', 'y', 'z',  0,   0,   0,   0,   0
+};
+
+static bool
+lang_equal (hb_language_t  v1,
+	    const void    *v2)
+{
+  const unsigned char *p1 = (const unsigned char *) v1;
+  const unsigned char *p2 = (const unsigned char *) v2;
+
+  while (*p1 && *p1 == canon_map[*p2]) {
+    p1++;
+    p2++;
+  }
+
+  return *p1 == canon_map[*p2];
+}
+
+#if 0
+static unsigned int
+lang_hash (const void *key)
+{
+  const unsigned char *p = key;
+  unsigned int h = 0;
+  while (canon_map[*p])
+    {
+      h = (h << 5) - h + canon_map[*p];
+      p++;
+    }
+
+  return h;
+}
+#endif
+
+
+struct hb_language_item_t {
+
+  struct hb_language_item_t *next;
+  hb_language_t lang;
+
+  bool operator == (const char *s) const
+  { return lang_equal (lang, s); }
+
+  hb_language_item_t & operator = (const char *s)
+  {
+    size_t len = strlen(s) + 1;
+    lang = (hb_language_t) hb_malloc(len);
+    if (likely (lang))
+    {
+      hb_memcpy((unsigned char *) lang, s, len);
+      for (unsigned char *p = (unsigned char *) lang; *p; p++)
+	*p = canon_map[*p];
+    }
+
+    return *this;
+  }
+
+  void fini () { hb_free ((void *) lang); }
+};
+
+
+
+static hb_atomic_t<hb_language_item_t *> langs;
+
+static inline void
+free_langs ()
+{
+retry:
+  hb_language_item_t *first_lang = langs;
+  if (unlikely (!langs.cmpexch (first_lang, nullptr)))
+    goto retry;
+
+  while (first_lang) {
+    hb_language_item_t *next = first_lang->next;
+    first_lang->fini ();
+    hb_free (first_lang);
+    first_lang = next;
+  }
+}
+
+static hb_language_item_t *
+lang_find_or_insert (const char *key)
+{
+retry:
+  hb_language_item_t *first_lang = langs;
+
+  for (hb_language_item_t *lang = first_lang; lang; lang = lang->next)
+    if (*lang == key)
+      return lang;
+
+  hb_language_item_t *lang = (hb_language_item_t *) hb_calloc (1, sizeof (hb_language_item_t));
+  if (unlikely (!lang))
+    return nullptr;
+  lang->next = first_lang;
+  *lang = key;
+  if (unlikely (!lang->lang))
+  {
+    hb_free (lang);
+    return nullptr;
+  }
+
+  if (unlikely (!langs.cmpexch (first_lang, lang)))
+  {
+    lang->fini ();
+    hb_free (lang);
+    goto retry;
+  }
+
+  if (!first_lang)
+    hb_atexit (free_langs); 
+
+  return lang;
+}
+
+
+hb_language_t
+hb_language_from_string (const char *str, int len)
+{
+  if (!str || !len || !*str)
+    return HB_LANGUAGE_INVALID;
+
+  hb_language_item_t *item = nullptr;
+  if (len >= 0)
+  {
+    char strbuf[64];
+    len = hb_min (len, (int) sizeof (strbuf) - 1);
+    hb_memcpy (strbuf, str, len);
+    strbuf[len] = '\0';
+    item = lang_find_or_insert (strbuf);
+  }
+  else
+    item = lang_find_or_insert (str);
+
+  return likely (item) ? item->lang : HB_LANGUAGE_INVALID;
+}
+
+const char *
+hb_language_to_string (hb_language_t language)
+{
+  if (unlikely (!language)) return nullptr;
+
+  return language->s;
+}
+
+hb_language_t
+hb_language_get_default ()
+{
+  static hb_atomic_t<hb_language_t> default_language;
+
+  hb_language_t language = default_language;
+  if (unlikely (language == HB_LANGUAGE_INVALID))
+  {
+    language = hb_language_from_string (hb_setlocale (LC_CTYPE, nullptr), -1);
+    (void) default_language.cmpexch (HB_LANGUAGE_INVALID, language);
+  }
+
+  return language;
+}
+
+hb_bool_t
+hb_language_matches (hb_language_t language,
+		     hb_language_t specific)
+{
+  if (language == specific) return true;
+  if (!language || !specific) return false;
+
+  const char *l = language->s;
+  const char *s = specific->s;
+  unsigned ll = strlen (l);
+  unsigned sl = strlen (s);
+
+  if (ll > sl)
+    return false;
+
+  return strncmp (l, s, ll) == 0 &&
+	 (s[ll] == '\0' || s[ll] == '-');
+}
+
+
+
+hb_script_t
+hb_script_from_iso15924_tag (hb_tag_t tag)
+{
+  if (unlikely (tag == HB_TAG_NONE))
+    return HB_SCRIPT_INVALID;
+
+  tag = (tag & 0xDFDFDFDFu) | 0x00202020u;
+
+  switch (tag) {
+
+    case HB_TAG('Q','a','a','i'): return HB_SCRIPT_INHERITED;
+    case HB_TAG('Q','a','a','c'): return HB_SCRIPT_COPTIC;
+
+    case HB_TAG('A','r','a','n'): return HB_SCRIPT_ARABIC;
+    case HB_TAG('C','y','r','s'): return HB_SCRIPT_CYRILLIC;
+    case HB_TAG('G','e','o','k'): return HB_SCRIPT_GEORGIAN;
+    case HB_TAG('H','a','n','s'): return HB_SCRIPT_HAN;
+    case HB_TAG('H','a','n','t'): return HB_SCRIPT_HAN;
+    case HB_TAG('J','a','m','o'): return HB_SCRIPT_HANGUL;
+    case HB_TAG('L','a','t','f'): return HB_SCRIPT_LATIN;
+    case HB_TAG('L','a','t','g'): return HB_SCRIPT_LATIN;
+    case HB_TAG('S','y','r','e'): return HB_SCRIPT_SYRIAC;
+    case HB_TAG('S','y','r','j'): return HB_SCRIPT_SYRIAC;
+    case HB_TAG('S','y','r','n'): return HB_SCRIPT_SYRIAC;
+  }
+
+  if (((uint32_t) tag & 0xE0E0E0E0u) == 0x40606060u)
+    return (hb_script_t) tag;
+
+  return HB_SCRIPT_UNKNOWN;
+}
+
+hb_script_t
+hb_script_from_string (const char *str, int len)
+{
+  return hb_script_from_iso15924_tag (hb_tag_from_string (str, len));
+}
+
+hb_tag_t
+hb_script_to_iso15924_tag (hb_script_t script)
+{
+  return (hb_tag_t) script;
+}
+
+hb_direction_t
+hb_script_get_horizontal_direction (hb_script_t script)
+{
+  switch ((hb_tag_t) script)
+  {
+    case HB_SCRIPT_ARABIC:
+    case HB_SCRIPT_HEBREW:
+
+    case HB_SCRIPT_SYRIAC:
+    case HB_SCRIPT_THAANA:
+
+    case HB_SCRIPT_CYPRIOT:
+
+    case HB_SCRIPT_KHAROSHTHI:
+
+    case HB_SCRIPT_PHOENICIAN:
+    case HB_SCRIPT_NKO:
+
+    case HB_SCRIPT_LYDIAN:
+
+    case HB_SCRIPT_AVESTAN:
+    case HB_SCRIPT_IMPERIAL_ARAMAIC:
+    case HB_SCRIPT_INSCRIPTIONAL_PAHLAVI:
+    case HB_SCRIPT_INSCRIPTIONAL_PARTHIAN:
+    case HB_SCRIPT_OLD_SOUTH_ARABIAN:
+    case HB_SCRIPT_OLD_TURKIC:
+    case HB_SCRIPT_SAMARITAN:
+
+    case HB_SCRIPT_MANDAIC:
+
+    case HB_SCRIPT_MEROITIC_CURSIVE:
+    case HB_SCRIPT_MEROITIC_HIEROGLYPHS:
+
+    case HB_SCRIPT_MANICHAEAN:
+    case HB_SCRIPT_MENDE_KIKAKUI:
+    case HB_SCRIPT_NABATAEAN:
+    case HB_SCRIPT_OLD_NORTH_ARABIAN:
+    case HB_SCRIPT_PALMYRENE:
+    case HB_SCRIPT_PSALTER_PAHLAVI:
+
+    case HB_SCRIPT_HATRAN:
+
+    case HB_SCRIPT_ADLAM:
+
+    case HB_SCRIPT_HANIFI_ROHINGYA:
+    case HB_SCRIPT_OLD_SOGDIAN:
+    case HB_SCRIPT_SOGDIAN:
+
+    case HB_SCRIPT_ELYMAIC:
+
+    case HB_SCRIPT_CHORASMIAN:
+    case HB_SCRIPT_YEZIDI:
+
+    case HB_SCRIPT_OLD_UYGHUR:
+
+    case HB_SCRIPT_GARAY:
+
+    case HB_SCRIPT_SIDETIC:
+
+      return HB_DIRECTION_RTL;
+
+
+    case HB_SCRIPT_OLD_HUNGARIAN:
+    case HB_SCRIPT_OLD_ITALIC:
+    case HB_SCRIPT_RUNIC:
+    case HB_SCRIPT_TIFINAGH:
+
+      return HB_DIRECTION_INVALID;
+  }
+
+  return HB_DIRECTION_LTR;
+}
+
+
+
+
+
+
+void
+hb_version (unsigned int *major,
+	    unsigned int *minor,
+	    unsigned int *micro)
+{
+  *major = HB_VERSION_MAJOR;
+  *minor = HB_VERSION_MINOR;
+  *micro = HB_VERSION_MICRO;
+}
+
+const char *
+hb_version_string ()
+{
+  return HB_VERSION_STRING;
+}
+
+hb_bool_t
+hb_version_atleast (unsigned int major,
+		    unsigned int minor,
+		    unsigned int micro)
+{
+  return HB_VERSION_ATLEAST (major, minor, micro);
+}
+
+
+
+
+static bool
+parse_space (const char **pp, const char *end)
+{
+  while (*pp < end && ISSPACE (**pp))
+    (*pp)++;
+  return true;
+}
+
+static bool
+parse_char (const char **pp, const char *end, char c)
+{
+  parse_space (pp, end);
+
+  if (*pp == end || **pp != c)
+    return false;
+
+  (*pp)++;
+  return true;
+}
+
+static bool
+parse_uint (const char **pp, const char *end, unsigned int *pv)
+{
+  int v;
+  if (unlikely (!hb_parse_int (pp, end, &v))) return false;
+
+  *pv = v;
+  return true;
+}
+
+static bool
+parse_uint32 (const char **pp, const char *end, uint32_t *pv)
+{
+  int v;
+  if (unlikely (!hb_parse_int (pp, end, &v))) return false;
+
+  *pv = v;
+  return true;
+}
+
+static bool
+parse_bool (const char **pp, const char *end, uint32_t *pv)
+{
+  parse_space (pp, end);
+
+  const char *p = *pp;
+  while (*pp < end && ISALPHA(**pp))
+    (*pp)++;
+
+  if (*pp - p == 2
+      && TOLOWER (p[0]) == 'o'
+      && TOLOWER (p[1]) == 'n')
+    *pv = 1;
+  else if (*pp - p == 3
+	   && TOLOWER (p[0]) == 'o'
+	   && TOLOWER (p[1]) == 'f'
+	   && TOLOWER (p[2]) == 'f')
+    *pv = 0;
+  else
+    return false;
+
+  return true;
+}
+
+
+static bool
+parse_feature_value_prefix (const char **pp, const char *end, hb_feature_t *feature)
+{
+  if (parse_char (pp, end, '-'))
+    feature->value = 0;
+  else {
+    parse_char (pp, end, '+');
+    feature->value = 1;
+  }
+
+  return true;
+}
+
+static bool
+parse_tag (const char **pp, const char *end, hb_tag_t *tag)
+{
+  parse_space (pp, end);
+
+  char quote = 0;
+
+  if (*pp < end && (**pp == '\'' || **pp == '"'))
+  {
+    quote = **pp;
+    (*pp)++;
+  }
+
+  const char *p = *pp;
+  while (*pp < end && (**pp != ' ' && **pp != '=' && **pp != '[' && **pp != quote))
+    (*pp)++;
+
+  if (p == *pp || *pp - p > 4)
+    return false;
+
+  *tag = hb_tag_from_string (p, *pp - p);
+
+  if (quote)
+  {
+     if (*pp - p != 4)
+       return false;
+    if (*pp == end || **pp != quote)
+      return false;
+    (*pp)++;
+  }
+
+  return true;
+}
+
+static bool
+parse_feature_indices (const char **pp, const char *end, hb_feature_t *feature)
+{
+  parse_space (pp, end);
+
+  bool has_start;
+
+  feature->start = HB_FEATURE_GLOBAL_START;
+  feature->end = HB_FEATURE_GLOBAL_END;
+
+  if (!parse_char (pp, end, '['))
+    return true;
+
+  has_start = parse_uint (pp, end, &feature->start);
+
+  if (parse_char (pp, end, ':') || parse_char (pp, end, ';')) {
+    parse_uint (pp, end, &feature->end);
+  } else {
+    if (has_start)
+      feature->end = feature->start + 1;
+  }
+
+  return parse_char (pp, end, ']');
+}
+
+static bool
+parse_feature_value_postfix (const char **pp, const char *end, hb_feature_t *feature)
+{
+  bool had_equal = parse_char (pp, end, '=');
+  bool had_value = parse_uint32 (pp, end, &feature->value) ||
+		   parse_bool (pp, end, &feature->value);
+  return !had_equal || had_value;
+}
+
+static bool
+parse_one_feature (const char **pp, const char *end, hb_feature_t *feature)
+{
+  return parse_feature_value_prefix (pp, end, feature) &&
+	 parse_tag (pp, end, &feature->tag) &&
+	 parse_feature_indices (pp, end, feature) &&
+	 parse_feature_value_postfix (pp, end, feature) &&
+	 parse_space (pp, end) &&
+	 *pp == end;
+}
+
+hb_bool_t
+hb_feature_from_string (const char *str, int len,
+			hb_feature_t *feature)
+{
+  hb_feature_t feat;
+
+  if (len < 0)
+    len = strlen (str);
+
+  if (likely (parse_one_feature (&str, str + len, &feat)))
+  {
+    if (feature)
+      *feature = feat;
+    return true;
+  }
+
+  if (feature)
+    hb_memset (feature, 0, sizeof (*feature));
+  return false;
+}
+
+void
+hb_feature_to_string (hb_feature_t *feature,
+		      char *buf, unsigned int size)
+{
+  if (unlikely (!size)) return;
+
+  char s[128];
+  unsigned int len = 0;
+  if (feature->value == 0)
+    s[len++] = '-';
+  hb_tag_to_string (feature->tag, s + len);
+  len += 4;
+  while (len && s[len - 1] == ' ')
+    len--;
+  if (feature->start != HB_FEATURE_GLOBAL_START || feature->end != HB_FEATURE_GLOBAL_END)
+  {
+    s[len++] = '[';
+    if (feature->start)
+      len += hb_max (0, snprintf (s + len, ARRAY_LENGTH (s) - len, "%u", feature->start));
+    if (feature->end != feature->start + 1) {
+      s[len++] = ':';
+      if (feature->end != HB_FEATURE_GLOBAL_END)
+	len += hb_max (0, snprintf (s + len, ARRAY_LENGTH (s) - len, "%u", feature->end));
+    }
+    s[len++] = ']';
+  }
+  if (feature->value > 1)
+  {
+    s[len++] = '=';
+    len += hb_max (0, snprintf (s + len, ARRAY_LENGTH (s) - len, "%" PRIu32, feature->value));
+  }
+  assert (len < ARRAY_LENGTH (s));
+  len = hb_min (len, size - 1);
+  hb_memcpy (buf, s, len);
+  buf[len] = '\0';
+}
+
+
+static bool
+parse_variation_value (const char **pp, const char *end, hb_variation_t *variation)
+{
+  parse_char (pp, end, '='); 
+  double v;
+  if (unlikely (!hb_parse_double (pp, end, &v))) return false;
+
+  variation->value = v;
+  return true;
+}
+
+static bool
+parse_one_variation (const char **pp, const char *end, hb_variation_t *variation)
+{
+  return parse_tag (pp, end, &variation->tag) &&
+	 parse_variation_value (pp, end, variation) &&
+	 parse_space (pp, end) &&
+	 *pp == end;
+}
+
+hb_bool_t
+hb_variation_from_string (const char *str, int len,
+			  hb_variation_t *variation)
+{
+  hb_variation_t var;
+
+  if (len < 0)
+    len = strlen (str);
+
+  if (likely (parse_one_variation (&str, str + len, &var)))
+  {
+    if (variation)
+      *variation = var;
+    return true;
+  }
+
+  if (variation)
+    hb_memset (variation, 0, sizeof (*variation));
+  return false;
+}
+
+#ifndef HB_NO_SETLOCALE
+
+static inline void free_static_C_locale ();
+
+static struct hb_C_locale_lazy_loader_t : hb_lazy_loader_t<hb_remove_pointer<hb_locale_t>,
+							   hb_C_locale_lazy_loader_t>
+{
+  static hb_locale_t create ()
+  {
+    hb_locale_t l = newlocale (LC_ALL_MASK, "C", NULL);
+    if (!l)
+      return l;
+
+    hb_atexit (free_static_C_locale);
+
+    return l;
+  }
+  static void destroy (hb_locale_t l)
+  {
+    freelocale (l);
+  }
+  static hb_locale_t get_null ()
+  {
+    return (hb_locale_t) 0;
+  }
+} static_C_locale;
+
+static inline
+void free_static_C_locale ()
+{
+  static_C_locale.free_instance ();
+}
+
+static hb_locale_t
+get_C_locale ()
+{
+  return static_C_locale.get_unconst ();
+}
+
+#endif
+
+void
+hb_variation_to_string (hb_variation_t *variation,
+			char *buf, unsigned int size)
+{
+  if (unlikely (!size)) return;
+
+  char s[128];
+  unsigned int len = 0;
+  hb_tag_to_string (variation->tag, s + len);
+  len += 4;
+  while (len && s[len - 1] == ' ')
+    len--;
+  s[len++] = '=';
+
+  hb_locale_t oldlocale HB_UNUSED;
+  oldlocale = hb_uselocale (get_C_locale ());
+  len += hb_max (0, snprintf (s + len, ARRAY_LENGTH (s) - len, "%g", (double) variation->value));
+  (void) hb_uselocale (oldlocale);
+
+  assert (len < ARRAY_LENGTH (s));
+  len = hb_min (len, size - 1);
+  hb_memcpy (buf, s, len);
+  buf[len] = '\0';
+}
+
+uint8_t
+(hb_color_get_alpha) (hb_color_t color)
+{
+  return hb_color_get_alpha (color);
+}
+
+uint8_t
+(hb_color_get_red) (hb_color_t color)
+{
+  return hb_color_get_red (color);
+}
+
+uint8_t
+(hb_color_get_green) (hb_color_t color)
+{
+  return hb_color_get_green (color);
+}
+
+uint8_t
+(hb_color_get_blue) (hb_color_t color)
+{
+  return hb_color_get_blue (color);
+}
+
+void* hb_malloc(size_t size) { return hb_malloc_impl (size); }
+
+void* hb_calloc(size_t nmemb, size_t size) { return hb_calloc_impl (nmemb, size); }
+
+void* hb_realloc(void *ptr, size_t size) { return hb_realloc_impl (ptr, size); }
+
+void  hb_free(void *ptr) { hb_free_impl (ptr); }
+
+
+#ifdef HB_NO_VISIBILITY
+#undef HB_NO_VISIBILITY
+#include "hb-static.cc"
+#define HB_NO_VISIBILITY 1
+#endif

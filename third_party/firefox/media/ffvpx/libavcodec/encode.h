@@ -1,0 +1,73 @@
+/*
+ * generic encoding-related code
+ *
+ * This file is part of FFmpeg.
+ *
+ * FFmpeg is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * FFmpeg is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with FFmpeg; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ */
+
+#ifndef AVCODEC_ENCODE_H
+#define AVCODEC_ENCODE_H
+
+#include "libavutil/frame.h"
+
+#include "avcodec.h"
+#include "packet.h"
+
+#define FF_INPUT_BUFFER_MIN_SIZE 16384
+
+int ff_encode_get_frame(AVCodecContext *avctx, AVFrame *frame);
+
+int ff_get_encode_buffer(AVCodecContext *avctx, AVPacket *avpkt, int64_t size, int flags);
+
+int ff_encode_alloc_frame(AVCodecContext *avctx, AVFrame *frame);
+
+int ff_alloc_packet(AVCodecContext *avctx, AVPacket *avpkt, int64_t size);
+
+int ff_encode_reordered_opaque(AVCodecContext *avctx,
+                               AVPacket *pkt, const AVFrame *frame);
+
+int ff_encode_encode_cb(AVCodecContext *avctx, AVPacket *avpkt,
+                        AVFrame *frame, int *got_packet);
+
+AVCPBProperties *ff_encode_add_cpb_side_data(AVCodecContext *avctx);
+
+int ff_encode_add_stats_side_data(AVPacket *pkt, int quality, const int64_t error[],
+                                  int error_count, enum AVPictureType pict_type);
+
+static av_always_inline int64_t ff_samples_to_time_base(const AVCodecContext *avctx,
+                                                        int64_t samples)
+{
+    if (samples == AV_NOPTS_VALUE)
+        return AV_NOPTS_VALUE;
+    return av_rescale_q(samples, (AVRational){ 1, avctx->sample_rate },
+                        avctx->time_base);
+}
+
+static av_always_inline int64_t ff_samples_from_time_base(const AVCodecContext *avctx,
+                                                          int64_t duration)
+{
+    if (!duration)
+        return duration;
+    return av_rescale_q(duration, avctx->time_base,
+                        (AVRational){ 1, avctx->sample_rate });
+}
+
+#define FF_MATRIX_TYPE_INTRA        (1U << 0)
+#define FF_MATRIX_TYPE_INTER        (1U << 1)
+#define FF_MATRIX_TYPE_CHROMA_INTRA (1U << 2)
+int ff_check_codec_matrices(AVCodecContext *avctx, unsigned types, uint16_t min, uint16_t max);
+
+#endif /* AVCODEC_ENCODE_H */

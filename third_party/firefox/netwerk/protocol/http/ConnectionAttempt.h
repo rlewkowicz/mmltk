@@ -1,0 +1,64 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef ConnectionAttempt_h_
+#define ConnectionAttempt_h_
+
+#include "mozilla/TimeStamp.h"
+#include "nsWeakReference.h"
+
+namespace mozilla {
+namespace net {
+
+class ConnectionEntry;
+class DnsAndConnectSocket;
+class nsAHttpTransaction;
+class nsHttpConnectionInfo;
+class nsHttpTransaction;
+
+class ConnectionAttempt : public nsSupportsWeakReference {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+
+  explicit ConnectionAttempt(nsHttpConnectionInfo* ci,
+                             nsAHttpTransaction* trans, uint32_t caps,
+                             bool speculative, bool urgentStart);
+
+  virtual nsresult Init(ConnectionEntry* ent) = 0;
+  virtual void Abandon() = 0;
+  virtual double Duration(TimeStamp epoch) = 0;
+  bool AcceptsTransaction(nsHttpTransaction* trans) const;
+  virtual bool Claim(nsHttpTransaction* newTransaction = nullptr) = 0;
+  virtual void Unclaim();
+  virtual void OnTimeout() = 0;
+  virtual void PrintDiagnostics(nsCString& log) = 0;
+  virtual DnsAndConnectSocket* ToDnsAndConnectSocket() { return nullptr; }
+  virtual uint32_t UnconnectedUDPConnsLength() const;
+
+  bool IsSpeculative() { return mSpeculative; }
+  bool Allow1918() { return mAllow1918; }
+  void SetAllow1918(bool val) { mAllow1918 = val; }
+  bool HasConnected() { return mHasConnected; }
+
+  void ForgetRealTransaction() { mTransaction = nullptr; }
+
+ protected:
+  virtual ~ConnectionAttempt() = default;
+
+  RefPtr<nsHttpConnectionInfo> mConnInfo;
+  RefPtr<nsAHttpTransaction> mTransaction;
+
+  uint32_t mCaps = 0;
+  bool mSpeculative = false;
+  bool mUrgentStart = false;
+  bool mAllow1918 = true;
+  bool mHasConnected = false;
+
+  bool mFreeToUse = true;
+};
+
+}  
+}  
+
+#endif

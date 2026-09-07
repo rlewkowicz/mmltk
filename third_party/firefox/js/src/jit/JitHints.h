@@ -1,0 +1,148 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_JitHints_h
+#define jit_JitHints_h
+
+#include "mozilla/BloomFilter.h"
+#include "mozilla/HashTable.h"
+#include "mozilla/LinkedList.h"
+#include "jit/ICState.h"
+#include "jit/JitOptions.h"
+#include "vm/BytecodeLocation.h"
+#include "vm/JSScript.h"
+
+namespace js::jit {
+
+class ICFallbackStub;
+class ICScript;
+
+
+class JitHintsMap {
+  using ScriptKey = HashNumber;
+  ScriptKey getScriptKey(JSScript* script) const;
+
+  static constexpr uint32_t ICModeHintMaxEntries = 128;
+
+  class IonHint : public mozilla::LinkedListElement<IonHint> {
+    friend class JitHintsMap;
+
+    ScriptKey key_ = 0;
+
+    uint32_t threshold_ = 0;
+
+    Vector<uint32_t, 0, SystemAllocPolicy> monomorphicInlineOffsets;
+
+    static_assert(ICModeHintMaxEntries % 32 == 0);
+    uint32_t icModeHints_[ICModeHintMaxEntries / 32];
+    uint32_t numICModeHints_ = 0;
+
+    void resetICHints() {
+      memset(icModeHints_, 0, sizeof(icModeHints_));
+      numICModeHints_ = 0;
+    }
+
+   public:
+    explicit IonHint(ScriptKey key) : key_(key) { resetICHints(); }
+
+    void setThreshold(uint32_t threshold) { threshold_ = threshold; }
+
+    uint32_t threshold() { return threshold_; }
+
+    void incThreshold(uint32_t inc) {
+      uint32_t newThreshold = threshold() + inc;
+      threshold_ = (newThreshold > JitOptions.normalIonWarmUpThreshold)
+                       ? JitOptions.normalIonWarmUpThreshold
+                       : newThreshold;
+    }
+
+    bool hasSpaceForMonomorphicInlineEntry() {
+      return monomorphicInlineOffsets.length() < MonomorphicInlineMaxEntries;
+    }
+
+    bool hasMonomorphicInlineOffset(uint32_t offset) {
+      for (uint32_t iterOffset : monomorphicInlineOffsets) {
+        if (iterOffset == offset) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    bool addMonomorphicInlineOffset(uint32_t newOffset) {
+      MOZ_ASSERT(hasSpaceForMonomorphicInlineEntry());
+
+      if (hasMonomorphicInlineOffset(newOffset)) {
+        return true;
+      }
+      return monomorphicInlineOffsets.append(newOffset);
+    }
+
+    bool hasICModeHints() const { return numICModeHints_ > 0; }
+    uint32_t numICModeHints() const { return numICModeHints_; }
+
+    bool isMegamorphicHint(uint32_t index) const {
+      MOZ_ASSERT(index < numICModeHints_);
+      return (icModeHints_[index / 32] >> (index % 32)) & 1;
+    }
+
+    void setMegamorphicHint(uint32_t index) {
+      MOZ_ASSERT(index < ICModeHintMaxEntries);
+      icModeHints_[index / 32] |= 1u << (index % 32);
+    }
+
+    ScriptKey key() {
+      MOZ_ASSERT(key_ != 0, "Should have valid key.");
+      return key_;
+    }
+  };
+
+  using ScriptToHintMap =
+      HashMap<ScriptKey, IonHint*, js::DefaultHasher<ScriptKey>,
+              js::SystemAllocPolicy>;
+  using IonHintPriorityQueue = mozilla::LinkedList<IonHint>;
+
+  static constexpr uint32_t InvalidationThresholdIncrement = 200;
+  static constexpr uint32_t IonHintMaxEntries = 5000;
+  static constexpr uint32_t MonomorphicInlineMaxEntries = 16;
+
+  static uint32_t IonHintEagerThresholdValue(uint32_t lastStubCounter,
+                                             bool hasPretenuredAllocSites);
+
+  ScriptToHintMap ionHintMap_;
+  IonHintPriorityQueue ionHintQueue_;
+
+  static constexpr uint32_t EagerBaselineCacheSize_ = 16;
+  mozilla::BitBloomFilter<EagerBaselineCacheSize_, ScriptKey> baselineHintMap_;
+
+  static constexpr uint32_t MaxEntries_ = 4281;
+  static_assert(EagerBaselineCacheSize_ == 16 && MaxEntries_ == 4281,
+                "MaxEntries should be recalculated for given CacheSize.");
+
+  uint32_t baselineEntryCount_ = 0;
+  void incrementBaselineEntryCount();
+
+  void updateAsRecentlyUsed(IonHint* hint);
+  IonHint* addIonHint(ScriptKey key, ScriptToHintMap::AddPtr& p);
+
+ public:
+  ~JitHintsMap();
+
+  void setEagerBaselineHint(JSScript* script);
+  bool mightHaveEagerBaselineHint(JSScript* script) const;
+
+  bool recordIonCompilation(JSScript* script);
+  bool getIonThresholdHint(JSScript* script, uint32_t& thresholdOut);
+
+  bool addMonomorphicInlineLocation(JSScript* script, BytecodeLocation loc);
+  bool hasMonomorphicInlineHintAtOffset(JSScript* script, uint32_t offset);
+
+  bool shouldTransitionMegamorphic(JSScript* script, ICScript* icScript,
+                                   ICFallbackStub* stub);
+
+  void recordInvalidation(JSScript* script);
+};
+
+}  
+#endif /* jit_JitHints_h */

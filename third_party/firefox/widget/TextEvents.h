@@ -1,0 +1,1139 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(mozilla_TextEvents_h_)
+#define mozilla_TextEvents_h_
+
+#include <stdint.h>
+
+#include "mozilla/Assertions.h"
+#include "mozilla/BasicEvents.h"
+#include "mozilla/CheckedInt.h"
+#include "mozilla/EventForwards.h"  // for KeyNameIndex, temporarily
+#include "mozilla/FontRange.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/NativeKeyBindingsType.h"
+#include "mozilla/OwningNonNull.h"
+#include "mozilla/TextRange.h"
+#include "mozilla/WritingModes.h"
+#include "mozilla/dom/DataTransfer.h"
+#include "mozilla/dom/KeyboardEventBinding.h"
+#include "mozilla/dom/StaticRange.h"
+#include "mozilla/widget/IMEData.h"
+#include "mozilla/ipc/IPCForwards.h"
+#include "nsCOMPtr.h"
+#include "nsHashtablesFwd.h"
+#include "nsIFrame.h"
+#include "nsISelectionListener.h"
+#include "nsITransferable.h"
+#include "nsRect.h"
+#include "nsString.h"
+#include "nsTArray.h"
+
+class nsStringHashKey;
+
+
+enum {
+#define NS_DEFINE_VK(aDOMKeyName, aDOMKeyCode) NS_##aDOMKeyName = aDOMKeyCode,
+#include "mozilla/VirtualKeyCodeList.inc"
+#undef NS_DEFINE_VK
+  NS_VK_UNKNOWN = 0xFF
+};
+
+namespace mozilla {
+
+enum : uint32_t {
+  eKeyLocationStandard = dom::KeyboardEvent_Binding::DOM_KEY_LOCATION_STANDARD,
+  eKeyLocationLeft = dom::KeyboardEvent_Binding::DOM_KEY_LOCATION_LEFT,
+  eKeyLocationRight = dom::KeyboardEvent_Binding::DOM_KEY_LOCATION_RIGHT,
+  eKeyLocationNumpad = dom::KeyboardEvent_Binding::DOM_KEY_LOCATION_NUMPAD
+};
+
+const nsCString GetDOMKeyCodeName(uint32_t aKeyCode);
+
+namespace dom {
+class PBrowserParent;
+class PBrowserChild;
+}  
+namespace plugins {
+class PPluginInstanceChild;
+}  
+
+enum class AccessKeyType {
+  eChrome,
+  eContent,
+  eNone
+};
+
+
+struct AlternativeCharCode {
+  AlternativeCharCode() = default;
+  AlternativeCharCode(uint32_t aUnshiftedCharCode, uint32_t aShiftedCharCode)
+      : mUnshiftedCharCode(aUnshiftedCharCode),
+        mShiftedCharCode(aShiftedCharCode) {}
+
+  uint32_t mUnshiftedCharCode = 0u;
+  uint32_t mShiftedCharCode = 0u;
+
+  bool operator==(const AlternativeCharCode& aOther) const {
+    return mUnshiftedCharCode == aOther.mUnshiftedCharCode &&
+           mShiftedCharCode == aOther.mShiftedCharCode;
+  }
+  bool operator!=(const AlternativeCharCode& aOther) const {
+    return !(*this == aOther);
+  }
+};
+
+
+struct ShortcutKeyCandidate {
+  enum class ShiftState : bool {
+    Ignorable,
+    MatchExactly,
+  };
+
+  enum class SkipIfEarlierHandlerDisabled : bool {
+    No,
+    Yes,
+  };
+
+  ShortcutKeyCandidate() = default;
+  ShortcutKeyCandidate(
+      uint32_t aCharCode, ShiftState aShiftState,
+      SkipIfEarlierHandlerDisabled aSkipIfEarlierHandlerDisabled)
+      : mCharCode(aCharCode),
+        mShiftState(aShiftState),
+        mSkipIfEarlierHandlerDisabled(aSkipIfEarlierHandlerDisabled) {}
+
+  uint32_t mCharCode = 0;
+
+  ShiftState mShiftState = ShiftState::MatchExactly;
+  SkipIfEarlierHandlerDisabled mSkipIfEarlierHandlerDisabled =
+      SkipIfEarlierHandlerDisabled::No;
+};
+
+
+struct IgnoreModifierState {
+  bool mShift;
+  bool mMeta;
+
+  IgnoreModifierState() : mShift(false), mMeta(false) {}
+};
+
+
+class WidgetKeyboardEvent final : public WidgetInputEvent {
+ private:
+  friend class dom::PBrowserParent;
+  friend class dom::PBrowserChild;
+  friend struct IPC::ParamTraits<WidgetKeyboardEvent>;
+  ALLOW_DEPRECATED_READPARAM
+
+ protected:
+  WidgetKeyboardEvent()
+      : mNativeKeyEvent(nullptr),
+        mKeyCode(0),
+        mCharCode(0),
+        mPseudoCharCode(0),
+        mLocation(eKeyLocationStandard),
+        mUniqueId(0),
+        mKeyNameIndex(KEY_NAME_INDEX_Unidentified),
+        mCodeNameIndex(CODE_NAME_INDEX_UNKNOWN),
+        mIsRepeat(false),
+        mIsComposing(false),
+        mIsSynthesizedByTIP(false),
+        mMaybeSkippableInRemoteProcess(true),
+        mUseLegacyKeyCodeAndCharCodeValues(false),
+        mEditCommandsForSingleLineEditorInitialized(false),
+        mEditCommandsForMultiLineEditorInitialized(false),
+        mEditCommandsForRichTextEditorInitialized(false) {}
+
+ public:
+  NS_DEFINE_AS_EVENT_OVERRIDE(Widget, KeyboardEvent);
+
+  WidgetKeyboardEvent(bool aIsTrusted, EventMessage aMessage,
+                      nsIWidget* aWidget,
+                      EventClassID aEventClassID = eKeyboardEventClass,
+                      const WidgetEventTime* aTime = nullptr)
+      : WidgetInputEvent(aIsTrusted, aMessage, aWidget, aEventClassID, aTime),
+        mNativeKeyEvent(nullptr),
+        mKeyCode(0),
+        mCharCode(0),
+        mPseudoCharCode(0),
+        mLocation(eKeyLocationStandard),
+        mUniqueId(0),
+        mKeyNameIndex(KEY_NAME_INDEX_Unidentified),
+        mCodeNameIndex(CODE_NAME_INDEX_UNKNOWN),
+        mIsRepeat(false),
+        mIsComposing(false),
+        mIsSynthesizedByTIP(false),
+        mMaybeSkippableInRemoteProcess(true),
+        mUseLegacyKeyCodeAndCharCodeValues(false),
+        mEditCommandsForSingleLineEditorInitialized(false),
+        mEditCommandsForMultiLineEditorInitialized(false),
+        mEditCommandsForRichTextEditorInitialized(false) {}
+
+  NS_DEFINE_VIRTUAL_DESTRUCTOR_CHECKING_CLASS_VALUE(WidgetKeyboardEvent,
+                                                    eKeyboardEventClass,
+                                                    eInputEventClass)
+
+  bool IsInputtingText() const {
+    return mMessage == eKeyPress && mCharCode &&
+           !(mModifiers & (
+                              MODIFIER_ALT |
+                              MODIFIER_CONTROL | MODIFIER_META));
+  }
+
+  bool IsInputtingLineBreak() const {
+    return mMessage == eKeyPress && mKeyNameIndex == KEY_NAME_INDEX_Enter &&
+           !(mModifiers & (MODIFIER_ALT | MODIFIER_CONTROL | MODIFIER_META));
+  }
+
+  bool ShouldKeyPressEventBeFiredOnContent() const {
+    MOZ_DIAGNOSTIC_ASSERT(mMessage == eKeyPress);
+    if (IsInputtingText() || IsInputtingLineBreak()) {
+      return true;
+    }
+    return mMessage == eKeyPress && mKeyNameIndex == KEY_NAME_INDEX_Enter &&
+           !(mModifiers & (MODIFIER_ALT | MODIFIER_META | MODIFIER_SHIFT));
+  }
+
+  WidgetEvent* Duplicate() const override {
+    MOZ_ASSERT(mClass == eKeyboardEventClass,
+               "Duplicate() must be overridden by sub class");
+    WidgetKeyboardEvent* result = new WidgetKeyboardEvent(
+        false, mMessage, nullptr, eKeyboardEventClass, this);
+    result->AssignKeyEventData(*this, true);
+    result->mEditCommandsForSingleLineEditor =
+        mEditCommandsForSingleLineEditor.Clone();
+    result->mEditCommandsForMultiLineEditor =
+        mEditCommandsForMultiLineEditor.Clone();
+    result->mEditCommandsForRichTextEditor =
+        mEditCommandsForRichTextEditor.Clone();
+    result->mFlags = mFlags;
+    return result;
+  }
+
+  bool CanUserGestureActivateTarget() const {
+    if (IsModifierKeyEvent()) {
+      return false;
+    }
+    return mKeyNameIndex != KEY_NAME_INDEX_Escape;
+  }
+
+  bool CanReflectModifiersToUserActivation() const {
+    MOZ_ASSERT(CanUserGestureActivateTarget(),
+               "Consumer should check CanUserGestureActivateTarget first");
+    return mKeyNameIndex == KEY_NAME_INDEX_Enter || mKeyCode == NS_VK_SPACE;
+  }
+
+  [[nodiscard]] bool ShouldWorkAsSpaceKey() const {
+    if (mKeyCode == NS_VK_SPACE) {
+      return true;
+    }
+    return mKeyNameIndex == KEY_NAME_INDEX_USE_STRING &&
+           mCodeNameIndex == CODE_NAME_INDEX_Space;
+  }
+
+  bool CanTreatAsUserInput() const {
+    if (!IsTrusted()) {
+      return false;
+    }
+    switch (mKeyNameIndex) {
+      case KEY_NAME_INDEX_Escape:
+      case KEY_NAME_INDEX_Alt:
+      case KEY_NAME_INDEX_AltGraph:
+      case KEY_NAME_INDEX_CapsLock:
+      case KEY_NAME_INDEX_Control:
+      case KEY_NAME_INDEX_Fn:
+      case KEY_NAME_INDEX_FnLock:
+      case KEY_NAME_INDEX_Meta:
+      case KEY_NAME_INDEX_NumLock:
+      case KEY_NAME_INDEX_ScrollLock:
+      case KEY_NAME_INDEX_Shift:
+      case KEY_NAME_INDEX_Symbol:
+      case KEY_NAME_INDEX_SymbolLock:
+      case KEY_NAME_INDEX_Hyper:
+      case KEY_NAME_INDEX_Super:
+        return false;
+      default:
+        return true;
+    }
+  }
+
+  bool ShouldInteractionTimeRecorded() const {
+    return CanTreatAsUserInput();
+  }
+
+  CopyableTArray<AlternativeCharCode> mAlternativeCharCodes;
+  nsString mKeyValue;
+  nsString mCodeValue;
+
+  void* mNativeKeyEvent;
+  uint32_t mKeyCode;
+  uint32_t mCharCode;
+  uint32_t mPseudoCharCode;
+  uint32_t mLocation;
+  uint32_t mUniqueId;
+
+  KeyNameIndex mKeyNameIndex;
+  CodeNameIndex mCodeNameIndex;
+
+  // Indicates whether the event is generated by auto repeat or not.
+  bool mIsRepeat;
+  bool mIsComposing;
+  bool mIsSynthesizedByTIP;
+  bool mMaybeSkippableInRemoteProcess;
+  bool mUseLegacyKeyCodeAndCharCodeValues;
+
+  bool CanSkipInRemoteProcess() const {
+    // If this is a repeat event (i.e., generated by auto-repeat feature of
+    return mIsRepeat && mMaybeSkippableInRemoteProcess;
+  }
+
+  bool NeedsToRemapNavigationKey() const {
+    return mKeyCode >= NS_VK_LEFT && mKeyCode <= NS_VK_DOWN;
+  }
+
+  uint32_t GetRemappedKeyCode(const WritingMode& aWritingMode) const {
+    if (!aWritingMode.IsVertical()) {
+      return mKeyCode;
+    }
+    switch (mKeyCode) {
+      case NS_VK_LEFT:
+        return aWritingMode.IsVerticalLR() ? NS_VK_UP : NS_VK_DOWN;
+      case NS_VK_RIGHT:
+        return aWritingMode.IsVerticalLR() ? NS_VK_DOWN : NS_VK_UP;
+      case NS_VK_UP:
+        return NS_VK_LEFT;
+      case NS_VK_DOWN:
+        return NS_VK_RIGHT;
+      default:
+        return mKeyCode;
+    }
+  }
+
+  KeyNameIndex GetRemappedKeyNameIndex(const WritingMode& aWritingMode) const {
+    if (!aWritingMode.IsVertical()) {
+      return mKeyNameIndex;
+    }
+    uint32_t remappedKeyCode = GetRemappedKeyCode(aWritingMode);
+    if (remappedKeyCode == mKeyCode) {
+      return mKeyNameIndex;
+    }
+    switch (remappedKeyCode) {
+      case NS_VK_LEFT:
+        return KEY_NAME_INDEX_ArrowLeft;
+      case NS_VK_RIGHT:
+        return KEY_NAME_INDEX_ArrowRight;
+      case NS_VK_UP:
+        return KEY_NAME_INDEX_ArrowUp;
+      case NS_VK_DOWN:
+        return KEY_NAME_INDEX_ArrowDown;
+      default:
+        MOZ_ASSERT_UNREACHABLE("Add a case for the new remapped key");
+        return mKeyNameIndex;
+    }
+  }
+
+  MOZ_CAN_RUN_SCRIPT void InitAllEditCommands(
+      const Maybe<WritingMode>& aWritingMode);
+
+  MOZ_CAN_RUN_SCRIPT bool InitEditCommandsFor(
+      NativeKeyBindingsType aType, const Maybe<WritingMode>& aWritingMode);
+
+  void PreventNativeKeyBindings() {
+    mEditCommandsForSingleLineEditor.Clear();
+    mEditCommandsForMultiLineEditor.Clear();
+    mEditCommandsForRichTextEditor.Clear();
+    mEditCommandsForSingleLineEditorInitialized = true;
+    mEditCommandsForMultiLineEditorInitialized = true;
+    mEditCommandsForRichTextEditorInitialized = true;
+  }
+
+  [[nodiscard]] bool HasEditCommands() const {
+    return !mEditCommandsForSingleLineEditor.IsEmpty() ||
+           !mEditCommandsForMultiLineEditor.IsEmpty() ||
+           !mEditCommandsForRichTextEditor.IsEmpty();
+  }
+
+  const nsTArray<CommandInt>& EditCommandsConstRef(
+      NativeKeyBindingsType aType) const {
+    MOZ_ASSERT(!IsHandledInRemoteProcess(),
+               "Editor commands is not available on reply event");
+    return const_cast<WidgetKeyboardEvent*>(this)->EditCommandsRef(aType);
+  }
+
+  bool IsEditCommandsInitialized(NativeKeyBindingsType aType) const {
+    return const_cast<WidgetKeyboardEvent*>(this)->IsEditCommandsInitializedRef(
+        aType);
+  }
+
+  bool AreAllEditCommandsInitialized() const {
+    return mEditCommandsForSingleLineEditorInitialized &&
+           mEditCommandsForMultiLineEditorInitialized &&
+           mEditCommandsForRichTextEditorInitialized;
+  }
+
+  typedef void (*DoCommandCallback)(Command, void*);
+  MOZ_CAN_RUN_SCRIPT bool ExecuteEditCommands(NativeKeyBindingsType aType,
+                                              DoCommandCallback aCallback,
+                                              void* aCallbackData);
+
+  bool ShouldCauseKeypressEvents() const;
+
+  uint32_t PseudoCharCode() const {
+    return mMessage == eKeyPress ? mCharCode : mPseudoCharCode;
+  }
+  void SetCharCode(uint32_t aCharCode) {
+    if (mMessage == eKeyPress) {
+      mCharCode = aCharCode;
+    } else {
+      mPseudoCharCode = aCharCode;
+    }
+  }
+
+  void GetDOMKeyName(nsAString& aKeyName) {
+    if (mKeyNameIndex == KEY_NAME_INDEX_USE_STRING) {
+      aKeyName = mKeyValue;
+      return;
+    }
+    GetDOMKeyName(mKeyNameIndex, aKeyName);
+  }
+  void GetDOMCodeName(nsAString& aCodeName) {
+    if (mCodeNameIndex == CODE_NAME_INDEX_USE_STRING) {
+      aCodeName = mCodeValue;
+      return;
+    }
+    GetDOMCodeName(mCodeNameIndex, aCodeName);
+  }
+
+  static uint32_t GetFallbackKeyCodeOfPunctuationKey(
+      CodeNameIndex aCodeNameIndex);
+
+  bool IsModifierKeyEvent() const {
+    return GetModifierForKeyName(mKeyNameIndex) != MODIFIER_NONE;
+  }
+
+  void GetShortcutKeyCandidates(ShortcutKeyCandidateArray& aCandidates) const;
+
+  void GetAccessKeyCandidates(nsTArray<uint32_t>& aCandidates) const;
+
+  bool ModifiersMatchWithAccessKey(AccessKeyType aType) const;
+
+  Modifiers ModifiersForAccessKeyMatching() const;
+
+  static Modifiers AccessKeyModifiers(AccessKeyType aType);
+
+  static void Shutdown();
+
+  static uint32_t ComputeLocationFromCodeValue(CodeNameIndex aCodeNameIndex);
+
+  static uint32_t ComputeKeyCodeFromKeyNameIndex(KeyNameIndex aKeyNameIndex);
+
+  static CodeNameIndex ComputeCodeNameIndexFromKeyNameIndex(
+      KeyNameIndex aKeyNameIndex, const Maybe<uint32_t>& aLocation);
+
+  static Modifier GetModifierForKeyName(KeyNameIndex aKeyNameIndex);
+
+  static bool IsLeftOrRightModiferKeyNameIndex(KeyNameIndex aKeyNameIndex) {
+    switch (aKeyNameIndex) {
+      case KEY_NAME_INDEX_Alt:
+      case KEY_NAME_INDEX_Control:
+      case KEY_NAME_INDEX_Meta:
+      case KEY_NAME_INDEX_Shift:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  static bool IsLockableModifier(KeyNameIndex aKeyNameIndex);
+
+  static void GetDOMKeyName(KeyNameIndex aKeyNameIndex, nsAString& aKeyName);
+  static void GetDOMCodeName(CodeNameIndex aCodeNameIndex,
+                             nsAString& aCodeName);
+
+  static KeyNameIndex GetKeyNameIndex(const nsAString& aKeyValue);
+  static CodeNameIndex GetCodeNameIndex(const nsAString& aCodeValue);
+
+  static const char* GetCommandStr(Command aCommand);
+
+  void AssignKeyEventData(const WidgetKeyboardEvent& aEvent,
+                          bool aCopyTargets) {
+    AssignInputEventData(aEvent, aCopyTargets);
+
+    mKeyCode = aEvent.mKeyCode;
+    mCharCode = aEvent.mCharCode;
+    mPseudoCharCode = aEvent.mPseudoCharCode;
+    mLocation = aEvent.mLocation;
+    mAlternativeCharCodes = aEvent.mAlternativeCharCodes.Clone();
+    mIsRepeat = aEvent.mIsRepeat;
+    mIsComposing = aEvent.mIsComposing;
+    mKeyNameIndex = aEvent.mKeyNameIndex;
+    mCodeNameIndex = aEvent.mCodeNameIndex;
+    mKeyValue = aEvent.mKeyValue;
+    mCodeValue = aEvent.mCodeValue;
+    mNativeKeyEvent = nullptr;
+    mUniqueId = aEvent.mUniqueId;
+    mIsSynthesizedByTIP = aEvent.mIsSynthesizedByTIP;
+    mMaybeSkippableInRemoteProcess = aEvent.mMaybeSkippableInRemoteProcess;
+    mUseLegacyKeyCodeAndCharCodeValues =
+        aEvent.mUseLegacyKeyCodeAndCharCodeValues;
+
+
+    mEditCommandsForSingleLineEditorInitialized =
+        aEvent.mEditCommandsForSingleLineEditorInitialized;
+    mEditCommandsForMultiLineEditorInitialized =
+        aEvent.mEditCommandsForMultiLineEditorInitialized;
+    mEditCommandsForRichTextEditorInitialized =
+        aEvent.mEditCommandsForRichTextEditorInitialized;
+  }
+
+  void AssignCommands(const WidgetKeyboardEvent& aEvent) {
+    mEditCommandsForSingleLineEditorInitialized =
+        aEvent.mEditCommandsForSingleLineEditorInitialized;
+    if (mEditCommandsForSingleLineEditorInitialized) {
+      mEditCommandsForSingleLineEditor =
+          aEvent.mEditCommandsForSingleLineEditor.Clone();
+    } else {
+      mEditCommandsForSingleLineEditor.Clear();
+    }
+    mEditCommandsForMultiLineEditorInitialized =
+        aEvent.mEditCommandsForMultiLineEditorInitialized;
+    if (mEditCommandsForMultiLineEditorInitialized) {
+      mEditCommandsForMultiLineEditor =
+          aEvent.mEditCommandsForMultiLineEditor.Clone();
+    } else {
+      mEditCommandsForMultiLineEditor.Clear();
+    }
+    mEditCommandsForRichTextEditorInitialized =
+        aEvent.mEditCommandsForRichTextEditorInitialized;
+    if (mEditCommandsForRichTextEditorInitialized) {
+      mEditCommandsForRichTextEditor =
+          aEvent.mEditCommandsForRichTextEditor.Clone();
+    } else {
+      mEditCommandsForRichTextEditor.Clear();
+    }
+  }
+
+ private:
+  static const char16_t* const kKeyNames[];
+  static const char16_t* const kCodeNames[];
+  typedef nsTHashMap<nsStringHashKey, KeyNameIndex> KeyNameIndexHashtable;
+  typedef nsTHashMap<nsStringHashKey, CodeNameIndex> CodeNameIndexHashtable;
+  static KeyNameIndexHashtable* sKeyNameIndexHashtable;
+  static CodeNameIndexHashtable* sCodeNameIndexHashtable;
+
+  CopyableTArray<CommandInt> mEditCommandsForSingleLineEditor;
+  CopyableTArray<CommandInt> mEditCommandsForMultiLineEditor;
+  CopyableTArray<CommandInt> mEditCommandsForRichTextEditor;
+
+  nsTArray<CommandInt>& EditCommandsRef(NativeKeyBindingsType aType) {
+    switch (aType) {
+      case NativeKeyBindingsType::SingleLineEditor:
+        return mEditCommandsForSingleLineEditor;
+      case NativeKeyBindingsType::MultiLineEditor:
+        return mEditCommandsForMultiLineEditor;
+      case NativeKeyBindingsType::RichTextEditor:
+        return mEditCommandsForRichTextEditor;
+      default:
+        MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE(
+            "Invalid native key binding type");
+    }
+  }
+
+  bool mEditCommandsForSingleLineEditorInitialized;
+  bool mEditCommandsForMultiLineEditorInitialized;
+  bool mEditCommandsForRichTextEditorInitialized;
+
+  bool& IsEditCommandsInitializedRef(NativeKeyBindingsType aType) {
+    switch (aType) {
+      case NativeKeyBindingsType::SingleLineEditor:
+        return mEditCommandsForSingleLineEditorInitialized;
+      case NativeKeyBindingsType::MultiLineEditor:
+        return mEditCommandsForMultiLineEditorInitialized;
+      case NativeKeyBindingsType::RichTextEditor:
+        return mEditCommandsForRichTextEditorInitialized;
+      default:
+        MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE(
+            "Invalid native key binding type");
+    }
+  }
+};
+
+
+class WidgetCompositionEvent final : public WidgetGUIEvent {
+ private:
+  friend class mozilla::dom::PBrowserParent;
+  friend class mozilla::dom::PBrowserChild;
+  ALLOW_DEPRECATED_READPARAM
+
+  WidgetCompositionEvent() : mOriginalMessage(eVoidEvent) {}
+
+ public:
+  NS_DEFINE_AS_EVENT_OVERRIDE(Widget, CompositionEvent);
+
+  WidgetCompositionEvent(bool aIsTrusted, EventMessage aMessage,
+                         nsIWidget* aWidget,
+                         const WidgetEventTime* aTime = nullptr)
+      : WidgetGUIEvent(aIsTrusted, aMessage, aWidget, eCompositionEventClass,
+                       aTime),
+        mNativeIMEContext(aWidget),
+        mOriginalMessage(eVoidEvent) {}
+
+  NS_DEFINE_VIRTUAL_DESTRUCTOR_CHECKING_CLASS_VALUE(WidgetCompositionEvent,
+                                                    eCompositionEventClass,
+                                                    eGUIEventClass)
+
+  virtual WidgetEvent* Duplicate() const override {
+    MOZ_ASSERT(mClass == eCompositionEventClass,
+               "Duplicate() must be overridden by sub class");
+    WidgetCompositionEvent* result =
+        new WidgetCompositionEvent(false, mMessage, nullptr, this);
+    result->AssignCompositionEventData(*this, true);
+    result->mFlags = mFlags;
+    return result;
+  }
+
+  nsString mData;
+
+  RefPtr<TextRangeArray> mRanges;
+
+  widget::NativeIMEContext mNativeIMEContext;
+
+  EventMessage mOriginalMessage;
+
+  uint32_t mCompositionId = 0;
+
+  void AssignCompositionEventData(const WidgetCompositionEvent& aEvent,
+                                  bool aCopyTargets) {
+    AssignGUIEventData(aEvent, aCopyTargets);
+
+    mData = aEvent.mData;
+    mOriginalMessage = aEvent.mOriginalMessage;
+    mRanges = aEvent.mRanges;
+
+  }
+
+  bool IsComposing() const { return mRanges && mRanges->IsComposing(); }
+
+  uint32_t TargetClauseOffset() const {
+    return mRanges ? mRanges->TargetClauseOffset() : 0;
+  }
+
+  uint32_t TargetClauseLength() const {
+    uint32_t length = UINT32_MAX;
+    if (mRanges) {
+      length = mRanges->TargetClauseLength();
+    }
+    return length == UINT32_MAX ? mData.Length() : length;
+  }
+
+  uint32_t RangeCount() const { return mRanges ? mRanges->Length() : 0; }
+
+  bool CausesDOMTextEvent() const {
+    return mMessage == eCompositionChange || mMessage == eCompositionCommit ||
+           mMessage == eCompositionCommitAsIs;
+  }
+
+  bool CausesDOMCompositionEndEvent() const {
+    return mMessage == eCompositionEnd || mMessage == eCompositionCommit ||
+           mMessage == eCompositionCommitAsIs;
+  }
+
+  bool IsFollowedByCompositionEnd() const {
+    return IsFollowedByCompositionEnd(mOriginalMessage);
+  }
+
+  static bool IsFollowedByCompositionEnd(EventMessage aEventMessage) {
+    return aEventMessage == eCompositionCommit ||
+           aEventMessage == eCompositionCommitAsIs;
+  }
+};
+
+
+class WidgetQueryContentEvent final : public WidgetGUIEvent {
+ private:
+  friend class dom::PBrowserParent;
+  friend class dom::PBrowserChild;
+  ALLOW_DEPRECATED_READPARAM
+
+  WidgetQueryContentEvent()
+      : mWithFontRanges(false), mNeedsToFlushLayout(true) {
+    MOZ_CRASH("WidgetQueryContentEvent is created without proper arguments");
+  }
+
+ public:
+  NS_DEFINE_AS_EVENT_OVERRIDE(Widget, QueryContentEvent);
+
+  WidgetQueryContentEvent(bool aIsTrusted, EventMessage aMessage,
+                          nsIWidget* aWidget)
+      : WidgetGUIEvent(aIsTrusted, aMessage, aWidget, eQueryContentEventClass) {
+  }
+
+  WidgetQueryContentEvent(EventMessage aMessage,
+                          const WidgetQueryContentEvent& aOtherEvent)
+      : WidgetGUIEvent(aOtherEvent.IsTrusted(), aMessage,
+                       const_cast<nsIWidget*>(aOtherEvent.mWidget.get()),
+                       eQueryContentEventClass),
+        mNeedsToFlushLayout(aOtherEvent.mNeedsToFlushLayout) {}
+
+  NS_DEFINE_VIRTUAL_DESTRUCTOR_CHECKING_CLASS_VALUE(WidgetQueryContentEvent,
+                                                    eQueryContentEventClass,
+                                                    eGUIEventClass)
+
+  WidgetEvent* Duplicate() const override {
+    NS_ASSERTION(!IsAllowedToDispatchDOMEvent(),
+                 "WidgetQueryContentEvent needs to support Duplicate()");
+    MOZ_CRASH("WidgetQueryContentEvent doesn't support Duplicate()");
+  }
+
+  struct Options final {
+    explicit Options() {}  
+    explicit Options(const WidgetQueryContentEvent& aEvent)
+        : mRelativeToInsertionPoint(aEvent.mInput.mRelativeToInsertionPoint) {}
+
+    bool mRelativeToInsertionPoint = false;
+  };
+
+  void Init(const Options& aOptions) {
+    mInput.mRelativeToInsertionPoint = aOptions.mRelativeToInsertionPoint;
+    MOZ_ASSERT(mInput.IsValidEventMessage(mMessage));
+  }
+
+  void InitForQueryTextContent(int64_t aOffset, uint32_t aLength,
+                               const Options& aOptions = Options()) {
+    NS_ASSERTION(mMessage == eQueryTextContent, "wrong initializer is called");
+    mInput.mOffset = aOffset;
+    mInput.mLength = aLength;
+    Init(aOptions);
+    MOZ_ASSERT(mInput.IsValidOffset());
+  }
+
+  void InitForQueryCaretRect(int64_t aOffset,
+                             const Options& aOptions = Options()) {
+    NS_ASSERTION(mMessage == eQueryCaretRect, "wrong initializer is called");
+    mInput.mOffset = aOffset;
+    Init(aOptions);
+    MOZ_ASSERT(mInput.IsValidOffset());
+  }
+
+  void InitForQueryTextRect(int64_t aOffset, uint32_t aLength,
+                            const Options& aOptions = Options()) {
+    NS_ASSERTION(mMessage == eQueryTextRect, "wrong initializer is called");
+    mInput.mOffset = aOffset;
+    mInput.mLength = aLength;
+    Init(aOptions);
+    MOZ_ASSERT(mInput.IsValidOffset());
+  }
+
+  void InitForQuerySelectedText(SelectionType aSelectionType,
+                                const Options& aOptions = Options()) {
+    MOZ_ASSERT(mMessage == eQuerySelectedText);
+    MOZ_ASSERT(aSelectionType != SelectionType::eNone);
+    mInput.mSelectionType = aSelectionType;
+    Init(aOptions);
+  }
+
+  void InitForQueryDOMWidgetHittest(
+      const mozilla::LayoutDeviceIntPoint& aPoint) {
+    NS_ASSERTION(mMessage == eQueryDOMWidgetHittest,
+                 "wrong initializer is called");
+    mRefPoint = aPoint;
+  }
+
+  void InitForQueryTextRectArray(uint32_t aOffset, uint32_t aLength,
+                                 const Options& aOptions = Options()) {
+    NS_ASSERTION(mMessage == eQueryTextRectArray,
+                 "wrong initializer is called");
+    mInput.mOffset = aOffset;
+    mInput.mLength = aLength;
+    Init(aOptions);
+  }
+
+  void RequestFontRanges() {
+    MOZ_ASSERT(mMessage == eQueryTextContent);
+    mWithFontRanges = true;
+  }
+
+  bool Succeeded() const {
+    if (mReply.isNothing()) {
+      return false;
+    }
+    switch (mMessage) {
+      case eQueryTextContent:
+      case eQueryTextRect:
+      case eQueryCaretRect:
+        return mReply->mOffsetAndData.isSome();
+      default:
+        return true;
+    }
+  }
+
+  bool Failed() const { return !Succeeded(); }
+
+  bool FoundSelection() const {
+    MOZ_ASSERT(mMessage == eQuerySelectedText);
+    return Succeeded() && mReply->mOffsetAndData.isSome();
+  }
+
+  bool FoundChar() const {
+    MOZ_ASSERT(mMessage == eQueryCharacterAtPoint);
+    return Succeeded() && mReply->mOffsetAndData.isSome();
+  }
+
+  bool FoundTentativeCaretOffset() const {
+    MOZ_ASSERT(mMessage == eQueryCharacterAtPoint);
+    return Succeeded() && mReply->mTentativeCaretOffset.isSome();
+  }
+
+  bool DidNotFindSelection() const {
+    MOZ_ASSERT(mMessage == eQuerySelectedText);
+    return Failed() || mReply->mOffsetAndData.isNothing();
+  }
+
+  bool DidNotFindChar() const {
+    MOZ_ASSERT(mMessage == eQueryCharacterAtPoint);
+    return Failed() || mReply->mOffsetAndData.isNothing();
+  }
+
+  bool DidNotFindTentativeCaretOffset() const {
+    MOZ_ASSERT(mMessage == eQueryCharacterAtPoint);
+    return Failed() || mReply->mTentativeCaretOffset.isNothing();
+  }
+
+  bool mWithFontRanges = false;
+  bool mNeedsToFlushLayout = true;
+
+  struct Input final {
+    uint32_t EndOffset() const {
+      CheckedInt<uint32_t> endOffset = CheckedInt<uint32_t>(mOffset) + mLength;
+      return NS_WARN_IF(!endOffset.isValid()) ? UINT32_MAX : endOffset.value();
+    }
+
+    int64_t mOffset = 0;
+    uint32_t mLength = 0;
+    SelectionType mSelectionType = SelectionType::eNormal;
+    bool mRelativeToInsertionPoint = false;
+
+    Input() = default;
+
+    bool IsValidOffset() const {
+      return mRelativeToInsertionPoint || mOffset >= 0;
+    }
+    bool IsValidEventMessage(EventMessage aEventMessage) const {
+      if (!mRelativeToInsertionPoint) {
+        return true;
+      }
+      switch (aEventMessage) {
+        case eQueryTextContent:
+        case eQueryCaretRect:
+        case eQueryTextRect:
+          return true;
+        default:
+          return false;
+      }
+    }
+    bool MakeOffsetAbsolute(uint32_t aInsertionPointOffset) {
+      if (NS_WARN_IF(!mRelativeToInsertionPoint)) {
+        return true;
+      }
+      mRelativeToInsertionPoint = false;
+      if (mOffset < 0 && -mOffset > aInsertionPointOffset) {
+        mOffset = 0;
+        return true;
+      }
+      CheckedInt<uint32_t> absOffset(mOffset + aInsertionPointOffset);
+      if (NS_WARN_IF(!absOffset.isValid())) {
+        mOffset = UINT32_MAX;
+        return false;
+      }
+      mOffset = absOffset.value();
+      return true;
+    }
+  } mInput;
+
+  struct Reply final {
+    EventMessage const mEventMessage;
+    void* mContentsRoot = nullptr;
+    Maybe<OffsetAndData<uint32_t>> mOffsetAndData;
+    Maybe<uint32_t> mTentativeCaretOffset;
+    mozilla::LayoutDeviceIntRect mRect;
+    nsIWidget* mFocusedWidget = nullptr;
+    mozilla::WritingMode mWritingMode;
+    nsCOMPtr<nsITransferable> mTransferable;
+    CopyableAutoTArray<mozilla::FontRange, 1> mFontRanges;
+    CopyableTArray<mozilla::LayoutDeviceIntRect> mRectArray;
+    bool mReversed = false;
+    bool mWidgetIsHit = false;
+    bool mIsEditableContent = false;
+    mozilla::dom::Element* mDropElement;
+    nsIFrame* mDropFrame;
+
+    Reply() = delete;
+    explicit Reply(EventMessage aEventMessage) : mEventMessage(aEventMessage) {}
+
+    Reply(const Reply& aOther) = delete;
+    Reply(Reply&& aOther) = delete;
+    Reply& operator=(const Reply& aOther) = delete;
+    Reply& operator=(Reply&& aOther) = delete;
+
+    MOZ_NEVER_INLINE_DEBUG uint32_t StartOffset() const {
+      MOZ_ASSERT(mOffsetAndData.isSome());
+      return mOffsetAndData->StartOffset();
+    }
+    MOZ_NEVER_INLINE_DEBUG uint32_t EndOffset() const {
+      MOZ_ASSERT(mOffsetAndData.isSome());
+      return mOffsetAndData->EndOffset();
+    }
+    MOZ_NEVER_INLINE_DEBUG uint32_t DataLength() const {
+      MOZ_ASSERT(mOffsetAndData.isSome() ||
+                 mEventMessage == eQuerySelectedText);
+      return mOffsetAndData.isSome() ? mOffsetAndData->Length() : 0;
+    }
+    MOZ_NEVER_INLINE_DEBUG uint32_t AnchorOffset() const {
+      MOZ_ASSERT(mEventMessage == eQuerySelectedText);
+      MOZ_ASSERT(mOffsetAndData.isSome());
+      return StartOffset() + (mReversed ? DataLength() : 0);
+    }
+
+    MOZ_NEVER_INLINE_DEBUG uint32_t FocusOffset() const {
+      MOZ_ASSERT(mEventMessage == eQuerySelectedText);
+      MOZ_ASSERT(mOffsetAndData.isSome());
+      return StartOffset() + (mReversed ? 0 : DataLength());
+    }
+
+    const WritingMode& WritingModeRef() const {
+      MOZ_ASSERT(mEventMessage == eQuerySelectedText ||
+                 mEventMessage == eQueryCaretRect ||
+                 mEventMessage == eQueryTextRect);
+      MOZ_ASSERT(mOffsetAndData.isSome() ||
+                 mEventMessage == eQuerySelectedText);
+      return mWritingMode;
+    }
+
+    MOZ_NEVER_INLINE_DEBUG const nsString& DataRef() const {
+      MOZ_ASSERT(mOffsetAndData.isSome() ||
+                 mEventMessage == eQuerySelectedText);
+      return mOffsetAndData.isSome() ? mOffsetAndData->DataRef()
+                                     : EmptyString();
+    }
+    MOZ_NEVER_INLINE_DEBUG bool IsDataEmpty() const {
+      MOZ_ASSERT(mOffsetAndData.isSome() ||
+                 mEventMessage == eQuerySelectedText);
+      return mOffsetAndData.isSome() ? mOffsetAndData->IsDataEmpty() : true;
+    }
+    MOZ_NEVER_INLINE_DEBUG bool IsOffsetInRange(uint32_t aOffset) const {
+      MOZ_ASSERT(mOffsetAndData.isSome() ||
+                 mEventMessage == eQuerySelectedText);
+      return mOffsetAndData.isSome() ? mOffsetAndData->IsOffsetInRange(aOffset)
+                                     : false;
+    }
+    MOZ_NEVER_INLINE_DEBUG bool IsOffsetInRangeOrEndOffset(
+        uint32_t aOffset) const {
+      MOZ_ASSERT(mOffsetAndData.isSome() ||
+                 mEventMessage == eQuerySelectedText);
+      return mOffsetAndData.isSome()
+                 ? mOffsetAndData->IsOffsetInRangeOrEndOffset(aOffset)
+                 : false;
+    }
+    MOZ_NEVER_INLINE_DEBUG void TruncateData(uint32_t aLength = 0) {
+      MOZ_ASSERT(mOffsetAndData.isSome());
+      mOffsetAndData->TruncateData(aLength);
+    }
+
+    friend std::ostream& operator<<(std::ostream& aStream,
+                                    const Reply& aReply) {
+      aStream << "{ ";
+      if (aReply.mEventMessage == eQuerySelectedText ||
+          aReply.mEventMessage == eQueryTextContent ||
+          aReply.mEventMessage == eQueryTextRect ||
+          aReply.mEventMessage == eQueryCaretRect ||
+          aReply.mEventMessage == eQueryCharacterAtPoint) {
+        aStream << "mOffsetAndData=" << ToString(aReply.mOffsetAndData).c_str()
+                << ", ";
+        if (aReply.mEventMessage == eQueryCharacterAtPoint) {
+          aStream << "mTentativeCaretOffset="
+                  << ToString(aReply.mTentativeCaretOffset).c_str() << ", ";
+        }
+      }
+      if (aReply.mOffsetAndData.isSome() && aReply.mOffsetAndData->Length()) {
+        if (aReply.mEventMessage == eQuerySelectedText) {
+          aStream << ", mReversed=" << (aReply.mReversed ? "true" : "false");
+        }
+        if (aReply.mEventMessage == eQuerySelectionAsTransferable) {
+          aStream << ", mTransferable=0x" << aReply.mTransferable;
+        }
+      }
+      if (aReply.mEventMessage == eQuerySelectedText ||
+          aReply.mEventMessage == eQueryTextRect ||
+          aReply.mEventMessage == eQueryCaretRect) {
+        aStream << ", mWritingMode=" << ToString(aReply.mWritingMode).c_str();
+      }
+      aStream << ", mContentsRoot=0x" << aReply.mContentsRoot
+              << ", mIsEditableContent="
+              << (aReply.mIsEditableContent ? "true" : "false")
+              << ", mFocusedWidget=0x" << aReply.mFocusedWidget;
+      if (aReply.mEventMessage == eQueryTextContent) {
+        aStream << ", mFontRanges={ Length()=" << aReply.mFontRanges.Length()
+                << " }";
+      } else if (aReply.mEventMessage == eQueryTextRect ||
+                 aReply.mEventMessage == eQueryCaretRect ||
+                 aReply.mEventMessage == eQueryCharacterAtPoint) {
+        aStream << ", mRect=" << ToString(aReply.mRect).c_str();
+      } else if (aReply.mEventMessage == eQueryTextRectArray) {
+        aStream << ", mRectArray={ Length()=" << aReply.mRectArray.Length()
+                << " }";
+      } else if (aReply.mEventMessage == eQueryDOMWidgetHittest) {
+        aStream << ", mWidgetIsHit="
+                << (aReply.mWidgetIsHit ? "true" : "false");
+      }
+      return aStream << " }";
+    }
+  };
+
+  void EmplaceReply() { mReply.emplace(mMessage); }
+  Maybe<Reply> mReply;
+
+  enum { SCROLL_ACTION_NONE, SCROLL_ACTION_LINE, SCROLL_ACTION_PAGE };
+};
+
+
+class WidgetSelectionEvent final : public WidgetGUIEvent {
+ private:
+  friend class mozilla::dom::PBrowserParent;
+  friend class mozilla::dom::PBrowserChild;
+  ALLOW_DEPRECATED_READPARAM
+
+  WidgetSelectionEvent() = default;
+
+ public:
+  NS_DEFINE_AS_EVENT_OVERRIDE(Widget, SelectionEvent);
+
+  WidgetSelectionEvent(bool aIsTrusted, EventMessage aMessage,
+                       nsIWidget* aWidget)
+      : WidgetGUIEvent(aIsTrusted, aMessage, aWidget, eSelectionEventClass) {}
+
+  NS_DEFINE_VIRTUAL_DESTRUCTOR_CHECKING_CLASS_VALUE(WidgetSelectionEvent,
+                                                    eSelectionEventClass,
+                                                    eGUIEventClass)
+
+  virtual WidgetEvent* Duplicate() const override {
+    NS_ASSERTION(!IsAllowedToDispatchDOMEvent(),
+                 "WidgetSelectionEvent needs to support Duplicate()");
+    MOZ_CRASH("WidgetSelectionEvent doesn't support Duplicate()");
+    return nullptr;
+  }
+
+  uint32_t mOffset = 0;
+  uint32_t mLength = 0;
+  bool mReversed = false;
+  bool mExpandToClusterBoundary = true;
+  bool mSucceeded = false;
+  int16_t mReason = nsISelectionListener::NO_REASON;
+};
+
+
+class InternalEditorInputEvent final : public InternalUIEvent {
+ public:
+  InternalEditorInputEvent() = delete;
+  NS_DEFINE_AS_EVENT_OVERRIDE(Internal, EditorInputEvent);
+
+  InternalEditorInputEvent(bool aIsTrusted, EventMessage aMessage,
+                           nsIWidget* aWidget = nullptr,
+                           const WidgetEventTime* aTime = nullptr)
+      : InternalUIEvent(aIsTrusted, aMessage, aWidget, eEditorInputEventClass,
+                        aTime) {}
+
+  NS_DEFINE_VIRTUAL_DESTRUCTOR_CHECKING_CLASS_VALUE(InternalEditorInputEvent,
+                                                    eEditorInputEventClass,
+                                                    eUIEventClass)
+
+  virtual WidgetEvent* Duplicate() const override {
+    MOZ_ASSERT(mClass == eEditorInputEventClass,
+               "Duplicate() must be overridden by sub class");
+    InternalEditorInputEvent* result =
+        new InternalEditorInputEvent(false, mMessage, nullptr, this);
+    result->AssignEditorInputEventData(*this, true);
+    result->mFlags = mFlags;
+    return result;
+  }
+
+  nsString mData = VoidString();
+  RefPtr<dom::DataTransfer> mDataTransfer;
+  OwningNonNullStaticRangeArray mTargetRanges;
+
+  EditorInputType mInputType = EditorInputType::eUnknown;
+
+  bool mIsComposing = false;
+
+  void AssignEditorInputEventData(const InternalEditorInputEvent& aEvent,
+                                  bool aCopyTargets) {
+    AssignUIEventData(aEvent, aCopyTargets);
+
+    mData = aEvent.mData;
+    mDataTransfer = aEvent.mDataTransfer;
+    mTargetRanges = aEvent.mTargetRanges.Clone();
+    mInputType = aEvent.mInputType;
+    mIsComposing = aEvent.mIsComposing;
+  }
+
+  void GetDOMInputTypeName(nsAString& aInputTypeName) {
+    GetDOMInputTypeName(mInputType, aInputTypeName);
+  }
+  static void GetDOMInputTypeName(EditorInputType aInputType,
+                                  nsAString& aInputTypeName);
+  static EditorInputType GetEditorInputType(const nsAString& aInputType);
+
+  static void Shutdown();
+
+ private:
+  static const char16_t* const kInputTypeNames[];
+  using InputTypeHashtable = nsTHashMap<nsStringHashKey, EditorInputType>;
+  static InputTypeHashtable* sInputTypeHashtable;
+};
+
+
+class InternalLegacyTextEvent final : public InternalUIEvent {
+ public:
+  InternalLegacyTextEvent() = delete;
+
+  NS_DEFINE_AS_EVENT_OVERRIDE(Internal, LegacyTextEvent);
+
+  InternalLegacyTextEvent(bool aIsTrusted, EventMessage aMessage,
+                          nsIWidget* aWidget = nullptr,
+                          const WidgetEventTime* aTime = nullptr)
+      : InternalUIEvent(aIsTrusted, aMessage, aWidget, eLegacyTextEventClass,
+                        aTime) {}
+
+  NS_DEFINE_VIRTUAL_DESTRUCTOR_CHECKING_CLASS_VALUE(InternalLegacyTextEvent,
+                                                    eLegacyTextEventClass,
+                                                    eUIEventClass)
+
+  virtual WidgetEvent* Duplicate() const override {
+    MOZ_ASSERT(mClass == eLegacyTextEventClass,
+               "Duplicate() must be overridden by sub class");
+    InternalLegacyTextEvent* result =
+        new InternalLegacyTextEvent(false, mMessage, nullptr, this);
+    result->AssignLegacyTextEventData(*this, true);
+    result->mFlags = mFlags;
+    return result;
+  }
+
+  nsString mData;
+  RefPtr<dom::DataTransfer> mDataTransfer;
+  EditorInputType mInputType = EditorInputType::eUnknown;
+
+  void AssignLegacyTextEventData(const InternalLegacyTextEvent& aEvent,
+                                 bool aCopyTargets) {
+    AssignUIEventData(aEvent, aCopyTargets);
+
+    mData = aEvent.mData;
+    mDataTransfer = aEvent.mDataTransfer;
+    mInputType = aEvent.mInputType;
+  }
+};
+
+}  
+
+#endif

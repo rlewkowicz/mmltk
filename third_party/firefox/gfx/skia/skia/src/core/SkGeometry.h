@@ -1,0 +1,338 @@
+/*
+ * Copyright 2006 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkGeometry_DEFINED)
+#define SkGeometry_DEFINED
+
+#include "include/core/SkPathTypes.h"
+#include "include/core/SkPoint.h"
+#include "include/core/SkScalar.h"
+#include "include/core/SkSpan.h"
+#include "include/core/SkTypes.h"
+#include "include/private/base/SkFloatingPoint.h"
+#include "src/base/SkVx.h"
+
+#include <cstring>
+
+class SkMatrix;
+struct SkRect;
+
+static inline skvx::float2 from_point(const SkPoint& point) {
+    return skvx::float2::Load(&point);
+}
+
+static inline SkPoint to_point(const skvx::float2& x) {
+    SkPoint point;
+    x.store(&point);
+    return point;
+}
+
+static skvx::float2 times_2(const skvx::float2& value) {
+    return value + value;
+}
+
+int SkFindUnitQuadRoots(SkScalar A, SkScalar B, SkScalar C, SkScalar roots[2]);
+
+float SkMeasureAngleBetweenVectors(SkVector, SkVector);
+
+SkVector SkFindBisector(SkVector, SkVector);
+
+
+SkPoint SkEvalQuadAt(const SkPoint src[3], SkScalar t);
+SkPoint SkEvalQuadTangentAt(const SkPoint src[3], SkScalar t);
+
+void SkEvalQuadAt(const SkPoint src[3], SkScalar t, SkPoint* pt, SkVector* tangent = nullptr);
+
+void SkChopQuadAt(const SkPoint src[3], SkPoint dst[5], SkScalar t);
+
+void SkChopQuadAtHalf(const SkPoint src[3], SkPoint dst[5]);
+
+inline float SkMeasureQuadRotation(const SkPoint pts[3]) {
+    return SkMeasureAngleBetweenVectors(pts[1] - pts[0], pts[2] - pts[1]);
+}
+
+float SkFindQuadMidTangent(const SkPoint src[3]);
+
+inline void SkChopQuadAtMidTangent(const SkPoint src[3], SkPoint dst[5]) {
+    SkChopQuadAt(src, dst, SkFindQuadMidTangent(src));
+}
+
+int SkFindQuadExtrema(SkScalar a, SkScalar b, SkScalar c, SkScalar tValues[1]);
+
+int SkChopQuadAtYExtrema(const SkPoint src[3], SkPoint dst[5]);
+int SkChopQuadAtXExtrema(const SkPoint src[3], SkPoint dst[5]);
+
+SkScalar SkFindQuadMaxCurvature(const SkPoint src[3]);
+
+int SkChopQuadAtMaxCurvature(const SkPoint src[3], SkPoint dst[5]);
+
+void SkConvertQuadToCubic(const SkPoint src[3], SkPoint dst[4]);
+
+
+void SkEvalCubicAt(const SkPoint src[4], SkScalar t, SkPoint* locOrNull,
+                   SkVector* tangentOrNull, SkVector* curvatureOrNull);
+
+void SkChopCubicAt(const SkPoint src[4], SkPoint dst[7], SkScalar t);
+
+void SkChopCubicAt(const SkPoint src[4], SkPoint dst[10], float t0, float t1);
+
+void SkChopCubicAt(const SkPoint src[4], SkPoint dst[], const SkScalar t[],
+                   int t_count);
+
+void SkChopCubicAtHalf(const SkPoint src[4], SkPoint dst[7]);
+
+float SkMeasureNonInflectCubicRotation(const SkPoint[4]);
+
+float SkFindCubicMidTangent(const SkPoint src[4]);
+
+inline void SkChopCubicAtMidTangent(const SkPoint src[4], SkPoint dst[7]) {
+    SkChopCubicAt(src, dst, SkFindCubicMidTangent(src));
+}
+
+int SkFindCubicExtrema(SkScalar a, SkScalar b, SkScalar c, SkScalar d,
+                       SkScalar tValues[2]);
+
+int SkChopCubicAtYExtrema(const SkPoint src[4], SkPoint dst[10]);
+int SkChopCubicAtXExtrema(const SkPoint src[4], SkPoint dst[10]);
+
+int SkFindCubicInflections(const SkPoint src[4], SkScalar tValues[2]);
+
+int SkChopCubicAtInflections(const SkPoint src[4], SkPoint dst[10]);
+
+int SkFindCubicMaxCurvature(const SkPoint src[4], SkScalar tValues[3]);
+int SkChopCubicAtMaxCurvature(const SkPoint src[4], SkPoint dst[13],
+                              SkScalar tValues[3] = nullptr);
+SkScalar SkFindCubicCusp(const SkPoint src[4]);
+
+bool SkChopMonoCubicAtX(const SkPoint src[4], SkScalar x, SkPoint dst[7]);
+
+bool SkChopMonoCubicAtY(const SkPoint src[4], SkScalar y, SkPoint dst[7]);
+
+enum class SkCubicType {
+    kSerpentine,
+    kLoop,
+    kLocalCusp,       
+    kCuspAtInfinity,  
+    kQuadratic,
+    kLineOrPoint
+};
+
+static inline bool SkCubicIsDegenerate(SkCubicType type) {
+    switch (type) {
+        case SkCubicType::kSerpentine:
+        case SkCubicType::kLoop:
+        case SkCubicType::kLocalCusp:
+        case SkCubicType::kCuspAtInfinity:
+            return false;
+        case SkCubicType::kQuadratic:
+        case SkCubicType::kLineOrPoint:
+            return true;
+    }
+    SK_ABORT("Invalid SkCubicType");
+}
+
+static inline const char* SkCubicTypeName(SkCubicType type) {
+    switch (type) {
+        case SkCubicType::kSerpentine: return "kSerpentine";
+        case SkCubicType::kLoop: return "kLoop";
+        case SkCubicType::kLocalCusp: return "kLocalCusp";
+        case SkCubicType::kCuspAtInfinity: return "kCuspAtInfinity";
+        case SkCubicType::kQuadratic: return "kQuadratic";
+        case SkCubicType::kLineOrPoint: return "kLineOrPoint";
+    }
+    SK_ABORT("Invalid SkCubicType");
+}
+
+SkCubicType SkClassifyCubic(const SkPoint p[4], double t[2] = nullptr, double s[2] = nullptr,
+                            double d[4] = nullptr);
+
+
+struct SkConic {
+    SkConic() {}
+    SkConic(const SkPoint& p0, const SkPoint& p1, const SkPoint& p2, SkScalar w) {
+        this->set(p0, p1, p2, w);
+    }
+
+    SkConic(const SkPoint pts[3], SkScalar w) {
+        this->set(pts, w);
+    }
+
+    SkPoint  fPts[3];
+    SkScalar fW;
+
+    void set(const SkPoint pts[3], SkScalar w) {
+        memcpy(fPts, pts, 3 * sizeof(SkPoint));
+        this->setW(w);
+    }
+
+    void set(const SkPoint& p0, const SkPoint& p1, const SkPoint& p2, SkScalar w) {
+        fPts[0] = p0;
+        fPts[1] = p1;
+        fPts[2] = p2;
+        this->setW(w);
+    }
+
+    void setW(SkScalar w) {
+        if (SkIsFinite(w)) {
+            SkASSERT(w > 0);
+        }
+
+        fW = w > 0 && SkIsFinite(w) ? w : 1;
+    }
+
+    void evalAt(SkScalar t, SkPoint* pos, SkVector* tangent = nullptr) const;
+    [[nodiscard]] bool chopAt(SkScalar t, SkConic dst[2]) const;
+    void chopAt(SkScalar t1, SkScalar t2, SkConic* dst) const;
+    void chop(SkConic dst[2]) const;
+
+    SkPoint evalAt(SkScalar t) const;
+    SkVector evalTangentAt(SkScalar t) const;
+
+    void computeAsQuadError(SkVector* err) const;
+    bool asQuadTol(SkScalar tol) const;
+
+    int SK_SPI computeQuadPOW2(SkScalar tol) const;
+
+    [[nodiscard]] int SK_SPI chopIntoQuadsPOW2(SkPoint pts[], int pow2) const;
+
+    float findMidTangent() const;
+    bool findXExtrema(SkScalar* t) const;
+    bool findYExtrema(SkScalar* t) const;
+    bool chopAtXExtrema(SkConic dst[2]) const;
+    bool chopAtYExtrema(SkConic dst[2]) const;
+
+    void computeTightBounds(SkRect* bounds) const;
+    void computeFastBounds(SkRect* bounds) const;
+
+
+    static SkScalar TransformW(const SkPoint[3], SkScalar w, const SkMatrix&);
+
+    enum {
+        kMaxConicsForArc = 5
+    };
+    static int BuildUnitArc(const SkVector& start, const SkVector& stop, SkPathDirection,
+                            const SkMatrix*, SkConic conics[kMaxConicsForArc]);
+};
+
+namespace {  // NOLINT(google-build-namespaces)
+
+struct SkQuadCoeff {
+    SkQuadCoeff() {}
+
+    SkQuadCoeff(const skvx::float2& A, const skvx::float2& B, const skvx::float2& C)
+        : fA(A)
+        , fB(B)
+        , fC(C)
+    {
+    }
+
+    SkQuadCoeff(const SkPoint src[3]) {
+        fC = from_point(src[0]);
+        auto P1 = from_point(src[1]);
+        auto P2 = from_point(src[2]);
+        fB = times_2(P1 - fC);
+        fA = P2 - times_2(P1) + fC;
+    }
+
+    skvx::float2 eval(const skvx::float2& tt) const {
+        return (fA * tt + fB) * tt + fC;
+    }
+
+    skvx::float2 fA;
+    skvx::float2 fB;
+    skvx::float2 fC;
+};
+
+struct SkConicCoeff {
+    SkConicCoeff(const SkConic& conic) {
+        skvx::float2 p0 = from_point(conic.fPts[0]);
+        skvx::float2 p1 = from_point(conic.fPts[1]);
+        skvx::float2 p2 = from_point(conic.fPts[2]);
+        skvx::float2 ww(conic.fW);
+
+        auto p1w = p1 * ww;
+        fNumer.fC = p0;
+        fNumer.fA = p2 - times_2(p1w) + p0;
+        fNumer.fB = times_2(p1w - p0);
+
+        fDenom.fC = 1;
+        fDenom.fB = times_2(ww - fDenom.fC);
+        fDenom.fA = 0 - fDenom.fB;
+    }
+
+    skvx::float2 eval(SkScalar t) const {
+        skvx::float2 tt(t);
+        skvx::float2 numer = fNumer.eval(tt);
+        skvx::float2 denom = fDenom.eval(tt);
+        return numer / denom;
+    }
+
+    SkQuadCoeff fNumer;
+    SkQuadCoeff fDenom;
+};
+
+struct SkCubicCoeff {
+    SkCubicCoeff(const SkPoint src[4]) {
+        skvx::float2 P0 = from_point(src[0]);
+        skvx::float2 P1 = from_point(src[1]);
+        skvx::float2 P2 = from_point(src[2]);
+        skvx::float2 P3 = from_point(src[3]);
+        skvx::float2 three(3);
+        fA = P3 + three * (P1 - P2) - P0;
+        fB = three * (P2 - times_2(P1) + P0);
+        fC = three * (P1 - P0);
+        fD = P0;
+    }
+
+    skvx::float2 eval(const skvx::float2& t) const {
+        return ((fA * t + fB) * t + fC) * t + fD;
+    }
+
+    skvx::float2 fA;
+    skvx::float2 fB;
+    skvx::float2 fC;
+    skvx::float2 fD;
+};
+
+}  
+
+#include "include/private/base/SkTemplates.h"
+
+class [[nodiscard]] SkAutoConicToQuads {
+public:
+    SkAutoConicToQuads() : fQuadCount(0) {}
+
+    const SkPoint* computeQuads(const SkConic& conic, SkScalar tol) {
+        int pow2 = conic.computeQuadPOW2(tol);
+        fQuadCount = 1 << pow2;
+        SkPoint* pts = fStorage.reset(1 + 2 * fQuadCount);
+        fQuadCount = conic.chopIntoQuadsPOW2(pts, pow2);
+        return pts;
+    }
+
+    const SkPoint* computeQuads(SkSpan<const SkPoint> pts, SkScalar weight, SkScalar tol) {
+        SkConic conic;
+        conic.set(pts.data(), weight);
+        return computeQuads(conic, tol);
+    }
+
+    const SkPoint* computeQuads(const SkPoint pts[3], SkScalar weight, SkScalar tol) {
+        return this->computeQuads({pts, 3}, weight, tol);
+    }
+
+    int countQuads() const { return fQuadCount; }
+
+private:
+    enum {
+        kQuadCount = 8, 
+        kPointCount = 1 + 2 * kQuadCount,
+    };
+    skia_private::AutoSTMalloc<kPointCount, SkPoint> fStorage;
+    int fQuadCount; 
+};
+
+#endif

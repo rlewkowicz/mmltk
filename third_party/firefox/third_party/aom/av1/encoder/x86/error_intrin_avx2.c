@@ -1,0 +1,176 @@
+/*
+ * Copyright (c) 2016, Alliance for Open Media. All rights reserved.
+ *
+ * This source code is subject to the terms of the BSD 2 Clause License and
+ * the Alliance for Open Media Patent License 1.0. If the BSD 2 Clause License
+ * was not distributed with this source code in the LICENSE file, you can
+ * obtain it at www.aomedia.org/license/software. If the Alliance for Open
+ * Media Patent License 1.0 was not distributed with this source code in the
+ * PATENTS file, you can obtain it at www.aomedia.org/license/patent.
+ */
+
+#include <immintrin.h>  // AVX2
+
+#include "config/av1_rtcd.h"
+
+#include "aom/aom_integer.h"
+
+static inline void read_coeff(const tran_low_t *coeff, intptr_t offset,
+                              __m256i *c) {
+  const tran_low_t *addr = coeff + offset;
+
+  if (sizeof(tran_low_t) == 4) {
+    const __m256i x0 = _mm256_loadu_si256((const __m256i *)addr);
+    const __m256i x1 = _mm256_loadu_si256((const __m256i *)addr + 1);
+    const __m256i y = _mm256_packs_epi32(x0, x1);
+    *c = _mm256_permute4x64_epi64(y, 0xD8);
+  } else {
+    *c = _mm256_loadu_si256((const __m256i *)addr);
+  }
+}
+
+static inline void av1_block_error_block_size16_avx2(const int16_t *coeff,
+                                                     const int16_t *dqcoeff,
+                                                     __m256i *sse_256) {
+  const __m256i _coeff = _mm256_loadu_si256((const __m256i *)coeff);
+  const __m256i _dqcoeff = _mm256_loadu_si256((const __m256i *)dqcoeff);
+  const __m256i diff = _mm256_sub_epi16(_dqcoeff, _coeff);
+  const __m256i error = _mm256_madd_epi16(diff, diff);
+  const __m256i error_hi = _mm256_hadd_epi32(error, error);
+  *sse_256 = _mm256_unpacklo_epi32(error_hi, _mm256_setzero_si256());
+}
+
+static inline void av1_block_error_block_size32_avx2(const int16_t *coeff,
+                                                     const int16_t *dqcoeff,
+                                                     __m256i *sse_256) {
+  const __m256i zero = _mm256_setzero_si256();
+  const __m256i _coeff_0 = _mm256_loadu_si256((const __m256i *)coeff);
+  const __m256i _dqcoeff_0 = _mm256_loadu_si256((const __m256i *)dqcoeff);
+  const __m256i _coeff_1 = _mm256_loadu_si256((const __m256i *)(coeff + 16));
+  const __m256i _dqcoeff_1 =
+      _mm256_loadu_si256((const __m256i *)(dqcoeff + 16));
+
+  const __m256i diff_0 = _mm256_sub_epi16(_dqcoeff_0, _coeff_0);
+  const __m256i diff_1 = _mm256_sub_epi16(_dqcoeff_1, _coeff_1);
+
+  const __m256i error_0 = _mm256_madd_epi16(diff_0, diff_0);
+  const __m256i error_1 = _mm256_madd_epi16(diff_1, diff_1);
+  const __m256i err_final_0 = _mm256_add_epi32(error_0, error_1);
+
+  const __m256i exp0_error_lo = _mm256_unpacklo_epi32(err_final_0, zero);
+  const __m256i exp0_error_hi = _mm256_unpackhi_epi32(err_final_0, zero);
+  const __m256i sum_temp_0 = _mm256_add_epi64(exp0_error_hi, exp0_error_lo);
+  *sse_256 = _mm256_add_epi64(*sse_256, sum_temp_0);
+}
+
+static inline void av1_block_error_block_size64_avx2(const int16_t *coeff,
+                                                     const int16_t *dqcoeff,
+                                                     __m256i *sse_256,
+                                                     intptr_t block_size) {
+  const __m256i zero = _mm256_setzero_si256();
+  for (int i = 0; i < block_size; i += 64) {
+    const __m256i _coeff_0 = _mm256_loadu_si256((const __m256i *)coeff);
+    const __m256i _dqcoeff_0 = _mm256_loadu_si256((const __m256i *)dqcoeff);
+    const __m256i _coeff_1 = _mm256_loadu_si256((const __m256i *)(coeff + 16));
+    const __m256i _dqcoeff_1 =
+        _mm256_loadu_si256((const __m256i *)(dqcoeff + 16));
+    const __m256i _coeff_2 = _mm256_loadu_si256((const __m256i *)(coeff + 32));
+    const __m256i _dqcoeff_2 =
+        _mm256_loadu_si256((const __m256i *)(dqcoeff + 32));
+    const __m256i _coeff_3 = _mm256_loadu_si256((const __m256i *)(coeff + 48));
+    const __m256i _dqcoeff_3 =
+        _mm256_loadu_si256((const __m256i *)(dqcoeff + 48));
+
+    const __m256i diff_0 = _mm256_sub_epi16(_dqcoeff_0, _coeff_0);
+    const __m256i diff_1 = _mm256_sub_epi16(_dqcoeff_1, _coeff_1);
+    const __m256i diff_2 = _mm256_sub_epi16(_dqcoeff_2, _coeff_2);
+    const __m256i diff_3 = _mm256_sub_epi16(_dqcoeff_3, _coeff_3);
+
+    const __m256i error_0 = _mm256_madd_epi16(diff_0, diff_0);
+    const __m256i error_1 = _mm256_madd_epi16(diff_1, diff_1);
+    const __m256i error_2 = _mm256_madd_epi16(diff_2, diff_2);
+    const __m256i error_3 = _mm256_madd_epi16(diff_3, diff_3);
+    const __m256i err_final_0 = _mm256_add_epi32(error_0, error_1);
+    const __m256i err_final_1 = _mm256_add_epi32(error_2, error_3);
+
+    const __m256i exp0_error_lo = _mm256_unpacklo_epi32(err_final_0, zero);
+    const __m256i exp0_error_hi = _mm256_unpackhi_epi32(err_final_0, zero);
+    const __m256i exp1_error_lo = _mm256_unpacklo_epi32(err_final_1, zero);
+    const __m256i exp1_error_hi = _mm256_unpackhi_epi32(err_final_1, zero);
+
+    const __m256i sum_temp_0 = _mm256_add_epi64(exp0_error_hi, exp0_error_lo);
+    const __m256i sum_temp_1 = _mm256_add_epi64(exp1_error_hi, exp1_error_lo);
+    const __m256i sse_256_temp = _mm256_add_epi64(sum_temp_1, sum_temp_0);
+    *sse_256 = _mm256_add_epi64(*sse_256, sse_256_temp);
+    coeff += 64;
+    dqcoeff += 64;
+  }
+}
+
+int64_t av1_block_error_lp_avx2(const int16_t *coeff, const int16_t *dqcoeff,
+                                intptr_t block_size) {
+  assert(block_size % 16 == 0);
+  __m256i sse_256 = _mm256_setzero_si256();
+  int64_t sse;
+
+  if (block_size == 16)
+    av1_block_error_block_size16_avx2(coeff, dqcoeff, &sse_256);
+  else if (block_size == 32)
+    av1_block_error_block_size32_avx2(coeff, dqcoeff, &sse_256);
+  else
+    av1_block_error_block_size64_avx2(coeff, dqcoeff, &sse_256, block_size);
+
+  const __m256i sse_hi = _mm256_srli_si256(sse_256, 8);
+  sse_256 = _mm256_add_epi64(sse_256, sse_hi);
+  const __m128i sse_128 = _mm_add_epi64(_mm256_castsi256_si128(sse_256),
+                                        _mm256_extractf128_si256(sse_256, 1));
+
+  _mm_storel_epi64((__m128i *)&sse, sse_128);
+  return sse;
+}
+
+int64_t av1_block_error_avx2(const tran_low_t *coeff, const tran_low_t *dqcoeff,
+                             intptr_t block_size, int64_t *ssz) {
+  __m256i sse_reg, ssz_reg, coeff_reg, dqcoeff_reg;
+  __m256i exp_dqcoeff_lo, exp_dqcoeff_hi, exp_coeff_lo, exp_coeff_hi;
+  __m256i sse_reg_64hi, ssz_reg_64hi;
+  __m128i sse_reg128, ssz_reg128;
+  int64_t sse;
+  int i;
+  const __m256i zero_reg = _mm256_setzero_si256();
+
+  sse_reg = _mm256_setzero_si256();
+  ssz_reg = _mm256_setzero_si256();
+
+  for (i = 0; i < block_size; i += 16) {
+    read_coeff(coeff, i, &coeff_reg);
+    read_coeff(dqcoeff, i, &dqcoeff_reg);
+    dqcoeff_reg = _mm256_sub_epi16(dqcoeff_reg, coeff_reg);
+    dqcoeff_reg = _mm256_madd_epi16(dqcoeff_reg, dqcoeff_reg);
+    coeff_reg = _mm256_madd_epi16(coeff_reg, coeff_reg);
+    exp_dqcoeff_lo = _mm256_unpacklo_epi32(dqcoeff_reg, zero_reg);
+    exp_dqcoeff_hi = _mm256_unpackhi_epi32(dqcoeff_reg, zero_reg);
+    exp_coeff_lo = _mm256_unpacklo_epi32(coeff_reg, zero_reg);
+    exp_coeff_hi = _mm256_unpackhi_epi32(coeff_reg, zero_reg);
+    sse_reg = _mm256_add_epi64(sse_reg, exp_dqcoeff_lo);
+    ssz_reg = _mm256_add_epi64(ssz_reg, exp_coeff_lo);
+    sse_reg = _mm256_add_epi64(sse_reg, exp_dqcoeff_hi);
+    ssz_reg = _mm256_add_epi64(ssz_reg, exp_coeff_hi);
+  }
+  sse_reg_64hi = _mm256_srli_si256(sse_reg, 8);
+  ssz_reg_64hi = _mm256_srli_si256(ssz_reg, 8);
+  sse_reg = _mm256_add_epi64(sse_reg, sse_reg_64hi);
+  ssz_reg = _mm256_add_epi64(ssz_reg, ssz_reg_64hi);
+
+  sse_reg128 = _mm_add_epi64(_mm256_castsi256_si128(sse_reg),
+                             _mm256_extractf128_si256(sse_reg, 1));
+
+  ssz_reg128 = _mm_add_epi64(_mm256_castsi256_si128(ssz_reg),
+                             _mm256_extractf128_si256(ssz_reg, 1));
+
+  _mm_storel_epi64((__m128i *)(&sse), sse_reg128);
+
+  _mm_storel_epi64((__m128i *)(ssz), ssz_reg128);
+  _mm256_zeroupper();
+  return sse;
+}

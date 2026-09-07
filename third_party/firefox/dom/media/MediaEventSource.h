@@ -1,0 +1,715 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MediaEventSource_h_
+#define MediaEventSource_h_
+
+#include <type_traits>
+#include <utility>
+
+#include "mozilla/DataMutex.h"
+#include "mozilla/Mutex.h"
+#include "nsISupportsImpl.h"
+#include "nsTArray.h"
+#include "nsThreadUtils.h"
+
+namespace mozilla {
+
+class RevocableToken {
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(RevocableToken);
+
+ public:
+  RevocableToken() = default;
+
+  virtual void Revoke() = 0;
+  virtual bool IsRevoked() const = 0;
+
+ protected:
+  virtual ~RevocableToken() = default;
+};
+
+enum class ListenerPolicy : int8_t {
+  Exclusive,
+  OneCopyPerThread,
+  NonExclusive
+};
+
+namespace detail {
+
+template <typename T>
+struct EventTypeTraits {
+  typedef T ArgType;
+};
+
+template <>
+struct EventTypeTraits<void> {
+  typedef bool ArgType;
+};
+
+template <typename T>
+class TakeArgsHelper {
+  template <typename C>
+  static std::false_type test(void (C::*)(), int);
+  template <typename C>
+  static std::false_type test(void (C::*)() const, int);
+  template <typename C>
+  static std::false_type test(void (C::*)() volatile, int);
+  template <typename C>
+  static std::false_type test(void (C::*)() const volatile, int);
+  template <typename F>
+  static std::false_type test(F&&, decltype(std::declval<F>()(), 0));
+  static std::true_type test(...);
+
+ public:
+  using type = decltype(test(std::declval<T>(), 0));
+};
+
+template <typename T>
+struct TakeArgs : public TakeArgsHelper<T>::type {};
+
+template <typename T>
+class RawPtr {
+ public:
+  explicit RawPtr(T* aPtr) : mPtr(aPtr) {}
+  T* get() const { return mPtr; }
+
+ private:
+  T* const mPtr;
+};
+
+template <typename Listener>
+class ListenerBatch {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(ListenerBatch);
+
+  explicit ListenerBatch(nsCOMPtr<nsIEventTarget>&& aTarget)
+      : mTarget(std::move(aTarget)) {}
+
+  bool MaybeAddListener(const RefPtr<Listener>& aListener) {
+    auto target = aListener->GetTarget();
+    if (!target) {
+      return true;
+    }
+    if (target != mTarget) {
+      return false;
+    }
+    mListeners.AppendElement(aListener);
+    return true;
+  }
+
+  bool CanTakeArgs() const {
+    for (auto& listener : mListeners) {
+      if (listener->CanTakeArgs()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  template <typename Storage>
+  void ApplyWithArgsTuple(Storage&& aStorage) {
+    std::apply(
+        [&](auto&&... aArgs) mutable {
+          for (auto& listener : mListeners) {
+            if (listener->CanTakeArgs()) {
+              listener->ApplyWithArgsImpl(
+                  std::forward<decltype(aArgs)>(aArgs)...);
+            } else {
+              listener->ApplyWithNoArgs();
+            }
+          }
+        },
+        std::forward<Storage>(aStorage));
+  }
+
+  void ApplyWithNoArgs() {
+    for (auto& listener : mListeners) {
+      listener->ApplyWithNoArgs();
+    }
+  }
+
+  void DispatchTask(already_AddRefed<nsIRunnable> aTask) {
+    nsCOMPtr task = aTask;
+    for (auto& listener : mListeners) {
+      if (listener->TryDispatchTask(do_AddRef(task))) {
+        return;
+      }
+    }
+  }
+
+  size_t Length() const { return mListeners.Length(); }
+
+ private:
+  ~ListenerBatch() = default;
+  nsTArray<RefPtr<Listener>> mListeners;
+  nsCOMPtr<nsIEventTarget> mTarget;
+};
+
+template <ListenerPolicy, typename Listener>
+class NotificationPolicy;
+
+template <typename Listener>
+class NotificationPolicy<ListenerPolicy::Exclusive, Listener> {
+ public:
+  using ListenerBatch = typename detail::ListenerBatch<Listener>;
+
+  template <typename... Ts>
+  static void DispatchNotifications(
+      const nsTArray<RefPtr<ListenerBatch>>& aListenerBatches,
+      Ts&&... aEvents) {
+    using Storage = std::tuple<std::decay_t<Ts>...>;
+    MOZ_ASSERT(aListenerBatches.Length() == 1);
+    auto& batch = aListenerBatches[0];
+    if (batch->CanTakeArgs()) {
+      Storage storage(std::move(aEvents)...);
+      batch->DispatchTask(NS_NewRunnableFunction(
+          "ListenerBatch::DispatchTask(with args)",
+          [batch, storage = std::move(storage)]() mutable {
+            batch->ApplyWithArgsTuple(std::move(storage));
+          }));
+    } else {
+      batch->DispatchTask(
+          NewRunnableMethod("ListenerBatch::DispatchTask(without args)", batch,
+                            &ListenerBatch::ApplyWithNoArgs));
+    }
+  }
+};
+
+template <typename Listener>
+class NotificationPolicy<ListenerPolicy::OneCopyPerThread, Listener> {
+ public:
+  using ListenerBatch = typename detail::ListenerBatch<Listener>;
+
+  template <typename... Ts>
+  static void DispatchNotifications(
+      const nsTArray<RefPtr<ListenerBatch>>& aListenerBatches,
+      Ts&&... aEvents) {
+    using Storage = std::tuple<std::decay_t<Ts>...>;
+
+    Maybe<size_t> lastBatchWithArgs;
+    for (size_t i = 0; i < aListenerBatches.Length(); ++i) {
+      if (aListenerBatches[i]->CanTakeArgs()) {
+        lastBatchWithArgs = Some(i);
+      }
+    }
+
+    Storage storage(std::move(aEvents)...);
+    for (size_t i = 0; i < aListenerBatches.Length(); ++i) {
+      auto& batch = aListenerBatches[i];
+      if (batch->CanTakeArgs()) {
+        if (i != *lastBatchWithArgs) {
+          batch->DispatchTask(
+              NS_NewRunnableFunction("ListenerBatch::DispatchTask(with args)",
+                                     [batch, storage]() mutable {
+                                       batch->ApplyWithArgsTuple(storage);
+                                     }));
+        } else {
+          batch->DispatchTask(NS_NewRunnableFunction(
+              "ListenerBatch::DispatchTask(with args)",
+              [batch, storage = std::move(storage)]() mutable {
+                batch->ApplyWithArgsTuple(storage);
+              }));
+        }
+      } else {
+        batch->DispatchTask(
+            NewRunnableMethod("ListenerBatch::DispatchTask(without args)",
+                              batch, &ListenerBatch::ApplyWithNoArgs));
+      }
+    }
+  }
+};
+
+template <typename Listener>
+class NotificationPolicy<ListenerPolicy::NonExclusive, Listener> {
+ public:
+  using ListenerBatch = typename detail::ListenerBatch<Listener>;
+
+  class SharedArgsBase {
+   public:
+    NS_INLINE_DECL_THREADSAFE_REFCOUNTING(SharedArgsBase);
+
+   protected:
+    virtual ~SharedArgsBase() = default;
+  };
+  template <typename... As>
+  class SharedArgs : public SharedArgsBase {
+   public:
+    using Storage = std::tuple<std::decay_t<As>...>;
+    explicit SharedArgs(As&&... aArgs) : mStorage(std::forward<As>(aArgs)...) {}
+    SharedArgs(const SharedArgs& aOrig) = delete;
+
+    void ApplyWithArgs(ListenerBatch* aBatch) {
+      aBatch->ApplyWithArgsTuple(mStorage);
+    }
+
+   private:
+    const Storage mStorage;
+  };
+
+  template <typename... Ts>
+  static void DispatchNotifications(
+      const nsTArray<RefPtr<ListenerBatch>>& aListenerBatches,
+      Ts&&... aEvents) {
+    RefPtr<SharedArgs<Ts...>> args;
+
+    for (auto& batch : aListenerBatches) {
+      if (batch->CanTakeArgs()) {
+        if (!args) {
+          args = MakeRefPtr<SharedArgs<Ts...>>(std::forward<Ts>(aEvents)...);
+        }
+        batch->DispatchTask(NewRunnableMethod<RefPtr<ListenerBatch>>(
+            "ListenerBatch::DispatchTask(with args)", args,
+            &SharedArgs<Ts...>::ApplyWithArgs, batch));
+      } else {
+        batch->DispatchTask(
+            NewRunnableMethod("ListenerBatch::DispatchTask(without args)",
+                              batch, &ListenerBatch::ApplyWithNoArgs));
+      }
+    }
+  }
+};
+
+class ListenerBase : public RevocableToken {
+ public:
+  virtual bool TryDispatchTask(already_AddRefed<nsIRunnable> aTask) = 0;
+
+  virtual bool CanTakeArgs() const = 0;
+  virtual void ApplyWithNoArgs() = 0;
+
+  virtual nsCOMPtr<nsIEventTarget> GetTarget() const = 0;
+};
+
+template <ListenerPolicy, typename...>
+class Listener;
+
+template <typename... As>
+class Listener<ListenerPolicy::Exclusive, As...> : public ListenerBase {
+ public:
+  virtual void ApplyWithArgsImpl(As&&... aEvents) = 0;
+};
+
+template <typename... As>
+class Listener<ListenerPolicy::OneCopyPerThread, As...> : public ListenerBase {
+ public:
+  virtual void ApplyWithArgsImpl(As&... aEvents) = 0;
+};
+
+template <typename... As>
+class Listener<ListenerPolicy::NonExclusive, As...> : public ListenerBase {
+ public:
+  virtual void ApplyWithArgsImpl(const As&... aEvents) = 0;
+};
+
+template <ListenerPolicy Policy, typename Function, typename... As>
+class ListenerImpl : public Listener<Policy, As...> {
+  using FunctionStorage = std::decay_t<Function>;
+  using SelfType = ListenerImpl<Policy, Function, As...>;
+
+ public:
+  ListenerImpl(nsCOMPtr<nsIEventTarget>&& aTarget, Function&& aFunction)
+      : mData(MakeRefPtr<Data>(std::move(aTarget),
+                               std::forward<Function>(aFunction)),
+              "MediaEvent ListenerImpl::mData") {}
+
+ protected:
+  virtual ~ListenerImpl() {
+    MOZ_ASSERT(IsRevoked(), "Must disconnect the listener.");
+  }
+
+  nsCOMPtr<nsIEventTarget> GetTarget() const override {
+    auto d = mData.Lock();
+    if (d.ref()) {
+      return d.ref()->mTarget;
+    }
+    return nullptr;
+  }
+
+  bool TryDispatchTask(already_AddRefed<nsIRunnable> aTask) override {
+    nsCOMPtr task = aTask;
+    RefPtr<Data> data;
+    {
+      auto d = mData.Lock();
+      data = *d;
+    }
+    if (!data) {
+      return false;
+    }
+    data->mTarget->Dispatch(task.forget());
+    return true;
+  }
+
+  bool CanTakeArgs() const override { return TakeArgs<FunctionStorage>::value; }
+
+  template <typename... Ts>
+  void ApplyWithArgs(Ts&&... aEvents) {
+    if constexpr (TakeArgs<Function>::value) {
+      RefPtr<Data> data;
+      {
+        auto d = mData.Lock();
+        data = *d;
+      }
+      if (!data) {
+        return;
+      }
+      MOZ_DIAGNOSTIC_ASSERT(data->mTarget->IsOnCurrentThread());
+      data->mFunction(std::forward<Ts>(aEvents)...);
+    } else {
+      MOZ_CRASH(
+          "Don't use ApplyWithArgsImpl on listeners that don't take args! Use "
+          "ApplyWithNoArgsImpl instead.");
+    }
+  }
+
+  void ApplyWithNoArgs() override {
+    if constexpr (!TakeArgs<Function>::value) {
+      RefPtr<Data> data;
+      {
+        auto d = mData.Lock();
+        data = *d;
+      }
+      if (!data) {
+        return;
+      }
+      MOZ_DIAGNOSTIC_ASSERT(data->mTarget->IsOnCurrentThread());
+      data->mFunction();
+    } else {
+      MOZ_CRASH(
+          "Don't use ApplyWithNoArgsImpl on listeners that take args! Use "
+          "ApplyWithArgsImpl instead.");
+    }
+  }
+
+  void Revoke() override {
+    {
+      auto data = mData.Lock();
+      *data = nullptr;
+    }
+  }
+
+  bool IsRevoked() const override {
+    auto data = mData.Lock();
+    return !*data;
+  }
+
+  struct RefCountedMediaEventListenerData {
+    NS_INLINE_DECL_THREADSAFE_REFCOUNTING(RefCountedMediaEventListenerData)
+   protected:
+    virtual ~RefCountedMediaEventListenerData() = default;
+  };
+  struct Data : public RefCountedMediaEventListenerData {
+    Data(nsCOMPtr<nsIEventTarget>&& aTarget, Function&& aFunction)
+        : mTarget(std::move(aTarget)),
+          mFunction(std::forward<Function>(aFunction)) {
+      MOZ_DIAGNOSTIC_ASSERT(mTarget);
+    }
+    const nsCOMPtr<nsIEventTarget> mTarget;
+    FunctionStorage mFunction;
+  };
+
+  mutable DataMutex<RefPtr<Data>> mData;
+};
+
+template <ListenerPolicy, typename, typename...>
+class ListenerImplFinal;
+
+template <typename Function, typename... As>
+class ListenerImplFinal<ListenerPolicy::Exclusive, Function, As...> final
+    : public ListenerImpl<ListenerPolicy::Exclusive, Function, As...> {
+ public:
+  using BaseType = ListenerImpl<ListenerPolicy::Exclusive, Function, As...>;
+  ListenerImplFinal(nsIEventTarget* aTarget, Function&& aFunction)
+      : BaseType(aTarget, std::forward<Function>(aFunction)) {}
+
+  void ApplyWithArgsImpl(As&&... aEvents) override {
+    BaseType::ApplyWithArgs(std::move(aEvents)...);
+  }
+};
+
+template <typename Function, typename... As>
+class ListenerImplFinal<ListenerPolicy::OneCopyPerThread, Function, As...> final
+    : public ListenerImpl<ListenerPolicy::OneCopyPerThread, Function, As...> {
+ public:
+  using BaseType =
+      ListenerImpl<ListenerPolicy::OneCopyPerThread, Function, As...>;
+  ListenerImplFinal(nsIEventTarget* aTarget, Function&& aFunction)
+      : BaseType(aTarget, std::forward<Function>(aFunction)) {}
+
+  void ApplyWithArgsImpl(As&... aEvents) override {
+    BaseType::ApplyWithArgs(aEvents...);
+  }
+};
+
+template <typename Function, typename... As>
+class ListenerImplFinal<ListenerPolicy::NonExclusive, Function, As...> final
+    : public ListenerImpl<ListenerPolicy::NonExclusive, Function, As...> {
+ public:
+  using BaseType = ListenerImpl<ListenerPolicy::NonExclusive, Function, As...>;
+  ListenerImplFinal(nsIEventTarget* aTarget, Function&& aFunction)
+      : BaseType(aTarget, std::forward<Function>(aFunction)) {}
+
+  void ApplyWithArgsImpl(const As&... aEvents) override {
+    BaseType::ApplyWithArgs(aEvents...);
+  }
+};
+
+template <typename Head, typename... Tails>
+struct IsAnyReference {
+  static const bool value =
+      std::is_reference_v<Head> || IsAnyReference<Tails...>::value;
+};
+
+template <typename T>
+struct IsAnyReference<T> {
+  static const bool value = std::is_reference_v<T>;
+};
+
+}  
+
+template <ListenerPolicy, typename... Ts>
+class MediaEventSourceImpl;
+
+class MediaEventListener {
+  template <ListenerPolicy, typename... Ts>
+  friend class MediaEventSourceImpl;
+
+ public:
+  MediaEventListener() = default;
+
+  MediaEventListener(MediaEventListener&& aOther)
+      : mToken(std::move(aOther.mToken)) {}
+
+  MediaEventListener& operator=(MediaEventListener&& aOther) {
+    MOZ_ASSERT(!mToken, "Must disconnect the listener.");
+    mToken = std::move(aOther.mToken);
+    return *this;
+  }
+
+  ~MediaEventListener() {
+    MOZ_ASSERT(!mToken, "Must disconnect the listener.");
+  }
+
+  void Disconnect() {
+    mToken->Revoke();
+    mToken = nullptr;
+  }
+
+  void DisconnectIfExists() {
+    if (mToken) {
+      Disconnect();
+    }
+  }
+
+ private:
+  explicit MediaEventListener(RevocableToken* aToken) : mToken(aToken) {}
+  RefPtr<RevocableToken> mToken;
+};
+
+template <ListenerPolicy Lp, typename... Es>
+class MediaEventSourceImpl {
+  static_assert(!detail::IsAnyReference<Es...>::value,
+                "Ref-type not supported!");
+
+  template <typename T>
+  using ArgType = typename detail::EventTypeTraits<T>::ArgType;
+
+  using Listener = detail::Listener<Lp, ArgType<Es>...>;
+
+  template <typename Func>
+  using ListenerImpl = detail::ListenerImplFinal<Lp, Func, ArgType<Es>...>;
+
+  using ListenerBatch = typename detail::ListenerBatch<Listener>;
+
+  template <typename Method>
+  using TakeArgs = detail::TakeArgs<Method>;
+
+  void PruneListeners() {
+    mListeners.RemoveElementsBy(
+        [](const auto& listener) { return listener->IsRevoked(); });
+  }
+
+  template <typename Function>
+  MediaEventListener ConnectInternal(nsIEventTarget* aTarget,
+                                     Function&& aFunction) {
+    MutexAutoLock lock(mMutex);
+    PruneListeners();
+    MOZ_ASSERT(Lp != ListenerPolicy::Exclusive || mListeners.IsEmpty());
+    auto l = mListeners.AppendElement();
+    *l = new ListenerImpl<Function>(aTarget, std::forward<Function>(aFunction));
+    return MediaEventListener(*l);
+  }
+
+ public:
+  template <typename Function>
+  MediaEventListener Connect(nsIEventTarget* aTarget, Function&& aFunction) {
+    return ConnectInternal(aTarget, std::forward<Function>(aFunction));
+  }
+
+  template <typename This, typename Method>
+  MediaEventListener Connect(nsIEventTarget* aTarget, This* aThis,
+                             Method aMethod) {
+    if constexpr (TakeArgs<Method>::value) {
+      detail::RawPtr<This> thiz(aThis);
+      if constexpr (Lp == ListenerPolicy::Exclusive) {
+        return ConnectInternal(aTarget, [=](ArgType<Es>&&... aEvents) {
+          (thiz.get()->*aMethod)(std::move(aEvents)...);
+        });
+      } else if constexpr (Lp == ListenerPolicy::OneCopyPerThread) {
+        return ConnectInternal(aTarget, [=](ArgType<Es>&... aEvents) {
+          (thiz.get()->*aMethod)(aEvents...);
+        });
+      } else if constexpr (Lp == ListenerPolicy::NonExclusive) {
+        return ConnectInternal(aTarget, [=](const ArgType<Es>&... aEvents) {
+          (thiz.get()->*aMethod)(aEvents...);
+        });
+      }
+    } else {
+      detail::RawPtr<This> thiz(aThis);
+      return ConnectInternal(aTarget, [=]() { (thiz.get()->*aMethod)(); });
+    }
+  }
+
+ protected:
+  MediaEventSourceImpl() : mMutex("MediaEventSourceImpl::mMutex") {}
+
+  template <typename... Ts>
+  void NotifyInternal(Ts&&... aEvents) {
+    MutexAutoLock lock(mMutex);
+    nsTArray<RefPtr<ListenerBatch>> listenerBatches;
+    for (size_t i = 0; i < mListeners.Length();) {
+      auto& l = mListeners[i];
+      nsCOMPtr<nsIEventTarget> target = l->GetTarget();
+      if (!target) {
+        mListeners.RemoveElementAt(i);
+        continue;
+      }
+
+      ++i;
+
+      bool added = false;
+      for (auto& batch : listenerBatches) {
+        if (batch->MaybeAddListener(l)) {
+          added = true;
+          break;
+        }
+      }
+
+      if (!added) {
+        listenerBatches.AppendElement(new ListenerBatch(nsCOMPtr(target)));
+        (void)listenerBatches.LastElement()->MaybeAddListener(l);
+      }
+    }
+
+    if (listenerBatches.Length()) {
+      detail::NotificationPolicy<Lp, Listener>::DispatchNotifications(
+          listenerBatches, std::forward<Ts>(aEvents)...);
+    }
+  }
+
+  using Listeners = nsTArray<RefPtr<Listener>>;
+
+ private:
+  Mutex mMutex MOZ_UNANNOTATED;
+  nsTArray<RefPtr<Listener>> mListeners;
+};
+
+template <typename... Es>
+using MediaEventSource =
+    MediaEventSourceImpl<ListenerPolicy::NonExclusive, Es...>;
+
+template <typename... Es>
+using MediaEventSourceExc =
+    MediaEventSourceImpl<ListenerPolicy::Exclusive, Es...>;
+
+template <typename... Es>
+using MediaEventSourceOneCopyPerThread =
+    MediaEventSourceImpl<ListenerPolicy::OneCopyPerThread, Es...>;
+
+template <typename... Es>
+class MediaEventProducer : public MediaEventSource<Es...> {
+ public:
+  template <typename... Ts>
+  void Notify(Ts&&... aEvents) {
+    this->NotifyInternal(std::forward<Ts>(aEvents)...);
+  }
+};
+
+template <>
+class MediaEventProducer<void> : public MediaEventSource<void> {
+ public:
+  void Notify() { this->NotifyInternal(true ); }
+};
+
+template <typename... Es>
+class MediaEventProducerExc : public MediaEventSourceExc<Es...> {
+ public:
+  template <typename... Ts>
+  void Notify(Ts&&... aEvents) {
+    this->NotifyInternal(std::forward<Ts>(aEvents)...);
+  }
+};
+
+template <typename... Es>
+class MediaEventProducerOneCopyPerThread
+    : public MediaEventSourceOneCopyPerThread<Es...> {
+ public:
+  template <typename... Ts>
+  void Notify(Ts&&... aEvents) {
+    this->NotifyInternal(std::forward<Ts>(aEvents)...);
+  }
+};
+
+template <typename... Es>
+class MediaEventForwarder : public MediaEventSource<Es...> {
+ public:
+  template <typename T>
+  using ArgType = typename detail::EventTypeTraits<T>::ArgType;
+
+  explicit MediaEventForwarder(nsCOMPtr<nsISerialEventTarget> aEventTarget)
+      : mEventTarget(std::move(aEventTarget)) {}
+
+  MediaEventForwarder(MediaEventForwarder&& aOther)
+      : mEventTarget(aOther.mEventTarget),
+        mListeners(std::move(aOther.mListeners)) {}
+
+  ~MediaEventForwarder() { MOZ_ASSERT(mListeners.IsEmpty()); }
+
+  MediaEventForwarder& operator=(MediaEventForwarder&& aOther) {
+    MOZ_RELEASE_ASSERT(mEventTarget == aOther.mEventTarget);
+    MOZ_ASSERT(mListeners.IsEmpty());
+    mListeners = std::move(aOther.mListeners);
+  }
+
+  void Forward(MediaEventSource<Es...>& aSource) {
+    mListeners.AppendElement(
+        aSource.Connect(mEventTarget, [this](const ArgType<Es>&... aEvents) {
+          this->NotifyInternal(aEvents...);
+        }));
+  }
+
+  template <typename Function>
+  void ForwardIf(MediaEventSource<Es...>& aSource, Function&& aFunction) {
+    mListeners.AppendElement(aSource.Connect(
+        mEventTarget, [this, func = aFunction](const ArgType<Es>&... aEvents) {
+          if (!func()) {
+            return;
+          }
+          this->NotifyInternal(aEvents...);
+        }));
+  }
+
+  void DisconnectAll() {
+    for (auto& l : mListeners) {
+      l.Disconnect();
+    }
+    mListeners.Clear();
+  }
+
+ private:
+  const nsCOMPtr<nsISerialEventTarget> mEventTarget;
+  nsTArray<MediaEventListener> mListeners;
+};
+
+}  
+
+#endif  // MediaEventSource_h_

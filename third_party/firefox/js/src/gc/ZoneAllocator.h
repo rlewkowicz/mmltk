@@ -1,0 +1,402 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef gc_ZoneAllocator_h
+#define gc_ZoneAllocator_h
+
+#include "mozilla/Maybe.h"
+
+#include "jsfriendapi.h"
+#include "jstypes.h"
+#include "gc/Allocator.h"
+#include "gc/Cell.h"
+#include "gc/Scheduling.h"
+#include "gc/Tracer.h"
+#include "js/GCAPI.h"
+#include "js/shadow/Zone.h"  // JS::shadow::Zone
+#include "js/Utility.h"
+#include "vm/MallocProvider.h"
+
+namespace JS {
+class JS_PUBLIC_API Zone;
+}  
+
+namespace js {
+
+class ZoneAllocator;
+
+#ifdef DEBUG
+bool CurrentThreadIsGCFinalizing();
+#endif
+
+namespace gc {
+void MaybeMallocTriggerZoneGC(JSRuntime* rt, ZoneAllocator* zoneAlloc,
+                              const HeapSize& heap,
+                              const HeapThreshold& threshold,
+                              JS::GCReason reason);
+}
+
+class ZoneAllocator : public JS::shadow::Zone,
+                      public js::MallocProvider<JS::Zone> {
+ protected:
+  explicit ZoneAllocator(JSRuntime* rt, Kind kind);
+  ~ZoneAllocator();
+  void fixupAfterMovingGC();
+
+ public:
+  static ZoneAllocator* from(JS::Zone* zone) {
+    return reinterpret_cast<ZoneAllocator*>(zone);
+  }
+
+  [[nodiscard]] void* onOutOfMemory(js::AllocFunction allocFunc,
+                                    arena_id_t arena, size_t nbytes,
+                                    void* reallocPtr = nullptr);
+  void reportAllocOverflow() const;
+
+  void updateSchedulingStateOnGCStart();
+  void updateGCStartThresholds(gc::GCRuntime& gc);
+  void setGCSliceThresholds(gc::GCRuntime& gc, bool waitingOnBGTask);
+  void clearGCSliceThresholds();
+
+
+  void addCellMemory(js::gc::Cell* cell, size_t nbytes, js::MemoryUse use) {
+    MOZ_ASSERT(cell);
+    MOZ_ASSERT(nbytes);
+
+    mallocHeapSize.addBytes(nbytes);
+
+#ifdef DEBUG
+    mallocTracker.trackGCMemory(cell, nbytes, use);
+#endif
+
+    maybeTriggerGCOnMalloc();
+  }
+
+  void removeCellMemory(js::gc::Cell* cell, size_t nbytes, js::MemoryUse use,
+                        bool updateRetainedSize = false) {
+    MOZ_ASSERT(cell);
+    MOZ_ASSERT(nbytes);
+    MOZ_ASSERT_IF(CurrentThreadIsGCFinalizing(), updateRetainedSize);
+
+    mallocHeapSize.removeBytes(nbytes, updateRetainedSize);
+
+#ifdef DEBUG
+    mallocTracker.untrackGCMemory(cell, nbytes, use);
+#endif
+  }
+
+  void swapCellMemory(js::gc::Cell* a, js::gc::Cell* b, js::MemoryUse use) {
+#ifdef DEBUG
+    mallocTracker.swapGCMemory(a, b, use);
+#endif
+  }
+
+  void registerNonGCMemory(void* mem, MemoryUse use) {
+#ifdef DEBUG
+    return mallocTracker.registerNonGCMemory(mem, use);
+#endif
+  }
+  void unregisterNonGCMemory(void* mem, MemoryUse use) {
+#ifdef DEBUG
+    return mallocTracker.unregisterNonGCMemory(mem, use);
+#endif
+  }
+  void moveOtherMemory(void* dst, void* src, MemoryUse use) {
+#ifdef DEBUG
+    return mallocTracker.moveNonGCMemory(dst, src, use);
+#endif
+  }
+
+  void incNonGCMemory(void* mem, size_t nbytes, MemoryUse use) {
+    MOZ_ASSERT(nbytes);
+    mallocHeapSize.addBytes(nbytes);
+
+#ifdef DEBUG
+    mallocTracker.incNonGCMemory(mem, nbytes, use);
+#endif
+
+    maybeTriggerGCOnMalloc();
+  }
+  void decNonGCMemory(void* mem, size_t nbytes, MemoryUse use,
+                      bool updateRetainedSize) {
+    MOZ_ASSERT(nbytes);
+
+    mallocHeapSize.removeBytes(nbytes, updateRetainedSize);
+
+#ifdef DEBUG
+    mallocTracker.decNonGCMemory(mem, nbytes, use);
+#endif
+  }
+
+  bool addSharedMemory(void* mem, size_t nbytes, MemoryUse use);
+  void removeSharedMemory(void* mem, size_t nbytes, MemoryUse use);
+
+  void incJitMemory(size_t nbytes) {
+    MOZ_ASSERT(nbytes);
+    jitHeapSize.addBytes(nbytes);
+    maybeTriggerZoneGC(jitHeapSize, jitHeapThreshold,
+                       JS::GCReason::TOO_MUCH_JIT_CODE);
+  }
+  void decJitMemory(size_t nbytes) {
+    MOZ_ASSERT(nbytes);
+    jitHeapSize.removeBytes(nbytes, true);
+  }
+
+  void maybeTriggerGCOnMalloc() {
+    maybeTriggerZoneGC(mallocHeapSize, mallocHeapThreshold,
+                       JS::GCReason::TOO_MUCH_MALLOC);
+  }
+
+ private:
+  void maybeTriggerZoneGC(const js::gc::HeapSize& heap,
+                          const js::gc::HeapThreshold& threshold,
+                          JS::GCReason reason) {
+    if (heap.bytes() >= threshold.startBytes()) {
+      gc::MaybeMallocTriggerZoneGC(runtimeFromAnyThread(), this, heap,
+                                   threshold, reason);
+    }
+  }
+
+  void updateCollectionRate(mozilla::TimeDuration mainThreadGCTime,
+                            size_t initialBytesForAllZones);
+
+  void updateAllocationRate(mozilla::TimeDuration mutatorTime);
+
+ public:
+  gc::PerZoneGCHeapSize gcHeapSize;
+
+  gc::GCHeapThreshold gcHeapThreshold;
+
+  gc::HeapSize mallocHeapSize;
+
+  gc::MallocHeapThreshold mallocHeapThreshold;
+
+  gc::HeapSize jitHeapSize;
+
+  gc::JitHeapThreshold jitHeapThreshold;
+
+  gc::SharedMemoryMap sharedMemoryUseCounts;
+
+  MainThreadData<mozilla::Maybe<double>> smoothedCollectionRate;
+  MainThreadOrGCTaskData<mozilla::TimeDuration> perZoneGCTime;
+
+  MainThreadData<mozilla::Maybe<double>> smoothedAllocationRate;
+  MainThreadData<size_t> prevGCHeapSize;
+
+ private:
+#ifdef DEBUG
+  gc::MemoryTracker mallocTracker;
+#endif
+
+  friend class gc::GCRuntime;
+};
+
+enum class TrackingKind { Cell, Zone };
+
+template <TrackingKind kind>
+class TrackedAllocPolicy : public MallocProvider<TrackedAllocPolicy<kind>> {
+  ZoneAllocator* zone_;
+
+#ifdef DEBUG
+  friend class js::gc::MemoryTracker;  
+#endif
+
+ public:
+  MOZ_IMPLICIT TrackedAllocPolicy(ZoneAllocator* z) : zone_(z) {
+    zone()->registerNonGCMemory(this, MemoryUse::TrackedAllocPolicy);
+  }
+  MOZ_IMPLICIT TrackedAllocPolicy(JS::Zone* z)
+      : TrackedAllocPolicy(ZoneAllocator::from(z)) {}
+  TrackedAllocPolicy(TrackedAllocPolicy& other)
+      : TrackedAllocPolicy(other.zone_) {}
+  TrackedAllocPolicy(TrackedAllocPolicy&& other) : zone_(other.zone_) {
+    zone()->moveOtherMemory(this, &other, MemoryUse::TrackedAllocPolicy);
+    other.zone_ = nullptr;
+  }
+  ~TrackedAllocPolicy() {
+    if (zone_) {
+      zone_->unregisterNonGCMemory(this, MemoryUse::TrackedAllocPolicy);
+    }
+  }
+
+  TrackedAllocPolicy& operator=(const TrackedAllocPolicy& other) {
+    zone()->unregisterNonGCMemory(this, MemoryUse::TrackedAllocPolicy);
+    zone_ = other.zone();
+    zone()->registerNonGCMemory(this, MemoryUse::TrackedAllocPolicy);
+    return *this;
+  }
+  TrackedAllocPolicy& operator=(TrackedAllocPolicy&& other) {
+    MOZ_ASSERT(this != &other);
+    zone()->unregisterNonGCMemory(this, MemoryUse::TrackedAllocPolicy);
+    zone_ = other.zone();
+    zone()->moveOtherMemory(this, &other, MemoryUse::TrackedAllocPolicy);
+    other.zone_ = nullptr;
+    return *this;
+  }
+
+
+  template <typename T>
+  void free_(T* p, size_t numElems) {
+    if (p) {
+      decMemory(numElems * sizeof(T));
+      js_free(p);
+    }
+  }
+
+
+  [[nodiscard]] void* onOutOfMemory(js::AllocFunction allocFunc,
+                                    arena_id_t arena, size_t nbytes,
+                                    void* reallocPtr = nullptr) {
+    return zone()->onOutOfMemory(allocFunc, arena, nbytes, reallocPtr);
+  }
+  void reportAllocOverflow() const { zone()->reportAllocOverflow(); }
+  void updateMallocCounter(size_t nbytes) {
+    zone()->incNonGCMemory(this, nbytes, MemoryUse::TrackedAllocPolicy);
+  }
+
+ private:
+  ZoneAllocator* zone() const {
+    MOZ_ASSERT(zone_);
+    return zone_;
+  }
+  void decMemory(size_t nbytes);
+};
+
+using ZoneAllocPolicy = TrackedAllocPolicy<TrackingKind::Zone>;
+using CellAllocPolicy = TrackedAllocPolicy<TrackingKind::Cell>;
+
+class BufferAllocPolicy : public AllocPolicyBase {
+ public:
+  JS::Zone* zone;
+  bool nurseryOwned;
+
+ public:
+  explicit BufferAllocPolicy(gc::Cell* owner)
+      : zone(owner->zone()), nurseryOwned(!owner->isTenured()) {}
+
+  explicit BufferAllocPolicy(JS::Zone* zone)
+      : zone(zone), nurseryOwned(false) {}
+
+  template <class T>
+  T* pod_malloc(size_t numElems) {
+    return maybe_pod_malloc<T>(numElems);
+  }
+
+  template <class T>
+  T* pod_calloc(size_t numElems = 1) {
+    return maybe_pod_calloc<T>(numElems);
+  }
+
+  template <class T>
+  T* pod_realloc(T* prior, size_t oldSize, size_t newSize) {
+    return maybe_pod_realloc(prior, oldSize, newSize);
+  }
+
+  template <class T>
+  T* maybe_pod_malloc(size_t numElems) {
+    size_t bytes;
+    if (MOZ_UNLIKELY(!CalculateAllocSize<T>(numElems, &bytes))) {
+      return nullptr;
+    }
+    return static_cast<T*>(gc::AllocBuffer(zone, bytes, nurseryOwned));
+  }
+
+  template <class T>
+  T* maybe_pod_calloc(size_t numElems) {
+    size_t bytes;
+    if (MOZ_UNLIKELY(!CalculateAllocSize<T>(numElems, &bytes))) {
+      return nullptr;
+    }
+    void* p = gc::AllocBuffer(zone, bytes, nurseryOwned);
+    if (!p) {
+      return nullptr;
+    }
+    memset(p, 0, bytes);
+    return static_cast<T*>(p);
+  }
+
+  template <class T>
+  T* maybe_pod_realloc(T* prior, size_t oldSize, size_t newSize) {
+    size_t bytes;
+    if (MOZ_UNLIKELY(!CalculateAllocSize<T>(newSize, &bytes))) {
+      return nullptr;
+    }
+    return static_cast<T*>(gc::ReallocBuffer(zone, prior, bytes, nurseryOwned));
+  }
+
+  template <typename T>
+  void free_(T* p, size_t numElems) {
+    if (p) {
+      FreeBuffer(zone, p);
+    }
+  }
+
+  void updateOwningGCThing(gc::Cell* maybeOwner) {
+    MOZ_ASSERT_IF(nurseryOwned, maybeOwner);
+    if (gc::Cell* owner = maybeOwner) {
+      MOZ_ASSERT(owner->zoneFromAnyThread() == zone);
+      MOZ_ASSERT_IF(!nurseryOwned, owner->isTenured());
+      if (nurseryOwned && owner->isTenured()) {
+        nurseryOwned = false;
+      }
+    }
+  }
+
+  template <typename T>
+  inline void traceOwnedAlloc(JSTracer* trc, T** bufferp, const char* name) {
+    MOZ_ASSERT(bufferp);
+    MOZ_ASSERT(*bufferp);
+    void** ptrp = reinterpret_cast<void**>(bufferp);
+    gc::TraceBufferEdgeInternal(trc, ptrp, name);
+  }
+
+  size_t getAllocSize(void* ptr, mozilla::MallocSizeOf mallocSizeOf) {
+    return gc::GetAllocSize(zone, ptr);
+  }
+
+  void reportAllocOverflow() const;
+};
+
+namespace gc {
+template <typename T, typename... Args>
+T* NewBuffer(Cell* owner, Args&&... args) {
+  return NewSizedBuffer<T>(owner->zone(), sizeof(T), IsInsideNursery(owner),
+                           std::forward<Args>(args)...);
+}
+}  
+
+
+
+inline void AddCellMemory(gc::TenuredCell* cell, size_t nbytes, MemoryUse use) {
+  if (nbytes) {
+    ZoneAllocator::from(cell->zone())->addCellMemory(cell, nbytes, use);
+  }
+}
+inline void AddCellMemory(gc::Cell* cell, size_t nbytes, MemoryUse use) {
+  if (cell->isTenured()) {
+    AddCellMemory(&cell->asTenured(), nbytes, use);
+  }
+}
+
+
+inline void RemoveCellMemory(gc::TenuredCell* cell, size_t nbytes,
+                             MemoryUse use) {
+  MOZ_ASSERT(!CurrentThreadIsGCFinalizing(),
+             "Use GCContext methods to remove associated memory in finalizers");
+
+  if (nbytes) {
+    auto zoneBase = ZoneAllocator::from(cell->zoneFromAnyThread());
+    zoneBase->removeCellMemory(cell, nbytes, use, false);
+  }
+}
+inline void RemoveCellMemory(gc::Cell* cell, size_t nbytes, MemoryUse use) {
+  if (cell->isTenured()) {
+    RemoveCellMemory(&cell->asTenured(), nbytes, use);
+  }
+}
+
+}  
+
+#endif  // gc_ZoneAllocator_h

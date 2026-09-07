@@ -1,0 +1,267 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef gc_GC_h
+#define gc_GC_h
+
+#include "gc/AllocKind.h"
+#include "gc/GCEnum.h"
+#include "js/Context.h"
+#include "js/GCAPI.h"
+#include "js/HeapAPI.h"
+#include "js/RealmIterators.h"
+#include "js/TraceKind.h"
+#include "vm/GeckoProfiler.h"
+
+class JSTracer;
+
+namespace JS {
+class RealmOptions;
+}
+
+namespace js {
+
+class Nursery;
+
+namespace gc {
+
+class Arena;
+class ArenaChunk;
+
+} 
+
+#define FOR_EACH_GC_PARAM(_)                                                \
+  _("maxBytes", JSGC_MAX_BYTES, true)                                       \
+  _("minNurseryBytes", JSGC_MIN_NURSERY_BYTES, true)                        \
+  _("maxNurseryBytes", JSGC_MAX_NURSERY_BYTES, true)                        \
+  _("gcBytes", JSGC_BYTES, false)                                           \
+  _("nurseryBytes", JSGC_NURSERY_BYTES, false)                              \
+  _("gcNumber", JSGC_NUMBER, false)                                         \
+  _("majorGCNumber", JSGC_MAJOR_GC_NUMBER, false)                           \
+  _("minorGCNumber", JSGC_MINOR_GC_NUMBER, false)                           \
+  _("sliceNumber", JSGC_SLICE_NUMBER, false)                                \
+  _("incrementalGCEnabled", JSGC_INCREMENTAL_GC_ENABLED, true)              \
+  _("perZoneGCEnabled", JSGC_PER_ZONE_GC_ENABLED, true)                     \
+  _("unusedChunks", JSGC_UNUSED_CHUNKS, false)                              \
+  _("totalChunks", JSGC_TOTAL_CHUNKS, false)                                \
+  _("sliceTimeBudgetMS", JSGC_SLICE_TIME_BUDGET_MS, true)                   \
+  _("highFrequencyTimeLimit", JSGC_HIGH_FREQUENCY_TIME_LIMIT, true)         \
+  _("smallHeapSizeMax", JSGC_SMALL_HEAP_SIZE_MAX, true)                     \
+  _("largeHeapSizeMin", JSGC_LARGE_HEAP_SIZE_MIN, true)                     \
+  _("highFrequencySmallHeapGrowth", JSGC_HIGH_FREQUENCY_SMALL_HEAP_GROWTH,  \
+    true)                                                                   \
+  _("highFrequencyLargeHeapGrowth", JSGC_HIGH_FREQUENCY_LARGE_HEAP_GROWTH,  \
+    true)                                                                   \
+  _("lowFrequencyHeapGrowth", JSGC_LOW_FREQUENCY_HEAP_GROWTH, true)         \
+  _("balancedHeapLimitsEnabled", JSGC_BALANCED_HEAP_LIMITS_ENABLED, true)   \
+  _("heapGrowthFactor", JSGC_HEAP_GROWTH_FACTOR, true)                      \
+  _("allocationThreshold", JSGC_ALLOCATION_THRESHOLD, true)                 \
+  _("smallHeapIncrementalLimit", JSGC_SMALL_HEAP_INCREMENTAL_LIMIT, true)   \
+  _("largeHeapIncrementalLimit", JSGC_LARGE_HEAP_INCREMENTAL_LIMIT, true)   \
+  _("minEmptyChunkCount", JSGC_MIN_EMPTY_CHUNK_COUNT, true)                 \
+  _("compactingEnabled", JSGC_COMPACTING_ENABLED, true)                     \
+  _("nurseryEnabled", JSGC_NURSERY_ENABLED, true)                           \
+  _("parallelMarkingEnabled", JSGC_PARALLEL_MARKING_ENABLED, true)          \
+  _("concurrentMarkingEnabled", JSGC_CONCURRENT_MARKING_ENABLED, true)      \
+  _("parallelMarkingThresholdMB", JSGC_PARALLEL_MARKING_THRESHOLD_MB, true) \
+  _("minLastDitchGCPeriod", JSGC_MIN_LAST_DITCH_GC_PERIOD, true)            \
+  _("nurseryEagerCollectionThresholdKB",                                    \
+    JSGC_NURSERY_EAGER_COLLECTION_THRESHOLD_KB, true)                       \
+  _("nurseryEagerCollectionThresholdPercent",                               \
+    JSGC_NURSERY_EAGER_COLLECTION_THRESHOLD_PERCENT, true)                  \
+  _("nurseryEagerCollectionTimeoutMS",                                      \
+    JSGC_NURSERY_EAGER_COLLECTION_TIMEOUT_MS, true)                         \
+  _("nurseryMaxTimeGoalMS", JSGC_NURSERY_MAX_TIME_GOAL_MS, true)            \
+  _("zoneAllocDelayKB", JSGC_ZONE_ALLOC_DELAY_KB, true)                     \
+  _("mallocThresholdBase", JSGC_MALLOC_THRESHOLD_BASE, true)                \
+  _("urgentThreshold", JSGC_URGENT_THRESHOLD_MB, true)                      \
+  _("chunkBytes", JSGC_CHUNK_BYTES, false)                                  \
+  _("helperThreadRatio", JSGC_HELPER_THREAD_RATIO, true)                    \
+  _("maxHelperThreads", JSGC_MAX_HELPER_THREADS, true)                      \
+  _("helperThreadCount", JSGC_HELPER_THREAD_COUNT, false)                   \
+  _("maxMarkingThreads", JSGC_MAX_MARKING_THREADS, true)                    \
+  _("markingThreadCount", JSGC_MARKING_THREAD_COUNT, false)                 \
+  _("systemPageSizeKB", JSGC_SYSTEM_PAGE_SIZE_KB, false)                    \
+  _("semispaceNurseryEnabled", JSGC_SEMISPACE_NURSERY_ENABLED, true)        \
+  _("generateMissingAllocSites", JSGC_GENERATE_MISSING_ALLOC_SITES, true)   \
+  _("highFrequencyMode", JSGC_HIGH_FREQUENCY_MODE, false)                   \
+  _("storeBufferEntries", JSGC_STORE_BUFFER_ENTRIES, true)                  \
+  _("storeBufferScaling", JSGC_STORE_BUFFER_SCALING, true)                  \
+  _("incrementalWeakMapMarkingEnabled", JSGC_INCREMENTAL_WEAKMAP_ENABLED, true)
+
+extern bool GetGCParameterInfo(const char* name, JSGCParamKey* keyOut,
+                               bool* writableOut);
+
+namespace gc {
+
+void FinishGC(JSContext* cx, JS::GCReason = JS::GCReason::FINISH_GC);
+
+class MOZ_RAII AutoHeapSession {
+ public:
+  ~AutoHeapSession();
+  AutoHeapSession(const AutoHeapSession&) = delete;
+  void operator=(const AutoHeapSession&) = delete;
+
+ protected:
+  AutoHeapSession(GCRuntime* gc, JS::HeapState state);
+
+ private:
+  GCRuntime* gc;
+  JS::HeapState prevState;
+  mozilla::Maybe<AutoGeckoProfilerEntry> profilingStackFrame;
+};
+
+class MOZ_RAII AutoTraceSession : public AutoHeapSession,
+                                  public JS::AutoCheckCannotGC {
+ public:
+  explicit AutoTraceSession(JSRuntime* rt);
+};
+
+struct MOZ_RAII AutoFinishGC {
+  explicit AutoFinishGC(JSContext* cx, JS::GCReason reason) {
+    FinishGC(cx, reason);
+  }
+};
+
+class MOZ_RAII AutoPrepareForTracing : private AutoFinishGC,
+                                       public AutoTraceSession {
+ public:
+  explicit AutoPrepareForTracing(JSContext* cx)
+      : AutoFinishGC(cx, JS::GCReason::PREPARE_FOR_TRACING),
+        AutoTraceSession(JS_GetRuntime(cx)) {}
+};
+
+}  
+
+extern void TraceRuntime(JSTracer* trc);
+
+extern void TraceRuntimeWithoutEviction(JSTracer* trc);
+
+extern void ReleaseAllJITCode(JS::GCContext* gcx);
+
+extern void PrepareForDebugGC(JSRuntime* rt);
+
+
+extern void NotifyGCNukeWrapper(JSContext* cx, JSObject* wrapper);
+
+extern unsigned NotifyGCPreSwap(JSObject* a, JSObject* b);
+
+extern void NotifyGCPostSwap(JSObject* a, JSObject* b, unsigned removedFlags);
+
+using IterateChunkCallback = void (*)(JSRuntime*, void*, gc::ArenaChunk*,
+                                      const JS::AutoRequireNoGC&);
+using IterateZoneCallback = void (*)(JSRuntime*, void*, JS::Zone*,
+                                     const JS::AutoRequireNoGC&);
+using IterateArenaCallback = void (*)(JSRuntime*, void*, gc::Arena*,
+                                      JS::TraceKind, size_t,
+                                      const JS::AutoRequireNoGC&);
+using IterateCellCallback = void (*)(JSRuntime*, void*, JS::GCCellPtr, size_t,
+                                     const JS::AutoRequireNoGC&);
+
+extern void IterateHeapUnbarriered(JSContext* cx, void* data,
+                                   IterateZoneCallback zoneCallback,
+                                   JS::IterateRealmCallback realmCallback,
+                                   IterateArenaCallback arenaCallback,
+                                   IterateCellCallback cellCallback,
+                                   const js::gc::AutoTraceSession& session);
+
+extern void IterateHeapUnbarrieredForZone(
+    JSContext* cx, JS::Zone* zone, void* data, IterateZoneCallback zoneCallback,
+    JS::IterateRealmCallback realmCallback, IterateArenaCallback arenaCallback,
+    IterateCellCallback cellCallback, const js::gc::AutoTraceSession& session);
+
+extern void IterateChunks(JSContext* cx, void* data,
+                          IterateChunkCallback chunkCallback,
+                          const js::gc::AutoTraceSession& session);
+
+using IterateScriptCallback = void (*)(JSRuntime*, void*, BaseScript*,
+                                       const JS::AutoRequireNoGC&);
+
+extern void IterateScripts(JSContext* cx, JS::Realm* realm, void* data,
+                           IterateScriptCallback scriptCallback);
+
+JS::Realm* NewRealm(JSContext* cx, JSPrincipals* principals,
+                    const JS::RealmOptions& options);
+
+namespace gc {
+
+void WaitForBackgroundTasks(JSContext* cx);
+
+enum VerifierType { PreBarrierVerifier, PostBarrierVerifier };
+
+#ifdef JS_GC_ZEAL
+
+extern const char ZealModeHelpText[];
+
+void VerifyBarriers(JSRuntime* rt, VerifierType type);
+
+void MaybeVerifyBarriers(JSContext* cx, bool always = false);
+
+void DumpArenaInfo();
+
+#else
+
+static inline void VerifyBarriers(JSRuntime* rt, VerifierType type) {}
+
+static inline void MaybeVerifyBarriers(JSContext* cx, bool always = false) {}
+
+#endif
+
+class MOZ_RAII JS_HAZ_GC_SUPPRESSED AutoSuppressGC
+    : public JS::AutoRequireNoGC {
+  int32_t& suppressGC_;
+
+ public:
+  explicit AutoSuppressGC(JSContext* cx);
+
+  ~AutoSuppressGC() { suppressGC_--; }
+};
+
+const char* StateName(State state);
+
+} 
+
+class MOZ_RAII AutoDisableProxyCheck {
+ public:
+#ifdef DEBUG
+  AutoDisableProxyCheck();
+  ~AutoDisableProxyCheck();
+#else
+  AutoDisableProxyCheck() {}
+#endif
+};
+
+struct MOZ_RAII AutoDisableCompactingGC {
+  explicit AutoDisableCompactingGC(JSContext* cx);
+  ~AutoDisableCompactingGC();
+
+ private:
+  JSContext* cx;
+};
+
+class MOZ_RAII AutoSelectGCHeap {
+ public:
+  explicit AutoSelectGCHeap(JSContext* cx,
+                            size_t allowedNurseryCollections = 0);
+  ~AutoSelectGCHeap();
+
+  gc::Heap heap() const { return heap_; }
+  operator gc::Heap() const { return heap_; }
+
+  void onNurseryCollectionEnd();
+
+ private:
+  static void NurseryCollectionCallback(JSContext* cx,
+                                        JS::GCNurseryProgress progress,
+                                        JS::GCReason reason, void* data);
+
+  JSContext* cx_;
+  size_t allowedNurseryCollections_;
+  gc::Heap heap_ = gc::Heap::Default;
+};
+
+} 
+
+#endif /* gc_GC_h */

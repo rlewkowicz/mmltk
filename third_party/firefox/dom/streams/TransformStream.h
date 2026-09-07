@@ -1,0 +1,89 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_STREAMS_TRANSFORMSTREAM_H_
+#define DOM_STREAMS_TRANSFORMSTREAM_H_
+
+#include "TransformStreamDefaultController.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/QueuingStrategyBinding.h"
+#include "mozilla/dom/TransformerBinding.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsWrapperCache.h"
+
+namespace mozilla::dom {
+
+class WritableStream;
+class ReadableStream;
+class UniqueMessagePortId;
+class MessagePort;
+class TransformerAlgorithmsWrapper;
+
+class TransformStream final : public nsISupports, public nsWrapperCache {
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(TransformStream)
+
+  MOZ_CAN_RUN_SCRIPT static already_AddRefed<TransformStream> CreateGeneric(
+      const GlobalObject& aGlobal, TransformerAlgorithmsWrapper& aAlgorithms,
+      ErrorResult& aRv);
+
+  bool Backpressure() const { return mBackpressure; }
+  Promise* BackpressureChangePromise() { return mBackpressureChangePromise; }
+  void SetBackpressure(bool aBackpressure);
+  MOZ_KNOWN_LIVE TransformStreamDefaultController* Controller() {
+    return mController;
+  }
+  void SetController(TransformStreamDefaultController& aController) {
+    MOZ_ASSERT(!mController);
+    mController = &aController;
+  }
+
+  MOZ_CAN_RUN_SCRIPT bool Transfer(JSContext* aCx,
+                                   UniqueMessagePortId& aPortId1,
+                                   UniqueMessagePortId& aPortId2);
+  static MOZ_CAN_RUN_SCRIPT bool ReceiveTransfer(
+      JSContext* aCx, nsIGlobalObject* aGlobal, MessagePort& aPort1,
+      MessagePort& aPort2, JS::MutableHandle<JSObject*> aReturnObject);
+
+ protected:
+  TransformStream(nsIGlobalObject* aGlobal, ReadableStream* aReadable,
+                  WritableStream* aWritable);
+  explicit TransformStream(nsIGlobalObject* aGlobal);
+
+  ~TransformStream();
+
+  MOZ_CAN_RUN_SCRIPT void Initialize(
+      JSContext* aCx, Promise* aStartPromise, double aWritableHighWaterMark,
+      QueuingStrategySize* aWritableSizeAlgorithm,
+      double aReadableHighWaterMark,
+      QueuingStrategySize* aReadableSizeAlgorithm, ErrorResult& aRv);
+
+ public:
+  nsIGlobalObject* GetParentObject() const { return mGlobal; }
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY static already_AddRefed<TransformStream>
+  Constructor(const GlobalObject& aGlobal,
+              const Optional<JS::Handle<JSObject*>>& aTransformer,
+              const QueuingStrategy& aWritableStrategy,
+              const QueuingStrategy& aReadableStrategy, ErrorResult& aRv);
+
+  ReadableStream* Readable() const { return mReadable; }
+  WritableStream* Writable() const { return mWritable; }
+
+ private:
+  nsCOMPtr<nsIGlobalObject> mGlobal;
+
+  bool mBackpressure = false;
+  RefPtr<Promise> mBackpressureChangePromise;
+  RefPtr<TransformStreamDefaultController> mController;
+  RefPtr<ReadableStream> mReadable;
+  RefPtr<WritableStream> mWritable;
+};
+
+}  
+
+#endif  // DOM_STREAMS_TRANSFORMSTREAM_H_

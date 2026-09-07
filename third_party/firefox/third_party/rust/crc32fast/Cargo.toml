@@ -1,0 +1,26 @@
+
+[package]
+name = "crc32fast"
+version = "1.4.2"
+authors = [
+    "Sam Rijs <srijs@airpost.net>",
+    "Alex Crichton <alex@alexcrichton.com>",
+]
+description = "Fast, SIMD-accelerated CRC32 (IEEE) checksum computation"
+keywords = [
+    "checksum",
+    "crc",
+    "crc32",
+    "simd",
+    "fast",
+]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/srijs/rust-crc32fast"
+
+[dependencies.cfg-if]
+version = "1.0"
+
+[features]
+default = ["std"]
+nightly = []
+std = []

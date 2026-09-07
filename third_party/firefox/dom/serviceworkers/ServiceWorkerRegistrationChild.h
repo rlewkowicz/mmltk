@@ -1,0 +1,47 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_serviceworkerregistrationchild_h_
+#define mozilla_dom_serviceworkerregistrationchild_h_
+
+#include "mozilla/dom/PServiceWorkerRegistrationChild.h"
+
+#include "mozilla/dom/WorkerRef.h"
+
+namespace mozilla::dom {
+
+class IPCWorkerRef;
+class ServiceWorkerRegistration;
+
+class ServiceWorkerRegistrationChild final
+    : public PServiceWorkerRegistrationChild {
+  RefPtr<IPCWorkerRef> mIPCWorkerRef;
+  ServiceWorkerRegistration* mOwner;
+
+  ServiceWorkerRegistrationChild();
+
+  ~ServiceWorkerRegistrationChild() = default;
+
+  void ActorDestroy(ActorDestroyReason aReason) override;
+
+  mozilla::ipc::IPCResult RecvUpdateState(
+      const IPCServiceWorkerRegistrationDescriptor& aDescriptor) override;
+
+  mozilla::ipc::IPCResult RecvFireUpdateFound() override;
+
+ public:
+  NS_INLINE_DECL_REFCOUNTING(ServiceWorkerRegistrationChild, override);
+
+  static RefPtr<ServiceWorkerRegistrationChild> Create();
+
+  void SetOwner(ServiceWorkerRegistration* aOwner);
+
+  void RevokeOwner(ServiceWorkerRegistration* aOwner);
+
+  void Shutdown();
+};
+
+}  
+
+#endif  // mozilla_dom_serviceworkerregistrationchild_h_

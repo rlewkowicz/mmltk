@@ -1,0 +1,381 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsListControlFrame.h"
+
+#include <algorithm>
+
+#include "mozilla/Attributes.h"
+#include "mozilla/LookAndFeel.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/ReflowInput.h"
+#include "mozilla/dom/HTMLOptGroupElement.h"
+#include "mozilla/dom/HTMLOptionsCollection.h"
+#include "mozilla/dom/HTMLSelectElement.h"
+#include "nsCSSRendering.h"
+#include "nsComboboxControlFrame.h"
+#include "nsContentUtils.h"
+#include "nsDisplayList.h"
+#include "nsFontMetrics.h"
+#include "nsGkAtoms.h"
+#include "nsLayoutUtils.h"
+#include "nscore.h"
+
+using namespace mozilla;
+using namespace mozilla::dom;
+
+nsListControlFrame* NS_NewListControlFrame(PresShell* aPresShell,
+                                           ComputedStyle* aStyle) {
+  return new (aPresShell)
+      nsListControlFrame(aStyle, aPresShell->GetPresContext());
+}
+
+NS_IMPL_FRAMEARENA_HELPERS(nsListControlFrame)
+
+nsListControlFrame::nsListControlFrame(ComputedStyle* aStyle,
+                                       nsPresContext* aPresContext)
+    : ScrollContainerFrame(aStyle, aPresContext, kClassID, false),
+      mNeedToReset(true),
+      mPostChildrenLoadedReset(false),
+      mMightNeedSecondPass(false),
+      mReflowWasInterrupted(false) {}
+
+nsListControlFrame::~nsListControlFrame() = default;
+
+Maybe<nscoord> nsListControlFrame::GetNaturalBaselineBOffset(
+    WritingMode aWM, BaselineSharingGroup aBaselineGroup,
+    BaselineExportContext) const {
+  return Nothing{};
+}
+
+HTMLOptionElement* nsListControlFrame::GetCurrentOption() const {
+  return Select().GetCurrentOption();
+}
+
+bool nsListControlFrame::IsFocused() const {
+  return Select().State().HasState(ElementState::FOCUS);
+}
+
+void nsListControlFrame::InvalidateFocus() { InvalidateFrame(); }
+
+NS_QUERYFRAME_HEAD(nsListControlFrame)
+  NS_QUERYFRAME_ENTRY(nsListControlFrame)
+NS_QUERYFRAME_TAIL_INHERITING(ScrollContainerFrame)
+
+#ifdef ACCESSIBILITY
+a11y::AccType nsListControlFrame::AccessibleType() {
+  return a11y::eHTMLSelectListType;
+}
+#endif
+
+static bool GetMaxRowBSize(nsIFrame* aContainer, WritingMode aWM,
+                           nscoord* aResult) {
+  bool found = false;
+  for (nsIFrame* child : aContainer->PrincipalChildList()) {
+    if (child->GetContent()->IsHTMLElement(nsGkAtoms::optgroup)) {
+      auto inner = child->GetContentInsertionFrame();
+      if (inner && GetMaxRowBSize(inner, aWM, aResult)) {
+        found = true;
+      }
+    } else {
+      bool isOptGroupLabel =
+          child->Style()->IsPseudoElement() &&
+          aContainer->GetContent()->IsHTMLElement(nsGkAtoms::optgroup);
+      nscoord childBSize = child->BSize(aWM);
+      if (!isOptGroupLabel || childBSize > nscoord(0)) {
+        found = true;
+        *aResult = std::max(childBSize, *aResult);
+      }
+    }
+  }
+  return found;
+}
+
+
+nscoord nsListControlFrame::CalcBSizeOfARow() {
+  nscoord rowBSize(0);
+  if (GetContainSizeAxes().mBContained ||
+      !GetMaxRowBSize(GetContentInsertionFrame(), GetWritingMode(),
+                      &rowBSize)) {
+    float inflation = nsLayoutUtils::FontSizeInflationFor(this);
+    rowBSize = CalcFallbackRowBSize(inflation);
+  }
+  return rowBSize;
+}
+
+nscoord nsListControlFrame::IntrinsicISize(const IntrinsicSizeInput& aInput,
+                                           IntrinsicISizeType aType) {
+  WritingMode wm = GetWritingMode();
+  nscoord result;
+  if (Maybe<nscoord> containISize = ContainIntrinsicISize()) {
+    result = *containISize;
+  } else {
+    result = GetScrolledFrame()->IntrinsicISize(aInput, aType);
+  }
+  LogicalMargin scrollbarSize(wm, GetDesiredScrollbarSizes());
+  result = NSCoordSaturatingAdd(result, scrollbarSize.IStartEnd(wm));
+  return result;
+}
+
+void nsListControlFrame::Reflow(nsPresContext* aPresContext,
+                                ReflowOutput& aDesiredSize,
+                                const ReflowInput& aReflowInput,
+                                nsReflowStatus& aStatus) {
+  MOZ_ASSERT(aStatus.IsEmpty(), "Caller should pass a fresh reflow status!");
+  NS_WARNING_ASSERTION(aReflowInput.ComputedISize() != NS_UNCONSTRAINEDSIZE,
+                       "Must have a computed inline size");
+
+  const bool hadPendingInterrupt = aPresContext->HasPendingInterrupt();
+
+  SchedulePaint();
+
+  MarkInReflow();
+  bool autoBSize = (aReflowInput.ComputedBSize() == NS_UNCONSTRAINEDSIZE);
+  Maybe<nscoord> containBSize = ContainIntrinsicBSize(NS_UNCONSTRAINEDSIZE);
+  bool usingContainBSize =
+      autoBSize && containBSize && *containBSize != NS_UNCONSTRAINEDSIZE;
+
+  mMightNeedSecondPass = [&] {
+    if (!autoBSize) {
+      return false;
+    }
+    if (!IsSubtreeDirty() && !aReflowInput.ShouldReflowAllKids()) {
+      return false;
+    }
+    if (usingContainBSize) {
+      return false;
+    }
+    return true;
+  }();
+
+  ReflowInput state(aReflowInput);
+  int32_t length = GetNumberOfRows();
+
+  nscoord oldBSizeOfARow = BSizeOfARow();
+
+  if (!HasAnyStateBits(NS_FRAME_FIRST_REFLOW) && autoBSize) {
+    nscoord computedBSize = CalcIntrinsicBSize(oldBSizeOfARow, length);
+    computedBSize = state.ApplyMinMaxBSize(computedBSize);
+    state.SetComputedBSize(computedBSize);
+  }
+
+  if (usingContainBSize) {
+    state.SetComputedBSize(*containBSize);
+  }
+
+  ScrollContainerFrame::Reflow(aPresContext, aDesiredSize, state, aStatus);
+
+  mBSizeOfARow = CalcBSizeOfARow();
+
+  if (!mMightNeedSecondPass) {
+    NS_ASSERTION(
+        !autoBSize || usingContainBSize || BSizeOfARow() == oldBSizeOfARow,
+        "How did our BSize of a row change if nothing was dirty?");
+    NS_ASSERTION(!autoBSize || usingContainBSize ||
+                     !HasAnyStateBits(NS_FRAME_FIRST_REFLOW),
+                 "How do we not need a second pass during initial reflow at "
+                 "auto BSize?");
+    if (!autoBSize || usingContainBSize) {
+      nscoord rowBSize = CalcBSizeOfARow();
+      if (rowBSize == 0) {
+        mNumDisplayRows = 1;
+      } else {
+        mNumDisplayRows = std::max(1, state.ComputedBSize() / rowBSize);
+      }
+    }
+
+    return;
+  }
+
+  mMightNeedSecondPass = false;
+
+  if (mBSizeOfARow == oldBSizeOfARow) {
+    return;
+  }
+
+  ScrollContainerFrame::DidReflow(aPresContext, &state);
+
+  nscoord computedBSize = CalcIntrinsicBSize(BSizeOfARow(), length);
+  computedBSize = state.ApplyMinMaxBSize(computedBSize);
+  state.SetComputedBSize(computedBSize);
+
+  aStatus.Reset();
+  ScrollContainerFrame::Reflow(aPresContext, aDesiredSize, state, aStatus);
+
+  mReflowWasInterrupted |=
+      !hadPendingInterrupt && aPresContext->HasPendingInterrupt();
+}
+
+static uint32_t CountOptionsAndOptgroups(nsIFrame* aFrame) {
+  uint32_t count = 0;
+  for (nsIFrame* child : aFrame->PrincipalChildList()) {
+    nsIContent* content = child->GetContent();
+    if (content) {
+      if (content->IsHTMLElement(nsGkAtoms::option)) {
+        ++count;
+      } else {
+        RefPtr<HTMLOptGroupElement> optgroup =
+            HTMLOptGroupElement::FromNode(content);
+        if (optgroup) {
+          nsAutoString label;
+          optgroup->GetLabel(label);
+          if (label.Length() > 0) {
+            ++count;
+          }
+          count += CountOptionsAndOptgroups(child);
+        }
+      }
+    }
+  }
+  return count;
+}
+
+uint32_t nsListControlFrame::GetNumberOfRows() {
+  return ::CountOptionsAndOptgroups(GetContentInsertionFrame());
+}
+
+nsresult nsListControlFrame::HandleEvent(nsPresContext* aPresContext,
+                                         WidgetGUIEvent* aEvent,
+                                         nsEventStatus* aEventStatus) {
+  NS_ENSURE_ARG_POINTER(aEventStatus);
+
+
+  if (nsEventStatus_eConsumeNoDefault == *aEventStatus) {
+    return NS_OK;
+  }
+
+  if (IsContentDisabled()) {
+    return nsIFrame::HandleEvent(aPresContext, aEvent, aEventStatus);
+  }
+
+  return ScrollContainerFrame::HandleEvent(aPresContext, aEvent, aEventStatus);
+}
+
+HTMLSelectElement& nsListControlFrame::Select() const {
+  return *static_cast<HTMLSelectElement*>(GetContent());
+}
+
+void nsListControlFrame::Init(nsIContent* aContent, nsContainerFrame* aParent,
+                              nsIFrame* aPrevInFlow) {
+  ScrollContainerFrame::Init(aContent, aParent, aPrevInFlow);
+}
+
+dom::HTMLOptionElement* nsListControlFrame::GetOption(uint32_t aIndex) const {
+  return Select().Item(aIndex);
+}
+
+void nsListControlFrame::OnSelectionReset() {
+  mPostChildrenLoadedReset = true;
+  InvalidateFocus();
+}
+
+void nsListControlFrame::ElementStateChanged(ElementState aStates) {
+  if (aStates.HasState(ElementState::FOCUS)) {
+    InvalidateFocus();
+  }
+}
+
+void nsListControlFrame::GetOptionText(uint32_t aIndex, nsAString& aStr) {
+  aStr.Truncate();
+  if (dom::HTMLOptionElement* optionElement = GetOption(aIndex)) {
+    optionElement->GetRenderedLabel(aStr);
+  }
+}
+
+void nsListControlFrame::OptionsAdded() {
+  mNeedToReset = true;
+
+  if (Select().IsDoneAddingChildren()) {
+    mPostChildrenLoadedReset = true;
+  }
+}
+
+class AsyncReset final : public Runnable {
+ public:
+  AsyncReset(HTMLSelectElement& aElement, bool aScroll)
+      : Runnable("AsyncReset"), mElement(&aElement), mScroll(aScroll) {}
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY NS_IMETHOD Run() override {
+    MOZ_KnownLive(mElement)->ResetListBoxSelection(mScroll);
+    return NS_OK;
+  }
+
+ private:
+  const RefPtr<HTMLSelectElement> mElement;
+  const bool mScroll;
+};
+
+bool nsListControlFrame::ReflowFinished() {
+  if (mNeedToReset && !mReflowWasInterrupted) {
+    mNeedToReset = false;
+    const bool scroll = !DidHistoryRestore() || mPostChildrenLoadedReset;
+    nsContentUtils::AddScriptRunner(
+        MakeAndAddRef<AsyncReset>(Select(), scroll));
+  }
+  mReflowWasInterrupted = false;
+  return ScrollContainerFrame::ReflowFinished();
+}
+
+#ifdef DEBUG_FRAME_DUMP
+nsresult nsListControlFrame::GetFrameName(nsAString& aResult) const {
+  return MakeFrameName(u"ListControl"_ns, aResult);
+}
+#endif
+
+nscoord nsListControlFrame::GetBSizeOfARow() { return BSizeOfARow(); }
+
+bool nsListControlFrame::IsOptionInteractivelySelectable(int32_t aIndex) const {
+  auto& select = Select();
+  if (HTMLOptionElement* item = select.Item(aIndex)) {
+    return IsOptionInteractivelySelectable(&select, item);
+  }
+  return false;
+}
+
+bool nsListControlFrame::IsOptionInteractivelySelectable(
+    HTMLSelectElement* aSelect, HTMLOptionElement* aOption) {
+  return !aSelect->IsOptionDisabled(aOption) && aOption->GetPrimaryFrame();
+}
+
+nscoord nsListControlFrame::CalcFallbackRowBSize(float aFontSizeInflation) {
+  RefPtr<nsFontMetrics> fontMet =
+      nsLayoutUtils::GetFontMetricsForFrame(this, aFontSizeInflation);
+  return fontMet->MaxHeight();
+}
+
+nscoord nsListControlFrame::CalcIntrinsicBSize(nscoord aBSizeOfARow,
+                                               int32_t aNumberOfOptions) {
+  if (Style()->StyleUIReset()->mFieldSizing == StyleFieldSizing::Content) {
+    int32_t length = GetNumberOfRows();
+    return length * aBSizeOfARow;
+  }
+
+  mNumDisplayRows = Select().Size();
+  if (mNumDisplayRows < 1) {
+    mNumDisplayRows = 4;
+  }
+  return mNumDisplayRows * aBSizeOfARow;
+}
+
+void nsListControlFrame::ScrollToIndex(int32_t aIndex) {
+  if (aIndex < 0) {
+    ScrollTo(nsPoint(0, 0), ScrollMode::Instant);
+  } else {
+    RefPtr<dom::HTMLOptionElement> option =
+        GetOption(AssertedCast<uint32_t>(aIndex));
+    if (option) {
+      ScrollToFrame(*option);
+    }
+  }
+}
+
+void nsListControlFrame::ScrollToFrame(dom::HTMLOptionElement& aOptElement) {
+  if (nsIFrame* childFrame = aOptElement.GetPrimaryFrame()) {
+    RefPtr<mozilla::PresShell> presShell = PresShell();
+    presShell->ScrollFrameIntoView(childFrame, Nothing(), AxisScrollParams(),
+                                   AxisScrollParams(),
+                                   ScrollFlags::ScrollOverflowHidden |
+                                       ScrollFlags::ScrollFirstAncestorOnly);
+  }
+}

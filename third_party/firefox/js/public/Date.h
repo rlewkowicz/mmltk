@@ -1,0 +1,102 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef js_Date_h
+#define js_Date_h
+
+
+#include "mozilla/FloatingPoint.h"  // mozilla::{IsFinite,}, mozilla::UnspecifiedNaN
+#include "mozilla/MathAlgorithms.h"  // mozilla::Abs
+
+#include "js/CharacterEncoding.h"  // JS::Latin1Chars
+#include "js/Conversions.h"        // JS::ToInteger
+#include "js/RealmOptions.h"       // JS::RTPCallerTypeToken
+#include "js/TypeDecls.h"
+#include "js/Value.h"  // JS::CanonicalizeNaN, JS::DoubleValue, JS::Value
+
+namespace JS {
+
+extern JS_PUBLIC_API void ResetTimeZone();
+
+class ClippedTime;
+inline ClippedTime TimeClip(double time);
+
+class ClippedTime {
+  double t = mozilla::UnspecifiedNaN<double>();
+
+  explicit ClippedTime(double time) : t(time) {}
+  friend ClippedTime TimeClip(double time);
+  friend ClippedTime TimeClip(int64_t time);
+
+ public:
+  ClippedTime() = default;
+
+  static ClippedTime invalid() { return ClippedTime(); }
+
+  double toDouble() const { return t; }
+
+  bool isValid() const { return !std::isnan(t); }
+};
+
+inline ClippedTime TimeClip(double time) {
+  constexpr double MaxTimeMagnitude = 8.64e15;
+  if (!(mozilla::Abs(time) <= MaxTimeMagnitude)) {
+    return ClippedTime(mozilla::UnspecifiedNaN<double>());
+  }
+
+  return ClippedTime(ToInteger(time));
+}
+
+inline ClippedTime TimeClip(int64_t time) {
+  constexpr int64_t MaxTimeMagnitude = 8.64e15;
+  if (mozilla::Abs(time) > MaxTimeMagnitude) {
+    return ClippedTime(mozilla::UnspecifiedNaN<double>());
+  }
+
+  return ClippedTime(static_cast<double>(time));
+}
+
+inline Value TimeValue(ClippedTime time) {
+  return CanonicalizedDoubleValue(time.toDouble());
+}
+
+extern JS_PUBLIC_API JSObject* NewDateObject(JSContext* cx, ClippedTime time);
+
+extern JS_PUBLIC_API JSObject* NewDateObject(JSContext* cx, int year, int mon,
+                                             int mday, int hour, int min,
+                                             int sec);
+
+extern JS_PUBLIC_API bool ObjectIsDate(JSContext* cx, Handle<JSObject*> obj,
+                                       bool* isDate);
+
+JS_PUBLIC_API double MakeDate(double year, unsigned month, unsigned day);
+
+JS_PUBLIC_API double MakeDate(double year, unsigned month, unsigned day,
+                              double time);
+
+JS_PUBLIC_API double YearFromTime(double time);
+
+JS_PUBLIC_API double MonthFromTime(double time);
+
+JS_PUBLIC_API double DayFromTime(double time);
+
+JS_PUBLIC_API double DayFromYear(double year);
+
+JS_PUBLIC_API double DayWithinYear(double time, double year);
+
+using ReduceMicrosecondTimePrecisionCallback =
+    double (*)(double, JS::RTPCallerTypeToken, JSContext*);
+
+JS_PUBLIC_API void SetReduceMicrosecondTimePrecisionCallback(
+    ReduceMicrosecondTimePrecisionCallback callback);
+
+JS_PUBLIC_API ReduceMicrosecondTimePrecisionCallback
+GetReduceMicrosecondTimePrecisionCallback();
+
+JS_PUBLIC_API bool IsISOStyleDate(JSContext* cx, const JS::Latin1Chars& str);
+
+}  
+
+#endif /* js_Date_h */

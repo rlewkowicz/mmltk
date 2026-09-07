@@ -1,0 +1,88 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_MachineState_h
+#define jit_MachineState_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/Variant.h"
+
+#include <stdint.h>
+
+#include "jit/Registers.h"
+#include "jit/RegisterSets.h"
+
+namespace js::jit {
+
+class MOZ_STACK_CLASS MachineState {
+  struct NullState {};
+
+  struct BailoutState {
+    RegisterDump::FPUArray& floatRegs;
+    RegisterDump::GPRArray& regs;
+
+    BailoutState(RegisterDump::FPUArray& floatRegs,
+                 RegisterDump::GPRArray& regs)
+        : floatRegs(floatRegs), regs(regs) {}
+  };
+
+  struct SafepointState {
+    FloatRegisterSet floatRegs;
+    GeneralRegisterSet regs;
+    char* floatSpillBase;
+    uintptr_t* spillBase;
+
+    SafepointState(const FloatRegisterSet& floatRegs,
+                   const GeneralRegisterSet& regs, char* floatSpillBase,
+                   uintptr_t* spillBase)
+        : floatRegs(floatRegs),
+          regs(regs),
+          floatSpillBase(floatSpillBase),
+          spillBase(spillBase) {}
+    uintptr_t* addressOfRegister(Register reg) const;
+    char* addressOfRegister(FloatRegister reg) const;
+  };
+  using State = mozilla::Variant<NullState, BailoutState, SafepointState>;
+  State state_{NullState()};
+
+ public:
+  MachineState() = default;
+  MachineState(const MachineState& other) = default;
+  MachineState& operator=(const MachineState& other) = default;
+
+  static MachineState FromBailout(RegisterDump::GPRArray& regs,
+                                  RegisterDump::FPUArray& fpregs) {
+    MachineState res;
+    res.state_.emplace<BailoutState>(fpregs, regs);
+    return res;
+  }
+
+  static MachineState FromSafepoint(const FloatRegisterSet& floatRegs,
+                                    const GeneralRegisterSet& regs,
+                                    char* floatSpillBase,
+                                    uintptr_t* spillBase) {
+    MachineState res;
+    res.state_.emplace<SafepointState>(floatRegs, regs, floatSpillBase,
+                                       spillBase);
+    return res;
+  }
+
+  bool has(Register reg) const {
+    if (state_.is<BailoutState>()) {
+      return true;
+    }
+    return state_.as<SafepointState>().regs.hasRegisterIndex(reg);
+  }
+  bool has(FloatRegister reg) const;
+
+  uintptr_t read(Register reg) const;
+  template <typename T>
+  T read(FloatRegister reg) const;
+
+  void write(Register reg, uintptr_t value) const;
+};
+
+}  
+
+#endif /* jit_MachineState_h */

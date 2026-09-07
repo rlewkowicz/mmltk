@@ -1,0 +1,486 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "FFmpegAudioEncoder.h"
+
+#include "AudioSegment.h"
+#include "FFmpegLog.h"
+#include "FFmpegRuntimeLinker.h"
+#include "FFmpegUtils.h"
+#include "MediaData.h"
+
+namespace mozilla {
+
+FFmpegAudioEncoder<LIBAV_VER>::FFmpegAudioEncoder(
+    const FFmpegLibWrapper* aLib, AVCodecID aCodecID,
+    const RefPtr<TaskQueue>& aTaskQueue, const EncoderConfig& aConfig)
+    : FFmpegDataEncoder(aLib, aCodecID, aTaskQueue, aConfig) {}
+
+RefPtr<MediaDataEncoder::InitPromise> FFmpegAudioEncoder<LIBAV_VER>::Init() {
+  FFMPEGA_LOG("Init");
+  return InvokeAsync(mTaskQueue, __func__, [self = RefPtr(this)]() {
+    MediaResult r = self->InitEncoder();
+    if (NS_FAILED(r.Code())) {
+      FFMPEGV_LOG("{}", r.Description().get());
+      return InitPromise::CreateAndReject(r, __func__);
+    }
+    return InitPromise::CreateAndResolve(true, __func__);
+  });
+}
+
+nsCString FFmpegAudioEncoder<LIBAV_VER>::GetDescriptionName() const {
+#ifdef USING_MOZFFVPX
+  return "ffvpx audio encoder"_ns;
+#else
+  const char* lib =
+#  if defined(MOZ_FFMPEG)
+      FFmpegRuntimeLinker::LinkStatusLibraryName();
+#  else
+      "no library: ffmpeg disabled during build";
+#  endif
+  return nsPrintfCString("ffmpeg audio encoder (%s)", lib);
+#endif
+}
+
+void FFmpegAudioEncoder<LIBAV_VER>::ResamplerDestroy::operator()(
+    SpeexResamplerState* aResampler) {
+  speex_resampler_destroy(aResampler);
+}
+
+MediaResult FFmpegAudioEncoder<LIBAV_VER>::InitEncoder() {
+  MOZ_ASSERT(mTaskQueue->IsOnCurrentThread());
+
+  FFMPEG_LOG("FFmpegAudioEncoder::InitEncoder");
+
+  auto r = AllocateCodecContext( false);
+  if (r.isErr()) {
+    return r.unwrapErr();
+  }
+  mCodecContext = r.unwrap();
+  const AVCodec* codec = mCodecContext->codec;
+  mCodecName = codec->name;
+
+#if LIBAVCODEC_VERSION_MAJOR >= 60
+  mCodecContext->flags |= AV_CODEC_FLAG_FRAME_DURATION;
+#endif
+
+  mInputSampleRate = AssertedCast<int>(mConfig.mSampleRate);
+  if (codec->supported_samplerates) {
+    AutoTArray<int, 16> supportedSampleRates;
+    IterateZeroTerminated(codec->supported_samplerates,
+                          [&supportedSampleRates](int aRate) mutable {
+                            supportedSampleRates.AppendElement(aRate);
+                          });
+    supportedSampleRates.Sort();
+
+    for (const auto& rate : supportedSampleRates) {
+      if (mInputSampleRate == rate) {
+        mConfig.mSampleRate = rate;
+        break;
+      }
+      if (mInputSampleRate < rate) {
+        mConfig.mSampleRate = rate;
+        break;
+      }
+      if (mInputSampleRate > rate) {
+        mConfig.mSampleRate = rate;
+      }
+    }
+  }
+
+  if (mConfig.mSampleRate != AssertedCast<uint32_t>(mInputSampleRate)) {
+    int err;
+    SpeexResamplerState* resampler = speex_resampler_init(
+        mConfig.mNumberOfChannels, mInputSampleRate, mConfig.mSampleRate,
+        SPEEX_RESAMPLER_QUALITY_DEFAULT, &err);
+    if (!err) {
+      mResampler.reset(resampler);
+    } else {
+      FFMPEG_LOG(
+          "Error creating resampler in FFmpegAudioEncoder {}Hz -> {}Hz ({}ch)",
+          mInputSampleRate, mConfig.mSampleRate, mConfig.mNumberOfChannels);
+    }
+  }
+
+  mCodecContext->sample_rate = AssertedCast<int>(mConfig.mSampleRate);
+
+#if LIBAVCODEC_VERSION_MAJOR >= 60
+  mLib->av_channel_layout_default(&mCodecContext->ch_layout,
+                                  AssertedCast<int>(mConfig.mNumberOfChannels));
+#else
+  mCodecContext->channels = AssertedCast<int>(mConfig.mNumberOfChannels);
+#endif
+
+  switch (mConfig.mCodec) {
+    case CodecType::Opus:
+      mCodecContext->sample_fmt = AV_SAMPLE_FMT_FLT;
+      break;
+    case CodecType::Vorbis:
+      mCodecContext->sample_fmt = AV_SAMPLE_FMT_FLTP;
+      break;
+    default:
+      MOZ_ASSERT_UNREACHABLE("Not supported");
+  }
+
+  if (mConfig.mCodec == CodecType::Opus) {
+    if (mConfig.mBitrateMode == BitrateMode::Constant) {
+      mLib->av_opt_set(mCodecContext->priv_data, "vbr", "off", 0);
+    }
+    if (mConfig.mNumberOfChannels > 8) {
+      if (mLib->av_opt_set_int(mCodecContext->priv_data, "mapping_family", 255,
+                               0) < 0) {
+        return MediaResult(NS_ERROR_FAILURE,
+                           "Failed to set Opus mapping_family for >8ch"_ns);
+      }
+    }
+    if (mConfig.mCodecSpecific.is<OpusSpecific>()) {
+      const OpusSpecific& specific = mConfig.mCodecSpecific.as<OpusSpecific>();
+      mCodecContext->compression_level = specific.mComplexity;
+      FFMPEG_LOG("Opus complexity set to {}", specific.mComplexity);
+      float frameDurationMs =
+          AssertedCast<float>(specific.mFrameDuration) / 1000.f;
+      if (mLib->av_opt_set_double(mCodecContext->priv_data, "frame_duration",
+                                  frameDurationMs, 0)) {
+        return MediaResult(
+            NS_ERROR_FAILURE,
+            "Error setting the frame duration on Opus encoder"_ns);
+      }
+      FFMPEG_LOG("Opus frame duration set to {:0.2f}", frameDurationMs);
+      if (specific.mPacketLossPerc) {
+        if (mLib->av_opt_set_int(
+                mCodecContext->priv_data, "packet_loss",
+                AssertedCast<int64_t>(specific.mPacketLossPerc), 0)) {
+          return MediaResult(
+              NS_ERROR_FAILURE,
+              RESULT_DETAIL(
+                  "Error setting the packet loss percentage to %" PRIu64
+                  " on Opus encoder",
+                  specific.mPacketLossPerc));
+        }
+        FFMPEG_LOGV("Packet loss set to {}% in Opus encoder",
+                    AssertedCast<int>(specific.mPacketLossPerc));
+      }
+      if (specific.mUseInBandFEC) {
+        if (mLib->av_opt_set(mCodecContext->priv_data, "fec", "on", 0)) {
+          return MediaResult(
+              NS_ERROR_FAILURE,
+              RESULT_DETAIL("Error %s FEC on Opus encoder",
+                            specific.mUseInBandFEC ? "enabling" : "disabling"));
+        }
+        FFMPEG_LOGV("In-band FEC enabled for Opus encoder.");
+      }
+      if (specific.mUseDTX) {
+        if (mLib->av_opt_set(mCodecContext->priv_data, "dtx", "on", 0)) {
+          return MediaResult(
+              NS_ERROR_FAILURE,
+              RESULT_DETAIL("Error %s DTX on Opus encoder",
+                            specific.mUseDTX ? "enabling" : "disabling"));
+        }
+        mDtxThreshold = 3;
+      }
+    } else {
+      MOZ_ASSERT(mConfig.mCodecSpecific.is<void_t>());
+    }
+  }
+  mCodecContext->time_base =
+      AVRational{.num = 1, .den = mCodecContext->sample_rate};
+
+#if LIBAVCODEC_VERSION_MAJOR >= 60
+  mCodecContext->flags |= AV_CODEC_FLAG_FRAME_DURATION;
+#endif
+
+  SetContextBitrate();
+
+  AVDictionary* options = nullptr;
+  if (int ret = OpenCodecContext(mCodecContext->codec, &options); ret < 0) {
+    return MediaResult(
+        NS_ERROR_DOM_MEDIA_FATAL_ERR,
+        RESULT_DETAIL("failed to open %s avcodec: %s", mCodecName.get(),
+                      MakeErrorString(mLib, ret).get()));
+  }
+  mLib->av_dict_free(&options);
+
+  FFMPEGA_LOG(
+      "{} has been initialized with sample-format: {}, bitrate: {}, "
+      "sample-rate: {}, channels: {}, time_base: {}/{}",
+      mCodecName.get(), static_cast<int>(mCodecContext->sample_fmt),
+      static_cast<int64_t>(mCodecContext->bit_rate), mCodecContext->sample_rate,
+      mConfig.mNumberOfChannels, mCodecContext->time_base.num,
+      mCodecContext->time_base.den);
+
+  return NS_OK;
+}
+
+#if LIBAVCODEC_VERSION_MAJOR >= 58
+
+Result<MediaDataEncoder::EncodedData, MediaResult>
+FFmpegAudioEncoder<LIBAV_VER>::EncodeOnePacket(Span<float> aSamples,
+                                               media::TimeUnit aPts) {
+  MOZ_ASSERT(mTaskQueue->IsOnCurrentThread());
+  MOZ_ASSERT(aSamples.Length() % mConfig.mNumberOfChannels == 0);
+
+  if (!PrepareFrame()) {
+    return Err(
+        MediaResult(NS_ERROR_OUT_OF_MEMORY, "failed to allocate frame"_ns));
+  }
+
+  uint32_t frameCount = aSamples.Length() / mConfig.mNumberOfChannels;
+
+  MOZ_ASSERT(AssertedCast<int>(frameCount) <= mCodecContext->frame_size);
+
+  ChannelCount(mFrame) = AssertedCast<int>(mConfig.mNumberOfChannels);
+
+#  if LIBAVCODEC_VERSION_MAJOR >= 60
+  int rv = mLib->av_channel_layout_copy(&mFrame->ch_layout,
+                                        &mCodecContext->ch_layout);
+  if (rv < 0) {
+    return Err(MediaResult(NS_ERROR_DOM_MEDIA_FATAL_ERR,
+                           RESULT_DETAIL("channel layout copy error: %s",
+                                         MakeErrorString(mLib, rv).get())));
+  }
+#  endif
+
+  mFrame->sample_rate = AssertedCast<int>(mConfig.mSampleRate);
+  mFrame->nb_samples = AssertedCast<int>(frameCount);
+  mFrame->format = mCodecContext->sample_fmt;
+#  if LIBAVCODEC_VERSION_MAJOR >= 59
+  mFrame->time_base =
+      AVRational{.num = 1, .den = AssertedCast<int>(mConfig.mSampleRate)};
+#  endif
+  mFrame->pts = aPts.ToTicksAtRate(mConfig.mSampleRate);
+#  if LIBAVCODEC_VERSION_MAJOR >= 60
+  mFrame->duration = frameCount;
+#  else
+  mFrame->pkt_duration = frameCount;
+#  endif
+
+  if (int ret = mLib->av_frame_get_buffer(mFrame, 16); ret < 0) {
+    return Err(MediaResult(NS_ERROR_OUT_OF_MEMORY,
+                           RESULT_DETAIL("failed to allocate frame data: %s",
+                                         MakeErrorString(mLib, ret).get())));
+  }
+
+  if (int ret = mLib->av_frame_make_writable(mFrame); ret < 0) {
+    return Err(MediaResult(NS_ERROR_DOM_MEDIA_FATAL_ERR,
+                           RESULT_DETAIL("failed to make frame writable: %s",
+                                         MakeErrorString(mLib, ret).get())));
+  }
+
+  if (mCodecContext->sample_fmt == AV_SAMPLE_FMT_FLT) {
+    PodCopy(reinterpret_cast<float*>(mFrame->data[0]), aSamples.data(),
+            aSamples.Length());
+  } else {
+    MOZ_ASSERT(mCodecContext->sample_fmt == AV_SAMPLE_FMT_FLTP);
+    DeinterleaveAndConvertBuffer(aSamples.data(), mFrame->nb_samples,
+                                 mConfig.mNumberOfChannels,
+                                 mFrame->extended_data);
+  }
+
+  return FFmpegDataEncoder<LIBAV_VER>::EncodeWithModernAPIs();
+}
+
+Result<MediaDataEncoder::EncodedData, MediaResult> FFmpegAudioEncoder<
+    LIBAV_VER>::EncodeInputWithModernAPIs(RefPtr<const MediaData> aSample) {
+  MOZ_ASSERT(mTaskQueue->IsOnCurrentThread());
+  MOZ_ASSERT(mCodecContext);
+  MOZ_ASSERT(aSample);
+
+  RefPtr<const AudioData> sample(aSample->As<AudioData>());
+
+  FFMPEG_LOG("Encoding {} frames of audio at pts: {}", sample->Frames(),
+             sample->mTime.ToString().get());
+
+  if ((!mResampler && sample->mRate != mConfig.mSampleRate) ||
+      (mResampler &&
+       sample->mRate != AssertedCast<uint32_t>(mInputSampleRate)) ||
+      sample->mChannels != mConfig.mNumberOfChannels) {
+    return Err(MediaResult(NS_ERROR_DOM_ENCODING_NOT_SUPPORTED_ERR,
+                           "Rate or sample-rate at the input of the encoder "
+                           "different from what has been configured "
+                           "initially"_ns));
+  }
+
+
+  if (!mPacketizer) {
+    media::TimeUnit basePts = media::TimeUnit::Zero(mConfig.mSampleRate);
+    basePts += sample->mTime;
+    mPacketizer.emplace(mCodecContext->frame_size, sample->mChannels,
+                        basePts.ToTicksAtRate(mConfig.mSampleRate),
+                        mConfig.mSampleRate);
+  }
+
+  if (!mFirstPacketPts.IsValid()) {
+    mFirstPacketPts = sample->mTime;
+  }
+
+  Span<float> audio = sample->Data();
+
+  if (mResampler) {
+    const uint32_t channels = mConfig.mNumberOfChannels;
+    CheckedUint32 inputFrames(audio.size());
+    inputFrames /= channels;
+    if (!inputFrames.isValid()) {
+      return Err(MediaResult(NS_ERROR_DOM_MEDIA_OVERFLOW_ERR,
+                             "Audio resampler input too large"_ns));
+    }
+    uint64_t scaledOutputFrames = static_cast<uint64_t>(inputFrames.value()) *
+                                      mConfig.mSampleRate /
+                                      AssertedCast<uint32_t>(mInputSampleRate) +
+                                  1u;
+    CheckedUint32 outputFrames(scaledOutputFrames);
+    CheckedUint32 outputSamples = outputFrames * channels;
+    if (!outputSamples.isValid()) {
+      return Err(MediaResult(NS_ERROR_DOM_MEDIA_OVERFLOW_ERR,
+                             "Invalid audio resampler output size"_ns));
+    }
+    if (!mTempBuffer.SetLength(outputSamples.value(), fallible)) {
+      return Err(
+          MediaResult(NS_ERROR_OUT_OF_MEMORY,
+                      "Audio resampler output buffer allocation failed"_ns));
+    }
+    uint32_t inputFramesProcessed = inputFrames.value();
+    uint32_t outputFramesWritten = outputFrames.value();
+    DebugOnly<int> rv = speex_resampler_process_interleaved_float(
+        mResampler.get(), audio.data(), &inputFramesProcessed,
+        mTempBuffer.Elements(), &outputFramesWritten);
+    FFMPEG_LOGV(
+        "Resampled %u -> %u frames (%dHz -> %uHz, %u ch), %u-sample buffer",
+        inputFramesProcessed, outputFramesWritten, mInputSampleRate,
+        mConfig.mSampleRate, channels, outputSamples.value());
+    audio = Span<float>(mTempBuffer.Elements(), outputFramesWritten * channels);
+    MOZ_ASSERT(inputFrames.value() == inputFramesProcessed,
+               "the output buffer must be large enough to consume all input");
+    MOZ_ASSERT(rv == RESAMPLER_ERR_SUCCESS);
+  }
+
+  EncodedData output;
+  MediaResult rv = NS_OK;
+
+  nsresult inputRv = mPacketizer->Input(
+      audio.data(), audio.Length() / mConfig.mNumberOfChannels);
+  if (NS_FAILED(inputRv)) {
+    return Err(MediaResult(inputRv, "Failed to feed the audio packetizer"_ns));
+  }
+
+  while (mPacketizer->PacketsAvailable() && rv.Code() == NS_OK) {
+    mTempBuffer.SetLength(mCodecContext->frame_size *
+                          mConfig.mNumberOfChannels);
+    media::TimeUnit pts = mPacketizer->Output(mTempBuffer.Elements());
+    auto audio = Span(mTempBuffer.Elements(), mTempBuffer.Length());
+    FFMPEG_LOG("Encoding {} frames, pts: {}", mPacketizer->PacketSize(),
+               pts.ToString().get());
+    auto encodeResult = EncodeOnePacket(audio, pts);
+    if (encodeResult.isErr()) {
+      mPacketizer.reset();
+      return encodeResult;
+    }
+    output.AppendElements(std::move(encodeResult.unwrap()));
+    pts += media::TimeUnit(mPacketizer->PacketSize(), mConfig.mSampleRate);
+  }
+  return std::move(output);
+}
+
+Result<MediaDataEncoder::EncodedData, MediaResult>
+FFmpegAudioEncoder<LIBAV_VER>::DrainWithModernAPIs() {
+  MOZ_ASSERT(mTaskQueue->IsOnCurrentThread());
+
+  if (!mPacketizer || mPacketizer->FramesAvailable() == 0) {
+    return FFmpegDataEncoder<LIBAV_VER>::DrainWithModernAPIs();
+  }
+  EncodedData output;
+  MediaResult rv = NS_OK;
+  mTempBuffer.SetLength(mCodecContext->frame_size *
+                        mPacketizer->ChannelCount());
+  uint32_t written;
+  media::TimeUnit pts = mPacketizer->Drain(mTempBuffer.Elements(), written);
+  auto audio =
+      Span(mTempBuffer.Elements(), written * mPacketizer->ChannelCount());
+  auto encodeResult = EncodeOnePacket(audio, pts);
+  if (encodeResult.isErr()) {
+    mPacketizer.reset();
+    return encodeResult;
+  }
+  auto array = encodeResult.unwrap();
+  output.AppendElements(std::move(array));
+  auto drainResult = FFmpegDataEncoder<LIBAV_VER>::DrainWithModernAPIs();
+  if (drainResult.isOk()) {
+    auto array = drainResult.unwrap();
+    output.AppendElements(std::move(array));
+  } else {
+    return drainResult;
+  }
+  return std::move(output);
+}
+#endif  // if LIBAVCODEC_VERSION_MAJOR >= 58
+
+Result<RefPtr<MediaRawData>, MediaResult>
+FFmpegAudioEncoder<LIBAV_VER>::ToMediaRawData(AVPacket* aPacket) {
+  MOZ_ASSERT(mTaskQueue->IsOnCurrentThread());
+  MOZ_ASSERT(aPacket);
+
+  if (aPacket->size < mDtxThreshold) {
+    FFMPEG_LOG(
+        "DTX enabled and packet is {} bytes (threshold {}), not returning.",
+        aPacket->size, mDtxThreshold);
+    return RefPtr<MediaRawData>(nullptr);
+  }
+
+  auto creationResult = CreateMediaRawData(aPacket);
+  if (creationResult.isErr()) {
+    return Err(creationResult.unwrapErr());
+  }
+
+  RefPtr<MediaRawData> data = creationResult.unwrap();
+
+  data->mKeyframe = (aPacket->flags & AV_PKT_FLAG_KEY) != 0;
+
+  if (auto extradataResult = GetExtraData(aPacket); extradataResult.isOk()) {
+    data->mExtraData = extradataResult.unwrap();
+  }
+
+  data->mTime = media::TimeUnit(aPacket->pts, mConfig.mSampleRate);
+  data->mTimecode = data->mTime;
+  data->mDuration =
+      media::TimeUnit(mCodecContext->frame_size, mConfig.mSampleRate);
+
+  if (mFirstPacketPts > data->mTime) {
+    data->mOriginalPresentationWindow =
+        Some(media::TimeInterval{data->mTime, data->GetEndTime()});
+    data->mTime = mFirstPacketPts;
+  }
+
+  if (mPacketsDelivered++ == 0) {
+    data->mConfig = MakeUnique<EncoderConfig>(mConfig);
+  }
+
+  if (data->mExtraData) {
+    FFMPEGA_LOG(
+        "FFmpegAudioEncoder out: [{},{}] ({} bytes, extradata {} bytes)",
+        data->mTime.ToString().get(), data->mDuration.ToString().get(),
+        data->Size(), data->mExtraData->Length());
+  } else {
+    FFMPEGA_LOG("FFmpegAudioEncoder out: [{},{}] ({} bytes)",
+                data->mTime.ToString().get(), data->mDuration.ToString().get(),
+                data->Size());
+  }
+
+  return data;
+}
+
+Result<already_AddRefed<MediaByteBuffer>, MediaResult>
+FFmpegAudioEncoder<LIBAV_VER>::GetExtraData(AVPacket* ) {
+  MOZ_ASSERT(mTaskQueue->IsOnCurrentThread());
+
+  if (!mCodecContext->extradata_size) {
+    return Err(MediaResult(NS_ERROR_NOT_AVAILABLE, "no extradata"_ns));
+  }
+  auto extraData = MakeRefPtr<MediaByteBuffer>();
+  extraData->SetLength(mCodecContext->extradata_size);
+  MOZ_ASSERT(extraData);
+  PodCopy(extraData->Elements(), mCodecContext->extradata,
+          mCodecContext->extradata_size);
+  return extraData.forget();
+}
+
+}  

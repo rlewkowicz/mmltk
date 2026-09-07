@@ -1,0 +1,305 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef AccessibleCaretManager_h
+#define AccessibleCaretManager_h
+
+#include "AccessibleCaret.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/EnumSet.h"
+#include "mozilla/EventForwards.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/dom/CaretStateChangedEvent.h"
+#include "mozilla/dom/MouseEventBinding.h"
+#include "nsCOMPtr.h"
+#include "nsCoord.h"
+#include "nsIFrame.h"
+#include "nsISelectionListener.h"
+
+class nsFrameSelection;
+class nsIContent;
+
+struct nsPoint;
+
+namespace mozilla {
+class PresShell;
+struct FrameAndOffset;  
+namespace dom {
+class Element;
+class Selection;
+}  
+
+class AccessibleCaretManager {
+ public:
+  explicit AccessibleCaretManager(PresShell* aPresShell);
+  virtual ~AccessibleCaretManager() = default;
+
+  void Terminate();
+
+
+  MOZ_CAN_RUN_SCRIPT
+  virtual nsresult PressCaret(const nsPoint& aPoint, EventClassID aEventClass);
+
+  MOZ_CAN_RUN_SCRIPT
+  virtual nsresult DragCaret(const nsPoint& aPoint);
+
+  MOZ_CAN_RUN_SCRIPT
+  virtual nsresult ReleaseCaret();
+
+  MOZ_CAN_RUN_SCRIPT
+  virtual nsresult TapCaret(const nsPoint& aPoint);
+
+  MOZ_CAN_RUN_SCRIPT
+  virtual nsresult SelectWordOrShortcut(const nsPoint& aPoint);
+
+  MOZ_CAN_RUN_SCRIPT
+  virtual void OnScrollStart();
+
+  MOZ_CAN_RUN_SCRIPT
+  virtual void OnScrollEnd();
+
+  MOZ_CAN_RUN_SCRIPT
+  virtual void OnScrollPositionChanged();
+
+  MOZ_CAN_RUN_SCRIPT
+  virtual void OnReflow();
+
+  MOZ_CAN_RUN_SCRIPT
+  virtual void OnBlur();
+
+  MOZ_CAN_RUN_SCRIPT
+  virtual nsresult OnSelectionChanged(dom::Document* aDoc, dom::Selection* aSel,
+                                      int16_t aReason);
+  MOZ_CAN_RUN_SCRIPT
+  virtual void OnKeyboardEvent();
+
+  void SetLastInputSource(uint16_t aInputSource);
+
+  bool ShouldDisableApz() const;
+
+ protected:
+  class Carets;
+
+  AccessibleCaretManager(PresShell* aPresShell, Carets aCarets);
+
+  enum class CaretMode : uint8_t {
+    None,
+
+    Cursor,
+
+    Selection
+  };
+
+  friend std::ostream& operator<<(std::ostream& aStream,
+                                  const CaretMode& aCaretMode);
+
+  enum class UpdateCaretsHint : uint8_t {
+    Default,
+
+    RespectOldAppearance,
+
+    DispatchNoEvent,
+  };
+
+  using UpdateCaretsHintSet = mozilla::EnumSet<UpdateCaretsHint>;
+
+  friend std::ostream& operator<<(std::ostream& aStream,
+                                  const UpdateCaretsHint& aResult);
+
+  enum class Terminated : bool { No, Yes };
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT virtual Terminated MaybeFlushLayout();
+
+  MOZ_CAN_RUN_SCRIPT
+  void UpdateCarets(
+      const UpdateCaretsHintSet& aHints = UpdateCaretsHint::Default);
+
+  MOZ_CAN_RUN_SCRIPT
+  void HideCaretsAndDispatchCaretStateChangedEvent();
+
+  MOZ_CAN_RUN_SCRIPT
+  void UpdateCaretsForCursorMode(const UpdateCaretsHintSet& aHints);
+
+  MOZ_CAN_RUN_SCRIPT
+  void UpdateCaretsForSelectionMode(const UpdateCaretsHintSet& aHints);
+
+  void UpdateShouldDisableApz();
+
+  void ProvideHapticFeedback(mozilla::HapticFeedbackType aType);
+
+  nsIFrame* GetFocusableFrame(nsIFrame* aFrame) const;
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void ChangeFocusToOrClearOldFocus(
+      nsIFrame* aFrame) const;
+
+  MOZ_CAN_RUN_SCRIPT
+  nsresult SelectWord(nsIFrame* aFrame, const nsPoint& aPoint) const;
+  MOZ_CAN_RUN_SCRIPT void SetSelectionDragState(bool aState) const;
+
+  bool IsPhoneNumber(const nsAString& aCandidate) const;
+
+  MOZ_CAN_RUN_SCRIPT
+  void SelectMoreIfPhoneNumber() const;
+
+  MOZ_CAN_RUN_SCRIPT
+  void ExtendPhoneNumberSelection(const nsAString& aDirection) const;
+
+  void SetSelectionDirection(nsDirection aDir) const;
+
+  FrameAndOffset GetFirstVisibleLeafFrameOrUnselectableChildFrame(
+      nsRange& aRange, nsIContent** aOutContent = nullptr,
+      int32_t* aOutOffsetInContent = nullptr) const;
+
+  FrameAndOffset GetLastVisibleLeafFrameOrUnselectableChildFrame(
+      nsRange& aRange, nsIContent** aOutContent = nullptr,
+      int32_t* aOutOffsetInContent = nullptr) const;
+
+  MOZ_CAN_RUN_SCRIPT nsresult DragCaretInternal(const nsPoint& aPoint);
+  nsPoint AdjustDragBoundary(const nsPoint& aPoint) const;
+
+  MOZ_CAN_RUN_SCRIPT
+  void StartSelectionAutoScrollTimer(const nsPoint& aPoint) const;
+  void StopSelectionAutoScrollTimer() const;
+
+  void ClearMaintainedSelection() const;
+
+  static dom::Element* GetEditingHostForFrame(const nsIFrame* aFrame);
+  dom::Selection* GetSelection() const;
+  already_AddRefed<nsFrameSelection> GetFrameSelection() const;
+
+  MOZ_CAN_RUN_SCRIPT
+  nsAutoString StringifiedSelection() const;
+
+  static nsRect GetAllChildFrameRectsUnion(nsIFrame* aFrame);
+
+  bool RestrictCaretDraggingOffsets(nsIFrame::ContentOffsets& aOffsets);
+
+  virtual Terminated IsTerminated() const {
+    return mPresShell ? Terminated::No : Terminated::Yes;
+  }
+
+  virtual CaretMode GetCaretMode() const;
+
+  virtual bool CompareTreePosition(const nsIFrame* aStartFrame,
+                                   int32_t aStartOffset,
+                                   const nsIFrame* aEndFrame,
+                                   int32_t aEndOffset) const;
+
+  virtual bool UpdateCaretsForOverlappingTilt();
+
+  virtual void UpdateCaretsForAlwaysTilt(const nsIFrame* aStartFrame,
+                                         const nsIFrame* aEndFrame);
+
+  virtual bool IsCaretDisplayableInCursorMode(
+      nsIFrame** aOutFrame = nullptr, int32_t* aOutOffset = nullptr) const;
+
+  virtual bool HasNonEmptyTextContent(nsINode* aNode) const;
+
+  MOZ_CAN_RUN_SCRIPT
+  virtual void DispatchCaretStateChangedEvent(dom::CaretChangedReason aReason,
+                                              const nsPoint* aPoint = nullptr);
+
+  nscoord mOffsetYToCaretLogicalPosition = NS_UNCONSTRAINEDSIZE;
+
+  PresShell* MOZ_NON_OWNING_REF mPresShell = nullptr;
+
+  class Carets {
+   public:
+    Carets(UniquePtr<AccessibleCaret> aFirst,
+           UniquePtr<AccessibleCaret> aSecond);
+
+    Carets(Carets&&) = default;
+    Carets(const Carets&) = delete;
+    Carets& operator=(const Carets&) = delete;
+
+    AccessibleCaret* GetFirst() const { return mFirst.get(); }
+
+    AccessibleCaret* GetSecond() const { return mSecond.get(); }
+
+    bool HasLogicallyVisibleCaret() const {
+      return mFirst->IsLogicallyVisible() || mSecond->IsLogicallyVisible();
+    }
+
+    bool HasVisuallyVisibleCaret() const {
+      return mFirst->IsVisuallyVisible() || mSecond->IsVisuallyVisible();
+    }
+
+    void Terminate() {
+      mFirst = nullptr;
+      mSecond = nullptr;
+    }
+
+   private:
+    UniquePtr<AccessibleCaret> mFirst;
+
+    UniquePtr<AccessibleCaret> mSecond;
+  };
+
+  Carets mCarets;
+
+  AccessibleCaret* mActiveCaret = nullptr;
+
+  CaretMode mLastUpdateCaretMode = CaretMode::None;
+
+  uint16_t mLastInputSource = dom::MouseEvent_Binding::MOZ_SOURCE_UNKNOWN;
+
+  bool mIsScrollStarted = false;
+
+  class LayoutFlusher final {
+   public:
+    LayoutFlusher() = default;
+
+    ~LayoutFlusher();
+
+    LayoutFlusher(const LayoutFlusher&) = delete;
+    LayoutFlusher& operator=(const LayoutFlusher&) = delete;
+
+    MOZ_CAN_RUN_SCRIPT void MaybeFlush(const PresShell& aPresShell);
+
+    bool mAllowFlushing = true;
+
+   private:
+    bool mFlushing = false;
+  };
+
+  LayoutFlusher mLayoutFlusher;
+
+  bool mIsCaretPositionChanged = false;
+
+  class DesiredAsyncPanZoomState final {
+   public:
+    void Update(const AccessibleCaretManager& aAccessibleCaretManager);
+
+    bool ShouldDisable() const { return mValue == Value::Disabled; }
+
+   private:
+    enum class Value : bool { Disabled, Enabled };
+
+    Value mValue = Value::Enabled;
+  };
+
+  DesiredAsyncPanZoomState mDesiredAsyncPanZoomState;
+
+  static const int32_t kAutoScrollTimerDelay = 30;
+
+  static const int32_t kBoundaryAppUnits = 61;
+
+  enum ScriptUpdateMode : int32_t {
+    kScriptAlwaysHide,
+    kScriptUpdateVisible,
+    kScriptAlwaysShow
+  };
+};
+
+std::ostream& operator<<(std::ostream& aStream,
+                         const AccessibleCaretManager::CaretMode& aCaretMode);
+
+std::ostream& operator<<(
+    std::ostream& aStream,
+    const AccessibleCaretManager::UpdateCaretsHint& aResult);
+
+}  
+
+#endif  // AccessibleCaretManager_h

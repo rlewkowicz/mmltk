@@ -1,0 +1,88 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZSTORAGESERVICE_H
+#define MOZSTORAGESERVICE_H
+
+#include "nsCOMPtr.h"
+#include "nsIFile.h"
+#include "nsIMemoryReporter.h"
+#include "nsIObserver.h"
+#include "nsTArray.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/intl/Collator.h"
+
+#include "mozIStorageService.h"
+
+class nsIMemoryReporter;
+struct sqlite3_vfs;
+namespace mozilla::intl {
+class Collator;
+}
+
+namespace mozilla::storage {
+
+class Connection;
+class Service : public mozIStorageService,
+                public nsIObserver,
+                public nsIMemoryReporter {
+ public:
+  nsresult initialize();
+
+  static already_AddRefed<Service> getSingleton();
+
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_MOZISTORAGESERVICE
+  NS_DECL_NSIOBSERVER
+  NS_DECL_NSIMEMORYREPORTER
+
+  static bool pageSizeIsValid(int32_t aPageSize) {
+    return aPageSize == 512 || aPageSize == 1024 || aPageSize == 2048 ||
+           aPageSize == 4096 || aPageSize == 8192 || aPageSize == 16384 ||
+           aPageSize == 32768 || aPageSize == 65536;
+  }
+
+  static const int32_t kDefaultPageSize = 32768;
+
+  void registerConnection(Connection* aConnection);
+
+  void unregisterConnection(Connection* aConnection);
+
+  void getConnections(nsTArray<RefPtr<Connection> >& aConnections);
+
+ private:
+  Service();
+  virtual ~Service();
+
+  struct AutoVFSRegistration {
+    int Init(UniquePtr<sqlite3_vfs> aVFS, bool aMakeDefault = false);
+    ~AutoVFSRegistration();
+
+   private:
+    UniquePtr<sqlite3_vfs> mVFS;
+  };
+
+  AutoVFSRegistration mBaseSqliteVFS;
+  AutoVFSRegistration mBaseExclSqliteVFS;
+  AutoVFSRegistration mQuotaSqliteVFS;
+  AutoVFSRegistration mObfuscatingSqliteVFS;
+  AutoVFSRegistration mReadOnlyNoLockSqliteVFS;
+
+  Mutex mRegistrationMutex MOZ_UNANNOTATED;
+
+  nsTArray<RefPtr<Connection> > mConnections;
+
+  void minimizeMemory();
+
+  nsCOMPtr<nsIFile> mProfileStorageFile;
+
+  nsCOMPtr<nsIMemoryReporter> mStorageSQLiteReporter;
+
+  static Service* gService;
+};
+
+}  
+
+#endif /* MOZSTORAGESERVICE_H */

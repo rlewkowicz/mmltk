@@ -1,0 +1,299 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsCOMArray_h_
+#define nsCOMArray_h_
+
+#include "mozilla/ArrayIterator.h"
+#include "mozilla/MemoryReporting.h"
+
+#include "nsCycleCollectionNoteChild.h"
+#include "nsTArray.h"
+#include "nsISupports.h"
+
+#include <iterator>
+
+
+class nsCOMArray_base {
+  friend class nsArrayBase;
+
+ public:
+  nsCOMArray_base& operator=(const nsCOMArray_base& aOther) = delete;
+
+ protected:
+  nsCOMArray_base() = default;
+  explicit nsCOMArray_base(int32_t aCount) : mArray(aCount) {}
+  nsCOMArray_base(const nsCOMArray_base& aOther);
+  nsCOMArray_base(nsCOMArray_base&& aOther) = default;
+  nsCOMArray_base& operator=(nsCOMArray_base&& aOther) = default;
+  ~nsCOMArray_base();
+
+  int32_t IndexOf(nsISupports* aObject, uint32_t aStartIndex = 0) const;
+  bool Contains(nsISupports* aObject) const { return IndexOf(aObject) != -1; }
+
+  int32_t IndexOfObject(nsISupports* aObject) const;
+  bool ContainsObject(nsISupports* aObject) const {
+    return IndexOfObject(aObject) != -1;
+  }
+
+  typedef bool (*nsBaseArrayEnumFunc)(void* aElement, void* aData);
+
+  bool EnumerateForwards(nsBaseArrayEnumFunc aFunc, void* aData) const;
+
+  bool EnumerateBackwards(nsBaseArrayEnumFunc aFunc, void* aData) const;
+
+  bool InsertObjectAt(nsISupports* aObject, int32_t aIndex);
+  void InsertElementAt(uint32_t aIndex, nsISupports* aElement);
+  void InsertElementAt(uint32_t aIndex, already_AddRefed<nsISupports> aElement);
+  bool InsertObjectsAt(const nsCOMArray_base& aObjects, int32_t aIndex);
+  void InsertElementsAt(uint32_t aIndex, const nsCOMArray_base& aElements);
+  void InsertElementsAt(uint32_t aIndex, nsISupports* const* aElements,
+                        uint32_t aCount);
+  void ReplaceObjectAt(nsISupports* aObject, int32_t aIndex);
+  void ReplaceElementAt(uint32_t aIndex, nsISupports* aElement) {
+    nsISupports* oldElement = mArray[aIndex];
+    NS_IF_ADDREF(mArray[aIndex] = aElement);
+    NS_IF_RELEASE(oldElement);
+  }
+  bool AppendObject(nsISupports* aObject) {
+    return InsertObjectAt(aObject, Count());
+  }
+  void AppendElement(nsISupports* aElement) {
+    InsertElementAt(Length(), aElement);
+  }
+  void AppendElement(already_AddRefed<nsISupports> aElement) {
+    InsertElementAt(Length(), std::move(aElement));
+  }
+
+  bool AppendObjects(const nsCOMArray_base& aObjects) {
+    return InsertObjectsAt(aObjects, Count());
+  }
+  void AppendElements(const nsCOMArray_base& aElements) {
+    return InsertElementsAt(Length(), aElements);
+  }
+  void AppendElements(nsISupports* const* aElements, uint32_t aCount) {
+    return InsertElementsAt(Length(), aElements, aCount);
+  }
+  bool RemoveObject(nsISupports* aObject);
+  nsISupports** Elements() { return mArray.Elements(); }
+  void SwapElements(nsCOMArray_base& aOther) {
+    mArray.SwapElements(aOther.mArray);
+  }
+
+ public:
+  int32_t Count() const { return mArray.Length(); }
+  uint32_t Length() const { return mArray.Length(); }
+  bool IsEmpty() const { return mArray.IsEmpty(); }
+
+  bool SetCount(int32_t aNewCount);
+  void TruncateLength(uint32_t aNewLength) {
+    if (mArray.Length() > aNewLength) {
+      RemoveElementsAt(aNewLength, mArray.Length() - aNewLength);
+    }
+  }
+
+  void Clear();
+
+  nsISupports* ObjectAt(int32_t aIndex) const { return mArray[aIndex]; }
+  nsISupports* ElementAt(uint32_t aIndex) const { return mArray[aIndex]; }
+
+  nsISupports* SafeObjectAt(int32_t aIndex) const {
+    return mArray.SafeElementAt(aIndex, nullptr);
+  }
+  nsISupports* SafeElementAt(uint32_t aIndex) const {
+    return mArray.SafeElementAt(aIndex, nullptr);
+  }
+
+  nsISupports* operator[](int32_t aIndex) const { return mArray[aIndex]; }
+
+  bool RemoveObjectAt(int32_t aIndex);
+  void RemoveElementAt(uint32_t aIndex);
+
+  bool RemoveObjectsAt(int32_t aIndex, int32_t aCount);
+  void RemoveElementsAt(uint32_t aIndex, uint32_t aCount);
+
+  void SwapElementsAt(uint32_t aIndex1, uint32_t aIndex2) {
+    nsISupports* tmp = mArray[aIndex1];
+    mArray[aIndex1] = mArray[aIndex2];
+    mArray[aIndex2] = tmp;
+  }
+
+  void SetCapacity(uint32_t aCapacity) { mArray.SetCapacity(aCapacity); }
+  uint32_t Capacity() { return mArray.Capacity(); }
+
+  size_t ShallowSizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) const {
+    return mArray.ShallowSizeOfExcludingThis(aMallocSizeOf);
+  }
+
+ protected:
+  nsTArray<nsISupports*> mArray;
+};
+
+inline void ImplCycleCollectionUnlink(nsCOMArray_base& aField) {
+  aField.Clear();
+}
+
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback, nsCOMArray_base& aField,
+    const char* aName, uint32_t aFlags = 0) {
+  aFlags |= CycleCollectionEdgeNameArrayFlag;
+  int32_t length = aField.Count();
+  for (int32_t i = 0; i < length; ++i) {
+    CycleCollectionNoteChild(aCallback, aField[i], aName, aFlags);
+  }
+}
+
+template <class T>
+class nsCOMArray : public nsCOMArray_base {
+ public:
+  typedef int32_t index_type;
+  typedef mozilla::ArrayIterator<T*, nsCOMArray> iterator;
+  typedef mozilla::ArrayIterator<const T*, nsCOMArray> const_iterator;
+  typedef std::reverse_iterator<iterator> reverse_iterator;
+  typedef std::reverse_iterator<const_iterator> const_reverse_iterator;
+
+  nsCOMArray() = default;
+  explicit nsCOMArray(int32_t aCount) : nsCOMArray_base(aCount) {}
+  explicit nsCOMArray(const nsCOMArray<T>& aOther) : nsCOMArray_base(aOther) {}
+  nsCOMArray(nsCOMArray<T>&& aOther) = default;
+  ~nsCOMArray() = default;
+
+  nsCOMArray<T>& operator=(nsCOMArray<T>&& aOther) = default;
+  nsCOMArray<T>& operator=(const nsCOMArray<T>& aOther) = delete;
+
+  T* ObjectAt(int32_t aIndex) const {
+    return static_cast<T*>(nsCOMArray_base::ObjectAt(aIndex));
+  }
+  T* ElementAt(uint32_t aIndex) const {
+    return static_cast<T*>(nsCOMArray_base::ElementAt(aIndex));
+  }
+
+  T* SafeObjectAt(int32_t aIndex) const {
+    return static_cast<T*>(nsCOMArray_base::SafeObjectAt(aIndex));
+  }
+  T* SafeElementAt(uint32_t aIndex) const {
+    return static_cast<T*>(nsCOMArray_base::SafeElementAt(aIndex));
+  }
+
+  T* operator[](int32_t aIndex) const { return ObjectAt(aIndex); }
+
+  int32_t IndexOf(T* aObject, uint32_t aStartIndex = 0) const {
+    return nsCOMArray_base::IndexOf(aObject, aStartIndex);
+  }
+  bool Contains(T* aObject) const { return nsCOMArray_base::Contains(aObject); }
+
+  int32_t IndexOfObject(T* aObject) const {
+    return nsCOMArray_base::IndexOfObject(aObject);
+  }
+  bool ContainsObject(nsISupports* aObject) const {
+    return nsCOMArray_base::ContainsObject(aObject);
+  }
+
+  bool InsertObjectAt(T* aObject, int32_t aIndex) {
+    return nsCOMArray_base::InsertObjectAt(aObject, aIndex);
+  }
+  void InsertElementAt(uint32_t aIndex, T* aElement) {
+    nsCOMArray_base::InsertElementAt(aIndex, aElement);
+  }
+
+  bool InsertObjectsAt(const nsCOMArray<T>& aObjects, int32_t aIndex) {
+    return nsCOMArray_base::InsertObjectsAt(aObjects, aIndex);
+  }
+  void InsertElementsAt(uint32_t aIndex, const nsCOMArray<T>& aElements) {
+    nsCOMArray_base::InsertElementsAt(aIndex, aElements);
+  }
+  void InsertElementsAt(uint32_t aIndex, T* const* aElements, uint32_t aCount) {
+    nsCOMArray_base::InsertElementsAt(
+        aIndex, reinterpret_cast<nsISupports* const*>(aElements), aCount);
+  }
+
+  void ReplaceObjectAt(T* aObject, int32_t aIndex) {
+    nsCOMArray_base::ReplaceObjectAt(aObject, aIndex);
+  }
+  void ReplaceElementAt(uint32_t aIndex, T* aElement) {
+    nsCOMArray_base::ReplaceElementAt(aIndex, aElement);
+  }
+
+  using TComparatorFunc = int (*)(T*, T*);
+
+  void Sort(TComparatorFunc aFunc) {
+    mArray.Sort(
+        [aFunc](nsISupports* const& aLeft, nsISupports* const& aRight) -> int {
+          return aFunc(static_cast<T*>(aLeft), static_cast<T*>(aRight));
+        });
+  }
+
+  void StableSort(TComparatorFunc aFunc) {
+    mArray.StableSort(
+        [aFunc](nsISupports* const& aLeft, nsISupports* const& aRight) -> int {
+          return aFunc(static_cast<T*>(aLeft), static_cast<T*>(aRight));
+        });
+  }
+
+  bool AppendObject(T* aObject) {
+    return nsCOMArray_base::AppendObject(aObject);
+  }
+  void AppendElement(T* aElement) { nsCOMArray_base::AppendElement(aElement); }
+  void AppendElement(already_AddRefed<T> aElement) {
+    nsCOMArray_base::AppendElement(std::move(aElement));
+  }
+
+  bool AppendObjects(const nsCOMArray<T>& aObjects) {
+    return nsCOMArray_base::AppendObjects(aObjects);
+  }
+  void AppendElements(const nsCOMArray<T>& aElements) {
+    return nsCOMArray_base::AppendElements(aElements);
+  }
+  void AppendElements(T* const* aElements, uint32_t aCount) {
+    InsertElementsAt(Length(), aElements, aCount);
+  }
+
+  bool RemoveObject(T* aObject) {
+    return nsCOMArray_base::RemoveObject(aObject);
+  }
+  bool RemoveElement(T* aElement) {
+    return nsCOMArray_base::RemoveObject(aElement);
+  }
+
+  T** Elements() { return reinterpret_cast<T**>(nsCOMArray_base::Elements()); }
+  void SwapElements(nsCOMArray<T>& aOther) {
+    nsCOMArray_base::SwapElements(aOther);
+  }
+
+  iterator begin() { return iterator(*this, 0); }
+  const_iterator begin() const { return const_iterator(*this, 0); }
+  const_iterator cbegin() const { return begin(); }
+  iterator end() { return iterator(*this, Length()); }
+  const_iterator end() const { return const_iterator(*this, Length()); }
+  const_iterator cend() const { return end(); }
+
+  reverse_iterator rbegin() { return reverse_iterator(end()); }
+  const_reverse_iterator rbegin() const {
+    return const_reverse_iterator(end());
+  }
+  const_reverse_iterator crbegin() const { return rbegin(); }
+  reverse_iterator rend() { return reverse_iterator(begin()); }
+  const_reverse_iterator rend() const {
+    return const_reverse_iterator(begin());
+  }
+  const_reverse_iterator crend() const { return rend(); }
+};
+
+template <typename T>
+inline void ImplCycleCollectionUnlink(nsCOMArray<T>& aField) {
+  aField.Clear();
+}
+
+template <typename E>
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback, nsCOMArray<E>& aField,
+    const char* aName, uint32_t aFlags = 0) {
+  aFlags |= CycleCollectionEdgeNameArrayFlag;
+  int32_t length = aField.Count();
+  for (int32_t i = 0; i < length; ++i) {
+    CycleCollectionNoteChild(aCallback, aField[i], aName, aFlags);
+  }
+}
+
+#endif

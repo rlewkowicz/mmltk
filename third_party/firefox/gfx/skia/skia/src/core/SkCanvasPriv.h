@@ -1,0 +1,128 @@
+/*
+ * Copyright 2014 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkCanvasPriv_DEFINED)
+#define SkCanvasPriv_DEFINED
+
+#include "include/core/SkCanvas.h"
+#include "include/core/SkPaint.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkScalar.h"
+#include "include/core/SkTileMode.h"
+#include "include/private/base/SkDebug.h"
+#include "include/private/base/SkNoncopyable.h"
+
+#include <cstddef>
+
+class SkDevice;
+class SkImageFilter;
+class SkMatrix;
+class SkReadBuffer;
+struct SkRect;
+class SkWriteBuffer;
+
+class [[nodiscard]] SkAutoCanvasMatrixPaint : SkNoncopyable {
+public:
+    SkAutoCanvasMatrixPaint(SkCanvas*, const SkMatrix*, const SkPaint*, const SkRect& bounds);
+    ~SkAutoCanvasMatrixPaint();
+
+private:
+    SkCanvas*   fCanvas;
+    int         fSaveCount;
+};
+
+class SkCanvasPriv {
+public:
+    [[nodiscard]] static bool ReadLattice(SkReadBuffer&, SkCanvas::Lattice*);
+
+    static void WriteLattice(SkWriteBuffer&, const SkCanvas::Lattice&);
+
+    static size_t WriteLattice(void* storage, const SkCanvas::Lattice&);
+
+    static int SaveBehind(SkCanvas* canvas, const SkRect* subset) {
+        return canvas->only_axis_aligned_saveBehind(subset);
+    }
+    static void DrawBehind(SkCanvas* canvas, const SkPaint& paint) {
+        canvas->drawClippedToSaveBehind(paint);
+    }
+
+    static void ResetClip(SkCanvas* canvas) {
+        canvas->internal_private_resetClip();
+    }
+
+    static SkDevice* TopDevice(const SkCanvas* canvas) {
+        return canvas->topDevice();
+    }
+
+    static void GetDstClipAndMatrixCounts(const SkCanvas::ImageSetEntry set[], int count,
+                                          int* totalDstClipCount, int* totalMatrixCount);
+
+    static SkCanvas::SaveLayerRec ScaledBackdropLayer(const SkRect* bounds,
+                                                      const SkPaint* paint,
+                                                      const SkImageFilter* backdrop,
+                                                      SkScalar backdropScale,
+                                                      SkTileMode backdropTileMode,
+                                                      SkCanvas::SaveLayerFlags saveLayerFlags,
+                                                      SkCanvas::FilterSpan filters = {}) {
+        return SkCanvas::SaveLayerRec(bounds, paint, backdrop, nullptr, backdropScale,
+                                      backdropTileMode, saveLayerFlags, filters);
+    }
+
+    static SkCanvas::SaveLayerRec ScaledBackdropLayer(const SkRect* bounds,
+                                                      const SkPaint* paint,
+                                                      const SkImageFilter* backdrop,
+                                                      SkScalar backdropScale,
+                                                      SkCanvas::SaveLayerFlags saveLayerFlags,
+                                                      SkCanvas::FilterSpan filters = {}) {
+        return ScaledBackdropLayer(bounds, paint, backdrop, backdropScale, SkTileMode::kClamp,
+                                   saveLayerFlags, filters);
+    }
+
+    static SkScalar GetBackdropScaleFactor(const SkCanvas::SaveLayerRec& rec) {
+        return rec.fExperimentalBackdropScale;
+    }
+
+    static void SetBackdropScaleFactor(SkCanvas::SaveLayerRec* rec, SkScalar scale) {
+        rec->fExperimentalBackdropScale = scale;
+    }
+
+    static bool ImageToColorFilter(SkPaint*);
+};
+
+constexpr int kMaxPictureOpsToUnrollInsteadOfRef = 1;
+
+class AutoLayerForImageFilter {
+public:
+    AutoLayerForImageFilter(SkCanvas* canvas,
+                            const SkPaint& paint,
+                            const SkRect* rawBounds,
+                            bool skipMaskFilterLayer);
+
+    AutoLayerForImageFilter(const AutoLayerForImageFilter&) = delete;
+    AutoLayerForImageFilter& operator=(const AutoLayerForImageFilter&) = delete;
+    AutoLayerForImageFilter(AutoLayerForImageFilter&&);
+    AutoLayerForImageFilter& operator=(AutoLayerForImageFilter&&);
+
+    ~AutoLayerForImageFilter();
+
+    const SkPaint& paint() const { return fPaint; }
+
+    void addMaskFilterLayer(const SkRect* drawBounds);
+
+private:
+    void addImageFilterLayer(const SkRect* drawBounds);
+
+    void addLayer(const SkPaint& restorePaint, const SkRect* drawBounds, bool coverageOnly);
+
+    SkPaint         fPaint;
+    SkCanvas*       fCanvas;
+    int             fTempLayersForFilters;
+
+    SkDEBUGCODE(int fSaveCount;)
+};
+
+#endif

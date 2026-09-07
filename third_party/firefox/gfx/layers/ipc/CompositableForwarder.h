@@ -1,0 +1,142 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_LAYERS_COMPOSITABLEFORWARDER
+#define MOZILLA_LAYERS_COMPOSITABLEFORWARDER
+
+#include <stdint.h>  // for int32_t, uint32_t, uint64_t
+
+#include "ImageContainer.h"
+#include "mozilla/Assertions.h"  // for AssertionConditionType, MOZ_ASSERT, MOZ_ASSERT_HELPER1
+#include "mozilla/Atomics.h"
+#include "mozilla/RefPtr.h"             // for RefPtr
+#include "mozilla/TimeStamp.h"          // for TimeStamp
+#include "mozilla/ipc/ProtocolUtils.h"  // for IToplevelProtocol, ProtocolID
+#include "mozilla/layers/KnowsCompositor.h"  // for KnowsCompositor
+#include "nsRect.h"                          // for nsIntRect
+#include "nsRegion.h"                        // for nsIntRegion
+#include "nsTArray.h"                        // for nsTArray
+
+namespace mozilla {
+namespace layers {
+class CompositableClient;
+class CompositableHandle;
+class PTextureChild;
+class SurfaceDescriptorTiles;
+class TextureClient;
+
+struct FwdTransactionCounter {
+  explicit FwdTransactionCounter(mozilla::ipc::IToplevelProtocol* aToplevel)
+      : mFwdTransactionType(aToplevel->GetProtocolId()) {}
+
+  mozilla::ipc::ProtocolId mFwdTransactionType;
+
+  uint64_t mFwdTransactionId = 0;
+};
+
+class FwdTransactionTracker {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(FwdTransactionTracker)
+
+  static already_AddRefed<FwdTransactionTracker> GetOrCreate(
+      RefPtr<FwdTransactionTracker>& aTracker) {
+    if (!aTracker) {
+      aTracker = new FwdTransactionTracker;
+    }
+    return do_AddRef(aTracker);
+  }
+
+  bool IsUsed() const { return mFwdTransactionType && mFwdTransactionId; }
+
+  void Use(const FwdTransactionCounter& aCounter) {
+    mFwdTransactionType = aCounter.mFwdTransactionType;
+    mFwdTransactionId = aCounter.mFwdTransactionId;
+  }
+
+  Atomic<mozilla::ipc::ProtocolId> mFwdTransactionType{
+      (mozilla::ipc::ProtocolId)0};
+  Atomic<uint64_t> mFwdTransactionId{0};
+
+ private:
+  FwdTransactionTracker() = default;
+  ~FwdTransactionTracker() = default;
+};
+
+inline RemoteTextureTxnType ToRemoteTextureTxnType(
+    const RefPtr<FwdTransactionTracker>& aTracker) {
+  return aTracker ? (RemoteTextureTxnType)aTracker->mFwdTransactionType : 0;
+}
+
+inline RemoteTextureTxnId ToRemoteTextureTxnId(
+    const RefPtr<FwdTransactionTracker>& aTracker) {
+  return aTracker ? (RemoteTextureTxnId)aTracker->mFwdTransactionId : 0;
+}
+
+class CompositableForwarder : public KnowsCompositor {
+ public:
+  CompositableForwarder();
+  ~CompositableForwarder();
+
+  virtual void Connect(CompositableClient* aCompositable,
+                       ImageContainer* aImageContainer = nullptr) = 0;
+
+  virtual void ReleaseCompositable(const CompositableHandle& aHandle) = 0;
+  virtual bool DestroyInTransaction(PTextureChild* aTexture) = 0;
+
+  virtual void RemoveTextureFromCompositable(CompositableClient* aCompositable,
+                                             TextureClient* aTexture) = 0;
+
+  virtual void ClearImagesFromCompositable(CompositableClient* aCompositable,
+                                           ClearImagesType aType) {}
+
+  struct TimedTextureClient {
+    TimedTextureClient()
+        : mTextureClient(nullptr), mFrameID(0), mProducerID(0) {}
+
+    TextureClient* mTextureClient;
+    TimeStamp mTimeStamp;
+    nsIntRect mPictureRect;
+    int32_t mFrameID;
+    int32_t mProducerID;
+  };
+  virtual void UseTextures(CompositableClient* aCompositable,
+                           const nsTArray<TimedTextureClient>& aTextures) = 0;
+
+  virtual void UseRemoteTexture(
+      CompositableClient* aCompositable, const RemoteTextureId aTextureId,
+      const RemoteTextureOwnerId aOwnerId, const gfx::IntSize aSize,
+      const TextureFlags aFlags,
+      const RefPtr<layers::FwdTransactionTracker>& aTracker) = 0;
+
+  void UpdateFwdTransactionId() {
+    ++GetFwdTransactionCounter().mFwdTransactionId;
+  }
+  uint64_t GetFwdTransactionId() {
+    return GetFwdTransactionCounter().mFwdTransactionId;
+  }
+  mozilla::ipc::ProtocolId GetFwdTransactionType() {
+    return GetFwdTransactionCounter().mFwdTransactionType;
+  }
+
+  virtual bool InForwarderThread() = 0;
+
+  void AssertInForwarderThread() { MOZ_ASSERT(InForwarderThread()); }
+
+  void TrackFwdTransaction(const RefPtr<FwdTransactionTracker>& aTracker) {
+    if (aTracker) {
+      aTracker->Use(GetFwdTransactionCounter());
+    }
+  }
+
+ protected:
+  virtual FwdTransactionCounter& GetFwdTransactionCounter() = 0;
+
+  nsTArray<RefPtr<TextureClient>> mTexturesToRemove;
+  nsTArray<RefPtr<CompositableClient>> mCompositableClientsToRemove;
+};
+
+}  
+}  
+
+#endif

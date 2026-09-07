@@ -1,0 +1,269 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "vm/EqualityOperations.h"  // js::LooselyEqual, js::StrictlyEqual, js::SameValue
+
+#include "mozilla/Assertions.h"  // MOZ_ASSERT, MOZ_ASSERT_IF
+
+#include "jstypes.h"  // JS_PUBLIC_API
+
+#include "builtin/Number.h"  // js::StringToNumber
+#include "js/Context.h"      // js::AssertHeapIsIdle
+#include "js/Equality.h"  // JS::LooselyEqual, JS::StrictlyEqual, JS::SameValue
+#include "js/Result.h"    // JS_TRY_VAR_OR_RETURN_FALSE
+#include "js/RootingAPI.h"  // JS::Rooted
+#include "js/Value.h"       // JS::Int32Value, JS::SameType, JS::Value
+#include "vm/BigIntType.h"  // JS::BigInt
+#include "vm/ConstantCompareOperand.h"
+#include "vm/JSContext.h"   // CHECK_THREAD
+#include "vm/JSObject.h"    // js::ToPrimitive
+#include "vm/StringType.h"  // js::EqualStrings
+
+#include "builtin/Boolean-inl.h"  // js::EmulatesUndefined
+#include "vm/JSContext-inl.h"     // JSContext::check
+
+static bool EqualGivenSameType(JSContext* cx, const JS::Value& lval,
+                               const JS::Value& rval, bool* equal) {
+  MOZ_ASSERT(JS::SameType(lval, rval));
+
+  if (lval.isString()) {
+    return js::EqualStrings(cx, lval.toString(), rval.toString(), equal);
+  }
+
+  if (lval.isDouble()) {
+    *equal = (lval.toDouble() == rval.toDouble());
+    return true;
+  }
+
+  if (lval.isBigInt()) {
+    *equal = JS::BigInt::equal(lval.toBigInt(), rval.toBigInt());
+    return true;
+  }
+
+  MOZ_ASSERT(js::CanUseBitwiseCompareForStrictlyEqual(lval) || lval.isInt32());
+
+  *equal = (lval.asRawBits() == rval.asRawBits());
+  MOZ_ASSERT_IF(lval.isUndefined() || lval.isNull(), *equal);
+  return true;
+}
+
+static bool LooselyEqualBooleanAndOther(JSContext* cx,
+                                        JS::Handle<JS::Value> lval,
+                                        JS::Handle<JS::Value> rval,
+                                        bool* result) {
+  MOZ_ASSERT(!rval.isBoolean());
+
+  JS::Rooted<JS::Value> lvalue(cx, JS::Int32Value(lval.toBoolean() ? 1 : 0));
+
+  if (rval.isNumber()) {
+    *result = (lvalue.toNumber() == rval.toNumber());
+    return true;
+  }
+  if (rval.isString()) {
+    double num;
+    if (!StringToNumber(cx, rval.toString(), &num)) {
+      return false;
+    }
+    *result = (lvalue.toNumber() == num);
+    return true;
+  }
+
+  return js::LooselyEqual(cx, lvalue, rval, result);
+}
+
+bool js::LooselyEqual(JSContext* cx, JS::Handle<JS::Value> lval,
+                      JS::Handle<JS::Value> rval, bool* result) {
+  if (JS::SameType(lval, rval)) {
+    return EqualGivenSameType(cx, lval, rval, result);
+  }
+
+  if (lval.isNumber() && rval.isNumber()) {
+    *result = (lval.toNumber() == rval.toNumber());
+    return true;
+  }
+
+  if (lval.isNullOrUndefined()) {
+    *result = rval.isNullOrUndefined() ||
+              (rval.isObject() && EmulatesUndefined(&rval.toObject()));
+    return true;
+  }
+  if (rval.isNullOrUndefined()) {
+    MOZ_ASSERT(!lval.isNullOrUndefined());
+    *result = lval.isObject() && EmulatesUndefined(&lval.toObject());
+    return true;
+  }
+
+  if (lval.isNumber() && rval.isString()) {
+    double num;
+    if (!StringToNumber(cx, rval.toString(), &num)) {
+      return false;
+    }
+    *result = (lval.toNumber() == num);
+    return true;
+  }
+
+  if (lval.isString() && rval.isNumber()) {
+    double num;
+    if (!StringToNumber(cx, lval.toString(), &num)) {
+      return false;
+    }
+    *result = (num == rval.toNumber());
+    return true;
+  }
+
+  if (lval.isBigInt() && rval.isString()) {
+    BigInt* n;
+    JS::Rooted<JSString*> str(cx, rval.toString());
+    JS_TRY_VAR_OR_RETURN_FALSE(cx, n, StringToBigInt(cx, str));
+    if (!n) {
+      *result = false;
+      return true;
+    }
+    *result = JS::BigInt::equal(lval.toBigInt(), n);
+    return true;
+  }
+
+  if (lval.isString() && rval.isBigInt()) {
+    BigInt* n;
+    JS::Rooted<JSString*> str(cx, lval.toString());
+    JS_TRY_VAR_OR_RETURN_FALSE(cx, n, StringToBigInt(cx, str));
+    if (!n) {
+      *result = false;
+      return true;
+    }
+    *result = JS::BigInt::equal(rval.toBigInt(), n);
+    return true;
+  }
+
+  if (lval.isBoolean()) {
+    return LooselyEqualBooleanAndOther(cx, lval, rval, result);
+  }
+
+  if (rval.isBoolean()) {
+    return LooselyEqualBooleanAndOther(cx, rval, lval, result);
+  }
+
+  if ((lval.isString() || lval.isNumber() || lval.isBigInt() ||
+       lval.isSymbol()) &&
+      rval.isObject()) {
+    JS::Rooted<JS::Value> rvalue(cx, rval);
+    if (!ToPrimitive(cx, &rvalue)) {
+      return false;
+    }
+    return js::LooselyEqual(cx, lval, rvalue, result);
+  }
+
+  if (lval.isObject() && (rval.isString() || rval.isNumber() ||
+                          rval.isBigInt() || rval.isSymbol())) {
+    JS::Rooted<JS::Value> lvalue(cx, lval);
+    if (!ToPrimitive(cx, &lvalue)) {
+      return false;
+    }
+    return js::LooselyEqual(cx, lvalue, rval, result);
+  }
+
+  if (lval.isBigInt() && rval.isNumber()) {
+    *result = BigInt::equal(lval.toBigInt(), rval.toNumber());
+    return true;
+  }
+  if (lval.isNumber() && rval.isBigInt()) {
+    *result = BigInt::equal(rval.toBigInt(), lval.toNumber());
+    return true;
+  }
+
+  *result = false;
+  return true;
+}
+
+JS_PUBLIC_API bool JS::LooselyEqual(JSContext* cx, Handle<Value> value1,
+                                    Handle<Value> value2, bool* equal) {
+  js::AssertHeapIsIdle();
+  CHECK_THREAD(cx);
+  cx->check(value1, value2);
+  MOZ_ASSERT(equal);
+  return js::LooselyEqual(cx, value1, value2, equal);
+}
+
+bool js::ConstantStrictEqual(const JS::Value& val, uint16_t operand) {
+  ConstantCompareOperand constant =
+      ConstantCompareOperand::fromRawValue(operand);
+
+  switch (constant.type()) {
+    case ConstantCompareOperand::EncodedType::Int32:
+      return val.isNumber() && val.toNumber() == double(constant.toInt32());
+    case ConstantCompareOperand::EncodedType::Boolean:
+      return val == BooleanValue(constant.toBoolean());
+    case ConstantCompareOperand::EncodedType::Undefined:
+      return val.isUndefined();
+    case ConstantCompareOperand::EncodedType::Null:
+      return val.isNull();
+  }
+  MOZ_CRASH("Unknown constant compare operand type");
+}
+
+bool js::StrictlyEqual(JSContext* cx, const JS::Value& lval,
+                       const JS::Value& rval, bool* equal) {
+  if (SameType(lval, rval)) {
+    return EqualGivenSameType(cx, lval, rval, equal);
+  }
+
+  if (lval.isNumber() && rval.isNumber()) {
+    *equal = (lval.toNumber() == rval.toNumber());
+    return true;
+  }
+
+  *equal = false;
+  return true;
+}
+
+JS_PUBLIC_API bool JS::StrictlyEqual(JSContext* cx, Handle<Value> value1,
+                                     Handle<Value> value2, bool* equal) {
+  js::AssertHeapIsIdle();
+  CHECK_THREAD(cx);
+  cx->check(value1, value2);
+  MOZ_ASSERT(equal);
+  return js::StrictlyEqual(cx, value1, value2, equal);
+}
+
+static inline bool IsNegativeZero(const JS::Value& v) {
+  return v.isDouble() && mozilla::IsNegativeZero(v.toDouble());
+}
+
+static inline bool IsNaN(const JS::Value& v) {
+  return v.isDouble() && std::isnan(v.toDouble());
+}
+
+bool js::SameValue(JSContext* cx, const JS::Value& v1, const JS::Value& v2,
+                   bool* same) {
+  if (IsNegativeZero(v1)) {
+    *same = IsNegativeZero(v2);
+    return true;
+  }
+
+  if (IsNegativeZero(v2)) {
+    *same = false;
+    return true;
+  }
+
+  return js::SameValueZero(cx, v1, v2, same);
+}
+
+JS_PUBLIC_API bool JS::SameValue(JSContext* cx, Handle<Value> value1,
+                                 Handle<Value> value2, bool* same) {
+  js::AssertHeapIsIdle();
+  CHECK_THREAD(cx);
+  cx->check(value1, value2);
+  MOZ_ASSERT(same);
+  return js::SameValue(cx, value1, value2, same);
+}
+
+bool js::SameValueZero(JSContext* cx, const Value& v1, const Value& v2,
+                       bool* same) {
+  if (IsNaN(v1) && IsNaN(v2)) {
+    *same = true;
+    return true;
+  }
+
+  return js::StrictlyEqual(cx, v1, v2, same);
+}

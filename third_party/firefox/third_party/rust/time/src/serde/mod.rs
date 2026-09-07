@@ -1,0 +1,455 @@
+//! Differential formats for serde.
+
+
+/// Consume the next item in a sequence.
+macro_rules! item {
+    ($seq:expr, $name:literal) => {
+        $seq.next_element()?
+            .ok_or_else(|| <A::Error as serde_core::de::Error>::custom(concat!("expected ", $name)))
+    };
+}
+
+#[cfg(any(feature = "formatting", feature = "parsing"))]
+pub mod iso8601;
+#[cfg(any(feature = "formatting", feature = "parsing"))]
+pub mod rfc2822;
+#[cfg(any(feature = "formatting", feature = "parsing"))]
+pub mod rfc3339;
+pub mod timestamp;
+mod visitor;
+
+#[cfg(feature = "serde-human-readable")]
+use alloc::string::ToString;
+use core::marker::PhantomData;
+
+#[cfg(feature = "serde-human-readable")]
+use serde_core::ser::Error as _;
+use serde_core::{Deserialize, Deserializer, Serialize, Serializer};
+/// Generate a custom serializer and deserializer from a format string or an existing format.
+///
+/// The syntax accepted by this macro is the same as [`format_description::parse()`], which can
+/// be found in [the book](https://time-rs.github.io/book/api/format-description.html).
+///
+/// # Usage
+///
+/// Invoked as `serde::format_description!(mod_name, Date, FORMAT)` where `FORMAT` is either a
+/// `"<format string>"` or something that implements
+#[cfg_attr(all(feature = "formatting", feature = "parsing"), doc = "[`Formattable`](crate::formatting::Formattable) and \
+           [`Parsable`](crate::parsing::Parsable).")]
+#[cfg_attr(all(feature = "formatting", not(feature = "parsing")), doc = "[`Formattable`](crate::formatting::Formattable).")]
+#[cfg_attr(all(not(feature = "formatting"), feature = "parsing"), doc = "[`Parsable`](crate::parsing::Parsable).")]
+#[cfg_attr(all(feature = "formatting", feature = "parsing"), doc = "use ::serde::{Serialize, Deserialize};")]
+#[cfg_attr(all(feature = "formatting", not(feature = "parsing")), doc = "use ::serde::Serialize;")]
+#[cfg_attr(all(not(feature = "formatting"), feature = "parsing"), doc = "use ::serde::Deserialize;")]
+#[cfg_attr(all(feature = "formatting", feature = "parsing"), doc = "#[derive(Serialize, Deserialize)]")]
+#[cfg_attr(all(feature = "formatting", not(feature = "parsing")), doc = "#[derive(Serialize)]")]
+#[cfg_attr(all(not(feature = "formatting"), feature = "parsing"), doc = "#[derive(Deserialize)]")]
+#[cfg_attr(all(feature = "formatting", feature = "parsing"), doc = "use ::serde::{Serialize, Deserialize};")]
+#[cfg_attr(all(feature = "formatting", not(feature = "parsing")), doc = "use ::serde::Serialize;")]
+#[cfg_attr(all(not(feature = "formatting"), feature = "parsing"), doc = "use ::serde::Deserialize;")]
+#[cfg_attr(all(feature = "formatting", feature = "parsing"), doc = "#[derive(Serialize, Deserialize)]")]
+#[cfg_attr(all(feature = "formatting", not(feature = "parsing")), doc = "#[derive(Serialize)]")]
+#[cfg_attr(all(not(feature = "formatting"), feature = "parsing"), doc = "#[derive(Deserialize)]")]
+#[cfg_attr(all(feature = "formatting", feature = "parsing"), doc = "use ::serde::{Serialize, Deserialize};")]
+#[cfg_attr(all(feature = "formatting", not(feature = "parsing")), doc = "use ::serde::Serialize;")]
+#[cfg_attr(all(not(feature = "formatting"), feature = "parsing"), doc = "use ::serde::Deserialize;")]
+#[cfg_attr(all(feature = "formatting", feature = "parsing"), doc = "#[derive(Serialize, Deserialize)]")]
+#[cfg_attr(all(feature = "formatting", not(feature = "parsing")), doc = "#[derive(Serialize)]")]
+#[cfg_attr(all(not(feature = "formatting"), feature = "parsing"), doc = "#[derive(Deserialize)]")]
+#[cfg(all(feature = "macros", any(feature = "formatting", feature = "parsing")))]
+pub use time_macros::serde_format_description as format_description;
+
+use self::visitor::Visitor;
+#[cfg(feature = "parsing")]
+use crate::format_description::{BorrowedFormatItem, Component, StaticFormatDescription, modifier};
+use crate::{
+    Date, Duration, Month, OffsetDateTime, PrimitiveDateTime, Time, UtcDateTime, UtcOffset, Weekday,
+};
+
+/// The format used when serializing and deserializing a human-readable `Date`.
+#[cfg(feature = "parsing")]
+const DATE_FORMAT: StaticFormatDescription = &[
+    BorrowedFormatItem::Component(Component::Year(modifier::Year::default())),
+    BorrowedFormatItem::Literal(b"-"),
+    BorrowedFormatItem::Component(Component::Month(modifier::Month::default())),
+    BorrowedFormatItem::Literal(b"-"),
+    BorrowedFormatItem::Component(Component::Day(modifier::Day::default())),
+];
+
+impl Serialize for Date {
+    #[inline]
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[cfg(feature = "serde-human-readable")]
+        if serializer.is_human_readable() {
+            let Ok(s) = self.format(&DATE_FORMAT) else {
+                return Err(S::Error::custom("failed formatting `Date`"));
+            };
+            return serializer.serialize_str(&s);
+        }
+
+        (self.year(), self.ordinal()).serialize(serializer)
+    }
+}
+
+impl<'a> Deserialize<'a> for Date {
+    #[inline]
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'a>,
+    {
+        if cfg!(feature = "serde-human-readable") && deserializer.is_human_readable() {
+            deserializer.deserialize_any(Visitor::<Self>(PhantomData))
+        } else {
+            deserializer.deserialize_tuple(2, Visitor::<Self>(PhantomData))
+        }
+    }
+}
+
+impl Serialize for Duration {
+    #[inline]
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[cfg(feature = "serde-human-readable")]
+        if serializer.is_human_readable() {
+            return serializer.collect_str(&format_args!(
+                "{}{}.{:>09}",
+                if self.is_negative() { "-" } else { "" },
+                self.whole_seconds().unsigned_abs(),
+                self.subsec_nanoseconds().abs(),
+            ));
+        }
+
+        (self.whole_seconds(), self.subsec_nanoseconds()).serialize(serializer)
+    }
+}
+
+impl<'a> Deserialize<'a> for Duration {
+    #[inline]
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'a>,
+    {
+        if cfg!(feature = "serde-human-readable") && deserializer.is_human_readable() {
+            deserializer.deserialize_any(Visitor::<Self>(PhantomData))
+        } else {
+            deserializer.deserialize_tuple(2, Visitor::<Self>(PhantomData))
+        }
+    }
+}
+
+/// The format used when serializing and deserializing a human-readable `OffsetDateTime`.
+#[cfg(feature = "parsing")]
+const OFFSET_DATE_TIME_FORMAT: StaticFormatDescription = &[
+    BorrowedFormatItem::Compound(DATE_FORMAT),
+    BorrowedFormatItem::Literal(b" "),
+    BorrowedFormatItem::Compound(TIME_FORMAT),
+    BorrowedFormatItem::Literal(b" "),
+    BorrowedFormatItem::Compound(UTC_OFFSET_FORMAT),
+];
+
+impl Serialize for OffsetDateTime {
+    #[inline]
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[cfg(feature = "serde-human-readable")]
+        if serializer.is_human_readable() {
+            let Ok(s) = self.format(&OFFSET_DATE_TIME_FORMAT) else {
+                return Err(S::Error::custom("failed formatting `OffsetDateTime`"));
+            };
+            return serializer.serialize_str(&s);
+        }
+
+        (
+            self.year(),
+            self.ordinal(),
+            self.hour(),
+            self.minute(),
+            self.second(),
+            self.nanosecond(),
+            self.offset().whole_hours(),
+            self.offset().minutes_past_hour(),
+            self.offset().seconds_past_minute(),
+        )
+            .serialize(serializer)
+    }
+}
+
+impl<'a> Deserialize<'a> for OffsetDateTime {
+    #[inline]
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'a>,
+    {
+        if cfg!(feature = "serde-human-readable") && deserializer.is_human_readable() {
+            deserializer.deserialize_any(Visitor::<Self>(PhantomData))
+        } else {
+            deserializer.deserialize_tuple(9, Visitor::<Self>(PhantomData))
+        }
+    }
+}
+
+/// The format used when serializing and deserializing a human-readable `PrimitiveDateTime`.
+#[cfg(feature = "parsing")]
+const PRIMITIVE_DATE_TIME_FORMAT: StaticFormatDescription = &[
+    BorrowedFormatItem::Compound(DATE_FORMAT),
+    BorrowedFormatItem::Literal(b" "),
+    BorrowedFormatItem::Compound(TIME_FORMAT),
+];
+
+impl Serialize for PrimitiveDateTime {
+    #[inline]
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[cfg(feature = "serde-human-readable")]
+        if serializer.is_human_readable() {
+            let Ok(s) = self.format(&PRIMITIVE_DATE_TIME_FORMAT) else {
+                return Err(S::Error::custom("failed formatting `PrimitiveDateTime`"));
+            };
+            return serializer.serialize_str(&s);
+        }
+
+        (
+            self.year(),
+            self.ordinal(),
+            self.hour(),
+            self.minute(),
+            self.second(),
+            self.nanosecond(),
+        )
+            .serialize(serializer)
+    }
+}
+
+impl<'a> Deserialize<'a> for PrimitiveDateTime {
+    #[inline]
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'a>,
+    {
+        if cfg!(feature = "serde-human-readable") && deserializer.is_human_readable() {
+            deserializer.deserialize_any(Visitor::<Self>(PhantomData))
+        } else {
+            deserializer.deserialize_tuple(6, Visitor::<Self>(PhantomData))
+        }
+    }
+}
+
+/// The format used when serializing and deserializing a human-readable `UtcDateTime`.
+#[cfg(feature = "parsing")]
+const UTC_DATE_TIME_FORMAT: StaticFormatDescription = PRIMITIVE_DATE_TIME_FORMAT;
+
+impl Serialize for UtcDateTime {
+    #[inline]
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[cfg(feature = "serde-human-readable")]
+        if serializer.is_human_readable() {
+            let Ok(s) = self.format(&PRIMITIVE_DATE_TIME_FORMAT) else {
+                return Err(S::Error::custom("failed formatting `UtcDateTime`"));
+            };
+            return serializer.serialize_str(&s);
+        }
+
+        (
+            self.year(),
+            self.ordinal(),
+            self.hour(),
+            self.minute(),
+            self.second(),
+            self.nanosecond(),
+        )
+            .serialize(serializer)
+    }
+}
+
+impl<'a> Deserialize<'a> for UtcDateTime {
+    #[inline]
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'a>,
+    {
+        if cfg!(feature = "serde-human-readable") && deserializer.is_human_readable() {
+            deserializer.deserialize_any(Visitor::<Self>(PhantomData))
+        } else {
+            deserializer.deserialize_tuple(6, Visitor::<Self>(PhantomData))
+        }
+    }
+}
+
+/// The format used when serializing and deserializing a human-readable `Time`.
+#[cfg(feature = "parsing")]
+const TIME_FORMAT: StaticFormatDescription = &[
+    BorrowedFormatItem::Component(Component::Hour(modifier::Hour::default())),
+    BorrowedFormatItem::Literal(b":"),
+    BorrowedFormatItem::Component(Component::Minute(modifier::Minute::default())),
+    BorrowedFormatItem::Literal(b":"),
+    BorrowedFormatItem::Component(Component::Second(modifier::Second::default())),
+    BorrowedFormatItem::Literal(b"."),
+    BorrowedFormatItem::Component(Component::Subsecond(modifier::Subsecond::default())),
+];
+
+impl Serialize for Time {
+    #[inline]
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[cfg(feature = "serde-human-readable")]
+        if serializer.is_human_readable() {
+            let Ok(s) = self.format(&TIME_FORMAT) else {
+                return Err(S::Error::custom("failed formatting `Time`"));
+            };
+            return serializer.serialize_str(&s);
+        }
+
+        (self.hour(), self.minute(), self.second(), self.nanosecond()).serialize(serializer)
+    }
+}
+
+impl<'a> Deserialize<'a> for Time {
+    #[inline]
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'a>,
+    {
+        if cfg!(feature = "serde-human-readable") && deserializer.is_human_readable() {
+            deserializer.deserialize_any(Visitor::<Self>(PhantomData))
+        } else {
+            deserializer.deserialize_tuple(4, Visitor::<Self>(PhantomData))
+        }
+    }
+}
+
+/// The format used when serializing and deserializing a human-readable `UtcOffset`.
+#[cfg(feature = "parsing")]
+const UTC_OFFSET_FORMAT: StaticFormatDescription = &[
+    BorrowedFormatItem::Component(Component::OffsetHour(
+        const {
+            let mut m = modifier::OffsetHour::default();
+            m.sign_is_mandatory = true;
+            m
+        },
+    )),
+    BorrowedFormatItem::Optional(&BorrowedFormatItem::Compound(&[
+        BorrowedFormatItem::Literal(b":"),
+        BorrowedFormatItem::Component(Component::OffsetMinute(
+            const { modifier::OffsetMinute::default() },
+        )),
+        BorrowedFormatItem::Optional(&BorrowedFormatItem::Compound(&[
+            BorrowedFormatItem::Literal(b":"),
+            BorrowedFormatItem::Component(Component::OffsetSecond(
+                const { modifier::OffsetSecond::default() },
+            )),
+        ])),
+    ])),
+];
+
+impl Serialize for UtcOffset {
+    #[inline]
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[cfg(feature = "serde-human-readable")]
+        if serializer.is_human_readable() {
+            let Ok(s) = self.format(&UTC_OFFSET_FORMAT) else {
+                return Err(S::Error::custom("failed formatting `UtcOffset`"));
+            };
+            return serializer.serialize_str(&s);
+        }
+
+        (
+            self.whole_hours(),
+            self.minutes_past_hour(),
+            self.seconds_past_minute(),
+        )
+            .serialize(serializer)
+    }
+}
+
+impl<'a> Deserialize<'a> for UtcOffset {
+    #[inline]
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'a>,
+    {
+        if cfg!(feature = "serde-human-readable") && deserializer.is_human_readable() {
+            deserializer.deserialize_any(Visitor::<Self>(PhantomData))
+        } else {
+            deserializer.deserialize_tuple(3, Visitor::<Self>(PhantomData))
+        }
+    }
+}
+
+impl Serialize for Weekday {
+    #[inline]
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[cfg(feature = "serde-human-readable")]
+        if serializer.is_human_readable() {
+            #[cfg(not(feature = "std"))]
+            use alloc::string::ToString;
+            return self.to_string().serialize(serializer);
+        }
+
+        self.number_from_monday().serialize(serializer)
+    }
+}
+
+impl<'a> Deserialize<'a> for Weekday {
+    #[inline]
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'a>,
+    {
+        if cfg!(feature = "serde-human-readable") && deserializer.is_human_readable() {
+            deserializer.deserialize_any(Visitor::<Self>(PhantomData))
+        } else {
+            deserializer.deserialize_u8(Visitor::<Self>(PhantomData))
+        }
+    }
+}
+
+impl Serialize for Month {
+    #[inline]
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[cfg(feature = "serde-human-readable")]
+        if serializer.is_human_readable() {
+            #[cfg(not(feature = "std"))]
+            use alloc::string::String;
+            return self.to_string().serialize(serializer);
+        }
+
+        u8::from(*self).serialize(serializer)
+    }
+}
+
+impl<'a> Deserialize<'a> for Month {
+    #[inline]
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'a>,
+    {
+        if cfg!(feature = "serde-human-readable") && deserializer.is_human_readable() {
+            deserializer.deserialize_any(Visitor::<Self>(PhantomData))
+        } else {
+            deserializer.deserialize_u8(Visitor::<Self>(PhantomData))
+        }
+    }
+}

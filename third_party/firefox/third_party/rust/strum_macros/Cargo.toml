@@ -1,0 +1,42 @@
+
+[package]
+edition = "2021"
+rust-version = "1.66.1"
+name = "strum_macros"
+version = "0.27.1"
+authors = ["Peter Glotfelty <peter.glotfelty@microsoft.com>"]
+description = "Helpful macros for working with enums and strings"
+homepage = "https://github.com/Peternator7/strum"
+documentation = "https://docs.rs/strum"
+keywords = [
+    "enum",
+    "string",
+    "macros",
+    "proc-macros",
+]
+categories = [
+    "development-tools::procedural-macro-helpers",
+    "parsing",
+]
+license = "MIT"
+repository = "https://github.com/Peternator7/strum"
+
+[lib]
+name = "strum_macros"
+proc-macro = true
+
+[dependencies.heck]
+version = "0.5.0"
+
+[dependencies.proc-macro2]
+version = "1.0"
+
+[dependencies.quote]
+version = "1.0"
+
+[dependencies.rustversion]
+version = "1.0"
+
+[dependencies.syn]
+version = "2.0"
+features = ["parsing"]

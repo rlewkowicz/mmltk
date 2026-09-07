@@ -1,0 +1,309 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#include "ICU4CGlue.h"
+#include "NumberFormatFields.h"
+#include "ScopedICUObject.h"
+
+#include "unicode/uformattedvalue.h"
+#include "unicode/unum.h"
+#include "unicode/unumberformatter.h"
+
+namespace mozilla::intl {
+
+bool NumberFormatFields::append(NumberPartType type, int32_t begin,
+                                int32_t end) {
+  MOZ_ASSERT(begin >= 0);
+  MOZ_ASSERT(end >= 0);
+  MOZ_ASSERT(begin < end, "erm, aren't fields always non-empty?");
+
+  return fields_.emplaceBack(uint32_t(begin), uint32_t(end), type);
+}
+
+bool NumberFormatFields::toPartsVector(size_t overallLength,
+                                       const NumberPartSourceMap& sourceMap,
+                                       NumberPartVector& parts) {
+  std::sort(fields_.begin(), fields_.end(),
+            [](const NumberFormatField& left, const NumberFormatField& right) {
+              return left.begin < right.begin ||
+                     (left.begin == right.begin && left.end > right.end);
+            });
+
+
+  class PartGenerator {
+    const FieldsVector& fields;
+
+    size_t index = 0;
+
+    uint32_t lastEnd = 0;
+
+    const uint32_t limit = 0;
+
+    NumberPartSourceMap sourceMap;
+
+    Vector<size_t, 4> enclosingFields;
+
+    void popEnclosingFieldsEndingAt(uint32_t end) {
+      MOZ_ASSERT_IF(enclosingFields.length() > 0,
+                    fields[enclosingFields.back()].end >= end);
+
+      while (enclosingFields.length() > 0 &&
+             fields[enclosingFields.back()].end == end) {
+        enclosingFields.popBack();
+      }
+    }
+
+    bool nextPartInternal(NumberPart* part) {
+      size_t len = fields.length();
+      MOZ_ASSERT(index <= len);
+
+      if (index == len) {
+        if (enclosingFields.length() > 0) {
+          const auto& enclosing = fields[enclosingFields.popCopy()];
+          *part = {enclosing.type, sourceMap.source(enclosing), enclosing.end};
+
+          popEnclosingFieldsEndingAt(part->endIndex);
+        } else {
+          *part = {NumberPartType::Literal, sourceMap.source(limit), limit};
+        }
+
+        return true;
+      }
+
+      const NumberFormatField* current = &fields[index];
+      MOZ_ASSERT(lastEnd <= current->begin);
+      MOZ_ASSERT(current->begin < current->end);
+
+      if (lastEnd < current->begin) {
+        if (enclosingFields.length() > 0) {
+          const auto& enclosing = fields[enclosingFields.back()];
+          *part = {enclosing.type, sourceMap.source(enclosing),
+                   std::min(enclosing.end, current->begin)};
+          popEnclosingFieldsEndingAt(part->endIndex);
+        } else {
+          *part = {NumberPartType::Literal, sourceMap.source(current->begin),
+                   current->begin};
+        }
+
+        return true;
+      }
+
+      const NumberFormatField* next;
+      do {
+        current = &fields[index];
+
+        if (++index == len) {
+          *part = {current->type, sourceMap.source(*current), current->end};
+          return true;
+        }
+
+        next = &fields[index];
+        MOZ_ASSERT(current->begin <= next->begin);
+        MOZ_ASSERT(current->begin < next->end);
+
+        if (current->end > next->begin) {
+          if (!enclosingFields.append(index - 1)) {
+            return false;
+          }
+        }
+
+      } while (current->begin == next->begin);
+
+      if (current->end <= next->begin) {
+        *part = {current->type, sourceMap.source(*current), current->end};
+        popEnclosingFieldsEndingAt(part->endIndex);
+      } else {
+        *part = {current->type, sourceMap.source(*current), next->begin};
+      }
+
+      return true;
+    }
+
+   public:
+    PartGenerator(const FieldsVector& vec, uint32_t limit,
+                  const NumberPartSourceMap& sourceMap)
+        : fields(vec), limit(limit), sourceMap(sourceMap) {}
+
+    bool nextPart(bool* hasPart, NumberPart* part) {
+      if (lastEnd == limit) {
+        MOZ_ASSERT(enclosingFields.length() == 0);
+        *hasPart = false;
+        return true;
+      }
+
+      if (!nextPartInternal(part)) {
+        return false;
+      }
+
+      *hasPart = true;
+      lastEnd = part->endIndex;
+      return true;
+    }
+  };
+
+  size_t lastEndIndex = 0;
+
+  PartGenerator gen(fields_, overallLength, sourceMap);
+  do {
+    bool hasPart;
+    NumberPart part;
+    if (!gen.nextPart(&hasPart, &part)) {
+      return false;
+    }
+
+    if (!hasPart) {
+      break;
+    }
+
+    MOZ_ASSERT(lastEndIndex < part.endIndex);
+
+    if (!parts.append(part)) {
+      return false;
+    }
+
+    lastEndIndex = part.endIndex;
+  } while (true);
+
+  MOZ_ASSERT(lastEndIndex == overallLength,
+             "result array must partition the entire string");
+
+  return lastEndIndex == overallLength;
+}
+
+Result<std::u16string_view, ICUError> FormatResultToParts(
+    const UFormattedNumber* value, Maybe<double> number, bool isNegative,
+    bool formatForUnit, NumberPartVector& parts) {
+  UErrorCode status = U_ZERO_ERROR;
+
+  const UFormattedValue* formattedValue = unumf_resultAsValue(value, &status);
+  if (U_FAILURE(status)) {
+    return Err(ToICUError(status));
+  }
+
+  return FormatResultToParts(formattedValue, number, isNegative, formatForUnit,
+                             parts);
+}
+
+Result<std::u16string_view, ICUError> FormatResultToParts(
+    const UFormattedValue* value, Maybe<double> number, bool isNegative,
+    bool formatForUnit, NumberPartVector& parts) {
+  UErrorCode status = U_ZERO_ERROR;
+
+  int32_t utf16Length;
+  const char16_t* utf16Str = ufmtval_getString(value, &utf16Length, &status);
+  if (U_FAILURE(status)) {
+    return Err(ToICUError(status));
+  }
+
+  UConstrainedFieldPosition* fpos = ucfpos_open(&status);
+  if (U_FAILURE(status)) {
+    return Err(ToICUError(status));
+  }
+  ScopedICUObject<UConstrainedFieldPosition, ucfpos_close> toCloseFpos(fpos);
+
+  ucfpos_constrainCategory(fpos, UFIELD_CATEGORY_NUMBER, &status);
+  if (U_FAILURE(status)) {
+    return Err(ToICUError(status));
+  }
+
+  NumberFormatFields fields;
+
+  while (true) {
+    bool hasMore = ufmtval_nextPosition(value, fpos, &status);
+    if (U_FAILURE(status)) {
+      return Err(ToICUError(status));
+    }
+    if (!hasMore) {
+      break;
+    }
+
+    int32_t fieldName = ucfpos_getField(fpos, &status);
+    if (U_FAILURE(status)) {
+      return Err(ToICUError(status));
+    }
+
+    int32_t beginIndex, endIndex;
+    ucfpos_getIndexes(fpos, &beginIndex, &endIndex, &status);
+    if (U_FAILURE(status)) {
+      return Err(ToICUError(status));
+    }
+
+    Maybe<NumberPartType> partType = GetPartTypeForNumberField(
+        UNumberFormatFields(fieldName), number, isNegative, formatForUnit);
+    if (!partType || !fields.append(*partType, beginIndex, endIndex)) {
+      return Err(ICUError::InternalError);
+    }
+  }
+
+  if (!fields.toPartsVector(utf16Length, parts)) {
+    return Err(ICUError::InternalError);
+  }
+
+  return std::u16string_view(utf16Str, static_cast<size_t>(utf16Length));
+}
+
+Maybe<NumberPartType> GetPartTypeForNumberField(UNumberFormatFields fieldName,
+                                                Maybe<double> number,
+                                                bool isNegative,
+                                                bool formatForUnit) {
+  switch (fieldName) {
+    case UNUM_INTEGER_FIELD:
+      if (number.isSome()) {
+        if (std::isnan(*number)) {
+          return Some(NumberPartType::Nan);
+        }
+        if (!std::isfinite(*number)) {
+          return Some(NumberPartType::Infinity);
+        }
+      }
+      return Some(NumberPartType::Integer);
+    case UNUM_FRACTION_FIELD:
+      return Some(NumberPartType::Fraction);
+    case UNUM_DECIMAL_SEPARATOR_FIELD:
+      return Some(NumberPartType::Decimal);
+    case UNUM_EXPONENT_SYMBOL_FIELD:
+      return Some(NumberPartType::ExponentSeparator);
+    case UNUM_EXPONENT_SIGN_FIELD:
+      return Some(NumberPartType::ExponentMinusSign);
+    case UNUM_EXPONENT_FIELD:
+      return Some(NumberPartType::ExponentInteger);
+    case UNUM_GROUPING_SEPARATOR_FIELD:
+      return Some(NumberPartType::Group);
+    case UNUM_CURRENCY_FIELD:
+      return Some(NumberPartType::Currency);
+    case UNUM_PERCENT_FIELD:
+      if (formatForUnit) {
+        return Some(NumberPartType::Unit);
+      }
+      return Some(NumberPartType::Percent);
+    case UNUM_PERMILL_FIELD:
+      MOZ_ASSERT_UNREACHABLE(
+          "unexpected permill field found, even though "
+          "we don't use any user-defined patterns that "
+          "would require a permill field");
+      break;
+    case UNUM_SIGN_FIELD:
+      if (isNegative) {
+        return Some(NumberPartType::MinusSign);
+      }
+      return Some(NumberPartType::PlusSign);
+    case UNUM_MEASURE_UNIT_FIELD:
+      return Some(NumberPartType::Unit);
+    case UNUM_COMPACT_FIELD:
+      return Some(NumberPartType::Compact);
+    case UNUM_APPROXIMATELY_SIGN_FIELD:
+      return Some(NumberPartType::ApproximatelySign);
+#ifndef U_HIDE_DEPRECATED_API
+    case UNUM_FIELD_COUNT:
+      MOZ_ASSERT_UNREACHABLE(
+          "format field sentinel value returned by iterator!");
+      break;
+#endif
+  }
+
+  MOZ_ASSERT_UNREACHABLE(
+      "unenumerated, undocumented format field returned by iterator");
+  return Nothing();
+}
+
+}  

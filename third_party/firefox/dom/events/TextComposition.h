@@ -1,0 +1,354 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_TextComposition_h
+#define mozilla_TextComposition_h
+
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/EventForwards.h"
+#include "mozilla/RangeBoundary.h"
+#include "mozilla/TextRange.h"
+#include "mozilla/dom/BrowserParent.h"
+#include "mozilla/dom/Text.h"
+#include "nsCOMPtr.h"
+#include "nsINode.h"
+#include "nsIWidget.h"
+#include "nsPresContext.h"
+#include "nsTArray.h"
+#include "nsThreadUtils.h"
+
+class nsRange;
+
+struct CharacterDataChangeInfo;
+
+namespace mozilla {
+
+class EditorBase;
+class EventDispatchingCallback;
+class IMEStateManager;
+
+
+class TextComposition final {
+  friend class IMEStateManager;
+
+  NS_INLINE_DECL_REFCOUNTING(TextComposition)
+
+ public:
+  typedef dom::BrowserParent BrowserParent;
+  typedef dom::Text Text;
+
+  static bool IsHandlingSelectionEvent() { return sHandlingSelectionEvent; }
+
+  TextComposition(nsPresContext* aPresContext, nsINode* aNode,
+                  BrowserParent* aBrowserParent,
+                  WidgetCompositionEvent* aCompositionEvent);
+  TextComposition() = delete;
+  TextComposition(const TextComposition& aOther) = delete;
+
+  bool Destroyed() const { return !mPresContext; }
+  nsPresContext* GetPresContext() const { return mPresContext; }
+  nsINode* GetEventTargetNode() const { return mNode; }
+  Text* GetContainerTextNode() const { return mContainerTextNode; }
+  const nsString& LastData() const { return mLastData; }
+  nsString CommitStringIfCommittedAsIs() const;
+  const nsString& String() const { return mString; }
+  TextRangeArray* GetLastRanges() const { return mLastRanges; }
+  TextRangeArray* GetRanges() const { return mRanges; }
+  already_AddRefed<nsIWidget> GetWidget() const {
+    if (!mPresContext) {
+      return nullptr;
+    }
+    return do_AddRef(mPresContext->GetRootWidget());
+  }
+  already_AddRefed<EditorBase> GetEditorBase() const;
+  BrowserParent* GetBrowserParent() const { return mBrowserParent; }
+  bool IsSynthesizedForTests() const { return mIsSynthesizedForTests; }
+
+  uint32_t Id() const { return mCompositionId; }
+
+  const widget::NativeIMEContext& GetNativeIMEContext() const {
+    return mNativeContext;
+  }
+
+  void Destroy();
+
+  nsresult RequestToCommit(nsIWidget* aWidget, bool aDiscard);
+
+  bool IsRequestingCommitOrCancelComposition() const {
+    return mIsRequestingCancel || mIsRequestingCommit;
+  }
+
+  nsresult NotifyIME(widget::IMEMessage aMessage);
+
+  uint32_t NativeOffsetOfStartComposition() const {
+    return mCompositionStartOffset;
+  }
+
+  uint32_t NativeOffsetOfTargetClause() const {
+    return mCompositionStartOffset + mTargetClauseOffsetInComposition;
+  }
+
+  RawRangeBoundary FirstIMESelectionStartRef() const;
+  RawRangeBoundary LastIMESelectionEndRef() const;
+
+  [[nodiscard]] uint32_t ClampedStartOffsetInTextNode() const {
+    return std::min(mCompositionStartOffsetInTextNode,
+                    mContainerTextNode->TextDataLength());
+  }
+
+  [[nodiscard]] uint32_t ClampedLengthInTextNode() const {
+    return mCompositionLengthInTextNode == UINT32_MAX
+               ? 0
+               : ClampedEndOffsetInTextNode() - ClampedStartOffsetInTextNode();
+  }
+
+  [[nodiscard]] uint32_t ClampedEndOffsetInTextNode() const {
+    if (mCompositionStartOffsetInTextNode == UINT32_MAX ||
+        mCompositionLengthInTextNode == UINT32_MAX) {
+      return UINT32_MAX;
+    }
+    return static_cast<uint32_t>(
+        std::min<uint64_t>(static_cast<uint64_t>(mCompositionLengthInTextNode) +
+                               ClampedStartOffsetInTextNode(),
+                           mContainerTextNode->TextDataLength()));
+  }
+
+  [[nodiscard]] uint32_t StartOffsetMaybeInFollowingTextNode() const {
+    return mCompositionStartOffsetInTextNode;
+  }
+
+  [[nodiscard]] uint32_t LengthMaybeInFollowingTextNode() const {
+    return mCompositionLengthInTextNode == UINT32_MAX
+               ? 0
+               : mCompositionLengthInTextNode;
+  }
+
+  [[nodiscard]] uint32_t EndOffsetMaybeInFollowingTextNode() const {
+    if (mCompositionStartOffsetInTextNode == UINT32_MAX ||
+        mCompositionLengthInTextNode == UINT32_MAX) {
+      return UINT32_MAX;
+    }
+    return mCompositionStartOffsetInTextNode + mCompositionLengthInTextNode;
+  }
+
+  bool IsComposing() const { return mIsComposing; }
+
+  [[nodiscard]] bool CanRequsetIMEToCommitOrCancelComposition() const {
+    return !mIsRequestingCommit && !mIsRequestingCancel &&
+           !mRequestedToCommitOrCancel && !mHasReceivedCommitEvent;
+  }
+
+  [[nodiscard]] bool EditorHasHandledLatestChange() const {
+    return EditorIsHandlingLatestChange() ||
+           (mLastRanges == mRanges && mLastData == mString);
+  }
+
+  [[nodiscard]] bool EditorIsHandlingLatestChange() const {
+    return mEditorIsHandlingEvent;
+  }
+
+  bool IsMovingToNewTextNode() const {
+    return !mContainerTextNode && mCompositionLengthInTextNode &&
+           mCompositionLengthInTextNode != UINT32_MAX;
+  }
+
+  void StartHandlingComposition(EditorBase* aEditorBase);
+  void EndHandlingComposition(EditorBase* aEditorBase);
+
+  void OnEditorDestroyed();
+
+  class MOZ_STACK_CLASS CompositionChangeEventHandlingMarker {
+   public:
+    CompositionChangeEventHandlingMarker(
+        TextComposition* aComposition,
+        const WidgetCompositionEvent* aCompositionChangeEvent)
+        : mComposition(aComposition) {
+      mComposition->EditorWillHandleCompositionChangeEvent(
+          aCompositionChangeEvent);
+    }
+
+    ~CompositionChangeEventHandlingMarker() {
+      mComposition->EditorDidHandleCompositionChangeEvent();
+    }
+    CompositionChangeEventHandlingMarker() = delete;
+    CompositionChangeEventHandlingMarker(
+        const CompositionChangeEventHandlingMarker& aOther) = delete;
+
+   private:
+    RefPtr<TextComposition> mComposition;
+  };
+
+  void OnUpdateCompositionInEditor(const nsAString& aStringToInsert,
+                                   Text& aTextNode, uint32_t aOffset) {
+    mContainerTextNode = &aTextNode;
+    mCompositionStartOffsetInTextNode = aOffset;
+    NS_WARNING_ASSERTION(mCompositionStartOffsetInTextNode != UINT32_MAX,
+                         "The text node is really too long.");
+    mCompositionLengthInTextNode = aStringToInsert.Length();
+    NS_WARNING_ASSERTION(mCompositionLengthInTextNode != UINT32_MAX,
+                         "The string to insert is really too long.");
+  }
+
+  void OnTextNodeRemoved() {
+    mContainerTextNode = nullptr;
+  }
+
+  void OnCharacterDataChanged(Text& aText,
+                              const CharacterDataChangeInfo& aInfo);
+
+ private:
+  ~TextComposition() = default;
+
+  static bool sHandlingSelectionEvent;
+
+  nsPresContext* mPresContext;
+  RefPtr<nsINode> mNode;
+  RefPtr<BrowserParent> mBrowserParent;
+
+  RefPtr<Text> mContainerTextNode;
+
+  RefPtr<TextRangeArray> mRanges;
+  RefPtr<TextRangeArray> mLastRanges;
+
+  widget::NativeIMEContext mNativeContext;
+
+  nsWeakPtr mEditorBaseWeak;
+
+  nsString mLastData;
+
+  nsString mString;
+
+  const uint32_t mCompositionId = 0;
+
+  uint32_t mCompositionStartOffset;
+  uint32_t mTargetClauseOffsetInComposition;
+  uint32_t mCompositionStartOffsetInTextNode;
+  uint32_t mCompositionLengthInTextNode;
+
+  bool mIsSynthesizedForTests;
+
+  bool mIsComposing;
+
+  bool mEditorIsHandlingEvent = false;
+
+  bool mIsRequestingCommit;
+  bool mIsRequestingCancel;
+
+  bool mRequestedToCommitOrCancel;
+
+  bool mHasDispatchedDOMTextEvent;
+
+  bool mHasReceivedCommitEvent;
+
+  bool mWasNativeCompositionEndEventDiscarded;
+
+  bool mAllowControlCharacters;
+
+  bool mWasCompositionStringEmpty;
+
+  bool HasEditor() const;
+
+  void EditorWillHandleCompositionChangeEvent(
+      const WidgetCompositionEvent* aCompositionChangeEvent);
+
+  void EditorDidHandleCompositionChangeEvent();
+
+  bool IsValidStateForComposition(nsIWidget* aWidget) const;
+
+  MOZ_CAN_RUN_SCRIPT void DispatchCompositionEvent(
+      WidgetCompositionEvent* aCompositionEvent, nsEventStatus* aStatus,
+      EventDispatchingCallback* aCallBack, bool aIsSynthesized);
+
+  MOZ_CAN_RUN_SCRIPT void DispatchEvent(
+      WidgetCompositionEvent* aDispatchEvent, nsEventStatus* aStatus,
+      EventDispatchingCallback* aCallback,
+      const WidgetCompositionEvent* aOriginalEvent = nullptr);
+
+  MOZ_CAN_RUN_SCRIPT
+  void HandleSelectionEvent(WidgetSelectionEvent* aSelectionEvent) {
+    RefPtr<nsPresContext> presContext(mPresContext);
+    RefPtr<BrowserParent> browserParent(mBrowserParent);
+    HandleSelectionEvent(presContext, browserParent, aSelectionEvent);
+  }
+  MOZ_CAN_RUN_SCRIPT
+  static void HandleSelectionEvent(nsPresContext* aPresContext,
+                                   BrowserParent* aBrowserParent,
+                                   WidgetSelectionEvent* aSelectionEvent);
+
+  MOZ_CAN_RUN_SCRIPT bool MaybeDispatchCompositionUpdate(
+      const WidgetCompositionEvent* aCompositionEvent);
+
+  MOZ_CAN_RUN_SCRIPT BaseEventFlags
+  CloneAndDispatchAs(const WidgetCompositionEvent* aCompositionEvent,
+                     EventMessage aMessage, nsEventStatus* aStatus = nullptr,
+                     EventDispatchingCallback* aCallBack = nullptr);
+
+  bool WasNativeCompositionEndEventDiscarded() const {
+    return mWasNativeCompositionEndEventDiscarded;
+  }
+
+  void OnCompositionEventDiscarded(WidgetCompositionEvent* aCompositionEvent);
+
+  MOZ_CAN_RUN_SCRIPT void OnCompositionEventDispatched(
+      const WidgetCompositionEvent* aDispatchEvent);
+
+  void MaybeNotifyIMEOfCompositionEventHandled(
+      const WidgetCompositionEvent* aCompositionEvent);
+
+  MOZ_CAN_RUN_SCRIPT uint32_t GetSelectionStartOffset();
+
+  void OnStartOffsetUpdatedInChild(uint32_t aStartOffset);
+
+  class CompositionEventDispatcher : public Runnable {
+   public:
+    CompositionEventDispatcher(TextComposition* aTextComposition,
+                               nsINode* aEventTarget,
+                               EventMessage aEventMessage,
+                               const nsAString& aData,
+                               bool aIsSynthesizedEvent = false);
+    MOZ_CAN_RUN_SCRIPT_BOUNDARY NS_IMETHOD Run() override;
+
+   private:
+    RefPtr<TextComposition> mTextComposition;
+    nsCOMPtr<nsINode> mEventTarget;
+    nsString mData;
+    EventMessage mEventMessage;
+    bool mIsSynthesizedEvent;
+
+    CompositionEventDispatcher()
+        : Runnable("TextComposition::CompositionEventDispatcher"),
+          mEventMessage(eVoidEvent),
+          mIsSynthesizedEvent(false) {};
+  };
+
+  void DispatchCompositionEventRunnable(EventMessage aEventMessage,
+                                        const nsAString& aData,
+                                        bool aIsSynthesizingCommit = false);
+};
+
+
+class TextCompositionArray final
+    : public AutoTArray<RefPtr<TextComposition>, 2> {
+ public:
+  index_type IndexOf(const widget::NativeIMEContext& aNativeIMEContext);
+  index_type IndexOf(nsIWidget* aWidget);
+
+  TextComposition* GetCompositionFor(nsIWidget* aWidget);
+  TextComposition* GetCompositionFor(
+      const WidgetCompositionEvent* aCompositionEvent);
+
+  index_type IndexOf(nsPresContext* aPresContext);
+  index_type IndexOf(nsPresContext* aPresContext, nsINode* aNode);
+
+  TextComposition* GetCompositionFor(nsPresContext* aPresContext);
+  TextComposition* GetCompositionFor(nsPresContext* aPresContext,
+                                     nsINode* aNode);
+  TextComposition* GetCompositionInContent(nsPresContext* aPresContext,
+                                           nsIContent* aContent);
+};
+
+}  
+
+#endif  // #ifndef mozilla_TextComposition_h

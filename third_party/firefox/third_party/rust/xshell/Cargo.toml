@@ -1,0 +1,33 @@
+
+[package]
+edition = "2021"
+rust-version = "1.63"
+name = "xshell"
+version = "0.2.7"
+authors = ["Aleksey Kladov <aleksey.kladov@gmail.com>"]
+build = false
+exclude = [
+    ".github/",
+    "bors.toml",
+    "rustfmt.toml",
+    "cbench",
+    "mock_bin/",
+]
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Utilities for quick shell scripting in Rust"
+categories = [
+    "development-tools::build-utils",
+    "filesystem",
+]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/matklad/xshell"
+
+[lib]
+name = "xshell"
+path = "src/lib.rs"
+
+[dependencies.xshell-macros]
+version = "=0.2.7"

@@ -1,0 +1,170 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "txList.h"
+
+
+
+txList::txList() {
+  firstItem = nullptr;
+  lastItem = nullptr;
+  itemCount = 0;
+}  
+
+txList::~txList() { clear(); }  
+
+void txList::add(void* objPtr) { insertBefore(objPtr, nullptr); }  
+
+int32_t List::getLength() { return itemCount; }  
+
+void txList::insertAfter(void* objPtr, ListItem* refItem) {
+  insertBefore(objPtr, refItem ? refItem->nextItem : firstItem);
+}  
+
+void txList::insertBefore(void* objPtr, ListItem* refItem) {
+  ListItem* item = new ListItem;
+  item->objPtr = objPtr;
+  item->nextItem = nullptr;
+  item->prevItem = nullptr;
+
+  if (!refItem) {
+    if (lastItem) {
+      lastItem->nextItem = item;
+      item->prevItem = lastItem;
+    }
+    lastItem = item;
+    if (!firstItem) firstItem = item;
+  } else {
+    item->nextItem = refItem;
+    item->prevItem = refItem->prevItem;
+    refItem->prevItem = item;
+
+    if (item->prevItem)
+      item->prevItem->nextItem = item;
+    else
+      firstItem = item;
+  }
+
+  ++itemCount;
+}  
+
+txList::ListItem* txList::remove(ListItem* item) {
+  if (!item) return item;
+
+  if (item->prevItem) {
+    item->prevItem->nextItem = item->nextItem;
+  }
+  if (item->nextItem) {
+    item->nextItem->prevItem = item->prevItem;
+  }
+
+  if (item == firstItem) firstItem = item->nextItem;
+  if (item == lastItem) lastItem = item->prevItem;
+
+  --itemCount;
+  return item;
+}  
+
+void txList::clear() {
+  ListItem* item = firstItem;
+  while (item) {
+    ListItem* tItem = item;
+    item = item->nextItem;
+    delete tItem;
+  }
+  firstItem = nullptr;
+  lastItem = nullptr;
+  itemCount = 0;
+}
+
+
+txListIterator::txListIterator(txList* list) {
+  this->list = list;
+  currentItem = nullptr;
+  atEndOfList = false;
+}  
+
+void txListIterator::addAfter(void* objPtr) {
+  if (currentItem || !atEndOfList) {
+    list->insertAfter(objPtr, currentItem);
+  } else {
+    list->insertBefore(objPtr, nullptr);
+  }
+}  
+
+void txListIterator::addBefore(void* objPtr) {
+  if (currentItem || atEndOfList) {
+    list->insertBefore(objPtr, currentItem);
+  } else {
+    list->insertAfter(objPtr, nullptr);
+  }
+}  
+
+bool txListIterator::hasNext() {
+  bool hasNext = false;
+  if (currentItem)
+    hasNext = (currentItem->nextItem != nullptr);
+  else if (!atEndOfList)
+    hasNext = (list->firstItem != nullptr);
+
+  return hasNext;
+}  
+
+void* txListIterator::next() {
+  void* obj = nullptr;
+  if (currentItem)
+    currentItem = currentItem->nextItem;
+  else if (!atEndOfList)
+    currentItem = list->firstItem;
+
+  if (currentItem)
+    obj = currentItem->objPtr;
+  else
+    atEndOfList = true;
+
+  return obj;
+}  
+
+void* txListIterator::previous() {
+  void* obj = nullptr;
+
+  if (currentItem)
+    currentItem = currentItem->prevItem;
+  else if (atEndOfList)
+    currentItem = list->lastItem;
+
+  if (currentItem) obj = currentItem->objPtr;
+
+  atEndOfList = false;
+
+  return obj;
+}  
+
+void* txListIterator::current() {
+  if (currentItem) return currentItem->objPtr;
+
+  return nullptr;
+}  
+
+void* txListIterator::remove() {
+  void* obj = nullptr;
+  if (currentItem) {
+    obj = currentItem->objPtr;
+    txList::ListItem* item = currentItem;
+    previous();  
+    list->remove(item);
+    delete item;
+  }
+  return obj;
+}  
+
+void txListIterator::reset() {
+  atEndOfList = false;
+  currentItem = nullptr;
+}  
+
+void txListIterator::resetToEnd() {
+  atEndOfList = true;
+  currentItem = nullptr;
+}  

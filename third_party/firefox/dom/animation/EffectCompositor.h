@@ -1,0 +1,155 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_EffectCompositor_h
+#define mozilla_EffectCompositor_h
+
+#include "NonCustomCSSPropertyId.h"
+#include "mozilla/AnimationPerformanceWarning.h"
+#include "mozilla/AnimationTarget.h"
+#include "mozilla/EnumeratedArray.h"
+#include "mozilla/HashTable.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/OwningNonNull.h"
+#include "mozilla/PseudoElementHashEntry.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/ServoTypes.h"
+#include "mozilla/dom/EndpointBehavior.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsTArray.h"
+#include "nsTHashMap.h"
+
+class nsCSSPropertyIDSet;
+class nsAtom;
+class nsIFrame;
+class nsPresContext;
+enum class DisplayItemType : uint8_t;
+
+namespace mozilla {
+
+class ComputedStyle;
+class EffectSet;
+class RestyleTracker;
+struct StyleAnimationValue;
+struct StyleAnimationValueMap;
+struct AnimationProperty;
+struct NonOwningAnimationTarget;
+
+namespace dom {
+class Animation;
+class Element;
+class KeyframeEffect;
+}  
+
+class EffectCompositor {
+ public:
+  explicit EffectCompositor(nsPresContext* aPresContext)
+      : mPresContext(aPresContext) {}
+
+  NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(EffectCompositor)
+  NS_DECL_CYCLE_COLLECTION_NATIVE_CLASS(EffectCompositor)
+
+  void Disconnect() { mPresContext = nullptr; }
+
+  enum class CascadeLevel : uint32_t {
+    Animations = 0,
+    Transitions = 1
+  };
+  static const size_t kCascadeLevelCount =
+      static_cast<size_t>(CascadeLevel::Transitions) + 1;
+
+  nsPresContext* PresContext() const { return mPresContext; }
+
+  enum class RestyleType {
+    Throttled,
+    Standard,
+    Layer
+  };
+
+  void RequestRestyle(dom::Element* aElement,
+                      const PseudoStyleRequest& aPseudoRequest,
+                      RestyleType aRestyleType, CascadeLevel aCascadeLevel);
+
+  void PostRestyleForAnimation(dom::Element* aElement,
+                               const PseudoStyleRequest& aPseudoRequest,
+                               CascadeLevel aCascadeLevel);
+
+  void PostRestyleForThrottledAnimations();
+
+  void UpdateEffectProperties(const ComputedStyle* aStyle,
+                              dom::Element* aElement,
+                              const PseudoStyleRequest& aPseudoRequest);
+
+  bool GetServoAnimationRule(const dom::Element* aElement,
+                             const PseudoStyleRequest& aPseudoRequest,
+                             CascadeLevel aCascadeLevel,
+                             StyleAnimationValueMap* aAnimationValues);
+
+  bool ComposeServoAnimationRuleForEffect(
+      dom::KeyframeEffect& aEffect, CascadeLevel aCascadeLevel,
+      StyleAnimationValueMap* aAnimationValues,
+      dom::EndpointBehavior aEndpointBehavior =
+          dom::EndpointBehavior::Exclusive);
+
+  bool HasPendingStyleUpdates() const;
+
+  static bool HasAnimationsForCompositor(const nsIFrame* aFrame,
+                                         DisplayItemType aType);
+
+  static nsTArray<RefPtr<dom::Animation>> GetAnimationsForCompositor(
+      const nsIFrame* aFrame, const nsCSSPropertyIDSet& aPropertySet);
+
+  static void ClearIsRunningOnCompositor(const nsIFrame* aFrame,
+                                         DisplayItemType aType);
+
+  static void MaybeUpdateCascadeResults(
+      dom::Element* aElement, const PseudoStyleRequest& aPseudoRequest);
+
+  static void UpdateCascadeResults(EffectSet& aEffectSet,
+                                   dom::Element* aElement,
+                                   const PseudoStyleRequest& aPseudoRequest);
+
+  static Maybe<NonOwningAnimationTarget> GetAnimationElementAndPseudoForFrame(
+      const nsIFrame* aFrame);
+
+  static void SetPerformanceWarning(
+      const nsIFrame* aFrame, const nsCSSPropertyIDSet& aPropertySet,
+      const AnimationPerformanceWarning& aWarning);
+
+  bool PreTraverse(ServoTraversalFlags aFlags);
+
+  bool PreTraverseInSubtree(ServoTraversalFlags aFlags, dom::Element* aRoot);
+
+  void NoteElementForReducing(const NonOwningAnimationTarget& aTarget);
+
+  bool NeedsReducing() const { return !mElementsToReduce.empty(); }
+  void ReduceAnimations();
+
+  static bool AllowCompositorAnimationsOnFrame(
+      const nsIFrame* aFrame,
+      AnimationPerformanceWarning::Type& aWarning );
+
+ private:
+  ~EffectCompositor() = default;
+
+  static nsCSSPropertyIDSet GetOverriddenProperties(
+      EffectSet& aEffectSet, dom::Element* aElement,
+      const PseudoStyleRequest& aPseudoRequest);
+
+  static nsPresContext* GetPresContext(dom::Element* aElement);
+
+  nsPresContext* mPresContext;
+
+  EnumeratedArray<CascadeLevel, nsTHashMap<PseudoElementHashEntry, bool>,
+                  kCascadeLevelCount>
+      mElementsToRestyle;
+
+  bool mIsInPreTraverse = false;
+
+  HashSet<OwningAnimationTarget> mElementsToReduce;
+};
+
+}  
+
+#endif  // mozilla_EffectCompositor_h

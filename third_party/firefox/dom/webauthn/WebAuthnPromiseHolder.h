@@ -1,0 +1,58 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_WebAuthnPromiseHolder_h
+#define mozilla_dom_WebAuthnPromiseHolder_h
+
+#include "mozilla/MozPromise.h"
+#include "nsIThread.h"
+#include "nsIWebAuthnPromise.h"
+#include "nsIWebAuthnResult.h"
+
+namespace mozilla::dom {
+
+
+using WebAuthnRegisterPromise =
+    MozPromise<RefPtr<nsIWebAuthnRegisterResult>, nsresult, true>;
+
+using WebAuthnSignPromise =
+    MozPromise<RefPtr<nsIWebAuthnSignResult>, nsresult, true>;
+
+class WebAuthnRegisterPromiseHolder final : public nsIWebAuthnRegisterPromise {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIWEBAUTHNREGISTERPROMISE
+
+  explicit WebAuthnRegisterPromiseHolder(nsISerialEventTarget* aEventTarget)
+      : mEventTarget(aEventTarget) {}
+
+  already_AddRefed<WebAuthnRegisterPromise> Ensure();
+
+ private:
+  ~WebAuthnRegisterPromiseHolder() = default;
+
+  nsCOMPtr<nsISerialEventTarget> mEventTarget;
+  MozPromiseHolder<WebAuthnRegisterPromise> mRegisterPromise;
+};
+
+class WebAuthnSignPromiseHolder final : public nsIWebAuthnSignPromise {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIWEBAUTHNSIGNPROMISE
+
+  explicit WebAuthnSignPromiseHolder(nsISerialEventTarget* aEventTarget)
+      : mEventTarget(aEventTarget) {}
+
+  already_AddRefed<WebAuthnSignPromise> Ensure();
+
+ private:
+  ~WebAuthnSignPromiseHolder() = default;
+
+  nsCOMPtr<nsISerialEventTarget> mEventTarget;
+  MozPromiseHolder<WebAuthnSignPromise> mSignPromise;
+};
+
+}  
+
+#endif  // mozilla_dom_WebAuthnPromiseHolder_h

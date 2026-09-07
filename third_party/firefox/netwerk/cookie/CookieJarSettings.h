@@ -1,0 +1,159 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_net_CookieJarSettings_h
+#define mozilla_net_CookieJarSettings_h
+
+#include "mozilla/Maybe.h"
+#include "mozilla/net/NeckoChannelParams.h"
+
+#include "nsICookieJarSettings.h"
+#include "nsIPermission.h"
+#include "nsTArray.h"
+
+#define COOKIEJARSETTINGS_CONTRACTID "@mozilla.org/cookieJarSettings;1"
+#define COOKIEJARSETTINGS_CID \
+  {0x4ce234f1, 0x52e8, 0x47a9, {0x8c, 0x8d, 0xb0, 0x2f, 0x81, 0x57, 0x33, 0xc7}}
+
+namespace mozilla {
+namespace net {
+
+class CookieJarSettingsArgs;
+
+using CookiePermissionsArgsData = nsTArray<net::CookiePermissionData>;
+
+
+class CookieJarSettings final : public nsICookieJarSettings {
+ public:
+  typedef nsTArray<RefPtr<nsIPermission>> CookiePermissionList;
+
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSICOOKIEJARSETTINGS
+  NS_DECL_NSISERIALIZABLE
+
+  static already_AddRefed<nsICookieJarSettings> GetBlockingAll(
+      bool aShouldResistFingerprinting);
+
+  enum CreateMode { eRegular, ePrivate };
+
+  static already_AddRefed<nsICookieJarSettings> Create(
+      CreateMode aMode, bool aShouldResistFingerprinting);
+
+  static already_AddRefed<nsICookieJarSettings> Create(
+      nsIPrincipal* aPrincipal);
+
+  static already_AddRefed<nsICookieJarSettings> CreateForXPCOM();
+
+  static already_AddRefed<nsICookieJarSettings> Create(
+      uint32_t aCookieBehavior, const nsAString& aPartitionKey,
+      bool aIsFirstPartyIsolated, bool aIsOnContentBlockingAllowList,
+      bool aShouldResistFingerprinting);
+
+  static CookieJarSettings* Cast(nsICookieJarSettings* aCS) {
+    return static_cast<CookieJarSettings*>(aCS);
+  }
+
+  already_AddRefed<CookieJarSettings> Clone() {
+    RefPtr<CookieJarSettings> clone = new CookieJarSettings(*this);
+    return clone.forget();
+  }
+
+  void Serialize(CookieJarSettingsArgs& aData);
+
+  static void Deserialize(const CookieJarSettingsArgs& aData,
+                          nsICookieJarSettings** aCookieJarSettings);
+
+  static CookiePermissionList DeserializeCookiePermissions(
+      const CookiePermissionsArgsData& aPermissionData);
+
+  already_AddRefed<nsICookieJarSettings> Merge(
+      const CookieJarSettingsArgs& aData);
+
+  bool HasBeenChanged() const { return mToBeMerged; }
+
+  void UpdateIsOnContentBlockingAllowList(nsIChannel* aChannel);
+  void SetIsOnContentBlockingAllowList(bool aIsOnContentBlockingAllowList) {
+    mIsOnContentBlockingAllowList = aIsOnContentBlockingAllowList;
+  }
+
+  void SetPartitionKey(nsIURI* aURI);
+  void SetPartitionKey(const nsAString& aPartitionKey) {
+    mPartitionKey = aPartitionKey;
+  }
+  const nsAString& GetPartitionKey() { return mPartitionKey; };
+
+  void UpdatePartitionKeyForDocumentLoadedByChannel(nsIChannel* aChannel);
+
+  void SetFingerprintingRandomizationKey(const nsTArray<uint8_t>& aKey) {
+    mFingerprintingRandomKey.reset();
+
+    mFingerprintingRandomKey.emplace(aKey.Clone());
+  }
+
+  static bool IsRejectThirdPartyContexts(uint32_t aCookieBehavior);
+
+  void SetTopLevelWindowContextId(uint64_t aId) {
+    mTopLevelWindowContextId = aId;
+  }
+  uint64_t GetTopLevelWindowContextId() { return mTopLevelWindowContextId; }
+
+ private:
+  enum State {
+    eFixed,
+
+    eProgressive,
+  };
+
+  CookieJarSettings(uint32_t aCookieBehavior, bool aIsFirstPartyIsolated,
+                    bool aShouldResistFingerprinting, State aState);
+
+  CookieJarSettings(const CookieJarSettings& aOther) {
+    mCookieBehavior = aOther.mCookieBehavior;
+    mIsFirstPartyIsolated = aOther.mIsFirstPartyIsolated;
+    mCookiePermissions = aOther.mCookiePermissions.Clone();
+
+    mIsOnContentBlockingAllowList = aOther.mIsOnContentBlockingAllowList;
+    mIsOnContentBlockingAllowListUpdated =
+        aOther.mIsOnContentBlockingAllowListUpdated;
+
+    mPartitionKey = aOther.mPartitionKey;
+    mState = aOther.mState;
+    mToBeMerged = aOther.mToBeMerged;
+
+    mShouldResistFingerprinting = aOther.mShouldResistFingerprinting;
+    if (aOther.mFingerprintingRandomKey.isSome()) {
+      mFingerprintingRandomKey =
+          Some(aOther.mFingerprintingRandomKey.ref().Clone());
+    }
+
+    mTopLevelWindowContextId = aOther.mTopLevelWindowContextId;
+  }
+
+  CookiePermissionList& GetCookiePermissionsListRef();
+
+  ~CookieJarSettings();
+
+  uint32_t mCookieBehavior;
+  bool mIsFirstPartyIsolated;
+  CookiePermissionList mCookiePermissions;
+  CookiePermissionsArgsData mIPCCookiePermissions;
+
+  bool mIsOnContentBlockingAllowList;
+  bool mIsOnContentBlockingAllowListUpdated;
+  nsString mPartitionKey;
+  State mState;
+
+  bool mToBeMerged;
+
+  bool mShouldResistFingerprinting;
+
+  Maybe<nsTArray<uint8_t>> mFingerprintingRandomKey;
+
+  uint64_t mTopLevelWindowContextId;
+};
+
+}  
+}  
+
+#endif  // mozilla_net_CookieJarSettings_h

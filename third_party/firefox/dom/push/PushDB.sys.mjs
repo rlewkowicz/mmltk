@@ -1,0 +1,410 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+import { IndexedDBHelper } from "resource://gre/modules/IndexedDBHelper.sys.mjs";
+
+const lazy = {};
+
+ChromeUtils.defineLazyGetter(lazy, "console", () => {
+  return console.createInstance({
+    maxLogLevelPref: "dom.push.loglevel",
+    prefix: "PushDB",
+  });
+});
+
+export function PushDB(dbName, dbVersion, dbStoreName, keyPath, model) {
+  lazy.console.debug("PushDB()");
+  this._dbStoreName = dbStoreName;
+  this._keyPath = keyPath;
+  this._model = model;
+
+  this.initDBHelper(dbName, dbVersion, [dbStoreName]);
+}
+
+PushDB.prototype = {
+  __proto__: IndexedDBHelper.prototype,
+
+  toPushRecord(record) {
+    if (!record) {
+      return null;
+    }
+    return new this._model(record);
+  },
+
+  isValidRecord(record) {
+    return (
+      record &&
+      typeof record.scope == "string" &&
+      typeof record.originAttributes == "string" &&
+      record.quota >= 0 &&
+      typeof record[this._keyPath] == "string"
+    );
+  },
+
+  upgradeSchema(aTransaction, aDb, aOldVersion) {
+    if (aOldVersion <= 3) {
+      if (aDb.objectStoreNames.contains(this._dbStoreName)) {
+        aDb.deleteObjectStore(this._dbStoreName);
+      }
+
+      let objectStore = aDb.createObjectStore(this._dbStoreName, {
+        keyPath: this._keyPath,
+      });
+
+      objectStore.createIndex("pushEndpoint", "pushEndpoint", { unique: true });
+
+      objectStore.createIndex("identifiers", ["scope", "originAttributes"], {
+        unique: true,
+      });
+      objectStore.createIndex("originAttributes", "originAttributes", {
+        unique: false,
+      });
+    }
+
+    if (aOldVersion < 4) {
+      let objectStore = aTransaction.objectStore(this._dbStoreName);
+
+      objectStore.createIndex("quota", "quota", { unique: false });
+    }
+  },
+
+
+  put(aRecord) {
+    lazy.console.debug("put()", aRecord);
+    if (!this.isValidRecord(aRecord)) {
+      return Promise.reject(
+        new TypeError(
+          "Scope, originAttributes, and quota are required! " +
+            JSON.stringify(aRecord)
+        )
+      );
+    }
+
+    return new Promise((resolve, reject) =>
+      this.newTxn(
+        "readwrite",
+        this._dbStoreName,
+        (aTxn, aStore) => {
+          aTxn.result = undefined;
+
+          aStore.put(aRecord).onsuccess = aEvent => {
+            lazy.console.debug(
+              "put: Request successful. Updated record",
+              aEvent.target.result
+            );
+            aTxn.result = this.toPushRecord(aRecord);
+          };
+        },
+        resolve,
+        reject
+      )
+    );
+  },
+
+  delete(aKeyID) {
+    lazy.console.debug("delete()");
+
+    return new Promise((resolve, reject) =>
+      this.newTxn(
+        "readwrite",
+        this._dbStoreName,
+        (aTxn, aStore) => {
+          lazy.console.debug("delete: Removing record", aKeyID);
+          aStore.get(aKeyID).onsuccess = event => {
+            aTxn.result = this.toPushRecord(event.target.result);
+            aStore.delete(aKeyID);
+          };
+        },
+        resolve,
+        reject
+      )
+    );
+  },
+
+  clearIf(testFn) {
+    lazy.console.debug("clearIf()");
+    return new Promise((resolve, reject) =>
+      this.newTxn(
+        "readwrite",
+        this._dbStoreName,
+        (aTxn, aStore) => {
+          aTxn.result = undefined;
+
+          aStore.openCursor().onsuccess = event => {
+            let cursor = event.target.result;
+            if (cursor) {
+              let record = this.toPushRecord(cursor.value);
+              if (testFn(record)) {
+                let deleteRequest = cursor.delete();
+                deleteRequest.onerror = e => {
+                  lazy.console.error(
+                    "clearIf: Error removing record",
+                    record.keyID,
+                    e
+                  );
+                };
+              }
+              cursor.continue();
+            }
+          };
+        },
+        resolve,
+        reject
+      )
+    );
+  },
+
+  getByPushEndpoint(aPushEndpoint) {
+    lazy.console.debug("getByPushEndpoint()");
+
+    return new Promise((resolve, reject) =>
+      this.newTxn(
+        "readonly",
+        this._dbStoreName,
+        (aTxn, aStore) => {
+          aTxn.result = undefined;
+
+          let index = aStore.index("pushEndpoint");
+          index.get(aPushEndpoint).onsuccess = aEvent => {
+            let record = this.toPushRecord(aEvent.target.result);
+            lazy.console.debug("getByPushEndpoint: Got record", record);
+            aTxn.result = record;
+          };
+        },
+        resolve,
+        reject
+      )
+    );
+  },
+
+  getByKeyID(aKeyID) {
+    lazy.console.debug("getByKeyID()");
+
+    return new Promise((resolve, reject) =>
+      this.newTxn(
+        "readonly",
+        this._dbStoreName,
+        (aTxn, aStore) => {
+          aTxn.result = undefined;
+
+          aStore.get(aKeyID).onsuccess = aEvent => {
+            let record = this.toPushRecord(aEvent.target.result);
+            lazy.console.debug("getByKeyID: Got record", record);
+            aTxn.result = record;
+          };
+        },
+        resolve,
+        reject
+      )
+    );
+  },
+
+  forEachOrigin(origin, originAttributes, callback) {
+    lazy.console.debug("forEachOrigin()");
+
+    return new Promise((resolve, reject) =>
+      this.newTxn(
+        "readwrite",
+        this._dbStoreName,
+        (aTxn, aStore) => {
+          aTxn.result = undefined;
+
+          let index = aStore.index("identifiers");
+          let range = IDBKeyRange.bound(
+            [origin, originAttributes],
+            [origin + "\x7f", originAttributes]
+          );
+          index.openCursor(range).onsuccess = event => {
+            let cursor = event.target.result;
+            if (!cursor) {
+              return;
+            }
+            callback(this.toPushRecord(cursor.value), cursor);
+            cursor.continue();
+          };
+        },
+        resolve,
+        reject
+      )
+    );
+  },
+
+  getByIdentifiers(aPageRecord) {
+    lazy.console.debug("getByIdentifiers()", aPageRecord);
+    if (!aPageRecord.scope || aPageRecord.originAttributes == undefined) {
+      lazy.console.error(
+        "getByIdentifiers: Scope and originAttributes are required",
+        aPageRecord
+      );
+      return Promise.reject(new TypeError("Invalid page record"));
+    }
+
+    return new Promise((resolve, reject) =>
+      this.newTxn(
+        "readonly",
+        this._dbStoreName,
+        (aTxn, aStore) => {
+          aTxn.result = undefined;
+
+          let index = aStore.index("identifiers");
+          let request = index.get(
+            IDBKeyRange.only([aPageRecord.scope, aPageRecord.originAttributes])
+          );
+          request.onsuccess = aEvent => {
+            aTxn.result = this.toPushRecord(aEvent.target.result);
+          };
+        },
+        resolve,
+        reject
+      )
+    );
+  },
+
+  _getAllByKey(aKeyName, aKeyValue) {
+    return new Promise((resolve, reject) =>
+      this.newTxn(
+        "readonly",
+        this._dbStoreName,
+        (aTxn, aStore) => {
+          aTxn.result = undefined;
+
+          let index = aStore.index(aKeyName);
+          let getAllReq = index.mozGetAll(aKeyValue);
+          getAllReq.onsuccess = aEvent => {
+            aTxn.result = aEvent.target.result.map(record =>
+              this.toPushRecord(record)
+            );
+          };
+        },
+        resolve,
+        reject
+      )
+    );
+  },
+
+  getAllByOriginAttributes(aOriginAttributes) {
+    if (typeof aOriginAttributes !== "string") {
+      return Promise.reject("Expected string!");
+    }
+    return this._getAllByKey("originAttributes", aOriginAttributes);
+  },
+
+  getAllKeyIDs() {
+    lazy.console.debug("getAllKeyIDs()");
+
+    return new Promise((resolve, reject) =>
+      this.newTxn(
+        "readonly",
+        this._dbStoreName,
+        (aTxn, aStore) => {
+          aTxn.result = undefined;
+          aStore.mozGetAll().onsuccess = event => {
+            aTxn.result = event.target.result.map(record =>
+              this.toPushRecord(record)
+            );
+          };
+        },
+        resolve,
+        reject
+      )
+    );
+  },
+
+  _getAllByPushQuota(range) {
+    lazy.console.debug("getAllByPushQuota()");
+
+    return new Promise((resolve, reject) =>
+      this.newTxn(
+        "readonly",
+        this._dbStoreName,
+        (aTxn, aStore) => {
+          aTxn.result = [];
+
+          let index = aStore.index("quota");
+          index.openCursor(range).onsuccess = event => {
+            let cursor = event.target.result;
+            if (cursor) {
+              aTxn.result.push(this.toPushRecord(cursor.value));
+              cursor.continue();
+            }
+          };
+        },
+        resolve,
+        reject
+      )
+    );
+  },
+
+  getAllUnexpired() {
+    lazy.console.debug("getAllUnexpired()");
+    return this._getAllByPushQuota(IDBKeyRange.lowerBound(1));
+  },
+
+  getAllExpired() {
+    lazy.console.debug("getAllExpired()");
+    return this._getAllByPushQuota(IDBKeyRange.only(0));
+  },
+
+  update(aKeyID, aUpdateFunc) {
+    return new Promise((resolve, reject) =>
+      this.newTxn(
+        "readwrite",
+        this._dbStoreName,
+        (aTxn, aStore) => {
+          aStore.get(aKeyID).onsuccess = aEvent => {
+            aTxn.result = undefined;
+
+            let record = aEvent.target.result;
+            if (!record) {
+              throw new Error("Record " + aKeyID + " does not exist");
+            }
+            let newRecord = aUpdateFunc(this.toPushRecord(record));
+            if (!this.isValidRecord(newRecord)) {
+              lazy.console.error(
+                "update: Ignoring invalid update",
+                aKeyID,
+                newRecord
+              );
+              throw new Error("Invalid update for record " + aKeyID);
+            }
+            function putRecord() {
+              let req = aStore.put(newRecord);
+              req.onsuccess = () => {
+                lazy.console.debug(
+                  "update: Update successful",
+                  aKeyID,
+                  newRecord
+                );
+                aTxn.result = newRecord;
+              };
+            }
+            if (aKeyID === newRecord.keyID) {
+              putRecord();
+            } else {
+              aStore.delete(aKeyID).onsuccess = putRecord;
+            }
+          };
+        },
+        resolve,
+        reject
+      )
+    );
+  },
+
+  drop() {
+    lazy.console.debug("drop()");
+
+    return new Promise((resolve, reject) =>
+      this.newTxn(
+        "readwrite",
+        this._dbStoreName,
+        function txnCb(aTxn, aStore) {
+          aStore.clear();
+        },
+        resolve,
+        reject
+      )
+    );
+  },
+};

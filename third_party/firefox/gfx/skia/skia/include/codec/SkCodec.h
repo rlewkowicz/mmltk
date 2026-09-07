@@ -1,0 +1,461 @@
+/*
+ * Copyright 2015 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkCodec_DEFINED)
+#define SkCodec_DEFINED
+
+#include "include/codec/SkEncodedOrigin.h"
+#include "include/core/SkImageInfo.h"
+#include "include/core/SkPixmap.h"
+#include "include/core/SkRect.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkSize.h"
+#include "include/core/SkSpan.h"
+#include "include/core/SkTypes.h"
+#include "include/core/SkYUVAPixmaps.h"
+#include "include/private/SkEncodedInfo.h"
+#include "include/private/SkHdrMetadata.h"
+#include "include/private/base/SkNoncopyable.h"
+#include "modules/skcms/skcms.h"
+
+#include <cstddef>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <string_view>
+#include <tuple>
+#include <vector>
+
+class SkData;
+class SkFrameHolder;
+class SkImage;
+class SkPngChunkReader;
+class SkSampler;
+class SkStream;
+struct SkGainmapInfo;
+enum SkAlphaType : int;
+enum class SkEncodedImageFormat;
+
+namespace SkCodecAnimation {
+enum class Blend;
+enum class DisposalMethod;
+}
+
+namespace DM {
+class CodecSrc;
+} 
+
+namespace SkCodecs {
+struct Decoder;
+}
+
+class SK_API SkCodec : SkNoncopyable {
+public:
+    static constexpr size_t MinBufferedBytesNeeded() { return 32; }
+
+    enum Result {
+        kSuccess,
+        kIncompleteInput,
+        kErrorInInput,
+        kInvalidConversion,
+        kInvalidScale,
+        kInvalidParameters,
+        kInvalidInput,
+        kCouldNotRewind,
+        kInternalError,
+        kUnimplemented,
+        kOutOfMemory,
+    };
+
+    static const char* ResultToString(Result);
+
+    enum class SelectionPolicy {
+        kPreferStillImage,
+        kPreferAnimation,
+    };
+
+    static std::unique_ptr<SkCodec> MakeFromStream(
+            std::unique_ptr<SkStream>,
+            SkSpan<const SkCodecs::Decoder> decoders,
+            Result* = nullptr,
+            SkPngChunkReader* = nullptr,
+            SelectionPolicy selectionPolicy = SelectionPolicy::kPreferStillImage);
+    static std::unique_ptr<SkCodec> MakeFromStream(
+            std::unique_ptr<SkStream>,
+            Result* = nullptr,
+            SkPngChunkReader* = nullptr,
+            SelectionPolicy selectionPolicy = SelectionPolicy::kPreferStillImage);
+
+    static std::unique_ptr<SkCodec> MakeFromData(sk_sp<const SkData>,
+                                                 SkSpan<const SkCodecs::Decoder> decoders,
+                                                 SkPngChunkReader* = nullptr);
+    static std::unique_ptr<SkCodec> MakeFromData(sk_sp<const SkData>, SkPngChunkReader* = nullptr);
+
+    virtual ~SkCodec();
+
+    SkImageInfo getInfo() const { return fEncodedInfo.makeImageInfo(); }
+
+    SkISize dimensions() const { return {fEncodedInfo.width(), fEncodedInfo.height()}; }
+    SkIRect bounds() const {
+        return SkIRect::MakeWH(fEncodedInfo.width(), fEncodedInfo.height());
+    }
+
+    const skcms_ICCProfile* getICCProfile() const {
+        return this->getEncodedInfo().profile();
+    }
+
+    const skhdr::Metadata& getHdrMetadata() const { return fEncodedInfo.getHdrMetadata(); }
+
+    bool hasHighBitDepthEncodedData() const {
+        return this->getEncodedInfo().bitsPerComponent() >= 16;
+    }
+
+    SkEncodedOrigin getOrigin() const { return fOrigin; }
+
+    SkISize getScaledDimensions(float desiredScale) const {
+        SkASSERT(desiredScale > 0.0f);
+        if (desiredScale <= 0.0f) {
+            return SkISize::Make(0, 0);
+        }
+
+        if (desiredScale >= 1.0f) {
+            return this->dimensions();
+        }
+        return this->onGetScaledDimensions(desiredScale);
+    }
+
+    bool getValidSubset(SkIRect* desiredSubset) const {
+        return this->onGetValidSubset(desiredSubset);
+    }
+
+    SkEncodedImageFormat getEncodedFormat() const { return this->onGetEncodedFormat(); }
+
+    enum ZeroInitialized {
+        kYes_ZeroInitialized,
+        kNo_ZeroInitialized,
+    };
+
+    struct Options {
+        Options()
+                : fZeroInitialized(kNo_ZeroInitialized)
+                , fSubset(nullptr)
+                , fFrameIndex(0)
+                , fPriorFrame(kNoFrame)
+                , fMaxDecodeMemory(0) {}
+
+        ZeroInitialized fZeroInitialized;
+        const SkIRect* fSubset;
+
+        int fFrameIndex;
+
+        int fPriorFrame;
+
+        size_t fMaxDecodeMemory;
+    };
+
+    Result getPixels(const SkImageInfo& info, void* pixels, size_t rowBytes, const Options*);
+
+    Result getPixels(const SkImageInfo& info, void* pixels, size_t rowBytes) {
+        return this->getPixels(info, pixels, rowBytes, nullptr);
+    }
+
+    Result getPixels(const SkPixmap& pm, const Options* opts = nullptr) {
+        return this->getPixels(pm.info(), pm.writable_addr(), pm.rowBytes(), opts);
+    }
+
+    std::tuple<sk_sp<SkImage>, SkCodec::Result> getImage(const SkImageInfo& info,
+                                                         const Options* opts = nullptr);
+    std::tuple<sk_sp<SkImage>, SkCodec::Result> getImage();
+
+    bool queryYUVAInfo(const SkYUVAPixmapInfo::SupportedDataTypes& supportedDataTypes,
+                       SkYUVAPixmapInfo* yuvaPixmapInfo) const;
+
+    Result getYUVAPlanes(const SkYUVAPixmaps& yuvaPixmaps);
+
+    Result startIncrementalDecode(const SkImageInfo& dstInfo, void* dst, size_t rowBytes,
+            const Options*);
+
+    Result startIncrementalDecode(const SkImageInfo& dstInfo, void* dst, size_t rowBytes) {
+        return this->startIncrementalDecode(dstInfo, dst, rowBytes, nullptr);
+    }
+
+    Result incrementalDecode(int* rowsDecoded = nullptr) {
+        if (!fStartedIncrementalDecode) {
+            return kInvalidParameters;
+        }
+        return this->onIncrementalDecode(rowsDecoded);
+    }
+
+
+    Result startScanlineDecode(const SkImageInfo& dstInfo, const Options* options);
+
+    Result startScanlineDecode(const SkImageInfo& dstInfo) {
+        return this->startScanlineDecode(dstInfo, nullptr);
+    }
+
+    int getScanlines(void* dst, int countLines, size_t rowBytes);
+
+    bool skipScanlines(int countLines);
+
+    enum SkScanlineOrder {
+        kTopDown_SkScanlineOrder,
+
+        kBottomUp_SkScanlineOrder,
+    };
+
+    SkScanlineOrder getScanlineOrder() const { return this->onGetScanlineOrder(); }
+
+    int nextScanline() const { return this->outputScanline(fCurrScanline); }
+
+    int outputScanline(int inputScanline) const;
+
+    int getFrameCount() {
+        return this->onGetFrameCount();
+    }
+
+    static constexpr int kNoFrame = -1;
+
+    struct FrameInfo {
+        int fRequiredFrame;
+
+        int fDuration;
+
+        bool fFullyReceived;
+
+        SkAlphaType fAlphaType;
+
+        bool fHasAlphaWithinBounds;
+
+        SkCodecAnimation::DisposalMethod fDisposalMethod;
+
+        SkCodecAnimation::Blend fBlend;
+
+        SkIRect fFrameRect;
+    };
+
+    bool getFrameInfo(int index, FrameInfo* info) const {
+        if (index < 0) {
+            return false;
+        }
+        return this->onGetFrameInfo(index, info);
+    }
+
+    std::vector<FrameInfo> getFrameInfo();
+
+    static constexpr int kRepetitionCountInfinite = -1;
+
+    int getRepetitionCount() {
+        return this->onGetRepetitionCount();
+    }
+
+    enum class IsAnimated {
+        kYes,
+        kNo,
+        kUnknown,
+    };
+    IsAnimated isAnimated() { return this->onIsAnimated(); }
+
+protected:
+    const SkEncodedInfo& getEncodedInfo() const { return fEncodedInfo; }
+
+    using XformFormat = skcms_PixelFormat;
+
+    SkCodec(SkEncodedInfo&&,
+            XformFormat srcFormat,
+            std::unique_ptr<SkStream>,
+            SkEncodedOrigin = kTopLeft_SkEncodedOrigin);
+
+    virtual bool onGetGainmapCodec(SkGainmapInfo*, std::unique_ptr<SkCodec>*) { return false; }
+    virtual bool onGetGainmapInfo(SkGainmapInfo*) { return false; }
+
+    virtual bool onGetGainmapInfo(SkGainmapInfo*, std::unique_ptr<SkStream>*) { return false; }
+
+    virtual SkISize onGetScaledDimensions(float ) const {
+        return this->dimensions();
+    }
+
+    virtual bool onDimensionsSupported(const SkISize&) {
+        return false;
+    }
+
+    virtual SkEncodedImageFormat onGetEncodedFormat() const = 0;
+
+    virtual Result onGetPixels(const SkImageInfo& info,
+                               void* pixels, size_t rowBytes, const Options&,
+                               int* rowsDecoded) = 0;
+
+    virtual bool onQueryYUVAInfo(const SkYUVAPixmapInfo::SupportedDataTypes&,
+                                 SkYUVAPixmapInfo*) const { return false; }
+
+    virtual Result onGetYUVAPlanes(const SkYUVAPixmaps&) { return kUnimplemented; }
+
+    virtual bool onGetValidSubset(SkIRect* ) const {
+        return false;
+    }
+
+    [[nodiscard]] bool rewindIfNeeded();
+
+    bool rewindStream();
+
+    virtual bool onRewind() {
+        if (!this->rewindStream()) {
+            return false;
+        }
+        return true;
+    }
+
+    SkStream* stream() {
+        return fStream.get();
+    }
+
+
+    virtual SkScanlineOrder onGetScanlineOrder() const { return kTopDown_SkScanlineOrder; }
+
+    const SkImageInfo& dstInfo() const { return fDstInfo; }
+
+    const Options& options() const { return fOptions; }
+
+    int currScanline() const { return fCurrScanline; }
+
+    virtual int onOutputScanline(int inputScanline) const;
+
+    virtual bool conversionSupported(const SkImageInfo& dst, bool srcIsOpaque,
+                                     bool needsColorXform);
+
+    virtual bool usesColorXform() const { return true; }
+    void applyColorXform(void* dst, const void* src, int count) const;
+
+    bool colorXform() const { return fXformTime != kNo_XformTime; }
+    bool xformOnDecode() const { return fXformTime == kDecodeRow_XformTime; }
+
+    virtual int onGetFrameCount() {
+        return 1;
+    }
+
+    virtual bool onGetFrameInfo(int, FrameInfo*) const {
+        return false;
+    }
+
+    virtual int onGetRepetitionCount() {
+        return 0;
+    }
+
+    virtual IsAnimated onIsAnimated() {
+        return IsAnimated::kNo;
+    }
+
+    bool allocateFromBudget(size_t numBytes);
+
+private:
+    const SkEncodedInfo                fEncodedInfo;
+    XformFormat                        fSrcXformFormat;
+    std::unique_ptr<SkStream>          fStream;
+    bool fNeedsRewind = false;
+    const SkEncodedOrigin fOrigin;
+
+    SkImageInfo                        fDstInfo;
+    Options                            fOptions;
+
+    enum XformTime {
+        kNo_XformTime,
+        kPalette_XformTime,
+        kDecodeRow_XformTime,
+    };
+    XformTime                          fXformTime;
+    XformFormat                        fDstXformFormat; 
+    skcms_ICCProfile                   fDstProfileStorage;
+    const skcms_ICCProfile*            fDstProfile = &fDstProfileStorage;
+    skcms_AlphaFormat                  fDstXformAlphaFormat;
+
+    int fCurrScanline = -1;
+
+    size_t fDecodeBudget = 0;
+
+    bool fStartedIncrementalDecode = false;
+
+    bool fUsingCallbackForHandleFrameIndex = false;
+
+    bool initializeColorXform(const SkImageInfo& dstInfo, SkEncodedInfo::Alpha, bool srcIsOpaque);
+
+    bool dimensionsSupported(const SkISize& dim) {
+        return dim == this->dimensions() || this->onDimensionsSupported(dim);
+    }
+
+    Result getPixelsBudgeted(const SkImageInfo& info,
+                             void* pixels,
+                             size_t rowBytes,
+                             const Options*);
+
+    virtual const SkFrameHolder* getFrameHolder() const {
+        return nullptr;
+    }
+
+    using GetPixelsCallback = std::function<Result(const SkImageInfo&, void* pixels,
+                                                   size_t rowBytes, const Options& opts,
+                                                   int frameIndex)>;
+
+    Result handleFrameIndex(const SkImageInfo&, void* pixels, size_t rowBytes, const Options&,
+                            GetPixelsCallback = nullptr);
+
+    virtual Result onStartScanlineDecode(const SkImageInfo& ,
+            const Options& ) {
+        return kUnimplemented;
+    }
+
+    virtual bool onSupportsIncrementalDecode(const SkImageInfo&) { return false; }
+
+    virtual Result onStartIncrementalDecode(const SkImageInfo& , void*, size_t,
+            const Options&) {
+        return kUnimplemented;
+    }
+
+    virtual Result onIncrementalDecode(int*) {
+        return kUnimplemented;
+    }
+
+
+    virtual bool onSkipScanlines(int ) { return false; }
+
+    virtual int onGetScanlines(void* , int , size_t ) { return 0; }
+
+    void fillIncompleteImage(const SkImageInfo& dstInfo, void* dst, size_t rowBytes,
+            ZeroInitialized zeroInit, int linesRequested, int linesDecoded);
+
+    virtual SkSampler* getSampler(bool ) { return nullptr; }
+
+    virtual sk_sp<const SkData> getEncodedData() const;
+
+    friend class DM::CodecSrc;  
+    friend class PNGCodecGM;    
+    friend class SkSampledCodec;
+    friend class SkIcoCodec;
+    friend class SkPngCodec;     
+    friend class SkAndroidCodec;  
+    friend class SkCodecPriv;     
+};
+
+namespace SkCodecs {
+
+using DecodeContext = void*;
+using IsFormatCallback = bool (*)(const void* data, size_t len);
+using MakeFromStreamCallback = std::unique_ptr<SkCodec> (*)(std::unique_ptr<SkStream>,
+                                                            SkCodec::Result*,
+                                                            DecodeContext);
+
+struct SK_API Decoder {
+    std::string_view id;
+    IsFormatCallback isFormat;
+    MakeFromStreamCallback makeFromStream;
+};
+
+void SK_API Register(Decoder d);
+
+SK_API sk_sp<SkImage> DeferredImage(std::unique_ptr<SkCodec> codec,
+                                    std::optional<SkAlphaType> alphaType = std::nullopt);
+}
+
+#endif

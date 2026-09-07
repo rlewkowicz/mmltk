@@ -1,0 +1,220 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "Worker.h"
+
+#include "EventWithOptionsRunnable.h"
+#include "MessageEventRunnable.h"
+#include "WorkerPrivate.h"
+#include "js/RootingAPI.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/TrustedScriptURL.h"
+#include "mozilla/dom/TrustedTypeUtils.h"
+#include "mozilla/dom/TrustedTypesConstants.h"
+#include "mozilla/dom/WorkerBinding.h"
+#include "mozilla/dom/WorkerStatus.h"
+#include "nsContentUtils.h"
+#include "nsDebug.h"
+#include "nsGlobalWindowInner.h"
+#include "nsISupports.h"
+
+
+namespace mozilla::dom {
+
+already_AddRefed<Worker> Worker::Constructor(
+    const GlobalObject& aGlobal, const TrustedScriptURLOrUSVString& aScriptURL,
+    const WorkerOptions& aOptions, ErrorResult& aRv) {
+  JSContext* cx = aGlobal.Context();
+
+  nsCOMPtr<nsIGlobalObject> globalObject =
+      do_QueryInterface(aGlobal.GetAsSupports());
+
+  nsPIDOMWindowInner* innerWindow = globalObject->GetAsInnerWindow();
+  if (innerWindow && !innerWindow->IsCurrentInnerWindow()) {
+    aRv.ThrowInvalidStateError(
+        "Cannot create worker for a going to be discarded document");
+    return nullptr;
+  }
+
+  nsCOMPtr<nsIPrincipal> principal = aGlobal.GetSubjectPrincipal();
+
+  const nsAString* compliantString = nullptr;
+  bool performTrustedTypeConversion = innerWindow;
+  if (!performTrustedTypeConversion) {
+    if (JSObject* globalJSObject = globalObject->GetGlobalJSObject()) {
+      performTrustedTypeConversion = IsWorkerGlobal(globalJSObject);
+    }
+  }
+  Maybe<nsAutoString> compliantStringHolder;
+  if (performTrustedTypeConversion) {
+    constexpr nsLiteralString sink = u"Worker constructor"_ns;
+    compliantString = TrustedTypeUtils::GetTrustedTypesCompliantString(
+        aScriptURL, sink, kTrustedTypesOnlySinkGroup, *globalObject, principal,
+        compliantStringHolder, aRv);
+    if (aRv.Failed()) {
+      return nullptr;
+    }
+  } else {
+    compliantString = aScriptURL.IsUSVString()
+                          ? &aScriptURL.GetAsUSVString()
+                          : &aScriptURL.GetAsTrustedScriptURL().mData;
+  }
+  MOZ_ASSERT(compliantString);
+
+  RefPtr<WorkerPrivate> workerPrivate = WorkerPrivate::Constructor(
+      cx, *compliantString, false , WorkerKindDedicated,
+      aOptions.mCredentials, aOptions.mType, aOptions.mName, VoidCString(),
+      nullptr , aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+
+  RefPtr<Worker> worker = new Worker(globalObject, workerPrivate.forget());
+  return worker.forget();
+}
+
+Worker::Worker(nsIGlobalObject* aGlobalObject,
+               already_AddRefed<WorkerPrivate> aWorkerPrivate)
+    : DOMEventTargetHelper(aGlobalObject),
+      mWorkerPrivate(std::move(aWorkerPrivate)) {
+  MOZ_ASSERT(mWorkerPrivate);
+  mWorkerPrivate->SetParentEventTargetRef(this);
+}
+
+Worker::~Worker() { Terminate(); }
+
+JSObject* Worker::WrapObject(JSContext* aCx,
+                             JS::Handle<JSObject*> aGivenProto) {
+  JS::Rooted<JSObject*> wrapper(aCx,
+                                Worker_Binding::Wrap(aCx, this, aGivenProto));
+  if (wrapper) {
+    TryPreserveWrapper(wrapper);
+  }
+
+  return wrapper;
+}
+
+bool Worker::IsEligibleForMessaging() {
+  NS_ASSERT_OWNINGTHREAD(Worker);
+
+  return mWorkerPrivate && mWorkerPrivate->ParentStatusProtected() <= Running;
+}
+
+void Worker::PostMessage(JSContext* aCx, JS::Handle<JS::Value> aMessage,
+                         const Sequence<JSObject*>& aTransferable,
+                         ErrorResult& aRv) {
+  NS_ASSERT_OWNINGTHREAD(Worker);
+
+  if (!mWorkerPrivate || mWorkerPrivate->ParentStatusProtected() > Running) {
+    return;
+  }
+  RefPtr<WorkerPrivate> workerPrivate = mWorkerPrivate;
+  (void)workerPrivate;
+
+  JS::Rooted<JS::Value> transferable(aCx, JS::UndefinedValue());
+
+  aRv = nsContentUtils::CreateJSValueFromSequenceOfObject(aCx, aTransferable,
+                                                          &transferable);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return;
+  }
+
+  RefPtr<MessageEventRunnable> runnable =
+      new MessageEventRunnable(mWorkerPrivate);
+
+  JS::CloneDataPolicy clonePolicy;
+  clonePolicy.allowIntraClusterClonableSharedObjects();
+
+  if (NS_IsMainThread()) {
+    nsGlobalWindowInner* win = nsContentUtils::IncumbentInnerWindow();
+    if (win && win->IsSharedMemoryAllowed()) {
+      clonePolicy.allowSharedMemoryObjects();
+    }
+  } else {
+    WorkerPrivate* worker = GetCurrentThreadWorkerPrivate();
+    if (worker && worker->IsSharedMemoryAllowed()) {
+      clonePolicy.allowSharedMemoryObjects();
+    }
+  }
+
+  runnable->Write(aCx, aMessage, transferable, clonePolicy, aRv);
+
+  if (!mWorkerPrivate || mWorkerPrivate->ParentStatusProtected() > Running) {
+    return;
+  }
+
+  if (NS_WARN_IF(aRv.Failed())) {
+    return;
+  }
+
+  (void)NS_WARN_IF(!runnable->Dispatch(mWorkerPrivate));
+}
+
+void Worker::PostMessage(JSContext* aCx, JS::Handle<JS::Value> aMessage,
+                         const StructuredSerializeOptions& aOptions,
+                         ErrorResult& aRv) {
+  PostMessage(aCx, aMessage, aOptions.mTransfer, aRv);
+}
+
+void Worker::PostEventWithOptions(JSContext* aCx,
+                                  JS::Handle<JS::Value> aOptions,
+                                  const Sequence<JSObject*>& aTransferable,
+                                  EventWithOptionsRunnable* aRunnable,
+                                  ErrorResult& aRv) {
+  NS_ASSERT_OWNINGTHREAD(Worker);
+
+  if (NS_WARN_IF(!mWorkerPrivate ||
+                 mWorkerPrivate->ParentStatusProtected() > Running)) {
+    return;
+  }
+  RefPtr<WorkerPrivate> workerPrivate = mWorkerPrivate;
+  (void)workerPrivate;
+
+  aRunnable->InitOptions(aCx, aOptions, aTransferable, aRv);
+
+  if (NS_WARN_IF(!mWorkerPrivate ||
+                 mWorkerPrivate->ParentStatusProtected() > Running)) {
+    return;
+  }
+
+  if (NS_WARN_IF(aRv.Failed())) {
+    return;
+  }
+
+  (void)NS_WARN_IF(!aRunnable->Dispatch(mWorkerPrivate));
+}
+
+void Worker::Terminate() {
+  NS_ASSERT_OWNINGTHREAD(Worker);
+
+  if (mWorkerPrivate) {
+    mWorkerPrivate->Cancel();
+    mWorkerPrivate = nullptr;
+  }
+}
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(Worker)
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(Worker, DOMEventTargetHelper)
+  if (tmp->mWorkerPrivate) {
+    tmp->mWorkerPrivate->Traverse(cb);
+  }
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_INHERITED(Worker, DOMEventTargetHelper)
+  tmp->Terminate();
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_WEAK_PTR
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_CYCLE_COLLECTION_TRACE_BEGIN_INHERITED(Worker, DOMEventTargetHelper)
+NS_IMPL_CYCLE_COLLECTION_TRACE_END
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(Worker)
+NS_INTERFACE_MAP_END_INHERITING(DOMEventTargetHelper)
+
+NS_IMPL_ADDREF_INHERITED(Worker, DOMEventTargetHelper)
+NS_IMPL_RELEASE_INHERITED(Worker, DOMEventTargetHelper)
+
+}  

@@ -1,0 +1,46 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_ipc_IPCStreamUtils_h
+#define mozilla_ipc_IPCStreamUtils_h
+
+#include "mozilla/ipc/EagerIPCStream.h"
+#include "mozilla/ipc/IPCStream.h"
+#include "nsCOMPtr.h"
+#include "nsIInputStream.h"
+
+namespace mozilla::ipc {
+
+[[nodiscard]] bool SerializeIPCStream(
+    already_AddRefed<nsIInputStream> aInputStream, IPCStream& aValue,
+    bool aAllowLazy);
+
+bool SerializeIPCStream(already_AddRefed<nsIInputStream> aInputStream,
+                        Maybe<IPCStream>& aValue, bool aAllowLazy);
+
+already_AddRefed<nsIInputStream> DeserializeIPCStream(const IPCStream& aValue);
+
+already_AddRefed<nsIInputStream> DeserializeIPCStream(
+    const Maybe<IPCStream>& aValue);
+
+}  
+
+namespace IPC {
+
+template <>
+struct ParamTraits<nsIInputStream*> {
+  static void Write(MessageWriter* aWriter, nsIInputStream* aParam);
+  static bool Read(MessageReader* aReader, RefPtr<nsIInputStream>* aResult);
+};
+
+template <>
+struct ParamTraits<mozilla::ipc::EagerIPCStream> {
+  using paramType = mozilla::ipc::EagerIPCStream;
+  static void Write(MessageWriter* aWriter, const paramType& aParam);
+  static ReadResult<paramType> Read(MessageReader* aReader);
+};
+
+}  
+
+#endif  // mozilla_ipc_IPCStreamUtils_h

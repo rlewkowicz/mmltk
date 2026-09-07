@@ -1,0 +1,130 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+export class DOMFullscreenChild extends JSWindowActorChild {
+  receiveMessage(aMessage) {
+    let window = this.contentWindow;
+    let windowUtils = window?.windowUtils;
+
+    switch (aMessage.name) {
+      case "DOMFullscreen:Entered": {
+        if (!windowUtils) {
+          this.sendAsyncMessage("DOMFullscreen:Exit", {});
+          break;
+        }
+
+        let remoteFrameBC = aMessage.data.remoteFrameBC;
+        if (remoteFrameBC) {
+          let remoteFrame = remoteFrameBC.embedderElement;
+          if (!remoteFrame) {
+            this.sendAsyncMessage("DOMFullscreen:Exit", {});
+            break;
+          }
+          this._isNotTheRequestSource = true;
+          windowUtils.remoteFrameFullscreenChanged(remoteFrame);
+        } else {
+          this._waitForMozAfterPaint = true;
+          this._lastTransactionId = windowUtils.lastTransactionId;
+          if (
+            !windowUtils.handleFullscreenRequests() &&
+            !this.document.fullscreenElement
+          ) {
+            this.sendAsyncMessage("DOMFullscreen:Exit", {});
+          }
+        }
+        break;
+      }
+      case "DOMFullscreen:CleanUp": {
+        let isNotTheRequestSource = !!aMessage.data.remoteFrameBC;
+        if (this.document.fullscreenElement) {
+          this._isNotTheRequestSource = isNotTheRequestSource;
+          this._waitForMozAfterPaint = !this._isNotTheRequestSource;
+          if (windowUtils) {
+            this._lastTransactionId = windowUtils.lastTransactionId;
+            windowUtils.exitFullscreen();
+          }
+        } else if (isNotTheRequestSource) {
+          this.sendAsyncMessage("DOMFullscreen:Exited", {});
+        } else {
+          this.sendAsyncMessage("DOMFullscreen:Painted", {});
+        }
+        break;
+      }
+      case "DOMFullscreen:Painted": {
+        Services.obs.notifyObservers(window, "fullscreen-painted");
+        break;
+      }
+    }
+  }
+
+  handleEvent(aEvent) {
+    if (this.hasBeenDestroyed()) {
+      return;
+    }
+
+    switch (aEvent.type) {
+      case "MozDOMFullscreen:Request": {
+        this.sendAsyncMessage("DOMFullscreen:Request", {
+          fullscreenKeyboardLock: aEvent.detail,
+        });
+        break;
+      }
+      case "MozDOMFullscreen:NewOrigin": {
+        this.sendAsyncMessage("DOMFullscreen:NewOrigin", {
+          originNoSuffix: aEvent.target.nodePrincipal.originNoSuffix,
+        });
+        break;
+      }
+      case "MozDOMFullscreen:Exit": {
+        this.sendAsyncMessage("DOMFullscreen:Exit", {});
+        break;
+      }
+      case "MozDOMFullscreen:Entered":
+      case "MozDOMFullscreen:Exited": {
+        if (this._isNotTheRequestSource) {
+
+          delete this._isNotTheRequestSource;
+          this.sendAsyncMessage(aEvent.type.replace("Moz", ""), {});
+          break;
+        }
+
+        if (this._waitForMozAfterPaint) {
+          delete this._waitForMozAfterPaint;
+          this._listeningWindow = this.contentWindow.windowRoot;
+          this._listeningWindow.addEventListener("MozAfterPaint", this);
+        }
+
+        if (!this.document || !this.document.fullscreenElement) {
+          this.sendAsyncMessage("DOMFullscreen:Exit", {});
+        }
+        break;
+      }
+      case "MozDOMFullscreen:UpdateKeyboardLock": {
+        this.sendAsyncMessage("DOMFullscreen:UpdateKeyboardLock", {
+          fullscreenKeyboardLock: aEvent.detail,
+        });
+        break;
+      }
+      case "MozAfterPaint": {
+        if (
+          !this._lastTransactionId ||
+          aEvent.transactionId > this._lastTransactionId
+        ) {
+          this._listeningWindow.removeEventListener("MozAfterPaint", this);
+          delete this._listeningWindow;
+          this.sendAsyncMessage("DOMFullscreen:Painted", {});
+        }
+        break;
+      }
+    }
+  }
+
+  hasBeenDestroyed() {
+    try {
+      return !this.browsingContext;
+    } catch {
+      return true;
+    }
+  }
+}

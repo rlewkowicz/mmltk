@@ -1,0 +1,47 @@
+/*
+ * Copyright 2012 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkMD5_DEFINED)
+#define SkMD5_DEFINED
+
+#include "include/core/SkStream.h"
+#include "include/core/SkString.h"
+#include "include/private/base/SkTo.h"
+
+#include <cstdint>
+#include <cstring>
+
+class SkMD5 : public SkWStream {
+public:
+    SkMD5();
+
+    bool write(const void* buffer, size_t size) final;
+
+    size_t bytesWritten() const final { return SkToSizeT(this->byteCount); }
+
+    struct Digest {
+        SkString toHexString() const;
+        SkString toLowercaseHexString() const;
+        bool operator==(Digest const& other) const {
+            return 0 == memcmp(data, other.data, sizeof(data));
+        }
+        bool operator!=(Digest const& other) const {
+            return !(*this == other);
+        }
+
+        uint8_t data[16];
+    };
+
+    Digest finish();
+
+private:
+    uint64_t byteCount;  
+    uint32_t state[4];   
+    uint8_t buffer[64];  
+};
+
+#endif

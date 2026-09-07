@@ -1,0 +1,222 @@
+/*
+ * Copyright 2012 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkSurface_DEFINED)
+#define SkSurface_DEFINED
+
+#include "include/core/SkImage.h"
+#include "include/core/SkImageInfo.h"
+#include "include/core/SkPixmap.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkSamplingOptions.h"
+#include "include/core/SkScalar.h"
+#include "include/core/SkSurfaceProps.h"
+#include "include/core/SkTypes.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+
+class GrBackendSemaphore;
+class GrBackendTexture;
+class GrRecordingContext;
+class GrSurfaceCharacterization;
+class SkBitmap;
+class SkCanvas;
+class SkCapabilities;
+class SkColorSpace;
+class SkPaint;
+class SkRecorder;
+class SkSurface;
+enum GrSurfaceOrigin : int;
+struct SkIRect;
+struct SkISize;
+
+namespace skgpu::graphite {
+class Recorder;
+}
+
+namespace SkSurfaces {
+
+enum class BackendSurfaceAccess {
+    kNoAccess,  
+    kPresent,   
+};
+
+SK_API sk_sp<SkSurface> Null(int width, int height);
+
+SK_API sk_sp<SkSurface> Raster(const SkImageInfo& imageInfo,
+                               size_t rowBytes,
+                               const SkSurfaceProps* surfaceProps);
+inline sk_sp<SkSurface> Raster(const SkImageInfo& imageInfo,
+                               const SkSurfaceProps* props = nullptr) {
+    return Raster(imageInfo, 0, props);
+}
+
+
+SK_API sk_sp<SkSurface> WrapPixels(const SkImageInfo& imageInfo,
+                                   void* pixels,
+                                   size_t rowBytes,
+                                   const SkSurfaceProps* surfaceProps = nullptr);
+inline sk_sp<SkSurface> WrapPixels(const SkPixmap& pm, const SkSurfaceProps* props = nullptr) {
+    return WrapPixels(pm.info(), pm.writable_addr(), pm.rowBytes(), props);
+}
+
+using PixelsReleaseProc = void(void* pixels, void* context);
+
+SK_API sk_sp<SkSurface> WrapPixels(const SkImageInfo& imageInfo,
+                                   void* pixels,
+                                   size_t rowBytes,
+                                   PixelsReleaseProc,
+                                   void* context,
+                                   const SkSurfaceProps* surfaceProps = nullptr);
+}  
+
+class SK_API SkSurface : public SkRefCnt {
+public:
+    bool isCompatible(const GrSurfaceCharacterization& characterization) const;
+
+    int width() const { return fWidth; }
+
+    int height() const { return fHeight; }
+
+    virtual SkImageInfo imageInfo() const { return SkImageInfo::MakeUnknown(fWidth, fHeight); }
+
+    uint32_t generationID();
+
+    enum ContentChangeMode {
+        kDiscard_ContentChangeMode, 
+        kRetain_ContentChangeMode,  
+    };
+
+    void notifyContentWillChange(ContentChangeMode mode);
+
+    GrRecordingContext* recordingContext() const;
+
+    skgpu::graphite::Recorder* recorder() const;
+
+    SkRecorder* baseRecorder() const;
+
+    enum class BackendHandleAccess {
+        kFlushRead,     
+        kFlushWrite,    
+        kDiscardWrite,  
+
+        kFlushRead_BackendHandleAccess = kFlushRead,
+        kFlushWrite_BackendHandleAccess = kFlushWrite,
+        kDiscardWrite_BackendHandleAccess = kDiscardWrite,
+    };
+
+    static constexpr BackendHandleAccess kFlushRead_BackendHandleAccess =
+            BackendHandleAccess::kFlushRead;
+    static constexpr BackendHandleAccess kFlushWrite_BackendHandleAccess =
+            BackendHandleAccess::kFlushWrite;
+    static constexpr BackendHandleAccess kDiscardWrite_BackendHandleAccess =
+            BackendHandleAccess::kDiscardWrite;
+
+    using ReleaseContext = void*;
+    using TextureReleaseProc = void (*)(ReleaseContext);
+
+    virtual bool replaceBackendTexture(const GrBackendTexture& backendTexture,
+                                       GrSurfaceOrigin origin,
+                                       ContentChangeMode mode = kRetain_ContentChangeMode,
+                                       TextureReleaseProc = nullptr,
+                                       ReleaseContext = nullptr) = 0;
+
+    SkCanvas* getCanvas();
+
+    sk_sp<const SkCapabilities> capabilities();
+
+    sk_sp<SkSurface> makeSurface(const SkImageInfo& imageInfo);
+
+    sk_sp<SkSurface> makeSurface(int width, int height);
+
+    sk_sp<SkImage> makeImageSnapshot();
+
+    sk_sp<SkImage> makeImageSnapshot(const SkIRect& bounds);
+
+    sk_sp<SkImage> makeTemporaryImage();
+
+    void draw(SkCanvas* canvas, SkScalar x, SkScalar y, const SkSamplingOptions& sampling,
+              const SkPaint* paint);
+
+    void draw(SkCanvas* canvas, SkScalar x, SkScalar y, const SkPaint* paint = nullptr) {
+        this->draw(canvas, x, y, SkSamplingOptions(), paint);
+    }
+
+    bool peekPixels(SkPixmap* pixmap);
+
+    bool readPixels(const SkPixmap& dst, int srcX, int srcY);
+
+    bool readPixels(const SkImageInfo& dstInfo, void* dstPixels, size_t dstRowBytes,
+                    int srcX, int srcY);
+
+    bool readPixels(const SkBitmap& dst, int srcX, int srcY);
+
+    using AsyncReadResult = SkImage::AsyncReadResult;
+
+    using ReadPixelsContext = void*;
+
+    using ReadPixelsCallback = void(ReadPixelsContext, std::unique_ptr<const AsyncReadResult>);
+
+    using RescaleGamma = SkImage::RescaleGamma;
+    using RescaleMode  = SkImage::RescaleMode;
+
+    void asyncRescaleAndReadPixels(const SkImageInfo& info,
+                                   const SkIRect& srcRect,
+                                   RescaleGamma rescaleGamma,
+                                   RescaleMode rescaleMode,
+                                   ReadPixelsCallback callback,
+                                   ReadPixelsContext context);
+
+    void asyncRescaleAndReadPixelsYUV420(SkYUVColorSpace yuvColorSpace,
+                                         sk_sp<SkColorSpace> dstColorSpace,
+                                         const SkIRect& srcRect,
+                                         const SkISize& dstSize,
+                                         RescaleGamma rescaleGamma,
+                                         RescaleMode rescaleMode,
+                                         ReadPixelsCallback callback,
+                                         ReadPixelsContext context);
+
+    void asyncRescaleAndReadPixelsYUVA420(SkYUVColorSpace yuvColorSpace,
+                                          sk_sp<SkColorSpace> dstColorSpace,
+                                          const SkIRect& srcRect,
+                                          const SkISize& dstSize,
+                                          RescaleGamma rescaleGamma,
+                                          RescaleMode rescaleMode,
+                                          ReadPixelsCallback callback,
+                                          ReadPixelsContext context);
+
+    void writePixels(const SkPixmap& src, int dstX, int dstY);
+
+    void writePixels(const SkBitmap& src, int dstX, int dstY);
+
+    const SkSurfaceProps& props() const { return fProps; }
+
+    bool wait(int numSemaphores, const GrBackendSemaphore* waitSemaphores,
+              bool deleteSemaphoresAfterWait = true);
+
+    bool characterize(GrSurfaceCharacterization* characterization) const;
+
+protected:
+    SkSurface(int width, int height, const SkSurfaceProps* surfaceProps);
+    SkSurface(const SkImageInfo& imageInfo, const SkSurfaceProps* surfaceProps);
+
+    void dirtyGenerationID() {
+        fGenerationID = 0;
+    }
+
+private:
+    const SkSurfaceProps fProps;
+    const int            fWidth;
+    const int            fHeight;
+    uint32_t             fGenerationID;
+
+    using INHERITED = SkRefCnt;
+};
+
+#endif

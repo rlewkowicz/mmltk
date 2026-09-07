@@ -1,0 +1,17 @@
+# syntax=docker/dockerfile:1
+
+ARG MMLTK_NVIDIA_DONOR_IMAGE
+FROM ${MMLTK_NVIDIA_DONOR_IMAGE} AS donor
+ARG MMLTK_NVIDIA_DONOR_IMAGE
+COPY docker/nvidia-payload.json docker/materialize_nvidia_payload.py docker/nvidia_payload.py /mmltk-extraction/
+RUN python3 /mmltk-extraction/materialize_nvidia_payload.py \
+    --manifest /mmltk-extraction/nvidia-payload.json --output /mmltk-payload \
+    --donor "${MMLTK_NVIDIA_DONOR_IMAGE}"
+
+FROM scratch AS payload
+COPY --from=donor /mmltk-payload/ /
+ARG MMLTK_IMAGE_FINGERPRINT=unlabeled
+ARG MMLTK_NVIDIA_DONOR_IMAGE
+LABEL com.mmltk.input-fingerprint="${MMLTK_IMAGE_FINGERPRINT}" \
+      com.mmltk.nvidia-donor="${MMLTK_NVIDIA_DONOR_IMAGE}" \
+      com.mmltk.payload-mode="extraction"

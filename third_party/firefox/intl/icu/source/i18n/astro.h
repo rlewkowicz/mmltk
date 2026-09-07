@@ -1,0 +1,165 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/************************************************************************
+ * Copyright (C) 1996-2008, International Business Machines Corporation *
+ * and others. All Rights Reserved.                                     *
+ ************************************************************************
+ *  2003-nov-07   srl       Port from Java
+ */
+
+#ifndef ASTRO_H
+#define ASTRO_H
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "gregoimp.h"  // for Math
+#include "unicode/unistr.h"
+
+U_NAMESPACE_BEGIN
+
+class U_I18N_API CalendarAstronomer : public UMemory {
+public:
+
+public:
+  class U_I18N_API Ecliptic : public UMemory {
+  public:
+    Ecliptic(double lat = 0, double lon = 0) {
+      latitude = lat;
+      longitude = lon;
+    }
+
+    void set(double lat, double lon) {
+      latitude = lat;
+      longitude = lon;
+    }
+
+    UnicodeString toString() const;
+
+    double latitude;
+
+    double longitude;
+  };
+
+  class U_I18N_API Equatorial : public UMemory {
+  public:
+    Equatorial(double asc = 0, double dec = 0)
+      : ascension(asc), declination(dec) { }
+
+    void set(double asc, double dec) {
+      ascension = asc;
+      declination = dec;
+    }
+
+    UnicodeString toString() const;
+
+
+    double ascension;
+
+    double declination;
+  };
+
+public:
+
+  static const double PI;
+
+  static const double SYNODIC_MONTH;
+
+
+  CalendarAstronomer();
+
+  CalendarAstronomer(UDate d);
+
+  ~CalendarAstronomer();
+
+
+  void setTime(UDate aTime);
+
+  UDate getTime();
+
+  double getJulianDay();
+
+public:
+  Equatorial& eclipticToEquatorial(Equatorial& result, double eclipLong, double eclipLat);
+
+
+  double getSunLongitude();
+
+   void getSunLongitude(double julianDay, double &longitude, double &meanAnomaly);
+
+public:
+  static double WINTER_SOLSTICE();
+
+  UDate getSunTime(double desired, UBool next);
+
+
+  const Equatorial& getMoonPosition();
+
+  double getMoonAge();
+
+  class U_I18N_API MoonAge : public UMemory {
+  public:
+    MoonAge(double l)
+      :  value(l) { }
+    void set(double l) { value = l; }
+    double value;
+  };
+
+  static MoonAge NEW_MOON();
+
+  UDate getMoonTime(const MoonAge& desired, UBool next);
+
+
+public:
+  class AngleFunc : public UMemory {
+  public:
+    virtual double eval(CalendarAstronomer&) = 0;
+    virtual ~AngleFunc();
+  };
+  friend class AngleFunc;
+
+private:
+  UDate timeOfAngle(AngleFunc& func, double desired,
+                    double periodDays, double epsilon, UBool next);
+
+private:
+
+  double eclipticObliquity();
+
+private:
+  UDate fTime;
+
+  double    julianDay;
+  double    sunLongitude;
+  double    meanAnomalySun;
+  double    moonEclipLong;
+
+  void clearCache();
+
+  Equatorial  moonPosition;
+  UBool       moonPositionSet;
+
+};
+
+U_NAMESPACE_END
+
+struct UHashtable;
+
+U_NAMESPACE_BEGIN
+
+class CalendarCache : public UMemory {
+public:
+  static int32_t get(CalendarCache** cache, int32_t key, UErrorCode &status);
+  static void put(CalendarCache** cache, int32_t key, int32_t value, UErrorCode &status);
+  virtual ~CalendarCache();
+private:
+  CalendarCache(int32_t size, UErrorCode& status);
+  static void createCache(CalendarCache** cache, UErrorCode& status);
+  CalendarCache();
+  UHashtable *fTable;
+};
+
+U_NAMESPACE_END
+
+#endif
+#endif

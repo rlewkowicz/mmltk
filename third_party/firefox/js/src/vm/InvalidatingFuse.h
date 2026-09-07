@@ -1,0 +1,55 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef vm_InvalidatingFuse_h
+#define vm_InvalidatingFuse_h
+
+#include "gc/Barrier.h"
+#include "jit/InvalidationScriptSet.h"
+#include "js/SweepingAPI.h"
+
+#include "vm/GuardFuse.h"
+class JSScript;
+
+namespace js {
+
+class InvalidatingFuse : public GuardFuse {
+ public:
+  virtual bool addFuseDependency(JSContext* cx,
+                                 const jit::IonScriptKey& ionScript) = 0;
+};
+
+class InvalidatingRuntimeFuse : public InvalidatingFuse {
+ public:
+  virtual bool addFuseDependency(JSContext* cx,
+                                 const jit::IonScriptKey& ionScript) override;
+  virtual void popFuse(JSContext* cx) override;
+};
+
+class FuseDependentIonScriptSet {
+ public:
+  FuseDependentIonScriptSet(JSContext* cx, InvalidatingFuse* fuse);
+
+  InvalidatingFuse* associatedFuse;
+  bool addScriptForFuse(InvalidatingFuse* fuse,
+                        const jit::IonScriptKey& ionScript);
+  void invalidateForFuse(JSContext* cx, InvalidatingFuse* fuse);
+
+ private:
+  JS::WeakCache<js::jit::DependentIonScriptSet> ionScripts;
+};
+
+class DependentIonScriptGroup {
+  Vector<FuseDependentIonScriptSet, 1, SystemAllocPolicy> dependencies;
+
+ public:
+  FuseDependentIonScriptSet* getOrCreateDependentScriptSet(
+      JSContext* cx, InvalidatingFuse* fuse);
+  FuseDependentIonScriptSet* begin() { return dependencies.begin(); }
+  FuseDependentIonScriptSet* end() { return dependencies.end(); }
+};
+
+}  
+
+#endif  // vm_InvalidatingFuse_h

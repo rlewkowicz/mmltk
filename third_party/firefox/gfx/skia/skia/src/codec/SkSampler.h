@@ -1,0 +1,53 @@
+/*
+ * Copyright 2015 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+#if !defined(SkSampler_DEFINED)
+#define SkSampler_DEFINED
+
+#include "include/codec/SkCodec.h"
+#include "include/core/SkTypes.h"
+#include "include/private/base/SkNoncopyable.h"
+#include "src/codec/SkCodecPriv.h"
+
+#include <cstddef>
+
+struct SkImageInfo;
+
+class SkSampler : public SkNoncopyable {
+public:
+    int setSampleX(int sampleX) {
+        return this->onSetSampleX(sampleX);
+    }
+
+    void setSampleY(int sampleY) {
+        fSampleY = sampleY;
+    }
+
+    int sampleY() const {
+        return fSampleY;
+    }
+
+    bool rowNeeded(int row) const {
+        return (row - SkCodecPriv::GetStartCoord(fSampleY)) % fSampleY == 0;
+    }
+
+    static void Fill(const SkImageInfo& info, void* dst, size_t rowBytes,
+                     SkCodec::ZeroInitialized zeroInit);
+
+    virtual int fillWidth() const = 0;
+
+    SkSampler()
+        : fSampleY(1)
+    {}
+
+    virtual ~SkSampler() {}
+private:
+    int fSampleY;
+
+    virtual int onSetSampleX(int) = 0;
+};
+
+#endif

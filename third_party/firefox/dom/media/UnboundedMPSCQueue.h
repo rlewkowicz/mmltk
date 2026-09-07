@@ -1,0 +1,67 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_UnboundedMPSCQueue_h
+#define mozilla_dom_UnboundedMPSCQueue_h
+
+namespace mozilla {
+
+const size_t MPSC_MSG_RESERVED = sizeof(std::atomic<void*>);
+
+template <typename T>
+class UnboundedMPSCQueue {
+ public:
+  struct Message {
+    Message() { mNext.store(nullptr, std::memory_order_relaxed); }
+    Message(const Message& aMessage) = delete;
+    void operator=(const Message& aMessage) = delete;
+
+    std::atomic<Message*> mNext;
+    T data;
+  };
+
+  UnboundedMPSCQueue()
+      : mHead(new Message()), mTail(mHead.load(std::memory_order_relaxed)) {}
+
+  ~UnboundedMPSCQueue() {
+    Message dummy;
+    while (Pop(&dummy.data)) {
+    }
+    Message* front = mHead.load(std::memory_order_relaxed);
+    delete front;
+  }
+
+  void Push(UnboundedMPSCQueue<T>::Message* aMessage) {
+    Message* prev = mHead.exchange(aMessage, std::memory_order_acq_rel);
+    prev->mNext.store(aMessage, std::memory_order_release);
+  }
+
+  bool Pop(T* aOutput) {
+    Message* tail = mTail.load(std::memory_order_relaxed);
+    Message* next = tail->mNext.load(std::memory_order_acquire);
+
+    if (next == nullptr) {
+      return false;
+    }
+
+    *aOutput = std::move(next->data);
+
+    mTail.store(next, std::memory_order_release);
+
+    delete tail;
+
+    return true;
+  }
+
+ private:
+  std::atomic<Message*> mHead;
+  std::atomic<Message*> mTail;
+
+  UnboundedMPSCQueue(const UnboundedMPSCQueue&) = delete;
+  void operator=(const UnboundedMPSCQueue&) = delete;
+};
+
+}  
+
+#endif  // mozilla_dom_UnboundedMPSCQueue_h

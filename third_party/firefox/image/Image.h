@@ -1,0 +1,298 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_image_Image_h
+#define mozilla_image_Image_h
+
+#include "ImageContainer.h"
+#include "ImageRegion.h"
+#include "LookupResult.h"
+#include "ProgressTracker.h"
+#include "SurfaceCache.h"
+#include "WebRenderImageProvider.h"
+#include "gfx2DGlue.h"
+#include "imgIContainer.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/SizeOfState.h"
+#include "mozilla/TimeStamp.h"
+#include "nsStringFwd.h"
+
+class imgRequest;
+class nsIRequest;
+class nsIInputStream;
+
+namespace mozilla {
+namespace image {
+
+class Image;
+
+
+struct MemoryCounter {
+  MemoryCounter()
+      : mSource(0),
+        mDecodedHeap(0),
+        mDecodedNonHeap(0),
+        mDecodedUnknown(0),
+        mExternalHandles(0),
+        mFrameIndex(0),
+        mExternalId(0),
+        mSurfaceTypes(0) {}
+
+  void SetSource(size_t aCount) { mSource = aCount; }
+  size_t Source() const { return mSource; }
+  void SetDecodedHeap(size_t aCount) { mDecodedHeap = aCount; }
+  size_t DecodedHeap() const { return mDecodedHeap; }
+  void SetDecodedNonHeap(size_t aCount) { mDecodedNonHeap = aCount; }
+  size_t DecodedNonHeap() const { return mDecodedNonHeap; }
+  void SetDecodedUnknown(size_t aCount) { mDecodedUnknown = aCount; }
+  size_t DecodedUnknown() const { return mDecodedUnknown; }
+  void SetExternalHandles(size_t aCount) { mExternalHandles = aCount; }
+  size_t ExternalHandles() const { return mExternalHandles; }
+  void SetFrameIndex(size_t aIndex) { mFrameIndex = aIndex; }
+  size_t FrameIndex() const { return mFrameIndex; }
+  void SetExternalId(uint64_t aId) { mExternalId = aId; }
+  uint64_t ExternalId() const { return mExternalId; }
+  void SetSurfaceTypes(uint32_t aTypes) { mSurfaceTypes = aTypes; }
+  uint32_t SurfaceTypes() const { return mSurfaceTypes; }
+
+  MemoryCounter& operator+=(const MemoryCounter& aOther) {
+    mSource += aOther.mSource;
+    mDecodedHeap += aOther.mDecodedHeap;
+    mDecodedNonHeap += aOther.mDecodedNonHeap;
+    mDecodedUnknown += aOther.mDecodedUnknown;
+    mExternalHandles += aOther.mExternalHandles;
+    mSurfaceTypes |= aOther.mSurfaceTypes;
+    return *this;
+  }
+
+ private:
+  size_t mSource;
+  size_t mDecodedHeap;
+  size_t mDecodedNonHeap;
+  size_t mDecodedUnknown;
+  size_t mExternalHandles;
+  size_t mFrameIndex;
+  uint64_t mExternalId;
+  uint32_t mSurfaceTypes;
+};
+
+enum class SurfaceMemoryCounterType { NORMAL, CONTAINER };
+
+struct SurfaceMemoryCounter {
+  SurfaceMemoryCounter(
+      const SurfaceKey& aKey, bool aIsLocked, bool aCannotSubstitute,
+      bool aIsFactor2, bool aFinished,
+      SurfaceMemoryCounterType aType = SurfaceMemoryCounterType::NORMAL)
+      : mKey(aKey),
+        mType(aType),
+        mIsLocked(aIsLocked),
+        mCannotSubstitute(aCannotSubstitute),
+        mIsFactor2(aIsFactor2),
+        mFinished(aFinished) {}
+
+  const SurfaceKey& Key() const { return mKey; }
+  MemoryCounter& Values() { return mValues; }
+  const MemoryCounter& Values() const { return mValues; }
+  SurfaceMemoryCounterType Type() const { return mType; }
+  bool IsLocked() const { return mIsLocked; }
+  bool CannotSubstitute() const { return mCannotSubstitute; }
+  bool IsFactor2() const { return mIsFactor2; }
+  bool IsFinished() const { return mFinished; }
+
+ private:
+  const SurfaceKey mKey;
+  MemoryCounter mValues;
+  const SurfaceMemoryCounterType mType;
+  const bool mIsLocked;
+  const bool mCannotSubstitute;
+  const bool mIsFactor2;
+  const bool mFinished;
+};
+
+struct ImageMemoryCounter {
+  ImageMemoryCounter(imgRequest* aRequest, SizeOfState& aState, bool aIsUsed);
+  ImageMemoryCounter(imgRequest* aRequest, Image* aImage, SizeOfState& aState,
+                     bool aIsUsed);
+
+  nsCString& URI() { return mURI; }
+  const nsCString& URI() const { return mURI; }
+  const nsTArray<SurfaceMemoryCounter>& Surfaces() const { return mSurfaces; }
+  const gfx::IntSize IntrinsicSize() const { return mIntrinsicSize; }
+  const MemoryCounter& Values() const { return mValues; }
+  uint32_t Progress() const { return mProgress; }
+  uint16_t Type() const { return mType; }
+  bool IsUsed() const { return mIsUsed; }
+  bool HasError() const { return mHasError; }
+  bool IsValidating() const { return mValidating; }
+
+  bool IsNotable() const {
+    if (mHasError || mValidating || mProgress == UINT32_MAX ||
+        mProgress & FLAG_HAS_ERROR || mType == imgIContainer::TYPE_REQUEST) {
+      return true;
+    }
+
+    const size_t NotableThreshold = 16 * 1024;
+    size_t total = mValues.Source() + mValues.DecodedHeap() +
+                   mValues.DecodedNonHeap() + mValues.DecodedUnknown();
+    if (total >= NotableThreshold) {
+      return true;
+    }
+
+    for (const auto& surface : mSurfaces) {
+      if (!surface.IsFinished()) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+ private:
+  nsCString mURI;
+  nsTArray<SurfaceMemoryCounter> mSurfaces;
+  gfx::IntSize mIntrinsicSize;
+  MemoryCounter mValues;
+  uint32_t mProgress;
+  uint16_t mType;
+  const bool mIsUsed;
+  bool mHasError;
+  bool mValidating;
+};
+
+
+class Image : public imgIContainer {
+ public:
+  static const uint32_t INIT_FLAG_NONE = 0x0;
+  static const uint32_t INIT_FLAG_DISCARDABLE = 0x1;
+  static const uint32_t INIT_FLAG_DECODE_IMMEDIATELY = 0x2;
+  static const uint32_t INIT_FLAG_TRANSIENT = 0x4;
+  static const uint32_t INIT_FLAG_SYNC_LOAD = 0x8;
+
+  virtual already_AddRefed<ProgressTracker> GetProgressTracker() = 0;
+  virtual void SetProgressTracker(ProgressTracker* aProgressTracker) {}
+
+  virtual size_t SizeOfSourceWithComputedFallback(
+      SizeOfState& aState) const = 0;
+
+  virtual void CollectSizeOfSurfaces(nsTArray<SurfaceMemoryCounter>& aCounters,
+                                     MallocSizeOf aMallocSizeOf) const = 0;
+
+  virtual void IncrementAnimationConsumers() = 0;
+  virtual void DecrementAnimationConsumers() = 0;
+#ifdef DEBUG
+  virtual uint32_t GetAnimationConsumers() = 0;
+#endif
+
+  virtual nsresult OnImageDataAvailable(nsIRequest* aRequest,
+                                        nsIInputStream* aInStr,
+                                        uint64_t aSourceOffset,
+                                        uint32_t aCount) = 0;
+
+  virtual nsresult OnImageDataComplete(nsIRequest* aRequest, nsresult aStatus,
+                                       bool aLastPart) = 0;
+
+  virtual void OnSurfaceDiscarded(const SurfaceKey& aSurfaceKey) = 0;
+
+  virtual void SetInnerWindowID(uint64_t aInnerWindowId) = 0;
+  virtual uint64_t InnerWindowID() const = 0;
+
+  virtual bool HasError() = 0;
+  virtual void SetHasError() = 0;
+
+  virtual nsIURI* GetURI() const = 0;
+
+  NS_IMETHOD GetHotspotX(int32_t* aX) override {
+    *aX = 0;
+    return NS_OK;
+  }
+  NS_IMETHOD GetHotspotY(int32_t* aY) override {
+    *aY = 0;
+    return NS_OK;
+  }
+};
+
+class ImageResource : public Image {
+ public:
+  already_AddRefed<ProgressTracker> GetProgressTracker() override {
+    RefPtr<ProgressTracker> progressTracker = mProgressTracker;
+    MOZ_ASSERT(progressTracker);
+    return progressTracker.forget();
+  }
+
+  void SetProgressTracker(ProgressTracker* aProgressTracker) final {
+    MOZ_ASSERT(aProgressTracker);
+    MOZ_ASSERT(!mProgressTracker);
+    mProgressTracker = aProgressTracker;
+  }
+
+  virtual void IncrementAnimationConsumers() override;
+  virtual void DecrementAnimationConsumers() override;
+#ifdef DEBUG
+  virtual uint32_t GetAnimationConsumers() override {
+    return mAnimationConsumers;
+  }
+#endif
+
+  virtual void OnSurfaceDiscarded(const SurfaceKey& aSurfaceKey) override {}
+
+  virtual void SetInnerWindowID(uint64_t aInnerWindowId) override {
+    mInnerWindowId = aInnerWindowId;
+  }
+  virtual uint64_t InnerWindowID() const override { return mInnerWindowId; }
+
+  virtual bool HasError() override { return mError; }
+  virtual void SetHasError() override { mError = true; }
+
+  nsIURI* GetURI() const override { return mURI; }
+
+  void CollectSizeOfSurfaces(nsTArray<SurfaceMemoryCounter>& aCounters,
+                             MallocSizeOf aMallocSizeOf) const override;
+
+  ImageProviderId GetImageProviderId() const { return mProviderId; }
+
+ protected:
+  explicit ImageResource(nsIURI* aURI);
+  ~ImageResource();
+
+  bool GetSpecTruncatedTo1k(nsCString& aSpec) const;
+
+  nsresult GetAnimationModeInternal(uint16_t* aAnimationMode);
+  nsresult SetAnimationModeInternal(uint16_t aAnimationMode);
+
+  bool HadRecentRefresh(const TimeStamp& aTime);
+
+  virtual void EvaluateAnimation();
+
+  virtual bool ShouldAnimate() {
+    return mAnimationConsumers > 0 && mAnimationMode != kDontAnimMode;
+  }
+
+  virtual nsresult StartAnimation() = 0;
+  virtual nsresult StopAnimation() = 0;
+
+  void SendOnUnlockedDraw(uint32_t aFlags);
+
+#ifdef DEBUG
+  void NotifyDrawingObservers();
+#endif
+
+  RefPtr<ProgressTracker> mProgressTracker;
+  nsCOMPtr<nsIURI> mURI;
+  TimeStamp mLastRefreshTime;
+  uint64_t mInnerWindowId;
+  uint32_t mAnimationConsumers;
+  uint16_t mAnimationMode;  
+  bool mInitialized : 1;    
+  bool mAnimating : 1;      
+  bool mError : 1;          
+
+ private:
+  ImageProviderId mProviderId;
+};
+
+}  
+}  
+
+#endif  // mozilla_image_Image_h

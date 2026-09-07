@@ -1,0 +1,152 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef builtin_Array_h
+#define builtin_Array_h
+
+#include "mozilla/Attributes.h"
+
+#include "vm/JSObject.h"
+
+namespace js {
+
+enum class ArraySortResult : uint32_t;
+
+namespace jit {
+class TrampolineNativeFrameLayout;
+}
+
+class ArrayObject;
+class IteratorProperty;
+
+MOZ_ALWAYS_INLINE bool IdIsIndex(jsid id, uint32_t* indexp) {
+  if (id.isInt()) {
+    int32_t i = id.toInt();
+    MOZ_ASSERT(i >= 0);
+    *indexp = uint32_t(i);
+    return true;
+  }
+
+  if (MOZ_UNLIKELY(!id.isAtom())) {
+    return false;
+  }
+
+  JSAtom* atom = id.toAtom();
+  return atom->isIndex(indexp);
+}
+
+
+extern ArrayObject* NewDenseEmptyArray(JSContext* cx);
+
+extern ArrayObject* NewTenuredDenseEmptyArray(JSContext* cx);
+
+extern ArrayObject* NewDenseUnallocatedArray(
+    JSContext* cx, uint32_t length, NewObjectKind newKind = GenericObject);
+
+extern ArrayObject* NewDenseFullyAllocatedArray(
+    JSContext* cx, uint32_t length, NewObjectKind newKind = GenericObject,
+    gc::AllocSite* site = nullptr);
+
+extern ArrayObject* NewDensePartlyAllocatedArray(
+    JSContext* cx, uint32_t length, NewObjectKind newKind = GenericObject,
+    gc::AllocSite* site = nullptr);
+
+extern ArrayObject* NewDensePartlyAllocatedArrayWithProto(JSContext* cx,
+                                                          uint32_t length,
+                                                          HandleObject proto);
+
+extern ArrayObject* NewDenseCopiedArray(JSContext* cx, uint32_t length,
+                                        const Value* values,
+                                        NewObjectKind newKind = GenericObject);
+
+extern ArrayObject* NewDenseCopiedArray(JSContext* cx, uint32_t length,
+                                        IteratorProperty* props,
+                                        NewObjectKind newKind = GenericObject);
+
+extern ArrayObject* NewDenseCopiedArrayWithProto(JSContext* cx, uint32_t length,
+                                                 const Value* values,
+                                                 HandleObject proto);
+
+extern ArrayObject* NewDenseFullyAllocatedArrayWithShape(
+    JSContext* cx, uint32_t length, Handle<SharedShape*> shape);
+
+extern ArrayObject* NewArrayWithShape(JSContext* cx, uint32_t length,
+                                      Handle<Shape*> shape);
+
+extern bool ToLength(JSContext* cx, HandleValue v, uint64_t* out);
+
+extern bool GetLengthProperty(JSContext* cx, HandleObject obj,
+                              uint64_t* lengthp);
+
+extern bool SetLengthProperty(JSContext* cx, HandleObject obj, uint32_t length);
+
+extern bool GetElements(JSContext* cx, HandleObject aobj, uint32_t length,
+                        js::Value* vp);
+
+extern bool HasAndGetElement(JSContext* cx, HandleObject obj, uint64_t index,
+                             bool* hole, MutableHandleValue vp);
+
+
+extern bool array_pop(JSContext* cx, unsigned argc, js::Value* vp);
+extern bool array_join(JSContext* cx, unsigned argc, js::Value* vp);
+extern bool array_slice(JSContext* cx, unsigned argc, js::Value* vp);
+extern bool array_shift(JSContext* cx, unsigned argc, js::Value* vp);
+extern bool array_sort(JSContext* cx, unsigned argc, js::Value* vp);
+
+extern void ArrayShiftMoveElements(ArrayObject* arr);
+
+extern JSObject* ArraySliceDense(JSContext* cx, HandleObject obj, int32_t begin,
+                                 int32_t end, HandleObject result);
+
+extern JSObject* ArgumentsSliceDense(JSContext* cx, HandleObject obj,
+                                     int32_t begin, int32_t end,
+                                     HandleObject result);
+
+extern ArrayObject* NewArrayWithNullProto(JSContext* cx);
+
+extern bool NewbornArrayPush(JSContext* cx, HandleObject obj, const Value& v);
+
+extern ArrayObject* ArrayConstructorOneArg(JSContext* cx,
+                                           Handle<ArrayObject*> templateObject,
+                                           int32_t lengthInt,
+                                           gc::AllocSite* site);
+
+#ifdef DEBUG
+extern bool ArrayInfo(JSContext* cx, unsigned argc, Value* vp);
+#endif
+
+extern bool ArrayConstructor(JSContext* cx, unsigned argc, Value* vp);
+
+extern bool array_construct(JSContext* cx, unsigned argc, Value* vp);
+
+extern JSString* ArrayToSource(JSContext* cx, HandleObject obj);
+
+extern bool IsCrossRealmArrayConstructor(JSContext* cx, JSObject* obj,
+                                         bool* result);
+
+extern bool ObjectMayHaveExtraIndexedOwnProperties(JSObject* obj);
+
+extern bool ObjectMayHaveExtraIndexedProperties(JSObject* obj);
+
+extern bool PrototypeMayHaveIndexedProperties(NativeObject* obj);
+
+extern bool IsArrayFromJit(JSContext* cx, HandleObject obj, bool* isArray);
+
+extern bool ArrayLengthGetter(JSContext* cx, HandleObject obj, HandleId id,
+                              MutableHandleValue vp);
+
+extern bool ArrayLengthSetter(JSContext* cx, HandleObject obj, HandleId id,
+                              HandleValue v, ObjectOpResult& result);
+
+extern ArraySortResult ArraySortFromJit(
+    JSContext* cx, jit::TrampolineNativeFrameLayout* frame);
+
+bool IsArrayConstructor(const JSObject* obj);
+
+bool intrinsic_CanOptimizeArraySpecies(JSContext* cx, unsigned argc, Value* vp);
+
+} 
+
+#endif /* builtin_Array_h */

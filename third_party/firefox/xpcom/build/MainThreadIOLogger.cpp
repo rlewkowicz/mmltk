@@ -1,0 +1,179 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "MainThreadIOLogger.h"
+#include "IOInterposerPrivate.h"
+#include "mozilla/IOInterposer.h"
+#include "mozilla/StaticPtr.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/UniquePtr.h"
+#include "nsNativeCharsetUtils.h"
+#include "nsThreadUtils.h"
+
+
+#include <prenv.h>
+#include <prprf.h>
+#include <prthread.h>
+#include <vector>
+
+namespace {
+
+struct ObservationRecord {
+  explicit ObservationRecord(mozilla::IOInterposeObserver::Observation& aObs)
+      : mObservation(aObs) {
+    aObs.Filename(mFilename);
+  }
+
+  mozilla::IOInterposeObserver::Observation mObservation;
+  nsString mFilename;
+};
+
+class MainThreadIOLoggerImpl final : public mozilla::IOInterposeObserver {
+ public:
+  MainThreadIOLoggerImpl();
+  ~MainThreadIOLoggerImpl();
+
+  bool Init();
+
+  void Observe(Observation& aObservation) override;
+
+ private:
+  static void sIOThreadFunc(void* aArg);
+  void IOThreadFunc();
+
+  mozilla::TimeStamp mLogStartTime;
+  const char* mFileName;
+  PRThread* mIOThread;
+  mozilla::IOInterposer::Monitor mMonitor;
+  bool mShutdownRequired MOZ_GUARDED_BY(mMonitor);
+  std::vector<ObservationRecord> mObservations MOZ_GUARDED_BY(mMonitor);
+};
+
+static mozilla::StaticAutoPtr<MainThreadIOLoggerImpl> sImpl;
+
+MainThreadIOLoggerImpl::MainThreadIOLoggerImpl()
+    : mFileName(nullptr), mIOThread(nullptr), mShutdownRequired(false) {}
+
+MainThreadIOLoggerImpl::~MainThreadIOLoggerImpl() {
+  if (!mIOThread) {
+    return;
+  }
+  {
+    mozilla::IOInterposer::MonitorAutoLock lock(mMonitor);
+    mShutdownRequired = true;
+    mMonitor.Notify();
+  }
+  PR_JoinThread(mIOThread);
+  mIOThread = nullptr;
+}
+
+bool MainThreadIOLoggerImpl::Init() {
+  if (mFileName) {
+    return true;
+  }
+  mFileName = PR_GetEnv("MOZ_MAIN_THREAD_IO_LOG");
+  if (!mFileName) {
+    return false;
+  }
+  mIOThread =
+      PR_CreateThread(PR_USER_THREAD, &sIOThreadFunc, this, PR_PRIORITY_LOW,
+                      PR_GLOBAL_THREAD, PR_JOINABLE_THREAD, 0);
+  if (!mIOThread) {
+    return false;
+  }
+  return true;
+}
+
+void MainThreadIOLoggerImpl::sIOThreadFunc(void* aArg) {
+
+  NS_SetCurrentThreadName("MainThreadIOLogger");
+  MainThreadIOLoggerImpl* obj = static_cast<MainThreadIOLoggerImpl*>(aArg);
+  obj->IOThreadFunc();
+}
+
+void MainThreadIOLoggerImpl::IOThreadFunc() {
+  PRFileDesc* fd = PR_Open(mFileName, PR_WRONLY | PR_CREATE_FILE | PR_TRUNCATE,
+                           PR_IRUSR | PR_IWUSR | PR_IRGRP);
+  if (!fd) {
+    mozilla::IOInterposer::MonitorAutoLock lock(mMonitor);
+    mShutdownRequired = true;
+    std::vector<ObservationRecord>().swap(mObservations);
+    return;
+  }
+  mLogStartTime = mozilla::TimeStamp::Now();
+  {
+    mozilla::IOInterposer::MonitorAutoLock lock(mMonitor);
+    while (true) {
+      while (!mShutdownRequired && mObservations.empty()) {
+        mMonitor.Wait();
+      }
+      if (mShutdownRequired) {
+        break;
+      }
+      std::vector<ObservationRecord> observationsToWrite;
+      observationsToWrite.swap(mObservations);
+
+      mozilla::IOInterposer::MonitorAutoUnlock unlock(mMonitor);
+
+      for (auto i = observationsToWrite.begin(), e = observationsToWrite.end();
+           i != e; ++i) {
+        if (i->mObservation.ObservedOperation() == OpNextStage) {
+          PR_fprintf(
+              fd, "%f,NEXT-STAGE\n",
+              (mozilla::TimeStamp::Now() - mLogStartTime).ToMilliseconds());
+          continue;
+        }
+        double durationMs = i->mObservation.Duration().ToMilliseconds();
+        nsAutoCString nativeFilename;
+        nativeFilename.AssignLiteral("(not available)");
+        if (!i->mFilename.IsEmpty()) {
+          if (NS_FAILED(NS_CopyUnicodeToNative(i->mFilename, nativeFilename))) {
+            nativeFilename.AssignLiteral("(conversion failed)");
+          }
+        }
+        // clang-format off
+        // clang-format on
+        if (PR_fprintf(
+                fd, "%f,%s,%f,%s,%s\n",
+                (i->mObservation.Start() - mLogStartTime).ToMilliseconds(),
+                i->mObservation.ObservedOperationString(), durationMs,
+                i->mObservation.Reference(), nativeFilename.get()) > 0) {
+        }
+      }
+    }
+  }
+  PR_Close(fd);
+}
+
+void MainThreadIOLoggerImpl::Observe(Observation& aObservation) {
+  if (!mFileName || !IsMainThread()) {
+    return;
+  }
+  mozilla::IOInterposer::MonitorAutoLock lock(mMonitor);
+  if (mShutdownRequired) {
+    return;
+  }
+  mObservations.emplace_back(aObservation);
+  mMonitor.Notify();
+}
+
+}  
+
+namespace mozilla {
+
+namespace MainThreadIOLogger {
+
+bool Init() {
+  auto impl = MakeUnique<MainThreadIOLoggerImpl>();
+  if (!impl->Init()) {
+    return false;
+  }
+  sImpl = impl.release();
+  IOInterposer::Register(IOInterposeObserver::OpAllWithStaging, sImpl);
+  return true;
+}
+
+}  
+
+}  

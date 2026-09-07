@@ -1,0 +1,159 @@
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use std::fmt;
+use std::iter::FusedIterator;
+
+use super::lazy_buffer::LazyBuffer;
+use crate::adaptors::checked_binomial;
+
+/// An iterator to iterate through all the `n`-length combinations in an iterator, with replacement.
+///
+/// See [`.combinations_with_replacement()`](crate::Itertools::combinations_with_replacement)
+/// for more information.
+#[derive(Clone)]
+#[must_use = "iterator adaptors are lazy and do nothing unless consumed"]
+pub struct CombinationsWithReplacement<I>
+where
+    I: Iterator,
+    I::Item: Clone,
+{
+    indices: Box<[usize]>,
+    pool: LazyBuffer<I>,
+    first: bool,
+}
+
+impl<I> fmt::Debug for CombinationsWithReplacement<I>
+where
+    I: Iterator + fmt::Debug,
+    I::Item: fmt::Debug + Clone,
+{
+    debug_fmt_fields!(CombinationsWithReplacement, indices, pool, first);
+}
+
+/// Create a new `CombinationsWithReplacement` from a clonable iterator.
+pub fn combinations_with_replacement<I>(iter: I, k: usize) -> CombinationsWithReplacement<I>
+where
+    I: Iterator,
+    I::Item: Clone,
+{
+    let indices = alloc::vec![0; k].into_boxed_slice();
+    let pool: LazyBuffer<I> = LazyBuffer::new(iter);
+
+    CombinationsWithReplacement {
+        indices,
+        pool,
+        first: true,
+    }
+}
+
+impl<I> CombinationsWithReplacement<I>
+where
+    I: Iterator,
+    I::Item: Clone,
+{
+    /// Increments indices representing the combination to advance to the next
+    /// (in lexicographic order by increasing sequence) combination.
+    ///
+    /// Returns true if we've run out of combinations, false otherwise.
+    fn increment_indices(&mut self) -> bool {
+        self.pool.get_next();
+
+        let mut increment = None;
+        for (i, indices_int) in self.indices.iter().enumerate().rev() {
+            if *indices_int < self.pool.len() - 1 {
+                increment = Some((i, indices_int + 1));
+                break;
+            }
+        }
+        match increment {
+            Some((increment_from, increment_value)) => {
+                self.indices[increment_from..].fill(increment_value);
+                false
+            }
+            None => true,
+        }
+    }
+}
+
+impl<I> Iterator for CombinationsWithReplacement<I>
+where
+    I: Iterator,
+    I::Item: Clone,
+{
+    type Item = Vec<I::Item>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.first {
+            if !(self.indices.is_empty() || self.pool.get_next()) {
+                return None;
+            }
+            self.first = false;
+        } else if self.increment_indices() {
+            return None;
+        }
+        Some(self.pool.get_at(&self.indices))
+    }
+
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        if self.first {
+            if !(self.indices.is_empty() || self.pool.get_next()) {
+                return None;
+            }
+            self.first = false;
+        } else if self.increment_indices() {
+            return None;
+        }
+        for _ in 0..n {
+            if self.increment_indices() {
+                return None;
+            }
+        }
+        Some(self.pool.get_at(&self.indices))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let (mut low, mut upp) = self.pool.size_hint();
+        low = remaining_for(low, self.first, &self.indices).unwrap_or(usize::MAX);
+        upp = upp.and_then(|upp| remaining_for(upp, self.first, &self.indices));
+        (low, upp)
+    }
+
+    fn count(self) -> usize {
+        let Self {
+            indices,
+            pool,
+            first,
+        } = self;
+        let n = pool.count();
+        remaining_for(n, first, &indices).unwrap()
+    }
+}
+
+impl<I> FusedIterator for CombinationsWithReplacement<I>
+where
+    I: Iterator,
+    I::Item: Clone,
+{
+}
+
+/// For a given size `n`, return the count of remaining combinations with replacement or None if it would overflow.
+fn remaining_for(n: usize, first: bool, indices: &[usize]) -> Option<usize> {
+    let count = |n: usize, k: usize| {
+        let positions = if n == 0 {
+            k.saturating_sub(1)
+        } else {
+            (n - 1).checked_add(k)?
+        };
+        checked_binomial(positions, k)
+    };
+    let k = indices.len();
+    if first {
+        count(n, k)
+    } else {
+
+
+        indices.iter().enumerate().try_fold(0usize, |sum, (i, n0)| {
+            sum.checked_add(count(n - 1 - *n0, k - i)?)
+        })
+    }
+}

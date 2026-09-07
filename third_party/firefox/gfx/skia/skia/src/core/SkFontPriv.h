@@ -1,0 +1,82 @@
+/*
+ * Copyright 2018 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkFontPriv_DEFINED)
+#define SkFontPriv_DEFINED
+
+#include "include/core/SkFont.h"
+#include "include/core/SkFontTypes.h"
+#include "include/core/SkMatrix.h"
+#include "include/core/SkTypeface.h"
+#include "include/private/base/SkTemplates.h"
+
+class SkReadBuffer;
+class SkWriteBuffer;
+
+class SkFontPriv {
+public:
+    inline static constexpr int kCanonicalTextSizeForPaths  = 64;
+
+    static SkMatrix MakeTextMatrix(SkScalar size, SkScalar scaleX, SkScalar skewX) {
+        SkMatrix m = SkMatrix::Scale(size * scaleX, size);
+        if (skewX) {
+            m.postSkew(skewX, 0);
+        }
+        return m;
+    }
+
+    static SkMatrix MakeTextMatrix(const SkFont& font) {
+        return MakeTextMatrix(font.getSize(), font.getScaleX(), font.getSkewX());
+    }
+
+    static void ScaleFontMetrics(SkFontMetrics*, SkScalar);
+
+    static SkRect GetFontBounds(const SkFont&);
+
+    static SkScalar ApproximateTransformedTextSize(const SkFont& font, const SkMatrix& matrix,
+                                                   const SkPoint& textLocation);
+
+    static bool IsFinite(const SkFont& font) {
+        return SkIsFinite(font.getSize(), font.getScaleX(), font.getSkewX());
+    }
+
+    static size_t CountTextElements(const void* text, size_t byteLength, SkTextEncoding);
+
+    static void GlyphsToUnichars(const SkFont&, const SkGlyphID glyphs[], int count, SkUnichar[]);
+
+    static void Flatten(const SkFont&, SkWriteBuffer& buffer);
+    static bool Unflatten(SkFont*, SkReadBuffer& buffer);
+
+    static inline uint8_t Flags(const SkFont& font) { return font.fFlags; }
+};
+
+class [[nodiscard]] SkAutoToGlyphs {
+public:
+    SkAutoToGlyphs(const SkFont& font, const void* text, size_t length, SkTextEncoding encoding) {
+        if (encoding == SkTextEncoding::kGlyphID || length == 0) {
+            fGlyphs = {reinterpret_cast<const uint16_t*>(text), length >> 1};
+        } else {
+            const size_t count = font.countText(text, length, encoding);
+            fStorage.reset(count);
+            SkSpan<SkGlyphID> glyphs = {fStorage.get(), count};
+            (void)font.textToGlyphs(text, length, encoding, glyphs);
+            fGlyphs = glyphs;
+        }
+    }
+
+    size_t size() const { return fGlyphs.size(); }
+    const SkGlyphID* data() const { return fGlyphs.data(); }
+
+    size_t count() const { return fGlyphs.size(); }
+    SkSpan<const SkGlyphID> glyphs() const { return fGlyphs; }
+
+private:
+    skia_private::AutoSTArray<32, SkGlyphID> fStorage;
+    SkSpan<const SkGlyphID> fGlyphs;
+};
+
+#endif

@@ -1,0 +1,440 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsProfileLock.h"
+#include "nsCOMPtr.h"
+#include "nsQueryObject.h"
+#include "nsString.h"
+#include "nsPrintfCString.h"
+#include "nsDebug.h"
+
+
+
+
+#if defined(XP_UNIX)
+#  include <unistd.h>
+#  include <fcntl.h>
+#  include <errno.h>
+#  include <signal.h>
+#  include <stdlib.h>
+#  include "prnetdb.h"
+#  include "prsystem.h"
+#  include "prenv.h"
+#  include "mozilla/Printf.h"
+#endif
+
+
+#if defined(XP_UNIX)
+static bool sDisableSignalHandling = false;
+#endif
+
+nsProfileLock::nsProfileLock()
+    : mHaveLock(false),
+      mReplacedLockTime(0)
+#if defined(XP_UNIX)
+      ,
+      mPidLockFileName(nullptr),
+      mLockFileDesc(-1)
+#endif
+{
+#if defined(XP_UNIX)
+  next = prev = this;
+  sDisableSignalHandling = PR_GetEnv("MOZ_DISABLE_SIG_HANDLER") ? true : false;
+#endif
+}
+
+nsProfileLock::nsProfileLock(nsProfileLock& src) { *this = src; }
+
+nsProfileLock& nsProfileLock::operator=(nsProfileLock& rhs) {
+  Unlock();
+
+  mLockFile = rhs.mLockFile;
+  rhs.mLockFile = nullptr;
+  mHaveLock = rhs.mHaveLock;
+  rhs.mHaveLock = false;
+  mReplacedLockTime = rhs.mReplacedLockTime;
+
+#if defined(XP_UNIX)
+  mLockFileDesc = rhs.mLockFileDesc;
+  rhs.mLockFileDesc = -1;
+  mPidLockFileName = rhs.mPidLockFileName;
+  rhs.mPidLockFileName = nullptr;
+  if (mPidLockFileName) {
+    PR_REMOVE_LINK(&rhs);
+    PR_APPEND_LINK(this, &mPidLockList);
+  }
+#endif
+
+  return *this;
+}
+
+nsProfileLock::~nsProfileLock() {
+  Unlock();
+}
+
+#if defined(XP_UNIX)
+
+static int setupPidLockCleanup;
+
+PRCList nsProfileLock::mPidLockList =
+    PR_INIT_STATIC_CLIST(&nsProfileLock::mPidLockList);
+
+void nsProfileLock::RemovePidLockFiles(bool aFatalSignal) {
+  while (!PR_CLIST_IS_EMPTY(&mPidLockList)) {
+    nsProfileLock* lock = static_cast<nsProfileLock*>(mPidLockList.next);
+    lock->Unlock(aFatalSignal);
+  }
+}
+
+static struct sigaction SIGHUP_oldact;
+static struct sigaction SIGINT_oldact;
+static struct sigaction SIGQUIT_oldact;
+static struct sigaction SIGILL_oldact;
+static struct sigaction SIGABRT_oldact;
+static struct sigaction SIGSEGV_oldact;
+static struct sigaction SIGTERM_oldact;
+
+void nsProfileLock::FatalSignalHandler(int signo
+#if defined(SA_SIGINFO)
+                                       ,
+                                       siginfo_t* info, void* context
+#endif
+) {
+  RemovePidLockFiles(true);
+
+  struct sigaction* oldact = nullptr;
+
+  switch (signo) {
+    case SIGHUP:
+      oldact = &SIGHUP_oldact;
+      break;
+    case SIGINT:
+      oldact = &SIGINT_oldact;
+      break;
+    case SIGQUIT:
+      oldact = &SIGQUIT_oldact;
+      break;
+    case SIGILL:
+      oldact = &SIGILL_oldact;
+      break;
+    case SIGABRT:
+      oldact = &SIGABRT_oldact;
+      break;
+    case SIGSEGV:
+      oldact = &SIGSEGV_oldact;
+      break;
+    case SIGTERM:
+      oldact = &SIGTERM_oldact;
+      break;
+    default:
+      MOZ_ASSERT_UNREACHABLE("bad signo");
+      break;
+  }
+
+  if (oldact) {
+    if (oldact->sa_handler == SIG_DFL) {
+      sigaction(signo, oldact, nullptr);
+
+
+      sigset_t unblock_sigs;
+      sigemptyset(&unblock_sigs);
+      sigaddset(&unblock_sigs, signo);
+
+      sigprocmask(SIG_UNBLOCK, &unblock_sigs, nullptr);
+
+      raise(signo);
+    }
+#if defined(SA_SIGINFO)
+    else if (oldact->sa_sigaction &&
+             (oldact->sa_flags & SA_SIGINFO) == SA_SIGINFO) {
+      oldact->sa_sigaction(signo, info, context);
+    }
+#endif
+    else if (oldact->sa_handler && oldact->sa_handler != SIG_IGN) {
+      oldact->sa_handler(signo);
+    }
+  }
+
+  _exit(signo);
+}
+
+nsresult nsProfileLock::LockWithFcntl(nsIFile* aLockFile,
+                                      nsIProfileUnlocker** aUnlocker) {
+  nsresult rv = NS_OK;
+
+  nsAutoCString lockFilePath;
+  rv = aLockFile->GetNativePath(lockFilePath);
+  if (NS_FAILED(rv)) {
+    NS_ERROR("Could not get native path");
+    return rv;
+  }
+
+  aLockFile->GetLastModifiedTime(&mReplacedLockTime);
+
+  mLockFileDesc = open(lockFilePath.get(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  if (mLockFileDesc != -1) {
+    struct flock lock;
+    lock.l_start = 0;
+    lock.l_len = 0;  
+    lock.l_type = F_WRLCK;
+    lock.l_whence = SEEK_SET;
+
+    struct flock testlock = lock;
+    if (fcntl(mLockFileDesc, F_GETLK, &testlock) == -1) {
+      close(mLockFileDesc);
+      mLockFileDesc = -1;
+      rv = NS_ERROR_FAILURE;
+    } else if (fcntl(mLockFileDesc, F_SETLK, &lock) == -1) {
+
+      close(mLockFileDesc);
+      mLockFileDesc = -1;
+
+#if defined(DEBUG)
+      printf("fcntl(F_SETLK) failed. errno = %d\n", errno);
+#endif
+      if (errno == EAGAIN || errno == EACCES)
+        rv = NS_ERROR_FILE_ACCESS_DENIED;
+      else
+        rv = NS_ERROR_FAILURE;
+    }
+  } else {
+    NS_WARNING("Failed to open lock file.");
+    rv = NS_ERROR_FAILURE;
+  }
+  return rv;
+}
+
+static bool IsSymlinkStaleLock(struct in_addr* aAddr, const char* aFileName,
+                               bool aHaveFcntlLock) {
+  char buf[1024];
+  int len = readlink(aFileName, buf, sizeof buf - 1);
+  if (len > 0) {
+    buf[len] = '\0';
+    char* colon = strchr(buf, ':');
+    if (colon) {
+      *colon++ = '\0';
+      unsigned long addr = inet_addr(buf);
+      if (addr != (unsigned long)-1) {
+        if (colon[0] == '+' && aHaveFcntlLock) {
+          return true;
+        }
+
+        char* after = nullptr;
+        pid_t pid = strtol(colon, &after, 0);
+        if (pid != 0 && *after == '\0') {
+          if (addr != aAddr->s_addr) {
+            return false;
+          }
+
+          if (kill(pid, 0) == 0 || errno != ESRCH) {
+            return false;
+          }
+        }
+      }
+    }
+  }
+  return true;
+}
+
+nsresult nsProfileLock::LockWithSymlink(nsIFile* aLockFile,
+                                        bool aHaveFcntlLock) {
+  nsresult rv;
+  nsAutoCString lockFilePath;
+  rv = aLockFile->GetNativePath(lockFilePath);
+  if (NS_FAILED(rv)) {
+    NS_ERROR("Could not get native path");
+    return rv;
+  }
+
+  if (!mReplacedLockTime)
+    aLockFile->GetLastModifiedTimeOfLink(&mReplacedLockTime);
+
+  struct in_addr inaddr;
+  inaddr.s_addr = htonl(INADDR_LOOPBACK);
+
+#if !defined(MOZ_PROXY_BYPASS_PROTECTION)
+  char hostname[256];
+  PRStatus status = PR_GetSystemInfo(PR_SI_HOSTNAME, hostname, sizeof hostname);
+  if (status == PR_SUCCESS) {
+    char netdbbuf[PR_NETDB_BUF_SIZE];
+    PRHostEnt hostent;
+    status = PR_GetHostByName(hostname, netdbbuf, sizeof netdbbuf, &hostent);
+    if (status == PR_SUCCESS) memcpy(&inaddr, hostent.h_addr, sizeof inaddr);
+  }
+#endif
+
+  mozilla::SmprintfPointer signature =
+      mozilla::Smprintf("%s:%s%lu", inet_ntoa(inaddr),
+                        aHaveFcntlLock ? "+" : "", (unsigned long)getpid());
+  const char* fileName = lockFilePath.get();
+  int symlink_rv, symlink_errno = 0, tries = 0;
+
+  while ((symlink_rv = symlink(signature.get(), fileName)) < 0) {
+    symlink_errno = errno;
+    if (symlink_errno != EEXIST) break;
+
+    if (!IsSymlinkStaleLock(&inaddr, fileName, aHaveFcntlLock)) break;
+
+    (void)unlink(fileName);
+    if (++tries > 100) break;
+  }
+
+  if (symlink_rv == 0) {
+    rv = NS_OK;
+    mPidLockFileName = strdup(fileName);
+    if (mPidLockFileName) {
+      PR_APPEND_LINK(this, &mPidLockList);
+      if (!setupPidLockCleanup++) {
+        static RemovePidLockFilesExiting r;
+
+        if (!sDisableSignalHandling) {
+          struct sigaction act, oldact;
+#if defined(SA_SIGINFO)
+          act.sa_sigaction = FatalSignalHandler;
+          act.sa_flags = SA_SIGINFO | SA_ONSTACK;
+#else
+          act.sa_handler = FatalSignalHandler;
+#endif
+          sigfillset(&act.sa_mask);
+
+#  define CATCH_SIGNAL(signame)                      \
+    PR_BEGIN_MACRO                                   \
+    if (sigaction(signame, nullptr, &oldact) == 0 && \
+        oldact.sa_handler != SIG_IGN) {              \
+      sigaction(signame, &act, &signame##_oldact);   \
+    }                                                \
+    PR_END_MACRO
+
+          CATCH_SIGNAL(SIGHUP);
+          CATCH_SIGNAL(SIGINT);
+          CATCH_SIGNAL(SIGQUIT);
+          CATCH_SIGNAL(SIGILL);
+          CATCH_SIGNAL(SIGABRT);
+          CATCH_SIGNAL(SIGSEGV);
+          CATCH_SIGNAL(SIGTERM);
+
+#  undef CATCH_SIGNAL
+        }
+      }
+    }
+  } else if (symlink_errno == EEXIST)
+    rv = NS_ERROR_FILE_ACCESS_DENIED;
+  else {
+#if defined(DEBUG)
+    printf("symlink() failed. errno = %d\n", errno);
+#endif
+    rv = NS_ERROR_FAILURE;
+  }
+  return rv;
+}
+#endif
+
+nsresult nsProfileLock::GetReplacedLockTime(PRTime* aResult) {
+  *aResult = mReplacedLockTime;
+  return NS_OK;
+}
+
+#if defined(XP_UNIX)
+constexpr auto OLD_LOCKFILE_NAME = u"lock"_ns;
+constexpr auto LOCKFILE_NAME = u".parentlock"_ns;
+#else
+constexpr auto LOCKFILE_NAME = u"parent.lock"_ns;
+#endif
+
+bool nsProfileLock::IsMaybeLockFile(nsIFile* aFile) {
+  nsAutoString tmp;
+  if (NS_SUCCEEDED(aFile->GetLeafName(tmp))) {
+    if (tmp.Equals(LOCKFILE_NAME)) return true;
+#if (0 || defined(XP_UNIX))
+    if (tmp.Equals(OLD_LOCKFILE_NAME)) return true;
+#endif
+  }
+  return false;
+}
+
+nsresult nsProfileLock::Lock(nsIFile* aProfileDir,
+                             nsIProfileUnlocker** aUnlocker) {
+  nsresult rv;
+  if (aUnlocker) *aUnlocker = nullptr;
+
+  NS_ENSURE_STATE(!mHaveLock);
+
+  bool isDir;
+  rv = aProfileDir->IsDirectory(&isDir);
+  if (NS_FAILED(rv)) return rv;
+  if (!isDir) return NS_ERROR_FILE_NOT_DIRECTORY;
+
+  nsCOMPtr<nsIFile> lockFile;
+  rv = aProfileDir->Clone(getter_AddRefs(lockFile));
+  if (NS_FAILED(rv)) return rv;
+
+  rv = lockFile->Append(LOCKFILE_NAME);
+  if (NS_FAILED(rv)) return rv;
+
+  rv = lockFile->Clone(getter_AddRefs(mLockFile));
+  if (NS_FAILED(rv)) return rv;
+
+#if defined(XP_UNIX)
+  nsCOMPtr<nsIFile> oldLockFile;
+  rv = aProfileDir->Clone(getter_AddRefs(oldLockFile));
+  if (NS_FAILED(rv)) return rv;
+  rv = oldLockFile->Append(OLD_LOCKFILE_NAME);
+  if (NS_FAILED(rv)) return rv;
+
+  rv = LockWithFcntl(lockFile, aUnlocker);
+  if (NS_SUCCEEDED(rv)) {
+    rv = LockWithSymlink(oldLockFile, true);
+
+    if (rv != NS_ERROR_FILE_ACCESS_DENIED) rv = NS_OK;
+  } else if (rv != NS_ERROR_FILE_ACCESS_DENIED) {
+    rv = LockWithSymlink(oldLockFile, false);
+  }
+
+#endif
+
+  if (NS_SUCCEEDED(rv)) mHaveLock = true;
+
+  return rv;
+}
+
+nsresult nsProfileLock::Unlock(bool aFatalSignal) {
+  nsresult rv = NS_OK;
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wuninitialized"
+  if (mHaveLock) {
+#pragma GCC diagnostic pop
+#if defined(XP_UNIX)
+    if (mPidLockFileName) {
+      PR_REMOVE_LINK(this);
+      (void)unlink(mPidLockFileName);
+
+      if (!aFatalSignal) free(mPidLockFileName);
+      mPidLockFileName = nullptr;
+    }
+    if (mLockFileDesc != -1) {
+      close(mLockFileDesc);
+      mLockFileDesc = -1;
+    }
+#endif
+
+    mHaveLock = false;
+  }
+
+  return rv;
+}
+
+nsresult nsProfileLock::Cleanup() {
+  if (mHaveLock) {
+    return NS_ERROR_FILE_IS_LOCKED;
+  }
+
+  if (mLockFile) {
+    nsresult rv = mLockFile->Remove(false);
+    NS_ENSURE_SUCCESS(rv, rv);
+    mLockFile = nullptr;
+  }
+
+  return NS_OK;
+}

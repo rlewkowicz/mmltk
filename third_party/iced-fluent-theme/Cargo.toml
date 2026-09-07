@@ -1,0 +1,22 @@
+[package]
+name = "iced-fluent-theme"
+version = "0.1.0"
+edition = "2024"
+description = "A Fluent 2 inspired theme for the Iced GUI library"
+authors = ["frgp42"]
+license = "MIT"
+repository = "https://codeberg.org/frgp42/iced-fluent-theme.git"
+publish = false
+
+[dependencies]
+iced_core = { path = "../iced/core" }
+iced_widget = { path = "../iced/widget" }
+iced_aw = { path = "../iced_aw", default-features = false, features = ["card", "color_picker", "context_menu", "number_input", "selection_list"] }
+
+[features]
+default = []
+markdown = ["iced_widget/markdown"]
+menu_bar = []
+ribbon = []
+selector_bar = []
+svg = ["iced_widget/svg"]

@@ -1,0 +1,192 @@
+// Copyright (c) 2008 The Chromium Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include "base/message_pump_glib.h"
+
+#include <unistd.h>
+#include <math.h>
+
+#include <gtk/gtk.h>
+#include <glib.h>
+
+#include "base/eintr_wrapper.h"
+#include "base/logging.h"
+#include "base/platform_thread.h"
+
+namespace {
+
+int GetTimeIntervalMilliseconds(const base::TimeTicks& from) {
+  if (from.is_null()) return -1;
+
+  int delay =
+      static_cast<int>(ceil((from - base::TimeTicks::Now()).InMillisecondsF()));
+
+  return delay < 0 ? 0 : delay;
+}
+
+
+struct WorkSource : public GSource {
+  base::MessagePumpForUI* pump;
+};
+
+gboolean WorkSourcePrepare(GSource* source, gint* timeout_ms) {
+  *timeout_ms = static_cast<WorkSource*>(source)->pump->HandlePrepare();
+  return FALSE;
+}
+
+gboolean WorkSourceCheck(GSource* source) {
+  return static_cast<WorkSource*>(source)->pump->HandleCheck();
+}
+
+gboolean WorkSourceDispatch(GSource* source, GSourceFunc unused_func,
+                            gpointer unused_data) {
+  static_cast<WorkSource*>(source)->pump->HandleDispatch();
+  return TRUE;
+}
+
+GSourceFuncs WorkSourceFuncs = {WorkSourcePrepare, WorkSourceCheck,
+                                WorkSourceDispatch, nullptr};
+
+}  
+
+namespace base {
+
+MessagePumpForUI::MessagePumpForUI()
+    : state_(nullptr),
+      context_(g_main_context_default()),
+      wakeup_gpollfd_(new GPollFD),
+      pipe_full_(false) {
+  int fds[2];
+  CHECK(pipe(fds) == 0);
+  wakeup_pipe_read_ = fds[0];
+  wakeup_pipe_write_ = fds[1];
+  wakeup_gpollfd_->fd = wakeup_pipe_read_;
+  wakeup_gpollfd_->events = G_IO_IN;
+
+  work_source_ = g_source_new(&WorkSourceFuncs, sizeof(WorkSource));
+  static_cast<WorkSource*>(work_source_)->pump = this;
+  g_source_add_poll(work_source_, wakeup_gpollfd_.get());
+  g_source_set_priority(work_source_, G_PRIORITY_DEFAULT_IDLE);
+  g_source_set_can_recurse(work_source_, TRUE);
+  g_source_attach(work_source_, context_);
+}
+
+MessagePumpForUI::~MessagePumpForUI() {
+  gdk_event_handler_set(reinterpret_cast<GdkEventFunc>(gtk_main_do_event), this,
+                        nullptr);
+  g_source_destroy(work_source_);
+  g_source_unref(work_source_);
+  close(wakeup_pipe_read_);
+  close(wakeup_pipe_write_);
+}
+
+void MessagePumpForUI::Run(Delegate* delegate) {
+#if !defined(NDEBUG)
+  static PlatformThreadId thread_id = PlatformThread::CurrentId();
+  DCHECK(thread_id == PlatformThread::CurrentId())
+      << "Running MessagePumpForUI on two different threads; "
+         "this is unsupported by GLib!";
+#endif
+
+  RunState state;
+  state.delegate = delegate;
+  state.should_quit = false;
+  state.run_depth = state_ ? state_->run_depth + 1 : 1;
+  state.has_work = false;
+
+  RunState* previous_state = state_;
+  state_ = &state;
+
+  bool more_work_is_plausible = true;
+
+  for (;;) {
+    bool block = !more_work_is_plausible;
+
+    more_work_is_plausible = g_main_context_iteration(context_, block);
+    if (state_->should_quit) break;
+
+    more_work_is_plausible |= state_->delegate->DoWork();
+    if (state_->should_quit) break;
+
+    more_work_is_plausible |=
+        state_->delegate->DoDelayedWork(&delayed_work_time_);
+    if (state_->should_quit) break;
+
+    if (more_work_is_plausible) continue;
+
+    more_work_is_plausible = state_->delegate->DoIdleWork();
+    if (state_->should_quit) break;
+  }
+
+  state_ = previous_state;
+}
+
+int MessagePumpForUI::HandlePrepare() {
+  if (state_ &&  
+      state_->has_work)
+    return 0;
+
+  return GetTimeIntervalMilliseconds(delayed_work_time_);
+}
+
+bool MessagePumpForUI::HandleCheck() {
+  if (!state_)  
+    return false;
+
+  if (wakeup_gpollfd_->revents & G_IO_IN) {
+    pipe_full_ = false;
+
+    char msg;
+    if (HANDLE_EINTR(read(wakeup_pipe_read_, &msg, 1)) != 1 || msg != '!') {
+      NOTREACHED() << "Error reading from the wakeup pipe.";
+    }
+    state_->has_work = true;
+  }
+
+  if (state_->has_work) return true;
+
+  if (GetTimeIntervalMilliseconds(delayed_work_time_) == 0) {
+    return true;
+  }
+
+  return false;
+}
+
+void MessagePumpForUI::HandleDispatch() {
+  state_->has_work = false;
+  if (state_->delegate->DoWork()) {
+    state_->has_work = true;
+  }
+
+  if (state_->should_quit) return;
+
+  state_->delegate->DoDelayedWork(&delayed_work_time_);
+}
+
+void MessagePumpForUI::Quit() {
+  if (state_) {
+    state_->should_quit = true;
+  } else {
+    NOTREACHED() << "Quit called outside Run!";
+  }
+}
+
+void MessagePumpForUI::ScheduleWork() {
+  bool was_full = pipe_full_.exchange(true);
+  if (was_full) {
+    return;
+  }
+
+  char msg = '!';
+  if (HANDLE_EINTR(write(wakeup_pipe_write_, &msg, 1)) != 1) {
+    NOTREACHED() << "Could not write to the UI message loop wakeup pipe!";
+  }
+}
+
+void MessagePumpForUI::ScheduleDelayedWork(const TimeTicks& delayed_work_time) {
+  delayed_work_time_ = delayed_work_time;
+  ScheduleWork();
+}
+
+}  

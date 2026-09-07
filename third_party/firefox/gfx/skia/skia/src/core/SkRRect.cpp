@@ -1,0 +1,848 @@
+/*
+ * Copyright 2012 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "include/core/SkRRect.h"
+
+#include "include/core/SkMatrix.h"
+#include "include/core/SkPoint.h"
+#include "include/core/SkRect.h"
+#include "include/core/SkScalar.h"
+#include "include/core/SkString.h"
+#include "include/core/SkTypes.h"
+#include "include/private/base/SkDebug.h"
+#include "include/private/base/SkFloatingPoint.h"
+#include "src/base/SkBuffer.h"
+#include "src/core/SkPathPriv.h"
+#include "src/core/SkPathRawShapes.h"
+#include "src/core/SkRRectPriv.h"
+#include "src/core/SkRectPriv.h"
+#include "src/core/SkScaleToSides.h"
+#include "src/core/SkStringUtils.h"
+
+#include <algorithm>
+#include <cstring>
+#include <iterator>
+
+
+void SkRRect::setOval(const SkRect& oval) {
+    if (!this->initializeRect(oval)) {
+        return;
+    }
+
+    SkScalar xRad = SkRectPriv::HalfWidth(fRect);
+    SkScalar yRad = SkRectPriv::HalfHeight(fRect);
+
+    if (xRad == 0.0f || yRad == 0.0f) {
+        memset(fRadii, 0, sizeof(fRadii));
+        fType = kRect_Type;
+    } else {
+        for (int i = 0; i < 4; ++i) {
+            fRadii[i].set(xRad, yRad);
+        }
+        fType = kOval_Type;
+    }
+
+    SkASSERT(this->isValid());
+}
+
+void SkRRect::setRectXY(const SkRect& rect, SkScalar xRad, SkScalar yRad) {
+    if (!this->initializeRect(rect)) {
+        return;
+    }
+
+    if (!SkIsFinite(xRad, yRad)) {
+        xRad = yRad = 0;    
+    }
+
+    if (fRect.width() < xRad+xRad || fRect.height() < yRad+yRad) {
+        SkScalar scale = std::min(sk_ieee_float_divide(fRect. width(), xRad + xRad),
+                                     sk_ieee_float_divide(fRect.height(), yRad + yRad));
+        SkASSERT(scale < SK_Scalar1);
+        xRad *= scale;
+        yRad *= scale;
+    }
+
+    if (xRad <= 0 || yRad <= 0) {
+        this->setRect(rect);
+        return;
+    }
+
+    for (int i = 0; i < 4; ++i) {
+        fRadii[i].set(xRad, yRad);
+    }
+    fType = kSimple_Type;
+    if (xRad >= SkScalarHalf(fRect.width()) && yRad >= SkScalarHalf(fRect.height())) {
+        fType = kOval_Type;
+    }
+
+    SkASSERT(this->isValid());
+}
+
+static bool clamp_to_zero(SkVector radii[4]) {
+    bool allCornersSquare = true;
+
+    for (int i = 0; i < 4; ++i) {
+        if (radii[i].fX <= 0 || radii[i].fY <= 0) {
+            radii[i].fX = 0;
+            radii[i].fY = 0;
+        } else {
+            allCornersSquare = false;
+        }
+    }
+
+    return allCornersSquare;
+}
+
+static bool radii_are_nine_patch(const SkVector radii[4]) {
+    return radii[SkRRect::kUpperLeft_Corner].fX == radii[SkRRect::kLowerLeft_Corner].fX &&
+           radii[SkRRect::kUpperLeft_Corner].fY == radii[SkRRect::kUpperRight_Corner].fY &&
+           radii[SkRRect::kUpperRight_Corner].fX == radii[SkRRect::kLowerRight_Corner].fX &&
+           radii[SkRRect::kLowerLeft_Corner].fY == radii[SkRRect::kLowerRight_Corner].fY;
+}
+
+void SkRRect::setNinePatch(const SkRect& rect, SkScalar leftRad, SkScalar topRad,
+                           SkScalar rightRad, SkScalar bottomRad) {
+    if (!this->initializeRect(rect)) {
+        return;
+    }
+
+    if (!SkIsFinite(leftRad, topRad, rightRad, bottomRad)) {
+        this->setRect(rect);    
+        return;
+    }
+
+    leftRad = std::max(leftRad, 0.0f);
+    topRad = std::max(topRad, 0.0f);
+    rightRad = std::max(rightRad, 0.0f);
+    bottomRad = std::max(bottomRad, 0.0f);
+
+    SkScalar scale = SK_Scalar1;
+    if (leftRad + rightRad > fRect.width()) {
+        scale = fRect.width() / (leftRad + rightRad);
+    }
+    if (topRad + bottomRad > fRect.height()) {
+        scale = std::min(scale, fRect.height() / (topRad + bottomRad));
+    }
+
+    if (scale < SK_Scalar1) {
+        leftRad *= scale;
+        topRad *= scale;
+        rightRad *= scale;
+        bottomRad *= scale;
+    }
+
+    if (leftRad == rightRad && topRad == bottomRad) {
+        if (leftRad >= SkScalarHalf(fRect.width()) && topRad >= SkScalarHalf(fRect.height())) {
+            fType = kOval_Type;
+        } else if (0 == leftRad || 0 == topRad) {
+            fType = kRect_Type;
+            leftRad = 0;
+            topRad = 0;
+            rightRad = 0;
+            bottomRad = 0;
+        } else {
+            fType = kSimple_Type;
+        }
+    } else {
+        fType = kNinePatch_Type;
+    }
+
+    fRadii[kUpperLeft_Corner].set(leftRad, topRad);
+    fRadii[kUpperRight_Corner].set(rightRad, topRad);
+    fRadii[kLowerRight_Corner].set(rightRad, bottomRad);
+    fRadii[kLowerLeft_Corner].set(leftRad, bottomRad);
+    if (clamp_to_zero(fRadii)) {
+        this->setRect(rect);    
+        return;
+    }
+    if (fType == kNinePatch_Type && !radii_are_nine_patch(fRadii)) {
+        fType = kComplex_Type;
+    }
+
+    SkASSERT(this->isValid());
+}
+
+static double compute_min_scale(double rad1, double rad2, double limit, double curMin) {
+    if ((rad1 + rad2) > limit) {
+        return std::min(curMin, limit / (rad1 + rad2));
+    }
+    return curMin;
+}
+
+void SkRRect::setRectRadii(const SkRect& rect, const SkVector radii[4]) {
+    if (!this->initializeRect(rect)) {
+        return;
+    }
+
+    if (!SkIsFinite(&radii[0].fX, 8)) {
+        this->setRect(rect);    
+        return;
+    }
+
+    memcpy(fRadii, radii, sizeof(fRadii));
+
+    if (clamp_to_zero(fRadii)) {
+        this->setRect(rect);
+        return;
+    }
+
+    this->scaleRadii();
+
+    if (!this->isValid()) {
+        this->setRect(rect);
+        return;
+    }
+}
+
+bool SkRRect::initializeRect(const SkRect& rect) {
+    if (!rect.isFinite()) {
+        *this = SkRRect();
+        return false;
+    }
+    fRect = rect.makeSorted();
+    if (fRect.isEmpty()) {
+        memset(fRadii, 0, sizeof(fRadii));
+        fType = kEmpty_Type;
+        return false;
+    }
+    return true;
+}
+
+static void flush_to_zero(SkScalar& a, SkScalar& b) {
+    SkASSERT(a >= 0);
+    SkASSERT(b >= 0);
+    if (a + b == a) {
+        b = 0;
+    } else if (a + b == b) {
+        a = 0;
+    }
+}
+
+bool SkRRect::scaleRadii() {
+    double scale = 1.0;
+
+    double width = (double)fRect.fRight - (double)fRect.fLeft;
+    double height = (double)fRect.fBottom - (double)fRect.fTop;
+    scale = compute_min_scale(fRadii[0].fX, fRadii[1].fX, width,  scale);
+    scale = compute_min_scale(fRadii[1].fY, fRadii[2].fY, height, scale);
+    scale = compute_min_scale(fRadii[2].fX, fRadii[3].fX, width,  scale);
+    scale = compute_min_scale(fRadii[3].fY, fRadii[0].fY, height, scale);
+
+    flush_to_zero(fRadii[0].fX, fRadii[1].fX);
+    flush_to_zero(fRadii[1].fY, fRadii[2].fY);
+    flush_to_zero(fRadii[2].fX, fRadii[3].fX);
+    flush_to_zero(fRadii[3].fY, fRadii[0].fY);
+
+    if (scale < 1.0) {
+        SkScaleToSides::AdjustRadii(width,  scale, &fRadii[0].fX, &fRadii[1].fX);
+        SkScaleToSides::AdjustRadii(height, scale, &fRadii[1].fY, &fRadii[2].fY);
+        SkScaleToSides::AdjustRadii(width,  scale, &fRadii[2].fX, &fRadii[3].fX);
+        SkScaleToSides::AdjustRadii(height, scale, &fRadii[3].fY, &fRadii[0].fY);
+    }
+
+    clamp_to_zero(fRadii);
+
+    this->computeType();
+
+
+    return scale < 1.0;
+}
+
+bool SkRRect::checkCornerContainment(SkScalar x, SkScalar y) const {
+    SkPoint canonicalPt; 
+    int index;
+
+    if (kOval_Type == this->type()) {
+        canonicalPt.set(x - fRect.centerX(), y - fRect.centerY());
+        index = kUpperLeft_Corner;  
+    } else {
+        if (x < fRect.fLeft + fRadii[kUpperLeft_Corner].fX &&
+            y < fRect.fTop + fRadii[kUpperLeft_Corner].fY) {
+            index = kUpperLeft_Corner;
+            canonicalPt.set(x - (fRect.fLeft + fRadii[kUpperLeft_Corner].fX),
+                            y - (fRect.fTop + fRadii[kUpperLeft_Corner].fY));
+            SkASSERT(canonicalPt.fX < 0 && canonicalPt.fY < 0);
+        } else if (x < fRect.fLeft + fRadii[kLowerLeft_Corner].fX &&
+                   y > fRect.fBottom - fRadii[kLowerLeft_Corner].fY) {
+            index = kLowerLeft_Corner;
+            canonicalPt.set(x - (fRect.fLeft + fRadii[kLowerLeft_Corner].fX),
+                            y - (fRect.fBottom - fRadii[kLowerLeft_Corner].fY));
+            SkASSERT(canonicalPt.fX < 0 && canonicalPt.fY > 0);
+        } else if (x > fRect.fRight - fRadii[kUpperRight_Corner].fX &&
+                   y < fRect.fTop + fRadii[kUpperRight_Corner].fY) {
+            index = kUpperRight_Corner;
+            canonicalPt.set(x - (fRect.fRight - fRadii[kUpperRight_Corner].fX),
+                            y - (fRect.fTop + fRadii[kUpperRight_Corner].fY));
+            SkASSERT(canonicalPt.fX > 0 && canonicalPt.fY < 0);
+        } else if (x > fRect.fRight - fRadii[kLowerRight_Corner].fX &&
+                   y > fRect.fBottom - fRadii[kLowerRight_Corner].fY) {
+            index = kLowerRight_Corner;
+            canonicalPt.set(x - (fRect.fRight - fRadii[kLowerRight_Corner].fX),
+                            y - (fRect.fBottom - fRadii[kLowerRight_Corner].fY));
+            SkASSERT(canonicalPt.fX > 0 && canonicalPt.fY > 0);
+        } else {
+            return true;
+        }
+    }
+
+    float dist =  SkScalarSquare(canonicalPt.fX) * SkScalarSquare(fRadii[index].fY) +
+                  SkScalarSquare(canonicalPt.fY) * SkScalarSquare(fRadii[index].fX);
+    return dist <= SkScalarSquare(fRadii[index].fX * fRadii[index].fY);
+}
+
+bool SkRRectPriv::IsNearlySimpleCircular(const SkRRect& rr, float tolerance) {
+    const float simpleRadius = rr.fRadii[0].fX;
+    return SkScalarNearlyEqual(simpleRadius, rr.fRadii[0].fY, tolerance) &&
+           SkScalarNearlyEqual(simpleRadius, rr.fRadii[1].fX, tolerance) &&
+           SkScalarNearlyEqual(simpleRadius, rr.fRadii[1].fY, tolerance) &&
+           SkScalarNearlyEqual(simpleRadius, rr.fRadii[2].fX, tolerance) &&
+           SkScalarNearlyEqual(simpleRadius, rr.fRadii[2].fY, tolerance) &&
+           SkScalarNearlyEqual(simpleRadius, rr.fRadii[3].fX, tolerance) &&
+           SkScalarNearlyEqual(simpleRadius, rr.fRadii[3].fY, tolerance);
+}
+
+bool SkRRectPriv::AllCornersCircular(const SkRRect& rr, float tolerance) {
+    return SkScalarNearlyEqual(rr.fRadii[0].fX, rr.fRadii[0].fY, tolerance) &&
+           SkScalarNearlyEqual(rr.fRadii[1].fX, rr.fRadii[1].fY, tolerance) &&
+           SkScalarNearlyEqual(rr.fRadii[2].fX, rr.fRadii[2].fY, tolerance) &&
+           SkScalarNearlyEqual(rr.fRadii[3].fX, rr.fRadii[3].fY, tolerance);
+}
+
+bool SkRRectPriv::IsRelativelyCircular(float rx, float ry, float tolerance) {
+    return std::abs(rx - ry) <= tolerance * std::max(rx, ry);
+}
+
+bool SkRRectPriv::AllCornersRelativelyCircular(const SkRRect &rr, float tolerance) {
+    return IsRelativelyCircular(rr.fRadii[0].fX, rr.fRadii[0].fY, tolerance) &&
+           IsRelativelyCircular(rr.fRadii[1].fX, rr.fRadii[1].fY, tolerance) &&
+           IsRelativelyCircular(rr.fRadii[2].fX, rr.fRadii[2].fY, tolerance) &&
+           IsRelativelyCircular(rr.fRadii[3].fX, rr.fRadii[3].fY, tolerance);
+}
+
+bool SkRRect::contains(const SkRect& rect) const {
+    if (!this->getBounds().contains(rect)) {
+        return false;
+    }
+
+    if (this->isRect()) {
+        return true;
+    }
+
+    return this->checkCornerContainment(rect.fLeft, rect.fTop) &&
+           this->checkCornerContainment(rect.fRight, rect.fTop) &&
+           this->checkCornerContainment(rect.fRight, rect.fBottom) &&
+           this->checkCornerContainment(rect.fLeft, rect.fBottom);
+}
+
+void SkRRect::computeType() {
+    if (fRect.isEmpty()) {
+        SkASSERT(fRect.isSorted());
+        for (size_t i = 0; i < std::size(fRadii); ++i) {
+            SkASSERT((fRadii[i] == SkVector{0, 0}));
+        }
+        fType = kEmpty_Type;
+        SkASSERT(this->isValid());
+        return;
+    }
+
+    bool allRadiiEqual = true; 
+    bool allCornersSquare = 0 == fRadii[0].fX || 0 == fRadii[0].fY;
+
+    for (int i = 1; i < 4; ++i) {
+        if (0 != fRadii[i].fX && 0 != fRadii[i].fY) {
+            allCornersSquare = false;
+        }
+        if (fRadii[i].fX != fRadii[i-1].fX || fRadii[i].fY != fRadii[i-1].fY) {
+            allRadiiEqual = false;
+        }
+    }
+
+    if (allCornersSquare) {
+        fType = kRect_Type;
+        SkASSERT(this->isValid());
+        return;
+    }
+
+    if (allRadiiEqual) {
+        if (fRadii[0].fX >= SkScalarHalf(fRect.width()) &&
+            fRadii[0].fY >= SkScalarHalf(fRect.height())) {
+            fType = kOval_Type;
+        } else {
+            fType = kSimple_Type;
+        }
+        SkASSERT(this->isValid());
+        return;
+    }
+
+    if (radii_are_nine_patch(fRadii)) {
+        fType = kNinePatch_Type;
+    } else {
+        fType = kComplex_Type;
+    }
+
+    if (!this->isValid()) {
+        this->setRect(this->rect());
+        SkASSERT(this->isValid());
+    }
+}
+
+std::optional<SkRRect> SkRRect::transform(const SkMatrix& matrix) const {
+#if defined(SK_SUPPORT_LEGACY_RRECT_TRANSFORM)
+    SkRRect newrr;
+    if (this->transform(matrix, &newrr)) {
+        return newrr;
+    }
+    return {};
+#else
+    if (matrix.isIdentity()) {
+        return *this;
+    }
+
+    if (!matrix.preservesAxisAlignment()) {
+        return {};
+    }
+
+    const SkRect newRect = matrix.mapRect(fRect);
+    if (!newRect.isFinite()) {
+        return {};
+    }
+
+    switch (this->getType()) {
+        case kEmpty_Type: return MakeEmpty();
+        case kRect_Type:  return MakeRect(newRect);
+        case kOval_Type:  return MakeOval(newRect);
+        default:
+            break;
+    }
+
+    SkPathRawShapes::RRect raw(*this);
+    matrix.mapPoints(raw.fStorage);
+    return SkPathPriv::DeduceRRectFromContour(newRect, raw.fPoints, raw.fVerbs);
+#endif
+}
+
+bool SkRRect::transform(const SkMatrix& matrix, SkRRect* dst) const {
+#if defined(SK_SUPPORT_LEGACY_RRECT_TRANSFORM)
+    if (nullptr == dst) {
+        return false;
+    }
+
+    SkASSERT(dst != this);
+
+    if (matrix.isIdentity()) {
+        *dst = *this;
+        return true;
+    }
+
+    if (!matrix.preservesAxisAlignment()) {
+        return false;
+    }
+
+    SkRect newRect;
+    if (!matrix.mapRect(&newRect, fRect)) {
+        return false;
+    }
+
+    if (!newRect.isFinite() || newRect.isEmpty()) {
+        return false;
+    }
+
+    dst->fRect = newRect;
+
+    dst->fType = fType;
+
+    if (kRect_Type == fType) {
+        SkASSERT(dst->isValid());
+        return true;
+    }
+    if (kOval_Type == fType) {
+        for (int i = 0; i < 4; ++i) {
+            dst->fRadii[i].fX = SkScalarHalf(newRect.width());
+            dst->fRadii[i].fY = SkScalarHalf(newRect.height());
+        }
+        SkASSERT(dst->isValid());
+        return true;
+    }
+
+    SkScalar xScale = matrix.getScaleX();
+    SkScalar yScale = matrix.getScaleY();
+
+    if (!matrix.isScaleTranslate()) {
+        SkASSERT(matrix.getScaleX() == 0.f && matrix.getScaleY() == 0.f &&
+                 matrix.getSkewX() != 0.f && matrix.getSkewY() != 0.f);
+        const bool isClockwise = matrix.getSkewX() < 0;
+
+        yScale = matrix.getSkewY() * (isClockwise ? 1 : -1);
+        xScale = matrix.getSkewX() * (isClockwise ? -1 : 1);
+
+        const int dir = isClockwise ? 3 : 1;
+        for (int i = 0; i < 4; ++i) {
+            const int src = (i + dir) >= 4 ? (i + dir) % 4 : (i + dir);
+            dst->fRadii[i].fX = fRadii[src].fY;
+            dst->fRadii[i].fY = fRadii[src].fX;
+        }
+    } else {
+        for (int i = 0; i < 4; ++i) {
+            dst->fRadii[i].fX = fRadii[i].fX;
+            dst->fRadii[i].fY = fRadii[i].fY;
+        }
+    }
+
+    const bool flipX = xScale < 0;
+    if (flipX) {
+        xScale = -xScale;
+    }
+
+    const bool flipY = yScale < 0;
+    if (flipY) {
+        yScale = -yScale;
+    }
+
+    for (int i = 0; i < 4; ++i) {
+        dst->fRadii[i].fX *= xScale;
+        dst->fRadii[i].fY *= yScale;
+    }
+
+    using std::swap;
+    if (flipX) {
+        if (flipY) {
+            swap(dst->fRadii[kUpperLeft_Corner], dst->fRadii[kLowerRight_Corner]);
+            swap(dst->fRadii[kUpperRight_Corner], dst->fRadii[kLowerLeft_Corner]);
+        } else {
+            swap(dst->fRadii[kUpperRight_Corner], dst->fRadii[kUpperLeft_Corner]);
+            swap(dst->fRadii[kLowerRight_Corner], dst->fRadii[kLowerLeft_Corner]);
+        }
+    } else if (flipY) {
+        swap(dst->fRadii[kUpperLeft_Corner], dst->fRadii[kLowerLeft_Corner]);
+        swap(dst->fRadii[kUpperRight_Corner], dst->fRadii[kLowerRight_Corner]);
+    }
+
+    dst->scaleRadii();
+
+    if (!AreRectAndRadiiValid(dst->fRect, dst->fRadii)) {
+        return false;
+    }
+
+    SkASSERT(dst->isValid());
+    return true;
+#else
+    if (auto rr = this->transform(matrix)) {
+        if (dst) {
+            *dst = *rr;
+        }
+        return true;
+    }
+    return false;
+#endif
+}
+
+
+void SkRRect::inset(SkScalar dx, SkScalar dy, SkRRect* dst) const {
+    SkRect r = fRect.makeInset(dx, dy);
+    bool degenerate = false;
+    if (r.fRight <= r.fLeft) {
+        degenerate = true;
+        r.fLeft = r.fRight = sk_float_midpoint(r.fLeft, r.fRight);
+    }
+    if (r.fBottom <= r.fTop) {
+        degenerate = true;
+        r.fTop = r.fBottom = sk_float_midpoint(r.fTop, r.fBottom);
+    }
+    if (degenerate) {
+        dst->fRect = r;
+        memset(dst->fRadii, 0, sizeof(dst->fRadii));
+        dst->fType = kEmpty_Type;
+        return;
+    }
+    if (!r.isFinite()) {
+        *dst = SkRRect();
+        return;
+    }
+
+    SkVector radii[4];
+    memcpy(radii, fRadii, sizeof(radii));
+    for (int i = 0; i < 4; ++i) {
+        if (radii[i].fX) {
+            radii[i].fX -= dx;
+        }
+        if (radii[i].fY) {
+            radii[i].fY -= dy;
+        }
+    }
+    dst->setRectRadii(r, radii);
+}
+
+
+size_t SkRRect::writeToMemory(void* buffer) const {
+    memcpy(buffer, this, kSizeInMemory);
+    return kSizeInMemory;
+}
+
+void SkRRectPriv::WriteToBuffer(const SkRRect& rr, SkWBuffer* buffer) {
+    buffer->write(&rr, SkRRect::kSizeInMemory);
+}
+
+size_t SkRRect::readFromMemory(const void* buffer, size_t length) {
+    if (length < kSizeInMemory) {
+        return 0;
+    }
+
+
+    SkRRect raw;
+    memcpy((void*)&raw, buffer, kSizeInMemory);
+    this->setRectRadii(raw.fRect, raw.fRadii);
+    return kSizeInMemory;
+}
+
+bool SkRRectPriv::ReadFromBuffer(SkRBuffer* buffer, SkRRect* rr) {
+    if (buffer->available() < SkRRect::kSizeInMemory) {
+        return false;
+    }
+    SkRRect storage;
+    return buffer->read(&storage, SkRRect::kSizeInMemory) &&
+           (rr->readFromMemory(&storage, SkRRect::kSizeInMemory) == SkRRect::kSizeInMemory);
+}
+
+SkString SkRRect::dumpToString(bool asHex) const {
+    SkScalarAsStringType asType = asHex ? kHex_SkScalarAsStringType : kDec_SkScalarAsStringType;
+
+    SkString line = fRect.dumpToString(asHex);
+    line.appendf("\nconst SkPoint corners[] = {\n");
+    for (int i = 0; i < 4; ++i) {
+        SkString strX, strY;
+        SkAppendScalar(&strX, fRadii[i].x(), asType);
+        SkAppendScalar(&strY, fRadii[i].y(), asType);
+        line.appendf("    { %s, %s },", strX.c_str(), strY.c_str());
+        if (asHex) {
+            line.appendf(" /* %f %f */", fRadii[i].x(), fRadii[i].y());
+        }
+        line.append("\n");
+    }
+    line.append("};");
+    return line;
+}
+
+void SkRRect::dump(bool asHex) const { SkDebugf("%s\n", this->dumpToString(asHex).c_str()); }
+
+
+static bool are_radius_check_predicates_valid(SkScalar rad, SkScalar min, SkScalar max) {
+    return (min <= max) && (rad <= max - min) && (min + rad <= max) && (max - rad >= min) &&
+           rad >= 0;
+}
+
+bool SkRRect::isValid() const {
+    if (!AreRectAndRadiiValid(fRect, fRadii)) {
+        return false;
+    }
+
+    bool allRadiiZero = (0 == fRadii[0].fX && 0 == fRadii[0].fY);
+    bool allCornersSquare = (0 == fRadii[0].fX || 0 == fRadii[0].fY);
+    bool allRadiiSame = true;
+
+    for (int i = 1; i < 4; ++i) {
+        if (0 != fRadii[i].fX || 0 != fRadii[i].fY) {
+            allRadiiZero = false;
+        }
+
+        if (fRadii[i].fX != fRadii[i-1].fX || fRadii[i].fY != fRadii[i-1].fY) {
+            allRadiiSame = false;
+        }
+
+        if (0 != fRadii[i].fX && 0 != fRadii[i].fY) {
+            allCornersSquare = false;
+        }
+    }
+    bool patchesOfNine = radii_are_nine_patch(fRadii);
+
+    if (fType < 0 || fType > kLastType) {
+        return false;
+    }
+
+    switch (fType) {
+        case kEmpty_Type:
+            if (!fRect.isEmpty() || !allRadiiZero || !allRadiiSame || !allCornersSquare) {
+                return false;
+            }
+            break;
+        case kRect_Type:
+            if (fRect.isEmpty() || !allRadiiZero || !allRadiiSame || !allCornersSquare) {
+                return false;
+            }
+            break;
+        case kOval_Type:
+            if (fRect.isEmpty() || allRadiiZero || !allRadiiSame || allCornersSquare) {
+                return false;
+            }
+
+            for (int i = 0; i < 4; ++i) {
+                if (!SkScalarNearlyEqual(fRadii[i].fX, SkRectPriv::HalfWidth(fRect)) ||
+                    !SkScalarNearlyEqual(fRadii[i].fY, SkRectPriv::HalfHeight(fRect))) {
+                    return false;
+                }
+            }
+            break;
+        case kSimple_Type:
+            if (fRect.isEmpty() || allRadiiZero || !allRadiiSame || allCornersSquare) {
+                return false;
+            }
+            break;
+        case kNinePatch_Type:
+            if (fRect.isEmpty() || allRadiiZero || allRadiiSame || allCornersSquare ||
+                !patchesOfNine) {
+                return false;
+            }
+            break;
+        case kComplex_Type:
+            if (fRect.isEmpty() || allRadiiZero || allRadiiSame || allCornersSquare ||
+                patchesOfNine) {
+                return false;
+            }
+            break;
+    }
+
+    return true;
+}
+
+bool SkRRect::AreRectAndRadiiValid(const SkRect& rect, const SkVector radii[4]) {
+    if (!rect.isFinite() || !rect.isSorted()) {
+        return false;
+    }
+    for (int i = 0; i < 4; ++i) {
+        if (!are_radius_check_predicates_valid(radii[i].fX, rect.fLeft, rect.fRight) ||
+            !are_radius_check_predicates_valid(radii[i].fY, rect.fTop, rect.fBottom)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+SkRect SkRRectPriv::InnerBounds(const SkRRect& rr) {
+    if (rr.isEmpty() || rr.isRect()) {
+        return rr.rect();
+    }
+
+    SkRect innerBounds = rr.getBounds();
+    SkVector tl = rr.radii(SkRRect::kUpperLeft_Corner);
+    SkVector tr = rr.radii(SkRRect::kUpperRight_Corner);
+    SkVector bl = rr.radii(SkRRect::kLowerLeft_Corner);
+    SkVector br = rr.radii(SkRRect::kLowerRight_Corner);
+
+    SkScalar leftShift   = std::max(tl.fX, bl.fX);
+    SkScalar topShift    = std::max(tl.fY, tr.fY);
+    SkScalar rightShift  = std::max(tr.fX, br.fX);
+    SkScalar bottomShift = std::max(bl.fY, br.fY);
+
+    SkScalar dw = leftShift + rightShift;
+    SkScalar dh = topShift + bottomShift;
+
+    SkScalar horizArea = (innerBounds.width() - dw) * innerBounds.height();
+    SkScalar vertArea = (innerBounds.height() - dh) * innerBounds.width();
+    static constexpr SkScalar kScale = (1.f - SK_ScalarRoot2Over2) + 1e-5f;
+    SkScalar innerArea = (innerBounds.width() - kScale * dw) * (innerBounds.height() - kScale * dh);
+
+    if (horizArea > vertArea && horizArea > innerArea) {
+        innerBounds.fLeft += leftShift;
+        innerBounds.fRight -= rightShift;
+    } else if (vertArea > innerArea) {
+        innerBounds.fTop += topShift;
+        innerBounds.fBottom -= bottomShift;
+    } else if (innerArea > 0.f) {
+        innerBounds.fLeft += kScale * leftShift;
+        innerBounds.fRight -= kScale * rightShift;
+        innerBounds.fTop += kScale * topShift;
+        innerBounds.fBottom -= kScale * bottomShift;
+    } else {
+        return SkRect::MakeEmpty();
+    }
+
+    SkASSERT(innerBounds.isSorted() && !innerBounds.isEmpty());
+    return innerBounds;
+}
+
+SkRRect SkRRectPriv::ConservativeIntersect(const SkRRect& a, const SkRRect& b) {
+    auto getCorner = [](const SkRect& r, SkRRect::Corner corner) -> SkPoint {
+        switch(corner) {
+            case SkRRect::kUpperLeft_Corner:  return {r.fLeft, r.fTop};
+            case SkRRect::kUpperRight_Corner: return {r.fRight, r.fTop};
+            case SkRRect::kLowerLeft_Corner:  return {r.fLeft, r.fBottom};
+            case SkRRect::kLowerRight_Corner: return {r.fRight, r.fBottom};
+            default: SkUNREACHABLE;
+        }
+    };
+    auto insideCorner = [](SkRRect::Corner corner, const SkPoint& a, const SkPoint& b) {
+        switch(corner) {
+            case SkRRect::kUpperLeft_Corner:  return a.fX >= b.fX && a.fY >= b.fY;
+            case SkRRect::kUpperRight_Corner: return a.fX <= b.fX && a.fY >= b.fY;
+            case SkRRect::kLowerRight_Corner: return a.fX <= b.fX && a.fY <= b.fY;
+            case SkRRect::kLowerLeft_Corner:  return a.fX >= b.fX && a.fY <= b.fY;
+            default:  SkUNREACHABLE;
+        }
+    };
+
+    auto getIntersectionRadii = [&](const SkRect& r, SkRRect::Corner corner, SkVector* radii) {
+        SkPoint test = getCorner(r, corner);
+        SkPoint aCorner = getCorner(a.rect(), corner);
+        SkPoint bCorner = getCorner(b.rect(), corner);
+
+        if (test == aCorner && test == bCorner) {
+            SkVector aRadii = a.radii(corner);
+            SkVector bRadii = b.radii(corner);
+            if (aRadii.fX >= bRadii.fX && aRadii.fY >= bRadii.fY) {
+                *radii = aRadii;
+                return true;
+            } else if (bRadii.fX >= aRadii.fX && bRadii.fY >= aRadii.fY) {
+                *radii = bRadii;
+                return true;
+            } else {
+                return false;
+            }
+        } else if (test == aCorner) {
+            *radii = a.radii(corner);
+            if (*radii == b.radii(corner)) {
+                return insideCorner(corner, aCorner, bCorner); 
+            } else {
+                return b.checkCornerContainment(aCorner.fX, aCorner.fY);
+            }
+        } else if (test == bCorner) {
+            *radii = b.radii(corner);
+            if (*radii == a.radii(corner)) {
+                return insideCorner(corner, bCorner, aCorner); 
+            } else {
+                return a.checkCornerContainment(bCorner.fX, bCorner.fY);
+            }
+        } else {
+            *radii = {0.f, 0.f};
+            return a.checkCornerContainment(test.fX, test.fY) &&
+                   b.checkCornerContainment(test.fX, test.fY);
+        }
+    };
+
+    SkRRect intersection;
+    if (!intersection.fRect.intersect(a.rect(), b.rect())) {
+        return SkRRect::MakeEmpty();
+    }
+
+    const SkRRect::Corner corners[] = {
+        SkRRect::kUpperLeft_Corner,
+        SkRRect::kUpperRight_Corner,
+        SkRRect::kLowerRight_Corner,
+        SkRRect::kLowerLeft_Corner
+    };
+    for (auto c : corners) {
+        if (!getIntersectionRadii(intersection.fRect, c, &intersection.fRadii[c])) {
+            return SkRRect::MakeEmpty(); 
+        }
+    }
+
+    if (!SkRRect::AreRectAndRadiiValid(intersection.fRect, intersection.fRadii) ||
+        intersection.scaleRadii()) {
+        return SkRRect::MakeEmpty();
+    }
+
+    intersection.computeType();
+    return intersection;
+}

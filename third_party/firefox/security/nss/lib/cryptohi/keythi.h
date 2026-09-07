@@ -1,0 +1,232 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef _KEYTHI_H_
+#define _KEYTHI_H_ 1
+
+#include "eccutil.h"
+#include "kyber.h"
+#include "ml_dsat.h"
+#include "plarena.h"
+#include "pkcs11t.h"
+#include "secmodt.h"
+#include "prclist.h"
+
+
+typedef enum {
+    nullKey = 0,
+    rsaKey = 1,
+    dsaKey = 2,
+    fortezzaKey = 3, 
+    dhKey = 4,
+    keaKey = 5, 
+    ecKey = 6,
+    rsaPssKey = 7,
+    rsaOaepKey = 8,
+    kyberKey = 9,
+    edKey = 10,
+    ecMontKey = 11,
+    mldsaKey = 12
+} KeyType;
+
+
+SEC_BEGIN_PROTOS
+extern const SEC_ASN1Template SECKEY_RSAPublicKeyTemplate[];
+extern const SEC_ASN1Template SECKEY_RSAPSSParamsTemplate[];
+extern const SEC_ASN1Template SECKEY_DSAPublicKeyTemplate[];
+extern const SEC_ASN1Template SECKEY_DHPublicKeyTemplate[];
+extern const SEC_ASN1Template SECKEY_DHParamKeyTemplate[];
+extern const SEC_ASN1Template SECKEY_PQGParamsTemplate[];
+extern const SEC_ASN1Template SECKEY_DSAPrivateKeyExportTemplate[];
+
+SEC_ASN1_CHOOSER_DECLARE(SECKEY_DSAPublicKeyTemplate)
+SEC_ASN1_CHOOSER_DECLARE(SECKEY_RSAPublicKeyTemplate)
+SEC_ASN1_CHOOSER_DECLARE(SECKEY_RSAPSSParamsTemplate)
+SEC_END_PROTOS
+
+
+struct SECKEYRSAPublicKeyStr {
+    PLArenaPool *arena;
+    SECItem modulus;
+    SECItem publicExponent;
+};
+typedef struct SECKEYRSAPublicKeyStr SECKEYRSAPublicKey;
+
+struct SECKEYRSAPSSParamsStr {
+    SECAlgorithmID *hashAlg;
+    SECAlgorithmID *maskAlg;
+    SECItem saltLength;
+    SECItem trailerField;
+};
+typedef struct SECKEYRSAPSSParamsStr SECKEYRSAPSSParams;
+
+
+struct SECKEYPQGParamsStr {
+    PLArenaPool *arena;
+    SECItem prime;    
+    SECItem subPrime; 
+    SECItem base;     
+};
+typedef struct SECKEYPQGParamsStr SECKEYPQGParams;
+
+struct SECKEYDSAPublicKeyStr {
+    SECKEYPQGParams params;
+    SECItem publicValue;
+};
+typedef struct SECKEYDSAPublicKeyStr SECKEYDSAPublicKey;
+
+struct SECKEYDHParamsStr {
+    PLArenaPool *arena;
+    SECItem prime; 
+    SECItem base;  
+};
+typedef struct SECKEYDHParamsStr SECKEYDHParams;
+
+struct SECKEYDHPublicKeyStr {
+    PLArenaPool *arena;
+    SECItem prime;
+    SECItem base;
+    SECItem publicValue;
+};
+typedef struct SECKEYDHPublicKeyStr SECKEYDHPublicKey;
+
+typedef SECItem SECKEYECParams;
+
+struct SECKEYECPublicKeyStr {
+    SECKEYECParams DEREncodedParams;
+    int size;                 
+    SECItem publicValue;      
+    ECPointEncoding encoding; 
+};
+typedef struct SECKEYECPublicKeyStr SECKEYECPublicKey;
+
+struct SECKEYFortezzaPublicKeyStr {
+    int KEAversion;
+    int DSSversion;
+    unsigned char KMID[8];
+    SECItem clearance;
+    SECItem KEApriviledge;
+    SECItem DSSpriviledge;
+    SECItem KEAKey;
+    SECItem DSSKey;
+    SECKEYPQGParams params;
+    SECKEYPQGParams keaParams;
+};
+typedef struct SECKEYFortezzaPublicKeyStr SECKEYFortezzaPublicKey;
+#define KEAprivilege KEApriviledge /* corrected spelling */
+#define DSSprivilege DSSpriviledge /* corrected spelling */
+
+struct SECKEYDiffPQGParamsStr {
+    SECKEYPQGParams DiffKEAParams;
+    SECKEYPQGParams DiffDSAParams;
+};
+typedef struct SECKEYDiffPQGParamsStr SECKEYDiffPQGParams;
+
+struct SECKEYPQGDualParamsStr {
+    SECKEYPQGParams CommParams;
+    SECKEYDiffPQGParams DiffParams;
+};
+typedef struct SECKEYPQGDualParamsStr SECKEYPQGDualParams;
+
+struct SECKEYKEAParamsStr {
+    PLArenaPool *arena;
+    SECItem hash;
+};
+typedef struct SECKEYKEAParamsStr SECKEYKEAParams;
+
+struct SECKEYKEAPublicKeyStr {
+    SECKEYKEAParams params;
+    SECItem publicValue;
+};
+typedef struct SECKEYKEAPublicKeyStr SECKEYKEAPublicKey;
+
+
+struct SECKEYKyberPublicKeyStr {
+    KyberParams params;
+    SECItem publicValue;
+};
+typedef struct SECKEYKyberPublicKeyStr SECKEYKyberPublicKey;
+
+struct SECKEYMLDSAPublicKeyStr {
+    SECOidTag paramSet;
+    SECItem publicValue;
+};
+typedef struct SECKEYMLDSAPublicKeyStr SECKEYMLDSAPublicKey;
+
+struct SECKEYPublicKeyStr {
+    PLArenaPool *arena;
+    KeyType keyType;
+    PK11SlotInfo *pkcs11Slot;
+    CK_OBJECT_HANDLE pkcs11ID;
+    union {
+        SECKEYRSAPublicKey rsa;
+        SECKEYDSAPublicKey dsa;
+        SECKEYDHPublicKey dh;
+        SECKEYKEAPublicKey kea;
+        SECKEYFortezzaPublicKey fortezza;
+        SECKEYECPublicKey ec;
+        SECKEYKyberPublicKey kyber;
+        SECKEYMLDSAPublicKey mldsa;
+    } u;
+};
+typedef struct SECKEYPublicKeyStr SECKEYPublicKey;
+
+#define SECKEY_Attributes_Cached 0x1 /* bit 0 states \
+                                        whether attributes are cached */
+#define SECKEY_CKA_PRIVATE (1U << 1) /* bit 1 is the value of CKA_PRIVATE */
+#define SECKEY_CKA_ALWAYS_AUTHENTICATE (1U << 2)
+
+#define SECKEY_ATTRIBUTES_CACHED(key) \
+    (0 != (key->staticflags & SECKEY_Attributes_Cached))
+
+#define SECKEY_ATTRIBUTE_VALUE(key, attribute) \
+    (0 != (key->staticflags & SECKEY_##attribute))
+
+#define SECKEY_HAS_ATTRIBUTE_SET(key, attribute) \
+    (0 != (key->staticflags & SECKEY_Attributes_Cached)) ? (0 != (key->staticflags & SECKEY_##attribute)) : PK11_HasAttributeSet(key->pkcs11Slot, key->pkcs11ID, attribute, PR_FALSE)
+
+#define SECKEY_HAS_ATTRIBUTE_SET_LOCK(key, attribute, haslock) \
+    (0 != (key->staticflags & SECKEY_Attributes_Cached)) ? (0 != (key->staticflags & SECKEY_##attribute)) : pk11_HasAttributeSet_Lock(key->pkcs11Slot, key->pkcs11ID, attribute, haslock)
+
+struct SECKEYPrivateKeyStr {
+    PLArenaPool *arena;
+    KeyType keyType;
+    PK11SlotInfo *pkcs11Slot;  
+    CK_OBJECT_HANDLE pkcs11ID; 
+    PRBool pkcs11IsTemp;       
+    void *wincx;               
+    PRUint32 staticflags;      
+};
+typedef struct SECKEYPrivateKeyStr SECKEYPrivateKey;
+
+#define SECKEYPRIVATEKEY_IS_TEMP_FLAG 0x01
+#define SECKEYPRIVATEKEY_IS_OWNED_FLAG 0x02
+#define SECKEYPRIVATEKEY_IS_TEMP(key) \
+    ((PRBool)((key)->pkcs11IsTemp & SECKEYPRIVATEKEY_IS_TEMP_FLAG) == SECKEYPRIVATEKEY_IS_TEMP_FLAG)
+#define SECKEYPRIVATEKEY_IS_OWNED(key) \
+    ((PRBool)((key)->pkcs11IsTemp & SECKEYPRIVATEKEY_IS_OWNED_FLAG) == SECKEYPRIVATEKEY_IS_OWNED_FLAG)
+#define SECKEYPRIVATEKEY_SET_TEMP(key, isTemp) (key)->pkcs11IsTemp = ((key)->pkcs11IsTemp & ~SECKEYPRIVATEKEY_IS_TEMP_FLAG) | \
+                                                                     ((isTemp) ? SECKEYPRIVATEKEY_IS_TEMP_FLAG : 0)
+#define SECKEYPRIVATEKEY_SET_OWNED(key, isOwned) (key)->pkcs11IsTemp = ((key)->pkcs11IsTemp & ~SECKEYPRIVATEKEY_IS_OWNED_FLAG) | \
+                                                                       ((isOwned) ? SECKEYPRIVATEKEY_IS_OWNED_FLAG : 0)
+
+typedef struct {
+    PRCList links;
+    SECKEYPrivateKey *key;
+} SECKEYPrivateKeyListNode;
+
+typedef struct {
+    PRCList list;
+    PLArenaPool *arena;
+} SECKEYPrivateKeyList;
+
+typedef struct {
+    PRCList links;
+    SECKEYPublicKey *key;
+} SECKEYPublicKeyListNode;
+
+typedef struct {
+    PRCList list;
+    PLArenaPool *arena;
+} SECKEYPublicKeyList;
+#endif /* _KEYTHI_H_ */

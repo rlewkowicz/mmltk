@@ -1,0 +1,86 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_ServoComputedData_h
+#define mozilla_ServoComputedData_h
+
+class nsWindowSizes;
+
+#include "mozilla/ServoStyleConsts.h"
+#include "nsStyleStructList.h"
+
+
+namespace mozilla {
+
+enum class PseudoStyleType : uint8_t;
+
+struct ServoWritingMode {
+  uint8_t mBits;
+};
+
+struct ServoComputedCustomProperties {
+  uintptr_t mInherited;
+  uintptr_t mNonInherited;
+};
+
+struct ServoUsedAttributes {
+  uintptr_t mUsedAttributes;
+};
+
+struct ServoRuleNode {
+  uintptr_t mPtr;
+};
+
+class ComputedStyle;
+
+}  
+
+#define FORWARD_STYLE_STRUCT(name_) struct nsStyle##name_;
+FOR_EACH_STYLE_STRUCT(FORWARD_STYLE_STRUCT, FORWARD_STYLE_STRUCT)
+#undef FORWARD_STYLE_STRUCT
+
+class ServoComputedData;
+
+struct ServoComputedDataForgotten {
+  explicit ServoComputedDataForgotten(const ServoComputedData* aValue)
+      : mPtr(aValue) {}
+  const ServoComputedData* mPtr;
+};
+
+class ServoComputedData {
+  friend class mozilla::ComputedStyle;
+
+ public:
+  explicit ServoComputedData(const ServoComputedDataForgotten aValue);
+
+#define SERVO_STYLE_STRUCT_ACCESSOR(name_)                        \
+  const nsStyle##name_* name_;                                    \
+  const nsStyle##name_* Style##name_() const MOZ_NONNULL_RETURN { \
+    return name_;                                                 \
+  }
+  FOR_EACH_STYLE_STRUCT(SERVO_STYLE_STRUCT_ACCESSOR,
+                        SERVO_STYLE_STRUCT_ACCESSOR)
+#undef SERVO_STYLE_STRUCT_ACCESSOR
+
+  void AddSizeOfExcludingThis(nsWindowSizes& aSizes) const;
+
+  mozilla::ServoWritingMode WritingMode() const { return writing_mode; }
+
+ private:
+  mozilla::ServoComputedCustomProperties custom_properties;
+  mozilla::ServoUsedAttributes attribute_references;
+  mozilla::ServoRuleNode rules;
+  const mozilla::ComputedStyle* visited_style;
+  mozilla::ServoWritingMode writing_mode;
+  mozilla::PseudoStyleType pseudo_type;
+  mozilla::StyleZoom effective_zoom;
+  mozilla::StyleComputedValueFlags flags;
+
+  ServoComputedData& operator=(const ServoComputedData&) = delete;
+  ServoComputedData(const ServoComputedData&) = delete;
+  ServoComputedData&& operator=(const ServoComputedData&&) = delete;
+  ServoComputedData(const ServoComputedData&&) = delete;
+};
+
+#endif  // mozilla_ServoComputedData_h

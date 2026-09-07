@@ -1,0 +1,236 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_textcompositionsynthesizer_h_
+#define mozilla_textcompositionsynthesizer_h_
+
+#include "mozilla/RefPtr.h"
+#include "nsString.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/EventForwards.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/TextEventDispatcherListener.h"
+#include "mozilla/TextRange.h"
+#include "mozilla/widget/IMEData.h"
+#include "WritingModes.h"
+
+class nsIWidget;
+
+namespace mozilla {
+namespace widget {
+
+class PuppetWidget;
+
+
+class TextEventDispatcher final {
+  ~TextEventDispatcher() = default;
+
+  NS_INLINE_DECL_REFCOUNTING(TextEventDispatcher)
+
+ public:
+  explicit TextEventDispatcher(nsIWidget* aWidget);
+
+  nsresult BeginInputTransaction(TextEventDispatcherListener* aListener);
+  nsresult BeginTestInputTransaction(TextEventDispatcherListener* aListener,
+                                     bool aIsAPZAware);
+  nsresult BeginNativeInputTransaction();
+
+  nsresult BeginInputTransactionFor(const WidgetGUIEvent* aEvent,
+                                    PuppetWidget* aPuppetWidget);
+
+  MOZ_CAN_RUN_SCRIPT void EndInputTransaction(
+      TextEventDispatcherListener* aListener);
+
+  void OnDestroyWidget();
+
+  nsIWidget* GetWidget() const { return mWidget; }
+
+  bool HasFocus() const { return mHasFocus; }
+
+  const IMENotificationRequests& IMENotificationRequestsRef() const {
+    return mIMENotificationRequests;
+  }
+
+  void OnWidgetChangeIMENotificationRequests(nsIWidget* aWidget) {
+    MOZ_ASSERT(aWidget);
+    if (mWidget == aWidget) {
+      UpdateNotificationRequests();
+    }
+  }
+
+  nsresult GetState() const;
+
+  bool IsComposing() const { return mIsComposing; }
+
+  bool IsHandlingComposition() const { return mIsHandlingComposition; }
+
+  bool IsInNativeInputTransaction() const {
+    return mInputTransactionType == eNativeInputTransaction;
+  }
+
+  bool IsDispatchingEvent() const { return mDispatchingEvent > 0; }
+
+  void* GetPseudoIMEContext() const {
+    if (mInputTransactionType == eNoInputTransaction ||
+        mInputTransactionType == eNativeInputTransaction) {
+      return nullptr;
+    }
+    return const_cast<TextEventDispatcher*>(this);
+  }
+
+  const Maybe<WritingMode>& MaybeWritingModeRefAtSelection() const {
+    return mWritingMode;
+  }
+
+  MOZ_CAN_RUN_SCRIPT Maybe<WritingMode> MaybeQueryWritingModeAtSelection()
+      const;
+
+  nsresult StartComposition(nsEventStatus& aStatus,
+                            const WidgetEventTime* aEventTime = nullptr);
+
+  nsresult CommitComposition(nsEventStatus& aStatus,
+                             const nsAString* aCommitString = nullptr,
+                             const WidgetEventTime* aEventTime = nullptr);
+
+  nsresult SetPendingCompositionString(const nsAString& aString) {
+    return mPendingComposition.SetString(aString);
+  }
+
+  nsresult AppendClauseToPendingComposition(uint32_t aLength,
+                                            TextRangeType aTextRangeType) {
+    return mPendingComposition.AppendClause(aLength, aTextRangeType);
+  }
+
+  nsresult SetCaretInPendingComposition(uint32_t aOffset, uint32_t aLength) {
+    return mPendingComposition.SetCaret(aOffset, aLength);
+  }
+
+  nsresult SetPendingComposition(const nsAString& aString,
+                                 const TextRangeArray* aRanges) {
+    return mPendingComposition.Set(aString, aRanges);
+  }
+
+  nsresult FlushPendingComposition(
+      nsEventStatus& aStatus, const WidgetEventTime* aEventTime = nullptr) {
+    return mPendingComposition.Flush(this, aStatus, aEventTime);
+  }
+
+  void ClearPendingComposition() { mPendingComposition.Clear(); }
+
+  const TextRangeArray* GetPendingCompositionClauses() const {
+    return mPendingComposition.GetClauses();
+  }
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY nsresult
+  NotifyIME(const IMENotification& aIMENotification);
+
+  bool DispatchKeyboardEvent(EventMessage aMessage,
+                             const WidgetKeyboardEvent& aKeyboardEvent,
+                             nsEventStatus& aStatus, void* aData = nullptr);
+
+  bool MaybeDispatchKeypressEvents(const WidgetKeyboardEvent& aKeyboardEvent,
+                                   nsEventStatus& aStatus,
+                                   void* aData = nullptr,
+                                   bool aNeedsCallback = false);
+
+ private:
+  nsIWidget* mWidget;
+  nsWeakPtr mListener;
+  IMENotificationRequests mIMENotificationRequests;
+  Maybe<WritingMode> mWritingMode;
+
+  class PendingComposition {
+   public:
+    PendingComposition();
+    nsresult SetString(const nsAString& aString);
+    nsresult AppendClause(uint32_t aLength, TextRangeType aTextRangeType);
+    nsresult SetCaret(uint32_t aOffset, uint32_t aLength);
+    nsresult Set(const nsAString& aString, const TextRangeArray* aRanges);
+    nsresult Flush(TextEventDispatcher* aDispatcher, nsEventStatus& aStatus,
+                   const WidgetEventTime* aEventTime);
+    const TextRangeArray* GetClauses() const { return mClauses; }
+    void Clear();
+
+   private:
+    nsString mString;
+    RefPtr<TextRangeArray> mClauses;
+    TextRange mCaret;
+    bool mReplacedNativeLineBreakers;
+
+    void EnsureClauseArray();
+
+    void ReplaceNativeLineBreakers();
+
+    static void AdjustRange(TextRange& aRange, const nsAString& aNativeString);
+  };
+  PendingComposition mPendingComposition;
+
+  uint16_t mDispatchingEvent;
+
+  enum InputTransactionType : uint8_t {
+    eNoInputTransaction,
+    eNativeInputTransaction,
+    eAsyncTestInputTransaction,
+    eSameProcessSyncTestInputTransaction,
+    eSameProcessSyncInputTransaction
+  };
+
+  InputTransactionType mInputTransactionType;
+
+  bool IsForTests() const {
+    return mInputTransactionType == eAsyncTestInputTransaction ||
+           mInputTransactionType == eSameProcessSyncTestInputTransaction;
+  }
+
+  bool ShouldSendInputEventToAPZ() const {
+    switch (mInputTransactionType) {
+      case eNativeInputTransaction:
+      case eAsyncTestInputTransaction:
+        return true;
+      case eSameProcessSyncTestInputTransaction:
+      case eSameProcessSyncInputTransaction:
+        return false;
+      case eNoInputTransaction:
+        NS_WARNING(
+            "Why does the caller need to dispatch an event when "
+            "there is no input transaction?");
+        return true;
+      default:
+        MOZ_CRASH("Define the behavior of new InputTransactionType");
+    }
+  }
+
+  bool mIsComposing;
+
+  bool mIsHandlingComposition;
+
+  bool mHasFocus;
+
+  nsresult BeginInputTransactionInternal(TextEventDispatcherListener* aListener,
+                                         InputTransactionType aType);
+
+  void InitEvent(WidgetGUIEvent& aEvent) const;
+
+  nsEventStatus DispatchEvent(nsIWidget* aWidget, WidgetGUIEvent& aEvent);
+
+  nsEventStatus DispatchInputEvent(nsIWidget* aWidget,
+                                   WidgetInputEvent& aEvent);
+
+  nsresult StartCompositionAutomaticallyIfNecessary(
+      nsEventStatus& aStatus, const WidgetEventTime* aEventTime);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY bool DispatchKeyboardEventInternal(
+      EventMessage aMessage, const WidgetKeyboardEvent& aKeyboardEvent,
+      nsEventStatus& aStatus, void* aData, uint32_t aIndexOfKeypress = 0,
+      bool aNeedsCallback = false);
+
+  void ClearNotificationRequests();
+
+  void UpdateNotificationRequests();
+};
+
+}  
+}  
+
+#endif  // #ifndef mozilla_widget_textcompositionsynthesizer_h_

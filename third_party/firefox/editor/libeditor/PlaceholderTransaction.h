@@ -1,0 +1,76 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef PlaceholderTransaction_h
+#define PlaceholderTransaction_h
+
+#include "EditAggregateTransaction.h"
+#include "EditorForwards.h"
+#include "SelectionState.h"
+
+#include "mozilla/Maybe.h"
+#include "mozilla/WeakPtr.h"
+
+namespace mozilla {
+
+
+class PlaceholderTransaction final : public EditAggregateTransaction,
+                                     public SupportsWeakPtr {
+ protected:
+  PlaceholderTransaction(EditorBase& aEditorBase, nsStaticAtom& aName,
+                         Maybe<SelectionState>&& aSelState);
+
+ public:
+  static already_AddRefed<PlaceholderTransaction> Create(
+      EditorBase& aEditorBase, nsStaticAtom& aName,
+      Maybe<SelectionState>&& aSelState) {
+    Maybe<SelectionState> selState(std::move(aSelState));
+    RefPtr<PlaceholderTransaction> transaction =
+        new PlaceholderTransaction(aEditorBase, aName, std::move(selState));
+    return transaction.forget();
+  }
+
+  NS_DECL_ISUPPORTS_INHERITED
+
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(PlaceholderTransaction,
+                                           EditAggregateTransaction)
+
+  NS_DECL_EDITTRANSACTIONBASE
+  NS_DECL_EDITTRANSACTIONBASE_GETASMETHODS_OVERRIDE(PlaceholderTransaction)
+
+  MOZ_CAN_RUN_SCRIPT NS_IMETHOD RedoTransaction() override;
+  NS_IMETHOD Merge(nsITransaction* aTransaction, bool* aDidMerge) override;
+
+  void AppendChild(EditTransactionBase& aTransaction);
+
+  nsresult EndPlaceHolderBatch();
+
+  void ForwardEndBatchTo(PlaceholderTransaction& aForwardingTransaction) {
+    mForwardingTransaction = &aForwardingTransaction;
+  }
+
+  void Commit() { mCommitted = true; }
+
+  nsresult RememberEndingSelection();
+
+ protected:
+  virtual ~PlaceholderTransaction() = default;
+
+  RefPtr<EditorBase> mEditorBase;
+
+  WeakPtr<PlaceholderTransaction> mForwardingTransaction;
+
+  WeakPtr<CompositionTransaction> mCompositionTransaction;
+
+
+  SelectionState mStartSel;
+  SelectionState mEndSel;
+
+  bool mAbsorb;
+  bool mCommitted;
+};
+
+}  
+
+#endif  // #ifndef PlaceholderTransaction_h

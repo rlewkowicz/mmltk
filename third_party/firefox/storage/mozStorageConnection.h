@@ -1,0 +1,237 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_storage_Connection_h
+#define mozilla_storage_Connection_h
+
+#include "nsCOMPtr.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/Mutex.h"
+#include "nsIPrefBranch.h"
+#include "nsProxyRelease.h"
+#include "nsThreadUtils.h"
+#include "nsIInterfaceRequestor.h"
+
+#include "nsTHashMap.h"
+#include "nsTHashSet.h"
+#include "mozIStorageProgressHandler.h"
+#include "SQLiteMutex.h"
+#include "mozIStorageConnection.h"
+#include "mozStorageService.h"
+#include "mozIStorageAsyncConnection.h"
+#include "mozIStorageCompletionCallback.h"
+
+#include "mozilla/Attributes.h"
+
+#include "sqlite3.h"
+
+class nsIFile;
+class nsIFileURL;
+class nsIEventTarget;
+class nsISerialEventTarget;
+class nsIThread;
+
+namespace mozilla::storage {
+
+class Connection final : public mozIStorageConnection,
+                         public nsIInterfaceRequestor {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_MOZISTORAGEASYNCCONNECTION
+  NS_DECL_MOZISTORAGECONNECTION
+  NS_DECL_NSIINTERFACEREQUESTOR
+
+  enum ConnectionOperation { ASYNCHRONOUS, SYNCHRONOUS };
+
+  struct FunctionInfo {
+    nsCOMPtr<mozIStorageFunction> function;
+    int32_t numArgs;
+  };
+
+  Connection(Service* aService, int aFlags,
+             ConnectionOperation aSupportedOperations,
+             const nsCString& aTelemetryFilename, bool aInterruptible = false,
+             bool aIgnoreLockingMode = false, bool aOpenNotExclusive = false);
+
+  nsresult initialize(const nsACString& aStorageKey, const nsACString& aName);
+
+  nsresult initialize(nsIFile* aDatabaseFile);
+
+  nsresult initialize(nsIFileURL* aFileURL);
+
+  nsresult initializeSecure(nsIFile* aDatabaseFile);
+
+  nsresult initializeOnAsyncThread(nsIFile* aStorageFile);
+
+  int32_t getSqliteRuntimeStatus(int32_t aStatusOption,
+                                 int32_t* aMaxValue = nullptr);
+  void setCommitHook(int (*aCallbackFn)(void*), void* aData = nullptr) {
+    MOZ_ASSERT(mDBConn, "A connection must exist at this point");
+    ::sqlite3_commit_hook(mDBConn, aCallbackFn, aData);
+  };
+
+  bool getAutocommit() {
+    return mDBConn && static_cast<bool>(::sqlite3_get_autocommit(mDBConn));
+  };
+
+  nsIEventTarget* getAsyncExecutionTarget();
+
+  Mutex sharedAsyncExecutionMutex MOZ_UNANNOTATED;
+
+  SQLiteMutex sharedDBMutex;
+
+  const nsCOMPtr<nsISerialEventTarget> eventTargetOpenedOn;
+
+  nsresult internalClose(sqlite3* aNativeconnection);
+
+  void shutdownAsyncThread();
+
+  nsCString getFilename();
+
+  int prepareStatement(sqlite3* aNativeConnection, const nsCString& aSQL,
+                       sqlite3_stmt** _stmt);
+
+  int stepStatement(sqlite3* aNativeConnection, sqlite3_stmt* aStatement);
+
+  nsresult beginTransactionInternal(
+      const SQLiteMutexAutoLock& aProofOfLock, sqlite3* aNativeConnection,
+      int32_t aTransactionType = TRANSACTION_DEFERRED);
+  nsresult commitTransactionInternal(const SQLiteMutexAutoLock& aProofOfLock,
+                                     sqlite3* aNativeConnection);
+  nsresult rollbackTransactionInternal(const SQLiteMutexAutoLock& aProofOfLock,
+                                       sqlite3* aNativeConnection);
+
+  inline bool connectionReady() { return mDBConn != nullptr; }
+
+  inline bool transactionInProgress(const SQLiteMutexAutoLock& aProofOfLock,
+                                    sqlite3* aNativeConnection) {
+    return aNativeConnection &&
+           !static_cast<bool>(::sqlite3_get_autocommit(aNativeConnection));
+  }
+  inline bool transactionInProgress(const SQLiteMutexAutoLock& aProofOfLock) {
+    return transactionInProgress(aProofOfLock, mDBConn);
+  }
+
+  bool operationSupported(ConnectionOperation aOperationType);
+
+  bool isConnectionReadyOnThisThread();
+
+  bool isClosing();
+
+  bool isClosed();
+
+  bool isClosed(MutexAutoLock& lock);
+
+  bool isAsyncExecutionThreadAvailable();
+
+  nsresult initializeClone(Connection* aClone, bool aReadOnly);
+
+
+  int32_t RemovablePagesInFreeList(const nsACString& aSchemaName);
+
+  Atomic<bool> mIsStatementOnHelperThreadInterruptible;
+
+ private:
+  ~Connection();
+  nsresult initializeInternal();
+  void initializeFailed();
+
+
+  nsresult setClosedState();
+
+  int executeSql(sqlite3* aNativeConnection, const char* aSqlString);
+
+  enum DatabaseElementType { INDEX, TABLE };
+
+  nsresult databaseElementExists(enum DatabaseElementType aElementType,
+                                 const nsACString& aElementName, bool* _exists);
+
+  bool findFunctionByInstance(mozIStorageFunction* aInstance);
+
+  static int sProgressHelper(void* aArg);
+  int progressHandler();
+
+  nsresult ensureOperationSupported(ConnectionOperation aOperationType);
+
+  sqlite3* mDBConn;
+  nsCString mStorageKey;
+  nsCString mName;
+  nsCOMPtr<nsIFileURL> mFileURL;
+  nsCOMPtr<nsIFile> mDatabaseFile;
+
+  nsCOMPtr<nsIThread> mAsyncExecutionThread;
+
+  nsCString mTelemetryFilename;
+
+  mozilla::Atomic<int32_t> mDefaultTransactionType;
+
+  mozilla::Atomic<bool> mDestroying;
+
+  nsTHashMap<nsCStringHashKey, FunctionInfo> mFunctions;
+
+  nsCOMPtr<mozIStorageProgressHandler> mProgressHandler;
+
+  RefPtr<Service> mStorageService;
+
+  nsresult synchronousClose();
+
+  const int mFlags;
+
+  uint32_t mTransactionNestingLevel;
+
+  const ConnectionOperation mSupportedOperations;
+
+  const bool mInterruptible;
+
+  const bool mIgnoreLockingMode;
+
+  const bool mOpenNotExclusive;
+
+  bool mAsyncExecutionThreadShuttingDown;
+
+  bool mConnectionClosed;
+
+  bool mDatabaseEncrypted;
+
+  int32_t mPageSize;
+
+  void SetDatabaseEncrypted(bool aEncrypted);
+
+  Atomic<int32_t> mGrowthChunkSize;
+
+  nsTHashSet<nsCString> mLoadedExtensions
+      MOZ_GUARDED_BY(sharedAsyncExecutionMutex);
+};
+
+class CallbackComplete final : public Runnable {
+ public:
+  CallbackComplete(nsresult aStatus, nsISupports* aValue,
+                   already_AddRefed<mozIStorageCompletionCallback> aCallback)
+      : Runnable("storage::CallbackComplete"),
+        mStatus(aStatus),
+        mValue(aValue),
+        mCallback(aCallback) {}
+
+  NS_IMETHOD Run() override {
+    MOZ_ASSERT(NS_IsMainThread());
+    nsresult rv = mCallback->Complete(mStatus, mValue);
+
+    mValue = nullptr;
+    mCallback = nullptr;
+    return rv;
+  }
+
+ private:
+  nsresult mStatus;
+  nsCOMPtr<nsISupports> mValue;
+  RefPtr<mozIStorageCompletionCallback> mCallback;
+};
+
+}  
+
+inline nsISupports* ToSupports(mozilla::storage::Connection* p) {
+  return NS_ISUPPORTS_CAST(mozIStorageAsyncConnection*, p);
+}
+
+#endif  // mozilla_storage_Connection_h

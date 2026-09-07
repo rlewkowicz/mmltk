@@ -1,0 +1,39 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_dom_UnionMember_h
+#define mozilla_dom_UnionMember_h
+
+#include <utility>
+
+#include "mozilla/Alignment.h"
+#include "mozilla/Attributes.h"
+
+namespace mozilla::dom {
+
+template <class T>
+class UnionMember {
+  AlignedStorage2<T> mStorage;
+
+  UnionMember(const UnionMember&) = delete;
+
+ public:
+  UnionMember() = default;
+  ~UnionMember() = default;
+
+  template <typename... Args>
+  T& SetValue(Args&&... args) {
+    new (mStorage.addr()) T(std::forward<Args>(args)...);
+    return *mStorage.addr();
+  }
+
+  T& Value() { return *mStorage.addr(); }
+  const T& Value() const { return *mStorage.addr(); }
+  void Destroy() { mStorage.addr()->~T(); }
+} MOZ_INHERIT_TYPE_ANNOTATIONS_FROM_TEMPLATE_ARGS;
+
+}  
+
+#endif  // mozilla_dom_UnionMember_h

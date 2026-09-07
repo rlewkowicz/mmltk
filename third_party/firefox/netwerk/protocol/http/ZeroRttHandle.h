@@ -1,0 +1,74 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef ZeroRttHandle_h_
+#define ZeroRttHandle_h_
+
+#include "mozilla/Maybe.h"
+#include "nsIWeakReferenceUtils.h"
+#include "nsISupportsImpl.h"
+#include "nscore.h"
+
+namespace mozilla::net {
+
+class HappyEyeballsConnectionAttempt;
+class HappyEyeballsTransaction;
+class nsAHttpSegmentReader;
+class nsHttpTransaction;
+
+class ZeroRttHandle {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(ZeroRttHandle)
+
+  explicit ZeroRttHandle(HappyEyeballsConnectionAttempt* aHet);
+
+  bool Do0RTT(HappyEyeballsTransaction* aCaller, bool aCanSendEarlyData);
+
+  nsresult ReadSegments(mozilla::Maybe<uint64_t>& aOffset,
+                        nsAHttpSegmentReader* aReader, uint32_t aCount,
+                        uint32_t* aCountRead);
+
+  nsresult Finish0RTT(HappyEyeballsTransaction* aCaller, bool aRestart,
+                      bool aAlpnChanged);
+
+  bool ShouldDisqualify(const HappyEyeballsTransaction* aCaller) const;
+
+  bool AnyStarted() const { return mAny0RttStarted; }
+
+  bool HadWinner() const { return mHadWinner; }
+
+  nsHttpTransaction* RealTxn() const;
+
+  void SetAnyStartedForTesting() { mAny0RttStarted = true; }
+
+  void Cleanup();
+
+ private:
+  ~ZeroRttHandle() = default;
+
+  enum class State : uint8_t {
+    Open,
+    WinnerDeclared,
+    CleanedUp,
+  };
+
+  void Transition(State aNext, HappyEyeballsTransaction* aWinner = nullptr,
+                  bool aRejected = false);
+
+  nsWeakPtr mHet;
+
+  RefPtr<HappyEyeballsTransaction> mWinner;
+
+  bool mHadWinner = false;
+
+  bool mAny0RttStarted = false;
+
+  bool mRejected = false;
+
+  State mState = State::Open;
+};
+
+}  
+
+#endif

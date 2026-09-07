@@ -1,0 +1,251 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/HTMLObjectElement.h"
+
+#include "mozilla/dom/BindContext.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/ElementInlines.h"
+#include "mozilla/dom/HTMLObjectElementBinding.h"
+#include "mozilla/dom/WindowProxyHolder.h"
+#include "nsAttrValueInlines.h"
+#include "nsContentUtils.h"
+#include "nsError.h"
+#include "nsGkAtoms.h"
+#include "nsIContentInlines.h"
+#include "nsIWidget.h"
+#include "nsPIDOMWindowInlines.h"
+
+namespace mozilla::dom {
+
+HTMLObjectElement::HTMLObjectElement(
+    already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo, FromParser aFromParser)
+    : nsGenericHTMLFormControlElement(std::move(aNodeInfo),
+                                      FormControlType::Object),
+      mIsDoneAddingChildren(!aFromParser) {
+  SetIsNetworkCreated(aFromParser == FROM_PARSER_NETWORK);
+
+  SetBarredFromConstraintValidation(true);
+}
+
+HTMLObjectElement::~HTMLObjectElement() = default;
+
+bool HTMLObjectElement::IsInteractiveHTMLContent() const {
+  return HasAttr(nsGkAtoms::usemap) ||
+         nsGenericHTMLFormControlElement::IsInteractiveHTMLContent();
+}
+
+void HTMLObjectElement::DoneAddingChildren(bool aHaveNotified) {
+  mIsDoneAddingChildren = true;
+
+  if (IsInComposedDoc()) {
+    StartObjectLoad(aHaveNotified, false);
+  }
+}
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(HTMLObjectElement)
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(
+    HTMLObjectElement, nsGenericHTMLFormControlElement)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mValidity)
+  nsObjectLoadingContent::Traverse(tmp, cb);
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_INHERITED(HTMLObjectElement,
+                                                nsGenericHTMLFormControlElement)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mValidity)
+  nsObjectLoadingContent::Unlink(tmp);
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_ISUPPORTS_CYCLE_COLLECTION_INHERITED(
+    HTMLObjectElement, nsGenericHTMLFormControlElement, nsIRequestObserver,
+    nsIStreamListener, nsFrameLoaderOwner, nsIObjectLoadingContent,
+    nsIChannelEventSink, nsIConstraintValidation)
+
+NS_IMPL_ELEMENT_CLONE(HTMLObjectElement)
+
+nsresult HTMLObjectElement::BindToTree(BindContext& aContext,
+                                       nsINode& aParent) {
+  nsresult rv = nsGenericHTMLFormControlElement::BindToTree(aContext, aParent);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (IsInComposedDoc() && mIsDoneAddingChildren) {
+    void (HTMLObjectElement::*start)() = &HTMLObjectElement::StartObjectLoad;
+    nsContentUtils::AddScriptRunner(
+        NewRunnableMethod("dom::HTMLObjectElement::BindToTree", this, start));
+  }
+
+  return NS_OK;
+}
+
+void HTMLObjectElement::UnbindFromTree(UnbindContext& aContext) {
+  nsObjectLoadingContent::UnbindFromTree();
+  nsGenericHTMLFormControlElement::UnbindFromTree(aContext);
+}
+
+void HTMLObjectElement::AfterSetAttr(int32_t aNamespaceID, nsAtom* aName,
+                                     const nsAttrValue* aValue,
+                                     const nsAttrValue* aOldValue,
+                                     nsIPrincipal* aSubjectPrincipal,
+                                     bool aNotify) {
+  AfterMaybeChangeAttr(aNamespaceID, aName, aNotify);
+
+  if (aName == nsGkAtoms::data) {
+    RefreshFeaturePolicy();
+  }
+
+  return nsGenericHTMLFormControlElement::AfterSetAttr(
+      aNamespaceID, aName, aValue, aOldValue, aSubjectPrincipal, aNotify);
+}
+
+void HTMLObjectElement::OnAttrSetButNotChanged(
+    int32_t aNamespaceID, nsAtom* aName, const nsAttrValueOrString& aValue,
+    bool aNotify) {
+  AfterMaybeChangeAttr(aNamespaceID, aName, aNotify);
+  return nsGenericHTMLFormControlElement::OnAttrSetButNotChanged(
+      aNamespaceID, aName, aValue, aNotify);
+}
+
+void HTMLObjectElement::AfterMaybeChangeAttr(int32_t aNamespaceID,
+                                             nsAtom* aName, bool aNotify) {
+  if (aNamespaceID != kNameSpaceID_None || aName != nsGkAtoms::data ||
+      !aNotify || !IsInComposedDoc() || !mIsDoneAddingChildren ||
+      BlockEmbedOrObjectContentLoading()) {
+    return;
+  }
+
+  nsContentUtils::AddScriptRunner(NS_NewRunnableFunction(
+      "HTMLObjectElement::LoadObject",
+      [self = RefPtr<HTMLObjectElement>(this), aNotify]() {
+        if (self->IsInComposedDoc()) {
+          self->LoadObject(aNotify, true);
+        }
+      }));
+}
+
+bool HTMLObjectElement::IsHTMLFocusable(IsFocusableFlags aFlags,
+                                        bool* aIsFocusable,
+                                        int32_t* aTabIndex) {
+  Document* doc = GetComposedDoc();
+  if (!doc || IsInDesignMode()) {
+    if (aTabIndex) {
+      *aTabIndex = -1;
+    }
+
+    *aIsFocusable = false;
+    return false;
+  }
+
+  const nsAttrValue* attrVal = mAttrs.GetAttr(nsGkAtoms::tabindex);
+  bool isFocusable = attrVal && attrVal->Type() == nsAttrValue::eInteger;
+
+  if (IsEditingHost() || Type() == ObjectType::Document) {
+    if (aTabIndex) {
+      *aTabIndex = isFocusable ? attrVal->GetIntegerValue() : 0;
+    }
+
+    *aIsFocusable = true;
+    return false;
+  }
+
+  if (aTabIndex && isFocusable) {
+    *aTabIndex = attrVal->GetIntegerValue();
+    *aIsFocusable = true;
+  }
+
+  return false;
+}
+
+int32_t HTMLObjectElement::TabIndexDefault() { return 0; }
+
+Nullable<WindowProxyHolder> HTMLObjectElement::GetContentWindow(
+    nsIPrincipal& aSubjectPrincipal) {
+  Document* doc = GetContentDocument(aSubjectPrincipal);
+  if (doc) {
+    nsPIDOMWindowOuter* win = doc->GetWindow();
+    if (win) {
+      return WindowProxyHolder(win->GetBrowsingContext());
+    }
+  }
+
+  return nullptr;
+}
+
+bool HTMLObjectElement::ParseAttribute(int32_t aNamespaceID, nsAtom* aAttribute,
+                                       const nsAString& aValue,
+                                       nsIPrincipal* aMaybeScriptedPrincipal,
+                                       nsAttrValue& aResult) {
+  if (aNamespaceID == kNameSpaceID_None) {
+    if (aAttribute == nsGkAtoms::align) {
+      return ParseAlignValue(aValue, aResult);
+    }
+    if (ParseImageAttribute(aAttribute, aValue, aResult)) {
+      return true;
+    }
+  }
+
+  return nsGenericHTMLFormControlElement::ParseAttribute(
+      aNamespaceID, aAttribute, aValue, aMaybeScriptedPrincipal, aResult);
+}
+
+void HTMLObjectElement::MapAttributesIntoRule(
+    MappedDeclarationsBuilder& aBuilder) {
+  MapImageAlignAttributeInto(aBuilder);
+  MapImageBorderAttributeInto(aBuilder);
+  MapImageMarginAttributeInto(aBuilder);
+  MapImageSizeAttributesInto(aBuilder);
+  MapCommonAttributesInto(aBuilder);
+}
+
+NS_IMETHODIMP_(bool)
+HTMLObjectElement::IsAttributeMapped(const nsAtom* aAttribute) const {
+  static const MappedAttributeEntry* const map[] = {
+      sCommonAttributeMap,
+      sImageMarginSizeAttributeMap,
+      sImageBorderAttributeMap,
+      sImageAlignAttributeMap,
+  };
+
+  return FindAttributeDependence(aAttribute, map);
+}
+
+nsMapRuleToAttributesFunc HTMLObjectElement::GetAttributeMappingFunction()
+    const {
+  return &MapAttributesIntoRule;
+}
+
+void HTMLObjectElement::StartObjectLoad(bool aNotify, bool aForce) {
+  if (!IsInComposedDoc() || !OwnerDoc()->IsActive() ||
+      BlockEmbedOrObjectContentLoading()) {
+    return;
+  }
+
+  LoadObject(aNotify, aForce);
+  SetIsNetworkCreated(false);
+}
+
+uint32_t HTMLObjectElement::GetCapabilities() const {
+  return nsObjectLoadingContent::GetCapabilities() | eFallbackIfClassIDPresent;
+}
+
+void HTMLObjectElement::DestroyContent() {
+  nsObjectLoadingContent::Destroy();
+  nsGenericHTMLFormControlElement::DestroyContent();
+}
+
+nsresult HTMLObjectElement::CopyInnerTo(Element* aDest) {
+  nsresult rv = nsGenericHTMLFormControlElement::CopyInnerTo(aDest);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return rv;
+}
+
+JSObject* HTMLObjectElement::WrapNode(JSContext* aCx,
+                                      JS::Handle<JSObject*> aGivenProto) {
+  return HTMLObjectElement_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+}  
+
+NS_IMPL_NS_NEW_HTML_ELEMENT_CHECK_PARSER(Object)

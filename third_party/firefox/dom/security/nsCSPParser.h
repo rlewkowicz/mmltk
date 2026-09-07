@@ -1,0 +1,168 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsCSPParser_h_
+#define nsCSPParser_h_
+
+#include "PolicyTokenizer.h"
+#include "nsCSPContext.h"
+#include "nsCSPUtils.h"
+#include "nsIURI.h"
+
+bool isNumberToken(char16_t aSymbol);
+bool isValidHexDig(char16_t aHexDig);
+
+// clang-format off
+const char16_t COLON        = ':';
+const char16_t SEMICOLON    = ';';
+const char16_t SLASH        = '/';
+const char16_t PLUS         = '+';
+const char16_t DASH         = '-';
+const char16_t DOT          = '.';
+const char16_t UNDERLINE    = '_';
+const char16_t TILDE        = '~';
+const char16_t WILDCARD     = '*';
+const char16_t SINGLEQUOTE  = '\'';
+const char16_t NUMBER_SIGN  = '#';
+const char16_t QUESTIONMARK = '?';
+const char16_t PERCENT_SIGN = '%';
+const char16_t EXCLAMATION  = '!';
+const char16_t DOLLAR       = '$';
+const char16_t AMPERSAND    = '&';
+const char16_t OPENBRACE    = '(';
+const char16_t CLOSINGBRACE = ')';
+const char16_t EQUALS       = '=';
+const char16_t ATSYMBOL     = '@';
+// clang-format on
+
+class nsCSPParser {
+ public:
+  static nsCSPPolicy* parseContentSecurityPolicy(const nsAString& aPolicyString,
+                                                 nsIURI* aSelfURI,
+                                                 bool aReportOnly,
+                                                 nsCSPContext* aCSPContext,
+                                                 bool aDeliveredViaMetaTag,
+                                                 bool aSuppressLogMessages);
+
+  static bool isValidBase64Value(const nsAString& aValue);
+
+ private:
+  nsCSPParser(policyTokens& aTokens, nsIURI* aSelfURI,
+              nsCSPContext* aCSPContext, bool aDeliveredViaMetaTag,
+              bool aSuppressLogMessages);
+
+  ~nsCSPParser();
+
+  nsCSPPolicy* policy();
+  void directive();
+  nsCSPDirective* directiveName();
+  void directiveValue(nsTArray<nsCSPBaseSrc*>& outSrcs);
+  void referrerDirectiveValue(nsCSPDirective* aDir);
+  void reportURIList(nsCSPDirective* aDir);
+  void reportGroup(nsCSPDirective* aDir);
+  void sandboxFlagList(nsCSPDirective* aDir);
+  void handleRequireTrustedTypesForDirective(nsCSPDirective* aDir);
+  void handleTrustedTypesDirective(nsCSPDirective* aDir);
+  void sourceList(nsTArray<nsCSPBaseSrc*>& outSrcs);
+  nsCSPBaseSrc* sourceExpression();
+  nsCSPSchemeSrc* schemeSource();
+  nsCSPHostSrc* hostSource();
+  nsCSPBaseSrc* keywordSource();
+  nsCSPNonceSrc* nonceSource();
+  nsCSPHashSrc* hashSource();
+  nsCSPHostSrc* host();
+  bool hostChar();
+  bool schemeChar();
+  bool port();
+  bool path(nsCSPHostSrc* aCspHost);
+
+  bool subHost();                        
+  bool atValidUnreservedChar();          
+  bool atValidSubDelimChar();            
+  bool atValidPctEncodedChar();          
+  bool subPath(nsCSPHostSrc* aCspHost);  
+
+  inline bool atEnd() { return mCurChar >= mEndChar; }
+
+  inline bool accept(char16_t aSymbol) {
+    if (atEnd()) {
+      return false;
+    }
+    return (*mCurChar == aSymbol) && advance();
+  }
+
+  inline bool accept(bool (*aClassifier)(char16_t)) {
+    if (atEnd()) {
+      return false;
+    }
+    return (aClassifier(*mCurChar)) && advance();
+  }
+
+  inline bool peek(char16_t aSymbol) {
+    if (atEnd()) {
+      return false;
+    }
+    return *mCurChar == aSymbol;
+  }
+
+  inline bool peek(bool (*aClassifier)(char16_t)) {
+    if (atEnd()) {
+      return false;
+    }
+    return aClassifier(*mCurChar);
+  }
+
+  inline bool advance() {
+    if (atEnd()) {
+      return false;
+    }
+    mCurValue.Append(*mCurChar++);
+    return true;
+  }
+
+  inline void resetCurValue() { mCurValue.Truncate(); }
+
+  bool atEndOfPath();
+  bool atValidPathChar();
+
+  void resetCurChar(const nsAString& aToken);
+
+  void logWarningErrorToConsole(uint32_t aSeverityFlag, const char* aProperty,
+                                const nsTArray<nsString>& aParams);
+
+  void logWarningForIgnoringNoneKeywordToConsole();
+
+  void MaybeWarnAboutIgnoredSources(const nsTArray<nsCSPBaseSrc*>& aSrcs);
+  void MaybeWarnAboutUnsafeInline(const nsCSPDirective& aDirective);
+  void MaybeWarnAboutUnsafeEval(const nsCSPDirective& aDirective);
+
+
+  const char16_t* mCurChar;
+  const char16_t* mEndChar;
+  nsString mCurValue;
+  nsString mCurToken;
+  nsTArray<nsString> mCurDir;
+
+  bool mHasHashOrNonce;    
+  bool mHasAnyUnsafeEval;  
+  bool mStrictDynamic;     
+  nsCSPKeywordSrc* mUnsafeInlineKeywordSrc;  
+
+  nsCSPChildSrcDirective* mChildSrc;
+  nsCSPDirective* mFrameSrc;
+  nsCSPDirective* mWorkerSrc;
+  nsCSPScriptSrcDirective* mScriptSrc;
+  nsCSPStyleSrcDirective* mStyleSrc;
+
+  bool mParsingFrameAncestorsDir;
+
+  policyTokens mTokens;
+  nsIURI* mSelfURI;
+  nsCSPPolicy* mPolicy;
+  nsCSPContext* mCSPContext;  
+  bool mDeliveredViaMetaTag;
+  bool mSuppressLogMessages;
+};
+
+#endif /* nsCSPParser_h_ */

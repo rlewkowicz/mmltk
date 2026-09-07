@@ -1,0 +1,2175 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsMenuPopupFrame.h"
+
+#include <algorithm>
+
+#include "LayoutConstants.h"
+#include "WindowRenderer.h"
+#include "XULButtonElement.h"
+#include "XULPopupElement.h"
+#include "mozilla/AnimationUtils.h"
+#include "mozilla/BasePrincipal.h"
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/ComputedStyle.h"
+#include "mozilla/EventDispatcher.h"
+#include "mozilla/EventStateManager.h"
+#include "mozilla/LookAndFeel.h"
+#include "mozilla/MouseEvents.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/ReflowInput.h"
+#include "mozilla/ScrollContainerFrame.h"
+#include "mozilla/Services.h"
+#include "mozilla/dom/BrowserParent.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/Event.h"
+#include "mozilla/dom/KeyboardEvent.h"
+#include "mozilla/dom/KeyboardEventBinding.h"
+#include "mozilla/dom/XULPopupElement.h"
+#include "mozilla/widget/ScreenManager.h"
+#include "nsAtom.h"
+#include "nsCSSFrameConstructor.h"
+#include "nsCSSRendering.h"
+#include "nsContentUtils.h"
+#include "nsDisplayList.h"
+#include "nsExpirationTracker.h"
+#include "nsFrameManager.h"
+#include "nsGkAtoms.h"
+#include "nsIBaseWindow.h"
+#include "nsIContent.h"
+#include "nsIDOMXULSelectCntrlEl.h"
+#include "nsIDocShell.h"
+#include "nsIDocShellTreeOwner.h"
+#include "nsIFrameInlines.h"
+#include "nsIPopupContainer.h"
+#include "nsIReflowCallback.h"
+#include "nsIScreenManager.h"
+#include "nsISound.h"
+#include "nsLayoutUtils.h"
+#include "nsNameSpaceManager.h"
+#include "nsPIDOMWindow.h"
+#include "nsPIWindowRoot.h"
+#include "nsPresContext.h"
+#include "nsReadableUtils.h"
+#include "nsRect.h"
+#include "nsServiceManagerUtils.h"
+#include "nsStyleConsts.h"
+#include "nsStyleStructInlines.h"
+#include "nsTransitionManager.h"
+#include "nsUnicharUtils.h"
+#include "nsWidgetsCID.h"
+#include "nsXULPopupManager.h"
+
+using namespace mozilla;
+using namespace mozilla::widget;
+using mozilla::dom::Document;
+using mozilla::dom::Element;
+using mozilla::dom::Event;
+using mozilla::dom::XULButtonElement;
+
+TimeStamp nsMenuPopupFrame::sLastKeyTime;
+
+#if defined(MOZ_WAYLAND)
+#  include "mozilla/WidgetUtilsGtk.h"
+#  define IS_WAYLAND_DISPLAY() mozilla::widget::GdkIsWaylandDisplay()
+extern mozilla::LazyLogModule gWidgetPopupLog;
+#  define LOG_WAYLAND(...) \
+    MOZ_LOG(gWidgetPopupLog, mozilla::LogLevel::Debug, (__VA_ARGS__))
+#  define LOG_WAYLAND_VERBOSE(...) \
+    MOZ_LOG(gWidgetPopupLog, mozilla::LogLevel::Verbose, (__VA_ARGS__))
+#else
+#  define IS_WAYLAND_DISPLAY() false
+#  define LOG_WAYLAND(...)
+#  define LOG_WAYLAND_VERBOSE(...)
+#endif
+
+nsIFrame* NS_NewMenuPopupFrame(PresShell* aPresShell, ComputedStyle* aStyle) {
+  return new (aPresShell)
+      nsMenuPopupFrame(aStyle, aPresShell->GetPresContext());
+}
+
+NS_IMPL_FRAMEARENA_HELPERS(nsMenuPopupFrame)
+
+NS_QUERYFRAME_HEAD(nsMenuPopupFrame)
+  NS_QUERYFRAME_ENTRY(nsMenuPopupFrame)
+NS_QUERYFRAME_TAIL_INHERITING(nsBlockFrame)
+
+class PopupExpirationTracker final
+    : public nsExpirationTracker<nsMenuPopupFrame, 3> {
+  static StaticAutoPtr<PopupExpirationTracker> sInstance;
+
+  void NotifyExpired(nsMenuPopupFrame* aPopup) override {
+    RemoveObject(aPopup);
+    aPopup->DestroyWidgetIfNeeded();
+  }
+
+ public:
+  PopupExpirationTracker()
+      : nsExpirationTracker(5000 , "PopupExpirationTracker"_ns) {}
+  static PopupExpirationTracker* Get() { return sInstance.get(); }
+  static PopupExpirationTracker& GetOrCreate() {
+    if (!sInstance) {
+      sInstance = new PopupExpirationTracker();
+      ClearOnShutdown(&sInstance);
+    }
+    return *sInstance;
+  }
+};
+StaticAutoPtr<PopupExpirationTracker> PopupExpirationTracker::sInstance;
+
+nsMenuPopupFrame::nsMenuPopupFrame(ComputedStyle* aStyle,
+                                   nsPresContext* aPresContext)
+    : nsBlockFrame(aStyle, aPresContext, kClassID) {}
+
+nsMenuPopupFrame::~nsMenuPopupFrame() = default;
+
+static bool IsMouseTransparent(const ComputedStyle& aStyle) {
+  return aStyle.PointerEvents() == StylePointerEvents::None;
+}
+
+static nsIWidget::InputRegion ComputeInputRegion(const ComputedStyle& aStyle,
+                                                 const nsPresContext& aPc) {
+  return {IsMouseTransparent(aStyle),
+          (aStyle.StyleUIReset()->mMozWindowInputRegionMargin.ToCSSPixels() *
+           aPc.CSSToDevPixelScale())
+              .Truncated()};
+}
+
+bool nsMenuPopupFrame::IsDragPopup() const {
+  return !mInContentShell && mPopupType == PopupType::Panel &&
+         mContent->AsElement()->AttrValueIs(kNameSpaceID_None, nsGkAtoms::type,
+                                            nsGkAtoms::drag, eIgnoreCase);
+}
+
+bool nsMenuPopupFrame::ShouldHaveWidgetWhenHidden() const {
+  if (mContent->AsElement()->HasAttr(nsGkAtoms::neverhidden)) {
+    return true;
+  }
+  if (IsDragPopup()) {
+    return true;
+  }
+  return false;
+}
+
+void nsMenuPopupFrame::Init(nsIContent* aContent, nsContainerFrame* aParent,
+                            nsIFrame* aPrevInFlow) {
+  nsBlockFrame::Init(aContent, aParent, aPrevInFlow);
+
+  const auto& el = PopupElement();
+  mPopupType = PopupType::Panel;
+  if (el.IsMenu()) {
+    mPopupType = PopupType::Menu;
+  } else if (el.IsXULElement(nsGkAtoms::tooltip)) {
+    mPopupType = PopupType::Tooltip;
+  }
+
+  mInContentShell = !PresContext()->IsChrome() &&
+                    !el.GetBoolAttr(nsGkAtoms::escapecontentshell);
+
+  if (!mWidget && ShouldHaveWidgetWhenHidden()) {
+    CreateWidget();
+  }
+
+  AddStateBits(NS_FRAME_IN_POPUP);
+}
+
+bool nsMenuPopupFrame::HasRemoteContent() const {
+  return !mInContentShell && mPopupType == PopupType::Panel &&
+         mContent->AsElement()->GetBoolAttr(nsGkAtoms::remote);
+}
+
+bool nsMenuPopupFrame::IsNoAutoHide() const {
+  return !mInContentShell && mPopupType == PopupType::Panel &&
+         mContent->AsElement()->GetBoolAttr(nsGkAtoms::noautohide);
+}
+
+widget::PopupLevel nsMenuPopupFrame::GetPopupLevel(bool aIsNoAutoHide) const {
+
+  if (mPopupType != PopupType::Panel) {
+    return PopupLevel::Top;
+  }
+
+  static Element::AttrValuesArray strings[] = {nsGkAtoms::top,
+                                               nsGkAtoms::parent, nullptr};
+  switch (mContent->AsElement()->FindAttrValueIn(
+      kNameSpaceID_None, nsGkAtoms::level, strings, eCaseMatters)) {
+    case 0:
+      return PopupLevel::Top;
+    case 1:
+      return PopupLevel::Parent;
+    default:
+      break;
+  }
+
+  if (aIsNoAutoHide) {
+    return PopupLevel::Parent;
+  }
+
+  return StaticPrefs::ui_panel_default_level_parent() ? PopupLevel::Parent
+                                                      : PopupLevel::Top;
+}
+
+void nsMenuPopupFrame::PrepareWidget(bool aForceRecreate) {
+  if (mExpirationState.IsTracked()) {
+    PopupExpirationTracker::Get()->RemoveObject(this);
+  }
+  if (auto* widget = GetWidget()) {
+    nsCOMPtr<nsIWidget> parent = ComputeParentWidget();
+    if (aForceRecreate || widget->GetParent() != parent ||
+        widget->NeedsRecreateToReshow()) {
+      DestroyWidget();
+    }
+  }
+  if (!mWidget) {
+    CreateWidget();
+  } else {
+    PropagateStyleToWidget();
+  }
+}
+
+already_AddRefed<nsIWidget> nsMenuPopupFrame::ComputeParentWidget() const {
+  auto popupLevel = GetPopupLevel(IsNoAutoHide());
+  nsCOMPtr<nsIWidget> parentWidget;
+  if (popupLevel != PopupLevel::Top) {
+    nsCOMPtr<nsIDocShellTreeItem> dsti = PresContext()->GetDocShell();
+    if (!dsti) {
+      return nullptr;
+    }
+
+    nsCOMPtr<nsIDocShellTreeOwner> treeOwner;
+    dsti->GetTreeOwner(getter_AddRefs(treeOwner));
+    if (!treeOwner) {
+      return nullptr;
+    }
+
+    if (nsCOMPtr<nsIBaseWindow> baseWindow = do_QueryInterface(treeOwner)) {
+      parentWidget = baseWindow->GetMainWidget();
+    }
+  }
+  if (!parentWidget) {
+    parentWidget = GetParent()->GetNearestWidget();
+  }
+  return parentWidget.forget();
+}
+
+void nsMenuPopupFrame::CreateWidget() {
+  widget::InitData widgetData;
+  widgetData.mWindowType = widget::WindowType::Popup;
+  widgetData.mBorderStyle = widget::BorderStyle::Default;
+  widgetData.mClipSiblings = true;
+  widgetData.mPopupHint = mPopupType;
+  widgetData.mIsDragPopup = IsDragPopup();
+
+  const bool remote = HasRemoteContent();
+
+  const auto mode = nsLayoutUtils::GetFrameTransparency(this, this);
+  widgetData.mHasRemoteContent = remote;
+  widgetData.mTransparencyMode = mode;
+  widgetData.mPopupLevel = GetPopupLevel(IsNoAutoHide());
+
+  nsCOMPtr<nsIWidget> parentWidget = ComputeParentWidget();
+  if (NS_WARN_IF(!parentWidget)) {
+    return;
+  }
+
+  mWidget = parentWidget->CreateChild(CalcWidgetBounds(), widgetData);
+  if (NS_WARN_IF(!mWidget)) {
+    return;
+  }
+  mWidget->SetWidgetListener(this);
+  mWidget->EnableDragDrop(true);
+  mWidget->SetTransparencyMode(mode);
+  PropagateStyleToWidget();
+}
+
+LayoutDeviceIntRect nsMenuPopupFrame::CalcWidgetBounds() const {
+  auto a2d = PresContext()->AppUnitsPerDevPixel();
+  nsPoint offset;
+  nsIWidget* parentWidget =
+      PresShell()->GetRootFrame()->GetNearestWidget(offset);
+  if (parentWidget) {
+    offset += LayoutDeviceIntPoint::ToAppUnits(
+        parentWidget->WidgetToScreenOffset(), a2d);
+  }
+  int32_t roundTo =
+      parentWidget ? parentWidget->RoundsWidgetCoordinatesTo() : 1;
+  auto bounds = GetRect() + offset;
+  const auto transparency = nsLayoutUtils::GetFrameTransparency(this, this);
+  const bool opaque = transparency == TransparencyMode::Opaque;
+  const auto idealBounds = LayoutDeviceIntRect::FromUnknownRect(
+      opaque ? bounds.ToNearestPixels(a2d) : bounds.ToOutsidePixels(a2d));
+  return nsIWidget::MaybeRoundToDisplayPixels(idealBounds, transparency,
+                                              roundTo);
+}
+
+void nsMenuPopupFrame::DestroyWidget() {
+  RefPtr widget = mWidget.forget();
+  if (!widget) {
+    return;
+  }
+  widget->ClearCachedWebrenderResources();
+  widget->SetWidgetListener(nullptr);
+  NS_DispatchToMainThread(
+      NewRunnableMethod("DestroyWidget", widget, &nsIWidget::Destroy));
+}
+
+void nsMenuPopupFrame::PropagateStyleToWidget(WidgetStyleFlags aFlags) const {
+  if (aFlags.isEmpty()) {
+    return;
+  }
+
+  nsIWidget* widget = GetWidget();
+  if (!widget) {
+    return;
+  }
+
+  if (aFlags.contains(WidgetStyle::ColorScheme)) {
+    widget->SetColorScheme(Some(LookAndFeel::ColorSchemeForFrame(this)));
+  }
+  if (aFlags.contains(WidgetStyle::InputRegion)) {
+    widget->SetInputRegion(ComputeInputRegion(*Style(), *PresContext()));
+  }
+  if (aFlags.contains(WidgetStyle::Opacity)) {
+    widget->SetWindowOpacity(StyleUIReset()->mWindowOpacity);
+  }
+  if (aFlags.contains(WidgetStyle::Shadow)) {
+    widget->SetWindowShadowStyle(GetShadowStyle());
+  }
+  if (aFlags.contains(WidgetStyle::Transform)) {
+    widget->SetWindowTransform(ComputeWidgetTransform());
+  }
+  if (aFlags.contains(WidgetStyle::MicaBackdrop)) {
+    widget->SetMicaBackdrop(StyleDisplay()->EffectiveAppearance() ==
+                            StyleAppearance::Menupopup);
+  }
+}
+
+bool nsMenuPopupFrame::IsMouseTransparent() const {
+  return ::IsMouseTransparent(*Style());
+}
+
+WindowShadow nsMenuPopupFrame::GetShadowStyle() const {
+  StyleWindowShadow shadow = StyleUIReset()->mWindowShadow;
+  if (shadow != StyleWindowShadow::Auto) {
+    MOZ_ASSERT(shadow == StyleWindowShadow::None);
+    return WindowShadow::None;
+  }
+
+  switch (StyleDisplay()->EffectiveAppearance()) {
+    case StyleAppearance::Tooltip:
+      return WindowShadow::Tooltip;
+    case StyleAppearance::Menupopup:
+      return WindowShadow::Menu;
+    default:
+      return WindowShadow::Panel;
+  }
+}
+
+void nsMenuPopupFrame::SetPopupState(nsPopupState aState) {
+  mPopupState = aState;
+
+  if (aState == ePopupShown && IS_WAYLAND_DISPLAY()) {
+    if (nsIWidget* widget = GetWidget()) {
+      widget->SetInputRegion(ComputeInputRegion(*Style(), *PresContext()));
+    }
+  }
+}
+
+MOZ_CAN_RUN_SCRIPT_BOUNDARY NS_IMETHODIMP nsXULPopupShownEvent::Run() {
+  nsMenuPopupFrame* popup = do_QueryFrame(mPopup->GetPrimaryFrame());
+  if (popup && popup->IsOpen()) {
+    popup->SetPopupState(ePopupShown);
+  }
+
+  if (!mPopup->IsXULElement(nsGkAtoms::tooltip)) {
+    nsCOMPtr<nsIObserverService> obsService =
+        mozilla::services::GetObserverService();
+    if (obsService) {
+      obsService->NotifyObservers(mPopup, "popup-shown", nullptr);
+    }
+  }
+  WidgetMouseEvent event(true, eXULPopupShown, nullptr,
+                         WidgetMouseEvent::eReal);
+  return EventDispatcher::Dispatch(mPopup, mPresContext, &event);
+}
+
+NS_IMETHODIMP nsXULPopupShownEvent::HandleEvent(Event* aEvent) {
+  nsMenuPopupFrame* popup = do_QueryFrame(mPopup->GetPrimaryFrame());
+  if (mPopup != aEvent->GetTarget()) {
+    return NS_OK;
+  }
+  if (popup) {
+    RefPtr<nsXULPopupShownEvent> event = this;
+    if (popup->ClearPopupShownDispatcher()) {
+      return Run();
+    }
+  }
+
+  CancelListener();
+  return NS_OK;
+}
+
+void nsXULPopupShownEvent::CancelListener() {
+  mPopup->RemoveSystemEventListener(u"transitionend"_ns, this, false);
+}
+
+NS_IMPL_ISUPPORTS_INHERITED(nsXULPopupShownEvent, Runnable,
+                            nsIDOMEventListener);
+
+void nsMenuPopupFrame::DidSetComputedStyle(ComputedStyle* aOldStyle) {
+  nsBlockFrame::DidSetComputedStyle(aOldStyle);
+
+  if (!aOldStyle) {
+    return;
+  }
+
+  WidgetStyleFlags flags;
+
+  if (aOldStyle->StyleUI()->mColorScheme != StyleUI()->mColorScheme) {
+    flags += WidgetStyle::ColorScheme;
+  }
+
+  auto& newUI = *StyleUIReset();
+  auto& oldUI = *aOldStyle->StyleUIReset();
+  if (newUI.mWindowOpacity != oldUI.mWindowOpacity) {
+    flags += WidgetStyle::Opacity;
+  }
+
+  if (newUI.mMozWindowTransform != oldUI.mMozWindowTransform) {
+    flags += WidgetStyle::Transform;
+  }
+
+  if (newUI.mWindowShadow != oldUI.mWindowShadow) {
+    flags += WidgetStyle::Shadow;
+  }
+
+  if (aOldStyle->StyleDisplay()->EffectiveAppearance() !=
+      StyleDisplay()->EffectiveAppearance()) {
+    flags += WidgetStyle::MicaBackdrop;
+  }
+
+  const auto& pc = *PresContext();
+  auto oldRegion = ComputeInputRegion(*aOldStyle, pc);
+  auto newRegion = ComputeInputRegion(*Style(), pc);
+  if (oldRegion.mFullyTransparent != newRegion.mFullyTransparent ||
+      oldRegion.mMargin != newRegion.mMargin) {
+    flags += WidgetStyle::InputRegion;
+  }
+
+  PropagateStyleToWidget(flags);
+}
+
+nscoord nsMenuPopupFrame::IntrinsicISize(const IntrinsicSizeInput& aInput,
+                                         IntrinsicISizeType aType) {
+  if (CanSkipLayout()) {
+    return 0;
+  }
+  nscoord iSize = nsBlockFrame::IntrinsicISize(aInput, aType);
+  if (!ShouldExpandToInflowParentOrAnchor()) {
+    return iSize;
+  }
+  if (ScrollContainerFrame* sf = GetScrollContainerFrame()) {
+    iSize += sf->GetDesiredScrollbarSizes().LeftRight();
+  }
+
+  nscoord menuListOrAnchorWidth = 0;
+  if (nsIFrame* menuList = GetInFlowParent()) {
+    menuListOrAnchorWidth = menuList->GetRect().width;
+  }
+  if (mAnchorType == MenuPopupAnchorType::Rect) {
+    menuListOrAnchorWidth = std::max(menuListOrAnchorWidth, mScreenRect.width);
+  }
+  menuListOrAnchorWidth +=
+      2 * StyleUIReset()->mMozWindowInputRegionMargin.ToAppUnits();
+
+  return std::max(iSize, menuListOrAnchorWidth);
+}
+
+void nsMenuPopupFrame::Reflow(nsPresContext* aPresContext,
+                              ReflowOutput& aDesiredSize,
+                              const ReflowInput& aReflowInput,
+                              nsReflowStatus& aStatus) {
+  MarkInReflow();
+  DO_GLOBAL_REFLOW_COUNT("nsMenuPopupFrame");
+  MOZ_ASSERT(aStatus.IsEmpty(), "Caller should pass a fresh reflow status!");
+
+  const auto wm = GetWritingMode();
+  aDesiredSize.SetSize(wm, GetLogicalSize(wm));
+
+  LayoutPopup(aPresContext, aDesiredSize, aReflowInput, aStatus);
+
+  aDesiredSize.SetBlockStartAscent(aDesiredSize.BSize(wm));
+  aDesiredSize.SetOverflowAreasToDesiredBounds();
+  FinishAndStoreOverflow(&aDesiredSize, aReflowInput.mStyleDisplay);
+}
+
+void nsMenuPopupFrame::EnsureActiveMenuListItemIsVisible() {
+  if (!IsMenuList() || !IsOpen()) {
+    return;
+  }
+  nsIFrame* frame = GetCurrentMenuItemFrame();
+  if (!frame) {
+    return;
+  }
+  RefPtr<mozilla::PresShell> presShell = PresShell();
+  presShell->ScrollFrameIntoView(
+      frame, Nothing(), AxisScrollParams(), AxisScrollParams(),
+      ScrollFlags::ScrollOverflowHidden | ScrollFlags::ScrollFirstAncestorOnly);
+}
+
+bool nsMenuPopupFrame::CanSkipLayout() const {
+  return !IsVisibleOrShowing() && !IsMenuList();
+}
+
+void nsMenuPopupFrame::LayoutPopup(nsPresContext* aPresContext,
+                                   ReflowOutput& aDesiredSize,
+                                   const ReflowInput& aReflowInput,
+                                   nsReflowStatus& aStatus) {
+  if (IsNativeMenu()) {
+    return;
+  }
+
+  SchedulePaint();
+
+  const bool isOpen = IsOpen();
+  if (CanSkipLayout()) {
+    RemoveStateBits(NS_FRAME_FIRST_REFLOW);
+    return;
+  }
+
+  const bool needsPrefSize = mPrefSize == nsSize(-1, -1) || IsSubtreeDirty();
+  if (needsPrefSize) {
+    ReflowOutput preferredSize(aReflowInput);
+    nsBlockFrame::Reflow(aPresContext, preferredSize, aReflowInput, aStatus);
+    mPrefSize = preferredSize.PhysicalSize();
+  }
+
+  auto constraints = GetRects(mPrefSize);
+  const auto finalSize = constraints.mUsedRect.Size();
+
+  const bool needDefiniteReflow =
+      aReflowInput.ComputedBSize() == NS_UNCONSTRAINEDSIZE || !needsPrefSize ||
+      finalSize != mPrefSize;
+
+  if (needDefiniteReflow) {
+    ReflowInput constrainedReflowInput(aReflowInput);
+    const auto& bp = aReflowInput.ComputedPhysicalBorderPadding();
+    const nsSize finalContentSize(finalSize.width - bp.LeftRight(),
+                                  finalSize.height - bp.TopBottom());
+    constrainedReflowInput.SetComputedISize(finalContentSize.width);
+    constrainedReflowInput.SetComputedBSize(finalContentSize.height);
+    constrainedReflowInput.SetIResize(finalSize.width != mPrefSize.width);
+    constrainedReflowInput.SetBResize([&] {
+      if (finalSize.height != mPrefSize.height) {
+        return true;
+      }
+      if (needsPrefSize &&
+          aReflowInput.ComputedBSize() == NS_UNCONSTRAINEDSIZE &&
+          aReflowInput.ComputedMaxBSize() == finalContentSize.height) {
+        return true;
+      }
+      return false;
+    }());
+
+    aStatus.Reset();
+    nsBlockFrame::Reflow(aPresContext, aDesiredSize, constrainedReflowInput,
+                         aStatus);
+  }
+
+  if (mIsOpenChanged || !mRect.IsEqualEdges(constraints.mUsedRect)) {
+    SchedulePendingWidgetMoveResize();
+  }
+
+  SetRect(constraints.mUsedRect);
+
+  if (isOpen) {
+    if (mPopupState == ePopupOpening) {
+      mPopupState = ePopupVisible;
+    }
+  }
+
+  PerformMove(constraints);
+
+  bool openChanged = mIsOpenChanged;
+  if (openChanged) {
+    mIsOpenChanged = false;
+
+    EnsureActiveMenuListItemIsVisible();
+
+    if (LookAndFeel::GetInt(LookAndFeel::IntID::PanelAnimations) &&
+        mContent->AsElement()->AttrValueIs(kNameSpaceID_None,
+                                           nsGkAtoms::animate, nsGkAtoms::open,
+                                           eCaseMatters) &&
+        AnimationUtils::HasCurrentTransitions(mContent->AsElement())) {
+      mPopupShownDispatcher = new nsXULPopupShownEvent(mContent, aPresContext);
+      mContent->AddSystemEventListener(u"transitionend"_ns,
+                                       mPopupShownDispatcher, false, false);
+      return;
+    }
+
+    nsCOMPtr<nsIRunnable> event =
+        MakeAndAddRef<nsXULPopupShownEvent>(GetContent(), aPresContext);
+    mContent->OwnerDoc()->Dispatch(event.forget());
+  }
+}
+
+bool nsMenuPopupFrame::IsMenuList() const {
+  return PopupElement().IsInMenuList();
+}
+
+bool nsMenuPopupFrame::ShouldExpandToInflowParentOrAnchor() const {
+  return IsMenuList() && !mContent->GetParent()->AsElement()->AttrValueIs(
+                             kNameSpaceID_None, nsGkAtoms::sizetopopup,
+                             nsGkAtoms::none, eCaseMatters);
+}
+
+nsIContent* nsMenuPopupFrame::GetTriggerContent(
+    nsMenuPopupFrame* aMenuPopupFrame) {
+  while (aMenuPopupFrame) {
+    if (aMenuPopupFrame->mTriggerContent) {
+      return aMenuPopupFrame->mTriggerContent;
+    }
+
+    auto* button = XULButtonElement::FromNodeOrNull(
+        aMenuPopupFrame->GetContent()->GetParent());
+    if (!button || !button->IsMenu()) {
+      break;
+    }
+
+    auto* popup = button->GetContainingPopupElement();
+    if (!popup) {
+      break;
+    }
+
+    aMenuPopupFrame = do_QueryFrame(popup->GetPrimaryFrame());
+  }
+
+  return nullptr;
+}
+
+void nsMenuPopupFrame::InitPositionFromAnchorAlign(const nsAString& aAnchor,
+                                                   const nsAString& aAlign) {
+  mTriggerContent = nullptr;
+
+  if (aAnchor.EqualsLiteral("topleft")) {
+    mPopupAnchor = POPUPALIGNMENT_TOPLEFT;
+  } else if (aAnchor.EqualsLiteral("topright")) {
+    mPopupAnchor = POPUPALIGNMENT_TOPRIGHT;
+  } else if (aAnchor.EqualsLiteral("bottomleft")) {
+    mPopupAnchor = POPUPALIGNMENT_BOTTOMLEFT;
+  } else if (aAnchor.EqualsLiteral("bottomright")) {
+    mPopupAnchor = POPUPALIGNMENT_BOTTOMRIGHT;
+  } else if (aAnchor.EqualsLiteral("leftcenter")) {
+    mPopupAnchor = POPUPALIGNMENT_LEFTCENTER;
+  } else if (aAnchor.EqualsLiteral("rightcenter")) {
+    mPopupAnchor = POPUPALIGNMENT_RIGHTCENTER;
+  } else if (aAnchor.EqualsLiteral("topcenter")) {
+    mPopupAnchor = POPUPALIGNMENT_TOPCENTER;
+  } else if (aAnchor.EqualsLiteral("bottomcenter")) {
+    mPopupAnchor = POPUPALIGNMENT_BOTTOMCENTER;
+  } else {
+    mPopupAnchor = POPUPALIGNMENT_NONE;
+  }
+
+  if (aAlign.EqualsLiteral("topleft")) {
+    mPopupAlignment = POPUPALIGNMENT_TOPLEFT;
+  } else if (aAlign.EqualsLiteral("topright")) {
+    mPopupAlignment = POPUPALIGNMENT_TOPRIGHT;
+  } else if (aAlign.EqualsLiteral("bottomleft")) {
+    mPopupAlignment = POPUPALIGNMENT_BOTTOMLEFT;
+  } else if (aAlign.EqualsLiteral("bottomright")) {
+    mPopupAlignment = POPUPALIGNMENT_BOTTOMRIGHT;
+  } else if (aAlign.EqualsLiteral("leftcenter")) {
+    mPopupAlignment = POPUPALIGNMENT_LEFTCENTER;
+  } else if (aAlign.EqualsLiteral("rightcenter")) {
+    mPopupAlignment = POPUPALIGNMENT_RIGHTCENTER;
+  } else if (aAlign.EqualsLiteral("topcenter")) {
+    mPopupAlignment = POPUPALIGNMENT_TOPCENTER;
+  } else if (aAlign.EqualsLiteral("bottomcenter")) {
+    mPopupAlignment = POPUPALIGNMENT_BOTTOMCENTER;
+  } else {
+    mPopupAlignment = POPUPALIGNMENT_NONE;
+  }
+
+  mPosition = POPUPPOSITION_UNKNOWN;
+}
+
+static FlipType FlipFromAttribute(nsMenuPopupFrame* aFrame) {
+  nsAutoString flip;
+  aFrame->PopupElement().GetAttr(nsGkAtoms::flip, flip);
+  if (flip.EqualsLiteral("none")) {
+    return FlipType::None;
+  }
+  if (flip.EqualsLiteral("both")) {
+    return FlipType::Both;
+  }
+  if (flip.EqualsLiteral("slide")) {
+    return FlipType::Slide;
+  }
+  return FlipType::Default;
+}
+
+void nsMenuPopupFrame::InitializePopup(nsIContent* aAnchorContent,
+                                       nsIContent* aTriggerContent,
+                                       const nsAString& aPosition,
+                                       int32_t aXPos, int32_t aYPos,
+                                       MenuPopupAnchorType aAnchorType,
+                                       bool aAttributesOverride,
+                                       enum IsNativeMenu aIsNativeMenu) {
+  if (aIsNativeMenu == IsNativeMenu::No) {
+    PrepareWidget();
+  }
+
+  mPopupState = ePopupShowing;
+  mAnchorContent = aAnchorContent;
+  mAnchorType = aAnchorType;
+  const nscoord auPerCssPx = AppUnitsPerCSSPixel();
+  const nsPoint pos = CSSPixel::ToAppUnits(CSSIntPoint(aXPos, aYPos));
+  mScreenRect = nsRect(-auPerCssPx, -auPerCssPx, 0, 0);
+  mExtraMargin = pos;
+  if (mAnchorType == MenuPopupAnchorType::Node && !aAnchorContent) {
+    mAnchorType = MenuPopupAnchorType::Point;
+    mScreenRect = nsRect(
+        pos + PresShell()->GetRootFrame()->GetScreenRectInAppUnits().TopLeft(),
+        nsSize());
+    mExtraMargin = {};
+  }
+  mTriggerContent = aTriggerContent;
+  mIsNativeMenu = aIsNativeMenu == IsNativeMenu::Yes;
+  mIsTopLevelContextMenu = false;
+  mVFlip = false;
+  mHFlip = false;
+  mConstrainedByLayout = false;
+  mAlignmentOffset = 0;
+  mPositionedOffset = 0;
+  mPositionedByMoveToRect = false;
+
+  if (aAnchorContent || aAnchorType == MenuPopupAnchorType::Rect) {
+    nsAutoString anchor, align, position;
+    mContent->AsElement()->GetAttr(nsGkAtoms::popupanchor, anchor);
+    mContent->AsElement()->GetAttr(nsGkAtoms::popupalign, align);
+    mContent->AsElement()->GetAttr(nsGkAtoms::position, position);
+
+    if (aAttributesOverride) {
+      if (anchor.IsEmpty() && align.IsEmpty() && position.IsEmpty()) {
+        position.Assign(aPosition);
+      }
+    } else if (!aPosition.IsEmpty()) {
+      position.Assign(aPosition);
+    }
+
+    mFlip = FlipFromAttribute(this);
+
+    position.CompressWhitespace();
+    int32_t spaceIdx = position.FindChar(' ');
+    if (spaceIdx >= 0) {
+      InitPositionFromAnchorAlign(Substring(position, 0, spaceIdx),
+                                  Substring(position, spaceIdx + 1));
+    } else if (position.EqualsLiteral("before_start")) {
+      mPopupAnchor = POPUPALIGNMENT_TOPLEFT;
+      mPopupAlignment = POPUPALIGNMENT_BOTTOMLEFT;
+      mPosition = POPUPPOSITION_BEFORESTART;
+    } else if (position.EqualsLiteral("before_end")) {
+      mPopupAnchor = POPUPALIGNMENT_TOPRIGHT;
+      mPopupAlignment = POPUPALIGNMENT_BOTTOMRIGHT;
+      mPosition = POPUPPOSITION_BEFOREEND;
+    } else if (position.EqualsLiteral("after_start")) {
+      mPopupAnchor = POPUPALIGNMENT_BOTTOMLEFT;
+      mPopupAlignment = POPUPALIGNMENT_TOPLEFT;
+      mPosition = POPUPPOSITION_AFTERSTART;
+    } else if (position.EqualsLiteral("after_end")) {
+      mPopupAnchor = POPUPALIGNMENT_BOTTOMRIGHT;
+      mPopupAlignment = POPUPALIGNMENT_TOPRIGHT;
+      mPosition = POPUPPOSITION_AFTEREND;
+    } else if (position.EqualsLiteral("start_before")) {
+      mPopupAnchor = POPUPALIGNMENT_TOPLEFT;
+      mPopupAlignment = POPUPALIGNMENT_TOPRIGHT;
+      mPosition = POPUPPOSITION_STARTBEFORE;
+    } else if (position.EqualsLiteral("start_after")) {
+      mPopupAnchor = POPUPALIGNMENT_BOTTOMLEFT;
+      mPopupAlignment = POPUPALIGNMENT_BOTTOMRIGHT;
+      mPosition = POPUPPOSITION_STARTAFTER;
+    } else if (position.EqualsLiteral("end_before")) {
+      mPopupAnchor = POPUPALIGNMENT_TOPRIGHT;
+      mPopupAlignment = POPUPALIGNMENT_TOPLEFT;
+      mPosition = POPUPPOSITION_ENDBEFORE;
+    } else if (position.EqualsLiteral("end_after")) {
+      mPopupAnchor = POPUPALIGNMENT_BOTTOMRIGHT;
+      mPopupAlignment = POPUPALIGNMENT_BOTTOMLEFT;
+      mPosition = POPUPPOSITION_ENDAFTER;
+    } else if (position.EqualsLiteral("overlap")) {
+      mPopupAnchor = POPUPALIGNMENT_TOPLEFT;
+      mPopupAlignment = POPUPALIGNMENT_TOPLEFT;
+      mPosition = POPUPPOSITION_OVERLAP;
+    } else if (position.EqualsLiteral("selection")) {
+      mPopupAnchor = POPUPALIGNMENT_BOTTOMLEFT;
+      mPopupAlignment = POPUPALIGNMENT_TOPLEFT;
+      mPosition = POPUPPOSITION_SELECTION;
+    } else {
+      InitPositionFromAnchorAlign(anchor, align);
+    }
+  }
+  mUntransformedPopupAnchor = mPopupAnchor;
+  mUntransformedPopupAlignment = mPopupAlignment;
+
+  if (aAttributesOverride) {
+    nsAutoString left, top;
+    mContent->AsElement()->GetAttr(nsGkAtoms::left, left);
+    mContent->AsElement()->GetAttr(nsGkAtoms::top, top);
+
+    nsresult err;
+    if (!left.IsEmpty()) {
+      int32_t x = left.ToInteger(&err);
+      if (NS_SUCCEEDED(err)) {
+        mScreenRect.x = CSSPixel::ToAppUnits(x);
+      }
+    }
+    if (!top.IsEmpty()) {
+      int32_t y = top.ToInteger(&err);
+      if (NS_SUCCEEDED(err)) {
+        mScreenRect.y = CSSPixel::ToAppUnits(y);
+      }
+    }
+  }
+
+  if (aIsNativeMenu == IsNativeMenu::Yes) {
+    if (nsIFrame* anchorFrame = GetAnchorFrame()) {
+      if (nsPresContext* rootPresContext =
+              PresContext()->GetRootPresContext()) {
+        mScreenRect = ComputeAnchorRect(rootPresContext, anchorFrame);
+      }
+    }
+
+    if (mExpirationState.IsTracked()) {
+      PopupExpirationTracker::Get()->RemoveObject(this);
+    }
+    DestroyWidget();
+  }
+}
+
+void nsMenuPopupFrame::InitializePopupAtScreen(
+    nsIContent* aTriggerContent, int32_t aXPos, int32_t aYPos,
+    bool aIsContextMenu, enum IsNativeMenu aIsNativeMenu) {
+  if (aIsNativeMenu == IsNativeMenu::No) {
+    PrepareWidget();
+  }
+
+  mPopupState = ePopupShowing;
+  mAnchorContent = nullptr;
+  mTriggerContent = aTriggerContent;
+  mScreenRect =
+      nsRect(CSSPixel::ToAppUnits(CSSIntPoint(aXPos, aYPos)), nsSize());
+  mExtraMargin = {};
+  mFlip = FlipFromAttribute(this);
+  mPopupAnchor = POPUPALIGNMENT_NONE;
+  mPopupAlignment = POPUPALIGNMENT_NONE;
+  mPosition = POPUPPOSITION_UNKNOWN;
+  mIsContextMenu = aIsContextMenu;
+  mIsTopLevelContextMenu = aIsContextMenu;
+  mIsNativeMenu = aIsNativeMenu == IsNativeMenu::Yes;
+  mAnchorType = MenuPopupAnchorType::Point;
+  mPositionedOffset = 0;
+  mPositionedByMoveToRect = false;
+
+  if (aIsNativeMenu == IsNativeMenu::Yes) {
+    if (mExpirationState.IsTracked()) {
+      PopupExpirationTracker::Get()->RemoveObject(this);
+    }
+    DestroyWidget();
+  }
+}
+
+void nsMenuPopupFrame::InitializePopupAtRect(nsIContent* aTriggerContent,
+                                             const nsAString& aPosition,
+                                             const nsIntRect& aRect,
+                                             bool aAttributesOverride,
+                                             enum IsNativeMenu aIsNativeMenu) {
+  InitializePopup(nullptr, aTriggerContent, aPosition, 0, 0,
+                  MenuPopupAnchorType::Rect, aAttributesOverride,
+                  aIsNativeMenu);
+  mScreenRect = ToAppUnits(aRect, AppUnitsPerCSSPixel());
+}
+
+void nsMenuPopupFrame::ShowPopup(bool aIsContextMenu) {
+  mIsContextMenu = aIsContextMenu;
+
+  InvalidateFrameSubtree();
+  SchedulePendingWidgetMoveResize();
+
+  if (mPopupState == ePopupShowing || mPopupState == ePopupPositioning) {
+    mPopupState = ePopupOpening;
+    mIsOpenChanged = true;
+
+    if (mPopupType == PopupType::Menu) {
+      if (auto* activeESM = EventStateManager::GetActiveEventStateManager()) {
+        EventStateManager::ClearGlobalActiveContent(activeESM);
+      }
+
+      PresShell::ReleaseCapturingContent();
+    }
+
+    if (RefPtr menu = PopupElement().GetContainingMenu()) {
+      menu->PopupOpened();
+    }
+
+    PresShell()->FrameNeedsReflow(
+        this, IntrinsicDirty::FrameAncestorsAndDescendants, NS_FRAME_IS_DIRTY);
+
+    if (mPopupType == PopupType::Menu) {
+      nsCOMPtr<nsISound> sound(do_GetService("@mozilla.org/sound;1"));
+      if (sound) {
+        sound->PlayEventSound(nsISound::EVENT_MENU_POPUP);
+      }
+    }
+  }
+}
+
+void nsMenuPopupFrame::ClearTriggerContentIncludingDocument() {
+  if (mTriggerContent) {
+    Document* doc = mContent->GetUncomposedDoc();
+    if (doc) {
+      if (nsPIDOMWindowOuter* win = doc->GetWindow()) {
+        nsCOMPtr<nsPIWindowRoot> root = win->GetTopWindowRoot();
+        if (root) {
+          root->SetPopupNode(nullptr);
+        }
+      }
+    }
+  }
+  mTriggerContent = nullptr;
+}
+
+void nsMenuPopupFrame::HidePopup(bool aDeselectMenu, nsPopupState aNewState,
+                                 bool aFromFrameDestruction) {
+  NS_ASSERTION(aNewState == ePopupClosed || aNewState == ePopupInvisible,
+               "popup being set to unexpected state");
+
+  ClearPopupShownDispatcher();
+
+  if (mPopupState == ePopupClosed || mPopupState == ePopupShowing ||
+      mPopupState == ePopupPositioning) {
+    return;
+  }
+
+  if (aNewState == ePopupClosed) {
+    ClearTriggerContentIncludingDocument();
+    ClearAnchorContent();
+  }
+
+  if (mPopupState == ePopupInvisible) {
+    if (aNewState == ePopupClosed) {
+      mPopupState = ePopupClosed;
+    }
+    return;
+  }
+
+  mPopupState = aNewState;
+
+  mIncrementalString.Truncate();
+
+  mIsOpenChanged = false;
+  mHFlip = mVFlip = false;
+  mConstrainedByLayout = false;
+
+  RefPtr widget = GetWidget();
+  if (widget) {
+    widget->ClearCachedWebrenderResources();
+    if (!aFromFrameDestruction && !ShouldHaveWidgetWhenHidden()) {
+      PopupExpirationTracker::GetOrCreate().AddObject(this);
+    }
+  }
+
+  ClearPendingWidgetMoveResize();
+  RefPtr popup = &PopupElement();
+  if (!aFromFrameDestruction &&
+      popup->State().HasState(dom::ElementState::HOVER)) {
+    EventStateManager* esm = PresContext()->EventStateManager();
+    esm->SetContentState(nullptr, dom::ElementState::HOVER);
+  }
+  popup->PopupClosed(aDeselectMenu);
+
+  if (widget) {
+    nsContentUtils::AddScriptRunner(
+        NS_NewRunnableFunction("HideWidget", [widget = std::move(widget)] {
+          auto* frame = widget->GetPopupFrame();
+          if (!frame || !frame->IsVisibleOrShowing()) {
+            widget->Show(false);
+          }
+        }));
+  }
+}
+
+void nsMenuPopupFrame::SchedulePendingWidgetMoveResize() {
+  if (mPendingWidgetMoveResize) {
+    return;
+  }
+  mPendingWidgetMoveResize = true;
+  SchedulePaint();
+}
+
+nsPoint nsMenuPopupFrame::AdjustPositionForAnchorAlign(
+    nsRect& anchorRect, const nsSize& aPrefSize, FlipStyle& aHFlip,
+    FlipStyle& aVFlip) const {
+  int8_t popupAnchor(mPopupAnchor);
+  int8_t popupAlign(mPopupAlignment);
+  if (IsDirectionRTL()) {
+    if (popupAnchor <= POPUPALIGNMENT_LEFTCENTER) {
+      popupAnchor = -popupAnchor;
+    }
+    if (popupAlign <= POPUPALIGNMENT_LEFTCENTER) {
+      popupAlign = -popupAlign;
+    }
+  }
+
+  nsRect originalAnchorRect(anchorRect);
+
+  nsPoint pnt;
+  switch (popupAnchor) {
+    case POPUPALIGNMENT_LEFTCENTER:
+      pnt = nsPoint(anchorRect.x, anchorRect.y + anchorRect.height / 2);
+      anchorRect.y = pnt.y;
+      anchorRect.height = 0;
+      break;
+    case POPUPALIGNMENT_RIGHTCENTER:
+      pnt = nsPoint(anchorRect.XMost(), anchorRect.y + anchorRect.height / 2);
+      anchorRect.y = pnt.y;
+      anchorRect.height = 0;
+      break;
+    case POPUPALIGNMENT_TOPCENTER:
+      pnt = nsPoint(anchorRect.x + anchorRect.width / 2, anchorRect.y);
+      anchorRect.x = pnt.x;
+      anchorRect.width = 0;
+      break;
+    case POPUPALIGNMENT_BOTTOMCENTER:
+      pnt = nsPoint(anchorRect.x + anchorRect.width / 2, anchorRect.YMost());
+      anchorRect.x = pnt.x;
+      anchorRect.width = 0;
+      break;
+    case POPUPALIGNMENT_TOPRIGHT:
+      pnt = anchorRect.TopRight();
+      break;
+    case POPUPALIGNMENT_BOTTOMLEFT:
+      pnt = anchorRect.BottomLeft();
+      break;
+    case POPUPALIGNMENT_BOTTOMRIGHT:
+      pnt = anchorRect.BottomRight();
+      break;
+    case POPUPALIGNMENT_TOPLEFT:
+    default:
+      pnt = anchorRect.TopLeft();
+      break;
+  }
+
+  nsMargin margin = GetMargin();
+  switch (popupAlign) {
+    case POPUPALIGNMENT_LEFTCENTER:
+      pnt.MoveBy(margin.left, -aPrefSize.height / 2);
+      break;
+    case POPUPALIGNMENT_RIGHTCENTER:
+      pnt.MoveBy(-aPrefSize.width - margin.right, -aPrefSize.height / 2);
+      break;
+    case POPUPALIGNMENT_TOPCENTER:
+      pnt.MoveBy(-aPrefSize.width / 2, margin.top);
+      break;
+    case POPUPALIGNMENT_BOTTOMCENTER:
+      pnt.MoveBy(-aPrefSize.width / 2, -aPrefSize.height - margin.bottom);
+      break;
+    case POPUPALIGNMENT_TOPRIGHT:
+      pnt.MoveBy(-aPrefSize.width - margin.right, margin.top);
+      break;
+    case POPUPALIGNMENT_BOTTOMLEFT:
+      pnt.MoveBy(margin.left, -aPrefSize.height - margin.bottom);
+      break;
+    case POPUPALIGNMENT_BOTTOMRIGHT:
+      pnt.MoveBy(-aPrefSize.width - margin.right,
+                 -aPrefSize.height - margin.bottom);
+      break;
+    case POPUPALIGNMENT_TOPLEFT:
+    default:
+      pnt.MoveBy(margin.left, margin.top);
+      break;
+  }
+
+  if (mPosition == POPUPPOSITION_SELECTION) {
+    MOZ_ASSERT(popupAnchor == POPUPALIGNMENT_BOTTOMLEFT ||
+               popupAnchor == POPUPALIGNMENT_BOTTOMRIGHT);
+    MOZ_ASSERT(popupAlign == POPUPALIGNMENT_TOPLEFT ||
+               popupAlign == POPUPALIGNMENT_TOPRIGHT);
+
+    if (mIsOpenChanged) {
+      if (nsIFrame* selectedItemFrame = GetSelectedItemForAlignment()) {
+        const nscoord itemHeight = selectedItemFrame->GetRect().height;
+        const nscoord itemOffset =
+            selectedItemFrame->GetOffsetToIgnoringScrolling(this).y;
+        nscoord maxOffset = aPrefSize.height - itemHeight;
+        if (const ScrollContainerFrame* sf = GetScrollContainerFrame()) {
+          maxOffset -= sf->GetOffsetTo(this).y;
+        }
+        mPositionedOffset =
+            originalAnchorRect.height + std::min(itemOffset, maxOffset);
+      }
+    }
+
+    pnt.y -= mPositionedOffset;
+  }
+
+  switch (popupAnchor) {
+    case POPUPALIGNMENT_LEFTCENTER:
+    case POPUPALIGNMENT_RIGHTCENTER:
+      aHFlip = FlipStyle::Outside;
+      aVFlip = FlipStyle::Inside;
+      break;
+    case POPUPALIGNMENT_TOPCENTER:
+    case POPUPALIGNMENT_BOTTOMCENTER:
+      aHFlip = FlipStyle::Inside;
+      aVFlip = FlipStyle::Outside;
+      break;
+    default: {
+      FlipStyle anchorEdge =
+          mFlip == FlipType::Both ? FlipStyle::Inside : FlipStyle::None;
+      aHFlip = (popupAnchor == -popupAlign) ? FlipStyle::Outside : anchorEdge;
+      if (((popupAnchor > 0) == (popupAlign > 0)) ||
+          (popupAnchor == POPUPALIGNMENT_TOPLEFT &&
+           popupAlign == POPUPALIGNMENT_TOPLEFT)) {
+        aVFlip = FlipStyle::Outside;
+      } else {
+        aVFlip = anchorEdge;
+      }
+      break;
+    }
+  }
+
+  return pnt;
+}
+
+nsIFrame* nsMenuPopupFrame::GetSelectedItemForAlignment() const {
+  nsCOMPtr<nsIDOMXULSelectControlElement> select;
+  if (mAnchorContent) {
+    select = mAnchorContent->AsElement()->AsXULSelectControl();
+  }
+
+  if (!select) {
+    select = mContent->GetParent()->AsElement()->AsXULSelectControl();
+    if (!select) {
+      return nullptr;
+    }
+  }
+
+  nsCOMPtr<Element> selectedElement;
+  select->GetSelectedItem(getter_AddRefs(selectedElement));
+  return selectedElement ? selectedElement->GetPrimaryFrame() : nullptr;
+}
+
+nscoord nsMenuPopupFrame::SlideOrResize(nscoord& aScreenPoint, nscoord aSize,
+                                        nscoord aScreenBegin,
+                                        nscoord aScreenEnd,
+                                        nscoord* aOffset) const {
+  nscoord newPos =
+      std::max(aScreenBegin, std::min(aScreenEnd - aSize, aScreenPoint));
+  *aOffset = newPos - aScreenPoint;
+  aScreenPoint = newPos;
+  return std::min(aSize, aScreenEnd - aScreenPoint);
+}
+
+nscoord nsMenuPopupFrame::FlipOrResize(nscoord& aScreenPoint, nscoord aSize,
+                                       nscoord aScreenBegin, nscoord aScreenEnd,
+                                       nscoord aAnchorBegin, nscoord aAnchorEnd,
+                                       nscoord aMarginBegin, nscoord aMarginEnd,
+                                       FlipStyle aFlip, bool aEndAligned,
+                                       bool* aFlipSide) const {
+  *aFlipSide = false;
+
+  nscoord popupSize = aSize;
+  if (aScreenPoint < aScreenBegin) {
+    if (aFlip != FlipStyle::None) {
+      nscoord startpos =
+          aFlip == FlipStyle::Outside ? aAnchorBegin : aAnchorEnd;
+      nscoord endpos = aFlip == FlipStyle::Outside ? aAnchorEnd : aAnchorBegin;
+
+      if (startpos - aScreenBegin >= aScreenEnd - endpos) {
+        aScreenPoint = aScreenBegin;
+        popupSize = startpos - aScreenPoint - aMarginEnd;
+        *aFlipSide = !aEndAligned;
+      } else {
+        nscoord newScreenPoint = endpos + aMarginEnd;
+        if (newScreenPoint != aScreenPoint) {
+          *aFlipSide = aEndAligned;
+          aScreenPoint = newScreenPoint;
+          if (aScreenPoint + aSize > aScreenEnd) {
+            popupSize = aScreenEnd - aScreenPoint;
+          }
+        }
+      }
+    } else {
+      aScreenPoint = aScreenBegin;
+    }
+  } else if (aScreenPoint + aSize > aScreenEnd) {
+    if (aFlip != FlipStyle::None) {
+      nscoord startpos =
+          aFlip == FlipStyle::Outside ? aAnchorBegin : aAnchorEnd;
+      nscoord endpos = aFlip == FlipStyle::Outside ? aAnchorEnd : aAnchorBegin;
+
+      if (aScreenEnd - endpos >= startpos - aScreenBegin) {
+        *aFlipSide = aEndAligned;
+        if (mIsContextMenu) {
+          aScreenPoint = aScreenEnd - aSize;
+        } else {
+          aScreenPoint = endpos + aMarginBegin;
+          popupSize = aScreenEnd - aScreenPoint;
+        }
+      } else {
+        nscoord newScreenPoint = startpos - aSize - aMarginBegin;
+        if (newScreenPoint != aScreenPoint) {
+          *aFlipSide = !aEndAligned;
+          aScreenPoint = newScreenPoint;
+
+          if (aScreenPoint < aScreenBegin) {
+            aScreenPoint = aScreenBegin;
+            if (!mIsContextMenu) {
+              popupSize = startpos - aScreenPoint - aMarginBegin;
+            }
+          }
+        }
+      }
+    } else {
+      aScreenPoint = aScreenEnd - aSize;
+    }
+  }
+
+  if (aScreenPoint < aScreenBegin) {
+    aScreenPoint = aScreenBegin;
+  }
+  if (aScreenPoint > aScreenEnd) {
+    aScreenPoint = aScreenEnd - aSize;
+  }
+
+  if (popupSize <= 0 || aSize < popupSize) {
+    popupSize = aSize;
+  }
+
+  return std::min(popupSize, aScreenEnd - aScreenPoint);
+}
+
+nsRect nsMenuPopupFrame::ComputeAnchorRect(nsPresContext* aRootPresContext,
+                                           nsIFrame* aAnchorFrame) const {
+  nsIFrame* rootFrame = aRootPresContext->PresShell()->GetRootFrame();
+
+  nsRect anchorRect = aAnchorFrame->GetRectRelativeToSelf();
+
+  anchorRect = nsLayoutUtils::TransformFrameRectToAncestor(
+      aAnchorFrame, anchorRect, rootFrame);
+  anchorRect.MoveBy(rootFrame->GetScreenRectInAppUnits().TopLeft());
+
+  return anchorRect.ScaleToOtherAppUnitsRoundOut(
+      aRootPresContext->AppUnitsPerDevPixel(),
+      PresContext()->AppUnitsPerDevPixel());
+}
+
+static nsIFrame* MaybeDelegatedAnchorFrame(nsIFrame* aFrame) {
+  if (!aFrame) {
+    return nullptr;
+  }
+  if (auto* element = Element::FromNodeOrNull(aFrame->GetContent())) {
+    if (element->HasAttr(nsGkAtoms::delegatesanchor)) {
+      for (nsIFrame* f : aFrame->PrincipalChildList()) {
+        if (!f->IsPlaceholderFrame()) {
+          return f;
+        }
+      }
+    }
+  }
+  return aFrame;
+}
+
+auto nsMenuPopupFrame::GetRects(const nsSize& aPrefSize) const -> Rects {
+  if (NS_WARN_IF(aPrefSize == nsSize(-1, -1))) {
+    return {};
+  }
+
+  nsPresContext* pc = PresContext();
+  nsIFrame* rootFrame = pc->PresShell()->GetRootFrame();
+
+  FlipStyle hFlip = FlipStyle::None;
+  FlipStyle vFlip = FlipStyle::None;
+
+  const nsMargin margin = GetMargin();
+
+  const nsRect rootScreenRect = rootFrame->GetScreenRectInAppUnits();
+
+  const bool isNoAutoHide = IsNoAutoHide();
+  const PopupLevel popupLevel = GetPopupLevel(isNoAutoHide);
+
+  Rects result;
+
+  result.mUsedRect = nsRect(nsPoint(), aPrefSize);
+
+  const bool anchored = IsAnchored();
+  if (anchored) {
+    nsPresContext* rootPc = pc->GetRootPresContext();
+    if (NS_WARN_IF(!rootPc)) {
+      return result;
+    }
+
+    result.mAnchorRect = result.mUntransformedAnchorRect = [&] {
+      if (mAnchorType == MenuPopupAnchorType::Rect) {
+        return mScreenRect;
+      }
+      nsIFrame* anchorFrame = GetAnchorFrame();
+      if (!anchorFrame) {
+        return rootScreenRect;
+      }
+      return ComputeAnchorRect(rootPc, anchorFrame);
+    }();
+
+    if (mAnchorContent || mAnchorType == MenuPopupAnchorType::Rect) {
+      result.mUsedRect.MoveTo(AdjustPositionForAnchorAlign(
+          result.mAnchorRect, aPrefSize, hFlip, vFlip));
+    } else {
+      result.mUsedRect.MoveTo(result.mAnchorRect.TopLeft() +
+                              nsPoint(margin.left, margin.top));
+    }
+  } else {
+    result.mUsedRect.MoveTo(mScreenRect.TopLeft());
+    result.mAnchorRect = result.mUntransformedAnchorRect =
+        nsRect(mScreenRect.TopLeft(), nsSize());
+
+    if (mIsContextMenu && IsDirectionRTL()) {
+      result.mUsedRect.x -= aPrefSize.Width();
+      result.mUsedRect.MoveBy(-margin.right, margin.top);
+    } else {
+      result.mUsedRect.MoveBy(margin.left, margin.top);
+    }
+    vFlip = FlipStyle::Outside;
+    if (mIsContextMenu) {
+      hFlip = FlipStyle::Outside;
+    }
+  }
+
+  const int32_t a2d = pc->AppUnitsPerDevPixel();
+
+  nsIWidget* widget = mWidget;
+
+  if (mInContentShell || mFlip != FlipType::None) {
+    const Maybe<nsRect> constraintRect =
+        GetConstraintRect(result.mAnchorRect, rootScreenRect, popupLevel);
+
+    if (constraintRect) {
+      result.mAnchorRect = result.mAnchorRect.Intersect(*constraintRect);
+      if (result.mUsedRect.width > constraintRect->width) {
+        result.mUsedRect.width = constraintRect->width;
+      }
+      if (result.mUsedRect.height > constraintRect->height) {
+        result.mUsedRect.height = constraintRect->height;
+      }
+      result.mConstrainedByLayout = true;
+    }
+
+    if (IS_WAYLAND_DISPLAY() && widget) {
+      const nsSize waylandSize = LayoutDeviceIntRect::ToAppUnits(
+          widget->GetMoveToRectPopupSize(), a2d);
+
+      LOG_WAYLAND_VERBOSE(
+          "[%p] Wayland popup size from layout [%d x %d] a2d %d", widget,
+          result.mUsedRect.width / a2d, result.mUsedRect.height / a2d, a2d);
+      LOG_WAYLAND_VERBOSE(
+          "[%p] Wayland popup size from last move-to-rect [%d x %d] a2d %d",
+          widget, widget->GetMoveToRectPopupSize().width,
+          widget->GetMoveToRectPopupSize().height, a2d);
+
+      if (waylandSize.width > 0 && result.mUsedRect.width > waylandSize.width) {
+        LOG_WAYLAND("[%p] Wayland constraint width %d to %d", widget,
+                    result.mUsedRect.width, waylandSize.width);
+        result.mUsedRect.width = waylandSize.width;
+      }
+      if (waylandSize.height > 0 &&
+          result.mUsedRect.height > waylandSize.height) {
+        LOG_WAYLAND("[%p] Wayland constraint height %d to %d", widget,
+                    result.mUsedRect.height, waylandSize.height);
+        result.mUsedRect.height = waylandSize.height;
+      }
+      if (RefPtr<widget::Screen> s = widget->GetWidgetScreen()) {
+        const nsSize screenSize =
+            LayoutDeviceIntSize::ToAppUnits(s->GetAvailRect().Size(), a2d);
+        LOG_WAYLAND_VERBOSE("[%p] Wayland screen size [%d x %d] a2d %d", widget,
+                            s->GetAvailRect().Size().width,
+                            s->GetAvailRect().Size().height, a2d);
+
+        if (result.mUsedRect.height > screenSize.height) {
+          LOG_WAYLAND("[%p] Wayland constraint height to screen %d to %d",
+                      widget, result.mUsedRect.height / a2d,
+                      screenSize.height / a2d);
+          result.mUsedRect.height = screenSize.height;
+        }
+        if (result.mUsedRect.width > screenSize.width) {
+          LOG_WAYLAND("[%p] Wayland constraint widthto screen %d to %d", widget,
+                      result.mUsedRect.width / a2d, screenSize.width / a2d);
+          result.mUsedRect.width = screenSize.width;
+        }
+      }
+    }
+
+    if (constraintRect) {
+      bool slideHorizontal = false, slideVertical = false;
+      if (mFlip == FlipType::Slide) {
+        int8_t position = GetAlignmentPosition();
+        slideHorizontal = position >= POPUPPOSITION_BEFORESTART &&
+                          position <= POPUPPOSITION_AFTEREND;
+        slideVertical = position >= POPUPPOSITION_STARTBEFORE &&
+                        position <= POPUPPOSITION_ENDAFTER;
+      }
+
+      if (slideHorizontal) {
+        result.mUsedRect.width = SlideOrResize(
+            result.mUsedRect.x, result.mUsedRect.width, constraintRect->x,
+            constraintRect->XMost(), &result.mAlignmentOffset);
+      } else {
+        const bool endAligned =
+            IsDirectionRTL()
+                ? mPopupAlignment == POPUPALIGNMENT_TOPLEFT ||
+                      mPopupAlignment == POPUPALIGNMENT_BOTTOMLEFT ||
+                      mPopupAlignment == POPUPALIGNMENT_LEFTCENTER
+                : mPopupAlignment == POPUPALIGNMENT_TOPRIGHT ||
+                      mPopupAlignment == POPUPALIGNMENT_BOTTOMRIGHT ||
+                      mPopupAlignment == POPUPALIGNMENT_RIGHTCENTER;
+        result.mUsedRect.width = FlipOrResize(
+            result.mUsedRect.x, result.mUsedRect.width, constraintRect->x,
+            constraintRect->XMost(), result.mAnchorRect.x,
+            result.mAnchorRect.XMost(), margin.left, margin.right, hFlip,
+            endAligned, &result.mHFlip);
+      }
+      if (slideVertical) {
+        result.mUsedRect.height = SlideOrResize(
+            result.mUsedRect.y, result.mUsedRect.height, constraintRect->y,
+            constraintRect->YMost(), &result.mAlignmentOffset);
+      } else {
+        bool endAligned = mPopupAlignment == POPUPALIGNMENT_BOTTOMLEFT ||
+                          mPopupAlignment == POPUPALIGNMENT_BOTTOMRIGHT ||
+                          mPopupAlignment == POPUPALIGNMENT_BOTTOMCENTER;
+        result.mUsedRect.height = FlipOrResize(
+            result.mUsedRect.y, result.mUsedRect.height, constraintRect->y,
+            constraintRect->YMost(), result.mAnchorRect.y,
+            result.mAnchorRect.YMost(), margin.top, margin.bottom, vFlip,
+            endAligned, &result.mVFlip);
+      }
+
+#if defined(DEBUG)
+      NS_ASSERTION(constraintRect->Contains(result.mUsedRect),
+                   "Popup is offscreen");
+      if (!constraintRect->Contains(result.mUsedRect)) {
+        NS_WARNING(nsPrintfCString("Popup is offscreen (%s vs. %s)",
+                                   ToString(constraintRect).c_str(),
+                                   ToString(result.mUsedRect).c_str())
+                       .get());
+      }
+#endif
+    }
+  }
+  result.mUsedRect.x = pc->RoundAppUnitsToNearestDevPixels(result.mUsedRect.x);
+  result.mUsedRect.y = pc->RoundAppUnitsToNearestDevPixels(result.mUsedRect.y);
+
+  result.mViewPoint = result.mUsedRect.TopLeft() - rootScreenRect.TopLeft();
+  return result;
+}
+
+void nsMenuPopupFrame::SetPopupPosition(bool aIsMove) {
+  if (aIsMove && (mPrefSize.width == -1 || mPrefSize.height == -1)) {
+    return;
+  }
+
+  auto rects = GetRects(mPrefSize);
+  if (rects.mUsedRect.Size() != mRect.Size()) {
+    MOZ_ASSERT(!HasAnyStateBits(NS_FRAME_IN_REFLOW));
+    PresShell()->FrameNeedsReflow(this, IntrinsicDirty::FrameAndAncestors,
+                                  NS_FRAME_IS_DIRTY);
+    return;
+  }
+  PerformMove(rects);
+}
+
+void nsMenuPopupFrame::PerformMove(const Rects& aRects) {
+  auto* ps = PresShell();
+
+  const nsPoint oldPos = mRect.TopLeft();
+  const nsPoint newPos =
+      aRects.mViewPoint - GetParent()->GetOffsetTo(ps->GetRootFrame());
+  nsBlockFrame::SetPosition(newPos);
+  if (oldPos != newPos) {
+    SchedulePendingWidgetMoveResize();
+  }
+
+  if (mPopupState == ePopupPositioning ||
+      (mPopupState == ePopupShown &&
+       !aRects.mUsedRect.IsEqualEdges(mUsedScreenRect)) ||
+      (mPopupState == ePopupShown &&
+       aRects.mAlignmentOffset != mAlignmentOffset)) {
+    mUsedScreenRect = aRects.mUsedRect;
+    if (!HasAnyStateBits(NS_FRAME_FIRST_REFLOW) && !mPendingPositionedEvent) {
+      mPendingPositionedEvent =
+          nsXULPopupPositionedEvent::DispatchIfNeeded(mContent->AsElement());
+    }
+  }
+
+  if (!mPositionedByMoveToRect) {
+    mUntransformedAnchorRect = aRects.mUntransformedAnchorRect;
+  }
+
+  mAlignmentOffset = aRects.mAlignmentOffset;
+  mHFlip = aRects.mHFlip;
+  mVFlip = aRects.mVFlip;
+  mConstrainedByLayout = aRects.mConstrainedByLayout;
+
+  const bool fixPositionToPoint =
+      IsNoAutoHide() && (GetPopupLevel() != PopupLevel::Parent ||
+                         mAnchorType == MenuPopupAnchorType::Rect);
+  if (fixPositionToPoint) {
+    const auto& margin = GetMargin();
+    mAnchorType = MenuPopupAnchorType::Point;
+    mScreenRect.x = aRects.mUsedRect.x - margin.left;
+    mScreenRect.y = aRects.mUsedRect.y - margin.top;
+  }
+
+  if (IsAnchored() && !ShouldFollowAnchor() && !mUsedScreenRect.IsEmpty() &&
+      mAnchorType != MenuPopupAnchorType::Rect) {
+    mAnchorType = MenuPopupAnchorType::Rect;
+    mScreenRect = aRects.mUntransformedAnchorRect;
+  }
+}
+
+Maybe<nsRect> nsMenuPopupFrame::GetConstraintRect(
+    const nsRect& aAnchorRect, const nsRect& aRootScreenRect,
+    PopupLevel aPopupLevel) const {
+  const nsPresContext* pc = PresContext();
+  const int32_t a2d = PresContext()->AppUnitsPerDevPixel();
+  Maybe<nsRect> result;
+
+  auto AddConstraint = [&result](const nsRect& aConstraint) {
+    if (result) {
+      *result = result->Intersect(aConstraint);
+    } else {
+      result.emplace(aConstraint);
+    }
+  };
+
+  if (IS_WAYLAND_DISPLAY()) {
+    if (mPopupType == PopupType::Tooltip) {
+      AddConstraint(aRootScreenRect);
+    }
+  } else {
+    const DesktopToLayoutDeviceScale scale =
+        pc->DeviceContext()->GetDesktopToDeviceScale();
+    const nsRect& rect = mInContentShell ? aRootScreenRect : aAnchorRect;
+    auto desktopRect = DesktopIntRect::RoundOut(
+        LayoutDeviceRect::FromAppUnits(rect, a2d) / scale);
+    desktopRect.width = std::max(1, desktopRect.width);
+    desktopRect.height = std::max(1, desktopRect.height);
+
+    RefPtr<nsIScreen> screen =
+        widget::ScreenManager::GetSingleton().ScreenForRect(desktopRect);
+    MOZ_ASSERT(screen, "We always fall back to the primary screen");
+    const bool canOverlapOSBar =
+        aPopupLevel == PopupLevel::Top &&
+        LookAndFeel::GetInt(LookAndFeel::IntID::MenusCanOverlapOSBar) &&
+        !mInContentShell;
+    const auto screenRect =
+        canOverlapOSBar ? screen->GetRect() : screen->GetAvailRect();
+    AddConstraint(LayoutDeviceRect::ToAppUnits(screenRect, a2d));
+  }
+
+  if (mInContentShell) {
+    AddConstraint(aRootScreenRect);
+  } else if (!mOverrideConstraintRect.IsEmpty()) {
+    AddConstraint(mOverrideConstraintRect);
+    result->x = mOverrideConstraintRect.x;
+    result->width = mOverrideConstraintRect.width;
+  }
+
+  if (result) {
+    const nscoord inputMargin =
+        StyleUIReset()->mMozWindowInputRegionMargin.ToAppUnits();
+    result->Inflate(inputMargin);
+  }
+  return result;
+}
+
+ConsumeOutsideClicksResult nsMenuPopupFrame::ConsumeOutsideClicks() {
+  if (mContent->AsElement()->AttrValueIs(kNameSpaceID_None,
+                                         nsGkAtoms::consumeoutsideclicks,
+                                         nsGkAtoms::_true, eCaseMatters)) {
+    return ConsumeOutsideClicks_True;
+  }
+  if (mContent->AsElement()->AttrValueIs(kNameSpaceID_None,
+                                         nsGkAtoms::consumeoutsideclicks,
+                                         nsGkAtoms::_false, eCaseMatters)) {
+    return ConsumeOutsideClicks_ParentOnly;
+  }
+  if (mContent->AsElement()->AttrValueIs(kNameSpaceID_None,
+                                         nsGkAtoms::consumeoutsideclicks,
+                                         nsGkAtoms::never, eCaseMatters)) {
+    return ConsumeOutsideClicks_Never;
+  }
+
+  nsCOMPtr<nsIContent> parentContent = mContent->GetParent();
+  if (parentContent) {
+    dom::NodeInfo* ni = parentContent->NodeInfo();
+    if (ni->Equals(nsGkAtoms::menulist, kNameSpaceID_XUL)) {
+      return ConsumeOutsideClicks_True;  
+    }
+  }
+
+  return ConsumeOutsideClicks_True;
+}
+
+static ScrollContainerFrame* DoGetScrollContainerFrame(const nsIFrame* aFrame) {
+  if (const ScrollContainerFrame* sf = do_QueryFrame(aFrame)) {
+    return const_cast<ScrollContainerFrame*>(sf);
+  }
+  for (nsIFrame* childFrame : aFrame->PrincipalChildList()) {
+    if (auto* sf = DoGetScrollContainerFrame(childFrame)) {
+      return sf;
+    }
+  }
+  return nullptr;
+}
+
+ScrollContainerFrame* nsMenuPopupFrame::GetScrollContainerFrame() const {
+  return DoGetScrollContainerFrame(this);
+}
+
+void nsMenuPopupFrame::ChangeByPage(bool aIsUp) {
+  if (!IsMenuList()) {
+    return;
+  }
+
+  ScrollContainerFrame* scrollContainerFrame = GetScrollContainerFrame();
+
+  RefPtr popup = &PopupElement();
+  XULButtonElement* currentMenu = popup->GetActiveMenuChild();
+  XULButtonElement* newMenu = nullptr;
+  if (!currentMenu) {
+    newMenu = popup->GetFirstMenuItem();
+    if (!aIsUp) {
+      currentMenu = newMenu;
+    }
+  }
+
+  if (currentMenu && currentMenu->GetPrimaryFrame()) {
+    const nscoord scrollHeight =
+        scrollContainerFrame ? scrollContainerFrame->GetScrollPortRect().height
+                             : mRect.height;
+    const nsRect currentRect = currentMenu->GetPrimaryFrame()->GetRect();
+    const XULButtonElement* startMenu = currentMenu;
+
+    const nscoord targetPos = aIsUp ? currentRect.YMost() - scrollHeight
+                                    : currentRect.y + scrollHeight;
+    for (; currentMenu;
+         currentMenu = aIsUp ? popup->GetPrevMenuItemFrom(*currentMenu)
+                             : popup->GetNextMenuItemFrom(*currentMenu)) {
+      if (!currentMenu->GetPrimaryFrame()) {
+        continue;
+      }
+      const nsRect curRect = currentMenu->GetPrimaryFrame()->GetRect();
+      const nscoord curPos = aIsUp ? curRect.y : curRect.YMost();
+      if (aIsUp ? (curPos < targetPos) : (curPos > targetPos)) {
+        if (!newMenu || newMenu == startMenu) {
+          newMenu = currentMenu;
+        }
+        break;
+      }
+
+      newMenu = currentMenu;
+    }
+  }
+
+  if (RefPtr newMenuRef = newMenu) {
+    popup->SetActiveMenuChild(newMenuRef);
+  }
+}
+
+dom::XULPopupElement& nsMenuPopupFrame::PopupElement() const {
+  auto* popup = dom::XULPopupElement::FromNode(GetContent());
+  MOZ_DIAGNOSTIC_ASSERT(popup);
+  return *popup;
+}
+
+XULButtonElement* nsMenuPopupFrame::GetCurrentMenuItem() const {
+  return PopupElement().GetActiveMenuChild();
+}
+
+nsIFrame* nsMenuPopupFrame::GetCurrentMenuItemFrame() const {
+  auto* child = GetCurrentMenuItem();
+  return child ? child->GetPrimaryFrame() : nullptr;
+}
+
+void nsMenuPopupFrame::HandleEnterKeyPress(WidgetEvent& aEvent) {
+  mIncrementalString.Truncate();
+  RefPtr popup = &PopupElement();
+  popup->HandleEnterKeyPress(aEvent);
+}
+
+XULButtonElement* nsMenuPopupFrame::FindMenuWithShortcut(
+    mozilla::dom::KeyboardEvent& aKeyEvent, bool& aDoAction) {
+  uint32_t charCode = aKeyEvent.CharCode();
+  uint32_t keyCode = aKeyEvent.KeyCode();
+
+  aDoAction = false;
+
+  const bool isMenu = !IsMenuList();
+  TimeStamp keyTime = aKeyEvent.WidgetEventPtr()->mTimeStamp;
+  if (charCode == 0) {
+    if (keyCode == dom::KeyboardEvent_Binding::DOM_VK_BACK_SPACE) {
+      if (!isMenu && !mIncrementalString.IsEmpty()) {
+        mIncrementalString.SetLength(mIncrementalString.Length() - 1);
+        return nullptr;
+      }
+    }
+    return nullptr;
+  }
+  char16_t uniChar = ToLowerCase(static_cast<char16_t>(charCode));
+  if (isMenu) {
+    mIncrementalString = uniChar;
+  } else if (IsWithinIncrementalTime(keyTime)) {
+    mIncrementalString.Append(uniChar);
+  } else {
+    mIncrementalString = uniChar;
+  }
+
+  nsAutoString incrementalString(mIncrementalString);
+  uint32_t charIndex = 1, stringLength = incrementalString.Length();
+  while (charIndex < stringLength &&
+         incrementalString[charIndex] == incrementalString[charIndex - 1]) {
+    charIndex++;
+  }
+  if (charIndex == stringLength) {
+    incrementalString.Truncate(1);
+    stringLength = 1;
+  }
+
+  sLastKeyTime = keyTime;
+
+  auto* item =
+      PopupElement().FindMenuWithShortcut(incrementalString, aDoAction);
+  if (item) {
+    return item;
+  }
+
+  mIncrementalString.SetLength(mIncrementalString.Length() - 1);
+
+
+  return nullptr;
+}
+
+nsIWidget* nsMenuPopupFrame::GetWidget() const { return mWidget.get(); }
+
+
+nsresult nsMenuPopupFrame::AttributeChanged(int32_t aNameSpaceID,
+                                            nsAtom* aAttribute,
+                                            AttrModType aModType)
+
+{
+  nsresult rv =
+      nsBlockFrame::AttributeChanged(aNameSpaceID, aAttribute, aModType);
+
+  if (aAttribute == nsGkAtoms::left || aAttribute == nsGkAtoms::top) {
+    MoveToAttributePosition();
+  }
+
+  if (aAttribute == nsGkAtoms::remote && GetWidget()) {
+    PrepareWidget(true);
+  }
+
+  if (aAttribute == nsGkAtoms::followanchor) {
+    if (nsXULPopupManager* pm = nsXULPopupManager::GetInstance()) {
+      pm->UpdateFollowAnchor(this);
+    }
+  }
+
+  if (aAttribute == nsGkAtoms::label) {
+    if (nsIWidget* widget = GetWidget()) {
+      nsAutoString title;
+      mContent->AsElement()->GetAttr(nsGkAtoms::label, title);
+      if (!title.IsEmpty()) {
+        widget->SetTitle(title);
+      }
+    }
+  } else if (aAttribute == nsGkAtoms::ignorekeys) {
+    nsXULPopupManager* pm = nsXULPopupManager::GetInstance();
+    if (pm) {
+      nsAutoString ignorekeys;
+      mContent->AsElement()->GetAttr(nsGkAtoms::ignorekeys, ignorekeys);
+      pm->UpdateIgnoreKeys(ignorekeys.EqualsLiteral("true"));
+    }
+  }
+
+  return rv;
+}
+
+void nsMenuPopupFrame::MoveToAttributePosition() {
+  nsAutoString left, top;
+  mContent->AsElement()->GetAttr(nsGkAtoms::left, left);
+  mContent->AsElement()->GetAttr(nsGkAtoms::top, top);
+  nsresult err1, err2;
+  const CSSIntPoint pos(left.ToInteger(&err1), top.ToInteger(&err2));
+  if (NS_SUCCEEDED(err1) && NS_SUCCEEDED(err2)) {
+    MoveTo(pos, false);
+  }
+
+  PresShell()->FrameNeedsReflow(
+      this, IntrinsicDirty::FrameAncestorsAndDescendants, NS_FRAME_IS_DIRTY);
+}
+
+void nsMenuPopupFrame::Destroy(DestroyContext& aContext) {
+  HidePopup( false, ePopupClosed,
+             true);
+  if (mExpirationState.IsTracked()) {
+    PopupExpirationTracker::Get()->RemoveObject(this);
+  }
+
+  if (RefPtr<nsXULPopupManager> pm = nsXULPopupManager::GetInstance()) {
+    pm->PopupDestroyed(this);
+  }
+
+  DestroyWidget();
+  nsBlockFrame::Destroy(aContext);
+}
+
+nsMargin nsMenuPopupFrame::GetMargin() const {
+  nsMargin margin;
+  StyleMargin()->GetMargin(margin);
+  if (mIsTopLevelContextMenu) {
+    const CSSIntPoint offset(
+        LookAndFeel::GetInt(LookAndFeel::IntID::ContextMenuOffsetHorizontal),
+        LookAndFeel::GetInt(LookAndFeel::IntID::ContextMenuOffsetVertical));
+    auto auOffset = CSSIntPoint::ToAppUnits(offset);
+    margin.top += auOffset.y;
+    margin.bottom += auOffset.y;
+    margin.left += auOffset.x;
+    margin.right += auOffset.x;
+  }
+  if (mPopupType == PopupType::Tooltip && !IsAnchored()) {
+    const auto auOffset =
+        CSSPixel::ToAppUnits(LookAndFeel::TooltipOffsetVertical());
+    margin.top += auOffset;
+    margin.bottom += auOffset;
+  }
+  margin.top += mExtraMargin.y;
+  margin.bottom -= mExtraMargin.y;
+  if (IsDirectionRTL()) {
+    margin.left -= mExtraMargin.x;
+    margin.right += mExtraMargin.x;
+  } else {
+    margin.left += mExtraMargin.x;
+    margin.right -= mExtraMargin.x;
+  }
+  return margin;
+}
+
+void nsMenuPopupFrame::DestroyWidgetIfNeeded() {
+  if (IsVisibleOrShowing()) {
+    MOZ_ASSERT_UNREACHABLE("Shouldn't be tracked while visible");
+    return;
+  }
+  DestroyWidget();
+}
+
+void nsMenuPopupFrame::MoveTo(const CSSPoint& aPos, bool aUpdateAttrs,
+                              bool aByMoveToRect) {
+  nsPoint appUnitsPos = CSSPixel::ToAppUnits(aPos);
+
+  const bool rtl = IsDirectionRTL();
+
+  {
+    nsMargin margin = GetMargin();
+    if (rtl && mIsContextMenu) {
+      appUnitsPos.x += margin.right + mRect.Width();
+    } else {
+      appUnitsPos.x -= margin.left;
+    }
+    appUnitsPos.y -= margin.top;
+  }
+
+  if (mScreenRect.TopLeft() == appUnitsPos) {
+    return;
+  }
+
+  mPositionedByMoveToRect = aByMoveToRect;
+  mScreenRect.MoveTo(appUnitsPos);
+  if (mAnchorType == MenuPopupAnchorType::Rect) {
+    mScreenRect.height = 0;
+    mPopupAlignment = rtl ? POPUPALIGNMENT_TOPRIGHT : POPUPALIGNMENT_TOPLEFT;
+    mPopupAnchor = rtl ? POPUPALIGNMENT_BOTTOMRIGHT : POPUPALIGNMENT_BOTTOMLEFT;
+  } else {
+    mAnchorType = MenuPopupAnchorType::Point;
+  }
+
+  SetPopupPosition(true);
+
+  RefPtr<Element> popup = mContent->AsElement();
+  if (aUpdateAttrs &&
+      (popup->HasAttr(nsGkAtoms::left) || popup->HasAttr(nsGkAtoms::top))) {
+    nsAutoString left, top;
+    left.AppendInt(RoundedToInt(aPos).x);
+    top.AppendInt(RoundedToInt(aPos).y);
+    popup->SetAttr(kNameSpaceID_None, nsGkAtoms::left, left, false);
+    popup->SetAttr(kNameSpaceID_None, nsGkAtoms::top, top, false);
+  }
+}
+
+void nsMenuPopupFrame::MoveToAnchor(nsIContent* aAnchorContent,
+                                    const nsAString& aPosition, int32_t aXPos,
+                                    int32_t aYPos, bool aAttributesOverride) {
+  NS_ASSERTION(IsVisibleOrShowing(),
+               "popup must be visible or showing to move it");
+
+  nsPopupState oldstate = mPopupState;
+  InitializePopup(aAnchorContent, mTriggerContent, aPosition, aXPos, aYPos,
+                  MenuPopupAnchorType::Node, aAttributesOverride,
+                  IsNativeMenu() ? IsNativeMenu::Yes : IsNativeMenu::No);
+  mPopupState = oldstate;
+
+  SetPopupPosition(false);
+}
+
+int8_t nsMenuPopupFrame::GetAlignmentPosition() const {
+
+  if (mPosition == POPUPPOSITION_OVERLAP ||
+      mPosition == POPUPPOSITION_AFTERPOINTER ||
+      mPosition == POPUPPOSITION_SELECTION) {
+    return mPosition;
+  }
+
+  int8_t position = mPosition;
+
+  if (position == POPUPPOSITION_UNKNOWN) {
+    switch (mPopupAnchor) {
+      case POPUPALIGNMENT_BOTTOMRIGHT:
+      case POPUPALIGNMENT_BOTTOMLEFT:
+      case POPUPALIGNMENT_BOTTOMCENTER:
+        position = mPopupAlignment == POPUPALIGNMENT_TOPRIGHT
+                       ? POPUPPOSITION_AFTEREND
+                       : POPUPPOSITION_AFTERSTART;
+        break;
+      case POPUPALIGNMENT_TOPRIGHT:
+      case POPUPALIGNMENT_TOPLEFT:
+      case POPUPALIGNMENT_TOPCENTER:
+        position = mPopupAlignment == POPUPALIGNMENT_BOTTOMRIGHT
+                       ? POPUPPOSITION_BEFOREEND
+                       : POPUPPOSITION_BEFORESTART;
+        break;
+      case POPUPALIGNMENT_LEFTCENTER:
+        position = mPopupAlignment == POPUPALIGNMENT_BOTTOMRIGHT
+                       ? POPUPPOSITION_STARTAFTER
+                       : POPUPPOSITION_STARTBEFORE;
+        break;
+      case POPUPALIGNMENT_RIGHTCENTER:
+        position = mPopupAlignment == POPUPALIGNMENT_BOTTOMLEFT
+                       ? POPUPPOSITION_ENDAFTER
+                       : POPUPPOSITION_ENDBEFORE;
+        break;
+      default:
+        break;
+    }
+  }
+
+  if (mHFlip) {
+    position = POPUPPOSITION_HFLIP(position);
+  }
+
+  if (mVFlip) {
+    position = POPUPPOSITION_VFLIP(position);
+  }
+
+  return position;
+}
+
+bool nsMenuPopupFrame::ShouldFollowAnchor() const {
+  if (mAnchorType != MenuPopupAnchorType::Node || !mAnchorContent) {
+    return false;
+  }
+
+  if (mContent->AsElement()->AttrValueIs(kNameSpaceID_None,
+                                         nsGkAtoms::followanchor,
+                                         nsGkAtoms::_true, eCaseMatters)) {
+    return true;
+  }
+
+  if (mContent->AsElement()->AttrValueIs(kNameSpaceID_None,
+                                         nsGkAtoms::followanchor,
+                                         nsGkAtoms::_false, eCaseMatters)) {
+    return false;
+  }
+
+  return mPopupType == PopupType::Panel &&
+         mContent->AsElement()->AttrValueIs(kNameSpaceID_None, nsGkAtoms::type,
+                                            nsGkAtoms::arrow, eCaseMatters);
+}
+
+bool nsMenuPopupFrame::ShouldFollowAnchor(nsRect& aRect) {
+  if (!ShouldFollowAnchor()) {
+    return false;
+  }
+
+  if (nsIFrame* anchorFrame = GetAnchorFrame()) {
+    if (nsPresContext* rootPresContext = PresContext()->GetRootPresContext()) {
+      aRect = ComputeAnchorRect(rootPresContext, anchorFrame);
+    }
+  }
+
+  return true;
+}
+
+bool nsMenuPopupFrame::IsDirectionRTL() const {
+  const nsIFrame* anchor = GetAnchorFrame();
+  const nsIFrame* f = anchor ? anchor : this;
+  return f->StyleVisibility()->mDirection == StyleDirection::Rtl;
+}
+
+nsIFrame* nsMenuPopupFrame::GetAnchorFrame() const {
+  nsIContent* anchor = mAnchorContent;
+  if (!anchor) {
+    return nullptr;
+  }
+  return MaybeDelegatedAnchorFrame(anchor->GetPrimaryFrame());
+}
+
+void nsMenuPopupFrame::CheckForAnchorChange(nsRect& aRect) {
+  if (!IsVisible() || !ShouldFollowAnchor()) {
+    return;
+  }
+
+  bool shouldHide = false;
+
+  nsPresContext* rootPresContext = PresContext()->GetRootPresContext();
+
+  nsIFrame* anchor = GetAnchorFrame();
+  if (!anchor || !rootPresContext) {
+    shouldHide = true;
+  } else if (!anchor->IsVisibleConsideringAncestors(
+                 VISIBILITY_CROSS_CHROME_CONTENT_BOUNDARY)) {
+    shouldHide = true;
+  } else {
+    nsIFrame* frame = anchor;
+    while (frame) {
+      nsMenuPopupFrame* popup = do_QueryFrame(frame);
+      if (popup && popup->PopupState() != ePopupShown) {
+        shouldHide = true;
+        break;
+      }
+
+      frame = frame->GetParent();
+    }
+  }
+
+  if (shouldHide) {
+    if (nsXULPopupManager* pm = nsXULPopupManager::GetInstance()) {
+      pm->HidePopup(mContent->AsElement(),
+                    {HidePopupOption::DeselectMenu, HidePopupOption::Async});
+    }
+
+    return;
+  }
+
+  nsRect anchorRect = ComputeAnchorRect(rootPresContext, anchor);
+
+  if (!anchorRect.IsEqualEdges(aRect)) {
+    aRect = anchorRect;
+    SetPopupPosition(true);
+  }
+}
+
+void nsMenuPopupFrame::WindowMoved(nsIWidget* aWidget,
+                                   const LayoutDeviceIntPoint& aPoint,
+                                   ByMoveToRect aByMoveToRect) {
+  MOZ_ASSERT(aWidget == mWidget);
+
+  if (!IsVisibleOrShowing()) {
+    return;
+  }
+
+  LayoutDeviceIntRect curDevBounds = CalcWidgetBounds();
+  if (curDevBounds.TopLeft() == aPoint) {
+    return;
+  }
+
+  if (IsAnchored() && GetPopupLevel() == widget::PopupLevel::Parent &&
+      aByMoveToRect == ByMoveToRect::No) {
+    SetPopupPosition(true);
+  } else {
+    CSSPoint cssPos = aPoint / PresContext()->CSSToDevPixelScale();
+    MoveTo(cssPos, false, aByMoveToRect == ByMoveToRect::Yes);
+  }
+}
+
+void nsMenuPopupFrame::WindowResized(nsIWidget* aWidget,
+                                     const LayoutDeviceIntSize& aSize) {
+  MOZ_ASSERT(aWidget == mWidget);
+  if (!IsVisibleOrShowing()) {
+    return;
+  }
+
+  const LayoutDeviceIntRect curDevBounds = CalcWidgetBounds();
+  if (curDevBounds.Size() == aSize) {
+    return;
+  }
+
+  RefPtr<Element> popup = &PopupElement();
+
+  if (!popup->HasAttr(nsGkAtoms::width) || !popup->HasAttr(nsGkAtoms::height)) {
+    return;
+  }
+
+  nsPresContext* presContext = PresContext();
+
+  CSSIntSize newCSS(presContext->DevPixelsToIntCSSPixels(aSize.width),
+                    presContext->DevPixelsToIntCSSPixels(aSize.height));
+
+  nsAutoString width, height;
+  width.AppendInt(newCSS.width);
+  height.AppendInt(newCSS.height);
+  popup->SetAttr(kNameSpaceID_None, nsGkAtoms::width, width, true);
+  popup->SetAttr(kNameSpaceID_None, nsGkAtoms::height, height, true);
+}
+
+bool nsMenuPopupFrame::RequestWindowClose(nsIWidget* aWidget) {
+  MOZ_ASSERT(aWidget == mWidget);
+  if (nsXULPopupManager* pm = nsXULPopupManager::GetInstance()) {
+    pm->HidePopup(&PopupElement(), {HidePopupOption::DeselectMenu});
+    return true;
+  }
+  return false;
+}
+
+nsEventStatus nsMenuPopupFrame::HandleEvent(mozilla::WidgetGUIEvent* aEvent) {
+  MOZ_ASSERT(aEvent->mWidget);
+  MOZ_ASSERT(aEvent->mWidget == mWidget);
+  nsEventStatus status = nsEventStatus_eIgnore;
+  RefPtr ps = PresShell();
+  ps->HandleEvent(this, aEvent, false, &status);
+  return status;
+}
+
+void nsMenuPopupFrame::PaintWindow(nsIWidget* aWidget) {
+  MOZ_ASSERT(aWidget == mWidget);
+  nsAutoScriptBlocker scriptBlocker;
+  RefPtr ps = PresShell();
+  RefPtr<WindowRenderer> renderer = aWidget->GetWindowRenderer();
+  if (!renderer->NeedsWidgetInvalidation()) {
+    renderer->FlushRendering(wr::RenderReasons::WIDGET);
+  } else {
+    ps->SyncPaintFallback(this, renderer);
+  }
+}
+
+void nsMenuPopupFrame::DidCompositeWindow(
+    mozilla::layers::TransactionId aTransactionId,
+    const TimeStamp& aCompositeStart, const TimeStamp& aCompositeEnd) {
+  RefPtr rootPc = PresContext()->GetRootPresContext();
+  if (!rootPc) {
+    return;
+  }
+  nsAutoScriptBlocker scriptBlocker;
+  rootPc->NotifyDidPaintForSubtree(aTransactionId, aCompositeEnd);
+}

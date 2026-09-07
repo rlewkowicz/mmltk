@@ -1,0 +1,323 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "nsCachedFaviconProtocolHandler.h"
+#include "nsFaviconService.h"
+#include "nsICancelable.h"
+#include "nsIChannel.h"
+#include "nsIInputStream.h"
+#include "nsISupportsUtils.h"
+#include "nsIURI.h"
+#include "nsNetUtil.h"
+#include "nsInputStreamPump.h"
+#include "nsContentUtils.h"
+#include "nsServiceManagerUtils.h"
+#include "nsStringStream.h"
+#include "SimpleChannel.h"
+#include "mozilla/ScopeExit.h"
+#include "mozilla/storage.h"
+#include "mozIStorageResultSet.h"
+#include "mozIStorageRow.h"
+#include "Helpers.h"
+#include "FaviconHelpers.h"
+#include "nsIURIMutator.h"
+#include "mozIStorageBindingParamsArray.h"
+
+using namespace mozilla;
+using namespace mozilla::places;
+
+
+static nsresult GetDefaultIcon(nsIChannel* aOriginalChannel,
+                               nsIChannel** aChannel) {
+  nsCOMPtr<nsIURI> defaultIconURI;
+  nsresult rv = NS_NewURI(getter_AddRefs(defaultIconURI),
+                          nsLiteralCString(FAVICON_DEFAULT_URL));
+  NS_ENSURE_SUCCESS(rv, rv);
+  nsCOMPtr<nsILoadInfo> loadInfo = aOriginalChannel->LoadInfo();
+  rv = NS_NewChannelInternal(aChannel, defaultIconURI, loadInfo);
+  NS_ENSURE_SUCCESS(rv, rv);
+  (void)(*aChannel)->SetContentType(nsLiteralCString(FAVICON_DEFAULT_MIMETYPE));
+  (void)aOriginalChannel->SetContentType(
+      nsLiteralCString(FAVICON_DEFAULT_MIMETYPE));
+  return NS_OK;
+}
+
+
+namespace {
+
+class faviconAsyncLoader : public PendingStatementCallback,
+                           public nsICancelable {
+  NS_DECL_NSICANCELABLE
+  NS_DECL_ISUPPORTS_INHERITED
+
+ public:
+  faviconAsyncLoader(nsIChannel* aChannel, nsIStreamListener* aListener,
+                     uint16_t aPreferredSize, nsIURI* aFaviconURI)
+      : mChannel(aChannel),
+        mListener(aListener),
+        mPreferredSize(aPreferredSize),
+        mFaviconURI(aFaviconURI) {
+    MOZ_ASSERT(aChannel, "Not providing a channel will result in crashes!");
+    MOZ_ASSERT(aListener,
+               "Not providing a stream listener will result in crashes!");
+    MOZ_ASSERT(aChannel, "Not providing a channel!");
+  }
+
+
+  NS_IMETHOD HandleResult(mozIStorageResultSet* aResultSet) override {
+    nsCOMPtr<mozIStorageRow> row;
+    while (NS_SUCCEEDED(aResultSet->GetNextRow(getter_AddRefs(row))) && row) {
+      int32_t width;
+      nsresult rv = row->GetInt32(1, &width);
+      NS_ENSURE_SUCCESS(rv, rv);
+
+      if (width < mPreferredSize && !mData.IsEmpty()) {
+        return NS_OK;
+      }
+
+      if (width == UINT16_MAX) {
+        rv = mChannel->SetContentType(nsLiteralCString(SVG_MIME_TYPE));
+      } else {
+        rv = mChannel->SetContentType(nsLiteralCString(PNG_MIME_TYPE));
+      }
+      NS_ENSURE_SUCCESS(rv, rv);
+
+      rv = row->GetBlobAsUTF8String(0, mData);
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
+
+    return NS_OK;
+  }
+
+  static void CancelRequest(nsIStreamListener* aListener, nsIChannel* aChannel,
+                            nsresult aResult) {
+    MOZ_ASSERT(aListener);
+    MOZ_ASSERT(aChannel);
+
+    aListener->OnStartRequest(aChannel);
+    aListener->OnStopRequest(aChannel, aResult);
+    aChannel->CancelWithReason(NS_BINDING_ABORTED,
+                               "faviconAsyncLoader::CancelRequest"_ns);
+  }
+
+  NS_IMETHOD HandleCompletion(uint16_t aReason) override {
+    MOZ_DIAGNOSTIC_ASSERT(mListener);
+    MOZ_ASSERT(mChannel);
+    NS_ENSURE_TRUE(mListener, NS_ERROR_UNEXPECTED);
+    NS_ENSURE_TRUE(mChannel, NS_ERROR_UNEXPECTED);
+
+    auto cleanup = MakeScopeExit([&]() {
+      mListener = nullptr;
+      mChannel = nullptr;
+    });
+
+    if (mCanceled) {
+      CancelRequest(mListener, mChannel, mStatus);
+      return NS_OK;
+    }
+
+    nsresult rv;
+
+    nsCOMPtr<nsILoadInfo> loadInfo = mChannel->LoadInfo();
+    nsISerialEventTarget* target = GetMainThreadSerialEventTarget();
+    if (!mData.IsEmpty()) {
+      nsCOMPtr<nsIInputStream> stream;
+      rv = NS_NewCStringInputStream(getter_AddRefs(stream), mData);
+      MOZ_ASSERT(NS_SUCCEEDED(rv));
+      if (NS_SUCCEEDED(rv)) {
+        RefPtr<nsInputStreamPump> pump;
+        rv = nsInputStreamPump::Create(getter_AddRefs(pump), stream, 0, 0, true,
+                                       target);
+        MOZ_ASSERT(NS_SUCCEEDED(rv));
+        if (NS_SUCCEEDED(rv)) {
+          rv = pump->AsyncRead(mListener);
+          if (NS_FAILED(rv)) {
+            CancelRequest(mListener, mChannel, rv);
+            return rv;
+          }
+
+          mPump = pump;
+          return NS_OK;
+        }
+      }
+    }
+
+    rv = GetDefaultIcon(mChannel, getter_AddRefs(mDefaultIconChannel));
+    if (NS_FAILED(rv)) {
+      CancelRequest(mListener, mChannel, rv);
+      return rv;
+    }
+
+    rv = mDefaultIconChannel->AsyncOpen(mListener);
+    if (NS_FAILED(rv)) {
+      mDefaultIconChannel = nullptr;
+      CancelRequest(mListener, mChannel, rv);
+      return rv;
+    }
+
+    return NS_OK;
+  }
+
+  nsresult BindParams(mozIStorageBindingParamsArray* aParamsArray) override {
+    nsCOMPtr<mozIStorageBindingParams> params;
+    nsresult rv = aParamsArray->NewBindingParams(getter_AddRefs(params));
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    rv = URIBinder::Bind(params, "url"_ns, mFaviconURI);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    rv = aParamsArray->AddParams(params);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    return NS_OK;
+  }
+
+ protected:
+  virtual ~faviconAsyncLoader() = default;
+
+ private:
+  nsCOMPtr<nsIChannel> mChannel;
+  nsCOMPtr<nsIChannel> mDefaultIconChannel;
+  nsCOMPtr<nsIStreamListener> mListener;
+  nsCOMPtr<nsIInputStreamPump> mPump;
+  nsCString mData;
+  uint16_t mPreferredSize;
+  bool mCanceled{false};
+  nsresult mStatus{NS_OK};
+  nsCOMPtr<nsIURI> mFaviconURI;
+};
+
+NS_IMPL_ISUPPORTS(faviconAsyncLoader, mozIStorageStatementCallback,
+                  nsICancelable)
+
+NS_IMETHODIMP
+faviconAsyncLoader::Cancel(nsresult aStatus) {
+  if (mCanceled) {
+    return NS_OK;
+  }
+
+  mCanceled = true;
+  mStatus = aStatus;
+
+  if (mPump) {
+    mPump->Cancel(aStatus);
+    mPump = nullptr;
+  }
+
+  if (mDefaultIconChannel) {
+    mDefaultIconChannel->Cancel(aStatus);
+    mDefaultIconChannel = nullptr;
+  }
+
+  return NS_OK;
+}
+
+}  
+
+
+NS_IMPL_ISUPPORTS(nsCachedFaviconProtocolHandler, nsIProtocolHandler)
+
+
+NS_IMETHODIMP
+nsCachedFaviconProtocolHandler::GetScheme(nsACString& aScheme) {
+  aScheme.AssignLiteral("cached-favicon");
+  return NS_OK;
+}
+
+
+NS_IMETHODIMP
+nsCachedFaviconProtocolHandler::NewChannel(nsIURI* aURI, nsILoadInfo* aLoadInfo,
+                                           nsIChannel** _retval) {
+  NS_ENSURE_ARG_POINTER(aURI);
+
+  if (!nsContentUtils::IsImageType(aLoadInfo->GetExternalContentPolicyType())) {
+    return NS_ERROR_CONTENT_BLOCKED;
+  }
+
+  nsCOMPtr<nsIURI> cachedFaviconURI;
+  nsresult rv = ParseCachedFaviconURI(aURI, getter_AddRefs(cachedFaviconURI));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NewFaviconChannel(aURI, cachedFaviconURI, aLoadInfo, _retval);
+}
+
+
+NS_IMETHODIMP
+nsCachedFaviconProtocolHandler::AllowPort(int32_t port, const char* scheme,
+                                          bool* _retval) {
+  *_retval = false;
+  return NS_OK;
+}
+
+
+nsresult nsCachedFaviconProtocolHandler::ParseCachedFaviconURI(
+    nsIURI* aURI, nsIURI** aResultURI) {
+  nsresult rv;
+  nsAutoCString path;
+  rv = aURI->GetPathQueryRef(path);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = NS_NewURI(aResultURI, path);
+  NS_ENSURE_SUCCESS(rv, rv);
+  return NS_OK;
+}
+
+nsresult nsCachedFaviconProtocolHandler::NewFaviconChannel(
+    nsIURI* aURI, nsIURI* aCachedFaviconURI, nsILoadInfo* aLoadInfo,
+    nsIChannel** _channel) {
+  nsCOMPtr<nsIChannel> channel = NS_NewSimpleChannel(
+      aURI, aLoadInfo, aCachedFaviconURI,
+      [](nsIStreamListener* listener, nsIChannel* channel,
+         nsIURI* cachedFaviconURI) -> RequestOrReason {
+        auto fallback = [&]() -> RequestOrReason {
+          nsCOMPtr<nsIChannel> chan;
+          nsresult rv = GetDefaultIcon(channel, getter_AddRefs(chan));
+          NS_ENSURE_SUCCESS(rv, Err(rv));
+
+          rv = chan->AsyncOpen(listener);
+          NS_ENSURE_SUCCESS(rv, Err(rv));
+
+          nsCOMPtr<nsIRequest> request(chan);
+          return RequestOrCancelable(WrapNotNull(request));
+        };
+
+        nsFaviconService* faviconService =
+            nsFaviconService::GetFaviconService();
+
+        nsCOMPtr<nsIURI> faviconURI;
+        nsresult rv = NS_MutateURI(cachedFaviconURI)
+                          .SetRef(EmptyCString())
+                          .Finalize(faviconURI);
+        if (NS_FAILED(rv) || !faviconService) return fallback();
+
+        faviconURI = GetExposableURI(faviconURI);
+
+        uint16_t preferredSize = UINT16_MAX;
+        MOZ_ALWAYS_SUCCEEDS(faviconService->PreferredSizeFromURI(
+            cachedFaviconURI, &preferredSize));
+        RefPtr<PendingStatementCallback> callback = new faviconAsyncLoader(
+            channel, listener, preferredSize, faviconURI);
+        if (!callback) return fallback();
+
+        auto conn = ConcurrentConnection::GetInstance();
+        if (NS_WARN_IF(!conn.isSome())) {
+          return fallback();
+        }
+
+        conn.value()->Queue(
+            "/*Do not warn (bug no: not worth adding an index */ "
+            "SELECT data, width FROM moz_icons "
+            "WHERE fixed_icon_url_hash = hash(fixup_url(:url)) AND icon_url = "
+            ":url "
+            "ORDER BY width DESC"_ns,
+            callback);
+
+        nsCOMPtr<nsICancelable> cancelable = do_QueryInterface(callback);
+        return RequestOrCancelable(WrapNotNull(cancelable));
+      });
+  NS_ENSURE_TRUE(channel, NS_ERROR_OUT_OF_MEMORY);
+
+  channel.forget(_channel);
+  return NS_OK;
+}

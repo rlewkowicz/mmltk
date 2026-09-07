@@ -1,0 +1,96 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+use nsstring::nsACString;
+use oxilangtag::LanguageTag;
+
+pub struct LangTag; 
+
+/// Parse a string as a BCP47 language tag. Returns a `LangTag` object if the string is
+/// successfully parsed; this must be freed with `lang_tag_destroy`.
+///
+/// The string `tag` must outlive the `LangTag`.
+///
+/// Returns null if `tag` is not a well-formed BCP47 tag (including if it is not
+/// valid UTF-8).
+#[no_mangle]
+pub extern "C" fn lang_tag_new(tag: &nsACString) -> *mut LangTag {
+    if let Ok(tag_str) = core::str::from_utf8(tag.as_ref()) {
+        if let Ok(language_tag) = LanguageTag::parse(tag_str) {
+            return Box::into_raw(Box::new(language_tag)) as *mut LangTag;
+        }
+    }
+    std::ptr::null_mut()
+}
+
+/// Free a `LangTag` instance.
+#[no_mangle]
+pub extern "C" fn lang_tag_destroy(lang: *mut LangTag) {
+    if lang.is_null() {
+        return;
+    }
+    let _ = unsafe { Box::from_raw(lang as *mut LanguageTag<&str>) };
+}
+
+/// Matches an HTML language attribute against a CSS :lang() selector using the
+/// "extended filtering" algorithm.
+/// The attribute is a BCP47 language tag that was successfully parsed by oxilangtag;
+/// the selector is a string that is treated as a language range per RFC 4647.
+#[no_mangle]
+pub extern "C" fn lang_tag_matches(attribute: *const LangTag, selector: &nsACString) -> bool {
+    let lang = unsafe { *(attribute as *const LanguageTag<&str>) };
+
+    let range_str = unsafe { selector.as_str_unchecked() };
+
+    if lang.is_empty() || range_str.is_empty() {
+        return false;
+    }
+
+
+
+    let mut range_subtags = range_str.split('-');
+    let mut lang_subtags = lang.as_str().split('-');
+
+
+    let mut range_subtag = range_subtags.next();
+    let mut lang_subtag = lang_subtags.next();
+    assert!(range_subtag.is_some() && lang_subtag.is_some());
+    if !(range_subtag.unwrap() == "*"
+        || range_subtag
+            .unwrap()
+            .eq_ignore_ascii_case(lang_subtag.unwrap()))
+    {
+        return false;
+    }
+
+    range_subtag = range_subtags.next();
+    lang_subtag = lang_subtags.next();
+
+    loop {
+        let Some(range_subtag_str) = range_subtag else {
+            return true;
+        };
+
+        if range_subtag_str == "*" {
+            range_subtag = range_subtags.next();
+            continue;
+        }
+
+        let Some(lang_subtag_str) = lang_subtag else {
+            return false;
+        };
+
+        if range_subtag_str.eq_ignore_ascii_case(lang_subtag_str) {
+            range_subtag = range_subtags.next();
+            lang_subtag = lang_subtags.next();
+            continue;
+        }
+
+        if lang_subtag_str.len() == 1 {
+            return false;
+        }
+
+        lang_subtag = lang_subtags.next();
+    }
+}

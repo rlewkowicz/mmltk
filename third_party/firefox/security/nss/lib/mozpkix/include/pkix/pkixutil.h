@@ -1,0 +1,205 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+/* Copyright 2013 Mozilla Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#ifndef mozilla_pkix_pkixutil_h
+#define mozilla_pkix_pkixutil_h
+
+#include "mozpkix/pkixder.h"
+
+namespace mozilla {
+namespace pkix {
+
+class BackCert final {
+ public:
+  BackCert(Input aCertDER, EndEntityOrCA aEndEntityOrCA,
+           const BackCert* aChildCert)
+      : der(aCertDER),
+        endEntityOrCA(aEndEntityOrCA),
+        childCert(aChildCert),
+        version(der::Version::Uninitialized) {}
+
+  Result Init();
+
+  const Input GetDER() const { return der; }
+  const der::SignedDataWithSignature& GetSignedData() const {
+    return signedData;
+  }
+
+  der::Version GetVersion() const { return version; }
+  const Input GetSerialNumber() const { return serialNumber; }
+  const Input GetSignature() const { return signature; }
+  const Input GetIssuer() const { return issuer; }
+  const Input GetValidity() const { return validity; }
+  const Input GetSubject() const { return subject; }
+  const Input GetSubjectPublicKeyInfo() const { return subjectPublicKeyInfo; }
+  const Input* GetAuthorityInfoAccess() const {
+    return MaybeInput(authorityInfoAccess);
+  }
+  const Input* GetBasicConstraints() const {
+    return MaybeInput(basicConstraints);
+  }
+  const Input* GetCertificatePolicies() const {
+    return MaybeInput(certificatePolicies);
+  }
+  const Input* GetExtKeyUsage() const { return MaybeInput(extKeyUsage); }
+  const Input* GetKeyUsage() const { return MaybeInput(keyUsage); }
+  const Input* GetInhibitAnyPolicy() const {
+    return MaybeInput(inhibitAnyPolicy);
+  }
+  const Input* GetNameConstraints() const {
+    return MaybeInput(nameConstraints);
+  }
+  const Input* GetQCStatements() const { return MaybeInput(qcStatements); }
+  const Input* GetSubjectAltName() const { return MaybeInput(subjectAltName); }
+  const Input* GetRequiredTLSFeatures() const {
+    return MaybeInput(requiredTLSFeatures);
+  }
+  const Input* GetSignedCertificateTimestamps() const {
+    return MaybeInput(signedCertificateTimestamps);
+  }
+
+ private:
+  const Input der;
+
+ public:
+  const EndEntityOrCA endEntityOrCA;
+  BackCert const* const childCert;
+
+ private:
+  static inline const Input* MaybeInput(const Input& item) {
+    return item.GetLength() > 0 ? &item : nullptr;
+  }
+
+  der::SignedDataWithSignature signedData;
+
+  der::Version version;
+  Input serialNumber;
+  Input signature;
+  Input issuer;
+  Input validity;
+  Input subject;
+  Input subjectPublicKeyInfo;
+
+  Input authorityInfoAccess;
+  Input basicConstraints;
+  Input certificatePolicies;
+  Input extKeyUsage;
+  Input inhibitAnyPolicy;
+  Input keyUsage;
+  Input nameConstraints;
+  Input subjectAltName;
+  Input criticalNetscapeCertificateType;
+  Input qcStatements;
+  Input requiredTLSFeatures;
+  Input signedCertificateTimestamps;  
+
+  Result RememberExtension(Reader& extnID, Input extnValue, bool critical,
+                            bool& understood);
+
+  BackCert(const BackCert&) = delete;
+  void operator=(const BackCert&) = delete;
+};
+
+class NonOwningDERArray final : public DERArray {
+ public:
+  NonOwningDERArray() : numItems(0) {
+  }
+
+  size_t GetLength() const override { return numItems; }
+
+  const Input* GetDER(size_t i) const override {
+    return i < numItems ? &items[i] : nullptr;
+  }
+
+  Result Append(Input der) {
+    if (numItems >= MAX_LENGTH) {
+      return Result::FATAL_ERROR_INVALID_ARGS;
+    }
+    Result rv = items[numItems].Init(der);  
+    if (rv != Success) {
+      return rv;
+    }
+    ++numItems;
+    return Success;
+  }
+
+  static const size_t MAX_LENGTH = 8;
+
+ private:
+  Input items[MAX_LENGTH];  
+  size_t numItems;
+
+  NonOwningDERArray(const NonOwningDERArray&) = delete;
+  void operator=(const NonOwningDERArray&) = delete;
+};
+
+Result ExtractSignedCertificateTimestampListFromExtension(Input extnValue,
+                                                          Input& sctList);
+
+inline unsigned int DaysBeforeYear(unsigned int year) {
+  assert(year <= 9999);
+  return ((year - 1u) * 365u) +
+         ((year - 1u) / 4u)       
+         - ((year - 1u) / 100u)   
+         + ((year - 1u) / 400u);  
+}
+
+static const size_t MAX_DIGEST_SIZE_IN_BYTES = 512 / 8;  
+
+Result VerifySignedData(TrustDomain& trustDomain,
+                        const der::SignedDataWithSignature& signedData,
+                        Input signerSubjectPublicKeyInfo);
+
+Result CheckSubjectPublicKeyInfo(Input subjectPublicKeyInfo,
+                                 TrustDomain& trustDomain,
+                                 EndEntityOrCA endEntityOrCA);
+
+#if defined(__clang__)
+#define MOZILLA_PKIX_UNREACHABLE_DEFAULT_ENUM  // empty
+#elif defined(__GNUC__)
+#define MOZILLA_PKIX_UNREACHABLE_DEFAULT_ENUM \
+  default:                                    \
+    assert(false);                            \
+    __builtin_unreachable();
+#elif defined(_MSC_VER)
+#define MOZILLA_PKIX_UNREACHABLE_DEFAULT_ENUM \
+  default:                                    \
+    assert(false);                            \
+    __assume(0);
+#else
+#error Unsupported compiler for MOZILLA_PKIX_UNREACHABLE_DEFAULT.
+#endif
+
+inline size_t DigestAlgorithmToSizeInBytes(DigestAlgorithm digestAlgorithm) {
+  switch (digestAlgorithm) {
+    case DigestAlgorithm::sha1:
+      return 160 / 8;
+    case DigestAlgorithm::sha256:
+      return 256 / 8;
+    case DigestAlgorithm::sha384:
+      return 384 / 8;
+    case DigestAlgorithm::sha512:
+      return 512 / 8;
+      MOZILLA_PKIX_UNREACHABLE_DEFAULT_ENUM
+  }
+}
+}  
+}  
+
+#endif  // mozilla_pkix_pkixutil_h

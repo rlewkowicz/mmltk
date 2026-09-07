@@ -1,0 +1,327 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_TextControlState_h
+#define mozilla_TextControlState_h
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/EnumSet.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/TextControlElement.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/WeakPtr.h"
+#include "mozilla/dom/Nullable.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsITimer.h"
+
+class nsTextControlFrame;
+class nsISelectionController;
+class nsFrameSelection;
+class nsFrame;
+
+namespace mozilla {
+
+class AutoTextControlHandlingState;
+class ErrorResult;
+class IMEContentObserver;
+class TextEditor;
+class TextInputListener;
+class TextInputSelectionController;
+
+enum class SelectionDirection : uint8_t {
+  None,
+  Forward,
+  Backward,
+};
+
+namespace dom {
+enum class SelectionMode : uint8_t;
+class Element;
+class HTMLInputElement;
+}  
+
+struct PasswordMaskData final {
+  nsCOMPtr<nsITimer> mTimer;
+
+  uint32_t mUnmaskedStart = UINT32_MAX;
+  uint32_t mUnmaskedLength = 0;
+
+  bool mIsMaskingPassword = true;
+
+  bool mEchoingPasswordPrevented = false;
+
+  MOZ_ALWAYS_INLINE bool IsAllMasked() const {
+    return mUnmaskedStart == UINT32_MAX && mUnmaskedLength == 0;
+  }
+  MOZ_ALWAYS_INLINE uint32_t UnmaskedEnd() const {
+    return mUnmaskedStart + mUnmaskedLength;
+  }
+  MOZ_ALWAYS_INLINE void MaskAll() {
+    mUnmaskedStart = UINT32_MAX;
+    mUnmaskedLength = 0;
+  }
+  MOZ_ALWAYS_INLINE void Reset() {
+    MaskAll();
+    mIsMaskingPassword = true;
+  }
+  enum class ReleaseTimer { No, Yes };
+  MOZ_ALWAYS_INLINE void CancelTimer(ReleaseTimer aReleaseTimer) {
+    if (mTimer) {
+      mTimer->Cancel();
+      if (aReleaseTimer == ReleaseTimer::Yes) {
+        mTimer = nullptr;
+      }
+    }
+    if (mIsMaskingPassword) {
+      MaskAll();
+    }
+  }
+};
+
+
+class RestoreSelectionState;
+
+class TextControlState final : public SupportsWeakPtr {
+ public:
+  using Element = dom::Element;
+  using HTMLInputElement = dom::HTMLInputElement;
+
+  static TextControlState* Construct(TextControlElement* aOwningElement);
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY static void Shutdown();
+
+  MOZ_CAN_RUN_SCRIPT void Destroy();
+
+  TextControlState() = delete;
+  explicit TextControlState(const TextControlState&) = delete;
+  TextControlState(TextControlState&&) = delete;
+
+  void operator=(const TextControlState&) = delete;
+  void operator=(TextControlState&&) = delete;
+
+  void Traverse(nsCycleCollectionTraversalCallback& cb);
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void Unlink();
+
+  bool IsBusy() const { return !!mHandlingState; }
+
+  MOZ_CAN_RUN_SCRIPT TextEditor* GetTextEditor();
+  TextEditor* GetExtantTextEditor() const;
+  nsISelectionController* GetSelectionController() const;
+  nsFrameSelection* GetIndependentFrameSelection() const;
+  nsresult InitializeSelection(PresShell*);
+  MOZ_CAN_RUN_SCRIPT void DeinitSelection();
+  MOZ_CAN_RUN_SCRIPT nsresult PrepareEditor();
+  MOZ_CAN_RUN_SCRIPT void UpdateEditorOnTypeChange();
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT nsresult OnEditActionHandled();
+
+  enum class ValueSetterOption {
+    ByInternalAPI,
+    BySetUserInputAPI,
+    ByContentAPI,
+    BySetRangeTextAPI,
+    SetValueChanged,
+    MoveCursorToEndIfValueChanged,
+
+    PreserveUndoHistory,
+
+    MoveCursorToBeginSetSelectionDirectionForward,
+  };
+  using ValueSetterOptions = EnumSet<ValueSetterOption, uint32_t>;
+
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT bool SetValue(
+      const nsAString& aValue, const nsAString* aOldValue,
+      const ValueSetterOptions& aOptions);
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT bool SetValue(
+      const nsAString& aValue, const ValueSetterOptions& aOptions) {
+    return SetValue(aValue, nullptr, aOptions);
+  }
+
+  void GetValue(nsAString& aValue, bool aForDisplay) const;
+
+  bool ValueEquals(const nsAString& aValue) const;
+  void EmptyValue() {
+    if (!mValue.IsVoid()) {
+      mValue.Truncate();
+    }
+  }
+  bool IsEmpty() const { return mValue.IsEmpty(); }
+
+  const nsAString& LastInteractiveValueIfLastChangeWasNonInteractive() const {
+    return mLastInteractiveValue;
+  }
+  void ClearLastInteractiveValue() { mLastInteractiveValue.SetIsVoid(true); }
+
+  Element* GetRootNode();
+  Element* GetPreviewNode();
+
+  bool IsSingleLineTextControl() const {
+    return mTextCtrlElement->IsSingleLineTextControl();
+  }
+  bool IsTextArea() const { return mTextCtrlElement->IsTextArea(); }
+  bool IsPasswordTextControl() const {
+    return mTextCtrlElement->IsPasswordTextControl();
+  }
+  int32_t GetColsOrDefault() { return mTextCtrlElement->GetColsOrDefault(); }
+  int32_t GetWrapCols() {
+    int32_t wrapCols = mTextCtrlElement->GetWrapCols();
+    MOZ_ASSERT(wrapCols >= 0);
+    return wrapCols;
+  }
+  int32_t GetRows() { return mTextCtrlElement->GetRows(); }
+
+  struct SelectionProperties {
+   public:
+    bool IsDefault() const {
+      return mStart == 0 && mEnd == 0 &&
+             mDirection == SelectionDirection::Forward;
+    }
+    uint32_t GetStart() const { return mStart; }
+    bool SetStart(uint32_t value) {
+      uint32_t newValue = std::min(value, *mMaxLength);
+      return SetStartInternal(newValue);
+    }
+    uint32_t GetEnd() const { return mEnd; }
+    bool SetEnd(uint32_t value) {
+      uint32_t newValue = std::min(value, *mMaxLength);
+      return SetEndInternal(newValue);
+    }
+    void CollapseToStart() {
+      SetStartInternal(0);
+      SetEndInternal(0);
+    }
+    SelectionDirection GetDirection() const { return mDirection; }
+    bool SetDirection(SelectionDirection value) {
+      bool changed = mDirection != value;
+      mDirection = value;
+      mIsDirty |= changed;
+      return changed;
+    }
+    void SetMaxLength(uint32_t aMax) {
+      mMaxLength = Some(aMax);
+      SetStart(GetStart());
+      SetEnd(GetEnd());
+    }
+    bool HasMaxLength() { return mMaxLength.isSome(); }
+    const Maybe<uint32_t>& GetMaxLength() { return mMaxLength; }
+
+    bool IsDirty() const { return mIsDirty; }
+    void SetIsDirty() { mIsDirty = true; }
+
+   private:
+    bool SetStartInternal(uint32_t aNewValue) {
+      bool changed = mStart != aNewValue;
+      mStart = aNewValue;
+      mIsDirty |= changed;
+      return changed;
+    }
+
+    bool SetEndInternal(uint32_t aNewValue) {
+      bool changed = mEnd != aNewValue;
+      mEnd = aNewValue;
+      mIsDirty |= changed;
+      return changed;
+    }
+
+    uint32_t mStart = 0;
+    uint32_t mEnd = 0;
+    Maybe<uint32_t> mMaxLength;
+    bool mIsDirty = false;
+    SelectionDirection mDirection = SelectionDirection::Forward;
+  };
+
+  bool IsSelectionCached() const { return mSelectionCached; }
+  SelectionProperties& GetSelectionProperties() { return mSelectionProperties; }
+  MOZ_CAN_RUN_SCRIPT void SetSelectionProperties(SelectionProperties& aProps);
+  bool HasNeverInitializedBefore() const { return !mEverInited; }
+
+  void GetSelectionRange(uint32_t* aSelectionStart, uint32_t* aSelectionEnd,
+                         ErrorResult& aRv);
+
+  SelectionDirection GetSelectionDirection(ErrorResult& aRv);
+
+  enum class ScrollAfterSelection { No, Yes };
+
+  MOZ_CAN_RUN_SCRIPT void SetSelectionRange(
+      uint32_t aStart, uint32_t aEnd, SelectionDirection aDirection,
+      ErrorResult& aRv,
+      ScrollAfterSelection aScroll = ScrollAfterSelection::Yes);
+
+  MOZ_CAN_RUN_SCRIPT void SetSelectionRange(
+      uint32_t aSelectionStart, uint32_t aSelectionEnd,
+      const dom::Optional<nsAString>& aDirection, ErrorResult& aRv,
+      ScrollAfterSelection aScroll = ScrollAfterSelection::Yes);
+
+  MOZ_CAN_RUN_SCRIPT void SetSelectionStart(
+      const dom::Nullable<uint32_t>& aStart, ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT void SetSelectionEnd(const dom::Nullable<uint32_t>& aEnd,
+                                          ErrorResult& aRv);
+
+  void GetSelectionDirectionString(nsAString& aDirection, ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT void SetSelectionDirection(const nsAString& aDirection,
+                                                ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT void SetRangeText(const nsAString& aReplacement,
+                                       ErrorResult& aRv);
+  MOZ_CAN_RUN_SCRIPT void SetRangeText(
+      const nsAString& aReplacement, uint32_t aStart, uint32_t aEnd,
+      dom::SelectionMode aSelectMode, ErrorResult& aRv,
+      const Maybe<uint32_t>& aSelectionStart = Nothing(),
+      const Maybe<uint32_t>& aSelectionEnd = Nothing());
+
+  MOZ_CAN_RUN_SCRIPT void EnsureEditorInitialized();
+
+ private:
+  explicit TextControlState(TextControlElement* aOwningElement);
+  MOZ_CAN_RUN_SCRIPT ~TextControlState();
+
+  MOZ_CAN_RUN_SCRIPT void DeleteOrCacheForReuse();
+
+  MOZ_CAN_RUN_SCRIPT void UnlinkInternal();
+
+  void EnsureTextInputListener();
+  MOZ_CAN_RUN_SCRIPT void DestroyEditor();
+  MOZ_CAN_RUN_SCRIPT void Clear();
+
+  nsresult InitializeRootNode();
+
+  void FinishedRestoringSelection();
+
+  bool EditorHasComposition();
+
+  MOZ_CAN_RUN_SCRIPT bool SetValueWithTextEditor(
+      AutoTextControlHandlingState& aHandlingSetValue);
+
+  MOZ_CAN_RUN_SCRIPT bool SetValueWithoutTextEditor(
+      AutoTextControlHandlingState& aHandlingSetValue);
+
+  AutoTextControlHandlingState* mHandlingState = nullptr;
+
+  TextControlElement* MOZ_NON_OWNING_REF mTextCtrlElement;
+  RefPtr<TextInputSelectionController> mSelCon;  
+  RefPtr<TextEditor> mTextEditor;
+  RefPtr<TextInputListener> mTextInputListener;
+  UniquePtr<PasswordMaskData> mPasswordMaskData;
+
+  nsString mValue{VoidString()};  
+
+  nsString mLastInteractiveValue{VoidString()};
+
+  SelectionProperties mSelectionProperties;
+
+  bool mEverInited : 1;  
+  bool mEditorInitialized : 1;
+  bool mSelectionCached : 1;  
+
+  friend class AutoTextControlHandlingState;
+  friend class PrepareEditorEvent;
+  friend class RestoreSelectionState;
+};
+
+}  
+
+#endif  // #ifndef mozilla_TextControlState_h

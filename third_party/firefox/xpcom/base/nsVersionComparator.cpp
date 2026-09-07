@@ -1,0 +1,208 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsVersionComparator.h"
+
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <errno.h>
+#include "mozilla/CheckedInt.h"
+
+struct VersionPart {
+  int32_t numA;
+
+  const char* strB;  
+  uint32_t strBlen;
+
+  int32_t numC;
+
+  char* extraD;  
+};
+
+
+static int32_t ns_strtol(const char* aPart, char** aNext) {
+  errno = 0;
+  long result_long = strtol(aPart, aNext, 10);
+
+  if (errno != 0) {
+    return 0;
+  }
+
+  mozilla::CheckedInt<int32_t> result = result_long;
+  if (!result.isValid()) {
+    return 0;
+  }
+
+  return result.value();
+}
+
+static char* ParseVP(char* aPart, VersionPart& aResult) {
+  char* dot;
+
+  aResult.numA = 0;
+  aResult.strB = nullptr;
+  aResult.strBlen = 0;
+  aResult.numC = 0;
+  aResult.extraD = nullptr;
+
+  if (!aPart) {
+    return aPart;
+  }
+
+  dot = strchr(aPart, '.');
+  if (dot) {
+    *dot = '\0';
+  }
+
+  if (aPart[0] == '*' && aPart[1] == '\0') {
+    aResult.numA = INT32_MAX;
+    aResult.strB = "";
+  } else {
+    aResult.numA = ns_strtol(aPart, const_cast<char**>(&aResult.strB));
+  }
+
+  if (!*aResult.strB) {
+    aResult.strB = nullptr;
+    aResult.strBlen = 0;
+  } else {
+    if (aResult.strB[0] == '+') {
+      static const char kPre[] = "pre";
+
+      ++aResult.numA;
+      aResult.strB = kPre;
+      aResult.strBlen = sizeof(kPre) - 1;
+    } else {
+      const char* numstart = strpbrk(aResult.strB, "0123456789+-");
+      if (!numstart) {
+        aResult.strBlen = strlen(aResult.strB);
+      } else {
+        aResult.strBlen = numstart - aResult.strB;
+        aResult.numC = ns_strtol(numstart, const_cast<char**>(&aResult.extraD));
+
+        if (!*aResult.extraD) {
+          aResult.extraD = nullptr;
+        }
+      }
+    }
+  }
+
+  if (dot) {
+    ++dot;
+
+    if (!*dot) {
+      dot = nullptr;
+    }
+  }
+
+  return dot;
+}
+
+
+static int32_t ns_strcmp(const char* aStr1, const char* aStr2) {
+  if (!aStr1) {
+    return aStr2 != nullptr;
+  }
+
+  if (!aStr2) {
+    return -1;
+  }
+
+  return strcmp(aStr1, aStr2);
+}
+
+static int32_t ns_strnncmp(const char* aStr1, uint32_t aLen1, const char* aStr2,
+                           uint32_t aLen2) {
+  if (!aStr1) {
+    return aStr2 != nullptr;
+  }
+
+  if (!aStr2) {
+    return -1;
+  }
+
+  for (; aLen1 && aLen2; --aLen1, --aLen2, ++aStr1, ++aStr2) {
+    if (*aStr1 < *aStr2) {
+      return -1;
+    }
+
+    if (*aStr1 > *aStr2) {
+      return 1;
+    }
+  }
+
+  if (aLen1 == 0) {
+    return aLen2 == 0 ? 0 : -1;
+  }
+
+  return 1;
+}
+
+static int32_t ns_cmp(int32_t aNum1, int32_t aNum2) {
+  if (aNum1 < aNum2) {
+    return -1;
+  }
+
+  return aNum1 != aNum2;
+}
+
+static int32_t CompareVP(VersionPart& aVer1, VersionPart& aVer2) {
+  int32_t r = ns_cmp(aVer1.numA, aVer2.numA);
+  if (r) {
+    return r;
+  }
+
+  r = ns_strnncmp(aVer1.strB, aVer1.strBlen, aVer2.strB, aVer2.strBlen);
+  if (r) {
+    return r;
+  }
+
+  r = ns_cmp(aVer1.numC, aVer2.numC);
+  if (r) {
+    return r;
+  }
+
+  return ns_strcmp(aVer1.extraD, aVer2.extraD);
+}
+
+
+namespace mozilla {
+
+
+int32_t CompareVersions(const char* aStrA, const char* aStrB) {
+  char* A2 = strdup(aStrA);
+  if (!A2) {
+    return 1;
+  }
+
+  char* B2 = strdup(aStrB);
+  if (!B2) {
+    free(A2);
+    return 1;
+  }
+
+  int32_t result;
+  char* a = A2;
+  char* b = B2;
+
+  do {
+    VersionPart va, vb;
+
+    a = ParseVP(a, va);
+    b = ParseVP(b, vb);
+
+    result = CompareVP(va, vb);
+    if (result) {
+      break;
+    }
+
+  } while (a || b);
+
+  free(A2);
+  free(B2);
+
+  return result;
+}
+
+}  

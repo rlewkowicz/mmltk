@@ -1,0 +1,212 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+ ********************************************************************************
+ * Copyright (C) 2003-2013, International Business Machines Corporation
+ * and others. All Rights Reserved.
+ ******************************************************************************
+ *
+ * File ISLAMCAL.H
+ *
+ * Modification History:
+ *
+ *   Date        Name        Description
+ *   10/14/2003  srl         ported from java IslamicCalendar
+ *****************************************************************************
+ */
+
+#ifndef ISLAMCAL_H
+#define ISLAMCAL_H
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/calendar.h"
+
+U_NAMESPACE_BEGIN
+
+class U_I18N_API IslamicCalendar : public Calendar {
+ public:
+  enum EMonths {
+    MUHARRAM = 0,
+
+    SAFAR = 1,
+
+    RABI_1 = 2,
+
+    RABI_2 = 3,
+
+    JUMADA_1 = 4,
+
+    JUMADA_2 = 5,
+
+    RAJAB = 6,
+
+    SHABAN = 7,
+
+    RAMADAN = 8,
+
+    SHAWWAL = 9,
+
+    DHU_AL_QIDAH = 10,
+
+    DHU_AL_HIJJAH = 11,
+    
+    ISLAMIC_MONTH_MAX
+  }; 
+
+
+
+  IslamicCalendar(const Locale& aLocale, UErrorCode &success);
+
+  IslamicCalendar(const IslamicCalendar& other) = default;
+
+  virtual ~IslamicCalendar();
+
+  virtual IslamicCalendar* clone() const override;
+
+ protected:
+  virtual int64_t yearStart(int32_t year, UErrorCode& status) const;
+
+  virtual int64_t monthStart(int32_t year, int32_t month, UErrorCode& status) const;
+
+
+ protected:
+  virtual int32_t handleGetLimit(UCalendarDateFields field, ELimitType limitType) const override;
+  
+  virtual int32_t handleGetMonthLength(int32_t extendedYear, int32_t month, UErrorCode& status) const override;
+  
+  virtual int32_t handleGetYearLength(int32_t extendedYear, UErrorCode& status) const override;
+    
+
+  virtual int64_t handleComputeMonthStart(int32_t eyear, int32_t month, UBool useMonth, UErrorCode& status) const override;
+
+
+  virtual int32_t handleGetExtendedYear(UErrorCode& status) override;
+
+  virtual void handleComputeFields(int32_t julianDay, UErrorCode &status) override;
+
+  virtual int32_t getEpoc() const;
+
+ public: 
+  virtual UClassID getDynamicClassID() const override;
+
+   static UClassID U_EXPORT2 getStaticClassID();
+
+  virtual const char * getType() const override;
+
+  virtual int32_t getRelatedYear(UErrorCode &status) const override;
+
+  virtual void setRelatedYear(int32_t year) override;
+
+  virtual bool inTemporalLeapYear(UErrorCode &status) const override;
+
+ private:
+  IslamicCalendar() = delete; 
+
+ protected:
+
+  DECLARE_OVERRIDE_SYSTEM_DEFAULT_CENTURY
+};
+
+class U_I18N_API IslamicCivilCalendar : public IslamicCalendar {
+ public:
+  IslamicCivilCalendar(const Locale& aLocale, UErrorCode &success);
+
+  IslamicCivilCalendar(const IslamicCivilCalendar& other) = default;
+
+  virtual ~IslamicCivilCalendar();
+
+  virtual IslamicCivilCalendar* clone() const override;
+
+  virtual UClassID getDynamicClassID() const override;
+
+  static UClassID U_EXPORT2 getStaticClassID();
+
+  virtual const char * getType() const override;
+
+ protected:
+  virtual int64_t yearStart(int32_t year, UErrorCode& status) const override;
+
+  virtual int64_t monthStart(int32_t year, int32_t month, UErrorCode& status) const override;
+
+  virtual int32_t handleGetMonthLength(int32_t extendedYear, int32_t month, UErrorCode& status) const override;
+
+  virtual int32_t handleGetYearLength(int32_t extendedYear, UErrorCode& status) const override;
+
+  virtual void handleComputeFields(int32_t julianDay, UErrorCode &status) override;
+};
+
+class U_I18N_API IslamicTBLACalendar : public IslamicCivilCalendar {
+ public:
+  IslamicTBLACalendar(const Locale& aLocale, UErrorCode &success);
+
+  IslamicTBLACalendar(const IslamicTBLACalendar& other) = default;
+
+  virtual ~IslamicTBLACalendar();
+
+  virtual UClassID getDynamicClassID() const override;
+
+  static UClassID U_EXPORT2 getStaticClassID();
+
+  virtual const char * getType() const override;
+
+  virtual IslamicTBLACalendar* clone() const override;
+
+ protected:
+  virtual int32_t getEpoc() const override;
+};
+
+class U_I18N_API IslamicUmalquraCalendar : public IslamicCivilCalendar {
+ public:
+  IslamicUmalquraCalendar(const Locale& aLocale, UErrorCode &success);
+
+  IslamicUmalquraCalendar(const IslamicUmalquraCalendar& other) = default;
+
+  virtual ~IslamicUmalquraCalendar();
+
+  virtual UClassID getDynamicClassID() const override;
+
+  static UClassID U_EXPORT2 getStaticClassID();
+
+  virtual const char * getType() const override;
+
+  virtual IslamicUmalquraCalendar* clone() const override;
+
+ protected:
+  virtual int64_t yearStart(int32_t year, UErrorCode& status) const override;
+
+  virtual int64_t monthStart(int32_t year, int32_t month, UErrorCode& status) const override;
+
+  virtual int32_t handleGetMonthLength(int32_t extendedYear, int32_t month, UErrorCode& status) const override;
+
+  virtual int32_t handleGetYearLength(int32_t extendedYear, UErrorCode& status) const override;
+
+  virtual void handleComputeFields(int32_t julianDay, UErrorCode &status) override;
+
+ private:
+  virtual int32_t yearLength(int32_t extendedYear, UErrorCode& status) const;
+};
+
+
+class U_I18N_API IslamicRGSACalendar : public IslamicCalendar {
+ public:
+  IslamicRGSACalendar(const Locale& aLocale, UErrorCode &success);
+
+  IslamicRGSACalendar(const IslamicRGSACalendar& other) = default;
+
+  virtual ~IslamicRGSACalendar();
+
+  virtual UClassID getDynamicClassID() const override;
+
+  static UClassID U_EXPORT2 getStaticClassID();
+
+  virtual const char * getType() const override;
+
+  virtual IslamicRGSACalendar* clone() const override;
+};
+
+U_NAMESPACE_END
+
+#endif
+#endif

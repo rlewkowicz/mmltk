@@ -1,0 +1,726 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "charstr.h"
+#include "cmemory.h"
+#include "cstring.h"
+#ifdef JS_HAS_INTL_API
+#include "double-conversion/string-to-double.h"
+#else
+#include "double-conversion-string-to-double.h"
+#endif
+#include "measunit_impl.h"
+#include "putilimp.h"
+#include "uassert.h"
+#include "unicode/errorcode.h"
+#include "unicode/localpointer.h"
+#include "unicode/stringpiece.h"
+#include "units_converter.h"
+#include <algorithm>
+#include <cmath>
+#include <stdlib.h>
+#include <utility>
+
+U_NAMESPACE_BEGIN
+namespace units {
+
+void Factor::multiplyBy(const Factor& rhs) {
+    factorNum *= rhs.factorNum;
+    factorDen *= rhs.factorDen;
+    for (int i = 0; i < CONSTANTS_COUNT; i++) {
+        constantExponents[i] += rhs.constantExponents[i];
+    }
+
+    offset = std::max(rhs.offset, offset);
+}
+
+void Factor::divideBy(const Factor& rhs) {
+    factorNum *= rhs.factorDen;
+    factorDen *= rhs.factorNum;
+    for (int i = 0; i < CONSTANTS_COUNT; i++) {
+        constantExponents[i] -= rhs.constantExponents[i];
+    }
+
+    offset = std::max(rhs.offset, offset);
+}
+
+void Factor::divideBy(const uint64_t constant) { factorDen *= constant; }
+
+void Factor::power(int32_t power) {
+    for (int i = 0; i < CONSTANTS_COUNT; i++) {
+        constantExponents[i] *= power;
+    }
+
+    bool shouldFlip = power < 0; 
+
+    factorNum = std::pow(factorNum, std::abs(power));
+    factorDen = std::pow(factorDen, std::abs(power));
+
+    if (shouldFlip) {
+        std::swap(factorNum, factorDen);
+    }
+}
+
+void Factor::applyPrefix(UMeasurePrefix unitPrefix) {
+    if (unitPrefix == UMeasurePrefix::UMEASURE_PREFIX_ONE) {
+        return;
+    }
+
+    int32_t prefixPower = umeas_getPrefixPower(unitPrefix);
+    double prefixFactor = std::pow(static_cast<double>(umeas_getPrefixBase(unitPrefix)),
+                                   static_cast<double>(std::abs(prefixPower)));
+    if (prefixPower >= 0) {
+        factorNum *= prefixFactor;
+    } else {
+        factorDen *= prefixFactor;
+    }
+}
+
+void Factor::substituteConstants() {
+    for (int i = 0; i < CONSTANTS_COUNT; i++) {
+        if (this->constantExponents[i] == 0) {
+            continue;
+        }
+
+        auto absPower = std::abs(this->constantExponents[i]);
+        Signum powerSig = this->constantExponents[i] < 0 ? Signum::NEGATIVE : Signum::POSITIVE;
+        double absConstantValue = std::pow(constantsValues[i], absPower);
+
+        if (powerSig == Signum::NEGATIVE) {
+            this->factorDen *= absConstantValue;
+        } else {
+            this->factorNum *= absConstantValue;
+        }
+
+        this->constantExponents[i] = 0;
+    }
+}
+
+namespace {
+
+
+#ifdef JS_HAS_INTL_API
+using double_conversion::StringToDoubleConverter;
+#else
+using icu::double_conversion::StringToDoubleConverter;
+#endif
+
+double strToDouble(StringPiece strNum, UErrorCode &status) {
+    StringToDoubleConverter converter(0, 0, 0, "", "");
+    int32_t count;
+    double result = converter.StringToDouble(strNum.data(), strNum.length(), &count);
+    if (count != strNum.length()) {
+        status = U_INVALID_FORMAT_ERROR;
+    }
+
+    return result;
+}
+
+double strHasDivideSignToDouble(StringPiece strWithDivide, UErrorCode &status) {
+    int divisionSignInd = -1;
+    for (int i = 0, n = strWithDivide.length(); i < n; ++i) {
+        if (strWithDivide.data()[i] == '/') {
+            divisionSignInd = i;
+            break;
+        }
+    }
+
+    if (divisionSignInd >= 0) {
+        return strToDouble(strWithDivide.substr(0, divisionSignInd), status) /
+               strToDouble(strWithDivide.substr(divisionSignInd + 1), status);
+    }
+
+    return strToDouble(strWithDivide, status);
+}
+
+void addFactorElement(Factor &factor, StringPiece elementStr, Signum signum, UErrorCode &status) {
+    StringPiece baseStr;
+    StringPiece powerStr;
+    int32_t power =
+        1; 
+
+    int32_t powerInd = -1;
+    for (int32_t i = 0, n = elementStr.length(); i < n; ++i) {
+        if (elementStr.data()[i] == '^') {
+            powerInd = i;
+            break;
+        }
+    }
+
+    if (powerInd > -1) {
+        baseStr = elementStr.substr(0, powerInd);
+        powerStr = elementStr.substr(powerInd + 1);
+
+        power = static_cast<int32_t>(strToDouble(powerStr, status));
+    } else {
+        baseStr = elementStr;
+    }
+
+    addSingleFactorConstant(baseStr, power, signum, factor, status);
+}
+
+Factor extractFactorConversions(StringPiece stringFactor, UErrorCode &status) {
+    Factor result;
+    Signum signum = Signum::POSITIVE;
+    const auto* factorData = stringFactor.data();
+    for (int32_t i = 0, start = 0, n = stringFactor.length(); i < n; i++) {
+        if (factorData[i] == '*' || factorData[i] == '/') {
+            StringPiece factorElement = stringFactor.substr(start, i - start);
+            addFactorElement(result, factorElement, signum, status);
+
+            start = i + 1; 
+        } else if (i == n - 1) {
+            addFactorElement(result, stringFactor.substr(start, i + 1), signum, status);
+        }
+
+        if (factorData[i] == '/') {
+            signum = Signum::NEGATIVE; 
+        }
+    }
+
+    return result;
+}
+
+Factor loadSingleFactor(StringPiece source, const ConversionRates &ratesInfo, UErrorCode &status) {
+    const auto* const conversionUnit = ratesInfo.extractConversionInfo(source, status);
+    if (U_FAILURE(status)) return {};
+    if (conversionUnit == nullptr) {
+        status = U_INTERNAL_PROGRAM_ERROR;
+        return {};
+    }
+
+    Factor result = extractFactorConversions(conversionUnit->factor.data(), status);
+    result.offset = strHasDivideSignToDouble(conversionUnit->offset.data(), status);
+
+    return result;
+}
+
+Factor loadCompoundFactor(const MeasureUnitImpl &source, const ConversionRates &ratesInfo,
+                          UErrorCode &status) {
+
+    Factor result;
+    for (int32_t i = 0, n = source.singleUnits.length(); i < n; i++) {
+        SingleUnitImpl singleUnit = *source.singleUnits[i];
+
+        Factor singleFactor = loadSingleFactor(singleUnit.getSimpleUnitID(), ratesInfo, status);
+        if (U_FAILURE(status)) return result;
+
+        singleFactor.applyPrefix(singleUnit.unitPrefix);
+
+        singleFactor.power(singleUnit.dimensionality);
+
+        result.multiplyBy(singleFactor);
+    }
+
+    if (source.constantDenominator != 0) {
+        result.divideBy(source.constantDenominator);
+    }
+
+    return result;
+}
+
+UBool checkSimpleUnit(const MeasureUnitImpl &unit, UErrorCode &status) {
+    if (U_FAILURE(status)) return false;
+
+    if (unit.complexity != UMEASURE_UNIT_SINGLE) {
+        return false;
+    }
+    if (unit.singleUnits.length() == 0) {
+        return true;
+    }
+
+    auto singleUnit = *(unit.singleUnits[0]);
+
+    if (singleUnit.dimensionality != 1 || singleUnit.unitPrefix != UMEASURE_PREFIX_ONE) {
+        return false;
+    }
+
+    return true;
+}
+
+StringPiece getSpecialMappingName(const MeasureUnitImpl& simpleUnit, const ConversionRates& ratesInfo,
+                                  UErrorCode& status) {
+    if (!checkSimpleUnit(simpleUnit, status)) {
+        return {};
+    }
+    SingleUnitImpl singleUnit = *simpleUnit.singleUnits[0];
+    const auto* const conversionUnit =
+        ratesInfo.extractConversionInfo(singleUnit.getSimpleUnitID(), status);
+    if (U_FAILURE(status)) {
+        return {};
+    }
+    if (conversionUnit == nullptr) {
+        status = U_INTERNAL_PROGRAM_ERROR;
+        return {};
+    }
+    return conversionUnit->specialMappingName.data();
+}
+
+void loadConversionRate(ConversionRate &conversionRate, const MeasureUnitImpl &source,
+                        const MeasureUnitImpl &target, Convertibility unitsState,
+                        const ConversionRates &ratesInfo, UErrorCode &status) {
+    StringPiece specialSource = getSpecialMappingName(source, ratesInfo, status);
+    StringPiece specialTarget = getSpecialMappingName(target, ratesInfo, status);
+
+    conversionRate.specialSource = specialSource;
+    conversionRate.specialTarget = specialTarget;
+
+    if (conversionRate.specialSource.isEmpty() != specialSource.empty() ||
+        conversionRate.specialTarget.isEmpty() != specialTarget.empty()) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        return;
+    }
+
+    if (conversionRate.specialSource.isEmpty() && conversionRate.specialTarget.isEmpty()) {
+        Factor finalFactor;
+
+        Factor sourceToBase = loadCompoundFactor(source, ratesInfo, status);
+        Factor targetToBase = loadCompoundFactor(target, ratesInfo, status);
+
+        finalFactor.multiplyBy(sourceToBase);
+        if (unitsState == Convertibility::CONVERTIBLE) {
+            finalFactor.divideBy(targetToBase);
+        } else if (unitsState == Convertibility::RECIPROCAL) {
+            finalFactor.multiplyBy(targetToBase);
+        } else {
+            status = UErrorCode::U_ARGUMENT_TYPE_MISMATCH;
+            return;
+        }
+
+        finalFactor.substituteConstants();
+
+        conversionRate.factorNum = finalFactor.factorNum;
+        conversionRate.factorDen = finalFactor.factorDen;
+
+        if (checkSimpleUnit(source, status) && checkSimpleUnit(target, status)) {
+            conversionRate.sourceOffset =
+                sourceToBase.offset * sourceToBase.factorDen / sourceToBase.factorNum;
+            conversionRate.targetOffset =
+                targetToBase.offset * targetToBase.factorDen / targetToBase.factorNum;
+        }
+
+        conversionRate.reciprocal = unitsState == Convertibility::RECIPROCAL;
+    } else if (conversionRate.specialSource.isEmpty() || conversionRate.specialTarget.isEmpty()) {
+        if (unitsState != Convertibility::CONVERTIBLE) {
+            status = UErrorCode::U_ARGUMENT_TYPE_MISMATCH;
+            return;
+        }
+        Factor finalFactor;
+        if (conversionRate.specialSource.isEmpty()) {
+            finalFactor = loadCompoundFactor(source, ratesInfo, status);
+        } else {
+            finalFactor = loadCompoundFactor(target, ratesInfo, status);
+        }
+        finalFactor.substituteConstants();
+        conversionRate.factorNum = finalFactor.factorNum;
+        conversionRate.factorDen = finalFactor.factorDen;
+    }
+}
+
+struct UnitIndexAndDimension : UMemory {
+    int32_t index = 0;
+    int32_t dimensionality = 0;
+
+    UnitIndexAndDimension(const SingleUnitImpl &singleUnit, int32_t multiplier) {
+        index = singleUnit.index;
+        dimensionality = singleUnit.dimensionality * multiplier;
+    }
+};
+
+void mergeSingleUnitWithDimension(MaybeStackVector<UnitIndexAndDimension> &unitIndicesWithDimension,
+                                  const SingleUnitImpl &shouldBeMerged, int32_t multiplier) {
+    for (int32_t i = 0; i < unitIndicesWithDimension.length(); i++) {
+        auto &unitWithIndex = *unitIndicesWithDimension[i];
+        if (unitWithIndex.index == shouldBeMerged.index) {
+            unitWithIndex.dimensionality += shouldBeMerged.dimensionality * multiplier;
+            return;
+        }
+    }
+
+    unitIndicesWithDimension.emplaceBack(shouldBeMerged, multiplier);
+}
+
+void mergeUnitsAndDimensions(MaybeStackVector<UnitIndexAndDimension> &unitIndicesWithDimension,
+                             const MeasureUnitImpl &shouldBeMerged, int32_t multiplier) {
+    for (int32_t unit_i = 0; unit_i < shouldBeMerged.singleUnits.length(); unit_i++) {
+        auto singleUnit = *shouldBeMerged.singleUnits[unit_i];
+        mergeSingleUnitWithDimension(unitIndicesWithDimension, singleUnit, multiplier);
+    }
+}
+
+UBool checkAllDimensionsAreZeros(const MaybeStackVector<UnitIndexAndDimension> &dimensionVector) {
+    for (int32_t i = 0; i < dimensionVector.length(); i++) {
+        if (dimensionVector[i]->dimensionality != 0) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+} 
+
+void U_I18N_API addSingleFactorConstant(StringPiece baseStr, int32_t power, Signum signum,
+                                        Factor &factor, UErrorCode &status) {
+    if (baseStr == "ft_to_m") {
+        factor.constantExponents[CONSTANT_FT2M] += power * signum;
+    } else if (baseStr == "ft2_to_m2") {
+        factor.constantExponents[CONSTANT_FT2M] += 2 * power * signum;
+    } else if (baseStr == "ft3_to_m3") {
+        factor.constantExponents[CONSTANT_FT2M] += 3 * power * signum;
+    } else if (baseStr == "in3_to_m3") {
+        factor.constantExponents[CONSTANT_FT2M] += 3 * power * signum;
+        factor.factorDen *= std::pow(12 * 12 * 12, power * signum);
+    } else if (baseStr == "gal_to_m3") {
+        factor.constantExponents[CONSTANT_FT2M] += 3 * power * signum;
+        factor.factorNum *= std::pow(231, power * signum);
+        factor.factorDen *= std::pow(12 * 12 * 12, power * signum);
+    } else if (baseStr == "gal_imp_to_m3") {
+        factor.constantExponents[CONSTANT_GAL_IMP2M3] += power * signum;
+    } else if (baseStr == "G") {
+        factor.constantExponents[CONSTANT_G] += power * signum;
+    } else if (baseStr == "gravity") {
+        factor.constantExponents[CONSTANT_GRAVITY] += power * signum;
+    } else if (baseStr == "lb_to_kg") {
+        factor.constantExponents[CONSTANT_LB2KG] += power * signum;
+    } else if (baseStr == "glucose_molar_mass") {
+        factor.constantExponents[CONSTANT_GLUCOSE_MOLAR_MASS] += power * signum;
+    } else if (baseStr == "item_per_mole") {
+        factor.constantExponents[CONSTANT_ITEM_PER_MOLE] += power * signum;
+    } else if (baseStr == "meters_per_AU") {
+        factor.constantExponents[CONSTANT_METERS_PER_AU] += power * signum;
+    } else if (baseStr == "PI") {
+        factor.constantExponents[CONSTANT_PI] += power * signum;
+    } else if (baseStr == "sec_per_julian_year") {
+        factor.constantExponents[CONSTANT_SEC_PER_JULIAN_YEAR] += power * signum;
+    } else if (baseStr == "speed_of_light_meters_per_second") {
+        factor.constantExponents[CONSTANT_SPEED_OF_LIGHT_METERS_PER_SECOND] += power * signum;
+    } else if (baseStr == "sho_to_m3") {
+        factor.constantExponents[CONSTANT_SHO_TO_M3] += power * signum;
+    } else if (baseStr == "tsubo_to_m2") {
+        factor.constantExponents[CONSTANT_TSUBO_TO_M2] += power * signum;
+    } else if (baseStr == "shaku_to_m") {
+        factor.constantExponents[CONSTANT_SHAKU_TO_M] += power * signum;
+    } else if (baseStr == "AMU") {
+        factor.constantExponents[CONSTANT_AMU] += power * signum;
+    } else {
+        if (signum == Signum::NEGATIVE) {
+            factor.factorDen *= std::pow(strToDouble(baseStr, status), power);
+        } else {
+            factor.factorNum *= std::pow(strToDouble(baseStr, status), power);
+        }
+    }
+}
+
+MeasureUnitImpl extractCompoundBaseUnit(const MeasureUnitImpl& source,
+                                        const ConversionRates& conversionRates,
+                                        UErrorCode& status) {
+
+    MeasureUnitImpl result;
+    if (U_FAILURE(status)) return result;
+
+    const auto &singleUnits = source.singleUnits;
+    for (int i = 0, count = singleUnits.length(); i < count; ++i) {
+        const auto &singleUnit = *singleUnits[i];
+        const auto* const rateInfo =
+            conversionRates.extractConversionInfo(singleUnit.getSimpleUnitID(), status);
+        if (U_FAILURE(status)) {
+            return result;
+        }
+        if (rateInfo == nullptr) {
+            status = U_INTERNAL_PROGRAM_ERROR;
+            return result;
+        }
+
+        auto baseUnits =
+            MeasureUnitImpl::forIdentifier(rateInfo->baseUnit.data(), status).singleUnits;
+        for (int32_t i = 0, baseUnitsCount = baseUnits.length(); i < baseUnitsCount; i++) {
+            baseUnits[i]->dimensionality *= singleUnit.dimensionality;
+            result.appendSingleUnit(*baseUnits[i], status);
+
+            if (U_FAILURE(status)) {
+                return result;
+            }
+        }
+    }
+
+    return result;
+}
+
+Convertibility U_I18N_API extractConvertibility(const MeasureUnitImpl &source,
+                                                const MeasureUnitImpl &target,
+                                                const ConversionRates &conversionRates,
+                                                UErrorCode &status) {
+
+    if (source.complexity == UMeasureUnitComplexity::UMEASURE_UNIT_MIXED ||
+        target.complexity == UMeasureUnitComplexity::UMEASURE_UNIT_MIXED) {
+        status = U_ARGUMENT_TYPE_MISMATCH;
+        return UNCONVERTIBLE;
+    }
+
+    MeasureUnitImpl sourceBaseUnit = extractCompoundBaseUnit(source, conversionRates, status);
+    MeasureUnitImpl targetBaseUnit = extractCompoundBaseUnit(target, conversionRates, status);
+    if (U_FAILURE(status)) return UNCONVERTIBLE;
+
+    MaybeStackVector<UnitIndexAndDimension> convertible;
+    MaybeStackVector<UnitIndexAndDimension> reciprocal;
+
+    mergeUnitsAndDimensions(convertible, sourceBaseUnit, 1);
+    mergeUnitsAndDimensions(reciprocal, sourceBaseUnit, 1);
+
+    mergeUnitsAndDimensions(convertible, targetBaseUnit, -1);
+    mergeUnitsAndDimensions(reciprocal, targetBaseUnit, 1);
+
+    if (checkAllDimensionsAreZeros(convertible)) {
+        return CONVERTIBLE;
+    }
+
+    if (checkAllDimensionsAreZeros(reciprocal)) {
+        return RECIPROCAL;
+    }
+
+    return UNCONVERTIBLE;
+}
+
+UnitsConverter::UnitsConverter(const MeasureUnitImpl &source, const MeasureUnitImpl &target,
+                               const ConversionRates &ratesInfo, UErrorCode &status)
+    : conversionRate_(source.copy(status), target.copy(status)) {
+    this->init(ratesInfo, status);
+}
+
+UnitsConverter::UnitsConverter(StringPiece sourceIdentifier, StringPiece targetIdentifier,
+                               UErrorCode &status)
+    : conversionRate_(MeasureUnitImpl::forIdentifier(sourceIdentifier, status),
+                      MeasureUnitImpl::forIdentifier(targetIdentifier, status)) {
+    if (U_FAILURE(status)) {
+        return;
+    }
+
+    ConversionRates ratesInfo(status);
+    this->init(ratesInfo, status);
+}
+
+void UnitsConverter::init(const ConversionRates &ratesInfo, UErrorCode &status) {
+    if (U_FAILURE(status)) {
+        return;
+    }
+
+    if (this->conversionRate_.source.complexity == UMeasureUnitComplexity::UMEASURE_UNIT_MIXED ||
+        this->conversionRate_.target.complexity == UMeasureUnitComplexity::UMEASURE_UNIT_MIXED) {
+        status = U_ARGUMENT_TYPE_MISMATCH;
+        return;
+    }
+
+    Convertibility unitsState = extractConvertibility(this->conversionRate_.source,
+                                                      this->conversionRate_.target, ratesInfo, status);
+    if (U_FAILURE(status)) return;
+    if (unitsState == Convertibility::UNCONVERTIBLE) {
+        status = U_ARGUMENT_TYPE_MISMATCH;
+        return;
+    }
+
+    loadConversionRate(conversionRate_, conversionRate_.source, conversionRate_.target, unitsState,
+                       ratesInfo, status);
+
+}
+
+int32_t UnitsConverter::compareTwoUnits(const MeasureUnitImpl &firstUnit,
+                                        const MeasureUnitImpl &secondUnit,
+                                        const ConversionRates &ratesInfo, UErrorCode &status) {
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+
+    if (firstUnit.complexity == UMeasureUnitComplexity::UMEASURE_UNIT_MIXED ||
+        secondUnit.complexity == UMeasureUnitComplexity::UMEASURE_UNIT_MIXED) {
+        status = U_ARGUMENT_TYPE_MISMATCH;
+        return 0;
+    }
+
+    Convertibility unitsState = extractConvertibility(firstUnit, secondUnit, ratesInfo, status);
+    if (U_FAILURE(status)) {
+        return 0;
+    }
+
+    if (unitsState == Convertibility::UNCONVERTIBLE || unitsState == Convertibility::RECIPROCAL) {
+        status = U_ARGUMENT_TYPE_MISMATCH;
+        return 0;
+    }
+
+    StringPiece firstSpecial = getSpecialMappingName(firstUnit, ratesInfo, status);
+    StringPiece secondSpecial = getSpecialMappingName(secondUnit, ratesInfo, status);
+    if (!firstSpecial.empty() || !secondSpecial.empty()) {
+        if (firstSpecial.empty()) {
+            return -1;
+        }
+        if (secondSpecial.empty()) {
+            return 1;
+        }
+        return firstSpecial.compare(secondSpecial);
+    }
+
+    Factor firstUnitToBase = loadCompoundFactor(firstUnit, ratesInfo, status);
+    Factor secondUnitToBase = loadCompoundFactor(secondUnit, ratesInfo, status);
+
+    firstUnitToBase.substituteConstants();
+    secondUnitToBase.substituteConstants();
+
+    double firstUnitToBaseConversionRate = firstUnitToBase.factorNum / firstUnitToBase.factorDen;
+    double secondUnitToBaseConversionRate = secondUnitToBase.factorNum / secondUnitToBase.factorDen;
+
+    double diff = firstUnitToBaseConversionRate - secondUnitToBaseConversionRate;
+    if (diff > 0) {
+        return 1;
+    }
+
+    if (diff < 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static double minMetersPerSecForBeaufort[] = {
+    0.0, 
+    0.3, 
+    1.6, 
+    3.4, 
+    5.5, 
+    8.0, 
+    10.8, 
+    13.9, 
+    17.2, 
+    20.8, 
+    24.5, 
+    28.5, 
+    32.7, 
+    36.9, 
+    41.4, 
+    46.1, 
+    51.1, 
+    55.8, 
+    61.4, 
+};
+
+static int maxBeaufort = UPRV_LENGTHOF(minMetersPerSecForBeaufort) - 2;
+
+double UnitsConverter::scaleToBase(double scaleValue, double minBaseForScaleValues[], int scaleMax) const {
+    if (scaleValue < 0) {
+        scaleValue = -scaleValue;
+    }
+    scaleValue += 0.5; 
+    if (scaleValue > static_cast<double>(scaleMax)) {
+        scaleValue = static_cast<double>(scaleMax);
+    }
+    int scaleInt = static_cast<int>(scaleValue);
+    return (minBaseForScaleValues[scaleInt] + minBaseForScaleValues[scaleInt+1])/2.0;
+}
+
+static int bsearchRanges(double rangeStarts[], int max, double key) {
+    if (key >= rangeStarts[max]) {
+        return max;
+    }
+    int beg = 0, mid = 0, end = max + 1;
+    while (beg < end) {
+        mid = (beg + end) / 2;
+        if (key < rangeStarts[mid]) {
+            end = mid;
+        } else if (key > rangeStarts[mid+1]) {
+            beg = mid+1;
+        } else {
+            break;
+        }
+    }
+    return mid;
+}
+
+double UnitsConverter::baseToScale(double baseValue, double minBaseForScaleValues[], int scaleMax) const {
+    if (baseValue < 0) {
+        baseValue = -baseValue;
+    }
+    int scaleIndex = bsearchRanges(minBaseForScaleValues, scaleMax, baseValue);
+    return static_cast<double>(scaleIndex);
+}
+
+double UnitsConverter::convert(double inputValue) const {
+    double result = inputValue;
+    if (!conversionRate_.specialSource.isEmpty() || !conversionRate_.specialTarget.isEmpty()) {
+        double base = inputValue;
+        if (!conversionRate_.specialSource.isEmpty()) {
+            base = uprv_strcmp(conversionRate_.specialSource.data(), "beaufort") == 0 ?
+                scaleToBase(inputValue, minMetersPerSecForBeaufort, maxBeaufort): inputValue;
+        } else {
+            base = inputValue * conversionRate_.factorNum / conversionRate_.factorDen;
+        }
+        if (!conversionRate_.specialTarget.isEmpty()) {
+            result = uprv_strcmp(conversionRate_.specialTarget.data(), "beaufort") == 0 ?
+                baseToScale(base, minMetersPerSecForBeaufort, maxBeaufort): base;
+        } else {
+            result = base * conversionRate_.factorDen / conversionRate_.factorNum;
+        }
+        return result;
+    }
+    result =
+        inputValue + conversionRate_.sourceOffset; 
+    result *= conversionRate_.factorNum / conversionRate_.factorDen;
+
+    result -= conversionRate_.targetOffset; 
+
+    if (conversionRate_.reciprocal) {
+        if (result == 0) {
+            return uprv_getInfinity();
+        }
+        result = 1.0 / result;
+    }
+
+    return result;
+}
+
+double UnitsConverter::convertInverse(double inputValue) const {
+    double result = inputValue;
+    if (!conversionRate_.specialSource.isEmpty() || !conversionRate_.specialTarget.isEmpty()) {
+        double base = inputValue;
+        if (!conversionRate_.specialTarget.isEmpty()) {
+            base = uprv_strcmp(conversionRate_.specialTarget.data(), "beaufort") == 0 ?
+                scaleToBase(inputValue, minMetersPerSecForBeaufort, maxBeaufort): inputValue;
+        } else {
+            base = inputValue * conversionRate_.factorNum / conversionRate_.factorDen;
+        }
+        if (!conversionRate_.specialSource.isEmpty()) {
+            result = uprv_strcmp(conversionRate_.specialSource.data(), "beaufort") == 0 ?
+                baseToScale(base, minMetersPerSecForBeaufort, maxBeaufort): base;
+        } else {
+            result = base * conversionRate_.factorDen / conversionRate_.factorNum;
+        }
+        return result;
+    }
+    if (conversionRate_.reciprocal) {
+        if (result == 0) {
+            return uprv_getInfinity();
+        }
+        result = 1.0 / result;
+    }
+    result += conversionRate_.targetOffset;
+    result *= conversionRate_.factorDen / conversionRate_.factorNum;
+    result -= conversionRate_.sourceOffset;
+    return result;
+}
+
+ConversionInfo UnitsConverter::getConversionInfo() const {
+    ConversionInfo result;
+    result.conversionRate = conversionRate_.factorNum / conversionRate_.factorDen;
+    result.offset =
+        (conversionRate_.sourceOffset * (conversionRate_.factorNum / conversionRate_.factorDen)) -
+        conversionRate_.targetOffset;
+    result.reciprocal = conversionRate_.reciprocal;
+
+    return result;
+}
+
+} 
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_FORMATTING */

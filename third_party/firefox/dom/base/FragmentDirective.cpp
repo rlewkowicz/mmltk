@@ -1,0 +1,442 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "FragmentDirective.h"
+
+#include <cstdint>
+
+#include "BasePrincipal.h"
+#include "Document.h"
+#include "RangeBoundary.h"
+#include "TextDirectiveCreator.h"
+#include "TextDirectiveFinder.h"
+#include "TextDirectiveUtil.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/CycleCollectedUniquePtr.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/ResultVariant.h"
+#include "mozilla/dom/BrowsingContext.h"
+#include "mozilla/dom/BrowsingContextGroup.h"
+#include "mozilla/dom/FragmentDirectiveBinding.h"
+#include "mozilla/dom/FragmentOrElement.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/Selection.h"
+#include "nsContentUtils.h"
+#include "nsDocShell.h"
+#include "nsICSSDeclaration.h"
+#include "nsIFrame.h"
+#include "nsINode.h"
+#include "nsIURIMutator.h"
+#include "nsRange.h"
+#include "nsString.h"
+
+namespace mozilla::dom {
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(FragmentDirective, mDocument, mFinder)
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(FragmentDirective)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(FragmentDirective)
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(FragmentDirective)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+FragmentDirective::FragmentDirective(Document* aDocument)
+    : mDocument(aDocument) {}
+
+FragmentDirective::~FragmentDirective() = default;
+
+JSObject* FragmentDirective::WrapObject(JSContext* aCx,
+                                        JS::Handle<JSObject*> aGivenProto) {
+  return FragmentDirective_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+void FragmentDirective::SetTextDirectives(
+    nsTArray<TextDirective>&& aTextDirectives) {
+  MOZ_ASSERT(mDocument);
+  if (!aTextDirectives.IsEmpty()) {
+    mFinder.reset(
+        new TextDirectiveFinder(mDocument, std::move(aTextDirectives)));
+  } else {
+    mFinder = nullptr;
+  }
+}
+
+void FragmentDirective::ClearUninvokedDirectives() { mFinder = nullptr; }
+bool FragmentDirective::HasUninvokedDirectives() const { return !!mFinder; };
+
+bool FragmentDirective::ParseAndRemoveFragmentDirectiveFromFragmentString(
+    nsCString& aFragment, nsTArray<TextDirective>* aTextDirectives,
+    nsIURI* aURI) {
+  auto uri = TextDirectiveUtil::ShouldLog() && aURI ? aURI->GetSpecOrDefault()
+                                                    : nsCString();
+  if (aFragment.IsEmpty()) {
+    TEXT_FRAGMENT_LOG("URL '{}' has no fragment.", uri);
+    return false;
+  }
+  TEXT_FRAGMENT_LOG(
+      "Trying to extract a fragment directive from fragment '{}' of URL '{}'.",
+      aFragment, uri);
+  ParsedFragmentDirectiveResult fragmentDirective;
+  const bool hasRemovedFragmentDirective =
+      StaticPrefs::dom_text_fragments_enabled() &&
+      parse_fragment_directive(&aFragment, &fragmentDirective);
+  if (hasRemovedFragmentDirective) {
+    TEXT_FRAGMENT_LOG(
+        "Found a fragment directive '{}', which was removed from the fragment. "
+        "New fragment is '{}'.",
+        fragmentDirective.fragment_directive,
+        fragmentDirective.hash_without_fragment_directive);
+    if (TextDirectiveUtil::ShouldLog()) {
+      if (fragmentDirective.text_directives.IsEmpty()) {
+        TEXT_FRAGMENT_LOG(
+            "Found no valid text directives in fragment directive '{}'.",
+            fragmentDirective.fragment_directive);
+      } else {
+        TEXT_FRAGMENT_LOG(
+            "Found {} valid text directives in fragment directive '{}':",
+            fragmentDirective.text_directives.Length(),
+            fragmentDirective.fragment_directive);
+        for (size_t index = 0;
+             index < fragmentDirective.text_directives.Length(); ++index) {
+          const auto& textDirective = fragmentDirective.text_directives[index];
+          TEXT_FRAGMENT_LOG(" [{}]: {}", index, ToString(textDirective));
+        }
+      }
+    }
+    aFragment = fragmentDirective.hash_without_fragment_directive;
+    if (aTextDirectives) {
+      aTextDirectives->SwapElements(fragmentDirective.text_directives);
+    }
+  } else {
+    TEXT_FRAGMENT_LOG(
+        "Fragment '{}' of URL '{}' did not contain a fragment directive.",
+        aFragment, uri);
+  }
+  return hasRemovedFragmentDirective;
+}
+
+void FragmentDirective::ParseAndRemoveFragmentDirectiveFromFragment(
+    nsCOMPtr<nsIURI>& aURI, nsTArray<TextDirective>* aTextDirectives) {
+  if (!aURI || !StaticPrefs::dom_text_fragments_enabled()) {
+    return;
+  }
+  bool hasRef = false;
+  aURI->GetHasRef(&hasRef);
+
+  nsAutoCString hash;
+  aURI->GetRef(hash);
+  if (!hasRef || hash.IsEmpty()) {
+    TEXT_FRAGMENT_LOG("URL '{}' has no fragment. Exiting.",
+                      aURI->GetSpecOrDefault());
+  }
+
+  const bool hasRemovedFragmentDirective =
+      ParseAndRemoveFragmentDirectiveFromFragmentString(hash, aTextDirectives,
+                                                        aURI);
+  if (!hasRemovedFragmentDirective) {
+    return;
+  }
+  (void)NS_MutateURI(aURI).SetRef(hash).Finalize(aURI);
+  TEXT_FRAGMENT_LOG("Updated hash of the URL. New URL: {}",
+                    aURI->GetSpecOrDefault());
+}
+
+nsTArray<RefPtr<nsRange>> FragmentDirective::FindTextFragmentsInDocument() {
+  MOZ_ASSERT(mDocument);
+  if (!mFinder) {
+    auto uri = TextDirectiveUtil::ShouldLog() && mDocument->GetDocumentURI()
+                   ? mDocument->GetDocumentURI()->GetSpecOrDefault()
+                   : nsCString();
+    TEXT_FRAGMENT_LOG("No uninvoked text directives in document '{}'. Exiting.",
+                      uri);
+    return {};
+  }
+  RefPtr doc = mDocument;
+  doc->FlushPendingNotifications(FlushType::Layout);
+  if (!mFinder) {
+    return {};
+  }
+  auto textDirectives = mFinder->FindTextDirectivesInDocument();
+  if (!mFinder->HasUninvokedDirectives()) {
+    mFinder = nullptr;
+  }
+  return textDirectives;
+}
+
+ nsresult FragmentDirective::GetSpecIgnoringFragmentDirective(
+    nsCOMPtr<nsIURI>& aURI, nsACString& aSpecIgnoringFragmentDirective) {
+  bool hasRef = false;
+  if (aURI->GetHasRef(&hasRef); !hasRef) {
+    return aURI->GetSpec(aSpecIgnoringFragmentDirective);
+  }
+
+  nsAutoCString ref;
+  nsresult rv = aURI->GetRef(ref);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  rv = aURI->GetSpecIgnoringRef(aSpecIgnoringFragmentDirective);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  ParseAndRemoveFragmentDirectiveFromFragmentString(ref);
+
+  if (!ref.IsEmpty()) {
+    aSpecIgnoringFragmentDirective.Append('#');
+    aSpecIgnoringFragmentDirective.Append(ref);
+  }
+
+  return NS_OK;
+}
+
+bool FragmentDirective::IsTextDirectiveAllowedToBeScrolledTo() {
+
+  MOZ_ASSERT(mDocument);
+  auto uri = TextDirectiveUtil::ShouldLog() && mDocument->GetDocumentURI()
+                 ? mDocument->GetDocumentURI()->GetSpecOrDefault()
+                 : nsCString();
+  TEXT_FRAGMENT_LOG(
+      "Trying to find out if the load of URL '{}' is allowed to scroll to the "
+      "text fragment",
+      uri);
+
+  nsCOMPtr<nsILoadInfo> loadInfo =
+      mDocument->GetChannel() ? mDocument->GetChannel()->LoadInfo() : nullptr;
+  const bool isSameDocumentNavigation =
+      loadInfo && loadInfo->GetIsSameDocumentNavigation();
+
+  TEXT_FRAGMENT_LOG("Current load is{} a same-document navigation.",
+                    isSameDocumentNavigation ? "" : " not");
+
+
+  const bool textDirectiveUserActivation =
+      mDocument->ConsumeTextDirectiveUserActivation();
+  TEXT_FRAGMENT_LOG(
+      "Consumed Document's TextDirectiveUserActivation flag (value={})",
+      textDirectiveUserActivation ? "true" : "false");
+
+  const bool isAllowedMIMEType = [doc = this->mDocument, func = __FUNCTION__] {
+    nsAutoString contentType;
+    doc->GetContentType(contentType);
+    TEXT_FRAGMENT_LOG_FN("Got document MIME type: {}", func,
+                         NS_ConvertUTF16toUTF8(contentType));
+    return contentType == u"text/html" || contentType == u"text/plain";
+  }();
+
+  if (!isAllowedMIMEType) {
+    TEXT_FRAGMENT_LOG("Invalid document MIME type. Scrolling not allowed.");
+    return false;
+  }
+
+  auto* triggeringPrincipal =
+      loadInfo ? loadInfo->TriggeringPrincipal() : nullptr;
+  const bool isTriggeredFromBrowserUI =
+      triggeringPrincipal && triggeringPrincipal->IsSystemPrincipal();
+
+  if (isTriggeredFromBrowserUI) {
+    TEXT_FRAGMENT_LOG(
+        "The load is triggered from browser UI. Scrolling allowed.");
+    return true;
+  }
+  TEXT_FRAGMENT_LOG("The load is not triggered from browser UI.");
+  if (!textDirectiveUserActivation && !isSameDocumentNavigation) {
+    TEXT_FRAGMENT_LOG(
+        "User involvement is false and not same-document navigation. Scrolling "
+        "not allowed.");
+    return false;
+  }
+  nsDocShell* docShell = nsDocShell::Cast(mDocument->GetDocShell());
+  if (!isSameDocumentNavigation &&
+      (!docShell || !docShell->GetIsTopLevelContentDocShell())) {
+    TEXT_FRAGMENT_LOG(
+        "Document's node navigable has a parent and this is not a "
+        "same-document navigation. Scrolling not allowed.");
+    return false;
+  }
+  const bool isSameOrigin = [doc = this->mDocument, triggeringPrincipal] {
+    auto* docPrincipal = doc->GetPrincipal();
+    return triggeringPrincipal && docPrincipal &&
+           docPrincipal->Equals(triggeringPrincipal);
+  }();
+
+  if (isSameOrigin) {
+    TEXT_FRAGMENT_LOG("Same origin. Scrolling allowed.");
+    return true;
+  }
+  TEXT_FRAGMENT_LOG("Not same origin.");
+
+  if (BrowsingContextGroup* group =
+          mDocument->GetBrowsingContext()
+              ? mDocument->GetBrowsingContext()->Group()
+              : nullptr) {
+    const bool isNoOpenerContext = group->Toplevels().Length() == 1;
+    if (!isNoOpenerContext) {
+      TEXT_FRAGMENT_LOG(
+          "Cross-origin + noopener=false. Scrolling not allowed.");
+    }
+    return isNoOpenerContext;
+  }
+
+  TEXT_FRAGMENT_LOG("Scrolling not allowed.");
+  return false;
+}
+
+void FragmentDirective::HighlightTextDirectives(
+    const nsTArray<RefPtr<nsRange>>& aTextDirectiveRanges) {
+  MOZ_ASSERT(mDocument);
+  if (!StaticPrefs::dom_text_fragments_enabled()) {
+    return;
+  }
+  auto uri = TextDirectiveUtil::ShouldLog() && mDocument->GetDocumentURI()
+                 ? mDocument->GetDocumentURI()->GetSpecOrDefault()
+                 : nsCString();
+  if (aTextDirectiveRanges.IsEmpty()) {
+    TEXT_FRAGMENT_LOG(
+        "No text directive ranges to highlight for document '{}'. Exiting.",
+        uri);
+    return;
+  }
+
+  TEXT_FRAGMENT_LOG(
+      "Highlighting text directives for document '{}' ({} ranges).", uri,
+      aTextDirectiveRanges.Length());
+
+  const RefPtr<Selection> targetTextSelection =
+      [doc = this->mDocument]() -> Selection* {
+    if (auto* presShell = doc->GetPresShell()) {
+      return presShell->GetCurrentSelection(SelectionType::eTargetText);
+    }
+    return nullptr;
+  }();
+  if (!targetTextSelection) {
+    return;
+  }
+  for (const RefPtr<nsRange>& range : aTextDirectiveRanges) {
+    targetTextSelection->AddRangeAndSelectFramesAndNotifyListeners(
+        MOZ_KnownLive(*range), IgnoreErrors());
+  }
+  const nsRange* firstDirectiveRange = aTextDirectiveRanges[0];
+  for (uint32_t rangeIndex : IntegerRange(targetTextSelection->RangeCount())) {
+    if (targetTextSelection->GetRangeAt(rangeIndex) == firstDirectiveRange) {
+      targetTextSelection->SetAnchorFocusRange(rangeIndex);
+      break;
+    }
+  }
+}
+
+void FragmentDirective::GetTextDirectiveRanges(
+    nsTArray<RefPtr<nsRange>>& aRanges) const {
+  if (!StaticPrefs::dom_text_fragments_enabled()) {
+    return;
+  }
+  auto* presShell = mDocument ? mDocument->GetPresShell() : nullptr;
+  if (!presShell) {
+    return;
+  }
+  RefPtr<Selection> targetTextSelection =
+      presShell->GetCurrentSelection(SelectionType::eTargetText);
+  if (!targetTextSelection) {
+    return;
+  }
+
+  aRanges.Clear();
+  for (uint32_t rangeIndex = 0; rangeIndex < targetTextSelection->RangeCount();
+       ++rangeIndex) {
+    nsRange* range = targetTextSelection->GetRangeAt(rangeIndex);
+    MOZ_ASSERT(range);
+    aRanges.AppendElement(range);
+  }
+}
+void FragmentDirective::RemoveAllTextDirectives(ErrorResult& aRv) {
+  if (!StaticPrefs::dom_text_fragments_enabled()) {
+    return;
+  }
+  auto* presShell = mDocument ? mDocument->GetPresShell() : nullptr;
+  if (!presShell) {
+    return;
+  }
+  RefPtr<Selection> targetTextSelection =
+      presShell->GetCurrentSelection(SelectionType::eTargetText);
+  if (!targetTextSelection) {
+    return;
+  }
+  targetTextSelection->RemoveAllRanges(aRv);
+}
+
+already_AddRefed<Promise> FragmentDirective::CreateTextDirectiveForRanges(
+    const Sequence<OwningNonNull<nsRange>>& aRanges) {
+  RefPtr<Promise> resultPromise =
+      Promise::Create(mDocument->GetRelevantGlobal(), IgnoreErrors());
+  if (!resultPromise) {
+    return nullptr;
+  }
+  if (!StaticPrefs::dom_text_fragments_enabled()) {
+    TEXT_FRAGMENT_LOG("Creating text fragments is disabled.");
+    resultPromise->MaybeResolve(JS::NullHandleValue);
+    return resultPromise.forget();
+  }
+  if (aRanges.IsEmpty()) {
+    TEXT_FRAGMENT_LOG("No ranges. Nothing to do here...");
+    resultPromise->MaybeResolve(JS::NullHandleValue);
+    return resultPromise.forget();
+  }
+  TEXT_FRAGMENT_LOG("Creating text directive for {} ranges.", aRanges.Length());
+
+  nsTArray<nsCString> textDirectives;
+  textDirectives.SetCapacity(aRanges.Length());
+
+  RefPtr<TimeoutWatchdog> watchdog = new TimeoutWatchdog();
+  uint32_t rangeIndex = 0;
+  for (const auto& range : aRanges) {
+    ++rangeIndex;
+
+    if (range->Collapsed()) {
+      TEXT_FRAGMENT_LOG("Skipping collapsed range {}.", rangeIndex);
+      continue;
+    }
+    Result<nsCString, ErrorResult> maybeTextDirective =
+        TextDirectiveCreator::CreateTextDirectiveFromRange(mDocument, range,
+                                                           watchdog);
+    if (MOZ_UNLIKELY(maybeTextDirective.isErr())) {
+      TEXT_FRAGMENT_LOG("Failed to create text directive for range {}.",
+                        rangeIndex);
+      resultPromise->MaybeReject(maybeTextDirective.unwrapErr());
+      return resultPromise.forget();
+    }
+    nsCString textDirective = maybeTextDirective.unwrap();
+    if (textDirective.IsEmpty() || textDirective.IsVoid()) {
+      TEXT_FRAGMENT_LOG("Skipping empty text directive for range {}.",
+                        rangeIndex);
+      continue;
+    }
+    textDirectives.AppendElement(std::move(textDirective));
+    TEXT_FRAGMENT_LOG("Created text directive for range {}: {}", rangeIndex,
+                      textDirectives.LastElement());
+  }
+
+  if (watchdog->IsDone()) {
+    TEXT_FRAGMENT_LOG("Hitting timeout while creating text directives.");
+    resultPromise->MaybeResolve(JS::NullHandleValue);
+  } else if (textDirectives.IsEmpty()) {
+    TEXT_FRAGMENT_LOG("No text directives created.");
+    resultPromise->MaybeResolve(JS::NullHandleValue);
+  } else {
+    TEXT_FRAGMENT_LOG("Created {} text directives in total.",
+                      textDirectives.Length());
+    nsAutoCString textDirectivesString;
+    StringJoinAppend(textDirectivesString, "&"_ns, textDirectives);
+    TEXT_FRAGMENT_LOG("Created text directive string: '{}'.",
+                      textDirectivesString);
+    resultPromise->MaybeResolve(textDirectivesString);
+  }
+
+
+
+  return resultPromise.forget();
+}
+
+}  

@@ -1,0 +1,74 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_XMLDocument_h
+#define mozilla_dom_XMLDocument_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/Document.h"
+#include "nsIScriptContext.h"
+
+class nsIURI;
+class nsIChannel;
+
+namespace mozilla::dom {
+
+class XMLDocument : public Document {
+ public:
+  XMLDocument(const char* aContentType,
+              mozilla::dom::LoadedAsData aLoadedAsData);
+
+  NS_INLINE_DECL_REFCOUNTING_INHERITED(XMLDocument, Document)
+
+  virtual void Reset(nsIChannel* aChannel, nsILoadGroup* aLoadGroup) override;
+  virtual void ResetToURI(nsIURI* aURI, nsILoadGroup* aLoadGroup,
+                          nsIPrincipal* aPrincipal,
+                          nsIPrincipal* aPartitionedPrincipal) override;
+
+  virtual void SetSuppressParserErrorElement(bool aSuppress) override;
+  virtual bool SuppressParserErrorElement() override;
+
+  virtual void SetSuppressParserErrorConsoleMessages(bool aSuppress) override;
+  virtual bool SuppressParserErrorConsoleMessages() override;
+
+  virtual nsresult StartDocumentLoad(const char* aCommand, nsIChannel* channel,
+                                     nsILoadGroup* aLoadGroup,
+                                     nsISupports* aContainer,
+                                     nsIStreamListener** aDocListener,
+                                     bool aReset = true) override;
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY virtual void EndLoad() override;
+
+  virtual nsresult Init(nsIPrincipal* aPrincipal,
+                        nsIPrincipal* aPartitionedPrincipal) override;
+
+  virtual nsresult Clone(dom::NodeInfo*, nsINode** aResult) const override;
+
+  virtual void DocAddSizeOfExcludingThis(
+      nsWindowSizes& aWindowSizes) const override;
+
+  using Document::GetLocation;
+
+ protected:
+  virtual ~XMLDocument() = default;
+
+  virtual JSObject* WrapNode(JSContext* aCx,
+                             JS::Handle<JSObject*> aGivenProto) override;
+
+  friend nsresult(::NS_NewXMLDocument)(Document**, nsIPrincipal*, nsIPrincipal*,
+                                       mozilla::dom::LoadedAsData, bool);
+
+  bool mChannelIsPending;
+
+  bool mIsPlainDocument;
+
+  bool mSuppressParserErrorElement;
+
+  bool mSuppressParserErrorConsoleMessages;
+};
+
+}  
+
+#endif  // mozilla_dom_XMLDocument_h

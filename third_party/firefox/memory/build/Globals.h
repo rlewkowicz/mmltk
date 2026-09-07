@@ -1,0 +1,148 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(GLOBALS_H)
+#define GLOBALS_H
+
+
+#include "mozilla/Literals.h"
+
+#include "Constants.h"
+#include "Chunk.h"
+#include "Mutex.h"
+#include "Utils.h"
+
+
+#if defined(MOZ_DEBUG)
+#  define MALLOC_RUNTIME_CONFIG
+#endif
+
+
+#if !defined(MALLOC_RUNTIME_CONFIG)
+#if !0 && !0 && !defined(__ia64__) &&     \
+      !defined(__sparc__) && !defined(__mips__) && !defined(__aarch64__) && \
+      !defined(__powerpc__) && !defined(__loongarch__)
+#    define MALLOC_STATIC_PAGESIZE 1
+#endif
+#endif
+
+namespace mozilla {
+
+#if defined(MALLOC_STATIC_PAGESIZE)
+#if defined(__powerpc64__)
+static const size_t gRealPageSize = 64_KiB;
+#elif defined(__loongarch64)
+static const size_t gRealPageSize = 16_KiB;
+#else
+static const size_t gRealPageSize = 4_KiB;
+#endif
+static const size_t gPageSize = gRealPageSize;
+#else
+extern size_t gRealPageSize;
+extern size_t gPageSize;
+#endif
+
+#define PAGE_CEILING(s) \
+  (((s) + mozilla::gPageSizeMask) & ~mozilla::gPageSizeMask)
+#define REAL_PAGE_CEILING(s) (((s) + gRealPageSizeMask) & ~gRealPageSizeMask)
+
+#define REAL_PAGE_FLOOR(s) ((s) & ~gRealPageSizeMask)
+
+#define PAGES_PER_REAL_PAGE_CEILING(s) \
+  (((s) + gPagesPerRealPage - 1) & ~(gPagesPerRealPage - 1))
+
+#if defined(MALLOC_STATIC_PAGESIZE)
+#  define GLOBAL(type, name, value) static const type name = value;
+#  define GLOBAL_LOG2 LOG2
+#  define GLOBAL_ASSERT_HELPER1(x) static_assert(x, #x)
+#  define GLOBAL_ASSERT_HELPER2(x, y) static_assert(x, y)
+#  define GLOBAL_ASSERT(...)                                          \
+                                                                      \
+    MOZ_PASTE_PREFIX_AND_ARG_COUNT(GLOBAL_ASSERT_HELPER, __VA_ARGS__) \
+    (__VA_ARGS__)
+#  define GLOBAL_CONSTEXPR constexpr
+#  include "Globals.inc"
+#  undef GLOBAL_CONSTEXPR
+#  undef GLOBAL_ASSERT
+#  undef GLOBAL_ASSERT_HELPER1
+#  undef GLOBAL_ASSERT_HELPER2
+#  undef GLOBAL_LOG2
+#  undef GLOBAL
+#else
+#  define GLOBAL(type, name, value) extern type name;
+#  define GLOBAL_ASSERT(...)
+#  include "Globals.inc"
+#  undef GLOBAL_ASSERT
+#  undef GLOBAL
+
+void DefineGlobals();
+#endif
+
+#define gMaxBinClass \
+  (gMaxSubPageClass ? gMaxSubPageClass : kMaxQuantumWideClass)
+
+#define CHUNK_CEILING(s) (((s) + kChunkSizeMask) & ~kChunkSizeMask)
+
+#define CACHELINE_CEILING(s) (((s) + kCacheLineMask) & ~kCacheLineMask)
+
+#define QUANTUM_CEILING(a) (((a) + (kQuantumMask)) & ~(kQuantumMask))
+#define QUANTUM_WIDE_CEILING(a) \
+  (((a) + (kQuantumWideMask)) & ~(kQuantumWideMask))
+
+#define SUBPAGE_CEILING(a) (std::bit_ceil(a))
+
+#define NUM_SMALL_CLASSES \
+  (kNumQuantumClasses + kNumQuantumWideClasses + gNumSubPageClasses)
+
+static inline arena_chunk_t* GetChunkForPtr(const void* aPtr) {
+  return (arena_chunk_t*)(uintptr_t(aPtr) & ~kChunkSizeMask);
+}
+
+static inline size_t GetChunkOffsetForPtr(const void* aPtr) {
+  return (size_t)(uintptr_t(aPtr) & kChunkSizeMask);
+}
+
+#define DIRTY_MAX_DEFAULT (1U << 8)
+
+enum PoisonType {
+  NONE,
+  SOME,
+  ALL,
+};
+
+extern size_t opt_dirty_max;
+
+#define OPT_JUNK_DEFAULT false
+#define OPT_ZERO_DEFAULT false
+#if defined(EARLY_BETA_OR_EARLIER)
+#  define OPT_POISON_DEFAULT ALL
+#else
+#  define OPT_POISON_DEFAULT SOME
+#endif
+#define OPT_POISON_SIZE_DEFAULT 256
+
+#if defined(MALLOC_RUNTIME_CONFIG)
+
+extern bool opt_junk;
+extern bool opt_zero;
+extern PoisonType opt_poison;
+extern size_t opt_poison_size;
+
+#else
+
+constexpr bool opt_junk = OPT_JUNK_DEFAULT;
+constexpr bool opt_zero = OPT_ZERO_DEFAULT;
+constexpr PoisonType opt_poison = OPT_POISON_DEFAULT;
+constexpr size_t opt_poison_size = OPT_POISON_SIZE_DEFAULT;
+
+static_assert(opt_poison_size >= kCacheLineSize);
+static_assert((opt_poison_size % kCacheLineSize) == 0);
+
+#endif
+
+extern bool opt_randomize_small;
+
+}  
+
+#endif

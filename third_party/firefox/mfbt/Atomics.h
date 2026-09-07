@@ -1,0 +1,360 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_Atomics_h
+#define mozilla_Atomics_h
+
+#include "mozilla/Attributes.h"
+
+#ifdef __wasi__
+#  include "mozilla/WasiAtomic.h"
+#else
+#  include <atomic>
+#endif  // __wasi__
+
+#include <cstddef>
+#include <cstdint>
+#include <type_traits>
+
+#if defined(__i386) || defined(_M_IX86) || defined(__x86_64__) || \
+    defined(_M_X64)
+#  include <emmintrin.h>
+#endif
+
+namespace mozilla {
+
+enum MemoryOrdering : uint8_t {
+  Relaxed,
+
+  ReleaseAcquire,
+
+  SequentiallyConsistent,
+};
+
+namespace detail {
+
+template <MemoryOrdering Order>
+struct AtomicOrderConstraints;
+
+template <>
+struct AtomicOrderConstraints<Relaxed> {
+  static const std::memory_order AtomicRMWOrder = std::memory_order_relaxed;
+  static const std::memory_order LoadOrder = std::memory_order_relaxed;
+  static const std::memory_order StoreOrder = std::memory_order_relaxed;
+  static const std::memory_order CompareExchangeFailureOrder =
+      std::memory_order_relaxed;
+};
+
+template <>
+struct AtomicOrderConstraints<ReleaseAcquire> {
+  static const std::memory_order AtomicRMWOrder = std::memory_order_acq_rel;
+  static const std::memory_order LoadOrder = std::memory_order_acquire;
+  static const std::memory_order StoreOrder = std::memory_order_release;
+  static const std::memory_order CompareExchangeFailureOrder =
+      std::memory_order_acquire;
+};
+
+template <>
+struct AtomicOrderConstraints<SequentiallyConsistent> {
+  static const std::memory_order AtomicRMWOrder = std::memory_order_seq_cst;
+  static const std::memory_order LoadOrder = std::memory_order_seq_cst;
+  static const std::memory_order StoreOrder = std::memory_order_seq_cst;
+  static const std::memory_order CompareExchangeFailureOrder =
+      std::memory_order_seq_cst;
+};
+
+template <typename T, MemoryOrdering Order>
+struct IntrinsicBase {
+  typedef std::atomic<T> ValueType;
+  typedef AtomicOrderConstraints<Order> OrderedOp;
+};
+
+template <typename T, MemoryOrdering Order>
+struct IntrinsicMemoryOps : public IntrinsicBase<T, Order> {
+  typedef IntrinsicBase<T, Order> Base;
+
+  static T load(const typename Base::ValueType& aPtr) {
+    return aPtr.load(Base::OrderedOp::LoadOrder);
+  }
+
+  static void store(typename Base::ValueType& aPtr, T aVal) {
+    aPtr.store(aVal, Base::OrderedOp::StoreOrder);
+  }
+
+  static T exchange(typename Base::ValueType& aPtr, T aVal) {
+    return aPtr.exchange(aVal, Base::OrderedOp::AtomicRMWOrder);
+  }
+
+  static bool compareExchange(typename Base::ValueType& aPtr, T aOldVal,
+                              T aNewVal) {
+    return aPtr.compare_exchange_strong(
+        aOldVal, aNewVal, Base::OrderedOp::AtomicRMWOrder,
+        Base::OrderedOp::CompareExchangeFailureOrder);
+  }
+};
+
+template <typename T, MemoryOrdering Order>
+struct IntrinsicAddSub : public IntrinsicBase<T, Order> {
+  typedef IntrinsicBase<T, Order> Base;
+
+  static T add(typename Base::ValueType& aPtr, T aVal) {
+    return aPtr.fetch_add(aVal, Base::OrderedOp::AtomicRMWOrder);
+  }
+
+  static T sub(typename Base::ValueType& aPtr, T aVal) {
+    return aPtr.fetch_sub(aVal, Base::OrderedOp::AtomicRMWOrder);
+  }
+};
+
+template <typename T, MemoryOrdering Order>
+struct IntrinsicAddSub<T*, Order> : public IntrinsicBase<T*, Order> {
+  typedef IntrinsicBase<T*, Order> Base;
+
+  static T* add(typename Base::ValueType& aPtr, ptrdiff_t aVal) {
+    return aPtr.fetch_add(aVal, Base::OrderedOp::AtomicRMWOrder);
+  }
+
+  static T* sub(typename Base::ValueType& aPtr, ptrdiff_t aVal) {
+    return aPtr.fetch_sub(aVal, Base::OrderedOp::AtomicRMWOrder);
+  }
+};
+
+template <typename T, MemoryOrdering Order>
+struct IntrinsicIncDec : public IntrinsicAddSub<T, Order> {
+  typedef IntrinsicBase<T, Order> Base;
+
+  static T inc(typename Base::ValueType& aPtr) {
+    return IntrinsicAddSub<T, Order>::add(aPtr, 1);
+  }
+
+  static T dec(typename Base::ValueType& aPtr) {
+    return IntrinsicAddSub<T, Order>::sub(aPtr, 1);
+  }
+};
+
+template <typename T, MemoryOrdering Order>
+struct MOZ_EMPTY_BASES AtomicIntrinsics : public IntrinsicMemoryOps<T, Order>,
+                                          public IntrinsicIncDec<T, Order> {
+  typedef IntrinsicBase<T, Order> Base;
+
+  static T or_(typename Base::ValueType& aPtr, T aVal) {
+    return aPtr.fetch_or(aVal, Base::OrderedOp::AtomicRMWOrder);
+  }
+
+  static T xor_(typename Base::ValueType& aPtr, T aVal) {
+    return aPtr.fetch_xor(aVal, Base::OrderedOp::AtomicRMWOrder);
+  }
+
+  static T and_(typename Base::ValueType& aPtr, T aVal) {
+    return aPtr.fetch_and(aVal, Base::OrderedOp::AtomicRMWOrder);
+  }
+};
+
+template <typename T, MemoryOrdering Order>
+struct MOZ_EMPTY_BASES
+    AtomicIntrinsics<T*, Order> : public IntrinsicMemoryOps<T*, Order>,
+                                  public IntrinsicIncDec<T*, Order> {};
+
+template <typename T>
+struct ToStorageTypeArgument {
+  static constexpr T convert(T aT) { return aT; }
+};
+
+template <typename T, MemoryOrdering Order>
+class AtomicBase {
+  static_assert(sizeof(T) == 4 || sizeof(T) == 8,
+                "mozilla/Atomics.h only supports 32-bit and 64-bit types");
+
+ protected:
+  typedef typename detail::AtomicIntrinsics<T, Order> Intrinsics;
+  typedef typename Intrinsics::ValueType ValueType;
+  ValueType mValue;
+
+ public:
+  constexpr AtomicBase() : mValue() {}
+  explicit constexpr AtomicBase(T aInit)
+      : mValue(ToStorageTypeArgument<T>::convert(aInit)) {}
+
+
+  T operator=(T aVal) {
+    Intrinsics::store(mValue, aVal);
+    return aVal;
+  }
+
+  T exchange(T aVal) { return Intrinsics::exchange(mValue, aVal); }
+
+  bool compareExchange(T aOldValue, T aNewValue) {
+    return Intrinsics::compareExchange(mValue, aOldValue, aNewValue);
+  }
+
+ private:
+  AtomicBase(const AtomicBase& aCopy) = delete;
+};
+
+template <typename T, MemoryOrdering Order>
+class AtomicBaseIncDec : public AtomicBase<T, Order> {
+  typedef typename detail::AtomicBase<T, Order> Base;
+
+ public:
+  constexpr AtomicBaseIncDec() : Base() {}
+  explicit constexpr AtomicBaseIncDec(T aInit) : Base(aInit) {}
+
+  using Base::operator=;
+
+  operator T() const { return Base::Intrinsics::load(Base::mValue); }
+  T operator++(int) { return Base::Intrinsics::inc(Base::mValue); }
+  T operator--(int) { return Base::Intrinsics::dec(Base::mValue); }
+  T operator++() { return Base::Intrinsics::inc(Base::mValue) + 1; }
+  T operator--() { return Base::Intrinsics::dec(Base::mValue) - 1; }
+
+ private:
+  AtomicBaseIncDec(const AtomicBaseIncDec& aCopy) = delete;
+};
+
+}  
+
+template <typename T, MemoryOrdering Order = SequentiallyConsistent,
+          typename Enable = void>
+class Atomic;
+
+template <typename T, MemoryOrdering Order>
+class Atomic<
+    T, Order,
+    std::enable_if_t<std::is_integral_v<T> && !std::is_same_v<T, bool>>>
+    : public detail::AtomicBaseIncDec<T, Order> {
+  typedef typename detail::AtomicBaseIncDec<T, Order> Base;
+
+ public:
+  constexpr Atomic() : Base() {}
+  explicit constexpr Atomic(T aInit) : Base(aInit) {}
+
+  using Base::operator=;
+
+  T operator+=(T aDelta) {
+    return Base::Intrinsics::add(Base::mValue, aDelta) + aDelta;
+  }
+
+  T operator-=(T aDelta) {
+    return Base::Intrinsics::sub(Base::mValue, aDelta) - aDelta;
+  }
+
+  T operator|=(T aVal) {
+    return Base::Intrinsics::or_(Base::mValue, aVal) | aVal;
+  }
+
+  T operator^=(T aVal) {
+    return Base::Intrinsics::xor_(Base::mValue, aVal) ^ aVal;
+  }
+
+  T operator&=(T aVal) {
+    return Base::Intrinsics::and_(Base::mValue, aVal) & aVal;
+  }
+
+ private:
+  Atomic(Atomic& aOther) = delete;
+};
+
+template <typename T, MemoryOrdering Order>
+class Atomic<T*, Order> : public detail::AtomicBaseIncDec<T*, Order> {
+  typedef typename detail::AtomicBaseIncDec<T*, Order> Base;
+
+ public:
+  constexpr Atomic() : Base() {}
+  explicit constexpr Atomic(T* aInit) : Base(aInit) {}
+
+  using Base::operator=;
+
+  T* operator+=(ptrdiff_t aDelta) {
+    return Base::Intrinsics::add(Base::mValue, aDelta) + aDelta;
+  }
+
+  T* operator-=(ptrdiff_t aDelta) {
+    return Base::Intrinsics::sub(Base::mValue, aDelta) - aDelta;
+  }
+
+ private:
+  Atomic(Atomic& aOther) = delete;
+};
+
+template <typename T, MemoryOrdering Order>
+class Atomic<T, Order, std::enable_if_t<std::is_enum_v<T>>>
+    : public detail::AtomicBase<T, Order> {
+  typedef typename detail::AtomicBase<T, Order> Base;
+
+ public:
+  constexpr Atomic() : Base() {}
+  explicit constexpr Atomic(T aInit) : Base(aInit) {}
+
+  operator T() const { return T(Base::Intrinsics::load(Base::mValue)); }
+
+  using Base::operator=;
+
+ private:
+  Atomic(Atomic& aOther) = delete;
+};
+
+template <MemoryOrdering Order>
+class Atomic<bool, Order> : protected detail::AtomicBase<uint32_t, Order> {
+  typedef typename detail::AtomicBase<uint32_t, Order> Base;
+
+ public:
+  constexpr Atomic() : Base() {}
+  explicit constexpr Atomic(bool aInit) : Base(aInit) {}
+
+  MOZ_IMPLICIT operator bool() const {
+    return Base::Intrinsics::load(Base::mValue);
+  }
+
+  bool operator=(bool aVal) { return Base::operator=(aVal); }
+
+  bool exchange(bool aVal) { return Base::exchange(aVal); }
+
+  bool compareExchange(bool aOldValue, bool aNewValue) {
+    return Base::compareExchange(aOldValue, aNewValue);
+  }
+
+ private:
+  Atomic(Atomic& aOther) = delete;
+};
+
+template <MemoryOrdering Order>
+class Atomic<double, Order> : protected detail::AtomicBase<double, Order> {
+  typedef typename detail::AtomicBase<double, Order> Base;
+
+ public:
+  constexpr Atomic() : Base() {}
+  explicit constexpr Atomic(double aInit) : Base(aInit) {}
+
+  operator double() const {
+    return double(Base::Intrinsics::load(Base::mValue));
+  }
+
+  double operator=(double aVal) { return Base::operator=(aVal); }
+
+ private:
+  Atomic(Atomic& aOther) = delete;
+};
+
+inline void cpu_pause() {
+#if defined(__i386) || defined(_M_IX86) || defined(__x86_64__) || \
+    defined(_M_X64)
+  _mm_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+  __asm__ __volatile__("yield");
+#else
+  __asm__ __volatile__("" ::: "memory");
+#endif
+}
+
+}  
+
+namespace std {
+
+template <typename T, mozilla::MemoryOrdering Order>
+void swap(mozilla::Atomic<T, Order>&, mozilla::Atomic<T, Order>&) = delete;
+
+}  
+
+#endif /* mozilla_Atomics_h */

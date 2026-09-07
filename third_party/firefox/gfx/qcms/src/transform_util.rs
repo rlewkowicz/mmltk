@@ -1,0 +1,487 @@
+//  Copyright (C) 2009 Mozilla Foundation
+//  Copyright (C) 1998-2007 Marti Maria
+// Permission is hereby granted, free of charge, to any person obtaining
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// The above copyright notice and this permission notice shall be included in
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+
+use crate::{
+    iccread::{curveType, Profile},
+    s15Fixed16Number_to_float,
+};
+use crate::{matrix::Matrix, transform::PRECACHE_OUTPUT_MAX, transform::PRECACHE_OUTPUT_SIZE};
+
+pub type uint16_fract_t = u16;
+
+#[inline]
+fn u8Fixed8Number_to_float(x: u16) -> f32 {
+    (x as i32 as f64 / 256.0) as f32
+}
+#[inline]
+pub fn clamp_float(a: f32) -> f32 {
+    if a > 1. {
+        1.
+    } else if a >= 0. {
+        a
+    } else {
+        0.
+    }
+}
+pub fn lut_interp_linear(mut input_value: f64, table: &[u16]) -> f32 {
+    if table.is_empty() {
+        return input_value as f32;
+    }
+
+    input_value *= (table.len() - 1) as f64;
+
+    let upper: i32 = input_value.ceil() as i32;
+    let lower: i32 = input_value.floor() as i32;
+    let value: f32 = ((table[(upper as usize).min(table.len() - 1)] as f64)
+        * (1. - (upper as f64 - input_value))
+        + (table[(lower as usize).min(table.len() - 1)] as f64 * (upper as f64 - input_value)))
+        as f32;
+    value * (1.0 / 65535.0)
+}
+#[no_mangle]
+pub fn lut_interp_linear16(input_value: u16, table: &[u16]) -> u16 {
+    let mut value: u32 = (input_value as i32 * (table.len() as i32 - 1)) as u32; 
+    let upper: u32 = (value + 65534) / 65535; 
+    let lower: u32 = value / 65535;
+    let interp: u32 = value % 65535; 
+    value = (table[upper as usize] as u32 * interp
+        + table[lower as usize] as u32 * (65535 - interp))
+        / 65535;
+    value as u16
+}
+fn lut_interp_linear_precache_output(input_value: u32, table: &[u16]) -> u8 {
+    let mut value: u32 = input_value * (table.len() - 1) as u32;
+    let upper: u32 = (value + PRECACHE_OUTPUT_MAX as u32 - 1) / PRECACHE_OUTPUT_MAX as u32;
+    let lower: u32 = value / PRECACHE_OUTPUT_MAX as u32;
+    let interp: u32 = value % PRECACHE_OUTPUT_MAX as u32;
+    value = table[upper as usize] as u32 * interp
+        + table[lower as usize] as u32 * (PRECACHE_OUTPUT_MAX as u32 - interp); 
+    value += (PRECACHE_OUTPUT_MAX * 65535 / 255 / 2) as u32; 
+    value /= (PRECACHE_OUTPUT_MAX * 65535 / 255) as u32;
+    value as u8
+}
+pub fn lut_interp_linear_float(mut value: f32, table: &[f32]) -> f32 {
+    value *= (table.len() - 1) as f32;
+
+    let upper: i32 = value.ceil() as i32;
+    let lower: i32 = value.floor() as i32;
+    value = (table[upper as usize] as f64 * (1.0f64 - (upper as f32 - value) as f64)
+        + (table[lower as usize] * (upper as f32 - value)) as f64) as f32;
+    value
+}
+
+fn compute_curve_gamma_table_type1(gamma_table: &mut [f32; 256], gamma: u16) {
+    let gamma_float: f32 = u8Fixed8Number_to_float(gamma);
+    for (i, g) in gamma_table.iter_mut().enumerate() {
+        *g = (i as f64 / 255.0).powf(gamma_float as f64) as f32;
+    }
+}
+
+fn compute_curve_gamma_table_type2(gamma_table: &mut [f32; 256], table: &[u16]) {
+    for (i, g) in gamma_table.iter_mut().enumerate() {
+        *g = lut_interp_linear(i as f64 / 255.0, table);
+    }
+}
+
+fn compute_curve_gamma_table_type_parametric(gamma_table: &mut [f32; 256], params: &[f32]) {
+    let params = Param::new(params);
+    for (i, g) in gamma_table.iter_mut().enumerate() {
+        let X = i as f32 / 255.;
+        *g = clamp_float(params.eval(X));
+    }
+}
+
+fn compute_curve_gamma_table_type0(gamma_table: &mut [f32; 256]) {
+    for (i, g) in gamma_table.iter_mut().enumerate() {
+        *g = (i as f64 / 255.0) as f32;
+    }
+}
+
+#[inline(always)]
+pub(crate) fn build_input_gamma_table(TRC: &curveType) -> [f32; 256] {
+    let mut gamma_table = [0.; 256];
+    match TRC {
+        curveType::Parametric(params) => {
+            compute_curve_gamma_table_type_parametric(&mut gamma_table, params)
+        }
+        curveType::Curve(data) => match data.len() {
+            0 => compute_curve_gamma_table_type0(&mut gamma_table),
+            1 => compute_curve_gamma_table_type1(&mut gamma_table, data[0]),
+            _ => compute_curve_gamma_table_type2(&mut gamma_table, data),
+        },
+    };
+    gamma_table
+}
+
+pub fn build_colorant_matrix(p: &Profile) -> Matrix {
+    let mut result: Matrix = Matrix { m: [[0.; 3]; 3] };
+    result.m[0][0] = s15Fixed16Number_to_float(p.redColorant.X);
+    result.m[0][1] = s15Fixed16Number_to_float(p.greenColorant.X);
+    result.m[0][2] = s15Fixed16Number_to_float(p.blueColorant.X);
+    result.m[1][0] = s15Fixed16Number_to_float(p.redColorant.Y);
+    result.m[1][1] = s15Fixed16Number_to_float(p.greenColorant.Y);
+    result.m[1][2] = s15Fixed16Number_to_float(p.blueColorant.Y);
+    result.m[2][0] = s15Fixed16Number_to_float(p.redColorant.Z);
+    result.m[2][1] = s15Fixed16Number_to_float(p.greenColorant.Z);
+    result.m[2][2] = s15Fixed16Number_to_float(p.blueColorant.Z);
+    result
+}
+
+/** Parametric representation of transfer function */
+#[derive(Debug)]
+struct Param {
+    g: f32,
+    a: f32,
+    b: f32,
+    c: f32,
+    d: f32,
+    e: f32,
+    f: f32,
+}
+
+impl Param {
+    #[allow(clippy::many_single_char_names)]
+    fn new(params: &[f32]) -> Param {
+        let g: f32 = params[0];
+        match params[1..] {
+            [] => Param {
+                g,
+                a: 1.,
+                b: 0.,
+                c: 1.,
+                d: 0.,
+                e: 0.,
+                f: 0.,
+            },
+            [a, b] => Param {
+                g,
+                a,
+                b,
+                c: 0.,
+                d: -b / a,
+                e: 0.,
+                f: 0.,
+            },
+            [a, b, c] => Param {
+                g,
+                a,
+                b,
+                c: 0.,
+                d: -b / a,
+                e: c,
+                f: c,
+            },
+            [a, b, c, d] => Param {
+                g,
+                a,
+                b,
+                c,
+                d,
+                e: 0.,
+                f: 0.,
+            },
+            [a, b, c, d, e, f] => Param {
+                g,
+                a,
+                b,
+                c,
+                d,
+                e,
+                f,
+            },
+            _ => panic!(),
+        }
+    }
+
+    fn eval(&self, x: f32) -> f32 {
+        if x < self.d {
+            self.c * x + self.f
+        } else {
+            (self.a * x + self.b).powf(self.g) + self.e
+        }
+    }
+    #[allow(clippy::many_single_char_names)]
+    fn invert(&self) -> Option<Param> {
+        let d1 = (self.a * self.d + self.b).powf(self.g) + self.e;
+        let d2 = self.c * self.d + self.f;
+
+        if (d1 - d2).abs() > 0.1 {
+            return None;
+        }
+        let d = d1;
+
+        let a = 1. / self.a.powf(self.g);
+        let b = -self.e / self.a.powf(self.g);
+        let g = 1. / self.g;
+        let e = -self.b / self.a;
+
+        let (c, f);
+        if d <= 0. {
+            c = 1.;
+            f = 0.;
+        } else {
+            c = 1. / self.c;
+            f = -self.f / self.c;
+        }
+
+        if !(g.is_finite()
+            && a.is_finite()
+            && b.is_finite()
+            && c.is_finite()
+            && d.is_finite()
+            && e.is_finite()
+            && f.is_finite())
+        {
+            return None;
+        }
+
+        Some(Param {
+            g,
+            a,
+            b,
+            c,
+            d,
+            e,
+            f,
+        })
+    }
+}
+
+
+#[no_mangle]
+#[allow(clippy::many_single_char_names)]
+pub fn lut_inverse_interp16(Value: u16, LutTable: &[u16]) -> uint16_fract_t {
+    let mut l: i32 = 1; 
+    let mut r: i32 = 0x10000;
+    let mut x: i32 = 0;
+    let mut res: i32;
+    let length = LutTable.len() as i32;
+
+    let mut NumZeroes: i32 = 0;
+    while LutTable[NumZeroes as usize] as i32 == 0 && NumZeroes < length - 1 {
+        NumZeroes += 1
+    }
+    if NumZeroes == 0 && Value as i32 == 0 {
+        return 0u16;
+    }
+    let mut NumPoles: i32 = 0;
+    while LutTable[(length - 1 - NumPoles) as usize] as i32 == 0xffff && NumPoles < length - 1 {
+        NumPoles += 1
+    }
+    if NumZeroes > 1 || NumPoles > 1 {
+        let a_0: i32;
+        let b_0: i32;
+        if Value as i32 == 0 {
+            return 0u16;
+        }
+        if NumZeroes > 1 {
+            a_0 = (NumZeroes - 1) * 0xffff / (length - 1);
+            l = a_0 - 1
+        }
+        if NumPoles > 1 {
+            b_0 = (length - 1 - NumPoles) * 0xffff / (length - 1);
+            r = b_0 + 1
+        }
+    }
+    if r <= l {
+        return 0u16;
+    }
+    while r > l {
+        x = (l + r) / 2;
+        res = lut_interp_linear16((x - 1) as uint16_fract_t, LutTable) as i32;
+        if res == Value as i32 {
+            return (x - 1) as uint16_fract_t;
+        }
+        if res > Value as i32 {
+            r = x - 1
+        } else {
+            l = x + 1
+        }
+    }
+
+
+    debug_assert!(x >= 1);
+
+    let val2: f64 = (length - 1) as f64 * ((x - 1) as f64 / 65535.0);
+    let cell0: i32 = val2.floor() as i32;
+    let cell1: i32 = val2.ceil() as i32;
+    if cell0 == cell1 {
+        return x as uint16_fract_t;
+    }
+
+    let y0: f64 = LutTable[cell0 as usize] as f64;
+    let x0: f64 = 65535.0 * cell0 as f64 / (length - 1) as f64;
+    let y1: f64 = LutTable[cell1 as usize] as f64;
+    let x1: f64 = 65535.0 * cell1 as f64 / (length - 1) as f64;
+    let a: f64 = (y1 - y0) / (x1 - x0);
+    let b: f64 = y0 - a * x0;
+    if a.abs() < 0.01f64 {
+        return x as uint16_fract_t;
+    }
+    let f: f64 = (Value as i32 as f64 - b) / a;
+    if f < 0.0 {
+        return 0u16;
+    }
+    if f >= 65535.0 {
+        return 0xffffu16;
+    }
+    (f + 0.5f64).floor() as uint16_fract_t
+}
+fn invert_lut(table: &[u16], out_length: usize) -> Vec<u16> {
+    let mut output = Vec::with_capacity(out_length);
+    for i in 0..out_length {
+        let x: f64 = i as f64 * 65535.0 / (out_length - 1) as f64;
+        let input: uint16_fract_t = (x + 0.5f64).floor() as uint16_fract_t;
+        output.push(lut_inverse_interp16(input, table));
+    }
+    output
+}
+#[allow(clippy::needless_range_loop)]
+fn compute_precache_pow(output: &mut [u8; PRECACHE_OUTPUT_SIZE], gamma: f32) {
+    for v in 0..PRECACHE_OUTPUT_SIZE {
+        output[v] = (255. * (v as f32 / PRECACHE_OUTPUT_MAX as f32).powf(gamma)) as u8;
+    }
+}
+#[allow(clippy::needless_range_loop)]
+pub fn compute_precache_lut(output: &mut [u8; PRECACHE_OUTPUT_SIZE], table: &[u16]) {
+    for v in 0..PRECACHE_OUTPUT_SIZE {
+        output[v] = lut_interp_linear_precache_output(v as u32, table);
+    }
+}
+#[allow(clippy::needless_range_loop)]
+pub fn compute_precache_linear(output: &mut [u8; PRECACHE_OUTPUT_SIZE]) {
+    for v in 0..PRECACHE_OUTPUT_SIZE {
+        output[v] = (v / (PRECACHE_OUTPUT_SIZE / 256)) as u8;
+    }
+}
+pub(crate) fn compute_precache(trc: &curveType, output: &mut [u8; PRECACHE_OUTPUT_SIZE]) {
+    match trc {
+        curveType::Parametric(params) => {
+            let mut gamma_table_uint: [u16; 256] = [0; 256];
+
+            let mut inverted_size: usize = 256;
+            let mut gamma_table = [0.; 256];
+            compute_curve_gamma_table_type_parametric(&mut gamma_table, params);
+            let mut i: u16 = 0u16;
+            while (i as i32) < 256 {
+                gamma_table_uint[i as usize] = (gamma_table[i as usize] * 65535f32) as u16;
+                i += 1
+            }
+            if inverted_size < 256 {
+                inverted_size = 256
+            }
+            let inverted = invert_lut(&gamma_table_uint, inverted_size);
+            compute_precache_lut(output, &inverted);
+        }
+        curveType::Curve(data) => {
+            match data.len() {
+                0 => compute_precache_linear(output),
+                1 => compute_precache_pow(output, 1. / u8Fixed8Number_to_float(data[0])),
+                _ => {
+                    let mut inverted_size = data.len();
+                    if inverted_size < 256 {
+                        inverted_size = 256
+                    } 
+                    let inverted = invert_lut(data, inverted_size);
+                    compute_precache_lut(output, &inverted);
+                }
+            }
+        }
+    }
+}
+fn build_linear_table(length: usize) -> Vec<u16> {
+    let mut output = Vec::with_capacity(length);
+    for i in 0..length {
+        let x: f64 = i as f64 * 65535.0 / (length - 1) as f64;
+        let input: uint16_fract_t = (x + 0.5f64).floor() as uint16_fract_t;
+        output.push(input);
+    }
+    output
+}
+fn build_pow_table(gamma: f32, length: usize) -> Vec<u16> {
+    let mut output = Vec::with_capacity(length);
+    for i in 0..length {
+        let mut x: f64 = i as f64 / (length - 1) as f64;
+        x = x.powf(gamma as f64);
+        let result: uint16_fract_t = (x * 65535.0 + 0.5f64).floor() as uint16_fract_t;
+        output.push(result);
+    }
+    output
+}
+
+fn to_lut(params: &Param, len: usize) -> Vec<u16> {
+    let mut output = Vec::with_capacity(len);
+    for i in 0..len {
+        let X = i as f32 / (len-1) as f32;
+        output.push((params.eval(X) * 65535.) as u16);
+    }
+    output
+}
+
+pub(crate) fn build_lut_for_linear_from_tf(trc: &curveType,
+        lut_len: Option<usize>) -> Vec<u16> {
+    match trc {
+        curveType::Parametric(params) => {
+            let lut_len = lut_len.unwrap_or(256);
+            let params = Param::new(params);
+            to_lut(&params, lut_len)
+        },
+        curveType::Curve(data) => {
+            let autogen_lut_len = lut_len.unwrap_or(4096);
+            match data.len() {
+                0 => build_linear_table(autogen_lut_len),
+                1 => {
+                    let gamma = u8Fixed8Number_to_float(data[0]);
+                    build_pow_table(gamma, autogen_lut_len)
+                }
+                _ => {
+                    let lut_len = lut_len.unwrap_or(data.len());
+                    assert_eq!(lut_len, data.len());
+                    data.clone() 
+                }
+            }
+        },
+    }
+}
+
+pub(crate) fn build_lut_for_tf_from_linear(trc: &curveType) -> Option<Vec<u16>> {
+    match trc {
+        curveType::Parametric(params) => {
+            let lut_len = 256;
+            let params = Param::new(params);
+            if let Some(inv_params) = params.invert() {
+                return Some(to_lut(&inv_params, lut_len));
+            }
+            // else return None instead of fallthrough to generic lut inversion.
+            return None;
+        },
+        curveType::Curve(data) => {
+            let autogen_lut_len = 4096;
+            match data.len() {
+                0 => {
+                    return Some(build_linear_table(autogen_lut_len));
+                },
+                1 => {
+                    let gamma = 1. / u8Fixed8Number_to_float(data[0]);
+                    return Some(build_pow_table(gamma, autogen_lut_len));
+                },
+                _ => {},
+            }
+        },
+    }
+
+    let linear_from_tf = build_lut_for_linear_from_tf(trc, None);
+
+    let inverted_lut_len = std::cmp::max(linear_from_tf.len(), 256);
+    Some(invert_lut(&linear_from_tf, inverted_lut_len))
+}
+
+pub(crate) fn build_output_lut(trc: &curveType) -> Option<Vec<u16>> {
+    build_lut_for_tf_from_linear(trc)
+}

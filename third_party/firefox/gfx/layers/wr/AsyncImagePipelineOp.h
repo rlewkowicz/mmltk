@@ -1,0 +1,81 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_GFX_AsyncImagePipelineOp_H
+#define MOZILLA_GFX_AsyncImagePipelineOp_H
+
+#include <queue>
+
+#include "mozilla/layers/TextureHost.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/webrender/webrender_ffi.h"
+#include "Units.h"
+
+namespace mozilla {
+
+namespace wr {
+struct Transaction;
+}  
+
+namespace layers {
+
+class AsyncImagePipelineManager;
+class TextureHost;
+
+class AsyncImagePipelineOp {
+ public:
+  enum class Tag {
+    ApplyAsyncImageForPipeline,
+    RemoveAsyncImagePipeline,
+  };
+
+  const Tag mTag;
+
+  const RefPtr<AsyncImagePipelineManager> mAsyncImageManager;
+  const wr::PipelineId mPipelineId;
+  const CompositableTextureHostRef mTextureHost;
+
+  ~AsyncImagePipelineOp();
+  AsyncImagePipelineOp(AsyncImagePipelineOp&&);
+  AsyncImagePipelineOp(const AsyncImagePipelineOp&);
+
+ private:
+  AsyncImagePipelineOp(Tag aTag, AsyncImagePipelineManager* aAsyncImageManager,
+                       const wr::PipelineId& aPipelineId,
+                       TextureHost* aTextureHost);
+
+  AsyncImagePipelineOp(Tag aTag, AsyncImagePipelineManager* aAsyncImageManager,
+                       const wr::PipelineId& aPipelineId);
+
+ public:
+  static AsyncImagePipelineOp ApplyAsyncImageForPipeline(
+      AsyncImagePipelineManager* aAsyncImageManager,
+      const wr::PipelineId& aPipelineId, TextureHost* aTextureHost) {
+    return AsyncImagePipelineOp(Tag::ApplyAsyncImageForPipeline,
+                                aAsyncImageManager, aPipelineId, aTextureHost);
+  }
+
+  static AsyncImagePipelineOp RemoveAsyncImagePipeline(
+      AsyncImagePipelineManager* aAsyncImageManager,
+      const wr::PipelineId& aPipelineId) {
+    return AsyncImagePipelineOp(Tag::RemoveAsyncImagePipeline,
+                                aAsyncImageManager, aPipelineId);
+  }
+};
+
+struct AsyncImagePipelineOps {
+  explicit AsyncImagePipelineOps(wr::Transaction* aTransaction)
+      : mTransaction(aTransaction) {}
+  ~AsyncImagePipelineOps();
+
+  void HandleOps(wr::TransactionBuilder& aTxn);
+
+  wr::Transaction* const mTransaction;
+  std::queue<AsyncImagePipelineOp> mList;
+};
+
+}  
+}  
+
+#endif  // MOZILLA_GFX_AsyncImagePipelineOp_H

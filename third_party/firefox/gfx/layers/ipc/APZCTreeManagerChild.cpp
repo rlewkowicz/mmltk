@@ -1,0 +1,171 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/layers/APZCTreeManagerChild.h"
+
+#include "InputData.h"                              // for InputData
+#include "mozilla/dom/BrowserParent.h"              // for BrowserParent
+#include "mozilla/layers/APZCCallbackHelper.h"      // for APZCCallbackHelper
+#include "mozilla/layers/APZInputBridgeChild.h"     // for APZInputBridgeChild
+#include "mozilla/layers/GeckoContentController.h"  // for GeckoContentController
+#include "mozilla/layers/DoubleTapToZoom.h"  // for DoubleTapToZoomMetrics
+#include "mozilla/layers/RemoteCompositorSession.h"  // for RemoteCompositorSession
+
+namespace mozilla {
+namespace layers {
+
+APZCTreeManagerChild::APZCTreeManagerChild() : mCompositorSession(nullptr) {}
+
+APZCTreeManagerChild::~APZCTreeManagerChild() = default;
+
+void APZCTreeManagerChild::SetCompositorSession(
+    RemoteCompositorSession* aSession) {
+  MOZ_ASSERT(!mCompositorSession ^ !aSession);
+  mCompositorSession = aSession;
+  if (mInputBridge) {
+    mInputBridge->SetCompositorSession(aSession);
+  }
+}
+
+void APZCTreeManagerChild::SetInputBridge(
+    RefPtr<APZInputBridgeChild>&& aInputBridge) {
+  MOZ_ASSERT(XRE_IsParentProcess());
+  MOZ_ASSERT(!mInputBridge);
+
+  mInputBridge = std::move(aInputBridge);
+}
+
+void APZCTreeManagerChild::Destroy() {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (mInputBridge) {
+    mInputBridge->Destroy();
+    mInputBridge = nullptr;
+  }
+}
+
+void APZCTreeManagerChild::SetKeyboardMap(const KeyboardMap& aKeyboardMap) {
+  MOZ_ASSERT(NS_IsMainThread());
+  SendSetKeyboardMap(aKeyboardMap);
+}
+
+void APZCTreeManagerChild::ZoomToRect(const ScrollableLayerGuid& aGuid,
+                                      const ZoomTarget& aZoomTarget,
+                                      const uint32_t aFlags) {
+  MOZ_ASSERT(NS_IsMainThread());
+  SendZoomToRect(aGuid, aZoomTarget, aFlags);
+}
+
+void APZCTreeManagerChild::ContentReceivedInputBlock(uint64_t aInputBlockId,
+                                                     bool aPreventDefault) {
+  MOZ_ASSERT(NS_IsMainThread());
+  SendContentReceivedInputBlock(aInputBlockId, aPreventDefault);
+}
+
+void APZCTreeManagerChild::SetTargetAPZC(
+    uint64_t aInputBlockId, const nsTArray<ScrollableLayerGuid>& aTargets) {
+  MOZ_ASSERT(NS_IsMainThread());
+  SendSetTargetAPZC(aInputBlockId, aTargets);
+}
+
+void APZCTreeManagerChild::UpdateZoomConstraints(
+    const ScrollableLayerGuid& aGuid,
+    const Maybe<ZoomConstraints>& aConstraints) {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (CanSend()) {
+    SendUpdateZoomConstraints(aGuid, aConstraints);
+  }
+}
+
+void APZCTreeManagerChild::SetDPI(float aDpiValue) {
+  MOZ_ASSERT(NS_IsMainThread());
+  SendSetDPI(aDpiValue);
+}
+
+void APZCTreeManagerChild::SetAllowedTouchBehavior(
+    uint64_t aInputBlockId, const nsTArray<TouchBehaviorFlags>& aValues) {
+  MOZ_ASSERT(NS_IsMainThread());
+  SendSetAllowedTouchBehavior(aInputBlockId, aValues);
+}
+
+void APZCTreeManagerChild::SetBrowserGestureResponse(
+    uint64_t aInputBlockId, BrowserGestureResponse aResponse) {
+  MOZ_ASSERT(NS_IsMainThread());
+  SendSetBrowserGestureResponse(aInputBlockId, aResponse);
+}
+
+void APZCTreeManagerChild::StartScrollbarDrag(
+    const ScrollableLayerGuid& aGuid, const AsyncDragMetrics& aDragMetrics) {
+  MOZ_ASSERT(NS_IsMainThread());
+  SendStartScrollbarDrag(aGuid, aDragMetrics);
+}
+
+bool APZCTreeManagerChild::StartAutoscroll(const ScrollableLayerGuid& aGuid,
+                                           const ScreenPoint& aAnchorLocation) {
+  MOZ_ASSERT(NS_IsMainThread());
+  return SendStartAutoscroll(aGuid, aAnchorLocation);
+}
+
+void APZCTreeManagerChild::StopAutoscroll(const ScrollableLayerGuid& aGuid) {
+  MOZ_ASSERT(NS_IsMainThread());
+  SendStopAutoscroll(aGuid);
+}
+
+void APZCTreeManagerChild::SetLongTapEnabled(bool aTapGestureEnabled) {
+  MOZ_ASSERT(NS_IsMainThread());
+  SendSetLongTapEnabled(aTapGestureEnabled);
+}
+
+void APZCTreeManagerChild::NotifyApzAwareListenerAdded(
+    const ScrollableLayerGuid& aGuid) {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (CanSend()) {
+    SendNotifyApzAwareListenerAdded(aGuid);
+  }
+}
+
+APZInputBridge* APZCTreeManagerChild::InputBridge() {
+  MOZ_ASSERT(XRE_IsParentProcess());
+  MOZ_ASSERT(mInputBridge);
+
+  return mInputBridge.get();
+}
+
+mozilla::ipc::IPCResult APZCTreeManagerChild::RecvNotifyPinchGesture(
+    const PinchGestureType& aType, const ScrollableLayerGuid& aGuid,
+    const LayoutDevicePoint& aFocusPoint, const LayoutDeviceCoord& aSpanChange,
+    const Modifiers& aModifiers) {
+  MOZ_ASSERT(XRE_IsParentProcess());
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (mCompositorSession && mCompositorSession->GetWidget()) {
+    APZCCallbackHelper::NotifyPinchGesture(aType, aFocusPoint, aSpanChange,
+                                           aModifiers,
+                                           mCompositorSession->GetWidget());
+  }
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult APZCTreeManagerChild::RecvCancelAutoscroll(
+    const ScrollableLayerGuid::ViewID& aScrollId) {
+  MOZ_ASSERT(XRE_IsParentProcess());
+  MOZ_ASSERT(NS_IsMainThread());
+
+  APZCCallbackHelper::CancelAutoscroll(aScrollId);
+  return IPC_OK();
+}
+
+mozilla::ipc::IPCResult APZCTreeManagerChild::RecvNotifyScaleGestureComplete(
+    const ScrollableLayerGuid::ViewID& aScrollId, float aScale) {
+  MOZ_ASSERT(XRE_IsParentProcess());
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (mCompositorSession && mCompositorSession->GetWidget()) {
+    APZCCallbackHelper::NotifyScaleGestureComplete(
+        mCompositorSession->GetWidget(), aScale);
+  }
+  return IPC_OK();
+}
+
+}  
+}  

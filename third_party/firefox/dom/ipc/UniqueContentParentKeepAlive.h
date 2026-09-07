@@ -1,0 +1,38 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_UniqueContentParentKeepAlive_h
+#define mozilla_dom_UniqueContentParentKeepAlive_h
+
+#include "mozilla/UniquePtr.h"
+#include "nsIDOMProcessParent.h"
+
+namespace mozilla::dom {
+
+class ContentParent;
+class ThreadsafeContentParentHandle;
+
+struct ContentParentKeepAliveDeleter {
+  void operator()(ContentParent* const& aProcess);
+  void operator()(ThreadsafeContentParentHandle* const& aHandle);
+  uint64_t mBrowserId = 0;
+};
+
+using UniqueContentParentKeepAlive =
+    UniquePtr<ContentParent, ContentParentKeepAliveDeleter>;
+
+using UniqueThreadsafeContentParentKeepAlive =
+    UniquePtr<ThreadsafeContentParentHandle, ContentParentKeepAliveDeleter>;
+
+UniqueContentParentKeepAlive UniqueContentParentKeepAliveFromThreadsafe(
+    UniqueThreadsafeContentParentKeepAlive&& aKeepAlive);
+UniqueThreadsafeContentParentKeepAlive UniqueContentParentKeepAliveToThreadsafe(
+    UniqueContentParentKeepAlive&& aKeepAlive);
+
+already_AddRefed<nsIContentParentKeepAlive> WrapContentParentKeepAliveForJS(
+    UniqueContentParentKeepAlive&& aKeepAlive);
+
+}  
+
+#endif  // mozilla_dom_UniqueContentParentKeepAlive_h

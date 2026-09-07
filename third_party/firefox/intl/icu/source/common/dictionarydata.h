@@ -1,0 +1,106 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*******************************************************************************
+* Copyright (C) 2014, International Business Machines
+* Corporation and others.  All Rights Reserved.
+*******************************************************************************
+* dictionarydata.h
+*
+* created on: 2012may31
+* created by: Markus W. Scherer & Maxime Serrano
+*/
+
+#ifndef __DICTIONARYDATA_H__
+#define __DICTIONARYDATA_H__
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_BREAK_ITERATION
+
+#include "unicode/utext.h"
+#include "unicode/udata.h"
+#include "udataswp.h"
+#include "unicode/uobject.h"
+#include "unicode/ustringtrie.h"
+
+U_NAMESPACE_BEGIN
+
+class UCharsTrie;
+class BytesTrie;
+
+class U_COMMON_API DictionaryData : public UMemory {
+public:
+    static const int32_t TRIE_TYPE_BYTES; 
+    static const int32_t TRIE_TYPE_UCHARS; 
+    static const int32_t TRIE_TYPE_MASK; 
+    static const int32_t TRIE_HAS_VALUES; 
+
+    static const int32_t TRANSFORM_NONE; 
+    static const int32_t TRANSFORM_TYPE_OFFSET; 
+    static const int32_t TRANSFORM_TYPE_MASK; 
+    static const int32_t TRANSFORM_OFFSET_MASK; 
+
+    enum {
+        IX_STRING_TRIE_OFFSET,
+        IX_RESERVED1_OFFSET,
+        IX_RESERVED2_OFFSET,
+        IX_TOTAL_SIZE,
+
+        IX_TRIE_TYPE,
+        IX_TRANSFORM,
+
+        IX_RESERVED6,
+        IX_RESERVED7,
+        IX_COUNT
+    };
+};
+
+class U_COMMON_API DictionaryMatcher : public UMemory {
+public:
+    DictionaryMatcher() {}
+    virtual ~DictionaryMatcher();
+    virtual int32_t matches(UText *text, int32_t maxLength, int32_t limit,
+                            int32_t *lengths, int32_t *cpLengths, int32_t *values,
+                            int32_t *prefix) const = 0;
+
+    virtual int32_t getType() const = 0;
+};
+
+class U_COMMON_API UCharsDictionaryMatcher : public DictionaryMatcher {
+public:
+    UCharsDictionaryMatcher(const char16_t *c, UDataMemory *f) : characters(c), file(f) { }
+    virtual ~UCharsDictionaryMatcher();
+    virtual int32_t matches(UText *text, int32_t maxLength, int32_t limit,
+                            int32_t *lengths, int32_t *cpLengths, int32_t *values,
+                            int32_t *prefix) const override;
+    virtual int32_t getType() const override;
+private:
+    const char16_t *characters;
+    UDataMemory *file;
+};
+
+class U_COMMON_API BytesDictionaryMatcher : public DictionaryMatcher {
+public:
+    BytesDictionaryMatcher(const char *c, int32_t t, UDataMemory *f)
+            : characters(c), transformConstant(t), file(f) { }
+    virtual ~BytesDictionaryMatcher();
+    virtual int32_t matches(UText *text, int32_t maxLength, int32_t limit,
+                            int32_t *lengths, int32_t *cpLengths, int32_t *values,
+                            int32_t *prefix) const override;
+    virtual int32_t getType() const override;
+private:
+    UChar32 transform(UChar32 c) const;
+
+    const char *characters;
+    int32_t transformConstant;
+    UDataMemory *file;
+};
+
+U_NAMESPACE_END
+
+U_CAPI int32_t U_EXPORT2
+udict_swap(const UDataSwapper *ds, const void *inData, int32_t length, void *outData, UErrorCode *pErrorCode);
+
+
+#endif  /* !UCONFIG_NO_BREAK_ITERATION */
+#endif  /* __DICTIONARYDATA_H__ */

@@ -1,0 +1,202 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+//! This provides a way to direct rust logging into the gecko logger.
+
+#[macro_use]
+extern crate lazy_static;
+
+use log::{Level, LevelFilter};
+use std::collections::HashMap;
+use std::ffi::{CStr, CString};
+use std::os::raw::c_char;
+use std::os::raw::c_int;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::RwLock;
+use std::{cmp, env};
+
+extern "C" {
+    fn ExternMozLog(tag: *const c_char, prio: c_int, text: *const c_char);
+    fn gfx_critical_note(msg: *const c_char);
+}
+
+lazy_static! {
+    static ref LOG_MODULE_MAP: RwLock<HashMap<String, (LevelFilter, bool)>> = RwLock::new(HashMap::new());
+}
+
+/// This tells us whether LOG_MODULE_MAP is possibly non-empty.
+static LOGGING_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// This function searches for the module's name in the hashmap. If that is not
+/// found, it proceeds to search for the parent modules.
+/// It returns a tuple containing the matched string, if the matched module
+/// was a pattern match, and the level we found in the hashmap.
+/// If none is found, it will return the module's name and LevelFilter::Off
+fn get_level_for_module<'a>(
+    map: &HashMap<String, (LevelFilter, bool)>,
+    key: &'a str,
+) -> (&'a str, bool, LevelFilter) {
+    if let Some((level, is_pattern_match)) = map.get(key) {
+        return (key, *is_pattern_match, level.clone());
+    }
+
+    let mut mod_name = &key[..];
+    while let Some(pos) = mod_name.rfind("::") {
+        mod_name = &mod_name[..pos];
+        if let Some((level, is_pattern_match)) = map.get(mod_name) {
+            return (mod_name, *is_pattern_match, level.clone());
+        }
+    }
+
+    return (key, false, LevelFilter::Off);
+}
+
+/// This function takes a record to maybe log to Gecko.
+/// It returns true if the record was handled by Gecko's logging, and false
+/// otherwise.
+pub fn log_to_gecko(record: &log::Record) -> bool {
+    if !LOGGING_ACTIVE.load(Ordering::Relaxed) {
+        return false;
+    }
+
+    let key = match record.module_path() {
+        Some(key) => key,
+        None => return false,
+    };
+
+    let (mod_name, is_pattern_match, level) = {
+        let map = LOG_MODULE_MAP.read().unwrap();
+        get_level_for_module(&map, &key)
+    };
+
+    if level == LevelFilter::Off {
+        return false;
+    }
+
+    if level < record.metadata().level() {
+        return false;
+    }
+
+    let moz_log_level = match record.metadata().level() {
+        Level::Error => 1, 
+        Level::Warn => 2,  
+        Level::Info => 3,  
+        Level::Debug => 4, 
+        Level::Trace => 5, 
+    };
+
+    let (tag, msg) = if is_pattern_match {
+        (
+            CString::new(format!("{}::*", mod_name)).unwrap(),
+            CString::new(format!("[{}] {}", key, record.args())).unwrap(),
+        )
+    } else {
+        (
+            CString::new(key).unwrap(),
+            CString::new(format!("{}", record.args())).unwrap(),
+        )
+    };
+
+    unsafe {
+        ExternMozLog(tag.as_ptr(), moz_log_level, msg.as_ptr());
+    }
+
+    return true;
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn set_rust_log_level(module: *const c_char, level: u8) {
+    let rust_level = match level {
+        1 => LevelFilter::Error,
+        2 => LevelFilter::Warn,
+        3 => LevelFilter::Info,
+        4 => LevelFilter::Debug,
+        5 => LevelFilter::Trace,
+        _ => LevelFilter::Off,
+    };
+
+    let mut mod_name = CStr::from_ptr(module).to_string_lossy().into_owned();
+
+    let is_pattern_match = mod_name.ends_with("::*");
+
+    if is_pattern_match {
+        let len = mod_name.len() - 3;
+        mod_name.truncate(len);
+    }
+
+    LOGGING_ACTIVE.store(true, Ordering::Relaxed);
+    let mut map = LOG_MODULE_MAP.write().unwrap();
+    map.insert(mod_name, (rust_level, is_pattern_match));
+
+    let max = map
+        .values()
+        .map(|(lvl, _)| lvl)
+        .max()
+        .unwrap_or(&LevelFilter::Off);
+    log::set_max_level(*max);
+}
+
+pub struct GeckoLogger {
+    logger: env_logger::Logger,
+}
+
+impl GeckoLogger {
+    pub fn new() -> GeckoLogger {
+        let mut builder = env_logger::Builder::new();
+        let default_level = if cfg!(debug_assertions) {
+            "warn"
+        } else {
+            "error"
+        };
+        let logger = match env::var("RUST_LOG") {
+            Ok(v) => builder.parse_filters(&v).build(),
+            _ => builder.parse_filters(default_level).build(),
+        };
+
+        GeckoLogger { logger }
+    }
+
+    pub fn init() -> Result<(), log::SetLoggerError> {
+        let gecko_logger = Self::new();
+
+        let level = cmp::max(log::max_level(), gecko_logger.logger.filter());
+        log::set_max_level(level);
+        log::set_boxed_logger(Box::new(gecko_logger))
+    }
+
+    fn should_log_to_gfx_critical_note(record: &log::Record) -> bool {
+        record.level() == log::Level::Error && record.target().contains("webrender")
+    }
+
+    fn maybe_log_to_gfx_critical_note(&self, record: &log::Record) {
+        if Self::should_log_to_gfx_critical_note(record) {
+            let msg = CString::new(format!("{}", record.args())).unwrap();
+            unsafe {
+                gfx_critical_note(msg.as_ptr());
+            }
+        }
+    }
+
+
+    fn log_out(&self, record: &log::Record) {
+        use log::Log;
+        if !log_to_gecko(record) {
+            self.logger.log(record);
+        }
+    }
+
+}
+
+impl log::Log for GeckoLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        self.logger.enabled(metadata)
+    }
+
+    fn log(&self, record: &log::Record) {
+        self.maybe_log_to_gfx_critical_note(record);
+        self.log_out(record);
+    }
+
+    fn flush(&self) {}
+}

@@ -1,0 +1,256 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "frontend/PrivateOpEmitter.h"
+
+#include "frontend/BytecodeEmitter.h"
+#include "frontend/NameOpEmitter.h"
+#include "vm/Opcodes.h"
+#include "vm/ThrowMsgKind.h"  // ThrowMsgKind
+
+using namespace js;
+using namespace js::frontend;
+
+PrivateOpEmitter::PrivateOpEmitter(BytecodeEmitter* bce, Kind kind,
+                                   TaggedParserAtomIndex name)
+    : bce_(bce), kind_(kind), name_(name) {
+  MOZ_ASSERT(kind_ != Kind::Delete);
+}
+
+bool PrivateOpEmitter::init() {
+  NameLocation loc = NameLocation::Dynamic();
+  bce_->lookupPrivate(name_, loc, brandLoc_);
+  loc_ = mozilla::Some(loc);
+  return true;
+}
+
+bool PrivateOpEmitter::emitLoad(TaggedParserAtomIndex name,
+                                const NameLocation& loc) {
+  NameOpEmitter noe(bce_, name, loc, NameOpEmitter::Kind::Get);
+  return noe.emitGet();
+}
+
+bool PrivateOpEmitter::emitLoadPrivateBrand() {
+  return emitLoad(TaggedParserAtomIndex::WellKnown::dot_privateBrand_(),
+                  *brandLoc_);
+}
+
+bool PrivateOpEmitter::emitBrandCheck() {
+  MOZ_ASSERT(state_ == State::Reference);
+
+  if (isBrandCheck()) {
+    if (!bce_->emitCheckPrivateField(ThrowCondition::OnlyCheckRhs,
+                                     ThrowMsgKind::PrivateDoubleInit)) {
+      return false;
+    }
+
+    return true;
+  }
+
+  if (isFieldInit()) {
+    if (!bce_->emitCheckPrivateField(ThrowCondition::ThrowHas,
+                                     ThrowMsgKind::PrivateDoubleInit)) {
+      return false;
+    }
+  } else {
+    bool assigning =
+        isSimpleAssignment() || isCompoundAssignment() || isIncDec();
+    if (!bce_->emitCheckPrivateField(ThrowCondition::ThrowHasNot,
+                                     assigning
+                                         ? ThrowMsgKind::MissingPrivateOnSet
+                                         : ThrowMsgKind::MissingPrivateOnGet)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool PrivateOpEmitter::emitReference() {
+  MOZ_ASSERT(state_ == State::Start);
+
+  if (!init()) {
+    return false;
+  }
+
+  if (brandLoc_) {
+    if (!emitLoadPrivateBrand()) {
+      return false;
+    }
+  } else {
+    if (!emitLoad(name_, loc_.ref())) {
+      return false;
+    }
+  }
+#ifdef DEBUG
+  state_ = State::Reference;
+#endif
+  return true;
+}
+
+bool PrivateOpEmitter::emitGet() {
+  MOZ_ASSERT(state_ == State::Reference);
+
+
+  if (brandLoc_) {
+    if (!emitBrandCheck()) {
+      return false;
+    }
+
+    if (isCompoundAssignment()) {
+      if (!bce_->emit1(JSOp::Pop)) {
+        return false;
+      }
+    } else if (isCall()) {
+      if (!bce_->emitPopN(2)) {
+        return false;
+      }
+    } else {
+      if (!bce_->emitPopN(3)) {
+        return false;
+      }
+    }
+
+    if (!emitLoad(name_, loc_.ref())) {
+      return false;
+    }
+  } else {
+    if (isCall()) {
+      if (!bce_->emitDupAt(1)) {
+        return false;
+      }
+      if (!bce_->emit1(JSOp::Swap)) {
+        return false;
+      }
+    }
+    if (!emitBrandCheck()) {
+      return false;
+    }
+    if (!bce_->emit1(JSOp::Pop)) {
+      return false;
+    }
+
+    if (isCompoundAssignment()) {
+      if (!bce_->emit1(JSOp::Dup2)) {
+        return false;
+      }
+    }
+
+    if (!bce_->emitElemOpBase(JSOp::GetElem)) {
+      return false;
+    }
+  }
+
+  if (isCall()) {
+    if (!bce_->emit1(JSOp::Swap)) {
+      return false;
+    }
+  }
+
+
+#ifdef DEBUG
+  state_ = State::Get;
+#endif
+  return true;
+}
+
+bool PrivateOpEmitter::emitGetForCallOrNew() { return emitGet(); }
+
+bool PrivateOpEmitter::emitAssignment() {
+  MOZ_ASSERT(isSimpleAssignment() || isFieldInit() || isCompoundAssignment());
+  MOZ_ASSERT_IF(!isCompoundAssignment(), state_ == State::Reference);
+  MOZ_ASSERT_IF(isCompoundAssignment(), state_ == State::Get);
+
+
+  if (brandLoc_) {
+    if (!bce_->emit2(JSOp::ThrowMsg,
+                     uint8_t(ThrowMsgKind::AssignToPrivateMethod))) {
+      return false;
+    }
+
+    if (!bce_->emitPopN(2)) {
+      return false;
+    }
+  } else {
+    if (!isCompoundAssignment()) {
+      if (!bce_->emitUnpickN(2)) {
+        return false;
+      }
+      if (!emitBrandCheck()) {
+        return false;
+      }
+      if (!bce_->emit1(JSOp::Pop)) {
+        return false;
+      }
+      if (!bce_->emitPickN(2)) {
+        return false;
+      }
+    }
+
+    JSOp setOp = isFieldInit() ? JSOp::InitHiddenElem : JSOp::StrictSetElem;
+    if (!bce_->emitElemOpBase(setOp)) {
+      return false;
+    }
+  }
+
+#ifdef DEBUG
+  state_ = State::Assignment;
+#endif
+  return true;
+}
+
+bool PrivateOpEmitter::emitIncDec(ValueUsage valueUsage) {
+  MOZ_ASSERT(state_ == State::Reference);
+  MOZ_ASSERT(isIncDec());
+
+  if (!bce_->emitDupAt(1, 2)) {
+    return false;
+  }
+
+  if (!emitGet()) {
+    return false;
+  }
+
+  MOZ_ASSERT(state_ == State::Get);
+
+  JSOp incOp = isInc() ? JSOp::Inc : JSOp::Dec;
+
+  if (!bce_->emit1(JSOp::ToNumeric)) {
+    return false;
+  }
+  if (isPostIncDec() && valueUsage == ValueUsage::WantValue) {
+    if (!bce_->emit1(JSOp::Dup)) {
+      return false;
+    }
+    if (!bce_->emit2(JSOp::Unpick, 3)) {
+      return false;
+    }
+  }
+  if (!bce_->emit1(incOp)) {
+    return false;
+  }
+
+  if (brandLoc_) {
+    if (!bce_->emit2(JSOp::ThrowMsg,
+                     uint8_t(ThrowMsgKind::AssignToPrivateMethod))) {
+      return false;
+    }
+
+    if (!bce_->emitPopN(2)) {
+      return false;
+    }
+  } else {
+    if (!bce_->emitElemOpBase(JSOp::StrictSetElem)) {
+      return false;
+    }
+  }
+
+  if (isPostIncDec() && valueUsage == ValueUsage::WantValue) {
+    if (!bce_->emit1(JSOp::Pop)) {
+      return false;
+    }
+  }
+
+  return true;
+}

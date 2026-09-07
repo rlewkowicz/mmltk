@@ -1,0 +1,713 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this,
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+import json
+import re
+import string
+import subprocess
+import sys
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, Optional, Union
+
+import mozpack.path as mozpath
+from mozfile import which
+from mozpack.files import FileListFinder
+from packaging.version import Version
+
+MINIMUM_SUPPORTED_JJ_VERSION = Version("0.38")
+
+from mozversioncontrol.errors import (
+    CannotDeleteFromRootOfRepositoryException,
+    MissingVCSExtension,
+    MissingVCSInfo,
+)
+from mozversioncontrol.repo.base import Repository
+from mozversioncontrol.repo.git import GitRepository
+
+
+class JjVersionError(Exception):
+    """Raised when the installed jj version is too old."""
+
+    pass
+
+
+class JujutsuRepository(Repository):
+    """An implementation of `Repository` for JJ repositories using the git backend."""
+
+    HEAD_REVSET = 'coalesce(@ ~ (empty() & description(exact:"")) ~ bookmarks(), @-)'
+
+    def __init__(self, path: Path, jj="jj", git="git"):
+        super().__init__(path, tool=jj)
+        self._git = GitRepository(path, git=git)
+
+        out = self._run("root")
+        if not out:
+            raise MissingVCSInfo("cannot find jj workspace root")
+
+        try:
+            jj_ws_root = Path(out.rstrip())
+            jj_repo = jj_ws_root / ".jj" / "repo"
+            if not jj_repo.is_dir():
+                jj_repo = jj_repo.parent / Path(jj_repo.read_text())
+        except Exception:
+            raise MissingVCSInfo("cannot find jj repo")
+
+        try:
+            git_target = jj_repo / "store" / "git_target"
+            git_dir = git_target.parent / Path(git_target.read_text())
+        except Exception:
+            raise MissingVCSInfo("cannot find git dir")
+
+        if not git_dir.is_dir():
+            raise MissingVCSInfo("cannot find git dir")
+
+        self._git._env["GIT_DIR"] = str(git_dir.resolve())
+
+    def _run(self, *args, **kwargs):
+        return super()._run("--quiet", *args, **kwargs)
+
+    def _run_read_only(self, *args, **kwargs):
+        """_run_read_only() should be used instead of _run() for read-only jj commands.
+
+        It will avoid locking the working copy and can prevent potential concurrency issues.
+        """
+        return self._run("--ignore-working-copy", *args, **kwargs)
+
+    def _snapshot(self, reason):
+        """_snapshot() can be used to update the repository after changing files in the working
+        directory. Normally jj commands will do this automatically, but we often run jj commands
+        using `_run_read_only` which passes `--ignore-working-copy` to jj.
+        See bug 1962245 and bug 1962389.
+
+        An alternative option would be to add an extra argument to methods such as
+        `get_commits`.
+        """
+        self._run("log", "--limit=0", "--template", f'"snapshot: {reason}"')
+
+    def _resolve_to_change(self, revset: str) -> Optional[str]:
+        change_id = self._run_read_only(
+            "log",
+            "--no-graph",
+            "--limit=1",
+            "--revisions",
+            revset,
+            "--template",
+            "change_id.short()",
+        ).rstrip()
+        return change_id if change_id != "" else None
+
+    @property
+    def name(self):
+        return "jj"
+
+    @property
+    def head_ref(self):
+        return self._resolve_to_change(self.HEAD_REVSET)
+
+    @property
+    def head_rev(self):
+        return self._resolve_to_commit(self.HEAD_REVSET)
+
+    def is_cinnabar_repo(self) -> bool:
+        return self._git.is_cinnabar_repo()
+
+    @property
+    def base_ref(self):
+        return self._resolve_to_change("roots((::@ & mutable())-)")
+
+    def _resolve_to_commit(self, revset):
+        commit = self._run_read_only(
+            "log",
+            "--no-graph",
+            "--revisions",
+            f"latest({revset})",
+            "--template",
+            "commit_id",
+        ).rstrip()
+        return commit
+
+    def base_ref_as_hg(self):
+        return self._git.base_ref_as_hg()
+
+    def base_ref_as_commit(self):
+        return self._resolve_to_commit(self.base_ref)
+
+    @property
+    def branch(self):
+        output = self._run_read_only(
+            "log",
+            "--no-graph",
+            "--limit=1",
+            "--revisions",
+            self.HEAD_REVSET,
+            "--template",
+            'local_bookmarks.join("\n")',
+        )
+        bookmark = output.split("\n")[0].strip()
+        return bookmark or None
+
+    @property
+    def has_git_cinnabar(self):
+        return self._git.has_git_cinnabar
+
+    def get_commit_time(self):
+        return int(
+            self._run_read_only(
+                "log",
+                "--limit=1",
+                "--no-graph",
+                "--template",
+                'committer.timestamp().format("%s")',
+            ).strip()
+        )
+
+    def sparse_checkout_present(self):
+        return self._run_read_only("sparse", "list").rstrip() != "."
+
+    def get_user_email(self):
+        email = self._run_read_only("config", "get", "user.email", return_codes=[0, 1])
+        if not email:
+            return None
+        return email.strip()
+
+    def get_remote_url(self, remote=None, push=False):
+        if not remote:
+            if push:
+                if remote := self._run(
+                    "config", "get", "git.push", return_codes=[0, 1]
+                ):
+                    remote = remote.strip().strip('"')
+            else:
+                fetch_config = self._run(
+                    "config", "get", "git.fetch", return_codes=[0, 1]
+                )
+                if fetch_config:
+                    fetch_config = fetch_config.strip().strip('"')
+                    remote = json.loads(fetch_config)[0]
+
+            if not remote:
+                return None
+
+        return self._git.get_remote_url(remote, push)
+
+    def get_changed_files(self, diff_filter="ADM", mode="(ignored)", rev="@"):
+        assert all(f.lower() in self._valid_diff_filter for f in diff_filter)
+
+        out = self._run(
+            "log",
+            "--revisions",
+            rev,
+            "--no-graph",
+            "--template",
+            'diff.files().map(|f| surround("", "\n", separate("\t", f.status(), f.source().path(), f.target().path()))).join("")',
+        )
+        changed = []
+        for line in out.splitlines():
+            op, source, target = line.split("\t")
+            if op == "modified":
+                if "M" in diff_filter:
+                    changed.append(source)
+            elif op == "added":
+                if "A" in diff_filter:
+                    changed.append(source)
+            elif op == "removed":
+                if "D" in diff_filter:
+                    changed.append(source)
+            elif op == "copied":
+                if "A" in diff_filter:
+                    changed.append(target)
+            elif op == "renamed":
+                if "A" in diff_filter:
+                    changed.append(target)
+                if "D" in diff_filter:
+                    changed.append(source)
+            else:
+                raise Exception(f"unexpected jj file status '{op}'")
+
+        return changed
+
+    # .clang-format-ignore) to a jj fileset expression. Support the small number
+    def _translate_exclude_expr(self, pattern):
+        if not pattern or pattern.startswith("#"):
+            return None  
+        pattern = pattern.replace(".*/", "**/")
+        pattern = re.sub(r"[.][*][^/]", "*", pattern)
+        pattern = pattern.replace("(^|[^/]).*", "**/*")
+        pattern = pattern.replace(".*", "*/**/*")
+        selector = "glob"
+        if pattern.startswith("^"):
+            selector = "root-glob"
+            pattern = pattern[1:]
+        elif "*" not in pattern:
+            selector = "root-file"
+        return f'{selector}:"{pattern}"'
+
+    def diff_stream(self, rev=None, extensions=(), exclude_file=None, context=8):
+        if rev is None:
+            rev = self.HEAD_REVSET
+        args = ["diff", "--revisions", rev, "--git"]
+
+        patterns = [f'glob:"**/*{dot_extension}"' for dot_extension in extensions]
+        if not patterns:
+            patterns = ["all()"]
+
+        excludes = []
+        if exclude_file is not None:
+            with open(exclude_file) as fh:
+                excludes.extend(line.strip() for line in fh)
+        exclude_patterns = []
+
+        fileset = " ~ ".join(["(" + " | ".join(patterns) + ")"] + exclude_patterns)
+        args.append(fileset)
+
+        return self._pipefrom(*args)
+
+    def get_outgoing_files(self, diff_filter="ADM", upstream=None):
+        assert all(f.lower() in self._valid_diff_filter for f in diff_filter)
+
+        if upstream is None:
+            upstream = self.base_ref
+
+        lines = self._run_read_only(
+            "diff",
+            "--from",
+            upstream,
+            "--to",
+            "@",
+            "--summary",
+        ).splitlines()
+
+        outgoing = []
+        for line in lines:
+            op, file = line.split(" ", 1)
+            if op.upper() in diff_filter:
+                outgoing.append(mozpath.normsep(file))
+        return outgoing
+
+    def add_remove_files(self, *paths: Union[str, Path], force: bool = False):
+        if not paths:
+            return
+
+        relative_paths = [self._repo_root_relative_path(p) for p in paths]
+        self._run("file", "track", *relative_paths)
+
+    def forget_add_remove_files(self, *paths: Union[str, Path]):
+        if not paths:
+            return
+
+        relative_paths = [self._repo_root_relative_path(p) for p in paths]
+        self._run("file", "untrack", *relative_paths)
+
+    def get_tracked_files_finder(self, path=None):
+        files = [mozpath.normsep(p) for p in self._run("file", "list").splitlines()]
+        return FileListFinder(files)
+
+    def get_ignored_files_finder(self):
+        raise Exception("unimplemented")
+
+    def working_directory_clean(self, untracked=False, ignored=False):
+        return True
+
+    def update(self, ref):
+        self._run("new", ref)
+
+    def edit(self, ref):
+        self._run("edit", ref)
+
+    def clean_directory(self, path: Union[str, Path]):
+        if Path(self.path).samefile(path):
+            raise CannotDeleteFromRootOfRepositoryException()
+
+        self._run("restore", "--", str(path))
+
+    def commit(self, message, author=None, date=None, paths=None):
+        run_kwargs = {}
+        cmd = ["commit", "--message", message]
+        if date:
+            dt = datetime.strptime(date, "%Y-%m-%d %H:%M:%S %z")
+            run_kwargs["env"] = {"JJ_TIMESTAMP": dt.isoformat()}
+        if paths:
+            cmd.extend(paths)
+        self._run(*cmd, **run_kwargs)
+        if author:
+            self._run("metaedit", "--author", author, "@-")
+
+    def add_note(
+        self,
+        note: str,
+        content: str,
+        commit: Optional[str] = None,
+    ):
+        commit = commit or self.head_rev
+        self._git.add_note(note, content, commit)
+
+    def push(
+        self,
+        remote: Optional[str] = None,
+        ref: Optional[str] = None,
+        dest_branch: Optional[str] = None,
+        force: bool = False,
+        env: Optional[dict] = None,
+    ):
+        if ref and not remote:
+            raise ValueError("Cannot specify ref without specifying remote")
+        if dest_branch and not ref:
+            raise ValueError("Cannot specify dest_branch without specifying ref")
+
+        if ref and dest_branch:
+            ref = self._resolve_to_commit(ref)
+        self._git.push(remote, ref=ref, dest_branch=dest_branch, force=force, env=env)
+
+    def _resolve_try_branch(self):
+        dest_branch = self.branch
+        if not dest_branch:
+            template = (
+                self._run_read_only(
+                    "config", "get", "templates.git_push_bookmark", return_codes=[0, 1]
+                ).strip()
+                or '"push-" ++ change_id.short()'
+            )
+            dest_branch = self._run_read_only(
+                "log",
+                "--no-graph",
+                "--limit=1",
+                "--revisions",
+                self.HEAD_REVSET,
+                "--template",
+                template,
+            ).strip()
+            self._run("bookmark", "create", dest_branch, "--revision", self.HEAD_REVSET)
+
+        return dest_branch
+
+    def _push_to_hg_try(self, message, changed_files, remote, allow_log_capture):
+        if not self.has_git_cinnabar:
+            raise MissingVCSExtension("cinnabar")
+
+        with self.try_commit(message, changed_files) as head:
+            if "mach_tryserver" in self._git._run("remote"):
+                self._run(
+                    "git", "remote", "remove", "mach_tryserver", return_codes=[0, 1]
+                )
+            self._git._run("remote", "add", "mach_tryserver", f"hg::{remote}")
+            self._run("git", "import")
+            cmd = (
+                str(self._tool),
+                "--quiet",
+                "git",
+                "push",
+                "--remote",
+                "mach_tryserver",
+                "--change",
+                head,
+                "--allow-empty-description",
+            )
+            if allow_log_capture:
+                self._push_to_try_with_log_capture(
+                    cmd,
+                    {
+                        "stdout": subprocess.PIPE,
+                        "stderr": subprocess.STDOUT,
+                        "cwd": self.path,
+                        "universal_newlines": True,
+                        "bufsize": 1,
+                    },
+                )
+            else:
+                subprocess.check_call(cmd, cwd=self.path)
+        self._run("git", "remote", "remove", "mach_tryserver", return_codes=[0, 1])
+
+    def set_config(self, name, value):
+        self._run_read_only("config", name, value)
+
+    def get_commits(
+        self,
+        head: Optional[str] = "@",
+        limit: Optional[int] = None,
+        follow: Optional[list[str]] = None,
+    ) -> list[str]:
+        """Return a list of commit SHAs for nodes on the current branch, in order that they should be applied."""
+        cmd = [
+            "log",
+            "--no-graph",
+            "--revisions",
+            f"(::{head} & mutable()) ~ empty()",
+            "--template",
+            'commit_id ++ "\n"',
+        ]
+        if limit is not None:
+            cmd.append(f"--limit={limit}")
+        if follow is not None:
+            cmd.extend(follow)
+
+        return list(reversed(self._run_read_only(*cmd).splitlines()))
+
+    def _looks_like_change_id(self, id):
+        return len(id) > 0 and all(letter >= "k" and letter <= "z" for letter in id)
+
+    def _looks_like_commit_id(self, id):
+        return len(id) > 0 and all(letter in string.hexdigits for letter in id)
+
+    def get_commit_patches(self, nodes: list[str]) -> list[bytes]:
+        """Return the contents of the patch `node` in the git standard format."""
+        nodes = [
+            id if self._looks_like_commit_id(id) else self._resolve_to_commit(id)
+            for id in nodes
+        ]
+        return [
+            self._git._run(
+                "format-patch",
+                node,
+                "-1",
+                "--always",
+                "--stdout",
+                "--no-base",  
+                encoding=None,
+            )
+            for node in nodes
+        ]
+
+    @contextmanager
+    def try_commit(
+        self, commit_message: str, changed_files: Optional[dict[str, str]] = None
+    ):
+        """Create a temporary try commit as a context manager.
+
+        Create a new commit using `commit_message` as the commit message. The commit
+        may be empty, for example when only including try syntax.
+
+        `changed_files` may contain a dict of file paths and their contents,
+        see `stage_changes`.
+        """
+        opid = self._run(
+            "operation", "log", "--limit=1", "--no-graph", "--template", "id.short(16)"
+        ).rstrip()
+        try:
+            change, _ = self.prepare_try_push(commit_message, changed_files)
+            yield change
+        finally:
+            self._run("operation", "restore", opid)
+
+    def prepare_try_push(
+        self, commit_message: str, changed_files: Optional[dict[str, str]] = None
+    ) -> tuple[Optional[str], Callable]:
+        """Create a temporary try commit as a context manager.
+
+        Create a new commit using `commit_message` as the commit message. The commit
+        may be empty, for example when only including try syntax.
+
+        `changed_files` may contain a dict of file paths and their contents,
+        see `stage_changes`.
+
+        This function returns a tuple of the changeid of the new head and a
+        function that can be called to restore the repository to its original
+        state prior to this function having been run.
+        """
+        print("Pushing changes:")
+        print(
+            self._run(
+                "log",
+                "--no-graph",
+                "--revisions",
+                "heads(trunk() | (remote_bookmarks() & ancestors(@)))..@ ~ description(exact:'')",
+                "--template",
+                "'  ' ++ description.first_line() ++ '\n'",
+            ),
+            end="",
+        )
+        self._snapshot("prepare_try_push")
+        opid = self._run(
+            "operation", "log", "--limit=1", "--no-graph", "--template", "id.short(16)"
+        ).rstrip()
+        try:
+            self._run("new", "--message", commit_message, self.HEAD_REVSET)
+            for path, content in (changed_files or {}).items():
+                p = self.path / Path(path)
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(content)
+                self.add_remove_files(p)
+            self._snapshot("prepare_try_push")
+
+            self._run(
+                "bookmark", "move", "--from", "heads(@- & bookmarks())", "--to", "@"
+            )
+
+            def cleanup():
+                self._run("operation", "restore", opid)
+
+            return self._resolve_to_change("@"), cleanup
+        except:
+            self._run("operation", "restore", opid)
+            raise
+
+    def get_last_modified_time_for_file(self, path: Path) -> datetime:
+        """Return last modified in VCS time for the specified file."""
+        escaped_path = str(path).replace("\\", "\\\\")
+        date = self._run(
+            "log",
+            "--no-graph",
+            "--limit=1",
+            "--template",
+            "committer.timestamp()",
+            f'"{escaped_path}"',
+        ).rstrip()
+        return datetime.strptime(date, "%Y-%m-%d %H:%M:%S.%f %z")
+
+    def config_key_list_value_missing(self, key: str):
+        output = self._run_read_only(
+            "config", "list", "--repo", key, stderr=subprocess.DEVNULL
+        ).strip()
+
+        if not output:
+            return True
+
+        if output.startswith(key):
+            return False
+
+        raise ValueError(f"Unexpected output: {output}")
+
+    def set_config_key_value(self, key: str, value: Any):
+        value_str = json.dumps(value)
+        print(f'Set jj config: "{key} = {value_str}"')
+        self._run("config", "set", "--repo", key, value_str)
+
+    def _set_default_if_missing(self, config_key: str, default_value):
+        """
+        If `config_key` is missing in jj, set it to `default_value`.
+        """
+        if self.config_key_list_value_missing(config_key):
+            self.set_config_key_value(config_key, default_value)
+        else:
+            print(f'jj config: "{config_key}" already set; skipping')
+
+    def _get_config_value(self, key: str) -> Optional[str]:
+        """Get a config value, returning None if not set."""
+        value = self._run_read_only(
+            "config", "get", key, return_codes=[0, 1], stderr=subprocess.DEVNULL
+        )
+        return value.strip() if value else None
+
+    def _migrate_config_value(
+        self, key: str, deprecated_value: str, default_value: str
+    ):
+        """
+        Migrate a config key from a deprecated value to a new valid default value.
+        Only updates if the current value matches deprecated_value.
+        """
+        if self._get_config_value(key) == deprecated_value:
+            print(f'Migrating jj config: "{key}"')
+            self.set_config_key_value(key, default_value)
+
+    def _copy_from_git_if_missing(self, config_key: str) -> bool:
+        """
+        If `config_key` exists in Git and is missing in jj, copy it into jj
+        Returns True if a value was copied (i.e. jj was updated).
+        """
+        git_value = self._git.get_config_key_value(config_key)
+        if git_value and self.config_key_list_value_missing(config_key):
+            self.set_config_key_value(config_key, git_value)
+            return True
+        return False
+
+    def configure(self, state_dir: Path, update_only: bool = False):
+        """Run the Jujutsu configuration steps."""
+        print(
+            "\nOur jj support currently relies on Git; checks will run for both jj and Git.\n"
+        )
+
+        self._git.configure(state_dir, update_only)
+
+        topsrcdir = Path(self.path)
+        if not update_only:
+            print("\nConfiguring jj...")
+
+            version_str = self._run_read_only("--version")
+            if match := re.search(r"(\d+\.\d+\.\d+)", version_str):
+                jj_version = Version(match.group(1))
+            else:
+                raise Exception("Could not find jj version")
+
+            if jj_version < MINIMUM_SUPPORTED_JJ_VERSION:
+                raise JjVersionError(
+                    f"Your version of jj ({jj_version}) is too old. "
+                    f"Please upgrade to at least version '{MINIMUM_SUPPORTED_JJ_VERSION}' to ensure "
+                    "full compatibility and performance."
+                )
+
+            print(f"Detected jj version `{jj_version}`, which is sufficiently modern.")
+
+
+            updated_author = False
+
+            for key in ("user.name", "user.email"):
+                if self._copy_from_git_if_missing(key):
+                    updated_author = True
+
+            if updated_author:
+                self._run("metaedit", "--update-author")
+
+            immutable_heads_key = 'revset-aliases."immutable_heads()"'
+            immutable_heads_default_value = "builtin_immutable_heads() | remote_bookmarks(glob:'*', remote=exact:'origin')"
+            immutable_heads_deprecated_value = (
+                "builtin_immutable_heads() | remote_bookmarks(glob:'*', 'origin')"
+            )
+            self._migrate_config_value(
+                immutable_heads_key,
+                immutable_heads_deprecated_value,
+                immutable_heads_default_value,
+            )
+            self._set_default_if_missing(
+                immutable_heads_key, immutable_heads_default_value
+            )
+
+            self._set_default_if_missing("snapshot.auto-update-stale", True)
+
+            fix_cmd = [f"{topsrcdir.as_posix()}/tools/lint/pipelint", "$path"]
+            if sys.platform.startswith("win"):
+                fix_cmd.insert(0, "python3")
+            self._set_default_if_missing("fix.tools.mozlint.command", fix_cmd)
+            self._set_default_if_missing("fix.tools.mozlint.patterns", ["glob:**/*"])
+
+            if which("watchman"):
+                if jj_version >= Version("0.32"):
+                    for key in [
+                        "core.fsmonitor",
+                        "core.watchman.register-snapshot-trigger",
+                    ]:
+                        self._run(
+                            "config",
+                            "unset",
+                            "--repo",
+                            key,
+                            return_codes=[0, 1],
+                            stderr=subprocess.DEVNULL,
+                        )
+
+                    self._set_default_if_missing("fsmonitor.backend", "watchman")
+                    self._set_default_if_missing(
+                        "fsmonitor.watchman.register-snapshot-trigger", False
+                    )
+                else:
+                    self._set_default_if_missing("core.fsmonitor", "watchman")
+                    self._set_default_if_missing(
+                        "core.watchman.register-snapshot-trigger", False
+                    )
+
+                print("Checking if watchman is enabled...")
+                output = self._run_read_only("debug", "watchman", "status")
+
+                pattern = re.compile(
+                    r"^Background snapshotting is (disabled|currently inactive)"
+                )
+
+                for line in output.splitlines():
+                    if not pattern.match(line):
+                        print(line)
+            else:
+                print(
+                    "Watchman could not be found on the PATH. It is recommended to "
+                    "install watchman to improve performance for jj operations"
+                )

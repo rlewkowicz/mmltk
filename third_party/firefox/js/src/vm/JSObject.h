@@ -1,0 +1,792 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef vm_JSObject_h
+#define vm_JSObject_h
+
+#include "mozilla/MemoryReporting.h"
+
+#include "jsfriendapi.h"
+
+#include "js/friend/ErrorMessages.h"  // JSErrNum
+#include "js/GCVector.h"
+#include "js/shadow/Zone.h"  // JS::shadow::Zone
+#include "js/Wrapper.h"
+#include "vm/Shape.h"
+
+namespace JS {
+struct ClassInfo;
+}  
+
+namespace js {
+
+using PropertyDescriptorVector = JS::GCVector<JS::PropertyDescriptor>;
+class GCMarker;
+class JS_PUBLIC_API GenericPrinter;
+class JSONPrinter;
+class Nursery;
+struct AutoEnterOOMUnsafeRegion;
+
+namespace gc {
+class RelocationOverlay;
+}  
+
+
+class GlobalObject;
+class NativeObject;
+class WithEnvironmentObject;
+
+enum class IntegrityLevel { Sealed, Frozen };
+
+enum NewObjectKind {
+  GenericObject,
+
+  TenuredObject
+};
+
+struct NewObjectOptions {
+  NewObjectKind newKind = GenericObject;
+  ObjectFlags flags = {};
+  gc::AllocKind allocKind = gc::AllocKind::INVALID;
+  gc::AllocSite* site = nullptr;
+};
+
+bool PreventExtensions(JSContext* cx, JS::HandleObject obj,
+                       JS::ObjectOpResult& result);
+bool SetImmutablePrototype(JSContext* cx, JS::HandleObject obj,
+                           bool* succeeded);
+
+} 
+
+class JSObject
+    : public js::gc::CellWithTenuredGCPointer<js::gc::Cell, js::Shape> {
+ public:
+  js::Shape* shape() const { return headerPtr(); }
+
+  js::Shape* shapeMaybeForwarded() const { return headerPtrAtomic(); }
+
+#ifndef JS_64BIT
+  uint32_t padding_;
+#endif
+
+ private:
+  friend class js::GCMarker;
+  friend class js::GlobalObject;
+  friend class js::Nursery;
+  friend class js::gc::RelocationOverlay;
+  friend bool js::PreventExtensions(JSContext* cx, JS::HandleObject obj,
+                                    JS::ObjectOpResult& result);
+  friend bool js::SetImmutablePrototype(JSContext* cx, JS::HandleObject obj,
+                                        bool* succeeded);
+
+ public:
+  const JSClass* getClass() const { return shape()->getObjectClass(); }
+  bool hasClass(const JSClass* c) const { return getClass() == c; }
+
+  js::LookupPropertyOp getOpsLookupProperty() const {
+    return getClass()->getOpsLookupProperty();
+  }
+  js::DefinePropertyOp getOpsDefineProperty() const {
+    return getClass()->getOpsDefineProperty();
+  }
+  js::HasPropertyOp getOpsHasProperty() const {
+    return getClass()->getOpsHasProperty();
+  }
+  js::GetPropertyOp getOpsGetProperty() const {
+    return getClass()->getOpsGetProperty();
+  }
+  js::SetPropertyOp getOpsSetProperty() const {
+    return getClass()->getOpsSetProperty();
+  }
+  js::GetOwnPropertyOp getOpsGetOwnPropertyDescriptor() const {
+    return getClass()->getOpsGetOwnPropertyDescriptor();
+  }
+  js::DeletePropertyOp getOpsDeleteProperty() const {
+    return getClass()->getOpsDeleteProperty();
+  }
+  js::GetElementsOp getOpsGetElements() const {
+    return getClass()->getOpsGetElements();
+  }
+  JSFunToStringOp getOpsFunToString() const {
+    return getClass()->getOpsFunToString();
+  }
+
+  JS::Compartment* compartment() const { return shape()->compartment(); }
+  JS::Compartment* maybeCompartment() const { return compartment(); }
+
+  void initShape(js::Shape* shape) {
+    MOZ_ASSERT(Cell::zone() == shape->zone());
+    initHeaderPtr(shape);
+  }
+  void setShape(js::Shape* shape) {
+    MOZ_ASSERT(maybeCCWRealm() == shape->realm());
+    setHeaderPtr(shape);
+  }
+
+  void setShapeForProxySwap(js::Shape* newShape) {
+    MOZ_ASSERT(shape()->isProxy());
+    MOZ_ASSERT(newShape->isProxy());
+    MOZ_RELEASE_ASSERT(compartment() == newShape->compartment());
+    setHeaderPtr(newShape);
+  }
+
+  static bool setFlags(JSContext* cx, JS::HandleObject obj,
+                       js::ObjectFlags flags);
+
+  static bool setFlag(JSContext* cx, JS::HandleObject obj,
+                      js::ObjectFlag flag) {
+    return setFlags(cx, obj, {flag});
+  }
+
+  bool hasFlag(js::ObjectFlag flag) const {
+    return shape()->hasObjectFlag(flag);
+  }
+
+  bool hasAnyFlag(js::ObjectFlags flags) const {
+    return shape()->objectFlags().hasAnyFlag(flags);
+  }
+  bool hasAllFlags(js::ObjectFlags flags) const {
+    return shape()->objectFlags().hasAllFlags(flags);
+  }
+
+  static bool setProtoUnchecked(JSContext* cx, JS::HandleObject obj,
+                                js::Handle<js::TaggedProto> proto);
+
+  bool isUsedAsPrototype() const {
+    return hasFlag(js::ObjectFlag::IsUsedAsPrototype);
+  }
+  static bool setIsUsedAsPrototype(JSContext* cx, JS::HandleObject obj);
+
+  bool useWatchtowerTestingLog() const {
+    return hasFlag(js::ObjectFlag::UseWatchtowerTestingLog);
+  }
+  static bool setUseWatchtowerTestingLog(JSContext* cx, JS::HandleObject obj) {
+    return setFlag(cx, obj, js::ObjectFlag::UseWatchtowerTestingLog);
+  }
+
+  bool isGenerationCountedGlobal() const {
+    return hasFlag(js::ObjectFlag::GenerationCountedGlobal);
+  }
+
+  bool hasRealmFuseProperty() const {
+    return hasFlag(js::ObjectFlag::HasRealmFuseProperty);
+  }
+  static bool setHasRealmFuseProperty(JSContext* cx, JS::HandleObject obj) {
+    return setFlag(cx, obj, js::ObjectFlag::HasRealmFuseProperty);
+  }
+
+  bool hasNonFunctionAccessor() const {
+    return hasFlag(js::ObjectFlag::HasNonFunctionAccessor);
+  }
+  static bool setHasNonFunctionAccessor(JSContext* cx, JS::HandleObject obj) {
+    return setFlag(cx, obj, js::ObjectFlag::HasNonFunctionAccessor);
+  }
+
+  static bool setLegacyFeaturesDisabled(JSContext* cx, JS::HandleObject obj) {
+    return setFlag(cx, obj, js::ObjectFlag::LegacyFeaturesDisabled);
+  }
+
+  bool hasObjectFuse() const { return hasFlag(js::ObjectFlag::HasObjectFuse); }
+
+  inline bool isQualifiedVarObj() const;
+
+  static inline bool setQualifiedVarObj(
+      JSContext* cx, JS::Handle<js::WithEnvironmentObject*> obj);
+
+  inline bool isUnqualifiedVarObj() const;
+
+  inline bool hasInvalidatedTeleporting() const;
+  static bool setInvalidatedTeleporting(JSContext* cx, JS::HandleObject obj) {
+    MOZ_ASSERT(obj->isUsedAsPrototype());
+    MOZ_ASSERT(obj->hasStaticPrototype(),
+               "teleporting as a concept is only applicable to static "
+               "(not dynamically-computed) prototypes");
+    return setFlag(cx, obj, js::ObjectFlag::InvalidatedTeleporting);
+  }
+
+  [[nodiscard]] static bool reshapeForTeleporting(JSContext* cx,
+                                                  JS::HandleObject obj);
+
+  MOZ_ALWAYS_INLINE bool maybeHasInterestingSymbolProperty() const;
+
+  inline bool needsProxyGetSetResultValidation() const;
+
+
+  void traceChildren(JSTracer* trc);
+
+  void fixupAfterMovingGC() {}
+
+  static const JS::TraceKind TraceKind = JS::TraceKind::Object;
+
+  static constexpr size_t thingSize(js::gc::AllocKind kind);
+
+  MOZ_ALWAYS_INLINE JS::Zone* zone() const {
+    MOZ_ASSERT_IF(!isTenured(), nurseryZone() == shape()->zone());
+    return shape()->zone();
+  }
+  MOZ_ALWAYS_INLINE JS::shadow::Zone* shadowZone() const {
+    return JS::shadow::Zone::from(zone());
+  }
+  MOZ_ALWAYS_INLINE JS::Zone* zoneFromAnyThread() const {
+    MOZ_ASSERT_IF(!isTenured(), nurseryZoneFromAnyThread() ==
+                                    shapeMaybeForwarded()->zoneFromAnyThread());
+    return shapeMaybeForwarded()->zoneFromAnyThread();
+  }
+  MOZ_ALWAYS_INLINE JS::shadow::Zone* shadowZoneFromAnyThread() const {
+    return JS::shadow::Zone::from(zoneFromAnyThread());
+  }
+  static MOZ_ALWAYS_INLINE void postWriteBarrier(void* cellp, JSObject* prev,
+                                                 JSObject* next) {
+    js::gc::PostWriteBarrierImpl<JSObject>(cellp, prev, next);
+  }
+
+  js::gc::AllocKind allocKind() const;
+
+  js::gc::AllocKind allocKindForTenure(const js::Nursery& nursery) const;
+
+  size_t tenuredSizeOfThis() const {
+    MOZ_ASSERT(isTenured());
+    return js::gc::Arena::thingSize(asTenured().getAllocKind());
+  }
+
+  void addSizeOfExcludingThis(mozilla::MallocSizeOf mallocSizeOf,
+                              JS::ClassInfo* info,
+                              JS::RuntimeSizes* runtimeSizes);
+
+  size_t sizeOfIncludingThisInNursery(mozilla::MallocSizeOf mallocSizeOf) const;
+
+#ifdef DEBUG
+  static void debugCheckNewObject(js::Shape* shape, js::gc::AllocKind allocKind,
+                                  js::gc::Heap heap);
+#else
+  static void debugCheckNewObject(js::Shape* shape, js::gc::AllocKind allocKind,
+                                  js::gc::Heap heap) {}
+#endif
+
+
+  js::TaggedProto taggedProto() const { return shape()->proto(); }
+
+  bool uninlinedIsProxyObject() const;
+
+  JSObject* staticPrototype() const {
+    MOZ_ASSERT(hasStaticPrototype());
+    return taggedProto().toObjectOrNull();
+  }
+
+  bool hasStaticPrototype() const { return !hasDynamicPrototype(); }
+
+  bool hasDynamicPrototype() const {
+    bool dynamic = taggedProto().isDynamic();
+    MOZ_ASSERT_IF(dynamic, uninlinedIsProxyObject());
+    return dynamic;
+  }
+
+  inline bool staticPrototypeIsImmutable() const;
+
+
+  inline JSObject* enclosingEnvironment() const;
+
+  inline js::GlobalObject& nonCCWGlobal() const;
+
+  JS::Realm* nonCCWRealm() const {
+    MOZ_ASSERT(!js::UninlinedIsCrossCompartmentWrapper(this));
+    return shape()->realm();
+  }
+  bool hasSameRealmAs(JSContext* cx) const;
+
+  JS::Realm* maybeCCWRealm() const { return shape()->realm(); }
+
+
+ public:
+  inline bool nonProxyIsExtensible() const;
+  bool uninlinedNonProxyIsExtensible() const;
+
+ public:
+  MOZ_ALWAYS_INLINE bool isCallable() const;
+  MOZ_ALWAYS_INLINE bool isConstructor() const;
+  MOZ_ALWAYS_INLINE JSNative callHook() const;
+  MOZ_ALWAYS_INLINE JSNative constructHook() const;
+
+  bool isBackgroundFinalized() const;
+
+  MOZ_ALWAYS_INLINE void finalize(JS::GCContext* gcx);
+
+ public:
+  static bool nonNativeSetProperty(JSContext* cx, js::HandleObject obj,
+                                   js::HandleId id, js::HandleValue v,
+                                   js::HandleValue receiver,
+                                   JS::ObjectOpResult& result);
+  static bool nonNativeSetElement(JSContext* cx, js::HandleObject obj,
+                                  uint32_t index, js::HandleValue v,
+                                  js::HandleValue receiver,
+                                  JS::ObjectOpResult& result);
+
+
+  template <class T>
+  inline bool is() const {
+    return getClass() == &T::class_;
+  }
+
+  template <class T>
+  T& as() {
+    MOZ_ASSERT(this->is<T>());
+    return *static_cast<T*>(this);
+  }
+
+  template <class T>
+  const T& as() const {
+    MOZ_ASSERT(this->is<T>());
+    return *static_cast<const T*>(this);
+  }
+
+  template <class T>
+  bool canUnwrapAs();
+
+  template <class T>
+  T& unwrapAs();
+
+  template <class T>
+  inline T* maybeUnwrapAs();
+
+  inline JSObject* maybeUnwrapAs(const JSClass* clasp);
+
+  template <class T>
+  T* maybeUnwrapIf();
+
+#if defined(DEBUG) || defined(JS_JITSPEW)
+  void dump() const;
+  void dump(js::GenericPrinter& out) const;
+  void dump(js::JSONPrinter& json) const;
+
+  void dumpFields(js::JSONPrinter& json) const;
+  void dumpStringContent(js::GenericPrinter& out) const;
+#endif
+
+#ifdef JS_64BIT
+  static constexpr size_t MAX_BYTE_SIZE =
+      3 * sizeof(void*) + 16 * sizeof(JS::Value);
+#else
+  static constexpr size_t MAX_BYTE_SIZE =
+      4 * sizeof(void*) + 16 * sizeof(JS::Value);
+#endif
+
+  JSObject(const JSObject& other) = delete;
+  void operator=(const JSObject& other) = delete;
+
+ protected:
+  friend class js::jit::MacroAssembler;
+
+  static constexpr size_t offsetOfShape() { return offsetOfHeaderPtr(); }
+
+ protected:
+  friend class js::gc::GCRuntime;
+  JSObject() = default;
+};
+
+template <>
+inline bool JSObject::is<JSObject>() const {
+  return true;
+}
+
+template <typename Wrapper>
+template <typename U>
+MOZ_ALWAYS_INLINE JS::Handle<U*> js::RootedOperations<JSObject*, Wrapper>::as()
+    const {
+  const Wrapper& self = *static_cast<const Wrapper*>(this);
+  MOZ_ASSERT(self->template is<U>());
+  return Handle<U*>::fromMarkedLocation(
+      reinterpret_cast<U* const*>(self.address()));
+}
+
+template <typename Wrapper>
+template <class U>
+MOZ_ALWAYS_INLINE JS::Handle<U*> js::HandleOperations<JSObject*, Wrapper>::as()
+    const {
+  const JS::Handle<JSObject*>& self =
+      *static_cast<const JS::Handle<JSObject*>*>(this);
+  MOZ_ASSERT(self->template is<U>());
+  return Handle<U*>::fromMarkedLocation(
+      reinterpret_cast<U* const*>(self.address()));
+}
+
+template <class T>
+bool JSObject::canUnwrapAs() {
+  static_assert(!std::is_convertible_v<T*, js::Wrapper*>,
+                "T can't be a Wrapper type; this function discards wrappers");
+
+  if (is<T>()) {
+    return true;
+  }
+  JSObject* obj = js::CheckedUnwrapStatic(this);
+  return obj && obj->is<T>();
+}
+
+template <class T>
+T& JSObject::unwrapAs() {
+  static_assert(!std::is_convertible_v<T*, js::Wrapper*>,
+                "T can't be a Wrapper type; this function discards wrappers");
+
+  if (is<T>()) {
+    return as<T>();
+  }
+
+  JSObject* unwrapped = js::UncheckedUnwrap(this);
+  MOZ_ASSERT(js::CheckedUnwrapStatic(this) == unwrapped,
+             "check that the security check we skipped really is redundant");
+  return unwrapped->as<T>();
+}
+
+template <class T>
+inline T* JSObject::maybeUnwrapAs() {
+  static_assert(!std::is_convertible_v<T*, js::Wrapper*>,
+                "T can't be a Wrapper type; this function discards wrappers");
+
+  if (is<T>()) {
+    return &as<T>();
+  }
+
+  JSObject* unwrapped = js::CheckedUnwrapStatic(this);
+  if (!unwrapped) {
+    return nullptr;
+  }
+
+  if (MOZ_LIKELY(unwrapped->is<T>())) {
+    return &unwrapped->as<T>();
+  }
+
+  MOZ_CRASH("Invalid object. Dead wrapper?");
+}
+
+inline JSObject* JSObject::maybeUnwrapAs(const JSClass* clasp) {
+  if (hasClass(clasp)) {
+    return this;
+  }
+
+  JSObject* unwrapped = js::CheckedUnwrapStatic(this);
+  if (!unwrapped) {
+    return nullptr;
+  }
+
+  if (MOZ_LIKELY(unwrapped->hasClass(clasp))) {
+    return unwrapped;
+  }
+
+  MOZ_CRASH("Invalid object. Dead wrapper?");
+}
+
+template <class T>
+T* JSObject::maybeUnwrapIf() {
+  static_assert(!std::is_convertible_v<T*, js::Wrapper*>,
+                "T can't be a Wrapper type; this function discards wrappers");
+
+  if (is<T>()) {
+    return &as<T>();
+  }
+
+  JSObject* unwrapped = js::CheckedUnwrapStatic(this);
+  return (unwrapped && unwrapped->is<T>()) ? &unwrapped->as<T>() : nullptr;
+}
+
+static MOZ_ALWAYS_INLINE bool operator==(const JSObject& lhs,
+                                         const JSObject& rhs) {
+  return &lhs == &rhs;
+}
+
+static MOZ_ALWAYS_INLINE bool operator!=(const JSObject& lhs,
+                                         const JSObject& rhs) {
+  return &lhs != &rhs;
+}
+
+struct JSObject_Slots0 : JSObject {
+  void* data[2];
+};
+struct JSObject_Slots2 : JSObject {
+  void* data[2];
+  js::Value fslots[2];
+};
+struct JSObject_Slots4 : JSObject {
+  void* data[2];
+  js::Value fslots[4];
+};
+struct JSObject_Slots6 : JSObject {
+  void* data[2];
+  js::Value fslots[6];
+};
+struct JSObject_Slots7 : JSObject {
+  void* data[2];
+  js::Value fslots[7];
+};
+struct JSObject_Slots8 : JSObject {
+  void* data[2];
+  js::Value fslots[8];
+};
+struct JSObject_Slots12 : JSObject {
+  void* data[2];
+  js::Value fslots[12];
+};
+struct JSObject_Slots16 : JSObject {
+  void* data[2];
+  js::Value fslots[16];
+};
+
+constexpr size_t JSObject::thingSize(js::gc::AllocKind kind) {
+  MOZ_ASSERT(IsObjectAllocKind(kind));
+  constexpr uint8_t objectSizes[] = {
+#define EXPAND_OJBECT_SIZE(_1, _2, _3, sizedType, _4, _5, _6) sizeof(sizedType),
+      FOR_EACH_OBJECT_ALLOCKIND(EXPAND_OJBECT_SIZE)};
+  return objectSizes[size_t(kind)];
+}
+
+namespace js {
+
+extern bool ObjectMayBeSwapped(const JSObject* obj);
+
+extern bool DefineFunctions(JSContext* cx, HandleObject obj,
+                            const JSFunctionSpec* fs);
+
+extern bool ToPrimitiveSlow(JSContext* cx, JSType hint, MutableHandleValue vp);
+
+inline bool ToPrimitive(JSContext* cx, MutableHandleValue vp) {
+  if (vp.isPrimitive()) {
+    return true;
+  }
+  return ToPrimitiveSlow(cx, JSTYPE_UNDEFINED, vp);
+}
+
+inline bool ToPrimitive(JSContext* cx, JSType preferredType,
+                        MutableHandleValue vp) {
+  if (vp.isPrimitive()) {
+    return true;
+  }
+  return ToPrimitiveSlow(cx, preferredType, vp);
+}
+
+MOZ_ALWAYS_INLINE const char* GetObjectClassName(JSContext* cx,
+                                                 HandleObject obj);
+
+} 
+
+namespace js {
+
+extern bool GetPrototypeFromConstructor(JSContext* cx,
+                                        js::HandleObject newTarget,
+                                        JSProtoKey intrinsicDefaultProto,
+                                        js::MutableHandleObject proto);
+
+MOZ_ALWAYS_INLINE bool GetPrototypeFromBuiltinConstructor(
+    JSContext* cx, const CallArgs& args, JSProtoKey intrinsicDefaultProto,
+    js::MutableHandleObject proto) {
+  if (!args.isConstructing() ||
+      &args.newTarget().toObject() == &args.callee()) {
+    MOZ_ASSERT(args.callee().hasSameRealmAs(cx));
+    proto.set(nullptr);
+    return true;
+  }
+
+  RootedObject newTarget(cx, &args.newTarget().toObject());
+  return GetPrototypeFromConstructor(cx, newTarget, intrinsicDefaultProto,
+                                     proto);
+}
+
+bool ToPropertyDescriptor(JSContext* cx, HandleValue descval,
+                          bool checkAccessors,
+                          MutableHandle<JS::PropertyDescriptor> desc);
+
+Result<> CheckPropertyDescriptorAccessors(JSContext* cx,
+                                          Handle<JS::PropertyDescriptor> desc);
+
+void CompletePropertyDescriptor(MutableHandle<JS::PropertyDescriptor> desc);
+
+extern bool ReadPropertyDescriptors(
+    JSContext* cx, HandleObject props, bool checkAccessors,
+    MutableHandleIdVector ids, MutableHandle<PropertyDescriptorVector> descs);
+
+extern bool LookupName(JSContext* cx, Handle<PropertyName*> name,
+                       HandleObject envChain, MutableHandleObject objp,
+                       MutableHandleObject pobjp, PropertyResult* propp);
+
+extern bool LookupNameNoGC(JSContext* cx, PropertyName* name,
+                           JSObject* envChain, NativeObject** pobjp,
+                           PropertyResult* propp);
+
+extern JSObject* LookupNameWithGlobalDefault(JSContext* cx,
+                                             Handle<PropertyName*> name,
+                                             HandleObject envChain);
+
+extern JSObject* LookupNameUnqualified(JSContext* cx,
+                                       Handle<PropertyName*> name,
+                                       HandleObject envChain);
+
+}  
+
+namespace js {
+
+
+bool LookupPropertyPure(JSContext* cx, JSObject* obj, jsid id,
+                        NativeObject** objp, PropertyResult* propp);
+
+bool LookupOwnPropertyPure(JSContext* cx, JSObject* obj, jsid id,
+                           PropertyResult* propp);
+
+bool GetPropertyPure(JSContext* cx, JSObject* obj, jsid id, Value* vp);
+
+bool GetOwnPropertyPure(JSContext* cx, JSObject* obj, jsid id, Value* vp,
+                        bool* found);
+
+bool GetGetterPure(JSContext* cx, JSObject* obj, jsid id, JSFunction** fp);
+
+extern bool FromPropertyDescriptorToObject(JSContext* cx,
+                                           Handle<JS::PropertyDescriptor> desc,
+                                           MutableHandleValue vp);
+
+extern bool IsPrototypeOf(JSContext* cx, HandleObject protoObj, JSObject* obj,
+                          bool* result);
+
+extern JSObject* PrimitiveToObject(JSContext* cx, const Value& v);
+extern JSProtoKey PrimitiveToProtoKey(JSContext* cx, const Value& v);
+
+} 
+
+namespace js {
+
+JSObject* ToObjectSlowForPropertyAccess(JSContext* cx, JS::HandleValue val,
+                                        int valIndex, HandleId key);
+JSObject* ToObjectSlowForPropertyAccess(JSContext* cx, JS::HandleValue val,
+                                        int valIndex,
+                                        Handle<PropertyName*> key);
+JSObject* ToObjectSlowForPropertyAccess(JSContext* cx, JS::HandleValue val,
+                                        int valIndex, HandleValue keyValue);
+
+MOZ_ALWAYS_INLINE JSObject* ToObjectFromStackForPropertyAccess(JSContext* cx,
+                                                               HandleValue vp,
+                                                               int vpIndex,
+                                                               HandleId key) {
+  if (vp.isObject()) {
+    return &vp.toObject();
+  }
+  return js::ToObjectSlowForPropertyAccess(cx, vp, vpIndex, key);
+}
+MOZ_ALWAYS_INLINE JSObject* ToObjectFromStackForPropertyAccess(
+    JSContext* cx, HandleValue vp, int vpIndex, Handle<PropertyName*> key) {
+  if (vp.isObject()) {
+    return &vp.toObject();
+  }
+  return js::ToObjectSlowForPropertyAccess(cx, vp, vpIndex, key);
+}
+MOZ_ALWAYS_INLINE JSObject* ToObjectFromStackForPropertyAccess(
+    JSContext* cx, HandleValue vp, int vpIndex, HandleValue key) {
+  if (vp.isObject()) {
+    return &vp.toObject();
+  }
+  return js::ToObjectSlowForPropertyAccess(cx, vp, vpIndex, key);
+}
+
+extern void ReportNotObject(JSContext* cx, const Value& v);
+
+inline JSObject* RequireObject(JSContext* cx, HandleValue v) {
+  if (v.isObject()) {
+    return &v.toObject();
+  }
+  ReportNotObject(cx, v);
+  return nullptr;
+}
+
+extern void ReportNotObject(JSContext* cx, JSErrNum err, int spindex,
+                            HandleValue v);
+
+inline JSObject* RequireObject(JSContext* cx, JSErrNum err, int spindex,
+                               HandleValue v) {
+  if (v.isObject()) {
+    return &v.toObject();
+  }
+  ReportNotObject(cx, err, spindex, v);
+  return nullptr;
+}
+
+extern void ReportNotObject(JSContext* cx, JSErrNum err, HandleValue v);
+
+inline JSObject* RequireObject(JSContext* cx, JSErrNum err, HandleValue v) {
+  if (v.isObject()) {
+    return &v.toObject();
+  }
+  ReportNotObject(cx, err, v);
+  return nullptr;
+}
+
+extern void ReportNotObjectArg(JSContext* cx, const char* nth, const char* fun,
+                               HandleValue v);
+
+inline JSObject* RequireObjectArg(JSContext* cx, const char* nth,
+                                  const char* fun, HandleValue v) {
+  if (v.isObject()) {
+    return &v.toObject();
+  }
+  ReportNotObjectArg(cx, nth, fun, v);
+  return nullptr;
+}
+
+extern bool GetFirstArgumentAsObject(JSContext* cx, const CallArgs& args,
+                                     const char* method,
+                                     MutableHandleObject objp);
+
+extern bool Throw(JSContext* cx, HandleId id, unsigned errorNumber,
+                  const char* details = nullptr);
+
+extern bool SetIntegrityLevel(JSContext* cx, HandleObject obj,
+                              IntegrityLevel level);
+
+inline bool FreezeObject(JSContext* cx, HandleObject obj) {
+  return SetIntegrityLevel(cx, obj, IntegrityLevel::Frozen);
+}
+
+extern bool TestIntegrityLevel(JSContext* cx, HandleObject obj,
+                               IntegrityLevel level, bool* resultp);
+
+[[nodiscard]] extern JSObject* SpeciesConstructor(
+    JSContext* cx, HandleObject obj, HandleObject defaultCtor,
+    bool (*isDefaultSpecies)(JSContext*, JSFunction*));
+
+[[nodiscard]] extern JSObject* SpeciesConstructor(
+    JSContext* cx, HandleObject obj, JSProtoKey ctorKey,
+    bool (*isDefaultSpecies)(JSContext*, JSFunction*));
+
+extern bool GetObjectFromHostDefinedData(
+    JSContext* cx, MutableHandleObject incumbentGlobal,
+    MutableHandleObject optionalHostDefinedData);
+
+extern bool GetIncumbentGlobalRepresentative(
+    JSContext* cx, MutableHandleObject incumbentGlobalRepresentative);
+
+#ifdef DEBUG
+inline bool IsObjectValueInCompartment(const Value& v, JS::Compartment* comp) {
+  if (!v.isObject()) {
+    return true;
+  }
+  return v.toObject().compartment() == comp;
+}
+#endif
+
+template <typename ObjectSubclass>
+void CallTraceMethod(JSTracer* trc, JSObject* obj) {
+  obj->as<ObjectSubclass>().trace(trc);
+}
+
+#ifdef JS_HAS_CTYPES
+
+namespace ctypes {
+
+extern size_t SizeOfDataIfCDataObject(mozilla::MallocSizeOf mallocSizeOf,
+                                      JSObject* obj);
+
+}  
+
+#endif
+
+#ifdef DEBUG
+void AssertJSClassInvariants(const JSClass* clasp);
+#endif
+
+} 
+
+#endif /* vm_JSObject_h */

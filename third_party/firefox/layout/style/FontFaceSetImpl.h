@@ -1,0 +1,231 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_FontFaceSetImpl_h
+#define mozilla_dom_FontFaceSetImpl_h
+
+#include <functional>
+
+#include "gfxUserFontSet.h"
+#include "mozilla/DOMEventTargetHelper.h"
+#include "mozilla/FontPropertyTypes.h"
+#include "mozilla/RecursiveMutex.h"
+#include "mozilla/dom/FontFace.h"
+#include "mozilla/dom/FontFaceSetBinding.h"
+#include "nsICSSLoaderObserver.h"
+#include "nsIDOMEventListener.h"
+
+struct gfxFontFaceSrc;
+class gfxFontSrcPrincipal;
+class gfxUserFontEntry;
+class nsFontFaceLoader;
+class nsIChannel;
+class nsIPrincipal;
+class nsPIDOMWindowInner;
+
+namespace mozilla {
+struct StyleLockedFontFaceRule;
+class PostTraversalTask;
+class Runnable;
+class SharedFontList;
+namespace dom {
+class FontFace;
+}  
+}  
+
+namespace mozilla::dom {
+
+class FontFaceSetImpl : public nsISupports, public gfxUserFontSet {
+  NS_DECL_THREADSAFE_ISUPPORTS
+
+ public:
+
+  already_AddRefed<gfxFontSrcPrincipal> GetStandardFontLoadPrincipal()
+      const final;
+
+  void RecordFontLoadDone(uint32_t aFontSize, TimeStamp aDoneTime) override;
+
+  bool BypassCache() final { return mBypassCache; }
+
+  void ForgetLocalFaces() final;
+
+ protected:
+  virtual nsresult CreateChannelForSyncLoadFontData(
+      nsIChannel** aOutChannel, gfxUserFontEntry* aFontToLoad,
+      const gfxFontFaceSrc* aFontFaceSrc) = 0;
+
+
+  bool GetPrivateBrowsing() override { return mPrivateBrowsing; }
+  nsresult SyncLoadFontData(gfxUserFontEntry* aFontToLoad,
+                            const gfxFontFaceSrc* aFontFaceSrc,
+                            uint8_t*& aBuffer,
+                            uint32_t& aBufferLength) override;
+  nsresult LogMessage(gfxUserFontEntry* aUserFontEntry, uint32_t aSrcIndex,
+                      const char* aMessage,
+                      uint32_t aFlags = nsIScriptError::errorFlag,
+                      nsresult aStatus = NS_OK) override;
+  void DoRebuildUserFontSet() override;
+  already_AddRefed<gfxUserFontEntry> CreateUserFontEntry(
+      nsTArray<gfxFontFaceSrc>&& aFontFaceSrcList,
+      gfxUserFontAttributes&& aAttr) override;
+
+  already_AddRefed<gfxUserFontFamily> GetFamily(
+      const nsACString& aFamilyName) final;
+
+  explicit FontFaceSetImpl(FontFaceSet* aOwner);
+
+  void DestroyLoaders();
+
+ public:
+  virtual void Destroy();
+  virtual bool IsOnOwningThread() = 0;
+#ifdef DEBUG
+  virtual void AssertIsOnOwningThread() = 0;
+#else
+  void AssertIsOnOwningThread() {}
+#endif
+  virtual void DispatchToOwningThread(const char* aName,
+                                      std::function<void()>&& aFunc) = 0;
+
+  void RemoveLoader(nsFontFaceLoader* aLoader) override;
+
+  virtual bool UpdateRules(const nsTArray<nsFontFaceRuleContainer>& aRules) {
+    MOZ_ASSERT_UNREACHABLE("Not implemented!");
+    return false;
+  }
+
+  virtual StyleLockedFontFaceRule* FindRuleForEntry(gfxFontEntry* aFontEntry) {
+    MOZ_ASSERT_UNREACHABLE("Not implemented!");
+    return nullptr;
+  }
+
+  static already_AddRefed<gfxUserFontEntry>
+  FindOrCreateUserFontEntryFromFontFace(FontFaceImpl* aFontFace,
+                                        gfxUserFontAttributes&& aAttr,
+                                        StyleOrigin);
+
+  virtual void OnFontFaceStatusChanged(FontFaceImpl* aFontFace);
+
+  virtual void DidRefresh() { MOZ_ASSERT_UNREACHABLE("Not implemented!"); }
+
+  virtual void FlushUserFontSet() = 0;
+
+  static FontVisibilityProvider* GetFontVisibilityProviderFor(
+      gfxUserFontSet* aUserFontSet) {
+    const auto* set = static_cast<FontFaceSetImpl*>(aUserFontSet);
+    return set ? set->GetFontVisibilityProvider() : nullptr;
+  }
+
+  virtual void RefreshStandardFontLoadPrincipal();
+
+  virtual dom::Document* GetDocument() const { return nullptr; }
+
+  virtual already_AddRefed<URLExtraData> GetURLExtraData() = 0;
+
+
+  virtual void EnsureReady() {}
+  dom::FontFaceSetLoadStatus Status();
+
+  virtual bool Add(FontFaceImpl* aFontFace, ErrorResult& aRv);
+  virtual void Clear();
+  virtual bool Delete(FontFaceImpl* aFontFace);
+
+  virtual void CacheFontLoadability() {
+    MOZ_ASSERT_UNREACHABLE("Not implemented!");
+  }
+
+  virtual void MarkUserFontSetDirty() {}
+
+  virtual void CheckLoadingFinished();
+
+  virtual void FindMatchingFontFaces(const nsACString& aFont,
+                                     const nsAString& aText,
+                                     nsTArray<FontFace*>& aFontFaces,
+                                     ErrorResult& aRv);
+
+  virtual void DispatchCheckLoadingFinishedAfterDelay();
+  void DispatchLoadingEventAndReplaceReadyPromise();
+
+ protected:
+  ~FontFaceSetImpl() override;
+
+  virtual uint64_t GetInnerWindowID() = 0;
+
+  bool HasAvailableFontFace(FontFaceImpl* aFontFace);
+
+  virtual bool MightHavePendingFontLoads();
+
+  void CheckLoadingStarted();
+
+  void CheckLoadingFinishedAfterDelay();
+
+  void OnLoadingStarted() { DispatchLoadingEventAndReplaceReadyPromise(); }
+  void OnLoadingFinished();
+
+  struct FontFaceRecord {
+    RefPtr<FontFaceImpl> mFontFace;
+    Maybe<StyleOrigin> mOrigin;  
+  };
+
+  virtual StyleLockedFontFaceRule* FindRuleForUserFontEntry(
+      gfxUserFontEntry* aUserFontEntry) {
+    return nullptr;
+  }
+
+  virtual void FindMatchingFontFaces(
+      const nsTHashSet<FontFace*>& aMatchingFaces,
+      nsTArray<FontFace*>& aFontFaces);
+
+  class UpdateUserFontEntryRunnable;
+  void UpdateUserFontEntry(gfxUserFontEntry* aEntry,
+                           gfxUserFontAttributes&& aAttr);
+
+  nsresult CheckFontLoad(const gfxFontFaceSrc* aFontFaceSrc,
+                         gfxFontSrcPrincipal** aPrincipal, bool* aBypassCache);
+
+  void InsertNonRuleFontFace(FontFaceImpl* aFontFace);
+
+  bool HasLoadingFontFaces();
+
+  bool ReadyPromiseIsPending() const;
+
+  virtual void UpdateHasLoadingFontFaces();
+
+  void ParseFontShorthandForMatching(const nsACString& aFont,
+                                     StyleFontFamilyList& aFamilyList,
+                                     FontWeight& aWeight, FontStretch& aStretch,
+                                     FontSlantStyle& aStyle, ErrorResult& aRv);
+
+  virtual TimeStamp GetNavigationStartTimeStamp() = 0;
+
+  FontFaceSet* MOZ_NON_OWNING_REF mOwner MOZ_GUARDED_BY(mMutex);
+
+  mutable RefPtr<gfxFontSrcPrincipal> mStandardFontLoadPrincipal
+      MOZ_GUARDED_BY(mMutex);
+
+  nsTHashtable<nsPtrHashKey<nsFontFaceLoader>> mLoaders MOZ_GUARDED_BY(mMutex);
+
+  nsTArray<FontFaceRecord> mNonRuleFaces MOZ_GUARDED_BY(mMutex);
+
+  dom::FontFaceSetLoadStatus mStatus MOZ_GUARDED_BY(mMutex);
+
+  nsTHashMap<nsPtrHashKey<const gfxFontFaceSrc>, bool> mAllowedFontLoads
+      MOZ_GUARDED_BY(mMutex);
+
+  bool mNonRuleFacesDirty MOZ_GUARDED_BY(mMutex);
+
+  bool mHasLoadingFontFaces MOZ_GUARDED_BY(mMutex);
+
+  bool mHasLoadingFontFacesIsDirty MOZ_GUARDED_BY(mMutex);
+
+  bool mDelayedLoadCheck MOZ_GUARDED_BY(mMutex);
+
+  bool mBypassCache;
+
+  bool mPrivateBrowsing;
+};
+
+}  
+
+#endif  // !defined(mozilla_dom_FontFaceSetImpl_h)

@@ -1,0 +1,140 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "MatroskaDemuxer.h"
+
+#include "AOMDecoder.h"
+#include "H264.h"
+#include "H265.h"
+#include "VPXDecoder.h"
+#include "XiphExtradata.h"
+
+namespace mozilla {
+
+extern LazyLogModule gMediaDemuxerLog;
+#define MKV_DEBUG(msg, ...) \
+  MOZ_LOG_FMT(gMediaDemuxerLog, LogLevel::Debug, msg, ##__VA_ARGS__)
+
+MatroskaDemuxer::MatroskaDemuxer(MediaResource* aResource)
+    : WebMDemuxer(aResource) {}
+
+nsresult MatroskaDemuxer::SetVideoCodecInfo(nestegg* aContext, int aTrackId) {
+  mVideoCodec = nestegg_track_codec_id(aContext, aTrackId);
+  switch (mVideoCodec) {
+    case NESTEGG_CODEC_AVC: {
+      mInfo.mVideo.mMimeType = "video/avc";
+      nsresult rv = SetCodecPrivateToVideoExtraData(aContext, aTrackId);
+      if (NS_FAILED(rv)) {
+        MKV_DEBUG("Failed to set extradata for avc");
+        return rv;
+      }
+      break;
+    }
+    case NESTEGG_CODEC_HEVC: {
+      mInfo.mVideo.mMimeType = "video/hevc";
+      nsresult rv = SetCodecPrivateToVideoExtraData(aContext, aTrackId);
+      if (NS_FAILED(rv)) {
+        MKV_DEBUG("Failed to set extradata for hevc");
+        return rv;
+      }
+      break;
+    }
+    case NESTEGG_CODEC_VP8:
+      mInfo.mVideo.mMimeType = "video/vp8";
+      break;
+    case NESTEGG_CODEC_VP9:
+      mInfo.mVideo.mMimeType = "video/vp9";
+      break;
+    case NESTEGG_CODEC_AV1:
+      mInfo.mVideo.mMimeType = "video/av1";
+      break;
+    default:
+      NS_WARNING("Unknown Matroska video codec");
+      return NS_ERROR_FAILURE;
+  }
+  return NS_OK;
+}
+
+nsresult MatroskaDemuxer::SetCodecPrivateToVideoExtraData(nestegg* aContext,
+                                                          int aTrackId) {
+  nsTArray<const unsigned char*> headers;
+  nsTArray<size_t> headerLens;
+  nsresult rv = GetCodecPrivateData(aContext, aTrackId, &headers, &headerLens);
+  if (NS_FAILED(rv)) {
+    MKV_DEBUG("GetCodecPrivateData error");
+    return rv;
+  }
+  mInfo.mVideo.mExtraData->AppendElements(headers[0], headerLens[0]);
+  return NS_OK;
+}
+
+nsresult MatroskaDemuxer::SetContainerAudioCodecInfo(
+    nestegg* aContext, const nestegg_audio_params& aParams) {
+
+  static const uint64_t NSECS_PER_USEC = 1000;
+  static const uint64_t USECS_PER_S = 1e6;
+
+  switch (mAudioCodec) {
+    case NESTEGG_CODEC_AAC: {
+      mInfo.mAudio.mMimeType = "audio/mp4a-latm";
+      const uint32_t AAC_SAMPLES_PER_FRAME = 1024;
+      AacCodecSpecificData aacCodecSpecificData{};
+      uint64_t codecDelayUs = aParams.codec_delay / NSECS_PER_USEC;
+      if (codecDelayUs > 0) {
+        aacCodecSpecificData.mEncoderDelayFrames = static_cast<uint32_t>(
+            std::lround(static_cast<double>(codecDelayUs) * aParams.rate /
+                        (USECS_PER_S * AAC_SAMPLES_PER_FRAME)));
+        MKV_DEBUG("AAC stream in MKV container, {} frames of encoder delay.",
+                  aacCodecSpecificData.mEncoderDelayFrames);
+      } else {
+        aacCodecSpecificData.mEncoderDelayFrames = 0;
+      }
+
+      uint64_t frameCount;
+      int r = nestegg_read_total_frames_count(aContext, &frameCount);
+      if (r == -1) {
+        return NS_ERROR_FAILURE;
+      }
+      aacCodecSpecificData.mMediaFrameCount = frameCount;
+      MKV_DEBUG(
+          "AAC stream in MKV container, media frames: {}, delay frames : {}",
+          frameCount, aacCodecSpecificData.mEncoderDelayFrames);
+      mInfo.mAudio.mCodecSpecificConfig =
+          AudioCodecSpecificVariant{std::move(aacCodecSpecificData)};
+      break;
+    }
+    default:
+      return WebMDemuxer::SetContainerAudioCodecInfo(aContext, aParams);
+  }
+  return NS_OK;
+}
+
+bool MatroskaDemuxer::CheckKeyFrameByExamineByteStream(
+    const MediaRawData* aSample) {
+  switch (mVideoCodec) {
+    case NESTEGG_CODEC_AVC: {
+      auto frameType = H264::GetFrameType(aSample);
+      return frameType == H264::FrameType::I_FRAME_IDR ||
+             frameType == H264::FrameType::I_FRAME_OTHER;
+    }
+    case NESTEGG_CODEC_HEVC: {
+      auto isKeyFrame = H265::IsKeyFrame(aSample);
+      return isKeyFrame.isOk() ? isKeyFrame.unwrap() : false;
+    }
+    case NESTEGG_CODEC_VP8:
+      return VPXDecoder::IsKeyframe(*aSample, VPXDecoder::Codec::VP8);
+    case NESTEGG_CODEC_VP9:
+      return VPXDecoder::IsKeyframe(*aSample, VPXDecoder::Codec::VP9);
+    case NESTEGG_CODEC_AV1:
+      return AOMDecoder::IsKeyframe(*aSample);
+    default:
+      MOZ_ASSERT_UNREACHABLE(
+          "Cannot detect keyframes in unknown Matroska video codec");
+      return false;
+  }
+}
+
+}  
+
+#undef MKV_DEBUG

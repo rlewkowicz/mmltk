@@ -1,0 +1,39 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+******************************************************************************
+*
+*   Copyright (C) 2016, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+*
+******************************************************************************
+*
+* File: cstr.h
+*/
+
+#ifndef CSTR_H
+#define CSTR_H
+
+#include "unicode/unistr.h"
+#include "unicode/uobject.h"
+#include "unicode/utypes.h"
+
+#include "charstr.h"
+
+
+U_NAMESPACE_BEGIN
+
+class U_COMMON_API_CLASS CStr : public UMemory {
+  public:
+    U_COMMON_API CStr(const UnicodeString &in);
+    U_COMMON_API ~CStr();
+    U_COMMON_API const char * operator ()() const;
+
+  private:
+    CharString s;
+    CStr(const CStr &other) = delete;               
+    CStr &operator =(const CStr &other) = delete;   
+};
+
+U_NAMESPACE_END
+
+#endif

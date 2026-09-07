@@ -1,0 +1,60 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef HostRecordQueue_h_
+#define HostRecordQueue_h_
+
+#include <functional>
+#include "mozilla/Mutex.h"
+#include "nsHostRecord.h"
+#include "nsRefPtrHashtable.h"
+
+namespace mozilla {
+namespace net {
+
+class HostRecordQueue final {
+ public:
+  HostRecordQueue() = default;
+  ~HostRecordQueue() = default;
+  HostRecordQueue(const HostRecordQueue& aCopy) = delete;
+  HostRecordQueue& operator=(const HostRecordQueue& aCopy) = delete;
+
+  uint32_t PendingCount() const { return mPendingCount; }
+  uint32_t EvictionQSize() const { return mEvictionQSize; }
+
+  mutable Mutex mLock{"nsHostResolver.mQueueLock"};
+
+  void InsertRecord(nsHostRecord* aRec, nsIDNSService::DNSFlags aFlags)
+      MOZ_REQUIRES(mLock);
+  void AddToEvictionQ(
+      nsHostRecord* aRec, uint32_t aMaxCacheEntries,
+      nsRefPtrHashtable<nsGenericHashKey<nsHostKey>, nsHostRecord>& aDB)
+      MOZ_REQUIRES(mLock);
+
+  void MoveToEvictionQueueTail(nsHostRecord* aRec) MOZ_REQUIRES(mLock);
+
+  void MaybeRenewHostRecord(nsHostRecord* aRec) MOZ_REQUIRES(mLock);
+  void FlushEvictionQ(
+      nsRefPtrHashtable<nsGenericHashKey<nsHostKey>, nsHostRecord>& aDB)
+      MOZ_REQUIRES(mLock);
+  void MaybeRemoveFromQ(nsHostRecord* aRec) MOZ_REQUIRES(mLock);
+  void MoveToAnotherPendingQ(nsHostRecord* aRec, nsIDNSService::DNSFlags aFlags)
+      MOZ_REQUIRES(mLock);
+  already_AddRefed<nsHostRecord> Dequeue(bool aHighQOnly) MOZ_REQUIRES(mLock);
+  void ClearAll(const std::function<void(nsHostRecord*)>& aCallback)
+      MOZ_REQUIRES(mLock);
+
+ private:
+  Atomic<uint32_t> mPendingCount{0};
+  Atomic<uint32_t> mEvictionQSize{0};
+  LinkedList<RefPtr<nsHostRecord>> mHighQ;
+  LinkedList<RefPtr<nsHostRecord>> mMediumQ;
+  LinkedList<RefPtr<nsHostRecord>> mLowQ;
+  LinkedList<RefPtr<nsHostRecord>> mEvictionQ;
+};
+
+}  
+}  
+
+#endif  // HostRecordQueue_h_

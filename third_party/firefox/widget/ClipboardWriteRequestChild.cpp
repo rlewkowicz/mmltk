@@ -1,0 +1,63 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/ClipboardWriteRequestChild.h"
+
+#include "mozilla/dom/ContentChild.h"
+#include "mozilla/net/CookieJarSettings.h"
+#include "nsITransferable.h"
+
+namespace mozilla {
+
+NS_IMPL_ISUPPORTS(ClipboardWriteRequestChild, nsIAsyncSetClipboardData)
+
+NS_IMETHODIMP
+ClipboardWriteRequestChild::SetData(nsITransferable* aTransferable,
+                                    nsIClipboardOwner* aOwner) {
+  MOZ_ASSERT(aTransferable);
+  MOZ_ASSERT_IF(!CanSend(), !mIsValid && !mCallback);
+
+  if (!mIsValid) {
+    return NS_ERROR_FAILURE;
+  }
+
+
+  mIsValid = false;
+  IPCTransferable ipcTransferable;
+  nsContentUtils::TransferableToIPCTransferable(aTransferable, &ipcTransferable,
+                                                false, nullptr);
+  SendSetData(std::move(ipcTransferable));
+  return NS_OK;
+}
+
+NS_IMETHODIMP ClipboardWriteRequestChild::Abort(nsresult aReason) {
+  MOZ_ASSERT_IF(!CanSend(), !mIsValid && !mCallback);
+
+  if (!mIsValid || !NS_FAILED(aReason)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  MaybeNotifyCallback(aReason);
+  (void)PClipboardWriteRequestChild::Send__delete__(this, aReason);
+  return NS_OK;
+}
+
+ipc::IPCResult ClipboardWriteRequestChild::Recv__delete__(nsresult aResult) {
+  MaybeNotifyCallback(aResult);
+  return IPC_OK();
+}
+
+void ClipboardWriteRequestChild::ActorDestroy(ActorDestroyReason aReason) {
+  MaybeNotifyCallback(NS_ERROR_ABORT);
+}
+
+void ClipboardWriteRequestChild::MaybeNotifyCallback(nsresult aResult) {
+  mIsValid = false;
+  if (nsCOMPtr<nsIAsyncClipboardRequestCallback> callback =
+          mCallback.forget()) {
+    callback->OnComplete(aResult);
+  }
+}
+
+}  

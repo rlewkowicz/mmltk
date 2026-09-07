@@ -1,0 +1,59 @@
+
+[package]
+edition = "2018"
+rust-version = "1.56"
+name = "futures-channel"
+version = "0.3.31"
+build = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = """
+Channels for asynchronous communication using futures-rs.
+"""
+homepage = "https://rust-lang.github.io/futures-rs"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rust-lang/futures-rs"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = [
+    "--cfg",
+    "docsrs",
+]
+
+[lib]
+name = "futures_channel"
+path = "src/lib.rs"
+
+[dependencies.futures-core]
+version = "0.3.31"
+default-features = false
+
+[dependencies.futures-sink]
+version = "0.3.31"
+optional = true
+default-features = false
+
+[features]
+alloc = ["futures-core/alloc"]
+cfg-target-has-atomic = []
+default = ["std"]
+sink = ["futures-sink"]
+std = [
+    "alloc",
+    "futures-core/std",
+]
+unstable = []
+
+[lints.rust]
+missing_debug_implementations = "warn"
+rust_2018_idioms = "warn"
+single_use_lifetimes = "warn"
+unreachable_pub = "warn"
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+priority = 0
+check-cfg = ["cfg(futures_sanitizer)"]

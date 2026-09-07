@@ -1,0 +1,285 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_dom_PrimitiveConversions_h
+#define mozilla_dom_PrimitiveConversions_h
+
+#include <math.h>
+#include <stdint.h>
+
+#include <limits>
+
+#include "js/Conversions.h"
+#include "js/RootingAPI.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/dom/BindingCallContext.h"
+
+namespace mozilla::dom {
+
+template <typename T>
+struct TypeName {};
+
+template <>
+struct TypeName<int8_t> {
+  static const char* value() { return "byte"; }
+};
+template <>
+struct TypeName<uint8_t> {
+  static const char* value() { return "octet"; }
+};
+template <>
+struct TypeName<int16_t> {
+  static const char* value() { return "short"; }
+};
+template <>
+struct TypeName<uint16_t> {
+  static const char* value() { return "unsigned short"; }
+};
+template <>
+struct TypeName<int32_t> {
+  static const char* value() { return "long"; }
+};
+template <>
+struct TypeName<uint32_t> {
+  static const char* value() { return "unsigned long"; }
+};
+template <>
+struct TypeName<int64_t> {
+  static const char* value() { return "long long"; }
+};
+template <>
+struct TypeName<uint64_t> {
+  static const char* value() { return "unsigned long long"; }
+};
+
+enum ConversionBehavior { eDefault, eEnforceRange, eClamp };
+
+template <typename T, ConversionBehavior B>
+struct PrimitiveConversionTraits {};
+
+template <typename T>
+struct DisallowedConversion {
+  typedef int jstype;
+  typedef int intermediateType;
+
+ private:
+  static inline bool converter(JSContext* cx, JS::Handle<JS::Value> v,
+                               const char* sourceDescription, jstype* retval) {
+    MOZ_CRASH("This should never be instantiated!");
+  }
+};
+
+struct PrimitiveConversionTraits_smallInt {
+  typedef int32_t jstype;
+  typedef int32_t intermediateType;
+  static inline bool converter(JSContext* cx, JS::Handle<JS::Value> v,
+                               const char* sourceDescription, jstype* retval) {
+    return JS::ToInt32(cx, v, retval);
+  }
+};
+template <>
+struct PrimitiveConversionTraits<int8_t, eDefault>
+    : PrimitiveConversionTraits_smallInt {
+  typedef uint8_t intermediateType;
+};
+template <>
+struct PrimitiveConversionTraits<uint8_t, eDefault>
+    : PrimitiveConversionTraits_smallInt {};
+template <>
+struct PrimitiveConversionTraits<int16_t, eDefault>
+    : PrimitiveConversionTraits_smallInt {
+  typedef uint16_t intermediateType;
+};
+template <>
+struct PrimitiveConversionTraits<uint16_t, eDefault>
+    : PrimitiveConversionTraits_smallInt {};
+template <>
+struct PrimitiveConversionTraits<int32_t, eDefault>
+    : PrimitiveConversionTraits_smallInt {};
+template <>
+struct PrimitiveConversionTraits<uint32_t, eDefault>
+    : PrimitiveConversionTraits_smallInt {};
+
+template <>
+struct PrimitiveConversionTraits<int64_t, eDefault> {
+  typedef int64_t jstype;
+  typedef int64_t intermediateType;
+  static inline bool converter(JSContext* cx, JS::Handle<JS::Value> v,
+                               const char* sourceDescription, jstype* retval) {
+    return JS::ToInt64(cx, v, retval);
+  }
+};
+
+template <>
+struct PrimitiveConversionTraits<uint64_t, eDefault> {
+  typedef uint64_t jstype;
+  typedef uint64_t intermediateType;
+  static inline bool converter(JSContext* cx, JS::Handle<JS::Value> v,
+                               const char* sourceDescription, jstype* retval) {
+    return JS::ToUint64(cx, v, retval);
+  }
+};
+
+template <typename T>
+struct PrimitiveConversionTraits_Limits {
+  static inline T min() { return std::numeric_limits<T>::min(); }
+  static inline T max() { return std::numeric_limits<T>::max(); }
+};
+
+template <>
+struct PrimitiveConversionTraits_Limits<int64_t> {
+  static inline int64_t min() { return -(1LL << 53) + 1; }
+  static inline int64_t max() { return (1LL << 53) - 1; }
+};
+
+template <>
+struct PrimitiveConversionTraits_Limits<uint64_t> {
+  static inline uint64_t min() { return 0; }
+  static inline uint64_t max() { return (1LL << 53) - 1; }
+};
+
+template <typename T, typename U,
+          bool (*Enforce)(U cx, const char* sourceDescription, const double& d,
+                          T* retval)>
+struct PrimitiveConversionTraits_ToCheckedIntHelper {
+  typedef T jstype;
+  typedef T intermediateType;
+
+  static inline bool converter(U cx, JS::Handle<JS::Value> v,
+                               const char* sourceDescription, jstype* retval) {
+    double intermediate;
+    if (!JS::ToNumber(cx, v, &intermediate)) {
+      return false;
+    }
+
+    return Enforce(cx, sourceDescription, intermediate, retval);
+  }
+};
+
+template <typename T>
+inline bool PrimitiveConversionTraits_EnforceRange(
+    BindingCallContext& cx, const char* sourceDescription, const double& d,
+    T* retval) {
+  static_assert(std::numeric_limits<T>::is_integer,
+                "This can only be applied to integers!");
+
+  if (!std::isfinite(d)) {
+    return cx.ThrowErrorMessage<MSG_ENFORCE_RANGE_NON_FINITE>(
+        sourceDescription, TypeName<T>::value());
+  }
+
+  bool neg = (d < 0);
+  double rounded = floor(neg ? -d : d);
+  rounded = neg ? -rounded : rounded;
+  if (rounded < PrimitiveConversionTraits_Limits<T>::min() ||
+      rounded > PrimitiveConversionTraits_Limits<T>::max()) {
+    return cx.ThrowErrorMessage<MSG_ENFORCE_RANGE_OUT_OF_RANGE>(
+        sourceDescription, TypeName<T>::value());
+  }
+
+  *retval = static_cast<T>(rounded);
+  return true;
+}
+
+template <typename T>
+struct PrimitiveConversionTraits<T, eEnforceRange>
+    : public PrimitiveConversionTraits_ToCheckedIntHelper<
+          T, BindingCallContext&, PrimitiveConversionTraits_EnforceRange<T> > {
+};
+
+template <typename T>
+inline bool PrimitiveConversionTraits_Clamp(JSContext* cx,
+                                            const char* sourceDescription,
+                                            const double& d, T* retval) {
+  static_assert(std::numeric_limits<T>::is_integer,
+                "This can only be applied to integers!");
+
+  if (std::isnan(d)) {
+    *retval = 0;
+    return true;
+  }
+  if (d >= PrimitiveConversionTraits_Limits<T>::max()) {
+    *retval = PrimitiveConversionTraits_Limits<T>::max();
+    return true;
+  }
+  if (d <= PrimitiveConversionTraits_Limits<T>::min()) {
+    *retval = PrimitiveConversionTraits_Limits<T>::min();
+    return true;
+  }
+
+  MOZ_ASSERT(std::isfinite(d));
+
+  double toTruncate = (d < 0) ? d - 0.5 : d + 0.5;
+
+  T truncated = static_cast<T>(toTruncate);
+
+  if (truncated == toTruncate) {
+    truncated &= ~1;
+  }
+
+  *retval = truncated;
+  return true;
+}
+
+template <typename T>
+struct PrimitiveConversionTraits<T, eClamp>
+    : public PrimitiveConversionTraits_ToCheckedIntHelper<
+          T, JSContext*, PrimitiveConversionTraits_Clamp<T> > {};
+
+template <ConversionBehavior B>
+struct PrimitiveConversionTraits<bool, B> : public DisallowedConversion<bool> {
+};
+
+template <>
+struct PrimitiveConversionTraits<bool, eDefault> {
+  typedef bool jstype;
+  typedef bool intermediateType;
+  static inline bool converter(JSContext* , JS::Handle<JS::Value> v,
+                               const char* sourceDescription, jstype* retval) {
+    *retval = JS::ToBoolean(v);
+    return true;
+  }
+};
+
+template <ConversionBehavior B>
+struct PrimitiveConversionTraits<float, B>
+    : public DisallowedConversion<float> {};
+
+template <ConversionBehavior B>
+struct PrimitiveConversionTraits<double, B>
+    : public DisallowedConversion<double> {};
+
+struct PrimitiveConversionTraits_float {
+  typedef double jstype;
+  typedef double intermediateType;
+  static inline bool converter(JSContext* cx, JS::Handle<JS::Value> v,
+                               const char* sourceDescription, jstype* retval) {
+    return JS::ToNumber(cx, v, retval);
+  }
+};
+
+template <>
+struct PrimitiveConversionTraits<float, eDefault>
+    : PrimitiveConversionTraits_float {};
+template <>
+struct PrimitiveConversionTraits<double, eDefault>
+    : PrimitiveConversionTraits_float {};
+
+template <typename T, ConversionBehavior B, typename U>
+bool ValueToPrimitive(U& cx, JS::Handle<JS::Value> v,
+                      const char* sourceDescription, T* retval) {
+  typename PrimitiveConversionTraits<T, B>::jstype t;
+  if (!PrimitiveConversionTraits<T, B>::converter(cx, v, sourceDescription, &t))
+    return false;
+
+  *retval = static_cast<T>(
+      static_cast<typename PrimitiveConversionTraits<T, B>::intermediateType>(
+          t));
+  return true;
+}
+
+}  
+
+#endif /* mozilla_dom_PrimitiveConversions_h */

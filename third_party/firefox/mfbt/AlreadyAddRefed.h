@@ -1,0 +1,80 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef AlreadyAddRefed_h
+#define AlreadyAddRefed_h
+
+#include "mozilla/Attributes.h"
+#ifdef DEBUG
+#  include "mozilla/Assertions.h"
+#endif
+
+namespace mozilla {
+
+struct unused_t;
+
+}  
+
+template <class T>
+struct
+#if !defined(MOZ_CLANG_PLUGIN) && !defined(XGILL_PLUGIN)
+    [[nodiscard]]
+#endif
+    MOZ_NON_AUTOABLE already_AddRefed {
+  already_AddRefed() : mRawPtr(nullptr) {}
+
+  MOZ_IMPLICIT already_AddRefed(decltype(nullptr)) : mRawPtr(nullptr) {}
+  explicit already_AddRefed(T* aRawPtr) : mRawPtr(aRawPtr) {}
+
+  already_AddRefed(const already_AddRefed<T>& aOther) = delete;
+  already_AddRefed<T>& operator=(const already_AddRefed<T>& aOther) = delete;
+
+
+  already_AddRefed(already_AddRefed<T>&& aOther)
+#ifdef DEBUG
+      : mRawPtr(aOther.take()){}
+#else
+      = default;
+#endif
+
+        already_AddRefed<T> &
+        operator=(already_AddRefed<T>&& aOther) {
+    mRawPtr = aOther.take();
+    return *this;
+  }
+
+  template <typename U>
+  MOZ_IMPLICIT already_AddRefed(already_AddRefed<U>&& aOther)
+      : mRawPtr(aOther.take()) {}
+
+  ~already_AddRefed()
+#ifdef DEBUG
+  {
+    MOZ_ASSERT(!mRawPtr);
+  }
+#else
+      = default;
+#endif
+
+  [[nodiscard]] T* take() {
+    T* rawPtr = mRawPtr;
+    mRawPtr = nullptr;
+    return rawPtr;
+  }
+
+  void leak() { mRawPtr = nullptr; }
+
+  template <class U>
+  already_AddRefed<U> downcast() {
+    U* tmp = static_cast<U*>(mRawPtr);
+    mRawPtr = nullptr;
+    return already_AddRefed<U>(tmp);
+  }
+
+ private:
+  T* MOZ_OWNING_REF mRawPtr;
+};
+
+#endif  // AlreadyAddRefed_h

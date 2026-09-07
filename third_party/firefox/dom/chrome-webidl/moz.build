@@ -1,0 +1,80 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+PREPROCESSED_WEBIDL_FILES = [
+    "ChromeUtils.webidl",
+    "IOUtils.webidl",
+]
+
+WEBIDL_FILES = [
+    "BrowserSessionStore.webidl",
+    "BrowsingContext.webidl",
+    "ChildSHistory.webidl",
+    "ChromeNodeList.webidl",
+    "ClonedErrorHolder.webidl",
+    "ConsoleInstance.webidl",
+    "CSSAppearanceBaseRule.webidl",
+    "DebuggerUtils.webidl",
+    "DocumentL10n.webidl",
+    "Flex.webidl",
+    "Fluent.webidl",
+    "FrameLoader.webidl",
+    "Grid.webidl",
+    "ImageText.webidl",
+    "InspectorUtils.webidl",
+    "IteratorResult.webidl",
+    "JSActor.webidl",
+    "JSActorTypeUtils.webidl",
+    "JSProcessActor.webidl",
+    "JSWindowActor.webidl",
+    "L10nOverlays.webidl",
+    "L10nRegistry.webidl",
+    "LoadURIOptions.webidl",
+    "MediaController.webidl",
+    "MessageManager.webidl",
+    "MozSharedMap.webidl",
+    "MozStorageAsyncStatementParams.webidl",
+    "MozStorageStatementParams.webidl",
+    "MozStorageStatementRow.webidl",
+    "NetDashboard.webidl",
+    "OriginAttributes.webidl",
+    "PathUtils.webidl",
+    "PermissionSetParameters.webidl",
+    "PrecompiledScript.webidl",
+    "PromiseDebugging.webidl",
+    "SessionStoreUtils.webidl",
+    "StripOnShareRule.webidl",
+    "StructuredCloneHolder.webidl",
+    "StyleSheetApplicableStateChangeEvent.webidl",
+    "StyleSheetRemovedEvent.webidl",
+    "TreeColumn.webidl",
+    "TreeColumns.webidl",
+    "TreeContentView.webidl",
+    "TreeView.webidl",
+    "WAICTManifest.webidl",
+    "WebCompat.webidl",
+    "WindowGlobalActors.webidl",
+    "WindowRoot.webidl",
+    "XULCommandEvent.webidl",
+    "XULElement.webidl",
+    "XULFrameElement.webidl",
+    "XULMenuElement.webidl",
+    "XULPopupElement.webidl",
+    "XULResizerElement.webidl",
+    "XULTextElement.webidl",
+    "XULTreeElement.webidl",
+]
+
+GENERATED_EVENTS_WEBIDL_FILES = [
+    "PopupPositionedEvent.webidl",
+    "RedirectBlockedEvent.webidl",
+    "StyleSheetApplicableStateChangeEvent.webidl",
+    "StyleSheetRemovedEvent.webidl",
+]
+
+if CONFIG["MOZ_PLACES"]:
+    WEBIDL_FILES += [
+        "PlacesEvent.webidl",
+        "PlacesObservers.webidl",
+    ]

@@ -1,0 +1,259 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef MOZILLA_AUDIONODEENGINE_H_
+#define MOZILLA_AUDIONODEENGINE_H_
+
+#include "AudioSegment.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/dom/AudioNode.h"
+
+namespace WebCore {
+class Reverb;
+}  
+
+namespace mozilla {
+
+namespace dom {
+struct ThreeDPoint;
+class AudioParamTimeline;
+class DelayNodeEngine;
+struct AudioParamEvent;
+}  
+
+class AbstractThread;
+class AudioBlock;
+class AudioNodeTrack;
+
+class ThreadSharedFloatArrayBufferList final : public ThreadSharedObject {
+ public:
+  explicit ThreadSharedFloatArrayBufferList(uint32_t aCount) {
+    mContents.SetLength(aCount);
+  }
+  static already_AddRefed<ThreadSharedFloatArrayBufferList> Create(
+      uint32_t aChannelCount, size_t aLength, const mozilla::fallible_t&);
+
+  ThreadSharedFloatArrayBufferList* AsThreadSharedFloatArrayBufferList()
+      override {
+    return this;
+  };
+
+  struct Storage final {
+    Storage() : mDataToFree(nullptr), mFree(nullptr), mSampleData(nullptr) {}
+    ~Storage() {
+      if (mFree) {
+        mFree(mDataToFree);
+      } else {
+        MOZ_ASSERT(!mDataToFree);
+      }
+    }
+    size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const {
+      return aMallocSizeOf(mDataToFree);
+    }
+    void* mDataToFree;
+    void (*mFree)(void*);
+    float* mSampleData;
+  };
+
+  uint32_t GetChannels() const { return mContents.Length(); }
+  const float* GetData(uint32_t aIndex) const {
+    return mContents[aIndex].mSampleData;
+  }
+  float* GetDataForWrite(uint32_t aIndex) {
+    MOZ_ASSERT(!IsShared());
+    return mContents[aIndex].mSampleData;
+  }
+
+  void SetData(uint32_t aIndex, void* aDataToFree, void (*aFreeFunc)(void*),
+               float* aData) {
+    Storage* s = &mContents[aIndex];
+    if (s->mFree) {
+      s->mFree(s->mDataToFree);
+    } else {
+      MOZ_ASSERT(!s->mDataToFree);
+    }
+
+    s->mDataToFree = aDataToFree;
+    s->mFree = aFreeFunc;
+    s->mSampleData = aData;
+  }
+
+  void Clear() { mContents.Clear(); }
+
+  size_t SizeOfExcludingThis(
+      mozilla::MallocSizeOf aMallocSizeOf) const override {
+    size_t amount = ThreadSharedObject::SizeOfExcludingThis(aMallocSizeOf);
+    amount += mContents.ShallowSizeOfExcludingThis(aMallocSizeOf);
+    for (size_t i = 0; i < mContents.Length(); i++) {
+      amount += mContents[i].SizeOfExcludingThis(aMallocSizeOf);
+    }
+
+    return amount;
+  }
+
+  size_t SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const override {
+    return aMallocSizeOf(this) + SizeOfExcludingThis(aMallocSizeOf);
+  }
+
+ private:
+  AutoTArray<Storage, 2> mContents;
+};
+
+void WriteZeroesToAudioBlock(AudioBlock* aChunk, uint32_t aStart,
+                             uint32_t aLength);
+
+void AudioBufferCopyWithScale(const float* aInput, float aScale, float* aOutput,
+                              uint32_t aSize);
+
+void AudioBufferAddWithScale(const float* aInput, float aScale, float* aOutput,
+                             uint32_t aSize);
+
+void AudioBlockAddChannelWithScale(const float aInput[WEBAUDIO_BLOCK_SIZE],
+                                   float aScale,
+                                   float aOutput[WEBAUDIO_BLOCK_SIZE]);
+
+void AudioBlockCopyChannelWithScale(const float* aInput, float aScale,
+                                    float* aOutput);
+
+void AudioBlockCopyChannelWithScale(const float aInput[WEBAUDIO_BLOCK_SIZE],
+                                    const float aScale[WEBAUDIO_BLOCK_SIZE],
+                                    float aOutput[WEBAUDIO_BLOCK_SIZE]);
+
+void BufferComplexMultiply(const float* aInput, const float* aScale,
+                           float* aOutput, uint32_t aSize);
+
+float AudioBufferPeakValue(const float* aInput, uint32_t aSize);
+
+void AudioBlockInPlaceScale(float aBlock[WEBAUDIO_BLOCK_SIZE], float aScale);
+
+void AudioBufferInPlaceScale(float* aBlock, float aScale, uint32_t aSize);
+
+void AudioBlockInPlaceScale(float aBlock[WEBAUDIO_BLOCK_SIZE],
+                            float aScale[WEBAUDIO_BLOCK_SIZE]);
+void AudioBufferInPlaceScale(float* aBlock, float* aScale, uint32_t aSize);
+
+void AudioBlockPanMonoToStereo(const float aInput[WEBAUDIO_BLOCK_SIZE],
+                               float aGainL, float aGainR,
+                               float aOutputL[WEBAUDIO_BLOCK_SIZE],
+                               float aOutputR[WEBAUDIO_BLOCK_SIZE]);
+
+void AudioBlockPanMonoToStereo(const float aInput[WEBAUDIO_BLOCK_SIZE],
+                               float aGainL[WEBAUDIO_BLOCK_SIZE],
+                               float aGainR[WEBAUDIO_BLOCK_SIZE],
+                               float aOutputL[WEBAUDIO_BLOCK_SIZE],
+                               float aOutputR[WEBAUDIO_BLOCK_SIZE]);
+void AudioBlockPanStereoToStereo(const float aInputL[WEBAUDIO_BLOCK_SIZE],
+                                 const float aInputR[WEBAUDIO_BLOCK_SIZE],
+                                 float aGainL, float aGainR, bool aIsOnTheLeft,
+                                 float aOutputL[WEBAUDIO_BLOCK_SIZE],
+                                 float aOutputR[WEBAUDIO_BLOCK_SIZE]);
+void AudioBlockPanStereoToStereo(const float aInputL[WEBAUDIO_BLOCK_SIZE],
+                                 const float aInputR[WEBAUDIO_BLOCK_SIZE],
+                                 const float aGainL[WEBAUDIO_BLOCK_SIZE],
+                                 const float aGainR[WEBAUDIO_BLOCK_SIZE],
+                                 const bool aIsOnTheLeft[WEBAUDIO_BLOCK_SIZE],
+                                 float aOutputL[WEBAUDIO_BLOCK_SIZE],
+                                 float aOutputR[WEBAUDIO_BLOCK_SIZE]);
+
+void NaNToZeroInPlace(float* aSamples, size_t aCount);
+
+float AudioBufferSumOfSquares(const float* aInput, uint32_t aLength);
+
+class AudioNodeEngine {
+ public:
+  typedef AutoTArray<AudioBlock, 1> OutputChunks;
+
+  explicit AudioNodeEngine(dom::AudioNode* aNode);
+
+  virtual ~AudioNodeEngine() {
+    MOZ_ASSERT(!mNode, "The node reference must be already cleared");
+    MOZ_COUNT_DTOR(AudioNodeEngine);
+  }
+
+  virtual dom::DelayNodeEngine* AsDelayNodeEngine() { return nullptr; }
+
+  virtual void SetTrackTimeParameter(uint32_t aIndex, TrackTime aParam) {
+    NS_ERROR("Invalid SetTrackTimeParameter index");
+  }
+  virtual void SetDoubleParameter(uint32_t aIndex, double aParam) {
+    NS_ERROR("Invalid SetDoubleParameter index");
+  }
+  virtual void SetInt32Parameter(uint32_t aIndex, int32_t aParam) {
+    NS_ERROR("Invalid SetInt32Parameter index");
+  }
+  virtual void RecvTimelineEvent(uint32_t aIndex,
+                                 dom::AudioParamEvent& aValue) {
+    NS_ERROR("Invalid RecvTimelineEvent index");
+  }
+  virtual void SetBuffer(AudioChunk&& aBuffer) {
+    NS_ERROR("SetBuffer called on engine that doesn't support it");
+  }
+  virtual void SetRawArrayData(nsTArray<float>&& aData) {
+    NS_ERROR("SetRawArrayData called on an engine that doesn't support it");
+  }
+
+  virtual void SetReverb(WebCore::Reverb* aBuffer,
+                         uint32_t aImpulseChannelCount) {
+    NS_ERROR("SetReverb called on engine that doesn't support it");
+  }
+
+  virtual void ProcessBlock(AudioNodeTrack* aTrack, GraphTime aFrom,
+                            const AudioBlock& aInput, AudioBlock* aOutput,
+                            bool* aFinished);
+  virtual void ProduceBlockBeforeInput(AudioNodeTrack* aTrack, GraphTime aFrom,
+                                       AudioBlock* aOutput) {
+    MOZ_ASSERT_UNREACHABLE("ProduceBlockBeforeInput called on wrong engine");
+  }
+
+  virtual void ProcessBlocksOnPorts(AudioNodeTrack* aTrack, GraphTime aFrom,
+                                    Span<const AudioBlock> aInput,
+                                    Span<AudioBlock> aOutput, bool* aFinished);
+
+  virtual bool IsActive() const { return false; }
+
+  virtual void OnGraphThreadDone() {}
+
+  bool HasNode() const {
+    MOZ_ASSERT(NS_IsMainThread());
+    return !!mNode;
+  }
+
+  dom::AudioNode* NodeMainThread() const {
+    MOZ_ASSERT(NS_IsMainThread());
+    return mNode;
+  }
+
+  void ClearNode() {
+    MOZ_ASSERT(NS_IsMainThread());
+    MOZ_ASSERT(mNode != nullptr);
+    mNode = nullptr;
+  }
+
+  uint16_t InputCount() const { return mInputCount; }
+  uint16_t OutputCount() const { return mOutputCount; }
+
+  virtual size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const {
+    return 0;
+  }
+
+  virtual size_t SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const {
+    return aMallocSizeOf(this) + SizeOfExcludingThis(aMallocSizeOf);
+  }
+
+  void SizeOfIncludingThis(MallocSizeOf aMallocSizeOf,
+                           AudioNodeSizes& aUsage) const {
+    aUsage.mEngine = SizeOfIncludingThis(aMallocSizeOf);
+    aUsage.mNodeType = mNodeType;
+  }
+
+ private:
+  dom::AudioNode* MOZ_NON_OWNING_REF mNode;  
+  const char* const mNodeType;
+  const uint16_t mInputCount;
+  const uint16_t mOutputCount;
+};
+
+}  
+
+#endif /* MOZILLA_AUDIONODEENGINE_H_ */

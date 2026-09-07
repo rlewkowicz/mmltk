@@ -1,0 +1,181 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsFontFaceUtils.h"
+
+#include "gfxTextRun.h"
+#include "gfxUserFontSet.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/RestyleManager.h"
+#include "mozilla/ServoStyleSet.h"
+#include "nsFontMetrics.h"
+#include "nsIFrame.h"
+#include "nsLayoutUtils.h"
+#include "nsPlaceholderFrame.h"
+#include "nsTArray.h"
+
+using namespace mozilla;
+
+enum class FontUsageKind {
+  None = 0,
+  Frame = 1 << 0,
+  FontMetrics = 1 << 1,
+
+  Max = Frame | FontMetrics,
+};
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(FontUsageKind);
+
+static bool IsFontReferenced(const ComputedStyle& aStyle,
+                             const nsAString& aFamilyName) {
+  for (const auto& family :
+       aStyle.StyleFont()->mFont.family.families.list.AsSpan()) {
+    if (family.IsNamedFamily(aFamilyName)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static FontUsageKind StyleFontUsage(nsIFrame* aFrame, ComputedStyle* aStyle,
+                                    nsPresContext* aPresContext,
+                                    const gfxUserFontEntry* aFont,
+                                    const nsAString& aFamilyName) {
+  MOZ_ASSERT(NS_ConvertUTF8toUTF16(aFont->FamilyName()) == aFamilyName);
+
+  auto FontIsUsed = [&aFont, &aPresContext,
+                     &aFamilyName](ComputedStyle* aStyle) {
+    if (!IsFontReferenced(*aStyle, aFamilyName)) {
+      return false;
+    }
+
+    RefPtr<nsFontMetrics> fm = nsLayoutUtils::GetFontMetricsForComputedStyle(
+        aStyle, aPresContext, 1.0f);
+    return fm->GetThebesFontGroup()->ContainsUserFont(aFont);
+  };
+
+  auto usage = FontUsageKind::None;
+
+  if (FontIsUsed(aStyle)) {
+    usage |= FontUsageKind::Frame;
+    if (aStyle->DependsOnSelfFontMetrics()) {
+      usage |= FontUsageKind::FontMetrics;
+    }
+  }
+
+  if (aStyle->DependsOnInheritedFontMetrics() &&
+      !(usage & FontUsageKind::FontMetrics)) {
+    nsIFrame* provider = nullptr;
+    if (auto* parentStyle = aFrame->GetParentComputedStyle(&provider);
+        parentStyle && FontIsUsed(parentStyle)) {
+      usage |= FontUsageKind::FontMetrics;
+    }
+  }
+
+  return usage;
+}
+
+static FontUsageKind FrameFontUsage(nsIFrame* aFrame,
+                                    nsPresContext* aPresContext,
+                                    const gfxUserFontEntry* aFont,
+                                    const nsAString& aFamilyName) {
+  return StyleFontUsage(aFrame, aFrame->Style(), aPresContext, aFont,
+                        aFamilyName);
+}
+
+static void ScheduleReflow(PresShell* aPresShell, nsIFrame* aFrame) {
+  nsIFrame* f = aFrame;
+  if (f->IsSVGFrame() || f->IsInSVGTextSubtree()) {
+    if (f->HasAnyStateBits(NS_FRAME_IS_NONDISPLAY)) {
+      while (f) {
+        if (!f->HasAnyStateBits(NS_FRAME_IS_NONDISPLAY)) {
+          if (f->IsSubtreeDirty()) {
+            return;
+          }
+          if (!f->HasAnyStateBits(NS_FRAME_SVG_LAYOUT) ||
+              !f->IsInSVGTextSubtree()) {
+            break;
+          }
+          f->AddStateBits(NS_FRAME_HAS_DIRTY_CHILDREN);
+        }
+        f = f->GetParent();
+      }
+      MOZ_ASSERT(f, "should have found an ancestor frame to reflow");
+    }
+  }
+
+  aPresShell->FrameNeedsReflow(f, IntrinsicDirty::FrameAncestorsAndDescendants,
+                               NS_FRAME_IS_DIRTY);
+}
+
+enum class ReflowAlreadyScheduled {
+  No,
+  Yes,
+};
+
+void nsFontFaceUtils::MarkDirtyForFontChange(nsIFrame* aSubtreeRoot,
+                                             const gfxUserFontEntry* aFont) {
+  MOZ_ASSERT(aFont);
+  AutoTArray<nsIFrame*, 4> subtrees;
+  subtrees.AppendElement(aSubtreeRoot);
+
+  nsPresContext* pc = aSubtreeRoot->PresContext();
+  PresShell* presShell = pc->PresShell();
+
+  const bool usesMetricsFromStyle = pc->StyleSet()->UsesFontMetrics();
+  const bool usesRootMetricsFromStyle = pc->StyleSet()->UsesRootFontMetrics();
+
+  NS_ConvertUTF8toUTF16 familyName(aFont->FamilyName());
+
+  do {
+    nsIFrame* subtreeRoot = subtrees.PopLastElement();
+
+    AutoTArray<std::pair<nsIFrame*, ReflowAlreadyScheduled>, 32> stack;
+    stack.AppendElement(
+        std::make_pair(subtreeRoot, ReflowAlreadyScheduled::No));
+
+    do {
+      auto pair = stack.PopLastElement();
+      nsIFrame* f = pair.first;
+      ReflowAlreadyScheduled alreadyScheduled = pair.second;
+
+      FontUsageKind kind = FrameFontUsage(f, pc, aFont, familyName);
+      if (kind != FontUsageKind::None) {
+        if ((kind & FontUsageKind::Frame) &&
+            alreadyScheduled == ReflowAlreadyScheduled::No) {
+          ScheduleReflow(presShell, f);
+          alreadyScheduled = ReflowAlreadyScheduled::Yes;
+        }
+
+        const bool shouldRestyleForFontMetrics =
+            (kind & FontUsageKind::FontMetrics) ||
+            (usesRootMetricsFromStyle && f->Style()->IsRootElementStyle());
+
+        if (shouldRestyleForFontMetrics) {
+          MOZ_ASSERT(f->GetContent() && f->GetContent()->IsElement(),
+                     "How could we target a non-element with selectors?");
+          f->PresContext()->RestyleManager()->PostRestyleEvent(
+              dom::Element::FromNode(f->GetContent()),
+              RestyleHint::RECASCADE_SELF, nsChangeHint(0));
+        }
+      }
+
+      if (alreadyScheduled == ReflowAlreadyScheduled::No ||
+          usesMetricsFromStyle) {
+        if (f->IsPlaceholderFrame()) {
+          nsIFrame* oof = nsPlaceholderFrame::GetRealFrameForPlaceholder(f);
+          if (!nsLayoutUtils::IsProperAncestorFrame(subtreeRoot, oof)) {
+            subtrees.AppendElement(oof);
+          }
+        }
+
+        for (const auto& childList : f->ChildLists()) {
+          for (nsIFrame* kid : childList.mList) {
+            stack.AppendElement(std::make_pair(kid, alreadyScheduled));
+          }
+        }
+      }
+    } while (!stack.IsEmpty());
+  } while (!subtrees.IsEmpty());
+}

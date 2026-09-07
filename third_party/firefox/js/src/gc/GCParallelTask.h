@@ -1,0 +1,227 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef gc_GCParallelTask_h
+#define gc_GCParallelTask_h
+
+#include "mozilla/LinkedList.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/TimeStamp.h"
+
+#include "gc/GCContext.h"
+#include "js/Utility.h"
+#include "threading/ProtectedData.h"
+#include "vm/HelperThreads.h"
+#include "vm/HelperThreadTask.h"
+
+#define JS_MEMBER_FN_PTR_TYPE(ClassT, ReturnT, /* ArgTs */...) \
+  ReturnT (ClassT::*)(__VA_ARGS__)
+
+#define JS_CALL_MEMBER_FN_PTR(Receiver, Ptr, /* Args */...) \
+  ((Receiver)->*(Ptr))(__VA_ARGS__)
+
+namespace js {
+
+namespace gcstats {
+enum class PhaseKind : uint8_t;
+}
+
+namespace gc {
+
+class GCRuntime;
+
+static constexpr size_t MaxParallelWorkers = 8;
+
+static inline mozilla::TimeDuration TimeSince(mozilla::TimeStamp prev) {
+  mozilla::TimeStamp now = mozilla::TimeStamp::Now();
+  MOZ_ASSERT(now >= prev);
+  if (now < prev) {
+    now = prev;
+  }
+  return now - prev;
+}
+
+}  
+
+class AutoLockHelperThreadState;
+class GCParallelTask;
+class HelperThread;
+
+class GCParallelTaskList {
+  mozilla::LinkedList<GCParallelTask> tasks;
+
+ public:
+  bool isEmpty(const AutoLockHelperThreadState& lock) {
+    gHelperThreadLock.assertOwnedByCurrentThread();
+    return tasks.isEmpty();
+  }
+
+  void insertBack(GCParallelTask* task, const AutoLockHelperThreadState& lock) {
+    gHelperThreadLock.assertOwnedByCurrentThread();
+    tasks.insertBack(task);
+  }
+
+  GCParallelTask* popFirst(const AutoLockHelperThreadState& lock) {
+    gHelperThreadLock.assertOwnedByCurrentThread();
+    return tasks.popFirst();
+  }
+
+  size_t sizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf,
+                             const AutoLockHelperThreadState& lock) const {
+    gHelperThreadLock.assertOwnedByCurrentThread();
+    return tasks.sizeOfExcludingThis(aMallocSizeOf);
+  }
+};
+
+class GCParallelTask : private mozilla::LinkedListElement<GCParallelTask>,
+                       public HelperThreadTask {
+  friend class mozilla::LinkedList<GCParallelTask>;
+  friend class mozilla::LinkedListElement<GCParallelTask>;
+
+ public:
+  gc::GCRuntime* const gc;
+
+  const gcstats::PhaseKind phaseKind;
+
+  gc::GCUse use;
+
+ private:
+  enum class State {
+    Idle,
+
+    Queued,
+
+    Dispatched,
+
+    Running,
+
+    Finished
+  };
+
+  UnprotectedData<State> state_;
+
+  HelperThreadLockData<bool> dispatchedToThreadPool;
+
+  MainThreadOrGCTaskData<mozilla::TimeDuration> duration_;
+
+ protected:
+  mozilla::Atomic<bool, mozilla::Relaxed> cancel_;
+
+ public:
+  explicit GCParallelTask(gc::GCRuntime* gc, gcstats::PhaseKind phaseKind,
+                          gc::GCUse use = gc::GCUse::Unspecified)
+      : gc(gc),
+        phaseKind(phaseKind),
+        use(use),
+        state_(State::Idle),
+        cancel_(false) {}
+  GCParallelTask(GCParallelTask&& other) noexcept
+      : gc(other.gc),
+        phaseKind(other.phaseKind),
+        use(other.use),
+        state_(other.state_),
+        cancel_(false) {}
+
+  explicit GCParallelTask(const GCParallelTask&) = delete;
+
+  virtual ~GCParallelTask();
+
+  mozilla::TimeDuration duration() const { return duration_; }
+
+  void start();
+
+  bool join(mozilla::Maybe<mozilla::TimeStamp> deadline = mozilla::Nothing());
+
+  void startWithLockHeld(AutoLockHelperThreadState& lock);
+  bool joinWithLockHeld(
+      AutoLockHelperThreadState& lock,
+      mozilla::Maybe<mozilla::TimeStamp> deadline = mozilla::Nothing());
+
+  void runFromMainThread();
+  void runFromMainThread(AutoLockHelperThreadState& lock);
+
+  void startOrRunIfIdle(AutoLockHelperThreadState& lock);
+
+  bool cancelAndWait();
+
+  bool isIdle() const;
+  bool isIdle(const AutoLockHelperThreadState& lock) const {
+    return state_ == State::Idle;
+  }
+
+  bool wasStarted() const;
+  bool wasStarted(const AutoLockHelperThreadState& lock) const {
+    return isDispatched(lock) || isRunning(lock);
+  }
+
+  bool isQueued(const AutoLockHelperThreadState& lock) const {
+    return state_ == State::Queued;
+  }
+
+  bool isDispatched(const AutoLockHelperThreadState& lock) const {
+    return state_ == State::Dispatched;
+  }
+
+  bool isNotYetRunning(const AutoLockHelperThreadState& lock) const {
+    return state_ == State::Idle || state_ == State::Queued ||
+           state_ == State::Dispatched;
+  }
+
+  const char* getName() override { return "GCParallelTask"; }
+
+ protected:
+  virtual void run(AutoLockHelperThreadState& lock) = 0;
+
+  virtual void recordDuration();
+
+  bool isCancelled() const { return cancel_; }
+
+ private:
+  void assertIdle() const {
+    MOZ_ASSERT(state_ == State::Idle);
+  }
+
+  bool isRunning(const AutoLockHelperThreadState& lock) const {
+    return state_ == State::Running;
+  }
+  bool isFinished(const AutoLockHelperThreadState& lock) const {
+    return state_ == State::Finished;
+  }
+
+  void setQueued(const AutoLockHelperThreadState& lock) {
+    MOZ_ASSERT(isIdle(lock));
+    state_ = State::Queued;
+  }
+  void setDispatched(const AutoLockHelperThreadState& lock) {
+    MOZ_ASSERT(isIdle(lock) || isQueued(lock));
+    state_ = State::Dispatched;
+  }
+  void setRunning(const AutoLockHelperThreadState& lock) {
+    MOZ_ASSERT(isNotYetRunning(lock));
+    state_ = State::Running;
+  }
+  void setFinished(const AutoLockHelperThreadState& lock) {
+    MOZ_ASSERT(isRunning(lock));
+    state_ = State::Finished;
+  }
+  void setIdle(const AutoLockHelperThreadState& lock) {
+    MOZ_ASSERT(!isRunning(lock));
+    state_ = State::Idle;
+  }
+  friend class gc::GCRuntime;
+
+  void joinNonIdleTask(mozilla::Maybe<mozilla::TimeStamp> deadline,
+                       AutoLockHelperThreadState& lock);
+
+  void runTask(JS::GCContext* gcx, AutoLockHelperThreadState& lock);
+
+  ThreadType threadType() override {
+    return ThreadType::THREAD_TYPE_GCPARALLEL;
+  }
+  void runHelperThreadTask(AutoLockHelperThreadState& locked) override;
+  void onThreadPoolDispatch() override;
+};
+
+} 
+#endif /* gc_GCParallelTask_h */

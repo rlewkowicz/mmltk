@@ -1,0 +1,118 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef LAYOUT_SVG_SVGPATTERNFRAME_H_
+#define LAYOUT_SVG_SVGPATTERNFRAME_H_
+
+#include <memory>
+
+#include "gfxMatrix.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/SVGPaintServerFrame.h"
+#include "mozilla/gfx/2D.h"
+
+class nsIFrame;
+
+namespace mozilla {
+class PresShell;
+class SVGAnimatedLength;
+class SVGAnimatedPreserveAspectRatio;
+class SVGAnimatedTransformList;
+class SVGAnimatedViewBox;
+class SVGGeometryFrame;
+}  
+
+nsIFrame* NS_NewSVGPatternFrame(mozilla::PresShell* aPresShell,
+                                mozilla::ComputedStyle* aStyle);
+
+namespace mozilla {
+
+class SVGPatternFrame final : public SVGPaintServerFrame {
+  using SourceSurface = gfx::SourceSurface;
+
+ public:
+  NS_DECL_FRAMEARENA_HELPERS(SVGPatternFrame)
+  NS_DECL_QUERYFRAME
+
+  friend nsIFrame* ::NS_NewSVGPatternFrame(mozilla::PresShell* aPresShell,
+                                           ComputedStyle* aStyle);
+
+  explicit SVGPatternFrame(ComputedStyle* aStyle, nsPresContext* aPresContext);
+
+  already_AddRefed<gfxPattern> GetPaintServerPattern(
+      nsIFrame* aSource, const DrawTarget* aDrawTarget,
+      const gfxMatrix& aContextMatrix,
+      StyleSVGPaint nsStyleSVG::* aFillOrStroke, float aGraphicOpacity,
+      imgDrawingParams& aImgParams, const gfxRect* aOverrideBounds) override;
+
+ public:
+  gfxMatrix GetCanvasTM() override;
+
+  nsresult AttributeChanged(int32_t aNameSpaceID, nsAtom* aAttribute,
+                            AttrModType aModType) override;
+
+#ifdef DEBUG
+  void Init(nsIContent* aContent, nsContainerFrame* aParent,
+            nsIFrame* aPrevInFlow) override;
+#endif
+
+#ifdef DEBUG_FRAME_DUMP
+  nsresult GetFrameName(nsAString& aResult) const override {
+    return MakeFrameName(u"SVGPattern"_ns, aResult);
+  }
+#endif  // DEBUG
+
+ protected:
+  SVGPatternFrame* GetReferencedPattern();
+
+  uint16_t GetEnumValue(uint32_t aIndex, nsIContent* aDefault);
+  uint16_t GetEnumValue(uint32_t aIndex) {
+    return GetEnumValue(aIndex, mContent);
+  }
+  SVGPatternFrame* GetPatternTransformFrame(SVGPatternFrame* aDefault);
+  gfxMatrix GetPatternTransform();
+  const SVGAnimatedViewBox& GetViewBox(nsIContent* aDefault);
+  const SVGAnimatedViewBox& GetViewBox() { return GetViewBox(mContent); }
+  const SVGAnimatedPreserveAspectRatio& GetPreserveAspectRatio(
+      nsIContent* aDefault);
+  const SVGAnimatedPreserveAspectRatio& GetPreserveAspectRatio() {
+    return GetPreserveAspectRatio(mContent);
+  }
+  const SVGAnimatedLength* GetLengthValue(uint32_t aIndex,
+                                          nsIContent* aDefault);
+  const SVGAnimatedLength* GetLengthValue(uint32_t aIndex) {
+    return GetLengthValue(aIndex, mContent);
+  }
+
+  void PaintChildren(DrawTarget* aDrawTarget,
+                     SVGPatternFrame* aPatternWithChildren, nsIFrame* aSource,
+                     float aGraphicOpacity, imgDrawingParams& aImgParams);
+
+  already_AddRefed<SourceSurface> PaintPattern(
+      const DrawTarget* aDrawTarget, Matrix* patternMatrix,
+      const Matrix& aContextMatrix, nsIFrame* aSource,
+      StyleSVGPaint nsStyleSVG::* aFillOrStroke, float aGraphicOpacity,
+      const gfxRect* aOverrideBounds, imgDrawingParams& aImgParams);
+
+  SVGPatternFrame* GetPatternWithChildren();
+
+  gfxRect GetPatternRect(uint16_t aPatternUnits, const gfxRect& bbox,
+                         const Matrix& aTargetCTM, nsIFrame* aTarget);
+  gfxMatrix ConstructCTM(const SVGAnimatedViewBox& aViewBox,
+                         uint16_t aPatternContentUnits, uint16_t aPatternUnits,
+                         const gfxRect& callerBBox, const Matrix& callerCTM,
+                         nsIFrame* aTarget);
+
+ private:
+  SVGGeometryFrame* mSource;
+  std::unique_ptr<gfxMatrix> mCTM;
+
+ protected:
+  bool mLoopFlag;
+  bool mNoHRefURI;
+};
+
+}  
+
+#endif  // LAYOUT_SVG_SVGPATTERNFRAME_H_

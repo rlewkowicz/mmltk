@@ -1,0 +1,204 @@
+/*
+ * Copyright 2016 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkEncodedInfo_DEFINED)
+#define SkEncodedInfo_DEFINED
+
+#include "include/core/SkAlphaType.h"
+#include "include/core/SkColorSpace.h"
+#include "include/core/SkColorType.h"
+#include "include/core/SkData.h"
+#include "include/core/SkImageInfo.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkTypes.h"
+#include "include/private/SkHdrMetadata.h"
+#include "include/private/base/SkAPI.h"
+#include "include/private/base/SkTo.h"
+#include "modules/skcms/skcms.h"
+
+#include <cstdint>
+#include <memory>
+#include <tuple>
+#include <utility>
+
+namespace SkCodecs {
+class ColorProfile;
+}
+
+struct SK_API SkEncodedInfo {
+public:
+    enum Alpha {
+        kOpaque_Alpha,
+        kUnpremul_Alpha,
+
+        kBinary_Alpha,
+    };
+
+    enum Color {
+        kGray_Color,
+
+        kGrayAlpha_Color,
+
+        kXAlpha_Color,
+
+        k565_Color,
+
+        kPalette_Color,
+
+        kRGB_Color,
+        kRGBA_Color,
+
+        kBGR_Color,
+        kBGRX_Color,
+        kBGRA_Color,
+
+        kYUV_Color,
+
+        kYUVA_Color,
+
+        kInvertedCMYK_Color,
+        kYCCK_Color,
+    };
+
+    static SkEncodedInfo Make(
+        int width, int height, Color color, Alpha alpha, int bitsPerComponent);
+
+    static SkEncodedInfo Make(
+        int width, int height, Color color, Alpha alpha, int bitsPerComponent,
+        std::unique_ptr<SkCodecs::ColorProfile> profile);
+
+    static SkEncodedInfo Make(
+        int width, int height, Color color, Alpha alpha, int bitsPerComponent,
+        std::unique_ptr<SkCodecs::ColorProfile> profile, int colorDepth);
+
+    static SkEncodedInfo Make(
+        int width, int height, Color color, Alpha alpha, int bitsPerComponent,
+        int colorDepth,
+        std::unique_ptr<SkCodecs::ColorProfile> profile, const skhdr::Metadata& hdrMetadata);
+
+    SkImageInfo makeImageInfo() const;
+
+    int   width() const { return fWidth;  }
+    int  height() const { return fHeight; }
+    Color color() const { return fColor;  }
+    Alpha alpha() const { return fAlpha;  }
+    bool opaque() const { return fAlpha == kOpaque_Alpha; }
+
+    const skcms_ICCProfile* profile() const;
+    sk_sp<const SkData> profileData() const;
+    const SkCodecs::ColorProfile* colorProfile() const {
+        return fColorProfile.get();
+    }
+
+    uint8_t bitsPerComponent() const { return fBitsPerComponent; }
+
+    uint8_t bitsPerPixel() const {
+        switch (fColor) {
+            case kGray_Color:
+                return fBitsPerComponent;
+            case kXAlpha_Color:
+            case kGrayAlpha_Color:
+                return 2 * fBitsPerComponent;
+            case kPalette_Color:
+                return fBitsPerComponent;
+            case kRGB_Color:
+            case kBGR_Color:
+            case kYUV_Color:
+            case k565_Color:
+                return 3 * fBitsPerComponent;
+            case kRGBA_Color:
+            case kBGRA_Color:
+            case kBGRX_Color:
+            case kYUVA_Color:
+            case kInvertedCMYK_Color:
+            case kYCCK_Color:
+                return 4 * fBitsPerComponent;
+        }
+        SkASSERT(false);
+        return 0;
+    }
+
+    SkEncodedInfo(const SkEncodedInfo& orig) = delete;
+    SkEncodedInfo& operator=(const SkEncodedInfo&) = delete;
+
+    SkEncodedInfo(SkEncodedInfo&& orig);
+    SkEncodedInfo& operator=(SkEncodedInfo&&);
+
+    SkEncodedInfo copy() const;
+
+    uint8_t getColorDepth() const {
+        return fColorDepth;
+    }
+
+    const skhdr::Metadata& getHdrMetadata() const {
+        return fHdrMetadata;
+    }
+
+    ~SkEncodedInfo();
+
+private:
+    SkEncodedInfo(
+        int width, int height, Color color, Alpha alpha, uint8_t bitsPerComponent,
+        uint8_t colorDepth,
+        std::unique_ptr<SkCodecs::ColorProfile> profile, const skhdr::Metadata& hdrMetadata);
+
+    static void VerifyColor(Color color, Alpha alpha, int bitsPerComponent) {
+        std::ignore = alpha;
+        std::ignore = bitsPerComponent;
+
+        switch (color) {
+            case kGray_Color:
+                SkASSERT(kOpaque_Alpha == alpha);
+                return;
+            case kGrayAlpha_Color:
+                SkASSERT(kOpaque_Alpha != alpha);
+                return;
+            case kPalette_Color:
+                SkASSERT(16 != bitsPerComponent);
+                return;
+            case kRGB_Color:
+            case kBGR_Color:
+            case kBGRX_Color:
+                SkASSERT(kOpaque_Alpha == alpha);
+                SkASSERT(bitsPerComponent >= 8);
+                return;
+            case kYUV_Color:
+            case kInvertedCMYK_Color:
+            case kYCCK_Color:
+                SkASSERT(kOpaque_Alpha == alpha);
+                SkASSERT(8 == bitsPerComponent);
+                return;
+            case kRGBA_Color:
+                SkASSERT(bitsPerComponent >= 8);
+                return;
+            case kBGRA_Color:
+            case kYUVA_Color:
+                SkASSERT(8 == bitsPerComponent);
+                return;
+            case kXAlpha_Color:
+                SkASSERT(kUnpremul_Alpha == alpha);
+                SkASSERT(8 == bitsPerComponent);
+                return;
+            case k565_Color:
+                SkASSERT(kOpaque_Alpha == alpha);
+                SkASSERT(8 == bitsPerComponent);
+                return;
+        }
+        SkASSERT(false);  
+    }
+
+    int     fWidth;
+    int     fHeight;
+    Color   fColor;
+    Alpha   fAlpha;
+    uint8_t fBitsPerComponent;
+    uint8_t fColorDepth;
+    std::unique_ptr<const SkCodecs::ColorProfile> fColorProfile;
+    skhdr::Metadata                               fHdrMetadata;
+};
+
+#endif

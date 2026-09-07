@@ -1,0 +1,132 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef TOOLKIT_COMPONENTS_TYPEAHEADFIND_NSTYPEAHEADFIND_H_
+#define TOOLKIT_COMPONENTS_TYPEAHEADFIND_NSTYPEAHEADFIND_H_
+
+#include "mozilla/GlobalTeardownObserver.h"
+#include "mozilla/WeakPtr.h"
+#include "nsComponentManagerUtils.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsISelectionController.h"
+#include "nsIDocShell.h"
+#include "nsIObserver.h"
+#include "nsIFind.h"
+#include "nsIWebBrowserFind.h"
+#include "nsWeakReference.h"
+#include "nsITypeAheadFind.h"
+
+class nsPIDOMWindowInner;
+class nsPresContext;
+class nsRange;
+
+namespace mozilla {
+class PresShell;
+namespace dom {
+class Document;
+class Element;
+class Selection;
+}  
+}  
+
+class nsTypeAheadFind : public nsITypeAheadFind,
+                        public nsIObserver,
+                        public nsSupportsWeakReference,
+                        public mozilla::GlobalTeardownObserver {
+ public:
+  nsTypeAheadFind();
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_NSITYPEAHEADFIND
+  NS_DECL_NSIOBSERVER
+
+  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(nsTypeAheadFind, nsITypeAheadFind)
+
+ protected:
+  virtual ~nsTypeAheadFind();
+
+  nsresult PrefsReset();
+
+  void SaveFind();
+  nsresult GetWebBrowserFind(nsIDocShell* aDocShell,
+                             nsIWebBrowserFind** aWebBrowserFind);
+
+  MOZ_CAN_RUN_SCRIPT nsresult FindInternal(uint32_t aMode,
+                                           const nsAString& aSearchString,
+                                           bool aLinksOnly,
+                                           bool aDontIterateFrames,
+                                           uint16_t* aResult);
+
+  void RangeStartsInsideLink(nsRange* aRange, bool* aIsInsideLink,
+                             bool* aIsStartingLink);
+
+  void GetSelection(mozilla::PresShell* aPresShell,
+                    nsISelectionController** aSelCon,
+                    mozilla::dom::Selection** aDomSel);
+  bool IsRangeVisible(nsRange* aRange, bool aMustBeVisible,
+                      bool aGetTopVisibleLeaf, bool* aUsesIndependentSelection);
+  bool IsRangeRendered(nsRange* aRange);
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  nsresult FindItNow(uint32_t aMode, bool aIsLinksOnly,
+                     bool aIsFirstVisiblePreferred, bool aDontIterateFrames,
+                     uint16_t* aResult);
+  nsresult GetSearchContainers(nsISupports* aContainer,
+                               nsISelectionController* aSelectionController,
+                               bool aIsFirstVisiblePreferred, bool aFindPrev,
+                               mozilla::PresShell** aPresShell,
+                               nsPresContext** aPresContext);
+
+  already_AddRefed<mozilla::dom::Document> GetDocument();
+
+  void DisconnectFromOwner() override;
+  void ReleaseStrongMemberVariables();
+  void ReleaseFoundResultsAndDisconnect();
+  void SetCurrentWindow(nsPIDOMWindowInner* aWindow);
+
+  nsString mTypeAheadBuffer;
+
+  bool mStartLinksOnlyPref;
+  bool mDidAddObservers;
+  nsCOMPtr<mozilla::dom::Element>
+      mFoundLink;  
+  nsCOMPtr<mozilla::dom::Element>
+      mFoundEditable;           
+  RefPtr<nsRange> mFoundRange;  
+
+  RefPtr<nsRange> mStartFindRange;
+  RefPtr<nsRange> mSearchRange;
+  RefPtr<nsRange> mStartPointRange;
+  RefPtr<nsRange> mEndPointRange;
+
+  nsCOMPtr<nsIFind> mFind;
+
+  bool mCaseSensitive;
+  bool mEntireWord;
+  bool mMatchDiacritics;
+
+  bool EnsureFind() {
+    if (mFind) {
+      return true;
+    }
+
+    mFind = do_CreateInstance("@mozilla.org/embedcomp/rangefind;1");
+    if (!mFind) {
+      return false;
+    }
+
+    mFind->SetCaseSensitive(mCaseSensitive);
+    mFind->SetEntireWord(mEntireWord);
+    mFind->SetMatchDiacritics(mMatchDiacritics);
+
+    return true;
+  }
+
+  nsCOMPtr<nsIWebBrowserFind> mWebBrowserFind;
+
+  nsWeakPtr mDocShell;
+  mozilla::WeakPtr<mozilla::dom::Document> mDocument;
+  nsWeakPtr mSelectionController;
+};
+
+#endif  // TOOLKIT_COMPONENTS_TYPEAHEADFIND_NSTYPEAHEADFIND_H_

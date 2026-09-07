@@ -1,0 +1,481 @@
+/*
+ * This file contains prototypes for experimental SSL functions.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef __sslexp_h_
+#define __sslexp_h_
+
+#include "ssl.h"
+#include "sslerr.h"
+#include "pk11hpke.h"
+
+SEC_BEGIN_PROTOS
+
+
+#define SSL_EXPERIMENTAL_API(name, arglist, args)                   \
+    (SSL_GetExperimentalAPI(name)                                   \
+         ? ((SECStatus(*) arglist)SSL_GetExperimentalAPI(name))args \
+         : SECFailure)
+#define SSL_DEPRECATED_EXPERIMENTAL_API \
+    (PR_SetError(SSL_ERROR_UNSUPPORTED_EXPERIMENTAL_API, 0), SECFailure)
+
+typedef enum {
+    ssl_ext_none,
+    ssl_ext_native,
+    ssl_ext_native_only
+} SSLExtensionSupport;
+
+#define SSL_GetExtensionSupport(extension, support)        \
+    SSL_EXPERIMENTAL_API("SSL_GetExtensionSupport",        \
+                         (PRUint16 _extension,             \
+                          SSLExtensionSupport * _support), \
+                         (extension, support))
+
+typedef PRBool(PR_CALLBACK *SSLExtensionWriter)(
+    PRFileDesc *fd, SSLHandshakeType message,
+    PRUint8 *data, unsigned int *len, unsigned int maxLen, void *arg);
+
+typedef SECStatus(PR_CALLBACK *SSLExtensionHandler)(
+    PRFileDesc *fd, SSLHandshakeType message,
+    const PRUint8 *data, unsigned int len,
+    SSLAlertDescription *alert, void *arg);
+
+#define SSL_InstallExtensionHooks(fd, extension, writer, writerArg,         \
+                                  handler, handlerArg)                      \
+    SSL_EXPERIMENTAL_API("SSL_InstallExtensionHooks",                       \
+                         (PRFileDesc * _fd, PRUint16 _extension,            \
+                          SSLExtensionWriter _writer, void *_writerArg,     \
+                          SSLExtensionHandler _handler, void *_handlerArg), \
+                         (fd, extension, writer, writerArg,                 \
+                          handler, handlerArg))
+
+typedef struct SSLAntiReplayContextStr SSLAntiReplayContext;
+#define SSL_CreateAntiReplayContext(now, window, k, bits, ctx) \
+    SSL_EXPERIMENTAL_API("SSL_CreateAntiReplayContext",        \
+                         (PRTime _now, PRTime _window,         \
+                          unsigned int _k, unsigned int _bits, \
+                          SSLAntiReplayContext **_ctx),        \
+                         (now, window, k, bits, ctx))
+
+#define SSL_SetAntiReplayContext(fd, ctx)                                 \
+    SSL_EXPERIMENTAL_API("SSL_SetAntiReplayContext",                      \
+                         (PRFileDesc * _fd, SSLAntiReplayContext * _ctx), \
+                         (fd, ctx))
+
+#define SSL_ReleaseAntiReplayContext(ctx)                \
+    SSL_EXPERIMENTAL_API("SSL_ReleaseAntiReplayContext", \
+                         (SSLAntiReplayContext * _ctx),  \
+                         (ctx))
+
+#define SSL_SendSessionTicket(fd, appToken, appTokenLen)              \
+    SSL_EXPERIMENTAL_API("SSL_SendSessionTicket",                     \
+                         (PRFileDesc * _fd, const PRUint8 *_appToken, \
+                          unsigned int _appTokenLen),                 \
+                         (fd, appToken, appTokenLen))
+
+typedef enum {
+    ssl_hello_retry_fail,
+    ssl_hello_retry_accept,
+    ssl_hello_retry_request,
+    ssl_hello_retry_reject_0rtt
+} SSLHelloRetryRequestAction;
+
+typedef SSLHelloRetryRequestAction(PR_CALLBACK *SSLHelloRetryRequestCallback)(
+    PRBool firstHello, const PRUint8 *clientToken, unsigned int clientTokenLen,
+    PRUint8 *retryToken, unsigned int *retryTokenLen, unsigned int retryTokMax,
+    void *arg);
+
+#define SSL_HelloRetryRequestCallback(fd, cb, arg)                       \
+    SSL_EXPERIMENTAL_API("SSL_HelloRetryRequestCallback",                \
+                         (PRFileDesc * _fd,                              \
+                          SSLHelloRetryRequestCallback _cb, void *_arg), \
+                         (fd, cb, arg))
+
+#define SSL_KeyUpdate(fd, requestUpdate)                            \
+    SSL_EXPERIMENTAL_API("SSL_KeyUpdate",                           \
+                         (PRFileDesc * _fd, PRBool _requestUpdate), \
+                         (fd, requestUpdate))
+
+#define SSL_SendCertificateRequest(fd)                 \
+    SSL_EXPERIMENTAL_API("SSL_SendCertificateRequest", \
+                         (PRFileDesc * _fd),           \
+                         (fd))
+
+
+typedef struct SSLResumptionTokenInfoStr {
+    PRUint16 length;
+    CERTCertificate *peerCert;
+    PRUint8 *alpnSelection;
+    PRUint32 alpnSelectionLen;
+    PRUint32 maxEarlyDataSize;
+    PRTime expirationTime; 
+} SSLResumptionTokenInfo;
+
+#define SSL_GetResumptionTokenInfo(tokenData, tokenLen, token, len)          \
+    SSL_EXPERIMENTAL_API("SSL_GetResumptionTokenInfo",                       \
+                         (const PRUint8 *_tokenData, unsigned int _tokenLen, \
+                          SSLResumptionTokenInfo *_token, PRUintn _len),     \
+                         (tokenData, tokenLen, token, len))
+
+#define SSL_DestroyResumptionTokenInfo(tokenInfo) \
+    SSL_EXPERIMENTAL_API(                         \
+        "SSL_DestroyResumptionTokenInfo",         \
+        (SSLResumptionTokenInfo * _tokenInfo),    \
+        (tokenInfo))
+
+typedef SECStatus(PR_CALLBACK *SSLResumptionTokenCallback)(
+    PRFileDesc *fd, const PRUint8 *resumptionToken, unsigned int len,
+    void *ctx);
+
+#define SSL_SetResumptionTokenCallback(fd, cb, ctx)                     \
+    SSL_EXPERIMENTAL_API(                                               \
+        "SSL_SetResumptionTokenCallback",                               \
+        (PRFileDesc * _fd, SSLResumptionTokenCallback _cb, void *_ctx), \
+        (fd, cb, ctx))
+
+#define SSL_SetResumptionToken(fd, token, len)                              \
+    SSL_EXPERIMENTAL_API(                                                   \
+        "SSL_SetResumptionToken",                                           \
+        (PRFileDesc * _fd, const PRUint8 *_token, const unsigned int _len), \
+        (fd, token, len))
+
+#define SSL_SetMaxEarlyDataSize(fd, size)                    \
+    SSL_EXPERIMENTAL_API("SSL_SetMaxEarlyDataSize",          \
+                         (PRFileDesc * _fd, PRUint32 _size), \
+                         (fd, size))
+
+#define SSL_EnableTls13GreaseEch(fd, enabled)        \
+    SSL_EXPERIMENTAL_API("SSL_EnableTls13GreaseEch", \
+                         (PRFileDesc * _fd, PRBool _enabled), (fd, enabled))
+
+#define SSL_SetTls13GreaseEchSize(fd, size)           \
+    SSL_EXPERIMENTAL_API("SSL_SetTls13GreaseEchSize", \
+                         (PRFileDesc * _fd, PRUint8 _size), (fd, size))
+
+#define SSL_EnableTls13BackendEch(fd, enabled)        \
+    SSL_EXPERIMENTAL_API("SSL_EnableTls13BackendEch", \
+                         (PRFileDesc * _fd, PRBool _enabled), (fd, enabled))
+
+#define SSL_CallExtensionWriterOnEchInner(fd, enabled)        \
+    SSL_EXPERIMENTAL_API("SSL_CallExtensionWriterOnEchInner", \
+                         (PRFileDesc * _fd, PRBool _enabled), (fd, enabled))
+
+#define SSL_GetEchRetryConfigs(fd, out)            \
+    SSL_EXPERIMENTAL_API("SSL_GetEchRetryConfigs", \
+                         (PRFileDesc * _fd,        \
+                          SECItem * _out),         \
+                         (fd, out))
+
+#define SSL_RemoveEchConfigs(fd)                 \
+    SSL_EXPERIMENTAL_API("SSL_RemoveEchConfigs", \
+                         (PRFileDesc * _fd),     \
+                         (fd))
+
+#define SSL_SetServerEchConfigs(fd, pubKey,                                 \
+                                privKey, record, recordLen)                 \
+    SSL_EXPERIMENTAL_API("SSL_SetServerEchConfigs",                         \
+                         (PRFileDesc * _fd,                                 \
+                          const SECKEYPublicKey *_pubKey,                   \
+                          const SECKEYPrivateKey *_privKey,                 \
+                          const PRUint8 *_record, unsigned int _recordLen), \
+                         (fd, pubKey, privKey,                              \
+                          record, recordLen))
+
+#define SSL_SetClientEchConfigs(fd, echConfigs, echConfigsLen) \
+    SSL_EXPERIMENTAL_API("SSL_SetClientEchConfigs",            \
+                         (PRFileDesc * _fd,                    \
+                          const PRUint8 *_echConfigs,          \
+                          unsigned int _echConfigsLen),        \
+                         (fd, echConfigs, echConfigsLen))
+
+typedef struct HpkeSymmetricSuiteStr {
+    HpkeKdfId kdfId;
+    HpkeAeadId aeadId;
+} HpkeSymmetricSuite;
+#define SSL_EncodeEchConfigId(configId, publicName, maxNameLen,          \
+                              kemId, pubKey, hpkeSuites, hpkeSuiteCount, \
+                              out, outlen, maxlen)                       \
+    SSL_EXPERIMENTAL_API("SSL_EncodeEchConfigId",                        \
+                         (PRUint8 _configId, const char *_publicName,    \
+                          unsigned int _maxNameLen, HpkeKemId _kemId,    \
+                          const SECKEYPublicKey *_pubKey,                \
+                          const HpkeSymmetricSuite *_hpkeSuites,         \
+                          unsigned int _hpkeSuiteCount,                  \
+                          PRUint8 *_out, unsigned int *_outlen,          \
+                          unsigned int _maxlen),                         \
+                         (configId, publicName, maxNameLen,              \
+                          kemId, pubKey, hpkeSuites, hpkeSuiteCount,     \
+                          out, outlen, maxlen))
+
+typedef void(PR_CALLBACK *SSLSecretCallback)(
+    PRFileDesc *fd, PRUint16 epoch, SSLSecretDirection dir, PK11SymKey *secret,
+    void *arg);
+
+#define SSL_SecretCallback(fd, cb, arg)                                         \
+    SSL_EXPERIMENTAL_API("SSL_SecretCallback",                                  \
+                         (PRFileDesc * _fd, SSLSecretCallback _cb, void *_arg), \
+                         (fd, cb, arg))
+
+typedef SECStatus(PR_CALLBACK *SSLRecordWriteCallback)(
+    PRFileDesc *fd, PRUint16 epoch, SSLContentType contentType,
+    const PRUint8 *data, unsigned int len, void *arg);
+
+#define SSL_RecordLayerWriteCallback(fd, writeCb, arg)                   \
+    SSL_EXPERIMENTAL_API("SSL_RecordLayerWriteCallback",                 \
+                         (PRFileDesc * _fd, SSLRecordWriteCallback _wCb, \
+                          void *_arg),                                   \
+                         (fd, writeCb, arg))
+
+#define SSL_RecordLayerData(fd, epoch, ct, data, len)               \
+    SSL_EXPERIMENTAL_API("SSL_RecordLayerData",                     \
+                         (PRFileDesc * _fd, PRUint16 _epoch,        \
+                          SSLContentType _contentType,              \
+                          const PRUint8 *_data, unsigned int _len), \
+                         (fd, epoch, ct, data, len))
+
+#define SSL_GetCurrentEpoch(fd, readEpoch, writeEpoch)             \
+    SSL_EXPERIMENTAL_API("SSL_GetCurrentEpoch",                    \
+                         (PRFileDesc * _fd, PRUint16 * _readEpoch, \
+                          PRUint16 * _writeEpoch),                 \
+                         (fd, readEpoch, writeEpoch))
+
+typedef struct SSLAeadContextStr SSLAeadContext;
+
+#define SSL_MakeAead(version, cipherSuite, secret,                  \
+                     labelPrefix, labelPrefixLen, ctx)              \
+    SSL_EXPERIMENTAL_API("SSL_MakeAead",                            \
+                         (PRUint16 _version, PRUint16 _cipherSuite, \
+                          PK11SymKey * _secret,                     \
+                          const char *_labelPrefix,                 \
+                          unsigned int _labelPrefixLen,             \
+                          SSLAeadContext **_ctx),                   \
+                         (version, cipherSuite, secret,             \
+                          labelPrefix, labelPrefixLen, ctx))
+
+#define SSL_MakeVariantAead(version, cipherSuite, variant, secret,  \
+                            labelPrefix, labelPrefixLen, ctx)       \
+    SSL_EXPERIMENTAL_API("SSL_MakeVariantAead",                     \
+                         (PRUint16 _version, PRUint16 _cipherSuite, \
+                          SSLProtocolVariant _variant,              \
+                          PK11SymKey * _secret,                     \
+                          const char *_labelPrefix,                 \
+                          unsigned int _labelPrefixLen,             \
+                          SSLAeadContext **_ctx),                   \
+                         (version, cipherSuite, variant, secret,    \
+                          labelPrefix, labelPrefixLen, ctx))
+
+#define SSL_AeadEncrypt(ctx, counter, aad, aadLen, in, inLen,            \
+                        output, outputLen, maxOutputLen)                 \
+    SSL_EXPERIMENTAL_API("SSL_AeadEncrypt",                              \
+                         (const SSLAeadContext *_ctx, PRUint64 _counter, \
+                          const PRUint8 *_aad, unsigned int _aadLen,     \
+                          const PRUint8 *_in, unsigned int _inLen,       \
+                          PRUint8 *_out, unsigned int *_outLen,          \
+                          unsigned int _maxOut),                         \
+                         (ctx, counter, aad, aadLen, in, inLen,          \
+                          output, outputLen, maxOutputLen))
+
+#define SSL_AeadDecrypt(ctx, counter, aad, aadLen, in, inLen,            \
+                        output, outputLen, maxOutputLen)                 \
+    SSL_EXPERIMENTAL_API("SSL_AeadDecrypt",                              \
+                         (const SSLAeadContext *_ctx, PRUint64 _counter, \
+                          const PRUint8 *_aad, unsigned int _aadLen,     \
+                          const PRUint8 *_in, unsigned int _inLen,       \
+                          PRUint8 *_output, unsigned int *_outLen,       \
+                          unsigned int _maxOut),                         \
+                         (ctx, counter, aad, aadLen, in, inLen,          \
+                          output, outputLen, maxOutputLen))
+
+#define SSL_DestroyAead(ctx)                      \
+    SSL_EXPERIMENTAL_API("SSL_DestroyAead",       \
+                         (SSLAeadContext * _ctx), \
+                         (ctx))
+
+#define SSL_HkdfExtract(version, cipherSuite, salt, ikm, keyp)      \
+    SSL_EXPERIMENTAL_API("SSL_HkdfExtract",                         \
+                         (PRUint16 _version, PRUint16 _cipherSuite, \
+                          PK11SymKey * _salt, PK11SymKey * _ikm,    \
+                          PK11SymKey * *_keyp),                     \
+                         (version, cipherSuite, salt, ikm, keyp))
+
+#define SSL_HkdfExpandLabel(version, cipherSuite, prk,                     \
+                            hsHash, hsHashLen, label, labelLen, keyp)      \
+    SSL_EXPERIMENTAL_API("SSL_HkdfExpandLabel",                            \
+                         (PRUint16 _version, PRUint16 _cipherSuite,        \
+                          PK11SymKey * _prk,                               \
+                          const PRUint8 *_hsHash, unsigned int _hsHashLen, \
+                          const char *_label, unsigned int _labelLen,      \
+                          PK11SymKey **_keyp),                             \
+                         (version, cipherSuite, prk,                       \
+                          hsHash, hsHashLen, label, labelLen, keyp))
+
+#define SSL_HkdfVariantExpandLabel(version, cipherSuite, prk,                   \
+                                   hsHash, hsHashLen, label, labelLen, variant, \
+                                   keyp)                                        \
+    SSL_EXPERIMENTAL_API("SSL_HkdfVariantExpandLabel",                          \
+                         (PRUint16 _version, PRUint16 _cipherSuite,             \
+                          PK11SymKey * _prk,                                    \
+                          const PRUint8 *_hsHash, unsigned int _hsHashLen,      \
+                          const char *_label, unsigned int _labelLen,           \
+                          SSLProtocolVariant _variant,                          \
+                          PK11SymKey **_keyp),                                  \
+                         (version, cipherSuite, prk,                            \
+                          hsHash, hsHashLen, label, labelLen, variant,          \
+                          keyp))
+
+#define SSL_HkdfExpandLabelWithMech(version, cipherSuite, prk,             \
+                                    hsHash, hsHashLen, label, labelLen,    \
+                                    mech, keySize, keyp)                   \
+    SSL_EXPERIMENTAL_API("SSL_HkdfExpandLabelWithMech",                    \
+                         (PRUint16 _version, PRUint16 _cipherSuite,        \
+                          PK11SymKey * _prk,                               \
+                          const PRUint8 *_hsHash, unsigned int _hsHashLen, \
+                          const char *_label, unsigned int _labelLen,      \
+                          CK_MECHANISM_TYPE _mech, unsigned int _keySize,  \
+                          PK11SymKey **_keyp),                             \
+                         (version, cipherSuite, prk,                       \
+                          hsHash, hsHashLen, label, labelLen,              \
+                          mech, keySize, keyp))
+
+#define SSL_HkdfVariantExpandLabelWithMech(version, cipherSuite, prk,          \
+                                           hsHash, hsHashLen, label, labelLen, \
+                                           mech, keySize, variant, keyp)       \
+    SSL_EXPERIMENTAL_API("SSL_HkdfVariantExpandLabelWithMech",                 \
+                         (PRUint16 _version, PRUint16 _cipherSuite,            \
+                          PK11SymKey * _prk,                                   \
+                          const PRUint8 *_hsHash, unsigned int _hsHashLen,     \
+                          const char *_label, unsigned int _labelLen,          \
+                          CK_MECHANISM_TYPE _mech, unsigned int _keySize,      \
+                          SSLProtocolVariant _variant,                         \
+                          PK11SymKey **_keyp),                                 \
+                         (version, cipherSuite, prk,                           \
+                          hsHash, hsHashLen, label, labelLen,                  \
+                          mech, keySize, variant, keyp))
+
+typedef PRTime(PR_CALLBACK *SSLTimeFunc)(void *arg);
+
+#define SSL_SetTimeFunc(fd, f, arg)                                      \
+    SSL_EXPERIMENTAL_API("SSL_SetTimeFunc",                              \
+                         (PRFileDesc * _fd, SSLTimeFunc _f, void *_arg), \
+                         (fd, f, arg))
+
+#define SSL_DelegateCredential(cert, certPriv, dcPub, dcCertVerifyAlg,        \
+                               dcValidFor, now, out)                          \
+    SSL_EXPERIMENTAL_API("SSL_DelegateCredential",                            \
+                         (const CERTCertificate *_cert,                       \
+                          const SECKEYPrivateKey *_certPriv,                  \
+                          const SECKEYPublicKey *_dcPub,                      \
+                          SSLSignatureScheme _dcCertVerifyAlg,                \
+                          PRUint32 _dcValidFor,                               \
+                          PRTime _now,                                        \
+                          SECItem *_out),                                     \
+                         (cert, certPriv, dcPub, dcCertVerifyAlg, dcValidFor, \
+                          now, out))
+
+#define SSL_CipherSuiteOrderGet(fd, cipherOrder, numCiphers)         \
+    SSL_EXPERIMENTAL_API("SSL_CipherSuiteOrderGet",                  \
+                         (PRFileDesc * _fd, PRUint16 * _cipherOrder, \
+                          unsigned int *_numCiphers),                \
+                         (fd, cipherOrder, numCiphers))
+
+#define SSL_CipherSuiteOrderSet(fd, cipherOrder, numCiphers)              \
+    SSL_EXPERIMENTAL_API("SSL_CipherSuiteOrderSet",                       \
+                         (PRFileDesc * _fd, const PRUint16 *_cipherOrder, \
+                          PRUint16 _numCiphers),                          \
+                         (fd, cipherOrder, numCiphers))
+
+
+typedef struct SSLMaskingContextStr {
+    CK_MECHANISM_TYPE mech;
+    PRUint16 version;
+    PRUint16 cipherSuite;
+    PK11SymKey *secret;
+} SSLMaskingContext;
+
+#define SSL_CreateMaskingContext(version, cipherSuite, secret,      \
+                                 label, labelLen, ctx)              \
+    SSL_EXPERIMENTAL_API("SSL_CreateMaskingContext",                \
+                         (PRUint16 _version, PRUint16 _cipherSuite, \
+                          PK11SymKey * _secret,                     \
+                          const char *_label,                       \
+                          unsigned int _labelLen,                   \
+                          SSLMaskingContext **_ctx),                \
+                         (version, cipherSuite, secret, label, labelLen, ctx))
+
+#define SSL_CreateVariantMaskingContext(version, cipherSuite, variant, \
+                                        secret, label, labelLen, ctx)  \
+    SSL_EXPERIMENTAL_API("SSL_CreateVariantMaskingContext",            \
+                         (PRUint16 _version, PRUint16 _cipherSuite,    \
+                          SSLProtocolVariant _variant,                 \
+                          PK11SymKey * _secret,                        \
+                          const char *_label,                          \
+                          unsigned int _labelLen,                      \
+                          SSLMaskingContext **_ctx),                   \
+                         (version, cipherSuite, variant, secret,       \
+                          label, labelLen, ctx))
+
+#define SSL_DestroyMaskingContext(ctx)                \
+    SSL_EXPERIMENTAL_API("SSL_DestroyMaskingContext", \
+                         (SSLMaskingContext * _ctx),  \
+                         (ctx))
+
+#define SSL_CreateMask(ctx, sample, sampleLen, mask, maskLen)               \
+    SSL_EXPERIMENTAL_API("SSL_CreateMask",                                  \
+                         (SSLMaskingContext * _ctx, const PRUint8 *_sample, \
+                          unsigned int _sampleLen, PRUint8 *_mask,          \
+                          unsigned int _maskLen),                           \
+                         (ctx, sample, sampleLen, mask, maskLen))
+
+#define SSL_SetDtls13VersionWorkaround(fd, enabled)        \
+    SSL_EXPERIMENTAL_API("SSL_SetDtls13VersionWorkaround", \
+                         (PRFileDesc * _fd, PRBool _enabled), (fd, enabled))
+
+#define SSL_AddExternalPsk(fd, psk, identity, identityLen, hash)               \
+    SSL_EXPERIMENTAL_API("SSL_AddExternalPsk",                                 \
+                         (PRFileDesc * _fd, PK11SymKey * _psk,                 \
+                          const PRUint8 *_identity, unsigned int _identityLen, \
+                          SSLHashType _hash),                                  \
+                         (fd, psk, identity, identityLen, hash))
+
+#define SSL_AddExternalPsk0Rtt(fd, psk, identity, identityLen, hash,           \
+                               zeroRttSuite, maxEarlyData)                     \
+    SSL_EXPERIMENTAL_API("SSL_AddExternalPsk0Rtt",                             \
+                         (PRFileDesc * _fd, PK11SymKey * _psk,                 \
+                          const PRUint8 *_identity, unsigned int _identityLen, \
+                          SSLHashType _hash, PRUint16 _zeroRttSuite,           \
+                          PRUint32 _maxEarlyData),                             \
+                         (fd, psk, identity, identityLen, hash,                \
+                          zeroRttSuite, maxEarlyData))
+
+#define SSL_RemoveExternalPsk(fd, identity, identityLen)              \
+    SSL_EXPERIMENTAL_API("SSL_RemoveExternalPsk",                     \
+                         (PRFileDesc * _fd, const PRUint8 *_identity, \
+                          unsigned int _identityLen),                 \
+                         (fd, identity, identityLen))
+
+
+#define SSL_SetCertificateCompressionAlgorithm(fd, t)              \
+    SSL_EXPERIMENTAL_API("SSL_SetCertificateCompressionAlgorithm", \
+                         (PRFileDesc * _fd,                        \
+                          SSLCertificateCompressionAlgorithm t),   \
+                         (fd, t))
+
+#define SSL_PeerCertificateChainDER(fd, out)                       \
+    SSL_EXPERIMENTAL_API("SSL_PeerCertificateChainDER",            \
+                         (PRFileDesc * _fd, SECItemArray * *_out), \
+                         (fd, out))
+
+#define SSL_UseAltServerHelloType(fd, enable) SSL_DEPRECATED_EXPERIMENTAL_API
+#define SSL_SetupAntiReplay(a, b, c) SSL_DEPRECATED_EXPERIMENTAL_API
+#define SSL_InitAntiReplay(a, b, c) SSL_DEPRECATED_EXPERIMENTAL_API
+#define SSL_EnableESNI(a, b, c, d) SSL_DEPRECATED_EXPERIMENTAL_API
+#define SSL_EncodeESNIKeys(a, b, c, d, e, f, g, h, i, j) SSL_DEPRECATED_EXPERIMENTAL_API
+#define SSL_SetESNIKeyPair(a, b, c, d) SSL_DEPRECATED_EXPERIMENTAL_API
+#define SSL_EncodeEchConfig(a, b, c, d, e, f, g, h, i) SSL_DEPRECATED_EXPERIMENTAL_API
+
+SEC_END_PROTOS
+
+#endif /* __sslexp_h_ */

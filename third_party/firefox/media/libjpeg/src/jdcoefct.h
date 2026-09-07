@@ -1,0 +1,69 @@
+/*
+ * jdcoefct.h
+ *
+ * This file was part of the Independent JPEG Group's software:
+ * Copyright (C) 1994-1997, Thomas G. Lane.
+ * libjpeg-turbo Modifications:
+ * Copyright 2009 Pierre Ossman <ossman@cendio.se> for Cendio AB
+ * Copyright (C) 2020, Google, Inc.
+ * Copyright (C) 2022, D. R. Commander.
+ * For conditions of distribution and use, see the accompanying README.ijg
+ * file.
+ */
+
+#define JPEG_INTERNALS
+#include "jpeglib.h"
+
+
+#if BITS_IN_JSAMPLE != 16 || defined(D_LOSSLESS_SUPPORTED)
+
+#ifndef D_PROGRESSIVE_SUPPORTED
+#undef BLOCK_SMOOTHING_SUPPORTED
+#endif
+
+
+
+typedef struct {
+  struct jpeg_d_coef_controller pub; 
+
+  JDIMENSION MCU_ctr;           
+  int MCU_vert_offset;          
+  int MCU_rows_per_iMCU_row;    
+
+
+  JBLOCKROW MCU_buffer[D_MAX_BLOCKS_IN_MCU];
+
+  JCOEF *workspace;
+
+#ifdef D_MULTISCAN_FILES_SUPPORTED
+  jvirt_barray_ptr whole_image[MAX_COMPONENTS];
+#endif
+
+#ifdef BLOCK_SMOOTHING_SUPPORTED
+  int *coef_bits_latch;
+#define SAVED_COEFS  10         /* we save coef_bits[0..9] */
+#endif
+} my_coef_controller;
+
+typedef my_coef_controller *my_coef_ptr;
+
+
+LOCAL(void)
+start_iMCU_row(j_decompress_ptr cinfo)
+{
+  my_coef_ptr coef = (my_coef_ptr)cinfo->coef;
+
+  if (cinfo->comps_in_scan > 1) {
+    coef->MCU_rows_per_iMCU_row = 1;
+  } else {
+    if (cinfo->input_iMCU_row < (cinfo->total_iMCU_rows - 1))
+      coef->MCU_rows_per_iMCU_row = cinfo->cur_comp_info[0]->v_samp_factor;
+    else
+      coef->MCU_rows_per_iMCU_row = cinfo->cur_comp_info[0]->last_row_height;
+  }
+
+  coef->MCU_ctr = 0;
+  coef->MCU_vert_offset = 0;
+}
+
+#endif /* BITS_IN_JSAMPLE != 16 || defined(D_LOSSLESS_SUPPORTED) */

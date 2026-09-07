@@ -1,0 +1,95 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_image_Orientation_h
+#define mozilla_image_Orientation_h
+
+#include <stdint.h>
+
+#include "mozilla/gfx/Rect.h"
+
+namespace mozilla {
+
+struct OrientedPixel {};
+template <>
+struct IsPixel<OrientedPixel> : std::true_type {};
+typedef gfx::IntPointTyped<OrientedPixel> OrientedIntPoint;
+typedef gfx::IntSizeTyped<OrientedPixel> OrientedIntSize;
+typedef gfx::IntRectTyped<OrientedPixel> OrientedIntRect;
+
+struct UnorientedPixel {};
+template <>
+struct IsPixel<UnorientedPixel> : std::true_type {};
+typedef gfx::IntPointTyped<UnorientedPixel> UnorientedIntPoint;
+typedef gfx::IntSizeTyped<UnorientedPixel> UnorientedIntSize;
+typedef gfx::IntRectTyped<UnorientedPixel> UnorientedIntRect;
+
+namespace image {
+
+enum class Angle : uint8_t { D0, D90, D180, D270 };
+
+enum class Flip : uint8_t { Unflipped, Horizontal };
+
+struct Orientation {
+  explicit Orientation(Angle aRotation = Angle::D0,
+                       Flip aFlip = Flip::Unflipped, bool aFlipFirst = false)
+      : rotation(aRotation), flip(aFlip), flipFirst(aFlipFirst) {}
+
+  Orientation Reversed() const {
+    return Orientation(InvertAngle(rotation), flip, !flipFirst);
+  }
+
+  bool IsIdentity() const {
+    return (rotation == Angle::D0) && (flip == Flip::Unflipped);
+  }
+
+  bool SwapsWidthAndHeight() const {
+    return (rotation == Angle::D90) || (rotation == Angle::D270);
+  }
+
+  bool operator==(const Orientation& aOther) const {
+    return rotation == aOther.rotation && flip == aOther.flip &&
+           flipFirst == aOther.flipFirst;
+  }
+
+  bool operator!=(const Orientation& aOther) const {
+    return !(*this == aOther);
+  }
+
+  OrientedIntSize ToOriented(const UnorientedIntSize& aSize) const {
+    if (SwapsWidthAndHeight()) {
+      return OrientedIntSize(aSize.height, aSize.width);
+    } else {
+      return OrientedIntSize(aSize.width, aSize.height);
+    }
+  }
+
+  UnorientedIntSize ToUnoriented(const OrientedIntSize& aSize) const {
+    if (SwapsWidthAndHeight()) {
+      return UnorientedIntSize(aSize.height, aSize.width);
+    } else {
+      return UnorientedIntSize(aSize.width, aSize.height);
+    }
+  }
+
+  static Angle InvertAngle(Angle aAngle) {
+    switch (aAngle) {
+      case Angle::D90:
+        return Angle::D270;
+      case Angle::D270:
+        return Angle::D90;
+      default:
+        return aAngle;
+    }
+  }
+
+  Angle rotation;
+  Flip flip;
+  bool flipFirst;
+};
+
+}  
+}  
+
+#endif  // mozilla_image_Orientation_h

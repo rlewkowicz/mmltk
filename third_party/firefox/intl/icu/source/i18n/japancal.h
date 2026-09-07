@@ -1,0 +1,81 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+ ********************************************************************************
+ * Copyright (C) 2003-2008, International Business Machines Corporation
+ * and others. All Rights Reserved.
+ ********************************************************************************
+ *
+ * File JAPANCAL.H
+ *
+ * Modification History:
+ *
+ *   Date        Name        Description
+ *   05/13/2003  srl         copied from gregocal.h
+ ********************************************************************************
+ */
+
+#ifndef JAPANCAL_H
+#define JAPANCAL_H
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/calendar.h"
+#include "unicode/gregocal.h"
+
+U_NAMESPACE_BEGIN
+
+class JapaneseCalendar : public GregorianCalendar {
+public:
+
+    U_I18N_API static UBool U_EXPORT2 enableTentativeEra();
+
+    U_I18N_API static uint32_t U_EXPORT2 getCurrentEra(); 
+
+    JapaneseCalendar(const Locale& aLocale, UErrorCode& success);
+
+
+    virtual ~JapaneseCalendar();
+
+    JapaneseCalendar(const JapaneseCalendar& source);
+
+    virtual JapaneseCalendar* clone() const override;
+
+    virtual int32_t handleGetExtendedYear(UErrorCode& status) override;
+
+    virtual int32_t getActualMaximum(UCalendarDateFields field, UErrorCode& status) const override;
+
+
+public:
+    virtual UClassID getDynamicClassID() const override;
+
+    U_I18N_API static UClassID U_EXPORT2 getStaticClassID();
+
+    virtual const char * getType() const override;
+
+    DECLARE_OVERRIDE_SYSTEM_DEFAULT_CENTURY
+
+private:
+    JapaneseCalendar(); 
+
+protected:
+    virtual int32_t internalGetEra() const override;
+
+    virtual void handleComputeFields(int32_t julianDay, UErrorCode& status) override;
+
+    virtual int32_t handleGetLimit(UCalendarDateFields field, ELimitType limitType) const override;
+
+    virtual int32_t getDefaultMonthInYear(int32_t eyear, UErrorCode& status) override;
+
+    virtual int32_t getDefaultDayInMonth(int32_t eyear, int32_t month, UErrorCode& status) override;
+
+    virtual bool isEra0CountingBackward() const override { return true; }
+};
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+
+#endif
+

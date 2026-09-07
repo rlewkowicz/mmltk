@@ -1,0 +1,88 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+gl_provider = "Null"
+
+gl_provider = "Linux"
+
+if CONFIG["MOZ_GL_PROVIDER"]:
+    gl_provider = CONFIG["MOZ_GL_PROVIDER"]
+
+EXPORTS += [
+    "AutoMappable.h",
+    "Colorspaces.h",
+    "GfxTexturesReporter.h",
+    "GLBlitHelper.h",
+    "GLConsts.h",
+    "GLContext.h",
+    "GLContextEGL.h",
+    "GLContextProvider.h",
+    "GLContextProviderImpl.h",
+    "GLContextSymbols.h",
+    "GLContextTypes.h",
+    "GLDefs.h",
+    "GLLibraryEGL.h",
+    "GLLibraryLoader.h",
+    "GLReadTexImageHelper.h",
+    "GLScreenBuffer.h",
+    "GLTextureImage.h",
+    "GLTypes.h",
+    "GLUploadHelpers.h",
+    "HeapCopyOfStackArray.h",
+    "MozFramebuffer.h",
+    "ScopedGLHelpers.h",
+    "SharedSurface.h",
+    "SharedSurfaceEGL.h",
+    "SharedSurfaceGL.h",
+    "SurfaceTypes.h",
+]
+
+if gl_provider == "Linux":
+    # GLContextProviderGLX.cpp needs to be kept out of UNIFIED_SOURCES
+    # as it includes X11 headers which cause conflicts.
+    SOURCES += [
+        "GLContextProviderLinux.cpp",
+        "SharedSurfaceDMABUF.cpp",
+    ]
+
+UNIFIED_SOURCES += [
+    "Colorspaces.cpp",
+    "GfxTexturesReporter.cpp",
+    "GLBlitHelper.cpp",
+    "GLContext.cpp",
+    "GLContextFeatures.cpp",
+    "GLContextProviderEGL.cpp",
+    "GLDebugUtils.cpp",
+    "GLLibraryEGL.cpp",
+    "GLLibraryLoader.cpp",
+    "GLReadTexImageHelper.cpp",
+    "GLTextureImage.cpp",
+    "GLUploadHelpers.cpp",
+    "MozFramebuffer.cpp",
+    "ScopedGLHelpers.cpp",
+    "SharedSurface.cpp",
+    "SharedSurfaceEGL.cpp",
+    "SharedSurfaceGL.cpp",
+]
+SOURCES += [
+    "GLScreenBuffer.cpp",
+]
+
+
+include("/ipc/chromium/chromium-config.mozbuild")
+
+FINAL_LIBRARY = "xul"
+
+CXXFLAGS += CONFIG["MOZ_GTK3_CFLAGS"]
+CFLAGS += CONFIG["MOZ_GTK3_CFLAGS"]
+
+COMPILE_FLAGS["WARNINGS_CXXFLAGS"] += ["-Werror=switch"]
+
+CXXFLAGS += CONFIG["MOZ_WAYLAND_CFLAGS"]
+CFLAGS += CONFIG["MOZ_WAYLAND_CFLAGS"]
+
+LOCAL_INCLUDES += CONFIG["SKIA_INCLUDES"]
+LOCAL_INCLUDES += [
+    "/gfx/cairo/cairo/src",
+]

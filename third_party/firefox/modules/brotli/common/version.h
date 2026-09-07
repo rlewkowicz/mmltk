@@ -1,0 +1,38 @@
+/* Copyright 2016 Google Inc. All Rights Reserved.
+
+   Distributed under MIT license.
+   See file LICENSE for detail or copy at https://opensource.org/licenses/MIT
+*/
+
+
+#ifndef BROTLI_COMMON_VERSION_H_
+#define BROTLI_COMMON_VERSION_H_
+
+#define BROTLI_MAKE_HEX_VERSION(A, B, C) ((A << 24) | (B << 12) | C)
+
+
+#define BROTLI_VERSION_MAJOR 1
+#define BROTLI_VERSION_MINOR 2
+#define BROTLI_VERSION_PATCH 0
+
+#define BROTLI_VERSION BROTLI_MAKE_HEX_VERSION(                     \
+  BROTLI_VERSION_MAJOR, BROTLI_VERSION_MINOR, BROTLI_VERSION_PATCH)
+
+
+#define BROTLI_ABI_CURRENT  3
+#define BROTLI_ABI_REVISION 0
+#define BROTLI_ABI_AGE      2
+
+#if BROTLI_VERSION_MAJOR != (BROTLI_ABI_CURRENT - BROTLI_ABI_AGE)
+#error ABI/API version inconsistency
+#endif
+
+#if BROTLI_VERSION_MINOR != BROTLI_ABI_AGE
+#error ABI/API version inconsistency
+#endif
+
+#if BROTLI_VERSION_PATCH != BROTLI_ABI_REVISION
+#error ABI/API version inconsistency
+#endif
+
+#endif  /* BROTLI_COMMON_VERSION_H_ */

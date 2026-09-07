@@ -1,0 +1,139 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef js_loader_ModuleLoadRequest_h
+#define js_loader_ModuleLoadRequest_h
+
+#include "LoadContextBase.h"
+#include "ScriptLoadRequest.h"
+#include "ModuleLoaderBase.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/HoldDropJSObjects.h"
+#include "js/RootingAPI.h"
+#include "js/Value.h"
+#include "nsURIHashKey.h"
+#include "nsTHashtable.h"
+
+namespace JS::loader {
+
+class LoadedScript;
+class ModuleScript;
+class ModuleLoaderBase;
+
+
+class ModuleLoadRequest final : public ScriptLoadRequest {
+  ~ModuleLoadRequest();
+
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_CLASS_INHERITED(ModuleLoadRequest,
+                                                         ScriptLoadRequest)
+  using SRIMetadata = mozilla::dom::SRIMetadata;
+
+  enum class Kind {
+    TopLevel,
+
+    StaticImport,
+
+    DynamicImport,
+  };
+
+  ModuleLoadRequest(ModuleType aModuleType, const SRIMetadata& aIntegrity,
+                    nsIURI* aReferrer, LoadContextBase* aContext, Kind aKind,
+                    ModuleLoaderBase* aLoader, ModuleLoadRequest* aRootModule);
+  ModuleLoadRequest(const ModuleLoadRequest& aOther) = delete;
+  ModuleLoadRequest(ModuleLoadRequest&& aOther) = delete;
+
+  bool IsTopLevel() const override { return mKind == Kind::TopLevel; }
+  bool IsStaticImport() const { return mKind == Kind::StaticImport; }
+  bool IsDynamicImport() const { return mKind == Kind::DynamicImport; }
+
+  bool IsErrored() const;
+
+  nsIGlobalObject* GetGlobalObject();
+
+  void SetReady() override;
+  void Cancel() override { mLoader->Cancel(this); };
+
+  void SetImport(Handle<JSScript*> aReferrerScript,
+                 Handle<JSObject*> aModuleRequestObj, Handle<Value> aPayload);
+  void ClearImport();
+
+  void ModuleLoaded();
+  void ModuleErrored();
+  void LoadFailed();
+
+  ModuleLoadRequest* GetRootModule() {
+    if (!mRootModule) {
+      return this;
+    }
+    return mRootModule;
+  }
+
+
+  void CancelDynamicImport(nsresult aResult) {
+    MOZ_ASSERT(IsDynamicImport());
+    mLoader->CancelDynamicImport(this, aResult);
+  }
+#ifdef DEBUG
+  bool IsRegisteredDynamicImport() const {
+    return IsDynamicImport() && mLoader->HasDynamicImport(this);
+  }
+#endif
+  nsresult StartModuleLoad() { return mLoader->StartModuleLoad(this); }
+  nsresult RestartModuleLoad() { return mLoader->RestartModuleLoad(this); }
+  nsresult OnFetchComplete(nsresult aRv) {
+    return mLoader->OnFetchComplete(this, aRv);
+  }
+  bool InstantiateModuleGraph() {
+    return mLoader->InstantiateModuleGraph(this);
+  }
+  nsresult EvaluateModule() { return mLoader->EvaluateModule(this); }
+  void ProcessDynamicImport() { mLoader->ProcessDynamicImport(this); }
+
+  void LoadFinished();
+
+#ifdef NIGHTLY_BUILD
+  void SetHasWasmMimeTypeEssence() { mHasWasmMimeTypeEssence = true; }
+
+  bool HasWasmMimeTypeEssence() { return mHasWasmMimeTypeEssence; }
+#endif
+
+  void SetErroredLoadingImports() {
+    MOZ_ASSERT(IsDynamicImport());
+    MOZ_ASSERT(IsFetching() || IsCompiling());
+    mErroredLoadingImports = true;
+  }
+
+  void UpdateReferrerPolicy(mozilla::dom::ReferrerPolicy aReferrerPolicy) {
+    FetchInfo()->UpdateReferrerPolicy(aReferrerPolicy);
+  }
+
+ public:
+  const Kind mKind;
+
+  const ModuleType mModuleType;
+
+  const bool mIsDynamicImport;
+
+#ifdef NIGHTLY_BUILD
+  bool mHasWasmMimeTypeEssence = false;
+#endif
+
+  bool mErroredLoadingImports;
+
+  RefPtr<ModuleLoaderBase> mLoader;
+
+  RefPtr<ModuleLoadRequest> mRootModule;
+
+  RefPtr<ModuleScript> mModuleScript;
+
+  Heap<JSScript*> mReferrerScript;
+  Heap<JSObject*> mModuleRequestObj;
+  Heap<Value> mPayload;
+};
+
+}  
+
+#endif  // js_loader_ModuleLoadRequest_h

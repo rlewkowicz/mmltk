@@ -1,0 +1,140 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(VideoSink_h_)
+#define VideoSink_h_
+
+#include "FrameStatistics.h"
+#include "ImageContainer.h"
+#include "MediaEventSource.h"
+#include "MediaSink.h"
+#include "MediaTimer.h"
+#include "VideoFrameContainer.h"
+#include "mozilla/AbstractThread.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/TimeStamp.h"
+
+namespace mozilla {
+
+class VideoFrameContainer;
+template <class T>
+class MediaQueue;
+
+class VideoSink : public MediaSink {
+  typedef mozilla::layers::ImageContainer::ProducerID ProducerID;
+
+ public:
+  VideoSink(AbstractThread* aThread, MediaSink* aAudioSink,
+            MediaQueue<VideoData>& aVideoQueue, VideoFrameContainer* aContainer,
+            FrameStatistics& aFrameStats, uint32_t aVQueueSentToCompositerSize);
+
+  RefPtr<EndedPromise> OnEnded(TrackType aType) override;
+
+  media::TimeUnit GetEndTime(TrackType aType) const override;
+
+  media::TimeUnit GetPosition(TimeStamp* aTimeStamp = nullptr) override;
+
+  bool HasUnplayedFrames(TrackType aType) const override;
+  media::TimeUnit UnplayedDuration(TrackType aType) const override;
+
+  void SetPlaybackRate(double aPlaybackRate) override;
+
+  void SetVolume(double aVolume) override;
+
+  void SetStreamName(const nsAString& aStreamName) override;
+
+  void SetPreservesPitch(bool aPreservesPitch) override;
+
+  void SetPlaying(bool aPlaying) override;
+
+  RefPtr<GenericPromise> SetAudioDevice(
+      RefPtr<AudioDeviceInfo> aDevice) override;
+
+  double PlaybackRate() const override;
+
+  void Redraw(const VideoInfo& aInfo) override;
+
+  nsresult Start(const media::TimeUnit& aStartTime, const MediaInfo& aInfo,
+                 StartType aStartType = StartType::Initial) override;
+
+  void Stop() override;
+
+  bool IsStarted() const override;
+
+  bool IsPlaying() const override;
+
+  void Shutdown() override;
+
+  void SetSecondaryVideoContainer(VideoFrameContainer* aSecondary) override;
+
+  void GetDebugInfo(dom::MediaSinkDebugInfo& aInfo) override;
+
+  void SetVideoQueueSendToCompositorSize(const uint32_t aSize) override {
+    mVideoQueueSendToCompositorSize = aSize;
+  }
+
+ private:
+  virtual ~VideoSink();
+
+  void OnVideoQueuePushed(const RefPtr<VideoData>& aSample);
+  void OnVideoQueueFinished();
+  void ConnectListener();
+  void DisconnectListener();
+
+  void EnsureHighResTimersOnOnlyIfPlaying();
+
+  void RenderVideoFrames(Span<const RefPtr<VideoData>> aFrames,
+                         int64_t aClockTime, const TimeStamp& aClockTimeStamp);
+
+  void TryUpdateRenderedVideoFrames();
+
+  void UpdateRenderedVideoFrames();
+  void UpdateRenderedVideoFramesByTimer();
+
+  void MaybeResolveEndPromise();
+
+  void AssertOwnerThread() const {
+    MOZ_ASSERT(mOwnerThread->IsCurrentThreadIn());
+  }
+
+  MediaQueue<VideoData>& VideoQueue() const { return mVideoQueue; }
+
+  const RefPtr<AbstractThread> mOwnerThread;
+  const RefPtr<MediaSink> mAudioSink;
+  MediaQueue<VideoData>& mVideoQueue;
+  VideoFrameContainer* mContainer;
+  RefPtr<VideoFrameContainer> mSecondaryContainer;
+
+  const ProducerID mProducerID;
+
+  FrameStatistics& mFrameStats;
+
+  RefPtr<EndedPromise> mEndPromise;
+  MozPromiseHolder<EndedPromise> mEndPromiseHolder;
+  MozPromiseRequestHolder<EndedPromise> mVideoSinkEndRequest;
+
+  media::TimeUnit mVideoFrameEndTime;
+
+  media::TimeUnit mDroppedInSinkSequenceDuration;
+  uint32_t mOldCompositorDroppedCount;
+  uint32_t mPendingDroppedCount;
+
+  MediaEventListener mPushListener;
+  MediaEventListener mFinishListener;
+
+  bool mHasVideo;
+
+  DelayedScheduler<TimeStamp> mUpdateScheduler;
+
+  uint32_t mVideoQueueSendToCompositorSize;
+
+
+  RefPtr<layers::Image> mBlankImage;
+  bool InitializeBlankImage();
+};
+
+}  
+
+#endif

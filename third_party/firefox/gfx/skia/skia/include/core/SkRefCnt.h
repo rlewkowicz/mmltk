@@ -1,0 +1,274 @@
+/*
+ * Copyright 2006 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkRefCnt_DEFINED)
+#define SkRefCnt_DEFINED
+
+#include "include/core/SkTypes.h"
+#include "include/private/base/SkDebug.h"
+
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <iosfwd>
+#include <type_traits>
+#include <utility>
+
+class SK_API SkRefCntBase {
+public:
+    SkRefCntBase() : fRefCnt(1) {}
+
+    virtual ~SkRefCntBase() {
+    #if defined(SK_DEBUG)
+        SkASSERTF(this->getRefCnt() == 1, "fRefCnt was %d", this->getRefCnt());
+        fRefCnt.store(0, std::memory_order_relaxed);
+    #endif
+    }
+
+    bool unique() const {
+        if (1 == fRefCnt.load(std::memory_order_acquire)) {
+            return true;
+        }
+        return false;
+    }
+
+    void ref() const {
+        SkASSERT(this->getRefCnt() > 0);
+        (void)fRefCnt.fetch_add(+1, std::memory_order_relaxed);
+    }
+
+    void unref() const {
+        SkASSERT(this->getRefCnt() > 0);
+        if (1 == fRefCnt.fetch_add(-1, std::memory_order_acq_rel)) {
+            this->internal_dispose();
+        }
+    }
+
+private:
+
+#if defined(SK_DEBUG)
+    int32_t getRefCnt() const {
+        return fRefCnt.load(std::memory_order_relaxed);
+    }
+#endif
+
+    virtual void internal_dispose() const {
+    #if defined(SK_DEBUG)
+        SkASSERT(0 == this->getRefCnt());
+        fRefCnt.store(1, std::memory_order_relaxed);
+    #endif
+        delete this;
+    }
+
+    friend class SkWeakRefCnt;
+
+    mutable std::atomic<int32_t> fRefCnt;
+
+    SkRefCntBase(SkRefCntBase&&) = delete;
+    SkRefCntBase(const SkRefCntBase&) = delete;
+    SkRefCntBase& operator=(SkRefCntBase&&) = delete;
+    SkRefCntBase& operator=(const SkRefCntBase&) = delete;
+};
+
+#if defined(SK_REF_CNT_MIXIN_INCLUDE)
+#include SK_REF_CNT_MIXIN_INCLUDE
+#else
+class SK_API SkRefCnt : public SkRefCntBase {
+    #if defined(SK_BUILD_FOR_GOOGLE3)
+    public:
+        void deref() const { this->unref(); }
+    #endif
+};
+#endif
+
+
+template <typename T> static inline T* SkRef(T* obj) {
+    SkASSERT(obj);
+    obj->ref();
+    return obj;
+}
+
+template <typename T> static inline T* SkSafeRef(T* obj) {
+    if (obj) {
+        obj->ref();
+    }
+    return obj;
+}
+
+template <typename T> static inline void SkSafeUnref(T* obj) {
+    if (obj) {
+        obj->unref();
+    }
+}
+
+
+template <typename Derived>
+class SkNVRefCnt {
+public:
+    SkNVRefCnt() : fRefCnt(1) {}
+    ~SkNVRefCnt() {
+    #if defined(SK_DEBUG)
+        int rc = fRefCnt.load(std::memory_order_relaxed);
+        SkASSERTF(rc == 1, "NVRefCnt was %d", rc);
+    #endif
+    }
+
+
+    bool unique() const { return 1 == fRefCnt.load(std::memory_order_acquire); }
+    void ref() const { (void)fRefCnt.fetch_add(+1, std::memory_order_relaxed); }
+    void unref() const {
+        if (1 == fRefCnt.fetch_add(-1, std::memory_order_acq_rel)) {
+            SkDEBUGCODE(fRefCnt.store(1, std::memory_order_relaxed));
+            delete (const Derived*)this;
+        }
+    }
+    void  deref() const { this->unref(); }
+
+    bool refCntGreaterThan(int32_t threadIsolatedTestCnt) const {
+        int cnt = fRefCnt.load(std::memory_order_acquire);
+        SkASSERT(cnt >= threadIsolatedTestCnt);
+        return cnt > threadIsolatedTestCnt;
+    }
+
+private:
+    mutable std::atomic<int32_t> fRefCnt;
+
+    SkNVRefCnt(SkNVRefCnt&&) = delete;
+    SkNVRefCnt(const SkNVRefCnt&) = delete;
+    SkNVRefCnt& operator=(SkNVRefCnt&&) = delete;
+    SkNVRefCnt& operator=(const SkNVRefCnt&) = delete;
+};
+
+
+template <typename T> class SK_TRIVIAL_ABI sk_sp {
+public:
+    using element_type = T;
+
+    constexpr sk_sp() : fPtr(nullptr) {}
+    constexpr sk_sp(std::nullptr_t) : fPtr(nullptr) {}
+
+    sk_sp(const sk_sp<T>& that) : fPtr(SkSafeRef(that.get())) {}
+    template <typename U,
+              typename = typename std::enable_if<std::is_convertible<U*, T*>::value>::type>
+    sk_sp(const sk_sp<U>& that) : fPtr(SkSafeRef(that.get())) {}
+
+    sk_sp(sk_sp<T>&& that) : fPtr(that.release()) {}
+    template <typename U,
+              typename = typename std::enable_if<std::is_convertible<U*, T*>::value>::type>
+    sk_sp(sk_sp<U>&& that) : fPtr(that.release()) {}
+
+    explicit sk_sp(T* obj) : fPtr(obj) {}
+
+    ~sk_sp() {
+        SkSafeUnref(fPtr);
+        SkDEBUGCODE(fPtr = nullptr);
+    }
+
+    sk_sp<T>& operator=(std::nullptr_t) { this->reset(); return *this; }
+
+    sk_sp<T>& operator=(const sk_sp<T>& that) {
+        if (this != &that) {
+            this->reset(SkSafeRef(that.get()));
+        }
+        return *this;
+    }
+    template <typename U,
+              typename = typename std::enable_if<std::is_convertible<U*, T*>::value>::type>
+    sk_sp<T>& operator=(const sk_sp<U>& that) {
+        this->reset(SkSafeRef(that.get()));
+        return *this;
+    }
+
+    sk_sp<T>& operator=(sk_sp<T>&& that) {
+        this->reset(that.release());
+        return *this;
+    }
+    template <typename U,
+              typename = typename std::enable_if<std::is_convertible<U*, T*>::value>::type>
+    sk_sp<T>& operator=(sk_sp<U>&& that) {
+        this->reset(that.release());
+        return *this;
+    }
+
+    T& operator*() const {
+        SkASSERT(this->get() != nullptr);
+        return *this->get();
+    }
+
+    explicit operator bool() const { return this->get() != nullptr; }
+
+    T* get() const { return fPtr; }
+    T* operator->() const { return fPtr; }
+
+    void reset(T* ptr = nullptr) {
+        T* oldPtr = fPtr;
+        fPtr = ptr;
+        SkSafeUnref(oldPtr);
+    }
+
+    [[nodiscard]] T* release() {
+        T* ptr = fPtr;
+        fPtr = nullptr;
+        return ptr;
+    }
+
+    void swap(sk_sp<T>& that)  {
+        using std::swap;
+        swap(fPtr, that.fPtr);
+    }
+
+    using sk_is_trivially_relocatable = std::true_type;
+
+private:
+    T*  fPtr;
+};
+
+template <typename T> inline void swap(sk_sp<T>& a, sk_sp<T>& b)  {
+    a.swap(b);
+}
+
+template <typename T, typename U> inline bool operator==(const sk_sp<T>& a, const sk_sp<U>& b) {
+    return a.get() == b.get();
+}
+template <typename T> inline bool operator==(const sk_sp<T>& a, std::nullptr_t)  {
+    return !a;
+}
+template <typename T> inline bool operator==(std::nullptr_t, const sk_sp<T>& b)  {
+    return !b;
+}
+
+template <typename T, typename U> inline bool operator!=(const sk_sp<T>& a, const sk_sp<U>& b) {
+    return a.get() != b.get();
+}
+template <typename T> inline bool operator!=(const sk_sp<T>& a, std::nullptr_t)  {
+    return static_cast<bool>(a);
+}
+template <typename T> inline bool operator!=(std::nullptr_t, const sk_sp<T>& b)  {
+    return static_cast<bool>(b);
+}
+
+template <typename C, typename CT, typename T>
+auto operator<<(std::basic_ostream<C, CT>& os, const sk_sp<T>& sp) -> decltype(os << sp.get()) {
+    return os << sp.get();
+}
+
+template <typename T> sk_sp(T*) -> sk_sp<T>;
+
+template <typename T, typename... Args>
+sk_sp<T> sk_make_sp(Args&&... args) {
+    return sk_sp<T>(new T(std::forward<Args>(args)...));
+}
+
+template <typename T> sk_sp<T> sk_ref_sp(T* obj) {
+    return sk_sp<T>(SkSafeRef(obj));
+}
+
+template <typename T> sk_sp<T> sk_ref_sp(const T* obj) {
+    return sk_sp<T>(const_cast<T*>(SkSafeRef(obj)));
+}
+
+#endif

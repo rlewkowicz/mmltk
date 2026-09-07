@@ -1,0 +1,1148 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsTableRowFrame.h"
+
+#include <algorithm>
+
+#include "mozilla/Baseline.h"
+#include "mozilla/ComputedStyle.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/ReflowInput.h"
+#include "mozilla/StaticPrefs_layout.h"
+#include "nsCSSRendering.h"
+#include "nsDisplayList.h"
+#include "nsHTMLParts.h"
+#include "nsIContent.h"
+#include "nsIFrame.h"
+#include "nsIFrameInlines.h"
+#include "nsPresContext.h"
+#include "nsStyleConsts.h"
+#include "nsTableCellFrame.h"
+#include "nsTableColFrame.h"
+#include "nsTableColGroupFrame.h"
+#include "nsTableFrame.h"
+#include "nsTableRowGroupFrame.h"
+
+#ifdef ACCESSIBILITY
+#  include "nsAccessibilityService.h"
+#endif
+
+using namespace mozilla;
+
+namespace mozilla {
+
+struct TableCellReflowInput : public ReflowInput {
+  TableCellReflowInput(nsPresContext* aPresContext,
+                       const ReflowInput& aParentReflowInput, nsIFrame* aFrame,
+                       const LogicalSize& aAvailableSpace,
+                       ReflowInput::InitFlags aFlags = {})
+      : ReflowInput(aPresContext, aParentReflowInput, aFrame, aAvailableSpace,
+                    Nothing(), aFlags) {}
+
+  void FixUp(const LogicalSize& aAvailSpace);
+};
+
+}  
+
+void TableCellReflowInput::FixUp(const LogicalSize& aAvailSpace) {
+  NS_WARNING_ASSERTION(
+      NS_UNCONSTRAINEDSIZE != aAvailSpace.ISize(mWritingMode),
+      "have unconstrained inline-size; this should only result from very large "
+      "sizes, not attempts at intrinsic inline size calculation");
+  if (NS_UNCONSTRAINEDSIZE != ComputedISize()) {
+    nscoord computedISize =
+        aAvailSpace.ISize(mWritingMode) -
+        ComputedLogicalBorderPadding(mWritingMode).IStartEnd(mWritingMode);
+    computedISize = std::max(0, computedISize);
+    SetComputedISize(computedISize);
+  }
+  if (NS_UNCONSTRAINEDSIZE != ComputedBSize() &&
+      NS_UNCONSTRAINEDSIZE != aAvailSpace.BSize(mWritingMode)) {
+    nscoord computedBSize =
+        aAvailSpace.BSize(mWritingMode) -
+        ComputedLogicalBorderPadding(mWritingMode).BStartEnd(mWritingMode);
+    computedBSize = std::max(0, computedBSize);
+    SetComputedBSize(computedBSize);
+  }
+}
+
+void nsTableRowFrame::InitChildReflowInput(nsPresContext& aPresContext,
+                                           const LogicalSize& aAvailSize,
+                                           bool aBorderCollapse,
+                                           TableCellReflowInput& aReflowInput) {
+  Maybe<LogicalMargin> collapseBorder;
+  if (aBorderCollapse) {
+    nsBCTableCellFrame* bcCellFrame = (nsBCTableCellFrame*)aReflowInput.mFrame;
+    if (bcCellFrame) {
+      collapseBorder.emplace(
+          bcCellFrame->GetBorderWidth(aReflowInput.GetWritingMode()));
+    }
+  }
+  aReflowInput.Init(&aPresContext, Nothing(), collapseBorder);
+  aReflowInput.FixUp(aAvailSize);
+}
+
+void nsTableRowFrame::SetFixedBSize(nscoord aValue) {
+  nscoord bsize = std::max(0, aValue);
+  if (HasFixedBSize()) {
+    if (bsize > mStyleFixedBSize) {
+      mStyleFixedBSize = bsize;
+    }
+  } else {
+    mStyleFixedBSize = bsize;
+    if (bsize > 0) {
+      SetHasFixedBSize(true);
+    }
+  }
+}
+
+void nsTableRowFrame::SetPctBSize(float aPctValue, bool aForce) {
+  nscoord bsize = std::max(0, NSToCoordRound(aPctValue * 100.0f));
+  if (HasPctBSize()) {
+    if ((bsize > mStylePctBSize) || aForce) {
+      mStylePctBSize = bsize;
+    }
+  } else {
+    mStylePctBSize = bsize;
+    if (bsize > 0) {
+      SetHasPctBSize(true);
+    }
+  }
+}
+
+
+NS_QUERYFRAME_HEAD(nsTableRowFrame)
+  NS_QUERYFRAME_ENTRY(nsTableRowFrame)
+NS_QUERYFRAME_TAIL_INHERITING(nsContainerFrame)
+
+nsTableRowFrame::nsTableRowFrame(ComputedStyle* aStyle,
+                                 nsPresContext* aPresContext, ClassID aID)
+    : nsContainerFrame(aStyle, aPresContext, aID) {
+  mBits.mRowIndex = 0;
+  mBits.mHasFixedBSize = 0;
+  mBits.mHasPctBSize = 0;
+  mBits.mFirstInserted = 0;
+  ResetBSize();
+}
+
+nsTableRowFrame::~nsTableRowFrame() = default;
+
+void nsTableRowFrame::Init(nsIContent* aContent, nsContainerFrame* aParent,
+                           nsIFrame* aPrevInFlow) {
+  nsContainerFrame::Init(aContent, aParent, aPrevInFlow);
+
+  NS_ASSERTION(mozilla::StyleDisplay::TableRow == StyleDisplay()->mDisplay,
+               "wrong display on table row frame");
+
+  if (aPrevInFlow) {
+    nsTableRowFrame* rowFrame = (nsTableRowFrame*)aPrevInFlow;
+
+    SetRowIndex(rowFrame->GetRowIndex());
+  } else {
+    mWritingMode = GetTableFrame()->GetWritingMode();
+  }
+}
+
+void nsTableRowFrame::Destroy(DestroyContext& aContext) {
+  nsTableFrame::MaybeUnregisterPositionedTablePart(this);
+  nsContainerFrame::Destroy(aContext);
+}
+
+void nsTableRowFrame::DidSetComputedStyle(ComputedStyle* aOldComputedStyle) {
+  nsContainerFrame::DidSetComputedStyle(aOldComputedStyle);
+  nsTableFrame::PositionedTablePartMaybeChanged(this, aOldComputedStyle);
+
+  if (!aOldComputedStyle) {
+    return;  
+  }
+
+#ifdef ACCESSIBILITY
+  if (nsAccessibilityService* accService = GetAccService()) {
+    if (StyleBackground()->BackgroundColor(this) !=
+        aOldComputedStyle->StyleBackground()->BackgroundColor(
+            aOldComputedStyle)) {
+      accService->TableLayoutGuessMaybeChanged(PresShell(), mContent);
+    }
+  }
+#endif
+
+  nsTableFrame* tableFrame = GetTableFrame();
+  if (tableFrame->IsBorderCollapse() &&
+      tableFrame->BCRecalcNeeded(aOldComputedStyle, Style())) {
+    TableArea damageArea(0, GetRowIndex(), tableFrame->GetColCount(), 1);
+    tableFrame->AddBCDamageArea(damageArea);
+  }
+}
+
+void nsTableRowFrame::AppendFrames(ChildListID aListID,
+                                   nsFrameList&& aFrameList) {
+  NS_ASSERTION(aListID == FrameChildListID::Principal, "unexpected child list");
+
+  DrainSelfOverflowList();  
+  const nsFrameList::Slice& newCells =
+      mFrames.AppendFrames(nullptr, std::move(aFrameList));
+
+  nsTableFrame* tableFrame = GetTableFrame();
+  for (nsIFrame* childFrame : newCells) {
+    NS_ASSERTION(childFrame->IsTableCellFrame(),
+                 "Not a table cell frame/pseudo frame construction failure");
+    tableFrame->AppendCell(static_cast<nsTableCellFrame&>(*childFrame),
+                           GetRowIndex());
+  }
+
+  PresShell()->FrameNeedsReflow(this, IntrinsicDirty::FrameAndAncestors,
+                                NS_FRAME_HAS_DIRTY_CHILDREN);
+  tableFrame->SetGeometryDirty();
+}
+
+void nsTableRowFrame::InsertFrames(ChildListID aListID, nsIFrame* aPrevFrame,
+                                   const nsLineList::iterator* aPrevFrameLine,
+                                   nsFrameList&& aFrameList) {
+  NS_ASSERTION(aListID == FrameChildListID::Principal, "unexpected child list");
+  NS_ASSERTION(!aPrevFrame || aPrevFrame->GetParent() == this,
+               "inserting after sibling frame with different parent");
+  if (mFrames.IsEmpty() || (aPrevFrame && !aPrevFrame->GetNextSibling())) {
+    AppendFrames(aListID, std::move(aFrameList));
+    return;
+  }
+
+  DrainSelfOverflowList();  
+  const nsFrameList::Slice& newCells =
+      mFrames.InsertFrames(nullptr, aPrevFrame, std::move(aFrameList));
+
+  nsTableCellFrame* prevCellFrame =
+      static_cast<nsTableCellFrame*>(nsTableFrame::GetFrameAtOrBefore(
+          this, aPrevFrame, LayoutFrameType::TableCell));
+  nsTArray<nsTableCellFrame*> cellChildren;
+  for (nsIFrame* childFrame : newCells) {
+    NS_ASSERTION(childFrame->IsTableCellFrame(),
+                 "Not a table cell frame/pseudo frame construction failure");
+    cellChildren.AppendElement(static_cast<nsTableCellFrame*>(childFrame));
+  }
+  int32_t colIndex = -1;
+  if (prevCellFrame) {
+    colIndex = prevCellFrame->ColIndex();
+  }
+  nsTableFrame* tableFrame = GetTableFrame();
+  tableFrame->InsertCells(cellChildren, GetRowIndex(), colIndex);
+
+  PresShell()->FrameNeedsReflow(this, IntrinsicDirty::FrameAndAncestors,
+                                NS_FRAME_HAS_DIRTY_CHILDREN);
+  tableFrame->SetGeometryDirty();
+}
+
+void nsTableRowFrame::RemoveFrame(DestroyContext& aContext, ChildListID aListID,
+                                  nsIFrame* aOldFrame) {
+  NS_ASSERTION(aListID == FrameChildListID::Principal, "unexpected child list");
+  MOZ_ASSERT((nsTableCellFrame*)do_QueryFrame(aOldFrame));
+
+  auto* cellFrame = static_cast<nsTableCellFrame*>(aOldFrame);
+  nsTableFrame* tableFrame = GetTableFrame();
+  tableFrame->RemoveCell(cellFrame, GetRowIndex());
+
+  mFrames.DestroyFrame(aContext, aOldFrame);
+
+  PresShell()->FrameNeedsReflow(this, IntrinsicDirty::FrameAndAncestors,
+                                NS_FRAME_HAS_DIRTY_CHILDREN);
+
+  tableFrame->SetGeometryDirty();
+}
+
+nsMargin nsTableRowFrame::GetUsedMargin() const { return nsMargin(0, 0, 0, 0); }
+
+nsMargin nsTableRowFrame::GetUsedBorder() const { return nsMargin(0, 0, 0, 0); }
+
+nsMargin nsTableRowFrame::GetUsedPadding() const {
+  return nsMargin(0, 0, 0, 0);
+}
+
+static nscoord GetBSizeOfRowsSpannedBelowFirst(
+    nsTableCellFrame& aTableCellFrame, nsTableFrame& aTableFrame,
+    const WritingMode aWM) {
+  nscoord bsize = 0;
+  int32_t rowSpan = aTableFrame.GetEffectiveRowSpan(aTableCellFrame);
+  nsIFrame* nextRow = aTableCellFrame.GetParent()->GetNextSibling();
+  for (int32_t rowX = 1; ((rowX < rowSpan) && nextRow);) {
+    if (nextRow->IsTableRowFrame()) {
+      bsize += nextRow->BSize(aWM);
+      rowX++;
+    }
+    bsize += aTableFrame.GetRowSpacing(rowX);
+    nextRow = nextRow->GetNextSibling();
+  }
+  return bsize;
+}
+
+void nsTableRowFrame::DidResize(ForceAlignTopForTableCell aForceAlignTop) {
+  nsTableFrame* tableFrame = GetTableFrame();
+
+  WritingMode wm = GetWritingMode();
+  ReflowOutput desiredSize(wm);
+  desiredSize.SetSize(wm, GetLogicalSize(wm));
+  desiredSize.SetOverflowAreasToDesiredBounds();
+
+  nsSize containerSize = mRect.Size();
+
+  for (nsTableCellFrame* cellFrame = GetFirstCell(); cellFrame;
+       cellFrame = cellFrame->GetNextCell()) {
+    nscoord cellBSize = BSize(wm) + GetBSizeOfRowsSpannedBelowFirst(
+                                        *cellFrame, *tableFrame, wm);
+
+    LogicalSize cellSize = cellFrame->GetLogicalSize(wm);
+    if (cellSize.BSize(wm) != cellBSize || wm.IsVerticalRL()) {
+      nsRect cellOldRect = cellFrame->GetRect();
+      nsRect cellInkOverflow = cellFrame->InkOverflowRect();
+
+      if (wm.IsVerticalRL()) {
+        LogicalPoint oldPos = cellFrame->GetLogicalPosition(wm, containerSize);
+
+        LogicalPoint newPos(wm, oldPos.I(wm), 0);
+
+        if (cellFrame->IsRelativelyOrStickyPositioned()) {
+          LogicalPoint oldNormalPos =
+              cellFrame->GetLogicalNormalPosition(wm, containerSize);
+          newPos.B(wm) = oldPos.B(wm) - oldNormalPos.B(wm);
+        }
+
+        if (oldPos != newPos) {
+          cellFrame->SetPosition(wm, newPos, containerSize);
+        }
+      }
+
+      cellSize.BSize(wm) = cellBSize;
+      cellFrame->SetSize(wm, cellSize);
+
+      if (tableFrame->IsBorderCollapse()) {
+        nsTableFrame::InvalidateTableFrame(cellFrame, cellOldRect,
+                                           cellInkOverflow, false);
+      }
+    }
+
+    cellFrame->AlignChildWithinCell(mMaxCellAscent, aForceAlignTop);
+
+    ConsiderChildOverflow(desiredSize.mOverflowAreas, cellFrame);
+
+  }
+  FinishAndStoreOverflow(&desiredSize);
+}
+
+nscoord nsTableRowFrame::GetMaxCellAscent() const { return mMaxCellAscent; }
+
+Maybe<nscoord> nsTableRowFrame::GetRowBaseline(WritingMode aWM) {
+  if (mMaxCellAscent) {
+    return Some(mMaxCellAscent);
+  }
+
+  nscoord ascent = 0;
+  for (nsIFrame* childFrame : mFrames) {
+    MOZ_ASSERT(childFrame->IsTableCellFrame());
+    nscoord s = Baseline::SynthesizeBOffsetFromContentBox(
+        childFrame, aWM, BaselineSharingGroup::First);
+    ascent = std::max(ascent, s);
+  }
+  return Some(ascent);
+}
+
+nscoord nsTableRowFrame::GetInitialBSize(nscoord aPctBasis) const {
+  nscoord bsize = 0;
+  if ((aPctBasis > 0) && HasPctBSize()) {
+    bsize = NSToCoordRound(GetPctBSize() * (float)aPctBasis);
+  }
+  if (HasFixedBSize()) {
+    bsize = std::max(bsize, GetFixedBSize());
+  }
+  return std::max(bsize, GetContentBSize());
+}
+
+void nsTableRowFrame::ResetBSize() {
+  SetHasFixedBSize(false);
+  SetHasPctBSize(false);
+  SetFixedBSize(0);
+  SetPctBSize(0);
+  SetContentBSize(0);
+
+  mMaxCellAscent = 0;
+  mMaxCellDescent = 0;
+}
+
+void nsTableRowFrame::UpdateBSize(nscoord aBSize, nsTableFrame* aTableFrame,
+                                  nsTableCellFrame* aCellFrame) {
+  if (!aTableFrame || !aCellFrame) {
+    MOZ_ASSERT_UNREACHABLE("Invalid call");
+    return;
+  }
+
+  if (aBSize == NS_UNCONSTRAINEDSIZE) {
+    return;
+  }
+
+  if (GetInitialBSize() < aBSize &&
+      aTableFrame->GetEffectiveRowSpan(*aCellFrame) == 1) {
+    SetContentBSize(aBSize);
+  }
+
+  if (aCellFrame->HasTableCellAlignmentBaseline()) {
+    if (auto ascent = aCellFrame->GetCellBaseline()) {
+      if (mMaxCellAscent < *ascent) {
+        mMaxCellAscent = *ascent;
+      }
+      nscoord descent = aBSize - *ascent;
+      if (mMaxCellDescent < descent &&
+          aTableFrame->GetEffectiveRowSpan(*aCellFrame) == 1) {
+        mMaxCellDescent = descent;
+      }
+    }
+  }
+}
+
+nscoord nsTableRowFrame::CalcBSize(const ReflowInput& aReflowInput) {
+  nsTableFrame* tableFrame = GetTableFrame();
+
+  ResetBSize();
+  const nscoord computedBSize = aReflowInput.ComputedBSize();
+  if (computedBSize != NS_UNCONSTRAINEDSIZE && computedBSize > 0) {
+    SetFixedBSize(computedBSize);
+  }
+
+  WritingMode wm = aReflowInput.GetWritingMode();
+  const nsStylePosition* position = StylePosition();
+  const auto bsizeStyleCoord =
+      position->BSize(wm, AnchorPosResolutionParams::From(this));
+  if (bsizeStyleCoord->ConvertsToLength()) {
+    SetFixedBSize(bsizeStyleCoord->ToLength());
+  } else if (bsizeStyleCoord->ConvertsToPercentage()) {
+    SetPctBSize(bsizeStyleCoord->ToPercentage());
+  }
+
+  for (nsTableCellFrame* kidFrame = GetFirstCell(); kidFrame;
+       kidFrame = kidFrame->GetNextCell()) {
+    MOZ_ASSERT(kidFrame->GetWritingMode() == wm);
+    LogicalSize desSize = kidFrame->GetDesiredSize();
+    if (NS_UNCONSTRAINEDSIZE == aReflowInput.AvailableBSize() &&
+        !GetPrevInFlow()) {
+      desSize.BSize(wm) = CalcCellActualBSize(kidFrame, desSize.BSize(wm), wm);
+    }
+    UpdateBSize(desSize.BSize(wm), tableFrame, kidFrame);
+  }
+  return GetInitialBSize();
+}
+
+void nsTableRowFrame::PaintCellBackgroundsForFrame(
+    nsIFrame* aFrame, nsDisplayListBuilder* aBuilder,
+    const nsDisplayListSet& aLists, const nsPoint& aOffset) {
+  const nsPoint toReferenceFrame = aBuilder->ToReferenceFrame(aFrame);
+  for (nsTableCellFrame* cell = GetFirstCell(); cell;
+       cell = cell->GetNextCell()) {
+    if (!cell->ShouldPaintBackground(aBuilder)) {
+      continue;
+    }
+
+    auto cellRect =
+        cell->GetRectRelativeToSelf() + cell->GetNormalPosition() + aOffset;
+    if (!aBuilder->GetDirtyRect().Intersects(cellRect)) {
+      continue;
+    }
+    cellRect += toReferenceFrame;
+    nsDisplayBackgroundImage::AppendBackgroundItemsToTop(
+        aBuilder, aFrame, cellRect, aLists.BorderBackground(), true,
+        aFrame->GetRectRelativeToSelf() + toReferenceFrame, cell);
+  }
+}
+
+void nsTableRowFrame::BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                                       const nsDisplayListSet& aLists) {
+  DisplayOutsetBoxShadow(aBuilder, aLists.BorderBackground());
+
+  PaintCellBackgroundsForFrame(this, aBuilder, aLists);
+
+  DisplayInsetBoxShadow(aBuilder, aLists.BorderBackground());
+
+  DisplayOutline(aBuilder, aLists);
+
+  if (mFrames.IsEmpty() || HidesContent()) {
+    return;
+  }
+
+  for (nsIFrame* kid : mFrames) {
+    BuildDisplayListForChild(aBuilder, kid, aLists);
+  }
+}
+
+LogicalSides nsTableRowFrame::GetLogicalSkipSides() const {
+  LogicalSides skip(mWritingMode);
+  if (MOZ_UNLIKELY(StyleBorder()->mBoxDecorationBreak ==
+                   StyleBoxDecorationBreak::Clone)) {
+    return skip;
+  }
+
+  if (GetPrevInFlow()) {
+    skip += LogicalSide::BStart;
+  }
+  if (GetNextInFlow()) {
+    skip += LogicalSide::BEnd;
+  }
+  return skip;
+}
+
+nscoord nsTableRowFrame::CalcCellActualBSize(nsTableCellFrame* aCellFrame,
+                                             const nscoord& aDesiredBSize,
+                                             WritingMode aWM) {
+  nscoord specifiedBSize = 0;
+
+  const nsStylePosition* position = aCellFrame->StylePosition();
+
+  int32_t rowSpan = GetTableFrame()->GetEffectiveRowSpan(*aCellFrame);
+
+  const auto bsizeStyleCoord =
+      position->BSize(aWM, AnchorPosResolutionParams::From(aCellFrame));
+  if (bsizeStyleCoord->ConvertsToLength()) {
+    specifiedBSize = bsizeStyleCoord->ToLength();
+    if (PresContext()->CompatibilityMode() != eCompatibility_NavQuirks &&
+        position->mBoxSizing == StyleBoxSizing::ContentBox) {
+      specifiedBSize +=
+          aCellFrame->GetLogicalUsedBorderAndPadding(aWM).BStartEnd(aWM);
+    }
+
+    if (1 == rowSpan) {
+      SetFixedBSize(specifiedBSize);
+    }
+  } else if (bsizeStyleCoord->ConvertsToPercentage()) {
+    if (1 == rowSpan) {
+      SetPctBSize(bsizeStyleCoord->ToPercentage());
+    }
+  }
+
+  return std::max(specifiedBSize, aDesiredBSize);
+}
+
+static nscoord CalcAvailISize(nsTableFrame& aTableFrame,
+                              nsTableCellFrame& aCellFrame) {
+  nscoord cellAvailISize = 0;
+  uint32_t colIndex = aCellFrame.ColIndex();
+  int32_t colspan = aTableFrame.GetEffectiveColSpan(aCellFrame);
+  NS_ASSERTION(colspan > 0, "effective colspan should be positive");
+  nsTableFrame* fifTable =
+      static_cast<nsTableFrame*>(aTableFrame.FirstInFlow());
+
+  for (int32_t spanX = 0; spanX < colspan; spanX++) {
+    cellAvailISize += fifTable->GetColumnISizeFromFirstInFlow(colIndex + spanX);
+    if (spanX > 0 && aTableFrame.ColumnHasCellSpacingBefore(colIndex + spanX)) {
+      cellAvailISize += aTableFrame.GetColSpacing(colIndex + spanX - 1);
+    }
+  }
+  return cellAvailISize;
+}
+
+static nscoord GetSpaceBetween(int32_t aPrevColIndex, int32_t aColIndex,
+                               int32_t aColSpan, nsTableFrame& aTableFrame,
+                               bool aCheckVisibility) {
+  nscoord space = 0;
+  int32_t colIdx;
+  nsTableFrame* fifTable =
+      static_cast<nsTableFrame*>(aTableFrame.FirstInFlow());
+  for (colIdx = aPrevColIndex + 1; aColIndex > colIdx; colIdx++) {
+    bool isCollapsed = false;
+    if (!aCheckVisibility) {
+      space += fifTable->GetColumnISizeFromFirstInFlow(colIdx);
+    } else {
+      nsTableColFrame* colFrame = aTableFrame.GetColFrame(colIdx);
+      const nsStyleVisibility* colVis = colFrame->StyleVisibility();
+      bool collapseCol = StyleVisibility::Collapse == colVis->mVisible;
+      nsIFrame* cgFrame = colFrame->GetParent();
+      const nsStyleVisibility* groupVis = cgFrame->StyleVisibility();
+      bool collapseGroup = StyleVisibility::Collapse == groupVis->mVisible;
+      isCollapsed = collapseCol || collapseGroup;
+      if (!isCollapsed) {
+        space += fifTable->GetColumnISizeFromFirstInFlow(colIdx);
+      }
+    }
+    if (!isCollapsed && aTableFrame.ColumnHasCellSpacingBefore(colIdx)) {
+      space += aTableFrame.GetColSpacing(colIdx - 1);
+    }
+  }
+  return space;
+}
+
+static nscoord CalcBSizeFromUnpaginatedBSize(nsTableRowFrame& aRow,
+                                             WritingMode aWM) {
+  nscoord bsize = 0;
+  nsTableRowFrame* firstInFlow =
+      static_cast<nsTableRowFrame*>(aRow.FirstInFlow());
+  if (firstInFlow->HasUnpaginatedBSize()) {
+    bsize = firstInFlow->GetUnpaginatedBSize();
+    for (nsIFrame* prevInFlow = aRow.GetPrevInFlow(); prevInFlow;
+         prevInFlow = prevInFlow->GetPrevInFlow()) {
+      bsize -= prevInFlow->BSize(aWM);
+    }
+  }
+  return std::max(bsize, 0);
+}
+
+void nsTableRowFrame::ReflowChildren(nsPresContext* aPresContext,
+                                     ReflowOutput& aDesiredSize,
+                                     const ReflowInput& aReflowInput,
+                                     nsTableFrame& aTableFrame,
+                                     nsReflowStatus& aStatus) {
+  aStatus.Reset();
+
+  const bool isPaginated = aPresContext->IsPaginated();
+  const bool borderCollapse = aTableFrame.IsBorderCollapse();
+
+  int32_t cellColSpan =
+      1;  
+
+  int32_t prevColIndex = -1;
+  nscoord iCoord = 0;  
+
+  nscoord cellMaxBSize = 0;
+
+  WritingMode wm = aReflowInput.GetWritingMode();
+  nsSize containerSize = aReflowInput.ComputedSizeAsContainerIfConstrained();
+  bool hasOrthogonalCell = false;
+
+  for (nsTableCellFrame* kidFrame = GetFirstCell(); kidFrame;
+       kidFrame = kidFrame->GetNextCell()) {
+    if (kidFrame->Inner()->GetWritingMode().IsOrthogonalTo(wm)) {
+      hasOrthogonalCell = true;
+    }
+    bool doReflowChild = true;
+    if (!aReflowInput.ShouldReflowAllKids() && !aTableFrame.IsGeometryDirty() &&
+        !kidFrame->IsSubtreeDirty()) {
+      if (!aReflowInput.mFlags.mSpecialBSizeReflow) {
+        doReflowChild = false;
+      }
+    } else if (NS_UNCONSTRAINEDSIZE != aReflowInput.AvailableBSize()) {
+      if (aTableFrame.GetEffectiveRowSpan(*kidFrame) > 1) {
+        doReflowChild = false;
+      }
+    }
+    if (aReflowInput.mFlags.mSpecialBSizeReflow && !isPaginated &&
+        !kidFrame->HasAnyStateBits(NS_FRAME_CONTAINS_RELATIVE_BSIZE)) {
+      continue;
+    }
+
+    uint32_t cellColIndex = kidFrame->ColIndex();
+    cellColSpan = aTableFrame.GetEffectiveColSpan(*kidFrame);
+
+    if (prevColIndex != (static_cast<int32_t>(cellColIndex) - 1)) {
+      iCoord += GetSpaceBetween(prevColIndex, cellColIndex, cellColSpan,
+                                aTableFrame, false);
+    }
+
+    prevColIndex = cellColIndex + (cellColSpan - 1);
+
+    nsRect kidRect = kidFrame->GetRect();
+    LogicalPoint origKidNormalPosition =
+        kidFrame->GetLogicalNormalPosition(wm, containerSize);
+
+    nsRect kidInkOverflow = kidFrame->InkOverflowRect();
+    LogicalPoint kidPosition(wm, iCoord, 0);
+    bool firstReflow = kidFrame->HasAnyStateBits(NS_FRAME_FIRST_REFLOW);
+
+    if (doReflowChild) {
+      nscoord availCellISize = CalcAvailISize(aTableFrame, *kidFrame);
+
+      Maybe<TableCellReflowInput> kidReflowInput;
+      ReflowOutput desiredSize(aReflowInput);
+
+      NS_ASSERTION(kidFrame->GetWritingMode() == wm,
+                   "expected consistent writing-mode within table");
+      LogicalSize cellDesiredSize = kidFrame->GetDesiredSize();
+      if (availCellISize != kidFrame->GetPriorAvailISize() ||
+          cellDesiredSize.ISize(wm) > kidFrame->GetPriorAvailISize() ||
+          HasAnyStateBits(NS_FRAME_IS_DIRTY) || isPaginated ||
+          kidFrame->IsSubtreeDirty() ||
+          kidFrame->HasAnyStateBits(NS_FRAME_CONTAINS_RELATIVE_BSIZE) ||
+          kidFrame->BCBordersChanged() || HasPctBSize()) {
+        LogicalSize kidAvailSize(wm, availCellISize,
+                                 aReflowInput.AvailableBSize());
+
+        kidReflowInput.emplace(aPresContext, aReflowInput, kidFrame,
+                               kidAvailSize,
+                               ReflowInput::InitFlag::CallerWillInit);
+        InitChildReflowInput(*aPresContext, kidAvailSize, borderCollapse,
+                             *kidReflowInput);
+
+        nsReflowStatus status;
+        ReflowChild(kidFrame, aPresContext, desiredSize, *kidReflowInput, wm,
+                    kidPosition, containerSize, ReflowChildFlags::Default,
+                    status);
+
+        if (status.IsIncomplete()) {
+          aStatus.Reset();
+          aStatus.SetIncomplete();
+        }
+      } else {
+        if (iCoord != origKidNormalPosition.I(wm)) {
+          kidFrame->InvalidateFrameSubtree();
+        }
+
+        desiredSize.SetSize(wm, cellDesiredSize);
+        desiredSize.mOverflowAreas = kidFrame->GetOverflowAreas();
+      }
+
+      if (NS_UNCONSTRAINEDSIZE == aReflowInput.AvailableBSize()) {
+        if (!GetPrevInFlow()) {
+          desiredSize.BSize(wm) =
+              CalcCellActualBSize(kidFrame, desiredSize.BSize(wm), wm);
+        }
+        UpdateBSize(desiredSize.BSize(wm), &aTableFrame, kidFrame);
+      } else {
+        cellMaxBSize = std::max(cellMaxBSize, desiredSize.BSize(wm));
+        int32_t rowSpan = aTableFrame.GetEffectiveRowSpan(*kidFrame);
+        if (1 == rowSpan) {
+          SetContentBSize(cellMaxBSize);
+        }
+      }
+
+      desiredSize.ISize(wm) = availCellISize;
+
+      ReflowChildFlags flags = ReflowChildFlags::Default;
+
+      if (kidReflowInput) {
+        flags = ReflowChildFlags::ApplyRelativePositioning;
+      } else if (kidFrame->IsRelativelyOrStickyPositioned()) {
+        nsMargin* computedOffsetProp =
+            kidFrame->GetProperty(nsIFrame::ComputedOffsetProperty());
+
+        LogicalMargin computedOffsets(
+            wm, computedOffsetProp ? *computedOffsetProp : nsMargin());
+        ReflowInput::ApplyRelativePositioning(kidFrame, wm, computedOffsets,
+                                              &kidPosition, containerSize);
+      }
+
+      FinishReflowChild(kidFrame, aPresContext, desiredSize,
+                        kidReflowInput.ptrOr(nullptr), wm, kidPosition,
+                        containerSize, flags);
+
+      nsTableFrame* tableFrame = GetTableFrame();
+      if (tableFrame->IsBorderCollapse()) {
+        nsTableFrame::InvalidateTableFrame(kidFrame, kidRect, kidInkOverflow,
+                                           firstReflow);
+      }
+
+      iCoord += desiredSize.ISize(wm);
+    } else {
+      if (iCoord != origKidNormalPosition.I(wm)) {
+        kidFrame->InvalidateFrameSubtree();
+        kidFrame->MovePositionBy(
+            wm, LogicalPoint(wm, iCoord - origKidNormalPosition.I(wm), 0));
+        kidFrame->InvalidateFrameSubtree();
+      }
+      iCoord += kidFrame->ISize(wm);
+
+      if (kidFrame->GetNextInFlow()) {
+        aStatus.Reset();
+        aStatus.SetIncomplete();
+      }
+    }
+    ConsiderChildOverflow(aDesiredSize.mOverflowAreas, kidFrame);
+    iCoord += aTableFrame.GetColSpacing(cellColIndex);
+  }
+
+  aDesiredSize.ISize(wm) = aReflowInput.AvailableISize();
+
+  if (aReflowInput.mFlags.mSpecialBSizeReflow) {
+    aDesiredSize.BSize(wm) = BSize(wm);
+  } else if (NS_UNCONSTRAINEDSIZE == aReflowInput.AvailableBSize()) {
+    aDesiredSize.BSize(wm) = CalcBSize(aReflowInput);
+    if (GetPrevInFlow()) {
+      nscoord bsize = CalcBSizeFromUnpaginatedBSize(*this, wm);
+      aDesiredSize.BSize(wm) = std::max(aDesiredSize.BSize(wm), bsize);
+    } else {
+      if (isPaginated && HasStyleBSize()) {
+        SetUnpaginatedBSize(aDesiredSize.BSize(wm));
+      }
+      if (isPaginated && HasUnpaginatedBSize()) {
+        aDesiredSize.BSize(wm) =
+            std::max(aDesiredSize.BSize(wm), GetUnpaginatedBSize());
+      }
+    }
+  } else {  
+    nscoord styleBSize = CalcBSizeFromUnpaginatedBSize(*this, wm);
+    if (styleBSize > aReflowInput.AvailableBSize()) {
+      styleBSize = aReflowInput.AvailableBSize();
+      aStatus.SetIncomplete();
+    }
+    aDesiredSize.BSize(wm) = std::max(cellMaxBSize, styleBSize);
+  }
+
+  if (wm.IsVerticalRL()) {
+    for (nsIFrame* kidFrame : mFrames) {
+      if (kidFrame->BSize(wm) != aDesiredSize.BSize(wm)) {
+        kidFrame->MovePositionBy(
+            wm,
+            LogicalPoint(wm, 0, kidFrame->BSize(wm) - aDesiredSize.BSize(wm)));
+      }
+    }
+  }
+
+  aDesiredSize.UnionOverflowAreasWithDesiredBounds();
+  FinishAndStoreOverflow(&aDesiredSize);
+
+  if (hasOrthogonalCell) {
+    for (nsTableCellFrame* kidFrame = GetFirstCell(); kidFrame;
+         kidFrame = kidFrame->GetNextCell()) {
+      if (kidFrame->Inner()->GetWritingMode().IsOrthogonalTo(wm)) {
+        LogicalSize kidAvailSize(wm, kidFrame->GetRectRelativeToSelf().Size());
+        kidAvailSize.BSize(wm) = aDesiredSize.BSize(wm);
+
+        TableCellReflowInput kidReflowInput(
+            aPresContext, aReflowInput, kidFrame, kidAvailSize,
+            ReflowInput::InitFlag::CallerWillInit);
+        kidReflowInput.mFlags.mOrthogonalCellFinalReflow = true;
+        InitChildReflowInput(*aPresContext, kidAvailSize, borderCollapse,
+                             kidReflowInput);
+
+        nsReflowStatus status;
+        ReflowOutput reflowOutput(wm);
+        ReflowChild(kidFrame, aPresContext, reflowOutput, kidReflowInput, wm,
+                    kidFrame->GetLogicalPosition(containerSize), containerSize,
+                    ReflowChildFlags::Default, status);
+      }
+    }
+  }
+}
+
+void nsTableRowFrame::Reflow(nsPresContext* aPresContext,
+                             ReflowOutput& aDesiredSize,
+                             const ReflowInput& aReflowInput,
+                             nsReflowStatus& aStatus) {
+  MarkInReflow();
+  DO_GLOBAL_REFLOW_COUNT("nsTableRowFrame");
+  MOZ_ASSERT(aStatus.IsEmpty(), "Caller should pass a fresh reflow status!");
+
+  WritingMode wm = aReflowInput.GetWritingMode();
+
+  nsTableFrame* tableFrame = GetTableFrame();
+  const nsStyleVisibility* rowVis = StyleVisibility();
+  bool collapseRow = StyleVisibility::Collapse == rowVis->mVisible;
+  if (collapseRow) {
+    tableFrame->SetNeedToCollapse(true);
+  }
+
+  nsTableFrame::CheckRequestSpecialBSizeReflow(aReflowInput);
+
+  InitHasCellWithStyleBSize(tableFrame);
+
+  ReflowChildren(aPresContext, aDesiredSize, aReflowInput, *tableFrame,
+                 aStatus);
+
+  if (aPresContext->IsPaginated() && !aStatus.IsFullyComplete() &&
+      ShouldAvoidBreakInside(aReflowInput)) {
+    aStatus.SetInlineLineBreakBeforeAndReset();
+  }
+
+  aDesiredSize.ISize(wm) = aReflowInput.AvailableISize();
+
+  if (!GetParent()->HasAnyStateBits(NS_FRAME_FIRST_REFLOW) &&
+      nsSize(aDesiredSize.Width(), aDesiredSize.Height()) != mRect.Size()) {
+    InvalidateFrame();
+  }
+
+  PushDirtyBitToAbsoluteFrames();
+}
+
+nscoord nsTableRowFrame::ReflowCellFrame(nsPresContext* aPresContext,
+                                         const ReflowInput& aReflowInput,
+                                         bool aIsTopOfPage,
+                                         nsTableCellFrame* aCellFrame,
+                                         nscoord aAvailableBSize,
+                                         nsReflowStatus& aStatus) {
+  MOZ_ASSERT(aPresContext->IsPaginated(),
+             "ReflowCellFrame currently supports only paged media!");
+  MOZ_ASSERT(aAvailableBSize != NS_UNCONSTRAINEDSIZE,
+             "Why split cell frame if available bsize is unconstrained?");
+  WritingMode wm = aReflowInput.GetWritingMode();
+
+  nsSize containerSize = aCellFrame->GetSize();
+  LogicalRect cellRect = aCellFrame->GetLogicalRect(wm, containerSize);
+  nsRect cellInkOverflow = aCellFrame->InkOverflowRect();
+
+  LogicalSize cellSize = cellRect.Size(wm);
+  LogicalSize availSize(wm, cellRect.ISize(wm), aAvailableBSize);
+  bool borderCollapse = GetTableFrame()->IsBorderCollapse();
+  NS_ASSERTION(aCellFrame->GetWritingMode() == wm,
+               "expected consistent writing-mode within table");
+  TableCellReflowInput cellReflowInput(aPresContext, aReflowInput, aCellFrame,
+                                       availSize,
+                                       ReflowInput::InitFlag::CallerWillInit);
+  InitChildReflowInput(*aPresContext, availSize, borderCollapse,
+                       cellReflowInput);
+  cellReflowInput.mFlags.mIsTopOfPage = aIsTopOfPage;
+
+  ReflowOutput desiredSize(aReflowInput);
+
+  ReflowChild(aCellFrame, aPresContext, desiredSize, cellReflowInput, 0, 0,
+              ReflowChildFlags::NoMoveFrame, aStatus);
+  const bool isTruncated =
+      aAvailableBSize < desiredSize.BSize(wm) &&
+      !aIsTopOfPage;  
+  const bool isCompleteAndNotTruncated = aStatus.IsComplete() && !isTruncated;
+  if (isCompleteAndNotTruncated) {
+    desiredSize.BSize(wm) = aAvailableBSize;
+  }
+  aCellFrame->SetSize(
+      wm, LogicalSize(wm, cellSize.ISize(wm), desiredSize.BSize(wm)));
+
+  if (isCompleteAndNotTruncated) {
+    aCellFrame->AlignChildWithinCell(mMaxCellAscent,
+                                     ForceAlignTopForTableCell::Yes);
+  }
+
+  nsTableFrame::InvalidateTableFrame(
+      aCellFrame, cellRect.GetPhysicalRect(wm, containerSize), cellInkOverflow,
+      aCellFrame->HasAnyStateBits(NS_FRAME_FIRST_REFLOW));
+
+  aCellFrame->DidReflow(aPresContext, nullptr);
+
+  return desiredSize.BSize(wm);
+}
+
+nscoord nsTableRowFrame::CollapseRowIfNecessary(nscoord aRowOffset,
+                                                nscoord aISize,
+                                                bool aCollapseGroup,
+                                                bool& aDidCollapse) {
+  const nsStyleVisibility* rowVis = StyleVisibility();
+  bool collapseRow = StyleVisibility::Collapse == rowVis->mVisible;
+  nsTableFrame* tableFrame =
+      static_cast<nsTableFrame*>(GetTableFrame()->FirstInFlow());
+  if (collapseRow) {
+    tableFrame->SetNeedToCollapse(true);
+  }
+
+  if (aRowOffset != 0) {
+    InvalidateFrameSubtree();
+  }
+
+  WritingMode wm = GetWritingMode();
+
+  nsSize parentSize = GetParent()->GetSize();
+  LogicalRect rowRect = GetLogicalRect(wm, parentSize);
+  nsRect oldRect = mRect;
+  nsRect oldInkOverflow = InkOverflowRect();
+
+  rowRect.BStart(wm) -= aRowOffset;
+  rowRect.ISize(wm) = aISize;
+  OverflowAreas overflow;
+  nscoord shift = 0;
+  nsSize containerSize = mRect.Size();
+
+  if (aCollapseGroup || collapseRow) {
+    aDidCollapse = true;
+    shift = rowRect.BSize(wm);
+    nsTableCellFrame* cellFrame = GetFirstCell();
+    if (cellFrame) {
+      uint32_t rowIndex = cellFrame->RowIndex();
+      shift += tableFrame->GetRowSpacing(rowIndex);
+      while (cellFrame) {
+        LogicalRect cRect = cellFrame->GetLogicalRect(wm, containerSize);
+        if (aRowOffset == 0) {
+          InvalidateFrame();
+        }
+        cRect.BSize(wm) = 0;
+        cellFrame->SetRect(wm, cRect, containerSize);
+        cellFrame = cellFrame->GetNextCell();
+      }
+    } else {
+      shift += tableFrame->GetRowSpacing(GetRowIndex());
+    }
+    rowRect.BSize(wm) = 0;
+  } else {  
+    int32_t prevColIndex = -1;
+    nscoord iPos = 0;  
+    nsTableFrame* fifTable =
+        static_cast<nsTableFrame*>(tableFrame->FirstInFlow());
+
+    for (nsTableCellFrame* cellFrame = GetFirstCell(); cellFrame;
+         cellFrame = cellFrame->GetNextCell()) {
+      uint32_t cellColIndex = cellFrame->ColIndex();
+      int32_t cellColSpan = tableFrame->GetEffectiveColSpan(*cellFrame);
+
+      if (prevColIndex != (static_cast<int32_t>(cellColIndex) - 1)) {
+        iPos += GetSpaceBetween(prevColIndex, cellColIndex, cellColSpan,
+                                *tableFrame, true);
+      }
+      LogicalRect cRect(wm, iPos, 0, 0, rowRect.BSize(wm));
+
+      prevColIndex = cellColIndex + cellColSpan - 1;
+      int32_t actualColSpan = cellColSpan;
+      bool isVisible = false;
+      for (int32_t colIdx = cellColIndex; actualColSpan > 0;
+           colIdx++, actualColSpan--) {
+        nsTableColFrame* colFrame = tableFrame->GetColFrame(colIdx);
+        const nsStyleVisibility* colVis = colFrame->StyleVisibility();
+        bool collapseCol = StyleVisibility::Collapse == colVis->mVisible;
+        nsIFrame* cgFrame = colFrame->GetParent();
+        const nsStyleVisibility* groupVis = cgFrame->StyleVisibility();
+        bool collapseGroup = StyleVisibility::Collapse == groupVis->mVisible;
+        bool isCollapsed = collapseCol || collapseGroup;
+        if (!isCollapsed) {
+          cRect.ISize(wm) += fifTable->GetColumnISizeFromFirstInFlow(colIdx);
+          isVisible = true;
+          if ((actualColSpan > 1)) {
+            nsTableColFrame* nextColFrame = tableFrame->GetColFrame(colIdx + 1);
+            const nsStyleVisibility* nextColVis =
+                nextColFrame->StyleVisibility();
+            if (StyleVisibility::Collapse != nextColVis->mVisible &&
+                tableFrame->ColumnHasCellSpacingBefore(colIdx + 1)) {
+              cRect.ISize(wm) += tableFrame->GetColSpacing(cellColIndex);
+            }
+          }
+        }
+      }
+      iPos += cRect.ISize(wm);
+      if (isVisible) {
+        iPos += tableFrame->GetColSpacing(cellColIndex);
+      }
+      int32_t actualRowSpan = tableFrame->GetEffectiveRowSpan(*cellFrame);
+      nsTableRowFrame* rowFrame = GetNextRow();
+      for (actualRowSpan--; actualRowSpan > 0 && rowFrame; actualRowSpan--) {
+        const nsStyleVisibility* nextRowVis = rowFrame->StyleVisibility();
+        bool collapseNextRow =
+            StyleVisibility::Collapse == nextRowVis->mVisible;
+        if (!collapseNextRow) {
+          LogicalRect nextRect = rowFrame->GetLogicalRect(wm, containerSize);
+          cRect.BSize(wm) += nextRect.BSize(wm) +
+                             tableFrame->GetRowSpacing(rowFrame->GetRowIndex());
+        }
+        rowFrame = rowFrame->GetNextRow();
+      }
+
+      nsRect oldCellRect = cellFrame->GetRect();
+      LogicalPoint oldCellNormalPos =
+          cellFrame->GetLogicalNormalPosition(wm, containerSize);
+
+      nsRect oldCellInkOverflow = cellFrame->InkOverflowRect();
+
+      if (aRowOffset == 0 && cRect.Origin(wm) != oldCellNormalPos) {
+        cellFrame->InvalidateFrameSubtree();
+      }
+
+      cellFrame->MovePositionBy(wm, cRect.Origin(wm) - oldCellNormalPos);
+      cellFrame->SetSize(wm, cRect.Size(wm));
+
+      LogicalRect cellBounds(wm, 0, 0, cRect.ISize(wm), cRect.BSize(wm));
+      nsRect cellPhysicalBounds = cellBounds.GetPhysicalRect(wm, containerSize);
+      OverflowAreas cellOverflow(cellPhysicalBounds, cellPhysicalBounds);
+      cellFrame->FinishAndStoreOverflow(cellOverflow,
+                                        cRect.Size(wm).GetPhysicalSize(wm));
+      ConsiderChildOverflow(overflow, cellFrame);
+
+      if (aRowOffset == 0) {
+        nsTableFrame::InvalidateTableFrame(cellFrame, oldCellRect,
+                                           oldCellInkOverflow, false);
+      }
+    }
+  }
+
+  SetRect(wm, rowRect, containerSize);
+  overflow.UnionAllWith(nsRect(0, 0, rowRect.Width(wm), rowRect.Height(wm)));
+  FinishAndStoreOverflow(overflow, rowRect.Size(wm).GetPhysicalSize(wm));
+  nsTableFrame::InvalidateTableFrame(this, oldRect, oldInkOverflow, false);
+  return shift;
+}
+
+void nsTableRowFrame::InsertCellFrame(nsTableCellFrame* aFrame,
+                                      int32_t aColIndex) {
+  nsTableCellFrame* priorCell = nullptr;
+
+  for (nsTableCellFrame* cellFrame = GetFirstCell(); cellFrame;
+       cellFrame = cellFrame->GetNextCell()) {
+    uint32_t colIndex = cellFrame->ColIndex();
+    if (static_cast<int32_t>(colIndex) < aColIndex) {
+      priorCell = cellFrame;
+    } else {
+      break;
+    }
+  }
+  mFrames.InsertFrame(this, priorCell, aFrame);
+}
+
+nsTableRowFrame* nsTableRowFrame::GetPrevRow() const {
+  nsIFrame* prevSibling = GetPrevSibling();
+  MOZ_ASSERT(
+      !prevSibling || static_cast<nsTableRowFrame*>(do_QueryFrame(prevSibling)),
+      "How do we have a non-row sibling?");
+  return static_cast<nsTableRowFrame*>(prevSibling);
+}
+
+nsTableRowFrame* nsTableRowFrame::GetNextRow() const {
+  nsIFrame* nextSibling = GetNextSibling();
+  MOZ_ASSERT(
+      !nextSibling || static_cast<nsTableRowFrame*>(do_QueryFrame(nextSibling)),
+      "How do we have a non-row sibling?");
+  return static_cast<nsTableRowFrame*>(nextSibling);
+}
+
+NS_DECLARE_FRAME_PROPERTY_SMALL_VALUE(TableRowUnpaginatedBSizeProperty, nscoord)
+
+void nsTableRowFrame::SetUnpaginatedBSize(nscoord aValue) {
+  MOZ_ASSERT(!GetPrevInFlow(),
+             "TableRowUnpaginatedBSizeProperty should only be set on the "
+             "first-in-flow!");
+  AddStateBits(NS_TABLE_ROW_HAS_UNPAGINATED_BSIZE);
+  SetProperty(TableRowUnpaginatedBSizeProperty(), aValue);
+}
+
+nscoord nsTableRowFrame::GetUnpaginatedBSize() const {
+  return GetProperty(TableRowUnpaginatedBSizeProperty());
+}
+
+#ifdef ACCESSIBILITY
+a11y::AccType nsTableRowFrame::AccessibleType() {
+  return a11y::eHTMLTableRowType;
+}
+#endif
+void nsTableRowFrame::InitHasCellWithStyleBSize(nsTableFrame* aTableFrame) {
+  WritingMode wm = GetWritingMode();
+
+  for (nsTableCellFrame* cellFrame = GetFirstCell(); cellFrame;
+       cellFrame = cellFrame->GetNextCell()) {
+    const auto cellBSize = cellFrame->StylePosition()->BSize(
+        wm, AnchorPosResolutionParams::From(cellFrame));
+    if (aTableFrame->GetEffectiveRowSpan(*cellFrame) == 1 &&
+        !cellBSize->IsAuto() &&
+        (cellBSize->ConvertsToLength() || cellBSize->ConvertsToPercentage())) {
+      AddStateBits(NS_ROW_HAS_CELL_WITH_STYLE_BSIZE);
+      return;
+    }
+  }
+  RemoveStateBits(NS_ROW_HAS_CELL_WITH_STYLE_BSIZE);
+}
+
+void nsTableRowFrame::InvalidateFrame(uint32_t aDisplayItemKey,
+                                      bool aRebuildDisplayItems) {
+  nsIFrame::InvalidateFrame(aDisplayItemKey, aRebuildDisplayItems);
+  if (GetTableFrame()->IsBorderCollapse()) {
+    const bool rebuild = StaticPrefs::layout_display_list_retain_sc();
+    GetParent()->InvalidateFrameWithRect(InkOverflowRect() + GetPosition(),
+                                         aDisplayItemKey, rebuild);
+  }
+}
+
+void nsTableRowFrame::InvalidateFrameWithRect(const nsRect& aRect,
+                                              uint32_t aDisplayItemKey,
+                                              bool aRebuildDisplayItems) {
+  nsIFrame::InvalidateFrameWithRect(aRect, aDisplayItemKey,
+                                    aRebuildDisplayItems);
+  GetParent()->InvalidateFrameWithRect(aRect + GetPosition(), aDisplayItemKey,
+                                       aRebuildDisplayItems);
+}
+
+
+nsTableRowFrame* NS_NewTableRowFrame(PresShell* aPresShell,
+                                     ComputedStyle* aStyle) {
+  return new (aPresShell) nsTableRowFrame(aStyle, aPresShell->GetPresContext());
+}
+
+NS_IMPL_FRAMEARENA_HELPERS(nsTableRowFrame)
+
+#ifdef DEBUG_FRAME_DUMP
+nsresult nsTableRowFrame::GetFrameName(nsAString& aResult) const {
+  return MakeFrameName(u"TableRow"_ns, aResult);
+}
+#endif

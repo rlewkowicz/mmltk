@@ -1,0 +1,52 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsIScrollbarMediator_h_
+#define nsIScrollbarMediator_h_
+
+#include "mozilla/ScrollTypes.h"
+#include "nsCoord.h"
+#include "nsQueryFrame.h"
+
+class nsScrollbarFrame;
+class nsIFrame;
+
+class nsIScrollbarMediator : public nsQueryFrame {
+ public:
+  NS_DECL_QUERYFRAME_TARGET(nsIScrollbarMediator)
+
+
+
+  virtual void ScrollByPage(nsScrollbarFrame* aScrollbar, int32_t aDirection,
+                            mozilla::ScrollSnapFlags aSnapFlags =
+                                mozilla::ScrollSnapFlags::Disabled) = 0;
+  virtual void ScrollByWhole(nsScrollbarFrame* aScrollbar, int32_t aDirection,
+                             mozilla::ScrollSnapFlags aSnapFlags =
+                                 mozilla::ScrollSnapFlags::Disabled) = 0;
+  virtual void ScrollByLine(nsScrollbarFrame* aScrollbar, int32_t aDirection,
+                            mozilla::ScrollSnapFlags aSnapFlags =
+                                mozilla::ScrollSnapFlags::Disabled) = 0;
+
+  virtual void ScrollByUnit(nsScrollbarFrame* aScrollbar,
+                            mozilla::ScrollMode aMode, int32_t aDirection,
+                            mozilla::ScrollUnit aUnit,
+                            mozilla::ScrollSnapFlags aSnapFlags =
+                                mozilla::ScrollSnapFlags::Disabled) = 0;
+
+  virtual void RepeatButtonScroll(nsScrollbarFrame* aScrollbar) = 0;
+  virtual void ThumbMoved(nsScrollbarFrame* aScrollbar, nscoord aOldPos,
+                          nscoord aNewPos) = 0;
+  virtual void ScrollbarReleased(nsScrollbarFrame* aScrollbar) = 0;
+  virtual void VisibilityChanged(bool aVisible) = 0;
+
+  virtual nsScrollbarFrame* GetScrollbarBox(bool aVertical) = 0;
+  virtual void ScrollbarActivityStarted() const = 0;
+  virtual void ScrollbarActivityStopped() const = 0;
+
+  virtual bool IsScrollbarOnRight() const = 0;
+
+  virtual bool ShouldSuppressScrollbarRepaints() const = 0;
+};
+
+#endif

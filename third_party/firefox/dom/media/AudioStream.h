@@ -1,0 +1,269 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#if !defined(AudioStream_h_)
+#  define AudioStream_h_
+
+#  include <thread>
+
+#  include "AudioSampleFormat.h"
+#  include "CubebUtils.h"
+#  include "MediaInfo.h"
+#  include "MediaSink.h"
+#  include "WavDumper.h"
+#  include "mozilla/Atomics.h"
+#  include "mozilla/Monitor.h"
+#  include "mozilla/MozPromise.h"
+#  include "mozilla/RefPtr.h"
+#  include "mozilla/SPSCQueue.h"
+#  include "mozilla/TimeStamp.h"
+#  include "mozilla/Types.h"
+#  include "mozilla/UniquePtr.h"
+#  include "nsCOMPtr.h"
+#  include "nsThreadUtils.h"
+
+namespace mozilla {
+
+struct CubebDestroyPolicy {
+  void operator()(cubeb_stream* aStream) const {
+    cubeb_stream_destroy(aStream);
+  }
+};
+
+class AudioStream;
+class FrameHistory;
+class AudioConfig;
+class MOZ_EXPORT SoundTouchAdapter;
+
+struct CallbackInfo {
+  CallbackInfo() = default;
+  CallbackInfo(uint32_t aServiced, uint32_t aUnderrun, uint32_t aOutputRate)
+      : mServiced(aServiced), mUnderrun(aUnderrun), mOutputRate(aOutputRate) {}
+  uint32_t mServiced = 0;
+  uint32_t mUnderrun = 0;
+  uint32_t mOutputRate = 0;
+};
+
+class AudioClock {
+ public:
+  explicit AudioClock(uint32_t aInRate);
+
+  void UpdateFrameHistory(uint32_t aServiced, uint32_t aUnderrun,
+                          bool aAudioThreadChanged);
+
+  int64_t GetPositionInFrames(int64_t aFrames);
+
+  int64_t GetPosition(int64_t frames);
+
+  void SetPlaybackRate(double aPlaybackRate);
+  double GetPlaybackRate() const;
+  void SetPreservesPitch(bool aPreservesPitch);
+  bool GetPreservesPitch() const;
+
+  uint32_t GetInputRate() const { return mInRate; }
+  uint32_t GetOutputRate() const { return mOutRate; }
+
+ private:
+  Atomic<uint32_t> mOutRate;
+  const uint32_t mInRate;
+  bool mPreservesPitch;
+  const UniquePtr<FrameHistory> mFrameHistory
+      MOZ_GUARDED_BY(mMutex)
+          ;
+  Mutex mMutex{"AudioClock"};
+};
+
+class AudioBufferCursor {
+ public:
+  AudioBufferCursor(Span<AudioDataValue> aSpan, uint32_t aChannels,
+                    uint32_t aFrames)
+      : mChannels(aChannels), mSpan(aSpan), mFrames(aFrames) {}
+
+  uint32_t Advance(uint32_t aFrames) {
+    MOZ_DIAGNOSTIC_ASSERT(Contains(aFrames));
+    MOZ_ASSERT(mFrames >= aFrames);
+    mFrames -= aFrames;
+    mOffset += mChannels * aFrames;
+    return aFrames;
+  }
+
+  uint32_t Available() const { return mFrames; }
+
+  AudioDataValue* Ptr() const {
+    MOZ_DIAGNOSTIC_ASSERT(mOffset <= mSpan.Length());
+    return mSpan.Elements() + mOffset;
+  }
+
+ protected:
+  bool Contains(uint32_t aFrames) const {
+    return mSpan.Length() >= mOffset + mChannels * aFrames;
+  }
+  const uint32_t mChannels;
+
+ private:
+  const Span<AudioDataValue> mSpan;
+  size_t mOffset = 0;
+  uint32_t mFrames;
+};
+
+class AudioBufferWriter : public AudioBufferCursor {
+ public:
+  AudioBufferWriter(Span<AudioDataValue> aSpan, uint32_t aChannels,
+                    uint32_t aFrames)
+      : AudioBufferCursor(aSpan, aChannels, aFrames) {}
+
+  uint32_t WriteZeros(uint32_t aFrames) {
+    MOZ_DIAGNOSTIC_ASSERT(Contains(aFrames));
+    memset(Ptr(), 0, sizeof(AudioDataValue) * mChannels * aFrames);
+    return Advance(aFrames);
+  }
+
+  uint32_t Write(const AudioDataValue* aPtr, uint32_t aFrames) {
+    MOZ_DIAGNOSTIC_ASSERT(Contains(aFrames));
+    memcpy(Ptr(), aPtr, sizeof(AudioDataValue) * mChannels * aFrames);
+    return Advance(aFrames);
+  }
+
+  template <typename Function>
+  uint32_t Write(const Function& aFunction, uint32_t aFrames) {
+    MOZ_DIAGNOSTIC_ASSERT(Contains(aFrames));
+    return Advance(aFunction(Ptr(), aFrames));
+  }
+
+  using AudioBufferCursor::Available;
+};
+
+class AudioStream final {
+  virtual ~AudioStream();
+
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(AudioStream)
+
+  class Chunk {
+   public:
+    virtual const AudioDataValue* Data() const = 0;
+    virtual uint32_t Frames() const = 0;
+    virtual uint32_t Channels() const = 0;
+    virtual uint32_t Rate() const = 0;
+    virtual AudioDataValue* GetWritable() const = 0;
+    virtual ~Chunk() = default;
+  };
+
+  class DataSource {
+   public:
+    virtual uint32_t PopFrames(AudioDataValue* aAudio, uint32_t aFrames,
+                               bool aAudioThreadChanged) = 0;
+    virtual bool Ended() const = 0;
+
+   protected:
+    virtual ~DataSource() = default;
+  };
+
+  AudioStream(DataSource& aSource, uint32_t aInRate, uint32_t aOutputChannels,
+              AudioConfig::ChannelLayout::ChannelMap aChannelMap);
+
+  nsresult Init(AudioDeviceInfo* aSinkInfo);
+
+  void ShutDown();
+
+  void SetVolume(double aVolume);
+
+  void SetStreamName(const nsAString& aStreamName);
+
+  RefPtr<MediaSink::EndedPromise> Start();
+
+  void Pause();
+
+  void Resume();
+
+  int64_t GetPosition();
+
+  int64_t GetPositionInFrames();
+
+  uint32_t GetOutChannels() const { return mOutChannels; }
+
+  nsresult SetPlaybackRate(double aPlaybackRate);
+  nsresult SetPreservesPitch(bool aPreservesPitch);
+
+  size_t SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const;
+
+  bool IsPlaybackCompleted() const;
+
+  bool CallbackStarted() const { return mCallbacksStarted; }
+
+ protected:
+  friend class AudioClock;
+
+  int64_t GetPositionInFramesUnlocked();
+
+ private:
+  nsresult OpenCubeb(cubeb* aContext, cubeb_stream_params& aParams,
+                     TimeStamp aStartTime, bool aIsFirst);
+
+  static long DataCallback_S(cubeb_stream*, void* aThis,
+                             const void* ,
+                             void* aOutputBuffer, long aFrames) {
+    return static_cast<AudioStream*>(aThis)->DataCallback(aOutputBuffer,
+                                                          aFrames);
+  }
+
+  static void StateCallback_S(cubeb_stream*, void* aThis, cubeb_state aState) {
+    static_cast<AudioStream*>(aThis)->StateCallback(aState);
+  }
+
+  long DataCallback(void* aBuffer, long aFrames);
+  void StateCallback(cubeb_state aState);
+
+  nsresult EnsureTimeStretcherInitialized();
+  void GetUnprocessed(AudioBufferWriter& aWriter);
+  void GetTimeStretched(AudioBufferWriter& aWriter);
+  void UpdatePlaybackRateIfNeeded();
+
+  bool IsValidAudioFormat(Chunk* aChunk) MOZ_REQUIRES(mMonitor);
+
+  template <typename Function, typename... Args>
+  int InvokeCubeb(Function aFunction, Args&&... aArgs) MOZ_REQUIRES(mMonitor);
+  bool CheckThreadIdChanged();
+  void AssertIsOnAudioThread() const;
+
+  SoundTouchAdapter* mTimeStretcher;
+  AudioClock mAudioClock;
+
+  WavDumper mDumpFile;
+
+  const AudioConfig::ChannelLayout::ChannelMap mChannelMap;
+
+  Monitor mMonitor;
+
+  const uint32_t mOutChannels;
+
+  RefPtr<CubebUtils::CubebHandle> mCubeb;
+  UniquePtr<cubeb_stream, CubebDestroyPolicy> mCubebStream;
+
+  enum StreamState {
+    INITIALIZED,  
+    STARTED,      
+    STOPPED,      
+    DRAINED,      
+    ERRORED,      
+    SHUTDOWN      
+  };
+
+  std::atomic<StreamState> mState;
+
+  DataSource& mDataSource;
+
+  RefPtr<AudioDeviceInfo> mSinkInfo;
+  std::atomic<std::thread::id> mAudioThreadId;
+  MozPromiseHolder<MediaSink::EndedPromise> mEndedPromise
+      MOZ_GUARDED_BY(mMonitor);
+  std::atomic<bool> mPlaybackComplete;
+  std::atomic<float> mPlaybackRate;
+  std::atomic<bool> mPreservesPitch;
+  bool mAudioThreadChanged = false;
+  Atomic<bool> mCallbacksStarted;
+};
+
+}  
+
+#endif

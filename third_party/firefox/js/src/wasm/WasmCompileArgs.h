@@ -1,0 +1,425 @@
+/*
+ * Copyright 2021 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#ifndef wasm_compile_args_h
+#define wasm_compile_args_h
+
+#include "mozilla/RefPtr.h"
+#include "mozilla/SHA1.h"
+#include "mozilla/TypedEnumBits.h"
+#include "mozilla/Variant.h"
+
+#include "js/Utility.h"
+#include "js/WasmFeatures.h"
+#include "wasm/WasmBinaryTypes.h"
+#include "wasm/WasmConstants.h"
+#include "wasm/WasmShareable.h"
+
+namespace js {
+namespace wasm {
+
+enum class Shareable { False, True };
+
+
+enum class Tier {
+  Baseline,
+  Debug = Baseline,
+  Optimized,
+  Serialized = Optimized
+};
+
+static constexpr const char* ToString(Tier tier) {
+  switch (tier) {
+    case wasm::Tier::Baseline:
+      return "baseline";
+    case wasm::Tier::Optimized:
+      return "optimized";
+    default:
+      return "unknown";
+  }
+}
+
+
+class Tiers {
+  Tier t_[2];
+  uint32_t n_;
+
+ public:
+  explicit Tiers() { n_ = 0; }
+  explicit Tiers(Tier t) {
+    t_[0] = t;
+    n_ = 1;
+  }
+  explicit Tiers(Tier t, Tier u) {
+    MOZ_ASSERT(t != u);
+    t_[0] = t;
+    t_[1] = u;
+    n_ = 2;
+  }
+
+  Tier* begin() { return t_; }
+  Tier* end() { return t_ + n_; }
+};
+
+struct BuiltinModuleIds {
+  BuiltinModuleIds() = default;
+
+  bool selfTest = false;
+  bool intGemm = false;
+  bool jsString = false;
+  bool jsStringConstants = false;
+  SharedChars jsStringConstantsNamespace;
+
+  bool hasNone() const {
+    return !selfTest && !intGemm && !jsString && !jsStringConstants;
+  }
+};
+
+
+struct FeatureOptions {
+  FeatureOptions()
+      : disableOptimizingCompiler(false),
+        mozIntGemm(false),
+        isBuiltinModule(false),
+        jsStringBuiltins(false),
+        jsStringConstants(false) {}
+
+  bool disableOptimizingCompiler;
+  bool mozIntGemm;
+
+  bool isBuiltinModule;
+
+  bool jsStringBuiltins;
+  bool jsStringConstants;
+  SharedChars jsStringConstantsNamespace;
+
+  [[nodiscard]] bool init(JSContext* cx, HandleValue val);
+};
+
+
+struct FeatureArgs {
+  FeatureArgs()
+      :
+#define WASM_FEATURE(NAME, LOWER_NAME, ...) LOWER_NAME(false),
+        JS_FOR_WASM_FEATURES(WASM_FEATURE)
+#undef WASM_FEATURE
+            sharedMemory(Shareable::False),
+        simd(false),
+        isBuiltinModule(false),
+        builtinModules() {
+  }
+  FeatureArgs(const FeatureArgs&) = default;
+  FeatureArgs& operator=(const FeatureArgs&) = default;
+  FeatureArgs(FeatureArgs&&) = default;
+  FeatureArgs& operator=(FeatureArgs&&) = default;
+
+  static FeatureArgs build(JSContext* cx, const FeatureOptions& options);
+  static FeatureArgs allEnabled() {
+    FeatureArgs args;
+#define WASM_FEATURE(NAME, LOWER_NAME, ...) args.LOWER_NAME = true;
+    JS_FOR_WASM_FEATURES(WASM_FEATURE)
+#undef WASM_FEATURE
+    args.sharedMemory = Shareable::True;
+    args.simd = true;
+    return args;
+  }
+
+#define WASM_FEATURE(NAME, LOWER_NAME, ...) bool LOWER_NAME;
+  JS_FOR_WASM_FEATURES(WASM_FEATURE)
+#undef WASM_FEATURE
+
+  Shareable sharedMemory;
+  bool simd;
+  bool isBuiltinModule;
+  BuiltinModuleIds builtinModules;
+};
+
+enum class FeatureUsage : uint8_t {
+  None = 0x0,
+  LegacyExceptions = 0x1,
+  ReturnCall = 0x2,
+};
+
+using FeatureUsageVector = Vector<FeatureUsage, 0, SystemAllocPolicy>;
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(FeatureUsage);
+
+
+enum class ScriptedCallerKind : uint8_t {
+  IntroducedFilename,
+  Url,
+  SelfHosted,
+};
+
+struct ScriptedCaller {
+  UniqueChars source;  
+  uint32_t line;
+  ScriptedCallerKind kind;
+
+  ScriptedCaller() : line(0), kind(ScriptedCallerKind::IntroducedFilename) {}
+  ScriptedCaller(UniqueChars&& source, ScriptedCallerKind kind, uint32_t line)
+      : source(std::move(source)), line(line), kind(kind) {}
+
+  static ScriptedCaller selfHosted(JSContext* cx);
+
+  bool isSelfHosted() const { return kind == ScriptedCallerKind::SelfHosted; }
+};
+
+
+enum class CompileArgsError {
+  OutOfMemory,
+  NoCompiler,
+};
+
+
+struct CompileArgs;
+using MutableCompileArgs = RefPtr<CompileArgs>;
+using SharedCompileArgs = RefPtr<const CompileArgs>;
+
+struct CompileArgs : ShareableBase<CompileArgs> {
+  ScriptedCaller scriptedCaller;
+  UniqueChars sourceMapURL;
+
+  bool baselineEnabled;
+  bool ionEnabled;
+  bool debugEnabled;
+  bool forceTiering;
+
+  FeatureArgs features;
+
+
+  static SharedCompileArgs build(JSContext* cx, ScriptedCaller&& scriptedCaller,
+                                 const FeatureOptions& options,
+                                 CompileArgsError* error);
+  static SharedCompileArgs buildAndReport(JSContext* cx,
+                                          ScriptedCaller&& scriptedCaller,
+                                          const FeatureOptions& options,
+                                          bool reportOOM = false);
+  static SharedCompileArgs buildForValidation(const FeatureArgs& args);
+
+  explicit CompileArgs()
+      : scriptedCaller(),
+        baselineEnabled(false),
+        ionEnabled(false),
+        debugEnabled(false),
+        forceTiering(false) {}
+};
+
+
+struct CompileArgs;
+class Decoder;
+
+struct CompilerEnvironment {
+  enum State { InitialWithArgs, InitialWithModeTierDebug, Computed };
+
+  State state_;
+  union {
+    const CompileArgs* args_;
+
+    struct {
+      CompileMode mode_;
+      Tier tier_;
+      DebugEnabled debug_;
+    };
+  };
+
+ public:
+  explicit CompilerEnvironment(const CompileArgs& args);
+
+  CompilerEnvironment(CompileMode mode, Tier tier, DebugEnabled debugEnabled);
+
+  void computeParameters(const ModuleMetadata& moduleMeta);
+
+  void computeParameters();
+
+  bool isComputed() const { return state_ == Computed; }
+  CompileMode mode() const {
+    MOZ_ASSERT(isComputed());
+    return mode_;
+  }
+  CompileState initialState() const {
+    switch (mode()) {
+      case CompileMode::Once:
+        return CompileState::Once;
+      case CompileMode::EagerTiering:
+        return CompileState::EagerTier1;
+      case CompileMode::LazyTiering:
+        return CompileState::LazyTier1;
+      default:
+        MOZ_CRASH();
+    }
+  }
+  Tier tier() const {
+    MOZ_ASSERT(isComputed());
+    return tier_;
+  }
+  DebugEnabled debug() const {
+    MOZ_ASSERT(isComputed());
+    return debug_;
+  }
+  bool debugEnabled() const { return debug() == DebugEnabled::True; }
+};
+
+class BytecodeSource {
+  BytecodeSpan env_;
+  BytecodeSpan code_;
+  BytecodeSpan tail_;
+
+  size_t envOffset() const { return 0; }
+  size_t codeOffset() const { return envOffset() + envLength(); }
+  size_t tailOffset() const { return codeOffset() + codeLength(); }
+
+  size_t envLength() const { return env_.size(); }
+  size_t codeLength() const { return code_.size(); }
+  size_t tailLength() const { return tail_.size(); }
+
+ public:
+  BytecodeSource() = default;
+
+  BytecodeSource(const BytecodeSpan& envSpan, const BytecodeSpan& codeSpan,
+                 const BytecodeSpan& tailSpan)
+      : env_(envSpan), code_(codeSpan), tail_(tailSpan) {}
+
+  BytecodeSource(const uint8_t* begin, size_t length);
+
+  BytecodeSource(const BytecodeSource&) = default;
+  BytecodeSource& operator=(const BytecodeSource&) = default;
+  BytecodeSource(BytecodeSource&&) = default;
+  BytecodeSource& operator=(BytecodeSource&&) = default;
+
+  size_t length() const { return env_.size() + code_.size() + tail_.size(); }
+
+  bool hasCodeSection() const { return code_.size() != 0; }
+
+  BytecodeRange envRange() const {
+    return BytecodeRange(envOffset(), envLength());
+  }
+  BytecodeRange codeRange() const {
+    MOZ_ASSERT(hasCodeSection());
+    return BytecodeRange(codeOffset(), codeLength());
+  }
+  BytecodeRange tailRange() const {
+    MOZ_ASSERT(hasCodeSection());
+    return BytecodeRange(tailOffset(), tailLength());
+  }
+
+  BytecodeSpan envSpan() const { return env_; }
+  BytecodeSpan codeSpan() const {
+    MOZ_ASSERT(hasCodeSection());
+    return code_;
+  }
+  BytecodeSpan tailSpan() const {
+    MOZ_ASSERT(hasCodeSection());
+    return tail_;
+  }
+  BytecodeSpan getSpan(const BytecodeRange& range) const {
+    if (range.end <= codeOffset()) {
+      return range.toSpan(env_);
+    }
+
+    if (range.end <= tailOffset()) {
+      MOZ_RELEASE_ASSERT(range.start >= codeOffset());
+      return range.relativeTo(codeRange()).toSpan(code_);
+    }
+
+    MOZ_RELEASE_ASSERT(range.start >= tailOffset());
+    return range.relativeTo(tailRange()).toSpan(tail_);
+  }
+
+  void copyTo(uint8_t* dest) const {
+    memcpy(dest + envOffset(), env_.data(), env_.size());
+    memcpy(dest + codeOffset(), code_.data(), code_.size());
+    memcpy(dest + tailOffset(), tail_.data(), tail_.size());
+  }
+
+  void computeHash(mozilla::SHA1Sum::Hash* hash) const {
+    mozilla::SHA1Sum sha1Sum;
+    sha1Sum.update(env_.data(), env_.size());
+    sha1Sum.update(code_.data(), code_.size());
+    sha1Sum.update(tail_.data(), tail_.size());
+    sha1Sum.finish(*hash);
+  }
+};
+
+class BytecodeBuffer {
+  SharedBytes env_;
+  SharedBytes code_;
+  SharedBytes tail_;
+  BytecodeSource source_;
+
+ public:
+  BytecodeBuffer() = default;
+  BytecodeBuffer(const ShareableBytes* env, const ShareableBytes* code,
+                 const ShareableBytes* tail);
+  [[nodiscard]]
+  static bool fromSource(const BytecodeSource& bytecodeSource,
+                         BytecodeBuffer* bytecodeBuffer);
+
+  BytecodeBuffer(const BytecodeBuffer&) = default;
+  BytecodeBuffer& operator=(const BytecodeBuffer&) = default;
+  BytecodeBuffer(BytecodeBuffer&&) = default;
+  BytecodeBuffer& operator=(BytecodeBuffer&&) = default;
+
+  const BytecodeSource& source() const { return source_; }
+
+  SharedBytes codeSection() const { return code_; }
+};
+
+class BytecodeBufferOrSource {
+  mozilla::Variant<BytecodeBuffer, BytecodeSource> data_;
+
+ public:
+  BytecodeBufferOrSource() : data_(BytecodeSource()) {}
+  explicit BytecodeBufferOrSource(BytecodeBuffer&& buffer)
+      : data_(std::move(buffer)) {}
+  explicit BytecodeBufferOrSource(const BytecodeSource& source)
+      : data_(source) {}
+
+  BytecodeBufferOrSource(const BytecodeBufferOrSource&) = default;
+  BytecodeBufferOrSource& operator=(const BytecodeBufferOrSource&) = default;
+
+  bool hasBuffer() const { return data_.is<BytecodeBuffer>(); }
+  const BytecodeBuffer& buffer() const {
+    MOZ_RELEASE_ASSERT(hasBuffer());
+    return data_.as<BytecodeBuffer>();
+  }
+  const BytecodeSource& source() const {
+    if (data_.is<BytecodeSource>()) {
+      return data_.as<BytecodeSource>();
+    }
+    MOZ_RELEASE_ASSERT(data_.is<BytecodeBuffer>());
+    return data_.as<BytecodeBuffer>().source();
+  }
+
+  [[nodiscard]] bool getOrCreateBuffer(BytecodeBuffer* result) const {
+    if (hasBuffer()) {
+      *result = buffer();
+    }
+    return BytecodeBuffer::fromSource(source(), result);
+  }
+
+  [[nodiscard]] SharedBytes getOrCreateCodeSection() const {
+    if (hasBuffer()) {
+      return buffer().codeSection();
+    }
+    return ShareableBytes::fromSpan(source().codeSpan());
+  }
+};
+
+}  
+}  
+
+#endif  // wasm_compile_args_h

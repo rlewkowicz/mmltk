@@ -1,0 +1,76 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef vm_ArrayObject_h
+#define vm_ArrayObject_h
+
+#include "vm/JSContext.h"
+#include "vm/NativeObject.h"
+
+namespace js {
+
+class AutoSetNewObjectMetadata;
+
+class ArrayObject : public NativeObject {
+ public:
+  static const uint32_t EagerAllocationMaxLength =
+      (1 << 16) - ObjectElements::VALUES_PER_HEADER - 1;
+
+  static const JSClass class_;
+
+  bool lengthIsWritable() const {
+    return !getElementsHeader()->hasNonwritableArrayLength();
+  }
+
+  uint32_t length() const { return getElementsHeader()->length; }
+
+  void setNonWritableLength(JSContext* cx) {
+    shrinkCapacityToInitializedLength(cx);
+    assertInt32LengthFuse(cx);
+    getElementsHeader()->setNonwritableArrayLength();
+  }
+
+  void setLengthToInitializedLength() {
+    MOZ_ASSERT(lengthIsWritable());
+    MOZ_ASSERT_IF(length() != getElementsHeader()->length,
+                  !denseElementsAreFrozen());
+    getElementsHeader()->length = getDenseInitializedLength();
+    static_assert(MAX_DENSE_ELEMENTS_COUNT <= INT32_MAX,
+                  "No need to check HasSeenArrayExceedsInt32LengthFuse");
+  }
+
+  void setLength(JSContext* cx, uint32_t length) {
+    MOZ_ASSERT(lengthIsWritable());
+    MOZ_ASSERT_IF(length != getElementsHeader()->length,
+                  !denseElementsAreFrozen());
+    assertInt32LengthFuse(cx);
+    NativeObject::elementsSizeMustNotOverflow();
+    if (MOZ_UNLIKELY(length > INT32_MAX)) {
+      cx->runtime()
+          ->runtimeFuses.ref()
+          .hasSeenArrayExceedsInt32LengthFuse.popFuse(cx);
+    }
+    getElementsHeader()->length = length;
+  }
+
+  void assertInt32LengthFuse(JSContext* cx) {
+    MOZ_ASSERT_IF(length() > INT32_MAX,
+                  !cx->runtime()
+                       ->runtimeFuses.ref()
+                       .hasSeenArrayExceedsInt32LengthFuse.intact());
+  }
+
+  inline DenseElementResult addDenseElementNoLengthChange(JSContext* cx,
+                                                          uint32_t index,
+                                                          const Value& val);
+
+  static MOZ_ALWAYS_INLINE ArrayObject* create(
+      JSContext* cx, gc::AllocKind kind, gc::Heap heap,
+      Handle<SharedShape*> shape, uint32_t length, uint32_t slotSpan,
+      AutoSetNewObjectMetadata& metadata, gc::AllocSite* site = nullptr);
+};
+
+}  
+
+#endif  // vm_ArrayObject_h

@@ -1,0 +1,148 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_Latin1_h
+#define mozilla_Latin1_h
+
+#include <cstddef>
+#include <type_traits>
+
+#include "mozilla/JsRust.h"
+
+#if MOZ_HAS_JSRUST()
+#  include "mozilla/Span.h"
+#  include "encoding_rs_mem.h"
+#endif
+
+namespace mozilla {
+
+namespace detail {
+
+constexpr size_t kShortStringLimitForInlinePaths = 16;
+
+template <typename Char>
+class MakeUnsignedChar {
+ public:
+  using Type = std::make_unsigned_t<Char>;
+};
+
+template <>
+class MakeUnsignedChar<char16_t> {
+ public:
+  using Type = char16_t;
+};
+
+template <>
+class MakeUnsignedChar<char32_t> {
+ public:
+  using Type = char32_t;
+};
+
+}  
+
+template <typename Char>
+constexpr bool IsNonAsciiLatin1(Char aChar) {
+  using UnsignedChar = typename detail::MakeUnsignedChar<Char>::Type;
+  auto uc = static_cast<UnsignedChar>(aChar);
+  return uc >= 0x80 && uc <= 0xFF;
+}
+
+#if MOZ_HAS_JSRUST()
+
+inline bool IsUtf16Latin1(mozilla::Span<const char16_t> aString) {
+  size_t length = aString.Length();
+  const char16_t* ptr = aString.Elements();
+  if (length < mozilla::detail::kShortStringLimitForInlinePaths) {
+    char16_t accu = 0;
+    for (size_t i = 0; i < length; i++) {
+      accu |= ptr[i];
+    }
+    return accu < 0x100;
+  }
+  return encoding_mem_is_utf16_latin1(ptr, length);
+}
+
+inline bool IsUtf8Latin1(mozilla::Span<const char> aString) {
+  return encoding_mem_is_utf8_latin1(aString.Elements(), aString.Length());
+}
+
+inline bool UnsafeIsValidUtf8Latin1(mozilla::Span<const char> aString) {
+  return encoding_mem_is_str_latin1(aString.Elements(), aString.Length());
+}
+
+inline size_t Utf8Latin1UpTo(mozilla::Span<const char> aString) {
+  return encoding_mem_utf8_latin1_up_to(aString.Elements(), aString.Length());
+}
+
+inline size_t UnsafeValidUtf8Lati1UpTo(mozilla::Span<const char> aString) {
+  return encoding_mem_str_latin1_up_to(aString.Elements(), aString.Length());
+}
+
+inline void LossyConvertUtf16toLatin1(mozilla::Span<const char16_t> aSource,
+                                      mozilla::Span<char> aDest) {
+  const char16_t* srcPtr = aSource.Elements();
+  size_t srcLen = aSource.Length();
+  char* dstPtr = aDest.Elements();
+  size_t dstLen = aDest.Length();
+  if (srcLen < mozilla::detail::kShortStringLimitForInlinePaths) {
+    MOZ_ASSERT(dstLen >= srcLen);
+    uint8_t* unsignedPtr = reinterpret_cast<uint8_t*>(dstPtr);
+    const char16_t* end = srcPtr + srcLen;
+    while (srcPtr < end) {
+      *unsignedPtr = static_cast<uint8_t>(*srcPtr);
+      ++srcPtr;
+      ++unsignedPtr;
+    }
+    return;
+  }
+  encoding_mem_convert_utf16_to_latin1_lossy(srcPtr, srcLen, dstPtr, dstLen);
+}
+
+inline size_t LossyConvertUtf8toLatin1(mozilla::Span<const char> aSource,
+                                       mozilla::Span<char> aDest) {
+  return encoding_mem_convert_utf8_to_latin1_lossy(
+      aSource.Elements(), aSource.Length(), aDest.Elements(), aDest.Length());
+}
+
+inline size_t ConvertLatin1toUtf8(mozilla::Span<const char> aSource,
+                                  mozilla::Span<char> aDest) {
+  return encoding_mem_convert_latin1_to_utf8(
+      aSource.Elements(), aSource.Length(), aDest.Elements(), aDest.Length());
+}
+
+inline std::tuple<size_t, size_t> ConvertLatin1toUtf8Partial(
+    mozilla::Span<const char> aSource, mozilla::Span<char> aDest) {
+  size_t srcLen = aSource.Length();
+  size_t dstLen = aDest.Length();
+  encoding_mem_convert_latin1_to_utf8_partial(aSource.Elements(), &srcLen,
+                                              aDest.Elements(), &dstLen);
+  return std::make_tuple(srcLen, dstLen);
+}
+
+inline void ConvertLatin1toUtf16(mozilla::Span<const char> aSource,
+                                 mozilla::Span<char16_t> aDest) {
+  const char* srcPtr = aSource.Elements();
+  size_t srcLen = aSource.Length();
+  char16_t* dstPtr = aDest.Elements();
+  size_t dstLen = aDest.Length();
+  if (srcLen < mozilla::detail::kShortStringLimitForInlinePaths) {
+    MOZ_ASSERT(dstLen >= srcLen);
+    const uint8_t* unsignedPtr = reinterpret_cast<const uint8_t*>(srcPtr);
+    const uint8_t* end = unsignedPtr + srcLen;
+    while (unsignedPtr < end) {
+      *dstPtr = *unsignedPtr;
+      ++unsignedPtr;
+      ++dstPtr;
+    }
+    return;
+  }
+  encoding_mem_convert_latin1_to_utf16(srcPtr, srcLen, dstPtr, dstLen);
+}
+
+#endif
+
+};  
+
+#endif  // mozilla_Latin1_h

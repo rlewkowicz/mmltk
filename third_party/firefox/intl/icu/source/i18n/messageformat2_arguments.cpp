@@ -1,0 +1,63 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_NORMALIZATION
+
+#if !UCONFIG_NO_FORMATTING
+
+#if !UCONFIG_NO_MF2
+
+#include "unicode/messageformat2.h"
+#include "unicode/messageformat2_arguments.h"
+#include "unicode/messageformat2_data_model_names.h"
+#include "messageformat2_evaluation.h"
+#include "messageformat2_function_registry_internal.h"
+#include "uvector.h" // U_ASSERT
+
+U_NAMESPACE_BEGIN
+
+namespace message2 {
+
+    using namespace data_model;
+
+
+    using Arguments = MessageArguments;
+
+    const Formattable* Arguments::getArgument(const VariableName& arg,
+                                              UErrorCode& errorCode) const {
+        if (U_SUCCESS(errorCode)) {
+            U_ASSERT(argsLen == 0 || arguments.isValid());
+            for (int32_t i = 0; i < argsLen; i++) {
+                UnicodeString normalized = StandardFunctions::normalizeNFC(argumentNames[i]);
+                if (normalized == arg) {
+                    return &arguments[i];
+                }
+            }
+            errorCode = U_ILLEGAL_ARGUMENT_ERROR;
+        }
+        return nullptr;
+    }
+
+    MessageArguments::~MessageArguments() {}
+
+
+    MessageArguments& MessageArguments::operator=(MessageArguments&& other) noexcept {
+        U_ASSERT(other.arguments.isValid() || other.argsLen == 0);
+        argsLen = other.argsLen;
+        if (argsLen != 0) {
+            argumentNames.adoptInstead(other.argumentNames.orphan());
+            arguments.adoptInstead(other.arguments.orphan());
+        }
+        return *this;
+    }
+
+} 
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_MF2 */
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+
+#endif /* #if !UCONFIG_NO_NORMALIZATION */

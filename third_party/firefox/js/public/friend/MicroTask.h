@@ -1,0 +1,80 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef js_friend_MicroTask_h
+#define js_friend_MicroTask_h
+
+#include "jstypes.h"
+
+#include "js/GCPolicyAPI.h"
+#include "js/RootingAPI.h"
+#include "js/TypeDecls.h"
+#include "js/UniquePtr.h"
+#include "js/Value.h"
+#include "js/ValueArray.h"
+
+namespace JS {
+
+
+using GenericMicroTask = JS::Value;
+using JSMicroTask = JSObject;
+
+JS_PUBLIC_API bool IsJSMicroTask(const JS::GenericMicroTask& hv);
+JS_PUBLIC_API JSMicroTask* ToUnwrappedJSMicroTask(
+    const JS::GenericMicroTask& genericMicroTask);
+JS_PUBLIC_API JSMicroTask* ToMaybeWrappedJSMicroTask(
+    const JS::GenericMicroTask& genericMicroTask);
+
+JS_PUBLIC_API bool RunJSMicroTask(JSContext* cx,
+                                  Handle<JS::JSMicroTask*> entry);
+
+JS_PUBLIC_API bool EnqueueMicroTask(JSContext* cx,
+                                    const GenericMicroTask& entry);
+JS_PUBLIC_API bool EnqueueDebugMicroTask(JSContext* cx,
+                                         const GenericMicroTask& entry);
+JS_PUBLIC_API bool PrependMicroTask(JSContext* cx,
+                                    const GenericMicroTask& entry);
+
+JS_PUBLIC_API GenericMicroTask DequeueNextMicroTask(JSContext* cx);
+JS_PUBLIC_API GenericMicroTask DequeueNextDebuggerMicroTask(JSContext* cx);
+JS_PUBLIC_API GenericMicroTask DequeueNextRegularMicroTask(JSContext* cx);
+
+JS_PUBLIC_API GenericMicroTask PeekNextMicroTask(JSContext* cx);
+
+JS_PUBLIC_API bool HasAnyMicroTasks(JSContext* cx);
+
+JS_PUBLIC_API bool HasDebuggerMicroTasks(JSContext* cx);
+
+JS_PUBLIC_API bool HasRegularMicroTasks(JSContext* cx);
+
+JS_PUBLIC_API size_t GetRegularMicroTaskCount(JSContext* cx);
+
+JS_PUBLIC_API JSObject* GetExecutionGlobalFromJSMicroTask(JSMicroTask* entry);
+
+class SavedMicroTaskQueue {
+ public:
+  SavedMicroTaskQueue() = default;
+  virtual ~SavedMicroTaskQueue() = default;
+  SavedMicroTaskQueue(const SavedMicroTaskQueue&) = delete;
+  SavedMicroTaskQueue& operator=(const SavedMicroTaskQueue&) = delete;
+};
+
+JS_PUBLIC_API js::UniquePtr<SavedMicroTaskQueue> SaveMicroTaskQueue(
+    JSContext* cx);
+JS_PUBLIC_API void RestoreMicroTaskQueue(
+    JSContext* cx, js::UniquePtr<SavedMicroTaskQueue> savedQueue);
+
+JS_PUBLIC_API bool MaybeGetHostDefinedDataFromJSMicroTask(
+    JSMicroTask* entry, MutableHandleObject incumbentGlobal,
+    MutableHandleObject optionalHostDefinedData);
+JS_PUBLIC_API bool MaybeGetAllocationSiteFromJSMicroTask(
+    JSMicroTask* entry, MutableHandleObject out);
+
+JS_PUBLIC_API JSObject* MaybeGetPromiseFromJSMicroTask(JSMicroTask* entry);
+
+JS_PUBLIC_API bool GetFlowIdFromJSMicroTask(JSMicroTask* entry, uint64_t* uid);
+
+}  
+
+#endif /* js_friend_MicroTask_h */

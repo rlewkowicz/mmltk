@@ -1,0 +1,43 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsStringFlags_h
+#define nsStringFlags_h
+
+#include <stdint.h>
+#include "mozilla/TypedEnumBits.h"
+
+namespace mozilla {
+namespace detail {
+
+enum class StringDataFlags : uint16_t {
+
+  TERMINATED = 1 << 0,
+
+  VOIDED = 1 << 1,
+
+  STRINGBUFFER = 1 << 2,
+
+  OWNED = 1 << 3,
+
+  INLINE = 1 << 4,
+
+  LITERAL = 1 << 5,
+
+  INVALID_MASK = (uint16_t)~((LITERAL << 1) - 1)
+};
+
+enum class StringClassFlags : uint16_t {
+  INLINE = 1 << 0,
+  NULL_TERMINATED = 1 << 1,
+  INVALID_MASK = (uint16_t)~((NULL_TERMINATED << 1) - 1)
+};
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(StringDataFlags)
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(StringClassFlags)
+
+}  
+}  
+
+#endif

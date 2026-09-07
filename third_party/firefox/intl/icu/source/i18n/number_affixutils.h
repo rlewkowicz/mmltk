@@ -1,0 +1,110 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+#ifndef __NUMBER_AFFIXUTILS_H__
+#define __NUMBER_AFFIXUTILS_H__
+
+#include <cstdint>
+#include "number_types.h"
+#include "unicode/stringpiece.h"
+#include "unicode/unistr.h"
+#include "formatted_string_builder.h"
+#include "unicode/uniset.h"
+
+U_NAMESPACE_BEGIN
+namespace number::impl {
+
+enum AffixPatternState {
+    STATE_BASE = 0,
+    STATE_FIRST_QUOTE = 1,
+    STATE_INSIDE_QUOTE = 2,
+    STATE_AFTER_QUOTE = 3,
+    STATE_FIRST_CURR = 4,
+    STATE_SECOND_CURR = 5,
+    STATE_THIRD_CURR = 6,
+    STATE_FOURTH_CURR = 7,
+    STATE_FIFTH_CURR = 8,
+    STATE_OVERFLOW_CURR = 9
+};
+
+
+struct AffixTag {
+    int32_t offset;
+    UChar32 codePoint;
+    AffixPatternState state;
+    AffixPatternType type;
+
+    AffixTag()
+            : offset(0), state(STATE_BASE) {}
+
+    AffixTag(int32_t offset)
+            : offset(offset) {}
+
+    AffixTag(int32_t offset, UChar32 codePoint, AffixPatternState state, AffixPatternType type)
+            : offset(offset), codePoint(codePoint), state(state), type(type) {}
+};
+
+class TokenConsumer {
+  public:
+    virtual ~TokenConsumer();
+
+    virtual void consumeToken(AffixPatternType type, UChar32 cp, UErrorCode& status) = 0;
+};
+
+class U_I18N_API SymbolProvider {
+  public:
+    virtual ~SymbolProvider();
+
+    virtual UnicodeString getSymbol(AffixPatternType type) const = 0;
+};
+
+class U_I18N_API AffixUtils {
+
+  public:
+
+    static int32_t estimateLength(const UnicodeString& patternString, UErrorCode& status);
+
+    static UnicodeString escape(const UnicodeString& input);
+
+    static Field getFieldForType(AffixPatternType type);
+
+    static int32_t unescape(const UnicodeString& affixPattern, FormattedStringBuilder& output,
+                            int32_t position, const SymbolProvider& provider, Field field,
+                            UErrorCode& status);
+
+    static int32_t unescapedCodePointCount(const UnicodeString& affixPattern,
+                                           const SymbolProvider& provider, UErrorCode& status);
+
+    static bool containsType(const UnicodeString& affixPattern, AffixPatternType type, UErrorCode& status);
+
+    static bool hasCurrencySymbols(const UnicodeString& affixPattern, UErrorCode& status);
+
+    static UnicodeString replaceType(const UnicodeString& affixPattern, AffixPatternType type,
+                                     char16_t replacementChar, UErrorCode& status);
+
+    static bool containsOnlySymbolsAndIgnorables(const UnicodeString& affixPattern,
+                                                 const UnicodeSet& ignorables, UErrorCode& status);
+
+    static void iterateWithConsumer(const UnicodeString& affixPattern, TokenConsumer& consumer,
+                                    UErrorCode& status);
+
+    static AffixTag nextToken(AffixTag tag, const UnicodeString& patternString, UErrorCode& status);
+
+    static bool hasNext(const AffixTag& tag, const UnicodeString& string);
+
+  private:
+    static inline AffixTag makeTag(int32_t offset, AffixPatternType type, AffixPatternState state,
+                                   UChar32 cp) {
+        return {offset, cp, state, type};
+    }
+};
+
+} 
+U_NAMESPACE_END
+
+
+#endif //__NUMBER_AFFIXUTILS_H__
+
+#endif /* #if !UCONFIG_NO_FORMATTING */

@@ -1,0 +1,205 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "frontend/ForOfEmitter.h"
+
+#include "frontend/BytecodeEmitter.h"
+#include "frontend/EmitterScope.h"
+#include "frontend/ParserAtom.h"  // TaggedParserAtomIndex
+#include "frontend/UsingEmitter.h"
+#include "vm/Opcodes.h"
+#include "vm/StencilEnums.h"  // TryNoteKind
+
+using namespace js;
+using namespace js::frontend;
+
+using mozilla::Nothing;
+
+ForOfEmitter::ForOfEmitter(BytecodeEmitter* bce,
+                           const EmitterScope* headLexicalEmitterScope,
+                           SelfHostedIter selfHostedIter, IteratorKind iterKind
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+                           ,
+                           HeadUsingDeclarationKind usingDeclarationInHead
+#endif
+                           )
+    : bce_(bce),
+      selfHostedIter_(selfHostedIter),
+      iterKind_(iterKind),
+      headLexicalEmitterScope_(headLexicalEmitterScope)
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+      ,
+      usingDeclarationInHead_(usingDeclarationInHead)
+#endif
+{
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+  MOZ_ASSERT_IF(usingDeclarationInHead != HeadUsingDeclarationKind::None,
+                headLexicalEmitterScope->hasEnvironment() &&
+                    headLexicalEmitterScope == bce_->innermostEmitterScope() &&
+                    headLexicalEmitterScope->hasDisposables());
+  MOZ_ASSERT_IF(
+      headLexicalEmitterScope && headLexicalEmitterScope->hasDisposables(),
+      usingDeclarationInHead != HeadUsingDeclarationKind::None);
+#endif
+}
+
+bool ForOfEmitter::emitIterated() {
+  MOZ_ASSERT(state_ == State::Start);
+
+  tdzCacheForIteratedValue_.emplace(bce_);
+
+#ifdef DEBUG
+  state_ = State::Iterated;
+#endif
+  return true;
+}
+
+bool ForOfEmitter::emitInitialize(uint32_t forPos) {
+  MOZ_ASSERT(state_ == State::Iterated);
+
+  tdzCacheForIteratedValue_.reset();
+
+
+  if (iterKind_ == IteratorKind::Async) {
+    if (!bce_->emitAsyncIterator(selfHostedIter_)) {
+      return false;
+    }
+  } else {
+    if (!bce_->emitIterator(selfHostedIter_)) {
+      return false;
+    }
+  }
+
+
+  int32_t iterDepth = bce_->bytecodeSection().stackDepth();
+  loopInfo_.emplace(bce_, iterDepth, selfHostedIter_, iterKind_);
+
+  if (!loopInfo_->emitLoopHead(bce_, Nothing())) {
+    return false;
+  }
+
+  if (headLexicalEmitterScope_) {
+    MOZ_ASSERT(headLexicalEmitterScope_ == bce_->innermostEmitterScope());
+    MOZ_ASSERT(headLexicalEmitterScope_->scope(bce_).kind() ==
+               ScopeKind::Lexical);
+
+    if (headLexicalEmitterScope_->hasEnvironment()) {
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+      if (!loopInfo_->prepareForForOfLoopIteration(
+              bce_, headLexicalEmitterScope_,
+              usingDeclarationInHead_ == HeadUsingDeclarationKind::Async)) {
+        return false;
+      }
+#endif
+      if (!bce_->emitInternedScopeOp(headLexicalEmitterScope_->index(),
+                                     JSOp::RecreateLexicalEnv)) {
+        return false;
+      }
+    }
+
+    if (!headLexicalEmitterScope_->deadZoneFrameSlots(bce_)) {
+      return false;
+    }
+  }
+
+#ifdef DEBUG
+  loopDepth_ = bce_->bytecodeSection().stackDepth();
+#endif
+
+  if (!bce_->updateSourceCoordNotes(forPos)) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Dup2)) {
+    return false;
+  }
+
+  if (!bce_->emitIteratorNext(mozilla::Some(forPos), iterKind_,
+                              selfHostedIter_)) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Dup)) {
+    return false;
+  }
+  if (!bce_->emitAtomOp(JSOp::GetProp,
+                        TaggedParserAtomIndex::WellKnown::done())) {
+    return false;
+  }
+
+  MOZ_ASSERT(bce_->innermostNestableControl == loopInfo_.ptr(),
+             "must be at the top-level of the loop");
+  if (!bce_->emitJump(JSOp::JumpIfTrue, &loopInfo_->breaks)) {
+    return false;
+  }
+
+  if (!bce_->emitAtomOp(JSOp::GetProp,
+                        TaggedParserAtomIndex::WellKnown::value())) {
+    return false;
+  }
+
+  if (!loopInfo_->emitBeginCodeNeedingIteratorClose(bce_)) {
+    return false;
+  }
+
+#ifdef DEBUG
+  state_ = State::Initialize;
+#endif
+  return true;
+}
+
+bool ForOfEmitter::emitBody() {
+  MOZ_ASSERT(state_ == State::Initialize);
+
+  MOZ_ASSERT(bce_->bytecodeSection().stackDepth() == loopDepth_ + 1,
+             "the stack must be balanced around the initializing "
+             "operation");
+
+#ifdef DEBUG
+  state_ = State::Body;
+#endif
+  return true;
+}
+
+bool ForOfEmitter::emitEnd(uint32_t iteratedPos) {
+  MOZ_ASSERT(state_ == State::Body);
+
+  MOZ_ASSERT(bce_->bytecodeSection().stackDepth() == loopDepth_ + 1,
+             "the stack must be balanced around the for-of body");
+
+  if (!loopInfo_->emitEndCodeNeedingIteratorClose(bce_)) {
+    return false;
+  }
+
+  if (!loopInfo_->emitContinueTarget(bce_)) {
+    return false;
+  }
+
+  if (!bce_->updateSourceCoordNotes(iteratedPos)) {
+    return false;
+  }
+
+  if (!bce_->emit1(JSOp::Pop)) {
+    return false;
+  }
+
+  if (!loopInfo_->emitLoopEnd(bce_, JSOp::Goto, TryNoteKind::ForOf)) {
+    return false;
+  }
+
+  MOZ_ASSERT(bce_->bytecodeSection().stackDepth() == loopDepth_);
+  bce_->bytecodeSection().setStackDepth(bce_->bytecodeSection().stackDepth() +
+                                        1);
+
+  if (!bce_->emitPopN(3)) {
+    return false;
+  }
+
+  loopInfo_.reset();
+
+#ifdef DEBUG
+  state_ = State::End;
+#endif
+  return true;
+}

@@ -1,0 +1,308 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef intl_components_DateTimeFormat_h_
+#define intl_components_DateTimeFormat_h_
+#include "unicode/udat.h"
+
+#include "mozilla/intl/ICU4CGlue.h"
+#include "mozilla/intl/ICUError.h"
+#include "mozilla/intl/Locale.h"
+
+#include "mozilla/intl/DateTimePart.h"
+#include "mozilla/intl/DateTimePatternGenerator.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/Span.h"
+#include "mozilla/Try.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/Vector.h"
+
+#define DATE_TIME_FORMAT_REPLACE_SPECIAL_SPACES 1
+
+namespace mozilla::intl {
+
+#if DATE_TIME_FORMAT_REPLACE_SPECIAL_SPACES
+static inline bool IsSpecialSpace(char16_t c) {
+  return c == 0x202F || c == 0x2009;
+}
+#endif
+
+class Calendar;
+
+class DateTimeFormat final {
+ public:
+  enum class HourCycle {
+    H11,
+    H12,
+    H23,
+    H24,
+  };
+
+  enum class Style {
+    Full,
+    Long,
+    Medium,
+    Short,
+  };
+
+  struct StyleBag {
+    Maybe<Style> date = Nothing();
+    Maybe<Style> time = Nothing();
+    Maybe<HourCycle> hourCycle = Nothing();
+    Maybe<bool> hour12 = Nothing();
+  };
+
+  enum class Numeric {
+    Numeric,
+    TwoDigit,
+  };
+
+  enum class Text {
+    Long,
+    Short,
+    Narrow,
+  };
+
+  enum class Month {
+    Numeric,
+    TwoDigit,
+    Long,
+    Short,
+    Narrow,
+  };
+
+  enum class TimeZoneName {
+    Long,
+    Short,
+    ShortOffset,
+    LongOffset,
+    ShortGeneric,
+    LongGeneric,
+  };
+
+  struct ComponentsBag {
+    Maybe<Text> era = Nothing();
+    Maybe<Numeric> year = Nothing();
+    Maybe<Month> month = Nothing();
+    Maybe<Numeric> day = Nothing();
+    Maybe<Text> weekday = Nothing();
+    Maybe<Numeric> hour = Nothing();
+    Maybe<Numeric> minute = Nothing();
+    Maybe<Numeric> second = Nothing();
+    Maybe<TimeZoneName> timeZoneName = Nothing();
+    Maybe<bool> hour12 = Nothing();
+    Maybe<HourCycle> hourCycle = Nothing();
+    Maybe<Text> dayPeriod = Nothing();
+    Maybe<uint8_t> fractionalSecondDigits = Nothing();
+  };
+
+  DateTimeFormat(const DateTimeFormat&) = delete;
+  DateTimeFormat& operator=(const DateTimeFormat&) = delete;
+
+  using PatternVector = Vector<char16_t, 128>;
+  using SkeletonVector = Vector<char16_t, 16>;
+
+  static Result<UniquePtr<DateTimeFormat>, ICUError> TryCreateFromStyle(
+      Span<const char> aLocale, const StyleBag& aStyleBag,
+      DateTimePatternGenerator* aDateTimePatternGenerator,
+      Maybe<Span<const char16_t>> aTimeZoneOverride = Nothing{});
+
+ private:
+  static Result<UniquePtr<DateTimeFormat>, ICUError> TryCreateFromSkeleton(
+      Span<const char> aLocale, Span<const char16_t> aSkeleton,
+      DateTimePatternGenerator* aDateTimePatternGenerator,
+      Maybe<DateTimeFormat::HourCycle> aHourCycle,
+      Maybe<Span<const char16_t>> aTimeZoneOverride);
+
+ public:
+  static Result<UniquePtr<DateTimeFormat>, ICUError> TryCreateFromComponents(
+      Span<const char> aLocale, const ComponentsBag& bag,
+      DateTimePatternGenerator* aDateTimePatternGenerator,
+      Maybe<Span<const char16_t>> aTimeZoneOverride = Nothing{});
+
+  static Result<UniquePtr<DateTimeFormat>, ICUError> TryCreateFromPattern(
+      Span<const char> aLocale, Span<const char16_t> aPattern,
+      Maybe<Span<const char16_t>> aTimeZoneOverride = Nothing{});
+
+  template <typename B>
+  ICUResult TryFormat(double aUnixEpoch, B& aBuffer) const {
+    static_assert(
+        std::is_same_v<typename B::CharType, unsigned char> ||
+            std::is_same_v<typename B::CharType, char> ||
+            std::is_same_v<typename B::CharType, char16_t>,
+        "The only buffer CharTypes supported by DateTimeFormat are char "
+        "(for UTF-8 support) and char16_t (for UTF-16 support).");
+
+    if constexpr (std::is_same_v<typename B::CharType, char> ||
+                  std::is_same_v<typename B::CharType, unsigned char>) {
+
+      PatternVector u16Vec;
+
+      auto result = FillBufferWithICUCall(
+          u16Vec, [this, &aUnixEpoch](UChar* target, int32_t length,
+                                      UErrorCode* status) {
+            return udat_format(mDateFormat, aUnixEpoch, target, length,
+                                nullptr, status);
+          });
+      if (result.isErr()) {
+        return result;
+      }
+
+#if DATE_TIME_FORMAT_REPLACE_SPECIAL_SPACES
+      for (auto& c : u16Vec) {
+        if (IsSpecialSpace(c)) {
+          c = ' ';
+        }
+      }
+#endif
+
+      if (!FillBuffer(u16Vec, aBuffer)) {
+        return Err(ICUError::OutOfMemory);
+      }
+      return Ok{};
+    } else {
+      static_assert(std::is_same_v<typename B::CharType, char16_t>);
+
+      auto result = FillBufferWithICUCall(
+          aBuffer, [&](UChar* target, int32_t length, UErrorCode* status) {
+            return udat_format(mDateFormat, aUnixEpoch, target, length, nullptr,
+                               status);
+          });
+      if (result.isErr()) {
+        return result;
+      }
+
+#if DATE_TIME_FORMAT_REPLACE_SPECIAL_SPACES
+      for (auto& c : Span(aBuffer.data(), aBuffer.length())) {
+        if (IsSpecialSpace(c)) {
+          c = ' ';
+        }
+      }
+#endif
+
+      return Ok{};
+    }
+  };
+
+  template <typename B>
+  ICUResult TryFormatToParts(double aUnixEpoch, B& aBuffer,
+                             DateTimePartVector& aParts) const {
+    static_assert(std::is_same_v<typename B::CharType, char16_t>,
+                  "Only char16_t is supported (for UTF-16 support) now.");
+
+    UErrorCode status = U_ZERO_ERROR;
+    UFieldPositionIterator* fpositer = ufieldpositer_open(&status);
+    if (U_FAILURE(status)) {
+      return Err(ToICUError(status));
+    }
+
+    auto result = FillBufferWithICUCall(
+        aBuffer, [this, aUnixEpoch, fpositer](UChar* chars, int32_t size,
+                                              UErrorCode* status) {
+          return udat_formatForFields(mDateFormat, aUnixEpoch, chars, size,
+                                      fpositer, status);
+        });
+    if (result.isErr()) {
+      ufieldpositer_close(fpositer);
+      return result.propagateErr();
+    }
+
+#if DATE_TIME_FORMAT_REPLACE_SPECIAL_SPACES
+    for (auto& c : Span(aBuffer.data(), aBuffer.length())) {
+      if (IsSpecialSpace(c)) {
+        c = ' ';
+      }
+    }
+#endif
+
+    return TryFormatToParts(fpositer, aBuffer.length(), aParts);
+  }
+
+  template <typename B>
+  ICUResult GetPattern(B& aBuffer) const {
+    return FillBufferWithICUCall(
+        aBuffer, [&](UChar* target, int32_t length, UErrorCode* status) {
+          return udat_toPattern(mDateFormat,  false, target,
+                                length, status);
+        });
+  }
+
+  template <typename B>
+  ICUResult GetOriginalSkeleton(B& aBuffer) {
+    static_assert(std::is_same_v<typename B::CharType, char16_t>);
+    if (mOriginalSkeleton.length() == 0) {
+      PatternVector pattern{};
+      VectorToBufferAdaptor buffer(pattern);
+      MOZ_TRY(GetPattern(buffer));
+
+      VectorToBufferAdaptor skeleton(mOriginalSkeleton);
+      MOZ_TRY(DateTimePatternGenerator::GetSkeleton(pattern, skeleton));
+    }
+
+    if (!FillBuffer(mOriginalSkeleton, aBuffer)) {
+      return Err(ICUError::OutOfMemory);
+    }
+    return Ok();
+  }
+
+  Result<ComponentsBag, ICUError> ResolveComponents();
+
+  ~DateTimeFormat();
+
+  Result<UniquePtr<Calendar>, ICUError> CloneCalendar(double aUnixEpoch) const;
+
+  static Maybe<DateTimeFormat::HourCycle> HourCycleFromPattern(
+      Span<const char16_t> aPattern);
+
+  using HourCyclesVector = Vector<HourCycle, 4>;
+
+  static Result<HourCyclesVector, ICUError> GetAllowedHourCycles(
+      const LanguageSubtag& aLanguage, const RegionSubtag& aRegion);
+
+  static auto GetAvailableLocales() {
+    return AvailableLocalesEnumeration<udat_countAvailable,
+                                       udat_getAvailable>();
+  }
+
+  template <typename B>
+  static ICUResult GetTimeSeparator(Span<const char> aLocale,
+                                    Span<const char> aNumberingSystem,
+                                    B& aBuffer) {
+    static_assert(std::is_same_v<typename B::CharType, char16_t>);
+    auto separator = GetTimeSeparator(aLocale, aNumberingSystem);
+    if (separator.isErr()) {
+      return separator.propagateErr();
+    }
+    if (!FillBuffer(separator.unwrap(), aBuffer)) {
+      return Err(ICUError::OutOfMemory);
+    }
+    return Ok();
+  }
+
+ private:
+  explicit DateTimeFormat(UDateFormat* aDateFormat);
+
+  ICUResult CacheSkeleton(Span<const char16_t> aSkeleton);
+
+  ICUResult TryFormatToParts(UFieldPositionIterator* aFieldPositionIterator,
+                             size_t aSpanSize,
+                             DateTimePartVector& aParts) const;
+  static void ReplaceHourSymbol(Span<char16_t> aPatternOrSkeleton,
+                                DateTimeFormat::HourCycle aHourCycle);
+
+  static ICUResult FindPatternWithHourCycle(
+      DateTimePatternGenerator& aDateTimePatternGenerator,
+      DateTimeFormat::PatternVector& aPattern, bool aHour12,
+      DateTimeFormat::SkeletonVector& aSkeleton);
+
+  static Result<Span<const char16_t>, ICUError> GetTimeSeparator(
+      Span<const char> aLocale, Span<const char> aNumberingSystem);
+
+  UDateFormat* mDateFormat = nullptr;
+
+  SkeletonVector mOriginalSkeleton;
+};
+
+}  
+
+#endif

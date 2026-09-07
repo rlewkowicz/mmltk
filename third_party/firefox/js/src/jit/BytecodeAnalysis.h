@@ -1,0 +1,82 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_BytecodeAnalysis_h
+#define jit_BytecodeAnalysis_h
+
+#include "jit/JitAllocPolicy.h"
+#include "js/Vector.h"
+#include "vm/JSScript.h"
+
+namespace js {
+namespace jit {
+
+struct BytecodeInfo {
+  static const uint16_t MAX_STACK_DEPTH = 0xffffU;
+  uint16_t stackDepth;
+  bool initialized : 1;
+  bool jumpTarget : 1;
+
+  bool loopHeadCanOsr : 1;
+
+  bool jumpTargetNormallyReachable : 1;
+
+  bool hasResumeOffset : 1;
+
+  void init(unsigned depth) {
+    MOZ_ASSERT(depth <= MAX_STACK_DEPTH);
+    MOZ_ASSERT_IF(initialized, stackDepth == depth);
+    initialized = true;
+    stackDepth = depth;
+  }
+
+  void setJumpTarget(bool normallyReachable) {
+    jumpTarget = true;
+    if (normallyReachable) {
+      jumpTargetNormallyReachable = true;
+    }
+  }
+};
+
+class BytecodeAnalysis {
+  JSScript* script_;
+  Vector<BytecodeInfo, 0, JitAllocPolicy> infos_;
+  bool disableIon_ = false;
+  bool disableInlining_ = false;
+
+  void disableIon() { disableIon_ = true; }
+  bool ionDisabled() const { return disableIon_; }
+  void disableInlining() { disableInlining_ = true; }
+
+ public:
+  explicit BytecodeAnalysis(TempAllocator& alloc, JSScript* script);
+
+  [[nodiscard]] bool init(TempAllocator& alloc);
+
+  BytecodeInfo& info(jsbytecode* pc) {
+    uint32_t pcOffset = script_->pcToOffset(pc);
+    MOZ_ASSERT(infos_[pcOffset].initialized);
+    return infos_[pcOffset];
+  }
+
+  BytecodeInfo* maybeInfo(jsbytecode* pc) {
+    uint32_t pcOffset = script_->pcToOffset(pc);
+    if (infos_[pcOffset].initialized) {
+      return &infos_[pcOffset];
+    }
+    return nullptr;
+  }
+
+  void checkWarpSupport(JSOp op);
+
+  bool isIonDisabled() const { return disableIon_; }
+  bool isInliningDisabled() const { return disableInlining_; }
+};
+
+bool ScriptUsesEnvironmentChain(JSScript* script);
+
+}  
+}  
+
+#endif /* jit_BytecodeAnalysis_h */

@@ -1,0 +1,54 @@
+// Copyright 2019 the V8 project authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(V8_REGEXP_SPECIAL_CASE_H_)
+#define V8_REGEXP_SPECIAL_CASE_H_
+
+#if defined(V8_INTL_SUPPORT)
+#include "irregexp/RegExpShim.h"
+
+#include "unicode/uchar.h"
+#include "unicode/uniset.h"
+#include "unicode/unistr.h"
+
+namespace v8 {
+namespace internal {
+namespace regexp {
+
+
+//    letter 'k'. Closing over 'k' gives "kKK" (lowercase k, uppercase
+
+class CaseFolding final : public AllStatic {
+ public:
+  static const icu::UnicodeSet& IgnoreSet();
+  static const icu::UnicodeSet& SpecialAddSet();
+
+  static UChar32 Canonicalize(UChar32 ch) {
+    CHECK_LE(ch, 0xffff);
+
+    icu::UnicodeString s(ch);
+
+    icu::UnicodeString& u = s.toUpper();
+
+    if (u.length() != 1) {
+      return ch;
+    }
+
+    UChar32 cu = u.char32At(0);
+
+    if (ch >= 128 && cu < 128) {
+      return ch;
+    }
+
+    return cu;
+  }
+};
+
+}  
+}  
+}  
+
+#endif
+
+#endif

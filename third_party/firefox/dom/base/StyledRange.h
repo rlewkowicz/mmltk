@@ -1,0 +1,103 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_BASE_STYLED_RANGE_H_
+#define DOM_BASE_STYLED_RANGE_H_
+
+#include "mozilla/RefPtr.h"
+#include "mozilla/TextRange.h"
+#include "nsTArray.h"
+#include "nsTHashMap.h"
+
+class nsCycleCollectionTraversalCallback;
+
+namespace mozilla::dom {
+class AbstractRange;
+
+struct StyledRange {
+  explicit StyledRange(AbstractRange* aRange, TextRangeStyle aStyle = {});
+
+  RefPtr<AbstractRange> mRange;
+  TextRangeStyle mTextRangeStyle;
+};
+
+class StyledRangeCollection {
+  friend void ImplCycleCollectionTraverse(
+      nsCycleCollectionTraversalCallback& aCallback,
+      StyledRangeCollection& aField, const char* aName, uint32_t aFlags);
+  friend void ImplCycleCollectionUnlink(StyledRangeCollection& aField);
+
+ public:
+  StyledRangeCollection() = default;
+  ~StyledRangeCollection() = default;
+
+  StyledRangeCollection(StyledRangeCollection&& aOther) = default;
+  StyledRangeCollection& operator=(StyledRangeCollection&& aOther) = default;
+
+  StyledRangeCollection(const StyledRangeCollection&) = delete;
+  StyledRangeCollection& operator=(const StyledRangeCollection&) = delete;
+
+  size_t Length() const { return mRanges.Length(); }
+  bool IsEmpty() const { return mRanges.IsEmpty(); }
+
+  AbstractRange* GetAbstractRangeAt(size_t aIndex) const {
+    return mRanges[aIndex];
+  }
+
+  StyledRange GetStyledRangeAt(size_t aIndex) {
+    AbstractRange* range = GetAbstractRangeAt(aIndex);
+    const TextRangeStyle* style = GetTextRangeStyleIfNotDefault(range);
+    if (style) {
+      return StyledRange{range, *style};
+    }
+    return StyledRange{range};
+  }
+
+  Span<RefPtr<AbstractRange>> Ranges() { return mRanges; }
+  Span<const RefPtr<AbstractRange>> Ranges() const { return mRanges; }
+
+  void AppendElement(StyledRange&& aRange);
+  void InsertElementAt(size_t aIndex, StyledRange&& aRange);
+  void AppendElement(const StyledRange& aRange);
+  void InsertElementAt(size_t aIndex, const StyledRange& aRange);
+
+  void InsertElementsAt(size_t aIndex,
+                        const nsTArray<StyledRange>& aStyledRanges);
+
+  bool RemoveElement(const AbstractRange* aRange);
+  void RemoveElementAt(size_t aIndex);
+  void RemoveElementsAt(size_t aStart, size_t aCount);
+
+  StyledRange ExtractElementAt(size_t aIndex);
+
+  void Clear();
+
+  template <typename Comparator>
+  void Sort(const Comparator& aComp) {
+    mRanges.Sort(aComp);
+  }
+
+  const TextRangeStyle* GetTextRangeStyleIfNotDefault(
+      const AbstractRange* aRange);
+
+  void SetTextRangeStyle(const AbstractRange* aRange,
+                         const TextRangeStyle& aStyle);
+
+ private:
+  void RemoveStyle(const AbstractRange* aRange);
+  AutoTArray<RefPtr<AbstractRange>, 1> mRanges;
+
+  nsTHashMap<const AbstractRange*, TextRangeStyle> mRangeStyleData;
+};
+
+inline void ImplCycleCollectionUnlink(StyledRangeCollection& aField) {
+  aField.Clear();
+}
+
+void ImplCycleCollectionTraverse(nsCycleCollectionTraversalCallback& aCallback,
+                                 StyledRangeCollection& aField,
+                                 const char* aName, uint32_t aFlags);
+}  
+
+#endif  // DOM_BASE_STYLED_RANGE_H_

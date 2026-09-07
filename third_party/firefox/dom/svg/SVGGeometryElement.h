@@ -1,0 +1,193 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SVG_SVGGEOMETRYELEMENT_H_
+#define DOM_SVG_SVGGEOMETRYELEMENT_H_
+
+#include "mozilla/EnumeratedArray.h"
+#include "mozilla/dom/SVGAnimatedNumber.h"
+#include "mozilla/dom/SVGGraphicsElement.h"
+#include "mozilla/gfx/2D.h"
+
+namespace mozilla {
+
+class SVGMarkerFrame;
+
+struct SVGMark {
+  enum class Type {
+    Start,
+    Mid,
+    End,
+  };
+
+  gfx::Point pos;
+  float angle;
+  Type type;
+  SVGMark(const gfx::Point& aPos, float aAngle, Type aType)
+      : pos(aPos), angle(aAngle), type(aType) {}
+};
+
+template <>
+struct MaxContiguousEnumValue<SVGMark::Type> {
+  static constexpr auto value = SVGMark::Type::End;
+};
+
+using SVGMarkerFrames = EnumeratedArray<SVGMark::Type, SVGMarkerFrame*>;
+
+namespace dom {
+
+class DOMSVGAnimatedNumber;
+class DOMSVGPoint;
+
+using SVGGeometryElementBase = mozilla::dom::SVGGraphicsElement;
+
+class SVGGeometryElement : public SVGGeometryElementBase {
+ protected:
+  using CapStyle = mozilla::gfx::CapStyle;
+  using DrawTarget = mozilla::gfx::DrawTarget;
+  using FillRule = mozilla::gfx::FillRule;
+  using Float = mozilla::gfx::Float;
+  using Matrix = mozilla::gfx::Matrix;
+  using Path = mozilla::gfx::Path;
+  using Point = mozilla::gfx::Point;
+  using PathBuilder = mozilla::gfx::PathBuilder;
+  using Rect = mozilla::gfx::Rect;
+  using StrokeOptions = mozilla::gfx::StrokeOptions;
+
+ public:
+  explicit SVGGeometryElement(
+      already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo);
+
+  NS_IMPL_FROMNODE_HELPER(SVGGeometryElement, IsSVGGeometryElement())
+
+  void AfterSetAttr(int32_t aNamespaceID, nsAtom* aName,
+                    const nsAttrValue* aValue, const nsAttrValue* aOldValue,
+                    nsIPrincipal* aSubjectPrincipal, bool aNotify) override;
+  bool IsSVGGeometryElement() const override { return true; }
+
+  void ClearAnyCachedPath() final { mCachedPath = nullptr; }
+
+  virtual bool AttributeDefinesGeometry(const nsAtom* aName);
+
+  bool GeometryDependsOnCoordCtx();
+
+  virtual bool IsMarkable();
+  virtual void GetMarkPoints(nsTArray<SVGMark>* aMarks);
+
+  virtual bool GetGeometryBounds(
+      Rect* aBounds, const StrokeOptions& aStrokeOptions,
+      const Matrix& aToBoundsSpace,
+      const Matrix* aToNonScalingStrokeSpace = nullptr) {
+    return false;
+  }
+
+  class SimplePath {
+   public:
+    SimplePath()
+        : mX(0.0),
+          mY(0.0),
+          mWidthOrX2(0.0),
+          mHeightOrY2(0.0),
+          mType(Type::None) {}
+    bool IsPath() const { return mType != Type::None; }
+    void SetRect(Float x, Float y, Float width, Float height) {
+      mX = x;
+      mY = y;
+      mWidthOrX2 = width;
+      mHeightOrY2 = height;
+      mType = Type::Rect;
+    }
+    void SetRect(const gfx::Rect& rect) {
+      mX = rect.x;
+      mY = rect.y;
+      mWidthOrX2 = rect.width;
+      mHeightOrY2 = rect.height;
+      mType = Type::Rect;
+    }
+    Rect AsRect() const {
+      MOZ_ASSERT(mType == Type::Rect);
+      return Rect(mX, mY, mWidthOrX2, mHeightOrY2);
+    }
+    bool IsRect() const { return mType == Type::Rect; }
+    void SetLine(Float x1, Float y1, Float x2, Float y2) {
+      mX = x1;
+      mY = y1;
+      mWidthOrX2 = x2;
+      mHeightOrY2 = y2;
+      mType = Type::Line;
+    }
+    Point Point1() const {
+      MOZ_ASSERT(mType == Type::Line);
+      return Point(mX, mY);
+    }
+    Point Point2() const {
+      MOZ_ASSERT(mType == Type::Line);
+      return Point(mWidthOrX2, mHeightOrY2);
+    }
+    bool IsLine() const { return mType == Type::Line; }
+    void Reset() { mType = Type::None; }
+
+   private:
+    enum class Type { None, Rect, Line };
+    Float mX, mY, mWidthOrX2, mHeightOrY2;
+    Type mType;
+  };
+
+  virtual void GetAsSimplePath(SimplePath* aSimplePath) {
+    aSimplePath->Reset();
+  }
+
+  virtual already_AddRefed<Path> GetOrBuildPath(const DrawTarget* aDrawTarget,
+                                                FillRule fillRule);
+
+  virtual already_AddRefed<Path> BuildPath(PathBuilder* aBuilder) = 0;
+
+  virtual bool GetDistancesFromOriginToEndsOfVisibleSegments(
+      FallibleTArray<double>* aOutput) {
+    aOutput->Clear();
+    double distances[] = {0.0, GetTotalLength()};
+    return aOutput->AppendElements(Span<double>(distances), fallible);
+  }
+
+  virtual already_AddRefed<Path> GetOrBuildPathForMeasuring();
+
+  virtual bool IsClosedLoop() const { return false; }
+
+  bool IsGeometryChangedViaCSS(ComputedStyle const& aNewStyle,
+                               ComputedStyle const& aOldStyle) const;
+
+  FillRule GetFillRule();
+
+  enum class PathLengthScaleUsageType { TextPath, Stroking };
+
+  float GetPathLengthScale(PathLengthScaleUsageType aFor);
+
+  already_AddRefed<DOMSVGAnimatedNumber> PathLength();
+  MOZ_CAN_RUN_SCRIPT bool IsPointInFill(const DOMPointInit& aPoint);
+  MOZ_CAN_RUN_SCRIPT bool IsPointInStroke(const DOMPointInit& aPoint);
+  MOZ_CAN_RUN_SCRIPT float GetTotalLengthForBinding();
+  MOZ_CAN_RUN_SCRIPT already_AddRefed<DOMSVGPoint> GetPointAtLength(
+      float distance, ErrorResult& rv);
+
+  gfx::Matrix LocalTransform() const;
+
+ protected:
+  NumberAttributesInfo GetNumberInfo() override;
+
+  MOZ_CAN_RUN_SCRIPT void FlushIfNeeded();
+
+  static NumberInfo sNumberInfo;
+  SVGAnimatedNumber mPathLength;
+  mutable RefPtr<Path> mCachedPath;
+
+ private:
+  already_AddRefed<Path> GetOrBuildPathForHitTest();
+
+  float GetTotalLength();
+};
+
+}  
+}  
+
+#endif  // DOM_SVG_SVGGEOMETRYELEMENT_H_

@@ -1,0 +1,47 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef nsSandboxFlags_h_
+#define nsSandboxFlags_h_
+
+const unsigned long SANDBOXED_NONE = 0x0;
+
+const unsigned long SANDBOXED_NAVIGATION = 0x1;
+
+const unsigned long SANDBOXED_AUXILIARY_NAVIGATION = 0x2;
+
+const unsigned long SANDBOXED_TOPLEVEL_NAVIGATION = 0x4;
+
+const unsigned long SANDBOXED_ORIGIN = 0x10;
+
+const unsigned long SANDBOXED_FORMS = 0x20;
+
+const unsigned long SANDBOXED_POINTER_LOCK = 0x40;
+
+const unsigned long SANDBOXED_SCRIPTS = 0x80;
+
+const unsigned long SANDBOXED_AUTOMATIC_FEATURES = 0x100;
+
+
+const unsigned long SANDBOXED_DOMAIN = 0x400;
+
+const unsigned long SANDBOXED_MODALS = 0x800;
+
+const unsigned long SANDBOX_PROPAGATES_TO_AUXILIARY_BROWSING_CONTEXTS = 0x1000;
+
+const unsigned long SANDBOXED_ORIENTATION_LOCK = 0x2000;
+
+const unsigned long SANDBOXED_PRESENTATION = 0x4000;
+
+const unsigned long SANDBOXED_STORAGE_ACCESS = 0x8000;
+
+const unsigned long SANDBOXED_TOPLEVEL_NAVIGATION_USER_ACTIVATION = 0x20000;
+
+const unsigned long SANDBOXED_DOWNLOADS = 0x10000;
+
+const unsigned long SANDBOXED_TOPLEVEL_NAVIGATION_CUSTOM_PROTOCOLS = 0x40000;
+
+const unsigned long SANDBOX_ALL_FLAGS = 0xFFFFF;
+#endif

@@ -1,0 +1,31 @@
+/*
+ * Copyright 2017 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkMaskBlurFilter_DEFINED)
+#define SkMaskBlurFilter_DEFINED
+
+#include <algorithm>
+#include <memory>
+#include <tuple>
+
+#include "include/core/SkTypes.h"
+#include "src/core/SkMask.h"
+
+class SkMaskBlurFilter {
+public:
+    SkMaskBlurFilter(double sigmaW, double sigmaH);
+
+    bool hasNoBlur() const;
+
+    SkIPoint blur(const SkMask& src, SkMaskBuilder* dst) const;
+
+private:
+    const double fSigmaW;
+    const double fSigmaH;
+};
+
+#endif

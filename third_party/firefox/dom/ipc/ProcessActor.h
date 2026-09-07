@@ -1,0 +1,31 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_ProcessActor_h
+#define mozilla_dom_ProcessActor_h
+
+#include "mozilla/dom/JSActorManager.h"
+#include "nsStringFwd.h"
+
+namespace mozilla {
+class ErrorResult;
+
+namespace dom {
+
+class JSActorProtocol;
+class JSActorService;
+
+class ProcessActor : public JSActorManager {
+ protected:
+  virtual ~ProcessActor() = default;
+
+  already_AddRefed<JSActorProtocol> MatchingJSActorProtocol(
+      JSActorService* aActorSvc, const nsACString& aName,
+      ErrorResult& aRv) final;
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_ProcessActor_h

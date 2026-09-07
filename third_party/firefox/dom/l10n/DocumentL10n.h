@@ -1,0 +1,67 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_l10n_DocumentL10n_h
+#define mozilla_dom_l10n_DocumentL10n_h
+
+#include "mozilla/dom/DOMLocalization.h"
+
+class nsIContentSink;
+
+namespace mozilla::dom {
+
+class Document;
+
+enum class DocumentL10nState {
+  Constructed = 0,
+
+  InitialTranslationTriggered,
+
+  Ready,
+};
+
+class DocumentL10n final : public DOMLocalization {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(DocumentL10n, DOMLocalization)
+
+  static RefPtr<DocumentL10n> Create(Document* aDocument, bool aSync);
+  static RefPtr<DocumentL10n> Create(Document* aDocument, bool aSync,
+                                     const nsTArray<nsCString>& aLocales);
+
+ protected:
+  explicit DocumentL10n(Document* aDocument, bool aSync);
+  explicit DocumentL10n(Document* aDocument, bool aSync,
+                        const nsTArray<nsCString>& aLocales);
+  virtual ~DocumentL10n() = default;
+
+  RefPtr<Document> mDocument;
+  RefPtr<Promise> mReady;
+  DocumentL10nState mState;
+  nsCOMPtr<nsIContentSink> mContentSink;
+
+ public:
+  virtual JSObject* WrapObject(JSContext* aCx,
+                               JS::Handle<JSObject*> aGivenProto) override;
+
+  Promise* Ready();
+
+  void TriggerInitialTranslation();
+  already_AddRefed<Promise> TranslateDocument(ErrorResult& aRv);
+
+  void InitialTranslationCompleted(bool aL10nCached);
+
+  Document* GetDocument() const { return mDocument; };
+  void OnCreatePresShell();
+
+  void ConnectRoot(nsINode& aNode, bool aTranslate, ErrorResult& aRv);
+
+  DocumentL10nState GetState() { return mState; };
+
+  bool mBlockingLayout = false;
+};
+
+}  
+
+#endif  // mozilla_dom_l10n_DocumentL10n_h

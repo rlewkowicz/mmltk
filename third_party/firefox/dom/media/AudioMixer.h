@@ -1,0 +1,86 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_AUDIOMIXER_H_
+#define MOZILLA_AUDIOMIXER_H_
+
+#include "AudioSampleFormat.h"
+#include "AudioSegment.h"
+#include "AudioStream.h"
+#include "mozilla/PodOperations.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+
+struct MixerCallbackReceiver {
+  virtual void MixerCallback(AudioChunk* aMixedBuffer,
+                             uint32_t aSampleRate) = 0;
+};
+class AudioMixer {
+ public:
+  AudioMixer() { mChunk.mBufferFormat = AUDIO_OUTPUT_FORMAT; }
+
+  ~AudioMixer() = default;
+
+  void StartMixing() {
+    mChunk.mDuration = 0;
+    mSampleRate = 0;
+  }
+
+  AudioChunk* MixedChunk() {
+    MOZ_ASSERT(mSampleRate, "Mix not called for this cycle?");
+    mSampleRate = 0;
+    return &mChunk;
+  };
+
+  void Mix(AudioDataValue* aSamples, uint32_t aChannels, uint32_t aFrames,
+           uint32_t aSampleRate) {
+    if (!mChunk.mDuration) {
+      mChunk.mDuration = aFrames;
+      MOZ_ASSERT(aChannels > 0);
+      mChunk.mChannelData.SetLength(aChannels);
+      mSampleRate = aSampleRate;
+      EnsureCapacityAndSilence();
+    }
+
+    MOZ_ASSERT(aFrames == mChunk.mDuration);
+    MOZ_ASSERT(aChannels == mChunk.ChannelCount());
+    MOZ_ASSERT(aSampleRate == mSampleRate);
+
+    if (!aSamples) {
+      return;
+    }
+
+    for (uint32_t i = 0; i < aFrames * aChannels; i++) {
+      mChunk.ChannelDataForWrite<AudioDataValue>(0)[i] += aSamples[i];
+    }
+  }
+
+ private:
+  void EnsureCapacityAndSilence() {
+    uint32_t sampleCount = mChunk.mDuration * mChunk.ChannelCount();
+    if (!mChunk.mBuffer || sampleCount > mSampleCapacity) {
+      CheckedInt<size_t> bufferSize(sizeof(AudioDataValue));
+      bufferSize *= sampleCount;
+      mChunk.mBuffer = SharedBuffer::Create(bufferSize);
+      mSampleCapacity = sampleCount;
+    }
+    MOZ_ASSERT(!mChunk.mBuffer->IsShared());
+    mChunk.mChannelData[0] =
+        static_cast<SharedBuffer*>(mChunk.mBuffer.get())->Data();
+    for (size_t i = 1; i < mChunk.ChannelCount(); ++i) {
+      mChunk.mChannelData[i] =
+          mChunk.ChannelData<AudioDataValue>()[0] + i * mChunk.mDuration;
+    }
+    PodZero(mChunk.ChannelDataForWrite<AudioDataValue>(0), sampleCount);
+  }
+
+  AudioChunk mChunk;
+  uint32_t mSampleCapacity = 0;
+  uint32_t mSampleRate = 0;
+};
+
+}  
+
+#endif  // MOZILLA_AUDIOMIXER_H_

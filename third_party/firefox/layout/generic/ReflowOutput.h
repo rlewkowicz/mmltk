@@ -1,0 +1,215 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_ReflowOutput_h
+#define mozilla_ReflowOutput_h
+
+#include "mozilla/EnumeratedRange.h"
+#include "mozilla/TypedEnumBits.h"
+#include "mozilla/WritingModes.h"
+#include "nsBoundingMetrics.h"
+#include "nsRect.h"
+
+
+namespace mozilla {
+struct ReflowInput;
+
+enum class OverflowType : uint8_t { Ink, Scrollable };
+constexpr auto AllOverflowTypes() {
+  return MakeInclusiveEnumeratedRange(OverflowType::Ink,
+                                      OverflowType::Scrollable);
+}
+
+enum class OverflowAreaUnionFlags : uint8_t {
+  None = 0,
+  AsIfScrolled = 1 << 0,
+  ChildIsAbsPos = 1 << 1,
+};
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(OverflowAreaUnionFlags)
+
+struct OverflowAreas {
+ public:
+  nsRect& InkOverflow() { return mInk; }
+  const nsRect& InkOverflow() const { return mInk; }
+
+  nsRect& ScrollableOverflow() { return mScrollable; }
+  const nsRect& ScrollableOverflow() const { return mScrollable; }
+
+  nsRect& Overflow(OverflowType aType) {
+    return aType == OverflowType::Ink ? InkOverflow() : ScrollableOverflow();
+  }
+  const nsRect& Overflow(OverflowType aType) const {
+    return aType == OverflowType::Ink ? InkOverflow() : ScrollableOverflow();
+  }
+
+  OverflowAreas() = default;
+
+  OverflowAreas(const nsRect& aInkOverflow, const nsRect& aScrollableOverflow)
+      : mInk(aInkOverflow), mScrollable(aScrollableOverflow) {}
+
+  bool operator==(const OverflowAreas& aOther) const {
+    return InkOverflow().IsEqualInterior(aOther.InkOverflow()) &&
+           ScrollableOverflow().IsEqualEdges(aOther.ScrollableOverflow());
+  }
+
+  bool operator!=(const OverflowAreas&) const = default;
+
+  OverflowAreas operator+(const nsPoint& aPoint) const {
+    OverflowAreas result(*this);
+    result += aPoint;
+    return result;
+  }
+
+  OverflowAreas& operator+=(const nsPoint& aPoint) {
+    mInk += aPoint;
+    mScrollable += aPoint;
+    return *this;
+  }
+
+  void Clear() { SetAllTo(nsRect()); }
+
+  void UnionWith(const OverflowAreas& aOther);
+
+  void UnionWithAbsoluteOverflowAreas(const OverflowAreas& aOther);
+
+  void UnionAllWith(const nsRect& aRect);
+
+  void SetAllTo(const nsRect& aRect);
+
+  void ApplyClipping(const nsRect& aBounds, PhysicalAxes aClipAxes,
+                     const nsMargin& aOverflowMargin) {
+    ApplyOverflowClippingOnRect(InkOverflow(), aBounds, aClipAxes,
+                                aOverflowMargin);
+    ApplyOverflowClippingOnRect(ScrollableOverflow(), aBounds, aClipAxes,
+                                aOverflowMargin);
+  }
+
+  static nsRect GetOverflowClipRect(const nsRect& aRectToClip,
+                                    const nsRect& aBounds,
+                                    PhysicalAxes aClipAxes,
+                                    const nsMargin& aOverflowMargin);
+
+  static void ApplyOverflowClippingOnRect(nsRect& aOverflowRect,
+                                          const nsRect& aBounds,
+                                          PhysicalAxes aClipAxes,
+                                          const nsMargin& aOverflowMargin);
+
+ private:
+  nsRect mInk;
+  nsRect mScrollable;
+};
+
+class CollapsingMargin final {
+ public:
+  bool operator==(const CollapsingMargin&) const = default;
+  bool operator!=(const CollapsingMargin&) const = default;
+
+  void Include(nscoord aCoord) {
+    if (aCoord > mMostPos) {
+      mMostPos = aCoord;
+    } else if (aCoord < mMostNeg) {
+      mMostNeg = aCoord;
+    }
+  }
+
+  void Include(const CollapsingMargin& aOther) {
+    if (aOther.mMostPos > mMostPos) {
+      mMostPos = aOther.mMostPos;
+    }
+    if (aOther.mMostNeg < mMostNeg) {
+      mMostNeg = aOther.mMostNeg;
+    }
+  }
+
+  void Zero() {
+    mMostPos = 0;
+    mMostNeg = 0;
+  }
+
+  bool IsZero() const { return mMostPos == 0 && mMostNeg == 0; }
+
+  nscoord Get() const { return mMostPos + mMostNeg; }
+
+ private:
+  nscoord mMostPos = 0;
+
+  nscoord mMostNeg = 0;
+};
+
+class ReflowOutput {
+ public:
+  explicit ReflowOutput(WritingMode aWritingMode)
+      : mSize(aWritingMode), mWritingMode(aWritingMode) {}
+
+  explicit ReflowOutput(const ReflowInput& aReflowInput);
+
+  nscoord ISize(WritingMode aWritingMode) const {
+    return mSize.ISize(aWritingMode);
+  }
+  nscoord BSize(WritingMode aWritingMode) const {
+    return mSize.BSize(aWritingMode);
+  }
+  LogicalSize Size(WritingMode aWritingMode) const {
+    return mSize.ConvertTo(aWritingMode, mWritingMode);
+  }
+
+  nscoord& ISize(WritingMode aWritingMode) { return mSize.ISize(aWritingMode); }
+  nscoord& BSize(WritingMode aWritingMode) { return mSize.BSize(aWritingMode); }
+
+  void SetSize(WritingMode aWM, const LogicalSize& aSize) {
+    mSize = aSize.ConvertTo(mWritingMode, aWM);
+  }
+
+  void ClearSize() { mSize.SizeTo(mWritingMode, 0, 0); }
+
+  nscoord Width() const { return mSize.Width(mWritingMode); }
+  nscoord Height() const { return mSize.Height(mWritingMode); }
+  nscoord& Width() {
+    return mWritingMode.IsVertical() ? mSize.BSize(mWritingMode)
+                                     : mSize.ISize(mWritingMode);
+  }
+  nscoord& Height() {
+    return mWritingMode.IsVertical() ? mSize.ISize(mWritingMode)
+                                     : mSize.BSize(mWritingMode);
+  }
+
+  nsSize PhysicalSize() const { return mSize.GetPhysicalSize(mWritingMode); }
+
+  enum { ASK_FOR_BASELINE = nscoord_MAX };
+  nscoord BlockStartAscent() const { return mBlockStartAscent; }
+  void SetBlockStartAscent(nscoord aAscent) { mBlockStartAscent = aAscent; }
+
+  nsBoundingMetrics mBoundingMetrics;  
+
+  CollapsingMargin mCarriedOutBEndMargin;
+
+  bool mNeedsTextBoxTrimAtFragmentEndRetry = false;
+
+  OverflowAreas mOverflowAreas;
+
+  nsRect& InkOverflow() { return mOverflowAreas.InkOverflow(); }
+  const nsRect& InkOverflow() const { return mOverflowAreas.InkOverflow(); }
+  nsRect& ScrollableOverflow() { return mOverflowAreas.ScrollableOverflow(); }
+  const nsRect& ScrollableOverflow() const {
+    return mOverflowAreas.ScrollableOverflow();
+  }
+
+  void SetOverflowAreasToDesiredBounds();
+
+  void UnionOverflowAreasWithDesiredBounds();
+
+  WritingMode GetWritingMode() const { return mWritingMode; }
+
+ private:
+  LogicalSize mSize;
+
+  nscoord mBlockStartAscent = ASK_FOR_BASELINE;
+
+  WritingMode mWritingMode;
+};
+
+}  
+
+#endif  // mozilla_ReflowOutput_h

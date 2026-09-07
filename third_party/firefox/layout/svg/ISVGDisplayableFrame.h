@@ -1,0 +1,77 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef LAYOUT_SVG_ISVGDISPLAYABLEFRAME_H_
+#define LAYOUT_SVG_ISVGDISPLAYABLEFRAME_H_
+
+#include "gfxMatrix.h"
+#include "gfxPoint.h"
+#include "gfxRect.h"
+#include "mozilla/EnumSet.h"
+#include "mozilla/gfx/MatrixFwd.h"
+#include "nsQueryFrame.h"
+#include "nsRect.h"
+
+class gfxContext;
+class nsIFrame;
+
+namespace mozilla {
+class SVGAnimatedLengthList;
+class SVGAnimatedNumberList;
+class SVGBBox;
+class SVGLengthList;
+class SVGNumberList;
+class SVGUserUnitList;
+
+namespace image {
+struct imgDrawingParams;
+}  
+
+enum class SVGBBoxFlag : uint16_t {
+  IncludeFillGeometry,
+  IncludeStroke,
+  IncludeStrokeGeometry,
+  IncludeMarkers,
+  IncludeClipped,
+  UseFrameBoundsForOuterSVG,
+  DisregardCSSZoom,
+  ForGetClientRects,
+  IncludeOnlyCurrentFrameForNonSVGElement,
+  UseUserSpaceOfUseElement,
+  DoNotClipToBBoxOfContentInsideClipPath,
+  AvoidCycleIfNonScalingStroke
+};
+using SVGBBoxFlags = EnumSet<SVGBBoxFlag>;
+
+class ISVGDisplayableFrame : public nsQueryFrame {
+ public:
+  using imgDrawingParams = image::imgDrawingParams;
+
+  NS_DECL_QUERYFRAME_TARGET(ISVGDisplayableFrame)
+
+  virtual void PaintSVG(gfxContext& aContext, const gfxMatrix& aTransform,
+                        imgDrawingParams& aImgParams) = 0;
+
+  virtual nsIFrame* GetFrameForPoint(const gfxPoint& aPoint) = 0;
+
+  virtual void ReflowSVG() = 0;
+
+  enum class ChangeFlag {
+    TransformChanged,
+    CoordContextChanged,
+    FullZoomChanged
+  };
+  using ChangeFlags = EnumSet<ChangeFlag>;
+
+  virtual void NotifySVGChanged(ChangeFlags aFlags) = 0;
+
+  virtual SVGBBox GetBBoxContribution(const gfx::Matrix& aToBBoxUserspace,
+                                      SVGBBoxFlags aFlags) = 0;
+
+  virtual bool IsDisplayContainer() = 0;
+};
+
+}  
+
+#endif  // LAYOUT_SVG_ISVGDISPLAYABLEFRAME_H_

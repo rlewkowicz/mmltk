@@ -1,0 +1,84 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#downloadsListBox > richlistitem:not([selected]) button {
+  -moz-user-focus: none;
+}
+
+#downloadsSummary:not([inprogress]) > vbox > #downloadsSummaryProgress,
+#downloadsSummary:not([inprogress]) > vbox > #downloadsSummaryDetails,
+#downloadsFooter:not([showingsummary]) #downloadsSummary {
+  display: none;
+}
+
+#downloadsFooter[showingsummary] > stack:hover > #downloadsSummary,
+#downloadsFooter[showingsummary] > stack:not(:hover) > #downloadsFooterButtons {
+  opacity: 0;
+  -moz-user-focus: ignore;
+}
+
+
+#downloadsListBox.allDownloadsListBox > richlistitem button {
+  -moz-user-focus: none;
+}
+
+.download-state[buttonhidden] > .downloadButton {
+  display: none;
+}
+
+.download-state:not([state="9"] )
+                                           .downloadBlockedBadge,
+
+.download-state:not([state="-1"],
+                    [state="5"], 
+                    [state="0"], 
+                    [state="4"], 
+                    [state="7"]  )
+                                           .downloadProgress {
+  display: none;
+}
+
+
+.download-state:not([state="-1"],
+                    [state="5"], 
+                    [state="0"], 
+                    [state="4"]  )
+                                           .downloadCancel,
+
+.download-state:not([state="2"], 
+                    [state="3"]  )
+                                           .downloadRetry,
+
+.download-state:not([state="1"]  )
+                                           .downloadShow {
+  display: none;
+}
+
+
+#downloadsPanel[hasdownloads] #emptyDownloads,
+#downloadsPanel:not([hasdownloads]) #downloadsListBox {
+  display: none;
+}
+
+
+#downloadsPanel-multiView > .panel-viewcontainer,
+#downloadsPanel-multiView > .panel-viewcontainer > .panel-viewstack {
+  max-width: unset;
+}
+
+#downloadsPanel-mainView {
+  min-width: 37em;
+  padding: 0.62em;
+}
+
+#downloadsHistory,
+#downloadsFooterButtons {
+  margin: 0;
+}
+
+.downloadMainArea,
+.downloadContainer {
+  min-width: 0;
+}

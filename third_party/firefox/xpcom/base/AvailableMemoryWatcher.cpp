@@ -1,0 +1,156 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "AvailableMemoryWatcher.h"
+
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/Services.h"
+#include "mozilla/StaticPtr.h"
+#include "nsMemoryPressure.h"
+#include "nsXULAppAPI.h"
+
+namespace mozilla {
+
+class NullTabUnloader final : public nsITabUnloader {
+  ~NullTabUnloader() = default;
+
+ public:
+  NullTabUnloader() = default;
+
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSITABUNLOADER
+};
+
+NS_IMPL_ISUPPORTS(NullTabUnloader, nsITabUnloader)
+
+NS_IMETHODIMP NullTabUnloader::UnloadTabAsync() {
+  return NS_ERROR_NOT_IMPLEMENTED;
+}
+
+StaticRefPtr<nsAvailableMemoryWatcherBase>
+    nsAvailableMemoryWatcherBase::sSingleton;
+
+already_AddRefed<nsAvailableMemoryWatcherBase>
+nsAvailableMemoryWatcherBase::GetSingleton() {
+  if (!sSingleton) {
+    sSingleton = CreateAvailableMemoryWatcher();
+    ClearOnShutdown(&sSingleton);
+  }
+
+  return do_AddRef(sSingleton);
+}
+
+NS_IMPL_ISUPPORTS(nsAvailableMemoryWatcherBase, nsIAvailableMemoryWatcherBase);
+
+nsAvailableMemoryWatcherBase::nsAvailableMemoryWatcherBase()
+    : mMutex("nsAvailableMemoryWatcher mutex"),
+      mNumOfTabUnloading(0),
+      mNumOfMemoryPressure(0),
+      mTabUnloader(new NullTabUnloader),
+      mInteracting(false) {
+  MOZ_ASSERT(XRE_IsParentProcess(),
+             "Watching memory only in the main process.");
+}
+
+const char* const nsAvailableMemoryWatcherBase::kObserverTopics[] = {
+    "xpcom-shutdown",
+    "user-interaction-active",
+    "user-interaction-inactive",
+};
+
+nsresult nsAvailableMemoryWatcherBase::Init() {
+  MOZ_ASSERT(NS_IsMainThread(),
+             "nsAvailableMemoryWatcherBase needs to be initialized "
+             "in the main thread.");
+
+  if (mObserverSvc) {
+    return NS_ERROR_ALREADY_INITIALIZED;
+  }
+
+  mObserverSvc = services::GetObserverService();
+  MOZ_ASSERT(mObserverSvc);
+
+  for (auto topic : kObserverTopics) {
+    nsresult rv = mObserverSvc->AddObserver(this, topic,
+                                             false);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+  return NS_OK;
+}
+
+void nsAvailableMemoryWatcherBase::Shutdown() {
+  for (auto topic : kObserverTopics) {
+    mObserverSvc->RemoveObserver(this, topic);
+  }
+}
+
+NS_IMETHODIMP
+nsAvailableMemoryWatcherBase::Observe(nsISupports* aSubject, const char* aTopic,
+                                      const char16_t* aData) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (strcmp(aTopic, "xpcom-shutdown") == 0) {
+    Shutdown();
+  } else if (strcmp(aTopic, "user-interaction-inactive") == 0) {
+    mInteracting = false;
+  } else if (strcmp(aTopic, "user-interaction-active") == 0) {
+    mInteracting = true;
+  }
+  return NS_OK;
+}
+
+nsresult nsAvailableMemoryWatcherBase::RegisterTabUnloader(
+    nsITabUnloader* aTabUnloader) {
+  mTabUnloader = aTabUnloader;
+  return NS_OK;
+}
+
+nsresult nsAvailableMemoryWatcherBase::OnUnloadAttemptCompleted(
+    nsresult aResult) {
+  MutexAutoLock lock(mMutex);
+  switch (aResult) {
+    case NS_OK:
+      ++mNumOfTabUnloading;
+      break;
+
+    case NS_ERROR_NOT_AVAILABLE:
+      ++mNumOfMemoryPressure;
+      NS_NotifyOfEventualMemoryPressure(MemoryPressureState::LowMemory);
+      break;
+
+    case NS_ERROR_ABORT:
+      break;
+
+    default:
+      MOZ_ASSERT_UNREACHABLE("Unexpected aResult");
+      break;
+  }
+  return NS_OK;
+}
+
+void nsAvailableMemoryWatcherBase::UpdateLowMemoryTimeStamp() {
+  if (mLowMemoryStart.IsNull()) {
+    mLowMemoryStart = TimeStamp::NowLoRes();
+  }
+}
+
+void nsAvailableMemoryWatcherBase::RecordTelemetryEventOnHighMemory(
+    const MutexAutoLock&) {
+
+  mNumOfTabUnloading = mNumOfMemoryPressure = 0;
+  mLowMemoryStart = TimeStamp();
+}
+
+#if 0 || \
+    !0 && !0 && !defined(XP_LINUX)
+already_AddRefed<nsAvailableMemoryWatcherBase> CreateAvailableMemoryWatcher() {
+  RefPtr instance(new nsAvailableMemoryWatcherBase);
+  return do_AddRef(instance);
+}
+#endif
+
+}  

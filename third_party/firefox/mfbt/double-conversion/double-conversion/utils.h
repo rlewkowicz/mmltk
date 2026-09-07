@@ -1,0 +1,289 @@
+// Copyright 2010 the V8 project authors. All rights reserved.
+// Redistribution and use in source and binary forms, with or without
+//     * Redistributions of source code must retain the above copyright
+//     * Redistributions in binary form must reproduce the above
+//       copyright notice, this list of conditions and the following
+//     * Neither the name of Google Inc. nor the names of its
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+
+#if !defined(DOUBLE_CONVERSION_UTILS_H_)
+#define DOUBLE_CONVERSION_UTILS_H_
+
+
+#include <cstdlib>
+#include <cstring>
+
+#if __cplusplus >= 201103L
+#define DOUBLE_CONVERSION_NULLPTR nullptr
+#else
+#define DOUBLE_CONVERSION_NULLPTR NULL
+#endif
+
+#include "mozilla/Assertions.h"
+
+#if !defined(DOUBLE_CONVERSION_ASSERT)
+#define DOUBLE_CONVERSION_ASSERT(condition)         \
+    MOZ_ASSERT(condition)
+#endif
+#if defined(DOUBLE_CONVERSION_NON_PREFIXED_MACROS) && !defined(ASSERT)
+#define ASSERT DOUBLE_CONVERSION_ASSERT
+#endif
+
+#if !defined(DOUBLE_CONVERSION_UNIMPLEMENTED)
+#define DOUBLE_CONVERSION_UNIMPLEMENTED() \
+    MOZ_CRASH("DOUBLE_CONVERSION_UNIMPLEMENTED")
+#endif
+#if defined(DOUBLE_CONVERSION_NON_PREFIXED_MACROS) && !defined(UNIMPLEMENTED)
+#define UNIMPLEMENTED DOUBLE_CONVERSION_UNIMPLEMENTED
+#endif
+
+#if !defined(DOUBLE_CONVERSION_NO_RETURN)
+#if defined(_MSC_VER)
+#define DOUBLE_CONVERSION_NO_RETURN __declspec(noreturn)
+#else
+#define DOUBLE_CONVERSION_NO_RETURN __attribute__((noreturn))
+#endif
+#endif
+#if defined(DOUBLE_CONVERSION_NON_PREFIXED_MACROS) && !defined(NO_RETURN)
+#define NO_RETURN DOUBLE_CONVERSION_NO_RETURN
+#endif
+
+#if !defined(DOUBLE_CONVERSION_UNREACHABLE)
+#if defined(_MSC_VER)
+void DOUBLE_CONVERSION_NO_RETURN abort_noreturn();
+inline void abort_noreturn() { MOZ_CRASH("abort_noreturn"); }
+#define DOUBLE_CONVERSION_UNREACHABLE()   (abort_noreturn())
+#else
+#define DOUBLE_CONVERSION_UNREACHABLE()   \
+    MOZ_CRASH("DOUBLE_CONVERSION_UNREACHABLE")
+#endif
+#endif
+#if defined(DOUBLE_CONVERSION_NON_PREFIXED_MACROS) && !defined(UNREACHABLE)
+#define UNREACHABLE DOUBLE_CONVERSION_UNREACHABLE
+#endif
+
+#if defined(__has_attribute)
+#   define DOUBLE_CONVERSION_HAS_ATTRIBUTE(x) __has_attribute(x)
+#else
+#   define DOUBLE_CONVERSION_HAS_ATTRIBUTE(x) 0
+#endif
+
+#if !defined(DOUBLE_CONVERSION_UNUSED)
+#if DOUBLE_CONVERSION_HAS_ATTRIBUTE(unused)
+#define DOUBLE_CONVERSION_UNUSED __attribute__((unused))
+#else
+#define DOUBLE_CONVERSION_UNUSED
+#endif
+#endif
+#if defined(DOUBLE_CONVERSION_NON_PREFIXED_MACROS) && !defined(UNUSED)
+#define UNUSED DOUBLE_CONVERSION_UNUSED
+#endif
+
+#if DOUBLE_CONVERSION_HAS_ATTRIBUTE(uninitialized)
+#define DOUBLE_CONVERSION_STACK_UNINITIALIZED __attribute__((uninitialized))
+#else
+#define DOUBLE_CONVERSION_STACK_UNINITIALIZED
+#endif
+#if defined(DOUBLE_CONVERSION_NON_PREFIXED_MACROS) && !defined(STACK_UNINITIALIZED)
+#define STACK_UNINITIALIZED DOUBLE_CONVERSION_STACK_UNINITIALIZED
+#endif
+
+#if defined(_M_X64) || defined(__x86_64__) || \
+    defined(__ARMEL__) || defined(__avr32__) || defined(_M_ARM) || defined(_M_ARM64) || \
+    defined(__hppa__) || defined(__ia64__) || \
+    defined(__mips__) || \
+    defined(__loongarch__) || \
+    defined(__nios2__) || defined(__ghs) || \
+    defined(__powerpc__) || defined(__ppc__) || defined(__ppc64__) || \
+    defined(_POWER) || defined(_ARCH_PPC) || defined(_ARCH_PPC64) || \
+    defined(__sparc__) || defined(__sparc) || defined(__s390__) || \
+    defined(__SH4__) || defined(__alpha__) || \
+    defined(_MIPS_ARCH_MIPS32R2) || defined(__ARMEB__) ||\
+    defined(__AARCH64EL__) || defined(__aarch64__) || defined(__AARCH64EB__) || \
+    defined(__riscv) || defined(__e2k__) || \
+    defined(__or1k__) || defined(__arc__) || defined(__ARC64__) || \
+    defined(__microblaze__) || defined(__XTENSA__) || \
+    defined(__EMSCRIPTEN__) || defined(__wasm32__)
+#define DOUBLE_CONVERSION_CORRECT_DOUBLE_OPERATIONS 1
+#elif defined(__mc68000__) || \
+    defined(__pnacl__) || defined(__native_client__)
+#undef DOUBLE_CONVERSION_CORRECT_DOUBLE_OPERATIONS
+#elif defined(_M_IX86) || defined(__i386__) || defined(__i386)
+#undef DOUBLE_CONVERSION_CORRECT_DOUBLE_OPERATIONS
+#else
+#error Target architecture was not detected as supported by Double-Conversion.
+#endif
+#if defined(DOUBLE_CONVERSION_NON_PREFIXED_MACROS) && !defined(CORRECT_DOUBLE_OPERATIONS)
+#define CORRECT_DOUBLE_OPERATIONS DOUBLE_CONVERSION_CORRECT_DOUBLE_OPERATIONS
+#endif
+
+
+#include <stdint.h>
+
+
+typedef uint16_t uc16;
+
+#define DOUBLE_CONVERSION_UINT64_2PART_C(a, b) (((static_cast<uint64_t>(a) << 32) + 0x##b##u))
+#if defined(DOUBLE_CONVERSION_NON_PREFIXED_MACROS) && !defined(UINT64_2PART_C)
+#define UINT64_2PART_C DOUBLE_CONVERSION_UINT64_2PART_C
+#endif
+
+#if !defined(DOUBLE_CONVERSION_ARRAY_SIZE)
+#define DOUBLE_CONVERSION_ARRAY_SIZE(a)                                   \
+  ((sizeof(a) / sizeof(*(a))) /                         \
+  static_cast<size_t>(!(sizeof(a) % sizeof(*(a)))))
+#endif
+#if defined(DOUBLE_CONVERSION_NON_PREFIXED_MACROS) && !defined(ARRAY_SIZE)
+#define ARRAY_SIZE DOUBLE_CONVERSION_ARRAY_SIZE
+#endif
+
+#if !defined(DOUBLE_CONVERSION_DISALLOW_COPY_AND_ASSIGN)
+#define DOUBLE_CONVERSION_DISALLOW_COPY_AND_ASSIGN(TypeName)      \
+  TypeName(const TypeName&);                    \
+  void operator=(const TypeName&)
+#endif
+#if defined(DOUBLE_CONVERSION_NON_PREFIXED_MACROS) && !defined(DC_DISALLOW_COPY_AND_ASSIGN)
+#define DC_DISALLOW_COPY_AND_ASSIGN DOUBLE_CONVERSION_DISALLOW_COPY_AND_ASSIGN
+#endif
+
+#if !defined(DOUBLE_CONVERSION_DISALLOW_IMPLICIT_CONSTRUCTORS)
+#define DOUBLE_CONVERSION_DISALLOW_IMPLICIT_CONSTRUCTORS(TypeName) \
+  TypeName();                                    \
+  DOUBLE_CONVERSION_DISALLOW_COPY_AND_ASSIGN(TypeName)
+#endif
+#if defined(DOUBLE_CONVERSION_NON_PREFIXED_MACROS) && !defined(DC_DISALLOW_IMPLICIT_CONSTRUCTORS)
+#define DC_DISALLOW_IMPLICIT_CONSTRUCTORS DOUBLE_CONVERSION_DISALLOW_IMPLICIT_CONSTRUCTORS
+#endif
+
+namespace double_conversion {
+
+inline int StrLength(const char* string) {
+  size_t length = strlen(string);
+  DOUBLE_CONVERSION_ASSERT(length == static_cast<size_t>(static_cast<int>(length)));
+  return static_cast<int>(length);
+}
+
+template <typename T>
+class Vector {
+ public:
+  Vector() : start_(DOUBLE_CONVERSION_NULLPTR), length_(0) {}
+  Vector(T* data, int len) : start_(data), length_(len) {
+    DOUBLE_CONVERSION_ASSERT(len == 0 || (len > 0 && data != DOUBLE_CONVERSION_NULLPTR));
+  }
+
+  Vector<T> SubVector(int from, int to) {
+    DOUBLE_CONVERSION_ASSERT(to <= length_);
+    DOUBLE_CONVERSION_ASSERT(from < to);
+    DOUBLE_CONVERSION_ASSERT(0 <= from);
+    return Vector<T>(start() + from, to - from);
+  }
+
+  int length() const { return length_; }
+
+  bool is_empty() const { return length_ == 0; }
+
+  T* start() const { return start_; }
+
+  T& operator[](int index) const {
+    DOUBLE_CONVERSION_ASSERT(0 <= index && index < length_);
+    return start_[index];
+  }
+
+  T& first() { return start_[0]; }
+
+  T& last() { return start_[length_ - 1]; }
+
+  void pop_back() {
+    DOUBLE_CONVERSION_ASSERT(!is_empty());
+    --length_;
+  }
+
+ private:
+  T* start_;
+  int length_;
+};
+
+
+class StringBuilder {
+ public:
+  StringBuilder(char* buffer, int buffer_size)
+      : buffer_(buffer, buffer_size), position_(0) { }
+
+  ~StringBuilder() { if (!is_finalized()) Finalize(); }
+
+  int size() const { return buffer_.length(); }
+
+  int position() const {
+    DOUBLE_CONVERSION_ASSERT(!is_finalized());
+    return position_;
+  }
+
+  void Reset() { position_ = 0; }
+
+  void AddCharacter(char c) {
+    DOUBLE_CONVERSION_ASSERT(c != '\0');
+    DOUBLE_CONVERSION_ASSERT(!is_finalized() && position_ < buffer_.length());
+    buffer_[position_++] = c;
+  }
+
+  void AddString(const char* s) {
+    AddSubstring(s, StrLength(s));
+  }
+
+  void AddSubstring(const char* s, int n) {
+    DOUBLE_CONVERSION_ASSERT(!is_finalized() && position_ + n < buffer_.length());
+    DOUBLE_CONVERSION_ASSERT(static_cast<size_t>(n) <= strlen(s));
+    memmove(&buffer_[position_], s, static_cast<size_t>(n));
+    position_ += n;
+  }
+
+
+  void AddPadding(char c, int count) {
+    for (int i = 0; i < count; i++) {
+      AddCharacter(c);
+    }
+  }
+
+  char* Finalize() {
+    DOUBLE_CONVERSION_ASSERT(!is_finalized() && position_ < buffer_.length());
+    buffer_[position_] = '\0';
+    DOUBLE_CONVERSION_ASSERT(strlen(buffer_.start()) == static_cast<size_t>(position_));
+    position_ = -1;
+    DOUBLE_CONVERSION_ASSERT(is_finalized());
+    return buffer_.start();
+  }
+
+ private:
+  Vector<char> buffer_;
+  int position_;
+
+  bool is_finalized() const { return position_ < 0; }
+
+  DOUBLE_CONVERSION_DISALLOW_IMPLICIT_CONSTRUCTORS(StringBuilder);
+};
+
+template <class Dest, class Source>
+Dest BitCast(const Source& source) {
+#if __cplusplus >= 201103L
+  static_assert(sizeof(Dest) == sizeof(Source),
+                "source and destination size mismatch");
+#else
+  DOUBLE_CONVERSION_UNUSED
+  typedef char VerifySizesAreEqual[sizeof(Dest) == sizeof(Source) ? 1 : -1];
+#endif
+
+  Dest dest;
+  memmove(&dest, &source, sizeof(dest));
+  return dest;
+}
+
+template <class Dest, class Source>
+Dest BitCast(Source* source) {
+  return BitCast<Dest>(reinterpret_cast<uintptr_t>(source));
+}
+
+}  
+
+#endif

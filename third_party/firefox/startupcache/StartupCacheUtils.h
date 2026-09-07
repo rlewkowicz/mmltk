@@ -1,0 +1,51 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef nsStartupCacheUtils_h_
+#define nsStartupCacheUtils_h_
+
+#include "nsString.h"
+#include "nsIStorageStream.h"
+#include "nsIObjectInputStream.h"
+#include "nsIObjectOutputStream.h"
+#include "mozilla/UniquePtrExtensions.h"
+
+class nsIURI;
+
+namespace mozilla {
+namespace scache {
+
+enum class ResourceType {
+  Gre,   
+  App,   
+  Xpi,   
+  File,  
+  Other  
+};
+
+nsresult NewObjectInputStreamFromBuffer(const char* buffer, uint32_t len,
+                                        nsIObjectInputStream** stream);
+
+nsresult NewObjectOutputWrappedStorageStream(
+    nsIObjectOutputStream** wrapperStream, nsIStorageStream** stream,
+    bool wantDebugStream);
+
+nsresult NewBufferFromStorageStream(nsIStorageStream* storageStream,
+                                    UniqueFreePtr<char[]>* buffer,
+                                    uint32_t* len);
+
+nsresult ResolveURI(nsIURI* in, nsIURI** out);
+
+nsresult PathifyURI(const char* loaderType, size_t loaderTypeLength, nsIURI* in,
+                    nsACString& out, ResourceType* aResourceType);
+
+template <int N>
+nsresult PathifyURI(const char (&loaderType)[N], nsIURI* in, nsACString& out,
+                    ResourceType* aResourceType) {
+  return PathifyURI(loaderType, N - 1, in, out, aResourceType);
+}
+
+}  
+}  
+
+#endif  // nsStartupCacheUtils_h_

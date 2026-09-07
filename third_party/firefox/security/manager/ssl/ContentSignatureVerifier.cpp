@@ -1,0 +1,413 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ContentSignatureVerifier.h"
+
+#include "AppTrustDomain.h"
+#include "CryptoTask.h"
+#include "ScopedNSSTypes.h"
+#include "SharedCertVerifier.h"
+#include "cryptohi.h"
+#include "keyhi.h"
+#include "mozilla/Base64.h"
+#include "mozilla/Logging.h"
+#include "mozilla/dom/Promise.h"
+#include "nsCOMPtr.h"
+#include "nsPromiseFlatString.h"
+#include "nsSecurityHeaderParser.h"
+#include "nsWhitespaceTokenizer.h"
+#include "mozpkix/pkix.h"
+#include "mozpkix/pkixtypes.h"
+#include "mozpkix/pkixutil.h"
+#include "secerr.h"
+#include "ssl.h"
+
+NS_IMPL_ISUPPORTS(ContentSignatureVerifier, nsIContentSignatureVerifier)
+
+using namespace mozilla;
+using namespace mozilla::pkix;
+using namespace mozilla::psm;
+using dom::Promise;
+
+static LazyLogModule gCSVerifierPRLog("ContentSignatureVerifier");
+#define CSVerifier_LOG(args) MOZ_LOG(gCSVerifierPRLog, LogLevel::Debug, args)
+
+const unsigned char kPREFIX[] = {'C', 'o', 'n', 't', 'e', 'n', 't',
+                                 '-', 'S', 'i', 'g', 'n', 'a', 't',
+                                 'u', 'r', 'e', ':', 0};
+
+class VerifyContentSignatureTask : public CryptoTask {
+ public:
+  VerifyContentSignatureTask(const nsACString& aData,
+                             const nsACString& aCSHeader,
+                             const nsACString& aCertChain,
+                             const nsACString& aHostname,
+                             AppTrustedRoot aTrustedRoot,
+                             RefPtr<Promise>& aPromise)
+      : mData(aData),
+        mCSHeader(aCSHeader),
+        mCertChain(aCertChain),
+        mHostname(aHostname),
+        mTrustedRoot(aTrustedRoot),
+        mSignatureVerified(false),
+        mPromise(new nsMainThreadPtrHolder<Promise>(
+            "VerifyContentSignatureTask::mPromise", aPromise)) {}
+
+ private:
+  virtual nsresult CalculateResult() override;
+  virtual void CallCallback(nsresult rv) override;
+
+  nsCString mData;
+  nsCString mCSHeader;
+  nsCString mCertChain;
+  nsCString mHostname;
+  AppTrustedRoot mTrustedRoot;
+  bool mSignatureVerified;
+  nsMainThreadPtrHandle<Promise> mPromise;
+};
+
+NS_IMETHODIMP
+ContentSignatureVerifier::AsyncVerifyContentSignature(
+    const nsACString& aData, const nsACString& aCSHeader,
+    const nsACString& aCertChain, const nsACString& aHostname,
+    AppTrustedRoot aTrustedRoot, JSContext* aCx, Promise** aPromise) {
+  NS_ENSURE_ARG_POINTER(aCx);
+
+  nsIGlobalObject* globalObject = xpc::CurrentNativeGlobal(aCx);
+  if (NS_WARN_IF(!globalObject)) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  ErrorResult result;
+  RefPtr<Promise> promise = Promise::Create(globalObject, result);
+  if (NS_WARN_IF(result.Failed())) {
+    return result.StealNSResult();
+  }
+
+  RefPtr<VerifyContentSignatureTask> task(new VerifyContentSignatureTask(
+      aData, aCSHeader, aCertChain, aHostname, aTrustedRoot, promise));
+  nsresult rv = task->Dispatch();
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  promise.forget(aPromise);
+  return NS_OK;
+}
+
+static nsresult VerifyContentSignatureInternal(
+    const nsACString& aData, const nsACString& aCSHeader,
+    const nsACString& aCertChain, const nsACString& aHostname,
+    AppTrustedRoot aTrustedRoot,
+     nsACString& aErrorLabel,
+     nsACString& aCertFingerprint,  uint32_t& aErrorValue);
+static nsresult ParseContentSignatureHeader(
+    const nsACString& aContentSignatureHeader,
+     nsCString& aSignature);
+
+nsresult VerifyContentSignatureTask::CalculateResult() {
+  nsAutoCString errorLabel("otherError"_ns);
+  nsAutoCString certFingerprint;
+  uint32_t errorValue = 3;
+  nsresult rv = VerifyContentSignatureInternal(
+      mData, mCSHeader, mCertChain, mHostname, mTrustedRoot, errorLabel,
+      certFingerprint, errorValue);
+  if (NS_FAILED(rv)) {
+    CSVerifier_LOG(("CSVerifier: Signature verification failed"));
+    if (certFingerprint.Length() > 0) {
+
+    }
+
+    if (rv == NS_ERROR_INVALID_SIGNATURE) {
+      return NS_OK;
+    }
+    return rv;
+  }
+
+  mSignatureVerified = true;
+
+
+  return NS_OK;
+}
+
+void VerifyContentSignatureTask::CallCallback(nsresult rv) {
+  if (NS_FAILED(rv)) {
+    mPromise->MaybeReject(rv);
+  } else {
+    mPromise->MaybeResolve(mSignatureVerified);
+  }
+}
+
+bool IsNewLine(char16_t c) { return c == '\n' || c == '\r'; }
+
+nsresult ReadChainIntoCertList(const nsACString& aCertChain,
+                               nsTArray<nsTArray<uint8_t>>& aCertList) {
+  bool inBlock = false;
+  bool certFound = false;
+
+  const nsCString header = "-----BEGIN CERTIFICATE-----"_ns;
+  const nsCString footer = "-----END CERTIFICATE-----"_ns;
+
+  nsCWhitespaceTokenizerTemplate<IsNewLine> tokenizer(aCertChain);
+
+  nsAutoCString blockData;
+  while (tokenizer.hasMoreTokens()) {
+    nsDependentCSubstring token = tokenizer.nextToken();
+    if (token.IsEmpty()) {
+      continue;
+    }
+    if (inBlock) {
+      if (token.Equals(footer)) {
+        inBlock = false;
+        certFound = true;
+        nsAutoCString derString;
+        nsresult rv = Base64Decode(blockData, derString);
+        if (NS_FAILED(rv)) {
+          CSVerifier_LOG(("CSVerifier: decoding the signature failed"));
+          return rv;
+        }
+        nsTArray<uint8_t> derBytes(derString.Data(), derString.Length());
+        aCertList.AppendElement(std::move(derBytes));
+      } else {
+        blockData.Append(token);
+      }
+    } else if (token.Equals(header)) {
+      inBlock = true;
+      blockData = "";
+    }
+  }
+  if (inBlock || !certFound) {
+    CSVerifier_LOG(("CSVerifier: supplied chain contains bad data"));
+    return NS_ERROR_FAILURE;
+  }
+  return NS_OK;
+}
+
+static nsresult VerifyContentSignatureInternal(
+    const nsACString& aData, const nsACString& aCSHeader,
+    const nsACString& aCertChain, const nsACString& aHostname,
+    AppTrustedRoot aTrustedRoot,
+     nsACString& aErrorLabel,
+     nsACString& aCertFingerprint,
+     uint32_t& aErrorValue) {
+  nsTArray<nsTArray<uint8_t>> certList;
+  nsresult rv = ReadChainIntoCertList(aCertChain, certList);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+  if (certList.Length() < 1) {
+    return NS_ERROR_FAILURE;
+  }
+  nsTArray<uint8_t>& certBytes(certList.ElementAt(0));
+  Input certInput;
+  mozilla::pkix::Result result =
+      certInput.Init(certBytes.Elements(), certBytes.Length());
+  if (result != Success) {
+    return NS_ERROR_FAILURE;
+  }
+
+  unsigned char fingerprint[SHA256_LENGTH] = {0};
+  SECStatus srv =
+      PK11_HashBuf(SEC_OID_SHA256, fingerprint, certInput.UnsafeGetData(),
+                   certInput.GetLength());
+  if (srv != SECSuccess) {
+    return NS_ERROR_FAILURE;
+  }
+  SECItem fingerprintItem = {siBuffer, fingerprint, SHA256_LENGTH};
+  UniquePORTString tmpFingerprintString(
+      CERT_Hexify(&fingerprintItem, false ));
+  if (!tmpFingerprintString) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+  aCertFingerprint.Assign(tmpFingerprintString.get());
+
+  nsTArray<Span<const uint8_t>> certSpans;
+  for (size_t i = 1; i < certList.Length(); i++) {
+    Span<const uint8_t> certSpan(certList.ElementAt(i).Elements(),
+                                 certList.ElementAt(i).Length());
+    certSpans.AppendElement(std::move(certSpan));
+  }
+  AppTrustDomain trustDomain(std::move(certSpans));
+  rv = trustDomain.SetTrustedRoot(aTrustedRoot);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+  result = BuildCertChain(
+      trustDomain, certInput, Now(), EndEntityOrCA::MustBeEndEntity,
+      KeyUsage::noParticularKeyUsageRequired, KeyPurposeId::id_kp_codeSigning,
+      CertPolicyId::anyPolicy, nullptr );
+  if (result != Success) {
+    if (IsFatalError(result)) {
+      return NS_ERROR_FAILURE;
+    }
+    if (result == mozilla::pkix::Result::ERROR_EXPIRED_CERTIFICATE) {
+      aErrorLabel = "expiredCert"_ns;
+      aErrorValue = 4;
+    } else if (result ==
+               mozilla::pkix::Result::ERROR_NOT_YET_VALID_CERTIFICATE) {
+      aErrorLabel = "certNotValidYet"_ns;
+      aErrorValue = 5;
+    } else {
+      aErrorLabel = "buildCertChainFailed"_ns;
+      aErrorValue = 6;
+    }
+    CSVerifier_LOG(("CSVerifier: The supplied chain is bad (%s)",
+                    MapResultToName(result)));
+    return NS_ERROR_INVALID_SIGNATURE;
+  }
+
+  Input hostnameInput;
+
+  result = hostnameInput.Init(
+      BitwiseCast<const uint8_t*, const char*>(aHostname.BeginReading()),
+      aHostname.Length());
+  if (result != Success) {
+    return NS_ERROR_FAILURE;
+  }
+
+  result = CheckCertHostname(certInput, hostnameInput);
+  if (result != Success) {
+    aErrorLabel = "eeCertForWrongHost"_ns;
+    aErrorValue = 7;
+    return NS_ERROR_INVALID_SIGNATURE;
+  }
+
+  pkix::BackCert backCert(certInput, EndEntityOrCA::MustBeEndEntity, nullptr);
+  result = backCert.Init();
+  if (result != Success) {
+    aErrorLabel = "extractKeyError"_ns;
+    aErrorValue = 8;
+    CSVerifier_LOG(("CSVerifier: couldn't decode certificate to get spki"));
+    return NS_ERROR_INVALID_SIGNATURE;
+  }
+  Input spkiInput = backCert.GetSubjectPublicKeyInfo();
+  SECItem spkiItem = {siBuffer, const_cast<uint8_t*>(spkiInput.UnsafeGetData()),
+                      spkiInput.GetLength()};
+  UniqueCERTSubjectPublicKeyInfo spki(
+      SECKEY_DecodeDERSubjectPublicKeyInfo(&spkiItem));
+  if (!spki) {
+    aErrorLabel = "extractKeyError"_ns;
+    aErrorValue = 8;
+    CSVerifier_LOG(("CSVerifier: couldn't decode spki"));
+    return NS_ERROR_INVALID_SIGNATURE;
+  }
+  mozilla::UniqueSECKEYPublicKey key(SECKEY_ExtractPublicKey(spki.get()));
+  if (!key) {
+    aErrorLabel = "extractKeyError"_ns;
+    aErrorValue = 8;
+    CSVerifier_LOG(("CSVerifier: unable to extract a key"));
+    return NS_ERROR_INVALID_SIGNATURE;
+  }
+
+  nsAutoCString signature;
+  rv = ParseContentSignatureHeader(aCSHeader, signature);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  nsAutoCString rawSignature;
+  rv = Base64Decode(signature, rawSignature);
+  if (NS_FAILED(rv)) {
+    CSVerifier_LOG(("CSVerifier: decoding the signature failed"));
+    return rv;
+  }
+
+  ScopedAutoSECItem signatureItem;
+  SECItem rawSignatureItem = {
+      siBuffer,
+      BitwiseCast<unsigned char*, const char*>(rawSignature.get()),
+      uint32_t(rawSignature.Length()),
+  };
+  if (rawSignatureItem.len == 0 || rawSignatureItem.len % 2 != 0) {
+    CSVerifier_LOG(("CSVerifier: signature length is bad"));
+    return NS_ERROR_FAILURE;
+  }
+  if (DSAU_EncodeDerSigWithLen(&signatureItem, &rawSignatureItem,
+                               rawSignatureItem.len) != SECSuccess) {
+    CSVerifier_LOG(("CSVerifier: encoding the signature failed"));
+    return NS_ERROR_FAILURE;
+  }
+
+  SECOidTag oid = SEC_OID_ANSIX962_ECDSA_SHA384_SIGNATURE;
+  mozilla::UniqueVFYContext cx(
+      VFY_CreateContext(key.get(), &signatureItem, oid, nullptr));
+  if (!cx) {
+    aErrorLabel = "vfyContextError"_ns;
+    aErrorValue = 9;
+    return NS_ERROR_INVALID_SIGNATURE;
+  }
+
+  if (VFY_Begin(cx.get()) != SECSuccess) {
+    aErrorLabel = "vfyContextError"_ns;
+    aErrorValue = 9;
+    return NS_ERROR_INVALID_SIGNATURE;
+  }
+  if (VFY_Update(cx.get(), kPREFIX, sizeof(kPREFIX)) != SECSuccess) {
+    aErrorLabel = "invalid"_ns;
+    aErrorValue = 1;
+    return NS_ERROR_INVALID_SIGNATURE;
+  }
+  if (VFY_Update(cx.get(),
+                 reinterpret_cast<const unsigned char*>(aData.BeginReading()),
+                 aData.Length()) != SECSuccess) {
+    aErrorLabel = "invalid"_ns;
+    aErrorValue = 1;
+    return NS_ERROR_INVALID_SIGNATURE;
+  }
+  if (VFY_End(cx.get()) != SECSuccess) {
+    aErrorLabel = "invalid"_ns;
+    aErrorValue = 1;
+    return NS_ERROR_INVALID_SIGNATURE;
+  }
+
+  return NS_OK;
+}
+
+static nsresult ParseContentSignatureHeader(
+    const nsACString& aContentSignatureHeader,
+     nsCString& aSignature) {
+  constexpr auto signature_var = "p384ecdsa"_ns;
+
+  aSignature.Truncate();
+
+  const nsCString& flatHeader = PromiseFlatCString(aContentSignatureHeader);
+  nsSecurityHeaderParser parser(flatHeader);
+  nsresult rv = parser.Parse();
+  if (NS_FAILED(rv)) {
+    CSVerifier_LOG(("CSVerifier: could not parse ContentSignature header"));
+    return NS_ERROR_FAILURE;
+  }
+  LinkedList<nsSecurityHeaderDirective>* directives = parser.GetDirectives();
+
+  for (nsSecurityHeaderDirective* directive = directives->getFirst();
+       directive != nullptr; directive = directive->getNext()) {
+    CSVerifier_LOG(
+        ("CSVerifier: found directive '%s'", directive->mName.get()));
+    if (directive->mName.EqualsIgnoreCase(signature_var)) {
+      if (!aSignature.IsEmpty()) {
+        CSVerifier_LOG(("CSVerifier: found two ContentSignatures"));
+        return NS_ERROR_INVALID_SIGNATURE;
+      }
+      if (directive->mValue.isNothing()) {
+        CSVerifier_LOG(("CSVerifier: found empty ContentSignature directive"));
+        return NS_ERROR_INVALID_SIGNATURE;
+      }
+
+      CSVerifier_LOG(("CSVerifier: found a ContentSignature directive"));
+      aSignature.Assign(*(directive->mValue));
+    }
+  }
+
+  if (aSignature.IsEmpty()) {
+    CSVerifier_LOG(
+        ("CSVerifier: got a Content-Signature header but didn't find a "
+         "signature."));
+    return NS_ERROR_FAILURE;
+  }
+
+  aSignature.ReplaceChar('-', '+');
+  aSignature.ReplaceChar('_', '/');
+
+  return NS_OK;
+}

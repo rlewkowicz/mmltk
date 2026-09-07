@@ -1,0 +1,88 @@
+// Copyright 2017 The ANGLE Project Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include "compiler/translator/tree_ops/RemoveArrayLengthMethod.h"
+
+#include "compiler/translator/IntermNode.h"
+#include "compiler/translator/tree_util/IntermTraverse.h"
+
+namespace sh
+{
+
+namespace
+{
+
+class RemoveArrayLengthTraverser : public TIntermTraverser
+{
+  public:
+    RemoveArrayLengthTraverser() : TIntermTraverser(true, false, false), mFoundArrayLength(false) {}
+
+    bool visitUnary(Visit visit, TIntermUnary *node) override;
+
+    void nextIteration() { mFoundArrayLength = false; }
+
+    bool foundArrayLength() const { return mFoundArrayLength; }
+
+  private:
+    void insertSideEffectsInParentBlock(TIntermTyped *node);
+
+    bool mFoundArrayLength;
+};
+
+bool RemoveArrayLengthTraverser::visitUnary(Visit visit, TIntermUnary *node)
+{
+    if (node->getOp() == EOpArrayLength && !node->getOperand()->getType().isUnsizedArray())
+    {
+        mFoundArrayLength = true;
+        insertSideEffectsInParentBlock(node->getOperand());
+        TConstantUnion *constArray = new TConstantUnion[1];
+        constArray->setIConst(node->getOperand()->getOutermostArraySize());
+        queueReplacement(new TIntermConstantUnion(constArray, node->getType()),
+                         OriginalNode::IS_DROPPED);
+        return false;
+    }
+    return true;
+}
+
+void RemoveArrayLengthTraverser::insertSideEffectsInParentBlock(TIntermTyped *node)
+{
+    if (!node->hasSideEffects())
+    {
+        return;
+    }
+
+    TIntermBinary *asBinary = node->getAsBinaryNode();
+    if (asBinary && !asBinary->isAssignment())
+    {
+        insertSideEffectsInParentBlock(asBinary->getLeft());
+        insertSideEffectsInParentBlock(asBinary->getRight());
+    }
+    else
+    {
+        insertStatementInParentBlock(node);
+    }
+}
+
+}  
+
+bool RemoveArrayLengthMethod(TCompiler *compiler, TIntermBlock *root)
+{
+    RemoveArrayLengthTraverser traverser;
+    do
+    {
+        traverser.nextIteration();
+        root->traverse(&traverser);
+        if (traverser.foundArrayLength())
+        {
+            if (!traverser.updateTree(compiler, root))
+            {
+                return false;
+            }
+        }
+    } while (traverser.foundArrayLength());
+
+    return true;
+}
+
+}  

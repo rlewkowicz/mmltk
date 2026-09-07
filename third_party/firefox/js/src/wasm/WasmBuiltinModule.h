@@ -1,0 +1,132 @@
+/*
+ * Copyright 2021 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#ifndef wasm_builtin_module_h
+#define wasm_builtin_module_h
+
+#include "mozilla/EnumeratedArray.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/Span.h"
+
+#include "wasm/WasmBuiltins.h"
+#include "wasm/WasmCompileArgs.h"
+#include "wasm/WasmConstants.h"
+#include "wasm/WasmModuleTypes.h"
+#include "wasm/WasmSerialize.h"
+#include "wasm/WasmTypeDecls.h"
+#include "wasm/WasmTypeDef.h"
+
+namespace js {
+namespace wasm {
+
+struct ImportValues;
+struct Import;
+
+struct MOZ_STACK_CLASS BuiltinModuleInstances {
+  explicit BuiltinModuleInstances(JSContext* cx)
+      : selfTest(cx), intGemm(cx), jsString(cx) {}
+
+  Rooted<JSObject*> selfTest;
+  Rooted<JSObject*> intGemm;
+  Rooted<JSObject*> jsString;
+
+  MutableHandle<JSObject*> operator[](BuiltinModuleId module) {
+    switch (module) {
+      case BuiltinModuleId::SelfTest: {
+        return &selfTest;
+      }
+      case BuiltinModuleId::IntGemm: {
+        return &intGemm;
+      }
+      case BuiltinModuleId::JSString: {
+        return &jsString;
+      }
+      default: {
+        MOZ_CRASH();
+      }
+    }
+  }
+};
+
+class BuiltinModuleFunc {
+ private:
+  SharedRecGroup recGroup_;
+  const char* exportName_;
+  const SymbolicAddressSignature* sig_;
+  bool usesMemory_;
+  BuiltinInlineOp inlineOp_;
+
+ public:
+  BuiltinModuleFunc() = default;
+
+  [[nodiscard]] bool init(const RefPtr<TypeContext>& types,
+                          mozilla::Span<const ValType> params,
+                          mozilla::Maybe<ValType> result, bool usesMemory,
+                          const SymbolicAddressSignature* sig,
+                          BuiltinInlineOp inlineOp, const char* exportName);
+
+  const RecGroup* recGroup() const { return recGroup_.get(); }
+  const TypeDef* typeDef() const { return &recGroup_->type(0); }
+  const FuncType* funcType() const { return &typeDef()->funcType(); }
+
+  const char* exportName() const { return exportName_; }
+  const SymbolicAddressSignature* sig() const { return sig_; }
+  bool usesMemory() const { return usesMemory_; }
+  BuiltinInlineOp inlineOp() const { return inlineOp_; }
+};
+
+class BuiltinModuleFuncs {
+  using Storage =
+      mozilla::EnumeratedArray<BuiltinModuleFuncId, BuiltinModuleFunc,
+                               size_t(BuiltinModuleFuncId::Limit)>;
+  Storage funcs_;
+
+  static BuiltinModuleFuncs* singleton_;
+
+ public:
+  [[nodiscard]] static bool init();
+  static void destroy();
+
+  static const BuiltinModuleFunc& getFromId(BuiltinModuleFuncId id) {
+    return singleton_->funcs_[id];
+  }
+};
+
+mozilla::Maybe<BuiltinModuleId> ImportMatchesBuiltinModule(
+    mozilla::Span<const char> importName,
+    const BuiltinModuleIds& enabledBuiltins);
+mozilla::Maybe<BuiltinModuleId> ImportMatchesBuiltinModule(
+    const Import& import, const BuiltinModuleIds& enabledBuiltins);
+
+bool ImportFieldMatchesBuiltinModuleDefinition(
+    mozilla::Span<const char> importName, BuiltinModuleId module,
+    DefinitionKind kind, const BuiltinModuleFunc** matchedFunc = nullptr,
+    BuiltinModuleFuncId* matchedFuncId = nullptr);
+
+[[nodiscard]] bool CompileBuiltinModule(
+    JSContext* cx, BuiltinModuleId module, const Import* moduleMemoryImport,
+    MutableHandle<WasmModuleObject*> result);
+
+[[nodiscard]] bool InstantiateBuiltinModule(JSContext* cx,
+                                            BuiltinModuleId module,
+                                            const Import* moduleMemoryImport,
+                                            Handle<JSObject*> importObj,
+                                            MutableHandle<JSObject*> result);
+
+}  
+}  
+
+#endif  // wasm_builtin_module_h

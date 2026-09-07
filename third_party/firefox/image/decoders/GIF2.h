@@ -1,0 +1,56 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_image_decoders_GIF2_H
+#define mozilla_image_decoders_GIF2_H
+
+#define MAX_LZW_BITS 12
+#define MAX_BITS 4097  // 2^MAX_LZW_BITS+1
+#define MAX_COLORS 256
+#define MIN_HOLD_SIZE 256
+
+enum { GIF_TRAILER = 0x3B };               
+enum { GIF_IMAGE_SEPARATOR = 0x2C };       
+enum { GIF_EXTENSION_INTRODUCER = 0x21 };  
+enum { GIF_GRAPHIC_CONTROL_LABEL = 0xF9 };
+enum { GIF_APPLICATION_EXTENSION_LABEL = 0xFF };
+
+typedef struct gif_struct {
+  uint8_t* stackp;  
+  int datasize;
+  int codesize;
+  int codemask;
+  int avail;  
+  int oldcode;
+  uint8_t firstchar;
+  int bits;       
+  int32_t datum;  
+
+  int64_t pixels_remaining;  
+
+  int tpixel;                
+  int32_t disposal_method;   
+  uint32_t* local_colormap;  
+  uint32_t local_colormap_buffer_size;  
+  int local_colormap_size;              
+  uint32_t delay_time;                  
+
+  int version;           
+  int32_t screen_width;  
+  int32_t screen_height;
+  uint8_t global_colormap_depth;   
+  uint16_t global_colormap_count;  
+  int images_decoded;              
+  int loop_count;  
+
+  bool is_transparent;  
+
+  uint16_t prefix[MAX_BITS];             
+  uint32_t global_colormap[MAX_COLORS];  
+  uint8_t suffix[MAX_BITS];              
+  uint8_t stack[MAX_BITS];               
+
+} gif_struct;
+
+#endif  // mozilla_image_decoders_GIF2_H

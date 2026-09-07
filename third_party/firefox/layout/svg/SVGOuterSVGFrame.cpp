@@ -1,0 +1,585 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "SVGOuterSVGFrame.h"
+
+#include "gfxContext.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/ReflowInput.h"
+#include "mozilla/SVGUtils.h"
+#include "mozilla/dom/BrowserChild.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/SVGSVGElement.h"
+#include "nsDisplayList.h"
+#include "nsIInterfaceRequestorUtils.h"
+#include "nsLayoutUtils.h"
+#include "nsObjectLoadingContent.h"
+#include "nsSubDocumentFrame.h"
+
+using namespace mozilla::dom;
+using namespace mozilla::gfx;
+using namespace mozilla::image;
+
+
+nsContainerFrame* NS_NewSVGOuterSVGFrame(mozilla::PresShell* aPresShell,
+                                         mozilla::ComputedStyle* aStyle) {
+  return new (aPresShell)
+      mozilla::SVGOuterSVGFrame(aStyle, aPresShell->GetPresContext());
+}
+
+namespace mozilla {
+
+NS_IMPL_FRAMEARENA_HELPERS(SVGOuterSVGFrame)
+
+SVGOuterSVGFrame::SVGOuterSVGFrame(ComputedStyle* aStyle,
+                                   nsPresContext* aPresContext)
+    : SVGDisplayContainerFrame(aStyle, aPresContext, kClassID) {
+  RemoveStateBits(NS_FRAME_SVG_LAYOUT);
+  AddStateBits(NS_FRAME_REFLOW_ROOT | NS_FRAME_FONT_INFLATION_CONTAINER |
+               NS_FRAME_FONT_INFLATION_FLOW_ROOT);
+}
+
+float SVGOuterSVGFrame::ComputeFullZoom() const {
+  MOZ_ASSERT(mIsRootContent);
+  MOZ_ASSERT(!mIsInIframe);
+  if (BrowsingContext* bc = PresContext()->Document()->GetBrowsingContext()) {
+    return bc->FullZoom();
+  }
+  return 1.0f;
+}
+
+class AsyncSendIntrinsicSizeAndRatioToEmbedder final : public Runnable {
+ public:
+  explicit AsyncSendIntrinsicSizeAndRatioToEmbedder(SVGOuterSVGFrame* aFrame)
+      : Runnable("AsyncSendIntrinsicSizeAndRatioToEmbedder") {
+    mElement = aFrame->GetContent()->AsElement();
+  }
+  NS_IMETHOD Run() override {
+    if (SVGOuterSVGFrame* frame = do_QueryFrame(mElement->GetPrimaryFrame())) {
+      frame->MaybeSendIntrinsicSizeAndRatioToEmbedder();
+    }
+    return NS_OK;
+  }
+
+ private:
+  RefPtr<Element> mElement;
+};
+
+void SVGOuterSVGFrame::Init(nsIContent* aContent, nsContainerFrame* aParent,
+                            nsIFrame* aPrevInFlow) {
+  NS_ASSERTION(aContent->IsSVGElement(nsGkAtoms::svg),
+               "Content is not an SVG 'svg' element!");
+
+  auto* svg = static_cast<SVGSVGElement*>(aContent);
+  if (!svg->PassesConditionalProcessingTests()) {
+    AddStateBits(NS_FRAME_IS_NONDISPLAY);
+  }
+
+  SVGDisplayContainerFrame::Init(aContent, aParent, aPrevInFlow);
+
+  Document* doc = mContent->GetUncomposedDoc();
+  mIsRootContent = doc && doc->GetRootElement() == mContent;
+
+  if (mIsRootContent) {
+    if (nsCOMPtr<nsIDocShell> docShell = PresContext()->GetDocShell()) {
+      RefPtr<BrowsingContext> bc = docShell->GetBrowsingContext();
+      if (const Maybe<nsString>& type = bc->GetEmbedderElementType()) {
+        mIsInObjectOrEmbed =
+            nsGkAtoms::object->Equals(*type) || nsGkAtoms::embed->Equals(*type);
+        mIsInIframe = nsGkAtoms::iframe->Equals(*type);
+      }
+    }
+    if (!mIsInIframe) {
+      mFullZoom = ComputeFullZoom();
+    }
+  }
+
+  nsContentUtils::AddScriptRunner(
+      MakeAndAddRef<AsyncSendIntrinsicSizeAndRatioToEmbedder>(this));
+}
+
+
+NS_QUERYFRAME_HEAD(SVGOuterSVGFrame)
+  NS_QUERYFRAME_ENTRY(SVGOuterSVGFrame)
+  NS_QUERYFRAME_ENTRY(ISVGSVGFrame)
+NS_QUERYFRAME_TAIL_INHERITING(SVGDisplayContainerFrame)
+
+
+nscoord SVGOuterSVGFrame::IntrinsicISize(const IntrinsicSizeInput& aInput,
+                                         IntrinsicISizeType aType) {
+  if (aType == IntrinsicISizeType::MinISize) {
+    return GetIntrinsicSize().ISize(GetWritingMode()).valueOr(0);
+  }
+
+  nscoord result;
+  SVGSVGElement* svg = static_cast<SVGSVGElement*>(GetContent());
+  WritingMode wm = GetWritingMode();
+  const SVGAnimatedLength& isize =
+      wm.IsVertical() ? svg->mLengthAttributes[SVGSVGElement::ATTR_HEIGHT]
+                      : svg->mLengthAttributes[SVGSVGElement::ATTR_WIDTH];
+
+  if (Maybe<nscoord> containISize =
+          ContainSizeAxesIfApplicable().ContainIntrinsicISize(*this)) {
+    result = *containISize;
+  } else if (isize.IsPercentage()) {
+    if (isize.IsExplicitlySet() ||
+        StylePosition()
+            ->ISize(wm, AnchorPosResolutionParams::From(this))
+            ->HasPercent() ||
+        !GetAspectRatio()) {
+      result = wm.IsVertical() ? kFallbackIntrinsicSize.height
+                               : kFallbackIntrinsicSize.width;
+    } else {
+      result = nscoord(0);
+    }
+  } else {
+    result =
+        nsPresContext::CSSPixelsToAppUnits(isize.GetAnimValueWithZoom(svg));
+    if (result < 0) {
+      result = nscoord(0);
+    }
+  }
+
+  return result;
+}
+
+IntrinsicSize SVGOuterSVGFrame::GetIntrinsicSize() {
+
+  const auto containAxes = ContainSizeAxesIfApplicable();
+  if (containAxes.IsBoth()) {
+    return FinishIntrinsicSize(containAxes, IntrinsicSize(0, 0));
+  }
+
+  SVGSVGElement* content = static_cast<SVGSVGElement*>(GetContent());
+  const SVGAnimatedLength& width =
+      content->mLengthAttributes[SVGSVGElement::ATTR_WIDTH];
+  const SVGAnimatedLength& height =
+      content->mLengthAttributes[SVGSVGElement::ATTR_HEIGHT];
+
+  IntrinsicSize intrinsicSize;
+
+  if (!width.IsPercentage()) {
+    nscoord val =
+        nsPresContext::CSSPixelsToAppUnits(width.GetAnimValueWithZoom(content));
+    intrinsicSize.width.emplace(std::max(val, 0));
+  }
+
+  if (!height.IsPercentage()) {
+    nscoord val = nsPresContext::CSSPixelsToAppUnits(
+        height.GetAnimValueWithZoom(content));
+    intrinsicSize.height.emplace(std::max(val, 0));
+  }
+
+  return FinishIntrinsicSize(containAxes, intrinsicSize);
+}
+
+AspectRatio SVGOuterSVGFrame::GetIntrinsicRatio() const {
+  if (AspectRatio ratio =
+          static_cast<SVGSVGElement*>(GetContent())->GetIntrinsicRatio()) {
+    return ratio;
+  }
+  return SVGDisplayContainerFrame::GetIntrinsicRatio();
+}
+
+nsIFrame::SizeComputationResult SVGOuterSVGFrame::ComputeSize(
+    const SizeComputationInput& aSizingInput, WritingMode aWritingMode,
+    const LogicalSize& aCBSize, nscoord aAvailableISize,
+    const LogicalSize& aMargin, const LogicalSize& aBorderPadding,
+    const StyleSizeOverrides& aSizeOverrides, ComputeSizeFlags aFlags) {
+  if (IsRootOfImage() || mIsInObjectOrEmbed) {
+    return {aCBSize, AspectRatioUsage::None};
+  }
+
+  LogicalSize cbSize = aCBSize;
+  IntrinsicSize intrinsicSize = GetIntrinsicSize();
+  AspectRatio ratio = GetAspectRatio();
+  if (mIsRootContent) {
+    NS_ASSERTION(aCBSize.ISize(aWritingMode) != NS_UNCONSTRAINEDSIZE &&
+                     aCBSize.BSize(aWritingMode) != NS_UNCONSTRAINEDSIZE,
+                 "root should not have auto-width/height containing block");
+
+    if (!mIsInIframe) {
+      const float zoom = ComputeFullZoom();
+      cbSize.ISize(aWritingMode) *= zoom;
+      cbSize.BSize(aWritingMode) *= zoom;
+    }
+  }
+
+  return {ComputeSizeWithIntrinsicDimensions(
+              aSizingInput.mRenderingContext, aWritingMode, intrinsicSize,
+              ratio, cbSize, aMargin, aBorderPadding, aSizeOverrides, aFlags),
+          AspectRatioUsage::None};
+}
+
+void SVGOuterSVGFrame::Reflow(nsPresContext* aPresContext,
+                              ReflowOutput& aDesiredSize,
+                              const ReflowInput& aReflowInput,
+                              nsReflowStatus& aStatus) {
+  MarkInReflow();
+  DO_GLOBAL_REFLOW_COUNT("SVGOuterSVGFrame");
+  MOZ_ASSERT(aStatus.IsEmpty(), "Caller should pass a fresh reflow status!");
+  NS_FRAME_TRACE(
+      NS_FRAME_TRACE_CALLS,
+      ("enter SVGOuterSVGFrame::Reflow: availSize=%d,%d",
+       aReflowInput.AvailableWidth(), aReflowInput.AvailableHeight()));
+
+  MOZ_ASSERT(HasAnyStateBits(NS_FRAME_IN_REFLOW), "frame is not in reflow");
+
+  const auto wm = GetWritingMode();
+  aDesiredSize.SetSize(wm, aReflowInput.ComputedSizeWithBorderPadding(wm));
+
+  NS_ASSERTION(!GetPrevInFlow(), "SVG can't currently be broken across pages.");
+
+  SVGSVGElement* svgElem = static_cast<SVGSVGElement*>(GetContent());
+
+  auto* anonKid = static_cast<SVGOuterSVGAnonChildFrame*>(
+      PrincipalChildList().FirstChild());
+
+  if (HasAnyStateBits(NS_FRAME_FIRST_REFLOW)) {
+    svgElem->UpdateHasChildrenOnlyTransform();
+  }
+
+
+  gfx::Size newViewportSize(
+      nsPresContext::AppUnitsToFloatCSSPixels(aReflowInput.ComputedWidth()),
+      nsPresContext::AppUnitsToFloatCSSPixels(aReflowInput.ComputedHeight()));
+
+  ChangeFlags changeBits;
+  if (newViewportSize != svgElem->GetViewportSize()) {
+    if (svgElem->HasViewBoxOrSyntheticViewBox()) {
+      nsIFrame* anonChild = PrincipalChildList().FirstChild();
+      anonChild->MarkSubtreeDirty();
+      for (nsIFrame* child : anonChild->PrincipalChildList()) {
+        child->MarkSubtreeDirty();
+      }
+    }
+    changeBits += ChangeFlag::CoordContextChanged;
+    svgElem->SetViewportSize(newViewportSize);
+  }
+  if (mIsRootContent && !mIsInIframe) {
+    const auto oldZoom = mFullZoom;
+    mFullZoom = ComputeFullZoom();
+    if (oldZoom != mFullZoom) {
+      changeBits += ChangeFlag::FullZoomChanged;
+    }
+  }
+  if (!changeBits.isEmpty() && !HasAnyStateBits(NS_FRAME_FIRST_REFLOW)) {
+    NotifyViewportOrTransformChanged(changeBits);
+  }
+
+  mCallingReflowSVG = true;
+  if (HasAnyStateBits(NS_FRAME_IS_NONDISPLAY)) {
+    ReflowSVGNonDisplayText(this);
+  } else {
+    anonKid->ReflowSVG();
+    MOZ_ASSERT(!anonKid->GetNextSibling(),
+               "We should have one anonymous child frame wrapping our real "
+               "children");
+  }
+  mCallingReflowSVG = false;
+
+  anonKid->SetPosition(GetContentRectRelativeToSelf().TopLeft());
+
+  aDesiredSize.SetOverflowAreasToDesiredBounds();
+
+  if (!HasAnyStateBits(NS_FRAME_IS_NONDISPLAY)) {
+    if (!mIsRootContent) {
+      aDesiredSize.mOverflowAreas.InkOverflow().UnionRect(
+          aDesiredSize.mOverflowAreas.InkOverflow(),
+          anonKid->InkOverflowRect() + anonKid->GetPosition());
+    }
+    FinishAndStoreOverflow(&aDesiredSize);
+  }
+
+  NS_FRAME_TRACE(NS_FRAME_TRACE_CALLS,
+                 ("exit SVGOuterSVGFrame::Reflow: size=%d,%d",
+                  aDesiredSize.Width(), aDesiredSize.Height()));
+}
+
+void SVGOuterSVGFrame::UnionChildOverflow(OverflowAreas& aOverflowAreas,
+                                          bool aAsIfScrolled) {
+
+
+  if (!mIsRootContent) {
+    nsIFrame* anonKid = PrincipalChildList().FirstChild();
+    aOverflowAreas.InkOverflow().UnionRect(
+        aOverflowAreas.InkOverflow(),
+        anonKid->InkOverflowRect() + anonKid->GetPosition());
+  }
+}
+
+
+nsresult SVGOuterSVGFrame::AttributeChanged(int32_t aNameSpaceID,
+                                            nsAtom* aAttribute, AttrModType) {
+  if (aNameSpaceID == kNameSpaceID_None &&
+      !HasAnyStateBits(NS_FRAME_FIRST_REFLOW | NS_FRAME_IS_NONDISPLAY)) {
+    if (aAttribute == nsGkAtoms::viewBox ||
+        aAttribute == nsGkAtoms::preserveAspectRatio) {
+      mCanvasTM = nullptr;
+
+      SVGUtils::NotifyChildrenOfSVGChange(
+          PrincipalChildList().FirstChild(),
+          aAttribute == nsGkAtoms::viewBox
+              ? ChangeFlags(ChangeFlag::TransformChanged,
+                            ChangeFlag::CoordContextChanged)
+              : ChangeFlag::TransformChanged);
+
+      if (aAttribute != nsGkAtoms::transform) {
+        static_cast<SVGSVGElement*>(GetContent())
+            ->ChildrenOnlyTransformChanged();
+      }
+    }
+    if (aAttribute == nsGkAtoms::width || aAttribute == nsGkAtoms::height ||
+        aAttribute == nsGkAtoms::viewBox) {
+
+      MaybeSendIntrinsicSizeAndRatioToEmbedder();
+
+      if (!mIsInObjectOrEmbed) {
+        PresShell()->FrameNeedsReflow(
+            this, IntrinsicDirty::FrameAncestorsAndDescendants,
+            NS_FRAME_IS_DIRTY);
+      }
+    }
+  }
+
+  return NS_OK;
+}
+
+
+void SVGOuterSVGFrame::BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                                        const nsDisplayListSet& aLists) {
+  if (HasAnyStateBits(NS_FRAME_IS_NONDISPLAY)) {
+    return;
+  }
+
+  DisplayBorderBackgroundOutline(aBuilder, aLists);
+
+  nsRect visibleRect = aBuilder->GetVisibleRect();
+  nsRect dirtyRect = aBuilder->GetDirtyRect();
+
+  DisplayListClipState::AutoSaveRestore autoSR(aBuilder);
+  if (mIsRootContent || StyleDisplay()->IsScrollableOverflow()) {
+    autoSR.ClipContainingBlockDescendantsToContentBox(aBuilder, this);
+    visibleRect = visibleRect.Intersect(GetContentRectRelativeToSelf());
+    dirtyRect = dirtyRect.Intersect(GetContentRectRelativeToSelf());
+  }
+
+  nsDisplayListBuilder::AutoBuildingDisplayList building(
+      aBuilder, this, visibleRect, dirtyRect);
+
+  nsDisplayList* contentList = aLists.Content();
+  nsDisplayListSet set(contentList, contentList, contentList, contentList,
+                       contentList, contentList);
+  BuildDisplayListForNonBlockChildren(aBuilder, set);
+}
+
+
+void SVGOuterSVGFrame::NotifyViewportOrTransformChanged(ChangeFlags aFlags) {
+  auto* content = static_cast<SVGSVGElement*>(GetContent());
+  if (aFlags.contains(ChangeFlag::CoordContextChanged)) {
+    if (content->HasViewBox()) {
+      aFlags = ChangeFlag::TransformChanged;
+    } else if (content->ShouldSynthesizeViewBox()) {
+      aFlags += ChangeFlag::TransformChanged;
+    } else if (mCanvasTM && mCanvasTM->IsSingular()) {
+      aFlags += ChangeFlag::TransformChanged;
+    }
+  }
+
+  bool haveNonFullZoomTransformChange =
+      aFlags.contains(ChangeFlag::TransformChanged);
+
+  if (aFlags.contains(ChangeFlag::FullZoomChanged)) {
+    aFlags -= ChangeFlag::FullZoomChanged;
+    aFlags += ChangeFlag::TransformChanged;
+  }
+
+  if (aFlags.contains(ChangeFlag::TransformChanged)) {
+    mCanvasTM = nullptr;
+
+    if (haveNonFullZoomTransformChange &&
+        !HasAnyStateBits(NS_FRAME_IS_NONDISPLAY)) {
+      SVGViewportElement::ChildrenOnlyTransformChangedFlags flags;
+      if (HasAnyStateBits(NS_FRAME_IN_REFLOW)) {
+        flags +=
+            SVGViewportElement::ChildrenOnlyTransformChangedFlag::DuringReflow;
+      }
+      content->ChildrenOnlyTransformChanged(flags);
+    }
+  }
+
+  SVGUtils::NotifyChildrenOfSVGChange(PrincipalChildList().FirstChild(),
+                                      aFlags);
+}
+
+
+void SVGOuterSVGFrame::PaintSVG(gfxContext& aContext,
+                                const gfxMatrix& aTransform,
+                                imgDrawingParams& aImgParams) {
+  NS_ASSERTION(
+      PrincipalChildList().FirstChild()->IsSVGOuterSVGAnonChildFrame() &&
+          !PrincipalChildList().FirstChild()->GetNextSibling(),
+      "We should have a single, anonymous, child");
+  auto* anonKid = static_cast<SVGOuterSVGAnonChildFrame*>(
+      PrincipalChildList().FirstChild());
+  anonKid->PaintSVG(aContext, aTransform, aImgParams);
+}
+
+SVGBBox SVGOuterSVGFrame::GetBBoxContribution(
+    const gfx::Matrix& aToBBoxUserspace, SVGBBoxFlags aFlags) {
+  NS_ASSERTION(
+      PrincipalChildList().FirstChild()->IsSVGOuterSVGAnonChildFrame() &&
+          !PrincipalChildList().FirstChild()->GetNextSibling(),
+      "We should have a single, anonymous, child");
+  auto* anonKid = static_cast<SVGOuterSVGAnonChildFrame*>(
+      PrincipalChildList().FirstChild());
+  return anonKid->GetBBoxContribution(aToBBoxUserspace, aFlags);
+}
+
+
+gfxMatrix SVGOuterSVGFrame::GetCanvasTM() {
+  if (!mCanvasTM) {
+    auto* content = static_cast<SVGSVGElement*>(GetContent());
+    float devPxPerCSSPx = 1.0f / nsPresContext::AppUnitsToFloatCSSPixels(
+                                     PresContext()->AppUnitsPerDevPixel());
+
+    gfxMatrix tm = content->ChildToUserSpaceTransform().PostScale(
+        devPxPerCSSPx, devPxPerCSSPx);
+    mCanvasTM = std::make_unique<gfxMatrix>(tm);
+  }
+  return *mCanvasTM;
+}
+
+
+bool SVGOuterSVGFrame::IsRootOfImage() {
+  if (!mContent->GetParent()) {
+    Document* doc = mContent->GetUncomposedDoc();
+    if (doc && doc->IsBeingUsedAsImage()) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool SVGOuterSVGFrame::VerticalScrollbarNotNeeded() const {
+  const SVGAnimatedLength& height =
+      static_cast<SVGSVGElement*>(GetContent())
+          ->mLengthAttributes[SVGSVGElement::ATTR_HEIGHT];
+  return height.IsPercentage() && height.GetBaseValInSpecifiedUnits() <= 100;
+}
+
+void SVGOuterSVGFrame::AppendDirectlyOwnedAnonBoxes(
+    nsTArray<OwnedAnonBox>& aResult) {
+  nsIFrame* anonKid = PrincipalChildList().FirstChild();
+  MOZ_ASSERT(anonKid->IsSVGOuterSVGAnonChildFrame());
+  aResult.AppendElement(OwnedAnonBox(anonKid));
+}
+
+void SVGOuterSVGFrame::MaybeSendIntrinsicSizeAndRatioToEmbedder() {
+  MaybeSendIntrinsicSizeAndRatioToEmbedder(Some(GetIntrinsicSize()),
+                                           Some(GetIntrinsicRatio()));
+}
+
+void SVGOuterSVGFrame::MaybeSendIntrinsicSizeAndRatioToEmbedder(
+    Maybe<IntrinsicSize> aIntrinsicSize, Maybe<AspectRatio> aIntrinsicRatio) {
+  if (!mIsInObjectOrEmbed) {
+    return;
+  }
+
+  nsCOMPtr<nsIDocShell> docShell = PresContext()->GetDocShell();
+  if (!docShell) {
+    return;
+  }
+
+  BrowsingContext* bc = docShell->GetBrowsingContext();
+  MOZ_ASSERT(bc->IsContentSubframe());
+
+  if (bc->GetParent()->IsInProcess()) {
+    if (Element* embedder = bc->GetEmbedderElement()) {
+      if (nsCOMPtr<nsIObjectLoadingContent> olc = do_QueryInterface(embedder)) {
+        static_cast<nsObjectLoadingContent*>(olc.get())
+            ->SubdocumentIntrinsicSizeOrRatioChanged(aIntrinsicSize,
+                                                     aIntrinsicRatio);
+      }
+      return;
+    }
+  }
+
+  if (BrowserChild* browserChild = BrowserChild::GetFrom(docShell)) {
+    (void)browserChild->SendIntrinsicSizeOrRatioChanged(aIntrinsicSize,
+                                                        aIntrinsicRatio);
+  }
+}
+
+void SVGOuterSVGFrame::DidSetComputedStyle(ComputedStyle* aOldComputedStyle) {
+  SVGDisplayContainerFrame::DidSetComputedStyle(aOldComputedStyle);
+
+  if (!aOldComputedStyle) {
+    return;
+  }
+
+  if (aOldComputedStyle->StylePosition()->mAspectRatio !=
+      StylePosition()->mAspectRatio) {
+    MaybeSendIntrinsicSizeAndRatioToEmbedder();
+  }
+}
+
+void SVGOuterSVGFrame::Destroy(DestroyContext& aContext) {
+  MaybeSendIntrinsicSizeAndRatioToEmbedder(Nothing(), Nothing());
+
+  SVGDisplayContainerFrame::Destroy(aContext);
+}
+
+}  
+
+
+nsContainerFrame* NS_NewSVGOuterSVGAnonChildFrame(
+    mozilla::PresShell* aPresShell, mozilla::ComputedStyle* aStyle) {
+  return new (aPresShell)
+      mozilla::SVGOuterSVGAnonChildFrame(aStyle, aPresShell->GetPresContext());
+}
+
+namespace mozilla {
+
+NS_IMPL_FRAMEARENA_HELPERS(SVGOuterSVGAnonChildFrame)
+
+#ifdef DEBUG
+void SVGOuterSVGAnonChildFrame::Init(nsIContent* aContent,
+                                     nsContainerFrame* aParent,
+                                     nsIFrame* aPrevInFlow) {
+  MOZ_ASSERT(aParent->IsSVGOuterSVGFrame(), "Unexpected parent");
+  SVGDisplayContainerFrame::Init(aContent, aParent, aPrevInFlow);
+}
+#endif
+
+void SVGOuterSVGAnonChildFrame::BuildDisplayList(
+    nsDisplayListBuilder* aBuilder, const nsDisplayListSet& aLists) {
+  nsDisplayList newList(aBuilder);
+  nsDisplayListSet set(&newList, &newList, &newList, &newList, &newList,
+                       &newList);
+  BuildDisplayListForNonBlockChildren(aBuilder, set);
+  aLists.Content()->AppendNewToTop<nsDisplaySVGWrapper>(aBuilder, this,
+                                                        &newList);
+}
+
+bool SVGOuterSVGFrame::HasChildrenOnlyTransform(Matrix* aTransform) const {
+  auto* content = static_cast<SVGSVGElement*>(GetContent());
+  if (!content->HasChildrenOnlyTransform()) {
+    return false;
+  }
+  if (aTransform) {
+    *aTransform = gfx::ToMatrix(content->ChildToUserSpaceTransform());
+  }
+  return true;
+}
+
+bool SVGOuterSVGAnonChildFrame::DoGetParentSVGTransforms(
+    Matrix* aFromParentTransform) const {
+  SVGUtils::GetParentSVGTransforms(this, aFromParentTransform);
+  return true;
+}
+
+}  

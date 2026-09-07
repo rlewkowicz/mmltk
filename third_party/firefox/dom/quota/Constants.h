@@ -1,0 +1,36 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_QUOTA_CONSTANTS_H_
+#define DOM_QUOTA_CONSTANTS_H_
+
+#include "nsLiteralString.h"
+#include "prtime.h"
+
+#define METADATA_FILE_NAME u".metadata"
+#define METADATA_TMP_FILE_NAME u".metadata-tmp"
+#define METADATA_V2_FILE_NAME u".metadata-v2"
+#define METADATA_V2_TMP_FILE_NAME u".metadata-v2-tmp"
+
+namespace mozilla::dom::quota {
+
+constexpr int64_t kSecPerDay = 86400;
+
+constexpr int64_t kSecPerWeek = 7 * kSecPerDay;
+
+constexpr int64_t aDefaultCutoffAccessTime = kSecPerWeek * PR_USEC_PER_SEC;
+
+const char kChromeOrigin[] = "chrome";
+
+constexpr auto kSQLiteSuffix = u".sqlite"_ns;
+
+constexpr nsLiteralCString kUUIDOriginScheme = "uuid"_ns;
+
+const uint32_t kNoQuotaVersion = 0;
+
+const uint32_t kCurrentQuotaVersion = 1;
+
+}  
+
+#endif  // DOM_QUOTA_CONSTANTS_H_

@@ -1,0 +1,115 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_SingleLineTextInputTypes_h_
+#define mozilla_dom_SingleLineTextInputTypes_h_
+
+#include "mozilla/dom/InputType.h"
+
+namespace mozilla::dom {
+
+class SingleLineTextInputTypeBase : public InputType {
+ public:
+  ~SingleLineTextInputTypeBase() override = default;
+
+  bool MinAndMaxLengthApply() const final { return true; }
+  bool IsTooLong() const final;
+  bool IsTooShort() const final;
+  bool IsValueMissing() const final;
+  Maybe<bool> HasPatternMismatch() const final;
+
+ protected:
+  explicit SingleLineTextInputTypeBase(HTMLInputElement* aInputElement)
+      : InputType(aInputElement) {}
+
+  bool IsMutable() const override;
+};
+
+class TextInputType : public SingleLineTextInputTypeBase {
+ public:
+  static InputType* Create(HTMLInputElement* aInputElement, void* aMemory) {
+    return new (aMemory) TextInputType(aInputElement);
+  }
+
+ private:
+  explicit TextInputType(HTMLInputElement* aInputElement)
+      : SingleLineTextInputTypeBase(aInputElement) {}
+};
+
+class SearchInputType : public SingleLineTextInputTypeBase {
+ public:
+  static InputType* Create(HTMLInputElement* aInputElement, void* aMemory) {
+    return new (aMemory) SearchInputType(aInputElement);
+  }
+
+ private:
+  explicit SearchInputType(HTMLInputElement* aInputElement)
+      : SingleLineTextInputTypeBase(aInputElement) {}
+};
+
+class TelInputType : public SingleLineTextInputTypeBase {
+ public:
+  static InputType* Create(HTMLInputElement* aInputElement, void* aMemory) {
+    return new (aMemory) TelInputType(aInputElement);
+  }
+
+ private:
+  explicit TelInputType(HTMLInputElement* aInputElement)
+      : SingleLineTextInputTypeBase(aInputElement) {}
+};
+
+class URLInputType : public SingleLineTextInputTypeBase {
+ public:
+  static InputType* Create(HTMLInputElement* aInputElement, void* aMemory) {
+    return new (aMemory) URLInputType(aInputElement);
+  }
+
+  bool HasTypeMismatch() const override;
+
+  nsresult GetTypeMismatchMessage(nsAString& aMessage) override;
+
+ private:
+  explicit URLInputType(HTMLInputElement* aInputElement)
+      : SingleLineTextInputTypeBase(aInputElement) {}
+};
+
+class EmailInputType : public SingleLineTextInputTypeBase {
+ public:
+  static InputType* Create(HTMLInputElement* aInputElement, void* aMemory) {
+    return new (aMemory) EmailInputType(aInputElement);
+  }
+
+  bool HasTypeMismatch() const override;
+  bool HasBadInput() const override;
+
+  nsresult GetTypeMismatchMessage(nsAString& aMessage) override;
+  nsresult GetBadInputMessage(nsAString& aMessage) override;
+
+ private:
+  explicit EmailInputType(HTMLInputElement* aInputElement)
+      : SingleLineTextInputTypeBase(aInputElement) {}
+
+  static bool IsValidEmailAddress(const nsAString& aValue);
+
+  static bool IsValidEmailAddressList(const nsAString& aValue);
+
+  static bool PunycodeEncodeEmailAddress(const nsAString& aEmail,
+                                         nsAutoCString& aEncodedEmail,
+                                         uint32_t* aIndexOfAt);
+};
+
+class PasswordInputType : public SingleLineTextInputTypeBase {
+ public:
+  static InputType* Create(HTMLInputElement* aInputElement, void* aMemory) {
+    return new (aMemory) PasswordInputType(aInputElement);
+  }
+
+ private:
+  explicit PasswordInputType(HTMLInputElement* aInputElement)
+      : SingleLineTextInputTypeBase(aInputElement) {}
+};
+
+}  
+
+#endif /* mozilla_dom_SingleLineTextInputTypes_h_ */

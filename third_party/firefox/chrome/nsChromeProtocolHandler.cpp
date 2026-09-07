@@ -1,0 +1,134 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "nsChromeProtocolHandler.h"
+#include "nsChromeRegistry.h"
+#include "nsCOMPtr.h"
+#include "nsContentUtils.h"
+#include "nsThreadUtils.h"
+#include "nsIChannel.h"
+#include "nsIChromeRegistry.h"
+#include "nsIFile.h"
+#include "nsIFileChannel.h"
+#include "nsIStandardURL.h"
+#include "nsNetUtil.h"
+#include "nsNetCID.h"
+#include "nsIURL.h"
+#include "nsString.h"
+#include "nsStandardURL.h"
+
+
+NS_IMPL_ISUPPORTS(nsChromeProtocolHandler, nsIProtocolHandler,
+                  nsISupportsWeakReference)
+
+
+NS_IMETHODIMP
+nsChromeProtocolHandler::GetScheme(nsACString& result) {
+  result.AssignLiteral("chrome");
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsChromeProtocolHandler::AllowPort(int32_t port, const char* scheme,
+                                   bool* _retval) {
+  *_retval = false;
+  return NS_OK;
+}
+
+ nsresult nsChromeProtocolHandler::CreateNewURI(
+    const nsACString& aSpec, const char* aCharset, nsIURI* aBaseURI,
+    nsIURI** result) {
+  nsresult rv;
+  nsCOMPtr<nsIURI> surl;
+  rv =
+      NS_MutateURI(new mozilla::net::nsStandardURL::Mutator())
+          .Apply(&nsIStandardURLMutator::Init, nsIStandardURL::URLTYPE_STANDARD,
+                 -1, aSpec, aCharset, aBaseURI, nullptr)
+
+          .Finalize(surl);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+
+  rv = nsChromeRegistry::Canonify(surl);
+  (void)NS_WARN_IF(NS_FAILED(rv));
+
+  surl.forget(result);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsChromeProtocolHandler::NewChannel(nsIURI* aURI, nsILoadInfo* aLoadInfo,
+                                    nsIChannel** aResult) {
+  nsresult rv;
+
+  NS_ENSURE_ARG_POINTER(aURI);
+  NS_ENSURE_ARG_POINTER(aLoadInfo);
+
+  MOZ_ASSERT(aResult, "Null out param");
+
+  nsCOMPtr<nsIURI> debugURL = aURI;
+  rv = nsChromeRegistry::Canonify(debugURL);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  nsCOMPtr<nsIChannel> result;
+
+  if (!nsChromeRegistry::gChromeRegistry) {
+    nsCOMPtr<nsIChromeRegistry> reg = mozilla::services::GetChromeRegistry();
+    NS_ENSURE_TRUE(nsChromeRegistry::gChromeRegistry, NS_ERROR_FAILURE);
+  }
+
+  nsCOMPtr<nsIURI> resolvedURI;
+  rv = nsChromeRegistry::gChromeRegistry->ConvertChromeURL(
+      aURI, getter_AddRefs(resolvedURI));
+  if (NS_FAILED(rv)) {
+#ifdef DEBUG
+    printf("Couldn't convert chrome URL: %s\n", aURI->GetSpecOrDefault().get());
+#endif
+    return rv;
+  }
+
+  nsCOMPtr<nsIURI> savedResultPrincipalURI;
+  rv =
+      aLoadInfo->GetResultPrincipalURI(getter_AddRefs(savedResultPrincipalURI));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = NS_NewChannelInternal(getter_AddRefs(result), resolvedURI, aLoadInfo);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+#ifdef DEBUG
+  nsCOMPtr<nsIFileChannel> fileChan(do_QueryInterface(result));
+  if (fileChan) {
+    nsCOMPtr<nsIFile> file;
+    fileChan->GetFile(getter_AddRefs(file));
+
+    bool exists = false;
+    file->Exists(&exists);
+    if (!exists) {
+      printf("Chrome file doesn't exist: %s\n",
+             file->HumanReadablePath().get());
+    }
+  }
+#endif
+
+  rv = aLoadInfo->SetResultPrincipalURI(savedResultPrincipalURI);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = result->SetOriginalURI(aURI);
+  if (NS_FAILED(rv)) return rv;
+
+  nsAutoCString path;
+  aURI->GetPathQueryRef(path);
+  if (StringBeginsWith(path, "/content/"_ns) ||
+      StringBeginsWith(path, "/skin/"_ns)) {
+    result->SetOwner(nsContentUtils::GetSystemPrincipal());
+  }
+
+  result->SetContentCharset("UTF-8"_ns);
+
+  result.forget(aResult);
+  return NS_OK;
+}
+

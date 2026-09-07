@@ -1,0 +1,86 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+include("/js/app.mozbuild")
+
+DIRS += [
+    "/tools",
+    "/xpcom/xpidl",
+]
+
+if CONFIG["COMPILE_ENVIRONMENT"]:
+    DIRS += [
+        "/config/external",
+        "/security",
+    ]
+
+if not CONFIG["MOZ_OVERRIDE_GKRUST"]:
+    DIRS += [
+        "/toolkit/library/rust",
+    ]
+
+
+DIRS += [
+    "/config/external/abseil-cpp",
+    "/config/external/freetype2",
+    "/intl",
+    "/modules/libpref",
+    "/netwerk",
+    "/xpcom",
+]
+
+# Gecko/Core components.
+
+DIRS += [
+    "/ipc",
+    "/hal",
+    "/js/loader",
+    "/js/xpconnect",
+    "/modules/libjar",
+    "/storage",
+]
+
+if CONFIG["COMPILE_ENVIRONMENT"]:
+    DIRS += [
+        "/media/libyuv",
+    ]
+
+DIRS += [
+    "/extensions/permissions",
+]
+
+
+DIRS += [
+    "/uriloader",
+    "/caps",
+    "/parser",
+    "/gfx",
+    "/image",
+    "/dom",
+    "/widget",
+    "/editor",
+    "/layout",
+    "/docshell",
+    "/xpfe/appshell",
+]
+
+# toolkit
+
+DIRS += [
+    "/security/certverifier",
+    "/security/manager",
+    "/toolkit",
+]
+
+DIRS += [
+    "/toolkit/library",
+    "/services",
+    "/startupcache",
+    "/other-licenses/snappy",
+]
+
+DIRS += [
+    "/media/mozva",
+    "/toolkit/system/gnome",
+]

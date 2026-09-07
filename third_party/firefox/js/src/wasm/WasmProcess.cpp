@@ -1,0 +1,225 @@
+/*
+ * Copyright 2017 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "wasm/WasmProcess.h"
+
+#include "gc/Memory.h"
+#include "threading/ExclusiveData.h"
+#include "vm/MutexIDs.h"
+#include "vm/Runtime.h"
+#include "wasm/WasmBuiltinModule.h"
+#include "wasm/WasmBuiltins.h"
+#include "wasm/WasmCode.h"
+#include "wasm/WasmComponent.h"
+#include "wasm/WasmInstance.h"
+#include "wasm/WasmModuleTypes.h"
+#include "wasm/WasmStaticTypeDefs.h"
+
+using namespace js;
+using namespace wasm;
+
+mozilla::Atomic<bool> wasm::CodeExists(false);
+
+
+
+static mozilla::Atomic<ThreadSafeCodeBlockMap*> sThreadSafeCodeBlockMap(
+    nullptr);
+
+bool wasm::RegisterCodeBlock(const CodeBlock* cs) {
+  if (cs->length() == 0) {
+    return true;
+  }
+
+  ThreadSafeCodeBlockMap* map = sThreadSafeCodeBlockMap;
+  MOZ_RELEASE_ASSERT(map);
+  bool result = map->insert(cs);
+  if (result) {
+    CodeExists = true;
+  }
+  return result;
+}
+
+void wasm::UnregisterCodeBlock(const CodeBlock* cs) {
+  if (cs->length() == 0) {
+    return;
+  }
+
+  ThreadSafeCodeBlockMap* map = sThreadSafeCodeBlockMap;
+  MOZ_RELEASE_ASSERT(map);
+  size_t newCount = map->remove(cs);
+  if (newCount == 0) {
+    CodeExists = false;
+  }
+}
+
+const CodeBlock* wasm::LookupCodeBlock(
+    const void* pc, const CodeRange** codeRange ) {
+  ThreadSafeCodeBlockMap* map = sThreadSafeCodeBlockMap;
+  if (!map) {
+    return nullptr;
+  }
+
+  return map->lookup(pc, codeRange);
+}
+
+const Code* wasm::LookupCode(const void* pc,
+                             const CodeRange** codeRange ) {
+  const CodeBlock* found = LookupCodeBlock(pc, codeRange);
+  MOZ_ASSERT_IF(!found && codeRange, !*codeRange);
+  return found ? found->code : nullptr;
+}
+
+bool wasm::InCompiledCode(void* pc) {
+  if (LookupCodeBlock(pc)) {
+    return true;
+  }
+
+  const CodeRange* codeRange;
+  const uint8_t* codeBase;
+  return LookupBuiltinThunk(pc, &codeRange, &codeBase);
+}
+
+#ifdef WASM_SUPPORTS_HUGE_MEMORY
+#  if defined(__riscv)
+static const size_t MinAddressBitsForHugeMemory = 47;
+#  else
+static const size_t MinAddressBitsForHugeMemory = 38;
+#  endif
+
+static const size_t MinVirtualMemoryLimitForHugeMemory =
+    size_t(1) << MinAddressBitsForHugeMemory;
+#endif
+
+static bool sHugeMemoryEnabled32 = false;
+
+bool wasm::IsHugeMemoryEnabled(wasm::AddressType t, wasm::PageSize sz) {
+  if (t == AddressType::I64 || sz != wasm::PageSize::Standard) {
+    return false;
+  }
+  return sHugeMemoryEnabled32;
+}
+
+void ConfigureHugeMemory() {
+#ifdef WASM_SUPPORTS_HUGE_MEMORY
+  MOZ_ASSERT(!sHugeMemoryEnabled32);
+
+  if (JS::Prefs::wasm_disable_huge_memory()) {
+    return;
+  }
+
+  if (gc::SystemAddressBits() < MinAddressBitsForHugeMemory) {
+    return;
+  }
+
+  if (gc::VirtualMemoryLimit() != size_t(-1) &&
+      gc::VirtualMemoryLimit() < MinVirtualMemoryLimitForHugeMemory) {
+    return;
+  }
+
+  sHugeMemoryEnabled32 = true;
+#endif
+}
+
+#ifdef ENABLE_WASM_JSPI
+const TagType* wasm::sJSPromiseTagType = nullptr;
+#endif
+const TagType* wasm::sWrappedJSValueTagType = nullptr;
+
+static bool InitStaticTagTypes() {
+  MutableTagType type = js_new<TagType>();
+  if (!type || !type->initialize(StaticTypeDefs::jsExceptionTag)) {
+    return false;
+  }
+  MOZ_ASSERT(WrappedJSValueTagType_ValueOffset ==
+             type->exceptionArgOffsets()[0]);
+  type.forget(&sWrappedJSValueTagType);
+
+#ifdef ENABLE_WASM_JSPI
+  type = js_new<TagType>();
+  if (!type || !type->initialize(StaticTypeDefs::jsPromiseTag)) {
+    return false;
+  }
+  type.forget(&sJSPromiseTagType);
+#endif
+
+  return true;
+}
+
+bool wasm::Init() {
+  MOZ_RELEASE_ASSERT(!sThreadSafeCodeBlockMap);
+
+  uintptr_t pageSize = gc::SystemPageSize();
+  MOZ_RELEASE_ASSERT(wasm::NullPtrGuardSize <= pageSize);
+  MOZ_RELEASE_ASSERT(intptr_t(nullptr) == AnyRef::NullRefValue);
+
+  ConfigureHugeMemory();
+
+  AutoEnterOOMUnsafeRegion oomUnsafe;
+  ThreadSafeCodeBlockMap* map = js_new<ThreadSafeCodeBlockMap>();
+  if (!map) {
+    oomUnsafe.crash("js::wasm::Init");
+  }
+
+  if (!StaticTypeDefs::init()) {
+    oomUnsafe.crash("js::wasm::Init");
+  }
+
+  if (!BuiltinModuleFuncs::init()) {
+    oomUnsafe.crash("js::wasm::Init");
+  }
+
+  sThreadSafeCodeBlockMap = map;
+
+  if (!InitStaticTagTypes()) {
+    oomUnsafe.crash("js::wasm::Init");
+  }
+
+  return true;
+}
+
+void wasm::ShutDown() {
+  if (JSRuntime::hasLiveRuntimes()) {
+    return;
+  }
+
+  BuiltinModuleFuncs::destroy();
+  StaticTypeDefs::destroy();
+  PurgeCanonicalTypes();
+#ifdef ENABLE_WASM_COMPONENTS
+  PurgeComponentCanonicalTypes();
+#endif
+
+#ifdef ENABLE_WASM_JSPI
+  if (sJSPromiseTagType) {
+    sJSPromiseTagType->Release();
+    sJSPromiseTagType = nullptr;
+  }
+#endif
+
+  if (sWrappedJSValueTagType) {
+    sWrappedJSValueTagType->Release();
+    sWrappedJSValueTagType = nullptr;
+  }
+
+  ThreadSafeCodeBlockMap* map = sThreadSafeCodeBlockMap;
+  MOZ_RELEASE_ASSERT(map);
+  sThreadSafeCodeBlockMap = nullptr;
+  while (map->numActiveLookups() > 0) {
+  }
+
+  ReleaseBuiltinThunks();
+  js_delete(map);
+}

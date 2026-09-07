@@ -1,0 +1,136 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "HitTestInfoManager.h"
+#include "HitTestInfo.h"
+
+#include "mozilla/gfx/CompositorHitTestInfo.h"
+#include "mozilla/layers/ScrollableLayerGuid.h"
+#include "nsDisplayList.h"
+
+#define DEBUG_HITTEST_INFO 0
+#if DEBUG_HITTEST_INFO
+#  define HITTEST_INFO_LOG(...) printf_stderr(__VA_ARGS__)
+#else
+#  define HITTEST_INFO_LOG(...)
+#endif
+
+namespace mozilla::layers {
+
+using ViewID = ScrollableLayerGuid::ViewID;
+
+static int32_t GetAppUnitsFromDisplayItem(nsDisplayItem* aItem) {
+  nsIFrame* frame = aItem->Frame();
+  MOZ_ASSERT(frame);
+  return frame->PresContext()->AppUnitsPerDevPixel();
+}
+
+static void CreateWebRenderCommands(wr::DisplayListBuilder& aBuilder,
+                                    nsDisplayItem* aItem, const nsRect& aArea,
+                                    const gfx::CompositorHitTestInfo& aFlags,
+                                    const ViewID& aViewId) {
+  const Maybe<SideBits> sideBits =
+      aBuilder.GetContainingFixedPosSideBits(aItem->GetActiveScrolledRoot());
+
+  const LayoutDeviceRect devRect =
+      LayoutDeviceRect::FromAppUnits(aArea, GetAppUnitsFromDisplayItem(aItem));
+  const wr::LayoutRect rect = wr::ToLayoutRect(devRect);
+
+  aBuilder.PushHitTest(rect, rect, !aItem->BackfaceIsHidden(), aViewId, aFlags,
+                       sideBits.valueOr(SideBits::eNone));
+}
+
+HitTestInfoManager::HitTestInfoManager()
+    : mFlags(gfx::CompositorHitTestInvisibleToHit),
+      mViewId(ScrollableLayerGuid::NULL_SCROLL_ID),
+      mSpaceAndClipChain(wr::InvalidScrollNodeWithChain()) {}
+
+void HitTestInfoManager::Reset() {
+  mArea = nsRect();
+  mFlags = gfx::CompositorHitTestInvisibleToHit;
+  mViewId = ScrollableLayerGuid::NULL_SCROLL_ID;
+  mSpaceAndClipChain = wr::InvalidScrollNodeWithChain();
+
+  HITTEST_INFO_LOG("* HitTestInfoManager::Reset\n");
+}
+
+bool HitTestInfoManager::ProcessItem(
+    nsDisplayItem* aItem, wr::DisplayListBuilder& aBuilder,
+    nsDisplayListBuilder* aDisplayListBuilder) {
+  MOZ_ASSERT(aItem);
+
+  HITTEST_INFO_LOG("* HitTestInfoManager::ProcessItem(%d, %s, has=%d)\n",
+                   getpid(), aItem->Frame()->ListTag().get(),
+                   aItem->HasHitTestInfo());
+
+  if (MOZ_UNLIKELY(aItem->GetType() == DisplayItemType::TYPE_REMOTE)) {
+    Reset();
+  }
+
+  if (!aItem->HasHitTestInfo()) {
+    return false;
+  }
+
+  const HitTestInfo& hitTestInfo = aItem->GetHitTestInfo();
+  const nsRect& area = hitTestInfo.Area();
+  const gfx::CompositorHitTestInfo& flags = hitTestInfo.Info();
+
+  if (flags == gfx::CompositorHitTestInvisibleToHit || area.IsEmpty()) {
+    return false;
+  }
+
+  const auto viewId =
+      hitTestInfo.GetViewId(aBuilder, aItem->GetActiveScrolledRoot());
+  const auto spaceAndClipChain = aBuilder.CurrentSpaceAndClipChain();
+
+  if (!Update(area, flags, viewId, spaceAndClipChain)) {
+    return false;
+  }
+
+  HITTEST_INFO_LOG("+ [%d, %d, %d, %d]: flags: 0x%x, viewId: %lu\n", area.x,
+                   area.y, area.width, area.height, flags.serialize(), viewId);
+
+  CreateWebRenderCommands(aBuilder, aItem, area, flags, viewId);
+
+  return true;
+}
+
+void HitTestInfoManager::ProcessItemAsImage(
+    nsDisplayItem* aItem, const wr::LayoutRect& aRect,
+    wr::DisplayListBuilder& aBuilder,
+    nsDisplayListBuilder* aDisplayListBuilder) {
+  if (!aItem->HasChildren()) {
+    return;
+  }
+  const auto* asr = aItem->GetActiveScrolledRoot();
+  SideBits sideBits =
+      aBuilder.GetContainingFixedPosSideBits(asr).valueOr(SideBits::eNone);
+  gfx::CompositorHitTestInfo hitInfo = mFlags;
+  if (hitInfo.contains(gfx::CompositorHitTestFlags::eVisibleToHitTest)) {
+    hitInfo += gfx::CompositorHitTestFlags::eIrregularArea;
+  }
+  aBuilder.PushHitTest(aRect, aRect, !aItem->BackfaceIsHidden(), mViewId,
+                       hitInfo, sideBits);
+}
+
+bool HitTestInfoManager::Update(const nsRect& aArea,
+                                const gfx::CompositorHitTestInfo& aFlags,
+                                const ViewID& aViewId,
+                                const wr::WrSpaceAndClipChain& aSpaceAndClip) {
+  if (mViewId == aViewId && mFlags == aFlags && mArea.Contains(aArea) &&
+      mSpaceAndClipChain == aSpaceAndClip) {
+    HITTEST_INFO_LOG("s [%d, %d, %d, %d]: flags: 0x%x, viewId: %lu\n", aArea.x,
+                     aArea.y, aArea.width, aArea.height, aFlags.serialize(),
+                     aViewId);
+    return false;
+  }
+
+  mArea = aArea;
+  mFlags = aFlags;
+  mViewId = aViewId;
+  mSpaceAndClipChain = aSpaceAndClip;
+  return true;
+}
+
+}  

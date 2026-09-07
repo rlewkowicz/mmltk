@@ -1,0 +1,391 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_Promise_h
+#define mozilla_dom_Promise_h
+
+#include <functional>
+#include <type_traits>
+#include <utility>
+
+#include "ErrorList.h"
+#include "js/RootingAPI.h"
+#include "js/TypeDecls.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/HoldDropJSObjects.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/Result.h"
+#include "mozilla/WeakPtr.h"
+#include "mozilla/dom/AutoEntryScript.h"
+#include "mozilla/dom/ScriptSettings.h"
+#include "mozilla/dom/ToJSValue.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsError.h"
+#include "nsISupports.h"
+#include "nsString.h"
+
+class nsCycleCollectionTraversalCallback;
+class nsIGlobalObject;
+
+namespace JS {
+class Value;
+}
+
+namespace mozilla::webgpu {
+class PipelineError;
+}
+
+namespace mozilla::dom {
+
+class AnyCallback;
+class PromiseInit;
+class PromiseNativeHandler;
+class PromiseDebugging;
+
+class Promise : public SupportsWeakPtr, public JSHolderBase {
+  friend class PromiseTask;
+  friend class PromiseWorkerProxy;
+  friend class PromiseWorkerProxyRunnable;
+
+ public:
+  NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(Promise)
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_NATIVE_CLASS(Promise)
+
+  enum PropagateUserInteraction {
+    eDontPropagateUserInteraction,
+    ePropagateUserInteraction
+  };
+
+  static already_AddRefed<Promise> Create(
+      nsIGlobalObject* aGlobal, ErrorResult& aRv,
+      PropagateUserInteraction aPropagateUserInteraction =
+          eDontPropagateUserInteraction);
+
+  static already_AddRefed<Promise> CreateInfallible(
+      nsIGlobalObject* aGlobal,
+      PropagateUserInteraction aPropagateUserInteraction =
+          eDontPropagateUserInteraction);
+
+  static void ReportRejectedPromise(JSContext* aCx,
+                                    JS::Handle<JSObject*> aPromise);
+
+  using MaybeFunc = void (Promise::*)(JSContext*, JS::Handle<JS::Value>);
+
+  template <typename T>
+  void MaybeResolve(T&& aArg) {
+    MaybeSomething(std::forward<T>(aArg), &Promise::MaybeResolve);
+  }
+
+  void MaybeResolveWithUndefined();
+
+  void MaybeReject(JS::Handle<JS::Value> aValue) {
+    MaybeSomething(aValue, &Promise::MaybeReject);
+  }
+
+  inline void MaybeReject(nsresult aArg) {
+    MOZ_ASSERT(NS_FAILED(aArg));
+    MaybeSomething(aArg, &Promise::MaybeReject);
+  }
+
+  inline void MaybeReject(ErrorResult&& aArg) {
+    MOZ_ASSERT(aArg.Failed());
+    MaybeSomething(std::move(aArg), &Promise::MaybeReject);
+    MOZ_ASSERT(!aArg.Failed());
+  }
+
+  void MaybeReject(const RefPtr<webgpu::PipelineError>& aArg);
+
+  void MaybeRejectWithUndefined();
+
+  void MaybeResolveWithClone(JSContext* aCx, JS::Handle<JS::Value> aValue);
+  void MaybeRejectWithClone(JSContext* aCx, JS::Handle<JS::Value> aValue);
+
+#define DOMEXCEPTION(name, err)                                   \
+  inline void MaybeRejectWith##name(const nsACString& aMessage) { \
+    ErrorResult res;                                              \
+    res.Throw##name(aMessage);                                    \
+    MaybeReject(std::move(res));                                  \
+  }                                                               \
+  template <int N>                                                \
+  void MaybeRejectWith##name(const char (&aMessage)[N]) {         \
+    MaybeRejectWith##name(nsLiteralCString(aMessage));            \
+  }
+
+#include "mozilla/dom/DOMExceptionNames.inc"
+
+#undef DOMEXCEPTION
+
+  template <ErrNum errorNumber, typename... Ts>
+  void MaybeRejectWithTypeError(Ts&&... aMessageArgs) {
+    ErrorResult res;
+    res.ThrowTypeError<errorNumber>(std::forward<Ts>(aMessageArgs)...);
+    MaybeReject(std::move(res));
+  }
+
+  inline void MaybeRejectWithTypeError(const nsACString& aMessage) {
+    ErrorResult res;
+    res.ThrowTypeError(aMessage);
+    MaybeReject(std::move(res));
+  }
+
+  template <int N>
+  void MaybeRejectWithTypeError(const char (&aMessage)[N]) {
+    MaybeRejectWithTypeError(nsLiteralCString(aMessage));
+  }
+
+  template <ErrNum errorNumber, typename... Ts>
+  void MaybeRejectWithRangeError(Ts&&... aMessageArgs) {
+    ErrorResult res;
+    res.ThrowRangeError<errorNumber>(std::forward<Ts>(aMessageArgs)...);
+    MaybeReject(std::move(res));
+  }
+
+  inline void MaybeRejectWithRangeError(const nsACString& aMessage) {
+    ErrorResult res;
+    res.ThrowRangeError(aMessage);
+    MaybeReject(std::move(res));
+  }
+
+  template <int N>
+  void MaybeRejectWithRangeError(const char (&aMessage)[N]) {
+    MaybeRejectWithRangeError(nsLiteralCString(aMessage));
+  }
+
+  template <typename T>
+  void MaybeRejectBrokenly(const T& aArg);  
+
+  void MaybeRejectWithExceptionFromContext(JSContext* aCx) {
+    HandleException(aCx);
+  }
+
+  bool SetSettledPromiseIsHandled();
+
+  [[nodiscard]] bool SetAnyPromiseIsHandled();
+
+
+  nsIGlobalObject* GetParentObject() const { return GetGlobalObject(); }
+
+  static already_AddRefed<Promise> Resolve(
+      nsIGlobalObject* aGlobal, JSContext* aCx, JS::Handle<JS::Value> aValue,
+      ErrorResult& aRv,
+      PropagateUserInteraction aPropagateUserInteraction =
+          eDontPropagateUserInteraction);
+
+  template <typename T>
+  static already_AddRefed<Promise> Resolve(
+      nsIGlobalObject* aGlobal, T&& aValue, ErrorResult& aError,
+      PropagateUserInteraction aPropagateUserInteraction =
+          eDontPropagateUserInteraction) {
+    AutoJSAPI jsapi;
+    if (!jsapi.Init(aGlobal)) {
+      aError.Throw(NS_ERROR_UNEXPECTED);
+      return nullptr;
+    }
+
+    JSContext* cx = jsapi.cx();
+    JS::Rooted<JS::Value> val(cx);
+    if (!ToJSValue(cx, std::forward<T>(aValue), &val)) {
+      return Promise::RejectWithExceptionFromContext(aGlobal, cx, aError);
+    }
+
+    return Resolve(aGlobal, cx, val, aError, aPropagateUserInteraction);
+  }
+
+  static already_AddRefed<Promise> Reject(nsIGlobalObject* aGlobal,
+                                          JSContext* aCx,
+                                          JS::Handle<JS::Value> aValue,
+                                          ErrorResult& aRv);
+
+  template <typename T>
+  static already_AddRefed<Promise> Reject(nsIGlobalObject* aGlobal, T&& aValue,
+                                          ErrorResult& aError) {
+    AutoJSAPI jsapi;
+    if (!jsapi.Init(aGlobal)) {
+      aError.Throw(NS_ERROR_UNEXPECTED);
+      return nullptr;
+    }
+
+    JSContext* cx = jsapi.cx();
+    JS::Rooted<JS::Value> val(cx);
+    if (!ToJSValue(cx, std::forward<T>(aValue), &val)) {
+      return Promise::RejectWithExceptionFromContext(aGlobal, cx, aError);
+    }
+
+    return Reject(aGlobal, cx, val, aError);
+  }
+
+  static already_AddRefed<Promise> RejectWithExceptionFromContext(
+      nsIGlobalObject* aGlobal, JSContext* aCx, ErrorResult& aError);
+
+  static already_AddRefed<Promise> All(
+      JSContext* aCx, const nsTArray<RefPtr<Promise>>& aPromiseList,
+      ErrorResult& aRv,
+      PropagateUserInteraction aPropagateUserInteraction =
+          eDontPropagateUserInteraction);
+
+  using SuccessSteps =
+      const std::function<void(const Span<JS::Heap<JS::Value>>&)>&;
+  using FailureSteps = const std::function<void(JS::Handle<JS::Value>)>&;
+  MOZ_CAN_RUN_SCRIPT
+  static void WaitForAll(nsIGlobalObject* aGlobal,
+                         const Span<RefPtr<Promise>>& aPromises,
+                         SuccessSteps aSuccessSteps, FailureSteps aFailureSteps,
+                         nsISupports* aCycleCollectedArg = nullptr);
+
+  template <typename Callback, typename... Args>
+  using IsHandlerCallback =
+      std::is_same<already_AddRefed<Promise>,
+                   decltype(std::declval<Callback>()(
+                       (JSContext*)(nullptr),
+                       std::declval<JS::Handle<JS::Value>>(),
+                       std::declval<ErrorResult&>(), std::declval<Args>()...))>;
+
+  template <typename Callback, typename... Args>
+  using ThenResult =
+      std::enable_if_t<IsHandlerCallback<Callback, Args...>::value,
+                       Result<RefPtr<Promise>, nsresult>>;
+
+  template <typename ResolveCallback, typename RejectCallback, typename... Args>
+  ThenResult<ResolveCallback, Args...> ThenCatchWithCycleCollectedArgs(
+      ResolveCallback&& aOnResolve, RejectCallback&& aOnReject,
+      Args&&... aArgs);
+
+  template <typename Callback, typename... Args>
+  ThenResult<Callback, Args...> ThenWithCycleCollectedArgs(
+      Callback&& aOnResolve, Args&&... aArgs);
+
+  template <typename Callback, typename... Args>
+  ThenResult<Callback, Args...> CatchWithCycleCollectedArgs(
+      Callback&& aOnReject, Args&&... aArgs);
+
+  template <typename ResolveCallback, typename RejectCallback,
+            typename ArgsTuple, typename JSArgsTuple>
+  Result<RefPtr<Promise>, nsresult> ThenCatchWithCycleCollectedArgsJS(
+      ResolveCallback&& aOnResolve, RejectCallback&& aOnReject,
+      ArgsTuple&& aArgs, JSArgsTuple&& aJSArgs);
+  template <typename Callback, typename ArgsTuple, typename JSArgsTuple>
+  Result<RefPtr<Promise>, nsresult> ThenWithCycleCollectedArgsJS(
+      Callback&& aOnResolve, ArgsTuple&& aArgs, JSArgsTuple&& aJSArgs);
+
+  Result<RefPtr<Promise>, nsresult> ThenWithoutCycleCollection(
+      const std::function<already_AddRefed<Promise>(
+          JSContext*, JS::Handle<JS::Value>, ErrorResult& aRv)>& aCallback);
+
+  template <typename ResolveCallback, typename RejectCallback, typename... Args>
+  void AddCallbacksWithCycleCollectedArgs(ResolveCallback&& aOnResolve,
+                                          RejectCallback&& aOnReject,
+                                          Args&&... aArgs);
+
+  JSObject* PromiseObj() const { return mPromiseObj; }
+
+  void AppendNativeHandler(PromiseNativeHandler* aRunnable);
+
+  nsIGlobalObject* GetGlobalObject() const { return mGlobal; }
+
+  static already_AddRefed<Promise> CreateFromExisting(
+      nsIGlobalObject* aGlobal, JS::Handle<JSObject*> aPromiseObj,
+      PropagateUserInteraction aPropagateUserInteraction =
+          eDontPropagateUserInteraction);
+
+  enum class PromiseState { Pending, Resolved, Rejected };
+
+  PromiseState State() const;
+
+  static already_AddRefed<Promise> CreateResolvedWithUndefined(
+      nsIGlobalObject* aGlobal, ErrorResult& aRv);
+
+  static already_AddRefed<Promise> CreateRejected(
+      nsIGlobalObject* aGlobal, JS::Handle<JS::Value> aRejectionError,
+      ErrorResult& aRv);
+
+  static already_AddRefed<Promise> CreateRejectedWithTypeError(
+      nsIGlobalObject* aGlobal, const nsACString& aMessage, ErrorResult& aRv);
+
+  static already_AddRefed<Promise> CreateRejectedWithErrorResult(
+      nsIGlobalObject* aGlobal, ErrorResult& aRejectionError);
+
+  static nsresult TryExtractNSResultFromRejectionValue(
+      JS::Handle<JS::Value> aValue);
+
+ protected:
+  template <typename ResolveCallback, typename RejectCallback, typename... Args,
+            typename... JSArgs>
+  Result<RefPtr<Promise>, nsresult> ThenCatchWithCycleCollectedArgsJSImpl(
+      Maybe<ResolveCallback>&& aOnResolve, Maybe<RejectCallback>&& aOnReject,
+      std::tuple<Args...>&& aArgs, std::tuple<JSArgs...>&& aJSArgs);
+  template <typename ResolveCallback, typename RejectCallback, typename... Args>
+  ThenResult<ResolveCallback, Args...> ThenCatchWithCycleCollectedArgsImpl(
+      Maybe<ResolveCallback>&& aOnResolve, Maybe<RejectCallback>&& aOnReject,
+      Args&&... aArgs);
+
+  inline void MaybeRejectWithDOMException(nsresult rv,
+                                          const nsACString& aMessage) {
+    ErrorResult res;
+    res.ThrowDOMException(rv, aMessage);
+    MaybeReject(std::move(res));
+  }
+
+  struct PromiseCapability;
+
+  explicit Promise(nsIGlobalObject* aGlobal);
+
+  virtual ~Promise();
+
+  void CreateWrapper(ErrorResult& aRv,
+                     PropagateUserInteraction aPropagateUserInteraction =
+                         eDontPropagateUserInteraction);
+
+ private:
+  void MaybeResolve(JSContext* aCx, JS::Handle<JS::Value> aValue);
+  void MaybeReject(JSContext* aCx, JS::Handle<JS::Value> aValue);
+
+  template <typename T>
+  void MaybeSomething(T&& aArgument, MaybeFunc aFunc) {
+    if (NS_WARN_IF(!PromiseObj())) {
+      return;
+    }
+
+    AutoAllowLegacyScriptExecution exemption;
+    AutoEntryScript aes(mGlobal, "Promise resolution or rejection");
+    JSContext* cx = aes.cx();
+
+    JS::Rooted<JS::Value> val(cx);
+    if (!ToJSValue(cx, std::forward<T>(aArgument), &val)) {
+      HandleException(cx);
+      return;
+    }
+
+    (this->*aFunc)(cx, val);
+  }
+
+  void HandleException(JSContext* aCx);
+
+  bool MaybePropagateUserInputEventHandling();
+
+  RefPtr<nsIGlobalObject> mGlobal;
+
+  JS::Heap<JSObject*> mPromiseObj;
+};
+
+}  
+
+extern "C" {
+void DomPromise_AddRef(mozilla::dom::Promise* aPromise);
+void DomPromise_Release(mozilla::dom::Promise* aPromise);
+
+void DomPromise_ResolveWithUndefined(mozilla::dom::Promise* aPromise);
+void DomPromise_RejectWithUndefined(mozilla::dom::Promise* aPromise);
+
+void DomPromise_ResolveWithVariant(mozilla::dom::Promise* aPromise,
+                                   nsIVariant* aVariant);
+void DomPromise_RejectWithVariant(mozilla::dom::Promise* aPromise,
+                                  nsIVariant* aVariant);
+
+void DomPromise_RejectWithNsresult(mozilla::dom::Promise* aPromise,
+                                   nsresult aResult);
+}
+
+#endif  // mozilla_dom_Promise_h

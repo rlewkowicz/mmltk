@@ -1,0 +1,69 @@
+/*
+ * Copyright 2006 The Android Open Source Project
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkShader_DEFINED)
+#define SkShader_DEFINED
+
+#include "include/core/SkColor.h"
+#include "include/core/SkColorSpace.h"
+#include "include/core/SkFlattenable.h"
+#include "include/core/SkRefCnt.h"
+#include "include/private/base/SkAPI.h"
+
+class SkBlender;
+class SkColorFilter;
+class SkImage;
+class SkMatrix;
+enum class SkBlendMode;
+enum class SkTileMode;
+struct SkRect;
+struct SkSamplingOptions;
+
+class SK_API SkShader : public SkFlattenable {
+public:
+    virtual bool isOpaque() const = 0;
+
+    SkImage* isAImage(SkMatrix* localMatrix, SkTileMode xy[2]) const;
+
+    bool isAImage() const {
+        return this->isAImage(nullptr, (SkTileMode*)nullptr) != nullptr;
+    }
+
+
+    sk_sp<SkShader> makeWithLocalMatrix(const SkMatrix&) const;
+
+    sk_sp<SkShader> makeWithColorFilter(sk_sp<SkColorFilter>) const;
+
+    sk_sp<SkShader> makeWithWorkingColorSpace(sk_sp<SkColorSpace> inputCS,
+                                              sk_sp<SkColorSpace> outputCS=nullptr) const;
+
+private:
+    SkShader() = default;
+    friend class SkShaderBase;
+
+    using INHERITED = SkFlattenable;
+};
+
+namespace SkShaders {
+SK_API sk_sp<SkShader> Empty();
+SK_API sk_sp<SkShader> Color(SkColor);
+SK_API sk_sp<SkShader> Color(const SkColor4f&, sk_sp<SkColorSpace>);
+SK_API sk_sp<SkShader> Blend(SkBlendMode mode, sk_sp<SkShader> dst, sk_sp<SkShader> src);
+SK_API sk_sp<SkShader> Blend(sk_sp<SkBlender>, sk_sp<SkShader> dst, sk_sp<SkShader> src);
+SK_API sk_sp<SkShader> CoordClamp(sk_sp<SkShader>, const SkRect& subset);
+
+SK_API sk_sp<SkShader> Image(sk_sp<SkImage> image,
+                             SkTileMode tmx, SkTileMode tmy,
+                             const SkSamplingOptions& options,
+                             const SkMatrix* localMatrix = nullptr);
+SK_API sk_sp<SkShader> RawImage(sk_sp<SkImage> image,
+                                SkTileMode tmx, SkTileMode tmy,
+                                const SkSamplingOptions& options,
+                                const SkMatrix* localMatrix = nullptr);
+}
+
+#endif

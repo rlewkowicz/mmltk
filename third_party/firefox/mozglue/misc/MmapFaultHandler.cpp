@@ -1,0 +1,100 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "MmapFaultHandler.h"
+
+#if defined(XP_UNIX) && !0 && !defined(__wasi__)
+
+#  include "mozilla/Assertions.h"
+#  include "mozilla/Atomics.h"
+#  include "mozilla/ThreadLocal.h"
+#  include <signal.h>
+#  include <cstring>
+
+static MOZ_THREAD_LOCAL(MmapAccessScope*) sMmapAccessScope;
+
+static struct sigaction sPrevSIGBUSHandler;
+
+static void MmapSIGBUSHandler(int signum, siginfo_t* info, void* context) {
+  MOZ_RELEASE_ASSERT(signum == SIGBUS);
+
+  MmapAccessScope* mas = sMmapAccessScope.get();
+
+  if (mas && mas->IsInsideBuffer(info->si_addr)) {
+    siglongjmp(mas->mJmpBuf, signum);
+  }
+
+  if (sPrevSIGBUSHandler.sa_flags & SA_SIGINFO) {
+    sPrevSIGBUSHandler.sa_sigaction(signum, info, context);
+  } else if (sPrevSIGBUSHandler.sa_handler == SIG_DFL ||
+             sPrevSIGBUSHandler.sa_handler == SIG_IGN) {
+    sigaction(signum, &sPrevSIGBUSHandler, nullptr);
+  } else {
+    sPrevSIGBUSHandler.sa_handler(signum);
+  }
+}
+
+mozilla::Atomic<bool> gSIGBUSHandlerInstalled(false);
+mozilla::Atomic<bool> gSIGBUSHandlerInstalling(false);
+
+void InstallMmapFaultHandler() {
+  if (gSIGBUSHandlerInstalled) {
+    return;
+  }
+
+  if (gSIGBUSHandlerInstalling.compareExchange(false, true)) {
+    sMmapAccessScope.infallibleInit();
+
+    struct sigaction busHandler;
+    busHandler.sa_flags = SA_SIGINFO | SA_NODEFER | SA_ONSTACK;
+    busHandler.sa_sigaction = MmapSIGBUSHandler;
+    sigemptyset(&busHandler.sa_mask);
+    if (sigaction(SIGBUS, &busHandler, &sPrevSIGBUSHandler)) {
+      MOZ_CRASH("Unable to install SIGBUS handler");
+    }
+
+    MOZ_ASSERT(!gSIGBUSHandlerInstalled);
+    gSIGBUSHandlerInstalled = true;
+  } else {
+    while (!gSIGBUSHandlerInstalled) {
+    }
+  }
+}
+
+MmapAccessScope::MmapAccessScope(void* aBuf, uint32_t aBufLen,
+                                 const char* aFilename) {
+  InstallMmapFaultHandler();
+
+  mBuf = aBuf;
+  mBufLen = aBufLen;
+  mFilename = aFilename;
+
+  SetThreadLocalScope();
+}
+
+MmapAccessScope::~MmapAccessScope() {
+  MOZ_RELEASE_ASSERT(sMmapAccessScope.get() == this);
+  sMmapAccessScope.set(mPreviousScope);
+}
+
+void MmapAccessScope::SetThreadLocalScope() {
+  memset(mJmpBuf, 0, sizeof(sigjmp_buf));
+
+  mPreviousScope = sMmapAccessScope.get();
+
+  sMmapAccessScope.set(this);
+}
+
+bool MmapAccessScope::IsInsideBuffer(void* aPtr) {
+  return aPtr >= mBuf && aPtr < (void*)((char*)mBuf + mBufLen);
+}
+
+void MmapAccessScope::CrashWithInfo(void* aPtr) {
+  MOZ_CRASH_UNSAFE_PRINTF(
+      "SIGBUS received when accessing mmaped file [buffer=%p, "
+      "buflen=%u, address=%p, filename=%s]",
+      mBuf, mBufLen, aPtr, mFilename);
+}
+
+#endif

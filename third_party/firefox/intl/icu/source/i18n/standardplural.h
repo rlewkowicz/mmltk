@@ -1,0 +1,78 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+ *******************************************************************************
+ * Copyright (C) 2015, International Business Machines Corporation
+ * and others. All Rights Reserved.
+ *******************************************************************************
+ * standardplural.h
+ *
+ * created on: 2015dec14
+ * created by: Markus W. Scherer
+ */
+
+#ifndef __STANDARDPLURAL_H__
+#define __STANDARDPLURAL_H__
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+U_NAMESPACE_BEGIN
+
+class UnicodeString;
+
+class U_I18N_API StandardPlural {
+public:
+    enum Form {
+        ZERO,
+        ONE,
+        TWO,
+        FEW,
+        MANY,
+        OTHER,
+        EQ_0,
+        EQ_1,
+        COUNT
+    };
+
+    static const char *getKeyword(Form p);
+
+    static Form orOtherFromString(const char *keyword) {
+        return static_cast<Form>(indexOrOtherIndexFromString(keyword));
+    }
+
+    static Form orOtherFromString(const UnicodeString &keyword) {
+        return static_cast<Form>(indexOrOtherIndexFromString(keyword));
+    }
+
+    static Form fromString(const char *keyword, UErrorCode &errorCode) {
+        return static_cast<Form>(indexFromString(keyword, errorCode));
+    }
+
+    static Form fromString(const UnicodeString &keyword, UErrorCode &errorCode) {
+        return static_cast<Form>(indexFromString(keyword, errorCode));
+    }
+
+    static int32_t indexOrNegativeFromString(const char *keyword);
+
+    static int32_t indexOrNegativeFromString(const UnicodeString &keyword);
+
+    static int32_t indexOrOtherIndexFromString(const char *keyword) {
+        int32_t i = indexOrNegativeFromString(keyword);
+        return i >= 0 ? i : OTHER;
+    }
+
+    static int32_t indexOrOtherIndexFromString(const UnicodeString &keyword) {
+        int32_t i = indexOrNegativeFromString(keyword);
+        return i >= 0 ? i : OTHER;
+    }
+
+    static int32_t indexFromString(const char *keyword, UErrorCode &errorCode);
+
+    static int32_t indexFromString(const UnicodeString &keyword, UErrorCode &errorCode);
+};
+
+U_NAMESPACE_END
+
+#endif  // !UCONFIG_NO_FORMATTING
+#endif  // __STANDARDPLURAL_H__

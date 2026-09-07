@@ -1,0 +1,77 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef include_dom_media_ipc_RemoteDecoderParent_h
+#define include_dom_media_ipc_RemoteDecoderParent_h
+
+#include "mozilla/Maybe.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/PRemoteDecoderParent.h"
+#include "mozilla/ShmemRecycleAllocator.h"
+
+namespace mozilla {
+
+class RemoteMediaManagerParent;
+using mozilla::ipc::IPCResult;
+
+class RemoteDecoderParent : public ShmemRecycleAllocator<RemoteDecoderParent>,
+                            public PRemoteDecoderParent {
+  friend class PRemoteDecoderParent;
+
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(RemoteDecoderParent, final)
+
+  RemoteDecoderParent(RemoteMediaManagerParent* aParent,
+                      const CreateDecoderParams::OptionSet& aOptions,
+                      nsISerialEventTarget* aManagerThread,
+                      TaskQueue* aDecodeTaskQueue,
+                      Maybe<TrackingId> aTrackingId);
+
+  virtual IPCResult RecvConstruct(ConstructResolver&& aResolver) = 0;
+  IPCResult RecvInit(InitResolver&& aResolver);
+  IPCResult RecvDecode(ArrayOfRemoteMediaRawData* aData,
+                       DecodeResolver&& aResolver);
+  IPCResult RecvFlush(FlushResolver&& aResolver);
+  IPCResult RecvDrain(DrainResolver&& aResolver);
+  IPCResult RecvShutdown(ShutdownResolver&& aResolver);
+  IPCResult RecvSetSeekThreshold(const media::TimeUnit& aTime);
+
+  void ActorDestroy(ActorDestroyReason aWhy) override;
+
+ protected:
+  virtual ~RemoteDecoderParent();
+
+  bool OnManagerThread();
+
+  void AbortPendingRequests();
+
+  virtual MediaResult ProcessDecodedData(MediaDataDecoder::DecodedData&& aData,
+                                         DecodedOutputIPDL& aDecodedData) = 0;
+
+  const RefPtr<RemoteMediaManagerParent> mParent;
+  const CreateDecoderParams::OptionSet mOptions;
+  const RefPtr<TaskQueue> mDecodeTaskQueue;
+  RefPtr<MediaDataDecoder> mDecoder;
+  const Maybe<TrackingId> mTrackingId;
+
+  bool mShutdown = false;
+
+  Maybe<InitResolver> mPendingInitResolver;
+  Maybe<DecodeResolver> mPendingDecodeResolver;
+  Maybe<FlushResolver> mPendingFlushResolver;
+  Maybe<DrainResolver> mPendingDrainResolver;
+
+  MozPromiseRequestHolder<MediaDataDecoder::InitPromise> mInitRequest;
+  MozPromiseRequestHolder<MediaDataDecoder::DecodePromise> mDecodeRequest;
+  MozPromiseRequestHolder<MediaDataDecoder::FlushPromise> mFlushRequest;
+  MozPromiseRequestHolder<MediaDataDecoder::DecodePromise> mDrainRequest;
+
+ private:
+  void DecodeNextSample(const RefPtr<ArrayOfRemoteMediaRawData>& aData,
+                        size_t aIndex, MediaDataDecoder::DecodedData&& aOutput);
+  const RefPtr<nsISerialEventTarget> mManagerThread;
+};
+
+}  
+
+#endif  // include_dom_media_ipc_RemoteDecoderParent_h

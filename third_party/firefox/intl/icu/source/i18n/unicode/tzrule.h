@@ -1,0 +1,214 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*******************************************************************************
+* Copyright (C) 2007-2008, International Business Machines Corporation and    *
+* others. All Rights Reserved.                                                *
+*******************************************************************************
+*/
+#ifndef TZRULE_H
+#define TZRULE_H
+
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/uobject.h"
+#include "unicode/unistr.h"
+#include "unicode/dtrule.h"
+
+U_NAMESPACE_BEGIN
+
+class U_I18N_API TimeZoneRule : public UObject {
+public:
+    virtual ~TimeZoneRule();
+
+    virtual TimeZoneRule* clone() const = 0;
+
+    virtual bool operator==(const TimeZoneRule& that) const;
+
+    virtual bool operator!=(const TimeZoneRule& that) const;
+
+    UnicodeString& getName(UnicodeString& name) const;
+
+    int32_t getRawOffset() const;
+
+    int32_t getDSTSavings() const;
+
+    virtual UBool isEquivalentTo(const TimeZoneRule& other) const;
+
+    virtual UBool getFirstStart(int32_t prevRawOffset, int32_t prevDSTSavings, UDate& result) const = 0;
+
+    virtual UBool getFinalStart(int32_t prevRawOffset, int32_t prevDSTSavings, UDate& result) const = 0;
+
+    virtual UBool getNextStart(UDate base, int32_t prevRawOffset, int32_t prevDSTSavings,
+        UBool inclusive, UDate& result) const = 0;
+
+    virtual UBool getPreviousStart(UDate base, int32_t prevRawOffset, int32_t prevDSTSavings,
+        UBool inclusive, UDate& result) const = 0;
+
+protected:
+
+    TimeZoneRule(const UnicodeString& name, int32_t rawOffset, int32_t dstSavings);
+
+    TimeZoneRule(const TimeZoneRule& source);
+
+    TimeZoneRule& operator=(const TimeZoneRule& right);
+
+private:
+    UnicodeString fName; 
+    int32_t fRawOffset;  
+    int32_t fDSTSavings; 
+};
+
+class U_I18N_API InitialTimeZoneRule : public TimeZoneRule {
+public:
+    InitialTimeZoneRule(const UnicodeString& name, int32_t rawOffset, int32_t dstSavings);
+
+    InitialTimeZoneRule(const InitialTimeZoneRule& source);
+
+    virtual ~InitialTimeZoneRule();
+
+    virtual InitialTimeZoneRule* clone() const override;
+
+    InitialTimeZoneRule& operator=(const InitialTimeZoneRule& right);
+
+    virtual bool operator==(const TimeZoneRule& that) const override;
+
+    virtual bool operator!=(const TimeZoneRule& that) const override;
+
+    virtual UBool isEquivalentTo(const TimeZoneRule& that) const override;
+
+    virtual UBool getFirstStart(int32_t prevRawOffset, int32_t prevDSTSavings, UDate& result) const override;
+
+    virtual UBool getFinalStart(int32_t prevRawOffset, int32_t prevDSTSavings, UDate& result) const override;
+
+    virtual UBool getNextStart(UDate base, int32_t prevRawOffset, int32_t prevDSTSavings,
+        UBool inclusive, UDate& result) const override;
+
+    virtual UBool getPreviousStart(UDate base, int32_t prevRawOffset, int32_t prevDSTSavings,
+        UBool inclusive, UDate& result) const override;
+
+public:
+    static UClassID U_EXPORT2 getStaticClassID();
+
+    virtual UClassID getDynamicClassID() const override;
+};
+
+class U_I18N_API AnnualTimeZoneRule : public TimeZoneRule {
+public:
+    static const int32_t MAX_YEAR;
+
+    AnnualTimeZoneRule(const UnicodeString& name, int32_t rawOffset, int32_t dstSavings,
+            const DateTimeRule& dateTimeRule, int32_t startYear, int32_t endYear);
+
+    AnnualTimeZoneRule(const UnicodeString& name, int32_t rawOffset, int32_t dstSavings,
+            DateTimeRule* dateTimeRule, int32_t startYear, int32_t endYear);
+
+    AnnualTimeZoneRule(const AnnualTimeZoneRule& source);
+
+    virtual ~AnnualTimeZoneRule();
+
+    virtual AnnualTimeZoneRule* clone() const override;
+
+    AnnualTimeZoneRule& operator=(const AnnualTimeZoneRule& right);
+
+    virtual bool operator==(const TimeZoneRule& that) const override;
+
+    virtual bool operator!=(const TimeZoneRule& that) const override;
+
+    const DateTimeRule* getRule() const;
+
+    int32_t getStartYear() const;
+
+    int32_t getEndYear() const;
+
+    UBool getStartInYear(int32_t year, int32_t prevRawOffset, int32_t prevDSTSavings, UDate& result) const;
+
+    virtual UBool isEquivalentTo(const TimeZoneRule& that) const override;
+
+    virtual UBool getFirstStart(int32_t prevRawOffset, int32_t prevDSTSavings, UDate& result) const override;
+
+    virtual UBool getFinalStart(int32_t prevRawOffset, int32_t prevDSTSavings, UDate& result) const override;
+
+    virtual UBool getNextStart(UDate base, int32_t prevRawOffset, int32_t prevDSTSavings,
+        UBool inclusive, UDate& result) const override;
+
+    virtual UBool getPreviousStart(UDate base, int32_t prevRawOffset, int32_t prevDSTSavings,
+        UBool inclusive, UDate& result) const override;
+
+
+private:
+    DateTimeRule* fDateTimeRule;
+    int32_t fStartYear;
+    int32_t fEndYear;
+
+public:
+    static UClassID U_EXPORT2 getStaticClassID();
+
+    virtual UClassID getDynamicClassID() const override;
+};
+
+class U_I18N_API TimeArrayTimeZoneRule : public TimeZoneRule {
+public:
+    TimeArrayTimeZoneRule(const UnicodeString& name, int32_t rawOffset, int32_t dstSavings,
+        const UDate* startTimes, int32_t numStartTimes, DateTimeRule::TimeRuleType timeRuleType);
+
+    TimeArrayTimeZoneRule(const TimeArrayTimeZoneRule& source);
+
+    virtual ~TimeArrayTimeZoneRule();
+
+    virtual TimeArrayTimeZoneRule* clone() const override;
+
+    TimeArrayTimeZoneRule& operator=(const TimeArrayTimeZoneRule& right);
+
+    virtual bool operator==(const TimeZoneRule& that) const override;
+
+    virtual bool operator!=(const TimeZoneRule& that) const override;
+
+    DateTimeRule::TimeRuleType getTimeType() const;
+
+    UBool getStartTimeAt(int32_t index, UDate& result) const;
+
+    int32_t countStartTimes() const;
+
+    virtual UBool isEquivalentTo(const TimeZoneRule& that) const override;
+
+    virtual UBool getFirstStart(int32_t prevRawOffset, int32_t prevDSTSavings, UDate& result) const override;
+
+    virtual UBool getFinalStart(int32_t prevRawOffset, int32_t prevDSTSavings, UDate& result) const override;
+
+    virtual UBool getNextStart(UDate base, int32_t prevRawOffset, int32_t prevDSTSavings,
+        UBool inclusive, UDate& result) const override;
+
+    virtual UBool getPreviousStart(UDate base, int32_t prevRawOffset, int32_t prevDSTSavings,
+        UBool inclusive, UDate& result) const override;
+
+
+private:
+    enum { TIMEARRAY_STACK_BUFFER_SIZE = 32 };
+    UBool initStartTimes(const UDate source[], int32_t size, UErrorCode& ec);
+    UDate getUTC(UDate time, int32_t raw, int32_t dst) const;
+
+    DateTimeRule::TimeRuleType  fTimeRuleType;
+    int32_t fNumStartTimes;
+    UDate*  fStartTimes;
+    UDate   fLocalStartTimes[TIMEARRAY_STACK_BUFFER_SIZE];
+
+public:
+    static UClassID U_EXPORT2 getStaticClassID();
+
+    virtual UClassID getDynamicClassID() const override;
+};
+
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_FORMATTING */
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif // TZRULE_H
+

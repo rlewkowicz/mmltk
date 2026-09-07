@@ -1,0 +1,68 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_PromiseDebugging_h
+#define mozilla_dom_PromiseDebugging_h
+
+#include "js/TypeDecls.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+
+class ErrorResult;
+
+namespace dom {
+class Promise;
+struct PromiseDebuggingStateHolder;
+class GlobalObject;
+class UncaughtRejectionObserver;
+class FlushRejections;
+class WorkerPrivate;
+
+void TriggerFlushRejections();
+
+class PromiseDebugging {
+ public:
+  static void Init();
+  static void Shutdown();
+
+  static void GetState(GlobalObject&, JS::Handle<JSObject*> aPromise,
+                       PromiseDebuggingStateHolder& aState, ErrorResult& aRv);
+
+  static void GetPromiseID(GlobalObject&, JS::Handle<JSObject*>, nsString&,
+                           ErrorResult&);
+
+  static void GetAllocationStack(GlobalObject&, JS::Handle<JSObject*> aPromise,
+                                 JS::MutableHandle<JSObject*> aStack,
+                                 ErrorResult& aRv);
+  static void GetRejectionStack(GlobalObject&, JS::Handle<JSObject*> aPromise,
+                                JS::MutableHandle<JSObject*> aStack,
+                                ErrorResult& aRv);
+  static void GetFullfillmentStack(GlobalObject&,
+                                   JS::Handle<JSObject*> aPromise,
+                                   JS::MutableHandle<JSObject*> aStack,
+                                   ErrorResult& aRv);
+
+  static void AddUncaughtRejectionObserver(
+      GlobalObject&, UncaughtRejectionObserver& aObserver);
+  static bool RemoveUncaughtRejectionObserver(
+      GlobalObject&, UncaughtRejectionObserver& aObserver);
+
+  static void AddUncaughtRejection(JS::Handle<JSObject*>);
+  static void AddConsumedRejection(JS::Handle<JSObject*>);
+  static void FlushUncaughtRejections();
+
+ protected:
+  static void FlushUncaughtRejectionsInternal(bool aDeferToEventPath = true);
+  friend class FlushRejections;
+  friend class mozilla::dom::WorkerPrivate;
+
+ private:
+  static nsString sIDPrefix;
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_PromiseDebugging_h

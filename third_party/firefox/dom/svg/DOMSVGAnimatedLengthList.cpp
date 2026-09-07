@@ -1,0 +1,108 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "DOMSVGAnimatedLengthList.h"
+
+#include "DOMSVGLengthList.h"
+#include "SVGAnimatedLengthList.h"
+#include "SVGAttrTearoffTable.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/dom/SVGAnimatedLengthListBinding.h"
+#include "mozilla/dom/SVGElement.h"
+
+
+namespace mozilla::dom {
+
+static inline SVGAttrTearoffTable<SVGAnimatedLengthList,
+                                  DOMSVGAnimatedLengthList>&
+SVGAnimatedLengthListTearoffTable() {
+  static SVGAttrTearoffTable<SVGAnimatedLengthList, DOMSVGAnimatedLengthList>
+      sSVGAnimatedLengthListTearoffTable;
+  return sSVGAnimatedLengthListTearoffTable;
+}
+
+NS_SVG_VAL_IMPL_CYCLE_COLLECTION_WRAPPERCACHED(DOMSVGAnimatedLengthList,
+                                               mElement)
+
+JSObject* DOMSVGAnimatedLengthList::WrapObject(
+    JSContext* aCx, JS::Handle<JSObject*> aGivenProto) {
+  return dom::SVGAnimatedLengthList_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+already_AddRefed<DOMSVGLengthList> DOMSVGAnimatedLengthList::BaseVal() {
+  if (!mBaseVal) {
+    mBaseVal = new DOMSVGLengthList(this, InternalAList().GetBaseValue());
+  }
+  RefPtr<DOMSVGLengthList> baseVal = mBaseVal;
+  return baseVal.forget();
+}
+
+already_AddRefed<DOMSVGLengthList> DOMSVGAnimatedLengthList::AnimVal() {
+  if (!mAnimVal) {
+    mAnimVal = new DOMSVGLengthList(this, InternalAList().GetAnimValue());
+  }
+  RefPtr<DOMSVGLengthList> animVal = mAnimVal;
+  return animVal.forget();
+}
+
+already_AddRefed<DOMSVGAnimatedLengthList>
+DOMSVGAnimatedLengthList::GetDOMWrapper(SVGAnimatedLengthList* aList,
+                                        dom::SVGElement* aElement,
+                                        uint8_t aAttrEnum,
+                                        SVGLength::Axis aAxis) {
+  RefPtr<DOMSVGAnimatedLengthList> wrapper =
+      SVGAnimatedLengthListTearoffTable().GetTearoff(aList);
+  if (!wrapper) {
+    wrapper = new DOMSVGAnimatedLengthList(aElement, aAttrEnum, aAxis);
+    SVGAnimatedLengthListTearoffTable().AddTearoff(aList, wrapper);
+  }
+  return wrapper.forget();
+}
+
+DOMSVGAnimatedLengthList* DOMSVGAnimatedLengthList::GetDOMWrapperIfExists(
+    SVGAnimatedLengthList* aList) {
+  return SVGAnimatedLengthListTearoffTable().GetTearoff(aList);
+}
+
+DOMSVGAnimatedLengthList::~DOMSVGAnimatedLengthList() {
+  SVGAnimatedLengthListTearoffTable().RemoveTearoff(&InternalAList());
+}
+
+void DOMSVGAnimatedLengthList::InternalBaseValListWillChangeTo(
+    const SVGLengthList& aNewValue) {
+
+  RefPtr<DOMSVGAnimatedLengthList> kungFuDeathGrip;
+  if (mBaseVal) {
+    if (aNewValue.Length() < mBaseVal->LengthNoFlush()) {
+      kungFuDeathGrip = this;
+    }
+    mBaseVal->InternalListLengthWillChange(aNewValue.Length());
+  }
+
+
+  if (!IsAnimating()) {
+    InternalAnimValListWillChangeTo(aNewValue);
+  }
+}
+
+void DOMSVGAnimatedLengthList::InternalAnimValListWillChangeTo(
+    const SVGLengthList& aNewValue) {
+  if (mAnimVal) {
+    mAnimVal->InternalListLengthWillChange(aNewValue.Length());
+  }
+}
+
+bool DOMSVGAnimatedLengthList::IsAnimating() const {
+  return InternalAList().IsAnimating();
+}
+
+SVGAnimatedLengthList& DOMSVGAnimatedLengthList::InternalAList() {
+  return *mElement->GetAnimatedLengthList(mAttrEnum);
+}
+
+const SVGAnimatedLengthList& DOMSVGAnimatedLengthList::InternalAList() const {
+  return *mElement->GetAnimatedLengthList(mAttrEnum);
+}
+
+}  

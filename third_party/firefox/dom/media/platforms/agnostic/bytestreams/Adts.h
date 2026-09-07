@@ -1,0 +1,81 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef ADTS_H_
+#define ADTS_H_
+
+#include <stdint.h>
+
+#include "MediaData.h"
+#include "mozilla/Result.h"
+
+namespace mozilla {
+class MediaRawData;
+
+namespace ADTS {
+
+class FrameHeader {
+ public:
+  uint32_t mFrameLength{};
+  uint32_t mSampleRate{};
+  uint32_t mSamples{};
+  uint32_t mChannels{};
+  uint8_t mObjectType{};
+  uint8_t mSamplingIndex{};
+  uint8_t mChannelConfig{};
+  uint8_t mNumAACFrames{};
+  bool mHaveCrc{};
+
+  static bool MatchesSync(const Span<const uint8_t>& aData);
+  FrameHeader();
+  uint64_t HeaderSize() const;
+  bool IsValid() const;
+  void Reset();
+
+  bool Parse(const Span<const uint8_t>& aData);
+};
+class Frame {
+ public:
+  Frame();
+
+  uint64_t Offset() const;
+  size_t Length() const;
+  uint64_t PayloadOffset() const;
+
+  size_t PayloadLength() const;
+  const FrameHeader& Header() const;
+  bool IsValid() const;
+  void Reset();
+  bool Parse(uint64_t aOffset, const uint8_t* aStart, const uint8_t* aEnd);
+
+ private:
+  uint64_t mOffset;
+  FrameHeader mHeader;
+};
+
+class FrameParser {
+ public:
+  const Frame& CurrentFrame();
+  const Frame& FirstFrame() const;
+  void Reset();
+  void EndFrameSession();
+  bool Parse(uint64_t aOffset, const uint8_t* aStart, const uint8_t* aEnd);
+
+ private:
+  Frame mFirstFrame;
+  Frame mFrame;
+};
+
+void InitAudioSpecificConfig(const Frame& aFrame, MediaByteBuffer* aBuffer);
+bool StripHeader(MediaRawData* aSample);
+Result<uint8_t, bool> GetFrequencyIndex(uint32_t aSamplesPerSecond);
+bool ConvertSample(uint16_t aChannelCount, uint8_t aFrequencyIndex,
+                   uint8_t aProfile, mozilla::MediaRawData* aSample);
+bool RevertSample(MediaRawData* aSample);
+Result<already_AddRefed<MediaByteBuffer>, nsresult> MakeSpecificConfig(
+    uint8_t aObjectType, uint32_t aFrequency, uint32_t aChannelCount);
+}  
+}  
+
+#endif

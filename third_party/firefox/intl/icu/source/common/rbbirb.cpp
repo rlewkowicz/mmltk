@@ -1,0 +1,291 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+//  Copyright (C) 2002-2011, International Business Machines Corporation and others.
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_BREAK_ITERATION
+
+#include "unicode/brkiter.h"
+#include "unicode/rbbi.h"
+#include "unicode/ubrk.h"
+#include "unicode/unistr.h"
+#include "unicode/uniset.h"
+#include "unicode/uchar.h"
+#include "unicode/uchriter.h"
+#include "unicode/ustring.h"
+#include "unicode/parsepos.h"
+#include "unicode/parseerr.h"
+
+#include "cmemory.h"
+#include "cstring.h"
+#include "rbbirb.h"
+#include "rbbinode.h"
+#include "rbbiscan.h"
+#include "rbbisetb.h"
+#include "rbbitblb.h"
+#include "rbbidata.h"
+#include "uassert.h"
+
+
+U_NAMESPACE_BEGIN
+
+
+RBBIRuleBuilder::RBBIRuleBuilder(const UnicodeString   &rules,
+                                       UParseError     *parseErr,
+                                       UErrorCode      &status)
+ : fRules(rules), fStrippedRules(rules)
+{
+    fStatus = &status; 
+    fParseError = parseErr;
+    fDebugEnv   = nullptr;
+#ifdef RBBI_DEBUG
+    fDebugEnv   = getenv("U_RBBIDEBUG");
+#endif
+
+
+    fForwardTree        = nullptr;
+    fReverseTree        = nullptr;
+    fSafeFwdTree        = nullptr;
+    fSafeRevTree        = nullptr;
+    fDefaultTree        = &fForwardTree;
+    fForwardTable       = nullptr;
+    fRuleStatusVals     = nullptr;
+    fChainRules         = false;
+    fLookAheadHardBreak = false;
+    fUSetNodes          = nullptr;
+    fRuleStatusVals     = nullptr;
+    fScanner            = nullptr;
+    fSetBuilder         = nullptr;
+    if (parseErr) {
+        uprv_memset(parseErr, 0, sizeof(UParseError));
+    }
+
+    if (U_FAILURE(status)) {
+        return;
+    }
+
+    fUSetNodes          = new UVector(status); 
+    fRuleStatusVals     = new UVector(status);
+    fScanner            = new RBBIRuleScanner(this);
+    fSetBuilder         = new RBBISetBuilder(this);
+    if (U_FAILURE(status)) {
+        return;
+    }
+    if (fSetBuilder == nullptr || fScanner == nullptr ||
+        fUSetNodes == nullptr || fRuleStatusVals == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+    }
+}
+
+
+
+RBBIRuleBuilder::~RBBIRuleBuilder() {
+
+    int        i;
+    for (i=0; ; i++) {
+        RBBINode* n = static_cast<RBBINode*>(fUSetNodes->elementAt(i));
+        if (n==nullptr) {
+            break;
+        }
+        delete n;
+    }
+
+    delete fUSetNodes;
+    delete fSetBuilder;
+    delete fForwardTable;
+    delete fForwardTree;
+    delete fReverseTree;
+    delete fSafeFwdTree;
+    delete fSafeRevTree;
+    delete fScanner;
+    delete fRuleStatusVals;
+}
+
+
+
+
+
+static int32_t align8(int32_t i) {return (i+7) & 0xfffffff8;}
+
+RBBIDataHeader *RBBIRuleBuilder::flattenData() {
+    int32_t    i;
+
+    if (U_FAILURE(*fStatus)) {
+        return nullptr;
+    }
+
+    fStrippedRules = fScanner->stripRules(fStrippedRules);
+
+    int32_t headerSize        = align8(sizeof(RBBIDataHeader));
+    int32_t forwardTableSize  = align8(fForwardTable->getTableSize());
+    int32_t reverseTableSize  = align8(fForwardTable->getSafeTableSize());
+    int32_t trieSize          = align8(fSetBuilder->getTrieSize());
+    int32_t statusTableSize   = align8(fRuleStatusVals->size() * sizeof(int32_t));
+
+    int32_t rulesLengthInUTF8 = 0;
+    u_strToUTF8WithSub(nullptr, 0, &rulesLengthInUTF8,
+                       fStrippedRules.getBuffer(), fStrippedRules.length(),
+                       0xfffd, nullptr, fStatus);
+    *fStatus = U_ZERO_ERROR;
+
+    int32_t rulesSize         = align8((rulesLengthInUTF8+1));
+
+    int32_t         totalSize = headerSize
+                                + forwardTableSize
+                                + reverseTableSize
+                                + statusTableSize + trieSize + rulesSize;
+
+#ifdef RBBI_DEBUG
+    if (fDebugEnv && uprv_strstr(fDebugEnv, "size")) {
+        RBBIDebugPrintf("Header Size:        %8d\n", headerSize);
+        RBBIDebugPrintf("Forward Table Size: %8d\n", forwardTableSize);
+        RBBIDebugPrintf("Reverse Table Size: %8d\n", reverseTableSize);
+        RBBIDebugPrintf("Trie Size:          %8d\n", trieSize);
+        RBBIDebugPrintf("Status Table Size:  %8d\n", statusTableSize);
+        RBBIDebugPrintf("Rules Size:         %8d\n", rulesSize);
+        RBBIDebugPrintf("-----------------------------\n");
+        RBBIDebugPrintf("Total Size:         %8d\n", totalSize);
+    }
+#endif
+
+    LocalMemory<RBBIDataHeader> data(static_cast<RBBIDataHeader*>(uprv_malloc(totalSize)));
+    if (data.isNull()) {
+        *fStatus = U_MEMORY_ALLOCATION_ERROR;
+        return nullptr;
+    }
+    uprv_memset(data.getAlias(), 0, totalSize);
+
+
+    data->fMagic            = 0xb1a0;
+    data->fFormatVersion[0] = RBBI_DATA_FORMAT_VERSION[0];
+    data->fFormatVersion[1] = RBBI_DATA_FORMAT_VERSION[1];
+    data->fFormatVersion[2] = RBBI_DATA_FORMAT_VERSION[2];
+    data->fFormatVersion[3] = RBBI_DATA_FORMAT_VERSION[3];
+    data->fLength           = totalSize;
+    data->fCatCount         = fSetBuilder->getNumCharCategories();
+
+    data->fFTable        = headerSize;
+    data->fFTableLen     = forwardTableSize;
+
+    data->fRTable        = data->fFTable  + data->fFTableLen;
+    data->fRTableLen     = reverseTableSize;
+
+    data->fTrie          = data->fRTable + data->fRTableLen;
+    data->fTrieLen       = trieSize;
+    data->fStatusTable   = data->fTrie    + data->fTrieLen;
+    data->fStatusTableLen= statusTableSize;
+    data->fRuleSource    = data->fStatusTable + statusTableSize;
+    data->fRuleSourceLen = rulesLengthInUTF8;
+
+    uprv_memset(data->fReserved, 0, sizeof(data->fReserved));
+
+    fForwardTable->exportTable(reinterpret_cast<uint8_t*>(data.getAlias()) + data->fFTable);
+    fForwardTable->exportSafeTable(reinterpret_cast<uint8_t*>(data.getAlias()) + data->fRTable);
+    fSetBuilder->serializeTrie(reinterpret_cast<uint8_t*>(data.getAlias()) + data->fTrie);
+
+    int32_t* ruleStatusTable = reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(data.getAlias()) + data->fStatusTable);
+    for (i=0; i<fRuleStatusVals->size(); i++) {
+        ruleStatusTable[i] = fRuleStatusVals->elementAti(i);
+    }
+
+    u_strToUTF8WithSub(reinterpret_cast<char*>(data.getAlias()) + data->fRuleSource, rulesSize, &rulesLengthInUTF8,
+                       fStrippedRules.getBuffer(), fStrippedRules.length(),
+                       0xfffd, nullptr, fStatus);
+    if (U_FAILURE(*fStatus)) {
+        return nullptr;
+    }
+
+    return data.orphan();
+}
+
+
+BreakIterator *
+RBBIRuleBuilder::createRuleBasedBreakIterator( const UnicodeString    &rules,
+                                    UParseError      *parseError,
+                                    UErrorCode       &status)
+{
+    RBBIRuleBuilder  builder(rules, parseError, status);
+    if (U_FAILURE(status)) { 
+        return nullptr;
+    }
+
+    RBBIDataHeader *data = builder.build(status);
+
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+
+    RuleBasedBreakIterator *This = new RuleBasedBreakIterator(data, status);
+    if (U_FAILURE(status)) {
+        delete This;
+        This = nullptr;
+    } 
+    else if(This == nullptr) { 
+        status = U_MEMORY_ALLOCATION_ERROR;
+    }
+    return This;
+}
+
+RBBIDataHeader *RBBIRuleBuilder::build(UErrorCode &status) {
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+
+    fScanner->parse();
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+
+    fSetBuilder->buildRanges();
+
+    fForwardTable = new RBBITableBuilder(this, &fForwardTree, status);
+    if (fForwardTable == nullptr) {
+        status = U_MEMORY_ALLOCATION_ERROR;
+        return nullptr;
+    }
+
+    fForwardTable->buildForwardTable();
+
+
+    optimizeTables();
+    fForwardTable->buildSafeReverseTable(status);
+
+
+#ifdef RBBI_DEBUG
+    if (fDebugEnv && uprv_strstr(fDebugEnv, "states")) {
+        fForwardTable->printStates();
+        fForwardTable->printRuleStatusTable();
+        fForwardTable->printReverseTable();
+    }
+#endif
+
+    fSetBuilder->buildTrie();
+
+    RBBIDataHeader *data = flattenData(); 
+    if (U_FAILURE(status)) {
+        return nullptr;
+    }
+    return data;
+}
+
+void RBBIRuleBuilder::optimizeTables() {
+    bool didSomething;
+    do {
+        didSomething = false;
+
+        IntPair duplPair = {3, 0};
+        while (fForwardTable->findDuplCharClassFrom(&duplPair)) {
+            fSetBuilder->mergeCategories(duplPair);
+            fForwardTable->removeColumn(duplPair.second);
+            didSomething = true;
+        }
+
+        while (fForwardTable->removeDuplicateStates() > 0) {
+            didSomething = true;
+        }
+    } while (didSomething);
+}
+
+U_NAMESPACE_END
+
+#endif /* #if !UCONFIG_NO_BREAK_ITERATION */

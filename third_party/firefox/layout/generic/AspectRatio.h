@@ -1,0 +1,102 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_AspectRatio_h
+#define mozilla_AspectRatio_h
+
+
+#include <algorithm>
+#include <limits>
+
+#include "mozilla/gfx/BaseSize.h"
+#include "nsCoord.h"
+
+namespace IPC {
+template <typename T>
+struct ParamTraits;
+}  
+
+namespace mozilla {
+
+enum class LogicalAxis : uint8_t;
+class LogicalSize;
+class WritingMode;
+
+enum class UseBoxSizing : uint8_t {
+  No,
+  Yes,
+};
+
+struct AspectRatio {
+  friend struct IPC::ParamTraits<mozilla::AspectRatio>;
+
+  AspectRatio() = default;
+  explicit AspectRatio(float aRatio,
+                       UseBoxSizing aUseBoxSizing = UseBoxSizing::No)
+      : mRatio(std::max(aRatio, 0.0f)), mUseBoxSizing(aUseBoxSizing) {}
+
+  static AspectRatio FromSize(float aWidth, float aHeight,
+                              UseBoxSizing aUseBoxSizing = UseBoxSizing::No) {
+    if (aWidth == 0.0f || aHeight == 0.0f) {
+      return AspectRatio();
+    }
+    float ratio = aWidth / aHeight;
+    if (!std::isfinite(ratio)) [[unlikely]] {
+      return AspectRatio();
+    }
+    return AspectRatio(ratio, aUseBoxSizing);
+  }
+
+  template <typename T, typename Sub, typename Coord>
+  static AspectRatio FromSize(const gfx::BaseSize<T, Sub, Coord>& aSize) {
+    return FromSize(aSize.Width(), aSize.Height());
+  }
+
+  explicit operator bool() const { return mRatio != 0.0f; }
+
+  nscoord ApplyTo(nscoord aCoord) const {
+    MOZ_DIAGNOSTIC_ASSERT(*this);
+    return NSCoordSaturatingNonnegativeMultiply(aCoord, mRatio);
+  }
+
+  float ApplyToFloat(float aFloat) const {
+    MOZ_DIAGNOSTIC_ASSERT(*this);
+    return mRatio * aFloat;
+  }
+
+  [[nodiscard]] AspectRatio Inverted() const {
+    if (!*this) {
+      return AspectRatio();
+    }
+    return AspectRatio(
+        std::max(std::numeric_limits<float>::epsilon(), 1.0f / mRatio),
+        mUseBoxSizing);
+  }
+
+  [[nodiscard]] inline AspectRatio ConvertToWritingMode(
+      const WritingMode& aWM) const;
+
+  [[nodiscard]] nscoord ComputeRatioDependentSize(
+      LogicalAxis aRatioDependentAxis, const WritingMode& aWM,
+      nscoord aRatioDeterminingSize,
+      const LogicalSize& aContentBoxSizeToBoxSizingAdjust) const;
+
+  bool operator==(const AspectRatio&) const = default;
+  bool operator!=(const AspectRatio&) const = default;
+
+  bool operator<(const AspectRatio& aOther) const {
+    MOZ_ASSERT(
+        mUseBoxSizing == aOther.mUseBoxSizing,
+        "Do not compare AspectRatio if their mUseBoxSizing are different.");
+    return mRatio < aOther.mRatio;
+  }
+
+ private:
+  float mRatio = 0.0f;
+  UseBoxSizing mUseBoxSizing = UseBoxSizing::No;
+};
+
+}  
+
+#endif  // mozilla_AspectRatio_h

@@ -1,0 +1,63 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(MediaChannelStatistics_h_)
+#  define MediaChannelStatistics_h_
+
+#  include "mozilla/TimeStamp.h"
+
+namespace mozilla {
+
+static const int64_t RELIABLE_DATA_THRESHOLD = 57 * 1460;
+
+class MediaChannelStatistics {
+ public:
+  MediaChannelStatistics() = default;
+  MediaChannelStatistics(const MediaChannelStatistics&) = default;
+  MediaChannelStatistics& operator=(const MediaChannelStatistics&) = default;
+
+  void Reset() {
+    mLastStartTime = TimeStamp();
+    mAccumulatedTime = TimeDuration(0);
+    mAccumulatedBytes = 0;
+    mIsStarted = false;
+  }
+  void Start() {
+    if (mIsStarted) return;
+    mLastStartTime = TimeStamp::Now();
+    mIsStarted = true;
+  }
+  void Stop() {
+    if (!mIsStarted) return;
+    mAccumulatedTime += TimeStamp::Now() - mLastStartTime;
+    mIsStarted = false;
+  }
+  void AddBytes(int64_t aBytes) {
+    if (!mIsStarted) {
+      return;
+    }
+    mAccumulatedBytes += aBytes;
+  }
+  double GetRate(bool* aReliable) const {
+    TimeDuration time = mAccumulatedTime;
+    if (mIsStarted) {
+      time += TimeStamp::Now() - mLastStartTime;
+    }
+    double seconds = time.ToSeconds();
+    *aReliable =
+        (seconds >= 3.0) || (mAccumulatedBytes >= RELIABLE_DATA_THRESHOLD);
+    if (seconds <= 0.0) return 0.0;
+    return static_cast<double>(mAccumulatedBytes) / seconds;
+  }
+
+ private:
+  int64_t mAccumulatedBytes = 0;
+  TimeDuration mAccumulatedTime;
+  TimeStamp mLastStartTime;
+  bool mIsStarted = false;
+};
+
+}  
+
+#endif  // MediaChannelStatistics_h_

@@ -1,0 +1,230 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_RemoteWorkerController_h
+#define mozilla_dom_RemoteWorkerController_h
+
+#include "mozilla/RefPtr.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/dom/DOMTypes.h"
+#include "mozilla/dom/ServiceWorkerOpArgs.h"
+#include "mozilla/dom/ServiceWorkerOpPromise.h"
+#include "mozilla/dom/SharedWorkerOpArgs.h"
+#include "nsISupportsImpl.h"
+#include "nsTArray.h"
+
+namespace mozilla::dom {
+
+
+class ErrorValue;
+class FetchEventOpParent;
+class RemoteWorkerControllerParent;
+class RemoteWorkerData;
+class RemoteWorkerManager;
+class RemoteWorkerNonLifeCycleOpControllerParent;
+class RemoteWorkerParent;
+
+class RemoteWorkerObserver {
+ public:
+  NS_INLINE_DECL_PURE_VIRTUAL_REFCOUNTING
+
+  virtual void CreationFailed() = 0;
+
+  virtual void CreationSucceeded() = 0;
+
+  virtual void ErrorReceived(const ErrorValue& aValue) = 0;
+
+  virtual void LockNotified(bool aCreated) = 0;
+
+  virtual void WebTransportNotified(bool aCreated) = 0;
+
+  virtual void Terminated() = 0;
+};
+
+class RemoteWorkerController final {
+  friend class RemoteWorkerControllerParent;
+  friend class RemoteWorkerManager;
+  friend class RemoteWorkerParent;
+  friend class RemoteWorkerNonLifeCycleOpControllerParent;
+
+ public:
+  NS_INLINE_DECL_REFCOUNTING(RemoteWorkerController)
+
+  static already_AddRefed<RemoteWorkerController> Create(
+      const RemoteWorkerData& aData, RemoteWorkerObserver* aObserver,
+      base::ProcessId = 0);
+
+  void AddWindowID(uint64_t aWindowID);
+
+  void RemoveWindowID(uint64_t aWindowID);
+
+  void AddPortIdentifier(const MessagePortIdentifier& aPortIdentifier);
+
+  void Terminate();
+
+  void Suspend();
+
+  void Resume();
+
+  void Freeze();
+
+  void Thaw();
+
+  void SetLocaleOverride(const nsACString& aLanguageOverride,
+                         const nsTArray<nsString>& aLanguages);
+
+  void UpdateTimezoneOverride(const nsAString& aTimezoneOverride);
+
+  RefPtr<ServiceWorkerOpPromise> ExecServiceWorkerOp(
+      ServiceWorkerOpArgs&& aArgs);
+
+  RefPtr<ServiceWorkerFetchEventOpPromise> ExecServiceWorkerFetchEventOp(
+      const ParentToParentServiceWorkerFetchEventOpArgs& aArgs,
+      RefPtr<FetchEventOpParent> aReal);
+
+  RefPtr<GenericPromise> SetServiceWorkerSkipWaitingFlag() const;
+
+  bool IsTerminated() const;
+
+  void NotifyWebTransport(bool aCreated);
+
+ private:
+  RemoteWorkerController(const RemoteWorkerData& aData,
+                         RemoteWorkerObserver* aObserver);
+
+  ~RemoteWorkerController();
+
+  void SetWorkerActor(RemoteWorkerParent* aActor);
+
+  void NoteDeadWorkerActor();
+
+  void ErrorPropagation(const ErrorValue& aValue);
+
+  void NotifyLock(bool aCreated);
+
+  void WorkerTerminated();
+
+  void Shutdown();
+
+  void CreationFailed();
+
+  void CreationSucceeded();
+
+  void CancelAllPendingOps();
+
+  template <typename... Args>
+  void MaybeStartSharedWorkerOp(Args&&... aArgs);
+
+  void NoteDeadWorker();
+
+  RefPtr<RemoteWorkerObserver> mObserver;
+  RefPtr<RemoteWorkerParent> mActor;
+  RefPtr<RemoteWorkerNonLifeCycleOpControllerParent> mNonLifeCycleOpController;
+
+  enum {
+    ePending,
+    eReady,
+    eTerminated,
+  } mState;
+
+  const bool mIsServiceWorker;
+
+  class PendingOp {
+   public:
+    PendingOp() = default;
+
+    PendingOp(const PendingOp&) = delete;
+
+    PendingOp& operator=(const PendingOp&) = delete;
+
+    virtual ~PendingOp() = default;
+
+    virtual bool MaybeStart(RemoteWorkerController* const aOwner) = 0;
+
+    virtual void Cancel() = 0;
+  };
+
+  class PendingSharedWorkerOp final : public PendingOp {
+   public:
+    enum Type {
+      eTerminate,
+      eSuspend,
+      eResume,
+      eFreeze,
+      eThaw,
+      ePortIdentifier,
+      eAddWindowID,
+      eRemoveWindowID,
+      eSetLocaleOverride,
+      eUpdateTimezoneOverride,
+    };
+
+    explicit PendingSharedWorkerOp(Type aType, uint64_t aWindowID = 0);
+
+    explicit PendingSharedWorkerOp(
+        const MessagePortIdentifier& aPortIdentifier);
+
+    PendingSharedWorkerOp(const nsACString& aLanguageOverride,
+                          const nsTArray<nsString>& aLanguages);
+
+    PendingSharedWorkerOp(Type aType, const nsAString& aTimezoneOverride);
+
+    ~PendingSharedWorkerOp();
+
+    bool MaybeStart(RemoteWorkerController* const aOwner) override;
+
+    void Cancel() override;
+
+   private:
+    const Type mType;
+    const MessagePortIdentifier mPortIdentifier;
+    const uint64_t mWindowID = 0;
+    const nsCString mLanguageOverride;
+    const CopyableTArray<nsString> mLanguages;
+    const nsString mTimezoneOverride;
+    bool mCompleted = false;
+  };
+
+  class PendingServiceWorkerOp final : public PendingOp {
+   public:
+    PendingServiceWorkerOp(ServiceWorkerOpArgs&& aArgs,
+                           RefPtr<ServiceWorkerOpPromise::Private> aPromise);
+
+    ~PendingServiceWorkerOp();
+
+    bool MaybeStart(RemoteWorkerController* const aOwner) override;
+
+    void Cancel() override;
+
+   private:
+    ServiceWorkerOpArgs mArgs;
+    RefPtr<ServiceWorkerOpPromise::Private> mPromise;
+  };
+
+  class PendingSWFetchEventOp final : public PendingOp {
+   public:
+    PendingSWFetchEventOp(
+        const ParentToParentServiceWorkerFetchEventOpArgs& aArgs,
+        RefPtr<ServiceWorkerFetchEventOpPromise::Private> aPromise,
+        RefPtr<FetchEventOpParent>&& aReal);
+
+    ~PendingSWFetchEventOp();
+
+    bool MaybeStart(RemoteWorkerController* const aOwner) override;
+
+    void Cancel() override;
+
+   private:
+    ParentToParentServiceWorkerFetchEventOpArgs mArgs;
+    RefPtr<ServiceWorkerFetchEventOpPromise::Private> mPromise;
+    RefPtr<FetchEventOpParent> mReal;
+    nsCOMPtr<nsIInputStream> mBodyStream;
+  };
+
+  nsTArray<UniquePtr<PendingOp>> mPendingOps;
+};
+
+}  
+
+#endif  // mozilla_dom_RemoteWorkerController_h

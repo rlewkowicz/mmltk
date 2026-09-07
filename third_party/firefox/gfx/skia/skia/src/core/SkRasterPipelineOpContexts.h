@@ -1,0 +1,276 @@
+/*
+ * Copyright 2023 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkRasterPipelineOpContexts_DEFINED)
+#define SkRasterPipelineOpContexts_DEFINED
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+
+namespace SkSL { class TraceHook; }
+struct SkRasterPipelineStage;
+enum class SkPerlinNoiseShaderType;
+
+namespace SkRasterPipelineContexts {
+
+inline static constexpr int kMaxStride = 16;
+inline static constexpr int kMaxStride_highp = 16;
+
+inline static constexpr size_t kMaxScratchPerPatch =
+        std::max(kMaxStride_highp * 16,  
+                 kMaxStride * 4);        
+
+struct MemoryCtx {
+    void* pixels;
+    int   stride;
+};
+
+struct MemoryCtxInfo {
+    MemoryCtx* context;
+
+    int bytesPerPixel;
+    bool load;
+    bool store;
+};
+
+struct MemoryCtxPatch {
+    std::byte scratch[kMaxScratchPerPatch];
+
+    MemoryCtxInfo info;
+    void* backup;  
+};
+
+struct GatherCtx {
+    const void* pixels;
+    int         stride;
+    float       width;
+    float       height;
+    float       weights[16];  
+    bool        roundDownAtInteger = false;
+};
+
+struct SamplerCtx {
+    float      x[kMaxStride_highp];
+    float      y[kMaxStride_highp];
+    float     fx[kMaxStride_highp];
+    float     fy[kMaxStride_highp];
+    float scalex[kMaxStride_highp];
+    float scaley[kMaxStride_highp];
+
+    float weights[16];
+    float wx[4][kMaxStride_highp];
+    float wy[4][kMaxStride_highp];
+};
+
+struct TileCtx {
+    float scale;
+    float invScale; 
+    int   mirrorBiasDir = -1;
+};
+
+struct DecalTileCtx {
+    uint32_t mask[kMaxStride];
+    float    limit_x;
+    float    limit_y;
+    float    inclusiveEdge_x = 0;
+    float    inclusiveEdge_y = 0;
+};
+
+struct PerlinNoiseCtx {
+    SkPerlinNoiseShaderType noiseType;
+    float baseFrequencyX, baseFrequencyY;
+    float stitchDataInX, stitchDataInY;
+    bool stitching;
+    int numOctaves;
+    const uint8_t* latticeSelector;  
+    const uint16_t* noiseData;       
+};
+
+struct MipmapCtx {
+    float x[kMaxStride_highp];
+    float y[kMaxStride_highp];
+
+    float r[kMaxStride_highp];
+    float g[kMaxStride_highp];
+    float b[kMaxStride_highp];
+    float a[kMaxStride_highp];
+
+    float scaleX;
+    float scaleY;
+
+    float lowerWeight;
+};
+
+struct CoordClampCtx {
+    float min_x, min_y;
+    float max_x, max_y;
+};
+
+struct CallbackCtx {
+    void (*fn)(CallbackCtx* self, int active_pixels );
+
+    float rgba[4 * kMaxStride_highp];
+    float* read_from = rgba;
+};
+
+struct RewindCtx {
+    float  r[kMaxStride_highp];
+    float  g[kMaxStride_highp];
+    float  b[kMaxStride_highp];
+    float  a[kMaxStride_highp];
+    float dr[kMaxStride_highp];
+    float dg[kMaxStride_highp];
+    float db[kMaxStride_highp];
+    float da[kMaxStride_highp];
+    std::byte* base;
+    SkRasterPipelineStage* stage;
+};
+
+constexpr size_t kRGBAChannels = 4;
+
+struct GradientCtx {
+    size_t stopCount;
+    float* factors[kRGBAChannels];
+    float* biases[kRGBAChannels];
+    float* ts;
+};
+
+struct EvenlySpaced2StopGradientCtx {
+    float factor[kRGBAChannels];
+    float bias[kRGBAChannels];
+};
+
+struct Conical2PtCtx {
+    uint32_t fMask[kMaxStride_highp];
+    float    fP0,
+             fP1;
+};
+
+struct UniformColorCtx {
+    float r,g,b,a;
+    uint16_t rgba[4];  
+};
+
+struct EmbossCtx {
+    MemoryCtx mul, add;
+};
+
+struct TablesCtx {
+    const uint8_t *r, *g, *b, *a;
+};
+
+using SkRPOffset = uint32_t;
+
+struct InitLaneMasksCtx {
+    uint8_t* tail;
+};
+
+struct ConstantCtx {
+    int32_t value;
+    SkRPOffset dst;
+};
+
+struct UniformCtx {
+    int32_t* dst;
+    const int32_t* src;
+};
+
+struct BinaryOpCtx {
+    SkRPOffset dst;
+    SkRPOffset src;
+};
+
+struct TernaryOpCtx {
+    SkRPOffset dst;
+    SkRPOffset delta;
+};
+
+struct MatrixMultiplyCtx {
+    SkRPOffset dst;
+    uint8_t leftColumns, leftRows, rightColumns, rightRows;
+};
+
+struct SwizzleCtx {
+    static_assert(kMaxStride_highp <= 16);
+
+    SkRPOffset dst;
+    uint8_t offsets[4];  
+};
+
+struct ShuffleCtx {
+    int32_t* ptr;
+    int count;
+    uint16_t offsets[16];  
+};
+
+struct SwizzleCopyCtx {
+    int32_t* dst;
+    const int32_t* src;   
+    uint16_t offsets[4];  
+};
+
+struct CopyIndirectCtx {
+    int32_t* dst;
+    const int32_t* src;
+    const uint32_t *indirectOffset;  
+    uint32_t indirectLimit;          
+    uint32_t slots;                  
+};
+
+struct SwizzleCopyIndirectCtx : public CopyIndirectCtx {
+    uint16_t offsets[4];  
+};
+
+struct BranchCtx {
+    int offset;  
+};
+
+struct BranchIfAllLanesActiveCtx : public BranchCtx {
+    uint8_t* tail = nullptr;  
+};
+
+struct BranchIfEqualCtx : public BranchCtx {
+    int value;
+    const int* ptr;
+};
+
+struct CaseOpCtx {
+    int expectedValue;
+    SkRPOffset offset;  
+};
+
+struct TraceFuncCtx {
+    const int* traceMask;
+    SkSL::TraceHook* traceHook;
+    int funcIdx;
+};
+
+struct TraceScopeCtx {
+    const int* traceMask;
+    SkSL::TraceHook* traceHook;
+    int delta;
+};
+
+struct TraceLineCtx {
+    const int* traceMask;
+    SkSL::TraceHook* traceHook;
+    int lineNumber;
+};
+
+struct TraceVarCtx {
+    const int* traceMask;
+    SkSL::TraceHook* traceHook;
+    int slotIdx, numSlots;
+    const int* data;
+    const uint32_t *indirectOffset;  
+    uint32_t indirectLimit;          
+};
+
+}  
+
+#endif

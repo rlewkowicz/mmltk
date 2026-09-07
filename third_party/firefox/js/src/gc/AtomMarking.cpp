@@ -1,0 +1,459 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "gc/AtomMarking-inl.h"
+
+#include <type_traits>
+
+#include "gc/GCLock.h"
+#include "gc/PublicIterators.h"
+
+#include "gc/GC-inl.h"
+#include "gc/Heap-inl.h"
+#include "gc/PrivateIterators-inl.h"
+
+namespace js {
+namespace gc {
+
+
+size_t AtomMarkingRuntime::allocateIndex(GCRuntime* gc) {
+
+  if (freeArenaIndexes.ref().empty()) {
+    mergePendingFreeArenaIndexes(gc);
+  }
+
+  if (!freeArenaIndexes.ref().empty()) {
+    return freeArenaIndexes.ref().popCopy();
+  }
+
+  size_t index = allocatedWords;
+  allocatedWords += ArenaBitmapWords;
+  return index;
+}
+
+void AtomMarkingRuntime::freeIndex(size_t index, const AutoLockGC& lock) {
+  MOZ_ASSERT((index % ArenaBitmapWords) == 0);
+  MOZ_ASSERT(index < allocatedWords);
+
+  bool wasEmpty = pendingFreeArenaIndexes.ref().empty();
+  MOZ_ASSERT_IF(wasEmpty, !hasPendingFreeArenaIndexes);
+
+  if (!pendingFreeArenaIndexes.ref().append(index)) {
+    return;
+  }
+
+  if (wasEmpty) {
+    hasPendingFreeArenaIndexes = true;
+  }
+}
+
+void AtomMarkingRuntime::mergePendingFreeArenaIndexes(GCRuntime* gc) {
+  MOZ_ASSERT(CurrentThreadCanAccessRuntime(gc->rt));
+  if (!hasPendingFreeArenaIndexes) {
+    return;
+  }
+
+  AutoLockGC lock(gc);
+  MOZ_ASSERT(!pendingFreeArenaIndexes.ref().empty());
+
+  hasPendingFreeArenaIndexes = false;
+
+  if (freeArenaIndexes.ref().empty()) {
+    std::swap(freeArenaIndexes.ref(), pendingFreeArenaIndexes.ref());
+    return;
+  }
+
+  (void)freeArenaIndexes.ref().appendAll(pendingFreeArenaIndexes.ref());
+  pendingFreeArenaIndexes.ref().clear();
+}
+
+static bool MultipleNonAtomZonesAreBeingCollected(GCRuntime* gc) {
+  size_t count = 0;
+  for (GCZonesIter zone(gc); !zone.done(); zone.next()) {
+    if (!zone->isAtomsZone()) {
+      count++;
+      if (count == 2) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+void AtomMarkingRuntime::refineZoneBitmapsForCollectedZones(GCRuntime* gc) {
+  DenseBitmap marked;
+  if (MultipleNonAtomZonesAreBeingCollected(gc) &&
+      computeBitmapFromChunkMarkBits(gc, marked)) {
+    for (GCZonesIter zone(gc, SkipAtoms); !zone.done(); zone.next()) {
+      refineZoneBitmapForCollectedZone(zone, marked);
+    }
+    return;
+  }
+
+  for (GCZonesIter zone(gc, SkipAtoms); !zone.done(); zone.next()) {
+    for (auto thingKind : AllAllocKinds()) {
+      for (ArenaIterInGC aiter(gc->atomsZone(), thingKind); !aiter.done();
+           aiter.next()) {
+        refineZoneBitmapForCollectedZone(zone, aiter);
+      }
+    }
+  }
+}
+
+
+#if JS_BITS_PER_WORD == 32
+static constexpr uintptr_t BlackBitMask = 0x55555555;
+#else
+static constexpr uintptr_t BlackBitMask = 0x5555555555555555;
+#endif
+static constexpr uintptr_t GrayOrBlackBitMask = ~BlackBitMask;
+
+static void PropagateBlackBitsToGrayOrBlackBits(DenseBitmap& bitmap,
+                                                Arena* arena) {
+  MOZ_ASSERT(
+      TraceKindCanBeMarkedGray(MapAllocToTraceKind(arena->getAllocKind())));
+  MOZ_ASSERT((arena->getThingSize() / CellBytesPerMarkBit) % 2 == 0);
+
+  bitmap.forEachWord(
+      arena->atomBitmapStart(), ArenaBitmapWords,
+      [](uintptr_t& word) { word |= (word & BlackBitMask) << 1; });
+}
+
+static void PropagateBlackBitsToGrayOrBlackBits(
+    uintptr_t (&words)[ArenaBitmapWords]) {
+  for (uintptr_t& word : words) {
+    word |= (word & BlackBitMask) << 1;
+  }
+}
+
+static void PropagateGrayOrBlackBitsToBlackBits(SparseBitmap& bitmap,
+                                                Arena* arena) {
+  MOZ_ASSERT(
+      TraceKindCanBeMarkedGray(MapAllocToTraceKind(arena->getAllocKind())));
+  MOZ_ASSERT((arena->getThingSize() / CellBytesPerMarkBit) % 2 == 0);
+
+  bitmap.forEachWord(
+      arena->atomBitmapStart(), ArenaBitmapWords,
+      [](uintptr_t& word) { word |= (word & GrayOrBlackBitMask) >> 1; });
+}
+
+#ifdef DEBUG
+static bool ArenaContainsGrayCells(Arena* arena) {
+  for (ArenaCellIter cell(arena); !cell.done(); cell.next()) {
+    if (cell->isMarkedGray()) {
+      return true;
+    }
+  }
+  return false;
+}
+#endif
+
+bool AtomMarkingRuntime::computeBitmapFromChunkMarkBits(GCRuntime* gc,
+                                                        DenseBitmap& bitmap) {
+  MOZ_ASSERT(CurrentThreadIsPerformingGC());
+
+  if (!bitmap.ensureSpace(allocatedWords)) {
+    return false;
+  }
+
+  Zone* atomsZone = gc->atomsZone();
+  for (auto thingKind : AllAllocKinds()) {
+    for (ArenaIterInGC aiter(atomsZone, thingKind); !aiter.done();
+         aiter.next()) {
+      Arena* arena = aiter.get();
+      AtomicBitmapWord* chunkWords = arena->chunk()->markBits.arenaBits(arena);
+      bitmap.copyBitsFrom(arena->atomBitmapStart(), ArenaBitmapWords,
+                          chunkWords);
+
+      if (thingKind == AllocKind::JITCODE) {
+        MOZ_ASSERT(!ArenaContainsGrayCells(arena));
+      } else if (TraceKindCanBeMarkedGray(MapAllocToTraceKind(thingKind))) {
+        PropagateBlackBitsToGrayOrBlackBits(bitmap, arena);
+      }
+    }
+  }
+
+  return true;
+}
+
+void AtomMarkingRuntime::refineZoneBitmapForCollectedZone(
+    Zone* zone, const DenseBitmap& bitmap) {
+  MOZ_ASSERT(zone->isCollectingFromAnyThread());
+  MOZ_ASSERT(!zone->isAtomsZone());
+
+  zone->markedAtoms().bitwiseAndWith(bitmap);
+}
+
+void AtomMarkingRuntime::refineZoneBitmapForCollectedZone(Zone* zone,
+                                                          Arena* arena) {
+  MOZ_ASSERT(zone->isCollectingFromAnyThread());
+  MOZ_ASSERT(!zone->isAtomsZone());
+
+  AtomicBitmapWord* chunkWords = arena->chunk()->markBits.arenaBits(arena);
+
+  AllocKind kind = arena->getAllocKind();
+  if (kind == AllocKind::JITCODE) {
+    MOZ_ASSERT(!ArenaContainsGrayCells(arena));
+  } else if (TraceKindCanBeMarkedGray(MapAllocToTraceKind(kind))) {
+    uintptr_t words[ArenaBitmapWords];
+    memcpy(words, chunkWords, sizeof(words));
+    PropagateBlackBitsToGrayOrBlackBits(words);
+    zone->markedAtoms().bitwiseAndRangeWith(arena->atomBitmapStart(),
+                                            ArenaBitmapWords, words);
+    return;
+  }
+
+  zone->markedAtoms().bitwiseAndRangeWith(arena->atomBitmapStart(),
+                                          ArenaBitmapWords, chunkWords);
+}
+
+template <typename Bitmap>
+static void BitwiseOrIntoChunkMarkBits(Zone* atomsZone, Bitmap& bitmap) {
+  static_assert(ArenaBitmapBits == ArenaBitmapWords * JS_BITS_PER_WORD,
+                "ArenaBitmapWords must evenly divide ArenaBitmapBits");
+
+  for (auto thingKind : AllAllocKinds()) {
+    for (ArenaIterInGC aiter(atomsZone, thingKind); !aiter.done();
+         aiter.next()) {
+      Arena* arena = aiter.get();
+      AtomicBitmapWord* chunkWords = arena->chunk()->markBits.arenaBits(arena);
+      bitmap.bitwiseOrRangeInto(arena->atomBitmapStart(), ArenaBitmapWords,
+                                chunkWords);
+    }
+  }
+}
+
+UniquePtr<DenseBitmap> AtomMarkingRuntime::getOrMarkAtomsUsedByUncollectedZones(
+    GCRuntime* gc) {
+  MOZ_ASSERT(CurrentThreadIsPerformingGC());
+
+  UniquePtr<DenseBitmap> markedUnion = MakeUnique<DenseBitmap>();
+  if (!markedUnion || !markedUnion->ensureSpace(allocatedWords)) {
+    for (ZonesIter zone(gc, SkipAtoms); !zone.done(); zone.next()) {
+      if (!zone->isCollecting()) {
+        BitwiseOrIntoChunkMarkBits(gc->atomsZone(), zone->markedAtoms());
+      }
+    }
+    return nullptr;
+  }
+
+  for (ZonesIter zone(gc, SkipAtoms); !zone.done(); zone.next()) {
+    if (!zone->isCollecting()) {
+      zone->markedAtoms().bitwiseOrInto(*markedUnion);
+    }
+  }
+
+  return markedUnion;
+}
+
+void AtomMarkingRuntime::markAtomsUsedByUncollectedZones(
+    GCRuntime* gc, UniquePtr<DenseBitmap> markedUnion) {
+  BitwiseOrIntoChunkMarkBits(gc->atomsZone(), *markedUnion);
+}
+
+void AtomMarkingRuntime::unmarkAllGrayReferences(GCRuntime* gc) {
+  for (ZonesIter sourceZone(gc, SkipAtoms); !sourceZone.done();
+       sourceZone.next()) {
+    MOZ_ASSERT(!sourceZone->isAtomsZone());
+    auto& bitmap = sourceZone->markedAtoms();
+    for (ArenaIter arena(gc->atomsZone(), AllocKind::SYMBOL); !arena.done();
+         arena.next()) {
+      PropagateGrayOrBlackBitsToBlackBits(bitmap, arena);
+    }
+#ifdef DEBUG
+    for (auto cell = gc->atomsZone()->cellIter<JS::Symbol>(); !cell.done();
+         cell.next()) {
+      MOZ_ASSERT(getAtomMarkColor(sourceZone, cell.get()) != CellColor::Gray);
+    }
+#endif
+  }
+}
+
+template <typename T>
+void AtomMarkingRuntime::markAtom(JSContext* cx, T* thing) {
+  ReadBarrier(thing);
+
+  return inlinedMarkAtom(cx->zone(), thing);
+}
+
+template void AtomMarkingRuntime::markAtom(JSContext* cx, JSAtom* thing);
+template void AtomMarkingRuntime::markAtom(JSContext* cx, JS::Symbol* thing);
+
+void AtomMarkingRuntime::markId(JSContext* cx, jsid id) {
+  if (id.isAtom()) {
+    markAtom(cx, id.toAtom());
+    return;
+  }
+  if (id.isSymbol()) {
+    markAtom(cx, id.toSymbol());
+    return;
+  }
+  MOZ_ASSERT(!id.isGCThing());
+}
+
+void AtomMarkingRuntime::markAtomValue(JSContext* cx, const Value& value) {
+  if (value.isString()) {
+    if (value.toString()->isAtom()) {
+      markAtom(cx, &value.toString()->asAtom());
+    }
+    return;
+  }
+  if (value.isSymbol()) {
+    markAtom(cx, value.toSymbol());
+    return;
+  }
+  MOZ_ASSERT_IF(value.isGCThing(), value.isObject() ||
+                                       value.isPrivateGCThing() ||
+                                       value.isBigInt());
+}
+
+template <typename T>
+CellColor AtomMarkingRuntime::getAtomMarkColor(Zone* zone, T* thing) {
+  static_assert(std::is_same_v<T, JSAtom> || std::is_same_v<T, JS::Symbol>,
+                "Should only be called with JSAtom* or JS::Symbol* argument");
+
+  MOZ_ASSERT(thing);
+  MOZ_ASSERT(!IsInsideNursery(thing));
+  MOZ_ASSERT(thing->zoneFromAnyThread()->isAtomsZone());
+
+  if (!zone->runtimeFromAnyThread()->permanentAtomsPopulated()) {
+    return CellColor::Black;
+  }
+
+  if (thing->isPermanentAndMayBeShared()) {
+    return CellColor::Black;
+  }
+
+  if constexpr (std::is_same_v<T, JSAtom>) {
+    if (thing->isPinned()) {
+      return CellColor::Black;
+    }
+  }
+
+  size_t bit = getAtomBit(&thing->asTenured());
+
+  size_t blackBit = bit + size_t(ColorBit::BlackBit);
+  size_t grayOrBlackBit = bit + size_t(ColorBit::GrayOrBlackBit);
+
+  SparseBitmap& bitmap = zone->markedAtoms();
+
+  MOZ_ASSERT_IF((std::is_same_v<T, JSAtom>),
+                !bitmap.readonlyThreadsafeGetBit(grayOrBlackBit));
+  MOZ_ASSERT_IF((std::is_same_v<T, JS::Symbol>) &&
+                    bitmap.readonlyThreadsafeGetBit(blackBit),
+                bitmap.readonlyThreadsafeGetBit(grayOrBlackBit));
+
+  if (bitmap.readonlyThreadsafeGetBit(blackBit)) {
+    return CellColor::Black;
+  }
+
+  if constexpr (std::is_same_v<T, JS::Symbol>) {
+    if (bitmap.readonlyThreadsafeGetBit(grayOrBlackBit)) {
+      return CellColor::Gray;
+    }
+  }
+
+  return CellColor::White;
+}
+
+template CellColor AtomMarkingRuntime::getAtomMarkColor(Zone* zone,
+                                                        JSAtom* thing);
+template CellColor AtomMarkingRuntime::getAtomMarkColor(Zone* zone,
+                                                        JS::Symbol* thing);
+
+CellColor AtomMarkingRuntime::getAtomMarkColorForIndex(Zone* zone,
+                                                       size_t bitIndex) {
+  MOZ_ASSERT(zone->runtimeFromAnyThread()->permanentAtomsPopulated());
+
+  size_t blackBit = bitIndex + size_t(ColorBit::BlackBit);
+  size_t grayOrBlackBit = bitIndex + size_t(ColorBit::GrayOrBlackBit);
+
+  SparseBitmap& bitmap = zone->markedAtoms();
+  bool blackBitSet = bitmap.readonlyThreadsafeGetBit(blackBit);
+  bool grayOrBlackBitSet = bitmap.readonlyThreadsafeGetBit(grayOrBlackBit);
+
+  if (blackBitSet) {
+    return CellColor::Black;
+  }
+
+  if (grayOrBlackBitSet) {
+    return CellColor::Gray;
+  }
+
+  return CellColor::White;
+}
+
+#ifdef DEBUG
+
+template <>
+CellColor AtomMarkingRuntime::getAtomMarkColor(Zone* zone, TenuredCell* thing) {
+  MOZ_ASSERT(thing);
+  MOZ_ASSERT(thing->zoneFromAnyThread()->isAtomsZone());
+
+  if (thing->is<JSString>()) {
+    JSString* str = thing->as<JSString>();
+    return getAtomMarkColor(zone, &str->asAtom());
+  }
+
+  if (thing->is<JS::Symbol>()) {
+    return getAtomMarkColor(zone, thing->as<JS::Symbol>());
+  }
+
+  MOZ_CRASH("Unexpected atom kind");
+}
+
+bool AtomMarkingRuntime::idIsMarked(Zone* zone, jsid id) {
+  if (id.isAtom()) {
+    return atomIsMarked(zone, id.toAtom());
+  }
+
+  if (id.isSymbol()) {
+    return atomIsMarked(zone, id.toSymbol());
+  }
+
+  MOZ_ASSERT(!id.isGCThing());
+  return true;
+}
+
+bool AtomMarkingRuntime::valueIsMarked(Zone* zone, const Value& value) {
+  if (value.isString()) {
+    if (value.toString()->isAtom()) {
+      return atomIsMarked(zone, &value.toString()->asAtom());
+    }
+    return true;
+  }
+
+  if (value.isSymbol()) {
+    return atomIsMarked(zone, value.toSymbol());
+  }
+
+  MOZ_ASSERT_IF(value.isGCThing(), value.isObject() ||
+                                       value.isPrivateGCThing() ||
+                                       value.isBigInt());
+  return true;
+}
+
+#endif  // DEBUG
+
+}  
+
+#ifdef DEBUG
+
+bool AtomIsMarked(Zone* zone, JSAtom* atom) {
+  return zone->runtimeFromAnyThread()->gc.atomMarking.atomIsMarked(zone, atom);
+}
+
+bool AtomIsMarked(Zone* zone, jsid id) {
+  return zone->runtimeFromAnyThread()->gc.atomMarking.idIsMarked(zone, id);
+}
+
+bool AtomIsMarked(Zone* zone, const Value& value) {
+  return zone->runtimeFromAnyThread()->gc.atomMarking.valueIsMarked(zone,
+                                                                    value);
+}
+
+#endif  // DEBUG
+
+}  

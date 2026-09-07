@@ -1,0 +1,143 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_APZCCallbackHelper_h
+#define mozilla_layers_APZCCallbackHelper_h
+
+#include "InputData.h"
+#include "LayersTypes.h"
+#include "Units.h"
+#include "mozilla/EventForwards.h"
+#include "mozilla/layers/MatrixMessage.h"
+#include "nsRefreshObservers.h"
+
+class nsIContent;
+class nsIWidget;
+class nsPresContext;
+template <class T>
+struct already_AddRefed;
+template <class T>
+class nsCOMPtr;
+
+namespace mozilla {
+
+enum class PreventDefaultResult : uint8_t { No, ByContent, ByChrome };
+
+class PresShell;
+class ScrollContainerFrame;
+enum class PreventDefaultResult : uint8_t;
+
+namespace layers {
+
+struct RepaintRequest;
+
+namespace apz {
+enum class PrecedingPointerDown : bool;
+}
+
+enum class SynthesizeForTests : bool { No, Yes };
+
+class DisplayportSetListener : public ManagedPostRefreshObserver {
+ public:
+  DisplayportSetListener(nsIWidget* aWidget, nsPresContext*,
+                         const uint64_t& aInputBlockId,
+                         nsTArray<ScrollableLayerGuid>&& aTargets);
+  virtual ~DisplayportSetListener();
+  void Register();
+
+ private:
+  RefPtr<nsIWidget> mWidget;
+  uint64_t mInputBlockId;
+  nsTArray<ScrollableLayerGuid> mTargets;
+
+  void OnPostRefresh();
+};
+
+class APZCCallbackHelper {
+  typedef mozilla::layers::ScrollableLayerGuid ScrollableLayerGuid;
+
+ public:
+  using PrecedingPointerDown = apz::PrecedingPointerDown;
+
+  static void NotifyLayerTransforms(const nsTArray<MatrixMessage>& aTransforms);
+
+  static void UpdateRootFrame(const RepaintRequest& aRequest);
+
+  static void UpdateSubFrame(const RepaintRequest& aRequest);
+
+  static bool GetOrCreateScrollIdentifiers(
+      nsIContent* aContent, uint32_t* aPresShellIdOut,
+      ScrollableLayerGuid::ViewID* aViewIdOut);
+
+  static void InitializeRootDisplayport(PresShell* aPresShell);
+
+  static void InitializeRootDisplayport(nsIFrame* aFrame);
+
+  static nsPresContext* GetPresContextForContent(nsIContent* aContent);
+
+  static PresShell* GetRootContentDocumentPresShellForContent(
+      nsIContent* aContent);
+
+  static nsEventStatus DispatchWidgetEvent(WidgetGUIEvent& aEvent);
+
+  MOZ_CAN_RUN_SCRIPT static nsEventStatus DispatchSynthesizedMouseEvent(
+      EventMessage aMsg, const LayoutDevicePoint& aRefPoint,
+      uint32_t aPointerId, Modifiers aModifiers, int32_t aClickCount,
+      PrecedingPointerDown aPrecedingPointerDownState, nsIWidget* aWidget,
+      SynthesizeForTests aSynthesizeForTests);
+
+  MOZ_CAN_RUN_SCRIPT static PreventDefaultResult
+  DispatchSynthesizedContextmenuEvent(const LayoutDevicePoint& aRefPoint,
+                                      uint32_t aPointerId, Modifiers aModifiers,
+                                      nsIWidget* aWidget,
+                                      SynthesizeForTests aSynthesizeForTests);
+
+  MOZ_CAN_RUN_SCRIPT static void FireSingleTapEvent(
+      const LayoutDevicePoint& aPoint, uint32_t aPointerId,
+      Modifiers aModifiers, int32_t aClickCount,
+      PrecedingPointerDown aPrecedingPointerDownState, nsIWidget* aWidget,
+      SynthesizeForTests aSynthesizeForTests);
+
+  static already_AddRefed<DisplayportSetListener> SendSetTargetAPZCNotification(
+      nsIWidget* aWidget, mozilla::dom::Document* aDocument,
+      const WidgetGUIEvent& aEvent, const LayersId& aLayersId,
+      uint64_t aInputBlockId);
+
+  static void NotifyMozMouseScrollEvent(
+      const ScrollableLayerGuid::ViewID& aScrollId, const nsString& aEvent);
+
+  static void NotifyFlushComplete(PresShell* aPresShell);
+
+  static void NotifyAsyncScrollbarDragInitiated(
+      uint64_t aDragBlockId, const ScrollableLayerGuid::ViewID& aScrollId,
+      ScrollDirection aDirection);
+  static void NotifyAsyncScrollbarDragRejected(
+      const ScrollableLayerGuid::ViewID& aScrollId);
+  static void NotifyAsyncAutoscrollRejected(
+      const ScrollableLayerGuid::ViewID& aScrollId);
+
+  static void CancelAutoscroll(const ScrollableLayerGuid::ViewID& aScrollId);
+  static void NotifyScaleGestureComplete(const nsCOMPtr<nsIWidget>& aWidget,
+                                         float aScale);
+
+  static bool IsScrollInProgress(ScrollContainerFrame* aFrame);
+
+  static void NotifyPinchGesture(PinchGestureInput::PinchGestureType aType,
+                                 const LayoutDevicePoint& aFocusPoint,
+                                 LayoutDeviceCoord aSpanChange,
+                                 Modifiers aModifiers,
+                                 const nsCOMPtr<nsIWidget>& aWidget);
+
+ private:
+  static uint64_t sLastTargetAPZCNotificationInputBlock;
+};
+
+}  
+
+std::ostream& operator<<(std::ostream& aOut,
+                         const PreventDefaultResult aPreventDefaultResult);
+
+}  
+
+#endif /* mozilla_layers_APZCCallbackHelper_h */

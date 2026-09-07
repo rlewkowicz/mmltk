@@ -1,0 +1,89 @@
+// Copyright 2011 Google Inc. All Rights Reserved.
+// Redistribution and use in source and binary forms, with or without
+//     * Redistributions of source code must retain the above copyright
+//     * Redistributions in binary form must reproduce the above
+// copyright notice, this list of conditions and the following disclaimer
+//     * Neither the name of Google Inc. nor the names of its
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+
+#ifndef THIRD_PARTY_SNAPPY_SNAPPY_SINKSOURCE_H_
+#define THIRD_PARTY_SNAPPY_SNAPPY_SINKSOURCE_H_
+
+#include <stddef.h>
+
+namespace snappy {
+
+class Sink {
+ public:
+  Sink() { }
+  virtual ~Sink();
+
+  virtual void Append(const char* bytes, size_t n) = 0;
+
+  virtual char* GetAppendBuffer(size_t length, char* scratch);
+
+
+  virtual void AppendAndTakeOwnership(
+      char* bytes, size_t n, void (*deleter)(void*, const char*, size_t),
+      void *deleter_arg);
+
+  virtual char* GetAppendBufferVariable(
+      size_t min_size, size_t desired_size_hint, char* scratch,
+      size_t scratch_size, size_t* allocated_size);
+
+ private:
+  Sink(const Sink&);
+  void operator=(const Sink&);
+};
+
+class Source {
+ public:
+  Source() { }
+  virtual ~Source();
+
+  virtual size_t Available() const = 0;
+
+  virtual const char* Peek(size_t* len) = 0;
+
+  virtual void Skip(size_t n) = 0;
+
+ private:
+  Source(const Source&);
+  void operator=(const Source&);
+};
+
+class ByteArraySource : public Source {
+ public:
+  ByteArraySource(const char* p, size_t n) : ptr_(p), left_(n) { }
+  ~ByteArraySource() override;
+  size_t Available() const override;
+  const char* Peek(size_t* len) override;
+  void Skip(size_t n) override;
+ private:
+  const char* ptr_;
+  size_t left_;
+};
+
+class UncheckedByteArraySink : public Sink {
+ public:
+  explicit UncheckedByteArraySink(char* dest) : dest_(dest) { }
+  ~UncheckedByteArraySink() override;
+  void Append(const char* data, size_t n) override;
+  char* GetAppendBuffer(size_t len, char* scratch) override;
+  char* GetAppendBufferVariable(
+      size_t min_size, size_t desired_size_hint, char* scratch,
+      size_t scratch_size, size_t* allocated_size) override;
+  void AppendAndTakeOwnership(
+      char* bytes, size_t n, void (*deleter)(void*, const char*, size_t),
+      void *deleter_arg) override;
+
+  char* CurrentDestination() const { return dest_; }
+ private:
+  char* dest_;
+};
+
+}  
+
+#endif  // THIRD_PARTY_SNAPPY_SNAPPY_SINKSOURCE_H_

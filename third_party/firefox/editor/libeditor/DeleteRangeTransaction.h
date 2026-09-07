@@ -1,0 +1,77 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DeleteRangeTransaction_h
+#define DeleteRangeTransaction_h
+
+#include "DeleteContentTransactionBase.h"
+#include "EditAggregateTransaction.h"
+
+#include "EditorBase.h"
+#include "EditorDOMPoint.h"
+#include "EditorForwards.h"
+
+#include "mozilla/RefPtr.h"
+
+#include "nsCycleCollectionParticipant.h"
+#include "nsID.h"
+#include "nsIEditor.h"
+#include "nsISupportsImpl.h"
+#include "nsRange.h"
+#include "nscore.h"
+
+class nsINode;
+
+namespace mozilla {
+
+class DeleteRangeTransaction final : public EditAggregateTransaction {
+ protected:
+  DeleteRangeTransaction(EditorBase& aEditorBase,
+                         const nsRange& aRangeToDelete);
+
+ public:
+  static already_AddRefed<DeleteRangeTransaction> Create(
+      EditorBase& aEditorBase, const nsRange& aRangeToDelete) {
+    RefPtr<DeleteRangeTransaction> transaction =
+        new DeleteRangeTransaction(aEditorBase, aRangeToDelete);
+    return transaction.forget();
+  }
+
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(DeleteRangeTransaction,
+                                           EditAggregateTransaction)
+  NS_IMETHOD QueryInterface(REFNSIID aIID, void** aInstancePtr) override;
+
+  NS_DECL_EDITTRANSACTIONBASE
+  NS_DECL_EDITTRANSACTIONBASE_GETASMETHODS_OVERRIDE(DeleteRangeTransaction)
+
+  void AppendChild(DeleteContentTransactionBase& aTransaction);
+
+  MOZ_CAN_RUN_SCRIPT NS_IMETHOD RedoTransaction() override;
+
+  EditorDOMPoint SuggestPointToPutCaret() const;
+
+ protected:
+  nsresult MaybeExtendDeletingRangeWithSurroundingWhitespace(
+      nsRange& aRange) const;
+
+  nsresult AppendTransactionsToDeleteIn(
+      const EditorRawDOMRange& aRangeToDelete);
+
+  nsresult AppendTransactionsToDeleteNodesWhoseEndBoundaryIn(
+      const EditorRawDOMRange& aRangeToDelete);
+
+  nsresult AppendTransactionToDeleteText(
+      const EditorRawDOMPoint& aMaybePointInText,
+      nsIEditor::EDirection aAction);
+
+  RefPtr<EditorBase> mEditorBase;
+
+  RefPtr<nsRange> mRangeToDelete;
+
+  EditorDOMPoint mPointToPutCaret;
+};
+
+}  
+
+#endif  // #ifndef DeleteRangeTransaction_h

@@ -1,0 +1,44 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_GFX_PRINTTARGETTHEBES_H
+#define MOZILLA_GFX_PRINTTARGETTHEBES_H
+
+#include "mozilla/gfx/PrintTarget.h"
+
+class gfxASurface;
+
+namespace mozilla {
+namespace gfx {
+
+class PrintTargetThebes final : public PrintTarget {
+ public:
+  static already_AddRefed<PrintTargetThebes> CreateOrNull(
+      gfxASurface* aSurface);
+
+  nsresult BeginPrinting(const nsAString& aTitle,
+                         const nsAString& aPrintToFileName,
+                         uint64_t aBrowsingContextId, int32_t aStartPage,
+                         int32_t aEndPage) override;
+  nsresult EndPrinting() override;
+  nsresult AbortPrinting() override;
+  nsresult BeginPage(const IntSize& aSizeInPoints) override;
+  nsresult EndPage() override;
+  void Finish() override;
+
+  already_AddRefed<DrawTarget> MakeDrawTarget(
+      const IntSize& aSize, DrawEventRecorder* aRecorder = nullptr) override;
+
+  already_AddRefed<DrawTarget> GetReferenceDrawTarget() final;
+
+ private:
+  explicit PrintTargetThebes(gfxASurface* aSurface);
+
+  RefPtr<gfxASurface> mGfxSurface;
+};
+
+}  
+}  
+
+#endif /* MOZILLA_GFX_PRINTTARGETTHEBES_H */

@@ -1,0 +1,112 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsStreamUtils_h_
+#define nsStreamUtils_h_
+
+#include "nsCOMPtr.h"
+#include "nsStringFwd.h"
+#include "nsIInputStream.h"
+#include "nsTArray.h"
+#include "nsIRunnable.h"
+
+class nsIAsyncInputStream;
+class nsICloneableInputStream;
+class nsIOutputStream;
+class nsIInputStreamCallback;
+class nsIOutputStreamCallback;
+class nsIEventTarget;
+
+extern already_AddRefed<nsIInputStreamCallback> NS_NewInputStreamReadyEvent(
+    const char* aName, nsIInputStreamCallback* aNotify, nsIEventTarget* aTarget,
+    uint32_t aPriority = nsIRunnablePriority::PRIORITY_NORMAL);
+
+extern already_AddRefed<nsIOutputStreamCallback> NS_NewOutputStreamReadyEvent(
+    nsIOutputStreamCallback* aNotify, nsIEventTarget* aTarget);
+
+
+enum nsAsyncCopyMode {
+  NS_ASYNCCOPY_VIA_READSEGMENTS,
+  NS_ASYNCCOPY_VIA_WRITESEGMENTS
+};
+
+typedef void (*nsAsyncCopyProgressFun)(void* closure, uint32_t count);
+
+typedef void (*nsAsyncCopyCallbackFun)(void* closure, nsresult status);
+
+extern nsresult NS_AsyncCopy(
+    nsIInputStream* aSource, nsIOutputStream* aSink, nsIEventTarget* aTarget,
+    nsAsyncCopyMode aMode = NS_ASYNCCOPY_VIA_READSEGMENTS,
+    uint32_t aChunkSize = 4096, nsAsyncCopyCallbackFun aCallbackFun = nullptr,
+    void* aCallbackClosure = nullptr, bool aCloseSource = true,
+    bool aCloseSink = true, nsISupports** aCopierCtx = nullptr,
+    nsAsyncCopyProgressFun aProgressCallbackFun = nullptr);
+
+extern nsresult NS_CancelAsyncCopy(nsISupports* aCopierCtx, nsresult aReason);
+
+extern nsresult NS_ConsumeStream(nsIInputStream* aSource, uint32_t aMaxCount,
+                                 nsACString& aBuffer);
+
+extern nsresult NS_ConsumeStream(nsIInputStream* aSource, uint32_t aMaxCount,
+                                 nsTArray<uint8_t>& aBuffer);
+
+extern bool NS_InputStreamIsBuffered(nsIInputStream* aInputStream);
+
+extern bool NS_OutputStreamIsBuffered(nsIOutputStream* aOutputStream);
+
+extern nsresult NS_CopySegmentToStream(nsIInputStream* aInputStream,
+                                       void* aClosure, const char* aFromSegment,
+                                       uint32_t aToOffset, uint32_t aCount,
+                                       uint32_t* aWriteCount);
+
+extern nsresult NS_CopySegmentToBuffer(nsIInputStream* aInputStream,
+                                       void* aClosure, const char* aFromSegment,
+                                       uint32_t aToOffset, uint32_t aCount,
+                                       uint32_t* aWriteCount);
+
+extern nsresult NS_CopyBufferToSegment(nsIOutputStream* aOutputStream,
+                                       void* aClosure, char* aToSegment,
+                                       uint32_t aFromOffset, uint32_t aCount,
+                                       uint32_t* aReadCount);
+
+extern nsresult NS_CopyStreamToSegment(nsIOutputStream* aOutputStream,
+                                       void* aClosure, char* aToSegment,
+                                       uint32_t aFromOffset, uint32_t aCount,
+                                       uint32_t* aReadCount);
+
+extern nsresult NS_DiscardSegment(nsIInputStream* aInputStream, void* aClosure,
+                                  const char* aFromSegment, uint32_t aToOffset,
+                                  uint32_t aCount, uint32_t* aWriteCount);
+
+extern nsresult NS_WriteSegmentThunk(nsIInputStream* aInputStream,
+                                     void* aClosure, const char* aFromSegment,
+                                     uint32_t aToOffset, uint32_t aCount,
+                                     uint32_t* aWriteCount);
+
+struct MOZ_STACK_CLASS nsWriteSegmentThunk {
+  nsCOMPtr<nsIInputStream> mStream;
+  nsWriteSegmentFun mFun;
+  void* mClosure;
+};
+
+extern nsresult NS_FillArray(FallibleTArray<char>& aDest,
+                             nsIInputStream* aInput, uint32_t aKeep,
+                             uint32_t* aNewBytes);
+
+extern bool NS_InputStreamIsCloneable(nsIInputStream* aSource);
+
+extern nsresult NS_EnsureInputStreamIsCloneable(
+    nsIInputStream* aSource, nsICloneableInputStream** aCloneableOut,
+    nsIInputStream** aReplacementOut = nullptr);
+
+extern nsresult NS_CloneInputStream(nsIInputStream* aSource,
+                                    nsIInputStream** aCloneOut,
+                                    nsIInputStream** aReplacementOut = nullptr);
+
+extern nsresult NS_MakeAsyncNonBlockingInputStream(
+    already_AddRefed<nsIInputStream> aSource,
+    nsIAsyncInputStream** aAsyncInputStream, bool aCloseWhenDone = true,
+    uint32_t aFlags = 0, uint32_t aSegmentSize = 0, uint32_t aSegmentCount = 0);
+
+#endif  // !nsStreamUtils_h_

@@ -1,0 +1,242 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_quota_EncryptingOutputStream_impl_h
+#define mozilla_dom_quota_EncryptingOutputStream_impl_h
+
+#include <algorithm>
+#include <utility>
+
+#include "CipherStrategy.h"
+#include "EncryptingOutputStream.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/Span.h"
+#include "mozilla/fallible.h"
+#include "nsDebug.h"
+#include "nsError.h"
+#include "nsIAsyncOutputStream.h"
+#include "nsIRandomGenerator.h"
+#include "nsServiceManagerUtils.h"
+
+namespace mozilla::dom::quota {
+template <typename CipherStrategy>
+EncryptingOutputStream<CipherStrategy>::EncryptingOutputStream(
+    nsCOMPtr<nsIOutputStream> aBaseStream, size_t aBlockSize,
+    typename CipherStrategy::KeyType aKey)
+    : EncryptingOutputStreamBase(std::move(aBaseStream), aBlockSize) {
+  MOZ_ALWAYS_SUCCEEDS(mCipherStrategy.Init(CipherMode::Encrypt,
+                                           CipherStrategy::SerializeKey(aKey),
+                                           CipherStrategy::MakeBlockPrefix()));
+
+  MOZ_ASSERT(mBlockSize > 0);
+  MOZ_ASSERT(mBlockSize % CipherStrategy::BasicBlockSize == 0);
+  static_assert(
+      CipherStrategy::BlockPrefixLength % CipherStrategy::BasicBlockSize == 0);
+
+#ifdef DEBUG
+  bool baseNonBlocking;
+  nsresult rv = (*mBaseStream)->IsNonBlocking(&baseNonBlocking);
+  MOZ_ASSERT(NS_SUCCEEDED(rv));
+  if (baseNonBlocking) {
+    nsCOMPtr<nsIAsyncOutputStream> async =
+        do_QueryInterface((*mBaseStream).get());
+    MOZ_ASSERT(!async);
+  }
+#endif
+}
+
+template <typename CipherStrategy>
+EncryptingOutputStream<CipherStrategy>::~EncryptingOutputStream() {
+  Close();
+}
+
+template <typename CipherStrategy>
+NS_IMETHODIMP EncryptingOutputStream<CipherStrategy>::Close() {
+  if (!mBaseStream) {
+    return NS_OK;
+  }
+
+  nsresult rv = FlushToBaseStream();
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  rv = (*mBaseStream)->Flush();
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  (*mBaseStream)->Close();
+  mBaseStream.destroy();
+
+  mBuffer.Clear();
+  mEncryptedBlock.reset();
+
+  return NS_OK;
+}
+
+template <typename CipherStrategy>
+NS_IMETHODIMP EncryptingOutputStream<CipherStrategy>::Flush() {
+  if (!mBaseStream) {
+    return NS_BASE_STREAM_CLOSED;
+  }
+
+  if (!EnsureBuffers()) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+
+  if (mNextByte && mNextByte == mEncryptedBlock->MaxPayloadLength()) {
+    nsresult rv = FlushToBaseStream();
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      return rv;
+    }
+  }
+
+  return (*mBaseStream)->Flush();
+}
+
+template <typename CipherStrategy>
+NS_IMETHODIMP EncryptingOutputStream<CipherStrategy>::StreamStatus() {
+  if (!mBaseStream) {
+    return NS_BASE_STREAM_CLOSED;
+  }
+  return (*mBaseStream)->StreamStatus();
+}
+
+template <typename CipherStrategy>
+NS_IMETHODIMP EncryptingOutputStream<CipherStrategy>::WriteSegments(
+    nsReadSegmentFun aReader, void* aClosure, uint32_t aCount,
+    uint32_t* aBytesWrittenOut) {
+  *aBytesWrittenOut = 0;
+
+  if (!mBaseStream) {
+    return NS_BASE_STREAM_CLOSED;
+  }
+
+  if (!EnsureBuffers()) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+
+  const size_t plainBufferSize = mEncryptedBlock->MaxPayloadLength();
+
+  while (aCount > 0) {
+    MOZ_ASSERT(mNextByte <= plainBufferSize);
+    uint32_t remaining = plainBufferSize - mNextByte;
+
+    if (remaining == 0) {
+      nsresult rv = FlushToBaseStream();
+      if (NS_WARN_IF(NS_FAILED(rv))) {
+        return rv;
+      }
+
+      MOZ_ASSERT(!mNextByte);
+      remaining = plainBufferSize;
+    }
+
+    uint32_t numToRead = std::min(remaining, aCount);
+    uint32_t numRead = 0;
+
+    nsresult rv =
+        aReader(this, aClosure, reinterpret_cast<char*>(&mBuffer[mNextByte]),
+                *aBytesWrittenOut, numToRead, &numRead);
+
+    if (NS_FAILED(rv)) {
+      return NS_OK;
+    }
+
+    if (numRead == 0) {
+      return NS_OK;
+    }
+
+    mNextByte += numRead;
+    *aBytesWrittenOut += numRead;
+    aCount -= numRead;
+  }
+
+  return NS_OK;
+}
+
+template <typename CipherStrategy>
+bool EncryptingOutputStream<CipherStrategy>::EnsureBuffers() {
+  if (!mEncryptedBlock) {
+    mEncryptedBlock.emplace(mBlockSize);
+    MOZ_ASSERT(mBuffer.IsEmpty());
+
+    if (NS_WARN_IF(!mBuffer.SetLength(mEncryptedBlock->MaxPayloadLength(),
+                                      fallible))) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+template <typename CipherStrategy>
+nsresult EncryptingOutputStream<CipherStrategy>::FlushToBaseStream() {
+  MOZ_ASSERT(mBaseStream);
+
+  if (!mNextByte) {
+    return NS_OK;
+  }
+
+  const size_t roundedNextByte =
+      mEncryptedBlock->RoundedUpToBasicBlockSize(mNextByte);
+
+  if (mNextByte < mEncryptedBlock->MaxPayloadLength()) {
+    if (!mRandomGenerator) {
+      mRandomGenerator =
+          do_GetService("@mozilla.org/security/random-generator;1");
+      if (NS_WARN_IF(!mRandomGenerator)) {
+        return NS_ERROR_FAILURE;
+      }
+    }
+
+    const auto payload = mEncryptedBlock->MutablePayload();
+
+    const auto unusedPayload = payload.From(roundedNextByte);
+
+    nsresult rv = mRandomGenerator->GenerateRandomBytesInto(
+        unusedPayload.Elements(), unusedPayload.Length());
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      return rv;
+    }
+
+    std::fill(mBuffer.begin() + mNextByte, mBuffer.begin() + roundedNextByte,
+              0);
+  }
+
+
+  const auto iv = mCipherStrategy.MakeBlockPrefix();
+  static_assert(iv.size() * sizeof(decltype(*iv.begin())) ==
+                CipherStrategy::BlockPrefixLength);
+  std::copy(iv.cbegin(), iv.cend(),
+            mEncryptedBlock->MutableCipherPrefix().begin());
+
+  nsresult rv =
+      mCipherStrategy.Cipher(mEncryptedBlock->MutableCipherPrefix(),
+                             mozilla::Span(mBuffer.Elements(), roundedNextByte),
+                             mEncryptedBlock->MutablePayload());
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  mEncryptedBlock->SetActualPayloadLength(mNextByte);
+
+  mNextByte = 0;
+
+  uint32_t numWritten = 0;
+  const auto& wholeBlock = mEncryptedBlock->WholeBlock();
+  rv = WriteAll(AsChars(wholeBlock).Elements(), wholeBlock.Length(),
+                &numWritten);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+  MOZ_ASSERT(wholeBlock.Length() == numWritten);
+
+  return NS_OK;
+}
+
+}  
+
+#endif

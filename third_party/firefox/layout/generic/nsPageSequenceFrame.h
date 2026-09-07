@@ -1,0 +1,132 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef nsPageSequenceFrame_h_
+#define nsPageSequenceFrame_h_
+
+#include "nsContainerFrame.h"
+#include "nsIPrintSettings.h"
+
+namespace mozilla {
+
+class PresShell;
+class PrintedSheetFrame;
+
+namespace dom {
+
+class HTMLCanvasElement;
+
+}  
+}  
+
+struct nsPagesPerSheetInfo {
+  static const nsPagesPerSheetInfo& LookupInfo(int32_t aPPS);
+
+  uint16_t mNumPages;
+
+  uint16_t mLargerNumTracks;
+};
+
+class nsSharedPageData {
+ public:
+  nsString mDateTimeStr;
+  nsString mPageNumFormat;
+  nsString mPageNumAndTotalsFormat;
+  nsString mDocTitle;
+  nsString mDocURL;
+  nsFont mHeadFootFont;
+
+  nsTArray<int32_t> mPageRanges;
+
+  nsMargin mEdgePaperMargin;
+
+  nsCOMPtr<nsIPrintSettings> mPrintSettings;
+
+  const nsPagesPerSheetInfo* PagesPerSheetInfo();
+
+  int32_t mRawNumPages = 0;
+
+  float mShrinkToFitRatio = 1.0f;
+
+ private:
+  const nsPagesPerSheetInfo* mPagesPerSheetInfo = nullptr;
+};
+
+class nsPageSequenceFrame final : public nsContainerFrame {
+  using LogicalSize = mozilla::LogicalSize;
+
+ public:
+  friend nsPageSequenceFrame* NS_NewPageSequenceFrame(
+      mozilla::PresShell* aPresShell, ComputedStyle* aStyle);
+
+  NS_DECL_QUERYFRAME
+  NS_DECL_FRAMEARENA_HELPERS(nsPageSequenceFrame)
+
+  void Reflow(nsPresContext* aPresContext, ReflowOutput& aReflowOutput,
+              const ReflowInput& aReflowInput,
+              nsReflowStatus& aStatus) override;
+
+  void BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                        const nsDisplayListSet& aLists) override;
+
+  float GetSTFPercent() const { return mPageData.mShrinkToFitRatio; }
+
+  float GetPrintPreviewScale() const;
+
+  nsresult StartPrint(nsPresContext* aPresContext,
+                      nsIPrintSettings* aPrintSettings,
+                      const nsAString& aDocTitle, const nsAString& aDocURL);
+  nsresult PrePrintNextSheet(nsITimerCallback* aCallback, bool* aDone);
+  nsresult PrintNextSheet();
+  void ResetPrintCanvasList();
+
+  uint32_t GetCurrentSheetIdx() const { return mCurrentSheetIdx; }
+
+  int32_t GetRawNumPages() const { return mPageData.mRawNumPages; }
+
+  uint32_t GetPagesInFirstSheet() const;
+
+  nsresult DoPageEnd();
+
+  ComputeTransformFunction GetTransformGetter() const override;
+
+#ifdef DEBUG_FRAME_DUMP
+  nsresult GetFrameName(nsAString& aResult) const override;
+#endif
+
+ protected:
+  nsPageSequenceFrame(ComputedStyle*, nsPresContext*);
+  virtual ~nsPageSequenceFrame();
+
+  void SetPageNumberFormat(const char* aPropName, const char* aDefPropVal,
+                           bool aPageNumOnly);
+
+  void SetDateTimeStr(const nsAString& aDateTimeStr);
+  void SetPageNumberFormat(const nsAString& aFormatStr, bool aForPageNumOnly);
+
+  void PopulateReflowOutput(ReflowOutput&, const ReflowInput&);
+
+  nscoord ComputeCenteringMargin(nscoord aContainerContentBoxWidth,
+                                 nscoord aChildPaddingBoxWidth,
+                                 const nsMargin& aChildPhysicalMargin);
+
+  mozilla::PrintedSheetFrame* GetCurrentSheetFrame();
+
+  nsSize mSize;
+
+
+  LogicalSize mMaxSheetSize;
+  LogicalSize mScrollportSize;
+
+  nsSharedPageData mPageData;
+
+  uint32_t mCurrentSheetIdx = 0;
+
+  nsTArray<RefPtr<mozilla::dom::HTMLCanvasElement>> mCurrentCanvasList;
+
+  bool mCalledBeginPage;
+
+  bool mCurrentCanvasListSetup;
+};
+
+#endif /* nsPageSequenceFrame_h_ */

@@ -1,0 +1,47 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_APZThreadUtils_h
+#define mozilla_layers_APZThreadUtils_h
+
+#include "nsIEventTarget.h"
+#include "nsINamed.h"
+#include "nsITimer.h"
+#include "nsString.h"
+
+class nsISerialEventTarget;
+
+namespace mozilla {
+
+class Runnable;
+
+namespace layers {
+
+class APZThreadUtils {
+ public:
+  static void SetThreadAssertionsEnabled(bool aEnabled);
+  static bool GetThreadAssertionsEnabled();
+
+  static void SetControllerThread(nsISerialEventTarget* aThread);
+
+  static void AssertOnControllerThread();
+
+  static void RunOnControllerThread(
+      RefPtr<Runnable>&& aTask,
+      nsIEventTarget::DispatchFlags flags = nsIEventTarget::DISPATCH_NORMAL);
+
+  static already_AddRefed<nsISerialEventTarget> GetControllerThread();
+
+  static bool IsControllerThread();
+
+  static bool IsControllerThreadAlive();
+
+  static void DelayedDispatch(already_AddRefed<Runnable> aRunnable,
+                              int aDelayMs);
+};
+
+}  
+}  
+
+#endif /* mozilla_layers_APZThreadUtils_h */

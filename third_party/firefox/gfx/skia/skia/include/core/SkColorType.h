@@ -1,0 +1,59 @@
+/*
+ * Copyright 2022 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkColorType_DEFINED)
+#define SkColorType_DEFINED
+
+#include "include/core/SkTypes.h"
+
+enum SkColorType : int {
+    kUnknown_SkColorType,
+    kAlpha_8_SkColorType,
+    kRGB_565_SkColorType,
+    kARGB_4444_SkColorType,
+    kRGBA_8888_SkColorType,
+    kRGB_888x_SkColorType,
+    kBGRA_8888_SkColorType,
+    kRGBA_1010102_SkColorType,
+    kBGRA_1010102_SkColorType,
+    kRGB_101010x_SkColorType,
+    kBGR_101010x_SkColorType,
+    kBGR_101010x_XR_SkColorType,
+    kBGRA_10101010_XR_SkColorType,
+    kRGBA_10x6_SkColorType,
+    kGray_8_SkColorType,
+    kRGBA_F16Norm_SkColorType,
+    kRGBA_F16_SkColorType,
+    kRGB_F16F16F16x_SkColorType,
+    kRGBA_F32_SkColorType,
+    kR8G8_unorm_SkColorType,
+    kA16_float_SkColorType,
+
+    kR16_float_SkColorType,
+    kR16G16_float_SkColorType,
+    kA16_unorm_SkColorType,
+    kR16_unorm_SkColorType,
+    kR16G16_unorm_SkColorType,
+    kR16G16B16A16_unorm_SkColorType,
+    kSRGBA_8888_SkColorType,
+    kR8_unorm_SkColorType,
+
+    kLastEnum_SkColorType     = kR8_unorm_SkColorType, 
+
+#if SK_PMCOLOR_BYTE_ORDER(B,G,R,A)
+    kN32_SkColorType          = kBGRA_8888_SkColorType,
+
+#elif SK_PMCOLOR_BYTE_ORDER(R,G,B,A)
+    kN32_SkColorType          = kRGBA_8888_SkColorType,
+
+#else
+    kN32_SkColorType = kBGRA_8888_SkColorType,
+#endif
+};
+static constexpr int kSkColorTypeCnt = static_cast<int>(kLastEnum_SkColorType) + 1;
+
+#endif

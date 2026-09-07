@@ -1,0 +1,19 @@
+
+[package]
+name = "xml-rs"
+version = "0.8.4"
+authors = ["Vladimir Matveev <vmatveev@citrine.cc>"]
+description = "An XML library in pure Rust"
+documentation = "http://docs.rs/xml-rs/"
+keywords = ["xml", "parsing", "parser"]
+categories = ["parsing"]
+license = "MIT"
+repository = "https://github.com/netvl/xml-rs"
+
+[lib]
+name = "xml"
+path = "src/lib.rs"
+
+[[bin]]
+name = "xml-analyze"
+path = "src/analyze.rs"

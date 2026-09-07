@@ -1,0 +1,1993 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(nsINode_h_)
+#define nsINode_h_
+
+#include <fmt/format.h>
+
+#include <iosfwd>
+
+#include "js/TypeDecls.h"  // for Handle, Value, JSObject, JSContext
+#include "mozilla/DoublyLinkedList.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/DOMString.h"
+#include "mozilla/dom/EventTarget.h"  // for base class
+#include "mozilla/dom/NodeInfo.h"     // member (in nsCOMPtr)
+#include "nsCOMPtr.h"                 // for member, local
+#include "nsGkAtoms.h"                // for nsGkAtoms::baseURIProperty
+#include "nsIMutationObserver.h"
+#include "nsIWeakReference.h"
+#include "nsNodeInfoManager.h"  // for use in NodePrincipal()
+#include "nsPropertyTable.h"    // for typedefs
+
+
+class AttrArray;
+class nsAttrChildContentList;
+template <typename T>
+class nsCOMArray;
+class nsDOMAttributeMap;
+class nsFrameSelection;
+class nsGenericHTMLElement;
+class nsIAnimationObserver;
+class nsIContent;
+class nsIContentSecurityPolicy;
+class nsIFrame;
+class nsIFormControl;
+class nsMultiMutationObserver;
+class nsINode;
+class nsIPolicyContainer;
+class nsIPrincipal;
+class nsIURI;
+class nsNodeSupportsWeakRefTearoff;
+class nsDOMMutationObserver;
+class nsRange;
+class nsWindowSizes;
+
+namespace mozilla {
+class EventListenerManager;
+struct StyleSelectorList;
+template <typename T>
+class Maybe;
+template <typename T>
+class LinkedList;
+class ErrorResult;
+class PresShell;
+class TextEditor;
+class WidgetEvent;
+namespace dom {
+class NodeList;
+class HTMLCollection;
+
+inline bool IsSpaceCharacter(char16_t aChar) {
+  return aChar == ' ' || aChar == '\t' || aChar == '\n' || aChar == '\r' ||
+         aChar == '\f';
+}
+inline bool IsSpaceCharacter(char aChar) {
+  return aChar == ' ' || aChar == '\t' || aChar == '\n' || aChar == '\r' ||
+         aChar == '\f';
+}
+class AbstractRange;
+class AccessibleNode;
+template <typename T>
+class AncestorsOfTypeIterator;
+struct BoxQuadOptions;
+struct ConvertCoordinateOptions;
+class CustomElementRegistry;
+class DocGroup;
+class Document;
+class DocumentFragment;
+class DocumentOrShadowRoot;
+class DOMPoint;
+class DOMQuad;
+class DOMRectReadOnly;
+class Element;
+class EventHandlerNonNull;
+template <typename T>
+class FlatTreeAncestorsOfTypeIterator;
+class HTMLDialogElement;
+class HTMLSlotElement;
+template <typename T>
+class InclusiveAncestorsOfTypeIterator;
+template <typename T>
+class InclusiveFlatTreeAncestorsOfTypeIterator;
+class LinkStyle;
+class MutationObservers;
+template <typename T>
+class Optional;
+class OwningNodeOrString;
+class SelectionNodeCache;
+template <typename>
+class Sequence;
+class ShadowRoot;
+class SVGUseElement;
+class Text;
+class TextOrElementOrDocument;
+struct DOMPointInit;
+struct GetRootNodeOptions;
+enum class AllowRangeCrossShadowBoundary : bool;  
+enum class CallerType : uint32_t;
+struct AriaNotificationOptions;
+}  
+}  
+
+#define NODE_FLAG_BIT(n_) \
+  (nsWrapperCache::FlagsType(1U) << (WRAPPER_CACHE_FLAGS_BITS_USED + (n_)))
+
+enum : uint32_t {
+  NODE_HAS_LISTENERMANAGER = NODE_FLAG_BIT(0),
+
+  NODE_HAS_PROPERTIES = NODE_FLAG_BIT(1),
+
+  NODE_IS_IN_NATIVE_ANONYMOUS_SUBTREE = NODE_FLAG_BIT(2),
+
+  NODE_IS_NATIVE_ANONYMOUS_ROOT = NODE_FLAG_BIT(3),
+
+  NODE_IS_EDITABLE = NODE_FLAG_BIT(4),
+
+  NODE_IS_IN_SHADOW_TREE = NODE_FLAG_BIT(5),
+
+  NODE_NEEDS_FRAME = NODE_FLAG_BIT(6),
+
+  NODE_DESCENDANTS_NEED_FRAMES = NODE_FLAG_BIT(7),
+
+  NODE_HAS_ACCESSKEY = NODE_FLAG_BIT(8),
+
+  NODE_HAS_BEEN_IN_UA_WIDGET = NODE_FLAG_BIT(9),
+
+  NODE_HAS_NONCE_AND_HEADER_CSP = NODE_FLAG_BIT(10),
+
+  NODE_KEEPS_DOMARENA = NODE_FLAG_BIT(11),
+
+  NODE_MAY_HAVE_ELEMENT_CHILDREN = NODE_FLAG_BIT(12),
+
+  NODE_HAS_SCHEDULED_SELECTION_CHANGE_EVENT = NODE_FLAG_BIT(13),
+
+  NODE_TYPE_SPECIFIC_BITS_OFFSET = 14
+};
+
+enum class NodeSelectorFlags : uint32_t {
+  HasEmptySelector = 1 << 0,
+
+  HasSlowSelector = 1 << 1,
+
+  HasEdgeChildSelector = 1 << 2,
+
+  HasSlowSelectorLaterSiblings = 1 << 3,
+
+  HasSlowSelectorNth = 1 << 4,
+
+  HasSlowSelectorNthOf = 1 << 5,
+
+  HasSlowSelectorNthAll = HasSlowSelectorNthOf | HasSlowSelectorNth,
+
+  MayHaveTreeCountingFunction = 1 << 6,
+
+  AllSimpleRestyleFlagsForAppend =
+      HasEmptySelector | HasSlowSelector | HasEdgeChildSelector |
+      HasSlowSelectorNthAll | MayHaveTreeCountingFunction,
+
+  AllSimpleRestyleFlags =
+      AllSimpleRestyleFlagsForAppend | HasSlowSelectorLaterSiblings,
+
+  RelativeSelectorAnchor = 1 << 7,
+
+  RelativeSelectorAnchorNonSubject = 1 << 8,
+
+  RelativeSelectorSearchDirectionSibling = 1 << 9,
+
+  RelativeSelectorSearchDirectionAncestor = 1 << 10,
+
+  RelativeSelectorSearchDirectionAncestorSibling =
+      RelativeSelectorSearchDirectionSibling |
+      RelativeSelectorSearchDirectionAncestor,
+};
+
+MOZ_MAKE_ENUM_CLASS_BITWISE_OPERATORS(NodeSelectorFlags);
+
+enum class BatchRemovalOrder {
+  FrontToBack,
+  BackToFront,
+};
+
+struct BatchRemovalState {
+  bool mIsFirst = true;
+};
+
+#define ASSERT_NODE_FLAGS_SPACE(n)                         \
+  static_assert(WRAPPER_CACHE_FLAGS_BITS_USED + (n) <=     \
+                    sizeof(nsWrapperCache::FlagsType) * 8, \
+                "Not enough space for our bits")
+ASSERT_NODE_FLAGS_SPACE(NODE_TYPE_SPECIFIC_BITS_OFFSET);
+
+class nsMutationGuard {
+ public:
+  nsMutationGuard() { mStartingGeneration = sGeneration; }
+
+  bool Mutated(uint8_t aIgnoreCount) const {
+    return (sGeneration - mStartingGeneration) > aIgnoreCount;
+  }
+
+  static void DidMutate() { sGeneration++; }
+
+ private:
+  uint64_t mStartingGeneration;
+
+  static uint64_t sGeneration;
+};
+
+class nsNodeWeakReference final : public nsIWeakReference {
+ public:
+  explicit nsNodeWeakReference(nsINode* aNode);
+
+  NS_DECL_ISUPPORTS
+
+  NS_DECL_NSIWEAKREFERENCE
+
+  void NoticeNodeDestruction() { mObject = nullptr; }
+
+ private:
+  ~nsNodeWeakReference();
+};
+
+enum class TreeKind : uint8_t {
+  DOM,
+  ShadowIncludingDOM,
+  Flat,
+  FlatForSelection,
+};
+
+template <TreeKind aKind>
+[[nodiscard]] constexpr static inline bool ShouldIgnoreNonContentShadow() {
+  return aKind != TreeKind::Flat;
+}
+
+template <TreeKind aKind>
+[[nodiscard]] constexpr static inline bool ShouldHandleAssignedNodesOnSlot() {
+  return aKind == TreeKind::Flat || aKind == TreeKind::FlatForSelection;
+}
+
+inline auto format_as(const TreeKind& aTreeKind) {
+  constexpr static const char* sNames[] = {
+      "DOM",
+      "ShadowIncludingDOM",
+      "Flat",
+      "FlatForSelection",
+  };
+  return std::string(sNames[static_cast<uint8_t>(aTreeKind)]);
+}
+
+inline std::ostream& operator<<(std::ostream& aStream, TreeKind aTreeKind) {
+  return aStream << format_as(aTreeKind);
+}
+
+#define NS_DECL_ADDSIZEOFEXCLUDINGTHIS                       \
+  virtual void AddSizeOfExcludingThis(nsWindowSizes& aSizes, \
+                                      size_t* aNodeSize) const override;
+
+#define NS_INODE_IID \
+  {0x70ba4547, 0x7699, 0x44fc, {0xb3, 0x20, 0x52, 0xdb, 0xe3, 0xd1, 0xf9, 0x0a}}
+
+class nsINode : public mozilla::dom::EventTarget {
+#if defined(MOZ_DIAGNOSTIC_ASSERT_ENABLED)
+  void AssertInvariantsOnNodeInfoChange();
+#endif
+ public:
+  using BoxQuadOptions = mozilla::dom::BoxQuadOptions;
+  using ConvertCoordinateOptions = mozilla::dom::ConvertCoordinateOptions;
+  using DocGroup = mozilla::dom::DocGroup;
+  using Document = mozilla::dom::Document;
+  using DOMPoint = mozilla::dom::DOMPoint;
+  using DOMPointInit = mozilla::dom::DOMPointInit;
+  using DOMQuad = mozilla::dom::DOMQuad;
+  using DOMRectReadOnly = mozilla::dom::DOMRectReadOnly;
+  using OwningNodeOrString = mozilla::dom::OwningNodeOrString;
+  using TextOrElementOrDocument = mozilla::dom::TextOrElementOrDocument;
+  using CallerType = mozilla::dom::CallerType;
+  using ErrorResult = mozilla::ErrorResult;
+
+  static const uint16_t ELEMENT_NODE = 1;
+  static const uint16_t ATTRIBUTE_NODE = 2;
+  static const uint16_t TEXT_NODE = 3;
+  static const uint16_t CDATA_SECTION_NODE = 4;
+  static const uint16_t ENTITY_REFERENCE_NODE = 5;
+  static const uint16_t ENTITY_NODE = 6;
+  static const uint16_t PROCESSING_INSTRUCTION_NODE = 7;
+  static const uint16_t COMMENT_NODE = 8;
+  static const uint16_t DOCUMENT_NODE = 9;
+  static const uint16_t DOCUMENT_TYPE_NODE = 10;
+  static const uint16_t DOCUMENT_FRAGMENT_NODE = 11;
+  static const uint16_t NOTATION_NODE = 12;
+  static const uint16_t MAX_NODE_TYPE = NOTATION_NODE;
+
+  void* operator new(size_t aSize, nsNodeInfoManager* aManager);
+  void* operator new(size_t aSize) = delete;
+  void operator delete(void* aPtr);
+
+  template <class T>
+  using Sequence = mozilla::dom::Sequence<T>;
+
+  NS_INLINE_DECL_STATIC_IID(NS_INODE_IID)
+
+  virtual void AddSizeOfExcludingThis(nsWindowSizes& aSizes,
+                                      size_t* aNodeSize) const;
+
+  void AddSizeOfIncludingThis(nsWindowSizes& aSizes, size_t* aNodeSize) const;
+
+  friend class nsNodeWeakReference;
+  friend class nsNodeSupportsWeakRefTearoff;
+  friend class AttrArray;
+
+#if defined(MOZILLA_INTERNAL_API)
+  explicit nsINode(already_AddRefed<mozilla::dom::NodeInfo> aNodeInfo);
+#endif
+
+  virtual ~nsINode();
+
+  bool IsContainerNode() const {
+    return IsElement() || IsDocument() || IsDocumentFragment();
+  }
+
+  bool IsTemplateElement() const { return IsHTMLElement(nsGkAtoms::_template); }
+
+  bool IsSlotable() const { return IsElement() || IsText(); }
+
+  bool IsDocument() const {
+    return !GetParentNode() && IsInUncomposedDoc();
+  }
+
+  inline Document* AsDocument();
+  inline const Document* AsDocument() const;
+
+  bool IsDocumentFragment() const {
+    return NodeType() == DOCUMENT_FRAGMENT_NODE;
+  }
+
+  virtual bool IsHTMLFormControlElement() const { return false; }
+
+  bool IsInclusiveDescendantOf(const nsINode* aNode) const;
+
+  bool IsShadowIncludingDescendantOf(const nsINode* aNode) const;
+
+  bool IsShadowIncludingInclusiveDescendantOf(const nsINode* aNode) const;
+
+  bool IsInclusiveFlatTreeDescendantOf(const nsINode* aNode) const;
+
+  inline mozilla::dom::DocumentFragment* AsDocumentFragment();
+  inline const mozilla::dom::DocumentFragment* AsDocumentFragment() const;
+
+  JSObject* WrapObject(JSContext*, JS::Handle<JSObject*> aGivenProto) final;
+
+  virtual void ConstructUbiNode(void* storage) = 0;
+
+  static bool HasBoxQuadsSupport(JSContext* aCx, JSObject* );
+
+ protected:
+  virtual JSObject* WrapNode(JSContext* aCx,
+                             JS::Handle<JSObject*> aGivenProto) = 0;
+
+ public:
+  mozilla::dom::ParentObject GetParentObject() const;
+
+  nsIContent* GetFirstChildOfTemplateOrNode();
+
+  virtual nsINode* GetScopeChainParent() const;
+
+  MOZ_CAN_RUN_SCRIPT mozilla::dom::Element* GetParentFlexElement();
+
+  mozilla::dom::Element* GetNearestInclusiveOpenPopover() const;
+
+  mozilla::dom::Element* GetNearestInclusiveTargetPopoverForInvoker() const;
+
+  nsGenericHTMLElement* GetEffectiveCommandForElement() const;
+
+  nsGenericHTMLElement* GetEffectivePopoverTargetElement() const;
+
+  mozilla::dom::Element* GetTopmostClickedPopover() const;
+
+  mozilla::dom::HTMLDialogElement* NearestClickedDialog(mozilla::WidgetEvent*);
+
+  bool IsNode() const final { return true; }
+
+  NS_IMPL_FROMEVENTTARGET_HELPER(nsINode, IsNode())
+
+  bool IsElement() const { return GetBoolFlag(NodeIsElement); }
+
+  virtual bool IsTextControlElement() const { return false; }
+  virtual bool IsSelectedContentElement() const { return false; }
+  virtual bool IsGenericHTMLFormControlElementWithState() const {
+    return false;
+  }
+
+  virtual const mozilla::dom::LinkStyle* AsLinkStyle() const { return nullptr; }
+  mozilla::dom::LinkStyle* AsLinkStyle() {
+    return const_cast<mozilla::dom::LinkStyle*>(
+        static_cast<const nsINode*>(this)->AsLinkStyle());
+  }
+
+  inline mozilla::dom::Element* AsElement();
+  inline const mozilla::dom::Element* AsElement() const;
+
+  virtual bool IsStyledElement() const { return false; }
+
+  nsIContent* AsContent() {
+    MOZ_ASSERT(IsContent());
+    return reinterpret_cast<nsIContent*>(this);
+  }
+  const nsIContent* AsContent() const {
+    MOZ_ASSERT(IsContent());
+    return reinterpret_cast<const nsIContent*>(this);
+  }
+
+  bool IsText() const {
+    uint32_t nodeType = NodeType();
+    return nodeType == TEXT_NODE || nodeType == CDATA_SECTION_NODE;
+  }
+
+  inline mozilla::dom::Text* GetAsText();
+  inline const mozilla::dom::Text* GetAsText() const;
+
+  inline mozilla::dom::Text* AsText();
+  inline const mozilla::dom::Text* AsText() const;
+
+  [[nodiscard]] virtual nsIFormControl* GetAsFormControl() { return nullptr; }
+  [[nodiscard]] virtual const nsIFormControl* GetAsFormControl() const {
+    return nullptr;
+  }
+
+  [[nodiscard]] mozilla::dom::HTMLSlotElement* GetAsHTMLSlotElementIfFilled();
+
+  [[nodiscard]] const mozilla::dom::HTMLSlotElement*
+  GetAsHTMLSlotElementIfFilled() const;
+
+  [[nodiscard]] mozilla::dom::HTMLSlotElement*
+  GetAsHTMLSlotElementIfFilledForSelection();
+
+  [[nodiscard]] const mozilla::dom::HTMLSlotElement*
+  GetAsHTMLSlotElementIfFilledForSelection() const;
+
+  template <TreeKind aKind>
+  [[nodiscard]] mozilla::dom::HTMLSlotElement* GetAsHTMLSlotElementIfFilled() {
+    if constexpr (aKind == TreeKind::DOM ||
+                  aKind == TreeKind::ShadowIncludingDOM) {
+      return nullptr;
+    } else if constexpr (aKind == TreeKind::Flat) {
+      return GetAsHTMLSlotElementIfFilled();
+    } else if constexpr (aKind == TreeKind::FlatForSelection) {
+      return GetAsHTMLSlotElementIfFilledForSelection();
+    } else {
+      MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE("Handle the new TreeKind value");
+    }
+  }
+
+  template <TreeKind aKind>
+  [[nodiscard]] const mozilla::dom::HTMLSlotElement*
+  GetAsHTMLSlotElementIfFilled() const {
+    return const_cast<nsINode*>(this)->GetAsHTMLSlotElementIfFilled();
+  }
+
+  bool IsProcessingInstruction() const {
+    return NodeType() == PROCESSING_INSTRUCTION_NODE;
+  }
+
+  bool IsCharacterData() const {
+    uint32_t nodeType = NodeType();
+    return nodeType == TEXT_NODE || nodeType == CDATA_SECTION_NODE ||
+           nodeType == PROCESSING_INSTRUCTION_NODE || nodeType == COMMENT_NODE;
+  }
+
+  bool IsComment() const { return NodeType() == COMMENT_NODE; }
+
+  bool IsAttr() const { return NodeType() == ATTRIBUTE_NODE; }
+
+  [[nodiscard]] bool HasChildren() const { return !!mFirstChild; }
+
+  template <TreeKind aKind>
+  [[nodiscard]] bool HasChildren() const {
+    return !!GetChildCount<aKind>();
+  }
+
+  [[nodiscard]] uint32_t GetChildCount() const { return mChildCount; }
+
+  [[nodiscard]] uint32_t GetFlatTreeChildCount() const;
+
+  [[nodiscard]] uint32_t GetFlatTreeForSelectionChildCount() const;
+
+  template <TreeKind aKind>
+  [[nodiscard]] uint32_t GetChildCount() const {
+    static_assert(
+        aKind != TreeKind::ShadowIncludingDOM,
+        "It's unclear what this should return if this is a shadow host so that "
+        "this does not support TreeKind::ShadowIncludingDOM");
+    if constexpr (aKind == TreeKind::DOM) {
+      return GetChildCount();
+    } else if constexpr (aKind == TreeKind::Flat) {
+      return GetFlatTreeChildCount();
+    } else if constexpr (aKind == TreeKind::FlatForSelection) {
+      return GetFlatTreeForSelectionChildCount();
+    } else {
+      MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE("Handle the new TreeKind value");
+    }
+  }
+
+  [[nodiscard]] nsIContent* GetChildAt_Deprecated(uint32_t aIndex) const;
+
+  [[nodiscard]] nsIContent* GetChildAtInFlatTree(uint32_t aIndex) const;
+
+  [[nodiscard]] nsIContent* GetChildAtInFlatTreeForSelection(
+      uint32_t aIndex) const;
+
+  template <TreeKind aKind>
+  [[nodiscard]] nsIContent* GetChildAt_Deprecated(uint32_t aIndex) const {
+    static_assert(
+        aKind != TreeKind::ShadowIncludingDOM,
+        "It's unclear what this should return if this is a shadow host so that "
+        "this does not support TreeKind::ShadowIncludingDOM");
+    if constexpr (aKind == TreeKind::DOM) {
+      return GetChildAt_Deprecated(aIndex);
+    } else if constexpr (aKind == TreeKind::Flat) {
+      return GetChildAtInFlatTree(aIndex);
+    } else if constexpr (aKind == TreeKind::FlatForSelection) {
+      return GetChildAtInFlatTreeForSelection(aIndex);
+    } else {
+      MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE("Handle the new TreeKind value");
+    }
+  }
+
+  [[nodiscard]] mozilla::Maybe<uint32_t> ComputeIndexOf(
+      const nsINode* aPossibleChild) const;
+
+  [[nodiscard]] bool MaybeCachesComputedIndex() const;
+
+  [[nodiscard]] mozilla::Maybe<uint32_t> ComputeFlatTreeIndexOf(
+      const nsINode* aPossibleChild) const;
+
+  [[nodiscard]] mozilla::Maybe<uint32_t> ComputeFlatTreeForSelectionIndexOf(
+      const nsINode* aPossibleChild) const;
+
+  template <TreeKind aKind>
+  [[nodiscard]] mozilla::Maybe<uint32_t> ComputeIndexOf(
+      const nsINode* aPossibleChild) const {
+    static_assert(
+        aKind != TreeKind::ShadowIncludingDOM,
+        "It's unclear what this should return if this is a shadow host and "
+        "aPossibleChild is either a child of the ShadowRoot or a child of the "
+        "host so that this does not support TreeKind::ShadowIncludingDOM");
+    if constexpr (aKind == TreeKind::DOM) {
+      return ComputeIndexOf(aPossibleChild);
+    } else if constexpr (aKind == TreeKind::Flat) {
+      return ComputeFlatTreeIndexOf(aPossibleChild);
+    } else if constexpr (aKind == TreeKind::FlatForSelection) {
+      return ComputeFlatTreeForSelectionIndexOf(aPossibleChild);
+    } else {
+      MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE("Handle the new TreeKind value");
+    }
+  }
+
+  mozilla::Maybe<uint32_t> ComputeIndexInParentNode() const;
+  mozilla::Maybe<uint32_t> ComputeIndexInParentContent() const;
+
+  int32_t ComputeIndexOf_Deprecated(const nsINode* aPossibleChild) const;
+
+  Document* OwnerDoc() const MOZ_NONNULL_RETURN {
+    return mNodeInfo->GetDocument();
+  }
+
+  nsNodeInfoManager* NodeInfoManager() const {
+    return mNodeInfo->NodeInfoManager();
+  }
+
+  inline nsINode* OwnerDocAsNode() const MOZ_NONNULL_RETURN;
+
+  bool IsInUncomposedDoc() const { return GetBoolFlag(IsInDocument); }
+
+
+  Document* GetUncomposedDoc() const {
+    return IsInUncomposedDoc() ? OwnerDoc() : nullptr;
+  }
+
+  bool IsInComposedDoc() const { return GetBoolFlag(IsConnected); }
+
+  Document* GetComposedDoc() const {
+    return IsInComposedDoc() ? OwnerDoc() : nullptr;
+  }
+
+  mozilla::dom::DocumentOrShadowRoot* GetContainingDocumentOrShadowRoot() const;
+
+  mozilla::dom::DocumentOrShadowRoot* GetUncomposedDocOrConnectedShadowRoot()
+      const;
+
+  void LastRelease();
+
+  uint16_t NodeType() const { return mNodeInfo->NodeType(); }
+  const nsString& NodeName() const { return mNodeInfo->NodeName(); }
+  const nsString& LocalName() const { return mNodeInfo->LocalName(); }
+
+  inline mozilla::dom::NodeInfo* NodeInfo() const { return mNodeInfo; }
+
+  void SetNamespacePrefix(nsAtom* aPrefix);
+
+  virtual void NodeInfoChanged(Document* aOldDoc) {
+#if defined(MOZ_DIAGNOSTIC_ASSERT_ENABLED)
+    AssertInvariantsOnNodeInfoChange();
+#endif
+  }
+
+  inline bool IsInNamespace(int32_t aNamespace) const {
+    return mNodeInfo->NamespaceID() == aNamespace;
+  }
+
+  DocGroup* GetDocGroup() const;
+
+  void GetDebugDescription(nsACString& aOutput,
+                           const nsINode* aRoot = nullptr) const;
+
+  nsCString FormatAs(const nsINode* aRoot) const;
+
+  friend std::ostream& operator<<(std::ostream&, const nsINode&);
+  friend nsCString format_as(const nsINode& aNode) {
+    return aNode.FormatAs(nullptr);
+  }
+
+ protected:
+  inline bool IsNodeInternal() const { return false; }
+
+  template <typename First, typename... Args>
+  inline bool IsNodeInternal(First aFirst, Args... aArgs) const {
+    return mNodeInfo->Equals(aFirst) || IsNodeInternal(aArgs...);
+  }
+
+ public:
+  inline bool IsHTMLElement() const {
+    return IsElement() && IsInNamespace(kNameSpaceID_XHTML);
+  }
+
+  inline bool IsHTMLElement(const nsAtom* aTag) const {
+    return IsElement() && mNodeInfo->Equals(aTag, kNameSpaceID_XHTML);
+  }
+
+  template <typename First, typename... Args>
+  inline bool IsAnyOfHTMLElements(First aFirst, Args... aArgs) const {
+    return IsHTMLElement() && IsNodeInternal(aFirst, aArgs...);
+  }
+
+  inline bool IsSVGElement() const {
+    return IsElement() && IsInNamespace(kNameSpaceID_SVG);
+  }
+
+  inline bool IsSVGElement(const nsAtom* aTag) const {
+    return IsElement() && mNodeInfo->Equals(aTag, kNameSpaceID_SVG);
+  }
+
+  template <typename First, typename... Args>
+  inline bool IsAnyOfSVGElements(First aFirst, Args... aArgs) const {
+    return IsSVGElement() && IsNodeInternal(aFirst, aArgs...);
+  }
+
+  virtual bool IsSVGAnimationElement() const { return false; }
+  virtual bool IsSVGComponentTransferFunctionElement() const { return false; }
+  virtual bool IsSVGFilterPrimitiveElement() const { return false; }
+  virtual bool IsSVGFilterPrimitiveChildElement() const { return false; }
+  virtual bool IsSVGGeometryElement() const { return false; }
+  virtual bool IsSVGGraphicsElement() const { return false; }
+
+  inline bool IsXULElement() const {
+    return IsElement() && IsInNamespace(kNameSpaceID_XUL);
+  }
+
+  inline bool IsXULElement(const nsAtom* aTag) const {
+    return IsElement() && mNodeInfo->Equals(aTag, kNameSpaceID_XUL);
+  }
+
+  template <typename First, typename... Args>
+  inline bool IsAnyOfXULElements(First aFirst, Args... aArgs) const {
+    return IsXULElement() && IsNodeInternal(aFirst, aArgs...);
+  }
+
+  inline bool IsMathMLElement() const {
+    return IsElement() && IsInNamespace(kNameSpaceID_MathML);
+  }
+
+  inline bool IsMathMLElement(const nsAtom* aTag) const {
+    return IsElement() && mNodeInfo->Equals(aTag, kNameSpaceID_MathML);
+  }
+
+  template <typename First, typename... Args>
+  inline bool IsAnyOfMathMLElements(First aFirst, Args... aArgs) const {
+    return IsMathMLElement() && IsNodeInternal(aFirst, aArgs...);
+  }
+
+  bool IsShadowRoot() const {
+    const bool isShadowRoot = IsInShadowTree() && !GetParentNode();
+    MOZ_ASSERT_IF(isShadowRoot, IsDocumentFragment());
+    return isShadowRoot;
+  }
+
+  bool IsHTMLHeadingElement() const {
+    return IsAnyOfHTMLElements(nsGkAtoms::h1, nsGkAtoms::h2, nsGkAtoms::h3,
+                               nsGkAtoms::h4, nsGkAtoms::h5, nsGkAtoms::h6);
+  }
+
+  virtual bool PassesConditionalProcessingTests() const { return true; }
+
+  virtual void InsertChildBefore(
+      nsIContent* aKid, nsIContent* aBeforeThis, bool aNotify,
+      mozilla::ErrorResult& aRv, nsINode* aOldParent = nullptr,
+      MutationEffectOnScript aMutationEffectOnScript =
+          MutationEffectOnScript::DropTrustWorthiness);
+
+  void AppendChildTo(nsIContent* aKid, bool aNotify, mozilla::ErrorResult& aRv,
+                     MutationEffectOnScript aMutationEffectOnScript =
+                         MutationEffectOnScript::DropTrustWorthiness) {
+    InsertChildBefore(aKid, nullptr, aNotify, aRv, nullptr,
+                      aMutationEffectOnScript);
+  }
+
+  template <BatchRemovalOrder aOrder = BatchRemovalOrder::FrontToBack>
+  void RemoveAllChildren(bool aNotify) {
+    BatchRemovalState state{};
+    while (HasChildren()) {
+      nsIContent* nodeToRemove = aOrder == BatchRemovalOrder::FrontToBack
+                                     ? GetFirstChild()
+                                     : GetLastChild();
+      RemoveChildNode(nodeToRemove, aNotify, &state, nullptr,
+                      MutationEffectOnScript::KeepTrustWorthiness);
+      state.mIsFirst = false;
+    }
+  }
+
+  virtual void RemoveChildNode(nsIContent* aKid, bool aNotify,
+                               const BatchRemovalState* = nullptr,
+                               nsINode* aNewParent = nullptr,
+                               MutationEffectOnScript aMutationEffectOnScript =
+                                   MutationEffectOnScript::DropTrustWorthiness);
+
+  void* GetProperty(const nsAtom* aPropertyName,
+                    nsresult* aStatus = nullptr) const;
+
+  nsresult SetProperty(nsAtom* aPropertyName, void* aValue,
+                       NSPropertyDtorFunc aDtor = nullptr,
+                       bool aTransfer = false);
+
+  template <class T>
+  static void DeleteProperty(void*, nsAtom*, void* aPropertyValue, void*) {
+    delete static_cast<T*>(aPropertyValue);
+  }
+
+  void RemoveProperty(const nsAtom* aPropertyName);
+
+  void* TakeProperty(const nsAtom* aPropertyName, nsresult* aStatus = nullptr);
+
+  bool HasProperties() const { return HasFlag(NODE_HAS_PROPERTIES); }
+
+  nsIPrincipal* NodePrincipal() const {
+    return mNodeInfo->NodeInfoManager()->DocumentPrincipal();
+  }
+
+  nsIPolicyContainer* GetPolicyContainer() const;
+
+  nsIContent* GetParent() const {
+    if (GetBoolFlag(ParentIsContent)) [[likely]] {
+      return mParent->AsContent();
+    }
+    return nullptr;
+  }
+
+  [[nodiscard]] nsINode* GetParentNode() const { return mParent; }
+
+ private:
+  nsIContent* DoGetShadowHost() const;
+
+ public:
+  [[nodiscard]] nsINode* GetParentOrShadowHostNode() const {
+    if (mParent) [[likely]] {
+      return mParent;
+    }
+    return IsInShadowTree() ? reinterpret_cast<nsINode*>(DoGetShadowHost())
+                            : nullptr;
+  }
+
+  enum FlattenedParentType { eNormal, eForStyle, eForSelection };
+
+  [[nodiscard]] inline nsINode* GetFlattenedTreeParentNode() const;
+
+  [[nodiscard]] nsINode* GetFlattenedTreeParentNodeNonInline() const;
+
+  inline nsINode* GetFlattenedTreeParentNodeForStyle() const;
+  inline nsIContent* GetFlattenedTreeParentForStyle() const;
+
+  [[nodiscard]] inline nsINode* GetFlattenedTreeParentNodeForSelection() const;
+
+  template <TreeKind aKind>
+  [[nodiscard]] nsINode* GetParentNode() const {
+    static_assert(aKind != TreeKind::ShadowIncludingDOM,
+                  "It's unclear what this should return if this is a child of "
+                  "a ShadowRoot so that this does not support "
+                  "TreeKind::ShadowIncludingDOM");
+    if constexpr (aKind == TreeKind::DOM) {
+      return GetParentNode();
+    } else if constexpr (aKind == TreeKind::FlatForSelection) {
+      return GetFlattenedTreeParentNodeForSelection();
+    } else if constexpr (aKind == TreeKind::Flat) {
+      return GetFlattenedTreeParentNode();
+    } else {
+      MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE("Handle the new TreeKind value");
+    }
+  }
+
+  inline mozilla::dom::Element* GetFlattenedTreeParentElement() const;
+  inline mozilla::dom::Element* GetFlattenedTreeParentElementForStyle() const;
+
+  inline mozilla::dom::Element* GetParentElement() const;
+
+  mozilla::dom::Element* GetParentElementCrossingShadowRoot() const;
+
+  inline mozilla::dom::Element* GetAsElementOrParentElement() const;
+
+  inline mozilla::dom::Element* GetInclusiveFlattenedTreeAncestorElement()
+      const;
+
+  nsINode* SubtreeRoot() const {
+#if defined(DEBUG)
+    AssertSubtreeRootIsInSync();
+#endif
+    return mSubtreeRoot;
+  }
+
+  nsINode* GetRootNode(const mozilla::dom::GetRootNodeOptions& aOptions);
+
+  mozilla::EventListenerManager* GetExistingListenerManager() const override;
+  mozilla::EventListenerManager* GetOrCreateListenerManager() override;
+
+  bool ComputeDefaultWantsUntrusted(mozilla::ErrorResult& aRv) final;
+
+  bool IsApzAware() const override;
+
+  nsIGlobalObject* GetRelevantGlobal() const override;
+  nsIGlobalObject* GetDocumentGlobal() const;
+  mozilla::dom::Nullable<mozilla::dom::WindowProxyHolder>
+  GetDocumentGlobalForBindings();
+
+  using mozilla::dom::EventTarget::DispatchEvent;
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY bool DispatchEvent(
+      mozilla::dom::Event& aEvent, mozilla::dom::CallerType aCallerType,
+      mozilla::ErrorResult& aRv) override;
+
+  MOZ_CAN_RUN_SCRIPT
+  nsresult PostHandleEvent(mozilla::EventChainPostVisitor& aVisitor) override;
+
+  void AddMutationObserver(nsIMutationObserver* aMutationObserver) {
+    nsSlots* s = Slots();
+    if (aMutationObserver) {
+      NS_ASSERTION(!s->mMutationObservers.contains(aMutationObserver),
+                   "Observer already in the list");
+
+      s->mMutationObservers.pushBack(aMutationObserver);
+    }
+  }
+
+  void AddMutationObserver(nsMultiMutationObserver* aMultiMutationObserver);
+
+  void AddMutationObserverUnlessExists(nsIMutationObserver* aMutationObserver) {
+    nsSlots* s = Slots();
+    if (aMutationObserver &&
+        !s->mMutationObservers.contains(aMutationObserver)) {
+      s->mMutationObservers.pushBack(aMutationObserver);
+    }
+  }
+
+  void AddMutationObserverUnlessExists(
+      nsMultiMutationObserver* aMultiMutationObserver);
+  void AddAnimationObserver(nsIAnimationObserver* aAnimationObserver);
+
+  void AddAnimationObserverUnlessExists(
+      nsIAnimationObserver* aAnimationObserver);
+
+  void RemoveMutationObserver(nsIMutationObserver* aMutationObserver) {
+    if (nsSlots* s = GetExistingSlots()) {
+      s->mMutationObservers.remove(aMutationObserver);
+    }
+  }
+
+  void RemoveMutationObserver(nsMultiMutationObserver* aMultiMutationObserver);
+
+  mozilla::SafeDoublyLinkedList<nsIMutationObserver>* GetMutationObservers();
+
+  template <typename T>
+  inline mozilla::dom::AncestorsOfTypeIterator<T> AncestorsOfType() const;
+
+  template <typename T>
+  inline mozilla::dom::InclusiveAncestorsOfTypeIterator<T>
+  InclusiveAncestorsOfType() const;
+
+  template <typename T>
+  inline mozilla::dom::FlatTreeAncestorsOfTypeIterator<T>
+  FlatTreeAncestorsOfType() const;
+
+  template <typename T>
+  inline mozilla::dom::InclusiveFlatTreeAncestorsOfTypeIterator<T>
+  InclusiveFlatTreeAncestorsOfType() const;
+
+  template <typename T>
+  T* FirstAncestorOfType() const;
+
+ private:
+#if defined(DEBUG)
+  void AssertSubtreeRootIsInSync() const;
+#endif
+  static already_AddRefed<nsINode> CloneAndAdopt(
+      nsINode* aNode, bool aClone, bool aDeep,
+      nsNodeInfoManager* aNewNodeInfoManager, nsIGlobalObject* aNewScope,
+      nsINode* aParent, mozilla::ErrorResult& aError);
+
+ public:
+  void Adopt(nsNodeInfoManager* aNewNodeInfoManager,
+             mozilla::ErrorResult& aError);
+
+  already_AddRefed<nsINode> Clone(bool aDeep,
+                                  nsNodeInfoManager* aNewNodeInfoManager,
+                                  mozilla::ErrorResult& aError);
+
+  virtual nsresult Clone(mozilla::dom::NodeInfo*, nsINode** aResult) const = 0;
+
+  using UnbindCallback = void (*)(nsISupports*, nsINode*);
+  struct BoundObject {
+    nsCOMPtr<nsISupports> mObject;
+    UnbindCallback mDtor = nullptr;
+
+    BoundObject(nsISupports* aObject, UnbindCallback aDtor)
+        : mObject(aObject), mDtor(aDtor) {}
+
+    bool operator==(nsISupports* aOther) const {
+      return mObject.get() == aOther;
+    }
+  };
+
+  class nsSlots {
+   public:
+    nsSlots();
+
+    virtual ~nsSlots();
+
+    virtual void Traverse(nsCycleCollectionTraversalCallback&);
+    virtual void Unlink(nsINode&);
+
+    mozilla::SafeDoublyLinkedList<nsIMutationObserver> mMutationObservers;
+
+    RefPtr<nsAttrChildContentList> mChildNodes;
+
+    nsNodeWeakReference* MOZ_NON_OWNING_REF mWeakReference;
+
+    nsTArray<BoundObject> mBoundObjects;
+
+    mozilla::UniquePtr<mozilla::LinkedList<mozilla::dom::AbstractRange>>
+        mClosestCommonInclusiveAncestorRanges;
+  };
+
+  void* AllocateSlots(size_t aSize);
+
+#if defined(DEBUG)
+  nsSlots* DebugGetSlots() { return Slots(); }
+#endif
+
+  void SetFlags(FlagsType aFlagsToSet) {
+    NS_ASSERTION(
+        !(aFlagsToSet &
+          (NODE_IS_NATIVE_ANONYMOUS_ROOT | NODE_IS_IN_NATIVE_ANONYMOUS_SUBTREE |
+           NODE_DESCENDANTS_NEED_FRAMES | NODE_NEEDS_FRAME |
+           NODE_HAS_BEEN_IN_UA_WIDGET)) ||
+            IsContent(),
+        "Flag only permitted on nsIContent nodes");
+    nsWrapperCache::SetFlags(aFlagsToSet);
+  }
+
+  void UnsetFlags(FlagsType aFlagsToUnset) {
+    NS_ASSERTION(!(aFlagsToUnset & (NODE_HAS_BEEN_IN_UA_WIDGET |
+                                    NODE_IS_NATIVE_ANONYMOUS_ROOT)),
+                 "Trying to unset write-only flags");
+    nsWrapperCache::UnsetFlags(aFlagsToUnset);
+  }
+
+  void SetEditableFlag(bool aEditable) {
+    if (aEditable) {
+      SetFlags(NODE_IS_EDITABLE);
+    } else {
+      UnsetFlags(NODE_IS_EDITABLE);
+    }
+  }
+
+  inline bool IsEditable() const { return HasFlag(NODE_IS_EDITABLE); }
+
+  inline bool IsEditingHost() const;
+
+  inline bool IsInDesignMode() const;
+
+  bool IsInNativeAnonymousSubtree() const {
+    return HasFlag(NODE_IS_IN_NATIVE_ANONYMOUS_SUBTREE);
+  }
+
+  nsIContent* GetClosestNativeAnonymousSubtreeRoot() const {
+    if (!IsInNativeAnonymousSubtree()) {
+      MOZ_ASSERT(!HasBeenInUAWidget(), "UA widget implies anonymous");
+      return nullptr;
+    }
+    MOZ_ASSERT(IsContent(), "How did non-content end up in NAC?");
+    if (HasBeenInUAWidget()) {
+      return reinterpret_cast<nsIContent*>(GetContainingShadow());
+    }
+    for (const nsINode* node = this; node; node = node->GetParentNode()) {
+      if (node->IsRootOfNativeAnonymousSubtree()) {
+        return const_cast<nsINode*>(node)->AsContent();
+      }
+    }
+    NS_WARNING("GetClosestNativeAnonymousSubtreeRoot on disconnected NAC!");
+    return nullptr;
+  }
+
+  nsIContent* GetClosestNativeAnonymousSubtreeRootParentOrHost() const {
+    const auto* root = reinterpret_cast<const nsINode*>(
+        GetClosestNativeAnonymousSubtreeRoot());
+    if (!root) {
+      return nullptr;
+    }
+    if (nsIContent* parent = root->GetParent()) {
+      return parent;
+    }
+    if (root->IsInShadowTree()) [[unlikely]] {
+      return root->DoGetShadowHost();
+    }
+    return nullptr;
+  }
+
+  mozilla::dom::ShadowRoot* GetContainingShadow() const {
+    return IsInShadowTree()
+               ? reinterpret_cast<mozilla::dom::ShadowRoot*>(mSubtreeRoot)
+               : nullptr;
+  }
+
+  [[nodiscard]] mozilla::dom::ShadowRoot* GetContainingShadowForSelection()
+      const;
+
+  template <TreeKind aKind>
+  [[nodiscard]] mozilla::dom::ShadowRoot* GetContainingShadow() const {
+    if constexpr (aKind == TreeKind::Flat) {
+      return GetContainingShadow();
+    } else if constexpr (aKind == TreeKind::FlatForSelection) {
+      return GetContainingShadowForSelection();
+    } else {
+      MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE("Handle the new TreeKind value");
+    }
+  }
+
+  mozilla::dom::Element* GetContainingShadowHost() const;
+
+  mozilla::dom::ShadowRoot* GetClosestShadowRootInFlattenedTree() const;
+
+  mozilla::dom::ShadowRoot* GetClosestShadowRootInFlattenedTreeForSelection()
+      const;
+
+  template <TreeKind aKind>
+  [[nodiscard]] mozilla::dom::ShadowRoot* GetClosestShadowRoot() const {
+    if constexpr (aKind == TreeKind::Flat) {
+      return GetClosestShadowRootInFlattenedTree();
+    } else if constexpr (aKind == TreeKind::FlatForSelection) {
+      return GetClosestShadowRootInFlattenedTreeForSelection();
+    } else {
+      MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE("Handle the new TreeKind value");
+    }
+  }
+
+  bool IsInSVGUseShadowTree() const {
+    return !!GetContainingSVGUseShadowHost();
+  }
+
+  mozilla::dom::SVGUseElement* GetContainingSVGUseShadowHost() const {
+    if (!IsInShadowTree()) {
+      return nullptr;
+    }
+    return DoGetContainingSVGUseShadowHost();
+  }
+
+  bool HasBeenInUAWidget() const { return HasFlag(NODE_HAS_BEEN_IN_UA_WIDGET); }
+
+  bool ChromeOnlyAccess() const { return IsInNativeAnonymousSubtree(); }
+
+  bool ChromeOnlyAccessForEvents() const {
+    return ChromeOnlyAccess() && !HasBeenInUAWidget();
+  }
+
+  bool IsInShadowTree() const { return HasFlag(NODE_IS_IN_SHADOW_TREE); }
+
+  bool IsRootOfNativeAnonymousSubtree() const {
+    NS_ASSERTION(
+        !HasFlag(NODE_IS_NATIVE_ANONYMOUS_ROOT) || IsInNativeAnonymousSubtree(),
+        "Some flags seem to be missing!");
+    return HasFlag(NODE_IS_NATIVE_ANONYMOUS_ROOT);
+  }
+
+  bool IsRootOfChromeAccessOnlySubtree() const {
+    return IsRootOfNativeAnonymousSubtree();
+  }
+
+  bool IsGeneratedContentContainerForBefore() const {
+    return IsRootOfNativeAnonymousSubtree() &&
+           mNodeInfo->NameAtom() == nsGkAtoms::mozgeneratedcontentbefore;
+  }
+
+  bool IsGeneratedContentContainerForAfter() const {
+    return IsRootOfNativeAnonymousSubtree() &&
+           mNodeInfo->NameAtom() == nsGkAtoms::mozgeneratedcontentafter;
+  }
+
+  bool IsGeneratedContentContainerForMarker() const {
+    return IsRootOfNativeAnonymousSubtree() &&
+           mNodeInfo->NameAtom() == nsGkAtoms::mozgeneratedcontentmarker;
+  }
+
+  bool IsGeneratedContentContainerForBackdrop() const {
+    return IsRootOfNativeAnonymousSubtree() &&
+           mNodeInfo->NameAtom() == nsGkAtoms::mozgeneratedcontentbackdrop;
+  }
+
+  bool IsGeneratedContentContainerForCheckmark() const {
+    return IsRootOfNativeAnonymousSubtree() &&
+           mNodeInfo->NameAtom() == nsGkAtoms::mozgeneratedcontentcheckmark;
+  }
+
+  bool IsGeneratedContentContainerForPickerIcon() const {
+    return IsRootOfNativeAnonymousSubtree() &&
+           mNodeInfo->NameAtom() == nsGkAtoms::mozgeneratedcontentpickericon;
+  }
+
+  bool IsMaybeSelected() const {
+    return IsDescendantOfClosestCommonInclusiveAncestorForRangeInSelection() ||
+           IsClosestCommonInclusiveAncestorForRangeInSelection();
+  }
+
+  bool IsSelected(uint32_t aStartOffset, uint32_t aEndOffset,
+                  mozilla::dom::SelectionNodeCache* aCache = nullptr) const;
+
+#if defined(DEBUG)
+  void AssertIsRootElementSlow(bool) const;
+#endif
+
+  bool IsRootElement() const {
+    const bool isRoot = !GetParent() && IsInUncomposedDoc() && IsElement();
+#if defined(DEBUG)
+    AssertIsRootElementSlow(isRoot);
+#endif
+    return isRoot;
+  }
+
+  mozilla::dom::Element* GetAnonymousRootElementOfTextEditor();
+
+  enum class IgnoreOwnIndependentSelection : bool { No, Yes };
+  using AllowCrossShadowBoundary = mozilla::dom::AllowRangeCrossShadowBoundary;
+
+  nsIContent* GetSelectionRootContent(
+      mozilla::PresShell* aPresShell,
+      IgnoreOwnIndependentSelection aIgnoreOwnIndependentSelection,
+      AllowCrossShadowBoundary aAllowCrossShadowBoundary);
+
+  [[nodiscard]] nsFrameSelection* GetFrameSelection() const;
+
+  bool HasScheduledSelectionChangeEvent() {
+    return HasFlag(NODE_HAS_SCHEDULED_SELECTION_CHANGE_EVENT);
+  }
+
+  void SetHasScheduledSelectionChangeEvent() {
+    SetFlags(NODE_HAS_SCHEDULED_SELECTION_CHANGE_EVENT);
+  }
+
+  void ClearHasScheduledSelectionChangeEvent() {
+    UnsetFlags(NODE_HAS_SCHEDULED_SELECTION_CHANGE_EVENT);
+  }
+
+  mozilla::dom::NodeList* ChildNodes();
+
+  [[nodiscard]] nsIContent* GetFirstChild() const { return mFirstChild; }
+
+  [[nodiscard]] nsIContent* GetLastChild() const;
+
+  [[nodiscard]] nsIContent* GetFlattenedTreeFirstChild() const;
+
+  [[nodiscard]] nsIContent* GetFlattenedTreeLastChild() const;
+
+  [[nodiscard]] nsIContent* GetFlattenedTreeFirstChildForSelection() const;
+
+  [[nodiscard]] nsIContent* GetFlattenedTreeLastChildForSelection() const;
+
+  template <TreeKind aKind>
+  [[nodiscard]] nsIContent* GetFirstChild() const {
+    static_assert(
+        aKind != TreeKind::ShadowIncludingDOM,
+        "It's unclear what this should return if this is a shadow host so that "
+        "this does not support TreeKind::ShadowIncludingDOM");
+    if constexpr (aKind == TreeKind::DOM) {
+      return GetFirstChild();
+    } else if constexpr (aKind == TreeKind::Flat) {
+      return GetFlattenedTreeFirstChild();
+    } else if constexpr (aKind == TreeKind::FlatForSelection) {
+      return GetFlattenedTreeFirstChildForSelection();
+    } else {
+      MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE("Handle the new TreeKind value");
+    }
+  }
+
+  template <TreeKind aKind>
+  [[nodiscard]] nsIContent* GetLastChild() const {
+    static_assert(
+        aKind != TreeKind::ShadowIncludingDOM,
+        "It's unclear what this should return if this is a shadow host so that "
+        "this does not support TreeKind::ShadowIncludingDOM");
+    if constexpr (aKind == TreeKind::DOM) {
+      return GetLastChild();
+    } else if constexpr (aKind == TreeKind::Flat) {
+      return GetFlattenedTreeLastChild();
+    } else if constexpr (aKind == TreeKind::FlatForSelection) {
+      return GetFlattenedTreeLastChildForSelection();
+    } else {
+      MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE("Handle the new TreeKind value");
+    }
+  }
+
+  Document* GetOwnerDocument() const;
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void Normalize();
+
+  virtual nsIURI* GetBaseURI(bool aTryUseXHRDocBaseURI = false) const = 0;
+  nsIURI* GetBaseURIObject() const;
+
+  bool IsNodeApzAware() const {
+    return NodeMayBeApzAware() ? IsNodeApzAwareInternal() : false;
+  }
+
+  virtual bool IsNodeApzAwareInternal() const;
+
+  void GetTextContent(nsAString& aTextContent, mozilla::OOMReporter& aError) {
+    GetTextContentInternal(aTextContent, aError);
+  }
+  MOZ_CAN_RUN_SCRIPT virtual void SetTextContent(
+      const nsAString& aTextContent, nsIPrincipal* aSubjectPrincipal,
+      mozilla::ErrorResult& aError) {
+    SetTextContentInternal(aTextContent, aSubjectPrincipal, aError);
+  }
+  void SetTextContent(const nsAString& aTextContent,
+                      mozilla::ErrorResult& aError) {
+    SetTextContentInternal(aTextContent, nullptr, aError);
+  }
+
+  mozilla::dom::Element* QuerySelector(const nsACString& aSelector,
+                                       mozilla::ErrorResult& aResult);
+  already_AddRefed<mozilla::dom::NodeList> QuerySelectorAll(
+      const nsACString& aSelector, mozilla::ErrorResult& aResult);
+
+ protected:
+  mozilla::dom::Element* GetElementById(const nsAString& aId);
+
+  void AppendChildToChildList(nsIContent* aKid);
+  void InsertChildToChildList(nsIContent* aKid, nsIContent* aNextSibling);
+  void DisconnectChild(nsIContent* aKid);
+
+ public:
+  void LookupPrefix(const nsAString& aNamespace, nsAString& aResult);
+  bool IsDefaultNamespace(const nsAString& aNamespaceURI) {
+    nsAutoString defaultNamespace;
+    LookupNamespaceURI(u""_ns, defaultNamespace);
+    return aNamespaceURI.Equals(defaultNamespace);
+  }
+  void LookupNamespaceURI(const nsAString& aNamespacePrefix,
+                          nsAString& aNamespaceURI);
+
+  nsIContent* GetNextSibling() const { return mNextSibling; }
+
+  nsIContent* GetPreviousSibling() const;
+
+  nsIContent* GetFlattenedTreeNextSibling() const = delete;
+  nsIContent* GetFlattenedTreePreviousSibling() const = delete;
+  nsIContent* GetFlattenedTreeNextSiblingForSelection() const = delete;
+  nsIContent* GetFlattenedTreePreviousSiblingForSelection() const = delete;
+
+  bool IsBeingRemoved() const {
+    return mParent && !mNextSibling && !mPreviousOrLastSibling;
+  }
+
+  nsIContent* GetNextNode(const nsINode* aRoot = nullptr) const {
+    return GetNextNodeImpl(aRoot, false);
+  }
+
+  nsIContent* GetNextNonChildNode(const nsINode* aRoot = nullptr) const {
+    return GetNextNodeImpl(aRoot, true);
+  }
+
+  bool Contains(const nsINode* aOther) const;
+
+  bool UnoptimizableCCNode() const;
+
+  [[nodiscard]] bool MaybeNeedsToNotifyDevToolsOfNodeRemovalsInOwnerDoc() const;
+
+  [[nodiscard]] bool DevToolsShouldBeNotifiedOfThisRemoval() const;
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY void NotifyDevToolsOfRemovalsOfChildren();
+
+  void QueueDevtoolsAnonymousEvent(bool aIsRemove);
+
+ private:
+  mozilla::dom::SVGUseElement* DoGetContainingSVGUseShadowHost() const;
+
+  nsIContent* GetNextNodeImpl(const nsINode* aRoot,
+                              const bool aSkipChildren) const {
+#if defined(DEBUG)
+    if (aRoot) {
+      const nsINode* cur = this;
+      for (; cur; cur = cur->GetParentNode())
+        if (cur == aRoot) break;
+      NS_ASSERTION(cur, "aRoot not an ancestor of |this|?");
+    }
+#endif
+    if (!aSkipChildren) {
+      nsIContent* kid = GetFirstChild();
+      if (kid) {
+        return kid;
+      }
+    }
+    if (this == aRoot) {
+      return nullptr;
+    }
+    const nsINode* cur = this;
+    while (true) {
+      nsIContent* next = cur->GetNextSibling();
+      if (next) {
+        return next;
+      }
+      nsINode* parent = cur->GetParentNode();
+      if (parent == aRoot) {
+        return nullptr;
+      }
+      cur = parent;
+    }
+    MOZ_ASSERT_UNREACHABLE("How did we get here?");
+  }
+
+ public:
+  nsIContent* GetPrevNode(const nsINode* aRoot = nullptr) const {
+#if defined(DEBUG)
+    if (aRoot) {
+      const nsINode* cur = this;
+      for (; cur; cur = cur->GetParentNode())
+        if (cur == aRoot) break;
+      NS_ASSERTION(cur, "aRoot not an ancestor of |this|?");
+    }
+#endif
+
+    if (this == aRoot) {
+      return nullptr;
+    }
+    nsIContent* cur = this->GetParent();
+    nsIContent* iter = this->GetPreviousSibling();
+    while (iter) {
+      cur = iter;
+      iter = reinterpret_cast<nsINode*>(iter)->GetLastChild();
+    }
+    return cur;
+  }
+
+ private:
+  enum BooleanFlag {
+    NodeHasDirectRenderingObservers,
+    IsInDocument,
+    IsConnected,
+    ParentIsContent,
+    NodeIsElement,
+    ElementHasID,
+    ElementMayHaveClass,
+    ElementMayHaveStyle,
+    ElementHasName,
+    ElementHasPart,
+    ElementMayHaveContentEditableAttr,
+    ElementHasContentEditableAttrTrueOrPlainTextOnly,
+    NodeIsClosestCommonInclusiveAncestorForRangeInSelection,
+    NodeIsDescendantOfClosestCommonInclusiveAncestorForRangeInSelection,
+    NodeIsCCMarkedRoot,
+    NodeIsCCBlackTree,
+    NodeIsPurpleRoot,
+    ElementHasLockedStyleStates,
+    ElementHasPointerLock,
+    NodeMayHaveDOMMutationObserver,
+    NodeIsContent,
+    ElementHasAnimations,
+    NodeHasValidDirAttribute,
+    NodeAncestorHasDirAuto,
+    NodeAffectsDirAutoSlot,
+    NodeHandlingClick,
+    ElementHasWeirdParserInsertionMode,
+    ParserHasNotified,
+    MayBeApzAware,
+    ElementMayHaveAnonymousChildren,
+    ElementHasCustomElementData,
+    ElementCreatedFromPrototypeAndHasUnmodifiedL10n,
+    BooleanFlagCount
+  };
+
+  void SetBoolFlag(BooleanFlag name, bool value) {
+    static_assert(BooleanFlagCount <= 8 * sizeof(mBoolFlags),
+                  "Too many boolean flags");
+    mBoolFlags = (mBoolFlags & ~(1U << name)) | (value << name);
+  }
+
+  void SetBoolFlag(BooleanFlag name) {
+    static_assert(BooleanFlagCount <= 8 * sizeof(mBoolFlags),
+                  "Too many boolean flags");
+    mBoolFlags |= (1U << name);
+  }
+
+  void ClearBoolFlag(BooleanFlag name) {
+    static_assert(BooleanFlagCount <= 8 * sizeof(mBoolFlags),
+                  "Too many boolean flags");
+    mBoolFlags &= ~(1U << name);
+  }
+
+  bool GetBoolFlag(BooleanFlag name) const {
+    static_assert(BooleanFlagCount <= 8 * sizeof(mBoolFlags),
+                  "Too many boolean flags");
+    return mBoolFlags & (1U << name);
+  }
+
+ public:
+  bool HasDirectRenderingObservers() const {
+    return GetBoolFlag(NodeHasDirectRenderingObservers);
+  }
+  void SetHasDirectRenderingObservers(bool aValue) {
+    SetBoolFlag(NodeHasDirectRenderingObservers, aValue);
+  }
+  bool IsContent() const { return GetBoolFlag(NodeIsContent); }
+  bool HasID() const { return GetBoolFlag(ElementHasID); }
+  bool MayHaveClass() const { return GetBoolFlag(ElementMayHaveClass); }
+  void SetMayHaveClass() { SetBoolFlag(ElementMayHaveClass); }
+  bool MayHaveStyle() const { return GetBoolFlag(ElementMayHaveStyle); }
+  bool HasName() const { return GetBoolFlag(ElementHasName); }
+  bool HasPartAttribute() const { return GetBoolFlag(ElementHasPart); }
+  bool MayHaveContentEditableAttr() const {
+    return GetBoolFlag(ElementMayHaveContentEditableAttr);
+  }
+  bool HasContentEditableAttrTrueOrPlainTextOnly() const {
+    return GetBoolFlag(ElementHasContentEditableAttrTrueOrPlainTextOnly);
+  }
+  bool IsClosestCommonInclusiveAncestorForRangeInSelection() const {
+    return GetBoolFlag(NodeIsClosestCommonInclusiveAncestorForRangeInSelection);
+  }
+  void SetClosestCommonInclusiveAncestorForRangeInSelection() {
+    SetBoolFlag(NodeIsClosestCommonInclusiveAncestorForRangeInSelection);
+  }
+  void ClearClosestCommonInclusiveAncestorForRangeInSelection() {
+    ClearBoolFlag(NodeIsClosestCommonInclusiveAncestorForRangeInSelection);
+  }
+  bool IsDescendantOfClosestCommonInclusiveAncestorForRangeInSelection() const {
+    return GetBoolFlag(
+        NodeIsDescendantOfClosestCommonInclusiveAncestorForRangeInSelection);
+  }
+  void SetDescendantOfClosestCommonInclusiveAncestorForRangeInSelection() {
+    SetBoolFlag(
+        NodeIsDescendantOfClosestCommonInclusiveAncestorForRangeInSelection);
+  }
+  void ClearDescendantOfClosestCommonInclusiveAncestorForRangeInSelection() {
+    ClearBoolFlag(
+        NodeIsDescendantOfClosestCommonInclusiveAncestorForRangeInSelection);
+  }
+
+  void SetCCMarkedRoot(bool aValue) { SetBoolFlag(NodeIsCCMarkedRoot, aValue); }
+  bool CCMarkedRoot() const { return GetBoolFlag(NodeIsCCMarkedRoot); }
+  void SetInCCBlackTree(bool aValue) { SetBoolFlag(NodeIsCCBlackTree, aValue); }
+  bool InCCBlackTree() const { return GetBoolFlag(NodeIsCCBlackTree); }
+  void SetIsPurpleRoot(bool aValue) { SetBoolFlag(NodeIsPurpleRoot, aValue); }
+  bool IsPurpleRoot() const { return GetBoolFlag(NodeIsPurpleRoot); }
+  bool MayHaveDOMMutationObserver() {
+    return GetBoolFlag(NodeMayHaveDOMMutationObserver);
+  }
+  void SetMayHaveDOMMutationObserver() {
+    SetBoolFlag(NodeMayHaveDOMMutationObserver, true);
+  }
+  bool HasListenerManager() { return HasFlag(NODE_HAS_LISTENERMANAGER); }
+  bool HasPointerLock() const { return GetBoolFlag(ElementHasPointerLock); }
+  void SetPointerLock() { SetBoolFlag(ElementHasPointerLock); }
+  void ClearPointerLock() { ClearBoolFlag(ElementHasPointerLock); }
+  bool MayHaveAnimations() const { return GetBoolFlag(ElementHasAnimations); }
+  void SetMayHaveAnimations() { SetBoolFlag(ElementHasAnimations); }
+  void ClearMayHaveAnimations() { ClearBoolFlag(ElementHasAnimations); }
+  void SetHasValidDir() { SetBoolFlag(NodeHasValidDirAttribute); }
+  void ClearHasValidDir() { ClearBoolFlag(NodeHasValidDirAttribute); }
+  bool HasValidDir() const { return GetBoolFlag(NodeHasValidDirAttribute); }
+  void SetAncestorHasDirAuto() { SetBoolFlag(NodeAncestorHasDirAuto); }
+  void ClearAncestorHasDirAuto() { ClearBoolFlag(NodeAncestorHasDirAuto); }
+  bool AncestorHasDirAuto() const {
+    return GetBoolFlag(NodeAncestorHasDirAuto);
+  }
+  void SetAffectsDirAutoSlot() { SetBoolFlag(NodeAffectsDirAutoSlot); }
+  void ClearAffectsDirAutoSlot() { ClearBoolFlag(NodeAffectsDirAutoSlot); }
+
+  bool AffectsDirAutoSlot() const {
+    return GetBoolFlag(NodeAffectsDirAutoSlot);
+  }
+
+  inline bool NodeOrAncestorHasDirAuto() const;
+
+  void SetParserHasNotified() { SetBoolFlag(ParserHasNotified); };
+  bool HasParserNotified() { return GetBoolFlag(ParserHasNotified); }
+
+  void SetMayBeApzAware() { SetBoolFlag(MayBeApzAware); }
+  bool NodeMayBeApzAware() const { return GetBoolFlag(MayBeApzAware); }
+
+  void SetMayHaveAnonymousChildren() {
+    SetBoolFlag(ElementMayHaveAnonymousChildren);
+  }
+  bool MayHaveAnonymousChildren() const {
+    return GetBoolFlag(ElementMayHaveAnonymousChildren);
+  }
+
+  void SetHasCustomElementData() { SetBoolFlag(ElementHasCustomElementData); }
+  bool HasCustomElementData() const {
+    return GetBoolFlag(ElementHasCustomElementData);
+  }
+  void ClearHasCustomElementData() {
+    ClearBoolFlag(ElementHasCustomElementData);
+  }
+
+  inline bool HasScopedRegistry() const;
+
+  void SetElementCreatedFromPrototypeAndHasUnmodifiedL10n() {
+    SetBoolFlag(ElementCreatedFromPrototypeAndHasUnmodifiedL10n);
+  }
+  bool HasElementCreatedFromPrototypeAndHasUnmodifiedL10n() {
+    return GetBoolFlag(ElementCreatedFromPrototypeAndHasUnmodifiedL10n);
+  }
+  void ClearElementCreatedFromPrototypeAndHasUnmodifiedL10n() {
+    ClearBoolFlag(ElementCreatedFromPrototypeAndHasUnmodifiedL10n);
+  }
+
+  [[nodiscard]] inline mozilla::dom::ShadowRoot* GetShadowRoot() const;
+
+  [[nodiscard]] mozilla::dom::ShadowRoot* GetShadowRootForSelection() const;
+
+  template <TreeKind aKind>
+  [[nodiscard]] mozilla::dom::ShadowRoot* GetShadowRoot() const {
+    if constexpr (aKind == TreeKind::DOM) {
+      return nullptr;
+    } else if constexpr (aKind == TreeKind::ShadowIncludingDOM ||
+                         aKind == TreeKind::FlatForSelection) {
+      MOZ_ASSERT(ShouldIgnoreNonContentShadow<aKind>());
+      return GetShadowRootForSelection();
+    } else if constexpr (aKind == TreeKind::Flat) {
+      MOZ_ASSERT(!ShouldIgnoreNonContentShadow<aKind>());
+      return GetShadowRoot();
+    } else {
+      MOZ_MAKE_COMPILER_ASSUME_IS_UNREACHABLE("Handle the new TreeKind value");
+    }
+  }
+
+  template <TreeKind aKind,
+            typename = std::enable_if_t<aKind == TreeKind::Flat ||
+                                        aKind == TreeKind::FlatForSelection>>
+  [[nodiscard]] mozilla::dom::Element*
+  GetClosestFlatTreeAncestorElementForNonFlatTreeNode() const;
+
+  template <TreeKind aKind,
+            typename = std::enable_if_t<aKind == TreeKind::Flat ||
+                                        aKind == TreeKind::FlatForSelection>>
+  [[nodiscard]] mozilla::dom::Element*
+  GetFlatTreeAncestorElementForNonFlatTreeNode() const;
+
+ protected:
+  void SetParentIsContent(bool aValue) { SetBoolFlag(ParentIsContent, aValue); }
+  void SetIsInDocument() { SetBoolFlag(IsInDocument); }
+  void ClearInDocument() { ClearBoolFlag(IsInDocument); }
+  void SetIsConnected(bool aConnected) { SetBoolFlag(IsConnected, aConnected); }
+  void SetNodeIsContent() { SetBoolFlag(NodeIsContent); }
+  void SetIsElement() { SetBoolFlag(NodeIsElement); }
+  void SetHasID() { SetBoolFlag(ElementHasID); }
+  void ClearHasID() { ClearBoolFlag(ElementHasID); }
+  void SetMayHaveStyle() { SetBoolFlag(ElementMayHaveStyle); }
+  void SetHasName() { SetBoolFlag(ElementHasName); }
+  void ClearHasName() { ClearBoolFlag(ElementHasName); }
+  void SetHasPartAttribute(bool aPart) { SetBoolFlag(ElementHasPart, aPart); }
+  void SetMayHaveContentEditableAttr() {
+    SetBoolFlag(ElementMayHaveContentEditableAttr);
+  }
+  void ClearMayHaveContentEditableAttr() {
+    ClearBoolFlag(ElementMayHaveContentEditableAttr);
+  }
+  void SetHasContentEditableAttrTrueOrPlainTextOnly() {
+    SetBoolFlag(ElementHasContentEditableAttrTrueOrPlainTextOnly);
+  }
+  void ClearHasContentEditableAttrTrueOrPlainTextOnly() {
+    ClearBoolFlag(ElementHasContentEditableAttrTrueOrPlainTextOnly);
+  }
+  void SetHasLockedStyleStates() { SetBoolFlag(ElementHasLockedStyleStates); }
+  void ClearHasLockedStyleStates() {
+    ClearBoolFlag(ElementHasLockedStyleStates);
+  }
+  bool HasLockedStyleStates() const {
+    return GetBoolFlag(ElementHasLockedStyleStates);
+  }
+  void SetHasWeirdParserInsertionMode() {
+    SetBoolFlag(ElementHasWeirdParserInsertionMode);
+  }
+  bool HasWeirdParserInsertionMode() const {
+    return GetBoolFlag(ElementHasWeirdParserInsertionMode);
+  }
+  bool HandlingClick() const { return GetBoolFlag(NodeHandlingClick); }
+  void SetHandlingClick() { SetBoolFlag(NodeHandlingClick); }
+  void ClearHandlingClick() { ClearBoolFlag(NodeHandlingClick); }
+
+  void SetSubtreeRootPointer(nsINode* aSubtreeRoot) {
+    MOZ_ASSERT(aSubtreeRoot, "aSubtreeRoot can never be null!");
+    mSubtreeRoot = aSubtreeRoot;
+  }
+
+ public:
+  void BindObject(nsISupports* aObject, UnbindCallback = nullptr);
+  void UnbindObject(nsISupports* aObject);
+
+  void GenerateXPath(nsAString& aResult);
+
+  already_AddRefed<mozilla::dom::AccessibleNode> GetAccessibleNode();
+
+  uint32_t Length() const;
+
+  void GetNodeName(mozilla::dom::DOMString& aNodeName) {
+    const nsString& nodeName = NodeName();
+    aNodeName.SetKnownLiveString(nodeName);
+  }
+  [[nodiscard]] nsresult GetBaseURI(nsAString& aBaseURI) const;
+  void GetBaseURIFromJS(nsAString& aBaseURI, CallerType aCallerType,
+                        ErrorResult& aRv) const;
+  bool HasChildNodes() const { return HasChildren(); }
+
+  uint16_t CompareDocumentPosition(const nsINode& aOther) const;
+  void GetNodeValue(nsAString& aNodeValue) { GetNodeValueInternal(aNodeValue); }
+  MOZ_CAN_RUN_SCRIPT virtual void SetNodeValue(const nsAString& aNodeValue,
+                                               mozilla::ErrorResult& aError) {
+    SetNodeValueInternal(aNodeValue, aError);
+  }
+  virtual void GetNodeValueInternal(nsAString& aNodeValue);
+  virtual void SetNodeValueInternal(
+      const nsAString& aNodeValue, mozilla::ErrorResult& aError,
+      MutationEffectOnScript aMutationEffectOnScript =
+          MutationEffectOnScript::DropTrustWorthiness) {
+  }
+  void EnsurePreInsertionValidity(nsINode& aNewChild, nsINode* aRefChild,
+                                  mozilla::ErrorResult& aError);
+  nsINode* InsertBefore(nsINode& aNode, nsINode* aChild,
+                        mozilla::ErrorResult& aError) {
+    return InsertBeforeInternal(
+        aNode, aChild, MutationEffectOnScript::DropTrustWorthiness, aError);
+  }
+  nsINode* InsertBeforeInternal(nsINode& aNode, nsINode* aChild,
+                                MutationEffectOnScript aMutationEffectOnScript,
+                                mozilla::ErrorResult& aError) {
+    return ReplaceOrInsertBefore(false, &aNode, aChild, aMutationEffectOnScript,
+                                 aError);
+  }
+
+  nsINode* AppendChild(nsINode& aNode, mozilla::ErrorResult& aError) {
+    return AppendChildInternal(
+        aNode, MutationEffectOnScript::DropTrustWorthiness, aError);
+  }
+  nsINode* AppendChildInternal(nsINode& aNode,
+                               MutationEffectOnScript aMutationEffectOnScript,
+                               mozilla::ErrorResult& aError) {
+    return InsertBeforeInternal(aNode, nullptr, aMutationEffectOnScript,
+                                aError);
+  }
+
+  nsINode* ReplaceChild(nsINode& aNode, nsINode& aChild,
+                        mozilla::ErrorResult& aError) {
+    return ReplaceChildInternal(
+        aNode, aChild, MutationEffectOnScript::DropTrustWorthiness, aError);
+  }
+  nsINode* ReplaceChildInternal(nsINode& aNode, nsINode& aChild,
+                                MutationEffectOnScript aMutationEffectOnScript,
+                                mozilla::ErrorResult& aError) {
+    return ReplaceOrInsertBefore(true, &aNode, &aChild, aMutationEffectOnScript,
+                                 aError);
+  }
+
+  nsINode* RemoveChild(nsINode& aChild, mozilla::ErrorResult& aError) {
+    return RemoveChildInternal(
+        aChild, MutationEffectOnScript::DropTrustWorthiness, aError);
+  }
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY nsINode* RemoveChildInternal(
+      nsINode& aChild, MutationEffectOnScript aMutationEffectOnScript,
+      mozilla::ErrorResult& aError);
+  already_AddRefed<nsINode> CloneNode(bool aDeep, mozilla::ErrorResult& aError);
+  bool IsSameNode(nsINode* aNode);
+  bool IsEqualNode(nsINode* aNode);
+  void GetNamespaceURI(nsAString& aNamespaceURI) const {
+    mNodeInfo->GetNamespaceURI(aNamespaceURI);
+  }
+#if defined(MOZILLA_INTERNAL_API)
+  void GetPrefix(nsAString& aPrefix) { mNodeInfo->GetPrefix(aPrefix); }
+#endif
+  void GetLocalName(mozilla::dom::DOMString& aLocalName) const {
+    const nsString& localName = LocalName();
+    aLocalName.SetKnownLiveString(localName);
+  }
+
+  nsDOMAttributeMap* GetAttributes();
+
+  inline mozilla::dom::Element* GetPreviousElementSibling() const;
+  inline mozilla::dom::Element* GetNextElementSibling() const;
+
+  MOZ_CAN_RUN_SCRIPT void Before(const Sequence<OwningNodeOrString>& aNodes,
+                                 ErrorResult& aRv);
+  MOZ_CAN_RUN_SCRIPT void After(const Sequence<OwningNodeOrString>& aNodes,
+                                ErrorResult& aRv);
+  MOZ_CAN_RUN_SCRIPT void ReplaceWith(
+      const Sequence<OwningNodeOrString>& aNodes, ErrorResult& aRv);
+  void Remove();
+
+  mozilla::dom::Element* GetFirstElementChild() const;
+  mozilla::dom::Element* GetLastElementChild() const;
+
+  already_AddRefed<mozilla::dom::HTMLCollection> GetElementsByAttribute(
+      const nsAString& aAttribute, const nsAString& aValue);
+  already_AddRefed<mozilla::dom::HTMLCollection> GetElementsByAttributeNS(
+      const nsAString& aNamespaceURI, const nsAString& aAttribute,
+      const nsAString& aValue, ErrorResult& aRv);
+
+  MOZ_CAN_RUN_SCRIPT void Prepend(const Sequence<OwningNodeOrString>& aNodes,
+                                  ErrorResult& aRv);
+  MOZ_CAN_RUN_SCRIPT void Append(const Sequence<OwningNodeOrString>& aNodes,
+                                 ErrorResult& aRv);
+  MOZ_CAN_RUN_SCRIPT void ReplaceChildren(
+      const Sequence<OwningNodeOrString>& aNodes, ErrorResult& aRv);
+  MOZ_CAN_RUN_SCRIPT void ReplaceChildren(
+      nsINode* aNode, ErrorResult& aRv,
+      MutationEffectOnScript aMutationEffectOnScript =
+          MutationEffectOnScript::DropTrustWorthiness);
+
+  MOZ_CAN_RUN_SCRIPT void MoveBefore(nsINode& aNode, nsINode* aChild,
+                                     ErrorResult& aRv);
+
+  void GetBoxQuads(const BoxQuadOptions& aOptions,
+                   nsTArray<RefPtr<DOMQuad>>& aResult, CallerType aCallerType,
+                   ErrorResult& aRv);
+
+  void GetBoxQuadsFromWindowOrigin(const BoxQuadOptions& aOptions,
+                                   nsTArray<RefPtr<DOMQuad>>& aResult,
+                                   ErrorResult& aRv);
+
+  already_AddRefed<DOMQuad> ConvertQuadFromNode(
+      DOMQuad& aQuad, const TextOrElementOrDocument& aFrom,
+      const ConvertCoordinateOptions& aOptions, CallerType aCallerType,
+      ErrorResult& aRv);
+  already_AddRefed<DOMQuad> ConvertRectFromNode(
+      DOMRectReadOnly& aRect, const TextOrElementOrDocument& aFrom,
+      const ConvertCoordinateOptions& aOptions, CallerType aCallerType,
+      ErrorResult& aRv);
+  already_AddRefed<DOMPoint> ConvertPointFromNode(
+      const DOMPointInit& aPoint, const TextOrElementOrDocument& aFrom,
+      const ConvertCoordinateOptions& aOptions, CallerType aCallerType,
+      ErrorResult& aRv);
+
+  const mozilla::LinkedList<mozilla::dom::AbstractRange>*
+  GetExistingClosestCommonInclusiveAncestorRanges() const {
+    if (!HasSlots()) {
+      return nullptr;
+    }
+    return GetExistingSlots()->mClosestCommonInclusiveAncestorRanges.get();
+  }
+
+  mozilla::LinkedList<mozilla::dom::AbstractRange>*
+  GetExistingClosestCommonInclusiveAncestorRanges() {
+    if (!HasSlots()) {
+      return nullptr;
+    }
+    return GetExistingSlots()->mClosestCommonInclusiveAncestorRanges.get();
+  }
+
+  mozilla::UniquePtr<mozilla::LinkedList<mozilla::dom::AbstractRange>>&
+  GetClosestCommonInclusiveAncestorRangesPtr() {
+    return Slots()->mClosestCommonInclusiveAncestorRanges;
+  }
+
+  nsIWeakReference* GetExistingWeakReference() {
+    return HasSlots() ? GetExistingSlots()->mWeakReference : nullptr;
+  }
+
+  void QueueAncestorRevealingAlgorithm();
+
+  MOZ_CAN_RUN_SCRIPT void AncestorRevealingAlgorithm(ErrorResult& aRv);
+
+ protected:
+  virtual nsINode::nsSlots* CreateSlots();
+
+  bool HasSlots() const { return mSlots != nullptr; }
+
+  nsSlots* GetExistingSlots() const { return mSlots; }
+
+  nsSlots* Slots() {
+    if (!HasSlots()) {
+      mSlots = CreateSlots();
+      MOZ_ASSERT(mSlots);
+    }
+    return GetExistingSlots();
+  }
+
+  void InvalidateChildNodes();
+
+  virtual void GetTextContentInternal(nsAString& aTextContent,
+                                      mozilla::OOMReporter& aError);
+  virtual void SetTextContentInternal(
+      const nsAString& aTextContent, nsIPrincipal* aSubjectPrincipal,
+      mozilla::ErrorResult& aError,
+      MutationEffectOnScript aMutationEffectOnScript =
+          MutationEffectOnScript::DropTrustWorthiness) {}
+
+  void EnsurePreInsertionValidity1(mozilla::ErrorResult& aError);
+  void EnsurePreInsertionValidity2(bool aReplace, nsINode& aNewChild,
+                                   nsINode* aRefChild,
+                                   mozilla::ErrorResult& aError);
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY nsINode* ReplaceOrInsertBefore(
+      bool aReplace, nsINode* aNewChild, nsINode* aRefChild,
+      MutationEffectOnScript aMutationEffectOnScript,
+      mozilla::ErrorResult& aError);
+
+  virtual mozilla::dom::Element* GetNameSpaceElement() = 0;
+
+  const mozilla::StyleSelectorList* ParseSelectorList(
+      const nsACString& aSelectorString, mozilla::ErrorResult&);
+
+ public:
+#define EVENT(name_, id_, type_, struct_)                         \
+  mozilla::dom::EventHandlerNonNull* GetOn##name_() {             \
+    return GetEventHandler(nsGkAtoms::on##name_);                 \
+  }                                                               \
+  void SetOn##name_(mozilla::dom::EventHandlerNonNull* handler) { \
+    SetEventHandler(nsGkAtoms::on##name_, handler);               \
+  }
+#define TOUCH_EVENT EVENT
+#define DOCUMENT_ONLY_EVENT EVENT
+#include "mozilla/EventNameList.inc"
+#undef DOCUMENT_ONLY_EVENT
+#undef TOUCH_EVENT
+#undef EVENT
+
+  NodeSelectorFlags GetSelectorFlags() const {
+    return static_cast<NodeSelectorFlags>(mSelectorFlags.Get());
+  }
+
+  void AriaNotify(const nsAString& aAnnouncement,
+                  const mozilla::dom::AriaNotificationOptions& aOptions);
+
+ protected:
+  static bool Traverse(nsINode* tmp, nsCycleCollectionTraversalCallback& cb);
+  static void Unlink(nsINode* tmp);
+
+  RefPtr<mozilla::dom::NodeInfo> mNodeInfo;
+
+  nsINode* MOZ_OWNING_REF mParent;
+
+ private:
+#if !defined(BOOL_FLAGS_ON_WRAPPER_CACHE)
+  uint32_t mBoolFlags;
+#endif
+
+  mozilla::RustCell<uint32_t> mSelectorFlags{0};
+
+  uint32_t mChildCount;
+
+ protected:
+  nsCOMPtr<nsIContent> mFirstChild;
+  nsCOMPtr<nsIContent> mNextSibling;
+  nsIContent* MOZ_NON_OWNING_REF mPreviousOrLastSibling;
+
+  nsINode* MOZ_NON_OWNING_REF mSubtreeRoot;
+
+  nsIFrame* mPrimaryFrame = nullptr;
+
+  nsSlots* mSlots;
+};
+
+NON_VIRTUAL_ADDREF_RELEASE(nsINode)
+
+template <>
+struct fmt::formatter<nsINode> : ostream_formatter {};
+
+inline nsINode* mozilla::dom::EventTarget::GetAsNode() {
+  return IsNode() ? AsNode() : nullptr;
+}
+
+inline const nsINode* mozilla::dom::EventTarget::GetAsNode() const {
+  return const_cast<mozilla::dom::EventTarget*>(this)->GetAsNode();
+}
+
+inline nsINode* mozilla::dom::EventTarget::AsNode() {
+  MOZ_DIAGNOSTIC_ASSERT(IsNode());
+  return static_cast<nsINode*>(this);
+}
+
+inline const nsINode* mozilla::dom::EventTarget::AsNode() const {
+  MOZ_DIAGNOSTIC_ASSERT(IsNode());
+  return static_cast<const nsINode*>(this);
+}
+
+template <class C, class D>
+inline nsINode* NODE_FROM(C& aContent, D& aDocument) {
+  if (aContent) return static_cast<nsINode*>(aContent);
+  return static_cast<nsINode*>(aDocument);
+}
+
+inline nsISupports* ToSupports(nsINode* aPointer) { return aPointer; }
+
+#define NS_IMPL_FROMNODE_GENERIC(_class, _check, _const)                 \
+  template <typename T>                                                  \
+  static auto FromNode(_const T& aNode)                                  \
+      -> decltype(static_cast<_const _class*>(&aNode)) {                 \
+    return aNode._check ? static_cast<_const _class*>(&aNode) : nullptr; \
+  }                                                                      \
+  template <typename T>                                                  \
+  static _const _class* FromNode(_const T* aNode) {                      \
+    return FromNode(*aNode);                                             \
+  }                                                                      \
+  template <typename T>                                                  \
+  static _const _class* FromNodeOrNull(_const T* aNode) {                \
+    return aNode ? FromNode(*aNode) : nullptr;                           \
+  }                                                                      \
+  template <typename T>                                                  \
+  static auto FromEventTarget(_const T& aEventTarget)                    \
+      -> decltype(static_cast<_const _class*>(&aEventTarget)) {          \
+    return aEventTarget.IsNode() && aEventTarget.AsNode()->_check        \
+               ? static_cast<_const _class*>(&aEventTarget)              \
+               : nullptr;                                                \
+  }                                                                      \
+  template <typename T>                                                  \
+  static _const _class* FromEventTarget(_const T* aEventTarget) {        \
+    return FromEventTarget(*aEventTarget);                               \
+  }                                                                      \
+  template <typename T>                                                  \
+  static _const _class* FromEventTargetOrNull(_const T* aEventTarget) {  \
+    return aEventTarget ? FromEventTarget(*aEventTarget) : nullptr;      \
+  }
+
+#define NS_IMPL_FROMNODE_HELPER(_class, _check)                                \
+  NS_IMPL_FROMNODE_GENERIC(_class, _check, )                                   \
+  NS_IMPL_FROMNODE_GENERIC(_class, _check, const)                              \
+                                                                               \
+  template <typename T>                                                        \
+  static _class* FromNode(T&& aNode) {                                         \
+              \
+               \
+                                         \
+    return aNode->_check ? static_cast<_class*>(static_cast<nsINode*>(aNode))  \
+                         : nullptr;                                            \
+  }                                                                            \
+  template <typename T>                                                        \
+  static _class* FromNodeOrNull(T&& aNode) {                                   \
+    return aNode ? FromNode(aNode) : nullptr;                                  \
+  }                                                                            \
+  template <typename T>                                                        \
+  static _class* FromEventTarget(T&& aEventTarget) {                           \
+       \
+               \
+                                         \
+    return aEventTarget->IsNode() && aEventTarget->AsNode()->_check            \
+               ? static_cast<_class*>(static_cast<EventTarget*>(aEventTarget)) \
+               : nullptr;                                                      \
+  }                                                                            \
+  template <typename T>                                                        \
+  static _class* FromEventTargetOrNull(T&& aEventTarget) {                     \
+    return aEventTarget ? FromEventTarget(aEventTarget) : nullptr;             \
+  }
+
+#define NS_IMPL_FROMNODE(_class, _nsid) \
+  NS_IMPL_FROMNODE_HELPER(_class, IsInNamespace(_nsid))
+
+#define NS_IMPL_FROMNODE_WITH_TAG(_class, _nsid, _tag) \
+  NS_IMPL_FROMNODE_HELPER(_class, NodeInfo()->Equals(nsGkAtoms::_tag, _nsid))
+
+#define NS_IMPL_FROMNODE_HTML_WITH_TAG(_class, _tag) \
+  NS_IMPL_FROMNODE_WITH_TAG(_class, kNameSpaceID_XHTML, _tag)
+
+#endif

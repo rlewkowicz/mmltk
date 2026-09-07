@@ -1,0 +1,630 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "ContentPrincipal.h"
+
+#include "mozIThirdPartyUtil.h"
+#include "nsAboutProtocolUtils.h"
+#include "nsContentUtils.h"
+#include "nscore.h"
+#include "nsScriptSecurityManager.h"
+#include "nsString.h"
+#include "nsReadableUtils.h"
+#include "pratom.h"
+#include "nsIURI.h"
+#include "nsIURL.h"
+#include "nsIStandardURL.h"
+#include "nsIURIWithSpecialOrigin.h"
+#include "nsIURIMutator.h"
+#include "nsJSPrincipals.h"
+#include "nsIEffectiveTLDService.h"
+#include "nsIClassInfoImpl.h"
+#include "nsIObjectInputStream.h"
+#include "nsIObjectOutputStream.h"
+#include "nsIProtocolHandler.h"
+#include "nsError.h"
+#include "nsIContentSecurityPolicy.h"
+#include "nsNetCID.h"
+#include "js/RealmIterators.h"
+#include "js/Wrapper.h"
+
+#include "mozilla/dom/BlobURLProtocolHandler.h"
+#include "mozilla/dom/ScriptSettings.h"
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/Preferences.h"
+
+#include "nsSerializationHelper.h"
+
+#include "js/JSON.h"
+#include "ContentPrincipalJSONHandler.h"
+
+using namespace mozilla;
+
+NS_IMPL_CLASSINFO(ContentPrincipal, nullptr, 0, NS_PRINCIPAL_CID)
+NS_IMPL_QUERY_INTERFACE_CI(ContentPrincipal, nsIPrincipal)
+NS_IMPL_CI_INTERFACE_GETTER(ContentPrincipal, nsIPrincipal)
+
+ContentPrincipal::ContentPrincipal(nsIURI* aURI,
+                                   const OriginAttributes& aOriginAttributes,
+                                   const nsACString& aOriginNoSuffix,
+                                   nsIURI* aInitialDomain)
+    : BasePrincipal(eContentPrincipal, aOriginNoSuffix, aOriginAttributes),
+      mURI(aURI),
+      mDomain(aInitialDomain) {
+  if (mDomain) {
+    SetHasExplicitDomain();
+  }
+
+#ifdef MOZ_DIAGNOSTIC_ASSERT_ENABLED
+  bool hasFlag = false;
+  MOZ_DIAGNOSTIC_ASSERT(
+      NS_SUCCEEDED(NS_URIChainHasFlags(
+          aURI, nsIProtocolHandler::URI_INHERITS_SECURITY_CONTEXT, &hasFlag)) &&
+      !hasFlag);
+#endif
+}
+
+ContentPrincipal::ContentPrincipal(ContentPrincipal* aOther,
+                                   const OriginAttributes& aOriginAttributes)
+    : BasePrincipal(aOther, aOriginAttributes),
+      mURI(aOther->mURI),
+      mDomain(aOther->mDomain) {}
+
+ContentPrincipal::~ContentPrincipal() = default;
+
+nsresult ContentPrincipal::GetScriptLocation(nsACString& aStr) {
+  return mURI->GetSpec(aStr);
+}
+
+nsresult ContentPrincipal::GenerateOriginNoSuffixFromURI(
+    nsIURI* aURI, nsACString& aOriginNoSuffix) {
+  if (!aURI) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsCOMPtr<nsIURI> origin = NS_GetInnermostURI(aURI);
+  if (!origin) {
+    return NS_ERROR_FAILURE;
+  }
+
+  MOZ_ASSERT(!NS_IsAboutBlankAllowQueryAndFragment(origin),
+             "The inner URI for about:blank must be moz-safe-about:blank");
+
+  if (!nsScriptSecurityManager::GetStrictFileOriginPolicy() &&
+      NS_URIIsLocalFile(origin)) {
+    aOriginNoSuffix.AssignLiteral("file://UNIVERSAL_FILE_URI_ORIGIN");
+    return NS_OK;
+  }
+
+  nsresult rv;
+#if IS_ORIGIN_IS_FULL_SPEC_DEFINED
+  bool fullSpec = false;
+  rv = NS_URIChainHasFlags(origin, nsIProtocolHandler::ORIGIN_IS_FULL_SPEC,
+                           &fullSpec);
+  NS_ENSURE_SUCCESS(rv, rv);
+  if (fullSpec) {
+    return origin->GetAsciiSpec(aOriginNoSuffix);
+  }
+#endif
+
+  if (origin->SchemeIs("about")) {
+    MOZ_ASSERT(!NS_IsContentAccessibleAboutURI(origin),
+               "about:blank and about:srcdoc should appear as "
+               "moz-safe-about:{blank,srcdoc} in this method, "
+               "and should not get an origin");
+
+    rv = origin->GetAsciiSpec(aOriginNoSuffix);
+    NS_ENSURE_SUCCESS(rv, rv);
+
+    int32_t pos = aOriginNoSuffix.FindChar('?');
+    int32_t hashPos = aOriginNoSuffix.FindChar('#');
+
+    if (hashPos != kNotFound && (pos == kNotFound || hashPos < pos)) {
+      pos = hashPos;
+    }
+
+    if (pos != kNotFound) {
+      aOriginNoSuffix.Truncate(pos);
+    }
+
+    if (NS_WARN_IF(aOriginNoSuffix.FindChar('^', 0) != -1)) {
+      aOriginNoSuffix.Truncate();
+      return NS_ERROR_FAILURE;
+    }
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIStandardURL> standardURL = do_QueryInterface(origin);
+  if (!standardURL) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsAutoCString hostPort;
+  if (!origin->SchemeIs("chrome")) {
+    rv = origin->GetAsciiHostPort(hostPort);
+    NS_ENSURE_SUCCESS(rv, rv);
+  }
+  if (!hostPort.IsEmpty()) {
+    rv = origin->GetScheme(aOriginNoSuffix);
+    NS_ENSURE_SUCCESS(rv, rv);
+    aOriginNoSuffix.AppendLiteral("://");
+    aOriginNoSuffix.Append(hostPort);
+    return NS_OK;
+  }
+
+  rv = aURI->GetAsciiSpec(aOriginNoSuffix);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+
+  int32_t pos = aOriginNoSuffix.FindChar('?');
+  int32_t hashPos = aOriginNoSuffix.FindChar('#');
+
+  if (hashPos != kNotFound && (pos == kNotFound || hashPos < pos)) {
+    pos = hashPos;
+  }
+
+  if (pos != kNotFound) {
+    aOriginNoSuffix.Truncate(pos);
+  }
+
+  return NS_OK;
+}
+
+bool ContentPrincipal::SubsumesInternal(
+    nsIPrincipal* aOther,
+    BasePrincipal::DocumentDomainConsideration aConsideration) {
+  MOZ_ASSERT(aOther);
+
+  if (aOther == this) {
+    return true;
+  }
+
+  if (aConsideration == ConsiderDocumentDomain) {
+    nsCOMPtr<nsIURI> thisDomain, otherDomain;
+    GetDomain(getter_AddRefs(thisDomain));
+    aOther->GetDomain(getter_AddRefs(otherDomain));
+
+    // Otherwise, we fall through to the non-document-domain-considering case.
+    if (thisDomain || otherDomain) {
+      bool isMatch =
+          nsScriptSecurityManager::SecurityCompareURIs(thisDomain, otherDomain);
+#ifdef DEBUG
+      if (isMatch) {
+        nsAutoCString thisSiteOrigin, otherSiteOrigin;
+        MOZ_ALWAYS_SUCCEEDS(GetSiteOrigin(thisSiteOrigin));
+        MOZ_ALWAYS_SUCCEEDS(aOther->GetSiteOrigin(otherSiteOrigin));
+        MOZ_ASSERT(
+            thisSiteOrigin == otherSiteOrigin,
+            "SubsumesConsideringDomain passed with mismatched siteOrigin!");
+      }
+#endif
+      return isMatch;
+    }
+  }
+
+  return FastEquals(aOther) || aOther->IsSameOrigin(mURI);
+}
+
+NS_IMETHODIMP
+ContentPrincipal::GetURI(nsIURI** aURI) {
+  *aURI = do_AddRef(mURI).take();
+  return NS_OK;
+}
+
+bool ContentPrincipal::MayLoadInternal(nsIURI* aURI) {
+  MOZ_ASSERT(aURI);
+
+#if defined(MOZ_THUNDERBIRD) || defined(MOZ_SUITE)
+  nsCOMPtr<nsIURIWithSpecialOrigin> uriWithSpecialOrigin =
+      do_QueryInterface(aURI);
+  if (uriWithSpecialOrigin) {
+    nsCOMPtr<nsIURI> origin;
+    nsresult rv = uriWithSpecialOrigin->GetOrigin(getter_AddRefs(origin));
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      return false;
+    }
+    MOZ_ASSERT(origin);
+    OriginAttributes attrs;
+    RefPtr<BasePrincipal> principal =
+        BasePrincipal::CreateContentPrincipal(origin, attrs);
+    return nsIPrincipal::Subsumes(principal);
+  }
+#endif
+
+  nsCOMPtr<nsIPrincipal> blobPrincipal;
+  if (dom::BlobURLProtocolHandler::GetBlobURLPrincipal(
+          aURI, OriginAttributesRef(), getter_AddRefs(blobPrincipal))) {
+    MOZ_ASSERT(blobPrincipal);
+    return nsIPrincipal::Subsumes(blobPrincipal);
+  }
+
+  if (nsScriptSecurityManager::SecurityCompareURIs(mURI, aURI)) {
+    return true;
+  }
+
+  return false;
+}
+
+NS_IMETHODIMP
+ContentPrincipal::GetDomain(nsIURI** aDomain) {
+  if (!GetHasExplicitDomain()) {
+    *aDomain = nullptr;
+    return NS_OK;
+  }
+
+  mozilla::MutexAutoLock lock(mMutex);
+  NS_ADDREF(*aDomain = mDomain);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+ContentPrincipal::SetDomain(nsIURI* aDomain) {
+  AssertIsOnMainThread();
+  MOZ_ASSERT(aDomain);
+
+  {
+    mozilla::MutexAutoLock lock(mMutex);
+    mDomain = aDomain;
+    SetHasExplicitDomain();
+  }
+
+  auto cb = [](JSContext*, void*, JS::Realm* aRealm,
+               const JS::AutoRequireNoGC& nogc) {
+    JS::Compartment* comp = JS::GetCompartmentForRealm(aRealm);
+    xpc::SetCompartmentChangedDocumentDomain(comp);
+  };
+  JSPrincipals* principals =
+      nsJSPrincipals::get(static_cast<nsIPrincipal*>(this));
+
+  dom::AutoJSAPI jsapi;
+  jsapi.Init();
+  JS::IterateRealmsWithPrincipals(jsapi.cx(), principals, nullptr, cb);
+
+  return NS_OK;
+}
+
+static nsresult GetSpecialBaseDomain(const nsCOMPtr<nsIURI>& aURI,
+                                     bool* aHandled, nsACString& aBaseDomain) {
+  *aHandled = false;
+
+  if (NS_URIIsLocalFile(aURI)) {
+    if (!nsScriptSecurityManager::GetStrictFileOriginPolicy()) {
+      *aHandled = true;
+      aBaseDomain.AssignLiteral("UNIVERSAL_FILE_URI_ORIGIN");
+      return NS_OK;
+    }
+
+    nsCOMPtr<nsIURL> url = do_QueryInterface(aURI);
+
+    if (url) {
+      *aHandled = true;
+      return url->GetFilePath(aBaseDomain);
+    }
+  }
+
+  bool hasNoRelativeFlag;
+  nsresult rv = NS_URIChainHasFlags(aURI, nsIProtocolHandler::URI_NORELATIVE,
+                                    &hasNoRelativeFlag);
+  if (NS_WARN_IF(NS_FAILED(rv))) {
+    return rv;
+  }
+
+  if (hasNoRelativeFlag && !aURI->SchemeIs("ftp")) {
+    *aHandled = true;
+    return aURI->GetSpec(aBaseDomain);
+  }
+
+  bool isUIResource = false;
+  if (NS_SUCCEEDED(NS_URIChainHasFlags(
+          aURI, nsIProtocolHandler::URI_IS_UI_RESOURCE, &isUIResource)) &&
+      isUIResource) {
+    *aHandled = true;
+    return aURI->GetPrePath(aBaseDomain);
+  }
+
+  if (aURI->SchemeIs("indexeddb")) {
+    *aHandled = true;
+    return aURI->GetSpec(aBaseDomain);
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+ContentPrincipal::GetBaseDomain(nsACString& aBaseDomain) {
+  bool handled;
+  nsresult rv = GetSpecialBaseDomain(mURI, &handled, aBaseDomain);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (handled) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<mozIThirdPartyUtil> thirdPartyUtil =
+      do_GetService(THIRDPARTYUTIL_CONTRACTID);
+  if (!thirdPartyUtil) {
+    return NS_ERROR_FAILURE;
+  }
+
+  return thirdPartyUtil->GetBaseDomain(mURI, aBaseDomain);
+}
+
+NS_IMETHODIMP
+ContentPrincipal::GetSiteOriginNoSuffix(nsACString& aSiteOrigin) {
+  nsresult rv = GetOriginNoSuffix(aSiteOrigin);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  // The originNoSuffix is already normalized when being generated by
+  int32_t schemeEnd = aSiteOrigin.Find("://");
+  if (schemeEnd == kNotFound) {
+    return NS_OK;
+  }
+
+  nsDependentCSubstring scheme(aSiteOrigin, 0, schemeEnd);
+  if (scheme != "http"_ns && scheme != "https"_ns) {
+    return NS_OK;
+  }
+
+  const char* portStart = aSiteOrigin.EndReading() - 1;
+  while ('0' <= *portStart && *portStart <= '9') {
+    --portStart;
+  }
+  if (*portStart == ':') {
+    aSiteOrigin.Truncate(portStart - aSiteOrigin.BeginReading());
+  }
+
+  nsCOMPtr<nsIEffectiveTLDService> tldService =
+      do_GetService(NS_EFFECTIVETLDSERVICE_CONTRACTID);
+  if (!tldService) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+
+  nsAutoCString baseDomain;
+  int32_t hostStart = schemeEnd + 3;
+  nsDependentCSubstring host(aSiteOrigin, hostStart);
+  rv = tldService->GetBaseDomainFromHost(host, 0, baseDomain);
+  if (NS_FAILED(rv)) {
+    if (rv != NS_ERROR_HOST_IS_IP_ADDRESS &&
+        rv != NS_ERROR_INSUFFICIENT_DOMAIN_LEVELS &&
+        rv != NS_ERROR_INVALID_ARG) {
+      return rv;
+    }
+    return NS_OK;
+  }
+
+  if (baseDomain != host) {
+    aSiteOrigin.Replace(hostStart, aSiteOrigin.Length() - hostStart,
+                        baseDomain);
+  }
+  return NS_OK;
+}
+
+nsresult ContentPrincipal::GetSiteIdentifier(SiteIdentifier& aSite) {
+  nsCString siteOrigin;
+  nsresult rv = GetSiteOrigin(siteOrigin);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  RefPtr<BasePrincipal> principal = CreateContentPrincipal(siteOrigin);
+  if (!principal) {
+    NS_WARNING("could not instantiate content principal");
+    return NS_ERROR_FAILURE;
+  }
+
+  aSite.Init(principal);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+ContentPrincipal::Deserializer::Read(nsIObjectInputStream* aStream) {
+  MOZ_ASSERT(!mPrincipal);
+
+  nsCOMPtr<nsISupports> supports;
+  nsCOMPtr<nsIURI> principalURI;
+  nsresult rv = NS_ReadOptionalObject(aStream, true, getter_AddRefs(supports));
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  principalURI = do_QueryInterface(supports);
+  if (principalURI->SchemeIs("about")) {
+    nsAutoCString spec;
+    principalURI->GetSpec(spec);
+    NS_ENSURE_SUCCESS(NS_NewURI(getter_AddRefs(principalURI), spec),
+                      NS_ERROR_FAILURE);
+  }
+
+  nsCOMPtr<nsIURI> domain;
+  rv = NS_ReadOptionalObject(aStream, true, getter_AddRefs(supports));
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  domain = do_QueryInterface(supports);
+
+  nsAutoCString suffix;
+  rv = aStream->ReadCString(suffix);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  OriginAttributes attrs;
+  bool ok = attrs.PopulateFromSuffix(suffix);
+  NS_ENSURE_TRUE(ok, NS_ERROR_FAILURE);
+
+  (void)NS_ReadOptionalObject(aStream, true, getter_AddRefs(supports));
+
+  nsAutoCString originNoSuffix;
+  rv = GenerateOriginNoSuffixFromURI(principalURI, originNoSuffix);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  mPrincipal =
+      new ContentPrincipal(principalURI, attrs, originNoSuffix, domain);
+  return NS_OK;
+}
+
+nsresult ContentPrincipal::WriteJSONInnerProperties(JSONWriter& aWriter) {
+  nsAutoCString principalURI;
+  nsresult rv = mURI->GetSpec(principalURI);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  WriteJSONProperty<eURI>(aWriter, principalURI);
+
+  if (GetHasExplicitDomain()) {
+    nsAutoCString domainStr;
+    {
+      MutexAutoLock lock(mMutex);
+      rv = mDomain->GetSpec(domainStr);
+      NS_ENSURE_SUCCESS(rv, rv);
+    }
+    WriteJSONProperty<eDomain>(aWriter, domainStr);
+  }
+
+  nsAutoCString suffix;
+  OriginAttributesRef().CreateSuffix(suffix);
+  if (suffix.Length() > 0) {
+    WriteJSONProperty<eSuffix>(aWriter, suffix);
+  }
+
+  return NS_OK;
+}
+
+bool ContentPrincipalJSONHandler::startObject() {
+  switch (mState) {
+    case State::Init:
+      mState = State::StartObject;
+      break;
+    default:
+      NS_WARNING("Unexpected object value");
+      mState = State::Error;
+      return false;
+  }
+
+  return true;
+}
+
+bool ContentPrincipalJSONHandler::propertyName(const JS::Latin1Char* name,
+                                               size_t length) {
+  switch (mState) {
+    case State::StartObject:
+    case State::AfterPropertyValue: {
+      if (length != 1) {
+        NS_WARNING(
+            nsPrintfCString("Unexpected property name length: %zu", length)
+                .get());
+        mState = State::Error;
+        return false;
+      }
+
+      char key = char(name[0]);
+      switch (key) {
+        case ContentPrincipal::URIKey:
+          mState = State::URIKey;
+          break;
+        case ContentPrincipal::DomainKey:
+          mState = State::DomainKey;
+          break;
+        case ContentPrincipal::SuffixKey:
+          mState = State::SuffixKey;
+          break;
+        default:
+          NS_WARNING(
+              nsPrintfCString("Unexpected property name: '%c'", key).get());
+          mState = State::Error;
+          return false;
+      }
+      break;
+    }
+    default:
+      NS_WARNING("Unexpected property name");
+      mState = State::Error;
+      return false;
+  }
+
+  return true;
+}
+
+bool ContentPrincipalJSONHandler::endObject() {
+  switch (mState) {
+    case State::AfterPropertyValue: {
+      MOZ_ASSERT(mPrincipalURI);
+
+      nsAutoCString originNoSuffix;
+      nsresult rv = ContentPrincipal::GenerateOriginNoSuffixFromURI(
+          mPrincipalURI, originNoSuffix);
+      if (NS_FAILED(rv)) {
+        mState = State::Error;
+        return false;
+      }
+
+      mPrincipal =
+          new ContentPrincipal(mPrincipalURI, mAttrs, originNoSuffix, mDomain);
+      MOZ_ASSERT(mPrincipal);
+
+      mState = State::EndObject;
+      break;
+    }
+    default:
+      NS_WARNING("Unexpected end of object");
+      mState = State::Error;
+      return false;
+  }
+
+  return true;
+}
+
+bool ContentPrincipalJSONHandler::stringValue(const JS::Latin1Char* str,
+                                              size_t length) {
+  switch (mState) {
+    case State::URIKey: {
+      nsDependentCSubstring spec(reinterpret_cast<const char*>(str), length);
+
+      nsresult rv = NS_NewURI(getter_AddRefs(mPrincipalURI), spec);
+      if (NS_FAILED(rv)) {
+        mState = State::Error;
+        return false;
+      }
+
+      {
+        if (mPrincipalURI->SchemeIs("about")) {
+          nsAutoCString spec;
+          mPrincipalURI->GetSpec(spec);
+          rv = NS_NewURI(getter_AddRefs(mPrincipalURI), spec);
+          if (NS_FAILED(rv)) {
+            mState = State::Error;
+            return false;
+          }
+        }
+      }
+
+      mState = State::AfterPropertyValue;
+      break;
+    }
+    case State::DomainKey: {
+      nsDependentCSubstring spec(reinterpret_cast<const char*>(str), length);
+
+      nsresult rv = NS_NewURI(getter_AddRefs(mDomain), spec);
+      if (NS_FAILED(rv)) {
+        mState = State::Error;
+        return false;
+      }
+
+      mState = State::AfterPropertyValue;
+      break;
+    }
+    case State::SuffixKey: {
+      nsDependentCSubstring attrs(reinterpret_cast<const char*>(str), length);
+      if (!mAttrs.PopulateFromSuffix(attrs)) {
+        mState = State::Error;
+        return false;
+      }
+
+      mState = State::AfterPropertyValue;
+      break;
+    }
+    default:
+      NS_WARNING("Unexpected string value");
+      mState = State::Error;
+      return false;
+  }
+
+  return true;
+}

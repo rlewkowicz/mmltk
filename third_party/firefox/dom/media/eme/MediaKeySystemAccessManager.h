@@ -1,0 +1,132 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_MEDIA_MEDIAKEYSYSTEMACCESSMANAGER_H_
+#define DOM_MEDIA_MEDIAKEYSYSTEMACCESSMANAGER_H_
+
+#include "DecoderDoctorDiagnostics.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/dom/MediaKeySystemAccess.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsIObserver.h"
+#include "nsISupportsImpl.h"
+#include "nsITimer.h"
+
+namespace mozilla::dom {
+
+class DetailedPromise;
+class TestGMPVideoDecoder;
+
+
+struct MediaKeySystemAccessRequest {
+  MediaKeySystemAccessRequest(
+      const nsAString& aKeySystem,
+      const Sequence<MediaKeySystemConfiguration>& aConfigs)
+      : mKeySystem(aKeySystem), mConfigs(aConfigs) {}
+  virtual ~MediaKeySystemAccessRequest() = default;
+  const nsString mKeySystem;
+  const Sequence<MediaKeySystemConfiguration> mConfigs;
+  DecoderDoctorDiagnostics mDiagnostics;
+};
+
+class MediaKeySystemAccessManager final : public nsIObserver, public nsINamed {
+ public:
+  explicit MediaKeySystemAccessManager(nsPIDOMWindowInner* aWindow);
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(MediaKeySystemAccessManager,
+                                           nsIObserver)
+  NS_DECL_NSIOBSERVER
+  NS_DECL_NSINAMED
+
+  using MediaKeySystemAccessPromise =
+      MozPromise<RefPtr<MediaKeySystemAccess>, MediaResult, true>;
+
+  void Request(DetailedPromise* aPromise, const nsAString& aKeySystem,
+               const Sequence<MediaKeySystemConfiguration>& aConfig);
+
+  RefPtr<MediaKeySystemAccessPromise> Request(
+      const nsAString& aKeySystem,
+      const Sequence<MediaKeySystemConfiguration>& aConfigs);
+
+  void Shutdown();
+
+ private:
+  struct PendingRequest : public MediaKeySystemAccessRequest {
+    enum class RequestType { Initial, Subsequent };
+
+    PendingRequest(DetailedPromise* aPromise, const nsAString& aKeySystem,
+                   const Sequence<MediaKeySystemConfiguration>& aConfigs);
+    virtual ~PendingRequest();
+
+    RefPtr<DetailedPromise> mPromise;
+
+    RequestType mRequestType = RequestType::Initial;
+
+    Maybe<MediaKeySystemConfiguration> mSupportedConfig;
+
+    nsCOMPtr<nsITimer> mTimer = nullptr;
+
+    virtual void RejectPromiseWithInvalidAccessError(const nsACString& aReason);
+    virtual void RejectPromiseWithNotSupportedError(const nsACString& aReason);
+    virtual void RejectPromiseWithTypeError(const nsACString& aReason);
+    virtual void ResolvePromise(MediaKeySystemAccess* aAccess);
+
+    void CancelTimer();
+  };
+
+  struct PendingRequestWithMozPromise : public PendingRequest {
+    PendingRequestWithMozPromise(
+        const nsAString& aKeySystem,
+        const Sequence<MediaKeySystemConfiguration>& aConfigs)
+        : PendingRequest(nullptr, aKeySystem, aConfigs) {};
+    ~PendingRequestWithMozPromise() = default;
+
+    MozPromiseHolder<MediaKeySystemAccessPromise> mAccessPromise;
+
+    void RejectPromiseWithInvalidAccessError(
+        const nsACString& aReason) override;
+    void RejectPromiseWithNotSupportedError(const nsACString& aReason) override;
+    void RejectPromiseWithTypeError(const nsACString& aReason) override;
+    void ResolvePromise(MediaKeySystemAccess* aAccess) override;
+  };
+
+  void CheckDoesAppAllowProtectedMedia(UniquePtr<PendingRequest> aRequest);
+
+  void OnDoesAppAllowProtectedMedia(bool aIsAllowed,
+                                    UniquePtr<PendingRequest> aRequest);
+
+  void CheckDoesWindowSupportProtectedMedia(UniquePtr<PendingRequest> aRequest);
+
+  void OnDoesWindowSupportProtectedMedia(bool aIsSupportedInWindow,
+                                         UniquePtr<PendingRequest> aRequest);
+
+  void RequestMediaKeySystemAccess(UniquePtr<PendingRequest> aRequest);
+
+  void ProvideAccess(UniquePtr<PendingRequest> aRequest);
+
+  ~MediaKeySystemAccessManager();
+
+  bool EnsureObserversAdded();
+
+  bool AwaitInstall(UniquePtr<PendingRequest> aRequest);
+
+  void RetryRequest(UniquePtr<PendingRequest> aRequest);
+
+  nsTArray<UniquePtr<PendingRequest>> mPendingAppApprovalRequests;
+
+  nsTArray<UniquePtr<PendingRequest>> mPendingInstallRequests;
+
+  nsCOMPtr<nsPIDOMWindowInner> mWindow;
+  bool mAddedObservers = false;
+
+  Maybe<bool> mAppAllowsProtectedMedia;
+
+  MozPromiseRequestHolder<MozPromise<bool, bool, true>>
+      mAppAllowsProtectedMediaPromiseRequest;
+};
+
+}  
+
+#endif  // DOM_MEDIA_MEDIAKEYSYSTEMACCESSMANAGER_H_

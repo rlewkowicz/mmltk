@@ -1,0 +1,120 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SVG_DOMSVGTRANSFORM_H_
+#define DOM_SVG_DOMSVGTRANSFORM_H_
+
+#include <memory>
+
+#include "DOMSVGTransformList.h"
+#include "SVGTransform.h"
+#include "gfxMatrix.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsDebug.h"
+#include "nsID.h"
+#include "nsWrapperCache.h"
+
+#define MOZ_SVG_LIST_INDEX_BIT_COUNT 31  // supports > 2 billion list items
+
+namespace mozilla::dom {
+
+struct DOMMatrix2DInit;
+class SVGElement;
+class SVGMatrix;
+
+class DOMSVGTransform final : public nsWrapperCache {
+  template <class T>
+  friend class AutoChangeTransformListNotifier;
+
+ public:
+  NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(DOMSVGTransform)
+  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_NATIVE_CLASS(DOMSVGTransform)
+
+  DOMSVGTransform(DOMSVGTransformList* aList, uint32_t aListIndex,
+                  bool aIsAnimValItem);
+
+  DOMSVGTransform();
+  explicit DOMSVGTransform(const gfxMatrix& aMatrix);
+  DOMSVGTransform(const DOMMatrix2DInit& aMatrix, ErrorResult& aRv);
+
+  explicit DOMSVGTransform(const SVGTransform& aTransform);
+
+  already_AddRefed<DOMSVGTransform> Clone() {
+    NS_ASSERTION(mList, "unexpected caller");
+    return MakeAndAddRef<DOMSVGTransform>(InternalItem());
+  }
+
+  bool IsInList() const { return !!mList; }
+
+  bool IsAnimating() const { return mList && mList->IsAnimating(); }
+
+  bool HasOwner() const { return !!mList; }
+
+  void InsertingIntoList(DOMSVGTransformList* aList, uint32_t aListIndex,
+                         bool aIsAnimValItem);
+
+  static uint32_t MaxListIndex() {
+    return (1U << MOZ_SVG_LIST_INDEX_BIT_COUNT) - 1;
+  }
+
+  void UpdateListIndex(uint32_t aListIndex) {
+    MOZ_RELEASE_ASSERT(aListIndex <= MaxListIndex());
+    mListIndex = aListIndex;
+  }
+
+  void RemovingFromList();
+
+  SVGTransform ToSVGTransform() const { return Transform(); }
+
+  DOMSVGTransformList* GetParentObject() const { return mList; }
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+  uint16_t Type() const;
+  dom::SVGMatrix* GetMatrix();
+  float Angle() const;
+  void SetMatrix(const DOMMatrix2DInit& matrix, ErrorResult& aRv);
+  void SetTranslate(float tx, float ty, ErrorResult& aRv);
+  void SetScale(float sx, float sy, ErrorResult& aRv);
+  void SetRotate(float angle, float cx, float cy, ErrorResult& aRv);
+  void SetSkewX(float angle, ErrorResult& aRv);
+  void SetSkewY(float angle, ErrorResult& aRv);
+
+ protected:
+  ~DOMSVGTransform();
+
+  friend class dom::SVGMatrix;
+  bool IsAnimVal() const { return mIsAnimValItem; }
+  void SetMatrix(const gfxMatrix& aMatrix);
+
+ private:
+  SVGElement* Element() { return mList->Element(); }
+
+  SVGTransform& InternalItem();
+  const SVGTransform& InternalItem() const;
+
+#ifdef DEBUG
+  bool IndexIsValid();
+#endif
+
+  const SVGTransform& Transform() const {
+    return HasOwner() ? InternalItem() : *mTransform;
+  }
+  SVGTransform& Transform() {
+    return HasOwner() ? InternalItem() : *mTransform;
+  }
+
+  RefPtr<DOMSVGTransformList> mList;
+
+
+  uint32_t mListIndex : MOZ_SVG_LIST_INDEX_BIT_COUNT;
+  uint32_t mIsAnimValItem : 1;
+
+  std::unique_ptr<SVGTransform> mTransform;
+};
+
+}  
+
+#undef MOZ_SVG_LIST_INDEX_BIT_COUNT
+
+#endif  // DOM_SVG_DOMSVGTRANSFORM_H_

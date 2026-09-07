@@ -1,0 +1,105 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef ds_PriorityQueue_h
+#define ds_PriorityQueue_h
+
+#include "js/Vector.h"
+
+namespace js {
+
+template <class T, class P, size_t MinInlineCapacity = 0,
+          class AllocPolicy = TempAllocPolicy>
+class PriorityQueue {
+  Vector<T, MinInlineCapacity, AllocPolicy> heap;
+
+  PriorityQueue(const PriorityQueue&) = delete;
+  PriorityQueue& operator=(const PriorityQueue&) = delete;
+
+ public:
+  explicit PriorityQueue(AllocPolicy ap = AllocPolicy())
+      : heap(std::move(ap)) {}
+
+  [[nodiscard]] bool reserve(size_t capacity) { return heap.reserve(capacity); }
+
+  size_t length() const { return heap.length(); }
+
+  bool empty() const { return heap.empty(); }
+
+  T& highest() {
+    MOZ_ASSERT(!empty());
+    return heap[0];
+  }
+
+  void popHighest() {
+    if (heap.length() == 1) {
+      heap.popBack();
+      return;
+    }
+    std::swap(heap[0], heap.back());
+    heap.popBack();
+    siftDown(0);
+  }
+  [[nodiscard]] bool insert(T&& v) {
+    if (!heap.append(std::move(v))) {
+      return false;
+    }
+    siftUp(heap.length() - 1);
+    return true;
+  }
+
+  [[nodiscard]] bool reserveOne() { return heap.reserve(heap.length() + 1); }
+
+  void infallibleInsert(T&& v) {
+    heap.infallibleAppend(std::move(v));
+    siftUp(heap.length() - 1);
+  }
+
+ private:
+
+  void siftDown(size_t n) {
+    while (true) {
+      size_t left = n * 2 + 1;
+      size_t right = n * 2 + 2;
+
+      if (left < heap.length()) {
+        if (right < heap.length()) {
+          if (P::higherPriority(heap[right], heap[n]) &&
+              P::higherPriority(heap[right], heap[left])) {
+            swap(n, right);
+            n = right;
+            continue;
+          }
+        }
+
+        if (P::higherPriority(heap[left], heap[n])) {
+          swap(n, left);
+          n = left;
+          continue;
+        }
+      }
+
+      break;
+    }
+  }
+
+  void siftUp(size_t n) {
+    while (n > 0) {
+      size_t parent = (n - 1) / 2;
+
+      if (P::higherPriority(heap[parent], heap[n])) {
+        break;
+      }
+
+      swap(n, parent);
+      n = parent;
+    }
+  }
+
+  void swap(size_t a, size_t b) { std::swap(heap[a], heap[b]); }
+};
+
+} 
+
+#endif /* ds_PriorityQueue_h */

@@ -1,0 +1,353 @@
+// Copyright 2022 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef ABSL_LOG_INTERNAL_LOG_MESSAGE_H_
+#define ABSL_LOG_INTERNAL_LOG_MESSAGE_H_
+
+#include <wchar.h>
+
+#include <cstddef>
+#include <ios>
+#include <memory>
+#include <ostream>
+#include <streambuf>
+#include <string>
+#include <string_view>
+#include <type_traits>
+
+#include "absl/base/attributes.h"
+#include "absl/base/config.h"
+#include "absl/base/internal/errno_saver.h"
+#include "absl/base/log_severity.h"
+#include "absl/base/nullability.h"
+#include "absl/log/internal/nullguard.h"
+#include "absl/log/internal/structured_proto.h"
+#include "absl/log/log_entry.h"
+#include "absl/log/log_sink.h"
+#include "absl/strings/has_absl_stringify.h"
+#include "absl/strings/string_view.h"
+#include "absl/time/time.h"
+#include "absl/types/source_location.h"
+#include "absl/types/span.h"
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace log_internal {
+constexpr int kLogMessageBufferSize = 15000;
+
+enum class StructuredStringType;
+
+class LogMessage {
+ public:
+  struct InfoTag {};
+  struct WarningTag {};
+  struct ErrorTag {};
+
+  LogMessage(const char* absl_nonnull file, int line,
+             absl::LogSeverity severity) ABSL_ATTRIBUTE_COLD;
+  LogMessage(absl::string_view file, int line,
+             absl::LogSeverity severity) ABSL_ATTRIBUTE_COLD;
+  LogMessage(const char* absl_nonnull file, int line,
+             InfoTag) ABSL_ATTRIBUTE_COLD ABSL_ATTRIBUTE_NOINLINE;
+  LogMessage(const char* absl_nonnull file, int line,
+             WarningTag) ABSL_ATTRIBUTE_COLD ABSL_ATTRIBUTE_NOINLINE;
+  LogMessage(const char* absl_nonnull file, int line,
+             ErrorTag) ABSL_ATTRIBUTE_COLD ABSL_ATTRIBUTE_NOINLINE;
+  LogMessage(const LogMessage&) = delete;
+  LogMessage& operator=(const LogMessage&) = delete;
+  ~LogMessage() ABSL_ATTRIBUTE_COLD;
+
+  LogMessage& AtLocation(absl::string_view file, int line);
+  LogMessage& AtLocation(absl::SourceLocation loc) {
+    return AtLocation(loc.file_name(), static_cast<int>(loc.line()));
+  }
+  LogMessage& NoPrefix();
+  LogMessage& WithVerbosity(int verbose_level);
+  LogMessage& WithTimestamp(absl::Time timestamp);
+  LogMessage& WithThreadID(absl::LogEntry::tid_t tid);
+  LogMessage& WithMetadataFrom(const absl::LogEntry& entry);
+  LogMessage& WithPerror();
+  LogMessage& ToSinkAlso(absl::LogSink* absl_nonnull sink);
+  LogMessage& ToSinkOnly(absl::LogSink* absl_nonnull sink);
+
+  LogMessage& InternalStream() { return *this; }
+
+  // NOLINTBEGIN(runtime/int)
+  // NOLINTBEGIN(google-runtime-int)
+  // clang-format off:  The CUDA toolchain cannot handle these <<<'s
+  LogMessage& operator<<(char v) { return operator<< <char>(v); }
+  LogMessage& operator<<(signed char v) { return operator<< <signed char>(v); }
+  LogMessage& operator<<(unsigned char v) {
+    return operator<< <unsigned char>(v);
+  }
+  LogMessage& operator<<(signed short v) {
+    return operator<< <signed short>(v);
+  }
+  LogMessage& operator<<(signed int v) { return operator<< <signed int>(v); }
+  LogMessage& operator<<(signed long v) {
+    return operator<< <signed long>(v);
+  }
+  LogMessage& operator<<(signed long long v) {
+    return operator<< <signed long long>(v);
+  }
+  LogMessage& operator<<(unsigned short v) {
+    return operator<< <unsigned short>(v);
+  }
+  LogMessage& operator<<(unsigned int v) {
+    return operator<< <unsigned int>(v);
+  }
+  LogMessage& operator<<(unsigned long v) {
+    return operator<< <unsigned long>(v);
+  }
+  LogMessage& operator<<(unsigned long long v) {
+    return operator<< <unsigned long long>(v);
+  }
+  LogMessage& operator<<(void* absl_nullable  v) {
+    return operator<< <void*>(v);
+  }
+  LogMessage& operator<<(const void* absl_nullable  v) {
+    return operator<< <const void*>(v);
+  }
+  LogMessage& operator<<(float v) { return operator<< <float>(v); }
+  LogMessage& operator<<(double v) { return operator<< <double>(v); }
+  LogMessage& operator<<(bool v) { return operator<< <bool>(v); }
+  // clang-format on
+  // NOLINTEND(google-runtime-int)
+  // NOLINTEND(runtime/int)
+
+  LogMessage& operator<<(const std::string& v);
+  LogMessage& operator<<(absl::string_view v);
+
+  LogMessage& operator<<(const std::wstring& v);
+  LogMessage& operator<<(std::wstring_view v);
+  LogMessage& operator<<(wchar_t* absl_nullable v);
+  LogMessage& operator<<(wchar_t v);
+
+  LogMessage& operator<<(const absl::SourceLocation& loc) {
+    OstreamView view(*data_);
+    view.stream() << loc.file_name() << ':' << loc.line();
+    return *this;
+  }
+
+  LogMessage& operator<<(std::ostream& (*absl_nonnull m)(std::ostream& os));
+  LogMessage& operator<<(std::ios_base& (*absl_nonnull m)(std::ios_base& os));
+
+  template <int SIZE>
+  LogMessage& operator<<(const char (&buf)[SIZE]);
+  template <int SIZE>
+  LogMessage& operator<<(const wchar_t (&buf)[SIZE]);
+
+  template <int SIZE>
+  LogMessage& operator<<(char (&buf)[SIZE]) ABSL_ATTRIBUTE_NOINLINE;
+
+  template <typename T>
+  LogMessage& operator<<(const T& v) ABSL_ATTRIBUTE_NOINLINE;
+
+  void Flush();
+
+
+ protected:
+  [[noreturn]] static void FailWithoutStackTrace();
+
+  [[noreturn]] static void FailQuietly();
+
+  void SetFailQuietly();
+
+ private:
+  struct LogMessageData;  
+  friend class AsLiteralImpl;
+  friend class StringifySink;
+  template <StructuredStringType str_type>
+  friend class AsStructuredStringTypeImpl;
+  template <typename T>
+  friend class AsStructuredValueImpl;
+
+  class OstreamView final : public std::streambuf {
+   public:
+    explicit OstreamView(LogMessageData& message_data);
+    ~OstreamView() override;
+    OstreamView(const OstreamView&) = delete;
+    OstreamView& operator=(const OstreamView&) = delete;
+    std::ostream& stream();
+
+   private:
+    LogMessageData& data_;
+    absl::Span<char> encoded_remaining_copy_;
+    absl::Span<char> message_start_;
+    absl::Span<char> string_start_;
+  };
+
+  enum class StringType {
+    kLiteral,
+    kNotLiteral,
+  };
+  template <StringType str_type>
+  void CopyToEncodedBuffer(absl::string_view str) ABSL_ATTRIBUTE_NOINLINE;
+  template <StringType str_type>
+  void CopyToEncodedBuffer(char ch, size_t num) ABSL_ATTRIBUTE_NOINLINE;
+  template <StringType str_type>
+  void CopyToEncodedBuffer(std::wstring_view str) ABSL_ATTRIBUTE_NOINLINE;
+
+  template <StringType str_type>
+  void CopyToEncodedBufferWithStructuredProtoField(StructuredProtoField field,
+                                                   absl::string_view str)
+      ABSL_ATTRIBUTE_NOINLINE;
+
+  bool IsFatal() const;
+
+  void PrepareToDie();
+  void Die();
+
+  void SendToLog();
+
+  void LogBacktraceIfNeeded();
+
+  absl::base_internal::ErrnoSaver errno_saver_;
+
+  absl_nonnull std::unique_ptr<LogMessageData> data_;
+};
+
+template <>
+LogMessage& LogMessage::operator<< <const wchar_t*>(
+    const wchar_t* absl_nullable const& v);
+
+inline LogMessage& LogMessage::operator<<(wchar_t* absl_nullable v) {
+  return operator<<(const_cast<const wchar_t*>(v));
+}
+
+class StringifySink final {
+ public:
+  explicit StringifySink(LogMessage& message) : message_(message) {}
+
+  void Append(size_t count, char ch) {
+    message_.CopyToEncodedBuffer<LogMessage::StringType::kNotLiteral>(ch,
+                                                                      count);
+  }
+
+  void Append(absl::string_view v) {
+    message_.CopyToEncodedBuffer<LogMessage::StringType::kNotLiteral>(v);
+  }
+
+  friend void AbslFormatFlush(StringifySink* absl_nonnull sink,
+                              absl::string_view v) {
+    sink->Append(v);
+  }
+
+ private:
+  LogMessage& message_;
+};
+
+template <typename T>
+LogMessage& LogMessage::operator<<(const T& v) {
+  if constexpr (absl::HasAbslStringify<T>::value) {
+    StringifySink sink(*this);
+    AbslStringify(sink, v);
+  } else {
+    OstreamView view(*data_);
+    view.stream() << log_internal::NullGuard<T>().Guard(v);
+  }
+  return *this;
+}
+
+template <int SIZE>
+LogMessage& LogMessage::operator<<(const char (&buf)[SIZE]) {
+  CopyToEncodedBuffer<StringType::kLiteral>(buf);
+  return *this;
+}
+
+template <int SIZE>
+LogMessage& LogMessage::operator<<(const wchar_t (&buf)[SIZE]) {
+  CopyToEncodedBuffer<StringType::kLiteral>(buf);
+  return *this;
+}
+
+template <int SIZE>
+LogMessage& LogMessage::operator<<(char (&buf)[SIZE]) {
+  CopyToEncodedBuffer<StringType::kNotLiteral>(buf);
+  return *this;
+}
+// NOLINTBEGIN(runtime/int)
+// NOLINTBEGIN(google-runtime-int)
+extern template LogMessage& LogMessage::operator<<(const char& v);
+extern template LogMessage& LogMessage::operator<<(const signed char& v);
+extern template LogMessage& LogMessage::operator<<(const unsigned char& v);
+extern template LogMessage& LogMessage::operator<<(const short& v);
+extern template LogMessage& LogMessage::operator<<(const unsigned short& v);
+extern template LogMessage& LogMessage::operator<<(const int& v);
+extern template LogMessage& LogMessage::operator<<(const unsigned int& v);
+extern template LogMessage& LogMessage::operator<<(const long& v);
+extern template LogMessage& LogMessage::operator<<(const unsigned long& v);
+extern template LogMessage& LogMessage::operator<<(const long long& v);
+extern template LogMessage& LogMessage::operator<<(const unsigned long long& v);
+extern template LogMessage& LogMessage::operator<<(
+    void* absl_nullable const& v);
+extern template LogMessage& LogMessage::operator<<(
+    const void* absl_nullable const& v);
+extern template LogMessage& LogMessage::operator<<(const float& v);
+extern template LogMessage& LogMessage::operator<<(const double& v);
+extern template LogMessage& LogMessage::operator<<(const bool& v);
+// NOLINTEND(google-runtime-int)
+// NOLINTEND(runtime/int)
+
+extern template void LogMessage::CopyToEncodedBuffer<
+    LogMessage::StringType::kLiteral>(absl::string_view str);
+extern template void LogMessage::CopyToEncodedBuffer<
+    LogMessage::StringType::kNotLiteral>(absl::string_view str);
+extern template void
+LogMessage::CopyToEncodedBuffer<LogMessage::StringType::kLiteral>(char ch,
+                                                                  size_t num);
+extern template void LogMessage::CopyToEncodedBuffer<
+    LogMessage::StringType::kNotLiteral>(char ch, size_t num);
+extern template void LogMessage::CopyToEncodedBuffer<
+    LogMessage::StringType::kLiteral>(std::wstring_view str);
+extern template void LogMessage::CopyToEncodedBuffer<
+    LogMessage::StringType::kNotLiteral>(std::wstring_view str);
+
+class LogMessageFatal final : public LogMessage {
+ public:
+  LogMessageFatal(const char* absl_nonnull file, int line) ABSL_ATTRIBUTE_COLD;
+  LogMessageFatal(const char* absl_nonnull file, int line,
+                  const char* absl_nonnull failure_msg) ABSL_ATTRIBUTE_COLD;
+  [[noreturn]] ~LogMessageFatal();
+};
+
+class LogMessageDebugFatal final : public LogMessage {
+ public:
+  LogMessageDebugFatal(const char* absl_nonnull file,
+                       int line) ABSL_ATTRIBUTE_COLD;
+  ~LogMessageDebugFatal();
+};
+
+class LogMessageQuietlyDebugFatal final : public LogMessage {
+ public:
+  LogMessageQuietlyDebugFatal(const char* absl_nonnull file,
+                              int line) ABSL_ATTRIBUTE_COLD;
+  ~LogMessageQuietlyDebugFatal();
+};
+
+class LogMessageQuietlyFatal final : public LogMessage {
+ public:
+  LogMessageQuietlyFatal(const char* absl_nonnull file,
+                         int line) ABSL_ATTRIBUTE_COLD;
+  LogMessageQuietlyFatal(const char* absl_nonnull file, int line,
+                         const char* absl_nonnull failure_msg)
+      ABSL_ATTRIBUTE_COLD;
+  [[noreturn]] ~LogMessageQuietlyFatal();
+};
+
+}  
+ABSL_NAMESPACE_END
+}  
+
+extern "C" ABSL_ATTRIBUTE_WEAK void ABSL_INTERNAL_C_SYMBOL(
+    AbslInternalOnFatalLogMessage)(const absl::LogEntry&);
+
+#endif  // ABSL_LOG_INTERNAL_LOG_MESSAGE_H_

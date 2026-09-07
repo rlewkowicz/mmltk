@@ -1,0 +1,1923 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef frontend_TokenStream_h
+#define frontend_TokenStream_h
+
+
+#include "mozilla/ArrayUtils.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/Casting.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/MemoryChecking.h"
+#include "mozilla/Span.h"
+#include "mozilla/TextUtils.h"
+#include "mozilla/Utf8.h"
+
+#include <algorithm>
+#include <stdarg.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <type_traits>
+
+#include "jspubtd.h"
+
+#include "frontend/ErrorReporter.h"
+#include "frontend/ParserAtom.h"  // ParserAtom, ParserAtomsTable, TaggedParserAtomIndex
+#include "frontend/Token.h"
+#include "frontend/TokenKind.h"
+#include "js/CharacterEncoding.h"  // JS::ConstUTF8CharsZ
+#include "js/ColumnNumber.h"  // JS::LimitedColumnNumberOneOrigin, JS::ColumnNumberOneOrigin, JS::ColumnNumberUnsignedOffset
+#include "js/CompileOptions.h"
+#include "js/friend/ErrorMessages.h"  // JSMSG_*
+#include "js/HashTable.h"             // js::HashMap
+#include "js/RegExpFlags.h"           // JS::RegExpFlags
+#include "js/UniquePtr.h"
+#include "js/Vector.h"
+#include "util/Unicode.h"
+#include "vm/ErrorReporting.h"
+
+struct KeywordInfo;
+
+namespace js {
+
+class FrontendContext;
+
+namespace frontend {
+
+bool IsKeyword(TaggedParserAtomIndex atom);
+
+extern TokenKind ReservedWordTokenKind(TaggedParserAtomIndex name);
+
+extern const char* ReservedWordToCharZ(TaggedParserAtomIndex name);
+
+extern const char* ReservedWordToCharZ(TokenKind tt);
+
+enum class DeprecatedContent : uint8_t {
+  None = 0,
+  OctalLiteral,
+  OctalEscape,
+  EightOrNineEscape,
+};
+
+struct TokenStreamFlags {
+  bool isEOF : 1;
+  bool isDirtyLine : 1;
+  bool hadError : 1;
+
+  uint8_t sawDeprecatedContent : 2;
+
+  TokenStreamFlags()
+      : isEOF(false),
+        isDirtyLine(false),
+        hadError(false),
+        sawDeprecatedContent(uint8_t(DeprecatedContent::None)) {}
+};
+
+template <typename Unit>
+class TokenStreamPosition;
+
+class TokenStreamShared {
+ protected:
+  static constexpr size_t ntokens = 4;
+
+  static constexpr unsigned ntokensMask = ntokens - 1;
+
+  template <typename Unit>
+  friend class TokenStreamPosition;
+
+ public:
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+  static constexpr unsigned maxLookahead = 3;
+#else
+  static constexpr unsigned maxLookahead = 2;
+#endif
+
+  using Modifier = Token::Modifier;
+  static constexpr Modifier SlashIsDiv = Token::SlashIsDiv;
+  static constexpr Modifier SlashIsRegExp = Token::SlashIsRegExp;
+  static constexpr Modifier SlashIsInvalid = Token::SlashIsInvalid;
+
+  static void verifyConsistentModifier(Modifier modifier,
+                                       const Token& nextToken) {
+    MOZ_ASSERT(
+        modifier == nextToken.modifier || modifier == SlashIsInvalid,
+        "This token was scanned with both SlashIsRegExp and SlashIsDiv, "
+        "indicating the parser is confused about how to handle a slash here. "
+        "See comment at Token::Modifier.");
+  }
+};
+
+static_assert(std::is_empty_v<TokenStreamShared>,
+              "TokenStreamShared shouldn't bloat classes that inherit from it");
+
+template <typename Unit, class AnyCharsAccess>
+class TokenStreamSpecific;
+
+template <typename Unit>
+class MOZ_STACK_CLASS TokenStreamPosition final {
+ public:
+  template <class AnyCharsAccess>
+  inline explicit TokenStreamPosition(
+      TokenStreamSpecific<Unit, AnyCharsAccess>& tokenStream);
+
+  TokenStreamPosition(const TokenStreamPosition&) = delete;
+
+ private:
+  template <typename Char, class AnyCharsAccess>
+  friend class TokenStreamSpecific;
+
+  const Unit* buf;
+  TokenStreamFlags flags;
+  unsigned lineno;
+  size_t linebase;
+  size_t prevLinebase;
+  Token currentToken;
+  unsigned lookahead;
+  Token lookaheadTokens[TokenStreamShared::maxLookahead];
+};
+
+template <typename Unit>
+class SourceUnits;
+
+class SourceCoords {
+  Vector<uint32_t, 128> lineStartOffsets_;
+
+  uint32_t initialLineNum_;
+
+  mutable uint32_t lastIndex_;
+
+  uint32_t indexFromOffset(uint32_t offset) const;
+
+  static const uint32_t MAX_PTR = UINT32_MAX;
+
+  uint32_t lineNumberFromIndex(uint32_t index) const {
+    return index + initialLineNum_;
+  }
+
+  uint32_t indexFromLineNumber(uint32_t lineNum) const {
+    return lineNum - initialLineNum_;
+  }
+
+ public:
+  SourceCoords(FrontendContext* fc, uint32_t initialLineNumber,
+               uint32_t initialOffset);
+
+  [[nodiscard]] bool add(uint32_t lineNum, uint32_t lineStartOffset);
+  [[nodiscard]] bool fill(const SourceCoords& other);
+
+  std::optional<bool> isOnThisLine(uint32_t offset, uint32_t lineNum) const {
+    uint32_t index = indexFromLineNumber(lineNum);
+    if (index + 1 >= lineStartOffsets_.length()) {  
+      return std::nullopt;
+    }
+    return (lineStartOffsets_[index] <= offset &&
+            offset < lineStartOffsets_[index + 1]);
+  }
+
+  class LineToken {
+    uint32_t index;
+#ifdef DEBUG
+    uint32_t offset_;  
+#endif
+
+    friend class SourceCoords;
+
+   public:
+    LineToken(uint32_t index, uint32_t offset)
+        : index(index)
+#ifdef DEBUG
+          ,
+          offset_(offset)
+#endif
+    {
+    }
+
+    bool isFirstLine() const { return index == 0; }
+
+    bool isSameLine(LineToken other) const { return index == other.index; }
+
+    void assertConsistentOffset(uint32_t offset) const {
+      MOZ_ASSERT(offset_ == offset);
+    }
+  };
+
+  LineToken lineToken(uint32_t offset) const;
+
+  uint32_t lineNumber(LineToken lineToken) const {
+    return lineNumberFromIndex(lineToken.index);
+  }
+
+  uint32_t lineStart(LineToken lineToken) const {
+    MOZ_ASSERT(lineToken.index + 1 < lineStartOffsets_.length(),
+               "recorded line-start information must be available");
+    return lineStartOffsets_[lineToken.index];
+  }
+};
+
+enum class UnitsType : unsigned char {
+  PossiblyMultiUnit = 0,
+  GuaranteedSingleUnit = 1,
+};
+
+class ChunkInfo {
+ private:
+  unsigned char columnOffset_[sizeof(uint32_t)];
+  unsigned char unitsType_;
+
+ public:
+  ChunkInfo(JS::ColumnNumberUnsignedOffset offset, UnitsType type)
+      : unitsType_(static_cast<unsigned char>(type)) {
+    memcpy(columnOffset_, offset.addressOfValueForTranscode(), sizeof(offset));
+  }
+
+  JS::ColumnNumberUnsignedOffset columnOffset() const {
+    JS::ColumnNumberUnsignedOffset offset;
+    memcpy(offset.addressOfValueForTranscode(), columnOffset_,
+           sizeof(uint32_t));
+    return offset;
+  }
+
+  UnitsType unitsType() const {
+    MOZ_ASSERT(unitsType_ <= 1, "unitsType_ must be 0 or 1");
+    return static_cast<UnitsType>(unitsType_);
+  }
+
+  void guaranteeSingleUnits() {
+    MOZ_ASSERT(unitsType() == UnitsType::PossiblyMultiUnit,
+               "should only be setting to possibly optimize from the "
+               "pessimistic case");
+    unitsType_ = static_cast<unsigned char>(UnitsType::GuaranteedSingleUnit);
+  }
+};
+
+enum class InvalidEscapeType {
+  None,
+  Hexadecimal,
+  Unicode,
+  UnicodeOverflow,
+  Octal,
+  EightOrNine
+};
+
+class TokenStreamAnyChars : public TokenStreamShared {
+ private:
+
+  FrontendContext* const fc;
+
+  const JS::ReadOnlyCompileOptions& options_;
+
+  StrictModeGetter* const strictModeGetter_;
+
+  JS::ConstUTF8CharsZ filename_;
+
+
+  mutable HashMap<uint32_t, Vector<ChunkInfo>> longLineColumnInfo_;
+
+
+  mutable uint32_t lineOfLastColumnComputation_ = UINT32_MAX;
+
+  mutable Vector<ChunkInfo>* lastChunkVectorForLine_ = nullptr;
+
+  mutable uint32_t lastOffsetOfComputedColumn_ = UINT32_MAX;
+
+  mutable JS::ColumnNumberUnsignedOffset lastComputedColumnOffset_;
+
+
+  uint32_t invalidTemplateEscapeOffset = 0;
+
+  InvalidEscapeType invalidTemplateEscapeType = InvalidEscapeType::None;
+
+
+  SourceCoords srcCoords;
+
+  Token tokens[ntokens] = {};
+
+  unsigned cursor_ = 0;
+
+  unsigned lookahead = 0;
+
+  unsigned lineno;
+
+  TokenStreamFlags flags = {};
+
+  size_t linebase = 0;
+
+  size_t prevLinebase = size_t(-1);
+
+  UniqueTwoByteChars displayURL_ = nullptr;
+
+  UniqueTwoByteChars sourceMapURL_ = nullptr;
+
+
+  const bool mutedErrors;
+
+  bool isExprEnding[size_t(TokenKind::Limit)] = {};  
+
+
+ public:
+  TokenStreamAnyChars(FrontendContext* fc,
+                      const JS::ReadOnlyCompileOptions& options,
+                      StrictModeGetter* smg);
+
+  template <typename Unit, class AnyCharsAccess>
+  friend class GeneralTokenStreamChars;
+  template <typename Unit, class AnyCharsAccess>
+  friend class TokenStreamChars;
+  template <typename Unit, class AnyCharsAccess>
+  friend class TokenStreamSpecific;
+
+  template <typename Unit>
+  friend class TokenStreamPosition;
+
+  unsigned cursor() const { return cursor_; }
+  unsigned nextCursor() const { return (cursor_ + 1) & ntokensMask; }
+  unsigned aheadCursor(unsigned steps) const {
+    return (cursor_ + steps) & ntokensMask;
+  }
+
+  const Token& currentToken() const { return tokens[cursor()]; }
+  bool isCurrentTokenType(TokenKind type) const {
+    return currentToken().type == type;
+  }
+
+  [[nodiscard]] bool checkOptions();
+
+ private:
+  TaggedParserAtomIndex reservedWordToPropertyName(TokenKind tt) const;
+
+ public:
+  TaggedParserAtomIndex currentName() const {
+    if (isCurrentTokenType(TokenKind::Name) ||
+        isCurrentTokenType(TokenKind::PrivateName)) {
+      return currentToken().name();
+    }
+
+    MOZ_ASSERT(TokenKindIsPossibleIdentifierName(currentToken().type));
+    return reservedWordToPropertyName(currentToken().type);
+  }
+
+  bool currentNameHasEscapes(ParserAtomsTable& parserAtoms) const {
+    if (isCurrentTokenType(TokenKind::Name) ||
+        isCurrentTokenType(TokenKind::PrivateName)) {
+      TokenPos pos = currentToken().pos;
+      return (pos.end - pos.begin) != parserAtoms.length(currentToken().name());
+    }
+
+    MOZ_ASSERT(TokenKindIsPossibleIdentifierName(currentToken().type));
+    return false;
+  }
+
+  bool isCurrentTokenAssignment() const {
+    return TokenKindIsAssignment(currentToken().type);
+  }
+
+  bool isEOF() const { return flags.isEOF; }
+  bool hadError() const { return flags.hadError; }
+
+  DeprecatedContent sawDeprecatedContent() const {
+    return static_cast<DeprecatedContent>(flags.sawDeprecatedContent);
+  }
+
+ private:
+  void setSawDeprecatedContent(DeprecatedContent content) {
+    flags.sawDeprecatedContent = static_cast<uint8_t>(content);
+  }
+
+ public:
+  void clearSawDeprecatedContent() {
+    setSawDeprecatedContent(DeprecatedContent::None);
+  }
+  void setSawDeprecatedOctalLiteral() {
+    setSawDeprecatedContent(DeprecatedContent::OctalLiteral);
+  }
+  void setSawDeprecatedOctalEscape() {
+    setSawDeprecatedContent(DeprecatedContent::OctalEscape);
+  }
+  void setSawDeprecatedEightOrNineEscape() {
+    setSawDeprecatedContent(DeprecatedContent::EightOrNineEscape);
+  }
+
+  bool hasInvalidTemplateEscape() const {
+    return invalidTemplateEscapeType != InvalidEscapeType::None;
+  }
+  void clearInvalidTemplateEscape() {
+    invalidTemplateEscapeType = InvalidEscapeType::None;
+  }
+
+ private:
+  bool strictMode() const {
+    return strictModeGetter_ && strictModeGetter_->strictMode();
+  }
+
+  void setInvalidTemplateEscape(uint32_t offset, InvalidEscapeType type) {
+    MOZ_ASSERT(type != InvalidEscapeType::None);
+    if (invalidTemplateEscapeType != InvalidEscapeType::None) {
+      return;
+    }
+    invalidTemplateEscapeOffset = offset;
+    invalidTemplateEscapeType = type;
+  }
+
+ public:
+  void allowGettingNextTokenWithSlashIsRegExp() {
+#ifdef DEBUG
+    MOZ_ASSERT(hasLookahead());
+    const Token& next = nextToken();
+    MOZ_ASSERT(next.modifier == SlashIsDiv);
+    MOZ_ASSERT(next.type != TokenKind::Div);
+    tokens[nextCursor()].modifier = SlashIsRegExp;
+#endif
+  }
+
+#ifdef DEBUG
+  inline bool debugHasNoLookahead() const { return lookahead == 0; }
+#endif
+
+  bool hasDisplayURL() const { return displayURL_ != nullptr; }
+
+  char16_t* displayURL() { return displayURL_.get(); }
+
+  bool hasSourceMapURL() const { return sourceMapURL_ != nullptr; }
+
+  char16_t* sourceMapURL() { return sourceMapURL_.get(); }
+
+  FrontendContext* context() const { return fc; }
+
+  using LineToken = SourceCoords::LineToken;
+
+  LineToken lineToken(uint32_t offset) const {
+    return srcCoords.lineToken(offset);
+  }
+
+  uint32_t lineNumber(LineToken lineToken) const {
+    return srcCoords.lineNumber(lineToken);
+  }
+
+  uint32_t lineStart(LineToken lineToken) const {
+    return srcCoords.lineStart(lineToken);
+  }
+
+  bool fillExceptingContext(ErrorMetadata* err, uint32_t offset) const;
+
+  MOZ_ALWAYS_INLINE void updateFlagsForEOL() { flags.isDirtyLine = false; }
+
+ private:
+  template <typename Unit>
+  JS::ColumnNumberUnsignedOffset computeColumnOffset(
+      const LineToken lineToken, const uint32_t offset,
+      const SourceUnits<Unit>& sourceUnits) const;
+
+  template <typename Unit>
+  JS::ColumnNumberUnsignedOffset computeColumnOffsetForUTF8(
+      const LineToken lineToken, const uint32_t offset, const uint32_t start,
+      const uint32_t offsetInLine, const SourceUnits<Unit>& sourceUnits) const;
+
+  [[nodiscard]] MOZ_ALWAYS_INLINE bool internalUpdateLineInfoForEOL(
+      uint32_t lineStartOffset);
+
+ public:
+  const Token& nextToken() const {
+    MOZ_ASSERT(hasLookahead());
+    return tokens[nextCursor()];
+  }
+
+  bool hasLookahead() const { return lookahead > 0; }
+
+  void advanceCursor() { cursor_ = (cursor_ + 1) & ntokensMask; }
+
+  void retractCursor() { cursor_ = (cursor_ - 1) & ntokensMask; }
+
+  Token* allocateToken() {
+    advanceCursor();
+
+    Token* tp = &tokens[cursor()];
+    MOZ_MAKE_MEM_UNDEFINED(tp, sizeof(*tp));
+
+    return tp;
+  }
+
+  void ungetToken() {
+    MOZ_ASSERT(lookahead < maxLookahead);
+    lookahead++;
+    retractCursor();
+  }
+
+ public:
+  void adoptState(TokenStreamAnyChars& other) {
+    if (auto& url = other.displayURL_) {
+      displayURL_ = std::move(url);
+    }
+    if (auto& url = other.sourceMapURL_) {
+      sourceMapURL_ = std::move(url);
+    }
+  }
+
+  void computeErrorMetadataNoOffset(ErrorMetadata* err) const;
+
+
+  void reportErrorNoOffset(unsigned errorNumber, ...) const;
+  void reportErrorNoOffsetVA(unsigned errorNumber, va_list* args) const;
+
+  const JS::ReadOnlyCompileOptions& options() const { return options_; }
+
+  JS::ConstUTF8CharsZ getFilename() const { return filename_; }
+};
+
+constexpr char16_t CodeUnitValue(char16_t unit) { return unit; }
+
+constexpr uint8_t CodeUnitValue(mozilla::Utf8Unit unit) {
+  return unit.toUint8();
+}
+
+template <typename Unit>
+class TokenStreamCharsBase;
+
+template <typename T>
+inline bool IsLineTerminator(T) = delete;
+
+inline bool IsLineTerminator(char32_t codePoint) {
+  return codePoint == '\n' || codePoint == '\r' ||
+         codePoint == unicode::LINE_SEPARATOR ||
+         codePoint == unicode::PARA_SEPARATOR;
+}
+
+inline bool IsLineTerminator(char16_t unit) {
+  return IsLineTerminator(static_cast<char32_t>(unit));
+}
+
+template <typename Unit>
+struct SourceUnitTraits;
+
+template <>
+struct SourceUnitTraits<char16_t> {
+ public:
+  static constexpr uint8_t maxUnitsLength = 2;
+
+  static constexpr size_t lengthInUnits(char32_t codePoint) {
+    return codePoint < unicode::NonBMPMin ? 1 : 2;
+  }
+};
+
+template <>
+struct SourceUnitTraits<mozilla::Utf8Unit> {
+ public:
+  static constexpr uint8_t maxUnitsLength = 4;
+
+  static constexpr size_t lengthInUnits(char32_t codePoint) {
+    return codePoint < 0x80      ? 1
+           : codePoint < 0x800   ? 2
+           : codePoint < 0x10000 ? 3
+                                 : 4;
+  }
+};
+
+template <typename Unit>
+class PeekedCodePoint final {
+  char32_t codePoint_ = 0;
+  uint8_t lengthInUnits_ = 0;
+
+ private:
+  using SourceUnitTraits = frontend::SourceUnitTraits<Unit>;
+
+  PeekedCodePoint() = default;
+
+ public:
+  PeekedCodePoint(char32_t codePoint, uint8_t lengthInUnits)
+      : codePoint_(codePoint), lengthInUnits_(lengthInUnits) {
+    MOZ_ASSERT(codePoint <= unicode::NonBMPMax);
+    MOZ_ASSERT(lengthInUnits != 0, "bad code point length");
+    MOZ_ASSERT(lengthInUnits == SourceUnitTraits::lengthInUnits(codePoint));
+  }
+
+  static PeekedCodePoint none() { return PeekedCodePoint(); }
+
+  bool isNone() const { return lengthInUnits_ == 0; }
+
+  char32_t codePoint() const {
+    MOZ_ASSERT(!isNone());
+    return codePoint_;
+  }
+
+  uint8_t lengthInUnits() const {
+    MOZ_ASSERT(!isNone());
+    return lengthInUnits_;
+  }
+};
+
+inline PeekedCodePoint<char16_t> PeekCodePoint(const char16_t* const ptr,
+                                               const char16_t* const end) {
+  if (MOZ_UNLIKELY(ptr >= end)) {
+    return PeekedCodePoint<char16_t>::none();
+  }
+
+  char16_t lead = ptr[0];
+
+  char32_t c;
+  uint8_t len;
+  if (MOZ_LIKELY(!unicode::IsLeadSurrogate(lead)) ||
+      MOZ_UNLIKELY(ptr + 1 >= end || !unicode::IsTrailSurrogate(ptr[1]))) {
+    c = lead;
+    len = 1;
+  } else {
+    c = unicode::UTF16Decode(lead, ptr[1]);
+    len = 2;
+  }
+
+  return PeekedCodePoint<char16_t>(c, len);
+}
+
+inline PeekedCodePoint<mozilla::Utf8Unit> PeekCodePoint(
+    const mozilla::Utf8Unit* const ptr, const mozilla::Utf8Unit* const end) {
+  if (MOZ_UNLIKELY(ptr >= end)) {
+    return PeekedCodePoint<mozilla::Utf8Unit>::none();
+  }
+
+  const mozilla::Utf8Unit lead = ptr[0];
+  if (mozilla::IsAscii(lead)) {
+    return PeekedCodePoint<mozilla::Utf8Unit>(lead.toUint8(), 1);
+  }
+
+  const mozilla::Utf8Unit* afterLead = ptr + 1;
+  mozilla::Maybe<char32_t> codePoint =
+      mozilla::DecodeOneUtf8CodePoint(lead, &afterLead, end);
+  if (codePoint.isNothing()) {
+    return PeekedCodePoint<mozilla::Utf8Unit>::none();
+  }
+
+  auto len =
+      mozilla::AssertedCast<uint8_t>(mozilla::PointerRangeSize(ptr, afterLead));
+  MOZ_ASSERT(len <= 4);
+
+  return PeekedCodePoint<mozilla::Utf8Unit>(codePoint.value(), len);
+}
+
+inline bool IsSingleUnitLineTerminator(mozilla::Utf8Unit unit) {
+  return unit == mozilla::Utf8Unit('\n') || unit == mozilla::Utf8Unit('\r');
+}
+
+template <typename Unit>
+class SourceUnits {
+ private:
+  const Unit* base_;
+
+  uint32_t startOffset_;
+
+  const Unit* limit_;
+
+  const Unit* ptr;
+
+ public:
+  SourceUnits(const Unit* units, size_t length, size_t startOffset)
+      : base_(units),
+        startOffset_(startOffset),
+        limit_(units + length),
+        ptr(units) {}
+
+  bool atStart() const {
+    MOZ_ASSERT(!isPoisoned(), "shouldn't be using if poisoned");
+    return ptr == base_;
+  }
+
+  bool atEnd() const {
+    MOZ_ASSERT(!isPoisoned(), "shouldn't be using if poisoned");
+    MOZ_ASSERT(ptr <= limit_, "shouldn't have overrun");
+    return ptr >= limit_;
+  }
+
+  size_t remaining() const {
+    MOZ_ASSERT(!isPoisoned(),
+               "can't get a count of remaining code units if poisoned");
+    return mozilla::PointerRangeSize(ptr, limit_);
+  }
+
+  size_t startOffset() const { return startOffset_; }
+
+  size_t offset() const {
+    return startOffset_ + mozilla::PointerRangeSize(base_, ptr);
+  }
+
+  const Unit* codeUnitPtrAt(size_t offset) const {
+    MOZ_ASSERT(!isPoisoned(), "shouldn't be using if poisoned");
+    MOZ_ASSERT(startOffset_ <= offset);
+    MOZ_ASSERT(offset - startOffset_ <=
+               mozilla::PointerRangeSize(base_, limit_));
+    return base_ + (offset - startOffset_);
+  }
+
+  const Unit* current() const { return ptr; }
+
+  const Unit* limit() const { return limit_; }
+
+  Unit previousCodeUnit() {
+    MOZ_ASSERT(!isPoisoned(), "can't get previous code unit if poisoned");
+    MOZ_ASSERT(!atStart(), "must have a previous code unit to get");
+    return *(ptr - 1);
+  }
+
+  MOZ_ALWAYS_INLINE Unit getCodeUnit() {
+    return *ptr++;  
+  }
+
+  Unit peekCodeUnit() const {
+    return *ptr;  
+  }
+
+  PeekedCodePoint<Unit> peekCodePoint() const {
+    return PeekCodePoint(ptr, limit_);
+  }
+
+ private:
+#ifdef DEBUG
+  void assertNextCodePoint(const PeekedCodePoint<Unit>& peeked);
+#endif
+
+ public:
+  void consumeKnownCodePoint(const PeekedCodePoint<Unit>& peeked) {
+    MOZ_ASSERT(!peeked.isNone());
+    MOZ_ASSERT(peeked.lengthInUnits() <= remaining());
+
+#ifdef DEBUG
+    assertNextCodePoint(peeked);
+#endif
+
+    ptr += peeked.lengthInUnits();
+  }
+
+  bool matchHexDigits(uint8_t n, char16_t* out) {
+    MOZ_ASSERT(!isPoisoned(), "shouldn't peek into poisoned SourceUnits");
+    MOZ_ASSERT(n <= 4, "hexdigit value can't overflow char16_t");
+    if (n > remaining()) {
+      return false;
+    }
+
+    char16_t v = 0;
+    for (uint8_t i = 0; i < n; i++) {
+      auto unit = CodeUnitValue(ptr[i]);
+      if (!mozilla::IsAsciiHexDigit(unit)) {
+        return false;
+      }
+
+      v = (v << 4) | mozilla::AsciiAlphanumericToNumber(unit);
+    }
+
+    *out = v;
+    ptr += n;
+    return true;
+  }
+
+  bool matchCodeUnits(const char* chars, uint8_t length) {
+    MOZ_ASSERT(!isPoisoned(), "shouldn't match into poisoned SourceUnits");
+    if (length > remaining()) {
+      return false;
+    }
+
+    const Unit* start = ptr;
+    const Unit* end = ptr + length;
+    while (ptr < end) {
+      if (*ptr++ != Unit(*chars++)) {
+        ptr = start;
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  void skipCodeUnits(uint32_t n) {
+    MOZ_ASSERT(!isPoisoned(), "shouldn't use poisoned SourceUnits");
+    MOZ_ASSERT(n <= remaining(), "shouldn't skip beyond end of SourceUnits");
+    ptr += n;
+  }
+
+  void unskipCodeUnits(uint32_t n) {
+    MOZ_ASSERT(!isPoisoned(), "shouldn't use poisoned SourceUnits");
+    MOZ_ASSERT(n <= mozilla::PointerRangeSize(base_, ptr),
+               "shouldn't unskip beyond start of SourceUnits");
+    ptr -= n;
+  }
+
+ private:
+  friend class TokenStreamCharsBase<Unit>;
+
+  bool internalMatchCodeUnit(Unit c) {
+    MOZ_ASSERT(!isPoisoned(), "shouldn't use poisoned SourceUnits");
+    if (MOZ_LIKELY(!atEnd()) && *ptr == c) {
+      ptr++;
+      return true;
+    }
+    return false;
+  }
+
+ public:
+  void consumeKnownCodeUnit(Unit c) {
+    MOZ_ASSERT(!isPoisoned(), "shouldn't use poisoned SourceUnits");
+    MOZ_ASSERT(*ptr == c, "consuming the wrong code unit");
+    ptr++;
+  }
+
+  inline void ungetLineOrParagraphSeparator();
+
+  void ungetCodeUnit() {
+    MOZ_ASSERT(!isPoisoned(), "can't unget from poisoned units");
+    MOZ_ASSERT(!atStart(), "can't unget if currently at start");
+    ptr--;
+  }
+
+  const Unit* addressOfNextCodeUnit(bool allowPoisoned = false) const {
+    MOZ_ASSERT_IF(!allowPoisoned, !isPoisoned());
+    return ptr;
+  }
+
+  void setAddressOfNextCodeUnit(const Unit* a, bool allowPoisoned = false) {
+    MOZ_ASSERT_IF(!allowPoisoned, a);
+    ptr = a;
+  }
+
+  void poisonInDebug() {
+#ifdef DEBUG
+    ptr = nullptr;
+#endif
+  }
+
+ private:
+  bool isPoisoned() const {
+#ifdef DEBUG
+    return ptr == nullptr && ptr != limit_;
+#else
+    return false;
+#endif
+  }
+
+ public:
+  void consumeRestOfSingleLineComment();
+
+  static constexpr size_t WindowRadius = ErrorMetadata::lineOfContextRadius;
+
+  size_t findWindowStart(size_t offset) const;
+
+  size_t findWindowEnd(size_t offset) const;
+
+  inline void computeWindowOffsetAndLength(const Unit* encodeWindow,
+                                           size_t encodingSpecificTokenOffset,
+                                           size_t* utf16TokenOffset,
+                                           size_t encodingSpecificWindowLength,
+                                           size_t* utf16WindowLength) const;
+};
+
+template <>
+inline void SourceUnits<char16_t>::ungetLineOrParagraphSeparator() {
+#ifdef DEBUG
+  char16_t prev = previousCodeUnit();
+#endif
+  MOZ_ASSERT(prev == unicode::LINE_SEPARATOR ||
+             prev == unicode::PARA_SEPARATOR);
+
+  ungetCodeUnit();
+}
+
+template <>
+inline void SourceUnits<mozilla::Utf8Unit>::ungetLineOrParagraphSeparator() {
+  unskipCodeUnits(3);
+
+  MOZ_ASSERT(ptr[0].toUint8() == 0xE2);
+  MOZ_ASSERT(ptr[1].toUint8() == 0x80);
+
+#ifdef DEBUG
+  uint8_t last = ptr[2].toUint8();
+#endif
+  MOZ_ASSERT(last == 0xA8 || last == 0xA9);
+}
+
+using CharBuffer = Vector<char16_t, 32>;
+
+[[nodiscard]] extern bool AppendCodePointToCharBuffer(CharBuffer& charBuffer,
+                                                      char32_t codePoint);
+
+[[nodiscard]] extern bool FillCharBufferFromSourceNormalizingAsciiLineBreaks(
+    CharBuffer& charBuffer, const char16_t* cur, const char16_t* end);
+
+[[nodiscard]] extern bool FillCharBufferFromSourceNormalizingAsciiLineBreaks(
+    CharBuffer& charBuffer, const mozilla::Utf8Unit* cur,
+    const mozilla::Utf8Unit* end);
+
+class TokenStreamCharsShared {
+ protected:
+  FrontendContext* fc;
+
+  CharBuffer charBuffer;
+
+  ParserAtomsTable* parserAtoms;
+
+ protected:
+  explicit TokenStreamCharsShared(FrontendContext* fc,
+                                  ParserAtomsTable* parserAtoms)
+      : fc(fc), charBuffer(fc), parserAtoms(parserAtoms) {}
+
+  [[nodiscard]] bool copyCharBufferTo(
+      UniquePtr<char16_t[], JS::FreePolicy>* destination);
+
+  [[nodiscard]] static constexpr MOZ_ALWAYS_INLINE bool isAsciiCodePoint(
+      int32_t unit) {
+    return mozilla::IsAscii(static_cast<char32_t>(unit));
+  }
+
+  TaggedParserAtomIndex drainCharBufferIntoAtom() {
+    auto atom = this->parserAtoms->internChar16(fc, charBuffer.begin(),
+                                                charBuffer.length());
+    charBuffer.clear();
+    return atom;
+  }
+
+ protected:
+  void adoptState(TokenStreamCharsShared& other) {
+    charBuffer = std::move(other.charBuffer);
+  }
+
+ public:
+  CharBuffer& getCharBuffer() { return charBuffer; }
+};
+
+template <typename Unit>
+class TokenStreamCharsBase : public TokenStreamCharsShared {
+ protected:
+  using SourceUnits = frontend::SourceUnits<Unit>;
+
+  SourceUnits sourceUnits;
+
+
+ protected:
+  TokenStreamCharsBase(FrontendContext* fc, ParserAtomsTable* parserAtoms,
+                       const Unit* units, size_t length, size_t startOffset);
+
+  inline Unit toUnit(int32_t codeUnitValue);
+
+  void ungetCodeUnit(int32_t c) {
+    if (c == EOF) {
+      MOZ_ASSERT(sourceUnits.atEnd());
+      return;
+    }
+
+    MOZ_ASSERT(sourceUnits.previousCodeUnit() == toUnit(c));
+    sourceUnits.ungetCodeUnit();
+  }
+
+  MOZ_ALWAYS_INLINE TaggedParserAtomIndex
+  atomizeSourceChars(mozilla::Span<const Unit> units);
+
+  bool matchCodeUnit(char expect) {
+    MOZ_ASSERT(mozilla::IsAscii(expect));
+    MOZ_ASSERT(expect != '\r');
+    MOZ_ASSERT(expect != '\n');
+    return this->sourceUnits.internalMatchCodeUnit(Unit(expect));
+  }
+
+  MOZ_NEVER_INLINE bool matchLineTerminator(char expect) {
+    MOZ_ASSERT(expect == '\r' || expect == '\n');
+    return this->sourceUnits.internalMatchCodeUnit(Unit(expect));
+  }
+
+  int32_t peekCodeUnit() {
+    return MOZ_LIKELY(!sourceUnits.atEnd())
+               ? CodeUnitValue(sourceUnits.peekCodeUnit())
+               : EOF;
+  }
+
+  inline void consumeKnownCodeUnit(int32_t unit);
+
+  [[nodiscard]] bool addLineOfContext(ErrorMetadata* err,
+                                      uint32_t offset) const;
+
+ public:
+  template <typename T>
+  bool matchCodeUnit(T) = delete;
+  template <typename T>
+  bool matchLineTerminator(T) = delete;
+
+  template <typename T>
+  inline void consumeKnownCodeUnit(T) = delete;
+};
+
+template <>
+inline char16_t TokenStreamCharsBase<char16_t>::toUnit(int32_t codeUnitValue) {
+  MOZ_ASSERT(codeUnitValue != EOF, "EOF is not a Unit");
+  return mozilla::AssertedCast<char16_t>(codeUnitValue);
+}
+
+template <>
+inline mozilla::Utf8Unit TokenStreamCharsBase<mozilla::Utf8Unit>::toUnit(
+    int32_t value) {
+  MOZ_ASSERT(value != EOF, "EOF is not a Unit");
+  return mozilla::Utf8Unit(mozilla::AssertedCast<unsigned char>(value));
+}
+
+template <typename Unit>
+inline void TokenStreamCharsBase<Unit>::consumeKnownCodeUnit(int32_t unit) {
+  sourceUnits.consumeKnownCodeUnit(toUnit(unit));
+}
+
+template <>
+MOZ_ALWAYS_INLINE TaggedParserAtomIndex
+TokenStreamCharsBase<char16_t>::atomizeSourceChars(
+    mozilla::Span<const char16_t> units) {
+  return this->parserAtoms->internChar16(fc, units.data(), units.size());
+}
+
+template <>
+ MOZ_ALWAYS_INLINE TaggedParserAtomIndex
+TokenStreamCharsBase<mozilla::Utf8Unit>::atomizeSourceChars(
+    mozilla::Span<const mozilla::Utf8Unit> units) {
+  return this->parserAtoms->internUtf8(fc, units.data(), units.size());
+}
+
+template <typename Unit>
+class SpecializedTokenStreamCharsBase;
+
+template <>
+class SpecializedTokenStreamCharsBase<char16_t>
+    : public TokenStreamCharsBase<char16_t> {
+  using CharsBase = TokenStreamCharsBase<char16_t>;
+
+ protected:
+  using TokenStreamCharsShared::isAsciiCodePoint;
+
+  using typename CharsBase::SourceUnits;
+
+ protected:
+
+  char32_t infallibleGetNonAsciiCodePointDontNormalize(char16_t lead) {
+    MOZ_ASSERT(!isAsciiCodePoint(lead));
+    MOZ_ASSERT(this->sourceUnits.previousCodeUnit() == lead);
+
+    if (MOZ_LIKELY(!unicode::IsLeadSurrogate(lead)) ||
+        MOZ_UNLIKELY(
+            this->sourceUnits.atEnd() ||
+            !unicode::IsTrailSurrogate(this->sourceUnits.peekCodeUnit()))) {
+      return lead;
+    }
+
+    return unicode::UTF16Decode(lead, this->sourceUnits.getCodeUnit());
+  }
+
+ protected:
+
+  using CharsBase::CharsBase;
+};
+
+template <>
+class SpecializedTokenStreamCharsBase<mozilla::Utf8Unit>
+    : public TokenStreamCharsBase<mozilla::Utf8Unit> {
+  using CharsBase = TokenStreamCharsBase<mozilla::Utf8Unit>;
+
+ protected:
+
+ protected:
+
+  using typename CharsBase::SourceUnits;
+
+  class SourceUnitsIterator {
+    SourceUnits& sourceUnits_;
+#ifdef DEBUG
+    mutable mozilla::Maybe<const mozilla::Utf8Unit*>
+        currentBeforePostIncrement_;
+#endif
+
+   public:
+    explicit SourceUnitsIterator(SourceUnits& sourceUnits)
+        : sourceUnits_(sourceUnits) {}
+
+    mozilla::Utf8Unit operator*() const {
+      MOZ_ASSERT(currentBeforePostIncrement_.value() + 1 ==
+                 sourceUnits_.current());
+#ifdef DEBUG
+      currentBeforePostIncrement_.reset();
+#endif
+      return sourceUnits_.previousCodeUnit();
+    }
+
+    SourceUnitsIterator operator++(int) {
+      MOZ_ASSERT(currentBeforePostIncrement_.isNothing(),
+                 "the only valid operation on a post-incremented "
+                 "iterator is dereferencing a single time");
+
+      SourceUnitsIterator copy = *this;
+#ifdef DEBUG
+      copy.currentBeforePostIncrement_.emplace(sourceUnits_.current());
+#endif
+
+      sourceUnits_.getCodeUnit();
+      return copy;
+    }
+
+    void operator-=(size_t n) {
+      MOZ_ASSERT(currentBeforePostIncrement_.isNothing(),
+                 "the only valid operation on a post-incremented "
+                 "iterator is dereferencing a single time");
+      sourceUnits_.unskipCodeUnits(n);
+    }
+
+    mozilla::Utf8Unit operator[](ptrdiff_t index) {
+      MOZ_ASSERT(currentBeforePostIncrement_.isNothing(),
+                 "the only valid operation on a post-incremented "
+                 "iterator is dereferencing a single time");
+      MOZ_ASSERT(index == -1,
+                 "must only be called to verify the value of the "
+                 "previous code unit");
+      return sourceUnits_.previousCodeUnit();
+    }
+
+    size_t remaining() const {
+      MOZ_ASSERT(currentBeforePostIncrement_.isNothing(),
+                 "the only valid operation on a post-incremented "
+                 "iterator is dereferencing a single time");
+      return sourceUnits_.remaining();
+    }
+  };
+
+  class SourceUnitsEnd {};
+
+  friend inline size_t operator-(const SourceUnitsEnd& aEnd,
+                                 const SourceUnitsIterator& aIter);
+
+ protected:
+
+  using CharsBase::CharsBase;
+};
+
+inline size_t operator-(const SpecializedTokenStreamCharsBase<
+                            mozilla::Utf8Unit>::SourceUnitsEnd& aEnd,
+                        const SpecializedTokenStreamCharsBase<
+                            mozilla::Utf8Unit>::SourceUnitsIterator& aIter) {
+  return aIter.remaining();
+}
+
+class TokenStart {
+  uint32_t startOffset_;
+
+ public:
+  template <class SourceUnits>
+  TokenStart(const SourceUnits& sourceUnits, ptrdiff_t adjust)
+      : startOffset_(sourceUnits.offset() + adjust) {}
+
+  TokenStart(const TokenStart&) = default;
+
+  uint32_t offset() const { return startOffset_; }
+};
+
+template <typename Unit, class AnyCharsAccess>
+class GeneralTokenStreamChars : public SpecializedTokenStreamCharsBase<Unit> {
+  using CharsBase = TokenStreamCharsBase<Unit>;
+  using SpecializedCharsBase = SpecializedTokenStreamCharsBase<Unit>;
+
+  using LineToken = TokenStreamAnyChars::LineToken;
+
+ private:
+  Token* newTokenInternal(TokenKind kind, TokenStart start, TokenKind* out);
+
+  Token* newToken(TokenKind kind, TokenStart start,
+                  TokenStreamShared::Modifier modifier, TokenKind* out) {
+    Token* token = newTokenInternal(kind, start, out);
+
+#ifdef DEBUG
+    token->modifier = modifier;
+#endif
+
+    return token;
+  }
+
+  uint32_t matchUnicodeEscape(char32_t* codePoint);
+  uint32_t matchExtendedUnicodeEscape(char32_t* codePoint);
+
+ protected:
+  using CharsBase::addLineOfContext;
+  using CharsBase::matchCodeUnit;
+  using CharsBase::matchLineTerminator;
+  using TokenStreamCharsShared::drainCharBufferIntoAtom;
+  using TokenStreamCharsShared::isAsciiCodePoint;
+  using CharsBase::toUnit;
+
+  using typename CharsBase::SourceUnits;
+
+ protected:
+  using SpecializedCharsBase::SpecializedCharsBase;
+
+  TokenStreamAnyChars& anyCharsAccess() {
+    return AnyCharsAccess::anyChars(this);
+  }
+
+  const TokenStreamAnyChars& anyCharsAccess() const {
+    return AnyCharsAccess::anyChars(this);
+  }
+
+  using TokenStreamSpecific =
+      frontend::TokenStreamSpecific<Unit, AnyCharsAccess>;
+
+  TokenStreamSpecific* asSpecific() {
+    static_assert(
+        std::is_base_of_v<GeneralTokenStreamChars, TokenStreamSpecific>,
+        "static_cast below presumes an inheritance relationship");
+
+    return static_cast<TokenStreamSpecific*>(this);
+  }
+
+ protected:
+  JS::LimitedColumnNumberOneOrigin computeColumn(LineToken lineToken,
+                                                 uint32_t offset) const;
+  void computeLineAndColumn(uint32_t offset, uint32_t* line,
+                            JS::LimitedColumnNumberOneOrigin* column) const;
+
+  [[nodiscard]] bool fillExceptingContext(ErrorMetadata* err,
+                                          uint32_t offset) const {
+    if (anyCharsAccess().fillExceptingContext(err, offset)) {
+      JS::LimitedColumnNumberOneOrigin columnNumber;
+      computeLineAndColumn(offset, &err->lineNumber, &columnNumber);
+      err->columnNumber = JS::ColumnNumberOneOrigin(columnNumber);
+      return true;
+    }
+    return false;
+  }
+
+  void newSimpleToken(TokenKind kind, TokenStart start,
+                      TokenStreamShared::Modifier modifier, TokenKind* out) {
+    newToken(kind, start, modifier, out);
+  }
+
+  void newNumberToken(double dval, DecimalPoint decimalPoint, TokenStart start,
+                      TokenStreamShared::Modifier modifier, TokenKind* out) {
+    Token* token = newToken(TokenKind::Number, start, modifier, out);
+    token->setNumber(dval, decimalPoint);
+  }
+
+  void newBigIntToken(TokenStart start, TokenStreamShared::Modifier modifier,
+                      TokenKind* out) {
+    newToken(TokenKind::BigInt, start, modifier, out);
+  }
+
+  void newAtomToken(TokenKind kind, TaggedParserAtomIndex atom,
+                    TokenStart start, TokenStreamShared::Modifier modifier,
+                    TokenKind* out) {
+    MOZ_ASSERT(kind == TokenKind::String || kind == TokenKind::TemplateHead ||
+               kind == TokenKind::NoSubsTemplate);
+
+    Token* token = newToken(kind, start, modifier, out);
+    token->setAtom(atom);
+  }
+
+  void newNameToken(TaggedParserAtomIndex name, TokenStart start,
+                    TokenStreamShared::Modifier modifier, TokenKind* out) {
+    Token* token = newToken(TokenKind::Name, start, modifier, out);
+    token->setName(name);
+  }
+
+  void newPrivateNameToken(TaggedParserAtomIndex name, TokenStart start,
+                           TokenStreamShared::Modifier modifier,
+                           TokenKind* out) {
+    Token* token = newToken(TokenKind::PrivateName, start, modifier, out);
+    token->setName(name);
+  }
+
+  void newRegExpToken(JS::RegExpFlags reflags, TokenStart start,
+                      TokenKind* out) {
+    Token* token = newToken(TokenKind::RegExp, start,
+                            TokenStreamShared::SlashIsRegExp, out);
+    token->setRegExpFlags(reflags);
+  }
+
+  MOZ_COLD bool badToken();
+
+  int32_t getCodeUnit() {
+    if (MOZ_LIKELY(!this->sourceUnits.atEnd())) {
+      return CodeUnitValue(this->sourceUnits.getCodeUnit());
+    }
+
+    anyCharsAccess().flags.isEOF = true;
+    return EOF;
+  }
+
+  void ungetCodeUnit(int32_t c) {
+    MOZ_ASSERT_IF(c == EOF, anyCharsAccess().flags.isEOF);
+
+    CharsBase::ungetCodeUnit(c);
+  }
+
+  [[nodiscard]] MOZ_ALWAYS_INLINE bool getFullAsciiCodePoint(int32_t lead) {
+    MOZ_ASSERT(isAsciiCodePoint(lead),
+               "non-ASCII code units must be handled separately");
+    MOZ_ASSERT(toUnit(lead) == this->sourceUnits.previousCodeUnit(),
+               "getFullAsciiCodePoint called incorrectly");
+
+    if (MOZ_UNLIKELY(lead == '\r')) {
+      matchLineTerminator('\n');
+    } else if (MOZ_LIKELY(lead != '\n')) {
+      return true;
+    }
+    return updateLineInfoForEOL();
+  }
+
+  [[nodiscard]] MOZ_NEVER_INLINE bool updateLineInfoForEOL() {
+    return anyCharsAccess().internalUpdateLineInfoForEOL(
+        this->sourceUnits.offset());
+  }
+
+  uint32_t matchUnicodeEscapeIdStart(char32_t* codePoint);
+  bool matchUnicodeEscapeIdent(char32_t* codePoint);
+  bool matchIdentifierStart();
+
+  [[nodiscard]] bool internalComputeLineOfContext(ErrorMetadata* err,
+                                                  uint32_t offset) const {
+    if (err->lineNumber != anyCharsAccess().lineno) {
+      return true;
+    }
+
+    return addLineOfContext(err, offset);
+  }
+
+ public:
+  void consumeOptionalHashbangComment();
+
+  TaggedParserAtomIndex getRawTemplateStringAtom() {
+    TokenStreamAnyChars& anyChars = anyCharsAccess();
+
+    MOZ_ASSERT(anyChars.currentToken().type == TokenKind::TemplateHead ||
+               anyChars.currentToken().type == TokenKind::NoSubsTemplate);
+    const Unit* cur =
+        this->sourceUnits.codeUnitPtrAt(anyChars.currentToken().pos.begin + 1);
+    const Unit* end;
+    if (anyChars.currentToken().type == TokenKind::TemplateHead) {
+      end =
+          this->sourceUnits.codeUnitPtrAt(anyChars.currentToken().pos.end - 2);
+    } else {
+      end =
+          this->sourceUnits.codeUnitPtrAt(anyChars.currentToken().pos.end - 1);
+    }
+
+    MOZ_ASSERT(this->charBuffer.length() == 0);
+    this->charBuffer.clear();
+
+    if (!FillCharBufferFromSourceNormalizingAsciiLineBreaks(this->charBuffer,
+                                                            cur, end)) {
+      return TaggedParserAtomIndex::null();
+    }
+
+    return drainCharBufferIntoAtom();
+  }
+};
+
+template <typename Unit, class AnyCharsAccess>
+class TokenStreamChars;
+
+template <class AnyCharsAccess>
+class TokenStreamChars<char16_t, AnyCharsAccess>
+    : public GeneralTokenStreamChars<char16_t, AnyCharsAccess> {
+  using CharsBase = TokenStreamCharsBase<char16_t>;
+  using SpecializedCharsBase = SpecializedTokenStreamCharsBase<char16_t>;
+  using GeneralCharsBase = GeneralTokenStreamChars<char16_t, AnyCharsAccess>;
+  using Self = TokenStreamChars<char16_t, AnyCharsAccess>;
+
+  using GeneralCharsBase::asSpecific;
+
+  using typename GeneralCharsBase::TokenStreamSpecific;
+
+ protected:
+  using CharsBase::matchLineTerminator;
+  using GeneralCharsBase::anyCharsAccess;
+  using GeneralCharsBase::getCodeUnit;
+  using SpecializedCharsBase::infallibleGetNonAsciiCodePointDontNormalize;
+  using TokenStreamCharsShared::isAsciiCodePoint;
+  using GeneralCharsBase::ungetCodeUnit;
+  using GeneralCharsBase::updateLineInfoForEOL;
+
+ protected:
+  using GeneralCharsBase::GeneralCharsBase;
+
+  [[nodiscard]] bool getNonAsciiCodePointDontNormalize(char16_t lead,
+                                                       char32_t* codePoint) {
+    *codePoint = infallibleGetNonAsciiCodePointDontNormalize(lead);
+    return true;
+  }
+
+  [[nodiscard]] bool getNonAsciiCodePoint(int32_t lead, char32_t* codePoint);
+};
+
+template <class AnyCharsAccess>
+class TokenStreamChars<mozilla::Utf8Unit, AnyCharsAccess>
+    : public GeneralTokenStreamChars<mozilla::Utf8Unit, AnyCharsAccess> {
+  using CharsBase = TokenStreamCharsBase<mozilla::Utf8Unit>;
+  using SpecializedCharsBase =
+      SpecializedTokenStreamCharsBase<mozilla::Utf8Unit>;
+  using GeneralCharsBase =
+      GeneralTokenStreamChars<mozilla::Utf8Unit, AnyCharsAccess>;
+  using Self = TokenStreamChars<mozilla::Utf8Unit, AnyCharsAccess>;
+
+  using typename SpecializedCharsBase::SourceUnitsEnd;
+  using typename SpecializedCharsBase::SourceUnitsIterator;
+
+ protected:
+  using GeneralCharsBase::anyCharsAccess;
+  using GeneralCharsBase::computeLineAndColumn;
+  using GeneralCharsBase::fillExceptingContext;
+  using GeneralCharsBase::internalComputeLineOfContext;
+  using TokenStreamCharsShared::isAsciiCodePoint;
+  using GeneralCharsBase::updateLineInfoForEOL;
+
+ private:
+  static char toHexChar(uint8_t nibble) {
+    MOZ_ASSERT(nibble < 16);
+    return "0123456789ABCDEF"[nibble];
+  }
+
+  static void byteToString(uint8_t n, char* str) {
+    str[0] = '0';
+    str[1] = 'x';
+    str[2] = toHexChar(n >> 4);
+    str[3] = toHexChar(n & 0xF);
+  }
+
+  static void byteToTerminatedString(uint8_t n, char* str) {
+    byteToString(n, str);
+    str[4] = '\0';
+  }
+
+  MOZ_COLD void internalEncodingError(uint8_t relevantUnits,
+                                      unsigned errorNumber, ...);
+
+
+  MOZ_COLD void badLeadUnit(mozilla::Utf8Unit lead);
+
+  MOZ_COLD void notEnoughUnits(mozilla::Utf8Unit lead, uint8_t remaining,
+                               uint8_t required);
+
+  MOZ_COLD void badTrailingUnit(uint8_t unitsObserved);
+
+  MOZ_COLD void badStructurallyValidCodePoint(char32_t codePoint,
+                                              uint8_t codePointLength,
+                                              const char* reason);
+
+  MOZ_COLD void badCodePoint(char32_t codePoint, uint8_t codePointLength) {
+    MOZ_ASSERT(unicode::IsSurrogate(codePoint) ||
+               codePoint > unicode::NonBMPMax);
+
+    badStructurallyValidCodePoint(codePoint, codePointLength,
+                                  unicode::IsSurrogate(codePoint)
+                                      ? "it's a UTF-16 surrogate"
+                                      : "the maximum code point is U+10FFFF");
+  }
+
+  MOZ_COLD void notShortestForm(char32_t codePoint, uint8_t codePointLength) {
+    MOZ_ASSERT(!unicode::IsSurrogate(codePoint));
+    MOZ_ASSERT(codePoint <= unicode::NonBMPMax);
+
+    badStructurallyValidCodePoint(
+        codePoint, codePointLength,
+        "it wasn't encoded in shortest possible form");
+  }
+
+ protected:
+  using GeneralCharsBase::GeneralCharsBase;
+
+  [[nodiscard]] bool getNonAsciiCodePointDontNormalize(mozilla::Utf8Unit lead,
+                                                       char32_t* codePoint);
+
+  [[nodiscard]] bool getNonAsciiCodePoint(int32_t lead, char32_t* codePoint);
+};
+
+template <typename Unit, class AnyCharsAccess>
+class MOZ_STACK_CLASS TokenStreamSpecific
+    : public TokenStreamChars<Unit, AnyCharsAccess>,
+      public TokenStreamShared,
+      public ErrorReporter {
+ public:
+  using CharsBase = TokenStreamCharsBase<Unit>;
+  using SpecializedCharsBase = SpecializedTokenStreamCharsBase<Unit>;
+  using GeneralCharsBase = GeneralTokenStreamChars<Unit, AnyCharsAccess>;
+  using SpecializedChars = TokenStreamChars<Unit, AnyCharsAccess>;
+
+  using Position = TokenStreamPosition<Unit>;
+
+ public:
+  using GeneralCharsBase::anyCharsAccess;
+  using GeneralCharsBase::computeLineAndColumn;
+  using TokenStreamCharsShared::adoptState;
+
+ private:
+  using typename CharsBase::SourceUnits;
+
+ private:
+  using CharsBase::atomizeSourceChars;
+  using GeneralCharsBase::badToken;
+  using CharsBase::consumeKnownCodeUnit;
+  using CharsBase::matchCodeUnit;
+  using CharsBase::matchLineTerminator;
+  using CharsBase::peekCodeUnit;
+  using GeneralCharsBase::computeColumn;
+  using GeneralCharsBase::fillExceptingContext;
+  using GeneralCharsBase::getCodeUnit;
+  using GeneralCharsBase::getFullAsciiCodePoint;
+  using GeneralCharsBase::internalComputeLineOfContext;
+  using GeneralCharsBase::matchUnicodeEscapeIdent;
+  using GeneralCharsBase::matchUnicodeEscapeIdStart;
+  using GeneralCharsBase::newAtomToken;
+  using GeneralCharsBase::newBigIntToken;
+  using GeneralCharsBase::newNameToken;
+  using GeneralCharsBase::newNumberToken;
+  using GeneralCharsBase::newPrivateNameToken;
+  using GeneralCharsBase::newRegExpToken;
+  using GeneralCharsBase::newSimpleToken;
+  using SpecializedChars::getNonAsciiCodePoint;
+  using SpecializedChars::getNonAsciiCodePointDontNormalize;
+  using TokenStreamCharsShared::copyCharBufferTo;
+  using TokenStreamCharsShared::drainCharBufferIntoAtom;
+  using TokenStreamCharsShared::isAsciiCodePoint;
+  using CharsBase::toUnit;
+  using GeneralCharsBase::ungetCodeUnit;
+  using GeneralCharsBase::updateLineInfoForEOL;
+
+  template <typename CharU>
+  friend class TokenStreamPosition;
+
+ public:
+  TokenStreamSpecific(FrontendContext* fc, ParserAtomsTable* parserAtoms,
+                      const JS::ReadOnlyCompileOptions& options,
+                      const Unit* units, size_t length);
+
+  [[nodiscard]] MOZ_ALWAYS_INLINE bool getCodePoint() {
+    int32_t unit = getCodeUnit();
+    if (MOZ_UNLIKELY(unit == EOF)) {
+      MOZ_ASSERT(anyCharsAccess().flags.isEOF,
+                 "flags.isEOF should have been set by getCodeUnit()");
+      return true;
+    }
+
+    if (isAsciiCodePoint(unit)) {
+      return getFullAsciiCodePoint(unit);
+    }
+
+    char32_t cp;
+    return getNonAsciiCodePoint(unit, &cp);
+  }
+
+  bool checkForInvalidTemplateEscapeError() {
+    if (anyCharsAccess().invalidTemplateEscapeType == InvalidEscapeType::None) {
+      return true;
+    }
+
+    reportInvalidEscapeError(anyCharsAccess().invalidTemplateEscapeOffset,
+                             anyCharsAccess().invalidTemplateEscapeType);
+    return false;
+  }
+
+ public:
+
+  std::optional<bool> isOnThisLine(size_t offset,
+                                   uint32_t lineNum) const final {
+    return anyCharsAccess().srcCoords.isOnThisLine(offset, lineNum);
+  }
+
+  uint32_t lineAt(size_t offset) const final {
+    const auto& anyChars = anyCharsAccess();
+    auto lineToken = anyChars.lineToken(offset);
+    return anyChars.lineNumber(lineToken);
+  }
+
+  JS::LimitedColumnNumberOneOrigin columnAt(size_t offset) const final {
+    return computeColumn(anyCharsAccess().lineToken(offset), offset);
+  }
+
+ private:
+
+  FrontendContext* getContext() const override {
+    return anyCharsAccess().context();
+  }
+
+  [[nodiscard]] bool strictMode() const override {
+    return anyCharsAccess().strictMode();
+  }
+
+ public:
+
+  const JS::ReadOnlyCompileOptions& options() const final {
+    return anyCharsAccess().options();
+  }
+
+  [[nodiscard]] bool computeErrorMetadata(
+      ErrorMetadata* err, const ErrorOffset& errorOffset) const override;
+
+ private:
+  void reportInvalidEscapeError(uint32_t offset, InvalidEscapeType type) {
+    switch (type) {
+      case InvalidEscapeType::None:
+        MOZ_ASSERT_UNREACHABLE("unexpected InvalidEscapeType");
+        return;
+      case InvalidEscapeType::Hexadecimal:
+        errorAt(offset, JSMSG_MALFORMED_ESCAPE, "hexadecimal");
+        return;
+      case InvalidEscapeType::Unicode:
+        errorAt(offset, JSMSG_MALFORMED_ESCAPE, "Unicode");
+        return;
+      case InvalidEscapeType::UnicodeOverflow:
+        errorAt(offset, JSMSG_UNICODE_OVERFLOW, "escape sequence");
+        return;
+      case InvalidEscapeType::Octal:
+        errorAt(offset, JSMSG_DEPRECATED_OCTAL_ESCAPE);
+        return;
+      case InvalidEscapeType::EightOrNine:
+        errorAt(offset, JSMSG_DEPRECATED_EIGHT_OR_NINE_ESCAPE);
+        return;
+    }
+  }
+
+  void reportIllegalCharacter(int32_t cp);
+
+  [[nodiscard]] bool putIdentInCharBuffer(const Unit* identStart);
+
+  using IsIntegerUnit = bool (*)(int32_t);
+  [[nodiscard]] MOZ_ALWAYS_INLINE bool matchInteger(IsIntegerUnit isIntegerUnit,
+                                                    int32_t* nextUnit);
+  [[nodiscard]] MOZ_ALWAYS_INLINE bool matchIntegerAfterFirstDigit(
+      IsIntegerUnit isIntegerUnit, int32_t* nextUnit);
+
+  [[nodiscard]] bool decimalNumber(int32_t unit, TokenStart start,
+                                   const Unit* numStart, Modifier modifier,
+                                   TokenKind* out);
+
+  [[nodiscard]] bool regexpLiteral(TokenStart start, TokenKind* out);
+
+  [[nodiscard]] bool bigIntLiteral(TokenStart start, Modifier modifier,
+                                   TokenKind* out);
+
+ public:
+  [[nodiscard]] bool getToken(TokenKind* ttp, Modifier modifier = SlashIsDiv) {
+    TokenStreamAnyChars& anyChars = anyCharsAccess();
+    if (anyChars.lookahead != 0) {
+      MOZ_ASSERT(!anyChars.flags.hadError);
+      anyChars.lookahead--;
+      anyChars.advanceCursor();
+      TokenKind tt = anyChars.currentToken().type;
+      MOZ_ASSERT(tt != TokenKind::Eol);
+      verifyConsistentModifier(modifier, anyChars.currentToken());
+      *ttp = tt;
+      return true;
+    }
+
+    return getTokenInternal(ttp, modifier);
+  }
+
+  [[nodiscard]] bool peekToken(TokenKind* ttp, Modifier modifier = SlashIsDiv) {
+    TokenStreamAnyChars& anyChars = anyCharsAccess();
+    if (anyChars.lookahead > 0) {
+      MOZ_ASSERT(!anyChars.flags.hadError);
+      verifyConsistentModifier(modifier, anyChars.nextToken());
+      *ttp = anyChars.nextToken().type;
+      return true;
+    }
+    if (!getTokenInternal(ttp, modifier)) {
+      return false;
+    }
+    anyChars.ungetToken();
+    return true;
+  }
+
+  [[nodiscard]] bool peekTokenPos(TokenPos* posp,
+                                  Modifier modifier = SlashIsDiv) {
+    TokenStreamAnyChars& anyChars = anyCharsAccess();
+    if (anyChars.lookahead == 0) {
+      TokenKind tt;
+      if (!getTokenInternal(&tt, modifier)) {
+        return false;
+      }
+      anyChars.ungetToken();
+      MOZ_ASSERT(anyChars.hasLookahead());
+    } else {
+      MOZ_ASSERT(!anyChars.flags.hadError);
+      verifyConsistentModifier(modifier, anyChars.nextToken());
+    }
+    *posp = anyChars.nextToken().pos;
+    return true;
+  }
+
+  [[nodiscard]] bool peekOffset(uint32_t* offset,
+                                Modifier modifier = SlashIsDiv) {
+    TokenPos pos;
+    if (!peekTokenPos(&pos, modifier)) {
+      return false;
+    }
+    *offset = pos.begin;
+    return true;
+  }
+
+  [[nodiscard]] MOZ_ALWAYS_INLINE bool peekTokenSameLine(
+      TokenKind* ttp, Modifier modifier = SlashIsDiv) {
+    TokenStreamAnyChars& anyChars = anyCharsAccess();
+    const Token& curr = anyChars.currentToken();
+
+    if (anyChars.lookahead != 0) {
+      std::optional<bool> onThisLineStatus =
+          anyChars.srcCoords.isOnThisLine(curr.pos.end, anyChars.lineno);
+      if (!onThisLineStatus.has_value()) {
+        error(JSMSG_OUT_OF_MEMORY);
+        return false;
+      }
+
+      bool onThisLine = *onThisLineStatus;
+      if (onThisLine) {
+        MOZ_ASSERT(!anyChars.flags.hadError);
+        verifyConsistentModifier(modifier, anyChars.nextToken());
+        *ttp = anyChars.nextToken().type;
+        return true;
+      }
+    }
+
+    TokenKind tmp;
+    if (!getToken(&tmp, modifier)) {
+      return false;
+    }
+
+    const Token& next = anyChars.currentToken();
+    anyChars.ungetToken();
+
+
+    auto currentEndToken = anyChars.lineToken(curr.pos.end);
+    auto nextBeginToken = anyChars.lineToken(next.pos.begin);
+
+    *ttp =
+        currentEndToken.isSameLine(nextBeginToken) ? next.type : TokenKind::Eol;
+    return true;
+  }
+
+  [[nodiscard]] bool matchToken(bool* matchedp, TokenKind tt,
+                                Modifier modifier = SlashIsDiv) {
+    TokenKind token;
+    if (!getToken(&token, modifier)) {
+      return false;
+    }
+    if (token == tt) {
+      *matchedp = true;
+    } else {
+      anyCharsAccess().ungetToken();
+      *matchedp = false;
+    }
+    return true;
+  }
+
+  void consumeKnownToken(TokenKind tt, Modifier modifier = SlashIsDiv) {
+    bool matched;
+    MOZ_ASSERT(anyCharsAccess().hasLookahead());
+    MOZ_ALWAYS_TRUE(matchToken(&matched, tt, modifier));
+    MOZ_ALWAYS_TRUE(matched);
+  }
+
+  [[nodiscard]] bool nextTokenEndsExpr(bool* endsExpr) {
+    TokenKind tt;
+    if (!peekToken(&tt)) {
+      return false;
+    }
+
+    *endsExpr = anyCharsAccess().isExprEnding[size_t(tt)];
+    if (*endsExpr) {
+      anyCharsAccess().allowGettingNextTokenWithSlashIsRegExp();
+    }
+    return true;
+  }
+
+  [[nodiscard]] bool advance(size_t position);
+
+  void seekTo(const Position& pos);
+  [[nodiscard]] bool seekTo(const Position& pos,
+                            const TokenStreamAnyChars& other);
+
+  void rewind(const Position& pos) {
+    MOZ_ASSERT(pos.buf <= this->sourceUnits.addressOfNextCodeUnit(),
+               "should be rewinding here");
+    seekTo(pos);
+  }
+
+  [[nodiscard]] bool rewind(const Position& pos,
+                            const TokenStreamAnyChars& other) {
+    MOZ_ASSERT(pos.buf <= this->sourceUnits.addressOfNextCodeUnit(),
+               "should be rewinding here");
+    return seekTo(pos, other);
+  }
+
+  void fastForward(const Position& pos) {
+    MOZ_ASSERT(this->sourceUnits.addressOfNextCodeUnit() <= pos.buf,
+               "should be moving forward here");
+    seekTo(pos);
+  }
+
+  [[nodiscard]] bool fastForward(const Position& pos,
+                                 const TokenStreamAnyChars& other) {
+    MOZ_ASSERT(this->sourceUnits.addressOfNextCodeUnit() <= pos.buf,
+               "should be moving forward here");
+    return seekTo(pos, other);
+  }
+
+  const Unit* codeUnitPtrAt(size_t offset) const {
+    return this->sourceUnits.codeUnitPtrAt(offset);
+  }
+
+  [[nodiscard]] bool identifierName(TokenStart start, const Unit* identStart,
+                                    IdentifierEscapes escaping,
+                                    Modifier modifier,
+                                    NameVisibility visibility, TokenKind* out);
+
+  [[nodiscard]] bool matchIdentifierStart(IdentifierEscapes* sawEscape);
+
+  [[nodiscard]] bool getTokenInternal(TokenKind* const ttp,
+                                      const Modifier modifier);
+
+  [[nodiscard]] bool getStringOrTemplateToken(char untilChar, Modifier modifier,
+                                              TokenKind* out);
+
+  [[nodiscard]] bool getTemplateToken(TokenKind* ttp) {
+    MOZ_ASSERT(anyCharsAccess().currentToken().type == TokenKind::RightCurly);
+    return getStringOrTemplateToken('`', SlashIsInvalid, ttp);
+  }
+
+  [[nodiscard]] bool getDirectives(bool isMultiline, bool shouldWarnDeprecated);
+  [[nodiscard]] bool getDirective(
+      bool isMultiline, bool shouldWarnDeprecated, const char* directive,
+      uint8_t directiveLength, const char* errorMsgPragma,
+      UniquePtr<char16_t[], JS::FreePolicy>* destination);
+  [[nodiscard]] bool getDisplayURL(bool isMultiline, bool shouldWarnDeprecated);
+  [[nodiscard]] bool getSourceMappingURL(bool isMultiline,
+                                         bool shouldWarnDeprecated);
+};
+
+template <typename Unit>
+template <class AnyCharsAccess>
+inline TokenStreamPosition<Unit>::TokenStreamPosition(
+    TokenStreamSpecific<Unit, AnyCharsAccess>& tokenStream)
+    : currentToken(tokenStream.anyCharsAccess().currentToken()) {
+  TokenStreamAnyChars& anyChars = tokenStream.anyCharsAccess();
+
+  buf =
+      tokenStream.sourceUnits.addressOfNextCodeUnit( true);
+  flags = anyChars.flags;
+  lineno = anyChars.lineno;
+  linebase = anyChars.linebase;
+  prevLinebase = anyChars.prevLinebase;
+  lookahead = anyChars.lookahead;
+  currentToken = anyChars.currentToken();
+  for (unsigned i = 0; i < anyChars.lookahead; i++) {
+    lookaheadTokens[i] = anyChars.tokens[anyChars.aheadCursor(1 + i)];
+  }
+}
+
+class TokenStreamAnyCharsAccess {
+ public:
+  template <class TokenStreamSpecific>
+  static inline TokenStreamAnyChars& anyChars(TokenStreamSpecific* tss);
+
+  template <class TokenStreamSpecific>
+  static inline const TokenStreamAnyChars& anyChars(
+      const TokenStreamSpecific* tss);
+};
+
+class MOZ_STACK_CLASS TokenStream
+    : public TokenStreamAnyChars,
+      public TokenStreamSpecific<char16_t, TokenStreamAnyCharsAccess> {
+  using Unit = char16_t;
+
+ public:
+  TokenStream(FrontendContext* fc, ParserAtomsTable* parserAtoms,
+              const JS::ReadOnlyCompileOptions& options, const Unit* units,
+              size_t length, StrictModeGetter* smg)
+      : TokenStreamAnyChars(fc, options, smg),
+        TokenStreamSpecific<Unit, TokenStreamAnyCharsAccess>(
+            fc, parserAtoms, options, units, length) {}
+};
+
+class MOZ_STACK_CLASS DummyTokenStream final : public TokenStream {
+ public:
+  DummyTokenStream(FrontendContext* fc,
+                   const JS::ReadOnlyCompileOptions& options)
+      : TokenStream(fc, nullptr, options, nullptr, 0, nullptr) {}
+};
+
+template <class TokenStreamSpecific>
+ inline TokenStreamAnyChars& TokenStreamAnyCharsAccess::anyChars(
+    TokenStreamSpecific* tss) {
+  auto* ts = static_cast<TokenStream*>(tss);
+  return *static_cast<TokenStreamAnyChars*>(ts);
+}
+
+template <class TokenStreamSpecific>
+ inline const TokenStreamAnyChars&
+TokenStreamAnyCharsAccess::anyChars(const TokenStreamSpecific* tss) {
+  const auto* ts = static_cast<const TokenStream*>(tss);
+  return *static_cast<const TokenStreamAnyChars*>(ts);
+}
+
+extern const char* TokenKindToDesc(TokenKind tt);
+
+}  
+}  
+
+#ifdef DEBUG
+extern const char* TokenKindToString(js::frontend::TokenKind tt);
+#endif
+
+#endif /* frontend_TokenStream_h */

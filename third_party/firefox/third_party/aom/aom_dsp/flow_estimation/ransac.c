@@ -1,0 +1,399 @@
+/*
+ * Copyright (c) 2016, Alliance for Open Media. All rights reserved.
+ *
+ * This source code is subject to the terms of the BSD 2 Clause License and
+ * the Alliance for Open Media Patent License 1.0. If the BSD 2 Clause License
+ * was not distributed with this source code in the LICENSE file, you can
+ * obtain it at www.aomedia.org/license/software. If the Alliance for Open
+ * Media Patent License 1.0 was not distributed with this source code in the
+ * PATENTS file, you can obtain it at www.aomedia.org/license/patent.
+ */
+
+#include <memory.h>
+#include <math.h>
+#include <time.h>
+#include <stdio.h>
+#include <stdbool.h>
+#include <string.h>
+#include <assert.h>
+
+#include "aom_dsp/flow_estimation/ransac.h"
+#include "aom_dsp/mathutils.h"
+#include "aom_mem/aom_mem.h"
+
+#include "av1/encoder/random.h"
+
+#define MAX_MINPTS 4
+#define MINPTS_MULTIPLIER 5
+
+#define INLIER_THRESHOLD 1.25
+#define INLIER_THRESHOLD_SQUARED (INLIER_THRESHOLD * INLIER_THRESHOLD)
+
+#define NUM_TRIALS 20
+
+#define NUM_REFINES 5
+
+#define ALLOW_TRANSLATION_MODELS 0
+
+typedef struct {
+  int num_inliers;
+  double sse;  
+  int *inlier_indices;
+} RANSAC_MOTION;
+
+typedef bool (*FindTransformationFunc)(const Correspondence *points,
+                                       const int *indices, int num_indices,
+                                       double *params);
+typedef void (*ScoreModelFunc)(const double *mat, const Correspondence *points,
+                               int num_points, RANSAC_MOTION *model);
+
+typedef struct {
+  FindTransformationFunc find_transformation;
+  ScoreModelFunc score_model;
+
+  int minpts;
+} RansacModelInfo;
+
+#if ALLOW_TRANSLATION_MODELS
+static void score_translation(const double *mat, const Correspondence *points,
+                              int num_points, RANSAC_MOTION *model) {
+  model->num_inliers = 0;
+  model->sse = 0.0;
+
+  for (int i = 0; i < num_points; ++i) {
+    const double x1 = points[i].x;
+    const double y1 = points[i].y;
+    const double x2 = points[i].rx;
+    const double y2 = points[i].ry;
+
+    const double proj_x = x1 + mat[0];
+    const double proj_y = y1 + mat[1];
+
+    const double dx = proj_x - x2;
+    const double dy = proj_y - y2;
+    const double sse = dx * dx + dy * dy;
+
+    if (sse < INLIER_THRESHOLD_SQUARED) {
+      model->inlier_indices[model->num_inliers++] = i;
+      model->sse += sse;
+    }
+  }
+}
+#endif
+
+static void score_affine(const double *mat, const Correspondence *points,
+                         int num_points, RANSAC_MOTION *model) {
+  model->num_inliers = 0;
+  model->sse = 0.0;
+
+  for (int i = 0; i < num_points; ++i) {
+    const double x1 = points[i].x;
+    const double y1 = points[i].y;
+    const double x2 = points[i].rx;
+    const double y2 = points[i].ry;
+
+    const double proj_x = mat[2] * x1 + mat[3] * y1 + mat[0];
+    const double proj_y = mat[4] * x1 + mat[5] * y1 + mat[1];
+
+    const double dx = proj_x - x2;
+    const double dy = proj_y - y2;
+    const double sse = dx * dx + dy * dy;
+
+    if (sse < INLIER_THRESHOLD_SQUARED) {
+      model->inlier_indices[model->num_inliers++] = i;
+      model->sse += sse;
+    }
+  }
+}
+
+#if ALLOW_TRANSLATION_MODELS
+static bool find_translation(const Correspondence *points, const int *indices,
+                             int num_indices, double *params) {
+  double sumx = 0;
+  double sumy = 0;
+
+  for (int i = 0; i < num_indices; ++i) {
+    int index = indices[i];
+    const double sx = points[index].x;
+    const double sy = points[index].y;
+    const double dx = points[index].rx;
+    const double dy = points[index].ry;
+
+    sumx += dx - sx;
+    sumy += dy - sy;
+  }
+
+  params[0] = sumx / np;
+  params[1] = sumy / np;
+  params[2] = 1;
+  params[3] = 0;
+  params[4] = 0;
+  params[5] = 1;
+  return true;
+}
+#endif
+
+static bool find_rotzoom(const Correspondence *points, const int *indices,
+                         int num_indices, double *params) {
+  const int n = 4;    
+  double mat[4 * 4];  
+  double y[4];        
+  double a[4];        
+  double b;           
+
+  least_squares_init(mat, y, n);
+  for (int i = 0; i < num_indices; ++i) {
+    int index = indices[i];
+    const double sx = points[index].x;
+    const double sy = points[index].y;
+    const double dx = points[index].rx;
+    const double dy = points[index].ry;
+
+    a[0] = 1;
+    a[1] = 0;
+    a[2] = sx;
+    a[3] = sy;
+    b = dx;
+    least_squares_accumulate(mat, y, a, b, n);
+
+    a[0] = 0;
+    a[1] = 1;
+    a[2] = sy;
+    a[3] = -sx;
+    b = dy;
+    least_squares_accumulate(mat, y, a, b, n);
+  }
+
+  if (!least_squares_solve(mat, y, params, n)) {
+    return false;
+  }
+
+  params[4] = -params[3];
+  params[5] = params[2];
+
+  return true;
+}
+
+static bool find_affine(const Correspondence *points, const int *indices,
+                        int num_indices, double *params) {
+
+  const int n = 3;       
+  double mat[2][3 * 3];  
+  double y[2][3];        
+  double x[2][3];        
+  double a[2][3];        
+  double b[2];           
+
+  least_squares_init(mat[0], y[0], n);
+  least_squares_init(mat[1], y[1], n);
+  for (int i = 0; i < num_indices; ++i) {
+    int index = indices[i];
+    const double sx = points[index].x;
+    const double sy = points[index].y;
+    const double dx = points[index].rx;
+    const double dy = points[index].ry;
+
+    a[0][0] = 1;
+    a[0][1] = sx;
+    a[0][2] = sy;
+    b[0] = dx;
+    least_squares_accumulate(mat[0], y[0], a[0], b[0], n);
+
+    a[1][0] = 1;
+    a[1][1] = sx;
+    a[1][2] = sy;
+    b[1] = dy;
+    least_squares_accumulate(mat[1], y[1], a[1], b[1], n);
+  }
+
+  if (!least_squares_solve(mat[0], y[0], x[0], n)) {
+    return false;
+  }
+  if (!least_squares_solve(mat[1], y[1], x[1], n)) {
+    return false;
+  }
+
+  params[0] = x[0][0];
+  params[1] = x[1][0];
+  params[2] = x[0][1];
+  params[3] = x[0][2];
+  params[4] = x[1][1];
+  params[5] = x[1][2];
+
+  return true;
+}
+
+static int compare_motions(const void *arg_a, const void *arg_b) {
+  const RANSAC_MOTION *motion_a = (RANSAC_MOTION *)arg_a;
+  const RANSAC_MOTION *motion_b = (RANSAC_MOTION *)arg_b;
+
+  if (motion_a->num_inliers > motion_b->num_inliers) return -1;
+  if (motion_a->num_inliers < motion_b->num_inliers) return 1;
+  if (motion_a->sse < motion_b->sse) return -1;
+  if (motion_a->sse > motion_b->sse) return 1;
+  return 0;
+}
+
+static bool is_better_motion(const RANSAC_MOTION *motion_a,
+                             const RANSAC_MOTION *motion_b) {
+  return compare_motions(motion_a, motion_b) < 0;
+}
+
+static bool ransac_internal(const Correspondence *matched_points, int npoints,
+                            MotionModel *motion_models, int num_desired_motions,
+                            const RansacModelInfo *model_info,
+                            bool *mem_alloc_failed) {
+  assert(npoints >= 0);
+  int i = 0;
+  int minpts = model_info->minpts;
+  bool ret_val = true;
+
+  unsigned int seed = (unsigned int)npoints;
+
+  int indices[MAX_MINPTS] = { 0 };
+
+  RANSAC_MOTION *motions, *worst_kept_motion = NULL;
+  RANSAC_MOTION current_motion;
+
+  double params_this_motion[MAX_PARAMDIM];
+
+  for (i = 0; i < num_desired_motions; i++) {
+    memcpy(motion_models[i].params, kIdentityParams,
+           MAX_PARAMDIM * sizeof(*(motion_models[i].params)));
+    motion_models[i].num_inliers = 0;
+  }
+
+  if (npoints < minpts * MINPTS_MULTIPLIER || npoints == 0) {
+    return false;
+  }
+
+  int min_inliers = AOMMAX((int)(MIN_INLIER_PROB * npoints), minpts);
+
+  motions =
+      (RANSAC_MOTION *)aom_calloc(num_desired_motions, sizeof(RANSAC_MOTION));
+
+  int *inlier_buffer = (int *)aom_malloc(sizeof(*inlier_buffer) * npoints *
+                                         (num_desired_motions + 1));
+
+  if (!(motions && inlier_buffer)) {
+    ret_val = false;
+    *mem_alloc_failed = true;
+    goto finish_ransac;
+  }
+
+  worst_kept_motion = motions;
+
+  for (i = 0; i < num_desired_motions; ++i) {
+    motions[i].inlier_indices = inlier_buffer + i * npoints;
+  }
+  memset(&current_motion, 0, sizeof(current_motion));
+  current_motion.inlier_indices = inlier_buffer + num_desired_motions * npoints;
+
+  for (int trial_count = 0; trial_count < NUM_TRIALS; trial_count++) {
+    lcg_pick(npoints, minpts, indices, &seed);
+
+    if (!model_info->find_transformation(matched_points, indices, minpts,
+                                         params_this_motion)) {
+      continue;
+    }
+
+    model_info->score_model(params_this_motion, matched_points, npoints,
+                            &current_motion);
+
+    if (current_motion.num_inliers < min_inliers) {
+      continue;
+    }
+
+    if (is_better_motion(&current_motion, worst_kept_motion)) {
+      worst_kept_motion->num_inliers = current_motion.num_inliers;
+      worst_kept_motion->sse = current_motion.sse;
+
+      int *tmp = worst_kept_motion->inlier_indices;
+      worst_kept_motion->inlier_indices = current_motion.inlier_indices;
+      current_motion.inlier_indices = tmp;
+
+      for (i = 0; i < num_desired_motions; ++i) {
+        if (is_better_motion(worst_kept_motion, &motions[i])) {
+          worst_kept_motion = &motions[i];
+        }
+      }
+    }
+  }
+
+  qsort(motions, num_desired_motions, sizeof(RANSAC_MOTION), compare_motions);
+
+  for (i = 0; i < num_desired_motions; ++i) {
+    if (motions[i].num_inliers <= 0) {
+      continue;
+    }
+
+    bool bad_model = false;
+    for (int refine_count = 0; refine_count < NUM_REFINES; refine_count++) {
+      int num_inliers = motions[i].num_inliers;
+      assert(num_inliers >= min_inliers);
+
+      if (!model_info->find_transformation(matched_points,
+                                           motions[i].inlier_indices,
+                                           num_inliers, params_this_motion)) {
+        bad_model = true;
+        break;
+      }
+
+      model_info->score_model(params_this_motion, matched_points, npoints,
+                              &current_motion);
+
+      if (current_motion.num_inliers > motions[i].num_inliers) {
+        motions[i].num_inliers = current_motion.num_inliers;
+        motions[i].sse = current_motion.sse;
+        int *tmp = motions[i].inlier_indices;
+        motions[i].inlier_indices = current_motion.inlier_indices;
+        current_motion.inlier_indices = tmp;
+      } else {
+        break;
+      }
+    }
+
+    if (bad_model) continue;
+
+    memcpy(motion_models[i].params, params_this_motion,
+           MAX_PARAMDIM * sizeof(*motion_models[i].params));
+    for (int j = 0; j < motions[i].num_inliers; j++) {
+      int index = motions[i].inlier_indices[j];
+      const Correspondence *corr = &matched_points[index];
+      motion_models[i].inliers[2 * j + 0] = (int)rint(corr->x);
+      motion_models[i].inliers[2 * j + 1] = (int)rint(corr->y);
+    }
+    motion_models[i].num_inliers = motions[i].num_inliers;
+  }
+
+finish_ransac:
+  aom_free(inlier_buffer);
+  aom_free(motions);
+
+  return ret_val;
+}
+
+static const RansacModelInfo ransac_model_info[TRANS_TYPES] = {
+  { NULL, NULL, 0 },
+#if ALLOW_TRANSLATION_MODELS
+  { find_translation, score_translation, 1 },
+#else
+  { NULL, NULL, 0 },
+#endif
+  { find_rotzoom, score_affine, 2 },
+  { find_affine, score_affine, 3 },
+};
+
+bool ransac(const Correspondence *matched_points, int npoints,
+            TransformationType type, MotionModel *motion_models,
+            int num_desired_motions, bool *mem_alloc_failed) {
+#if ALLOW_TRANSLATION_MODELS
+  assert(type > IDENTITY && type < TRANS_TYPES);
+#else
+  assert(type > TRANSLATION && type < TRANS_TYPES);
+#endif
+
+  return ransac_internal(matched_points, npoints, motion_models,
+                         num_desired_motions, &ransac_model_info[type],
+                         mem_alloc_failed);
+}

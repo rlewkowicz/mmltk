@@ -1,0 +1,483 @@
+/*
+ * Copyright 2008 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "include/core/SkMatrix.h"
+#include "include/core/SkPixmap.h"
+#include "include/core/SkTileMode.h"
+#include "include/core/SkTypes.h"
+#include "include/private/base/SkCPUTypes.h"
+#include "include/private/base/SkFixed.h"
+#include "include/private/base/SkMath.h"
+#include "include/private/base/SkTFitsIn.h"
+#include "include/private/base/SkTPin.h"
+#include "include/private/base/SkTo.h"
+#include "src/core/SkBitmapProcState.h"
+#include "src/core/SkMemset.h"
+
+#include <cstdint>
+#include <cstring>
+
+static inline bool can_truncate_to_fixed_for_decal(SkFixed fx,
+                                                   SkFixed dx,
+                                                   int count, unsigned max) {
+    SkASSERT(count > 0);
+
+    if (dx <= SK_Fixed1 / 256) {
+        return false;
+    }
+
+
+    if ((unsigned)SkFixedFloorToInt(fx) >= max) {
+        return false;
+    }
+
+    const uint64_t lastFx = fx + sk_64_mul(dx, count - 1);
+
+    return SkTFitsIn<int32_t>(lastFx) && (unsigned)SkFixedFloorToInt(SkTo<int32_t>(lastFx)) < max;
+}
+
+
+static void decal_nofilter_scale(uint32_t dst[], SkFixed fx, SkFixed dx, int count) {
+    for (; count > 2; count -= 2) {
+        *dst++ = pack_two_shorts( (fx +  0) >> 16,
+                                  (fx + dx) >> 16);
+        fx += dx+dx;
+    }
+
+    SkASSERT(count <= 2);
+    switch (count) {
+        case 2: ((uint16_t*)dst)[1] = SkToU16((fx + dx) >> 16); [[fallthrough]];
+        case 1: ((uint16_t*)dst)[0] = SkToU16((fx +  0) >> 16);
+    }
+}
+
+using TileProc = unsigned (*)(SkFixed, int);
+
+template <TileProc tilex, TileProc tiley, bool tryDecal>
+static void nofilter_scale(const SkBitmapProcState& s,
+                           uint32_t xy[], int count, int x, int y) {
+    SkASSERT(s.fInvMatrix.isScaleTranslate());
+
+    SkFixed3232 fx;
+    {
+        const SkBitmapProcStateAutoMapper mapper(s, x, y);
+        *xy++ = tiley(mapper.fixedY(), s.fPixmap.height() - 1);
+        fx = mapper.fixed3232X();
+    }
+
+    const unsigned maxX = s.fPixmap.width() - 1;
+    if (0 == maxX) {
+        memset(xy, 0, count * sizeof(uint16_t));
+        return;
+    }
+
+    const SkFixed3232 dx = s.fInvSx;
+
+    if (tryDecal) {
+        const SkFixed fixedFx = SkFixed3232ToFixed(fx);
+        const SkFixed fixedDx = SkFixed3232ToFixed(dx);
+
+        if (can_truncate_to_fixed_for_decal(fixedFx, fixedDx, count, maxX)) {
+            decal_nofilter_scale(xy, fixedFx, fixedDx, count);
+            return;
+        }
+    }
+
+    for (; count >= 2; count -= 2) {
+        *xy++ = pack_two_shorts(tilex(SkFixed3232ToFixed(fx     ), maxX),
+                                tilex(SkFixed3232ToFixed(fx + dx), maxX));
+        fx += dx+dx;
+    }
+
+    auto xx = (uint16_t*)xy;
+    while (count --> 0) {
+        *xx++ = tilex(SkFixed3232ToFixed(fx), maxX);
+        fx += dx;
+    }
+}
+
+template <TileProc tilex, TileProc tiley>
+static void nofilter_affine(const SkBitmapProcState& s,
+                            uint32_t xy[], int count, int x, int y) {
+    SkASSERT(!s.fInvMatrix.hasPerspective());
+
+    const SkBitmapProcStateAutoMapper mapper(s, x, y);
+
+    SkFixed3232 fx = mapper.fixed3232X(),
+                    fy = mapper.fixed3232Y(),
+                    dx = s.fInvSx,
+                    dy = s.fInvKy;
+    int maxX = s.fPixmap.width () - 1,
+        maxY = s.fPixmap.height() - 1;
+
+    while (count --> 0) {
+        *xy++ = (tiley(SkFixed3232ToFixed(fy), maxY) << 16)
+              | (tilex(SkFixed3232ToFixed(fx), maxX)      );
+        fx += dx;
+        fy += dy;
+    }
+}
+
+static unsigned extract_low_bits_clamp_clamp(SkFixed fx, int ) {
+    return (fx >> 12) & 0xf;
+}
+
+static unsigned extract_low_bits_general(SkFixed fx, int max) {
+    return extract_low_bits_clamp_clamp((fx & 0xffff) * (max+1), max);
+}
+
+template <TileProc tile, TileProc extract_low_bits>
+SK_NO_SANITIZE("signed-integer-overflow")
+static uint32_t pack(SkFixed f, unsigned max, SkFixed one) {
+    uint32_t packed = tile(f, max);                      
+    packed = (packed <<  4) | extract_low_bits(f, max);  
+    packed = (packed << 14) | tile((f + one), max);      
+    return packed;
+}
+
+static constexpr int32_t max_hi = INT16_MAX;
+static constexpr int32_t min_hi = INT16_MIN;
+static constexpr SkFixed3232 max_fx = SkIntToFixed3232(INT16_MAX);
+static constexpr SkFixed3232 min_fx = SkIntToFixed3232(0xFFFF8000ULL);
+
+static constexpr SkFixed sk_fixed3232_saturate2fixed(SkFixed3232 x) {
+    x = (x >> 32) < max_hi ? x : max_fx;
+    x = (x >> 32) > min_hi ? x : min_fx;
+    return SkFixed3232ToFixed(x);
+}
+
+template <TileProc tilex, TileProc tiley, TileProc extract_low_bits, bool tryDecal>
+static void filter_scale(const SkBitmapProcState& s,
+                         uint32_t xy[], int count, int x, int y) {
+    SkASSERT(s.fInvMatrix.isScaleTranslate());
+
+    const unsigned maxX = s.fPixmap.width() - 1;
+    const SkFixed3232 dx = s.fInvSx;
+    SkFixed3232 fx;
+    {
+        const SkBitmapProcStateAutoMapper mapper(s, x, y);
+        const unsigned maxY = s.fPixmap.height() - 1;
+        *xy++ = pack<tiley, extract_low_bits>(
+            sk_fixed3232_saturate2fixed(mapper.fixed3232Y()), maxY, s.fFilterOneY);
+        fx = mapper.fixed3232X();
+    }
+
+    if (tryDecal &&
+        (unsigned)SkFixed3232ToInt(fx               ) < maxX &&
+        (unsigned)SkFixed3232ToInt(fx + dx*(count-1)) < maxX) {
+        while (count --> 0) {
+            SkFixed fixedFx = sk_fixed3232_saturate2fixed(fx);
+            SkASSERT((fixedFx >> (16 + 14)) == 0);
+            *xy++ = (fixedFx >> 12 << 14) | ((fixedFx >> 16) + 1);
+            fx += dx;
+        }
+        return;
+    }
+
+    while (count --> 0) {
+        *xy++ = pack<tilex, extract_low_bits>(
+            sk_fixed3232_saturate2fixed(fx), maxX, s.fFilterOneX);
+        fx += dx;
+    }
+}
+
+template <TileProc tilex, TileProc tiley, TileProc extract_low_bits>
+static void filter_affine(const SkBitmapProcState& s,
+                          uint32_t xy[], int count, int x, int y) {
+    SkASSERT(!s.fInvMatrix.hasPerspective());
+
+    const SkBitmapProcStateAutoMapper mapper(s, x, y);
+
+    SkFixed oneX = s.fFilterOneX,
+            oneY = s.fFilterOneY;
+
+    SkFixed3232 fx = mapper.fixed3232X(),
+                    fy = mapper.fixed3232Y(),
+                    dx = s.fInvSx,
+                    dy = s.fInvKy;
+    unsigned maxX = s.fPixmap.width () - 1,
+             maxY = s.fPixmap.height() - 1;
+    while (count --> 0) {
+        *xy++ = pack<tiley, extract_low_bits>(SkFixed3232ToFixed(fy), maxY, oneY);
+        *xy++ = pack<tilex, extract_low_bits>(SkFixed3232ToFixed(fx), maxX, oneX);
+
+        fy += dy;
+        fx += dx;
+    }
+}
+
+static inline unsigned SK_USHIFT16(unsigned x) {
+    return x >> 16;
+}
+
+static unsigned repeat(SkFixed fx, int max) {
+    SkASSERT(max < 65535);
+    return SK_USHIFT16((unsigned)(fx & 0xFFFF) * (max + 1));
+}
+static unsigned mirror(SkFixed fx, int max) {
+    SkASSERT(max < 65535);
+    SkFixed s = SkLeftShift(fx, 15) >> 31;
+
+    return SK_USHIFT16( ((fx ^ s) & 0xFFFF) * (max + 1) );
+}
+
+static unsigned clamp(SkFixed fx, int max) {
+    return SkTPin(fx >> 16, 0, max);
+}
+
+static const SkBitmapProcState::MatrixProc ClampX_ClampY_Procs[] = {
+    nofilter_scale <clamp, clamp, true>, filter_scale <clamp, clamp, extract_low_bits_clamp_clamp, true>,
+    nofilter_affine<clamp, clamp>,       filter_affine<clamp, clamp, extract_low_bits_clamp_clamp>,
+};
+static const SkBitmapProcState::MatrixProc RepeatX_RepeatY_Procs[] = {
+    nofilter_scale <repeat, repeat, false>, filter_scale <repeat, repeat, extract_low_bits_general, false>,
+    nofilter_affine<repeat, repeat>,        filter_affine<repeat, repeat, extract_low_bits_general>
+};
+static const SkBitmapProcState::MatrixProc MirrorX_MirrorY_Procs[] = {
+    nofilter_scale <mirror, mirror,  false>, filter_scale <mirror, mirror, extract_low_bits_general, false>,
+    nofilter_affine<mirror, mirror>,         filter_affine<mirror, mirror, extract_low_bits_general>,
+};
+
+
+
+static inline U16CPU int_clamp(int x, int n) {
+    if (x <  0) { x = 0; }
+    if (x >= n) { x = n - 1; }
+    return x;
+}
+
+static inline int sk_int_mod(int x, int n) {
+    SkASSERT(n > 0);
+    if ((unsigned)x >= (unsigned)n) {
+        if (x < 0) {
+            x = n + ~(~x % n);
+        } else {
+            x = x % n;
+        }
+    }
+    return x;
+}
+
+static inline U16CPU int_repeat(int x, int n) {
+    return sk_int_mod(x, n);
+}
+
+static inline U16CPU int_mirror(int x, int n) {
+    x = sk_int_mod(x, 2 * n);
+    if (x >= n) {
+        x = n + ~(x - n);
+    }
+    return x;
+}
+
+static void fill_sequential(uint16_t xptr[], int pos, int count) {
+    while (count --> 0) {
+        *xptr++ = pos++;
+    }
+}
+
+static void fill_backwards(uint16_t xptr[], int pos, int count) {
+    while (count --> 0) {
+        SkASSERT(pos >= 0);
+        *xptr++ = pos--;
+    }
+}
+
+template< U16CPU (tiley)(int x, int n) >
+static void clampx_nofilter_trans(const SkBitmapProcState& s,
+                                  uint32_t xy[], int count, int x, int y) {
+    SkASSERT(s.fInvMatrix.isTranslate());
+
+    const SkBitmapProcStateAutoMapper mapper(s, x, y);
+    *xy++ = tiley(mapper.intY(), s.fPixmap.height());
+    int xpos = mapper.intX();
+
+    const int width = s.fPixmap.width();
+    if (1 == width) {
+        memset(xy, 0, count * sizeof(uint16_t));
+        return;
+    }
+
+    uint16_t* xptr = reinterpret_cast<uint16_t*>(xy);
+    int n;
+
+    if (xpos < 0) {
+        n = -xpos;
+        if (n > count) {
+            n = count;
+        }
+        memset(xptr, 0, n * sizeof(uint16_t));
+        count -= n;
+        if (0 == count) {
+            return;
+        }
+        xptr += n;
+        xpos = 0;
+    }
+
+    if (xpos < width) {
+        n = width - xpos;
+        if (n > count) {
+            n = count;
+        }
+        fill_sequential(xptr, xpos, n);
+        count -= n;
+        if (0 == count) {
+            return;
+        }
+        xptr += n;
+    }
+
+    SkOpts::memset16(xptr, width - 1, count);
+}
+
+template< U16CPU (tiley)(int x, int n) >
+static void repeatx_nofilter_trans(const SkBitmapProcState& s,
+                                   uint32_t xy[], int count, int x, int y) {
+    SkASSERT(s.fInvMatrix.isTranslate());
+
+    const SkBitmapProcStateAutoMapper mapper(s, x, y);
+    *xy++ = tiley(mapper.intY(), s.fPixmap.height());
+    int xpos = mapper.intX();
+
+    const int width = s.fPixmap.width();
+    if (1 == width) {
+        memset(xy, 0, count * sizeof(uint16_t));
+        return;
+    }
+
+    uint16_t* xptr = reinterpret_cast<uint16_t*>(xy);
+    int start = sk_int_mod(xpos, width);
+    int n = width - start;
+    if (n > count) {
+        n = count;
+    }
+    fill_sequential(xptr, start, n);
+    xptr += n;
+    count -= n;
+
+    while (count >= width) {
+        fill_sequential(xptr, 0, width);
+        xptr += width;
+        count -= width;
+    }
+
+    if (count > 0) {
+        fill_sequential(xptr, 0, count);
+    }
+}
+
+template< U16CPU (tiley)(int x, int n) >
+static void mirrorx_nofilter_trans(const SkBitmapProcState& s,
+                                   uint32_t xy[], int count, int x, int y) {
+    SkASSERT(s.fInvMatrix.isTranslate());
+
+    const SkBitmapProcStateAutoMapper mapper(s, x, y);
+    *xy++ = tiley(mapper.intY(), s.fPixmap.height());
+    int xpos = mapper.intX();
+
+    const int width = s.fPixmap.width();
+    if (1 == width) {
+        memset(xy, 0, count * sizeof(uint16_t));
+        return;
+    }
+
+    uint16_t* xptr = reinterpret_cast<uint16_t*>(xy);
+    bool forward;
+    int n;
+    int start = sk_int_mod(xpos, 2 * width);
+    if (start >= width) {
+        start = width + ~(start - width);
+        forward = false;
+        n = start + 1;  
+    } else {
+        forward = true;
+        n = width - start;  
+    }
+    if (n > count) {
+        n = count;
+    }
+    if (forward) {
+        fill_sequential(xptr, start, n);
+    } else {
+        fill_backwards(xptr, start, n);
+    }
+    forward = !forward;
+    xptr += n;
+    count -= n;
+
+    while (count >= width) {
+        if (forward) {
+            fill_sequential(xptr, 0, width);
+        } else {
+            fill_backwards(xptr, width - 1, width);
+        }
+        forward = !forward;
+        xptr += width;
+        count -= width;
+    }
+
+    if (count > 0) {
+        if (forward) {
+            fill_sequential(xptr, 0, count);
+        } else {
+            fill_backwards(xptr, width - 1, count);
+        }
+    }
+}
+
+
+
+SkBitmapProcState::MatrixProc SkBitmapProcState::chooseMatrixProc(bool translate_only_matrix) {
+    SkASSERT(!fInvMatrix.hasPerspective());
+    SkASSERT(fTileModeX != SkTileMode::kDecal);
+
+    if( fTileModeX == fTileModeY ) {
+        if (translate_only_matrix && !fBilerp) {
+            switch (fTileModeX) {
+                default: SkASSERT(false); [[fallthrough]];
+                case SkTileMode::kClamp:  return  clampx_nofilter_trans<int_clamp>;
+                case SkTileMode::kRepeat: return repeatx_nofilter_trans<int_repeat>;
+                case SkTileMode::kMirror: return mirrorx_nofilter_trans<int_mirror>;
+            }
+        }
+
+        int index = fBilerp ? 1 : 0;
+        if (!fInvMatrix.isScaleTranslate()) {
+            index |= 2;
+        }
+
+        if (fTileModeX == SkTileMode::kClamp) {
+            fFilterOneX = SK_Fixed1;
+            fFilterOneY = SK_Fixed1;
+            return ClampX_ClampY_Procs[index];
+        }
+
+        fFilterOneX = SK_Fixed1 / fPixmap.width();
+        fFilterOneY = SK_Fixed1 / fPixmap.height();
+
+        if (fTileModeX == SkTileMode::kRepeat) {
+            return RepeatX_RepeatY_Procs[index];
+        }
+        return MirrorX_MirrorY_Procs[index];
+    }
+
+    SkASSERT(fTileModeX == fTileModeY);
+    return nullptr;
+}
+
+uint32_t sktests::pack_clamp(SkFixed f, unsigned max) {
+    return ::pack<clamp, extract_low_bits_clamp_clamp>(f, max, SK_Fixed1);
+}
+
+uint32_t sktests::pack_repeat(SkFixed f, unsigned max, size_t width) {
+    return ::pack<repeat, extract_low_bits_general>(f, max, SK_Fixed1 / width);
+}
+
+uint32_t sktests::pack_mirror(SkFixed f, unsigned max, size_t width) {
+    return ::pack<mirror, extract_low_bits_general>(f, max, SK_Fixed1 / width);
+}

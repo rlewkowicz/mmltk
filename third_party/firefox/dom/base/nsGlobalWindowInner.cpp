@@ -1,0 +1,6487 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsGlobalWindowInner.h"
+
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <cstdint>
+#include <new>
+#include <utility>
+
+#include "AudioChannelService.h"
+#include "AutoplayPolicy.h"
+#include "Crypto.h"
+#include "MainThreadUtils.h"
+#include "Navigator.h"
+#include "PaintWorkletImpl.h"
+#include "SessionStorageCache.h"
+#include "Units.h"
+#include "WindowDestroyedEvent.h"
+#include "WindowNamedPropertiesHandler.h"
+#include "js/ComparisonOperators.h"
+#include "js/CompilationAndEvaluation.h"
+#include "js/CompileOptions.h"
+#include "js/Id.h"
+#include "js/PropertyAndElement.h"  // JS_DefineProperty, JS_GetProperty
+#include "js/PropertyDescriptor.h"
+#include "js/RealmOptions.h"
+#include "js/RootingAPI.h"
+#include "js/TypeDecls.h"
+#include "js/Value.h"
+#include "js/Warnings.h"
+#include "js/friend/PerformanceHint.h"
+#include "js/loader/LoadedScript.h"
+#include "js/shadow/String.h"
+#include "jsapi.h"
+#include "jsfriendapi.h"
+#include "mozIDOMWindow.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/AppShutdown.h"
+#include "mozilla/ArrayIterator.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/BasicEvents.h"
+#include "mozilla/CallState.h"
+#include "mozilla/Components.h"
+#include "mozilla/CycleCollectedJSContext.h"
+#include "mozilla/DOMEventTargetHelper.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/EventDispatcher.h"
+#include "mozilla/EventListenerManager.h"
+#include "mozilla/EventQueue.h"
+#include "mozilla/FloatingPoint.h"
+#include "mozilla/FlushType.h"
+#include "mozilla/Likely.h"
+#include "mozilla/Logging.h"
+#include "mozilla/LookAndFeel.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/OwningNonNull.h"
+#include "mozilla/PermissionDelegateHandler.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/PresShell.h"
+#include "mozilla/ProcessHangMonitor.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/Result.h"
+#include "mozilla/ScrollContainerFrame.h"
+#include "mozilla/ScrollTypes.h"
+#include "mozilla/SizeOfState.h"
+#include "mozilla/SpinEventLoopUntil.h"
+#include "mozilla/Sprintf.h"
+#include "mozilla/StaticPrefs_browser.h"
+#include "mozilla/StaticPrefs_docshell.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/StaticPrefs_privacy.h"
+#include "mozilla/StorageAccess.h"
+#include "mozilla/StoragePrincipalHelper.h"
+#include "mozilla/ThrottledEventQueue.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/Utf16.h"
+#include "mozilla/dom/AudioContext.h"
+#include "mozilla/dom/AutoEntryScript.h"
+#include "mozilla/dom/BarProps.h"
+#include "mozilla/dom/BindingDeclarations.h"
+#include "mozilla/dom/BindingUtils.h"
+#include "mozilla/dom/BrowserChild.h"
+#include "mozilla/dom/BrowsingContext.h"
+#include "mozilla/dom/CSPEvalChecker.h"
+#include "mozilla/dom/ChromeMessageBroadcaster.h"
+#include "mozilla/dom/ClientInfo.h"
+#include "mozilla/dom/ClientManager.h"
+#include "mozilla/dom/ClientSource.h"
+#include "mozilla/dom/ClientState.h"
+#include "mozilla/dom/ClientsBinding.h"
+#include "mozilla/dom/CloseWatcher.h"
+#include "mozilla/dom/CloseWatcherManager.h"
+#include "mozilla/dom/Console.h"
+#include "mozilla/dom/ContentChild.h"
+#include "mozilla/dom/ContentFrameMessageManager.h"
+#include "mozilla/dom/ContentMediaController.h"
+#include "mozilla/dom/CookieStore.h"
+#include "mozilla/dom/CustomElementRegistry.h"
+#include "mozilla/dom/DocGroup.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/DocumentInlines.h"
+#include "mozilla/dom/Element.h"
+#include "mozilla/dom/Event.h"
+#include "mozilla/dom/EventTarget.h"
+#include "mozilla/dom/External.h"
+#include "mozilla/dom/Fetch.h"
+#include "mozilla/dom/HashChangeEvent.h"
+#include "mozilla/dom/HashChangeEventBinding.h"
+#include "mozilla/dom/IDBFactory.h"
+#include "mozilla/dom/IdleRequest.h"
+#include "mozilla/dom/ImageBitmap.h"
+#include "mozilla/dom/ImageBitmapSource.h"
+#include "mozilla/dom/IntlUtils.h"
+#include "mozilla/dom/JSExecutionUtils.h"  // mozilla::dom::Compile, mozilla::dom::EvaluationExceptionToNSResult
+#include "mozilla/dom/LSObject.h"
+#include "mozilla/dom/LocalStorage.h"
+#include "mozilla/dom/LocalStorageCommon.h"
+#include "mozilla/dom/Location.h"
+#include "mozilla/dom/Navigation.h"
+#include "mozilla/dom/NavigatorBinding.h"
+#include "mozilla/dom/Nullable.h"
+#include "mozilla/dom/PartitionedLocalStorage.h"
+#include "mozilla/dom/Performance.h"
+#include "mozilla/dom/PerformanceMainThread.h"
+#include "mozilla/dom/PolicyContainer.h"
+#include "mozilla/dom/PopStateEvent.h"
+#include "mozilla/dom/PopStateEventBinding.h"
+#include "mozilla/dom/PopupBlocker.h"
+#include "mozilla/dom/PrimitiveConversions.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/RootedDictionary.h"
+#include "mozilla/dom/ScriptLoader.h"
+#include "mozilla/dom/ScriptSettings.h"
+#include "mozilla/dom/ServiceWorker.h"
+#include "mozilla/dom/ServiceWorkerDescriptor.h"
+#include "mozilla/dom/ServiceWorkerRegistration.h"
+#include "mozilla/dom/SessionStorageManager.h"
+#include "mozilla/dom/SharedWorker.h"
+#include "mozilla/dom/Storage.h"
+#include "mozilla/dom/StorageEvent.h"
+#include "mozilla/dom/StorageEventBinding.h"
+#include "mozilla/dom/StorageNotifierService.h"
+#include "mozilla/dom/StorageUtils.h"
+#include "mozilla/dom/TabMessageTypes.h"
+#include "mozilla/dom/Timeout.h"
+#include "mozilla/dom/TimeoutHandler.h"
+#include "mozilla/dom/TimeoutManager.h"
+#include "mozilla/dom/ToJSValue.h"
+#include "mozilla/dom/TrustedTypePolicyFactory.h"
+#include "mozilla/dom/TrustedTypeUtils.h"
+#include "mozilla/dom/TrustedTypesConstants.h"
+#include "mozilla/dom/VisualViewport.h"
+#include "mozilla/dom/WebCompatBinding.h"
+#include "mozilla/dom/WebIDLGlobalNameHash.h"
+#include "mozilla/dom/WebTaskSchedulerMainThread.h"
+#include "mozilla/dom/WindowBinding.h"
+#include "mozilla/dom/WindowContext.h"
+#include "mozilla/dom/WindowGlobalChild.h"
+#include "mozilla/dom/WindowOrWorkerGlobalScopeBinding.h"
+#include "mozilla/dom/WindowProxyHolder.h"
+#include "mozilla/dom/WorkerCommon.h"
+#include "mozilla/dom/Worklet.h"
+#include "mozilla/dom/cache/CacheStorage.h"
+#include "mozilla/dom/cache/Types.h"
+#include "mozilla/fallible.h"
+#include "mozilla/gfx/BasePoint.h"
+#include "mozilla/gfx/BaseRect.h"
+#include "mozilla/gfx/BaseSize.h"
+#include "mozilla/gfx/Rect.h"
+#include "mozilla/gfx/Types.h"
+#include "mozilla/intl/LocaleService.h"
+#include "mozilla/ipc/BackgroundUtils.h"
+#include "mozilla/ipc/PBackgroundSharedTypes.h"
+#include "mozilla/net/CookieJarSettings.h"
+#include "nsAtom.h"
+#include "nsBaseHashtable.h"
+#include "nsCCUncollectableMarker.h"
+#include "nsCOMPtr.h"
+#include "nsCRT.h"
+#include "nsCRTGlue.h"
+#include "nsCanvasFrame.h"
+#include "nsCheapSets.h"
+#include "nsContentUtils.h"
+#include "nsCoord.h"
+#include "nsCycleCollectionNoteChild.h"
+#include "nsCycleCollectionTraversalCallback.h"
+#include "nsDOMNavigationTiming.h"
+#include "nsDebug.h"
+#include "nsDeviceContext.h"
+#include "nsDocShell.h"
+#include "nsFocusManager.h"
+#include "nsFrameMessageManager.h"
+#include "nsGkAtoms.h"
+#include "nsGlobalWindowOuter.h"
+#include "nsHashKeys.h"
+#include "nsHistory.h"
+#include "nsIArray.h"
+#include "nsIBrowserChild.h"
+#include "nsICancelableRunnable.h"
+#include "nsIChannel.h"
+#include "nsIClipboard.h"
+#include "nsIContentSecurityPolicy.h"
+#include "nsIControllers.h"
+#include "nsICookieJarSettings.h"
+#include "nsICookieService.h"
+#include "nsID.h"
+#include "nsIDOMStorageManager.h"
+#include "nsIDOMXULControlElement.h"
+#include "nsIDeviceSensors.h"
+#include "nsIDocShell.h"
+#include "nsIDocShellTreeItem.h"
+#include "nsIDocShellTreeOwner.h"
+#include "nsIDocumentLoader.h"
+#include "nsIDragService.h"
+#include "nsIFocusManager.h"
+#include "nsIFrame.h"
+#include "nsIGlobalObject.h"
+#include "nsIIOService.h"
+#include "nsIIdleRunnable.h"
+#include "nsIInterfaceRequestorUtils.h"
+#include "nsILoadContext.h"
+#include "nsILoadGroup.h"
+#include "nsILoadInfo.h"
+#include "nsINamed.h"
+#include "nsINode.h"
+#include "nsIObserver.h"
+#include "nsIObserverService.h"
+#include "nsIPermission.h"
+#include "nsIPermissionManager.h"
+#include "nsIPrefBranch.h"
+#include "nsIPrincipal.h"
+#include "nsIPrompt.h"
+#include "nsIRunnable.h"
+#include "nsIScreen.h"
+#include "nsIScreenManager.h"
+#include "nsIScriptContext.h"
+#include "nsIScriptGlobalObject.h"
+#include "nsIScriptObjectPrincipal.h"
+#include "nsISerialEventTarget.h"
+#include "nsISimpleEnumerator.h"
+#include "nsISizeOfEventTarget.h"
+#include "nsISlowScriptDebug.h"
+#include "nsISupportsPrimitives.h"
+#include "nsISupportsUtils.h"
+#include "nsIThread.h"
+#include "nsITimedChannel.h"
+#include "nsIURI.h"
+#include "nsIWeakReference.h"
+#include "nsIWebBrowserChrome.h"
+#include "nsIWebNavigation.h"
+#include "nsIWebProgressListener.h"
+#include "nsIWidget.h"
+#include "nsIWidgetListener.h"
+#include "nsIXULRuntime.h"
+#include "nsJSPrincipals.h"
+#include "nsJSUtils.h"
+#include "nsLayoutStatics.h"
+#include "nsLiteralString.h"
+#include "nsNetUtil.h"
+#include "nsPIDOMWindow.h"
+#include "nsPIDOMWindowInlines.h"
+#include "nsPIWindowRoot.h"
+#include "nsPoint.h"
+#include "nsPresContext.h"
+#include "nsQueryObject.h"
+#include "nsSandboxFlags.h"
+#include "nsScreen.h"
+#include "nsServiceManagerUtils.h"
+#include "nsString.h"
+#include "nsStringFlags.h"
+#include "nsStringFwd.h"
+#include "nsTArray.h"
+#include "nsTLiteralString.h"
+#include "nsTObserverArray.h"
+#include "nsTStringRepr.h"
+#include "nsThreadUtils.h"
+#include "nsWeakReference.h"
+#include "nsWindowMemoryReporter.h"
+#include "nsWindowSizes.h"
+#include "nsWrapperCache.h"
+#include "nsWrapperCacheInlines.h"
+#include "nsXULAppAPI.h"
+#include "nsrootidl.h"
+#include "prclist.h"
+#include "prtypes.h"
+#include "xpcprivate.h"
+#include "xpcpublic.h"
+
+
+#if defined(MOZ_WEBSPEECH)
+#  include "mozilla/dom/SpeechSynthesis.h"
+#endif
+
+
+#  include <unistd.h>  // for getpid()
+
+using namespace mozilla;
+using namespace mozilla::dom;
+using namespace mozilla::dom::ipc;
+using mozilla::TimeDuration;
+using mozilla::TimeStamp;
+using mozilla::dom::cache::CacheStorage;
+
+#define FORWARD_TO_OUTER(method, args, err_rval)                     \
+  PR_BEGIN_MACRO                                                     \
+  RefPtr<nsGlobalWindowOuter> outer = GetOuterWindowInternal();      \
+  if (!HasActiveDocument()) {                                        \
+    NS_WARNING(outer ? "Inner window does not have active document." \
+                     : "No outer window available!");                \
+    return err_rval;                                                 \
+  }                                                                  \
+  return outer->method args;                                         \
+  PR_END_MACRO
+
+static nsGlobalWindowOuter* GetOuterWindowForForwarding(
+    nsGlobalWindowInner* aInner, ErrorResult& aError) {
+  nsGlobalWindowOuter* outer = aInner->GetOuterWindowInternal();
+  if (MOZ_LIKELY(aInner->HasActiveDocument())) {
+    return outer;
+  }
+  if (!outer) {
+    NS_WARNING("No outer window available!");
+    aError.Throw(NS_ERROR_NOT_INITIALIZED);
+  } else {
+    aError.Throw(NS_ERROR_XPC_SECURITY_MANAGER_VETO);
+  }
+  return nullptr;
+}
+
+#define FORWARD_TO_OUTER_OR_THROW(method, args, rv, err_rval)                \
+  PR_BEGIN_MACRO                                                             \
+  RefPtr<nsGlobalWindowOuter> outer = GetOuterWindowForForwarding(this, rv); \
+  if (MOZ_LIKELY(outer)) {                                                   \
+    return outer->method args;                                               \
+  }                                                                          \
+  return err_rval;                                                           \
+  PR_END_MACRO
+
+#define FORWARD_TO_OUTER_VOID(method, args)                          \
+  PR_BEGIN_MACRO                                                     \
+  RefPtr<nsGlobalWindowOuter> outer = GetOuterWindowInternal();      \
+  if (!HasActiveDocument()) {                                        \
+    NS_WARNING(outer ? "Inner window does not have active document." \
+                     : "No outer window available!");                \
+    return;                                                          \
+  }                                                                  \
+  outer->method args;                                                \
+  return;                                                            \
+  PR_END_MACRO
+
+#define ENSURE_ACTIVE_DOCUMENT(errorresult, err_rval) \
+  PR_BEGIN_MACRO                                      \
+  if (MOZ_UNLIKELY(!HasActiveDocument())) {           \
+    aError.Throw(NS_ERROR_XPC_SECURITY_MANAGER_VETO); \
+    return err_rval;                                  \
+  }                                                   \
+  PR_END_MACRO
+
+#define DOM_TOUCH_LISTENER_ADDED "dom-touch-listener-added"
+#define MEMORY_PRESSURE_OBSERVER_TOPIC "memory-pressure"
+#define PERMISSION_CHANGED_TOPIC "perm-changed"
+
+static LazyLogModule gDOMLeakPRLogInner("DOMLeakInner");
+extern mozilla::LazyLogModule gTimeoutLog;
+
+#if defined(DEBUG)
+static LazyLogModule gDocShellAndDOMWindowLeakLogging(
+    "DocShellAndDOMWindowLeak");
+#endif
+
+static FILE* gDumpFile = nullptr;
+
+mozilla::StaticAutoPtr<nsGlobalWindowInner::InnerWindowByIdTable>
+    nsGlobalWindowInner::sInnerWindowsById;
+
+bool nsGlobalWindowInner::sDragServiceDisabled = false;
+bool nsGlobalWindowInner::sMouseDown = false;
+
+class nsGlobalWindowObserver final : public nsIObserver,
+                                     public nsIInterfaceRequestor,
+                                     public StorageNotificationObserver {
+ public:
+  explicit nsGlobalWindowObserver(nsGlobalWindowInner* aWindow)
+      : mWindow(aWindow) {}
+  NS_DECL_ISUPPORTS
+  NS_IMETHOD Observe(nsISupports* aSubject, const char* aTopic,
+                     const char16_t* aData) override {
+    if (!mWindow) return NS_OK;
+    return mWindow->Observe(aSubject, aTopic, aData);
+  }
+  void Forget() { mWindow = nullptr; }
+  NS_IMETHOD GetInterface(const nsIID& aIID, void** aResult) override {
+    if (mWindow && aIID.Equals(NS_GET_IID(nsIDOMWindow)) && mWindow) {
+      return mWindow->QueryInterface(aIID, aResult);
+    }
+    return NS_NOINTERFACE;
+  }
+
+  void ObserveStorageNotification(StorageEvent* aEvent,
+                                  const char16_t* aStorageType,
+                                  bool aPrivateBrowsing) override {
+    if (mWindow) {
+      mWindow->ObserveStorageNotification(aEvent, aStorageType,
+                                          aPrivateBrowsing);
+    }
+  }
+
+  nsIPrincipal* GetEffectiveCookiePrincipal() const override {
+    return mWindow ? mWindow->GetEffectiveCookiePrincipal() : nullptr;
+  }
+
+  nsIPrincipal* GetEffectiveStoragePrincipal() const override {
+    return mWindow ? mWindow->GetEffectiveStoragePrincipal() : nullptr;
+  }
+
+  bool IsPrivateBrowsing() const override {
+    return mWindow ? mWindow->IsPrivateBrowsing() : false;
+  }
+
+  nsIEventTarget* GetEventTarget() const override {
+    return mWindow ? mWindow->SerialEventTarget() : nullptr;
+  }
+
+ private:
+  ~nsGlobalWindowObserver() = default;
+
+  nsGlobalWindowInner* MOZ_NON_OWNING_REF mWindow;
+};
+
+NS_IMPL_ISUPPORTS(nsGlobalWindowObserver, nsIObserver, nsIInterfaceRequestor)
+
+class IdleRequestExecutor;
+
+class IdleRequestExecutorTimeoutHandler final : public TimeoutHandler {
+ public:
+  explicit IdleRequestExecutorTimeoutHandler(IdleRequestExecutor* aExecutor)
+      : mExecutor(aExecutor) {}
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_CLASS(IdleRequestExecutorTimeoutHandler)
+
+  bool Call(const char* ) override;
+
+ private:
+  ~IdleRequestExecutorTimeoutHandler() override = default;
+  RefPtr<IdleRequestExecutor> mExecutor;
+};
+
+NS_IMPL_CYCLE_COLLECTION(IdleRequestExecutorTimeoutHandler, mExecutor)
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(IdleRequestExecutorTimeoutHandler)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(IdleRequestExecutorTimeoutHandler)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(IdleRequestExecutorTimeoutHandler)
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+class IdleRequestExecutor final : public nsIRunnable,
+                                  public nsICancelableRunnable,
+                                  public nsINamed,
+                                  public nsIIdleRunnable {
+ public:
+  explicit IdleRequestExecutor(nsGlobalWindowInner* aWindow)
+      : mDispatched(false), mDeadline(TimeStamp::Now()), mWindow(aWindow) {
+    MOZ_DIAGNOSTIC_ASSERT(mWindow);
+
+    mIdlePeriodLimit = {mDeadline, mWindow->LastIdleRequestHandle()};
+    mDelayedExecutorDispatcher =
+        MakeRefPtr<IdleRequestExecutorTimeoutHandler>(this);
+  }
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(IdleRequestExecutor, nsIRunnable)
+
+  NS_DECL_NSIRUNNABLE
+  NS_DECL_NSINAMED
+  nsresult Cancel() override;
+  void SetDeadline(TimeStamp aDeadline) override;
+
+  bool IsCancelled() const { return !mWindow || mWindow->IsDying(); }
+  bool IneligibleForCurrentIdlePeriod(IdleRequest* aRequest) const {
+    return aRequest->Handle() >= mIdlePeriodLimit.mLastRequestIdInIdlePeriod &&
+           TimeStamp::Now() <= mIdlePeriodLimit.mEndOfIdlePeriod;
+  }
+
+  void MaybeUpdateIdlePeriodLimit();
+
+  void MaybeDispatch(TimeStamp aDelayUntil = TimeStamp());
+  void ScheduleDispatch();
+
+ private:
+  struct IdlePeriodLimit {
+    TimeStamp mEndOfIdlePeriod;
+    uint32_t mLastRequestIdInIdlePeriod;
+  };
+
+  void DelayedDispatch(uint32_t aDelay);
+
+  ~IdleRequestExecutor() override = default;
+
+  bool mDispatched;
+  TimeStamp mDeadline;
+  IdlePeriodLimit mIdlePeriodLimit;
+  RefPtr<nsGlobalWindowInner> mWindow;
+  RefPtr<TimeoutHandler> mDelayedExecutorDispatcher;
+  Maybe<int32_t> mDelayedExecutorHandle;
+};
+
+NS_IMPL_CYCLE_COLLECTION(IdleRequestExecutor, mWindow,
+                         mDelayedExecutorDispatcher)
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(IdleRequestExecutor)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(IdleRequestExecutor)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(IdleRequestExecutor)
+  NS_INTERFACE_MAP_ENTRY(nsIRunnable)
+  NS_INTERFACE_MAP_ENTRY(nsICancelableRunnable)
+  NS_INTERFACE_MAP_ENTRY(nsINamed)
+  NS_INTERFACE_MAP_ENTRY(nsIIdleRunnable)
+  NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIRunnable)
+NS_INTERFACE_MAP_END
+
+NS_IMETHODIMP
+IdleRequestExecutor::GetName(nsACString& aName) {
+  aName.AssignLiteral("IdleRequestExecutor");
+  return NS_OK;
+}
+
+MOZ_CAN_RUN_SCRIPT_BOUNDARY NS_IMETHODIMP IdleRequestExecutor::Run() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  mDispatched = false;
+  if (mWindow) {
+    RefPtr<nsGlobalWindowInner> window(mWindow);
+    window->ExecuteIdleRequest(mDeadline);
+  }
+
+  return NS_OK;
+}
+
+nsresult IdleRequestExecutor::Cancel() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (mDelayedExecutorHandle && mWindow) {
+    mWindow->GetTimeoutManager()->ClearTimeout(
+        mDelayedExecutorHandle.value(), Timeout::Reason::eIdleCallbackTimeout);
+  }
+
+  mWindow = nullptr;
+  return NS_OK;
+}
+
+void IdleRequestExecutor::SetDeadline(TimeStamp aDeadline) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (!mWindow) {
+    return;
+  }
+
+  mDeadline = aDeadline;
+}
+
+void IdleRequestExecutor::MaybeUpdateIdlePeriodLimit() {
+  if (TimeStamp::Now() > mIdlePeriodLimit.mEndOfIdlePeriod) {
+    mIdlePeriodLimit = {mDeadline, mWindow->LastIdleRequestHandle()};
+  }
+}
+
+void IdleRequestExecutor::MaybeDispatch(TimeStamp aDelayUntil) {
+  if (mDispatched || IsCancelled()) {
+    return;
+  }
+
+  mDispatched = true;
+
+  nsPIDOMWindowOuter* outer = mWindow->GetOuterWindow();
+  if (outer && outer->IsBackground()) {
+    DelayedDispatch(0);
+    return;
+  }
+
+  TimeStamp now = TimeStamp::Now();
+  if (!aDelayUntil || aDelayUntil < now) {
+    ScheduleDispatch();
+    return;
+  }
+
+  TimeDuration delay = aDelayUntil - now;
+  DelayedDispatch(static_cast<uint32_t>(delay.ToMilliseconds()));
+}
+
+void IdleRequestExecutor::ScheduleDispatch() {
+  MOZ_ASSERT(mWindow);
+  mDelayedExecutorHandle = Nothing();
+  RefPtr<IdleRequestExecutor> request = this;
+  NS_DispatchToCurrentThreadQueue(request.forget(), EventQueuePriority::Idle);
+}
+
+void IdleRequestExecutor::DelayedDispatch(uint32_t aDelay) {
+  MOZ_ASSERT(mWindow);
+  MOZ_ASSERT(mDelayedExecutorHandle.isNothing());
+  int32_t handle;
+  mWindow->GetTimeoutManager()->SetTimeout(
+      mDelayedExecutorDispatcher, aDelay, false,
+      Timeout::Reason::eIdleCallbackTimeout, &handle);
+  mDelayedExecutorHandle = Some(handle);
+}
+
+bool IdleRequestExecutorTimeoutHandler::Call(const char* ) {
+  if (!mExecutor->IsCancelled()) {
+    mExecutor->ScheduleDispatch();
+  }
+  return true;
+}
+
+void nsGlobalWindowInner::ScheduleIdleRequestDispatch() {
+  AssertIsOnMainThread();
+
+  if (!mIdleRequestExecutor) {
+    mIdleRequestExecutor = MakeRefPtr<IdleRequestExecutor>(this);
+  }
+
+  mIdleRequestExecutor->MaybeDispatch();
+}
+
+void nsGlobalWindowInner::SuspendIdleRequests() {
+  if (mIdleRequestExecutor) {
+    mIdleRequestExecutor->Cancel();
+    mIdleRequestExecutor = nullptr;
+  }
+}
+
+void nsGlobalWindowInner::ResumeIdleRequests() {
+  MOZ_ASSERT(!mIdleRequestExecutor);
+
+  ScheduleIdleRequestDispatch();
+}
+
+void nsGlobalWindowInner::RemoveIdleCallback(
+    mozilla::dom::IdleRequest* aRequest) {
+  AssertIsOnMainThread();
+
+  if (aRequest->HasTimeout()) {
+    mTimeoutManager->ClearTimeout(aRequest->GetTimeoutHandle(),
+                                  Timeout::Reason::eIdleCallbackTimeout);
+  }
+
+  aRequest->removeFrom(mIdleRequestCallbacks);
+}
+
+void nsGlobalWindowInner::RunIdleRequest(IdleRequest* aRequest,
+                                         DOMHighResTimeStamp aDeadline,
+                                         bool aDidTimeout) {
+  AssertIsOnMainThread();
+  RefPtr<IdleRequest> request(aRequest);
+  RemoveIdleCallback(request);
+  request->IdleRun(this, aDeadline, aDidTimeout);
+}
+
+void nsGlobalWindowInner::ExecuteIdleRequest(TimeStamp aDeadline) {
+  AssertIsOnMainThread();
+  RefPtr<IdleRequest> request = mIdleRequestCallbacks.getFirst();
+
+  if (!request) {
+    return;
+  }
+
+  if (mIdleRequestExecutor->IneligibleForCurrentIdlePeriod(request)) {
+    mIdleRequestExecutor->MaybeDispatch(aDeadline);
+    return;
+  }
+
+  DOMHighResTimeStamp deadline = 0.0;
+
+  if (Performance* perf = GetPerformance()) {
+    deadline = perf->GetDOMTiming()->TimeStampToDOMHighRes(aDeadline);
+  }
+
+  mIdleRequestExecutor->MaybeUpdateIdlePeriodLimit();
+  RunIdleRequest(request, deadline, false);
+
+  if (mIdleRequestExecutor) {
+    mIdleRequestExecutor->MaybeDispatch();
+  }
+}
+
+class IdleRequestTimeoutHandler final : public TimeoutHandler {
+ public:
+  IdleRequestTimeoutHandler(JSContext* aCx, IdleRequest* aIdleRequest,
+                            nsPIDOMWindowInner* aWindow)
+      : TimeoutHandler(aCx), mIdleRequest(aIdleRequest), mWindow(aWindow) {}
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_CLASS(IdleRequestTimeoutHandler)
+
+  MOZ_CAN_RUN_SCRIPT bool Call(const char* ) override {
+    RefPtr<nsGlobalWindowInner> window(nsGlobalWindowInner::Cast(mWindow));
+    RefPtr<IdleRequest> request(mIdleRequest);
+    window->RunIdleRequest(request, 0.0, true);
+    return true;
+  }
+
+ private:
+  ~IdleRequestTimeoutHandler() override = default;
+
+  RefPtr<IdleRequest> mIdleRequest;
+  nsCOMPtr<nsPIDOMWindowInner> mWindow;
+};
+
+NS_IMPL_CYCLE_COLLECTION(IdleRequestTimeoutHandler, mIdleRequest, mWindow)
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(IdleRequestTimeoutHandler)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(IdleRequestTimeoutHandler)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(IdleRequestTimeoutHandler)
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+uint32_t nsGlobalWindowInner::RequestIdleCallback(
+    JSContext* aCx, IdleRequestCallback& aCallback,
+    const IdleRequestOptions& aOptions, ErrorResult& aError) {
+  AssertIsOnMainThread();
+
+  if (IsDying()) {
+    return 0;
+  }
+
+  uint32_t handle = mIdleRequestCallbackCounter++;
+
+  RefPtr request = MakeRefPtr<IdleRequest>(&aCallback, handle);
+
+  if (aOptions.mTimeout.WasPassed()) {
+    int32_t timeoutHandle;
+    RefPtr handler = MakeRefPtr<IdleRequestTimeoutHandler>(aCx, request, this);
+
+    nsresult rv = mTimeoutManager->SetTimeout(
+        handler, aOptions.mTimeout.Value(), false,
+        Timeout::Reason::eIdleCallbackTimeout, &timeoutHandle);
+
+    if (NS_WARN_IF(NS_FAILED(rv))) {
+      return 0;
+    }
+
+    request->SetTimeoutHandle(timeoutHandle);
+  }
+
+  mIdleRequestCallbacks.insertBack(request);
+
+  if (!IsSuspended()) {
+    ScheduleIdleRequestDispatch();
+  }
+
+  return handle;
+}
+
+void nsGlobalWindowInner::CancelIdleCallback(uint32_t aHandle) {
+  for (IdleRequest* r : mIdleRequestCallbacks) {
+    if (r->Handle() == aHandle) {
+      RemoveIdleCallback(r);
+      break;
+    }
+  }
+}
+
+void nsGlobalWindowInner::DisableIdleCallbackRequests() {
+  if (mIdleRequestExecutor) {
+    mIdleRequestExecutor->Cancel();
+    mIdleRequestExecutor = nullptr;
+  }
+
+  while (!mIdleRequestCallbacks.isEmpty()) {
+    RefPtr<IdleRequest> request = mIdleRequestCallbacks.getFirst();
+    RemoveIdleCallback(request);
+  }
+}
+
+bool nsGlobalWindowInner::IsBackgroundInternal() const {
+  return !mOuterWindow || mOuterWindow->IsBackground();
+}
+
+class PromiseDocumentFlushedResolver final {
+ public:
+  PromiseDocumentFlushedResolver(Promise* aPromise,
+                                 PromiseDocumentFlushedCallback& aCallback)
+      : mPromise(aPromise), mCallback(&aCallback) {}
+
+  virtual ~PromiseDocumentFlushedResolver() = default;
+
+  void Call() {
+    nsMutationGuard guard;
+    ErrorResult error;
+    JS::Rooted<JS::Value> returnVal(RootingCx());
+    mCallback->Call(&returnVal, error);
+
+    if (error.Failed()) {
+      mPromise->MaybeReject(std::move(error));
+    } else if (guard.Mutated(0)) {
+      mPromise->MaybeRejectWithNoModificationAllowedError(
+          "DOM mutated from promiseDocumentFlushed callbacks");
+    } else {
+      mPromise->MaybeResolve(returnVal);
+    }
+  }
+
+  RefPtr<Promise> mPromise;
+  RefPtr<PromiseDocumentFlushedCallback> mCallback;
+};
+
+
+nsGlobalWindowInner::nsGlobalWindowInner(nsGlobalWindowOuter* aOuterWindow,
+                                         WindowGlobalChild* aActor)
+    : nsPIDOMWindowInner(aOuterWindow, aActor),
+      mHasOrientationChangeListeners(false),
+      mWasOffline(false),
+      mIsChrome(false),
+      mCleanMessageManager(false),
+      mNeedsFocus(true),
+      mFocusByKeyOccurred(false),
+      mDidFireDocElemInserted(false),
+      mWasCurrentInnerWindow(false),
+      mHintedWasLoading(false),
+      mHasOpenedExternalProtocolFrame(false),
+      mScrollMarksOnHScrollbar(false),
+      mStorageAllowedReasonCache(0),
+      mSuspendDepth(0),
+      mFreezeDepth(0),
+#if defined(DEBUG)
+      mSerial(0),
+#endif
+      mFocusMethod(0),
+      mIdleRequestCallbackCounter(1),
+      mIdleRequestExecutor(nullptr),
+      mObservingRefresh(false),
+      mIteratingDocumentFlushedResolvers(false),
+      mCanSkipCCGeneration(0) {
+  mIsInnerWindow = true;
+
+  AssertIsOnMainThread();
+  SetIsOnMainThread();
+  nsLayoutStatics::AddRef();
+
+  PR_INIT_CLIST(this);
+
+  PR_INSERT_AFTER(this, aOuterWindow);
+
+  mTimeoutManager = MakeUnique<dom::TimeoutManager>(
+      *this, StaticPrefs::dom_timeout_max_idle_defer_ms(),
+      static_cast<nsISerialEventTarget*>(nsPIDOMWindowInner::From(this)
+                                             ->GetBrowsingContextGroup()
+                                             ->GetTimerEventQueue()));
+
+  mObserver = MakeRefPtr<nsGlobalWindowObserver>(this);
+  if (nsCOMPtr<nsIObserverService> os = services::GetObserverService()) {
+    os->AddObserver(mObserver, NS_IOSERVICE_OFFLINE_STATUS_TOPIC, false);
+    os->AddObserver(mObserver, MEMORY_PRESSURE_OBSERVER_TOPIC, false);
+    os->AddObserver(mObserver, PERMISSION_CHANGED_TOPIC, false);
+    os->AddObserver(mObserver, "browser-perm-changed", false);
+    os->AddObserver(mObserver, "screen-information-changed", false);
+    os->AddObserver(mObserver, "audio-playback", false);
+  }
+
+  Preferences::AddStrongObserver(mObserver, "intl.accept_languages");
+
+  RefPtr<StorageNotifierService> sns = StorageNotifierService::GetOrCreate();
+  if (sns) {
+    sns->Register(mObserver);
+  }
+
+  if (XRE_IsContentProcess()) {
+    nsCOMPtr<nsIDocShell> docShell = GetDocShell();
+    if (docShell) {
+      mBrowserChild = docShell->GetBrowserChild();
+    }
+  }
+
+  if (gDumpFile == nullptr) {
+    nsAutoCString fname;
+    Preferences::GetCString("browser.dom.window.dump.file", fname);
+    if (!fname.IsEmpty()) {
+      gDumpFile = fopen(fname.get(), "wb+");
+    } else {
+      gDumpFile = stdout;
+    }
+  }
+
+#if defined(DEBUG)
+  mSerial = nsContentUtils::InnerOrOuterWindowCreated();
+
+  if (MOZ_LOG_TEST(gDocShellAndDOMWindowLeakLogging, LogLevel::Info)) {
+    MOZ_LOG(gDocShellAndDOMWindowLeakLogging, LogLevel::Info,
+            ("++DOMWINDOW == %d (%p) [pid = %d] [serial = %d] [outer = %p]\n",
+             nsContentUtils::GetCurrentInnerOrOuterWindowCount(),
+             static_cast<void*>(ToCanonicalSupports(this)), getpid(), mSerial,
+             static_cast<void*>(ToCanonicalSupports(aOuterWindow))));
+
+    nsCOMPtr<nsIObserverService> obs = mozilla::services::GetObserverService();
+    if (obs) {
+      nsString data;
+      data.AppendPrintf(
+          "serial=%d address=0x%" PRIxPTR " type=inner outer=0x%" PRIxPTR,
+          mSerial, reinterpret_cast<uintptr_t>(ToCanonicalSupports(this)),
+          reinterpret_cast<uintptr_t>(ToCanonicalSupports(aOuterWindow)));
+      obs->NotifyObservers(nullptr, "debug-domwindow-created", data.get());
+    }
+  }
+#endif
+
+  MOZ_LOG(gDOMLeakPRLogInner, LogLevel::Debug,
+          ("DOMWINDOW %p created outer=%p", this, aOuterWindow));
+
+  MOZ_ASSERT(sInnerWindowsById, "Inner Windows hash table must be created!");
+  MOZ_ASSERT(!sInnerWindowsById->Contains(mWindowID),
+             "This window shouldn't be in the hash table yet!");
+  if (sInnerWindowsById) {
+    sInnerWindowsById->InsertOrUpdate(mWindowID, this);
+  }
+}
+
+#if defined(DEBUG)
+
+void nsGlobalWindowInner::AssertIsOnMainThread() {
+  MOZ_ASSERT(NS_IsMainThread());
+}
+
+#endif
+
+void nsGlobalWindowInner::Init() {
+  AssertIsOnMainThread();
+
+  NS_ASSERTION(gDOMLeakPRLogInner,
+               "gDOMLeakPRLogInner should have been initialized!");
+
+  sInnerWindowsById = new InnerWindowByIdTable();
+}
+
+nsGlobalWindowInner::~nsGlobalWindowInner() {
+  AssertIsOnMainThread();
+  MOZ_ASSERT(!mHintedWasLoading);
+
+  if (IsChromeWindow()) {
+    MOZ_ASSERT(mCleanMessageManager,
+               "chrome windows may always disconnect the msg manager");
+
+    DisconnectAndClearGroupMessageManagers();
+
+    if (mChromeFields.mMessageManager) {
+      static_cast<nsFrameMessageManager*>(mChromeFields.mMessageManager.get())
+          ->Disconnect();
+    }
+
+    mCleanMessageManager = false;
+  }
+
+  FreeInnerObjects();
+
+  if (sInnerWindowsById) {
+    sInnerWindowsById->Remove(mWindowID);
+  }
+
+  nsContentUtils::InnerOrOuterWindowDestroyed();
+
+#if defined(DEBUG)
+  if (MOZ_LOG_TEST(gDocShellAndDOMWindowLeakLogging, LogLevel::Info)) {
+    nsAutoCString url;
+    if (mLastOpenedURI) {
+      url = mLastOpenedURI->GetSpecOrDefault();
+
+      const uint32_t maxURLLength = 1000;
+      if (url.Length() > maxURLLength) {
+        url.Truncate(maxURLLength);
+      }
+    }
+
+    nsGlobalWindowOuter* outer = nsGlobalWindowOuter::Cast(mOuterWindow);
+    MOZ_LOG(
+        gDocShellAndDOMWindowLeakLogging, LogLevel::Info,
+        ("--DOMWINDOW == %d (%p) [pid = %d] [serial = %d] [outer = %p] [url = "
+         "%s]\n",
+         nsContentUtils::GetCurrentInnerOrOuterWindowCount(),
+         static_cast<void*>(ToCanonicalSupports(this)), getpid(), mSerial,
+         static_cast<void*>(ToCanonicalSupports(outer)), url.get()));
+
+    uint32_t serial = mSerial;
+    NS_DispatchToMainThread(
+        NS_NewRunnableFunction(
+            "TestDOMWindowDestroyed",
+            [serial, url = std::move(url)] {
+              nsCOMPtr<nsIObserverService> obs =
+                  mozilla::services::GetObserverService();
+              if (obs) {
+                nsString data;
+                data.AppendPrintf("serial=%d type=inner url=%s", serial,
+                                  url.get());
+                obs->NotifyObservers(nullptr, "debug-domwindow-destroyed",
+                                     data.get());
+              }
+            }),
+        NS_DISPATCH_FALLIBLE);
+  }
+#endif
+  MOZ_LOG(gDOMLeakPRLogInner, LogLevel::Debug,
+          ("DOMWINDOW %p destroyed", this));
+
+
+  PR_REMOVE_LINK(this);
+
+  nsGlobalWindowOuter* outer = GetOuterWindowInternal();
+  if (outer) {
+    outer->MaybeClearInnerWindow(this);
+  }
+
+
+  nsCOMPtr<nsIDeviceSensors> ac = do_GetService(NS_DEVICE_SENSORS_CONTRACTID);
+  if (ac) ac->RemoveWindowAsListener(this);
+
+  nsLayoutStatics::Release();
+}
+
+void nsGlobalWindowInner::ShutDown() {
+  AssertIsOnMainThread();
+
+  if (gDumpFile && gDumpFile != stdout) {
+    fclose(gDumpFile);
+  }
+  gDumpFile = nullptr;
+
+  sInnerWindowsById = nullptr;
+}
+
+void nsGlobalWindowInner::FreeInnerObjects() {
+  if (IsDying()) {
+    return;
+  }
+  StartDying();
+
+  ClearHasPointerRawUpdateEventListeners();
+
+  if (auto* reporter = nsWindowMemoryReporter::Get()) {
+    reporter->ObserveDOMWindowDetached(this);
+  }
+
+  CancelWorkersForWindow(*this);
+
+  for (RefPtr<mozilla::dom::SharedWorker> pinnedWorker :
+       mSharedWorkers.ForwardRange()) {
+    pinnedWorker->Close();
+  }
+
+  if (mTimeoutManager) {
+    mTimeoutManager->ClearAllTimeouts();
+  }
+
+  DisableIdleCallbackRequests();
+
+  mChromeEventHandler = nullptr;
+
+  if (mListenerManager) {
+    mListenerManager->RemoveAllListeners();
+    mListenerManager->Disconnect();
+    mListenerManager = nullptr;
+  }
+
+  mHistory = nullptr;
+
+  mNavigation = nullptr;
+
+  if (mNavigator) {
+    mNavigator->Invalidate();
+    mNavigator = nullptr;
+  }
+
+  mScreen = nullptr;
+
+  if (mDoc) {
+    mDocumentPrincipal = mDoc->NodePrincipal();
+    mDocumentCookiePrincipal = mDoc->EffectiveCookiePrincipal();
+    mDocumentStoragePrincipal = mDoc->EffectiveStoragePrincipal();
+    mDocumentPartitionedPrincipal = mDoc->PartitionedPrincipal();
+    mDocumentURI = mDoc->GetDocumentURI();
+    mDocBaseURI = mDoc->GetDocBaseURI();
+    mDocumentPolicyContainer = mDoc->GetPolicyContainer();
+
+    while (mDoc->EventHandlingSuppressed()) {
+      mDoc->UnsuppressEventHandlingAndFireEvents(false);
+    }
+  }
+
+  mFocusedElement = nullptr;
+
+  if (RefPtr<DocGroup> docGroup = GetDocGroup()) {
+    nsTArray<nsCString> mediaSourceURLs = std::move(mMediaSourceURLs);
+    for (auto& url : mediaSourceURLs) {
+      docGroup->UnregisterMediaSourceURL(url,  false);
+    }
+  }
+
+  nsIGlobalObject::UnlinkObjectsInGlobal();
+
+  NotifyWindowIDDestroyed("inner-window-destroyed");
+
+  for (uint32_t i = 0; i < mAudioContexts.Length(); ++i) {
+    mAudioContexts[i]->OnWindowDestroy();
+  }
+  mAudioContexts.Clear();
+
+  mClientSource.reset();
+
+  if (mWindowGlobalChild) {
+    int64_t nListeners = mWindowGlobalChild->BeforeUnloadListeners();
+    for (int64_t i = 0; i < nListeners; ++i) {
+      mWindowGlobalChild->BeforeUnloadRemoved();
+    }
+    MOZ_ASSERT(mWindowGlobalChild->BeforeUnloadListeners() == 0);
+  }
+
+  CallDocumentFlushedResolvers( true);
+
+  DisconnectGlobalTeardownObservers();
+
+
+  if (mObserver) {
+    if (nsCOMPtr<nsIObserverService> os = services::GetObserverService()) {
+      os->RemoveObserver(mObserver, NS_IOSERVICE_OFFLINE_STATUS_TOPIC);
+      os->RemoveObserver(mObserver, MEMORY_PRESSURE_OBSERVER_TOPIC);
+      os->RemoveObserver(mObserver, PERMISSION_CHANGED_TOPIC);
+      os->RemoveObserver(mObserver, "browser-perm-changed");
+      os->RemoveObserver(mObserver, "screen-information-changed");
+      os->RemoveObserver(mObserver, "audio-playback");
+    }
+
+    RefPtr<StorageNotifierService> sns = StorageNotifierService::GetOrCreate();
+    if (sns) {
+      sns->Unregister(mObserver);
+    }
+
+    Preferences::RemoveObserver(mObserver, "intl.accept_languages");
+
+    mObserver->Forget();
+  }
+
+  mMenubar = nullptr;
+  mToolbar = nullptr;
+  mLocationbar = nullptr;
+  mPersonalbar = nullptr;
+  mStatusbar = nullptr;
+  mScrollbars = nullptr;
+
+  mConsole = nullptr;
+  mCookieStore = nullptr;
+  mCloseWatcherManager = nullptr;
+
+  mPaintWorklet = nullptr;
+
+  mExternal = nullptr;
+
+  if (mLocalStorage) {
+    mLocalStorage->Disconnect();
+    mLocalStorage = nullptr;
+  }
+  mSessionStorage = nullptr;
+  if (mPerformance) {
+    static_cast<PerformanceMainThread*>(mPerformance.get())
+        ->ClearGeneratedTempDataForLCP();
+  }
+  mPerformance = nullptr;
+
+  mContentMediaController = nullptr;
+
+  if (mWebTaskScheduler) {
+    mWebTaskScheduler->Disconnect();
+    mWebTaskScheduler = nullptr;
+  }
+
+  mTrustedTypePolicyFactory = nullptr;
+
+  mSharedWorkers.Clear();
+
+#if defined(MOZ_WEBSPEECH)
+  mSpeechSynthesis = nullptr;
+#endif
+
+  mParentTarget = nullptr;
+
+  if (mCleanMessageManager) {
+    MOZ_ASSERT(mIsChrome, "only chrome should have msg manager cleaned");
+    if (mChromeFields.mMessageManager) {
+      mChromeFields.mMessageManager->Disconnect();
+    }
+  }
+
+  if (mWindowGlobalChild && !mWindowGlobalChild->IsClosed()) {
+    mWindowGlobalChild->Destroy();
+  }
+
+  mIntlUtils = nullptr;
+
+  HintIsLoading(false);
+}
+
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(nsGlobalWindowInner)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, EventTarget)
+  NS_INTERFACE_MAP_ENTRY(nsIDOMWindow)
+  NS_INTERFACE_MAP_ENTRY(nsIGlobalObject)
+  NS_INTERFACE_MAP_ENTRY(nsIScriptGlobalObject)
+  NS_INTERFACE_MAP_ENTRY(nsIScriptObjectPrincipal)
+  NS_INTERFACE_MAP_ENTRY(mozilla::dom::EventTarget)
+  NS_INTERFACE_MAP_ENTRY(nsPIDOMWindowInner)
+  NS_INTERFACE_MAP_ENTRY(mozIDOMWindow)
+  NS_INTERFACE_MAP_ENTRY(nsISupportsWeakReference)
+  NS_INTERFACE_MAP_ENTRY(nsIInterfaceRequestor)
+NS_INTERFACE_MAP_END
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(nsGlobalWindowInner)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(nsGlobalWindowInner)
+
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_BEGIN(nsGlobalWindowInner)
+  if (tmp->IsBlackForCC(false)) {
+    if (nsCCUncollectableMarker::InGeneration(tmp->mCanSkipCCGeneration)) {
+      return true;
+    }
+    tmp->mCanSkipCCGeneration = nsCCUncollectableMarker::sGeneration;
+    if (EventListenerManager* elm = tmp->GetExistingListenerManager()) {
+      elm->MarkForCC();
+    }
+    if (tmp->mTimeoutManager) {
+      tmp->mTimeoutManager->UnmarkGrayTimers();
+    }
+    return true;
+  }
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_END
+
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_IN_CC_BEGIN(nsGlobalWindowInner)
+  return tmp->IsBlackForCC(true);
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_IN_CC_END
+
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_THIS_BEGIN(nsGlobalWindowInner)
+  return tmp->IsBlackForCC(false);
+NS_IMPL_CYCLE_COLLECTION_CAN_SKIP_THIS_END
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(nsGlobalWindowInner)
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INTERNAL(nsGlobalWindowInner)
+  if (MOZ_UNLIKELY(cb.WantDebugInfo())) {
+    char name[512];
+    nsAutoCString uri;
+    if (tmp->mDoc && tmp->mDoc->GetDocumentURI()) {
+      uri = tmp->mDoc->GetDocumentURI()->GetSpecOrDefault();
+    }
+    SprintfLiteral(name, "nsGlobalWindowInner # %" PRIu64 " inner %s",
+                   tmp->mWindowID, uri.get());
+    cb.DescribeRefCountedNode(tmp->mRefCnt.get(), name);
+  } else {
+    NS_IMPL_CYCLE_COLLECTION_DESCRIBE(nsGlobalWindowInner, tmp->mRefCnt.get())
+  }
+
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mNavigation)
+
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mNavigator)
+
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mPerformance)
+
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mWebTaskScheduler)
+
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mWebTaskSchedulingState)
+
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mTrustedTypePolicyFactory)
+
+#if defined(MOZ_WEBSPEECH)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mSpeechSynthesis)
+#endif
+
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mOuterWindow)
+
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mTopInnerWindow)
+
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mListenerManager)
+
+  if (tmp->mTimeoutManager) {
+    tmp->mTimeoutManager->ForEachUnorderedTimeout([&cb](Timeout* timeout) {
+      cb.NoteNativeChild(timeout, NS_CYCLE_COLLECTION_PARTICIPANT(Timeout));
+    });
+  }
+
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mLocation)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mHistory)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mCustomElements)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mSharedWorkers)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mLocalStorage)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mSessionStorage)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mIndexedDB)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mDocumentPrincipal)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mDocumentCookiePrincipal)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mDocumentStoragePrincipal)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mDocumentPartitionedPrincipal)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mDocumentPolicyContainer)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mBrowserChild)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mDoc)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mIdleRequestExecutor)
+  for (IdleRequest* request : tmp->mIdleRequestCallbacks) {
+    cb.NoteNativeChild(request, NS_CYCLE_COLLECTION_PARTICIPANT(IdleRequest));
+  }
+
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mClientSource)
+
+
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mCacheStorage)
+
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mChromeEventHandler)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mParentTarget)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mFocusedElement)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mBrowsingContext)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mWindowGlobalChild)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mCloseWatcherManager)
+
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mMenubar)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mToolbar)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mLocationbar)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mPersonalbar)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mStatusbar)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mScrollbars)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mCrypto)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mConsole)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mCookieStore)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mPaintWorklet)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mExternal)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mIntlUtils)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mVisualViewport)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mCurrentPasteDataTransfer)
+
+  tmp->TraverseObjectsInGlobal(cb);
+
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mChromeFields.mMessageManager)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mChromeFields.mGroupMessageManagers)
+
+  for (size_t i = 0; i < tmp->mDocumentFlushedResolvers.Length(); i++) {
+    NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mDocumentFlushedResolvers[i]->mPromise);
+    NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mDocumentFlushedResolvers[i]->mCallback);
+  }
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(nsGlobalWindowInner)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_WEAK_REFERENCE
+  if (sInnerWindowsById) {
+    sInnerWindowsById->Remove(tmp->mWindowID);
+  }
+
+  JSObject* wrapper = tmp->GetWrapperPreserveColor();
+  if (wrapper) {
+    JS::SetRealmNonLive(js::GetNonCCWObjectRealm(wrapper));
+  }
+
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mNavigation)
+
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mNavigator)
+
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mPerformance)
+
+  if (tmp->mWebTaskScheduler) {
+    tmp->mWebTaskScheduler->Disconnect();
+    NS_IMPL_CYCLE_COLLECTION_UNLINK(mWebTaskScheduler)
+  }
+
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mWebTaskSchedulingState)
+
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mTrustedTypePolicyFactory)
+
+#if defined(MOZ_WEBSPEECH)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mSpeechSynthesis)
+#endif
+
+  if (tmp->mOuterWindow) {
+    nsGlobalWindowOuter::Cast(tmp->mOuterWindow)->MaybeClearInnerWindow(tmp);
+    NS_IMPL_CYCLE_COLLECTION_UNLINK(mOuterWindow)
+  }
+
+  if (tmp->mListenerManager) {
+    tmp->mListenerManager->Disconnect();
+    NS_IMPL_CYCLE_COLLECTION_UNLINK(mListenerManager)
+  }
+
+
+  tmp->UpdateTopInnerWindow();
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mTopInnerWindow)
+
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mLocation)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mHistory)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mNavigation)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mCustomElements)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mSharedWorkers)
+  if (tmp->mLocalStorage) {
+    tmp->mLocalStorage->Disconnect();
+    NS_IMPL_CYCLE_COLLECTION_UNLINK(mLocalStorage)
+  }
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mSessionStorage)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mIndexedDB)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mDocumentPrincipal)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mDocumentCookiePrincipal)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mDocumentStoragePrincipal)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mDocumentPartitionedPrincipal)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mDocumentPolicyContainer)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mBrowserChild)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mDoc)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mCacheStorage)
+
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mChromeEventHandler)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mParentTarget)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mFocusedElement)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mBrowsingContext)
+
+  MOZ_DIAGNOSTIC_ASSERT(
+      !tmp->mWindowGlobalChild || tmp->mWindowGlobalChild->IsClosed(),
+      "How are we unlinking a window before its actor has been destroyed?");
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mWindowGlobalChild)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mCloseWatcherManager)
+
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mMenubar)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mToolbar)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mLocationbar)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mPersonalbar)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mStatusbar)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mScrollbars)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mCrypto)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mConsole)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mCookieStore)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mPaintWorklet)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mExternal)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mIntlUtils)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mVisualViewport)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mCurrentPasteDataTransfer)
+
+  tmp->UnlinkObjectsInGlobal();
+
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mIdleRequestExecutor)
+
+
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mClientSource)
+
+  if (tmp->IsChromeWindow()) {
+    if (tmp->mChromeFields.mMessageManager) {
+      static_cast<nsFrameMessageManager*>(
+          tmp->mChromeFields.mMessageManager.get())
+          ->Disconnect();
+      NS_IMPL_CYCLE_COLLECTION_UNLINK(mChromeFields.mMessageManager)
+    }
+    tmp->DisconnectAndClearGroupMessageManagers();
+    NS_IMPL_CYCLE_COLLECTION_UNLINK(mChromeFields.mGroupMessageManagers)
+  }
+
+  for (size_t i = 0; i < tmp->mDocumentFlushedResolvers.Length(); i++) {
+    NS_IMPL_CYCLE_COLLECTION_UNLINK(mDocumentFlushedResolvers[i]->mPromise);
+    NS_IMPL_CYCLE_COLLECTION_UNLINK(mDocumentFlushedResolvers[i]->mCallback);
+  }
+  tmp->mDocumentFlushedResolvers.Clear();
+
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_PRESERVED_WRAPPER
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+#if defined(DEBUG)
+void nsGlobalWindowInner::RiskyUnlink() {
+  NS_CYCLE_COLLECTION_INNERNAME.Unlink(this);
+}
+#endif
+
+NS_IMPL_CYCLE_COLLECTION_TRACE_BEGIN(nsGlobalWindowInner)
+  NS_IMPL_CYCLE_COLLECTION_TRACE_PRESERVED_WRAPPER
+NS_IMPL_CYCLE_COLLECTION_TRACE_END
+
+bool nsGlobalWindowInner::IsBlackForCC(bool aTracingNeeded) {
+  if (!nsCCUncollectableMarker::sGeneration) {
+    return false;
+  }
+
+  return (nsCCUncollectableMarker::InGeneration(GetMarkedCCGeneration()) ||
+          HasKnownLiveWrapper()) &&
+         (!aTracingNeeded || HasNothingToTrace(ToSupports(this)));
+}
+
+
+bool nsGlobalWindowInner::ShouldResistFingerprinting(RFPTarget aTarget) const {
+  if (mDoc) {
+    return mDoc->ShouldResistFingerprinting(aTarget);
+  }
+  return nsContentUtils::ShouldResistFingerprinting(
+      "If we do not have a document then we do not have any context"
+      "to make an informed RFP choice, so we fall back to the global pref",
+      aTarget);
+}
+
+OriginTrials nsGlobalWindowInner::Trials() const {
+  return OriginTrials::FromWindow(this);
+}
+
+FontFaceSet* nsGlobalWindowInner::GetFonts() {
+  if (mDoc) {
+    return mDoc->Fonts();
+  }
+  return nullptr;
+}
+
+mozilla::Result<mozilla::ipc::PrincipalInfo, nsresult>
+nsGlobalWindowInner::GetStorageKey() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  nsIPrincipal* principal = GetEffectiveStoragePrincipal();
+  if (!principal) {
+    return mozilla::Err(NS_ERROR_FAILURE);
+  }
+
+  mozilla::ipc::PrincipalInfo principalInfo;
+  nsresult rv = PrincipalToPrincipalInfo(principal, &principalInfo);
+  if (NS_FAILED(rv)) {
+    return mozilla::Err(rv);
+  }
+
+  if (principalInfo.type() !=
+          mozilla::ipc::PrincipalInfo::TContentPrincipalInfo &&
+      principalInfo.type() !=
+          mozilla::ipc::PrincipalInfo::TSystemPrincipalInfo) {
+    return Err(NS_ERROR_DOM_SECURITY_ERR);
+  }
+
+  return std::move(principalInfo);
+}
+
+mozilla::dom::StorageManager* nsGlobalWindowInner::GetStorageManager() {
+  return Navigator()->Storage();
+}
+
+bool nsGlobalWindowInner::IsEligibleForMessaging() { return IsFullyActive(); }
+
+void nsGlobalWindowInner::ReportToConsole(
+    uint32_t aErrorFlags, const nsCString& aCategory, PropertiesFile aFile,
+    const nsCString& aMessageName, const nsTArray<nsString>& aParams,
+    const mozilla::SourceLocation& aLocation) {
+  nsContentUtils::ReportToConsole(aErrorFlags, aCategory, mDoc, aFile,
+                                  aMessageName.get(), aParams, aLocation);
+}
+
+nsresult nsGlobalWindowInner::EnsureScriptEnvironment() {
+  nsGlobalWindowOuter* outer = GetOuterWindowInternal();
+  if (!outer) {
+    NS_WARNING("No outer window available!");
+    return NS_ERROR_FAILURE;
+  }
+  return outer->EnsureScriptEnvironment();
+}
+
+nsIScriptContext* nsGlobalWindowInner::GetScriptContext() {
+  nsGlobalWindowOuter* outer = GetOuterWindowInternal();
+  if (!outer) {
+    return nullptr;
+  }
+  return outer->GetScriptContext();
+}
+
+void nsGlobalWindowInner::TraceGlobalJSObject(JSTracer* aTrc) {
+  TraceWrapper(aTrc, "active window global");
+}
+
+void nsGlobalWindowInner::UpdateAutoplayPermission() {
+  if (!GetWindowContext()) {
+    return;
+  }
+  uint32_t perm =
+      media::AutoplayPolicy::GetSiteAutoplayPermission(GetPrincipal());
+  if (GetWindowContext()->GetAutoplayPermission() == perm) {
+    return;
+  }
+
+  (void)GetWindowContext()->SetAutoplayPermission(perm);
+}
+
+void nsGlobalWindowInner::UpdateShortcutsPermission() {
+  if (!GetWindowContext() ||
+      !GetWindowContext()->GetBrowsingContext()->IsTop()) {
+    return;
+  }
+
+  uint32_t perm = GetShortcutsPermission(GetPrincipal());
+
+  if (GetWindowContext()->GetShortcutsPermission() == perm) {
+    return;
+  }
+
+  (void)GetWindowContext()->SetShortcutsPermission(perm);
+}
+
+uint32_t nsGlobalWindowInner::GetShortcutsPermission(nsIPrincipal* aPrincipal) {
+  uint32_t perm = nsIPermissionManager::DENY_ACTION;
+  nsCOMPtr<nsIPermissionManager> permMgr =
+      mozilla::components::PermissionManager::Service();
+  if (aPrincipal && permMgr) {
+    permMgr->TestExactPermissionFromPrincipal(aPrincipal, "shortcuts"_ns,
+                                              &perm);
+  }
+  return perm;
+}
+
+void nsGlobalWindowInner::UpdatePopupPermission() {
+  if (!GetWindowContext()) {
+    return;
+  }
+
+  uint32_t perm = PopupBlocker::GetPopupPermission(GetPrincipal());
+  if (GetWindowContext()->GetPopupPermission() == perm) {
+    return;
+  }
+
+  (void)GetWindowContext()->SetPopupPermission(perm);
+}
+
+void nsGlobalWindowInner::UpdatePermissions() {
+  if (!GetWindowContext()) {
+    return;
+  }
+
+  nsCOMPtr<nsIPrincipal> principal = GetPrincipal();
+  RefPtr<WindowContext> windowContext = GetWindowContext();
+
+  WindowContext::Transaction txn;
+  txn.SetAutoplayPermission(
+      media::AutoplayPolicy::GetSiteAutoplayPermission(principal));
+  txn.SetPopupPermission(PopupBlocker::GetPopupPermission(principal));
+
+  if (windowContext->IsTop()) {
+    txn.SetShortcutsPermission(GetShortcutsPermission(principal));
+  }
+
+  (void)txn.Commit(windowContext);
+}
+
+void nsGlobalWindowInner::InitDocumentDependentState(JSContext* aCx) {
+  MOZ_ASSERT(mDoc);
+
+  if (MOZ_LOG_TEST(gDOMLeakPRLogInner, LogLevel::Debug)) {
+    nsIURI* uri = mDoc->GetDocumentURI();
+    MOZ_LOG(gDOMLeakPRLogInner, LogLevel::Debug,
+            ("DOMWINDOW %p SetNewDocument %s", this,
+             uri ? uri->GetSpecOrDefault().get() : ""));
+  }
+
+  mFocusedElement = nullptr;
+  mLocalStorage = nullptr;
+  mSessionStorage = nullptr;
+  mPerformance = nullptr;
+  if (mWebTaskScheduler) {
+    mWebTaskScheduler->Disconnect();
+    mWebTaskScheduler = nullptr;
+    mWebTaskSchedulingState = nullptr;
+  }
+
+  ClearDocumentDependentSlots(aCx);
+
+  if (!mWindowGlobalChild) {
+    mWindowGlobalChild = WindowGlobalChild::Create(this);
+  } else {
+    MOZ_ASSERT(NS_IsAboutBlankAllowQueryAndFragment(GetDocumentURI()),
+               "AboutBlankInitializer should only be used with about:blank");
+  }
+  MOZ_ASSERT(!GetWindowContext()->HasBeenUserGestureActivated(),
+             "WindowContext should always not have user gesture activation at "
+             "this point.");
+
+  UpdatePermissions();
+
+  RefPtr<PermissionDelegateHandler> permDelegateHandler =
+      mDoc->GetPermissionDelegateHandler();
+
+  if (permDelegateHandler) {
+    permDelegateHandler->PopulateAllDelegatedPermissions();
+  }
+
+
+#if defined(DEBUG)
+  mLastOpenedURI = mDoc->GetDocumentURI();
+#endif
+}
+
+nsresult nsGlobalWindowInner::EnsureClientSource() {
+  MOZ_DIAGNOSTIC_ASSERT(mDoc);
+
+  bool newClientSource = false;
+
+  nsCOMPtr<nsILoadInfo> loadInfo;
+  nsCOMPtr<nsIChannel> channel = mDoc->GetChannel();
+  if (channel) {
+    nsCOMPtr<nsIURI> uri;
+    (void)channel->GetURI(getter_AddRefs(uri));
+
+    bool ignoreLoadInfo = false;
+
+    if (uri->SchemeIs("about")) {
+      ignoreLoadInfo =
+          NS_IsAboutBlankAllowQueryAndFragment(uri) || NS_IsAboutSrcdoc(uri);
+    } else {
+      ignoreLoadInfo = uri->SchemeIs("data") || uri->SchemeIs("blob");
+    }
+
+    if (!ignoreLoadInfo) {
+      loadInfo = channel->LoadInfo();
+    }
+  }
+
+  UniquePtr<ClientSource> initialClientSource;
+  nsIDocShell* docshell = GetDocShell();
+  if (docshell) {
+    initialClientSource = docshell->TakeInitialClientSource();
+  }
+
+  if (loadInfo) {
+    UniquePtr<ClientSource> reservedClient =
+        loadInfo->TakeReservedClientSource();
+    if (reservedClient) {
+      mClientSource.reset();
+      mClientSource = std::move(reservedClient);
+      newClientSource = true;
+    }
+  }
+
+  if (!mClientSource) {
+    mClientSource = std::move(initialClientSource);
+    if (mClientSource) {
+      newClientSource = true;
+    }
+  }
+
+  nsCOMPtr<nsIPrincipal> foreignPartitionedPrincipal;
+
+  nsresult rv = StoragePrincipalHelper::GetPrincipal(
+      this,
+      StaticPrefs::privacy_partition_serviceWorkers()
+          ? StoragePrincipalHelper::eForeignPartitionedPrincipal
+          : StoragePrincipalHelper::eRegularPrincipal,
+      getter_AddRefs(foreignPartitionedPrincipal));
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (mClientSource) {
+    auto principalOrErr = mClientSource->Info().GetPrincipal();
+    nsCOMPtr<nsIPrincipal> clientPrincipal =
+        principalOrErr.isOk() ? principalOrErr.unwrap() : nullptr;
+    if (!clientPrincipal ||
+        !clientPrincipal->Equals(foreignPartitionedPrincipal)) {
+      mClientSource.reset();
+    }
+  }
+
+  if (!mClientSource) {
+    mClientSource = ClientManager::CreateSource(
+        ClientType::Window, SerialEventTarget(), foreignPartitionedPrincipal);
+    MOZ_DIAGNOSTIC_ASSERT(mClientSource);
+    newClientSource = true;
+
+  }
+
+  else if (loadInfo) {
+    const Maybe<ServiceWorkerDescriptor> controller = loadInfo->GetController();
+    if (controller.isSome()) {
+      mClientSource->SetController(controller.ref());
+    }
+
+    else if (mClientSource->GetController().isSome()) {
+      mClientSource.reset();
+      mClientSource = ClientManager::CreateSource(
+          ClientType::Window, SerialEventTarget(), foreignPartitionedPrincipal);
+      MOZ_DIAGNOSTIC_ASSERT(mClientSource);
+      newClientSource = true;
+    }
+  }
+
+  if (mClientSource) {
+    mClientSource->SetPolicyContainer(mDoc->GetPolicyContainer());
+
+    DocGroup* docGroup = GetDocGroup();
+    MOZ_DIAGNOSTIC_ASSERT(docGroup);
+    mClientSource->SetAgentClusterId(docGroup->AgentClusterId());
+
+    if (mWindowGlobalChild) {
+      mWindowGlobalChild->SendSetClientInfo(mClientSource->Info().ToIPC());
+    }
+  }
+
+  if (newClientSource && IsFrozen()) {
+    mClientSource->Freeze();
+  }
+
+  return NS_OK;
+}
+
+nsresult nsGlobalWindowInner::ExecutionReady() {
+  nsresult rv = EnsureClientSource();
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  rv = mClientSource->WindowExecutionReady(this);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  return NS_OK;
+}
+
+void nsGlobalWindowInner::UpdateParentTarget() {
+
+
+  nsPIDOMWindowOuter* outer = GetOuterWindow();
+  if (!outer) {
+    return;
+  }
+  nsCOMPtr<Element> frameElement = outer->GetFrameElementInternal();
+  nsCOMPtr<EventTarget> eventTarget =
+      nsContentUtils::TryGetBrowserChildGlobal(frameElement);
+
+  if (!eventTarget) {
+    nsGlobalWindowOuter* topWin = GetInProcessScriptableTopInternal();
+    if (topWin) {
+      frameElement = topWin->GetFrameElementInternal();
+      eventTarget = nsContentUtils::TryGetBrowserChildGlobal(frameElement);
+    }
+  }
+
+  if (!eventTarget) {
+    eventTarget = nsContentUtils::TryGetBrowserChildGlobal(mChromeEventHandler);
+  }
+
+  if (!eventTarget) {
+    eventTarget = mChromeEventHandler;
+  }
+
+  mParentTarget = std::move(eventTarget);
+}
+
+EventTarget* nsGlobalWindowInner::GetTargetForDOMEvent() {
+  return GetOuterWindowInternal();
+}
+
+void nsGlobalWindowInner::GetEventTargetParent(EventChainPreVisitor& aVisitor) {
+  aVisitor.mCanHandle = true;
+  aVisitor.mForceContentDispatch = true;  
+  switch (aVisitor.mEvent->mMessage) {
+    case eResize:
+      if (aVisitor.mEvent->IsTrusted()) {
+        if (aVisitor.mEvent->mOriginalTarget &&
+            aVisitor.mEvent->mOriginalTarget->IsInnerWindow()) {
+          mIsHandlingResizeEvent = true;
+        }
+      }
+      break;
+    case eMouseDown:
+      if (aVisitor.mEvent->IsTrusted()) {
+        sMouseDown = true;
+      }
+      break;
+    case eMouseUp:
+    case eDragEnd:
+      if (aVisitor.mEvent->IsTrusted()) {
+        sMouseDown = false;
+        if (sDragServiceDisabled) {
+          nsCOMPtr<nsIDragService> ds =
+              do_GetService("@mozilla.org/widget/dragservice;1");
+          if (ds) {
+            sDragServiceDisabled = false;
+            ds->Unsuppress();
+          }
+        }
+      }
+      break;
+    default:
+      break;
+  }
+
+  aVisitor.SetParentTarget(GetParentTarget(), true);
+}
+
+enum class EmptyFrameLibrary {
+  None,
+  CKEditor,
+  GWT,
+  ZE,
+};
+
+MOZ_CAN_RUN_SCRIPT static bool IsDeferredLoadEmptyFrame(Element& aEmbedder) {
+  const nsAttrValue* classes = aEmbedder.GetClasses();
+  if (!classes) {
+    return false;
+  }
+  EmptyFrameLibrary lib = EmptyFrameLibrary::None;
+  if (StaticPrefs::dom_about_blank_ckeditor_hack_enabled() &&
+      classes->Contains(nsGkAtoms::cke_wysiwyg_frame, eCaseMatters)) {
+    lib = EmptyFrameLibrary::CKEditor;
+  } else if (StaticPrefs::dom_about_blank_gwt_hack_enabled() &&
+             classes->Contains(nsGkAtoms::gwt_RichTextArea, eCaseMatters)) {
+    lib = EmptyFrameLibrary::GWT;
+  } else if (StaticPrefs::dom_about_blank_polarion_gwt_hack_enabled() &&
+             classes->Contains(nsGkAtoms::polarion_rte_RichTextArea,
+                               eCaseMatters)) {
+    lib = EmptyFrameLibrary::GWT;
+  } else if (StaticPrefs::dom_about_blank_ze_hack_enabled() &&
+             classes->Contains(nsGkAtoms::ze_area, eCaseMatters)) {
+    lib = EmptyFrameLibrary::ZE;
+  }
+  if (lib == EmptyFrameLibrary::None) {
+    return false;
+  }
+  if (!aEmbedder.IsHTMLElement(nsGkAtoms::iframe)) {
+    return false;
+  }
+  MOZ_ASSERT(!aEmbedder.HasAttr(nsGkAtoms::srcdoc));
+  const auto* src = aEmbedder.GetParsedAttr(nsGkAtoms::src);
+  switch (lib) {
+    case EmptyFrameLibrary::CKEditor:
+      if (!src || !src->IsEmptyString()) {
+        return false;
+      }
+      break;
+    default:
+      if (src) {
+        return false;
+      }
+      break;
+  }
+  const char* blocklistPref = "";
+  switch (lib) {
+    case EmptyFrameLibrary::CKEditor:
+      blocklistPref = "dom.about-blank-ckeditor-hack.disabled-domains";
+      break;
+    case EmptyFrameLibrary::GWT:
+      blocklistPref = "dom.about-blank-gwt-hack.disabled-domains";
+      break;
+    case EmptyFrameLibrary::ZE:
+      blocklistPref = "dom.about-blank-ze-hack.disabled-domains";
+      break;
+    case EmptyFrameLibrary::None:
+      MOZ_ASSERT_UNREACHABLE();
+      return false;
+  }
+
+  if (aEmbedder.NodePrincipal()->IsURIInPrefList(blocklistPref)) {
+    return false;
+  }
+  RefPtr global = aEmbedder.GetRelevantGlobal();
+  if (!global || !global->GetGlobalJSObject()) {
+    return false;
+  }
+  AutoJSAPI jsapi;
+  if (!jsapi.Init(global)) {
+    return false;
+  }
+  if (lib == EmptyFrameLibrary::GWT) {
+    JS::Rooted<JSObject*> globalObj(jsapi.cx(), global->GetGlobalJSObject());
+    JS::Rooted<JS::Value> val(jsapi.cx());
+    if (!JS_GetProperty(jsapi.cx(), globalObj, "__gwt_stylesLoaded", &val)) {
+      JS_ClearPendingException(jsapi.cx());
+      return false;
+    }
+    if (!val.isObject()) {
+      return false;
+    }
+    aEmbedder.OwnerDoc()->WarnOnceAbout(
+        DeprecatedOperations::eGWTRichTextAreaCompatHack);
+    return true;
+  }
+  CkEditorProperty property;
+  JS::Rooted<JS::Value> v(jsapi.cx(),
+                          JS::ObjectValue(*global->GetGlobalJSObject()));
+  if (!property.Init(jsapi.cx(), v)) {
+    JS_ClearPendingException(jsapi.cx());
+    return false;
+  }
+  switch (lib) {
+    case EmptyFrameLibrary::GWT:
+    case EmptyFrameLibrary::None:
+      MOZ_ASSERT_UNREACHABLE();
+      return false;
+    case EmptyFrameLibrary::ZE:
+      if (!property.mZE_Init.WasPassed()) {
+        return false;
+      }
+      aEmbedder.OwnerDoc()->WarnOnceAbout(
+          DeprecatedOperations::eOldZECompatHack);
+      return true;
+    case EmptyFrameLibrary::CKEditor:
+      const auto* version = [&]() -> const CkEditorVersion* {
+        if (property.mCKEDITOR.WasPassed()) {
+          return &property.mCKEDITOR.Value();
+        }
+        if (property.mJEDITOR.WasPassed()) {
+          return &property.mJEDITOR.Value();
+        }
+        return nullptr;
+      }();
+      if (!version) {
+        return false;
+      }
+      if (!(StringBeginsWith(version->mVersion, u"4."_ns) ||
+            version->mVersion.EqualsLiteral(u"%VERSION%"))) {
+        return false;
+      }
+      aEmbedder.OwnerDoc()->WarnOnceAbout(
+          DeprecatedOperations::eCKEditor4CompatHack);
+      return true;
+  }
+  MOZ_ASSERT_UNREACHABLE("Every switch case should have returned.");
+  return false;
+}
+
+MOZ_CAN_RUN_SCRIPT static bool NeedsAsyncLoadEventForInitialDocument(
+    nsGlobalWindowInner& aInner, Element& aEmbedder) {
+  if (auto* doc = aInner.GetExtantDoc(); !doc || !doc->IsInitialDocument()) {
+    return false;
+  }
+  return IsDeferredLoadEmptyFrame(aEmbedder);
+}
+
+void nsGlobalWindowInner::FireFrameLoadEvent() {
+  if (GetBrowsingContext()->IsTopContent() ||
+      GetBrowsingContext()->IsChrome()) {
+    return;
+  }
+
+  if (RefPtr<Element> element = GetBrowsingContext()->GetEmbedderElement()) {
+    if (NeedsAsyncLoadEventForInitialDocument(*this, *element)) {
+      (new AsyncEventDispatcher(element, eLoad, CanBubble::eNo))
+          ->PostDOMEvent();
+      return;
+    }
+
+    nsEventStatus status = nsEventStatus_eIgnore;
+    WidgetEvent event( true, eLoad);
+    event.mFlags.mBubbles = false;
+    event.mFlags.mCancelable = false;
+
+    EventDispatcher::Dispatch(element, nullptr, &event, nullptr, &status);
+    return;
+  }
+
+  RefPtr<BrowserChild> browserChild =
+      BrowserChild::GetFrom(static_cast<nsPIDOMWindowInner*>(this));
+  if (browserChild &&
+      !GetBrowsingContext()->GetParentWindowContext()->IsInProcess()) {
+    nsCOMPtr<nsPIDOMWindowOuter> rootOuter =
+        do_GetInterface(browserChild->WebNavigation());
+    if (!rootOuter || rootOuter != GetOuterWindow()) {
+      return;
+    }
+
+    (void)browserChild->SendMaybeFireEmbedderLoadEvents(
+        EmbedderElementEventType::LoadEvent);
+  }
+}
+
+nsresult nsGlobalWindowInner::PostHandleEvent(EventChainPostVisitor& aVisitor) {
+  switch (aVisitor.mEvent->mMessage) {
+    case eResize:
+    case eUnload:
+    case eLoad:
+      break;
+    default:
+      return NS_OK;
+  }
+
+  RefPtr<EventTarget> kungFuDeathGrip1(mChromeEventHandler);
+  (void)kungFuDeathGrip1;  
+  nsCOMPtr<nsIScriptContext> kungFuDeathGrip2(GetContextInternal());
+  (void)kungFuDeathGrip2;  
+
+  if (aVisitor.mEvent->mMessage == eResize) {
+    mIsHandlingResizeEvent = false;
+  } else if (aVisitor.mEvent->mMessage == eUnload &&
+             aVisitor.mEvent->IsTrusted()) {
+    mIsDocumentLoaded = false;
+    if (mWindowGlobalChild) {
+      mWindowGlobalChild->SendUpdateDocumentHasLoaded(mIsDocumentLoaded);
+    }
+  } else if (aVisitor.mEvent->mMessage == eLoad &&
+             aVisitor.mEvent->IsTrusted()) {
+    mIsDocumentLoaded = true;
+    if (mWindowGlobalChild) {
+      mWindowGlobalChild->SendUpdateDocumentHasLoaded(mIsDocumentLoaded);
+    }
+
+    mTimeoutManager->OnDocumentLoaded();
+
+    MOZ_ASSERT(aVisitor.mEvent->IsTrusted());
+    FireFrameLoadEvent();
+
+  }
+
+  return NS_OK;
+}
+
+nsresult nsGlobalWindowInner::DefineArgumentsProperty(nsIArray* aArguments) {
+  nsIScriptContext* ctx = GetOuterWindowInternal()->mContext;
+  NS_ENSURE_TRUE(aArguments && ctx, NS_ERROR_NOT_INITIALIZED);
+
+  JS::Rooted<JSObject*> obj(RootingCx(), GetWrapperPreserveColor());
+  return ctx->SetProperty(obj, "arguments", aArguments);
+}
+
+
+nsIPrincipal* nsGlobalWindowInner::GetPrincipal() {
+  if (mDoc) {
+    return mDoc->NodePrincipal();
+  }
+
+  if (mDocumentPrincipal) {
+    return mDocumentPrincipal;
+  }
+
+
+  nsCOMPtr<nsIScriptObjectPrincipal> objPrincipal =
+      do_QueryInterface(GetInProcessParentInternal());
+
+  if (objPrincipal) {
+    return objPrincipal->GetPrincipal();
+  }
+
+  return nullptr;
+}
+
+nsIPrincipal* nsGlobalWindowInner::GetEffectiveCookiePrincipal() {
+  if (mDoc) {
+    return mDoc->EffectiveCookiePrincipal();
+  }
+
+  if (mDocumentCookiePrincipal) {
+    return mDocumentCookiePrincipal;
+  }
+
+
+  nsCOMPtr<nsIScriptObjectPrincipal> objPrincipal =
+      do_QueryInterface(GetInProcessParentInternal());
+
+  if (objPrincipal) {
+    return objPrincipal->GetEffectiveCookiePrincipal();
+  }
+
+  return nullptr;
+}
+
+nsIPrincipal* nsGlobalWindowInner::GetEffectiveStoragePrincipal() {
+  if (mDoc) {
+    return mDoc->EffectiveStoragePrincipal();
+  }
+
+  if (mDocumentStoragePrincipal) {
+    return mDocumentStoragePrincipal;
+  }
+
+
+  nsCOMPtr<nsIScriptObjectPrincipal> objPrincipal =
+      do_QueryInterface(GetInProcessParentInternal());
+
+  if (objPrincipal) {
+    return objPrincipal->GetEffectiveStoragePrincipal();
+  }
+
+  return nullptr;
+}
+
+nsIPrincipal* nsGlobalWindowInner::PartitionedPrincipal() {
+  if (mDoc) {
+    return mDoc->PartitionedPrincipal();
+  }
+
+  if (mDocumentPartitionedPrincipal) {
+    return mDocumentPartitionedPrincipal;
+  }
+
+
+  nsCOMPtr<nsIScriptObjectPrincipal> objPrincipal =
+      do_QueryInterface(GetInProcessParentInternal());
+
+  if (objPrincipal) {
+    return objPrincipal->PartitionedPrincipal();
+  }
+
+  return nullptr;
+}
+
+
+bool nsPIDOMWindowInner::AddAudioContext(AudioContext* aAudioContext) {
+  mAudioContexts.AppendElement(aAudioContext);
+
+  nsIDocShell* docShell = GetDocShell();
+  return docShell && !docShell->GetAllowMedia() && !aAudioContext->IsOffline();
+}
+
+void nsPIDOMWindowInner::RemoveAudioContext(AudioContext* aAudioContext) {
+  mAudioContexts.RemoveElement(aAudioContext);
+}
+
+void nsPIDOMWindowInner::MuteAudioContexts() {
+  for (uint32_t i = 0; i < mAudioContexts.Length(); ++i) {
+    if (!mAudioContexts[i]->IsOffline()) {
+      mAudioContexts[i]->Mute();
+    }
+  }
+}
+
+void nsPIDOMWindowInner::UnmuteAudioContexts() {
+  for (uint32_t i = 0; i < mAudioContexts.Length(); ++i) {
+    if (!mAudioContexts[i]->IsOffline()) {
+      mAudioContexts[i]->Unmute();
+    }
+  }
+}
+
+WindowProxyHolder nsGlobalWindowInner::Window() {
+  return WindowProxyHolder(GetBrowsingContext());
+}
+
+Navigation* nsPIDOMWindowInner::Navigation() {
+  if (!mNavigation && Navigation::IsAPIEnabled()) {
+    mNavigation = MakeRefPtr<mozilla::dom::Navigation>(this);
+  }
+
+  return mNavigation;
+}
+
+Navigator* nsPIDOMWindowInner::Navigator() {
+  if (!mNavigator) {
+    mNavigator = MakeRefPtr<mozilla::dom::Navigator>(this);
+  }
+
+  return mNavigator;
+}
+
+VisualViewport* nsGlobalWindowInner::VisualViewport() {
+  if (!mVisualViewport) {
+    mVisualViewport = MakeRefPtr<mozilla::dom::VisualViewport>(this);
+  }
+  return mVisualViewport;
+}
+
+nsScreen* nsGlobalWindowInner::Screen() {
+  if (!mScreen) {
+    mScreen = nsScreen::Create(this);
+  }
+  return mScreen;
+}
+
+nsHistory* nsGlobalWindowInner::GetHistory(ErrorResult& aError) {
+  if (!mHistory) {
+    mHistory = MakeRefPtr<nsHistory>(this);
+  }
+  return mHistory;
+}
+
+CustomElementRegistry* nsGlobalWindowInner::CustomElements() {
+  if (!mCustomElements) {
+    mCustomElements = MakeRefPtr<CustomElementRegistry>(this);
+  }
+
+  return mCustomElements;
+}
+
+CustomElementRegistry* nsGlobalWindowInner::GetExistingCustomElements() {
+  return mCustomElements;
+}
+
+Performance* nsPIDOMWindowInner::GetPerformance() {
+  CreatePerformanceObjectIfNeeded();
+  return mPerformance;
+}
+
+void nsPIDOMWindowInner::QueuePerformanceNavigationTiming() {
+  CreatePerformanceObjectIfNeeded();
+  if (mPerformance) {
+    mPerformance->QueueNavigationTimingEntry();
+  }
+}
+
+void nsPIDOMWindowInner::CreatePerformanceObjectIfNeeded() {
+  if (mPerformance || !mDoc) {
+    return;
+  }
+  RefPtr<nsDOMNavigationTiming> timing = mDoc->GetNavigationTiming();
+  nsCOMPtr<nsITimedChannel> timedChannel(do_QueryInterface(mDoc->GetChannel()));
+  if (timing) {
+    mPerformance = Performance::CreateForMainThread(this, mDoc->NodePrincipal(),
+                                                    timing, timedChannel);
+  }
+}
+
+bool nsPIDOMWindowInner::IsSecureContext() const {
+  return nsGlobalWindowInner::Cast(this)->IsSecureContext();
+}
+
+void nsPIDOMWindowInner::Suspend(bool aIncludeSubWindows) {
+  nsGlobalWindowInner::Cast(this)->Suspend(aIncludeSubWindows);
+}
+
+void nsPIDOMWindowInner::Resume(bool aIncludeSubWindows) {
+  nsGlobalWindowInner::Cast(this)->Resume(aIncludeSubWindows);
+}
+
+void nsPIDOMWindowInner::SyncStateFromParentWindow() {
+  nsGlobalWindowInner::Cast(this)->SyncStateFromParentWindow();
+}
+
+Maybe<ClientInfo> nsPIDOMWindowInner::GetClientInfo() const {
+  return nsGlobalWindowInner::Cast(this)->GetClientInfo();
+}
+
+Maybe<ClientState> nsPIDOMWindowInner::GetClientState() const {
+  return nsGlobalWindowInner::Cast(this)->GetClientState();
+}
+
+Maybe<ServiceWorkerDescriptor> nsPIDOMWindowInner::GetController() const {
+  return nsGlobalWindowInner::Cast(this)->GetController();
+}
+
+ClientSource* nsPIDOMWindowInner::GetClientSource() const {
+  return nsGlobalWindowInner::Cast(this)->GetClientSource();
+}
+
+void nsPIDOMWindowInner::SetPolicyContainer(
+    nsIPolicyContainer* aPolicyContainer) {
+  return nsGlobalWindowInner::Cast(this)->SetPolicyContainer(aPolicyContainer);
+}
+
+void nsPIDOMWindowInner::SetPreloadCsp(nsIContentSecurityPolicy* aPreloadCsp) {
+  return nsGlobalWindowInner::Cast(this)->SetPreloadCsp(aPreloadCsp);
+}
+
+nsIPolicyContainer* nsPIDOMWindowInner::GetPolicyContainer() {
+  return nsGlobalWindowInner::Cast(this)->GetPolicyContainer();
+}
+
+void nsPIDOMWindowInner::NoteCalledRegisterForServiceWorkerScope(
+    const nsACString& aScope) {
+  nsGlobalWindowInner::Cast(this)->NoteCalledRegisterForServiceWorkerScope(
+      aScope);
+}
+
+void nsPIDOMWindowInner::NoteDOMContentLoaded() {
+  nsGlobalWindowInner::Cast(this)->NoteDOMContentLoaded();
+}
+
+bool nsGlobalWindowInner::ShouldReportForServiceWorkerScope(
+    const nsAString& aScope) {
+  bool result = false;
+
+  nsPIDOMWindowOuter* topOuter = GetInProcessScriptableTop();
+  NS_ENSURE_TRUE(topOuter, false);
+
+  nsGlobalWindowInner* topInner =
+      nsGlobalWindowInner::Cast(topOuter->GetCurrentInnerWindow());
+  NS_ENSURE_TRUE(topInner, false);
+
+  topInner->ShouldReportForServiceWorkerScopeInternal(
+      NS_ConvertUTF16toUTF8(aScope), &result);
+  return result;
+}
+
+void nsGlobalWindowInner::GetInstallTrigger(
+    JSContext* aCx, JS::MutableHandle<JSObject*> aResult) {
+  aResult.set(nullptr);
+}
+
+nsIDOMWindowUtils* nsGlobalWindowInner::GetWindowUtils(ErrorResult& aRv) {
+  FORWARD_TO_OUTER_OR_THROW(WindowUtils, (), aRv, nullptr);
+}
+
+bool nsGlobalWindowInner::SynthesizeMouseEvent(
+    const nsAString& aType, float aOffsetX, float aOffsetY,
+    const SynthesizeMouseEventData& aMouseEventData,
+    const SynthesizeMouseEventOptions& aOptions,
+    const Optional<OwningNonNull<VoidFunction>>& aCallback,
+    ErrorResult& aError) {
+  nsIDocShell* docShell = GetDocShell();
+  RefPtr<PresShell> presShell = docShell ? docShell->GetPresShell() : nullptr;
+  if (!presShell) {
+    aError.Throw(NS_ERROR_FAILURE);
+    return false;
+  }
+
+  nsPoint offset;
+  nsCOMPtr<nsIWidget> widget = nsContentUtils::GetWidget(presShell, &offset);
+  if (!widget) {
+    aError.Throw(NS_ERROR_FAILURE);
+    return false;
+  }
+
+  LayoutDeviceIntPoint refPoint = nsContentUtils::ToWidgetPoint(
+      CSSPoint(aOffsetX, aOffsetY), offset, presShell->GetPresContext());
+  auto result = nsContentUtils::SynthesizeMouseEvent(
+      presShell, widget, aType, refPoint, aMouseEventData, aOptions, aCallback);
+  if (result.isErr()) {
+    aError.Throw(result.unwrapErr());
+    return false;
+  }
+
+  return result.unwrap();
+}
+
+bool nsGlobalWindowInner::SynthesizeTouchEvent(
+    const nsAString& aType, const nsTArray<SynthesizeTouchEventData>& aTouches,
+    const int32_t aModifiers, const SynthesizeTouchEventOptions& aOptions,
+    const Optional<OwningNonNull<VoidFunction>>& aCallback,
+    mozilla::ErrorResult& aError) {
+  nsIDocShell* docShell = GetDocShell();
+  RefPtr<PresShell> presShell = docShell ? docShell->GetPresShell() : nullptr;
+  if (!presShell) {
+    aError.Throw(NS_ERROR_FAILURE);
+    return false;
+  }
+
+  nsPoint offset;
+  nsCOMPtr<nsIWidget> widget = nsContentUtils::GetWidget(presShell, &offset);
+  if (!widget) {
+    aError.Throw(NS_ERROR_FAILURE);
+    return false;
+  }
+
+  RefPtr<nsPresContext> presContext = mDoc->GetPresContext();
+  if (!presContext) {
+    aError.Throw(NS_ERROR_FAILURE);
+    return false;
+  }
+
+  auto result = nsContentUtils::SynthesizeTouchEvent(
+      presContext, widget, offset, aType, aTouches, aModifiers, aOptions,
+      aCallback);
+  if (result.isErr()) {
+    aError.Throw(result.unwrapErr());
+    return false;
+  }
+
+  return result.unwrap();
+}
+
+CallState nsGlobalWindowInner::ShouldReportForServiceWorkerScopeInternal(
+    const nsACString& aScope, bool* aResultOut) {
+  MOZ_DIAGNOSTIC_ASSERT(aResultOut);
+
+  const Maybe<ServiceWorkerDescriptor> swd = GetController();
+  if (swd.isSome() && swd.ref().Scope() == aScope) {
+    *aResultOut = true;
+    return CallState::Stop;
+  }
+
+  if (mClientSource &&
+      mClientSource->CalledRegisterForServiceWorkerScope(aScope)) {
+    *aResultOut = true;
+    return CallState::Stop;
+  }
+
+  nsCOMPtr<nsIDocumentLoader> loader(do_QueryInterface(GetDocShell()));
+  if (loader) {
+    nsCOMPtr<nsILoadGroup> loadgroup;
+    (void)loader->GetLoadGroup(getter_AddRefs(loadgroup));
+    if (loadgroup) {
+      nsCOMPtr<nsISimpleEnumerator> iter;
+      (void)loadgroup->GetRequests(getter_AddRefs(iter));
+      if (iter) {
+        nsCOMPtr<nsISupports> tmp;
+        bool hasMore = true;
+        while (NS_SUCCEEDED(iter->HasMoreElements(&hasMore)) && hasMore) {
+          iter->GetNext(getter_AddRefs(tmp));
+          nsCOMPtr<nsIChannel> loadingChannel(do_QueryInterface(tmp));
+          if (!loadingChannel ||
+              !nsContentUtils::IsNonSubresourceRequest(loadingChannel)) {
+            continue;
+          }
+          nsCOMPtr<nsIURI> loadingURL;
+          (void)loadingChannel->GetURI(getter_AddRefs(loadingURL));
+          if (!loadingURL) {
+            continue;
+          }
+          nsAutoCString loadingSpec;
+          (void)loadingURL->GetSpec(loadingSpec);
+          if (StringBeginsWith(loadingSpec, aScope)) {
+            *aResultOut = true;
+            return CallState::Stop;
+          }
+        }
+      }
+    }
+  }
+
+  return CallOnInProcessChildren(
+      &nsGlobalWindowInner::ShouldReportForServiceWorkerScopeInternal, aScope,
+      aResultOut);
+}
+
+void nsGlobalWindowInner::NoteCalledRegisterForServiceWorkerScope(
+    const nsACString& aScope) {
+  if (!mClientSource) {
+    return;
+  }
+
+  mClientSource->NoteCalledRegisterForServiceWorkerScope(aScope);
+}
+
+void nsGlobalWindowInner::NoteDOMContentLoaded() {
+  if (!mClientSource) {
+    return;
+  }
+
+  mClientSource->NoteDOMContentLoaded();
+}
+
+void nsGlobalWindowInner::UpdateTopInnerWindow() {
+  if (IsTopInnerWindow() || !mTopInnerWindow) {
+    return;
+  }
+
+  nsGlobalWindowInner::Cast(mTopInnerWindow)
+      ->UpdateWebSocketCount(-(int32_t)mNumOfOpenWebSockets);
+}
+
+bool nsGlobalWindowInner::IsInSyncOperation() {
+  return GetExtantDoc() && GetExtantDoc()->IsInSyncOperation();
+}
+
+bool nsGlobalWindowInner::IsSharedMemoryAllowedInternal(
+    nsIPrincipal* aPrincipal) const {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (StaticPrefs::
+          dom_postMessage_sharedArrayBuffer_bypassCOOP_COEP_insecure_enabled()) {
+    return true;
+  }
+
+  return CrossOriginIsolated();
+}
+
+bool nsGlobalWindowInner::CrossOriginIsolated() const {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  RefPtr<BrowsingContext> bc = GetBrowsingContext();
+  MOZ_DIAGNOSTIC_ASSERT(bc);
+  return bc->CrossOriginIsolated();
+}
+
+bool nsGlobalWindowInner::OriginAgentCluster() const {
+  if (DocGroup* docGroup = GetDocGroup()) {
+    return docGroup->IsOriginKeyed();
+  }
+  return false;
+}
+
+WindowContext* TopWindowContext(nsPIDOMWindowInner& aWindow) {
+  WindowContext* wc = aWindow.GetWindowContext();
+  if (!wc) {
+    return nullptr;
+  }
+
+  return wc->TopWindowContext();
+}
+
+bool nsGlobalWindowInner::IsPlayingAudio() {
+  for (uint32_t i = 0; i < mAudioContexts.Length(); i++) {
+    if (mAudioContexts[i]->IsRunning()) {
+      return true;
+    }
+  }
+  RefPtr<AudioChannelService> acs = AudioChannelService::Get();
+  if (!acs) {
+    return false;
+  }
+  auto outer = GetOuterWindow();
+  if (!outer) {
+    return false;
+  }
+  return acs->IsWindowActive(outer);
+}
+
+bool nsPIDOMWindowInner::IsDocumentLoaded() const { return mIsDocumentLoaded; }
+
+mozilla::dom::TimeoutManager* nsGlobalWindowInner::GetTimeoutManager() {
+  return mTimeoutManager.get();
+}
+
+bool nsGlobalWindowInner::IsRunningTimeout() {
+  return GetTimeoutManager()->IsRunningTimeout();
+}
+
+void nsPIDOMWindowInner::TryToCacheTopInnerWindow() {
+  if (mHasTriedToCacheTopInnerWindow) {
+    return;
+  }
+
+  nsGlobalWindowInner* window = nsGlobalWindowInner::Cast(this);
+
+  MOZ_ASSERT(!window->IsDying());
+
+  mHasTriedToCacheTopInnerWindow = true;
+
+  MOZ_ASSERT(window);
+
+  if (nsCOMPtr<nsPIDOMWindowOuter> topOutter =
+          window->GetInProcessScriptableTop()) {
+    mTopInnerWindow = topOutter->GetCurrentInnerWindow();
+  }
+}
+
+void nsGlobalWindowInner::UpdateActiveIndexedDBDatabaseCount(int32_t aDelta) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (aDelta == 0) {
+    return;
+  }
+
+  uint32_t& counter = mTopInnerWindow
+                          ? mTopInnerWindow->mNumOfIndexedDBDatabases
+                          : mNumOfIndexedDBDatabases;
+
+  counter += aDelta;
+}
+
+bool nsGlobalWindowInner::HasActiveIndexedDBDatabases() const {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  return mTopInnerWindow ? mTopInnerWindow->mNumOfIndexedDBDatabases > 0
+                         : mNumOfIndexedDBDatabases > 0;
+}
+
+void nsGlobalWindowInner::UpdateWebSocketCount(int32_t aDelta) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (aDelta == 0) {
+    return;
+  }
+
+  if (mTopInnerWindow && !IsTopInnerWindow()) {
+    nsGlobalWindowInner::Cast(mTopInnerWindow)->UpdateWebSocketCount(aDelta);
+  }
+
+  MOZ_DIAGNOSTIC_ASSERT(
+      aDelta > 0 || ((aDelta + mNumOfOpenWebSockets) < mNumOfOpenWebSockets));
+
+  mNumOfOpenWebSockets += aDelta;
+}
+
+bool nsGlobalWindowInner::HasOpenWebSockets() const {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  return mNumOfOpenWebSockets ||
+         (mTopInnerWindow && mTopInnerWindow->mNumOfOpenWebSockets);
+}
+
+void nsGlobalWindowInner::AudioPlaybackChanged(bool aIsPlayingAudio) {
+  UpdateWorkersPlaybackState(*this, aIsPlayingAudio);
+}
+
+bool nsPIDOMWindowInner::IsCurrentInnerWindow() const {
+  if (mBrowsingContext && mBrowsingContext->IsInBFCache()) {
+    return false;
+  }
+
+  if (!mBrowsingContext || mBrowsingContext->IsDiscarded()) {
+    return mOuterWindow && WasCurrentInnerWindow();
+  }
+
+  nsPIDOMWindowOuter* outer = mBrowsingContext->GetDOMWindow();
+  return outer && outer->GetCurrentInnerWindow() == this;
+}
+
+bool nsGlobalWindowInner::HasScheduledNormalOrHighPriorityWebTasks() const {
+  return gNumNormalOrHighPriorityQueuesHaveTaskScheduledMainThread > 0;
+}
+
+bool nsPIDOMWindowInner::IsFullyActive() const {
+  WindowContext* wc = GetWindowContext();
+  if (!wc || wc->IsDiscarded() || !wc->IsCurrent()) {
+    return false;
+  }
+  return GetBrowsingContext()->AncestorsAreCurrent();
+}
+
+void nsPIDOMWindowInner::SetAudioCapture(bool aCapture) {
+  RefPtr<AudioChannelService> service = AudioChannelService::GetOrCreate();
+  if (service) {
+    service->SetWindowAudioCaptured(GetOuterWindow(), mWindowID, aCapture);
+  }
+}
+
+void nsGlobalWindowInner::SetActiveLoadingState(bool aIsLoading) {
+  MOZ_LOG(
+      gTimeoutLog, mozilla::LogLevel::Debug,
+      ("SetActiveLoadingState innerwindow %p: %d", (void*)this, aIsLoading));
+  if (GetBrowsingContext()) {
+    (void)GetBrowsingContext()->SetLoading(aIsLoading);
+  }
+
+  if (StaticPrefs::dom_timeout_defer_during_load() && !IsChromeWindow()) {
+    nsIPrincipal* principal = GetPrincipal();
+    if (!principal || !principal->IsURIInPrefList(
+                          "dom.timeout.defer_during_load.force-disable")) {
+      mTimeoutManager->SetLoading(aIsLoading);
+    }
+  }
+
+  HintIsLoading(aIsLoading);
+}
+
+void nsGlobalWindowInner::HintIsLoading(bool aIsLoading) {
+  if (mHintedWasLoading != aIsLoading) {
+    using namespace js::gc;
+    SetPerformanceHint(danger::GetJSContext(), aIsLoading
+                                                   ? PerformanceHint::InPageLoad
+                                                   : PerformanceHint::Normal);
+    mHintedWasLoading = aIsLoading;
+  }
+}
+
+
+#if defined(MOZ_WEBSPEECH)
+SpeechSynthesis* nsGlobalWindowInner::GetSpeechSynthesis(ErrorResult& aError) {
+  if (!mSpeechSynthesis) {
+    mSpeechSynthesis = MakeRefPtr<SpeechSynthesis>(this);
+  }
+
+  return mSpeechSynthesis;
+}
+
+bool nsGlobalWindowInner::HasActiveSpeechSynthesis() {
+  if (mSpeechSynthesis) {
+    return !mSpeechSynthesis->HasEmptyQueue();
+  }
+
+  return false;
+}
+
+#endif
+
+Nullable<WindowProxyHolder> nsGlobalWindowInner::GetParent(
+    ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(GetParentOuter, (), aError, nullptr);
+}
+
+nsPIDOMWindowOuter* nsGlobalWindowInner::GetInProcessScriptableParent() {
+  FORWARD_TO_OUTER(GetInProcessScriptableParent, (), nullptr);
+}
+
+nsPIDOMWindowOuter* nsGlobalWindowInner::GetInProcessScriptableTop() {
+  FORWARD_TO_OUTER(GetInProcessScriptableTop, (), nullptr);
+}
+
+void nsGlobalWindowInner::GetContent(JSContext* aCx,
+                                     JS::MutableHandle<JSObject*> aRetval,
+                                     CallerType aCallerType,
+                                     ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(GetContentOuter,
+                            (aCx, aRetval, aCallerType, aError), aError, );
+}
+
+BarProp* nsGlobalWindowInner::GetMenubar(ErrorResult& aError) {
+  if (!mMenubar) {
+    mMenubar = MakeRefPtr<MenubarProp>(this);
+  }
+
+  return mMenubar;
+}
+
+BarProp* nsGlobalWindowInner::GetToolbar(ErrorResult& aError) {
+  if (!mToolbar) {
+    mToolbar = MakeRefPtr<ToolbarProp>(this);
+  }
+
+  return mToolbar;
+}
+
+BarProp* nsGlobalWindowInner::GetLocationbar(ErrorResult& aError) {
+  if (!mLocationbar) {
+    mLocationbar = MakeRefPtr<LocationbarProp>(this);
+  }
+  return mLocationbar;
+}
+
+BarProp* nsGlobalWindowInner::GetPersonalbar(ErrorResult& aError) {
+  if (!mPersonalbar) {
+    mPersonalbar = MakeRefPtr<PersonalbarProp>(this);
+  }
+  return mPersonalbar;
+}
+
+BarProp* nsGlobalWindowInner::GetStatusbar(ErrorResult& aError) {
+  if (!mStatusbar) {
+    mStatusbar = MakeRefPtr<StatusbarProp>(this);
+  }
+  return mStatusbar;
+}
+
+BarProp* nsGlobalWindowInner::GetScrollbars(ErrorResult& aError) {
+  if (!mScrollbars) {
+    mScrollbars = MakeRefPtr<ScrollbarsProp>(this);
+  }
+
+  return mScrollbars;
+}
+
+bool nsGlobalWindowInner::GetClosed(ErrorResult& aError) {
+  FORWARD_TO_OUTER(GetClosedOuter, (), true);
+}
+
+Nullable<WindowProxyHolder> nsGlobalWindowInner::IndexedGetter(
+    uint32_t aIndex) {
+  FORWARD_TO_OUTER(IndexedGetterOuter, (aIndex), nullptr);
+}
+
+namespace {
+
+struct InterfaceShimEntry {
+  const char* geckoName;
+  const char* domName;
+};
+
+}  
+
+const InterfaceShimEntry kInterfaceShimMap[] = {
+    {"nsIXMLHttpRequest", "XMLHttpRequest"},
+    {"nsIDOMDOMException", "DOMException"},
+    {"nsIDOMNode", "Node"},
+    {"nsIDOMCSSRule", "CSSRule"},
+    {"nsIDOMEvent", "Event"},
+    {"nsIDOMNSEvent", "Event"},
+    {"nsIDOMKeyEvent", "KeyEvent"},
+    {"nsIDOMMouseEvent", "MouseEvent"},
+    {"nsIDOMMouseScrollEvent", "MouseScrollEvent"},
+    {"nsIDOMMutationEvent", "MutationEvent"},
+    {"nsIDOMUIEvent", "UIEvent"},
+    {"nsIDOMHTMLMediaElement", "HTMLMediaElement"},
+    {"nsIDOMRange", "Range"},
+    {"nsIDOMNodeFilter", "NodeFilter"},
+    {"nsIDOMXPathResult", "XPathResult"}};
+
+bool nsGlobalWindowInner::ResolveComponentsShim(
+    JSContext* aCx, JS::Handle<JSObject*> aGlobal,
+    JS::MutableHandle<mozilla::Maybe<JS::PropertyDescriptor>> aDesc) {
+  nsCOMPtr<Document> doc = GetExtantDoc();
+  if (doc) {
+    doc->WarnOnceAndReportAbout(
+        DeprecatedOperations::eComponents, 
+        true);
+  }
+
+  AssertSameCompartment(aCx, aGlobal);
+  JS::Rooted<JSObject*> components(aCx, JS_NewPlainObject(aCx));
+  if (NS_WARN_IF(!components)) {
+    return false;
+  }
+
+  JS::Rooted<JSObject*> interfaces(aCx, JS_NewPlainObject(aCx));
+  if (NS_WARN_IF(!interfaces)) {
+    return false;
+  }
+  bool ok =
+      JS_DefineProperty(aCx, components, "interfaces", interfaces,
+                        JSPROP_ENUMERATE | JSPROP_PERMANENT | JSPROP_READONLY);
+  if (NS_WARN_IF(!ok)) {
+    return false;
+  }
+
+  for (auto entry : kInterfaceShimMap) {
+    const char* geckoName = entry.geckoName;
+    const char* domName = entry.domName;
+
+    JS::Rooted<JS::Value> v(aCx, JS::UndefinedValue());
+    ok = JS_GetProperty(aCx, aGlobal, domName, &v);
+    if (NS_WARN_IF(!ok)) {
+      return false;
+    }
+    if (!v.isObject()) {
+      NS_WARNING("Unable to find interface object on global");
+      continue;
+    }
+
+    ok = JS_DefineProperty(
+        aCx, interfaces, geckoName, v,
+        JSPROP_ENUMERATE | JSPROP_PERMANENT | JSPROP_READONLY);
+    if (NS_WARN_IF(!ok)) {
+      return false;
+    }
+  }
+
+  aDesc.set(mozilla::Some(JS::PropertyDescriptor::Data(
+      JS::ObjectValue(*components),
+      {JS::PropertyAttribute::Configurable, JS::PropertyAttribute::Enumerable,
+       JS::PropertyAttribute::Writable})));
+  return true;
+}
+
+#if defined(RELEASE_OR_BETA)
+#  define USE_CONTROLLERS_SHIM
+#endif
+
+#if defined(USE_CONTROLLERS_SHIM)
+static const JSClass ControllersShimClass = {"Controllers", 0};
+static const JSClass XULControllersShimClass = {"XULControllers", 0};
+#endif
+
+bool nsGlobalWindowInner::DoResolve(
+    JSContext* aCx, JS::Handle<JSObject*> aObj, JS::Handle<jsid> aId,
+    JS::MutableHandle<mozilla::Maybe<JS::PropertyDescriptor>> aDesc) {
+
+  if (!aId.isString()) {
+    return true;
+  }
+
+  bool found;
+  if (!WebIDLGlobalNameHash::DefineIfEnabled(aCx, aObj, aId, aDesc, &found)) {
+    return false;
+  }
+
+  if (found) {
+    return true;
+  }
+
+  if (StaticPrefs::dom_use_components_shim() &&
+      aId == XPCJSRuntime::Get()->GetStringID(XPCJSContext::IDX_COMPONENTS)) {
+    return ResolveComponentsShim(aCx, aObj, aDesc);
+  }
+
+#if defined(USE_CONTROLLERS_SHIM)
+  if ((aId == XPCJSRuntime::Get()->GetStringID(XPCJSContext::IDX_CONTROLLERS) ||
+       aId == XPCJSRuntime::Get()->GetStringID(
+                  XPCJSContext::IDX_CONTROLLERS_CLASS)) &&
+      !xpc::IsXrayWrapper(aObj) &&
+      !nsContentUtils::ObjectPrincipal(aObj)->IsSystemPrincipal()) {
+    if (GetExtantDoc()) {
+      GetExtantDoc()->WarnOnceAndReportAbout(
+          DeprecatedOperations::eWindow_Cc_ontrollers);
+    }
+    const JSClass* clazz;
+    if (aId ==
+        XPCJSRuntime::Get()->GetStringID(XPCJSContext::IDX_CONTROLLERS)) {
+      clazz = &XULControllersShimClass;
+    } else {
+      clazz = &ControllersShimClass;
+    }
+    MOZ_ASSERT(JS_IsGlobalObject(aObj));
+    JS::Rooted<JSObject*> shim(aCx, JS_NewObject(aCx, clazz));
+    if (NS_WARN_IF(!shim)) {
+      return false;
+    }
+
+    aDesc.set(mozilla::Some(JS::PropertyDescriptor::Data(
+        JS::ObjectValue(*shim),
+        {JS::PropertyAttribute::Configurable, JS::PropertyAttribute::Enumerable,
+         JS::PropertyAttribute::Writable})));
+    return true;
+  }
+#endif
+
+  return true;
+}
+
+bool nsGlobalWindowInner::MayResolve(jsid aId) {
+  if (!aId.isString()) {
+    return false;
+  }
+
+  if (aId == XPCJSRuntime::Get()->GetStringID(XPCJSContext::IDX_COMPONENTS)) {
+    return true;
+  }
+
+  if (aId == XPCJSRuntime::Get()->GetStringID(XPCJSContext::IDX_CONTROLLERS) ||
+      aId == XPCJSRuntime::Get()->GetStringID(
+                 XPCJSContext::IDX_CONTROLLERS_CLASS)) {
+    return true;
+  }
+
+  return WebIDLGlobalNameHash::MayResolve(aId);
+}
+
+void nsGlobalWindowInner::GetOwnPropertyNames(
+    JSContext* aCx, JS::MutableHandleVector<jsid> aNames, bool aEnumerableOnly,
+    ErrorResult& aRv) {
+  if (aEnumerableOnly) {
+    return;
+  }
+
+
+  JS::Rooted<JSObject*> wrapper(aCx, GetWrapper());
+
+  WebIDLGlobalNameHash::NameType nameType =
+      js::IsObjectInContextCompartment(wrapper, aCx)
+          ? WebIDLGlobalNameHash::UnresolvedNamesOnly
+          : WebIDLGlobalNameHash::AllNames;
+  if (!WebIDLGlobalNameHash::GetNames(aCx, wrapper, nameType, aNames)) {
+    aRv.NoteJSContextException(aCx);
+  }
+}
+
+bool nsGlobalWindowInner::IsPrivilegedChromeWindow(JSContext*, JSObject* aObj) {
+  nsGlobalWindowInner* win = xpc::WindowOrNull(aObj);
+  return win && win->IsChromeWindow() &&
+         nsContentUtils::ObjectPrincipal(aObj) ==
+             nsContentUtils::GetSystemPrincipal();
+}
+
+bool nsGlobalWindowInner::DeviceSensorsEnabled(JSContext*, JSObject*) {
+  return Preferences::GetBool("device.sensors.enabled");
+}
+
+Crypto* nsGlobalWindowInner::GetCrypto(ErrorResult& aError) {
+  if (!mCrypto) {
+    mCrypto = MakeRefPtr<Crypto>(this);
+  }
+  return mCrypto;
+}
+
+nsIControllers* nsGlobalWindowInner::GetControllers(ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(GetControllersOuter, (aError), aError, nullptr);
+}
+
+nsresult nsGlobalWindowInner::GetControllers(nsIControllers** aResult) {
+  ErrorResult rv;
+  nsCOMPtr<nsIControllers> controllers = GetControllers(rv);
+  controllers.forget(aResult);
+
+  return rv.StealNSResult();
+}
+
+Nullable<WindowProxyHolder> nsGlobalWindowInner::GetOpenerWindow(
+    ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(GetOpenerWindowOuter, (), aError, nullptr);
+}
+
+void nsGlobalWindowInner::GetOpener(JSContext* aCx,
+                                    JS::MutableHandle<JS::Value> aRetval,
+                                    ErrorResult& aError) {
+  Nullable<WindowProxyHolder> opener = GetOpenerWindow(aError);
+  if (aError.Failed() || opener.IsNull()) {
+    aRetval.setNull();
+    return;
+  }
+
+  if (!ToJSValue(aCx, opener.Value(), aRetval)) {
+    aError.NoteJSContextException(aCx);
+  }
+}
+
+void nsGlobalWindowInner::SetOpener(JSContext* aCx,
+                                    JS::Handle<JS::Value> aOpener,
+                                    ErrorResult& aError) {
+  if (aOpener.isNull()) {
+    RefPtr<BrowsingContext> bc(GetBrowsingContext());
+    if (!bc->IsDiscarded()) {
+      bc->SetOpener(nullptr);
+    }
+    return;
+  }
+
+  RedefineProperty(aCx, "opener", aOpener, aError);
+}
+
+void nsGlobalWindowInner::GetEvent(OwningEventOrUndefined& aRetval) {
+  if (mEvent) {
+    aRetval.SetAsEvent() = mEvent;
+  } else {
+    aRetval.SetUndefined();
+  }
+}
+
+void nsGlobalWindowInner::GetStatus(nsAString& aStatus, ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(GetStatusOuter, (aStatus), aError, );
+}
+
+void nsGlobalWindowInner::SetStatus(const nsAString& aStatus,
+                                    ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(SetStatusOuter, (aStatus), aError, );
+}
+
+void nsGlobalWindowInner::GetName(nsAString& aName, ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(GetNameOuter, (aName), aError, );
+}
+
+void nsGlobalWindowInner::SetName(const nsAString& aName,
+                                  mozilla::ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(SetNameOuter, (aName, aError), aError, );
+}
+
+double nsGlobalWindowInner::GetInnerWidth(ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(GetInnerWidthOuter, (aError), aError, 0);
+}
+
+nsresult nsGlobalWindowInner::GetInnerWidth(double* aWidth) {
+  ErrorResult rv;
+  *aWidth = GetInnerWidth(rv);
+  return rv.StealNSResult();
+}
+
+double nsGlobalWindowInner::GetInnerHeight(ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(GetInnerHeightOuter, (aError), aError, 0);
+}
+
+nsresult nsGlobalWindowInner::GetInnerHeight(double* aHeight) {
+  ErrorResult rv;
+  *aHeight = GetInnerHeight(rv);
+  return rv.StealNSResult();
+}
+
+int32_t nsGlobalWindowInner::GetOuterWidth(CallerType aCallerType,
+                                           ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(GetOuterWidthOuter, (aCallerType, aError), aError,
+                            0);
+}
+
+int32_t nsGlobalWindowInner::GetOuterHeight(CallerType aCallerType,
+                                            ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(GetOuterHeightOuter, (aCallerType, aError), aError,
+                            0);
+}
+
+double nsGlobalWindowInner::ScreenEdgeSlopX() const {
+  FORWARD_TO_OUTER(ScreenEdgeSlopX, (), 0);
+}
+
+double nsGlobalWindowInner::ScreenEdgeSlopY() const {
+  FORWARD_TO_OUTER(ScreenEdgeSlopY, (), 0);
+}
+
+int32_t nsGlobalWindowInner::GetScreenX(CallerType aCallerType,
+                                        ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(GetScreenXOuter, (aCallerType, aError), aError, 0);
+}
+
+int32_t nsGlobalWindowInner::GetScreenY(CallerType aCallerType,
+                                        ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(GetScreenYOuter, (aCallerType, aError), aError, 0);
+}
+
+float nsGlobalWindowInner::GetMozInnerScreenX(CallerType aCallerType,
+                                              ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(GetMozInnerScreenXOuter, (aCallerType), aError, 0);
+}
+
+float nsGlobalWindowInner::GetMozInnerScreenY(CallerType aCallerType,
+                                              ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(GetMozInnerScreenYOuter, (aCallerType), aError, 0);
+}
+
+static nsPresContext* GetPresContextForRatio(Document* aDoc) {
+  if (nsPresContext* presContext = aDoc->GetPresContext()) {
+    return presContext;
+  }
+  Document* doc = aDoc;
+  while (doc->StyleOrLayoutObservablyDependsOnParentDocumentLayout()) {
+    doc = doc->GetInProcessParentDocument();
+    if (nsPresContext* presContext = doc->GetPresContext()) {
+      return presContext;
+    }
+  }
+  return nullptr;
+}
+
+double nsGlobalWindowInner::GetDevicePixelRatio(CallerType aCallerType,
+                                                ErrorResult& aError) {
+  ENSURE_ACTIVE_DOCUMENT(aError, 0.0);
+
+  RefPtr<nsPresContext> presContext = GetPresContextForRatio(mDoc);
+  if (NS_WARN_IF(!presContext)) {
+    return 1.0;
+  }
+
+  if (nsIGlobalObject::ShouldResistFingerprinting(
+          aCallerType, RFPTarget::WindowDevicePixelRatio)) {
+    return nsRFPService::GetDevicePixelRatioAtZoom(presContext->GetFullZoom());
+  }
+
+  if (aCallerType == CallerType::NonSystem) {
+    float overrideDPPX = presContext->GetOverrideDPPX();
+    if (overrideDPPX > 0.0f) {
+      return overrideDPPX;
+    }
+  }
+
+  return double(AppUnitsPerCSSPixel()) /
+         double(presContext->AppUnitsPerDevPixel());
+}
+
+double nsGlobalWindowInner::GetDesktopToDeviceScale(ErrorResult& aError) {
+  ENSURE_ACTIVE_DOCUMENT(aError, 0.0);
+  nsPresContext* presContext = GetPresContextForRatio(mDoc);
+  if (!presContext) {
+    return 1.0;
+  }
+  return presContext->DeviceContext()->GetDesktopToDeviceScale().scale;
+}
+
+uint32_t nsGlobalWindowInner::RequestAnimationFrame(
+    FrameRequestCallback& aCallback, ErrorResult& aError) {
+  if (!mDoc) {
+    return 0;
+  }
+
+  if (GetWrapperPreserveColor()) {
+    js::NotifyAnimationActivity(GetWrapperPreserveColor());
+  }
+
+  uint32_t handle;
+  aError = mDoc->ScheduleFrameRequestCallback(aCallback, &handle);
+  return handle;
+}
+
+void nsGlobalWindowInner::CancelAnimationFrame(uint32_t aHandle,
+                                               ErrorResult& aError) {
+  if (!mDoc) {
+    return;
+  }
+
+  mDoc->CancelFrameRequestCallback(aHandle);
+}
+
+already_AddRefed<MediaQueryList> nsGlobalWindowInner::MatchMedia(
+    const nsACString& aMediaQueryList, CallerType aCallerType,
+    ErrorResult& aError) {
+  ENSURE_ACTIVE_DOCUMENT(aError, nullptr);
+  return mDoc->MatchMedia(aMediaQueryList, aCallerType);
+}
+
+int32_t nsGlobalWindowInner::GetScrollMinX(ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(GetScrollBoundaryOuter, (eSideLeft), aError, 0);
+}
+
+int32_t nsGlobalWindowInner::GetScrollMinY(ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(GetScrollBoundaryOuter, (eSideTop), aError, 0);
+}
+
+int32_t nsGlobalWindowInner::GetScrollMaxX(ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(GetScrollBoundaryOuter, (eSideRight), aError, 0);
+}
+
+int32_t nsGlobalWindowInner::GetScrollMaxY(ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(GetScrollBoundaryOuter, (eSideBottom), aError, 0);
+}
+
+double nsGlobalWindowInner::GetScrollX(ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(GetScrollXOuter, (), aError, 0);
+}
+
+double nsGlobalWindowInner::GetScrollY(ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(GetScrollYOuter, (), aError, 0);
+}
+
+uint32_t nsGlobalWindowInner::Length() { FORWARD_TO_OUTER(Length, (), 0); }
+
+Nullable<WindowProxyHolder> nsGlobalWindowInner::GetTop(
+    mozilla::ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(GetTopOuter, (), aError, nullptr);
+}
+
+already_AddRefed<BrowsingContext> nsGlobalWindowInner::GetChildWindow(
+    const nsAString& aName) {
+  if (GetOuterWindowInternal()) {
+    return GetOuterWindowInternal()->GetChildWindow(aName);
+  }
+  return nullptr;
+}
+
+void nsGlobalWindowInner::RefreshRealmPrincipal() {
+  JS::SetRealmPrincipals(js::GetNonCCWObjectRealm(GetWrapperPreserveColor()),
+                         nsJSPrincipals::get(mDoc->NodePrincipal()));
+}
+
+void nsGlobalWindowInner::RefreshReduceTimerPrecisionCallerType() {
+  JS::SetRealmReduceTimerPrecisionCallerType(
+      js::GetNonCCWObjectRealm(GetWrapperPreserveColor()),
+      RTPCallerTypeToToken(GetRTPCallerType()));
+}
+
+already_AddRefed<nsIWidget> nsGlobalWindowInner::GetMainWidget() const {
+  FORWARD_TO_OUTER(GetMainWidget, (), nullptr);
+}
+
+nsIWidget* nsGlobalWindowInner::GetNearestWidget() const {
+  if (GetOuterWindowInternal()) {
+    return GetOuterWindowInternal()->GetNearestWidget();
+  }
+  return nullptr;
+}
+
+void nsGlobalWindowInner::SetFullScreen(bool aFullscreen,
+                                        CallerType aCallerType,
+                                        ErrorResult& aError) {
+  if (aCallerType == CallerType::NonSystem) {
+    if (Document* doc = GetExtantDoc()) {
+      doc->WarnOnceAndReportAbout(DeprecatedOperations::eFullscreenAttribute);
+    }
+  }
+  FORWARD_TO_OUTER_OR_THROW(SetFullscreenOuter, (aFullscreen, aError), aError,
+                            );
+}
+
+bool nsGlobalWindowInner::GetFullScreen(CallerType aCallerType,
+                                        ErrorResult& aError) {
+  if (aCallerType == CallerType::NonSystem) {
+    if (Document* doc = GetExtantDoc()) {
+      doc->WarnOnceAndReportAbout(DeprecatedOperations::eFullscreenAttribute);
+    }
+  }
+  FORWARD_TO_OUTER_OR_THROW(GetFullscreenOuter, (), aError, false);
+}
+
+bool nsGlobalWindowInner::GetFullScreen() {
+  bool fullscreen = GetFullScreen(CallerType::System, IgnoreErrors());
+  return fullscreen;
+}
+
+void nsGlobalWindowInner::Dump(const nsAString& aStr) {
+  if (!nsJSUtils::DumpEnabled()) {
+    return;
+  }
+
+  char* cstr = ToNewUTF8String(aStr);
+
+
+  if (cstr) {
+    MOZ_LOG(nsContentUtils::DOMDumpLog(), LogLevel::Debug,
+            ("[Window.Dump] %s", cstr));
+    FILE* fp = gDumpFile ? gDumpFile : stdout;
+    fputs(cstr, fp);
+    fflush(fp);
+    free(cstr);
+  }
+}
+
+void nsGlobalWindowInner::Alert(nsIPrincipal& aSubjectPrincipal,
+                                ErrorResult& aError) {
+  Alert(u""_ns, aSubjectPrincipal, aError);
+}
+
+void nsGlobalWindowInner::Alert(const nsAString& aMessage,
+                                nsIPrincipal& aSubjectPrincipal,
+                                ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(AlertOuter, (aMessage, aSubjectPrincipal, aError),
+                            aError, );
+}
+
+bool nsGlobalWindowInner::Confirm(const nsAString& aMessage,
+                                  nsIPrincipal& aSubjectPrincipal,
+                                  ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(ConfirmOuter, (aMessage, aSubjectPrincipal, aError),
+                            aError, false);
+}
+
+already_AddRefed<Promise> nsGlobalWindowInner::Fetch(
+    const RequestOrUTF8String& aInput, const RequestInit& aInit,
+    CallerType aCallerType, ErrorResult& aRv) {
+  return FetchRequest(this, aInput, aInit, aCallerType, aRv);
+}
+
+void nsGlobalWindowInner::Prompt(const nsAString& aMessage,
+                                 const nsAString& aInitial, nsAString& aReturn,
+                                 nsIPrincipal& aSubjectPrincipal,
+                                 ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(
+      PromptOuter, (aMessage, aInitial, aReturn, aSubjectPrincipal, aError),
+      aError, );
+}
+
+void nsGlobalWindowInner::Focus(CallerType aCallerType, ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(FocusOuter,
+                            (aCallerType,  false,
+                             nsFocusManager::GenerateFocusActionId()),
+                            aError, );
+}
+
+nsresult nsGlobalWindowInner::Focus(CallerType aCallerType) {
+  ErrorResult rv;
+  Focus(aCallerType, rv);
+
+  return rv.StealNSResult();
+}
+
+void nsGlobalWindowInner::Blur(CallerType aCallerType, ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(BlurOuter, (aCallerType), aError, );
+}
+
+void nsGlobalWindowInner::Stop(ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(StopOuter, (aError), aError, );
+}
+
+void nsGlobalWindowInner::MoveTo(int32_t aXPos, int32_t aYPos,
+                                 CallerType aCallerType, ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(MoveToOuter, (aXPos, aYPos, aCallerType, aError),
+                            aError, );
+}
+
+void nsGlobalWindowInner::MoveBy(int32_t aXDif, int32_t aYDif,
+                                 CallerType aCallerType, ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(MoveByOuter, (aXDif, aYDif, aCallerType, aError),
+                            aError, );
+}
+
+void nsGlobalWindowInner::ResizeTo(int32_t aWidth, int32_t aHeight,
+                                   CallerType aCallerType,
+                                   ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(ResizeToOuter,
+                            (aWidth, aHeight, aCallerType, aError), aError, );
+}
+
+void nsGlobalWindowInner::ResizeBy(int32_t aWidthDif, int32_t aHeightDif,
+                                   CallerType aCallerType,
+                                   ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(
+      ResizeByOuter, (aWidthDif, aHeightDif, aCallerType, aError), aError, );
+}
+
+void nsGlobalWindowInner::MoveResize(int32_t aX, int32_t aY, int32_t aWidth,
+                                     int32_t aHeight, ErrorResult& aError) {
+  const auto callerType = CallerType::System;  
+  FORWARD_TO_OUTER_OR_THROW(
+      MoveResizeOuter, (aX, aY, aWidth, aHeight, callerType, aError), aError, );
+}
+
+void nsGlobalWindowInner::SizeToContent(
+    const SizeToContentConstraints& aConstraints, ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(SizeToContentOuter, (aConstraints, aError),
+                            aError, );
+}
+
+already_AddRefed<nsPIWindowRoot> nsGlobalWindowInner::GetTopWindowRoot() {
+  nsGlobalWindowOuter* outer = GetOuterWindowInternal();
+  if (!outer) {
+    return nullptr;
+  }
+  return outer->GetTopWindowRoot();
+}
+
+void nsGlobalWindowInner::ScrollTo(double aXScroll, double aYScroll) {
+  ScrollToOptions options;
+  options.mLeft.Construct(aXScroll);
+  options.mTop.Construct(aYScroll);
+  ScrollTo(options);
+}
+
+void nsGlobalWindowInner::ScrollTo(const ScrollToOptions& aOptions) {
+  Maybe<double> left;
+  Maybe<double> top;
+  if (aOptions.mLeft.WasPassed()) {
+    left.emplace(ToZeroIfNonfinite(aOptions.mLeft.Value()));
+  }
+  if (aOptions.mTop.WasPassed()) {
+    top.emplace(ToZeroIfNonfinite(aOptions.mTop.Value()));
+  }
+
+  if ((top && *top != 0) || (left && *left != 0)) {
+    FlushPendingNotifications(FlushType::Layout);
+  }
+
+  ScrollContainerFrame* sf = GetScrollContainerFrame();
+  if (!sf) {
+    return;
+  }
+  CSSPoint scrollPos = sf->GetScrollPositionCSSPixels();
+  if (left) {
+    scrollPos.x = *left;
+  }
+  if (top) {
+    scrollPos.y = *top;
+  }
+  const double maxpx = CSSPixel::FromAppUnits(0x7fffffff) - 4;
+  if (scrollPos.x > maxpx) {
+    scrollPos.x = maxpx;
+  }
+  if (scrollPos.y > maxpx) {
+    scrollPos.y = maxpx;
+  }
+  auto scrollMode = sf->ScrollModeForScrollBehavior(aOptions.mBehavior);
+  sf->ScrollToCSSPixels(scrollPos, scrollMode);
+}
+
+void nsGlobalWindowInner::ScrollBy(double aXScrollDif, double aYScrollDif) {
+  ScrollToOptions options;
+  options.mLeft.Construct(aXScrollDif);
+  options.mTop.Construct(aYScrollDif);
+  ScrollBy(options);
+}
+
+void nsGlobalWindowInner::ScrollBy(const ScrollToOptions& aOptions) {
+  CSSPoint scrollDelta;
+  if (aOptions.mLeft.WasPassed()) {
+    scrollDelta.x = ToZeroIfNonfinite(aOptions.mLeft.Value());
+  }
+  if (aOptions.mTop.WasPassed()) {
+    scrollDelta.y = ToZeroIfNonfinite(aOptions.mTop.Value());
+  }
+
+  if (!scrollDelta.x && !scrollDelta.y) {
+    return;
+  }
+
+  FlushPendingNotifications(FlushType::Layout);
+  ScrollContainerFrame* sf = GetScrollContainerFrame();
+  if (!sf) {
+    return;
+  }
+
+  auto scrollMode = sf->ScrollModeForScrollBehavior(aOptions.mBehavior);
+  sf->ScrollByCSSPixels(scrollDelta, scrollMode);
+}
+
+void nsGlobalWindowInner::ScrollByLines(int32_t numLines,
+                                        const ScrollOptions& aOptions) {
+  if (!numLines) {
+    return;
+  }
+  FlushPendingNotifications(FlushType::Layout);
+  ScrollContainerFrame* sf = GetScrollContainerFrame();
+  if (!sf) {
+    return;
+  }
+  ScrollMode scrollMode = sf->ScrollModeForScrollBehavior(aOptions.mBehavior);
+  sf->ScrollBy(nsIntPoint(0, numLines), ScrollUnit::LINES, scrollMode);
+}
+
+void nsGlobalWindowInner::ScrollByPages(int32_t numPages,
+                                        const ScrollOptions& aOptions) {
+  if (!numPages) {
+    return;
+  }
+  FlushPendingNotifications(FlushType::Layout);
+  ScrollContainerFrame* sf = GetScrollContainerFrame();
+  if (!sf) {
+    return;
+  }
+  ScrollMode scrollMode = sf->ScrollModeForScrollBehavior(aOptions.mBehavior);
+
+  sf->ScrollBy(nsIntPoint(0, numPages), ScrollUnit::PAGES, scrollMode);
+}
+
+void nsGlobalWindowInner::MozScrollSnap() {
+  FlushPendingNotifications(FlushType::Layout);
+  if (ScrollContainerFrame* sf = GetScrollContainerFrame()) {
+    sf->ScrollSnap();
+  }
+}
+
+void nsGlobalWindowInner::ClearTimeout(int32_t aHandle) {
+  if (aHandle > 0) {
+    mTimeoutManager->ClearTimeout(aHandle, Timeout::Reason::eTimeoutOrInterval);
+  }
+}
+
+void nsGlobalWindowInner::ClearInterval(int32_t aHandle) {
+  if (aHandle > 0) {
+    mTimeoutManager->ClearTimeout(aHandle, Timeout::Reason::eTimeoutOrInterval);
+  }
+}
+
+void nsGlobalWindowInner::SetResizable(bool aResizable) const {
+}
+
+void nsGlobalWindowInner::CaptureEvents() {
+}
+
+void nsGlobalWindowInner::ReleaseEvents() {
+}
+
+Nullable<WindowProxyHolder> nsGlobalWindowInner::Open(const nsAString& aUrl,
+                                                      const nsAString& aName,
+                                                      const nsAString& aOptions,
+                                                      ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(OpenOuter, (aUrl, aName, aOptions, aError), aError,
+                            nullptr);
+}
+
+Nullable<WindowProxyHolder> nsGlobalWindowInner::OpenDialog(
+    JSContext* aCx, const nsAString& aUrl, const nsAString& aName,
+    const nsAString& aOptions, const Sequence<JS::Value>& aExtraArgument,
+    ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(
+      OpenDialogOuter, (aCx, aUrl, aName, aOptions, aExtraArgument, aError),
+      aError, nullptr);
+}
+
+WindowProxyHolder nsGlobalWindowInner::GetFrames(ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(GetFramesOuter, (), aError, Window());
+}
+
+void nsGlobalWindowInner::PostMessageMoz(JSContext* aCx,
+                                         JS::Handle<JS::Value> aMessage,
+                                         const nsAString& aTargetOrigin,
+                                         JS::Handle<JS::Value> aTransfer,
+                                         nsIPrincipal& aSubjectPrincipal,
+                                         ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(
+      PostMessageMozOuter,
+      (aCx, aMessage, aTargetOrigin, aTransfer, aSubjectPrincipal, aError),
+      aError, );
+}
+
+void nsGlobalWindowInner::PostMessageMoz(JSContext* aCx,
+                                         JS::Handle<JS::Value> aMessage,
+                                         const nsAString& aTargetOrigin,
+                                         const Sequence<JSObject*>& aTransfer,
+                                         nsIPrincipal& aSubjectPrincipal,
+                                         ErrorResult& aRv) {
+  JS::Rooted<JS::Value> transferArray(aCx, JS::UndefinedValue());
+
+  aRv = nsContentUtils::CreateJSValueFromSequenceOfObject(aCx, aTransfer,
+                                                          &transferArray);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return;
+  }
+
+  PostMessageMoz(aCx, aMessage, aTargetOrigin, transferArray, aSubjectPrincipal,
+                 aRv);
+}
+
+void nsGlobalWindowInner::PostMessageMoz(
+    JSContext* aCx, JS::Handle<JS::Value> aMessage,
+    const WindowPostMessageOptions& aOptions, nsIPrincipal& aSubjectPrincipal,
+    ErrorResult& aRv) {
+  JS::Rooted<JS::Value> transferArray(aCx, JS::UndefinedValue());
+
+  aRv = nsContentUtils::CreateJSValueFromSequenceOfObject(
+      aCx, aOptions.mTransfer, &transferArray);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return;
+  }
+
+  PostMessageMoz(aCx, aMessage, aOptions.mTargetOrigin, transferArray,
+                 aSubjectPrincipal, aRv);
+}
+
+void nsGlobalWindowInner::Close(CallerType aCallerType, ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(CloseOuter, (aCallerType == CallerType::System),
+                            aError, );
+}
+
+nsresult nsGlobalWindowInner::Close() {
+  FORWARD_TO_OUTER(Close, (), NS_ERROR_UNEXPECTED);
+}
+
+bool nsGlobalWindowInner::IsInModalState() {
+  FORWARD_TO_OUTER(IsInModalState, (), false);
+}
+
+void nsGlobalWindowInner::NotifyWindowIDDestroyed(const char* aTopic) {
+  RefPtr runnable = MakeRefPtr<WindowDestroyedEvent>(this, mWindowID, aTopic);
+  Dispatch(runnable.forget());
+}
+
+Element* nsGlobalWindowInner::GetFrameElement(nsIPrincipal& aSubjectPrincipal,
+                                              ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(GetFrameElement, (aSubjectPrincipal), aError,
+                            nullptr);
+}
+
+Element* nsGlobalWindowInner::GetRealFrameElement(ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(GetFrameElement, (), aError, nullptr);
+}
+
+void nsGlobalWindowInner::UpdateCommands(const nsAString& anAction) {
+  if (GetOuterWindowInternal()) {
+    GetOuterWindowInternal()->UpdateCommands(anAction);
+  }
+}
+
+Selection* nsGlobalWindowInner::GetSelection(ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(GetSelectionOuter, (), aError, nullptr);
+}
+
+WebTaskScheduler* nsGlobalWindowInner::Scheduler() {
+  if (!mWebTaskScheduler) {
+    mWebTaskScheduler = WebTaskScheduler::CreateForMainThread(this);
+  }
+  MOZ_ASSERT(mWebTaskScheduler);
+  return mWebTaskScheduler;
+}
+
+inline void nsGlobalWindowInner::SetWebTaskSchedulingState(
+    WebTaskSchedulingState* aState) {
+  mWebTaskSchedulingState = aState;
+}
+
+bool nsGlobalWindowInner::Find(const nsAString& aString, bool aCaseSensitive,
+                               bool aBackwards, bool aWrapAround,
+                               bool aWholeWord, bool aSearchInFrames,
+                               bool aShowDialog, ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(FindOuter,
+                            (aString, aCaseSensitive, aBackwards, aWrapAround,
+                             aWholeWord, aSearchInFrames, aShowDialog, aError),
+                            aError, false);
+}
+
+void nsGlobalWindowInner::GetOrigin(nsAString& aOrigin) {
+  nsContentUtils::GetWebExposedOriginSerialization(GetPrincipal(), aOrigin);
+}
+
+void nsGlobalWindowInner::ReportError(JSContext* aCx,
+                                      JS::Handle<JS::Value> aError,
+                                      CallerType aCallerType,
+                                      ErrorResult& aRv) {
+  if (MOZ_UNLIKELY(!HasActiveDocument())) {
+    return aRv.Throw(NS_ERROR_XPC_SECURITY_MANAGER_VETO);
+  }
+
+  JS::ErrorReportBuilder jsReport(aCx);
+  JS::ExceptionStack exnStack(aCx, aError, nullptr);
+  if (!jsReport.init(aCx, exnStack, JS::ErrorReportBuilder::NoSideEffects)) {
+    return aRv.NoteJSContextException(aCx);
+  }
+
+  RefPtr xpcReport = MakeRefPtr<xpc::ErrorReport>();
+  bool isChrome = aCallerType == CallerType::System;
+  xpcReport->Init(jsReport.report(), jsReport.toStringResult().c_str(),
+                  isChrome, WindowID());
+
+  JS::RootingContext* rcx = JS::RootingContext::get(aCx);
+  DispatchScriptErrorEvent(this, rcx, xpcReport, exnStack.exception(),
+                           exnStack.stack());
+}
+
+void nsGlobalWindowInner::Atob(const nsAString& aAsciiBase64String,
+                               nsAString& aBinaryData, ErrorResult& aError) {
+  aError = nsContentUtils::Atob(aAsciiBase64String, aBinaryData);
+}
+
+void nsGlobalWindowInner::Btoa(const nsAString& aBinaryData,
+                               nsAString& aAsciiBase64String,
+                               ErrorResult& aError) {
+  aError = nsContentUtils::Btoa(aBinaryData, aAsciiBase64String);
+}
+
+
+bool nsGlobalWindowInner::DispatchEvent(Event& aEvent, CallerType aCallerType,
+                                        ErrorResult& aRv) {
+  if (!IsCurrentInnerWindow()) {
+    NS_WARNING(
+        "DispatchEvent called on non-current inner window, dropping. "
+        "Please check the window in the caller instead.");
+    aRv.Throw(NS_ERROR_FAILURE);
+    return false;
+  }
+
+  if (!mDoc) {
+    aRv.Throw(NS_ERROR_FAILURE);
+    return false;
+  }
+
+  RefPtr<nsPresContext> presContext = mDoc->GetPresContext();
+
+  nsEventStatus status = nsEventStatus_eIgnore;
+  nsresult rv = EventDispatcher::DispatchDOMEvent(this, nullptr, &aEvent,
+                                                  presContext, &status);
+  bool retval = !aEvent.DefaultPrevented(aCallerType);
+  if (NS_FAILED(rv)) {
+    aRv.Throw(rv);
+  }
+  return retval;
+}
+
+bool nsGlobalWindowInner::ComputeDefaultWantsUntrusted(ErrorResult& aRv) {
+  return !nsContentUtils::IsChromeDoc(mDoc);
+}
+
+EventListenerManager* nsGlobalWindowInner::GetOrCreateListenerManager() {
+  if (!mListenerManager) {
+    mListenerManager =
+        MakeRefPtr<EventListenerManager>(static_cast<EventTarget*>(this));
+  }
+
+  return mListenerManager;
+}
+
+EventListenerManager* nsGlobalWindowInner::GetExistingListenerManager() const {
+  return mListenerManager;
+}
+
+
+Location* nsGlobalWindowInner::Location() {
+  if (!mLocation) {
+    mLocation = MakeRefPtr<dom::Location>(this);
+  }
+
+  return mLocation;
+}
+
+void nsGlobalWindowInner::MaybeUpdateTouchState() {
+  if (mMayHaveTouchEventListener) {
+    nsCOMPtr<nsIObserverService> observerService =
+        services::GetObserverService();
+
+    if (observerService) {
+      observerService->NotifyObservers(static_cast<nsIDOMWindow*>(this),
+                                       DOM_TOUCH_LISTENER_ADDED, nullptr);
+    }
+  }
+}
+
+void nsGlobalWindowInner::SetFocusedElement(Element* aElement,
+                                            uint32_t aFocusMethod,
+                                            bool aNeedsFocus) {
+  if (aElement && aElement->GetComposedDoc() != mDoc) {
+    NS_WARNING("Trying to set focus to a node from a wrong document");
+    return;
+  }
+
+  if (IsDying()) {
+    NS_ASSERTION(!aElement, "Trying to focus cleaned up window!");
+    aElement = nullptr;
+    aNeedsFocus = false;
+  }
+  if (mFocusedElement != aElement) {
+    mFocusedElement = aElement;
+    mFocusMethod = aFocusMethod & nsIFocusManager::METHOD_MASK;
+  }
+
+  if (mFocusedElement) {
+    if (mFocusMethod & nsIFocusManager::FLAG_BYKEY) {
+      mUnknownFocusMethodShouldShowOutline = true;
+      mFocusByKeyOccurred = true;
+    } else if (nsFocusManager::GetFocusMoveActionCause(mFocusMethod) !=
+               widget::InputContextAction::CAUSE_UNKNOWN) {
+      mUnknownFocusMethodShouldShowOutline = false;
+    } else if (aFocusMethod & nsIFocusManager::FLAG_NOSHOWRING) {
+      mUnknownFocusMethodShouldShowOutline = false;
+    }
+  }
+
+  if (aNeedsFocus) {
+    mNeedsFocus = aNeedsFocus;
+  }
+}
+
+uint32_t nsGlobalWindowInner::GetFocusMethod() { return mFocusMethod; }
+
+bool nsGlobalWindowInner::ShouldShowFocusRing() {
+  if (mFocusByKeyOccurred &&
+      StaticPrefs::browser_display_always_show_rings_after_key_focus()) {
+    return true;
+  }
+  return StaticPrefs::browser_display_show_focus_rings();
+}
+
+bool nsGlobalWindowInner::TakeFocus(bool aFocus, uint32_t aFocusMethod) {
+  if (IsDying()) {
+    return false;
+  }
+
+  if (aFocus) {
+    mFocusMethod = aFocusMethod & nsIFocusManager::METHOD_MASK;
+  }
+
+  if (aFocus && mNeedsFocus && mDoc && mDoc->GetRootElement()) {
+    mNeedsFocus = false;
+    return true;
+  }
+
+  mNeedsFocus = false;
+  return false;
+}
+
+void nsGlobalWindowInner::SetReadyForFocus() {
+  bool oldNeedsFocus = mNeedsFocus;
+  mNeedsFocus = false;
+
+  if (RefPtr<nsFocusManager> fm = nsFocusManager::GetFocusManager()) {
+    nsCOMPtr<nsPIDOMWindowOuter> outerWindow = GetOuterWindow();
+    fm->WindowShown(outerWindow, oldNeedsFocus);
+  }
+}
+
+void nsGlobalWindowInner::PageHidden(bool aIsEnteringBFCacheInParent) {
+
+  if (RefPtr<nsFocusManager> fm = nsFocusManager::GetFocusManager()) {
+    nsCOMPtr<nsPIDOMWindowOuter> outerWindow = GetOuterWindow();
+    fm->WindowHidden(outerWindow, nsFocusManager::GenerateFocusActionId(),
+                     aIsEnteringBFCacheInParent);
+  }
+
+  mNeedsFocus = true;
+}
+
+class HashchangeCallback : public Runnable {
+ public:
+  HashchangeCallback(const nsAString& aOldURL, const nsAString& aNewURL,
+                     nsGlobalWindowInner* aWindow)
+      : mozilla::Runnable("HashchangeCallback"), mWindow(aWindow) {
+    MOZ_ASSERT(mWindow);
+    mOldURL.Assign(aOldURL);
+    mNewURL.Assign(aNewURL);
+  }
+
+  NS_IMETHOD Run() override {
+    MOZ_ASSERT(NS_IsMainThread(), "Should be called on the main thread.");
+    return mWindow->FireHashchange(mOldURL, mNewURL);
+  }
+
+ private:
+  nsString mOldURL;
+  nsString mNewURL;
+  RefPtr<nsGlobalWindowInner> mWindow;
+};
+
+nsresult nsGlobalWindowInner::DispatchAsyncHashchange(nsIURI* aOldURI,
+                                                      nsIURI* aNewURI) {
+  bool equal = false;
+  NS_ENSURE_STATE(NS_SUCCEEDED(aOldURI->EqualsExceptRef(aNewURI, &equal)) &&
+                  equal);
+  nsAutoCString oldHash, newHash;
+  bool oldHasHash, newHasHash;
+  NS_ENSURE_STATE(NS_SUCCEEDED(aOldURI->GetRef(oldHash)) &&
+                  NS_SUCCEEDED(aNewURI->GetRef(newHash)) &&
+                  NS_SUCCEEDED(aOldURI->GetHasRef(&oldHasHash)) &&
+                  NS_SUCCEEDED(aNewURI->GetHasRef(&newHasHash)) &&
+                  (oldHasHash != newHasHash || !oldHash.Equals(newHash)));
+
+  nsAutoCString oldSpec, newSpec;
+  nsresult rv = aOldURI->GetSpec(oldSpec);
+  NS_ENSURE_SUCCESS(rv, rv);
+  rv = aNewURI->GetSpec(newSpec);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  NS_ConvertUTF8toUTF16 oldWideSpec(oldSpec);
+  NS_ConvertUTF8toUTF16 newWideSpec(newSpec);
+
+  RefPtr callback =
+      MakeRefPtr<HashchangeCallback>(oldWideSpec, newWideSpec, this);
+  return Dispatch(callback.forget());
+}
+
+nsresult nsGlobalWindowInner::FireHashchange(const nsAString& aOldURL,
+                                             const nsAString& aNewURL) {
+  if (IsFrozen()) {
+    return NS_OK;
+  }
+
+  NS_ENSURE_STATE(IsCurrentInnerWindow());
+
+  HashChangeEventInit init;
+  init.mNewURL = aNewURL;
+  init.mOldURL = aOldURL;
+
+  RefPtr<HashChangeEvent> event =
+      HashChangeEvent::Constructor(this, u"hashchange"_ns, init);
+
+  event->SetTrusted(true);
+
+  ErrorResult rv;
+  DispatchEvent(*event, rv);
+  return rv.StealNSResult();
+}
+
+nsresult nsGlobalWindowInner::DispatchSyncPopState() {
+  NS_ASSERTION(nsContentUtils::IsSafeToRunScript(),
+               "Must be safe to run script here.");
+
+  if (IsFrozen()) {
+    return NS_OK;
+  }
+
+  AutoJSAPI jsapi;
+  bool result = jsapi.Init(this);
+  NS_ENSURE_TRUE(result, NS_ERROR_FAILURE);
+
+  JSContext* cx = jsapi.cx();
+
+  JS::Rooted<JS::Value> stateJSValue(cx);
+  nsresult rv = mDoc->GetStateObject(&stateJSValue);
+  NS_ENSURE_SUCCESS(rv, rv);
+
+  if (!JS_WrapValue(cx, &stateJSValue)) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+
+  RootedDictionary<PopStateEventInit> init(cx);
+  init.mState = stateJSValue;
+
+  RefPtr<PopStateEvent> event =
+      PopStateEvent::Constructor(this, u"popstate"_ns, init);
+  event->SetTrusted(true);
+  event->SetTarget(this);
+
+  ErrorResult err;
+  DispatchEvent(*event, err);
+  return err.StealNSResult();
+}
+
+already_AddRefed<nsDOMCSSDeclaration> nsGlobalWindowInner::GetComputedStyle(
+    Element& aElt, const nsAString& aPseudoElt, ErrorResult& aError) {
+  return GetComputedStyleHelper(aElt, aPseudoElt, false, aError);
+}
+
+already_AddRefed<nsDOMCSSDeclaration>
+nsGlobalWindowInner::GetDefaultComputedStyle(Element& aElt,
+                                             const nsAString& aPseudoElt,
+                                             ErrorResult& aError) {
+  return GetComputedStyleHelper(aElt, aPseudoElt, true, aError);
+}
+
+already_AddRefed<nsDOMCSSDeclaration>
+nsGlobalWindowInner::GetComputedStyleHelper(Element& aElt,
+                                            const nsAString& aPseudoElt,
+                                            bool aDefaultStylesOnly,
+                                            ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(GetComputedStyleHelperOuter,
+                            (aElt, aPseudoElt, aDefaultStylesOnly, aError),
+                            aError, nullptr);
+}
+
+Storage* nsGlobalWindowInner::GetSessionStorage(ErrorResult& aError) {
+  nsIPrincipal* principal = GetPrincipal();
+  nsIPrincipal* storagePrincipal = GetEffectiveStoragePrincipal();
+  BrowsingContext* browsingContext = GetBrowsingContext();
+
+  if (!principal || !storagePrincipal || !browsingContext ||
+      !Storage::StoragePrefIsEnabled()) {
+    return nullptr;
+  }
+
+  if (mSessionStorage) {
+    MOZ_LOG(gDOMLeakPRLogInner, LogLevel::Debug,
+            ("nsGlobalWindowInner %p has %p sessionStorage", this,
+             mSessionStorage.get()));
+    bool canAccess =
+        principal->Subsumes(mSessionStorage->Principal()) &&
+        storagePrincipal->Subsumes(mSessionStorage->StoragePrincipal());
+    if (!canAccess) {
+      mSessionStorage = nullptr;
+    }
+  }
+
+  if (!mSessionStorage) {
+    nsString documentURI;
+    if (mDoc) {
+      aError = mDoc->GetDocumentURI(documentURI);
+      if (NS_WARN_IF(aError.Failed())) {
+        return nullptr;
+      }
+    }
+
+    if (!mDoc) {
+      aError.Throw(NS_ERROR_FAILURE);
+      return nullptr;
+    }
+
+    if (mDoc->GetSandboxFlags() & SANDBOXED_ORIGIN) {
+      aError.ThrowSecurityError(
+          "Forbidden in a sandboxed document without the 'allow-same-origin' "
+          "flag.");
+      return nullptr;
+    }
+
+    uint32_t rejectedReason = 0;
+    StorageAccess access = StorageAllowedForWindow(this, &rejectedReason);
+
+    if (access == StorageAccess::eDeny &&
+        rejectedReason !=
+            nsIWebProgressListener::STATE_COOKIES_BLOCKED_FOREIGN) {
+      aError.Throw(NS_ERROR_DOM_SECURITY_ERR);
+      return nullptr;
+    }
+
+    const RefPtr<SessionStorageManager> storageManager =
+        browsingContext->GetSessionStorageManager();
+    if (!storageManager) {
+      aError.Throw(NS_ERROR_DOM_NOT_SUPPORTED_ERR);
+      return nullptr;
+    }
+
+    RefPtr<Storage> storage;
+    aError = storageManager->CreateStorage(this, principal, storagePrincipal,
+                                           documentURI, IsPrivateBrowsing(),
+                                           getter_AddRefs(storage));
+    if (aError.Failed()) {
+      return nullptr;
+    }
+
+    mSessionStorage = storage;
+    MOZ_ASSERT(mSessionStorage);
+
+    MOZ_LOG(gDOMLeakPRLogInner, LogLevel::Debug,
+            ("nsGlobalWindowInner %p tried to get a new sessionStorage %p",
+             this, mSessionStorage.get()));
+
+    if (!mSessionStorage) {
+      aError.Throw(NS_ERROR_DOM_NOT_SUPPORTED_ERR);
+      return nullptr;
+    }
+  }
+
+  MOZ_LOG(gDOMLeakPRLogInner, LogLevel::Debug,
+          ("nsGlobalWindowInner %p returns %p sessionStorage", this,
+           mSessionStorage.get()));
+
+  return mSessionStorage;
+}
+
+Storage* nsGlobalWindowInner::GetLocalStorage(ErrorResult& aError) {
+  if (!Storage::StoragePrefIsEnabled()) {
+    return nullptr;
+  }
+
+  if (mDoc && mDoc->GetSandboxFlags() & SANDBOXED_ORIGIN) {
+    aError.ThrowSecurityError(
+        "Forbidden in a sandboxed document without the 'allow-same-origin' "
+        "flag.");
+    return nullptr;
+  }
+
+
+  StorageAccess access = StorageAllowedForWindow(this);
+
+  bool isolated = false;
+  if (ShouldPartitionStorage(access)) {
+    if (!mDoc) {
+      access = StorageAccess::eDeny;
+    } else if (!StoragePartitioningEnabled(access, mDoc->CookieJarSettings())) {
+      static const char* kPrefName =
+          "privacy.restrict3rdpartystorage.partitionedHosts";
+
+      bool isInList = false;
+      mDoc->NodePrincipal()->IsURIInPrefList(kPrefName, &isInList);
+      if (!isInList) {
+        access = StorageAccess::eDeny;
+      } else {
+        isolated = true;
+      }
+    }
+  }
+
+  if (access == StorageAccess::eDeny) {
+    aError.Throw(NS_ERROR_DOM_SECURITY_ERR);
+    return nullptr;
+  }
+
+  nsCOMPtr<nsICookieJarSettings> cookieJarSettings;
+  if (mDoc) {
+    cookieJarSettings = mDoc->CookieJarSettings();
+  } else {
+    cookieJarSettings = net::CookieJarSettings::GetBlockingAll(
+        ShouldResistFingerprinting(RFPTarget::IsAlwaysEnabledForPrecompute));
+  }
+
+  if (mLocalStorage) {
+    if ((mLocalStorage->Type() == (isolated ? Storage::ePartitionedLocalStorage
+                                            : Storage::eLocalStorage)) &&
+        (mLocalStorage->StoragePrincipal() == GetEffectiveStoragePrincipal())) {
+      return mLocalStorage;
+    }
+
+    mLocalStorage = nullptr;
+  }
+
+  MOZ_ASSERT(!mLocalStorage);
+
+  if (!isolated) {
+    RefPtr<Storage> storage;
+
+    if (NextGenLocalStorageEnabled()) {
+      aError = LSObject::CreateForWindow(this, getter_AddRefs(storage));
+    } else {
+      nsresult rv;
+      nsCOMPtr<nsIDOMStorageManager> storageManager =
+          do_GetService("@mozilla.org/dom/localStorage-manager;1", &rv);
+      if (NS_FAILED(rv)) {
+        aError.Throw(rv);
+        return nullptr;
+      }
+
+      nsString documentURI;
+      if (mDoc) {
+        aError = mDoc->GetDocumentURI(documentURI);
+        if (NS_WARN_IF(aError.Failed())) {
+          return nullptr;
+        }
+      }
+
+      nsIPrincipal* principal = GetPrincipal();
+      if (!principal) {
+        aError.Throw(NS_ERROR_DOM_SECURITY_ERR);
+        return nullptr;
+      }
+
+      nsIPrincipal* storagePrincipal = GetEffectiveStoragePrincipal();
+      if (!storagePrincipal) {
+        aError.Throw(NS_ERROR_DOM_SECURITY_ERR);
+        return nullptr;
+      }
+
+      aError = storageManager->CreateStorage(this, principal, storagePrincipal,
+                                             documentURI, IsPrivateBrowsing(),
+                                             getter_AddRefs(storage));
+    }
+
+    if (aError.Failed()) {
+      return nullptr;
+    }
+
+    mLocalStorage = storage;
+  } else {
+    nsresult rv;
+    nsCOMPtr<nsIDOMSessionStorageManager> storageManager =
+        do_GetService("@mozilla.org/dom/sessionStorage-manager;1", &rv);
+    if (NS_FAILED(rv)) {
+      aError.Throw(rv);
+      return nullptr;
+    }
+
+    nsIPrincipal* principal = GetPrincipal();
+    if (!principal) {
+      aError.Throw(NS_ERROR_DOM_SECURITY_ERR);
+      return nullptr;
+    }
+
+    nsIPrincipal* storagePrincipal = GetEffectiveStoragePrincipal();
+    if (!storagePrincipal) {
+      aError.Throw(NS_ERROR_DOM_SECURITY_ERR);
+      return nullptr;
+    }
+
+    RefPtr<SessionStorageCache> cache;
+    if (isolated) {
+      cache = MakeRefPtr<SessionStorageCache>();
+    } else {
+      rv = storageManager->GetSessionStorageCache(principal, storagePrincipal,
+                                                  &cache);
+      if (NS_FAILED(rv)) {
+        aError.Throw(rv);
+        return nullptr;
+      }
+    }
+
+    mLocalStorage = MakeRefPtr<PartitionedLocalStorage>(
+        this, principal, storagePrincipal, cache);
+  }
+
+  MOZ_ASSERT(mLocalStorage);
+  MOZ_ASSERT(
+      mLocalStorage->Type() ==
+      (isolated ? Storage::ePartitionedLocalStorage : Storage::eLocalStorage));
+  return mLocalStorage;
+}
+
+IDBFactory* nsGlobalWindowInner::GetIndexedDB(JSContext* aCx,
+                                              ErrorResult& aError) {
+  if (!mIndexedDB) {
+    auto res = IDBFactory::CreateForWindow(this);
+    if (res.isErr()) {
+      aError = res.unwrapErr();
+    } else {
+      mIndexedDB = res.unwrap();
+    }
+  }
+
+  return mIndexedDB;
+}
+
+
+NS_IMETHODIMP
+nsGlobalWindowInner::GetInterface(const nsIID& aIID, void** aSink) {
+  nsGlobalWindowOuter* outer = GetOuterWindowInternal();
+  NS_ENSURE_TRUE(outer, NS_ERROR_NOT_INITIALIZED);
+
+  nsresult rv = outer->GetInterfaceInternal(aIID, aSink);
+  if (rv == NS_ERROR_NO_INTERFACE) {
+    return QueryInterface(aIID, aSink);
+  }
+  return rv;
+}
+
+void nsGlobalWindowInner::GetInterface(JSContext* aCx,
+                                       JS::Handle<JS::Value> aIID,
+                                       JS::MutableHandle<JS::Value> aRetval,
+                                       ErrorResult& aError) {
+  dom::GetInterface(aCx, this, aIID, aRetval, aError);
+}
+
+already_AddRefed<CacheStorage> nsGlobalWindowInner::GetCaches(
+    ErrorResult& aRv) {
+  if (!mCacheStorage) {
+    mCacheStorage = CacheStorage::CreateOnMainThread(
+        cache::DEFAULT_NAMESPACE, this, GetEffectiveStoragePrincipal(),
+        false, aRv);
+  }
+
+  RefPtr<CacheStorage> ref = mCacheStorage;
+  return ref.forget();
+}
+
+void nsGlobalWindowInner::FireOfflineStatusEventIfChanged() {
+  if (!IsCurrentInnerWindow()) return;
+
+  bool isOffline =
+      NS_IsOffline() ||
+      (GetBrowsingContext() && GetBrowsingContext()->Top()->GetForceOffline());
+
+  if (mWasOffline == isOffline) {
+    return;
+  }
+
+  if (ShouldResistFingerprinting(RFPTarget::NetworkConnection)) {
+    return;
+  }
+
+  mWasOffline = !mWasOffline;
+
+  nsAutoString name;
+  if (mWasOffline) {
+    name.AssignLiteral("offline");
+  } else {
+    name.AssignLiteral("online");
+  }
+  nsContentUtils::DispatchTrustedEvent(mDoc, this, name, CanBubble::eNo,
+                                       Cancelable::eNo);
+}
+
+nsGlobalWindowInner::SlowScriptResponse
+nsGlobalWindowInner::ShowSlowScriptDialog(JSContext* aCx,
+                                          const double aDuration) {
+  nsresult rv;
+
+  if (Preferences::GetBool("dom.always_stop_slow_scripts")) {
+    return KillSlowScript;
+  }
+
+  if (!nsContentUtils::IsSafeToRunScript()) {
+    JS::WarnASCII(aCx, "A long running script was terminated");
+    return KillSlowScript;
+  }
+
+  if (!HasActiveDocument()) {
+    return KillSlowScript;
+  }
+
+  JS::AutoFilename filename;
+  uint32_t lineno;
+  uint32_t* linenop = XRE_IsParentProcess() ? &lineno : nullptr;
+  bool hasFrame = JS::DescribeScriptedCaller(&filename, aCx, linenop);
+
+  SetCursor("auto"_ns, IgnoreErrors());
+
+  if (XRE_IsContentProcess() && ProcessHangMonitor::Get()) {
+    ProcessHangMonitor::SlowScriptAction action;
+    RefPtr<ProcessHangMonitor> monitor = ProcessHangMonitor::Get();
+    nsIDocShell* docShell = GetDocShell();
+    nsCOMPtr<nsIBrowserChild> child =
+        docShell ? docShell->GetBrowserChild() : nullptr;
+    action = monitor->NotifySlowScript(child, filename.get(), aDuration);
+    if (action == ProcessHangMonitor::Terminate) {
+      return KillSlowScript;
+    }
+
+    if (action == ProcessHangMonitor::StartDebugger) {
+      RefPtr<nsGlobalWindowOuter> outer = GetOuterWindowInternal();
+      outer->EnterModalState();
+      SpinEventLoopUntil("nsGlobalWindowInner::ShowSlowScriptDialog"_ns, [&]() {
+        return monitor->IsDebuggerStartupComplete() ||
+               AppShutdown::IsShutdownImpending();
+      });
+      outer->LeaveModalState();
+      return (AppShutdown::IsShutdownImpending()) ? KillSlowScript
+                                                  : ContinueSlowScript;
+    }
+
+    return ContinueSlowScriptAndKeepNotifying;
+  }
+
+  nsCOMPtr<nsIDocShell> ds = GetDocShell();
+  NS_ENSURE_TRUE(ds, KillSlowScript);
+  nsCOMPtr<nsIPrompt> prompt = do_GetInterface(ds);
+  NS_ENSURE_TRUE(prompt, KillSlowScript);
+
+  nsCOMPtr<nsISlowScriptDebugCallback> debugCallback;
+
+  if (hasFrame) {
+    const char* debugCID = "@mozilla.org/dom/slow-script-debug;1";
+    nsCOMPtr<nsISlowScriptDebug> debugService = do_GetService(debugCID, &rv);
+    if (NS_SUCCEEDED(rv)) {
+      debugService->GetActivationHandler(getter_AddRefs(debugCallback));
+    }
+  }
+
+  bool failed = false;
+  auto getString = [&](const char* name, PropertiesFile propFile =
+                                             PropertiesFile::DOM_PROPERTIES) {
+    nsAutoString result;
+    nsresult rv = nsContentUtils::GetLocalizedString(propFile, name, result);
+
+    failed = failed || NS_FAILED(rv) || result.IsEmpty();
+    return result;
+  };
+
+  bool showDebugButton = !!debugCallback;
+
+
+  nsAutoString title, checkboxMsg, debugButton, msg;
+  title = getString("KillScriptTitle");
+  checkboxMsg = getString("DontAskAgain");
+
+  if (showDebugButton) {
+    debugButton = getString("DebugScriptButton");
+    msg = getString("KillScriptWithDebugMessage");
+  } else {
+    msg = getString("KillScriptMessage");
+  }
+
+  auto stopButton = getString("StopScriptButton");
+  auto waitButton = getString("WaitForScriptButton");
+
+  if (failed) {
+    NS_ERROR("Failed to get localized strings.");
+    return ContinueSlowScript;
+  }
+
+  if (filename.get()) {
+    nsAutoString scriptLocation;
+    NS_ConvertUTF8toUTF16 filenameUTF16(filename.get());
+    if (filenameUTF16.Length() > 60) {
+      size_t cutStart = 30;
+      size_t cutLength = filenameUTF16.Length() - 60;
+      MOZ_ASSERT(cutLength > 0);
+      if (IsLowSurrogate(filenameUTF16[cutStart])) {
+        ++cutStart;
+        --cutLength;
+      }
+      if (IsLowSurrogate(filenameUTF16[cutStart + cutLength])) {
+        ++cutLength;
+      }
+
+      filenameUTF16.ReplaceLiteral(cutStart, cutLength, u"\x2026");
+    }
+    rv = nsContentUtils::FormatLocalizedString(
+        scriptLocation, PropertiesFile::DOM_PROPERTIES, "KillScriptLocation",
+        filenameUTF16);
+
+    if (NS_SUCCEEDED(rv)) {
+      msg.AppendLiteral("\n\n");
+      msg.Append(scriptLocation);
+      msg.Append(':');
+      msg.AppendInt(lineno);
+    }
+  }
+
+  uint32_t buttonFlags = nsIPrompt::BUTTON_POS_1_DEFAULT +
+                         (nsIPrompt::BUTTON_TITLE_IS_STRING *
+                          (nsIPrompt::BUTTON_POS_0 + nsIPrompt::BUTTON_POS_1));
+
+  if (showDebugButton)
+    buttonFlags += nsIPrompt::BUTTON_TITLE_IS_STRING * nsIPrompt::BUTTON_POS_2;
+
+  bool checkboxValue = false;
+  int32_t buttonPressed = 0;  
+  {
+    AutoDisableJSInterruptCallback disabler(aCx);
+
+    rv = prompt->ConfirmEx(
+        title.get(), msg.get(), buttonFlags, waitButton.get(), stopButton.get(),
+        debugButton.get(), checkboxMsg.get(), &checkboxValue, &buttonPressed);
+  }
+
+  if (buttonPressed == 0) {
+    if (checkboxValue && NS_SUCCEEDED(rv))
+      return AlwaysContinueSlowScript;
+    return ContinueSlowScript;
+  }
+
+  if (buttonPressed == 2) {
+    MOZ_RELEASE_ASSERT(debugCallback);
+
+    rv = debugCallback->HandleSlowScriptDebug(this);
+    return NS_SUCCEEDED(rv) ? ContinueSlowScript : KillSlowScript;
+  }
+
+  JS_ClearPendingException(aCx);
+
+  return KillSlowScript;
+}
+
+nsresult nsGlobalWindowInner::Observe(nsISupports* aSubject, const char* aTopic,
+                                      const char16_t* aData) {
+  if (!nsCRT::strcmp(aTopic, "audio-playback")) {
+    if (ToSupports(GetOuterWindow()) != aSubject) {
+      return NS_OK;
+    }
+
+    nsGlobalWindowOuter* outer =
+        nsGlobalWindowOuter::Cast(nsPIDOMWindowOuter::From(GetOuterWindow())
+                                      ->GetInProcessScriptableTop());
+    nsGlobalWindowInner* topInnerWindow =
+        outer ? nsGlobalWindowInner::Cast(outer->GetCurrentInnerWindow())
+              : nullptr;
+
+    if (topInnerWindow) {
+      const bool isPlayingAudio{IsPlayingAudio()};
+      topInnerWindow->AudioPlaybackChanged(isPlayingAudio);
+      topInnerWindow->CallOnInProcessDescendants(
+          &nsGlobalWindowInner::AudioPlaybackChanged, isPlayingAudio);
+    }
+
+    return NS_OK;
+  }
+
+  if (!nsCRT::strcmp(aTopic, NS_IOSERVICE_OFFLINE_STATUS_TOPIC)) {
+    if (!IsFrozen()) {
+      FireOfflineStatusEventIfChanged();
+    }
+    return NS_OK;
+  }
+
+  if (!nsCRT::strcmp(aTopic, MEMORY_PRESSURE_OBSERVER_TOPIC)) {
+    if (mPerformance) {
+      mPerformance->MemoryPressure();
+    }
+    RemoveReportRecords();
+    return NS_OK;
+  }
+
+  if (!nsCRT::strcmp(aTopic, PERMISSION_CHANGED_TOPIC) ||
+      !nsCRT::strcmp(aTopic, "browser-perm-changed")) {
+    bool isBrowserPerm = !nsCRT::strcmp(aTopic, "browser-perm-changed");
+
+    nsCOMPtr<nsIPermission> perm(do_QueryInterface(aSubject));
+    if (!perm) {
+      if (isBrowserPerm) {
+        nsCOMPtr<nsISupportsPRUint64> wrapper = do_QueryInterface(aSubject);
+        if (wrapper) {
+          uint64_t clearedBrowserId = 0;
+          wrapper->GetData(&clearedBrowserId);
+          if (clearedBrowserId) {
+            RefPtr<BrowsingContext> bc = GetBrowsingContext();
+            if (!bc || bc->Top()->BrowserId() != clearedBrowserId) {
+              return NS_OK;
+            }
+          }
+        }
+      }
+      UpdatePermissions();
+      if (mDoc) {
+        RefPtr<PermissionDelegateHandler> permDelegateHandler =
+            mDoc->GetPermissionDelegateHandler();
+        if (permDelegateHandler) {
+          permDelegateHandler->PopulateAllDelegatedPermissions();
+        }
+      }
+      return NS_OK;
+    }
+
+    if (isBrowserPerm) {
+      uint64_t permBrowserId = 0;
+      perm->GetBrowserId(&permBrowserId);
+      if (!permBrowserId) {
+        return NS_OK;
+      }
+      RefPtr<BrowsingContext> bc = GetBrowsingContext();
+      if (!bc || bc->Top()->BrowserId() != permBrowserId) {
+        return NS_OK;
+      }
+    }
+
+    nsAutoCString type;
+    perm->GetType(type);
+    if (type == "autoplay-media"_ns) {
+      UpdateAutoplayPermission();
+    } else if (type == "shortcuts"_ns) {
+      UpdateShortcutsPermission();
+    } else if (type == "popup"_ns) {
+      UpdatePopupPermission();
+    }
+
+    if (!mDoc) {
+      return NS_OK;
+    }
+
+    RefPtr<PermissionDelegateHandler> permDelegateHandler =
+        mDoc->GetPermissionDelegateHandler();
+
+    if (permDelegateHandler) {
+      permDelegateHandler->UpdateDelegatedPermission(type);
+    }
+
+    return NS_OK;
+  }
+
+  if (!nsCRT::strcmp(aTopic, "screen-information-changed")) {
+    if (mScreen) {
+      if (RefPtr<ScreenOrientation> orientation =
+              mScreen->GetOrientationIfExists()) {
+        orientation->MaybeChanged();
+      }
+    }
+    if (mHasOrientationChangeListeners) {
+      int32_t oldAngle = mOrientationAngle;
+      mOrientationAngle = Orientation(CallerType::System);
+      if (mOrientationAngle != oldAngle && IsCurrentInnerWindow()) {
+        nsCOMPtr<nsPIDOMWindowOuter> outer = GetOuterWindow();
+        outer->DispatchCustomEvent(u"orientationchange"_ns);
+      }
+    }
+    return NS_OK;
+  }
+
+  if (!nsCRT::strcmp(aTopic, NS_PREFBRANCH_PREFCHANGE_TOPIC_ID)) {
+    MOZ_ASSERT(!NS_strcmp(aData, u"intl.accept_languages"));
+
+
+    if (mNavigator) {
+      Navigator_Binding::ClearCachedLanguageValue(mNavigator);
+      Navigator_Binding::ClearCachedLanguagesValue(mNavigator);
+    }
+
+    if (!IsCurrentInnerWindow()) {
+      return NS_OK;
+    }
+
+    RefPtr<Event> event = NS_NewDOMEvent(this, nullptr, nullptr);
+    event->InitEvent(u"languagechange"_ns, false, false);
+    event->SetTrusted(true);
+
+    ErrorResult rv;
+    DispatchEvent(*event, rv);
+    return rv.StealNSResult();
+  }
+
+  NS_WARNING(nsPrintfCString("unrecognized topic %s", aTopic).get());
+  return NS_ERROR_FAILURE;
+}
+
+void nsGlobalWindowInner::ObserveStorageNotification(
+    StorageEvent* aEvent, const char16_t* aStorageType, bool aPrivateBrowsing) {
+  MOZ_ASSERT(aEvent);
+
+  if (aPrivateBrowsing != IsPrivateBrowsing()) {
+    return;
+  }
+
+  if (!IsCurrentInnerWindow() || IsFrozen()) {
+    return;
+  }
+
+  nsIPrincipal* principal = GetPrincipal();
+  if (!principal) {
+    return;
+  }
+
+  bool fireMozStorageChanged = false;
+  nsAutoString eventType;
+  eventType.AssignLiteral("storage");
+
+  if (!NS_strcmp(aStorageType, u"sessionStorage")) {
+    RefPtr<Storage> changingStorage = aEvent->GetStorageArea();
+    MOZ_ASSERT(changingStorage);
+
+    bool check = false;
+
+    if (const RefPtr<SessionStorageManager> storageManager =
+            GetBrowsingContext()->GetSessionStorageManager()) {
+      nsresult rv = storageManager->CheckStorage(GetEffectiveStoragePrincipal(),
+                                                 changingStorage, &check);
+      if (NS_FAILED(rv)) {
+        return;
+      }
+    }
+
+    if (!check) {
+      return;
+    }
+
+    MOZ_LOG(
+        gDOMLeakPRLogInner, LogLevel::Debug,
+        ("nsGlobalWindowInner %p with sessionStorage %p passing event from %p",
+         this, mSessionStorage.get(), changingStorage.get()));
+
+    fireMozStorageChanged = mSessionStorage == changingStorage;
+    if (fireMozStorageChanged) {
+      eventType.AssignLiteral("MozSessionStorageChanged");
+    }
+  }
+
+  else {
+    MOZ_ASSERT(!NS_strcmp(aStorageType, u"localStorage"));
+
+    nsIPrincipal* storagePrincipal = GetEffectiveStoragePrincipal();
+    if (!storagePrincipal) {
+      return;
+    }
+
+    MOZ_DIAGNOSTIC_ASSERT(StorageUtils::PrincipalsEqual(aEvent->GetPrincipal(),
+                                                        storagePrincipal));
+
+    fireMozStorageChanged =
+        mLocalStorage && mLocalStorage == aEvent->GetStorageArea();
+
+    if (fireMozStorageChanged) {
+      eventType.AssignLiteral("MozLocalStorageChanged");
+    }
+  }
+
+  IgnoredErrorResult error;
+  RefPtr<StorageEvent> clonedEvent =
+      CloneStorageEvent(eventType, aEvent, error);
+  if (error.Failed() || !clonedEvent) {
+    return;
+  }
+
+  clonedEvent->SetTrusted(true);
+
+  if (fireMozStorageChanged) {
+    WidgetEvent* internalEvent = clonedEvent->WidgetEventPtr();
+    internalEvent->mFlags.mOnlyChromeDispatch = true;
+  }
+
+  DispatchEvent(*clonedEvent);
+}
+
+already_AddRefed<StorageEvent> nsGlobalWindowInner::CloneStorageEvent(
+    const nsAString& aType, const RefPtr<StorageEvent>& aEvent,
+    ErrorResult& aRv) {
+  StorageEventInit dict;
+
+  dict.mBubbles = aEvent->Bubbles();
+  dict.mCancelable = aEvent->Cancelable();
+  aEvent->GetKey(dict.mKey);
+  aEvent->GetOldValue(dict.mOldValue);
+  aEvent->GetNewValue(dict.mNewValue);
+  aEvent->GetUrl(dict.mUrl);
+
+  RefPtr<Storage> storageArea = aEvent->GetStorageArea();
+
+  RefPtr<Storage> storage;
+
+  if (!storageArea) {
+    storage = GetLocalStorage(aRv);
+    if (!NextGenLocalStorageEnabled()) {
+      if (aRv.Failed() || !storage) {
+        return nullptr;
+      }
+
+      if (storage->Type() == Storage::eLocalStorage) {
+        RefPtr<LocalStorage> localStorage =
+            static_cast<LocalStorage*>(storage.get());
+
+        localStorage->ApplyEvent(aEvent);
+      }
+    }
+  } else if (storageArea->Type() == Storage::eSessionStorage) {
+    storage = GetSessionStorage(aRv);
+  } else {
+    MOZ_ASSERT(storageArea->Type() == Storage::eLocalStorage);
+    storage = GetLocalStorage(aRv);
+  }
+
+  if (aRv.Failed() || !storage) {
+    return nullptr;
+  }
+
+  if (storage->Type() == Storage::ePartitionedLocalStorage) {
+    aRv.Throw(NS_ERROR_DOM_SECURITY_ERR);
+    return nullptr;
+  }
+
+  MOZ_ASSERT(storage);
+  MOZ_ASSERT_IF(storageArea, storage->IsForkOf(storageArea));
+
+  dict.mStorageArea = storage;
+
+  RefPtr<StorageEvent> event = StorageEvent::Constructor(this, aType, dict);
+  return event.forget();
+}
+
+void nsGlobalWindowInner::Suspend(bool aIncludeSubWindows) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (!IsCurrentInnerWindow()) {
+    return;
+  }
+
+  if (aIncludeSubWindows) {
+    CallOnInProcessDescendants(&nsGlobalWindowInner::Suspend, false);
+  }
+
+  mSuspendDepth += 1;
+  if (mSuspendDepth != 1) {
+    return;
+  }
+
+  if (mWindowGlobalChild) {
+    mWindowGlobalChild->BlockBFCacheFor(BFCacheStatus::SUSPENDED);
+  }
+
+  nsCOMPtr<nsIDeviceSensors> ac = do_GetService(NS_DEVICE_SENSORS_CONTRACTID);
+  if (ac) {
+    for (uint32_t i = 0; i < mEnabledSensors.Length(); i++)
+      ac->RemoveWindowListener(mEnabledSensors[i], this);
+  }
+  SuspendWorkersForWindow(*this);
+
+  for (RefPtr<mozilla::dom::SharedWorker> pinnedWorker :
+       mSharedWorkers.ForwardRange()) {
+    pinnedWorker->Suspend();
+  }
+
+  SuspendIdleRequests();
+
+  mTimeoutManager->Suspend();
+
+  for (uint32_t i = 0; i < mAudioContexts.Length(); ++i) {
+    mAudioContexts[i]->SuspendFromChrome();
+  }
+}
+
+void nsGlobalWindowInner::Resume(bool aIncludeSubWindows) {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  if (!IsCurrentInnerWindow()) {
+    return;
+  }
+
+  if (aIncludeSubWindows) {
+    CallOnInProcessDescendants(&nsGlobalWindowInner::Resume, false);
+  }
+
+  if (mSuspendDepth == 0) {
+    return;
+  }
+
+  mSuspendDepth -= 1;
+
+  if (mSuspendDepth != 0) {
+    return;
+  }
+
+  MOZ_ASSERT(mFreezeDepth == 0);
+
+  nsCOMPtr<nsIDeviceSensors> ac = do_GetService(NS_DEVICE_SENSORS_CONTRACTID);
+  if (ac) {
+    for (uint32_t i = 0; i < mEnabledSensors.Length(); i++)
+      ac->AddWindowListener(mEnabledSensors[i], this);
+  }
+  for (uint32_t i = 0; i < mAudioContexts.Length(); ++i) {
+    mAudioContexts[i]->ResumeFromChrome();
+  }
+
+  mTimeoutManager->Resume();
+
+  ResumeIdleRequests();
+
+  ResumeWorkersForWindow(*this);
+
+  for (RefPtr<mozilla::dom::SharedWorker> pinnedWorker :
+       mSharedWorkers.ForwardRange()) {
+    pinnedWorker->Resume();
+  }
+
+  if (mWindowGlobalChild) {
+    mWindowGlobalChild->UnblockBFCacheFor(BFCacheStatus::SUSPENDED);
+  }
+}
+
+bool nsGlobalWindowInner::IsSuspended() const {
+  MOZ_ASSERT(NS_IsMainThread());
+  return mSuspendDepth != 0;
+}
+
+void nsGlobalWindowInner::Freeze(bool aIncludeSubWindows) {
+  MOZ_ASSERT(NS_IsMainThread());
+  Suspend(aIncludeSubWindows);
+  FreezeInternal(aIncludeSubWindows);
+}
+
+void nsGlobalWindowInner::FreezeInternal(bool aIncludeSubWindows) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_DIAGNOSTIC_ASSERT(IsCurrentInnerWindow());
+  MOZ_DIAGNOSTIC_ASSERT(IsSuspended());
+
+  HintIsLoading(false);
+
+  if (aIncludeSubWindows) {
+    CallOnInProcessChildren(&nsGlobalWindowInner::FreezeInternal,
+                            aIncludeSubWindows);
+  }
+
+  mFreezeDepth += 1;
+  MOZ_ASSERT(mSuspendDepth >= mFreezeDepth);
+  if (mFreezeDepth != 1) {
+    return;
+  }
+
+  FreezeWorkersForWindow(*this);
+
+  for (RefPtr<mozilla::dom::SharedWorker> pinnedWorker :
+       mSharedWorkers.ForwardRange()) {
+    pinnedWorker->Freeze();
+  }
+
+  mTimeoutManager->Freeze();
+  if (mClientSource) {
+    mClientSource->Freeze();
+  }
+
+  NotifyGlobalFrozen();
+}
+
+void nsGlobalWindowInner::Thaw(bool aIncludeSubWindows) {
+  MOZ_ASSERT(NS_IsMainThread());
+  ThawInternal(aIncludeSubWindows);
+  Resume(aIncludeSubWindows);
+}
+
+void nsGlobalWindowInner::ThawInternal(bool aIncludeSubWindows) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_DIAGNOSTIC_ASSERT(IsCurrentInnerWindow());
+  MOZ_DIAGNOSTIC_ASSERT(IsSuspended());
+
+  if (aIncludeSubWindows) {
+    CallOnInProcessChildren(&nsGlobalWindowInner::ThawInternal,
+                            aIncludeSubWindows);
+  }
+
+  MOZ_ASSERT(mFreezeDepth != 0);
+  mFreezeDepth -= 1;
+  MOZ_ASSERT(mSuspendDepth >= mFreezeDepth);
+  if (mFreezeDepth != 0) {
+    return;
+  }
+
+  if (mClientSource) {
+    mClientSource->Thaw();
+  }
+  mTimeoutManager->Thaw();
+
+  ThawWorkersForWindow(*this);
+
+  for (RefPtr<mozilla::dom::SharedWorker> pinnedWorker :
+       mSharedWorkers.ForwardRange()) {
+    pinnedWorker->Thaw();
+  }
+
+  NotifyGlobalThawed();
+}
+
+bool nsGlobalWindowInner::IsFrozen() const {
+  MOZ_ASSERT(NS_IsMainThread());
+  bool frozen = mFreezeDepth != 0;
+  MOZ_ASSERT_IF(frozen, IsSuspended());
+  return frozen;
+}
+
+void nsGlobalWindowInner::SyncStateFromParentWindow() {
+  MOZ_ASSERT(IsCurrentInnerWindow());
+  nsPIDOMWindowOuter* outer = GetOuterWindow();
+  MOZ_ASSERT(outer);
+
+  nsCOMPtr<Element> frame = outer->GetFrameElementInternal();
+  nsPIDOMWindowOuter* parentOuter =
+      frame ? frame->OwnerDoc()->GetWindow() : nullptr;
+  nsGlobalWindowInner* parentInner =
+      parentOuter
+          ? nsGlobalWindowInner::Cast(parentOuter->GetCurrentInnerWindow())
+          : nullptr;
+
+  if ((!parentInner || !parentInner->IsInModalState()) && IsInModalState()) {
+    Suspend();
+  }
+
+  uint32_t parentFreezeDepth = parentInner ? parentInner->mFreezeDepth : 0;
+  uint32_t parentSuspendDepth = parentInner ? parentInner->mSuspendDepth : 0;
+
+  MOZ_ASSERT(parentFreezeDepth <= parentSuspendDepth);
+
+  for (uint32_t i = 0; i < parentFreezeDepth; ++i) {
+    Freeze();
+  }
+
+  for (uint32_t i = 0; i < (parentSuspendDepth - parentFreezeDepth); ++i) {
+    Suspend();
+  }
+}
+
+void nsGlobalWindowInner::UpdateBackgroundState() {
+  mTimeoutManager->UpdateBackgroundState();
+
+  UpdateWorkersBackgroundState(*this, IsBackgroundInternal());
+}
+
+template <typename Method, typename... Args>
+CallState nsGlobalWindowInner::CallOnInProcessDescendantsInternal(
+    BrowsingContext* aBrowsingContext, bool aChildOnly, Method aMethod,
+    Args&&... aArgs) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(aBrowsingContext);
+
+  CallState state = CallState::Continue;
+  for (const RefPtr<BrowsingContext>& bc : aBrowsingContext->Children()) {
+    if (nsCOMPtr<nsPIDOMWindowOuter> pWin = bc->GetDOMWindow()) {
+      auto* win = nsGlobalWindowOuter::Cast(pWin);
+      if (nsGlobalWindowInner* inner =
+              nsGlobalWindowInner::Cast(win->GetCurrentInnerWindow())) {
+        using returnType = decltype((inner->*aMethod)(aArgs...));
+        state = CallDescendant<returnType>(inner, aMethod, aArgs...);
+
+        if (state == CallState::Stop) {
+          return state;
+        }
+      }
+    }
+
+    if (!aChildOnly) {
+      state = CallOnInProcessDescendantsInternal(bc.get(), aChildOnly, aMethod,
+                                                 aArgs...);
+      if (state == CallState::Stop) {
+        return state;
+      }
+    }
+  }
+
+  return state;
+}
+
+nsIURI* nsGlobalWindowInner::GetBaseURI() const { return GetDocBaseURI(); }
+
+Maybe<ClientInfo> nsGlobalWindowInner::GetClientInfo() const {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (mDoc && mDoc->IsStaticDocument()) {
+    if (Maybe<ClientInfo> info = mDoc->GetOriginalDocument()->GetClientInfo()) {
+      return info;
+    }
+  }
+
+  Maybe<ClientInfo> clientInfo;
+  if (mClientSource) {
+    clientInfo.emplace(mClientSource->Info());
+  }
+  return clientInfo;
+}
+
+Maybe<ClientState> nsGlobalWindowInner::GetClientState() const {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (mDoc && mDoc->IsStaticDocument()) {
+    if (Maybe<ClientState> state =
+            mDoc->GetOriginalDocument()->GetClientState()) {
+      return state;
+    }
+  }
+
+  Maybe<ClientState> clientState;
+  if (mClientSource) {
+    Result<ClientState, ErrorResult> res = mClientSource->SnapshotState();
+    if (res.isOk()) {
+      clientState.emplace(res.unwrap());
+    } else {
+      res.unwrapErr().SuppressException();
+    }
+  }
+  return clientState;
+}
+
+Maybe<ServiceWorkerDescriptor> nsGlobalWindowInner::GetController() const {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (mDoc && mDoc->IsStaticDocument()) {
+    if (Maybe<ServiceWorkerDescriptor> controller =
+            mDoc->GetOriginalDocument()->GetController()) {
+      return controller;
+    }
+  }
+
+  Maybe<ServiceWorkerDescriptor> controller;
+  if (mClientSource) {
+    controller = mClientSource->GetController();
+  }
+  return controller;
+}
+
+void nsGlobalWindowInner::SetPolicyContainer(
+    nsIPolicyContainer* aPolicyContainer) {
+  if (!mClientSource) {
+    return;
+  }
+  mClientSource->SetPolicyContainer(aPolicyContainer);
+  mDoc->SetPolicyContainer(aPolicyContainer);
+
+  if (mWindowGlobalChild) {
+    mWindowGlobalChild->SendSetClientInfo(mClientSource->Info().ToIPC());
+  }
+}
+
+nsIPolicyContainer* nsGlobalWindowInner::GetPolicyContainer() {
+  if (mDoc) {
+    return mDoc->GetPolicyContainer();
+  }
+
+  if (mDocumentPolicyContainer) {
+    return mDocumentPolicyContainer;
+  }
+  return nullptr;
+}
+
+void nsGlobalWindowInner::SetPreloadCsp(nsIContentSecurityPolicy* aPreloadCsp) {
+  if (!mClientSource) {
+    return;
+  }
+  mClientSource->SetPreloadCsp(aPreloadCsp);
+  mDoc->SetPreloadCsp(aPreloadCsp);
+
+  if (mWindowGlobalChild) {
+    mWindowGlobalChild->SendSetClientInfo(mClientSource->Info().ToIPC());
+  }
+}
+
+already_AddRefed<ServiceWorkerContainer>
+nsGlobalWindowInner::GetServiceWorkerContainer() {
+  return Navigator()->ServiceWorker();
+}
+
+RefPtr<ServiceWorker> nsGlobalWindowInner::GetOrCreateServiceWorker(
+    const ServiceWorkerDescriptor& aDescriptor) {
+  MOZ_ASSERT(NS_IsMainThread());
+  RefPtr<ServiceWorker> ref;
+  ForEachGlobalTeardownObserver(
+      [&](GlobalTeardownObserver* aObserver, bool* aDoneOut) {
+        RefPtr<ServiceWorker> sw = do_QueryObject(aObserver);
+        if (!sw || !sw->Descriptor().Matches(aDescriptor)) {
+          return;
+        }
+
+        ref = std::move(sw);
+        *aDoneOut = true;
+      });
+
+  if (!ref) {
+    ref = ServiceWorker::Create(this, aDescriptor);
+  }
+
+  return ref;
+}
+
+RefPtr<mozilla::dom::ServiceWorkerRegistration>
+nsGlobalWindowInner::GetServiceWorkerRegistration(
+    const mozilla::dom::ServiceWorkerRegistrationDescriptor& aDescriptor)
+    const {
+  MOZ_ASSERT(NS_IsMainThread());
+  RefPtr<ServiceWorkerRegistration> ref;
+  ForEachGlobalTeardownObserver(
+      [&](GlobalTeardownObserver* aObserver, bool* aDoneOut) {
+        RefPtr<ServiceWorkerRegistration> swr = do_QueryObject(aObserver);
+        if (!swr || !swr->MatchesDescriptor(aDescriptor)) {
+          return;
+        }
+
+        ref = std::move(swr);
+        *aDoneOut = true;
+      });
+  return ref;
+}
+
+RefPtr<ServiceWorkerRegistration>
+nsGlobalWindowInner::GetOrCreateServiceWorkerRegistration(
+    const ServiceWorkerRegistrationDescriptor& aDescriptor) {
+  MOZ_ASSERT(NS_IsMainThread());
+  RefPtr<ServiceWorkerRegistration> ref =
+      GetServiceWorkerRegistration(aDescriptor);
+  if (!ref) {
+    ref = ServiceWorkerRegistration::CreateForMainThread(this, aDescriptor);
+  }
+  return ref;
+}
+
+StorageAccess nsGlobalWindowInner::GetStorageAccess() {
+  return StorageAllowedForWindow(this);
+}
+
+nsICookieJarSettings* nsGlobalWindowInner::GetCookieJarSettings() {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (mDoc) {
+    return mDoc->CookieJarSettings();
+  }
+  return nullptr;
+}
+
+nsresult nsGlobalWindowInner::FireDelayedDOMEvents(bool aIncludeSubWindows) {
+  FireOfflineStatusEventIfChanged();
+
+  if (mCookieStore) {
+    mCookieStore->FireDelayedDOMEvents();
+  }
+
+  if (!aIncludeSubWindows) {
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsIDocShell> docShell = GetDocShell();
+  if (docShell) {
+    int32_t childCount = 0;
+    docShell->GetInProcessChildCount(&childCount);
+
+    AutoTArray<nsCOMPtr<nsIDocShellTreeItem>, 8> children;
+    for (int32_t i = 0; i < childCount; ++i) {
+      nsCOMPtr<nsIDocShellTreeItem> childShell;
+      docShell->GetInProcessChildAt(i, getter_AddRefs(childShell));
+      if (childShell) {
+        children.AppendElement(childShell);
+      }
+    }
+
+    for (const nsCOMPtr<nsIDocShellTreeItem>& childShell : children) {
+      if (nsCOMPtr<nsPIDOMWindowOuter> pWin = childShell->GetWindow()) {
+        auto* win = nsGlobalWindowOuter::Cast(pWin);
+        win->FireDelayedDOMEvents(true);
+      }
+    }
+  }
+
+  return NS_OK;
+}
+
+
+nsPIDOMWindowOuter* nsGlobalWindowInner::GetInProcessParentInternal() {
+  nsGlobalWindowOuter* outer = GetOuterWindowInternal();
+  if (!outer) {
+    return nullptr;
+  }
+  return outer->GetInProcessParentInternal();
+}
+
+nsIPrincipal* nsGlobalWindowInner::GetTopLevelAntiTrackingPrincipal() {
+  nsPIDOMWindowOuter* outerWindow = GetOuterWindowInternal();
+  if (!outerWindow) {
+    return nullptr;
+  }
+
+  nsPIDOMWindowOuter* topLevelOuterWindow =
+      GetBrowsingContext()->Top()->GetDOMWindow();
+  if (!topLevelOuterWindow) {
+    return nullptr;
+  }
+
+  bool stopAtOurLevel =
+      mDoc && mDoc->CookieJarSettings()->GetCookieBehavior() ==
+                  nsICookieService::BEHAVIOR_REJECT_TRACKER;
+
+  if (stopAtOurLevel && topLevelOuterWindow == outerWindow) {
+    return nullptr;
+  }
+
+  nsPIDOMWindowInner* topLevelInnerWindow =
+      topLevelOuterWindow->GetCurrentInnerWindow();
+  if (NS_WARN_IF(!topLevelInnerWindow)) {
+    return nullptr;
+  }
+
+  nsIPrincipal* topLevelPrincipal =
+      nsGlobalWindowInner::Cast(topLevelInnerWindow)->GetPrincipal();
+  if (NS_WARN_IF(!topLevelPrincipal)) {
+    return nullptr;
+  }
+
+  return topLevelPrincipal;
+}
+
+nsIPrincipal* nsGlobalWindowInner::GetClientPrincipal() {
+  return mClientSource ? mClientSource->GetPrincipal() : nullptr;
+}
+
+bool nsGlobalWindowInner::IsInFullScreenTransition() {
+  if (!mIsChrome) {
+    return false;
+  }
+
+  nsGlobalWindowOuter* outerWindow = GetOuterWindowInternal();
+  if (!outerWindow) {
+    return false;
+  }
+
+  return outerWindow->mIsInFullScreenTransition;
+}
+
+
+class WindowScriptTimeoutHandler final : public ScriptTimeoutHandler {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(WindowScriptTimeoutHandler,
+                                           ScriptTimeoutHandler)
+
+  WindowScriptTimeoutHandler(JSContext* aCx, nsIGlobalObject* aGlobal,
+                             const nsAString& aExpression)
+      : ScriptTimeoutHandler(aCx, aGlobal, aExpression),
+        mInitiatingScriptFetchInfo(
+            ScriptLoader::GetActiveScriptFetchInfo(aCx)) {}
+
+  MOZ_CAN_RUN_SCRIPT virtual bool Call(const char* aExecutionReason) override;
+
+ private:
+  virtual ~WindowScriptTimeoutHandler() = default;
+
+  RefPtr<JS::loader::ScriptFetchInfo> mInitiatingScriptFetchInfo;
+};
+
+NS_IMPL_CYCLE_COLLECTION_INHERITED(WindowScriptTimeoutHandler,
+                                   ScriptTimeoutHandler,
+                                   mInitiatingScriptFetchInfo)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(WindowScriptTimeoutHandler)
+NS_INTERFACE_MAP_END_INHERITING(ScriptTimeoutHandler)
+
+NS_IMPL_ADDREF_INHERITED(WindowScriptTimeoutHandler, ScriptTimeoutHandler)
+NS_IMPL_RELEASE_INHERITED(WindowScriptTimeoutHandler, ScriptTimeoutHandler)
+
+bool WindowScriptTimeoutHandler::Call(const char* aExecutionReason) {
+  nsAutoMicroTask mt;
+  AutoEntryScript aes(mGlobal, aExecutionReason, true);
+  JS::CompileOptions options(aes.cx());
+  options.setFileAndLine(mCaller.FileName().get(), mCaller.mLine);
+  options.setNoScriptRval(true);
+  options.setIntroductionType("domTimer");
+  JS::Rooted<JSObject*> global(aes.cx(), mGlobal->GetGlobalJSObject());
+  {
+    if (MOZ_UNLIKELY(!xpc::Scriptability::Get(global).Allowed())) {
+      return true;
+    }
+
+    IgnoredErrorResult erv;
+    JSAutoRealm autoRealm(aes.cx(), global);
+    RefPtr<JS::Stencil> stencil;
+    JS::Rooted<JSScript*> script(aes.cx());
+    Compile(aes.cx(), options, mExpr, stencil, erv);
+    if (stencil) {
+      JS::InstantiateOptions instantiateOptions(options);
+      MOZ_ASSERT(!instantiateOptions.deferDebugMetadata);
+      script.set(JS::InstantiateGlobalStencil(aes.cx(), instantiateOptions,
+                                              stencil,  nullptr));
+      if (!script) {
+        erv.NoteJSContextException(aes.cx());
+      }
+    }
+
+    if (script) {
+      MOZ_ASSERT(!erv.Failed());
+      if (mInitiatingScriptFetchInfo) {
+        mInitiatingScriptFetchInfo->AssociateWithScript(script);
+      }
+
+      if (!JS_ExecuteScript(aes.cx(), script)) {
+        erv.NoteJSContextException(aes.cx());
+      }
+    }
+
+    if (erv.IsUncatchableException()) {
+      return false;
+    }
+  }
+
+  return true;
+};
+
+nsGlobalWindowInner* nsGlobalWindowInner::InnerForSetTimeoutOrInterval(
+    ErrorResult& aError) {
+  nsGlobalWindowOuter* outer = GetOuterWindowInternal();
+  nsPIDOMWindowInner* currentInner =
+      outer ? outer->GetCurrentInnerWindow() : this;
+
+  return HasActiveDocument() ? nsGlobalWindowInner::Cast(currentInner)
+                             : nullptr;
+}
+
+int32_t nsGlobalWindowInner::SetTimeout(
+    JSContext* aCx, const FunctionOrTrustedScriptOrString& aHandler,
+    int32_t aTimeout, const Sequence<JS::Value>& aArguments,
+    nsIPrincipal* aSubjectPrincipal, ErrorResult& aError) {
+  return SetTimeoutOrInterval(aCx, aHandler, aTimeout, aArguments, false,
+                              aSubjectPrincipal, aError);
+}
+
+int32_t nsGlobalWindowInner::SetInterval(
+    JSContext* aCx, const FunctionOrTrustedScriptOrString& aHandler,
+    const int32_t aTimeout, const Sequence<JS::Value>& aArguments,
+    nsIPrincipal* aSubjectPrincipal, ErrorResult& aError) {
+  return SetTimeoutOrInterval(aCx, aHandler, aTimeout, aArguments, true,
+                              aSubjectPrincipal, aError);
+}
+
+int32_t nsGlobalWindowInner::SetTimeoutOrInterval(
+    JSContext* aCx, const FunctionOrTrustedScriptOrString& aHandler,
+    int32_t aTimeout, const Sequence<JS::Value>& aArguments, bool aIsInterval,
+    nsIPrincipal* aSubjectPrincipal, ErrorResult& aError) {
+  nsGlobalWindowInner* inner = InnerForSetTimeoutOrInterval(aError);
+  if (!inner) {
+    return -1;
+  }
+
+  if (inner != this) {
+    RefPtr<nsGlobalWindowInner> innerRef(inner);
+    return innerRef->SetTimeoutOrInterval(aCx, aHandler, aTimeout, aArguments,
+                                          aIsInterval, aSubjectPrincipal,
+                                          aError);
+  }
+
+  if (!GetContextInternal() || !HasJSGlobal()) {
+    return 0;
+  }
+
+  if (aHandler.IsFunction()) {
+    nsTArray<JS::Heap<JS::Value>> args;
+    if (!args.AppendElements(aArguments, fallible)) {
+      aError.Throw(NS_ERROR_OUT_OF_MEMORY);
+      return 0;
+    }
+
+    RefPtr handler = MakeRefPtr<CallbackTimeoutHandler>(
+        aCx, this, &aHandler.GetAsFunction(), std::move(args));
+
+    int32_t result;
+    aError = mTimeoutManager->SetTimeout(handler, aTimeout, aIsInterval,
+                                         Timeout::Reason::eTimeoutOrInterval,
+                                         &result);
+    return result;
+  }
+
+  constexpr nsLiteralString sinkSetTimeout = u"Window setTimeout"_ns;
+  constexpr nsLiteralString sinkSetInterval = u"Window setInterval"_ns;
+  Maybe<nsAutoString> compliantStringHolder;
+  nsCOMPtr<nsIGlobalObject> pinnedGlobal = this;
+  const nsAString* compliantString =
+      TrustedTypeUtils::GetTrustedTypesCompliantString(
+          aHandler, aIsInterval ? sinkSetInterval : sinkSetTimeout,
+          kTrustedTypesOnlySinkGroup, *pinnedGlobal, aSubjectPrincipal,
+          compliantStringHolder, aError);
+  if (aError.Failed()) {
+    return 0;
+  }
+
+  bool allowEval = false;
+  aError =
+      CSPEvalChecker::CheckForWindow(aCx, this, *compliantString, &allowEval);
+  if (NS_WARN_IF(aError.Failed()) || !allowEval) {
+    return 0;
+  }
+  RefPtr handler =
+      MakeRefPtr<WindowScriptTimeoutHandler>(aCx, this, *compliantString);
+  int32_t result;
+  aError =
+      mTimeoutManager->SetTimeout(handler, aTimeout, aIsInterval,
+                                  Timeout::Reason::eTimeoutOrInterval, &result);
+  return result;
+}
+
+static const char* GetTimeoutReasonString(Timeout* aTimeout) {
+  switch (aTimeout->mReason) {
+    case Timeout::Reason::eTimeoutOrInterval:
+      if (aTimeout->mIsInterval) {
+        return "setInterval handler";
+      }
+      return "setTimeout handler";
+    case Timeout::Reason::eIdleCallbackTimeout:
+      return "setIdleCallback handler (timed out)";
+    case Timeout::Reason::eAbortSignalTimeout:
+      return "AbortSignal timeout";
+    case Timeout::Reason::eDelayedWebTaskTimeout:
+      return "delayedWebTaskCallback handler (timed out)";
+    case Timeout::Reason::eJSTimeout:
+      return "JavaScript TimeoutJob (timed out)";
+    default:
+      MOZ_CRASH("Unexpected enum value");
+      return "";
+  }
+  MOZ_CRASH("Unexpected enum value");
+  return "";
+}
+
+bool nsGlobalWindowInner::RunTimeoutHandler(Timeout* aTimeout) {
+  RefPtr<Timeout> timeout = aTimeout;
+  Timeout* last_running_timeout = mTimeoutManager->BeginRunningTimeout(timeout);
+  timeout->mRunning = true;
+
+  AutoPopupStatePusher popupStatePusher(timeout->mPopupState);
+
+  timeout->mPopupState = PopupBlocker::openAbused;
+
+  uint32_t nestingLevel = mTimeoutManager->GetNestingLevelForWindow();
+  mTimeoutManager->SetNestingLevelForWindow(timeout->mNestingLevel);
+
+  const char* reason = GetTimeoutReasonString(timeout);
+
+  bool abortIntervalHandler;
+  {
+    RefPtr<TimeoutHandler> handler(timeout->mScriptHandler);
+
+    abortIntervalHandler = !handler->Call(reason);
+  }
+
+  if (abortIntervalHandler) {
+    timeout->mIsInterval = false;
+  }
+
+
+  mTimeoutManager->SetNestingLevelForWindow(nestingLevel);
+
+  mTimeoutManager->EndRunningTimeout(last_running_timeout);
+  timeout->mRunning = false;
+
+  return timeout->mCleared;
+}
+
+
+already_AddRefed<nsIDocShellTreeOwner> nsGlobalWindowInner::GetTreeOwner() {
+  FORWARD_TO_OUTER(GetTreeOwner, (), nullptr);
+}
+
+already_AddRefed<nsIWebBrowserChrome>
+nsGlobalWindowInner::GetWebBrowserChrome() {
+  nsCOMPtr<nsIDocShellTreeOwner> treeOwner = GetTreeOwner();
+
+  nsCOMPtr<nsIWebBrowserChrome> browserChrome = do_GetInterface(treeOwner);
+  return browserChrome.forget();
+}
+
+ScrollContainerFrame* nsGlobalWindowInner::GetScrollContainerFrame() {
+  FORWARD_TO_OUTER(GetScrollContainerFrame, (), nullptr);
+}
+
+bool nsGlobalWindowInner::IsPrivateBrowsing() {
+  nsCOMPtr<nsILoadContext> loadContext = do_QueryInterface(GetDocShell());
+  return loadContext && loadContext->UsePrivateBrowsing();
+}
+
+void nsGlobalWindowInner::FlushPendingNotifications(FlushType aType) {
+  if (mDoc) {
+    mDoc->FlushPendingNotifications(aType);
+  }
+}
+
+void nsGlobalWindowInner::EnableDeviceSensor(uint32_t aType) {
+  bool alreadyEnabled = false;
+  for (uint32_t i = 0; i < mEnabledSensors.Length(); i++) {
+    if (mEnabledSensors[i] == aType) {
+      alreadyEnabled = true;
+      break;
+    }
+  }
+
+  mEnabledSensors.AppendElement(aType);
+
+  if (alreadyEnabled) {
+    return;
+  }
+
+  nsCOMPtr<nsIDeviceSensors> ac = do_GetService(NS_DEVICE_SENSORS_CONTRACTID);
+  if (ac) {
+    ac->AddWindowListener(aType, this);
+  }
+}
+
+void nsGlobalWindowInner::DisableDeviceSensor(uint32_t aType) {
+  int32_t doomedElement = -1;
+  int32_t listenerCount = 0;
+  for (uint32_t i = 0; i < mEnabledSensors.Length(); i++) {
+    if (mEnabledSensors[i] == aType) {
+      doomedElement = i;
+      listenerCount++;
+    }
+  }
+
+  if (doomedElement == -1) {
+    return;
+  }
+
+  mEnabledSensors.RemoveElementAt(doomedElement);
+
+  if (listenerCount > 1) {
+    return;
+  }
+
+  nsCOMPtr<nsIDeviceSensors> ac = do_GetService(NS_DEVICE_SENSORS_CONTRACTID);
+  if (ac) {
+    ac->RemoveWindowListener(aType, this);
+  }
+}
+
+
+void nsGlobalWindowInner::EventListenerAdded(nsAtom* aType) {
+  if (aType == nsGkAtoms::onunload && mWindowGlobalChild) {
+    if (++mUnloadOrBeforeUnloadListenerCount == 1) {
+      mWindowGlobalChild->BlockBFCacheFor(BFCacheStatus::UNLOAD_LISTENER);
+    }
+  }
+
+  if (aType == nsGkAtoms::onbeforeunload && mWindowGlobalChild) {
+    if (!StaticPrefs::
+            docshell_shistory_bfcache_ship_allow_beforeunload_listeners()) {
+      if (++mUnloadOrBeforeUnloadListenerCount == 1) {
+        mWindowGlobalChild->BlockBFCacheFor(
+            BFCacheStatus::BEFOREUNLOAD_LISTENER);
+      }
+    }
+    if (!mDoc || !(mDoc->GetSandboxFlags() & SANDBOXED_MODALS)) {
+      mWindowGlobalChild->BeforeUnloadAdded();
+      MOZ_ASSERT(mWindowGlobalChild->BeforeUnloadListeners() > 0);
+    }
+  }
+
+  if (aType == nsGkAtoms::onstorage) {
+    ErrorResult rv;
+    GetLocalStorage(rv);
+    rv.SuppressException();
+
+    if (NextGenLocalStorageEnabled() && mLocalStorage &&
+        mLocalStorage->Type() == Storage::eLocalStorage) {
+      auto object = static_cast<LSObject*>(mLocalStorage.get());
+
+      (void)NS_WARN_IF(NS_FAILED(object->EnsureObserver()));
+    }
+  }
+}
+
+void nsGlobalWindowInner::EventListenerRemoved(nsAtom* aType) {
+  if (aType == nsGkAtoms::onunload && mWindowGlobalChild) {
+    MOZ_ASSERT(mUnloadOrBeforeUnloadListenerCount > 0);
+    if (--mUnloadOrBeforeUnloadListenerCount == 0) {
+      mWindowGlobalChild->UnblockBFCacheFor(BFCacheStatus::UNLOAD_LISTENER);
+    }
+  }
+
+  if (aType == nsGkAtoms::onbeforeunload && mWindowGlobalChild) {
+    if (!StaticPrefs::
+            docshell_shistory_bfcache_ship_allow_beforeunload_listeners()) {
+      if (--mUnloadOrBeforeUnloadListenerCount == 0) {
+        mWindowGlobalChild->UnblockBFCacheFor(
+            BFCacheStatus::BEFOREUNLOAD_LISTENER);
+      }
+    }
+    if (!mDoc || !(mDoc->GetSandboxFlags() & SANDBOXED_MODALS)) {
+      mWindowGlobalChild->BeforeUnloadRemoved();
+      MOZ_ASSERT(mWindowGlobalChild->BeforeUnloadListeners() >= 0);
+    }
+  }
+
+  if (aType == nsGkAtoms::onstorage) {
+    if (NextGenLocalStorageEnabled() && mLocalStorage &&
+        mLocalStorage->Type() == Storage::eLocalStorage &&
+        mListenerManager &&
+        !mListenerManager->HasListenersFor(nsGkAtoms::onstorage)) {
+      auto object = static_cast<LSObject*>(mLocalStorage.get());
+
+      object->DropObserver();
+    }
+  }
+}
+
+void nsGlobalWindowInner::AddSizeOfIncludingThis(
+    nsWindowSizes& aWindowSizes) const {
+  aWindowSizes.mDOMSizes.mDOMOtherSize +=
+      aWindowSizes.mState.mMallocSizeOf(this);
+  aWindowSizes.mDOMSizes.mDOMOtherSize +=
+      nsIGlobalObject::ShallowSizeOfExcludingThis(
+          aWindowSizes.mState.mMallocSizeOf);
+
+  EventListenerManager* elm = GetExistingListenerManager();
+  if (elm) {
+    aWindowSizes.mDOMSizes.mDOMOtherSize +=
+        elm->SizeOfIncludingThis(aWindowSizes.mState.mMallocSizeOf);
+    aWindowSizes.mDOMEventListenersCount += elm->ListenerCount();
+  }
+  if (mDoc) {
+    if (!mDoc->GetInnerWindow() || mDoc->GetInnerWindow() == this) {
+      mDoc->DocAddSizeOfIncludingThis(aWindowSizes);
+    }
+  }
+
+  if (mNavigation) {
+    aWindowSizes.mDOMSizes.mDOMOtherSize +=
+        aWindowSizes.mState.mMallocSizeOf(mNavigation.get());
+  }
+  if (mNavigator) {
+    aWindowSizes.mDOMSizes.mDOMOtherSize +=
+        mNavigator->SizeOfIncludingThis(aWindowSizes.mState.mMallocSizeOf);
+  }
+
+  ForEachGlobalTeardownObserver([&](GlobalTeardownObserver* et,
+                                    bool* aDoneOut) {
+    if (nsCOMPtr<nsISizeOfEventTarget> iSizeOf = do_QueryObject(et)) {
+      aWindowSizes.mDOMSizes.mDOMEventTargetsSize +=
+          iSizeOf->SizeOfEventTargetIncludingThis(
+              aWindowSizes.mState.mMallocSizeOf);
+    }
+    if (nsCOMPtr<DOMEventTargetHelper> helper = do_QueryObject(et)) {
+      if (EventListenerManager* elm = helper->GetExistingListenerManager()) {
+        aWindowSizes.mDOMEventListenersCount += elm->ListenerCount();
+      }
+    }
+    ++aWindowSizes.mDOMEventTargetsCount;
+  });
+
+  if (mPerformance) {
+    aWindowSizes.mDOMSizes.mDOMPerformanceUserEntries =
+        mPerformance->SizeOfUserEntries(aWindowSizes.mState.mMallocSizeOf);
+    aWindowSizes.mDOMSizes.mDOMPerformanceResourceEntries =
+        mPerformance->SizeOfResourceEntries(aWindowSizes.mState.mMallocSizeOf);
+    aWindowSizes.mDOMSizes.mDOMPerformanceEventEntries =
+        mPerformance->SizeOfEventEntries(aWindowSizes.mState.mMallocSizeOf);
+  }
+
+  aWindowSizes.mMediaSourceURLsCount = mMediaSourceURLs.Length();
+}
+
+void nsGlobalWindowInner::RegisterDataDocumentForMemoryReporting(
+    Document* aDocument) {
+  aDocument->SetAddedToMemoryReportAsDataDocument();
+  mDataDocumentsForMemoryReporting.AppendElement(aDocument);
+}
+
+void nsGlobalWindowInner::UnregisterDataDocumentForMemoryReporting(
+    Document* aDocument) {
+  DebugOnly<bool> found =
+      mDataDocumentsForMemoryReporting.RemoveElement(aDocument);
+  MOZ_ASSERT(found);
+}
+
+void nsGlobalWindowInner::CollectDOMSizesForDataDocuments(
+    nsWindowSizes& aSize) const {
+  for (Document* doc : mDataDocumentsForMemoryReporting) {
+    if (doc) {
+      doc->DocAddSizeOfIncludingThis(aSize);
+    }
+  }
+}
+
+enum WindowState {
+  STATE_MAXIMIZED = 1,
+  STATE_MINIMIZED = 2,
+  STATE_NORMAL = 3,
+  STATE_FULLSCREEN = 4
+};
+
+uint16_t nsGlobalWindowInner::WindowState() {
+  nsCOMPtr<nsIWidget> widget = GetMainWidget();
+
+  int32_t mode = widget ? widget->SizeMode() : 0;
+
+  switch (mode) {
+    case nsSizeMode_Minimized:
+      return STATE_MINIMIZED;
+    case nsSizeMode_Maximized:
+      return STATE_MAXIMIZED;
+    case nsSizeMode_Fullscreen:
+      return STATE_FULLSCREEN;
+    case nsSizeMode_Normal:
+      return STATE_NORMAL;
+    default:
+      NS_WARNING("Illegal window state for this chrome window");
+      break;
+  }
+
+  return STATE_NORMAL;
+}
+
+bool nsGlobalWindowInner::IsFullyOccluded() {
+  nsCOMPtr<nsIWidget> widget = GetMainWidget();
+  return widget && widget->IsFullyOccluded();
+}
+
+void nsGlobalWindowInner::Maximize() {
+  if (nsCOMPtr<nsIWidget> widget = GetMainWidget()) {
+    widget->SetSizeMode(nsSizeMode_Maximized);
+  }
+}
+
+void nsGlobalWindowInner::Minimize() {
+  if (nsCOMPtr<nsIWidget> widget = GetMainWidget()) {
+    widget->SetSizeMode(nsSizeMode_Minimized);
+  }
+}
+
+void nsGlobalWindowInner::Restore() {
+  if (nsCOMPtr<nsIWidget> widget = GetMainWidget()) {
+    widget->SetSizeMode(nsSizeMode_Normal);
+  }
+}
+
+void nsGlobalWindowInner::GetWorkspaceID(nsAString& workspaceID) {
+  workspaceID.Truncate();
+  if (nsCOMPtr<nsIWidget> widget = GetMainWidget()) {
+    return widget->GetWorkspaceID(workspaceID);
+  }
+}
+
+void nsGlobalWindowInner::MoveToWorkspace(const nsAString& workspaceID) {
+  if (nsCOMPtr<nsIWidget> widget = GetMainWidget()) {
+    widget->MoveToWorkspace(workspaceID);
+  }
+}
+
+bool nsGlobalWindowInner::IsCloaked() const {
+  if (nsCOMPtr<nsIWidget> widget = GetMainWidget()) {
+    return widget->IsCloaked();
+  }
+  return false;
+}
+
+void nsGlobalWindowInner::GetAttention(ErrorResult& aResult) {
+  return GetAttentionWithCycleCount(-1, aResult);
+}
+
+void nsGlobalWindowInner::GetAttentionWithCycleCount(int32_t aCycleCount,
+                                                     ErrorResult& aError) {
+  nsCOMPtr<nsIWidget> widget = GetMainWidget();
+
+  if (widget) {
+    aError = widget->GetAttention(aCycleCount);
+  }
+}
+
+already_AddRefed<Promise> nsGlobalWindowInner::PromiseDocumentFlushed(
+    PromiseDocumentFlushedCallback& aCallback, ErrorResult& aError) {
+  MOZ_RELEASE_ASSERT(IsChromeWindow());
+
+  if (!IsCurrentInnerWindow()) {
+    aError.ThrowInvalidStateError("Not the current inner window");
+    return nullptr;
+  }
+  if (!mDoc) {
+    aError.ThrowInvalidStateError("No document");
+    return nullptr;
+  }
+
+  if (mIteratingDocumentFlushedResolvers) {
+    aError.ThrowInvalidStateError("Already iterating through resolvers");
+    return nullptr;
+  }
+
+  PresShell* presShell = mDoc->GetPresShell();
+  if (!presShell) {
+    aError.ThrowInvalidStateError("No pres shell");
+    return nullptr;
+  }
+
+  nsIGlobalObject* global = GetIncumbentGlobal();
+  if (!global) {
+    aError.ThrowInvalidStateError("No incumbent global");
+    return nullptr;
+  }
+
+  RefPtr<Promise> resultPromise = Promise::Create(global, aError);
+  if (aError.Failed()) {
+    return nullptr;
+  }
+
+  auto flushResolver =
+      MakeUnique<PromiseDocumentFlushedResolver>(resultPromise, aCallback);
+
+  if (!presShell->NeedStyleFlush() && !presShell->NeedLayoutFlush()) {
+    flushResolver->Call();
+    return resultPromise.forget();
+  }
+
+  if (!TryToObserveRefresh()) {
+    aError.ThrowInvalidStateError("Couldn't observe refresh");
+    return nullptr;
+  }
+
+  mDocumentFlushedResolvers.AppendElement(std::move(flushResolver));
+  return resultPromise.forget();
+}
+
+bool nsGlobalWindowInner::TryToObserveRefresh() {
+  if (mObservingRefresh) {
+    return true;
+  }
+
+  if (!mDoc) {
+    return false;
+  }
+
+  nsPresContext* pc = mDoc->GetPresContext();
+  if (!pc) {
+    return false;
+  }
+
+  mObservingRefresh = true;
+  auto observer = MakeRefPtr<ManagedPostRefreshObserver>(
+      pc, [win = RefPtr{this}](bool aWasCanceled) {
+        if (win->MaybeCallDocumentFlushedResolvers(
+                 aWasCanceled)) {
+          return ManagedPostRefreshObserver::Unregister::No;
+        }
+        win->mObservingRefresh = false;
+        return ManagedPostRefreshObserver::Unregister::Yes;
+      });
+  pc->RegisterManagedPostRefreshObserver(observer.get());
+  return mObservingRefresh;
+}
+
+void nsGlobalWindowInner::CallDocumentFlushedResolvers(bool aUntilExhaustion) {
+  while (true) {
+    {
+      nsAutoMicroTask mt;
+
+      mIteratingDocumentFlushedResolvers = true;
+
+      auto resolvers = std::move(mDocumentFlushedResolvers);
+      for (const auto& resolver : resolvers) {
+        resolver->Call();
+      }
+
+      mIteratingDocumentFlushedResolvers = false;
+    }
+
+
+    if (!aUntilExhaustion || mDocumentFlushedResolvers.IsEmpty()) {
+      break;
+    }
+  }
+}
+
+bool nsGlobalWindowInner::MaybeCallDocumentFlushedResolvers(
+    bool aUntilExhaustion) {
+  MOZ_ASSERT(mDoc);
+
+  PresShell* presShell = mDoc->GetPresShell();
+  if (!presShell || aUntilExhaustion) {
+    CallDocumentFlushedResolvers( true);
+    return false;
+  }
+
+  if (presShell->NeedStyleFlush() || presShell->NeedLayoutFlush()) {
+    return true;
+  }
+
+  CallDocumentFlushedResolvers( false);
+  return !mDocumentFlushedResolvers.IsEmpty();
+}
+
+already_AddRefed<nsWindowRoot> nsGlobalWindowInner::GetWindowRoot(
+    mozilla::ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(GetWindowRootOuter, (), aError, nullptr);
+}
+
+void nsGlobalWindowInner::SetCursor(const nsACString& aCursor,
+                                    ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(SetCursorOuter, (aCursor, aError), aError, );
+}
+
+nsIBrowserDOMWindow* nsGlobalWindowInner::GetBrowserDOMWindow(
+    ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(GetBrowserDOMWindow, (), aError, nullptr);
+}
+
+void nsGlobalWindowInner::SetBrowserDOMWindow(
+    nsIBrowserDOMWindow* aBrowserWindow, ErrorResult& aError) {
+  FORWARD_TO_OUTER_OR_THROW(SetBrowserDOMWindowOuter, (aBrowserWindow),
+                            aError, );
+}
+
+void nsGlobalWindowInner::NotifyDefaultButtonLoaded(Element& aDefaultButton,
+                                                    ErrorResult& aError) {
+  nsCOMPtr<nsIDOMXULControlElement> xulControl = aDefaultButton.AsXULControl();
+  if (!xulControl) {
+    aError.Throw(NS_ERROR_FAILURE);
+    return;
+  }
+  bool disabled;
+  aError = xulControl->GetDisabled(&disabled);
+  if (aError.Failed() || disabled) {
+    return;
+  }
+
+  nsIFrame* frame = aDefaultButton.GetPrimaryFrame();
+  if (!frame) {
+    aError.Throw(NS_ERROR_FAILURE);
+    return;
+  }
+  LayoutDeviceIntRect buttonRect = LayoutDeviceIntRect::FromAppUnitsToNearest(
+      frame->GetScreenRectInAppUnits(),
+      frame->PresContext()->AppUnitsPerDevPixel());
+
+  nsIWidget* widget = GetNearestWidget();
+  if (!widget) {
+    aError.Throw(NS_ERROR_FAILURE);
+    return;
+  }
+  LayoutDeviceIntRect widgetRect = widget->GetScreenBounds();
+
+  buttonRect -= widgetRect.TopLeft();
+  nsresult rv = widget->OnDefaultButtonLoaded(buttonRect);
+  if (NS_FAILED(rv) && rv != NS_ERROR_NOT_IMPLEMENTED) {
+    aError.Throw(rv);
+  }
+}
+
+ChromeMessageBroadcaster* nsGlobalWindowInner::MessageManager() {
+  MOZ_ASSERT(IsChromeWindow());
+  if (!mChromeFields.mMessageManager) {
+    RefPtr<ChromeMessageBroadcaster> globalMM =
+        nsFrameMessageManager::GetGlobalMessageManager();
+    mChromeFields.mMessageManager =
+        MakeRefPtr<ChromeMessageBroadcaster>(globalMM);
+  }
+  return mChromeFields.mMessageManager;
+}
+
+ChromeMessageBroadcaster* nsGlobalWindowInner::GetGroupMessageManager(
+    const nsAString& aGroup) {
+  MOZ_ASSERT(IsChromeWindow());
+
+  return mChromeFields.mGroupMessageManagers
+      .LookupOrInsertWith(
+          aGroup,
+          [&] {
+            return MakeAndAddRef<ChromeMessageBroadcaster>(MessageManager());
+          })
+      .get();
+}
+
+void nsGlobalWindowInner::InitWasOffline() { mWasOffline = NS_IsOffline(); }
+
+int16_t nsGlobalWindowInner::Orientation(CallerType aCallerType) {
+  uint16_t screenAngle = Screen()->GetOrientationAngle();
+  if (nsIGlobalObject::ShouldResistFingerprinting(
+          aCallerType, RFPTarget::ScreenOrientation)) {
+    CSSIntSize size = mBrowsingContext->TopInnerSizeSpoofedForRFP();
+    screenAngle = nsRFPService::ViewportSizeToAngle(size.width, size.height);
+  }
+  int16_t angle = AssertedCast<int16_t>(screenAngle);
+  return angle <= 180 ? angle : angle - 360;
+}
+
+already_AddRefed<Console> nsGlobalWindowInner::GetConsole(JSContext* aCx,
+                                                          ErrorResult& aRv) {
+  if (!mConsole) {
+    mConsole = Console::Create(aCx, this, aRv);
+    if (NS_WARN_IF(aRv.Failed())) {
+      return nullptr;
+    }
+  }
+
+  RefPtr<Console> console = mConsole;
+  return console.forget();
+}
+
+already_AddRefed<CookieStore> nsGlobalWindowInner::CookieStore() {
+  if (!mCookieStore) {
+    mCookieStore = CookieStore::Create(this);
+  }
+
+  return do_AddRef(mCookieStore);
+}
+
+bool nsGlobalWindowInner::IsSecureContext() const {
+  JS::Realm* realm = js::GetNonCCWObjectRealm(GetWrapperPreserveColor());
+  return JS::GetIsSecureContext(realm);
+}
+
+External* nsGlobalWindowInner::External() {
+  if (!mExternal) {
+    mExternal = MakeRefPtr<dom::External>(ToSupports(this));
+  }
+
+  return mExternal;
+}
+
+void nsGlobalWindowInner::ClearDocumentDependentSlots(JSContext* aCx) {
+  if (!Window_Binding::ClearCachedDocumentValue(aCx, this) ||
+      !Window_Binding::ClearCachedPerformanceValue(aCx, this)) {
+    MOZ_CRASH("Unhandlable OOM while clearing document dependent slots.");
+  }
+}
+
+JSObject* nsGlobalWindowInner::CreateNamedPropertiesObject(
+    JSContext* aCx, JS::Handle<JSObject*> aProto) {
+  return WindowNamedPropertiesHandler::Create(aCx, aProto);
+}
+
+void nsGlobalWindowInner::RedefineProperty(JSContext* aCx,
+                                           const char* aPropName,
+                                           JS::Handle<JS::Value> aValue,
+                                           ErrorResult& aError) {
+  JS::Rooted<JSObject*> thisObj(aCx, GetWrapperPreserveColor());
+  if (!thisObj) {
+    aError.Throw(NS_ERROR_UNEXPECTED);
+    return;
+  }
+
+  if (!JS_WrapObject(aCx, &thisObj) ||
+      !JS_DefineProperty(aCx, thisObj, aPropName, aValue, JSPROP_ENUMERATE)) {
+    aError.Throw(NS_ERROR_FAILURE);
+  }
+}
+
+void nsGlobalWindowInner::FireOnNewGlobalObject() {
+  AutoEntryScript aes(this, "nsGlobalWindowInner report new global");
+  JS::Rooted<JSObject*> global(aes.cx(), GetWrapper());
+  JS_FireOnNewGlobalObject(aes.cx(), global);
+}
+
+#if defined(_WINDOWS_) && !defined(MOZ_WRAPPED_WINDOWS_H)
+#  pragma message( \
+      "wrapper failure reason: " MOZ_WINDOWS_WRAPPER_DISABLED_REASON)
+#  error "Never include unwrapped windows.h in this file!"
+#endif
+
+already_AddRefed<Promise> nsGlobalWindowInner::CreateImageBitmap(
+    const ImageBitmapSource& aImage, const ImageBitmapOptions& aOptions,
+    ErrorResult& aRv) {
+  return ImageBitmap::Create(this, aImage, Nothing(), aOptions, aRv);
+}
+
+already_AddRefed<Promise> nsGlobalWindowInner::CreateImageBitmap(
+    const ImageBitmapSource& aImage, int32_t aSx, int32_t aSy, int32_t aSw,
+    int32_t aSh, const ImageBitmapOptions& aOptions, ErrorResult& aRv) {
+  return ImageBitmap::Create(
+      this, aImage, Some(gfx::IntRect(aSx, aSy, aSw, aSh)), aOptions, aRv);
+}
+
+void nsGlobalWindowInner::StructuredClone(
+    JSContext* aCx, JS::Handle<JS::Value> aValue,
+    const StructuredSerializeOptions& aOptions,
+    JS::MutableHandle<JS::Value> aRetval, ErrorResult& aError) {
+  nsContentUtils::StructuredClone(aCx, this, aValue, aOptions, aRetval, aError);
+}
+
+nsresult nsGlobalWindowInner::Dispatch(
+    already_AddRefed<nsIRunnable> aRunnable) const {
+  MOZ_RELEASE_ASSERT(NS_IsMainThread());
+  return NS_DispatchToCurrentThread(std::move(aRunnable));
+}
+
+nsISerialEventTarget* nsGlobalWindowInner::SerialEventTarget() const {
+  MOZ_RELEASE_ASSERT(NS_IsMainThread());
+  return GetMainThreadSerialEventTarget();
+}
+
+Worklet* nsGlobalWindowInner::GetPaintWorklet(ErrorResult& aRv) {
+  if (!mPaintWorklet) {
+    nsIPrincipal* principal = GetPrincipal();
+    if (!principal) {
+      aRv.Throw(NS_ERROR_FAILURE);
+      return nullptr;
+    }
+
+    mPaintWorklet = PaintWorkletImpl::CreateWorklet(this, principal);
+  }
+
+  return mPaintWorklet;
+}
+
+void nsGlobalWindowInner::GetWebExposedLocales(nsTArray<nsString>& aLocales) {
+  MOZ_ASSERT(mozilla::intl::LocaleService::GetInstance());
+
+  AutoTArray<nsCString, 10> rpLocales;
+  mozilla::intl::LocaleService::GetInstance()->GetWebExposedLocales(rpLocales);
+
+  for (const auto& loc : rpLocales) {
+    aLocales.AppendElement(NS_ConvertUTF8toUTF16(loc));
+  }
+}
+
+IntlUtils* nsGlobalWindowInner::GetIntlUtils(ErrorResult& aError) {
+  if (!mIntlUtils) {
+    mIntlUtils = MakeRefPtr<IntlUtils>(this);
+  }
+
+  return mIntlUtils;
+}
+
+void nsGlobalWindowInner::StoreSharedWorker(SharedWorker* aSharedWorker) {
+  MOZ_ASSERT(aSharedWorker);
+  MOZ_ASSERT(!mSharedWorkers.Contains(aSharedWorker));
+
+  mSharedWorkers.AppendElement(aSharedWorker);
+}
+
+void nsGlobalWindowInner::ForgetSharedWorker(SharedWorker* aSharedWorker) {
+  MOZ_ASSERT(aSharedWorker);
+  MOZ_ASSERT(mSharedWorkers.Contains(aSharedWorker));
+
+  mSharedWorkers.RemoveElement(aSharedWorker);
+}
+
+void nsGlobalWindowInner::UpdateSharedWorkersLanguageOverride(
+    const nsCString& aLanguageOverride) {
+  nsTArray<nsString> resolvedLanguages;
+  Navigator::GetAcceptLanguages(resolvedLanguages, aLanguageOverride.IsEmpty()
+                                                       ? nullptr
+                                                       : &aLanguageOverride);
+
+  for (RefPtr<mozilla::dom::SharedWorker> pinnedWorker :
+       mSharedWorkers.ForwardRange()) {
+    pinnedWorker->UpdateLanguageOverride(aLanguageOverride, resolvedLanguages);
+  }
+}
+
+void nsGlobalWindowInner::UpdateSharedWorkerTimezoneOverride(
+    const nsAString& aTimezoneOverride) {
+  for (RefPtr<SharedWorker> pinnedWorker : mSharedWorkers.ForwardRange()) {
+    pinnedWorker->UpdateTimezoneOverride(aTimezoneOverride);
+  }
+}
+
+RefPtr<GenericPromise> nsGlobalWindowInner::StorageAccessPermissionChanged(
+    bool aGranted) {
+  ClearStorageAllowedCache();
+
+  nsCOMPtr<nsICookieJarSettings> cjs;
+  if (mDoc) {
+    cjs = mDoc->CookieJarSettings();
+  }
+  StorageAccess storageAccess = StorageAllowedForWindow(this);
+  if (ShouldPartitionStorage(storageAccess) &&
+      StoragePartitioningEnabled(storageAccess, cjs)) {
+    if (mDoc) {
+      mDoc->ClearActiveCookieAndStoragePrincipals();
+    }
+    if (aGranted) {
+      nsIChannel* channel = mDoc->GetChannel();
+      if (channel) {
+        return ContentChild::UpdateCookieStatus(channel);
+      }
+    }
+  }
+
+  PropagateStorageAccessPermissionGrantedToWorkers(*this);
+
+
+  if (mLocalStorage) {
+    IgnoredErrorResult error;
+    GetLocalStorage(error);
+    if (NS_WARN_IF(error.Failed())) {
+      return MozPromise<bool, nsresult, true>::CreateAndReject(
+          error.StealNSResult(), __func__);
+    }
+
+    MOZ_ASSERT(mLocalStorage &&
+               mLocalStorage->Type() == Storage::eLocalStorage);
+
+    if (NextGenLocalStorageEnabled() && mListenerManager &&
+        mListenerManager->HasListenersFor(nsGkAtoms::onstorage)) {
+      auto object = static_cast<LSObject*>(mLocalStorage.get());
+
+      object->EnsureObserver();
+    }
+  }
+
+  mIndexedDB = nullptr;
+
+  mCacheStorage = nullptr;
+
+  if (mDoc) {
+    mDoc->ClearActiveCookieAndStoragePrincipals();
+    if (mWindowGlobalChild) {
+      mWindowGlobalChild->SetDocumentPrincipal(
+          mDoc->NodePrincipal(), mDoc->EffectiveStoragePrincipal());
+    }
+  }
+
+  if (aGranted) {
+    nsIChannel* channel = mDoc->GetChannel();
+    if (channel) {
+      return ContentChild::UpdateCookieStatus(channel);
+    }
+  }
+  return MozPromise<bool, nsresult, true>::CreateAndResolve(true, __func__);
+}
+
+ContentMediaController* nsGlobalWindowInner::GetContentMediaController() {
+  if (mContentMediaController) {
+    return mContentMediaController;
+  }
+  if (!mBrowsingContext) {
+    return nullptr;
+  }
+
+  mContentMediaController =
+      MakeRefPtr<ContentMediaController>(mBrowsingContext->Id());
+  return mContentMediaController;
+}
+
+void nsGlobalWindowInner::SetScrollMarks(const nsTArray<uint32_t>& aScrollMarks,
+                                         bool aOnHScrollbar) {
+  mScrollMarks.Assign(aScrollMarks);
+  mScrollMarksOnHScrollbar = aOnHScrollbar;
+
+  if (mDoc) {
+    PresShell* presShell = mDoc->GetPresShell();
+    if (presShell) {
+      ScrollContainerFrame* sf = presShell->GetRootScrollContainerFrame();
+      if (sf) {
+        sf->InvalidateScrollbars();
+      }
+    }
+  }
+}
+
+already_AddRefed<nsGlobalWindowInner> nsGlobalWindowInner::Create(
+    nsGlobalWindowOuter* aOuterWindow, bool aIsChrome,
+    WindowGlobalChild* aActor) {
+  RefPtr<nsGlobalWindowInner> window =
+      new nsGlobalWindowInner(aOuterWindow, aActor);
+  if (aIsChrome) {
+    window->mIsChrome = true;
+    window->mCleanMessageManager = true;
+  }
+
+  if (aActor) {
+    aActor->InitWindowGlobal(window);
+  }
+
+  window->InitWasOffline();
+  return window.forget();
+}
+
+JS::loader::ModuleLoaderBase* nsGlobalWindowInner::GetModuleLoader(
+    JSContext* aCx) {
+  Document* document = GetDocument();
+  if (!document) {
+    return nullptr;
+  }
+
+  ScriptLoader* loader = document->GetScriptLoader();
+  if (!loader) {
+    return nullptr;
+  }
+
+  return loader->GetModuleLoader();
+}
+
+void nsGlobalWindowInner::SetCurrentPasteDataTransfer(
+    DataTransfer* aDataTransfer) {
+  MOZ_ASSERT_IF(aDataTransfer, aDataTransfer->GetEventMessage() == ePaste);
+  MOZ_ASSERT_IF(aDataTransfer, aDataTransfer->ClipboardType() ==
+                                   Some(nsIClipboard::kGlobalClipboard));
+  MOZ_ASSERT_IF(aDataTransfer, aDataTransfer->GetClipboardDataSnapshot());
+  mCurrentPasteDataTransfer = aDataTransfer;
+}
+
+DataTransfer* nsGlobalWindowInner::GetCurrentPasteDataTransfer() const {
+  return mCurrentPasteDataTransfer;
+}
+
+TrustedTypePolicyFactory* nsGlobalWindowInner::TrustedTypes() {
+  if (!mTrustedTypePolicyFactory) {
+    mTrustedTypePolicyFactory = MakeRefPtr<TrustedTypePolicyFactory>(this);
+  }
+
+  return mTrustedTypePolicyFactory;
+}
+
+void nsGlobalWindowInner::NoteMediaSourceURL(const nsACString& aURL) {
+  MOZ_ASSERT(!IsDying(), "MediaSourceURL will never be cleaned up");
+  mMediaSourceURLs.InsertElementSorted(aURL);
+}
+
+void nsGlobalWindowInner::UnnoteMediaSourceURL(const nsACString& aURL) {
+  DebugOnly<bool> found = mMediaSourceURLs.RemoveElementSorted(aURL);
+  MOZ_ASSERT(found, "MediaSourceURL should have been noted");
+}
+
+void nsPIDOMWindowInner::MaybeSetHasPointerRawUpdateEventListeners() {
+  if (HasPointerRawUpdateEventListeners() || !IsSecureContext()) {
+    return;
+  }
+  mMayHavePointerRawUpdateEventListener = true;
+  if (BrowserChild* const browserChild = BrowserChild::GetFrom(this)) {
+    browserChild->OnPointerRawUpdateEventListenerAdded(this);
+  }
+}
+
+void nsPIDOMWindowInner::ClearHasPointerRawUpdateEventListeners() {
+  if (!HasPointerRawUpdateEventListeners()) {
+    return;
+  }
+  mMayHavePointerRawUpdateEventListener = false;
+  if (BrowserChild* const browserChild = BrowserChild::GetFrom(this)) {
+    browserChild->OnPointerRawUpdateEventListenerRemoved(this);
+  }
+}
+
+nsIURI* nsPIDOMWindowInner::GetDocumentURI() const {
+  return mDoc ? mDoc->GetDocumentURI() : mDocumentURI.get();
+}
+
+nsIURI* nsPIDOMWindowInner::GetDocBaseURI() const {
+  return mDoc ? mDoc->GetDocBaseURI() : mDocBaseURI.get();
+}
+
+mozilla::dom::WindowContext* nsPIDOMWindowInner::GetWindowContext() const {
+  return mWindowGlobalChild ? mWindowGlobalChild->WindowContext() : nullptr;
+}
+
+bool nsPIDOMWindowInner::RemoveFromBFCacheSync() {
+  if (Document* doc = GetExtantDoc()) {
+    return doc->RemoveFromBFCacheSync();
+  }
+  return false;
+}
+
+void nsPIDOMWindowInner::MaybeCreateDoc() {
+  MOZ_ASSERT(!mDoc);
+  if (nsIDocShell* docShell = GetDocShell()) {
+    nsCOMPtr<Document> document = docShell->GetDocument();
+    (void)document;
+  }
+}
+
+mozilla::dom::DocGroup* nsPIDOMWindowInner::GetDocGroup() const {
+  Document* doc = GetExtantDoc();
+  if (doc) {
+    return doc->GetDocGroup();
+  }
+  return nullptr;
+}
+
+mozilla::dom::BrowsingContextGroup*
+nsPIDOMWindowInner::GetBrowsingContextGroup() const {
+  return mBrowsingContext ? mBrowsingContext->Group() : nullptr;
+}
+
+nsIGlobalObject* nsPIDOMWindowInner::AsGlobal() {
+  return nsGlobalWindowInner::Cast(this);
+}
+
+const nsIGlobalObject* nsPIDOMWindowInner::AsGlobal() const {
+  return nsGlobalWindowInner::Cast(this);
+}
+
+RefPtr<GenericPromise>
+nsPIDOMWindowInner::SaveStorageAccessPermissionGranted() {
+  WindowContext* wc = GetWindowContext();
+  if (wc) {
+    (void)wc->SetUsingStorageAccess(true);
+  }
+
+  return nsGlobalWindowInner::Cast(this)->StorageAccessPermissionChanged(true);
+}
+
+RefPtr<GenericPromise>
+nsPIDOMWindowInner::SaveStorageAccessPermissionRevoked() {
+  WindowContext* wc = GetWindowContext();
+  if (wc) {
+    (void)wc->SetUsingStorageAccess(false);
+  }
+
+  return nsGlobalWindowInner::Cast(this)->StorageAccessPermissionChanged(false);
+}
+
+bool nsPIDOMWindowInner::UsingStorageAccess() {
+  WindowContext* wc = GetWindowContext();
+  if (!wc) {
+    return false;
+  }
+
+  return wc->GetUsingStorageAccess();
+}
+
+CloseWatcherManager* nsPIDOMWindowInner::EnsureCloseWatcherManager() {
+  if (!mCloseWatcherManager) {
+    mCloseWatcherManager = MakeRefPtr<CloseWatcherManager>();
+  }
+  return mCloseWatcherManager;
+}
+
+void nsPIDOMWindowInner::NotifyCloseWatcherAdded() {
+  MOZ_ASSERT(mCloseWatcherManager && !mCloseWatcherManager->IsEmpty());
+  if (WindowContext* top = TopWindowContext(*this)) {
+    (void)top->SetHasActiveCloseWatcher(true);
+  }
+}
+
+void nsPIDOMWindowInner::NotifyCloseWatcherRemoved() {
+  MOZ_ASSERT(mCloseWatcherManager);
+  if (WindowContext* top = TopWindowContext(*this)) {
+    (void)top->SetHasActiveCloseWatcher(!mCloseWatcherManager->IsEmpty());
+  }
+}
+
+nsPIDOMWindowInner::nsPIDOMWindowInner(nsPIDOMWindowOuter* aOuterWindow,
+                                       WindowGlobalChild* aActor)
+    : mOuterWindow(aOuterWindow), mWindowGlobalChild(aActor) {
+  MOZ_ASSERT(aOuterWindow);
+  mBrowsingContext = aOuterWindow->GetBrowsingContext();
+
+  if (mWindowGlobalChild) {
+    mWindowID = aActor->InnerWindowId();
+
+    MOZ_ASSERT(mWindowGlobalChild->BrowsingContext() == mBrowsingContext);
+  } else {
+    mWindowID = nsContentUtils::GenerateWindowId();
+  }
+}
+
+nsPIDOMWindowInner::~nsPIDOMWindowInner() = default;
+
+#undef FORWARD_TO_OUTER
+#undef FORWARD_TO_OUTER_OR_THROW
+#undef FORWARD_TO_OUTER_VOID

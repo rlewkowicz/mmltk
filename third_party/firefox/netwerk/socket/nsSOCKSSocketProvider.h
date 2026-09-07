@@ -1,0 +1,26 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsSOCKSSocketProvider_h_
+#define nsSOCKSSocketProvider_h_
+
+#include "nsISocketProvider.h"
+
+enum { NS_SOCKS_VERSION_4 = 4, NS_SOCKS_VERSION_5 = 5 };
+
+class nsSOCKSSocketProvider : public nsISocketProvider {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSISOCKETPROVIDER
+
+  explicit nsSOCKSSocketProvider(uint32_t version) : mVersion(version) {}
+
+ private:
+  virtual ~nsSOCKSSocketProvider() = default;
+
+  uint32_t mVersion;  
+};
+
+#endif /* nsSOCKSSocketProvider_h_ */

@@ -1,0 +1,456 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "nsTransferable.h"
+#include "nsAnonymousTemporaryFile.h"
+#include "nsArray.h"
+#include "nsArrayUtils.h"
+#include "nsString.h"
+#include "nsReadableUtils.h"
+#include "nsTArray.h"
+#include "nsIFormatConverter.h"
+#include "nsIContentPolicy.h"
+#include "nsCOMPtr.h"
+#include "nsXPCOM.h"
+#include "nsISupportsPrimitives.h"
+#include "nsPrimitiveHelpers.h"
+#include "nsDirectoryServiceDefs.h"
+#include "nsDirectoryService.h"
+#include "nsCRT.h"
+#include "nsNetUtil.h"
+#include "nsILoadContext.h"
+#include "nsXULAppAPI.h"
+#include "mozilla/StaticPrefs_browser.h"
+#include "mozilla/UniquePtr.h"
+
+using namespace mozilla;
+
+NS_IMPL_ISUPPORTS(nsTransferable, nsITransferable)
+
+DataStruct::DataStruct(DataStruct&& aRHS)
+    : mData(aRHS.mData.forget()),
+      mCacheFD(aRHS.mCacheFD),
+      mFlavor(aRHS.mFlavor) {
+  aRHS.mCacheFD = nullptr;
+}
+
+DataStruct::~DataStruct() {
+  if (mCacheFD) {
+    PR_Close(mCacheFD);
+  }
+}
+
+
+void DataStruct::SetData(nsISupports* aData, bool aIsPrivateData) {
+  if (!aIsPrivateData && XRE_IsParentProcess()) {
+    void* data = nullptr;
+    uint32_t dataLen = 0;
+    nsPrimitiveHelpers::CreateDataFromPrimitive(mFlavor, aData, &data,
+                                                &dataLen);
+
+    if (dataLen > kLargeDatasetSize) {
+      if (NS_SUCCEEDED(WriteCache(data, dataLen))) {
+        free(data);
+        mData = nullptr;
+        return;
+      }
+
+      NS_WARNING("Oh no, couldn't write data to the cache file");
+    }
+
+    free(data);
+  }
+
+  if (mCacheFD) {
+    PR_Close(mCacheFD);
+    mCacheFD = nullptr;
+  }
+
+  mData = aData;
+}
+
+void DataStruct::GetData(nsISupports** aData) {
+  if (mCacheFD) {
+    if (NS_SUCCEEDED(ReadCache(aData))) {
+      return;
+    }
+
+    NS_WARNING("Oh no, couldn't read data in from the cache file");
+    *aData = nullptr;
+    PR_Close(mCacheFD);
+    mCacheFD = nullptr;
+    return;
+  }
+
+  nsCOMPtr<nsISupports> data = mData;
+  data.forget(aData);
+}
+
+void DataStruct::ClearData() {
+  if (mCacheFD) {
+    PR_Close(mCacheFD);
+    mCacheFD = nullptr;
+  }
+  mData = nullptr;
+}
+
+nsresult DataStruct::WriteCache(void* aData, uint32_t aDataLen) {
+  MOZ_ASSERT(aData && aDataLen);
+  MOZ_ASSERT(aDataLen <= uint32_t(std::numeric_limits<int32_t>::max()),
+             "too large size for PR_Write");
+
+  nsresult rv;
+  if (!mCacheFD) {
+    rv = NS_OpenAnonymousTemporaryFile(&mCacheFD);
+    if (NS_FAILED(rv)) {
+      return NS_ERROR_FAILURE;
+    }
+  } else if (PR_Seek64(mCacheFD, 0, PR_SEEK_SET) == -1) {
+    return NS_ERROR_FAILURE;
+  }
+
+  int32_t written = PR_Write(mCacheFD, aData, aDataLen);
+  if (written == int32_t(aDataLen)) {
+    return NS_OK;
+  }
+
+  PR_Close(mCacheFD);
+  mCacheFD = nullptr;
+  return NS_ERROR_FAILURE;
+}
+
+nsresult DataStruct::ReadCache(nsISupports** aData) {
+  if (!mCacheFD) {
+    return NS_ERROR_FAILURE;
+  }
+
+  PRFileInfo fileInfo;
+  if (PR_GetOpenFileInfo(mCacheFD, &fileInfo) != PR_SUCCESS) {
+    return NS_ERROR_FAILURE;
+  }
+  if (PR_Seek64(mCacheFD, 0, PR_SEEK_SET) == -1) {
+    return NS_ERROR_FAILURE;
+  }
+  uint32_t fileSize = fileInfo.size;
+
+  auto data = MakeUnique<char[]>(fileSize);
+  if (!data) {
+    return NS_ERROR_OUT_OF_MEMORY;
+  }
+
+  uint32_t actual = PR_Read(mCacheFD, data.get(), fileSize);
+  if (actual != fileSize) {
+    return NS_ERROR_FAILURE;
+  }
+
+  nsPrimitiveHelpers::CreatePrimitiveForData(mFlavor, data.get(), fileSize,
+                                             aData);
+  return NS_OK;
+}
+
+nsTransferable::nsTransferable()
+    : mPrivateData(false),
+      mContentPolicyType(nsIContentPolicy::TYPE_OTHER)
+#ifdef DEBUG
+      ,
+      mInitialized(false)
+#endif
+{
+}
+
+nsTransferable::~nsTransferable() = default;
+
+NS_IMETHODIMP
+nsTransferable::Init(nsILoadContext* aContext) {
+  MOZ_ASSERT(!mInitialized);
+
+  if (aContext) {
+    mPrivateData = aContext->UsePrivateBrowsing();
+  } else {
+    mPrivateData = StaticPrefs::browser_privatebrowsing_autostart();
+  }
+#ifdef DEBUG
+  mInitialized = true;
+#endif
+  return NS_OK;
+}
+
+void nsTransferable::GetTransferDataFlavors(nsTArray<nsCString>& aFlavors) {
+  MOZ_ASSERT(mInitialized);
+
+  for (size_t i = 0; i < mDataArray.Length(); ++i) {
+    DataStruct& data = mDataArray.ElementAt(i);
+    aFlavors.AppendElement(data.GetFlavor());
+  }
+}
+
+Maybe<size_t> nsTransferable::FindDataFlavor(const char* aFlavor) {
+  nsDependentCString flavor(aFlavor);
+
+  for (size_t i = 0; i < mDataArray.Length(); ++i) {
+    if (mDataArray[i].GetFlavor().Equals(flavor)) {
+      return Some(i);
+    }
+  }
+
+  return Nothing();
+}
+
+NS_IMETHODIMP
+nsTransferable::GetTransferData(const char* aFlavor, nsISupports** aData) {
+  MOZ_ASSERT(mInitialized);
+
+  *aData = nullptr;
+
+  nsresult rv = NS_OK;
+
+  if (Maybe<size_t> index = FindDataFlavor(aFlavor)) {
+    nsCOMPtr<nsISupports> dataBytes;
+    mDataArray[index.value()].GetData(getter_AddRefs(dataBytes));
+
+    if (nsCOMPtr<nsIFlavorDataProvider> dataProvider =
+            do_QueryInterface(dataBytes)) {
+      rv =
+          dataProvider->GetFlavorData(this, aFlavor, getter_AddRefs(dataBytes));
+      if (NS_FAILED(rv)) {
+        dataBytes = nullptr;
+      }
+    }
+
+    if (dataBytes) {
+      dataBytes.forget(aData);
+      return NS_OK;
+    }
+
+  }
+
+  if (mFormatConv) {
+    for (size_t i = 0; i < mDataArray.Length(); ++i) {
+      DataStruct& data = mDataArray.ElementAt(i);
+      bool canConvert = false;
+      mFormatConv->CanConvert(data.GetFlavor().get(), aFlavor, &canConvert);
+      if (canConvert) {
+        nsCOMPtr<nsISupports> dataBytes;
+        data.GetData(getter_AddRefs(dataBytes));
+
+        if (nsCOMPtr<nsIFlavorDataProvider> dataProvider =
+                do_QueryInterface(dataBytes)) {
+          rv = dataProvider->GetFlavorData(this, aFlavor,
+                                           getter_AddRefs(dataBytes));
+          if (NS_FAILED(rv)) {
+            return rv;
+          }
+        }
+
+        return mFormatConv->Convert(data.GetFlavor().get(), dataBytes, aFlavor,
+                                    aData);
+      }
+    }
+  }
+
+  return NS_ERROR_FAILURE;
+}
+
+NS_IMETHODIMP
+nsTransferable::GetAnyTransferData(nsACString& aFlavor, nsISupports** aData) {
+  MOZ_ASSERT(mInitialized);
+
+  for (size_t i = 0; i < mDataArray.Length(); ++i) {
+    DataStruct& data = mDataArray.ElementAt(i);
+    if (data.IsDataAvailable()) {
+      aFlavor.Assign(data.GetFlavor());
+      data.GetData(aData);
+      return NS_OK;
+    }
+  }
+
+  return NS_ERROR_FAILURE;
+}
+
+NS_IMETHODIMP
+nsTransferable::SetTransferData(const char* aFlavor, nsISupports* aData) {
+  MOZ_ASSERT(mInitialized);
+
+  if (Maybe<size_t> index = FindDataFlavor(aFlavor)) {
+    DataStruct& data = mDataArray.ElementAt(index.value());
+    data.SetData(aData, mPrivateData);
+    return NS_OK;
+  }
+
+  if (mFormatConv) {
+    for (size_t i = 0; i < mDataArray.Length(); ++i) {
+      DataStruct& data = mDataArray.ElementAt(i);
+      bool canConvert = false;
+      mFormatConv->CanConvert(aFlavor, data.GetFlavor().get(), &canConvert);
+
+      if (canConvert) {
+        nsCOMPtr<nsISupports> ConvertedData;
+        mFormatConv->Convert(aFlavor, aData, data.GetFlavor().get(),
+                             getter_AddRefs(ConvertedData));
+        data.SetData(ConvertedData, mPrivateData);
+        return NS_OK;
+      }
+    }
+  }
+
+  if (NS_SUCCEEDED(AddDataFlavor(aFlavor))) {
+    return SetTransferData(aFlavor, aData);
+  }
+
+  return NS_ERROR_FAILURE;
+}
+
+NS_IMETHODIMP
+nsTransferable::ClearAllData() {
+  for (auto& entry : mDataArray) {
+    entry.ClearData();
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsTransferable::AddDataFlavor(const char* aDataFlavor) {
+  MOZ_ASSERT(mInitialized);
+
+  if (FindDataFlavor(aDataFlavor).isSome()) {
+    return NS_ERROR_FAILURE;
+  }
+
+  mDataArray.AppendElement(DataStruct(aDataFlavor));
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsTransferable::RemoveDataFlavor(const char* aDataFlavor) {
+  MOZ_ASSERT(mInitialized);
+
+  if (Maybe<size_t> index = FindDataFlavor(aDataFlavor)) {
+    mDataArray.RemoveElementAt(index.value());
+    return NS_OK;
+  }
+
+  return NS_ERROR_FAILURE;
+}
+
+NS_IMETHODIMP
+nsTransferable::SetConverter(nsIFormatConverter* aConverter) {
+  MOZ_ASSERT(mInitialized);
+
+  mFormatConv = aConverter;
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsTransferable::GetConverter(nsIFormatConverter** aConverter) {
+  MOZ_ASSERT(mInitialized);
+
+  nsCOMPtr<nsIFormatConverter> converter = mFormatConv;
+  converter.forget(aConverter);
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsTransferable::FlavorsTransferableCanImport(nsTArray<nsCString>& aFlavors) {
+  MOZ_ASSERT(mInitialized);
+
+  GetTransferDataFlavors(aFlavors);
+
+  if (mFormatConv) {
+    nsTArray<nsCString> convertedList;
+    mFormatConv->GetInputDataFlavors(convertedList);
+
+    for (uint32_t i = 0; i < convertedList.Length(); ++i) {
+      nsCString& flavorStr = convertedList[i];
+
+      if (!aFlavors.Contains(flavorStr)) {
+        aFlavors.AppendElement(flavorStr);
+      }
+    }
+  }
+
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+nsTransferable::FlavorsTransferableCanExport(nsTArray<nsCString>& aFlavors) {
+  MOZ_ASSERT(mInitialized);
+
+  GetTransferDataFlavors(aFlavors);
+
+  if (mFormatConv) {
+    nsTArray<nsCString> convertedList;
+    mFormatConv->GetOutputDataFlavors(convertedList);
+
+    for (uint32_t i = 0; i < convertedList.Length(); ++i) {
+      nsCString& flavorStr = convertedList[i];
+
+      if (!aFlavors.Contains(flavorStr)) {
+        aFlavors.AppendElement(flavorStr);
+      }
+    }
+  }
+
+  return NS_OK;
+}
+
+bool nsTransferable::GetIsPrivateData() {
+  MOZ_ASSERT(mInitialized);
+
+  return mPrivateData;
+}
+
+void nsTransferable::SetIsPrivateData(bool aIsPrivateData) {
+  MOZ_ASSERT(mInitialized);
+
+  mPrivateData = aIsPrivateData;
+}
+
+nsIPrincipal* nsTransferable::GetDataPrincipal() {
+  MOZ_ASSERT(mInitialized);
+
+  return mDataPrincipal;
+}
+
+void nsTransferable::SetDataPrincipal(nsIPrincipal* aDataPrincipal) {
+  MOZ_ASSERT(mInitialized);
+
+  mDataPrincipal = aDataPrincipal;
+}
+
+nsContentPolicyType nsTransferable::GetContentPolicyType() {
+  MOZ_ASSERT(mInitialized);
+
+  return mContentPolicyType;
+}
+
+void nsTransferable::SetContentPolicyType(
+    nsContentPolicyType aContentPolicyType) {
+  MOZ_ASSERT(mInitialized);
+
+  mContentPolicyType = aContentPolicyType;
+}
+
+nsICookieJarSettings* nsTransferable::GetCookieJarSettings() {
+  MOZ_ASSERT(mInitialized);
+
+  return mCookieJarSettings;
+}
+
+void nsTransferable::SetCookieJarSettings(
+    nsICookieJarSettings* aCookieJarSettings) {
+  MOZ_ASSERT(mInitialized);
+
+  mCookieJarSettings = aCookieJarSettings;
+}
+
+nsIReferrerInfo* nsTransferable::GetReferrerInfo() {
+  MOZ_ASSERT(mInitialized);
+  return mReferrerInfo;
+}
+
+void nsTransferable::SetReferrerInfo(nsIReferrerInfo* aReferrerInfo) {
+  MOZ_ASSERT(mInitialized);
+  mReferrerInfo = aReferrerInfo;
+}

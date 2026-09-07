@@ -1,0 +1,345 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "Hal.h"
+#include "HalLog.h"
+#include <mozilla/Attributes.h>
+#include <mozilla/dom/battery/Constants.h>
+#include "mozilla/GRefPtr.h"
+#include "mozilla/GUniquePtr.h"
+#include <cmath>
+#include <gio/gio.h>
+#include "mozilla/widget/AsyncDBus.h"
+#include "nsAppShell.h"
+
+using namespace mozilla::widget;
+using namespace mozilla::dom::battery;
+
+namespace mozilla::hal_impl {
+
+class UPowerClient {
+ public:
+  static UPowerClient* GetInstance();
+
+  void BeginListening();
+  void StopListening();
+
+  double GetLevel();
+  bool IsCharging();
+  double GetRemainingTime();
+
+  ~UPowerClient();
+
+ private:
+  UPowerClient();
+
+  enum States {
+    eState_Unknown = 0,
+    eState_Charging,
+    eState_Discharging,
+    eState_Empty,
+    eState_FullyCharged,
+    eState_PendingCharge,
+    eState_PendingDischarge
+  };
+
+  void UpdateTrackedDevices();
+
+  bool GetBatteryInfo();
+
+  bool AddTrackedDevice(const char* devicePath);
+
+  static void DeviceChanged(GDBusProxy* aProxy, gchar* aSenderName,
+                            gchar* aSignalName, GVariant* aParameters,
+                            UPowerClient* aListener);
+
+  static void DevicePropertiesChanged(GDBusProxy* aProxy, gchar* aSenderName,
+                                      gchar* aSignalName, GVariant* aParameters,
+                                      UPowerClient* aListener);
+
+  RefPtr<GCancellable> mCancellable;
+
+  RefPtr<GDBusProxy> mUPowerProxy;
+
+  GUniquePtr<gchar> mTrackedDevice;
+
+  RefPtr<GDBusProxy> mTrackedDeviceProxy;
+
+  double mLevel;
+  bool mCharging;
+  double mRemainingTime;
+
+  static UPowerClient* sInstance;
+
+  static const guint sDeviceTypeBattery = 2;
+  static const guint64 kUPowerUnknownRemainingTime = 0;
+};
+
+
+void EnableBatteryNotifications() {
+  UPowerClient::GetInstance()->BeginListening();
+}
+
+void DisableBatteryNotifications() {
+  UPowerClient::GetInstance()->StopListening();
+}
+
+void GetCurrentBatteryInformation(hal::BatteryInformation* aBatteryInfo) {
+  UPowerClient* upowerClient = UPowerClient::GetInstance();
+
+  aBatteryInfo->level() = upowerClient->GetLevel();
+  aBatteryInfo->charging() = upowerClient->IsCharging();
+  aBatteryInfo->remainingTime() = upowerClient->GetRemainingTime();
+}
+
+
+UPowerClient* UPowerClient::sInstance = nullptr;
+
+UPowerClient* UPowerClient::GetInstance() {
+  if (!sInstance) {
+    sInstance = new UPowerClient();
+  }
+
+  return sInstance;
+}
+
+UPowerClient::UPowerClient()
+    : mLevel(kDefaultLevel),
+      mCharging(kDefaultCharging),
+      mRemainingTime(kDefaultRemainingTime) {}
+
+UPowerClient::~UPowerClient() {
+  NS_ASSERTION(
+      !mUPowerProxy && !mTrackedDevice && !mTrackedDeviceProxy && !mCancellable,
+      "The observers have not been correctly removed! "
+      "(StopListening should have been called)");
+}
+
+void UPowerClient::BeginListening() {
+  GUniquePtr<GError> error;
+
+  mCancellable = dont_AddRef(g_cancellable_new());
+  CreateDBusProxyForBus(G_BUS_TYPE_SYSTEM, G_DBUS_PROXY_FLAGS_NONE,
+                         nullptr,
+                        "org.freedesktop.UPower", "/org/freedesktop/UPower",
+                        "org.freedesktop.UPower", mCancellable)
+      ->Then(
+          GetCurrentSerialEventTarget(), __func__,
+          [this](RefPtr<GDBusProxy>&& aProxy) {
+            mUPowerProxy = std::move(aProxy);
+            UpdateTrackedDevices();
+          },
+          [](GUniquePtr<GError>&& aError) {
+            if (!g_error_matches(aError.get(), G_IO_ERROR,
+                                 G_IO_ERROR_CANCELLED)) {
+              g_warning(
+                  "Failed to create DBus proxy for org.freedesktop.UPower: "
+                  "%s\n",
+                  aError->message);
+            }
+          });
+}
+
+void UPowerClient::StopListening() {
+  if (mUPowerProxy) {
+    g_signal_handlers_disconnect_by_func(mUPowerProxy, (void*)DeviceChanged,
+                                         this);
+  }
+  if (mCancellable) {
+    g_cancellable_cancel(mCancellable);
+    mCancellable = nullptr;
+  }
+
+  mTrackedDeviceProxy = nullptr;
+  mTrackedDevice = nullptr;
+  mUPowerProxy = nullptr;
+
+  mLevel = kDefaultLevel;
+  mCharging = kDefaultCharging;
+  mRemainingTime = kDefaultRemainingTime;
+}
+
+bool UPowerClient::AddTrackedDevice(const char* aDevicePath) {
+  nsAppShell::DBusConnectionCheck();
+  RefPtr<GDBusProxy> proxy = dont_AddRef(g_dbus_proxy_new_for_bus_sync(
+      G_BUS_TYPE_SYSTEM, G_DBUS_PROXY_FLAGS_NONE, nullptr,
+      "org.freedesktop.UPower", aDevicePath, "org.freedesktop.UPower.Device",
+      mCancellable, nullptr));
+  if (!proxy) {
+    return false;
+  }
+
+  RefPtr<GVariant> deviceType =
+      dont_AddRef(g_dbus_proxy_get_cached_property(proxy, "Type"));
+  if (NS_WARN_IF(!deviceType ||
+                 !g_variant_is_of_type(deviceType, G_VARIANT_TYPE_UINT32))) {
+    return false;
+  }
+
+  if (g_variant_get_uint32(deviceType) != sDeviceTypeBattery) {
+    return false;
+  }
+
+  GUniquePtr<gchar> device(g_strdup(aDevicePath));
+  mTrackedDevice = std::move(device);
+  mTrackedDeviceProxy = std::move(proxy);
+
+  if (!GetBatteryInfo()) {
+    return false;
+  }
+  hal::NotifyBatteryChange(
+      hal::BatteryInformation(mLevel, mCharging, mRemainingTime));
+
+  g_signal_connect(mTrackedDeviceProxy, "g-signal",
+                   G_CALLBACK(DevicePropertiesChanged), this);
+  return true;
+}
+
+void UPowerClient::UpdateTrackedDevices() {
+  g_signal_handlers_disconnect_by_func(mUPowerProxy, (void*)DeviceChanged,
+                                       this);
+
+  mTrackedDevice = nullptr;
+  mTrackedDeviceProxy = nullptr;
+
+  nsAppShell::DBusConnectionCheck();
+  DBusProxyCall(mUPowerProxy, "EnumerateDevices", nullptr,
+                G_DBUS_CALL_FLAGS_NONE, -1, mCancellable)
+      ->Then(
+          GetCurrentSerialEventTarget(), __func__,
+          [this](RefPtr<GVariant>&& aResult) {
+            RefPtr<GVariant> variant =
+                dont_AddRef(g_variant_get_child_value(aResult.get(), 0));
+            if (!variant || !g_variant_is_of_type(
+                                variant, G_VARIANT_TYPE_OBJECT_PATH_ARRAY)) {
+              g_warning(
+                  "Failed to enumerate devices of org.freedesktop.UPower: "
+                  "wrong param %s\n",
+                  g_variant_get_type_string(aResult.get()));
+              return;
+            }
+            gsize num = g_variant_n_children(variant);
+            for (gsize i = 0; i < num; i++) {
+              const char* devicePath = g_variant_get_string(
+                  g_variant_get_child_value(variant, i), nullptr);
+              if (!devicePath) {
+                g_warning(
+                    "Failed to enumerate devices of org.freedesktop.UPower: "
+                    "missing device?\n");
+                return;
+              }
+              if (AddTrackedDevice(devicePath)) {
+                break;
+              }
+            }
+            g_signal_connect(mUPowerProxy, "g-signal",
+                             G_CALLBACK(DeviceChanged), this);
+          },
+          [this](GUniquePtr<GError>&& aError) {
+            if (!g_error_matches(aError.get(), G_IO_ERROR,
+                                 G_IO_ERROR_CANCELLED)) {
+              g_warning(
+                  "Failed to enumerate devices of org.freedesktop.UPower: %s\n",
+                  aError->message);
+            }
+            g_signal_connect(mUPowerProxy, "g-signal",
+                             G_CALLBACK(DeviceChanged), this);
+          });
+}
+
+void UPowerClient::DeviceChanged(GDBusProxy* aProxy, gchar* aSenderName,
+                                 gchar* aSignalName, GVariant* aParameters,
+                                 UPowerClient* aListener) {
+  if (!g_strcmp0(aSignalName, "DeviceAdded")) {
+    if (aListener->mTrackedDevice) {
+      return;
+    }
+  } else if (!g_strcmp0(aSignalName, "DeviceRemoved")) {
+    if (g_strcmp0(aSenderName, aListener->mTrackedDevice.get())) {
+      return;
+    }
+  }
+  aListener->UpdateTrackedDevices();
+}
+
+void UPowerClient::DevicePropertiesChanged(GDBusProxy* aProxy,
+                                           gchar* aSenderName,
+                                           gchar* aSignalName,
+                                           GVariant* aParameters,
+                                           UPowerClient* aListener) {
+  if (aListener->GetBatteryInfo()) {
+    hal::NotifyBatteryChange(hal::BatteryInformation(
+        sInstance->mLevel, sInstance->mCharging, sInstance->mRemainingTime));
+  }
+}
+
+bool UPowerClient::GetBatteryInfo() {
+  bool isFull = false;
+
+
+  if (!mTrackedDeviceProxy) {
+    return false;
+  }
+
+  RefPtr<GVariant> value = dont_AddRef(
+      g_dbus_proxy_get_cached_property(mTrackedDeviceProxy, "State"));
+  if (NS_WARN_IF(!value ||
+                 !g_variant_is_of_type(value, G_VARIANT_TYPE_UINT32))) {
+    return false;
+  }
+
+  switch (g_variant_get_uint32(value)) {
+    case eState_Unknown:
+      mCharging = kDefaultCharging;
+      break;
+    case eState_FullyCharged:
+      isFull = true;
+      [[fallthrough]];
+    case eState_Charging:
+    case eState_PendingCharge:
+      mCharging = true;
+      break;
+    case eState_Discharging:
+    case eState_Empty:
+    case eState_PendingDischarge:
+      mCharging = false;
+      break;
+  }
+
+  if (isFull) {
+    mLevel = 1.0;
+  } else {
+    value = dont_AddRef(
+        g_dbus_proxy_get_cached_property(mTrackedDeviceProxy, "Percentage"));
+    if (NS_WARN_IF(!value ||
+                   !g_variant_is_of_type(value, G_VARIANT_TYPE_DOUBLE))) {
+      return false;
+    }
+    mLevel = round(g_variant_get_double(value)) * 0.01;
+  }
+
+  if (isFull) {
+    mRemainingTime = 0;
+  } else {
+    value = dont_AddRef(g_dbus_proxy_get_cached_property(
+        mTrackedDeviceProxy, mCharging ? "TimeToFull" : "TimeToEmpty"));
+    if (NS_WARN_IF(!value ||
+                   !g_variant_is_of_type(value, G_VARIANT_TYPE_INT64))) {
+      return false;
+    }
+    mRemainingTime = g_variant_get_int64(value);
+    if (mRemainingTime == kUPowerUnknownRemainingTime) {
+      mRemainingTime = kUnknownRemainingTime;
+    }
+  }
+  return true;
+}
+
+double UPowerClient::GetLevel() { return mLevel; }
+
+bool UPowerClient::IsCharging() { return mCharging; }
+
+double UPowerClient::GetRemainingTime() { return mRemainingTime; }
+
+}  

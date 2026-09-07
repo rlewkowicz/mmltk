@@ -1,0 +1,66 @@
+/*
+ * Copyright 2016 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkAutoPixmapStorage_DEFINED)
+#define SkAutoPixmapStorage_DEFINED
+
+#include "include/core/SkPixmap.h"
+#include "include/core/SkRefCnt.h"
+#include "include/private/base/SkMalloc.h"
+
+#include <cstddef>
+
+class SkData;
+struct SkImageInfo;
+struct SkMask;
+
+class [[nodiscard]] SkAutoPixmapStorage : public SkPixmap {
+public:
+    SkAutoPixmapStorage();
+    ~SkAutoPixmapStorage();
+
+    SkAutoPixmapStorage(SkAutoPixmapStorage&& other);
+
+    SkAutoPixmapStorage& operator=(SkAutoPixmapStorage&& other);
+
+    bool tryAlloc(const SkImageInfo&);
+
+    void alloc(const SkImageInfo&);
+
+    static size_t AllocSize(const SkImageInfo& info, size_t* rowBytes);
+
+    [[nodiscard]] void* detachPixels();
+
+    [[nodiscard]] sk_sp<SkData> detachPixelsAsData();
+
+
+    void reset() {
+        this->freeStorage();
+        this->INHERITED::reset();
+    }
+    void reset(const SkImageInfo& info, const void* addr, size_t rb) {
+        this->freeStorage();
+        this->INHERITED::reset(info, addr, rb);
+    }
+
+    [[nodiscard]] bool reset(const SkMask& mask) {
+        this->freeStorage();
+        return this->INHERITED::reset(mask);
+    }
+
+private:
+    void*   fStorage;
+
+    void freeStorage() {
+        sk_free(fStorage);
+        fStorage = nullptr;
+    }
+
+    using INHERITED = SkPixmap;
+};
+
+#endif

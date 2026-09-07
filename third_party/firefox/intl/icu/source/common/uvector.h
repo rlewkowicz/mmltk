@@ -1,0 +1,201 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+**********************************************************************
+*   Copyright (C) 1999-2016, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+**********************************************************************
+*   Date        Name        Description
+*   10/22/99    alan        Creation.  This is an internal header.
+*                           It should not be exported.
+**********************************************************************
+*/
+
+#ifndef UVECTOR_H
+#define UVECTOR_H
+
+#include "unicode/utypes.h"
+#include "unicode/uobject.h"
+#include "cmemory.h"
+#include "uarrsort.h"
+#include "uelement.h"
+
+U_NAMESPACE_BEGIN
+
+class U_COMMON_API UVector : public UObject {
+
+private:
+    int32_t count = 0;
+
+    int32_t capacity = 0;
+
+    UElement* elements = nullptr;
+
+    UObjectDeleter *deleter = nullptr;
+
+    UElementsAreEqual *comparer = nullptr;
+
+public:
+    UVector(UErrorCode &status);
+
+    UVector(int32_t initialCapacity, UErrorCode &status);
+
+    UVector(UObjectDeleter *d, UElementsAreEqual *c, UErrorCode &status);
+
+    UVector(UObjectDeleter *d, UElementsAreEqual *c, int32_t initialCapacity, UErrorCode &status);
+
+    virtual ~UVector();
+
+    void assign(const UVector& other, UElementAssigner *assign, UErrorCode &ec);
+
+    bool operator==(const UVector& other) const;
+
+    inline bool operator!=(const UVector& other) const {return !operator==(other);}
+
+
+    void addElement(void *obj, UErrorCode &status);
+
+    void adoptElement(void *obj, UErrorCode &status);
+
+    void addElement(int32_t elem, UErrorCode &status);
+
+    void setElementAt(void* obj, int32_t index);
+
+    void setElementAt(int32_t elem, int32_t index);
+
+    void insertElementAt(void* obj, int32_t index, UErrorCode &status);
+
+    void insertElementAt(int32_t elem, int32_t index, UErrorCode &status);
+    
+    void* elementAt(int32_t index) const;
+
+    int32_t elementAti(int32_t index) const;
+
+    UBool equals(const UVector &other) const;
+
+    inline void* firstElement() const {return elementAt(0);}
+
+    inline void* lastElement() const {return elementAt(count-1);}
+
+    inline int32_t lastElementi() const {return elementAti(count-1);}
+
+    int32_t indexOf(void* obj, int32_t startIndex = 0) const;
+
+    int32_t indexOf(int32_t obj, int32_t startIndex = 0) const;
+
+    inline UBool contains(void* obj) const {return indexOf(obj) >= 0;}
+
+    inline UBool contains(int32_t obj) const {return indexOf(obj) >= 0;}
+
+    UBool containsAll(const UVector& other) const;
+
+    UBool removeAll(const UVector& other);
+
+    UBool retainAll(const UVector& other);
+
+    void removeElementAt(int32_t index);
+
+    UBool removeElement(void* obj);
+
+    void removeAllElements();
+
+    inline int32_t size() const {return count;}
+
+    inline UBool isEmpty() const {return count == 0;}
+
+    UBool ensureCapacity(int32_t minimumCapacity, UErrorCode &status);
+
+    void setSize(int32_t newSize, UErrorCode &status);
+
+    void** toArray(void** result) const;
+
+
+    UObjectDeleter *setDeleter(UObjectDeleter *d);
+    bool hasDeleter() {return deleter != nullptr;}
+
+    UElementsAreEqual *setComparer(UElementsAreEqual *c);
+
+    inline void* operator[](int32_t index) const {return elementAt(index);}
+
+    void* orphanElementAt(int32_t index);
+
+    UBool containsNone(const UVector& other) const;
+
+    void sortedInsert(void* obj, UElementComparator *compare, UErrorCode& ec);
+
+    void sortedInsert(int32_t obj, UElementComparator *compare, UErrorCode& ec);
+
+    void sorti(UErrorCode &ec);
+
+    void sort(UElementComparator *compare, UErrorCode &ec);
+
+    void sortWithUComparator(UComparator *compare, const void *context, UErrorCode &ec);
+
+    static UClassID U_EXPORT2 getStaticClassID();
+
+    virtual UClassID getDynamicClassID() const override;
+
+private:
+    int32_t indexOf(UElement key, int32_t startIndex = 0, int8_t hint = 0) const;
+
+    void sortedInsert(UElement e, UElementComparator *compare, UErrorCode& ec);
+
+public:
+    UVector(const UVector&) = delete;
+
+    UVector& operator=(const UVector&) = delete;
+
+};
+
+
+class U_COMMON_API UStack : public UVector {
+public:
+    UStack(UErrorCode &status);
+
+    UStack(int32_t initialCapacity, UErrorCode &status);
+
+    UStack(UObjectDeleter *d, UElementsAreEqual *c, UErrorCode &status);
+
+    UStack(UObjectDeleter *d, UElementsAreEqual *c, int32_t initialCapacity, UErrorCode &status);
+
+    virtual ~UStack();
+
+
+    inline UBool empty() const {return isEmpty();}
+
+    inline void* peek() const {return lastElement();}
+
+    inline int32_t peeki() const {return lastElementi();}
+    
+    void* pop();
+    
+    int32_t popi();
+    
+    inline void* push(void* obj, UErrorCode &status) {
+        if (hasDeleter()) {
+            adoptElement(obj, status);
+            return (U_SUCCESS(status)) ? obj : nullptr;
+        } else {
+            addElement(obj, status);
+            return obj;
+        }
+    }
+
+    inline int32_t push(int32_t i, UErrorCode &status) {
+        addElement(i, status);
+        return i;
+    }
+
+    int32_t search(void* obj) const;
+
+    static UClassID U_EXPORT2 getStaticClassID();
+
+    virtual UClassID getDynamicClassID() const override;
+
+    UStack(const UStack&) = delete;
+
+    UStack& operator=(const UStack&) = delete;
+};
+
+U_NAMESPACE_END
+
+#endif

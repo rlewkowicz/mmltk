@@ -1,0 +1,115 @@
+use crate::{
+    engine::{general_purpose::INVALID_VALUE, DecodeMetadata, DecodePaddingMode},
+    DecodeError, DecodeSliceError, PAD_BYTE,
+};
+
+/// Decode the last 0-4 bytes, checking for trailing set bits and padding per the provided
+/// parameters.
+///
+/// Returns the decode metadata representing the total number of bytes decoded, including the ones
+/// indicated as already written by `output_index`.
+pub(crate) fn decode_suffix(
+    input: &[u8],
+    input_index: usize,
+    output: &mut [u8],
+    mut output_index: usize,
+    decode_table: &[u8; 256],
+    decode_allow_trailing_bits: bool,
+    padding_mode: DecodePaddingMode,
+) -> Result<DecodeMetadata, DecodeSliceError> {
+    debug_assert!((input.len() - input_index) <= 4);
+
+    let mut morsels_in_leftover = 0;
+    let mut padding_bytes_count = 0;
+    let mut first_padding_offset: usize = 0;
+    let mut last_symbol = 0_u8;
+    let mut morsels = [0_u8; 4];
+
+    for (leftover_index, &b) in input[input_index..].iter().enumerate() {
+        if b == PAD_BYTE {
+
+            if leftover_index < 2 {
+                debug_assert!(
+                    leftover_index == 0 || (leftover_index == 1 && padding_bytes_count == 0)
+                );
+                let bad_padding_index = input_index + leftover_index;
+                return Err(DecodeError::InvalidByte(bad_padding_index, b).into());
+            }
+
+            if padding_bytes_count == 0 {
+                first_padding_offset = leftover_index;
+            }
+
+            padding_bytes_count += 1;
+            continue;
+        }
+
+        if padding_bytes_count > 0 {
+            return Err(
+                DecodeError::InvalidByte(input_index + first_padding_offset, PAD_BYTE).into(),
+            );
+        }
+
+        last_symbol = b;
+
+        let morsel = decode_table[b as usize];
+        if morsel == INVALID_VALUE {
+            return Err(DecodeError::InvalidByte(input_index + leftover_index, b).into());
+        }
+
+        morsels[morsels_in_leftover] = morsel;
+        morsels_in_leftover += 1;
+    }
+
+    if !input.is_empty() && morsels_in_leftover < 2 {
+        return Err(DecodeError::InvalidLength(input_index + morsels_in_leftover).into());
+    }
+
+    match padding_mode {
+        DecodePaddingMode::Indifferent => {  }
+        DecodePaddingMode::RequireCanonical => {
+            if (padding_bytes_count + morsels_in_leftover) % 4 != 0 {
+                return Err(DecodeError::InvalidPadding.into());
+            }
+        }
+        DecodePaddingMode::RequireNone => {
+            if padding_bytes_count > 0 {
+                return Err(DecodeError::InvalidPadding.into());
+            }
+        }
+    }
+
+
+    let leftover_bytes_to_append = morsels_in_leftover * 6 / 8;
+    let mut leftover_num = (u32::from(morsels[0]) << 26)
+        | (u32::from(morsels[1]) << 20)
+        | (u32::from(morsels[2]) << 14)
+        | (u32::from(morsels[3]) << 8);
+
+    let mask = !0_u32 >> (leftover_bytes_to_append * 8);
+    if !decode_allow_trailing_bits && (leftover_num & mask) != 0 {
+        return Err(DecodeError::InvalidLastSymbol(
+            input_index + morsels_in_leftover - 1,
+            last_symbol,
+        )
+        .into());
+    }
+
+    for _ in 0..leftover_bytes_to_append {
+        let hi_byte = (leftover_num >> 24) as u8;
+        leftover_num <<= 8;
+        *output
+            .get_mut(output_index)
+            .ok_or(DecodeSliceError::OutputSliceTooSmall)? = hi_byte;
+        output_index += 1;
+    }
+
+    Ok(DecodeMetadata::new(
+        output_index,
+        if padding_bytes_count > 0 {
+            Some(input_index + first_padding_offset)
+        } else {
+            None
+        },
+    ))
+}

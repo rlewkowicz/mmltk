@@ -1,0 +1,36 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/ProcessMessageManager.h"
+
+#include "mozilla/dom/MessageManagerBinding.h"
+#include "mozilla/dom/ParentProcessMessageManager.h"
+#include "nsContentUtils.h"
+
+namespace mozilla::dom {
+
+ProcessMessageManager::ProcessMessageManager(
+    ipc::MessageManagerCallback* aCallback,
+    ParentProcessMessageManager* aParentManager, MessageManagerFlags aFlags)
+    : MessageSender(aCallback, aParentManager,
+                    aFlags | MessageManagerFlags::MM_CHROME |
+                        MessageManagerFlags::MM_PROCESSMANAGER),
+      mPid(-1),
+      mInProcess(!!aCallback) {
+  MOZ_ASSERT(!(aFlags & ~(MessageManagerFlags::MM_GLOBAL |
+                          MessageManagerFlags::MM_OWNSCALLBACK)));
+
+  if (aParentManager && mCallback) {
+    aParentManager->AddChildManager(this);
+  }
+}
+
+JSObject* ProcessMessageManager::WrapObject(JSContext* aCx,
+                                            JS::Handle<JSObject*> aGivenProto) {
+  MOZ_ASSERT(nsContentUtils::IsSystemCaller(aCx));
+
+  return ProcessMessageManager_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+}  

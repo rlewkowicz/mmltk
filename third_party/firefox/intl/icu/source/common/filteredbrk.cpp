@@ -1,0 +1,608 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+*******************************************************************************
+* Copyright (C) 2014-2015, International Business Machines Corporation and
+* others. All Rights Reserved.
+*******************************************************************************
+*/
+
+#include "unicode/utypes.h"
+#if !UCONFIG_NO_BREAK_ITERATION && !UCONFIG_NO_FILTERED_BREAK_ITERATION
+
+#include "cmemory.h"
+
+#include "unicode/filteredbrk.h"
+#include "unicode/ucharstriebuilder.h"
+#include "unicode/ures.h"
+
+#include "uresimp.h" // ures_getByKeyWithFallback
+#include "ubrkimpl.h" // U_ICUDATA_BRKITR
+#include "uvector.h"
+#include "cmemory.h"
+#include "umutex.h"
+
+U_NAMESPACE_BEGIN
+
+#ifndef FB_DEBUG
+#define FB_DEBUG 0
+#endif
+
+#if FB_DEBUG
+#include <stdio.h>
+static void _fb_trace(const char *m, const UnicodeString *s, UBool b, int32_t d, const char *f, int l) {
+  char buf[2048];
+  if(s) {
+    s->extract(0,s->length(),buf,2048);
+  } else {
+    strcpy(buf,"nullptr");
+  }
+  fprintf(stderr,"%s:%d: %s. s='%s'(%p), b=%c, d=%d\n",
+          f, l, m, buf, (const void*)s, b?'T':'F',(int)d);
+}
+
+#define FB_TRACE(m,s,b,d) _fb_trace(m,s,b,d,__FILE__,__LINE__)
+#else
+#define FB_TRACE(m,s,b,d)
+#endif
+
+static int32_t U_CALLCONV compareUnicodeString(UElement t1, UElement t2) {
+    const UnicodeString& a = *static_cast<const UnicodeString*>(t1.pointer);
+    const UnicodeString& b = *static_cast<const UnicodeString*>(t2.pointer);
+    return a.compare(b);
+}
+
+class UStringSet : public UVector {
+ public:
+  UStringSet(UErrorCode &status) : UVector(uprv_deleteUObject,
+                                           uhash_compareUnicodeString,
+                                           1,
+                                           status) {}
+  virtual ~UStringSet();
+  inline UBool contains(const UnicodeString& s) {
+    return contains((void*) &s);
+  }
+  using UVector::contains;
+  inline const UnicodeString* getStringAt(int32_t i) const {
+    return static_cast<const UnicodeString*>(elementAt(i));
+  }
+  inline UBool adopt(UnicodeString *str, UErrorCode &status) {
+    if(U_FAILURE(status) || contains(*str)) {
+      delete str;
+      return false;
+    } else {
+      sortedInsert(str, compareUnicodeString, status);
+      if(U_FAILURE(status)) {
+        return false;
+      }
+      return true;
+    }
+  }
+  inline UBool add(const UnicodeString& str, UErrorCode &status) {
+    if(U_FAILURE(status)) return false;
+    UnicodeString *t = new UnicodeString(str);
+    if(t==nullptr) {
+      status = U_MEMORY_ALLOCATION_ERROR; return false;
+    }
+    return adopt(t, status);
+  }
+  inline UBool remove(const UnicodeString &s, UErrorCode &status) {
+    if(U_FAILURE(status)) return false;
+    return removeElement((void*) &s);
+  }
+};
+
+UStringSet::~UStringSet() {}
+
+
+
+static const int32_t kPARTIAL = (1<<0); 
+static const int32_t kMATCH   = (1<<1); 
+static const int32_t kSuppressInReverse = (1<<0);
+static const int32_t kAddToForward = (1<<1);
+static const char16_t kFULLSTOP = 0x002E; 
+
+class SimpleFilteredSentenceBreakData : public UMemory {
+public:
+  SimpleFilteredSentenceBreakData(UCharsTrie *forwards, UCharsTrie *backwards ) 
+      : fForwardsPartialTrie(forwards), fBackwardsTrie(backwards), refcount(1) { }
+    SimpleFilteredSentenceBreakData *incr() {
+        umtx_atomic_inc(&refcount);
+        return this;
+    }
+    SimpleFilteredSentenceBreakData *decr() {
+        if(umtx_atomic_dec(&refcount) <= 0) {
+            delete this;
+        }
+        return nullptr;
+    }
+    virtual ~SimpleFilteredSentenceBreakData();
+
+    bool hasForwardsPartialTrie() const { return fForwardsPartialTrie.isValid(); }
+    bool hasBackwardsTrie() const { return fBackwardsTrie.isValid(); }
+
+    const UCharsTrie &getForwardsPartialTrie() const { return *fForwardsPartialTrie; }
+    const UCharsTrie &getBackwardsTrie() const { return *fBackwardsTrie; }
+
+private:
+    LocalPointer<UCharsTrie>    fForwardsPartialTrie; 
+    LocalPointer<UCharsTrie>    fBackwardsTrie; 
+    u_atomic_int32_t            refcount;
+};
+
+SimpleFilteredSentenceBreakData::~SimpleFilteredSentenceBreakData() {}
+
+class SimpleFilteredSentenceBreakIterator : public BreakIterator {
+public:
+  SimpleFilteredSentenceBreakIterator(BreakIterator *adopt, UCharsTrie *forwards, UCharsTrie *backwards, UErrorCode &status);
+  SimpleFilteredSentenceBreakIterator(const SimpleFilteredSentenceBreakIterator& other);
+  virtual ~SimpleFilteredSentenceBreakIterator();
+private:
+  SimpleFilteredSentenceBreakData *fData;
+  LocalPointer<BreakIterator> fDelegate;
+  LocalUTextPointer           fText;
+
+public:
+  virtual BreakIterator *  createBufferClone(void * ,
+                                             int32_t &,
+                                             UErrorCode &status) override {
+    status = U_SAFECLONE_ALLOCATED_WARNING;
+    return clone();
+  }
+  virtual SimpleFilteredSentenceBreakIterator* clone() const override { return new SimpleFilteredSentenceBreakIterator(*this); }
+  virtual UClassID getDynamicClassID() const override { return nullptr; }
+  virtual bool operator==(const BreakIterator& o) const override { if(this==&o) return true; return false; }
+
+  virtual void setText(UText *text, UErrorCode &status) override { fDelegate->setText(text,status); }
+  virtual BreakIterator &refreshInputText(UText *input, UErrorCode &status) override { fDelegate->refreshInputText(input,status); return *this; }
+  virtual void adoptText(CharacterIterator* it) override { fDelegate->adoptText(it); }
+  virtual void setText(const UnicodeString &text) override { fDelegate->setText(text); }
+
+  virtual UText *getUText(UText *fillIn, UErrorCode &status) const override { return fDelegate->getUText(fillIn,status); }
+  virtual CharacterIterator& getText() const override { return fDelegate->getText(); }
+
+  virtual int32_t first() override;
+  virtual int32_t preceding(int32_t offset) override;
+  virtual int32_t previous() override;
+  virtual UBool isBoundary(int32_t offset) override;
+  virtual int32_t current() const override { return fDelegate->current(); } 
+
+  virtual int32_t next() override;
+
+  virtual int32_t next(int32_t n) override;
+  virtual int32_t following(int32_t offset) override;
+  virtual int32_t last() override;
+
+private:
+    int32_t internalNext(int32_t n);
+    int32_t internalPrev(int32_t n);
+    void resetState(UErrorCode &status);
+    enum EFBMatchResult { kNoExceptionHere, kExceptionHere };
+    enum EFBMatchResult breakExceptionAt(int32_t n);
+};
+
+SimpleFilteredSentenceBreakIterator::SimpleFilteredSentenceBreakIterator(const SimpleFilteredSentenceBreakIterator& other)
+  : BreakIterator(other), fData(other.fData->incr()), fDelegate(other.fDelegate->clone())
+{
+}
+
+
+SimpleFilteredSentenceBreakIterator::SimpleFilteredSentenceBreakIterator(BreakIterator *adopt, UCharsTrie *forwards, UCharsTrie *backwards, UErrorCode &status) :
+  BreakIterator(adopt->getLocale(ULOC_VALID_LOCALE,status),adopt->getLocale(ULOC_ACTUAL_LOCALE,status)),
+  fData(new SimpleFilteredSentenceBreakData(forwards, backwards)),
+  fDelegate(adopt)
+{
+    if (fData == nullptr) {
+        delete forwards;
+        delete backwards;
+        if (U_SUCCESS(status)) {
+            status = U_MEMORY_ALLOCATION_ERROR;
+        }
+    }
+}
+
+SimpleFilteredSentenceBreakIterator::~SimpleFilteredSentenceBreakIterator() {
+    fData = fData->decr();
+}
+
+void SimpleFilteredSentenceBreakIterator::resetState(UErrorCode &status) {
+  fText.adoptInstead(fDelegate->getUText(fText.orphan(), status));
+}
+
+SimpleFilteredSentenceBreakIterator::EFBMatchResult
+SimpleFilteredSentenceBreakIterator::breakExceptionAt(int32_t n) {
+    int64_t bestPosn = -1;
+    int32_t bestValue = -1;
+    utext_setNativeIndex(fText.getAlias(), n); 
+
+    if(utext_previous32(fText.getAlias())==u' ') {  
+    } else {
+      utext_next32(fText.getAlias());
+    }
+
+    {
+        // Do not modify the shared trie!
+        UCharsTrie iter(fData->getBackwardsTrie());
+        UChar32 uch;
+        while((uch=utext_previous32(fText.getAlias()))!=U_SENTINEL) {  
+            UStringTrieResult r = iter.nextForCodePoint(uch);
+            if(USTRINGTRIE_HAS_VALUE(r)) { 
+                bestPosn = utext_getNativeIndex(fText.getAlias());
+                bestValue = iter.getValue();
+            }
+            if(!USTRINGTRIE_HAS_NEXT(r)) {
+                break;
+            }
+        }
+    }
+
+
+    if(bestPosn>=0) {
+
+
+      if(bestValue == kMATCH) { 
+        return kExceptionHere; 
+      } else if(bestValue == kPARTIAL
+                && fData->hasForwardsPartialTrie()) { 
+        UStringTrieResult rfwd = USTRINGTRIE_INTERMEDIATE_VALUE;
+        utext_setNativeIndex(fText.getAlias(), bestPosn); 
+        // Do not modify the shared trie!
+        UCharsTrie iter(fData->getForwardsPartialTrie());
+        UChar32 uch;
+        while((uch=utext_next32(fText.getAlias()))!=U_SENTINEL &&
+              USTRINGTRIE_HAS_NEXT(rfwd=iter.nextForCodePoint(uch))) {
+        }
+        if(USTRINGTRIE_MATCHES(rfwd)) {
+            return kExceptionHere;
+        } else {
+          return kNoExceptionHere;
+        }
+      } else {
+        return kNoExceptionHere; 
+      }
+    } else {
+      return kNoExceptionHere; 
+    }
+}
+
+int32_t
+SimpleFilteredSentenceBreakIterator::internalNext(int32_t n) {
+  if(n == UBRK_DONE || 
+    !fData->hasBackwardsTrie()) { 
+      return n;
+  }
+  UErrorCode status = U_ZERO_ERROR;
+  resetState(status);
+  if(U_FAILURE(status)) return UBRK_DONE; 
+  int64_t utextLen = utext_nativeLength(fText.getAlias());
+
+  while (n != UBRK_DONE && n != utextLen) { 
+    SimpleFilteredSentenceBreakIterator::EFBMatchResult m = breakExceptionAt(n);
+
+    switch(m) {
+    case kExceptionHere:
+      n = fDelegate->next(); 
+      continue;
+
+    default:
+    case kNoExceptionHere:
+      return n;
+    }    
+  }
+  return n;
+}
+
+int32_t
+SimpleFilteredSentenceBreakIterator::internalPrev(int32_t n) {
+  if(n == 0 || n == UBRK_DONE || 
+    !fData->hasBackwardsTrie()) { 
+      return n;
+  }
+  UErrorCode status = U_ZERO_ERROR;
+  resetState(status);
+  if(U_FAILURE(status)) return UBRK_DONE; 
+
+  while (n != UBRK_DONE && n != 0) { 
+    SimpleFilteredSentenceBreakIterator::EFBMatchResult m = breakExceptionAt(n);
+
+    switch(m) {
+    case kExceptionHere:
+      n = fDelegate->previous(); 
+      continue;
+
+    default:
+    case kNoExceptionHere:
+      return n;
+    }    
+  }
+  return n;
+}
+
+
+int32_t
+SimpleFilteredSentenceBreakIterator::next() {
+  return internalNext(fDelegate->next());
+}
+
+int32_t
+SimpleFilteredSentenceBreakIterator::first() {
+  return fDelegate->first();
+}
+
+int32_t
+SimpleFilteredSentenceBreakIterator::preceding(int32_t offset) {
+  return internalPrev(fDelegate->preceding(offset));
+}
+
+int32_t
+SimpleFilteredSentenceBreakIterator::previous() {
+  return internalPrev(fDelegate->previous());
+}
+
+UBool SimpleFilteredSentenceBreakIterator::isBoundary(int32_t offset) {
+  if (!fDelegate->isBoundary(offset)) return false; 
+
+  if (!fData->hasBackwardsTrie()) return true; 
+
+  UErrorCode status = U_ZERO_ERROR;
+  resetState(status);
+
+  SimpleFilteredSentenceBreakIterator::EFBMatchResult m = breakExceptionAt(offset);
+
+  switch(m) {
+  case kExceptionHere:
+    return false;
+  default:
+  case kNoExceptionHere:
+    return true;
+  }    
+}
+ 
+int32_t
+SimpleFilteredSentenceBreakIterator::next(int32_t offset) {
+  return internalNext(fDelegate->next(offset));
+}
+
+int32_t
+SimpleFilteredSentenceBreakIterator::following(int32_t offset) {
+  return internalNext(fDelegate->following(offset));
+}
+
+int32_t
+SimpleFilteredSentenceBreakIterator::last() {
+  return fDelegate->last();
+}
+
+
+class SimpleFilteredBreakIteratorBuilder : public FilteredBreakIteratorBuilder {
+public:
+  virtual ~SimpleFilteredBreakIteratorBuilder();
+  SimpleFilteredBreakIteratorBuilder(const Locale &fromLocale, UErrorCode &status);
+  SimpleFilteredBreakIteratorBuilder(UErrorCode &status);
+  virtual UBool suppressBreakAfter(const UnicodeString& exception, UErrorCode& status) override;
+  virtual UBool unsuppressBreakAfter(const UnicodeString& exception, UErrorCode& status) override;
+  virtual BreakIterator *build(BreakIterator* adoptBreakIterator, UErrorCode& status) override;
+private:
+  UStringSet fSet;
+};
+
+SimpleFilteredBreakIteratorBuilder::~SimpleFilteredBreakIteratorBuilder()
+{
+}
+
+SimpleFilteredBreakIteratorBuilder::SimpleFilteredBreakIteratorBuilder(UErrorCode &status) 
+  : fSet(status)
+{
+}
+
+SimpleFilteredBreakIteratorBuilder::SimpleFilteredBreakIteratorBuilder(const Locale &fromLocale, UErrorCode &status)
+  : fSet(status)
+{
+  if(U_SUCCESS(status)) {
+    UErrorCode subStatus = U_ZERO_ERROR;
+    LocalUResourceBundlePointer b(ures_open(U_ICUDATA_BRKITR, fromLocale.getBaseName(), &subStatus));
+    if (U_FAILURE(subStatus) || (subStatus == U_USING_DEFAULT_WARNING) ) {    
+      status = subStatus; 
+#if FB_DEBUG
+      fprintf(stderr, "open BUNDLE %s : %s, %s\n", fromLocale.getBaseName(), "[exit]", u_errorName(status));
+#endif
+      return;  
+    }
+    LocalUResourceBundlePointer exceptions(ures_getByKeyWithFallback(b.getAlias(), "exceptions", nullptr, &subStatus));
+    if (U_FAILURE(subStatus) || (subStatus == U_USING_DEFAULT_WARNING) ) {    
+      status = subStatus; 
+#if FB_DEBUG
+      fprintf(stderr, "open EXCEPTIONS %s : %s, %s\n", fromLocale.getBaseName(), "[exit]", u_errorName(status));
+#endif
+      return;  
+    }
+    LocalUResourceBundlePointer breaks(ures_getByKeyWithFallback(exceptions.getAlias(), "SentenceBreak", nullptr, &subStatus));
+
+#if FB_DEBUG
+    {
+      UErrorCode subsub = subStatus;
+      fprintf(stderr, "open SentenceBreak %s => %s, %s\n", fromLocale.getBaseName(), ures_getLocale(breaks.getAlias(), &subsub), u_errorName(subStatus));
+    }
+#endif
+    
+    if (U_FAILURE(subStatus) || (subStatus == U_USING_DEFAULT_WARNING) ) {    
+      status = subStatus; 
+#if FB_DEBUG
+      fprintf(stderr, "open %s : %s, %s\n", fromLocale.getBaseName(), "[exit]", u_errorName(status));
+#endif
+      return;  
+    }
+
+    LocalUResourceBundlePointer strs;
+    subStatus = status; 
+    do {
+      strs.adoptInstead(ures_getNextResource(breaks.getAlias(), strs.orphan(), &subStatus));
+      if(strs.isValid() && U_SUCCESS(subStatus)) {
+        UnicodeString str(ures_getUnicodeString(strs.getAlias(), &status));
+        suppressBreakAfter(str, status); 
+      }
+    } while (strs.isValid() && U_SUCCESS(subStatus));
+    if(U_FAILURE(subStatus)&&subStatus!=U_INDEX_OUTOFBOUNDS_ERROR&&U_SUCCESS(status)) {
+      status = subStatus;
+    }
+  }
+}
+
+UBool
+SimpleFilteredBreakIteratorBuilder::suppressBreakAfter(const UnicodeString& exception, UErrorCode& status)
+{
+  UBool r = fSet.add(exception, status);
+  FB_TRACE("suppressBreakAfter",&exception,r,0);
+  return r;
+}
+
+UBool
+SimpleFilteredBreakIteratorBuilder::unsuppressBreakAfter(const UnicodeString& exception, UErrorCode& status)
+{
+  UBool r = fSet.remove(exception, status);
+  FB_TRACE("unsuppressBreakAfter",&exception,r,0);
+  return r;
+}
+
+static inline UnicodeString* newUnicodeStringArray(size_t count) {
+    return new UnicodeString[count ? count : 1];
+}
+
+BreakIterator *
+SimpleFilteredBreakIteratorBuilder::build(BreakIterator* adoptBreakIterator, UErrorCode& status) {
+  LocalPointer<BreakIterator> adopt(adoptBreakIterator);
+
+  LocalPointer<UCharsTrieBuilder> builder(new UCharsTrieBuilder(status), status);
+  LocalPointer<UCharsTrieBuilder> builder2(new UCharsTrieBuilder(status), status);
+  if(U_FAILURE(status)) {
+    return nullptr;
+  }
+
+  int32_t revCount = 0;
+  int32_t fwdCount = 0;
+
+  int32_t subCount = fSet.size();
+
+  UnicodeString *ustrs_ptr = newUnicodeStringArray(subCount);
+  
+  LocalArray<UnicodeString> ustrs(ustrs_ptr);
+
+  LocalMemory<int> partials;
+  partials.allocateInsteadAndReset(subCount);
+
+  LocalPointer<UCharsTrie>    backwardsTrie; 
+  LocalPointer<UCharsTrie>    forwardsPartialTrie; 
+
+  int n=0;
+  for ( int32_t i = 0;
+        i<fSet.size();
+        i++) {
+    const UnicodeString *abbr = fSet.getStringAt(i);
+    if(abbr) {
+      FB_TRACE("build",abbr,true,i);
+      ustrs[n] = *abbr; 
+      FB_TRACE("ustrs[n]",&ustrs[n],true,i);
+    } else {
+      FB_TRACE("build",abbr,false,i);
+      status = U_MEMORY_ALLOCATION_ERROR;
+      return nullptr;
+    }
+    partials[n] = 0; 
+    n++;
+  }
+  for(int i=0;i<subCount;i++) {
+    int nn = ustrs[i].indexOf(kFULLSTOP); 
+    if(nn>-1 && (nn+1)!=ustrs[i].length()) {
+      FB_TRACE("partial",&ustrs[i],false,i);
+      int sameAs = -1;
+      for(int j=0;j<subCount;j++) {
+        if(j==i) continue;
+        if(ustrs[i].compare(0,nn+1,ustrs[j],0,nn+1)==0) {
+          FB_TRACE("prefix",&ustrs[j],false,nn+1);
+          if(partials[j]==0) { 
+            partials[j] = kSuppressInReverse | kAddToForward;
+            FB_TRACE("suppressing",&ustrs[j],false,j);
+          } else if(partials[j] & kSuppressInReverse) {
+            sameAs = j; 
+          }
+        }
+      }
+      FB_TRACE("for partial same-",&ustrs[i],false,sameAs);
+      FB_TRACE(" == partial #",&ustrs[i],false,partials[i]);
+      UnicodeString prefix(ustrs[i], 0, nn+1);
+      if(sameAs == -1 && partials[i] == 0) {
+        prefix.reverse();
+        builder->add(prefix, kPARTIAL, status);
+        revCount++;
+        FB_TRACE("Added partial",&prefix,false, i);
+        FB_TRACE(u_errorName(status),&ustrs[i],false,i);
+        partials[i] = kSuppressInReverse | kAddToForward;
+      } else {
+        FB_TRACE("NOT adding partial",&prefix,false, i);
+        FB_TRACE(u_errorName(status),&ustrs[i],false,i);
+      }
+    }
+  }
+  for(int i=0;i<subCount;i++) {
+    if(partials[i]==0) {
+      ustrs[i].reverse();
+      builder->add(ustrs[i], kMATCH, status);
+      revCount++;
+      FB_TRACE(u_errorName(status), &ustrs[i], false, i);
+    } else {
+      FB_TRACE("Adding fwd",&ustrs[i], false, i);
+
+      builder2->add(ustrs[i], kMATCH, status); 
+      fwdCount++;
+    }
+  }
+  FB_TRACE("AbbrCount",nullptr,false, subCount);
+
+  if(revCount>0) {
+    backwardsTrie.adoptInstead(builder->build(USTRINGTRIE_BUILD_FAST, status));
+    if(U_FAILURE(status)) {
+      FB_TRACE(u_errorName(status),nullptr,false, -1);
+      return nullptr;
+    }
+  }
+
+  if(fwdCount>0) {
+    forwardsPartialTrie.adoptInstead(builder2->build(USTRINGTRIE_BUILD_FAST, status));
+    if(U_FAILURE(status)) {
+      FB_TRACE(u_errorName(status),nullptr,false, -1);
+      return nullptr;
+    }
+  }
+
+  return new SimpleFilteredSentenceBreakIterator(adopt.orphan(), forwardsPartialTrie.orphan(), backwardsTrie.orphan(), status);
+}
+
+
+
+FilteredBreakIteratorBuilder::FilteredBreakIteratorBuilder() {
+}
+
+FilteredBreakIteratorBuilder::~FilteredBreakIteratorBuilder() {
+}
+
+FilteredBreakIteratorBuilder *
+FilteredBreakIteratorBuilder::createInstance(const Locale& where, UErrorCode& status) {
+  if(U_FAILURE(status)) return nullptr;
+  LocalPointer<FilteredBreakIteratorBuilder> ret(new SimpleFilteredBreakIteratorBuilder(where, status), status);
+  return (U_SUCCESS(status))? ret.orphan(): nullptr;
+}
+
+FilteredBreakIteratorBuilder *
+FilteredBreakIteratorBuilder::createInstance(UErrorCode &status) {
+  return createEmptyInstance(status);
+}
+
+FilteredBreakIteratorBuilder *
+FilteredBreakIteratorBuilder::createEmptyInstance(UErrorCode& status) {
+  if(U_FAILURE(status)) return nullptr;
+  LocalPointer<FilteredBreakIteratorBuilder> ret(new SimpleFilteredBreakIteratorBuilder(status), status);
+  return (U_SUCCESS(status))? ret.orphan(): nullptr;
+}
+
+U_NAMESPACE_END
+
+#endif //#if !UCONFIG_NO_BREAK_ITERATION && !UCONFIG_NO_FILTERED_BREAK_ITERATION

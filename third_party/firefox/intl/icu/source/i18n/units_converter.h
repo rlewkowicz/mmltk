@@ -1,0 +1,156 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+#ifndef __UNITS_CONVERTER_H__
+#define __UNITS_CONVERTER_H__
+
+#include "cmemory.h"
+#include "fixedstring.h"
+#include "measunit_impl.h"
+#include "unicode/errorcode.h"
+#include "unicode/stringpiece.h"
+#include "unicode/uobject.h"
+#include "units_converter.h"
+#include "units_data.h"
+
+U_NAMESPACE_BEGIN
+namespace units {
+
+
+enum Constants {
+    CONSTANT_FT2M,       
+    CONSTANT_PI,         
+    CONSTANT_GRAVITY,    
+    CONSTANT_G,          
+    CONSTANT_GAL_IMP2M3, 
+    CONSTANT_LB2KG,      
+    CONSTANT_GLUCOSE_MOLAR_MASS,
+    CONSTANT_ITEM_PER_MOLE,
+    CONSTANT_METERS_PER_AU,
+    CONSTANT_SEC_PER_JULIAN_YEAR,
+    CONSTANT_SPEED_OF_LIGHT_METERS_PER_SECOND,
+    CONSTANT_SHO_TO_M3,   
+    CONSTANT_TSUBO_TO_M2, 
+    CONSTANT_SHAKU_TO_M,  
+    CONSTANT_AMU,         
+
+    CONSTANTS_COUNT
+};
+
+static const double constantsValues[CONSTANTS_COUNT] = {
+    0.3048,                    
+    411557987.0 / 131002976.0, 
+    9.80665,                   
+    6.67408E-11,               
+    0.00454609,                
+    0.45359237,                
+    180.1557,                  
+    6.02214076E+23,            
+    149597870700,              
+    31557600,                  
+    299792458,                 
+    2401.0 / (1331.0 * 1000.0),
+    400.0 / 121.0,
+    4.0 / 121.0,
+    1.66053878283E-27,         
+};
+
+typedef enum Signum {
+    NEGATIVE = -1,
+    POSITIVE = 1,
+} Signum;
+
+struct U_I18N_API_CLASS Factor {
+    double factorNum = 1;
+    double factorDen = 1;
+    double offset = 0;
+    bool reciprocal = false;
+
+    int32_t constantExponents[CONSTANTS_COUNT] = {};
+
+    void multiplyBy(const Factor &rhs);
+    void divideBy(const Factor &rhs);
+    void divideBy(const uint64_t constant);
+
+    void power(int32_t power);
+
+    void applyPrefix(UMeasurePrefix unitPrefix);
+
+    U_I18N_API void substituteConstants();
+};
+
+struct ConversionInfo {
+    double conversionRate;
+    double offset;
+    bool reciprocal;
+};
+
+void U_I18N_API addSingleFactorConstant(StringPiece baseStr, int32_t power, Signum sigNum,
+                                        Factor &factor, UErrorCode &status);
+
+struct ConversionRate : public UMemory {
+    const MeasureUnitImpl source;
+    const MeasureUnitImpl target;
+    FixedString specialSource;
+    FixedString specialTarget;
+    double factorNum = 1;
+    double factorDen = 1;
+    double sourceOffset = 0;
+    double targetOffset = 0;
+    bool reciprocal = false;
+
+    ConversionRate(MeasureUnitImpl &&source, MeasureUnitImpl &&target)
+        : source(std::move(source)), target(std::move(target)), specialSource(), specialTarget() {}
+};
+
+enum Convertibility {
+    RECIPROCAL,
+    CONVERTIBLE,
+    UNCONVERTIBLE,
+};
+
+MeasureUnitImpl extractCompoundBaseUnit(const MeasureUnitImpl& source,
+                                        const ConversionRates& conversionRates,
+                                        UErrorCode& status);
+
+Convertibility U_I18N_API extractConvertibility(const MeasureUnitImpl &source,
+                                                const MeasureUnitImpl &target,
+                                                const ConversionRates &conversionRates,
+                                                UErrorCode &status);
+
+class U_I18N_API_CLASS UnitsConverter : public UMemory {
+  public:
+    U_I18N_API UnitsConverter(StringPiece sourceIdentifier, StringPiece targetIdentifier,
+                              UErrorCode &status);
+
+    U_I18N_API UnitsConverter(const MeasureUnitImpl &source, const MeasureUnitImpl &target,
+                              const ConversionRates &ratesInfo, UErrorCode &status);
+
+    static int32_t compareTwoUnits(const MeasureUnitImpl &firstUnit, const MeasureUnitImpl &SecondUnit,
+                                   const ConversionRates &ratesInfo, UErrorCode &status);
+
+    U_I18N_API double convert(double inputValue) const;
+
+    U_I18N_API double convertInverse(double inputValue) const;
+
+    U_I18N_API ConversionInfo getConversionInfo() const;
+
+  private:
+    ConversionRate conversionRate_;
+
+    void init(const ConversionRates &ratesInfo, UErrorCode &status);
+
+    double scaleToBase(double scaleValue, double minBaseForScaleValues[], int scaleMax) const;
+
+    double baseToScale(double baseValue, double minBaseForScaleValues[], int scaleMax) const;
+
+};
+
+} 
+U_NAMESPACE_END
+
+#endif //__UNITS_CONVERTER_H__
+
+#endif /* #if !UCONFIG_NO_FORMATTING */

@@ -1,0 +1,948 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "TLSClientAuthCertSelection.h"
+#include "cert_storage/src/cert_storage.h"
+#include "mozilla/Logging.h"
+#include "mozilla/dom/BrowsingContext.h"
+#include "mozilla/dom/CanonicalBrowsingContext.h"
+#include "mozilla/ipc/Endpoint.h"
+#include "mozilla/net/DocumentLoadListener.h"
+#include "mozilla/net/SocketProcessBackgroundChild.h"
+#include "mozilla/psm/SelectTLSClientAuthCertChild.h"
+#include "mozilla/psm/SelectTLSClientAuthCertParent.h"
+#include "nsArray.h"
+#include "nsArrayUtils.h"
+#include "nsNSSComponent.h"
+#include "nsIClientAuthDialogService.h"
+#include "nsIMutableArray.h"
+#include "nsINSSComponent.h"
+#include "NSSCertDBTrustDomain.h"
+#include "nsIClientAuthRememberService.h"
+#include "nsIX509CertDB.h"
+#include "mozpkix/pkixnss.h"
+#include "mozpkix/pkixutil.h"
+#include "mozpkix/pkix.h"
+#include "secerr.h"
+#include "sslerr.h"
+
+
+using namespace mozilla;
+using namespace mozilla::pkix;
+using namespace mozilla::psm;
+
+extern LazyLogModule gPIPNSSLog;
+
+mozilla::pkix::Result BuildChainForCertificate(
+    nsTArray<uint8_t>& certBytes, nsTArray<nsTArray<uint8_t>>& certChainBytes,
+    const nsTArray<nsTArray<uint8_t>>& caNames,
+    const nsTArray<nsTArray<uint8_t>>& enterpriseCertificates);
+
+enum class UserCertChoice {
+  Ask = 0,
+  Auto = 1,
+};
+
+UserCertChoice nsGetUserCertChoice() {
+  nsAutoCString value;
+  nsresult rv =
+      Preferences::GetCString("security.default_personal_cert", value);
+  if (NS_FAILED(rv)) {
+    return UserCertChoice::Ask;
+  }
+
+  return value.EqualsLiteral("Select Automatically") ? UserCertChoice::Auto
+                                                     : UserCertChoice::Ask;
+}
+
+static bool hasExplicitKeyUsageNonRepudiation(CERTCertificate* cert) {
+  if (!cert->extensions) return false;
+
+  SECStatus srv;
+  SECItem keyUsageItem;
+  keyUsageItem.data = nullptr;
+
+  srv = CERT_FindKeyUsageExtension(cert, &keyUsageItem);
+  if (srv == SECFailure) return false;
+
+  unsigned char keyUsage = keyUsageItem.data[0];
+  PORT_Free(keyUsageItem.data);
+
+  return !!(keyUsage & KU_NON_REPUDIATION);
+}
+
+ClientAuthInfo::ClientAuthInfo(const nsACString& hostName,
+                               const OriginAttributes& originAttributes,
+                               int32_t port, uint32_t providerFlags,
+                               uint32_t providerTlsFlags)
+    : mHostName(hostName),
+      mOriginAttributes(originAttributes),
+      mPort(port),
+      mProviderFlags(providerFlags),
+      mProviderTlsFlags(providerTlsFlags) {}
+
+ClientAuthInfo::ClientAuthInfo(ClientAuthInfo&& aOther) noexcept
+    : mHostName(std::move(aOther.mHostName)),
+      mOriginAttributes(std::move(aOther.mOriginAttributes)),
+      mPort(aOther.mPort),
+      mProviderFlags(aOther.mProviderFlags),
+      mProviderTlsFlags(aOther.mProviderTlsFlags) {}
+
+const nsACString& ClientAuthInfo::HostName() const { return mHostName; }
+
+const OriginAttributes& ClientAuthInfo::OriginAttributesRef() const {
+  return mOriginAttributes;
+}
+
+int32_t ClientAuthInfo::Port() const { return mPort; }
+
+uint32_t ClientAuthInfo::ProviderFlags() const { return mProviderFlags; }
+
+uint32_t ClientAuthInfo::ProviderTlsFlags() const { return mProviderTlsFlags; }
+
+nsTArray<nsTArray<uint8_t>> CollectCANames(CERTDistNames* caNames) {
+  MOZ_ASSERT(caNames);
+
+  nsTArray<nsTArray<uint8_t>> collectedCANames;
+  if (!caNames) {
+    return collectedCANames;
+  }
+
+  for (int i = 0; i < caNames->nnames; i++) {
+    nsTArray<uint8_t> caName;
+    caName.AppendElements(caNames->names[i].data, caNames->names[i].len);
+    collectedCANames.AppendElement(std::move(caName));
+  }
+  return collectedCANames;
+}
+
+class ClientAuthCertNonverifyingTrustDomain final : public TrustDomain {
+ public:
+  ClientAuthCertNonverifyingTrustDomain(
+      const nsTArray<nsTArray<uint8_t>>& caNames,
+      const nsTArray<nsTArray<uint8_t>>& thirdPartyCertificates)
+      : mCANames(caNames),
+        mCertStorage(do_GetService(NS_CERT_STORAGE_CID)),
+        mThirdPartyCertificates(thirdPartyCertificates) {}
+
+  virtual mozilla::pkix::Result GetCertTrust(
+      pkix::EndEntityOrCA endEntityOrCA, const pkix::CertPolicyId& policy,
+      pkix::Input candidateCertDER,
+       pkix::TrustLevel& trustLevel) override;
+  virtual mozilla::pkix::Result FindIssuer(pkix::Input encodedIssuerName,
+                                           IssuerChecker& checker,
+                                           pkix::Time time) override;
+
+  virtual mozilla::pkix::Result CheckRevocation(
+      EndEntityOrCA endEntityOrCA, const pkix::CertID& certID, Time time,
+      mozilla::pkix::Duration validityDuration,
+       const Input* stapledOCSPresponse,
+       const Input* aiaExtension) override {
+    return pkix::Success;
+  }
+
+  virtual mozilla::pkix::Result IsChainValid(
+      const pkix::DERArray& certChain, pkix::Time time,
+      const pkix::CertPolicyId& requiredPolicy) override;
+
+  virtual mozilla::pkix::Result CheckSignatureDigestAlgorithm(
+      pkix::DigestAlgorithm digestAlg, pkix::EndEntityOrCA endEntityOrCA,
+      pkix::Time notBefore) override {
+    return pkix::Success;
+  }
+  virtual mozilla::pkix::Result CheckRSAPublicKeyModulusSizeInBits(
+      pkix::EndEntityOrCA endEntityOrCA,
+      unsigned int modulusSizeInBits) override {
+    return pkix::Success;
+  }
+  virtual mozilla::pkix::Result VerifyRSAPKCS1SignedData(
+      pkix::Input data, pkix::DigestAlgorithm, pkix::Input signature,
+      pkix::Input subjectPublicKeyInfo) override {
+    return pkix::Success;
+  }
+  virtual mozilla::pkix::Result VerifyRSAPSSSignedData(
+      pkix::Input data, pkix::DigestAlgorithm, pkix::Input signature,
+      pkix::Input subjectPublicKeyInfo) override {
+    return pkix::Success;
+  }
+  virtual mozilla::pkix::Result CheckECDSACurveIsAcceptable(
+      pkix::EndEntityOrCA endEntityOrCA, pkix::NamedCurve curve) override {
+    return pkix::Success;
+  }
+  virtual mozilla::pkix::Result VerifyECDSASignedData(
+      pkix::Input data, pkix::DigestAlgorithm, pkix::Input signature,
+      pkix::Input subjectPublicKeyInfo) override {
+    return pkix::Success;
+  }
+  virtual mozilla::pkix::Result CheckValidityIsAcceptable(
+      pkix::Time notBefore, pkix::Time notAfter,
+      pkix::EndEntityOrCA endEntityOrCA,
+      pkix::KeyPurposeId keyPurpose) override {
+    return pkix::Success;
+  }
+  virtual void NoteAuxiliaryExtension(pkix::AuxiliaryExtension extension,
+                                      pkix::Input extensionData) override {}
+  virtual mozilla::pkix::Result DigestBuf(pkix::Input item,
+                                          pkix::DigestAlgorithm digestAlg,
+                                           uint8_t* digestBuf,
+                                          size_t digestBufLen) override {
+    return pkix::DigestBufNSS(item, digestAlg, digestBuf, digestBufLen);
+  }
+
+  nsTArray<nsTArray<uint8_t>> TakeBuiltChain() {
+    return std::move(mBuiltChain);
+  }
+
+ private:
+  const nsTArray<nsTArray<uint8_t>>& mCANames;  
+  nsCOMPtr<nsICertStorage> mCertStorage;
+  const nsTArray<nsTArray<uint8_t>>& mThirdPartyCertificates;  
+  nsTArray<nsTArray<uint8_t>> mBuiltChain;
+};
+
+mozilla::pkix::Result ClientAuthCertNonverifyingTrustDomain::GetCertTrust(
+    pkix::EndEntityOrCA endEntityOrCA, const pkix::CertPolicyId& policy,
+    pkix::Input candidateCertDER,
+     pkix::TrustLevel& trustLevel) {
+  if (mCANames.Length() == 0) {
+    trustLevel = pkix::TrustLevel::TrustAnchor;
+    return pkix::Success;
+  }
+  BackCert cert(candidateCertDER, endEntityOrCA, nullptr);
+  mozilla::pkix::Result rv = cert.Init();
+  if (rv != pkix::Success) {
+    return rv;
+  }
+  pkix::Input issuer(cert.GetIssuer());
+  pkix::Input subject(cert.GetSubject());
+  for (const auto& caName : mCANames) {
+    pkix::Input caNameInput;
+    rv = caNameInput.Init(caName.Elements(), caName.Length());
+    if (rv != pkix::Success) {
+      continue;  
+    }
+    if (InputsAreEqual(issuer, caNameInput) ||
+        InputsAreEqual(subject, caNameInput)) {
+      trustLevel = pkix::TrustLevel::TrustAnchor;
+      return pkix::Success;
+    }
+  }
+  trustLevel = pkix::TrustLevel::InheritsTrust;
+  return pkix::Success;
+}
+
+mozilla::pkix::Result ClientAuthCertNonverifyingTrustDomain::FindIssuer(
+    pkix::Input encodedIssuerName, IssuerChecker& checker, pkix::Time time) {
+  Vector<pkix::Input> geckoCandidates;
+  if (!mCertStorage) {
+    return mozilla::pkix::Result::FATAL_ERROR_LIBRARY_FAILURE;
+  }
+  nsTArray<uint8_t> subject;
+  subject.AppendElements(encodedIssuerName.UnsafeGetData(),
+                         encodedIssuerName.GetLength());
+  nsTArray<nsTArray<uint8_t>> certs;
+  nsresult rv = mCertStorage->FindCertsBySubject(subject, certs);
+  if (NS_FAILED(rv)) {
+    return mozilla::pkix::Result::FATAL_ERROR_LIBRARY_FAILURE;
+  }
+  for (auto& cert : certs) {
+    pkix::Input certDER;
+    mozilla::pkix::Result rv = certDER.Init(cert.Elements(), cert.Length());
+    if (rv != pkix::Success) {
+      continue;  
+    }
+    if (!geckoCandidates.append(certDER)) {
+      return mozilla::pkix::Result::FATAL_ERROR_NO_MEMORY;
+    }
+  }
+
+  for (const auto& thirdPartyCertificate : mThirdPartyCertificates) {
+    pkix::Input thirdPartyCertificateInput;
+    mozilla::pkix::Result rv = thirdPartyCertificateInput.Init(
+        thirdPartyCertificate.Elements(), thirdPartyCertificate.Length());
+    if (rv != pkix::Success) {
+      continue;  
+    }
+    if (!geckoCandidates.append(thirdPartyCertificateInput)) {
+      return mozilla::pkix::Result::FATAL_ERROR_NO_MEMORY;
+    }
+  }
+
+  bool keepGoing = true;
+  for (pkix::Input candidate : geckoCandidates) {
+    mozilla::pkix::Result rv = checker.Check(candidate, nullptr, keepGoing);
+    if (rv != pkix::Success) {
+      return rv;
+    }
+    if (!keepGoing) {
+      return pkix::Success;
+    }
+  }
+
+  SECItem encodedIssuerNameItem =
+      pkix::UnsafeMapInputToSECItem(encodedIssuerName);
+  UniqueCERTCertList candidates(CERT_CreateSubjectCertList(
+      nullptr, CERT_GetDefaultCertDB(), &encodedIssuerNameItem, 0, false));
+  Vector<pkix::Input> nssCandidates;
+  if (candidates) {
+    for (CERTCertListNode* n = CERT_LIST_HEAD(candidates);
+         !CERT_LIST_END(n, candidates); n = CERT_LIST_NEXT(n)) {
+      pkix::Input certDER;
+      mozilla::pkix::Result rv =
+          certDER.Init(n->cert->derCert.data, n->cert->derCert.len);
+      if (rv != pkix::Success) {
+        continue;  
+      }
+      if (!nssCandidates.append(certDER)) {
+        return mozilla::pkix::Result::FATAL_ERROR_NO_MEMORY;
+      }
+    }
+  }
+
+  for (pkix::Input candidate : nssCandidates) {
+    mozilla::pkix::Result rv = checker.Check(candidate, nullptr, keepGoing);
+    if (rv != pkix::Success) {
+      return rv;
+    }
+    if (!keepGoing) {
+      return pkix::Success;
+    }
+  }
+  return pkix::Success;
+}
+
+mozilla::pkix::Result ClientAuthCertNonverifyingTrustDomain::IsChainValid(
+    const pkix::DERArray& certArray, pkix::Time, const pkix::CertPolicyId&) {
+  mBuiltChain.Clear();
+
+  size_t numCerts = certArray.GetLength();
+  for (size_t i = 0; i < numCerts; ++i) {
+    nsTArray<uint8_t> certBytes;
+    const pkix::Input* certInput = certArray.GetDER(i);
+    MOZ_ASSERT(certInput != nullptr);
+    if (!certInput) {
+      return mozilla::pkix::Result::FATAL_ERROR_LIBRARY_FAILURE;
+    }
+    certBytes.AppendElements(certInput->UnsafeGetData(),
+                             certInput->GetLength());
+    mBuiltChain.AppendElement(std::move(certBytes));
+  }
+
+  return pkix::Success;
+}
+
+nsTArray<nsTArray<uint8_t>> GetEnterpriseCertificates() {
+  nsTArray<nsTArray<uint8_t>> enterpriseCertificates;
+  nsCOMPtr<nsINSSComponent> component(do_GetService(PSM_COMPONENT_CONTRACTID));
+  if (!component) {
+    return nsTArray<nsTArray<uint8_t>>{};
+  }
+  nsresult rv = component->GetEnterpriseIntermediates(enterpriseCertificates);
+  if (NS_FAILED(rv)) {
+    return nsTArray<nsTArray<uint8_t>>{};
+  }
+  nsTArray<nsTArray<uint8_t>> enterpriseRoots;
+  rv = component->GetEnterpriseRoots(enterpriseRoots);
+  if (NS_FAILED(rv)) {
+    return nsTArray<nsTArray<uint8_t>>{};
+  }
+  enterpriseCertificates.AppendElements(std::move(enterpriseRoots));
+  return enterpriseCertificates;
+}
+
+bool FindRememberedDecision(
+    const ClientAuthInfo& clientAuthInfo,
+    const nsTArray<nsTArray<uint8_t>>& caNames,
+    const nsTArray<nsTArray<uint8_t>>& enterpriseCertificates,
+    nsTArray<uint8_t>& rememberedCertBytes,
+    nsTArray<nsTArray<uint8_t>>& rememberedCertChainBytes) {
+  rememberedCertBytes.Clear();
+  rememberedCertChainBytes.Clear();
+
+  if (clientAuthInfo.ProviderTlsFlags() != 0) {
+    return false;
+  }
+
+  nsCOMPtr<nsIClientAuthRememberService> clientAuthRememberService(
+      do_GetService(NS_CLIENTAUTHREMEMBERSERVICE_CONTRACTID));
+  if (!clientAuthRememberService) {
+    return false;
+  }
+
+  nsCString rememberedDBKey;
+  bool found;
+  nsresult rv = clientAuthRememberService->HasRememberedDecision(
+      clientAuthInfo.HostName(), clientAuthInfo.OriginAttributesRef(),
+      rememberedDBKey, &found);
+  if (NS_FAILED(rv)) {
+    return false;
+  }
+  if (!found) {
+    return false;
+  }
+  if (rememberedDBKey.IsEmpty()) {
+    return true;
+  }
+  nsCOMPtr<nsIX509CertDB> certdb(do_GetService(NS_X509CERTDB_CONTRACTID));
+  if (!certdb) {
+    return false;
+  }
+  nsCOMPtr<nsIX509Cert> foundCert;
+  rv = certdb->FindCertByDBKey(rememberedDBKey, getter_AddRefs(foundCert));
+  if (NS_FAILED(rv)) {
+    return false;
+  }
+  if (!foundCert) {
+    return false;
+  }
+  rv = foundCert->GetRawDER(rememberedCertBytes);
+  if (NS_FAILED(rv)) {
+    return false;
+  }
+  if (BuildChainForCertificate(rememberedCertBytes, rememberedCertChainBytes,
+                               caNames, enterpriseCertificates) != Success) {
+    return false;
+  }
+  return true;
+}
+
+void FilterPotentialClientCertificatesByCANames(
+    UniqueCERTCertList& potentialClientCertificates,
+    const nsTArray<nsTArray<uint8_t>>& caNames,
+    const nsTArray<nsTArray<uint8_t>>& enterpriseCertificates,
+    nsTArray<nsTArray<nsTArray<uint8_t>>>& potentialClientCertificateChains) {
+  if (!potentialClientCertificates) {
+    return;
+  }
+
+  CERTCertListNode* n = CERT_LIST_HEAD(potentialClientCertificates);
+  while (!CERT_LIST_END(n, potentialClientCertificates)) {
+    nsTArray<nsTArray<uint8_t>> builtChain;
+    nsTArray<uint8_t> certBytes;
+    certBytes.AppendElements(n->cert->derCert.data, n->cert->derCert.len);
+    mozilla::pkix::Result result = BuildChainForCertificate(
+        certBytes, builtChain, caNames, enterpriseCertificates);
+    if (result != pkix::Success) {
+      MOZ_LOG(gPIPNSSLog, LogLevel::Debug,
+              ("removing cert '%s'", n->cert->subjectName));
+      CERTCertListNode* toRemove = n;
+      n = CERT_LIST_NEXT(n);
+      CERT_RemoveCertListNode(toRemove);
+      continue;
+    }
+    potentialClientCertificateChains.AppendElement(std::move(builtChain));
+    MOZ_LOG(gPIPNSSLog, LogLevel::Debug,
+            ("keeping cert '%s'\n", n->cert->subjectName));
+    n = CERT_LIST_NEXT(n);
+  }
+}
+
+void ClientAuthCertificateSelectedBase::SetSelectedClientAuthData(
+    nsTArray<uint8_t>&& selectedCertBytes,
+    nsTArray<nsTArray<uint8_t>>&& selectedCertChainBytes) {
+  mSelectedCertBytes = std::move(selectedCertBytes);
+  mSelectedCertChainBytes = std::move(selectedCertChainBytes);
+}
+
+NS_IMETHODIMP
+ClientAuthCertificateSelected::Run() {
+  mSocketInfo->ClientAuthCertificateSelected(mSelectedCertBytes,
+                                             mSelectedCertChainBytes);
+  return NS_OK;
+}
+
+void SelectClientAuthCertificate::DispatchContinuation(
+    nsTArray<uint8_t>&& selectedCertBytes) {
+  nsTArray<nsTArray<uint8_t>> selectedCertChainBytes;
+  for (const auto& clientCertificateChain : mPotentialClientCertificateChains) {
+    if (clientCertificateChain.Length() > 0 &&
+        clientCertificateChain[0] == selectedCertBytes) {
+      for (const auto& certificateBytes : clientCertificateChain) {
+        selectedCertChainBytes.AppendElement(certificateBytes.Clone());
+      }
+      break;
+    }
+  }
+  mContinuation->SetSelectedClientAuthData(std::move(selectedCertBytes),
+                                           std::move(selectedCertChainBytes));
+  nsCOMPtr<nsIEventTarget> socketThread(
+      do_GetService(NS_SOCKETTRANSPORTSERVICE_CONTRACTID));
+  if (socketThread) {
+    (void)socketThread->Dispatch(mContinuation, NS_DISPATCH_NORMAL);
+  }
+}
+
+mozilla::pkix::Result BuildChainForCertificate(
+    nsTArray<uint8_t>& certBytes, nsTArray<nsTArray<uint8_t>>& certChainBytes,
+    const nsTArray<nsTArray<uint8_t>>& caNames,
+    const nsTArray<nsTArray<uint8_t>>& enterpriseCertificates) {
+  ClientAuthCertNonverifyingTrustDomain trustDomain(caNames,
+                                                    enterpriseCertificates);
+  pkix::Input certDER;
+  mozilla::pkix::Result result =
+      certDER.Init(certBytes.Elements(), certBytes.Length());
+  if (result != pkix::Success) {
+    return result;
+  }
+  const pkix::EndEntityOrCA kEndEntityOrCAParams[] = {
+      pkix::EndEntityOrCA::MustBeEndEntity, pkix::EndEntityOrCA::MustBeCA};
+  const pkix::KeyPurposeId kKeyPurposeIdParams[] = {
+      pkix::KeyPurposeId::anyExtendedKeyUsage,
+      pkix::KeyPurposeId::id_kp_OCSPSigning};
+  for (const auto& endEntityOrCAParam : kEndEntityOrCAParams) {
+    for (const auto& keyPurposeIdParam : kKeyPurposeIdParams) {
+      mozilla::pkix::Result result = BuildCertChain(
+          trustDomain, certDER, Now(), endEntityOrCAParam,
+          KeyUsage::noParticularKeyUsageRequired, keyPurposeIdParam,
+          pkix::CertPolicyId::anyPolicy, nullptr);
+      if (result == pkix::Success) {
+        certChainBytes = trustDomain.TakeBuiltChain();
+        return pkix::Success;
+      }
+    }
+  }
+  return mozilla::pkix::Result::ERROR_UNKNOWN_ISSUER;
+}
+
+class ClientAuthDialogCallback : public nsIClientAuthDialogCallback {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSICLIENTAUTHDIALOGCALLBACK
+
+  explicit ClientAuthDialogCallback(
+      SelectClientAuthCertificate* selectClientAuthCertificate)
+      : mSelectClientAuthCertificate(selectClientAuthCertificate) {}
+
+ private:
+  virtual ~ClientAuthDialogCallback() = default;
+
+  RefPtr<SelectClientAuthCertificate> mSelectClientAuthCertificate;
+};
+
+NS_IMPL_ISUPPORTS(ClientAuthDialogCallback, nsIClientAuthDialogCallback)
+
+NS_IMETHODIMP
+ClientAuthDialogCallback::CertificateChosen(
+    nsIX509Cert* cert,
+    nsIClientAuthRememberService::Duration rememberDuration) {
+  MOZ_ASSERT(mSelectClientAuthCertificate);
+  if (!mSelectClientAuthCertificate) {
+    return NS_ERROR_FAILURE;
+  }
+  const ClientAuthInfo& info = mSelectClientAuthCertificate->Info();
+  nsCOMPtr<nsIClientAuthRememberService> clientAuthRememberService(
+      do_GetService(NS_CLIENTAUTHREMEMBERSERVICE_CONTRACTID));
+  if (info.ProviderTlsFlags() == 0 && clientAuthRememberService) {
+    (void)clientAuthRememberService->RememberDecision(
+        info.HostName(), info.OriginAttributesRef(), cert, rememberDuration);
+  }
+  nsTArray<uint8_t> selectedCertBytes;
+  if (cert) {
+    nsresult rv = cert->GetRawDER(selectedCertBytes);
+    if (NS_FAILED(rv)) {
+      selectedCertBytes.Clear();
+      mSelectClientAuthCertificate->DispatchContinuation(
+          std::move(selectedCertBytes));
+      return rv;
+    }
+  }
+  mSelectClientAuthCertificate->DispatchContinuation(
+      std::move(selectedCertBytes));
+  return NS_OK;
+}
+
+NS_IMETHODIMP
+SelectClientAuthCertificate::Run() {
+  MOZ_ASSERT(NS_IsMainThread());
+
+  nsTArray<uint8_t> selectedCertBytes;
+
+  if (nsGetUserCertChoice() == UserCertChoice::Auto) {
+    UniqueCERTCertificate lowPrioNonrepCert;
+    for (CERTCertListNode* node = CERT_LIST_HEAD(mPotentialClientCertificates);
+         !CERT_LIST_END(node, mPotentialClientCertificates);
+         node = CERT_LIST_NEXT(node)) {
+      UniqueSECKEYPrivateKey tmpKey(PK11_FindKeyByAnyCert(node->cert, nullptr));
+      if (tmpKey) {
+        if (hasExplicitKeyUsageNonRepudiation(node->cert)) {
+          if (!lowPrioNonrepCert) {  
+            lowPrioNonrepCert.reset(CERT_DupCertificate(node->cert));
+          }
+        } else {
+          selectedCertBytes.AppendElements(node->cert->derCert.data,
+                                           node->cert->derCert.len);
+          DispatchContinuation(std::move(selectedCertBytes));
+          return NS_OK;
+        }
+      }
+      if (PR_GetError() == SEC_ERROR_BAD_PASSWORD) {
+        break;
+      }
+    }
+
+    if (lowPrioNonrepCert) {
+      selectedCertBytes.AppendElements(lowPrioNonrepCert->derCert.data,
+                                       lowPrioNonrepCert->derCert.len);
+    }
+    DispatchContinuation(std::move(selectedCertBytes));
+    return NS_OK;
+  }
+
+  nsTArray<RefPtr<nsIX509Cert>> certArray;
+  for (CERTCertListNode* node = CERT_LIST_HEAD(mPotentialClientCertificates);
+       !CERT_LIST_END(node, mPotentialClientCertificates);
+       node = CERT_LIST_NEXT(node)) {
+    RefPtr<nsIX509Cert> tempCert(new nsNSSCertificate(node->cert));
+    certArray.AppendElement(tempCert);
+  }
+
+  nsCOMPtr<nsIClientAuthDialogService> clientAuthDialogService(
+      do_GetService(NS_CLIENTAUTHDIALOGSERVICE_CONTRACTID));
+  if (!clientAuthDialogService) {
+    DispatchContinuation(std::move(selectedCertBytes));
+    return NS_ERROR_FAILURE;
+  }
+
+  RefPtr<mozilla::dom::BrowsingContext> browsingContext;
+  if (mBrowserId) {
+    browsingContext =
+        mozilla::dom::BrowsingContext::GetCurrentTopByBrowserId(mBrowserId);
+  }
+
+  if (browsingContext) {
+    RefPtr<net::DocumentLoadListener> loadListener =
+        browsingContext->Canonical()->GetCurrentLoad();
+    if (loadListener) {
+      nsCOMPtr<nsIHttpChannel> channel =
+          do_QueryInterface(loadListener->GetChannel());
+      if (channel) {
+        nsCOMPtr<nsILoadInfo> loadInfo = channel->LoadInfo();
+        uint32_t httpsOnlyStatus = loadInfo->GetHttpsOnlyStatus();
+        httpsOnlyStatus |= nsILoadInfo::HTTPS_ONLY_TOP_LEVEL_LOAD_IN_PROGRESS;
+        loadInfo->SetHttpsOnlyStatus(httpsOnlyStatus);
+      }
+    }
+  }
+
+  RefPtr<nsIClientAuthDialogCallback> callback(
+      new ClientAuthDialogCallback(this));
+  nsresult rv = clientAuthDialogService->ChooseCertificate(
+      mInfo.HostName(), certArray, browsingContext, mCANames, callback);
+  if (NS_FAILED(rv)) {
+    DispatchContinuation(std::move(selectedCertBytes));
+    return rv;
+  }
+  return NS_OK;
+}
+
+SECStatus SSLGetClientAuthDataHook(void* arg, PRFileDesc* socket,
+                                   CERTDistNames* caNamesDecoded,
+                                   CERTCertificate** pRetCert,
+                                   SECKEYPrivateKey** pRetKey) {
+  MOZ_LOG(gPIPNSSLog, LogLevel::Debug,
+          ("[%p][%p] SSLGetClientAuthDataHook", socket, arg));
+
+  if (!arg || !socket || !caNamesDecoded || !pRetCert || !pRetKey) {
+    PR_SetError(PR_INVALID_ARGUMENT_ERROR, 0);
+    return SECFailure;
+  }
+
+  *pRetCert = nullptr;
+  *pRetKey = nullptr;
+
+  RefPtr<NSSSocketControl> info(static_cast<NSSSocketControl*>(arg));
+
+
+  if (info->GetDenyClientCert()) {
+    MOZ_LOG(gPIPNSSLog, LogLevel::Debug,
+            ("[%p] Not returning client cert due to denyClientCert attribute",
+             socket));
+    return SECSuccess;
+  }
+
+  if (info->GetJoined()) {
+    MOZ_LOG(gPIPNSSLog, LogLevel::Debug,
+            ("[%p] Not returning client cert due to previous join", socket));
+    return SECSuccess;
+  }
+
+  if (info->CancelIfNotClaimed()) {
+    MOZ_LOG(
+        gPIPNSSLog, LogLevel::Debug,
+        ("[%p] Cancelling unclaimed connection with client certificate request",
+         socket));
+    return SECSuccess;
+  }
+
+  UniqueCERTCertificate serverCert(SSL_PeerCertificate(socket));
+  if (!serverCert) {
+    PR_SetError(SSL_ERROR_NO_CERTIFICATE, 0);
+    return SECFailure;
+  }
+
+  nsTArray<nsTArray<uint8_t>> caNames(CollectCANames(caNamesDecoded));
+  info->SetClientAuthCertificateRequest(std::move(serverCert),
+                                        std::move(caNames));
+  PR_SetError(PR_WOULD_BLOCK_ERROR, 0);
+  return SECWouldBlock;
+}
+
+void DoSelectClientAuthCertificate(NSSSocketControl* info,
+                                   UniqueCERTCertificate&& serverCert,
+                                   nsTArray<nsTArray<uint8_t>>&& caNames) {
+  MOZ_ASSERT(info);
+  uint64_t browserId;
+  if (NS_FAILED(info->GetBrowserId(&browserId))) {
+    info->SetCanceled(SEC_ERROR_LIBRARY_FAILURE);
+    return;
+  }
+
+  RefPtr<ClientAuthCertificateSelected> continuation(
+      new ClientAuthCertificateSelected(info));
+  if (XRE_IsSocketProcess()) {
+    RefPtr<SelectTLSClientAuthCertChild> selectClientAuthCertificate(
+        new SelectTLSClientAuthCertChild(continuation));
+    nsAutoCString hostname(info->GetHostName());
+    nsTArray<uint8_t> serverCertBytes;
+    nsTArray<ByteArray> caNamesBytes;
+    for (const auto& caName : caNames) {
+      caNamesBytes.AppendElement(ByteArray(std::move(caName)));
+    }
+    serverCertBytes.AppendElements(serverCert->derCert.data,
+                                   serverCert->derCert.len);
+    OriginAttributes originAttributes(info->GetOriginAttributes());
+    int32_t port(info->GetPort());
+    uint32_t providerFlags(info->GetProviderFlags());
+    uint32_t providerTlsFlags(info->GetProviderTlsFlags());
+    nsCOMPtr<nsIRunnable> remoteSelectClientAuthCertificate(
+        NS_NewRunnableFunction(
+            "RemoteSelectClientAuthCertificate",
+            [selectClientAuthCertificate(
+                 std::move(selectClientAuthCertificate)),
+             hostname(std::move(hostname)),
+             originAttributes(std::move(originAttributes)), port, providerFlags,
+             providerTlsFlags, serverCertBytes(std::move(serverCertBytes)),
+             caNamesBytes(std::move(caNamesBytes)),
+             browserId(browserId)]() mutable {
+              ipc::Endpoint<PSelectTLSClientAuthCertParent> parentEndpoint;
+              ipc::Endpoint<PSelectTLSClientAuthCertChild> childEndpoint;
+              PSelectTLSClientAuthCert::CreateEndpoints(&parentEndpoint,
+                                                        &childEndpoint);
+              if (NS_FAILED(net::SocketProcessBackgroundChild::WithActor(
+                      "SendInitSelectTLSClientAuthCert",
+                      [endpoint = std::move(parentEndpoint),
+                       hostname(std::move(hostname)),
+                       originAttributes(std::move(originAttributes)), port,
+                       providerFlags, providerTlsFlags,
+                       serverCertBytes(std::move(serverCertBytes)),
+                       caNamesBytes(std::move(caNamesBytes)), browserId](
+                          net::SocketProcessBackgroundChild* aActor) mutable {
+                        (void)aActor->SendInitSelectTLSClientAuthCert(
+                            std::move(endpoint), hostname, originAttributes,
+                            port, providerFlags, providerTlsFlags,
+                            ByteArray(serverCertBytes), caNamesBytes,
+                            browserId);
+                      }))) {
+                return;
+              }
+
+              if (!childEndpoint.Bind(selectClientAuthCertificate)) {
+                return;
+              }
+            }));
+    (void)NS_DispatchToMainThread(remoteSelectClientAuthCertificate);
+    return;
+  }
+
+  ClientAuthInfo authInfo(info->GetHostName(), info->GetOriginAttributes(),
+                          info->GetPort(), info->GetProviderFlags(),
+                          info->GetProviderTlsFlags());
+  nsTArray<nsTArray<uint8_t>> enterpriseCertificates(
+      GetEnterpriseCertificates());
+  nsTArray<uint8_t> rememberedCertBytes;
+  nsTArray<nsTArray<uint8_t>> rememberedCertChainBytes;
+  if (FindRememberedDecision(authInfo, caNames, enterpriseCertificates,
+                             rememberedCertBytes, rememberedCertChainBytes)) {
+    continuation->SetSelectedClientAuthData(
+        std::move(rememberedCertBytes), std::move(rememberedCertChainBytes));
+    (void)continuation->Run();
+    return;
+  }
+
+  UniqueCERTCertList potentialClientCertificates(
+      FindClientCertificatesWithPrivateKeys());
+  if (!potentialClientCertificates) {
+    MOZ_LOG(gPIPNSSLog, LogLevel::Debug,
+            ("[%p] FindClientCertificatesWithPrivateKeys() returned null (out "
+             "of memory?)",
+             &info));
+    info->SetCanceled(SEC_ERROR_LIBRARY_FAILURE);
+    return;
+  }
+
+  nsTArray<nsTArray<nsTArray<uint8_t>>> potentialClientCertificateChains;
+
+  FilterPotentialClientCertificatesByCANames(potentialClientCertificates,
+                                             caNames, enterpriseCertificates,
+                                             potentialClientCertificateChains);
+  if (CERT_LIST_EMPTY(potentialClientCertificates)) {
+    MOZ_LOG(
+        gPIPNSSLog, LogLevel::Debug,
+        ("[%p] no client certificates available after filtering by CA", &info));
+    (void)continuation->Run();
+    return;
+  }
+
+  nsCOMPtr<nsIRunnable> selectClientAuthCertificate(
+      new SelectClientAuthCertificate(
+          std::move(authInfo), std::move(serverCert),
+          std::move(potentialClientCertificates),
+          std::move(potentialClientCertificateChains), std::move(caNames),
+          continuation, browserId));
+  (void)NS_DispatchToMainThread(selectClientAuthCertificate);
+}
+
+class RemoteClientAuthCertificateSelected
+    : public ClientAuthCertificateSelectedBase {
+ public:
+  explicit RemoteClientAuthCertificateSelected(
+      SelectTLSClientAuthCertParent* selectTLSClientAuthCertParent)
+      : mSelectTLSClientAuthCertParent(selectTLSClientAuthCertParent),
+        mEventTarget(GetCurrentSerialEventTarget()) {}
+
+  NS_IMETHOD Run() override;
+
+ private:
+  RefPtr<SelectTLSClientAuthCertParent> mSelectTLSClientAuthCertParent;
+  nsCOMPtr<nsISerialEventTarget> mEventTarget;
+};
+
+NS_IMETHODIMP
+RemoteClientAuthCertificateSelected::Run() {
+  return mEventTarget->Dispatch(
+      NS_NewRunnableFunction(
+          "psm::RemoteClientAuthCertificateSelected::Run",
+          [parent(mSelectTLSClientAuthCertParent),
+           certBytes(std::move(mSelectedCertBytes)),
+           builtCertChain(std::move(mSelectedCertChainBytes))]() mutable {
+            parent->TLSClientAuthCertSelected(certBytes,
+                                              std::move(builtCertChain));
+          }),
+      NS_DISPATCH_NORMAL);
+}
+
+namespace mozilla::psm {
+
+bool SelectTLSClientAuthCertParent::Dispatch(
+    const nsACString& aHostName, const OriginAttributes& aOriginAttributes,
+    const int32_t& aPort, const uint32_t& aProviderFlags,
+    const uint32_t& aProviderTlsFlags, const ByteArray& aServerCertBytes,
+    nsTArray<ByteArray>&& aCANames, const uint64_t& aBrowserId) {
+  RefPtr<ClientAuthCertificateSelectedBase> continuation(
+      new RemoteClientAuthCertificateSelected(this));
+  ClientAuthInfo authInfo(aHostName, aOriginAttributes, aPort, aProviderFlags,
+                          aProviderTlsFlags);
+  nsCOMPtr<nsIEventTarget> socketThread =
+      do_GetService(NS_SOCKETTRANSPORTSERVICE_CONTRACTID);
+  if (NS_WARN_IF(!socketThread)) {
+    return false;
+  }
+  nsresult rv = socketThread->Dispatch(NS_NewRunnableFunction(
+      "SelectTLSClientAuthCertParent::Dispatch",
+      [authInfo(std::move(authInfo)), continuation(std::move(continuation)),
+       serverCertBytes(aServerCertBytes), caNames(std::move(aCANames)),
+       browserId(aBrowserId)]() mutable {
+        SECItem serverCertItem{
+            siBuffer,
+            const_cast<uint8_t*>(serverCertBytes.data().Elements()),
+            static_cast<unsigned int>(serverCertBytes.data().Length()),
+        };
+        UniqueCERTCertificate serverCert(CERT_NewTempCertificate(
+            CERT_GetDefaultCertDB(), &serverCertItem, nullptr, false, true));
+        if (!serverCert) {
+          return;
+        }
+        nsTArray<nsTArray<uint8_t>> caNamesArray;
+        for (auto& caName : caNames) {
+          caNamesArray.AppendElement(std::move(caName.data()));
+        }
+        nsTArray<nsTArray<uint8_t>> enterpriseCertificates(
+            GetEnterpriseCertificates());
+        nsTArray<uint8_t> rememberedCertBytes;
+        nsTArray<nsTArray<uint8_t>> rememberedCertChainBytes;
+        if (FindRememberedDecision(authInfo, caNamesArray,
+                                   enterpriseCertificates, rememberedCertBytes,
+                                   rememberedCertChainBytes)) {
+          continuation->SetSelectedClientAuthData(
+              std::move(rememberedCertBytes),
+              std::move(rememberedCertChainBytes));
+          (void)NS_DispatchToCurrentThread(continuation);
+          return;
+        }
+        UniqueCERTCertList potentialClientCertificates(
+            FindClientCertificatesWithPrivateKeys());
+        nsTArray<nsTArray<nsTArray<uint8_t>>> potentialClientCertificateChains;
+        FilterPotentialClientCertificatesByCANames(
+            potentialClientCertificates, caNamesArray, enterpriseCertificates,
+            potentialClientCertificateChains);
+        RefPtr<SelectClientAuthCertificate> selectClientAuthCertificate(
+            new SelectClientAuthCertificate(
+                std::move(authInfo), std::move(serverCert),
+                std::move(potentialClientCertificates),
+                std::move(potentialClientCertificateChains),
+                std::move(caNamesArray), continuation, browserId));
+        (void)NS_DispatchToMainThread(selectClientAuthCertificate);
+      }));
+  return NS_SUCCEEDED(rv);
+}
+
+void SelectTLSClientAuthCertParent::TLSClientAuthCertSelected(
+    const nsTArray<uint8_t>& aSelectedCertBytes,
+    nsTArray<nsTArray<uint8_t>>&& aSelectedCertChainBytes) {
+  if (!CanSend()) {
+    return;
+  }
+
+  nsTArray<ByteArray> selectedCertChainBytes;
+  for (auto& certBytes : aSelectedCertChainBytes) {
+    selectedCertChainBytes.AppendElement(ByteArray(certBytes));
+  }
+
+  (void)SendTLSClientAuthCertSelected(aSelectedCertBytes,
+                                      selectedCertChainBytes);
+  Close();
+}
+
+void SelectTLSClientAuthCertParent::ActorDestroy(
+    mozilla::ipc::IProtocol::ActorDestroyReason aWhy) {}
+
+SelectTLSClientAuthCertChild::SelectTLSClientAuthCertChild(
+    ClientAuthCertificateSelected* continuation)
+    : mContinuation(continuation) {}
+
+ipc::IPCResult SelectTLSClientAuthCertChild::RecvTLSClientAuthCertSelected(
+    ByteArray&& aSelectedCertBytes,
+    nsTArray<ByteArray>&& aSelectedCertChainBytes) {
+  nsTArray<uint8_t> selectedCertBytes(std::move(aSelectedCertBytes.data()));
+  nsTArray<nsTArray<uint8_t>> selectedCertChainBytes;
+  for (auto& certBytes : aSelectedCertChainBytes) {
+    selectedCertChainBytes.AppendElement(std::move(certBytes.data()));
+  }
+  mContinuation->SetSelectedClientAuthData(std::move(selectedCertBytes),
+                                           std::move(selectedCertChainBytes));
+
+  nsCOMPtr<nsIEventTarget> socketThread =
+      do_GetService(NS_SOCKETTRANSPORTSERVICE_CONTRACTID);
+  if (NS_WARN_IF(!socketThread)) {
+    return IPC_OK();
+  }
+  nsresult rv = socketThread->Dispatch(mContinuation, NS_DISPATCH_NORMAL);
+  (void)NS_WARN_IF(NS_FAILED(rv));
+
+  return IPC_OK();
+}
+
+}  

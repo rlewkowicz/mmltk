@@ -1,0 +1,555 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+const { AppConstants } = ChromeUtils.importESModule(
+  "resource://gre/modules/AppConstants.sys.mjs"
+);
+
+const { Interactions } = ChromeUtils.importESModule(
+  "moz-src:///browser/components/places/Interactions.sys.mjs"
+);
+const { PlacesUtils } = ChromeUtils.importESModule(
+  "resource://gre/modules/PlacesUtils.sys.mjs"
+);
+const { PlacesDBUtils } = ChromeUtils.importESModule(
+  "resource://gre/modules/PlacesDBUtils.sys.mjs"
+);
+
+const lazy = {};
+
+ChromeUtils.defineLazyGetter(lazy, "PlacesFrecencyRecalculator", () => {
+  return Cc["@mozilla.org/places/frecency-recalculator;1"].getService(
+    Ci.nsIObserver
+  ).wrappedJSObject;
+});
+
+const SortingType = {
+  ASCENDING: "ASC",
+  DESCENDING: "DESC",
+};
+
+
+class TableViewer {
+  maxRows = 100;
+
+  #lastFilledRows = 0;
+
+  columnMap;
+
+  #timer;
+
+  sortSetting = null;
+
+  async start() {
+    this.setupUI();
+    await this.updateDisplay();
+    this.#timer = setInterval(this.updateDisplay.bind(this), 10000);
+  }
+
+  pause() {
+    if (this.#timer) {
+      clearInterval(this.#timer);
+      this.#timer = null;
+    }
+  }
+
+  setupUI() {
+    document.getElementById("title").textContent = this.title;
+
+    let viewer = document.getElementById("tableViewer");
+    viewer.textContent = "";
+
+    let existingStyle = document.getElementById("tableStyle");
+    let numColumns = this.columnMap.size;
+    let styleText = `
+#tableViewer {
+  display: grid;
+  grid-template-columns: ${this.cssGridTemplateColumns}
+}
+
+/* Sets the first row of elements to bold. The number is the number of columns */
+#tableViewer > div:nth-child(-n+${numColumns}) {
+  font-weight: bold;
+  white-space: break-spaces;
+}
+
+/* Highlights every other row to make visual scanning of the table easier.
+   The numbers need to be adapted if the number of columns changes. */
+`;
+    for (let i = numColumns + 1; i <= numColumns * 2 - 1; i++) {
+      styleText += `#tableViewer > div:nth-child(${numColumns}n+${i}):nth-child(${
+        numColumns * 2
+      }n+${i}),\n`;
+    }
+    styleText += `#tableViewer > div:nth-child(${numColumns}n+${
+      numColumns * 2
+    }):nth-child(${numColumns * 2}n+${numColumns * 2})\n
+{
+  background: var(--table-row-background-color-alternate);
+}`;
+    existingStyle.innerText = styleText;
+
+    let tableBody = document.createDocumentFragment();
+    let header = document.createDocumentFragment();
+    for (let [key, details] of this.columnMap.entries()) {
+      let columnDiv = document.createElement("div");
+      columnDiv.classList.add("column-title");
+      columnDiv.setAttribute("data-column-title", key);
+      columnDiv.textContent = details.header;
+      header.appendChild(columnDiv);
+    }
+    tableBody.appendChild(header);
+
+    for (let i = 0; i < this.maxRows; i++) {
+      let row = document.createDocumentFragment();
+      for (let j = 0; j < this.columnMap.size; j++) {
+        row.appendChild(document.createElement("div"));
+      }
+      tableBody.appendChild(row);
+    }
+    viewer.appendChild(tableBody);
+
+    let limit = document.getElementById("tableLimit");
+    limit.textContent = `Maximum rows displayed: ${this.maxRows}.`;
+
+    this.#lastFilledRows = 0;
+  }
+
+  displayData(rows) {
+    if (gCurrentHandler != this) {
+      return;
+    }
+    let viewer = document.getElementById("tableViewer");
+    let index = this.columnMap.size;
+    for (let row of rows) {
+      for (let [column, details] of this.columnMap.entries()) {
+        let value = row[column];
+
+        if (details.includeTitle) {
+          viewer.children[index].setAttribute("title", value);
+        }
+
+        viewer.children[index].textContent = details.modifier
+          ? details.modifier(value)
+          : value;
+
+        index++;
+      }
+    }
+    let numRows = rows.length;
+    if (numRows < this.#lastFilledRows) {
+      for (let r = numRows; r < this.#lastFilledRows; r++) {
+        for (let c = 0; c < this.columnMap.size; c++) {
+          viewer.children[index].textContent = "";
+          viewer.children[index].removeAttribute("title");
+          index++;
+        }
+      }
+    }
+    this.#lastFilledRows = numRows;
+
+    this.updateDisplayedSort();
+  }
+
+  updateDisplayedSort() {
+    if (this.sortable) {
+      let viewer = document.getElementById("tableViewer");
+      let element = viewer.querySelector(
+        `[data-column-title="${this.sortSetting.column}"]`
+      );
+      let symbolHolder = document.getElementById("column-title-sort-indicator");
+      if (!symbolHolder) {
+        symbolHolder = document.createElement("span");
+        symbolHolder.style.marginLeft = "5px";
+        symbolHolder.style.pointerEvents = "none";
+        symbolHolder.id = "column-title-sort-indicator";
+      }
+      element.appendChild(symbolHolder);
+      symbolHolder.textContent =
+        this.sortSetting.order == SortingType.DESCENDING
+          ? "\u2B07\uFE0F"
+          : "\u2B06\uFE0F";
+    }
+  }
+
+  changeSort(column) {
+    if (this.sortSetting.column == column) {
+      this.sortSetting.order =
+        this.sortSetting.order == SortingType.DESCENDING
+          ? SortingType.ASCENDING
+          : SortingType.DESCENDING;
+    } else {
+      this.sortSetting = { column, order: SortingType.DESCENDING };
+    }
+  }
+
+  get sortable() {
+    return !!this.sortSetting;
+  }
+}
+
+const metadataHandler = new (class extends TableViewer {
+  title = "Interactions";
+  cssGridTemplateColumns =
+    "max-content fit-content(100%) repeat(6, min-content) fit-content(100%);";
+
+  columnMap = new Map([
+    ["id", { header: "ID" }],
+    ["url", { header: "URL", includeTitle: true }],
+    [
+      "updated_at",
+      {
+        header: "Updated",
+        modifier: updatedAt => new Date(updatedAt).toLocaleString(),
+      },
+    ],
+    [
+      "total_view_time",
+      {
+        header: "View Time (s)",
+        modifier: totalViewTime => (totalViewTime / 1000).toFixed(2),
+      },
+    ],
+    [
+      "typing_time",
+      {
+        header: "Typing Time (s)",
+        modifier: typingTime => (typingTime / 1000).toFixed(2),
+      },
+    ],
+    ["key_presses", { header: "Key Presses" }],
+    [
+      "scrolling_time",
+      {
+        header: "Scroll Time (s)",
+        modifier: scrollingTime => (scrollingTime / 1000).toFixed(2),
+      },
+    ],
+    ["scrolling_distance", { header: "Scroll Distance (pixels)" }],
+    ["referrer", { header: "Referrer", includeTitle: true }],
+  ]);
+
+  sortSetting = { column: "updated_at", order: SortingType.DESCENDING };
+
+  #db = null;
+
+  async #getRows(query, columns = [...this.columnMap.keys()]) {
+    if (!this.#db) {
+      this.#db = await PlacesUtils.promiseDBConnection();
+    }
+    let rows = await this.#db.executeCached(query);
+    return rows.map(r => {
+      let result = {};
+      for (let column of columns) {
+        result[column] = r.getResultByName(column);
+      }
+      return result;
+    });
+  }
+
+  async updateDisplay() {
+    let rows = await this.#getRows(
+      `SELECT m.id AS id, h.url AS url, updated_at, total_view_time,
+              typing_time, key_presses, scrolling_time, scrolling_distance, h2.url as referrer
+       FROM moz_places_metadata m
+       JOIN moz_places h ON h.id = m.place_id
+       LEFT JOIN moz_places h2 ON h2.id = m.referrer_place_id
+       ORDER BY ${this.sortSetting.column} ${this.sortSetting.order}
+       LIMIT ${this.maxRows}`
+    );
+    this.displayData(rows);
+  }
+
+  export(includeUrlAndTitle = false) {
+    return this.#getRows(
+      `SELECT
+      m.id,
+      ${includeUrlAndTitle ? "h.title," : ""}
+      ${includeUrlAndTitle ? "h.url" : "m.place_id"},
+      m.updated_at,
+      h.frecency,
+      m.total_view_time,
+      m.typing_time,
+      m.key_presses,
+      m.scrolling_time,
+      m.scrolling_distance,
+      ${includeUrlAndTitle ? "r.url AS referrer_url" : "m.referrer_place_id"},
+      ${includeUrlAndTitle ? "o.host" : "h.origin_id"},
+      h.visit_count,
+      vall.visit_dates,
+      vall.visit_types
+  FROM moz_places_metadata m
+  JOIN moz_places h ON h.id = m.place_id
+  JOIN
+      (SELECT
+          place_id,
+          group_concat(visit_date, ',') AS visit_dates,
+          group_concat(visit_type, ',') AS visit_types
+      FROM moz_historyvisits
+      GROUP BY place_id
+      ORDER BY visit_date DESC
+      ) vall ON vall.place_id = m.place_id
+  JOIN moz_origins o ON h.origin_id = o.id
+  LEFT JOIN moz_places r ON m.referrer_place_id = r.id
+
+  ORDER BY m.place_id DESC
+     `,
+      [
+        "id",
+        ...(includeUrlAndTitle ? ["title"] : []),
+        includeUrlAndTitle ? "url" : "place_id",
+        "updated_at",
+        "frecency",
+        "total_view_time",
+        "typing_time",
+        "key_presses",
+        "scrolling_time",
+        "scrolling_distance",
+        includeUrlAndTitle ? "referrer_url" : "referrer_place_id",
+        includeUrlAndTitle ? "host" : "origin_id",
+        "visit_count",
+        "visit_dates",
+        "visit_types",
+      ]
+    );
+  }
+})();
+
+const placesStatsHandler = new (class extends TableViewer {
+  title = "Places Database Statistics";
+  cssGridTemplateColumns = "fit-content(100%) repeat(5, max-content);";
+
+  columnMap = new Map([
+    ["entity", { header: "Entity" }],
+    ["count", { header: "Count" }],
+    [
+      "sizeBytes",
+      {
+        header: "Size (KiB)",
+        modifier: c => c / 1024,
+      },
+    ],
+    [
+      "sizePerc",
+      {
+        header: "Size (Perc.)",
+      },
+    ],
+    [
+      "efficiencyPerc",
+      {
+        header: "Space Eff. (Perc.)",
+      },
+    ],
+    [
+      "sequentialityPerc",
+      {
+        header: "Sequentiality (Perc.)",
+      },
+    ],
+  ]);
+
+  async updateDisplay() {
+    let data = await PlacesDBUtils.getEntitiesStatsAndCounts();
+    this.displayData(data);
+  }
+})();
+
+const placesViewerHandler = new (class extends TableViewer {
+  title = "Places Viewer";
+  cssGridTemplateColumns = "fit-content(100%) repeat(6, min-content);";
+  #db = null;
+  #maxRows = 100;
+
+  columnMap = new Map([
+    ["url", { header: "URL" }],
+    ["title", { header: "Title" }],
+    [
+      "last_visit_date",
+      {
+        header: "Last Visit Date",
+        modifier: lastVisitDate =>
+          new Date(lastVisitDate / 1000).toLocaleString(),
+      },
+    ],
+    ["frecency", { header: "Frecency" }],
+    [
+      "recalc_frecency",
+      {
+        header: "Recalc Frecency",
+      },
+    ],
+    [
+      "alt_frecency",
+      {
+        header: "Alt Frecency",
+      },
+    ],
+    [
+      "recalc_alt_frecency",
+      {
+        header: "Recalc Alt Frecency",
+      },
+    ],
+  ]);
+
+  sortSetting = { column: "last_visit_date", order: SortingType.DESCENDING };
+
+  async #getRows(query, columns = [...this.columnMap.keys()]) {
+    if (!this.#db) {
+      this.#db = await PlacesUtils.promiseDBConnection();
+    }
+    let rows = await this.#db.executeCached(query);
+    return rows.map(r => {
+      let result = {};
+      for (let column of columns) {
+        result[column] = r.getResultByName(column);
+      }
+      return result;
+    });
+  }
+
+  async updateDisplay() {
+    let rows = await this.#getRows(
+      `
+        SELECT
+          url,
+          title,
+          last_visit_date,
+          frecency,
+          recalc_frecency,
+          alt_frecency,
+          recalc_alt_frecency
+        FROM moz_places
+        ORDER BY ${this.sortSetting.column} ${this.sortSetting.order}
+        LIMIT ${this.#maxRows}`
+    );
+    this.displayData(rows);
+  }
+})();
+
+function checkPrefs() {
+  if (
+    !Services.prefs.getBoolPref("browser.places.interactions.enabled", false)
+  ) {
+    let warning = document.getElementById("enabledWarning");
+    warning.hidden = false;
+  }
+}
+
+function show(selectedButton) {
+  let currentButton = document.querySelector(".category.selected");
+  if (currentButton == selectedButton) {
+    return;
+  }
+
+  gCurrentHandler.pause();
+  currentButton.classList.remove("selected");
+  selectedButton.classList.add("selected");
+  switch (selectedButton.getAttribute("value")) {
+    case "metadata":
+      (gCurrentHandler = metadataHandler).start();
+      metadataHandler.start();
+      break;
+    case "places-stats":
+      (gCurrentHandler = placesStatsHandler).start();
+      break;
+    case "places-viewer":
+      (gCurrentHandler = placesViewerHandler).start();
+      break;
+  }
+}
+
+function createObjectURL(data, type) {
+  if (AppConstants.DEBUG) {
+    let escapedData = data.replaceAll("'", "\\'").replaceAll("\n", "\\n");
+    let sb = new Cu.Sandbox(null, { wantGlobalProperties: ["Blob", "URL"] });
+    return Cu.evalInSandbox(
+      `URL.createObjectURL(new Blob(['${escapedData}'], {type: '${type}'}))`,
+      sb,
+      "",
+      null,
+      0,
+      false
+    );
+  }
+  let blob = new Blob([data], {
+    type,
+  });
+  return window.URL.createObjectURL(blob);
+}
+
+function downloadFile(data, blobType, fileType) {
+  const a = document.createElement("a");
+  a.setAttribute("download", `places-${Date.now()}.${fileType}`);
+  a.setAttribute("href", createObjectURL(data, blobType));
+  a.click();
+  a.remove();
+}
+
+async function getData() {
+  let includeUrlAndTitle =
+    document.getElementById("include-place-data").checked;
+  return await metadataHandler.export(includeUrlAndTitle);
+}
+
+function setupListeners() {
+  let menu = document.getElementById("categories");
+  menu.addEventListener("click", e => {
+    if (e.target && e.target.parentNode == menu) {
+      show(e.target);
+    }
+  });
+
+  document.getElementById("export-json").addEventListener("click", async e => {
+    e.preventDefault();
+    const data = await getData();
+    downloadFile(JSON.stringify(data), "text/json;charset=utf-8", "json");
+  });
+
+  document.getElementById("export-csv").addEventListener("click", async e => {
+    e.preventDefault();
+    const data = await getData();
+
+    let headers = Object.keys(data.at(0));
+    let rows = [
+      headers.join(","),
+      ...data.map(obj =>
+        headers.map(field => JSON.stringify(obj[field] ?? "")).join(",")
+      ),
+    ];
+    rows = rows.join("\n");
+
+    downloadFile(rows, "text/csv", "csv");
+  });
+
+  document
+    .getElementById("recalc-alt-frecency")
+    .addEventListener("click", async e => {
+      e.preventDefault();
+      lazy.PlacesFrecencyRecalculator.recalculateAnyOutdatedFrecencies();
+    });
+
+  document.getElementById("tableViewer").addEventListener("click", e => {
+    if (gCurrentHandler.sortable && e.target.dataset.columnTitle) {
+      gCurrentHandler.changeSort(e.target.dataset.columnTitle);
+      gCurrentHandler.updateDisplay();
+    }
+  });
+}
+
+let gCurrentHandler;
+if (
+  Services.prefs.getBoolPref(
+    "browser.places.interactions.viewer.enabled",
+    false
+  )
+) {
+  document.body.classList.remove("hidden");
+
+  checkPrefs();
+  gCurrentHandler = metadataHandler;
+  gCurrentHandler.start().catch(console.error);
+  setupListeners();
+}

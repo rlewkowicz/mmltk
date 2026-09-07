@@ -1,0 +1,122 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(mozjemalloc_h)
+#define mozjemalloc_h
+
+#include <errno.h>
+
+#include "mozjemalloc_types.h"
+#include "malloc_decls.h"
+#include "mozilla/MacroArgs.h"
+
+
+#define MACRO_CALL(a, b) a b
+#define MACRO_CALL2(a, b) a b
+
+#define ARGS_HELPER(name, ...)                                     \
+  MACRO_CALL2(MOZ_PASTE_PREFIX_AND_ARG_COUNT(name, ##__VA_ARGS__), \
+              (__VA_ARGS__))
+#define TYPED_ARGS0()
+#define TYPED_ARGS1(t1) t1 arg1
+#define TYPED_ARGS2(t1, t2) TYPED_ARGS1(t1), t2 arg2
+#define TYPED_ARGS3(t1, t2, t3) TYPED_ARGS2(t1, t2), t3 arg3
+
+#define ARGS0()
+#define ARGS1(t1) arg1
+#define ARGS2(t1, t2) ARGS1(t1), arg2
+#define ARGS3(t1, t2, t3) ARGS2(t1, t2), arg3
+
+#if defined(MOZ_MEMORY)
+
+size_t GetKernelPageSize();
+
+template <void* (*memalign)(size_t, size_t)>
+struct AlignedAllocator {
+  static inline int posix_memalign(void** aMemPtr, size_t aAlignment,
+                                   size_t aSize) {
+    void* result;
+
+    if (((aAlignment - 1) & aAlignment) != 0 || aAlignment < sizeof(void*)) {
+      return EINVAL;
+    }
+
+    result = memalign(aAlignment, aSize);
+
+    if (!result) {
+      return ENOMEM;
+    }
+
+    *aMemPtr = result;
+    return 0;
+  }
+
+  static inline void* aligned_alloc(size_t aAlignment, size_t aSize) {
+    if (aSize % aAlignment) {
+      return nullptr;
+    }
+    return memalign(aAlignment, aSize);
+  }
+
+  static inline void* valloc(size_t aSize) {
+    return memalign(GetKernelPageSize(), aSize);
+  }
+};
+
+
+struct MozJemalloc {
+#  define MALLOC_DECL(name, return_type, ...) \
+    static inline return_type name(__VA_ARGS__);
+#  include "malloc_decls.h"
+};
+
+
+#if defined(MOZ_REPLACE_MALLOC)
+struct ReplaceMalloc {
+#    define MALLOC_DECL(name, return_type, ...) \
+      static return_type name(__VA_ARGS__);
+#    include "malloc_decls.h"
+};
+#endif
+
+using CanonicalMalloc = MozJemalloc;
+
+#if defined(MOZ_REPLACE_MALLOC)
+using DefaultMalloc = ReplaceMalloc;
+#else
+using DefaultMalloc = CanonicalMalloc;
+#endif
+
+constexpr uint8_t kAllocPoison = 0xe5;
+
+constexpr uint8_t kAllocJunk = 0xe4;
+
+#endif
+
+template <typename T>
+struct DummyArenaAllocator {
+  static arena_id_t moz_create_arena_with_params(arena_params_t*) { return 0; }
+
+  static void moz_dispose_arena(arena_id_t) {}
+
+  static void moz_set_max_dirty_page_modifier(int32_t) {}
+
+  static bool moz_enable_deferred_purge(bool aEnable) { return false; }
+
+  static may_purge_now_result_t moz_may_purge_now(
+      bool aPeekOnly, uint32_t aReuseGraceMS,
+      const mozilla::Maybe<std::function<bool()>>& aKeepGoing) {
+    return may_purge_now_result_t::Done;
+  }
+
+#define MALLOC_DECL(name, return_type, ...)                 \
+  static return_type moz_arena_##name(                      \
+      arena_id_t, ARGS_HELPER(TYPED_ARGS, ##__VA_ARGS__)) { \
+    return T::name(ARGS_HELPER(ARGS, ##__VA_ARGS__));       \
+  }
+#define MALLOC_FUNCS MALLOC_FUNCS_MALLOC_BASE
+#include "malloc_decls.h"
+};
+
+#endif

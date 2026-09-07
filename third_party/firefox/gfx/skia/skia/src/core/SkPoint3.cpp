@@ -1,0 +1,58 @@
+/*
+ * Copyright 2015 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "include/core/SkPoint3.h"
+#include "include/private/base/SkFloatingPoint.h"
+
+#include <cmath>
+
+static inline float get_length_squared(float x, float y, float z) {
+    return x * x + y * y + z * z;
+}
+
+static inline bool is_length_nearly_zero(float x, float y, float z, float *lengthSquared) {
+    *lengthSquared = get_length_squared(x, y, z);
+    return *lengthSquared <= (SK_ScalarNearlyZero * SK_ScalarNearlyZero);
+}
+
+SkScalar SkPoint3::Length(SkScalar x, SkScalar y, SkScalar z) {
+    float magSq = get_length_squared(x, y, z);
+    if (SkIsFinite(magSq)) {
+        return std::sqrt(magSq);
+    } else {
+        double xx = x;
+        double yy = y;
+        double zz = z;
+        return (float)sqrt(xx * xx + yy * yy + zz * zz);
+    }
+}
+
+bool SkPoint3::normalize() {
+    float magSq;
+    if (is_length_nearly_zero(fX, fY, fZ, &magSq)) {
+        this->set(0, 0, 0);
+        return false;
+    }
+    double invScale;
+    if (SkIsFinite(magSq)) {
+        invScale = magSq;
+    } else {
+        double xx = fX;
+        double yy = fY;
+        double zz = fZ;
+        invScale = xx * xx + yy * yy + zz * zz;
+    }
+    double scale = 1 / sqrt(invScale);
+    fX *= scale;
+    fY *= scale;
+    fZ *= scale;
+    if (!SkIsFinite(fX, fY, fZ)) {
+        this->set(0, 0, 0);
+        return false;
+    }
+    return true;
+}

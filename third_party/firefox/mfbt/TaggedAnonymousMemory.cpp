@@ -1,0 +1,66 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifdef XP_LINUX
+
+#  include "mozilla/TaggedAnonymousMemory.h"
+
+#  include <sys/types.h>
+#  include <sys/mman.h>
+#  include <sys/prctl.h>
+#  include <sys/syscall.h>
+#  include <unistd.h>
+#  include <stdint.h>
+
+#  include "mozilla/Assertions.h"
+
+#  ifndef PR_SET_VMA
+#    define PR_SET_VMA 0x53564d41
+#  endif
+#  ifndef PR_SET_VMA_ANON_NAME
+#    define PR_SET_VMA_ANON_NAME 0
+#  endif
+
+namespace mozilla {
+
+static int TagAnonymousMemoryAligned(const void* aPtr, size_t aLength,
+                                     const char* aTag) {
+  return prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME,
+               reinterpret_cast<unsigned long>(aPtr), aLength,
+               reinterpret_cast<unsigned long>(aTag));
+}
+
+static uintptr_t GetPageMask() {
+  static uintptr_t mask = 0;
+
+  if (mask == 0) {
+    uintptr_t pageSize = sysconf(_SC_PAGESIZE);
+    mask = ~(pageSize - 1);
+    MOZ_ASSERT((pageSize & (pageSize - 1)) == 0,
+               "Page size must be a power of 2!");
+  }
+  return mask;
+}
+
+}  
+
+void MozTagAnonymousMemory(const void* aPtr, size_t aLength, const char* aTag) {
+  uintptr_t addr = reinterpret_cast<uintptr_t>(aPtr);
+  uintptr_t end = addr + aLength;
+  uintptr_t addrRounded = addr & mozilla::GetPageMask();
+  const void* ptrRounded = reinterpret_cast<const void*>(addrRounded);
+
+  mozilla::TagAnonymousMemoryAligned(ptrRounded, end - addrRounded, aTag);
+}
+
+void* MozTaggedAnonymousMmap(void* aAddr, size_t aLength, int aProt, int aFlags,
+                             int aFd, off_t aOffset, const char* aTag) {
+  void* mapped = mmap(aAddr, aLength, aProt, aFlags, aFd, aOffset);
+  if ((aFlags & MAP_ANONYMOUS) == MAP_ANONYMOUS && mapped != MAP_FAILED) {
+    mozilla::TagAnonymousMemoryAligned(mapped, aLength, aTag);
+  }
+  return mapped;
+}
+
+#endif  // XP_LINUX

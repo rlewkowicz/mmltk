@@ -1,0 +1,798 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+//! This module contains the convoluted logic that goes into uploading content into
+//! the texture cache's textures.
+//!
+//! We need to support various combinations of code paths depending on the quirks of
+//! each hardware/driver configuration:
+//! - direct upload,
+//! - staged upload via a pixel buffer object,
+//! - staged upload via a direct upload to a staging texture where PBO's aren't supported,
+//! - copy from the staging to destination textures, either via blits or batched draw calls.
+//!
+//! Conceptually a lot of this logic should probably be in the device module, but some code
+//! here relies on submitting draw calls via the renderer.
+
+
+use std::mem;
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::time::Duration;
+use euclid::{Transform3D, point2};
+use malloc_size_of::MallocSizeOfOps;
+use api::units::*;
+use api::{ExternalImageSource, ImageBufferKind, ImageFormat};
+use crate::renderer::{
+    Renderer, VertexArrayKind, RendererStats, TextureSampler, TEXTURE_CACHE_DBG_CLEAR_COLOR
+};
+use crate::internal_types::{
+    FastHashMap, TextureUpdateSource, Swizzle, TextureCacheUpdate,
+    CacheTextureId, RenderTargetInfo,
+};
+use crate::device::{
+    Device, UploadMethod, Texture, DrawTarget, UploadStagingBuffer, TextureFlags, TextureUploader,
+    TextureFilter,
+};
+use crate::gpu_types::CopyInstance;
+use crate::batch::BatchTextures;
+use crate::texture_pack::{GuillotineAllocator, FreeRectSlice};
+use crate::render_stats;
+use crate::render_api::MemoryReport;
+
+pub const BATCH_UPLOAD_TEXTURE_SIZE: DeviceIntSize = DeviceIntSize::new(512, 512);
+const BATCH_UPLOAD_FORMAT_COUNT: usize = 4;
+
+/// Upload a number of items to texture cache textures.
+///
+/// This is the main entry point of the texture cache upload code.
+/// See also the module documentation for more information.
+pub fn upload_to_texture_cache(
+    renderer: &mut Renderer,
+    update_list: FastHashMap<CacheTextureId, Vec<TextureCacheUpdate>>,
+) {
+    if update_list.is_empty() {
+        return;
+    }
+
+    let mut stats = UploadStats {
+        num_draw_calls: 0,
+        upload_time: 0,
+        cpu_buffer_alloc_time: 0,
+        texture_alloc_time: 0,
+        cpu_copy_time: 0,
+        gpu_copy_commands_time: 0,
+        bytes_uploaded: 0,
+        items_uploaded: 0,
+    };
+
+    let upload_total_start = zeitstempel::now();
+
+    let mut batch_upload_textures = Vec::new();
+
+    let mut batch_upload_copies = Vec::new();
+
+    let mut batch_upload_buffers = FastHashMap::default();
+
+    let mut uploader = renderer.device.upload_texture(
+        &mut renderer.texture_upload_pbo_pool,
+    );
+
+    let num_updates = update_list.len();
+
+    for (texture_id, updates) in update_list {
+        let texture = &renderer.texture_resolver.texture_cache_map[&texture_id].texture;
+        for update in updates {
+            let TextureCacheUpdate { rect, stride, offset, format_override, source } = update;
+            let mut arc_data = None;
+            let dummy_data;
+            let data = match source {
+                TextureUpdateSource::Bytes { ref data } => {
+                    arc_data = Some(data.clone());
+                    &data[offset as usize ..]
+                }
+                TextureUpdateSource::External { id, channel_index } => {
+                    let handler = renderer.external_image_handler
+                        .as_mut()
+                        .expect("Found external image, but no handler set!");
+                    match handler.lock(id, channel_index, false).source {
+                        ExternalImageSource::RawData(data) => {
+                            &data[offset as usize ..]
+                        }
+                        ExternalImageSource::Invalid => {
+                            let bpp = texture.get_format().bytes_per_pixel();
+                            let width = stride.unwrap_or(rect.width() * bpp);
+                            let total_size = width * rect.height();
+                            dummy_data = vec![0xFFu8; total_size as usize];
+                            &dummy_data
+                        }
+                        ExternalImageSource::NativeTexture(eid) => {
+                            panic!("Unexpected external texture {:?} for the texture cache update of {:?}", eid, id);
+                        }
+                    }
+                }
+                TextureUpdateSource::DebugClear => {
+                    let draw_target = DrawTarget::from_texture(
+                        texture,
+                        false,
+                    );
+                    renderer.device.bind_draw_target(draw_target);
+                    renderer.device.clear_target(
+                        Some(TEXTURE_CACHE_DBG_CLEAR_COLOR),
+                        None,
+                        Some(draw_target.to_framebuffer_rect(update.rect.to_i32()))
+                    );
+
+                    continue;
+                }
+            };
+
+            stats.items_uploaded += 1;
+
+            let use_batch_upload = renderer.device.use_batched_texture_uploads() &&
+                texture.flags().contains(TextureFlags::IS_SHARED_TEXTURE_CACHE) &&
+                rect.width() <= BATCH_UPLOAD_TEXTURE_SIZE.width &&
+                rect.height() <= BATCH_UPLOAD_TEXTURE_SIZE.height &&
+                rect.area() < renderer.device.batched_upload_threshold();
+
+            if use_batch_upload
+                && arc_data.is_some()
+                && matches!(renderer.device.upload_method(), &UploadMethod::Immediate)
+                && rect.area() > BATCH_UPLOAD_TEXTURE_SIZE.area() / 2 {
+                skip_staging_buffer(
+                    &mut renderer.device,
+                    &mut renderer.staging_texture_pool,
+                    rect,
+                    stride,
+                    arc_data.unwrap(),
+                    texture_id,
+                    texture,
+                    &mut batch_upload_buffers,
+                    &mut batch_upload_textures,
+                    &mut batch_upload_copies,
+                    &mut stats,
+                );
+            } else if use_batch_upload {
+                copy_into_staging_buffer(
+                    &mut renderer.device,
+                    &mut uploader,
+                    &mut renderer.staging_texture_pool,
+                    rect,
+                    stride,
+                    data,
+                    texture_id,
+                    texture,
+                    &mut batch_upload_buffers,
+                    &mut batch_upload_textures,
+                    &mut batch_upload_copies,
+                    &mut stats,
+                );
+            } else {
+                let upload_start_time = zeitstempel::now();
+
+                stats.bytes_uploaded += uploader.upload(
+                    &mut renderer.device,
+                    texture,
+                    rect,
+                    stride,
+                    format_override,
+                    data.as_ptr(),
+                    data.len()
+                );
+
+                stats.upload_time += zeitstempel::now() - upload_start_time;
+            }
+
+            if let TextureUpdateSource::External { id, channel_index } = source {
+                let handler = renderer.external_image_handler
+                    .as_mut()
+                    .expect("Found external image, but no handler set!");
+                handler.unlock(id, channel_index);
+            }
+        }
+    }
+
+    let upload_start_time = zeitstempel::now();
+    for batch_buffer in batch_upload_buffers.into_iter().map(|(_, (_, buffers))| buffers).flatten() {
+        let texture = &batch_upload_textures[batch_buffer.texture_index];
+        match batch_buffer.staging_buffer {
+            StagingBufferKind::Pbo(pbo) => {
+                stats.bytes_uploaded += uploader.upload_staged(
+                    &mut renderer.device,
+                    texture,
+                    DeviceIntRect::from_size(texture.get_dimensions()),
+                    None,
+                    pbo,
+                );
+            }
+            StagingBufferKind::CpuBuffer { bytes, .. } => {
+                let bpp = texture.get_format().bytes_per_pixel();
+                stats.bytes_uploaded += uploader.upload(
+                    &mut renderer.device,
+                    texture,
+                    batch_buffer.upload_rect,
+                    Some(BATCH_UPLOAD_TEXTURE_SIZE.width * bpp),
+                    None,
+                    bytes.as_ptr(),
+                    bytes.len()
+                );
+                renderer.staging_texture_pool.return_temporary_buffer(bytes);
+            }
+            StagingBufferKind::Image { bytes, stride } => {
+                stats.bytes_uploaded += uploader.upload(
+                    &mut renderer.device,
+                    texture,
+                    batch_buffer.upload_rect,
+                    stride,
+                    None,
+                    bytes.as_ptr(),
+                    bytes.len()
+                );
+            }
+        }
+    }
+    stats.upload_time += zeitstempel::now() - upload_start_time;
+
+
+    let flush_start_time = zeitstempel::now();
+    uploader.flush(&mut renderer.device);
+    stats.upload_time += zeitstempel::now() - flush_start_time;
+
+    if !batch_upload_copies.is_empty() {
+        batch_upload_copies.sort_unstable_by_key(|b| (b.dest_texture_id.0, b.src_texture_index));
+
+        let gpu_copy_start = zeitstempel::now();
+
+        if renderer.device.use_draw_calls_for_texture_copy() {
+            copy_from_staging_to_cache_using_draw_calls(
+                renderer,
+                &mut stats,
+                &batch_upload_textures,
+                batch_upload_copies,
+            );
+        } else {
+            copy_from_staging_to_cache(
+                renderer,
+                &batch_upload_textures,
+                batch_upload_copies,
+            );
+        }
+
+        stats.gpu_copy_commands_time += zeitstempel::now() - gpu_copy_start;
+    }
+
+    for texture in batch_upload_textures.drain(..) {
+        renderer.staging_texture_pool.return_texture(texture);
+    }
+
+
+    let upload_total = zeitstempel::now() - upload_total_start;
+    renderer.profile.add(
+        render_stats::TOTAL_UPLOAD_TIME,
+        render_stats::ns_to_ms(upload_total)
+    );
+
+    if num_updates > 0 {
+        renderer.profile.add(render_stats::TEXTURE_UPLOADS, num_updates);
+    }
+
+    if stats.bytes_uploaded > 0 {
+        renderer.profile.add(
+            render_stats::TEXTURE_UPLOADS_MEM,
+            render_stats::bytes_to_mb(stats.bytes_uploaded)
+        );
+    }
+
+    if stats.cpu_copy_time > 0 {
+        renderer.profile.add(
+            render_stats::UPLOAD_CPU_COPY_TIME,
+            render_stats::ns_to_ms(stats.cpu_copy_time)
+        );
+    }
+    if stats.upload_time > 0 {
+        renderer.profile.add(
+            render_stats::UPLOAD_TIME,
+            render_stats::ns_to_ms(stats.upload_time)
+        );
+    }
+    if stats.texture_alloc_time > 0 {
+        renderer.profile.add(
+            render_stats::STAGING_TEXTURE_ALLOCATION_TIME,
+            render_stats::ns_to_ms(stats.texture_alloc_time)
+        );
+    }
+    if stats.cpu_buffer_alloc_time > 0 {
+        renderer.profile.add(
+            render_stats::CPU_TEXTURE_ALLOCATION_TIME,
+            render_stats::ns_to_ms(stats.cpu_buffer_alloc_time)
+        );
+    }
+    if stats.num_draw_calls > 0{
+        renderer.profile.add(
+            render_stats::UPLOAD_NUM_COPY_BATCHES,
+            stats.num_draw_calls
+        );
+    }
+
+    if stats.gpu_copy_commands_time > 0 {
+        renderer.profile.add(
+            render_stats::UPLOAD_GPU_COPY_TIME,
+            render_stats::ns_to_ms(stats.gpu_copy_commands_time)
+        );
+    }
+
+    let add_markers = render_stats::thread_is_being_profiled();
+    if add_markers && stats.bytes_uploaded > 0 {
+    	let details = format!("{} bytes uploaded, {} items", stats.bytes_uploaded, stats.items_uploaded);
+        render_stats::add_text_marker(&"Texture uploads", &details, Duration::from_nanos(upload_total));
+    }
+}
+
+/// Copy an item into a batched upload staging buffer.
+fn copy_into_staging_buffer<'a>(
+    device: &mut Device,
+    uploader: &mut TextureUploader< 'a>,
+    staging_texture_pool: &mut UploadTexturePool,
+    update_rect: DeviceIntRect,
+    update_stride: Option<i32>,
+    data: &[u8],
+    dest_texture_id: CacheTextureId,
+    texture: &Texture,
+    batch_upload_buffers: &mut FastHashMap<ImageFormat, (GuillotineAllocator, Vec<BatchUploadBuffer<'a>>)>,
+    batch_upload_textures: &mut Vec<Texture>,
+    batch_upload_copies: &mut Vec<BatchUploadCopy>,
+    stats: &mut UploadStats
+) {
+    let (allocator, buffers) = batch_upload_buffers.entry(texture.get_format())
+        .or_insert_with(|| (GuillotineAllocator::new(None), Vec::new()));
+
+    let (slice, origin) = match allocator.allocate(&update_rect.size()) {
+        Some((slice, origin)) => (slice, origin),
+        None => {
+            let new_slice = FreeRectSlice(buffers.len() as u32);
+            allocator.extend(new_slice, BATCH_UPLOAD_TEXTURE_SIZE, update_rect.size());
+
+            let texture_alloc_time_start = zeitstempel::now();
+            let staging_texture = staging_texture_pool.get_texture(device, texture.get_format());
+            stats.texture_alloc_time = zeitstempel::now() - texture_alloc_time_start;
+
+            let texture_index = batch_upload_textures.len();
+            batch_upload_textures.push(staging_texture);
+
+            let cpu_buffer_alloc_start_time = zeitstempel::now();
+            let staging_buffer = match device.upload_method() {
+                UploadMethod::Immediate => StagingBufferKind::CpuBuffer {
+                    bytes: staging_texture_pool.get_temporary_buffer(),
+                },
+                UploadMethod::PixelBuffer(_) => {
+                    match uploader.stage(
+                        device,
+                        texture.get_format(),
+                        BATCH_UPLOAD_TEXTURE_SIZE,
+                    ) {
+                        Ok(pbo) => StagingBufferKind::Pbo(pbo),
+                        Err(_) => StagingBufferKind::CpuBuffer {
+                            bytes: staging_texture_pool.get_temporary_buffer(),
+                        },
+                    }
+                }
+            };
+            stats.cpu_buffer_alloc_time += zeitstempel::now() - cpu_buffer_alloc_start_time;
+
+            buffers.push(BatchUploadBuffer {
+                staging_buffer,
+                texture_index,
+                upload_rect: DeviceIntRect::zero()
+            });
+
+            (new_slice, DeviceIntPoint::zero())
+        }
+    };
+    let buffer = &mut buffers[slice.0 as usize];
+    let allocated_rect = DeviceIntRect::from_origin_and_size(origin, update_rect.size());
+    buffer.upload_rect = buffer.upload_rect.union(&allocated_rect);
+
+    batch_upload_copies.push(BatchUploadCopy {
+        src_texture_index: buffer.texture_index,
+        src_offset: allocated_rect.min,
+        dest_texture_id,
+        dest_offset: update_rect.min,
+        size: update_rect.size(),
+    });
+
+    unsafe {
+        let memcpy_start_time = zeitstempel::now();
+        let bpp = texture.get_format().bytes_per_pixel() as usize;
+        let width_bytes = update_rect.width() as usize * bpp;
+        let src_stride = update_stride.map_or(width_bytes, |stride| {
+            assert!(stride >= 0);
+            stride as usize
+        });
+        let src_size = (update_rect.height() as usize - 1) * src_stride + width_bytes;
+        assert!(src_size <= data.len());
+
+        let src: &[mem::MaybeUninit<u8>] = std::slice::from_raw_parts(data.as_ptr() as *const _, src_size);
+        let (dst_stride, dst) = match &mut buffer.staging_buffer {
+            StagingBufferKind::Pbo(buffer) => (
+                buffer.get_stride(),
+                buffer.get_mapping(),
+            ),
+            StagingBufferKind::CpuBuffer { bytes } => (
+                BATCH_UPLOAD_TEXTURE_SIZE.width as usize * bpp,
+                &mut bytes[..],
+            ),
+            StagingBufferKind::Image { .. } => unreachable!(),
+        };
+
+        for y in 0..allocated_rect.height() as usize {
+            let src_start = y * src_stride;
+            let src_end = src_start + width_bytes;
+            let dst_start = (allocated_rect.min.y as usize + y as usize) * dst_stride +
+                allocated_rect.min.x as usize * bpp;
+            let dst_end = dst_start + width_bytes;
+
+            dst[dst_start..dst_end].copy_from_slice(&src[src_start..src_end])
+        }
+
+        stats.cpu_copy_time += zeitstempel::now() - memcpy_start_time;
+    }
+}
+
+/// Take this code path instead of copying into a staging CPU buffer when the image
+/// we would copy is large enough that it's unlikely anything else would fit in the
+/// buffer, therefore we might as well copy directly from the source image's pixels.
+fn skip_staging_buffer<'a>(
+    device: &mut Device,
+    staging_texture_pool: &mut UploadTexturePool,
+    update_rect: DeviceIntRect,
+    stride: Option<i32>,
+    data: Arc<Vec<u8>>,
+    dest_texture_id: CacheTextureId,
+    texture: &Texture,
+    batch_upload_buffers: &mut FastHashMap<ImageFormat, (GuillotineAllocator, Vec<BatchUploadBuffer<'a>>)>,
+    batch_upload_textures: &mut Vec<Texture>,
+    batch_upload_copies: &mut Vec<BatchUploadCopy>,
+    stats: &mut UploadStats
+) {
+    let (_, buffers) = batch_upload_buffers.entry(texture.get_format())
+        .or_insert_with(|| (GuillotineAllocator::new(None), Vec::new()));
+
+    let texture_alloc_time_start = zeitstempel::now();
+    let staging_texture = staging_texture_pool.get_texture(device, texture.get_format());
+    stats.texture_alloc_time = zeitstempel::now() - texture_alloc_time_start;
+
+    let texture_index = batch_upload_textures.len();
+    batch_upload_textures.push(staging_texture);
+
+    buffers.push(BatchUploadBuffer {
+        staging_buffer: StagingBufferKind::Image { bytes: data, stride },
+        texture_index,
+        upload_rect: DeviceIntRect::from_size(update_rect.size())
+    });
+
+    batch_upload_copies.push(BatchUploadCopy {
+        src_texture_index: texture_index,
+        src_offset: point2(0, 0),
+        dest_texture_id,
+        dest_offset: update_rect.min,
+        size: update_rect.size(),
+    });
+}
+
+
+/// Copy from the staging PBOs or textures to texture cache textures using blit commands.
+///
+/// Using blits instead of draw calls is supposedly more efficient but some drivers have
+/// a very high per-command overhead so in some configurations we end up using
+/// copy_from_staging_to_cache_using_draw_calls instead.
+fn copy_from_staging_to_cache(
+    renderer: &mut Renderer,
+    batch_upload_textures: &[Texture],
+    batch_upload_copies: Vec<BatchUploadCopy>,
+) {
+    for copy in batch_upload_copies {
+        let dest_texture = &renderer.texture_resolver.texture_cache_map[&copy.dest_texture_id].texture;
+
+        renderer.device.copy_texture_sub_region(
+            &batch_upload_textures[copy.src_texture_index],
+            copy.src_offset.x as _,
+            copy.src_offset.y as _,
+            dest_texture,
+            copy.dest_offset.x as _,
+            copy.dest_offset.y as _,
+            copy.size.width as _,
+            copy.size.height as _,
+        );
+    }
+}
+
+/// Generate and submit composite shader batches to copy from
+/// the staging textures to the destination cache textures.
+///
+/// If this shows up in GPU time ptofiles we could replace it with
+/// a simpler shader (composite.glsl is already quite simple).
+fn copy_from_staging_to_cache_using_draw_calls(
+    renderer: &mut Renderer,
+    stats: &mut UploadStats,
+    batch_upload_textures: &[Texture],
+    batch_upload_copies: Vec<BatchUploadCopy>,
+) {
+    let mut copy_instances = Vec::new();
+    let mut prev_src = None;
+    let mut prev_dst = None;
+    let mut dst_texture_size = DeviceSize::new(0.0, 0.0);
+
+    for copy in batch_upload_copies {
+
+        let src_changed = prev_src != Some(copy.src_texture_index);
+        let dst_changed = prev_dst != Some(copy.dest_texture_id);
+
+        if (src_changed || dst_changed) && !copy_instances.is_empty() {
+            renderer.draw_instanced_batch(
+                &copy_instances,
+                VertexArrayKind::Copy,
+                &BatchTextures::empty(),
+                &mut RendererStats::default(),
+            );
+
+            stats.num_draw_calls += 1;
+            copy_instances.clear();
+        }
+
+        if dst_changed {
+            let dest_texture = &renderer.texture_resolver.texture_cache_map[&copy.dest_texture_id].texture;
+            dst_texture_size = dest_texture.get_dimensions().to_f32();
+
+            let draw_target = DrawTarget::from_texture(dest_texture, false);
+            renderer.device.bind_draw_target(draw_target);
+
+            renderer.shaders
+                .borrow_mut()
+                .ps_copy()
+                .bind(
+                    &mut renderer.device,
+                    &Transform3D::identity(),
+                    None,
+                    &mut renderer.renderer_errors,
+                    &mut renderer.profile,
+                    &mut renderer.command_log,
+                );
+
+            prev_dst = Some(copy.dest_texture_id);
+        }
+
+        if src_changed {
+            renderer.device.bind_texture(
+                TextureSampler::Color0,
+                &batch_upload_textures[copy.src_texture_index],
+                Swizzle::default(),
+            );
+
+            prev_src = Some(copy.src_texture_index)
+        }
+
+        let src_rect = DeviceRect::from_origin_and_size(
+            copy.src_offset.to_f32(),
+            copy.size.to_f32(),
+        );
+
+        let dst_rect = DeviceRect::from_origin_and_size(
+            copy.dest_offset.to_f32(),
+            copy.size.to_f32(),
+        );
+
+        copy_instances.push(CopyInstance {
+            src_rect,
+            dst_rect,
+            dst_texture_size,
+        });
+    }
+
+    if !copy_instances.is_empty() {
+        renderer.draw_instanced_batch(
+            &copy_instances,
+            VertexArrayKind::Copy,
+            &BatchTextures::empty(),
+            &mut RendererStats::default(),
+        );
+
+        stats.num_draw_calls += 1;
+    }
+}
+
+/// A very basic pool to avoid reallocating staging textures as well as staging
+/// CPU side buffers.
+pub struct UploadTexturePool {
+    /// The textures in the pool associated with a last used frame index.
+    ///
+    /// The outer array corresponds to each of teh three supported texture formats.
+    textures: [VecDeque<(Texture, u64)>; BATCH_UPLOAD_FORMAT_COUNT],
+    delay_texture_deallocation: [u64; BATCH_UPLOAD_FORMAT_COUNT],
+    current_frame: u64,
+
+    /// Temporary buffers that are used when using staging uploads + glTexImage2D.
+    ///
+    /// Temporary buffers aren't used asynchronously so they can be reused every frame.
+    /// To keep things simple we always allocate enough memory for formats with four bytes
+    /// per pixel (more than we need for alpha-only textures but it works just as well).
+    temporary_buffers: Vec<Vec<mem::MaybeUninit<u8>>>,
+    min_temporary_buffers: usize,
+    delay_buffer_deallocation: u64,
+}
+
+impl UploadTexturePool {
+    pub fn new() -> Self {
+        UploadTexturePool {
+            textures: [VecDeque::new(), VecDeque::new(), VecDeque::new(), VecDeque::new()],
+            delay_texture_deallocation: [0; BATCH_UPLOAD_FORMAT_COUNT],
+            current_frame: 0,
+            temporary_buffers: Vec::new(),
+            min_temporary_buffers: 0,
+            delay_buffer_deallocation: 0,
+        }
+    }
+
+    fn format_index(&self, format: ImageFormat) -> usize {
+        match format {
+            ImageFormat::RGBA8 => 0,
+            ImageFormat::BGRA8 => 1,
+            ImageFormat::R8 => 2,
+            ImageFormat::R16 => 3,
+            _ => { panic!("unexpected format {:?}", format); }
+        }
+    }
+
+    pub fn begin_frame(&mut self) {
+        self.current_frame += 1;
+        self.min_temporary_buffers = self.temporary_buffers.len();
+    }
+
+    /// Create or reuse a staging texture.
+    ///
+    /// See also return_texture.
+    pub fn get_texture(&mut self, device: &mut Device, format: ImageFormat) -> Texture {
+
+        let format_idx = self.format_index(format);
+        let can_reuse = self.textures[format_idx].get(0)
+            .map(|tex| self.current_frame - tex.1 > 2)
+            .unwrap_or(false);
+
+        if can_reuse {
+            return self.textures[format_idx].pop_front().unwrap().0;
+        }
+
+
+        device.create_texture(
+            ImageBufferKind::Texture2D,
+            format,
+            BATCH_UPLOAD_TEXTURE_SIZE.width,
+            BATCH_UPLOAD_TEXTURE_SIZE.height,
+            TextureFilter::Nearest,
+            Some(RenderTargetInfo { has_depth: false }),
+        )
+    }
+
+    /// Hand the staging texture back to the pool after being done with uploads.
+    ///
+    /// The texture must have been obtained from this pool via get_texture.
+    pub fn return_texture(&mut self, texture: Texture) {
+        let format_idx = self.format_index(texture.get_format());
+        self.textures[format_idx].push_back((texture, self.current_frame));
+    }
+
+    /// Create or reuse a temporary CPU buffer.
+    ///
+    /// These buffers are used in the batched upload path when PBOs are not supported.
+    /// Content is first written to the temporary buffer and uploaded via a single
+    /// glTexSubImage2D call.
+    pub fn get_temporary_buffer(&mut self) -> Vec<mem::MaybeUninit<u8>> {
+        let buffer = self.temporary_buffers.pop().unwrap_or_else(|| {
+            vec![mem::MaybeUninit::new(0); BATCH_UPLOAD_TEXTURE_SIZE.area() as usize * 4]
+        });
+        self.min_temporary_buffers = self.min_temporary_buffers.min(self.temporary_buffers.len());
+        buffer
+    }
+
+    /// Return memory that was obtained from this pool via get_temporary_buffer.
+    pub fn return_temporary_buffer(&mut self, buffer: Vec<mem::MaybeUninit<u8>>) {
+        assert_eq!(buffer.len(), BATCH_UPLOAD_TEXTURE_SIZE.area() as usize * 4);
+        self.temporary_buffers.push(buffer);
+    }
+
+    /// Deallocate this pool's CPU and GPU memory.
+    pub fn delete_textures(&mut self, device: &mut Device) {
+        for format in &mut self.textures {
+            while let Some(texture) = format.pop_back() {
+                device.delete_texture(texture.0)
+            }
+        }
+        self.temporary_buffers.clear();
+    }
+
+    /// Deallocate some textures if there are too many for a long time.
+    pub fn end_frame(&mut self, device: &mut Device) {
+        for format_idx in 0..self.textures.len() {
+
+            let mut num_reusable_textures = 0;
+            for texture in &self.textures[format_idx] {
+                if self.current_frame - texture.1 > 2 {
+                    num_reusable_textures += 1;
+                }
+            }
+
+            if num_reusable_textures < 8 {
+                self.delay_texture_deallocation[format_idx] = self.current_frame + 120;
+            }
+
+            let to_remove = if self.current_frame > self.delay_texture_deallocation[format_idx] {
+                num_reusable_textures.min(4)
+            } else {
+                0
+            };
+
+            for _ in 0..to_remove {
+                let texture = self.textures[format_idx].pop_front().unwrap().0;
+                device.delete_texture(texture);
+            }
+        }
+
+        let unused_buffers = self.min_temporary_buffers;
+        if unused_buffers < 8 {
+            self.delay_buffer_deallocation = self.current_frame + 120;
+        }
+        let to_remove = if self.current_frame > self.delay_buffer_deallocation  {
+            unused_buffers.min(4)
+        } else {
+            0
+        };
+        for _ in 0..to_remove {
+            self.temporary_buffers.pop();
+        }
+    }
+
+    pub fn report_memory_to(&self, report: &mut MemoryReport, size_op_funs: &MallocSizeOfOps) {
+        for buf in &self.temporary_buffers {
+            report.upload_staging_memory += unsafe { (size_op_funs.size_of_op)(buf.as_ptr() as *const _) };
+        }
+
+        for format in &self.textures {
+            for texture in format {
+                report.upload_staging_textures += texture.0.size_in_bytes();
+            }
+        }
+    }
+}
+
+struct UploadStats {
+    num_draw_calls: u32,
+    upload_time: u64,
+    cpu_buffer_alloc_time: u64,
+    texture_alloc_time: u64,
+    cpu_copy_time: u64,
+    gpu_copy_commands_time: u64,
+    bytes_uploaded: usize,
+    items_uploaded: usize,
+}
+
+#[derive(Debug)]
+enum StagingBufferKind<'a> {
+    Pbo(UploadStagingBuffer<'a>),
+    CpuBuffer { bytes: Vec<mem::MaybeUninit<u8>> },
+    Image { bytes: Arc<Vec<u8>>, stride: Option<i32> },
+}
+#[derive(Debug)]
+struct BatchUploadBuffer<'a> {
+    staging_buffer: StagingBufferKind<'a>,
+    texture_index: usize,
+    upload_rect: DeviceIntRect,
+}
+
+#[derive(Debug)]
+struct BatchUploadCopy {
+    src_texture_index: usize,
+    src_offset: DeviceIntPoint,
+    dest_texture_id: CacheTextureId,
+    dest_offset: DeviceIntPoint,
+    size: DeviceIntSize,
+}

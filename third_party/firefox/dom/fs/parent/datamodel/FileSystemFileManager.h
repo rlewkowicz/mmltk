@@ -1,0 +1,77 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_FS_PARENT_DATAMODEL_FILESYSTEMFILEMANAGER_H_
+#define DOM_FS_PARENT_DATAMODEL_FILESYSTEMFILEMANAGER_H_
+
+#include "ErrorList.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/dom/FileSystemTypes.h"
+#include "mozilla/dom/QMResult.h"
+#include "nsIFile.h"
+#include "nsString.h"
+
+template <class T>
+class nsCOMPtr;
+
+class nsIFileURL;
+
+namespace mozilla::dom {
+
+namespace quota {
+
+struct OriginMetadata;
+
+}  
+
+namespace fs {
+
+struct FileId;
+
+namespace data {
+
+Result<nsCOMPtr<nsIFile>, QMResult> GetFileSystemDirectory(
+    const quota::OriginMetadata& aOriginMetadata);
+
+nsresult EnsureFileSystemDirectory(
+    const quota::OriginMetadata& aOriginMetadata);
+
+Result<nsCOMPtr<nsIFile>, QMResult> GetDatabaseFile(
+    const quota::OriginMetadata& aOriginMetadata);
+
+Result<nsCOMPtr<nsIFileURL>, QMResult> GetDatabaseFileURL(
+    const quota::OriginMetadata& aOriginMetadata,
+    const int64_t aDirectoryLockId);
+
+class FileSystemFileManager {
+ public:
+  static Result<UniquePtr<FileSystemFileManager>, QMResult>
+  CreateFileSystemFileManager(const quota::OriginMetadata& aOriginMetadata);
+
+  static Result<FileSystemFileManager, QMResult> CreateFileSystemFileManager(
+      nsCOMPtr<nsIFile>&& topDirectory);
+
+  Result<nsCOMPtr<nsIFile>, QMResult> GetFile(const FileId& aFileId) const;
+
+  Result<nsCOMPtr<nsIFile>, QMResult> GetOrCreateFile(const FileId& aFileId);
+
+  Result<nsCOMPtr<nsIFile>, QMResult> CreateFileFrom(
+      const FileId& aDestinationFileId, const FileId& aSourceFileId);
+
+  Result<Usage, QMResult> RemoveFile(const FileId& aFileId);
+
+  Result<DebugOnly<Usage>, QMResult> RemoveFiles(
+      const nsTArray<FileId>& aFileIds, nsTArray<FileId>& aFailedRemovals);
+
+ private:
+  explicit FileSystemFileManager(nsCOMPtr<nsIFile>&& aTopDirectory);
+
+  nsCOMPtr<nsIFile> mTopDirectory;
+};
+
+}  
+}  
+}  
+
+#endif  // DOM_FS_PARENT_DATAMODEL_FILESYSTEMFILEMANAGER_H_

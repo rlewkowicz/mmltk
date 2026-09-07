@@ -1,0 +1,109 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+******************************************************************************
+*
+*   Copyright (C) 2002-2012, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+*
+******************************************************************************
+*   file name:  uobject.h
+*   encoding:   UTF-8
+*   tab size:   8 (not used)
+*   indentation:4
+*
+*   created on: 2002jun26
+*   created by: Markus W. Scherer
+*/
+
+#ifndef __UOBJECT_H__
+#define __UOBJECT_H__
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+#include "unicode/platform.h"
+
+
+#ifndef U_NO_THROW
+#define U_NO_THROW noexcept
+#endif
+
+
+typedef void* UClassID;
+
+U_NAMESPACE_BEGIN
+
+class U_COMMON_API UMemory {
+public:
+
+#ifdef SHAPER_MEMORY_DEBUG  
+    static void * NewArray(int size, int count);
+    static void * GrowArray(void * array, int newSize );
+    static void   FreeArray(void * array );
+#endif
+
+#if U_OVERRIDE_CXX_ALLOCATION
+    static void * U_EXPORT2 operator new(size_t size) noexcept;
+
+    static void * U_EXPORT2 operator new[](size_t size) noexcept;
+
+    static void U_EXPORT2 operator delete(void *p) noexcept;
+
+    static void U_EXPORT2 operator delete[](void *p) noexcept;
+
+    static inline void * U_EXPORT2 operator new(size_t, void *ptr) noexcept { return ptr; }
+
+    static inline void U_EXPORT2 operator delete(void *, void *) noexcept {}
+
+#if U_HAVE_DEBUG_LOCATION_NEW
+    static void * U_EXPORT2 operator new(size_t size, const char* file, int line) noexcept;
+    static void U_EXPORT2 operator delete(void* p, const char* file, int line) noexcept;
+#endif /* U_HAVE_DEBUG_LOCATION_NEW */
+#endif /* U_OVERRIDE_CXX_ALLOCATION */
+
+};
+
+class U_COMMON_API UObject : public UMemory {
+public:
+    virtual ~UObject();
+
+    virtual UClassID getDynamicClassID() const;
+
+protected:
+
+
+
+#if 0
+
+
+    virtual inline bool operator==(const UObject &other) const { return this==&other; }
+    inline bool operator!=(const UObject &other) const { return !operator==(other); }
+
+#endif
+
+};
+
+#ifndef U_HIDE_INTERNAL_API
+#define UOBJECT_DEFINE_RTTI_IMPLEMENTATION(myClass) \
+    UClassID U_EXPORT2 myClass::getStaticClassID() { \
+        static char classID = 0; \
+        return (UClassID)&classID; \
+    } \
+    UClassID myClass::getDynamicClassID() const \
+    { return myClass::getStaticClassID(); }
+
+
+#define UOBJECT_DEFINE_ABSTRACT_RTTI_IMPLEMENTATION(myClass) \
+    UClassID U_EXPORT2 myClass::getStaticClassID() { \
+        static char classID = 0; \
+        return (UClassID)&classID; \
+    }
+
+#endif  /* U_HIDE_INTERNAL_API */
+
+U_NAMESPACE_END
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif

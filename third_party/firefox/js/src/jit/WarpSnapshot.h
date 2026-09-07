@@ -1,0 +1,645 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef jit_WarpSnapshot_h
+#define jit_WarpSnapshot_h
+
+#include "mozilla/LinkedList.h"
+#include "mozilla/Variant.h"
+
+#include "builtin/ModuleObject.h"
+#include "jit/JitAllocPolicy.h"
+#include "jit/JitContext.h"
+#include "jit/JitZone.h"
+#include "jit/OffthreadSnapshot.h"
+#include "jit/TypeData.h"
+#include "vm/EnvironmentObject.h"
+#include "vm/FunctionFlags.h"  // js::FunctionFlags
+
+namespace js {
+
+class ArgumentsObject;
+class CallObject;
+class GlobalLexicalEnvironmentObject;
+class LexicalEnvironmentObject;
+class ModuleEnvironmentObject;
+class NamedLambdaObject;
+
+namespace jit {
+
+class CacheIRStubInfo;
+class CompileInfo;
+class WarpScriptSnapshot;
+
+#define WARP_OP_SNAPSHOT_LIST(_)        \
+  _(WarpArguments)                      \
+  _(WarpRegExp)                         \
+  _(WarpBuiltinObject)                  \
+  _(WarpGetIntrinsic)                   \
+  _(WarpGetImport)                      \
+  _(WarpRest)                           \
+  _(WarpBindUnqualifiedGName)           \
+  _(WarpVarEnvironment)                 \
+  _(WarpLexicalEnvironment)             \
+  _(WarpClassBodyEnvironment)           \
+  _(WarpBailout)                        \
+  _(WarpCacheIR)                        \
+  _(WarpCacheIRWithShapeList)           \
+  _(WarpCacheIRWithShapeListAndOffsets) \
+  _(WarpInlinedCall)                    \
+  _(WarpPolymorphicTypes)
+
+class WarpOpSnapshot : public TempObject,
+                       public mozilla::LinkedListElement<WarpOpSnapshot> {
+ public:
+  enum class Kind : uint16_t {
+#define DEF_KIND(KIND) KIND,
+    WARP_OP_SNAPSHOT_LIST(DEF_KIND)
+#undef DEF_KIND
+  };
+
+ private:
+  uint32_t offset_ = 0;
+
+  Kind kind_;
+
+ protected:
+  WarpOpSnapshot(Kind kind, uint32_t offset) : offset_(offset), kind_(kind) {}
+
+ public:
+  uint32_t offset() const { return offset_; }
+  Kind kind() const { return kind_; }
+
+  template <typename T>
+  bool is() const {
+    return kind_ == T::ThisKind;
+  }
+
+  template <typename T>
+  const T* as() const {
+    MOZ_ASSERT(is<T>());
+    return static_cast<const T*>(this);
+  }
+
+  template <typename T>
+  T* as() {
+    MOZ_ASSERT(is<T>());
+    return static_cast<T*>(this);
+  }
+
+  void trace(JSTracer* trc);
+
+#ifdef JS_JITSPEW
+  void dump(GenericPrinter& out, JSScript* script) const;
+#endif
+};
+
+using WarpOpSnapshotList = mozilla::LinkedList<WarpOpSnapshot>;
+
+class WarpArguments : public WarpOpSnapshot {
+  OffthreadGCPtr<ArgumentsObject*> templateObj_;
+
+ public:
+  static constexpr Kind ThisKind = Kind::WarpArguments;
+
+  WarpArguments(uint32_t offset, ArgumentsObject* templateObj)
+      : WarpOpSnapshot(ThisKind, offset), templateObj_(templateObj) {}
+  ArgumentsObject* templateObj() const { return templateObj_; }
+
+  void traceData(JSTracer* trc);
+
+#ifdef JS_JITSPEW
+  void dumpData(GenericPrinter& out) const;
+#endif
+};
+
+class WarpRegExp : public WarpOpSnapshot {
+  bool hasShared_;
+
+ public:
+  static constexpr Kind ThisKind = Kind::WarpRegExp;
+
+  WarpRegExp(uint32_t offset, bool hasShared)
+      : WarpOpSnapshot(ThisKind, offset), hasShared_(hasShared) {}
+  bool hasShared() const { return hasShared_; }
+
+  void traceData(JSTracer* trc);
+
+#ifdef JS_JITSPEW
+  void dumpData(GenericPrinter& out) const;
+#endif
+};
+
+class WarpBuiltinObject : public WarpOpSnapshot {
+  OffthreadGCPtr<JSObject*> builtin_;
+
+ public:
+  static constexpr Kind ThisKind = Kind::WarpBuiltinObject;
+
+  WarpBuiltinObject(uint32_t offset, JSObject* builtin)
+      : WarpOpSnapshot(ThisKind, offset), builtin_(builtin) {
+    MOZ_ASSERT(builtin);
+  }
+  JSObject* builtin() const { return builtin_; }
+
+  void traceData(JSTracer* trc);
+
+#ifdef JS_JITSPEW
+  void dumpData(GenericPrinter& out) const;
+#endif
+};
+
+class WarpGetIntrinsic : public WarpOpSnapshot {
+  OffthreadGCPtr<Value> intrinsic_;
+
+ public:
+  static constexpr Kind ThisKind = Kind::WarpGetIntrinsic;
+
+  WarpGetIntrinsic(uint32_t offset, const Value& intrinsic)
+      : WarpOpSnapshot(ThisKind, offset), intrinsic_(intrinsic) {}
+  Value intrinsic() const { return intrinsic_; }
+
+  void traceData(JSTracer* trc);
+
+#ifdef JS_JITSPEW
+  void dumpData(GenericPrinter& out) const;
+#endif
+};
+
+class WarpGetImport : public WarpOpSnapshot {
+  OffthreadGCPtr<ModuleEnvironmentObject*> targetEnv_;
+  uint32_t numFixedSlots_;
+  uint32_t slot_;
+  bool needsLexicalCheck_;
+
+ public:
+  static constexpr Kind ThisKind = Kind::WarpGetImport;
+
+  WarpGetImport(uint32_t offset, ModuleEnvironmentObject* targetEnv,
+                uint32_t numFixedSlots, uint32_t slot, bool needsLexicalCheck)
+      : WarpOpSnapshot(ThisKind, offset),
+        targetEnv_(targetEnv),
+        numFixedSlots_(numFixedSlots),
+        slot_(slot),
+        needsLexicalCheck_(needsLexicalCheck) {}
+  ModuleEnvironmentObject* targetEnv() const { return targetEnv_; }
+  uint32_t numFixedSlots() const { return numFixedSlots_; }
+  uint32_t slot() const { return slot_; }
+  bool needsLexicalCheck() const { return needsLexicalCheck_; }
+
+  void traceData(JSTracer* trc);
+
+#ifdef JS_JITSPEW
+  void dumpData(GenericPrinter& out) const;
+#endif
+};
+
+class WarpBailout : public WarpOpSnapshot {
+ public:
+  static constexpr Kind ThisKind = Kind::WarpBailout;
+
+  explicit WarpBailout(uint32_t offset) : WarpOpSnapshot(ThisKind, offset) {}
+
+  void traceData(JSTracer* trc);
+
+#ifdef JS_JITSPEW
+  void dumpData(GenericPrinter& out) const;
+#endif
+};
+
+class WarpCacheIRBase : public WarpOpSnapshot {
+  OffthreadGCPtr<JitCode*> stubCode_;
+  const CacheIRStubInfo* stubInfo_;
+
+  const uint8_t* stubData_;
+
+ protected:
+  WarpCacheIRBase(Kind kind, uint32_t offset, JitCode* stubCode,
+                  const CacheIRStubInfo* stubInfo, const uint8_t* stubData)
+      : WarpOpSnapshot(kind, offset),
+        stubCode_(stubCode),
+        stubInfo_(stubInfo),
+        stubData_(stubData) {}
+
+  void traceData(JSTracer* trc);
+
+#ifdef JS_JITSPEW
+  void dumpData(GenericPrinter& out) const;
+#endif
+
+ public:
+  const CacheIRStubInfo* stubInfo() const { return stubInfo_; }
+  const uint8_t* stubData() const { return stubData_; }
+};
+
+class WarpCacheIR : public WarpCacheIRBase {
+ public:
+  static constexpr Kind ThisKind = Kind::WarpCacheIR;
+
+  WarpCacheIR(uint32_t offset, JitCode* stubCode,
+              const CacheIRStubInfo* stubInfo, const uint8_t* stubData)
+      : WarpCacheIRBase(ThisKind, offset, stubCode, stubInfo, stubData) {}
+
+  void traceData(JSTracer* trc);
+
+#ifdef JS_JITSPEW
+  void dumpData(GenericPrinter& out) const;
+#endif
+};
+
+class ShapeListSnapshot {
+ public:
+  ShapeListSnapshot() = default;
+
+  void init(size_t index, Shape* shape) {
+    MOZ_ASSERT(shape);
+    shapes_[index].init(shape);
+  }
+  const auto& shapes() const { return shapes_; }
+
+  static bool shouldSnapshot(size_t length) {
+    return length > 0 && length <= NumShapes;
+  }
+
+  void trace(JSTracer* trc) const;
+
+ protected:
+  static constexpr size_t NumShapes = 4;
+  mozilla::Array<OffthreadGCPtr<Shape*>, NumShapes> shapes_{};
+};
+
+class ShapeListWithOffsetsSnapshot : public ShapeListSnapshot {
+ public:
+  ShapeListWithOffsetsSnapshot() = default;
+
+  void init(size_t index, Shape* shape, uint32_t offset) {
+    MOZ_ASSERT(shape);
+    shapes_[index].init(shape);
+    offsets_[index] = offset;
+  }
+
+  const auto& offsets() const { return offsets_; }
+
+ private:
+  mozilla::Array<uint32_t, NumShapes> offsets_{};
+};
+
+class WarpCacheIRWithShapeList : public WarpCacheIRBase {
+  const ShapeListSnapshot shapes_;
+
+ public:
+  static constexpr Kind ThisKind = Kind::WarpCacheIRWithShapeList;
+
+  WarpCacheIRWithShapeList(uint32_t offset, JitCode* stubCode,
+                           const CacheIRStubInfo* stubInfo,
+                           const uint8_t* stubData,
+                           const ShapeListSnapshot& shapes)
+      : WarpCacheIRBase(ThisKind, offset, stubCode, stubInfo, stubData),
+        shapes_(shapes) {}
+
+  void traceData(JSTracer* trc);
+
+#ifdef JS_JITSPEW
+  void dumpData(GenericPrinter& out) const;
+#endif
+
+  const ShapeListSnapshot* shapes() const { return &shapes_; }
+};
+
+class WarpCacheIRWithShapeListAndOffsets : public WarpCacheIRBase {
+  const ShapeListWithOffsetsSnapshot shapes_;
+
+ public:
+  static constexpr Kind ThisKind = Kind::WarpCacheIRWithShapeListAndOffsets;
+
+  WarpCacheIRWithShapeListAndOffsets(uint32_t offset, JitCode* stubCode,
+                                     const CacheIRStubInfo* stubInfo,
+                                     const uint8_t* stubData,
+                                     const ShapeListWithOffsetsSnapshot& shapes)
+      : WarpCacheIRBase(ThisKind, offset, stubCode, stubInfo, stubData),
+        shapes_(shapes) {}
+
+  void traceData(JSTracer* trc);
+
+#ifdef JS_JITSPEW
+  void dumpData(GenericPrinter& out) const;
+#endif
+
+  const ShapeListWithOffsetsSnapshot* shapes() const { return &shapes_; }
+};
+
+class WarpObjectField {
+  static constexpr uintptr_t NurseryIndexTag = 0x1;
+  static constexpr uintptr_t NurseryIndexShift = 1;
+
+  uintptr_t data_;
+
+  explicit WarpObjectField(uintptr_t data) : data_(data) {}
+
+ public:
+  static WarpObjectField fromData(uintptr_t data) {
+    return WarpObjectField(data);
+  }
+  static WarpObjectField fromObject(JSObject* obj) {
+    return WarpObjectField(uintptr_t(obj));
+  }
+  static WarpObjectField fromNurseryIndex(uint32_t index) {
+    uintptr_t data = (uintptr_t(index) << NurseryIndexShift) | NurseryIndexTag;
+    return WarpObjectField(data);
+  }
+
+  uintptr_t rawData() const { return data_; }
+
+  bool isNurseryIndex() const { return (data_ & NurseryIndexTag) != 0; }
+
+  uint32_t toNurseryIndex() const {
+    MOZ_ASSERT(isNurseryIndex());
+    return data_ >> NurseryIndexShift;
+  }
+
+  JSObject* toObject() const {
+    MOZ_ASSERT(!isNurseryIndex());
+    return reinterpret_cast<JSObject*>(data_);
+  }
+};
+
+class WarpInlinedCall : public WarpOpSnapshot {
+  WarpCacheIR* cacheIRSnapshot_;
+
+  WarpScriptSnapshot* scriptSnapshot_;
+  CompileInfo* info_;
+
+ public:
+  static constexpr Kind ThisKind = Kind::WarpInlinedCall;
+
+  WarpInlinedCall(uint32_t offset, WarpCacheIR* cacheIRSnapshot,
+                  WarpScriptSnapshot* scriptSnapshot, CompileInfo* info)
+      : WarpOpSnapshot(ThisKind, offset),
+        cacheIRSnapshot_(cacheIRSnapshot),
+        scriptSnapshot_(scriptSnapshot),
+        info_(info) {}
+
+  WarpCacheIR* cacheIRSnapshot() const { return cacheIRSnapshot_; }
+  WarpScriptSnapshot* scriptSnapshot() const { return scriptSnapshot_; }
+  CompileInfo* info() const { return info_; }
+
+  void traceData(JSTracer* trc);
+
+#ifdef JS_JITSPEW
+  void dumpData(GenericPrinter& out) const;
+#endif
+};
+
+class WarpPolymorphicTypes : public WarpOpSnapshot {
+  TypeDataList list_;
+
+ public:
+  static constexpr Kind ThisKind = Kind::WarpPolymorphicTypes;
+
+  WarpPolymorphicTypes(uint32_t offset, TypeDataList list)
+      : WarpOpSnapshot(ThisKind, offset), list_(list) {}
+
+  const TypeDataList& list() const { return list_; }
+
+  void traceData(JSTracer* trc);
+
+#ifdef JS_JITSPEW
+  void dumpData(GenericPrinter& out) const;
+#endif
+};
+
+class WarpRest : public WarpOpSnapshot {
+  OffthreadGCPtr<Shape*> shape_;
+
+ public:
+  static constexpr Kind ThisKind = Kind::WarpRest;
+
+  WarpRest(uint32_t offset, Shape* shape)
+      : WarpOpSnapshot(ThisKind, offset), shape_(shape) {}
+
+  Shape* shape() const { return shape_; }
+
+  void traceData(JSTracer* trc);
+
+#ifdef JS_JITSPEW
+  void dumpData(GenericPrinter& out) const;
+#endif
+};
+
+class WarpBindUnqualifiedGName : public WarpOpSnapshot {
+  OffthreadGCPtr<JSObject*> globalEnv_;
+
+ public:
+  static constexpr Kind ThisKind = Kind::WarpBindUnqualifiedGName;
+
+  WarpBindUnqualifiedGName(uint32_t offset, JSObject* globalEnv)
+      : WarpOpSnapshot(ThisKind, offset), globalEnv_(globalEnv) {}
+
+  JSObject* globalEnv() const { return globalEnv_; }
+
+  void traceData(JSTracer* trc);
+
+#ifdef JS_JITSPEW
+  void dumpData(GenericPrinter& out) const;
+#endif
+};
+
+class WarpVarEnvironment : public WarpOpSnapshot {
+  OffthreadGCPtr<VarEnvironmentObject*> templateObj_;
+
+ public:
+  static constexpr Kind ThisKind = Kind::WarpVarEnvironment;
+
+  WarpVarEnvironment(uint32_t offset, VarEnvironmentObject* templateObj)
+      : WarpOpSnapshot(ThisKind, offset), templateObj_(templateObj) {}
+
+  VarEnvironmentObject* templateObj() const { return templateObj_; }
+
+  void traceData(JSTracer* trc);
+
+#ifdef JS_JITSPEW
+  void dumpData(GenericPrinter& out) const;
+#endif
+};
+
+class WarpLexicalEnvironment : public WarpOpSnapshot {
+  OffthreadGCPtr<BlockLexicalEnvironmentObject*> templateObj_;
+
+ public:
+  static constexpr Kind ThisKind = Kind::WarpLexicalEnvironment;
+
+  WarpLexicalEnvironment(uint32_t offset,
+                         BlockLexicalEnvironmentObject* templateObj)
+      : WarpOpSnapshot(ThisKind, offset), templateObj_(templateObj) {}
+
+  BlockLexicalEnvironmentObject* templateObj() const { return templateObj_; }
+
+  void traceData(JSTracer* trc);
+
+#ifdef JS_JITSPEW
+  void dumpData(GenericPrinter& out) const;
+#endif
+};
+
+class WarpClassBodyEnvironment : public WarpOpSnapshot {
+  OffthreadGCPtr<ClassBodyLexicalEnvironmentObject*> templateObj_;
+
+ public:
+  static constexpr Kind ThisKind = Kind::WarpClassBodyEnvironment;
+
+  WarpClassBodyEnvironment(uint32_t offset,
+                           ClassBodyLexicalEnvironmentObject* templateObj)
+      : WarpOpSnapshot(ThisKind, offset), templateObj_(templateObj) {}
+
+  ClassBodyLexicalEnvironmentObject* templateObj() const {
+    return templateObj_;
+  }
+
+  void traceData(JSTracer* trc);
+
+#ifdef JS_JITSPEW
+  void dumpData(GenericPrinter& out) const;
+#endif
+};
+
+struct NoEnvironment {};
+using ConstantObjectEnvironment = OffthreadGCPtr<JSObject*>;
+struct FunctionEnvironment {
+  OffthreadGCPtr<CallObject*> callObjectTemplate;
+  OffthreadGCPtr<NamedLambdaObject*> namedLambdaTemplate;
+  gc::Heap initialHeap;
+
+ public:
+  FunctionEnvironment(CallObject* callObjectTemplate,
+                      NamedLambdaObject* namedLambdaTemplate,
+                      gc::Heap initialHeap)
+      : callObjectTemplate(callObjectTemplate),
+        namedLambdaTemplate(namedLambdaTemplate),
+        initialHeap(initialHeap) {}
+};
+
+using WarpEnvironment =
+    mozilla::Variant<NoEnvironment, ConstantObjectEnvironment,
+                     FunctionEnvironment>;
+
+class WarpScriptSnapshot
+    : public TempObject,
+      public mozilla::LinkedListElement<WarpScriptSnapshot> {
+  OffthreadGCPtr<JSScript*> script_;
+  WarpEnvironment environment_;
+  WarpOpSnapshotList opSnapshots_;
+
+  OffthreadGCPtr<ModuleObject*> moduleObject_;
+
+  bool isArrowFunction_;
+
+ public:
+  WarpScriptSnapshot(JSScript* script, const WarpEnvironment& env,
+                     WarpOpSnapshotList&& opSnapshots,
+                     ModuleObject* moduleObject);
+
+  JSScript* script() const { return script_; }
+  const WarpEnvironment& environment() const { return environment_; }
+  const WarpOpSnapshotList& opSnapshots() const { return opSnapshots_; }
+  ModuleObject* moduleObject() const { return moduleObject_; }
+
+  bool isArrowFunction() const { return isArrowFunction_; }
+
+  void trace(JSTracer* trc);
+
+#ifdef JS_JITSPEW
+  void dump(GenericPrinter& out) const;
+#endif
+};
+
+class WarpBailoutInfo {
+  bool failedBoundsCheck_ = false;
+
+  bool failedLexicalCheck_ = false;
+
+ public:
+  bool failedBoundsCheck() const { return failedBoundsCheck_; }
+  void setFailedBoundsCheck() { failedBoundsCheck_ = true; }
+
+  bool failedLexicalCheck() const { return failedLexicalCheck_; }
+  void setFailedLexicalCheck() { failedLexicalCheck_ = true; }
+};
+
+using WarpScriptSnapshotList = mozilla::LinkedList<WarpScriptSnapshot>;
+
+using WarpZoneStubsSnapshot = JitZone::Stubs<JitCode*>;
+
+class WarpSnapshot : public TempObject {
+  WarpScriptSnapshotList scriptSnapshots_;
+
+  const WarpZoneStubsSnapshot zoneStubs_;
+
+  OffthreadGCPtr<GlobalLexicalEnvironmentObject*> globalLexicalEnv_;
+  OffthreadGCPtr<JSObject*> globalLexicalEnvThis_;
+
+  const WarpBailoutInfo bailoutInfo_;
+
+  using NurseryObjectVector = Vector<JSObject*, 0, JitAllocPolicy>;
+  NurseryObjectVector nurseryObjects_;
+
+  using NurseryValueVector = mozilla::Vector<Value, 0, JitAllocPolicy>;
+  NurseryValueVector nurseryValues_;
+
+#ifdef JS_CACHEIR_SPEW
+  bool needsFinalWarmUpCount_ = false;
+#endif
+
+#ifdef DEBUG
+  mozilla::HashNumber icHash_ = 0;
+#endif
+
+ public:
+  explicit WarpSnapshot(JSContext* cx, TempAllocator& alloc,
+                        WarpScriptSnapshotList&& scriptSnapshots,
+                        const WarpZoneStubsSnapshot& zoneStubs,
+                        const WarpBailoutInfo& bailoutInfo,
+                        bool recordWarmUpCount);
+
+  WarpScriptSnapshot* rootScript() { return scriptSnapshots_.getFirst(); }
+  const WarpScriptSnapshotList& scripts() const { return scriptSnapshots_; }
+
+  JitCode* getZoneStub(JitZone::StubKind kind) const {
+    MOZ_ASSERT(zoneStubs_[kind]);
+    return zoneStubs_[kind];
+  }
+
+  GlobalLexicalEnvironmentObject* globalLexicalEnv() const {
+    return globalLexicalEnv_;
+  }
+  JSObject* globalLexicalEnvThis() const { return globalLexicalEnvThis_; }
+
+  void trace(JSTracer* trc);
+
+  const WarpBailoutInfo& bailoutInfo() const { return bailoutInfo_; }
+
+  NurseryObjectVector& nurseryObjects() { return nurseryObjects_; }
+  const NurseryObjectVector& nurseryObjects() const { return nurseryObjects_; }
+
+  NurseryValueVector& nurseryValues() { return nurseryValues_; }
+  const NurseryValueVector& nurseryValues() const { return nurseryValues_; }
+
+#ifdef DEBUG
+  mozilla::HashNumber icHash() const { return icHash_; }
+  void setICHash(mozilla::HashNumber hash) { icHash_ = hash; }
+#endif
+
+#ifdef JS_JITSPEW
+  void dump() const;
+  void dump(GenericPrinter& out) const;
+#endif
+
+#ifdef JS_CACHEIR_SPEW
+  bool needsFinalWarmUpCount() const { return needsFinalWarmUpCount_; }
+#endif
+};
+
+}  
+}  
+
+#endif /* jit_WarpSnapshot_h */

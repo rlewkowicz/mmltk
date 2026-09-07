@@ -1,0 +1,89 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_serviceworkershutdownblocker_h_
+#define mozilla_dom_serviceworkershutdownblocker_h_
+
+#include "ServiceWorkerShutdownState.h"
+#include "mozilla/HashTable.h"
+#include "mozilla/InitializedOnce.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/NotNull.h"
+#include "nsCOMPtr.h"
+#include "nsIAsyncShutdown.h"
+#include "nsISupportsImpl.h"
+#include "nsITimer.h"
+
+namespace mozilla::dom {
+
+class ServiceWorkerManager;
+
+class ServiceWorkerShutdownBlocker final : public nsIAsyncShutdownBlocker,
+                                           public nsITimerCallback,
+                                           public nsINamed {
+ public:
+  using Progress = ServiceWorkerShutdownState::Progress;
+  static const uint32_t kInvalidShutdownStateId = 0;
+
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIASYNCSHUTDOWNBLOCKER
+  NS_DECL_NSITIMERCALLBACK
+  NS_DECL_NSINAMED
+
+  static already_AddRefed<ServiceWorkerShutdownBlocker> CreateAndRegisterOn(
+      nsIAsyncShutdownClient& aShutdownBarrier,
+      ServiceWorkerManager& aServiceWorkerManager);
+
+  void WaitOnPromise(GenericNonExclusivePromise* aPromise,
+                     uint32_t aShutdownStateId);
+
+  void StopAcceptingPromises();
+
+  uint32_t CreateShutdownState();
+
+  void ReportShutdownProgress(uint32_t aShutdownStateId, Progress aProgress);
+
+ private:
+  explicit ServiceWorkerShutdownBlocker(
+      ServiceWorkerManager& aServiceWorkerManager);
+
+  ~ServiceWorkerShutdownBlocker();
+
+  void MaybeUnblockShutdown();
+
+  void UnblockShutdown();
+
+  uint32_t PromiseSettled();
+
+  bool IsAcceptingPromises() const;
+
+  uint32_t GetPendingPromises() const;
+
+  void MaybeInitUnblockShutdownTimer();
+
+  struct AcceptingPromises {
+    uint32_t mPendingPromises = 0;
+  };
+
+  struct NotAcceptingPromises {
+    explicit NotAcceptingPromises(AcceptingPromises aPreviousState);
+
+    uint32_t mPendingPromises = 0;
+  };
+
+  Variant<AcceptingPromises, NotAcceptingPromises> mState;
+
+  nsCOMPtr<nsIAsyncShutdownClient> mShutdownClient;
+
+  HashMap<uint32_t, ServiceWorkerShutdownState> mShutdownStates;
+
+  nsCOMPtr<nsITimer> mTimer;
+  LazyInitializedOnceEarlyDestructible<
+      const NotNull<RefPtr<ServiceWorkerManager>>>
+      mServiceWorkerManager;
+};
+
+}  
+
+#endif  // mozilla_dom_serviceworkershutdownblocker_h_

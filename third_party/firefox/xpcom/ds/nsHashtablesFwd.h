@@ -1,0 +1,58 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef XPCOM_DS_NSHASHTABLESFWD_H_
+#define XPCOM_DS_NSHASHTABLESFWD_H_
+
+#include "mozilla/Attributes.h"
+
+struct PLDHashEntryHdr;
+
+template <class T>
+class MOZ_IS_REFPTR nsCOMPtr;
+
+template <class T>
+class MOZ_IS_REFPTR RefPtr;
+
+template <class EntryType>
+class MOZ_NEEDS_NO_VTABLE_TYPE nsTHashtable;
+
+template <class DataType, class UserDataType>
+class nsDefaultConverter;
+
+template <class KeyClass, class DataType, class UserDataType,
+          class Converter = nsDefaultConverter<DataType, UserDataType>>
+class nsBaseHashtable;
+
+template <class KeyClass, class T>
+class nsClassHashtable;
+
+template <class KeyClass, class PtrType>
+class nsRefCountedHashtable;
+
+template <class KeyClass, class Interface>
+using nsInterfaceHashtable =
+    nsRefCountedHashtable<KeyClass, nsCOMPtr<Interface>>;
+
+template <class KeyClass, class ClassType>
+using nsRefPtrHashtable = nsRefCountedHashtable<KeyClass, RefPtr<ClassType>>;
+
+namespace mozilla::detail {
+template <class KeyType, class = void>
+struct nsKeyClass;
+}  
+
+template <class KeyType, class DataType>
+using nsTHashMap =
+    nsBaseHashtable<typename mozilla::detail::nsKeyClass<KeyType>::type,
+                    DataType, DataType>;
+
+template <class KeyClass>
+class nsTBaseHashSet;
+
+template <class KeyType>
+using nsTHashSet =
+    nsTBaseHashSet<typename mozilla::detail::nsKeyClass<KeyType>::type>;
+
+#endif  // XPCOM_DS_NSHASHTABLESFWD_H_

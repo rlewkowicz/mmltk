@@ -1,0 +1,120 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef xptcall_h_
+#define xptcall_h_
+
+#include "nscore.h"
+#include "nsISupports.h"
+#include "xptinfo.h"
+#include "js/Value.h"
+#include "mozilla/MemoryReporting.h"
+
+struct nsXPTCMiniVariant {
+  union Union {
+    int8_t i8;
+    int16_t i16;
+    int32_t i32;
+    int64_t i64;
+    uint8_t u8;
+    uint16_t u16;
+    uint32_t u32;
+    uint64_t u64;
+    float f;
+    double d;
+    bool b;
+    char c;
+    char16_t wc;
+    void* p;
+  };
+
+  Union val;
+};
+
+static_assert(offsetof(nsXPTCMiniVariant, val) == 0,
+              "nsXPTCMiniVariant must be a thin wrapper");
+
+struct nsXPTCVariant {
+  union ExtendedVal {
+    nsXPTCMiniVariant mini;
+
+    nsID nsid;
+    nsCString nscstr;
+    nsString nsstr;
+    JS::Value jsval;
+    xpt::detail::UntypedTArray array;
+
+    ExtendedVal() = delete;
+    ~ExtendedVal() = delete;
+  };
+
+  union {
+    nsXPTCMiniVariant::Union val;
+
+    ExtendedVal ext;
+  };
+
+  nsXPTType type;
+  uint8_t flags;
+
+  nsXPTCVariant() {
+    memset((void*)this, 0, sizeof(nsXPTCVariant));
+    type = nsXPTType::T_VOID;
+  }
+
+  enum {
+
+    IS_INDIRECT = 0x1,
+  };
+
+  void ClearFlags() { flags = 0; }
+  void SetIndirect() { flags |= IS_INDIRECT; }
+
+  bool IsIndirect() const { return 0 != (flags & IS_INDIRECT); }
+
+  operator nsXPTCMiniVariant&() { return *(nsXPTCMiniVariant*)&val; }
+  operator const nsXPTCMiniVariant&() const {
+    return *(const nsXPTCMiniVariant*)&val;
+  }
+
+  ~nsXPTCVariant() {}
+};
+
+static_assert(offsetof(nsXPTCVariant, val) == offsetof(nsXPTCVariant, ext),
+              "nsXPTCVariant::{ext,val} must have matching offsets");
+
+#define XPT_CHECK_SIZEOF(xpt, type)                                            \
+  static_assert(sizeof(nsXPTCVariant::ExtendedVal) >= sizeof(type),            \
+                "nsXPTCVariant::ext not big enough for " #xpt " (" #type ")"); \
+  static_assert(alignof(nsXPTCVariant::ExtendedVal) >= alignof(type),          \
+                "nsXPTCVariant::ext not aligned enough for " #xpt " (" #type   \
+                ")");
+XPT_FOR_EACH_TYPE(XPT_CHECK_SIZEOF)
+#undef XPT_CHECK_SIZEOF
+
+class nsIXPTCProxy : public nsISupports {
+ public:
+  NS_IMETHOD CallMethod(uint16_t aMethodIndex, const nsXPTMethodInfo* aInfo,
+                        nsXPTCMiniVariant* aParams) = 0;
+};
+
+typedef nsISupports nsISomeInterface;
+
+XPCOM_API(nsresult)
+NS_GetXPTCallStub(REFNSIID aIID, nsIXPTCProxy* aOuter,
+                  nsISomeInterface** aStub);
+
+XPCOM_API(void)
+NS_DestroyXPTCallStub(nsISomeInterface* aStub);
+
+XPCOM_API(size_t)
+NS_SizeOfIncludingThisXPTCallStub(const nsISomeInterface* aStub,
+                                  mozilla::MallocSizeOf aMallocSizeOf);
+
+extern "C" nsresult NS_InvokeByIndex(nsISupports* that, uint32_t methodIndex,
+                                     uint32_t paramCount,
+                                     nsXPTCVariant* params);
+
+#endif /* xptcall_h_ */

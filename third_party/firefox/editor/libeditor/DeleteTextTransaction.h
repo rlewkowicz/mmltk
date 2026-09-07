@@ -1,0 +1,90 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DeleteTextTransaction_h
+#define DeleteTextTransaction_h
+
+#include "DeleteContentTransactionBase.h"
+
+#include "EditorForwards.h"
+
+#include "mozilla/dom/Text.h"
+
+#include "nsCOMPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsID.h"
+#include "nsString.h"
+#include "nscore.h"
+
+namespace mozilla {
+
+class DeleteTextTransaction : public DeleteContentTransactionBase {
+ protected:
+  DeleteTextTransaction(EditorBase& aEditorBase, dom::Text& aTextNode,
+                        uint32_t aOffset, uint32_t aLengthToDelete);
+
+ public:
+  static already_AddRefed<DeleteTextTransaction> MaybeCreate(
+      EditorBase& aEditorBase, dom::Text& aTextNode, uint32_t aOffset,
+      uint32_t aLengthToDelete);
+
+  static already_AddRefed<DeleteTextTransaction>
+  MaybeCreateForPreviousCharacter(EditorBase& aEditorBase, dom::Text& aTextNode,
+                                  uint32_t aOffset);
+  static already_AddRefed<DeleteTextTransaction> MaybeCreateForNextCharacter(
+      EditorBase& aEditorBase, dom::Text& aTextNode, uint32_t aOffset);
+
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(DeleteTextTransaction,
+                                           DeleteContentTransactionBase)
+  NS_IMETHOD QueryInterface(REFNSIID aIID, void** aInstancePtr) override;
+
+  NS_DECL_EDITTRANSACTIONBASE
+  NS_DECL_EDITTRANSACTIONBASE_GETASMETHODS_OVERRIDE(DeleteTextTransaction)
+
+  MOZ_CAN_RUN_SCRIPT NS_IMETHOD RedoTransaction() final;
+
+  EditorDOMPoint SuggestPointToPutCaret() const final;
+
+  dom::Text* GetTextNode() const;
+  uint32_t Offset() const { return mOffset; }
+  uint32_t LengthToDelete() const { return mLengthToDelete; }
+
+  friend std::ostream& operator<<(std::ostream& aStream,
+                                  const DeleteTextTransaction& aTransaction);
+
+ protected:
+  uint32_t mOffset;
+
+  uint32_t mLengthToDelete;
+
+  nsString mDeletedText;
+};
+
+class DeleteTextFromTextNodeTransaction final : public DeleteTextTransaction {
+ public:
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(DeleteTextFromTextNodeTransaction,
+                                           DeleteTextTransaction)
+  NS_IMETHOD QueryInterface(REFNSIID aIID, void** aInstancePtr) override;
+
+  friend std::ostream& operator<<(
+      std::ostream& aStream,
+      const DeleteTextFromTextNodeTransaction& aTransaction);
+
+ private:
+  DeleteTextFromTextNodeTransaction(EditorBase& aEditorBase,
+                                    dom::Text& aTextNode, uint32_t aOffset,
+                                    uint32_t aLengthToDelete);
+  virtual ~DeleteTextFromTextNodeTransaction() = default;
+
+  NS_DECL_EDITTRANSACTIONBASE_GETASMETHODS_OVERRIDE(
+      DeleteTextFromTextNodeTransaction)
+
+  RefPtr<dom::Text> mTextNode;
+
+  friend class DeleteTextTransaction;
+};
+
+}  
+
+#endif  // #ifndef DeleteTextTransaction_h

@@ -1,0 +1,83 @@
+// Copyright 2012 Google Inc. All Rights Reserved.
+// Use of this source code is governed by a BSD-style license
+
+#if !defined(WEBP_ENC_HISTOGRAM_ENC_H_)
+#define WEBP_ENC_HISTOGRAM_ENC_H_
+
+#include "src/enc/backward_references_enc.h"
+#include "src/webp/encode.h"
+#include "src/webp/format_constants.h"
+#include "src/webp/types.h"
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+#define VP8L_NON_TRIVIAL_SYM ((uint16_t)(0xffff))
+
+typedef struct {
+  uint32_t* literal;        
+  uint32_t red[NUM_LITERAL_CODES];
+  uint32_t blue[NUM_LITERAL_CODES];
+  uint32_t alpha[NUM_LITERAL_CODES];
+  uint32_t distance[NUM_DISTANCE_CODES];
+  int palette_code_bits;
+
+  uint16_t trivial_symbol[5];
+  uint64_t bit_cost;        
+  uint64_t costs[5];
+  uint8_t is_used[5];       
+  uint16_t bin_id;          
+} VP8LHistogram;
+
+typedef struct {
+  int size;         
+  int max_size;     
+  VP8LHistogram** histograms;
+} VP8LHistogramSet;
+
+void VP8LHistogramCreate(VP8LHistogram* const h,
+                         const VP8LBackwardRefs* const refs,
+                         int palette_code_bits);
+
+void VP8LHistogramInit(VP8LHistogram* const h, int palette_code_bits,
+                       int init_arrays);
+
+void VP8LHistogramStoreRefs(const VP8LBackwardRefs* const refs,
+                            int (*const distance_modifier)(int, int),
+                            int distance_modifier_arg0,
+                            VP8LHistogram* const histo);
+
+void VP8LFreeHistogram(VP8LHistogram* const histo);
+
+void VP8LFreeHistogramSet(VP8LHistogramSet* const histo);
+
+VP8LHistogramSet* VP8LAllocateHistogramSet(int size, int cache_bits);
+
+void VP8LHistogramSetClear(VP8LHistogramSet* const set);
+
+VP8LHistogram* VP8LAllocateHistogram(int cache_bits);
+
+static WEBP_INLINE int VP8LHistogramNumCodes(int palette_code_bits) {
+  return NUM_LITERAL_CODES + NUM_LENGTH_CODES +
+      ((palette_code_bits > 0) ? (1 << palette_code_bits) : 0);
+}
+
+int VP8LGetHistoImageSymbols(int xsize, int ysize,
+                             const VP8LBackwardRefs* const refs, int quality,
+                             int low_effort, int histogram_bits, int cache_bits,
+                             VP8LHistogramSet* const image_histo,
+                             VP8LHistogram* const tmp_histo,
+                             uint32_t* const histogram_symbols,
+                             const WebPPicture* const pic, int percent_range,
+                             int* const percent);
+
+uint64_t VP8LBitsEntropy(const uint32_t* const array, int n);
+
+uint64_t VP8LHistogramEstimateBits(const VP8LHistogram* const h);
+
+#if defined(__cplusplus)
+}
+#endif
+
+#endif

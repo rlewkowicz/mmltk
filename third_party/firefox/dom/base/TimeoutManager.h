@@ -1,0 +1,246 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_TimeoutManager_h_
+#define mozilla_dom_TimeoutManager_h_
+
+#include "mozilla/dom/Timeout.h"
+#include "mozilla/dom/TimeoutBudgetManager.h"
+#include "nsISerialEventTarget.h"
+#include "nsTArray.h"
+
+class nsIEventTarget;
+class nsITimer;
+class nsIGlobalObject;
+
+namespace mozilla {
+
+namespace dom {
+
+class TimeoutExecutor;
+class TimeoutHandler;
+
+class TimeoutManager final {
+ private:
+  struct Timeouts;
+
+ public:
+  TimeoutManager(nsIGlobalObject& aHandle, uint32_t aMaxIdleDeferMS,
+                 nsISerialEventTarget* aEventTarget,
+                 bool aIsChromeWorker = false);
+  ~TimeoutManager();
+  TimeoutManager(const TimeoutManager& rhs) = delete;
+  void operator=(const TimeoutManager& rhs) = delete;
+
+  bool IsRunningTimeout() const;
+
+  uint32_t GetNestingLevelForWorker() {
+    MOZ_ASSERT(!NS_IsMainThread());
+    return mNestingLevel;
+  }
+  uint32_t GetNestingLevelForWindow() {
+    MOZ_ASSERT(NS_IsMainThread());
+    return sNestingLevel;
+  }
+
+  void SetNestingLevelForWorker(uint32_t aLevel) {
+    MOZ_ASSERT(!NS_IsMainThread());
+    mNestingLevel = aLevel;
+  }
+
+  void SetNestingLevelForWindow(uint32_t aLevel) {
+    MOZ_ASSERT(NS_IsMainThread());
+    sNestingLevel = aLevel;
+  }
+
+  bool HasTimeouts() const {
+    return !mTimeouts.IsEmpty() || !mIdleTimeouts.IsEmpty();
+  }
+
+  nsresult SetTimeout(TimeoutHandler* aHandler, int32_t interval,
+                      bool aIsInterval, mozilla::dom::Timeout::Reason aReason,
+                      int32_t* aReturn);
+  void ClearTimeout(int32_t aTimerId, mozilla::dom::Timeout::Reason aReason);
+  bool ClearTimeoutInternal(int32_t aTimerId,
+                            mozilla::dom::Timeout::Reason aReason,
+                            bool aIsIdle);
+
+  MOZ_CAN_RUN_SCRIPT
+  void RunTimeout(const TimeStamp& aNow, const TimeStamp& aTargetDeadline,
+                  bool aProcessIdle);
+
+  void ClearAllTimeouts();
+  int32_t GetTimeoutId(mozilla::dom::Timeout::Reason aReason);
+
+  TimeDuration CalculateDelay(Timeout* aTimeout) const;
+
+  mozilla::dom::Timeout* BeginRunningTimeout(mozilla::dom::Timeout* aTimeout);
+  void EndRunningTimeout(mozilla::dom::Timeout* aTimeout);
+
+  void UnmarkGrayTimers();
+
+  void Suspend();
+  void Resume();
+  void Freeze();
+  void Thaw();
+
+  void UpdateBackgroundState();
+
+  void OnDocumentLoaded();
+  void StartThrottlingTimeouts();
+
+  template <class Callable>
+  void ForEachUnorderedTimeout(Callable c) {
+    mIdleTimeouts.ForEach(c);
+    mTimeouts.ForEach(c);
+  }
+
+  void BeginSyncOperation();
+  void EndSyncOperation();
+
+  nsIEventTarget* EventTarget();
+
+  bool BudgetThrottlingEnabled(bool aIsBackground) const;
+
+  static const uint32_t InvalidFiringId;
+
+  void SetLoading(bool value);
+
+ private:
+  void MaybeStartThrottleTimeout();
+
+  nsGlobalWindowInner* GetInnerWindow() const;
+
+  bool RescheduleTimeout(mozilla::dom::Timeout* aTimeout,
+                         const TimeStamp& aLastCallbackTime,
+                         const TimeStamp& aCurrentNow);
+
+  void MoveIdleToActive();
+
+  bool IsBackground() const;
+
+  bool IsActive() const;
+
+  uint32_t CreateFiringId();
+
+  void DestroyFiringId(uint32_t aFiringId);
+
+  bool IsValidFiringId(uint32_t aFiringId) const;
+
+  bool IsInvalidFiringId(uint32_t aFiringId) const;
+
+  TimeDuration MinSchedulingDelay() const;
+
+  nsresult MaybeSchedule(const TimeStamp& aWhen,
+                         const TimeStamp& aNow = TimeStamp::Now());
+
+  void RecordExecution(Timeout* aRunningTimeout, Timeout* aTimeout);
+
+  void UpdateBudget(const TimeStamp& aNow,
+                    const TimeDuration& aDuration = TimeDuration());
+
+ private:
+  struct Timeouts {
+    explicit Timeouts(const TimeoutManager& aManager)
+        : mManager(aManager), mTimeouts(new Timeout::TimeoutSet()) {}
+
+    enum class SortBy { TimeRemaining, TimeWhen };
+    void Insert(mozilla::dom::Timeout* aTimeout, SortBy aSortBy);
+
+    const Timeout* GetFirst() const { return mTimeoutList.getFirst(); }
+    Timeout* GetFirst() { return mTimeoutList.getFirst(); }
+    const Timeout* GetLast() const { return mTimeoutList.getLast(); }
+    Timeout* GetLast() { return mTimeoutList.getLast(); }
+    bool IsEmpty() const { return mTimeoutList.isEmpty(); }
+    void InsertFront(Timeout* aTimeout) {
+      aTimeout->SetTimeoutContainer(mTimeouts);
+      mTimeoutList.insertFront(aTimeout);
+    }
+    void InsertBack(Timeout* aTimeout) {
+      aTimeout->SetTimeoutContainer(mTimeouts);
+      mTimeoutList.insertBack(aTimeout);
+    }
+    void Clear() {
+      mTimeouts->Clear();
+      mTimeoutList.clear();
+    }
+
+    template <class Callable>
+    void ForEach(Callable c) {
+      for (Timeout* timeout = GetFirst(); timeout;
+           timeout = timeout->getNext()) {
+        c(timeout);
+      }
+    }
+
+    template <class Callable>
+    bool ForEachAbortable(Callable c) {
+      for (Timeout* timeout = GetFirst(); timeout;
+           timeout = timeout->getNext()) {
+        if (c(timeout)) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    Timeout* GetTimeout(int32_t aTimeoutId, Timeout::Reason aReason) {
+      Timeout::TimeoutIdAndReason key = {aTimeoutId, aReason};
+      return mTimeouts->Get(key);
+    }
+
+   private:
+    const TimeoutManager& mManager;
+
+    using TimeoutList = mozilla::LinkedList<RefPtr<Timeout>>;
+
+    TimeoutList mTimeoutList;
+
+    RefPtr<Timeout::TimeoutSet> mTimeouts;
+  };
+
+  nsIGlobalObject& mGlobalObject;
+  RefPtr<TimeoutExecutor> mExecutor;
+  RefPtr<TimeoutExecutor> mIdleExecutor;
+  Timeouts mTimeouts;
+  int32_t mTimeoutIdCounter;
+  uint32_t mNextFiringId;
+#ifdef DEBUG
+  int64_t mFiringIndex;
+  int64_t mLastFiringIndex;
+#endif
+  AutoTArray<uint32_t, 2> mFiringIdStack;
+  mozilla::dom::Timeout* mRunningTimeout;
+
+  Timeouts mIdleTimeouts;
+
+  int32_t mIdleCallbackTimeoutCounter;
+
+  nsCOMPtr<nsITimer> mThrottleTimeoutsTimer;
+  mozilla::TimeStamp mLastBudgetUpdate;
+  mozilla::TimeDuration mExecutionBudget;
+
+  bool mThrottleTimeouts;
+  bool mThrottleTrackingTimeouts;
+  bool mBudgetThrottleTimeouts;
+
+  bool mIsLoading;
+  nsCOMPtr<nsISerialEventTarget> mEventTarget;
+
+  const bool mIsWindow;
+
+  const bool mIsChromeWorker;
+
+  uint32_t mNestingLevel{0};
+
+  static uint32_t sNestingLevel;
+
+  TimeoutBudgetManager mBudgetManager;
+  static TimeoutBudgetManager sBudgetManager;
+};
+
+}  
+}  
+
+#endif

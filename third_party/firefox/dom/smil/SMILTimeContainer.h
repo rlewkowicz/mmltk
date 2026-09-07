@@ -1,0 +1,139 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SMIL_SMILTIMECONTAINER_H_
+#define DOM_SMIL_SMILTIMECONTAINER_H_
+
+#include "mozilla/EnumSet.h"
+#include "mozilla/SMILMilestone.h"
+#include "mozilla/SMILTypes.h"
+#include "mozilla/dom/SVGAnimationElement.h"
+#include "nsTPriorityQueue.h"
+#include "nscore.h"
+
+namespace mozilla {
+
+class SMILTimeValue;
+
+class SMILTimeContainer {
+ public:
+  SMILTimeContainer() = default;
+  virtual ~SMILTimeContainer();
+
+  enum class PauseType : uint8_t {
+    Begin,     
+    Script,    
+    PageHide,  
+    UserPref,  
+    Image      
+  };
+  using PauseTypes = EnumSet<PauseType>;
+
+  void Begin();
+
+  virtual void Pause(PauseType aType);
+
+  void PauseAt(SMILTime aTime);
+
+  virtual void Resume(PauseType aType);
+
+  bool IsPausedByType(PauseTypes aType) const {
+    return !(mPauseTypes & aType).isEmpty();
+  }
+
+  bool IsPaused() const { return !mPauseTypes.isEmpty(); }
+
+  SMILTime GetCurrentTimeAsSMILTime() const;
+
+  void SetCurrentTime(SMILTime aSeekTo);
+
+  virtual SMILTime GetParentTime() const;
+
+  SMILTimeValue ContainerToParentTime(SMILTime aContainerTime) const;
+
+  SMILTimeValue ParentToContainerTime(SMILTime aParentTime) const;
+
+  void SyncPauseTime();
+
+  void Sample();
+
+  bool NeedsSample() const { return !IsPaused() || mNeedsPauseSample; }
+
+  bool NeedsRewind() const { return mNeedsRewind; }
+  void ClearNeedsRewind() { mNeedsRewind = false; }
+
+  bool IsSeeking() const { return mIsSeeking; }
+  void MarkSeekFinished() { mIsSeeking = false; }
+
+  nsresult SetParent(SMILTimeContainer* aParent);
+
+  void AddMilestone(const SMILMilestone& aMilestone,
+                    mozilla::dom::SVGAnimationElement& aElement);
+
+  void ClearMilestones();
+
+  bool GetNextMilestoneInParentTime(SMILMilestone& aNextMilestone) const;
+
+  using AnimElemArray = nsTArray<RefPtr<dom::SVGAnimationElement>>;
+
+  bool PopMilestoneElementsAtMilestone(const SMILMilestone& aMilestone,
+                                       AnimElemArray& aMatchedElements);
+
+  void Traverse(nsCycleCollectionTraversalCallback* aCallback);
+  void Unlink();
+
+ protected:
+  virtual void DoSample() {}
+
+
+  virtual nsresult AddChild(SMILTimeContainer& aChild) {
+    return NS_ERROR_FAILURE;
+  }
+
+  virtual void RemoveChild(SMILTimeContainer& aChild) {}
+
+  void UpdateCurrentTime();
+
+  void NotifyTimeChange();
+
+  SMILTimeContainer* mParent = nullptr;
+
+  SMILTime mCurrentTime = 0L;
+
+  SMILTime mParentOffset = 0L;
+
+  Maybe<SMILTime> mPauseTime;
+
+  SMILTime mPauseStart = 0L;
+
+  struct MilestoneEntry {
+    MilestoneEntry(const SMILMilestone& aMilestone,
+                   mozilla::dom::SVGAnimationElement& aElement)
+        : mMilestone(aMilestone), mTimebase(&aElement) {}
+
+    bool operator<(const MilestoneEntry& aOther) const {
+      return mMilestone < aOther.mMilestone;
+    }
+
+    SMILMilestone mMilestone;  
+    RefPtr<mozilla::dom::SVGAnimationElement> mTimebase;
+  };
+
+  nsTPriorityQueue<MilestoneEntry> mMilestoneEntries;
+
+  PauseTypes mPauseTypes = PauseType::Begin;
+
+  bool mNeedsPauseSample = false;
+
+  bool mNeedsRewind = false;
+  bool mIsSeeking = false;
+
+#ifdef DEBUG
+  bool mHoldingEntries = false;
+#endif
+};
+
+}  
+
+#endif  // DOM_SMIL_SMILTIMECONTAINER_H_

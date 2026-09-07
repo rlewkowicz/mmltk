@@ -1,0 +1,49 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef MITRE_XMLUTILS_H
+#define MITRE_XMLUTILS_H
+
+#include "nsDependentSubstring.h"
+#include "txCore.h"
+#include "txXPathNode.h"
+
+#define kExpatSeparatorChar 0xFFFF
+
+extern "C" int MOZ_XMLIsLetter(const char* ptr);
+extern "C" int MOZ_XMLIsNCNameChar(const char* ptr);
+
+class nsAtom;
+
+class XMLUtils {
+ public:
+  static nsresult splitExpatName(const char16_t* aExpatName, nsAtom** aPrefix,
+                                 nsAtom** aLocalName, int32_t* aNameSpaceID);
+  static nsresult splitQName(const nsAString& aName, nsAtom** aPrefix,
+                             nsAtom** aLocalName);
+
+  static bool isWhitespace(const char16_t& aChar) {
+    return (aChar <= ' ' &&
+            (aChar == ' ' || aChar == '\r' || aChar == '\n' || aChar == '\t'));
+  }
+
+  static bool isWhitespace(const nsAString& aText);
+
+  static void normalizePIValue(nsAString& attValue);
+
+  static bool isValidQName(const nsAString& aQName, const char16_t** aColon);
+
+  static bool isLetter(char16_t aChar) {
+    return !!MOZ_XMLIsLetter(reinterpret_cast<const char*>(&aChar));
+  }
+
+  static bool isNCNameChar(char16_t aChar) {
+    return !!MOZ_XMLIsNCNameChar(reinterpret_cast<const char*>(&aChar));
+  }
+
+  static bool getXMLSpacePreserve(const txXPathNode& aNode);
+};
+
+#endif

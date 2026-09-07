@@ -1,0 +1,65 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef SEEK_TARGET_H
+#define SEEK_TARGET_H
+
+#include "TimeUnits.h"
+#include "mozilla/DefineEnum.h"
+
+namespace mozilla {
+
+enum class MediaDecoderEventVisibility : int8_t { Observable, Suppressed };
+
+struct SeekTarget {
+  enum Type {
+    Invalid,
+    PrevSyncPoint,
+    Accurate,
+    NextFrame,
+  };
+  MOZ_DEFINE_ENUM_WITH_TOSTRING_AT_CLASS_SCOPE(Track,
+                                               (All, AudioOnly, VideoOnly));
+  SeekTarget()
+      : mTime(media::TimeUnit::Invalid()),
+        mType(SeekTarget::Invalid),
+        mTargetTrack(Track::All) {}
+  SeekTarget(const media::TimeUnit& aTime, Type aType,
+             Track aTrack = Track::All)
+      : mTime(aTime), mType(aType), mTargetTrack(aTrack) {
+    MOZ_ASSERT(mTime.IsValid());
+  }
+  SeekTarget(const SeekTarget& aOther)
+      : mTime(aOther.mTime),
+        mType(aOther.mType),
+        mTargetTrack(aOther.mTargetTrack) {
+    MOZ_ASSERT(mTime.IsValid());
+  }
+  media::TimeUnit GetTime() const {
+    MOZ_ASSERT(mTime.IsValid(), "Invalid SeekTarget");
+    return mTime;
+  }
+  void SetTime(const media::TimeUnit& aTime) {
+    MOZ_ASSERT(aTime.IsValid(), "Invalid SeekTarget destination");
+    mTime = aTime;
+  }
+  void SetType(Type aType) { mType = aType; }
+  bool IsFast() const { return mType == SeekTarget::Type::PrevSyncPoint; }
+  bool IsAccurate() const { return mType == SeekTarget::Type::Accurate; }
+  bool IsNextFrame() const { return mType == SeekTarget::Type::NextFrame; }
+  bool IsVideoOnly() const { return mTargetTrack == Track::VideoOnly; }
+  bool IsAudioOnly() const { return mTargetTrack == Track::AudioOnly; }
+  bool IsAllTracks() const { return mTargetTrack == Track::All; }
+  Type GetType() const { return mType; }
+  Track GetTrack() const { return mTargetTrack; }
+
+ private:
+  media::TimeUnit mTime;
+  Type mType;
+  Track mTargetTrack;
+};
+
+}  
+
+#endif /* SEEK_TARGET_H */

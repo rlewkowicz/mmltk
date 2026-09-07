@@ -1,0 +1,55 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsIWeakReferenceUtils_h_
+#define nsIWeakReferenceUtils_h_
+
+#include "nsCOMPtr.h"
+#include "nsIWeakReference.h"
+
+typedef nsCOMPtr<nsIWeakReference> nsWeakPtr;
+
+
+template <class T, class DestinationType>
+inline nsresult CallQueryReferent(T* aSource, DestinationType** aDestination) {
+  MOZ_ASSERT(aSource, "null parameter");
+  MOZ_ASSERT(aDestination, "null parameter");
+
+  return aSource->QueryReferent(NS_GET_IID(DestinationType),
+                                reinterpret_cast<void**>(aDestination));
+}
+
+inline const nsQueryReferent do_QueryReferent(nsIWeakReference* aRawPtr,
+                                              nsresult* aError = 0) {
+  return nsQueryReferent(aRawPtr, aError);
+}
+
+extern nsIWeakReference* NS_GetWeakReference(nsISupports*,
+                                             nsresult* aResult = 0);
+extern nsIWeakReference* NS_GetWeakReference(nsISupportsWeakReference*,
+                                             nsresult* aResult = 0);
+
+inline already_AddRefed<nsIWeakReference> do_GetWeakReference(
+    nsISupports* aRawPtr, nsresult* aError = 0) {
+  return dont_AddRef(NS_GetWeakReference(aRawPtr, aError));
+}
+
+inline already_AddRefed<nsIWeakReference> do_GetWeakReference(
+    nsISupportsWeakReference* aRawPtr, nsresult* aError = 0) {
+  return dont_AddRef(NS_GetWeakReference(aRawPtr, aError));
+}
+
+inline void do_GetWeakReference(nsIWeakReference* aRawPtr,
+                                nsresult* aError = 0) {
+}
+
+template <class T>
+inline void do_GetWeakReference(already_AddRefed<T>&) {
+}
+
+template <class T>
+inline void do_GetWeakReference(already_AddRefed<T>&, nsresult*) {
+}
+
+#endif

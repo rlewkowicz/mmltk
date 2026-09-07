@@ -1,0 +1,159 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "RubyUtils.h"
+
+#include "nsRubyBaseContainerFrame.h"
+#include "nsRubyBaseFrame.h"
+#include "nsRubyFrame.h"
+#include "nsRubyTextContainerFrame.h"
+#include "nsRubyTextFrame.h"
+
+using namespace mozilla;
+
+NS_DECLARE_FRAME_PROPERTY_SMALL_VALUE(ReservedISize, nscoord)
+
+void RubyUtils::SetReservedISize(nsIFrame* aFrame, nscoord aISize) {
+  MOZ_ASSERT(IsExpandableRubyBox(aFrame));
+  aFrame->SetProperty(ReservedISize(), aISize);
+}
+
+void RubyUtils::ClearReservedISize(nsIFrame* aFrame) {
+  MOZ_ASSERT(IsExpandableRubyBox(aFrame));
+  aFrame->RemoveProperty(ReservedISize());
+}
+
+nscoord RubyUtils::GetReservedISize(nsIFrame* aFrame) {
+  MOZ_ASSERT(IsExpandableRubyBox(aFrame));
+  return aFrame->GetProperty(ReservedISize());
+}
+
+AutoRubyTextContainerArray::AutoRubyTextContainerArray(
+    nsRubyBaseContainerFrame* aBaseContainer) {
+  for (nsIFrame* frame = aBaseContainer->GetNextSibling();
+       frame && frame->IsRubyTextContainerFrame();
+       frame = frame->GetNextSibling()) {
+    AppendElement(static_cast<nsRubyTextContainerFrame*>(frame));
+  }
+}
+
+nsIFrame* RubyColumn::Iterator::operator*() const {
+  nsIFrame* frame;
+  if (mIndex == -1) {
+    frame = mColumn.mBaseFrame;
+  } else {
+    frame = mColumn.mTextFrames[mIndex];
+  }
+  MOZ_ASSERT(frame, "Frame here cannot be null");
+  return frame;
+}
+
+void RubyColumn::Iterator::SkipUntilExistingFrame() {
+  if (mIndex == -1) {
+    if (mColumn.mBaseFrame) {
+      return;
+    }
+    ++mIndex;
+  }
+  int32_t numTextFrames = mColumn.mTextFrames.Length();
+  for (; mIndex < numTextFrames; ++mIndex) {
+    if (mColumn.mTextFrames[mIndex]) {
+      break;
+    }
+  }
+}
+
+RubySegmentEnumerator::RubySegmentEnumerator(nsRubyFrame* aRubyFrame) {
+  nsIFrame* frame = aRubyFrame->PrincipalChildList().FirstChild();
+  MOZ_ASSERT(!frame || frame->IsRubyBaseContainerFrame());
+  mBaseContainer = static_cast<nsRubyBaseContainerFrame*>(frame);
+}
+
+void RubySegmentEnumerator::Next() {
+  MOZ_ASSERT(mBaseContainer);
+  nsIFrame* frame = mBaseContainer->GetNextSibling();
+  while (frame && !frame->IsRubyBaseContainerFrame()) {
+    frame = frame->GetNextSibling();
+  }
+  mBaseContainer = static_cast<nsRubyBaseContainerFrame*>(frame);
+}
+
+RubyColumnEnumerator::RubyColumnEnumerator(
+    nsRubyBaseContainerFrame* aBaseContainer,
+    const AutoRubyTextContainerArray& aTextContainers)
+    : mAtIntraLevelWhitespace(false) {
+  const uint32_t rtcCount = aTextContainers.Length();
+  mFrames.SetCapacity(rtcCount + 1);
+
+  nsIFrame* rbFrame = aBaseContainer->PrincipalChildList().FirstChild();
+  MOZ_ASSERT(!rbFrame || rbFrame->IsRubyBaseFrame());
+  mFrames.AppendElement(static_cast<nsRubyContentFrame*>(rbFrame));
+  for (uint32_t i = 0; i < rtcCount; i++) {
+    nsRubyTextContainerFrame* container = aTextContainers[i];
+    nsIFrame* rtFrame = !container->IsSpanContainer()
+                            ? container->PrincipalChildList().FirstChild()
+                            : nullptr;
+    MOZ_ASSERT(!rtFrame || rtFrame->IsRubyTextFrame());
+    mFrames.AppendElement(static_cast<nsRubyContentFrame*>(rtFrame));
+  }
+
+  for (uint32_t i = 0, iend = mFrames.Length(); i < iend; i++) {
+    nsRubyContentFrame* frame = mFrames[i];
+    if (frame && frame->IsIntraLevelWhitespace()) {
+      mAtIntraLevelWhitespace = true;
+      break;
+    }
+  }
+}
+
+void RubyColumnEnumerator::Next() {
+  bool advancingToIntraLevelWhitespace = false;
+  for (uint32_t i = 0, iend = mFrames.Length(); i < iend; i++) {
+    nsRubyContentFrame* frame = mFrames[i];
+    if (frame &&
+        (!mAtIntraLevelWhitespace || frame->IsIntraLevelWhitespace())) {
+      nsIFrame* nextSibling = frame->GetNextSibling();
+      MOZ_ASSERT(!nextSibling || nextSibling->Type() == frame->Type(),
+                 "Frame type should be identical among a level");
+      mFrames[i] = frame = static_cast<nsRubyContentFrame*>(nextSibling);
+      if (!advancingToIntraLevelWhitespace && frame &&
+          frame->IsIntraLevelWhitespace()) {
+        advancingToIntraLevelWhitespace = true;
+      }
+    }
+  }
+  MOZ_ASSERT(!advancingToIntraLevelWhitespace || !mAtIntraLevelWhitespace,
+             "Should never have adjacent intra-level whitespace columns");
+  mAtIntraLevelWhitespace = advancingToIntraLevelWhitespace;
+}
+
+bool RubyColumnEnumerator::AtEnd() const {
+  for (uint32_t i = 0, iend = mFrames.Length(); i < iend; i++) {
+    if (mFrames[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+nsRubyContentFrame* RubyColumnEnumerator::GetFrameAtLevel(
+    uint32_t aIndex) const {
+  nsRubyContentFrame* frame = mFrames[aIndex];
+  return !mAtIntraLevelWhitespace || (frame && frame->IsIntraLevelWhitespace())
+             ? frame
+             : nullptr;
+}
+
+void RubyColumnEnumerator::GetColumn(RubyColumn& aColumn) const {
+  nsRubyContentFrame* rbFrame = GetFrameAtLevel(0);
+  MOZ_ASSERT(!rbFrame || rbFrame->IsRubyBaseFrame());
+  aColumn.mBaseFrame = static_cast<nsRubyBaseFrame*>(rbFrame);
+  aColumn.mTextFrames.ClearAndRetainStorage();
+  for (uint32_t i = 1, iend = mFrames.Length(); i < iend; i++) {
+    nsRubyContentFrame* rtFrame = GetFrameAtLevel(i);
+    MOZ_ASSERT(!rtFrame || rtFrame->IsRubyTextFrame());
+    aColumn.mTextFrames.AppendElement(static_cast<nsRubyTextFrame*>(rtFrame));
+  }
+  aColumn.mIsIntraLevelWhitespace = mAtIntraLevelWhitespace;
+}

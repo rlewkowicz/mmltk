@@ -1,0 +1,70 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/ErrorNames.h"
+#include "nsString.h"
+#include "prerror.h"
+#include "MainThreadUtils.h"
+
+#include "ErrorNamesInternal.h"
+
+namespace mozilla {
+
+const char* GetStaticErrorName(nsresult rv) { return GetErrorNameInternal(rv); }
+
+void GetErrorName(nsresult rv, nsACString& name) {
+  if (const char* errorName = GetErrorNameInternal(rv)) {
+    name.AssignASCII(errorName);
+    return;
+  }
+
+  bool isSecurityError = NS_ERROR_GET_MODULE(rv) == NS_ERROR_MODULE_SECURITY;
+
+  MOZ_ASSERT(isSecurityError);
+
+  if (NS_SUCCEEDED(rv)) {
+    name.AssignLiteral("NS_ERROR_GENERATE_SUCCESS(");
+  } else {
+    name.AssignLiteral("NS_ERROR_GENERATE_FAILURE(");
+  }
+
+  if (isSecurityError) {
+    name.AppendLiteral("NS_ERROR_MODULE_SECURITY");
+  } else {
+    name.AppendInt(NS_ERROR_GET_MODULE(rv));
+  }
+
+  name.AppendLiteral(", ");
+
+  const char* nsprName = nullptr;
+  if (isSecurityError && NS_IsMainThread()) {
+    PRErrorCode nsprCode = -1 * static_cast<PRErrorCode>(NS_ERROR_GET_CODE(rv));
+    nsprName = PR_ErrorToName(nsprCode);
+
+    MOZ_ASSERT(nsprName);
+  }
+
+  if (nsprName) {
+    name.AppendASCII(nsprName);
+  } else {
+    name.AppendInt(NS_ERROR_GET_CODE(rv));
+  }
+
+  name.AppendLiteral(")");
+}
+
+}  
+
+nsCString format_as(nsresult aErr) {
+  nsAutoCString name;
+  mozilla::GetErrorName(aErr, name);
+  return name;
+}
+
+extern "C" {
+
+void Gecko_GetErrorName(nsresult aRv, nsACString& aName) {
+  mozilla::GetErrorName(aRv, aName);
+}
+}

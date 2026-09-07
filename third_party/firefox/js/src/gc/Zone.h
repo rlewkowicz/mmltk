@@ -1,0 +1,897 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef gc_Zone_h
+#define gc_Zone_h
+
+#include "mozilla/Array.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+#include "mozilla/LinkedList.h"
+#include "mozilla/MemoryReporting.h"
+#include "mozilla/PodOperations.h"
+#include "mozilla/TimeStamp.h"
+
+#include <array>
+#include <bit>
+
+#include "jstypes.h"
+
+#include "ds/Bitmap.h"
+#include "ds/SlimLinkedList.h"
+#include "gc/ArenaList.h"
+#include "gc/Barrier.h"
+#include "gc/BufferAllocator.h"
+#include "gc/ChunkPool.h"
+#include "gc/FinalizationObservers.h"
+#include "gc/FindSCCs.h"
+#include "gc/GCMarker.h"
+#include "gc/NurseryAwareHashMap.h"
+#include "gc/Policy.h"
+#include "gc/Pretenuring.h"
+#include "gc/Statistics.h"
+#include "gc/WeakMap.h"
+#include "gc/ZoneAllocator.h"
+#include "js/GCHashTable.h"
+#include "js/Vector.h"
+#include "vm/AtomsTable.h"
+#include "vm/InvalidatingFuse.h"
+#include "vm/JSObject.h"
+#include "vm/JSScript.h"
+#include "vm/ObjectFuse.h"
+#include "vm/ShapeZone.h"
+
+namespace js {
+
+class AutoLockGC;
+class DebugScriptMap;
+class RegExpZone;
+class WeakRefObject;
+
+namespace jit {
+class JitZone;
+}  
+
+namespace gc {
+
+class FinalizationObservers;
+class ZoneList;
+
+using ZoneComponentFinder = ComponentFinder<JS::Zone>;
+
+struct UniqueIdGCPolicy {
+  static bool traceWeak(JSTracer* trc, Cell** keyp, uint64_t* valuep);
+};
+
+using UniqueIdMap = GCHashMap<Cell*, uint64_t, PointerHasher<Cell*>,
+                              SystemAllocPolicy, UniqueIdGCPolicy>;
+
+template <typename T>
+class ZoneAllCellIter;
+
+template <typename T>
+class ZoneCellIter;
+
+#ifdef JS_GC_ZEAL
+
+class MissingAllocSites {
+ public:
+  using SiteMap = JS::GCHashMap<uint32_t, UniquePtr<AllocSite>,
+                                DefaultHasher<uint32_t>, SystemAllocPolicy>;
+
+  using ScriptMap = JS::GCHashMap<WeakHeapPtr<JSScript*>, SiteMap,
+                                  StableCellHasher<WeakHeapPtr<JSScript*>>,
+                                  SystemAllocPolicy>;
+  JS::WeakCache<ScriptMap> scriptMap;
+
+  explicit MissingAllocSites(JS::Zone* zone) : scriptMap(zone) {}
+};
+
+#endif  // JS_GC_ZEAL
+
+}  
+
+using StringWrapperMap =
+    NurseryAwareHashMap<JSString*, JSString*, ZoneAllocPolicy,
+                        DuplicatesPossible>;
+
+class MOZ_NON_TEMPORARY_CLASS ExternalStringCache {
+  static const size_t NumEntries = 4;
+  mozilla::Array<JSInlineString*, NumEntries> inlineLatin1Entries_;
+  mozilla::Array<JSLinearString*, NumEntries> entries_;
+
+ public:
+  ExternalStringCache() { purge(); }
+
+  ExternalStringCache(const ExternalStringCache&) = delete;
+  void operator=(const ExternalStringCache&) = delete;
+
+  void purge() {
+    inlineLatin1Entries_ = {};
+    entries_ = {};
+  }
+
+  MOZ_ALWAYS_INLINE JSLinearString* lookup(const JS::Latin1Char* chars,
+                                           size_t len) const;
+  MOZ_ALWAYS_INLINE JSLinearString* lookup(const char16_t* chars,
+                                           size_t len) const;
+  MOZ_ALWAYS_INLINE void put(JSLinearString* s);
+
+  MOZ_ALWAYS_INLINE JSInlineString* lookupInlineLatin1(
+      const JS::Latin1Char* chars, size_t len) const;
+  MOZ_ALWAYS_INLINE JSInlineString* lookupInlineLatin1(const char16_t* chars,
+                                                       size_t len) const;
+  MOZ_ALWAYS_INLINE void putInlineLatin1(JSInlineString* s);
+
+ private:
+  template <typename CharT>
+  MOZ_ALWAYS_INLINE JSLinearString* lookupImpl(const CharT* chars,
+                                               size_t len) const;
+  template <typename CharT>
+  MOZ_ALWAYS_INLINE JSInlineString* lookupInlineLatin1Impl(const CharT* chars,
+                                                           size_t len) const;
+};
+
+class MOZ_NON_TEMPORARY_CLASS FunctionToStringCache {
+  struct Entry {
+    BaseScript* script;
+    JSString* string;
+
+    void set(BaseScript* scriptArg, JSString* stringArg) {
+      script = scriptArg;
+      string = stringArg;
+    }
+  };
+  static const size_t NumEntries = 2;
+  mozilla::Array<Entry, NumEntries> entries_;
+
+ public:
+  FunctionToStringCache() { purge(); }
+
+  FunctionToStringCache(const FunctionToStringCache&) = delete;
+  void operator=(const FunctionToStringCache&) = delete;
+
+  void purge() { mozilla::PodArrayZero(entries_); }
+
+  MOZ_ALWAYS_INLINE JSString* lookup(BaseScript* script) const;
+  MOZ_ALWAYS_INLINE void put(BaseScript* script, JSString* string);
+};
+
+class HashAndLength {
+ public:
+  MOZ_ALWAYS_INLINE explicit HashAndLength(uint64_t initialValue = unsetValue())
+      : mHashAndLength(initialValue) {}
+  MOZ_ALWAYS_INLINE HashAndLength(HashNumber hash, uint32_t length)
+      : mHashAndLength(uint64FromHashAndLength(hash, length)) {}
+
+  void MOZ_ALWAYS_INLINE set(HashNumber hash, uint32_t length) {
+    mHashAndLength = uint64FromHashAndLength(hash, length);
+  }
+
+  constexpr MOZ_ALWAYS_INLINE HashNumber hash() const {
+    return hashFromUint64(mHashAndLength);
+  }
+  constexpr MOZ_ALWAYS_INLINE uint32_t length() const {
+    return lengthFromUint64(mHashAndLength);
+  }
+
+  constexpr MOZ_ALWAYS_INLINE bool isEqual(HashNumber hash,
+                                           uint32_t length) const {
+    return mHashAndLength == uint64FromHashAndLength(hash, length);
+  }
+
+  static constexpr bool staticChecks() {
+    std::array<HashNumber, 5> hashes{0x00000000, 0xffffffff, 0xf0f0f0f0,
+                                     0x0f0f0f0f, 0x73737373};
+    std::array<uint32_t, 6> lengths{0, 1, 2, 3, 11, 56};
+
+    for (const HashNumber hash : hashes) {
+      for (const uint32_t length : lengths) {
+        const uint64_t lengthAndHash = uint64FromHashAndLength(hash, length);
+        if (hashFromUint64(lengthAndHash) != hash) {
+          return false;
+        }
+        if (lengthFromUint64(lengthAndHash) != length) {
+          return false;
+        }
+      }
+    }
+
+    return true;
+  }
+
+  static constexpr MOZ_ALWAYS_INLINE uint64_t unsetValue() {
+    return uint64FromHashAndLength(0xffffffff, 0);
+  }
+
+ private:
+  uint64_t mHashAndLength;
+
+  static constexpr MOZ_ALWAYS_INLINE uint64_t
+  uint64FromHashAndLength(HashNumber hash, uint32_t length) {
+    return (static_cast<uint64_t>(length) << 32) | hash;
+  }
+
+  static constexpr MOZ_ALWAYS_INLINE uint32_t
+  lengthFromUint64(uint64_t hashAndLength) {
+    return static_cast<uint32_t>(hashAndLength >> 32);
+  }
+
+  static constexpr MOZ_ALWAYS_INLINE HashNumber
+  hashFromUint64(uint64_t hashAndLength) {
+    return hashAndLength & 0xffffffff;
+  }
+};
+
+static_assert(HashAndLength::staticChecks());
+
+class AtomCacheHashTable {
+ public:
+  static MOZ_ALWAYS_INLINE constexpr uint32_t computeIndexFromHash(
+      const HashNumber hash) {
+    return hash & (sSize - 1);
+  }
+
+  MOZ_ALWAYS_INLINE JSAtom* lookupForAdd(
+      const AtomHasher::Lookup& lookup) const {
+    MOZ_ASSERT(lookup.atom == nullptr, "Lookup by atom is not supported");
+
+    const uint32_t index = computeIndexFromHash(lookup.hash);
+
+    const EntrySet& entrySet = mEntrySets[index];
+    for (const Entry& entry : entrySet.mEntries) {
+      JSAtom* const atom = entry.mAtom;
+
+      if (!entry.mHashAndLength.isEqual(lookup.hash, lookup.length)) {
+        continue;
+      }
+
+      if (MOZ_UNLIKELY(!lookup.StringsMatch(*atom))) {
+        continue;
+      }
+
+      return atom;
+    }
+
+    return nullptr;
+  }
+
+  MOZ_ALWAYS_INLINE void add(const HashNumber hash, JSAtom* atom) {
+    const uint32_t index = computeIndexFromHash(hash);
+
+    mEntrySets[index].add(hash, atom->length(), atom);
+  }
+
+ private:
+  struct Entry {
+    MOZ_ALWAYS_INLINE Entry()
+        : mHashAndLength(HashAndLength::unsetValue()), mAtom(nullptr) {}
+
+    MOZ_ALWAYS_INLINE void set(const HashNumber hash, const uint32_t length,
+                               JSAtom* const atom) {
+      mHashAndLength.set(hash, length);
+      mAtom = atom;
+    }
+
+    HashAndLength mHashAndLength;
+    JSAtom* mAtom;
+  };
+
+  static_assert(sizeof(Entry) <= 16);
+
+  struct EntrySet {
+    MOZ_ALWAYS_INLINE void add(const HashNumber hash, const uint32_t length,
+                               JSAtom* const atom) {
+      MOZ_ASSERT(mEntries[0].mAtom != atom);
+      MOZ_ASSERT(mEntries[1].mAtom != atom);
+      MOZ_ASSERT(mEntries[2].mAtom != atom);
+      MOZ_ASSERT(mEntries[3].mAtom != atom);
+      mEntries[3] = mEntries[2];
+      mEntries[2] = mEntries[1];
+      mEntries[1] = mEntries[0];
+      mEntries[0].set(hash, length, atom);
+    }
+
+    std::array<Entry, 4> mEntries;
+  };
+
+  static_assert(sizeof(EntrySet) <= 64,
+                "EntrySet will not fit in a cache line");
+
+  static constexpr uint32_t sSize = 2 * 1024;
+  static_assert(std::has_single_bit(sSize));
+  std::array<EntrySet, sSize> mEntrySets;
+};
+
+}  
+
+namespace JS {
+
+class Zone : public js::ZoneAllocator, public js::gc::GraphNodeBase<JS::Zone> {
+ public:
+  js::gc::ArenaLists arenas;
+
+  js::GCLockData<js::gc::ChunkPool> availableChunks_;
+
+  js::GCLockData<js::gc::ChunkPool> fullChunks_;
+
+  js::MainThreadOrGCTaskData<js::gc::ArenaChunk*> currentChunk_;
+
+  js::GCLockData<js::gc::ChunkArenaBitmap> pendingFreeCommittedArenas;
+
+  js::gc::ChunkPool& fullChunks(const js::AutoLockGC& lock) {
+    return fullChunks_.ref();
+  }
+  js::gc::ChunkPool& availableChunks(const js::AutoLockGC& lock) {
+    return availableChunks_.ref();
+  }
+  const js::gc::ChunkPool& fullChunks(const js::AutoLockGC& lock) const {
+    return fullChunks_.ref();
+  }
+  const js::gc::ChunkPool& availableChunks(const js::AutoLockGC& lock) const {
+    return availableChunks_.ref();
+  }
+
+  template <typename F>
+  inline void forEachNonEmptyChunk(js::gc::GCRuntime* gc,
+                                   const js::AutoLockGC& lock, F&& func);
+
+  js::gc::BufferAllocator bufferAllocator;
+
+  js::MainThreadData<void*> data;
+
+  js::MainThreadData<bool> suppressAllocationMetadataBuilder;
+
+  js::MainThreadData<bool> nurseryStringsDisabled;
+  js::MainThreadData<bool> nurseryBigIntsDisabled;
+
+ private:
+  js::MainThreadOrIonCompileData<bool> allocNurseryObjects_;
+  js::MainThreadOrIonCompileData<bool> allocNurseryStrings_;
+  js::MainThreadOrIonCompileData<bool> allocNurseryBigInts_;
+  js::MainThreadOrIonCompileData<bool> allocNurseryGetterSetters_;
+
+  js::MainThreadData<js::gc::Heap> minObjectHeapToTenure_;
+  js::MainThreadData<js::gc::Heap> minStringHeapToTenure_;
+  js::MainThreadData<js::gc::Heap> minBigintHeapToTenure_;
+  js::MainThreadData<js::gc::Heap> minGetterSetterHeapToTenure_;
+
+ public:
+  js::UniquePtr<JS::WeakCache<js::ScriptCountsMap>> scriptCountsMap;
+  js::UniquePtr<JS::WeakCache<js::ScriptLCovMap>> scriptLCovMap;
+  js::MainThreadData<js::DebugScriptMap*> debugScriptMap;
+#ifdef MOZ_VTUNE
+  js::UniquePtr<JS::WeakCache<js::ScriptVTuneIdMap>> scriptVTuneIdMap;
+#endif
+#ifdef JS_CACHEIR_SPEW
+  js::UniquePtr<JS::WeakCache<js::ScriptFinalWarmUpCountMap>>
+      scriptFinalWarmUpCountMap;
+#endif
+
+  js::UniquePtr<JS::WeakCache<js::ProfileStringMap>> profilerStrings;
+
+  js::MainThreadData<js::StringStats> previousGCStringStats;
+  js::MainThreadData<js::StringStats> stringStats;
+
+  js::gc::PretenuringZone pretenuring;
+
+ private:
+  js::MainThreadOrGCTaskData<js::gc::UniqueIdMap> uniqueIds_;
+
+  uint32_t tenuredAllocsSinceMinorGC_ = 0;
+
+  js::MainThreadOrGCTaskData<js::SlimLinkedList<js::WeakMapBase>>
+      gcSystemWeakMaps_;
+  js::MainThreadOrGCTaskData<js::SlimLinkedList<js::WeakMapBase>>
+      gcUserWeakMaps_;
+  js::MainThreadOrGCTaskData<js::SlimLinkedList<js::WeakMapBase>>
+      gcMarkedUserWeakMaps_;
+
+  using CompartmentVector =
+      js::Vector<JS::Compartment*, 1, js::SystemAllocPolicy>;
+  js::MainThreadOrGCTaskData<CompartmentVector> compartments_;
+
+  js::MainThreadOrGCTaskData<js::StringWrapperMap> crossZoneStringWrappers_;
+
+  js::MainThreadOrGCTaskData<mozilla::LinkedList<detail::WeakCacheBase>>
+      weakCaches_;
+
+  js::MainThreadOrGCTaskData<js::gc::EphemeronEdgeTable> gcEphemeronEdges_;
+
+  js::MainThreadData<js::UniquePtr<js::RegExpZone>> regExps_;
+
+  js::MainThreadOrGCTaskData<js::SparseBitmap> markedAtoms_;
+
+  js::MainThreadOrGCTaskData<js::UniquePtr<js::AtomCacheHashTable>> atomCache_;
+
+  js::MainThreadOrGCTaskData<js::ExternalStringCache> externalStringCache_;
+
+  js::MainThreadOrGCTaskData<js::FunctionToStringCache> functionToStringCache_;
+
+  using BoundPrefixCache =
+      js::HashMap<JSAtom*, JSAtom*, js::PointerHasher<JSAtom*>,
+                  js::SystemAllocPolicy>;
+  js::MainThreadData<BoundPrefixCache> boundPrefixCache_;
+
+  js::MainThreadData<js::ShapeZone> shapeZone_;
+
+  js::MainThreadOrGCTaskData<js::UniquePtr<js::gc::FinalizationObservers>>
+      finalizationObservers_;
+
+  js::MainThreadOrGCTaskOrIonCompileData<js::jit::JitZone*> jitZone_;
+
+  js::MainThreadOrIonCompileData<size_t> numRealmsWithAllocMetadataBuilder_{0};
+
+  js::MainThreadData<mozilla::TimeStamp> lastDiscardedCodeTime_;
+
+  js::MainThreadData<bool> gcScheduled_;
+  js::MainThreadData<bool> gcScheduledSaved_;
+  js::MainThreadData<bool> gcPreserveCode_;
+  js::MainThreadData<bool> keepPropMapTables_;
+  js::MainThreadData<bool> wasCollected_;
+
+  js::MainThreadOrGCTaskData<bool> gcUserWeakMapsMayHaveKeyDelegates_;
+  js::MainThreadOrGCTaskData<bool> gcWeakMapsMayHaveSymbolKeys_;
+
+  js::MainThreadOrGCTaskData<bool>
+      gcFinalizationRegistriesMayHaveSymbolRegistrations_;
+
+  js::MainThreadOrIonCompileData<JSObject**> preservedWrappers_;
+  js::MainThreadOrIonCompileData<size_t> preservedWrappersCount_;
+  js::MainThreadOrIonCompileData<size_t> preservedWrappersCapacity_;
+
+  js::MainThreadOrGCTaskData<Zone*> listNext_;
+  static Zone* const NotOnList;
+  friend class js::gc::ZoneList;
+
+  using KeptAliveSet =
+      JS::GCHashSet<js::HeapPtr<Value>, js::gc::WeakTargetHasher,
+                    js::ZoneAllocPolicy>;
+  friend class js::WeakRefObject;
+  js::MainThreadOrGCTaskData<KeptAliveSet> keptAliveSet;
+
+  using ObjectVector = js::GCVector<JSObject*, 0, js::SystemAllocPolicy>;
+  js::MainThreadOrGCTaskData<ObjectVector> objectsWithWeakPointers;
+
+#ifdef DEBUG
+  js::MainThreadData<unsigned> gcSweepGroupIndex;
+
+  js::MainThreadData<js::Vector<const js::gc::Cell*, 0, js::SystemAllocPolicy>>
+      cellsToAssertNotGray_;
+#endif
+
+ public:
+#ifdef JS_GC_ZEAL
+  js::UniquePtr<js::gc::MissingAllocSites> missingSites;
+#endif  // JS_GC_ZEAL
+
+  static JS::Zone* from(ZoneAllocator* zoneAlloc) {
+    return static_cast<Zone*>(zoneAlloc);
+  }
+
+  explicit Zone(JSRuntime* rt, Kind kind = NormalZone);
+  ~Zone();
+
+  [[nodiscard]] bool init();
+
+  void destroy(JS::GCContext* gcx);
+
+  [[nodiscard]] bool findSweepGroupEdges(Zone* atomsZone);
+
+  struct JitDiscardOptions {
+    JitDiscardOptions() = default;
+    bool discardJitScripts = false;
+    bool resetNurseryAllocSites = false;
+    bool resetPretenuredAllocSites = false;
+  };
+
+  static constexpr JitDiscardOptions DefaultJitDiscardOptions() { return {}; }
+
+  void maybeDiscardJitCode(JS::GCContext* gcx);
+
+  void forceDiscardJitCode(
+      JS::GCContext* gcx,
+      const JitDiscardOptions& options = DefaultJitDiscardOptions());
+
+  void resetAllocSitesAndInvalidate(bool resetNurserySites,
+                                    bool resetPretenuredSites);
+
+  void traceWeakJitScripts(JSTracer* trc);
+
+  bool registerObjectWithWeakPointers(JSObject* obj);
+  void sweepObjectsWithWeakPointers(JSTracer* trc);
+
+  void addSizeOfIncludingThis(mozilla::MallocSizeOf mallocSizeOf,
+                              size_t* zoneObject, JS::CodeSizes* code,
+                              size_t* regexpZone, size_t* jitZone,
+                              size_t* cacheIRStubs, size_t* objectFusesArg,
+                              size_t* uniqueIdMap, size_t* initialPropMapTable,
+                              size_t* shapeTables, size_t* atomsMarkBitmaps,
+                              size_t* compartmentObjects,
+                              size_t* crossCompartmentWrappersTables,
+                              size_t* compartmentsPrivateData,
+                              size_t* scriptCountsMapArg);
+
+  template <typename T, typename... Args>
+  js::gc::ZoneCellIter<T> cellIter(Args&&... args) {
+    return js::gc::ZoneCellIter<T>(const_cast<Zone*>(this),
+                                   std::forward<Args>(args)...);
+  }
+
+  template <typename T, typename... Args>
+  js::gc::ZoneAllCellIter<T> cellIterUnsafe(Args&&... args) {
+    return js::gc::ZoneAllCellIter<T>(const_cast<Zone*>(this),
+                                      std::forward<Args>(args)...);
+  }
+
+  bool hasMarkedRealms();
+
+  void scheduleGC() {
+    MOZ_ASSERT(!RuntimeHeapIsBusy());
+    gcScheduled_ = true;
+  }
+  void unscheduleGC() { gcScheduled_ = false; }
+  bool isGCScheduled() { return gcScheduled_; }
+
+  void setPreservingCode(bool preserving) { gcPreserveCode_ = preserving; }
+  bool isPreservingCode() const { return gcPreserveCode_; }
+
+  mozilla::TimeStamp lastDiscardedCodeTime() const {
+    return lastDiscardedCodeTime_;
+  }
+
+  void changeGCState(js::gc::GCRuntime* gc, GCState prev, GCState next);
+
+  bool isCollecting() const {
+    MOZ_ASSERT(js::CurrentThreadCanAccessRuntime(runtimeFromMainThread()));
+    return isCollectingFromAnyThread();
+  }
+
+  inline bool isCollectingFromAnyThread() const {
+    return needsMarkingBarrier() || wasGCStarted();
+  }
+
+  GCState initialMarkingState() const;
+
+  bool shouldMarkInZone(js::gc::MarkColor color) const {
+    if (color == js::gc::MarkColor::Black) {
+      return isGCMarkingOrVerifyingPreBarriers();
+    }
+
+    return isGCMarkingBlackAndGray();
+  }
+
+  bool wasCollected() const { return wasCollected_; }
+  void setWasCollected(bool v) { wasCollected_ = v; }
+
+  void setNeedsMarkingBarrier(js::gc::GCRuntime* gc, bool needs);
+  const BarrierState* addressOfNeedsMarkingBarrier() const {
+    return &needsMarkingBarrier_;
+  }
+
+  static constexpr size_t offsetOfNeedsMarkingBarrier() {
+    return offsetof(Zone, needsMarkingBarrier_);
+  }
+  static constexpr size_t offsetOfJitZone() { return offsetof(Zone, jitZone_); }
+
+  js::jit::JitZone* getOrCreateJitZone(JSContext* cx) {
+    return jitZone_ ? jitZone_ : createJitZone(cx);
+  }
+  js::jit::JitZone* jitZone() { return jitZone_; }
+
+  bool ensureJitZoneExists(JSContext* cx) { return getOrCreateJitZone(cx); }
+
+  bool preserveWrapper(JSObject* obj) {
+    MOZ_ASSERT(preservedWrappersCount_ <= preservedWrappersCapacity_);
+    if (preservedWrappersCount_ >= preservedWrappersCapacity_) {
+      const size_t initialCapacity = 8;
+      const size_t maxCapacity = 8192;
+      size_t newCapacity =
+          std::max(size_t(initialCapacity), preservedWrappersCapacity_ * 2);
+      if (newCapacity > maxCapacity) {
+        return false;
+      }
+      JSObject** oldPtr = preservedWrappers_.ref();
+      JSObject** newPtr = js_pod_arena_realloc<JSObject*>(
+          js::MallocArena, oldPtr, preservedWrappersCapacity_, newCapacity);
+      if (!newPtr) {
+        return false;
+      }
+      preservedWrappersCapacity_ = newCapacity;
+      preservedWrappers_ = newPtr;
+    }
+    preservedWrappers_[preservedWrappersCount_++] = obj;
+    return true;
+  }
+
+  bool hasPendingWrapperPreservations() const {
+    return preservedWrappersCount_ != 0;
+  }
+
+  void purgePendingWrapperPreservationBuffer() {
+    MOZ_RELEASE_ASSERT(preservedWrappersCount_ == 0);
+    js_free(preservedWrappers_);
+    preservedWrappers_ = nullptr;
+    preservedWrappersCapacity_ = 0;
+  }
+
+  const void* addressOfPreservedWrappers() const {
+    return &preservedWrappers_.ref();
+  }
+
+  const size_t* addressOfPreservedWrappersCount() const {
+    return &preservedWrappersCount_.ref();
+  }
+
+  const size_t* addressOfPreservedWrappersCapacity() const {
+    return &preservedWrappersCapacity_.ref();
+  }
+
+  mozilla::Span<JSObject*> slurpPendingWrapperPreservations() {
+    size_t count = preservedWrappersCount_;
+    preservedWrappersCount_ = 0;
+    return mozilla::Span<JSObject*>(preservedWrappers_.ref(), count);
+  }
+
+  void incNumRealmsWithAllocMetadataBuilder() {
+    numRealmsWithAllocMetadataBuilder_++;
+  }
+  void decNumRealmsWithAllocMetadataBuilder() {
+    MOZ_ASSERT(numRealmsWithAllocMetadataBuilder_ > 0);
+    numRealmsWithAllocMetadataBuilder_--;
+  }
+  bool hasRealmWithAllocMetadataBuilder() const {
+    return numRealmsWithAllocMetadataBuilder_ > 0;
+  }
+
+  void traceRootsInMajorGC(JSTracer* trc);
+
+  void sweepAfterMinorGC(JSTracer* trc);
+  void sweepUniqueIds();
+  void sweepCompartments(JS::GCContext* gcx, bool keepAtleastOne,
+                         bool destroyingRuntime);
+
+  void maybeWriteCoverageAndSpew();
+
+  void sweepWeakMaps(JSTracer* trc);
+
+  void traceWeakMaps(JSTracer* trc);
+
+  js::gc::UniqueIdMap& uniqueIds() { return uniqueIds_.ref(); }
+
+  void notifyObservingDebuggers();
+
+  void noteTenuredAlloc() { tenuredAllocsSinceMinorGC_++; }
+
+  uint32_t* addressOfTenuredAllocCount() { return &tenuredAllocsSinceMinorGC_; }
+
+  uint32_t getAndResetTenuredAllocsSinceMinorGC() {
+    uint32_t res = tenuredAllocsSinceMinorGC_;
+    tenuredAllocsSinceMinorGC_ = 0;
+    return res;
+  }
+
+  js::SlimLinkedList<js::WeakMapBase>& gcSystemWeakMaps() {
+    return gcSystemWeakMaps_.ref();
+  }
+  js::SlimLinkedList<js::WeakMapBase>& gcUserWeakMaps() {
+    return gcUserWeakMaps_.ref();
+  }
+  js::SlimLinkedList<js::WeakMapBase>& gcMarkedUserWeakMaps() {
+    return gcMarkedUserWeakMaps_.ref();
+  }
+
+  bool gcUserWeakMapsMayHaveKeyDelegates() const {
+    return gcUserWeakMapsMayHaveKeyDelegates_;
+  }
+  void setGCWeakMapsMayHaveKeyDelegates() {
+    gcUserWeakMapsMayHaveKeyDelegates_ = true;
+  }
+  bool gcWeakMapsMayHaveSymbolKeys() const {
+    return gcWeakMapsMayHaveSymbolKeys_;
+  }
+  void setGCWeakMapsMayHaveSymbolKeys() { gcWeakMapsMayHaveSymbolKeys_ = true; }
+  void clearGCCachedWeakMapKeyData() {
+    gcUserWeakMapsMayHaveKeyDelegates_ = false;
+    gcWeakMapsMayHaveSymbolKeys_ = false;
+  }
+
+  void setGCFinalizationRegistriesMayHaveSymbolRegistrations() {
+    gcFinalizationRegistriesMayHaveSymbolRegistrations_ = true;
+  }
+  void clearGCFinalizationRegistriesMayHaveSymbolRegistrations() {
+    gcFinalizationRegistriesMayHaveSymbolRegistrations_ = false;
+  }
+
+  CompartmentVector& compartments() { return compartments_.ref(); }
+
+  js::StringWrapperMap& crossZoneStringWrappers() {
+    return crossZoneStringWrappers_.ref();
+  }
+  const js::StringWrapperMap& crossZoneStringWrappers() const {
+    return crossZoneStringWrappers_.ref();
+  }
+
+  void dropStringWrappersOnGC();
+
+  void traceWeakCCWEdges(JSTracer* trc);
+  static void fixupAllCrossCompartmentWrappersAfterMovingGC(JSTracer* trc);
+
+  void prepareForMovingGC();
+  void fixupAfterMovingGC();
+
+  void setNurseryAllocFlags(bool allocObjects, bool allocStrings,
+                            bool allocBigInts, bool allocGetterSetters);
+
+  bool allocKindInNursery(JS::TraceKind kind) const {
+    switch (kind) {
+      case JS::TraceKind::Object:
+        return allocNurseryObjects_;
+      case JS::TraceKind::String:
+        return allocNurseryStrings_;
+      case JS::TraceKind::BigInt:
+        return allocNurseryBigInts_;
+      case JS::TraceKind::GetterSetter:
+        return allocNurseryGetterSetters_;
+      default:
+        MOZ_CRASH("Unsupported kind for nursery allocation");
+    }
+  }
+  bool allocNurseryObjects() const { return allocNurseryObjects_; }
+
+  bool allocNurseryStrings() const { return allocNurseryStrings_; }
+
+  bool allocNurseryBigInts() const { return allocNurseryBigInts_; }
+
+  bool allocNurseryGetterSetters() const { return allocNurseryGetterSetters_; }
+
+  js::gc::Heap minHeapToTenure(JS::TraceKind kind) const {
+    switch (kind) {
+      case JS::TraceKind::Object:
+        return minObjectHeapToTenure_;
+      case JS::TraceKind::String:
+        return minStringHeapToTenure_;
+      case JS::TraceKind::BigInt:
+        return minBigintHeapToTenure_;
+      case JS::TraceKind::GetterSetter:
+        return minGetterSetterHeapToTenure_;
+      default:
+        MOZ_CRASH("Unsupported kind for nursery allocation");
+    }
+  }
+
+  mozilla::LinkedList<detail::WeakCacheBase>& weakCaches() {
+    return weakCaches_.ref();
+  }
+  void registerWeakCache(detail::WeakCacheBase* cachep) {
+    weakCaches().insertBack(cachep);
+  }
+
+  void beforeClearDelegate(JSObject* wrapper, JSObject* delegate) {
+    if (needsMarkingBarrier()) {
+      beforeClearDelegateInternal(wrapper, delegate);
+    }
+  }
+
+  void beforeClearDelegateInternal(JSObject* wrapper, JSObject* delegate);
+  js::gc::EphemeronEdgeTable& gcEphemeronEdges() {
+    return gcEphemeronEdges_.ref();
+  }
+
+  js::gc::IncrementalProgress enterWeakMarkingMode(js::GCMarker* marker,
+                                                   JS::SliceBudget& budget);
+
+  NodeSet& gcSweepGroupEdges() {
+    return gcGraphEdges;  
+  }
+  bool hasSweepGroupEdgeTo(Zone* otherZone) const {
+    return gcGraphEdges.has(otherZone);
+  }
+  [[nodiscard]] bool addSweepGroupEdgeTo(Zone* otherZone) {
+    MOZ_ASSERT(isGCMarking());
+    MOZ_ASSERT(otherZone->isGCMarking());
+    return gcSweepGroupEdges().put(otherZone);
+  }
+  void clearSweepGroupEdges() { gcSweepGroupEdges().clear(); }
+
+  js::RegExpZone& regExps() { return *regExps_.ref(); }
+
+  js::SparseBitmap& markedAtoms() { return markedAtoms_.ref(); }
+
+  js::AtomCacheHashTable* atomCache() {
+    if (atomCache_.ref()) {
+      return atomCache_.ref().get();
+    }
+
+    atomCache_ = js::MakeUnique<js::AtomCacheHashTable>();
+    return atomCache_.ref().get();
+  }
+
+  void purgeAtomCache();
+
+  js::ExternalStringCache& externalStringCache() {
+    return externalStringCache_.ref();
+  };
+
+  js::FunctionToStringCache& functionToStringCache() {
+    return functionToStringCache_.ref();
+  }
+
+  BoundPrefixCache& boundPrefixCache() { return boundPrefixCache_.ref(); }
+
+  js::ShapeZone& shapeZone() { return shapeZone_.ref(); }
+
+  bool keepPropMapTables() const { return keepPropMapTables_; }
+  void setKeepPropMapTables(bool b) { keepPropMapTables_ = b; }
+
+  void clearRootsForShutdownGC();
+  void finishRoots();
+
+  void traceScriptTableRoots(JSTracer* trc);
+
+  void clearScriptCounts(Realm* realm);
+  void clearScriptLCov(Realm* realm);
+
+  bool addToKeptObjects(HandleValue target);
+
+  void traceKeptObjects(JSTracer* trc);
+
+  void clearKeptObjects();
+
+  js::gc::AllocSite* unknownAllocSite(JS::TraceKind kind) {
+    return &pretenuring.unknownAllocSite(kind);
+  }
+  js::gc::AllocSite* optimizedAllocSite() {
+    return &pretenuring.optimizedAllocSite;
+  }
+  js::gc::AllocSite* tenuringAllocSite() {
+    return &pretenuring.tenuringAllocSite;
+  }
+  uint32_t nurseryPromotedCount(JS::TraceKind kind) const {
+    return pretenuring.nurseryPromotedCount(kind);
+  }
+
+#ifdef JSGC_HASH_TABLE_CHECKS
+  void checkAllCrossCompartmentWrappersAfterMovingGC();
+  void checkStringWrappersAfterMovingGC();
+
+  void checkUniqueIdTableAfterMovingGC();
+
+  void checkScriptMapsAfterMovingGC();
+#endif
+
+#ifdef DEBUG
+  unsigned lastSweepGroupIndex() { return gcSweepGroupIndex; }
+
+  auto& cellsToAssertNotGray() { return cellsToAssertNotGray_.ref(); }
+#endif
+
+  js::DependentIonScriptGroup fuseDependencies;
+
+  js::ObjectFuseMap objectFuses;
+
+ private:
+  js::jit::JitZone* createJitZone(JSContext* cx);
+
+  bool isQueuedForBackgroundSweep() { return isOnList(); }
+
+  js::gc::FinalizationObservers* finalizationObservers() {
+    return finalizationObservers_.ref().get();
+  }
+  bool ensureFinalizationObservers();
+
+  bool isOnList() const;
+  Zone* nextZone() const;
+
+  friend bool js::CurrentThreadCanAccessZone(Zone* zone);
+  friend class js::gc::GCRuntime;
+};
+
+}  
+
+namespace js::gc {
+const char* StateName(JS::Zone::GCState state);
+}  
+
+#endif  // gc_Zone_h

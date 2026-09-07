@@ -1,0 +1,672 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "ssl.h"
+#include "sslimpl.h"
+#include "sslproto.h"
+#include "keyhi.h"
+#include "pk11func.h"
+
+
+
+#define MASK_TWO_LOW_BITS 0x3
+
+#define UNIFIED_HEADER_LONG 0x2c
+#define UNIFIED_HEADER_SHORT 0x20
+
+#define MASK_SEQUENCE_NUMBER_SHORT 0xff
+#define MASK_SEQUENCE_NUMBER_LONG 0xffff
+
+SECStatus
+dtls13_InsertCipherTextHeader(const sslSocket *ss, const ssl3CipherSpec *cwSpec,
+                              sslBuffer *wrBuf, PRBool *needsLength)
+{
+
+    if (ss->opt.enableDtlsShortHeader &&
+        cwSpec->epoch > TrafficKeyHandshake) {
+        *needsLength = PR_FALSE;
+        PRUint8 ct = UNIFIED_HEADER_SHORT | ((uint64_t)cwSpec->epoch & MASK_TWO_LOW_BITS);
+        if (sslBuffer_AppendNumber(wrBuf, ct, sizeof(ct)) != SECSuccess) {
+            return SECFailure;
+        }
+        PRUint8 seq = cwSpec->nextSeqNum & MASK_SEQUENCE_NUMBER_SHORT;
+        return sslBuffer_AppendNumber(wrBuf, seq, sizeof(seq));
+    }
+
+    PRUint8 ct = UNIFIED_HEADER_LONG | ((PRUint8)cwSpec->epoch & MASK_TWO_LOW_BITS);
+    if (sslBuffer_AppendNumber(wrBuf, ct, sizeof(ct)) != SECSuccess) {
+        return SECFailure;
+    }
+    PRUint16 seq = cwSpec->nextSeqNum & MASK_SEQUENCE_NUMBER_LONG;
+    if (sslBuffer_AppendNumber(wrBuf, seq, sizeof(seq)) != SECSuccess) {
+        return SECFailure;
+    }
+    *needsLength = PR_TRUE;
+    return SECSuccess;
+}
+
+typedef struct DTLSHandshakeRecordEntryStr {
+    PRCList link;
+    PRUint16 messageSeq;      
+    PRUint32 offset;          
+    PRUint32 length;          
+    sslSequenceNumber record; 
+    PRBool acked;             
+} DTLSHandshakeRecordEntry;
+
+#define LENGTH_SEQ_NUMBER 48
+
+static inline sslSequenceNumber
+dtls_CombineSequenceNumber(DTLSEpoch epoch, sslSequenceNumber seqNum)
+{
+    PORT_Assert(seqNum <= RECORD_SEQ_MAX);
+    return ((sslSequenceNumber)epoch << LENGTH_SEQ_NUMBER) | seqNum;
+}
+
+SECStatus
+dtls13_RememberFragment(sslSocket *ss,
+                        PRCList *list,
+                        PRUint32 sequence,
+                        PRUint32 offset,
+                        PRUint32 length,
+                        DTLSEpoch epoch,
+                        sslSequenceNumber record)
+{
+    DTLSHandshakeRecordEntry *entry;
+
+    PORT_Assert(IS_DTLS(ss));
+    PORT_Assert(length || !offset);
+
+    if (!tls13_MaybeTls13(ss)) {
+        return SECSuccess;
+    }
+
+    SSL_TRC(20, ("%d: SSL3[%d]: %s remembering %s record=%llx msg=%d offset=%d",
+                 SSL_GETPID(), ss->fd,
+                 SSL_ROLE(ss),
+                 list == &ss->ssl3.hs.dtlsSentHandshake ? "sent" : "received",
+                 dtls_CombineSequenceNumber(epoch, record), sequence, offset));
+
+    entry = PORT_ZAlloc(sizeof(DTLSHandshakeRecordEntry));
+    if (!entry) {
+        return SECFailure;
+    }
+
+    entry->messageSeq = sequence;
+    entry->offset = offset;
+    entry->length = length;
+    entry->record = dtls_CombineSequenceNumber(epoch, record);
+    entry->acked = PR_FALSE;
+
+    PR_APPEND_LINK(&entry->link, list);
+
+    return SECSuccess;
+}
+
+SECStatus
+dtls13_SendAck(sslSocket *ss)
+{
+    sslBuffer buf = SSL_BUFFER_EMPTY;
+    SECStatus rv = SECSuccess;
+    PRCList *cursor;
+    PRInt32 sent;
+    unsigned int offset = 0;
+
+    SSL_TRC(10, ("%d: SSL3[%d]: Sending ACK",
+                 SSL_GETPID(), ss->fd));
+
+    PRUint32 sizeOfListACK = 2;
+    rv = sslBuffer_Skip(&buf, sizeOfListACK, &offset);
+    if (rv != SECSuccess) {
+        goto loser;
+    }
+    for (cursor = PR_LIST_HEAD(&ss->ssl3.hs.dtlsRcvdHandshake);
+         cursor != &ss->ssl3.hs.dtlsRcvdHandshake;
+         cursor = PR_NEXT_LINK(cursor)) {
+        DTLSHandshakeRecordEntry *entry = (DTLSHandshakeRecordEntry *)cursor;
+
+        SSL_TRC(10, ("%d: SSL3[%d]: ACK for record=%llx",
+                     SSL_GETPID(), ss->fd, entry->record));
+
+        PRUint64 epoch = entry->record >> 48;
+        PRUint64 seqNum = entry->record & 0xffffffffffff;
+
+        rv = sslBuffer_AppendNumber(&buf, epoch, 8);
+        if (rv != SECSuccess) {
+            goto loser;
+        }
+
+        rv = sslBuffer_AppendNumber(&buf, seqNum, 8);
+        if (rv != SECSuccess) {
+            goto loser;
+        }
+    }
+
+    rv = sslBuffer_InsertLength(&buf, offset, sizeOfListACK);
+    if (rv != SECSuccess) {
+        goto loser;
+    }
+
+    ssl_GetXmitBufLock(ss);
+    sent = ssl3_SendRecord(ss, NULL, ssl_ct_ack,
+                           buf.buf, buf.len, 0);
+    ssl_ReleaseXmitBufLock(ss);
+    if (sent != buf.len) {
+        rv = SECFailure;
+        if (sent != -1) {
+            PORT_SetError(SEC_ERROR_LIBRARY_FAILURE);
+        }
+    }
+
+loser:
+    sslBuffer_Clear(&buf);
+    return rv;
+}
+
+void
+dtls13_SendAckCb(sslSocket *ss)
+{
+    if (!IS_DTLS(ss)) {
+        return;
+    }
+    (void)dtls13_SendAck(ss);
+}
+
+PRBool
+dtls13_AeadLimitReached(ssl3CipherSpec *spec)
+{
+    if (spec->version >= SSL_LIBRARY_VERSION_TLS_1_3) {
+        switch (spec->cipherDef->calg) {
+            case ssl_calg_chacha20:
+            case ssl_calg_aes_gcm:
+                return spec->deprotectionFailures >= (1ULL << 36);
+            default:
+                PORT_Assert(0);
+                break;
+        }
+    }
+    return PR_FALSE;
+}
+
+static PRBool
+dtls_IsEmptyMessageAcknowledged(sslSocket *ss, PRUint16 msgSeq, PRUint32 offset)
+{
+    PRCList *cursor;
+
+    for (cursor = PR_LIST_HEAD(&ss->ssl3.hs.dtlsSentHandshake);
+         cursor != &ss->ssl3.hs.dtlsSentHandshake;
+         cursor = PR_NEXT_LINK(cursor)) {
+        DTLSHandshakeRecordEntry *entry = (DTLSHandshakeRecordEntry *)cursor;
+        if (!entry->acked || msgSeq != entry->messageSeq) {
+            continue;
+        }
+        if (entry->length == 0) {
+            PORT_Assert(!entry->offset);
+            return PR_TRUE;
+        }
+    }
+    return PR_FALSE;
+}
+
+static PRBool
+dtls_MoveUnackedStartForward(DTLSHandshakeRecordEntry *entry, PRUint32 *start)
+{
+    if (*start < entry->offset) {
+        return PR_FALSE;
+    }
+    if (*start >= entry->offset + entry->length) {
+        return PR_FALSE;
+    }
+    *start = entry->offset + entry->length;
+    return PR_TRUE;
+}
+
+static PRBool
+dtls_MoveUnackedEndBackward(DTLSHandshakeRecordEntry *entry, PRUint32 *end)
+{
+    if (*end > entry->offset + entry->length) {
+        return PR_FALSE;
+    }
+    if (*end <= entry->offset) {
+        return PR_FALSE;
+    }
+    *end = entry->offset;
+    return PR_TRUE;
+}
+
+PRBool
+dtls_NextUnackedRange(sslSocket *ss, PRUint16 msgSeq, PRUint32 offset,
+                      PRUint32 len, PRUint32 *startOut, PRUint32 *endOut)
+{
+    PRCList *cur_p;
+    PRBool done = PR_FALSE;
+    DTLSHandshakeRecordEntry *entry;
+    PRUint32 start;
+    PRUint32 end;
+
+    PORT_Assert(IS_DTLS(ss));
+
+    *startOut = offset;
+    *endOut = len;
+    if (!tls13_MaybeTls13(ss)) {
+        return PR_TRUE;
+    }
+
+    if (!len) {
+        PORT_Assert(!offset);
+        return !dtls_IsEmptyMessageAcknowledged(ss, msgSeq, offset);
+    }
+
+    start = offset;
+    end = len;
+    while (!done) {
+        done = PR_TRUE;
+        for (cur_p = PR_LIST_HEAD(&ss->ssl3.hs.dtlsSentHandshake);
+             cur_p != &ss->ssl3.hs.dtlsSentHandshake;
+             cur_p = PR_NEXT_LINK(cur_p)) {
+            entry = (DTLSHandshakeRecordEntry *)cur_p;
+            if (!entry->acked || msgSeq != entry->messageSeq) {
+                continue;
+            }
+
+            if (dtls_MoveUnackedStartForward(entry, &start) ||
+                dtls_MoveUnackedEndBackward(entry, &end)) {
+                if (start >= end) {
+                    return PR_FALSE;
+                }
+                done = PR_FALSE;
+                break;
+            }
+        }
+    }
+    PORT_Assert(start < end);
+
+    *startOut = start;
+    *endOut = end;
+    return PR_TRUE;
+}
+
+SECStatus
+dtls13_SetupAcks(sslSocket *ss)
+{
+    if (ss->version < SSL_LIBRARY_VERSION_TLS_1_3) {
+        return SECSuccess;
+    }
+
+    if (ss->ssl3.hs.endOfFlight) {
+        dtls_CancelTimer(ss, ss->ssl3.hs.ackTimer);
+
+        if (ss->ssl3.hs.ws == idle_handshake && ss->sec.isServer) {
+            SSL_TRC(10, ("%d: SSL3[%d]: dtls_HandleHandshake, sending ACK",
+                         SSL_GETPID(), ss->fd));
+            return dtls13_SendAck(ss);
+        }
+        return SECSuccess;
+    }
+
+    if (!ss->ssl3.hs.ackTimer->cb) {
+        SSL_TRC(10, ("%d: SSL3[%d]: dtls_HandleHandshake, arming ack timer",
+                     SSL_GETPID(), ss->fd));
+        return dtls_StartTimer(ss, ss->ssl3.hs.ackTimer,
+                               DTLS_RETRANSMIT_INITIAL_MS / 4,
+                               dtls13_SendAckCb);
+    }
+    return SECSuccess;
+}
+
+SECStatus
+dtls13_HandleOutOfEpochRecord(sslSocket *ss, const ssl3CipherSpec *spec,
+                              SSLContentType rType,
+                              sslBuffer *databuf)
+{
+    SECStatus rv;
+    sslBuffer buf = *databuf;
+
+    databuf->len = 0; 
+    PORT_Assert(IS_DTLS(ss));
+    PORT_Assert(ss->version >= SSL_LIBRARY_VERSION_TLS_1_3);
+    if (!IS_DTLS(ss) || (ss->version < SSL_LIBRARY_VERSION_TLS_1_3)) {
+        tls13_FatalError(ss, SEC_ERROR_LIBRARY_FAILURE, internal_error);
+        return SECFailure;
+    }
+    SSL_TRC(30, ("%d: DTLS13[%d]: %s handles out of epoch record: type=%d", SSL_GETPID(),
+                 ss->fd, SSL_ROLE(ss), rType));
+
+    if (rType == ssl_ct_ack) {
+        ssl_GetSSL3HandshakeLock(ss);
+        rv = dtls13_HandleAck(ss, &buf);
+        ssl_ReleaseSSL3HandshakeLock(ss);
+        PORT_Assert(databuf->len == 0);
+        return rv;
+    }
+
+    switch (spec->epoch) {
+
+        case TrafficKeyClearText:
+            return SECSuccess;
+
+        case TrafficKeyHandshake:
+            if (rType == ssl_ct_handshake) {
+                if ((ss->sec.isServer) &&
+                    (ss->ssl3.hs.ws == idle_handshake)) {
+                    PORT_Assert(dtls_TimerActive(ss, ss->ssl3.hs.hdTimer));
+                    return dtls13_SendAck(ss);
+                }
+                return SECSuccess;
+            }
+
+            break;
+
+        default:
+            if (rType == ssl_ct_application_data) {
+                return SECSuccess;
+            }
+            break;
+    }
+
+    SSL_TRC(10, ("%d: SSL3[%d]: unexpected out of epoch record type %d", SSL_GETPID(),
+                 ss->fd, rType));
+
+    (void)SSL3_SendAlert(ss, alert_fatal, illegal_parameter);
+    PORT_SetError(SSL_ERROR_RX_UNKNOWN_RECORD_TYPE);
+    return SECFailure;
+}
+
+SECStatus
+dtls13_maybeProcessKeyUpdateAck(sslSocket *ss, PRUint16 entrySeq)
+{
+
+    if (ss->ssl3.hs.isKeyUpdateInProgress && entrySeq == ss->ssl3.hs.dtlsHandhakeKeyUpdateMessage) {
+        SSL_TRC(30, ("%d: DTLS13[%d]: %s key update is completed", SSL_GETPID(), ss->fd, SSL_ROLE(ss)));
+        PORT_Assert(ss->opt.noLocks || ssl_HaveSSL3HandshakeLock(ss));
+
+        SECStatus rv = SECSuccess;
+        rv = tls13_UpdateTrafficKeys(ss, ssl_secret_write);
+        if (rv != SECSuccess) {
+            return SECFailure;
+        }
+        PORT_Assert(ss->ssl3.hs.isKeyUpdateInProgress);
+        ss->ssl3.hs.isKeyUpdateInProgress = PR_FALSE;
+
+        return rv;
+    }
+
+    else
+        return SECSuccess;
+}
+
+SECStatus
+dtls13_HandleAck(sslSocket *ss, sslBuffer *databuf)
+{
+    PRUint8 *b = databuf->buf;
+    PRUint32 l = databuf->len;
+    unsigned int length;
+    SECStatus rv;
+
+    PORT_Assert(ss->opt.noLocks || ssl_HaveSSL3HandshakeLock(ss));
+
+    databuf->len = 0;
+
+    PORT_Assert(IS_DTLS(ss));
+    if (!tls13_MaybeTls13(ss)) {
+        tls13_FatalError(ss, SSL_ERROR_RX_UNKNOWN_RECORD_TYPE, illegal_parameter);
+        return SECFailure;
+    }
+
+    SSL_TRC(10, ("%d: SSL3[%d]: Handling ACK", SSL_GETPID(), ss->fd));
+    rv = ssl3_ConsumeHandshakeNumber(ss, &length, 2, &b, &l);
+    if (rv != SECSuccess) {
+        goto loser;
+    }
+    if (length != l) {
+        goto loser;
+    }
+
+    while (l > 0) {
+        PRUint64 seq;
+        PRUint64 epoch;
+        PRCList *cursor;
+
+        rv = ssl3_ConsumeHandshakeNumber64(ss, &epoch, 8, &b, &l);
+        if (rv != SECSuccess) {
+            goto loser;
+        }
+
+        rv = ssl3_ConsumeHandshakeNumber64(ss, &seq, 8, &b, &l);
+        if (rv != SECSuccess) {
+            goto loser;
+        }
+
+        if (epoch > RECORD_EPOCH_MAX) {
+            SSL_TRC(50, ("%d: SSL3[%d]: ACK message was rejected: the epoch exceeds the limit", SSL_GETPID(), ss->fd));
+            continue;
+        }
+        if (seq > RECORD_SEQ_MAX) {
+            SSL_TRC(50, ("%d: SSL3[%d]: ACK message was rejected: the sequence number exceeds the limit", SSL_GETPID(), ss->fd));
+            continue;
+        }
+
+        seq = dtls_CombineSequenceNumber(epoch, seq);
+
+        for (cursor = PR_LIST_HEAD(&ss->ssl3.hs.dtlsSentHandshake);
+             cursor != &ss->ssl3.hs.dtlsSentHandshake;
+             cursor = PR_NEXT_LINK(cursor)) {
+            DTLSHandshakeRecordEntry *entry = (DTLSHandshakeRecordEntry *)cursor;
+
+            if (entry->record == seq) {
+                SSL_TRC(30, (
+                                "%d: DTLS13[%d]: Marking record=%llx message %d offset %d length=%d as ACKed",
+                                SSL_GETPID(), ss->fd,
+                                entry->record, entry->messageSeq, entry->offset, entry->length));
+                entry->acked = PR_TRUE;
+
+                rv = dtls13_maybeProcessKeyUpdateAck(ss, entry->messageSeq);
+                if (rv != SECSuccess) {
+                    return SECFailure;
+                }
+            }
+        }
+    }
+    rv = dtls_TransmitMessageFlight(ss);
+    if (rv != SECSuccess) {
+        return SECFailure;
+    }
+
+    if (ss->ssl3.hs.rtTimer->cb) {
+        (void)dtls_RestartTimer(ss, ss->ssl3.hs.rtTimer);
+    }
+
+    if (PR_CLIST_IS_EMPTY(&ss->ssl3.hs.lastMessageFlight)) {
+        SSL_TRC(10, ("%d: SSL3[%d]: No more unacked handshake messages",
+                     SSL_GETPID(), ss->fd));
+
+        dtls_CancelTimer(ss, ss->ssl3.hs.rtTimer);
+        ssl_ClearPRCList(&ss->ssl3.hs.dtlsSentHandshake, NULL);
+        if (!ss->sec.isServer && (ss->ssl3.hs.ws == idle_handshake)) {
+            ssl_CipherSpecReleaseByEpoch(ss, ssl_secret_read,
+                                         TrafficKeyHandshake);
+        }
+    }
+    return SECSuccess;
+
+loser:
+    SSL_TRC(11, ("%d: SSL3[%d]: Error processing DTLS1.3 ACK.",
+                 SSL_GETPID(), ss->fd));
+    PORT_SetError(SSL_ERROR_RX_MALFORMED_DTLS_ACK);
+    return SECFailure;
+}
+
+
+void
+dtls13_HolddownTimerCb(sslSocket *ss)
+{
+    SSL_TRC(10, ("%d: SSL3[%d]: holddown timer fired",
+                 SSL_GETPID(), ss->fd));
+    ssl_CipherSpecReleaseByEpoch(ss, ssl_secret_read, TrafficKeyHandshake);
+    ssl_ClearPRCList(&ss->ssl3.hs.dtlsRcvdHandshake, NULL);
+}
+
+SECStatus
+dtls13_MaskSequenceNumber(sslSocket *ss, ssl3CipherSpec *spec,
+                          PRUint8 *hdr, PRUint8 *cipherText, PRUint32 cipherTextLen)
+{
+    PORT_Assert(IS_DTLS(ss));
+    if (spec->version < SSL_LIBRARY_VERSION_TLS_1_3) {
+        return SECSuccess;
+    }
+
+    if (spec->maskContext) {
+        if (cipherTextLen < 16) {
+            PORT_SetError(SSL_ERROR_BAD_MAC_READ);
+            return SECFailure;
+        }
+
+        PRUint8 mask[2];
+        SECStatus rv = ssl_CreateMaskInner(spec->maskContext, cipherText, cipherTextLen, mask, sizeof(mask));
+
+        if (rv != SECSuccess) {
+            PORT_SetError(SSL_ERROR_BAD_MAC_READ);
+            return SECFailure;
+        }
+
+
+        PRUint32 maskSBitIsSet = 0x08;
+        hdr[1] ^= mask[0];
+        if (hdr[0] & maskSBitIsSet) {
+            hdr[2] ^= mask[1];
+        }
+    }
+    return SECSuccess;
+}
+
+CK_MECHANISM_TYPE
+tls13_SequenceNumberEncryptionMechanism(SSLCipherAlgorithm bulkAlgorithm)
+{
+    /*
+    When the AEAD is based on AES, then the mask is generated by
+        computing AES-ECB on the first 16 bytes of the ciphertext:
+
+    When the AEAD is based on ChaCha20, then the mask is generated by
+    treating the first 4 bytes of the ciphertext as the block counter and
+    the next 12 bytes as the nonce, passing them to the ChaCha20 block
+    function.
+    */
+
+    switch (bulkAlgorithm) {
+        case ssl_calg_aes_gcm:
+            return CKM_AES_ECB;
+        case ssl_calg_chacha20:
+            return CKM_NSS_CHACHA20_CTR;
+        default:
+            PORT_Assert(PR_FALSE);
+    }
+    return CKM_INVALID_MECHANISM;
+}
+
+
+SECStatus
+dtls13_EnqueueKeyUpdateMessage(sslSocket *ss, tls13KeyUpdateRequest request)
+{
+    SECStatus rv = SECFailure;
+    rv = ssl3_AppendHandshakeHeaderAndStashSeqNum(ss, ssl_hs_key_update, 1, &ss->ssl3.hs.dtlsHandhakeKeyUpdateMessage);
+    if (rv != SECSuccess) {
+        return rv; 
+    }
+    rv = ssl3_AppendHandshakeNumber(ss, request, 1);
+    if (rv != SECSuccess) {
+        return rv; 
+    }
+
+    return SECSuccess;
+}
+
+#define DTLS13_MAX_EPOCH_TYPE PR_UINT16_MAX
+#define DTLS13_MAX_EPOCH ((0x1ULL << 48) - 1)
+
+SECStatus
+dtls13_MaybeSendKeyUpdate(sslSocket *ss, tls13KeyUpdateRequest request, PRBool buffer)
+{
+
+    SSL_TRC(30, ("%d: DTLS13[%d]: %s sends key update, response %s",
+                 SSL_GETPID(), ss->fd, SSL_ROLE(ss),
+                 (request == update_requested) ? "requested"
+                                               : "not requested"));
+
+    PORT_Assert(ss->opt.noLocks || ssl_HaveSSL3HandshakeLock(ss));
+
+    SECStatus rv = SECFailure;
+
+    ssl_GetSpecWriteLock(ss);
+    if (ss->ssl3.cwSpec->epoch >= DTLS13_MAX_EPOCH_TYPE) {
+        ssl_ReleaseSpecWriteLock(ss);
+        SSL_TRC(30, ("%d: DTLS13[%d]: %s keyUpdate request was cancelled, as the writing epoch arrived to the maximum possible",
+                     SSL_GETPID(), ss->fd, SSL_ROLE(ss)));
+        PORT_SetError(SSL_ERROR_RENEGOTIATION_NOT_ALLOWED);
+        return SECFailure;
+    } else {
+        ssl_ReleaseSpecWriteLock(ss);
+    }
+
+    PORT_Assert(DTLS13_MAX_EPOCH_TYPE <= DTLS13_MAX_EPOCH);
+
+    ssl_GetSpecReadLock(ss);
+    if (request == update_requested && ss->ssl3.crSpec->epoch >= DTLS13_MAX_EPOCH_TYPE) {
+        SSL_TRC(30, ("%d: DTLS13[%d]: %s keyUpdate request update_requested was cancelled, as the reading epoch arrived to the maximum possible",
+                     SSL_GETPID(), ss->fd, SSL_ROLE(ss)));
+        request = update_not_requested;
+    }
+    ssl_ReleaseSpecReadLock(ss);
+
+    if (ss->ssl3.hs.isKeyUpdateInProgress) {
+        SSL_TRC(30, ("%d: DTLS13[%d]: the previous %s KeyUpdate message was not yet ack-ed, dropping",
+                     SSL_GETPID(), ss->fd, SSL_ROLE(ss), ss->ssl3.hs.sendMessageSeq));
+        return SECSuccess;
+    }
+
+    ssl_GetXmitBufLock(ss);
+    rv = dtls13_EnqueueKeyUpdateMessage(ss, request);
+    if (rv != SECSuccess) {
+        ssl_ReleaseXmitBufLock(ss);
+        return rv; 
+    }
+
+    rv = ssl3_FlushHandshake(ss, 0);
+    ssl_ReleaseXmitBufLock(ss);
+    if (rv != SECSuccess) {
+        return SECFailure; 
+    }
+
+    PORT_Assert(ss->ssl3.hs.isKeyUpdateInProgress == PR_FALSE);
+    ss->ssl3.hs.isKeyUpdateInProgress = PR_TRUE;
+
+    SSL_TRC(30, ("%d: DTLS13[%d]: %s has just sent keyUpdate request #%d and is waiting for ack",
+                 SSL_GETPID(), ss->fd, SSL_ROLE(ss), ss->ssl3.hs.dtlsHandhakeKeyUpdateMessage));
+    return SECSuccess;
+}
+
+SECStatus
+dtls13_HandleKeyUpdate(sslSocket *ss, PRUint8 *b, unsigned int length, PRBool update)
+{
+    SSL_TRC(10, ("%d: DTLS13[%d]: %s handles Key Update",
+                 SSL_GETPID(), ss->fd, SSL_ROLE(ss)));
+
+    PORT_Assert(ss->opt.noLocks || ssl_HaveSSL3HandshakeLock(ss));
+    SECStatus rv = SECSuccess;
+    if (update == update_requested) {
+        rv = tls13_SendKeyUpdate(ss, update_not_requested, PR_FALSE);
+        if (rv != SECSuccess) {
+            return SECFailure; 
+        }
+    }
+
+    SSL_TRC(30, ("%d: DTLS13[%d]: now %s is allowing the messages from the previous epoch",
+                 SSL_GETPID(), ss->fd, SSL_ROLE(ss)));
+    ss->ssl3.hs.allowPreviousEpoch = PR_TRUE;
+    rv = tls13_UpdateTrafficKeys(ss, ssl_secret_read);
+    if (rv != SECSuccess) {
+        return SECFailure; 
+    }
+    return SECSuccess;
+}

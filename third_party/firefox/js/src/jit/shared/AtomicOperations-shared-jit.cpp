@@ -1,0 +1,236 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/Assertions.h"
+#include "mozilla/Attributes.h"
+
+#include <atomic>
+#include <bit>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <tuple>
+#include <utility>
+
+#include "jit/AtomicOperations.h"
+#include "js/GCAPI.h"
+
+#if defined(__arm__)
+#  include "jit/arm/Architecture-arm.h"
+#endif
+
+#ifdef JS_HAVE_GENERATED_ATOMIC_OPS
+
+using namespace js;
+using namespace js::jit;
+
+
+static constexpr size_t WORDSIZE = sizeof(uintptr_t);
+static constexpr size_t BLOCKSIZE = 8 * WORDSIZE;  
+
+static_assert(BLOCKSIZE % WORDSIZE == 0,
+              "A block is an integral number of words");
+
+static_assert(JS_GENERATED_ATOMICS_BLOCKSIZE == BLOCKSIZE);
+static_assert(JS_GENERATED_ATOMICS_WORDSIZE == WORDSIZE);
+
+static constexpr size_t WORDMASK = WORDSIZE - 1;
+static constexpr size_t BLOCKMASK = BLOCKSIZE - 1;
+
+namespace js {
+namespace jit {
+
+static bool UnalignedAccessesAreOK() {
+#  ifdef DEBUG
+  const char* flag = getenv("JS_NO_UNALIGNED_MEMCPY");
+  if (flag && *flag == '1') return false;
+#  endif
+#  if defined(__x86_64__) || defined(__i386__)
+  return true;
+#  elif defined(__arm__)
+  return !ARMFlags::HasAlignmentFault();
+#  elif defined(__aarch64__)
+  return true;
+#  else
+#    error "Unsupported platform"
+#  endif
+}
+
+#  ifndef JS_64BIT
+void AtomicCompilerFence() {
+  std::atomic_signal_fence(std::memory_order_acq_rel);
+}
+#  endif
+
+template <size_t Alignment>
+static inline bool CanCopyAligned(const uint8_t* dest, const uint8_t* src,
+                                  const uint8_t* lim) {
+  static_assert(std::has_single_bit(Alignment));
+  return ((uintptr_t(dest) | uintptr_t(src) | uintptr_t(lim)) &
+          (Alignment - 1)) == 0;
+}
+
+template <size_t Alignment>
+static inline bool CanAlignTo(const uint8_t* dest, const uint8_t* src) {
+  static_assert(std::has_single_bit(Alignment));
+  return ((uintptr_t(dest) ^ uintptr_t(src)) & (Alignment - 1)) == 0;
+}
+
+static MOZ_ALWAYS_INLINE auto AtomicCopyDownNoTearIfAlignedUnsynchronized(
+    uint8_t* dest, const uint8_t* src, const uint8_t* srcEnd) {
+  MOZ_ASSERT(src <= srcEnd);
+  MOZ_ASSERT(size_t(srcEnd - src) < WORDSIZE);
+
+  if (WORDSIZE > 4 && CanCopyAligned<4>(dest, src, srcEnd)) {
+    static_assert(WORDSIZE <= 8, "copies 32-bits at most once");
+
+    if (src < srcEnd) {
+      AtomicCopy32Unsynchronized(dest, src);
+      dest += 4;
+      src += 4;
+    }
+  } else if (CanCopyAligned<2>(dest, src, srcEnd)) {
+    while (src < srcEnd) {
+      AtomicCopy16Unsynchronized(dest, src);
+      dest += 2;
+      src += 2;
+    }
+  } else {
+    while (src < srcEnd) {
+      AtomicCopy8Unsynchronized(dest++, src++);
+    }
+  }
+  return std::pair{dest, src};
+}
+
+void AtomicMemcpyDownUnsynchronized(uint8_t* dest, const uint8_t* src,
+                                    size_t nbytes) {
+  JS::AutoSuppressGCAnalysis nogc;
+
+  const uint8_t* lim = src + nbytes;
+
+
+  if (nbytes >= WORDSIZE) {
+    void (*copyBlock)(uint8_t* dest, const uint8_t* src);
+    void (*copyWord)(uint8_t* dest, const uint8_t* src);
+
+    if (CanAlignTo<WORDSIZE>(dest, src)) {
+      const uint8_t* cutoff = (const uint8_t*)RoundUp(uintptr_t(src), WORDSIZE);
+      MOZ_ASSERT(cutoff <= lim);  
+
+      std::tie(dest, src) =
+          AtomicCopyDownNoTearIfAlignedUnsynchronized(dest, src, cutoff);
+
+      copyBlock = AtomicCopyBlockDownUnsynchronized;
+      copyWord = AtomicCopyWordUnsynchronized;
+    } else if (UnalignedAccessesAreOK()) {
+      copyBlock = AtomicCopyBlockDownUnsynchronized;
+      copyWord = AtomicCopyWordUnsynchronized;
+    } else {
+      copyBlock = AtomicCopyUnalignedBlockDownUnsynchronized;
+      copyWord = AtomicCopyUnalignedWordDownUnsynchronized;
+    }
+
+
+    const uint8_t* blocklim = src + ((lim - src) & ~BLOCKMASK);
+    while (src < blocklim) {
+      copyBlock(dest, src);
+      dest += BLOCKSIZE;
+      src += BLOCKSIZE;
+    }
+
+    const uint8_t* wordlim = src + ((lim - src) & ~WORDMASK);
+    while (src < wordlim) {
+      copyWord(dest, src);
+      dest += WORDSIZE;
+      src += WORDSIZE;
+    }
+  }
+
+
+  AtomicCopyDownNoTearIfAlignedUnsynchronized(dest, src, lim);
+}
+
+static MOZ_ALWAYS_INLINE auto AtomicCopyUpNoTearIfAlignedUnsynchronized(
+    uint8_t* dest, const uint8_t* src, const uint8_t* srcBegin) {
+  MOZ_ASSERT(src >= srcBegin);
+  MOZ_ASSERT(size_t(src - srcBegin) < WORDSIZE);
+
+  if (WORDSIZE > 4 && CanCopyAligned<4>(dest, src, srcBegin)) {
+    static_assert(WORDSIZE <= 8, "copies 32-bits at most once");
+
+    if (src > srcBegin) {
+      dest -= 4;
+      src -= 4;
+      AtomicCopy32Unsynchronized(dest, src);
+    }
+  } else if (CanCopyAligned<2>(dest, src, srcBegin)) {
+    while (src > srcBegin) {
+      dest -= 2;
+      src -= 2;
+      AtomicCopy16Unsynchronized(dest, src);
+    }
+  } else {
+    while (src > srcBegin) {
+      AtomicCopy8Unsynchronized(--dest, --src);
+    }
+  }
+  return std::pair{dest, src};
+}
+
+void AtomicMemcpyUpUnsynchronized(uint8_t* dest, const uint8_t* src,
+                                  size_t nbytes) {
+  JS::AutoSuppressGCAnalysis nogc;
+
+  const uint8_t* lim = src;
+
+  src += nbytes;
+  dest += nbytes;
+
+
+  if (nbytes >= WORDSIZE) {
+    void (*copyBlock)(uint8_t* dest, const uint8_t* src);
+    void (*copyWord)(uint8_t* dest, const uint8_t* src);
+
+    if (CanAlignTo<WORDSIZE>(dest, src)) {
+      const uint8_t* cutoff = (const uint8_t*)(uintptr_t(src) & ~WORDMASK);
+      MOZ_ASSERT(cutoff >= lim);  
+
+      std::tie(dest, src) =
+          AtomicCopyUpNoTearIfAlignedUnsynchronized(dest, src, cutoff);
+
+      copyBlock = AtomicCopyBlockUpUnsynchronized;
+      copyWord = AtomicCopyWordUnsynchronized;
+    } else if (UnalignedAccessesAreOK()) {
+      copyBlock = AtomicCopyBlockUpUnsynchronized;
+      copyWord = AtomicCopyWordUnsynchronized;
+    } else {
+      copyBlock = AtomicCopyUnalignedBlockUpUnsynchronized;
+      copyWord = AtomicCopyUnalignedWordUpUnsynchronized;
+    }
+
+
+    const uint8_t* blocklim = src - ((src - lim) & ~BLOCKMASK);
+    while (src > blocklim) {
+      dest -= BLOCKSIZE;
+      src -= BLOCKSIZE;
+      copyBlock(dest, src);
+    }
+
+    const uint8_t* wordlim = src - ((src - lim) & ~WORDMASK);
+    while (src > wordlim) {
+      dest -= WORDSIZE;
+      src -= WORDSIZE;
+      copyWord(dest, src);
+    }
+  }
+
+
+  AtomicCopyUpNoTearIfAlignedUnsynchronized(dest, src, lim);
+}
+
+}  
+}  
+
+#endif  // JS_HAVE_GENERATED_ATOMIC_OPS

@@ -1,0 +1,415 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef js_ErrorReport_h
+#define js_ErrorReport_h
+
+#include "mozilla/Assertions.h"  // MOZ_ASSERT
+#include "mozilla/Maybe.h"       // mozilla::Maybe
+
+#include <cstdarg>
+#include <iterator>  // std::input_iterator_tag, std::iterator
+#include <stdarg.h>
+#include <stddef.h>  // size_t
+#include <stdint.h>  // int16_t, uint16_t
+#include <string.h>  // strlen
+
+#include "jstypes.h"  // JS_PUBLIC_API
+
+#include "js/AllocPolicy.h"
+#include "js/CharacterEncoding.h"  // JS::ConstUTF8CharsZ
+#include "js/ColumnNumber.h"       // JS::ColumnNumberOneOrigin
+#include "js/Exception.h"          // JS::BorrowedErrorReport
+#include "js/RootingAPI.h"         // JS::HandleObject, JS::RootedObject
+#include "js/UniquePtr.h"          // js::UniquePtr
+#include "js/Value.h"              // JS::Value
+#include "js/Vector.h"             // js::Vector
+
+struct JS_PUBLIC_API JSContext;
+class JS_PUBLIC_API JSString;
+
+namespace JS {
+class ExceptionStack;
+}
+namespace js {
+class SystemAllocPolicy;
+
+enum ErrorArgumentsType {
+  ArgumentsAreUnicode,
+  ArgumentsAreASCII,
+  ArgumentsAreLatin1,
+  ArgumentsAreUTF8
+};
+}  
+
+enum JSExnType {
+  JSEXN_ERR,
+  JSEXN_FIRST = JSEXN_ERR,
+  JSEXN_INTERNALERR,
+  JSEXN_AGGREGATEERR,
+  JSEXN_EVALERR,
+  JSEXN_RANGEERR,
+  JSEXN_REFERENCEERR,
+#ifdef ENABLE_EXPLICIT_RESOURCE_MANAGEMENT
+  JSEXN_SUPPRESSEDERR,
+#endif
+  JSEXN_SYNTAXERR,
+  JSEXN_TYPEERR,
+  JSEXN_URIERR,
+  JSEXN_DEBUGGEEWOULDRUN,
+  JSEXN_WASMCOMPILEERROR,
+  JSEXN_WASMLINKERROR,
+  JSEXN_WASMRUNTIMEERROR,
+#ifdef ENABLE_WASM_JSPI
+  JSEXN_WASMSUSPENDERROR,
+#endif
+  JSEXN_ERROR_LIMIT,
+  JSEXN_WARN = JSEXN_ERROR_LIMIT,
+  JSEXN_NOTE,
+  JSEXN_LIMIT
+};
+
+struct JSErrorFormatString {
+  const char* name;
+
+  const char* format;
+
+  uint16_t argCount;
+
+  int16_t exnType;
+};
+
+using JSErrorCallback =
+    const JSErrorFormatString* (*)(void* userRef, const unsigned errorNumber);
+
+class JSErrorBase {
+ private:
+  JS::ConstUTF8CharsZ message_;
+
+ public:
+  JS::ConstUTF8CharsZ filename;
+
+  unsigned sourceId;
+
+  uint32_t lineno;
+
+  JS::ColumnNumberOneOrigin column;
+
+  unsigned errorNumber;
+
+  const char* errorMessageName;
+
+ private:
+  bool ownsMessage_ : 1;
+
+ public:
+  JSErrorBase()
+      : filename(nullptr),
+        sourceId(0),
+        lineno(0),
+        errorNumber(0),
+        errorMessageName(nullptr),
+        ownsMessage_(false) {}
+  JSErrorBase(JSErrorBase&& other) noexcept
+      : message_(other.message_),
+        filename(other.filename),
+        sourceId(other.sourceId),
+        lineno(other.lineno),
+        column(other.column),
+        errorNumber(other.errorNumber),
+        errorMessageName(other.errorMessageName),
+        ownsMessage_(other.ownsMessage_) {
+    if (ownsMessage_) {
+      other.ownsMessage_ = false;
+    }
+  }
+
+  ~JSErrorBase() { freeMessage(); }
+
+ public:
+  const JS::ConstUTF8CharsZ message() const { return message_; }
+
+  void initOwnedMessage(const char* messageArg) {
+    initBorrowedMessage(messageArg);
+    ownsMessage_ = true;
+  }
+  void initBorrowedMessage(const char* messageArg) {
+    MOZ_ASSERT(!message_);
+    message_ = JS::ConstUTF8CharsZ(messageArg, strlen(messageArg));
+  }
+
+  JSString* newMessageString(JSContext* cx);
+
+ private:
+  void freeMessage();
+};
+
+class JSErrorNotes {
+ public:
+  class Note final : public JSErrorBase {};
+
+ private:
+  js::Vector<js::UniquePtr<Note>, 1, js::SystemAllocPolicy> notes_;
+
+  bool addNoteVA(js::FrontendContext* fc, const char* filename,
+                 unsigned sourceId, uint32_t lineno,
+                 JS::ColumnNumberOneOrigin column,
+                 JSErrorCallback errorCallback, void* userRef,
+                 const unsigned errorNumber,
+                 js::ErrorArgumentsType argumentsType, va_list ap);
+
+ public:
+  JSErrorNotes();
+  ~JSErrorNotes();
+
+  bool addNoteASCII(JSContext* cx, const char* filename, unsigned sourceId,
+                    uint32_t lineno, JS::ColumnNumberOneOrigin column,
+                    JSErrorCallback errorCallback, void* userRef,
+                    const unsigned errorNumber, ...);
+  bool addNoteASCII(js::FrontendContext* fc, const char* filename,
+                    unsigned sourceId, uint32_t lineno,
+                    JS::ColumnNumberOneOrigin column,
+                    JSErrorCallback errorCallback, void* userRef,
+                    const unsigned errorNumber, ...);
+  bool addNoteLatin1(JSContext* cx, const char* filename, unsigned sourceId,
+                     uint32_t lineno, JS::ColumnNumberOneOrigin column,
+                     JSErrorCallback errorCallback, void* userRef,
+                     const unsigned errorNumber, ...);
+  bool addNoteLatin1(js::FrontendContext* fc, const char* filename,
+                     unsigned sourceId, uint32_t lineno,
+                     JS::ColumnNumberOneOrigin column,
+                     JSErrorCallback errorCallback, void* userRef,
+                     const unsigned errorNumber, ...);
+  bool addNoteUTF8(JSContext* cx, const char* filename, unsigned sourceId,
+                   uint32_t lineno, JS::ColumnNumberOneOrigin column,
+                   JSErrorCallback errorCallback, void* userRef,
+                   const unsigned errorNumber, ...);
+  bool addNoteUTF8(js::FrontendContext* fc, const char* filename,
+                   unsigned sourceId, uint32_t lineno,
+                   JS::ColumnNumberOneOrigin column,
+                   JSErrorCallback errorCallback, void* userRef,
+                   const unsigned errorNumber, ...);
+
+  JS_PUBLIC_API size_t length();
+
+  js::UniquePtr<JSErrorNotes> copy(JSContext* cx);
+
+  class iterator final {
+   private:
+    js::UniquePtr<Note>* note_;
+
+   public:
+    using iterator_category = std::input_iterator_tag;
+    using value_type = js::UniquePtr<Note>;
+    using difference_type = ptrdiff_t;
+    using pointer = value_type*;
+    using reference = value_type&;
+
+    explicit iterator(js::UniquePtr<Note>* note = nullptr) : note_(note) {}
+
+    bool operator==(iterator other) const { return note_ == other.note_; }
+    bool operator!=(iterator other) const { return !(*this == other); }
+    iterator& operator++() {
+      note_++;
+      return *this;
+    }
+    reference operator*() { return *note_; }
+  };
+
+  JS_PUBLIC_API iterator begin();
+  JS_PUBLIC_API iterator end();
+};
+
+class JSErrorReport : public JSErrorBase {
+ private:
+  const char16_t* linebuf_;
+
+  size_t linebufLength_;
+
+  size_t tokenOffset_;
+
+ public:
+  js::UniquePtr<JSErrorNotes> notes;
+
+  int16_t exnType;
+
+  bool isMuted : 1;
+
+  bool isWarning_ : 1;
+
+ private:
+  bool ownsLinebuf_ : 1;
+
+ public:
+  JSErrorReport()
+      : linebuf_(nullptr),
+        linebufLength_(0),
+        tokenOffset_(0),
+        notes(nullptr),
+        exnType(0),
+        isMuted(false),
+        isWarning_(false),
+        ownsLinebuf_(false) {}
+  JSErrorReport(JSErrorReport&& other) noexcept
+      : JSErrorBase(std::move(other)),
+        linebuf_(other.linebuf_),
+        linebufLength_(other.linebufLength_),
+        tokenOffset_(other.tokenOffset_),
+        notes(std::move(other.notes)),
+        exnType(other.exnType),
+        isMuted(other.isMuted),
+        isWarning_(other.isWarning_),
+        ownsLinebuf_(other.ownsLinebuf_) {
+    if (ownsLinebuf_) {
+      other.ownsLinebuf_ = false;
+    }
+  }
+
+  ~JSErrorReport() { freeLinebuf(); }
+
+ public:
+  const char16_t* linebuf() const { return linebuf_; }
+  size_t linebufLength() const { return linebufLength_; }
+  size_t tokenOffset() const { return tokenOffset_; }
+  void initOwnedLinebuf(const char16_t* linebufArg, size_t linebufLengthArg,
+                        size_t tokenOffsetArg) {
+    initBorrowedLinebuf(linebufArg, linebufLengthArg, tokenOffsetArg);
+    ownsLinebuf_ = true;
+  }
+  void initBorrowedLinebuf(const char16_t* linebufArg, size_t linebufLengthArg,
+                           size_t tokenOffsetArg);
+
+  bool isWarning() const { return isWarning_; }
+
+ private:
+  void freeLinebuf();
+};
+
+namespace JS {
+
+struct MOZ_STACK_CLASS JS_PUBLIC_API ErrorReportBuilder {
+  explicit ErrorReportBuilder(JSContext* cx);
+  ~ErrorReportBuilder();
+
+  enum SniffingBehavior { WithSideEffects, NoSideEffects };
+
+  bool init(JSContext* cx, const JS::ExceptionStack& exnStack,
+            SniffingBehavior sniffingBehavior);
+
+  JSErrorReport* report() const { return reportp; }
+
+  const JS::ConstUTF8CharsZ toStringResult() const { return toStringResult_; }
+
+ private:
+  bool populateUncaughtExceptionReportUTF8(JSContext* cx,
+                                           JS::HandleObject stack, ...);
+  bool populateUncaughtExceptionReportUTF8VA(JSContext* cx,
+                                             JS::HandleObject stack,
+                                             va_list ap);
+
+  void ReportAddonExceptionToTelemetry(JSContext* cx);
+
+  JSString* maybeCreateReportFromDOMException(JS::HandleObject obj,
+                                              JSContext* cx);
+
+  JSErrorReport* reportp;
+
+  JSErrorReport ownedReport;
+
+  JS::BorrowedErrorReport borrowedReport;
+
+  JS::UniqueChars filename;
+
+  JS::ConstUTF8CharsZ toStringResult_;
+  JS::UniqueChars toStringResultBytesStorage;
+};
+
+extern JS_PUBLIC_API void PrintError(FILE* file, JSErrorReport* report,
+                                     bool reportWarnings);
+
+extern JS_PUBLIC_API void PrintError(FILE* file,
+                                     const JS::ErrorReportBuilder& builder,
+                                     bool reportWarnings);
+
+}  
+
+
+namespace JS {
+const uint16_t MaxNumErrorArguments = 10;
+};
+
+extern JS_PUBLIC_API void JS_ReportErrorASCII(JSContext* cx, const char* format,
+                                              ...) MOZ_FORMAT_PRINTF(2, 3);
+
+extern JS_PUBLIC_API void JS_ReportErrorLatin1(JSContext* cx,
+                                               const char* format, ...)
+    MOZ_FORMAT_PRINTF(2, 3);
+
+extern JS_PUBLIC_API void JS_ReportErrorUTF8(JSContext* cx, const char* format,
+                                             ...) MOZ_FORMAT_PRINTF(2, 3);
+
+extern JS_PUBLIC_API void JS_ReportErrorNumberASCII(
+    JSContext* cx, JSErrorCallback errorCallback, void* userRef,
+    const unsigned errorNumber, ...);
+
+extern JS_PUBLIC_API void JS_ReportErrorNumberASCIIVA(
+    JSContext* cx, JSErrorCallback errorCallback, void* userRef,
+    const unsigned errorNumber, va_list ap);
+
+extern JS_PUBLIC_API void JS_ReportErrorNumberLatin1(
+    JSContext* cx, JSErrorCallback errorCallback, void* userRef,
+    const unsigned errorNumber, ...);
+
+#ifdef va_start
+extern JS_PUBLIC_API void JS_ReportErrorNumberLatin1VA(
+    JSContext* cx, JSErrorCallback errorCallback, void* userRef,
+    const unsigned errorNumber, va_list ap);
+#endif
+
+extern JS_PUBLIC_API void JS_ReportErrorNumberUTF8(
+    JSContext* cx, JSErrorCallback errorCallback, void* userRef,
+    const unsigned errorNumber, ...);
+
+#ifdef va_start
+extern JS_PUBLIC_API void JS_ReportErrorNumberUTF8VA(
+    JSContext* cx, JSErrorCallback errorCallback, void* userRef,
+    const unsigned errorNumber, va_list ap);
+#endif
+
+extern JS_PUBLIC_API void JS_ReportErrorNumberUTF8Array(
+    JSContext* cx, JSErrorCallback errorCallback, void* userRef,
+    const unsigned errorNumber, const char** args);
+
+extern JS_PUBLIC_API void JS_ReportErrorNumberUC(JSContext* cx,
+                                                 JSErrorCallback errorCallback,
+                                                 void* userRef,
+                                                 const unsigned errorNumber,
+                                                 ...);
+
+extern JS_PUBLIC_API void JS_ReportErrorNumberUCArray(
+    JSContext* cx, JSErrorCallback errorCallback, void* userRef,
+    const unsigned errorNumber, const char16_t** args);
+
+extern MOZ_COLD JS_PUBLIC_API void JS_ReportOutOfMemory(JSContext* cx);
+
+extern JS_PUBLIC_API bool JS_ExpandErrorArgumentsASCII(
+    JSContext* cx, JSErrorCallback errorCallback, const unsigned errorNumber,
+    JSErrorReport* reportp, ...);
+
+extern JS_PUBLIC_API void JS_ReportAllocationOverflow(JSContext* cx);
+
+namespace JS {
+
+extern JS_PUBLIC_API bool CreateError(
+    JSContext* cx, JSExnType type, HandleObject stack, HandleString fileName,
+    uint32_t lineNumber, JS::ColumnNumberOneOrigin column,
+    JSErrorReport* report, HandleString message,
+    Handle<mozilla::Maybe<Value>> cause, MutableHandleValue rval);
+
+extern JS_PUBLIC_API void ReportUncatchableException(JSContext* cx);
+
+} 
+
+#endif /* js_ErrorReport_h */

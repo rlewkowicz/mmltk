@@ -1,0 +1,409 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsHtml5StreamParser_h
+#define nsHtml5StreamParser_h
+
+#include <tuple>
+
+#include "MainThreadUtils.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/Encoding.h"
+#include "mozilla/Mutex.h"
+#include "mozilla/NotNull.h"
+#include "mozilla/ReentrantMonitor.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/Span.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/UniquePtr.h"
+#include "nsCharsetSource.h"
+#include "nsCOMPtr.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsDebug.h"
+#include "nsHtml5AtomTable.h"
+#include "nsIRequestObserver.h"
+#include "nsISerialEventTarget.h"
+#include "nsISupports.h"
+#include "nsStringFwd.h"
+#include "nsTArray.h"
+#include "nscore.h"
+
+class nsCycleCollectionTraversalCallback;
+class nsHtml5OwningUTF16Buffer;
+class nsHtml5Parser;
+class nsHtml5Speculation;
+class nsHtml5String;
+class nsHtml5Tokenizer;
+class nsHtml5TreeBuilder;
+class nsHtml5TreeOpExecutor;
+class nsIChannel;
+class nsIInputStream;
+class nsIRequest;
+class nsIRunnable;
+class nsITimer;
+class nsIURI;
+
+namespace mozilla {
+class EncodingDetector;
+template <typename T>
+class Buffer;
+
+namespace dom {
+class DocGroup;
+}
+}  
+
+enum eParserMode {
+  NORMAL,
+
+  VIEW_SOURCE_HTML,
+
+  VIEW_SOURCE_XML,
+
+  VIEW_SOURCE_PLAIN,
+
+  PLAIN_TEXT,
+
+  LOAD_AS_DATA,
+
+  ABOUT_BLANK,
+};
+
+enum eBomState {
+  BOM_SNIFFING_NOT_STARTED,
+
+  SEEN_UTF_16_LE_FIRST_BYTE,
+
+  SEEN_UTF_16_BE_FIRST_BYTE,
+
+  SEEN_UTF_8_FIRST_BYTE,
+
+  SEEN_UTF_8_SECOND_BYTE,
+
+  SEEN_UTF_16_BE_XML_FIRST,
+
+  SEEN_UTF_16_BE_XML_SECOND,
+
+  SEEN_UTF_16_BE_XML_THIRD,
+
+  SEEN_UTF_16_BE_XML_FOURTH,
+
+  SEEN_UTF_16_BE_XML_FIFTH,
+
+  SEEN_UTF_16_LE_XML_FIRST,
+
+  SEEN_UTF_16_LE_XML_SECOND,
+
+  SEEN_UTF_16_LE_XML_THIRD,
+
+  SEEN_UTF_16_LE_XML_FOURTH,
+
+  SEEN_UTF_16_LE_XML_FIFTH,
+
+  BOM_SNIFFING_OVER,
+};
+
+enum eHtml5StreamState {
+  STREAM_NOT_STARTED = 0,
+  STREAM_BEING_READ = 1,
+  STREAM_ENDED = 2
+};
+
+class nsHtml5StreamParser final : public nsISupports {
+  template <typename T>
+  using NotNull = mozilla::NotNull<T>;
+  using Encoding = mozilla::Encoding;
+
+  const uint32_t UNCONDITIONAL_META_SCAN_BOUNDARY = 1024;
+  const uint32_t READ_BUFFER_SIZE = 1024;
+  const uint32_t LOCAL_FILE_UTF_8_BUFFER_SIZE = 1024 * 1024 * 4;  
+
+  friend class nsHtml5RequestStopper;
+  friend class nsHtml5DataAvailable;
+  friend class nsHtml5StreamParserContinuation;
+  friend class nsHtml5TimerKungFu;
+  friend class nsHtml5StreamParserPtr;
+  friend class nsHtml5StreamListener;
+
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_CLASS(nsHtml5StreamParser)
+
+  nsHtml5StreamParser(nsHtml5TreeOpExecutor* aExecutor, nsHtml5Parser* aOwner,
+                      eParserMode aMode);
+
+  nsresult OnStartRequest(nsIRequest* aRequest);
+
+  nsresult OnDataAvailable(nsIRequest* aRequest, nsIInputStream* aInStream,
+                           uint64_t aSourceOffset, uint32_t aLength);
+  nsresult OnStopRequest(
+      nsIRequest* aRequest, nsresult status,
+      const mozilla::ReentrantMonitorAutoEnter& aProofOfLock);
+
+  bool internalEncodingDeclaration(nsHtml5String aEncoding);
+
+  bool TemplatePushedOrHeadPopped();
+
+  void RememberGt(int32_t aPos);
+
+
+  void PostLoadFlusher();
+
+  void FeedDetector(mozilla::Span<const uint8_t> aBuffer);
+
+  void DetectorEof();
+
+  inline void SetDocumentCharset(NotNull<const Encoding*> aEncoding,
+                                 nsCharsetSource aSource,
+                                 bool aForceAutoDetection) {
+    MOZ_ASSERT(mStreamState == STREAM_NOT_STARTED,
+               "SetDocumentCharset called too late.");
+    MOZ_ASSERT(NS_IsMainThread(), "Wrong thread!");
+    MOZ_ASSERT(!(aForceAutoDetection && aSource >= kCharsetFromOtherComponent),
+               "Can't force with high-ranking source.");
+    mEncoding = aEncoding;
+    mCharsetSource = aSource;
+    mForceAutoDetection = aForceAutoDetection;
+    mChannelHadCharset = (aSource == kCharsetFromChannel);
+  }
+
+  nsresult GetChannel(nsIChannel** aChannel);
+
+  void ContinueAfterScriptsOrEncodingCommitment(
+      nsHtml5Tokenizer* aTokenizer, nsHtml5TreeBuilder* aTreeBuilder,
+      bool aLastWasCR);
+
+  void ContinueAfterFailedCharsetSwitch();
+
+  void Terminate() { mTerminated = true; }
+
+  void DropTimer();
+
+  void SetViewSourceTitle(nsIURI* aURL);
+
+ private:
+  virtual ~nsHtml5StreamParser();
+
+#ifdef DEBUG
+  bool IsParserThread() { return mEventTarget->IsOnCurrentThread(); }
+#endif
+
+  void MarkAsBroken(nsresult aRv);
+
+  void Interrupt() {
+    MOZ_ASSERT(NS_IsMainThread(), "Wrong thread!");
+    mInterrupted = true;
+  }
+
+  void Uninterrupt() MOZ_NO_THREAD_SAFETY_ANALYSIS {
+    MOZ_ASSERT(IsParserThread(), "Wrong thread!");
+    mTokenizerMutex.AssertCurrentThreadOwns();
+    mInterrupted = false;
+  }
+
+  void FlushTreeOpsAndDisarmTimer();
+
+  void SwitchDecoderIfAsciiSoFar(NotNull<const Encoding*> aEncoding)
+      MOZ_REQUIRES(mTokenizerMutex);
+  ;
+
+  size_t CountGts();
+
+  void DiscardMetaSpeculation();
+
+  bool ProcessLookingForMetaCharset(bool aEof) MOZ_REQUIRES(mTokenizerMutex);
+
+  void ParseAvailableData();
+
+  void DoStopRequest();
+
+  void DoDataAvailableBuffer(mozilla::Buffer<uint8_t>&& aBuffer)
+      MOZ_REQUIRES(mTokenizerMutex);
+
+  void DoDataAvailable(mozilla::Span<const uint8_t> aBuffer)
+      MOZ_REQUIRES(mTokenizerMutex);
+
+  static nsresult CopySegmentsToParser(nsIInputStream* aInStream,
+                                       void* aClosure, const char* aFromSegment,
+                                       uint32_t aToOffset, uint32_t aCount,
+                                       uint32_t* aWriteCount)
+      MOZ_REQUIRES(mTokenizerMutex);
+
+  bool IsTerminatedOrInterrupted() { return mTerminated || mInterrupted; }
+
+  bool IsTerminated() { return mTerminated; }
+
+  inline bool HasDecoder() { return !!mUnicodeDecoder; }
+
+  size_t LengthOfLtContainingPrefixInSecondBuffer();
+
+  nsresult SniffStreamBytes(mozilla::Span<const uint8_t> aFromSegment,
+                            bool aEof) MOZ_REQUIRES(mTokenizerMutex);
+
+  nsresult WriteStreamBytes(mozilla::Span<const uint8_t> aFromSegment)
+      MOZ_REQUIRES(mTokenizerMutex);
+
+  nsresult SetupDecodingAndWriteSniffingBufferAndCurrentSegment(
+      mozilla::Span<const uint8_t> aPrefix,
+      mozilla::Span<const uint8_t> aFromSegment) MOZ_REQUIRES(mTokenizerMutex);
+
+  void SetupDecodingFromBom(NotNull<const Encoding*> aEncoding);
+
+  void SetupDecodingFromUtf16BogoXml(NotNull<const Encoding*> aEncoding);
+
+  [[nodiscard]] nsresult CommitLocalFileToEncoding();
+
+  [[nodiscard]] nsresult ReDecodeLocalFile() MOZ_REQUIRES(mTokenizerMutex);
+
+  std::tuple<NotNull<const Encoding*>, nsCharsetSource> GuessEncoding(
+      bool aInitial);
+
+  const Encoding* PreferredForInternalEncodingDecl(const nsAString& aEncoding);
+
+  static void TimerCallback(nsITimer* aTimer, void* aClosure);
+
+  void TimerFlush();
+
+  void MaybeDisableFutureSpeculation() { mSpeculationFailureCount++; }
+
+  bool IsSpeculationEnabled() { return mSpeculationFailureCount < 100; }
+
+  nsresult DispatchToMain(already_AddRefed<nsIRunnable> aRunnable);
+
+  inline void OnNewContent(mozilla::Span<const char16_t> aData);
+
+  inline void OnContentComplete();
+
+  nsCOMPtr<nsIRequest> mRequest;
+
+  nsCString mViewSourceTitle;
+
+  mozilla::UniquePtr<mozilla::Decoder> mUnicodeDecoder;
+
+  eBomState mBomState;
+
+  nsCharsetSource mCharsetSource;
+
+  nsCharsetSource mEncodingSwitchSource;
+
+  NotNull<const Encoding*> mEncoding;
+
+  const Encoding* mNeedsEncodingSwitchTo;
+
+  bool mSeenEligibleMetaCharset;
+
+  bool mChardetEof;
+
+#ifdef DEBUG
+
+  bool mStartedFeedingDetector;
+
+  bool mStartedFeedingDevTools;
+
+#endif
+
+  bool mReparseForbidden;
+
+  bool mForceAutoDetection;
+
+  bool mChannelHadCharset;
+
+  bool mLookingForMetaCharset;
+
+  bool mStartsWithLtQuestion;
+
+  bool mLookingForXmlDeclarationForXmlViewSource;
+
+  bool mTemplatePushedOrHeadPopped;
+
+  RefPtr<nsHtml5OwningUTF16Buffer> mFirstBuffer;
+
+  nsHtml5OwningUTF16Buffer* mGtBuffer;
+
+  int32_t mGtPos;
+
+  nsHtml5OwningUTF16Buffer*
+      mLastBuffer;  
+
+  RefPtr<nsHtml5OwningUTF16Buffer> mFirstBufferOfMetaScan;
+
+  nsHtml5TreeOpExecutor* mExecutor;
+
+  mozilla::UniquePtr<nsHtml5TreeBuilder> mTreeBuilder;
+
+  mozilla::UniquePtr<nsHtml5Tokenizer> mTokenizer;
+
+  mozilla::Mutex mTokenizerMutex;
+
+  nsHtml5AtomTable mAtomTable;
+
+  RefPtr<nsHtml5Parser> mOwner;
+
+  bool mLastWasCR;
+
+  eHtml5StreamState mStreamState;
+
+  bool mSpeculating;
+
+  bool mAtEOF;
+
+  nsTArray<mozilla::UniquePtr<nsHtml5Speculation>> mSpeculations;
+  mozilla::Mutex mSpeculationMutex;
+
+  mozilla::Atomic<uint32_t> mSpeculationFailureCount;
+
+  uint32_t mNumBytesBuffered;
+
+  nsTArray<mozilla::Buffer<uint8_t>> mBufferedBytes;
+
+  mozilla::Atomic<bool> mTerminated;
+
+  mozilla::Atomic<bool> mInterrupted;
+
+  nsCOMPtr<nsISerialEventTarget> mEventTarget;
+
+  nsCOMPtr<nsIRunnable> mExecutorFlusher;
+
+  nsCOMPtr<nsIRunnable> mLoadFlusher;
+
+  nsCOMPtr<nsIRunnable> mEncodingCommitter;
+
+  mozilla::UniquePtr<mozilla::EncodingDetector> mDetector;
+
+  nsCString mTLD;
+
+  bool mInitialEncodingWasFromParentFrame;
+
+  bool mHasHadErrors;
+
+  bool mDetectorHasSeenNonAscii;
+
+  bool mDecodingLocalFileWithoutTokenizing;
+
+  bool mBufferingBytes;
+
+  nsCOMPtr<nsITimer> mFlushTimer;
+
+  mozilla::Mutex mFlushTimerMutex;
+
+  bool mFlushTimerArmed;
+
+  bool mFlushTimerEverFired;
+
+  eParserMode mMode;
+
+  nsCOMPtr<nsIURI> mURIToSendToDevtools;
+
+  nsString mUUIDForDevtools;
+
+  uint64_t mBrowserIdForDevtools;
+
+  uint64_t mBrowsingContextIDForDevtools;
+
+  bool mOnStopCalled{false};
+};
+
+#endif  // nsHtml5StreamParser_h

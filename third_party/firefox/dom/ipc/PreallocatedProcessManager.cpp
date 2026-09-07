@@ -1,0 +1,373 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/PreallocatedProcessManager.h"
+
+#include "ProcessPriorityManager.h"
+#include "mozilla/AppShutdown.h"
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/StaticPrefs_dom.h"
+#include "mozilla/dom/ContentParent.h"
+#include "mozilla/dom/ScriptSettings.h"
+#include "nsIPropertyBag2.h"
+#include "nsIXULRuntime.h"
+#include "nsServiceManagerUtils.h"
+#include "nsTArray.h"
+#include "prsystem.h"
+
+using namespace mozilla::hal;
+using namespace mozilla::dom;
+
+namespace mozilla {
+class PreallocatedProcessManagerImpl final : public nsIObserver {
+  friend class PreallocatedProcessManager;
+
+ public:
+  static PreallocatedProcessManagerImpl* Singleton();
+
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+
+  void AddBlocker(ContentParent* aParent);
+  void RemoveBlocker(ContentParent* aParent);
+  UniqueContentParentKeepAlive Take(const nsACString& aRemoteType);
+  void Erase(ContentParent* aParent);
+
+  PreallocatedProcessManagerImpl(const PreallocatedProcessManagerImpl&) =
+      delete;
+
+  const PreallocatedProcessManagerImpl& operator=(
+      const PreallocatedProcessManagerImpl&) = delete;
+
+ private:
+  static const char* const kObserverTopics[];
+
+  static StaticRefPtr<PreallocatedProcessManagerImpl> sSingleton;
+
+  PreallocatedProcessManagerImpl();
+  ~PreallocatedProcessManagerImpl();
+
+  void Init();
+
+  bool CanAllocate();
+  void AllocateAfterDelay();
+  void AllocateOnIdle();
+  void AllocateNow();
+
+  void RereadPrefs();
+  void Enable(uint32_t aProcesses);
+  void Disable();
+  void CloseProcesses();
+
+  bool IsEmpty() const { return mPreallocatedProcesses.IsEmpty(); }
+  static bool IsShutdown() {
+    return AppShutdown::IsInOrBeyond(ShutdownPhase::AppShutdownConfirmed);
+  }
+  bool IsEnabled() { return mEnabled && !IsShutdown(); }
+
+  bool mEnabled;
+  uint32_t mNumberPreallocs;
+  AutoTArray<UniqueContentParentKeepAlive, 3> mPreallocatedProcesses;
+  static uint32_t sNumBlockers;
+  TimeStamp mBlockingStartTime;
+};
+
+uint32_t PreallocatedProcessManagerImpl::sNumBlockers = 0;
+
+const char* const PreallocatedProcessManagerImpl::kObserverTopics[] = {
+    "memory-pressure",
+    "profile-change-teardown",
+    NS_XPCOM_SHUTDOWN_OBSERVER_ID,
+};
+
+StaticRefPtr<PreallocatedProcessManagerImpl>
+    PreallocatedProcessManagerImpl::sSingleton;
+
+PreallocatedProcessManagerImpl* PreallocatedProcessManagerImpl::Singleton() {
+  MOZ_ASSERT(NS_IsMainThread());
+  if (!sSingleton) {
+    sSingleton = new PreallocatedProcessManagerImpl;
+    sSingleton->Init();
+    ClearOnShutdown(&sSingleton);
+  }
+  return sSingleton;
+}
+
+NS_IMPL_ISUPPORTS(PreallocatedProcessManagerImpl, nsIObserver)
+
+PreallocatedProcessManagerImpl::PreallocatedProcessManagerImpl()
+    : mEnabled(false), mNumberPreallocs(1) {}
+
+PreallocatedProcessManagerImpl::~PreallocatedProcessManagerImpl() = default;
+
+void PreallocatedProcessManagerImpl::Init() {
+  Preferences::AddStrongObserver(this, "dom.ipc.processPrelaunch.enabled");
+  Preferences::AddStrongObserver(this, "dom.ipc.processCount");
+  Preferences::AddStrongObserver(this,
+                                 "dom.ipc.processPrelaunch.fission.number");
+
+  nsCOMPtr<nsIObserverService> os = services::GetObserverService();
+  MOZ_ASSERT(os);
+  for (auto topic : kObserverTopics) {
+    os->AddObserver(this, topic,  false);
+  }
+  RereadPrefs();
+}
+
+NS_IMETHODIMP
+PreallocatedProcessManagerImpl::Observe(nsISupports* aSubject,
+                                        const char* aTopic,
+                                        const char16_t* aData) {
+  if (!strcmp("nsPref:changed", aTopic)) {
+    RereadPrefs();
+  } else if (!strcmp(NS_XPCOM_SHUTDOWN_OBSERVER_ID, aTopic) ||
+             !strcmp("profile-change-teardown", aTopic)) {
+    Preferences::RemoveObserver(this, "dom.ipc.processPrelaunch.enabled");
+    Preferences::RemoveObserver(this, "dom.ipc.processCount");
+    Preferences::RemoveObserver(this,
+                                "dom.ipc.processPrelaunch.fission.number");
+
+    nsCOMPtr<nsIObserverService> os = services::GetObserverService();
+    MOZ_ASSERT(os);
+    for (auto topic : kObserverTopics) {
+      os->RemoveObserver(this, topic);
+    }
+  } else if (!strcmp("memory-pressure", aTopic)) {
+    CloseProcesses();
+  } else {
+    MOZ_ASSERT_UNREACHABLE("Unknown topic");
+  }
+
+  return NS_OK;
+}
+
+void PreallocatedProcessManagerImpl::RereadPrefs() {
+  if (mozilla::BrowserTabsRemoteAutostart() &&
+      Preferences::GetBool("dom.ipc.processPrelaunch.enabled")) {
+    int32_t number = 1;
+    if (mozilla::FissionAutostart()) {
+      number = StaticPrefs::dom_ipc_processPrelaunch_fission_number();
+      PRUint64 bytes = PR_GetPhysicalMemorySize();
+      if (bytes > 0 &&
+          bytes <=
+              StaticPrefs::dom_ipc_processPrelaunch_lowmem_mb() * 1024 * 1024) {
+        number = 1;
+      }
+    }
+    if (number >= 0) {
+      Enable(number);
+      if (static_cast<uint64_t>(number) < mPreallocatedProcesses.Length()) {
+        CloseProcesses();
+      }
+    }
+  } else {
+    Disable();
+  }
+}
+
+UniqueContentParentKeepAlive PreallocatedProcessManagerImpl::Take(
+    const nsACString& aRemoteType) {
+  if (!IsEnabled()) {
+    return nullptr;
+  }
+  UniqueContentParentKeepAlive process;
+  if (!IsEmpty()) {
+    process = std::move(mPreallocatedProcesses.ElementAt(0));
+    mPreallocatedProcesses.RemoveElementAt(0);
+
+
+    ContentParent* last = mPreallocatedProcesses.SafeLastElement(nullptr).get();
+    if (!last || !last->IsLaunching()) {
+      AllocateAfterDelay();
+    }
+    MOZ_LOG(ContentParent::GetLog(), LogLevel::Debug,
+            ("Use prealloc process %p%s, %lu available", process.get(),
+             process->IsLaunching() ? " (still launching)" : "",
+             (unsigned long)mPreallocatedProcesses.Length()));
+  }
+  if (process && !process->IsLaunching()) {
+    ProcessPriorityManager::SetProcessPriority(process.get(),
+                                               PROCESS_PRIORITY_FOREGROUND);
+  }  
+
+  return process;
+}
+
+void PreallocatedProcessManagerImpl::Erase(ContentParent* aParent) {
+  (void)mPreallocatedProcesses.RemoveElement(aParent);
+}
+
+void PreallocatedProcessManagerImpl::Enable(uint32_t aProcesses) {
+  mNumberPreallocs = aProcesses;
+  MOZ_LOG(ContentParent::GetLog(), LogLevel::Debug,
+          ("Enabling preallocation: %u", aProcesses));
+  if (mEnabled || IsShutdown()) {
+    return;
+  }
+
+  mEnabled = true;
+  AllocateAfterDelay();
+}
+
+void PreallocatedProcessManagerImpl::AddBlocker(ContentParent* aParent) {
+  if (sNumBlockers == 0) {
+    mBlockingStartTime = TimeStamp::Now();
+  }
+  sNumBlockers++;
+}
+
+void PreallocatedProcessManagerImpl::RemoveBlocker(ContentParent* aParent) {
+
+  MOZ_DIAGNOSTIC_ASSERT(sNumBlockers > 0);
+  sNumBlockers--;
+  if (sNumBlockers == 0) {
+    MOZ_LOG(ContentParent::GetLog(), LogLevel::Debug,
+            ("Blocked preallocation for %fms",
+             (TimeStamp::Now() - mBlockingStartTime).ToMilliseconds()));
+    if (IsEmpty()) {
+      AllocateAfterDelay();
+    }
+  }
+}
+
+bool PreallocatedProcessManagerImpl::CanAllocate() {
+  return IsEnabled() && sNumBlockers == 0 &&
+         mPreallocatedProcesses.Length() < mNumberPreallocs && !IsShutdown() &&
+         (FissionAutostart() ||
+          !ContentParent::IsMaxProcessCountReached(DEFAULT_REMOTE_TYPE));
+}
+
+void PreallocatedProcessManagerImpl::AllocateAfterDelay() {
+  if (!IsEnabled()) {
+    return;
+  }
+  long delay = StaticPrefs::dom_ipc_processPrelaunch_delayMs();
+  MOZ_LOG(ContentParent::GetLog(), LogLevel::Debug,
+          ("Starting delayed process start, delay=%ld", delay));
+  NS_DelayedDispatchToCurrentThread(
+      NewRunnableMethod("PreallocatedProcessManagerImpl::AllocateOnIdle", this,
+                        &PreallocatedProcessManagerImpl::AllocateOnIdle),
+      delay);
+}
+
+void PreallocatedProcessManagerImpl::AllocateOnIdle() {
+  if (!IsEnabled()) {
+    return;
+  }
+
+  MOZ_LOG(ContentParent::GetLog(), LogLevel::Debug,
+          ("Starting process allocate on idle"));
+  NS_DispatchToCurrentThreadQueue(
+      NewRunnableMethod("PreallocatedProcessManagerImpl::AllocateNow", this,
+                        &PreallocatedProcessManagerImpl::AllocateNow),
+      EventQueuePriority::Idle);
+}
+
+void PreallocatedProcessManagerImpl::AllocateNow() {
+  MOZ_LOG(ContentParent::GetLog(), LogLevel::Debug,
+          ("Trying to start process now"));
+  if (!CanAllocate()) {
+    if (IsEnabled() && IsEmpty() && sNumBlockers > 0) {
+      AllocateAfterDelay();
+    }
+    return;
+  }
+
+  UniqueContentParentKeepAlive process = ContentParent::MakePreallocProcess();
+  if (!process) {
+    MOZ_LOG(ContentParent::GetLog(), LogLevel::Debug,
+            ("Failed to launch prealloc process"));
+    return;
+  }
+
+  process->WaitForLaunchAsync(PROCESS_PRIORITY_PREALLOC)
+      ->Then(
+          GetCurrentSerialEventTarget(), __func__,
+          [self = RefPtr{this},
+           process = RefPtr{process.get()}](UniqueContentParentKeepAlive&&) {
+            if (process->IsDead()) {
+              self->Erase(process);
+            } else if (self->CanAllocate()) {
+              if (self->mPreallocatedProcesses.Length() <
+                  self->mNumberPreallocs) {
+                self->AllocateOnIdle();
+              }
+            }
+          },
+          [self = RefPtr{this}, process = RefPtr{process.get()}]() {
+            self->Erase(process);
+          });
+
+  mPreallocatedProcesses.AppendElement(std::move(process));
+  MOZ_LOG(ContentParent::GetLog(), LogLevel::Debug,
+          ("Preallocated = %lu of %d processes",
+           (unsigned long)mPreallocatedProcesses.Length(), mNumberPreallocs));
+}
+
+void PreallocatedProcessManagerImpl::Disable() {
+  if (!mEnabled) {
+    return;
+  }
+
+  mEnabled = false;
+  CloseProcesses();
+}
+
+void PreallocatedProcessManagerImpl::CloseProcesses() {
+  mPreallocatedProcesses.Clear();
+}
+
+inline PreallocatedProcessManagerImpl*
+PreallocatedProcessManager::GetPPMImpl() {
+  if (PreallocatedProcessManagerImpl::IsShutdown()) {
+    return nullptr;
+  }
+  return PreallocatedProcessManagerImpl::Singleton();
+}
+
+bool PreallocatedProcessManager::Enabled() {
+  if (auto impl = GetPPMImpl()) {
+    return impl->IsEnabled();
+  }
+  return false;
+}
+
+void PreallocatedProcessManager::AddBlocker(const nsACString& aRemoteType,
+                                            ContentParent* aParent) {
+  MOZ_LOG(ContentParent::GetLog(), LogLevel::Debug,
+          ("AddBlocker: %s %p (sNumBlockers=%d)",
+           PromiseFlatCString(aRemoteType).get(), aParent,
+           PreallocatedProcessManagerImpl::sNumBlockers));
+  if (auto impl = GetPPMImpl()) {
+    impl->AddBlocker(aParent);
+  }
+}
+
+void PreallocatedProcessManager::RemoveBlocker(const nsACString& aRemoteType,
+                                               ContentParent* aParent) {
+  MOZ_LOG(ContentParent::GetLog(), LogLevel::Debug,
+          ("RemoveBlocker: %s %p (sNumBlockers=%d)",
+           PromiseFlatCString(aRemoteType).get(), aParent,
+           PreallocatedProcessManagerImpl::sNumBlockers));
+  if (auto impl = GetPPMImpl()) {
+    impl->RemoveBlocker(aParent);
+  }
+}
+
+UniqueContentParentKeepAlive PreallocatedProcessManager::Take(
+    const nsACString& aRemoteType) {
+  if (auto impl = GetPPMImpl()) {
+    return impl->Take(aRemoteType);
+  }
+  return nullptr;
+}
+
+void PreallocatedProcessManager::Erase(ContentParent* aParent) {
+  if (auto impl = GetPPMImpl()) {
+    impl->Erase(aParent);
+  }
+}
+
+}  

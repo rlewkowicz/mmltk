@@ -1,0 +1,51 @@
+/*
+ * Copyright 2023 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+#include "src/core/SkReadPixelsRec.h"
+
+#include "include/core/SkRect.h"
+#include "src/base/SkSafeMath.h"
+
+bool SkReadPixelsRec::trim(int srcWidth, int srcHeight) {
+    const size_t minRowBytes = fInfo.minRowBytes();
+    if (nullptr == fPixels || fRowBytes < minRowBytes || minRowBytes == 0) {
+        return false;
+    }
+    if (0 >= fInfo.width() || 0 >= fInfo.height()) {
+        return false;
+    }
+    if (fX == INT_MIN || fY == INT_MIN) {
+        return false;
+    }
+
+    int x = fX;
+    int y = fY;
+    SkIRect srcR = SkIRect::MakeXYWH(x, y, fInfo.width(), fInfo.height());
+    if (!srcR.intersect({0, 0, srcWidth, srcHeight})) {
+        return false;
+    }
+
+    if (x > 0) {
+        x = 0;
+    }
+    if (y > 0) {
+        y = 0;
+    }
+    SkSafeMath safeMath;
+    const size_t y_offset = safeMath.mul(-y, fRowBytes);
+    const size_t x_offset = safeMath.mul(-x, fInfo.bytesPerPixel());
+    const size_t total = safeMath.add(y_offset, x_offset);
+    if (!safeMath.ok()) {
+        return false;
+    }
+
+    fPixels = ((char*)fPixels + total);
+    fInfo = fInfo.makeDimensions(srcR.size());
+    fX = srcR.x();
+    fY = srcR.y();
+
+    return true;
+}

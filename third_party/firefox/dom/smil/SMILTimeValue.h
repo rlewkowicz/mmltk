@@ -1,0 +1,98 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SMIL_SMILTIMEVALUE_H_
+#define DOM_SMIL_SMILTIMEVALUE_H_
+
+#include "mozilla/SMILTypes.h"
+#include "nsDebug.h"
+
+namespace mozilla {
+
+
+class SMILTimeValue {
+ public:
+  SMILTimeValue()
+      : mMilliseconds(kUnresolvedMillis), mState(State::Unresolved) {}
+
+  explicit SMILTimeValue(SMILTime aMillis)
+      : mMilliseconds(aMillis), mState(State::Definite) {}
+
+  static SMILTimeValue Indefinite() {
+    SMILTimeValue value;
+    value.SetIndefinite();
+    return value;
+  }
+
+  static SMILTimeValue Zero() { return SMILTimeValue(SMILTime(0L)); }
+
+  bool IsIndefinite() const { return mState == State::Indefinite; }
+  void SetIndefinite() {
+    mState = State::Indefinite;
+    mMilliseconds = kUnresolvedMillis;
+  }
+
+  bool IsResolved() const { return mState != State::Unresolved; }
+  void SetUnresolved() {
+    mState = State::Unresolved;
+    mMilliseconds = kUnresolvedMillis;
+  }
+
+  bool IsDefinite() const { return mState == State::Definite; }
+  SMILTime GetMillis() const {
+    MOZ_ASSERT(mState == State::Definite,
+               "GetMillis() called for unresolved or indefinite time");
+
+    return mState == State::Definite ? mMilliseconds : kUnresolvedMillis;
+  }
+
+  bool IsZero() const {
+    return mState == State::Definite ? mMilliseconds == 0 : false;
+  }
+
+  void SetMillis(SMILTime aMillis) {
+    mState = State::Definite;
+    mMilliseconds = aMillis;
+  }
+
+  enum class Rounding : uint8_t { EnsureNonZero, Nearest };
+
+  void SetMillis(double aMillis, Rounding aRounding);
+
+  int8_t CompareTo(const SMILTimeValue& aOther) const;
+
+  bool operator==(const SMILTimeValue& aOther) const {
+    return CompareTo(aOther) == 0;
+  }
+
+  bool operator!=(const SMILTimeValue& aOther) const {
+    return CompareTo(aOther) != 0;
+  }
+
+  bool operator<(const SMILTimeValue& aOther) const {
+    return CompareTo(aOther) < 0;
+  }
+
+  bool operator>(const SMILTimeValue& aOther) const {
+    return CompareTo(aOther) > 0;
+  }
+
+  bool operator<=(const SMILTimeValue& aOther) const {
+    return CompareTo(aOther) <= 0;
+  }
+
+  bool operator>=(const SMILTimeValue& aOther) const {
+    return CompareTo(aOther) >= 0;
+  }
+
+ private:
+  static const SMILTime kUnresolvedMillis;
+
+  SMILTime mMilliseconds;
+  enum class State : uint8_t { Definite, Indefinite, Unresolved } mState;
+};
+
+}  
+
+#endif  // DOM_SMIL_SMILTIMEVALUE_H_

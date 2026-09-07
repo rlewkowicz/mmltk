@@ -1,0 +1,46 @@
+/*
+ * Copyright 2014 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkTaskGroup_DEFINED)
+#define SkTaskGroup_DEFINED
+
+#include "include/core/SkExecutor.h"
+#include "include/core/SkTypes.h"
+#include "include/private/base/SkNoncopyable.h"
+
+#include <atomic>
+#include <cstdint>
+#include <functional>
+#include <memory>
+
+class SkTaskGroup : SkNoncopyable {
+public:
+    explicit SkTaskGroup(SkExecutor& executor = SkExecutor::GetDefault());
+    ~SkTaskGroup() { this->wait(); }
+
+    void add(std::function<void(void)> fn);
+    void add(std::function<void(void)> fn, int workList);
+
+    void discardAllPendingWork();
+
+    void batch(int N, std::function<void(int)> fn);
+
+    bool done() const;
+
+    void wait();
+
+    struct Enabler {
+        explicit Enabler(int threads = -1);  
+        std::unique_ptr<SkExecutor> fThreadPool;
+    };
+
+private:
+    std::atomic<int32_t> fPending;
+    SkExecutor&          fExecutor;
+};
+
+#endif

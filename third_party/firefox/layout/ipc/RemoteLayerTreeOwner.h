@@ -1,0 +1,70 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layout_RemoteLayerTreeOwner_h
+#define mozilla_layout_RemoteLayerTreeOwner_h
+
+#include "base/process.h"
+#include "mozilla/dom/ipc/IdType.h"
+#include "mozilla/layers/CompositorOptions.h"
+#include "mozilla/layers/LayersTypes.h"
+#include "nsDisplayList.h"
+
+class nsFrameLoader;
+class nsSubDocumentFrame;
+
+namespace mozilla {
+
+namespace dom {
+class BrowserParent;
+}  
+
+namespace layers {
+struct TextureFactoryIdentifier;
+}  
+
+namespace layout {
+
+class RemoteLayerTreeOwner final {
+  typedef mozilla::layers::CompositorOptions CompositorOptions;
+  typedef mozilla::layers::LayerManager LayerManager;
+  typedef mozilla::layers::LayersId LayersId;
+  typedef mozilla::layers::TextureFactoryIdentifier TextureFactoryIdentifier;
+
+ public:
+  RemoteLayerTreeOwner();
+  virtual ~RemoteLayerTreeOwner();
+
+  bool Initialize(dom::BrowserParent* aBrowserParent);
+  void Destroy();
+
+  void EnsureLayersConnected(Maybe<CompositorOptions>& aCompositorOptions);
+  bool AttachWindowRenderer();
+  void OwnerContentChanged();
+
+  LayersId GetLayersId() const { return mLayersId; }
+  CompositorOptions GetCompositorOptions() const { return mCompositorOptions; }
+
+  void GetTextureFactoryIdentifier(
+      TextureFactoryIdentifier* aTextureFactoryIdentifier) const;
+
+  bool IsInitialized() const { return mInitialized; }
+  bool IsLayersConnected() const { return mLayersConnected; }
+
+ private:
+  base::ProcessId mTabProcessId;
+  LayersId mLayersId;
+  CompositorOptions mCompositorOptions;
+
+  dom::BrowserParent* mBrowserParent;
+  RefPtr<WindowRenderer> mWindowRenderer;
+
+  bool mInitialized;
+  bool mLayersConnected;
+};
+
+}  
+}  
+
+#endif  // mozilla_layout_RemoteLayerTreeOwner_h

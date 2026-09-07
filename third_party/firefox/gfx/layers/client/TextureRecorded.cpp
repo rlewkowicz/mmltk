@@ -1,0 +1,189 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "TextureRecorded.h"
+#include "mozilla/gfx/DrawTargetRecording.h"
+#include "mozilla/layers/CompositableForwarder.h"
+
+#include "RecordedCanvasEventImpl.h"
+
+namespace mozilla {
+namespace layers {
+
+RecordedTextureData::RecordedTextureData(
+    already_AddRefed<CanvasChild> aCanvasChild, gfx::IntSize aSize,
+    gfx::SurfaceFormat aFormat, TextureType aTextureType,
+    TextureType aWebglTextureType)
+    : mRemoteTextureOwnerId(RemoteTextureOwnerId::GetNext()),
+      mCanvasChild(aCanvasChild),
+      mSize(aSize),
+      mFormat(aFormat) {}
+
+RecordedTextureData::~RecordedTextureData() {
+  mSnapshot = nullptr;
+  DetachSnapshotWrapper();
+  if (mDT) {
+    mDT->DetachTextureData(this);
+    mDT = nullptr;
+  }
+  mCanvasChild->RecordEvent(RecordedTextureDestruction(
+      mRemoteTextureOwnerId, ToRemoteTextureTxnType(mFwdTransactionTracker),
+      ToRemoteTextureTxnId(mFwdTransactionTracker)));
+}
+
+void RecordedTextureData::FillInfo(TextureData::Info& aInfo) const {
+  aInfo.size = mSize;
+  aInfo.format = mFormat;
+  aInfo.supportsMoz2D = true;
+  aInfo.hasSynchronization = true;
+}
+
+void RecordedTextureData::InvalidateContents() { mInvalidContents = true; }
+
+bool RecordedTextureData::Lock(OpenMode aMode) {
+  if (!mCanvasChild->EnsureBeginTransaction()) {
+    return false;
+  }
+
+  if (!mDT && mInited) {
+    return false;
+  }
+
+  if (aMode & OpenMode::OPEN_WRITE) {
+    mUsedRemoteTexture = false;
+  }
+
+  bool wasInvalidContents = mInvalidContents;
+  mInvalidContents = false;
+
+  if (!mDT && !mInited) {
+    mInited = true;
+    mDT = mCanvasChild->CreateDrawTarget(mRemoteTextureOwnerId, mSize, mFormat);
+    if (!mDT) {
+      return false;
+    }
+
+    mDT->AttachTextureData(this);
+
+    mLockedMode = aMode;
+    return true;
+  }
+
+  mCanvasChild->RecordEvent(
+      RecordedTextureLock(mRemoteTextureOwnerId, aMode, wasInvalidContents));
+  mLockedMode = aMode;
+  return true;
+}
+
+void RecordedTextureData::DetachSnapshotWrapper(bool aInvalidate,
+                                                bool aRelease) {
+  if (mSnapshotWrapper) {
+    mCanvasChild->DetachSurface(mSnapshotWrapper,
+                                aInvalidate && !mSnapshotWrapper->hasOneRef());
+    if (aRelease) {
+      mSnapshotWrapper = nullptr;
+    }
+  }
+}
+
+void RecordedTextureData::Unlock() {
+  if ((mLockedMode == OpenMode::OPEN_READ_WRITE) &&
+      mCanvasChild->ShouldCacheDataSurface()) {
+    DetachSnapshotWrapper();
+    mSnapshot = mDT->Snapshot();
+    mDT->DetachAllSnapshots();
+    mCanvasChild->RecordEvent(RecordedCacheDataSurface(mSnapshot.get()));
+  }
+
+  mCanvasChild->RecordEvent(RecordedTextureUnlock(mRemoteTextureOwnerId));
+
+  mLockedMode = OpenMode::OPEN_NONE;
+}
+
+already_AddRefed<gfx::DrawTarget> RecordedTextureData::BorrowDrawTarget() {
+  if (mLockedMode & OpenMode::OPEN_WRITE) {
+    mSnapshot = nullptr;
+    DetachSnapshotWrapper(true);
+  }
+  return do_AddRef(mDT);
+}
+
+void RecordedTextureData::EndDraw() {
+  MOZ_ASSERT(mDT->hasOneRef());
+  MOZ_ASSERT(mLockedMode == OpenMode::OPEN_READ_WRITE);
+
+  if (mCanvasChild->ShouldCacheDataSurface()) {
+    DetachSnapshotWrapper();
+    mSnapshot = mDT->Snapshot();
+    mCanvasChild->RecordEvent(RecordedCacheDataSurface(mSnapshot.get()));
+  }
+}
+
+void RecordedTextureData::DrawTargetWillChange() {
+  mSnapshot = nullptr;
+  DetachSnapshotWrapper(true);
+}
+
+already_AddRefed<gfx::SourceSurface> RecordedTextureData::BorrowSnapshot() {
+  if (mSnapshotWrapper) {
+    mCanvasChild->AttachSurface(mSnapshotWrapper);
+    return do_AddRef(mSnapshotWrapper);
+  }
+
+  if (!mDT) {
+    return nullptr;
+  }
+
+  RefPtr<gfx::SourceSurface> wrapper = mCanvasChild->WrapSurface(
+      mSnapshot ? mSnapshot : mDT->Snapshot(), mRemoteTextureOwnerId);
+  mSnapshotWrapper = wrapper;
+  return wrapper.forget();
+}
+
+void RecordedTextureData::ReturnDrawTarget(
+    already_AddRefed<gfx::DrawTarget> aDT) {
+  RefPtr<gfx::DrawTarget> dt(aDT);
+}
+
+void RecordedTextureData::ReturnSnapshot(
+    already_AddRefed<gfx::SourceSurface> aSnapshot) {
+  RefPtr<gfx::SourceSurface> snapshot = aSnapshot;
+  DetachSnapshotWrapper(false, false);
+}
+
+void RecordedTextureData::Deallocate(LayersIPCChannel* aAllocator) {}
+
+bool RecordedTextureData::Serialize(SurfaceDescriptor& aDescriptor) {
+  if (!mUsedRemoteTexture) {
+    mLastRemoteTextureId = RemoteTextureId::GetNext();
+    mCanvasChild->RecordEvent(
+        RecordedPresentTexture(mRemoteTextureOwnerId, mLastRemoteTextureId));
+    mUsedRemoteTexture = true;
+  }
+
+  aDescriptor = SurfaceDescriptorRemoteTexture(mLastRemoteTextureId,
+                                               mRemoteTextureOwnerId);
+  return true;
+}
+
+already_AddRefed<FwdTransactionTracker>
+RecordedTextureData::UseCompositableForwarder(
+    CompositableForwarder* aForwarder) {
+  return FwdTransactionTracker::GetOrCreate(mFwdTransactionTracker);
+}
+
+void RecordedTextureData::OnForwardedToHost() {
+  MOZ_CRASH("OnForwardedToHost not supported!");
+}
+
+TextureFlags RecordedTextureData::GetTextureFlags() const {
+  return TextureFlags::WAIT_HOST_USAGE_END;
+}
+
+bool RecordedTextureData::RequiresRefresh() const {
+  return mCanvasChild->RequiresRefresh(mRemoteTextureOwnerId);
+}
+
+}  
+}  

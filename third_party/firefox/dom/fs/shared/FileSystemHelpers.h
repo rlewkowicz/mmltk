@@ -1,0 +1,94 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_FS_SHARED_FILESYSTEMHELPERS_H_
+#define DOM_FS_SHARED_FILESYSTEMHELPERS_H_
+
+#include "FileSystemTypes.h"
+#include "mozilla/RefPtr.h"
+
+namespace mozilla::dom::fs {
+
+
+
+template <class T>
+class Registered {
+ private:
+  RefPtr<T> mObject;
+
+ public:
+  ~Registered() {
+    if (mObject) {
+      mObject->Unregister();
+    }
+  }
+
+  Registered() = default;
+
+  Registered(const Registered& aOther) : mObject(aOther.mObject) {
+    mObject->Register();
+  }
+
+  Registered(Registered&& aOther) noexcept = default;
+
+  MOZ_IMPLICIT Registered(RefPtr<T> aObject) : mObject(std::move(aObject)) {
+    if (mObject) {
+      mObject->Register();
+    }
+  }
+
+  Registered<T>& operator=(decltype(nullptr)) {
+    RefPtr<T> oldObject = std::move(mObject);
+    mObject = nullptr;
+    if (oldObject) {
+      oldObject->Unregister();
+    }
+    return *this;
+  }
+
+  Registered<T>& operator=(const Registered<T>& aRhs) {
+    if (aRhs.mObject) {
+      aRhs.mObject->Register();
+    }
+    RefPtr<T> oldObject = std::move(mObject);
+    mObject = aRhs.mObject;
+    if (oldObject) {
+      oldObject->Unregister();
+    }
+    return *this;
+  }
+
+  Registered<T>& operator=(Registered<T>&& aRhs) noexcept {
+    RefPtr<T> oldObject = std::move(mObject);
+    mObject = std::move(aRhs.mObject);
+    aRhs.mObject = nullptr;
+    if (oldObject) {
+      oldObject->Unregister();
+    }
+    return *this;
+  }
+
+  const RefPtr<T>& inspect() const { return mObject; }
+
+  RefPtr<T> unwrap() {
+    RefPtr<T> oldObject = std::move(mObject);
+    mObject = nullptr;
+    if (oldObject) {
+      oldObject->Unregister();
+    }
+    return oldObject;
+  }
+
+  T* get() const { return mObject; }
+
+  operator T*() const& { return get(); }
+
+  T* operator->() const { return get(); }
+};
+
+bool IsValidName(const fs::Name& aName);
+
+}  
+
+#endif  // DOM_FS_SHARED_FILESYSTEMHELPERS_H_

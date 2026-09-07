@@ -1,0 +1,98 @@
+// Copyright 2011 Google Inc. All Rights Reserved.
+// Redistribution and use in source and binary forms, with or without
+//     * Redistributions of source code must retain the above copyright
+//     * Redistributions in binary form must reproduce the above
+// copyright notice, this list of conditions and the following disclaimer
+//     * Neither the name of Google Inc. nor the names of its
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+
+#include <stddef.h>
+#include <cstring>
+
+#include "snappy-sinksource.h"
+
+namespace snappy {
+
+Source::~Source() = default;
+
+Sink::~Sink() = default;
+
+char* Sink::GetAppendBuffer(size_t length, char* scratch) {
+  (void)length;
+
+  return scratch;
+}
+
+char* Sink::GetAppendBufferVariable(
+      size_t min_size, size_t desired_size_hint, char* scratch,
+      size_t scratch_size, size_t* allocated_size) {
+  (void)min_size;
+  (void)desired_size_hint;
+
+  *allocated_size = scratch_size;
+  return scratch;
+}
+
+void Sink::AppendAndTakeOwnership(
+    char* bytes, size_t n,
+    void (*deleter)(void*, const char*, size_t),
+    void *deleter_arg) {
+  Append(bytes, n);
+  (*deleter)(deleter_arg, bytes, n);
+}
+
+ByteArraySource::~ByteArraySource() = default;
+
+size_t ByteArraySource::Available() const { return left_; }
+
+const char* ByteArraySource::Peek(size_t* len) {
+  *len = left_;
+  return ptr_;
+}
+
+void ByteArraySource::Skip(size_t n) {
+  left_ -= n;
+  ptr_ += n;
+}
+
+UncheckedByteArraySink::~UncheckedByteArraySink() { }
+
+void UncheckedByteArraySink::Append(const char* data, size_t n) {
+  if (data != dest_) {
+    std::memcpy(dest_, data, n);
+  }
+  dest_ += n;
+}
+
+char* UncheckedByteArraySink::GetAppendBuffer(size_t len, char* scratch) {
+  (void)len;
+  (void)scratch;
+
+  return dest_;
+}
+
+void UncheckedByteArraySink::AppendAndTakeOwnership(
+    char* bytes, size_t n,
+    void (*deleter)(void*, const char*, size_t),
+    void *deleter_arg) {
+  if (bytes != dest_) {
+    std::memcpy(dest_, bytes, n);
+    (*deleter)(deleter_arg, bytes, n);
+  }
+  dest_ += n;
+}
+
+char* UncheckedByteArraySink::GetAppendBufferVariable(
+      size_t min_size, size_t desired_size_hint, char* scratch,
+      size_t scratch_size, size_t* allocated_size) {
+  (void)min_size;
+  (void)scratch;
+  (void)scratch_size;
+
+  *allocated_size = desired_size_hint;
+  return dest_;
+}
+
+}  

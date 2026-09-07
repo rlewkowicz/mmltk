@@ -1,0 +1,294 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_ScrollTimeline_h
+#define mozilla_dom_ScrollTimeline_h
+
+#include "mozilla/AnimationTarget.h"
+#include "mozilla/LinkedList.h"
+#include "mozilla/WritingModes.h"
+#include "mozilla/dom/AnimationTimeline.h"
+
+namespace mozilla {
+enum class StyleScrollAxis : uint8_t;
+enum class StyleScroller : uint8_t;
+enum class StyleOverflow : uint8_t;
+}  
+
+namespace mozilla::layers {
+enum class ScrollDirection : uint8_t;
+}  
+
+namespace mozilla::dom {
+enum class ScrollAxis : uint8_t;
+struct ScrollTimelineOptions;
+}  
+
+#define PROGRESS_TIMELINE_DURATION_MILLISEC 100000
+
+namespace mozilla {
+class ScrollContainerFrame;
+class ElementAnimationData;
+namespace dom {
+class Document;
+class Element;
+
+class ScrollTimeline : public AnimationTimeline,
+                       public LinkedListElement<ScrollTimeline> {
+  template <typename T, typename... Args>
+  friend already_AddRefed<T> mozilla::MakeAndAddRef(Args&&... aArgs);
+
+ protected:
+  struct ScrollerInfo {
+    enum class Type : uint8_t {
+      Provided,
+      Root,
+      Nearest,
+      Name,
+      Self,
+    };
+    Type mType = Type::Root;
+
+   private:
+    OwningAnimationTarget mSourceOrTarget;
+    ScrollerInfo(Type aType, Element* aElement,
+                 const PseudoStyleRequest& aPseudoRequest)
+        : mType{aType}, mSourceOrTarget{aElement, aPseudoRequest} {}
+
+   public:
+    ScrollerInfo() = default;
+
+    bool IsAnonymous() const { return mType != Type::Name; }
+
+    static ScrollerInfo Anonymous(Type aType, Element* aElement,
+                                  const PseudoStyleRequest& aPseudoRequest) {
+      return {aType, aElement, aPseudoRequest};
+    }
+
+    static ScrollerInfo Anonymous(StyleScroller aType,
+                                  const NonOwningAnimationTarget& aTarget) {
+      const auto type = [aType]() {
+        switch (aType) {
+          case StyleScroller::Root:
+            break;
+          case StyleScroller::Nearest:
+            return Type::Nearest;
+          case StyleScroller::SelfElement:
+            return Type::Self;
+          default:
+            MOZ_ASSERT_UNREACHABLE("Unhandled scroller type");
+            break;
+        }
+
+        return Type::Root;
+      }();
+      return {type, aTarget.mElement, aTarget.mPseudoRequest};
+    }
+
+    static ScrollerInfo Named(Element* aElement,
+                              const PseudoStyleRequest& aPseudoRequest) {
+      return {Type::Name, aElement, aPseudoRequest};
+    }
+
+    NonOwningAnimationTarget Source() const;
+    RefPtr<Element>& ElementForCycleCollection() {
+      return mSourceOrTarget.mElement;
+    }
+  };
+
+ public:
+  class StateSnapshot {
+    friend class ScrollTimeline;
+    friend class ViewTimeline;
+
+   public:
+    StateSnapshot() = default;
+
+    layers::ScrollDirection Axis() const { return mPhysicalAxis; }
+    StyleOverflow SourceScrollStyle() const { return mSourceScrollStyle; }
+    bool APZIsActiveForSource() const { return mAPZIsActiveForSource; }
+    Element* SourceElement() const { return mSource.mElement; }
+    bool ScrollingDirectionIsAvailable() const {
+      return mScrollingDirectionAvailable;
+    }
+    bool IsActive() const { return mActive; }
+    const ScrollContainerFrame* GetScrollContainerFrame() const;
+
+   private:
+    StateSnapshot(const NonOwningAnimationTarget& aResolvedSource,
+                  StyleScrollAxis aAxis, bool aIsRoot);
+
+    layers::ScrollDirection ComputePhysicalAxis() const;
+
+    NonOwningAnimationTarget mSource;
+    StyleScrollAxis mAxis{};
+    bool mIsRoot = false;
+
+    bool mActive = false;
+    layers::ScrollDirection mPhysicalAxis{};
+    bool mScrollingDirectionAvailable = false;
+    StyleOverflow mSourceScrollStyle{};
+    bool mAPZIsActiveForSource = false;
+  };
+
+  ScrollTimeline() = delete;
+
+  static already_AddRefed<ScrollTimeline> MakeAnonymous(
+      Document* aDocument, const NonOwningAnimationTarget& aTarget,
+      StyleScrollAxis aAxis, StyleScroller aScroller);
+
+  static already_AddRefed<ScrollTimeline> MakeNamed(
+      Document* aDocument, Element* aReferenceElement,
+      const PseudoStyleRequest& aPseudoRequest, StyleScrollAxis aAxis);
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(ScrollTimeline, AnimationTimeline)
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  MOZ_CAN_RUN_SCRIPT_BOUNDARY
+  static already_AddRefed<ScrollTimeline> Constructor(
+      const GlobalObject& aGlobal, const ScrollTimelineOptions& aOptions,
+      ErrorResult& aRv);
+  Element* GetSource() const;
+  dom::ScrollAxis GetScrollAxis() const;
+
+  StateSnapshot GetSnapshot() const;
+
+  void GetCurrentTime(Nullable<OwningCSSNumberish>& aRetVal) const override;
+  Nullable<TimeDuration> GetCurrentTimeAsDuration() const override;
+  bool TracksWallclockTime() const override { return false; }
+  Nullable<TimeDuration> ToTimelineTime(
+      const TimeStamp& aTimeStamp) const override {
+    return nullptr;
+  }
+  TimeStamp ToTimeStamp(const TimeDuration& aTimelineTime) const override {
+    return {};
+  }
+  Document* GetDocument() const override { return mDocument; }
+  bool IsMonotonicallyIncreasing() const override { return false; }
+  bool IsScrollTimeline() const override { return true; }
+  const ScrollTimeline* AsScrollTimeline() const override { return this; }
+  bool IsViewTimeline() const override { return false; }
+
+  Nullable<TimeDuration> TimelineDuration(
+      const AnimationRange& aRange) const override {
+    const auto interval = IntervalForAttachmentRange(aRange);
+    return TimeDuration::FromMilliseconds(
+        (interval.second > interval.first ? interval.second - interval.first
+                                          : 0.0) *
+        PROGRESS_TIMELINE_DURATION_MILLISEC);
+  }
+
+  void WillRefresh();
+
+  bool UpdateIfStale();
+
+  Element* SourceElement() const { return mScrollerInfo.Source().mElement; }
+
+  virtual NonOwningAnimationTarget TimelineTarget() const {
+    MOZ_ASSERT(!mScrollerInfo.IsAnonymous());
+    return mScrollerInfo.Source();
+  }
+
+  bool SourceMatches(const Element* aElement,
+                     const PseudoStyleRequest& aPseudoRequest) const;
+
+  void ReplacePropertiesWith(const Element* aReferenceElement,
+                             const PseudoStyleRequest& aPseudoRequest,
+                             nsAtom* aName, StyleScrollAxis aAxis);
+
+  void NotifyAnimationUpdated(Animation& aAnimation) override;
+
+  void NotifyAnimationContentVisibilityChanged(Animation* aAnimation,
+                                               bool aIsVisible) override;
+
+  virtual bool UpdateCachedCurrentTime();
+
+  virtual std::pair<double, double> IntervalForAttachmentRange(
+      const AnimationRange& aStyleRange) const;
+
+  void AutoAlignStartTime();
+
+ protected:
+  virtual ~ScrollTimeline();
+  ScrollTimeline(Document* aDocument, const ScrollerInfo& aScrollerInfo,
+                 StyleScrollAxis aAxis);
+
+  void TimelineDataDidChange();
+
+  StateSnapshot ComputeSnapshot() const;
+
+  struct ComputedTimelineData {
+    nscoord mPosition = 0;
+    nscoord mStart = 0;
+    nscoord mEnd = 0;
+  };
+  virtual Maybe<ComputedTimelineData> ComputeTimelineData() const;
+
+  void Teardown() {
+    if (isInList()) {
+      remove();
+    }
+  }
+
+  static std::pair<const Element*, PseudoStyleRequest> FindNearestScroller(
+      Element* aSubject, const PseudoStyleRequest& aPseudoRequest);
+
+  RefPtr<Document> mDocument;
+
+  ScrollerInfo mScrollerInfo;
+  StyleScrollAxis mAxis;
+
+  Maybe<StateSnapshot> mCachedStateSnapshot;
+
+  struct CurrentTimeData {
+    nscoord mPosition = 0;
+    nscoord mMaxScrollOffset = 0;
+    bool operator==(const CurrentTimeData& aOther) const {
+      return mPosition == aOther.mPosition &&
+             mMaxScrollOffset == aOther.mMaxScrollOffset;
+    }
+  };
+
+ private:
+  Maybe<CurrentTimeData> mCachedCurrentTime;
+};
+
+class InactiveTimeline final : public ScrollTimeline {
+ public:
+  Nullable<TimeDuration> GetCurrentTimeAsDuration() const override {
+    return {};
+  }
+
+  TimeStamp ToTimeStamp(const TimeDuration& aTimelineTime) const override {
+    return {};
+  }
+  bool IsInactiveTimeline() const override { return true; }
+
+  JSObject* WrapObject(JSContext*, JS::Handle<JSObject*>) override {
+    return nullptr;
+  }
+
+  Nullable<TimeDuration> TimelineDuration(
+      const AnimationRange&) const override {
+    return TimeDuration::FromMilliseconds(PROGRESS_TIMELINE_DURATION_MILLISEC);
+  }
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(InactiveTimeline, ScrollTimeline)
+
+ private:
+  explicit InactiveTimeline(Document* aDocument);
+  ~InactiveTimeline() override = default;
+
+  template <typename T, typename... Args>
+  friend already_AddRefed<T> mozilla::MakeAndAddRef(Args&&... aArgs);
+};
+
+}  
+}  
+
+#endif  // mozilla_dom_ScrollTimeline_h

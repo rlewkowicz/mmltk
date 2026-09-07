@@ -1,0 +1,220 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "PreferenceSheet.h"
+
+#include "MainThreadUtils.h"
+#include "ServoCSSParser.h"
+#include "mozilla/Encoding.h"
+#include "mozilla/LookAndFeel.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/ServoBindings.h"
+#include "mozilla/StaticPrefs_browser.h"
+#include "mozilla/StaticPrefs_layout.h"
+#include "mozilla/StaticPrefs_ui.h"
+#include "mozilla/StaticPrefs_widget.h"
+#include "mozilla/dom/Document.h"
+#include "nsContentUtils.h"
+
+namespace mozilla {
+
+using dom::Document;
+
+bool PreferenceSheet::sInitialized;
+PreferenceSheet::Prefs PreferenceSheet::sContentPrefs;
+PreferenceSheet::Prefs PreferenceSheet::sChromePrefs;
+PreferenceSheet::Prefs PreferenceSheet::sPrintPrefs;
+
+static void GetColor(const char* aPrefName, ColorScheme aColorScheme,
+                     nscolor& aColor) {
+  nsAutoCString darkPrefName;
+  if (aColorScheme == ColorScheme::Dark) {
+    darkPrefName.Append(aPrefName);
+    darkPrefName.AppendLiteral(".dark");
+    aPrefName = darkPrefName.get();
+  }
+
+  nsAutoCString value;
+  Preferences::GetCString(aPrefName, value);
+  if (value.IsEmpty() || Encoding::UTF8ValidUpTo(value) != value.Length()) {
+    return;
+  }
+  nscolor result;
+  if (!ServoCSSParser::ComputeColor(nullptr, NS_RGB(0, 0, 0), value, &result)) {
+    return;
+  }
+  aColor = result;
+}
+
+auto PreferenceSheet::PrefsKindFor(const Document& aDoc) -> PrefsKind {
+  if (aDoc.IsInChromeDocShell()) {
+    return PrefsKind::Chrome;
+  }
+
+  if (aDoc.IsBeingUsedAsImage() && aDoc.ChromeRulesEnabled()) {
+    return PrefsKind::Chrome;
+  }
+
+  if (aDoc.IsStaticDocument()) {
+    return PrefsKind::Print;
+  }
+
+  return PrefsKind::Content;
+}
+
+static bool UseStandinsForNativeColors() {
+  return nsContentUtils::ShouldResistFingerprinting(
+             "we want to have consistent colors across the browser if RFP is "
+             "enabled, so we check the global preference"
+             "not excluding chrome browsers or webpages, so we call the legacy "
+             "RFP function to prevent that",
+             RFPTarget::UseStandinsForNativeColors) ||
+         StaticPrefs::ui_use_standins_for_native_colors();
+}
+
+void PreferenceSheet::Prefs::LoadColors(bool aIsLight) {
+  auto& colors = aIsLight ? mLightColors : mDarkColors;
+
+  if (!aIsLight) {
+    std::swap(colors.mDefault, colors.mDefaultBackground);
+  }
+
+  const auto scheme = aIsLight ? ColorScheme::Light : ColorScheme::Dark;
+  using ColorID = LookAndFeel::ColorID;
+
+  if (!mIsChrome && (mUseDocumentColors || mUseStandins)) {
+    auto GetStandinColor = [&scheme](ColorID aColorID, nscolor& aColor) {
+      aColor = LookAndFeel::Color(aColorID, scheme,
+                                  LookAndFeel::UseStandins::Yes, aColor);
+    };
+
+    GetStandinColor(ColorID::Windowtext, colors.mDefault);
+    GetStandinColor(ColorID::Window, colors.mDefaultBackground);
+    GetStandinColor(ColorID::Linktext, colors.mLink);
+    GetStandinColor(ColorID::Visitedtext, colors.mVisitedLink);
+    GetStandinColor(ColorID::Activetext, colors.mActiveLink);
+  } else if (!mIsChrome && mUsePrefColors) {
+    GetColor("browser.display.background_color", scheme,
+             colors.mDefaultBackground);
+    GetColor("browser.display.foreground_color", scheme, colors.mDefault);
+    GetColor("browser.anchor_color", scheme, colors.mLink);
+    GetColor("browser.active_color", scheme, colors.mActiveLink);
+    GetColor("browser.visited_color", scheme, colors.mVisitedLink);
+  } else {
+    auto GetSystemColor = [&scheme](ColorID aColorID, nscolor& aColor) {
+      aColor = LookAndFeel::Color(aColorID, scheme,
+                                  LookAndFeel::UseStandins::No, aColor);
+    };
+
+    GetSystemColor(ColorID::Windowtext, colors.mDefault);
+    GetSystemColor(ColorID::Window, colors.mDefaultBackground);
+    GetSystemColor(ColorID::Linktext, colors.mLink);
+    GetSystemColor(ColorID::Visitedtext, colors.mVisitedLink);
+    GetSystemColor(ColorID::Activetext, colors.mActiveLink);
+  }
+
+  colors.mDefaultBackground =
+      NS_ComposeColors(NS_RGB(0xFF, 0xFF, 0xFF), colors.mDefaultBackground);
+}
+
+auto PreferenceSheet::ColorSchemeSettingForChrome()
+    -> ChromeColorSchemeSetting {
+  switch (StaticPrefs::browser_theme_toolbar_theme()) {
+    case 0:  
+      return ChromeColorSchemeSetting::Dark;
+    case 1:  
+      return ChromeColorSchemeSetting::Light;
+    default:
+      return ChromeColorSchemeSetting::System;
+  }
+}
+
+ColorScheme PreferenceSheet::ThemeDerivedColorSchemeForContent() {
+  switch (StaticPrefs::browser_theme_content_theme()) {
+    case 0:  
+      return ColorScheme::Dark;
+    case 1:  
+      return ColorScheme::Light;
+    default:
+      return LookAndFeel::SystemColorScheme();
+  }
+}
+
+void PreferenceSheet::Prefs::Load(bool aIsChrome) {
+  *this = {};
+
+  mIsChrome = aIsChrome;
+  mUseAccessibilityTheme =
+      LookAndFeel::GetInt(LookAndFeel::IntID::UseAccessibilityTheme);
+  if (!aIsChrome) {
+    switch (StaticPrefs::browser_display_document_color_use()) {
+      case 1:
+        mUsePrefColors = false;
+        mUseDocumentColors = true;
+        break;
+      case 2:
+        mUsePrefColors = true;
+        mUseDocumentColors = false;
+        break;
+      default:
+        mUsePrefColors = false;
+        mUseDocumentColors = !mUseAccessibilityTheme;
+        break;
+    }
+    mUseStandins = UseStandinsForNativeColors();
+  }
+
+  LoadColors(true);
+  LoadColors(false);
+
+  mMustUseLightColorSet = mUsePrefColors && !mUseDocumentColors;
+
+  mColorScheme = [&] {
+    if (aIsChrome) {
+      switch (ColorSchemeSettingForChrome()) {
+        case ChromeColorSchemeSetting::Light:
+          return ColorScheme::Light;
+        case ChromeColorSchemeSetting::Dark:
+          return ColorScheme::Dark;
+        case ChromeColorSchemeSetting::System:
+          break;
+      }
+      return LookAndFeel::SystemColorScheme();
+    }
+    if (mMustUseLightColorSet) {
+      return LookAndFeel::IsDarkColor(mLightColors.mDefaultBackground)
+                 ? ColorScheme::Dark
+                 : ColorScheme::Light;
+    }
+    switch (StaticPrefs::layout_css_prefers_color_scheme_content_override()) {
+      case 0:
+        return ColorScheme::Dark;
+      case 1:
+        return ColorScheme::Light;
+      default:
+        return ThemeDerivedColorSchemeForContent();
+    }
+  }();
+}
+
+void PreferenceSheet::Initialize() {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(!sInitialized);
+
+  sInitialized = true;
+
+  sContentPrefs.Load(false);
+  sChromePrefs.Load(true);
+  sPrintPrefs = sContentPrefs;
+  {
+    sPrintPrefs.mColorScheme = ColorScheme::Light;
+    if (!sPrintPrefs.mUseDocumentColors) {
+      sPrintPrefs.mLightColors = Prefs().mLightColors;
+      sPrintPrefs.mUseStandins = true;
+    }
+  }
+
+}
+
+}  

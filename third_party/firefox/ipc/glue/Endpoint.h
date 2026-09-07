@@ -1,0 +1,218 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+#ifndef IPC_GLUE_ENDPOINT_H_
+#define IPC_GLUE_ENDPOINT_H_
+
+#include <utility>
+#include "base/process.h"
+#include "base/process_util.h"
+#include "mozilla/Assertions.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/ipc/MessageLink.h"
+#include "mozilla/ipc/ProtocolUtils.h"
+#include "mozilla/ipc/NodeController.h"
+#include "mozilla/ipc/ScopedPort.h"
+#include "nsXULAppAPI.h"
+#include "nscore.h"
+
+namespace IPC {
+template <class P>
+struct ParamTraits;
+}
+
+namespace mozilla {
+namespace ipc {
+
+namespace endpoint_detail {
+
+template <class T>
+static auto ActorNeedsOtherPidHelper(int)
+    -> decltype(std::declval<T>().OtherPid(), std::true_type{});
+template <class>
+static auto ActorNeedsOtherPidHelper(long) -> std::false_type;
+
+template <typename T>
+constexpr bool ActorNeedsOtherPid =
+    decltype(ActorNeedsOtherPidHelper<T>(0))::value;
+
+}  
+
+struct PrivateIPDLInterface {};
+
+class UntypedEndpoint {
+ public:
+  UntypedEndpoint() = default;
+
+  UntypedEndpoint(const PrivateIPDLInterface&, ScopedPort aPort,
+                  const nsID& aMessageChannelId,
+                  EndpointProcInfo aMyProcInfo = EndpointProcInfo::Invalid(),
+                  EndpointProcInfo aOtherProcInfo = EndpointProcInfo::Invalid())
+      : mPort(std::move(aPort)),
+        mMessageChannelId(aMessageChannelId),
+        mMyProcInfo(aMyProcInfo),
+        mOtherProcInfo(aOtherProcInfo) {}
+
+  UntypedEndpoint(const UntypedEndpoint&) = delete;
+  UntypedEndpoint(UntypedEndpoint&& aOther) = default;
+
+  UntypedEndpoint& operator=(const UntypedEndpoint&) = delete;
+  UntypedEndpoint& operator=(UntypedEndpoint&& aOther) = default;
+
+  bool Bind(IToplevelProtocol* aActor,
+            nsISerialEventTarget* aEventTarget = nullptr) {
+    MOZ_RELEASE_ASSERT(IsValid());
+    MOZ_RELEASE_ASSERT(mMyProcInfo == EndpointProcInfo::Invalid() ||
+                       mMyProcInfo == EndpointProcInfo::Current());
+    MOZ_RELEASE_ASSERT(!aEventTarget || aEventTarget->IsOnCurrentThread());
+    return aActor->Open(std::move(mPort), mMessageChannelId, mOtherProcInfo,
+                        aEventTarget);
+  }
+
+  bool IsValid() const { return mPort.IsValid(); }
+
+ protected:
+  friend struct IPC::ParamTraits<UntypedEndpoint>;
+
+  ScopedPort mPort;
+  nsID mMessageChannelId{};
+  EndpointProcInfo mMyProcInfo;
+  EndpointProcInfo mOtherProcInfo;
+};
+
+template <class PFooSide>
+class Endpoint final : public UntypedEndpoint {
+ public:
+  using UntypedEndpoint::IsValid;
+  using UntypedEndpoint::UntypedEndpoint;
+
+  EndpointProcInfo OtherEndpointProcInfo() const {
+    static_assert(
+        endpoint_detail::ActorNeedsOtherPid<PFooSide>,
+        "OtherPid may only be called on Endpoints for actors which are "
+        "[NeedsOtherPid]");
+    MOZ_RELEASE_ASSERT(mOtherProcInfo != EndpointProcInfo::Invalid());
+    return mOtherProcInfo;
+  }
+
+  base::ProcessId OtherPid() const { return OtherEndpointProcInfo().mPid; }
+
+  GeckoChildID OtherChildID() const { return OtherEndpointProcInfo().mChildID; }
+
+  bool Bind(PFooSide* aActor, nsISerialEventTarget* aEventTarget = nullptr) {
+    return UntypedEndpoint::Bind(aActor, aEventTarget);
+  }
+};
+
+template <class PFooParent, class PFooChild>
+nsresult CreateEndpoints(const PrivateIPDLInterface& aPrivate,
+                         Endpoint<PFooParent>* aParentEndpoint,
+                         Endpoint<PFooChild>* aChildEndpoint) {
+  static_assert(
+      !endpoint_detail::ActorNeedsOtherPid<PFooParent> &&
+          !endpoint_detail::ActorNeedsOtherPid<PFooChild>,
+      "Pids are required when creating endpoints for [NeedsOtherPid] actors");
+
+  auto [parentPort, childPort] =
+      NodeController::GetSingleton()->CreatePortPair();
+  nsID channelId = nsID::GenerateUUID();
+  *aParentEndpoint =
+      Endpoint<PFooParent>(aPrivate, std::move(parentPort), channelId);
+  *aChildEndpoint =
+      Endpoint<PFooChild>(aPrivate, std::move(childPort), channelId);
+  return NS_OK;
+}
+
+template <class PFooParent, class PFooChild>
+nsresult CreateEndpoints(const PrivateIPDLInterface& aPrivate,
+                         EndpointProcInfo aParentDestProcInfo,
+                         EndpointProcInfo aChildDestProcInfo,
+                         Endpoint<PFooParent>* aParentEndpoint,
+                         Endpoint<PFooChild>* aChildEndpoint) {
+  MOZ_RELEASE_ASSERT(aParentDestProcInfo != EndpointProcInfo::Invalid());
+  MOZ_RELEASE_ASSERT(aChildDestProcInfo != EndpointProcInfo::Invalid());
+
+  auto [parentPort, childPort] =
+      NodeController::GetSingleton()->CreatePortPair();
+  nsID channelId = nsID::GenerateUUID();
+  *aParentEndpoint =
+      Endpoint<PFooParent>(aPrivate, std::move(parentPort), channelId,
+                           aParentDestProcInfo, aChildDestProcInfo);
+  *aChildEndpoint =
+      Endpoint<PFooChild>(aPrivate, std::move(childPort), channelId,
+                          aChildDestProcInfo, aParentDestProcInfo);
+  return NS_OK;
+}
+
+class UntypedManagedEndpoint {
+ public:
+  bool IsValid() const { return mInner.isSome(); }
+
+  bool IsValidForManager(IRefCountedProtocol* aManager) const;
+  bool IsValidForManager(const UntypedManagedEndpoint& aManager) const;
+
+  bool IsForProtocol(ProtocolId aProtocolId) const {
+    return !IsValid() || mInner->mType == aProtocolId;
+  }
+
+  UntypedManagedEndpoint(const UntypedManagedEndpoint&) = delete;
+  UntypedManagedEndpoint& operator=(const UntypedManagedEndpoint&) = delete;
+
+ protected:
+  UntypedManagedEndpoint() = default;
+  explicit UntypedManagedEndpoint(IProtocol* aActor);
+
+  UntypedManagedEndpoint(UntypedManagedEndpoint&& aOther) noexcept
+      : mInner(std::move(aOther.mInner)) {
+    aOther.mInner = Nothing();
+  }
+  UntypedManagedEndpoint& operator=(UntypedManagedEndpoint&& aOther) noexcept {
+    this->~UntypedManagedEndpoint();
+    new (this) UntypedManagedEndpoint(std::move(aOther));
+    return *this;
+  }
+
+  ~UntypedManagedEndpoint() noexcept;
+
+  bool BindCommon(IProtocol* aActor, IRefCountedProtocol* aManager);
+
+ private:
+  friend struct IPC::ParamTraits<UntypedManagedEndpoint>;
+
+  struct Inner {
+    RefPtr<WeakActorLifecycleProxy> mOtherSide;
+    RefPtr<WeakActorLifecycleProxy> mToplevel;
+
+    ActorId mId = 0;
+    ProtocolId mType = LastMsgIndex;
+    ActorId mManagerId = 0;
+    ProtocolId mManagerType = LastMsgIndex;
+  };
+  Maybe<Inner> mInner;
+};
+
+template <class PFooSide>
+class ManagedEndpoint : public UntypedManagedEndpoint {
+ public:
+  ManagedEndpoint() = default;
+  ManagedEndpoint(ManagedEndpoint&&) noexcept = default;
+  ManagedEndpoint& operator=(ManagedEndpoint&&) noexcept = default;
+
+  ManagedEndpoint(const PrivateIPDLInterface&, IProtocol* aActor)
+      : UntypedManagedEndpoint(aActor) {}
+
+  bool Bind(const PrivateIPDLInterface&, PFooSide* aActor,
+            IRefCountedProtocol* aManager) {
+    return BindCommon(aActor, aManager);
+  }
+
+  bool operator==(const ManagedEndpoint& _o) const {
+    return !IsValid() && !_o.IsValid();
+  }
+};
+
+}  
+}  
+
+#endif  // IPC_GLUE_ENDPOINT_H_

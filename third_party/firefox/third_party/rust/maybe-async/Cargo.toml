@@ -1,0 +1,41 @@
+
+[package]
+edition = "2021"
+name = "maybe-async"
+version = "0.2.10"
+authors = ["Guoli Lyu <guoli-lv@hotmail.com>"]
+description = "A procedure macro to unify SYNC and ASYNC implementation"
+documentation = "https://docs.rs/maybe-async"
+keywords = [
+    "maybe",
+    "async",
+    "futures",
+    "macros",
+    "proc_macro",
+]
+license = "MIT"
+repository = "https://github.com/fMeow/maybe-async-rs"
+
+[lib]
+path = "src/lib.rs"
+proc-macro = true
+
+[dependencies.proc-macro2]
+version = "1.0"
+
+[dependencies.quote]
+version = "1.0"
+
+[dependencies.syn]
+version = "2.0"
+features = [
+    "visit-mut",
+    "full",
+]
+
+[features]
+default = []
+is_sync = []
+
+[badges.maintenance]
+status = "actively-developed"

@@ -1,0 +1,41 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_PreallocatedProcessManager_h
+#define mozilla_PreallocatedProcessManager_h
+
+#include "base/basictypes.h"
+#include "mozilla/dom/UniqueContentParentKeepAlive.h"
+#include "nsStringFwd.h"
+
+namespace mozilla {
+
+class PreallocatedProcessManagerImpl;
+
+class PreallocatedProcessManager final {
+  using ContentParent = mozilla::dom::ContentParent;
+  using UniqueContentParentKeepAlive =
+      mozilla::dom::UniqueContentParentKeepAlive;
+
+ public:
+  static PreallocatedProcessManagerImpl* GetPPMImpl();
+
+  static bool Enabled();
+
+  static void AddBlocker(const nsACString& aRemoteType, ContentParent* aParent);
+  static void RemoveBlocker(const nsACString& aRemoteType,
+                            ContentParent* aParent);
+
+  static UniqueContentParentKeepAlive Take(const nsACString& aRemoteType);
+
+  static void Erase(ContentParent* aParent);
+
+ private:
+  PreallocatedProcessManager();
+  DISALLOW_EVIL_CONSTRUCTORS(PreallocatedProcessManager);
+};
+
+}  
+
+#endif  // defined mozilla_PreallocatedProcessManager_h

@@ -1,0 +1,1185 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "MediaChangeMonitor.h"
+
+#include "AOMDecoder.h"
+#include "Adts.h"
+#include "AnnexB.h"
+#include "H264.h"
+#include "H265.h"
+#include "ImageContainer.h"
+#include "MP4Decoder.h"
+#include "MediaInfo.h"
+#include "PDMFactory.h"
+#include "VPXDecoder.h"
+#include "gfxUtils.h"
+#include "mozilla/StaticPrefs_media.h"
+#include "mozilla/TaskQueue.h"
+#include "nsPrintfCString.h"
+
+namespace mozilla {
+
+extern LazyLogModule gMediaDecoderLog;
+
+#define LOG(x, ...) \
+  MOZ_LOG_FMT(gMediaDecoderLog, LogLevel::Debug, x, ##__VA_ARGS__)
+
+#define LOGV(x, ...) \
+  MOZ_LOG_FMT(gMediaDecoderLog, LogLevel::Verbose, x, ##__VA_ARGS__)
+
+inline double GetPixelAspectRatio(const gfx::IntSize& aImage,
+                                  const gfx::IntSize& aDisplay) {
+  if (MOZ_UNLIKELY(aImage.IsEmpty() || aDisplay.IsEmpty())) {
+    return 0.0;
+  }
+  return (static_cast<double>(aDisplay.Width()) / aImage.Width()) /
+         (static_cast<double>(aDisplay.Height()) / aImage.Height());
+}
+
+inline gfx::IntSize ApplyPixelAspectRatio(double aPixelAspectRatio,
+                                          const gfx::IntSize& aImage) {
+  if (aPixelAspectRatio == 1.0 || MOZ_UNLIKELY(aPixelAspectRatio <= 0)) {
+    return aImage;
+  }
+  double width = aImage.Width() * aPixelAspectRatio;
+  if (MOZ_UNLIKELY(width > std::numeric_limits<int32_t>::max())) {
+    return aImage;
+  }
+  return gfx::IntSize(static_cast<int32_t>(width), aImage.Height());
+}
+
+static bool IsLogEnabled() {
+  return MOZ_LOG_TEST(gMediaDecoderLog, LogLevel::Info);
+}
+
+
+class H264ChangeMonitor : public MediaChangeMonitor::CodecChangeMonitor {
+ public:
+  explicit H264ChangeMonitor(const CreateDecoderParams& aParams)
+      : mCurrentConfig(aParams.VideoConfig()),
+        mFullParsing(aParams.mOptions.contains(
+            CreateDecoderParams::Option::FullH264Parsing)) {
+    if (CanBeInstantiated()) {
+      UpdateConfigFromExtraData(mCurrentConfig.mExtraData);
+      auto avcc = AVCCConfig::Parse(mCurrentConfig.mExtraData);
+      if (avcc.isOk() && avcc.unwrap().NALUSize() != 4) {
+        mCurrentConfig.mExtraData->ReplaceElementAt(4, 0xfc | 3);
+      }
+    }
+  }
+
+  bool CanBeInstantiated() const override {
+    return H264::HasSPS(mCurrentConfig.mExtraData);
+  }
+
+  MediaResult CheckForChange(MediaRawData* aSample) override {
+    if (!AnnexB::ConvertSampleToAVCC(aSample)) {
+      return MediaResult(NS_ERROR_OUT_OF_MEMORY,
+                         RESULT_DETAIL("ConvertSampleToAVCC"));
+    }
+
+    if (!AnnexB::IsAVCC(aSample)) {
+      return MediaResult(NS_ERROR_DOM_MEDIA_FATAL_ERR,
+                         RESULT_DETAIL("Invalid H264 content"));
+    }
+
+    RefPtr<MediaByteBuffer> extra_data =
+        aSample->mKeyframe || !mGotSPS || mFullParsing
+            ? H264::ExtractExtraData(aSample)
+            : nullptr;
+
+    if (!H264::HasSPS(extra_data) && !H264::HasSPS(mCurrentConfig.mExtraData)) {
+      return NS_ERROR_NOT_INITIALIZED;
+    }
+
+    mGotSPS = true;
+
+    if (!H264::HasSPS(extra_data)) {
+      bool hasOutOfBandExtraData = H264::HasSPS(aSample->mExtraData);
+      if (!hasOutOfBandExtraData || !mPreviousExtraData ||
+          H264::CompareExtraData(aSample->mExtraData, mPreviousExtraData)) {
+        if (hasOutOfBandExtraData && !mPreviousExtraData) {
+          mPreviousExtraData = aSample->mExtraData;
+        }
+        return NS_OK;
+      }
+      extra_data = aSample->mExtraData;
+    } else {
+      if (H264::CompareExtraData(extra_data, mCurrentConfig.mExtraData)) {
+        return NS_OK;
+      }
+    }
+
+    mPreviousExtraData = aSample->mExtraData;
+    UpdateConfigFromExtraData(extra_data);
+
+    if (IsLogEnabled()) {
+      nsPrintfCString msg(
+          "H264ChangeMonitor::CheckForChange has detected a "
+          "change in the stream and will request a new decoder");
+      LOG("{}", msg.get());
+    }
+    return NS_ERROR_DOM_MEDIA_NEED_NEW_DECODER;
+  }
+
+  const TrackInfo& Config() const override { return mCurrentConfig; }
+
+  MediaResult PrepareSample(MediaDataDecoder::ConversionRequired aConversion,
+                            MediaRawData* aSample,
+                            bool aNeedKeyFrame) override {
+    MOZ_DIAGNOSTIC_ASSERT(
+        aConversion == MediaDataDecoder::ConversionRequired::kNeedAnnexB ||
+            aConversion == MediaDataDecoder::ConversionRequired::kNeedAVCC,
+        "Conversion must be either AVCC or AnnexB");
+
+    aSample->mExtraData = mCurrentConfig.mExtraData;
+    aSample->mTrackInfo = mTrackInfo;
+
+    bool appendExtradata = aNeedKeyFrame;
+    if (aConversion == MediaDataDecoder::ConversionRequired::kNeedAnnexB) {
+      auto res = AnnexB::ConvertAVCCSampleToAnnexB(aSample, appendExtradata);
+      if (res.isErr()) {
+        return MediaResult(res.unwrapErr(),
+                           RESULT_DETAIL("ConvertSampleToAnnexB"));
+      }
+    }
+
+    return NS_OK;
+  }
+
+ private:
+  void UpdateConfigFromExtraData(MediaByteBuffer* aExtraData) {
+    SPSData spsdata;
+    if (H264::DecodeSPSFromExtraData(aExtraData, spsdata) &&
+        spsdata.pic_width > 0 && spsdata.pic_height > 0) {
+      H264::EnsureSPSIsSane(spsdata);
+      mCurrentConfig.mImage.width = spsdata.pic_width;
+      mCurrentConfig.mImage.height = spsdata.pic_height;
+      mCurrentConfig.mDisplay.width = spsdata.display_width;
+      mCurrentConfig.mDisplay.height = spsdata.display_height;
+      mCurrentConfig.mColorDepth = spsdata.ColorDepth();
+      mCurrentConfig.mColorSpace = Some(spsdata.ColorSpace());
+      mCurrentConfig.mColorPrimaries = gfxUtils::CicpToColorPrimaries(
+          static_cast<gfx::CICP::ColourPrimaries>(spsdata.colour_primaries),
+          gMediaDecoderLog);
+      mCurrentConfig.mTransferFunction = gfxUtils::CicpToTransferFunction(
+          static_cast<gfx::CICP::TransferCharacteristics>(
+              spsdata.transfer_characteristics));
+      mCurrentConfig.mColorRange = spsdata.video_full_range_flag
+                                       ? gfx::ColorRange::FULL
+                                       : gfx::ColorRange::LIMITED;
+    }
+    mCurrentConfig.mExtraData = aExtraData;
+    mTrackInfo = new TrackInfoSharedPtr(mCurrentConfig, mStreamID++);
+  }
+
+  VideoInfo mCurrentConfig;
+  uint32_t mStreamID = 0;
+  const bool mFullParsing;
+  bool mGotSPS = false;
+  RefPtr<TrackInfoSharedPtr> mTrackInfo;
+  RefPtr<MediaByteBuffer> mPreviousExtraData;
+};
+
+class HEVCChangeMonitor : public MediaChangeMonitor::CodecChangeMonitor {
+ public:
+  explicit HEVCChangeMonitor(const VideoInfo& aInfo) : mCurrentConfig(aInfo) {
+    const bool canBeInstantiated = CanBeInstantiated();
+    if (canBeInstantiated) {
+      UpdateConfigFromExtraData(aInfo.mExtraData);
+    }
+    LOG("created HEVCChangeMonitor, CanBeInstantiated={}", canBeInstantiated);
+  }
+
+  bool CanBeInstantiated() const override {
+    auto rv = HVCCConfig::Parse(mCurrentConfig.mExtraData);
+    if (rv.isErr()) {
+      return false;
+    }
+    return rv.unwrap().HasSPS();
+  }
+
+  MediaResult CheckForChange(MediaRawData* aSample) override {
+    if (auto rv = AnnexB::ConvertSampleToHVCC(aSample); rv.isErr()) {
+      nsPrintfCString msg("Failed to convert to HVCC");
+      LOG("{}", msg.get());
+      return MediaResult(rv.unwrapErr(), msg);
+    }
+
+    if (!AnnexB::IsHVCC(aSample)) {
+      nsPrintfCString msg("Invalid HVCC content");
+      LOG("{}", msg.get());
+      return MediaResult(NS_ERROR_DOM_MEDIA_FATAL_ERR, msg);
+    }
+
+    RefPtr<MediaByteBuffer> extraData =
+        aSample->mKeyframe || !mSPS.IsEmpty()
+            ? H265::ExtractHVCCExtraData(aSample)
+            : nullptr;
+    if (!extraData || extraData->IsEmpty()) {
+      auto sampleConfig = HVCCConfig::Parse(aSample->mExtraData);
+      if (sampleConfig.isOk()) {
+        if (!mPreviousExtraData) {
+          mPreviousExtraData = aSample->mExtraData;
+          return NS_OK;
+        } else if (!H265::CompareExtraData(aSample->mExtraData,
+                                           mPreviousExtraData)) {
+          extraData = aSample->mExtraData;
+        }
+      }
+    }
+    auto curConfig = HVCCConfig::Parse(mCurrentConfig.mExtraData);
+    if ((!extraData || extraData->IsEmpty()) && curConfig.isOk() &&
+        curConfig.inspect().HasSPS()) {
+      LOG("No SPS in sample. Use existing config");
+      return NS_OK;
+    }
+
+    mPreviousExtraData = aSample->mExtraData;
+    auto rv = HVCCConfig::Parse(extraData);
+    if (rv.isErr()) {
+      LOG("Ignore corrupted extradata");
+      return NS_OK;
+    }
+    const HVCCConfig newConfig = rv.unwrap();
+    LOGV("Current config: {}, new config: {}",
+         curConfig.isOk() ? curConfig.inspect().ToString().get() : "invalid",
+         newConfig.ToString().get());
+
+    if (!newConfig.HasSPS() &&
+        (curConfig.isErr() || !curConfig.inspect().HasSPS())) {
+      LOG("No sps found, waiting for initialization");
+      return NS_ERROR_NOT_INITIALIZED;
+    }
+
+    if (H265::CompareExtraData(extraData, mCurrentConfig.mExtraData)) {
+      LOG("No config changed");
+      return NS_OK;
+    }
+    UpdateConfigFromExtraData(extraData);
+
+    if (IsLogEnabled()) {
+      nsPrintfCString msg(
+          "HEVCChangeMonitor::CheckForChange has detected a change in the "
+          "stream and will request a new decoder");
+      LOG("{}", msg.get());
+    }
+    return NS_ERROR_DOM_MEDIA_NEED_NEW_DECODER;
+  }
+
+  const TrackInfo& Config() const override { return mCurrentConfig; }
+
+  MediaResult PrepareSample(MediaDataDecoder::ConversionRequired aConversion,
+                            MediaRawData* aSample,
+                            bool aNeedKeyFrame) override {
+    MOZ_DIAGNOSTIC_ASSERT(
+        aConversion == MediaDataDecoder::ConversionRequired::kNeedAnnexB ||
+        aConversion == MediaDataDecoder::ConversionRequired::kNeedHVCC);
+    MOZ_DIAGNOSTIC_ASSERT(AnnexB::IsHVCC(aSample));
+
+    aSample->mExtraData = mCurrentConfig.mExtraData;
+    aSample->mTrackInfo = mTrackInfo;
+
+    bool appendExtradata = aNeedKeyFrame;
+    if (aSample->mCrypto.IsEncrypted() && !mReceivedFirstEncryptedSample) {
+      LOG("Detected first encrypted sample [{},{}], keyframe={}",
+          aSample->mTime.ToMicroseconds(),
+          aSample->GetEndTime().ToMicroseconds(), aSample->mKeyframe);
+      mReceivedFirstEncryptedSample = true;
+      appendExtradata = true;
+    }
+
+    if (aConversion == MediaDataDecoder::ConversionRequired::kNeedAnnexB) {
+      auto res = AnnexB::ConvertHVCCSampleToAnnexB(aSample, appendExtradata);
+      if (res.isErr()) {
+        return MediaResult(res.unwrapErr(),
+                           RESULT_DETAIL("ConvertSampleToAnnexB"));
+      }
+    }
+    return NS_OK;
+  }
+
+  bool IsHardwareAccelerated(nsACString& aFailureReason) const override {
+    return true;
+  }
+
+  void Flush() override { mReceivedFirstEncryptedSample = false; }
+
+ private:
+  void UpdateConfigFromExtraData(MediaByteBuffer* aExtraData) {
+    auto rv = HVCCConfig::Parse(aExtraData);
+    MOZ_ASSERT(rv.isOk());
+    const auto hvcc = rv.unwrap();
+
+    if (auto nalu = hvcc.GetFirstAvaiableNALU(H265NALU::NAL_TYPES::SPS_NUT)) {
+      mSPS.Clear();
+      mSPS.AppendElements(nalu->mNALU);
+      if (auto rv = H265::DecodeSPSFromSPSNALU(*nalu); rv.isOk()) {
+        const auto sps = rv.unwrap();
+        mCurrentConfig.mImage.width = sps.GetImageSize().Width();
+        mCurrentConfig.mImage.height = sps.GetImageSize().Height();
+        if (const auto& vui = sps.vui_parameters;
+            vui && vui->HasValidAspectRatio()) {
+          mCurrentConfig.mDisplay = ApplyPixelAspectRatio(
+              vui->GetPixelAspectRatio(), mCurrentConfig.mImage);
+        } else {
+          mCurrentConfig.mDisplay.width = sps.GetDisplaySize().Width();
+          mCurrentConfig.mDisplay.height = sps.GetDisplaySize().Height();
+        }
+        mCurrentConfig.mColorDepth = sps.ColorDepth();
+        mCurrentConfig.mColorSpace = Some(sps.ColorSpace());
+        mCurrentConfig.mColorPrimaries = gfxUtils::CicpToColorPrimaries(
+            static_cast<gfx::CICP::ColourPrimaries>(sps.ColorPrimaries()),
+            gMediaDecoderLog);
+        mCurrentConfig.mTransferFunction = gfxUtils::CicpToTransferFunction(
+            static_cast<gfx::CICP::TransferCharacteristics>(
+                sps.TransferFunction()));
+        mCurrentConfig.mColorRange = sps.IsFullColorRange()
+                                         ? gfx::ColorRange::FULL
+                                         : gfx::ColorRange::LIMITED;
+      }
+    }
+    if (auto nalu = hvcc.GetFirstAvaiableNALU(H265NALU::NAL_TYPES::PPS_NUT)) {
+      mPPS.Clear();
+      mPPS.AppendElements(nalu->mNALU);
+    }
+    if (auto nalu = hvcc.GetFirstAvaiableNALU(H265NALU::NAL_TYPES::VPS_NUT)) {
+      mVPS.Clear();
+      mVPS.AppendElements(nalu->mNALU);
+    }
+    if (auto nalu =
+            hvcc.GetFirstAvaiableNALU(H265NALU::NAL_TYPES::PREFIX_SEI_NUT)) {
+      mSEI.Clear();
+      mSEI.AppendElements(nalu->mNALU);
+      if (auto hdrMetadata = H265::ParseSEIHDRMetadata(*nalu)) {
+        mCurrentConfig.mHDRMetadata = std::move(hdrMetadata);
+      }
+    }
+
+    MOZ_ASSERT(!mSPS.IsEmpty());  
+    nsTArray<H265NALU> nalus;
+    if (!mVPS.IsEmpty()) {
+      nalus.AppendElement(H265NALU(mVPS.Elements(), mVPS.Length()));
+    }
+    nalus.AppendElement(H265NALU(mSPS.Elements(), mSPS.Length()));
+    if (!mPPS.IsEmpty()) {
+      nalus.AppendElement(H265NALU(mPPS.Elements(), mPPS.Length()));
+    }
+    if (!mSEI.IsEmpty()) {
+      nalus.AppendElement(H265NALU(mSEI.Elements(), mSEI.Length()));
+    }
+    mCurrentConfig.mExtraData = H265::CreateNewExtraData(hvcc, nalus);
+    mTrackInfo = new TrackInfoSharedPtr(mCurrentConfig, mStreamID++);
+    LOG("Updated extradata, hasSPS={}, hasPPS={}, hasVPS={}, hasSEI={}",
+        !mSPS.IsEmpty(), !mPPS.IsEmpty(), !mVPS.IsEmpty(), !mSEI.IsEmpty());
+  }
+
+  VideoInfo mCurrentConfig;
+
+  nsTArray<uint8_t> mSPS;
+  nsTArray<uint8_t> mPPS;
+  nsTArray<uint8_t> mVPS;
+  nsTArray<uint8_t> mSEI;
+
+  uint32_t mStreamID = 0;
+  RefPtr<TrackInfoSharedPtr> mTrackInfo;
+
+  bool mReceivedFirstEncryptedSample = false;
+  RefPtr<MediaByteBuffer> mPreviousExtraData;
+};
+
+class VPXChangeMonitor : public MediaChangeMonitor::CodecChangeMonitor {
+ public:
+  explicit VPXChangeMonitor(const VideoInfo& aInfo)
+      : mCurrentConfig(aInfo),
+        mCodec(VPXDecoder::IsVP8(aInfo.mMimeType) ? VPXDecoder::Codec::VP8
+                                                  : VPXDecoder::Codec::VP9),
+        mPixelAspectRatio(GetPixelAspectRatio(aInfo.mImage, aInfo.mDisplay)) {
+    mTrackInfo = new TrackInfoSharedPtr(mCurrentConfig, mStreamID++);
+
+    if (mCurrentConfig.mExtraData && !mCurrentConfig.mExtraData->IsEmpty()) {
+      VPXDecoder::VPXStreamInfo vpxInfo;
+      vpxInfo.mImage = mCurrentConfig.mImage;
+      vpxInfo.mDisplay = mCurrentConfig.mDisplay;
+      VPXDecoder::ReadVPCCBox(vpxInfo, mCurrentConfig.mExtraData);
+      mInfo = Some(vpxInfo);
+
+      mCurrentConfig.mTransferFunction = Some(vpxInfo.TransferFunction());
+      mCurrentConfig.mColorPrimaries = Some(vpxInfo.ColorPrimaries());
+      mCurrentConfig.mColorSpace = Some(vpxInfo.ColorSpace());
+    }
+  }
+
+  bool CanBeInstantiated() const override {
+    if (mCodec == VPXDecoder::Codec::VP8 && mCurrentConfig.mImage.IsEmpty()) {
+      return false;
+    }
+
+    return mInfo || mCurrentConfig.mCrypto.IsEncrypted();
+  }
+
+  MediaResult CheckForChange(MediaRawData* aSample) override {
+    if (aSample->mCrypto.IsEncrypted()) {
+      return NS_OK;
+    }
+    auto dataSpan = Span<const uint8_t>(aSample->Data(), aSample->Size());
+
+    VPXDecoder::VPXStreamInfo info;
+    if (!VPXDecoder::GetStreamInfo(dataSpan, info, mCodec)) {
+      return NS_ERROR_DOM_MEDIA_DECODE_ERR;
+    }
+
+    if (!info.mKeyFrame) {
+      return NS_OK;
+    }
+
+    nsresult rv = NS_OK;
+    if (mInfo) {
+      if (mInfo.ref().IsCompatible(info)) {
+        return rv;
+      }
+
+      info.mColorPrimaries = mInfo.ref().mColorPrimaries;
+      info.mTransferFunction = mInfo.ref().mTransferFunction;
+
+      mCurrentConfig.ResetImageRect();
+      rv = NS_ERROR_DOM_MEDIA_NEED_NEW_DECODER;
+    } else if (mCurrentConfig.mImage != info.mImage ||
+               mCurrentConfig.mDisplay != info.mDisplay) {
+      mCurrentConfig.ResetImageRect();
+      rv = NS_ERROR_DOM_MEDIA_NEED_NEW_DECODER;
+    }
+
+    LOG("Detect inband {} resolution changes, image ({},{})->({},{}), display "
+        "({},{})->({},{} {})",
+        mCodec == VPXDecoder::Codec::VP9 ? "VP9" : "VP8",
+        mCurrentConfig.mImage.Width(), mCurrentConfig.mImage.Height(),
+        info.mImage.Width(), info.mImage.Height(),
+        mCurrentConfig.mDisplay.Width(), mCurrentConfig.mDisplay.Height(),
+        info.mDisplay.Width(), info.mDisplay.Height(),
+        info.mDisplayAndImageDifferent ? "specified" : "unspecified");
+
+    bool imageSizeEmpty = mCurrentConfig.mImage.IsEmpty();
+    mInfo = Some(info);
+    mCurrentConfig.mImage = info.mImage;
+    if (imageSizeEmpty || info.mDisplayAndImageDifferent) {
+      mCurrentConfig.mDisplay = info.mDisplay;
+      mPixelAspectRatio = GetPixelAspectRatio(info.mImage, info.mDisplay);
+    } else {
+      mCurrentConfig.mDisplay =
+          ApplyPixelAspectRatio(mPixelAspectRatio, info.mImage);
+    }
+
+    mCurrentConfig.mColorDepth = gfx::ColorDepthForBitDepth(info.mBitDepth);
+    mCurrentConfig.mColorSpace = Some(info.ColorSpace());
+
+
+    mCurrentConfig.mColorRange = info.ColorRange();
+    if (mCodec == VPXDecoder::Codec::VP9) {
+      mCurrentConfig.mExtraData->ClearAndRetainStorage();
+      VPXDecoder::GetVPCCBox(mCurrentConfig.mExtraData, info);
+    }
+    mTrackInfo = new TrackInfoSharedPtr(mCurrentConfig, mStreamID++);
+
+    return rv;
+  }
+
+  const TrackInfo& Config() const override { return mCurrentConfig; }
+
+  MediaResult PrepareSample(MediaDataDecoder::ConversionRequired aConversion,
+                            MediaRawData* aSample,
+                            bool aNeedKeyFrame) override {
+    aSample->mTrackInfo = mTrackInfo;
+
+    return NS_OK;
+  }
+
+ private:
+  VideoInfo mCurrentConfig;
+  const VPXDecoder::Codec mCodec;
+  Maybe<VPXDecoder::VPXStreamInfo> mInfo;
+  uint32_t mStreamID = 0;
+  RefPtr<TrackInfoSharedPtr> mTrackInfo;
+  double mPixelAspectRatio;
+};
+
+class AV1ChangeMonitor : public MediaChangeMonitor::CodecChangeMonitor {
+ public:
+  explicit AV1ChangeMonitor(const VideoInfo& aInfo)
+      : mCurrentConfig(aInfo),
+        mPixelAspectRatio(GetPixelAspectRatio(aInfo.mImage, aInfo.mDisplay)) {
+    mTrackInfo = new TrackInfoSharedPtr(mCurrentConfig, mStreamID++);
+
+    if (mCurrentConfig.mExtraData && !mCurrentConfig.mExtraData->IsEmpty()) {
+      AOMDecoder::AV1SequenceInfo seqInfo;
+      MediaResult seqHdrResult;
+      AOMDecoder::TryReadAV1CBox(mCurrentConfig.mExtraData, seqInfo,
+                                 seqHdrResult);
+      if (seqHdrResult.Code() != NS_OK) {
+        seqInfo.mImage = mCurrentConfig.mImage;
+      }
+
+      UpdateConfig(seqInfo);
+    }
+  }
+
+  bool CanBeInstantiated() const override {
+    return mInfo || mCurrentConfig.mCrypto.IsEncrypted();
+  }
+
+  void UpdateConfig(const AOMDecoder::AV1SequenceInfo& aInfo) {
+    mInfo = Some(aInfo);
+    mCurrentConfig.mColorDepth = gfx::ColorDepthForBitDepth(aInfo.mBitDepth);
+    mCurrentConfig.mColorSpace = gfxUtils::CicpToColorSpace(
+        aInfo.mColorSpace.mMatrix, aInfo.mColorSpace.mPrimaries,
+        gMediaDecoderLog);
+    mCurrentConfig.mColorPrimaries = gfxUtils::CicpToColorPrimaries(
+        aInfo.mColorSpace.mPrimaries, gMediaDecoderLog);
+    mCurrentConfig.mTransferFunction =
+        gfxUtils::CicpToTransferFunction(aInfo.mColorSpace.mTransfer);
+    mCurrentConfig.mColorRange = aInfo.mColorSpace.mRange;
+
+    if (mCurrentConfig.mImage != mInfo->mImage) {
+      gfx::IntSize newDisplay =
+          ApplyPixelAspectRatio(mPixelAspectRatio, aInfo.mImage);
+      LOG("AV1ChangeMonitor detected a resolution change in-band, image "
+          "({},{})->({},{}), display ({},{})->({},{} from PAR)",
+          mCurrentConfig.mImage.Width(), mCurrentConfig.mImage.Height(),
+          aInfo.mImage.Width(), aInfo.mImage.Height(),
+          mCurrentConfig.mDisplay.Width(), mCurrentConfig.mDisplay.Height(),
+          newDisplay.Width(), newDisplay.Height());
+      mCurrentConfig.mImage = aInfo.mImage;
+      mCurrentConfig.mDisplay = newDisplay;
+      mCurrentConfig.ResetImageRect();
+    }
+
+    bool wroteSequenceHeader = false;
+    mCurrentConfig.mExtraData->ClearAndRetainStorage();
+    AOMDecoder::WriteAV1CBox(aInfo, mCurrentConfig.mExtraData.get(),
+                             wroteSequenceHeader);
+    MOZ_ASSERT(wroteSequenceHeader);
+  }
+
+  MediaResult CheckForChange(MediaRawData* aSample) override {
+    if (aSample->mCrypto.IsEncrypted()) {
+      return NS_OK;
+    }
+    auto dataSpan = Span<const uint8_t>(aSample->Data(), aSample->Size());
+
+    AOMDecoder::AV1SequenceInfo info;
+    MediaResult seqHdrResult =
+        AOMDecoder::ReadSequenceHeaderInfo(dataSpan, info);
+    nsresult seqHdrCode = seqHdrResult.Code();
+    if (seqHdrCode == NS_ERROR_DOM_MEDIA_WAITING_FOR_DATA) {
+      return NS_OK;
+    }
+    if (seqHdrCode != NS_OK) {
+      LOG("AV1ChangeMonitor::CheckForChange read a corrupted sample: {}",
+          seqHdrResult.Description().get());
+      return seqHdrResult;
+    }
+
+    nsresult rv = NS_OK;
+    if (mInfo.isSome() &&
+        (mInfo->mProfile != info.mProfile ||
+         mInfo->ColorDepth() != info.ColorDepth() ||
+         mInfo->mMonochrome != info.mMonochrome ||
+         mInfo->mSubsamplingX != info.mSubsamplingX ||
+         mInfo->mSubsamplingY != info.mSubsamplingY ||
+         mInfo->mChromaSamplePosition != info.mChromaSamplePosition ||
+         mInfo->mImage != info.mImage)) {
+      LOG("AV1ChangeMonitor detected a change and requests a new decoder");
+      rv = NS_ERROR_DOM_MEDIA_NEED_NEW_DECODER;
+    }
+
+    UpdateConfig(info);
+
+    if (auto hdrMetadata = AOMDecoder::ReadMetadataOBUHDR(dataSpan)) {
+      mCurrentConfig.mHDRMetadata = std::move(hdrMetadata);
+    }
+
+    if (rv == NS_ERROR_DOM_MEDIA_NEED_NEW_DECODER) {
+      mTrackInfo = new TrackInfoSharedPtr(mCurrentConfig, mStreamID++);
+    }
+    return rv;
+  }
+
+  const TrackInfo& Config() const override { return mCurrentConfig; }
+
+  MediaResult PrepareSample(MediaDataDecoder::ConversionRequired aConversion,
+                            MediaRawData* aSample,
+                            bool aNeedKeyFrame) override {
+    aSample->mTrackInfo = mTrackInfo;
+    return NS_OK;
+  }
+
+ private:
+  VideoInfo mCurrentConfig;
+  Maybe<AOMDecoder::AV1SequenceInfo> mInfo;
+  uint32_t mStreamID = 0;
+  RefPtr<TrackInfoSharedPtr> mTrackInfo;
+  double mPixelAspectRatio;
+};
+
+class AACCodecChangeMonitor : public MediaChangeMonitor::CodecChangeMonitor {
+ public:
+  explicit AACCodecChangeMonitor(const AudioInfo& aInfo)
+      : mCurrentConfig(aInfo), mIsADTS(IsADTS(aInfo)) {}
+
+  bool CanBeInstantiated() const override { return true; }
+
+  MediaResult CheckForChange(MediaRawData* aSample) override {
+    bool isADTS =
+        ADTS::FrameHeader::MatchesSync(Span{aSample->Data(), aSample->Size()});
+    if (isADTS != mIsADTS) {
+      if (mIsADTS) {
+        if (!MakeAACSpecificConfig()) {
+          LOG("Failed to make AAC specific config");
+          return MediaResult(NS_ERROR_DOM_MEDIA_DECODE_ERR);
+        }
+        LOG("Reconfiguring decoder adts -> raw aac, with maked AAC specific "
+            "config: {} bytes",
+            mCurrentConfig.mCodecSpecificConfig
+                .as<AudioCodecSpecificBinaryBlob>()
+                .mBinaryBlob->Length());
+      } else {
+        LOG("Reconfiguring decoder raw aac -> adts");
+        mCurrentConfig.mCodecSpecificConfig =
+            AudioCodecSpecificVariant{NoCodecSpecificData{}};
+      }
+
+      mIsADTS = isADTS;
+      return MediaResult(NS_ERROR_DOM_MEDIA_NEED_NEW_DECODER);
+    }
+    return NS_OK;
+  }
+
+  const TrackInfo& Config() const override { return mCurrentConfig; }
+
+  MediaResult PrepareSample(MediaDataDecoder::ConversionRequired aConversion,
+                            MediaRawData* aSample,
+                            bool aNeedKeyFrame) override {
+    return NS_OK;
+  }
+
+ private:
+  static bool IsADTS(const AudioInfo& aInfo) {
+    return !aInfo.mCodecSpecificConfig.is<AacCodecSpecificData>() &&
+           !aInfo.mCodecSpecificConfig.is<AudioCodecSpecificBinaryBlob>();
+  }
+
+  bool MakeAACSpecificConfig() {
+    MOZ_ASSERT(IsADTS(mCurrentConfig));
+    const uint8_t aacObjectType =
+        mCurrentConfig.mProfile ? mCurrentConfig.mProfile : 2;
+    auto r = ADTS::MakeSpecificConfig(aacObjectType, mCurrentConfig.mRate,
+                                      mCurrentConfig.mChannels);
+    if (r.isErr()) {
+      return false;
+    }
+    mCurrentConfig.mCodecSpecificConfig =
+        AudioCodecSpecificVariant{AudioCodecSpecificBinaryBlob{r.unwrap()}};
+    return true;
+  }
+
+  AudioInfo mCurrentConfig;
+  bool mIsADTS;
+};
+
+MediaChangeMonitor::MediaChangeMonitor(
+    PDMFactory* aPDMFactory,
+    UniquePtr<CodecChangeMonitor>&& aCodecChangeMonitor,
+    MediaDataDecoder* aDecoder, const CreateDecoderParams& aParams)
+    : mChangeMonitor(std::move(aCodecChangeMonitor)),
+      mPDMFactory(aPDMFactory),
+      mCurrentConfig(aParams.mConfig.Clone()),
+      mDecoder(aDecoder),
+      mParams(aParams) {}
+
+RefPtr<PlatformDecoderModule::CreateDecoderPromise> MediaChangeMonitor::Create(
+    PDMFactory* aPDMFactory, const CreateDecoderParams& aParams) {
+  LOG("MediaChangeMonitor::Create, params = {}", aParams.ToString().get());
+  UniquePtr<CodecChangeMonitor> changeMonitor;
+  if (aParams.IsVideo()) {
+    const VideoInfo& config = aParams.VideoConfig();
+    if (VPXDecoder::IsVPX(config.mMimeType)) {
+      changeMonitor = MakeUnique<VPXChangeMonitor>(config);
+    } else if (AOMDecoder::IsAV1(config.mMimeType)) {
+      changeMonitor = MakeUnique<AV1ChangeMonitor>(config);
+    } else if (MP4Decoder::IsHEVC(config.mMimeType)) {
+      changeMonitor = MakeUnique<HEVCChangeMonitor>(config);
+    } else {
+      MOZ_ASSERT(MP4Decoder::IsH264(config.mMimeType));
+      changeMonitor = MakeUnique<H264ChangeMonitor>(aParams);
+    }
+  } else {
+    MOZ_ASSERT(MP4Decoder::IsAAC(aParams.AudioConfig().mMimeType));
+    changeMonitor = MakeUnique<AACCodecChangeMonitor>(aParams.AudioConfig());
+  }
+
+  const CreateDecoderParams updatedParams{changeMonitor->Config(), aParams};
+  LOG("updated params = {}", updatedParams.ToString().get());
+
+  RefPtr<MediaChangeMonitor> instance = new MediaChangeMonitor(
+      aPDMFactory, std::move(changeMonitor), nullptr, updatedParams);
+
+  if (instance->mChangeMonitor->CanBeInstantiated()) {
+    RefPtr<PlatformDecoderModule::CreateDecoderPromise> p =
+        instance->CreateDecoder()->Then(
+            GetCurrentSerialEventTarget(), __func__,
+            [instance = RefPtr{instance}] {
+              return PlatformDecoderModule::CreateDecoderPromise::
+                  CreateAndResolve(instance, __func__);
+            },
+            [](const MediaResult& aError) {
+              return PlatformDecoderModule::CreateDecoderPromise::
+                  CreateAndReject(aError, __func__);
+            });
+    return p;
+  }
+
+  return PlatformDecoderModule::CreateDecoderPromise::CreateAndResolve(
+      instance, __func__);
+}
+
+MediaChangeMonitor::~MediaChangeMonitor() = default;
+
+RefPtr<MediaDataDecoder::InitPromise> MediaChangeMonitor::Init() {
+  mThread = GetCurrentSerialEventTarget();
+  if (mDecoder) {
+    RefPtr<InitPromise> p = mInitPromise.Ensure(__func__);
+    RefPtr<MediaChangeMonitor> self = this;
+    mDecoder->Init()
+        ->Then(GetCurrentSerialEventTarget(), __func__,
+               [self, this](InitPromise::ResolveOrRejectValue&& aValue) {
+                 mInitPromiseRequest.Complete();
+                 if (aValue.IsResolve()) {
+                   mDecoderInitialized = true;
+                   mConversionRequired = Some(mDecoder->NeedsConversion());
+                   mCanRecycleDecoder = Some(CanRecycleDecoder());
+                   if (mPendingSeekThreshold) {
+                     mDecoder->SetSeekThreshold(*mPendingSeekThreshold);
+                     mPendingSeekThreshold.reset();
+                   }
+                 }
+                 return mInitPromise.ResolveOrRejectIfExists(std::move(aValue),
+                                                             __func__);
+               })
+        ->Track(mInitPromiseRequest);
+    return p;
+  }
+
+  return MediaDataDecoder::InitPromise::CreateAndResolve(TrackType::kVideoTrack,
+                                                         __func__);
+}
+
+RefPtr<MediaDataDecoder::DecodePromise> MediaChangeMonitor::Decode(
+    MediaRawData* aSample) {
+  AssertOnThread();
+  MOZ_RELEASE_ASSERT(mFlushPromise.IsEmpty(),
+                     "Flush operation didn't complete");
+
+  MOZ_RELEASE_ASSERT(
+      !mDecodePromiseRequest.Exists() && !mInitPromiseRequest.Exists(),
+      "Can't request a new decode until previous one completed");
+
+  MediaResult rv = CheckForChange(aSample);
+
+  if (rv == NS_ERROR_NOT_INITIALIZED) {
+    if (mParams.mOptions.contains(
+            CreateDecoderParams::Option::ErrorIfNoInitializationData)) {
+      return DecodePromise::CreateAndReject(rv, __func__);
+    }
+    return DecodePromise::CreateAndResolve(DecodedData(), __func__);
+  }
+  if (rv == NS_ERROR_DOM_MEDIA_INITIALIZING_DECODER) {
+    RefPtr<DecodePromise> p = mDecodePromise.Ensure(__func__);
+    return p;
+  }
+
+  if (NS_FAILED(rv)) {
+    return DecodePromise::CreateAndReject(rv, __func__);
+  }
+
+  if (mNeedKeyframe && !aSample->mKeyframe) {
+    return DecodePromise::CreateAndResolve(DecodedData(), __func__);
+  }
+
+  rv = mChangeMonitor->PrepareSample(*mConversionRequired, aSample,
+                                     mNeedKeyframe);
+  if (NS_FAILED(rv)) {
+    return DecodePromise::CreateAndReject(rv, __func__);
+  }
+
+  mNeedKeyframe = false;
+
+  return mDecoder->Decode(aSample);
+}
+
+RefPtr<MediaDataDecoder::FlushPromise> MediaChangeMonitor::Flush() {
+  AssertOnThread();
+  mDecodePromiseRequest.DisconnectIfExists();
+  mDecodePromise.RejectIfExists(NS_ERROR_DOM_MEDIA_CANCELED, __func__);
+  mNeedKeyframe = true;
+  mChangeMonitor->Flush();
+  mPendingFrames.Clear();
+
+  MOZ_RELEASE_ASSERT(mFlushPromise.IsEmpty(), "Previous flush didn't complete");
+
+
+  if (mDrainRequest.Exists() || mFlushRequest.Exists() ||
+      mShutdownRequest.Exists() || mCreateAndInitRequest.Exists() ||
+      mInitPromiseRequest.Exists()) {
+    RefPtr<FlushPromise> p = mFlushPromise.Ensure(__func__);
+    return p;
+  }
+  if (mDecoder && mDecoderInitialized) {
+    return mDecoder->Flush();
+  }
+  return FlushPromise::CreateAndResolve(true, __func__);
+}
+
+RefPtr<MediaDataDecoder::DecodePromise> MediaChangeMonitor::Drain() {
+  AssertOnThread();
+  MOZ_RELEASE_ASSERT(!mDrainRequest.Exists());
+  mNeedKeyframe = true;
+  if (mDecoder) {
+    return mDecoder->Drain();
+  }
+  return DecodePromise::CreateAndResolve(DecodedData(), __func__);
+}
+
+RefPtr<ShutdownPromise> MediaChangeMonitor::Shutdown() {
+  AssertOnThread();
+  mInitPromiseRequest.DisconnectIfExists();
+  mInitPromise.RejectIfExists(NS_ERROR_DOM_MEDIA_CANCELED, __func__);
+  mCreateAndInitRequest.DisconnectIfExists();
+  mDecodePromiseRequest.DisconnectIfExists();
+  mDecodePromise.RejectIfExists(NS_ERROR_DOM_MEDIA_CANCELED, __func__);
+  mDrainRequest.DisconnectIfExists();
+  mFlushRequest.DisconnectIfExists();
+  mFlushPromise.RejectIfExists(NS_ERROR_DOM_MEDIA_CANCELED, __func__);
+  mShutdownRequest.DisconnectIfExists();
+
+  mCreateDecoderHolder.RejectIfExists(
+      MediaResult(NS_ERROR_DOM_MEDIA_CANCELED, __func__), __func__);
+
+  if (mCreateDecoderRequest.Exists()) {
+    return mShutdownWhileCreationPromise.Ensure(__func__);
+  }
+
+  if (mShutdownPromise) {
+    RefPtr<ShutdownPromise> p = std::move(mShutdownPromise);
+    return p;
+  }
+  return ShutdownDecoder();
+}
+
+RefPtr<ShutdownPromise> MediaChangeMonitor::ShutdownDecoder() {
+  AssertOnThread();
+  mConversionRequired.reset();
+  if (mDecoder) {
+    MutexAutoLock lock(mMutex);
+    RefPtr<MediaDataDecoder> decoder = std::move(mDecoder);
+    return decoder->Shutdown();
+  }
+  return ShutdownPromise::CreateAndResolve(true, __func__);
+}
+
+bool MediaChangeMonitor::IsHardwareAccelerated(
+    nsACString& aFailureReason) const {
+  if (mDecoder) {
+    return mDecoder->IsHardwareAccelerated(aFailureReason);
+  }
+  return mChangeMonitor->IsHardwareAccelerated(aFailureReason);
+}
+
+void MediaChangeMonitor::SetSeekThreshold(const media::TimeUnit& aTime) {
+  GetCurrentSerialEventTarget()->Dispatch(NS_NewRunnableFunction(
+      "MediaChangeMonitor::SetSeekThreshold",
+      [self = RefPtr<MediaChangeMonitor>(this), time = aTime, this] {
+        if (mShutdownPromise) {
+          return;
+        }
+        if (mDecoder && mDecoderInitialized) {
+          mDecoder->SetSeekThreshold(time);
+        } else {
+          mPendingSeekThreshold = Some(time);
+        }
+      }));
+}
+
+RefPtr<MediaChangeMonitor::CreateDecoderPromise>
+MediaChangeMonitor::CreateDecoder() {
+  mCurrentConfig = mChangeMonitor->Config().Clone();
+  CreateDecoderParams currentParams = {*mCurrentConfig, mParams};
+  currentParams.mWrappers -= media::Wrapper::MediaChangeMonitor;
+  LOG("MediaChangeMonitor::CreateDecoder, current params = {}",
+      currentParams.ToString().get());
+
+  mDecoderInitialized = false;
+  mNeedKeyframe = true;
+
+  RefPtr<CreateDecoderPromise> p = mCreateDecoderHolder.Ensure(__func__);
+
+  mPDMFactory->CreateDecoder(currentParams)
+      ->Then(
+          GetCurrentSerialEventTarget(), __func__,
+          [self = RefPtr{this}, this](RefPtr<MediaDataDecoder>&& aDecoder) {
+            mCreateDecoderRequest.Complete();
+            if (!mShutdownWhileCreationPromise.IsEmpty()) {
+              aDecoder->Shutdown()->Then(
+                  GetCurrentSerialEventTarget(), __func__,
+                  [self,
+                   this](const ShutdownPromise::ResolveOrRejectValue& aValue) {
+                    mShutdownWhileCreationPromise.ResolveOrReject(aValue,
+                                                                  __func__);
+                  });
+              return;
+            }
+            {
+              MutexAutoLock lock(mMutex);
+              mDecoder = std::move(aDecoder);
+              DDLINKCHILD("decoder", mDecoder.get());
+            }
+            mCreateDecoderHolder.Resolve(true, __func__);
+          },
+          [self = RefPtr{this}, this](const MediaResult& aError) {
+            mCreateDecoderRequest.Complete();
+            if (!mShutdownWhileCreationPromise.IsEmpty()) {
+              mShutdownWhileCreationPromise.Resolve(true, __func__);
+              return;
+            }
+            mCreateDecoderHolder.Reject(aError, __func__);
+          })
+      ->Track(mCreateDecoderRequest);
+
+  return p;
+}
+
+MediaResult MediaChangeMonitor::CreateDecoderAndInit(MediaRawData* aSample) {
+  MOZ_ASSERT(mThread && mThread->IsOnCurrentThread());
+
+  MediaResult rv = mChangeMonitor->CheckForChange(aSample);
+  if (!NS_SUCCEEDED(rv) && rv != NS_ERROR_DOM_MEDIA_NEED_NEW_DECODER) {
+    return rv;
+  }
+
+  if (!mChangeMonitor->CanBeInstantiated()) {
+    return NS_ERROR_NOT_INITIALIZED;
+  }
+
+  CreateDecoder()
+      ->Then(
+          GetCurrentSerialEventTarget(), __func__,
+          [self = RefPtr{this}, this, sample = RefPtr{aSample}] {
+            mCreateAndInitRequest.Complete();
+            mDecoder->Init()
+                ->Then(
+                    GetCurrentSerialEventTarget(), __func__,
+                    [self, sample, this](const TrackType aTrackType) {
+                      mInitPromiseRequest.Complete();
+                      mDecoderInitialized = true;
+                      mConversionRequired = Some(mDecoder->NeedsConversion());
+                      mCanRecycleDecoder = Some(CanRecycleDecoder());
+
+                      if (mPendingSeekThreshold) {
+                        mDecoder->SetSeekThreshold(*mPendingSeekThreshold);
+                        mPendingSeekThreshold.reset();
+                      }
+
+                      if (!mFlushPromise.IsEmpty()) {
+                        mFlushPromise.Resolve(true, __func__);
+                        return;
+                      }
+
+                      DecodeFirstSample(sample);
+                    },
+                    [self, this](const MediaResult& aError) {
+                      mInitPromiseRequest.Complete();
+
+                      if (!mFlushPromise.IsEmpty()) {
+                        mFlushPromise.Reject(aError, __func__);
+                        return;
+                      }
+
+                      mDecodePromise.RejectIfExists(
+                          MediaResult(
+                              aError.Code(),
+                              RESULT_DETAIL("Unable to initialize decoder")),
+                          __func__);
+                    })
+                ->Track(mInitPromiseRequest);
+          },
+          [self = RefPtr{this}, this](const MediaResult& aError) {
+            mCreateAndInitRequest.Complete();
+            if (!mFlushPromise.IsEmpty()) {
+              mFlushPromise.Reject(aError, __func__);
+              return;
+            }
+            mDecodePromise.RejectIfExists(
+                MediaResult(NS_ERROR_DOM_MEDIA_FATAL_ERR,
+                            RESULT_DETAIL("Unable to create decoder")),
+                __func__);
+          })
+      ->Track(mCreateAndInitRequest);
+  return NS_ERROR_DOM_MEDIA_INITIALIZING_DECODER;
+}
+
+bool MediaChangeMonitor::CanRecycleDecoder() const {
+  MOZ_ASSERT(mDecoder);
+  return StaticPrefs::media_decoder_recycle_enabled() &&
+         mDecoder->SupportDecoderRecycling();
+}
+
+void MediaChangeMonitor::DecodeFirstSample(MediaRawData* aSample) {
+  if (mNeedKeyframe && !aSample->mKeyframe &&
+      *mConversionRequired != ConversionRequired::kNeedAnnexB) {
+    mDecodePromise.Resolve(std::move(mPendingFrames), __func__);
+    mPendingFrames = DecodedData();
+    return;
+  }
+
+  MediaResult rv = mChangeMonitor->PrepareSample(*mConversionRequired, aSample,
+                                                 mNeedKeyframe);
+
+  if (NS_FAILED(rv)) {
+    mDecodePromise.Reject(rv, __func__);
+    return;
+  }
+
+  if (aSample->mKeyframe) {
+    mNeedKeyframe = false;
+  }
+
+  RefPtr<MediaChangeMonitor> self = this;
+  mDecoder->Decode(aSample)
+      ->Then(
+          GetCurrentSerialEventTarget(), __func__,
+          [self, this](MediaDataDecoder::DecodedData&& aResults) {
+            mDecodePromiseRequest.Complete();
+            mPendingFrames.AppendElements(std::move(aResults));
+            mDecodePromise.ResolveIfExists(std::move(mPendingFrames), __func__);
+            mPendingFrames = DecodedData();
+          },
+          [self, this](const MediaResult& aError) {
+            mDecodePromiseRequest.Complete();
+            mDecodePromise.RejectIfExists(aError, __func__);
+          })
+      ->Track(mDecodePromiseRequest);
+}
+
+MediaResult MediaChangeMonitor::CheckForChange(MediaRawData* aSample) {
+  if (!mDecoder) {
+    return CreateDecoderAndInit(aSample);
+  }
+
+  MediaResult rv = mChangeMonitor->CheckForChange(aSample);
+
+  if (NS_SUCCEEDED(rv) || rv != NS_ERROR_DOM_MEDIA_NEED_NEW_DECODER) {
+    return rv;
+  }
+
+  if (*mCanRecycleDecoder) {
+    mNeedKeyframe = true;
+    return NS_OK;
+  }
+
+  DrainThenFlushDecoder(aSample);
+  return NS_ERROR_DOM_MEDIA_INITIALIZING_DECODER;
+}
+
+void MediaChangeMonitor::DrainThenFlushDecoder(MediaRawData* aPendingSample) {
+  AssertOnThread();
+  MOZ_ASSERT(mDecoderInitialized);
+  RefPtr<MediaRawData> sample = aPendingSample;
+  RefPtr<MediaChangeMonitor> self = this;
+  mDecoder->Drain()
+      ->Then(
+          GetCurrentSerialEventTarget(), __func__,
+          [self, sample, this](MediaDataDecoder::DecodedData&& aResults) {
+            mDrainRequest.Complete();
+            if (!mFlushPromise.IsEmpty()) {
+              mFlushPromise.Resolve(true, __func__);
+              return;
+            }
+            if (aResults.Length() > 0) {
+              mPendingFrames.AppendElements(std::move(aResults));
+              DrainThenFlushDecoder(sample);
+              return;
+            }
+            FlushThenShutdownDecoder(sample);
+          },
+          [self, this](const MediaResult& aError) {
+            mDrainRequest.Complete();
+            if (!mFlushPromise.IsEmpty()) {
+              mFlushPromise.Reject(aError, __func__);
+              return;
+            }
+            mDecodePromise.RejectIfExists(aError, __func__);
+          })
+      ->Track(mDrainRequest);
+}
+
+void MediaChangeMonitor::FlushThenShutdownDecoder(
+    MediaRawData* aPendingSample) {
+  AssertOnThread();
+  MOZ_ASSERT(mDecoderInitialized);
+  RefPtr<MediaRawData> sample = aPendingSample;
+  RefPtr<MediaChangeMonitor> self = this;
+  mDecoder->Flush()
+      ->Then(
+          GetCurrentSerialEventTarget(), __func__,
+          [self, sample, this]() {
+            mFlushRequest.Complete();
+
+            if (!mFlushPromise.IsEmpty()) {
+              mFlushPromise.Resolve(true, __func__);
+              return;
+            }
+
+            mShutdownPromise = ShutdownDecoder();
+            mShutdownPromise
+                ->Then(
+                    GetCurrentSerialEventTarget(), __func__,
+                    [self, sample, this]() {
+                      mShutdownRequest.Complete();
+                      mShutdownPromise = nullptr;
+
+                      if (!mFlushPromise.IsEmpty()) {
+                        mFlushPromise.Resolve(true, __func__);
+                        return;
+                      }
+
+                      MediaResult rv = CreateDecoderAndInit(sample);
+                      if (rv == NS_ERROR_DOM_MEDIA_INITIALIZING_DECODER) {
+                        return;
+                      }
+                      MOZ_ASSERT(NS_FAILED(rv));
+                      mDecodePromise.RejectIfExists(rv, __func__);
+                      return;
+                    },
+                    [] { MOZ_CRASH("Can't reach here'"); })
+                ->Track(mShutdownRequest);
+          },
+          [self, this](const MediaResult& aError) {
+            mFlushRequest.Complete();
+            if (!mFlushPromise.IsEmpty()) {
+              mFlushPromise.Reject(aError, __func__);
+              return;
+            }
+            mDecodePromise.RejectIfExists(aError, __func__);
+          })
+      ->Track(mFlushRequest);
+}
+
+MediaDataDecoder* MediaChangeMonitor::GetDecoderOnNonOwnerThread() const {
+  MutexAutoLock lock(mMutex);
+  return mDecoder;
+}
+
+#undef LOG
+
+}  

@@ -1,0 +1,311 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_SyncedContext_h
+#define mozilla_dom_SyncedContext_h
+
+#include <array>
+#include <type_traits>
+#include <utility>
+#include "mozilla/BitSet.h"
+#include "mozilla/EnumSet.h"
+#include "nsStringFwd.h"
+#include "nscore.h"
+
+#include "mozilla/ErrorResult.h"
+
+class PickleIterator;
+
+namespace IPC {
+class Message;
+class MessageReader;
+class MessageWriter;
+template <typename T>
+struct ParamTraits;
+}  
+
+namespace mozilla {
+namespace ipc {
+class IProtocol;
+class IPCResult;
+}  
+
+namespace dom {
+class ContentParent;
+class ContentChild;
+template <typename T>
+class MaybeDiscarded;
+
+namespace syncedcontext {
+
+template <size_t I>
+using Index = typename std::integral_constant<size_t, I>;
+
+template <size_t I, size_t S>
+struct Empty {};
+
+template <size_t I, typename T>
+struct Field {
+  T mField{};
+};
+
+template <size_t I, typename T, size_t S>
+using SizedField = std::conditional_t<((sizeof(T) > 8) ? 8 : sizeof(T)) == S,
+                                      Field<I, T>, Empty<I, S>>;
+
+template <typename Context>
+class Transaction {
+ public:
+  using IndexSet = EnumSet<size_t, BitSet<Context::FieldValues::count>>;
+
+  template <size_t I, typename U>
+  void Set(U&& aValue) {
+    mValues.Get(Index<I>{}) = std::forward<U>(aValue);
+    mModified += I;
+  }
+
+  [[nodiscard]] nsresult Commit(Context* aOwner);
+
+  mozilla::ipc::IPCResult CommitFromIPC(const MaybeDiscarded<Context>& aOwner,
+                                        ContentParent* aSource);
+
+  mozilla::ipc::IPCResult CommitFromIPC(const MaybeDiscarded<Context>& aOwner,
+                                        uint64_t aEpoch, ContentChild* aSource);
+
+  void CommitWithoutSyncing(Context* aOwner);
+
+ private:
+  friend struct IPC::ParamTraits<Transaction<Context>>;
+
+  void Write(IPC::MessageWriter* aWriter) const;
+  bool Read(IPC::MessageReader* aReader);
+
+  void Apply(Context* aOwner, bool aFromIPC);
+
+  IndexSet Validate(Context* aOwner, ContentParent* aSource);
+
+  template <typename F>
+  static void EachIndex(F&& aCallback) {
+    Context::FieldValues::EachIndex(aCallback);
+  }
+
+  template <size_t I>
+  static uint64_t& FieldEpoch(Index<I>, Context* aContext) {
+    return std::get<I>(aContext->mFields.mEpochs);
+  }
+
+  typename Context::FieldValues mValues;
+  IndexSet mModified;
+};
+
+template <typename Base, size_t Count>
+class FieldValues : public Base {
+ public:
+  static constexpr size_t count = Count;
+
+  using Base::Get;
+
+  template <typename F>
+  static void EachIndex(F&& aCallback) {
+    EachIndexInner(std::make_index_sequence<count>(),
+                   std::forward<F>(aCallback));
+  }
+
+ private:
+  friend struct IPC::ParamTraits<FieldValues<Base, Count>>;
+
+  void Write(IPC::MessageWriter* aWriter) const;
+  bool Read(IPC::MessageReader* aReader);
+
+  template <typename F, size_t... Indexes>
+  static void EachIndexInner(std::index_sequence<Indexes...> aIndexes,
+                             F&& aCallback) {
+    (aCallback(Index<Indexes>()), ...);
+  }
+};
+
+template <typename Values>
+class FieldStorage {
+ public:
+  Values& RawValues() { return mValues; }
+  const Values& RawValues() const { return mValues; }
+
+  template <size_t I>
+  const auto& Get() const {
+    return RawValues().Get(Index<I>{});
+  }
+
+  template <size_t I, typename U>
+  void SetWithoutSyncing(U&& aValue) {
+    GetNonSyncingReference<I>() = std::move(aValue);
+  }
+
+  template <size_t I>
+  auto& GetNonSyncingReference() {
+    return RawValues().Get(Index<I>{});
+  }
+
+  FieldStorage() = default;
+  explicit FieldStorage(Values&& aInit) : mValues(std::move(aInit)) {}
+
+ private:
+  template <typename Context>
+  friend class Transaction;
+
+  std::array<uint64_t, Values::count> mEpochs{};
+  Values mValues;
+};
+
+enum class CanSetResult : uint8_t {
+  Deny,
+  Allow,
+  Revert,
+};
+
+template <typename T>
+struct GetFieldSetterType {
+  using SetterArg = T;
+};
+template <>
+struct GetFieldSetterType<nsString> {
+  using SetterArg = const nsAString&;
+};
+template <>
+struct GetFieldSetterType<nsCString> {
+  using SetterArg = const nsACString&;
+};
+template <typename T>
+using FieldSetterType = typename GetFieldSetterType<T>::SetterArg;
+
+#define MOZ_DECL_SYNCED_CONTEXT_FIELD_INDEX(name, type) IDX_##name,
+
+#define MOZ_DECL_SYNCED_CONTEXT_FIELD_GETSET(name, type)                       \
+  const type& Get##name() const { return mFields.template Get<IDX_##name>(); } \
+                                                                               \
+  [[nodiscard]] nsresult Set##name(                                            \
+      ::mozilla::dom::syncedcontext::FieldSetterType<type> aValue) {           \
+    Transaction txn;                                                           \
+    txn.template Set<IDX_##name>(std::move(aValue));                           \
+    return txn.Commit(this);                                                   \
+  }                                                                            \
+  void Set##name(::mozilla::dom::syncedcontext::FieldSetterType<type> aValue,  \
+                 ErrorResult& aRv) {                                           \
+    nsresult rv = this->Set##name(std::move(aValue));                          \
+    if (NS_FAILED(rv)) {                                                       \
+      aRv.ThrowInvalidStateError("cannot set synced field '" #name             \
+                                 "': context is discarded");                   \
+    }                                                                          \
+  }
+
+#define MOZ_DECL_SYNCED_CONTEXT_TRANSACTION_SET(name, type)  \
+  template <typename U>                                      \
+  void Set##name(U&& aValue) {                               \
+    this->template Set<IDX_##name>(std::forward<U>(aValue)); \
+  }
+#define MOZ_DECL_SYNCED_CONTEXT_INDEX_TO_NAME(name, type) \
+  case IDX_##name:                                        \
+    return #name;
+
+#define MOZ_DECL_SYNCED_FIELD_INHERIT(name, type) \
+ public                                           \
+  syncedcontext::SizedField<IDX_##name, type, Size>,
+
+#define MOZ_DECL_SYNCED_CONTEXT_BASE_FIELD_GETTER(name, type) \
+  type& Get(FieldIndex<IDX_##name>) {                         \
+    return Field<IDX_##name, type>::mField;                   \
+  }                                                           \
+  const type& Get(FieldIndex<IDX_##name>) const {             \
+    return Field<IDX_##name, type>::mField;                   \
+  }
+
+#define MOZ_DECL_SYNCED_CONTEXT(clazz, eachfield)                              \
+ public:                                                                       \
+              \
+  enum FieldIndexes {                                                          \
+    eachfield(MOZ_DECL_SYNCED_CONTEXT_FIELD_INDEX) SYNCED_FIELD_COUNT          \
+  };                                                                           \
+                                                                               \
+                \
+  template <size_t I>                                                          \
+  using FieldIndex = typename ::mozilla::dom::syncedcontext::Index<I>;         \
+                                                                               \
+                                         \
+  template <size_t Size>                                                       \
+  struct MOZ_EMPTY_BASES Fields                                                \
+      : eachfield(MOZ_DECL_SYNCED_FIELD_INHERIT)                               \
+            syncedcontext::Empty<SYNCED_FIELD_COUNT, Size>{};                  \
+                                                                               \
+                                                                            \
+  struct BaseFieldValues : public Fields<1>,                                   \
+                           public Fields<2>,                                   \
+                           public Fields<4>,                                   \
+                           public Fields<8> {                                  \
+    template <size_t I>                                                        \
+    auto& Get() {                                                              \
+      return Get(FieldIndex<I>{});                                             \
+    }                                                                          \
+    template <size_t I>                                                        \
+    const auto& Get() const {                                                  \
+      return Get(FieldIndex<I>{});                                             \
+    }                                                                          \
+    eachfield(MOZ_DECL_SYNCED_CONTEXT_BASE_FIELD_GETTER)                       \
+  };                                                                           \
+  using FieldValues =                                                          \
+      typename ::mozilla::dom::syncedcontext::FieldValues<BaseFieldValues,     \
+                                                          SYNCED_FIELD_COUNT>; \
+                                                                               \
+ protected:                                                                    \
+  friend class ::mozilla::dom::syncedcontext::Transaction<clazz>;              \
+  ::mozilla::dom::syncedcontext::FieldStorage<FieldValues> mFields;            \
+                                                                               \
+ public:                                                                       \
+                                     \
+  using BaseTransaction = ::mozilla::dom::syncedcontext::Transaction<clazz>;   \
+  class Transaction final : public BaseTransaction {                           \
+   public:                                                                     \
+    eachfield(MOZ_DECL_SYNCED_CONTEXT_TRANSACTION_SET)                         \
+  };                                                                           \
+                                                                               \
+                                         \
+  static const char* FieldIndexToName(size_t aIndex) {                         \
+    switch (aIndex) { eachfield(MOZ_DECL_SYNCED_CONTEXT_INDEX_TO_NAME) }       \
+    return "<unknown>";                                                        \
+  }                                                                            \
+  eachfield(MOZ_DECL_SYNCED_CONTEXT_FIELD_GETSET)
+
+}  
+}  
+}  
+
+namespace IPC {
+
+template <typename Context>
+struct ParamTraits<mozilla::dom::syncedcontext::Transaction<Context>> {
+  using paramType = mozilla::dom::syncedcontext::Transaction<Context>;
+
+  static void Write(MessageWriter* aWriter, const paramType& aParam) {
+    aParam.Write(aWriter);
+  }
+
+  static bool Read(MessageReader* aReader, paramType* aResult) {
+    return aResult->Read(aReader);
+  }
+};
+
+template <typename Base, size_t Count>
+struct ParamTraits<mozilla::dom::syncedcontext::FieldValues<Base, Count>> {
+  using paramType = mozilla::dom::syncedcontext::FieldValues<Base, Count>;
+
+  static void Write(MessageWriter* aWriter, const paramType& aParam) {
+    aParam.Write(aWriter);
+  }
+
+  static bool Read(MessageReader* aReader, paramType* aResult) {
+    return aResult->Read(aReader);
+  }
+};
+
+}  
+
+#endif  // !defined(mozilla_dom_SyncedContext_h)

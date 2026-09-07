@@ -1,0 +1,127 @@
+// Copyright 2017 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef ABSL_BASE_MACROS_H_
+#define ABSL_BASE_MACROS_H_
+
+#include <atomic>
+#include <cassert>
+#include <cstddef>
+
+#include "absl/base/attributes.h"
+#include "absl/base/config.h"
+#include "absl/base/optimization.h"
+#include "absl/base/options.h"
+#include "absl/base/port.h"
+
+#define ABSL_ARRAYSIZE(array) \
+  (sizeof(::absl::macros_internal::ArraySizeHelper(array)))
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace macros_internal {
+template <typename T, size_t N>
+auto ArraySizeHelper(const T (&array)[N]) -> char (&)[N];
+}  
+
+namespace base_internal {
+#if ABSL_HAVE_CPP_ATTRIBUTE(clang::nomerge)
+[[clang::nomerge]]  
+#endif
+[[noreturn]] inline void HardeningAbort() {
+#if ABSL_HAVE_CPP_ATTRIBUTE(clang::nomerge)
+  [[clang::nomerge]]  
+#endif
+  ABSL_INTERNAL_IMMEDIATE_ABORT_IMPL();
+  ABSL_INTERNAL_UNREACHABLE_IMPL();
+}
+}  
+ABSL_NAMESPACE_END
+}  
+
+#if ABSL_INTERNAL_CPLUSPLUS_LANG >= 202002L
+#define ABSL_INTERNAL_UNEVALUATED(expr) (decltype((void)(expr))())
+#else
+#define ABSL_INTERNAL_UNEVALUATED(expr) (false ? (void)(expr) : void())
+#endif
+
+#if ABSL_HAVE_ATTRIBUTE(enable_if)
+#define ABSL_BAD_CALL_IF(expr, msg) \
+  __attribute__((enable_if(expr, "Bad call trap"), unavailable(msg)))
+#endif
+
+#if defined(NDEBUG)
+#define ABSL_ASSERT(expr) ABSL_INTERNAL_UNEVALUATED((expr) ? void() : void())
+#else
+#define ABSL_ASSERT(expr)                           \
+  (ABSL_PREDICT_TRUE((expr)) ? static_cast<void>(0) \
+                             : assert(false && #expr))  // NOLINT
+#endif
+
+#if defined(__CUDACC__) || defined(__CUDA_ARCH__) || defined(__CUDA__)
+#define ABSL_INTERNAL_HARDENING_ABORT()   \
+  do {                                    \
+    ABSL_INTERNAL_IMMEDIATE_ABORT_IMPL(); \
+    ABSL_INTERNAL_UNREACHABLE_IMPL();     \
+  } while (false)
+#else
+#define ABSL_INTERNAL_HARDENING_ABORT() ::absl::base_internal::HardeningAbort()
+#endif
+
+#if (ABSL_OPTION_HARDENED == 1 || ABSL_OPTION_HARDENED == 2) && defined(NDEBUG)
+ #define ABSL_HARDENING_ASSERT(expr)    \
+   do {                                 \
+     if (!ABSL_PREDICT_TRUE((expr))) {  \
+       ABSL_INTERNAL_HARDENING_ABORT(); \
+     }                                  \
+   } while (false)
+#else
+#define ABSL_HARDENING_ASSERT(expr) ABSL_ASSERT(expr)
+#endif
+
+#if ABSL_OPTION_HARDENED == 1 && defined(NDEBUG)
+#define ABSL_HARDENING_ASSERT_SLOW(expr) ABSL_HARDENING_ASSERT(expr)
+#else
+#define ABSL_HARDENING_ASSERT_SLOW(expr) ABSL_ASSERT(expr)
+#endif
+
+#ifdef ABSL_HAVE_EXCEPTIONS
+#define ABSL_INTERNAL_TRY try
+#define ABSL_INTERNAL_CATCH_ANY catch (...)
+#define ABSL_INTERNAL_RETHROW do { throw; } while (false)
+#else  // ABSL_HAVE_EXCEPTIONS
+#define ABSL_INTERNAL_TRY if (true)
+#define ABSL_INTERNAL_CATCH_ANY else if (false)
+#define ABSL_INTERNAL_RETHROW do {} while (false)
+#endif  // ABSL_HAVE_EXCEPTIONS
+
+#if ABSL_HAVE_CPP_ATTRIBUTE(clang::annotate)
+#define ABSL_REFACTOR_INLINE                                                \
+  _Pragma("clang diagnostic push")  \
+      _Pragma("clang diagnostic ignored \"-Wcxx-attribute-extension\"")     \
+          [[clang::annotate("inline-me")]] _Pragma("clang diagnostic pop")
+#else
+#define ABSL_REFACTOR_INLINE
+#endif
+
+#define ABSL_DEPRECATE_AND_INLINE() ABSL_REFACTOR_INLINE
+
+#if ABSL_HAVE_ATTRIBUTE(diagnose_if) && ABSL_HAVE_BUILTIN(__builtin_object_size)
+#define ABSL_INTERNAL_NEED_MIN_SIZE(Obj, N)                     \
+  __attribute__((diagnose_if(__builtin_object_size(Obj, 0) < N, \
+                             "object size provably too small "  \
+                             "(this would corrupt memory)",     \
+                             "error")))
+#else
+#define ABSL_INTERNAL_NEED_MIN_SIZE(Obj, N)
+#endif
+
+#endif  // ABSL_BASE_MACROS_H_

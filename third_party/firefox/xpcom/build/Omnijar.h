@@ -1,0 +1,92 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_Omnijar_h
+#define mozilla_Omnijar_h
+
+#include "nscore.h"
+#include "nsCOMPtr.h"
+#include "nsString.h"
+#include "nsIFile.h"
+#include "nsZipArchive.h"
+
+#include "mozilla/StaticPtr.h"
+
+namespace mozilla {
+
+class Omnijar {
+ private:
+  static StaticRefPtr<nsIFile> sPath[2];
+
+  static StaticRefPtr<nsZipArchive> sReader[2];
+
+  static StaticRefPtr<nsZipArchive> sOuterReader[2];
+
+  static bool sInitialized;
+
+  static bool sIsUnified;
+
+ public:
+  enum Type { GRE = 0, APP = 1 };
+
+ private:
+  static inline bool IsNested(Type aType) {
+    MOZ_ASSERT(IsInitialized(), "Omnijar not initialized");
+    return !!sOuterReader[aType];
+  }
+
+  static inline already_AddRefed<nsZipArchive> GetOuterReader(Type aType) {
+    MOZ_ASSERT(IsInitialized(), "Omnijar not initialized");
+    RefPtr<nsZipArchive> reader = sOuterReader[aType].get();
+    return reader.forget();
+  }
+
+ public:
+  static inline bool IsInitialized() { return sInitialized; }
+
+  static void Init(nsIFile* aGrePath = nullptr, nsIFile* aAppPath = nullptr);
+
+  static nsresult FallibleInit(nsIFile* aGrePath = nullptr,
+                               nsIFile* aAppPath = nullptr);
+
+  static void ChildProcessInit(int& aArgc, char** aArgv);
+
+  static void CleanUp();
+
+  static inline already_AddRefed<nsIFile> GetPath(Type aType) {
+    MOZ_ASSERT(IsInitialized(), "Omnijar not initialized");
+    nsCOMPtr<nsIFile> path = sPath[aType].get();
+    return path.forget();
+  }
+
+  static inline bool HasOmnijar(Type aType) {
+    MOZ_ASSERT(IsInitialized(), "Omnijar not initialized");
+    return !!sPath[aType];
+  }
+
+  static inline already_AddRefed<nsZipArchive> GetReader(Type aType) {
+    MOZ_ASSERT(IsInitialized(), "Omnijar not initialized");
+    RefPtr<nsZipArchive> reader = sReader[aType].get();
+    return reader.forget();
+  }
+
+  static already_AddRefed<nsZipArchive> GetReader(nsIFile* aPath);
+
+  static already_AddRefed<nsZipArchive> GetInnerReader(
+      nsIFile* aPath, const nsACString& aEntry);
+
+  static nsresult GetURIString(Type aType, nsACString& aResult);
+
+ private:
+  static nsresult InitOne(nsIFile* aPath, Type aType);
+  static void CleanUpOne(Type aType);
+}; 
+
+inline bool IsPackagedBuild() {
+  return Omnijar::HasOmnijar(mozilla::Omnijar::GRE);
+}
+
+} 
+
+#endif /* mozilla_Omnijar_h */

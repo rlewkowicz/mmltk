@@ -1,0 +1,146 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(MediaSourceDemuxer_h_)
+#  define MediaSourceDemuxer_h_
+
+#  include "MediaDataDemuxer.h"
+#  include "MediaResource.h"
+#  include "MediaSource.h"
+#  include "TrackBuffersManager.h"
+#  include "mozilla/EventTargetAndLockCapability.h"
+#  include "mozilla/Maybe.h"
+#  include "mozilla/TaskQueue.h"
+#  include "mozilla/dom/MediaDebugInfoBinding.h"
+
+namespace mozilla {
+
+class AbstractThread;
+class MediaResult;
+class MediaSourceTrackDemuxer;
+
+DDLoggedTypeDeclNameAndBase(MediaSourceDemuxer, MediaDataDemuxer);
+DDLoggedTypeNameAndBase(MediaSourceTrackDemuxer, MediaTrackDemuxer);
+
+class MediaSourceDemuxer : public MediaDataDemuxer,
+                           public DecoderDoctorLifeLogger<MediaSourceDemuxer> {
+ public:
+  explicit MediaSourceDemuxer(AbstractThread* aAbstractMainThread);
+
+  RefPtr<InitPromise> Init() override;
+
+  uint32_t GetNumberTracks(TrackInfo::TrackType aType) const override;
+
+  already_AddRefed<MediaTrackDemuxer> GetTrackDemuxer(
+      TrackInfo::TrackType aType, uint32_t aTrackNumber) override;
+
+  bool IsSeekable() const override;
+
+  UniquePtr<EncryptionInfo> GetCrypto() override;
+
+  bool ShouldComputeStartTime() const override { return false; }
+
+  void AttachSourceBuffer(const RefPtr<TrackBuffersManager>& aSourceBuffer);
+  void DetachSourceBuffer(const RefPtr<TrackBuffersManager>& aSourceBuffer);
+  TaskQueue* GetTaskQueue() { return mTaskQueue; }
+  void NotifyInitDataArrived();
+
+  RefPtr<GenericPromise> GetDebugInfo(
+      dom::MediaSourceDemuxerDebugInfo& aInfo) const;
+
+  void AddSizeOfResources(MediaSourceDecoder::ResourceSizes* aSizes);
+
+  static constexpr media::TimeUnit EOS_FUZZ =
+      media::TimeUnit::FromMicroseconds(500000);
+
+  static constexpr media::TimeUnit EOS_FUZZ_START =
+      media::TimeUnit::FromMicroseconds(1000000);
+
+ private:
+  ~MediaSourceDemuxer();
+  friend class MediaSourceTrackDemuxer;
+  bool ScanSourceBuffersForContent();
+  RefPtr<TrackBuffersManager> GetManager(TrackInfo::TrackType aType)
+      MOZ_REQUIRES(mMutex);
+  TrackInfo* GetTrackInfo(TrackInfo::TrackType) MOZ_REQUIRES(mMutex);
+  void DoAttachSourceBuffer(RefPtr<TrackBuffersManager>&& aSourceBuffer);
+  void DoDetachSourceBuffer(const RefPtr<TrackBuffersManager>& aSourceBuffer);
+  bool OnTaskQueue() {
+    return !GetTaskQueue() || GetTaskQueue()->IsCurrentThreadIn();
+  }
+
+  RefPtr<TaskQueue> mTaskQueue;
+  nsTArray<RefPtr<TrackBuffersManager>> mSourceBuffers;
+  MozPromiseHolder<InitPromise> mInitPromise;
+
+  mutable Mutex mMutex;
+  nsTArray<RefPtr<MediaSourceTrackDemuxer>> mDemuxers MOZ_GUARDED_BY(mMutex);
+  RefPtr<TrackBuffersManager> mAudioTrack MOZ_GUARDED_BY(mMutex);
+  RefPtr<TrackBuffersManager> mVideoTrack MOZ_GUARDED_BY(mMutex);
+  MediaInfo mInfo MOZ_GUARDED_BY(mMutex);
+};
+
+class MediaSourceTrackDemuxer
+    : public MediaTrackDemuxer,
+      public DecoderDoctorLifeLogger<MediaSourceTrackDemuxer> {
+ public:
+  MediaSourceTrackDemuxer(MediaSourceDemuxer* aParent,
+                          TrackInfo::TrackType aType,
+                          TrackBuffersManager* aManager)
+      MOZ_REQUIRES(aParent->mMutex);
+
+  UniquePtr<TrackInfo> GetInfo() const override;
+
+  RefPtr<SeekPromise> Seek(const media::TimeUnit& aTime) override;
+
+  RefPtr<SamplesPromise> GetSamples(int32_t aNumSamples = 1) override;
+
+  void Reset() override;
+
+  nsresult GetNextRandomAccessPoint(media::TimeUnit* aTime) override;
+
+  RefPtr<SkipAccessPointPromise> SkipToNextRandomAccessPoint(
+      const media::TimeUnit& aTimeThreshold) override;
+
+  media::TimeIntervals GetBuffered() override;
+
+  void BreakCycles() override;
+
+  bool GetSamplesMayBlock() const override { return false; }
+
+  bool HasManager(TrackBuffersManager* aManager) const;
+  void DetachManager();
+
+ private:
+  mozilla::Mutex& Mutex() MOZ_RETURN_CAPABILITY(mLock.Lock()) {
+    return mLock.Lock();
+  }
+  const EventTargetCapability<mozilla::TaskQueue>& TaskQueue() const
+      MOZ_RETURN_CAPABILITY(mLock.Target()) {
+    return mLock.Target();
+  }
+
+  RefPtr<SeekPromise> DoSeek(const media::TimeUnit& aTime);
+  RefPtr<SamplesPromise> DoGetSamples(int32_t aNumSamples);
+  RefPtr<SkipAccessPointPromise> DoSkipToNextRandomAccessPoint(
+      const media::TimeUnit& aTimeThreadshold);
+  already_AddRefed<MediaRawData> GetSample(MediaResult& aError);
+  media::TimeUnit GetNextRandomAccessPoint();
+
+  RefPtr<MediaSourceDemuxer> mParent;
+
+  TrackInfo::TrackType mType;
+  EventTargetAndLockCapability<mozilla::TaskQueue, mozilla::Mutex> mLock;
+  media::TimeUnit mNextRandomAccessPoint MOZ_GUARDED_BY(mLock);
+  RefPtr<TrackBuffersManager> mManager MOZ_GUARDED_BY(mLock);
+
+  Maybe<RefPtr<MediaRawData>> mNextSample;
+  bool mReset;
+
+  const media::TimeUnit mPreRoll;
+};
+
+}  
+
+#endif

@@ -1,0 +1,81 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef js_experimental_CompileScript_h
+#define js_experimental_CompileScript_h
+
+#include "jspubtd.h"
+#include "js/ErrorReport.h"  // JSErrorReport
+#include "js/experimental/JSStencil.h"
+#include "js/GCAnnotations.h"
+#include "js/Modules.h"
+#include "js/Stack.h"
+#include "js/UniquePtr.h"
+
+namespace js {
+class FrontendContext;
+namespace frontend {
+struct CompilationInput;
+}  
+}  
+
+namespace JS {
+using FrontendContext = js::FrontendContext;
+
+JS_PUBLIC_API JS::FrontendContext* NewFrontendContext();
+
+JS_PUBLIC_API void DestroyFrontendContext(JS::FrontendContext* fc);
+
+JS_PUBLIC_API void SetNativeStackQuota(JS::FrontendContext* fc,
+                                       JS::NativeStackSize stackSize);
+
+JS_PUBLIC_API JS::NativeStackSize ThreadStackQuotaForSize(size_t stackSize);
+
+JS_PUBLIC_API bool HadFrontendErrors(JS::FrontendContext* fc);
+
+JS_PUBLIC_API bool ConvertFrontendErrorsToRuntimeErrors(
+    JSContext* cx, JS::FrontendContext* fc,
+    const JS::ReadOnlyCompileOptions& options);
+
+JS_PUBLIC_API const JSErrorReport* GetFrontendErrorReport(
+    JS::FrontendContext* fc, const JS::ReadOnlyCompileOptions& options);
+
+JS_PUBLIC_API bool HadFrontendOverRecursed(JS::FrontendContext* fc);
+
+JS_PUBLIC_API bool HadFrontendOutOfMemory(JS::FrontendContext* fc);
+
+JS_PUBLIC_API bool HadFrontendAllocationOverflow(JS::FrontendContext* fc);
+
+JS_PUBLIC_API void ClearFrontendErrors(JS::FrontendContext* fc);
+
+JS_PUBLIC_API size_t GetFrontendWarningCount(JS::FrontendContext* fc);
+
+JS_PUBLIC_API const JSErrorReport* GetFrontendWarningAt(
+    JS::FrontendContext* fc, size_t index,
+    const JS::ReadOnlyCompileOptions& options);
+
+extern JS_PUBLIC_API already_AddRefed<JS::Stencil> CompileGlobalScriptToStencil(
+    JS::FrontendContext* fc, const JS::ReadOnlyCompileOptions& options,
+    JS::SourceText<mozilla::Utf8Unit>& srcBuf);
+
+extern JS_PUBLIC_API already_AddRefed<JS::Stencil> CompileGlobalScriptToStencil(
+    JS::FrontendContext* fc, const JS::ReadOnlyCompileOptions& options,
+    JS::SourceText<char16_t>& srcBuf);
+
+extern JS_PUBLIC_API already_AddRefed<JS::Stencil> CompileModuleScriptToStencil(
+    JS::FrontendContext* fc, const JS::ReadOnlyCompileOptions& options,
+    JS::SourceText<mozilla::Utf8Unit>& srcBuf);
+
+extern JS_PUBLIC_API already_AddRefed<JS::Stencil> CompileModuleScriptToStencil(
+    JS::FrontendContext* fc, const JS::ReadOnlyCompileOptions& options,
+    JS::SourceText<char16_t>& srcBuf);
+
+extern JS_PUBLIC_API bool PrepareForInstantiate(
+    JS::FrontendContext* fc, JS::Stencil& stencil,
+    JS::InstantiationStorage& storage);
+
+}  
+
+#endif  // js_experimental_CompileScript_h

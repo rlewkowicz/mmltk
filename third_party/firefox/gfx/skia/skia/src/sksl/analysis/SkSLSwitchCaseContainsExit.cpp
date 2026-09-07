@@ -1,0 +1,91 @@
+/*
+ * Copyright 2021 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "src/sksl/SkSLAnalysis.h"
+
+#include "src/sksl/analysis/SkSLProgramVisitor.h"
+#include "src/sksl/ir/SkSLIRNode.h"
+#include "src/sksl/ir/SkSLStatement.h"
+
+namespace SkSL {
+
+class Expression;
+
+namespace {
+
+class SwitchCaseContainsExit : public ProgramVisitor {
+public:
+    SwitchCaseContainsExit(bool conditionalExits) : fConditionalExits(conditionalExits) {}
+
+    bool visitExpression(const Expression& expr) override {
+        return false;
+    }
+
+    bool visitStatement(const Statement& stmt) override {
+        switch (stmt.kind()) {
+            case Statement::Kind::kBlock:
+            case Statement::Kind::kSwitchCase:
+                return INHERITED::visitStatement(stmt);
+
+            case Statement::Kind::kReturn:
+                return fConditionalExits ? fInConditional : !fInConditional;
+
+            case Statement::Kind::kContinue:
+                return !fInLoop &&
+                       (fConditionalExits ? fInConditional : !fInConditional);
+
+            case Statement::Kind::kBreak:
+                return !fInLoop && !fInSwitch &&
+                       (fConditionalExits ? fInConditional : !fInConditional);
+
+            case Statement::Kind::kIf: {
+                ++fInConditional;
+                bool result = INHERITED::visitStatement(stmt);
+                --fInConditional;
+                return result;
+            }
+
+            case Statement::Kind::kFor:
+            case Statement::Kind::kDo: {
+                ++fInConditional;
+                ++fInLoop;
+                bool result = INHERITED::visitStatement(stmt);
+                --fInLoop;
+                --fInConditional;
+                return result;
+            }
+
+            case Statement::Kind::kSwitch: {
+                ++fInSwitch;
+                bool result = INHERITED::visitStatement(stmt);
+                --fInSwitch;
+                return result;
+            }
+
+            default:
+                return false;
+        }
+    }
+
+    bool fConditionalExits = false;
+    int fInConditional = 0;
+    int fInLoop = 0;
+    int fInSwitch = 0;
+    using INHERITED = ProgramVisitor;
+};
+
+}  
+
+bool Analysis::SwitchCaseContainsUnconditionalExit(const Statement& stmt) {
+    return SwitchCaseContainsExit{false}.visitStatement(stmt);
+}
+
+bool Analysis::SwitchCaseContainsConditionalExit(const Statement& stmt) {
+    return SwitchCaseContainsExit{true}.visitStatement(stmt);
+}
+
+}  

@@ -1,0 +1,69 @@
+/*
+ * Copyright © 2014 Mozilla Foundation
+ *
+ * This program is made available under an ISC-style license.  See the
+ * accompanying file LICENSE for details.
+ */
+#ifndef CUBEB_RESAMPLER_H
+#define CUBEB_RESAMPLER_H
+
+#include "cubeb/cubeb.h"
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+typedef struct cubeb_resampler cubeb_resampler;
+
+typedef enum {
+  CUBEB_RESAMPLER_QUALITY_VOIP,
+  CUBEB_RESAMPLER_QUALITY_DEFAULT,
+  CUBEB_RESAMPLER_QUALITY_DESKTOP
+} cubeb_resampler_quality;
+
+typedef enum {
+  CUBEB_RESAMPLER_RECLOCK_NONE,
+  CUBEB_RESAMPLER_RECLOCK_INPUT
+} cubeb_resampler_reclock;
+
+cubeb_resampler *
+cubeb_resampler_create(cubeb_stream * stream,
+                       cubeb_stream_params * input_params,
+                       cubeb_stream_params * output_params,
+                       unsigned int target_rate, cubeb_data_callback callback,
+                       void * user_ptr, cubeb_resampler_quality quality,
+                       cubeb_resampler_reclock reclock);
+
+long
+cubeb_resampler_fill(cubeb_resampler * resampler, void * input_buffer,
+                     long * input_frame_count, void * output_buffer,
+                     long output_frames_needed);
+
+void
+cubeb_resampler_destroy(cubeb_resampler * resampler);
+
+long
+cubeb_resampler_latency(cubeb_resampler * resampler);
+
+long
+cubeb_resampler_input_latency(cubeb_resampler * resampler);
+
+long
+cubeb_resampler_input_needed_for_output(cubeb_resampler * resampler,
+                                        long output_frames);
+
+typedef struct {
+  size_t input_input_buffer_size;
+  size_t input_output_buffer_size;
+  size_t output_input_buffer_size;
+  size_t output_output_buffer_size;
+} cubeb_resampler_stats;
+
+cubeb_resampler_stats
+cubeb_resampler_stats_get(cubeb_resampler * resampler);
+
+#if defined(__cplusplus)
+}
+#endif
+
+#endif /* CUBEB_RESAMPLER_H */

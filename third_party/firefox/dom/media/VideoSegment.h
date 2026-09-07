@@ -1,0 +1,199 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_VIDEOSEGMENT_H_
+#define MOZILLA_VIDEOSEGMENT_H_
+
+#include "ImageContainer.h"
+#include "MediaSegment.h"
+#include "TimeUnits.h"
+#include "gfxPoint.h"
+#include "nsCOMPtr.h"
+
+namespace mozilla {
+
+namespace layers {
+class Image;
+}  
+
+class VideoFrame {
+ public:
+  typedef mozilla::layers::Image Image;
+
+  VideoFrame(already_AddRefed<Image> aImage,
+             const gfx::IntSize& aIntrinsicSize);
+  VideoFrame();
+  ~VideoFrame();
+
+  bool operator==(const VideoFrame& aFrame) const {
+    return mIntrinsicSize == aFrame.mIntrinsicSize &&
+           mForceBlack == aFrame.mForceBlack &&
+           ((mForceBlack && aFrame.mForceBlack) || mImage == aFrame.mImage) &&
+           mPrincipalHandle == aFrame.mPrincipalHandle;
+  }
+  bool operator!=(const VideoFrame& aFrame) const {
+    return !operator==(aFrame);
+  }
+
+  Image* GetImage() const { return mImage; }
+  void SetForceBlack(bool aForceBlack) { mForceBlack = aForceBlack; }
+  bool GetForceBlack() const { return mForceBlack; }
+  void SetPrincipalHandle(PrincipalHandle aPrincipalHandle) {
+    mPrincipalHandle = std::forward<PrincipalHandle>(aPrincipalHandle);
+  }
+  const PrincipalHandle& GetPrincipalHandle() const { return mPrincipalHandle; }
+  const gfx::IntSize& GetIntrinsicSize() const { return mIntrinsicSize; }
+  void SetNull();
+  void TakeFrom(VideoFrame* aFrame);
+
+  already_AddRefed<Image> CloneAsBlackImage() const;
+
+ protected:
+  RefPtr<Image> mImage;
+  gfx::IntSize mIntrinsicSize;
+  bool mForceBlack;
+  PrincipalHandle mPrincipalHandle;
+};
+
+struct VideoChunk {
+  void SliceTo(TrackTime aStart, TrackTime aEnd) {
+    NS_ASSERTION(aStart >= 0 && aStart < aEnd && aEnd <= mDuration,
+                 "Slice out of bounds");
+    mDuration = aEnd - aStart;
+  }
+  TrackTime GetDuration() const { return mDuration; }
+  bool CanCombineWithFollowing(const VideoChunk& aOther) const {
+    return aOther.mFrame == mFrame;
+  }
+  bool IsNull() const { return !mFrame.GetImage(); }
+  void SetNull(TrackTime aDuration) {
+    mDuration = aDuration;
+    mFrame.SetNull();
+    mTimeStamp = TimeStamp();
+  }
+  void SetForceBlack(bool aForceBlack) { mFrame.SetForceBlack(aForceBlack); }
+
+  size_t SizeOfExcludingThisIfUnshared(MallocSizeOf aMallocSizeOf) const {
+    return 0;
+  }
+
+  const PrincipalHandle& GetPrincipalHandle() const {
+    return mFrame.GetPrincipalHandle();
+  }
+
+  TrackTime mDuration;
+  VideoFrame mFrame;
+  TimeStamp mTimeStamp;
+  media::TimeUnit mProcessingDuration;
+  media::TimeUnit mMediaTime;
+  layers::ContainerCaptureTime mWebrtcCaptureTime = AsVariant(Nothing());
+  layers::ContainerReceiveTime mWebrtcReceiveTime;
+  layers::ContainerRtpTimestamp mRtpTimestamp;
+};
+
+class VideoSegment : public MediaSegmentBase<VideoSegment, VideoChunk> {
+ public:
+  typedef mozilla::layers::Image Image;
+  typedef mozilla::gfx::IntSize IntSize;
+
+  VideoSegment();
+  VideoSegment(VideoSegment&& aSegment);
+
+  VideoSegment(const VideoSegment&) = delete;
+  VideoSegment& operator=(const VideoSegment&) = delete;
+
+  ~VideoSegment();
+
+  void AppendFrame(const VideoChunk& aChunk,
+                   const Maybe<bool>& aForceBlack = Nothing(),
+                   const Maybe<TimeStamp>& aTimeStamp = Nothing());
+  void AppendFrame(
+      already_AddRefed<Image> aImage, const IntSize& aIntrinsicSize,
+      const PrincipalHandle& aPrincipalHandle, bool aForceBlack = false,
+      TimeStamp aTimeStamp = TimeStamp::Now(),
+      media::TimeUnit aProcessingDuration = media::TimeUnit::Invalid(),
+      media::TimeUnit aMediaTime = media::TimeUnit::Invalid());
+  void AppendWebrtcRemoteFrame(already_AddRefed<Image> aImage,
+                               const IntSize& aIntrinsicSize,
+                               const PrincipalHandle& aPrincipalHandle,
+                               bool aForceBlack, TimeStamp aTimeStamp,
+                               media::TimeUnit aProcessingDuration,
+                               uint32_t aRtpTimestamp,
+                               int64_t aWebrtcCaptureTimeNtp,
+                               int64_t aWebrtcReceiveTimeUs);
+  void AppendWebrtcLocalFrame(already_AddRefed<Image> aImage,
+                              const IntSize& aIntrinsicSize,
+                              const PrincipalHandle& aPrincipalHandle,
+                              bool aForceBlack, TimeStamp aTimeStamp,
+                              TimeStamp aWebrtcCaptureTime);
+  void ExtendLastFrameBy(TrackTime aDuration) {
+    if (aDuration <= 0) {
+      return;
+    }
+    if (mChunks.IsEmpty()) {
+      mChunks.AppendElement()->SetNull(aDuration);
+    } else {
+      mChunks[mChunks.Length() - 1].mDuration += aDuration;
+    }
+    mDuration += aDuration;
+  }
+  const VideoFrame* GetLastFrame(TrackTime* aStart = nullptr) {
+    VideoChunk* c = GetLastChunk();
+    if (!c) {
+      return nullptr;
+    }
+    if (aStart) {
+      *aStart = mDuration - c->mDuration;
+    }
+    return &c->mFrame;
+  }
+  VideoChunk* FindChunkContaining(const TimeStamp& aTime) {
+    VideoChunk* previousChunk = nullptr;
+    for (VideoChunk& c : mChunks) {
+      if (c.mTimeStamp.IsNull()) {
+        continue;
+      }
+      if (c.mTimeStamp > aTime) {
+        return previousChunk;
+      }
+      previousChunk = &c;
+    }
+    return previousChunk;
+  }
+  void ForgetUpToTime(const TimeStamp& aTime) {
+    VideoChunk* chunk = FindChunkContaining(aTime);
+    if (!chunk) {
+      return;
+    }
+    TrackTime duration = 0;
+    size_t chunksToRemove = 0;
+    for (const VideoChunk& c : mChunks) {
+      if (c.mTimeStamp >= chunk->mTimeStamp) {
+        break;
+      }
+      duration += c.GetDuration();
+      ++chunksToRemove;
+    }
+    mChunks.RemoveElementsAt(0, chunksToRemove);
+    mDuration -= duration;
+    MOZ_ASSERT(mChunks.Capacity() >= DEFAULT_SEGMENT_CAPACITY,
+               "Capacity must be retained after removing chunks");
+  }
+  void ReplaceWithDisabled() override {
+    for (ChunkIterator i(*this); !i.IsEnded(); i.Next()) {
+      VideoChunk& chunk = *i;
+      chunk.SetForceBlack(true);
+    }
+  }
+
+  static Type StaticType() { return VIDEO; }
+
+  size_t SizeOfIncludingThis(MallocSizeOf aMallocSizeOf) const override {
+    return aMallocSizeOf(this) + SizeOfExcludingThis(aMallocSizeOf);
+  }
+};
+
+}  
+
+#endif /* MOZILLA_VIDEOSEGMENT_H_ */

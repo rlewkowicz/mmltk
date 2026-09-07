@@ -1,0 +1,165 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+[after]
+is_css2 = true
+is_eager = true
+is_flex_or_grid_item = true
+is_tree_abiding = true
+[before]
+is_css2 = true
+is_eager = true
+is_flex_or_grid_item = true
+is_tree_abiding = true
+[marker]
+is_tree_abiding = true
+[backdrop]
+[cue]
+is_js_created_nac = true
+[first-letter]
+is_css2 = true
+is_eager = true
+[first-line]
+is_css2 = true
+is_eager = true
+[highlight]
+argument = "AtomIdent"
+[selection]
+[target-text]
+[view-transition]
+enabled_in = "ua"
+pref = "dom.viewTransitions.enabled"
+[view-transition-group]
+enabled_in = "ua"
+pref = "dom.viewTransitions.enabled"
+argument = "PtNameAndClassSelector"
+is_element_backed = true
+[view-transition-image-pair]
+enabled_in = "ua"
+pref = "dom.viewTransitions.enabled"
+is_element_backed = true
+argument = "PtNameAndClassSelector"
+[view-transition-old]
+enabled_in = "ua"
+pref = "dom.viewTransitions.enabled"
+is_element_backed = true
+argument = "PtNameAndClassSelector"
+[view-transition-new]
+enabled_in = "ua"
+pref = "dom.viewTransitions.enabled"
+is_element_backed = true
+argument = "PtNameAndClassSelector"
+[-moz-snapshot-containing-block]
+enabled_in = "ua"
+[picker]
+enabled_in = "ua"
+pref = "dom.select.customizable_select.enabled"
+argument = "AtomIdent"
+is_element_backed = true
+[checkmark]
+pref = "dom.select.customizable_select.enabled"
+is_tree_abiding = true
+
+[-moz-number-spin-box]
+supports_user_action_state = true
+enabled_in = "chrome"
+[-moz-number-spin-down]
+supports_user_action_state = true
+enabled_in = "chrome"
+[-moz-number-spin-up]
+supports_user_action_state = true
+enabled_in = "chrome"
+[-moz-search-clear-button]
+supports_user_action_state = true
+enabled_in = "chrome"
+[-moz-select-content]
+enabled_in = "chrome"
+is_element_backed = true
+[picker-icon]
+enabled_in = "chrome"
+pref = "dom.select.customizable_select.enabled"
+is_tree_abiding = true
+[-moz-progress-bar]
+supports_user_action_state = true
+[-moz-range-track]
+supports_user_action_state = true
+[-moz-range-progress]
+supports_user_action_state = true
+[-moz-range-thumb]
+supports_user_action_state = true
+[-moz-meter-bar]
+supports_user_action_state = true
+[placeholder]
+supports_user_action_state = true
+is_element_backed = true
+parses_as_element_backed = false
+[-moz-color-swatch]
+supports_user_action_state = true
+[-moz-text-control-editing-root]
+enabled_in = "ua"
+is_element_backed = true
+[-moz-text-control-preview]
+enabled_in = "ua"
+is_element_backed = true
+[-moz-reveal]
+supports_user_action_state = true
+enabled_in = "ua"
+[file-selector-button]
+supports_user_action_state = true
+is_tree_abiding = true
+[-moz-file-content]
+enabled_in = "chrome"
+[slider-track]
+supports_user_action_state = true
+enabled_in = "chrome"
+pref = "layout.css.modern-range-pseudos.enabled"
+[slider-thumb]
+supports_user_action_state = true
+enabled_in = "chrome"
+pref = "layout.css.modern-range-pseudos.enabled"
+[slider-fill]
+supports_user_action_state = true
+enabled_in = "chrome"
+pref = "layout.css.modern-range-pseudos.enabled"
+[details-content]
+supports_user_action_state = true
+enabled_in = "chrome"
+pref = "layout.css.details-content.enabled"
+is_element_backed = true
+[-webkit-scrollbar]
+pref = "layout.css.fake-webkit-scrollbar.enabled"
+disabled_domains_pref = "layout.css.fake-webkit-scrollbar.disabled-domains"
+
+[-moz-tree-column]
+enabled_in = "chrome"
+argument = "AtomThinVec"
+[-moz-tree-row]
+enabled_in = "chrome"
+argument = "AtomThinVec"
+[-moz-tree-separator]
+enabled_in = "chrome"
+argument = "AtomThinVec"
+[-moz-tree-cell]
+enabled_in = "chrome"
+argument = "AtomThinVec"
+[-moz-tree-indentation]
+enabled_in = "chrome"
+argument = "AtomThinVec"
+[-moz-tree-line]
+enabled_in = "chrome"
+argument = "AtomThinVec"
+[-moz-tree-twisty]
+enabled_in = "chrome"
+argument = "AtomThinVec"
+[-moz-tree-image]
+enabled_in = "chrome"
+argument = "AtomThinVec"
+[-moz-tree-cell-text]
+enabled_in = "chrome"
+argument = "AtomThinVec"
+[-moz-tree-checkbox]
+enabled_in = "chrome"
+argument = "AtomThinVec"
+[-moz-tree-drop-feedback]
+enabled_in = "chrome"
+argument = "AtomThinVec"

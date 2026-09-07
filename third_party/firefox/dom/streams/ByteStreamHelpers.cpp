@@ -1,0 +1,88 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/ByteStreamHelpers.h"
+
+#include "js/ArrayBuffer.h"
+#include "js/RootingAPI.h"
+#include "js/experimental/TypedData.h"
+#include "mozilla/ErrorResult.h"
+
+namespace mozilla::dom {
+
+JSObject* TransferArrayBuffer(JSContext* aCx, JS::Handle<JSObject*> aObject) {
+  JS::Rooted<JSObject*> unwrappedObj(aCx, JS::UnwrapArrayBuffer(aObject));
+  if (!unwrappedObj) {
+    js::ReportAccessDenied(aCx);
+    return nullptr;
+  }
+
+  size_t bufferLength = 0;
+  UniquePtr<void, JS::FreePolicy> bufferData;
+  {
+    JSAutoRealm ar(aCx, unwrappedObj);
+
+    MOZ_ASSERT(!JS::IsDetachedArrayBufferObject(unwrappedObj));
+
+    bufferLength = JS::GetArrayBufferByteLength(unwrappedObj);
+
+    bufferData.reset(JS::StealArrayBufferContents(aCx, unwrappedObj));
+
+    if (!JS::DetachArrayBuffer(aCx, unwrappedObj)) {
+      return nullptr;
+    }
+  }
+
+  return JS::NewArrayBufferWithContents(aCx, bufferLength,
+                                        std::move(bufferData));
+}
+
+bool CanTransferArrayBuffer(JSContext* aCx, JS::Handle<JSObject*> aObject,
+                            ErrorResult& aRv) {
+  MOZ_ASSERT(JS::IsArrayBufferObject(aObject));
+
+  if (JS::IsDetachedArrayBufferObject(aObject)) {
+    return false;
+  }
+
+  bool hasDefinedArrayBufferDetachKey = false;
+  if (!JS::HasDefinedArrayBufferDetachKey(aCx, aObject,
+                                          &hasDefinedArrayBufferDetachKey)) {
+    aRv.StealExceptionFromJSContext(aCx);
+    return false;
+  }
+  return !hasDefinedArrayBufferDetachKey;
+}
+
+JSObject* CloneAsUint8Array(JSContext* aCx, JS::Handle<JSObject*> aObject) {
+  MOZ_ASSERT(JS_IsArrayBufferViewObject(aObject));
+
+  bool isShared;
+  JS::Rooted<JSObject*> viewedArrayBuffer(
+      aCx, JS_GetArrayBufferViewBuffer(aCx, aObject, &isShared));
+  if (!viewedArrayBuffer) {
+    return nullptr;
+  }
+  MOZ_ASSERT(!JS::IsDetachedArrayBufferObject(viewedArrayBuffer));
+
+  size_t byteOffset = JS_GetTypedArrayByteOffset(aObject);
+  size_t byteLength = JS_GetTypedArrayByteLength(aObject);
+  JS::Rooted<JSObject*> buffer(
+      aCx,
+      JS::ArrayBufferClone(aCx, viewedArrayBuffer, byteOffset, byteLength));
+  if (!buffer) {
+    return nullptr;
+  }
+
+  JS::Rooted<JSObject*> array(
+      aCx, JS_NewUint8ArrayWithBuffer(aCx, buffer, 0,
+                                      static_cast<int64_t>(byteLength)));
+  if (!array) {
+    return nullptr;
+  }
+
+  return array;
+}
+
+}  

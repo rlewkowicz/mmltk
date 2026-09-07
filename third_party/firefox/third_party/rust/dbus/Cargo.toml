@@ -1,0 +1,23 @@
+
+[package]
+name = "dbus"
+version = "0.6.5"
+authors = ["David Henningsson <diwic@ubuntu.com>"]
+description = "Bindings to D-Bus, which is a bus commonly used on Linux for inter-process communication."
+documentation = "http://docs.rs/dbus"
+keywords = ["D-Bus", "DBus", "IPC"]
+categories = ["os::unix-apis", "api-bindings"]
+license = "Apache-2.0/MIT"
+repository = "https://github.com/diwic/dbus-rs"
+[dependencies.libc]
+version = "0.2.7"
+
+[dependencies.libdbus-sys]
+version = "0.2"
+[features]
+no-string-validation = []
+[badges.is-it-maintained-issue-resolution]
+repository = "diwic/dbus-rs"
+
+[badges.is-it-maintained-open-issues]
+repository = "diwic/dbus-rs"

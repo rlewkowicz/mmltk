@@ -1,0 +1,48 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_ThrottledEventQueue_h
+#define mozilla_ThrottledEventQueue_h
+
+#include "nsISerialEventTarget.h"
+
+#define NS_THROTTLEDEVENTQUEUE_IID \
+  {0x8f3cf7dc, 0xfc14, 0x4ad5, {0x9f, 0xd5, 0xdb, 0x79, 0xbc, 0xe6, 0xd5, 0x08}}
+
+namespace mozilla {
+
+class ThrottledEventQueue final : public nsISerialEventTarget {
+  class Inner;
+  RefPtr<Inner> mInner;
+
+  explicit ThrottledEventQueue(already_AddRefed<Inner> aInner);
+  ~ThrottledEventQueue() = default;
+
+ public:
+  static already_AddRefed<ThrottledEventQueue> Create(
+      nsISerialEventTarget* aBaseTarget, const char* aName,
+      uint32_t aPriority = nsIRunnablePriority::PRIORITY_NORMAL);
+
+  bool IsEmpty() const;
+
+  uint32_t Length() const;
+
+  already_AddRefed<nsIRunnable> GetEvent();
+
+  void AwaitIdle() const;
+
+  [[nodiscard]] nsresult SetIsPaused(bool aIsPaused);
+
+  bool IsPaused() const;
+
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIEVENTTARGET_FULL
+
+  NS_INLINE_DECL_STATIC_IID(NS_THROTTLEDEVENTQUEUE_IID);
+};
+
+}  
+
+#endif  // mozilla_ThrottledEventQueue_h

@@ -1,0 +1,577 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+@namespace url("http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul"); 
+@namespace html url("http://www.w3.org/1999/xhtml"); 
+
+* {
+  -moz-user-focus: ignore;
+  display: flex;
+  box-sizing: border-box;
+}
+
+[hidden] {
+  display: none;
+}
+
+[collapsed] {
+  visibility: collapse;
+}
+
+:root {
+  text-rendering: optimizeLegibility;
+  -moz-control-character-visibility: visible;
+  -moz-box-collapse: legacy;
+  width: 100%;
+  height: 100%;
+  user-select: none;
+}
+
+:root:-moz-locale-dir(rtl) {
+  direction: rtl;
+}
+
+:focus-visible {
+  outline: initial;
+}
+
+popupgroup:-moz-native-anonymous:-moz-locale-dir(rtl),
+tooltip:-moz-native-anonymous:-moz-locale-dir(rtl) {
+  direction: rtl;
+}
+
+
+.uri-element {
+  direction: ltr !important;
+}
+
+
+script,
+data,
+commandset,
+command,
+broadcasterset,
+broadcaster,
+observes,
+keyset,
+key,
+toolbarpalette,
+template,
+treeitem,
+treeseparator,
+treerow,
+treecell {
+  display: none;
+}
+
+
+button,
+checkbox,
+menulist,
+radiogroup,
+richlistbox,
+tree,
+browser,
+editor,
+iframe,
+label:is(.text-link, [onclick]),
+tab[selected]:not([ignorefocus]) {
+  -moz-user-focus: normal;
+}
+
+tab:focus {
+  -moz-user-focus: normal;
+}
+
+
+window {
+  overflow: clip;
+  flex-direction: column;
+}
+
+
+vbox {
+  flex-direction: column;
+}
+
+
+label {
+  display: inline-block;
+}
+
+description {
+  display: flow-root;
+}
+
+label html|span.accesskey {
+  text-decoration: underline;
+  text-decoration-skip-ink: none;
+}
+
+:is(label, description)[value] {
+  white-space: nowrap;
+}
+
+:is(label, description)[value]::before {
+  content: -moz-label-content;
+}
+
+label[value=""]::before {
+  content: "\200b" !important; 
+}
+
+:is(label, description)[value][crop] {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+:is(label, description)[value][crop="start"]::before {
+  direction: rtl;
+  content: "\200e" -moz-label-content;
+}
+
+:is(label, description)[value][crop="start"]:-moz-locale-dir(rtl)::before {
+  direction: ltr;
+  content: "\200f" -moz-label-content;
+}
+
+.checkbox-label-box,
+.radio-label-box {
+  min-width: 0;
+}
+
+
+toolbarbutton {
+  align-items: center;
+  justify-content: center;
+}
+
+toolbarbutton.tabbable {
+  -moz-user-focus: normal !important;
+}
+
+toolbarbutton[crop] {
+  min-width: 0;
+}
+
+.toolbarbutton-text {
+  display: block;
+  text-align: center;
+}
+
+toolbar[mode="icons"] .toolbarbutton-text,
+toolbar[mode="text"] .toolbarbutton-icon,
+html|label.toolbarbutton-badge:empty {
+  display: none;
+}
+
+.toolbarbutton-icon,
+.toolbarbutton-text,
+.toolbarbutton-badge-stack,
+.treecol-text,
+.treecol-sortdirection,
+.button-box {
+  pointer-events: none;
+}
+
+
+button {
+  -moz-default-appearance: button;
+  appearance: auto;
+}
+
+dropmarker {
+  -moz-default-appearance: -moz-menulist-arrow-button;
+  appearance: auto;
+}
+
+
+browser,
+editor,
+iframe {
+  display: inline;
+}
+
+browser {
+  align-self: stretch;
+  justify-self: stretch;
+  min-height: 0;
+  min-width: 0;
+  contain: size;
+}
+
+browser:fullscreen:fullscreen {
+  -moz-top-layer: none !important;
+  position: static !important;
+}
+
+popupnotification {
+  flex-direction: column;
+}
+
+.popup-notification-menubutton:not([label]) {
+  display: none;
+}
+
+
+radiogroup {
+  flex-direction: column;
+}
+
+
+groupbox {
+  flex-direction: column;
+}
+
+
+toolbar:not([nowindowdrag], [customizing]) {
+  -moz-window-dragging: drag;
+}
+
+toolbaritem,
+toolbarbutton,
+toolbarseparator,
+button,
+html|input,
+tab,
+radio,
+splitter,
+menu,
+menulist {
+  -moz-window-dragging: no-drag;
+}
+
+titlebar {
+  pointer-events: auto !important;
+}
+
+
+toolbox {
+  flex-direction: column;
+}
+
+@media (-moz-platform: macos) {
+  toolbar[type="menubar"] {
+    min-height: 0 !important;
+    border: 0 !important;
+  }
+}
+
+toolbarspring {
+  flex: 1000 1000;
+}
+
+
+menubar[native] {
+  display: none !important;
+}
+
+menubar > menu:empty {
+  visibility: collapse;
+}
+
+.menu-text {
+  flex: 1;
+}
+
+
+menupopup,
+panel,
+tooltip {
+  position: fixed;
+  -moz-top-layer: auto;
+  width: fit-content;
+  height: fit-content;
+  -moz-inert: none;
+  contain: paint;
+  z-index: 2147483647;
+  text-shadow: none;
+}
+
+tooltip {
+  appearance: auto;
+  -moz-default-appearance: tooltip;
+
+  white-space: pre-wrap;
+
+  background-color: InfoBackground;
+  color: InfoText;
+  font: message-box;
+  padding: 2px 3px;
+  max-width: 40em;
+  overflow: clip;
+  pointer-events: none;
+
+  @media (-moz-platform: linux) {
+    padding: 6px 10px; 
+    line-height: 1.4; 
+    border: 0.5px solid color-mix(in srgb, currentColor 60%, transparent);
+    @media (-moz-gtk-csd-transparency-available) {
+      border-radius: env(-moz-gtk-csd-tooltip-radius);
+    }
+  }
+  @media (-moz-platform: macos) {
+    padding: 2px 6px; 
+  }
+  @media (-moz-platform: windows) {
+    appearance: none;
+    border: 1px solid;
+
+    @media not (prefers-contrast) {
+      background-color: light-dark(#f9f9fb, #2b2a33);
+      color: light-dark(black, white);
+      border-color: light-dark(#67676c, #f9f9fb);
+      border-radius: 4px;
+    }
+  }
+}
+
+
+treecolpicker {
+  order: 2147483646;
+}
+
+treechildren {
+  display: flex;
+  flex: 1;
+}
+
+tree {
+  flex-direction: column;
+}
+
+tree[hidecolumnpicker="true"] treecolpicker {
+  display: none;
+}
+
+treecol {
+  min-width: 16px;
+  order: 1;
+}
+
+treecol[hidden] {
+  visibility: collapse;
+  display: flex !important;
+}
+
+tree:not([treelines="true"]) treechildren::-moz-tree-line {
+  visibility: hidden;
+}
+
+treechildren::-moz-tree-cell(ltr) {
+  direction: ltr !important;
+}
+
+
+tabpanels > *|*:not(:-moz-native-anonymous) {
+  -moz-subtree-hidden-only-visually: 1;
+}
+
+deck > *|*:not(:-moz-native-anonymous) {
+  visibility: hidden;
+}
+
+tabpanels > .deck-selected,
+tabpanels > .split-view-panel-active,
+tabpanels > .split-view-splitter,
+deck > .deck-selected {
+  -moz-subtree-hidden-only-visually: 0;
+  visibility: inherit;
+}
+
+tabpanels,
+deck,
+stack {
+  display: grid;
+  position: relative;
+}
+
+tabpanels > *|*:not(:-moz-native-anonymous),
+deck > *|*:not(:-moz-native-anonymous),
+stack > *|*:not(:-moz-native-anonymous) {
+  grid-area: 1 / 1;
+  z-index: 0;
+
+  min-height: 0;
+}
+
+
+tabbox {
+  flex-direction: column;
+  min-height: 0;
+}
+
+tabpanels {
+  min-height: 0;
+}
+
+tabs {
+  flex-direction: row;
+}
+
+tab {
+  align-items: center;
+  justify-content: center;
+}
+
+
+tooltip[titletip="true"] {
+  max-width: none;
+}
+
+
+.box-inherit {
+  align-items: inherit;
+  justify-content: inherit;
+  flex-grow: inherit;
+  flex-shrink: inherit;
+  flex-direction: inherit;
+}
+
+:root html|textarea:not([resizable="true"]) {
+  resize: none;
+}
+
+
+.autocomplete-richlistbox {
+  -moz-user-focus: ignore;
+  overflow-x: hidden !important;
+  flex: 1;
+}
+
+.autocomplete-richlistitem {
+  flex-direction: column;
+  align-items: center;
+  overflow: clip;
+}
+
+
+menulist[popuponly] {
+  appearance: none !important;
+  margin: 0 !important;
+  height: 0 !important;
+  min-height: 0 !important;
+  border: 0 !important;
+  padding: 0 !important;
+}
+
+
+slider {
+  overflow: hidden;
+}
+
+
+scrollbox {
+  overflow: hidden;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  scrollbox[smoothscroll="true"] {
+    scroll-behavior: smooth;
+  }
+}
+
+
+stringbundle,
+stringbundleset {
+  display: none;
+}
+
+
+dialog {
+  flex: 1;
+  flex-direction: column;
+}
+
+
+wizard {
+  flex: 1;
+  flex-direction: column;
+  contain: inline-size;
+  min-width: 40em;
+  min-height: 30em;
+}
+
+wizard > wizardpage {
+  grid-area: 1 / 1;
+  min-height: 0;
+}
+
+wizard > wizardpage:not(.selected) {
+  visibility: hidden;
+}
+
+wizardpage {
+  flex-direction: column;
+  overflow: auto;
+}
+
+
+richlistbox {
+  flex-direction: column;
+  overflow: auto;
+  min-width: 0;
+  min-height: 0;
+}
+
+richlistitem {
+  flex-shrink: 0;
+}
+
+findbar {
+  overflow-x: hidden;
+  contain: inline-size;
+}
+
+image {
+  overflow-clip-margin: content-box;
+  overflow: clip;
+}
+
+button,
+image {
+  display: inline-flex;
+}
+
+[orient="vertical"] {
+  flex-direction: column !important;
+}
+[orient="horizontal"] {
+  flex-direction: row !important;
+}
+
+[align="start"] {
+  align-items: flex-start !important;
+}
+[align="center"] {
+  align-items: center !important;
+}
+[align="end"] {
+  align-items: flex-end !important;
+}
+[align="baseline"] {
+  align-items: baseline !important;
+}
+[align="stretch"] {
+  align-items: stretch !important;
+}
+
+[pack="start"] {
+  justify-content: start !important;
+}
+[pack="center"] {
+  justify-content: center !important;
+}
+[pack="end"] {
+  justify-content: flex-end !important;
+}
+
+[flex="0"] {
+  flex: none !important;
+}
+[flex="1"] {
+  flex: 1 !important;
+}

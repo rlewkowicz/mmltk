@@ -1,0 +1,456 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef js_loader_ModuleLoaderBase_h
+#define js_loader_ModuleLoaderBase_h
+
+#include "LoadedScript.h"
+#include "ScriptLoadRequestList.h"
+
+#include "ImportMap.h"
+#include "js/ColumnNumber.h"  // JS::ColumnNumberOneOrigin
+#include "js/TypeDecls.h"     // JS::MutableHandle, JS::Handle, JS::Root
+#include "js/Modules.h"
+#include "nsRefPtrHashtable.h"
+#include "nsCOMArray.h"
+#include "nsCOMPtr.h"
+#include "nsILoadInfo.h"    // nsSecurityFlags
+#include "nsThreadUtils.h"  // GetMainThreadSerialEventTarget
+#include "nsURIHashKey.h"
+#include "mozilla/Attributes.h"  // MOZ_RAII
+#include "mozilla/CORSMode.h"
+#include "mozilla/MaybeOneOf.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/dom/ReferrerPolicyBinding.h"
+#include "mozilla/StaticPrefs_layout.h"
+#include "ResolvedModuleSet.h"
+#include "ResolveResult.h"
+
+class nsIConsoleReportCollector;
+class nsIURI;
+
+namespace mozilla {
+
+class LazyLogModule;
+union Utf8Unit;
+
+namespace dom {
+class SRIMetadata;
+}  
+
+}  
+
+namespace JS {
+
+class CompileOptions;
+
+template <typename UnitT>
+class SourceText;
+
+namespace loader {
+
+class LoadContextBase;
+class ModuleLoaderBase;
+class ModuleLoadRequest;
+class ModuleScript;
+
+
+class ScriptLoaderInterface : public nsISupports {
+ public:
+  using ScriptFetchOptions = JS::loader::ScriptFetchOptions;
+  using ScriptKind = JS::loader::ScriptKind;
+  using ScriptLoadRequest = JS::loader::ScriptLoadRequest;
+  using ScriptLoadRequestList = JS::loader::ScriptLoadRequestList;
+  using ModuleLoadRequest = JS::loader::ModuleLoadRequest;
+
+  virtual ~ScriptLoaderInterface() = default;
+
+  virtual nsIURI* GetBaseURI() const = 0;
+
+  virtual void ReportErrorToConsole(ScriptLoadRequest* aRequest,
+                                    nsresult aResult) const = 0;
+
+  virtual void ReportWarningToConsole(
+      ScriptLoadRequest* aRequest, const char* aMessageName,
+      const nsTArray<nsString>& aParams = nsTArray<nsString>()) const = 0;
+
+  virtual nsIConsoleReportCollector* GetConsoleReportCollector() const {
+    return nullptr;
+  }
+
+  virtual nsresult FillCompileOptionsForRequest(
+      JSContext* cx, ScriptLoadRequest* aRequest, CompileOptions* aOptions,
+      MutableHandle<JSScript*> aIntroductionScript) = 0;
+
+  virtual nsresult MaybePrepareModuleForDiskCacheAfterExecute(
+      ModuleLoadRequest* aRequest, nsresult aRv) {
+    return NS_OK;
+  }
+
+  virtual void MaybeUpdateDiskCache() {}
+
+  virtual bool IsImportMapSupported() const { return false; }
+};
+
+class ModuleMapKey : public PLDHashEntryHdr {
+ public:
+  using KeyType = const ModuleMapKey&;
+  using KeyTypePointer = const ModuleMapKey*;
+
+  ModuleMapKey(const nsIURI* aUri, const ModuleType aModuleType)
+      : mUri(const_cast<nsIURI*>(aUri)), mModuleType(aModuleType) {
+    MOZ_COUNT_CTOR(ModuleMapKey);
+    MOZ_ASSERT(aUri);
+  }
+  explicit ModuleMapKey(KeyTypePointer aOther)
+      : mUri(std::move(aOther->mUri)), mModuleType(aOther->mModuleType) {
+    MOZ_COUNT_CTOR(ModuleMapKey);
+    MOZ_ASSERT(mUri);
+  }
+  ModuleMapKey(ModuleMapKey&& aOther)
+      : mUri(std::move(aOther.mUri)), mModuleType(aOther.mModuleType) {
+    MOZ_COUNT_CTOR(ModuleMapKey);
+    MOZ_ASSERT(mUri);
+  }
+  MOZ_COUNTED_DTOR(ModuleMapKey)
+
+  bool KeyEquals(KeyTypePointer aKey) const {
+    if (mModuleType != aKey->mModuleType) {
+      return false;
+    }
+
+    bool eq;
+    if (NS_SUCCEEDED(mUri->Equals(aKey->mUri, &eq))) {
+      return eq;
+    }
+
+    return false;
+  }
+
+  static KeyTypePointer KeyToPointer(KeyType key) { return &key; }
+
+  static PLDHashNumber HashKey(KeyTypePointer aKey) {
+    MOZ_ASSERT(aKey->mUri);
+    nsAutoCString spec;
+    (void)aKey->mUri->GetSpec(spec);
+    return mozilla::HashGeneric(mozilla::HashString(spec), aKey->mModuleType);
+  }
+
+  enum { ALLOW_MEMMOVE = true };
+
+  const nsCOMPtr<nsIURI> mUri;
+  const ModuleType mModuleType;
+};
+
+class ModuleLoaderBase : public nsISupports {
+ public:
+  using LoadedScript = JS::loader::LoadedScript;
+  using ScriptFetchOptions = JS::loader::ScriptFetchOptions;
+  using ScriptLoadRequest = JS::loader::ScriptLoadRequest;
+  using ModuleLoadRequest = JS::loader::ModuleLoadRequest;
+
+ private:
+  class LoadingRequest final : public nsISupports {
+    ~LoadingRequest() = default;
+
+   public:
+    NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+    NS_DECL_CYCLE_COLLECTION_CLASS(LoadingRequest)
+
+    RefPtr<ModuleLoadRequest> mRequest;
+
+    nsTArray<RefPtr<ModuleLoadRequest>> mWaiting;
+  };
+
+  nsRefPtrHashtable<ModuleMapKey, LoadingRequest> mFetchingModules;
+  nsRefPtrHashtable<ModuleMapKey, ModuleScript> mFetchedModules;
+
+  ScriptLoadRequestList mDynamicImportRequests;
+
+  nsCOMPtr<nsIGlobalObject> mGlobalObject;
+
+  RefPtr<ModuleLoaderBase> mOverriddenBy;
+
+  bool mImportMapsAllowed = true;
+
+ protected:
+  RefPtr<ScriptLoaderInterface> mLoader;
+
+  mozilla::UniquePtr<ImportMap> mImportMap;
+
+  mozilla::UniquePtr<ResolvedModuleSet> mResolvedModuleSet;
+
+  virtual ~ModuleLoaderBase();
+
+#ifdef DEBUG
+  const ScriptLoadRequestList& DynamicImportRequests() const {
+    return mDynamicImportRequests;
+  }
+#endif
+
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+  NS_DECL_CYCLE_COLLECTION_CLASS(ModuleLoaderBase)
+  explicit ModuleLoaderBase(ScriptLoaderInterface* aLoader,
+                            nsIGlobalObject* aGlobalObject);
+
+  void CancelFetchingModules();
+
+  void Shutdown();
+
+  virtual nsIURI* GetBaseURI() const { return mLoader->GetBaseURI(); };
+
+  using MaybeSourceText =
+      mozilla::MaybeOneOf<SourceText<char16_t>, SourceText<Utf8Unit>>;
+
+
+ private:
+  virtual nsIURI* GetClientReferrerURI() { return nullptr; }
+
+  virtual already_AddRefed<JS::loader::ScriptFetchOptions>
+  CreateDefaultScriptFetchOptions() {
+    return nullptr;
+  }
+
+  virtual already_AddRefed<ModuleLoadRequest> CreateRequest(
+      JSContext* aCx, nsIURI* aURI, Handle<JSObject*> aModuleRequest,
+      Handle<Value> aHostDefined, Handle<Value> aPayload, bool aIsDynamicImport,
+      ScriptFetchOptions* aOptions,
+      mozilla::dom::ReferrerPolicy aReferrerPolicy, nsIURI* aBaseURL,
+      const mozilla::dom::SRIMetadata& aSriMetadata) = 0;
+
+  virtual bool IsDynamicImportSupported() { return true; }
+
+  virtual bool IsForServiceWorker() const { return false; }
+
+  virtual void OnDynamicImportStarted(ModuleLoadRequest* aRequest) {}
+
+  virtual bool CanStartLoad(ModuleLoadRequest* aRequest, nsresult* aRvOut) = 0;
+
+  virtual nsresult StartFetch(ModuleLoadRequest* aRequest) = 0;
+
+  virtual nsresult CompileFetchedModule(
+      JSContext* aCx, Handle<JSObject*> aGlobal, CompileOptions& aOptions,
+      ModuleLoadRequest* aRequest, MutableHandle<JSObject*> aModuleOut) = 0;
+
+  virtual void OnModuleLoadComplete(ModuleLoadRequest* aRequest) = 0;
+
+  virtual bool IsModuleEvaluationAborted(ModuleLoadRequest* aRequest) {
+    return false;
+  }
+
+  virtual nsresult GetResolveFailureMessage(ResolveError aError,
+                                            const nsAString& aSpecifier,
+                                            nsAString& aResult);
+
+
+ public:
+  ScriptLoaderInterface* GetScriptLoaderInterface() const { return mLoader; }
+
+  nsIGlobalObject* GetGlobalObject() const { return mGlobalObject; }
+
+  bool HasFetchingModules() const;
+
+  bool HasPendingDynamicImports() const;
+  void CancelDynamicImport(ModuleLoadRequest* aRequest, nsresult aResult);
+#ifdef DEBUG
+  bool HasDynamicImport(const ModuleLoadRequest* aRequest) const;
+#endif
+
+  nsresult StartModuleLoad(ModuleLoadRequest* aRequest);
+  nsresult RestartModuleLoad(ModuleLoadRequest* aRequest);
+
+  nsresult OnFetchComplete(ModuleLoadRequest* aRequest, nsresult aRv);
+
+  bool InstantiateModuleGraph(ModuleLoadRequest* aRequest);
+
+  nsresult EvaluateModule(ModuleLoadRequest* aRequest);
+
+  nsresult EvaluateModuleInContext(JSContext* aCx, ModuleLoadRequest* aRequest,
+                                   ModuleErrorBehaviour errorBehaviour);
+
+  void AppendDynamicImport(ModuleLoadRequest* aRequest);
+  void ProcessDynamicImport(ModuleLoadRequest* aRequest);
+  void CancelAndClearDynamicImports();
+
+  mozilla::UniquePtr<ImportMap> ParseImportMap(ScriptLoadRequest* aRequest);
+
+  void RegisterImportMap(mozilla::UniquePtr<ImportMap> aImportMap,
+                         ScriptLoadRequest* aRequest);
+
+  bool HasImportMapRegistered() const { return bool(mImportMap); }
+
+  bool IsImportMapAllowed() const { return mImportMapsAllowed; }
+  void DisallowImportMaps() { mImportMapsAllowed = false; }
+
+  virtual bool IsModuleTypeAllowed(ModuleType aModuleType) {
+    if (aModuleType == ModuleType::Unknown) {
+      return false;
+    }
+
+    if (aModuleType == ModuleType::CSS &&
+        !mozilla::StaticPrefs::layout_css_module_scripts_enabled()) {
+      return false;
+    }
+
+    return true;
+  }
+
+  ImportMap* GetImportMap() { return mImportMap.get(); }
+
+  bool GetImportMapSRI(nsIURI* aURI, nsIURI* aSourceURI,
+                       nsIConsoleReportCollector* aReporter,
+                       mozilla::dom::SRIMetadata* aMetadataOut);
+
+  ResolvedModuleSet* GetResolvedModuleSet();
+
+  void MovePreloadedSetToResolvedSet(ModuleLoadRequest* aRootRequest);
+
+  void ClearPreloadedModuleGraph(ModuleLoadRequest* aRootRequest);
+
+  bool IsModuleFetched(const ModuleMapKey& key) const;
+
+  nsresult GetFetchedModuleURLs(nsTArray<nsCString>& aURLs);
+
+  void SetOverride(ModuleLoaderBase* aLoader);
+
+  bool IsOverridden();
+
+  bool IsOverriddenBy(ModuleLoaderBase* aLoader);
+
+  void ResetOverride();
+
+  void CopyModulesTo(ModuleLoaderBase* aDest);
+
+  void MoveModulesTo(ModuleLoaderBase* aDest);
+
+
+ private:
+  friend class JS::loader::ModuleLoadRequest;
+  friend class JS::loader::ImportMap;
+
+  static ModuleLoaderBase* GetCurrentModuleLoader(JSContext* aCx);
+  static ScriptFetchInfo* GetScriptFetchInfoOrNull(Handle<JSScript*> aReferrer);
+
+  static void EnsureModuleHooksInitialized();
+
+  static bool HostLoadImportedModule(JSContext* aCx,
+                                     Handle<JSScript*> aReferrer,
+                                     Handle<JSObject*> aModuleRequest,
+                                     Handle<Value> aHostDefined,
+                                     Handle<Value> aPayload,
+                                     uint32_t aLineNumber,
+                                     JS::ColumnNumberOneOrigin aColumnNumber);
+  static bool FinishLoadingImportedModule(JSContext* aCx,
+                                          ModuleLoadRequest* aRequest);
+
+  static bool HostPopulateImportMeta(JSContext* aCx,
+                                     Handle<JSObject*> aModuleRecord,
+                                     Handle<JSObject*> aMetaObject);
+  static bool ImportMetaResolve(JSContext* cx, unsigned argc, Value* vp);
+  static JSString* ImportMetaResolveImpl(JSContext* aCx,
+                                         Handle<Value> aReferencingPrivate,
+                                         Handle<JSString*> aSpecifier);
+
+  ResolveResult ResolveModuleSpecifier(ScriptFetchInfo* aFetchInfo,
+                                       const nsAString& aSpecifier);
+
+  nsresult HandleResolveFailure(JSContext* aCx, ScriptFetchInfo* aFetchInfo,
+                                const nsAString& aSpecifier,
+                                ResolveError aError, uint32_t aLineNumber,
+                                ColumnNumberOneOrigin aColumnNumber,
+                                MutableHandle<Value> aErrorOut);
+
+  enum class RestartRequest { No, Yes };
+  nsresult StartOrRestartModuleLoad(ModuleLoadRequest* aRequest,
+                                    RestartRequest aRestart);
+
+  bool ModuleMapContainsURL(const ModuleMapKey& key) const;
+  bool IsModuleFetching(const ModuleMapKey& key) const;
+  void WaitForModuleFetch(ModuleLoadRequest* aRequest);
+
+  void AddToPreloadedResolvedSet(
+      ModuleLoadRequest* aRootRequest,
+      mozilla::UniquePtr<SpecifierResolutionRecord> aRecord);
+
+  void AddToGlobalResolvedSet(
+      mozilla::UniquePtr<SpecifierResolutionRecord> aRecord);
+
+  void AddToResolvedModuleSet(
+      mozilla::UniquePtr<SpecifierResolutionRecord> aRecord,
+      ScriptFetchInfo* aFetchInfo = nullptr,
+      Handle<Value> aHostDefined = UndefinedHandleValue);
+
+  void ResetPreloadFlag(nsIURI* aURI);
+  void ResetPreloadedModule(nsIURI* aURI);
+
+ protected:
+  void SetModuleFetchStarted(ModuleLoadRequest* aRequest);
+
+ private:
+  ModuleScript* GetFetchedModule(const ModuleMapKey& moduleMapKey) const;
+
+  already_AddRefed<LoadingRequest> SetModuleFetchFinishedAndGetWaitingRequests(
+      ModuleLoadRequest* aRequest, nsresult aResult);
+  void ResumeWaitingRequests(LoadingRequest* aLoadingRequest, bool aSuccess);
+  void ResumeWaitingRequest(ModuleLoadRequest* aRequest, bool aSuccess);
+
+  void StartFetchingModuleDependencies(ModuleLoadRequest* aRequest);
+
+  void InstantiateAndEvaluateDynamicImport(ModuleLoadRequest* aRequest);
+
+  static bool OnLoadRequestedModulesResolved(JSContext* aCx, unsigned aArgc,
+                                             Value* aVp);
+  static bool OnLoadRequestedModulesRejected(JSContext* aCx, unsigned aArgc,
+                                             Value* aVp);
+  static bool OnLoadRequestedModulesResolved(JSContext* aCx,
+                                             Handle<Value> aHostDefined);
+  static bool OnLoadRequestedModulesRejected(JSContext* aCx,
+                                             Handle<Value> aHostDefined,
+                                             Handle<Value> aError);
+  static bool OnLoadRequestedModulesResolved(ModuleLoadRequest* aRequest);
+  static bool OnLoadRequestedModulesRejected(JSContext* aCx,
+                                             ModuleLoadRequest* aRequest,
+                                             Handle<Value> aError);
+
+  void RemoveDynamicImport(ModuleLoadRequest* aRequest);
+
+  nsresult CreateModuleScript(ModuleLoadRequest* aRequest);
+  void DispatchModuleErrored(ModuleLoadRequest* aRequest);
+
+  void OnFetchSucceeded(ModuleLoadRequest* aRequest);
+  void OnFetchFailed(ModuleLoadRequest* aRequest);
+  void Cancel(ModuleLoadRequest* aRequest);
+
+  enum class ImportMetaSlots : uint32_t { ModuleRecordSlot = 0, SlotCount };
+
+  static const uint32_t ImportMetaResolveNumArgs = 1;
+  static const uint32_t ImportMetaResolveSpecifierArg = 0;
+
+  static const uint32_t LoadReactionHostDefinedSlot = 0;
+
+  static const uint32_t OnLoadRequestedModulesResolvedNumArgs = 0;
+  static const uint32_t OnLoadRequestedModulesRejectedNumArgs = 1;
+
+  static const uint32_t OnLoadRequestedModulesRejectedErrorArg = 0;
+
+ public:
+  static mozilla::LazyLogModule gCspPRLog;
+  static mozilla::LazyLogModule gModuleLoaderBaseLog;
+};
+
+class MOZ_RAII AutoOverrideModuleLoader {
+ public:
+  AutoOverrideModuleLoader(ModuleLoaderBase* aTarget,
+                           ModuleLoaderBase* aLoader);
+  ~AutoOverrideModuleLoader();
+
+ private:
+  RefPtr<ModuleLoaderBase> mTarget;
+};
+
+}  
+}  
+
+#endif  // js_loader_ModuleLoaderBase_h

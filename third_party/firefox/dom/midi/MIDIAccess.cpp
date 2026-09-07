@@ -1,0 +1,224 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/MIDIAccess.h"
+
+#include "MIDILog.h"
+#include "ipc/IPCMessageUtils.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/dom/MIDIAccessBinding.h"
+#include "mozilla/dom/MIDIAccessManager.h"
+#include "mozilla/dom/MIDIConnectionEvent.h"
+#include "mozilla/dom/MIDIInput.h"
+#include "mozilla/dom/MIDIInputMap.h"
+#include "mozilla/dom/MIDIInputMapBinding.h"
+#include "mozilla/dom/MIDIOptionsBinding.h"
+#include "mozilla/dom/MIDIOutput.h"
+#include "mozilla/dom/MIDIOutputMap.h"
+#include "mozilla/dom/MIDIOutputMapBinding.h"
+#include "mozilla/dom/MIDIPort.h"
+#include "mozilla/dom/MIDITypes.h"
+#include "mozilla/dom/PContent.h"
+#include "mozilla/dom/Promise.h"
+#include "nsContentPermissionHelper.h"
+#include "nsGlobalWindowInner.h"
+#include "nsISupportsImpl.h"  // for MOZ_COUNT_CTOR, MOZ_COUNT_DTOR
+#include "nsPIDOMWindow.h"
+
+namespace mozilla::dom {
+
+NS_IMPL_CYCLE_COLLECTION_CLASS(MIDIAccess)
+NS_IMPL_CYCLE_COLLECTION_TRACE_BEGIN_INHERITED(MIDIAccess, DOMEventTargetHelper)
+NS_IMPL_CYCLE_COLLECTION_TRACE_END
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(MIDIAccess,
+                                                  DOMEventTargetHelper)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mInputMap)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mOutputMap)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mAccessPromise)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_INHERITED(MIDIAccess,
+                                                DOMEventTargetHelper)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mInputMap)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mOutputMap)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mAccessPromise)
+  tmp->Shutdown();
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(MIDIAccess)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+NS_INTERFACE_MAP_END_INHERITING(DOMEventTargetHelper)
+
+NS_IMPL_ADDREF_INHERITED(MIDIAccess, DOMEventTargetHelper)
+NS_IMPL_RELEASE_INHERITED(MIDIAccess, DOMEventTargetHelper)
+
+MIDIAccess::MIDIAccess(nsPIDOMWindowInner* aWindow, bool aSysexEnabled,
+                       Promise* aAccessPromise)
+    : DOMEventTargetHelper(aWindow),
+      mInputMap(new MIDIInputMap(aWindow)),
+      mOutputMap(new MIDIOutputMap(aWindow)),
+      mSysexEnabled(aSysexEnabled),
+      mAccessPromise(aAccessPromise),
+      mHasShutdown(false) {
+  MOZ_ASSERT(aWindow);
+  MOZ_ASSERT(aAccessPromise);
+  KeepAliveIfHasListenersFor(nsGkAtoms::onstatechange);
+}
+
+MIDIAccess::~MIDIAccess() { Shutdown(); }
+
+void MIDIAccess::Shutdown() {
+  LOG("MIDIAccess::Shutdown");
+  if (mHasShutdown) {
+    return;
+  }
+  if (MIDIAccessManager::IsRunning()) {
+    MIDIAccessManager::Get()->RemoveObserver(this);
+  }
+  mHasShutdown = true;
+}
+
+void MIDIAccess::FireConnectionEvent(MIDIPort* aPort) {
+  MOZ_ASSERT(aPort);
+  MIDIConnectionEventInit init;
+  init.mPort = aPort;
+  nsAutoString id;
+  aPort->GetId(id);
+  ErrorResult rv;
+  if (aPort->State() == MIDIPortDeviceState::Disconnected) {
+    if (aPort->Type() == MIDIPortType::Input && mInputMap->Has(id)) {
+      MIDIInputMap_Binding::MaplikeHelpers::Delete(mInputMap, aPort->StableId(),
+                                                   rv);
+      mInputMap->Remove(id);
+    } else if (aPort->Type() == MIDIPortType::Output && mOutputMap->Has(id)) {
+      MIDIOutputMap_Binding::MaplikeHelpers::Delete(mOutputMap,
+                                                    aPort->StableId(), rv);
+      mOutputMap->Remove(id);
+    }
+    if (NS_WARN_IF(rv.Failed())) {
+      LOG("Inconsistency during FireConnectionEvent");
+      return;
+    }
+  } else {
+    if (aPort->Type() == MIDIPortType::Input && !mInputMap->Has(id)) {
+      if (NS_WARN_IF(rv.Failed())) {
+        LOG("Input port not found");
+        return;
+      }
+      MIDIInputMap_Binding::MaplikeHelpers::Set(
+          mInputMap, aPort->StableId(), *(static_cast<MIDIInput*>(aPort)), rv);
+      if (NS_WARN_IF(rv.Failed())) {
+        LOG("Map Set failed for input port");
+        return;
+      }
+      mInputMap->Insert(id, aPort);
+    } else if (aPort->Type() == MIDIPortType::Output && mOutputMap->Has(id)) {
+      if (NS_WARN_IF(rv.Failed())) {
+        LOG("Output port not found");
+        return;
+      }
+      MIDIOutputMap_Binding::MaplikeHelpers::Set(
+          mOutputMap, aPort->StableId(), *(static_cast<MIDIOutput*>(aPort)),
+          rv);
+      if (NS_WARN_IF(rv.Failed())) {
+        LOG("Map set failed for output port");
+        return;
+      }
+      mOutputMap->Insert(id, aPort);
+    }
+  }
+  RefPtr<MIDIConnectionEvent> event =
+      MIDIConnectionEvent::Constructor(this, u"statechange"_ns, init);
+  DispatchTrustedEvent(event);
+}
+
+void MIDIAccess::MaybeCreateMIDIPort(const MIDIPortInfo& aInfo,
+                                     ErrorResult& aRv) {
+  nsAutoString id(aInfo.id());
+  MIDIPortType type = aInfo.type();
+  RefPtr<MIDIPort> port;
+  if (type == MIDIPortType::Input) {
+    if (mInputMap->Has(id) || NS_WARN_IF(aRv.Failed())) {
+      return;
+    }
+    port = MIDIInput::Create(GetOwnerWindow(), this, aInfo, mSysexEnabled);
+    if (NS_WARN_IF(!port)) {
+      LOG("Couldn't create input port");
+      aRv.Throw(NS_ERROR_FAILURE);
+      return;
+    }
+    MIDIInputMap_Binding::MaplikeHelpers::Set(
+        mInputMap, port->StableId(), *(static_cast<MIDIInput*>(port.get())),
+        aRv);
+    if (NS_WARN_IF(aRv.Failed())) {
+      LOG("Coudld't set input port in map");
+      return;
+    }
+    mInputMap->Insert(id, port);
+  } else if (type == MIDIPortType::Output) {
+    if (mOutputMap->Has(id) || NS_WARN_IF(aRv.Failed())) {
+      return;
+    }
+    port = MIDIOutput::Create(GetOwnerWindow(), this, aInfo, mSysexEnabled);
+    if (NS_WARN_IF(!port)) {
+      LOG("Couldn't create output port");
+      aRv.Throw(NS_ERROR_FAILURE);
+      return;
+    }
+    MIDIOutputMap_Binding::MaplikeHelpers::Set(
+        mOutputMap, port->StableId(), *(static_cast<MIDIOutput*>(port.get())),
+        aRv);
+    if (NS_WARN_IF(aRv.Failed())) {
+      LOG("Coudld't set output port in map");
+      return;
+    }
+    mOutputMap->Insert(id, port);
+  } else {
+    MOZ_CRASH("We shouldn't be here!");
+  }
+
+  if (!mAccessPromise) {
+    FireConnectionEvent(port);
+  }
+}
+
+void MIDIAccess::Notify(const MIDIPortList& aEvent) {
+  LOG("MIDIAccess::Notify");
+  if (!GetOwnerWindow()) {
+    return;
+  }
+
+  for (const auto& port : aEvent.ports()) {
+    ErrorResult rv;
+    MaybeCreateMIDIPort(port, rv);
+    if (rv.Failed()) {
+      if (!mAccessPromise) {
+        rv.SuppressException();
+        return;
+      }
+      mAccessPromise->MaybeReject(std::move(rv));
+      mAccessPromise = nullptr;
+    }
+  }
+  if (!mAccessPromise) {
+    return;
+  }
+  mAccessPromise->MaybeResolve(this);
+  mAccessPromise = nullptr;
+}
+
+JSObject* MIDIAccess::WrapObject(JSContext* aCx,
+                                 JS::Handle<JSObject*> aGivenProto) {
+  return MIDIAccess_Binding::Wrap(aCx, this, aGivenProto);
+}
+
+void MIDIAccess::DisconnectFromOwner() {
+  IgnoreKeepAliveIfHasListenersFor(nsGkAtoms::onstatechange);
+
+  DOMEventTargetHelper::DisconnectFromOwner();
+  MIDIAccessManager::Get()->SendRefresh();
+}
+
+}  

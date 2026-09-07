@@ -1,0 +1,73 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+/*
+******************************************************************************
+*
+*   Copyright (C) 1998-2005, International Business Machines
+*   Corporation and others.  All Rights Reserved.
+*
+******************************************************************************
+*
+* File schriter.h
+*
+* Modification History:
+*
+*   Date        Name        Description
+*  05/05/99     stephen     Cleaned up.
+******************************************************************************
+*/
+
+#ifndef SCHRITER_H
+#define SCHRITER_H
+
+#include "unicode/utypes.h"
+
+#if U_SHOW_CPLUSPLUS_API
+
+#include "unicode/chariter.h"
+#include "unicode/uchriter.h"
+
+ 
+U_NAMESPACE_BEGIN
+class U_COMMON_API StringCharacterIterator : public UCharCharacterIterator {
+public:
+  StringCharacterIterator(const UnicodeString& textStr);
+
+  StringCharacterIterator(const UnicodeString&    textStr,
+              int32_t              textPos);
+
+  StringCharacterIterator(const UnicodeString&    textStr,
+              int32_t              textBegin,
+              int32_t              textEnd,
+              int32_t              textPos);
+
+  StringCharacterIterator(const StringCharacterIterator&  that);
+
+  virtual ~StringCharacterIterator();
+
+  StringCharacterIterator&
+  operator=(const StringCharacterIterator&    that);
+
+  virtual bool           operator==(const ForwardCharacterIterator& that) const override;
+
+  virtual StringCharacterIterator* clone() const override;
+
+  void setText(const UnicodeString& newText);
+
+  virtual void            getText(UnicodeString& result) override;
+
+  virtual UClassID getDynamicClassID() const override;
+
+  static UClassID U_EXPORT2 getStaticClassID();
+
+protected:
+  StringCharacterIterator();
+
+  UnicodeString            text;
+
+};
+
+U_NAMESPACE_END
+
+#endif /* U_SHOW_CPLUSPLUS_API */
+
+#endif

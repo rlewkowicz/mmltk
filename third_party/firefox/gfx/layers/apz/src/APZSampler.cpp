@@ -1,0 +1,182 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/layers/APZSampler.h"
+
+#include "AsyncPanZoomController.h"
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/layers/APZThreadUtils.h"
+#include "mozilla/layers/APZUtils.h"
+#include "mozilla/layers/CompositorThread.h"
+#include "mozilla/layers/SynchronousTask.h"
+#include "TreeTraversal.h"
+#include "mozilla/webrender/WebRenderAPI.h"
+
+namespace mozilla {
+namespace layers {
+
+StaticMutex APZSampler::sWindowIdLock;
+StaticAutoPtr<std::unordered_map<uint64_t, RefPtr<APZSampler>>>
+    APZSampler::sWindowIdMap;
+
+APZSampler::APZSampler(const RefPtr<APZCTreeManager>& aApz,
+                       bool aIsUsingWebRender)
+    : mApz(aApz),
+      mIsUsingWebRender(aIsUsingWebRender),
+      mThreadIdLock("APZSampler::mThreadIdLock"),
+      mSampleTimeLock("APZSampler::mSampleTimeLock") {
+  MOZ_ASSERT(aApz);
+  mApz->SetSampler(this);
+}
+
+APZSampler::~APZSampler() { mApz->SetSampler(nullptr); }
+
+void APZSampler::Destroy() {
+  StaticMutexAutoLock lock(sWindowIdLock);
+  if (mWindowId) {
+    MOZ_ASSERT(sWindowIdMap);
+    sWindowIdMap->erase(wr::AsUint64(*mWindowId));
+  }
+}
+
+void APZSampler::SetWebRenderWindowId(const wr::WindowId& aWindowId) {
+  StaticMutexAutoLock lock(sWindowIdLock);
+  MOZ_ASSERT(!mWindowId);
+  mWindowId = Some(aWindowId);
+  if (!sWindowIdMap) {
+    sWindowIdMap = new std::unordered_map<uint64_t, RefPtr<APZSampler>>();
+    NS_DispatchToMainThread(NS_NewRunnableFunction(
+        "APZSampler::ClearOnShutdown", [] { ClearOnShutdown(&sWindowIdMap); }));
+  }
+  (*sWindowIdMap)[wr::AsUint64(aWindowId)] = this;
+}
+
+void APZSampler::SetSamplerThread(const wr::WrWindowId& aWindowId) {
+  if (RefPtr<APZSampler> sampler = GetSampler(aWindowId)) {
+    MutexAutoLock lock(sampler->mThreadIdLock);
+    sampler->mSamplerThreadId = Some(PlatformThread::CurrentId());
+  }
+}
+
+void APZSampler::SampleForWebRender(const wr::WrWindowId& aWindowId,
+                                    const uint64_t* aGeneratedFrameId,
+                                    wr::Transaction* aTransaction) {
+  if (RefPtr<APZSampler> sampler = GetSampler(aWindowId)) {
+    wr::TransactionWrapper txn(aTransaction);
+    Maybe<VsyncId> vsyncId =
+        aGeneratedFrameId ? Some(VsyncId{*aGeneratedFrameId}) : Nothing();
+    sampler->SampleForWebRender(vsyncId, txn);
+  }
+}
+
+void APZSampler::SetSampleTime(const SampleTime& aSampleTime) {
+  MOZ_ASSERT(CompositorThreadHolder::IsInCompositorThread());
+  MutexAutoLock lock(mSampleTimeLock);
+  mSampleTime = aSampleTime;
+}
+
+void APZSampler::SampleForWebRender(const Maybe<VsyncId>& aVsyncId,
+                                    wr::TransactionWrapper& aTxn) {
+  AssertOnSamplerThread();
+  SampleTime sampleTime;
+  {  
+    MutexAutoLock lock(mSampleTimeLock);
+
+    SampleTime now = SampleTime::FromNow();
+    sampleTime = mSampleTime.IsNull() ? now : mSampleTime;
+  }
+  mApz->SampleForWebRender(aVsyncId, aTxn, sampleTime);
+}
+
+AsyncTransform APZSampler::GetCurrentAsyncTransform(
+    const LayersId& aLayersId, const ScrollableLayerGuid::ViewID& aScrollId,
+    AsyncTransformComponents aComponents,
+    const MutexAutoLock& aProofOfMapLock) const {
+  MOZ_ASSERT(!CompositorThreadHolder::IsInCompositorThread());
+  AssertOnSamplerThread();
+
+  RefPtr<AsyncPanZoomController> apzc =
+      mApz->GetTargetAPZC(aLayersId, aScrollId, aProofOfMapLock);
+  if (!apzc) {
+    return AsyncTransform{};
+  }
+
+  return apzc->GetCurrentAsyncTransform(AsyncPanZoomController::eForCompositing,
+                                        aComponents);
+}
+
+ParentLayerRect APZSampler::GetCompositionBounds(
+    const LayersId& aLayersId, const ScrollableLayerGuid::ViewID& aScrollId,
+    const MutexAutoLock& aProofOfMapLock) const {
+  AssertOnSamplerThread();
+
+  RefPtr<AsyncPanZoomController> apzc =
+      mApz->GetTargetAPZC(aLayersId, aScrollId, aProofOfMapLock);
+  if (!apzc) {
+    return ParentLayerRect();
+  }
+
+  return apzc->GetCompositionBounds();
+}
+
+Maybe<APZSampler::ScrollOffsetAndRange>
+APZSampler::GetCurrentScrollOffsetAndRange(
+    const LayersId& aLayersId, const ScrollableLayerGuid::ViewID& aScrollId,
+    const MutexAutoLock& aProofOfMapLock) const {
+
+  RefPtr<AsyncPanZoomController> apzc =
+      mApz->GetTargetAPZC(aLayersId, aScrollId, aProofOfMapLock);
+  if (!apzc) {
+    return Nothing();
+  }
+
+  return Some(ScrollOffsetAndRange{
+      apzc->GetCurrentAsyncVisualViewport(
+              AsyncTransformConsumer::eForCompositing)
+          .TopLeft(),
+      apzc->GetCurrentScrollRangeInCssPixels()});
+}
+
+void APZSampler::AssertOnSamplerThread() const {
+  if (APZThreadUtils::GetThreadAssertionsEnabled()) {
+    MOZ_ASSERT(IsSamplerThread());
+  }
+}
+
+bool APZSampler::IsSamplerThread() const {
+  if (mIsUsingWebRender) {
+    MutexAutoLock lock(mThreadIdLock);
+    return mSamplerThreadId && PlatformThread::CurrentId() == *mSamplerThreadId;
+  }
+  return CompositorThreadHolder::IsInCompositorThread();
+}
+
+already_AddRefed<APZSampler> APZSampler::GetSampler(
+    const wr::WrWindowId& aWindowId) {
+  RefPtr<APZSampler> sampler;
+  StaticMutexAutoLock lock(sWindowIdLock);
+  if (sWindowIdMap) {
+    auto it = sWindowIdMap->find(wr::AsUint64(aWindowId));
+    if (it != sWindowIdMap->end()) {
+      sampler = it->second;
+    }
+  }
+  return sampler.forget();
+}
+
+}  
+}  
+
+void apz_register_sampler(mozilla::wr::WrWindowId aWindowId) {
+  mozilla::layers::APZSampler::SetSamplerThread(aWindowId);
+}
+
+void apz_sample_transforms(mozilla::wr::WrWindowId aWindowId,
+                           const uint64_t* aGeneratedFrameId,
+                           mozilla::wr::Transaction* aTransaction) {
+  mozilla::layers::APZSampler::SampleForWebRender(aWindowId, aGeneratedFrameId,
+                                                  aTransaction);
+}
+
+void apz_deregister_sampler(mozilla::wr::WrWindowId aWindowId) {}

@@ -1,0 +1,1741 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsMathMLChar.h"
+
+#include <algorithm>
+#include <numbers>
+#include <numeric>
+
+#include "gfxContext.h"
+#include "gfxMathTable.h"
+#include "gfxTextRun.h"
+#include "gfxUtils.h"
+#include "mozilla/BinarySearch.h"
+#include "mozilla/ComputedStyle.h"
+#include "mozilla/LookAndFeel.h"
+#include "mozilla/MathAlgorithms.h"
+#include "mozilla/Sprintf.h"
+#include "mozilla/StaticPrefs_mathml.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/dom/Document.h"
+#include "mozilla/gfx/2D.h"
+#include "mozilla/intl/UnicodeScriptCodes.h"
+#include "nsCSSRendering.h"
+#include "nsContentUtils.h"
+#include "nsDeviceContext.h"
+#include "nsDisplayList.h"
+#include "nsFontMetrics.h"
+#include "nsIFrame.h"
+#include "nsIObserver.h"
+#include "nsIObserverService.h"
+#include "nsLayoutUtils.h"
+#include "nsMathMLOperators.h"
+#include "nsNetUtil.h"
+#include "nsPresContext.h"
+#include "nsUnicharUtils.h"
+
+using namespace mozilla;
+using namespace mozilla::gfx;
+using namespace mozilla::image;
+
+
+static const float kMaxScaleFactor = 20.0;
+static const float kLargeOpFactor = std::numbers::sqrt2_v<float>;
+static const float kIntegralFactor = 2.0;
+
+static void NormalizeDefaultFont(nsFont& aFont, float aFontSizeInflation) {
+  aFont.size.ScaleBy(aFontSizeInflation);
+}
+
+static const nsGlyphCode kNullGlyph = {{0}, false};
+
+
+class nsGlyphTable {
+ public:
+  virtual ~nsGlyphTable() = default;
+  virtual bool IsUnicodeTable() const { return false; }
+
+  virtual const nsCString& FontNameFor(const nsGlyphCode& aGlyphCode) const = 0;
+
+  virtual nsGlyphCode ElementAt(DrawTarget* aDrawTarget,
+                                int32_t aAppUnitsPerDevPixel,
+                                gfxFontGroup* aFontGroup, char16_t aChar,
+                                bool aVertical, uint32_t aPosition) = 0;
+  virtual nsGlyphCode BigOf(DrawTarget* aDrawTarget,
+                            int32_t aAppUnitsPerDevPixel,
+                            gfxFontGroup* aFontGroup, char16_t aChar,
+                            bool aVertical, uint32_t aSize) = 0;
+
+  virtual bool HasPartsOf(DrawTarget* aDrawTarget, int32_t aAppUnitsPerDevPixel,
+                          gfxFontGroup* aFontGroup, char16_t aChar,
+                          bool aVertical) = 0;
+
+  virtual already_AddRefed<gfxTextRun> MakeTextRun(
+      DrawTarget* aDrawTarget, int32_t aAppUnitsPerDevPixel,
+      gfxFontGroup* aFontGroup, const nsGlyphCode& aGlyph) = 0;
+
+ protected:
+  char16_t mCharCache = 0;
+};
+
+typedef char16_t const UnicodeConstruction[7];
+// clang-format off
+static const UnicodeConstruction gUnicodeTableConstructions[] = {
+  { 0x0028, 0x239B, 0x0000, 0x239D, 0x239C, 0x0028, 0x0000 },
+  { 0x0029, 0x239E, 0x0000, 0x23A0, 0x239F, 0x0029, 0x0000 },
+  { 0x003D, 0x0000, 0x0000, 0x0000, 0x003D, 0x003D, 0x0000 },
+  { 0x005B, 0x23A1, 0x0000, 0x23A3, 0x23A2, 0x005B, 0x0000 },
+  { 0x005D, 0x23A4, 0x0000, 0x23A6, 0x23A5, 0x005D, 0x0000 },
+  { 0x005F, 0x0000, 0x0000, 0x0000, 0x0332, 0x0332, 0x0000 },
+  { 0x007B, 0x23A7, 0x23A8, 0x23A9, 0x23AA, 0x007B, 0x0000 },
+  { 0x007C, 0x0000, 0x0000, 0x0000, 0x007C, 0x007C, 0x0000 },
+  { 0x007D, 0x23AB, 0x23AC, 0x23AD, 0x23AA, 0x007D, 0x0000 },
+  { 0x00AF, 0x0000, 0x0000, 0x0000, 0x0305, 0x00AF, 0x0000 },
+  { 0x0332, 0x0000, 0x0000, 0x0000, 0x0332, 0x0332, 0x0000 },
+  { 0x2016, 0x0000, 0x0000, 0x0000, 0x2016, 0x2016, 0x0000 },
+  { 0x203E, 0x0000, 0x0000, 0x0000, 0x0305, 0x00AF, 0x0000 },
+  { 0x2190, 0x2190, 0x0000, 0x0000, 0x23AF, 0x2190, 0x27F5 },
+  { 0x2191, 0x2191, 0x0000, 0x0000, 0x23D0, 0x2191, 0x0000 },
+  { 0x2192, 0x0000, 0x0000, 0x2192, 0x23AF, 0x2192, 0x27F6 },
+  { 0x2193, 0x0000, 0x0000, 0x2193, 0x23D0, 0x2193, 0x0000 },
+  { 0x2194, 0x2190, 0x0000, 0x2192, 0x23AF, 0x2194, 0x27F7 },
+  { 0x2195, 0x2191, 0x0000, 0x2193, 0x23D0, 0x2195, 0x0000 },
+  { 0x21A4, 0x2190, 0x0000, 0x22A3, 0x23AF, 0x21AA, 0x27FB },
+  { 0x21A6, 0x22A2, 0x0000, 0x2192, 0x23AF, 0x21A6, 0x27FC },
+  { 0x21BC, 0x21BC, 0x0000, 0x0000, 0x23AF, 0x21BC, 0x0000 },
+  { 0x21BD, 0x21BD, 0x0000, 0x0000, 0x23AF, 0x21BD, 0x0000 },
+  { 0x21C0, 0x0000, 0x0000, 0x21C0, 0x23AF, 0x21C0, 0x0000 },
+  { 0x21C1, 0x0000, 0x0000, 0x21C1, 0x23AF, 0x21C1, 0x0000 },
+  { 0x21D0, 0x0000, 0x0000, 0x0000, 0x0000, 0x21D0, 0x27F8 },
+  { 0x21D2, 0x0000, 0x0000, 0x0000, 0x0000, 0x21D2, 0x27F9 },
+  { 0x21D4, 0x0000, 0x0000, 0x0000, 0x0000, 0x21D4, 0x27FA },
+  { 0x2223, 0x0000, 0x0000, 0x0000, 0x2223, 0x2223, 0x0000 },
+  { 0x2225, 0x0000, 0x0000, 0x0000, 0x2225, 0x2225, 0x0000 },
+  { 0x222B, 0x2320, 0x0000, 0x2321, 0x23AE, 0x222B, 0x0000 },
+  { 0x2308, 0x23A1, 0x0000, 0x0000, 0x23A2, 0x2308, 0x0000 },
+  { 0x2309, 0x23A4, 0x0000, 0x0000, 0x23A5, 0x2309, 0x0000 },
+  { 0x230A, 0x0000, 0x0000, 0x23A3, 0x23A2, 0x230A, 0x0000 },
+  { 0x230B, 0x0000, 0x0000, 0x23A6, 0x23A5, 0x230B, 0x0000 },
+  { 0x23B0, 0x23A7, 0x0000, 0x23AD, 0x23AA, 0x23B0, 0x0000 },
+  { 0x23B1, 0x23AB, 0x0000, 0x23A9, 0x23AA, 0x23B1, 0x0000 },
+  { 0x27F5, 0x2190, 0x0000, 0x0000, 0x23AF, 0x27F5, 0x0000 },
+  { 0x27F6, 0x0000, 0x0000, 0x2192, 0x23AF, 0x27F6, 0x0000 },
+  { 0x27F7, 0x2190, 0x0000, 0x2192, 0x23AF, 0x27F7, 0x0000 },
+  { 0x294E, 0x21BC, 0x0000, 0x21C0, 0x23AF, 0x294E, 0x0000 },
+  { 0x2950, 0x21BD, 0x0000, 0x21C1, 0x23AF, 0x2950, 0x0000 },
+  { 0x295A, 0x21BC, 0x0000, 0x22A3, 0x23AF, 0x295A, 0x0000 },
+  { 0x295B, 0x22A2, 0x0000, 0x21C0, 0x23AF, 0x295B, 0x0000 },
+  { 0x295E, 0x21BD, 0x0000, 0x22A3, 0x23AF, 0x295E, 0x0000 },
+  { 0x295F, 0x22A2, 0x0000, 0x21C1, 0x23AF, 0x295F, 0x0000 },
+};
+// clang-format on
+
+class nsUnicodeTable final : public nsGlyphTable {
+ public:
+  constexpr nsUnicodeTable() = default;
+
+  bool IsUnicodeTable() const final { return true; };
+
+  const nsCString& FontNameFor(const nsGlyphCode& aGlyphCode) const override {
+    MOZ_ASSERT_UNREACHABLE();
+    return VoidCString();
+  }
+
+  virtual nsGlyphCode ElementAt(DrawTarget* aDrawTarget,
+                                int32_t aAppUnitsPerDevPixel,
+                                gfxFontGroup* aFontGroup, char16_t aChar,
+                                bool aVertical, uint32_t aPosition) override;
+
+  virtual nsGlyphCode BigOf(DrawTarget* aDrawTarget,
+                            int32_t aAppUnitsPerDevPixel,
+                            gfxFontGroup* aFontGroup, char16_t aChar,
+                            bool aVertical, uint32_t aSize) override {
+    return ElementAt(aDrawTarget, aAppUnitsPerDevPixel, aFontGroup, aChar,
+                     aVertical, 4 + aSize);
+  }
+
+  virtual bool HasPartsOf(DrawTarget* aDrawTarget, int32_t aAppUnitsPerDevPixel,
+                          gfxFontGroup* aFontGroup, char16_t aChar,
+                          bool aVertical) override {
+    return (ElementAt(aDrawTarget, aAppUnitsPerDevPixel, aFontGroup, aChar,
+                      aVertical, 0)
+                .Exists() ||
+            ElementAt(aDrawTarget, aAppUnitsPerDevPixel, aFontGroup, aChar,
+                      aVertical, 1)
+                .Exists() ||
+            ElementAt(aDrawTarget, aAppUnitsPerDevPixel, aFontGroup, aChar,
+                      aVertical, 2)
+                .Exists() ||
+            ElementAt(aDrawTarget, aAppUnitsPerDevPixel, aFontGroup, aChar,
+                      aVertical, 3)
+                .Exists());
+  }
+
+  virtual already_AddRefed<gfxTextRun> MakeTextRun(
+      DrawTarget* aDrawTarget, int32_t aAppUnitsPerDevPixel,
+      gfxFontGroup* aFontGroup, const nsGlyphCode& aGlyph) override;
+
+  void* operator new(size_t) = delete;
+  void* operator new[](size_t) = delete;
+
+ private:
+  struct UnicodeConstructionComparator {
+    int operator()(const UnicodeConstruction& aValue) const {
+      if (mTarget < aValue[0]) {
+        return -1;
+      }
+      if (mTarget > aValue[0]) {
+        return 1;
+      }
+      return 0;
+    }
+    explicit UnicodeConstructionComparator(char16_t aTarget)
+        : mTarget(aTarget) {}
+    const char16_t mTarget;
+  };
+  size_t mCachedIndex = 0;
+};
+
+static constinit nsUnicodeTable gUnicodeTable;
+
+nsGlyphCode nsUnicodeTable::ElementAt(DrawTarget* ,
+                                      int32_t ,
+                                      gfxFontGroup* ,
+                                      char16_t aChar, bool ,
+                                      uint32_t aPosition) {
+  if (mCharCache != aChar) {
+    size_t match;
+    if (!BinarySearchIf(gUnicodeTableConstructions, 0,
+                        std::size(gUnicodeTableConstructions),
+                        UnicodeConstructionComparator(aChar), &match)) {
+      return kNullGlyph;
+    }
+    mCachedIndex = match;
+    mCharCache = aChar;
+  }
+
+  const UnicodeConstruction& construction =
+      gUnicodeTableConstructions[mCachedIndex];
+  if (aPosition + 1 >= std::size(construction)) {
+    return kNullGlyph;
+  }
+  nsGlyphCode ch;
+  ch.code = construction[aPosition + 1];
+  ch.isGlyphID = false;
+  return ch.code == char16_t(0xFFFD) ? kNullGlyph : ch;
+}
+
+already_AddRefed<gfxTextRun> nsUnicodeTable::MakeTextRun(
+    DrawTarget* aDrawTarget, int32_t aAppUnitsPerDevPixel,
+    gfxFontGroup* aFontGroup, const nsGlyphCode& aGlyph) {
+  NS_ASSERTION(!aGlyph.isGlyphID,
+               "nsUnicodeTable can only access glyphs by code point");
+  return aFontGroup->MakeTextRun(&aGlyph.code, 1, aDrawTarget,
+                                 aAppUnitsPerDevPixel, gfx::ShapedTextFlags(),
+                                 nsTextFrameUtils::Flags(), nullptr);
+}
+
+class nsOpenTypeTable final : public nsGlyphTable {
+ public:
+  MOZ_COUNTED_DTOR(nsOpenTypeTable)
+
+  virtual nsGlyphCode ElementAt(DrawTarget* aDrawTarget,
+                                int32_t aAppUnitsPerDevPixel,
+                                gfxFontGroup* aFontGroup, char16_t aChar,
+                                bool aVertical, uint32_t aPosition) override;
+  virtual nsGlyphCode BigOf(DrawTarget* aDrawTarget,
+                            int32_t aAppUnitsPerDevPixel,
+                            gfxFontGroup* aFontGroup, char16_t aChar,
+                            bool aVertical, uint32_t aSize) override;
+  virtual bool HasPartsOf(DrawTarget* aDrawTarget, int32_t aAppUnitsPerDevPixel,
+                          gfxFontGroup* aFontGroup, char16_t aChar,
+                          bool aVertical) override;
+
+  const nsCString& FontNameFor(const nsGlyphCode& aGlyphCode) const override {
+    NS_ASSERTION(aGlyphCode.isGlyphID,
+                 "nsOpenTypeTable can only access glyphs by id");
+    return mFontFamilyName;
+  }
+
+  virtual already_AddRefed<gfxTextRun> MakeTextRun(
+      DrawTarget* aDrawTarget, int32_t aAppUnitsPerDevPixel,
+      gfxFontGroup* aFontGroup, const nsGlyphCode& aGlyph) override;
+
+  static UniquePtr<nsOpenTypeTable> Create(gfxFont* aFont,
+                                           gfx::ShapedTextFlags aFlags) {
+    if (!aFont->TryGetMathTable()) {
+      return nullptr;
+    }
+    return WrapUnique(new nsOpenTypeTable(aFont, aFlags));
+  }
+
+ private:
+  RefPtr<gfxFont> mFont;
+  nsCString mFontFamilyName;
+  uint32_t mGlyphID;
+  gfx::ShapedTextFlags mFlags;
+
+  nsOpenTypeTable(gfxFont* aFont, gfx::ShapedTextFlags aFlags)
+      : mFont(aFont),
+        mFontFamilyName(aFont->GetFontEntry()->FamilyName()),
+        mGlyphID(0),
+        mFlags(aFlags) {
+    MOZ_COUNT_CTOR(nsOpenTypeTable);
+  }
+
+  void UpdateCache(DrawTarget* aDrawTarget, int32_t aAppUnitsPerDevPixel,
+                   gfxFontGroup* aFontGroup, char16_t aChar);
+
+  bool IsRtl() const {
+    return bool(mFlags & gfx::ShapedTextFlags::TEXT_IS_RTL);
+  };
+};
+
+void nsOpenTypeTable::UpdateCache(DrawTarget* aDrawTarget,
+                                  int32_t aAppUnitsPerDevPixel,
+                                  gfxFontGroup* aFontGroup, char16_t aChar) {
+  if (mCharCache != aChar) {
+    RefPtr<gfxTextRun> textRun =
+        aFontGroup->MakeTextRun(&aChar, 1, aDrawTarget, aAppUnitsPerDevPixel,
+                                mFlags, nsTextFrameUtils::Flags(), nullptr);
+    const gfxTextRun::CompressedGlyph& data = textRun->GetCharacterGlyphs()[0];
+    if (data.IsSimpleGlyph()) {
+      mGlyphID = data.GetSimpleGlyph();
+    } else if (data.GetGlyphCount() == 1) {
+      mGlyphID = textRun->GetDetailedGlyphs(0)->mGlyphID;
+    } else {
+      mGlyphID = 0;
+    }
+    mCharCache = aChar;
+  }
+}
+
+nsGlyphCode nsOpenTypeTable::ElementAt(DrawTarget* aDrawTarget,
+                                       int32_t aAppUnitsPerDevPixel,
+                                       gfxFontGroup* aFontGroup, char16_t aChar,
+                                       bool aVertical, uint32_t aPosition) {
+  UpdateCache(aDrawTarget, aAppUnitsPerDevPixel, aFontGroup, aChar);
+
+  uint32_t parts[4];
+  if (!mFont->MathTable()->VariantsParts(mGlyphID, aVertical, IsRtl(), parts)) {
+    return kNullGlyph;
+  }
+
+  uint32_t glyphID = parts[aPosition];
+  if (!glyphID) {
+    return kNullGlyph;
+  }
+  nsGlyphCode glyph;
+  glyph.glyphID = glyphID;
+  glyph.isGlyphID = true;
+  return glyph;
+}
+
+nsGlyphCode nsOpenTypeTable::BigOf(DrawTarget* aDrawTarget,
+                                   int32_t aAppUnitsPerDevPixel,
+                                   gfxFontGroup* aFontGroup, char16_t aChar,
+                                   bool aVertical, uint32_t aSize) {
+  UpdateCache(aDrawTarget, aAppUnitsPerDevPixel, aFontGroup, aChar);
+
+  uint32_t glyphID =
+      mFont->MathTable()->VariantsSize(mGlyphID, aVertical, IsRtl(), aSize);
+  if (!glyphID) {
+    return kNullGlyph;
+  }
+
+  nsGlyphCode glyph;
+  glyph.glyphID = glyphID;
+  glyph.isGlyphID = true;
+  return glyph;
+}
+
+bool nsOpenTypeTable::HasPartsOf(DrawTarget* aDrawTarget,
+                                 int32_t aAppUnitsPerDevPixel,
+                                 gfxFontGroup* aFontGroup, char16_t aChar,
+                                 bool aVertical) {
+  UpdateCache(aDrawTarget, aAppUnitsPerDevPixel, aFontGroup, aChar);
+
+  uint32_t parts[4];
+  if (!mFont->MathTable()->VariantsParts(mGlyphID, aVertical, IsRtl(), parts)) {
+    return false;
+  }
+
+  return parts[0] || parts[1] || parts[2] || parts[3];
+}
+
+already_AddRefed<gfxTextRun> nsOpenTypeTable::MakeTextRun(
+    DrawTarget* aDrawTarget, int32_t aAppUnitsPerDevPixel,
+    gfxFontGroup* aFontGroup, const nsGlyphCode& aGlyph) {
+  NS_ASSERTION(aGlyph.isGlyphID,
+               "nsOpenTypeTable can only access glyphs by id");
+
+  gfxTextRunFactory::Parameters params = {
+      aDrawTarget, nullptr, nullptr, nullptr, 0, aAppUnitsPerDevPixel};
+  RefPtr<gfxTextRun> textRun = gfxTextRun::Create(
+      &params, 1, aFontGroup, mFlags, nsTextFrameUtils::Flags());
+  RefPtr<gfxFont> font = aFontGroup->GetFirstValidFont();
+  textRun->AddGlyphRun(font, FontMatchType::Kind::kFontGroup, 0, false,
+                       gfx::ShapedTextFlags::TEXT_ORIENT_HORIZONTAL, false);
+  gfxTextRun::DetailedGlyph detailedGlyph;
+  detailedGlyph.mGlyphID = aGlyph.glyphID;
+  detailedGlyph.mAdvance = NSToCoordRound(
+      aAppUnitsPerDevPixel * font->GetGlyphAdvance(aGlyph.glyphID));
+  textRun->SetDetailedGlyphs(0, 1, &detailedGlyph);
+
+  return textRun.forget();
+}
+
+
+nsMathMLChar::~nsMathMLChar() { MOZ_COUNT_DTOR(nsMathMLChar); }
+
+void nsMathMLChar::SetComputedStyle(ComputedStyle* aComputedStyle) {
+  MOZ_ASSERT(aComputedStyle);
+  mComputedStyle = aComputedStyle;
+}
+
+void nsMathMLChar::SetData(nsString& aData) {
+  mData = aData;
+  mDirection = StretchDirection::Unsupported;
+  mBoundingMetrics = nsBoundingMetrics();
+  if (1 == mData.Length()) {
+    mDirection = nsMathMLOperators::GetStretchyDirection(mData);
+  }
+}
+
+
+static constexpr float kMathMLDelimiterFactor = 0.901;
+static constexpr float kMathMLDelimiterShortfallPoints = 5.0;
+
+static bool IsSizeOK(nscoord a, nscoord b, MathMLStretchFlags aStretchFlags) {
+  bool isNormal =
+      (aStretchFlags.contains(MathMLStretchFlag::Normal)) &&
+      Abs<float>(a - b) < (1.0f - kMathMLDelimiterFactor) * float(b);
+
+  bool isNearer = false;
+  if (aStretchFlags.contains(MathMLStretchFlag::Nearer) ||
+      aStretchFlags.contains(MathMLStretchFlag::LargeOperator)) {
+    float c = std::max(float(b) * kMathMLDelimiterFactor,
+                       float(b) - nsPresContext::CSSPointsToAppUnits(
+                                      kMathMLDelimiterShortfallPoints));
+    isNearer = Abs<float>(b - a) <= float(b) - c;
+  }
+
+  bool isSmaller = aStretchFlags.contains(MathMLStretchFlag::Smaller) &&
+                   float(a) >= kMathMLDelimiterFactor * float(b) && a <= b;
+
+  bool isLarger = (aStretchFlags.contains(MathMLStretchFlag::Larger) ||
+                   aStretchFlags.contains(MathMLStretchFlag::LargeOperator)) &&
+                  a >= b;
+
+  return (isNormal || isSmaller || isNearer || isLarger);
+}
+
+static bool IsSizeBetter(nscoord a, nscoord olda, nscoord b,
+                         MathMLStretchFlags aStretchFlags) {
+  if (0 == olda) {
+    return true;
+  }
+  if (aStretchFlags.contains(MathMLStretchFlag::Larger) ||
+      aStretchFlags.contains(MathMLStretchFlag::LargeOperator)) {
+    return (a >= olda) ? (olda < b) : (a >= b);
+  }
+  if (aStretchFlags.contains(MathMLStretchFlag::Smaller)) {
+    return (a <= olda) ? (olda > b) : (a <= b);
+  }
+
+  return Abs(a - b) < Abs(olda - b);
+}
+
+static nscoord ComputeSizeFromParts(nsPresContext* aPresContext,
+                                    nsGlyphCode* aGlyphs, nscoord* aSizes,
+                                    nscoord aTargetSize) {
+  enum { first, middle, last, glue };
+  nscoord sum = 0;
+  for (int32_t i = first; i <= last; i++) {
+    sum += aSizes[i];
+  }
+
+  nscoord oneDevPixel = aPresContext->AppUnitsPerDevPixel();
+  int32_t joins = aGlyphs[middle] == aGlyphs[glue] ? 1 : 2;
+
+  const int32_t maxGlyphs = 1000;
+
+  nscoord maxSize = sum - 2 * joins * oneDevPixel + maxGlyphs * aSizes[glue];
+  if (maxSize < aTargetSize) {
+    return maxSize;  
+  }
+
+  nscoord minSize = NSToCoordRound(kMathMLDelimiterFactor * sum);
+
+  if (minSize > aTargetSize) {
+    return minSize;  
+  }
+
+  return aTargetSize;
+}
+
+bool nsMathMLChar::SetFontFamily(nsPresContext* aPresContext,
+                                 const nsGlyphTable* aGlyphTable,
+                                 const nsGlyphCode& aGlyphCode,
+                                 const StyleFontFamilyList& aDefaultFamilyList,
+                                 nsFont& aFont,
+                                 RefPtr<gfxFontGroup>* aFontGroup) {
+  StyleFontFamilyList glyphCodeFont;
+  if (aGlyphCode.isGlyphID) {
+    glyphCodeFont = StyleFontFamilyList::WithOneUnquotedFamily(
+        aGlyphTable->FontNameFor(aGlyphCode));
+  }
+
+  const StyleFontFamilyList& familyList =
+      aGlyphCode.isGlyphID ? glyphCodeFont : aDefaultFamilyList;
+
+  if (!*aFontGroup || aFont.family.families != familyList) {
+    nsFont font = aFont;
+    font.family.families = familyList;
+    const nsStyleFont* styleFont = mComputedStyle->StyleFont();
+    nsFontMetrics::Params params;
+    params.language = styleFont->mLanguage;
+    params.explicitLanguage = styleFont->mExplicitLanguage;
+    params.userFontSet = aPresContext->GetUserFontSet();
+    params.textPerf = aPresContext->GetTextPerfMetrics();
+    params.featureValueLookup = aPresContext->GetFontFeatureValuesLookup();
+    RefPtr<nsFontMetrics> fm = aPresContext->GetMetricsFor(font, params);
+    const bool shouldSetFont = [&] {
+      if (aGlyphTable && aGlyphTable->IsUnicodeTable()) {
+        return true;
+      }
+
+      if (familyList.list.IsEmpty()) {
+        return false;
+      }
+
+      const auto& firstFontInList = familyList.list.AsSpan()[0];
+
+      RefPtr<gfxFont> firstFont = fm->GetThebesFontGroup()->GetFirstValidFont();
+      RefPtr<nsAtom> firstFontName =
+          NS_Atomize(firstFont->GetFontEntry()->FamilyName());
+
+      return firstFontInList.IsFamilyName() &&
+             firstFontInList.AsFamilyName().name.AsAtom() == firstFontName;
+    }();
+    if (!shouldSetFont) {
+      return false;
+    }
+    aFont.family.families = familyList;
+    *aFontGroup = fm->GetThebesFontGroup();
+  }
+  return true;
+}
+
+static nsBoundingMetrics MeasureTextRun(DrawTarget* aDrawTarget,
+                                        gfxTextRun* aTextRun) {
+  gfxTextRun::Metrics metrics =
+      aTextRun->MeasureText(gfxFont::TIGHT_HINTED_OUTLINE_EXTENTS, aDrawTarget);
+
+  nsBoundingMetrics bm;
+  bm.leftBearing = NSToCoordFloor(metrics.mBoundingBox.X());
+  bm.rightBearing = NSToCoordCeil(metrics.mBoundingBox.XMost());
+  bm.ascent = NSToCoordCeil(-metrics.mBoundingBox.Y());
+  bm.descent = NSToCoordCeil(metrics.mBoundingBox.YMost());
+  bm.width = NSToCoordRound(metrics.mAdvanceWidth);
+
+  return bm;
+}
+
+class nsMathMLChar::StretchEnumContext {
+ public:
+  StretchEnumContext(nsMathMLChar* aChar, nsPresContext* aPresContext,
+                     DrawTarget* aDrawTarget, float aFontSizeInflation,
+                     StretchDirection aStretchDirection, nscoord aTargetSize,
+                     MathMLStretchFlags aStretchFlags,
+                     nsBoundingMetrics& aStretchedMetrics,
+                     const StyleFontFamilyList& aFamilyList, bool& aGlyphFound)
+      : mChar(aChar),
+        mPresContext(aPresContext),
+        mDrawTarget(aDrawTarget),
+        mFontSizeInflation(aFontSizeInflation),
+        mDirection(aStretchDirection),
+        mTargetSize(aTargetSize),
+        mStretchFlags(aStretchFlags),
+        mBoundingMetrics(aStretchedMetrics),
+        mFamilyList(aFamilyList),
+        mTryVariants(true),
+        mTryParts(true),
+        mGlyphFound(aGlyphFound) {}
+
+  static bool EnumCallback(const StyleSingleFontFamily& aFamily, void* aData,
+                           gfx::ShapedTextFlags aFlags, bool aRtl);
+
+ private:
+  bool TryVariants(nsGlyphTable* aGlyphTable, RefPtr<gfxFontGroup>* aFontGroup,
+                   const StyleFontFamilyList& aFamilyList, bool aRtl);
+  bool TryParts(nsGlyphTable* aGlyphTable, RefPtr<gfxFontGroup>* aFontGroup,
+                const StyleFontFamilyList& aFamilyList);
+
+  nsMathMLChar* mChar;
+  nsPresContext* mPresContext;
+  DrawTarget* mDrawTarget;
+  float mFontSizeInflation;
+  const StretchDirection mDirection;
+  const nscoord mTargetSize;
+  const MathMLStretchFlags mStretchFlags;
+  nsBoundingMetrics& mBoundingMetrics;
+  const StyleFontFamilyList& mFamilyList;
+
+ public:
+  bool mTryVariants;
+  bool mTryParts;
+
+ private:
+  bool mUnicodeTableTried = false;
+  bool& mGlyphFound;
+};
+
+bool nsMathMLChar::StretchEnumContext::TryVariants(
+    nsGlyphTable* aGlyphTable, RefPtr<gfxFontGroup>* aFontGroup,
+    const StyleFontFamilyList& aFamilyList, bool aRtl) {
+  ComputedStyle* sc = mChar->mComputedStyle;
+  nsFont font = sc->StyleFont()->mFont;
+  NormalizeDefaultFont(font, mFontSizeInflation);
+
+  bool isVertical = (mDirection == StretchDirection::Vertical);
+  nscoord oneDevPixel = mPresContext->AppUnitsPerDevPixel();
+  char16_t uchar = mChar->mData[0];
+  bool largeop = mStretchFlags.contains(MathMLStretchFlag::LargeOperator);
+  bool largeopOnly =
+      largeop && (mStretchFlags & kMathMLStretchVariableSet).isEmpty();
+  bool maxWidth = mStretchFlags.contains(MathMLStretchFlag::MaxWidth);
+
+  nscoord bestSize =
+      isVertical ? mBoundingMetrics.ascent + mBoundingMetrics.descent
+                 : mBoundingMetrics.rightBearing - mBoundingMetrics.leftBearing;
+  bool haveBetter = false;
+
+  int32_t size = aRtl ? 0 : 1;
+  nsGlyphCode ch;
+  nscoord displayOperatorMinHeight = 0;
+  if (largeopOnly) {
+    NS_ASSERTION(isVertical, "Stretching should be in the vertical direction");
+    ch = aGlyphTable->BigOf(mDrawTarget, oneDevPixel, *aFontGroup, uchar,
+                            isVertical, 0);
+    if (ch.isGlyphID) {
+      RefPtr<gfxFont> mathFont = aFontGroup->get()->GetFirstMathFont();
+      if (mathFont) {
+        displayOperatorMinHeight = mathFont->MathTable()->Constant(
+            gfxMathTable::DisplayOperatorMinHeight, oneDevPixel);
+      }
+    }
+  }
+#ifdef NOISY_SEARCH
+  printf("  searching in %s ...\n", NS_LossyConvertUTF16toASCII(aFamily).get());
+#endif
+  while ((ch = aGlyphTable->BigOf(mDrawTarget, oneDevPixel, *aFontGroup, uchar,
+                                  isVertical, size))
+             .Exists()) {
+    if (!mChar->SetFontFamily(mPresContext, aGlyphTable, ch, aFamilyList, font,
+                              aFontGroup)) {
+      if (largeopOnly) {
+        break;
+      }
+      ++size;
+      continue;
+    }
+
+    RefPtr<gfxTextRun> textRun =
+        aGlyphTable->MakeTextRun(mDrawTarget, oneDevPixel, *aFontGroup, ch);
+    nsBoundingMetrics bm = MeasureTextRun(mDrawTarget, textRun.get());
+
+    nscoord charSize =
+        isVertical ? bm.ascent + bm.descent : bm.rightBearing - bm.leftBearing;
+
+    if (largeopOnly ||
+        IsSizeBetter(charSize, bestSize, mTargetSize, mStretchFlags)) {
+      mGlyphFound = true;
+      if (maxWidth) {
+        if (mBoundingMetrics.width < bm.width) {
+          mBoundingMetrics.width = bm.width;
+        }
+        if (mBoundingMetrics.leftBearing > bm.leftBearing) {
+          mBoundingMetrics.leftBearing = bm.leftBearing;
+        }
+        if (mBoundingMetrics.rightBearing < bm.rightBearing) {
+          mBoundingMetrics.rightBearing = bm.rightBearing;
+        }
+        haveBetter = largeopOnly;
+      } else {
+        mBoundingMetrics = bm;
+        haveBetter = true;
+        bestSize = charSize;
+        mChar->mGlyphs[0] = std::move(textRun);
+        mChar->mDrawingMethod = DrawingMethod::Variant;
+
+        mChar->mItalicCorrection = 0;
+        if (ch.isGlyphID) {
+          if (RefPtr<gfxFont> mathFont =
+                  aFontGroup->get()->GetFirstMathFont()) {
+            mChar->mItalicCorrection = NSToCoordRound(
+                mathFont->MathTable()->ItalicsCorrection(ch.glyphID) *
+                oneDevPixel);
+          }
+        }
+      }
+#ifdef NOISY_SEARCH
+      printf("    size:%d Current best\n", size);
+#endif
+    } else {
+#ifdef NOISY_SEARCH
+      printf("    size:%d Rejected!\n", size);
+#endif
+      if (haveBetter) {
+        break;  
+      }
+    }
+
+    if (largeopOnly && (bm.ascent + bm.descent) >= displayOperatorMinHeight) {
+      break;
+    }
+    ++size;
+  }
+
+  return haveBetter &&
+         (largeopOnly || IsSizeOK(bestSize, mTargetSize, mStretchFlags));
+}
+
+bool nsMathMLChar::StretchEnumContext::TryParts(
+    nsGlyphTable* aGlyphTable, RefPtr<gfxFontGroup>* aFontGroup,
+    const StyleFontFamilyList& aFamilyList) {
+  nsFont font = mChar->mComputedStyle->StyleFont()->mFont;
+  NormalizeDefaultFont(font, mFontSizeInflation);
+
+  RefPtr<gfxTextRun> textRun[4];
+  nsGlyphCode chdata[4];
+  nsBoundingMetrics bmdata[4];
+  nscoord sizedata[4];
+
+  bool isVertical = (mDirection == StretchDirection::Vertical);
+  nscoord oneDevPixel = mPresContext->AppUnitsPerDevPixel();
+  char16_t uchar = mChar->mData[0];
+  bool maxWidth = mStretchFlags.contains(MathMLStretchFlag::MaxWidth);
+  if (!aGlyphTable->HasPartsOf(mDrawTarget, oneDevPixel, *aFontGroup, uchar,
+                               isVertical)) {
+    return false;  
+  }
+
+  for (int32_t i = 0; i < 4; i++) {
+    nsGlyphCode ch = aGlyphTable->ElementAt(mDrawTarget, oneDevPixel,
+                                            *aFontGroup, uchar, isVertical, i);
+    chdata[i] = ch;
+    if (ch.Exists()) {
+      if (!mChar->SetFontFamily(mPresContext, aGlyphTable, ch, aFamilyList,
+                                font, aFontGroup)) {
+        return false;
+      }
+
+      textRun[i] =
+          aGlyphTable->MakeTextRun(mDrawTarget, oneDevPixel, *aFontGroup, ch);
+      nsBoundingMetrics bm = MeasureTextRun(mDrawTarget, textRun[i].get());
+      bmdata[i] = bm;
+      sizedata[i] = isVertical ? bm.ascent + bm.descent
+                               : bm.rightBearing - bm.leftBearing;
+    } else {
+      textRun[i] = nullptr;
+      bmdata[i] = nsBoundingMetrics();
+      sizedata[i] = i == 3 ? mTargetSize : 0;
+    }
+  }
+
+  if (aGlyphTable->IsUnicodeTable()) {
+    gfxFont* unicodeFont = nullptr;
+    for (const auto& i : textRun) {
+      if (!i) {
+        continue;
+      }
+      if (i->GetLength() != 1 || i->GetCharacterGlyphs()[0].IsMissing()) {
+        return false;
+      }
+      uint32_t numGlyphRuns;
+      const gfxTextRun::GlyphRun* glyphRuns = i->GetGlyphRuns(&numGlyphRuns);
+      if (numGlyphRuns != 1) {
+        return false;
+      }
+      if (!unicodeFont) {
+        unicodeFont = glyphRuns[0].mFont;
+      } else if (unicodeFont != glyphRuns[0].mFont) {
+        return false;
+      }
+    }
+  }
+
+  nscoord computedSize =
+      ComputeSizeFromParts(mPresContext, chdata, sizedata, mTargetSize);
+
+  nscoord currentSize =
+      isVertical ? mBoundingMetrics.ascent + mBoundingMetrics.descent
+                 : mBoundingMetrics.rightBearing - mBoundingMetrics.leftBearing;
+
+  if (!IsSizeBetter(computedSize, currentSize, mTargetSize, mStretchFlags)) {
+#ifdef NOISY_SEARCH
+    printf("    Font %s Rejected!\n",
+           NS_LossyConvertUTF16toASCII(fontName).get());
+#endif
+    return false;  
+  }
+
+#ifdef NOISY_SEARCH
+  printf("    Font %s Current best!\n",
+         NS_LossyConvertUTF16toASCII(fontName).get());
+#endif
+
+  if (isVertical) {
+    int32_t i;
+    for (i = 0; i <= 3 && !textRun[i]; i++) {
+      ;
+    }
+    if (i == 4) {
+      NS_ERROR("Cannot stretch - All parts missing");
+      return false;
+    }
+    nscoord lbearing = bmdata[i].leftBearing;
+    nscoord rbearing = bmdata[i].rightBearing;
+    nscoord width = bmdata[i].width;
+    i++;
+    for (; i <= 3; i++) {
+      if (!textRun[i]) {
+        continue;
+      }
+      lbearing = std::min(lbearing, bmdata[i].leftBearing);
+      rbearing = std::max(rbearing, bmdata[i].rightBearing);
+      width = std::max(width, bmdata[i].width);
+    }
+    if (maxWidth) {
+      lbearing = std::min(lbearing, mBoundingMetrics.leftBearing);
+      rbearing = std::max(rbearing, mBoundingMetrics.rightBearing);
+      width = std::max(width, mBoundingMetrics.width);
+    }
+    mBoundingMetrics.width = width;
+    mBoundingMetrics.ascent = bmdata[0].ascent;  
+    mBoundingMetrics.descent = computedSize - mBoundingMetrics.ascent;
+    mBoundingMetrics.leftBearing = lbearing;
+    mBoundingMetrics.rightBearing = rbearing;
+  } else {
+    int32_t i;
+    for (i = 0; i <= 3 && !textRun[i]; i++) {
+      ;
+    }
+    if (i == 4) {
+      NS_ERROR("Cannot stretch - All parts missing");
+      return false;
+    }
+    nscoord ascent = bmdata[i].ascent;
+    nscoord descent = bmdata[i].descent;
+    i++;
+    for (; i <= 3; i++) {
+      if (!textRun[i]) {
+        continue;
+      }
+      ascent = std::max(ascent, bmdata[i].ascent);
+      descent = std::max(descent, bmdata[i].descent);
+    }
+    mBoundingMetrics.width = computedSize;
+    mBoundingMetrics.ascent = ascent;
+    mBoundingMetrics.descent = descent;
+    mBoundingMetrics.leftBearing = 0;
+    mBoundingMetrics.rightBearing = computedSize;
+  }
+
+  mGlyphFound = true;
+  if (maxWidth) {
+    return false;  
+  }
+
+  mChar->mDrawingMethod = DrawingMethod::Parts;
+  for (int32_t i = 0; i < 4; i++) {
+    mChar->mGlyphs[i] = std::move(textRun[i]);
+    mChar->mBmData[i] = bmdata[i];
+  }
+
+  return IsSizeOK(computedSize, mTargetSize, mStretchFlags);
+}
+
+bool nsMathMLChar::StretchEnumContext::EnumCallback(
+    const StyleSingleFontFamily& aFamily, void* aData,
+    gfx::ShapedTextFlags aFlags, bool aRtl) {
+  StretchEnumContext* context = static_cast<StretchEnumContext*>(aData);
+
+  StyleFontFamilyList family;
+  if (aFamily.IsFamilyName()) {
+    family = StyleFontFamilyList::WithOneUnquotedFamily(
+        nsAtomCString(aFamily.AsFamilyName().name.AsAtom()));
+  }
+
+  ComputedStyle* sc = context->mChar->mComputedStyle;
+  nsFont font = sc->StyleFont()->mFont;
+  NormalizeDefaultFont(font, context->mFontSizeInflation);
+  RefPtr<gfxFontGroup> fontGroup;
+  if (!aFamily.IsGeneric() &&
+      !context->mChar->SetFontFamily(context->mPresContext, nullptr, kNullGlyph,
+                                     family, font, &fontGroup)) {
+    return false;  
+  }
+
+  UniquePtr<nsOpenTypeTable> openTypeTable;
+  auto glyphTable = [&aFamily, &fontGroup, &openTypeTable,
+                     &aFlags]() -> nsGlyphTable* {
+    if (!aFamily.IsGeneric()) {
+      RefPtr<gfxFont> font = fontGroup->GetFirstValidFont();
+      openTypeTable = nsOpenTypeTable::Create(font, aFlags);
+      if (openTypeTable) {
+        return openTypeTable.get();
+      }
+    }
+    return &gUnicodeTable;
+  }();
+  MOZ_ASSERT(glyphTable);
+
+  if (!openTypeTable) {
+    if (context->mUnicodeTableTried) {
+      return false;
+    }
+    context->mUnicodeTableTried = true;
+  }
+
+  const StyleFontFamilyList& familyList =
+      glyphTable->IsUnicodeTable() ? context->mFamilyList : family;
+
+  return (context->mTryVariants &&
+          context->TryVariants(glyphTable, &fontGroup, familyList, aRtl)) ||
+         (context->mTryParts &&
+          context->TryParts(glyphTable, &fontGroup, familyList));
+}
+
+static void AppendFallbacks(nsTArray<StyleSingleFontFamily>& aNames,
+                            const nsTArray<nsCString>& aFallbacks) {
+  for (const nsCString& fallback : aFallbacks) {
+    aNames.AppendElement(StyleSingleFontFamily::FamilyName(
+        StyleFamilyName{StyleAtom(NS_Atomize(fallback)),
+                        StyleFontFamilyNameSyntax::Identifiers}));
+  }
+}
+
+static void InsertMathFallbacks(StyleFontFamilyList& aFamilyList,
+                                nsTArray<nsCString>& aFallbacks) {
+  nsTArray<StyleSingleFontFamily> mergedList;
+
+  bool inserted = false;
+  for (const auto& name : aFamilyList.list.AsSpan()) {
+    if (!inserted && name.IsGeneric()) {
+      inserted = true;
+      AppendFallbacks(mergedList, aFallbacks);
+    }
+    mergedList.AppendElement(name);
+  }
+
+  if (!inserted) {
+    AppendFallbacks(mergedList, aFallbacks);
+  }
+  aFamilyList = StyleFontFamilyList::WithNames(std::move(mergedList));
+}
+
+bool CanBeMirroredWithScaleFallback(uint32_t ch) {
+  return ch != 0x2231 && ch != 0x2232 && ch != 0x2233 && ch != 0x2A11 &&
+         ch != 0x2A17;
+}
+
+nsresult nsMathMLChar::StretchInternal(
+    nsIFrame* aForFrame, DrawTarget* aDrawTarget, float aFontSizeInflation,
+    StretchDirection& aStretchDirection,
+    const nsBoundingMetrics& aContainerSize,
+    nsBoundingMetrics& aDesiredStretchSize, MathMLStretchFlags aStretchFlags,
+    float aMaxSize, bool aMaxSizeIsAbsolute) {
+  nsPresContext* presContext = aForFrame->PresContext();
+
+  StretchDirection direction = nsMathMLOperators::GetStretchyDirection(mData);
+
+  nsFont font = aForFrame->StyleFont()->mFont;
+  NormalizeDefaultFont(font, aFontSizeInflation);
+
+  const nsStyleFont* styleFont = mComputedStyle->StyleFont();
+  nsFontMetrics::Params params;
+  params.language = styleFont->mLanguage;
+  params.explicitLanguage = styleFont->mExplicitLanguage;
+  params.userFontSet = presContext->GetUserFontSet();
+  params.textPerf = presContext->GetTextPerfMetrics();
+  RefPtr<nsFontMetrics> fm = presContext->GetMetricsFor(font, params);
+  uint32_t len = uint32_t(mData.Length());
+
+  gfx::ShapedTextFlags flags = gfx::ShapedTextFlags();
+  if (mMirroringMethod == MirroringMethod::Glyph) {
+    RefPtr<gfxFont> font = fm->GetThebesFontGroup()->GetFirstMathFont();
+    const uint32_t kRtlm = HB_TAG('r', 't', 'l', 'm');
+    if (!font || !font->FeatureWillHandleChar(intl::Script::COMMON, kRtlm,
+                                              mData.First())) {
+      mMirroringMethod = MirroringMethod::ScaleFallback;
+    }
+  }
+
+  if (mMirroringMethod == MirroringMethod::ScaleFallback &&
+      !CanBeMirroredWithScaleFallback(mData.First())) {
+    mMirroringMethod = MirroringMethod::None;
+  }
+
+  if (mMirroringMethod == MirroringMethod::Glyph ||
+      mMirroringMethod == MirroringMethod::Character) {
+    flags |= gfx::ShapedTextFlags::TEXT_IS_RTL;
+  }
+
+  mGlyphs[0] = fm->GetThebesFontGroup()->MakeTextRun(
+      static_cast<const char16_t*>(mData.get()), len, aDrawTarget,
+      presContext->AppUnitsPerDevPixel(), flags, nsTextFrameUtils::Flags(),
+      presContext->MissingFontRecorder());
+  aDesiredStretchSize = MeasureTextRun(aDrawTarget, mGlyphs[0].get());
+
+  bool maxWidth = aStretchFlags.contains(MathMLStretchFlag::MaxWidth);
+  if (!maxWidth) {
+    mUnscaledAscent = aDesiredStretchSize.ascent;
+  }
+
+
+  if ((aStretchDirection != direction &&
+       aStretchDirection != StretchDirection::Default) ||
+      (aStretchFlags - MathMLStretchFlag::MaxWidth).isEmpty()) {
+    mDirection = StretchDirection::Unsupported;
+    return NS_OK;
+  }
+
+  if (aStretchDirection == StretchDirection::Default) {
+    aStretchDirection = direction;
+  }
+
+  bool largeop = aStretchFlags.contains(MathMLStretchFlag::LargeOperator);
+  bool stretchy = !(aStretchFlags & kMathMLStretchVariableSet).isEmpty();
+  bool largeopOnly = largeop && !stretchy;
+
+  bool isVertical = (direction == StretchDirection::Vertical);
+
+  nscoord targetSize =
+      isVertical ? aContainerSize.ascent + aContainerSize.descent
+                 : aContainerSize.rightBearing - aContainerSize.leftBearing;
+
+  if (maxWidth) {
+    if (stretchy) {
+      aStretchFlags -= kMathMLStretchVariableSet;
+      aStretchFlags += MathMLStretchFlag::Smaller;
+    }
+
+    if (aMaxSize == kMathMLOperatorSizeInfinity) {
+      aDesiredStretchSize.ascent = nscoord_MAX;
+      aDesiredStretchSize.descent = 0;
+    } else {
+      nscoord height = aDesiredStretchSize.ascent + aDesiredStretchSize.descent;
+      if (height == 0) {
+        if (aMaxSizeIsAbsolute) {
+          aDesiredStretchSize.ascent =
+              NSToCoordRound(aMaxSize / kMathMLDelimiterFactor);
+          aDesiredStretchSize.descent = 0;
+        }
+      } else {
+        float scale = aMaxSizeIsAbsolute ? aMaxSize / height : aMaxSize;
+        scale /= kMathMLDelimiterFactor;
+        aDesiredStretchSize.ascent =
+            NSToCoordRound(scale * aDesiredStretchSize.ascent);
+        aDesiredStretchSize.descent =
+            NSToCoordRound(scale * aDesiredStretchSize.descent);
+      }
+    }
+  }
+
+  nsBoundingMetrics initialSize = aDesiredStretchSize;
+  nscoord charSize = isVertical
+                         ? initialSize.ascent + initialSize.descent
+                         : initialSize.rightBearing - initialSize.leftBearing;
+
+  bool done = false;
+
+  if (!maxWidth && !largeop) {
+    if ((targetSize <= 0) || ((isVertical && charSize >= targetSize) ||
+                              IsSizeOK(charSize, targetSize, aStretchFlags))) {
+      done = true;
+    }
+  }
+
+
+  bool glyphFound = false;
+
+  if (!done) {  
+    font = mComputedStyle->StyleFont()->mFont;
+    NormalizeDefaultFont(font, aFontSizeInflation);
+
+    AutoTArray<nsCString, 16> mathFallbacks;
+    nsAutoCString value;
+    gfxPlatformFontList* pfl = gfxPlatformFontList::PlatformFontList();
+    pfl->Lock();
+    if (pfl->GetFontPrefs()->LookupName("serif.x-math"_ns, value)) {
+      gfxFontUtils::ParseFontList(value, mathFallbacks);
+    }
+    if (pfl->GetFontPrefs()->LookupNameList("serif.x-math"_ns, value)) {
+      gfxFontUtils::ParseFontList(value, mathFallbacks);
+    }
+    pfl->Unlock();
+    InsertMathFallbacks(font.family.families, mathFallbacks);
+
+#ifdef NOISY_SEARCH
+    nsAutoString fontlistStr;
+    font.fontlist.ToString(fontlistStr, false, true);
+    printf(
+        "Searching in " % s " for a glyph of appropriate size for: 0x%04X:%c\n",
+        NS_ConvertUTF16toUTF8(fontlistStr).get(), mData[0], mData[0] & 0x00FF);
+#endif
+    StretchEnumContext enumData(this, presContext, aDrawTarget,
+                                aFontSizeInflation, aStretchDirection,
+                                targetSize, aStretchFlags, aDesiredStretchSize,
+                                font.family.families, glyphFound);
+    enumData.mTryParts = !largeopOnly;
+
+    for (const StyleSingleFontFamily& name :
+         font.family.families.list.AsSpan()) {
+      if (StretchEnumContext::EnumCallback(
+              name, &enumData, flags,
+              mMirroringMethod == MirroringMethod::Glyph)) {
+        break;
+      }
+    }
+  }
+
+  if (!maxWidth) {
+    mUnscaledAscent = aDesiredStretchSize.ascent;
+  }
+
+  if (glyphFound) {
+    return NS_OK;
+  }
+
+  gfxMissingFontRecorder* MFR = presContext->MissingFontRecorder();
+  RefPtr<gfxFont> firstMathFont = fm->GetThebesFontGroup()->GetFirstMathFont();
+  if (MFR && !firstMathFont) {
+    MFR->RecordScript(intl::Script::MATHEMATICAL_NOTATION);
+  }
+
+  if (!StaticPrefs::mathml_scale_stretchy_operators_enabled()) {
+    return NS_OK;
+  }
+
+  if (stretchy) {
+    if (isVertical) {
+      float scale = std::min(
+          kMaxScaleFactor,
+          float(aContainerSize.ascent + aContainerSize.descent) /
+              (aDesiredStretchSize.ascent + aDesiredStretchSize.descent));
+      if (!largeop || scale > 1.0) {
+        if (!maxWidth) {
+          mScaleY *= scale;
+        }
+        aDesiredStretchSize.ascent *= scale;
+        aDesiredStretchSize.descent *= scale;
+      }
+    } else {
+      float scale = std::min(
+          kMaxScaleFactor,
+          float(aContainerSize.rightBearing - aContainerSize.leftBearing) /
+              (aDesiredStretchSize.rightBearing -
+               aDesiredStretchSize.leftBearing));
+      if (!largeop || scale > 1.0) {
+        if (!maxWidth) {
+          mScaleX *= scale;
+        }
+        aDesiredStretchSize.leftBearing *= scale;
+        aDesiredStretchSize.rightBearing *= scale;
+        aDesiredStretchSize.width *= scale;
+      }
+    }
+  }
+
+  if (largeop) {
+    float scale;
+    float largeopFactor = kLargeOpFactor;
+
+    if ((aDesiredStretchSize.rightBearing - aDesiredStretchSize.leftBearing) <
+        largeopFactor * (initialSize.rightBearing - initialSize.leftBearing)) {
+      scale =
+          (largeopFactor *
+           (initialSize.rightBearing - initialSize.leftBearing)) /
+          (aDesiredStretchSize.rightBearing - aDesiredStretchSize.leftBearing);
+      if (!maxWidth) {
+        mScaleX *= scale;
+      }
+      aDesiredStretchSize.leftBearing *= scale;
+      aDesiredStretchSize.rightBearing *= scale;
+      aDesiredStretchSize.width *= scale;
+    }
+
+    if (nsMathMLOperators::IsIntegralOperator(mData)) {
+      largeopFactor = kIntegralFactor;
+    }
+    if ((aDesiredStretchSize.ascent + aDesiredStretchSize.descent) <
+        largeopFactor * (initialSize.ascent + initialSize.descent)) {
+      scale = (largeopFactor * (initialSize.ascent + initialSize.descent)) /
+              (aDesiredStretchSize.ascent + aDesiredStretchSize.descent);
+      if (!maxWidth) {
+        mScaleY *= scale;
+      }
+      aDesiredStretchSize.ascent *= scale;
+      aDesiredStretchSize.descent *= scale;
+    }
+  }
+
+  return NS_OK;
+}
+
+nsresult nsMathMLChar::Stretch(nsIFrame* aForFrame, DrawTarget* aDrawTarget,
+                               float aFontSizeInflation,
+                               StretchDirection aStretchDirection,
+                               const nsBoundingMetrics& aContainerSize,
+                               nsBoundingMetrics& aDesiredStretchSize,
+                               MathMLStretchFlags aStretchFlags, bool aRTL) {
+  NS_ASSERTION((aStretchFlags - kMathMLStretchSet).isEmpty(),
+               "Unexpected stretch flags");
+
+  mDrawingMethod = DrawingMethod::Normal;
+  mMirroringMethod = [&] {
+    if (!aRTL || !nsMathMLOperators::IsMirrorableOperator(mData)) {
+      return MirroringMethod::None;
+    }
+    if (nsMathMLOperators::GetMirroredOperator(mData) != mData) {
+      return MirroringMethod::Character;
+    }
+    return MirroringMethod::Glyph;
+  }();
+  mScaleY = mScaleX = 1.0;
+  mDirection = aStretchDirection;
+  nsresult rv =
+      StretchInternal(aForFrame, aDrawTarget, aFontSizeInflation, mDirection,
+                      aContainerSize, aDesiredStretchSize, aStretchFlags);
+
+  mBoundingMetrics = aDesiredStretchSize;
+
+  return rv;
+}
+
+nscoord nsMathMLChar::GetMaxWidth(nsIFrame* aForFrame, DrawTarget* aDrawTarget,
+                                  float aFontSizeInflation,
+                                  MathMLStretchFlags aStretchFlags) {
+  nsBoundingMetrics bm;
+  StretchDirection direction = StretchDirection::Vertical;
+  const nsBoundingMetrics container;  
+
+  StretchInternal(aForFrame, aDrawTarget, aFontSizeInflation, direction,
+                  container, bm, aStretchFlags + MathMLStretchFlag::MaxWidth);
+
+  return std::max(bm.width, bm.rightBearing) - std::min(0, bm.leftBearing);
+}
+
+namespace mozilla {
+
+class nsDisplayMathMLSelectionRect final : public nsPaintedDisplayItem {
+ public:
+  nsDisplayMathMLSelectionRect(nsDisplayListBuilder* aBuilder, nsIFrame* aFrame,
+                               const nsRect& aRect)
+      : nsPaintedDisplayItem(aBuilder, aFrame), mRect(aRect) {
+    MOZ_COUNT_CTOR(nsDisplayMathMLSelectionRect);
+  }
+
+  MOZ_COUNTED_DTOR_FINAL(nsDisplayMathMLSelectionRect)
+
+  virtual void Paint(nsDisplayListBuilder* aBuilder, gfxContext* aCtx) override;
+  NS_DISPLAY_DECL_NAME("MathMLSelectionRect", TYPE_MATHML_SELECTION_RECT)
+ private:
+  nsRect mRect;
+};
+
+void nsDisplayMathMLSelectionRect::Paint(nsDisplayListBuilder* aBuilder,
+                                         gfxContext* aCtx) {
+  DrawTarget* drawTarget = aCtx->GetDrawTarget();
+  Rect rect = NSRectToSnappedRect(mRect + ToReferenceFrame(),
+                                  mFrame->PresContext()->AppUnitsPerDevPixel(),
+                                  *drawTarget);
+  nscolor bgColor = LookAndFeel::Color(LookAndFeel::ColorID::Highlight, mFrame);
+  drawTarget->FillRect(rect, ColorPattern(ToDeviceColor(bgColor)));
+}
+
+class nsDisplayMathMLCharForeground final : public nsPaintedDisplayItem {
+ public:
+  nsDisplayMathMLCharForeground(nsDisplayListBuilder* aBuilder,
+                                nsIFrame* aFrame, nsMathMLChar* aChar,
+                                const bool aIsSelected)
+      : nsPaintedDisplayItem(aBuilder, aFrame),
+        mChar(aChar),
+        mIsSelected(aIsSelected) {
+    MOZ_COUNT_CTOR(nsDisplayMathMLCharForeground);
+  }
+
+  MOZ_COUNTED_DTOR_FINAL(nsDisplayMathMLCharForeground)
+
+  virtual nsRect GetBounds(nsDisplayListBuilder* aBuilder,
+                           bool* aSnap) const override {
+    *aSnap = false;
+    nsRect rect;
+    mChar->GetRect(rect);
+    nsPoint offset = ToReferenceFrame() + rect.TopLeft();
+    nsBoundingMetrics bm;
+    mChar->GetBoundingMetrics(bm);
+    nsRect temp(offset.x + bm.leftBearing, offset.y,
+                bm.rightBearing - bm.leftBearing, bm.ascent + bm.descent);
+    temp.Inflate(mFrame->PresContext()->AppUnitsPerDevPixel());
+    return temp;
+  }
+
+  virtual void Paint(nsDisplayListBuilder* aBuilder,
+                     gfxContext* aCtx) override {
+    imgDrawingParams imgParams(aBuilder->GetImageDecodeFlags());
+    mChar->PaintForeground(mFrame, *aCtx, imgParams, ToReferenceFrame(),
+                           mIsSelected);
+  }
+
+  NS_DISPLAY_DECL_NAME("MathMLCharForeground", TYPE_MATHML_CHAR_FOREGROUND)
+
+  virtual nsRect GetComponentAlphaBounds(
+      nsDisplayListBuilder* aBuilder) const override {
+    bool snap;
+    return GetBounds(aBuilder, &snap);
+  }
+
+ private:
+  nsMathMLChar* mChar;
+  bool mIsSelected;
+};
+
+#ifdef DEBUG
+class nsDisplayMathMLCharDebug final : public nsPaintedDisplayItem {
+ public:
+  nsDisplayMathMLCharDebug(nsDisplayListBuilder* aBuilder, nsIFrame* aFrame,
+                           const nsRect& aRect)
+      : nsPaintedDisplayItem(aBuilder, aFrame), mRect(aRect) {
+    MOZ_COUNT_CTOR(nsDisplayMathMLCharDebug);
+  }
+
+  MOZ_COUNTED_DTOR_FINAL(nsDisplayMathMLCharDebug)
+
+  virtual void Paint(nsDisplayListBuilder* aBuilder, gfxContext* aCtx) override;
+  NS_DISPLAY_DECL_NAME("MathMLCharDebug", TYPE_MATHML_CHAR_DEBUG)
+
+ private:
+  nsRect mRect;
+};
+
+void nsDisplayMathMLCharDebug::Paint(nsDisplayListBuilder* aBuilder,
+                                     gfxContext* aCtx) {
+  Sides skipSides;
+  nsPresContext* presContext = mFrame->PresContext();
+  ComputedStyle* computedStyle = mFrame->Style();
+  nsRect rect = mRect + ToReferenceFrame();
+
+  PaintBorderFlags flags = aBuilder->ShouldSyncDecodeImages()
+                               ? PaintBorderFlags::SyncDecodeImages
+                               : PaintBorderFlags();
+
+  (void)nsCSSRendering::PaintBorder(presContext, *aCtx, mFrame,
+                                    GetPaintRect(aBuilder, aCtx), rect,
+                                    computedStyle, flags, skipSides);
+
+  nsCSSRendering::PaintNonThemedOutline(presContext, *aCtx, mFrame,
+                                        GetPaintRect(aBuilder, aCtx), rect,
+                                        computedStyle);
+}
+#endif
+
+}  
+
+void nsMathMLChar::Display(nsDisplayListBuilder* aBuilder, nsIFrame* aForFrame,
+                           const nsDisplayListSet& aLists, uint32_t aIndex,
+                           const nsRect* aSelectedRect) {
+  ComputedStyle* computedStyle = mComputedStyle;
+  if (!computedStyle->StyleVisibility()->IsVisible()) {
+    return;
+  }
+
+  const bool isSelected = aSelectedRect && !aSelectedRect->IsEmpty();
+
+  if (isSelected) {
+    aLists.BorderBackground()->AppendNewToTop<nsDisplayMathMLSelectionRect>(
+        aBuilder, aForFrame, *aSelectedRect);
+  }
+  aLists.Content()->AppendNewToTopWithIndex<nsDisplayMathMLCharForeground>(
+      aBuilder, aForFrame, aIndex, this, isSelected);
+}
+
+void nsMathMLChar::ApplyTransforms(gfxContext* aThebesContext,
+                                   int32_t aAppUnitsPerGfxUnit, nsRect& r) {
+  nsPoint pt =
+      (mMirroringMethod != MirroringMethod::None) ? r.TopRight() : r.TopLeft();
+  gfxPoint devPixelOffset(NSAppUnitsToFloatPixels(pt.x, aAppUnitsPerGfxUnit),
+                          NSAppUnitsToFloatPixels(pt.y, aAppUnitsPerGfxUnit));
+  aThebesContext->SetMatrixDouble(
+      aThebesContext->CurrentMatrixDouble()
+          .PreTranslate(devPixelOffset)
+          .PreScale(
+              mScaleX *
+                  (mMirroringMethod == MirroringMethod::ScaleFallback ? -1 : 1),
+              mScaleY));
+
+  r.x = r.y = 0;
+  r.width /= mScaleX;
+  r.height /= mScaleY;
+}
+
+void nsMathMLChar::PaintForeground(nsIFrame* aForFrame,
+                                   gfxContext& aRenderingContext,
+                                   imgDrawingParams& aImgParams, nsPoint aPt,
+                                   bool aIsSelected) {
+  ComputedStyle* computedStyle = mComputedStyle;
+  nsPresContext* presContext = aForFrame->PresContext();
+
+  if (mDrawingMethod == DrawingMethod::Normal) {
+    computedStyle = aForFrame->Style();
+  }
+
+  nscolor fgColor = computedStyle->GetVisitedDependentColor(
+      &nsStyleText::mWebkitTextFillColor);
+  if (aIsSelected) {
+    fgColor = LookAndFeel::Color(LookAndFeel::ColorID::Highlighttext, aForFrame,
+                                 fgColor);
+  }
+  aRenderingContext.SetColor(sRGBColor::FromABGR(fgColor));
+  aRenderingContext.Save();
+  nsRect r = mRect + aPt;
+  ApplyTransforms(&aRenderingContext,
+                  aForFrame->PresContext()->AppUnitsPerDevPixel(), r);
+
+  switch (mDrawingMethod) {
+    case DrawingMethod::Normal:
+    case DrawingMethod::Variant:
+      if (mGlyphs[0]) {
+        mGlyphs[0]->Draw(Range(mGlyphs[0].get()),
+                         gfx::Point(0.0, mUnscaledAscent),
+                         gfxTextRun::DrawParams(
+                             &aRenderingContext,
+                             aForFrame->PresContext()->FontPaletteCache()),
+                         aImgParams);
+      }
+      break;
+    case DrawingMethod::Parts: {
+      if (StretchDirection::Vertical == mDirection) {
+        PaintVertically(presContext, &aRenderingContext, aImgParams, r,
+                        fgColor);
+      } else if (StretchDirection::Horizontal == mDirection) {
+        PaintHorizontally(presContext, &aRenderingContext, aImgParams, r,
+                          fgColor);
+      }
+      break;
+    }
+    default:
+      MOZ_ASSERT_UNREACHABLE("Unknown drawing method");
+      break;
+  }
+
+  aRenderingContext.Restore();
+}
+
+
+class AutoPushClipRect {
+  gfxContext* mThebesContext;
+
+ public:
+  AutoPushClipRect(gfxContext* aThebesContext, int32_t aAppUnitsPerGfxUnit,
+                   const nsRect& aRect)
+      : mThebesContext(aThebesContext) {
+    mThebesContext->Save();
+    gfxRect clip = nsLayoutUtils::RectToGfxRect(aRect, aAppUnitsPerGfxUnit);
+    mThebesContext->SnappedClip(clip);
+  }
+  ~AutoPushClipRect() { mThebesContext->Restore(); }
+};
+
+static nsPoint SnapToDevPixels(const gfxContext* aThebesContext,
+                               int32_t aAppUnitsPerGfxUnit,
+                               const nsPoint& aPt) {
+  gfxPoint pt(NSAppUnitsToFloatPixels(aPt.x, aAppUnitsPerGfxUnit),
+              NSAppUnitsToFloatPixels(aPt.y, aAppUnitsPerGfxUnit));
+  pt = aThebesContext->UserToDevice(pt);
+  pt.Round();
+  pt = aThebesContext->DeviceToUser(pt);
+  return nsPoint(NSFloatPixelsToAppUnits(pt.x, aAppUnitsPerGfxUnit),
+                 NSFloatPixelsToAppUnits(pt.y, aAppUnitsPerGfxUnit));
+}
+
+static void PaintRule(DrawTarget& aDrawTarget, int32_t aAppUnitsPerGfxUnit,
+                      nsRect& aRect, nscolor aColor) {
+  Rect rect = NSRectToSnappedRect(aRect, aAppUnitsPerGfxUnit, aDrawTarget);
+  ColorPattern color(ToDeviceColor(aColor));
+  aDrawTarget.FillRect(rect, color);
+}
+
+nsresult nsMathMLChar::PaintVertically(nsPresContext* aPresContext,
+                                       gfxContext* aThebesContext,
+                                       imgDrawingParams& aImgParams,
+                                       nsRect& aRect, nscolor aColor) {
+  DrawTarget& aDrawTarget = *aThebesContext->GetDrawTarget();
+
+  nscoord oneDevPixel = aPresContext->AppUnitsPerDevPixel();
+
+  int32_t i = 0;
+  nscoord dx = aRect.x;
+  nscoord offset[3], start[3], end[3];
+  for (i = 0; i <= 2; ++i) {
+    const nsBoundingMetrics& bm = mBmData[i];
+    nscoord dy;
+    if (0 == i) {  
+      dy = aRect.y + bm.ascent;
+    } else if (2 == i) {  
+      dy = aRect.y + aRect.height - bm.descent;
+    } else {  
+      dy = aRect.y + std::midpoint(bm.ascent, aRect.height - bm.descent);
+    }
+    dy = SnapToDevPixels(aThebesContext, oneDevPixel, nsPoint(dx, dy)).y;
+    offset[i] = dy;
+    if (bm.ascent + bm.descent >= 2 * oneDevPixel) {
+      start[i] = dy - bm.ascent + oneDevPixel;  
+      end[i] = dy + bm.descent - oneDevPixel;   
+    } else {
+      start[i] = dy - bm.ascent;  
+      end[i] = dy + bm.descent;   
+    }
+  }
+
+  for (i = 0; i < 2; ++i) {
+    if (end[i] > start[i + 1]) {
+      end[i] = std::midpoint(end[i], start[i + 1]);
+      start[i + 1] = end[i];
+    }
+  }
+
+  nsRect unionRect = aRect;
+  unionRect.x += mBoundingMetrics.leftBearing;
+  unionRect.width =
+      mBoundingMetrics.rightBearing - mBoundingMetrics.leftBearing;
+  if (mMirroringMethod == MirroringMethod::Glyph ||
+      mMirroringMethod == MirroringMethod::Character) {
+    unionRect.x -= unionRect.width;
+  }
+  unionRect.Inflate(oneDevPixel);
+
+  gfxTextRun::DrawParams params(aThebesContext,
+                                aPresContext->FontPaletteCache());
+
+  for (i = 0; i <= 2; ++i) {
+    if (mGlyphs[i]) {
+      nscoord dy = offset[i];
+      nsRect clipRect = unionRect;
+      nscoord height = mBmData[i].ascent + mBmData[i].descent;
+      if (height * (1.0 - kMathMLDelimiterFactor) > oneDevPixel) {
+        if (0 == i) {  
+          clipRect.height = end[i] - clipRect.y;
+        } else if (2 == i) {  
+          clipRect.height -= start[i] - clipRect.y;
+          clipRect.y = start[i];
+        } else {  
+          clipRect.y = start[i];
+          clipRect.height = end[i] - start[i];
+        }
+      }
+      if (!clipRect.IsEmpty()) {
+        AutoPushClipRect clip(aThebesContext, oneDevPixel, clipRect);
+        mGlyphs[i]->Draw(Range(mGlyphs[i].get()), gfx::Point(dx, dy), params,
+                         aImgParams);
+      }
+    }
+  }
+
+  if (!mGlyphs[3]) {  
+    nscoord lbearing, rbearing;
+    int32_t first = 0, last = 1;
+    while (last <= 2) {
+      if (mGlyphs[last]) {
+        lbearing = mBmData[last].leftBearing;
+        rbearing = mBmData[last].rightBearing;
+        if (mGlyphs[first]) {
+          if (lbearing < mBmData[first].leftBearing) {
+            lbearing = mBmData[first].leftBearing;
+          }
+          if (rbearing > mBmData[first].rightBearing) {
+            rbearing = mBmData[first].rightBearing;
+          }
+        }
+      } else if (mGlyphs[first]) {
+        lbearing = mBmData[first].leftBearing;
+        rbearing = mBmData[first].rightBearing;
+      } else {
+        NS_ERROR("Cannot stretch - All parts missing");
+        return NS_ERROR_UNEXPECTED;
+      }
+      nsRect rule(aRect.x + lbearing, end[first], rbearing - lbearing,
+                  start[last] - end[first]);
+      PaintRule(aDrawTarget, oneDevPixel, rule, aColor);
+      first = last;
+      last++;
+    }
+  } else if (mBmData[3].ascent + mBmData[3].descent > 0) {
+    nsBoundingMetrics& bm = mBmData[3];
+    if (bm.ascent + bm.descent >= 3 * oneDevPixel) {
+      bm.ascent -= oneDevPixel;
+      bm.descent -= oneDevPixel;
+    }
+
+    nsRect clipRect = unionRect;
+
+    for (i = 0; i < 2; ++i) {
+      nscoord dy = std::max(end[i], aRect.y);
+      nscoord fillEnd = std::min(start[i + 1], aRect.YMost());
+      while (dy < fillEnd) {
+        clipRect.y = dy;
+        clipRect.height = std::min(bm.ascent + bm.descent, fillEnd - dy);
+        AutoPushClipRect clip(aThebesContext, oneDevPixel, clipRect);
+        dy += bm.ascent;
+        mGlyphs[3]->Draw(Range(mGlyphs[3].get()), gfx::Point(dx, dy), params,
+                         aImgParams);
+        dy += bm.descent;
+      }
+    }
+  }
+#ifdef DEBUG
+  else {
+    for (i = 0; i < 2; ++i) {
+      NS_ASSERTION(end[i] >= start[i + 1],
+                   "gap between parts with missing glue glyph");
+    }
+  }
+#endif
+  return NS_OK;
+}
+
+nsresult nsMathMLChar::PaintHorizontally(nsPresContext* aPresContext,
+                                         gfxContext* aThebesContext,
+                                         imgDrawingParams& aImgParams,
+                                         nsRect& aRect, nscolor aColor) {
+  DrawTarget& aDrawTarget = *aThebesContext->GetDrawTarget();
+
+  nscoord oneDevPixel = aPresContext->AppUnitsPerDevPixel();
+
+  int32_t i = 0;
+  nscoord dy = aRect.y + mBoundingMetrics.ascent;
+  nscoord offset[3], start[3], end[3];
+  for (i = 0; i <= 2; ++i) {
+    const nsBoundingMetrics& bm = mBmData[i];
+    nscoord dx;
+    if (0 == i) {  
+      dx = aRect.x - bm.leftBearing;
+    } else if (2 == i) {  
+      dx = aRect.x + aRect.width - bm.rightBearing;
+    } else {  
+      dx = aRect.x + (aRect.width - bm.width) / 2;
+    }
+    dx = SnapToDevPixels(aThebesContext, oneDevPixel, nsPoint(dx, dy)).x;
+    offset[i] = dx;
+    if (bm.rightBearing - bm.leftBearing >= 2 * oneDevPixel) {
+      start[i] = dx + bm.leftBearing + oneDevPixel;  
+      end[i] = dx + bm.rightBearing - oneDevPixel;   
+    } else {
+      start[i] = dx + bm.leftBearing;  
+      end[i] = dx + bm.rightBearing;   
+    }
+  }
+
+  for (i = 0; i < 2; ++i) {
+    if (end[i] > start[i + 1]) {
+      end[i] = std::midpoint(end[i], start[i + 1]);
+      start[i + 1] = end[i];
+    }
+  }
+
+  nsRect unionRect = aRect;
+  unionRect.Inflate(oneDevPixel);
+
+  gfxTextRun::DrawParams params(aThebesContext,
+                                aPresContext->FontPaletteCache());
+
+  for (i = 0; i <= 2; ++i) {
+    if (mGlyphs[i]) {
+      nscoord dx = offset[i];
+      nsRect clipRect = unionRect;
+      nscoord width = mBmData[i].rightBearing - mBmData[i].leftBearing;
+      if (width * (1.0 - kMathMLDelimiterFactor) > oneDevPixel) {
+        if (0 == i) {  
+          clipRect.width = end[i] - clipRect.x;
+        } else if (2 == i) {  
+          clipRect.width -= start[i] - clipRect.x;
+          clipRect.x = start[i];
+        } else {  
+          clipRect.x = start[i];
+          clipRect.width = end[i] - start[i];
+        }
+      }
+      if (!clipRect.IsEmpty()) {
+        AutoPushClipRect clip(aThebesContext, oneDevPixel, clipRect);
+        mGlyphs[i]->Draw(Range(mGlyphs[i].get()), gfx::Point(dx, dy), params,
+                         aImgParams);
+      }
+    }
+  }
+
+  if (!mGlyphs[3]) {  
+    nscoord ascent, descent;
+    int32_t first = 0, last = 1;
+    while (last <= 2) {
+      if (mGlyphs[last]) {
+        ascent = mBmData[last].ascent;
+        descent = mBmData[last].descent;
+        if (mGlyphs[first]) {
+          if (ascent > mBmData[first].ascent) {
+            ascent = mBmData[first].ascent;
+          }
+          if (descent > mBmData[first].descent) {
+            descent = mBmData[first].descent;
+          }
+        }
+      } else if (mGlyphs[first]) {
+        ascent = mBmData[first].ascent;
+        descent = mBmData[first].descent;
+      } else {
+        NS_ERROR("Cannot stretch - All parts missing");
+        return NS_ERROR_UNEXPECTED;
+      }
+      nsRect rule(end[first], dy - ascent, start[last] - end[first],
+                  ascent + descent);
+      PaintRule(aDrawTarget, oneDevPixel, rule, aColor);
+      first = last;
+      last++;
+    }
+  } else if (mBmData[3].rightBearing - mBmData[3].leftBearing > 0) {
+    nsBoundingMetrics& bm = mBmData[3];
+    if (bm.rightBearing - bm.leftBearing >= 3 * oneDevPixel) {
+      bm.leftBearing += oneDevPixel;
+      bm.rightBearing -= oneDevPixel;
+    }
+
+    nsRect clipRect = unionRect;
+
+    for (i = 0; i < 2; ++i) {
+      nscoord dx = std::max(end[i], aRect.x);
+      nscoord fillEnd = std::min(start[i + 1], aRect.XMost());
+      while (dx < fillEnd) {
+        clipRect.x = dx;
+        clipRect.width =
+            std::min(bm.rightBearing - bm.leftBearing, fillEnd - dx);
+        AutoPushClipRect clip(aThebesContext, oneDevPixel, clipRect);
+        dx -= bm.leftBearing;
+        mGlyphs[3]->Draw(Range(mGlyphs[3].get()), gfx::Point(dx, dy), params,
+                         aImgParams);
+        dx += bm.rightBearing;
+      }
+    }
+  }
+#ifdef DEBUG
+  else {  
+    for (i = 0; i < 2; ++i) {
+      NS_ASSERTION(end[i] >= start[i + 1],
+                   "gap between parts with missing glue glyph");
+    }
+  }
+#endif
+  return NS_OK;
+}

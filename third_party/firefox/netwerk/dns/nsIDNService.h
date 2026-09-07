@@ -1,0 +1,67 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsIDNService_h_
+#define nsIDNService_h_
+
+#include "nsIIDNService.h"
+
+#include "mozilla/RWLock.h"
+#include "mozilla/intl/UnicodeScriptCodes.h"
+#include "mozilla/net/IDNBlocklistUtils.h"
+#include "mozilla/Span.h"
+#include "nsTHashSet.h"
+
+class nsIPrefBranch;
+
+
+namespace mozilla::net {
+enum ScriptCombo : int32_t;
+}
+
+class nsIDNService final : public nsIIDNService {
+ public:
+  NS_DECL_THREADSAFE_ISUPPORTS
+  NS_DECL_NSIIDNSERVICE
+
+  nsIDNService();
+
+  nsresult Init();
+
+ protected:
+  virtual ~nsIDNService();
+
+ private:
+  void InitCJKSlashConfusables();
+  void InitCJKIdeographs();
+  void InitDigitConfusables();
+  void InitCyrillicLatinConfusables();
+  void InitThaiLatinConfusables();
+
+ public:
+  bool IsLabelSafe(mozilla::Span<const char32_t> aLabel,
+                   mozilla::Span<const char32_t> aTLD);
+
+ private:
+  bool illegalScriptCombo(mozilla::intl::Script script,
+                          mozilla::net::ScriptCombo& savedScript);
+
+  bool isCJKSlashConfusable(char32_t aChar);
+  bool isCJKIdeograph(char32_t aChar);
+
+  nsTArray<mozilla::net::BlocklistRange> mIDNBlocklist;
+
+  nsTHashSet<char32_t> mCJKSlashConfusables;
+  nsTHashSet<char32_t> mCJKIdeographs;
+  nsTHashSet<char32_t> mDigitConfusables;
+  nsTHashSet<char32_t> mCyrillicLatinConfusables;
+  nsTHashSet<char32_t> mThaiLatinConfusables;
+};
+
+extern "C" MOZ_EXPORT bool mozilla_net_is_label_safe(const char32_t* aLabel,
+                                                     size_t aLabelLen,
+                                                     const char32_t* aTld,
+                                                     size_t aTldLen);
+
+#endif  // nsIDNService_h_

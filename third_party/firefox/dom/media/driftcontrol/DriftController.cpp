@@ -1,0 +1,216 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "DriftController.h"
+
+#include <atomic>
+#include <cmath>
+#include <mutex>
+
+#include "mozilla/CheckedInt.h"
+#include "mozilla/Logging.h"
+
+namespace mozilla {
+
+LazyLogModule gDriftControllerGraphsLog("DriftControllerGraphs");
+extern LazyLogModule gMediaTrackGraphLog;
+
+#define LOG_CONTROLLER(level, controller, format, ...)    \
+  MOZ_LOG_FMT(gMediaTrackGraphLog, level,                 \
+              "DriftController {}: (plot-id {}) " format, \
+              fmt::ptr(controller), (controller)->mPlotId, ##__VA_ARGS__)
+#define LOG_PLOT_NAMES()                                                    \
+  MOZ_LOG_FMT(                                                              \
+      gDriftControllerGraphsLog, LogLevel::Verbose,                         \
+      "id,t,buffering,avgbuffered,desired,buffersize,inlatency,outlatency," \
+      "inframesavg,outframesavg,inrate,outrate,steadystaterate,"            \
+      "nearthreshold,corrected,hysteresiscorrected,configured")
+#define LOG_PLOT_VALUES(id, t, buffering, avgbuffered, desired, buffersize,   \
+                        inlatency, outlatency, inframesavg, outframesavg,     \
+                        inrate, outrate, steadystaterate, nearthreshold,      \
+                        corrected, hysteresiscorrected, configured)           \
+  MOZ_LOG_FMT(gDriftControllerGraphsLog, LogLevel::Verbose,                   \
+              "DriftController {},{:.3f},{},{:.5f},{},{},{},{},{:.5f},"       \
+              "{:.5f},{},{},{:.5f},{},{:.5f},{:.5f},{}",                      \
+              id, t, buffering, avgbuffered, desired, buffersize, inlatency,  \
+              outlatency, inframesavg, outframesavg, inrate, outrate,         \
+              steadystaterate, nearthreshold, corrected, hysteresiscorrected, \
+              configured)
+
+static uint8_t GenerateId() {
+  static std::atomic<uint8_t> id{0};
+  return ++id;
+}
+
+DriftController::DriftController(uint32_t aSourceRate, uint32_t aTargetRate,
+                                 media::TimeUnit aDesiredBuffering)
+    : mPlotId(GenerateId()),
+      mSourceRate(aSourceRate),
+      mTargetRate(aTargetRate),
+      mDesiredBuffering(aDesiredBuffering),
+      mCorrectedSourceRate(static_cast<float>(aSourceRate)),
+      mMeasuredSourceLatency(5),
+      mMeasuredTargetLatency(5) {
+  LOG_CONTROLLER(
+      LogLevel::Info, this,
+      "Created. Resampling {}Hz->{}Hz. Initial desired buffering: {:.2f}ms.",
+      mSourceRate, mTargetRate, mDesiredBuffering.ToSeconds() * 1000.0);
+  static std::once_flag sOnceFlag;
+  std::call_once(sOnceFlag, [] { LOG_PLOT_NAMES(); });
+}
+
+void DriftController::SetDesiredBuffering(media::TimeUnit aDesiredBuffering) {
+  LOG_CONTROLLER(LogLevel::Debug, this,
+                 "SetDesiredBuffering {:.2f}ms->{:.2f}ms",
+                 mDesiredBuffering.ToSeconds() * 1000.0,
+                 aDesiredBuffering.ToSeconds() * 1000.0);
+  mLastDesiredBufferingChangeTime = mTotalTargetClock;
+  mDesiredBuffering = aDesiredBuffering.ToBase(mSourceRate);
+}
+
+void DriftController::ResetAfterUnderrun() {
+  mIsHandlingUnderrun = true;
+  mTargetClock = mAdjustmentInterval;
+}
+
+uint32_t DriftController::GetCorrectedSourceRate() const {
+  return std::lround(mCorrectedSourceRate);
+}
+
+int64_t DriftController::NearThreshold() const {
+  static constexpr uint32_t kNearDenominator = 5;  
+
+  const media::TimeUnit nearCap = media::TimeUnit::FromSeconds(0.01);
+
+  return std::min(nearCap, mDesiredBuffering / kNearDenominator)
+      .ToTicksAtRate(mSourceRate);
+}
+
+void DriftController::UpdateClock(media::TimeUnit aSourceDuration,
+                                  media::TimeUnit aTargetDuration,
+                                  uint32_t aBufferedFrames,
+                                  uint32_t aBufferSize) {
+  MOZ_ASSERT(!aTargetDuration.IsZero());
+
+  mTargetClock += aTargetDuration;
+  mTotalTargetClock += aTargetDuration;
+
+  mMeasuredTargetLatency.insert(aTargetDuration);
+
+  if (aSourceDuration.IsZero()) {
+    return;
+  }
+
+  media::TimeUnit targetDuration =
+      mTotalTargetClock - mTargetClockAfterLastSourcePacket;
+  mTargetClockAfterLastSourcePacket = mTotalTargetClock;
+
+  mMeasuredSourceLatency.insert(aSourceDuration);
+
+  double sourceDurationSecs = aSourceDuration.ToSeconds();
+  double targetDurationSecs = targetDuration.ToSeconds();
+  if (mOutputDurationAvg == 0.0) {
+    mInputDurationAvg = mOutputDurationAvg =
+        std::max(sourceDurationSecs, targetDurationSecs);
+  }
+  auto UpdateAverageWithMeasurement = [](double* aAvg, double aData) {
+    constexpr double kMovingAvgWeight = 0.01;
+    *aAvg += kMovingAvgWeight * (aData - *aAvg);
+  };
+  UpdateAverageWithMeasurement(&mInputDurationAvg, sourceDurationSecs);
+  UpdateAverageWithMeasurement(&mOutputDurationAvg, targetDurationSecs);
+  double driftEstimate = mInputDurationAvg / mOutputDurationAvg;
+  UpdateAverageWithMeasurement(&mStage1Drift, driftEstimate);
+  UpdateAverageWithMeasurement(&mDriftEstimate, mStage1Drift);
+  double adjustment = targetDurationSecs *
+                      (mSourceRate * mDriftEstimate - GetCorrectedSourceRate());
+  mStage1Buffered += adjustment;
+  mAvgBufferedFramesEst += adjustment;
+  UpdateAverageWithMeasurement(&mStage1Buffered, aBufferedFrames);
+  UpdateAverageWithMeasurement(&mAvgBufferedFramesEst, mStage1Buffered);
+
+  if (mIsHandlingUnderrun) {
+    mIsHandlingUnderrun = false;
+    mAvgBufferedFramesEst =
+        static_cast<double>(mDesiredBuffering.ToTicksAtRate(mSourceRate));
+    mStage1Buffered = mAvgBufferedFramesEst;
+  }
+
+  uint32_t desiredBufferedFrames = mDesiredBuffering.ToTicksAtRate(mSourceRate);
+  int32_t error =
+      (CheckedInt32(aBufferedFrames) - desiredBufferedFrames).value();
+  if (std::abs(error) > NearThreshold()) {
+    mDurationNearDesired = media::TimeUnit::Zero();
+  } else {
+    mDurationNearDesired += mTargetClock;
+  };
+
+  if (mTargetClock >= mAdjustmentInterval) {
+    CalculateCorrection(aBufferedFrames, aBufferSize);
+  }
+}
+
+void DriftController::CalculateCorrection(uint32_t aBufferedFrames,
+                                          uint32_t aBufferSize) {
+  const float cap = static_cast<float>(mSourceRate) / 1000.0f;
+
+  float steadyStateRate =
+      static_cast<float>(mDriftEstimate) * static_cast<float>(mSourceRate);
+  uint32_t desiredBufferedFrames = mDesiredBuffering.ToTicksAtRate(mSourceRate);
+  float avgError = static_cast<float>(mAvgBufferedFramesEst) -
+                   static_cast<float>(desiredBufferedFrames);
+
+  float rateError =
+      (mCorrectedSourceRate - steadyStateRate) * std::copysign(1.f, avgError);
+  float absAvgError = std::abs(avgError);
+  constexpr float slowConvergenceSecs = 30;
+  constexpr float resetConvergenceSecs = 15;
+  float correctedRate = steadyStateRate + avgError / resetConvergenceSecs;
+  float hysteresisCorrectedRate = mCorrectedSourceRate;
+  constexpr float slowHysteresis = 1.f;
+  if (
+      (rateError + slowHysteresis) * slowConvergenceSecs <= absAvgError ||
+      rateError * mAdjustmentInterval.ToSeconds() >= absAvgError) {
+    hysteresisCorrectedRate = correctedRate;
+    float cappedRate = std::clamp(correctedRate, mCorrectedSourceRate - cap,
+                                  mCorrectedSourceRate + cap);
+
+    if (std::lround(mCorrectedSourceRate) != std::lround(cappedRate)) {
+      LOG_CONTROLLER(
+          LogLevel::Verbose, this,
+          "Updating Correction: Nominal: {}Hz->{}Hz, Corrected: "
+          "{:.2f}Hz->{}Hz  (diff {:.2f}Hz), error: {:.2f}ms (nearThreshold: "
+          "{:.2f}ms), buffering: {:.2f}ms, desired buffering: {:.2f}ms",
+          mSourceRate, mTargetRate, cappedRate, mTargetRate,
+          cappedRate - mCorrectedSourceRate,
+          media::TimeUnit(CheckedInt64(aBufferedFrames) - desiredBufferedFrames,
+                          mSourceRate)
+                  .ToSeconds() *
+              1000.0,
+          media::TimeUnit(NearThreshold(), mSourceRate).ToSeconds() * 1000.0,
+          media::TimeUnit(aBufferedFrames, mSourceRate).ToSeconds() * 1000.0,
+          mDesiredBuffering.ToSeconds() * 1000.0);
+
+      ++mNumCorrectionChanges;
+    }
+
+    mCorrectedSourceRate = std::max(1.f, cappedRate);
+  }
+
+  LOG_PLOT_VALUES(
+      mPlotId, mTotalTargetClock.ToSeconds(), aBufferedFrames,
+      mAvgBufferedFramesEst, mDesiredBuffering.ToTicksAtRate(mSourceRate),
+      aBufferSize, mMeasuredSourceLatency.mean().ToTicksAtRate(mSourceRate),
+      mMeasuredTargetLatency.mean().ToTicksAtRate(mTargetRate),
+      mInputDurationAvg * mSourceRate, mOutputDurationAvg * mTargetRate,
+      mSourceRate, mTargetRate, steadyStateRate, NearThreshold(), correctedRate,
+      hysteresisCorrectedRate, std::lround(mCorrectedSourceRate));
+
+  mTargetClock = media::TimeUnit::Zero();
+}
+}  
+
+#undef LOG_PLOT_VALUES
+#undef LOG_PLOT_NAMES
+#undef LOG_CONTROLLER

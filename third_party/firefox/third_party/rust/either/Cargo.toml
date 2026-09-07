@@ -1,0 +1,37 @@
+
+[package]
+edition = "2018"
+rust-version = "1.36"
+name = "either"
+version = "1.8.1"
+authors = ["bluss"]
+description = """
+The enum `Either` with variants `Left` and `Right` is a general purpose sum type with two cases.
+"""
+documentation = "https://docs.rs/either/1/"
+keywords = [
+    "data-structure",
+    "no_std",
+]
+categories = [
+    "data-structures",
+    "no-std",
+]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bluss/either"
+
+[package.metadata.release]
+no-dev-version = true
+tag-name = "{{version}}"
+
+[package.metadata.docs.rs]
+features = ["serde"]
+
+[dependencies.serde]
+version = "1.0"
+features = ["derive"]
+optional = true
+
+[features]
+default = ["use_std"]
+use_std = []

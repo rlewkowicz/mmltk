@@ -1,0 +1,74 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+FINAL_LIBRARY = "mozglue"
+
+EXPORTS.mozilla += [
+    "AwakeTimeStamp.h",
+    "decimal/Decimal.h",
+    "decimal/DoubleConversion.h",
+    "IntegerPrintfMacros.h",
+    "LoggingCore.h",
+    "MmapFaultHandler.h",
+    "Now.h",
+    "PlatformConditionVariable.h",
+    "PlatformMutex.h",
+    "PlatformRWLock.h",
+    "Printf.h",
+    "SIMD.h",
+    "Sprintf.h",
+    "SSE.h",
+    "StackWalk.h",
+    "TimeStamp.h",
+    "Uptime.h",
+]
+
+EXPORTS.mozilla.glue += [
+    "Debug.h",
+]
+
+SOURCES += [
+    "AwakeTimeStamp.cpp",
+    "Debug.cpp",
+    "LoggingCore.cpp",
+    "MmapFaultHandler.cpp",
+    "Printf.cpp",
+    "SIMD.cpp",
+    "StackWalk.cpp",
+]
+
+SOURCES += [
+    "SIMD_avx2.cpp",
+    "SSE.cpp",
+]
+SOURCES["SIMD_avx2.cpp"].flags += ["-mavx2"]
+
+if not CONFIG["JS_STANDALONE"]:
+    EXPORTS.mozilla += [
+        "ProcessType.h",
+    ]
+
+    SOURCES += [
+        "ProcessType.cpp",
+    ]
+
+OS_LIBS += CONFIG["REALTIME_LIBS"]
+
+SOURCES += [
+    "ConditionVariable_posix.cpp",
+    "Mutex_posix.cpp",
+    "RWLock_posix.cpp",
+]
+
+
+SOURCES += [
+    "decimal/Decimal.cpp",
+]
+
+SOURCES["decimal/Decimal.cpp"].flags += ["-Wno-implicit-fallthrough"]
+
+for var in ("MOZ_APP_BASENAME", "MOZ_APP_VENDOR"):
+    DEFINES[var] = '"%s"' % CONFIG[var]
+
+include("/mozglue/misc/timestamp.mozbuild")

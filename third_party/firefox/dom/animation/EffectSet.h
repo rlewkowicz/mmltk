@@ -1,0 +1,199 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_EffectSet_h
+#define mozilla_EffectSet_h
+
+#include "mozilla/AnimationTarget.h"
+#include "mozilla/EffectCompositor.h"
+#include "mozilla/TimeStamp.h"
+#include "mozilla/dom/KeyframeEffect.h"
+#include "nsHashKeys.h"  // For nsPtrHashKey
+#include "nsTHashSet.h"
+
+class nsPresContext;
+enum class DisplayItemType : uint8_t;
+
+namespace mozilla {
+
+namespace dom {
+class Element;
+}  
+
+struct PseudoStyleRequest;
+
+class EffectSet {
+ public:
+  EffectSet()
+      : mCascadeNeedsUpdate(false),
+        mMayHaveOpacityAnim(false),
+        mMayHaveTransformAnim(false) {
+    MOZ_COUNT_CTOR(EffectSet);
+  }
+
+  ~EffectSet() {
+    MOZ_ASSERT(!IsBeingEnumerated(),
+               "Effect set should not be destroyed while it is being "
+               "enumerated");
+    MOZ_COUNT_DTOR(EffectSet);
+  }
+
+  void Traverse(nsCycleCollectionTraversalCallback& aCallback);
+
+  static EffectSet* Get(const dom::Element* aElement,
+                        const PseudoStyleRequest& aPseudoRequest);
+  static EffectSet* Get(const NonOwningAnimationTarget& aTarget) {
+    return Get(aTarget.mElement, aTarget.mPseudoRequest);
+  }
+  static EffectSet* Get(const OwningAnimationTarget& aTarget) {
+    return Get(aTarget.mElement, aTarget.mPseudoRequest);
+  }
+
+  static EffectSet* GetOrCreate(dom::Element* aElement,
+                                const PseudoStyleRequest& aPseudoRequest);
+  static EffectSet* GetOrCreate(const OwningAnimationTarget& aTarget) {
+    return GetOrCreate(aTarget.mElement, aTarget.mPseudoRequest);
+  }
+
+  static EffectSet* GetForFrame(const nsIFrame* aFrame,
+                                const nsCSSPropertyIDSet& aProperties);
+  static EffectSet* GetForFrame(const nsIFrame* aFrame,
+                                DisplayItemType aDisplayItemType);
+  static EffectSet* GetForStyleFrame(const nsIFrame* aStyleFrame);
+
+  static EffectSet* GetForEffect(const dom::KeyframeEffect* aEffect);
+
+  static void DestroyEffectSet(dom::Element* aElement,
+                               const PseudoStyleRequest& aPseudoRequest);
+  static void DestroyEffectSet(const OwningAnimationTarget& aTarget) {
+    return DestroyEffectSet(aTarget.mElement, aTarget.mPseudoRequest);
+  }
+
+  void AddEffect(dom::KeyframeEffect& aEffect);
+  void RemoveEffect(dom::KeyframeEffect& aEffect);
+
+  void SetMayHaveOpacityAnimation() { mMayHaveOpacityAnim = true; }
+  bool MayHaveOpacityAnimation() const { return mMayHaveOpacityAnim; }
+  void SetMayHaveTransformAnimation() { mMayHaveTransformAnim = true; }
+  bool MayHaveTransformAnimation() const { return mMayHaveTransformAnim; }
+
+ private:
+  using OwningEffectSet = nsTHashSet<nsRefPtrHashKey<dom::KeyframeEffect>>;
+
+ public:
+  class Iterator {
+   public:
+    explicit Iterator(EffectSet& aEffectSet)
+        : Iterator(aEffectSet, aEffectSet.mEffects.begin()) {}
+
+    Iterator() = delete;
+    Iterator(const Iterator&) = delete;
+    Iterator(Iterator&&) = delete;
+    Iterator& operator=(const Iterator&) = delete;
+    Iterator& operator=(Iterator&&) = delete;
+
+    static Iterator EndIterator(EffectSet& aEffectSet) {
+      return {aEffectSet, aEffectSet.mEffects.end()};
+    }
+
+#ifdef DEBUG
+    ~Iterator() {
+      MOZ_ASSERT(mEffectSet.mActiveIterators > 0);
+      mEffectSet.mActiveIterators--;
+    }
+#endif
+
+    bool operator!=(const Iterator& aOther) const {
+      return mHashIterator != aOther.mHashIterator;
+    }
+
+    Iterator& operator++() {
+      ++mHashIterator;
+      return *this;
+    }
+
+    dom::KeyframeEffect* operator*() { return *mHashIterator; }
+
+   private:
+    Iterator(EffectSet& aEffectSet,
+             OwningEffectSet::const_iterator aHashIterator)
+        :
+#ifdef DEBUG
+          mEffectSet(aEffectSet),
+#endif
+          mHashIterator(std::move(aHashIterator)) {
+#ifdef DEBUG
+      mEffectSet.mActiveIterators++;
+#endif
+    }
+
+#ifdef DEBUG
+    EffectSet& mEffectSet;
+#endif
+    OwningEffectSet::const_iterator mHashIterator;
+  };
+
+  friend class Iterator;
+
+  Iterator begin() { return Iterator(*this); }
+  Iterator end() { return Iterator::EndIterator(*this); }
+#ifdef DEBUG
+  bool IsBeingEnumerated() const { return mActiveIterators != 0; }
+#endif
+
+  bool IsEmpty() const { return mEffects.IsEmpty(); }
+
+  size_t Count() const { return mEffects.Count(); }
+
+  const TimeStamp& LastOverflowAnimationSyncTime() const {
+    return mLastOverflowAnimationSyncTime;
+  }
+  void UpdateLastOverflowAnimationSyncTime(const TimeStamp& aRefreshTime) {
+    mLastOverflowAnimationSyncTime = aRefreshTime;
+  }
+
+  bool CascadeNeedsUpdate() const { return mCascadeNeedsUpdate; }
+  void MarkCascadeNeedsUpdate() { mCascadeNeedsUpdate = true; }
+  void MarkCascadeUpdated() { mCascadeNeedsUpdate = false; }
+
+  void UpdateAnimationGeneration(nsPresContext* aPresContext);
+  uint64_t GetAnimationGeneration() const { return mAnimationGeneration; }
+
+  const nsCSSPropertyIDSet& PropertiesWithImportantRules() const {
+    return mPropertiesWithImportantRules;
+  }
+  nsCSSPropertyIDSet& PropertiesWithImportantRules() {
+    return mPropertiesWithImportantRules;
+  }
+  const AnimatedPropertyIDSet& PropertiesForAnimationsLevel() const {
+    return mPropertiesForAnimationsLevel;
+  }
+  AnimatedPropertyIDSet& PropertiesForAnimationsLevel() {
+    return mPropertiesForAnimationsLevel;
+  }
+
+ private:
+  OwningEffectSet mEffects;
+
+
+  TimeStamp mLastOverflowAnimationSyncTime;
+
+  uint64_t mAnimationGeneration = 0;
+
+  nsCSSPropertyIDSet mPropertiesWithImportantRules;
+  AnimatedPropertyIDSet mPropertiesForAnimationsLevel;
+
+#ifdef DEBUG
+  uint64_t mActiveIterators = 0;
+#endif
+
+  bool mCascadeNeedsUpdate = false;
+
+  bool mMayHaveOpacityAnim = false;
+  bool mMayHaveTransformAnim = false;
+};
+
+}  
+
+#endif  // mozilla_EffectSet_h

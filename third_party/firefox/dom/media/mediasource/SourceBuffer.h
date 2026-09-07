@@ -1,0 +1,185 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_SourceBuffer_h_
+#define mozilla_dom_SourceBuffer_h_
+
+#include "MediaContainerType.h"
+#include "MediaSource.h"
+#include "SourceBufferTask.h"
+#include "TrackBuffersManager.h"
+#include "js/RootingAPI.h"
+#include "mozilla/Atomics.h"
+#include "mozilla/DOMEventTargetHelper.h"
+#include "mozilla/MozPromise.h"
+#include "mozilla/dom/SourceBufferBinding.h"
+#include "mozilla/dom/TypedArray.h"
+#include "mozilla/mozalloc.h"
+#include "nsCOMPtr.h"
+#include "nsCycleCollectionNoteChild.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsISupports.h"
+#include "nscore.h"
+
+class JSObject;
+struct JSContext;
+
+namespace mozilla {
+
+class AbstractThread;
+class ErrorResult;
+class MediaByteBuffer;
+template <typename T>
+class AsyncEventRunner;
+
+DDLoggedTypeName(dom::SourceBuffer);
+
+namespace dom {
+
+class TimeRanges;
+
+class SourceBuffer final : public DOMEventTargetHelper,
+                           public DecoderDoctorLifeLogger<SourceBuffer> {
+ public:
+  SourceBufferAppendMode Mode() const {
+    return mCurrentAttributes.GetAppendMode();
+  }
+
+  void SetMode(SourceBufferAppendMode aMode, ErrorResult& aRv);
+
+  bool Updating() const { return mUpdating; }
+
+  TimeRanges* GetBuffered(ErrorResult& aRv);
+  media::TimeIntervals GetTimeIntervals();
+
+  double TimestampOffset() const {
+    return mCurrentAttributes.GetApparentTimestampOffset();
+  }
+
+  void SetTimestampOffset(double aTimestampOffset, ErrorResult& aRv);
+
+  double AppendWindowStart() const {
+    return mCurrentAttributes.GetAppendWindowStart();
+  }
+
+  void SetAppendWindowStart(double aAppendWindowStart, ErrorResult& aRv);
+
+  double AppendWindowEnd() const {
+    return mCurrentAttributes.GetAppendWindowEnd();
+  }
+
+  void SetAppendWindowEnd(double aAppendWindowEnd, ErrorResult& aRv);
+
+  void AppendBuffer(const ArrayBuffer& aData, ErrorResult& aRv);
+  void AppendBuffer(const ArrayBufferView& aData, ErrorResult& aRv);
+
+  already_AddRefed<Promise> AppendBufferAsync(const ArrayBuffer& aData,
+                                              ErrorResult& aRv);
+  already_AddRefed<Promise> AppendBufferAsync(const ArrayBufferView& aData,
+                                              ErrorResult& aRv);
+
+  void Abort(ErrorResult& aRv);
+  void AbortBufferAppend();
+
+  void Remove(double aStart, double aEnd, ErrorResult& aRv);
+
+  already_AddRefed<Promise> RemoveAsync(double aStart, double aEnd,
+                                        ErrorResult& aRv);
+
+  void ChangeType(const nsAString& aType, ErrorResult& aRv);
+
+  IMPL_EVENT_HANDLER(updatestart);
+  IMPL_EVENT_HANDLER(update);
+  IMPL_EVENT_HANDLER(updateend);
+  IMPL_EVENT_HANDLER(error);
+  IMPL_EVENT_HANDLER(abort);
+
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(SourceBuffer, DOMEventTargetHelper)
+
+  SourceBuffer(MediaSource* aMediaSource, const MediaContainerType& aType);
+
+  MediaSource* GetParentObject() const;
+
+  JSObject* WrapObject(JSContext* aCx,
+                       JS::Handle<JSObject*> aGivenProto) override;
+
+  void Detach();
+  bool IsAttached() const { return mMediaSource != nullptr; }
+
+  void SetEnded(const Optional<MediaSourceEndOfStreamError>& aError);
+
+  media::TimeIntervals GetBufferedIntervals();
+  media::TimeUnit GetBufferedEnd();
+  media::TimeUnit HighestStartTime();
+  media::TimeUnit HighestEndTime();
+
+  void RangeRemoval(double aStart, double aEnd);
+
+  bool IsActive() const { return mActive; }
+
+ private:
+  ~SourceBuffer();
+
+  friend class AsyncEventRunner<SourceBuffer>;
+  friend class BufferAppendRunnable;
+  friend class mozilla::TrackBuffersManager;
+  void DispatchSimpleEvent(const char* aName);
+  void QueueAsyncSimpleEvent(const char* aName);
+
+  void StartUpdating();
+  void StopUpdating();
+  void AbortUpdating();
+  void ResetParserState();
+
+  void CheckEndTime();
+
+  void AppendData(RefPtr<MediaByteBuffer>&& aData, ErrorResult& aRv);
+  already_AddRefed<Promise> AppendDataAsync(RefPtr<MediaByteBuffer>&& aData,
+                                            ErrorResult& aRv);
+
+  void PrepareRemove(double aStart, double aEnd, ErrorResult& aRv);
+
+  void AppendError(const MediaResult& aDecodeError);
+
+  already_AddRefed<MediaByteBuffer> PrepareAppend(const uint8_t* aData,
+                                                  uint32_t aLength,
+                                                  ErrorResult& aRv);
+  template <typename T>
+  already_AddRefed<MediaByteBuffer> PrepareAppend(const T& aData,
+                                                  ErrorResult& aRv);
+
+  void AppendDataCompletedWithSuccess(
+      const SourceBufferTask::AppendBufferResult& aResult);
+  void AppendDataErrored(const MediaResult& aError);
+
+  RefPtr<MediaSource> mMediaSource;
+  const RefPtr<AbstractThread> mAbstractMainThread;
+
+  RefPtr<TrackBuffersManager> mTrackBuffersManager;
+  SourceBufferAttributes mCurrentAttributes;
+
+  bool mUpdating;
+
+  mozilla::Atomic<bool> mActive;
+
+  MozPromiseRequestHolder<SourceBufferTask::AppendPromise> mPendingAppend;
+  MozPromiseRequestHolder<SourceBufferTask::RangeRemovalPromise>
+      mPendingRemoval;
+  MediaContainerType mType;
+
+  RefPtr<TimeRanges> mBuffered;
+
+  MozPromiseRequestHolder<MediaSource::ActiveCompletionPromise>
+      mCompletionPromise;
+
+  RefPtr<Promise> mDOMPromise;
+};
+
+}  
+
+}  
+
+#endif /* mozilla_dom_SourceBuffer_h_ */

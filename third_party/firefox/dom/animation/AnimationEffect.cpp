@@ -1,0 +1,384 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/AnimationEffect.h"
+
+#include "mozilla/AnimationUtils.h"
+#include "mozilla/FloatingPoint.h"
+#include "mozilla/dom/Animation.h"
+#include "mozilla/dom/AnimationEffectBinding.h"
+#include "mozilla/dom/CSSUnitValue.h"
+#include "mozilla/dom/KeyframeEffect.h"
+#include "mozilla/dom/MutationObservers.h"
+#include "mozilla/dom/ScrollTimeline.h"  // For PROGRESS_TIMELINE_DURATION_MILLISEC
+#include "nsDOMMutationObserver.h"
+
+namespace mozilla::dom {
+
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(AnimationEffect)
+NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(AnimationEffect)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK(mDocument, mAnimation)
+  NS_IMPL_CYCLE_COLLECTION_UNLINK_PRESERVED_WRAPPER
+NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(AnimationEffect)
+  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mDocument, mAnimation)
+NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(AnimationEffect)
+NS_IMPL_CYCLE_COLLECTING_RELEASE(AnimationEffect)
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(AnimationEffect)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+AnimationEffect::AnimationEffect(Document* aDocument, TimingParams&& aTiming)
+    : mDocument(aDocument), mTiming(std::move(aTiming)) {
+  mRTPCallerType = mDocument->GetScopeObject()->GetRTPCallerType();
+}
+
+AnimationEffect::~AnimationEffect() = default;
+
+nsISupports* AnimationEffect::GetParentObject() const {
+  return ToSupports(mDocument);
+}
+
+bool AnimationEffect::IsCurrent() const {
+  if (!mAnimation) {
+    return false;
+  }
+
+  const AnimationTimeline* timeline = mAnimation->GetTimeline();
+  if (timeline && timeline->IsInactiveTimeline()) {
+    return false;
+  }
+  if (timeline && !timeline->IsMonotonicallyIncreasing() &&
+      mAnimation->PlayState() != AnimationPlayState::Idle) {
+    return true;
+  }
+
+  if (mAnimation->PlayState() == AnimationPlayState::Finished) {
+    return false;
+  }
+
+  ComputedTiming computedTiming = GetComputedTiming();
+  if (computedTiming.mPhase == ComputedTiming::AnimationPhase::Active) {
+    return true;
+  }
+
+  return (mAnimation->PlaybackRateInternal() > 0 &&
+          computedTiming.mPhase == ComputedTiming::AnimationPhase::Before) ||
+         (mAnimation->PlaybackRateInternal() < 0 &&
+          computedTiming.mPhase == ComputedTiming::AnimationPhase::After);
+}
+
+bool AnimationEffect::IsInEffect() const {
+  const auto* timeline = mAnimation ? mAnimation->GetTimeline() : nullptr;
+  if (timeline && timeline->IsInactiveTimeline()) {
+    return false;
+  }
+  ComputedTiming computedTiming = GetComputedTiming();
+  return !computedTiming.mProgress.IsNull();
+}
+
+void AnimationEffect::SetSpecifiedTiming(TimingParams&& aTiming) {
+  if (mTiming == aTiming) {
+    return;
+  }
+
+  mTiming = std::move(aTiming);
+
+  UpdateNormalizedTiming();
+
+  if (mAnimation) {
+    Maybe<nsAutoAnimationMutationBatch> mb;
+    if (AsKeyframeEffect() && AsKeyframeEffect()->GetAnimationTarget()) {
+      mb.emplace(AsKeyframeEffect()->GetAnimationTarget().mElement->OwnerDoc());
+    }
+
+    mAnimation->NotifyEffectTimingUpdated();
+
+    if (mAnimation->IsRelevant()) {
+      MutationObservers::NotifyAnimationChanged(mAnimation);
+    }
+
+    if (AsKeyframeEffect()) {
+      AsKeyframeEffect()->RequestRestyle(EffectCompositor::RestyleType::Layer);
+    }
+  }
+
+}
+
+ComputedTiming AnimationEffect::GetComputedTimingAt(
+    const Nullable<TimeDuration>& aLocalTime, const TimingParams& aTiming,
+    double aPlaybackRate,
+    Animation::ProgressTimelinePosition aProgressTimelinePosition,
+    EndpointBehavior aEndpointBehavior) {
+  static const StickyTimeDuration zeroDuration;
+
+  ComputedTiming result;
+
+  if (aTiming.Duration()) {
+    MOZ_ASSERT(aTiming.Duration().ref() >= zeroDuration,
+               "Iteration duration should be positive");
+    result.mDuration = aTiming.Duration().ref();
+  }
+
+  MOZ_ASSERT(aTiming.Iterations() >= 0.0 && !std::isnan(aTiming.Iterations()),
+             "mIterations should be nonnegative & finite, as ensured by "
+             "ValidateIterations or CSSParser");
+  result.mIterations = aTiming.Iterations();
+
+  MOZ_ASSERT(aTiming.IterationStart() >= 0.0,
+             "mIterationStart should be nonnegative, as ensured by "
+             "ValidateIterationStart");
+  result.mIterationStart = aTiming.IterationStart();
+
+  result.mActiveDuration = aTiming.ActiveDuration();
+  result.mEndTime = aTiming.EndTime();
+  result.mFill = aTiming.Fill() == dom::FillMode::Auto ? dom::FillMode::None
+                                                       : aTiming.Fill();
+
+  if (aLocalTime.IsNull()) {
+    return result;
+  }
+  const TimeDuration& localTime = aLocalTime.Value();
+  const bool atProgressTimelineBoundary =
+      aProgressTimelinePosition ==
+      Animation::ProgressTimelinePosition::Boundary;
+
+  StickyTimeDuration beforeActiveBoundary = aTiming.CalcBeforeActiveBoundary();
+  StickyTimeDuration activeAfterBoundary = aTiming.CalcActiveAfterBoundary();
+
+  if (localTime > activeAfterBoundary ||
+      (aEndpointBehavior == EndpointBehavior::Exclusive && aPlaybackRate >= 0 &&
+       localTime == activeAfterBoundary && !atProgressTimelineBoundary)) {
+    result.mPhase = ComputedTiming::AnimationPhase::After;
+    if (!result.FillsForwards()) {
+      return result;
+    }
+    result.mActiveTime =
+        std::max(std::min(StickyTimeDuration(localTime - aTiming.Delay()),
+                          result.mActiveDuration),
+                 zeroDuration);
+  } else if (localTime < beforeActiveBoundary ||
+             (aEndpointBehavior == EndpointBehavior::Exclusive &&
+              aPlaybackRate < 0 && localTime == beforeActiveBoundary &&
+              !atProgressTimelineBoundary)) {
+    result.mPhase = ComputedTiming::AnimationPhase::Before;
+    if (!result.FillsBackwards()) {
+      return result;
+    }
+    result.mActiveTime =
+        std::max(StickyTimeDuration(localTime - aTiming.Delay()), zeroDuration);
+  } else {
+    result.mPhase = ComputedTiming::AnimationPhase::Active;
+    result.mActiveTime = localTime - aTiming.Delay();
+  }
+
+  double overallProgress;
+  if (!result.mDuration) {
+    overallProgress = result.mPhase == ComputedTiming::AnimationPhase::Before
+                          ? 0.0
+                          : result.mIterations;
+  } else {
+    overallProgress = result.mActiveTime / result.mDuration;
+  }
+
+  if (std::isfinite(overallProgress)) {
+    overallProgress += result.mIterationStart;
+  }
+
+  result.mCurrentIteration =
+      (result.mIterations >= double(UINT64_MAX) &&
+       result.mPhase == ComputedTiming::AnimationPhase::After) ||
+              overallProgress >= double(UINT64_MAX)
+          ? UINT64_MAX  
+          : static_cast<uint64_t>(std::max(overallProgress, 0.0));
+
+  double progress = std::isfinite(overallProgress)
+                        ? fmod(overallProgress, 1.0)
+                        : fmod(result.mIterationStart, 1.0);
+
+  if (progress == 0.0 &&
+      (result.mPhase == ComputedTiming::AnimationPhase::After ||
+       result.mPhase == ComputedTiming::AnimationPhase::Active) &&
+      result.mActiveTime == result.mActiveDuration &&
+      result.mIterations != 0.0) {
+    MOZ_ASSERT(result.mCurrentIteration != 0,
+               "Should not have zero current iteration");
+    progress = 1.0;
+    if (result.mCurrentIteration != UINT64_MAX) {
+      result.mCurrentIteration--;
+    }
+  }
+
+  bool thisIterationReverse = false;
+  switch (aTiming.Direction()) {
+    case PlaybackDirection::Normal:
+      thisIterationReverse = false;
+      break;
+    case PlaybackDirection::Reverse:
+      thisIterationReverse = true;
+      break;
+    case PlaybackDirection::Alternate:
+      thisIterationReverse = (result.mCurrentIteration & 1) == 1;
+      break;
+    case PlaybackDirection::Alternate_reverse:
+      thisIterationReverse = (result.mCurrentIteration & 1) == 0;
+      break;
+    default:
+      MOZ_ASSERT_UNREACHABLE("Unknown PlaybackDirection type");
+  }
+  if (thisIterationReverse) {
+    progress = 1.0 - progress;
+  }
+
+  if ((result.mPhase == ComputedTiming::AnimationPhase::After &&
+       thisIterationReverse) ||
+      (result.mPhase == ComputedTiming::AnimationPhase::Before &&
+       !thisIterationReverse)) {
+    result.mBeforeFlag = true;
+  }
+
+  if (const auto& fn = aTiming.TimingFunction()) {
+    progress = fn->At(progress, result.mBeforeFlag);
+  }
+
+  if (!std::isfinite(progress)) {
+    return result;
+  }
+
+  result.mProgress.SetValue(progress);
+  return result;
+}
+
+ComputedTiming AnimationEffect::GetComputedTiming(
+    const TimingParams* aTiming, EndpointBehavior aEndpointBehavior) const {
+  const double playbackRate =
+      mAnimation ? mAnimation->PlaybackRateInternal() : 1;
+  const auto progressTimelinePosition =
+      mAnimation ? mAnimation->AtProgressTimelineBoundary()
+                 : Animation::ProgressTimelinePosition::NotBoundary;
+  return GetComputedTimingAt(
+      GetLocalTime(), aTiming ? *aTiming : NormalizedTiming(), playbackRate,
+      progressTimelinePosition, aEndpointBehavior);
+}
+
+static void GetEffectTimingDictionary(const TimingParams& aTiming,
+                                      EffectTiming& aRetVal) {
+  aRetVal.mDelay = aTiming.Delay().ToMilliseconds();
+  aRetVal.mEndDelay = aTiming.EndDelay().ToMilliseconds();
+  aRetVal.mFill = aTiming.Fill();
+  aRetVal.mIterationStart = aTiming.IterationStart();
+  aRetVal.mIterations = aTiming.Iterations();
+  if (aTiming.Duration()) {
+    aRetVal.mDuration.SetAsUnrestrictedDouble() =
+        aTiming.Duration()->ToMilliseconds();
+  }
+  aRetVal.mDirection = aTiming.Direction();
+  if (aTiming.TimingFunction()) {
+    aRetVal.mEasing.Truncate();
+    aTiming.TimingFunction()->AppendToString(aRetVal.mEasing);
+  }
+}
+
+void AnimationEffect::GetTiming(EffectTiming& aRetVal) const {
+  GetEffectTimingDictionary(SpecifiedTiming(), aRetVal);
+}
+
+void AnimationEffect::GetComputedTimingAsDict(
+    ComputedEffectTiming& aRetVal) const {
+  GetEffectTimingDictionary(SpecifiedTiming(), aRetVal);
+
+  double playbackRate = mAnimation ? mAnimation->PlaybackRateInternal() : 1;
+  const Nullable<TimeDuration> currentTime = GetLocalTime();
+  const auto progressTimelinePosition =
+      mAnimation ? mAnimation->AtProgressTimelineBoundary()
+                 : Animation::ProgressTimelinePosition::NotBoundary;
+  ComputedTiming computedTiming = GetComputedTimingAt(
+      currentTime, NormalizedTiming(), playbackRate, progressTimelinePosition);
+
+  const bool hasProgressTimeline =
+      mAnimation && mAnimation->AcceptsPercentageBasedTime();
+  auto* progressGlobal =
+      hasProgressTimeline ? mAnimation->GetParentObject() : nullptr;
+
+  if (progressGlobal) {
+    aRetVal.mDuration.SetAsCSSNumericValue() = MakeCSSUnitValue(
+        progressGlobal, StyleNumericType::Percent(),
+        computedTiming.mDuration.ToMilliseconds() /
+            static_cast<double>(PROGRESS_TIMELINE_DURATION_MILLISEC) * 100.0,
+        "percent"_ns);
+  } else {
+    aRetVal.mDuration.SetAsUnrestrictedDouble() =
+        computedTiming.mDuration.ToMilliseconds();
+  }
+  aRetVal.mFill = computedTiming.mFill;
+  AnimationUtils::DoubleToCSSNumberish(
+      computedTiming.mActiveDuration.ToMilliseconds(), hasProgressTimeline,
+      progressGlobal, aRetVal.mActiveDuration.Construct());
+  AnimationUtils::DoubleToCSSNumberish(computedTiming.mEndTime.ToMilliseconds(),
+                                       hasProgressTimeline, progressGlobal,
+                                       aRetVal.mEndTime.Construct());
+  Nullable<OwningCSSNumberish>& localTime = aRetVal.mLocalTime.Construct();
+  if (currentTime.IsNull()) {
+    localTime.SetNull();
+  } else {
+    AnimationUtils::DoubleToCSSNumberish(
+        AnimationUtils::TimeDurationToDouble(currentTime, mRTPCallerType)
+            .Value(),
+        hasProgressTimeline, progressGlobal, localTime.SetValue());
+  }
+  aRetVal.mProgress = computedTiming.mProgress;
+
+  if (!aRetVal.mProgress.IsNull()) {
+    double iteration =
+        computedTiming.mCurrentIteration == UINT64_MAX
+            ? PositiveInfinity<double>()
+            : static_cast<double>(computedTiming.mCurrentIteration);
+    aRetVal.mCurrentIteration.SetValue(iteration);
+  }
+}
+
+void AnimationEffect::UpdateTiming(const OptionalEffectTiming& aTiming,
+                                   ErrorResult& aRv) {
+  TimingParams timing =
+      TimingParams::MergeOptionalEffectTiming(mTiming, aTiming, aRv);
+  if (aRv.Failed()) {
+    return;
+  }
+
+  SetSpecifiedTiming(std::move(timing));
+}
+
+void AnimationEffect::UpdateNormalizedTiming() {
+  mNormalizedTiming.reset();
+
+  if (!mAnimation) {
+    return;
+  }
+
+  const auto* timeline = mAnimation->GetTimeline();
+  if (!timeline || timeline->IsMonotonicallyIncreasing()) {
+    return;
+  }
+
+  const Nullable<TimeDuration>& timelineDuration =
+      timeline->TimelineDuration(mAnimation->GetTimelineRange());
+  MOZ_ASSERT(!timelineDuration.IsNull(),
+             "We always have a timeline duration even for 0 duration");
+  mNormalizedTiming.emplace(mTiming.Normalize(timelineDuration.Value()));
+}
+
+Nullable<TimeDuration> AnimationEffect::GetLocalTime() const {
+  Nullable<TimeDuration> result;
+  if (mAnimation) {
+    result = mAnimation->GetCurrentTimeAsDuration();
+  }
+  return result;
+}
+
+}  

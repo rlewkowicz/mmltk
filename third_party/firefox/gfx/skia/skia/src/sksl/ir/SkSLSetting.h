@@ -1,0 +1,66 @@
+/*
+ * Copyright 2016 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SKSL_SETTING)
+#define SKSL_SETTING
+
+#include "src/sksl/SkSLPosition.h"
+#include "src/sksl/SkSLUtil.h"
+#include "src/sksl/ir/SkSLExpression.h"
+#include "src/sksl/ir/SkSLIRNode.h"
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <string_view>
+
+
+namespace SkSL {
+
+class Context;
+class Type;
+enum class OperatorPrecedence : uint8_t;
+
+class Setting final : public Expression {
+public:
+    inline static constexpr Kind kIRNodeKind = Kind::kSetting;
+
+    using CapsPtr = const bool ShaderCaps::*;
+
+    Setting(Position pos, CapsPtr capsPtr, const Type* type)
+        : INHERITED(pos, kIRNodeKind, type)
+        , fCapsPtr(capsPtr) {}
+
+    static std::unique_ptr<Expression> Convert(const Context& context,
+                                               Position pos,
+                                               const std::string_view& name);
+
+    static std::unique_ptr<Expression> Make(const Context& context, Position pos, CapsPtr capsPtr);
+
+    std::unique_ptr<Expression> toLiteral(const ShaderCaps& caps) const;
+
+    std::unique_ptr<Expression> clone(Position pos) const override {
+        return std::make_unique<Setting>(pos, fCapsPtr, &this->type());
+    }
+
+    std::string_view name() const;
+
+    CapsPtr capsPtr() const { return fCapsPtr; }
+
+    std::string description(OperatorPrecedence) const override {
+        return "sk_Caps." + std::string(this->name());
+    }
+
+private:
+    CapsPtr fCapsPtr;
+
+    using INHERITED = Expression;
+};
+
+}  
+
+#endif

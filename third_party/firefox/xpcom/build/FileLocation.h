@@ -1,0 +1,79 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_FileLocation_h
+#define mozilla_FileLocation_h
+
+#include "nsString.h"
+#include "nsCOMPtr.h"
+#include "nsIFile.h"
+#include "mozilla/FileUtils.h"
+
+class nsZipArchive;
+class nsZipItem;
+
+namespace mozilla {
+
+class FileLocation {
+ public:
+  FileLocation();
+  ~FileLocation();
+
+  FileLocation(const FileLocation& aOther);
+  FileLocation(FileLocation&& aOther);
+
+  FileLocation& operator=(const FileLocation&) = default;
+
+  explicit FileLocation(nsIFile* aFile);
+
+  FileLocation(nsIFile* aZip, const nsACString& aPath);
+
+  FileLocation(nsZipArchive* aZip, const nsACString& aPath);
+
+  FileLocation(const FileLocation& aFile, const nsACString& aPath);
+
+  void Init(nsIFile* aFile);
+
+  void Init(nsIFile* aZip, const nsACString& aPath);
+
+  void Init(nsZipArchive* aZip, const nsACString& aPath);
+
+  void GetURIString(nsACString& aResult) const;
+
+  already_AddRefed<nsIFile> GetBaseFile();
+
+  nsZipArchive* GetBaseZip() { return mBaseZip; }
+
+  bool IsZip() const { return !mPath.IsEmpty(); }
+
+  void GetPath(nsACString& aResult) const { aResult = mPath; }
+
+  explicit operator bool() const { return mBaseFile || mBaseZip; }
+
+  bool Equals(const FileLocation& aFile) const;
+
+  class Data {
+   public:
+    nsresult GetSize(uint32_t* aResult);
+
+    nsresult Copy(char* aBuf, uint32_t aLen);
+
+   protected:
+    friend class FileLocation;
+    nsZipItem* mItem;
+    RefPtr<nsZipArchive> mZip;
+    mozilla::AutoFDClose mFd;
+  };
+
+  nsresult GetData(Data& aData);
+
+ private:
+  nsCOMPtr<nsIFile> mBaseFile;
+  RefPtr<nsZipArchive> mBaseZip;
+  nsCString mPath;
+}; 
+
+} 
+
+#endif /* mozilla_FileLocation_h */

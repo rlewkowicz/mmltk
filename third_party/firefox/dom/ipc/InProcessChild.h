@@ -1,0 +1,53 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_InProcessChild_h
+#define mozilla_dom_InProcessChild_h
+
+#include "mozilla/StaticPtr.h"
+#include "mozilla/dom/JSProcessActorChild.h"
+#include "mozilla/dom/PInProcessChild.h"
+#include "mozilla/dom/ProcessActor.h"
+#include "mozilla/dom/RemoteType.h"
+#include "nsIDOMProcessChild.h"
+
+namespace mozilla::dom {
+class PWindowGlobalParent;
+class PWindowGlobalChild;
+class InProcessParent;
+
+class InProcessChild final : public nsIDOMProcessChild,
+                             public PInProcessChild,
+                             public ProcessActor {
+ public:
+  friend class InProcessParent;
+  friend class PInProcessChild;
+
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIDOMPROCESSCHILD
+
+  static InProcessChild* Singleton();
+
+  static IProtocol* ParentActorFor(IProtocol* aActor);
+
+  const nsACString& GetRemoteType() const override { return NOT_REMOTE_TYPE; }
+
+ protected:
+  already_AddRefed<JSActor> InitJSActor(JS::Handle<JSObject*> aMaybeActor,
+                                        const nsACString& aName,
+                                        ErrorResult& aRv) override;
+  mozilla::ipc::IProtocol* AsNativeActor() override { return this; }
+
+ private:
+  virtual void ActorDestroy(ActorDestroyReason aWhy) override;
+  ~InProcessChild() = default;
+
+  static StaticRefPtr<InProcessChild> sSingleton;
+
+  nsRefPtrHashtable<nsCStringHashKey, JSProcessActorChild> mProcessActors;
+};
+
+}  
+
+#endif  // defined(mozilla_dom_InProcessChild_h)

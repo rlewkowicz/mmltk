@@ -1,0 +1,2315 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "mozilla/ReflowInput.h"
+
+#include <algorithm>
+
+#include "AnchorPositioningUtils.h"
+#include "CounterStyleManager.h"
+#include "LayoutLogging.h"
+#include "PresShell.h"
+#include "StickyScrollContainer.h"
+#include "mozilla/ScrollContainerFrame.h"
+#include "mozilla/WritingModes.h"
+#include "mozilla/dom/HTMLInputElement.h"
+#include "nsBlockFrame.h"
+#include "nsFlexContainerFrame.h"
+#include "nsFontInflationData.h"
+#include "nsFontMetrics.h"
+#include "nsGkAtoms.h"
+#include "nsGridContainerFrame.h"
+#include "nsIContent.h"
+#include "nsIFrame.h"
+#include "nsIFrameInlines.h"
+#include "nsIPercentBSizeObserver.h"
+#include "nsImageFrame.h"
+#include "nsLayoutUtils.h"
+#include "nsLineBox.h"
+#include "nsPresContext.h"
+#include "nsStyleConsts.h"
+#include "nsTableFrame.h"
+
+using namespace mozilla;
+using namespace mozilla::css;
+using namespace mozilla::dom;
+using namespace mozilla::layout;
+
+AnchorPosResolutionParams AnchorPosResolutionParams::From(
+    const mozilla::SizeComputationInput* aSizingInput,
+    bool aIgnorePositionArea) {
+  auto override = AutoResolutionOverrideParams{
+      aSizingInput->mFrame, aSizingInput->mAnchorPosResolutionCache};
+  if (aIgnorePositionArea) {
+    override.mPositionAreaInUse = false;
+  }
+  return {aSizingInput->mFrame, aSizingInput->mFrame->StyleDisplay()->mPosition,
+          aSizingInput->mAnchorPosResolutionCache, override};
+}
+
+static bool CheckNextInFlowParenthood(nsIFrame* aFrame, nsIFrame* aParent) {
+  nsIFrame* frameNext = aFrame->GetNextInFlow();
+  nsIFrame* parentNext = aParent->GetNextInFlow();
+  return frameNext && parentNext && frameNext->GetParent() == parentNext;
+}
+
+static nscoord FontSizeInflationListMarginAdjustment(const nsIFrame* aFrame) {
+  if (!aFrame->HasAnyStateBits(NS_BLOCK_HAS_MARKER)) {
+    return 0;
+  }
+
+  float inflation = nsLayoutUtils::FontSizeInflationFor(aFrame);
+  if (inflation <= 1.0f) {
+    return 0;
+  }
+
+  if (!aFrame->IsBlockFrameOrSubclass()) {
+    return 0;
+  }
+
+  MOZ_ASSERT(static_cast<const nsBlockFrame*>(aFrame)->HasMarker());
+
+  const auto* list = aFrame->StyleList();
+  if (list->mListStyleType.IsNone()) {
+    return 0;
+  }
+
+  auto margin = nsPresContext::CSSPixelsToAppUnits(40) * (inflation - 1);
+  if (!list->mListStyleType.IsName()) {
+    return margin;
+  }
+
+  nsAtom* type = list->mListStyleType.AsName().AsAtom();
+  if (type != nsGkAtoms::disc && type != nsGkAtoms::circle &&
+      type != nsGkAtoms::square && type != nsGkAtoms::disclosure_closed &&
+      type != nsGkAtoms::disclosure_open) {
+    return margin;
+  }
+
+  return 0;
+}
+
+SizeComputationInput::SizeComputationInput(
+    nsIFrame* aFrame, gfxContext* aRenderingContext,
+    AnchorPosResolutionCache* aAnchorPosResolutionCache)
+    : mFrame(aFrame),
+      mRenderingContext(aRenderingContext),
+      mAnchorPosResolutionCache(aAnchorPosResolutionCache),
+      mWritingMode(aFrame->GetWritingMode()),
+      mIsThemed(aFrame->IsThemed()),
+      mComputedMargin(mWritingMode),
+      mComputedBorderPadding(mWritingMode),
+      mComputedPadding(mWritingMode) {
+  MOZ_ASSERT(mFrame);
+}
+
+SizeComputationInput::SizeComputationInput(
+    nsIFrame* aFrame, gfxContext* aRenderingContext,
+    WritingMode aContainingBlockWritingMode, nscoord aContainingBlockISize,
+    const Maybe<LogicalMargin>& aBorder, const Maybe<LogicalMargin>& aPadding)
+    : SizeComputationInput(aFrame, aRenderingContext) {
+  MOZ_ASSERT(!mFrame->IsTableColFrame());
+  InitOffsets(aContainingBlockWritingMode, aContainingBlockISize,
+              mFrame->Type(), {}, aBorder, aPadding);
+}
+
+ReflowInput::ReflowInput(nsPresContext* aPresContext, nsIFrame* aFrame,
+                         gfxContext* aRenderingContext,
+                         const LogicalSize& aAvailableSpace, InitFlags aFlags)
+    : SizeComputationInput(aFrame, aRenderingContext),
+      mAvailableSize(aAvailableSpace) {
+  MOZ_ASSERT(aRenderingContext, "no rendering context");
+  MOZ_ASSERT(aPresContext, "no pres context");
+  MOZ_ASSERT(aFrame, "no frame");
+  MOZ_ASSERT(aPresContext == aFrame->PresContext(), "wrong pres context");
+
+  if (aFlags.contains(InitFlag::DummyParentReflowInput)) {
+    mFlags.mDummyParentReflowInput = true;
+  }
+  if (aFlags.contains(InitFlag::StaticPosIsCBOrigin)) {
+    mFlags.mStaticPosIsCBOrigin = true;
+  }
+
+  if (!aFlags.contains(InitFlag::CallerWillInit)) {
+    Init(aPresContext);
+  }
+  mFlags.mCanHaveClassABreakpoints = false;
+}
+
+static nsSize GetICBSize(const nsPresContext* aPresContext,
+                         const nsIFrame* aFrame) {
+  if (!aPresContext->IsPaginated()) {
+    return aPresContext->GetVisibleArea().Size();
+  }
+  for (const nsIFrame* f = aFrame->GetParent(); f; f = f->GetParent()) {
+    if (f->IsPageContentFrame()) {
+      return f->GetSize();
+    }
+  }
+  return aPresContext->GetPageSize();
+}
+
+ReflowInput::ReflowInput(nsPresContext* aPresContext,
+                         const ReflowInput& aParentReflowInput,
+                         nsIFrame* aFrame, const LogicalSize& aAvailableSpace,
+                         const Maybe<LogicalSize>& aContainingBlockSize,
+                         InitFlags aFlags,
+                         const StyleSizeOverrides& aSizeOverrides,
+                         ComputeSizeFlags aComputeSizeFlags,
+                         AnchorPosResolutionCache* aAnchorPosResolutionCache)
+    : SizeComputationInput(aFrame, aParentReflowInput.mRenderingContext,
+                           aAnchorPosResolutionCache),
+      mParentReflowInput(&aParentReflowInput),
+      mFloatManager(aParentReflowInput.mFloatManager),
+      mLineLayout(mFrame->IsLineParticipant() ? aParentReflowInput.mLineLayout
+                                              : nullptr),
+      mBreakType(aParentReflowInput.mBreakType),
+      mPercentBSizeObserver(
+          (aParentReflowInput.mPercentBSizeObserver &&
+           aParentReflowInput.mPercentBSizeObserver->NeedsToObserve(*this))
+              ? aParentReflowInput.mPercentBSizeObserver
+              : nullptr),
+      mFlags(aParentReflowInput.mFlags),
+      mStyleSizeOverrides(aSizeOverrides),
+      mComputeSizeFlags(aComputeSizeFlags),
+      mReflowDepth(aParentReflowInput.mReflowDepth + 1),
+      mAvailableSize(aAvailableSpace) {
+  MOZ_ASSERT(aPresContext, "no pres context");
+  MOZ_ASSERT(aFrame, "no frame");
+  MOZ_ASSERT(aPresContext == aFrame->PresContext(), "wrong pres context");
+  MOZ_ASSERT(!mFlags.mSpecialBSizeReflow || !aFrame->IsSubtreeDirty(),
+             "frame should be clean when getting special bsize reflow");
+
+  if (mWritingMode.IsOrthogonalTo(mParentReflowInput->GetWritingMode())) {
+
+    auto GetISizeConstraint = [this](const nsIFrame* aFrame,
+                                     bool* aFixed = nullptr) -> nscoord {
+      nscoord limit = NS_UNCONSTRAINEDSIZE;
+      const auto* pos = aFrame->StylePosition();
+      const auto anchorResolutionParams =
+          AnchorPosResolutionParams::From(aFrame);
+      if (auto size = nsLayoutUtils::GetAbsoluteSize(
+              *pos->ISize(mWritingMode, anchorResolutionParams))) {
+        limit = size.value();
+        if (aFixed) {
+          *aFixed = true;
+        }
+      } else if (auto maxSize = nsLayoutUtils::GetAbsoluteSize(
+                     *pos->MaxISize(mWritingMode, anchorResolutionParams))) {
+        limit = maxSize.value();
+      }
+      if (limit != NS_UNCONSTRAINEDSIZE) {
+        if (auto minSize = nsLayoutUtils::GetAbsoluteSize(
+                *pos->MinISize(mWritingMode, anchorResolutionParams))) {
+          limit = std::max(limit, minSize.value());
+        }
+      }
+      return limit;
+    };
+
+    const nsIFrame* cb = mFrame->GetContainingBlock();
+    bool isFixed = false;
+    nscoord cbLimit = aContainingBlockSize
+                          ? aContainingBlockSize->ISize(mWritingMode)
+                          : NS_UNCONSTRAINEDSIZE;
+    if (cbLimit != NS_UNCONSTRAINEDSIZE) {
+      isFixed = true;
+    } else {
+      cbLimit = GetISizeConstraint(cb, &isFixed);
+    }
+
+    if (isFixed) {
+      SetAvailableISize(cbLimit);
+    } else {
+
+      nscoord scLimit = NS_UNCONSTRAINEDSIZE;
+      if (!cb->IsScrollContainerFrame()) {
+        for (const nsIFrame* p = mFrame->GetParent(); p; p = p->GetParent()) {
+          if (p->IsScrollContainerFrame()) {
+            scLimit = GetISizeConstraint(p);
+            break;
+          }
+        }
+      }
+
+      LogicalSize icbSize(mWritingMode, GetICBSize(aPresContext, mFrame));
+      nscoord icbLimit = icbSize.ISize(mWritingMode);
+
+      SetAvailableISize(std::min(icbLimit, std::min(scLimit, cbLimit)));
+
+      mFrame->PresShell()->AddOrthogonalFlow(mFrame);
+    }
+  }
+
+  mFlags.mNextInFlowUntouched =
+      aParentReflowInput.mFlags.mNextInFlowUntouched &&
+      CheckNextInFlowParenthood(aFrame, aParentReflowInput.mFrame);
+  mFlags.mAssumingHScrollbar = mFlags.mAssumingVScrollbar = false;
+  mFlags.mIsColumnBalancing = false;
+  mFlags.mColumnSetWrapperHasNoBSizeLeft = false;
+  mFlags.mTreatBSizeAsIndefinite = false;
+  mFlags.mDummyParentReflowInput = false;
+  mFlags.mStaticPosIsCBOrigin = aFlags.contains(InitFlag::StaticPosIsCBOrigin);
+  mFlags.mIOffsetsNeedCSSAlign = mFlags.mBOffsetsNeedCSSAlign = false;
+
+  mFlags.mOrthogonalCellFinalReflow = false;
+
+  if (aParentReflowInput.mFlags.mCanHaveClassABreakpoints) {
+    MOZ_ASSERT(aPresContext->IsPaginated(),
+               "mCanHaveClassABreakpoints set during non-paginated reflow.");
+  }
+
+  {
+    switch (mFrame->Type()) {
+      case LayoutFrameType::PageContent:
+        MOZ_ASSERT(aPresContext->IsPaginated(),
+                   "nsPageContentFrame should not be in non-paginated reflow");
+        MOZ_ASSERT(!mFlags.mCanHaveClassABreakpoints,
+                   "mFlags.mCanHaveClassABreakpoints should have been "
+                   "initalized to false before we found nsPageContentFrame");
+        mFlags.mCanHaveClassABreakpoints = true;
+        break;
+      case LayoutFrameType::Block:          // FALLTHROUGH
+      case LayoutFrameType::Canvas:         // FALLTHROUGH
+      case LayoutFrameType::FlexContainer:  // FALLTHROUGH
+      case LayoutFrameType::GridContainer:
+        if (mFrame->HasAnyStateBits(NS_FRAME_OUT_OF_FLOW)) {
+          mFlags.mCanHaveClassABreakpoints = false;
+          break;
+        }
+        MOZ_ASSERT(mFlags.mCanHaveClassABreakpoints ==
+                   aParentReflowInput.mFlags.mCanHaveClassABreakpoints);
+        break;
+      default:
+        mFlags.mCanHaveClassABreakpoints = false;
+        break;
+    }
+  }
+
+  if (aFlags.contains(InitFlag::DummyParentReflowInput) ||
+      (mParentReflowInput->mFlags.mDummyParentReflowInput &&
+       mFrame->IsTableFrame())) {
+    mFlags.mDummyParentReflowInput = true;
+  }
+
+  if (!aFlags.contains(InitFlag::CallerWillInit)) {
+    Init(aPresContext, aContainingBlockSize);
+  }
+}
+
+template <typename SizeOrMaxSize>
+nscoord SizeComputationInput::ComputeISizeValue(
+    const LogicalSize& aContainingBlockSize, StyleBoxSizing aBoxSizing,
+    const SizeOrMaxSize& aSize) const {
+  WritingMode wm = GetWritingMode();
+  const auto borderPadding = ComputedLogicalBorderPadding(wm);
+  const auto margin = ComputedLogicalMargin(wm);
+  const LogicalSize contentEdgeToBoxSizing =
+      aBoxSizing == StyleBoxSizing::BorderBox ? borderPadding.Size(wm)
+                                              : LogicalSize(wm);
+  const nscoord boxSizingToMarginEdgeISize = borderPadding.IStartEnd(wm) +
+                                             margin.IStartEnd(wm) -
+                                             contentEdgeToBoxSizing.ISize(wm);
+
+  auto bSize = mFrame->StylePosition()->BSize(
+      wm, AnchorPosResolutionParams::From(mFrame, mAnchorPosResolutionCache));
+  if (bSize->BehavesLikeStretchOnBlockAxis()) {
+    if (NS_UNCONSTRAINEDSIZE == aContainingBlockSize.BSize(wm)) {
+      bSize = AnchorResolvedSizeHelper::Auto();
+    } else {
+      nscoord stretchBSize = nsLayoutUtils::ComputeStretchBSize(
+          aContainingBlockSize.BSize(wm), margin.BStartEnd(wm),
+          borderPadding.BStartEnd(wm), aBoxSizing);
+      bSize = AnchorResolvedSizeHelper::LengthPercentage(
+          StyleLengthPercentage::FromAppUnits(stretchBSize));
+    }
+  }
+
+  return mFrame
+      ->ComputeISizeValue(mRenderingContext, wm, aContainingBlockSize,
+                          contentEdgeToBoxSizing, boxSizingToMarginEdgeISize,
+                          aSize, *bSize, mFrame->GetAspectRatio())
+      .mISize;
+}
+
+template <typename SizeOrMaxSize>
+nscoord SizeComputationInput::ComputeBSizeValueHandlingStretch(
+    nscoord aContainingBlockBSize, StyleBoxSizing aBoxSizing,
+    const SizeOrMaxSize& aSize) const {
+  if (aSize.BehavesLikeStretchOnBlockAxis()) {
+    WritingMode wm = GetWritingMode();
+    return nsLayoutUtils::ComputeStretchContentBoxBSize(
+        aContainingBlockBSize, ComputedLogicalMargin(wm).Size(wm).BSize(wm),
+        ComputedLogicalBorderPadding(wm).Size(wm).BSize(wm));
+  }
+  return ComputeBSizeValue(aContainingBlockBSize, aBoxSizing,
+                           aSize.AsLengthPercentage());
+}
+
+nscoord SizeComputationInput::ComputeBSizeValue(
+    nscoord aContainingBlockBSize, StyleBoxSizing aBoxSizing,
+    const LengthPercentage& aSize) const {
+  WritingMode wm = GetWritingMode();
+  nscoord inside = 0;
+  if (aBoxSizing == StyleBoxSizing::BorderBox) {
+    inside = ComputedLogicalBorderPadding(wm).BStartEnd(wm);
+  }
+  return nsLayoutUtils::ComputeBSizeValue(aContainingBlockBSize, inside, aSize);
+}
+
+WritingMode ReflowInput::GetCBWritingMode() const {
+  return mCBReflowInput ? mCBReflowInput->GetWritingMode()
+                        : mFrame->GetContainingBlock()->GetWritingMode();
+}
+
+static nsSize BorderBoxSizeAsContainerIfConstrained(
+    WritingMode aWM, const LogicalSize& aContentBoxSize,
+    const LogicalMargin& aBorderPadding) {
+  LogicalSize size = aContentBoxSize;
+  if (size.ISize(aWM) == NS_UNCONSTRAINEDSIZE) {
+    size.ISize(aWM) = 0;
+  } else {
+    size.ISize(aWM) += aBorderPadding.IStartEnd(aWM);
+  }
+  if (size.BSize(aWM) == NS_UNCONSTRAINEDSIZE) {
+    size.BSize(aWM) = 0;
+  } else {
+    size.BSize(aWM) += aBorderPadding.BStartEnd(aWM);
+  }
+  return size.GetPhysicalSize(aWM);
+}
+
+nsSize ReflowInput::ComputedSizeAsContainerIfConstrained() const {
+  return BorderBoxSizeAsContainerIfConstrained(mWritingMode, ComputedSize(),
+                                               mComputedBorderPadding);
+}
+
+bool ReflowInput::ShouldReflowAllKids() const {
+  return mFrame->HasAnyStateBits(NS_FRAME_IS_DIRTY) || IsIResize() ||
+         (IsBResize() &&
+          mFrame->HasAnyStateBits(NS_FRAME_CONTAINS_RELATIVE_BSIZE)) ||
+         mFlags.mIsInLastColumnBalancingReflow;
+}
+
+void ReflowInput::SetComputedISize(nscoord aComputedISize,
+                                   ResetResizeFlags aFlags) {
+  NS_WARNING_ASSERTION(aComputedISize >= 0, "Invalid computed inline-size!");
+  if (ComputedISize() != aComputedISize) {
+    mComputedSize.ISize(mWritingMode) = std::max(0, aComputedISize);
+    if (aFlags == ResetResizeFlags::Yes) {
+      InitResizeFlags(mFrame->PresContext(), mFrame->Type());
+    }
+  }
+}
+
+void ReflowInput::SetComputedBSize(nscoord aComputedBSize,
+                                   ResetResizeFlags aFlags) {
+  NS_WARNING_ASSERTION(aComputedBSize >= 0, "Invalid computed block-size!");
+  if (ComputedBSize() != aComputedBSize) {
+    mComputedSize.BSize(mWritingMode) = std::max(0, aComputedBSize);
+    if (aFlags == ResetResizeFlags::Yes) {
+      InitResizeFlags(mFrame->PresContext(), mFrame->Type());
+    }
+  }
+}
+
+void ReflowInput::Init(nsPresContext* aPresContext,
+                       const Maybe<LogicalSize>& aContainingBlockSize,
+                       const Maybe<LogicalMargin>& aBorder,
+                       const Maybe<LogicalMargin>& aPadding) {
+  LAYOUT_WARN_IF_FALSE(AvailableISize() != NS_UNCONSTRAINEDSIZE,
+                       "have unconstrained inline-size; this should only "
+                       "result from very large sizes, not attempts at "
+                       "intrinsic inline-size calculation");
+
+  mStylePosition = mFrame->StylePosition();
+  mStyleDisplay = mFrame->StyleDisplay();
+  mStyleBorder = mFrame->StyleBorder();
+  mStyleMargin = mFrame->StyleMargin();
+
+  InitCBReflowInput();
+
+  LayoutFrameType type = mFrame->Type();
+  if (type == LayoutFrameType::Placeholder) {
+    mComputedSize.SizeTo(mWritingMode, 0, 0);
+    return;
+  }
+
+  mFlags.mIsReplaced = mFrame->IsReplaced();
+
+  InitConstraints(aPresContext, aContainingBlockSize, aBorder, aPadding, type);
+
+  InitResizeFlags(aPresContext, type);
+  InitDynamicReflowRoot();
+
+  nsIFrame* parent = mFrame->GetParent();
+  if (parent && parent->HasAnyStateBits(NS_FRAME_IN_CONSTRAINED_BSIZE) &&
+      !(parent->IsScrollContainerFrame() &&
+        parent->StyleDisplay()->mOverflowY != StyleOverflow::Hidden)) {
+    mFrame->AddStateBits(NS_FRAME_IN_CONSTRAINED_BSIZE);
+  } else if (type == LayoutFrameType::SVGForeignObject) {
+    mFrame->AddStateBits(NS_FRAME_IN_CONSTRAINED_BSIZE);
+  } else {
+    const auto anchorResolutionParams = AnchorPosResolutionParams::From(this);
+    const auto bSizeCoord =
+        mStylePosition->BSize(mWritingMode, anchorResolutionParams);
+    const auto maxBSizeCoord =
+        mStylePosition->MaxBSize(mWritingMode, anchorResolutionParams);
+    if ((!bSizeCoord->BehavesLikeInitialValueOnBlockAxis() ||
+         !maxBSizeCoord->BehavesLikeInitialValueOnBlockAxis()) &&
+        (mFrame->GetContent() && !(mFrame->GetContent()->IsAnyOfHTMLElements(
+                                     nsGkAtoms::body, nsGkAtoms::html)))) {
+      nsIFrame* containingBlk = mFrame;
+      while (containingBlk) {
+        const nsStylePosition* stylePos = containingBlk->StylePosition();
+        const auto containingBlkAnchorResolutionParams =
+            AnchorPosResolutionParams::From(containingBlk);
+        const auto bSizeCoord =
+            stylePos->BSize(mWritingMode, containingBlkAnchorResolutionParams);
+        const auto& maxBSizeCoord = stylePos->MaxBSize(
+            mWritingMode, containingBlkAnchorResolutionParams);
+        if ((bSizeCoord->IsLengthPercentage() && !bSizeCoord->HasPercent()) ||
+            (maxBSizeCoord->IsLengthPercentage() &&
+             !maxBSizeCoord->HasPercent())) {
+          mFrame->AddStateBits(NS_FRAME_IN_CONSTRAINED_BSIZE);
+          break;
+        } else if (bSizeCoord->HasPercent() || maxBSizeCoord->HasPercent()) {
+          if (!(containingBlk = containingBlk->GetContainingBlock())) {
+            mFrame->RemoveStateBits(NS_FRAME_IN_CONSTRAINED_BSIZE);
+            break;
+          }
+
+          continue;
+        } else {
+          mFrame->RemoveStateBits(NS_FRAME_IN_CONSTRAINED_BSIZE);
+          break;
+        }
+      }
+    } else {
+      mFrame->RemoveStateBits(NS_FRAME_IN_CONSTRAINED_BSIZE);
+    }
+  }
+
+  if (mParentReflowInput &&
+      mParentReflowInput->GetWritingMode().IsOrthogonalTo(mWritingMode)) {
+    if (type == LayoutFrameType::ColumnSet &&
+        mStylePosition
+            ->ISize(mWritingMode, AnchorPosResolutionParams::From(this))
+            ->IsAuto()) {
+      SetComputedISize(NS_UNCONSTRAINEDSIZE, ResetResizeFlags::No);
+    } else {
+      SetAvailableBSize(NS_UNCONSTRAINEDSIZE);
+    }
+  }
+
+  if (mFrame->GetContainSizeAxes().mBContained) {
+    SetAvailableBSize(NS_UNCONSTRAINEDSIZE);
+  }
+
+  LAYOUT_WARN_IF_FALSE(
+      (mStyleDisplay->IsInlineOutsideStyle() && !mFrame->IsReplaced()) ||
+          type == LayoutFrameType::Text ||
+          ComputedISize() != NS_UNCONSTRAINEDSIZE,
+      "have unconstrained inline-size; this should only "
+      "result from very large sizes, not attempts at "
+      "intrinsic inline-size calculation");
+}
+
+static bool MightBeContainingBlockFor(nsIFrame* aMaybeContainingBlock,
+                                      nsIFrame* aFrame,
+                                      const nsStyleDisplay* aStyleDisplay) {
+  if (aFrame->IsAbsolutelyPositioned(aStyleDisplay) &&
+      aMaybeContainingBlock == aFrame->GetParent()) {
+    return true;
+  }
+  return aMaybeContainingBlock->IsBlockContainer();
+}
+
+void ReflowInput::InitCBReflowInput() {
+  mCBReflowInput = mParentReflowInput;
+  if (!mCBReflowInput || mParentReflowInput->mFlags.mDummyParentReflowInput) {
+    return;
+  }
+  if (MightBeContainingBlockFor(mCBReflowInput->mFrame, mFrame,
+                                mStyleDisplay) &&
+      mCBReflowInput->mFrame == mFrame->GetContainingBlock(0, mStyleDisplay)) {
+    if (mFrame->IsTableFrame()) {
+      MOZ_ASSERT(mParentReflowInput->mCBReflowInput,
+                 "Inner table frames shouldn't be reflow roots");
+      mCBReflowInput = mParentReflowInput->mCBReflowInput;
+    }
+  } else if (mParentReflowInput->mCBReflowInput) {
+    mCBReflowInput = mParentReflowInput->mCBReflowInput;
+  }
+}
+
+static bool IsQuirkContainingBlockHeight(const ReflowInput* rs,
+                                         LayoutFrameType aFrameType) {
+  if (LayoutFrameType::Block == aFrameType ||
+      LayoutFrameType::ScrollContainer == aFrameType) {
+    if (NS_UNCONSTRAINEDSIZE == rs->ComputedHeight()) {
+      if (!rs->mFrame->IsAbsolutelyPositioned(rs->mStyleDisplay)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+void ReflowInput::InitResizeFlags(nsPresContext* aPresContext,
+                                  LayoutFrameType aFrameType) {
+  SetIResize(false);
+  SetBResize(false);
+  SetBResizeForPercentages(false);
+
+  const WritingMode wm = mWritingMode;  
+  bool isIResize =
+      mFrame->ISize(wm) !=
+          ComputedISize() + ComputedLogicalBorderPadding(wm).IStartEnd(wm) ||
+      mFrame->HasPaddingChange();
+
+  if (mFrame->HasAnyStateBits(NS_FRAME_FONT_INFLATION_FLOW_ROOT) &&
+      nsLayoutUtils::FontSizeInflationEnabled(aPresContext)) {
+    bool dirty = nsFontInflationData::UpdateFontInflationDataISizeFor(*this) &&
+                 !mFlags.mDummyParentReflowInput;
+
+    if (dirty || (!mFrame->GetParent() && isIResize)) {
+
+      if (mFrame->IsSVGForeignObjectFrame()) {
+        mFrame->AddStateBits(NS_FRAME_HAS_DIRTY_CHILDREN);
+        nsIFrame* kid = mFrame->PrincipalChildList().FirstChild();
+        if (kid) {
+          kid->MarkSubtreeDirty();
+        }
+      } else {
+        mFrame->MarkSubtreeDirty();
+      }
+
+
+
+
+      AutoTArray<nsIFrame*, 32> stack;
+      stack.AppendElement(mFrame);
+
+      do {
+        nsIFrame* f = stack.PopLastElement();
+        for (const auto& childList : f->ChildLists()) {
+          for (nsIFrame* kid : childList.mList) {
+            kid->MarkIntrinsicISizesDirty();
+            stack.AppendElement(kid);
+          }
+        }
+      } while (stack.Length() != 0);
+    }
+  }
+
+  SetIResize(!mFrame->HasAnyStateBits(NS_FRAME_IS_DIRTY) && isIResize);
+  const auto anchorResolutionParams =
+      AnchorPosOffsetResolutionParams::UseCBFrameSize(
+          AnchorPosResolutionParams::From(this));
+
+  const auto bSize =
+      mStylePosition->BSize(wm, anchorResolutionParams.mBaseParams);
+  const auto minBSize =
+      mStylePosition->MinBSize(wm, anchorResolutionParams.mBaseParams);
+  const auto maxBSize =
+      mStylePosition->MaxBSize(wm, anchorResolutionParams.mBaseParams);
+  if (mFrame->HasBSizeChange()) {
+    SetBResize(true);
+    SetBResizeForPercentages(true);
+  } else if (mCBReflowInput &&
+             mCBReflowInput->IsBResizeForPercentagesForWM(wm) &&
+             (bSize->HasPercent() || minBSize->HasPercent() ||
+              maxBSize->HasPercent())) {
+    SetBResize(true);
+    SetBResizeForPercentages(true);
+  } else if (aFrameType == LayoutFrameType::TableCell &&
+             (mFlags.mSpecialBSizeReflow ||
+              mFrame->FirstInFlow()->HasAnyStateBits(
+                  NS_TABLE_CELL_HAD_SPECIAL_REFLOW)) &&
+             mFrame->HasAnyStateBits(NS_FRAME_CONTAINS_RELATIVE_BSIZE)) {
+    SetBResize(true);
+    SetBResizeForPercentages(true);
+  } else if (mCBReflowInput && mFrame->IsBlockWrapper()) {
+    SetBResize(mCBReflowInput->IsBResizeForWM(wm));
+    SetBResizeForPercentages(mCBReflowInput->IsBResizeForPercentagesForWM(wm));
+  } else if (ComputedBSize() == NS_UNCONSTRAINEDSIZE) {
+    if (eCompatibility_NavQuirks == aPresContext->CompatibilityMode() &&
+        mCBReflowInput) {
+      SetBResize(mCBReflowInput->IsBResizeForWM(wm));
+    } else {
+      SetBResize(IsIResize());
+    }
+    SetBResize(IsBResize() || mFrame->IsSubtreeDirty() ||
+               (aFrameType == LayoutFrameType::Table &&
+                mParentReflowInput->IsBResize()));
+  } else {
+    SetBResize(mFrame->BSize(wm) !=
+               ComputedBSize() +
+                   ComputedLogicalBorderPadding(wm).BStartEnd(wm));
+  }
+
+  bool dependsOnCBBSize =
+      (nsStylePosition::BSizeDependsOnContainer(bSize) &&
+       !bSize->IsAuto()) ||
+      nsStylePosition::MinBSizeDependsOnContainer(minBSize) ||
+      nsStylePosition::MaxBSizeDependsOnContainer(maxBSize) ||
+      mStylePosition
+          ->GetAnchorResolvedInset(LogicalSide::BStart, wm,
+                                   anchorResolutionParams)
+          ->HasPercent() ||
+      !mStylePosition
+           ->GetAnchorResolvedInset(LogicalSide::BEnd, wm,
+                                    anchorResolutionParams)
+           ->IsAuto() ||
+      (mCBReflowInput && mCBReflowInput->GetWritingMode().IsOrthogonalTo(wm));
+
+  if (mFrame->IsFlexItem() &&
+      !nsFlexContainerFrame::IsItemInlineAxisMainAxis(mFrame)) {
+    const auto& flexBasis = mStylePosition->mFlexBasis;
+    dependsOnCBBSize |= (flexBasis.IsSize() && flexBasis.AsSize().HasPercent());
+  }
+
+  if (!IsBResize() && mCBReflowInput &&
+      (mCBReflowInput->mFrame->IsTableCellFrame() ||
+       mCBReflowInput->mFlags.mHeightDependsOnAncestorCell) &&
+      !mCBReflowInput->mFlags.mSpecialBSizeReflow && dependsOnCBBSize) {
+    SetBResize(true);
+    mFlags.mHeightDependsOnAncestorCell = true;
+  }
+
+
+  if (dependsOnCBBSize && mCBReflowInput) {
+    const ReflowInput* rs = this;
+    bool hitCBReflowInput = false;
+    do {
+      rs = rs->mParentReflowInput;
+      if (!rs) {
+        break;
+      }
+
+      if (rs->mFrame->HasAnyStateBits(NS_FRAME_CONTAINS_RELATIVE_BSIZE)) {
+        break;  
+      }
+      rs->mFrame->AddStateBits(NS_FRAME_CONTAINS_RELATIVE_BSIZE);
+
+      if (rs == mCBReflowInput) {
+        hitCBReflowInput = true;
+      }
+
+    } while (!hitCBReflowInput ||
+             (eCompatibility_NavQuirks == aPresContext->CompatibilityMode() &&
+              !IsQuirkContainingBlockHeight(rs, rs->mFrame->Type())));
+  }
+  if (mFrame->HasAnyStateBits(NS_FRAME_IS_DIRTY)) {
+    mFrame->RemoveStateBits(NS_FRAME_CONTAINS_RELATIVE_BSIZE);
+  }
+}
+
+void ReflowInput::InitDynamicReflowRoot() {
+  if (mFrame->CanBeDynamicReflowRoot()) {
+    mFrame->AddStateBits(NS_FRAME_DYNAMIC_REFLOW_ROOT);
+  } else {
+    mFrame->RemoveStateBits(NS_FRAME_DYNAMIC_REFLOW_ROOT);
+  }
+}
+
+bool ReflowInput::ShouldApplyAutomaticMinimumOnBlockAxis() const {
+  MOZ_ASSERT(!mFrame->HasReplacedSizing());
+  return mFlags.mIsBSizeSetByAspectRatio &&
+         !mStyleDisplay->IsScrollableOverflow() &&
+         mStylePosition
+             ->MinBSize(GetWritingMode(), AnchorPosResolutionParams::From(this))
+             ->IsAuto() &&
+         !mFrame->GetContainSizeAxes().mBContained;
+}
+
+bool ReflowInput::IsInFragmentedContext() const {
+  return AvailableBSize() != NS_UNCONSTRAINEDSIZE || mFrame->GetPrevInFlow();
+}
+
+LogicalMargin ReflowInput::ComputeRelativeOffsets(WritingMode aWM,
+                                                  nsIFrame* aFrame,
+                                                  const LogicalSize& aCBSize) {
+  LogicalMargin offsets(aWM);
+  const nsStylePosition* position = aFrame->StylePosition();
+  const auto anchorResolutionParams =
+      AnchorPosOffsetResolutionParams::UseCBFrameSize(
+          AnchorPosResolutionParams::From(aFrame));
+
+  const auto inlineStart = position->GetAnchorResolvedInset(
+      LogicalSide::IStart, aWM, anchorResolutionParams);
+  const auto inlineEnd = position->GetAnchorResolvedInset(
+      LogicalSide::IEnd, aWM, anchorResolutionParams);
+  bool inlineStartIsAuto = inlineStart->IsAuto();
+  bool inlineEndIsAuto = inlineEnd->IsAuto();
+
+  if (!inlineStartIsAuto && !inlineEndIsAuto) {
+    inlineEndIsAuto = true;
+  }
+
+  if (inlineStartIsAuto) {
+    if (inlineEndIsAuto) {
+      offsets.IStart(aWM) = offsets.IEnd(aWM) = 0;
+    } else {
+      offsets.IEnd(aWM) = inlineEnd->IsAuto()
+                              ? 0
+                              : nsLayoutUtils::ComputeCBDependentValue(
+                                    aCBSize.ISize(aWM), inlineEnd);
+
+      offsets.IStart(aWM) = -offsets.IEnd(aWM);
+    }
+
+  } else {
+    NS_ASSERTION(inlineEndIsAuto, "unexpected specified constraint");
+
+    offsets.IStart(aWM) =
+        nsLayoutUtils::ComputeCBDependentValue(aCBSize.ISize(aWM), inlineStart);
+
+    offsets.IEnd(aWM) = -offsets.IStart(aWM);
+  }
+
+  const auto blockStart = position->GetAnchorResolvedInset(
+      LogicalSide::BStart, aWM, anchorResolutionParams);
+  const auto blockEnd = position->GetAnchorResolvedInset(
+      LogicalSide::BEnd, aWM, anchorResolutionParams);
+  bool blockStartIsAuto = blockStart->IsAuto();
+  bool blockEndIsAuto = blockEnd->IsAuto();
+
+  if (NS_UNCONSTRAINEDSIZE == aCBSize.BSize(aWM)) {
+    if (blockStart->HasPercent()) {
+      blockStartIsAuto = true;
+    }
+    if (blockEnd->HasPercent()) {
+      blockEndIsAuto = true;
+    }
+  }
+
+  if (!blockStartIsAuto && !blockEndIsAuto) {
+    blockEndIsAuto = true;
+  }
+
+  if (blockStartIsAuto) {
+    if (blockEndIsAuto) {
+      offsets.BStart(aWM) = offsets.BEnd(aWM) = 0;
+    } else {
+      offsets.BEnd(aWM) = blockEnd->IsAuto()
+                              ? 0
+                              : nsLayoutUtils::ComputeCBDependentValue(
+                                    aCBSize.BSize(aWM), blockEnd);
+
+      offsets.BStart(aWM) = -offsets.BEnd(aWM);
+    }
+
+  } else {
+    NS_ASSERTION(blockEndIsAuto, "unexpected specified constraint");
+
+    offsets.BStart(aWM) =
+        nsLayoutUtils::ComputeCBDependentValue(aCBSize.BSize(aWM), blockStart);
+
+    offsets.BEnd(aWM) = -offsets.BStart(aWM);
+  }
+
+  const nsMargin physicalOffsets = offsets.GetPhysicalMargin(aWM);
+  if (nsMargin* prop =
+          aFrame->GetProperty(nsIFrame::ComputedOffsetProperty())) {
+    *prop = physicalOffsets;
+  } else {
+    aFrame->AddProperty(nsIFrame::ComputedOffsetProperty(),
+                        new nsMargin(physicalOffsets));
+  }
+
+  NS_ASSERTION(offsets.IStart(aWM) == -offsets.IEnd(aWM) &&
+                   offsets.BStart(aWM) == -offsets.BEnd(aWM),
+               "ComputeRelativeOffsets should return valid results!");
+
+  return offsets;
+}
+
+void ReflowInput::ApplyRelativePositioning(nsIFrame* aFrame,
+                                           const nsMargin& aComputedOffsets,
+                                           nsPoint* aPosition) {
+  if (!aFrame->IsRelativelyOrStickyPositioned()) {
+    NS_ASSERTION(!aFrame->HasProperty(nsIFrame::NormalPositionProperty()),
+                 "We assume that changing the 'position' property causes "
+                 "frame reconstruction.  If that ever changes, this code "
+                 "should call "
+                 "aFrame->RemoveProperty(nsIFrame::NormalPositionProperty())");
+    return;
+  }
+
+  aFrame->SetProperty(nsIFrame::NormalPositionProperty(), *aPosition);
+
+  const nsStyleDisplay* display = aFrame->StyleDisplay();
+  if (StylePositionProperty::Relative == display->mPosition) {
+    *aPosition += nsPoint(aComputedOffsets.left, aComputedOffsets.top);
+  }
+}
+
+void ReflowInput::ComputeAbsPosInlineAutoMargin(nscoord aAvailMarginSpace,
+                                                WritingMode aContainingBlockWM,
+                                                bool aIsMarginIStartAuto,
+                                                bool aIsMarginIEndAuto,
+                                                LogicalMargin& aMargin) {
+  if (aIsMarginIStartAuto) {
+    if (aIsMarginIEndAuto) {
+      if (aAvailMarginSpace < 0) {
+        aMargin.IEnd(aContainingBlockWM) = aAvailMarginSpace;
+      } else {
+        aMargin.IStart(aContainingBlockWM) = aAvailMarginSpace / 2;
+        aMargin.IEnd(aContainingBlockWM) =
+            aAvailMarginSpace - aMargin.IStart(aContainingBlockWM);
+      }
+    } else {
+      aMargin.IStart(aContainingBlockWM) = aAvailMarginSpace;
+    }
+  } else {
+    if (aIsMarginIEndAuto) {
+      aMargin.IEnd(aContainingBlockWM) = aAvailMarginSpace;
+    }
+  }
+}
+
+void ReflowInput::ComputeAbsPosBlockAutoMargin(nscoord aAvailMarginSpace,
+                                               WritingMode aContainingBlockWM,
+                                               bool aIsMarginBStartAuto,
+                                               bool aIsMarginBEndAuto,
+                                               LogicalMargin& aMargin) {
+  if (aIsMarginBStartAuto) {
+    if (aIsMarginBEndAuto) {
+      aMargin.BStart(aContainingBlockWM) = aAvailMarginSpace / 2;
+      aMargin.BEnd(aContainingBlockWM) =
+          aAvailMarginSpace - aMargin.BStart(aContainingBlockWM);
+    } else {
+      aMargin.BStart(aContainingBlockWM) = aAvailMarginSpace;
+    }
+  } else {
+    if (aIsMarginBEndAuto) {
+      aMargin.BEnd(aContainingBlockWM) = aAvailMarginSpace;
+    }
+  }
+}
+
+void ReflowInput::ApplyRelativePositioning(
+    nsIFrame* aFrame, WritingMode aWritingMode,
+    const LogicalMargin& aComputedOffsets, LogicalPoint* aPosition,
+    const nsSize& aContainerSize) {
+  nsSize frameSize = aFrame->GetSize();
+  nsPoint pos =
+      aPosition->GetPhysicalPoint(aWritingMode, aContainerSize - frameSize);
+  ApplyRelativePositioning(
+      aFrame, aComputedOffsets.GetPhysicalMargin(aWritingMode), &pos);
+  *aPosition = LogicalPoint(aWritingMode, pos, aContainerSize - frameSize);
+}
+
+ReflowInput::HypotheticalBoxContainerInfo
+ReflowInput::GetHypotheticalBoxContainer(const nsIFrame* aFrame) const {
+  nsIFrame* cb = aFrame->GetContainingBlock();
+  NS_ASSERTION(cb != mFrame, "How did that happen?");
+
+  const ReflowInput* ri = nullptr;
+  if (cb->HasAnyStateBits(NS_FRAME_IN_REFLOW)) {
+    ri = mParentReflowInput;
+    while (ri && ri->mFrame != cb) {
+      ri = ri->mParentReflowInput;
+    }
+  }
+
+  const WritingMode wm = cb->GetWritingMode();
+  if (ri) {
+    return {cb, ri->ComputedLogicalBorderPadding(wm), ri->ComputedSize(wm)};
+  }
+
+  NS_ASSERTION(!cb->HasAnyStateBits(NS_FRAME_IN_REFLOW),
+               "cb shouldn't be in reflow; we'll lie if it is");
+  return {cb, cb->GetLogicalUsedBorderAndPadding(wm), cb->ContentSize(wm)};
+}
+
+struct nsHypotheticalPosition {
+  nscoord mIStart = 0;
+  nscoord mBStart = 0;
+  WritingMode mWritingMode;
+};
+
+void ReflowInput::CalculateBorderPaddingMargin(
+    LogicalAxis aAxis, nscoord aContainingBlockSize, nscoord* aInsideBoxSizing,
+    nscoord* aOutsideBoxSizing) const {
+  WritingMode wm = GetWritingMode();
+  Side startSide = wm.PhysicalSide(MakeLogicalSide(aAxis, LogicalEdge::Start));
+  Side endSide = wm.PhysicalSide(MakeLogicalSide(aAxis, LogicalEdge::End));
+
+  nsMargin styleBorder = mStyleBorder->GetComputedBorder();
+  nscoord borderStartEnd =
+      styleBorder.Side(startSide) + styleBorder.Side(endSide);
+
+  nscoord paddingStartEnd, marginStartEnd;
+
+  const auto* stylePadding = mFrame->StylePadding();
+  if (nsMargin padding; stylePadding->GetPadding(padding)) {
+    paddingStartEnd = padding.Side(startSide) + padding.Side(endSide);
+  } else {
+    const nscoord start = nsLayoutUtils::ComputeCBDependentValue(
+        aContainingBlockSize, stylePadding->mPadding.Get(startSide));
+    const nscoord end = nsLayoutUtils::ComputeCBDependentValue(
+        aContainingBlockSize, stylePadding->mPadding.Get(endSide));
+    paddingStartEnd = start + end;
+  }
+
+  if (nsMargin margin; mStyleMargin->GetMargin(margin)) {
+    marginStartEnd = margin.Side(startSide) + margin.Side(endSide);
+  } else {
+    const auto anchorResolutionParams = AnchorPosResolutionParams::From(this);
+    const nscoord start = nsLayoutUtils::ComputeCBDependentValue(
+        aContainingBlockSize,
+        mStyleMargin->GetMargin(startSide, anchorResolutionParams));
+    const nscoord end = nsLayoutUtils::ComputeCBDependentValue(
+        aContainingBlockSize,
+        mStyleMargin->GetMargin(endSide, anchorResolutionParams));
+    marginStartEnd = start + end;
+  }
+
+  nscoord outside = paddingStartEnd + borderStartEnd + marginStartEnd;
+  nscoord inside = 0;
+  if (mStylePosition->mBoxSizing == StyleBoxSizing::BorderBox) {
+    inside = borderStartEnd + paddingStartEnd;
+  }
+  outside -= inside;
+  *aInsideBoxSizing = inside;
+  *aOutsideBoxSizing = outside;
+}
+
+static bool AreAllEarlierInFlowFramesEmpty(nsIFrame* aFrame,
+                                           nsIFrame* aDescendant,
+                                           bool* aFound) {
+  if (aFrame == aDescendant) {
+    *aFound = true;
+    return true;
+  }
+  if (aFrame->IsPlaceholderFrame()) {
+    auto ph = static_cast<nsPlaceholderFrame*>(aFrame);
+    MOZ_ASSERT(ph->IsSelfEmpty() && ph->PrincipalChildList().IsEmpty());
+    ph->SetLineIsEmptySoFar(true);
+  } else {
+    if (!aFrame->IsSelfEmpty()) {
+      *aFound = false;
+      return false;
+    }
+    for (nsIFrame* f : aFrame->PrincipalChildList()) {
+      bool allEmpty = AreAllEarlierInFlowFramesEmpty(f, aDescendant, aFound);
+      if (*aFound || !allEmpty) {
+        return allEmpty;
+      }
+    }
+  }
+  *aFound = false;
+  return true;
+}
+
+void ReflowInput::CalculateHypotheticalPosition(
+    nsPlaceholderFrame* aPlaceholderFrame, const ReflowInput* aCBReflowInput,
+    const LogicalSize& aCBPaddingBoxSize,
+    nsHypotheticalPosition& aHypotheticalPos) const {
+  NS_ASSERTION(mStyleDisplay->mOriginalDisplay != StyleDisplay::None,
+               "mOriginalDisplay has not been properly initialized");
+
+  WritingMode cbwm = aCBReflowInput->GetWritingMode();
+  const auto [blockContainer, blockContainerBP, blockContainerContentBoxSize] =
+      GetHypotheticalBoxContainer(aPlaceholderFrame);
+  WritingMode wm = blockContainer->GetWritingMode();
+  const nscoord blockContainerContentIStart = blockContainerBP.IStart(wm);
+
+  const auto anchorResolutionParams = AnchorPosResolutionParams::From(this);
+  const auto styleISize = mStylePosition->ISize(wm, anchorResolutionParams);
+  bool isAutoISize = styleISize->IsAuto();
+
+  Maybe<nsSize> intrinsicSize;
+  if (mFlags.mIsReplaced && isAutoISize) {
+    intrinsicSize = mFrame->GetIntrinsicSize().ToSize();
+  }
+
+  Maybe<nscoord> boxISize;
+  if (mStyleDisplay->IsOriginalDisplayInlineOutside() && !mFlags.mIsReplaced) {
+  } else {
+
+    nscoord contentEdgeToBoxSizingISize, boxSizingToMarginEdgeISize;
+    CalculateBorderPaddingMargin(
+        LogicalAxis::Inline, blockContainerContentBoxSize.ISize(wm),
+        &contentEdgeToBoxSizingISize, &boxSizingToMarginEdgeISize);
+
+    if (mFlags.mIsReplaced && isAutoISize) {
+      if (intrinsicSize) {
+        boxISize.emplace(LogicalSize(wm, *intrinsicSize).ISize(wm) +
+                         contentEdgeToBoxSizingISize +
+                         boxSizingToMarginEdgeISize);
+      }
+    } else if (isAutoISize) {
+      boxISize.emplace(blockContainerContentBoxSize.ISize(wm));
+    } else {
+      nscoord contentEdgeToBoxSizingBSize, dummy;
+      CalculateBorderPaddingMargin(LogicalAxis::Block,
+                                   blockContainerContentBoxSize.ISize(wm),
+                                   &contentEdgeToBoxSizingBSize, &dummy);
+
+      const auto contentISize =
+          mFrame
+              ->ComputeISizeValue(
+                  mRenderingContext, wm, blockContainerContentBoxSize,
+                  LogicalSize(wm, contentEdgeToBoxSizingISize,
+                              contentEdgeToBoxSizingBSize),
+                  boxSizingToMarginEdgeISize, *styleISize,
+                  *mStylePosition->BSize(wm, anchorResolutionParams),
+                  mFrame->GetAspectRatio())
+              .mISize;
+      boxISize.emplace(contentISize + contentEdgeToBoxSizingISize +
+                       boxSizingToMarginEdgeISize);
+    }
+  }
+
+  const nsSize blockContainerSize = BorderBoxSizeAsContainerIfConstrained(
+      wm, blockContainerContentBoxSize, blockContainerBP);
+  LogicalPoint placeholderOffset(
+      wm, aPlaceholderFrame->GetOffsetToIgnoringScrolling(blockContainer),
+      blockContainerSize);
+
+  nsBlockFrame* blockFrame =
+      do_QueryFrame(blockContainer->GetContentInsertionFrame());
+  if (blockFrame) {
+    const nsSize nullContainerSize;
+    LogicalPoint blockOffset(
+        wm, blockFrame->GetOffsetToIgnoringScrolling(blockContainer),
+        nullContainerSize);
+    bool isValid;
+    nsBlockInFlowLineIterator iter(blockFrame, aPlaceholderFrame, &isValid);
+    if (!isValid) {
+      aHypotheticalPos.mBStart = placeholderOffset.B(wm);
+    } else {
+      NS_ASSERTION(iter.GetContainer() == blockFrame,
+                   "Found placeholder in wrong block!");
+      nsBlockFrame::LineIterator lineBox = iter.GetLine();
+
+      LogicalRect lineBounds = lineBox->GetBounds().ConvertTo(
+          wm, lineBox->mWritingMode, lineBox->mContainerSize);
+      if (mStyleDisplay->IsOriginalDisplayInlineOutside()) {
+        aHypotheticalPos.mBStart = lineBounds.BStart(wm) + blockOffset.B(wm);
+      } else {
+        if (lineBox != iter.End()) {
+          nsIFrame* firstFrame = lineBox->mFirstChild;
+          bool allEmpty = false;
+          if (firstFrame == aPlaceholderFrame) {
+            aPlaceholderFrame->SetLineIsEmptySoFar(true);
+            allEmpty = true;
+          } else {
+            auto* prev = aPlaceholderFrame->GetPrevSibling();
+            if (prev && prev->IsPlaceholderFrame()) {
+              auto* ph = static_cast<nsPlaceholderFrame*>(prev);
+              if (ph->GetLineIsEmptySoFar(&allEmpty)) {
+                aPlaceholderFrame->SetLineIsEmptySoFar(allEmpty);
+              }
+            }
+          }
+          if (!allEmpty) {
+            bool found = false;
+            while (firstFrame) {  
+              allEmpty = AreAllEarlierInFlowFramesEmpty(
+                  firstFrame, aPlaceholderFrame, &found);
+              if (found || !allEmpty) {
+                break;
+              }
+              firstFrame = firstFrame->GetNextSibling();
+            }
+            aPlaceholderFrame->SetLineIsEmptySoFar(allEmpty);
+          }
+          NS_ASSERTION(firstFrame, "Couldn't find placeholder!");
+
+          if (allEmpty) {
+            aHypotheticalPos.mBStart =
+                lineBounds.BStart(wm) + blockOffset.B(wm);
+          } else {
+            aHypotheticalPos.mBStart = lineBounds.BEnd(wm) + blockOffset.B(wm);
+          }
+        } else {
+          aHypotheticalPos.mBStart = placeholderOffset.B(wm);
+        }
+      }
+    }
+  } else {
+    aHypotheticalPos.mBStart = placeholderOffset.B(wm);
+  }
+
+  if (mStyleDisplay->IsOriginalDisplayInlineOutside() ||
+      mFlags.mIOffsetsNeedCSSAlign) {
+    aHypotheticalPos.mIStart = placeholderOffset.I(wm);
+  } else {
+    aHypotheticalPos.mIStart = blockContainerContentIStart;
+  }
+
+  const nsIFrame* cbFrame = aCBReflowInput->mFrame;
+  nsPoint cbOffset = blockContainer->GetOffsetToIgnoringScrolling(cbFrame);
+  nsSize cbSize;
+  if (cbFrame->IsViewportFrame()) {
+    if (ScrollContainerFrame* sf =
+            do_QueryFrame(cbFrame->PrincipalChildList().FirstChild())) {
+      const nsMargin scrollbarSizes = sf->GetActualScrollbarSizes();
+      cbOffset.MoveBy(-scrollbarSizes.left, -scrollbarSizes.top);
+    }
+
+    cbSize = aCBPaddingBoxSize.GetPhysicalSize(cbwm);
+  } else {
+    cbSize = aCBReflowInput->ComputedSizeAsContainerIfConstrained();
+  }
+
+  LogicalPoint logCBOffs(wm, cbOffset, cbSize - blockContainerSize);
+  aHypotheticalPos.mIStart += logCBOffs.I(wm);
+  aHypotheticalPos.mBStart += logCBOffs.B(wm);
+
+  const bool hypotheticalPosWillUseCbwm =
+      cbwm.GetBlockDir() != wm.GetBlockDir();
+  const LogicalMargin border = aCBReflowInput->ComputedLogicalBorder(wm);
+  if (hypotheticalPosWillUseCbwm &&
+      !wm.ParallelAxisStartsOnSameSide(LogicalAxis::Inline, cbwm)) {
+    aHypotheticalPos.mIStart += border.IEnd(wm);
+  } else {
+    aHypotheticalPos.mIStart -= border.IStart(wm);
+  }
+
+  if (hypotheticalPosWillUseCbwm &&
+      !wm.ParallelAxisStartsOnSameSide(LogicalAxis::Block, cbwm)) {
+    aHypotheticalPos.mBStart += border.BEnd(wm);
+  } else {
+    aHypotheticalPos.mBStart -= border.BStart(wm);
+  }
+
+  if (hypotheticalPosWillUseCbwm) {
+
+
+    nscoord insideBoxSizing, outsideBoxSizing;
+    CalculateBorderPaddingMargin(LogicalAxis::Block,
+                                 blockContainerContentBoxSize.BSize(wm),
+                                 &insideBoxSizing, &outsideBoxSizing);
+
+    nscoord boxBSize;
+    const auto styleBSize = mStylePosition->BSize(wm, anchorResolutionParams);
+    const bool isAutoBSize = nsLayoutUtils::IsAutoBSize(
+        *styleBSize, blockContainerContentBoxSize.BSize(wm));
+    if (isAutoBSize) {
+      if (mFlags.mIsReplaced && intrinsicSize) {
+        boxBSize = LogicalSize(wm, *intrinsicSize).BSize(wm) +
+                   outsideBoxSizing + insideBoxSizing;
+      } else {
+        boxBSize = 0;
+      }
+    } else if (styleBSize->BehavesLikeStretchOnBlockAxis()) {
+      MOZ_ASSERT(blockContainerContentBoxSize.BSize(wm) != NS_UNCONSTRAINEDSIZE,
+                 "If we're 'stretch' with unconstrained size, isAutoBSize "
+                 "should be true which should make us skip this code");
+      boxBSize = nsLayoutUtils::ComputeStretchContentBoxBSize(
+          blockContainerContentBoxSize.BSize(wm), outsideBoxSizing,
+          insideBoxSizing);
+    } else {
+      boxBSize = nsLayoutUtils::ComputeBSizeValue(
+                     blockContainerContentBoxSize.BSize(wm), insideBoxSizing,
+                     styleBSize->AsLengthPercentage()) +
+                 insideBoxSizing + outsideBoxSizing;
+    }
+
+    LogicalSize boxSize(wm, boxISize.valueOr(0), boxBSize);
+
+    LogicalPoint origin(wm, aHypotheticalPos.mIStart, aHypotheticalPos.mBStart);
+    origin = origin.ConvertRectOriginTo(cbwm, wm, boxSize.GetPhysicalSize(wm),
+                                        cbSize);
+
+    aHypotheticalPos.mIStart = origin.I(cbwm);
+    aHypotheticalPos.mBStart = origin.B(cbwm);
+    aHypotheticalPos.mWritingMode = cbwm;
+  } else {
+    aHypotheticalPos.mWritingMode = wm;
+  }
+}
+
+void ReflowInput::InitAbsoluteConstraints(const ReflowInput* aCBReflowInput,
+                                          const LogicalSize& aCBSize) {
+  WritingMode wm = GetWritingMode();
+  WritingMode cbwm = aCBReflowInput->GetWritingMode();
+  NS_WARNING_ASSERTION(aCBSize.BSize(cbwm) != NS_UNCONSTRAINEDSIZE,
+                       "containing block bsize must be constrained");
+
+  NS_ASSERTION(!mFrame->IsTableFrame(),
+               "InitAbsoluteConstraints should not be called on table frames");
+  MOZ_ASSERT(
+      mFrame->IsAbsolutelyPositioned(mStyleDisplay),
+      "InitAbsoluteConstraints should be called on abspos or fixedpos frames!");
+
+  const auto anchorResolutionParams =
+      AnchorPosOffsetResolutionParams::ExplicitCBFrameSize(
+          AnchorPosResolutionParams::From(this), &aCBSize);
+  const auto iStartOffset = mStylePosition->GetAnchorResolvedInset(
+      LogicalSide::IStart, cbwm, anchorResolutionParams);
+  const auto iEndOffset = mStylePosition->GetAnchorResolvedInset(
+      LogicalSide::IEnd, cbwm, anchorResolutionParams);
+  const auto bStartOffset = mStylePosition->GetAnchorResolvedInset(
+      LogicalSide::BStart, cbwm, anchorResolutionParams);
+  const auto bEndOffset = mStylePosition->GetAnchorResolvedInset(
+      LogicalSide::BEnd, cbwm, anchorResolutionParams);
+  bool iStartIsAuto = iStartOffset->IsAuto();
+  bool iEndIsAuto = iEndOffset->IsAuto();
+  bool bStartIsAuto = bStartOffset->IsAuto();
+  bool bEndIsAuto = bEndOffset->IsAuto();
+
+  nsHypotheticalPosition hypotheticalPos;
+  if ((iStartIsAuto && iEndIsAuto) || (bStartIsAuto && bEndIsAuto)) {
+    nsPlaceholderFrame* placeholderFrame = mFrame->GetPlaceholderFrame();
+    MOZ_ASSERT(placeholderFrame, "no placeholder frame");
+    nsIFrame* placeholderParent = placeholderFrame->GetParent();
+    MOZ_ASSERT(placeholderParent, "shouldn't have unparented placeholders");
+
+    if (placeholderFrame->HasAnyStateBits(
+            PLACEHOLDER_STATICPOS_NEEDS_CSSALIGN)) {
+      MOZ_ASSERT(placeholderParent->IsFlexOrGridContainer(),
+                 "This flag should only be set on grid/flex children");
+      mFlags.mIOffsetsNeedCSSAlign = (iStartIsAuto && iEndIsAuto);
+      mFlags.mBOffsetsNeedCSSAlign = (bStartIsAuto && bEndIsAuto);
+    }
+
+    if (mFlags.mStaticPosIsCBOrigin) {
+      hypotheticalPos.mWritingMode = cbwm;
+      if (placeholderParent->IsGridContainerFrame() &&
+          placeholderParent->HasAnyStateBits(NS_STATE_GRID_IS_COL_MASONRY |
+                                             NS_STATE_GRID_IS_ROW_MASONRY)) {
+        auto cbsz = aCBSize.GetPhysicalSize(cbwm);
+        LogicalPoint pos = placeholderFrame->GetLogicalPosition(cbwm, cbsz);
+        if (placeholderParent->HasAnyStateBits(NS_STATE_GRID_IS_COL_MASONRY)) {
+          mFlags.mIOffsetsNeedCSSAlign = false;
+          hypotheticalPos.mIStart = pos.I(cbwm);
+        } else {
+          mFlags.mBOffsetsNeedCSSAlign = false;
+          hypotheticalPos.mBStart = pos.B(cbwm);
+        }
+      }
+    } else {
+      CalculateHypotheticalPosition(placeholderFrame, aCBReflowInput, aCBSize,
+                                    hypotheticalPos);
+      if (aCBReflowInput->mFrame->IsGridContainerFrame()) {
+        nsRect cb = nsGridContainerFrame::GridItemCB(mFrame);
+        nscoord left(0);
+        nscoord right(0);
+        if (cbwm.IsBidiLTR()) {
+          left = cb.X();
+        } else {
+          right = aCBReflowInput->ComputedWidth() +
+                  aCBReflowInput->ComputedPhysicalPadding().LeftRight() -
+                  cb.XMost();
+        }
+        LogicalMargin offsets(cbwm, nsMargin(cb.Y(), right, nscoord(0), left));
+        hypotheticalPos.mIStart -= offsets.IStart(cbwm);
+        hypotheticalPos.mBStart -= offsets.BStart(cbwm);
+      }
+    }
+  }
+
+  LogicalMargin offsets(cbwm);
+
+  if (iStartIsAuto) {
+    offsets.IStart(cbwm) = 0;
+  } else {
+    offsets.IStart(cbwm) = nsLayoutUtils::ComputeCBDependentValue(
+        aCBSize.ISize(cbwm), iStartOffset);
+  }
+  if (iEndIsAuto) {
+    offsets.IEnd(cbwm) = 0;
+  } else {
+    offsets.IEnd(cbwm) =
+        nsLayoutUtils::ComputeCBDependentValue(aCBSize.ISize(cbwm), iEndOffset);
+  }
+
+  if (iStartIsAuto && iEndIsAuto) {
+    if (cbwm.IsInlineReversed() !=
+        hypotheticalPos.mWritingMode.IsInlineReversed()) {
+      offsets.IEnd(cbwm) = hypotheticalPos.mIStart;
+      iEndIsAuto = false;
+    } else {
+      offsets.IStart(cbwm) = hypotheticalPos.mIStart;
+      iStartIsAuto = false;
+    }
+  }
+
+  if (bStartIsAuto) {
+    offsets.BStart(cbwm) = 0;
+  } else {
+    offsets.BStart(cbwm) = nsLayoutUtils::ComputeCBDependentValue(
+        aCBSize.BSize(cbwm), bStartOffset);
+  }
+  if (bEndIsAuto) {
+    offsets.BEnd(cbwm) = 0;
+  } else {
+    offsets.BEnd(cbwm) =
+        nsLayoutUtils::ComputeCBDependentValue(aCBSize.BSize(cbwm), bEndOffset);
+  }
+
+  if (bStartIsAuto && bEndIsAuto) {
+    offsets.BStart(cbwm) = hypotheticalPos.mBStart;
+    bStartIsAuto = false;
+  }
+
+  SetComputedLogicalOffsets(cbwm, offsets);
+  const bool isOrthogonal = wm.IsOrthogonalTo(cbwm);
+  if (isOrthogonal) {
+    if (bStartIsAuto || bEndIsAuto) {
+      mComputeSizeFlags += ComputeSizeFlag::ShrinkWrap;
+    }
+  } else {
+    if (iStartIsAuto || iEndIsAuto) {
+      mComputeSizeFlags += ComputeSizeFlag::ShrinkWrap;
+    }
+  }
+
+  {
+    AutoMaybeDisableFontInflation an(mFrame);
+
+    auto size = mFrame->ComputeSize(
+        *this, wm, aCBSize.ConvertTo(wm, cbwm),
+        aCBSize.ConvertTo(wm, cbwm).ISize(wm),  
+        ComputedLogicalMargin(wm).Size(wm) +
+            ComputedLogicalOffsets(wm).Size(wm),
+        ComputedLogicalBorderPadding(wm).Size(wm), {}, mComputeSizeFlags);
+    mComputedSize = size.mLogicalSize;
+    NS_ASSERTION(ComputedISize() >= 0, "Bogus inline-size");
+    NS_ASSERTION(
+        ComputedBSize() == NS_UNCONSTRAINEDSIZE || ComputedBSize() >= 0,
+        "Bogus block-size");
+
+    mFlags.mIsBSizeSetByAspectRatio =
+        size.mAspectRatioUsage == nsIFrame::AspectRatioUsage::ToComputeBSize;
+  }
+
+  LogicalMargin margin = ComputedLogicalMargin(cbwm);
+  const LogicalMargin borderPadding = ComputedLogicalBorderPadding(cbwm);
+  const LogicalSize computedSize = mComputedSize.ConvertTo(cbwm, wm);
+
+  bool iSizeIsAuto =
+      mStylePosition->ISize(cbwm, anchorResolutionParams.mBaseParams)->IsAuto();
+  if (iStartIsAuto) {
+    if (iSizeIsAuto) {
+      offsets.IStart(cbwm) = NS_AUTOOFFSET;
+    } else {
+      offsets.IStart(cbwm) = aCBSize.ISize(cbwm) - offsets.IEnd(cbwm) -
+                             computedSize.ISize(cbwm) - margin.IStartEnd(cbwm) -
+                             borderPadding.IStartEnd(cbwm);
+    }
+  } else if (iEndIsAuto) {
+    if (iSizeIsAuto) {
+      offsets.IEnd(cbwm) = NS_AUTOOFFSET;
+    } else {
+      offsets.IEnd(cbwm) = aCBSize.ISize(cbwm) - offsets.IStart(cbwm) -
+                           computedSize.ISize(cbwm) - margin.IStartEnd(cbwm) -
+                           borderPadding.IStartEnd(cbwm);
+    }
+  }
+
+  bool bSizeIsAuto =
+      mStylePosition->BSize(cbwm, anchorResolutionParams.mBaseParams)
+          ->BehavesLikeInitialValueOnBlockAxis();
+  if (bStartIsAuto) {
+    if (bSizeIsAuto) {
+      offsets.BStart(cbwm) = NS_AUTOOFFSET;
+    } else {
+      offsets.BStart(cbwm) = aCBSize.BSize(cbwm) - margin.BStartEnd(cbwm) -
+                             borderPadding.BStartEnd(cbwm) -
+                             computedSize.BSize(cbwm) - offsets.BEnd(cbwm);
+    }
+  } else if (bEndIsAuto) {
+    if (bSizeIsAuto) {
+      offsets.BEnd(cbwm) = NS_AUTOOFFSET;
+    } else {
+      offsets.BEnd(cbwm) = aCBSize.BSize(cbwm) - margin.BStartEnd(cbwm) -
+                           borderPadding.BStartEnd(cbwm) -
+                           computedSize.BSize(cbwm) - offsets.BStart(cbwm);
+    }
+  }
+
+  SetComputedLogicalOffsets(cbwm, offsets);
+}
+
+static nscoord GetBlockMarginBorderPadding(const ReflowInput* aReflowInput) {
+  nscoord result = 0;
+  if (!aReflowInput) {
+    return result;
+  }
+
+  nsMargin margin = aReflowInput->ComputedPhysicalMargin();
+  if (NS_AUTOMARGIN == margin.top) {
+    margin.top = 0;
+  }
+  if (NS_AUTOMARGIN == margin.bottom) {
+    margin.bottom = 0;
+  }
+
+  result += margin.top + margin.bottom;
+  result += aReflowInput->ComputedPhysicalBorderPadding().top +
+            aReflowInput->ComputedPhysicalBorderPadding().bottom;
+
+  return result;
+}
+
+static nscoord CalcQuirkContainingBlockHeight(
+    const ReflowInput* aCBReflowInput) {
+  const ReflowInput* firstAncestorRI = nullptr;   
+  const ReflowInput* secondAncestorRI = nullptr;  
+
+  nscoord result = NS_UNCONSTRAINEDSIZE;
+
+  const ReflowInput* ri = aCBReflowInput;
+  for (; ri; ri = ri->mParentReflowInput) {
+    LayoutFrameType frameType = ri->mFrame->Type();
+    if (LayoutFrameType::Block == frameType ||
+        LayoutFrameType::ScrollContainer == frameType) {
+      secondAncestorRI = firstAncestorRI;
+      firstAncestorRI = ri;
+
+      if (ri->ComputedHeight() == NS_UNCONSTRAINEDSIZE ||
+          ri->mFlags.mTreatBSizeAsIndefinite) {
+        if (ri->mFrame->IsAbsolutelyPositioned(ri->mStyleDisplay)) {
+          break;
+        } else {
+          continue;
+        }
+      }
+    } else if (LayoutFrameType::Canvas == frameType) {
+    } else if (LayoutFrameType::PageContent == frameType) {
+      nsIFrame* prevInFlow = ri->mFrame->GetPrevInFlow();
+      if (prevInFlow) {
+        break;
+      }
+    } else {
+      break;
+    }
+
+    result = (LayoutFrameType::PageContent == frameType) ? ri->AvailableHeight()
+                                                         : ri->ComputedHeight();
+    if (NS_UNCONSTRAINEDSIZE == result) {
+      return result;
+    }
+
+    if ((LayoutFrameType::Canvas == frameType) ||
+        (LayoutFrameType::PageContent == frameType)) {
+      result -= GetBlockMarginBorderPadding(firstAncestorRI);
+      result -= GetBlockMarginBorderPadding(secondAncestorRI);
+
+#ifdef DEBUG
+      if (firstAncestorRI) {
+        nsIContent* frameContent = firstAncestorRI->mFrame->GetContent();
+        if (frameContent) {
+          NS_ASSERTION(frameContent->IsHTMLElement(nsGkAtoms::html),
+                       "First ancestor is not HTML");
+        }
+      }
+      if (secondAncestorRI) {
+        nsIContent* frameContent = secondAncestorRI->mFrame->GetContent();
+        if (frameContent) {
+          NS_ASSERTION(frameContent->IsHTMLElement(nsGkAtoms::body),
+                       "Second ancestor is not BODY");
+        }
+      }
+#endif
+
+    }
+    else if (LayoutFrameType::Block == frameType && ri->mParentReflowInput &&
+             ri->mParentReflowInput->mFrame->IsCanvasFrame()) {
+      result -= GetBlockMarginBorderPadding(secondAncestorRI);
+    }
+    break;
+  }
+
+  return std::max(result, 0);
+}
+
+LogicalSize ReflowInput::ComputeContainingBlockRectangle(
+    nsPresContext* aPresContext, const ReflowInput* aContainingBlockRI) const {
+  LogicalSize cbSize = aContainingBlockRI->ComputedSize();
+  WritingMode wm = aContainingBlockRI->GetWritingMode();
+
+  if (aContainingBlockRI->mFlags.mTreatBSizeAsIndefinite) {
+    cbSize.BSize(wm) = NS_UNCONSTRAINEDSIZE;
+  } else if (aContainingBlockRI->mPercentageBasisInBlockAxis) {
+    MOZ_ASSERT(cbSize.BSize(wm) == NS_UNCONSTRAINEDSIZE,
+               "Why provide a percentage basis when the containing block's "
+               "block-size is definite?");
+    cbSize.BSize(wm) = *aContainingBlockRI->mPercentageBasisInBlockAxis;
+  }
+
+  auto IsQuirky = [](const StyleSize& aSize) -> bool {
+    return aSize.ConvertsToPercentage() ||
+           aSize.BehavesLikeStretchOnBlockAxis();
+  };
+  const auto anchorResolutionParams = AnchorPosResolutionParams::From(this);
+  if (!wm.IsVertical() && NS_UNCONSTRAINEDSIZE == cbSize.BSize(wm)) {
+    if (eCompatibility_NavQuirks == aPresContext->CompatibilityMode() &&
+        !aContainingBlockRI->mFrame->IsFlexOrGridItem() &&
+        (IsQuirky(*mStylePosition->GetHeight(anchorResolutionParams)) ||
+         (mFrame->IsTableWrapperFrame() &&
+          IsQuirky(*mFrame->PrincipalChildList()
+                        .FirstChild()
+                        ->StylePosition()
+                        ->GetHeight(anchorResolutionParams))))) {
+      cbSize.BSize(wm) = CalcQuirkContainingBlockHeight(aContainingBlockRI);
+    }
+  }
+
+  return cbSize.ConvertTo(GetWritingMode(), wm);
+}
+
+
+void ReflowInput::InitConstraints(
+    nsPresContext* aPresContext, const Maybe<LogicalSize>& aContainingBlockSize,
+    const Maybe<LogicalMargin>& aBorder, const Maybe<LogicalMargin>& aPadding,
+    LayoutFrameType aFrameType) {
+  WritingMode wm = GetWritingMode();
+  LogicalSize cbSize = aContainingBlockSize.valueOr(
+      LogicalSize(mWritingMode, NS_UNCONSTRAINEDSIZE, NS_UNCONSTRAINEDSIZE));
+
+  if (nullptr == mParentReflowInput || mFlags.mDummyParentReflowInput) {
+    InitOffsets(wm, cbSize.ISize(wm), aFrameType, mComputeSizeFlags, aBorder,
+                aPadding, mStyleDisplay);
+    SetComputedLogicalMargin(wm, LogicalMargin(wm));
+    SetComputedLogicalOffsets(wm, LogicalMargin(wm));
+
+    const auto borderPadding = ComputedLogicalBorderPadding(wm);
+    SetComputedISize(
+        std::max(0, AvailableISize() - borderPadding.IStartEnd(wm)),
+        ResetResizeFlags::No);
+    SetComputedBSize(
+        AvailableBSize() != NS_UNCONSTRAINEDSIZE
+            ? std::max(0, AvailableBSize() - borderPadding.BStartEnd(wm))
+            : NS_UNCONSTRAINEDSIZE,
+        ResetResizeFlags::No);
+
+    mComputedMinSize.SizeTo(mWritingMode, 0, 0);
+    mComputedMaxSize.SizeTo(mWritingMode, NS_UNCONSTRAINEDSIZE,
+                            NS_UNCONSTRAINEDSIZE);
+  } else {
+    const ReflowInput* cbri = mCBReflowInput;
+    MOZ_ASSERT(cbri, "no containing block");
+    MOZ_ASSERT(mFrame->GetParent());
+
+    if (aContainingBlockSize.isNothing()) {
+      cbSize = ComputeContainingBlockRectangle(aPresContext, cbri);
+    }
+
+    if (NS_UNCONSTRAINEDSIZE == cbSize.BSize(wm)) {
+      if (cbri->mParentReflowInput && cbri->mFrame->IsTableCellFrame()) {
+        cbSize.BSize(wm) = cbri->ComputedSize(wm).BSize(wm);
+      }
+    }
+
+
+    WritingMode cbwm = cbri->GetWritingMode();
+    InitOffsets(cbwm, cbSize.ConvertTo(cbwm, wm).ISize(cbwm), aFrameType,
+                mComputeSizeFlags, aBorder, aPadding, mStyleDisplay);
+
+    auto blockSize =
+        mStylePosition->BSize(wm, AnchorPosResolutionParams::From(this));
+    if (blockSize->BehavesLikeStretchOnBlockAxis()) {
+      if (NS_UNCONSTRAINEDSIZE == cbSize.BSize(wm)) {
+        blockSize = AnchorResolvedSizeHelper::Auto();
+      } else {
+        nscoord stretchBSize = nsLayoutUtils::ComputeStretchBSize(
+            cbSize.BSize(wm), ComputedLogicalMargin(wm).BStartEnd(wm),
+            ComputedLogicalBorderPadding(wm).BStartEnd(wm),
+            mStylePosition->mBoxSizing);
+        blockSize = AnchorResolvedSizeHelper::LengthPercentage(
+            StyleLengthPercentage::FromAppUnits(stretchBSize));
+      }
+    }
+    bool isAutoBSize = blockSize->BehavesLikeInitialValueOnBlockAxis();
+
+    if (blockSize->HasPercent()) {
+      if (NS_UNCONSTRAINEDSIZE == cbSize.BSize(wm)) {
+        if (mFlags.mIsReplaced && mStyleDisplay->IsInlineOutsideStyle()) {
+          NS_ASSERTION(cbri, "no containing block");
+          if (!wm.IsVertical() &&
+              eCompatibility_NavQuirks == aPresContext->CompatibilityMode()) {
+            if (!cbri->mFrame->IsTableCellFrame() &&
+                !cbri->mFrame->IsFlexOrGridItem()) {
+              cbSize.BSize(wm) = CalcQuirkContainingBlockHeight(cbri);
+              if (cbSize.BSize(wm) == NS_UNCONSTRAINEDSIZE) {
+                isAutoBSize = true;
+              }
+            } else {
+              isAutoBSize = true;
+            }
+          }
+          else {
+            nscoord computedBSize = cbri->ComputedSize(wm).BSize(wm);
+            if (NS_UNCONSTRAINEDSIZE != computedBSize) {
+              cbSize.BSize(wm) = computedBSize;
+            } else {
+              isAutoBSize = true;
+            }
+          }
+        } else {
+          isAutoBSize = true;
+        }
+      }
+    }
+
+    if (mStyleDisplay->IsRelativelyPositioned(mFrame)) {
+      const LogicalMargin offsets =
+          ComputeRelativeOffsets(cbwm, mFrame, cbSize.ConvertTo(cbwm, wm));
+      SetComputedLogicalOffsets(cbwm, offsets);
+    } else {
+      SetComputedLogicalOffsets(wm, LogicalMargin(wm));
+    }
+
+    ComputeMinMaxValues(cbSize);
+
+
+    if (IsInternalTableFrame()) {
+      bool rowOrRowGroup = false;
+      const auto inlineSize =
+          mStylePosition->ISize(wm, AnchorPosResolutionParams::From(this));
+      bool isAutoISize = inlineSize->IsAuto();
+      if ((StyleDisplay::TableRow == mStyleDisplay->mDisplay) ||
+          (StyleDisplay::TableRowGroup == mStyleDisplay->mDisplay)) {
+        isAutoISize = true;
+        rowOrRowGroup = true;
+      }
+
+      if (isAutoISize || inlineSize->HasLengthAndPercentage()) {
+        if (AvailableISize() != NS_UNCONSTRAINEDSIZE && !rowOrRowGroup) {
+          SetComputedISize(
+              std::max(0, AvailableISize() -
+                              ComputedLogicalBorderPadding(wm).IStartEnd(wm)),
+              ResetResizeFlags::No);
+        } else {
+          SetComputedISize(AvailableISize(), ResetResizeFlags::No);
+        }
+        NS_ASSERTION(ComputedISize() >= 0, "Bogus computed isize");
+
+      } else {
+        SetComputedISize(
+            ComputeISizeValue(cbSize, mStylePosition->mBoxSizing, *inlineSize),
+            ResetResizeFlags::No);
+      }
+
+      if (StyleDisplay::TableColumn == mStyleDisplay->mDisplay ||
+          StyleDisplay::TableColumnGroup == mStyleDisplay->mDisplay) {
+        isAutoBSize = true;
+      }
+      if (isAutoBSize || blockSize->HasLengthAndPercentage()) {
+        SetComputedBSize(NS_UNCONSTRAINEDSIZE, ResetResizeFlags::No);
+      } else {
+        SetComputedBSize(
+            ComputeBSizeValue(cbSize.BSize(wm), mStylePosition->mBoxSizing,
+                              blockSize->AsLengthPercentage()),
+            ResetResizeFlags::No);
+      }
+
+      mComputedMinSize.SizeTo(mWritingMode, 0, 0);
+      mComputedMaxSize.SizeTo(mWritingMode, NS_UNCONSTRAINEDSIZE,
+                              NS_UNCONSTRAINEDSIZE);
+    } else if (mFrame->IsAbsolutelyPositioned(mStyleDisplay) &&
+               !mFrame->GetPrevInFlow()) {
+      InitAbsoluteConstraints(cbri,
+                              cbSize.ConvertTo(cbri->GetWritingMode(), wm));
+    } else {
+      AutoMaybeDisableFontInflation an(mFrame);
+
+      auto* const alignCB = [&] {
+        auto* cb = mFrame->GetParent();
+        if (cb->IsTableWrapperFrame()) {
+          auto* alignCBParent = cb->GetParent();
+          if (alignCBParent && alignCBParent->IsGridContainerFrame()) {
+            return alignCBParent;
+          }
+        }
+        if (cb->Style()->GetPseudoType() ==
+            PseudoStyleType::MozColumnSpanWrapper) {
+          MOZ_ASSERT(mFrame->StyleColumn()->mColumnSpan !=
+                     StyleColumnSpan::None);
+          auto* p = cb->GetParent();
+          while (p) {
+            if (p->Style()->GetPseudoType() !=
+                PseudoStyleType::MozColumnSpanWrapper) {
+              return p;
+            }
+            p = p->GetParent();
+          }
+          MOZ_ASSERT_UNREACHABLE("No parent above :-moz-column-span-wrapper?");
+        }
+        return cb;
+      }();
+
+      const bool isInlineLevel = [&] {
+        if (mFrame->IsTableFrame()) {
+          return false;
+        }
+        if (mStyleDisplay->IsInlineOutsideStyle()) {
+          return true;
+        }
+        if (mFlags.mIsReplaced && (mStyleDisplay->IsInnerTableStyle() ||
+                                   mStyleDisplay->DisplayOutside() ==
+                                       StyleDisplayOutside::TableCaption)) {
+          return true;
+        }
+        if (mFrame->HasAnyStateBits(NS_FRAME_OUT_OF_FLOW) &&
+            !mStyleDisplay->IsAbsolutelyPositionedStyle()) {
+          return true;
+        }
+        return false;
+      }();
+
+      if (mParentReflowInput->mFlags.mOrthogonalCellFinalReflow) {
+        MOZ_ASSERT(mFrame->GetParent()->IsTableCellFrame(),
+                   "unexpected mOrthogonalCellFinalReflow flag!");
+        cbSize = mParentReflowInput->AvailableSize().ConvertTo(
+            wm, mParentReflowInput->GetWritingMode());
+        cbSize -= mParentReflowInput->ComputedLogicalBorder(wm).Size(wm);
+        SetAvailableISize(cbSize.ISize(wm));
+      } else {
+        const bool shouldShrinkWrap = [&] {
+          if (isInlineLevel) {
+            return true;
+          }
+          if (mFlags.mIsReplaced && !alignCB->IsFlexOrGridContainer()) {
+            return true;
+          }
+          if (!alignCB->IsGridContainerFrame() &&
+              mWritingMode.IsOrthogonalTo(alignCB->GetWritingMode())) {
+            return true;
+          }
+          return false;
+        }();
+
+        if (shouldShrinkWrap) {
+          mComputeSizeFlags += ComputeSizeFlag::ShrinkWrap;
+        }
+
+        if (cbSize.ISize(wm) == NS_UNCONSTRAINEDSIZE) {
+          cbSize.ISize(wm) = AvailableISize();
+        }
+      }
+
+      auto size = mFrame->ComputeSize(*this, wm, cbSize, AvailableISize(),
+                                      ComputedLogicalMargin(wm).Size(wm),
+                                      ComputedLogicalBorderPadding(wm).Size(wm),
+                                      mStyleSizeOverrides, mComputeSizeFlags);
+
+      mComputedSize = size.mLogicalSize;
+      NS_ASSERTION(ComputedISize() >= 0, "Bogus inline-size");
+      NS_ASSERTION(
+          ComputedBSize() == NS_UNCONSTRAINEDSIZE || ComputedBSize() >= 0,
+          "Bogus block-size");
+
+      mFlags.mIsBSizeSetByAspectRatio =
+          size.mAspectRatioUsage == nsIFrame::AspectRatioUsage::ToComputeBSize;
+
+      const bool shouldCalculateBlockSideMargins = [&]() {
+        if (isInlineLevel) {
+          return false;
+        }
+        if (mFrame->IsTableFrame()) {
+          return false;
+        }
+        if (alignCB->IsFlexOrGridContainer()) {
+          return false;
+        }
+        const auto pseudoType = mFrame->Style()->GetPseudoType();
+        if (pseudoType == PseudoStyleType::Marker &&
+            mFrame->GetParent()->StyleList()->mListStylePosition ==
+                StyleListStylePosition::Outside) {
+          return false;
+        }
+        if (pseudoType == PseudoStyleType::MozColumnContent) {
+          return false;
+        }
+        return true;
+      }();
+
+      if (shouldCalculateBlockSideMargins) {
+        CalculateBlockSideMargins();
+      }
+    }
+  }
+
+  mContainingBlockSize = cbSize;
+}
+
+static void UpdateProp(nsIFrame* aFrame,
+                       const FramePropertyDescriptor<nsMargin>* aProperty,
+                       bool aNeeded, const nsMargin& aNewValue) {
+  if (aNeeded) {
+    if (nsMargin* propValue = aFrame->GetProperty(aProperty)) {
+      *propValue = aNewValue;
+    } else {
+      aFrame->AddProperty(aProperty, new nsMargin(aNewValue));
+    }
+  } else {
+    aFrame->RemoveProperty(aProperty);
+  }
+}
+
+void SizeComputationInput::InitOffsets(WritingMode aCBWM, nscoord aPercentBasis,
+                                       LayoutFrameType aFrameType,
+                                       ComputeSizeFlags aFlags,
+                                       const Maybe<LogicalMargin>& aBorder,
+                                       const Maybe<LogicalMargin>& aPadding,
+                                       const nsStyleDisplay* aDisplay) {
+  nsPresContext* presContext = mFrame->PresContext();
+
+  bool needMarginProp = ComputeMargin(aCBWM, aPercentBasis, aFrameType);
+  ::UpdateProp(mFrame, nsIFrame::UsedMarginProperty(), needMarginProp,
+               ComputedPhysicalMargin());
+
+  const WritingMode wm = GetWritingMode();
+  const nsStyleDisplay* disp = mFrame->StyleDisplayWithOptionalParam(aDisplay);
+  bool needPaddingProp;
+  LayoutDeviceIntMargin widgetPadding;
+  if (mIsThemed && presContext->Theme()->GetWidgetPadding(
+                       presContext->DeviceContext(), mFrame,
+                       disp->EffectiveAppearance(), &widgetPadding)) {
+    const nsMargin padding = LayoutDevicePixel::ToAppUnits(
+        widgetPadding, presContext->AppUnitsPerDevPixel());
+    SetComputedLogicalPadding(wm, LogicalMargin(wm, padding));
+    needPaddingProp = false;
+  } else if (mFrame->IsInSVGTextSubtree()) {
+    SetComputedLogicalPadding(wm, LogicalMargin(wm));
+    needPaddingProp = false;
+  } else if (aPadding) {  
+    SetComputedLogicalPadding(wm, *aPadding);
+    nsMargin stylePadding;
+    needPaddingProp = !mFrame->StylePadding()->GetPadding(stylePadding) ||
+                      aPadding->GetPhysicalMargin(wm) != stylePadding;
+  } else {
+    needPaddingProp = ComputePadding(aCBWM, aPercentBasis, aFrameType);
+  }
+
+  typedef const FramePropertyDescriptor<SmallValueHolder<nscoord>>* Prop;
+  auto ApplyBaselinePadding = [this, wm, &needPaddingProp](LogicalAxis aAxis,
+                                                           Prop aProp) {
+    bool found;
+    nscoord val = mFrame->GetProperty(aProp, &found);
+    if (found) {
+      NS_ASSERTION(val != nscoord(0), "zero in this property is useless");
+      LogicalSide side;
+      if (val > 0) {
+        side = MakeLogicalSide(aAxis, LogicalEdge::Start);
+      } else {
+        side = MakeLogicalSide(aAxis, LogicalEdge::End);
+        val = -val;
+      }
+      mComputedPadding.Side(side, wm) += val;
+      needPaddingProp = true;
+      if (aAxis == LogicalAxis::Block && val > 0) {
+        this->mFrame->AddStateBits(NS_FRAME_CONTAINS_RELATIVE_BSIZE);
+      }
+    }
+  };
+  if (!aFlags.contains(ComputeSizeFlag::IsGridMeasuringReflow)) {
+    ApplyBaselinePadding(LogicalAxis::Block, nsIFrame::BBaselinePadProperty());
+  }
+  if (!aFlags.contains(ComputeSizeFlag::ShrinkWrap)) {
+    ApplyBaselinePadding(LogicalAxis::Inline, nsIFrame::IBaselinePadProperty());
+  }
+
+  LogicalMargin border(wm);
+  if (mIsThemed) {
+    const LayoutDeviceIntMargin widgetBorder =
+        presContext->Theme()->GetWidgetBorder(
+            presContext->DeviceContext(), mFrame, disp->EffectiveAppearance());
+    border = LogicalMargin(
+        wm, LayoutDevicePixel::ToAppUnits(widgetBorder,
+                                          presContext->AppUnitsPerDevPixel()));
+  } else if (mFrame->IsInSVGTextSubtree()) {
+  } else if (aBorder) {  
+    border = *aBorder;
+  } else {
+    border = LogicalMargin(wm, mFrame->StyleBorder()->GetComputedBorder());
+  }
+  SetComputedLogicalBorderPadding(wm, border + ComputedLogicalPadding(wm));
+
+  if (aFrameType == LayoutFrameType::Scrollbar) {
+    nsSize size(mFrame->GetSize());
+    if (size.width == 0 || size.height == 0) {
+      SetComputedLogicalPadding(wm, LogicalMargin(wm));
+      SetComputedLogicalBorderPadding(wm, LogicalMargin(wm));
+    }
+  }
+
+  bool hasPaddingChange;
+  if (nsMargin* oldPadding =
+          mFrame->GetProperty(nsIFrame::UsedPaddingProperty())) {
+    hasPaddingChange = *oldPadding != ComputedPhysicalPadding();
+  } else {
+    hasPaddingChange = needPaddingProp;
+  }
+  mFrame->SetHasPaddingChange(mFrame->HasPaddingChange() || hasPaddingChange);
+
+  ::UpdateProp(mFrame, nsIFrame::UsedPaddingProperty(), needPaddingProp,
+               ComputedPhysicalPadding());
+}
+
+void ReflowInput::CalculateBlockSideMargins() {
+  MOZ_ASSERT(!mFrame->IsTableFrame(),
+             "Inner table frame cannot have computed margins!");
+
+  WritingMode cbWM = GetCBWritingMode();
+
+  nscoord availISizeCBWM = AvailableSize(cbWM).ISize(cbWM);
+  nscoord computedISizeCBWM = ComputedSize(cbWM).ISize(cbWM);
+  if (availISizeCBWM == NS_UNCONSTRAINEDSIZE ||
+      computedISizeCBWM == NS_UNCONSTRAINEDSIZE) {
+    return;
+  }
+
+  LAYOUT_WARN_IF_FALSE(NS_UNCONSTRAINEDSIZE != computedISizeCBWM &&
+                           NS_UNCONSTRAINEDSIZE != availISizeCBWM,
+                       "have unconstrained inline-size; this should only "
+                       "result from very large sizes, not attempts at "
+                       "intrinsic inline-size calculation");
+
+  LogicalMargin margin = ComputedLogicalMargin(cbWM);
+  LogicalMargin borderPadding = ComputedLogicalBorderPadding(cbWM);
+  nscoord sum = margin.IStartEnd(cbWM) + borderPadding.IStartEnd(cbWM) +
+                computedISizeCBWM;
+  if (sum == availISizeCBWM) {
+    return;
+  }
+
+
+  nscoord availMarginSpace = availISizeCBWM - sum;
+
+  if (availMarginSpace < 0) {
+    margin.IEnd(cbWM) += availMarginSpace;
+    SetComputedLogicalMargin(cbWM, margin);
+    return;
+  }
+
+  const auto anchorResolutionParams = AnchorPosResolutionParams::From(this);
+  bool isAutoStartMargin =
+      mStyleMargin->GetMargin(LogicalSide::IStart, cbWM, anchorResolutionParams)
+          ->IsAuto();
+  bool isAutoEndMargin =
+      mStyleMargin->GetMargin(LogicalSide::IEnd, cbWM, anchorResolutionParams)
+          ->IsAuto();
+  if (!isAutoStartMargin && !isAutoEndMargin) {
+    const StyleTextAlign* textAlign =
+        mParentReflowInput
+            ? &mParentReflowInput->mFrame->StyleText()->mTextAlign
+            : nullptr;
+    if (textAlign && (*textAlign == StyleTextAlign::MozLeft ||
+                      *textAlign == StyleTextAlign::MozCenter ||
+                      *textAlign == StyleTextAlign::MozRight)) {
+      if (mParentReflowInput->mWritingMode.IsBidiLTR()) {
+        isAutoStartMargin = *textAlign != StyleTextAlign::MozLeft;
+        isAutoEndMargin = *textAlign != StyleTextAlign::MozRight;
+      } else {
+        isAutoStartMargin = *textAlign != StyleTextAlign::MozRight;
+        isAutoEndMargin = *textAlign != StyleTextAlign::MozLeft;
+      }
+    }
+    else {
+      isAutoEndMargin = true;
+    }
+  }
+
+
+  if (isAutoStartMargin) {
+    if (isAutoEndMargin) {
+      nscoord forStart = availMarginSpace / 2;
+      margin.IStart(cbWM) += forStart;
+      margin.IEnd(cbWM) += availMarginSpace - forStart;
+    } else {
+      margin.IStart(cbWM) += availMarginSpace;
+    }
+  } else if (isAutoEndMargin) {
+    margin.IEnd(cbWM) += availMarginSpace;
+  }
+  SetComputedLogicalMargin(cbWM, margin);
+
+  if (isAutoStartMargin || isAutoEndMargin) {
+    nsMargin* propValue = mFrame->GetProperty(nsIFrame::UsedMarginProperty());
+    if (propValue) {
+      *propValue = margin.GetPhysicalMargin(cbWM);
+    }
+  }
+}
+
+static nscoord GetNormalLineHeight(nsFontMetrics* aFontMetrics) {
+  MOZ_ASSERT(aFontMetrics, "no font metrics");
+  nscoord externalLeading = aFontMetrics->ExternalLeading();
+  nscoord internalLeading = aFontMetrics->InternalLeading();
+  nscoord emHeight = aFontMetrics->EmHeight();
+  if (!internalLeading && !externalLeading) {
+    return NSToCoordRound(static_cast<float>(emHeight) *
+                          ReflowInput::kNormalLineHeightFactor);
+  }
+  return emHeight + internalLeading + externalLeading;
+}
+
+static inline nscoord ComputeLineHeight(const StyleLineHeight& aLh,
+                                        const nsFont& aFont, nsAtom* aLanguage,
+                                        bool aExplicitLanguage,
+                                        nsPresContext* aPresContext,
+                                        bool aIsVertical,
+                                        float aFontSizeInflation) {
+  if (aLh.IsLength()) {
+    nscoord result = aLh.AsLength().ToAppUnits();
+    if (aFontSizeInflation != 1.0f) {
+      result = NSToCoordRound(static_cast<float>(result) * aFontSizeInflation);
+    }
+    return result;
+  }
+
+  if (aLh.IsNumber()) {
+    return aFont.size.ScaledBy(aLh.AsNumber() * aFontSizeInflation)
+        .ToAppUnits();
+  }
+
+  MOZ_ASSERT(aLh.IsNormal());
+
+  auto size = aFont.size;
+  size.ScaleBy(aFontSizeInflation);
+
+  if (aPresContext) {
+    nsFont font = aFont;
+    font.size = size;
+    nsFontMetrics::Params params;
+    params.language = aLanguage;
+    params.explicitLanguage = aExplicitLanguage;
+    params.orientation =
+        aIsVertical ? nsFontMetrics::eVertical : nsFontMetrics::eHorizontal;
+    params.userFontSet = aPresContext->GetUserFontSet();
+    params.textPerf = aPresContext->GetTextPerfMetrics();
+    params.featureValueLookup = aPresContext->GetFontFeatureValuesLookup();
+    RefPtr<nsFontMetrics> fm = aPresContext->GetMetricsFor(font, params);
+    return GetNormalLineHeight(fm);
+  }
+  size.ScaleBy(ReflowInput::kNormalLineHeightFactor);
+  return size.ToAppUnits();
+}
+
+nscoord ReflowInput::GetLineHeight() const {
+  if (mLineHeight != NS_UNCONSTRAINEDSIZE) {
+    return mLineHeight;
+  }
+  mLineHeight = CalcLineHeight(*mFrame->Style(), mFrame->PresContext(),
+                               mFrame->GetContent(),
+                               nsLayoutUtils::FontSizeInflationFor(mFrame));
+  return mLineHeight;
+}
+
+void ReflowInput::SetLineHeight(nscoord aLineHeight) {
+  MOZ_ASSERT(aLineHeight >= 0, "aLineHeight must be >= 0!");
+
+  if (mLineHeight != aLineHeight) {
+    mLineHeight = aLineHeight;
+    InitResizeFlags(mFrame->PresContext(), mFrame->Type());
+  }
+}
+
+nscoord ReflowInput::CalcLineHeight(const ComputedStyle& aStyle,
+                                    nsPresContext* aPresContext,
+                                    const nsIContent* aContent,
+                                    float aFontSizeInflation) {
+  const StyleLineHeight& lh = aStyle.StyleFont()->mLineHeight;
+  WritingMode wm(&aStyle);
+  const bool vertical = wm.IsVertical() && !wm.IsSideways();
+  return CalcLineHeight(lh, *aStyle.StyleFont(), aPresContext, vertical,
+                        aContent, aFontSizeInflation);
+}
+
+nscoord ReflowInput::CalcLineHeight(const StyleLineHeight& aLh,
+                                    const nsStyleFont& aRelativeToFont,
+                                    nsPresContext* aPresContext,
+                                    bool aIsVertical,
+                                    const nsIContent* aContent,
+                                    float aFontSizeInflation) {
+  nscoord lineHeight =
+      ComputeLineHeight(aLh, aRelativeToFont.mFont, aRelativeToFont.mLanguage,
+                        aRelativeToFont.mExplicitLanguage, aPresContext,
+                        aIsVertical, aFontSizeInflation);
+
+  NS_ASSERTION(lineHeight >= 0, "ComputeLineHeight screwed up");
+
+  const auto* input = HTMLInputElement::FromNodeOrNull(aContent);
+  if (input && input->IsSingleLineTextControl()) {
+    if (!aLh.IsNormal()) {
+      nscoord normal = ComputeLineHeight(
+          StyleLineHeight::Normal(), aRelativeToFont.mFont,
+          aRelativeToFont.mLanguage, aRelativeToFont.mExplicitLanguage,
+          aPresContext, aIsVertical, aFontSizeInflation);
+      if (lineHeight < normal) {
+        lineHeight = normal;
+      }
+    }
+  }
+
+  return lineHeight;
+}
+
+nscoord ReflowInput::CalcLineHeightForCanvas(const StyleLineHeight& aLh,
+                                             const nsFont& aRelativeToFont,
+                                             nsAtom* aLanguage,
+                                             bool aExplicitLanguage,
+                                             nsPresContext* aPresContext,
+                                             WritingMode aWM) {
+  return ComputeLineHeight(aLh, aRelativeToFont, aLanguage, aExplicitLanguage,
+                           aPresContext, aWM.IsVertical() && !aWM.IsSideways(),
+                           1.0f);
+}
+
+bool SizeComputationInput::ComputeMargin(WritingMode aCBWM,
+                                         nscoord aPercentBasis,
+                                         LayoutFrameType aFrameType) {
+  if (mFrame->IsInSVGTextSubtree()) {
+    return false;
+  }
+
+  if (aFrameType == LayoutFrameType::Table) {
+    SetComputedLogicalMargin(mWritingMode, LogicalMargin(mWritingMode));
+    return false;
+  }
+
+  const nsStyleMargin* styleMargin = mFrame->StyleMargin();
+  nsMargin margin;
+  const bool isLayoutDependent = !styleMargin->GetMargin(margin);
+  if (isLayoutDependent) {
+    if (aPercentBasis == NS_UNCONSTRAINEDSIZE) {
+      aPercentBasis = 0;
+    }
+    LogicalMargin m(aCBWM);
+    const auto anchorResolutionParams =
+        AnchorPosResolutionParams::From(mFrame, mAnchorPosResolutionCache);
+    for (const LogicalSide side : LogicalSides::All) {
+      m.Side(side, aCBWM) = nsLayoutUtils::ComputeCBDependentValue(
+          aPercentBasis,
+          styleMargin->GetMargin(side, aCBWM, anchorResolutionParams));
+    }
+    SetComputedLogicalMargin(aCBWM, m);
+  } else {
+    SetComputedLogicalMargin(mWritingMode, LogicalMargin(mWritingMode, margin));
+  }
+
+  nscoord marginAdjustment = FontSizeInflationListMarginAdjustment(mFrame);
+
+  if (marginAdjustment > 0) {
+    LogicalMargin m = ComputedLogicalMargin(mWritingMode);
+    m.IStart(mWritingMode) += marginAdjustment;
+    SetComputedLogicalMargin(mWritingMode, m);
+  }
+
+  return isLayoutDependent;
+}
+
+bool SizeComputationInput::ComputePadding(WritingMode aCBWM,
+                                          nscoord aPercentBasis,
+                                          LayoutFrameType aFrameType) {
+  const nsStylePadding* stylePadding = mFrame->StylePadding();
+  nsMargin padding;
+  bool isCBDependent = !stylePadding->GetPadding(padding);
+  if (LayoutFrameType::TableRowGroup == aFrameType ||
+      LayoutFrameType::TableColGroup == aFrameType ||
+      LayoutFrameType::TableRow == aFrameType ||
+      LayoutFrameType::TableCol == aFrameType) {
+    SetComputedLogicalPadding(mWritingMode, LogicalMargin(mWritingMode));
+  } else if (isCBDependent) {
+    if (aPercentBasis == NS_UNCONSTRAINEDSIZE) {
+      aPercentBasis = 0;
+    }
+    LogicalMargin p(aCBWM);
+    for (const LogicalSide side : LogicalSides::All) {
+      p.Side(side, aCBWM) = std::max(
+          0, nsLayoutUtils::ComputeCBDependentValue(
+                 aPercentBasis, stylePadding->mPadding.Get(side, aCBWM)));
+    }
+    SetComputedLogicalPadding(aCBWM, p);
+  } else {
+    SetComputedLogicalPadding(mWritingMode,
+                              LogicalMargin(mWritingMode, padding));
+  }
+  return isCBDependent;
+}
+
+void ReflowInput::ComputeMinMaxValues(const LogicalSize& aCBSize) {
+  WritingMode wm = GetWritingMode();
+
+  const auto anchorResolutionParams = AnchorPosResolutionParams::From(this);
+  const auto minISize = mStylePosition->MinISize(wm, anchorResolutionParams);
+  const auto maxISize = mStylePosition->MaxISize(wm, anchorResolutionParams);
+  const auto minBSize = mStylePosition->MinBSize(wm, anchorResolutionParams);
+  const auto maxBSize = mStylePosition->MaxBSize(wm, anchorResolutionParams);
+
+  LogicalSize minWidgetSize(wm);
+  if (mIsThemed) {
+    nsPresContext* pc = mFrame->PresContext();
+    const LayoutDeviceIntSize widget = pc->Theme()->GetMinimumWidgetSize(
+        pc, mFrame, mStyleDisplay->EffectiveAppearance());
+
+    minWidgetSize = {
+        wm, LayoutDeviceIntSize::ToAppUnits(widget, pc->AppUnitsPerDevPixel())};
+
+    minWidgetSize -= ComputedLogicalBorderPadding(wm).Size(wm);
+  }
+
+  if (minISize->IsAuto()) {
+    SetComputedMinISize(0);
+  } else {
+    SetComputedMinISize(
+        ComputeISizeValue(aCBSize, mStylePosition->mBoxSizing, *minISize));
+  }
+
+  if (mIsThemed) {
+    SetComputedMinISize(std::max(ComputedMinISize(), minWidgetSize.ISize(wm)));
+  }
+
+  if (maxISize->IsNone()) {
+    SetComputedMaxISize(NS_UNCONSTRAINEDSIZE);
+  } else {
+    SetComputedMaxISize(
+        ComputeISizeValue(aCBSize, mStylePosition->mBoxSizing, *maxISize));
+  }
+
+  if (ComputedMinISize() > ComputedMaxISize()) {
+    SetComputedMaxISize(ComputedMinISize());
+  }
+
+  const bool isInternalTableFrame = IsInternalTableFrame();
+  const nscoord& bPercentageBasis = aCBSize.BSize(wm);
+  auto BSizeBehavesAsInitialValue = [&](const auto& aBSize) {
+    if (nsLayoutUtils::IsAutoBSize(aBSize, bPercentageBasis)) {
+      return true;
+    }
+    if (isInternalTableFrame) {
+      return aBSize.HasLengthAndPercentage();
+    }
+    return false;
+  };
+
+  if (BSizeBehavesAsInitialValue(*minBSize)) {
+    SetComputedMinBSize(0);
+  } else {
+    SetComputedMinBSize(ComputeBSizeValueHandlingStretch(
+        bPercentageBasis, mStylePosition->mBoxSizing, *minBSize));
+  }
+
+  if (mIsThemed) {
+    SetComputedMinBSize(std::max(ComputedMinBSize(), minWidgetSize.BSize(wm)));
+  }
+
+  if (BSizeBehavesAsInitialValue(*maxBSize)) {
+    SetComputedMaxBSize(NS_UNCONSTRAINEDSIZE);
+  } else {
+    SetComputedMaxBSize(ComputeBSizeValueHandlingStretch(
+        bPercentageBasis, mStylePosition->mBoxSizing, *maxBSize));
+  }
+
+  if (ComputedMinBSize() > ComputedMaxBSize()) {
+    SetComputedMaxBSize(ComputedMinBSize());
+  }
+}
+
+bool ReflowInput::IsInternalTableFrame() const {
+  return mFrame->IsTableRowGroupFrame() || mFrame->IsTableColGroupFrame() ||
+         mFrame->IsTableRowFrame() || mFrame->IsTableCellFrame();
+}

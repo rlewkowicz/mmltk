@@ -1,0 +1,379 @@
+/*
+ *  Copyright 2011 The LibYuv Project Authors. All rights reserved.
+ *
+ *  Use of this source code is governed by a BSD-style license
+ *  that can be found in the LICENSE file in the root of the source
+ *  tree. An additional intellectual property rights grant can be found
+ *  in the file PATENTS. All contributing project authors may
+ *  be found in the AUTHORS file in the root of the source tree.
+ */
+
+#include "libyuv/cpu_id.h"
+
+#if defined(_MSC_VER)
+#include <intrin.h>  // For __cpuidex()
+#endif
+#if !defined(__pnacl__) && !defined(__CLR_VER) &&                           \
+    !defined(__native_client__) && (defined(_M_IX86) || defined(_M_X64)) && \
+    defined(_MSC_FULL_VER) && (_MSC_FULL_VER >= 160040219)
+#include <immintrin.h>  // For _xgetbv()
+#endif
+
+#include <stdio.h>  // For fopen()
+#include <string.h>
+
+#if defined(__linux__) && (defined(__aarch64__) || defined(__loongarch__))
+#include <sys/auxv.h>  // For getauxval()
+#endif
+
+
+
+#if defined(__cplusplus)
+namespace libyuv {
+extern "C" {
+#endif
+
+#if defined(_MSC_FULL_VER) && (_MSC_FULL_VER >= 160040219) && \
+    !defined(__clang__)
+#define SAFEBUFFERS __declspec(safebuffers)
+#else
+#define SAFEBUFFERS
+#endif
+
+LIBYUV_API int cpu_info_ = 0;
+
+#if (defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || \
+     defined(__x86_64__)) &&                                     \
+    !defined(__pnacl__) && !defined(__CLR_VER)
+LIBYUV_API
+void CpuId(int info_eax, int info_ecx, int* cpu_info) {
+#if defined(_MSC_VER)
+#if defined(_MSC_FULL_VER) && (_MSC_FULL_VER >= 160040219)
+  __cpuidex(cpu_info, info_eax, info_ecx);
+#elif defined(_M_IX86)
+  __asm {
+    mov        eax, info_eax
+    mov        ecx, info_ecx
+    mov        edi, cpu_info
+    cpuid
+    mov        [edi], eax
+    mov        [edi + 4], ebx
+    mov        [edi + 8], ecx
+    mov        [edi + 12], edx
+  }
+#else
+  if (info_ecx == 0) {
+    __cpuid(cpu_info, info_eax);
+  } else {
+    cpu_info[3] = cpu_info[2] = cpu_info[1] = cpu_info[0] = 0u;
+  }
+#endif
+#else
+  int info_ebx, info_edx;
+  asm volatile(
+#if defined(__i386__) && defined(__PIC__)
+      "mov         %%ebx, %%edi                  \n"
+      "cpuid                                     \n"
+      "xchg        %%edi, %%ebx                  \n"
+      : "=D"(info_ebx),
+#else
+      "cpuid                                     \n"
+      : "=b"(info_ebx),
+#endif
+        "+a"(info_eax), "+c"(info_ecx), "=d"(info_edx));
+  cpu_info[0] = info_eax;
+  cpu_info[1] = info_ebx;
+  cpu_info[2] = info_ecx;
+  cpu_info[3] = info_edx;
+#endif
+}
+#else
+LIBYUV_API
+void CpuId(int eax, int ecx, int* cpu_info) {
+  (void)eax;
+  (void)ecx;
+  cpu_info[0] = cpu_info[1] = cpu_info[2] = cpu_info[3] = 0;
+}
+#endif
+
+#if defined(_M_IX86) && defined(_MSC_VER) && (_MSC_VER < 1900)
+#pragma optimize("g", off)
+#endif
+#if (defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || \
+     defined(__x86_64__)) &&                                     \
+    !defined(__pnacl__) && !defined(__CLR_VER) && !defined(__native_client__)
+static int GetXCR0() {
+  int xcr0 = 0;
+#if defined(_MSC_FULL_VER) && (_MSC_FULL_VER >= 160040219)
+  xcr0 = (int)_xgetbv(0);  // VS2010 SP1 required.  NOLINT
+#elif defined(__i386__) || defined(__x86_64__)
+  asm(".byte 0x0f, 0x01, 0xd0" : "=a"(xcr0) : "c"(0) : "%edx");
+#endif
+  return xcr0;
+}
+#else
+#define GetXCR0() 0
+#endif
+#if defined(_M_IX86) && defined(_MSC_VER) && (_MSC_VER < 1900)
+#pragma optimize("g", on)
+#endif
+
+static int cpuinfo_search(const char* cpuinfo_line,
+                          const char* needle,
+                          int needle_len) {
+  const char* p = strstr(cpuinfo_line, needle);
+  return p && (p[needle_len] == ' ' || p[needle_len] == '\n');
+}
+
+LIBYUV_API SAFEBUFFERS int ArmCpuCaps(const char* cpuinfo_name) {
+  char cpuinfo_line[512];
+  FILE* f = fopen(cpuinfo_name, "re");
+  if (!f) {
+    return kCpuHasNEON;
+  }
+  memset(cpuinfo_line, 0, sizeof(cpuinfo_line));
+  int features = 0;
+  while (fgets(cpuinfo_line, sizeof(cpuinfo_line), f)) {
+    if (memcmp(cpuinfo_line, "Features", 8) == 0) {
+      if (cpuinfo_search(cpuinfo_line, " neon", 5)) {
+        features |= kCpuHasNEON;
+      }
+    }
+  }
+  fclose(f);
+  return features;
+}
+
+#if defined(__aarch64__)
+#if defined(__linux__)
+#define YUV_AARCH64_HWCAP_ASIMDDP (1UL << 20)
+#define YUV_AARCH64_HWCAP_SVE (1UL << 22)
+#define YUV_AARCH64_HWCAP2_SVE2 (1UL << 1)
+#define YUV_AARCH64_HWCAP2_SVEF32MM (1UL << 10)
+#define YUV_AARCH64_HWCAP2_I8MM (1UL << 13)
+#define YUV_AARCH64_HWCAP2_SME (1UL << 23)
+#define YUV_AARCH64_HWCAP2_SME2 (1UL << 37)
+
+LIBYUV_API SAFEBUFFERS int AArch64CpuCaps(unsigned long hwcap,
+                                          unsigned long hwcap2) {
+  int features = kCpuHasNEON;
+
+  if (hwcap & YUV_AARCH64_HWCAP_ASIMDDP) {
+    features |= kCpuHasNeonDotProd;
+    if (hwcap2 & YUV_AARCH64_HWCAP2_I8MM) {
+      features |= kCpuHasNeonI8MM;
+      if (hwcap & YUV_AARCH64_HWCAP_SVE) {
+        features |= kCpuHasSVE;
+        if (hwcap2 & YUV_AARCH64_HWCAP2_SVEF32MM) {
+          features |= kCpuHasSVEF32MM;
+        }
+        if (hwcap2 & YUV_AARCH64_HWCAP2_SVE2) {
+          features |= kCpuHasSVE2;
+        }
+      }
+      if (hwcap2 & YUV_AARCH64_HWCAP2_SME) {
+        features |= kCpuHasSME;
+        if (hwcap2 & YUV_AARCH64_HWCAP2_SME2) {
+          features |= kCpuHasSME2;
+        }
+      }
+    }
+  }
+  return features;
+}
+
+#else
+LIBYUV_API SAFEBUFFERS int AArch64CpuCaps() {
+  int features = kCpuHasNEON;
+
+
+  return features;
+}
+#endif
+#endif
+
+LIBYUV_API SAFEBUFFERS int RiscvCpuCaps(const char* cpuinfo_name) {
+  char cpuinfo_line[512];
+  int flag = 0;
+  FILE* f = fopen(cpuinfo_name, "re");
+  if (!f) {
+#if defined(__riscv_vector)
+    return kCpuHasRVV;
+#else
+    return 0;
+#endif
+  }
+  memset(cpuinfo_line, 0, sizeof(cpuinfo_line));
+  while (fgets(cpuinfo_line, sizeof(cpuinfo_line), f)) {
+    if (memcmp(cpuinfo_line, "isa", 3) == 0) {
+      char* isa = strstr(cpuinfo_line, "rv64");
+      if (isa) {
+        size_t isa_len = strlen(isa);
+        char* extensions;
+        size_t extensions_len = 0;
+        size_t std_isa_len;
+        if (isa[isa_len - 1] == '\n') {
+          isa[--isa_len] = '\0';
+        }
+        if (isa_len < 5) {
+          fclose(f);
+          return 0;
+        }
+        isa += 5;
+        extensions = strpbrk(isa, "zxs");
+        if (extensions) {
+          extensions_len = strlen(extensions);
+          char* ext = extensions;
+          while (ext) {
+            char* next = strchr(ext, '_');
+            if (next) {
+              *next = '\0';
+              next++;
+            }
+            if (!strcmp(ext, "zvfh")) {
+              flag |= kCpuHasRVVZVFH;
+            }
+            ext = next;
+          }
+        }
+        std_isa_len = isa_len - extensions_len - 5;
+        if (memchr(isa, 'v', std_isa_len)) {
+          flag |= kCpuHasRVV;
+        }
+      }
+    }
+#if defined(__riscv_vector)
+    else if ((memcmp(cpuinfo_line, "vendor_id\t: GenuineIntel", 24) == 0) ||
+             (memcmp(cpuinfo_line, "vendor_id\t: AuthenticAMD", 24) == 0)) {
+      fclose(f);
+      return kCpuHasRVV;
+    }
+#endif
+  }
+  fclose(f);
+  return flag;
+}
+
+#if defined(__loongarch__) && defined(__linux__)
+#define YUV_LOONGARCH_HWCAP_LSX (1 << 4)
+#define YUV_LOONGARCH_HWCAP_LASX (1 << 5)
+
+LIBYUV_API SAFEBUFFERS int LoongArchCpuCaps(void) {
+  int flag = 0;
+  unsigned long hwcap = getauxval(AT_HWCAP);
+
+  if (hwcap & YUV_LOONGARCH_HWCAP_LSX)
+    flag |= kCpuHasLSX;
+
+  if (hwcap & YUV_LOONGARCH_HWCAP_LASX)
+    flag |= kCpuHasLASX;
+  return flag;
+}
+#endif
+
+static SAFEBUFFERS int GetCpuFlags(void) {
+  int cpu_info = 0;
+#if !defined(__pnacl__) && !defined(__CLR_VER) &&                   \
+    (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || \
+     defined(_M_IX86))
+  int cpu_info0[4] = {0, 0, 0, 0};
+  int cpu_info1[4] = {0, 0, 0, 0};
+  int cpu_info7[4] = {0, 0, 0, 0};
+  int cpu_einfo7[4] = {0, 0, 0, 0};
+  int cpu_info24[4] = {0, 0, 0, 0};
+  int cpu_info21[4] = {0, 0, 0, 0};
+  int cpu_amdinfo21[4] = {0, 0, 0, 0};
+  CpuId(0, 0, cpu_info0);
+  CpuId(1, 0, cpu_info1);
+  if (cpu_info0[0] >= 7) {
+    CpuId(7, 0, cpu_info7);
+    CpuId(7, 1, cpu_einfo7);
+    CpuId(0x80000021, 0, cpu_amdinfo21);
+  }
+  if (cpu_info0[0] >= 0x21) {
+    CpuId(0x21, 0, cpu_info21);
+  }
+  if (cpu_info0[0] >= 0x24) {
+    CpuId(0x24, 0, cpu_info24);
+  }
+  cpu_info = kCpuHasX86 | ((cpu_info1[3] & 0x04000000) ? kCpuHasSSE2 : 0) |
+             ((cpu_info1[2] & 0x00000200) ? kCpuHasSSSE3 : 0) |
+             ((cpu_info1[2] & 0x00080000) ? kCpuHasSSE41 : 0) |
+             ((cpu_info1[2] & 0x00100000) ? kCpuHasSSE42 : 0) |
+             ((cpu_info7[1] & 0x00000200) ? kCpuHasERMS : 0) |
+             ((cpu_info7[3] & 0x00000010) ? kCpuHasFSMR : 0);
+
+  if (((cpu_info1[2] & 0x1c000000) == 0x1c000000) &&  
+      ((GetXCR0() & 6) == 6)) {  
+    cpu_info |= kCpuHasAVX | ((cpu_info7[1] & 0x00000020) ? kCpuHasAVX2 : 0) |
+                ((cpu_info1[2] & 0x00001000) ? kCpuHasFMA3 : 0) |
+                ((cpu_info1[2] & 0x20000000) ? kCpuHasF16C : 0) |
+                ((cpu_einfo7[0] & 0x00000010) ? kCpuHasAVXVNNI : 0) |
+                ((cpu_einfo7[3] & 0x00000010) ? kCpuHasAVXVNNIINT8 : 0);
+
+    cpu_info |= ((cpu_amdinfo21[0] & 0x00008000) ? kCpuHasERMS : 0);
+
+    if ((GetXCR0() & 0xe0) == 0xe0 && (cpu_info7[1] & 0x00010000)) {
+      cpu_info |= ((cpu_info7[1] & 0x40000000) ? kCpuHasAVX512BW : 0) |
+                  ((cpu_info7[1] & 0x80000000) ? kCpuHasAVX512VL : 0) |
+                  ((cpu_info7[2] & 0x00000002) ? kCpuHasAVX512VBMI : 0) |
+                  ((cpu_info7[2] & 0x00000040) ? kCpuHasAVX512VBMI2 : 0) |
+                  ((cpu_info7[2] & 0x00000800) ? kCpuHasAVX512VNNI : 0) |
+                  ((cpu_info7[2] & 0x00001000) ? kCpuHasAVX512VBITALG : 0) |
+                  ((cpu_einfo7[3] & 0x00080000) ? kCpuHasAVX10 : 0) |
+                  ((cpu_info7[3] & 0x02000000) ? kCpuHasAMXINT8 : 0) |
+                  ((cpu_info21[0] & 0x00800000) ? kCpuHasAVX512BMM : 0);
+      if (cpu_info0[0] >= 0x24 && (cpu_einfo7[3] & 0x00080000)) {
+        cpu_info |= ((cpu_info24[1] & 0xFF) >= 2) ? kCpuHasAVX10_2 : 0;
+      }
+    }
+  }
+#endif
+#if defined(__loongarch__) && defined(__linux__)
+  cpu_info = LoongArchCpuCaps();
+  cpu_info |= kCpuHasLOONGARCH;
+#endif
+#if defined(__aarch64__)
+#if defined(__linux__)
+  unsigned long hwcap = getauxval(AT_HWCAP);
+  unsigned long hwcap2 = getauxval(AT_HWCAP2);
+  cpu_info = AArch64CpuCaps(hwcap, hwcap2);
+#else
+  cpu_info = AArch64CpuCaps();
+#endif
+  cpu_info |= kCpuHasARM;
+#endif
+#if defined(__arm__)
+#if defined(__linux__)
+  cpu_info = ArmCpuCaps("/proc/cpuinfo");
+#elif defined(__ARM_NEON__)
+  cpu_info = kCpuHasNEON;
+#else
+  cpu_info = 0;
+#endif
+  cpu_info |= kCpuHasARM;
+#endif
+#if defined(__riscv) && defined(__linux__)
+  cpu_info = RiscvCpuCaps("/proc/cpuinfo");
+  cpu_info |= kCpuHasRISCV;
+#endif
+  cpu_info |= kCpuInitialized;
+  return cpu_info;
+}
+
+LIBYUV_API
+int MaskCpuFlags(int enable_flags) {
+  int cpu_info = GetCpuFlags() & enable_flags;
+  SetCpuFlags(cpu_info);
+  return cpu_info;
+}
+
+LIBYUV_API
+int InitCpuFlags(void) {
+  return MaskCpuFlags(-1);
+}
+
+#if defined(__cplusplus)
+}  
+}  
+#endif

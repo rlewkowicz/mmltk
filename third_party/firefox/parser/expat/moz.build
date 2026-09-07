@@ -1,0 +1,27 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+include("sources.mozbuild")
+
+EXPORTS += [
+    'expat/lib/expat.h',
+    'expat/lib/expat_external.h',
+    'expat/lib/moz_expat.h',
+    'expat_config.h',
+    'expat_config_moz.h',
+]
+
+SOURCES += expat_sources
+
+LOCAL_INCLUDES += [
+]
+
+FINAL_LIBRARY = 'xul'
+
+# Expat 2.8.2 added fallthrough annotations unreachable in our instantiation
+# (upstream PR 1224), tripping clang's -Wunreachable-code-fallthrough.
+CFLAGS += ['-Wno-unreachable-code-fallthrough']
+
+for k, v in expat_defines:
+    DEFINES[k] = v

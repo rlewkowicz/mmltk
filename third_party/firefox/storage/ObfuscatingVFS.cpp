@@ -1,0 +1,640 @@
+/*
+** 2020-04-20
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+******************************************************************************
+**
+** This file implements a VFS shim that obfuscates database content
+** written to disk by applying a CipherStrategy.
+**
+** COMPILING
+**
+** This extension requires SQLite 3.32.0 or later.
+**
+**
+** LOADING
+**
+** Initialize it using a single API call as follows:
+**
+**     sqlite3_obfsvfs_init();
+**
+** Obfsvfs is a VFS Shim. When loaded, "obfsvfs" becomes the new
+** default VFS and it uses the prior default VFS as the next VFS
+** down in the stack.  This is normally what you want.  However, it
+** complex situations where multiple VFS shims are being loaded,
+** it might be important to ensure that obfsvfs is loaded in the
+** correct order so that it sequences itself into the default VFS
+** Shim stack in the right order.
+**
+** USING
+**
+** Open database connections using the sqlite3_open_v2() with
+** the SQLITE_OPEN_URI flag and using a URI filename that includes
+** the query parameter "key=XXXXXXXXXXX..." where the XXXX... consists
+** of 64 hexadecimal digits (32 bytes of content).
+**
+** Create a new encrypted database by opening a file that does not
+** yet exist using the key= query parameter.
+**
+** LIMITATIONS:
+**
+**    *   An obfuscated database must be created as such.  There is
+**        no way to convert an existing database file into an
+**        obfuscated database file other than to run ".dump" on the
+**        older database and reimport the SQL text into a new
+**        obfuscated database.
+**
+**    *   There is no way to change the key value, other than to
+**        ".dump" and restore the database
+**
+**    *   The database page size must be exactly 8192 bytes.  No other
+**        database page sizes are currently supported.
+**
+**    *   Memory-mapped I/O does not work for obfuscated databases.
+**        If you think about it, memory-mapped I/O doesn't make any
+**        sense for obfuscated databases since you have to make a
+**        copy of the content to deobfuscate anyhow - you might as
+**        well use normal read()/write().
+**
+**    *   Only the main database, the rollback journal, and WAL file
+**        are obfuscated.  Other temporary files used for things like
+**        SAVEPOINTs or as part of a large external sort remain
+**        unobfuscated.
+**
+**    *   Requires SQLite 3.32.0 or later.
+*/
+#include "ObfuscatingVFS.h"
+
+#include <string.h>
+#include <ctype.h>
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+
+#include "mozilla/dom/quota/IPCStreamCipherStrategy.h"
+#include "mozilla/Logging.h"
+#include "mozilla/ScopeExit.h"
+#include "nsPrintfCString.h"
+#include "nsString.h"
+#include "QuotaVFS.h"
+#include "sqlite3.h"
+
+using ObfsVfs = sqlite3_vfs;
+
+#if !defined(SQLITE_CORE)
+using u8 = unsigned char;
+#endif
+
+#define ORIGVFS(p) ((sqlite3_vfs*)((p)->pAppData))
+#define ORIGFILE(p) ((sqlite3_file*)(((ObfsFile*)(p)) + 1))
+
+#define OBFS_PGSZ (::mozilla::storage::obfsvfs::kObfsPageSize)
+
+#define WAL_FRAMEHDRSIZE 24
+
+using namespace mozilla;
+using namespace mozilla::dom::quota;
+
+static constexpr int kKeyBytes = sizeof(IPCStreamCipherStrategy::KeyType);
+
+struct ObfsFile {
+  sqlite3_file base;  
+  const char* zFName; 
+  bool inCkpt;        
+  ObfsFile* pPartner; 
+  void* pTemp;        
+  IPCStreamCipherStrategy*
+      encryptCipherStrategy; 
+  IPCStreamCipherStrategy*
+      decryptCipherStrategy; 
+  bool aHasUriKey;
+  u8 aKey[kKeyBytes];
+};
+
+static int obfsClose(sqlite3_file*);
+static int obfsRead(sqlite3_file*, void*, int iAmt, sqlite3_int64 iOfst);
+static int obfsWrite(sqlite3_file*, const void*, int iAmt, sqlite3_int64 iOfst);
+static int obfsTruncate(sqlite3_file*, sqlite3_int64 size);
+static int obfsSync(sqlite3_file*, int flags);
+static int obfsFileSize(sqlite3_file*, sqlite3_int64* pSize);
+static int obfsLock(sqlite3_file*, int);
+static int obfsUnlock(sqlite3_file*, int);
+static int obfsCheckReservedLock(sqlite3_file*, int* pResOut);
+static int obfsFileControl(sqlite3_file*, int op, void* pArg);
+static int obfsSectorSize(sqlite3_file*);
+static int obfsDeviceCharacteristics(sqlite3_file*);
+static int obfsShmMap(sqlite3_file*, int iPg, int pgsz, int, void volatile**);
+static int obfsShmLock(sqlite3_file*, int offset, int n, int flags);
+static void obfsShmBarrier(sqlite3_file*);
+static int obfsShmUnmap(sqlite3_file*, int deleteFlag);
+static int obfsFetch(sqlite3_file*, sqlite3_int64 iOfst, int iAmt, void** pp);
+static int obfsUnfetch(sqlite3_file*, sqlite3_int64 iOfst, void* p);
+
+static int obfsOpen(sqlite3_vfs*, const char*, sqlite3_file*, int, int*);
+static int obfsDelete(sqlite3_vfs*, const char* zPath, int syncDir);
+static int obfsAccess(sqlite3_vfs*, const char* zPath, int flags, int*);
+static int obfsFullPathname(sqlite3_vfs*, const char* zPath, int, char* zOut);
+static void* obfsDlOpen(sqlite3_vfs*, const char* zPath);
+static void obfsDlError(sqlite3_vfs*, int nByte, char* zErrMsg);
+static void (*obfsDlSym(sqlite3_vfs* pVfs, void* p, const char* zSym))(void);
+static void obfsDlClose(sqlite3_vfs*, void*);
+static int obfsRandomness(sqlite3_vfs*, int nByte, char* zBufOut);
+static int obfsSleep(sqlite3_vfs*, int nMicroseconds);
+static int obfsCurrentTime(sqlite3_vfs*, double*);
+static int obfsGetLastError(sqlite3_vfs*, int, char*);
+static int obfsCurrentTimeInt64(sqlite3_vfs*, sqlite3_int64*);
+static int obfsSetSystemCall(sqlite3_vfs*, const char*, sqlite3_syscall_ptr);
+static sqlite3_syscall_ptr obfsGetSystemCall(sqlite3_vfs*, const char* z);
+static const char* obfsNextSystemCall(sqlite3_vfs*, const char* zName);
+
+static const sqlite3_io_methods obfs_io_methods = {
+    3,                         
+    obfsClose,                 
+    obfsRead,                  
+    obfsWrite,                 
+    obfsTruncate,              
+    obfsSync,                  
+    obfsFileSize,              
+    obfsLock,                  
+    obfsUnlock,                
+    obfsCheckReservedLock,     
+    obfsFileControl,           
+    obfsSectorSize,            
+    obfsDeviceCharacteristics, 
+    obfsShmMap,                
+    obfsShmLock,               
+    obfsShmBarrier,            
+    obfsShmUnmap,              
+    obfsFetch,                 
+    obfsUnfetch                
+};
+
+static constexpr int kIvBytes = IPCStreamCipherStrategy::BlockPrefixLength;
+static constexpr int kClearTextPrefixBytesOnFirstPage = 32;
+static constexpr int kReservedBytes = 32;
+static constexpr int kBasicBlockSize = IPCStreamCipherStrategy::BasicBlockSize;
+static_assert(kClearTextPrefixBytesOnFirstPage % kBasicBlockSize == 0);
+static_assert(kReservedBytes % kBasicBlockSize == 0);
+
+static constexpr int kChangeCounterOffset = 24;
+static constexpr int kChangeCounterBytes = 16;
+
+static void* obfsEncode(ObfsFile* p, 
+                        u8* a,       
+                        int nByte 
+) {
+  u8 aIv[kIvBytes];
+  u8* pOut;
+  int i;
+
+  static_assert((kIvBytes & (kIvBytes - 1)) == 0);
+  sqlite3_randomness(kIvBytes, aIv);
+  pOut = (u8*)p->pTemp;
+  if (pOut == nullptr) {
+    pOut = static_cast<u8*>(sqlite3_malloc64(nByte));
+    if (pOut == nullptr) {
+      NS_WARNING(nsPrintfCString("unable to allocate a buffer in which to"
+                                 " write obfuscated database content for %s",
+                                 p->zFName)
+                     .get());
+      return nullptr;
+    }
+    p->pTemp = pOut;
+  }
+  if (memcmp(a, "SQLite format 3", 16) == 0) {
+    i = kClearTextPrefixBytesOnFirstPage;
+    if (a[20] != kReservedBytes) {
+      NS_WARNING(nsPrintfCString("obfuscated database must have reserved-bytes"
+                                 " set to %d",
+                                 kReservedBytes)
+                     .get());
+      return nullptr;
+    }
+    memcpy(pOut, a, kClearTextPrefixBytesOnFirstPage);
+  } else {
+    i = 0;
+  }
+  const int payloadLength = nByte - kReservedBytes - i;
+  MOZ_ASSERT(payloadLength > 0);
+  p->encryptCipherStrategy->Cipher(
+      Span{aIv}, Span{a + i, static_cast<unsigned>(payloadLength)},
+      Span{pOut + i, static_cast<unsigned>(payloadLength)});
+  memcpy(pOut + nByte - kReservedBytes, aIv, kIvBytes);
+
+  return pOut;
+}
+
+static void obfsDecode(ObfsFile* p, 
+                       u8* a,       
+                       int nByte 
+) {
+  int i;
+
+  if (memcmp(a, "SQLite format 3", 16) == 0) {
+    i = kClearTextPrefixBytesOnFirstPage;
+  } else {
+    i = 0;
+  }
+  const int payloadLength = nByte - kReservedBytes - i;
+  MOZ_ASSERT(payloadLength > 0);
+  p->decryptCipherStrategy->Cipher(
+      Span{a + nByte - kReservedBytes, kIvBytes},
+      Span{a + i, static_cast<unsigned>(payloadLength)},
+      Span{a + i, static_cast<unsigned>(payloadLength)});
+  memset(a + nByte - kReservedBytes, 0, kIvBytes);
+}
+
+static int obfsClose(sqlite3_file* pFile) {
+  ObfsFile* p = (ObfsFile*)pFile;
+  if (p->pPartner) {
+    MOZ_ASSERT(p->pPartner->pPartner == p);
+    p->pPartner->pPartner = nullptr;
+    p->pPartner = nullptr;
+  }
+  sqlite3_free(p->pTemp);
+
+  delete p->decryptCipherStrategy;
+  delete p->encryptCipherStrategy;
+
+  ::memset(p->aKey, 0, sizeof(p->aKey));
+
+  pFile = ORIGFILE(pFile);
+  return pFile->pMethods->xClose(pFile);
+}
+
+static int obfsRead(sqlite3_file* pFile, void* zBuf, int iAmt,
+                    sqlite_int64 iOfst) {
+  int rc;
+  ObfsFile* p = (ObfsFile*)pFile;
+  pFile = ORIGFILE(pFile);
+
+  if (!p->inCkpt && iOfst == kChangeCounterOffset &&
+      iAmt == kChangeCounterBytes) {
+    u8 aPage1[OBFS_PGSZ];
+    rc = pFile->pMethods->xRead(pFile, aPage1, OBFS_PGSZ, 0);
+    if (rc == SQLITE_OK && memcmp(aPage1, "SQLite format 3", 16) == 0) {
+      obfsDecode(p, aPage1, OBFS_PGSZ);
+      memcpy(zBuf, aPage1 + kChangeCounterOffset, kChangeCounterBytes);
+      return SQLITE_OK;
+    }
+  }
+
+  rc = pFile->pMethods->xRead(pFile, zBuf, iAmt, iOfst);
+  if (rc == SQLITE_OK) {
+    if ((iAmt == OBFS_PGSZ || iAmt == OBFS_PGSZ + WAL_FRAMEHDRSIZE) &&
+        !p->inCkpt) {
+      obfsDecode(p, ((u8*)zBuf) + iAmt - OBFS_PGSZ, OBFS_PGSZ);
+    }
+  } else if (rc == SQLITE_IOERR_SHORT_READ && iOfst == 0 && iAmt >= 100) {
+    static const unsigned char aEmptyDb[] = {
+        0x53, 0x51, 0x4c, 0x69, 0x74, 0x65, 0x20, 0x66, 0x6f, 0x72, 0x6d, 0x61,
+        0x74, 0x20, 0x33, 0x00,
+        0x20, 0x00, 0x02, 0x02, kReservedBytes, 0x40, 0x20, 0x20, 0x00, 0x00,
+        0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00,
+        0x00, 0x00, 0x00, 0x01};
+
+    memcpy(zBuf, aEmptyDb, sizeof(aEmptyDb));
+    memset(((u8*)zBuf) + sizeof(aEmptyDb), 0, iAmt - sizeof(aEmptyDb));
+    rc = SQLITE_OK;
+  }
+  return rc;
+}
+
+static int obfsWrite(sqlite3_file* pFile, const void* zBuf, int iAmt,
+                     sqlite_int64 iOfst) {
+  ObfsFile* p = (ObfsFile*)pFile;
+  pFile = ORIGFILE(pFile);
+  if (iAmt == OBFS_PGSZ && !p->inCkpt) {
+    zBuf = obfsEncode(p, (u8*)zBuf, iAmt);
+    if (zBuf == nullptr) {
+      return SQLITE_IOERR;
+    }
+  }
+  return pFile->pMethods->xWrite(pFile, zBuf, iAmt, iOfst);
+}
+
+static int obfsTruncate(sqlite3_file* pFile, sqlite_int64 size) {
+  pFile = ORIGFILE(pFile);
+  return pFile->pMethods->xTruncate(pFile, size);
+}
+
+static int obfsSync(sqlite3_file* pFile, int flags) {
+  pFile = ORIGFILE(pFile);
+  return pFile->pMethods->xSync(pFile, flags);
+}
+
+static int obfsFileSize(sqlite3_file* pFile, sqlite_int64* pSize) {
+  ObfsFile* p = (ObfsFile*)pFile;
+  pFile = ORIGFILE(p);
+  return pFile->pMethods->xFileSize(pFile, pSize);
+}
+
+static int obfsLock(sqlite3_file* pFile, int eLock) {
+  pFile = ORIGFILE(pFile);
+  return pFile->pMethods->xLock(pFile, eLock);
+}
+
+static int obfsUnlock(sqlite3_file* pFile, int eLock) {
+  pFile = ORIGFILE(pFile);
+  return pFile->pMethods->xUnlock(pFile, eLock);
+}
+
+static int obfsCheckReservedLock(sqlite3_file* pFile, int* pResOut) {
+  pFile = ORIGFILE(pFile);
+  return pFile->pMethods->xCheckReservedLock(pFile, pResOut);
+}
+
+static int obfsFileControl(sqlite3_file* pFile, int op, void* pArg) {
+  int rc;
+  ObfsFile* p = (ObfsFile*)pFile;
+  pFile = ORIGFILE(pFile);
+  if (op == SQLITE_FCNTL_PRAGMA) {
+    char** azArg = (char**)pArg;
+    MOZ_ASSERT(azArg[1] != nullptr);
+    if (azArg[2] != nullptr && sqlite3_stricmp(azArg[1], "page_size") == 0) {
+      return SQLITE_OK;
+    }
+  } else if (op == SQLITE_FCNTL_CKPT_START || op == SQLITE_FCNTL_CKPT_DONE) {
+    p->inCkpt = op == SQLITE_FCNTL_CKPT_START;
+    if (p->pPartner) {
+      p->pPartner->inCkpt = p->inCkpt;
+    }
+  }
+  rc = pFile->pMethods->xFileControl(pFile, op, pArg);
+  if (rc == SQLITE_OK && op == SQLITE_FCNTL_VFSNAME) {
+    *(char**)pArg = sqlite3_mprintf("obfs/%z", *(char**)pArg);
+  }
+  return rc;
+}
+
+static int obfsSectorSize(sqlite3_file* pFile) {
+  pFile = ORIGFILE(pFile);
+  return pFile->pMethods->xSectorSize(pFile);
+}
+
+static int obfsDeviceCharacteristics(sqlite3_file* pFile) {
+  int dc;
+  pFile = ORIGFILE(pFile);
+  dc = pFile->pMethods->xDeviceCharacteristics(pFile);
+  return dc & ~SQLITE_IOCAP_SUBPAGE_READ; 
+}
+
+static int obfsShmMap(sqlite3_file* pFile, int iPg, int pgsz, int bExtend,
+                      void volatile** pp) {
+  pFile = ORIGFILE(pFile);
+  return pFile->pMethods->xShmMap(pFile, iPg, pgsz, bExtend, pp);
+}
+
+static int obfsShmLock(sqlite3_file* pFile, int offset, int n, int flags) {
+  pFile = ORIGFILE(pFile);
+  return pFile->pMethods->xShmLock(pFile, offset, n, flags);
+}
+
+static void obfsShmBarrier(sqlite3_file* pFile) {
+  pFile = ORIGFILE(pFile);
+  pFile->pMethods->xShmBarrier(pFile);
+}
+
+static int obfsShmUnmap(sqlite3_file* pFile, int deleteFlag) {
+  pFile = ORIGFILE(pFile);
+  return pFile->pMethods->xShmUnmap(pFile, deleteFlag);
+}
+
+static int obfsFetch(sqlite3_file* pFile, sqlite3_int64 iOfst, int iAmt,
+                     void** pp) {
+  *pp = nullptr;
+  return SQLITE_OK;
+}
+
+static int obfsUnfetch(sqlite3_file* pFile, sqlite3_int64 iOfst, void* pPage) {
+  pFile = ORIGFILE(pFile);
+  return pFile->pMethods->xUnfetch(pFile, iOfst, pPage);
+}
+
+static u8 obfsHexToInt(int h) {
+  MOZ_ASSERT((h >= '0' && h <= '9') || (h >= 'a' && h <= 'f') ||
+             (h >= 'A' && h <= 'F'));
+#if 1 /* ASCII */
+  h += 9 * (1 & (h >> 6));
+#else /* EBCDIC */
+  h += 9 * (1 & ~(h >> 4));
+#endif
+  return (u8)(h & 0xf);
+}
+
+/*
+** Open a new file.
+**
+** If the file is an ordinary database file, or a rollback or WAL journal
+** file, and if the key=XXXX parameter exists, then try to open the file
+** as an obfuscated database.  All other open attempts fall through into
+** the lower-level VFS shim.
+**
+** If the key=XXXX parameter exists but is not 64-bytes of hex key, then
+** put an error message in NS_WARNING() and return SQLITE_CANTOPEN.
+*/
+static int obfsOpen(sqlite3_vfs* pVfs, const char* zName, sqlite3_file* pFile,
+                    int flags, int* pOutFlags) {
+  ObfsFile* p;
+  sqlite3_file* pSubFile;
+  sqlite3_vfs* pSubVfs;
+  int rc, i;
+  const char* zKey;
+  u8 aKey[kKeyBytes];
+  pSubVfs = ORIGVFS(pVfs);
+  if (flags &
+      (SQLITE_OPEN_MAIN_DB | SQLITE_OPEN_WAL | SQLITE_OPEN_MAIN_JOURNAL)) {
+    zKey = sqlite3_uri_parameter(zName, "key");
+  } else {
+    zKey = nullptr;
+  }
+  const bool keyFromUri = (zKey != nullptr);
+
+  bool keyReady = false;
+  if (zKey == nullptr &&
+      (flags & (SQLITE_OPEN_WAL | SQLITE_OPEN_MAIN_JOURNAL))) {
+    sqlite3_file* pDbFile = sqlite3_database_file_object(zName);
+    if (pDbFile && pDbFile->pMethods == &obfs_io_methods) {
+      ObfsFile* pPartner = reinterpret_cast<ObfsFile*>(pDbFile);
+      if (pPartner->aHasUriKey) {
+        ::memcpy(aKey, pPartner->aKey, sizeof(aKey));
+        keyReady = true;
+      }
+    }
+  }
+
+  if (!keyReady && zKey == nullptr) {
+    return pSubVfs->xOpen(pSubVfs, zName, pFile, flags, pOutFlags);
+  }
+  if (!keyReady) {
+    for (i = 0;
+         i < kKeyBytes && isxdigit(zKey[i * 2]) && isxdigit(zKey[i * 2 + 1]);
+         i++) {
+      aKey[i] =
+          (obfsHexToInt(zKey[i * 2]) << 4) | obfsHexToInt(zKey[i * 2 + 1]);
+    }
+    if (i != kKeyBytes) {
+      NS_WARNING(
+          nsPrintfCString("invalid query parameter on %s: key=%s", zName, zKey)
+              .get());
+      return SQLITE_CANTOPEN;
+    }
+  }
+  p = (ObfsFile*)pFile;
+  memset(p, 0, sizeof(*p));
+
+  auto encryptCipherStrategy = MakeUnique<IPCStreamCipherStrategy>();
+  auto decryptCipherStrategy = MakeUnique<IPCStreamCipherStrategy>();
+
+  auto resetMethods = MakeScopeExit([pFile] { pFile->pMethods = nullptr; });
+
+  if (NS_WARN_IF(NS_FAILED(encryptCipherStrategy->Init(
+          CipherMode::Encrypt, Span{aKey, sizeof(aKey)},
+          IPCStreamCipherStrategy::MakeBlockPrefix())))) {
+    return SQLITE_ERROR;
+  }
+
+  if (NS_WARN_IF(NS_FAILED(decryptCipherStrategy->Init(
+          CipherMode::Decrypt, Span{aKey, sizeof(aKey)})))) {
+    return SQLITE_ERROR;
+  }
+
+  pSubFile = ORIGFILE(pFile);
+  p->base.pMethods = &obfs_io_methods;
+  rc = pSubVfs->xOpen(pSubVfs, zName, pSubFile, flags, pOutFlags);
+  if (rc) {
+    return rc;
+  }
+
+  resetMethods.release();
+
+  if (flags & (SQLITE_OPEN_WAL | SQLITE_OPEN_MAIN_JOURNAL)) {
+    sqlite3_file* pDb = sqlite3_database_file_object(zName);
+    p->pPartner = (ObfsFile*)pDb;
+    MOZ_ASSERT(p->pPartner->pPartner == nullptr);
+    p->pPartner->pPartner = p;
+  }
+  p->zFName = zName;
+
+  p->encryptCipherStrategy = encryptCipherStrategy.release();
+  p->decryptCipherStrategy = decryptCipherStrategy.release();
+
+  if (keyFromUri) {
+    p->aHasUriKey = true;
+    ::memcpy(p->aKey, aKey, sizeof(aKey));
+  }
+
+  return SQLITE_OK;
+}
+
+static int obfsDelete(sqlite3_vfs* pVfs, const char* zPath, int syncDir) {
+  return ORIGVFS(pVfs)->xDelete(ORIGVFS(pVfs), zPath, syncDir);
+}
+static int obfsAccess(sqlite3_vfs* pVfs, const char* zPath, int flags,
+                      int* pResOut) {
+  return ORIGVFS(pVfs)->xAccess(ORIGVFS(pVfs), zPath, flags, pResOut);
+}
+static int obfsFullPathname(sqlite3_vfs* pVfs, const char* zPath, int nOut,
+                            char* zOut) {
+  return ORIGVFS(pVfs)->xFullPathname(ORIGVFS(pVfs), zPath, nOut, zOut);
+}
+static void* obfsDlOpen(sqlite3_vfs* pVfs, const char* zPath) {
+  return ORIGVFS(pVfs)->xDlOpen(ORIGVFS(pVfs), zPath);
+}
+static void obfsDlError(sqlite3_vfs* pVfs, int nByte, char* zErrMsg) {
+  ORIGVFS(pVfs)->xDlError(ORIGVFS(pVfs), nByte, zErrMsg);
+}
+static void (*obfsDlSym(sqlite3_vfs* pVfs, void* p, const char* zSym))(void) {
+  return ORIGVFS(pVfs)->xDlSym(ORIGVFS(pVfs), p, zSym);
+}
+static void obfsDlClose(sqlite3_vfs* pVfs, void* pHandle) {
+  ORIGVFS(pVfs)->xDlClose(ORIGVFS(pVfs), pHandle);
+}
+static int obfsRandomness(sqlite3_vfs* pVfs, int nByte, char* zBufOut) {
+  return ORIGVFS(pVfs)->xRandomness(ORIGVFS(pVfs), nByte, zBufOut);
+}
+static int obfsSleep(sqlite3_vfs* pVfs, int nMicroseconds) {
+  return ORIGVFS(pVfs)->xSleep(ORIGVFS(pVfs), nMicroseconds);
+}
+static int obfsCurrentTime(sqlite3_vfs* pVfs, double* pTimeOut) {
+  return ORIGVFS(pVfs)->xCurrentTime(ORIGVFS(pVfs), pTimeOut);
+}
+static int obfsGetLastError(sqlite3_vfs* pVfs, int a, char* b) {
+  return ORIGVFS(pVfs)->xGetLastError(ORIGVFS(pVfs), a, b);
+}
+static int obfsCurrentTimeInt64(sqlite3_vfs* pVfs, sqlite3_int64* p) {
+  return ORIGVFS(pVfs)->xCurrentTimeInt64(ORIGVFS(pVfs), p);
+}
+static int obfsSetSystemCall(sqlite3_vfs* pVfs, const char* zName,
+                             sqlite3_syscall_ptr pCall) {
+  return ORIGVFS(pVfs)->xSetSystemCall(ORIGVFS(pVfs), zName, pCall);
+}
+static sqlite3_syscall_ptr obfsGetSystemCall(sqlite3_vfs* pVfs,
+                                             const char* zName) {
+  return ORIGVFS(pVfs)->xGetSystemCall(ORIGVFS(pVfs), zName);
+}
+static const char* obfsNextSystemCall(sqlite3_vfs* pVfs, const char* zName) {
+  return ORIGVFS(pVfs)->xNextSystemCall(ORIGVFS(pVfs), zName);
+}
+
+namespace mozilla::storage::obfsvfs {
+
+const char* GetVFSName() { return "obfsvfs"; }
+
+UniquePtr<sqlite3_vfs> ConstructVFS(const char* aBaseVFSName) {
+  MOZ_ASSERT(aBaseVFSName);
+
+  if (sqlite3_vfs_find(GetVFSName()) != nullptr) {
+    return nullptr;
+  }
+  sqlite3_vfs* const pOrig = sqlite3_vfs_find(aBaseVFSName);
+  if (pOrig == nullptr) {
+    return nullptr;
+  }
+
+#ifdef DEBUG
+  static constexpr int kLastKnownVfsVersion = 3;
+  MOZ_ASSERT(pOrig->iVersion <= kLastKnownVfsVersion);
+#endif
+
+  const sqlite3_vfs obfs_vfs = {
+      pOrig->iVersion,                                      
+      static_cast<int>(pOrig->szOsFile + sizeof(ObfsFile)), 
+      pOrig->mxPathname,                                    
+      nullptr,                                              
+      GetVFSName(),                                         
+      pOrig,                                                
+      obfsOpen,                                             
+      obfsDelete,                                           
+      obfsAccess,                                           
+      obfsFullPathname,                                     
+      obfsDlOpen,                                           
+      obfsDlError,                                          
+      obfsDlSym,                                            
+      obfsDlClose,                                          
+      obfsRandomness,                                       
+      obfsSleep,                                            
+      obfsCurrentTime,                                      
+      obfsGetLastError,                                     
+      obfsCurrentTimeInt64, 
+      obfsSetSystemCall,    
+      obfsGetSystemCall,    
+      obfsNextSystemCall    
+  };
+
+  return MakeUnique<sqlite3_vfs>(obfs_vfs);
+}
+
+already_AddRefed<QuotaObject> GetQuotaObjectForFile(sqlite3_file* pFile) {
+  return quotavfs::GetQuotaObjectForFile(ORIGFILE(pFile));
+}
+
+}  

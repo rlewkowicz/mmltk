@@ -1,0 +1,88 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef IdleTaskRunner_h
+#define IdleTaskRunner_h
+
+#include "mozilla/TimeStamp.h"
+#include "nsIEventTarget.h"
+#include "nsISupports.h"
+#include "nsITimer.h"
+#include "nsString.h"
+#include <functional>
+
+namespace mozilla {
+
+class IdleTaskRunnerTask;
+
+class IdleTaskRunner {
+ public:
+  friend class IdleTaskRunnerTask;
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(IdleTaskRunner)
+
+  using CallbackType = std::function<bool(TimeStamp aDeadline)>;
+
+  using MayStopProcessingCallbackType = std::function<bool()>;
+
+  using RequestInterruptCallbackType = std::function<void(uint32_t)>;
+
+ public:
+  static already_AddRefed<IdleTaskRunner> Create(
+      const CallbackType& aCallback, const nsACString& aRunnableName,
+      TimeDuration aStartDelay, TimeDuration aMaxDelay,
+      TimeDuration aMinimumUsefulBudget, bool aRepeating,
+      const MayStopProcessingCallbackType& aMayStopProcessing,
+      const RequestInterruptCallbackType& aRequestInterrupt = nullptr);
+
+  void Run();
+
+  void SetIdleDeadline(mozilla::TimeStamp aDeadline);
+
+  void SetTimer(TimeDuration aDelay, nsIEventTarget* aTarget);
+
+  void ResetTimer(TimeDuration aDelay);
+
+  void SetMinimumUsefulBudget(int64_t aMinimumUsefulBudget);
+
+  void Cancel();
+
+  void Schedule(bool aAllowIdleDispatch);
+
+  const nsACString& GetName() { return mName; }
+
+ private:
+  explicit IdleTaskRunner(
+      const CallbackType& aCallback, const nsACString& aRunnableName,
+      TimeDuration aStartDelay, TimeDuration aMaxDelay,
+      TimeDuration aMinimumUsefulBudget, bool aRepeating,
+      const MayStopProcessingCallbackType& aMayStopProcessing,
+      const RequestInterruptCallbackType& aRequestInterrupt);
+  ~IdleTaskRunner();
+  void CancelTimer();
+  void SetTimerInternal(TimeDuration aDelay);
+  static void TimedOut(nsITimer* aTimer, void* aClosure);
+
+  nsCOMPtr<nsITimer> mTimer;
+  nsCOMPtr<nsITimer> mScheduleTimer;
+  CallbackType mCallback;
+
+  const mozilla::TimeStamp mStartTime;
+
+  TimeDuration mMaxDelay;
+
+  TimeStamp mDeadline;
+
+  TimeDuration mMinimumUsefulBudget;
+
+  bool mRepeating;
+  bool mTimerActive;
+  MayStopProcessingCallbackType mMayStopProcessing;
+  RequestInterruptCallbackType mRequestInterrupt;
+  nsCString mName;
+  RefPtr<IdleTaskRunnerTask> mTask;
+};
+
+}  
+
+#endif

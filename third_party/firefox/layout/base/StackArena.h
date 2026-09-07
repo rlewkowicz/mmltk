@@ -1,0 +1,70 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef StackArena_h
+#define StackArena_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/MemoryReporting.h"
+#include "nsError.h"
+
+namespace mozilla {
+
+struct StackBlock;
+struct StackMark;
+class AutoStackArena;
+
+class StackArena {
+ private:
+  friend class AutoStackArena;
+  StackArena();
+  ~StackArena();
+
+  void* Allocate(size_t aSize);
+  void Push();
+  void Pop();
+
+  size_t SizeOfExcludingThis(mozilla::MallocSizeOf aMallocSizeOf) const;
+
+  size_t mPos;
+
+  StackBlock* mBlocks;
+
+  StackBlock* mCurBlock;
+
+  StackMark* mMarks;
+
+  uint32_t mStackTop;
+
+  uint32_t mMarkLength;
+};
+
+class MOZ_RAII AutoStackArena {
+ public:
+  AutoStackArena() : mOwnsStackArena(false) {
+    if (!gStackArena) {
+      gStackArena = new StackArena();
+      mOwnsStackArena = true;
+    }
+    gStackArena->Push();
+  }
+
+  ~AutoStackArena() {
+    gStackArena->Pop();
+    if (mOwnsStackArena) {
+      delete gStackArena;
+      gStackArena = nullptr;
+    }
+  }
+
+  static void* Allocate(size_t aSize) { return gStackArena->Allocate(aSize); }
+
+ private:
+  static StackArena* gStackArena;
+  bool mOwnsStackArena;
+};
+
+}  
+
+#endif

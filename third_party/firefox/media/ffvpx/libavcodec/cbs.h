@@ -1,0 +1,206 @@
+/*
+ * This file is part of FFmpeg.
+ *
+ * FFmpeg is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * FFmpeg is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with FFmpeg; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ */
+
+#ifndef AVCODEC_CBS_H
+#define AVCODEC_CBS_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include "libavutil/buffer.h"
+
+#include "codec_id.h"
+#include "codec_par.h"
+#include "defs.h"
+#include "packet.h"
+
+#ifndef CBS_PREFIX
+#define CBS_PREFIX cbs
+#endif
+
+#define CBS_FUNC_PREFIX_NAME(prefix, name) ff_ ## prefix ## _ ## name
+#define CBS_FUNC_NAME(prefix, name) CBS_FUNC_PREFIX_NAME(prefix, name)
+#define CBS_FUNC(name) CBS_FUNC_NAME(CBS_PREFIX, name)
+
+
+struct AVCodecContext;
+struct CodedBitstreamType;
+
+typedef uint32_t CodedBitstreamUnitType;
+
+typedef struct CodedBitstreamUnit {
+    CodedBitstreamUnitType type;
+
+    uint8_t *data;
+    size_t   data_size;
+    size_t   data_bit_padding;
+    AVBufferRef *data_ref;
+
+    void *content;
+    void *content_ref;
+} CodedBitstreamUnit;
+
+typedef struct CodedBitstreamFragment {
+    uint8_t *data;
+    size_t   data_size;
+    size_t data_bit_padding;
+    AVBufferRef *data_ref;
+
+    int              nb_units;
+
+     int             nb_units_allocated;
+
+    CodedBitstreamUnit *units;
+} CodedBitstreamFragment;
+
+
+struct CodedBitstreamContext;
+struct GetBitContext;
+struct PutBitContext;
+
+typedef void (*CBSTraceReadCallback)(void *trace_context,
+                                     struct GetBitContext *gbc,
+                                     int start_position,
+                                     const char *name,
+                                     const int *subscripts,
+                                     int64_t value);
+
+typedef void (*CBSTraceWriteCallback)(void *trace_context,
+                                      struct PutBitContext *pbc,
+                                      int start_position,
+                                      const char *name,
+                                      const int *subscripts,
+                                      int64_t value);
+
+typedef struct CodedBitstreamContext {
+    void *log_ctx;
+
+    const struct CodedBitstreamType *codec;
+
+    void *priv_data;
+
+    const CodedBitstreamUnitType *decompose_unit_types;
+    int nb_decompose_unit_types;
+
+    int trace_enable;
+    int trace_level;
+    void *trace_context;
+    CBSTraceReadCallback  trace_read_callback;
+    CBSTraceWriteCallback trace_write_callback;
+
+    uint8_t *write_buffer;
+    size_t   write_buffer_size;
+} CodedBitstreamContext;
+
+
+extern const enum AVCodecID CBS_FUNC(all_codec_ids)[];
+
+
+int CBS_FUNC(init)(CodedBitstreamContext **ctx,
+                enum AVCodecID codec_id, void *log_ctx);
+
+void CBS_FUNC(flush)(CodedBitstreamContext *ctx);
+
+void CBS_FUNC(close)(CodedBitstreamContext **ctx);
+
+
+int CBS_FUNC(read_extradata)(CodedBitstreamContext *ctx,
+                          CodedBitstreamFragment *frag,
+                          const AVCodecParameters *par);
+
+int CBS_FUNC(read_extradata_from_codec)(CodedBitstreamContext *ctx,
+                                     CodedBitstreamFragment *frag,
+                                     const struct AVCodecContext *avctx);
+
+int CBS_FUNC(read_packet_side_data)(CodedBitstreamContext *ctx,
+                                 CodedBitstreamFragment *frag,
+                                 const AVPacket *pkt);
+
+int CBS_FUNC(read_packet)(CodedBitstreamContext *ctx,
+                       CodedBitstreamFragment *frag,
+                       const AVPacket *pkt);
+
+int CBS_FUNC(read)(CodedBitstreamContext *ctx,
+                CodedBitstreamFragment *frag,
+                const AVBufferRef *buf,
+                const uint8_t *data, size_t size);
+
+
+int CBS_FUNC(write_fragment_data)(CodedBitstreamContext *ctx,
+                               CodedBitstreamFragment *frag);
+
+int CBS_FUNC(write_extradata)(CodedBitstreamContext *ctx,
+                           AVCodecParameters *par,
+                           CodedBitstreamFragment *frag);
+
+int CBS_FUNC(write_packet)(CodedBitstreamContext *ctx,
+                        AVPacket *pkt,
+                        CodedBitstreamFragment *frag);
+
+
+void CBS_FUNC(fragment_reset)(CodedBitstreamFragment *frag);
+
+void CBS_FUNC(fragment_free)(CodedBitstreamFragment *frag);
+
+int CBS_FUNC(alloc_unit_content)(CodedBitstreamContext *ctx,
+                              CodedBitstreamUnit *unit);
+
+int CBS_FUNC(insert_unit_content)(CodedBitstreamFragment *frag,
+                               int position,
+                               CodedBitstreamUnitType type,
+                               void *content,
+                               void *content_ref);
+
+int CBS_FUNC(append_unit_data)(CodedBitstreamFragment *frag,
+                            CodedBitstreamUnitType type,
+                            uint8_t *data, size_t data_size,
+                            AVBufferRef *data_buf);
+
+void CBS_FUNC(delete_unit)(CodedBitstreamFragment *frag,
+                        int position);
+
+
+int CBS_FUNC(make_unit_refcounted)(CodedBitstreamContext *ctx,
+                                CodedBitstreamUnit *unit);
+
+int CBS_FUNC(make_unit_writable)(CodedBitstreamContext *ctx,
+                              CodedBitstreamUnit *unit);
+
+enum CbsDiscardFlags {
+    DISCARD_FLAG_NONE = 0,
+
+    DISCARD_FLAG_KEEP_NON_VCL = 0x01,
+};
+
+void CBS_FUNC(discard_units)(CodedBitstreamContext *ctx,
+                          CodedBitstreamFragment *frag,
+                          enum AVDiscard skip,
+                          int flags);
+
+
+void CBS_FUNC(trace_read_log)(void *trace_context,
+                           struct GetBitContext *gbc, int length,
+                           const char *str, const int *subscripts,
+                           int64_t value);
+
+void CBS_FUNC(trace_write_log)(void *trace_context,
+                            struct PutBitContext *pbc, int length,
+                            const char *str, const int *subscripts,
+                            int64_t value);
+
+#endif /* AVCODEC_CBS_H */

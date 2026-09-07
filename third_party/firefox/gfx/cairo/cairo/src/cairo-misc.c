@@ -1,0 +1,777 @@
+/* cairo - a vector graphics library with display and print output
+ *
+ * Copyright © 2002 University of Southern California
+ * Copyright © 2005 Red Hat, Inc.
+ * Copyright © 2007 Adrian Johnson
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it either under the terms of the GNU Lesser General Public
+ * License version 2.1 as published by the Free Software Foundation
+ * (the "LGPL") or, at your option, under the terms of the Mozilla
+ * Public License Version 1.1 (the "MPL"). If you do not alter this
+ * notice, a recipient may use your version of this file under either
+ * the MPL or the LGPL.
+ *
+ * You should have received a copy of the LGPL along with this library
+ * in the file COPYING-LGPL-2.1; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Suite 500, Boston, MA 02110-1335, USA
+ * You should have received a copy of the MPL along with this library
+ * in the file COPYING-MPL-1.1
+ *
+ * The contents of this file are subject to the Mozilla Public License
+ * Version 1.1 (the "License"); you may not use this file except in
+ * compliance with the License. You may obtain a copy of the License at
+ * http://www.mozilla.org/MPL/
+ *
+ * This software is distributed on an "AS IS" basis, WITHOUT WARRANTY
+ * OF ANY KIND, either express or implied. See the LGPL or the MPL for
+ * the specific language governing rights and limitations.
+ *
+ * The Original Code is the cairo graphics library.
+ *
+ * The Initial Developer of the Original Code is University of Southern
+ * California.
+ *
+ * Contributor(s):
+ *	Carl D. Worth <cworth@cworth.org>
+ *      Adrian Johnson <ajohnson@redneon.com>
+ */
+
+#include "cairoint.h"
+#include "cairo-error-private.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <locale.h>
+#if defined(HAVE_XLOCALE_H)
+#include <xlocale.h>
+#endif
+#if HAVE_FCNTL_H
+#include <fcntl.h>
+#endif
+
+COMPILE_TIME_ASSERT ((int)CAIRO_STATUS_LAST_STATUS < (int)CAIRO_INT_STATUS_UNSUPPORTED);
+COMPILE_TIME_ASSERT (CAIRO_INT_STATUS_LAST_STATUS <= 127);
+
+
+
+const char *
+cairo_status_to_string (cairo_status_t status)
+{
+    switch (status) {
+    case CAIRO_STATUS_SUCCESS:
+	return "no error has occurred";
+    case CAIRO_STATUS_NO_MEMORY:
+	return "out of memory";
+    case CAIRO_STATUS_INVALID_RESTORE:
+	return "cairo_restore() without matching cairo_save()";
+    case CAIRO_STATUS_INVALID_POP_GROUP:
+	return "no saved group to pop, i.e. cairo_pop_group() without matching cairo_push_group()";
+    case CAIRO_STATUS_NO_CURRENT_POINT:
+	return "no current point defined";
+    case CAIRO_STATUS_INVALID_MATRIX:
+	return "invalid matrix (not invertible)";
+    case CAIRO_STATUS_INVALID_STATUS:
+	return "invalid value for an input cairo_status_t";
+    case CAIRO_STATUS_NULL_POINTER:
+	return "NULL pointer";
+    case CAIRO_STATUS_INVALID_STRING:
+	return "input string not valid UTF-8";
+    case CAIRO_STATUS_INVALID_PATH_DATA:
+	return "input path data not valid";
+    case CAIRO_STATUS_READ_ERROR:
+	return "error while reading from input stream";
+    case CAIRO_STATUS_WRITE_ERROR:
+	return "error while writing to output stream";
+    case CAIRO_STATUS_SURFACE_FINISHED:
+	return "the target surface has been finished";
+    case CAIRO_STATUS_SURFACE_TYPE_MISMATCH:
+	return "the surface type is not appropriate for the operation";
+    case CAIRO_STATUS_PATTERN_TYPE_MISMATCH:
+	return "the pattern type is not appropriate for the operation";
+    case CAIRO_STATUS_INVALID_CONTENT:
+	return "invalid value for an input cairo_content_t";
+    case CAIRO_STATUS_INVALID_FORMAT:
+	return "invalid value for an input cairo_format_t";
+    case CAIRO_STATUS_INVALID_VISUAL:
+	return "invalid value for an input Visual*";
+    case CAIRO_STATUS_FILE_NOT_FOUND:
+	return "file not found";
+    case CAIRO_STATUS_INVALID_DASH:
+	return "invalid value for a dash setting";
+    case CAIRO_STATUS_INVALID_DSC_COMMENT:
+	return "invalid value for a DSC comment";
+    case CAIRO_STATUS_INVALID_INDEX:
+	return "invalid index passed to getter";
+    case CAIRO_STATUS_CLIP_NOT_REPRESENTABLE:
+        return "clip region not representable in desired format";
+    case CAIRO_STATUS_TEMP_FILE_ERROR:
+	return "error creating or writing to a temporary file";
+    case CAIRO_STATUS_INVALID_STRIDE:
+	return "invalid value for stride";
+    case CAIRO_STATUS_FONT_TYPE_MISMATCH:
+	return "the font type is not appropriate for the operation";
+    case CAIRO_STATUS_USER_FONT_IMMUTABLE:
+	return "the user-font is immutable";
+    case CAIRO_STATUS_USER_FONT_ERROR:
+	return "error occurred in a user-font callback function";
+    case CAIRO_STATUS_NEGATIVE_COUNT:
+	return "negative number used where it is not allowed";
+    case CAIRO_STATUS_INVALID_CLUSTERS:
+	return "input clusters do not represent the accompanying text and glyph arrays";
+    case CAIRO_STATUS_INVALID_SLANT:
+	return "invalid value for an input cairo_font_slant_t";
+    case CAIRO_STATUS_INVALID_WEIGHT:
+	return "invalid value for an input cairo_font_weight_t";
+    case CAIRO_STATUS_INVALID_SIZE:
+	return "invalid value (typically too big) for the size of the input (surface, pattern, etc.)";
+    case CAIRO_STATUS_USER_FONT_NOT_IMPLEMENTED:
+	return "user-font method not implemented";
+    case CAIRO_STATUS_DEVICE_TYPE_MISMATCH:
+	return "the device type is not appropriate for the operation";
+    case CAIRO_STATUS_DEVICE_ERROR:
+	return "an operation to the device caused an unspecified error";
+    case CAIRO_STATUS_INVALID_MESH_CONSTRUCTION:
+	return "invalid operation during mesh pattern construction";
+    case CAIRO_STATUS_DEVICE_FINISHED:
+	return "the target device has been finished";
+    case CAIRO_STATUS_JBIG2_GLOBAL_MISSING:
+	return "CAIRO_MIME_TYPE_JBIG2_GLOBAL_ID used but no CAIRO_MIME_TYPE_JBIG2_GLOBAL data provided";
+    case CAIRO_STATUS_PNG_ERROR:
+	return "error occurred in libpng while reading from or writing to a PNG file";
+    case CAIRO_STATUS_FREETYPE_ERROR:
+	return "error occurred in libfreetype";
+    case CAIRO_STATUS_WIN32_GDI_ERROR:
+	return "error occurred in the Windows Graphics Device Interface";
+    case CAIRO_STATUS_TAG_ERROR:
+	return "invalid tag name, attributes, or nesting";
+    case CAIRO_STATUS_DWRITE_ERROR:
+	return "Window Direct Write error";
+    case CAIRO_STATUS_SVG_FONT_ERROR:
+	return "error occured while rendering an OpenType-SVG font";
+    default:
+    case CAIRO_STATUS_LAST_STATUS:
+	return "<unknown error status>";
+    }
+}
+
+cairo_glyph_t *
+cairo_glyph_allocate (int num_glyphs)
+{
+    if (num_glyphs <= 0)
+	return NULL;
+
+    return _cairo_malloc_ab (num_glyphs, sizeof (cairo_glyph_t));
+}
+
+void
+cairo_glyph_free (cairo_glyph_t *glyphs)
+{
+    free (glyphs);
+}
+
+cairo_text_cluster_t *
+cairo_text_cluster_allocate (int num_clusters)
+{
+    if (num_clusters <= 0)
+	return NULL;
+
+    return _cairo_malloc_ab (num_clusters, sizeof (cairo_text_cluster_t));
+}
+
+void
+cairo_text_cluster_free (cairo_text_cluster_t *clusters)
+{
+    free (clusters);
+}
+
+
+cairo_status_t
+_cairo_validate_text_clusters (const char		   *utf8,
+			       int			    utf8_len,
+			       const cairo_glyph_t	   *glyphs,
+			       int			    num_glyphs,
+			       const cairo_text_cluster_t  *clusters,
+			       int			    num_clusters,
+			       cairo_text_cluster_flags_t   cluster_flags)
+{
+    cairo_status_t status;
+    unsigned int n_bytes  = 0;
+    unsigned int n_glyphs = 0;
+    int i;
+
+    for (i = 0; i < num_clusters; i++) {
+	int cluster_bytes  = clusters[i].num_bytes;
+	int cluster_glyphs = clusters[i].num_glyphs;
+
+	if (cluster_bytes < 0 || cluster_glyphs < 0)
+	    goto BAD;
+
+	if (cluster_bytes == 0 && cluster_glyphs == 0)
+	    goto BAD;
+
+	if (n_bytes+cluster_bytes > (unsigned int)utf8_len || n_glyphs+cluster_glyphs > (unsigned int)num_glyphs)
+	    goto BAD;
+
+	status = _cairo_utf8_to_ucs4 (utf8+n_bytes, cluster_bytes, NULL, NULL);
+	if (unlikely (status))
+	    return _cairo_error (CAIRO_STATUS_INVALID_CLUSTERS);
+
+	n_bytes  += cluster_bytes ;
+	n_glyphs += cluster_glyphs;
+    }
+
+    if (n_bytes != (unsigned int) utf8_len || n_glyphs != (unsigned int) num_glyphs) {
+      BAD:
+	return _cairo_error (CAIRO_STATUS_INVALID_CLUSTERS);
+    }
+
+    return CAIRO_STATUS_SUCCESS;
+}
+
+cairo_bool_t
+_cairo_operator_bounded_by_mask (cairo_operator_t op)
+{
+    switch (op) {
+    case CAIRO_OPERATOR_CLEAR:
+    case CAIRO_OPERATOR_SOURCE:
+    case CAIRO_OPERATOR_OVER:
+    case CAIRO_OPERATOR_ATOP:
+    case CAIRO_OPERATOR_DEST:
+    case CAIRO_OPERATOR_DEST_OVER:
+    case CAIRO_OPERATOR_DEST_OUT:
+    case CAIRO_OPERATOR_XOR:
+    case CAIRO_OPERATOR_ADD:
+    case CAIRO_OPERATOR_SATURATE:
+    case CAIRO_OPERATOR_MULTIPLY:
+    case CAIRO_OPERATOR_SCREEN:
+    case CAIRO_OPERATOR_OVERLAY:
+    case CAIRO_OPERATOR_DARKEN:
+    case CAIRO_OPERATOR_LIGHTEN:
+    case CAIRO_OPERATOR_COLOR_DODGE:
+    case CAIRO_OPERATOR_COLOR_BURN:
+    case CAIRO_OPERATOR_HARD_LIGHT:
+    case CAIRO_OPERATOR_SOFT_LIGHT:
+    case CAIRO_OPERATOR_DIFFERENCE:
+    case CAIRO_OPERATOR_EXCLUSION:
+    case CAIRO_OPERATOR_HSL_HUE:
+    case CAIRO_OPERATOR_HSL_SATURATION:
+    case CAIRO_OPERATOR_HSL_COLOR:
+    case CAIRO_OPERATOR_HSL_LUMINOSITY:
+	return TRUE;
+    case CAIRO_OPERATOR_OUT:
+    case CAIRO_OPERATOR_IN:
+    case CAIRO_OPERATOR_DEST_IN:
+    case CAIRO_OPERATOR_DEST_ATOP:
+	return FALSE;
+    default:
+	ASSERT_NOT_REACHED;
+	return FALSE; 
+    }
+}
+
+cairo_bool_t
+_cairo_operator_bounded_by_source (cairo_operator_t op)
+{
+    switch (op) {
+    case CAIRO_OPERATOR_OVER:
+    case CAIRO_OPERATOR_ATOP:
+    case CAIRO_OPERATOR_DEST:
+    case CAIRO_OPERATOR_DEST_OVER:
+    case CAIRO_OPERATOR_DEST_OUT:
+    case CAIRO_OPERATOR_XOR:
+    case CAIRO_OPERATOR_ADD:
+    case CAIRO_OPERATOR_SATURATE:
+    case CAIRO_OPERATOR_MULTIPLY:
+    case CAIRO_OPERATOR_SCREEN:
+    case CAIRO_OPERATOR_OVERLAY:
+    case CAIRO_OPERATOR_DARKEN:
+    case CAIRO_OPERATOR_LIGHTEN:
+    case CAIRO_OPERATOR_COLOR_DODGE:
+    case CAIRO_OPERATOR_COLOR_BURN:
+    case CAIRO_OPERATOR_HARD_LIGHT:
+    case CAIRO_OPERATOR_SOFT_LIGHT:
+    case CAIRO_OPERATOR_DIFFERENCE:
+    case CAIRO_OPERATOR_EXCLUSION:
+    case CAIRO_OPERATOR_HSL_HUE:
+    case CAIRO_OPERATOR_HSL_SATURATION:
+    case CAIRO_OPERATOR_HSL_COLOR:
+    case CAIRO_OPERATOR_HSL_LUMINOSITY:
+	return TRUE;
+    case CAIRO_OPERATOR_CLEAR:
+    case CAIRO_OPERATOR_SOURCE:
+    case CAIRO_OPERATOR_OUT:
+    case CAIRO_OPERATOR_IN:
+    case CAIRO_OPERATOR_DEST_IN:
+    case CAIRO_OPERATOR_DEST_ATOP:
+	return FALSE;
+    default:
+	ASSERT_NOT_REACHED;
+	return FALSE; 
+    }
+}
+
+uint32_t
+_cairo_operator_bounded_by_either (cairo_operator_t op)
+{
+    switch (op) {
+    case CAIRO_OPERATOR_OVER:
+    case CAIRO_OPERATOR_ATOP:
+    case CAIRO_OPERATOR_DEST:
+    case CAIRO_OPERATOR_DEST_OVER:
+    case CAIRO_OPERATOR_DEST_OUT:
+    case CAIRO_OPERATOR_XOR:
+    case CAIRO_OPERATOR_ADD:
+    case CAIRO_OPERATOR_SATURATE:
+    case CAIRO_OPERATOR_MULTIPLY:
+    case CAIRO_OPERATOR_SCREEN:
+    case CAIRO_OPERATOR_OVERLAY:
+    case CAIRO_OPERATOR_DARKEN:
+    case CAIRO_OPERATOR_LIGHTEN:
+    case CAIRO_OPERATOR_COLOR_DODGE:
+    case CAIRO_OPERATOR_COLOR_BURN:
+    case CAIRO_OPERATOR_HARD_LIGHT:
+    case CAIRO_OPERATOR_SOFT_LIGHT:
+    case CAIRO_OPERATOR_DIFFERENCE:
+    case CAIRO_OPERATOR_EXCLUSION:
+    case CAIRO_OPERATOR_HSL_HUE:
+    case CAIRO_OPERATOR_HSL_SATURATION:
+    case CAIRO_OPERATOR_HSL_COLOR:
+    case CAIRO_OPERATOR_HSL_LUMINOSITY:
+	return CAIRO_OPERATOR_BOUND_BY_MASK | CAIRO_OPERATOR_BOUND_BY_SOURCE;
+    case CAIRO_OPERATOR_CLEAR:
+    case CAIRO_OPERATOR_SOURCE:
+	return CAIRO_OPERATOR_BOUND_BY_MASK;
+    case CAIRO_OPERATOR_OUT:
+    case CAIRO_OPERATOR_IN:
+    case CAIRO_OPERATOR_DEST_IN:
+    case CAIRO_OPERATOR_DEST_ATOP:
+	return 0;
+    default:
+	ASSERT_NOT_REACHED;
+	return FALSE; 
+    }
+
+}
+
+#if DISABLE_SOME_FLOATING_POINT
+int
+_cairo_lround (double d)
+{
+    uint32_t top, shift_amount, output;
+    union {
+        double d;
+        uint64_t ui64;
+        uint32_t ui32[2];
+    } u;
+
+    u.d = d;
+
+#if ( defined(FLOAT_WORDS_BIGENDIAN) && !defined(WORDS_BIGENDIAN)) || \
+    (!defined(FLOAT_WORDS_BIGENDIAN) &&  defined(WORDS_BIGENDIAN))
+    {
+        uint32_t temp = u.ui32[0];
+        u.ui32[0] = u.ui32[1];
+        u.ui32[1] = temp;
+    }
+#endif
+
+#if defined(WORDS_BIGENDIAN)
+    #define MSW (0) /* Most Significant Word */
+    #define LSW (1) /* Least Significant Word */
+#else
+    #define MSW (1)
+    #define LSW (0)
+#endif
+
+    top = u.ui32[MSW] >> 20;
+
+    shift_amount = 1053 - (top & 0x7FF);
+
+    top >>= 11;
+
+    u.ui32[MSW] |= 0x100000;
+
+    u.ui64 -= top;
+
+    top--;
+
+    output = (u.ui32[MSW] << 11) | (u.ui32[LSW] >> 21);
+
+    output >>= shift_amount;
+
+    output = (output >> 1) + (output & 1);
+
+    output &= ((shift_amount > 31) - 1);
+
+    output = (output & top) - (output & ~top);
+
+    return output;
+#undef MSW
+#undef LSW
+}
+#endif
+
+uint16_t
+_cairo_half_from_float (float f)
+{
+    union {
+	uint32_t ui;
+	float f;
+    } u;
+    int s, e, m;
+
+    u.f = f;
+    s =  (u.ui >> 16) & 0x00008000;
+    e = ((u.ui >> 23) & 0x000000ff) - (127 - 15);
+    m =   u.ui        & 0x007fffff;
+    if (e <= 0) {
+	if (e < -10) {
+	    return 0;
+	}
+
+	m = (m | 0x00800000) >> (1 - e);
+
+	if (m &  0x00001000)
+	    m += 0x00002000;
+	return s | (m >> 13);
+    } else if (e == 0xff - (127 - 15)) {
+	if (m == 0) {
+	    return s | 0x7c00;
+	} else {
+	    m >>= 13;
+	    return s | 0x7c00 | m | (m == 0);
+	}
+    } else {
+	if (m &  0x00001000) {
+	    m += 0x00002000;
+
+	    if (m & 0x00800000) {
+		m =  0;
+		e += 1;
+	    }
+	}
+
+	if (e > 30) {
+	    return s | 0x7c00;
+	}
+
+	return s | (e << 10) | (m >> 13);
+    }
+}
+
+#if !defined(__BIONIC__)
+# include <locale.h>
+
+const char *
+_cairo_get_locale_decimal_point (void)
+{
+    struct lconv *locale_data = localeconv ();
+    return locale_data->decimal_point;
+}
+
+#else
+const char *
+_cairo_get_locale_decimal_point (void)
+{
+    return ".";
+}
+#endif
+
+#if defined (HAVE_NEWLOCALE) && defined (HAVE_STRTOD_L)
+
+static locale_t C_locale;
+
+static locale_t
+get_C_locale (void)
+{
+    locale_t C;
+
+retry:
+    C = (locale_t) _cairo_atomic_ptr_get ((cairo_atomic_intptr_t *) &C_locale);
+
+    if (unlikely (!C)) {
+        C = newlocale (LC_ALL_MASK, "C", NULL);
+
+        if (!_cairo_atomic_ptr_cmpxchg ((cairo_atomic_intptr_t *) &C_locale, NULL, C)) {
+            freelocale (C_locale);
+            goto retry;
+        }
+    }
+
+    return C;
+}
+
+double
+_cairo_strtod (const char *nptr, char **endptr)
+{
+    return strtod_l (nptr, endptr, get_C_locale ());
+}
+
+#else
+
+double
+_cairo_strtod (const char *nptr, char **endptr)
+{
+    const char *decimal_point;
+    int decimal_point_len;
+    const char *p;
+    char buf[100];
+    char *bufptr;
+    char *bufend = buf + sizeof(buf) - 1;
+    double value;
+    char *end;
+    int delta;
+    cairo_bool_t have_dp;
+
+    decimal_point = _cairo_get_locale_decimal_point ();
+    decimal_point_len = strlen (decimal_point);
+    assert (decimal_point_len != 0);
+
+    p = nptr;
+    bufptr = buf;
+    delta = 0;
+    have_dp = FALSE;
+    while (*p && _cairo_isspace (*p)) {
+	p++;
+	delta++;
+    }
+
+    while (*p && (bufptr + decimal_point_len < bufend)) {
+	if (_cairo_isdigit (*p)) {
+	    *bufptr++ = *p;
+	} else if (*p == '.') {
+	    if (have_dp)
+		break;
+	    strncpy (bufptr, decimal_point, decimal_point_len);
+	    bufptr += decimal_point_len;
+	    delta -= decimal_point_len - 1;
+	    have_dp = TRUE;
+	} else if (bufptr == buf && (*p == '-' || *p == '+')) {
+	    *bufptr++ = *p;
+	} else {
+	    break;
+	}
+	p++;
+    }
+    *bufptr = 0;
+
+    value = strtod (buf, &end);
+    if (endptr) {
+	if (end == buf)
+	    *endptr = (char*)(nptr);
+	else
+	    *endptr = (char*)(nptr + (end - buf) + delta);
+    }
+
+    return value;
+}
+#endif
+
+#if !defined(HAVE_STRNDUP)
+char *
+_cairo_strndup (const char *s, size_t n)
+{
+    const char *end;
+    size_t len;
+    char *sdup;
+
+    if (s == NULL)
+	return NULL;
+
+    end = memchr (s, 0, n);
+    if (end)
+	len = end - s;
+    else
+	len = n;
+
+    sdup = (char *) _cairo_malloc (len + 1);
+    if (sdup != NULL) {
+	memcpy (sdup, s, len);
+	sdup[len] = '\0';
+    }
+
+    return sdup;
+}
+#endif
+
+cairo_status_t
+_cairo_fopen (const char *filename, const char *mode, FILE **file_out)
+{
+    FILE *result;
+
+#if __GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 7)
+
+    char new_mode[20];
+    snprintf (new_mode, sizeof (new_mode), "%s%s", mode, "e");
+    result = fopen (filename, new_mode);
+
+#else
+
+    result = fopen (filename, mode);
+
+#if defined(HAVE_FCNTL_H) && defined(FD_CLOEXEC)
+    if (result != NULL) {
+	int fd = fileno (result);
+	if (fd != -1) {
+	    int flags = fcntl (fd, F_GETFD);
+	    if (flags >= 0)
+		flags = fcntl (fd, F_SETFD, flags | FD_CLOEXEC);
+	}
+    }
+#endif
+
+#endif
+
+
+    *file_out = result;
+
+    return CAIRO_STATUS_SUCCESS;
+}
+
+
+FILE *
+_cairo_tmpfile (void)
+{
+    int fd;
+    FILE *file;
+    int flags;
+
+#if defined(O_TMPFILE)
+    fd = open(P_tmpdir,
+	      O_TMPFILE | O_EXCL | O_RDWR | O_NOATIME | O_CLOEXEC,
+	      0600);
+    if (fd == -1 && errno == ENOENT) {
+	fd = open("/tmp",
+		  O_TMPFILE | O_EXCL | O_RDWR | O_NOATIME | O_CLOEXEC,
+		  0600);
+    }
+    if (fd != -1)
+	return fdopen (fd, "wb+");
+
+#endif
+
+    file = tmpfile();
+
+#if defined(HAVE_FCNTL_H) && defined(FD_CLOEXEC)
+    if (file != NULL) {
+	fd = fileno(file);
+	if (fd != -1) {
+	    flags = fcntl(fd, F_GETFD);
+	    if (flags >= 0 && !(flags & FD_CLOEXEC))
+		fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+	}
+    }
+#endif
+
+    return file;
+}
+
+typedef struct _cairo_intern_string {
+    cairo_hash_entry_t hash_entry;
+    int len;
+    char *string;
+} cairo_intern_string_t;
+
+static cairo_hash_table_t *_cairo_intern_string_ht;
+
+unsigned long
+_cairo_string_hash (const char *str, int len)
+{
+    const signed char *p = (const signed char *) str;
+    unsigned int h = *p;
+
+    for (p += 1; len > 0; len--, p++)
+	h = (h << 5) - h + *p;
+
+    return h;
+}
+
+static cairo_bool_t
+_intern_string_equal (const void *_a, const void *_b)
+{
+    const cairo_intern_string_t *a = _a;
+    const cairo_intern_string_t *b = _b;
+
+    if (a->len != b->len)
+	return FALSE;
+
+    return memcmp (a->string, b->string, a->len) == 0;
+}
+
+cairo_status_t
+_cairo_intern_string (const char **str_inout, int len)
+{
+    char *str = (char *) *str_inout;
+    cairo_intern_string_t tmpl, *istring;
+    cairo_status_t status = CAIRO_STATUS_SUCCESS;
+
+    if (CAIRO_INJECT_FAULT ())
+	return _cairo_error (CAIRO_STATUS_NO_MEMORY);
+
+    if (len < 0)
+	len = strlen (str);
+    tmpl.hash_entry.hash = _cairo_string_hash (str, len);
+    tmpl.len = len;
+    tmpl.string = (char *) str;
+
+    CAIRO_MUTEX_LOCK (_cairo_intern_string_mutex);
+    if (_cairo_intern_string_ht == NULL) {
+	_cairo_intern_string_ht = _cairo_hash_table_create (_intern_string_equal);
+	if (unlikely (_cairo_intern_string_ht == NULL)) {
+	    status = _cairo_error (CAIRO_STATUS_NO_MEMORY);
+	    goto BAIL;
+	}
+    }
+
+    istring = _cairo_hash_table_lookup (_cairo_intern_string_ht,
+					&tmpl.hash_entry);
+    if (istring == NULL) {
+	istring = _cairo_malloc (sizeof (cairo_intern_string_t) + len + 1);
+	if (likely (istring != NULL)) {
+	    istring->hash_entry.hash = tmpl.hash_entry.hash;
+	    istring->len = tmpl.len;
+	    istring->string = (char *) (istring + 1);
+	    memcpy (istring->string, str, len);
+	    istring->string[len] = '\0';
+
+	    status = _cairo_hash_table_insert (_cairo_intern_string_ht,
+					       &istring->hash_entry);
+	    if (unlikely (status)) {
+		free (istring);
+		goto BAIL;
+	    }
+	} else {
+	    status = _cairo_error (CAIRO_STATUS_NO_MEMORY);
+	    goto BAIL;
+	}
+    }
+
+    *str_inout = istring->string;
+
+  BAIL:
+    CAIRO_MUTEX_UNLOCK (_cairo_intern_string_mutex);
+    return status;
+}
+
+static void
+_intern_string_pluck (void *entry, void *closure)
+{
+    _cairo_hash_table_remove (closure, entry);
+    free (entry);
+}
+
+void
+_cairo_intern_string_reset_static_data (void)
+{
+    CAIRO_MUTEX_LOCK (_cairo_intern_string_mutex);
+    if (_cairo_intern_string_ht != NULL) {
+	_cairo_hash_table_foreach (_cairo_intern_string_ht,
+				   _intern_string_pluck,
+				   _cairo_intern_string_ht);
+	_cairo_hash_table_destroy(_cairo_intern_string_ht);
+	_cairo_intern_string_ht = NULL;
+    }
+    CAIRO_MUTEX_UNLOCK (_cairo_intern_string_mutex);
+}

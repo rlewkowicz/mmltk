@@ -1,0 +1,146 @@
+/*
+ * Copyright 2016 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkRasterPipeline_DEFINED)
+#define SkRasterPipeline_DEFINED
+
+#include "include/core/SkColor.h"
+#include "include/core/SkTypes.h"
+#include "include/private/base/SkMacros.h"
+#include "include/private/base/SkSpan_impl.h"
+#include "include/private/base/SkTArray.h"
+#include "src/base/SkArenaAlloc.h"
+#include "src/core/SkRasterPipelineOpContexts.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+
+class SkMatrix;
+enum class SkRasterPipelineOp;
+enum SkColorType : int;
+struct SkImageInfo;
+struct skcms_TransferFunction;
+
+#if __has_cpp_attribute(clang::musttail) && !defined(__EMSCRIPTEN__) && !defined(SK_CPU_ARM32) && \
+        !defined(SK_CPU_LOONGARCH) && !defined(SK_CPU_PPC) && !defined(__sparc) && \
+        !(0 && defined(SK_BUILD_FOR_ANDROID_FRAMEWORK)) && \
+        !(0 && defined(__GNUC__))
+    #define SK_HAS_MUSTTAIL 1
+#else
+    #define SK_HAS_MUSTTAIL 0
+#endif
+
+
+SK_BEGIN_REQUIRE_DENSE
+struct SkRasterPipelineStage {
+    void (*fn)();
+
+    void* ctx;
+};
+SK_END_REQUIRE_DENSE
+
+class SkRasterPipeline {
+public:
+    explicit SkRasterPipeline(SkArenaAlloc*);
+
+    SkRasterPipeline(const SkRasterPipeline&) = delete;
+    SkRasterPipeline(SkRasterPipeline&&)      = default;
+
+    SkRasterPipeline& operator=(const SkRasterPipeline&) = delete;
+    SkRasterPipeline& operator=(SkRasterPipeline&&)      = default;
+
+    void reset();
+
+    void append(SkRasterPipelineOp, void* = nullptr);
+    void append(SkRasterPipelineOp op, const void* ctx) { this->append(op,const_cast<void*>(ctx)); }
+    void append(SkRasterPipelineOp, uintptr_t ctx);
+
+    void extend(const SkRasterPipeline&);
+
+    void run(size_t x, size_t y, size_t w, size_t h) const;
+
+    std::function<void(size_t, size_t, size_t, size_t)> compile() const;
+
+    struct StageList {
+        StageList*          prev;
+        SkRasterPipelineOp  stage;
+        void*               ctx;
+    };
+
+    static const char* GetOpName(SkRasterPipelineOp op);
+    const StageList* getStageList() const { return fStages; }
+    int getNumStages() const { return fNumStages; }
+
+    void dump() const;
+
+    void appendMatrix(SkArenaAlloc*, const SkMatrix&);
+
+    void appendConstantColor(SkArenaAlloc*, const float rgba[4]);
+
+    void appendConstantColor(SkArenaAlloc* alloc, const SkColor4f& color) {
+        this->appendConstantColor(alloc, color.vec());
+    }
+
+    void appendSetRGB(SkArenaAlloc*, const float rgb[3]);
+
+    void appendSetRGB(SkArenaAlloc* alloc, const SkColor4f& color) {
+        this->appendSetRGB(alloc, color.vec());
+    }
+
+    void appendLoad(SkColorType, const SkRasterPipelineContexts::MemoryCtx*);
+    void appendLoadDst(SkColorType, const SkRasterPipelineContexts::MemoryCtx*);
+    void appendStore(SkColorType, const SkRasterPipelineContexts::MemoryCtx*);
+
+    void appendClampIfNormalized(const SkImageInfo&);
+
+    void appendTransferFunction(const skcms_TransferFunction&);
+
+    void appendStackRewind();
+
+    bool empty() const { return fStages == nullptr; }
+
+private:
+    bool buildLowpPipeline(SkRasterPipelineStage* ip) const;
+    void buildHighpPipeline(SkRasterPipelineStage* ip) const;
+
+    using StartPipelineFn = void (*)(size_t, size_t, size_t, size_t,
+                                     SkRasterPipelineStage* program,
+                                     SkSpan<SkRasterPipelineContexts::MemoryCtxPatch>,
+                                     uint8_t*);
+    StartPipelineFn buildPipeline(SkRasterPipelineStage*) const;
+
+    void uncheckedAppend(SkRasterPipelineOp, void*);
+    int stagesNeeded() const;
+
+    void addMemoryContext(SkRasterPipelineContexts::MemoryCtx*,
+                          int bytesPerPixel,
+                          bool load,
+                          bool store);
+    uint8_t* tailPointer();
+
+    SkArenaAlloc*                        fAlloc;
+    SkRasterPipelineContexts::RewindCtx* fRewindCtx;
+    StageList*                  fStages;
+    uint8_t*                    fTailPointer;
+    int                         fNumStages;
+
+    skia_private::STArray<2, SkRasterPipelineContexts::MemoryCtxInfo> fMemoryCtxInfos;
+};
+
+template <size_t bytes>
+class SkRasterPipeline_ : public SkRasterPipeline {
+public:
+    SkRasterPipeline_()
+        : SkRasterPipeline(&fBuiltinAlloc) {}
+
+private:
+    SkSTArenaAlloc<bytes> fBuiltinAlloc;
+};
+
+
+#endif

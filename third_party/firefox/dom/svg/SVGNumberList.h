@@ -1,0 +1,148 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SVG_SVGNUMBERLIST_H_
+#define DOM_SVG_SVGNUMBERLIST_H_
+
+#include "SVGElement.h"
+#include "nsCOMPtr.h"
+#include "nsDebug.h"
+#include "nsIContent.h"
+#include "nsINode.h"
+#include "nsIWeakReferenceUtils.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+
+namespace dom {
+class DOMSVGNumber;
+class DOMSVGNumberList;
+}  
+
+class SVGNumberList {
+  friend class dom::DOMSVGNumber;
+  friend class dom::DOMSVGNumberList;
+  friend class SVGAnimatedNumberList;
+
+ public:
+  SVGNumberList() = default;
+  ~SVGNumberList() = default;
+
+  SVGNumberList& operator=(const SVGNumberList& aOther) {
+    mNumbers.ClearAndRetainStorage();
+    (void)mNumbers.AppendElements(aOther.mNumbers, fallible);
+    return *this;
+  }
+
+  SVGNumberList(const SVGNumberList& aOther) { *this = aOther; }
+
+
+  void GetValueAsString(nsAString& aValue) const;
+
+  bool IsEmpty() const { return mNumbers.IsEmpty(); }
+
+  uint32_t Length() const { return mNumbers.Length(); }
+
+  const float& operator[](uint32_t aIndex) const { return mNumbers[aIndex]; }
+
+  [[nodiscard]] FallibleTArray<float>::const_iterator begin() const {
+    return mNumbers.begin();
+  }
+  [[nodiscard]] FallibleTArray<float>::const_iterator end() const {
+    return mNumbers.end();
+  }
+
+  bool operator==(const SVGNumberList& rhs) const {
+    return mNumbers == rhs.mNumbers;
+  }
+
+  bool SetCapacity(uint32_t size) {
+    return mNumbers.SetCapacity(size, fallible);
+  }
+
+  void Compact() { mNumbers.Compact(); }
+
+
+ protected:
+  nsresult CopyFrom(const SVGNumberList& rhs);
+  void SwapWith(SVGNumberList& aRhs) { mNumbers.SwapElements(aRhs.mNumbers); }
+
+  float& operator[](uint32_t aIndex) { return mNumbers[aIndex]; }
+  [[nodiscard]] FallibleTArray<float>::iterator begin() {
+    return mNumbers.begin();
+  }
+  [[nodiscard]] FallibleTArray<float>::iterator end() { return mNumbers.end(); }
+
+  bool SetLength(uint32_t aNumberOfItems) {
+    return mNumbers.SetLength(aNumberOfItems, fallible);
+  }
+
+ private:
+
+  nsresult SetValueFromString(const nsAString& aValue);
+
+  void Clear() { mNumbers.Clear(); }
+
+  bool InsertItem(uint32_t aIndex, const float& aNumber) {
+    if (aIndex >= mNumbers.Length()) {
+      aIndex = mNumbers.Length();
+    }
+    return !!mNumbers.InsertElementAt(aIndex, aNumber, fallible);
+  }
+
+  void ReplaceItem(uint32_t aIndex, const float& aNumber) {
+    MOZ_ASSERT(aIndex < mNumbers.Length(),
+               "DOM wrapper caller should have raised INDEX_SIZE_ERR");
+    mNumbers[aIndex] = aNumber;
+  }
+
+  void RemoveItem(uint32_t aIndex) {
+    MOZ_ASSERT(aIndex < mNumbers.Length(),
+               "DOM wrapper caller should have raised INDEX_SIZE_ERR");
+    mNumbers.RemoveElementAt(aIndex);
+  }
+
+  bool AppendItem(float aNumber) {
+    return !!mNumbers.AppendElement(aNumber, fallible);
+  }
+
+ protected:
+  FallibleTArray<float> mNumbers;
+};
+
+class SVGNumberListAndInfo : public SVGNumberList {
+ public:
+  SVGNumberListAndInfo() : mElement(nullptr) {}
+
+  explicit SVGNumberListAndInfo(dom::SVGElement* aElement)
+      : mElement(do_GetWeakReference(static_cast<nsINode*>(aElement))) {}
+
+  void SetInfo(dom::SVGElement* aElement) {
+    mElement = do_GetWeakReference(static_cast<nsINode*>(aElement));
+  }
+
+  dom::SVGElement* Element() const {
+    nsCOMPtr<nsIContent> e = do_QueryReferent(mElement);
+    return static_cast<dom::SVGElement*>(e.get());
+  }
+
+  nsresult CopyFrom(const SVGNumberListAndInfo& rhs) {
+    mElement = rhs.mElement;
+    return SVGNumberList::CopyFrom(rhs);
+  }
+
+
+  using SVGNumberList::CopyFrom;
+  using SVGNumberList::operator[];
+  using SVGNumberList::begin;
+  using SVGNumberList::end;
+  using SVGNumberList::SetLength;
+
+ private:
+  nsWeakPtr mElement;
+};
+
+}  
+
+#endif  // DOM_SVG_SVGNUMBERLIST_H_

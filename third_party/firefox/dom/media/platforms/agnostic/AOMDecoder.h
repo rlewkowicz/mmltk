@@ -1,0 +1,242 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#if !defined(AOMDecoder_h_)
+#  define AOMDecoder_h_
+
+#  include <aom/aom_decoder.h>
+#  include <stdint.h>
+
+#  include "PerformanceRecorder.h"
+#  include "PlatformDecoderModule.h"
+#  include "VideoUtils.h"
+#  include "mozilla/Span.h"
+
+namespace mozilla {
+
+DDLoggedTypeDeclNameAndBase(AOMDecoder, MediaDataDecoder);
+
+class AOMDecoder final : public MediaDataDecoder,
+                         public DecoderDoctorLifeLogger<AOMDecoder> {
+ public:
+  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(AOMDecoder, final);
+
+  explicit AOMDecoder(const CreateDecoderParams& aParams);
+
+  RefPtr<InitPromise> Init() override;
+  RefPtr<DecodePromise> Decode(MediaRawData* aSample) override;
+  RefPtr<DecodePromise> Drain() override;
+  RefPtr<FlushPromise> Flush() override;
+  RefPtr<ShutdownPromise> Shutdown() override;
+  nsCString GetDescriptionName() const override {
+    return "av1 libaom video decoder"_ns;
+  }
+  nsCString GetCodecName() const override { return "av1"_ns; }
+
+  static bool IsAV1(const nsACString& aMimeType);
+
+  static bool IsMainProfile(const MediaByteBuffer* aBox);
+
+  static bool IsKeyframe(Span<const uint8_t> aBuffer);
+
+  static gfx::IntSize GetFrameSize(Span<const uint8_t> aBuffer);
+
+  enum class OBUType : uint8_t {
+    Reserved = 0,
+    SequenceHeader = 1,
+    TemporalDelimiter = 2,
+    FrameHeader = 3,
+    TileGroup = 4,
+    Metadata = 5,
+    Frame = 6,
+    RedundantFrameHeader = 7,
+    TileList = 8,
+    Padding = 15
+  };
+
+  struct OBUInfo {
+    OBUType mType = OBUType::Reserved;
+    bool mExtensionFlag = false;
+    Span<const uint8_t> mContents;
+
+    bool IsValid() const {
+      switch (mType) {
+        case OBUType::SequenceHeader:
+        case OBUType::TemporalDelimiter:
+        case OBUType::FrameHeader:
+        case OBUType::TileGroup:
+        case OBUType::Metadata:
+        case OBUType::Frame:
+        case OBUType::RedundantFrameHeader:
+        case OBUType::TileList:
+        case OBUType::Padding:
+          return true;
+        default:
+          return false;
+      }
+    }
+  };
+
+  struct OBUIterator {
+   public:
+    explicit OBUIterator(const Span<const uint8_t>& aData)
+        : mData(aData), mPosition(0), mGoNext(true), mResult(NS_OK) {}
+    bool HasNext() {
+      UpdateNext();
+      return !mGoNext;
+    }
+    OBUInfo Next() {
+      UpdateNext();
+      mGoNext = true;
+      return mCurrent;
+    }
+    MediaResult GetResult() const { return mResult; }
+
+   private:
+    const Span<const uint8_t>& mData;
+    size_t mPosition;
+    OBUInfo mCurrent;
+    bool mGoNext;
+    MediaResult mResult;
+
+    void UpdateNext();
+  };
+
+  static OBUIterator ReadOBUs(const Span<const uint8_t>& aData);
+  static already_AddRefed<MediaByteBuffer> CreateOBU(
+      const OBUType aType, const Span<const uint8_t>& aContents);
+
+  enum class ChromaSamplePosition : uint8_t {
+    Unknown = 0,
+    Vertical = 1,
+    Colocated = 2,
+    Reserved = 3
+  };
+
+  struct OperatingPoint {
+    uint16_t mLayers = 0;
+    uint8_t mLevel = 0;
+    uint8_t mTier = 0;
+
+    bool operator==(const OperatingPoint& aOther) const {
+      return mLayers == aOther.mLayers && mLevel == aOther.mLevel &&
+             mTier == aOther.mTier;
+    }
+    bool operator!=(const OperatingPoint& aOther) const {
+      return !(*this == aOther);
+    }
+  };
+
+  struct AV1SequenceInfo {
+    AV1SequenceInfo() = default;
+
+    AV1SequenceInfo(const AV1SequenceInfo& aOther) { *this = aOther; }
+
+    uint8_t mProfile = 0;
+
+    nsTArray<OperatingPoint> mOperatingPoints = nsTArray<OperatingPoint>(1);
+
+    gfx::IntSize mImage = {0, 0};
+
+    uint8_t mBitDepth = 8;
+    bool mMonochrome = false;
+    bool mSubsamplingX = true;
+    bool mSubsamplingY = true;
+    ChromaSamplePosition mChromaSamplePosition = ChromaSamplePosition::Unknown;
+
+    VideoColorSpace mColorSpace;
+
+    gfx::ColorDepth ColorDepth() const {
+      return gfx::ColorDepthForBitDepth(mBitDepth);
+    }
+
+    bool operator==(const AV1SequenceInfo& aOther) const {
+      if (mProfile != aOther.mProfile || mImage != aOther.mImage ||
+          mBitDepth != aOther.mBitDepth || mMonochrome != aOther.mMonochrome ||
+          mSubsamplingX != aOther.mSubsamplingX ||
+          mSubsamplingY != aOther.mSubsamplingY ||
+          mChromaSamplePosition != aOther.mChromaSamplePosition ||
+          mColorSpace != aOther.mColorSpace) {
+        return false;
+      }
+
+      size_t opCount = mOperatingPoints.Length();
+      if (opCount != aOther.mOperatingPoints.Length()) {
+        return false;
+      }
+      for (size_t i = 0; i < opCount; i++) {
+        if (mOperatingPoints[i] != aOther.mOperatingPoints[i]) {
+          return false;
+        }
+      }
+
+      return true;
+    }
+    bool operator!=(const AV1SequenceInfo& aOther) const {
+      return !(*this == aOther);
+    }
+    AV1SequenceInfo& operator=(const AV1SequenceInfo& aOther) {
+      mProfile = aOther.mProfile;
+
+      size_t opCount = aOther.mOperatingPoints.Length();
+      mOperatingPoints.ClearAndRetainStorage();
+      mOperatingPoints.SetCapacity(opCount);
+      for (size_t i = 0; i < opCount; i++) {
+        mOperatingPoints.AppendElement(aOther.mOperatingPoints[i]);
+      }
+
+      mImage = aOther.mImage;
+      mBitDepth = aOther.mBitDepth;
+      mMonochrome = aOther.mMonochrome;
+      mSubsamplingX = aOther.mSubsamplingX;
+      mSubsamplingY = aOther.mSubsamplingY;
+      mChromaSamplePosition = aOther.mChromaSamplePosition;
+      mColorSpace = aOther.mColorSpace;
+      return *this;
+    }
+  };
+
+  static MediaResult ReadSequenceHeaderInfo(const Span<const uint8_t>& aSample,
+                                            AV1SequenceInfo& aDestInfo);
+
+  static mozilla::Maybe<mozilla::gfx::HDRMetadata> ReadMetadataOBUHDR(
+      const Span<const uint8_t>& aSample);
+
+  static already_AddRefed<MediaByteBuffer> CreateSequenceHeader(
+      const AV1SequenceInfo& aInfo, nsresult& aResult);
+
+  static void TryReadAV1CBox(const MediaByteBuffer* aBox,
+                             AV1SequenceInfo& aDestInfo,
+                             MediaResult& aSeqHdrResult);
+  static void ReadAV1CBox(const MediaByteBuffer* aBox,
+                          AV1SequenceInfo& aDestInfo, bool& aHadSeqHdr) {
+    MediaResult seqHdrResult;
+    TryReadAV1CBox(aBox, aDestInfo, seqHdrResult);
+    nsresult code = seqHdrResult.Code();
+    MOZ_ASSERT(code == NS_OK || code == NS_ERROR_DOM_MEDIA_WAITING_FOR_DATA);
+    aHadSeqHdr = code == NS_OK;
+  }
+  static void WriteAV1CBox(const AV1SequenceInfo& aInfo,
+                           MediaByteBuffer* aDestBox, bool& aHasSeqHdr);
+
+  static Maybe<AV1SequenceInfo> CreateSequenceInfoFromCodecs(
+      const nsAString& aCodec);
+  static bool SetVideoInfo(VideoInfo* aDestInfo, const nsAString& aCodec);
+
+ private:
+  ~AOMDecoder();
+  RefPtr<DecodePromise> ProcessDecode(MediaRawData* aSample);
+
+  const RefPtr<layers::ImageContainer> mImageContainer;
+  const RefPtr<TaskQueue> mTaskQueue;
+
+  aom_codec_ctx_t mCodec;
+
+  const VideoInfo mInfo;
+  const Maybe<TrackingId> mTrackingId;
+  PerformanceRecorderMulti<DecodeStage> mPerformanceRecorder;
+};
+
+}  
+
+#endif  // AOMDecoder_h_

@@ -1,0 +1,192 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "SMILCompositor.h"
+
+#include "SMILCSSProperty.h"
+#include "mozilla/dom/SVGSVGElement.h"
+#include "nsCSSProps.h"
+#include "nsComputedDOMStyle.h"
+#include "nsHashKeys.h"
+
+namespace mozilla {
+
+bool SMILCompositor::KeyEquals(KeyTypePointer aKey) const {
+  return aKey && aKey->Equals(mKey);
+}
+
+PLDHashNumber SMILCompositor::HashKey(KeyTypePointer aKey) {
+  return (NS_PTR_TO_UINT32(aKey->mElement.get()) >> 2) +
+         NS_PTR_TO_UINT32(aKey->mAttributeName.get());
+}
+
+void SMILCompositor::Traverse(nsCycleCollectionTraversalCallback* aCallback) {
+  if (!mKey.mElement) return;
+
+  NS_CYCLE_COLLECTION_NOTE_EDGE_NAME(*aCallback, "Compositor mKey.mElement");
+  aCallback->NoteXPCOMChild(mKey.mElement);
+}
+
+void SMILCompositor::AddAnimationFunction(SMILAnimationFunction* aFunc) {
+  if (aFunc) {
+#ifdef DEBUG
+    for (const SMILAnimationFunction* func : mAnimationFunctions) {
+      MOZ_ASSERT(
+          !aFunc->HasSameAnimationElement(func),
+          "Two animations cannot have the same animation content element!");
+    }
+#endif
+    mAnimationFunctions.AppendElement(aFunc);
+  }
+}
+
+void SMILCompositor::ComposeAttribute(bool& aMightHavePendingStyleUpdates) {
+  if (!mKey.mElement) return;
+
+  RefPtr<const ComputedStyle> baseComputedStyle;
+  if (MightNeedBaseStyle()) {
+    baseComputedStyle = nsComputedDOMStyle::GetUnanimatedComputedStyleNoFlush(
+        mKey.mElement, {});
+  }
+
+  std::unique_ptr<SMILAttr> smilAttr = CreateSMILAttr(baseComputedStyle);
+  if (!smilAttr) {
+    return;
+  }
+  if (mAnimationFunctions.IsEmpty()) {
+    smilAttr->ClearAnimValue();
+    aMightHavePendingStyleUpdates = true;
+    return;
+  }
+
+  SMILAnimationFunction::Comparator comparator;
+  mAnimationFunctions.Sort(comparator);
+
+  uint32_t firstFuncToCompose = GetFirstFuncToAffectSandwich();
+
+  SMILValue sandwichResultValue;
+  if (!mAnimationFunctions[firstFuncToCompose]->WillReplace()) {
+    sandwichResultValue = smilAttr->GetBaseValue();
+  }
+  UpdateCachedBaseValue(sandwichResultValue);
+
+  if (!mForceCompositing) {
+    return;
+  }
+
+  aMightHavePendingStyleUpdates = true;
+  uint32_t length = mAnimationFunctions.Length();
+  for (uint32_t i = firstFuncToCompose; i < length; ++i) {
+    mAnimationFunctions[i]->ComposeResult(*smilAttr, sandwichResultValue);
+  }
+  if (sandwichResultValue.IsNull()) {
+    smilAttr->ClearAnimValue();
+    return;
+  }
+
+  nsresult rv = smilAttr->SetAnimValue(sandwichResultValue);
+  if (NS_FAILED(rv)) {
+    NS_WARNING("SMILAttr::SetAnimValue failed");
+  }
+}
+
+void SMILCompositor::ClearAnimationEffects() {
+  if (!mKey.mElement || !mKey.mAttributeName) return;
+
+  std::unique_ptr<SMILAttr> smilAttr = CreateSMILAttr(nullptr);
+  if (!smilAttr) {
+    return;
+  }
+  smilAttr->ClearAnimValue();
+}
+
+std::unique_ptr<SMILAttr> SMILCompositor::CreateSMILAttr(
+    const ComputedStyle* aBaseComputedStyle) {
+  NonCustomCSSPropertyId propId = GetCSSPropertyToAnimate();
+
+  if (propId != eCSSProperty_UNKNOWN) {
+    return std::make_unique<SMILCSSProperty>(propId, mKey.mElement.get(),
+                                             aBaseComputedStyle);
+  }
+
+  return mKey.mElement->GetAnimatedAttr(mKey.mAttributeNamespaceID,
+                                        mKey.mAttributeName);
+}
+
+NonCustomCSSPropertyId SMILCompositor::GetCSSPropertyToAnimate() const {
+  if (mKey.mAttributeNamespaceID != kNameSpaceID_None) {
+    return eCSSProperty_UNKNOWN;
+  }
+
+  NonCustomCSSPropertyId propId =
+      nsCSSProps::LookupProperty(nsAtomCString(mKey.mAttributeName));
+
+  if (!SMILCSSProperty::IsPropertyAnimatable(propId)) {
+    return eCSSProperty_UNKNOWN;
+  }
+
+  if ((mKey.mAttributeName == nsGkAtoms::width ||
+       mKey.mAttributeName == nsGkAtoms::height) &&
+      mKey.mElement->GetNameSpaceID() == kNameSpaceID_SVG) {
+    if (!mKey.mElement->IsSVGElement(nsGkAtoms::svg)) {
+      return eCSSProperty_UNKNOWN;
+    }
+
+    if (static_cast<dom::SVGSVGElement const&>(*mKey.mElement).IsInner()) {
+      return eCSSProperty_UNKNOWN;
+    }
+
+    // Indeed an outer <svg> element, fall through.
+  }
+
+  return propId;
+}
+
+bool SMILCompositor::MightNeedBaseStyle() const {
+  if (GetCSSPropertyToAnimate() == eCSSProperty_UNKNOWN) {
+    return false;
+  }
+
+  for (const SMILAnimationFunction* func : mAnimationFunctions) {
+    if (!func->WillReplace()) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+uint32_t SMILCompositor::GetFirstFuncToAffectSandwich() {
+  bool canThrottle = mKey.mAttributeName != nsGkAtoms::display &&
+                     !mKey.mElement->GetPrimaryFrame();
+
+  uint32_t i;
+  for (i = mAnimationFunctions.Length(); i > 0; --i) {
+    SMILAnimationFunction* curAnimFunc = mAnimationFunctions[i - 1];
+    mForceCompositing |= curAnimFunc->UpdateCachedTarget(mKey) ||
+                         (curAnimFunc->HasChanged() && !canThrottle) ||
+                         curAnimFunc->WasSkippedInPrevSample();
+
+    if (curAnimFunc->WillReplace()) {
+      --i;
+      break;
+    }
+  }
+
+  if (mForceCompositing) {
+    for (uint32_t j = i; j > 0; --j) {
+      mAnimationFunctions[j - 1]->SetWasSkipped();
+    }
+  }
+  return i;
+}
+
+void SMILCompositor::UpdateCachedBaseValue(const SMILValue& aBaseValue) {
+  if (mCachedBaseValue != aBaseValue) {
+    mCachedBaseValue = aBaseValue;
+    mForceCompositing = true;
+  }
+}
+
+}  

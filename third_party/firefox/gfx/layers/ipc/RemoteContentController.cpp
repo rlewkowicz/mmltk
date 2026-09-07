@@ -1,0 +1,476 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/layers/RemoteContentController.h"
+
+#include "CompositorThread.h"
+#include "MainThreadUtils.h"
+#include "ipc/RemoteContentController.h"
+#include "mozilla/dom/BrowserParent.h"
+#include "mozilla/layers/APZCCallbackHelper.h"
+#include "mozilla/layers/APZCTreeManagerParent.h"  // for APZCTreeManagerParent
+#include "mozilla/layers/APZThreadUtils.h"
+#include "mozilla/layers/DoubleTapToZoom.h"
+#include "mozilla/layers/CompositorBridgeParent.h"
+#include "mozilla/layers/MatrixMessage.h"
+#include "mozilla/gfx/GPUProcessManager.h"
+#include "Units.h"
+
+static mozilla::LazyLogModule sApzRemoteLog("apz.cc.remote");
+
+namespace mozilla {
+namespace layers {
+
+using namespace mozilla::gfx;
+
+RemoteContentController::RemoteContentController()
+    : mCompositorThread(NS_GetCurrentThread()), mCanSend(true) {
+  MOZ_ASSERT(CompositorThread()->IsOnCurrentThread());
+}
+
+RemoteContentController::~RemoteContentController() = default;
+
+void RemoteContentController::NotifyLayerTransforms(
+    nsTArray<MatrixMessage>&& aTransforms) {
+  if (!mCompositorThread->IsOnCurrentThread()) {
+    mCompositorThread->Dispatch(
+        NewRunnableMethod<StoreCopyPassByRRef<nsTArray<MatrixMessage>>>(
+            "layers::RemoteContentController::NotifyLayerTransforms", this,
+            &RemoteContentController::NotifyLayerTransforms,
+            std::move(aTransforms)));
+    return;
+  }
+
+  if (mCanSend) {
+    (void)SendLayerTransforms(aTransforms);
+  }
+}
+
+void RemoteContentController::RequestContentRepaint(
+    const RepaintRequest& aRequest) {
+  MOZ_ASSERT(IsRepaintThread());
+
+  if (mCanSend) {
+    (void)SendRequestContentRepaint(aRequest);
+  }
+}
+
+void RemoteContentController::HandleTapOnParentProcessMainThread(
+    TapType aTapType, LayoutDevicePoint aPoint, Modifiers aModifiers,
+    ScrollableLayerGuid aGuid, uint64_t aInputBlockId,
+    const Maybe<DoubleTapToZoomMetrics>& aDoubleTapToZoomMetrics) {
+  MOZ_LOG(sApzRemoteLog, LogLevel::Debug,
+          ("HandleTapOnMainThread(%d)", (int)aTapType));
+  MOZ_ASSERT(NS_IsMainThread());
+
+  RefPtr<dom::BrowserParent> tab =
+      dom::BrowserParent::GetBrowserParentFromLayersId(aGuid.mLayersId);
+  if (tab) {
+    tab->SendHandleTap(aTapType, aPoint, aModifiers, aGuid, aInputBlockId,
+                       aDoubleTapToZoomMetrics);
+  }
+}
+
+void RemoteContentController::HandleTapOnGPUProcessMainThread(
+    TapType aTapType, LayoutDevicePoint aPoint, Modifiers aModifiers,
+    ScrollableLayerGuid aGuid, uint64_t aInputBlockId,
+    const Maybe<DoubleTapToZoomMetrics>& aDoubleTapToZoomMetrics) {
+  MOZ_ASSERT(XRE_IsGPUProcess());
+  MOZ_ASSERT(NS_IsMainThread());
+
+  auto apzib =
+      CompositorBridgeParent::GetApzInputBridgeParentForRoot(aGuid.mLayersId);
+  if (apzib) {
+    (void)apzib->SendHandleTap(aTapType, aPoint, aModifiers, aGuid,
+                               aInputBlockId, aDoubleTapToZoomMetrics);
+  }
+}
+
+void RemoteContentController::HandleTap(
+    TapType aTapType, const LayoutDevicePoint& aPoint, Modifiers aModifiers,
+    const ScrollableLayerGuid& aGuid, uint64_t aInputBlockId,
+    const Maybe<DoubleTapToZoomMetrics>& aDoubleTapToZoomMetrics) {
+  MOZ_LOG(sApzRemoteLog, LogLevel::Debug, ("HandleTap(%d)", (int)aTapType));
+  APZThreadUtils::AssertOnControllerThread();
+
+  if (XRE_GetProcessType() == GeckoProcessType_GPU) {
+    if (NS_IsMainThread()) {
+      HandleTapOnGPUProcessMainThread(aTapType, aPoint, aModifiers, aGuid,
+                                      aInputBlockId, aDoubleTapToZoomMetrics);
+    } else {
+      NS_DispatchToMainThread(NewRunnableMethod<TapType, LayoutDevicePoint,
+                                                Modifiers, ScrollableLayerGuid,
+                                                uint64_t,
+                                                Maybe<DoubleTapToZoomMetrics>>(
+          "layers::RemoteContentController::HandleTapOnGPUProcessMainThread",
+          this, &RemoteContentController::HandleTapOnGPUProcessMainThread,
+          aTapType, aPoint, aModifiers, aGuid, aInputBlockId,
+          aDoubleTapToZoomMetrics));
+    }
+    return;
+  }
+
+  MOZ_ASSERT(XRE_IsParentProcess());
+
+  if (NS_IsMainThread()) {
+    HandleTapOnParentProcessMainThread(aTapType, aPoint, aModifiers, aGuid,
+                                       aInputBlockId, aDoubleTapToZoomMetrics);
+  } else {
+    MOZ_ASSERT(false);
+  }
+}
+
+void RemoteContentController::NotifyPinchGestureOnCompositorThread(
+    PinchGestureInput::PinchGestureType aType, const ScrollableLayerGuid& aGuid,
+    const LayoutDevicePoint& aFocusPoint, LayoutDeviceCoord aSpanChange,
+    Modifiers aModifiers) {
+  MOZ_ASSERT(mCompositorThread->IsOnCurrentThread());
+
+  auto apzctmp =
+      CompositorBridgeParent::GetApzcTreeManagerParentForRoot(aGuid.mLayersId);
+  if (apzctmp) {
+    (void)apzctmp->SendNotifyPinchGesture(aType, aGuid, aFocusPoint,
+                                          aSpanChange, aModifiers);
+  }
+}
+
+void RemoteContentController::NotifyPinchGesture(
+    PinchGestureInput::PinchGestureType aType, const ScrollableLayerGuid& aGuid,
+    const LayoutDevicePoint& aFocusPoint, LayoutDeviceCoord aSpanChange,
+    Modifiers aModifiers) {
+  APZThreadUtils::AssertOnControllerThread();
+
+
+  if (XRE_IsGPUProcess()) {
+    if (mCompositorThread->IsOnCurrentThread()) {
+      NotifyPinchGestureOnCompositorThread(aType, aGuid, aFocusPoint,
+                                           aSpanChange, aModifiers);
+    } else {
+      mCompositorThread->Dispatch(
+          NewRunnableMethod<PinchGestureInput::PinchGestureType,
+                            ScrollableLayerGuid, LayoutDevicePoint,
+                            LayoutDeviceCoord, Modifiers>(
+              "layers::RemoteContentController::"
+              "NotifyPinchGestureOnCompositorThread",
+              this,
+              &RemoteContentController::NotifyPinchGestureOnCompositorThread,
+              aType, aGuid, aFocusPoint, aSpanChange, aModifiers));
+    }
+    return;
+  }
+
+  if (XRE_IsParentProcess()) {
+    MOZ_ASSERT(NS_IsMainThread());
+    RefPtr<GeckoContentController> rootController =
+        CompositorBridgeParent::GetGeckoContentControllerForRoot(
+            aGuid.mLayersId);
+    if (rootController) {
+      rootController->NotifyPinchGesture(aType, aGuid, aFocusPoint, aSpanChange,
+                                         aModifiers);
+    }
+  }
+}
+
+bool RemoteContentController::IsRepaintThread() {
+  return mCompositorThread->IsOnCurrentThread();
+}
+
+void RemoteContentController::DispatchToRepaintThread(
+    already_AddRefed<Runnable> aTask) {
+  mCompositorThread->Dispatch(std::move(aTask));
+}
+
+void RemoteContentController::NotifyAPZStateChange(
+    const ScrollableLayerGuid& aGuid, APZStateChange aChange, int aArg,
+    Maybe<uint64_t> aInputBlockId) {
+  if (!mCompositorThread->IsOnCurrentThread()) {
+    mCompositorThread->Dispatch(
+        NewRunnableMethod<ScrollableLayerGuid, APZStateChange, int,
+                          Maybe<uint64_t>>(
+            "layers::RemoteContentController::NotifyAPZStateChange", this,
+            &RemoteContentController::NotifyAPZStateChange, aGuid, aChange,
+            aArg, aInputBlockId));
+    return;
+  }
+
+  if (mCanSend) {
+    (void)SendNotifyAPZStateChange(aGuid, aChange, aArg, aInputBlockId);
+  }
+}
+
+void RemoteContentController::UpdateOverscrollVelocity(
+    const ScrollableLayerGuid& aGuid, float aX, float aY, bool aIsRootContent) {
+  if (XRE_IsParentProcess()) {
+
+    MOZ_RELEASE_ASSERT(NS_IsMainThread());
+    RefPtr<GeckoContentController> rootController =
+        CompositorBridgeParent::GetGeckoContentControllerForRoot(
+            aGuid.mLayersId);
+    if (rootController) {
+      rootController->UpdateOverscrollVelocity(aGuid, aX, aY, aIsRootContent);
+    }
+  } else if (XRE_IsGPUProcess()) {
+    if (!mCompositorThread->IsOnCurrentThread()) {
+      mCompositorThread->Dispatch(
+          NewRunnableMethod<ScrollableLayerGuid, float, float, bool>(
+              "layers::RemoteContentController::UpdateOverscrollVelocity", this,
+              &RemoteContentController::UpdateOverscrollVelocity, aGuid, aX, aY,
+              aIsRootContent));
+      return;
+    }
+
+    MOZ_RELEASE_ASSERT(mCompositorThread->IsOnCurrentThread());
+    GeckoContentController* rootController =
+        CompositorBridgeParent::GetGeckoContentControllerForRoot(
+            aGuid.mLayersId);
+    if (rootController) {
+      MOZ_RELEASE_ASSERT(rootController->IsRemote());
+      (void)static_cast<RemoteContentController*>(rootController)
+          ->SendUpdateOverscrollVelocity(aGuid, aX, aY, aIsRootContent);
+    }
+  }
+}
+
+void RemoteContentController::UpdateOverscrollOffset(
+    const ScrollableLayerGuid& aGuid, float aX, float aY, bool aIsRootContent) {
+  if (XRE_IsParentProcess()) {
+
+    MOZ_RELEASE_ASSERT(NS_IsMainThread());
+    RefPtr<GeckoContentController> rootController =
+        CompositorBridgeParent::GetGeckoContentControllerForRoot(
+            aGuid.mLayersId);
+    if (rootController) {
+      rootController->UpdateOverscrollOffset(aGuid, aX, aY, aIsRootContent);
+    }
+  } else if (XRE_IsGPUProcess()) {
+    if (!mCompositorThread->IsOnCurrentThread()) {
+      mCompositorThread->Dispatch(
+          NewRunnableMethod<ScrollableLayerGuid, float, float, bool>(
+              "layers::RemoteContentController::UpdateOverscrollOffset", this,
+              &RemoteContentController::UpdateOverscrollOffset, aGuid, aX, aY,
+              aIsRootContent));
+      return;
+    }
+
+    MOZ_RELEASE_ASSERT(mCompositorThread->IsOnCurrentThread());
+    GeckoContentController* rootController =
+        CompositorBridgeParent::GetGeckoContentControllerForRoot(
+            aGuid.mLayersId);
+    if (rootController) {
+      MOZ_RELEASE_ASSERT(rootController->IsRemote());
+      (void)static_cast<RemoteContentController*>(rootController)
+          ->SendUpdateOverscrollOffset(aGuid, aX, aY, aIsRootContent);
+    }
+  }
+}
+
+void RemoteContentController::HideDynamicToolbar(
+    const ScrollableLayerGuid& aGuid) {
+  if (XRE_IsParentProcess()) {
+
+    MOZ_RELEASE_ASSERT(NS_IsMainThread());
+    RefPtr<GeckoContentController> rootController =
+        CompositorBridgeParent::GetGeckoContentControllerForRoot(
+            aGuid.mLayersId);
+    if (rootController) {
+      rootController->HideDynamicToolbar(aGuid);
+    }
+  } else if (XRE_IsGPUProcess()) {
+    if (!mCompositorThread->IsOnCurrentThread()) {
+      mCompositorThread->Dispatch(NewRunnableMethod<ScrollableLayerGuid>(
+          "layers::RemoteContentController::HideDynamicToolbar", this,
+          &RemoteContentController::HideDynamicToolbar, aGuid));
+      return;
+    }
+
+    MOZ_RELEASE_ASSERT(mCompositorThread->IsOnCurrentThread());
+    GeckoContentController* rootController =
+        CompositorBridgeParent::GetGeckoContentControllerForRoot(
+            aGuid.mLayersId);
+    if (rootController) {
+      MOZ_RELEASE_ASSERT(rootController->IsRemote());
+      (void)static_cast<RemoteContentController*>(rootController)
+          ->SendHideDynamicToolbar();
+    }
+  }
+}
+
+void RemoteContentController::NotifyMozMouseScrollEvent(
+    const ScrollableLayerGuid::ViewID& aScrollId, const nsString& aEvent) {
+  if (!mCompositorThread->IsOnCurrentThread()) {
+    mCompositorThread->Dispatch(
+        NewRunnableMethod<ScrollableLayerGuid::ViewID, nsString>(
+            "layers::RemoteContentController::NotifyMozMouseScrollEvent", this,
+            &RemoteContentController::NotifyMozMouseScrollEvent, aScrollId,
+            aEvent));
+    return;
+  }
+
+  if (mCanSend) {
+    (void)SendNotifyMozMouseScrollEvent(aScrollId, aEvent);
+  }
+}
+
+void RemoteContentController::NotifyFlushComplete() {
+  MOZ_ASSERT(IsRepaintThread());
+
+  if (mCanSend) {
+    (void)SendNotifyFlushComplete();
+  }
+}
+
+void RemoteContentController::NotifyAsyncScrollbarDragInitiated(
+    uint64_t aDragBlockId, const ScrollableLayerGuid::ViewID& aScrollId,
+    ScrollDirection aDirection) {
+  if (!mCompositorThread->IsOnCurrentThread()) {
+    mCompositorThread->Dispatch(
+        NewRunnableMethod<uint64_t, ScrollableLayerGuid::ViewID,
+                          ScrollDirection>(
+            "layers::RemoteContentController::"
+            "NotifyAsyncScrollbarDragInitiated",
+            this, &RemoteContentController::NotifyAsyncScrollbarDragInitiated,
+            aDragBlockId, aScrollId, aDirection));
+    return;
+  }
+
+  if (mCanSend) {
+    (void)SendNotifyAsyncScrollbarDragInitiated(aDragBlockId, aScrollId,
+                                                aDirection);
+  }
+}
+
+void RemoteContentController::NotifyAsyncScrollbarDragRejected(
+    const ScrollableLayerGuid::ViewID& aScrollId) {
+  if (!mCompositorThread->IsOnCurrentThread()) {
+    mCompositorThread->Dispatch(NewRunnableMethod<ScrollableLayerGuid::ViewID>(
+        "layers::RemoteContentController::NotifyAsyncScrollbarDragRejected",
+        this, &RemoteContentController::NotifyAsyncScrollbarDragRejected,
+        aScrollId));
+    return;
+  }
+
+  if (mCanSend) {
+    (void)SendNotifyAsyncScrollbarDragRejected(aScrollId);
+  }
+}
+
+void RemoteContentController::NotifyAsyncAutoscrollRejected(
+    const ScrollableLayerGuid::ViewID& aScrollId) {
+  if (!mCompositorThread->IsOnCurrentThread()) {
+    mCompositorThread->Dispatch(NewRunnableMethod<ScrollableLayerGuid::ViewID>(
+        "layers::RemoteContentController::NotifyAsyncAutoscrollRejected", this,
+        &RemoteContentController::NotifyAsyncAutoscrollRejected, aScrollId));
+    return;
+  }
+
+  if (mCanSend) {
+    (void)SendNotifyAsyncAutoscrollRejected(aScrollId);
+  }
+}
+
+void RemoteContentController::CancelAutoscroll(
+    const ScrollableLayerGuid& aGuid) {
+  if (XRE_GetProcessType() == GeckoProcessType_GPU) {
+    CancelAutoscrollCrossProcess(aGuid);
+  } else {
+    CancelAutoscrollInProcess(aGuid);
+  }
+}
+
+void RemoteContentController::CancelAutoscrollInProcess(
+    const ScrollableLayerGuid& aGuid) {
+  MOZ_ASSERT(XRE_IsParentProcess());
+  NS_DispatchToMainThread(NewRunnableFunction(
+      "layers::CancelAutoScroll", &APZCCallbackHelper::CancelAutoscroll,
+      aGuid.mScrollId));
+}
+
+void RemoteContentController::CancelAutoscrollCrossProcess(
+    const ScrollableLayerGuid& aGuid) {
+  MOZ_ASSERT(XRE_IsGPUProcess());
+
+  if (!mCompositorThread->IsOnCurrentThread()) {
+    mCompositorThread->Dispatch(NewRunnableMethod<ScrollableLayerGuid>(
+        "layers::RemoteContentController::CancelAutoscrollCrossProcess", this,
+        &RemoteContentController::CancelAutoscrollCrossProcess, aGuid));
+    return;
+  }
+
+  if (auto parent = CompositorBridgeParent::GetApzcTreeManagerParentForRoot(
+          aGuid.mLayersId)) {
+    (void)parent->SendCancelAutoscroll(aGuid.mScrollId);
+  }
+}
+
+void RemoteContentController::NotifyScaleGestureComplete(
+    const ScrollableLayerGuid& aGuid, float aScale) {
+  if (XRE_GetProcessType() == GeckoProcessType_GPU) {
+    NotifyScaleGestureCompleteCrossProcess(aGuid, aScale);
+  } else {
+    NotifyScaleGestureCompleteInProcess(aGuid, aScale);
+  }
+}
+
+void RemoteContentController::NotifyScaleGestureCompleteInProcess(
+    const ScrollableLayerGuid& aGuid, float aScale) {
+  MOZ_ASSERT(XRE_IsParentProcess());
+
+  if (!NS_IsMainThread()) {
+    NS_DispatchToMainThread(NewRunnableMethod<ScrollableLayerGuid, float>(
+        "layers::RemoteContentController::"
+        "NotifyScaleGestureCompleteInProcess",
+        this, &RemoteContentController::NotifyScaleGestureCompleteInProcess,
+        aGuid, aScale));
+    return;
+  }
+
+  RefPtr<GeckoContentController> rootController =
+      CompositorBridgeParent::GetGeckoContentControllerForRoot(aGuid.mLayersId);
+  if (rootController) {
+    MOZ_ASSERT(rootController != this);
+    if (rootController != this) {
+      rootController->NotifyScaleGestureComplete(aGuid, aScale);
+    }
+  }
+}
+
+void RemoteContentController::NotifyScaleGestureCompleteCrossProcess(
+    const ScrollableLayerGuid& aGuid, float aScale) {
+  MOZ_ASSERT(XRE_IsGPUProcess());
+
+  if (!mCompositorThread->IsOnCurrentThread()) {
+    mCompositorThread->Dispatch(NewRunnableMethod<ScrollableLayerGuid, float>(
+        "layers::RemoteContentController::"
+        "NotifyScaleGestureCompleteCrossProcess",
+        this, &RemoteContentController::NotifyScaleGestureCompleteCrossProcess,
+        aGuid, aScale));
+    return;
+  }
+
+  if (auto parent = CompositorBridgeParent::GetApzcTreeManagerParentForRoot(
+          aGuid.mLayersId)) {
+    (void)parent->SendNotifyScaleGestureComplete(aGuid.mScrollId, aScale);
+  }
+}
+
+void RemoteContentController::ActorDestroy(ActorDestroyReason aWhy) {
+  mCanSend = false;
+}
+
+void RemoteContentController::Destroy() {
+  if (mCanSend) {
+    mCanSend = false;
+    (void)SendDestroy();
+  }
+}
+
+mozilla::ipc::IPCResult RemoteContentController::RecvDestroy() {
+  mCanSend = false;
+  return IPC_OK();
+}
+
+bool RemoteContentController::IsRemote() { return true; }
+
+}  
+}  

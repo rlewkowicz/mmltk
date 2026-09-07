@@ -1,0 +1,29 @@
+// Dual licensed as MIT and Apache 2.0 just like the rest of serde_json, but
+// copyright Alexander Huszagh.
+
+//! Fast, minimal float-parsing algorithm.
+
+pub(crate) mod algorithm;
+mod bhcomp;
+mod bignum;
+mod cached;
+mod cached_float80;
+mod digit;
+mod errors;
+pub(crate) mod exponent;
+pub(crate) mod float;
+mod large_powers;
+pub(crate) mod math;
+pub(crate) mod num;
+pub(crate) mod parse;
+pub(crate) mod rounding;
+mod shift;
+mod small_powers;
+
+#[cfg(fast_arithmetic = "32")]
+mod large_powers32;
+
+#[cfg(fast_arithmetic = "64")]
+mod large_powers64;
+
+pub use self::parse::{parse_concise_float, parse_truncated_float};

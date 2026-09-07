@@ -1,0 +1,134 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#include "mozilla/Poison.h"
+
+#include "mozilla/Assertions.h"
+#if !defined(__OS2__)
+#  include <unistd.h>
+#if !defined(__wasi__)
+#    include <sys/mman.h>
+#if !defined(MAP_ANON)
+#if defined(MAP_ANONYMOUS)
+#        define MAP_ANON MAP_ANONYMOUS
+#else
+#        error "Don't know how to get anonymous memory"
+#endif
+#endif
+#endif
+#endif
+
+
+#if defined(__OS2__)
+static void* ReserveRegion(uintptr_t aRegion, uintptr_t aSize) {
+  return (void*)0xFFFD0000;
+}
+
+static void ReleaseRegion(void* aRegion, uintptr_t aSize) { return; }
+
+static bool ProbeRegion(uintptr_t aRegion, uintptr_t aSize) {
+  return false;
+}
+
+static uintptr_t GetDesiredRegionSize() {
+  return 0x1000;
+}
+
+#  define RESERVE_FAILED 0
+
+#elif defined(__wasi__)
+
+#  define RESERVE_FAILED 0
+
+static void* ReserveRegion(uintptr_t aRegion, uintptr_t aSize) {
+  return RESERVE_FAILED;
+}
+
+static void ReleaseRegion(void* aRegion, uintptr_t aSize) { return; }
+
+static bool ProbeRegion(uintptr_t aRegion, uintptr_t aSize) {
+  const auto pageSize = 1 << 16;
+  MOZ_ASSERT(pageSize == sysconf(_SC_PAGESIZE));
+  auto heapSize = __builtin_wasm_memory_size(0) * pageSize;
+  return aRegion + aSize < heapSize;
+}
+
+static uintptr_t GetDesiredRegionSize() { return 0; }
+
+#else
+
+#  include "mozilla/TaggedAnonymousMemory.h"
+
+static void* ReserveRegion(uintptr_t aRegion, uintptr_t aSize) {
+  return MozTaggedAnonymousMmap(reinterpret_cast<void*>(aRegion), aSize,
+                                PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0,
+                                "poison");
+}
+
+static void ReleaseRegion(void* aRegion, uintptr_t aSize) {
+  munmap(aRegion, aSize);
+}
+
+static bool ProbeRegion(uintptr_t aRegion, uintptr_t aSize) {
+  if (madvise(reinterpret_cast<void*>(aRegion), aSize, MADV_NORMAL)) {
+    return true;
+  }
+  return false;
+}
+
+static uintptr_t GetDesiredRegionSize() { return sysconf(_SC_PAGESIZE); }
+
+#  define RESERVE_FAILED MAP_FAILED
+
+#endif
+
+static_assert((sizeof(uintptr_t) == 4 || sizeof(uintptr_t) == 8) &&
+              (sizeof(uintptr_t) == sizeof(void*)));
+
+static uintptr_t ReservePoisonArea(uintptr_t rgnsize) {
+  if (sizeof(uintptr_t) == 8) {
+    return (((uintptr_t(0x7FFFFFFFu) << 31) << 1 | uintptr_t(0xF0DEAFFFu)) &
+            ~(rgnsize - 1));
+  }
+
+  uintptr_t candidate = (0xF0DEAFFF & ~(rgnsize - 1));
+  void* result = ReserveRegion(candidate, rgnsize);
+  if (result == (void*)candidate) {
+    return candidate;
+  }
+
+  if (ProbeRegion(candidate, rgnsize)) {
+    if (result != RESERVE_FAILED) {
+      ReleaseRegion(result, rgnsize);
+    }
+    return candidate;
+  }
+
+  if (result != RESERVE_FAILED) {
+    return uintptr_t(result);
+  }
+
+  result = ReserveRegion(0, rgnsize);
+  if (result != RESERVE_FAILED) {
+    return uintptr_t(result);
+  }
+
+  MOZ_CRASH("no usable poison region identified");
+}
+
+static uintptr_t GetPoisonValue(uintptr_t aBase, uintptr_t aSize) {
+  if (aSize == 0) {  
+    return 0;
+  }
+  return aBase + aSize / 2 - 1;
+}
+
+extern "C" {
+MOZ_RUNINIT uintptr_t gMozillaPoisonSize = GetDesiredRegionSize();
+MOZ_RUNINIT uintptr_t gMozillaPoisonBase =
+    ReservePoisonArea(gMozillaPoisonSize);
+MOZ_RUNINIT uintptr_t gMozillaPoisonValue =
+    GetPoisonValue(gMozillaPoisonBase, gMozillaPoisonSize);
+}

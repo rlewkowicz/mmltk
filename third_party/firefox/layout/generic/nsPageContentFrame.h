@@ -1,0 +1,60 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+#ifndef nsPageContentFrame_h_
+#define nsPageContentFrame_h_
+
+#include "mozilla/ViewportFrame.h"
+
+class nsPageFrame;
+class nsSharedPageData;
+
+namespace mozilla {
+class PresShell;
+}  
+
+class nsPageContentFrame final : public mozilla::ViewportFrame {
+ public:
+  NS_DECL_FRAMEARENA_HELPERS(nsPageContentFrame)
+
+  friend nsPageContentFrame* NS_NewPageContentFrame(
+      mozilla::PresShell* aPresShell, ComputedStyle* aStyle,
+      already_AddRefed<const nsAtom> aPageName);
+  friend class nsPageFrame;
+
+  void Reflow(nsPresContext* aPresContext, ReflowOutput& aReflowOutput,
+              const ReflowInput& aReflowInput,
+              nsReflowStatus& aStatus) override;
+
+  const nsAtom* GetPageName() const { return mPageName; }
+
+  void SetSharedPageData(nsSharedPageData* aPD) { mPD = aPD; }
+
+  ComputeTransformFunction GetTransformGetter() const override;
+  void BuildDisplayList(nsDisplayListBuilder*,
+                        const nsDisplayListSet&) override;
+
+  void AppendDirectlyOwnedAnonBoxes(nsTArray<OwnedAnonBox>& aResult) override;
+
+  void EnsurePageName();
+
+#ifdef DEBUG_FRAME_DUMP
+  nsresult GetFrameName(nsAString& aResult) const override;
+  void ExtraContainerFrameInfo(nsACString& aTo,
+                               bool aListOnlyDeterministic) const override;
+#endif
+
+ protected:
+  explicit nsPageContentFrame(ComputedStyle* aStyle,
+                              nsPresContext* aPresContext,
+                              already_AddRefed<const nsAtom> aPageName)
+      : ViewportFrame(aStyle, aPresContext, kClassID), mPageName(aPageName) {}
+
+  RefPtr<const nsAtom> mPageName;
+
+  nsSharedPageData* mPD = nullptr;
+
+  nscoord mRemainingOverflow = 0;
+};
+
+#endif /* nsPageContentFrame_h_ */

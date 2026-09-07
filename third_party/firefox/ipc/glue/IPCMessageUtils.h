@@ -1,0 +1,238 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef IPC_GLUE_IPCMESSAGEUTILS_H_
+#define IPC_GLUE_IPCMESSAGEUTILS_H_
+
+#include <cstdint>
+#include <tuple>
+#include "chrome/common/ipc_message.h"
+#include "chrome/common/ipc_message_utils.h"
+#include "mozilla/ipc/IPCCore.h"
+#include "mozilla/MacroForEach.h"
+#include "mozilla/TiedFields.h"
+
+class PickleIterator;
+
+#include "base/string_util.h"
+
+#ifdef _MSC_VER
+#  pragma warning(disable : 4800)
+#endif
+
+#if !defined(XP_UNIX)
+namespace base {
+struct FileDescriptor {};
+}  
+#endif
+
+namespace mozilla {
+template <typename...>
+class Variant;
+
+namespace detail {
+template <typename...>
+struct VariantTag;
+}
+}  
+
+namespace IPC {
+
+template <typename T>
+struct EmptyStructSerializer {
+  typedef T paramType;
+
+  static void Write(MessageWriter* aWriter, const paramType& aParam) {}
+
+  static bool Read(MessageReader* aReader, paramType* aResult) {
+    *aResult = {};
+    return true;
+  }
+};
+
+template <>
+struct ParamTraits<int8_t> {
+  typedef int8_t paramType;
+
+  static void Write(MessageWriter* aWriter, const paramType& aParam) {
+    aWriter->WriteBytes(&aParam, sizeof(aParam));
+  }
+
+  static bool Read(MessageReader* aReader, paramType* aResult) {
+    return aReader->ReadBytesInto(aResult, sizeof(*aResult));
+  }
+};
+
+template <>
+struct ParamTraits<uint8_t> {
+  typedef uint8_t paramType;
+
+  static void Write(MessageWriter* aWriter, const paramType& aParam) {
+    aWriter->WriteBytes(&aParam, sizeof(aParam));
+  }
+
+  static bool Read(MessageReader* aReader, paramType* aResult) {
+    return aReader->ReadBytesInto(aResult, sizeof(*aResult));
+  }
+};
+
+#if !defined(XP_UNIX)
+template <>
+struct ParamTraits<base::FileDescriptor> {
+  typedef base::FileDescriptor paramType;
+  static void Write(MessageWriter* aWriter, const paramType& aParam) {
+    MOZ_CRASH("FileDescriptor isn't meaningful on this platform");
+  }
+  static bool Read(MessageReader* aReader, paramType* aResult) {
+    MOZ_CRASH("FileDescriptor isn't meaningful on this platform");
+    return false;
+  }
+};
+#endif  // !defined(XP_UNIX)
+
+template <>
+struct ParamTraits<mozilla::void_t> {
+  typedef mozilla::void_t paramType;
+  static void Write(MessageWriter* aWriter, const paramType& aParam) {}
+  static bool Read(MessageReader* aReader, paramType* aResult) {
+    *aResult = paramType();
+    return true;
+  }
+};
+
+template <>
+struct ParamTraits<mozilla::null_t> {
+  typedef mozilla::null_t paramType;
+  static void Write(MessageWriter* aWriter, const paramType& aParam) {}
+  static bool Read(MessageReader* aReader, paramType* aResult) {
+    *aResult = paramType();
+    return true;
+  }
+};
+
+template <typename ParamType>
+struct BitfieldHelper {
+  static bool ReadBoolForBitfield(MessageReader* aReader, ParamType* aResult,
+                                  void (ParamType::*aSetter)(bool)) {
+    bool value;
+    if (ReadParam(aReader, &value)) {
+      (aResult->*aSetter)(value);
+      return true;
+    }
+    return false;
+  }
+};
+
+
+template <typename... Ts>
+static void WriteParams(MessageWriter* aWriter, const Ts&... aArgs) {
+  (WriteParam(aWriter, aArgs), ...);
+}
+
+template <typename... Ts>
+static bool ReadParams(MessageReader* aReader, Ts&... aArgs) {
+  return (ReadParam(aReader, &aArgs) && ...);
+}
+
+template <class T>
+struct ParamTraits_TiedFields {
+  static_assert(mozilla::AssertTiedFieldsAreExhaustive<T>());
+
+  static void Write(MessageWriter* const writer, const T& in) {
+    const auto& fields = mozilla::TiedFields(in);
+    std::apply([=](const auto&... field) { WriteParams(writer, field...); },
+               fields);
+  }
+
+  static bool Read(MessageReader* const reader, T* const out) {
+    const auto& fields = mozilla::TiedFields(*out);
+    return std::apply(
+        [=](auto&... field) { return ReadParams(reader, field...); }, fields);
+  }
+};
+
+template <class U, size_t N>
+struct ParamTraits<mozilla::PaddingField<U, N>> final
+    : public ParamTraits_TiedFields<mozilla::PaddingField<U, N>> {};
+
+#define ACCESS_PARAM_FIELD(Field) aParam.Field
+
+#define DEFINE_IPC_SERIALIZER_WITH_FIELDS(Type, ...)                         \
+  template <>                                                                \
+  struct ParamTraits<Type> {                                                 \
+    typedef Type paramType;                                                  \
+    static void Write(MessageWriter* aWriter, const paramType& aParam) {     \
+      WriteParams(aWriter, MOZ_FOR_EACH_SEPARATED(ACCESS_PARAM_FIELD, (, ),  \
+                                                  (), (__VA_ARGS__)));       \
+    }                                                                        \
+                                                                             \
+    static bool Read(MessageReader* aReader, paramType* aResult) {           \
+      paramType& aParam = *aResult;                                          \
+      return ReadParams(aReader,                                             \
+                        MOZ_FOR_EACH_SEPARATED(ACCESS_PARAM_FIELD, (, ), (), \
+                                               (__VA_ARGS__)));              \
+    }                                                                        \
+  };
+
+#define DECLARE_IPC_SERIALIZER(Type)                                    \
+  template <>                                                           \
+  struct ParamTraits<Type> {                                            \
+    typedef Type paramType;                                             \
+    static void Write(MessageWriter* aWriter, const paramType& aParam); \
+    static bool Read(MessageReader* aReader, paramType* aResult);       \
+  };
+
+#define IMPLEMENT_IPC_SERIALIZER_WITH_FIELDS(Type, ...)                       \
+  void ParamTraits<Type>::Write(MessageWriter* aWriter,                       \
+                                const paramType& aParam) {                    \
+    WriteParams(aWriter, MOZ_FOR_EACH_SEPARATED(ACCESS_PARAM_FIELD, (, ), (), \
+                                                (__VA_ARGS__)));              \
+  }                                                                           \
+                                                                              \
+  bool ParamTraits<Type>::Read(MessageReader* aReader, paramType* aResult) {  \
+    paramType& aParam = *aResult;                                             \
+    return ReadParams(                                                        \
+        aReader,                                                              \
+        MOZ_FOR_EACH_SEPARATED(ACCESS_PARAM_FIELD, (, ), (), (__VA_ARGS__))); \
+  }
+
+#define DEFINE_IPC_SERIALIZER_WITHOUT_FIELDS(Type) \
+  template <>                                      \
+  struct ParamTraits<Type> : public EmptyStructSerializer<Type> {};
+
+} 
+
+#define DEFINE_IPC_SERIALIZER_WITH_SUPER_CLASS(Type, Super)              \
+  template <>                                                            \
+  struct ParamTraits<Type> {                                             \
+    typedef Type paramType;                                              \
+    static void Write(MessageWriter* aWriter, const paramType& aParam) { \
+      WriteParam(aWriter, static_cast<const Super&>(aParam));            \
+    }                                                                    \
+                                                                         \
+    static bool Read(MessageReader* aReader, paramType* aResult) {       \
+      return ReadParam(aReader, static_cast<Super*>(aResult));           \
+    }                                                                    \
+  };
+
+#define DEFINE_IPC_SERIALIZER_WITH_SUPER_CLASS_AND_FIELDS(Type, Super, ...)  \
+  template <>                                                                \
+  struct ParamTraits<Type> {                                                 \
+    typedef Type paramType;                                                  \
+    static void Write(MessageWriter* aWriter, const paramType& aParam) {     \
+      WriteParam(aWriter, static_cast<const Super&>(aParam));                \
+      WriteParams(aWriter, MOZ_FOR_EACH_SEPARATED(ACCESS_PARAM_FIELD, (, ),  \
+                                                  (), (__VA_ARGS__)));       \
+    }                                                                        \
+                                                                             \
+    static bool Read(MessageReader* aReader, paramType* aResult) {           \
+      paramType& aParam = *aResult;                                          \
+      return ReadParam(aReader, static_cast<Super*>(aResult)) &&             \
+             ReadParams(aReader,                                             \
+                        MOZ_FOR_EACH_SEPARATED(ACCESS_PARAM_FIELD, (, ), (), \
+                                               (__VA_ARGS__)));              \
+    }                                                                        \
+  };
+
+#endif /* IPC_GLUE_IPCMESSAGEUTILS_H_ */

@@ -1,0 +1,227 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_ViewTransition_h
+#define mozilla_dom_ViewTransition_h
+
+#include "mozilla/Attributes.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/layers/IpcResourceUpdateQueue.h"
+#include "nsAtomHashKeys.h"
+#include "nsClassHashtable.h"
+#include "nsRect.h"
+#include "nsRefPtrHashtable.h"
+#include "nsWrapperCache.h"
+
+class nsIGlobalObject;
+class nsITimer;
+
+namespace mozilla {
+
+class ErrorResult;
+struct Keyframe;
+struct PseudoStyleRequest;
+struct StyleLockedDeclarationBlock;
+
+namespace layers {
+class RenderRootStateManager;
+}
+
+namespace wr {
+struct ImageKey;
+class IpcResourceUpdateQueue;
+}  
+
+namespace dom {
+
+class ViewTransitionTypeSet;
+extern LazyLogModule gViewTransitionsLog;
+
+#define VT_LOG(...)                                                    \
+  MOZ_LOG(mozilla::dom::gViewTransitionsLog, mozilla::LogLevel::Debug, \
+          (__VA_ARGS__))
+
+#ifdef DEBUG
+#  define VT_LOG_DEBUG(...) VT_LOG(__VA_ARGS__)
+#else
+#  define VT_LOG_DEBUG(...)
+#endif
+
+class Document;
+class Element;
+class Promise;
+class ViewTransitionUpdateCallback;
+
+enum class SkipTransitionReason : uint8_t {
+  JS,
+  DocumentHidden,
+  RootRemoved,
+  ClobberedActiveTransition,
+  Timeout,
+  UpdateCallbackRejected,
+  DuplicateTransitionNameCapturingOldState,
+  DuplicateTransitionNameCapturingNewState,
+  PseudoUpdateFailure,
+  Resize,
+  PageSwap,
+  ResetRendering,
+};
+
+enum class ViewTransitionPhase : uint8_t {
+  PendingCapture = 0,
+  UpdateCallbackCalled,
+  Animating,
+  PendingDone,
+  Done,
+};
+
+struct ViewTransitionCapturedElement;
+
+using ViewTransitionNamedElements =
+    nsClassHashtable<nsAtomHashKey, ViewTransitionCapturedElement>;
+
+struct ViewTransitionParams {
+  ViewTransitionNamedElements namedElements;
+  AutoTArray<RefPtr<nsAtom>, 8> names;
+  nsSize initialSnapshotContainingBlockSize;
+
+  ~ViewTransitionParams();
+};
+
+class ViewTransition final : public nsISupports, public nsWrapperCache {
+ public:
+  using Phase = ViewTransitionPhase;
+  using TypeList = nsTArray<RefPtr<nsAtom>>;
+
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+  NS_DECL_CYCLE_COLLECTION_WRAPPERCACHE_CLASS(ViewTransition)
+
+  ViewTransition(Document&, ViewTransitionUpdateCallback*, TypeList&&);
+
+  static already_AddRefed<ViewTransition> CreateCrossDocument(
+      Document&, UniquePtr<ViewTransitionParams>, TypeList&&);
+
+  Promise* GetUpdateCallbackDone(ErrorResult&);
+  Promise* GetReady(ErrorResult&);
+  Promise* GetFinished(ErrorResult&);
+  ViewTransitionTypeSet* Types();
+  const TypeList& GetTypeList() const { return mTypeList; }
+  TypeList& GetTypeList() { return mTypeList; }
+
+  void SkipTransition(SkipTransitionReason = SkipTransitionReason::JS);
+  MOZ_CAN_RUN_SCRIPT void PerformPendingOperations();
+
+  void FinishDone();
+
+  Element* GetSnapshotContainingBlock() const {
+    return mSnapshotContainingBlock;
+  }
+  Element* GetViewTransitionTreeRoot() const;
+  void GetCapturedFrames(nsTArray<nsIFrame*>& aCapturedFrames) const;
+
+  Maybe<nsRect> GetOldInkOverflowRect(nsAtom* aName) const;
+  Maybe<nsRect> GetNewInkOverflowRect(nsAtom* aName) const;
+  Maybe<nsSize> GetOldBorderBoxSize(nsAtom* aName) const;
+  Maybe<nsSize> GetNewBorderBoxSize(nsAtom* aName) const;
+  Maybe<nsRect> GetOldActiveRect(nsAtom* aName) const;
+  Maybe<nsRect> GetNewActiveRect(nsAtom* aName) const;
+  const wr::ImageKey* GetOrCreateOldImageKey(nsAtom* aName,
+                                             layers::RenderRootStateManager*,
+                                             wr::IpcResourceUpdateQueue&) const;
+  const wr::ImageKey* ReadOldImageKey(nsAtom* aName,
+                                      layers::RenderRootStateManager*,
+                                      wr::IpcResourceUpdateQueue&) const;
+  const wr::ImageKey* GetNewImageKey(nsAtom* aName) const;
+  const wr::ImageKey* GetImageKeyForCapturedFrame(
+      nsIFrame* aFrame, layers::RenderRootStateManager*,
+      wr::IpcResourceUpdateQueue&) const;
+  void UpdateActiveRectForCapturedFrame(
+      nsIFrame* capturedFrame, const gfx::MatrixScales& aInheritedScale,
+      nsRect& aOutCapturedRect);
+
+  Element* FindPseudo(const PseudoStyleRequest&) const;
+
+  const StyleLockedDeclarationBlock* GetDynamicRuleFor(const Element&) const;
+
+  static constexpr nsLiteralString kGroupAnimPrefix =
+      u"-ua-view-transition-group-anim-"_ns;
+
+  [[nodiscard]] bool GetGroupKeyframes(nsAtom* aAnimationName,
+                                       const StyleComputedTimingFunction&,
+                                       nsTArray<Keyframe>&);
+
+  bool MatchClassList(nsAtom*, const nsTArray<StyleAtom>&) const;
+
+  nsIGlobalObject* GetParentObject() const;
+  JSObject* WrapObject(JSContext*, JS::Handle<JSObject*> aGivenProto) override;
+
+  static nsRect SnapshotContainingBlockRect(nsPresContext*);
+  static nsRect CapturedInkOverflowRectForFrame(nsIFrame*, bool aIsRoot);
+  MOZ_CAN_RUN_SCRIPT void CallUpdateCallback(ErrorResult&);
+
+  void Activate();
+
+ private:
+  using CapturedElement = ViewTransitionCapturedElement;
+
+  MOZ_CAN_RUN_SCRIPT void MaybeScheduleUpdateCallback();
+
+  void ClearActiveTransition(bool aIsDocumentHidden);
+  void Timeout();
+  MOZ_CAN_RUN_SCRIPT void Setup();
+  [[nodiscard]] MOZ_CAN_RUN_SCRIPT Maybe<SkipTransitionReason>
+  CaptureOldState();
+  [[nodiscard]] Maybe<SkipTransitionReason> CaptureNewState();
+  void SetupTransitionPseudoElements();
+  [[nodiscard]] bool UpdatePseudoElementStyles(bool aNeedsInvalidation);
+  void ClearNamedElements();
+  void HandleFrame();
+  bool CheckForActiveAnimations() const;
+  void SkipTransition(SkipTransitionReason, JS::Handle<JS::Value>);
+  void ClearTimeoutTimer();
+
+  nsRect SnapshotContainingBlockRect() const;
+
+  Maybe<uint64_t> GetElementIdentifier(Element* aElement) const;
+  uint64_t EnsureElementIdentifier(Element* aElement);
+
+  already_AddRefed<nsAtom> DocumentScopedTransitionNameFor(nsIFrame* aFrame);
+
+  ~ViewTransition();
+
+  RefPtr<Document> mDocument;
+  RefPtr<ViewTransitionUpdateCallback> mUpdateCallback;
+
+  ViewTransitionNamedElements mNamedElements;
+  // auto-generated for this view transition.
+  AutoTArray<RefPtr<nsAtom>, 8> mNames;
+
+  using OldCaptureFramesArray =
+      AutoTArray<std::pair<nsIFrame*, RefPtr<nsAtom>>, 32>;
+  OldCaptureFramesArray* mOldCaptureElements = nullptr;
+
+  // The element identifier for the elements which need the auto-generated
+  using ElementIdentifiers = nsTHashMap<Element*, uint64_t>;
+  ElementIdentifiers mElementIdentifiers;
+
+  nsSize mInitialSnapshotContainingBlockSize;
+
+  RefPtr<Promise> mUpdateCallbackDonePromise;
+  RefPtr<Promise> mReadyPromise;
+  RefPtr<Promise> mFinishedPromise;
+
+  TypeList mTypeList;
+  RefPtr<ViewTransitionTypeSet> mTypes;
+
+  static void TimeoutCallback(nsITimer*, void*);
+  RefPtr<nsITimer> mTimeoutTimer;
+
+  Phase mPhase = Phase::PendingCapture;
+  RefPtr<Element> mSnapshotContainingBlock;
+};
+
+}  
+}  
+
+#endif

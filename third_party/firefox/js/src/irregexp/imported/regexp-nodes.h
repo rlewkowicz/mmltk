@@ -1,0 +1,749 @@
+// Copyright 2019 the V8 project authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(V8_REGEXP_REGEXP_NODES_H_)
+#define V8_REGEXP_REGEXP_NODES_H_
+
+#include "irregexp/imported/regexp-macro-assembler.h"
+
+namespace v8 {
+namespace internal {
+namespace regexp {
+
+class AlternativeGenerationList;
+class BoyerMooreLookahead;
+class Compiler;
+class NegativeSubmatchSuccess;
+template <typename T>
+class NodePrinter;
+class NodeVisitor;
+struct PreloadState;
+class QuickCheckDetails;
+class SeqNode;
+class SpecialLoopState;
+class Trace;
+
+#define FOR_EACH_NODE_TYPE(VISIT) \
+  VISIT(End)                      \
+  VISIT(Action)                   \
+  VISIT(Choice)                   \
+  VISIT(LoopChoice)               \
+  VISIT(NegativeLookaroundChoice) \
+  VISIT(BackReference)            \
+  VISIT(Assertion)                \
+  VISIT(Text)                     \
+  VISIT(UnanchoredAdvance)
+
+#define FORWARD_DECLARE(type) class type##Node;
+FOR_EACH_NODE_TYPE(FORWARD_DECLARE)
+#undef FORWARD_DECLARE
+
+struct NodeInfo final {
+  NodeInfo()
+      : being_analyzed(false),
+        been_analyzed(false),
+        follows_word_interest(false),
+        follows_newline_interest(false),
+        follows_start_interest(false),
+        at_end(false),
+        visited(false),
+        replacement_calculated(false) {}
+
+  bool Matches(NodeInfo* that) {
+    return (at_end == that->at_end) &&
+           (follows_word_interest == that->follows_word_interest) &&
+           (follows_newline_interest == that->follows_newline_interest) &&
+           (follows_start_interest == that->follows_start_interest);
+  }
+
+  void AddFromPreceding(NodeInfo* that) {
+    at_end |= that->at_end;
+    follows_word_interest |= that->follows_word_interest;
+    follows_newline_interest |= that->follows_newline_interest;
+    follows_start_interest |= that->follows_start_interest;
+  }
+
+  bool HasLookbehind() {
+    return follows_word_interest || follows_newline_interest ||
+           follows_start_interest;
+  }
+
+  void AddFromFollowing(NodeInfo* that) {
+    follows_word_interest |= that->follows_word_interest;
+    follows_newline_interest |= that->follows_newline_interest;
+    follows_start_interest |= that->follows_start_interest;
+  }
+
+  void ResetCompilationState() {
+    being_analyzed = false;
+    been_analyzed = false;
+  }
+
+  bool being_analyzed : 1;
+  bool been_analyzed : 1;
+
+  bool follows_word_interest : 1;
+  bool follows_newline_interest : 1;
+  bool follows_start_interest : 1;
+
+  bool at_end : 1;
+  bool visited : 1;
+  bool replacement_calculated : 1;
+};
+
+struct EatsAtLeastInfo final {
+  EatsAtLeastInfo() : EatsAtLeastInfo(0) {}
+  explicit EatsAtLeastInfo(uint8_t eats)
+      : from_possibly_start(eats), from_not_start(eats) {}
+  void SetMin(const EatsAtLeastInfo& other) {
+    from_possibly_start =
+        std::min(from_possibly_start, other.from_possibly_start);
+    from_not_start = std::min(from_not_start, other.from_not_start);
+  }
+  void SetMax(int other) {
+    uint8_t max = base::saturated_cast<uint8_t>(other);
+    from_possibly_start = std::max(from_possibly_start, max);
+    from_not_start = std::max(from_not_start, max);
+  }
+
+  bool IsZero() const {
+    return from_possibly_start == 0 && from_not_start == 0;
+  }
+
+  uint8_t from_possibly_start;
+
+  uint8_t from_not_start;
+};
+
+class EmitResult final {
+ public:
+  static EmitResult Success() { return EmitResult(kSuccess); }
+  static EmitResult Error() { return EmitResult(kError); }
+
+  bool IsSuccess() const { return result_ == kSuccess; }
+  bool IsError() const { return result_ == kError; }
+
+ private:
+  enum Result { kSuccess, kError };
+  constexpr explicit EmitResult(Result result) : result_(result) {}
+  Result result_;
+};
+
+#define RETURN_IF_ERROR(stmt) \
+  if (EmitResult r = (stmt); V8_UNLIKELY(r.IsError())) return r
+
+class V8_EXPORT_PRIVATE Node : public ZoneObject {
+ public:
+  explicit Node(Zone* zone)
+      : replacement_(nullptr),
+        on_work_list_(false),
+        trace_count_(0),
+        zone_(zone) {
+    bm_info_[0] = bm_info_[1] = nullptr;
+  }
+  virtual ~Node();
+  virtual void Accept(NodeVisitor* visitor) = 0;
+  V8_WARN_UNUSED_RESULT virtual EmitResult Emit(Compiler* compiler,
+                                                Trace* trace) = 0;
+  uint32_t EatsAtLeast(bool not_at_start);
+  static constexpr uint32_t kLargeEatsAtLeastValue = 255;
+  bool EmitQuickCheck(Compiler* compiler, Trace* bounds_check_trace,
+                      Trace* trace, bool preload_has_checked_bounds,
+                      Label* on_possible_success,
+                      QuickCheckDetails* details_return,
+                      bool fall_through_on_failure, ChoiceNode* predecessor);
+  virtual void GetQuickCheckDetails(QuickCheckDetails* details,
+                                    Compiler* compiler,
+                                    int characters_filled_in, bool not_at_start,
+                                    int budget) = 0;
+  static const int kNodeIsTooComplexForFixedLengthLoops = kMinInt;
+  virtual int FixedLengthLoopLength() {
+    return kNodeIsTooComplexForFixedLengthLoops;
+  }
+  virtual Node* GetSuccessorOfOmnivorousTextNode(Compiler* compiler) {
+    return nullptr;
+  }
+
+  static const int kRecursionBudget = 200;
+  bool KeepRecursing(Compiler* compiler);
+  virtual void FillInBMInfo(Isolate* isolate, int offset, int budget,
+                            BoyerMooreLookahead* bm, bool not_at_start) {
+    return;
+  }
+
+  void SaveBMInfo(BoyerMooreLookahead* bm, bool not_at_start, int offset) {
+    if (offset == 0) set_bm_info(not_at_start, bm);
+  }
+
+  Label* label() { return &label_; }
+  static const int kMaxCopiesCodeGenerated = 10;
+
+  bool on_work_list() { return on_work_list_; }
+  void set_on_work_list(bool value) { on_work_list_ = value; }
+
+  NodeInfo* info() { return &info_; }
+  const EatsAtLeastInfo* eats_at_least_info() const { return &eats_at_least_; }
+  void set_eats_at_least_info(const EatsAtLeastInfo& eats_at_least) {
+    eats_at_least_ = eats_at_least;
+  }
+
+  // for very large choice nodes that can be generated by unicode property
+  void SetDoNotInline() { trace_count_ = kMaxCopiesCodeGenerated; }
+
+  BoyerMooreLookahead* bm_info(bool not_at_start) {
+    return bm_info_[not_at_start ? 1 : 0];
+  }
+
+#define DECLARE_CAST(type) \
+  virtual type##Node* As##type##Node() { return nullptr; }
+  FOR_EACH_NODE_TYPE(DECLARE_CAST)
+#undef DECLARE_CAST
+
+  virtual NegativeSubmatchSuccess* AsNegativeSubmatchSuccess() {
+    return nullptr;
+  }
+  virtual SeqNode* AsSeqNode() { return nullptr; }
+
+  Zone* zone() const { return zone_; }
+
+  virtual bool IsBacktrack() const { return false; }
+
+ protected:
+  enum LimitResult { DONE, CONTINUE };
+  Node* replacement_;
+
+  LimitResult LimitVersions(Compiler* compiler, Trace* trace);
+
+  void set_bm_info(bool not_at_start, BoyerMooreLookahead* bm) {
+    bm_info_[not_at_start ? 1 : 0] = bm;
+  }
+
+ private:
+  static const int kFirstCharBudget = 10;
+  Label label_;
+  bool on_work_list_;
+  NodeInfo info_;
+
+  EatsAtLeastInfo eats_at_least_;
+
+  int trace_count_;
+  BoyerMooreLookahead* bm_info_[2];
+
+  Zone* zone_;
+};
+
+class V8_EXPORT_PRIVATE SeqNode : public Node {
+ public:
+  explicit SeqNode(Node* on_success)
+      : Node(on_success->zone()), on_success_(on_success) {}
+  Node* on_success() const { return on_success_; }
+  void set_on_success(Node* node) { on_success_ = node; }
+  void FillInBMInfo(Isolate* isolate, int offset, int budget,
+                    BoyerMooreLookahead* bm, bool not_at_start) override {
+    on_success_->FillInBMInfo(isolate, offset, budget - 1, bm, not_at_start);
+    if (offset == 0) set_bm_info(not_at_start, bm);
+  }
+  SeqNode* AsSeqNode() override { return this; }
+
+ private:
+  Node* on_success_;
+};
+
+class ActionNode : public SeqNode {
+ public:
+  enum ActionType {
+    SET_REGISTER_FOR_LOOP,
+    INCREMENT_REGISTER,
+    STORE_POSITION,
+    RESTORE_POSITION,
+    BEGIN_POSITIVE_SUBMATCH,
+    BEGIN_NEGATIVE_SUBMATCH,
+    POSITIVE_SUBMATCH_SUCCESS,
+    EMPTY_MATCH_CHECK,
+    CLEAR_CAPTURES,
+    MODIFY_FLAGS,
+    EATS_AT_LEAST,
+  };
+  static ActionNode* SetRegisterForLoop(int reg, int val, Node* on_success);
+  static ActionNode* IncrementRegister(int reg, Node* on_success);
+  static ActionNode* StorePosition(int reg, Node* on_success);
+  static ActionNode* RestorePosition(int reg, Node* on_success);
+  static ActionNode* ClearCaptures(Interval range, Node* on_success);
+  static ActionNode* BeginPositiveSubmatch(int stack_pointer_reg,
+                                           int position_reg, Node* body,
+                                           ActionNode* success_node);
+  static ActionNode* BeginNegativeSubmatch(int stack_pointer_reg,
+                                           int position_reg, Node* on_success);
+  static ActionNode* PositiveSubmatchSuccess(int stack_pointer_reg,
+                                             int restore_reg,
+                                             int clear_capture_count,
+                                             int clear_capture_from,
+                                             Node* on_success);
+  static ActionNode* EmptyMatchCheck(int start_register,
+                                     int repetition_register,
+                                     int repetition_limit, Node* on_success);
+  static ActionNode* ModifyFlags(Flags flags, Node* on_success);
+  static ActionNode* EatsAtLeast(int characters, Node* on_success);
+  ActionNode* AsActionNode() override { return this; }
+  void Accept(NodeVisitor* visitor) override;
+  V8_WARN_UNUSED_RESULT EmitResult Emit(Compiler* compiler,
+                                        Trace* trace) override;
+  void GetQuickCheckDetails(QuickCheckDetails* details, Compiler* compiler,
+                            int filled_in, bool not_at_start,
+                            int budget) override;
+  void FillInBMInfo(Isolate* isolate, int offset, int budget,
+                    BoyerMooreLookahead* bm, bool not_at_start) override;
+  ActionType action_type() const { return action_type_; }
+  int FixedLengthLoopLength() override {
+    return kNodeIsTooComplexForFixedLengthLoops;
+  }
+  Flags flags() const {
+    DCHECK_EQ(action_type(), MODIFY_FLAGS);
+    return Flags{data_.u_modify_flags.flags};
+  }
+  ActionNode* success_node() const {
+    DCHECK_EQ(action_type(), BEGIN_POSITIVE_SUBMATCH);
+    return data_.u_submatch.success_node;
+  }
+  int stored_eats_at_least() {
+    DCHECK_EQ(action_type(), EATS_AT_LEAST);
+    return data_.u_eats_at_least.characters;
+  }
+
+  bool Mentions(int reg) const {
+    return base::IsInRange(reg, register_from(), register_to());
+  }
+
+  int value() const {
+    DCHECK(action_type() == SET_REGISTER_FOR_LOOP);
+    return data_.u_simple.value;
+  }
+
+  bool IsSimpleAction() const {
+    return action_type() == STORE_POSITION ||
+           action_type() == RESTORE_POSITION ||
+           action_type() == INCREMENT_REGISTER ||
+           action_type() == SET_REGISTER_FOR_LOOP ||
+           action_type() == CLEAR_CAPTURES;
+  }
+
+  int register_from() const {
+    DCHECK(IsSimpleAction());
+    return data_.u_simple.register_from;
+  }
+
+  int register_to() const { return data_.u_simple.register_to; }
+
+ protected:
+  ActionNode(ActionType action_type, Node* on_success)
+      : SeqNode(on_success), action_type_(action_type) {}
+
+  ActionNode(ActionType action_type, Node* on_success, int from, int to = -1,
+             int value = 0)
+      : SeqNode(on_success), action_type_(action_type) {
+    data_.u_simple.register_from = from;
+    data_.u_simple.register_to = to == -1 ? from : to;
+    data_.u_simple.value = value;
+    DCHECK(IsSimpleAction());
+  }
+
+ private:
+  union {
+    struct {
+      int register_from;
+      int register_to;
+      int value;
+    } u_simple;
+    struct {
+      int stack_pointer_register;
+      int current_position_register;
+      int clear_register_count;
+      int clear_register_from;
+      ActionNode* success_node;  
+    } u_submatch;
+    struct {
+      int start_register;
+      int repetition_register;
+      int repetition_limit;
+    } u_empty_match_check;
+    struct {
+      int flags;
+    } u_modify_flags;
+    struct {
+      int characters;
+    } u_eats_at_least;
+  } data_;
+
+  ActionType action_type_;
+  friend class DotPrinterImpl;
+  friend class NodePrinter<Node>;
+  friend Zone;
+};
+
+class V8_EXPORT_PRIVATE TextNode : public SeqNode {
+ public:
+  TextNode(ZoneList<TextElement>* elms, bool read_backward, Node* on_success)
+      : SeqNode(on_success), elms_(elms), read_backward_(read_backward) {}
+  TextNode(ClassRanges* that, bool read_backward, Node* on_success)
+      : SeqNode(on_success),
+        elms_(zone()->New<ZoneList<TextElement>>(1, zone())),
+        read_backward_(read_backward) {
+    elms_->Add(TextElement::FromClassRanges(that), zone());
+  }
+  static TextNode* CreateForCharacterRanges(Zone* zone,
+                                            ZoneList<CharacterRange>* ranges,
+                                            bool read_backward,
+                                            Node* on_success);
+  static TextNode* CreateForSurrogatePair(
+      Zone* zone, CharacterRange lead, ZoneList<CharacterRange>* trail_ranges,
+      bool read_backward, Node* on_success);
+  static TextNode* CreateForSurrogatePair(Zone* zone,
+                                          ZoneList<CharacterRange>* lead_ranges,
+                                          CharacterRange trail,
+                                          bool read_backward, Node* on_success);
+  TextNode* AsTextNode() override { return this; }
+  void Accept(NodeVisitor* visitor) override;
+  V8_WARN_UNUSED_RESULT EmitResult Emit(Compiler* compiler,
+                                        Trace* trace) override;
+  void GetQuickCheckDetails(QuickCheckDetails* details, Compiler* compiler,
+                            int characters_filled_in, bool not_at_start,
+                            int budget) override;
+  ZoneList<TextElement>* elements() { return elms_; }
+  bool read_backward() const { return read_backward_; }
+  void MakeCaseIndependent(Isolate* isolate, bool is_one_byte, Flags flags);
+  int FixedLengthLoopLength() override;
+  Node* GetSuccessorOfOmnivorousTextNode(Compiler* compiler) override;
+  void FillInBMInfo(Isolate* isolate, int offset, int budget,
+                    BoyerMooreLookahead* bm, bool not_at_start) override;
+  void CalculateOffsets();
+  int Length();
+
+  bool CanMatchLatin1(Compiler* compiler);
+
+ private:
+  enum TextEmitPassType {
+    NON_LATIN1_MATCH,            
+    SIMPLE_CHARACTER_MATCH,      
+    NON_LETTER_CHARACTER_MATCH,  
+    CASE_CHARACTER_MATCH,        
+    CHARACTER_CLASS_MATCH        
+  };
+  void TextEmitPass(Compiler* compiler, TextEmitPassType pass, bool preloaded,
+                    Trace* trace, bool first_element_checked,
+                    int* checked_up_to);
+  ZoneList<TextElement>* elms_;
+  bool read_backward_;
+};
+
+class AssertionNode : public SeqNode {
+ public:
+  enum AssertionType {
+    AT_END,
+    AT_START,
+    AT_BOUNDARY,
+    AT_NON_BOUNDARY,
+    AFTER_NEWLINE
+  };
+  static AssertionNode* AtEnd(Node* on_success) {
+    return on_success->zone()->New<AssertionNode>(AT_END, on_success);
+  }
+  static AssertionNode* AtStart(Node* on_success) {
+    return on_success->zone()->New<AssertionNode>(AT_START, on_success);
+  }
+  static AssertionNode* AtBoundary(Node* on_success) {
+    return on_success->zone()->New<AssertionNode>(AT_BOUNDARY, on_success);
+  }
+  static AssertionNode* AtNonBoundary(Node* on_success) {
+    return on_success->zone()->New<AssertionNode>(AT_NON_BOUNDARY, on_success);
+  }
+  static AssertionNode* AfterNewline(Node* on_success) {
+    return on_success->zone()->New<AssertionNode>(AFTER_NEWLINE, on_success);
+  }
+  AssertionNode* AsAssertionNode() override { return this; }
+  void Accept(NodeVisitor* visitor) override;
+  V8_WARN_UNUSED_RESULT EmitResult Emit(Compiler* compiler,
+                                        Trace* trace) override;
+  void GetQuickCheckDetails(QuickCheckDetails* details, Compiler* compiler,
+                            int filled_in, bool not_at_start,
+                            int budget) override;
+  void FillInBMInfo(Isolate* isolate, int offset, int budget,
+                    BoyerMooreLookahead* bm, bool not_at_start) override;
+  AssertionType assertion_type() const { return assertion_type_; }
+
+ private:
+  friend Zone;
+
+  V8_WARN_UNUSED_RESULT EmitResult EmitBoundaryCheck(Compiler* compiler,
+                                                     Trace* trace);
+  enum IfPrevious { kIsNonWord, kIsWord };
+  V8_WARN_UNUSED_RESULT EmitResult BacktrackIfPrevious(
+      Compiler* compiler, Trace* trace, IfPrevious backtrack_if_previous);
+  AssertionNode(AssertionType t, Node* on_success)
+      : SeqNode(on_success), assertion_type_(t) {}
+  AssertionType assertion_type_;
+};
+
+class BackReferenceNode : public SeqNode {
+ public:
+  BackReferenceNode(int start_reg, int end_reg, bool read_backward,
+                    Node* on_success)
+      : SeqNode(on_success),
+        start_reg_(start_reg),
+        end_reg_(end_reg),
+        read_backward_(read_backward) {}
+  BackReferenceNode* AsBackReferenceNode() override { return this; }
+  void Accept(NodeVisitor* visitor) override;
+  int start_register() const { return start_reg_; }
+  int end_register() const { return end_reg_; }
+  bool read_backward() const { return read_backward_; }
+  V8_WARN_UNUSED_RESULT EmitResult Emit(Compiler* compiler,
+                                        Trace* trace) override;
+  void GetQuickCheckDetails(QuickCheckDetails* details, Compiler* compiler,
+                            int characters_filled_in, bool not_at_start,
+                            int budget) override {
+    return;
+  }
+  void FillInBMInfo(Isolate* isolate, int offset, int budget,
+                    BoyerMooreLookahead* bm, bool not_at_start) override;
+
+ private:
+  int start_reg_;
+  int end_reg_;
+  bool read_backward_;
+};
+
+class UnanchoredAdvanceNode : public SeqNode {
+ public:
+  explicit UnanchoredAdvanceNode(Node* on_success) : SeqNode(on_success) {}
+  UnanchoredAdvanceNode* AsUnanchoredAdvanceNode() override { return this; }
+  void Accept(NodeVisitor* visitor) override;
+  V8_WARN_UNUSED_RESULT EmitResult Emit(Compiler* compiler,
+                                        Trace* trace) override;
+  void GetQuickCheckDetails(QuickCheckDetails* details, Compiler* compiler,
+                            int characters_filled_in, bool not_at_start,
+                            int budget) override;
+  void FillInBMInfo(Isolate* isolate, int offset, int budget,
+                    BoyerMooreLookahead* bm, bool not_at_start) override;
+};
+
+class V8_EXPORT_PRIVATE EndNode : public Node {
+ public:
+  enum Action { ACCEPT, BACKTRACK, NEGATIVE_SUBMATCH_SUCCESS };
+  EndNode(Action action, Zone* zone) : Node(zone), action_(action) {
+    EatsAtLeastInfo large(kLargeEatsAtLeastValue);
+    if (action == BACKTRACK) set_eats_at_least_info(large);
+  }
+  EndNode* AsEndNode() override { return this; }
+  void Accept(NodeVisitor* visitor) override;
+  V8_WARN_UNUSED_RESULT EmitResult Emit(Compiler* compiler,
+                                        Trace* trace) override;
+  void GetQuickCheckDetails(QuickCheckDetails* details, Compiler* compiler,
+                            int characters_filled_in, bool not_at_start,
+                            int budget) override;
+  void FillInBMInfo(Isolate* isolate, int offset, int budget,
+                    BoyerMooreLookahead* bm, bool not_at_start) override {}
+  Action action() const { return action_; }
+
+  bool IsBacktrack() const override { return action_ == BACKTRACK; }
+
+ private:
+  Action action_;
+};
+
+class NegativeSubmatchSuccess : public EndNode {
+ public:
+  NegativeSubmatchSuccess(int stack_pointer_reg, int position_reg,
+                          int clear_capture_count, int clear_capture_start,
+                          Zone* zone)
+      : EndNode(NEGATIVE_SUBMATCH_SUCCESS, zone),
+        stack_pointer_register_(stack_pointer_reg),
+        current_position_register_(position_reg),
+        clear_capture_count_(clear_capture_count),
+        clear_capture_start_(clear_capture_start) {}
+  V8_WARN_UNUSED_RESULT EmitResult Emit(Compiler* compiler,
+                                        Trace* trace) override;
+  NegativeSubmatchSuccess* AsNegativeSubmatchSuccess() override { return this; }
+
+ private:
+  int stack_pointer_register_;
+  int current_position_register_;
+  int clear_capture_count_;
+  int clear_capture_start_;
+
+  friend class NodePrinter<Node>;
+};
+
+class Guard : public ZoneObject {
+ public:
+  enum Relation { LT, GEQ };
+  Guard(int reg, Relation op, int value) : reg_(reg), op_(op), value_(value) {}
+  int reg() const { return reg_; }
+  Relation op() const { return op_; }
+  int value() const { return value_; }
+
+ private:
+  int reg_;
+  Relation op_;
+  int value_;
+};
+
+class GuardedAlternative {
+ public:
+  explicit GuardedAlternative(Node* node) : node_(node), guards_(nullptr) {}
+  void AddGuard(Guard* guard, Zone* zone);
+  Node* node() const { return node_; }
+  void set_node(Node* node) { node_ = node; }
+  const ZoneList<Guard*>* guards() const { return guards_; }
+
+ private:
+  Node* node_;
+  ZoneList<Guard*>* guards_;
+};
+
+class AlternativeGeneration;
+
+class ChoiceNode : public Node {
+ public:
+  explicit ChoiceNode(int expected_size, Zone* zone)
+      : Node(zone),
+        alternatives_(
+            zone->New<ZoneList<GuardedAlternative>>(expected_size, zone)),
+        not_at_start_(false),
+        being_calculated_(false) {}
+  ChoiceNode* AsChoiceNode() override { return this; }
+  void Accept(NodeVisitor* visitor) override;
+  void AddAlternative(GuardedAlternative node) {
+    alternatives()->Add(node, zone());
+  }
+  ZoneList<GuardedAlternative>* alternatives() { return alternatives_; }
+  V8_WARN_UNUSED_RESULT EmitResult Emit(Compiler* compiler,
+                                        Trace* trace) override;
+  void GetQuickCheckDetails(QuickCheckDetails* details, Compiler* compiler,
+                            int characters_filled_in, bool not_at_start,
+                            int budget) override;
+  void FillInBMInfo(Isolate* isolate, int offset, int budget,
+                    BoyerMooreLookahead* bm, bool not_at_start) override;
+
+  bool being_calculated() const { return being_calculated_; }
+  bool not_at_start() const { return not_at_start_; }
+  void set_not_at_start() { not_at_start_ = true; }
+  void set_being_calculated(bool b) { being_calculated_ = b; }
+  virtual bool try_to_emit_quick_check_for_alternative(bool is_first) {
+    return true;
+  }
+  virtual bool read_backward() const { return false; }
+
+ protected:
+  int FixedLengthLoopLengthForAlternative(GuardedAlternative* alternative);
+  ZoneList<GuardedAlternative>* alternatives_;
+
+ private:
+  template <typename...>
+  friend class Analysis;
+
+  void GenerateGuard(RegExpMacroAssembler* macro_assembler, Guard* guard,
+                     Trace* trace);
+  int CalculatePreloadCharacters(Compiler* compiler, int eats_at_least);
+  V8_WARN_UNUSED_RESULT EmitResult EmitOutOfLineContinuation(
+      Compiler* compiler, Trace* trace, GuardedAlternative alternative,
+      AlternativeGeneration* alt_gen, int preload_characters,
+      bool next_expects_preload);
+  void SetUpPreLoad(Compiler* compiler, Trace* current_trace,
+                    PreloadState* preloads);
+  void AssertGuardsMentionRegisters(Trace* trace);
+  int EmitOptimizedUnanchoredSearch(Compiler* compiler, Trace* trace,
+                                    SpecialLoopState* search_loop_state);
+  V8_WARN_UNUSED_RESULT Trace* EmitFixedLengthLoop(
+      Compiler* compiler, Trace* trace, AlternativeGenerationList* alt_gens,
+      PreloadState* preloads, SpecialLoopState* fixed_length_loop_state,
+      int text_length, Flags flags);
+  V8_WARN_UNUSED_RESULT EmitResult EmitChoices(
+      Compiler* compiler, AlternativeGenerationList* alt_gens, int first_choice,
+      Trace* trace, PreloadState* preloads, Flags flags);
+
+  bool not_at_start_;
+  bool being_calculated_;
+};
+
+class NegativeLookaroundChoiceNode : public ChoiceNode {
+ public:
+  explicit NegativeLookaroundChoiceNode(GuardedAlternative this_must_fail,
+                                        GuardedAlternative then_do_this,
+                                        Zone* zone)
+      : ChoiceNode(2, zone) {
+    AddAlternative(this_must_fail);
+    AddAlternative(then_do_this);
+  }
+  void GetQuickCheckDetails(QuickCheckDetails* details, Compiler* compiler,
+                            int characters_filled_in, bool not_at_start,
+                            int budget) override;
+  void FillInBMInfo(Isolate* isolate, int offset, int budget,
+                    BoyerMooreLookahead* bm, bool not_at_start) override {
+    continue_node()->FillInBMInfo(isolate, offset, budget - 1, bm,
+                                  not_at_start);
+    if (offset == 0) set_bm_info(not_at_start, bm);
+  }
+  static constexpr int kLookaroundIndex = 0;
+  static constexpr int kContinueIndex = 1;
+  Node* lookaround_node() {
+    return alternatives()->at(kLookaroundIndex).node();
+  }
+  Node* continue_node() { return alternatives()->at(kContinueIndex).node(); }
+  bool try_to_emit_quick_check_for_alternative(bool is_first) override {
+    return !is_first;
+  }
+  NegativeLookaroundChoiceNode* AsNegativeLookaroundChoiceNode() override {
+    return this;
+  }
+  void Accept(NodeVisitor* visitor) override;
+};
+
+class LoopChoiceNode : public ChoiceNode {
+ public:
+  LoopChoiceNode(bool body_can_be_zero_length, bool read_backward, Zone* zone)
+      : ChoiceNode(2, zone),
+        loop_node_(nullptr),
+        continue_node_(nullptr),
+        body_can_be_zero_length_(body_can_be_zero_length),
+        read_backward_(read_backward) {}
+  void AddLoopAlternative(GuardedAlternative alt);
+  void AddContinueAlternative(GuardedAlternative alt);
+  V8_WARN_UNUSED_RESULT EmitResult Emit(Compiler* compiler,
+                                        Trace* trace) override;
+  void GetQuickCheckDetails(QuickCheckDetails* details, Compiler* compiler,
+                            int characters_filled_in, bool not_at_start,
+                            int budget) override;
+  void FillInBMInfo(Isolate* isolate, int offset, int budget,
+                    BoyerMooreLookahead* bm, bool not_at_start) override;
+  Node* loop_node() const { return loop_node_; }
+  Node* continue_node() const { return continue_node_; }
+  bool body_can_be_zero_length() const { return body_can_be_zero_length_; }
+  bool read_backward() const override { return read_backward_; }
+  LoopChoiceNode* AsLoopChoiceNode() override { return this; }
+  void Accept(NodeVisitor* visitor) override;
+
+ private:
+  void AddAlternative(GuardedAlternative node) {
+    ChoiceNode::AddAlternative(node);
+  }
+
+  Node* loop_node_;
+  Node* continue_node_;
+  bool body_can_be_zero_length_;
+  bool read_backward_;
+};
+
+class NodeVisitor {
+ public:
+  virtual ~NodeVisitor() = default;
+#define DECLARE_VISIT(Type) virtual void Visit##Type(Type##Node* that) = 0;
+  FOR_EACH_NODE_TYPE(DECLARE_VISIT)
+#undef DECLARE_VISIT
+};
+
+}  
+}  
+}  
+
+#endif

@@ -1,0 +1,3204 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include <stack>
+#include <unordered_set>
+#include "APZCTreeManager.h"
+#include "AsyncPanZoomController.h"
+#include "Compositor.h"             // for Compositor
+#include "DragTracker.h"            // for DragTracker
+#include "GenericFlingAnimation.h"  // for FLING_LOG
+#include "HitTestingTreeNode.h"     // for HitTestingTreeNode
+#include "InputBlockState.h"        // for InputBlockState
+#include "InputData.h"              // for InputData, etc
+#include "WRHitTester.h"            // for WRHitTester
+#include "apz/src/APZUtils.h"
+#include "mozilla/RecursiveMutex.h"
+#include "mozilla/dom/BrowserParent.h"      // for AreRecordReplayTabsActive
+#include "mozilla/dom/MouseEventBinding.h"  // for MouseEvent constants
+#include "mozilla/dom/InteractiveWidget.h"
+#include "mozilla/dom/Touch.h"  // for Touch
+#include "mozilla/gfx/CompositorHitTestInfo.h"
+#include "mozilla/gfx/LoggingConstants.h"
+#include "mozilla/gfx/Matrix.h"
+#include "mozilla/gfx/gfxVars.h"            // for gfxVars
+#include "mozilla/gfx/GPUParent.h"          // for GPUParent
+#include "mozilla/gfx/Logging.h"            // for gfx::TreeLog
+#include "mozilla/gfx/Point.h"              // for Point
+#include "mozilla/layers/APZSampler.h"      // for APZSampler
+#include "mozilla/layers/APZThreadUtils.h"  // for AssertOnControllerThread, etc
+#include "mozilla/layers/APZUpdater.h"      // for APZUpdater
+#include "mozilla/layers/APZUtils.h"        // for AsyncTransform
+#include "mozilla/layers/AsyncDragMetrics.h"        // for AsyncDragMetrics
+#include "mozilla/layers/CompositorBridgeParent.h"  // for CompositorBridgeParent, etc
+#include "mozilla/layers/DoubleTapToZoom.h"         // for ZoomTarget
+#include "mozilla/layers/MatrixMessage.h"
+#include "mozilla/layers/ScrollableLayerGuid.h"
+#include "mozilla/layers/UiCompositorControllerParent.h"
+#include "mozilla/layers/WebRenderScrollDataWrapper.h"
+#include "mozilla/MouseEvents.h"
+#include "mozilla/mozalloc.h"  // for operator new
+#include "mozilla/MozPromise.h"
+#include "mozilla/Preferences.h"  // for Preferences
+#include "mozilla/StaticPrefs_apz.h"
+#include "mozilla/StaticPrefs_layout.h"
+#include "mozilla/ToString.h"
+#include "mozilla/TouchEvents.h"
+#include "mozilla/EventStateManager.h"  // for WheelPrefs
+#include "mozilla/webrender/WebRenderAPI.h"
+#include "mozilla/webrender/WebRenderTypes.h"
+#include "nsDebug.h"                 // for NS_WARNING
+#include "nsPoint.h"                 // for nsIntPoint
+#include "nsThreadUtils.h"           // for NS_IsMainThread
+#include "ScrollThumbUtils.h"        // for ComputeTransformForScrollThumb
+#include "OverscrollHandoffState.h"  // for OverscrollHandoffState
+#include "TreeTraversal.h"           // for ForEachNode, BreadthFirstSearch, etc
+#include "Units.h"                   // for ParentlayerPixel
+#include "GestureEventListener.h"  // for GestureEventListener::setLongTapEnabled
+#include "UnitTransforms.h"        // for ViewAs
+
+mozilla::LazyLogModule mozilla::layers::APZCTreeManager::sLog("apz.manager");
+
+static mozilla::LazyLogModule sApzFastPathLog("apz.fastpath");
+#define APZCTM_LOG(...) \
+  MOZ_LOG(APZCTreeManager::sLog, LogLevel::Debug, (__VA_ARGS__))
+#define APZCTM_LOGV(...) \
+  MOZ_LOG(APZCTreeManager::sLog, LogLevel::Verbose, (__VA_ARGS__))
+
+static mozilla::LazyLogModule sApzKeyLog("apz.key");
+#define APZ_KEY_LOG(...) MOZ_LOG(sApzKeyLog, LogLevel::Debug, (__VA_ARGS__))
+
+namespace mozilla {
+namespace layers {
+
+using mozilla::gfx::CompositorHitTestFlags;
+using mozilla::gfx::CompositorHitTestInfo;
+using mozilla::gfx::CompositorHitTestInvisibleToHit;
+using mozilla::gfx::LOG_DEFAULT;
+
+typedef mozilla::gfx::Point Point;
+typedef mozilla::gfx::Point4D Point4D;
+typedef mozilla::gfx::Matrix4x4 Matrix4x4;
+
+typedef CompositorBridgeParent::LayerTreeState LayerTreeState;
+
+struct APZCTreeManager::TreeBuildingState {
+  TreeBuildingState(LayersId aRootLayersId, LayersId aOriginatingLayersId)
+      : mOriginatingLayersId(aOriginatingLayersId) {
+    CompositorBridgeParent::CallWithLayerTreeState(
+        aRootLayersId, [this](LayerTreeState& aState) -> void {
+          mCompositorController = aState.GetCompositorController();
+        });
+  }
+
+  typedef std::unordered_map<AsyncPanZoomController*, gfx::Matrix4x4>
+      DeferredTransformMap;
+
+  RefPtr<CompositorController> mCompositorController;
+  const LayersId mOriginatingLayersId;
+
+
+  nsTArray<RefPtr<HitTestingTreeNode>> mNodesToDestroy;
+
+  std::unordered_map<ScrollableLayerGuid, ApzcMapData,
+                     ScrollableLayerGuid::HashIgnoringPresShellFn,
+                     ScrollableLayerGuid::EqualIgnoringPresShellFn>
+      mApzcMap;
+
+  std::vector<HitTestingTreeNode*> mScrollThumbs;
+  std::unordered_map<ScrollableLayerGuid, HitTestingTreeNode*,
+                     ScrollableLayerGuid::HashIgnoringPresShellFn,
+                     ScrollableLayerGuid::EqualIgnoringPresShellFn>
+      mScrollTargets;
+
+  DeferredTransformMap mPerspectiveTransformsDeferredToChildren;
+
+  Maybe<uint64_t> mZoomAnimationId;
+
+  std::vector<FixedPositionInfo> mFixedPositionInfo;
+  std::vector<RootScrollbarInfo> mRootScrollbarInfo;
+  std::vector<StickyPositionInfo> mStickyPositionInfo;
+
+  std::stack<EventRegionsOverride> mOverrideFlags;
+
+  std::vector<LayersId> mUpdatedLayersIds;
+};
+
+class APZCTreeManager::CheckerboardFlushObserver : public nsIObserver {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+
+  explicit CheckerboardFlushObserver(APZCTreeManager* aTreeManager)
+      : mTreeManager(aTreeManager) {
+    MOZ_ASSERT(NS_IsMainThread());
+    nsCOMPtr<nsIObserverService> obsSvc =
+        mozilla::services::GetObserverService();
+    MOZ_ASSERT(obsSvc);
+    if (obsSvc) {
+      obsSvc->AddObserver(this, "APZ:FlushActiveCheckerboard", false);
+    }
+  }
+
+  void Unregister() {
+    MOZ_ASSERT(NS_IsMainThread());
+    nsCOMPtr<nsIObserverService> obsSvc =
+        mozilla::services::GetObserverService();
+    if (obsSvc) {
+      obsSvc->RemoveObserver(this, "APZ:FlushActiveCheckerboard");
+    }
+    mTreeManager = nullptr;
+  }
+
+ protected:
+  virtual ~CheckerboardFlushObserver() = default;
+
+ private:
+  RefPtr<APZCTreeManager> mTreeManager;
+};
+
+NS_IMPL_ISUPPORTS(APZCTreeManager::CheckerboardFlushObserver, nsIObserver)
+
+NS_IMETHODIMP
+APZCTreeManager::CheckerboardFlushObserver::Observe(nsISupports* aSubject,
+                                                    const char* aTopic,
+                                                    const char16_t*) {
+  MOZ_ASSERT(NS_IsMainThread());
+  MOZ_ASSERT(mTreeManager.get());
+
+  RecursiveMutexAutoLock lock(mTreeManager->mTreeLock);
+  if (mTreeManager->mRootNode) {
+    ForEachNode<ReverseIterator>(
+        mTreeManager->mRootNode.get(), [](HitTestingTreeNode* aNode) {
+          if (aNode->IsPrimaryHolder()) {
+            MOZ_ASSERT(aNode->GetApzc());
+            aNode->GetApzc()->FlushActiveCheckerboardReport();
+          }
+        });
+  }
+  if (XRE_IsGPUProcess()) {
+    if (gfx::GPUParent* gpu = gfx::GPUParent::GetSingleton()) {
+      (void)gpu->SendFlushActiveCheckerboardReportsDone();
+    }
+  } else {
+    MOZ_ASSERT(XRE_IsParentProcess());
+    nsCOMPtr<nsIObserverService> obsSvc =
+        mozilla::services::GetObserverService();
+    if (obsSvc) {
+      obsSvc->NotifyObservers(nullptr, "APZ:FlushActiveCheckerboard:Done",
+                              nullptr);
+    }
+  }
+  return NS_OK;
+}
+
+class MOZ_RAII AutoFocusSequenceNumberSetter {
+ public:
+  AutoFocusSequenceNumberSetter(FocusState& aFocusState, InputData& aEvent)
+      : mFocusState(aFocusState), mEvent(aEvent), mMayChangeFocus(true) {}
+
+  void MarkAsNonFocusChanging() { mMayChangeFocus = false; }
+
+  ~AutoFocusSequenceNumberSetter() {
+    if (mMayChangeFocus) {
+      mFocusState.ReceiveFocusChangingEvent();
+
+      APZ_KEY_LOG(
+          "Marking input with type=%d as focus changing with seq=%" PRIu64 "\n",
+          static_cast<int>(mEvent.mInputType),
+          mFocusState.LastAPZProcessedEvent());
+    } else {
+      APZ_KEY_LOG(
+          "Marking input with type=%d as non focus changing with seq=%" PRIu64
+          "\n",
+          static_cast<int>(mEvent.mInputType),
+          mFocusState.LastAPZProcessedEvent());
+    }
+
+    mEvent.mFocusSequenceNumber = mFocusState.LastAPZProcessedEvent();
+  }
+
+ private:
+  FocusState& mFocusState;
+  InputData& mEvent;
+  bool mMayChangeFocus;
+};
+
+APZCTreeManager::APZCTreeManager(LayersId aRootLayersId,
+                                 UniquePtr<IAPZHitTester> aHitTester)
+    : mTestSampleTime(Nothing(), "APZCTreeManager::mTestSampleTime"),
+      mInputQueue(new InputQueue()),
+      mMapLock("APZCMapLock"),
+      mRootLayersId(aRootLayersId),
+      mSampler(nullptr),
+      mUpdater(nullptr),
+      mTreeLock("APZCTreeLock"),
+      mRetainedTouchIdentifier(-1),
+      mInScrollbarTouchDrag(false),
+      mCurrentMousePosition(ScreenPoint(),
+                            "APZCTreeManager::mCurrentMousePosition"),
+      mApzcTreeLog("apzctree"),
+      mDPI(160.0),
+      mHitTester(std::move(aHitTester)),
+      mScrollGenerationLock("APZScrollGenerationLock"),
+      mInteractiveWidget(
+          dom::InteractiveWidgetUtils::DefaultInteractiveWidgetMode()),
+      mIsSoftwareKeyboardVisible(false),
+      mHaveOOPIframes(false) {
+  AsyncPanZoomController::InitializeGlobalState();
+  mApzcTreeLog.ConditionOnPrefFunction(StaticPrefs::apz_printtree);
+
+  if (!mHitTester) {
+    mHitTester = MakeUnique<WRHitTester>();
+  }
+  mHitTester->Initialize(this);
+}
+
+APZCTreeManager::~APZCTreeManager() = default;
+
+void APZCTreeManager::Init() {
+  RefPtr<APZCTreeManager> self(this);
+  NS_DispatchToMainThread(NS_NewRunnableFunction(
+      "layers::APZCTreeManager::Init",
+      [self] { self->mFlushObserver = new CheckerboardFlushObserver(self); }));
+}
+
+already_AddRefed<APZCTreeManager> APZCTreeManager::Create(
+    LayersId aRootLayersId, UniquePtr<IAPZHitTester> aHitTester) {
+  RefPtr<APZCTreeManager> manager =
+      new APZCTreeManager(aRootLayersId, std::move(aHitTester));
+  manager->Init();
+  return manager.forget();
+}
+
+void APZCTreeManager::SetSampler(APZSampler* aSampler) {
+  MOZ_ASSERT((mSampler == nullptr) != (aSampler == nullptr));
+  mSampler = aSampler;
+}
+
+void APZCTreeManager::SetUpdater(APZUpdater* aUpdater) {
+  MOZ_ASSERT((mUpdater == nullptr) != (aUpdater == nullptr));
+  mUpdater = aUpdater;
+}
+
+void APZCTreeManager::NotifyLayerTreeAdopted(
+    LayersId aLayersId, const RefPtr<APZCTreeManager>& aOldApzcTreeManager) {
+  AssertOnUpdaterThread();
+
+  if (aOldApzcTreeManager) {
+    aOldApzcTreeManager->mFocusState.RemoveFocusTarget(aLayersId);
+  }
+
+  mFocusState.Reset();
+
+}
+
+void APZCTreeManager::NotifyLayerTreeRemoved(LayersId aLayersId) {
+  AssertOnUpdaterThread();
+
+  mFocusState.RemoveFocusTarget(aLayersId);
+
+  {  
+    MutexAutoLock lock(mMapLock);
+    size_t removed = 0;
+    for (auto it = mFastPathApzAwareGuids.begin();
+         it != mFastPathApzAwareGuids.end();) {
+      if (it->mLayersId == aLayersId) {
+        it = mFastPathApzAwareGuids.erase(it);
+        ++removed;
+      } else {
+        ++it;
+      }
+    }
+    if (removed > 0) {
+      MOZ_LOG(sApzFastPathLog, LogLevel::Debug,
+              ("APZCTreeManager: NotifyLayerTreeRemoved layersId=%" PRIu64
+               " cleared %zu fast-path entries",
+               uint64_t(aLayersId), removed));
+    }
+  }
+}
+
+already_AddRefed<AsyncPanZoomController> APZCTreeManager::NewAPZCInstance(
+    LayersId aLayersId, GeckoContentController* aController) {
+  return MakeRefPtr<AsyncPanZoomController>(
+             aLayersId, this, mInputQueue, aController,
+             AsyncPanZoomController::USE_GESTURE_DETECTOR)
+      .forget();
+}
+
+void APZCTreeManager::SetTestSampleTime(const Maybe<TimeStamp>& aTime) {
+  auto testSampleTime = mTestSampleTime.Lock();
+  testSampleTime.ref() = aTime;
+}
+
+SampleTime APZCTreeManager::GetFrameTime() {
+  auto testSampleTime = mTestSampleTime.Lock();
+  if (testSampleTime.ref()) {
+    return SampleTime::FromTest(*testSampleTime.ref());
+  }
+  return SampleTime::FromNow();
+}
+
+void APZCTreeManager::SetAllowedTouchBehavior(
+    uint64_t aInputBlockId, const nsTArray<TouchBehaviorFlags>& aValues) {
+  if (!APZThreadUtils::IsControllerThread()) {
+    APZThreadUtils::RunOnControllerThread(
+        NewRunnableMethod<uint64_t, nsTArray<TouchBehaviorFlags>>(
+            "layers::APZCTreeManager::SetAllowedTouchBehavior", this,
+            &APZCTreeManager::SetAllowedTouchBehavior, aInputBlockId,
+            aValues.Clone()));
+    return;
+  }
+
+  APZThreadUtils::AssertOnControllerThread();
+
+  mInputQueue->SetAllowedTouchBehavior(aInputBlockId, aValues);
+}
+
+void APZCTreeManager::SetBrowserGestureResponse(
+    uint64_t aInputBlockId, BrowserGestureResponse aResponse) {
+  if (!APZThreadUtils::IsControllerThread()) {
+    APZThreadUtils::RunOnControllerThread(
+        NewRunnableMethod<uint64_t, BrowserGestureResponse>(
+            "layers::APZCTreeManager::SetBrowserGestureResponse", this,
+            &APZCTreeManager::SetBrowserGestureResponse, aInputBlockId,
+            aResponse));
+    return;
+  }
+
+  APZThreadUtils::AssertOnControllerThread();
+
+  mInputQueue->SetBrowserGestureResponse(aInputBlockId, aResponse);
+}
+
+std::vector<LayersId> APZCTreeManager::UpdateHitTestingTree(
+    const WebRenderScrollDataWrapper& aRoot, LayersId aOriginatingLayersId,
+    uint32_t aPaintSequenceNumber) {
+  AssertOnUpdaterThread();
+
+  RecursiveMutexAutoLock lock(mTreeLock);
+
+  TreeBuildingState state(mRootLayersId, aOriginatingLayersId);
+
+  mRootContentApzcs.ClearAndRetainStorage();
+
+  ForEachNode<ReverseIterator>(mRootNode.get(),
+                               [&state](HitTestingTreeNode* aNode) {
+                                 state.mNodesToDestroy.AppendElement(aNode);
+                               });
+  mRootNode = nullptr;
+  mHaveOOPIframes = false;
+  Maybe<LayersId> asyncZoomContainerSubtree = Nothing();
+  LayersId currentRootContentLayersId{0};
+  int asyncZoomContainerNestingDepth = 0;
+  bool haveNestedAsyncZoomContainers = false;
+  nsTArray<LayersId> subtreesWithRootContentOutsideAsyncZoomContainer;
+
+  if (aRoot) {
+    std::unordered_set<LayersId, LayersId::HashFn> seenLayersIds;
+    std::stack<gfx::TreeAutoIndent<gfx::LOG_CRITICAL>> indents;
+    std::stack<AncestorTransform> ancestorTransforms;
+    HitTestingTreeNode* parent = nullptr;
+    HitTestingTreeNode* next = nullptr;
+    LayersId layersId = mRootLayersId;
+    seenLayersIds.insert(mRootLayersId);
+    ancestorTransforms.push(AncestorTransform());
+    state.mOverrideFlags.push(EventRegionsOverride::NoOverride);
+    nsTArray<Maybe<ZoomConstraints>> zoomConstraintsStack;
+    uint64_t fixedSubtreeDepth = 0;
+
+    zoomConstraintsStack.AppendElement(Nothing());
+
+    mApzcTreeLog << "[start]\n";
+    mTreeLock.AssertCurrentThreadIn();
+
+    ForEachNode<ReverseIterator>(
+        aRoot,
+        [&](ScrollNode aLayerMetrics) {
+          if (auto asyncZoomContainerId =
+                  aLayerMetrics.GetAsyncZoomContainerId()) {
+            if (asyncZoomContainerNestingDepth > 0) {
+              haveNestedAsyncZoomContainers = true;
+            }
+            asyncZoomContainerSubtree = Some(layersId);
+            ++asyncZoomContainerNestingDepth;
+
+            auto it = mZoomConstraints.find(
+                ScrollableLayerGuid(layersId, 0, *asyncZoomContainerId));
+            if (it != mZoomConstraints.end()) {
+              zoomConstraintsStack.AppendElement(Some(it->second));
+            } else {
+              zoomConstraintsStack.AppendElement(Nothing());
+            }
+          }
+
+          if (aLayerMetrics.Metrics().IsRootContent()) {
+            MutexAutoLock lock(mMapLock);
+            mGeckoFixedLayerMargins =
+                aLayerMetrics.Metrics().GetFixedLayerMargins();
+            SetInteractiveWidgetMode(
+                aLayerMetrics.Metrics().GetInteractiveWidget(), lock);
+            SetIsSoftwareKeyboardVisible(
+                aLayerMetrics.Metrics().IsSoftwareKeyboardVisible(), lock);
+            currentRootContentLayersId = layersId;
+          } else {
+            MOZ_ASSERT(aLayerMetrics.Metrics().GetFixedLayerMargins() ==
+                           ScreenMargin(),
+                       "fixed-layer-margins should be 0 on non-root layer");
+          }
+
+          if (aLayerMetrics.Metrics().IsRootContent() &&
+              asyncZoomContainerNestingDepth == 0) {
+            subtreesWithRootContentOutsideAsyncZoomContainer.AppendElement(
+                layersId);
+          }
+
+          HitTestingTreeNode* node = PrepareNodeForLayer(
+              lock, aLayerMetrics, aLayerMetrics.Metrics(), layersId,
+              zoomConstraintsStack.LastElement(), ancestorTransforms.top(),
+              parent, next, state);
+          MOZ_ASSERT(node);
+          AsyncPanZoomController* apzc = node->GetApzc();
+          aLayerMetrics.SetApzc(apzc);
+
+          if (node->GetScrollbarAnimationId()) {
+            if (node->IsScrollThumbNode()) {
+              state.mScrollThumbs.push_back(node);
+            } else if (node->IsScrollbarContainerNode()) {
+              state.mRootScrollbarInfo.emplace_back(
+                  *(node->GetScrollbarAnimationId()),
+                  node->GetScrollbarDirection());
+            }
+          }
+
+          if (node->GetFixedPositionAnimationId().isSome()) {
+            if (fixedSubtreeDepth == 0) {
+              state.mFixedPositionInfo.emplace_back(node);
+            }
+            fixedSubtreeDepth += 1;
+          }
+          if (node->GetStickyPositionAnimationId().isSome()) {
+            state.mStickyPositionInfo.emplace_back(node);
+          }
+          if (apzc && node->IsPrimaryHolder()) {
+            state.mScrollTargets[apzc->GetGuid()] = node;
+            if (aLayerMetrics.Metrics().IsRootContent()) {
+              mTreeLock.AssertCurrentThreadIn();  
+              mRootContentApzcs.AppendElement(apzc);
+            }
+          }
+
+          AncestorTransform currentTransform{
+              aLayerMetrics.GetTransform(),
+              aLayerMetrics.TransformIsPerspective()};
+          if (!apzc) {
+            currentTransform = currentTransform * ancestorTransforms.top();
+          }
+          ancestorTransforms.push(currentTransform);
+
+          MOZ_ASSERT(!node->GetFirstChild());
+          parent = node;
+          next = nullptr;
+
+          if (Maybe<LayersId> newLayersId = aLayerMetrics.GetReferentId()) {
+            layersId = *newLayersId;
+            seenLayersIds.insert(layersId);
+
+            if (state.mOverrideFlags.size() > 1) {
+              mHaveOOPIframes = true;
+            }
+
+            state.mOverrideFlags.push(state.mOverrideFlags.top() |
+                                      aLayerMetrics.GetEventRegionsOverride());
+          }
+
+          indents.push(gfx::TreeAutoIndent<gfx::LOG_CRITICAL>(mApzcTreeLog));
+        },
+        [&](ScrollNode aLayerMetrics) {
+          if (aLayerMetrics.GetAsyncZoomContainerId()) {
+            --asyncZoomContainerNestingDepth;
+            zoomConstraintsStack.RemoveLastElement();
+          }
+          if (aLayerMetrics.GetReferentId()) {
+            state.mOverrideFlags.pop();
+          }
+
+          if (aLayerMetrics.GetFixedPositionAnimationId().isSome()) {
+            fixedSubtreeDepth -= 1;
+          }
+
+          next = parent;
+          parent = parent->GetParent();
+          layersId = next->GetLayersId();
+          ancestorTransforms.pop();
+          indents.pop();
+        });
+
+    mApzcTreeLog << "[end]\n";
+
+    MOZ_ASSERT(
+        !asyncZoomContainerSubtree ||
+            !subtreesWithRootContentOutsideAsyncZoomContainer.Contains(
+                *asyncZoomContainerSubtree),
+        "If there is an async zoom container, all scroll nodes with root "
+        "content scroll metadata should be inside it");
+    MOZ_ASSERT(!haveNestedAsyncZoomContainers,
+               "Should not have nested async zoom container");
+
+    if (!state.mPerspectiveTransformsDeferredToChildren.empty()) {
+      ForEachNode<ReverseIterator>(
+          mRootNode.get(), [&state](HitTestingTreeNode* aNode) {
+            AsyncPanZoomController* apzc = aNode->GetApzc();
+            if (!apzc) {
+              return;
+            }
+            if (!aNode->IsPrimaryHolder()) {
+              return;
+            }
+
+            AsyncPanZoomController* parent = apzc->GetParent();
+            if (!parent) {
+              return;
+            }
+
+            auto it =
+                state.mPerspectiveTransformsDeferredToChildren.find(parent);
+            if (it != state.mPerspectiveTransformsDeferredToChildren.end()) {
+              apzc->SetAncestorTransform(AncestorTransform{
+                  it->second * apzc->GetAncestorTransform(), false});
+            }
+          });
+    }
+
+    for (auto iter = mDetachedLayersIds.begin();
+         iter != mDetachedLayersIds.end();) {
+      if (seenLayersIds.find(*iter) == seenLayersIds.end()) {
+        iter = mDetachedLayersIds.erase(iter);
+      } else {
+        ++iter;
+      }
+    }
+  }
+
+  MOZ_ASSERT(!(mRootNode && mRootNode->GetPrevSibling()));
+
+  {  
+    MutexAutoLock lock(mMapLock);
+    mApzcMap = std::move(state.mApzcMap);
+
+    for (auto& mapping : mApzcMap) {
+      AsyncPanZoomController* parent = mapping.second.apzc->GetParent();
+      mapping.second.parent = parent ? Some(parent->GetGuid()) : Nothing();
+    }
+
+    mScrollThumbInfo.clear();
+    for (HitTestingTreeNode* thumb : state.mScrollThumbs) {
+      MOZ_ASSERT(thumb->IsScrollThumbNode());
+      ScrollableLayerGuid targetGuid(thumb->GetLayersId(), 0,
+                                     thumb->GetScrollTargetId());
+      auto it = state.mScrollTargets.find(targetGuid);
+      if (it == state.mScrollTargets.end()) {
+        continue;
+      }
+      HitTestingTreeNode* target = it->second;
+      mScrollThumbInfo.emplace_back(
+          *(thumb->GetScrollbarAnimationId()), thumb->GetTransform(),
+          thumb->GetScrollbarData(), targetGuid, target->GetTransform(),
+          target->IsAncestorOf(thumb));
+    }
+
+    mRootScrollbarInfo = std::move(state.mRootScrollbarInfo);
+    mFixedPositionInfo = std::move(state.mFixedPositionInfo);
+    mStickyPositionInfo = std::move(state.mStickyPositionInfo);
+  }
+
+  for (size_t i = 0; i < state.mNodesToDestroy.Length(); i++) {
+    APZCTM_LOG("Destroying node at %p with APZC %p\n",
+               state.mNodesToDestroy[i].get(),
+               state.mNodesToDestroy[i]->GetApzc());
+    state.mNodesToDestroy[i]->Destroy();
+  }
+
+  SetFixedLayerMarginsOnRootContentApzcs(lock);
+
+  APZCTM_LOG("APZCTreeManager (%p)\n", this);
+  if (mRootNode && MOZ_LOG_TEST(sLog, LogLevel::Debug)) {
+    mRootNode->Dump("  ");
+  }
+  SendSubtreeTransformsToChromeMainThread(nullptr);
+
+  return std::move(state.mUpdatedLayersIds);
+}
+
+void APZCTreeManager::UpdateFocusState(LayersId aRootLayerTreeId,
+                                       LayersId aOriginatingLayersId,
+                                       const FocusTarget& aFocusTarget) {
+  AssertOnUpdaterThread();
+
+  if (!StaticPrefs::apz_keyboard_enabled_AtStartup()) {
+    return;
+  }
+
+  mFocusState.Update(aRootLayerTreeId, aOriginatingLayersId, aFocusTarget);
+}
+
+void APZCTreeManager::SampleForWebRender(const Maybe<VsyncId>& aVsyncId,
+                                         wr::TransactionWrapper& aTxn,
+                                         const SampleTime& aSampleTime) {
+  AssertOnSamplerThread();
+  MutexAutoLock lock(mMapLock);
+
+  RefPtr<WebRenderBridgeParent> wrBridgeParent;
+  RefPtr<CompositorController> controller;
+  CompositorBridgeParent::CallWithLayerTreeState(
+      mRootLayersId, [&](LayerTreeState& aState) -> void {
+        controller = aState.GetCompositorController();
+        wrBridgeParent = aState.mWrBridge;
+      });
+
+  const bool activeAnimations = AdvanceAnimationsInternal(lock, aSampleTime);
+  if (activeAnimations && controller) {
+    controller->ScheduleRenderOnCompositorThread(
+        wr::RenderReasons::ANIMATED_PROPERTY);
+  }
+  APZCTM_LOGV(
+      "APZCTreeManager(%p)::SampleForWebRender, want more composites: %d\n",
+      this, (activeAnimations && controller));
+
+  nsTArray<wr::WrTransformProperty> transforms;
+
+  for (const auto& [_, mapData] : mApzcMap) {
+    AsyncPanZoomController* apzc = mapData.apzc;
+
+    if (Maybe<CompositionPayload> payload = apzc->NotifyScrollSampling()) {
+      if (wrBridgeParent && aVsyncId) {
+        wrBridgeParent->AddPendingScrollPayload(*payload, *aVsyncId);
+      }
+    }
+
+    wr::LayoutTransform zoomForMinimap =
+        wr::ToLayoutTransform(gfx::Matrix4x4());
+    if (Maybe<uint64_t> zoomAnimationId = apzc->GetZoomAnimationId()) {
+      MOZ_ASSERT(apzc->IsRootContent());
+
+      LayoutDeviceToParentLayerScale zoom = apzc->GetCurrentPinchZoomScale(
+          AsyncPanZoomController::eForCompositing);
+
+      AsyncTransform asyncVisualTransform = apzc->GetCurrentAsyncTransform(
+          AsyncPanZoomController::eForCompositing,
+          AsyncTransformComponents{AsyncTransformComponent::eVisual});
+
+      wr::WrTransformProperty zoomTransform = wr::ToWrTransformProperty(
+          *zoomAnimationId, LayoutDeviceToParentLayerMatrix4x4::Scaling(
+                                zoom.scale, zoom.scale, 1.0f) *
+                                AsyncTransformComponentMatrix::Translation(
+                                    asyncVisualTransform.mTranslation));
+
+      zoomForMinimap = zoomTransform.value;
+
+      transforms.AppendElement(zoomTransform);
+      aTxn.UpdateIsTransformAsyncZooming(*zoomAnimationId,
+                                         apzc->IsAsyncZooming());
+    }
+
+    nsTArray<wr::SampledScrollOffset> sampledOffsets =
+        apzc->GetSampledScrollOffsets();
+    wr::ExternalScrollId scrollId{apzc->GetGuid().mScrollId,
+                                  wr::AsPipelineId(apzc->GetGuid().mLayersId)};
+    aTxn.UpdateScrollPosition(scrollId, sampledOffsets);
+
+    if (StaticPrefs::apz_minimap_enabled()) {
+      wr::MinimapData minimapData = apzc->GetMinimapData();
+      minimapData.zoom_transform = zoomForMinimap;
+      ScrollableLayerGuid enclosingRootContentId;
+      ApzcMapData currentEntry = mapData;
+      AsyncPanZoomController* current = currentEntry.apzc;
+      while (current) {
+        if (current->IsRootContent()) {
+          enclosingRootContentId = current->GetGuid();
+          break;
+        }
+        if (auto parentGuid = currentEntry.parent) {
+          auto iter = mApzcMap.find(*parentGuid);
+          if (iter != mApzcMap.end()) {
+            currentEntry = iter->second;
+            current = currentEntry.apzc;
+            continue;
+          }
+        }
+        break;
+      }
+      minimapData.root_content_pipeline_id =
+          wr::AsPipelineId(enclosingRootContentId.mLayersId);
+      minimapData.root_content_scroll_id = enclosingRootContentId.mScrollId;
+      aTxn.AddMinimapData(scrollId, minimapData);
+    }
+
+    if (apzc->IsRootContent()) {
+      if (RefPtr<UiCompositorControllerParent> uiController =
+              UiCompositorControllerParent::GetFromRootLayerTreeId(
+                  mRootLayersId)) {
+        for (const auto& update : apzc->GetCompositorScrollUpdates()) {
+          uiController->NotifyCompositorScrollUpdate(update);
+        }
+      }
+    }
+  }
+
+  for (const ScrollThumbInfo& info : mScrollThumbInfo) {
+    auto it = mApzcMap.find(info.mTargetGuid);
+    if (it == mApzcMap.end()) {
+      continue;
+    }
+    AsyncPanZoomController* scrollTargetApzc = it->second.apzc;
+    MOZ_ASSERT(scrollTargetApzc);
+    LayerToParentLayerMatrix4x4 transform =
+        scrollTargetApzc->CallWithLastContentPaintMetrics(
+            [&](const FrameMetrics& aMetrics) {
+              return ComputeTransformForScrollThumb(
+                  info.mThumbTransform * AsyncTransformMatrix(),
+                  info.mTargetTransform.ToUnknownMatrix(), scrollTargetApzc,
+                  aMetrics, info.mThumbData, info.mTargetIsAncestor);
+            });
+    transforms.AppendElement(
+        wr::ToWrTransformProperty(info.mThumbAnimationId, transform));
+  }
+
+  for (const RootScrollbarInfo& info : mRootScrollbarInfo) {
+    if (info.mScrollDirection == ScrollDirection::eHorizontal) {
+      ScreenPoint translation =
+          ComputeFixedMarginsOffset(lock, SideBits::eBottom, ScreenMargin());
+
+      LayerToParentLayerMatrix4x4 transform =
+          LayerToParentLayerMatrix4x4::Translation(ViewAs<ParentLayerPixel>(
+              translation, PixelCastJustification::ScreenIsParentLayerForRoot));
+
+      transforms.AppendElement(
+          wr::ToWrTransformProperty(info.mScrollbarAnimationId, transform));
+    }
+  }
+
+  for (const FixedPositionInfo& info : mFixedPositionInfo) {
+    MOZ_ASSERT(info.mFixedPositionAnimationId.isSome());
+    if (!IsFixedToRootContent(info, lock)) {
+      continue;
+    }
+
+    ScreenPoint translation = ComputeFixedMarginsOffset(
+        lock, info.mFixedPosSides, mGeckoFixedLayerMargins);
+
+    LayerToParentLayerMatrix4x4 transform =
+        LayerToParentLayerMatrix4x4::Translation(ViewAs<ParentLayerPixel>(
+            translation, PixelCastJustification::ScreenIsParentLayerForRoot));
+
+    transforms.AppendElement(
+        wr::ToWrTransformProperty(*info.mFixedPositionAnimationId, transform));
+  }
+
+  for (const StickyPositionInfo& info : mStickyPositionInfo) {
+    MOZ_ASSERT(info.mStickyPositionAnimationId.isSome());
+    SideBits sides = SidesStuckToRootContent(
+        info, AsyncTransformConsumer::eForCompositing, lock);
+    if (sides == SideBits::eNone) {
+      continue;
+    }
+
+    ScreenPoint translation =
+        ComputeFixedMarginsOffset(lock, sides, mGeckoFixedLayerMargins);
+
+    LayerToParentLayerMatrix4x4 transform =
+        LayerToParentLayerMatrix4x4::Translation(ViewAs<ParentLayerPixel>(
+            translation, PixelCastJustification::ScreenIsParentLayerForRoot));
+
+    transforms.AppendElement(
+        wr::ToWrTransformProperty(*info.mStickyPositionAnimationId, transform));
+  }
+
+  aTxn.AppendTransformProperties(transforms);
+}
+
+ParentLayerRect APZCTreeManager::ComputeClippedCompositionBounds(
+    const MutexAutoLock& aProofOfMapLock, ClippedCompositionBoundsMap& aDestMap,
+    ScrollableLayerGuid aGuid) {
+  if (auto iter = aDestMap.find(aGuid); iter != aDestMap.end()) {
+    return iter->second;
+  }
+
+  ParentLayerRect bounds = mApzcMap[aGuid].apzc->GetCompositionBounds();
+  const auto& mapEntry = mApzcMap.find(aGuid);
+  MOZ_ASSERT(mapEntry != mApzcMap.end());
+  if (mapEntry->second.parent.isNothing()) {
+    aDestMap.emplace(aGuid, bounds);
+    return bounds;
+  }
+
+  ScrollableLayerGuid parentGuid = mapEntry->second.parent.value();
+  auto parentBoundsEntry = aDestMap.find(parentGuid);
+  ParentLayerRect parentClippedBounds =
+      (parentBoundsEntry == aDestMap.end())
+          ? ComputeClippedCompositionBounds(aProofOfMapLock, aDestMap,
+                                            parentGuid)
+          : parentBoundsEntry->second;
+
+  AsyncTransform appliesToLayer =
+      mApzcMap[parentGuid].apzc->GetCurrentAsyncTransform(
+          AsyncPanZoomController::eForCompositing);
+
+  LayerRect parentClippedBoundsInParentLayerSpace =
+      (parentClippedBounds - appliesToLayer.mTranslation) /
+      appliesToLayer.mScale;
+
+  bounds = bounds.Intersect(
+      ViewAs<ParentLayerPixel>(parentClippedBoundsInParentLayerSpace,
+                               PixelCastJustification::MovingDownToChildren));
+
+  aDestMap.emplace(aGuid, bounds);
+  return bounds;
+}
+
+bool APZCTreeManager::AdvanceAnimationsInternal(
+    const MutexAutoLock& aProofOfMapLock, const SampleTime& aSampleTime) {
+  ClippedCompositionBoundsMap clippedCompBounds;
+  bool activeAnimations = false;
+  for (const auto& mapping : mApzcMap) {
+    AsyncPanZoomController* apzc = mapping.second.apzc;
+    ParentLayerRect clippedBounds = ComputeClippedCompositionBounds(
+        aProofOfMapLock, clippedCompBounds, mapping.first);
+
+    apzc->ReportCheckerboard(aSampleTime, clippedBounds);
+    activeAnimations |= apzc->AdvanceAnimations(aSampleTime);
+  }
+  return activeAnimations;
+}
+
+void APZCTreeManager::PrintLayerInfo(const ScrollNode& aLayer) {
+  if (StaticPrefs::apz_printtree() && aLayer.Dump(mApzcTreeLog) > 0) {
+    mApzcTreeLog << "\n";
+  }
+}
+
+void APZCTreeManager::AttachNodeToTree(HitTestingTreeNode* aNode,
+                                       HitTestingTreeNode* aParent,
+                                       HitTestingTreeNode* aNextSibling) {
+  if (aNextSibling) {
+    aNextSibling->SetPrevSibling(aNode);
+  } else if (aParent) {
+    aParent->SetLastChild(aNode);
+  } else {
+    MOZ_ASSERT(!mRootNode);
+    mRootNode = aNode;
+    aNode->MakeRoot();
+  }
+}
+
+already_AddRefed<HitTestingTreeNode> APZCTreeManager::RecycleOrCreateNode(
+    const RecursiveMutexAutoLock& aProofOfTreeLock, TreeBuildingState& aState,
+    AsyncPanZoomController* aApzc, LayersId aLayersId) {
+  for (int32_t i = aState.mNodesToDestroy.Length() - 1; i >= 0; i--) {
+    RefPtr<HitTestingTreeNode> node = aState.mNodesToDestroy[i];
+    if (node->IsRecyclable(aProofOfTreeLock)) {
+      aState.mNodesToDestroy.RemoveElementAt(i);
+      node->RecycleWith(aProofOfTreeLock, aApzc, aLayersId);
+      return node.forget();
+    }
+  }
+  RefPtr node = MakeRefPtr<HitTestingTreeNode>(aApzc, false, aLayersId);
+  return node.forget();
+}
+
+void APZCTreeManager::StartScrollbarDrag(const ScrollableLayerGuid& aGuid,
+                                         const AsyncDragMetrics& aDragMetrics) {
+  if (!APZThreadUtils::IsControllerThread()) {
+    APZThreadUtils::RunOnControllerThread(
+        NewRunnableMethod<ScrollableLayerGuid, AsyncDragMetrics>(
+            "layers::APZCTreeManager::StartScrollbarDrag", this,
+            &APZCTreeManager::StartScrollbarDrag, aGuid, aDragMetrics));
+    return;
+  }
+
+  APZThreadUtils::AssertOnControllerThread();
+
+  RefPtr<AsyncPanZoomController> apzc = GetTargetAPZC(aGuid);
+  if (!apzc) {
+    NotifyScrollbarDragRejected(aGuid);
+    return;
+  }
+
+  uint64_t inputBlockId = aDragMetrics.mDragStartSequenceNumber;
+  mInputQueue->ConfirmDragBlock(inputBlockId, apzc, aDragMetrics);
+}
+
+bool APZCTreeManager::StartAutoscroll(const ScrollableLayerGuid& aGuid,
+                                      const ScreenPoint& aAnchorLocation) {
+  APZThreadUtils::AssertOnControllerThread();
+
+  RefPtr<AsyncPanZoomController> apzc = GetTargetAPZC(aGuid);
+  if (!apzc) {
+    if (XRE_IsGPUProcess()) {
+      NotifyAutoscrollRejected(aGuid);
+    }
+    return false;
+  }
+
+  apzc->StartAutoscroll(aAnchorLocation);
+  return true;
+}
+
+void APZCTreeManager::StopAutoscroll(const ScrollableLayerGuid& aGuid) {
+  APZThreadUtils::AssertOnControllerThread();
+
+  if (RefPtr<AsyncPanZoomController> apzc = GetTargetAPZC(aGuid)) {
+    apzc->StopAutoscroll();
+  }
+}
+
+void APZCTreeManager::NotifyScrollbarDragInitiated(
+    uint64_t aDragBlockId, const ScrollableLayerGuid& aGuid,
+    ScrollDirection aDirection) const {
+  RefPtr<GeckoContentController> controller =
+      GetContentController(aGuid.mLayersId);
+  if (controller) {
+    controller->NotifyAsyncScrollbarDragInitiated(aDragBlockId, aGuid.mScrollId,
+                                                  aDirection);
+  }
+}
+
+void APZCTreeManager::NotifyScrollbarDragRejected(
+    const ScrollableLayerGuid& aGuid) const {
+  RefPtr<GeckoContentController> controller =
+      GetContentController(aGuid.mLayersId);
+  if (controller) {
+    controller->NotifyAsyncScrollbarDragRejected(aGuid.mScrollId);
+  }
+}
+
+void APZCTreeManager::NotifyAutoscrollRejected(
+    const ScrollableLayerGuid& aGuid) const {
+  RefPtr<GeckoContentController> controller =
+      GetContentController(aGuid.mLayersId);
+  MOZ_ASSERT(controller);
+  controller->NotifyAsyncAutoscrollRejected(aGuid.mScrollId);
+}
+
+void SetHitTestData(HitTestingTreeNode* aNode,
+                    const WebRenderScrollDataWrapper& aLayer,
+                    const EventRegionsOverride& aOverrideFlags) {
+  aNode->SetHitTestData(aLayer.GetVisibleRect(), aLayer.GetRemoteDocumentSize(),
+                        aLayer.GetTransformTyped(), aOverrideFlags,
+                        aLayer.GetAsyncZoomContainerId());
+}
+
+HitTestingTreeNode* APZCTreeManager::PrepareNodeForLayer(
+    const RecursiveMutexAutoLock& aProofOfTreeLock, const ScrollNode& aLayer,
+    const FrameMetrics& aMetrics, LayersId aLayersId,
+    const Maybe<ZoomConstraints>& aZoomConstraints,
+    const AncestorTransform& aAncestorTransform, HitTestingTreeNode* aParent,
+    HitTestingTreeNode* aNextSibling, TreeBuildingState& aState) {
+  mTreeLock.AssertCurrentThreadIn();  
+
+
+  bool needsApzc = true;
+  if (!aMetrics.IsScrollable()) {
+    needsApzc = false;
+  }
+
+  RefPtr<GeckoContentController> geckoContentController;
+  CompositorBridgeParent::CallWithLayerTreeState(
+      aLayersId, [&](LayerTreeState& lts) -> void {
+        geckoContentController = lts.mController;
+      });
+
+  if (!geckoContentController) {
+    needsApzc = false;
+  }
+
+  if (Maybe<uint64_t> zoomAnimationId = aLayer.GetZoomAnimationId()) {
+    aState.mZoomAnimationId = zoomAnimationId;
+  }
+
+  RefPtr<HitTestingTreeNode> node = nullptr;
+  if (!needsApzc) {
+    node = RecycleOrCreateNode(aProofOfTreeLock, aState, nullptr, aLayersId);
+    AttachNodeToTree(node, aParent, aNextSibling);
+    SetHitTestData(node, aLayer, aState.mOverrideFlags.top());
+    node->SetScrollbarData(aLayer.GetScrollbarAnimationId(),
+                           aLayer.GetScrollbarData());
+    node->SetFixedPosData(aLayer.GetFixedPositionScrollContainerId(),
+                          aLayer.GetFixedPositionSides(),
+                          aLayer.GetFixedPositionAnimationId());
+    node->SetStickyPosData(aLayer.GetStickyScrollContainerId(),
+                           aLayer.GetStickyScrollRangeOuter(),
+                           aLayer.GetStickyScrollRangeInner(),
+                           aLayer.GetStickyPositionAnimationId());
+    PrintLayerInfo(aLayer);
+    return node;
+  }
+
+  RefPtr<AsyncPanZoomController> apzc;
+
+  ScrollableLayerGuid guid(aLayersId, aMetrics.GetPresShellId(),
+                           aMetrics.GetScrollId());
+  auto insertResult = aState.mApzcMap.insert(std::make_pair(
+      guid,
+      ApzcMapData{static_cast<AsyncPanZoomController*>(nullptr), Nothing()}));
+  if (!insertResult.second) {
+    apzc = insertResult.first->second.apzc;
+    PrintLayerInfo(aLayer);
+  }
+  APZCTM_LOG(
+      "Found APZC %p for layer %p with identifiers %" PRIx64 " %" PRId64 "\n",
+      apzc.get(), aLayer.GetLayer(), uint64_t(guid.mLayersId), guid.mScrollId);
+
+  aState.mUpdatedLayersIds.push_back(aLayersId);
+
+  if (apzc == nullptr) {
+    apzc = aLayer.GetApzc();
+
+    if (apzc && (!apzc->Matches(guid) || !apzc->HasTreeManager(this))) {
+      apzc = nullptr;
+    }
+
+    for (size_t i = 0; i < aState.mNodesToDestroy.Length(); i++) {
+      RefPtr<HitTestingTreeNode> n = aState.mNodesToDestroy[i];
+      if (n->IsPrimaryHolder() && n->GetApzc() && n->GetApzc()->Matches(guid)) {
+        node = n;
+        if (apzc != nullptr) {
+          MOZ_ASSERT(apzc == node->GetApzc());
+        }
+        apzc = node->GetApzc();
+        break;
+      }
+    }
+
+    bool newApzc = (apzc == nullptr || apzc->IsDestroyed());
+    if (newApzc) {
+      apzc = NewAPZCInstance(aLayersId, geckoContentController);
+      apzc->SetCompositorController(aState.mCompositorController.get());
+      MOZ_ASSERT(node == nullptr);
+      node = new HitTestingTreeNode(apzc, true, aLayersId);
+    } else {
+      aState.mNodesToDestroy.RemoveElement(node);
+      node->SetPrevSibling(nullptr);
+      node->SetLastChild(nullptr);
+    }
+
+    if (aMetrics.IsRootContent()) {
+      apzc->SetZoomAnimationId(aState.mZoomAnimationId);
+      aState.mZoomAnimationId = Nothing();
+    }
+
+    APZCTM_LOG("Using APZC %p for layer %p with identifiers %" PRIx64
+               " %" PRId64 "\n",
+               apzc.get(), aLayer.GetLayer(), uint64_t(aLayersId),
+               aMetrics.GetScrollId());
+
+    apzc->NotifyMainThreadTransaction(
+        aLayer.Metadata(), AsyncPanZoomController::LayersUpdateFlags{
+                               .mIsFirstPaint = aLayer.IsFirstPaint(),
+                               .mThisLayerTreeUpdated =
+                                   (aLayersId == aState.mOriginatingLayersId)});
+
+    MOZ_ASSERT(node->IsPrimaryHolder() && node->GetApzc() &&
+               node->GetApzc()->Matches(guid));
+
+    SetHitTestData(node, aLayer, aState.mOverrideFlags.top());
+    apzc->SetAncestorTransform(aAncestorTransform);
+
+    PrintLayerInfo(aLayer);
+
+    AttachNodeToTree(node, aParent, aNextSibling);
+
+    if (node->IsPrimaryHolder()) {
+      if (aZoomConstraints) {
+        apzc->UpdateZoomConstraints(*aZoomConstraints);
+
+#if defined(DEBUG)
+        auto it = mZoomConstraints.find(guid);
+        if (it != mZoomConstraints.end()) {
+          MOZ_ASSERT(it->second == *aZoomConstraints);
+        }
+      } else {
+        // clang-format off
+        // clang-format on
+#endif
+      }
+    }
+
+    insertResult.first->second.apzc = apzc;
+  } else {
+
+    node = RecycleOrCreateNode(aProofOfTreeLock, aState, apzc, aLayersId);
+    AttachNodeToTree(node, aParent, aNextSibling);
+
+    auto ancestorTransform = aAncestorTransform.CombinedTransform();
+    auto existingAncestorTransform = apzc->GetAncestorTransform();
+    if (!ancestorTransform.FuzzyEqualsMultiplicative(
+            existingAncestorTransform)) {
+      typedef TreeBuildingState::DeferredTransformMap::value_type PairType;
+      if (!aAncestorTransform.ContainsPerspectiveTransform() &&
+          !apzc->AncestorTransformContainsPerspective()) {
+        if (!aLayer.Metadata().IsPaginatedPresentation()) {
+          if (ancestorTransform.IsFinite() &&
+              existingAncestorTransform.IsFinite()) {
+            MOZ_LOG(sLog, LogLevel::Error,
+                    ("Two layers that scroll together have different ancestor "
+                     "transforms (guid=%s)",
+                     ToString(apzc->GetGuid()).c_str()));
+            MOZ_ASSERT(false,
+                       "Two layers that scroll together have different "
+                       "ancestor transforms");
+          } else {
+            MOZ_ASSERT(ancestorTransform.IsFinite() ==
+                       existingAncestorTransform.IsFinite());
+          }
+        }
+      } else if (!aAncestorTransform.ContainsPerspectiveTransform()) {
+        aState.mPerspectiveTransformsDeferredToChildren.insert(
+            PairType{apzc, apzc->GetAncestorTransformPerspective()});
+        apzc->SetAncestorTransform(aAncestorTransform);
+      } else {
+        aState.mPerspectiveTransformsDeferredToChildren.insert(
+            PairType{apzc, aAncestorTransform.GetPerspectiveTransform()});
+      }
+    }
+
+    SetHitTestData(node, aLayer, aState.mOverrideFlags.top());
+  }
+
+  node->SetScrollbarData(aLayer.GetScrollbarAnimationId(),
+                         aLayer.GetScrollbarData());
+  node->SetFixedPosData(aLayer.GetFixedPositionScrollContainerId(),
+                        aLayer.GetFixedPositionSides(),
+                        aLayer.GetFixedPositionAnimationId());
+  node->SetStickyPosData(aLayer.GetStickyScrollContainerId(),
+                         aLayer.GetStickyScrollRangeOuter(),
+                         aLayer.GetStickyScrollRangeInner(),
+                         aLayer.GetStickyPositionAnimationId());
+  return node;
+}
+
+template <typename PanGestureOrScrollWheelInput>
+static bool WillHandleInput(const PanGestureOrScrollWheelInput& aPanInput) {
+  if (!NS_IsMainThread()) {
+    return true;
+  }
+
+  WidgetWheelEvent wheelEvent = aPanInput.ToWidgetEvent(nullptr);
+  return APZInputBridge::ActionForWheelEvent(&wheelEvent).isSome();
+}
+
+void APZCTreeManager::FlushApzRepaints(LayersId aLayersId) {
+  APZCTM_LOG("Flushing repaints for layers id 0x%" PRIx64 "\n",
+             uint64_t(aLayersId));
+  RefPtr<GeckoContentController> controller = GetContentController(aLayersId);
+  MOZ_ASSERT(controller);
+  if (controller) {
+    controller->DispatchToRepaintThread(NewRunnableMethod(
+        "layers::GeckoContentController::NotifyFlushComplete", controller,
+        &GeckoContentController::NotifyFlushComplete));
+  }
+}
+
+void APZCTreeManager::MarkAsDetached(LayersId aLayersId) {
+  RecursiveMutexAutoLock lock(mTreeLock);
+  mDetachedLayersIds.insert(aLayersId);
+}
+
+static bool HasNonLockModifier(Modifiers aModifiers) {
+  return (aModifiers &
+          (MODIFIER_ALT | MODIFIER_ALTGRAPH | MODIFIER_CONTROL | MODIFIER_FN |
+           MODIFIER_META | MODIFIER_SHIFT | MODIFIER_SYMBOL)) != 0;
+}
+
+APZEventResult APZCTreeManager::ReceiveInputEvent(
+    InputData& aEvent, InputBlockCallback&& aCallback) {
+  APZThreadUtils::AssertOnControllerThread();
+  InputHandlingState state{aEvent};
+
+  AutoFocusSequenceNumberSetter focusSetter(mFocusState, aEvent);
+
+  switch (aEvent.mInputType) {
+    case MULTITOUCH_INPUT: {
+      MultiTouchInput& touchInput = aEvent.AsMultiTouchInput();
+      ProcessTouchInput(state, touchInput);
+      break;
+    }
+    case MOUSE_INPUT: {
+      MouseInput& mouseInput = aEvent.AsMouseInput();
+      MOZ_LOG(APZCTreeManager::sLog,
+              mouseInput.mType == MouseInput::MOUSE_MOVE ? LogLevel::Verbose
+                                                         : LogLevel::Debug,
+              ("Received mouse input type %d at %s\n", (int)mouseInput.mType,
+               ToString(mouseInput.mOrigin).c_str()));
+      mouseInput.mHandledByAPZ = true;
+
+      SetCurrentMousePosition(mouseInput.mOrigin);
+
+      bool startsDrag = DragTracker::StartsDrag(mouseInput);
+      if (startsDrag) {
+        FlushRepaintsToClearScreenToGeckoTransform();
+      }
+      const bool endsDrag = DragTracker::EndsDrag(mouseInput);
+      if (endsDrag) {
+        mDragBlockHitResult = HitTestResult();
+      }
+
+      state.mHit = GetTargetAPZCForMouseInput(mouseInput);
+
+      bool hitScrollbar = (bool)state.mHit.mScrollbarNode;
+      if (startsDrag && hitScrollbar) {
+        RecursiveMutexAutoLock lock(mTreeLock);
+        mDragBlockHitResult = mHitTester->CloneHitTestResult(lock, state.mHit);
+      }
+
+      {  
+        RecursiveMutexAutoLock lock(mTreeLock);
+        if (!state.mHit.mTargetApzc && mRootNode) {
+          state.mHit.mTargetApzc = mRootNode->GetApzc();
+        }
+      }
+
+      if (state.mHit.mTargetApzc) {
+        TargetConfirmationFlags confFlags{state.mHit.mHitResult};
+        state.mResult = mInputQueue->ReceiveInputEvent(state.mHit.mTargetApzc,
+                                                       confFlags, mouseInput);
+
+        bool apzDragEnabled = StaticPrefs::apz_drag_enabled();
+        if (apzDragEnabled && startsDrag && state.mHit.mScrollbarNode &&
+            state.mHit.mScrollbarNode->IsScrollThumbNode() &&
+            state.mHit.mScrollbarNode->GetScrollbarData()
+                .mThumbIsAsyncDraggable) {
+          SetupScrollbarDrag(mouseInput, state.mHit.mScrollbarNode,
+                             state.mHit.mTargetApzc.get());
+        }
+
+        if (state.mResult.GetStatus() == nsEventStatus_eConsumeDoDefault) {
+          hitScrollbar = mInputQueue->IsDragOnScrollbar(hitScrollbar);
+        }
+
+        if (!hitScrollbar) {
+          ScreenToParentLayerMatrix4x4 transformToApzc =
+              GetScreenToApzcTransform(state.mHit.mTargetApzc);
+          ParentLayerToScreenMatrix4x4 transformToGecko =
+              GetApzcToGeckoTransformForHit(state.mHit);
+          ScreenToScreenMatrix4x4 outTransform =
+              transformToApzc * transformToGecko;
+          Maybe<ScreenPoint> untransformedRefPoint =
+              UntransformBy(outTransform, mouseInput.mOrigin);
+          if (untransformedRefPoint) {
+            mouseInput.mOrigin = *untransformedRefPoint;
+          }
+        } else {
+          state.mResult.mTargetGuid.mScrollId =
+              ScrollableLayerGuid::NULL_SCROLL_ID;
+        }
+      }
+      break;
+    }
+    case SCROLLWHEEL_INPUT: {
+      FlushRepaintsToClearScreenToGeckoTransform();
+
+      ScrollWheelInput& wheelInput = aEvent.AsScrollWheelInput();
+      APZCTM_LOG("Received wheel input at %s with delta (%f, %f)\n",
+                 ToString(wheelInput.mOrigin).c_str(), wheelInput.mDeltaX,
+                 wheelInput.mDeltaY);
+      state.mHit = GetTargetAPZC(wheelInput.mOrigin);
+
+      wheelInput.mHandledByAPZ = WillHandleInput(wheelInput);
+      if (!wheelInput.mHandledByAPZ) {
+        return state.Finish(*this, std::move(aCallback));
+      }
+
+      if (state.mHit.mTargetApzc) {
+        MOZ_ASSERT(state.mHit.mHitResult != CompositorHitTestInvisibleToHit);
+
+        if (wheelInput.mAPZAction == APZWheelAction::PinchZoom) {
+          {
+            RecursiveMutexAutoLock lock(mTreeLock);
+            state.mHit.mTargetApzc = FindRootContentApzcForLayersId(
+                state.mHit.mTargetApzc->GetLayersId());
+          }
+          if (state.mHit.mTargetApzc) {
+            SynthesizePinchGestureFromMouseWheel(wheelInput,
+                                                 state.mHit.mTargetApzc);
+          }
+          state.mResult.SetStatusAsConsumeNoDefault();
+          return state.Finish(*this, std::move(aCallback));
+        }
+
+        MOZ_ASSERT(wheelInput.mAPZAction == APZWheelAction::Scroll);
+
+        ScreenToScreenMatrix4x4 transformToGecko =
+            GetScreenToApzcTransform(state.mHit.mTargetApzc) *
+            GetApzcToGeckoTransformForHit(state.mHit);
+        Maybe<ScreenPoint> untransformedOrigin =
+            UntransformBy(transformToGecko, wheelInput.mOrigin);
+
+        if (!untransformedOrigin) {
+          return state.Finish(*this, std::move(aCallback));
+        }
+
+        state.mResult = mInputQueue->ReceiveInputEvent(
+            state.mHit.mTargetApzc,
+            TargetConfirmationFlags{state.mHit.mHitResult}, wheelInput);
+
+        wheelInput.mOrigin = *untransformedOrigin;
+      }
+      break;
+    }
+    case PANGESTURE_INPUT: {
+      FlushRepaintsToClearScreenToGeckoTransform();
+
+      PanGestureInput& panInput = aEvent.AsPanGestureInput();
+      APZCTM_LOG("Received pan gesture input type %d at %s with delta %s\n",
+                 (int)panInput.mType, ToString(panInput.mPanStartPoint).c_str(),
+                 ToString(panInput.mPanDisplacement).c_str());
+      state.mHit = GetTargetAPZC(panInput.mPanStartPoint);
+
+      panInput.mHandledByAPZ = WillHandleInput(panInput);
+      if (!panInput.mHandledByAPZ) {
+        if (mInputQueue->GetCurrentPanGestureBlock()) {
+          if (state.mHit.mTargetApzc &&
+              (panInput.mType == PanGestureInput::PANGESTURE_END ||
+               panInput.mType == PanGestureInput::PANGESTURE_CANCELLED)) {
+            PanGestureInput panInterrupted(
+                PanGestureInput::PANGESTURE_INTERRUPTED, panInput.mTimeStamp,
+                panInput.mPanStartPoint, panInput.mPanDisplacement,
+                panInput.modifiers);
+            (void)mInputQueue->ReceiveInputEvent(
+                state.mHit.mTargetApzc,
+                TargetConfirmationFlags{state.mHit.mHitResult}, panInterrupted);
+          }
+        }
+        return state.Finish(*this, std::move(aCallback));
+      }
+
+      MOZ_ASSERT(NS_IsMainThread());
+      WidgetWheelEvent wheelEvent = panInput.ToWidgetEvent(nullptr);
+      EventStateManager::GetUserPrefsForWheelEvent(
+          &wheelEvent, &panInput.mUserDeltaMultiplierX,
+          &panInput.mUserDeltaMultiplierY);
+
+      if (state.mHit.mTargetApzc) {
+        MOZ_ASSERT(state.mHit.mHitResult != CompositorHitTestInvisibleToHit);
+
+        ScreenToScreenMatrix4x4 transformToGecko =
+            GetScreenToApzcTransform(state.mHit.mTargetApzc) *
+            GetApzcToGeckoTransformForHit(state.mHit);
+        Maybe<ScreenPoint> untransformedStartPoint =
+            UntransformBy(transformToGecko, panInput.mPanStartPoint);
+        Maybe<ScreenPoint> untransformedDisplacement =
+            UntransformVector(transformToGecko, panInput.mPanDisplacement,
+                              panInput.mPanStartPoint);
+
+        if (!untransformedStartPoint || !untransformedDisplacement) {
+          return state.Finish(*this, std::move(aCallback));
+        }
+
+        panInput.mOverscrollBehaviorAllowsSwipe =
+            state.mHit.mTargetApzc->OverscrollBehaviorAllowsSwipe();
+
+        state.mResult = mInputQueue->ReceiveInputEvent(
+            state.mHit.mTargetApzc,
+            TargetConfirmationFlags{state.mHit.mHitResult}, panInput);
+
+        panInput.mPanStartPoint = *untransformedStartPoint;
+        panInput.mPanDisplacement = *untransformedDisplacement;
+      }
+      break;
+    }
+    case PINCHGESTURE_INPUT: {
+      PinchGestureInput& pinchInput = aEvent.AsPinchGestureInput();
+      if (HasNonLockModifier(pinchInput.modifiers)) {
+        APZCTM_LOG("Discarding pinch input due to modifiers 0x%x\n",
+                   pinchInput.modifiers);
+        return state.Finish(*this, std::move(aCallback));
+      }
+
+      state.mHit = GetTargetAPZC(pinchInput.mFocusPoint);
+
+      pinchInput.mHandledByAPZ = true;
+
+      if (state.mHit.mTargetApzc) {
+        MOZ_ASSERT(state.mHit.mHitResult != CompositorHitTestInvisibleToHit);
+
+        if (!state.mHit.mTargetApzc->IsRootContent()) {
+          state.mHit.mTargetApzc = FindZoomableApzc(state.mHit.mTargetApzc);
+        }
+      }
+
+      if (state.mHit.mTargetApzc) {
+        ScreenToScreenMatrix4x4 outTransform =
+            GetScreenToApzcTransform(state.mHit.mTargetApzc) *
+            GetApzcToGeckoTransformForHit(state.mHit);
+        Maybe<ScreenPoint> untransformedFocusPoint =
+            UntransformBy(outTransform, pinchInput.mFocusPoint);
+
+        if (!untransformedFocusPoint) {
+          return state.Finish(*this, std::move(aCallback));
+        }
+
+        state.mResult = mInputQueue->ReceiveInputEvent(
+            state.mHit.mTargetApzc,
+            TargetConfirmationFlags{state.mHit.mHitResult}, pinchInput);
+
+        pinchInput.mFocusPoint = *untransformedFocusPoint;
+      }
+      break;
+    }
+    case TAPGESTURE_INPUT: {  
+      TapGestureInput& tapInput = aEvent.AsTapGestureInput();
+      state.mHit = GetTargetAPZC(tapInput.mPoint);
+
+      if (state.mHit.mTargetApzc) {
+        MOZ_ASSERT(state.mHit.mHitResult != CompositorHitTestInvisibleToHit);
+
+        ScreenToScreenMatrix4x4 outTransform =
+            GetScreenToApzcTransform(state.mHit.mTargetApzc) *
+            GetApzcToGeckoTransformForHit(state.mHit);
+        Maybe<ScreenIntPoint> untransformedPoint =
+            UntransformBy(outTransform, tapInput.mPoint);
+
+        if (!untransformedPoint) {
+          return state.Finish(*this, std::move(aCallback));
+        }
+
+        {
+          RecursiveMutexAutoLock lock(mTreeLock);
+          mTapGestureHitResult =
+              mHitTester->CloneHitTestResult(lock, state.mHit);
+        }
+
+        state.mResult = mInputQueue->ReceiveInputEvent(
+            state.mHit.mTargetApzc,
+            TargetConfirmationFlags{state.mHit.mHitResult}, tapInput);
+
+        mTapGestureHitResult = HitTestResult();
+
+        tapInput.mPoint = *untransformedPoint;
+      }
+      break;
+    }
+    case KEYBOARD_INPUT: {
+      if (!StaticPrefs::apz_keyboard_enabled_AtStartup()) {
+        APZ_KEY_LOG("Skipping key input from invalid prefs\n");
+        return state.Finish(*this, std::move(aCallback));
+      }
+
+      KeyboardInput& keyInput = aEvent.AsKeyboardInput();
+
+      Maybe<KeyboardShortcut> shortcut = mKeyboardMap.FindMatch(keyInput);
+
+      if (!shortcut) {
+        APZ_KEY_LOG("Skipping key input with no shortcut\n");
+
+        if (mFocusState.CanIgnoreKeyboardShortcutMisses()) {
+          focusSetter.MarkAsNonFocusChanging();
+        }
+        return state.Finish(*this, std::move(aCallback));
+      }
+
+      if (shortcut->mDispatchToContent) {
+        APZ_KEY_LOG("Skipping key input with dispatch-to-content shortcut\n");
+        return state.Finish(*this, std::move(aCallback));
+      }
+
+      const KeyboardScrollAction& action = shortcut->mAction;
+
+      Maybe<ScrollableLayerGuid> targetGuid;
+      switch (action.mType) {
+        case KeyboardScrollAction::eScrollCharacter: {
+          targetGuid = mFocusState.GetHorizontalTarget();
+          break;
+        }
+        case KeyboardScrollAction::eScrollLine:
+        case KeyboardScrollAction::eScrollPage:
+        case KeyboardScrollAction::eScrollComplete: {
+          targetGuid = mFocusState.GetVerticalTarget();
+          break;
+        }
+      }
+
+      if (!targetGuid) {
+        APZ_KEY_LOG("Skipping key input with no current focus target\n");
+        return state.Finish(*this, std::move(aCallback));
+      }
+
+      RefPtr<AsyncPanZoomController> targetApzc =
+          GetTargetAPZC(targetGuid->mLayersId, targetGuid->mScrollId);
+
+      if (!targetApzc) {
+        APZ_KEY_LOG("Skipping key input with focus target but no APZC\n");
+        return state.Finish(*this, std::move(aCallback));
+      }
+
+      keyInput.mAction = action;
+
+      APZ_KEY_LOG("Dispatching key input with apzc=%p\n", targetApzc.get());
+
+      state.mResult = mInputQueue->ReceiveInputEvent(
+          targetApzc, TargetConfirmationFlags{true}, keyInput);
+
+      MOZ_ASSERT(state.mResult.GetStatus() == nsEventStatus_eConsumeDoDefault ||
+                 state.mResult.GetStatus() == nsEventStatus_eConsumeNoDefault);
+
+      keyInput.mHandledByAPZ = true;
+      focusSetter.MarkAsNonFocusChanging();
+
+      break;
+    }
+  }
+  return state.Finish(*this, std::move(aCallback));
+}
+
+static TouchBehaviorFlags ConvertToTouchBehavior(
+    const CompositorHitTestInfo& info) {
+  TouchBehaviorFlags result = AllowedTouchBehavior::UNKNOWN;
+  if (info == CompositorHitTestInvisibleToHit) {
+    result = AllowedTouchBehavior::NONE;
+  } else if (info.contains(CompositorHitTestFlags::eIrregularArea)) {
+    result = AllowedTouchBehavior::UNKNOWN;
+  } else {
+    result = AllowedTouchBehavior::VERTICAL_PAN |
+             AllowedTouchBehavior::HORIZONTAL_PAN |
+             AllowedTouchBehavior::PINCH_ZOOM |
+             AllowedTouchBehavior::ANIMATING_ZOOM;
+    if (info.contains(CompositorHitTestFlags::eTouchActionPanXDisabled)) {
+      result &= ~AllowedTouchBehavior::HORIZONTAL_PAN;
+    }
+    if (info.contains(CompositorHitTestFlags::eTouchActionPanYDisabled)) {
+      result &= ~AllowedTouchBehavior::VERTICAL_PAN;
+    }
+    if (info.contains(CompositorHitTestFlags::eTouchActionPinchZoomDisabled)) {
+      result &= ~AllowedTouchBehavior::PINCH_ZOOM;
+    }
+    if (info.contains(
+            CompositorHitTestFlags::eTouchActionAnimatingZoomDisabled)) {
+      result &= ~AllowedTouchBehavior::ANIMATING_ZOOM;
+    }
+  }
+  return result;
+}
+
+APZCTreeManager::HitTestResult APZCTreeManager::GetTouchInputBlockAPZC(
+    const MultiTouchInput& aEvent,
+    nsTArray<TouchBehaviorFlags>* aOutTouchBehaviors) {
+  HitTestResult hit;
+  if (aEvent.mTouches.Length() == 0) {
+    return hit;
+  }
+
+  FlushRepaintsToClearScreenToGeckoTransform();
+
+  hit = GetTargetAPZC(aEvent.mTouches[0].mScreenPoint);
+  if (aEvent.mTouches.Length() != 1) {
+    hit.mLayersId = LayersId{0};
+  }
+
+  aOutTouchBehaviors->AppendElement(ConvertToTouchBehavior(hit.mHitResult));
+  for (size_t i = 1; i < aEvent.mTouches.Length(); i++) {
+    HitTestResult hit2 = GetTargetAPZC(aEvent.mTouches[i].mScreenPoint);
+    aOutTouchBehaviors->AppendElement(ConvertToTouchBehavior(hit2.mHitResult));
+    hit.mTargetApzc = GetZoomableTarget(hit.mTargetApzc, hit2.mTargetApzc);
+    APZCTM_LOG("Using APZC %p as the root APZC for multi-touch\n",
+               hit.mTargetApzc.get());
+    hit.mScrollbarNode.Clear();
+
+    hit.mHitResult = hit2.mHitResult;
+  }
+
+  return hit;
+}
+
+APZEventResult APZCTreeManager::InputHandlingState::Finish(
+    APZCTreeManager& aTreeManager, InputBlockCallback&& aCallback) {
+  if (mHit.mLayersId.IsValid()) {
+    mEvent.mLayersId = mHit.mLayersId;
+  }
+
+  if (mEvent.mInputType == SCROLLWHEEL_INPUT ||
+      mEvent.mInputType == PANGESTURE_INPUT) {
+    aTreeManager.MaybeOverrideLayersIdForWheelEvent(mEvent);
+  }
+
+  if (mHit.mHitOverscrollGutter && mHit.mFixedPosSides == SideBits::eNone) {
+    mResult.SetStatusAsConsumeNoDefault();
+  }
+
+  if (aCallback && mResult.WillHaveDelayedResult()) {
+    aTreeManager.AddInputBlockCallback(mResult.mInputBlockId,
+                                       std::move(aCallback));
+  }
+
+  return mResult;
+}
+
+void APZCTreeManager::ProcessTouchInput(InputHandlingState& aState,
+                                        MultiTouchInput& aInput) {
+  APZCTM_LOG("Received touch input type %d with touch points [%s]\n",
+             (int)aInput.mType,
+             [&] {
+               nsCString result;
+               for (const auto& touch : aInput.mTouches) {
+                 result.AppendPrintf("%s",
+                                     ToString(touch.mScreenPoint).c_str());
+               }
+               return result;
+             }()
+                 .get());
+
+  aInput.mHandledByAPZ = true;
+  nsTArray<TouchBehaviorFlags> touchBehaviors;
+  HitTestingTreeNodeAutoLock hitScrollbarNode;
+  InitialTouchMove initialTouchMove = InitialTouchMove::No;
+  FastPathApzAwareListener fastPathApzAwareListener =
+      FastPathApzAwareListener::No;
+  if (aInput.mType == MultiTouchInput::MULTITOUCH_START) {
+    if (mTouchBlockHitResult.mTargetApzc &&
+        mTouchBlockHitResult.mTargetApzc->IsInPanningState() &&
+        BuildOverscrollHandoffChain(mTouchBlockHitResult.mTargetApzc)
+            ->HasOverscrolledApzc()) {
+      if (mRetainedTouchIdentifier == -1) {
+        mRetainedTouchIdentifier =
+            mTouchBlockHitResult.mTargetApzc->GetLastTouchIdentifier();
+      }
+
+      aState.mResult.SetStatusAsConsumeNoDefault();
+      return;
+    }
+
+    aState.mHit = GetTouchInputBlockAPZC(aInput, &touchBehaviors);
+    RecursiveMutexAutoLock lock(mTreeLock);
+    mTouchBlockHitResult = mHitTester->CloneHitTestResult(lock, aState.mHit);
+    hitScrollbarNode = std::move(aState.mHit.mScrollbarNode);
+
+    mInScrollbarTouchDrag =
+        StaticPrefs::apz_drag_enabled() &&
+        StaticPrefs::apz_drag_touch_enabled() && hitScrollbarNode &&
+        hitScrollbarNode->IsScrollThumbNode() &&
+        hitScrollbarNode->GetScrollbarData().mThumbIsAsyncDraggable;
+
+    MOZ_ASSERT(touchBehaviors.Length() == aInput.mTouches.Length());
+    for (size_t i = 0; i < touchBehaviors.Length(); i++) {
+      APZCTM_LOG("Touch point has allowed behaviours 0x%02x\n",
+                 touchBehaviors[i]);
+      if (touchBehaviors[i] == AllowedTouchBehavior::UNKNOWN) {
+        touchBehaviors.Clear();
+        break;
+      }
+    }
+  } else if (mTouchBlockHitResult.mTargetApzc) {
+    APZCTM_LOG("Re-using APZC %p as continuation of event block\n",
+               mTouchBlockHitResult.mTargetApzc.get());
+    RecursiveMutexAutoLock lock(mTreeLock);
+    if (aInput.mType == MultiTouchInput::MULTITOUCH_MOVE &&
+        !mTouchCounter.HasSeenFirstMove()) {
+      initialTouchMove = InitialTouchMove::Yes;
+      if (ChainHasFastPathApzAwareListener(
+              mTouchBlockHitResult.mTargetApzc->GetGuid())) {
+        mTouchBlockHitResult.mHitResult +=
+            CompositorHitTestFlags::eApzAwareListeners;
+        fastPathApzAwareListener = FastPathApzAwareListener::Yes;
+      }
+    }
+    aState.mHit = mHitTester->CloneHitTestResult(lock, mTouchBlockHitResult);
+  }
+
+  if (mInScrollbarTouchDrag) {
+    aState.mResult = ProcessTouchInputForScrollbarDrag(
+        aInput, hitScrollbarNode, mTouchBlockHitResult.mHitResult);
+  } else {
+    if (aInput.mType == MultiTouchInput::MULTITOUCH_CANCEL) {
+      mRetainedTouchIdentifier = -1;
+    }
+
+    if (mRetainedTouchIdentifier != -1) {
+      for (size_t j = 0; j < aInput.mTouches.Length(); ++j) {
+        if (aInput.mTouches[j].mIdentifier != mRetainedTouchIdentifier) {
+          aInput.mTouches.RemoveElementAt(j);
+          if (!touchBehaviors.IsEmpty()) {
+            MOZ_ASSERT(touchBehaviors.Length() > j);
+            touchBehaviors.RemoveElementAt(j);
+          }
+          --j;
+        }
+      }
+      if (aInput.mTouches.IsEmpty()) {
+        aState.mResult.SetStatusAsConsumeNoDefault();
+        return;
+      }
+    }
+
+    if (mTouchBlockHitResult.mTargetApzc) {
+      MOZ_ASSERT(mTouchBlockHitResult.mHitResult !=
+                 CompositorHitTestInvisibleToHit);
+
+      aState.mResult = mInputQueue->ReceiveInputEvent(
+          mTouchBlockHitResult.mTargetApzc,
+          TargetConfirmationFlags{mTouchBlockHitResult.mHitResult,
+                                  fastPathApzAwareListener},
+          aInput,
+          touchBehaviors.IsEmpty() ? Nothing()
+                                   : Some(std::move(touchBehaviors)),
+          initialTouchMove);
+
+      ScreenToParentLayerMatrix4x4 transformToApzc =
+          GetScreenToApzcTransform(mTouchBlockHitResult.mTargetApzc);
+      ParentLayerToScreenMatrix4x4 transformToGecko =
+          GetApzcToGeckoTransformForHit(mTouchBlockHitResult);
+      ScreenToScreenMatrix4x4 outTransform = transformToApzc * transformToGecko;
+
+      for (size_t i = 0; i < aInput.mTouches.Length(); i++) {
+        SingleTouchData& touchData = aInput.mTouches[i];
+        Maybe<ScreenIntPoint> untransformedScreenPoint =
+            UntransformBy(outTransform, touchData.mScreenPoint);
+        if (!untransformedScreenPoint) {
+          aState.mResult.SetStatusAsIgnore();
+          return;
+        }
+        touchData.mScreenPoint = *untransformedScreenPoint;
+        AdjustEventPointForDynamicToolbar(touchData.mScreenPoint,
+                                          mTouchBlockHitResult);
+      }
+    }
+  }
+
+  mTouchCounter.Update(aInput);
+
+  if (mTouchCounter.GetActiveTouchCount() == 0) {
+    mTouchBlockHitResult = HitTestResult();
+    mRetainedTouchIdentifier = -1;
+    mInScrollbarTouchDrag = false;
+  }
+}
+
+void APZCTreeManager::AdjustEventPointForDynamicToolbar(
+    ScreenIntPoint& aEventPoint, const HitTestResult& aHit) {
+  if (aHit.mFixedPosSides != SideBits::eNone) {
+    MutexAutoLock lock(mMapLock);
+    aEventPoint -= RoundedToInt(ComputeFixedMarginsOffset(
+        lock, aHit.mFixedPosSides, mGeckoFixedLayerMargins));
+  } else if (aHit.mNode && aHit.mNode->GetStickyPositionAnimationId()) {
+    SideBits sideBits = SideBits::eNone;
+    {
+      RecursiveMutexAutoLock lock(mTreeLock);
+      sideBits = SidesStuckToRootContent(
+          aHit.mNode.Get(lock), AsyncTransformConsumer::eForEventHandling);
+    }
+    MutexAutoLock lock(mMapLock);
+    aEventPoint -= RoundedToInt(
+        ComputeFixedMarginsOffset(lock, sideBits, mGeckoFixedLayerMargins));
+  }
+}
+
+static MouseInput::MouseType MultiTouchTypeToMouseType(
+    MultiTouchInput::MultiTouchType aType) {
+  switch (aType) {
+    case MultiTouchInput::MULTITOUCH_START:
+      return MouseInput::MOUSE_DOWN;
+    case MultiTouchInput::MULTITOUCH_MOVE:
+      return MouseInput::MOUSE_MOVE;
+    case MultiTouchInput::MULTITOUCH_END:
+    case MultiTouchInput::MULTITOUCH_CANCEL:
+      return MouseInput::MOUSE_UP;
+  }
+  MOZ_ASSERT_UNREACHABLE("Invalid multi-touch type");
+  return MouseInput::MOUSE_NONE;
+}
+
+APZEventResult APZCTreeManager::ProcessTouchInputForScrollbarDrag(
+    MultiTouchInput& aTouchInput,
+    const HitTestingTreeNodeAutoLock& aScrollThumbNode,
+    const gfx::CompositorHitTestInfo& aHitInfo) {
+  MOZ_ASSERT(mRetainedTouchIdentifier == -1);
+  MOZ_ASSERT(mTouchBlockHitResult.mTargetApzc);
+  MOZ_ASSERT(aTouchInput.mTouches.Length() == 1);
+
+  MouseInput mouseInput{MultiTouchTypeToMouseType(aTouchInput.mType),
+                        MouseInput::PRIMARY_BUTTON,
+                        dom::MouseEvent_Binding::MOZ_SOURCE_TOUCH,
+                        MouseButtonsFlag::ePrimaryFlag,
+                        aTouchInput.mTouches[0].mScreenPoint,
+                        aTouchInput.mTimeStamp,
+                        aTouchInput.modifiers};
+  mouseInput.mHandledByAPZ = true;
+
+  TargetConfirmationFlags targetConfirmed{aHitInfo};
+  APZEventResult result;
+  result = mInputQueue->ReceiveInputEvent(mTouchBlockHitResult.mTargetApzc,
+                                          targetConfirmed, mouseInput);
+
+  if (aScrollThumbNode) {
+    SetupScrollbarDrag(mouseInput, aScrollThumbNode,
+                       mTouchBlockHitResult.mTargetApzc.get());
+  }
+
+  result.mTargetGuid.mScrollId = ScrollableLayerGuid::NULL_SCROLL_ID;
+
+  return result;
+}
+
+void APZCTreeManager::SetupScrollbarDrag(
+    MouseInput& aMouseInput, const HitTestingTreeNodeAutoLock& aScrollThumbNode,
+    AsyncPanZoomController* aApzc) {
+  DragBlockState* dragBlock = mInputQueue->GetCurrentDragBlock();
+  if (!dragBlock) {
+    return;
+  }
+
+  const ScrollbarData& thumbData = aScrollThumbNode->GetScrollbarData();
+  MOZ_ASSERT(thumbData.mDirection.isSome());
+
+  dragBlock->SetInitialThumbPos(thumbData.mThumbStart);
+
+  if (
+      aScrollThumbNode->GetScrollTargetId() == aApzc->GetGuid().mScrollId &&
+      !aApzc->IsScrollInfoLayer()) {
+    uint64_t dragBlockId = dragBlock->GetBlockId();
+    aMouseInput.TransformToLocal(aApzc->GetTransformToThis());
+    OuterCSSCoord dragStart =
+        aApzc->ConvertScrollbarPoint(aMouseInput.mLocalOrigin, thumbData);
+    LayerToParentLayerMatrix4x4 thumbTransform;
+    {
+      RecursiveMutexAutoLock lock(mTreeLock);
+      thumbTransform =
+          ComputeTransformForScrollThumbNode(aScrollThumbNode.Get(lock));
+    }
+    OuterCSSCoord thumbStart =
+        thumbData.mThumbStart +
+        ((*thumbData.mDirection == ScrollDirection::eHorizontal)
+             ? thumbTransform._41
+             : thumbTransform._42);
+    dragStart -= thumbStart;
+
+    dragBlock->SetContentResponse(false);
+
+    NotifyScrollbarDragInitiated(dragBlockId, aApzc->GetGuid(),
+                                 *thumbData.mDirection);
+
+    mInputQueue->ConfirmDragBlock(
+        dragBlockId, aApzc,
+        AsyncDragMetrics(aApzc->GetGuid().mScrollId,
+                         aApzc->GetGuid().mPresShellId, dragBlockId, dragStart,
+                         *thumbData.mDirection));
+  }
+}
+
+void APZCTreeManager::SynthesizePinchGestureFromMouseWheel(
+    const ScrollWheelInput& aWheelInput,
+    const RefPtr<AsyncPanZoomController>& aTarget) {
+  MOZ_ASSERT(aTarget);
+
+  ScreenPoint focusPoint = aWheelInput.mOrigin;
+
+  ScreenCoord oldSpan = 100;
+  ScreenCoord newSpan = oldSpan + aWheelInput.mDeltaY;
+
+  TargetConfirmationFlags confFlags{true};
+
+  PinchGestureInput pinchStart{PinchGestureInput::PINCHGESTURE_START,
+                               PinchGestureInput::MOUSEWHEEL,
+                               aWheelInput.mTimeStamp,
+                               ExternalPoint(0, 0),
+                               focusPoint,
+                               oldSpan,
+                               oldSpan,
+                               aWheelInput.modifiers};
+  PinchGestureInput pinchScale1{PinchGestureInput::PINCHGESTURE_SCALE,
+                                PinchGestureInput::MOUSEWHEEL,
+                                aWheelInput.mTimeStamp,
+                                ExternalPoint(0, 0),
+                                focusPoint,
+                                oldSpan,
+                                oldSpan,
+                                aWheelInput.modifiers};
+  PinchGestureInput pinchScale2{PinchGestureInput::PINCHGESTURE_SCALE,
+                                PinchGestureInput::MOUSEWHEEL,
+                                aWheelInput.mTimeStamp,
+                                ExternalPoint(0, 0),
+                                focusPoint,
+                                oldSpan,
+                                newSpan,
+                                aWheelInput.modifiers};
+  PinchGestureInput pinchEnd{PinchGestureInput::PINCHGESTURE_END,
+                             PinchGestureInput::MOUSEWHEEL,
+                             aWheelInput.mTimeStamp,
+                             ExternalPoint(0, 0),
+                             focusPoint,
+                             newSpan,
+                             newSpan,
+                             aWheelInput.modifiers};
+
+  mInputQueue->ReceiveInputEvent(aTarget, confFlags, pinchStart);
+  mInputQueue->ReceiveInputEvent(aTarget, confFlags, pinchScale1);
+  mInputQueue->ReceiveInputEvent(aTarget, confFlags, pinchScale2);
+  mInputQueue->ReceiveInputEvent(aTarget, confFlags, pinchEnd);
+}
+
+void APZCTreeManager::MaybeOverrideLayersIdForWheelEvent(InputData& aEvent) {
+  APZThreadUtils::AssertOnControllerThread();
+
+  InputBlockState* txn = nullptr;
+  if (aEvent.mInputType == SCROLLWHEEL_INPUT &&
+      aEvent.AsScrollWheelInput().mHandledByAPZ) {
+    txn = mInputQueue->GetActiveWheelTransaction();
+  } else if (aEvent.mInputType == PANGESTURE_INPUT &&
+             aEvent.AsPanGestureInput().mHandledByAPZ) {
+    txn = mInputQueue->GetCurrentPanGestureBlock();
+  }
+
+  APZCTM_LOG("Maybe override txn (0x%p)", txn);
+
+  if (!txn) {
+    return;
+  }
+
+  Maybe<LayersId> layersId = txn->WheelTransactionLayersId();
+
+  APZCTM_LOG("Maybe override layers id (%s) -> (%s)",
+             ToString(aEvent.mLayersId).c_str(), ToString(layersId).c_str());
+
+  if (layersId.isSome() && *layersId != LayersId{0}) {
+    aEvent.mLayersId = *layersId;
+  }
+}
+
+void APZCTreeManager::UpdateWheelTransaction(
+    LayoutDeviceIntPoint aRefPoint, EventMessage aEventMessage,
+    const Maybe<ScrollableLayerGuid>& aTargetGuid) {
+  APZThreadUtils::AssertOnControllerThread();
+
+  WheelBlockState* txn = mInputQueue->GetActiveWheelTransaction();
+  if (!txn) {
+    return;
+  }
+
+  if (txn->MaybeTimeout(TimeStamp::Now())) {
+    return;
+  }
+
+  switch (aEventMessage) {
+    case eMouseMove:
+    case eDragOver: {
+      ScreenIntPoint point = ViewAs<ScreenPixel>(
+          aRefPoint,
+          PixelCastJustification::LayoutDeviceIsScreenForUntransformedEvent);
+
+      txn->OnMouseMove(point, aTargetGuid);
+
+      return;
+    }
+    case eKeyPress:
+    case eKeyUp:
+    case eKeyDown:
+    case eMouseUp:
+    case eMouseDown:
+    case eMouseDoubleClick:
+    case ePointerAuxClick:
+    case ePointerClick:
+    case eContextMenu:
+    case eDrop:
+      txn->EndTransaction();
+      return;
+    default:
+      break;
+  }
+}
+
+void APZCTreeManager::ProcessUnhandledEvent(LayoutDeviceIntPoint* aRefPoint,
+                                            ScrollableLayerGuid* aOutTargetGuid,
+                                            uint64_t* aOutFocusSequenceNumber,
+                                            LayersId* aOutLayersId) {
+  APZThreadUtils::AssertOnControllerThread();
+
+  PixelCastJustification LDIsScreen =
+      PixelCastJustification::LayoutDeviceIsScreenForUntransformedEvent;
+  ScreenIntPoint refPointAsScreen = ViewAs<ScreenPixel>(*aRefPoint, LDIsScreen);
+  HitTestResult hit = GetTargetAPZC(refPointAsScreen);
+  if (aOutLayersId) {
+    *aOutLayersId = hit.mLayersId;
+  }
+  if (hit.mTargetApzc) {
+    MOZ_ASSERT(hit.mHitResult != CompositorHitTestInvisibleToHit);
+    hit.mTargetApzc->GetGuid(aOutTargetGuid);
+    ScreenToParentLayerMatrix4x4 transformToApzc =
+        GetScreenToApzcTransform(hit.mTargetApzc);
+    ParentLayerToScreenMatrix4x4 transformToGecko =
+        GetApzcToGeckoTransformForHit(hit);
+    ScreenToScreenMatrix4x4 outTransform = transformToApzc * transformToGecko;
+    Maybe<ScreenIntPoint> untransformedRefPoint =
+        UntransformBy(outTransform, refPointAsScreen);
+    if (untransformedRefPoint) {
+      *aRefPoint =
+          ViewAs<LayoutDevicePixel>(*untransformedRefPoint, LDIsScreen);
+    }
+  }
+
+  mFocusState.ReceiveFocusChangingEvent();
+  *aOutFocusSequenceNumber = mFocusState.LastAPZProcessedEvent();
+}
+
+void APZCTreeManager::SetKeyboardMap(const KeyboardMap& aKeyboardMap) {
+  if (!APZThreadUtils::IsControllerThread()) {
+    APZThreadUtils::RunOnControllerThread(NewRunnableMethod<KeyboardMap>(
+        "layers::APZCTreeManager::SetKeyboardMap", this,
+        &APZCTreeManager::SetKeyboardMap, aKeyboardMap));
+    return;
+  }
+
+  APZThreadUtils::AssertOnControllerThread();
+
+  mKeyboardMap = aKeyboardMap;
+}
+
+void APZCTreeManager::ZoomToRect(const ScrollableLayerGuid& aGuid,
+                                 const ZoomTarget& aZoomTarget,
+                                 const uint32_t aFlags) {
+  if (!APZThreadUtils::IsControllerThread()) {
+    APZThreadUtils::RunOnControllerThread(
+        NewRunnableMethod<ScrollableLayerGuid, ZoomTarget, uint32_t>(
+            "layers::APZCTreeManager::ZoomToRect", this,
+            &APZCTreeManager::ZoomToRect, aGuid, aZoomTarget, aFlags));
+    return;
+  }
+
+  APZThreadUtils::AssertOnControllerThread();
+
+  RefPtr<AsyncPanZoomController> apzc = GetTargetAPZC(aGuid);
+  if (aFlags & ZOOM_TO_FOCUSED_INPUT) {
+    if (apzc) {
+      CSSRect transformedRect =
+          ConvertRectInApzcToRoot(apzc, aZoomTarget.targetRect);
+
+      transformedRect.Inflate(15.0f, 0.0f);
+      ZoomTarget zoomTarget{transformedRect};
+
+      apzc = FindZoomableApzc(apzc);
+      if (apzc) {
+        uint32_t flags = aFlags;
+        MutexAutoLock lock(mMapLock);
+        if (IsSoftwareKeyboardVisible(lock) &&
+            InteractiveWidgetMode(lock) ==
+                dom::InteractiveWidget::ResizesVisual) {
+          flags |= ZOOM_TO_FOCUSED_INPUT_ON_RESIZES_VISUAL;
+        }
+        apzc->ZoomToRect(zoomTarget, flags);
+      }
+    }
+    return;
+  }
+
+  if (apzc) {
+    apzc = FindZoomableApzc(apzc);
+    if (apzc) {
+      apzc->ZoomToRect(aZoomTarget, aFlags);
+    }
+  }
+}
+
+void APZCTreeManager::ContentReceivedInputBlock(uint64_t aInputBlockId,
+                                                bool aPreventDefault) {
+  if (!APZThreadUtils::IsControllerThread()) {
+    APZThreadUtils::RunOnControllerThread(NewRunnableMethod<uint64_t, bool>(
+        "layers::APZCTreeManager::ContentReceivedInputBlock", this,
+        &APZCTreeManager::ContentReceivedInputBlock, aInputBlockId,
+        aPreventDefault));
+    return;
+  }
+
+  APZThreadUtils::AssertOnControllerThread();
+
+  mInputQueue->ContentReceivedInputBlock(aInputBlockId, aPreventDefault);
+}
+
+void APZCTreeManager::SetTargetAPZC(
+    uint64_t aInputBlockId, const nsTArray<ScrollableLayerGuid>& aTargets) {
+  if (!APZThreadUtils::IsControllerThread()) {
+    APZThreadUtils::RunOnControllerThread(
+        NewRunnableMethod<uint64_t,
+                          StoreCopyPassByRRef<nsTArray<ScrollableLayerGuid>>>(
+            "layers::APZCTreeManager::SetTargetAPZC", this,
+            &layers::APZCTreeManager::SetTargetAPZC, aInputBlockId,
+            aTargets.Clone()));
+    return;
+  }
+
+  RefPtr<AsyncPanZoomController> target = nullptr;
+  if (aTargets.Length() > 0) {
+    target = GetTargetAPZC(aTargets[0]);
+  }
+  for (size_t i = 1; i < aTargets.Length(); i++) {
+    RefPtr<AsyncPanZoomController> apzc = GetTargetAPZC(aTargets[i]);
+    target = GetZoomableTarget(target, apzc);
+  }
+  if (InputBlockState* block = mInputQueue->GetBlockForId(aInputBlockId)) {
+    if (block->AsPinchGestureBlock() && aTargets.Length() == 1) {
+      target = FindZoomableApzc(target);
+    }
+  }
+  mInputQueue->SetConfirmedTargetApzc(aInputBlockId, target);
+}
+
+void APZCTreeManager::UpdateZoomConstraints(
+    const ScrollableLayerGuid& aGuid,
+    const Maybe<ZoomConstraints>& aConstraints) {
+  if (!GetUpdater()->IsUpdaterThread()) {
+    GetUpdater()->RunOnUpdaterThread(
+        aGuid.mLayersId,
+        NewRunnableMethod<ScrollableLayerGuid, Maybe<ZoomConstraints>>(
+            "APZCTreeManager::UpdateZoomConstraints", this,
+            &APZCTreeManager::UpdateZoomConstraints, aGuid, aConstraints));
+    return;
+  }
+
+  AssertOnUpdaterThread();
+
+  if (aConstraints) {
+    APZCTM_LOG("Recording constraints %s for guid %s\n",
+               ToString(aConstraints.value()).c_str(), ToString(aGuid).c_str());
+    mZoomConstraints[aGuid] = aConstraints.ref();
+  } else {
+    APZCTM_LOG("Removing constraints for guid %s\n", ToString(aGuid).c_str());
+    mZoomConstraints.erase(aGuid);
+  }
+
+  RecursiveMutexAutoLock lock(mTreeLock);
+  RefPtr<HitTestingTreeNode> node = DepthFirstSearchPostOrder<ReverseIterator>(
+      mRootNode.get(), [&aGuid](HitTestingTreeNode* aNode) {
+        bool matches = false;
+        if (auto zoomId = aNode->GetAsyncZoomContainerId()) {
+          matches = ScrollableLayerGuid::EqualsIgnoringPresShell(
+              aGuid, ScrollableLayerGuid(aNode->GetLayersId(), 0, *zoomId));
+        }
+        return matches;
+      });
+
+  // clang-format off
+  // clang-format on
+
+
+  if (node && aConstraints) {
+    ForEachNode<ReverseIterator>(node.get(), [&aConstraints, &node, &aGuid,
+                                              this](HitTestingTreeNode* aNode) {
+      if (aNode != node) {
+        if (auto zoomId = aNode->GetAsyncZoomContainerId()) {
+          MOZ_ASSERT(!ScrollableLayerGuid::EqualsIgnoringPresShell(
+              aGuid, ScrollableLayerGuid(aNode->GetLayersId(), 0, *zoomId)));
+          return TraversalFlag::Skip;
+        }
+        if (AsyncPanZoomController* childApzc = aNode->GetApzc()) {
+          if (!ScrollableLayerGuid::EqualsIgnoringPresShell(
+                  aGuid, childApzc->GetGuid())) {
+            if (this->mZoomConstraints.find(childApzc->GetGuid()) !=
+                this->mZoomConstraints.end()) {
+              return TraversalFlag::Skip;
+            }
+          }
+        }
+      }
+      if (aNode->IsPrimaryHolder()) {
+        MOZ_ASSERT(aNode->GetApzc());
+        aNode->GetApzc()->UpdateZoomConstraints(aConstraints.ref());
+      }
+      return TraversalFlag::Continue;
+    });
+  }
+}
+
+void APZCTreeManager::FlushRepaintsToClearScreenToGeckoTransform() {
+  RecursiveMutexAutoLock lock(mTreeLock);
+
+  ForEachNode<ReverseIterator>(mRootNode.get(), [](HitTestingTreeNode* aNode) {
+    if (aNode->IsPrimaryHolder()) {
+      MOZ_ASSERT(aNode->GetApzc());
+      aNode->GetApzc()->FlushRepaintForNewInputBlock();
+    }
+  });
+}
+
+void APZCTreeManager::ClearTree() {
+  GetUpdater()->AssertOnUpdaterThreadOrNotInitialized();
+
+  APZThreadUtils::RunOnControllerThread(NewRunnableMethod(
+      "layers::InputQueue::Clear", mInputQueue, &InputQueue::Clear));
+
+  RecursiveMutexAutoLock lock(mTreeLock);
+
+  nsTArray<RefPtr<HitTestingTreeNode>> nodesToDestroy;
+  ForEachNode<ReverseIterator>(mRootNode.get(),
+                               [&nodesToDestroy](HitTestingTreeNode* aNode) {
+                                 nodesToDestroy.AppendElement(aNode);
+                               });
+
+  mRootContentApzcs.Clear();
+  for (size_t i = 0; i < nodesToDestroy.Length(); i++) {
+    nodesToDestroy[i]->Destroy();
+  }
+  mRootNode = nullptr;
+
+  {
+    MutexAutoLock lock(mMapLock);
+    mApzcMap.clear();
+  }
+
+  RefPtr<APZCTreeManager> self(this);
+  NS_DispatchToMainThread(
+      NS_NewRunnableFunction("layers::APZCTreeManager::ClearTree", [self] {
+        self->mFlushObserver->Unregister();
+        self->mFlushObserver = nullptr;
+      }));
+}
+
+RefPtr<HitTestingTreeNode> APZCTreeManager::GetRootNode() const {
+  RecursiveMutexAutoLock lock(mTreeLock);
+  return mRootNode;
+}
+
+static bool TransformDisplacement(APZCTreeManager* aTreeManager,
+                                  AsyncPanZoomController* aSource,
+                                  AsyncPanZoomController* aTarget,
+                                  ParentLayerPoint& aStartPoint,
+                                  ParentLayerPoint& aEndPoint) {
+  if (aSource == aTarget) {
+    return true;
+  }
+
+  ParentLayerToScreenMatrix4x4 untransformToApzc =
+      aTreeManager->GetScreenToApzcTransform(aSource).Inverse();
+  ScreenPoint screenStart = TransformBy(untransformToApzc, aStartPoint);
+  ScreenPoint screenEnd = TransformBy(untransformToApzc, aEndPoint);
+
+  ScreenToParentLayerMatrix4x4 transformToApzc =
+      aTreeManager->GetScreenToApzcTransform(aTarget);
+  Maybe<ParentLayerPoint> startPoint =
+      UntransformBy(transformToApzc, screenStart);
+  Maybe<ParentLayerPoint> endPoint = UntransformBy(transformToApzc, screenEnd);
+  if (!startPoint || !endPoint) {
+    return false;
+  }
+  aEndPoint = *endPoint;
+  aStartPoint = *startPoint;
+
+  return true;
+}
+
+bool APZCTreeManager::DispatchScroll(
+    AsyncPanZoomController* aPrev, ParentLayerPoint& aStartPoint,
+    ParentLayerPoint& aEndPoint,
+    OverscrollHandoffState& aOverscrollHandoffState) {
+  const OverscrollHandoffChain& overscrollHandoffChain =
+      aOverscrollHandoffState.mChain;
+  uint32_t overscrollHandoffChainIndex = aOverscrollHandoffState.mChainIndex;
+  RefPtr<AsyncPanZoomController> next;
+  if (overscrollHandoffChainIndex >= overscrollHandoffChain.Length()) {
+    return false;
+  }
+
+  next = overscrollHandoffChain.GetApzcAtIndex(overscrollHandoffChainIndex);
+
+  if (next == nullptr || next->IsDestroyed()) {
+    return false;
+  }
+
+  if (!TransformDisplacement(this, aPrev, next, aStartPoint, aEndPoint)) {
+    return false;
+  }
+
+  if (!next->AttemptScroll(aStartPoint, aEndPoint, aOverscrollHandoffState)) {
+    if (!TransformDisplacement(this, next, aPrev, aStartPoint, aEndPoint)) {
+      NS_WARNING("Failed to untransform scroll points during dispatch");
+    }
+    return false;
+  }
+
+  return true;
+}
+
+ParentLayerPoint APZCTreeManager::DispatchFling(
+    AsyncPanZoomController* aPrev, const FlingHandoffState& aHandoffState) {
+  if (aHandoffState.mIsHandoff && !StaticPrefs::apz_allow_immediate_handoff() &&
+      aHandoffState.mScrolledApzc == aPrev) {
+    FLING_LOG("APZCTM dropping handoff due to disallowed immediate handoff\n");
+    return aHandoffState.mVelocity;
+  }
+
+  const OverscrollHandoffChain* chain = aHandoffState.mChain;
+  RefPtr<AsyncPanZoomController> current;
+  uint32_t overscrollHandoffChainLength = chain->Length();
+  uint32_t startIndex;
+
+  ParentLayerPoint startPoint;  
+  ParentLayerPoint endPoint;
+
+  if (aHandoffState.mIsHandoff) {
+    startIndex = chain->IndexOf(aPrev) + 1;
+
+    if (startIndex >= overscrollHandoffChainLength) {
+      return aHandoffState.mVelocity;
+    }
+  } else {
+    startIndex = 0;
+  }
+
+  ParentLayerPoint finalResidualVelocity = aHandoffState.mVelocity;
+
+  ParentLayerPoint currentVelocity = aHandoffState.mVelocity;
+  for (; startIndex < overscrollHandoffChainLength; startIndex++) {
+    current = chain->GetApzcAtIndex(startIndex);
+
+    if (current == nullptr || current->IsDestroyed()) {
+      break;
+    }
+
+    endPoint = startPoint + currentVelocity;
+
+    RefPtr<AsyncPanZoomController> prevApzc =
+        (startIndex > 0) ? chain->GetApzcAtIndex(startIndex - 1) : nullptr;
+
+    if (prevApzc) {
+      if (!TransformDisplacement(this, prevApzc, current, startPoint,
+                                 endPoint)) {
+        break;
+      }
+    }
+
+    ParentLayerPoint availableVelocity = (endPoint - startPoint);
+    ParentLayerPoint residualVelocity;
+
+    FlingHandoffState transformedHandoffState = aHandoffState;
+    transformedHandoffState.mVelocity = availableVelocity;
+
+    if (prevApzc) {
+      residualVelocity += prevApzc->AdjustHandoffVelocityForOverscrollBehavior(
+          transformedHandoffState.mVelocity);
+    }
+
+    residualVelocity += current->AttemptFling(transformedHandoffState);
+
+    if (current->IsZero(residualVelocity)) {
+      return ParentLayerPoint();
+    }
+
+    if (!current->IsZero(availableVelocity.x - residualVelocity.x)) {
+      finalResidualVelocity.x *= (residualVelocity.x / availableVelocity.x);
+    }
+    if (!current->IsZero(availableVelocity.y - residualVelocity.y)) {
+      finalResidualVelocity.y *= (residualVelocity.y / availableVelocity.y);
+    }
+
+    currentVelocity = residualVelocity;
+  }
+
+  return finalResidualVelocity;
+}
+
+already_AddRefed<AsyncPanZoomController> APZCTreeManager::GetTargetAPZC(
+    const ScrollableLayerGuid& aGuid) {
+  RecursiveMutexAutoLock lock(mTreeLock);
+  RefPtr<HitTestingTreeNode> node = GetTargetNode(aGuid, nullptr);
+  MOZ_ASSERT(!node || node->GetApzc());  
+  RefPtr<AsyncPanZoomController> apzc = node ? node->GetApzc() : nullptr;
+  return apzc.forget();
+}
+
+already_AddRefed<AsyncPanZoomController> APZCTreeManager::GetTargetAPZC(
+    const LayersId& aLayersId,
+    const ScrollableLayerGuid::ViewID& aScrollId) const {
+  MutexAutoLock lock(mMapLock);
+  return GetTargetAPZC(aLayersId, aScrollId, lock);
+}
+
+already_AddRefed<AsyncPanZoomController> APZCTreeManager::GetTargetAPZC(
+    const LayersId& aLayersId, const ScrollableLayerGuid::ViewID& aScrollId,
+    const MutexAutoLock& aProofOfMapLock) const {
+  mMapLock.AssertCurrentThreadOwns();
+  ScrollableLayerGuid guid(aLayersId, 0, aScrollId);
+  auto it = mApzcMap.find(guid);
+  RefPtr<AsyncPanZoomController> apzc =
+      (it != mApzcMap.end() ? it->second.apzc : nullptr);
+  return apzc.forget();
+}
+
+already_AddRefed<HitTestingTreeNode> APZCTreeManager::GetTargetNode(
+    const ScrollableLayerGuid& aGuid, GuidComparator aComparator) const {
+  mTreeLock.AssertCurrentThreadIn();
+  RefPtr<HitTestingTreeNode> target =
+      DepthFirstSearchPostOrder<ReverseIterator>(
+          mRootNode.get(), [&aGuid, &aComparator](HitTestingTreeNode* node) {
+            bool matches = false;
+            if (node->GetApzc()) {
+              if (aComparator) {
+                matches = aComparator(aGuid, node->GetApzc()->GetGuid());
+              } else {
+                matches = node->GetApzc()->Matches(aGuid);
+              }
+            }
+            return matches;
+          });
+  return target.forget();
+}
+
+APZCTreeManager::HitTestResult APZCTreeManager::GetTargetAPZC(
+    const ScreenPoint& aPoint) {
+  RecursiveMutexAutoLock lock(mTreeLock);
+  MOZ_ASSERT(mHitTester);
+  return mHitTester->GetAPZCAtPoint(aPoint, lock);
+}
+
+APZCTreeManager::HitTestResult APZCTreeManager::GetTargetAPZCForMouseInput(
+    const MouseInput& aMouseInput) {
+  if (!StaticPrefs::apz_mousemove_hittest_optimization_enabled() ||
+      aMouseInput.mType != MouseInput::MOUSE_MOVE ||
+      mInputQueue->GetActiveWheelTransaction()) {
+    return GetTargetAPZC(aMouseInput.mOrigin);
+  }
+
+  if (mDragBlockHitResult.mTargetApzc) {
+    RecursiveMutexAutoLock lock(mTreeLock);
+    return mHitTester->CloneHitTestResult(lock, mDragBlockHitResult);
+  }
+
+  RecursiveMutexAutoLock lock(mTreeLock);
+  if (!mHaveOOPIframes) {
+    return HitTestResult{};
+  }
+  return GetTargetAPZC(aMouseInput.mOrigin);
+}
+
+APZCTreeManager::TargetApzcForNodeResult APZCTreeManager::FindHandoffParent(
+    const AsyncPanZoomController* aApzc) {
+  RefPtr<HitTestingTreeNode> node = GetTargetNode(aApzc->GetGuid(), nullptr);
+  while (node) {
+    auto result = GetTargetApzcForNode(node->GetParent());
+    if (result.mApzc) {
+      if (result.mApzc != aApzc) {
+        return result;
+      }
+    }
+    node = node->GetParent();
+  }
+
+  return {nullptr, false};
+}
+
+RefPtr<const OverscrollHandoffChain>
+APZCTreeManager::BuildOverscrollHandoffChain(
+    const RefPtr<AsyncPanZoomController>& aInitialTarget) {
+
+  RecursiveMutexAutoLock lock(mTreeLock);
+
+  OverscrollHandoffChain* result = new OverscrollHandoffChain;
+  AsyncPanZoomController* apzc = aInitialTarget;
+  while (apzc != nullptr) {
+    result->Add(apzc);
+
+    APZCTreeManager::TargetApzcForNodeResult handoffResult =
+        FindHandoffParent(apzc);
+
+    if (!handoffResult.mIsFixed && !apzc->IsRootForLayersId() &&
+        apzc->GetScrollHandoffParentId() ==
+            ScrollableLayerGuid::NULL_SCROLL_ID) {
+      NS_WARNING("Found a non-root APZ with no handoff parent");
+    }
+
+    if (handoffResult.mIsFixed || apzc->GetScrollHandoffParentId() ==
+                                      ScrollableLayerGuid::NULL_SCROLL_ID) {
+      apzc = handoffResult.mApzc;
+      continue;
+    }
+
+    MOZ_ASSERT(apzc->GetScrollHandoffParentId() != apzc->GetGuid().mScrollId);
+    RefPtr<AsyncPanZoomController> scrollParent = GetTargetAPZC(
+        apzc->GetGuid().mLayersId, apzc->GetScrollHandoffParentId());
+    apzc = scrollParent.get();
+  }
+
+  for (uint32_t i = 0; i < result->Length(); ++i) {
+    APZCTM_LOG("OverscrollHandoffChain[%d] = %p\n", i,
+               result->GetApzcAtIndex(i).get());
+  }
+
+  return result;
+}
+
+void APZCTreeManager::SetLongTapEnabled(bool aLongTapEnabled) {
+  if (!APZThreadUtils::IsControllerThread()) {
+    APZThreadUtils::RunOnControllerThread(NewRunnableMethod<bool>(
+        "layers::APZCTreeManager::SetLongTapEnabled", this,
+        &APZCTreeManager::SetLongTapEnabled, aLongTapEnabled));
+    return;
+  }
+
+  APZThreadUtils::AssertOnControllerThread();
+  GestureEventListener::SetLongTapEnabled(aLongTapEnabled);
+}
+
+void APZCTreeManager::NotifyApzAwareListenerAdded(
+    const ScrollableLayerGuid& aGuid) {
+  MutexAutoLock lock(mMapLock);
+  auto result = mFastPathApzAwareGuids.insert(aGuid);
+  MOZ_LOG(sApzFastPathLog, LogLevel::Debug,
+          ("APZCTreeManager: %s fast-path entry for layersId=%" PRIu64
+           " scrollId=%" PRIu64 " (set size=%zu)",
+           result.second ? "added" : "already had", uint64_t(aGuid.mLayersId),
+           aGuid.mScrollId, mFastPathApzAwareGuids.size()));
+}
+
+bool APZCTreeManager::ChainHasFastPathApzAwareListener(
+    const ScrollableLayerGuid& aHitGuid) {
+  MutexAutoLock lock(mMapLock);
+  if (mFastPathApzAwareGuids.empty()) {
+    return false;
+  }
+  ScrollableLayerGuid current = aHitGuid;
+  while (true) {
+    if (mFastPathApzAwareGuids.find(current) != mFastPathApzAwareGuids.end()) {
+      MOZ_LOG(sApzFastPathLog, LogLevel::Debug,
+              ("APZCTreeManager: hit-test matched fast-path entry "
+               "layersId=%" PRIu64 " scrollId=%" PRIu64
+               " (hit was layersId=%" PRIu64 " scrollId=%" PRIu64 ")",
+               uint64_t(current.mLayersId), current.mScrollId,
+               uint64_t(aHitGuid.mLayersId), aHitGuid.mScrollId));
+      return true;
+    }
+    auto it = mApzcMap.find(current);
+    if (it == mApzcMap.end() || it->second.parent.isNothing()) {
+      return false;
+    }
+    const ScrollableLayerGuid& parent = *it->second.parent;
+    if (parent.mLayersId != aHitGuid.mLayersId) {
+      return false;
+    }
+    current = parent;
+  }
+}
+
+void APZCTreeManager::AddInputBlockCallback(uint64_t aInputBlockId,
+                                            InputBlockCallback&& aCallback) {
+  APZThreadUtils::AssertOnControllerThread();
+  mInputQueue->AddInputBlockCallback(aInputBlockId, std::move(aCallback));
+}
+
+void APZCTreeManager::FindScrollThumbNode(
+    const AsyncDragMetrics& aDragMetrics, LayersId aLayersId,
+    HitTestingTreeNodeAutoLock& aOutThumbNode) {
+  if (!aDragMetrics.mDirection) {
+    return;
+  }
+
+  RecursiveMutexAutoLock lock(mTreeLock);
+
+  RefPtr<HitTestingTreeNode> result = DepthFirstSearch<ReverseIterator>(
+      mRootNode.get(), [&aDragMetrics, &aLayersId](HitTestingTreeNode* aNode) {
+        return aNode->MatchesScrollDragMetrics(aDragMetrics, aLayersId);
+      });
+  if (result) {
+    aOutThumbNode.Initialize(lock, result.forget(), mTreeLock);
+  }
+}
+
+APZCTreeManager::TargetApzcForNodeResult APZCTreeManager::GetTargetApzcForNode(
+    const HitTestingTreeNode* aNode) {
+  for (const HitTestingTreeNode* n = aNode;
+       n && n->GetLayersId() == aNode->GetLayersId(); n = n->GetParent()) {
+    if (n->GetFixedPosTarget() != ScrollableLayerGuid::NULL_SCROLL_ID) {
+      RefPtr<AsyncPanZoomController> fpTarget =
+          GetTargetAPZC(n->GetLayersId(), n->GetFixedPosTarget());
+      APZCTM_LOG("Found target APZC %p using fixed-pos lookup on %" PRIu64 "\n",
+                 fpTarget.get(), n->GetFixedPosTarget());
+      return {fpTarget.get(), true};
+    }
+    if (n->GetApzc()) {
+      APZCTM_LOG("Found target %p using ancestor lookup\n", n->GetApzc());
+      return {n->GetApzc(), false};
+    }
+  }
+  return {nullptr, false};
+}
+
+HitTestingTreeNode* APZCTreeManager::FindRootNodeForLayersId(
+    LayersId aLayersId) const {
+  mTreeLock.AssertCurrentThreadIn();
+
+  HitTestingTreeNode* resultNode = BreadthFirstSearch<ReverseIterator>(
+      mRootNode.get(), [aLayersId](HitTestingTreeNode* aNode) {
+        AsyncPanZoomController* apzc = aNode->GetApzc();
+        return apzc && apzc->GetLayersId() == aLayersId &&
+               apzc->IsRootForLayersId();
+      });
+  return resultNode;
+}
+
+already_AddRefed<AsyncPanZoomController> APZCTreeManager::FindZoomableApzc(
+    AsyncPanZoomController* aStart) const {
+  return GetZoomableTarget(aStart, aStart);
+}
+
+ScreenMargin APZCTreeManager::GetCompositorFixedLayerMargins() const {
+  MutexAutoLock lock(mMapLock);
+  return GetCompositorFixedLayerMargins(lock);
+}
+
+AsyncPanZoomController* APZCTreeManager::FindRootApzcFor(
+    LayersId aLayersId) const {
+  RecursiveMutexAutoLock lock(mTreeLock);
+
+  HitTestingTreeNode* resultNode = FindRootNodeForLayersId(aLayersId);
+  return resultNode ? resultNode->GetApzc() : nullptr;
+}
+
+AsyncPanZoomController* APZCTreeManager::FindRootContentApzcForLayersId(
+    LayersId aLayersId) const {
+  mTreeLock.AssertCurrentThreadIn();
+
+  HitTestingTreeNode* resultNode = BreadthFirstSearch<ReverseIterator>(
+      mRootNode.get(), [aLayersId](HitTestingTreeNode* aNode) {
+        AsyncPanZoomController* apzc = aNode->GetApzc();
+        return apzc && apzc->GetLayersId() == aLayersId &&
+               apzc->IsRootContent();
+      });
+  return resultNode ? resultNode->GetApzc() : nullptr;
+}
+
+// clang-format off
+// clang-format on
+
+ScreenToParentLayerMatrix4x4 APZCTreeManager::GetScreenToApzcTransform(
+    const AsyncPanZoomController* aApzc) const {
+  Matrix4x4 result;
+  RecursiveMutexAutoLock lock(mTreeLock);
+
+
+  Matrix4x4 ancestorUntransform = aApzc->GetAncestorTransform().Inverse();
+
+  result = ancestorUntransform;
+
+  for (AsyncPanZoomController* parent = aApzc->GetParent(); parent;
+       parent = parent->GetParent()) {
+    ancestorUntransform = parent->GetAncestorTransform().Inverse();
+    Matrix4x4 asyncUntransform = parent
+                                     ->GetAsyncTransformForInputTransformation(
+                                         LayoutAndVisual, aApzc->GetLayersId())
+                                     .Inverse()
+                                     .ToUnknownMatrix();
+    Matrix4x4 untransformSinceLastApzc = ancestorUntransform * asyncUntransform;
+
+    result = untransformSinceLastApzc * result;
+
+  }
+
+  return ViewAs<ScreenToParentLayerMatrix4x4>(result);
+}
+
+ParentLayerToParentLayerMatrix4x4 APZCTreeManager::GetApzcToApzcTransform(
+    const AsyncPanZoomController* aStartApzc,
+    const AsyncPanZoomController* aStopApzc,
+    const AsyncTransformComponents& aComponents) const {
+  Matrix4x4 result;
+  RecursiveMutexAutoLock lock(mTreeLock);
+
+
+  Matrix4x4 asyncUntransform = aStartApzc
+                                   ->GetAsyncTransformForInputTransformation(
+                                       aComponents, aStartApzc->GetLayersId())
+                                   .Inverse()
+                                   .ToUnknownMatrix();
+
+  result = asyncUntransform *
+           aStartApzc->GetTransformToLastDispatchedPaint(
+               aComponents, aStartApzc->GetLayersId()) *
+           aStartApzc->GetAncestorTransform();
+
+  for (AsyncPanZoomController* parent = aStartApzc->GetParent();
+       parent && parent != aStopApzc; parent = parent->GetParent()) {
+    result = result *
+             parent->GetTransformToLastDispatchedPaint(
+                 LayoutAndVisual, aStartApzc->GetLayersId()) *
+             parent->GetAncestorTransform();
+
+  }
+
+  return ViewAs<ParentLayerToParentLayerMatrix4x4>(result);
+}
+
+ParentLayerToScreenMatrix4x4 APZCTreeManager::GetApzcToGeckoTransform(
+    const AsyncPanZoomController* aApzc,
+    const AsyncTransformComponents& aComponents) const {
+  return ViewAs<ParentLayerToScreenMatrix4x4>(
+      GetApzcToApzcTransform(aApzc, nullptr, aComponents),
+      PixelCastJustification::ScreenIsParentLayerForRoot);
+}
+
+ParentLayerToScreenMatrix4x4 APZCTreeManager::GetApzcToGeckoTransformForHit(
+    HitTestResult& aHitResult) const {
+  AsyncTransformComponents components =
+      aHitResult.mFixedPosSides == SideBits::eNone
+          ? LayoutAndVisual
+          : AsyncTransformComponents{AsyncTransformComponent::eVisual};
+  return GetApzcToGeckoTransform(aHitResult.mTargetApzc, components);
+}
+
+CSSToCSSMatrix4x4 APZCTreeManager::GetOopifToRootContentTransform(
+    AsyncPanZoomController* aApzc) const {
+  MOZ_ASSERT(aApzc->IsRootForLayersId());
+
+  RefPtr<AsyncPanZoomController> rootContentApzc = FindZoomableApzc(aApzc);
+  MOZ_ASSERT(aApzc->GetLayersId() != rootContentApzc->GetLayersId(),
+             "aApzc must be out-of-process of the rootContentApzc");
+  if (!rootContentApzc || rootContentApzc == aApzc ||
+      rootContentApzc->GetLayersId() == aApzc->GetLayersId()) {
+    return CSSToCSSMatrix4x4();
+  }
+  ParentLayerToParentLayerMatrix4x4 result =
+      GetApzcToApzcTransform(aApzc, rootContentApzc,
+                             AsyncTransformComponent::eLayout) *
+      ViewAs<AsyncTransformComponentMatrix>(
+          rootContentApzc->GetPaintedResolutionTransform());
+
+  CSSToParentLayerScale rootZoom = rootContentApzc->GetZoom();
+
+  if (rootZoom == CSSToParentLayerScale(0)) {
+    rootZoom = CSSToParentLayerScale(1.0f);
+  }
+
+  CSSPoint rootScrollPosition = rootContentApzc->GetLayoutScrollOffset();
+
+  return result.PreScale(aApzc->GetZoom())
+      .PostScale(rootZoom.Inverse())
+      .PostTranslate(rootScrollPosition);
+}
+
+CSSRect APZCTreeManager::ConvertRectInApzcToRoot(AsyncPanZoomController* aApzc,
+                                                 const CSSRect& aRect) const {
+  MOZ_ASSERT(aApzc->IsRootForLayersId());
+  RefPtr<AsyncPanZoomController> rootContentApzc = FindZoomableApzc(aApzc);
+  if (!rootContentApzc) {
+    return aRect;
+  }
+
+  if (rootContentApzc == aApzc) {
+    return aRect + rootContentApzc->GetLayoutScrollOffset();
+  }
+
+  return GetOopifToRootContentTransform(aApzc).TransformBounds(aRect);
+}
+
+ScreenPoint APZCTreeManager::GetCurrentMousePosition() const {
+  auto pos = mCurrentMousePosition.Lock();
+  return pos.ref();
+}
+
+void APZCTreeManager::SetCurrentMousePosition(const ScreenPoint& aNewPos) {
+  auto pos = mCurrentMousePosition.Lock();
+  pos.ref() = aNewPos;
+}
+
+static AsyncPanZoomController* GetApzcWithDifferentLayersIdByWalkingParents(
+    AsyncPanZoomController* aApzc) {
+  if (!aApzc) {
+    return nullptr;
+  }
+  AsyncPanZoomController* parent = aApzc->GetParent();
+  while (parent && (parent->GetLayersId() == aApzc->GetLayersId())) {
+    parent = parent->GetParent();
+  }
+  return parent;
+}
+
+already_AddRefed<AsyncPanZoomController> APZCTreeManager::GetZoomableTarget(
+    AsyncPanZoomController* aApzc1, AsyncPanZoomController* aApzc2) const {
+  RecursiveMutexAutoLock lock(mTreeLock);
+  RefPtr<AsyncPanZoomController> apzc;
+  if (aApzc1 && aApzc2 && aApzc1->GetLayersId() == aApzc2->GetLayersId()) {
+    apzc = FindRootContentApzcForLayersId(aApzc1->GetLayersId());
+    if (apzc) {
+      return apzc.forget();
+    }
+  }
+
+  apzc = CommonAncestor(aApzc1, aApzc2);
+  RefPtr<AsyncPanZoomController> zoomable;
+  while (apzc && !zoomable) {
+    zoomable = FindRootContentApzcForLayersId(apzc->GetLayersId());
+    apzc = GetApzcWithDifferentLayersIdByWalkingParents(apzc);
+  }
+
+  return zoomable.forget();
+}
+
+Maybe<ScreenIntPoint> APZCTreeManager::ConvertToGecko(
+    const ScreenIntPoint& aPoint, AsyncPanZoomController* aApzc) {
+  RecursiveMutexAutoLock lock(mTreeLock);
+  const HitTestResult& hit = mInputQueue->GetCurrentTouchBlock()
+                                 ? mTouchBlockHitResult
+                                 : mTapGestureHitResult;
+  AsyncTransformComponents components =
+      hit.mFixedPosSides == SideBits::eNone
+          ? LayoutAndVisual
+          : AsyncTransformComponents{AsyncTransformComponent::eVisual};
+  ScreenToScreenMatrix4x4 transformScreenToGecko =
+      GetScreenToApzcTransform(aApzc) *
+      GetApzcToGeckoTransform(aApzc, components);
+  Maybe<ScreenIntPoint> geckoPoint =
+      UntransformBy(transformScreenToGecko, aPoint);
+  if (geckoPoint) {
+    AdjustEventPointForDynamicToolbar(*geckoPoint, hit);
+  }
+  return geckoPoint;
+}
+
+already_AddRefed<AsyncPanZoomController> APZCTreeManager::CommonAncestor(
+    AsyncPanZoomController* aApzc1, AsyncPanZoomController* aApzc2) const {
+  mTreeLock.AssertCurrentThreadIn();
+  RefPtr<AsyncPanZoomController> ancestor;
+
+
+  int depth1 = 0, depth2 = 0;
+  for (AsyncPanZoomController* parent = aApzc1; parent;
+       parent = parent->GetParent()) {
+    depth1++;
+  }
+  for (AsyncPanZoomController* parent = aApzc2; parent;
+       parent = parent->GetParent()) {
+    depth2++;
+  }
+
+  int minDepth = depth1 < depth2 ? depth1 : depth2;
+  while (depth1 > minDepth) {
+    depth1--;
+    aApzc1 = aApzc1->GetParent();
+  }
+  while (depth2 > minDepth) {
+    depth2--;
+    aApzc2 = aApzc2->GetParent();
+  }
+
+  while (true) {
+    if (aApzc1 == aApzc2) {
+      ancestor = aApzc1;
+      break;
+    }
+    if (depth1 <= 0) {
+      break;
+    }
+    aApzc1 = aApzc1->GetParent();
+    aApzc2 = aApzc2->GetParent();
+  }
+  return ancestor.forget();
+}
+
+bool APZCTreeManager::IsFixedToRootContent(
+    const FixedPositionInfo& aFixedInfo,
+    const MutexAutoLock& aProofOfMapLock) const {
+  ScrollableLayerGuid::ViewID fixedTarget = aFixedInfo.mFixedPosTarget;
+  if (fixedTarget == ScrollableLayerGuid::NULL_SCROLL_ID) {
+    return false;
+  }
+  auto it =
+      mApzcMap.find(ScrollableLayerGuid(aFixedInfo.mLayersId, 0, fixedTarget));
+  if (it == mApzcMap.end()) {
+    return false;
+  }
+  RefPtr<AsyncPanZoomController> targetApzc = it->second.apzc;
+  return targetApzc && targetApzc->IsRootContent();
+}
+
+SideBits APZCTreeManager::SidesStuckToRootContent(
+    const HitTestingTreeNode* aNode, AsyncTransformConsumer aMode) const {
+  MutexAutoLock lock(mMapLock);
+  return SidesStuckToRootContent(StickyPositionInfo(aNode), aMode, lock);
+}
+
+SideBits APZCTreeManager::SidesStuckToRootContent(
+    const StickyPositionInfo& aStickyInfo, AsyncTransformConsumer aMode,
+    const MutexAutoLock& aProofOfMapLock) const {
+  SideBits result = SideBits::eNone;
+
+  ScrollableLayerGuid::ViewID stickyTarget = aStickyInfo.mStickyPosTarget;
+  if (stickyTarget == ScrollableLayerGuid::NULL_SCROLL_ID) {
+    return result;
+  }
+
+  if ((aStickyInfo.mFixedPosSides & SideBits::eTopBottom) == SideBits::eNone) {
+    return result;
+  }
+
+  auto it = mApzcMap.find(
+      ScrollableLayerGuid(aStickyInfo.mLayersId, 0, stickyTarget));
+  if (it == mApzcMap.end()) {
+    return result;
+  }
+  RefPtr<AsyncPanZoomController> stickyTargetApzc = it->second.apzc;
+  if (!stickyTargetApzc || !stickyTargetApzc->IsRootContent()) {
+    return result;
+  }
+
+  ParentLayerPoint translation =
+      stickyTargetApzc
+          ->GetCurrentAsyncTransform(
+              aMode, AsyncTransformComponents{AsyncTransformComponent::eLayout})
+          .mTranslation;
+
+  if (apz::IsStuckAtTop(translation.y, aStickyInfo.mStickyScrollRangeInner,
+                        aStickyInfo.mStickyScrollRangeOuter)) {
+    result |= SideBits::eTop;
+  }
+  if (apz::IsStuckAtBottom(translation.y, aStickyInfo.mStickyScrollRangeInner,
+                           aStickyInfo.mStickyScrollRangeOuter)) {
+    result |= SideBits::eBottom;
+  }
+  return result;
+}
+
+LayerToParentLayerMatrix4x4 APZCTreeManager::ComputeTransformForScrollThumbNode(
+    const HitTestingTreeNode* aNode) const {
+  mTreeLock.AssertCurrentThreadIn();
+  MOZ_ASSERT(aNode->IsScrollThumbNode());
+  ScrollableLayerGuid guid{aNode->GetLayersId(), 0, aNode->GetScrollTargetId()};
+  if (RefPtr<HitTestingTreeNode> scrollTargetNode =
+          GetTargetNode(guid, &ScrollableLayerGuid::EqualsIgnoringPresShell)) {
+    AsyncPanZoomController* scrollTargetApzc = scrollTargetNode->GetApzc();
+    MOZ_ASSERT(scrollTargetApzc);
+    return scrollTargetApzc->CallWithLastContentPaintMetrics(
+        [&](const FrameMetrics& aMetrics) {
+          return ComputeTransformForScrollThumb(
+              aNode->GetTransform() * AsyncTransformMatrix(),
+              scrollTargetNode->GetTransform().ToUnknownMatrix(),
+              scrollTargetApzc, aMetrics, aNode->GetScrollbarData(),
+              scrollTargetNode->IsAncestorOf(aNode));
+        });
+  }
+  return aNode->GetTransform() * AsyncTransformMatrix();
+}
+
+already_AddRefed<wr::WebRenderAPI> APZCTreeManager::GetWebRenderAPI() const {
+  RefPtr<wr::WebRenderAPI> api;
+  CompositorBridgeParent::CallWithLayerTreeState(
+      mRootLayersId,
+      [&](LayerTreeState& aState) -> void { api = aState.mWebRenderAPI; });
+  return api.forget();
+}
+
+already_AddRefed<GeckoContentController> APZCTreeManager::GetContentController(
+    LayersId aLayersId) {
+  RefPtr<GeckoContentController> controller;
+  CompositorBridgeParent::CallWithLayerTreeState(
+      aLayersId,
+      [&](LayerTreeState& aState) -> void { controller = aState.mController; });
+  return controller.forget();
+}
+
+ScreenMargin APZCTreeManager::GetCompositorFixedLayerMargins(
+    const MutexAutoLock& aProofOfMapLock) const {
+  ScreenMargin result = mCompositorFixedLayerMargins;
+  if (StaticPrefs::apz_fixed_margin_override_enabled()) {
+    result.top = StaticPrefs::apz_fixed_margin_override_top();
+    result.bottom = StaticPrefs::apz_fixed_margin_override_bottom();
+  }
+  return result;
+}
+
+
+void APZCTreeManager::SendSubtreeTransformsToChromeMainThread(
+    const AsyncPanZoomController* aAncestor) {
+  RefPtr<GeckoContentController> controller =
+      GetContentController(mRootLayersId);
+  if (!controller) {
+    return;
+  }
+  nsTArray<MatrixMessage> messages;
+  bool underAncestor = (aAncestor == nullptr);
+  bool shouldNotify = false;
+  {
+    RecursiveMutexAutoLock lock(mTreeLock);
+    if (!mRootNode) {
+      return;
+    }
+    ForEachNode<ReverseIterator>(
+        mRootNode.get(),
+        [&](HitTestingTreeNode* aNode) {
+          mTreeLock.AssertCurrentThreadIn();
+          bool atAncestor = (aAncestor && aNode->GetApzc() == aAncestor);
+          MOZ_ASSERT(!(underAncestor && atAncestor));
+          underAncestor |= atAncestor;
+          if (!underAncestor) {
+            return;
+          }
+          LayersId layersId = aNode->GetLayersId();
+          HitTestingTreeNode* parent = aNode->GetParent();
+          if (!parent) {
+            messages.AppendElement(MatrixMessage(Some(LayerToScreenMatrix4x4()),
+                                                 ScreenRect(), layersId));
+          } else if (layersId != parent->GetLayersId()) {
+            if (mDetachedLayersIds.find(layersId) != mDetachedLayersIds.end()) {
+              messages.AppendElement(
+                  MatrixMessage(Nothing(), ScreenRect(), layersId));
+            } else {
+              messages.AppendElement(MatrixMessage(
+                  Some(parent->GetTransformToGecko(layersId)),
+                  parent->GetRemoteDocumentScreenRect(layersId), layersId));
+            }
+          }
+        },
+        [&](HitTestingTreeNode* aNode) {
+          bool atAncestor = (aAncestor && aNode->GetApzc() == aAncestor);
+          if (atAncestor) {
+            MOZ_ASSERT(underAncestor);
+            underAncestor = false;
+          }
+        });
+    if (messages != mLastMessages) {
+      mLastMessages = messages;
+      shouldNotify = true;
+    }
+  }
+  if (shouldNotify) {
+    controller->NotifyLayerTransforms(std::move(messages));
+  }
+}
+
+void APZCTreeManager::SetFixedLayerMargins(ScreenIntCoord aTop,
+                                           ScreenIntCoord aBottom) {
+  {
+    MutexAutoLock lock(mMapLock);
+    mCompositorFixedLayerMargins.top = ScreenCoord(aTop);
+    mCompositorFixedLayerMargins.bottom = ScreenCoord(aBottom);
+  }
+  {
+    RecursiveMutexAutoLock lock(mTreeLock);
+    SetFixedLayerMarginsOnRootContentApzcs(lock);
+  }
+}
+
+void APZCTreeManager::SetFixedLayerMarginsOnRootContentApzcs(
+    const RecursiveMutexAutoLock& aProofOfTreeLock) {
+  ScreenMargin margins = GetCompositorFixedLayerMargins();
+  for (auto* apzc : mRootContentApzcs) {
+    apzc->SetFixedLayerMargins(margins);
+  }
+}
+
+ScreenPoint APZCTreeManager::ComputeFixedMarginsOffset(
+    const MutexAutoLock& aProofOfMapLock, SideBits aFixedSides,
+    const ScreenMargin& aGeckoFixedLayerMargins) const {
+  if (IsSoftwareKeyboardVisible(aProofOfMapLock) &&
+      InteractiveWidgetMode(aProofOfMapLock) !=
+          dom::InteractiveWidget::ResizesContent) {
+    return ScreenPoint(0, 0);
+  }
+
+  ScreenPoint translation;
+
+  ScreenMargin effectiveMargin =
+      GetCompositorFixedLayerMargins(aProofOfMapLock) - aGeckoFixedLayerMargins;
+  if (aFixedSides & SideBits::eLeft) {
+    translation.x += effectiveMargin.left;
+  } else if (aFixedSides & SideBits::eRight) {
+    translation.x -= effectiveMargin.right;
+  }
+
+  if (aFixedSides & SideBits::eTop) {
+    translation.y += effectiveMargin.top;
+  } else if (aFixedSides & SideBits::eBottom) {
+    translation.y -= effectiveMargin.bottom;
+  }
+
+  return translation;
+}
+
+LayerToParentLayerMatrix4x4 APZCTreeManager::ComputeTransformForScrollThumb(
+    const LayerToParentLayerMatrix4x4& aCurrentTransform,
+    const Matrix4x4& aScrollableContentTransform, AsyncPanZoomController* aApzc,
+    const FrameMetrics& aMetrics, const ScrollbarData& aScrollbarData,
+    bool aScrollbarIsDescendant) {
+  return apz::ComputeTransformForScrollThumb(
+      aCurrentTransform, aScrollableContentTransform, aApzc, aMetrics,
+      aScrollbarData, aScrollbarIsDescendant);
+}
+
+APZSampler* APZCTreeManager::GetSampler() const {
+  MOZ_ASSERT(mSampler);
+  return mSampler;
+}
+
+void APZCTreeManager::AssertOnSamplerThread() {
+  GetSampler()->AssertOnSamplerThread();
+}
+
+APZUpdater* APZCTreeManager::GetUpdater() const {
+  MOZ_ASSERT(mUpdater);
+  return mUpdater;
+}
+
+void APZCTreeManager::AssertOnUpdaterThread() {
+  GetUpdater()->AssertOnUpdaterThread();
+}
+
+MOZ_PUSH_IGNORE_THREAD_SAFETY
+void APZCTreeManager::LockTree() {
+  AssertOnUpdaterThread();
+  mTreeLock.Lock();
+}
+
+void APZCTreeManager::UnlockTree() {
+  AssertOnUpdaterThread();
+  mTreeLock.Unlock();
+}
+MOZ_POP_THREAD_SAFETY
+
+void APZCTreeManager::SetDPI(float aDpiValue) {
+  if (!APZThreadUtils::IsControllerThread()) {
+    APZThreadUtils::RunOnControllerThread(
+        NewRunnableMethod<float>("layers::APZCTreeManager::SetDPI", this,
+                                 &APZCTreeManager::SetDPI, aDpiValue));
+    return;
+  }
+
+  APZThreadUtils::AssertOnControllerThread();
+  mDPI = aDpiValue;
+}
+
+float APZCTreeManager::GetDPI() const {
+  APZThreadUtils::AssertOnControllerThread();
+  return mDPI;
+}
+
+void APZCTreeManager::EndWheelTransaction(
+    PWebRenderBridgeParent::EndWheelTransactionResolver&& aResolver) {
+  RefPtr<nsISerialEventTarget> controllerThread =
+      APZThreadUtils::GetControllerThread();
+  InvokeAsync(controllerThread, __func__,
+              [self = RefPtr{this}] {
+                if (WheelBlockState* txn =
+                        self->mInputQueue->GetActiveWheelTransaction()) {
+                  txn->EndTransaction();
+                }
+                return GenericPromise::CreateAndResolve(true, __func__);
+              })
+      ->Then(GetCurrentSerialEventTarget(), __func__,
+             [resolver = std::move(aResolver)](
+                 GenericPromise::ResolveOrRejectValue&&) { resolver(true); });
+}
+
+APZCTreeManager::FixedPositionInfo::FixedPositionInfo(
+    const HitTestingTreeNode* aNode) {
+  mFixedPositionAnimationId = aNode->GetFixedPositionAnimationId();
+  mFixedPosSides = aNode->GetFixedPosSides();
+  mFixedPosTarget = aNode->GetFixedPosTarget();
+  mLayersId = aNode->GetLayersId();
+}
+
+APZCTreeManager::StickyPositionInfo::StickyPositionInfo(
+    const HitTestingTreeNode* aNode) {
+  mStickyPositionAnimationId = aNode->GetStickyPositionAnimationId();
+  mFixedPosSides = aNode->GetFixedPosSides();
+  mStickyPosTarget = aNode->GetStickyPosTarget();
+  mLayersId = aNode->GetLayersId();
+  mStickyScrollRangeInner = aNode->GetStickyScrollRangeInner();
+  mStickyScrollRangeOuter = aNode->GetStickyScrollRangeOuter();
+}
+
+}  
+}  

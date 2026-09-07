@@ -1,0 +1,516 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_net_Http2Session_h
+#define mozilla_net_Http2Session_h
+
+
+#include "ASpdySession.h"
+#include "mozilla/Queue.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/WeakPtr.h"
+#include "nsAHttpConnection.h"
+#include "nsCOMArray.h"
+#include "nsRefPtrHashtable.h"
+#include "nsTHashMap.h"
+#include "nsDeque.h"
+#include "nsHashKeys.h"
+#include "nsHttpRequestHead.h"
+#include "nsICacheEntryOpenCallback.h"
+
+#include "Http2Compression.h"
+
+class nsISocketTransport;
+
+namespace mozilla {
+namespace net {
+
+class Http2PushedStream;
+class Http2StreamBase;
+class Http2StreamTunnel;
+class nsHttpTransaction;
+class nsHttpConnection;
+
+enum Http2StreamBaseType { Normal, WebSocket, Tunnel, ServerPush };
+enum class ExtendedCONNECTType : uint8_t { Proxy, WebSocket, WebTransport };
+enum class Http2StreamQueueType {
+  ReadyForWrite = 0,
+  QueuedStreams,
+  SlowConsumersReadyForRead
+};
+
+class Http2StreamQueueManager final {
+ public:
+  void AddStreamToQueue(Http2StreamQueueType aType, Http2StreamBase* aStream);
+  void RemoveStreamFromAllQueue(Http2StreamBase* aStream);
+  already_AddRefed<Http2StreamBase> GetNextStreamFromQueue(
+      Http2StreamQueueType aType);
+
+  uint32_t GetWriteQueueSize() const { return mReadyForWrite.Count(); }
+
+ private:
+  using StreamQueue = mozilla::Queue<WeakPtr<Http2StreamBase>>;
+
+  StreamQueue& GetQueue(Http2StreamQueueType aType);
+  bool GetQueueFlag(Http2StreamQueueType aType, Http2StreamBase* aStream);
+  void SetQueueFlag(Http2StreamQueueType aType, Http2StreamBase* aStream,
+                    bool value);
+
+  StreamQueue mReadyForWrite;
+  StreamQueue mQueuedStreams;
+  StreamQueue mSlowConsumersReadyForRead;
+};
+
+#define NS_HTTP2SESSION_IID \
+  {0xb23b147c, 0xc4f8, 0x4d6e, {0x84, 0x1a, 0x09, 0xf2, 0x9a, 0x01, 0x0d, 0xe7}}
+
+class Http2Session final : public ASpdySession,
+                           public nsAHttpConnection,
+                           public nsAHttpSegmentReader,
+                           public nsAHttpSegmentWriter {
+  ~Http2Session();
+
+ public:
+  NS_INLINE_DECL_STATIC_IID(NS_HTTP2SESSION_IID)
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_NSAHTTPTRANSACTION
+  NS_DECL_NSAHTTPCONNECTION(mConnection)
+  NS_DECL_NSAHTTPSEGMENTREADER
+  NS_DECL_NSAHTTPSEGMENTWRITER
+
+  static Http2Session* CreateSession(nsISocketTransport*,
+                                     enum SpdyVersion version,
+                                     bool attemptingEarlyData);
+
+  [[nodiscard]] bool AddStream(nsAHttpTransaction*, int32_t,
+                               nsIInterfaceRequestor*) override;
+
+  void SwapTransaction(nsAHttpTransaction* aOld, nsAHttpTransaction* aNew);
+  bool CanReuse() override { return !mShouldGoAway && !mClosed; }
+  bool RoomForMoreStreams() override;
+  enum SpdyVersion SpdyVersion() override;
+  bool TestJoinConnection(const nsACString& hostname, int32_t port) override;
+  bool JoinConnection(const nsACString& hostname, int32_t port) override;
+
+  uint32_t ReadTimeoutTick(PRIntervalTime now) override;
+
+  PRIntervalTime IdleTime() override;
+
+  uint32_t RegisterStreamID(Http2StreamBase*, uint32_t aNewID = 0);
+
+
+  enum FrameType {
+    FRAME_TYPE_DATA = 0x0,
+    FRAME_TYPE_HEADERS = 0x1,
+    FRAME_TYPE_PRIORITY = 0x2,
+    FRAME_TYPE_RST_STREAM = 0x3,
+    FRAME_TYPE_SETTINGS = 0x4,
+    FRAME_TYPE_PUSH_PROMISE = 0x5,
+    FRAME_TYPE_PING = 0x6,
+    FRAME_TYPE_GOAWAY = 0x7,
+    FRAME_TYPE_WINDOW_UPDATE = 0x8,
+    FRAME_TYPE_CONTINUATION = 0x9,
+    FRAME_TYPE_ALTSVC = 0xA,
+    FRAME_TYPE_UNUSED = 0xB,
+    FRAME_TYPE_ORIGIN = 0xC,
+    FRAME_TYPE_PRIORITY_UPDATE = 0x10,
+  };
+
+  enum errorType {
+    NO_HTTP_ERROR = 0,
+    PROTOCOL_ERROR = 1,
+    INTERNAL_ERROR = 2,
+    FLOW_CONTROL_ERROR = 3,
+    SETTINGS_TIMEOUT_ERROR = 4,
+    STREAM_CLOSED_ERROR = 5,
+    FRAME_SIZE_ERROR = 6,
+    REFUSED_STREAM_ERROR = 7,
+    CANCEL_ERROR = 8,
+    COMPRESSION_ERROR = 9,
+    CONNECT_ERROR = 10,
+    ENHANCE_YOUR_CALM = 11,
+    INADEQUATE_SECURITY = 12,
+    HTTP_1_1_REQUIRED = 13,
+    UNASSIGNED = 31
+  };
+
+  const static uint8_t kFlag_END_STREAM = 0x01;        
+  const static uint8_t kFlag_END_HEADERS = 0x04;       
+  const static uint8_t kFlag_END_PUSH_PROMISE = 0x04;  
+  const static uint8_t kFlag_ACK = 0x01;               
+  const static uint8_t kFlag_PADDED =
+      0x08;  
+  const static uint8_t kFlag_PRIORITY = 0x20;  
+
+  enum {
+    SETTINGS_TYPE_HEADER_TABLE_SIZE = 1,
+    SETTINGS_TYPE_ENABLE_PUSH = 2,
+    SETTINGS_TYPE_MAX_CONCURRENT = 3,
+    SETTINGS_TYPE_INITIAL_WINDOW = 4,
+    SETTINGS_TYPE_MAX_FRAME_SIZE = 5,
+    SETTINGS_TYPE_ENABLE_CONNECT_PROTOCOL = 8,
+    SETTINGS_NO_RFC7540_PRIORITIES = 9,
+    SETTINGS_WEBTRANSPORT_MAX_SESSIONS = 0x2b60,
+    SETTINGS_WEBTRANSPORT_INITIAL_MAX_DATA = 0x2b61,
+    SETTINGS_WEBTRANSPORT_INITIAL_MAX_STREAM_DATA_UNI = 0x2b62,
+    SETTINGS_WEBTRANSPORT_INITIAL_MAX_STREAM_DATA_BIDI = 0x2b63,
+    SETTINGS_WEBTRANSPORT_INITIAL_MAX_STREAMS_UNI = 0x2b64,
+    SETTINGS_WEBTRANSPORT_INITIAL_MAX_STREAMS_BIDI = 0x2b65,
+  };
+
+  const static uint32_t kDefaultBufferSize = 2048;
+
+  const static uint32_t kDefaultQueueSize = 32768;
+  const static uint32_t kQueueMinimumCleanup = 24576;
+  const static uint32_t kQueueTailRoom = 4096;
+  const static uint32_t kQueueReserved = 1024;
+
+  const static uint32_t kDeadStreamID = 0xffffdead;
+
+  const static int32_t kEmergencyWindowThreshold = 96 * 1024;
+  const static uint32_t kMinimumToAck = 4 * 1024 * 1024;
+
+  const static uint32_t kDefaultRwin = 65535;
+
+  const static uint32_t kMaxFrameData = 0x4000;
+
+  const static uint8_t kFrameLengthBytes = 3;
+  const static uint8_t kFrameStreamIDBytes = 4;
+  const static uint8_t kFrameFlagBytes = 1;
+  const static uint8_t kFrameTypeBytes = 1;
+  const static uint8_t kFrameHeaderBytes = kFrameLengthBytes + kFrameFlagBytes +
+                                           kFrameTypeBytes +
+                                           kFrameStreamIDBytes;
+
+  enum {
+    kLeaderGroupID = 0x3,
+    kOtherGroupID = 0x5,
+    kBackgroundGroupID = 0x7,
+    kSpeculativeGroupID = 0x9,
+    kFollowerGroupID = 0xB,
+    kUrgentStartGroupID = 0xD
+  };
+  const static uint8_t kPriorityGroupCount = 6;
+
+  static nsresult RecvHeaders(Http2Session*);
+  static nsresult RecvPriority(Http2Session*);
+  static nsresult RecvRstStream(Http2Session*);
+  static nsresult RecvSettings(Http2Session*);
+  static nsresult RecvPushPromise(Http2Session*);
+  static nsresult RecvPing(Http2Session*);
+  static nsresult RecvGoAway(Http2Session*);
+  static nsresult RecvWindowUpdate(Http2Session*);
+  static nsresult RecvContinuation(Http2Session*);
+  static nsresult RecvAltSvc(Http2Session*);
+  static nsresult RecvUnused(Http2Session*);
+  static nsresult RecvOrigin(Http2Session*);
+  static nsresult RecvPriorityUpdate(Http2Session*);
+
+  char* EnsureOutputBuffer(uint32_t needed);
+
+  template <typename charType>
+  void CreateFrameHeader(charType dest, uint16_t frameLength, uint8_t frameType,
+                         uint8_t frameFlags, uint32_t streamID);
+
+  static void LogIO(Http2Session*, Http2StreamBase*, const char*, const char*,
+                    uint32_t);
+
+  void TransactionHasDataToWrite(nsAHttpTransaction*) override;
+  void TransactionHasDataToRecv(nsAHttpTransaction*) override;
+
+  void TransactionHasDataToWrite(Http2StreamBase*);
+  void TransactionHasDataToRecv(Http2StreamBase* caller);
+
+  [[nodiscard]] virtual nsresult CommitToSegmentSize(
+      uint32_t count, bool forceCommitment) override;
+  [[nodiscard]] nsresult BufferOutput(const char*, uint32_t, uint32_t*);
+  void FlushOutputQueue();
+  uint32_t AmountOfOutputBuffered() {
+    return mOutputQueueUsed - mOutputQueueSent;
+  }
+
+  uint32_t GetServerInitialStreamWindow() { return mServerInitialStreamWindow; }
+
+  [[nodiscard]] bool TryToActivate(Http2StreamBase* stream);
+  void ConnectPushedStream(Http2StreamBase* stream);
+  void ConnectSlowConsumer(Http2StreamBase* stream);
+
+  [[nodiscard]] nsresult ConfirmTLSProfile();
+  [[nodiscard]] static bool ALPNCallback(nsITLSSocketControl* tlsSocketControl);
+
+  uint64_t Serial() { return mSerial; }
+
+  void PrintDiagnostics(nsCString& log) override;
+
+  uint32_t SendingChunkSize() { return mSendingChunkSize; }
+  uint32_t PushAllowance() { return mPushAllowance; }
+  Http2Compressor* Compressor() { return &mCompressor; }
+  nsISocketTransport* SocketTransport() { return mSocketTransport; }
+  int64_t ServerSessionWindow() { return mServerSessionWindow; }
+  void DecrementServerSessionWindow(uint32_t bytes) {
+    mServerSessionWindow -= bytes;
+  }
+  uint32_t InitialRwin() { return mInitialRwin; }
+
+  void SendPing() override;
+  bool UseH2Deps() { return mUseH2Deps; }
+  void SetCleanShutdown(bool) override;
+
+  [[nodiscard]] nsresult ReadSegmentsAgain(nsAHttpSegmentReader*, uint32_t,
+                                           uint32_t*, bool*) final;
+  [[nodiscard]] nsresult WriteSegmentsAgain(nsAHttpSegmentWriter*, uint32_t,
+                                            uint32_t*, bool*) final;
+  [[nodiscard]] bool Do0RTT(bool aCanSendEarlyData) final { return true; }
+  [[nodiscard]] nsresult Finish0RTT(bool aRestart, bool aAlpnChanged) final;
+
+  void Received421(nsHttpConnectionInfo* ci);
+
+  void SendPriorityFrame(uint32_t streamID, uint32_t dependsOn, uint8_t weight);
+  void IncrementTrrCounter() { mTrrStreams++; }
+
+  void SendPriorityUpdateFrame(uint32_t streamID, uint8_t urgency,
+                               bool incremental);
+
+  ExtendedCONNECTSupport GetExtendedCONNECTSupport() override;
+
+  Result<already_AddRefed<nsHttpConnection>, nsresult> CreateTunnelStream(
+      nsAHttpTransaction* aHttpTransaction, nsIInterfaceRequestor* aCallbacks,
+      PRIntervalTime aRtt, bool aIsExtendedCONNECT = false) override;
+
+  void CleanupStream(Http2StreamBase*, nsresult, errorType);
+
+ private:
+  Http2Session(nsISocketTransport*, enum SpdyVersion version,
+               bool attemptingEarlyData);
+
+  static already_AddRefed<Http2StreamTunnel> CreateTunnelStreamFromConnInfo(
+      Http2Session* session, uint64_t bcId, nsHttpConnectionInfo* connInfo,
+      ExtendedCONNECTType aType);
+
+  enum internalStateType {
+    BUFFERING_OPENING_SETTINGS,
+    BUFFERING_FRAME_HEADER,
+    BUFFERING_CONTROL_FRAME,
+    PROCESSING_DATA_FRAME_PADDING_CONTROL,
+    PROCESSING_DATA_FRAME,
+    DISCARDING_DATA_FRAME_PADDING,
+    DISCARDING_DATA_FRAME,
+    PROCESSING_COMPLETE_HEADERS,
+    PROCESSING_CONTROL_RST_STREAM,
+    NOT_USING_NETWORK
+  };
+
+  static const uint8_t kMagicHello[24];
+
+  void CreateStream(nsAHttpTransaction* aHttpTransaction, int32_t aPriority,
+                    Http2StreamBaseType streamType);
+
+  [[nodiscard]] nsresult ResponseHeadersComplete();
+  uint32_t GetWriteQueueSize();
+  void ChangeDownstreamState(enum internalStateType);
+  void ResetDownstreamState();
+  [[nodiscard]] nsresult ReadyToProcessDataFrame(enum internalStateType);
+  [[nodiscard]] nsresult UncompressAndDiscard(bool);
+  void GeneratePing(bool);
+  void GenerateSettingsAck();
+  void GenerateRstStream(uint32_t, uint32_t);
+  void GenerateGoAway(uint32_t);
+  void CleanupStream(uint32_t, nsresult, errorType);
+  void CloseStream(Http2StreamBase* aStream, nsresult aResult,
+                   bool aRemoveFromQueue = true);
+  void SendHello();
+  void RemoveStreamFromQueues(Http2StreamBase*);
+  void RemoveStreamFromTables(Http2StreamBase*);
+  [[nodiscard]] nsresult ParsePadding(uint8_t&, uint16_t&);
+
+  void SetWriteCallbacks();
+  void RealignOutputQueue();
+
+  void ProcessPending();
+  [[nodiscard]] nsresult ProcessConnectedPush(Http2StreamBase*,
+                                              nsAHttpSegmentWriter*, uint32_t,
+                                              uint32_t*);
+  [[nodiscard]] nsresult ProcessSlowConsumer(Http2StreamBase*,
+                                             nsAHttpSegmentWriter*, uint32_t,
+                                             uint32_t*);
+
+  [[nodiscard]] nsresult SetInputFrameDataStream(uint32_t);
+  void CreatePriorityNode(uint32_t, uint32_t, uint8_t, const char*);
+  char* CreatePriorityFrame(uint32_t, uint32_t, uint8_t);
+  bool VerifyStream(Http2StreamBase*, uint32_t);
+  void SetNeedsCleanup();
+
+  char* CreatePriorityUpdateFrame(uint32_t streamID, uint8_t urgency,
+                                  bool incremental);
+
+  void UpdateLocalRwin(Http2StreamBase* stream, uint32_t bytes);
+  void UpdateLocalStreamWindow(Http2StreamBase* stream, uint32_t bytes);
+  void UpdateLocalSessionWindow(uint32_t bytes);
+
+  void MaybeDecrementConcurrent(Http2StreamBase* stream);
+  uint32_t RoomForMoreConcurrent();
+  void IncrementConcurrent(Http2StreamBase* stream);
+  void QueueStream(Http2StreamBase* stream);
+
+  [[nodiscard]] nsresult NetworkRead(nsAHttpSegmentWriter*, char*, uint32_t,
+                                     uint32_t*);
+
+  void Shutdown(nsresult aReason);
+  void ShutdownStream(Http2StreamBase* aStream, nsresult aResult);
+
+  nsresult SessionError(enum errorType);
+
+  RefPtr<nsAHttpConnection> mConnection;
+
+  nsISocketTransport* mSocketTransport;
+
+  RefPtr<nsAHttpSegmentReader> mSegmentReader;
+  nsAHttpSegmentWriter* mSegmentWriter;
+  const uint32_t kMaxStreamID;
+  uint32_t mSendingChunkSize;    
+  uint32_t mNextStreamID;        
+  uint32_t mConcurrentHighWater; 
+  uint32_t mPushAllowance;       
+
+  internalStateType mDownstreamState; 
+
+  nsTHashMap<nsUint32HashKey, WeakPtr<Http2StreamBase>> mStreamIDHash;
+  nsRefPtrHashtable<nsPtrHashKey<nsAHttpTransaction>, Http2StreamBase>
+      mStreamTransactionHash;
+  nsTArray<RefPtr<Http2StreamTunnel>> mTunnelStreams;
+
+  Http2StreamQueueManager mQueueManager;
+
+  Http2Compressor mCompressor;
+  Http2Decompressor mDecompressor;
+  nsCString mDecompressBuffer;
+
+  uint32_t mInputFrameBufferSize;  
+  uint32_t mInputFrameBufferUsed;  
+  UniquePtr<char[]> mInputFrameBuffer;
+
+  uint32_t mInputFrameDataSize;
+  uint32_t mInputFrameDataRead;
+  bool mInputFrameFinal;  
+  uint8_t mInputFrameType;
+  uint8_t mInputFrameFlags;
+  uint32_t mInputFrameID;
+  uint16_t mPaddingLength;
+
+  WeakPtr<Http2StreamBase> mInputFrameDataStream;
+
+  WeakPtr<Http2StreamBase> mNeedsCleanup;
+
+  uint32_t mDownstreamRstReason;
+
+  uint32_t mExpectedHeaderID;
+  uint32_t mExpectedPushPromiseID;
+
+  nsCString mFlatHTTPResponseHeaders;
+  uint32_t mFlatHTTPResponseHeadersOut;
+
+  bool mShouldGoAway;
+
+  bool mClosed;
+
+  bool mCleanShutdown;
+
+  bool mReceivedSettings;
+
+  bool mTLSProfileConfirmed;
+
+  errorType mGoAwayReason;
+
+  int32_t mClientGoAwayReason;
+  int32_t mPeerGoAwayReason;
+
+  uint32_t mGoAwayID;
+
+  uint32_t mOutgoingGoAwayID;
+
+  uint32_t mMaxConcurrent;
+
+  uint32_t mConcurrent;
+
+  uint32_t mServerPushedResources;
+
+  uint32_t mServerInitialStreamWindow;
+
+  int64_t mLocalSessionWindow;
+
+  int64_t mServerSessionWindow;
+
+  uint32_t mInitialRwin;
+
+  uint32_t mInitialWebTransportMaxData = 0;
+  uint32_t mInitialWebTransportMaxStreamDataBidi = 0;
+  uint32_t mInitialWebTransportMaxStreamDataUnidi = 0;
+  uint32_t mInitialWebTransportMaxStreamsBidi = 0;
+  uint32_t mInitialWebTransportMaxStreamsUnidi = 0;
+
+  uint32_t mOutputQueueSize;
+  uint32_t mOutputQueueUsed;
+  uint32_t mOutputQueueSent;
+  UniquePtr<char[]> mOutputQueueBuffer;
+
+  PRIntervalTime mPingThreshold;
+  PRIntervalTime mLastReadEpoch;      
+  PRIntervalTime mLastDataReadEpoch;  
+  PRIntervalTime mPingSentEpoch;
+
+  PRIntervalTime mPreviousPingThreshold;  
+  bool mPreviousUsed;                     
+
+  nsDeque<Http2StreamBase> mGoAwayStreamsToRestart;
+
+  uint64_t mSerial;
+
+  uint32_t mAggregatedHeaderSize;
+
+  bool mWaitingForSettingsAck;
+  bool mGoAwayOnPush;
+
+  bool mUseH2Deps;
+
+  bool mAttemptingEarlyData;
+  nsTArray<WeakPtr<Http2StreamBase>> m0RTTStreams;
+  nsTArray<WeakPtr<Http2StreamBase>> mCannotDo0RTTStreams;
+
+  bool RealJoinConnection(const nsACString& hostname, int32_t port,
+                          bool justKidding);
+  bool TestOriginFrame(const nsACString& name, int32_t port);
+  bool mOriginFrameActivated;
+  nsTHashMap<nsCStringHashKey, bool> mOriginFrame;
+
+  nsTHashMap<nsCStringHashKey, bool> mJoinConnectionCache;
+
+  uint64_t mCurrentBrowserId;
+
+  uint32_t mCntActivated;
+
+  RefPtr<nsHttpTransaction> mFirstHttpTransaction;
+  bool mTlsHandshakeFinished;
+
+  bool mPeerFailedHandshake;
+
+  uint32_t mWebTransportMaxSessions = 0;
+
+  uint32_t mOngoingWebTransportSessions = 0;
+
+ private:
+  TimeStamp mLastTRRResponseTime;  
+  uint32_t mTrrStreams;
+  nsCString mTrrHost;
+
+  bool mEnableWebsockets = false;
+  bool mPeerAllowsExtendedCONNECT = false;
+
+  bool mHasTransactionWaitingForExtendedCONNECT = false;
+};
+
+}  
+}  
+
+#endif  // mozilla_net_Http2Session_h

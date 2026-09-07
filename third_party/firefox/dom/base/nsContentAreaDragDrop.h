@@ -1,0 +1,50 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsContentAreaDragDrop_h_
+#define nsContentAreaDragDrop_h_
+
+#include "nsCOMPtr.h"
+#include "nsITransferable.h"
+
+class nsIPolicyContainer;
+class nsICookieJarSettings;
+class nsPIDOMWindowOuter;
+class nsITransferable;
+class nsIContent;
+class nsIFile;
+
+namespace mozilla::dom {
+class DataTransfer;
+class Selection;
+}  
+
+class nsContentAreaDragDrop {
+ public:
+  static nsresult GetDragData(nsPIDOMWindowOuter* aWindow, nsIContent* aTarget,
+                              nsIContent* aSelectionTargetNode,
+                              bool aIsAltKeyPressed,
+                              mozilla::dom::DataTransfer* aDataTransfer,
+                              bool* aCanDrag,
+                              mozilla::dom::Selection** aSelection,
+                              nsIContent** aDragNode,
+                              nsIPolicyContainer** aPolicyContainer,
+                              nsICookieJarSettings** aCookieJarSettings);
+};
+
+class nsContentAreaDragDropDataProvider : public nsIFlavorDataProvider {
+  virtual ~nsContentAreaDragDropDataProvider() = default;
+
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIFLAVORDATAPROVIDER
+
+  nsresult SaveURIToFile(nsIURI* inSourceURI,
+                         nsIPrincipal* inTriggeringPrincipal,
+                         nsICookieJarSettings* inCookieJarSettings,
+                         nsIFile* inDestFile, nsContentPolicyType inPolicyType,
+                         bool isPrivate);
+};
+
+#endif /* nsContentAreaDragDrop_h_ */

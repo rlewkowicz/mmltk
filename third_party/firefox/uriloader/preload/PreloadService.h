@@ -1,0 +1,116 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef PreloadService_h_
+#define PreloadService_h_
+
+#include "nsIContentPolicy.h"
+#include "nsIURI.h"
+#include "nsRefPtrHashtable.h"
+#include "mozilla/PreloadHashKey.h"
+
+class nsINode;
+
+namespace mozilla {
+
+class PreloaderBase;
+
+namespace dom {
+
+class HTMLLinkElement;
+class Document;
+enum class ReferrerPolicy : uint8_t;
+
+}  
+
+class PreloadService {
+ public:
+  explicit PreloadService(dom::Document*);
+  ~PreloadService();
+
+  bool RegisterPreload(const PreloadHashKey& aKey, PreloaderBase* aPreload);
+
+  void DeregisterPreload(const PreloadHashKey& aKey);
+
+  void ClearAllPreloads();
+
+  bool PreloadExists(const PreloadHashKey& aKey);
+
+  already_AddRefed<PreloaderBase> LookupPreload(
+      const PreloadHashKey& aKey) const;
+
+  void SetSpeculationBase(nsIURI* aURI) { mSpeculationBaseURI = aURI; }
+  already_AddRefed<nsIURI> GetPreloadURI(const nsAString& aURL);
+
+  already_AddRefed<PreloaderBase> PreloadLinkElement(
+      dom::HTMLLinkElement* aLink, nsContentPolicyType aPolicyType);
+
+  void PreloadLinkHeader(nsIURI* aURI, const nsAString& aURL,
+                         nsContentPolicyType aPolicyType, const nsAString& aAs,
+                         const nsAString& aRel, const nsAString& aType,
+                         const nsAString& aNonce, const nsAString& aIntegrity,
+                         const nsAString& aSrcset, const nsAString& aSizes,
+                         const nsAString& aCORS,
+                         const nsAString& aReferrerPolicy,
+                         uint64_t aEarlyHintPreloaderId,
+                         const nsAString& aFetchPriority);
+
+  void PreloadScript(nsIURI* aURI, const nsAString& aType,
+                     const nsAString& aCharset, const nsAString& aCrossOrigin,
+                     const nsAString& aReferrerPolicy, const nsAString& aNonce,
+                     const nsAString& aFetchPriority,
+                     const nsAString& aIntegrity, bool aScriptFromHead,
+                     uint64_t aEarlyHintPreloaderId);
+
+  void PreloadImage(nsIURI* aURI, const nsAString& aCrossOrigin,
+                    const nsAString& aImageReferrerPolicy, bool aIsImgSet,
+                    uint64_t aEarlyHintPreloaderId,
+                    const nsAString& aFetchPriority);
+
+  void PreloadFont(nsIURI* aURI, const nsAString& aCrossOrigin,
+                   const nsAString& aReferrerPolicy,
+                   uint64_t aEarlyHintPreloaderId,
+                   const nsAString& aFetchPriority);
+
+  void PreloadFetch(nsIURI* aURI, const nsAString& aCrossOrigin,
+                    const nsAString& aReferrerPolicy,
+                    uint64_t aEarlyHintPreloaderId,
+                    const nsAString& aFetchPriority);
+
+  static void NotifyNodeEvent(nsINode* aNode, bool aSuccess);
+
+  void SetEarlyHintUsed() { mEarlyHintUsed = true; }
+  bool GetEarlyHintUsed() const { return mEarlyHintUsed; }
+
+ private:
+  dom::ReferrerPolicy PreloadReferrerPolicy(const nsAString& aReferrerPolicy);
+  nsIURI* BaseURIForPreload();
+
+  struct PreloadOrCoalesceResult {
+    RefPtr<PreloaderBase> mPreloader;
+    bool mAlreadyComplete;
+  };
+
+  PreloadOrCoalesceResult PreloadOrCoalesce(
+      nsIURI* aURI, const nsAString& aURL, nsContentPolicyType aPolicyType,
+      const nsAString& aAs, const nsAString& aRel, const nsAString& aType,
+      const nsAString& aCharset, const nsAString& aSrcset,
+      const nsAString& aSizes, const nsAString& aNonce,
+      const nsAString& aIntegrity, const nsAString& aCORS,
+      const nsAString& aReferrerPolicy, const nsAString& aFetchPriority,
+      bool aFromHeader, uint64_t aEarlyHintPreloaderId);
+
+ private:
+  nsRefPtrHashtable<PreloadHashKey, PreloaderBase> mPreloads;
+
+  dom::Document* mDocument;
+
+  nsCOMPtr<nsIURI> mSpeculationBaseURI;
+
+  bool mEarlyHintUsed = false;
+};
+
+}  
+
+#endif

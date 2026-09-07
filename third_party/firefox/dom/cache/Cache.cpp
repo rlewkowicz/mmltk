@@ -1,0 +1,560 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/cache/Cache.h"
+
+#include "js/Array.h"               // JS::GetArrayLength, JS::IsArrayObject
+#include "js/PropertyAndElement.h"  // JS_GetElement
+#include "mozilla/ErrorResult.h"
+#include "mozilla/Preferences.h"
+#include "mozilla/dom/CacheBinding.h"
+#include "mozilla/dom/Headers.h"
+#include "mozilla/dom/InternalResponse.h"
+#include "mozilla/dom/Promise.h"
+#include "mozilla/dom/PromiseNativeHandler.h"
+#include "mozilla/dom/Response.h"
+#include "mozilla/dom/RootedDictionary.h"
+#include "mozilla/dom/ServiceWorkerUtils.h"
+#include "mozilla/dom/WorkerPrivate.h"
+#include "mozilla/dom/cache/AutoUtils.h"
+#include "mozilla/dom/cache/CacheChild.h"
+#include "mozilla/dom/cache/CacheCommon.h"
+#include "mozilla/dom/cache/CacheWorkerRef.h"
+#include "mozilla/dom/quota/ResultExtensions.h"
+#include "nsIGlobalObject.h"
+
+namespace mozilla::dom::cache {
+
+using mozilla::ipc::PBackgroundChild;
+
+bool IsValidPutRequestURL(nsIURI* aUrl, ErrorResult& aRv) {
+  if (!TypeUtils::URLHasValidScheme(aUrl)) {
+    aRv.ThrowTypeError<MSG_INVALID_URL_SCHEME>("Request",
+                                               aUrl->GetSpecOrDefault());
+    return false;
+  }
+
+  return true;
+}
+
+bool IsValidPutRequestMethod(const Request& aRequest, ErrorResult& aRv) {
+  nsAutoCString method;
+  aRequest.GetMethod(method);
+  if (!method.LowerCaseEqualsLiteral("get")) {
+    aRv.ThrowTypeError<MSG_INVALID_REQUEST_METHOD>(method);
+    return false;
+  }
+
+  return true;
+}
+
+bool IsValidPutRequestMethod(const RequestOrUTF8String& aRequest,
+                             ErrorResult& aRv) {
+  if (!aRequest.IsRequest()) {
+    return true;
+  }
+  return IsValidPutRequestMethod(aRequest.GetAsRequest(), aRv);
+}
+
+bool IsValidPutResponseStatus(Response& aResponse, PutStatusPolicy aPolicy,
+                              ErrorResult& aRv) {
+  if ((aPolicy == PutStatusPolicy::RequireOK && !aResponse.Ok()) ||
+      aResponse.Status() == 206) {
+    nsAutoCString url;
+    aResponse.GetUrl(url);
+    aRv.ThrowTypeError<MSG_CACHE_ADD_FAILED_RESPONSE>(
+        GetEnumString(aResponse.Type()), IntToCString(aResponse.Status()), url);
+    return false;
+  }
+
+  return true;
+}
+
+class Cache::FetchHandler final : public PromiseNativeHandler {
+ public:
+  FetchHandler(SafeRefPtr<CacheWorkerRef> aWorkerRef, Cache* aCache,
+               nsTArray<SafeRefPtr<Request>>&& aRequestList, Promise* aPromise)
+      : mWorkerRef(std::move(aWorkerRef)),
+        mCache(aCache),
+        mRequestList(std::move(aRequestList)),
+        mPromise(aPromise) {
+    MOZ_ASSERT_IF(!NS_IsMainThread(), mWorkerRef);
+    MOZ_DIAGNOSTIC_ASSERT(mCache);
+    MOZ_DIAGNOSTIC_ASSERT(mPromise);
+  }
+
+  virtual void ResolvedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue,
+                                ErrorResult& aRv) override {
+    NS_ASSERT_OWNINGTHREAD(FetchHandler);
+
+    const SafeRefPtr<CacheWorkerRef> workerRef = std::move(mWorkerRef);
+
+
+    AutoTArray<RefPtr<Response>, 256> responseList;
+    responseList.SetCapacity(mRequestList.Length());
+
+    const auto failOnErr = [this](const auto) { Fail(); };
+
+    bool isArray;
+    QM_TRY(OkIf(JS::IsArrayObject(aCx, aValue, &isArray)), QM_VOID, failOnErr);
+    QM_TRY(OkIf(isArray), QM_VOID, failOnErr);
+
+    JS::Rooted<JSObject*> obj(aCx, &aValue.toObject());
+
+    uint32_t length;
+    QM_TRY(OkIf(JS::GetArrayLength(aCx, obj, &length)), QM_VOID, failOnErr);
+
+    for (uint32_t i = 0; i < length; ++i) {
+      JS::Rooted<JS::Value> value(aCx);
+
+      QM_TRY(OkIf(JS_GetElement(aCx, obj, i, &value)), QM_VOID, failOnErr);
+
+      QM_TRY(OkIf(value.isObject()), QM_VOID, failOnErr);
+
+      JS::Rooted<JSObject*> responseObj(aCx, &value.toObject());
+
+      RefPtr<Response> response;
+      QM_TRY(MOZ_TO_RESULT(UNWRAP_OBJECT(Response, responseObj, response)),
+             QM_VOID, failOnErr);
+
+      QM_TRY(OkIf(response->Type() != ResponseType::Error), QM_VOID, failOnErr);
+
+      ErrorResult errorResult;
+      if (!IsValidPutResponseStatus(*response, PutStatusPolicy::RequireOK,
+                                    errorResult)) {
+        mPromise->MaybeReject(std::move(errorResult));
+        return;
+      }
+
+      responseList.AppendElement(std::move(response));
+    }
+
+    MOZ_DIAGNOSTIC_ASSERT(mRequestList.Length() == responseList.Length());
+
+    ErrorResult result;
+    RefPtr<Promise> put =
+        mCache->PutAll(aCx, mRequestList, responseList, result);
+    result.WouldReportJSException();
+    if (NS_WARN_IF(result.Failed())) {
+      mPromise->MaybeReject(std::move(result));
+      return;
+    }
+
+    mPromise->MaybeResolve(put);
+  }
+
+  virtual void RejectedCallback(JSContext* aCx, JS::Handle<JS::Value> aValue,
+                                ErrorResult& aRv) override {
+    NS_ASSERT_OWNINGTHREAD(FetchHandler);
+    Fail();
+  }
+
+ private:
+  ~FetchHandler() = default;
+
+  void Fail() { mPromise->MaybeRejectWithTypeError<MSG_FETCH_FAILED>(); }
+
+  SafeRefPtr<CacheWorkerRef> mWorkerRef;
+  RefPtr<Cache> mCache;
+  nsTArray<SafeRefPtr<Request>> mRequestList;
+  RefPtr<Promise> mPromise;
+
+  NS_DECL_ISUPPORTS
+};
+
+NS_IMPL_ISUPPORTS0(Cache::FetchHandler)
+
+NS_IMPL_CYCLE_COLLECTING_ADDREF(mozilla::dom::cache::Cache);
+NS_IMPL_CYCLE_COLLECTING_RELEASE(mozilla::dom::cache::Cache);
+NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(mozilla::dom::cache::Cache, mGlobal);
+
+NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(Cache)
+  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
+  NS_INTERFACE_MAP_ENTRY(nsISupports)
+NS_INTERFACE_MAP_END
+
+Cache::Cache(nsIGlobalObject* aGlobal, CacheChild* aActor, Namespace aNamespace)
+    : mGlobal(aGlobal), mActor(aActor), mNamespace(aNamespace) {
+  MOZ_DIAGNOSTIC_ASSERT(mGlobal);
+  MOZ_DIAGNOSTIC_ASSERT(mActor);
+  MOZ_DIAGNOSTIC_ASSERT(mNamespace != INVALID_NAMESPACE);
+  mActor->SetListener(this);
+}
+
+bool Cache::CachesEnabled(JSContext* aCx, JSObject* aObj) {
+  if (!IsSecureContextOrObjectIsFromSecureContext(aCx, aObj)) {
+    return ServiceWorkersEnabled(aCx, aObj);
+  }
+  return true;
+}
+
+already_AddRefed<Promise> Cache::Match(JSContext* aCx,
+                                       const RequestOrUTF8String& aRequest,
+                                       const CacheQueryOptions& aOptions,
+                                       ErrorResult& aRv) {
+  if (NS_WARN_IF(!mActor)) {
+    aRv.Throw(NS_ERROR_UNEXPECTED);
+    return nullptr;
+  }
+
+  CacheChild::AutoLock actorLock(*mActor);
+
+  SafeRefPtr<InternalRequest> ir =
+      ToInternalRequest(aCx, aRequest, IgnoreBody, aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+
+  CacheQueryParams params;
+  ToCacheQueryParams(params, aOptions);
+
+  AutoChildOpArgs args(
+      this, CacheMatchArgs(CacheRequest(), params, GetOpenMode()), 1);
+
+  args.Add(*ir, IgnoreBody, IgnoreInvalidScheme, aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+
+  return ExecuteOp(args, aRv);
+}
+
+already_AddRefed<Promise> Cache::MatchAll(
+    JSContext* aCx, const Optional<RequestOrUTF8String>& aRequest,
+    const CacheQueryOptions& aOptions, ErrorResult& aRv) {
+  if (NS_WARN_IF(!mActor)) {
+    aRv.Throw(NS_ERROR_UNEXPECTED);
+    return nullptr;
+  }
+
+  CacheChild::AutoLock actorLock(*mActor);
+
+  CacheQueryParams params;
+  ToCacheQueryParams(params, aOptions);
+
+  AutoChildOpArgs args(this,
+                       CacheMatchAllArgs(Nothing(), params, GetOpenMode()), 1);
+
+  if (aRequest.WasPassed()) {
+    SafeRefPtr<InternalRequest> ir =
+        ToInternalRequest(aCx, aRequest.Value(), IgnoreBody, aRv);
+    if (aRv.Failed()) {
+      return nullptr;
+    }
+
+    args.Add(*ir, IgnoreBody, IgnoreInvalidScheme, aRv);
+    if (aRv.Failed()) {
+      return nullptr;
+    }
+  }
+
+  return ExecuteOp(args, aRv);
+}
+
+already_AddRefed<Promise> Cache::Add(JSContext* aContext,
+                                     const RequestOrUTF8String& aRequest,
+                                     CallerType aCallerType, ErrorResult& aRv) {
+  if (NS_WARN_IF(!mActor)) {
+    aRv.Throw(NS_ERROR_UNEXPECTED);
+    return nullptr;
+  }
+
+  CacheChild::AutoLock actorLock(*mActor);
+
+  if (!IsValidPutRequestMethod(aRequest, aRv)) {
+    return nullptr;
+  }
+
+  GlobalObject global(aContext, mGlobal->GetGlobalJSObject());
+  MOZ_DIAGNOSTIC_ASSERT(!global.Failed());
+
+  nsTArray<SafeRefPtr<Request>> requestList(1);
+  RootedDictionary<RequestInit> requestInit(aContext);
+  SafeRefPtr<Request> request =
+      Request::Constructor(global, aRequest, requestInit, aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+
+  SafeRefPtr<InternalRequest> ireq = request->GetInternalRequest();
+  if (NS_WARN_IF(!IsValidPutRequestURL(ireq->GetURLWithoutFragment(), aRv))) {
+    return nullptr;
+  }
+
+  requestList.AppendElement(std::move(request));
+  return AddAll(global, std::move(requestList), aCallerType, aRv);
+}
+
+already_AddRefed<Promise> Cache::AddAll(
+    JSContext* aContext,
+    const Sequence<OwningRequestOrUTF8String>& aRequestList,
+    CallerType aCallerType, ErrorResult& aRv) {
+  if (NS_WARN_IF(!mActor)) {
+    aRv.Throw(NS_ERROR_UNEXPECTED);
+    return nullptr;
+  }
+
+  CacheChild::AutoLock actorLock(*mActor);
+
+  GlobalObject global(aContext, mGlobal->GetGlobalJSObject());
+  MOZ_DIAGNOSTIC_ASSERT(!global.Failed());
+
+  nsTArray<SafeRefPtr<Request>> requestList(aRequestList.Length());
+  for (uint32_t i = 0; i < aRequestList.Length(); ++i) {
+    RequestOrUTF8String requestOrString;
+
+    if (aRequestList[i].IsRequest()) {
+      requestOrString.SetAsRequest() = aRequestList[i].GetAsRequest();
+      if (NS_WARN_IF(
+              !IsValidPutRequestMethod(requestOrString.GetAsRequest(), aRv))) {
+        return nullptr;
+      }
+    } else {
+      requestOrString.SetAsUTF8String() = aRequestList[i].GetAsUTF8String();
+    }
+
+    RootedDictionary<RequestInit> requestInit(aContext);
+    SafeRefPtr<Request> request =
+        Request::Constructor(global, requestOrString, requestInit, aRv);
+    if (NS_WARN_IF(aRv.Failed())) {
+      return nullptr;
+    }
+
+    SafeRefPtr<InternalRequest> ireq = request->GetInternalRequest();
+    if (NS_WARN_IF(!IsValidPutRequestURL(ireq->GetURLWithoutFragment(), aRv))) {
+      return nullptr;
+    }
+
+    requestList.AppendElement(std::move(request));
+  }
+
+  return AddAll(global, std::move(requestList), aCallerType, aRv);
+}
+
+already_AddRefed<Promise> Cache::Put(JSContext* aCx,
+                                     const RequestOrUTF8String& aRequest,
+                                     Response& aResponse, ErrorResult& aRv) {
+  if (NS_WARN_IF(!mActor)) {
+    aRv.Throw(NS_ERROR_UNEXPECTED);
+    return nullptr;
+  }
+
+  CacheChild::AutoLock actorLock(*mActor);
+
+  if (NS_WARN_IF(!IsValidPutRequestMethod(aRequest, aRv))) {
+    return nullptr;
+  }
+
+  if (!IsValidPutResponseStatus(aResponse, PutStatusPolicy::Default, aRv)) {
+    return nullptr;
+  }
+
+  if (NS_WARN_IF(aResponse.GetPrincipalInfo() &&
+                 aResponse.GetPrincipalInfo()->type() ==
+                     mozilla::ipc::PrincipalInfo::TExpandedPrincipalInfo)) {
+    aRv.ThrowSecurityError("Disallowed on WebExtension ContentScript Request");
+    return nullptr;
+  }
+
+  SafeRefPtr<InternalRequest> ir =
+      ToInternalRequest(aCx, aRequest, ReadBody, aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+
+  AutoChildOpArgs args(this, CachePutAllArgs(), 1);
+
+  args.Add(aCx, *ir, ReadBody, TypeErrorOnInvalidScheme, aResponse, aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+
+  return ExecuteOp(args, aRv);
+}
+
+already_AddRefed<Promise> Cache::Delete(JSContext* aCx,
+                                        const RequestOrUTF8String& aRequest,
+                                        const CacheQueryOptions& aOptions,
+                                        ErrorResult& aRv) {
+  if (NS_WARN_IF(!mActor)) {
+    aRv.Throw(NS_ERROR_UNEXPECTED);
+    return nullptr;
+  }
+
+  CacheChild::AutoLock actorLock(*mActor);
+
+  SafeRefPtr<InternalRequest> ir =
+      ToInternalRequest(aCx, aRequest, IgnoreBody, aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+
+  CacheQueryParams params;
+  ToCacheQueryParams(params, aOptions);
+
+  AutoChildOpArgs args(this, CacheDeleteArgs(CacheRequest(), params), 1);
+
+  args.Add(*ir, IgnoreBody, IgnoreInvalidScheme, aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+
+  return ExecuteOp(args, aRv);
+}
+
+already_AddRefed<Promise> Cache::Keys(
+    JSContext* aCx, const Optional<RequestOrUTF8String>& aRequest,
+    const CacheQueryOptions& aOptions, ErrorResult& aRv) {
+  if (NS_WARN_IF(!mActor)) {
+    aRv.Throw(NS_ERROR_UNEXPECTED);
+    return nullptr;
+  }
+
+  CacheChild::AutoLock actorLock(*mActor);
+
+  CacheQueryParams params;
+  ToCacheQueryParams(params, aOptions);
+
+  AutoChildOpArgs args(this, CacheKeysArgs(Nothing(), params, GetOpenMode()),
+                       1);
+
+  if (aRequest.WasPassed()) {
+    SafeRefPtr<InternalRequest> ir =
+        ToInternalRequest(aCx, aRequest.Value(), IgnoreBody, aRv);
+    if (NS_WARN_IF(aRv.Failed())) {
+      return nullptr;
+    }
+
+    args.Add(*ir, IgnoreBody, IgnoreInvalidScheme, aRv);
+    if (NS_WARN_IF(aRv.Failed())) {
+      return nullptr;
+    }
+  }
+
+  return ExecuteOp(args, aRv);
+}
+
+nsISupports* Cache::GetParentObject() const { return mGlobal; }
+
+JSObject* Cache::WrapObject(JSContext* aContext,
+                            JS::Handle<JSObject*> aGivenProto) {
+  return Cache_Binding::Wrap(aContext, this, aGivenProto);
+}
+
+void Cache::OnActorDestroy(CacheChild* aActor) {
+  MOZ_DIAGNOSTIC_ASSERT(mActor);
+  MOZ_DIAGNOSTIC_ASSERT(mActor == aActor);
+  mActor->ClearListener();
+  mActor = nullptr;
+}
+
+nsIGlobalObject* Cache::GetGlobalObject() const { return mGlobal; }
+
+#ifdef DEBUG
+void Cache::AssertOwningThread() const { NS_ASSERT_OWNINGTHREAD(Cache); }
+#endif
+
+Cache::~Cache() {
+  NS_ASSERT_OWNINGTHREAD(Cache);
+  if (mActor) {
+    mActor->StartDestroyFromListener();
+    MOZ_DIAGNOSTIC_ASSERT(!mActor);
+  }
+}
+
+already_AddRefed<Promise> Cache::ExecuteOp(AutoChildOpArgs& aOpArgs,
+                                           ErrorResult& aRv) {
+  MOZ_DIAGNOSTIC_ASSERT(mActor);
+
+  RefPtr<Promise> promise = Promise::Create(mGlobal, aRv);
+  if (NS_WARN_IF(!promise)) {
+    return nullptr;
+  }
+
+  mActor->ExecuteOp(mGlobal, promise, this, aOpArgs.SendAsOpArgs());
+  return promise.forget();
+}
+
+already_AddRefed<Promise> Cache::AddAll(
+    const GlobalObject& aGlobal, nsTArray<SafeRefPtr<Request>>&& aRequestList,
+    CallerType aCallerType, ErrorResult& aRv) {
+  MOZ_DIAGNOSTIC_ASSERT(mActor);
+
+  if (aRequestList.IsEmpty()) {
+    RefPtr<Promise> promise = Promise::Create(mGlobal, aRv);
+    if (NS_WARN_IF(!promise)) {
+      return nullptr;
+    }
+
+    promise->MaybeResolveWithUndefined();
+    return promise.forget();
+  }
+
+  AutoTArray<RefPtr<Promise>, 256> fetchList;
+  fetchList.SetCapacity(aRequestList.Length());
+
+
+  for (uint32_t i = 0; i < aRequestList.Length(); ++i) {
+    RequestOrUTF8String requestOrString;
+    requestOrString.SetAsRequest() = aRequestList[i].unsafeGetRawPtr();
+    RootedDictionary<RequestInit> requestInit(aGlobal.Context());
+    RefPtr<Promise> fetch =
+        FetchRequest(mGlobal, requestOrString, requestInit, aCallerType, aRv);
+    if (NS_WARN_IF(aRv.Failed())) {
+      return nullptr;
+    }
+
+    fetchList.AppendElement(std::move(fetch));
+  }
+
+  RefPtr<Promise> promise = Promise::Create(mGlobal, aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+
+  RefPtr<FetchHandler> handler =
+      new FetchHandler(mActor->GetWorkerRefPtr().clonePtr(), this,
+                       std::move(aRequestList), promise);
+
+  RefPtr<Promise> fetchPromise =
+      Promise::All(aGlobal.Context(), fetchList, aRv);
+  if (NS_WARN_IF(aRv.Failed())) {
+    return nullptr;
+  }
+  fetchPromise->AppendNativeHandler(handler);
+
+  return promise.forget();
+}
+
+already_AddRefed<Promise> Cache::PutAll(
+    JSContext* aCx, const nsTArray<SafeRefPtr<Request>>& aRequestList,
+    const nsTArray<RefPtr<Response>>& aResponseList, ErrorResult& aRv) {
+  MOZ_DIAGNOSTIC_ASSERT(aRequestList.Length() == aResponseList.Length());
+
+  if (NS_WARN_IF(!mActor)) {
+    aRv.Throw(NS_ERROR_UNEXPECTED);
+    return nullptr;
+  }
+
+  CacheChild::AutoLock actorLock(*mActor);
+
+  AutoChildOpArgs args(this, CachePutAllArgs(), aRequestList.Length());
+
+  for (uint32_t i = 0; i < aRequestList.Length(); ++i) {
+    SafeRefPtr<InternalRequest> ir = aRequestList[i]->GetInternalRequest();
+    args.Add(aCx, *ir, ReadBody, TypeErrorOnInvalidScheme, *aResponseList[i],
+             aRv);
+    if (NS_WARN_IF(aRv.Failed())) {
+      return nullptr;
+    }
+  }
+
+  return ExecuteOp(args, aRv);
+}
+
+OpenMode Cache::GetOpenMode() const {
+  return mNamespace == CHROME_ONLY_NAMESPACE ? OpenMode::Eager : OpenMode::Lazy;
+}
+
+}  

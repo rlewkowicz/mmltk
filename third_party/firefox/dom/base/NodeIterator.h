@@ -1,0 +1,76 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_dom_NodeIterator_h
+#define mozilla_dom_NodeIterator_h
+
+#include "nsCycleCollectionParticipant.h"
+#include "nsStubMutationObserver.h"
+#include "nsTraversal.h"
+
+class nsINode;
+
+namespace mozilla::dom {
+
+class NodeIterator final : public nsStubMutationObserver, public nsTraversal {
+ public:
+  NS_DECL_CYCLE_COLLECTING_ISUPPORTS_FINAL
+
+  NodeIterator(nsINode* aRoot, uint32_t aWhatToShow, NodeFilter* aFilter);
+
+  NS_DECL_NSIMUTATIONOBSERVER_CONTENTREMOVED
+
+  NS_DECL_CYCLE_COLLECTION_CLASS(NodeIterator)
+
+  nsINode* Root() const { return mRoot; }
+  nsINode* GetReferenceNode() const { return mPointer.mNode; }
+  bool PointerBeforeReferenceNode() const { return mPointer.mBeforeNode; }
+  uint32_t WhatToShow() const { return mWhatToShow; }
+  NodeFilter* GetFilter() { return mFilter; }
+  already_AddRefed<nsINode> NextNode(ErrorResult& aResult) {
+    return NextOrPrevNode(&NodePointer::MoveToNext, aResult);
+  }
+  already_AddRefed<nsINode> PreviousNode(ErrorResult& aResult) {
+    return NextOrPrevNode(&NodePointer::MoveToPrevious, aResult);
+  }
+  void Detach();
+
+  bool WrapObject(JSContext* cx, JS::Handle<JSObject*> aGivenProto,
+                  JS::MutableHandle<JSObject*> aReflector);
+
+ private:
+  ~NodeIterator();
+
+  struct NodePointer {
+    NodePointer() : mNode(nullptr), mBeforeNode(false) {}
+    NodePointer(nsINode* aNode, bool aBeforeNode);
+
+    typedef bool (NodePointer::*MoveToMethodType)(nsINode*);
+    bool MoveToNext(nsINode* aRoot);
+    bool MoveToPrevious(nsINode* aRoot);
+
+    bool MoveForward(nsINode* aRoot, nsINode* aNode);
+    void MoveBackward(nsINode* aParent, nsINode* aNode);
+
+    void AdjustForRemoval(nsINode* aRoot, nsINode* aContainer,
+                          nsIContent* aChild);
+
+    void Clear() { mNode = nullptr; }
+
+    nsINode* mNode;
+    bool mBeforeNode;
+  };
+
+  already_AddRefed<nsINode> NextOrPrevNode(NodePointer::MoveToMethodType aMove,
+                                           ErrorResult& aResult);
+
+  NodePointer mPointer;
+  NodePointer mWorkingPointer;
+};
+
+}  
+
+#endif  // mozilla_dom_NodeIterator_h

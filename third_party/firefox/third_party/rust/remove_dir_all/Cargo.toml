@@ -1,0 +1,11 @@
+
+[package]
+name = "remove_dir_all"
+version = "0.5.3"
+authors = ["Aaronepower <theaaronepower@gmail.com>"]
+include = ["Cargo.toml", "LICENCE-APACHE", "LICENCE-MIT", "src/**/*", "README.md"]
+description = "Linux directory-tree removal"
+keywords = ["utility", "filesystem", "remove_dir", "linux"]
+categories = ["filesystem"]
+license = "MIT/Apache-2.0"
+repository = "https://github.com/XAMPPRocky/remove_dir_all.git"

@@ -1,0 +1,61 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef js_RegExp_h
+#define js_RegExp_h
+
+#include <stddef.h>  // size_t
+
+#include "jstypes.h"  // JS_PUBLIC_API
+
+#include "js/RegExpFlags.h"  // JS::RegExpFlags
+#include "js/TypeDecls.h"
+
+struct JS_PUBLIC_API JSContext;
+class JS_PUBLIC_API JSString;
+
+namespace JS {
+
+extern JS_PUBLIC_API JSObject* NewRegExpObject(JSContext* cx, const char* bytes,
+                                               size_t length,
+                                               RegExpFlags flags);
+
+extern JS_PUBLIC_API JSObject* NewUCRegExpObject(JSContext* cx,
+                                                 const char16_t* chars,
+                                                 size_t length,
+                                                 RegExpFlags flags);
+
+extern JS_PUBLIC_API bool SetRegExpInput(JSContext* cx, Handle<JSObject*> obj,
+                                         Handle<JSString*> input);
+
+extern JS_PUBLIC_API bool ClearRegExpStatics(JSContext* cx,
+                                             Handle<JSObject*> obj);
+
+extern JS_PUBLIC_API bool ExecuteRegExp(JSContext* cx, Handle<JSObject*> obj,
+                                        Handle<JSObject*> reobj,
+                                        const char16_t* chars, size_t length,
+                                        size_t* indexp, bool test,
+                                        MutableHandle<Value> rval);
+
+extern JS_PUBLIC_API bool ExecuteRegExpNoStatics(
+    JSContext* cx, Handle<JSObject*> reobj, const char16_t* chars,
+    size_t length, size_t* indexp, bool test, MutableHandle<Value> rval);
+
+extern JS_PUBLIC_API bool ObjectIsRegExp(JSContext* cx, Handle<JSObject*> obj,
+                                         bool* isRegExp);
+
+extern JS_PUBLIC_API RegExpFlags GetRegExpFlags(JSContext* cx,
+                                                Handle<JSObject*> obj);
+
+extern JS_PUBLIC_API JSString* GetRegExpSource(JSContext* cx,
+                                               Handle<JSObject*> obj);
+extern JS_PUBLIC_API bool CheckRegExpSyntax(JSContext* cx,
+                                            const char16_t* chars,
+                                            size_t length, RegExpFlags flags,
+                                            MutableHandle<Value> error);
+
+}  
+
+#endif  // js_RegExp_h

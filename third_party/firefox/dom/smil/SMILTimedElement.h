@@ -1,0 +1,305 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SMIL_SMILTIMEDELEMENT_H_
+#define DOM_SMIL_SMILTIMEDELEMENT_H_
+
+#include <limits>
+#include <memory>
+#include <utility>
+
+#include "mozilla/EventForwards.h"
+#include "mozilla/SMILInstanceTime.h"
+#include "mozilla/SMILInterval.h"
+#include "mozilla/SMILMilestone.h"
+#include "mozilla/SMILRepeatCount.h"
+#include "mozilla/SMILTimeValueSpec.h"
+#include "mozilla/SMILTypes.h"
+#include "nsAttrValue.h"
+#include "nsHashKeys.h"
+#include "nsTArray.h"
+#include "nsTHashtable.h"
+
+class nsAtom;
+
+namespace mozilla {
+
+class SMILAnimationFunction;
+class SMILTimeContainer;
+class SMILTimeValue;
+
+namespace dom {
+class SVGAnimationElement;
+}  
+
+
+class SMILTimedElement {
+ public:
+  SMILTimedElement();
+  ~SMILTimedElement();
+
+  using Element = dom::Element;
+
+  void SetAnimationElement(mozilla::dom::SVGAnimationElement* aElement);
+
+  SMILTimeContainer* GetTimeContainer();
+
+  Element* GetTargetElement();
+
+
+  nsresult BeginElementAt(double aOffsetSeconds);
+
+  nsresult EndElementAt(double aOffsetSeconds);
+
+
+  SMILTimeValue GetStartTime() const;
+
+  SMILTimeValue GetSimpleDuration() const { return mSimpleDur; }
+
+
+
+  SMILTimeValue GetHyperlinkTime() const;
+
+  void AddInstanceTime(SMILInstanceTime* aInstanceTime, bool aIsBegin);
+
+  void UpdateInstanceTime(SMILInstanceTime* aInstanceTime,
+                          SMILTimeValue& aUpdatedTime, bool aIsBegin);
+
+  void RemoveInstanceTime(SMILInstanceTime* aInstanceTime, bool aIsBegin);
+
+  void RemoveInstanceTimesForCreator(const SMILTimeValueSpec* aCreator,
+                                     bool aIsBegin);
+
+  void SetTimeClient(SMILAnimationFunction* aClient);
+
+  void SampleAt(SMILTime aContainerTime);
+
+  void SampleEndAt(SMILTime aContainerTime);
+
+  void HandleContainerTimeChange();
+
+  void Rewind();
+
+  bool SetIsDisabled(bool aIsDisabled);
+
+  bool SetAttr(nsAtom* aAttribute, const nsAString& aValue,
+               nsAttrValue& aResult, Element& aContextElement,
+               nsresult* aParseResult = nullptr);
+
+  bool UnsetAttr(nsAtom* aAttribute);
+
+  void AddDependent(SMILTimeValueSpec& aDependent);
+
+  void RemoveDependent(SMILTimeValueSpec& aDependent);
+
+  bool IsTimeDependent(const SMILTimedElement& aOther) const;
+
+  void BindToTree(Element& aContextElement);
+
+  void HandleTargetElementChange(Element* aNewTarget);
+
+  void DissolveReferences() { Unlink(); }
+
+  void Traverse(nsCycleCollectionTraversalCallback* aCallback);
+  void Unlink();
+
+  using RemovalTestFunction = bool (*)(SMILInstanceTime* aInstance);
+
+ protected:
+  using TimeValueSpecList = nsTArray<std::unique_ptr<SMILTimeValueSpec>>;
+  using InstanceTimeList = nsTArray<RefPtr<SMILInstanceTime>>;
+  using IntervalList = nsTArray<std::unique_ptr<SMILInterval>>;
+  using TimeValueSpecPtrKey = nsPtrHashKey<SMILTimeValueSpec>;
+  using TimeValueSpecHashSet = nsTHashtable<TimeValueSpecPtrKey>;
+
+  class InstanceTimeComparator {
+   public:
+    bool Equals(const SMILInstanceTime* aElem1,
+                const SMILInstanceTime* aElem2) const;
+    bool LessThan(const SMILInstanceTime* aElem1,
+                  const SMILInstanceTime* aElem2) const;
+  };
+
+  template <class TestFunctor>
+  void RemoveInstanceTimes(InstanceTimeList& aArray, TestFunctor& aTest);
+
+
+  nsresult SetBeginSpec(const nsAString& aBeginSpec, Element& aContextElement,
+                        RemovalTestFunction aRemove);
+  nsresult SetEndSpec(const nsAString& aEndSpec, Element& aContextElement,
+                      RemovalTestFunction aRemove);
+  nsresult SetSimpleDuration(const nsAString& aDurSpec);
+  nsresult SetMin(const nsAString& aMinSpec);
+  nsresult SetMax(const nsAString& aMaxSpec);
+  nsresult SetRestart(const nsAString& aRestartSpec);
+  nsresult SetRepeatCount(const nsAString& aRepeatCountSpec);
+  nsresult SetRepeatDur(const nsAString& aRepeatDurSpec);
+  nsresult SetFillMode(const nsAString& aFillModeSpec);
+
+  void UnsetBeginSpec(RemovalTestFunction aRemove);
+  void UnsetEndSpec(RemovalTestFunction aRemove);
+  void UnsetSimpleDuration();
+  void UnsetMin();
+  void UnsetMax();
+  void UnsetRestart();
+  void UnsetRepeatCount();
+  void UnsetRepeatDur();
+  void UnsetFillMode();
+
+  nsresult SetBeginOrEndSpec(const nsAString& aSpec, Element& aContextElement,
+                             bool aIsBegin, RemovalTestFunction aRemove);
+  void ClearSpecs(TimeValueSpecList& aSpecs, InstanceTimeList& aInstances,
+                  RemovalTestFunction aRemove);
+  void ClearIntervals();
+  void DoSampleAt(SMILTime aContainerTime, bool aEndOnly);
+
+  bool ApplyEarlyEnd(const SMILTimeValue& aSampleTime);
+
+  void Reset();
+
+  void ClearTimingState(RemovalTestFunction aRemove);
+
+  void RebuildTimingState(RemovalTestFunction aRemove);
+
+  void DoPostSeek();
+
+  void UnpreserveInstanceTimes(InstanceTimeList& aList);
+
+  void FilterHistory();
+
+  void FilterIntervals();
+  void FilterInstanceTimes(InstanceTimeList& aList);
+
+  bool GetNextInterval(const SMILInterval* aPrevInterval,
+                       const SMILInterval* aReplacedInterval,
+                       const SMILInstanceTime* aFixedBeginTime,
+                       SMILInterval& aResult) const;
+  SMILInstanceTime* GetNextGreater(const InstanceTimeList& aList,
+                                   const SMILTimeValue& aBase,
+                                   int32_t& aPosition) const;
+  SMILInstanceTime* GetNextGreaterOrEqual(const InstanceTimeList& aList,
+                                          const SMILTimeValue& aBase,
+                                          int32_t& aPosition) const;
+  SMILTimeValue CalcActiveEnd(const SMILTimeValue& aBegin,
+                              const SMILTimeValue& aEnd) const;
+  SMILTimeValue GetRepeatDuration() const;
+  SMILTimeValue ApplyMinAndMax(const SMILTimeValue& aDuration) const;
+  SMILTime ActiveTimeToSimpleTime(SMILTime aActiveTime,
+                                  uint32_t& aRepeatIteration);
+  SMILInstanceTime* CheckForEarlyEnd(const SMILTimeValue& aContainerTime) const;
+  void UpdateCurrentInterval(bool aForceChangeNotice = false);
+  void SampleSimpleTime(SMILTime aActiveTime);
+  void SampleFillValue();
+  void AddInstanceTimeFromCurrentTime(SMILTime aCurrentTime,
+                                      double aOffsetSeconds, bool aIsBegin);
+  void RegisterMilestone();
+  bool GetNextMilestone(SMILMilestone& aNextMilestone) const;
+
+  void NotifyNewInterval();
+  void NotifyChangedInterval(SMILInterval* aInterval, bool aBeginObjectChanged,
+                             bool aEndObjectChanged);
+
+  void FireTimeEventAsync(EventMessage aMsg, int32_t aDetail);
+  const SMILInstanceTime* GetEffectiveBeginInstance() const;
+  const SMILInterval* GetPreviousInterval() const;
+  bool HasPlayed() const { return !mOldIntervals.IsEmpty(); }
+  bool HasClientInFillRange() const;
+  bool EndHasEventConditions() const;
+  bool AreEndTimesDependentOn(const SMILInstanceTime* aBase) const;
+
+  void ResetCurrentInterval() {
+    if (mCurrentInterval) {
+      auto interval = std::move(mCurrentInterval);
+      interval->Unlink();
+    }
+  }
+
+  dom::SVGAnimationElement* mAnimationElement = nullptr;  
+  SMILAnimationFunction* mClient = nullptr;
+  std::unique_ptr<SMILInterval> mCurrentInterval;
+  TimeValueSpecList mBeginSpecs;  
+  TimeValueSpecList mEndSpecs;    
+
+  SMILTimeValue mSimpleDur;
+
+  SMILRepeatCount mRepeatCount;
+  SMILTimeValue mRepeatDur;
+
+  SMILTimeValue mMin = SMILTimeValue::Zero();
+  SMILTimeValue mMax;
+
+  SMILMilestone mPrevRegisteredMilestone = sMaxMilestone;
+
+  TimeValueSpecHashSet mTimeDependents;
+
+  InstanceTimeList mBeginInstances;
+  InstanceTimeList mEndInstances;
+  IntervalList mOldIntervals;
+  uint32_t mInstanceSerialIndex = 0;
+
+  uint32_t mCurrentRepeatIteration = 0;
+  static constexpr SMILMilestone sMaxMilestone = {
+      std::numeric_limits<SMILTime>::max(), false};
+
+  static constexpr uint8_t sMaxNumIntervals = 20;
+  static constexpr uint8_t sMaxNumInstanceTimes = 100;
+
+  enum class SMILFillMode : uint8_t { Remove, Freeze };
+  SMILFillMode mFillMode = SMILFillMode::Remove;
+  static constexpr nsAttrValue::EnumTableEntry sFillModeTable[] = {
+      {"remove", SMILFillMode::Remove},
+      {"freeze", SMILFillMode::Freeze},
+  };
+
+  enum class SMILRestartMode : uint8_t { Always, WhenNotActive, Never };
+  SMILRestartMode mRestartMode = SMILRestartMode::Always;
+  static constexpr nsAttrValue::EnumTableEntry sRestartModeTable[] = {
+      {"always", SMILRestartMode::Always},
+      {"whenNotActive", SMILRestartMode::WhenNotActive},
+      {"never", SMILRestartMode::Never},
+  };
+
+  enum class SMILElementState : uint8_t {
+    Startup,
+    Waiting,
+    Active,
+    PostActive
+  };
+  SMILElementState mElementState = SMILElementState::Startup;
+
+  enum class SMILSeekState : uint8_t {
+    NotSeeking,
+    ForwardFromActive,
+    ForwardFromInactive,
+    BackwardFromActive,
+    BackwardFromInactive
+  };
+  SMILSeekState mSeekState = SMILSeekState::NotSeeking;
+
+  class AutoIntervalUpdateBatcher;
+  bool mDeferIntervalUpdates : 1 = false;
+
+  bool mDoDeferredUpdate : 1 = false;
+  bool mIsDisabled : 1 = false;
+
+  class AutoIntervalUpdater;
+
+  uint8_t mDeleteCount = 0;
+  uint8_t mUpdateIntervalRecursionDepth = 0;
+  static constexpr uint8_t sMaxUpdateIntervalRecursionDepth = 20;
+};
+
+inline void ImplCycleCollectionUnlink(SMILTimedElement& aField) {
+  aField.Unlink();
+}
+
+inline void ImplCycleCollectionTraverse(
+    nsCycleCollectionTraversalCallback& aCallback, SMILTimedElement& aField,
+    const char* aName, uint32_t aFlags = 0) {
+  aField.Traverse(&aCallback);
+}
+
+}  
+
+#endif  // DOM_SMIL_SMILTIMEDELEMENT_H_

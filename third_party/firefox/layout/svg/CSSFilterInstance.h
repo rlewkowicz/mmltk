@@ -1,0 +1,71 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef LAYOUT_SVG_CSSFILTERINSTANCE_H_
+#define LAYOUT_SVG_CSSFILTERINSTANCE_H_
+
+#include "FilterSupport.h"
+#include "gfxMatrix.h"
+#include "gfxRect.h"
+#include "mozilla/ServoStyleConsts.h"
+#include "mozilla/gfx/Point.h"
+#include "mozilla/gfx/Types.h"
+#include "nsColor.h"
+
+namespace mozilla {
+
+class CSSFilterInstance {
+  using sRGBColor = gfx::sRGBColor;
+  using FilterPrimitiveDescription = gfx::FilterPrimitiveDescription;
+  using IntPoint = gfx::IntPoint;
+  using Size = gfx::Size;
+
+ public:
+  CSSFilterInstance(const StyleFilter& aFilter, nscolor aShadowFallbackColor,
+                    const nsIntRect& aTargetBoundsInFilterSpace,
+                    const gfxMatrix& aFrameSpaceInCSSPxToFilterSpaceTransform);
+
+  nsresult BuildPrimitives(
+      nsTArray<FilterPrimitiveDescription>& aPrimitiveDescrs,
+      bool aInputIsTainted);
+
+ private:
+  FilterPrimitiveDescription CreatePrimitiveDescription(
+      const nsTArray<FilterPrimitiveDescription>& aPrimitiveDescrs,
+      bool aInputIsTainted);
+
+  nsresult SetAttributesForBlur(FilterPrimitiveDescription& aDescr);
+  nsresult SetAttributesForBrightness(FilterPrimitiveDescription& aDescr);
+  nsresult SetAttributesForContrast(FilterPrimitiveDescription& aDescr);
+  nsresult SetAttributesForDropShadow(FilterPrimitiveDescription& aDescr);
+  nsresult SetAttributesForGrayscale(FilterPrimitiveDescription& aDescr);
+  nsresult SetAttributesForHueRotate(FilterPrimitiveDescription& aDescr);
+  nsresult SetAttributesForInvert(FilterPrimitiveDescription& aDescr);
+  nsresult SetAttributesForOpacity(FilterPrimitiveDescription& aDescr);
+  nsresult SetAttributesForSaturate(FilterPrimitiveDescription& aDescr);
+  nsresult SetAttributesForSepia(FilterPrimitiveDescription& aDescr);
+
+  int32_t GetLastResultIndex(
+      const nsTArray<FilterPrimitiveDescription>& aPrimitiveDescrs);
+
+  void SetBounds(FilterPrimitiveDescription& aDescr,
+                 const nsTArray<FilterPrimitiveDescription>& aPrimitiveDescrs);
+
+  Size BlurRadiusToFilterSpace(nscoord aRadiusInFrameSpace);
+
+  IntPoint OffsetToFilterSpace(nscoord aXOffsetInFrameSpace,
+                               nscoord aYOffsetInFrameSpace);
+
+  const StyleFilter& mFilter;
+
+  nsIntRect mTargetBoundsInFilterSpace;
+
+  gfxMatrix mFrameSpaceInCSSPxToFilterSpaceTransform;
+
+  nscolor mShadowFallbackColor;
+};
+
+}  
+
+#endif  // LAYOUT_SVG_CSSFILTERINSTANCE_H_

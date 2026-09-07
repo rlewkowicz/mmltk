@@ -1,0 +1,91 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef GFX_RENDERROOTSTATEMANAGER_H
+#define GFX_RENDERROOTSTATEMANAGER_H
+
+#include "mozilla/webrender/WebRenderAPI.h"
+
+#include "mozilla/layers/IpcResourceUpdateQueue.h"
+#include "mozilla/layers/SharedSurfacesChild.h"
+#include "mozilla/layers/WebRenderCommandBuilder.h"
+#include "nsTHashSet.h"
+
+namespace mozilla {
+
+namespace layers {
+
+class RenderRootStateManager {
+  typedef nsTHashSet<RefPtr<WebRenderUserData>> WebRenderUserDataRefTable;
+
+ public:
+  void AddRef();
+  void Release();
+
+  RenderRootStateManager() : mLayerManager(nullptr), mDestroyed(false) {}
+
+  void Destroy();
+  bool IsDestroyed() { return mDestroyed; }
+  wr::IpcResourceUpdateQueue& AsyncResourceUpdates();
+  WebRenderBridgeChild* WrBridge() const;
+  WebRenderCommandBuilder& CommandBuilder();
+  WebRenderUserDataRefTable* GetWebRenderUserDataTable();
+  WebRenderLayerManager* LayerManager() { return mLayerManager; }
+
+  void AddImageKeyForDiscard(wr::ImageKey);
+  void AddBlobImageKeyForDiscard(wr::BlobImageKey);
+  void AddSnapshotImageKeyForDiscard(wr::SnapshotImageKey);
+  void AddUnusedSnapshotImageKeyForDiscard(wr::SnapshotImageKey);
+  void DiscardImagesInTransaction(wr::IpcResourceUpdateQueue& aResources);
+  void DiscardUnusedImagesInTransaction(wr::IpcResourceUpdateQueue& aResources);
+  void DiscardLocalImages();
+
+  void ClearCachedResources();
+
+  void AddActiveCompositorAnimationId(uint64_t aId);
+  void AddCompositorAnimationsIdForDiscard(uint64_t aId);
+  void DiscardCompositorAnimations();
+
+  void RegisterAsyncAnimation(const wr::ImageKey& aKey,
+                              SharedSurfacesAnimation* aAnimation);
+  void DeregisterAsyncAnimation(const wr::ImageKey& aKey);
+  void ClearAsyncAnimations();
+  void WrReleasedImages(const nsTArray<wr::ExternalImageKeyPair>& aPairs);
+
+  void AddWebRenderParentCommand(const WebRenderParentCommand& aCmd);
+  void UpdateResources(wr::IpcResourceUpdateQueue& aResources);
+  void AddPipelineIdForCompositable(const wr::PipelineId& aPipelineId,
+                                    const CompositableHandle& aHandle,
+                                    CompositableHandleOwner aOwner);
+  void RemovePipelineIdForCompositable(const wr::PipelineId& aPipelineId);
+  void ReleaseTextureOfImage(const wr::ImageKey& aKey);
+  Maybe<wr::FontInstanceKey> GetFontKeyForScaledFont(
+      gfx::ScaledFont* aScaledFont, wr::IpcResourceUpdateQueue& aResources);
+  Maybe<wr::FontKey> GetFontKeyForUnscaledFont(
+      gfx::UnscaledFont* aUnscaledFont, wr::IpcResourceUpdateQueue& aResources);
+
+  void FlushAsyncResourceUpdates();
+
+ private:
+  WebRenderLayerManager* mLayerManager;
+  Maybe<wr::IpcResourceUpdateQueue> mAsyncResourceUpdates;
+  nsTArray<wr::ImageKey> mImageKeysToDelete;
+  nsTArray<wr::BlobImageKey> mBlobImageKeysToDelete;
+  nsTArray<wr::SnapshotImageKey> mSnapshotImageKeysToDelete;
+  nsTArray<wr::SnapshotImageKey> mUnusedSnapshotImageKeysToDelete;
+  std::unordered_map<uint64_t, RefPtr<SharedSurfacesAnimation>>
+      mAsyncAnimations;
+
+  std::unordered_set<uint64_t> mActiveCompositorAnimationIds;
+  nsTArray<uint64_t> mDiscardedCompositorAnimationsIds;
+
+  bool mDestroyed;
+
+  friend class WebRenderLayerManager;
+};
+
+}  
+}  
+
+#endif /* GFX_RENDERROOTSTATEMANAGER_H */

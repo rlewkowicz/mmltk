@@ -1,0 +1,442 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(jsfriendapi_h)
+#define jsfriendapi_h
+
+#include "jspubtd.h"
+
+#include "js/CallArgs.h"
+#include "js/Class.h"
+#include "js/ColumnNumber.h"  // JS::LimitedColumnNumberOneOrigin
+#include "js/GCAPI.h"
+#include "js/GCVector.h"
+#include "js/HeapAPI.h"
+#include "js/Object.h"           // JS::GetClass
+#include "js/shadow/Function.h"  // JS::shadow::Function
+#include "js/shadow/Object.h"    // JS::shadow::Object
+#include "js/TypeDecls.h"
+
+class JSJitInfo;
+
+extern JS_PUBLIC_API JSObject* JS_FindCompilationScope(JSContext* cx,
+                                                       JS::HandleObject obj);
+
+extern JS_PUBLIC_API JSFunction* JS_GetObjectFunction(JSObject* obj);
+
+extern JS_PUBLIC_API JSObject* JS_NewObjectWithoutMetadata(
+    JSContext* cx, const JSClass* clasp, JS::Handle<JSObject*> proto);
+
+extern JS_PUBLIC_API bool JS_NondeterministicGetWeakMapKeys(
+    JSContext* cx, JS::HandleObject obj, JS::MutableHandleObject ret);
+
+extern JS_PUBLIC_API bool JS_NondeterministicGetWeakSetKeys(
+    JSContext* cx, JS::HandleObject obj, JS::MutableHandleObject ret);
+
+extern JS_PUBLIC_API unsigned JS_PCToLineNumber(
+    JSScript* script, jsbytecode* pc,
+    JS::LimitedColumnNumberOneOrigin* columnp = nullptr);
+
+extern JS_PUBLIC_API bool JS_IsDeadWrapper(JSObject* obj);
+
+extern JS_PUBLIC_API JSObject* JS_NewDeadWrapper(
+    JSContext* cx, JSObject* origObject = nullptr);
+
+extern JS_PUBLIC_API JSPrincipals* JS_GetScriptPrincipals(JSScript* script);
+
+extern JS_PUBLIC_API bool JS_ScriptHasMutedErrors(JSScript* script);
+
+extern JS_PUBLIC_API bool JS_InitializePropertiesFromCompatibleNativeObject(
+    JSContext* cx, JS::HandleObject dst, JS::HandleObject src);
+
+namespace js {
+
+JS_PUBLIC_API bool IsArgumentsObject(JS::HandleObject obj);
+
+JS_PUBLIC_API bool AddRawValueRoot(JSContext* cx, JS::Value* vp,
+                                   const char* name);
+
+JS_PUBLIC_API void RemoveRawValueRoot(JSContext* cx, JS::Value* vp);
+
+}  
+
+namespace JS {
+
+extern JS_PUBLIC_API bool ForceLexicalInitialization(JSContext* cx,
+                                                     HandleObject obj);
+
+extern JS_PUBLIC_API bool IsGCPoisoning();
+
+extern JS_PUBLIC_API JSPrincipals* GetRealmPrincipals(JS::Realm* realm);
+
+extern JS_PUBLIC_API void SetRealmPrincipals(JS::Realm* realm,
+                                             JSPrincipals* principals);
+
+extern JS_PUBLIC_API bool GetIsSecureContext(JS::Realm* realm);
+
+extern JS_PUBLIC_API bool GetDebuggerObservesWasm(JS::Realm* realm);
+
+}  
+
+extern JS_PUBLIC_API bool JS_WrapPropertyDescriptor(
+    JSContext* cx, JS::MutableHandle<JS::PropertyDescriptor> desc);
+
+extern JS_PUBLIC_API bool JS_WrapPropertyDescriptor(
+    JSContext* cx,
+    JS::MutableHandle<mozilla::Maybe<JS::PropertyDescriptor>> desc);
+
+struct JSFunctionSpecWithHelp {
+  const char* name;
+  JSNative call;
+  uint16_t nargs;
+  uint16_t flags;
+  const JSJitInfo* jitInfo;
+  const char* usage;
+  const char* help;
+};
+
+#define JS_FN_HELP(name, call, nargs, flags, usage, help) \
+  {name, call, nargs, (flags) | JSPROP_ENUMERATE, nullptr, usage, help}
+#define JS_INLINABLE_FN_HELP(name, call, nargs, flags, native, usage, help)    \
+  {name,  call, nargs, (flags) | JSPROP_ENUMERATE, &js::jit::JitInfo_##native, \
+   usage, help}
+#define JS_FS_HELP_END {nullptr, nullptr, 0, 0, nullptr, nullptr}
+
+extern JS_PUBLIC_API bool JS_DefineFunctionsWithHelp(
+    JSContext* cx, JS::HandleObject obj, const JSFunctionSpecWithHelp* fs);
+
+namespace js {
+
+extern JS_PUBLIC_API bool UseInternalJobQueues(JSContext* cx);
+
+#if defined(DEBUG)
+extern JS_PUBLIC_API JSObject* GetJobsInInternalJobQueue(JSContext* cx);
+#endif
+
+extern JS_PUBLIC_API void StopDrainingJobQueue(JSContext* cx);
+
+extern JS_PUBLIC_API void RestartDrainingJobQueue(JSContext* cx);
+
+extern JS_PUBLIC_API void RunJobs(JSContext* cx);
+
+extern JS_PUBLIC_API JS::Zone* GetRealmZone(JS::Realm* realm);
+
+using PreserveWrapperCallback = void (*)(JSContext*, JS::HandleObject);
+using HasReleasedWrapperCallback = bool (*)(JS::HandleObject);
+
+extern JS_PUBLIC_API bool IsSystemRealm(JS::Realm* realm);
+
+extern JS_PUBLIC_API bool IsSystemCompartment(JS::Compartment* comp);
+
+extern JS_PUBLIC_API bool IsSystemZone(JS::Zone* zone);
+
+extern JS_PUBLIC_API bool IsCompartmentZoneSweepingOrCompacting(
+    JS::Compartment* comp);
+
+extern JS_PUBLIC_API JS::Realm* GetAnyRealmInZone(JS::Zone* zone);
+
+extern JS_PUBLIC_API JSObject* GetFirstGlobalInCompartment(
+    JS::Compartment* comp);
+
+extern JS_PUBLIC_API bool CompartmentHasLiveGlobal(JS::Compartment* comp);
+
+extern JS_PUBLIC_API bool IsSharableCompartment(JS::Compartment* comp);
+
+extern JS_PUBLIC_DATA const JSClass* const ObjectClassPtr;
+
+JS_PUBLIC_API const JSClass* ProtoKeyToClass(JSProtoKey key);
+
+inline JSProtoKey InheritanceProtoKeyForStandardClass(JSProtoKey key) {
+  if (key == JSProto_Object) {
+    return JSProto_Null;
+  }
+
+  if (ProtoKeyToClass(key)->specDefined()) {
+    return ProtoKeyToClass(key)->specInheritanceProtoKey();
+  }
+
+  return JSProto_Object;
+}
+
+JS_PUBLIC_API bool ShouldIgnorePropertyDefinition(JSContext* cx, JSProtoKey key,
+                                                  jsid id);
+
+JS_PUBLIC_API bool IsFunctionObject(JSObject* obj);
+
+JS_PUBLIC_API const char* MaybeGetModuleFilename(JSObject* obj);
+
+JS_PUBLIC_API bool UninlinedIsCrossCompartmentWrapper(const JSObject* obj);
+
+static MOZ_ALWAYS_INLINE JS::Realm* GetNonCCWObjectRealm(JSObject* obj) {
+  MOZ_ASSERT(!js::UninlinedIsCrossCompartmentWrapper(obj));
+  return reinterpret_cast<JS::shadow::Object*>(obj)->shape->base->realm;
+}
+
+JS_PUBLIC_API void AssertSameCompartment(JSContext* cx, JSObject* obj);
+
+JS_PUBLIC_API void AssertSameCompartment(JSContext* cx, JS::HandleValue v);
+
+#if defined(JS_DEBUG)
+JS_PUBLIC_API void AssertSameCompartment(JSObject* objA, JSObject* objB);
+#else
+inline void AssertSameCompartment(JSObject* objA, JSObject* objB) {}
+#endif
+
+JS_PUBLIC_API void NotifyAnimationActivity(JSObject* obj);
+
+JS_PUBLIC_API JSFunction* DefineFunctionWithReserved(
+    JSContext* cx, JSObject* obj, const char* name, JSNative call,
+    unsigned nargs, unsigned attrs);
+
+JS_PUBLIC_API JSFunction* NewFunctionWithReserved(JSContext* cx, JSNative call,
+                                                  unsigned nargs,
+                                                  unsigned flags,
+                                                  const char* name);
+
+JS_PUBLIC_API JSFunction* NewFunctionByIdWithReserved(JSContext* cx,
+                                                      JSNative native,
+                                                      unsigned nargs,
+                                                      unsigned flags, jsid id);
+
+JS_PUBLIC_API JSFunction* NewFunctionByIdWithReservedAndProto(
+    JSContext* cx, JSNative native, JS::Handle<JSObject*> proto, unsigned nargs,
+    unsigned flags, jsid id);
+
+JS_PUBLIC_API const JS::Value& GetFunctionNativeReserved(JSObject* fun,
+                                                         size_t which);
+
+JS_PUBLIC_API void SetFunctionNativeReserved(JSObject* fun, size_t which,
+                                             const JS::Value& val);
+
+JS_PUBLIC_API bool FunctionHasNativeReserved(JSObject* fun);
+
+JS_PUBLIC_API bool GetObjectProto(JSContext* cx, JS::HandleObject obj,
+                                  JS::MutableHandleObject proto);
+
+extern JS_PUBLIC_API JSObject* GetStaticPrototype(JSObject* obj);
+
+JS_PUBLIC_API bool GetRealmOriginalEval(JSContext* cx,
+                                        JS::MutableHandleObject eval);
+
+JS_PUBLIC_API bool GetPropertyKeys(JSContext* cx, JS::HandleObject obj,
+                                   unsigned flags,
+                                   JS::MutableHandleIdVector props);
+
+JS_PUBLIC_API bool AppendUnique(JSContext* cx, JS::MutableHandleIdVector base,
+                                JS::HandleIdVector others);
+
+JS_PUBLIC_API bool GetSetObjectKeys(
+    JSContext* cx, JS::HandleObject obj,
+    JS::MutableHandle<JS::GCVector<JS::Value>> keys);
+
+JS_PUBLIC_API bool GetMapObjectKeysAndValuesInterleaved(
+    JSContext* cx, JS::HandleObject obj,
+    JS::MutableHandle<JS::GCVector<JS::Value>> entries);
+
+JS_PUBLIC_API bool StringIsArrayIndex(const JSLinearString* str,
+                                      uint32_t* indexp);
+
+JS_PUBLIC_API bool StringIsArrayIndex(const char16_t* str, uint32_t length,
+                                      uint32_t* indexp);
+
+JS_PUBLIC_API void SetPreserveWrapperCallbacks(
+    JSContext* cx, PreserveWrapperCallback preserveWrapper,
+    HasReleasedWrapperCallback hasReleasedWrapper);
+
+JS_PUBLIC_API void CommitPendingWrapperPreservations(JSContext* cx);
+
+JS_PUBLIC_API bool IsObjectInContextCompartment(JSObject* obj,
+                                                const JSContext* cx);
+
+#define JSITER_PRIVATE 0x4      /* Include private names in iteration */
+#define JSITER_OWNONLY 0x8      /* iterate over obj's own properties only */
+#define JSITER_HIDDEN 0x10      /* also enumerate non-enumerable properties */
+#define JSITER_SYMBOLS 0x20     /* also include symbol property keys */
+#define JSITER_SYMBOLSONLY 0x40 /* exclude string property keys */
+#define JSITER_FORAWAITOF 0x80  /* for-await-of */
+
+using DOMInstanceClassHasProtoAtDepth = bool (*)(const JSClass*, uint32_t,
+                                                 uint32_t);
+using DOMInstanceClassIsError = bool (*)(const JSClass*);
+
+using DOMExtractExceptionInfo = bool (*)(JSContext*, JS::HandleObject, bool*,
+                                         JS::MutableHandle<JSString*>,
+                                         uint32_t*, uint32_t*,
+                                         JS::MutableHandle<JSString*>);
+
+struct JSDOMCallbacks {
+  DOMInstanceClassHasProtoAtDepth instanceClassMatchesProto;
+  DOMInstanceClassIsError instanceClassIsError;
+  DOMExtractExceptionInfo extractExceptionInfo;
+};
+using DOMCallbacks = struct JSDOMCallbacks;
+
+extern JS_PUBLIC_API void SetDOMCallbacks(JSContext* cx,
+                                          const DOMCallbacks* callbacks);
+
+extern JS_PUBLIC_API const DOMCallbacks* GetDOMCallbacks(JSContext* cx);
+
+
+extern JS_PUBLIC_API JSLinearString* GetErrorTypeName(JSContext* cx,
+                                                      int16_t exnType);
+
+
+extern JS_PUBLIC_API bool DateIsValid(JSContext* cx, JS::HandleObject obj,
+                                      bool* isValid);
+
+extern JS_PUBLIC_API bool DateGetMsecSinceEpoch(JSContext* cx,
+                                                JS::HandleObject obj,
+                                                double* msecSinceEpoch);
+
+extern JS_PUBLIC_API uint64_t GetSCOffset(JSStructuredCloneWriter* writer);
+
+static const unsigned JS_FUNCTION_INTERPRETED_BITS = 0x0060;
+
+}  
+
+static MOZ_ALWAYS_INLINE const JSJitInfo* FUNCTION_VALUE_TO_JITINFO(
+    const JS::Value& v) {
+  JSObject* obj = &v.toObject();
+  MOZ_ASSERT(JS::GetClass(obj)->isJSFunction());
+
+  auto* fun = reinterpret_cast<JS::shadow::Function*>(obj);
+  MOZ_ASSERT(!(fun->flagsAndArgCount() & js::JS_FUNCTION_INTERPRETED_BITS),
+             "Unexpected non-native function");
+
+  return static_cast<const JSJitInfo*>(fun->jitInfoOrScript());
+}
+
+static MOZ_ALWAYS_INLINE void SET_JITINFO(JSFunction* func,
+                                          const JSJitInfo* info) {
+  auto* fun = reinterpret_cast<JS::shadow::Function*>(func);
+  MOZ_ASSERT(!(fun->flagsAndArgCount() & js::JS_FUNCTION_INTERPRETED_BITS));
+
+  fun->setJitInfoOrScript(const_cast<JSJitInfo*>(info));
+}
+
+static_assert(sizeof(jsid) == sizeof(void*));
+
+namespace js {
+
+static MOZ_ALWAYS_INLINE JS::Value IdToValue(jsid id) {
+  if (id.isString()) {
+    return JS::StringValue(id.toString());
+  }
+  if (id.isInt()) {
+    return JS::Int32Value(id.toInt());
+  }
+  if (id.isSymbol()) {
+    return JS::SymbolValue(id.toSymbol());
+  }
+  MOZ_ASSERT(id.isVoid());
+  return JS::UndefinedValue();
+}
+
+
+struct ScriptEnvironmentPreparer {
+  struct Closure {
+    virtual bool operator()(JSContext* cx) = 0;
+  };
+
+  virtual void invoke(JS::HandleObject global, Closure& closure) = 0;
+};
+
+extern JS_PUBLIC_API void PrepareScriptEnvironmentAndInvoke(
+    JSContext* cx, JS::HandleObject global,
+    ScriptEnvironmentPreparer::Closure& closure);
+
+JS_PUBLIC_API void SetScriptEnvironmentPreparer(
+    JSContext* cx, ScriptEnvironmentPreparer* preparer);
+
+struct AllocationMetadataBuilder {
+  AllocationMetadataBuilder() = default;
+
+  virtual JSObject* build(JSContext* cx, JS::HandleObject obj,
+                          AutoEnterOOMUnsafeRegion& oomUnsafe) const {
+    return nullptr;
+  }
+};
+
+JS_PUBLIC_API void SetAllocationMetadataBuilder(
+    JSContext* cx, const AllocationMetadataBuilder* callback);
+
+JS_PUBLIC_API JSObject* GetAllocationMetadata(JSObject* obj);
+
+JS_PUBLIC_API bool GetElementsWithAdder(JSContext* cx, JS::HandleObject obj,
+                                        JS::HandleObject receiver,
+                                        uint32_t begin, uint32_t end,
+                                        js::ElementAdder* adder);
+
+JS_PUBLIC_API bool ForwardToNative(JSContext* cx, JSNative native,
+                                   const JS::CallArgs& args);
+
+JS_PUBLIC_API bool SetPropertyIgnoringNamedGetter(
+    JSContext* cx, JS::HandleObject obj, JS::HandleId id, JS::HandleValue v,
+    JS::HandleValue receiver,
+    JS::Handle<mozilla::Maybe<JS::PropertyDescriptor>> ownDesc,
+    JS::ObjectOpResult& result);
+
+extern JS_PUBLIC_API bool ExecuteInFrameScriptEnvironment(
+    JSContext* cx, JS::HandleObject obj, JS::HandleScript script,
+    JS::MutableHandleObject scope);
+
+extern JS_PUBLIC_API bool IsSavedFrame(JSObject* obj);
+
+
+extern JS_PUBLIC_API bool ReportIsNotFunction(JSContext* cx, JS::HandleValue v);
+
+class MOZ_STACK_CLASS JS_PUBLIC_API AutoAssertNoContentJS {
+ public:
+  explicit AutoAssertNoContentJS(JSContext* cx);
+  ~AutoAssertNoContentJS();
+
+ private:
+  JSContext* context_;
+  bool prevAllowContentJS_;
+};
+
+extern JS_PUBLIC_API uint64_t GetMemoryUsageForZone(JS::Zone* zone);
+
+enum class MemoryUse : uint8_t;
+
+namespace gc {
+
+struct SharedMemoryUse {
+  explicit SharedMemoryUse(MemoryUse use) : count(0), nbytes(0) {
+#if defined(DEBUG)
+    this->use = use;
+#endif
+  }
+
+  size_t count;
+  size_t nbytes;
+#if defined(DEBUG)
+  MemoryUse use;
+#endif
+};
+
+using SharedMemoryMap =
+    HashMap<void*, SharedMemoryUse, DefaultHasher<void*>, SystemAllocPolicy>;
+
+} 
+
+extern JS_PUBLIC_API const gc::SharedMemoryMap& GetSharedMemoryUsageForZone(
+    JS::Zone* zone);
+
+extern JS_PUBLIC_API uint64_t GetGCHeapUsage(JSContext* cx);
+
+class JS_PUBLIC_API CompartmentTransplantCallback {
+ public:
+  virtual JSObject* getObjectToTransplant(JS::Compartment* compartment) = 0;
+};
+
+extern JS_PUBLIC_API void RemapRemoteWindowProxies(
+    JSContext* cx, CompartmentTransplantCallback* callback,
+    JS::MutableHandleObject newTarget);
+
+extern JS_PUBLIC_API JS::Zone* GetObjectZoneFromAnyThread(const JSObject* obj);
+
+} 
+
+#endif

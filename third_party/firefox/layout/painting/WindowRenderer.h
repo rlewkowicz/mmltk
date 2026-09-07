@@ -1,0 +1,189 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_PAINTING_WINDOWRENDERER_H
+#define MOZILLA_PAINTING_WINDOWRENDERER_H
+
+#include "gfxContext.h"
+#include "mozilla/ScrollPositionUpdate.h"  // for ScrollPositionUpdate
+#include "mozilla/dom/Animation.h"         // for Animation
+#include "mozilla/gfx/GPUProcessListener.h"
+#include "mozilla/layers/LayersTypes.h"
+#include "mozilla/layers/ScrollableLayerGuid.h"  // for ScrollableLayerGuid, ScrollableLayerGuid::ViewID
+#include "mozilla/webrender/webrender_ffi.h"
+#include "nsRefPtrHashtable.h"  // for nsRefPtrHashtable
+
+namespace mozilla {
+namespace layers {
+class LayerManager;
+class WebRenderLayerManager;
+class KnowsCompositor;
+class CompositorBridgeChild;
+class PersistentBufferProvider;
+}  
+class FallbackRenderer;
+class nsDisplayListBuilder;
+class nsDisplayList;
+
+class FrameRecorder {
+ public:
+
+  virtual uint32_t StartFrameTimeRecording(int32_t aBufferSize);
+
+  virtual void StopFrameTimeRecording(uint32_t aStartIndex,
+                                      nsTArray<float>& aFrameIntervals);
+
+  void RecordFrame();
+
+ private:
+  struct FramesTimingRecording {
+    FramesTimingRecording()
+        : mNextIndex(0),
+          mLatestStartIndex(0),
+          mCurrentRunStartIndex(0),
+          mIsPaused(true) {}
+    nsTArray<float> mIntervals;
+    TimeStamp mLastFrameTime;
+    uint32_t mNextIndex;
+    uint32_t mLatestStartIndex;
+    uint32_t mCurrentRunStartIndex;
+    bool mIsPaused;
+  };
+  FramesTimingRecording mRecording;
+};
+
+class WindowRenderer : public FrameRecorder {
+  NS_INLINE_DECL_PURE_VIRTUAL_REFCOUNTING
+
+ public:
+  virtual layers::WebRenderLayerManager* AsWebRender() { return nullptr; }
+  virtual FallbackRenderer* AsFallback() { return nullptr; }
+
+
+  virtual bool BeginTransaction(const nsCString& aURL = nsCString()) = 0;
+
+  enum EndTransactionFlags {
+    END_DEFAULT = 0,
+    END_NO_IMMEDIATE_REDRAW = 1 << 0,  
+    END_NO_COMPOSITE =
+        1 << 1,  
+    END_NO_REMOTE_COMPOSITE = 1 << 2  
+  };
+
+  virtual bool EndEmptyTransaction(
+      EndTransactionFlags aFlags = END_DEFAULT) = 0;
+
+  virtual void Destroy() {}
+
+  virtual layers::LayersBackend GetBackendType() = 0;
+
+  virtual layers::LayersBackend GetCompositorBackendType() {
+    return GetBackendType();
+  }
+
+  virtual bool NeedsWidgetInvalidation() { return true; }
+
+  virtual void FlushRendering(wr::RenderReasons aReasons) {}
+
+  virtual void WaitOnTransactionProcessed() {}
+
+  virtual int32_t GetMaxTextureSize() const { return INT32_MAX; }
+
+  virtual void GetBackendName(nsAString& aName) = 0;
+
+
+  virtual bool AddPendingScrollUpdateForNextTransaction(
+      layers::ScrollableLayerGuid::ViewID aScrollId,
+      const ScrollPositionUpdate& aUpdateInfo) {
+    return false;
+  }
+
+  virtual already_AddRefed<layers::PersistentBufferProvider>
+  CreatePersistentBufferProvider(const mozilla::gfx::IntSize& aSize,
+                                 mozilla::gfx::SurfaceFormat aFormat,
+                                 bool aWillReadFrequently = false);
+
+
+  virtual layers::KnowsCompositor* AsKnowsCompositor() { return nullptr; }
+
+  virtual layers::CompositorBridgeChild* GetCompositorBridgeChild() {
+    return nullptr;
+  }
+
+
+  void AddPartialPrerenderedAnimation(uint64_t aCompositorAnimationId,
+                                      dom::Animation* aAnimation);
+  void RemovePartialPrerenderedAnimation(uint64_t aCompositorAnimationId,
+                                         dom::Animation* aAnimation);
+  void UpdatePartialPrerenderedAnimations(
+      const nsTArray<uint64_t>& aJankedAnimations);
+
+ protected:
+  virtual ~WindowRenderer() = default;
+
+  nsRefPtrHashtable<nsUint64HashKey, dom::Animation>
+      mPartialPrerenderedAnimations;
+};
+
+class FallbackRenderer : public WindowRenderer {
+ public:
+  FallbackRenderer* AsFallback() final { return this; }
+
+  void SetTarget(gfxContext* aContext);
+
+  bool BeginTransaction(const nsCString& aURL = nsCString()) final;
+
+  bool EndEmptyTransaction(EndTransactionFlags aFlags = END_DEFAULT) final {
+    return false;
+  }
+
+  layers::LayersBackend GetBackendType() final {
+    return layers::LayersBackend::LAYERS_NONE;
+  }
+
+  void GetBackendName(nsAString& name) final { name.AssignLiteral("Fallback"); }
+
+  void EndTransactionWithColor(const nsIntRect& aRect,
+                               const gfx::DeviceColor& aColor);
+  void EndTransactionWithList(nsDisplayListBuilder* aBuilder,
+                              nsDisplayList* aList,
+                              int32_t aAppUnitsPerDevPixel,
+                              EndTransactionFlags aFlags);
+
+  gfxContext* mTarget = nullptr;
+
+ protected:
+  FallbackRenderer() = default;
+};
+
+class DefaultFallbackRenderer final : public FallbackRenderer {
+  NS_INLINE_DECL_REFCOUNTING(DefaultFallbackRenderer, final)
+
+ public:
+  DefaultFallbackRenderer() = default;
+
+ private:
+  ~DefaultFallbackRenderer() final = default;
+};
+
+class BackgroundedFallbackRenderer final : public FallbackRenderer,
+                                           public gfx::GPUProcessListener {
+  NS_INLINE_DECL_REFCOUNTING(BackgroundedFallbackRenderer, final)
+
+ public:
+  explicit BackgroundedFallbackRenderer(nsIWidget* aWidget);
+
+  void Destroy() final;
+
+  void OnCompositorDestroyBackgrounded() final;
+
+ private:
+  ~BackgroundedFallbackRenderer() final;
+
+  nsIWidget* mWidget;
+};
+
+}  
+
+#endif /* MOZILLA_PAINTING_WINDOWRENDERER_H */

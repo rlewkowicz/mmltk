@@ -1,0 +1,274 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsHttpHeaderArray_h_
+#define nsHttpHeaderArray_h_
+
+#include "nsHttp.h"
+#include "nsTArray.h"
+#include "nsString.h"
+
+class nsIHttpHeaderVisitor;
+
+namespace IPC {
+template <typename>
+struct ParamTraits;
+}  
+
+namespace mozilla {
+namespace net {
+
+class nsHttpHeaderArray {
+ public:
+  const char* PeekHeader(const nsHttpAtom& header) const;
+
+  enum HeaderVariety {
+    eVarietyUnknown,
+    eVarietyRequestOverride,
+    eVarietyRequestDefault,
+    eVarietyRequestEnforceDefault,
+    eVarietyResponseNetOriginalAndResponse,
+    eVarietyResponseNetOriginal,
+    eVarietyResponse,
+    eVarietyResponseOverride,
+  };
+
+  [[nodiscard]] nsresult SetHeader(const nsACString& headerName,
+                                   const nsACString& value, bool merge,
+                                   HeaderVariety variety);
+  [[nodiscard]] nsresult SetHeader(const nsHttpAtom& header,
+                                   const nsACString& value, bool merge,
+                                   HeaderVariety variety);
+  [[nodiscard]] nsresult SetHeader(const nsHttpAtom& header,
+                                   const nsACString& headerName,
+                                   const nsACString& value, bool merge,
+                                   HeaderVariety variety);
+
+  [[nodiscard]] nsresult SetEmptyHeader(const nsACString& headerName,
+                                        HeaderVariety variety);
+
+  [[nodiscard]] nsresult SetHeaderFromNet(const nsHttpAtom& header,
+                                          const nsACString& headerNameOriginal,
+                                          const nsACString& value,
+                                          bool response);
+
+  [[nodiscard]] nsresult SetResponseHeaderFromCache(
+      const nsHttpAtom& header, const nsACString& headerNameOriginal,
+      const nsACString& value, HeaderVariety variety);
+
+  [[nodiscard]] nsresult GetHeader(const nsHttpAtom& header,
+                                   nsACString& result) const;
+  [[nodiscard]] nsresult GetOriginalHeader(const nsHttpAtom& aHeader,
+                                           nsIHttpHeaderVisitor* aVisitor);
+  void ClearHeader(const nsHttpAtom& h);
+
+  const char* FindHeaderValue(const nsHttpAtom& header,
+                              const char* value) const {
+    return nsHttp::FindToken(PeekHeader(header), value, HTTP_HEADER_VALUE_SEPS);
+  }
+
+  bool HasHeaderValue(const nsHttpAtom& header, const char* value) const {
+    return FindHeaderValue(header, value) != nullptr;
+  }
+
+  bool HasHeader(const nsHttpAtom& header) const;
+
+  enum VisitorFilter {
+    eFilterAll,
+    eFilterSkipDefault,
+    eFilterResponse,
+    eFilterResponseOriginal
+  };
+
+  [[nodiscard]] nsresult VisitHeaders(nsIHttpHeaderVisitor* visitor,
+                                      VisitorFilter filter = eFilterAll);
+
+  [[nodiscard]] static nsresult ParseHeaderLine(
+      const nsACString& line, nsHttpAtom* hdr = nullptr,
+      nsACString* headerNameOriginal = nullptr, nsACString* value = nullptr);
+
+  void Flatten(nsACString&, bool pruneProxyHeaders, bool pruneTransients) const;
+  void FlattenOriginalHeader(nsACString&);
+
+  uint32_t Count() const { return mHeaders.Length(); }
+
+  const char* PeekHeaderAt(uint32_t i, nsHttpAtom& header,
+                           nsACString& headerNameOriginal) const;
+
+  void Clear();
+
+  struct nsEntry {
+    nsHttpAtom header;
+    nsCString headerNameOriginal;
+    nsCString value;
+    HeaderVariety variety = eVarietyUnknown;
+
+    struct MatchHeader {
+      bool Equals(const nsEntry& aEntry, const nsHttpAtom& aHeader) const {
+        return aEntry.header == aHeader;
+      }
+    };
+
+    bool operator==(const nsEntry& aOther) const {
+      return header == aOther.header && value == aOther.value;
+    }
+  };
+
+  bool operator==(const nsHttpHeaderArray& aOther) const {
+    return mHeaders == aOther.mHeaders;
+  }
+
+ private:
+  int32_t LookupEntry(const nsHttpAtom& header, const nsEntry**) const;
+  int32_t LookupEntry(const nsHttpAtom& header, nsEntry**);
+  [[nodiscard]] nsresult MergeHeader(const nsHttpAtom& header, nsEntry* entry,
+                                     const nsACString& value,
+                                     HeaderVariety variety);
+  [[nodiscard]] nsresult SetHeader_internal(const nsHttpAtom& header,
+                                            const nsACString& headerName,
+                                            const nsACString& value,
+                                            HeaderVariety variety);
+
+  bool IsSingletonHeader(const nsHttpAtom& header);
+  bool IsIgnoreMultipleHeader(const nsHttpAtom& header);
+
+  bool IsSuspectDuplicateHeader(const nsHttpAtom& header);
+
+  void RemoveDuplicateHeaderValues(const nsACString& aHeaderValue,
+                                   nsACString& aResult);
+
+  CopyableAutoTArray<nsEntry, 16> mHeaders;
+
+  friend struct IPC::ParamTraits<nsHttpHeaderArray>;
+  friend class nsHttpRequestHead;
+};
+
+
+inline int32_t nsHttpHeaderArray::LookupEntry(const nsHttpAtom& header,
+                                              const nsEntry** entry) const {
+  uint32_t index = 0;
+  while (index != UINT32_MAX) {
+    index = mHeaders.IndexOf(header, index, nsEntry::MatchHeader());
+    if (index != UINT32_MAX) {
+      if ((&mHeaders[index])->variety != eVarietyResponseNetOriginal) {
+        *entry = &mHeaders[index];
+        return index;
+      }
+      index++;
+    }
+  }
+
+  return index;
+}
+
+inline int32_t nsHttpHeaderArray::LookupEntry(const nsHttpAtom& header,
+                                              nsEntry** entry) {
+  uint32_t index = 0;
+  while (index != UINT32_MAX) {
+    index = mHeaders.IndexOf(header, index, nsEntry::MatchHeader());
+    if (index != UINT32_MAX) {
+      if ((&mHeaders[index])->variety != eVarietyResponseNetOriginal) {
+        *entry = &mHeaders[index];
+        return index;
+      }
+      index++;
+    }
+  }
+  return index;
+}
+
+inline bool nsHttpHeaderArray::IsSingletonHeader(const nsHttpAtom& header) {
+  return header == nsHttp::Content_Type ||
+         header == nsHttp::Content_Disposition ||
+         header == nsHttp::Content_Length || header == nsHttp::User_Agent ||
+         header == nsHttp::Referer || header == nsHttp::Host ||
+         header == nsHttp::Authorization ||
+         header == nsHttp::Proxy_Authorization ||
+         header == nsHttp::If_Modified_Since ||
+         header == nsHttp::If_Unmodified_Since || header == nsHttp::From ||
+         header == nsHttp::Location || header == nsHttp::Max_Forwards ||
+         header == nsHttp::GlobalPrivacyControl ||
+         IsIgnoreMultipleHeader(header);
+}
+
+inline bool nsHttpHeaderArray::IsIgnoreMultipleHeader(
+    const nsHttpAtom& header) {
+  return header == nsHttp::Strict_Transport_Security;
+}
+
+[[nodiscard]] inline nsresult nsHttpHeaderArray::MergeHeader(
+    const nsHttpAtom& header, nsEntry* entry, const nsACString& value,
+    nsHttpHeaderArray::HeaderVariety variety) {
+  if (value.IsEmpty() && header != nsHttp::X_Frame_Options) {
+    return NS_OK;
+  }
+
+  auto AppendSeparator = [&header](nsCString& s) {
+    if (header == nsHttp::Set_Cookie || header == nsHttp::WWW_Authenticate ||
+        header == nsHttp::Proxy_Authenticate) {
+      s.Append('\n');
+    } else {
+      s.AppendLiteral(", ");
+    }
+  };
+
+  if (entry->variety == eVarietyResponseNetOriginalAndResponse) {
+    MOZ_ASSERT(variety == eVarietyResponse);
+    entry->variety = eVarietyResponseNetOriginal;
+    nsCString headerNameOriginal = entry->headerNameOriginal;
+    nsCString newValue = entry->value;
+    if (!newValue.IsEmpty() || header == nsHttp::X_Frame_Options) {
+      AppendSeparator(newValue);
+    }
+    newValue.Append(value);
+    return SetHeader_internal(header, headerNameOriginal, newValue,
+                              eVarietyResponse);
+  }
+
+  if (!entry->value.IsEmpty() || header == nsHttp::X_Frame_Options) {
+    AppendSeparator(entry->value);
+  }
+  entry->value.Append(value);
+  entry->variety = variety;
+  return NS_OK;
+}
+
+inline bool nsHttpHeaderArray::IsSuspectDuplicateHeader(
+    const nsHttpAtom& header) {
+  bool retval = header == nsHttp::Content_Length ||
+                header == nsHttp::Content_Disposition ||
+                header == nsHttp::Location;
+
+  MOZ_ASSERT(!retval || IsSingletonHeader(header),
+             "Only non-mergeable headers should be in this list\n");
+
+  return retval;
+}
+
+inline void nsHttpHeaderArray::RemoveDuplicateHeaderValues(
+    const nsACString& aHeaderValue, nsACString& aResult) {
+  mozilla::Maybe<nsAutoCString> result;
+  for (const nsACString& token :
+       nsCCharSeparatedTokenizer(aHeaderValue, ',').ToRange()) {
+    if (result.isNothing()) {
+      result.emplace(token);
+      continue;
+    }
+    if (*result != token) {
+      result.reset();
+      break;
+    }
+  }
+
+  if (result.isSome()) {
+    aResult = *result;
+  } else {
+    aResult = aHeaderValue;
+  }
+}
+
+}  
+}  
+
+#endif

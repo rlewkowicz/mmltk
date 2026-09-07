@@ -1,0 +1,52 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+EXPORTS += [
+    "nsGeoPositionIPCSerialiser.h",
+]
+
+EXPORTS.mozilla.dom += [
+    "Geolocation.h",
+    "GeolocationCoordinates.h",
+    "GeolocationIPCUtils.h",
+    "GeolocationPosition.h",
+    "GeolocationPositionError.h",
+    "GeolocationSystem.h",
+]
+
+SOURCES += [
+    "Geolocation.cpp",
+    "GeolocationCoordinates.cpp",
+    "GeolocationPosition.cpp",
+    "GeolocationPositionError.cpp",
+]
+
+UNIFIED_SOURCES += [
+    "MLSFallback.cpp",
+]
+
+UNIFIED_SOURCES += [
+    "GeolocationSystem.cpp",
+]
+
+MOZ_SRC_FILES += [
+    "GeolocationUIUtils.sys.mjs",
+]
+XPCOM_MANIFESTS += [
+    "components.conf",
+]
+XPIDL_SOURCES += ["nsIGeolocationUIUtils.idl"]
+XPIDL_MODULE = "dom_geolocation"
+
+include("/ipc/chromium/chromium-config.mozbuild")
+
+FINAL_LIBRARY = "xul"
+LOCAL_INCLUDES += [
+    "/dom/base",
+    "/dom/ipc",
+]
+
+if CONFIG["MOZ_ENABLE_DBUS"]:
+    LOCAL_INCLUDES += ["/dom/system/linux"]
+    CXXFLAGS += CONFIG["MOZ_GTK3_CFLAGS"]

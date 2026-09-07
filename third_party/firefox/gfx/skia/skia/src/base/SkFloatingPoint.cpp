@@ -1,0 +1,40 @@
+/*
+ * Copyright 2023 Google LLC
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "include/private/base/SkFloatingPoint.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <limits>
+
+static double magnitude(double a) {
+    static constexpr int64_t extractMagnitude =
+            0b0'11111111111'0000000000000000000000000000000000000000000000000000;
+    int64_t bits;
+    memcpy(&bits, &a, sizeof(bits));
+    bits &= extractMagnitude;
+    double out;
+    memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+bool sk_doubles_nearly_equal_ulps(double a, double b, uint8_t maxUlpsDiff) {
+
+    static constexpr double minMagnitude = std::numeric_limits<double>::min();
+    const double maxMagnitude = std::max(std::max(magnitude(a), minMagnitude), magnitude(b));
+
+    static constexpr double ulpFactor = std::numeric_limits<double>::epsilon();
+
+    const double tolerance = maxMagnitude * (ulpFactor * (maxUlpsDiff + 1));
+
+    return a == b || std::abs(b - a) < tolerance;
+}
+
+bool sk_double_nearly_zero(double a) {
+    return a == 0 || fabs(a) < std::numeric_limits<float>::epsilon();
+}

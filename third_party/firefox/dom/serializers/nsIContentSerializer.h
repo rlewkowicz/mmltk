@@ -1,0 +1,73 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef nsIContentSerializer_h
+#define nsIContentSerializer_h
+
+#include "nsISupports.h"
+#include "nsStringFwd.h"
+
+class nsIContent;
+
+namespace mozilla {
+class Encoding;
+namespace dom {
+class Comment;
+class Document;
+class DocumentType;
+class Element;
+class ProcessingInstruction;
+class Text;
+}  
+}  
+
+#define NS_ICONTENTSERIALIZER_IID \
+  {0xb1ee32f2, 0xb8c4, 0x49b9, {0x93, 0xdf, 0xb6, 0xfa, 0xb5, 0xd5, 0x46, 0x88}}
+
+class nsIContentSerializer : public nsISupports {
+ public:
+  NS_INLINE_DECL_STATIC_IID(NS_ICONTENTSERIALIZER_IID)
+
+  NS_IMETHOD Init(uint32_t flags, uint32_t aWrapColumn,
+                  const mozilla::Encoding* aEncoding, bool aIsCopying,
+                  bool aIsWholeDocument, bool* aNeedsPerformatScanning,
+                  nsAString& aOutput) = 0;
+
+  NS_IMETHOD AppendText(mozilla::dom::Text* aText, int32_t aStartOffset,
+                        int32_t aEndOffset) = 0;
+
+  NS_IMETHOD AppendCDATASection(mozilla::dom::Text* aCDATASection,
+                                int32_t aStartOffset, int32_t aEndOffset) = 0;
+
+  NS_IMETHOD AppendProcessingInstruction(
+      mozilla::dom::ProcessingInstruction* aPI, int32_t aStartOffset,
+      int32_t aEndOffset) = 0;
+
+  NS_IMETHOD AppendComment(mozilla::dom::Comment* aComment,
+                           int32_t aStartOffset, int32_t aEndOffset) = 0;
+
+  NS_IMETHOD AppendDoctype(mozilla::dom::DocumentType* aDoctype) = 0;
+
+  NS_IMETHOD AppendElementStart(mozilla::dom::Element* aElement,
+                                mozilla::dom::Element* aOriginalElement) = 0;
+
+  NS_IMETHOD AppendElementEnd(mozilla::dom::Element* aElement,
+                              mozilla::dom::Element* aOriginalElement) = 0;
+
+  NS_IMETHOD FlushAndFinish() = 0;
+
+  NS_IMETHOD Finish() = 0;
+
+  NS_IMETHOD GetOutputLength(uint32_t& aLength) const = 0;
+
+  NS_IMETHOD AppendDocumentStart(mozilla::dom::Document* aDocument) = 0;
+
+  NS_IMETHOD ScanElementForPreformat(mozilla::dom::Element* aElement) = 0;
+  NS_IMETHOD ForgetElementForPreformat(mozilla::dom::Element* aElement) = 0;
+};
+
+#define NS_CONTENTSERIALIZER_CONTRACTID_PREFIX \
+  "@mozilla.org/layout/contentserializer;1?mimetype="
+
+#endif /* nsIContentSerializer_h */

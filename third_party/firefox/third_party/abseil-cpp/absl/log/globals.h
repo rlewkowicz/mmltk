@@ -1,0 +1,105 @@
+// Copyright 2022 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef ABSL_LOG_GLOBALS_H_
+#define ABSL_LOG_GLOBALS_H_
+
+#include "absl/base/attributes.h"
+#include "absl/base/config.h"
+#include "absl/base/log_severity.h"
+#include "absl/log/internal/vlog_config.h"
+#include "absl/strings/string_view.h"
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+
+
+[[nodiscard]] absl::LogSeverityAtLeast MinLogLevel();
+
+void SetMinLogLevel(absl::LogSeverityAtLeast severity);
+
+namespace log_internal {
+
+class ScopedMinLogLevel final {
+ public:
+  explicit ScopedMinLogLevel(absl::LogSeverityAtLeast severity);
+  ScopedMinLogLevel(const ScopedMinLogLevel&) = delete;
+  ScopedMinLogLevel& operator=(const ScopedMinLogLevel&) = delete;
+  ~ScopedMinLogLevel();
+
+ private:
+  absl::LogSeverityAtLeast saved_severity_;
+};
+
+}  
+
+
+[[nodiscard]] absl::LogSeverityAtLeast StderrThreshold();
+
+void SetStderrThreshold(absl::LogSeverityAtLeast severity);
+inline void SetStderrThreshold(absl::LogSeverity severity) {
+  absl::SetStderrThreshold(static_cast<absl::LogSeverityAtLeast>(severity));
+}
+
+class ScopedStderrThreshold final {
+ public:
+  explicit ScopedStderrThreshold(absl::LogSeverityAtLeast severity);
+  ScopedStderrThreshold(const ScopedStderrThreshold&) = delete;
+  ScopedStderrThreshold& operator=(const ScopedStderrThreshold&) = delete;
+  ~ScopedStderrThreshold();
+
+ private:
+  absl::LogSeverityAtLeast saved_severity_;
+};
+
+
+namespace log_internal {
+[[nodiscard]] bool ShouldLogBacktraceAt(absl::string_view file, int line);
+}  
+
+void SetLogBacktraceLocation(absl::string_view file, int line);
+
+void ClearLogBacktraceLocation();
+
+[[nodiscard]] bool ShouldPrependLogPrefix();
+
+void EnableLogPrefix(bool on_off);
+
+
+inline int SetGlobalVLogLevel(int threshold) {
+  return absl::log_internal::UpdateGlobalVLogLevel(threshold);
+}
+
+inline int SetVLogLevel(absl::string_view module_pattern, int threshold) {
+  return absl::log_internal::PrependVModule(module_pattern, threshold);
+}
+
+
+void SetAndroidNativeTag(const char* tag);
+
+namespace log_internal {
+const char* GetAndroidNativeTag();
+}  
+
+namespace log_internal {
+
+using LoggingGlobalsListener = void (*)();
+void SetLoggingGlobalsListener(LoggingGlobalsListener l);
+
+void RawSetMinLogLevel(absl::LogSeverityAtLeast severity);
+void RawSetStderrThreshold(absl::LogSeverityAtLeast severity);
+void RawEnableLogPrefix(bool on_off);
+
+}  
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_LOG_GLOBALS_H_

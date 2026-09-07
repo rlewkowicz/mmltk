@@ -1,0 +1,475 @@
+// Copyright (c) 2011-2016 Google Inc.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the gfx/skia/LICENSE file.
+
+#include "SkConvolver.h"
+
+#include <algorithm>
+
+#if defined(USE_SSE2)
+#  include "mozilla/SSE.h"
+#endif
+
+#if defined(USE_NEON)
+#  include "mozilla/arm.h"
+#endif
+
+namespace skia {
+
+using mozilla::gfx::BytesPerPixel;
+using mozilla::gfx::IsOpaque;
+using mozilla::gfx::SurfaceFormat;
+
+static inline unsigned char ClampTo8(int a) {
+  if (static_cast<unsigned>(a) < 256) {
+    return a;  
+  }
+  if (a < 0) {
+    return 0;
+  }
+  return 255;
+}
+
+template <bool hasAlpha>
+void ConvolveHorizontally(const unsigned char* srcData,
+                          const SkConvolutionFilter1D& filter,
+                          unsigned char* outRow) {
+  int numValues = filter.numValues();
+  for (int outX = 0; outX < numValues; outX++) {
+    int filterOffset, filterLength;
+    const SkConvolutionFilter1D::ConvolutionFixed* filterValues =
+        filter.FilterForValue(outX, &filterOffset, &filterLength);
+
+    const unsigned char* rowToFilter = &srcData[filterOffset * 4];
+
+    int accum[4] = {0};
+    for (int filterX = 0; filterX < filterLength; filterX++) {
+      SkConvolutionFilter1D::ConvolutionFixed curFilter = filterValues[filterX];
+      accum[0] += curFilter * rowToFilter[filterX * 4 + 0];
+      accum[1] += curFilter * rowToFilter[filterX * 4 + 1];
+      accum[2] += curFilter * rowToFilter[filterX * 4 + 2];
+      if (hasAlpha) {
+        accum[3] += curFilter * rowToFilter[filterX * 4 + 3];
+      }
+    }
+
+    constexpr int kRound = 1 << (SkConvolutionFilter1D::kShiftBits - 1);
+    accum[0] = (accum[0] + kRound) >> SkConvolutionFilter1D::kShiftBits;
+    accum[1] = (accum[1] + kRound) >> SkConvolutionFilter1D::kShiftBits;
+    accum[2] = (accum[2] + kRound) >> SkConvolutionFilter1D::kShiftBits;
+
+    if (hasAlpha) {
+      accum[3] = (accum[3] + kRound) >> SkConvolutionFilter1D::kShiftBits;
+    }
+
+    outRow[outX * 4 + 0] = ClampTo8(accum[0]);
+    outRow[outX * 4 + 1] = ClampTo8(accum[1]);
+    outRow[outX * 4 + 2] = ClampTo8(accum[2]);
+    if (hasAlpha) {
+      outRow[outX * 4 + 3] = ClampTo8(accum[3]);
+    }
+  }
+}
+
+template <bool hasAlpha>
+void ConvolveVertically(
+    const SkConvolutionFilter1D::ConvolutionFixed* filterValues,
+    int filterLength, unsigned char* const* sourceDataRows, int pixelWidth,
+    unsigned char* outRow) {
+  for (int outX = 0; outX < pixelWidth; outX++) {
+    int byteOffset = outX * 4;
+
+    int accum[4] = {0};
+    for (int filterY = 0; filterY < filterLength; filterY++) {
+      SkConvolutionFilter1D::ConvolutionFixed curFilter = filterValues[filterY];
+      accum[0] += curFilter * sourceDataRows[filterY][byteOffset + 0];
+      accum[1] += curFilter * sourceDataRows[filterY][byteOffset + 1];
+      accum[2] += curFilter * sourceDataRows[filterY][byteOffset + 2];
+      if (hasAlpha) {
+        accum[3] += curFilter * sourceDataRows[filterY][byteOffset + 3];
+      }
+    }
+
+    constexpr int kRound = 1 << (SkConvolutionFilter1D::kShiftBits - 1);
+    accum[0] = (accum[0] + kRound) >> SkConvolutionFilter1D::kShiftBits;
+    accum[1] = (accum[1] + kRound) >> SkConvolutionFilter1D::kShiftBits;
+    accum[2] = (accum[2] + kRound) >> SkConvolutionFilter1D::kShiftBits;
+    if (hasAlpha) {
+      accum[3] = (accum[3] + kRound) >> SkConvolutionFilter1D::kShiftBits;
+    }
+
+    outRow[byteOffset + 0] = ClampTo8(accum[0]);
+    outRow[byteOffset + 1] = ClampTo8(accum[1]);
+    outRow[byteOffset + 2] = ClampTo8(accum[2]);
+
+    if (hasAlpha) {
+      unsigned char alpha = ClampTo8(accum[3]);
+
+      int maxColorChannel =
+          std::max(outRow[byteOffset + 0],
+                   std::max(outRow[byteOffset + 1], outRow[byteOffset + 2]));
+      if (alpha < maxColorChannel) {
+        outRow[byteOffset + 3] = maxColorChannel;
+      } else {
+        outRow[byteOffset + 3] = alpha;
+      }
+    } else {
+      outRow[byteOffset + 3] = 0xff;
+    }
+  }
+}
+
+void ConvolveHorizontallyA8(const unsigned char* srcData,
+                            const SkConvolutionFilter1D& filter,
+                            unsigned char* outRow) {
+  int numValues = filter.numValues();
+  for (int outX = 0; outX < numValues; outX++) {
+    int filterOffset, filterLength;
+    const SkConvolutionFilter1D::ConvolutionFixed* filterValues =
+        filter.FilterForValue(outX, &filterOffset, &filterLength);
+
+    const unsigned char* rowToFilter = &srcData[filterOffset];
+
+    int accum = 0;
+    for (int filterX = 0; filterX < filterLength; filterX++) {
+      SkConvolutionFilter1D::ConvolutionFixed curFilter = filterValues[filterX];
+      accum += curFilter * rowToFilter[filterX];
+    }
+
+    constexpr int kRound = 1 << (SkConvolutionFilter1D::kShiftBits - 1);
+    accum = (accum + kRound) >> SkConvolutionFilter1D::kShiftBits;
+
+    outRow[outX] = ClampTo8(accum);
+  }
+}
+
+void ConvolveVerticallyA8(
+    const SkConvolutionFilter1D::ConvolutionFixed* filterValues,
+    int filterLength, unsigned char* const* sourceDataRows, int pixelWidth,
+    unsigned char* outRow) {
+  for (int outX = 0; outX < pixelWidth; outX++) {
+    int accum = 0;
+    for (int filterY = 0; filterY < filterLength; filterY++) {
+      SkConvolutionFilter1D::ConvolutionFixed curFilter = filterValues[filterY];
+      accum += curFilter * sourceDataRows[filterY][outX];
+    }
+
+    constexpr int kRound = 1 << (SkConvolutionFilter1D::kShiftBits - 1);
+    accum = (accum + kRound) >> SkConvolutionFilter1D::kShiftBits;
+
+    outRow[outX] = ClampTo8(accum);
+  }
+}
+
+#if defined(USE_SSE2)
+void convolve_vertically_avx2(const int16_t* filter, int filterLen,
+                              uint8_t* const* srcRows, int width, uint8_t* out,
+                              bool hasAlpha);
+void convolve_horizontally_sse2(const unsigned char* srcData,
+                                const SkConvolutionFilter1D& filter,
+                                unsigned char* outRow, bool hasAlpha);
+void convolve_vertically_sse2(const int16_t* filter, int filterLen,
+                              uint8_t* const* srcRows, int width, uint8_t* out,
+                              bool hasAlpha);
+#elif defined(USE_NEON)
+void convolve_horizontally_neon(const unsigned char* srcData,
+                                const SkConvolutionFilter1D& filter,
+                                unsigned char* outRow, bool hasAlpha);
+void convolve_vertically_neon(const int16_t* filter, int filterLen,
+                              uint8_t* const* srcRows, int width, uint8_t* out,
+                              bool hasAlpha);
+#endif
+
+void convolve_horizontally(const unsigned char* srcData,
+                           const SkConvolutionFilter1D& filter,
+                           unsigned char* outRow, SurfaceFormat format) {
+  if (format == SurfaceFormat::A8) {
+    ConvolveHorizontallyA8(srcData, filter, outRow);
+    return;
+  }
+
+  bool hasAlpha = !IsOpaque(format);
+#if defined(USE_SSE2)
+  if (mozilla::supports_sse2()) {
+    convolve_horizontally_sse2(srcData, filter, outRow, hasAlpha);
+    return;
+  }
+#elif defined(USE_NEON)
+  if (mozilla::supports_neon()) {
+    convolve_horizontally_neon(srcData, filter, outRow, hasAlpha);
+    return;
+  }
+#endif
+  if (hasAlpha) {
+    ConvolveHorizontally<true>(srcData, filter, outRow);
+  } else {
+    ConvolveHorizontally<false>(srcData, filter, outRow);
+  }
+}
+
+void convolve_vertically(
+    const SkConvolutionFilter1D::ConvolutionFixed* filterValues,
+    int filterLength, unsigned char* const* sourceDataRows, int pixelWidth,
+    unsigned char* outRow, SurfaceFormat format) {
+  if (format == SurfaceFormat::A8) {
+    ConvolveVerticallyA8(filterValues, filterLength, sourceDataRows, pixelWidth,
+                         outRow);
+    return;
+  }
+
+  bool hasAlpha = !IsOpaque(format);
+#if defined(USE_SSE2)
+  if (mozilla::supports_avx2()) {
+    convolve_vertically_avx2(filterValues, filterLength, sourceDataRows,
+                             pixelWidth, outRow, hasAlpha);
+    return;
+  }
+  if (mozilla::supports_sse2()) {
+    convolve_vertically_sse2(filterValues, filterLength, sourceDataRows,
+                             pixelWidth, outRow, hasAlpha);
+    return;
+  }
+#elif defined(USE_NEON)
+  if (mozilla::supports_neon()) {
+    convolve_vertically_neon(filterValues, filterLength, sourceDataRows,
+                             pixelWidth, outRow, hasAlpha);
+    return;
+  }
+#endif
+  if (hasAlpha) {
+    ConvolveVertically<true>(filterValues, filterLength, sourceDataRows,
+                             pixelWidth, outRow);
+  } else {
+    ConvolveVertically<false>(filterValues, filterLength, sourceDataRows,
+                              pixelWidth, outRow);
+  }
+}
+
+class CircularRowBuffer {
+ public:
+  CircularRowBuffer(int destRowPixelWidth, int maxYFilterSize,
+                    int firstInputRow)
+      : fRowByteWidth(destRowPixelWidth * 4),
+        fNumRows(maxYFilterSize),
+        fNextRow(0),
+        fNextRowCoordinate(firstInputRow) {}
+
+  bool AllocBuffer() {
+    return fBuffer.resize(fRowByteWidth * fNumRows) &&
+           fRowAddresses.resize(fNumRows);
+  }
+
+  unsigned char* advanceRow() {
+    unsigned char* row = &fBuffer[fNextRow * fRowByteWidth];
+    fNextRowCoordinate++;
+
+    fNextRow++;
+    if (fNextRow == fNumRows) {
+      fNextRow = 0;
+    }
+    return row;
+  }
+
+  unsigned char* const* GetRowAddresses(int* firstRowIndex) {
+    *firstRowIndex = fNextRowCoordinate - fNumRows;
+
+    int curRow = fNextRow;
+    for (int i = 0; i < fNumRows; i++) {
+      fRowAddresses[i] = &fBuffer[curRow * fRowByteWidth];
+
+      curRow++;
+      if (curRow == fNumRows) {
+        curRow = 0;
+      }
+    }
+    return &fRowAddresses[0];
+  }
+
+ private:
+  mozilla::Vector<unsigned char> fBuffer;
+
+  int fRowByteWidth;
+
+  int fNumRows;
+
+  int fNextRow;
+
+  int fNextRowCoordinate;
+
+  mozilla::Vector<unsigned char*> fRowAddresses;
+};
+
+SkConvolutionFilter1D::SkConvolutionFilter1D() : fMaxFilter(0) {}
+
+SkConvolutionFilter1D::~SkConvolutionFilter1D() = default;
+
+bool SkConvolutionFilter1D::AddFilter(int filterOffset,
+                                      const ConvolutionFixed* filterValues,
+                                      int filterLength) {
+  int filterSize = filterLength;
+  int firstNonZero = 0;
+  while (firstNonZero < filterLength && filterValues[firstNonZero] == 0) {
+    firstNonZero++;
+  }
+
+  if (firstNonZero < filterLength) {
+    int lastNonZero = filterLength - 1;
+    while (lastNonZero >= 0 && filterValues[lastNonZero] == 0) {
+      lastNonZero--;
+    }
+
+    filterOffset += firstNonZero;
+    filterLength = lastNonZero + 1 - firstNonZero;
+    MOZ_ASSERT(filterLength > 0);
+
+    if (!fFilterValues.append(&filterValues[firstNonZero], filterLength)) {
+      return false;
+    }
+  } else {
+    filterLength = 0;
+  }
+
+  FilterInstance instance = {
+      int(fFilterValues.length()) - filterLength, filterOffset, filterLength,
+      filterSize};
+  if (!fFilters.append(instance)) {
+    if (filterLength > 0) {
+      fFilterValues.shrinkBy(filterLength);
+    }
+    return false;
+  }
+
+  fMaxFilter = std::max(fMaxFilter, filterLength);
+  return true;
+}
+
+bool SkConvolutionFilter1D::ComputeFilterValues(
+    const SkBitmapFilter& aBitmapFilter, int32_t aSrcSize, int32_t aDstSize) {
+  float scale = float(aDstSize) / float(aSrcSize);
+  float clampedScale = std::min(1.0f, scale);
+  float srcSupport = aBitmapFilter.width() / clampedScale;
+  float invScale = 1.0f / scale;
+
+  mozilla::Vector<float, 64> filterValues;
+  mozilla::Vector<ConvolutionFixed, 64> fixedFilterValues;
+
+
+  const int32_t maxToPassToReserveAdditional = 1717986913;
+
+  int32_t filterValueCount = int32_t(ceilf(aDstSize * srcSupport * 2));
+  if (aDstSize > maxToPassToReserveAdditional || filterValueCount < 0 ||
+      filterValueCount > maxToPassToReserveAdditional ||
+      !reserveAdditional(aDstSize, filterValueCount)) {
+    return false;
+  }
+  size_t oldFiltersLength = fFilters.length();
+  size_t oldFilterValuesLength = fFilterValues.length();
+  int oldMaxFilter = fMaxFilter;
+  for (int32_t destI = 0; destI < aDstSize; destI++) {
+    float srcPixel = (static_cast<float>(destI) + 0.5f) * invScale;
+
+    int32_t srcBegin =
+        int32_t(std::clamp(int64_t(floorf(srcPixel - srcSupport)), int64_t(0),
+                           int64_t(aSrcSize) - 1));
+    int32_t srcEnd = int32_t(std::clamp(int64_t(ceilf(srcPixel + srcSupport)),
+                                        int64_t(0), int64_t(aSrcSize) - 1));
+
+
+    int32_t filterCount = srcEnd - srcBegin + 1;
+    if (filterCount <= 0 || !filterValues.resize(filterCount) ||
+        !fixedFilterValues.resize(filterCount)) {
+      return false;
+    }
+
+    float destFilterDist =
+        (static_cast<float>(srcBegin) + 0.5f - srcPixel) * clampedScale;
+    float filterSum = 0.0f;
+    for (int32_t index = 0; index < filterCount; index++) {
+      float filterValue = aBitmapFilter.evaluate(destFilterDist);
+      filterValues[index] = filterValue;
+      filterSum += filterValue;
+      destFilterDist += clampedScale;
+    }
+
+    ConvolutionFixed fixedSum = 0;
+    float invFilterSum = 1.0f / filterSum;
+    for (int32_t fixedI = 0; fixedI < filterCount; fixedI++) {
+      ConvolutionFixed curFixed = ToFixed(filterValues[fixedI] * invFilterSum);
+      fixedSum += curFixed;
+      fixedFilterValues[fixedI] = curFixed;
+    }
+
+    ConvolutionFixed leftovers = ToFixed(1) - fixedSum;
+    fixedFilterValues[filterCount / 2] += leftovers;
+
+    if (!AddFilter(srcBegin, fixedFilterValues.begin(), filterCount)) {
+      fFilters.shrinkTo(oldFiltersLength);
+      fFilterValues.shrinkTo(oldFilterValuesLength);
+      fMaxFilter = oldMaxFilter;
+      return false;
+    }
+  }
+
+  return maxFilter() > 0 && numValues() == aDstSize;
+}
+
+bool BGRAConvolve2D(const unsigned char* sourceData, int sourceByteRowStride,
+                    SurfaceFormat format, const SkConvolutionFilter1D& filterX,
+                    const SkConvolutionFilter1D& filterY,
+                    int outputByteRowStride, unsigned char* output) {
+  int maxYFilterSize = filterY.maxFilter();
+
+  int filterOffset = 0, filterLength = 0;
+  const SkConvolutionFilter1D::ConvolutionFixed* filterValues =
+      filterY.FilterForValue(0, &filterOffset, &filterLength);
+  int nextXRow = filterOffset;
+
+  int rowBufferWidth = (filterX.numValues() + 31) & ~0x1F;
+  int rowBufferHeight = maxYFilterSize;
+
+  {
+    int64_t size = int64_t(rowBufferWidth) * int64_t(rowBufferHeight);
+    if (size > 100 * 1024 * 1024) {
+      return false;
+    }
+  }
+
+  CircularRowBuffer rowBuffer(rowBufferWidth, rowBufferHeight, filterOffset);
+  if (!rowBuffer.AllocBuffer()) {
+    return false;
+  }
+
+  MOZ_ASSERT(outputByteRowStride >=
+             filterX.numValues() * BytesPerPixel(format));
+  int numOutputRows = filterY.numValues();
+
+  int lastFilterOffset, lastFilterLength;
+  filterY.FilterForValue(numOutputRows - 1, &lastFilterOffset,
+                         &lastFilterLength);
+
+  for (int outY = 0; outY < numOutputRows; outY++) {
+    filterValues = filterY.FilterForValue(outY, &filterOffset, &filterLength);
+
+    while (nextXRow < filterOffset + filterLength) {
+      convolve_horizontally(
+          &sourceData[(uint64_t)nextXRow * sourceByteRowStride], filterX,
+          rowBuffer.advanceRow(), format);
+      nextXRow++;
+    }
+
+    unsigned char* curOutputRow = &output[(uint64_t)outY * outputByteRowStride];
+
+    int firstRowInCircularBuffer;
+    unsigned char* const* rowsToConvolve =
+        rowBuffer.GetRowAddresses(&firstRowInCircularBuffer);
+
+    unsigned char* const* firstRowForFilter =
+        &rowsToConvolve[filterOffset - firstRowInCircularBuffer];
+
+    convolve_vertically(filterValues, filterLength, firstRowForFilter,
+                        filterX.numValues(), curOutputRow, format);
+  }
+  return true;
+}
+
+}  

@@ -1,0 +1,302 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MP4_DEMUXER_H264_H_
+#define MP4_DEMUXER_H264_H_
+
+#include <stdint.h>
+
+#include "ErrorList.h"
+#include "mozilla/AlreadyAddRefed.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/Result.h"
+#include "mozilla/Span.h"
+#include "mozilla/gfx/Point.h"
+#include "mozilla/gfx/Types.h"
+#include "nsTArray.h"
+
+namespace mozilla {
+class BitReader;
+class MediaByteBuffer;
+class MediaRawData;
+
+enum H264_PROFILE {
+  H264_PROFILE_UNKNOWN = 0,
+  H264_PROFILE_BASE = 0x42,
+  H264_PROFILE_MAIN = 0x4D,
+  H264_PROFILE_EXTENDED = 0x58,
+  H264_PROFILE_HIGH = 0x64,
+};
+
+enum class H264_LEVEL {
+  H264_LEVEL_1 = 10,
+  H264_LEVEL_1_b = 11,
+  H264_LEVEL_1_1 = 11,
+  H264_LEVEL_1_2 = 12,
+  H264_LEVEL_1_3 = 13,
+  H264_LEVEL_2 = 20,
+  H264_LEVEL_2_1 = 21,
+  H264_LEVEL_2_2 = 22,
+  H264_LEVEL_3 = 30,
+  H264_LEVEL_3_1 = 31,
+  H264_LEVEL_3_2 = 32,
+  H264_LEVEL_4 = 40,
+  H264_LEVEL_4_1 = 41,
+  H264_LEVEL_4_2 = 42,
+  H264_LEVEL_5 = 50,
+  H264_LEVEL_5_1 = 51,
+  H264_LEVEL_5_2 = 52,
+  H264_LEVEL_6 = 60,
+  H264_LEVEL_6_1 = 61,
+  H264_LEVEL_6_2 = 62
+};
+
+#define MAX_SPS_COUNT 32
+#define MAX_PPS_COUNT 256
+
+enum NAL_TYPES {
+  H264_NAL_SLICE = 1,
+  H264_NAL_DPA = 2,
+  H264_NAL_DPB = 3,
+  H264_NAL_DPC = 4,
+  H264_NAL_IDR_SLICE = 5,
+  H264_NAL_SEI = 6,
+  H264_NAL_SPS = 7,
+  H264_NAL_PPS = 8,
+  H264_NAL_AUD = 9,
+  H264_NAL_END_SEQUENCE = 10,
+  H264_NAL_END_STREAM = 11,
+  H264_NAL_FILLER_DATA = 12,
+  H264_NAL_SPS_EXT = 13,
+  H264_NAL_PREFIX = 14,
+  H264_NAL_AUXILIARY_SLICE = 19,
+  H264_NAL_SLICE_EXT = 20,
+  H264_NAL_SLICE_EXT_DVC = 21,
+};
+
+struct MOZ_STACK_CLASS H264NALU final {
+  H264NALU(const uint8_t* aData MOZ_LIFETIME_BOUND, uint32_t aByteCount);
+  H264NALU() = default;
+
+  uint8_t mNalUnitType;
+  const Span<const uint8_t> mNALU;
+};
+
+enum SLICE_TYPES {
+  P_SLICE = 0,
+  B_SLICE = 1,
+  I_SLICE = 2,
+  SP_SLICE = 3,
+  SI_SLICE = 4,
+};
+
+struct SPSData {
+  bool operator==(const SPSData& aOther) const;
+  bool operator!=(const SPSData& aOther) const;
+
+  gfx::YUVColorSpace ColorSpace() const;
+  gfx::ColorDepth ColorDepth() const;
+
+  bool valid = {};
+
+  uint32_t pic_width = {};
+  uint32_t pic_height = {};
+
+  bool interlaced = {};
+
+  uint32_t display_width = {};
+  uint32_t display_height = {};
+
+  float sample_ratio = {};
+
+  uint32_t crop_left = {};
+  uint32_t crop_right = {};
+  uint32_t crop_top = {};
+  uint32_t crop_bottom = {};
+
+
+  bool constraint_set0_flag = {};
+  bool constraint_set1_flag = {};
+  bool constraint_set2_flag = {};
+  bool constraint_set3_flag = {};
+  bool constraint_set4_flag = {};
+  bool constraint_set5_flag = {};
+
+  uint8_t profile_idc = {};
+  uint8_t level_idc = {};
+
+  uint8_t seq_parameter_set_id = {};
+
+  uint8_t chroma_format_idc = {};
+
+  uint8_t bit_depth_luma_minus8 = {};
+
+  uint8_t bit_depth_chroma_minus8 = {};
+
+  bool separate_colour_plane_flag = {};
+
+  bool seq_scaling_matrix_present_flag = {};
+
+  uint8_t log2_max_frame_num = {};
+
+  uint8_t pic_order_cnt_type = {};
+
+  uint8_t log2_max_pic_order_cnt_lsb = {};
+
+  bool delta_pic_order_always_zero_flag = {};
+
+  int8_t offset_for_non_ref_pic = {};
+
+  int8_t offset_for_top_to_bottom_field = {};
+
+  uint32_t max_num_ref_frames = {};
+
+  bool gaps_in_frame_num_allowed_flag = {};
+
+  uint32_t pic_width_in_mbs = {};
+
+  uint32_t pic_height_in_map_units = {};
+
+  bool frame_mbs_only_flag = {};
+
+  bool mb_adaptive_frame_field_flag = {};
+
+  bool direct_8x8_inference_flag = {};
+
+  bool frame_cropping_flag = {};
+  uint32_t frame_crop_left_offset = {};
+  uint32_t frame_crop_right_offset = {};
+  uint32_t frame_crop_top_offset = {};
+  uint32_t frame_crop_bottom_offset = {};
+
+
+  bool vui_parameters_present_flag = {};
+
+  bool aspect_ratio_info_present_flag = {};
+
+  uint8_t aspect_ratio_idc = {};
+  uint32_t sar_width = {};
+  uint32_t sar_height = {};
+
+  bool video_signal_type_present_flag = {};
+
+  bool overscan_info_present_flag = {};
+  bool overscan_appropriate_flag = {};
+
+  uint8_t video_format = {};
+
+  bool video_full_range_flag = {};
+
+  bool colour_description_present_flag = {};
+
+  uint8_t colour_primaries = {};
+
+  uint8_t transfer_characteristics = {};
+
+  uint8_t matrix_coefficients = {};
+  bool chroma_loc_info_present_flag = {};
+  uint8_t chroma_sample_loc_type_top_field = {};
+  uint8_t chroma_sample_loc_type_bottom_field = {};
+
+  bool scaling_matrix_present = {};
+  uint8_t scaling_matrix4x4[6][16] = {};
+  uint8_t scaling_matrix8x8[6][64] = {};
+
+  SPSData();
+};
+
+struct SEIRecoveryData {
+  uint32_t recovery_frame_cnt = 0;
+  bool exact_match_flag = false;
+  bool broken_link_flag = false;
+  uint8_t changing_slice_group_idc = 0;
+};
+
+class H264 {
+ public:
+  static bool HasSPS(const mozilla::MediaByteBuffer* aExtraData);
+  static already_AddRefed<mozilla::MediaByteBuffer> ExtractExtraData(
+      const mozilla::MediaRawData* aSample);
+  static bool CompareExtraData(const mozilla::MediaByteBuffer* aExtraData1,
+                               const mozilla::MediaByteBuffer* aExtraData2);
+
+  static bool EnsureSPSIsSane(SPSData& aSPS);
+
+  static bool DecodeSPSFromExtraData(const mozilla::MediaByteBuffer* aExtraData,
+                                     SPSData& aDest);
+  static bool DecodeSPS(const mozilla::MediaByteBuffer* aSPS, SPSData& aDest);
+
+  static uint32_t ComputeMaxRefFrames(
+      const mozilla::MediaByteBuffer* aExtraData);
+
+  enum class FrameType {
+    I_FRAME_IDR,
+    I_FRAME_OTHER,
+    OTHER,
+    INVALID,
+  };
+
+  static FrameType GetFrameType(const mozilla::MediaRawData* aSample);
+
+  static Result<int, nsresult> ExtractSVCTemporalId(const uint8_t* aData,
+                                                    size_t aLength);
+
+  static already_AddRefed<mozilla::MediaByteBuffer> CreateExtraData(
+      uint8_t aProfile, uint8_t aConstraints, H264_LEVEL aLevel,
+      const gfx::IntSize& aSize);
+  static void WriteExtraData(mozilla::MediaByteBuffer* aDestExtraData,
+                             const uint8_t aProfile, const uint8_t aConstraints,
+                             const uint8_t aLevel,
+                             const Span<const uint8_t> aSPS,
+                             const Span<const uint8_t> aPPS);
+
+ private:
+  friend class SPSNAL;
+
+  static already_AddRefed<mozilla::MediaByteBuffer> DecodeNALUnit(
+      const uint8_t* aNAL, size_t aLength);
+  static already_AddRefed<mozilla::MediaByteBuffer> EncodeNALUnit(
+      const uint8_t* aNAL, size_t aLength);
+  static bool vui_parameters(mozilla::BitReader& aBr, SPSData& aDest);
+  static void hrd_parameters(mozilla::BitReader& aBr);
+  static uint8_t NumSPS(const mozilla::MediaByteBuffer* aExtraData);
+  static bool DecodeRecoverySEI(const mozilla::MediaByteBuffer* aSEI,
+                                SEIRecoveryData& aDest);
+  static bool DecodeISlice(const mozilla::MediaByteBuffer* aSlice);
+};
+
+struct AVCCConfig final {
+ public:
+  static Result<AVCCConfig, nsresult> Parse(
+      const mozilla::MediaRawData* aSample);
+  static Result<AVCCConfig, nsresult> Parse(
+      const mozilla::MediaByteBuffer* aExtraData);
+
+  uint8_t NALUSize() const { return mLengthSizeMinusOne + 1; }
+
+  uint8_t mConfigurationVersion;
+  uint8_t mAVCProfileIndication;
+  uint8_t mProfileCompatibility;
+  uint8_t mAVCLevelIndication;
+  uint8_t mLengthSizeMinusOne;
+  nsTArray<H264NALU> mSPSs;
+  nsTArray<H264NALU> mPPSs;
+  Maybe<uint8_t> mChromaFormat;
+  Maybe<uint8_t> mBitDepthLumaMinus8;
+  Maybe<uint8_t> mBitDepthChromaMinus8;
+  nsTArray<H264NALU> mSPSExts;
+
+  uint32_t NumSPS() const { return mSPSs.Length(); }
+  uint32_t NumPPS() const { return mPPSs.Length(); }
+  uint32_t NumSPSExt() const { return mSPSExts.Length(); }
+
+  already_AddRefed<mozilla::MediaByteBuffer> CreateNewExtraData() const;
+
+ private:
+  AVCCConfig() = default;
+};
+
+}  
+
+#endif  // MP4_DEMUXER_H264_H_

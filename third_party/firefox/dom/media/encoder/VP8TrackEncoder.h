@@ -1,0 +1,103 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef VP8TrackEncoder_h_
+#define VP8TrackEncoder_h_
+
+#include <vpx/vpx_codec.h>
+
+#include "TimeUnits.h"
+#include "TrackEncoder.h"
+#include "mozilla/RollingMean.h"
+
+namespace mozilla {
+
+typedef struct vpx_codec_ctx vpx_codec_ctx_t;
+typedef struct vpx_codec_enc_cfg vpx_codec_enc_cfg_t;
+typedef struct vpx_image vpx_image_t;
+
+class VP8Metadata;
+
+class VP8TrackEncoder : public VideoTrackEncoder {
+  enum EncodeOperation {
+    ENCODE_NORMAL_FRAME,  
+    ENCODE_I_FRAME,       
+    SKIP_FRAME,           
+  };
+
+ public:
+  VP8TrackEncoder(RefPtr<DriftCompensator> aDriftCompensator,
+                  TrackRate aTrackRate,
+                  MediaQueue<EncodedFrame>& aEncodedDataQueue,
+                  FrameDroppingMode aFrameDroppingMode,
+                  Maybe<float> aKeyFrameIntervalFactor = Nothing());
+  virtual ~VP8TrackEncoder();
+
+  already_AddRefed<TrackMetadataBase> GetMetadata() final;
+
+ protected:
+  nsresult Init(int32_t aWidth, int32_t aHeight, int32_t aDisplayWidth,
+                int32_t aDisplayHeight, float aEstimatedFrameRate) final;
+
+ private:
+  nsresult InitInternal(int32_t aWidth, int32_t aHeight,
+                        int32_t aMaxKeyFrameDistance);
+
+  EncodeOperation GetNextEncodeOperation(TimeDuration aTimeElapsed,
+                                         TimeDuration aProcessedDuration);
+
+  Result<RefPtr<EncodedFrame>, nsresult> ExtractEncodedData();
+
+  nsresult Encode(VideoSegment* aSegment) final;
+
+  nsresult PrepareRawFrame(VideoChunk& aChunk);
+
+  nsresult Reconfigure(int32_t aWidth, int32_t aHeight,
+                       int32_t aMaxKeyFrameDistance);
+
+  void Destroy();
+
+  Maybe<int32_t> CalculateMaxKeyFrameDistance(
+      Maybe<float> aEstimatedFrameRate = Nothing()) const;
+
+  void SetMaxKeyFrameDistance(int32_t aMaxKeyFrameDistance);
+
+  RefPtr<VP8Metadata> mMetadata;
+
+  int mFrameWidth = 0;
+
+  int mFrameHeight = 0;
+
+  TrackTime mEncodedTimestamp = 0;
+
+  CheckedInt64 mExtractedDuration;
+
+  media::TimeUnit mExtractedDurationUs;
+
+  RefPtr<layers::Image> mMuteFrame;
+
+  UniquePtr<uint8_t[]> mI420Frame;
+  size_t mI420FrameSize = 0;
+
+  TrackTime mDurationSinceLastKeyframe = 0;
+
+  const TimeDuration mKeyFrameInterval;
+
+  float mKeyFrameIntervalFactor;
+
+  media::TimeUnit mLastKeyFrameDistanceUpdate;
+
+  Maybe<int32_t> mMaxKeyFrameDistance;
+
+  RollingMean<TimeDuration, TimeDuration> mMeanFrameDuration{30};
+
+  RollingMean<TimeDuration, TimeDuration> mMeanFrameEncodeDuration{30};
+
+  vpx_codec_ctx_t mVPXContext;
+  vpx_image_t mVPXImageWrapper;
+};
+
+}  
+
+#endif

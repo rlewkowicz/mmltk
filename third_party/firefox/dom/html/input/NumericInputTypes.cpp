@@ -1,0 +1,157 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "mozilla/dom/NumericInputTypes.h"
+
+#include "ICUUtils.h"
+#include "mozilla/ClearOnShutdown.h"
+#include "mozilla/TextControlState.h"
+#include "mozilla/dom/HTMLInputElement.h"
+
+using namespace mozilla;
+using namespace mozilla::dom;
+
+bool NumericInputTypeBase::IsRangeOverflow() const {
+  Decimal maximum = mInputElement->GetMaximum();
+  if (maximum.isNaN()) {
+    return false;
+  }
+
+  Decimal value = mInputElement->GetValueAsDecimal();
+  if (value.isNaN()) {
+    return false;
+  }
+
+  return value > maximum;
+}
+
+bool NumericInputTypeBase::IsRangeUnderflow() const {
+  Decimal minimum = mInputElement->GetMinimum();
+  if (minimum.isNaN()) {
+    return false;
+  }
+
+  Decimal value = mInputElement->GetValueAsDecimal();
+  if (value.isNaN()) {
+    return false;
+  }
+
+  return value < minimum;
+}
+
+bool NumericInputTypeBase::HasStepMismatch() const {
+  Decimal value = mInputElement->GetValueAsDecimal();
+  return mInputElement->ValueIsStepMismatch(value);
+}
+
+nsresult NumericInputTypeBase::GetRangeOverflowMessage(nsAString& aMessage) {
+  Decimal maximum = mInputElement->GetMaximum();
+  MOZ_ASSERT(!maximum.isNaN());
+
+  nsAutoString maxStr;
+  ConvertNumberToString(maximum, Localized::Yes, maxStr);
+  return nsContentUtils::FormatMaybeLocalizedString(
+      aMessage, PropertiesFile::DOM_PROPERTIES,
+      "FormValidationNumberRangeOverflow", mInputElement->OwnerDoc(), maxStr);
+}
+
+nsresult NumericInputTypeBase::GetRangeUnderflowMessage(nsAString& aMessage) {
+  Decimal minimum = mInputElement->GetMinimum();
+  MOZ_ASSERT(!minimum.isNaN());
+
+  nsAutoString minStr;
+  ConvertNumberToString(minimum, Localized::Yes, minStr);
+  return nsContentUtils::FormatMaybeLocalizedString(
+      aMessage, PropertiesFile::DOM_PROPERTIES,
+      "FormValidationNumberRangeUnderflow", mInputElement->OwnerDoc(), minStr);
+}
+
+auto NumericInputTypeBase::ConvertStringToNumber(const nsAString& aValue,
+                                                 Localized) const
+    -> StringToNumberResult {
+  return {HTMLInputElement::StringToDecimal(aValue)};
+}
+
+bool NumericInputTypeBase::ConvertNumberToString(
+    Decimal aValue, Localized, nsAString& aResultString) const {
+  MOZ_ASSERT(aValue.isFinite(), "aValue must be a valid non-Infinite number.");
+  aResultString.Truncate();
+  aResultString.AssignASCII(aValue.toString().c_str());
+  return true;
+}
+
+
+bool NumberInputType::IsValueMissing() const {
+  if (!mInputElement->IsRequired()) {
+    return false;
+  }
+
+  if (!IsMutable()) {
+    return false;
+  }
+
+  if (PastShutdownPhase(ShutdownPhase::XPCOMShutdown)) {
+    return false;
+  }
+
+  return mInputElement->GetValueAsDecimal().isNaN();
+}
+
+bool NumberInputType::HasBadInput() const {
+  nsAutoString value;
+  GetNonFileValueInternal(value);
+  return !value.IsEmpty() && mInputElement->GetValueAsDecimal().isNaN();
+}
+
+auto NumberInputType::ConvertStringToNumber(const nsAString& aValue,
+                                            Localized aLocalized) const
+    -> StringToNumberResult {
+  auto result =
+      NumericInputTypeBase::ConvertStringToNumber(aValue, Localized::No);
+  if (result.mResult.isFinite() || aLocalized == Localized::No) {
+    return result;
+  }
+  ICUUtils::LanguageTagIterForContent langTagIter(mInputElement);
+  result.mLocalized = true;
+  result.mResult =
+      Decimal::fromDouble(ICUUtils::ParseNumber(aValue, langTagIter));
+  return result;
+}
+
+bool NumberInputType::ConvertNumberToString(Decimal aValue,
+                                            Localized aLocalized,
+                                            nsAString& aResultString) const {
+  MOZ_ASSERT(aValue.isFinite(), "aValue must be a valid non-Infinite number.");
+
+  if (aLocalized == Localized::No) {
+    return NumericInputTypeBase::ConvertNumberToString(aValue, aLocalized,
+                                                       aResultString);
+  }
+  aResultString.Truncate();
+  ICUUtils::LanguageTagIterForContent langTagIter(mInputElement);
+  ICUUtils::LocalizeNumber(aValue.toDouble(), langTagIter, aResultString);
+  return true;
+}
+
+nsresult NumberInputType::GetValueMissingMessage(nsAString& aMessage) {
+  return nsContentUtils::GetMaybeLocalizedString(
+      PropertiesFile::DOM_PROPERTIES, "FormValidationBadInputNumber",
+      mInputElement->OwnerDoc(), aMessage);
+}
+
+nsresult NumberInputType::GetBadInputMessage(nsAString& aMessage) {
+  return nsContentUtils::GetMaybeLocalizedString(
+      PropertiesFile::DOM_PROPERTIES, "FormValidationBadInputNumber",
+      mInputElement->OwnerDoc(), aMessage);
+}
+
+bool NumberInputType::IsMutable() const {
+  return !mInputElement->IsDisabledOrReadOnly();
+}
+
+void RangeInputType::MinMaxStepAttrChanged() {
+  nsAutoString value;
+  GetNonFileValueInternal(value);
+  SetValueInternal(value, TextControlState::ValueSetterOption::ByInternalAPI);
+}

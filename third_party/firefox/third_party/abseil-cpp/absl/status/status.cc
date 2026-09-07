@@ -1,0 +1,403 @@
+// Copyright 2019 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+#include "absl/status/status.h"
+
+#include <errno.h>
+
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <ostream>
+#include <string>
+
+#include "absl/base/attributes.h"
+#include "absl/base/config.h"
+#include "absl/base/internal/raw_logging.h"
+#include "absl/base/internal/strerror.h"
+#include "absl/base/macros.h"
+#include "absl/base/no_destructor.h"
+#include "absl/base/nullability.h"
+#include "absl/debugging/stacktrace.h"
+#include "absl/debugging/symbolize.h"
+#include "absl/status/internal/status_internal.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
+#include "absl/strings/str_split.h"
+#include "absl/strings/string_view.h"
+#include "absl/types/source_location.h"
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+
+static_assert(
+    alignof(status_internal::StatusRep) >= 4,
+    "absl::Status assumes it can use the bottom 2 bits of a StatusRep*.");
+
+std::string StatusCodeToString(StatusCode code) {
+  return std::string(absl::StatusCodeToStringView(code));
+}
+
+absl::string_view StatusCodeToStringView(StatusCode code) {
+  switch (code) {
+    case StatusCode::kOk:
+      return "OK";
+    case StatusCode::kCancelled:
+      return "CANCELLED";
+    case StatusCode::kUnknown:
+      return "UNKNOWN";
+    case StatusCode::kInvalidArgument:
+      return "INVALID_ARGUMENT";
+    case StatusCode::kDeadlineExceeded:
+      return "DEADLINE_EXCEEDED";
+    case StatusCode::kNotFound:
+      return "NOT_FOUND";
+    case StatusCode::kAlreadyExists:
+      return "ALREADY_EXISTS";
+    case StatusCode::kPermissionDenied:
+      return "PERMISSION_DENIED";
+    case StatusCode::kUnauthenticated:
+      return "UNAUTHENTICATED";
+    case StatusCode::kResourceExhausted:
+      return "RESOURCE_EXHAUSTED";
+    case StatusCode::kFailedPrecondition:
+      return "FAILED_PRECONDITION";
+    case StatusCode::kAborted:
+      return "ABORTED";
+    case StatusCode::kOutOfRange:
+      return "OUT_OF_RANGE";
+    case StatusCode::kUnimplemented:
+      return "UNIMPLEMENTED";
+    case StatusCode::kInternal:
+      return "INTERNAL";
+    case StatusCode::kUnavailable:
+      return "UNAVAILABLE";
+    case StatusCode::kDataLoss:
+      return "DATA_LOSS";
+    default:
+      return "";
+  }
+}
+
+std::ostream& operator<<(std::ostream& os, StatusCode code) {
+  return os << StatusCodeToString(code);
+}
+
+const std::string* absl_nonnull Status::EmptyString() {
+  static const absl::NoDestructor<std::string> kEmpty;
+  return kEmpty.get();
+}
+
+const std::string* absl_nonnull Status::MovedFromString() {
+  static const absl::NoDestructor<std::string> kMovedFrom(kMovedFromString);
+  return kMovedFrom.get();
+}
+
+absl::Status absl::Status::MakeNonOkStatusWithOkCode(
+    absl::string_view message) {
+  return absl::Status(
+      absl::Status::PointerToRep(new absl::status_internal::StatusRep(
+          absl::StatusCode::kOk, message, nullptr)));
+}
+
+uintptr_t Status::MakeRep(uintptr_t inlined_rep, absl::string_view msg,
+                          absl::SourceLocation loc) {
+  bool ok = inlined_rep == CodeToInlinedRep(absl::StatusCode::kOk);
+  if (ok) return inlined_rep;
+  if (msg.empty()
+  ) {
+    return inlined_rep;
+  }
+  auto* rep = new status_internal::StatusRep(InlinedRepToCode(inlined_rep), msg,
+                                             nullptr);
+  if (loc.file_name()[0] != '\0') {
+    rep->AddSourceLocation(loc);
+  }
+  return PointerToRep(rep);
+}
+
+uintptr_t Status::AddSourceLocationImpl(uintptr_t rep,
+                                        absl::SourceLocation loc) {
+  if (IsInlined(rep)) return rep;
+  if (loc.file_name()[0] == '\0') return rep;
+  status_internal::StatusRep* rep_ptr = PrepareToModify(rep);
+  rep_ptr->AddSourceLocation(loc);
+  return PointerToRep(rep_ptr);
+}
+
+status_internal::StatusRep* absl_nonnull Status::PrepareToModify(
+    uintptr_t rep) {
+  if (IsInlined(rep)) {
+    return new status_internal::StatusRep(InlinedRepToCode(rep),
+                                          absl::string_view(), nullptr);
+  }
+  return RepToPointer(rep)->CloneAndUnref();
+}
+
+std::string Status::ToStringSlow(uintptr_t rep, StatusToStringMode mode) {
+  if (IsInlined(rep)) {
+    return absl::StrCat(absl::StatusCodeToString(InlinedRepToCode(rep)), ": ");
+  }
+  return RepToPointer(rep)->ToString(mode);
+}
+
+std::ostream& operator<<(std::ostream& os, const Status& x) {
+  os << x.ToString(StatusToStringMode::kWithEverything);
+  return os;
+}
+
+namespace status_internal {
+template <int error_code>
+Status MakeErrorImpl(string_view message, SourceLocation loc) {
+  return Status(static_cast<StatusCode>(error_code), message, loc);
+}
+
+template Status MakeErrorImpl<0>(string_view, SourceLocation);
+template Status MakeErrorImpl<1>(string_view, SourceLocation);
+template Status MakeErrorImpl<2>(string_view, SourceLocation);
+template Status MakeErrorImpl<3>(string_view, SourceLocation);
+template Status MakeErrorImpl<4>(string_view, SourceLocation);
+template Status MakeErrorImpl<5>(string_view, SourceLocation);
+template Status MakeErrorImpl<6>(string_view, SourceLocation);
+template Status MakeErrorImpl<7>(string_view, SourceLocation);
+template Status MakeErrorImpl<8>(string_view, SourceLocation);
+template Status MakeErrorImpl<9>(string_view, SourceLocation);
+template Status MakeErrorImpl<10>(string_view, SourceLocation);
+template Status MakeErrorImpl<11>(string_view, SourceLocation);
+template Status MakeErrorImpl<12>(string_view, SourceLocation);
+template Status MakeErrorImpl<13>(string_view, SourceLocation);
+template Status MakeErrorImpl<14>(string_view, SourceLocation);
+template Status MakeErrorImpl<15>(string_view, SourceLocation);
+template Status MakeErrorImpl<16>(string_view, SourceLocation);
+}  
+
+bool IsAborted(const Status& status) {
+  return status.code() == absl::StatusCode::kAborted;
+}
+
+bool IsAlreadyExists(const Status& status) {
+  return status.code() == absl::StatusCode::kAlreadyExists;
+}
+
+bool IsCancelled(const Status& status) {
+  return status.code() == absl::StatusCode::kCancelled;
+}
+
+bool IsDataLoss(const Status& status) {
+  return status.code() == absl::StatusCode::kDataLoss;
+}
+
+bool IsDeadlineExceeded(const Status& status) {
+  return status.code() == absl::StatusCode::kDeadlineExceeded;
+}
+
+bool IsFailedPrecondition(const Status& status) {
+  return status.code() == absl::StatusCode::kFailedPrecondition;
+}
+
+bool IsInternal(const Status& status) {
+  return status.code() == absl::StatusCode::kInternal;
+}
+
+bool IsInvalidArgument(const Status& status) {
+  return status.code() == absl::StatusCode::kInvalidArgument;
+}
+
+bool IsNotFound(const Status& status) {
+  return status.code() == absl::StatusCode::kNotFound;
+}
+
+bool IsOutOfRange(const Status& status) {
+  return status.code() == absl::StatusCode::kOutOfRange;
+}
+
+bool IsPermissionDenied(const Status& status) {
+  return status.code() == absl::StatusCode::kPermissionDenied;
+}
+
+bool IsResourceExhausted(const Status& status) {
+  return status.code() == absl::StatusCode::kResourceExhausted;
+}
+
+bool IsUnauthenticated(const Status& status) {
+  return status.code() == absl::StatusCode::kUnauthenticated;
+}
+
+bool IsUnavailable(const Status& status) {
+  return status.code() == absl::StatusCode::kUnavailable;
+}
+
+bool IsUnimplemented(const Status& status) {
+  return status.code() == absl::StatusCode::kUnimplemented;
+}
+
+bool IsUnknown(const Status& status) {
+  return status.code() == absl::StatusCode::kUnknown;
+}
+
+StatusCode ErrnoToStatusCode(int error_number) {
+  switch (error_number) {
+    case 0:
+      return StatusCode::kOk;
+    case EINVAL:        
+    case ENAMETOOLONG:  
+    case E2BIG:         
+    case EDESTADDRREQ:  
+    case EDOM:          
+    case EFAULT:        
+    case EILSEQ:        
+    case ENOPROTOOPT:   
+    case ENOTSOCK:      
+    case ENOTTY:        
+    case EPROTOTYPE:    
+    case ESPIPE:        
+      return StatusCode::kInvalidArgument;
+    case ETIMEDOUT:  
+      return StatusCode::kDeadlineExceeded;
+    case ENODEV:  
+    case ENOENT:  
+#ifdef ENOMEDIUM
+    case ENOMEDIUM:  
+#endif
+    case ENXIO:  
+    case ESRCH:  
+      return StatusCode::kNotFound;
+    case EEXIST:         
+    case EADDRNOTAVAIL:  
+    case EALREADY:       
+#ifdef ENOTUNIQ
+    case ENOTUNIQ:  
+#endif
+      return StatusCode::kAlreadyExists;
+    case EPERM:   
+    case EACCES:  
+#ifdef ENOKEY
+    case ENOKEY:  
+#endif
+    case EROFS:  
+      return StatusCode::kPermissionDenied;
+    case ENOTEMPTY:   
+    case EISDIR:      
+    case ENOTDIR:     
+    case EADDRINUSE:  
+    case EBADF:       
+#ifdef EBADFD
+    case EBADFD:  
+#endif
+    case EBUSY:    
+    case ECHILD:   
+    case EISCONN:  
+#ifdef EISNAM
+    case EISNAM:  
+#endif
+#ifdef ENOTBLK
+    case ENOTBLK:  
+#endif
+    case ENOTCONN:  
+    case EPIPE:     
+#ifdef ESHUTDOWN
+    case ESHUTDOWN:  
+#endif
+    case ETXTBSY:  
+#ifdef EUNATCH
+    case EUNATCH:  
+#endif
+      return StatusCode::kFailedPrecondition;
+    case ENOSPC:  
+#ifdef EDQUOT
+    case EDQUOT:  
+#endif
+    case EMFILE:   
+    case EMLINK:   
+    case ENFILE:   
+    case ENOBUFS:  
+    case ENOMEM:   
+#ifdef EUSERS
+    case EUSERS:  
+#endif
+      return StatusCode::kResourceExhausted;
+#ifdef ECHRNG
+    case ECHRNG:  
+#endif
+    case EFBIG:      
+    case EOVERFLOW:  
+    case ERANGE:     
+      return StatusCode::kOutOfRange;
+#ifdef ENOPKG
+    case ENOPKG:  
+#endif
+    case ENOSYS:        
+    case ENOTSUP:       
+    case EAFNOSUPPORT:  
+#ifdef EPFNOSUPPORT
+    case EPFNOSUPPORT:  
+#endif
+    case EPROTONOSUPPORT:  
+#ifdef ESOCKTNOSUPPORT
+    case ESOCKTNOSUPPORT:  
+#endif
+    case EXDEV:  
+      return StatusCode::kUnimplemented;
+    case EAGAIN:  
+#ifdef ECOMM
+    case ECOMM:  
+#endif
+    case ECONNREFUSED:  
+    case ECONNABORTED:  
+    case ECONNRESET:    
+    case EINTR:         
+#ifdef EHOSTDOWN
+    case EHOSTDOWN:  
+#endif
+    case EHOSTUNREACH:  
+    case ENETDOWN:      
+    case ENETRESET:     
+    case ENETUNREACH:   
+    case ENOLCK:        
+    case ENOLINK:       
+#ifdef ENONET
+    case ENONET:  
+#endif
+      return StatusCode::kUnavailable;
+    case EDEADLK:  
+#ifdef ESTALE
+    case ESTALE:  
+#endif
+      return StatusCode::kAborted;
+    case ECANCELED:  
+      return StatusCode::kCancelled;
+    default:
+      return StatusCode::kUnknown;
+  }
+}
+
+namespace {
+std::string MessageForErrnoToStatus(int error_number,
+                                    absl::string_view message) {
+  return absl::StrCat(message, ": ",
+                      absl::base_internal::StrError(error_number));
+}
+}  
+
+Status ErrnoToStatus(int error_number, absl::string_view message,
+                     absl::SourceLocation loc) {
+  return Status(ErrnoToStatusCode(error_number),
+                MessageForErrnoToStatus(error_number, message), loc);
+}
+
+const char* absl_nonnull StatusMessageAsCStr(const Status& status) {
+  auto sv_message = status.message();
+  return sv_message.empty() ? "" : sv_message.data();
+}
+
+ABSL_NAMESPACE_END
+}  

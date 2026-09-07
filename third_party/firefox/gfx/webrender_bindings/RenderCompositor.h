@@ -1,0 +1,187 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#if !defined(MOZILLA_GFX_RENDERCOMPOSITOR_H)
+#define MOZILLA_GFX_RENDERCOMPOSITOR_H
+
+#include "mozilla/RefPtr.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/layers/Fence.h"
+#include "mozilla/webrender/WebRenderTypes.h"
+#include "Units.h"
+
+#include "GLTypes.h"
+
+namespace mozilla {
+
+namespace gl {
+class GLContext;
+}
+
+namespace layers {
+class AndroidHardwareBuffer;
+class CompositionRecorder;
+class SyncObjectHost;
+}  
+
+namespace widget {
+class CompositorWidget;
+}
+
+namespace wr {
+
+class RenderCompositor {
+ public:
+  static UniquePtr<RenderCompositor> Create(
+      const RefPtr<widget::CompositorWidget>& aWidget, nsACString& aError);
+
+  RenderCompositor(const RefPtr<widget::CompositorWidget>& aWidget);
+  virtual ~RenderCompositor();
+
+  virtual bool BeginFrame() = 0;
+
+  virtual void CancelFrame() {}
+
+  virtual RenderedFrameId EndFrame(
+      const nsTArray<DeviceIntRect>& aDirtyRects) = 0;
+  virtual bool WaitForGPU() { return true; }
+
+  virtual void WaitUntilPresentationFlushed() {}
+
+  virtual RenderedFrameId GetLastCompletedFrameId() {
+    return mLatestRenderFrameId.Prev();
+  }
+
+  virtual RenderedFrameId UpdateFrameId() { return GetNextRenderFrameId(); }
+
+  virtual void Pause() = 0;
+  virtual bool Resume() = 0;
+  virtual void Update() {}
+
+  virtual gl::GLContext* gl() const { return nullptr; }
+  virtual bool MakeCurrent();
+
+  virtual bool UseANGLE() const { return false; }
+
+  virtual bool UseDComp() const { return false; }
+
+  virtual bool UseTripleBuffering() const { return false; }
+
+  virtual layers::WebRenderBackend BackendType() const {
+    return layers::WebRenderBackend::HARDWARE;
+  }
+  virtual layers::WebRenderCompositor CompositorType() const {
+    return layers::WebRenderCompositor::DRAW;
+  }
+
+  virtual bool SupportsExternalBufferTextures() const { return false; }
+
+  virtual LayoutDeviceIntSize GetBufferSize() = 0;
+
+  widget::CompositorWidget* GetWidget() const { return mWidget; }
+
+  layers::SyncObjectHost* GetSyncObject() const { return mSyncObject.get(); }
+
+  virtual gfx::DeviceResetReason IsContextLost(bool aForce);
+
+  virtual bool SupportAsyncScreenshot() { return true; }
+
+  virtual bool ShouldUseNativeCompositor() { return false; }
+
+  virtual bool ShouldUseLayerCompositor() const { return false; }
+
+  virtual bool UseLayerCompositor() const { return false; }
+
+  virtual bool EnableAsyncScreenshot() { return false; }
+
+  virtual void CompositorBeginFrame() {}
+  virtual void CompositorEndFrame() {}
+  virtual void Bind(wr::NativeTileId aId, wr::DeviceIntPoint* aOffset,
+                    uint32_t* aFboId, wr::DeviceIntRect aDirtyRect,
+                    wr::DeviceIntRect aValidRect) {}
+  virtual void Unbind() {}
+  virtual void CreateSurface(wr::NativeSurfaceId aId,
+                             wr::DeviceIntPoint aVirtualOffset,
+                             wr::DeviceIntSize aTileSize, bool aIsOpaque) {}
+  virtual void CreateSwapChainSurface(wr::NativeSurfaceId aId,
+                                      wr::DeviceIntSize aSize, bool aIsOpaque,
+                                      bool aNeedsSyncDcompCommit) {}
+  virtual void ResizeSwapChainSurface(wr::NativeSurfaceId aId,
+                                      wr::DeviceIntSize aSize) {}
+  virtual void BindSwapChain(wr::NativeSurfaceId aId,
+                             const wr::DeviceIntRect* aDirtyRects,
+                             size_t aNumDirtyRects) {}
+  virtual void PresentSwapChain(wr::NativeSurfaceId aId,
+                                const wr::DeviceIntRect* aDirtyRects,
+                                size_t aNumDirtyRects) {}
+  virtual void CreateExternalSurface(wr::NativeSurfaceId aId, bool aIsOpaque) {}
+  virtual void CreateBackdropSurface(wr::NativeSurfaceId aId,
+                                     wr::ColorF aColor) {}
+  virtual void DestroySurface(NativeSurfaceId aId) {}
+  virtual void CreateTile(wr::NativeSurfaceId, int32_t aX, int32_t aY) {}
+  virtual void DestroyTile(wr::NativeSurfaceId, int32_t aX, int32_t aY) {}
+  virtual void AttachExternalImage(wr::NativeSurfaceId aId,
+                                   wr::ExternalImageId aExternalImage) {}
+  virtual void AddSurface(wr::NativeSurfaceId aId,
+                          const wr::CompositorSurfaceTransform& aTransform,
+                          wr::DeviceIntRect aClipRect,
+                          wr::ImageRendering aImageRendering,
+                          wr::DeviceIntRect aRoundedClipRect,
+                          wr::ClipRadius aClipRadius) {}
+  virtual void StartCompositing(wr::ColorF aClearColor,
+                                const wr::DeviceIntRect* aDirtyRects,
+                                size_t aNumDirtyRects,
+                                const wr::DeviceIntRect* aOpaqueRects,
+                                size_t aNumOpaqueRects) {}
+  virtual void DeInit() {}
+  virtual void GetCompositorCapabilities(CompositorCapabilities* aCaps);
+
+  virtual void GetWindowVisibility(WindowVisibility* aVisibility);
+
+  virtual void GetWindowProperties(WindowProperties* aProperties);
+
+  virtual bool UsePartialPresent() { return false; }
+  virtual bool RequestFullRender() { return false; }
+  virtual uint32_t GetMaxPartialPresentRects() { return 0; }
+  virtual bool ShouldDrawPreviousPartialPresentRegions() { return false; }
+  virtual size_t GetBufferAge() const { return 0; }
+  virtual void SetBufferDamageRegion(const wr::DeviceIntRect* aRects,
+                                     size_t aNumRects) {}
+
+  virtual bool SurfaceOriginIsTopLeft() { return false; }
+
+  virtual bool MaybeReadback(const gfx::IntSize& aReadbackSize,
+                             const wr::ImageFormat& aReadbackFormat,
+                             const Range<uint8_t>& aReadbackBuffer,
+                             bool* aNeedsYFlip) {
+    return false;
+  }
+  virtual void MaybeRequestAllowFrameRecording(bool aWillRecord) {}
+  virtual bool MaybeRecordFrame(layers::CompositionRecorder& aRecorder) {
+    return false;
+  }
+  virtual bool MaybeGrabScreenshot(const gfx::IntSize& aWindowSize) {
+    return false;
+  }
+  virtual bool MaybeProcessScreenshotQueue() { return false; }
+
+  virtual RefPtr<layers::Fence> GetAndResetReleaseFence() { return nullptr; }
+
+  virtual bool IsPaused() { return false; }
+
+ protected:
+  RenderedFrameId mLatestRenderFrameId = RenderedFrameId{2};
+  RenderedFrameId GetNextRenderFrameId() {
+    mLatestRenderFrameId = mLatestRenderFrameId.Next();
+    return mLatestRenderFrameId;
+  }
+
+  RefPtr<widget::CompositorWidget> mWidget;
+  RefPtr<layers::SyncObjectHost> mSyncObject;
+};
+
+}  
+}  
+
+#endif

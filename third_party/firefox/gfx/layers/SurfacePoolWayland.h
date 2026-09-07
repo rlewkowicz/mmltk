@@ -1,0 +1,118 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_layers_SurfacePoolWayland_h
+#define mozilla_layers_SurfacePoolWayland_h
+
+#include <wayland-egl.h>
+
+#include "GLContext.h"
+#include "MozFramebuffer.h"
+#include "mozilla/layers/SurfacePool.h"
+#include "mozilla/widget/WaylandBuffer.h"
+
+#include <unordered_map>
+
+namespace mozilla::layers {
+
+class SurfacePoolWayland final : public SurfacePool {
+ public:
+  RefPtr<SurfacePoolHandle> GetHandleForGL(gl::GLContext* aGL) override;
+
+  void DestroyGLResourcesForContext(gl::GLContext* aGL) override;
+
+ private:
+  friend class SurfacePoolHandleWayland;
+  friend RefPtr<SurfacePool> SurfacePool::Create(size_t aPoolSizeLimit);
+
+  explicit SurfacePoolWayland(size_t aPoolSizeLimit);
+
+  RefPtr<widget::WaylandBuffer> ObtainBufferFromPool(
+      const widget::WaylandSurfaceLock& aWaylandSurfaceLock,
+      const gfx::IntSize& aSize, gl::GLContext* aGL,
+      RefPtr<widget::DRMFormat> aFormat);
+  void ReturnBufferToPool(const widget::WaylandSurfaceLock& aWaylandSurfaceLock,
+                          const RefPtr<widget::WaylandBuffer>& aBuffer);
+  void EnforcePoolSizeLimit();
+  void CollectPendingSurfaces();
+  Maybe<GLuint> GetFramebufferForBuffer(
+      const RefPtr<widget::WaylandBuffer>& aBuffer, gl::GLContext* aGL,
+      bool aNeedsDepthBuffer);
+
+  struct GLResourcesForBuffer final {
+    RefPtr<gl::GLContext> mGL;                   
+    UniquePtr<gl::MozFramebuffer> mFramebuffer;  
+  };
+
+  struct SurfacePoolEntry final {
+    const gfx::IntSize mSize;
+    const RefPtr<widget::WaylandSurface> mWaylandSurface;  
+    const RefPtr<widget::WaylandBuffer> mWaylandBuffer;    
+    Maybe<GLResourcesForBuffer> mGLResources;
+  };
+
+  bool CanRecycleSurfaceForRequest(
+      const MutexAutoLock& aProofOfLock, const SurfacePoolEntry& aEntry,
+      const widget::WaylandSurfaceLock& aWaylandSurfaceLock,
+      const gfx::IntSize& aSize, gl::GLContext* aGL);
+
+  RefPtr<gl::DepthAndStencilBuffer> GetDepthBufferForSharing(
+      const MutexAutoLock& aProofOfLock, gl::GLContext* aGL,
+      const gfx::IntSize& aSize);
+  UniquePtr<gl::MozFramebuffer> CreateFramebufferForTexture(
+      const MutexAutoLock& aProofOfLock, gl::GLContext* aGL,
+      const gfx::IntSize& aSize, GLuint aTexture, bool aNeedsDepthBuffer);
+
+  Mutex mMutex MOZ_UNANNOTATED;
+
+  std::unordered_map<widget::WaylandBuffer*, SurfacePoolEntry> mInUseEntries;
+
+  nsTArray<SurfacePoolEntry> mPendingEntries;
+
+  nsTArray<SurfacePoolEntry> mAvailableEntries;
+  size_t mPoolSizeLimit;
+
+  template <typename F>
+  void ForEachEntry(F aFn);
+
+  struct DepthBufferEntry final {
+    RefPtr<gl::GLContext> mGL;
+    gfx::IntSize mSize;
+    WeakPtr<gl::DepthAndStencilBuffer> mBuffer;
+  };
+
+  nsTArray<DepthBufferEntry> mDepthBuffers;
+};
+
+class SurfacePoolHandleWayland final : public SurfacePoolHandle {
+ public:
+  SurfacePoolHandleWayland* AsSurfacePoolHandleWayland() override {
+    return this;
+  }
+
+  RefPtr<widget::WaylandBuffer> ObtainBufferFromPool(
+      const widget::WaylandSurfaceLock& aWaylandSurfaceLock,
+      const gfx::IntSize& aSize, RefPtr<widget::DRMFormat> aFormat);
+  void ReturnBufferToPool(const widget::WaylandSurfaceLock& aWaylandSurfaceLock,
+                          const RefPtr<widget::WaylandBuffer>& aBuffer);
+  Maybe<GLuint> GetFramebufferForBuffer(
+      const RefPtr<widget::WaylandBuffer>& aBuffer, bool aNeedsDepthBuffer);
+  const auto& gl() { return mGL; }
+
+  RefPtr<SurfacePool> Pool() override { return mPool; }
+  void OnBeginFrame() override;
+  void OnEndFrame() override;
+
+ private:
+  friend class SurfacePoolWayland;
+  SurfacePoolHandleWayland(RefPtr<SurfacePoolWayland> aPool,
+                           gl::GLContext* aGL);
+
+  const RefPtr<SurfacePoolWayland> mPool;
+  const RefPtr<gl::GLContext> mGL;
+};
+
+}  
+
+#endif

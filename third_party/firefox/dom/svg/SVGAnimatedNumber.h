@@ -1,0 +1,97 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_SVG_SVGANIMATEDNUMBER_H_
+#define DOM_SVG_SVGANIMATEDNUMBER_H_
+
+#include <memory>
+
+#include "mozilla/SMILAttr.h"
+#include "mozilla/dom/DOMSVGAnimatedNumber.h"
+#include "mozilla/dom/SVGElement.h"
+#include "nsCycleCollectionParticipant.h"
+#include "nsError.h"
+#include "nsMathUtils.h"
+
+namespace mozilla {
+
+class SMILValue;
+
+namespace dom {
+class SVGAnimationElement;
+}  
+
+class SVGAnimatedNumber {
+ public:
+  friend class AutoChangeNumberNotifier;
+  using SVGElement = dom::SVGElement;
+
+  void Init(uint8_t aAttrEnum = 0xff, float aValue = 0) {
+    mAnimVal = mBaseVal = aValue;
+    mAttrEnum = aAttrEnum;
+    mIsAnimated = false;
+    mIsBaseSet = false;
+  }
+
+  nsresult SetBaseValueString(const nsAString& aValue, SVGElement* aSVGElement);
+  void GetBaseValueString(nsAString& aValue);
+
+  void SetBaseValue(float aValue, SVGElement* aSVGElement);
+  float GetBaseValue() const { return mBaseVal; }
+  void SetAnimValue(float aValue, SVGElement* aSVGElement);
+  float GetAnimValue() const { return mAnimVal; }
+
+  bool IsExplicitlySet() const { return mIsAnimated || mIsBaseSet; }
+
+  already_AddRefed<dom::DOMSVGAnimatedNumber> ToDOMAnimatedNumber(
+      SVGElement* aSVGElement);
+  std::unique_ptr<SMILAttr> ToSMILAttr(SVGElement* aSVGElement);
+
+ private:
+  float mAnimVal;
+  float mBaseVal;
+  uint8_t mAttrEnum;  
+  bool mIsAnimated;
+  bool mIsBaseSet;
+
+ public:
+  struct DOMAnimatedNumber final : public dom::DOMSVGAnimatedNumber {
+    DOMAnimatedNumber(SVGAnimatedNumber* aVal, SVGElement* aSVGElement)
+        : dom::DOMSVGAnimatedNumber(aSVGElement), mVal(aVal) {}
+    virtual ~DOMAnimatedNumber();
+
+    SVGAnimatedNumber* mVal;  
+
+    float BaseVal() override { return mVal->GetBaseValue(); }
+    void SetBaseVal(float aValue) override {
+      MOZ_ASSERT(std::isfinite(aValue));
+      mVal->SetBaseValue(aValue, mSVGElement);
+    }
+
+    float AnimVal() override {
+      mSVGElement->FlushAnimations();
+      return mVal->GetAnimValue();
+    }
+  };
+
+  struct SMILNumber : public SMILAttr {
+   public:
+    SMILNumber(SVGAnimatedNumber* aVal, SVGElement* aSVGElement)
+        : mVal(aVal), mSVGElement(aSVGElement) {}
+
+    SVGAnimatedNumber* mVal;
+    SVGElement* mSVGElement;
+
+    virtual nsresult ValueFromString(
+        const nsAString& aStr, const dom::SVGAnimationElement* aSrcElement,
+        SMILValue& aValue, bool& aPreventCachingOfSandwich) const override;
+    SMILValue GetBaseValue() const override;
+    void ClearAnimValue() override;
+    nsresult SetAnimValue(const SMILValue& aValue) override;
+  };
+};
+
+}  
+
+#endif  // DOM_SVG_SVGANIMATEDNUMBER_H_

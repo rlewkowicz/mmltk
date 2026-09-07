@@ -1,0 +1,575 @@
+mod expressions;
+mod functions;
+mod handle_set_map;
+mod statements;
+mod types;
+
+use alloc::vec::Vec;
+
+use crate::{
+    arena::{self, HandleSet},
+    compact::functions::FunctionTracer,
+    ir,
+};
+use handle_set_map::HandleMap;
+
+
+/// Configuration option for [`compact`]. See [`compact`] for details.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepUnused {
+    No,
+    Yes,
+}
+
+impl From<KeepUnused> for bool {
+    fn from(keep_unused: KeepUnused) -> Self {
+        match keep_unused {
+            KeepUnused::No => false,
+            KeepUnused::Yes => true,
+        }
+    }
+}
+
+/// Remove most unused objects from `module`, which must be valid.
+///
+/// Always removes the following unused objects:
+/// - anonymous types, overrides, and constants
+/// - abstract-typed constants
+/// - expressions
+///
+/// If `keep_unused` is `Yes`, the following are never considered unused,
+/// otherwise, they will also be removed if unused:
+/// - functions
+/// - global variables
+/// - named types and overrides
+///
+/// The following are never removed:
+/// - named constants with a concrete type
+/// - special types
+/// - entry points
+/// - within an entry point or a used function:
+///     - arguments
+///     - local variables
+///     - named expressions
+///
+/// After removing items according to the rules above, all handles in the
+/// remaining objects are adjusted as necessary. When `KeepUnused` is `Yes`, the
+/// resulting module should have all the named objects (except abstract-typed
+/// constants) present in the original, and those objects should be functionally
+/// identical. When `KeepUnused` is `No`, the resulting module should have the
+/// entry points present in the original, and those entry points should be
+/// functionally identical.
+///
+/// # Panics
+///
+/// If `module` would not pass validation, this may panic.
+pub fn compact(module: &mut crate::Module, keep_unused: KeepUnused) {
+    let mut module_tracer = ModuleTracer::new(module);
+
+    log::trace!("tracing entry points");
+    let entry_point_maps = module
+        .entry_points
+        .iter()
+        .map(|e| {
+            log::trace!("tracing entry point {:?}", e.function.name);
+
+            if let Some(sizes) = e.workgroup_size_overrides {
+                for size in sizes.iter().filter_map(|x| *x) {
+                    module_tracer.global_expressions_used.insert(size);
+                }
+            }
+
+            if let Some(task_payload) = e.task_payload {
+                module_tracer.global_variables_used.insert(task_payload);
+            }
+            if let Some(ref mesh_info) = e.mesh_info {
+                module_tracer
+                    .global_variables_used
+                    .insert(mesh_info.output_variable);
+                module_tracer
+                    .types_used
+                    .insert(mesh_info.vertex_output_type);
+                module_tracer
+                    .types_used
+                    .insert(mesh_info.primitive_output_type);
+                if let Some(max_vertices_override) = mesh_info.max_vertices_override {
+                    module_tracer
+                        .global_expressions_used
+                        .insert(max_vertices_override);
+                }
+                if let Some(max_primitives_override) = mesh_info.max_primitives_override {
+                    module_tracer
+                        .global_expressions_used
+                        .insert(max_primitives_override);
+                }
+            }
+            if e.stage == crate::ShaderStage::Task || e.stage == crate::ShaderStage::Mesh {
+                if let Some(u32_type) = module.types.iter().find_map(|tuple| {
+                    (tuple.1.inner == crate::TypeInner::Scalar(crate::Scalar::U32))
+                        .then_some(tuple.0)
+                }) {
+                    module_tracer.types_used.insert(u32_type);
+                }
+            }
+
+            let mut used = module_tracer.as_function(&e.function);
+            used.trace();
+            FunctionMap::from(used)
+        })
+        .collect::<Vec<_>>();
+
+    log::trace!("tracing functions");
+    let mut function_maps = HandleMap::with_capacity(module.functions.len());
+    if keep_unused.into() {
+        module_tracer.functions_used.add_all();
+        module_tracer.functions_pending.add_all();
+    }
+    while let Some(handle) = module_tracer.functions_pending.pop() {
+        let function = &module.functions[handle];
+        log::trace!("tracing function {function:?}");
+        let mut function_tracer = module_tracer.as_function(function);
+        function_tracer.trace();
+        function_maps.insert(handle, FunctionMap::from(function_tracer));
+    }
+
+    log::trace!("tracing special types");
+    module_tracer.trace_special_types(&module.special_types);
+
+    log::trace!("tracing global variables");
+    if keep_unused.into() {
+        module_tracer.global_variables_used.add_all();
+    }
+    for global in module_tracer.global_variables_used.iter() {
+        log::trace!("tracing global {:?}", module.global_variables[global].name);
+        module_tracer
+            .types_used
+            .insert(module.global_variables[global].ty);
+        if let Some(init) = module.global_variables[global].init {
+            module_tracer.global_expressions_used.insert(init);
+        }
+    }
+
+    log::trace!("tracing named constants");
+    for (handle, constant) in module.constants.iter() {
+        if constant.name.is_none() || module.types[constant.ty].inner.is_abstract(&module.types) {
+            continue;
+        }
+
+        log::trace!("tracing constant {:?}", constant.name.as_ref().unwrap());
+        module_tracer.constants_used.insert(handle);
+        module_tracer.types_used.insert(constant.ty);
+        module_tracer.global_expressions_used.insert(constant.init);
+    }
+
+    if keep_unused.into() {
+        for (handle, r#override) in module.overrides.iter() {
+            if r#override.name.is_some() && module_tracer.overrides_used.insert(handle) {
+                module_tracer.types_used.insert(r#override.ty);
+                if let Some(init) = r#override.init {
+                    module_tracer.global_expressions_used.insert(init);
+                }
+            }
+        }
+
+        for (handle, ty) in module.types.iter() {
+            if ty.name.is_some() {
+                module_tracer.types_used.insert(handle);
+            }
+        }
+    }
+
+    module_tracer.type_expression_tandem();
+
+    let module_map = ModuleMap::from(module_tracer);
+
+    log::trace!("compacting types");
+    let mut new_types = arena::UniqueArena::new();
+    for (old_handle, mut ty, span) in module.types.drain_all() {
+        if let Some(expected_new_handle) = module_map.types.try_adjust(old_handle) {
+            module_map.adjust_type(&mut ty);
+            let actual_new_handle = new_types.insert(ty, span);
+            assert_eq!(actual_new_handle, expected_new_handle);
+        }
+    }
+    module.types = new_types;
+    log::trace!("adjusting special types");
+    module_map.adjust_special_types(&mut module.special_types);
+
+    log::trace!("adjusting constant expressions");
+    module.global_expressions.retain_mut(|handle, expr| {
+        if module_map.global_expressions.used(handle) {
+            module_map.adjust_expression(expr, &module_map.global_expressions);
+            true
+        } else {
+            false
+        }
+    });
+
+    log::trace!("adjusting constants");
+    module.constants.retain_mut(|handle, constant| {
+        if module_map.constants.used(handle) {
+            module_map.types.adjust(&mut constant.ty);
+            module_map.global_expressions.adjust(&mut constant.init);
+            true
+        } else {
+            false
+        }
+    });
+
+    log::trace!("adjusting overrides");
+    module.overrides.retain_mut(|handle, r#override| {
+        if module_map.overrides.used(handle) {
+            module_map.types.adjust(&mut r#override.ty);
+            if let Some(ref mut init) = r#override.init {
+                module_map.global_expressions.adjust(init);
+            }
+            true
+        } else {
+            false
+        }
+    });
+
+    log::trace!("adjusting workgroup_size_overrides");
+    for e in module.entry_points.iter_mut() {
+        if let Some(sizes) = e.workgroup_size_overrides.as_mut() {
+            for size in sizes.iter_mut() {
+                if let Some(expr) = size.as_mut() {
+                    module_map.global_expressions.adjust(expr);
+                }
+            }
+        }
+    }
+
+    log::trace!("adjusting global variables");
+    module.global_variables.retain_mut(|handle, global| {
+        if module_map.globals.used(handle) {
+            log::trace!("retaining global variable {:?}", global.name);
+            module_map.types.adjust(&mut global.ty);
+            if let Some(ref mut init) = global.init {
+                module_map.global_expressions.adjust(init);
+            }
+            true
+        } else {
+            log::trace!("dropping global variable {:?}", global.name);
+            false
+        }
+    });
+
+    if let Some(ref mut doc_comments) = module.doc_comments {
+        module_map.adjust_doc_comments(doc_comments.as_mut());
+    }
+
+    let mut reused_named_expressions = crate::NamedExpressions::default();
+
+    module.functions.retain_mut(|handle, function| {
+        if let Some(map) = function_maps.get(handle) {
+            log::trace!("retaining and compacting function {:?}", function.name);
+            map.compact(function, &module_map, &mut reused_named_expressions);
+            true
+        } else {
+            log::trace!("dropping function {:?}", function.name);
+            false
+        }
+    });
+
+    for (entry, map) in module.entry_points.iter_mut().zip(entry_point_maps.iter()) {
+        log::trace!("compacting entry point {:?}", entry.function.name);
+        map.compact(
+            &mut entry.function,
+            &module_map,
+            &mut reused_named_expressions,
+        );
+        if let Some(ref mut task_payload) = entry.task_payload {
+            module_map.globals.adjust(task_payload);
+        }
+        if let Some(ref mut mesh_info) = entry.mesh_info {
+            module_map.globals.adjust(&mut mesh_info.output_variable);
+            module_map.types.adjust(&mut mesh_info.vertex_output_type);
+            module_map
+                .types
+                .adjust(&mut mesh_info.primitive_output_type);
+            if let Some(ref mut max_vertices_override) = mesh_info.max_vertices_override {
+                module_map.global_expressions.adjust(max_vertices_override);
+            }
+            if let Some(ref mut max_primitives_override) = mesh_info.max_primitives_override {
+                module_map
+                    .global_expressions
+                    .adjust(max_primitives_override);
+            }
+        }
+    }
+}
+
+struct ModuleTracer<'module> {
+    module: &'module crate::Module,
+
+    /// The subset of functions in `functions_used` that have not yet been
+    /// traced.
+    functions_pending: HandleSet<crate::Function>,
+
+    functions_used: HandleSet<crate::Function>,
+    types_used: HandleSet<crate::Type>,
+    global_variables_used: HandleSet<crate::GlobalVariable>,
+    constants_used: HandleSet<crate::Constant>,
+    overrides_used: HandleSet<crate::Override>,
+    global_expressions_used: HandleSet<crate::Expression>,
+}
+
+impl<'module> ModuleTracer<'module> {
+    fn new(module: &'module crate::Module) -> Self {
+        Self {
+            module,
+            functions_pending: HandleSet::for_arena(&module.functions),
+            functions_used: HandleSet::for_arena(&module.functions),
+            types_used: HandleSet::for_arena(&module.types),
+            global_variables_used: HandleSet::for_arena(&module.global_variables),
+            constants_used: HandleSet::for_arena(&module.constants),
+            overrides_used: HandleSet::for_arena(&module.overrides),
+            global_expressions_used: HandleSet::for_arena(&module.global_expressions),
+        }
+    }
+
+    fn trace_special_types(&mut self, special_types: &crate::SpecialTypes) {
+        let crate::SpecialTypes {
+            ref ray_desc,
+            ref ray_intersection,
+            ref ray_vertex_return,
+            ref predeclared_types,
+            ref external_texture_params,
+            ref external_texture_transfer_function,
+        } = *special_types;
+
+        if let Some(ray_desc) = *ray_desc {
+            self.types_used.insert(ray_desc);
+        }
+        if let Some(ray_intersection) = *ray_intersection {
+            self.types_used.insert(ray_intersection);
+        }
+        if let Some(ray_vertex_return) = *ray_vertex_return {
+            self.types_used.insert(ray_vertex_return);
+        }
+        if let Some(external_texture_params) = *external_texture_params {
+            self.types_used.insert(external_texture_params);
+        }
+        if let Some(external_texture_transfer_function) = *external_texture_transfer_function {
+            self.types_used.insert(external_texture_transfer_function);
+        }
+        for (_, &handle) in predeclared_types {
+            self.types_used.insert(handle);
+        }
+    }
+
+    /// Traverse types and global expressions in tandem to determine which are used.
+    ///
+    /// Assuming that all types and global expressions used by other parts of
+    /// the module have been added to [`types_used`] and
+    /// [`global_expressions_used`], expand those sets to include all types and
+    /// global expressions reachable from those.
+    ///
+    /// [`types_used`]: ModuleTracer::types_used
+    /// [`global_expressions_used`]: ModuleTracer::global_expressions_used
+    fn type_expression_tandem(&mut self) {
+        let mut max_dep = Vec::with_capacity(self.module.types.len());
+        let mut previous = None;
+        for (_handle, ty) in self.module.types.iter() {
+            previous = core::cmp::max(
+                previous,
+                match ty.inner {
+                    crate::TypeInner::Array { size, .. }
+                    | crate::TypeInner::BindingArray { size, .. } => match size {
+                        crate::ArraySize::Constant(_) | crate::ArraySize::Dynamic => None,
+                        crate::ArraySize::Pending(handle) => self.module.overrides[handle].init,
+                    },
+                    _ => None,
+                },
+            );
+            max_dep.push(previous);
+        }
+
+        let mut exprs = self.module.global_expressions.iter().rev().peekable();
+
+        for ((ty_handle, ty), dep) in self.module.types.iter().zip(max_dep).rev() {
+            while let Some((expr_handle, expr)) = exprs.next_if(|&(h, _)| Some(h) > dep) {
+                if self.global_expressions_used.contains(expr_handle) {
+                    self.as_const_expression().trace_expression(expr);
+                }
+            }
+            if self.types_used.contains(ty_handle) {
+                self.as_type().trace_type(ty);
+            }
+        }
+        for (expr_handle, expr) in exprs {
+            if self.global_expressions_used.contains(expr_handle) {
+                self.as_const_expression().trace_expression(expr);
+            }
+        }
+    }
+
+    const fn as_type(&mut self) -> types::TypeTracer<'_> {
+        types::TypeTracer {
+            overrides: &self.module.overrides,
+            types_used: &mut self.types_used,
+            expressions_used: &mut self.global_expressions_used,
+            overrides_used: &mut self.overrides_used,
+        }
+    }
+
+    const fn as_const_expression(&mut self) -> expressions::ExpressionTracer<'_> {
+        expressions::ExpressionTracer {
+            constants: &self.module.constants,
+            overrides: &self.module.overrides,
+            expressions: &self.module.global_expressions,
+            types_used: &mut self.types_used,
+            global_variables_used: &mut self.global_variables_used,
+            constants_used: &mut self.constants_used,
+            expressions_used: &mut self.global_expressions_used,
+            overrides_used: &mut self.overrides_used,
+            global_expressions_used: None,
+        }
+    }
+
+    pub fn as_function<'tracer>(
+        &'tracer mut self,
+        function: &'tracer crate::Function,
+    ) -> FunctionTracer<'tracer> {
+        FunctionTracer {
+            function,
+            constants: &self.module.constants,
+            overrides: &self.module.overrides,
+            functions_pending: &mut self.functions_pending,
+            functions_used: &mut self.functions_used,
+            types_used: &mut self.types_used,
+            global_variables_used: &mut self.global_variables_used,
+            constants_used: &mut self.constants_used,
+            overrides_used: &mut self.overrides_used,
+            global_expressions_used: &mut self.global_expressions_used,
+            expressions_used: HandleSet::for_arena(&function.expressions),
+        }
+    }
+}
+
+struct ModuleMap {
+    functions: HandleMap<crate::Function>,
+    types: HandleMap<crate::Type>,
+    globals: HandleMap<crate::GlobalVariable>,
+    constants: HandleMap<crate::Constant>,
+    overrides: HandleMap<crate::Override>,
+    global_expressions: HandleMap<crate::Expression>,
+}
+
+impl From<ModuleTracer<'_>> for ModuleMap {
+    fn from(used: ModuleTracer) -> Self {
+        ModuleMap {
+            functions: HandleMap::from_set(used.functions_used),
+            types: HandleMap::from_set(used.types_used),
+            globals: HandleMap::from_set(used.global_variables_used),
+            constants: HandleMap::from_set(used.constants_used),
+            overrides: HandleMap::from_set(used.overrides_used),
+            global_expressions: HandleMap::from_set(used.global_expressions_used),
+        }
+    }
+}
+
+impl ModuleMap {
+    fn adjust_special_types(&self, special: &mut crate::SpecialTypes) {
+        let crate::SpecialTypes {
+            ref mut ray_desc,
+            ref mut ray_intersection,
+            ref mut ray_vertex_return,
+            ref mut predeclared_types,
+            ref mut external_texture_params,
+            ref mut external_texture_transfer_function,
+        } = *special;
+
+        if let Some(ref mut ray_desc) = *ray_desc {
+            self.types.adjust(ray_desc);
+        }
+        if let Some(ref mut ray_intersection) = *ray_intersection {
+            self.types.adjust(ray_intersection);
+        }
+
+        if let Some(ref mut ray_vertex_return) = *ray_vertex_return {
+            self.types.adjust(ray_vertex_return);
+        }
+
+        if let Some(ref mut external_texture_params) = *external_texture_params {
+            self.types.adjust(external_texture_params);
+        }
+
+        if let Some(ref mut external_texture_transfer_function) =
+            *external_texture_transfer_function
+        {
+            self.types.adjust(external_texture_transfer_function);
+        }
+
+        for handle in predeclared_types.values_mut() {
+            self.types.adjust(handle);
+        }
+    }
+
+    fn adjust_doc_comments(&self, doc_comments: &mut ir::DocComments) {
+        let crate::DocComments {
+            module: _,
+            types: ref mut doc_types,
+            struct_members: ref mut doc_struct_members,
+            entry_points: _,
+            functions: ref mut doc_functions,
+            constants: ref mut doc_constants,
+            global_variables: ref mut doc_globals,
+        } = *doc_comments;
+        log::trace!("adjusting doc comments for types");
+        for (mut ty, doc_comment) in core::mem::take(doc_types) {
+            if !self.types.used(ty) {
+                continue;
+            }
+            self.types.adjust(&mut ty);
+            doc_types.insert(ty, doc_comment);
+        }
+        log::trace!("adjusting doc comments for struct members");
+        for ((mut ty, index), doc_comment) in core::mem::take(doc_struct_members) {
+            if !self.types.used(ty) {
+                continue;
+            }
+            self.types.adjust(&mut ty);
+            doc_struct_members.insert((ty, index), doc_comment);
+        }
+        log::trace!("adjusting doc comments for functions");
+        for (mut handle, doc_comment) in core::mem::take(doc_functions) {
+            if !self.functions.used(handle) {
+                continue;
+            }
+            self.functions.adjust(&mut handle);
+            doc_functions.insert(handle, doc_comment);
+        }
+        log::trace!("adjusting doc comments for constants");
+        for (mut constant, doc_comment) in core::mem::take(doc_constants) {
+            if !self.constants.used(constant) {
+                continue;
+            }
+            self.constants.adjust(&mut constant);
+            doc_constants.insert(constant, doc_comment);
+        }
+        log::trace!("adjusting doc comments for globals");
+        for (mut handle, doc_comment) in core::mem::take(doc_globals) {
+            if !self.globals.used(handle) {
+                continue;
+            }
+            self.globals.adjust(&mut handle);
+            doc_globals.insert(handle, doc_comment);
+        }
+    }
+}
+
+struct FunctionMap {
+    expressions: HandleMap<crate::Expression>,
+}
+
+impl From<FunctionTracer<'_>> for FunctionMap {
+    fn from(used: FunctionTracer) -> Self {
+        FunctionMap {
+            expressions: HandleMap::from_set(used.expressions_used),
+        }
+    }
+}
+
+

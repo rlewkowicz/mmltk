@@ -1,0 +1,927 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+function ArrayEvery(callbackfn ) {
+  var O = ToObject(this);
+
+  var len = ToLength(O.length);
+
+  if (ArgumentsLength() === 0) {
+    ThrowTypeError(JSMSG_MISSING_FUN_ARG, 0, "Array.prototype.every");
+  }
+  if (!IsCallable(callbackfn)) {
+    ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(0, callbackfn));
+  }
+
+  var T = ArgumentsLength() > 1 ? GetArgument(1) : undefined;
+
+  for (var k = 0; k < len; k++) {
+    if (k in O) {
+      if (!callContentFunction(callbackfn, T, O[k], k, O)) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+SetIsInlinableLargeFunction(ArrayEvery);
+
+function ArraySome(callbackfn ) {
+  var O = ToObject(this);
+
+  var len = ToLength(O.length);
+
+  if (ArgumentsLength() === 0) {
+    ThrowTypeError(JSMSG_MISSING_FUN_ARG, 0, "Array.prototype.some");
+  }
+  if (!IsCallable(callbackfn)) {
+    ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(0, callbackfn));
+  }
+
+  var T = ArgumentsLength() > 1 ? GetArgument(1) : undefined;
+
+  for (var k = 0; k < len; k++) {
+    if (k in O) {
+      if (callContentFunction(callbackfn, T, O[k], k, O)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+SetIsInlinableLargeFunction(ArraySome);
+
+function ArrayForEach(callbackfn ) {
+  var O = ToObject(this);
+
+  var len = ToLength(O.length);
+
+  if (ArgumentsLength() === 0) {
+    ThrowTypeError(JSMSG_MISSING_FUN_ARG, 0, "Array.prototype.forEach");
+  }
+  if (!IsCallable(callbackfn)) {
+    ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(0, callbackfn));
+  }
+
+  var T = ArgumentsLength() > 1 ? GetArgument(1) : undefined;
+
+  for (var k = 0; k < len; k++) {
+    if (k in O) {
+      callContentFunction(callbackfn, T, O[k], k, O);
+    }
+  }
+
+  return undefined;
+}
+SetIsInlinableLargeFunction(ArrayForEach);
+
+function ArrayMap(callbackfn ) {
+  var O = ToObject(this);
+
+  var len = ToLength(O.length);
+
+  if (ArgumentsLength() === 0) {
+    ThrowTypeError(JSMSG_MISSING_FUN_ARG, 0, "Array.prototype.map");
+  }
+  if (!IsCallable(callbackfn)) {
+    ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(0, callbackfn));
+  }
+
+  var T = ArgumentsLength() > 1 ? GetArgument(1) : undefined;
+
+  var A = CanOptimizeArraySpecies(O) ? std_Array(len) : ArraySpeciesCreate(O, len);
+
+  for (var k = 0; k < len; k++) {
+    if (k in O) {
+      var mappedValue = callContentFunction(callbackfn, T, O[k], k, O);
+      DefineDataProperty(A, k, mappedValue);
+    }
+  }
+
+  return A;
+}
+SetIsInlinableLargeFunction(ArrayMap);
+
+function ArrayFilter(callbackfn ) {
+  var O = ToObject(this);
+
+  var len = ToLength(O.length);
+
+  if (ArgumentsLength() === 0) {
+    ThrowTypeError(JSMSG_MISSING_FUN_ARG, 0, "Array.prototype.filter");
+  }
+  if (!IsCallable(callbackfn)) {
+    ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(0, callbackfn));
+  }
+
+  var T = ArgumentsLength() > 1 ? GetArgument(1) : undefined;
+
+  var A = CanOptimizeArraySpecies(O) ? [] : ArraySpeciesCreate(O, 0);
+
+  for (var k = 0, to = 0; k < len; k++) {
+    if (k in O) {
+      var kValue = O[k];
+      if (callContentFunction(callbackfn, T, kValue, k, O)) {
+        DefineDataProperty(A, to++, kValue);
+      }
+    }
+  }
+
+  return A;
+}
+SetIsInlinableLargeFunction(ArrayFilter);
+
+function ArrayReduce(callbackfn ) {
+  var O = ToObject(this);
+
+  var len = ToLength(O.length);
+
+  if (ArgumentsLength() === 0) {
+    ThrowTypeError(JSMSG_MISSING_FUN_ARG, 0, "Array.prototype.reduce");
+  }
+  if (!IsCallable(callbackfn)) {
+    ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(0, callbackfn));
+  }
+
+  var k = 0;
+
+  var accumulator;
+  if (ArgumentsLength() > 1) {
+    accumulator = GetArgument(1);
+  } else {
+    if (len === 0) {
+      throw ThrowTypeError(JSMSG_EMPTY_ARRAY_REDUCE);
+    }
+
+    var kPresent = false;
+    do {
+      if (k in O) {
+        kPresent = true;
+        break;
+      }
+    } while (++k < len);
+    if (!kPresent) {
+      throw ThrowTypeError(JSMSG_EMPTY_ARRAY_REDUCE);
+    }
+
+    accumulator = O[k++];
+  }
+
+  for (; k < len; k++) {
+    if (k in O) {
+      accumulator = callContentFunction(
+        callbackfn,
+        undefined,
+        accumulator,
+        O[k],
+        k,
+        O
+      );
+    }
+  }
+
+  return accumulator;
+}
+
+function ArrayReduceRight(callbackfn ) {
+  var O = ToObject(this);
+
+  var len = ToLength(O.length);
+
+  if (ArgumentsLength() === 0) {
+    ThrowTypeError(JSMSG_MISSING_FUN_ARG, 0, "Array.prototype.reduce");
+  }
+  if (!IsCallable(callbackfn)) {
+    ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(0, callbackfn));
+  }
+
+  var k = len - 1;
+
+  var accumulator;
+  if (ArgumentsLength() > 1) {
+    accumulator = GetArgument(1);
+  } else {
+    if (len === 0) {
+      throw ThrowTypeError(JSMSG_EMPTY_ARRAY_REDUCE);
+    }
+
+    var kPresent = false;
+    do {
+      if (k in O) {
+        kPresent = true;
+        break;
+      }
+    } while (--k >= 0);
+    if (!kPresent) {
+      throw ThrowTypeError(JSMSG_EMPTY_ARRAY_REDUCE);
+    }
+
+    accumulator = O[k--];
+  }
+
+  for (; k >= 0; k--) {
+    if (k in O) {
+      accumulator = callContentFunction(
+        callbackfn,
+        undefined,
+        accumulator,
+        O[k],
+        k,
+        O
+      );
+    }
+  }
+
+  return accumulator;
+}
+
+function ArrayFind(predicate ) {
+  var O = ToObject(this);
+
+  var len = ToLength(O.length);
+
+  if (ArgumentsLength() === 0) {
+    ThrowTypeError(JSMSG_MISSING_FUN_ARG, 0, "Array.prototype.find");
+  }
+  if (!IsCallable(predicate)) {
+    ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(0, predicate));
+  }
+
+  var T = ArgumentsLength() > 1 ? GetArgument(1) : undefined;
+
+  for (var k = 0; k < len; k++) {
+    var kValue = O[k];
+    if (callContentFunction(predicate, T, kValue, k, O)) {
+      return kValue;
+    }
+  }
+
+  return undefined;
+}
+SetIsInlinableLargeFunction(ArrayFind);
+
+function ArrayFindIndex(predicate ) {
+  var O = ToObject(this);
+
+  var len = ToLength(O.length);
+
+  if (ArgumentsLength() === 0) {
+    ThrowTypeError(JSMSG_MISSING_FUN_ARG, 0, "Array.prototype.find");
+  }
+  if (!IsCallable(predicate)) {
+    ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(0, predicate));
+  }
+
+  var T = ArgumentsLength() > 1 ? GetArgument(1) : undefined;
+
+  for (var k = 0; k < len; k++) {
+    if (callContentFunction(predicate, T, O[k], k, O)) {
+      return k;
+    }
+  }
+
+  return -1;
+}
+SetIsInlinableLargeFunction(ArrayFindIndex);
+
+function ArrayCopyWithin(target, start, end = undefined) {
+  var O = ToObject(this);
+
+  var len = ToLength(O.length);
+
+  var relativeTarget = ToInteger(target);
+
+  var to =
+    relativeTarget < 0
+      ? std_Math_max(len + relativeTarget, 0)
+      : std_Math_min(relativeTarget, len);
+
+  var relativeStart = ToInteger(start);
+
+  var from =
+    relativeStart < 0
+      ? std_Math_max(len + relativeStart, 0)
+      : std_Math_min(relativeStart, len);
+
+  var relativeEnd = end === undefined ? len : ToInteger(end);
+
+  var final =
+    relativeEnd < 0
+      ? std_Math_max(len + relativeEnd, 0)
+      : std_Math_min(relativeEnd, len);
+
+  var count = std_Math_min(final - from, len - to);
+
+  if (from < to && to < from + count) {
+    from = from + count - 1;
+    to = to + count - 1;
+
+    while (count > 0) {
+      if (from in O) {
+        O[to] = O[from];
+      } else {
+        delete O[to];
+      }
+
+      from--;
+      to--;
+      count--;
+    }
+  } else {
+    while (count > 0) {
+      if (from in O) {
+        O[to] = O[from];
+      } else {
+        delete O[to];
+      }
+
+      from++;
+      to++;
+      count--;
+    }
+  }
+
+  return O;
+}
+
+function ArrayFill(value, start = 0, end = undefined) {
+  var O = ToObject(this);
+
+  var len = ToLength(O.length);
+
+  var relativeStart = ToInteger(start);
+
+  var k =
+    relativeStart < 0
+      ? std_Math_max(len + relativeStart, 0)
+      : std_Math_min(relativeStart, len);
+
+  var relativeEnd = end === undefined ? len : ToInteger(end);
+
+  var final =
+    relativeEnd < 0
+      ? std_Math_max(len + relativeEnd, 0)
+      : std_Math_min(relativeEnd, len);
+
+  for (; k < final; k++) {
+    O[k] = value;
+  }
+
+  return O;
+}
+
+function ArrayIteratorNext() {
+  var obj = this;
+  if (!IsObject(obj) || (obj = GuardToArrayIterator(obj)) === null) {
+    return callFunction(
+      CallArrayIteratorMethodIfWrapped,
+      this,
+      "ArrayIteratorNext"
+    );
+  }
+
+  var a = UnsafeGetReservedSlot(obj, ITERATOR_SLOT_TARGET);
+  var result = { value: undefined, done: false };
+
+  if (a === null) {
+    result.done = true;
+    return result;
+  }
+
+  var index = UnsafeGetReservedSlot(obj, ITERATOR_SLOT_NEXT_INDEX);
+
+  var itemKind = UnsafeGetInt32FromReservedSlot(obj, ARRAY_ITERATOR_SLOT_ITEM_KIND);
+
+  var len;
+  if (IsPossiblyWrappedTypedArray(a)) {
+    len = PossiblyWrappedTypedArrayLength(a);
+
+    if (len === 0) {
+      if (PossiblyWrappedTypedArrayHasDetachedBuffer(a)) {
+        ThrowTypeError(JSMSG_TYPED_ARRAY_DETACHED);
+      }
+    }
+  } else {
+    len = ToLength(a.length);
+  }
+
+  if (index >= len) {
+    UnsafeSetReservedSlot(obj, ITERATOR_SLOT_TARGET, null);
+    result.done = true;
+    return result;
+  }
+
+  UnsafeSetReservedSlot(obj, ITERATOR_SLOT_NEXT_INDEX, index + 1);
+
+  if (itemKind === ITEM_KIND_VALUE) {
+    result.value = a[index];
+    return result;
+  }
+
+  if (itemKind === ITEM_KIND_KEY_AND_VALUE) {
+    var pair = [index, a[index]];
+    result.value = pair;
+    return result;
+  }
+
+  assert(itemKind === ITEM_KIND_KEY, itemKind);
+  result.value = index;
+  return result;
+}
+SetIsInlinableLargeFunction(ArrayIteratorNext);
+
+function $ArrayValues() {
+  RETURN_ARRAY_ITERATOR(this, ITEM_KIND_VALUE);
+}
+SetCanonicalName($ArrayValues, "values");
+
+function ArrayEntries() {
+  RETURN_ARRAY_ITERATOR(this, ITEM_KIND_KEY_AND_VALUE);
+}
+
+function ArrayKeys() {
+  RETURN_ARRAY_ITERATOR(this, ITEM_KIND_KEY);
+}
+
+function ArrayFromAsync(asyncItems, mapfn = undefined, thisArg = undefined) {
+  var C = this;
+
+  var fromAsyncClosure = async () => {
+    var mapping = mapfn !== undefined;
+    if (mapping && !IsCallable(mapfn)) {
+      ThrowTypeError(JSMSG_NOT_FUNCTION, ToSource(mapfn));
+    }
+
+    var usingAsyncIterator = asyncItems[GetBuiltinSymbol("asyncIterator")];
+    if (usingAsyncIterator === null) {
+      usingAsyncIterator = undefined;
+    }
+
+    var usingSyncIterator = undefined;
+    if (usingAsyncIterator !== undefined) {
+      if (!IsCallable(usingAsyncIterator)) {
+        ThrowTypeError(JSMSG_NOT_ITERABLE, ToSource(asyncItems));
+      }
+    } else {
+
+      usingSyncIterator = asyncItems[GetBuiltinSymbol("iterator")];
+      if (usingSyncIterator === null) {
+        usingSyncIterator = undefined;
+      }
+
+      if (usingSyncIterator !== undefined) {
+        if (!IsCallable(usingSyncIterator)) {
+          ThrowTypeError(JSMSG_NOT_ITERABLE, ToSource(asyncItems));
+        }
+      }
+    }
+
+    if (usingAsyncIterator !== undefined || usingSyncIterator !== undefined) {
+
+
+
+      var A = IsConstructor(C) ? constructContentFunction(C, C) : [];
+
+      var k = 0;
+
+      for await (var nextValue of allowContentIterWith(
+        asyncItems,
+        usingAsyncIterator,
+        usingSyncIterator
+      )) {
+
+
+
+        var mappedValue = nextValue;
+
+        if (mapping) {
+          mappedValue = callContentFunction(mapfn, thisArg, nextValue, k);
+
+          mappedValue = await mappedValue;
+        }
+
+        DefineDataProperty(A, k, mappedValue);
+
+        k = k + 1;
+      }
+
+
+      A.length = k;
+
+      return A;
+    }
+
+
+    var arrayLike = ToObject(asyncItems);
+
+    var len = ToLength(arrayLike.length);
+
+    var A = IsConstructor(C) ? constructContentFunction(C, C, len) : std_Array(len);
+
+    var k = 0;
+
+    while (k < len) {
+      var kValue = await arrayLike[k];
+
+      var mappedValue = mapping
+        ? await callContentFunction(mapfn, thisArg, kValue, k)
+        : kValue;
+
+      DefineDataProperty(A, k, mappedValue);
+
+      k = k + 1;
+    }
+
+    A.length = len;
+
+    return A;
+  };
+
+  return fromAsyncClosure();
+}
+
+function ArrayFrom(items, mapfn = undefined, thisArg = undefined) {
+  var C = this;
+
+  var mapping = mapfn !== undefined;
+  if (mapping && !IsCallable(mapfn)) {
+    ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(1, mapfn));
+  }
+  var T = thisArg;
+
+  var usingIterator = items[GetBuiltinSymbol("iterator")];
+
+  if (!IsNullOrUndefined(usingIterator)) {
+    if (!IsCallable(usingIterator)) {
+      ThrowTypeError(JSMSG_NOT_ITERABLE, DecompileArg(0, items));
+    }
+
+    var A = IsConstructor(C) ? constructContentFunction(C, C) : [];
+
+    var k = 0;
+
+    for (var nextValue of allowContentIterWith(items, usingIterator)) {
+
+      var mappedValue = mapping
+        ? callContentFunction(mapfn, T, nextValue, k)
+        : nextValue;
+
+      DefineDataProperty(A, k++, mappedValue);
+    }
+
+    A.length = k;
+    return A;
+  }
+
+
+  var arrayLike = ToObject(items);
+
+  var len = ToLength(arrayLike.length);
+
+  var A = IsConstructor(C)
+    ? constructContentFunction(C, C, len)
+    : std_Array(len);
+
+  for (var k = 0; k < len; k++) {
+    var kValue = items[k];
+
+    var mappedValue = mapping
+      ? callContentFunction(mapfn, T, kValue, k)
+      : kValue;
+
+    DefineDataProperty(A, k, mappedValue);
+  }
+
+  A.length = len;
+
+  return A;
+}
+
+function ArrayToString() {
+  var array = ToObject(this);
+
+  var func = array.join;
+
+  if (!IsCallable(func)) {
+    return callFunction(std_Object_toString, array);
+  }
+  return callContentFunction(func, array);
+}
+
+function ArrayToLocaleString(locales, options) {
+  assert(IsObject(this), "|this| should be an object");
+  var array = this;
+
+  var len = ToLength(array.length);
+
+  if (len === 0) {
+    return "";
+  }
+
+  var firstElement = array[0];
+
+  var R;
+  if (IsNullOrUndefined(firstElement)) {
+    R = "";
+  } else {
+    #if JS_HAS_INTL_API
+    R = ToString(
+      callContentFunction(
+        firstElement.toLocaleString,
+        firstElement,
+        locales,
+        options
+      )
+    );
+    #else
+    R = ToString(
+      callContentFunction(firstElement.toLocaleString, firstElement)
+    );
+    #endif
+  }
+
+  var separator = ",";
+
+  for (var k = 1; k < len; k++) {
+    var nextElement = array[k];
+
+    R += separator;
+    if (!IsNullOrUndefined(nextElement)) {
+      #if JS_HAS_INTL_API
+      R += ToString(
+        callContentFunction(
+          nextElement.toLocaleString,
+          nextElement,
+          locales,
+          options
+        )
+      );
+      #else
+      R += ToString(
+        callContentFunction(nextElement.toLocaleString, nextElement)
+      );
+      #endif
+    }
+  }
+
+  return R;
+}
+
+function $ArraySpecies() {
+  return this;
+}
+SetCanonicalName($ArraySpecies, "get [Symbol.species]");
+
+function ArraySpeciesCreate(originalArray, length) {
+  assert(typeof length === "number", "length should be a number");
+  assert(length >= 0, "length should be a non-negative number");
+
+  // eslint-disable-next-line no-compare-neg-zero
+  if (length === -0) {
+    length = 0;
+  }
+
+  if (!IsArray(originalArray)) {
+    return std_Array(length);
+  }
+
+  var originalConstructor = originalArray.constructor;
+  var C = originalConstructor;
+
+  if (IsConstructor(C) && IsCrossRealmArrayConstructor(C)) {
+    return std_Array(length);
+  }
+
+  if (IsObject(C)) {
+    C = C[GetBuiltinSymbol("species")];
+
+    if (C === GetBuiltinConstructor("Array")) {
+      return std_Array(length);
+    }
+
+    if (C === null) {
+      return std_Array(length);
+    }
+
+  }
+
+  if (C === undefined) {
+    return std_Array(length);
+  }
+
+  if (!IsConstructor(C)) {
+    ThrowTypeError(JSMSG_NOT_CONSTRUCTOR, "constructor property");
+  }
+
+  return constructContentFunction(C, C, length);
+}
+
+function ArrayFlatMap(mapperFunction ) {
+  var O = ToObject(this);
+
+  var sourceLen = ToLength(O.length);
+
+  if (!IsCallable(mapperFunction)) {
+    ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(0, mapperFunction));
+  }
+
+  var T = ArgumentsLength() > 1 ? GetArgument(1) : undefined;
+
+  var A = CanOptimizeArraySpecies(O) ? [] : ArraySpeciesCreate(O, 0);
+
+  FlattenIntoArray(A, O, sourceLen, 0, 1, mapperFunction, T);
+
+  return A;
+}
+
+function ArrayFlat() {
+  var O = ToObject(this);
+
+  var sourceLen = ToLength(O.length);
+
+  var depthNum = 1;
+
+  if (ArgumentsLength() && GetArgument(0) !== undefined) {
+    depthNum = ToInteger(GetArgument(0));
+  }
+
+  var A = CanOptimizeArraySpecies(O) ? [] : ArraySpeciesCreate(O, 0);
+
+  FlattenIntoArray(A, O, sourceLen, 0, depthNum);
+
+  return A;
+}
+
+function FlattenIntoArray(
+  target,
+  source,
+  sourceLen,
+  start,
+  depth,
+  mapperFunction,
+  thisArg
+) {
+  var targetIndex = start;
+
+  for (var sourceIndex = 0; sourceIndex < sourceLen; sourceIndex++) {
+    if (sourceIndex in source) {
+      var element = source[sourceIndex];
+
+      if (mapperFunction) {
+        assert(ArgumentsLength() === 7, "thisArg is present");
+
+        element = callContentFunction(
+          mapperFunction,
+          thisArg,
+          element,
+          sourceIndex,
+          source
+        );
+      }
+
+      var shouldFlatten = false;
+
+      if (depth > 0) {
+        shouldFlatten = IsArray(element);
+      }
+
+      if (shouldFlatten) {
+        var elementLen = ToLength(element.length);
+
+        targetIndex = FlattenIntoArray(
+          target,
+          element,
+          elementLen,
+          targetIndex,
+          depth - 1
+        );
+      } else {
+        if (targetIndex >= MAX_NUMERIC_INDEX) {
+          ThrowTypeError(JSMSG_TOO_LONG_ARRAY);
+        }
+
+        DefineDataProperty(target, targetIndex, element);
+
+        targetIndex++;
+      }
+    }
+  }
+
+  return targetIndex;
+}
+
+function ArrayAt(index) {
+  var O = ToObject(this);
+
+  var len = ToLength(O.length);
+
+  var relativeIndex = ToInteger(index);
+
+  var k;
+  if (relativeIndex >= 0) {
+    k = relativeIndex;
+  } else {
+    k = len + relativeIndex;
+  }
+
+  if (k < 0 || k >= len) {
+    return undefined;
+  }
+
+  return O[k];
+}
+SetIsInlinableLargeFunction(ArrayAt);
+
+function ArrayToReversed() {
+  var O = ToObject(this);
+
+  var len = ToLength(O.length);
+
+  var A = std_Array(len);
+
+  for (var k = 0; k < len; k++) {
+    var from = len - k - 1;
+
+
+    var fromValue = O[from];
+
+    DefineDataProperty(A, k, fromValue);
+  }
+
+  return A;
+}
+
+function ArrayToSorted(comparefn) {
+  if (comparefn !== undefined && !IsCallable(comparefn)) {
+    ThrowTypeError(JSMSG_BAD_TOSORTED_ARG);
+  }
+
+  var O = ToObject(this);
+
+  var len = ToLength(O.length);
+
+  var items = std_Array(len);
+
+  for (var k = 0; k < len; k++) {
+    DefineDataProperty(items, k, O[k]);
+  }
+
+  if (len <= 1) {
+    return items;
+  }
+
+  return callFunction(std_Array_sort, items, comparefn);
+}
+
+function ArrayFindLast(predicate ) {
+  var O = ToObject(this);
+
+  var len = ToLength(O.length);
+
+  if (ArgumentsLength() === 0) {
+    ThrowTypeError(JSMSG_MISSING_FUN_ARG, 0, "Array.prototype.findLast");
+  }
+  if (!IsCallable(predicate)) {
+    ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(0, predicate));
+  }
+
+  var thisArg = ArgumentsLength() > 1 ? GetArgument(1) : undefined;
+
+  for (var k = len - 1; k >= 0; k--) {
+    var kValue = O[k];
+
+    if (callContentFunction(predicate, thisArg, kValue, k, O)) {
+      return kValue;
+    }
+  }
+
+  return undefined;
+}
+SetIsInlinableLargeFunction(ArrayFindLast);
+
+function ArrayFindLastIndex(predicate ) {
+  var O = ToObject(this);
+
+  var len = ToLength(O.length);
+
+  if (ArgumentsLength() === 0) {
+    ThrowTypeError(JSMSG_MISSING_FUN_ARG, 0, "Array.prototype.findLastIndex");
+  }
+  if (!IsCallable(predicate)) {
+    ThrowTypeError(JSMSG_NOT_FUNCTION, DecompileArg(0, predicate));
+  }
+
+  var thisArg = ArgumentsLength() > 1 ? GetArgument(1) : undefined;
+
+  for (var k = len - 1; k >= 0; k--) {
+    if (callContentFunction(predicate, thisArg, O[k], k, O)) {
+      return k;
+    }
+  }
+
+  return -1;
+}
+SetIsInlinableLargeFunction(ArrayFindLastIndex);

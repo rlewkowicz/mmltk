@@ -1,0 +1,41 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef DOM_BINDINGS_PINNEDSTRINGID_H_
+#define DOM_BINDINGS_PINNEDSTRINGID_H_
+
+#include "js/GCAnnotations.h"
+#include "js/Id.h"
+#include "js/RootingAPI.h"
+#include "js/String.h"
+#include "jsapi.h"
+
+class JSString;
+struct JSContext;
+
+namespace mozilla::dom {
+class PinnedStringId {
+  jsid id;
+
+ public:
+  constexpr PinnedStringId() : id(JS::PropertyKey::Void()) {}
+
+  bool init(JSContext* cx, const char* string) {
+    JSString* str = JS_AtomizeAndPinString(cx, string);
+    if (!str) {
+      return false;
+    }
+    id = JS::PropertyKey::fromPinnedString(str);
+    return true;
+  }
+
+  operator const jsid&() const { return id; }
+
+  operator JS::Handle<jsid>() const {
+    return JS::Handle<jsid>::fromMarkedLocation(&id);
+  }
+} JS_HAZ_ROOTED;
+}  
+
+#endif

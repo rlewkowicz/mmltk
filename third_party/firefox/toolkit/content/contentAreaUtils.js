@@ -1,0 +1,965 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+var { AppConstants } = ChromeUtils.importESModule(
+  "resource://gre/modules/AppConstants.sys.mjs"
+);
+var { XPCOMUtils } = ChromeUtils.importESModule(
+  "resource://gre/modules/XPCOMUtils.sys.mjs"
+);
+
+ChromeUtils.defineESModuleGetters(this, {
+  BrowserUtils: "resource://gre/modules/BrowserUtils.sys.mjs",
+  DownloadLastDir: "resource://gre/modules/DownloadLastDir.sys.mjs",
+  DownloadPaths: "resource://gre/modules/DownloadPaths.sys.mjs",
+  Downloads: "resource://gre/modules/Downloads.sys.mjs",
+  FileUtils: "resource://gre/modules/FileUtils.sys.mjs",
+  NetUtil: "resource://gre/modules/NetUtil.sys.mjs",
+  PrivateBrowsingUtils: "resource://gre/modules/PrivateBrowsingUtils.sys.mjs",
+});
+
+var ContentAreaUtils = {
+  get stringBundle() {
+    delete this.stringBundle;
+    return (this.stringBundle = Services.strings.createBundle(
+      "chrome://global/locale/contentAreaCommands.properties"
+    ));
+  },
+};
+
+function urlSecurityCheck(
+  aURL,
+  aPrincipal,
+  aFlags = Services.scriptSecurityManager
+) {
+  if (aURL instanceof Ci.nsIURI) {
+    Services.scriptSecurityManager.checkLoadURIWithPrincipal(
+      aPrincipal,
+      aURL,
+      aFlags
+    );
+  } else {
+    Services.scriptSecurityManager.checkLoadURIStrWithPrincipal(
+      aPrincipal,
+      aURL,
+      aFlags
+    );
+  }
+}
+
+function saveURL(
+  aURL,
+  aOriginalURL,
+  aFileName,
+  aFilePickerTitleKey,
+  aShouldBypassCache,
+  aSkipPrompt,
+  aReferrerInfo,
+  aCookieJarSettings,
+  aSourceDocument,
+  aIsContentWindowPrivate,
+  aPrincipal,
+  aSaveCompleteCallback
+) {
+  internalSave(
+    aURL,
+    aOriginalURL,
+    null,
+    aFileName,
+    null,
+    null,
+    aShouldBypassCache,
+    aFilePickerTitleKey,
+    null,
+    aReferrerInfo,
+    aCookieJarSettings,
+    aSourceDocument,
+    aSkipPrompt,
+    null,
+    aIsContentWindowPrivate,
+    aPrincipal,
+    aSaveCompleteCallback
+  );
+}
+
+function saveBrowser(aBrowser, aSkipPrompt, aBrowsingContext = null) {
+  if (!aBrowser) {
+    throw new Error("Must have a browser when calling saveBrowser");
+  }
+  let persistable = aBrowser.frameLoader;
+  if (aBrowser.contentPrincipal.spec == "resource://pdf.js/web/viewer.html") {
+    aBrowser.sendMessageToActor("PDFJS:Save", {}, "Pdfjs");
+    return;
+  }
+  let stack = Components.stack.caller;
+  persistable.startPersistence(aBrowsingContext, {
+    onDocumentReady(document) {
+      if (!document || !(document instanceof Ci.nsIWebBrowserPersistDocument)) {
+        throw new Error("Must have an nsIWebBrowserPersistDocument!");
+      }
+
+      const principal = null;
+
+      internalSave(
+        document.documentURI,
+        null, 
+        document,
+        null, 
+        document.contentDisposition,
+        document.contentType,
+        false, 
+        null, 
+        null, 
+        document.referrerInfo,
+        document.cookieJarSettings,
+        document,
+        aSkipPrompt,
+        document.cacheKey,
+        undefined,
+        principal
+      );
+    },
+    onError(status) {
+      throw new Components.Exception(
+        "saveBrowser failed asynchronously in startPersistence",
+        status,
+        stack
+      );
+    },
+  });
+}
+
+function DownloadListener(win, transfer) {
+  function makeClosure(name) {
+    return function () {
+      transfer[name].apply(transfer, arguments);
+    };
+  }
+
+  this.window = win;
+
+  for (var i in transfer) {
+    if (i != "QueryInterface") {
+      this[i] = makeClosure(i);
+    }
+  }
+}
+
+DownloadListener.prototype = {
+  QueryInterface: ChromeUtils.generateQI([
+    "nsIInterfaceRequestor",
+    "nsIWebProgressListener",
+    "nsIWebProgressListener2",
+  ]),
+
+  getInterface: function dl_gi(aIID) {
+    if (aIID.equals(Ci.nsIAuthPrompt) || aIID.equals(Ci.nsIAuthPrompt2)) {
+      var ww = Cc["@mozilla.org/embedcomp/window-watcher;1"].getService(
+        Ci.nsIPromptFactory
+      );
+      return ww.getPrompt(this.window, aIID);
+    }
+
+    throw Components.Exception("", Cr.NS_ERROR_NO_INTERFACE);
+  },
+};
+
+const kSaveAsType_Complete = 0; 
+XPCOMUtils.defineConstant(this, "kSaveAsType_Complete", 0);
+const kSaveAsType_Text = 2; 
+XPCOMUtils.defineConstant(this, "kSaveAsType_Text", kSaveAsType_Text);
+
+function internalSave(
+  aURL,
+  aOriginalURL,
+  aDocument,
+  aDefaultFileName,
+  aContentDisposition,
+  aContentType,
+  aShouldBypassCache,
+  aFilePickerTitleKey,
+  aChosenData,
+  aReferrerInfo,
+  aCookieJarSettings,
+  aInitiatingDocument,
+  aSkipPrompt,
+  aCacheKey,
+  aIsContentWindowPrivate,
+  aPrincipal,
+  aSaveCompleteCallback
+) {
+  if (aSkipPrompt == undefined) {
+    aSkipPrompt = false;
+  }
+
+  if (aCacheKey == undefined) {
+    aCacheKey = 0;
+  }
+
+  var saveMode = GetSaveModeForContentType(aContentType, aDocument);
+
+  var file, sourceURI, saveAsType;
+  let contentPolicyType = Ci.nsIContentPolicy.TYPE_SAVEAS_DOWNLOAD;
+  if (aChosenData) {
+    file = aChosenData.file;
+    sourceURI = aChosenData.uri;
+    saveAsType = kSaveAsType_Complete;
+
+    continueSave();
+  } else {
+    var charset = null;
+    if (aDocument) {
+      charset = aDocument.characterSet;
+    }
+    var fileInfo = new FileInfo(aDefaultFileName);
+    initFileInfo(
+      fileInfo,
+      aURL,
+      charset,
+      aDocument,
+      aContentType,
+      aContentDisposition
+    );
+    sourceURI = fileInfo.uri;
+
+    if (aContentType && aContentType.startsWith("image/")) {
+      contentPolicyType = Ci.nsIContentPolicy.TYPE_IMAGE;
+    }
+    var fpParams = {
+      fpTitleKey: aFilePickerTitleKey,
+      fileInfo,
+      contentType: aContentType,
+      saveMode,
+      saveAsType: kSaveAsType_Complete,
+      file,
+    };
+
+    let relatedURI =
+      aOriginalURL || aReferrerInfo?.originalReferrer || sourceURI;
+
+    promiseTargetFile(fpParams, aSkipPrompt, relatedURI)
+      .then(aDialogAccepted => {
+        if (!aDialogAccepted) {
+          aDocument?.close();
+          aSaveCompleteCallback?.();
+          return;
+        }
+
+        saveAsType = fpParams.saveAsType;
+        file = fpParams.file;
+
+        continueSave();
+      })
+      .catch(console.error);
+  }
+
+  function continueSave() {
+    var useSaveDocument =
+      aDocument &&
+      ((saveMode & SAVEMODE_COMPLETE_DOM &&
+        saveAsType == kSaveAsType_Complete) ||
+        (saveMode & SAVEMODE_COMPLETE_TEXT && saveAsType == kSaveAsType_Text));
+
+    let isPrivate = aIsContentWindowPrivate;
+    if (isPrivate === undefined) {
+      isPrivate =
+        aInitiatingDocument.nodeType == 9 
+          ? PrivateBrowsingUtils.isContentWindowPrivate(
+              aInitiatingDocument.defaultView
+            )
+          : aInitiatingDocument.isPrivate;
+    }
+
+    let sourcePrincipal =
+      aPrincipal ||
+      (aDocument && (aDocument.nodePrincipal || aDocument.principal)) ||
+      (aInitiatingDocument && aInitiatingDocument.nodePrincipal);
+
+    let sourceOriginalURI = aOriginalURL ? makeURI(aOriginalURL) : null;
+
+    var persistArgs = {
+      sourceURI,
+      sourceOriginalURI,
+      sourcePrincipal,
+      sourceReferrerInfo: aReferrerInfo,
+      sourceDocument: useSaveDocument ? aDocument : null,
+      targetContentType: saveAsType == kSaveAsType_Text ? "text/plain" : null,
+      targetFile: file,
+      sourceCacheKey: aCacheKey,
+      sourcePostData: aDocument ? getPostData(aDocument) : null,
+      bypassCache: aShouldBypassCache,
+      contentPolicyType,
+      cookieJarSettings: aCookieJarSettings,
+      isPrivate,
+      saveCompleteCallback: aSaveCompleteCallback,
+    };
+
+    internalPersist(persistArgs);
+
+    if (!useSaveDocument) {
+      aDocument?.close();
+    }
+  }
+}
+
+function internalPersist(persistArgs) {
+  var persist = makeWebBrowserPersist();
+
+  const nsIWBP = Ci.nsIWebBrowserPersist;
+  const flags = nsIWBP.PERSIST_FLAGS_REPLACE_EXISTING_FILES;
+  if (persistArgs.bypassCache) {
+    persist.persistFlags = flags | nsIWBP.PERSIST_FLAGS_BYPASS_CACHE;
+  } else {
+    persist.persistFlags = flags | nsIWBP.PERSIST_FLAGS_FROM_CACHE;
+  }
+
+  persist.persistFlags |= nsIWBP.PERSIST_FLAGS_AUTODETECT_APPLY_CONVERSION;
+
+  var targetFileURL = makeFileURI(persistArgs.targetFile);
+
+  var tr = Cc["@mozilla.org/transfer;1"].createInstance(Ci.nsITransfer);
+  tr.init(
+    persistArgs.sourceURI,
+    persistArgs.sourceOriginalURI,
+    targetFileURL,
+    "",
+    null,
+    null,
+    null,
+    persist,
+    persistArgs.isPrivate,
+    Ci.nsITransfer.DOWNLOAD_ACCEPTABLE,
+    persistArgs.sourceReferrerInfo
+  );
+  persist.progressListener = new DownloadListener(window, tr);
+  const { saveCompleteCallback } = persistArgs;
+  if (saveCompleteCallback) {
+    tr.downloadPromise
+      .then(aDownload => aDownload.whenSucceeded())
+      .catch(console.error)
+      .finally(saveCompleteCallback);
+  }
+
+  if (persistArgs.sourceDocument) {
+    var filesFolder = null;
+    if (persistArgs.targetContentType != "text/plain") {
+      filesFolder = persistArgs.targetFile.clone();
+
+      var nameWithoutExtension = getFileBaseName(filesFolder.leafName);
+      var filesFolderLeafName = nameWithoutExtension + "_files";
+
+      filesFolder.leafName = filesFolderLeafName;
+    }
+
+    var encodingFlags = 0;
+    if (persistArgs.targetContentType == "text/plain") {
+      encodingFlags |= nsIWBP.ENCODE_FLAGS_FORMATTED;
+      encodingFlags |= nsIWBP.ENCODE_FLAGS_ABSOLUTE_LINKS;
+      encodingFlags |= nsIWBP.ENCODE_FLAGS_NOFRAMES_CONTENT;
+    } else {
+      encodingFlags |= nsIWBP.ENCODE_FLAGS_ENCODE_BASIC_ENTITIES;
+      encodingFlags |= nsIWBP.ENCODE_FLAGS_DISALLOW_LINE_BREAKING;
+    }
+
+    const kWrapColumn = 80;
+    persist.saveDocument(
+      persistArgs.sourceDocument,
+      targetFileURL,
+      filesFolder,
+      persistArgs.targetContentType,
+      encodingFlags,
+      kWrapColumn
+    );
+  } else {
+    persist.saveURI(
+      persistArgs.sourceURI,
+      persistArgs.sourcePrincipal,
+      persistArgs.sourceCacheKey,
+      persistArgs.sourceReferrerInfo,
+      persistArgs.cookieJarSettings,
+      persistArgs.sourcePostData,
+      null,
+      targetFileURL,
+      persistArgs.contentPolicyType || Ci.nsIContentPolicy.TYPE_SAVEAS_DOWNLOAD,
+      persistArgs.isPrivate
+    );
+  }
+}
+
+function AutoChosen(aFileAutoChosen, aUriAutoChosen) {
+  this.file = aFileAutoChosen;
+  this.uri = aUriAutoChosen;
+}
+
+function FileInfo(
+  aSuggestedFileName,
+  aFileName,
+  aFileBaseName,
+  aFileExt,
+  aUri
+) {
+  this.suggestedFileName = aSuggestedFileName;
+  this.fileName = aFileName;
+  this.fileBaseName = aFileBaseName;
+  this.fileExt = aFileExt;
+  this.uri = aUri;
+}
+
+function initFileInfo(
+  aFI,
+  aURL,
+  aURLCharset,
+  aDocument,
+  aContentType,
+  aContentDisposition
+) {
+  try {
+    let uriExt = null;
+    try {
+      aFI.uri = makeURI(aURL, aURLCharset);
+      uriExt = aFI.uri.QueryInterface(Ci.nsIURL).fileExtension;
+    } catch (e) {}
+
+    let fileName = getDefaultFileName(
+      aFI.suggestedFileName || aFI.fileName,
+      aFI.uri,
+      aDocument,
+      aContentDisposition
+    );
+
+    let mimeService = this.getMIMEService();
+    aFI.fileName = mimeService.validateFileNameForSaving(
+      fileName,
+      aContentType,
+      mimeService.VALIDATE_FORCE_APPEND_EXTENSION
+    );
+
+    if (
+      !uriExt &&
+      !aDocument &&
+      !aContentType &&
+      /^http(s?):\/\//i.test(aURL)
+    ) {
+      aFI.fileExt = "htm";
+      aFI.fileBaseName = aFI.fileName;
+    } else {
+      let idx = aFI.fileName.lastIndexOf(".");
+      aFI.fileBaseName =
+        idx >= 0 ? aFI.fileName.substring(0, idx) : aFI.fileName;
+      aFI.fileExt = idx >= 0 ? aFI.fileName.substring(idx + 1) : null;
+    }
+  } catch (e) {}
+}
+
+function promiseTargetFile(
+  aFpP,
+   aSkipPrompt,
+   aRelatedURI
+) {
+  return (async function () {
+    let downloadLastDir = new DownloadLastDir(window);
+    let prefBranch = Services.prefs.getBranch("browser.download.");
+    let useDownloadDir = prefBranch.getBoolPref("useDownloadDir");
+
+    if (!aSkipPrompt) {
+      useDownloadDir = false;
+    }
+
+    let dirPath = await Downloads.getPreferredDownloadsDirectory();
+    let dirExists = await IOUtils.exists(dirPath);
+    let dir = new FileUtils.File(dirPath);
+
+    if (useDownloadDir && dirExists) {
+      dir.append(aFpP.fileInfo.fileName);
+      aFpP.file = uniqueFile(dir);
+      return true;
+    }
+
+    let file = null;
+    if (!useDownloadDir) {
+      file = await downloadLastDir.getFileAsync(aRelatedURI);
+    }
+    if (file && (await IOUtils.exists(file.path))) {
+      dir = file;
+      dirExists = true;
+    }
+
+    if (!dirExists) {
+      dir = Services.dirsvc.get("Desk", Ci.nsIFile);
+    }
+
+    let fp = makeFilePicker();
+    let titleKey = aFpP.fpTitleKey || "SaveLinkTitle";
+    fp.init(
+      window.browsingContext,
+      ContentAreaUtils.stringBundle.GetStringFromName(titleKey),
+      Ci.nsIFilePicker.modeSave
+    );
+
+    fp.displayDirectory = dir;
+    fp.defaultExtension = aFpP.fileInfo.fileExt;
+    fp.defaultString = aFpP.fileInfo.fileName;
+    appendFiltersForContentType(
+      fp,
+      aFpP.contentType,
+      aFpP.fileInfo.fileExt,
+      aFpP.saveMode
+    );
+
+    if (aFpP.saveMode != SAVEMODE_FILEONLY) {
+      // eslint-disable-next-line mozilla/use-default-preference-values
+      try {
+        fp.filterIndex = prefBranch.getIntPref("save_converter_index");
+      } catch (e) {}
+    }
+
+    let result = await new Promise(resolve => {
+      fp.open(function (aResult) {
+        resolve(aResult);
+      });
+    });
+    if (result == Ci.nsIFilePicker.returnCancel || !fp.file) {
+      return false;
+    }
+
+    if (aFpP.saveMode != SAVEMODE_FILEONLY) {
+      prefBranch.setIntPref("save_converter_index", fp.filterIndex);
+    }
+
+    downloadLastDir.setFile(aRelatedURI, fp.file.parent);
+
+    aFpP.saveAsType = fp.filterIndex;
+    aFpP.file = fp.file;
+    if (AppConstants.platform != "linux") {
+      aFpP.file.leafName = validateFileName(aFpP.file.leafName);
+    }
+
+    return true;
+  })();
+}
+
+function uniqueFile(aLocalFile) {
+  var collisionCount = 0;
+  while (aLocalFile.exists()) {
+    collisionCount++;
+    if (collisionCount == 1) {
+      if (aLocalFile.leafName.match(/\.[^\.]{1,3}\.(gz|bz2|Z)$/i)) {
+        aLocalFile.leafName = aLocalFile.leafName.replace(
+          /\.[^\.]{1,3}\.(gz|bz2|Z)$/i,
+          "(2)$&"
+        );
+      } else {
+        aLocalFile.leafName = aLocalFile.leafName.replace(
+          /(\.[^\.]*)?$/,
+          "(2)$&"
+        );
+      }
+    } else {
+      aLocalFile.leafName = aLocalFile.leafName.replace(
+        /^(.*\()\d+\)/,
+        "$1" + (collisionCount + 1) + ")"
+      );
+    }
+  }
+  return aLocalFile;
+}
+
+function DownloadURL(aURL, aFileName, aInitiatingDocument) {
+  let isPrivate = aInitiatingDocument.defaultView.docShell.QueryInterface(
+    Ci.nsILoadContext
+  ).usePrivateBrowsing;
+
+  let fileInfo = new FileInfo(aFileName);
+  initFileInfo(fileInfo, aURL, null, null, null, null);
+
+  let filepickerParams = {
+    fileInfo,
+    saveMode: SAVEMODE_FILEONLY,
+  };
+
+  (async function () {
+    let accepted = await promiseTargetFile(
+      filepickerParams,
+      true,
+      fileInfo.uri
+    );
+    if (!accepted) {
+      return;
+    }
+
+    let file = filepickerParams.file;
+    let download = await Downloads.createDownload({
+      source: { url: aURL, isPrivate },
+      target: { path: file.path, partFilePath: file.path + ".part" },
+    });
+    download.tryToKeepPartialData = true;
+
+    download.start().catch(() => {});
+
+    let list = await Downloads.getList(Downloads.ALL);
+    list.add(download);
+  })().catch(console.error);
+}
+
+const SAVEMODE_FILEONLY = 0x00;
+XPCOMUtils.defineConstant(this, "SAVEMODE_FILEONLY", SAVEMODE_FILEONLY);
+const SAVEMODE_COMPLETE_DOM = 0x01;
+XPCOMUtils.defineConstant(this, "SAVEMODE_COMPLETE_DOM", SAVEMODE_COMPLETE_DOM);
+const SAVEMODE_COMPLETE_TEXT = 0x02;
+XPCOMUtils.defineConstant(
+  this,
+  "SAVEMODE_COMPLETE_TEXT",
+  SAVEMODE_COMPLETE_TEXT
+);
+
+function appendFiltersForContentType(
+  aFilePicker,
+  aContentType,
+  aFileExtension,
+  aSaveMode
+) {
+  var bundleName;
+  var filterString;
+
+  if (aSaveMode != SAVEMODE_FILEONLY) {
+    switch (aContentType) {
+      case "text/html":
+        bundleName = "WebPageHTMLOnlyFilter";
+        filterString = "*.htm; *.html";
+        break;
+
+      case "application/xhtml+xml":
+        bundleName = "WebPageXHTMLOnlyFilter";
+        filterString = "*.xht; *.xhtml";
+        break;
+
+      case "image/svg+xml":
+        bundleName = "WebPageSVGOnlyFilter";
+        filterString = "*.svg; *.svgz";
+        break;
+
+      case "text/xml":
+      case "application/xml":
+        bundleName = "WebPageXMLOnlyFilter";
+        filterString = "*.xml";
+        break;
+    }
+  }
+
+  if (!bundleName) {
+    if (aSaveMode != SAVEMODE_FILEONLY) {
+      throw new Error(`Invalid save mode for type '${aContentType}'`);
+    }
+
+    var mimeInfo = getMIMEInfoForType(aContentType, aFileExtension);
+    if (mimeInfo) {
+      var extString = "";
+      for (var extension of mimeInfo.getFileExtensions()) {
+        if (extString) {
+          extString += "; ";
+        } 
+        extString += "*." + extension;
+      }
+
+      if (extString) {
+        aFilePicker.appendFilter(mimeInfo.description, extString);
+      }
+    }
+  }
+
+  if (aSaveMode & SAVEMODE_COMPLETE_DOM) {
+    aFilePicker.appendFilter(
+      ContentAreaUtils.stringBundle.GetStringFromName("WebPageCompleteFilter"),
+      filterString
+    );
+    aFilePicker.appendFilter(
+      ContentAreaUtils.stringBundle.GetStringFromName(bundleName),
+      filterString
+    );
+  }
+
+  if (aSaveMode & SAVEMODE_COMPLETE_TEXT) {
+    aFilePicker.appendFilters(Ci.nsIFilePicker.filterText);
+  }
+
+  aFilePicker.appendFilters(Ci.nsIFilePicker.filterAll);
+}
+
+function getPostData(aDocument) {
+  if (aDocument instanceof Ci.nsIWebBrowserPersistDocument) {
+    return aDocument.postData;
+  }
+  try {
+    let sessionHistoryEntry = aDocument.defaultView.docShell
+      .QueryInterface(Ci.nsIWebPageDescriptor)
+      .currentDescriptor.QueryInterface(Ci.nsISHEntry);
+    return sessionHistoryEntry.postData;
+  } catch (e) {}
+  return null;
+}
+
+function makeWebBrowserPersist() {
+  const persistContractID =
+    "@mozilla.org/embedding/browser/nsWebBrowserPersist;1";
+  const persistIID = Ci.nsIWebBrowserPersist;
+  return Cc[persistContractID].createInstance(persistIID);
+}
+
+function makeURI(aURL, aOriginCharset, aBaseURI) {
+  return Services.io.newURI(aURL, aOriginCharset, aBaseURI);
+}
+
+function makeFileURI(aFile) {
+  return Services.io.newFileURI(aFile);
+}
+
+function makeFilePicker() {
+  const fpContractID = "@mozilla.org/filepicker;1";
+  const fpIID = Ci.nsIFilePicker;
+  return Cc[fpContractID].createInstance(fpIID);
+}
+
+function getMIMEService() {
+  const mimeSvcContractID = "@mozilla.org/mime;1";
+  const mimeSvcIID = Ci.nsIMIMEService;
+  const mimeSvc = Cc[mimeSvcContractID].getService(mimeSvcIID);
+  return mimeSvc;
+}
+
+function getFileBaseName(aFileName) {
+  return aFileName.replace(/\.[^.]*$/, "");
+}
+
+function getMIMETypeForURI(aURI) {
+  try {
+    return getMIMEService().getTypeFromURI(aURI);
+  } catch (e) {}
+  return null;
+}
+
+function getMIMEInfoForType(aMIMEType, aExtension) {
+  if (aMIMEType || aExtension) {
+    try {
+      return getMIMEService().getFromTypeAndExtension(aMIMEType, aExtension);
+    } catch (e) {}
+  }
+  return null;
+}
+
+function getDefaultFileName(
+  aDefaultFileName,
+  aURI,
+  aDocument,
+  aContentDisposition
+) {
+  if (aContentDisposition) {
+    const mhpContractID = "@mozilla.org/network/mime-hdrparam;1";
+    const mhpIID = Ci.nsIMIMEHeaderParam;
+    const mhp = Cc[mhpContractID].getService(mhpIID);
+    var dummy = { value: null }; 
+    var charset = getCharsetforSave(aDocument);
+
+    var fileName = null;
+    try {
+      fileName = mhp.getParameter(
+        aContentDisposition,
+        "filename",
+        charset,
+        true,
+        dummy
+      );
+    } catch (e) {
+      try {
+        fileName = mhp.getParameter(
+          aContentDisposition,
+          "name",
+          charset,
+          true,
+          dummy
+        );
+      } catch (e) {}
+    }
+    if (fileName) {
+      return Services.textToSubURI.unEscapeURIForUI(
+        fileName,
+         true
+      );
+    }
+  }
+
+  let docTitle;
+  if (aDocument && aDocument.title && aDocument.title.trim()) {
+    let contentType = aDocument.contentType;
+    if (
+      contentType == "application/xhtml+xml" ||
+      contentType == "application/xml" ||
+      contentType == "image/svg+xml" ||
+      contentType == "text/html" ||
+      contentType == "text/xml"
+    ) {
+      return aDocument.title;
+    }
+  }
+
+  try {
+    var url = aURI.QueryInterface(Ci.nsIURL);
+    if (url.fileName != "") {
+      return Services.textToSubURI.unEscapeURIForUI(
+        url.fileName,
+         true
+      );
+    }
+  } catch (e) {
+  }
+
+  if (docTitle && aURI?.scheme != "data") {
+    return docTitle;
+  }
+
+  if (aDefaultFileName) {
+    return aDefaultFileName;
+  }
+
+  try {
+    if (aURI.host) {
+      return aURI.host;
+    }
+  } catch (e) {
+  }
+
+  return "";
+}
+
+function validateFileName(aFileName) {
+  let processed =
+    DownloadPaths.sanitize(aFileName, {
+      compressWhitespaces: false,
+      allowInvalidFilenames: true,
+    }) || "_";
+  if (AppConstants.platform == "android") {
+    if (processed.replace(/_/g, "").length <= processed.length / 2) {
+      var original = processed;
+      processed = "download";
+
+      if (original.includes(".")) {
+        var suffix = original.split(".").slice(-1)[0];
+        if (suffix && !suffix.includes("_")) {
+          processed += "." + suffix;
+        }
+      }
+    }
+  }
+  return processed;
+}
+
+function GetSaveModeForContentType(aContentType, aDocument) {
+  if (!aDocument) {
+    return SAVEMODE_FILEONLY;
+  }
+
+  var saveMode = SAVEMODE_FILEONLY;
+  switch (aContentType) {
+    case "text/html":
+    case "application/xhtml+xml":
+    case "image/svg+xml":
+      saveMode |= SAVEMODE_COMPLETE_TEXT;
+    case "text/xml":
+    case "application/xml":
+      saveMode |= SAVEMODE_COMPLETE_DOM;
+      break;
+  }
+
+  return saveMode;
+}
+
+function getCharsetforSave(aDocument) {
+  if (aDocument) {
+    return aDocument.characterSet;
+  }
+
+  if (document.commandDispatcher.focusedWindow) {
+    return document.commandDispatcher.focusedWindow.document.characterSet;
+  }
+
+  return window.content.document.characterSet;
+}
+
+function openURL(aURL) {
+  var uri = aURL instanceof Ci.nsIURI ? aURL : makeURI(aURL);
+
+  var protocolSvc = Cc[
+    "@mozilla.org/uriloader/external-protocol-service;1"
+  ].getService(Ci.nsIExternalProtocolService);
+
+  let recentWindow = Services.wm.getMostRecentWindow("navigator:browser");
+
+  if (!protocolSvc.isExposedProtocol(uri.scheme)) {
+    protocolSvc.loadURI(uri, recentWindow?.document.contentPrincipal);
+  } else {
+    if (recentWindow) {
+      recentWindow.openWebLinkIn(uri.spec, "tab", {
+        triggeringPrincipal: recentWindow.document.contentPrincipal,
+      });
+      return;
+    }
+
+    var loadgroup = Cc["@mozilla.org/network/load-group;1"].createInstance(
+      Ci.nsILoadGroup
+    );
+    var appstartup = Services.startup;
+
+    var loadListener = {
+      onStartRequest: function ll_start() {
+        appstartup.enterLastWindowClosingSurvivalArea();
+      },
+      onStopRequest: function ll_stop() {
+        appstartup.exitLastWindowClosingSurvivalArea();
+      },
+      QueryInterface: ChromeUtils.generateQI([
+        "nsIRequestObserver",
+        "nsISupportsWeakReference",
+      ]),
+    };
+    loadgroup.groupObserver = loadListener;
+
+    var uriListener = {
+      doContent() {
+        return false;
+      },
+      isPreferred() {
+        return false;
+      },
+      canHandleContent() {
+        return false;
+      },
+      loadCookie: null,
+      parentContentListener: null,
+      getInterface(iid) {
+        if (iid.equals(Ci.nsIURIContentListener)) {
+          return this;
+        }
+        if (iid.equals(Ci.nsILoadGroup)) {
+          return loadgroup;
+        }
+        throw Components.Exception("", Cr.NS_ERROR_NO_INTERFACE);
+      },
+    };
+
+    var channel = NetUtil.newChannel({
+      uri,
+      loadUsingSystemPrincipal: true,
+    });
+
+    if (channel) {
+      channel.channelIsForDownload = true;
+    }
+
+    var uriLoader = Cc["@mozilla.org/uriloader;1"].getService(Ci.nsIURILoader);
+    uriLoader.openURI(
+      channel,
+      Ci.nsIURILoader.IS_CONTENT_PREFERRED,
+      uriListener
+    );
+  }
+}

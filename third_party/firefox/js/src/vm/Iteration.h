@@ -1,0 +1,656 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef vm_Iteration_h
+#define vm_Iteration_h
+
+
+#include "mozilla/MemoryReporting.h"
+
+#include "builtin/SelfHostingDefines.h"
+#include "gc/Barrier.h"
+#include "util/Memory.h"
+#include "vm/NativeObject.h"
+#include "vm/TypedArrayObject.h"
+
+
+namespace js {
+
+class ArrayObject;
+class PlainObject;
+class PropertyIteratorObject;
+
+struct PropertyIndex {
+ private:
+  uint32_t asBits_;
+
+ public:
+  enum class Kind : uint32_t { DynamicSlot, FixedSlot, Element, Invalid };
+
+  PropertyIndex(Kind kind, uint32_t index) : asBits_(encode(kind, index)) {}
+
+  static PropertyIndex Invalid() { return PropertyIndex(Kind::Invalid, 0); }
+
+  static PropertyIndex ForElement(uint32_t index) {
+    return PropertyIndex(Kind::Element, index);
+  }
+
+  static PropertyIndex ForSlot(NativeObject* obj, uint32_t index) {
+    if (index < obj->numFixedSlots()) {
+      return PropertyIndex(Kind::FixedSlot, index);
+    } else {
+      return PropertyIndex(Kind::DynamicSlot, index - obj->numFixedSlots());
+    }
+  }
+
+  static constexpr uint32_t KindBits = 2;
+
+  static constexpr uint32_t IndexBits = 32 - KindBits;
+  static constexpr uint32_t IndexLimit = 1 << IndexBits;
+  static constexpr uint32_t IndexMask = (1 << IndexBits) - 1;
+
+  static constexpr uint32_t KindShift = IndexBits;
+
+  static_assert(NativeObject::MAX_FIXED_SLOTS < IndexLimit);
+  static_assert(NativeObject::MAX_SLOTS_COUNT < IndexLimit);
+  static_assert(NativeObject::MAX_DENSE_ELEMENTS_COUNT < IndexLimit);
+
+ private:
+  uint32_t encode(Kind kind, uint32_t index) {
+    MOZ_ASSERT(index < IndexLimit);
+    return (uint32_t(kind) << KindShift) | index;
+  }
+
+ public:
+  Kind kind() const { return Kind(asBits_ >> KindShift); }
+  uint32_t index() const { return asBits_ & IndexMask; }
+};
+
+using PropertyIndexVector = js::Vector<PropertyIndex, 8, js::TempAllocPolicy>;
+
+struct NativeIterator;
+
+class NativeIteratorListNode {
+ protected:
+  NativeIteratorListNode* prev_ = nullptr;
+  NativeIteratorListNode* next_ = nullptr;
+
+ public:
+  NativeIteratorListNode* prev() { return prev_; }
+  NativeIteratorListNode* next() { return next_; }
+
+  void setPrev(NativeIteratorListNode* prev) { prev_ = prev; }
+  void setNext(NativeIteratorListNode* next) { next_ = next; }
+
+  static constexpr size_t offsetOfNext() {
+    return offsetof(NativeIteratorListNode, next_);
+  }
+
+  static constexpr size_t offsetOfPrev() {
+    return offsetof(NativeIteratorListNode, prev_);
+  }
+
+ private:
+  NativeIterator* asNativeIterator() {
+    return reinterpret_cast<NativeIterator*>(this);
+  }
+
+  friend class NativeIteratorListIter;
+};
+
+class NativeIteratorListHead : public NativeIteratorListNode {
+ private:
+  NativeIteratorListHead() { prev_ = next_ = this; }
+  friend class JS::Compartment;
+};
+
+class NativeIteratorListIter {
+ private:
+  NativeIteratorListHead* head_;
+  NativeIteratorListNode* curr_;
+
+ public:
+  explicit NativeIteratorListIter(NativeIteratorListHead* head)
+      : head_(head), curr_(head->next()) {}
+
+  bool done() const { return curr_ == head_; }
+
+  NativeIterator* next() {
+    MOZ_ASSERT(!done());
+    NativeIterator* result = curr_->asNativeIterator();
+    curr_ = curr_->next();
+    return result;
+  }
+};
+
+class IteratorProperty {
+  uintptr_t raw_ = 0;
+
+ public:
+  static constexpr uintptr_t DeletedBit = 0x1;
+
+  IteratorProperty(const IteratorProperty&) = delete;
+
+  IteratorProperty() = default;
+  explicit IteratorProperty(JSLinearString* str) : raw_(uintptr_t(str)) {}
+  IteratorProperty(JSLinearString* str, bool deleted)
+      : raw_(uintptr_t(str) | (deleted ? DeletedBit : 0)) {}
+
+  JSLinearString* asString() const {
+    return reinterpret_cast<JSLinearString*>(raw_ & ~DeletedBit);
+  }
+
+  bool deleted() const { return raw_ & DeletedBit; }
+  void markDeleted() { raw_ |= DeletedBit; }
+  void clearDeleted() { raw_ &= ~DeletedBit; }
+
+  void traceString(JSTracer* trc);
+} JS_HAZ_GC_POINTER;
+
+struct NativeIterator : public NativeIteratorListNode {
+ private:
+  GCPtr<JSObject*> objectBeingIterated_ = {};
+
+  const GCPtr<JSObject*> iterObj_ = {};
+  const GCPtr<Shape*> objShape_ = {};
+  uint32_t propertyCount_ = 0;
+  uint32_t propertyCursor_;    
+  uint32_t ownPropertyCount_;  
+  HashNumber shapesHash_;      
+  uint16_t protoShapeCount_ = 0;
+  uint8_t flags_ = 0;
+
+ public:
+  struct Flags {
+    static constexpr uint32_t Initialized = 0x1;
+
+    static constexpr uint32_t Active = 0x2;
+
+    static constexpr uint32_t HasUnvisitedPropertyDeletion = 0x4;
+
+    static constexpr uint32_t IsEmptyIteratorSingleton = 0x8;
+
+
+    static constexpr uint32_t IndicesSupported = 0x10;
+
+    static constexpr uint32_t IndicesAllocated = 0x20;
+
+    static constexpr uint32_t IndicesAvailable = 0x40;
+
+    static constexpr uint32_t OwnPropertiesOnly = 0x80;
+
+    static constexpr uint32_t NotReusable =
+        Active | HasUnvisitedPropertyDeletion | OwnPropertiesOnly;
+  };
+
+  static constexpr uint32_t PropCountLimit = 1 << 30;
+
+  static constexpr uint32_t ShapeCountLimit = 1 << 16;
+
+ private:
+#ifdef DEBUG
+  bool maybeHasIndexedPropertiesFromProto_ = false;
+#endif
+
+
+ public:
+  NativeIterator(JSContext* cx, Handle<PropertyIteratorObject*> propIter,
+                 Handle<JSObject*> objBeingIterated, HandleIdVector props,
+                 bool supportsIndices, PropertyIndexVector* indices,
+                 uint32_t numShapes, uint32_t ownPropertyCount,
+                 bool forObjectKeys, bool* hadError);
+
+  JSObject* objectBeingIterated() const { return objectBeingIterated_; }
+
+  void initObjectBeingIterated(JSObject& obj) {
+    MOZ_ASSERT(!objectBeingIterated_);
+    objectBeingIterated_.init(&obj);
+  }
+  void clearObjectBeingIterated() {
+    MOZ_ASSERT(objectBeingIterated_);
+    objectBeingIterated_ = nullptr;
+  }
+
+  const GCPtr<Shape*>& objShape() const { return objShape_; }
+
+  GCPtr<Shape*>* protoShapesBegin(size_t numProperties) const {
+    uintptr_t raw = reinterpret_cast<uintptr_t>(this);
+    uintptr_t propertiesStart = raw + offsetOfFirstProperty();
+    uintptr_t propertiesEnd =
+        propertiesStart + numProperties * sizeof(IteratorProperty);
+    uintptr_t result = propertiesEnd;
+    if (flags_ & Flags::IndicesAllocated) {
+      result += numProperties * sizeof(PropertyIndex);
+      if constexpr (sizeof(PropertyIndex) != alignof(GCPtr<Shape*>)) {
+        result = AlignBytes(result, alignof(GCPtr<Shape*>));
+      }
+    }
+    MOZ_ASSERT(result % alignof(GCPtr<Shape*>) == 0);
+    return reinterpret_cast<GCPtr<Shape*>*>(result);
+  }
+
+  GCPtr<Shape*>* protoShapesBegin() const {
+    return protoShapesBegin(allocatedPropertyCount());
+  }
+
+  GCPtr<Shape*>* protoShapesEnd() const {
+    return protoShapesBegin() + protoShapeCount_;
+  }
+
+  uint32_t protoShapeCount() const { return protoShapeCount_; }
+
+  IteratorProperty* propertiesBegin() const {
+    static_assert(
+        alignof(GCPtr<Shape*>) >= alignof(IteratorProperty),
+        "IteratorPropertys for properties must be able to appear "
+        "directly after any GCPtr<Shape*>s after this NativeIterator, "
+        "with no padding space required for correct alignment");
+    static_assert(
+        alignof(NativeIterator) >= alignof(IteratorProperty),
+        "IteratorPropertys for properties must be able to appear "
+        "directly after this NativeIterator when no GCPtr<Shape*>s are "
+        "present, with no padding space required for correct "
+        "alignment");
+
+    return reinterpret_cast<IteratorProperty*>(uintptr_t(this) + sizeof(*this));
+  }
+
+  IteratorProperty* propertiesEnd() const {
+    return propertiesBegin() + propertyCount_;
+  }
+
+  IteratorProperty* nextProperty() const {
+    return propertiesBegin() + propertyCursor_;
+  }
+
+  PropertyIndex* indicesBegin() const {
+    static_assert(alignof(IteratorProperty) >= alignof(PropertyIndex));
+    return reinterpret_cast<PropertyIndex*>(propertiesEnd());
+  }
+
+  MOZ_ALWAYS_INLINE JS::Value nextIteratedValueAndAdvance() {
+    while (propertyCursor_ < propertyCount_) {
+      IteratorProperty& prop = *nextProperty();
+      incCursor();
+      if (prop.deleted()) {
+        continue;
+      }
+      return JS::StringValue(prop.asString());
+    }
+
+    return JS::MagicValue(JS_NO_ITER_VALUE);
+  }
+
+  void resetPropertyCursorForReuse() {
+    MOZ_ASSERT(isInitialized());
+
+
+    if (hasUnvisitedPropertyDeletion()) {
+      for (IteratorProperty* prop = propertiesBegin(); prop < propertiesEnd();
+           prop++) {
+        prop->clearDeleted();
+      }
+      unmarkHasUnvisitedPropertyDeletion();
+    }
+
+    propertyCursor_ = 0;
+  }
+
+  bool previousPropertyWas(JS::Handle<JSLinearString*> str) {
+    MOZ_ASSERT(isInitialized());
+    return propertyCursor_ > 0 &&
+           propertiesBegin()[propertyCursor_ - 1].asString() == str;
+  }
+
+  size_t numKeys() const { return propertyCount_; }
+
+  size_t ownPropertyCount() const { return ownPropertyCount_; }
+
+  size_t allocatedPropertyCount() const {
+    if (!isInitialized()) {
+      return propertyCursor_;
+    }
+    return propertyCount_;
+  }
+
+  JSObject* iterObj() const { return iterObj_; }
+
+  void incCursor() {
+    MOZ_ASSERT(isInitialized());
+    propertyCursor_++;
+  }
+
+  HashNumber shapesHash() const { return shapesHash_; }
+
+  bool isInitialized() const { return flags_ & Flags::Initialized; }
+
+  size_t allocationSize() const;
+
+#ifdef DEBUG
+  void setMaybeHasIndexedPropertiesFromProto() {
+    maybeHasIndexedPropertiesFromProto_ = true;
+  }
+  bool maybeHasIndexedPropertiesFromProto() const {
+    return maybeHasIndexedPropertiesFromProto_;
+  }
+#endif
+
+ private:
+  bool indicesAllocated() const { return flags_ & Flags::IndicesAllocated; }
+
+  bool isUnlinked() const { return !prev_ && !next_; }
+
+ public:
+  bool indicesAvailable() const { return flags_ & Flags::IndicesAvailable; }
+
+  bool indicesSupported() const { return flags_ & Flags::IndicesSupported; }
+
+  bool ownPropertiesOnly() const { return flags_ & Flags::OwnPropertiesOnly; }
+
+  bool isEmptyIteratorSingleton() const {
+    bool res = flags_ & Flags::IsEmptyIteratorSingleton;
+    MOZ_ASSERT_IF(
+        res, flags_ == (Flags::Initialized | Flags::IsEmptyIteratorSingleton));
+    MOZ_ASSERT_IF(res, !objectBeingIterated_);
+    MOZ_ASSERT_IF(res, propertyCount_ == 0);
+    MOZ_ASSERT_IF(res, protoShapeCount_ == 0);
+    MOZ_ASSERT_IF(res, isUnlinked());
+    return res;
+  }
+  void markEmptyIteratorSingleton() {
+    flags_ |= Flags::IsEmptyIteratorSingleton;
+
+    MOZ_ASSERT(isEmptyIteratorSingleton());
+  }
+
+  bool isActive() const {
+    MOZ_ASSERT(isInitialized());
+
+    return flags_ & Flags::Active;
+  }
+
+  void markActive() {
+    MOZ_ASSERT(isInitialized());
+    MOZ_ASSERT(!isEmptyIteratorSingleton());
+
+    flags_ |= Flags::Active;
+  }
+
+  void markInactive() {
+    MOZ_ASSERT(isInitialized());
+    MOZ_ASSERT(!isEmptyIteratorSingleton());
+
+    flags_ &= ~Flags::Active;
+  }
+
+  bool isReusable() const {
+    MOZ_ASSERT(isInitialized());
+
+    if (!(flags_ & Flags::Initialized)) {
+      return false;
+    }
+    if (flags_ & Flags::Active) {
+      return false;
+    }
+    return true;
+  }
+
+  void markHasUnvisitedPropertyDeletion() {
+    MOZ_ASSERT(isInitialized());
+    MOZ_ASSERT(!isEmptyIteratorSingleton());
+
+    flags_ |= Flags::HasUnvisitedPropertyDeletion;
+  }
+
+  void unmarkHasUnvisitedPropertyDeletion() {
+    MOZ_ASSERT(isInitialized());
+    MOZ_ASSERT(!isEmptyIteratorSingleton());
+    MOZ_ASSERT(hasUnvisitedPropertyDeletion());
+
+    flags_ &= ~Flags::HasUnvisitedPropertyDeletion;
+  }
+
+  bool hasUnvisitedPropertyDeletion() const {
+    MOZ_ASSERT(isInitialized());
+
+    return flags_ & Flags::HasUnvisitedPropertyDeletion;
+  }
+
+  bool mayHavePrototypeProperties() {
+    return !indicesAvailable() && !indicesSupported();
+  }
+
+  void disableIndices() {
+    flags_ &= ~(Flags::IndicesAvailable | Flags::IndicesSupported);
+  }
+
+  void link(NativeIteratorListNode* other) {
+    MOZ_ASSERT(isInitialized());
+
+    MOZ_ASSERT(!isEmptyIteratorSingleton());
+
+    MOZ_ASSERT(isUnlinked());
+
+    setNext(other);
+    setPrev(other->prev());
+
+    other->prev()->setNext(this);
+    other->setPrev(this);
+  }
+  void unlink() {
+    MOZ_ASSERT(isInitialized());
+    MOZ_ASSERT(!isEmptyIteratorSingleton());
+
+    next()->setPrev(prev());
+    prev()->setNext(next());
+    setNext(nullptr);
+    setPrev(nullptr);
+  }
+
+  void trace(JSTracer* trc);
+
+  static constexpr size_t offsetOfObjectBeingIterated() {
+    return offsetof(NativeIterator, objectBeingIterated_);
+  }
+
+  static constexpr size_t offsetOfProtoShapeCount() {
+    return offsetof(NativeIterator, protoShapeCount_);
+  }
+
+  static constexpr size_t offsetOfPropertyCursor() {
+    return offsetof(NativeIterator, propertyCursor_);
+  }
+
+  static constexpr size_t offsetOfPropertyCount() {
+    return offsetof(NativeIterator, propertyCount_);
+  }
+
+  static constexpr size_t offsetOfOwnPropertyCount() {
+    return offsetof(NativeIterator, ownPropertyCount_);
+  }
+
+  static constexpr size_t offsetOfFlags() {
+    return offsetof(NativeIterator, flags_);
+  }
+
+  static constexpr size_t offsetOfObjectShape() {
+    return offsetof(NativeIterator, objShape_);
+  }
+
+  static constexpr size_t offsetOfFirstProperty() {
+    return sizeof(NativeIterator);
+  }
+};
+
+class PropertyIteratorObject : public NativeObject {
+  static const JSClassOps classOps_;
+
+  enum { IteratorSlot, SlotCount };
+
+ public:
+  static const JSClass class_;
+
+  NativeIterator* getNativeIterator() const {
+    return maybePtrFromReservedSlot<NativeIterator>(IteratorSlot);
+  }
+  void initNativeIterator(js::NativeIterator* ni) {
+    initReservedSlot(IteratorSlot, PrivateValue(ni));
+  }
+
+  size_t sizeOfMisc(mozilla::MallocSizeOf mallocSizeOf) const;
+
+  static size_t offsetOfIteratorSlot() {
+    return getFixedSlotOffset(IteratorSlot);
+  }
+
+ private:
+  static void trace(JSTracer* trc, JSObject* obj);
+  static void finalize(JS::GCContext* gcx, JSObject* obj);
+};
+
+class ArrayIteratorObject : public NativeObject {
+ public:
+  static const JSClass class_;
+};
+
+ArrayIteratorObject* NewArrayIteratorTemplate(JSContext* cx);
+ArrayIteratorObject* NewArrayIterator(JSContext* cx);
+
+class StringIteratorObject : public NativeObject {
+ public:
+  static const JSClass class_;
+};
+
+StringIteratorObject* NewStringIteratorTemplate(JSContext* cx);
+StringIteratorObject* NewStringIterator(JSContext* cx);
+
+class RegExpStringIteratorObject : public NativeObject {
+ public:
+  static const JSClass class_;
+};
+
+RegExpStringIteratorObject* NewRegExpStringIteratorTemplate(JSContext* cx);
+RegExpStringIteratorObject* NewRegExpStringIterator(JSContext* cx);
+
+#ifdef NIGHTLY_BUILD
+class IteratorRangeObject : public NativeObject {
+ public:
+  static const JSClass class_;
+};
+
+IteratorRangeObject* NewIteratorRange(JSContext* cx);
+#endif
+
+[[nodiscard]] bool EnumerateProperties(JSContext* cx, HandleObject obj,
+                                       MutableHandleIdVector props);
+
+PropertyIteratorObject* LookupInIteratorCache(JSContext* cx, HandleObject obj);
+PropertyIteratorObject* LookupInShapeIteratorCache(JSContext* cx,
+                                                   HandleObject obj);
+
+PropertyIteratorObject* GetIterator(JSContext* cx, HandleObject obj);
+PropertyIteratorObject* GetIteratorWithIndices(JSContext* cx, HandleObject obj);
+
+PropertyIteratorObject* GetIteratorForObjectKeys(JSContext* cx,
+                                                 HandleObject obj);
+PropertyIteratorObject* GetIteratorWithIndicesForObjectKeys(JSContext* cx,
+                                                            HandleObject obj);
+
+PropertyIteratorObject* ValueToIterator(JSContext* cx, HandleValue vp);
+
+void CloseIterator(JSObject* obj);
+
+bool IteratorCloseForException(JSContext* cx, HandleObject obj);
+
+void UnwindIteratorForUncatchableException(JSObject* obj);
+
+extern bool SuppressDeletedProperty(JSContext* cx, HandleObject obj, jsid id);
+
+extern bool SuppressDeletedElement(JSContext* cx, HandleObject obj,
+                                   uint32_t index);
+
+#ifdef DEBUG
+extern void AssertDenseElementsNotIterated(NativeObject* obj);
+#else
+inline void AssertDenseElementsNotIterated(NativeObject* obj) {}
+#endif
+
+inline Value IteratorMore(JSObject* iterobj) {
+  NativeIterator* ni =
+      iterobj->as<PropertyIteratorObject>().getNativeIterator();
+  return ni->nextIteratedValueAndAdvance();
+}
+
+extern PlainObject* CreateIterResultObject(JSContext* cx, HandleValue value,
+                                           bool done);
+
+class IteratorObject : public NativeObject {
+ public:
+  static const JSClass class_;
+  static const JSClass protoClass_;
+
+  static bool finishInit(JSContext* cx, HandleObject ctor, HandleObject proto);
+};
+
+class WrapForValidIteratorObject : public NativeObject {
+ public:
+  static const JSClass class_;
+
+  enum { IteratorSlot, NextMethodSlot, SlotCount };
+
+  static_assert(
+      IteratorSlot == WRAP_FOR_VALID_ITERATOR_ITERATOR_SLOT,
+      "IteratedSlot must match self-hosting define for iterator object slot.");
+
+  static_assert(
+      NextMethodSlot == WRAP_FOR_VALID_ITERATOR_NEXT_METHOD_SLOT,
+      "NextMethodSlot must match self-hosting define for next method slot.");
+};
+
+WrapForValidIteratorObject* NewWrapForValidIterator(JSContext* cx);
+
+class IteratorHelperObject : public NativeObject {
+ public:
+  static const JSClass class_;
+
+  enum {
+    GeneratorSlot,
+
+    UnderlyingIteratorSlot,
+
+    SlotCount,
+  };
+
+  static_assert(GeneratorSlot == ITERATOR_HELPER_GENERATOR_SLOT,
+                "GeneratorSlot must match self-hosting define for generator "
+                "object slot.");
+
+  static_assert(UnderlyingIteratorSlot ==
+                    ITERATOR_HELPER_UNDERLYING_ITERATOR_SLOT,
+                "UnderlyingIteratorSlot must match self-hosting define for "
+                "underlying iterator slot.");
+};
+
+IteratorHelperObject* NewIteratorHelper(JSContext* cx);
+
+ArrayObject* IterableToArray(JSContext* cx, HandleValue iterable);
+
+bool HasOptimizableArrayIteratorPrototype(JSContext* cx);
+
+enum class MustBePacked { No, Yes };
+
+template <MustBePacked Packed>
+bool IsArrayWithDefaultIterator(JSObject* obj, JSContext* cx);
+
+bool IsMapObjectWithDefaultIterator(JSObject* obj, JSContext* cx);
+bool IsSetObjectWithDefaultIterator(JSObject* obj, JSContext* cx);
+
+static inline bool ClassCanHaveExtraEnumeratedProperties(const JSClass* clasp) {
+  return IsTypedArrayClass(clasp) || clasp->getNewEnumerate() ||
+         clasp->getEnumerate();
+}
+
+} 
+
+#endif /* vm_Iteration_h */

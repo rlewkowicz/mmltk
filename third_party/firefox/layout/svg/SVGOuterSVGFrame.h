@@ -1,0 +1,165 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef LAYOUT_SVG_SVGOUTERSVGFRAME_H_
+#define LAYOUT_SVG_SVGOUTERSVGFRAME_H_
+
+#include "mozilla/ISVGSVGFrame.h"
+#include "mozilla/SVGContainerFrame.h"
+
+class gfxContext;
+
+namespace mozilla {
+class AutoFragmentHandler;
+class PresShell;
+}  
+
+nsContainerFrame* NS_NewSVGOuterSVGFrame(mozilla::PresShell* aPresShell,
+                                         mozilla::ComputedStyle* aStyle);
+nsContainerFrame* NS_NewSVGOuterSVGAnonChildFrame(
+    mozilla::PresShell* aPresShell, mozilla::ComputedStyle* aStyle);
+
+namespace mozilla {
+
+
+class SVGOuterSVGFrame final : public SVGDisplayContainerFrame,
+                               public ISVGSVGFrame {
+  using imgDrawingParams = image::imgDrawingParams;
+
+  friend nsContainerFrame* ::NS_NewSVGOuterSVGFrame(
+      mozilla::PresShell* aPresShell, ComputedStyle* aStyle);
+  friend class AsyncSendIntrinsicSizeAndRatioToEmbedder;
+  friend class AutoFragmentHandler;
+
+ protected:
+  explicit SVGOuterSVGFrame(ComputedStyle* aStyle, nsPresContext* aPresContext);
+
+ public:
+  NS_DECL_QUERYFRAME
+  NS_DECL_FRAMEARENA_HELPERS(SVGOuterSVGFrame)
+
+  nscoord IntrinsicISize(const IntrinsicSizeInput& aInput,
+                         IntrinsicISizeType aType) override;
+
+  inline ContainSizeAxes ContainSizeAxesIfApplicable() const {
+    if (!GetContent()->GetParent()) {
+      return ContainSizeAxes(false, false);
+    }
+    return GetContainSizeAxes();
+  }
+  IntrinsicSize GetIntrinsicSize() override;
+  AspectRatio GetIntrinsicRatio() const override;
+
+  SizeComputationResult ComputeSize(
+      const SizeComputationInput& aSizingInput, WritingMode aWritingMode,
+      const LogicalSize& aCBSize, nscoord aAvailableISize,
+      const LogicalSize& aMargin, const LogicalSize& aBorderPadding,
+      const mozilla::StyleSizeOverrides& aSizeOverrides,
+      ComputeSizeFlags aFlags) override;
+
+  void Reflow(nsPresContext* aPresContext, ReflowOutput& aDesiredSize,
+              const ReflowInput& aReflowInput,
+              nsReflowStatus& aStatus) override;
+
+  void UnionChildOverflow(mozilla::OverflowAreas& aOverflowAreas,
+                          bool aAsIfScrolled) override;
+
+  void BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                        const nsDisplayListSet& aLists) override;
+
+  void Init(nsIContent* aContent, nsContainerFrame* aParent,
+            nsIFrame* aPrevInFlow) override;
+
+#ifdef DEBUG_FRAME_DUMP
+  nsresult GetFrameName(nsAString& aResult) const override {
+    return MakeFrameName(u"SVGOuterSVG"_ns, aResult);
+  }
+#endif
+
+  void DidSetComputedStyle(ComputedStyle* aOldComputedStyle) override;
+
+  void Destroy(DestroyContext&) override;
+
+  nsresult AttributeChanged(int32_t aNameSpaceID, nsAtom* aAttribute,
+                            AttrModType aModType) override;
+
+  nsContainerFrame* GetContentInsertionFrame() override {
+    MOZ_ASSERT(
+        PrincipalChildList().FirstChild() &&
+            PrincipalChildList().FirstChild()->IsSVGOuterSVGAnonChildFrame(),
+        "Where is our anonymous child?");
+    return PrincipalChildList().FirstChild()->GetContentInsertionFrame();
+  }
+
+  bool DoGetParentSVGTransforms(Matrix*) const override { return false; };
+
+  void AppendDirectlyOwnedAnonBoxes(nsTArray<OwnedAnonBox>& aResult) override;
+
+  void NotifyViewportOrTransformChanged(ChangeFlags aFlags) override;
+
+  void PaintSVG(gfxContext& aContext, const gfxMatrix& aTransform,
+                imgDrawingParams& aImgParams) override;
+  SVGBBox GetBBoxContribution(const Matrix& aToBBoxUserspace,
+                              SVGBBoxFlags aFlags) override;
+
+  gfxMatrix GetCanvasTM() override;
+
+  bool HasChildrenOnlyTransform(Matrix* aTransform) const override;
+
+  bool VerticalScrollbarNotNeeded() const;
+
+  bool IsCallingReflowSVG() const { return mCallingReflowSVG; }
+
+ protected:
+  bool IsRootOfImage();
+  float ComputeFullZoom() const;
+
+  void MaybeSendIntrinsicSizeAndRatioToEmbedder();
+  void MaybeSendIntrinsicSizeAndRatioToEmbedder(Maybe<IntrinsicSize>,
+                                                Maybe<AspectRatio>);
+
+  float mFullZoom = 1.0f;
+
+  bool mCallingReflowSVG = false;
+  bool mIsRootContent = false;
+  bool mIsInObjectOrEmbed = false;
+  bool mIsInIframe = false;
+};
+
+
+class SVGOuterSVGAnonChildFrame final : public SVGDisplayContainerFrame {
+  friend nsContainerFrame* ::NS_NewSVGOuterSVGAnonChildFrame(
+      mozilla::PresShell* aPresShell, ComputedStyle* aStyle);
+
+  explicit SVGOuterSVGAnonChildFrame(ComputedStyle* aStyle,
+                                     nsPresContext* aPresContext)
+      : SVGDisplayContainerFrame(aStyle, aPresContext, kClassID) {}
+
+ public:
+  NS_DECL_FRAMEARENA_HELPERS(SVGOuterSVGAnonChildFrame)
+
+#ifdef DEBUG
+  void Init(nsIContent* aContent, nsContainerFrame* aParent,
+            nsIFrame* aPrevInFlow) override;
+#endif
+
+  void BuildDisplayList(nsDisplayListBuilder* aBuilder,
+                        const nsDisplayListSet& aLists) override;
+
+#ifdef DEBUG_FRAME_DUMP
+  nsresult GetFrameName(nsAString& aResult) const override {
+    return MakeFrameName(u"SVGOuterSVGAnonChild"_ns, aResult);
+  }
+#endif
+
+  bool DoGetParentSVGTransforms(Matrix*) const override;
+
+  gfxMatrix GetCanvasTM() override {
+    return static_cast<SVGOuterSVGFrame*>(GetParent())->GetCanvasTM();
+  }
+};
+
+}  
+
+#endif  // LAYOUT_SVG_SVGOUTERSVGFRAME_H_

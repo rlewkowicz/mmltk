@@ -1,0 +1,185 @@
+// Copyright 2020 The Abseil Authors.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//      https://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+
+#ifndef ABSL_LOG_INTERNAL_PROTO_H_
+#define ABSL_LOG_INTERNAL_PROTO_H_
+
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+
+#include "absl/base/attributes.h"
+#include "absl/base/casts.h"
+#include "absl/base/config.h"
+#include "absl/strings/string_view.h"
+#include "absl/types/span.h"
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace log_internal {
+
+
+
+
+bool EncodeVarint(uint64_t tag, uint64_t value, absl::Span<char> *buf);
+inline bool EncodeVarint(uint64_t tag, int64_t value, absl::Span<char> *buf) {
+  return EncodeVarint(tag, static_cast<uint64_t>(value), buf);
+}
+inline bool EncodeVarint(uint64_t tag, uint32_t value, absl::Span<char> *buf) {
+  return EncodeVarint(tag, static_cast<uint64_t>(value), buf);
+}
+inline bool EncodeVarint(uint64_t tag, int32_t value, absl::Span<char> *buf) {
+  return EncodeVarint(tag, static_cast<uint64_t>(value), buf);
+}
+
+inline bool EncodeVarintZigZag(uint64_t tag, int64_t value,
+                               absl::Span<char> *buf) {
+  if (value < 0)
+    return EncodeVarint(tag, 2 * static_cast<uint64_t>(-(value + 1)) + 1, buf);
+  return EncodeVarint(tag, 2 * static_cast<uint64_t>(value), buf);
+}
+
+bool Encode64Bit(uint64_t tag, uint64_t value, absl::Span<char> *buf);
+inline bool Encode64Bit(uint64_t tag, int64_t value, absl::Span<char> *buf) {
+  return Encode64Bit(tag, static_cast<uint64_t>(value), buf);
+}
+inline bool Encode64Bit(uint64_t tag, uint32_t value, absl::Span<char> *buf) {
+  return Encode64Bit(tag, static_cast<uint64_t>(value), buf);
+}
+inline bool Encode64Bit(uint64_t tag, int32_t value, absl::Span<char> *buf) {
+  return Encode64Bit(tag, static_cast<uint64_t>(value), buf);
+}
+
+inline bool EncodeDouble(uint64_t tag, double value, absl::Span<char> *buf) {
+  return Encode64Bit(tag, absl::bit_cast<uint64_t>(value), buf);
+}
+
+bool Encode32Bit(uint64_t tag, uint32_t value, absl::Span<char> *buf);
+inline bool Encode32Bit(uint64_t tag, int32_t value, absl::Span<char> *buf) {
+  return Encode32Bit(tag, static_cast<uint32_t>(value), buf);
+}
+
+inline bool EncodeFloat(uint64_t tag, float value, absl::Span<char> *buf) {
+  return Encode32Bit(tag, absl::bit_cast<uint32_t>(value), buf);
+}
+
+bool EncodeBytes(uint64_t tag, absl::Span<const char> value,
+                 absl::Span<char> *buf);
+
+bool EncodeBytesTruncate(uint64_t tag, absl::Span<const char> value,
+                         absl::Span<char> *buf);
+
+inline bool EncodeString(uint64_t tag, absl::string_view value,
+                         absl::Span<char> *buf) {
+  return EncodeBytes(tag, value, buf);
+}
+
+inline bool EncodeStringTruncate(uint64_t tag, absl::string_view value,
+                                 absl::Span<char> *buf) {
+  return EncodeBytesTruncate(tag, value, buf);
+}
+
+[[nodiscard]] absl::Span<char> EncodeMessageStart(uint64_t tag,
+                                                  uint64_t max_size,
+                                                  absl::Span<char> *buf);
+
+void EncodeMessageLength(absl::Span<char> msg, const absl::Span<char> *buf);
+
+enum class WireType : uint64_t {
+  kVarint = 0,
+  k64Bit = 1,
+  kLengthDelimited = 2,
+  k32Bit = 5,
+};
+
+constexpr size_t VarintSize(uint64_t value) {
+  return value < 128 ? 1 : 1 + VarintSize(value >> 7);
+}
+constexpr size_t MinVarintSize() {
+  return VarintSize((std::numeric_limits<uint64_t>::min)());
+}
+constexpr size_t MaxVarintSize() {
+  return VarintSize((std::numeric_limits<uint64_t>::max)());
+}
+
+constexpr uint64_t MaxVarintForSize(size_t size) {
+  return size >= 10 ? (std::numeric_limits<uint64_t>::max)()
+                    : (static_cast<uint64_t>(1) << size * 7) - 1;
+}
+constexpr uint64_t MakeTagType(uint64_t tag, WireType type) {
+  return tag << 3 | static_cast<uint64_t>(type);
+}
+
+constexpr size_t BufferSizeFor(uint64_t tag, WireType type) {
+  size_t buffer_size = VarintSize(MakeTagType(tag, type));
+  switch (type) {
+    case WireType::kVarint:
+      buffer_size += MaxVarintSize();
+      break;
+    case WireType::k64Bit:
+      buffer_size += size_t{8};
+      break;
+    case WireType::kLengthDelimited:
+      buffer_size += MaxVarintSize();
+      break;
+    case WireType::k32Bit:
+      buffer_size += size_t{4};
+      break;
+  }
+  return buffer_size;
+}
+
+
+class ProtoField final {
+ public:
+  bool DecodeFrom(absl::Span<const char> *data);
+  uint64_t tag() const { return tag_; }
+  WireType type() const { return type_; }
+
+
+  double double_value() const { return absl::bit_cast<double>(value_); }
+  float float_value() const {
+    return absl::bit_cast<float>(static_cast<uint32_t>(value_));
+  }
+  int32_t int32_value() const { return static_cast<int32_t>(value_); }
+  int64_t int64_value() const { return static_cast<int64_t>(value_); }
+  int32_t sint32_value() const {
+    if (value_ % 2) return static_cast<int32_t>(0 - ((value_ - 1) / 2) - 1);
+    return static_cast<int32_t>(value_ / 2);
+  }
+  int64_t sint64_value() const {
+    if (value_ % 2) return 0 - ((value_ - 1) / 2) - 1;
+    return value_ / 2;
+  }
+  uint32_t uint32_value() const { return static_cast<uint32_t>(value_); }
+  uint64_t uint64_value() const { return value_; }
+  bool bool_value() const { return value_ != 0; }
+
+  absl::Span<const char> bytes_value() const { return data_; }
+  absl::string_view string_value() const {
+    const auto data = bytes_value();
+    return absl::string_view(data.data(), data.size());
+  }
+  uint64_t encoded_length() const { return value_; }
+
+ private:
+  uint64_t tag_;
+  WireType type_;
+  uint64_t value_;
+  absl::Span<const char> data_;
+};
+
+}  
+ABSL_NAMESPACE_END
+}  
+
+#endif  // ABSL_LOG_INTERNAL_PROTO_H_

@@ -1,0 +1,250 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "SVGAnimatedTransformList.h"
+
+#include <utility>
+
+#include "DOMSVGAnimatedTransformList.h"
+#include "SVGTransform.h"
+#include "SVGTransformListSMILType.h"
+#include "mozilla/SMILValue.h"
+#include "mozilla/SVGContentUtils.h"
+#include "mozilla/dom/SVGAnimationElement.h"
+#include "nsCharSeparatedTokenizer.h"
+#include "nsContentUtils.h"
+
+using namespace mozilla::dom;
+using namespace mozilla::dom::SVGTransform_Binding;
+
+namespace mozilla {
+
+nsresult SVGAnimatedTransformList::SetBaseValueString(const nsAString& aValue,
+                                                      SVGElement* aSVGElement) {
+  SVGTransformList newBaseValue;
+  nsresult rv = newBaseValue.SetValueFromString(aValue);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+
+  return SetBaseValue(newBaseValue, aSVGElement);
+}
+
+nsresult SVGAnimatedTransformList::SetBaseValue(const SVGTransformList& aValue,
+                                                SVGElement* aSVGElement) {
+  DOMSVGAnimatedTransformList* domWrapper =
+      DOMSVGAnimatedTransformList::GetDOMWrapperIfExists(this);
+  if (domWrapper) {
+    domWrapper->InternalBaseValListWillChangeLengthTo(aValue.Length());
+  }
+
+  bool hadTransform = HasTransform();
+
+
+  nsresult rv = mBaseVal.CopyFrom(aValue);
+  if (NS_FAILED(rv) && domWrapper) {
+    domWrapper->InternalBaseValListWillChangeLengthTo(mBaseVal.Length());
+  } else {
+    mIsBaseSet = true;
+    mCreatedOrRemovedOnLastChange =
+        aSVGElement->GetPrimaryFrame() && !hadTransform;
+  }
+  return rv;
+}
+
+void SVGAnimatedTransformList::ClearBaseValue() {
+  mCreatedOrRemovedOnLastChange = !HasTransform();
+
+  DOMSVGAnimatedTransformList* domWrapper =
+      DOMSVGAnimatedTransformList::GetDOMWrapperIfExists(this);
+  if (domWrapper) {
+    domWrapper->InternalBaseValListWillChangeLengthTo(0);
+  }
+  mBaseVal.Clear();
+  mIsBaseSet = false;
+}
+
+nsresult SVGAnimatedTransformList::SetAnimValue(const SVGTransformList& aValue,
+                                                SVGElement* aElement) {
+  bool prevSet = HasTransform() || aElement->GetAnimateMotionTransform();
+  DOMSVGAnimatedTransformList* domWrapper =
+      DOMSVGAnimatedTransformList::GetDOMWrapperIfExists(this);
+  if (domWrapper) {
+    domWrapper->InternalAnimValListWillChangeLengthTo(aValue.Length());
+  }
+  if (!mAnimVal) {
+    mAnimVal = std::make_unique<SVGTransformList>();
+  }
+  nsresult rv = mAnimVal->CopyFrom(aValue);
+  if (NS_FAILED(rv)) {
+    ClearAnimValue(aElement);
+    return rv;
+  }
+  mCreatedOrRemovedOnLastChange = !prevSet;
+  aElement->DidAnimateTransformList();
+  return NS_OK;
+}
+
+void SVGAnimatedTransformList::ClearAnimValue(SVGElement* aElement) {
+  DOMSVGAnimatedTransformList* domWrapper =
+      DOMSVGAnimatedTransformList::GetDOMWrapperIfExists(this);
+  if (domWrapper) {
+    domWrapper->InternalAnimValListWillChangeLengthTo(mBaseVal.Length());
+  }
+  mAnimVal = nullptr;
+  mCreatedOrRemovedOnLastChange =
+      !HasTransform() && !aElement->GetAnimateMotionTransform();
+  aElement->DidAnimateTransformList();
+}
+
+bool SVGAnimatedTransformList::IsExplicitlySet() const {
+  return mIsBaseSet || !mBaseVal.IsEmpty() || mAnimVal;
+}
+
+std::unique_ptr<SMILAttr> SVGAnimatedTransformList::ToSMILAttr(
+    SVGElement* aSVGElement) {
+  return std::make_unique<SMILAnimatedTransformList>(this, aSVGElement);
+}
+
+static uint16_t ToTransformType(const nsAtom* aTransformType) {
+  if (aTransformType == nsGkAtoms::translate) {
+    return SVG_TRANSFORM_TRANSLATE;
+  }
+  if (aTransformType == nsGkAtoms::scale) {
+    return SVG_TRANSFORM_SCALE;
+  }
+  if (aTransformType == nsGkAtoms::rotate) {
+    return SVG_TRANSFORM_ROTATE;
+  }
+  if (aTransformType == nsGkAtoms::skewX) {
+    return SVG_TRANSFORM_SKEWX;
+  }
+  if (aTransformType == nsGkAtoms::skewY) {
+    return SVG_TRANSFORM_SKEWY;
+  }
+  if (aTransformType == nsGkAtoms::matrix) {
+    return SVG_TRANSFORM_MATRIX;
+  }
+  return SVG_TRANSFORM_UNKNOWN;
+}
+
+nsresult SVGAnimatedTransformList::SMILAnimatedTransformList::ValueFromString(
+    const nsAString& aStr, const dom::SVGAnimationElement* aSrcElement,
+    SMILValue& aValue, bool& aPreventCachingOfSandwich) const {
+  NS_ENSURE_TRUE(aSrcElement, NS_ERROR_FAILURE);
+  MOZ_ASSERT(aValue.IsNull(),
+             "aValue should have been cleared before calling ValueFromString");
+
+  const nsAttrValue* typeAttr = aSrcElement->GetParsedAttr(nsGkAtoms::type);
+  uint16_t transformType = SVG_TRANSFORM_TRANSLATE;  
+  if (typeAttr) {
+    if (typeAttr->Type() != nsAttrValue::eAtom) {
+      return NS_ERROR_FAILURE;
+    }
+    transformType = ToTransformType(typeAttr->GetAtomValue());
+  }
+
+  ParseValue(aStr, transformType, aValue);
+  return aValue.IsNull() ? NS_ERROR_FAILURE : NS_OK;
+}
+
+void SVGAnimatedTransformList::SMILAnimatedTransformList::ParseValue(
+    const nsAString& aSpec, uint16_t aTransformType, SMILValue& aResult) {
+  MOZ_ASSERT(aResult.IsNull(), "Unexpected type for SMIL value");
+
+  static_assert(SVGTransformSMILData::kNumSimpleParams == 3,
+                "SVGSMILTransform constructor should be expecting array "
+                "with 3 params");
+
+  SVGTransformSMILData::SimpleParams params = {0.f};
+  int32_t numParsed = ParseParameterList(aSpec, params);
+
+  switch (aTransformType) {
+    case SVG_TRANSFORM_TRANSLATE:
+      if (numParsed != 1 && numParsed != 2) {
+        return;
+      }
+      break;
+    case SVG_TRANSFORM_SCALE:
+      if (numParsed != 1 && numParsed != 2) {
+        return;
+      }
+      if (numParsed == 1) {
+        params[1] = params[0];
+      }
+      break;
+    case SVG_TRANSFORM_ROTATE:
+      if (numParsed != 1 && numParsed != 3) {
+        return;
+      }
+      break;
+    case SVG_TRANSFORM_SKEWX:
+    case SVG_TRANSFORM_SKEWY:
+      if (numParsed != 1) {
+        return;
+      }
+      break;
+    default:
+      return;
+  }
+
+  SMILValue val(SVGTransformListSMILType::Singleton());
+  SVGTransformSMILData transform(aTransformType, params);
+  if (NS_FAILED(SVGTransformListSMILType::AppendTransform(transform, val))) {
+    return;  
+  }
+
+  aResult = std::move(val);
+}
+
+int32_t SVGAnimatedTransformList::SMILAnimatedTransformList::ParseParameterList(
+    const nsAString& aSpec, SVGTransformSMILData::SimpleParams& aParams) {
+  size_t numArgsFound = 0;
+
+  for (const auto& token :
+       nsCharSeparatedTokenizerTemplate<nsContentUtils::IsHTMLWhitespace,
+                                        nsTokenizerFlags::SeparatorOptional>(
+           aSpec, ',')
+           .ToRange()) {
+    float f;
+    if (!SVGContentUtils::ParseNumber(token, f)) {
+      return -1;
+    }
+    if (numArgsFound < aParams.size()) {
+      aParams[numArgsFound] = f;
+    }
+    numArgsFound++;
+  }
+  return numArgsFound;
+}
+
+SMILValue SVGAnimatedTransformList::SMILAnimatedTransformList::GetBaseValue()
+    const {
+  SMILValue val(SVGTransformListSMILType::Singleton());
+  if (!SVGTransformListSMILType::AppendTransforms(mVal->mBaseVal, val)) {
+    val = SMILValue();
+  }
+
+  return val;
+}
+
+nsresult SVGAnimatedTransformList::SMILAnimatedTransformList::SetAnimValue(
+    const SMILValue& aNewAnimValue) {
+  MOZ_ASSERT(aNewAnimValue.mType == SVGTransformListSMILType::Singleton(),
+             "Unexpected type to assign animated value");
+  SVGTransformList animVal;
+  if (!SVGTransformListSMILType::GetTransforms(aNewAnimValue, animVal.mItems)) {
+    return NS_ERROR_FAILURE;
+  }
+
+  return mVal->SetAnimValue(animVal, mElement);
+}
+
+void SVGAnimatedTransformList::SMILAnimatedTransformList::ClearAnimValue() {
+  if (mVal->mAnimVal) {
+    mVal->ClearAnimValue(mElement);
+  }
+}
+
+}  

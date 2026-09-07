@@ -1,0 +1,64 @@
+use std::{io, sync::Mutex};
+
+use crate::fmt::{WritableTarget, WriteStyle};
+
+pub(in crate::fmt::writer) mod glob {}
+
+pub(in crate::fmt::writer) struct BufferWriter {
+    target: WritableTarget,
+}
+
+pub(in crate::fmt) struct Buffer(Vec<u8>);
+
+impl BufferWriter {
+    pub(in crate::fmt::writer) fn stderr(_is_test: bool, _write_style: WriteStyle) -> Self {
+        BufferWriter {
+            target: WritableTarget::Stderr,
+        }
+    }
+
+    pub(in crate::fmt::writer) fn stdout(_is_test: bool, _write_style: WriteStyle) -> Self {
+        BufferWriter {
+            target: WritableTarget::Stdout,
+        }
+    }
+
+    pub(in crate::fmt::writer) fn pipe(
+        _write_style: WriteStyle,
+        pipe: Box<Mutex<dyn io::Write + Send + 'static>>,
+    ) -> Self {
+        BufferWriter {
+            target: WritableTarget::Pipe(pipe),
+        }
+    }
+
+    pub(in crate::fmt::writer) fn buffer(&self) -> Buffer {
+        Buffer(Vec::new())
+    }
+
+    pub(in crate::fmt::writer) fn print(&self, buf: &Buffer) -> io::Result<()> {
+        match &self.target {
+            WritableTarget::Pipe(pipe) => pipe.lock().unwrap().write_all(&buf.0)?,
+            WritableTarget::Stdout => print!("{}", String::from_utf8_lossy(&buf.0)),
+            WritableTarget::Stderr => eprint!("{}", String::from_utf8_lossy(&buf.0)),
+        }
+
+        Ok(())
+    }
+}
+
+impl Buffer {
+    pub(in crate::fmt) fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    pub(in crate::fmt) fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.extend(buf);
+        Ok(buf.len())
+    }
+
+    pub(in crate::fmt) fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+}

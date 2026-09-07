@@ -1,0 +1,33 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+XPIDL_SOURCES += [
+    "nsIWifiAccessPoint.idl",
+    "nsIWifiListener.idl",
+    "nsIWifiMonitor.idl",
+]
+
+XPIDL_MODULE = "necko_wifi"
+
+# for socket
+OS_LIBS += CONFIG["SOCKET_LIBS"]
+
+UNIFIED_SOURCES += [
+    "nsWifiAccessPoint.cpp",
+    "nsWifiMonitor.cpp",
+]
+
+if CONFIG["NECKO_WIFI_DBUS"]:
+    UNIFIED_SOURCES += [
+        "dbus/DbusWifiScanner.cpp",
+    ]
+    LOCAL_INCLUDES += [
+        "dbus",
+    ]
+    CXXFLAGS += CONFIG["MOZ_GTK3_CFLAGS"]
+
+
+FINAL_LIBRARY = "xul"
+
+include("/ipc/chromium/chromium-config.mozbuild")

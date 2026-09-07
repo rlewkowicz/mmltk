@@ -1,0 +1,748 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef _nsWindow_h_
+#define _nsWindow_h_
+
+#include <gdk/gdk.h>
+#include <gtk/gtk.h>
+
+#include "CompositorWidget.h"
+#include "MozContainer.h"
+#include "WaylandSurfaceLock.h"
+#include "VsyncSource.h"
+#include "mozilla/EventForwards.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/RefPtr.h"
+#include "mozilla/TouchEvents.h"
+#include "mozilla/UniquePtr.h"
+#include "mozilla/RWLock.h"
+#include "mozilla/gfx/BaseMargin.h"
+#include "mozilla/widget/WindowSurface.h"
+#include "mozilla/widget/WindowSurfaceProvider.h"
+#include "nsIWidget.h"
+#include "nsIDragService.h"
+#include "nsRefPtrHashtable.h"
+#include "IMContextWrapper.h"
+#include "LookAndFeel.h"
+
+#ifdef ACCESSIBILITY
+#  include "mozilla/a11y/LocalAccessible.h"
+#endif
+
+#ifdef MOZ_LOGGING
+#  undef LOG
+#  undef LOGVERBOSE
+
+#  include "mozilla/Logging.h"
+#  include "nsTArray.h"
+#  include "Units.h"
+
+extern mozilla::LazyLogModule gWidgetLog;
+extern mozilla::LazyLogModule gWidgetDragLog;
+extern mozilla::LazyLogModule gWidgetPopupLog;
+extern mozilla::LazyLogModule gWidgetVsync;
+extern mozilla::LazyLogModule gWidgetWaylandLog;
+
+#  define LOG_WIN(win, str, ...)                           \
+    MOZ_LOG(win->IsPopup() ? gWidgetPopupLog : gWidgetLog, \
+            mozilla::LogLevel::Debug,                      \
+            ("%s: " str, win->GetDebugTag().get(), ##__VA_ARGS__))
+#  define LOG(...) LOG_WIN(this, __VA_ARGS__)
+#  define LOGVERBOSE(str, ...)                        \
+    MOZ_LOG(IsPopup() ? gWidgetPopupLog : gWidgetLog, \
+            mozilla::LogLevel::Verbose,               \
+            ("%s: " str, GetDebugTag().get(), ##__VA_ARGS__))
+#  define LOGW(...) MOZ_LOG(gWidgetLog, mozilla::LogLevel::Debug, (__VA_ARGS__))
+#  define LOGDRAG(...) \
+    MOZ_LOG(gWidgetDragLog, mozilla::LogLevel::Debug, (__VA_ARGS__))
+#  define LOG_POPUP(...) \
+    MOZ_LOG(gWidgetPopupLog, mozilla::LogLevel::Debug, (__VA_ARGS__))
+#  define LOG_VSYNC(str, ...)                       \
+    MOZ_LOG(gWidgetVsync, mozilla::LogLevel::Debug, \
+            ("%s: " str, GetDebugTag().get(), ##__VA_ARGS__))
+#  define LOG_ENABLED()                                         \
+    (MOZ_LOG_TEST(gWidgetPopupLog, mozilla::LogLevel::Debug) || \
+     MOZ_LOG_TEST(gWidgetLog, mozilla::LogLevel::Debug))
+#  define LOG_ENABLED_VERBOSE()                                   \
+    (MOZ_LOG_TEST(gWidgetPopupLog, mozilla::LogLevel::Verbose) || \
+     MOZ_LOG_TEST(gWidgetLog, mozilla::LogLevel::Verbose))
+#  define LOG_WAYLAND(...) \
+    MOZ_LOG(gWidgetWaylandLog, mozilla::LogLevel::Debug, (__VA_ARGS__))
+
+#else
+
+#  define LOG(...)
+#  define LOG_WIN(...)
+#  define LOGVERBOSE(...)
+#  define LOGW(...)
+#  define LOGDRAG(...)
+#  define LOG_POPUP(...)
+#  define LOG_ENABLED() false
+
+#endif /* MOZ_LOGGING */
+
+#ifdef MOZ_WAYLAND
+typedef uintptr_t Window;
+#endif
+
+class gfxPattern;
+class nsIFrame;
+class nsMenuPopupFrame;
+#if !GTK_CHECK_VERSION(3, 18, 0)
+struct _GdkEventTouchpadPinch;
+typedef struct _GdkEventTouchpadPinch GdkEventTouchpadPinch;
+#endif
+
+extern bool gUseStableRounding;
+
+#if !GTK_CHECK_VERSION(3, 22, 0)
+typedef enum {
+  GDK_ANCHOR_FLIP_X = 1 << 0,
+  GDK_ANCHOR_FLIP_Y = 1 << 1,
+  GDK_ANCHOR_SLIDE_X = 1 << 2,
+  GDK_ANCHOR_SLIDE_Y = 1 << 3,
+  GDK_ANCHOR_RESIZE_X = 1 << 4,
+  GDK_ANCHOR_RESIZE_Y = 1 << 5,
+  GDK_ANCHOR_FLIP = GDK_ANCHOR_FLIP_X | GDK_ANCHOR_FLIP_Y,
+  GDK_ANCHOR_SLIDE = GDK_ANCHOR_SLIDE_X | GDK_ANCHOR_SLIDE_Y,
+  GDK_ANCHOR_RESIZE = GDK_ANCHOR_RESIZE_X | GDK_ANCHOR_RESIZE_Y
+} GdkAnchorHints;
+#endif
+
+#if !GTK_CHECK_VERSION(3, 18, 0)
+typedef enum {
+  GDK_TOUCHPAD_GESTURE_PHASE_BEGIN,
+  GDK_TOUCHPAD_GESTURE_PHASE_UPDATE,
+  GDK_TOUCHPAD_GESTURE_PHASE_END,
+  GDK_TOUCHPAD_GESTURE_PHASE_CANCEL
+} GdkTouchpadGesturePhase;
+#endif
+
+struct zwp_locked_pointer_v1;
+struct zwp_relative_pointer_v1;
+
+namespace mozilla {
+enum class NativeKeyBindingsType : uint8_t;
+
+class TimeStamp;
+class WaylandVsyncSource;
+
+namespace widget {
+class DBusMenuBar;
+class Screen;
+class WaylandSurface;
+class WaylandSurfaceLock;
+class nsWindowX11;
+class nsWindowWayland;
+}  
+}  
+
+class gfxImageSurface;
+
+class nsWindow : public nsIWidget {
+ public:
+  typedef mozilla::gfx::DrawTarget DrawTarget;
+  typedef mozilla::WidgetEventTime WidgetEventTime;
+  typedef mozilla::WidgetKeyboardEvent WidgetKeyboardEvent;
+  typedef mozilla::widget::PlatformCompositorWidgetDelegate
+      PlatformCompositorWidgetDelegate;
+
+  nsWindow();
+
+  static void ReleaseGlobals();
+
+  NS_INLINE_DECL_REFCOUNTING_INHERITED(nsWindow, nsIWidget)
+
+  virtual mozilla::widget::nsWindowWayland* AsWayland() { return nullptr; }
+  virtual mozilla::widget::nsWindowX11* AsX11() { return nullptr; }
+
+  void OnDestroy() override;
+
+  bool AreBoundsSane();
+
+  using nsIWidget::Create;  
+  [[nodiscard]] nsresult Create(nsIWidget* aParent,
+                                const LayoutDeviceIntRect& aRect,
+                                const InitData&) override;
+  void Destroy() override;
+  float GetDPI() override;
+  double GetDefaultScaleInternal() override;
+  uint32_t GetMaxTouchPoints() const override;
+  mozilla::DesktopToLayoutDeviceScale GetDesktopToDeviceScale() const override;
+  void SetModal(bool aModal) override;
+  bool IsVisible() const override;
+  void ConstrainPosition(DesktopIntPoint&) override;
+  void SetSizeConstraints(const SizeConstraints&) override;
+  void LockAspectRatio(bool aShouldLock) override;
+  void Move(const DesktopPoint&) override;
+  void Show(bool aState) override;
+  void Resize(const DesktopSize&, bool aRepaint) override;
+  void Resize(const DesktopRect&, bool aRepaint) override;
+  bool IsEnabled() const override;
+
+  nsSizeMode GetSizeMode() const { return mSizeMode; }
+  nsSizeMode SizeMode() override { return mSizeMode; }
+  void SetSizeMode(nsSizeMode aMode) override;
+  void GetWorkspaceID(nsAString& workspaceID) override;
+  void MoveToWorkspace(const nsAString& workspaceID) override;
+  void Enable(bool aState) override;
+  void SetFocus(Raise, mozilla::dom::CallerType aCallerType) override;
+  LayoutDeviceIntRect GetBounds() override;
+  LayoutDeviceIntRect GetScreenBounds() override;
+  DesktopIntRect GetScreenBoundsUnscaled();
+  LayoutDeviceIntRect GetClientBounds() override;
+  LayoutDeviceIntSize GetClientSize() override;
+  LayoutDeviceIntPoint GetClientOffset() override;
+  LayoutDeviceIntPoint GetScreenEdgeSlop() override;
+  nsresult GetRestoredBounds(LayoutDeviceIntRect&) override;
+  bool PersistClientBounds() const override { return true; }
+  LayoutDeviceIntMargin NormalSizeModeClientToWindowMargin() override;
+
+  bool WorkspaceManagementDisabled();
+  bool ConstrainSizeWithScale(int* aWidth, int* aHeight, double aScale);
+
+  void RecomputeBounds(bool aScaleChange = false);
+  struct Bounds {
+    DesktopIntRect mClientArea;
+    DesktopIntMargin mClientMargin;
+
+    static Bounds Compute(const nsWindow*);
+#ifdef MOZ_WAYLAND
+    static Bounds ComputeWayland(const nsWindow*);
+#endif
+  };
+  void SchedulePendingBounds();
+  void MaybeRecomputeBounds();
+
+  void SetCursor(const Cursor&) override;
+  void Invalidate(const LayoutDeviceIntRect& aRect) override;
+  void* GetNativeData(uint32_t aDataType) override;
+  nsresult SetTitle(const nsAString& aTitle) override;
+  void SetIcon(const nsAString& aIconSpec) override;
+  void SetWindowClass(const nsAString& xulWinType, const nsAString& xulWinClass,
+                      const nsAString& xulWinName) override;
+  LayoutDeviceIntPoint WidgetToScreenOffset() override;
+  DesktopIntPoint WidgetToScreenOffsetUnscaled();
+  void CaptureRollupEvents(bool aDoCapture) override;
+  [[nodiscard]] nsresult GetAttention(int32_t aCycleCount) override;
+  bool HasPendingInputEvent() override;
+
+  bool PrepareForFullscreenTransition(nsISupports** aData) override;
+  void PerformFullscreenTransition(FullscreenTransitionStage aStage,
+                                   uint16_t aDuration, nsISupports* aData,
+                                   nsIRunnable* aCallback) override;
+  already_AddRefed<mozilla::widget::Screen> GetWidgetScreen() override;
+  nsresult MakeFullScreen(bool aFullScreen) override;
+  void HideWindowChrome(bool aShouldHide) override;
+
+  static guint32 GetLastUserInputTime();
+
+  gint ConvertBorderStyles(BorderStyle aStyle);
+
+  mozilla::widget::IMContextWrapper* GetIMContext() const { return mIMContext; }
+
+  bool DispatchCommandEvent(nsAtom* aCommand);
+  bool DispatchContentCommandEvent(mozilla::EventMessage aMsg);
+
+  gboolean OnExposeEvent(cairo_t* cr);
+  gboolean OnShellConfigureEvent(GdkEventConfigure* aEvent);
+  void OnContainerSizeAllocate(GtkAllocation* aAllocation);
+  void OnMap();
+  void OnUnmap();
+  void OnDeleteEvent();
+  void OnEnterNotifyEvent(GdkEventCrossing* aEvent);
+  void OnLeaveNotifyEvent(GdkEventCrossing* aEvent);
+  void OnMotionNotifyEvent(GdkEventMotion* aEvent);
+  void OnButtonPressEvent(GdkEventButton* aEvent);
+  void OnButtonReleaseEvent(GdkEventButton* aEvent);
+  void OnContainerFocusInEvent(GdkEventFocus* aEvent);
+  void OnContainerFocusOutEvent(GdkEventFocus* aEvent);
+  gboolean OnKeyPressEvent(GdkEventKey* aEvent);
+  gboolean OnKeyReleaseEvent(GdkEventKey* aEvent);
+
+  void OnScrollEvent(GdkEventScroll* aEvent);
+  void OnSmoothScrollEvent(uint32_t aTime, float aDeltaX, float aDeltaY);
+
+  void OnVisibilityNotifyEvent(GdkVisibilityState aState);
+  void OnWindowStateEvent(GtkWidget* aWidget, GdkEventWindowState* aEvent);
+  gboolean OnPropertyNotifyEvent(GtkWidget* aWidget, GdkEventProperty* aEvent);
+  gboolean OnTouchEvent(GdkEventTouch* aEvent);
+  gboolean OnTouchpadPinchEvent(GdkEventTouchpadPinch* aEvent);
+  void OnTouchpadHoldEvent(GdkTouchpadGesturePhase aPhase, guint aTime,
+                           uint32_t aFingers);
+
+  gint GetInputRegionMarginInGdkCoords();
+
+  void UpdateOpaqueRegionInternal();
+  void UpdateOpaqueRegion(const LayoutDeviceIntRegion&) override;
+  LayoutDeviceIntRegion GetOpaqueRegionForTesting() const override {
+    return GetOpaqueRegion();
+  }
+  LayoutDeviceIntRegion GetOpaqueRegion() const;
+
+  using ExportHandlePromise =
+      mozilla::MozPromise<nsCString, bool,  true>;
+  RefPtr<ExportHandlePromise> ExportHandle();
+  void UnexportHandle();
+
+  already_AddRefed<mozilla::gfx::DrawTarget> StartRemoteDrawingInRegion(
+      const LayoutDeviceIntRegion& aInvalidRegion) override;
+  void EndRemoteDrawingInRegion(
+      mozilla::gfx::DrawTarget* aDrawTarget,
+      const LayoutDeviceIntRegion& aInvalidRegion) override;
+
+  virtual void SetProgress(unsigned long progressPercent) {};
+
+  bool SynchronouslyRepaintOnResize() override;
+
+  void OnDPIChanged();
+  void OnCheckResize();
+  void OnCompositedChanged();
+  void DispatchResized();
+  void OnScaleEvent();
+
+
+  void RefreshScale(bool aRefreshScreen, bool aForceRefresh = false);
+
+  static guint32 sLastButtonPressTime;
+
+  MozContainer* GetMozContainer() { return mContainer; }
+  GdkWindow* GetGdkWindow() const { return mGdkWindow; }
+  void SetGdkWindow(GdkWindow* aGdkWindow);
+  GdkWindow* GetToplevelGdkWindow() const;
+  GtkWidget* GetGtkWidget() const { return mShell; }
+#ifdef MOZ_WAYLAND
+  RefPtr<mozilla::widget::WaylandSurface> GetWaylandSurface() {
+    return mSurface;
+  }
+#endif
+  bool IsDestroyed() const { return mIsDestroyed; }
+  bool IsPopup() const;
+  bool IsWaylandPopup() const;
+  bool IsDragPopup() { return mIsDragPopup; };
+
+  nsAutoCString GetDebugTag() const;
+
+  void DispatchDragEvent(mozilla::EventMessage aMsg,
+                         const LayoutDeviceIntPoint& aRefPoint, guint aTime);
+  static void UpdateDragStatus(GdkDragContext* aDragContext,
+                               nsIDragService* aDragService);
+  void SetDragSource(GdkDragContext* aSourceDragContext);
+
+  WidgetEventTime GetWidgetEventTime(guint32 aEventTime);
+  mozilla::TimeStamp GetEventTimeStamp(guint32 aEventTime);
+
+  void SetInputContext(const InputContext& aContext,
+                       const InputContextAction& aAction) override;
+  InputContext GetInputContext() override;
+  TextEventDispatcherListener* GetNativeTextEventDispatcherListener() override;
+  MOZ_CAN_RUN_SCRIPT bool GetEditCommands(
+      mozilla::NativeKeyBindingsType aType,
+      const mozilla::WidgetKeyboardEvent& aEvent,
+      nsTArray<mozilla::CommandInt>& aCommands) override;
+
+  void SetTransparencyMode(TransparencyMode aMode) override;
+  TransparencyMode GetTransparencyMode() override;
+  void SetInputRegion(const InputRegion&) override;
+
+  nsresult SynthesizeNativeMouseEvent(
+      LayoutDeviceIntPoint aPoint, NativeMouseMessage aNativeMessage,
+      mozilla::MouseButton aButton, nsIWidget::NativeModifiers aModifierFlags,
+      nsISynthesizedEventCallback* aCallback) override;
+
+  nsresult SynthesizeNativeMouseMove(
+      LayoutDeviceIntPoint aPoint,
+      nsISynthesizedEventCallback* aCallback) override {
+    return SynthesizeNativeMouseEvent(
+        aPoint, NativeMouseMessage::Move, mozilla::MouseButton::eNotPressed,
+        nsIWidget::NativeModifiers::NO_MODIFIERS, aCallback);
+  }
+
+  nsresult SynthesizeNativeMouseScrollEvent(
+      LayoutDeviceIntPoint aPoint, uint32_t aNativeMessage, double aDeltaX,
+      double aDeltaY, double aDeltaZ, nsIWidget::NativeModifiers aModifierFlags,
+      uint32_t aAdditionalFlags,
+      nsISynthesizedEventCallback* aCallback) override;
+
+  nsresult SynthesizeNativeTouchPoint(
+      uint32_t aPointerId, TouchPointerState aPointerState,
+      LayoutDeviceIntPoint aPoint, double aPointerPressure,
+      uint32_t aPointerOrientation,
+      nsISynthesizedEventCallback* aCallback) override;
+
+  nsresult SynthesizeNativeTouchPadPinch(TouchpadGesturePhase aEventPhase,
+                                         float aScale,
+                                         LayoutDeviceIntPoint aPoint,
+                                         int32_t aModifierFlags) override;
+
+  nsresult SynthesizeNativeTouchpadPan(
+      TouchpadGesturePhase aEventPhase, LayoutDeviceIntPoint aPoint,
+      double aDeltaX, double aDeltaY, int32_t aModifierFlags,
+      nsISynthesizedEventCallback* aCallback) override;
+
+  void GetCompositorWidgetInitData(
+      mozilla::widget::CompositorWidgetInitData* aInitData) override;
+
+  void SetCustomTitlebar(bool) override;
+  void UpdateWindowDraggingRegion(
+      const LayoutDeviceIntRegion& aRegion) override;
+
+#ifdef MOZ_ENABLE_DBUS
+  void SetDBusMenuBar(RefPtr<mozilla::widget::DBusMenuBar> aDbusMenuBar);
+#endif
+
+  gint GdkCeiledScaleFactor();
+  double FractionalScaleFactor() const;
+
+  LayoutDeviceIntPoint ToLayoutDevicePixels(const DesktopIntPoint&);
+  LayoutDeviceIntSize ToLayoutDevicePixels(const DesktopIntSize&);
+  LayoutDeviceIntRect ToLayoutDevicePixels(const DesktopIntRect&);
+  LayoutDeviceIntMargin ToLayoutDevicePixels(const DesktopIntMargin&);
+  DesktopIntSize ToDesktopPixels(const LayoutDeviceIntSize&);
+  DesktopIntRect ToDesktopPixels(const LayoutDeviceIntRect&);
+  DesktopIntPoint ToDesktopPixels(const LayoutDeviceIntPoint&);
+
+  gint DevicePixelsToGdkCoordRound(int);
+
+  gint DevicePixelsToGdkCoordRoundDown(int);
+  GdkPoint DevicePixelsToGdkPointRoundDown(const LayoutDeviceIntPoint&);
+  GdkRectangle DevicePixelsToGdkRectRoundOut(const LayoutDeviceIntRect&);
+  GdkRectangle DevicePixelsToGdkRectRoundIn(const LayoutDeviceIntRect&);
+
+  LayoutDeviceIntPoint GdkPointToDevicePixels(const GdkPoint&);
+  LayoutDeviceIntPoint GdkEventCoordsToDevicePixels(gdouble aX, gdouble aY);
+
+  bool WidgetTypeSupportsAcceleration() override;
+  bool WidgetTypeSupportsNativeCompositing() override;
+
+  nsresult SetSystemFont(const nsCString& aFontName) override;
+  nsresult GetSystemFont(nsCString& aFontName) override;
+
+  typedef enum {
+    GTK_DECORATION_SYSTEM,  
+    GTK_DECORATION_CLIENT,  
+    GTK_DECORATION_NONE,    
+  } GtkWindowDecoration;
+  static GtkWindowDecoration GetSystemGtkWindowDecoration();
+
+  bool IsRemoteContent() const { return HasRemoteContent(); }
+
+  static bool IsToplevelWindowTransparent();
+
+  static nsWindow* GetFocusedWindow();
+
+  mozilla::UniquePtr<mozilla::widget::WaylandSurfaceLock> LockSurface();
+
+  bool ApplyEnterLeaveMutterWorkaround();
+
+  void NotifyOcclusionState(mozilla::widget::OcclusionState aState) override;
+
+  static nsWindow* GetWindow(GdkWindow* window);
+
+  void DispatchActivateEventAccessible();
+
+  void GtkWidgetDestroyHandler(GtkWidget* aWidget);
+
+  void SetDragPopupSurface(RefPtr<gfxImageSurface> aDragPopupSurface,
+                           const LayoutDeviceIntRegion& aInvalidRegion);
+
+  static nsWindow* FromGtkWidget(GtkWidget* widget);
+  static nsWindow* FromGdkWindow(GdkWindow* window);
+
+  static nsWindow* FromWidget(nsIWidget* aWidget) {
+    if (aWidget && aWidget->IsNativeWidget()) {
+      return static_cast<nsWindow*>(aWidget);
+    }
+    return nullptr;
+  }
+  static nsWindow* FromWidget(nsWindow*) = delete;
+
+  void SetTextInputArea(LayoutDeviceIntRect aCursorArea);
+  DesktopIntRect GetTextInputArea() { return mIMContextInputArea; };
+  void UnlockCursor() { mWidgetCursorLocked = false; };
+  void InsertEmoji(RefPtr<nsWindow> aToplevelWindow = nullptr);
+
+  static void SessionRestoreFinished();
+
+ protected:
+  virtual ~nsWindow();
+
+  virtual void CreateNative() = 0;
+  virtual void DestroyNative() = 0;
+
+  void ConfigureToplevelWindow();
+  virtual void ConfigureToplevelWindowNative() {};
+
+  virtual void EnableVSyncSource() {};
+  virtual void DisableVSyncSource() {};
+
+  void DispatchActivateEvent(void);
+  void DispatchDeactivateEvent(void);
+  void DispatchPanGesture(mozilla::PanGestureInput& aPanInput);
+
+  void RegisterTouchWindow() override;
+
+  void NativeMoveResize(bool aMoved, bool aResized);
+
+  virtual void NativeShow(bool aAction) = 0;
+  void SetHasMappedToplevel(bool aState);
+
+  bool SetSafeWindowSize(LayoutDeviceIntSize& aSize);
+  bool SetSafeWindowSize(DesktopIntSize& aSize);
+
+  void DispatchContextMenuEventFromMouseEvent(
+      uint16_t domButton, GdkEventButton* aEvent,
+      const mozilla::LayoutDeviceIntPoint& aRefPoint);
+
+  void TryToShowNativeWindowMenu(GdkEventButton* aEvent);
+
+  bool DoTitlebarAction(mozilla::LookAndFeel::TitlebarEvent aEvent,
+                        GdkEventButton* aButtonEvent);
+
+  void DestroyChildWindows();
+  nsWindow* GetContainerWindow() const;
+  Window GetX11Window();
+  void SetUrgencyHint(GtkWidget* top_window, bool state);
+  void SetDefaultIcon(void);
+  void SetWindowDecoration(BorderStyle aStyle);
+  void InitButtonEvent(mozilla::WidgetMouseEvent& aEvent,
+                       GdkEventButton* aGdkEvent,
+                       const mozilla::LayoutDeviceIntPoint& aRefPoint,
+                       bool isEraser = false);
+  bool CheckForRollup(gdouble aMouseX, gdouble aMouseY, bool aIsWheel,
+                      bool aAlwaysRollup);
+  void RollupAllMenus() { CheckForRollup(0, 0, false, true); }
+  void CheckForRollupDuringGrab() { RollupAllMenus(); }
+
+  bool GetDragInfo(mozilla::WidgetMouseEvent* aMouseEvent, GdkWindow** aWindow,
+                   gint* aButton, gint* aRootX, gint* aRootY);
+
+  nsWindow* GetTransientForWindowIfPopup();
+  bool IsHandlingTouchSequence(GdkEventSequence* aSequence);
+
+  void ResizeInt(const mozilla::Maybe<DesktopIntPoint>& aMove,
+                 DesktopIntSize aSize);
+
+
+  GtkTextDirection GetTextDirection();
+
+  bool DrawsToCSDTitlebar() const;
+  bool ToplevelUsesCSD() const;
+
+  void CreateAndPutGdkScrollEvent(mozilla::LayoutDeviceIntPoint aPoint,
+                                  double aDeltaX, double aDeltaY);
+
+  nsCString mGtkWindowAppClass;
+  nsCString mGtkWindowAppName;
+  nsCString mGtkWindowRoleName;
+  void RefreshWindowClass();
+
+  GtkWidget* mShell = nullptr;
+  MozContainer* mContainer = nullptr;
+  GdkWindow* mGdkWindow = nullptr;
+  void* mEGLWindow = nullptr;
+#ifdef MOZ_WAYLAND
+  RefPtr<mozilla::widget::WaylandSurface> mSurface;
+#endif
+  RefPtr<gfxImageSurface> mDragPopupSurface;
+  LayoutDeviceIntRegion mDragPopupSurfaceRegion;
+
+  PlatformCompositorWidgetDelegate* mCompositorWidgetDelegate = nullptr;
+
+  nsSizeMode mSizeMode = nsSizeMode_Normal;
+  nsSizeMode mLastSizeModeRequest = nsSizeMode_Normal;
+  nsSizeMode mLastSizeModeBeforeFullscreen = nsSizeMode_Normal;
+
+  float mAspectRatio = 0.0f;
+  mozilla::Maybe<GtkOrientation> mAspectResizer;
+  GdkPoint mLastResizePoint{0, 0};
+
+  constexpr static const int sNoScale = -1;
+  int mCeiledScaleFactor = sNoScale;
+
+  DesktopIntSize mLastSizeRequest;
+  DesktopIntPoint mLastMoveRequest;
+
+  DesktopIntRect mClientArea;
+  DesktopIntMargin mClientMargin;
+
+  guint32 mLastScrollEventTime = GDK_CURRENT_TIME;
+  mozilla::ScreenCoord mLastPinchEventSpan;
+
+  struct TouchpadPinchGestureState {
+    ScreenPoint mBeginFocus;
+
+    ScreenPoint mCurrentFocus;
+  };
+
+  ScreenPoint mCurrentTouchpadFocus;
+
+  TouchpadPinchGestureState mCurrentSynthesizedTouchpadPinch;
+
+  struct TouchpadPanGestureState {
+    mozilla::Maybe<TouchpadGesturePhase> mTouchpadGesturePhase;
+    mozilla::Maybe<uint64_t> mSavedCallbackId;
+  };
+
+  TouchpadPanGestureState mCurrentSynthesizedTouchpadPan;
+
+  nsRefPtrHashtable<nsPtrHashKey<GdkEventSequence>, mozilla::dom::Touch>
+      mTouches;
+
+  unsigned int mPendingConfigures = 0;
+
+  GtkWindowDecoration mGtkWindowDecoration = GTK_DECORATION_NONE;
+
+  LayoutDeviceIntRegion mDraggableRegion;
+
+  static GdkCursor* gsGtkCursorCache[eCursorCount];
+
+  bool mDrawInTitlebar = false;
+
+  bool mIsMapped;
+  mozilla::Atomic<bool, mozilla::Relaxed> mIsDestroyed;
+  bool mIsShown : 1;
+  bool mNeedsShow : 1;
+  bool mEnabled : 1;
+  bool mCreated : 1;
+  bool mHandleTouchEvent : 1;
+  bool mIsDragPopup : 1;
+  bool mCompositedScreen : 1;
+  bool mIsAccelerated : 1;
+  bool mIsAlert : 1;
+  bool mWindowShouldStartDragging : 1;
+  bool mHasMappedToplevel : 1;
+  bool mPanInProgress : 1;
+  bool mPendingBoundsChange : 1;
+  bool mTitlebarBackdropState : 1;
+  bool mAlwaysOnTop : 1;
+  bool mIsTransparent : 1;
+  bool mHasReceivedSizeAllocate : 1;
+  bool mWidgetCursorLocked : 1;
+  bool mUndecorated : 1;
+
+  bool mHasAlphaVisual : 1;
+
+  bool mConfiguredClearColor : 1;
+  bool mGotNonBlankPaint : 1;
+
+  bool mNeedsToRetryCapturingMouse : 1;
+
+  bool mX11HiddenPopupPositioned : 1;
+
+  bool mPopupTemporaryHidden : 1;
+
+  bool mWaitingToSessionRestore : 1;
+
+  void InitDragEvent(mozilla::WidgetDragEvent& aEvent);
+
+  float mLastMotionPressure = 0.0f;
+
+  InputRegion mInputRegion;
+
+  bool DragInProgress(void);
+
+  void DispatchMissedButtonReleases(GdkEventCrossing* aGdkEvent);
+
+  bool IsAlwaysUndecoratedWindow() const;
+
+  WindowRenderer* GetWindowRenderer() override;
+  void DidGetNonBlankPaint() override;
+
+  void SetCompositorWidgetDelegate(CompositorWidgetDelegate* delegate) override;
+
+  void UpdateMozWindowActive();
+
+  void ForceTitlebarRedraw();
+  bool DoDrawTilebarCorners();
+  bool IsChromeWindowTitlebar();
+
+  void SetPopupWindowDecoration(bool aShowOnTaskbar);
+
+  void ApplySizeConstraints();
+
+  GtkWindow* GetCurrentTopmostWindow() const;
+  nsAutoCString GetFrameTag() const;
+  nsCString GetPopupTypeName();
+  bool IsPopupDirectionRTL();
+
+#ifdef MOZ_LOGGING
+  void LogPopupHierarchy();
+  void LogPopupAnchorHints(int aHints);
+  void LogPopupGravity(GdkGravity aGravity);
+#endif
+
+  DesktopIntSize mMoveToRectPopupSize;
+
+#ifdef MOZ_ENABLE_DBUS
+  RefPtr<mozilla::widget::DBusMenuBar> mDBusMenuBar;
+#endif
+
+  struct LastMouseCoordinates {
+    template <typename Event>
+    void Set(Event* aEvent) {
+      mX = aEvent->x;
+      mY = aEvent->y;
+      mRootX = aEvent->x_root;
+      mRootY = aEvent->y_root;
+    }
+
+    float mX = 0.0f, mY = 0.0f;
+    float mRootX = 0.0f, mRootY = 0.0f;
+  } mLastMouseCoordinates;
+
+  guint32 mLastSmoothScrollEventTime = GDK_CURRENT_TIME;
+
+  RefPtr<mozilla::widget::IMContextWrapper> mIMContext;
+  DesktopIntRect mIMContextInputArea;
+
+  int mEmojiHidenSignal = 0;
+
+  static GtkWindowDecoration sGtkWindowDecoration;
+
+  static bool sTransparentMainWindow;
+
+#ifdef ACCESSIBILITY
+  RefPtr<mozilla::a11y::LocalAccessible> mRootAccessible;
+
+  void CreateRootAccessible();
+
+  void DispatchEventToRootAccessible(uint32_t aEventType);
+
+  void DispatchDeactivateEventAccessible();
+
+  void DispatchMaximizeEventAccessible();
+
+  void DispatchMinimizeEventAccessible();
+
+  void DispatchRestoreEventAccessible();
+#endif
+
+  void SetUserTimeAndStartupTokenForActivatedWindow();
+
+  void KioskLockOnMonitor();
+
+  void EmulateResizeDrag(GdkEventMotion* aEvent);
+
+  void RequestRepaint(LayoutDeviceIntRegion& aRepaintRegion);
+
+  bool DrawDragPopupSurface(cairo_t* cr);
+  bool ExtractExposeRegion(LayoutDeviceIntRegion& aRegion, cairo_t* cr);
+
+  nsCString mWindowActivationTokenFromEnv;
+  mozilla::widget::WindowSurfaceProvider mSurfaceProvider;
+  GdkDragContext* mSourceDragContext = nullptr;
+  bool mSourceDragContextActive = false;
+  mozilla::Sides mResizableEdges{mozilla::SideBits::eAll};
+  mozilla::Maybe<int> mKioskMonitor;
+  LayoutDeviceIntRegion mOpaqueRegion MOZ_GUARDED_BY(mOpaqueRegionLock);
+  mutable mozilla::RWLock mOpaqueRegionLock{"nsWindow::mOpaqueRegion"};
+};
+
+nsWindow* get_window_for_gtk_widget(GtkWidget* widget);
+nsWindow* get_window_for_gdk_window(GdkWindow* window);
+void GtkWindowSetTransientFor(GtkWindow* aWindow, GtkWindow* aParent);
+
+#endif /* _nsWindow_h_ */

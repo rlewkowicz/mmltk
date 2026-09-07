@@ -1,0 +1,217 @@
+/*
+ * Copyright 2014 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#include "src/core/SkRecordOpts.h"
+
+#include "include/core/SkBlendMode.h"
+#include "include/core/SkCanvas.h"
+#include "include/core/SkColor.h"
+#include "include/core/SkPaint.h"
+#include "include/core/SkRefCnt.h"
+#include "include/private/base/SkMath.h"
+#include "include/private/base/SkTemplates.h"
+#include "src/core/SkRecord.h"
+#include "src/core/SkRecordPattern.h"
+#include "src/core/SkRecords.h"
+
+#include <cstdint>
+#include <optional>
+
+using namespace SkRecords;
+
+
+template <typename Pass>
+static bool apply(Pass* pass, SkRecord* record) {
+    typename Pass::Match match;
+    bool changed = false;
+    int begin, end = 0;
+
+    while (match.search(record, &begin, &end)) {
+        changed |= pass->onMatch(record, &match, begin, end);
+    }
+    return changed;
+}
+
+
+struct SaveOnlyDrawsRestoreNooper {
+    typedef Pattern<Is<Save>,
+                    Greedy<Or<Is<NoOp>, IsDraw>>,
+                    Is<Restore>>
+        Match;
+
+    bool onMatch(SkRecord* record, Match*, int begin, int end) {
+        record->replace<NoOp>(begin);  
+        record->replace<NoOp>(end-1);  
+        return true;
+    }
+};
+
+static bool fold_opacity_layer_color_to_paint(const SkPaint* layerPaint,
+                                              bool isSaveLayer,
+                                              SkPaint* paint) {
+
+    if (!paint->isSrcOver()) {
+        return false;
+    }
+
+    if (!isSaveLayer && paint->getImageFilter()) {
+        return false;
+    }
+
+    if (paint->getColorFilter()) {
+
+        return false;
+    }
+
+    if (layerPaint) {
+        const uint32_t layerColor = layerPaint->getColor();
+        if (SK_ColorTRANSPARENT != SkColorSetA(layerColor, SK_AlphaTRANSPARENT)) {
+            return false;
+        }
+
+        if (layerPaint->getPathEffect()  ||
+            layerPaint->getShader()      ||
+            !layerPaint->isSrcOver()     ||
+            layerPaint->getMaskFilter()  ||
+            layerPaint->getColorFilter() ||
+            layerPaint->getImageFilter()) {
+            return false;
+        }
+        paint->setAlpha(SkMulDiv255Round(paint->getAlpha(), SkColorGetA(layerColor)));
+    }
+
+    return true;
+}
+
+struct SaveNoDrawsRestoreNooper {
+    typedef Pattern<Is<Save>,
+                    Greedy<Not<Or<Is<Save>,
+                                  Is<SaveLayer>,
+                                  Is<Restore>,
+                                  IsDraw>>>,
+                    Is<Restore>>
+        Match;
+
+    bool onMatch(SkRecord* record, Match*, int begin, int end) {
+        for (int i = begin; i < end; i++) {
+            record->replace<NoOp>(i);
+        }
+        return true;
+    }
+};
+void SkRecordNoopSaveRestores(SkRecord* record) {
+    SaveOnlyDrawsRestoreNooper onlyDraws;
+    SaveNoDrawsRestoreNooper noDraws;
+
+    while (apply(&onlyDraws, record) || apply(&noDraws, record));
+}
+
+#if !defined(SK_BUILD_FOR_ANDROID_FRAMEWORK)
+static bool effectively_srcover(const SkPaint* paint) {
+    if (!paint || paint->isSrcOver()) {
+        return true;
+    }
+    return !paint->getShader() && !paint->getColorFilter() && !paint->getImageFilter() &&
+           0xFF == paint->getAlpha() && paint->asBlendMode() == SkBlendMode::kSrc;
+}
+
+struct SaveLayerDrawRestoreNooper {
+    typedef Pattern<Is<SaveLayer>, IsSingleDraw, Is<Restore>> Match;
+
+    bool onMatch(SkRecord* record, Match* match, int begin, int end) {
+        if (match->first<SaveLayer>()->backdrop) {
+            return false;
+        }
+
+        if (!match->first<SaveLayer>()->filters.empty()) {
+            return false;
+        }
+
+        SkPaint* layerPaint = match->first<SaveLayer>()->paint;
+        SkPaint* drawPaint = match->second<SkPaint>();
+
+        if (nullptr == layerPaint && effectively_srcover(drawPaint)) {
+            return KillSaveLayerAndRestore(record, begin);
+        }
+
+        if (drawPaint == nullptr) {
+            return false;
+        }
+
+        if (!fold_opacity_layer_color_to_paint(layerPaint, false , drawPaint)) {
+            return false;
+        }
+
+        return KillSaveLayerAndRestore(record, begin);
+    }
+
+    static bool KillSaveLayerAndRestore(SkRecord* record, int saveLayerIndex) {
+        record->replace<NoOp>(saveLayerIndex);    
+        record->replace<NoOp>(saveLayerIndex+2);  
+        return true;
+    }
+};
+void SkRecordNoopSaveLayerDrawRestores(SkRecord* record) {
+    SaveLayerDrawRestoreNooper pass;
+    apply(&pass, record);
+}
+#endif
+
+struct SvgOpacityAndFilterLayerMergePass {
+    typedef Pattern<Is<SaveLayer>, Is<Save>, Is<ClipRect>, Is<SaveLayer>,
+                    Is<Restore>, Is<Restore>, Is<Restore>> Match;
+
+    bool onMatch(SkRecord* record, Match* match, int begin, int end) {
+        if (match->first<SaveLayer>()->backdrop) {
+            return false;
+        }
+
+        if (!match->first<SaveLayer>()->filters.empty() ||
+            !match->fourth<SaveLayer>()->filters.empty()) {
+            return false;
+        }
+
+        SkPaint* opacityPaint = match->first<SaveLayer>()->paint;
+        if (nullptr == opacityPaint) {
+            return KillSaveLayerAndRestore(record, begin);
+        }
+
+        SkPaint* filterLayerPaint = match->fourth<SaveLayer>()->paint;
+        if (filterLayerPaint == nullptr) {
+            return false;
+        }
+
+        if (!fold_opacity_layer_color_to_paint(opacityPaint, true ,
+                                               filterLayerPaint)) {
+            return false;
+        }
+
+        return KillSaveLayerAndRestore(record, begin);
+    }
+
+    static bool KillSaveLayerAndRestore(SkRecord* record, int saveLayerIndex) {
+        record->replace<NoOp>(saveLayerIndex);     
+        record->replace<NoOp>(saveLayerIndex + 6); 
+        return true;
+    }
+};
+
+void SkRecordMergeSvgOpacityAndFilterLayers(SkRecord* record) {
+    SvgOpacityAndFilterLayerMergePass pass;
+    apply(&pass, record);
+}
+
+
+void SkRecordOptimize(SkRecord* record) {
+
+#if !defined(SK_BUILD_FOR_ANDROID_FRAMEWORK)
+    SkRecordNoopSaveLayerDrawRestores(record);
+#endif
+    SkRecordMergeSvgOpacityAndFilterLayers(record);
+
+    record->defrag();
+}

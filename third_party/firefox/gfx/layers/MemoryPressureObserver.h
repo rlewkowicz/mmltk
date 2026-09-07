@@ -1,0 +1,44 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef MOZILLA_LAYERS_MEMORYPRESSUREOBSERVER_H
+#define MOZILLA_LAYERS_MEMORYPRESSUREOBSERVER_H
+
+#include "nsIObserver.h"
+
+namespace mozilla {
+namespace layers {
+
+
+enum class MemoryPressureReason {
+  LOW_MEMORY,
+  LOW_MEMORY_ONGOING,
+  HEAP_MINIMIZE,
+};
+
+class MemoryPressureListener {
+ public:
+  virtual void OnMemoryPressure(MemoryPressureReason aWhy) = 0;
+};
+
+class MemoryPressureObserver final : public nsIObserver {
+ public:
+  NS_DECL_ISUPPORTS
+  NS_DECL_NSIOBSERVER
+
+  static already_AddRefed<MemoryPressureObserver> Create(
+      MemoryPressureListener* aListener);
+
+  void Unregister();
+
+ private:
+  explicit MemoryPressureObserver(MemoryPressureListener* aListener);
+  ~MemoryPressureObserver();
+  MemoryPressureListener* mListener;
+};
+
+}  
+}  
+
+#endif

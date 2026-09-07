@@ -1,0 +1,100 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_ModuleLoader_h
+#define mozilla_dom_ModuleLoader_h
+
+#include "ScriptLoader.h"
+#include "js/loader/ModuleLoaderBase.h"
+#include "mozilla/dom/ScriptLoadRequestType.h"
+
+class nsIGlobalObject;
+class nsIURI;
+
+namespace JS {
+
+class CompileOptions;
+
+namespace loader {
+
+class ModuleLoadRequest;
+
+}  
+}  
+
+namespace mozilla::dom {
+
+class ScriptLoader;
+class ScriptLoadContext;
+class SRIMetadata;
+
+
+class ModuleLoader final : public JS::loader::ModuleLoaderBase {
+ private:
+  virtual ~ModuleLoader();
+
+ public:
+  ModuleLoader(ScriptLoader* aLoader, nsIGlobalObject* aGlobalObject);
+
+  ScriptLoader* GetScriptLoader();
+
+  bool CanStartLoad(ModuleLoadRequest* aRequest, nsresult* aRvOut) override;
+
+  nsresult StartFetch(ModuleLoadRequest* aRequest) override;
+
+  void OnModuleLoadComplete(ModuleLoadRequest* aRequest) override;
+
+  nsresult CompileFetchedModule(
+      JSContext* aCx, JS::Handle<JSObject*> aGlobal,
+      JS::CompileOptions& aOptions, ModuleLoadRequest* aRequest,
+      JS::MutableHandle<JSObject*> aModuleScript) override;
+
+  already_AddRefed<ModuleLoadRequest> CreateTopLevel(
+      nsIURI* aURI, nsIScriptElement* aElement, ReferrerPolicy aReferrerPolicy,
+      ScriptFetchOptions* aFetchOptions, const SRIMetadata& aIntegrity,
+      nsIURI* aReferrer, ScriptLoadContext* aContext,
+      ScriptLoadRequestType aRequestType);
+
+  nsIURI* GetClientReferrerURI() override;
+
+  already_AddRefed<ScriptFetchOptions> CreateDefaultScriptFetchOptions()
+      override;
+
+  already_AddRefed<ModuleLoadRequest> CreateRequest(
+      JSContext* aCx, nsIURI* aURI, JS::Handle<JSObject*> aModuleRequest,
+      JS::Handle<JS::Value> aHostDefined, JS::Handle<JS::Value> aPayload,
+      bool aIsDynamicImport, ScriptFetchOptions* aOptions,
+      ReferrerPolicy aReferrerPolicy, nsIURI* aBaseURL,
+      const SRIMetadata& aSriMetadata) override;
+
+  static ModuleLoader* From(ModuleLoaderBase* aLoader) {
+    return static_cast<ModuleLoader*>(aLoader);
+  }
+
+  void AsyncExecuteInlineModule(ModuleLoadRequest* aRequest);
+  void ExecuteInlineModule(ModuleLoadRequest* aRequest);
+
+ private:
+  nsresult CompileJavaScriptOrWasmModule(
+      JSContext* aCx, JS::CompileOptions& aOptions, ModuleLoadRequest* aRequest,
+      JS::MutableHandle<JSObject*> aModuleOut);
+  nsresult CompileJsonModule(JSContext* aCx, JS::CompileOptions& aOptions,
+                             ModuleLoadRequest* aRequest,
+                             JS::MutableHandle<JSObject*> aModuleOut);
+  nsresult CompileCssModule(JSContext* aCx, JS::CompileOptions& aOptions,
+                            ModuleLoadRequest* aRequest,
+                            JS::MutableHandle<JSObject*> aModuleOut);
+  nsresult CreateTextModule(JSContext* aCx, JS::CompileOptions& aOptions,
+                            ModuleLoadRequest* aRequest,
+                            JS::MutableHandle<JSObject*> aModuleOut);
+
+};
+
+nsresult CreateCssModule(JSContext* aCx, nsIGlobalObject* aGlobal,
+                         const nsACString& aSource, nsIURI* aBaseURI,
+                         JS::MutableHandle<JSObject*> aModuleOut);
+
+}  
+
+#endif  // mozilla_dom_ModuleLoader_h

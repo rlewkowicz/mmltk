@@ -1,0 +1,72 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_EventTargetAndLockCapability_h
+#define mozilla_EventTargetAndLockCapability_h
+
+#include "MainThreadUtils.h"
+#include "mozilla/ThreadSafety.h"
+#include "mozilla/EventTargetCapability.h"
+
+
+namespace mozilla {
+
+template <typename LockT>
+class MOZ_CAPABILITY("combo (main thread + mutex)")
+    MainThreadAndLockCapability {
+ public:
+  explicit MainThreadAndLockCapability(const char* aName) : mLock(aName) {}
+
+  LockT& Lock() MOZ_RETURN_CAPABILITY(mLock) { return mLock; }
+
+  void NoteOnMainThread() const MOZ_REQUIRES(sMainThreadCapability)
+      MOZ_ASSERT_SHARED_CAPABILITY(this) {}
+
+  void NoteLockHeld() const MOZ_REQUIRES(mLock)
+      MOZ_ASSERT_SHARED_CAPABILITY(this) {}
+
+  void NoteExclusiveAccess() const MOZ_REQUIRES(sMainThreadCapability, mLock)
+      MOZ_ASSERT_CAPABILITY(this) {}
+
+  void ClearCurrentAccess() const
+      MOZ_RELEASE_GENERIC(this) MOZ_NO_THREAD_SAFETY_ANALYSIS {}
+
+ private:
+  LockT mLock;
+};
+
+template <typename TargetT, typename LockT>
+class MOZ_CAPABILITY("combo (event target + mutex)")
+    EventTargetAndLockCapability {
+ public:
+  EventTargetAndLockCapability(const char* aName, TargetT* aTarget)
+      : mLock(aName), mTarget(aTarget) {}
+
+  LockT& Lock() MOZ_RETURN_CAPABILITY(mLock) { return mLock; }
+
+  const mozilla::EventTargetCapability<TargetT>& Target() const
+      MOZ_RETURN_CAPABILITY(mTarget) {
+    return mTarget;
+  }
+
+  void NoteOnTarget() const MOZ_REQUIRES(mTarget)
+      MOZ_ASSERT_SHARED_CAPABILITY(this) {}
+
+  void NoteLockHeld() const MOZ_REQUIRES(mLock)
+      MOZ_ASSERT_SHARED_CAPABILITY(this) {}
+
+  void NoteExclusiveAccess() const MOZ_REQUIRES(mTarget, mLock)
+      MOZ_ASSERT_CAPABILITY(this) {}
+
+  void ClearCurrentAccess() const
+      MOZ_RELEASE_GENERIC(this) MOZ_NO_THREAD_SAFETY_ANALYSIS {}
+
+ private:
+  LockT mLock;
+  mozilla::EventTargetCapability<TargetT> mTarget;
+};
+
+}  
+
+#endif  // mozilla_EventTargetAndLockCapability_h

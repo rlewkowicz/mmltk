@@ -1,0 +1,31 @@
+
+[package]
+edition = "2021"
+name = "failspot"
+version = "0.2.0"
+authors = ["Chris Martin <marti4d@live.ca>"]
+build = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "A testing library that makes it easy(ish) to add intentional errors to a program"
+keywords = [
+    "error",
+    "error-handling",
+    "testing",
+]
+categories = ["development-tools::testing"]
+license = "MIT"
+repository = "https://github.com/marti4d/failspot"
+
+[lib]
+name = "failspot"
+path = "src/lib.rs"
+
+[dependencies.flagset]
+version = "0.4.6"
+optional = true
+
+[features]
+enabled = ["dep:flagset"]

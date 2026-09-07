@@ -1,0 +1,62 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef GFX_LINESEGMENT_H
+#define GFX_LINESEGMENT_H
+
+#include "gfxTypes.h"
+#include "gfxPoint.h"
+
+struct gfxLineSegment {
+  gfxLineSegment() {}
+  gfxLineSegment(const gfxPoint& aStart, const gfxPoint& aEnd)
+      : mStart(aStart), mEnd(aEnd) {}
+
+  bool PointsOnSameSide(const gfxPoint& aOne, const gfxPoint& aTwo) {
+
+    gfxFloat deltaY = (mEnd.y - mStart.y);
+    gfxFloat deltaX = (mEnd.x - mStart.x);
+
+    gfxFloat one = deltaX * (aOne.y - mStart.y) - deltaY * (aOne.x - mStart.x);
+    gfxFloat two = deltaX * (aTwo.y - mStart.y) - deltaY * (aTwo.x - mStart.x);
+
+
+    if ((one >= 0 && two >= 0) || (one <= 0 && two <= 0)) return true;
+    return false;
+  }
+
+  bool Intersects(const gfxLineSegment& aOther, gfxPoint& aIntersection) {
+    gfxFloat denominator =
+        (aOther.mEnd.y - aOther.mStart.y).value * (mEnd.x - mStart.x).value -
+        (aOther.mEnd.x - aOther.mStart.x).value * (mEnd.y - mStart.y).value;
+
+    if (!denominator) {
+      return false;
+    }
+
+    gfxFloat anumerator = (aOther.mEnd.x - aOther.mStart.x).value *
+                              (mStart.y - aOther.mStart.y).value -
+                          (aOther.mEnd.y - aOther.mStart.y).value *
+                              (mStart.x - aOther.mStart.x).value;
+
+    gfxFloat bnumerator =
+        (mEnd.x - mStart.x).value * (mStart.y - aOther.mStart.y).value -
+        (mEnd.y - mStart.y).value * (mStart.x - aOther.mStart.x).value;
+
+    gfxFloat ua = anumerator / denominator;
+    gfxFloat ub = bnumerator / denominator;
+
+    if (ua <= 0.0 || ua >= 1.0 || ub <= 0.0 || ub >= 1.0) {
+      return false;
+    }
+
+    aIntersection = mStart + (mEnd - mStart) * ua;
+    return true;
+  }
+
+  gfxPoint mStart;
+  gfxPoint mEnd;
+};
+
+#endif /* GFX_LINESEGMENT_H */

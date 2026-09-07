@@ -1,0 +1,35 @@
+// Copyright 2002 The ANGLE Project Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#if !defined(COMPILER_TRANSLATOR_COLLECTVARIABLES_H_)
+#define COMPILER_TRANSLATOR_COLLECTVARIABLES_H_
+
+#include <GLSLANG/ShaderLang.h>
+
+#include "compiler/translator/ExtensionBehavior.h"
+
+namespace sh
+{
+
+class TIntermBlock;
+class TSymbolTable;
+
+void CollectVariables(TIntermBlock *root,
+                      std::vector<ShaderVariable> *attributes,
+                      std::vector<ShaderVariable> *outputVariables,
+                      std::vector<ShaderVariable> *uniforms,
+                      std::vector<ShaderVariable> *inputVaryings,
+                      std::vector<ShaderVariable> *outputVaryings,
+                      std::vector<ShaderVariable> *sharedVariables,
+                      std::vector<InterfaceBlock> *uniformBlocks,
+                      std::vector<InterfaceBlock> *shaderStorageBlocks,
+                      char userVariablePrefix,
+                      ShHashFunction64 hashFunction,
+                      TSymbolTable *symbolTable,
+                      GLenum shaderType,
+                      const TExtensionBehavior &extensionBehavior,
+                      bool transformFloatUniformToFP16);
+}  
+
+#endif

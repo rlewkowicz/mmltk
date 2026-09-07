@@ -1,0 +1,42 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_SerialPortIPCTypes_h
+#define mozilla_dom_SerialPortIPCTypes_h
+
+#include "ipc/EnumSerializer.h"
+#include "mozilla/dom/BindingIPCUtils.h"
+#include "mozilla/dom/SerialPortBinding.h"
+
+namespace mozilla::dom {
+constexpr uint32_t kMaxSerialBufferSize = 16u * 1024u * 1024u;  
+
+enum class RequestPortReason : uint8_t {
+  Granted,        
+  UserCancelled,  
+  AddonDenied,    
+  InternalError,  
+  EndGuard_
+};
+}  
+
+namespace IPC {
+template <>
+struct ParamTraits<mozilla::dom::ParityType>
+    : public mozilla::dom::WebIDLEnumSerializer<mozilla::dom::ParityType> {};
+
+template <>
+struct ParamTraits<mozilla::dom::FlowControlType>
+    : public mozilla::dom::WebIDLEnumSerializer<mozilla::dom::FlowControlType> {
+};
+
+template <>
+struct ParamTraits<mozilla::dom::RequestPortReason>
+    : public ContiguousEnumSerializer<
+          mozilla::dom::RequestPortReason,
+          mozilla::dom::RequestPortReason::Granted,
+          mozilla::dom::RequestPortReason::EndGuard_> {};
+}  
+
+#endif  // mozilla_dom_SerialPortIPCTypes_h

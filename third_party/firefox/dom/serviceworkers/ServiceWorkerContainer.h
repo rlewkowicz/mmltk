@@ -1,0 +1,118 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_serviceworkercontainer_h_
+#define mozilla_dom_serviceworkercontainer_h_
+
+#include "mozilla/DOMEventTargetHelper.h"
+#include "mozilla/ErrorResult.h"
+#include "mozilla/dom/ServiceWorkerUtils.h"
+
+class nsIGlobalWindow;
+class nsIPrincipal;
+
+namespace mozilla::dom {
+
+class ClientPostMessageArgs;
+struct MessageEventInit;
+class Promise;
+struct RegistrationOptions;
+class ServiceWorker;
+class ServiceWorkerContainerChild;
+class TrustedScriptURLOrUSVString;
+
+class ServiceWorkerContainer final : public DOMEventTargetHelper {
+ public:
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(ServiceWorkerContainer,
+                                           DOMEventTargetHelper)
+
+  IMPL_EVENT_HANDLER(controllerchange)
+  IMPL_EVENT_HANDLER(messageerror)
+
+  inline mozilla::dom::EventHandlerNonNull* GetOnmessage() {
+    return GetEventHandler(nsGkAtoms::onmessage);
+  }
+  inline void SetOnmessage(mozilla::dom::EventHandlerNonNull* aCallback) {
+    SetEventHandler(nsGkAtoms::onmessage, aCallback);
+    StartMessages();
+  }
+
+  static bool IsEnabled(JSContext* aCx, JSObject* aGlobal);
+
+  static already_AddRefed<ServiceWorkerContainer> Create(
+      nsIGlobalObject* aGlobal);
+
+  virtual JSObject* WrapObject(JSContext* aCx,
+                               JS::Handle<JSObject*> aGivenProto) override;
+
+  MOZ_CAN_RUN_SCRIPT already_AddRefed<Promise> Register(
+      const TrustedScriptURLOrUSVString& aScriptURL,
+      const RegistrationOptions& aOptions, nsIPrincipal* aSubjectPrincipal,
+      ErrorResult& aRv);
+
+  already_AddRefed<ServiceWorker> GetController();
+
+  already_AddRefed<Promise> GetRegistration(const nsAString& aDocumentURL,
+                                            ErrorResult& aRv);
+
+  already_AddRefed<Promise> GetRegistrations(ErrorResult& aRv);
+
+  void StartMessages();
+
+  Promise* GetReady(ErrorResult& aRv);
+
+  void GetScopeForUrl(const nsAString& aUrl, nsString& aScope,
+                      ErrorResult& aRv);
+
+  void DisconnectFromOwner() override;
+
+  void ControllerChanged(ErrorResult& aRv);
+
+  void ReceiveMessage(const ClientPostMessageArgs& aArgs);
+
+  void RevokeActor(ServiceWorkerContainerChild* aActor);
+
+ private:
+  explicit ServiceWorkerContainer(nsIGlobalObject* aGlobal);
+
+  ~ServiceWorkerContainer();
+
+  nsIGlobalObject* GetGlobalIfValid(
+      ErrorResult& aRv,
+      const std::function<void(nsIGlobalObject*)>&& aStorageFailureCB =
+          nullptr) const;
+
+  struct ReceivedMessage;
+
+  void EnqueueReceivedMessageDispatch(RefPtr<ReceivedMessage> aMessage);
+
+  template <typename F>
+  void RunWithJSContext(F&& aCallable);
+
+  void DispatchMessage(RefPtr<ReceivedMessage> aMessage);
+
+  static Result<Ok, bool> FillInMessageEventInit(JSContext* aCx,
+                                                 nsIGlobalObject* aGlobal,
+                                                 ReceivedMessage& aMessage,
+                                                 MessageEventInit& aInit);
+
+  void Shutdown();
+
+  RefPtr<ServiceWorkerContainerChild> mActor;
+  bool mShutdown;
+
+  RefPtr<ServiceWorker> mControllerWorker;
+
+  RefPtr<Promise> mReadyPromise;
+  MozPromiseRequestHolder<ServiceWorkerRegistrationPromise> mReadyPromiseHolder;
+
+  bool mMessagesStarted = false;
+
+  nsTArray<RefPtr<ReceivedMessage>> mPendingMessages;
+};
+
+}  
+
+#endif /* mozilla_dom_serviceworkercontainer_h_ */

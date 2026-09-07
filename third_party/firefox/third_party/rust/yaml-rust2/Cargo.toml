@@ -1,0 +1,60 @@
+
+[package]
+edition = "2021"
+rust-version = "1.65.0"
+name = "yaml-rust2"
+version = "0.10.3"
+authors = [
+    "Yuheng Chen <yuhengchen@sensetime.com>",
+    "Ethiraric <ethiraric@gmail.com>",
+    "David Aguilar <davvid@gmail.com>",
+]
+build = false
+exclude = [
+    "/documents",
+    "/tests/yaml-test-suite",
+]
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "A fully YAML 1.2 compliant YAML parser"
+documentation = "https://docs.rs/yaml-rust2"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Ethiraric/yaml-rust2"
+
+[features]
+debug_prints = []
+default = ["encoding"]
+encoding = ["dep:encoding_rs"]
+
+[lib]
+name = "yaml_rust2"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dump_events"
+path = "tools/dump_events.rs"
+
+[[bin]]
+name = "run_bench"
+path = "tools/run_bench.rs"
+
+[[bin]]
+name = "time_parse"
+path = "tools/time_parse.rs"
+
+[dependencies.arraydeque]
+version = "0.5.1"
+
+[dependencies.encoding_rs]
+version = "0.8.33"
+optional = true
+
+[dependencies.hashlink]
+version = "0.10"
+
+[profile.release-lto]
+lto = true
+inherits = "release"

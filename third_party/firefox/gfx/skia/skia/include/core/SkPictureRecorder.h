@@ -1,0 +1,73 @@
+/*
+ * Copyright 2014 Google Inc.
+ *
+ * Use of this source code is governed by a BSD-style license that can be
+ * found in the LICENSE file.
+ */
+
+#if !defined(SkPictureRecorder_DEFINED)
+#define SkPictureRecorder_DEFINED
+
+#include "include/core/SkRect.h"
+#include "include/core/SkRefCnt.h"
+#include "include/core/SkScalar.h"
+#include "include/private/base/SkAPI.h"
+
+#include <memory>
+
+#if defined(SK_BUILD_FOR_ANDROID_FRAMEWORK)
+namespace android {
+    class Picture;
+};
+#endif
+
+class SkBBHFactory;
+class SkBBoxHierarchy;
+class SkCanvas;
+class SkDrawable;
+class SkPicture;
+class SkRecord;
+class SkRecordCanvas;
+
+class SK_API SkPictureRecorder {
+public:
+    SkPictureRecorder();
+    ~SkPictureRecorder();
+
+    SkCanvas* beginRecording(const SkRect& bounds, sk_sp<SkBBoxHierarchy> bbh);
+
+    SkCanvas* beginRecording(const SkRect& bounds, SkBBHFactory* bbhFactory = nullptr);
+
+    SkCanvas* beginRecording(SkScalar width, SkScalar height,
+                             SkBBHFactory* bbhFactory = nullptr) {
+        return this->beginRecording(SkRect::MakeWH(width, height), bbhFactory);
+    }
+
+    SkCanvas* getRecordingCanvas();
+
+    sk_sp<SkPicture> finishRecordingAsPicture();
+
+    sk_sp<SkPicture> finishRecordingAsPictureWithCull(const SkRect& cullRect);
+
+    sk_sp<SkDrawable> finishRecordingAsDrawable();
+
+private:
+    void reset();
+
+#if defined(SK_BUILD_FOR_ANDROID_FRAMEWORK)
+    friend class android::Picture;
+#endif
+    friend class SkPictureRecorderReplayTester; 
+    void partialReplay(SkCanvas* canvas) const;
+
+    sk_sp<SkBBoxHierarchy> fBBH;
+    std::unique_ptr<SkRecordCanvas> fRecorder;
+    sk_sp<SkRecord> fRecord;
+    SkRect fCullRect;
+    bool fActivelyRecording;
+
+    SkPictureRecorder(SkPictureRecorder&&) = delete;
+    SkPictureRecorder& operator=(SkPictureRecorder&&) = delete;
+};
+
+#endif

@@ -1,0 +1,45 @@
+
+[package]
+edition = "2018"
+name = "spirv"
+version = "0.4.0+sdk-1.4.341.0"
+authors = ["Lei Zhang <antiagainst@gmail.com>"]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Rust definition of SPIR-V structs and enums"
+documentation = "https://docs.rs/spirv"
+keywords = [
+    "spirv",
+    "definition",
+    "struct",
+    "enum",
+]
+license = "Apache-2.0"
+repository = "https://github.com/gfx-rs/rspirv"
+
+[features]
+deserialize = [
+    "serde",
+    "bitflags/serde",
+]
+serialize = [
+    "serde",
+    "bitflags/serde",
+]
+
+[lib]
+name = "spirv"
+path = "lib.rs"
+
+[dependencies.bitflags]
+version = "2.0"
+
+[dependencies.serde]
+version = "1"
+features = ["derive"]
+optional = true
+default-features = false

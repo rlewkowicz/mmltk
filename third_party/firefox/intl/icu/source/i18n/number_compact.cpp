@@ -1,0 +1,300 @@
+// License & terms of use: http://www.unicode.org/copyright.html
+
+#include "unicode/utypes.h"
+
+#if !UCONFIG_NO_FORMATTING
+
+#include "unicode/ustring.h"
+#include "unicode/ures.h"
+#include "cstring.h"
+#include "charstr.h"
+#include "resource.h"
+#include "number_compact.h"
+#include "number_microprops.h"
+#include "uresimp.h"
+
+using namespace icu;
+using namespace icu::number;
+using namespace icu::number::impl;
+
+namespace {
+
+const char16_t *USE_FALLBACK = u"<USE FALLBACK>";
+
+void getResourceBundleKey(const char *nsName, CompactStyle compactStyle, CompactType compactType,
+                                 CharString &sb, UErrorCode &status) {
+    sb.clear();
+    sb.append("NumberElements/", status);
+    sb.append(nsName, status);
+    sb.append(compactStyle == CompactStyle::UNUM_SHORT ? "/patternsShort" : "/patternsLong", status);
+    sb.append(compactType == CompactType::TYPE_DECIMAL ? "/decimalFormat" : "/currencyFormat", status);
+}
+
+int32_t getIndex(int32_t magnitude, StandardPlural::Form plural) {
+    return magnitude * StandardPlural::COUNT + plural;
+}
+
+int32_t countZeros(const char16_t *patternString, int32_t patternLength) {
+    int32_t numZeros = 0;
+    for (int32_t i = 0; i < patternLength; i++) {
+        if (patternString[i] == u'0') {
+            numZeros++;
+        } else if (numZeros > 0) {
+            break; 
+        }
+    }
+    return numZeros;
+}
+
+} 
+
+CompactData::CompactData() : patterns(), multipliers(), largestMagnitude(0), isEmpty(true) {
+}
+
+void CompactData::populate(const Locale &locale, const char *nsName, CompactStyle compactStyle,
+                           CompactType compactType, UErrorCode &status) {
+    CompactDataSink sink(*this);
+    LocalUResourceBundlePointer rb(ures_open(nullptr, locale.getName(), &status));
+    if (U_FAILURE(status)) { return; }
+
+    bool nsIsLatn = strcmp(nsName, "latn") == 0;
+    bool compactIsShort = compactStyle == CompactStyle::UNUM_SHORT;
+
+    CharString resourceKey;
+    getResourceBundleKey(nsName, compactStyle, compactType, resourceKey, status);
+    UErrorCode localStatus = U_ZERO_ERROR;
+    ures_getAllItemsWithFallback(rb.getAlias(), resourceKey.data(), sink, localStatus);
+    if (isEmpty && !nsIsLatn) {
+        getResourceBundleKey("latn", compactStyle, compactType, resourceKey, status);
+        localStatus = U_ZERO_ERROR;
+        ures_getAllItemsWithFallback(rb.getAlias(), resourceKey.data(), sink, localStatus);
+    }
+    if (isEmpty && !compactIsShort) {
+        getResourceBundleKey(nsName, CompactStyle::UNUM_SHORT, compactType, resourceKey, status);
+        localStatus = U_ZERO_ERROR;
+        ures_getAllItemsWithFallback(rb.getAlias(), resourceKey.data(), sink, localStatus);
+    }
+    if (isEmpty && !nsIsLatn && !compactIsShort) {
+        getResourceBundleKey("latn", CompactStyle::UNUM_SHORT, compactType, resourceKey, status);
+        localStatus = U_ZERO_ERROR;
+        ures_getAllItemsWithFallback(rb.getAlias(), resourceKey.data(), sink, localStatus);
+    }
+
+    if (isEmpty) {
+        status = U_INTERNAL_PROGRAM_ERROR;
+    }
+}
+
+int32_t CompactData::getMultiplier(int32_t magnitude) const {
+    if (magnitude < 0) {
+        return 0;
+    }
+    if (magnitude > largestMagnitude) {
+        magnitude = largestMagnitude;
+    }
+    return multipliers[magnitude];
+}
+
+const char16_t *CompactData::getPattern(
+        int32_t magnitude,
+        const PluralRules *rules,
+        const DecimalQuantity &dq) const {
+    if (magnitude < 0) {
+        return nullptr;
+    }
+    if (magnitude > largestMagnitude) {
+        magnitude = largestMagnitude;
+    }
+    const char16_t *patternString = nullptr;
+    if (dq.hasIntegerValue()) {
+        int64_t i = dq.toLong(true);
+        if (i == 0) {
+            patternString = patterns[getIndex(magnitude, StandardPlural::Form::EQ_0)];
+        } else if (i == 1) {
+            patternString = patterns[getIndex(magnitude, StandardPlural::Form::EQ_1)];
+        }
+        if (patternString != nullptr) {
+            return patternString;
+        }
+    }
+    StandardPlural::Form plural = utils::getStandardPlural(rules, dq);
+    patternString = patterns[getIndex(magnitude, plural)];
+    if (patternString == nullptr && plural != StandardPlural::OTHER) {
+        patternString = patterns[getIndex(magnitude, StandardPlural::OTHER)];
+    }
+    if (patternString == USE_FALLBACK) { 
+        patternString = nullptr;
+    }
+    return patternString;
+}
+
+void CompactData::getUniquePatterns(UVector &output, UErrorCode &status) const {
+    U_ASSERT(output.isEmpty());
+    for (const auto* pattern : patterns) {
+        if (pattern == nullptr || pattern == USE_FALLBACK) {
+            continue;
+        }
+
+        for (int32_t i = output.size() - 1; i >= 0; i--) {
+            if (u_strcmp(pattern, static_cast<const char16_t *>(output[i])) == 0) {
+                goto continue_outer;
+            }
+        }
+
+        output.addElement(const_cast<char16_t *>(pattern), status);
+
+        continue_outer:
+        continue;
+    }
+}
+
+void CompactData::CompactDataSink::put(const char *key, ResourceValue &value, UBool ,
+                                       UErrorCode &status) {
+    ResourceTable powersOfTenTable = value.getTable(status);
+    if (U_FAILURE(status)) { return; }
+    for (int i3 = 0; powersOfTenTable.getKeyAndValue(i3, key, value); ++i3) {
+
+        auto magnitude = static_cast<int8_t> (strlen(key) - 1);
+        U_ASSERT(magnitude < COMPACT_MAX_DIGITS); 
+        if (magnitude >= COMPACT_MAX_DIGITS) { 
+            continue;
+        }
+        int8_t multiplier = data.multipliers[magnitude];
+
+        ResourceTable pluralVariantsTable = value.getTable(status);
+        if (U_FAILURE(status)) { return; }
+        for (int i4 = 0; pluralVariantsTable.getKeyAndValue(i4, key, value); ++i4) {
+            StandardPlural::Form plural = StandardPlural::fromString(key, status);
+            if (U_FAILURE(status)) { return; }
+            if (data.patterns[getIndex(magnitude, plural)] != nullptr) {
+                continue;
+            }
+
+            int32_t patternLength;
+            const char16_t *patternString = value.getString(patternLength, status);
+            if (U_FAILURE(status)) { return; }
+            if (u_strcmp(patternString, u"0") == 0) {
+                patternString = USE_FALLBACK;
+                patternLength = 0;
+            }
+
+            data.patterns[getIndex(magnitude, plural)] = patternString;
+
+            if (multiplier == 0) {
+                int32_t numZeros = countZeros(patternString, patternLength);
+                if (numZeros > 0) { 
+                    multiplier = static_cast<int8_t> (numZeros - magnitude - 1);
+                }
+            }
+        }
+
+        if (data.multipliers[magnitude] == 0) {
+            data.multipliers[magnitude] = multiplier;
+            if (magnitude > data.largestMagnitude) {
+                data.largestMagnitude = magnitude;
+            }
+            data.isEmpty = false;
+        } else {
+            U_ASSERT(data.multipliers[magnitude] == multiplier);
+        }
+    }
+}
+
+
+CompactHandler::CompactHandler(
+        CompactStyle compactStyle,
+        const Locale &locale,
+        const char *nsName,
+        CompactType compactType,
+        const PluralRules *rules,
+        MutablePatternModifier *buildReference,
+        bool safe,
+        const MicroPropsGenerator *parent,
+        UErrorCode &status)
+        : rules(rules), parent(parent), safe(safe) {
+    data.populate(locale, nsName, compactStyle, compactType, status);
+    if (safe) {
+        precomputeAllModifiers(*buildReference, status);
+    } else {
+        unsafePatternModifier = buildReference;
+    }
+}
+
+CompactHandler::~CompactHandler() {
+    for (int32_t i = 0; i < precomputedModsLength; i++) {
+        delete precomputedMods[i].mod;
+    }
+}
+
+void CompactHandler::precomputeAllModifiers(MutablePatternModifier &buildReference, UErrorCode &status) {
+    if (U_FAILURE(status)) { return; }
+
+    UVector allPatterns(12, status);
+    if (U_FAILURE(status)) { return; }
+    data.getUniquePatterns(allPatterns, status);
+    if (U_FAILURE(status)) { return; }
+
+    precomputedModsLength = allPatterns.size();
+    if (precomputedMods.getCapacity() < precomputedModsLength) {
+        precomputedMods.resize(allPatterns.size(), status);
+        if (U_FAILURE(status)) { return; }
+    }
+
+    for (int32_t i = 0; i < precomputedModsLength; i++) {
+        const auto* patternString = static_cast<const char16_t*>(allPatterns[i]);
+        UnicodeString hello(patternString);
+        CompactModInfo &info = precomputedMods[i];
+        ParsedPatternInfo patternInfo;
+        PatternParser::parseToPatternInfo(UnicodeString(patternString), patternInfo, status);
+        if (U_FAILURE(status)) { return; }
+        buildReference.setPatternInfo(&patternInfo, {UFIELD_CATEGORY_NUMBER, UNUM_COMPACT_FIELD});
+        info.mod = buildReference.createImmutable(status);
+        if (U_FAILURE(status)) { return; }
+        info.patternString = patternString;
+    }
+}
+
+void CompactHandler::processQuantity(DecimalQuantity &quantity, MicroProps &micros,
+                                     UErrorCode &status) const {
+    parent->processQuantity(quantity, micros, status);
+    if (U_FAILURE(status)) { return; }
+
+    int32_t magnitude;
+    int32_t multiplier = 0;
+    if (quantity.isZeroish()) {
+        magnitude = 0;
+        micros.rounder.apply(quantity, status);
+    } else {
+        multiplier = micros.rounder.chooseMultiplierAndApply(quantity, data, status);
+        magnitude = quantity.isZeroish() ? 0 : quantity.getMagnitude();
+        magnitude -= multiplier;
+    }
+
+    const char16_t *patternString = data.getPattern(magnitude, rules, quantity);
+    if (patternString == nullptr) {
+    } else if (safe) {
+        int32_t i = 0;
+        for (; i < precomputedModsLength; i++) {
+            const CompactModInfo &info = precomputedMods[i];
+            if (u_strcmp(patternString, info.patternString) == 0) {
+                info.mod->applyToMicros(micros, quantity, status);
+                break;
+            }
+        }
+        U_ASSERT(i < precomputedModsLength);
+    } else {
+        ParsedPatternInfo &patternInfo = const_cast<CompactHandler *>(this)->unsafePatternInfo;
+        PatternParser::parseToPatternInfo(UnicodeString(patternString), patternInfo, status);
+        unsafePatternModifier->setPatternInfo(
+            &unsafePatternInfo,
+            {UFIELD_CATEGORY_NUMBER, UNUM_COMPACT_FIELD});
+        unsafePatternModifier->setNumberProperties(quantity.signum(), StandardPlural::Form::COUNT);
+        micros.modMiddle = unsafePatternModifier;
+    }
+
+    quantity.adjustExponent(-1 * multiplier);
+
+    micros.rounder = RoundingImpl::passThrough();
+}
+
+#endif /* #if !UCONFIG_NO_FORMATTING */

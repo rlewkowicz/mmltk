@@ -1,0 +1,230 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+
+#ifndef mozilla_dom_ScriptSettings_h
+#define mozilla_dom_ScriptSettings_h
+
+#include "js/Exception.h"
+#include "js/Warnings.h"  // JS::WarningReporter
+#include "jsapi.h"
+#include "mozilla/Maybe.h"
+#include "mozilla/dom/JSExecutionManager.h"
+#include "xpcpublic.h"
+
+class JSObject;
+class nsIGlobalObject;
+class nsIPrincipal;
+class nsPIDOMWindowInner;
+class nsGlobalWindowInner;
+class nsIScriptContext;
+struct JSContext;
+
+namespace JS {
+class ExceptionStack;
+class Value;
+}  
+
+namespace mozilla {
+namespace dom {
+
+class Document;
+class WebTaskSchedulingState;
+
+void InitScriptSettings();
+void DestroyScriptSettings();
+
+
+nsIGlobalObject* GetEntryGlobal();
+
+Document* GetEntryDocument();
+
+nsIGlobalObject* GetIncumbentGlobal();
+
+nsIGlobalObject* GetCurrentGlobal();
+
+WebTaskSchedulingState* GetWebTaskSchedulingState();
+
+nsIPrincipal* GetWebIDLCallerPrincipal();
+
+bool IsJSAPIActive();
+
+namespace danger {
+
+JSContext* GetJSContext();
+
+}  
+
+JS::RootingContext* RootingCx();
+
+class ScriptSettingsStack;
+class ScriptSettingsStackEntry {
+  friend class ScriptSettingsStack;
+
+ public:
+  ~ScriptSettingsStackEntry();
+
+  bool NoJSAPI() const { return mType == eNoJSAPI; }
+  bool IsEntryCandidate() const {
+    return mType == eEntryScript || mType == eNoJSAPI;
+  }
+  bool IsIncumbentCandidate() { return mType != eJSAPI; }
+  bool IsIncumbentScript() { return mType == eIncumbentScript; }
+
+ protected:
+  enum Type { eEntryScript, eIncumbentScript, eJSAPI, eNoJSAPI };
+
+  ScriptSettingsStackEntry(nsIGlobalObject* aGlobal, Type aEntryType);
+
+  nsCOMPtr<nsIGlobalObject> mGlobalObject;
+  Type mType;
+
+ private:
+  ScriptSettingsStackEntry* mOlder;
+};
+
+class MOZ_STACK_CLASS AutoJSAPI : protected ScriptSettingsStackEntry {
+ public:
+  AutoJSAPI();
+
+  ~AutoJSAPI();
+
+  void Init();
+
+  [[nodiscard]] bool Init(nsIGlobalObject* aGlobalObject);
+
+  [[nodiscard]] bool Init(JSObject* aObject);
+
+  [[nodiscard]] bool Init(nsIGlobalObject* aGlobalObject, JSContext* aCx);
+
+  [[nodiscard]] bool Init(nsPIDOMWindowInner* aWindow);
+  [[nodiscard]] bool Init(nsPIDOMWindowInner* aWindow, JSContext* aCx);
+
+  [[nodiscard]] bool Init(nsGlobalWindowInner* aWindow);
+  [[nodiscard]] bool Init(nsGlobalWindowInner* aWindow, JSContext* aCx);
+
+  JSContext* cx() const {
+    MOZ_ASSERT(mCx, "Must call Init before using an AutoJSAPI");
+    MOZ_ASSERT(IsStackTop());
+    return mCx;
+  }
+
+#ifdef DEBUG
+  bool IsStackTop() const;
+#endif
+
+  void ReportException();
+
+  bool HasException() const {
+    MOZ_ASSERT(IsStackTop());
+    return JS_IsExceptionPending(cx());
+  };
+
+  [[nodiscard]] bool StealException(JS::MutableHandle<JS::Value> aVal);
+
+  [[nodiscard]] bool StealExceptionAndStack(JS::ExceptionStack* aExnStack);
+
+  [[nodiscard]] bool PeekException(JS::MutableHandle<JS::Value> aVal);
+
+  void ClearException() {
+    MOZ_ASSERT(IsStackTop());
+    JS_ClearPendingException(cx());
+  }
+
+ protected:
+  AutoJSAPI(nsIGlobalObject* aGlobalObject, bool aIsMainThread, Type aType);
+
+  mozilla::Maybe<JSAutoNullableRealm> mAutoNullableRealm;
+  JSContext* mCx;
+
+  bool mIsMainThread;
+  Maybe<JS::WarningReporter> mOldWarningReporter;
+
+ private:
+  void InitInternal(nsIGlobalObject* aGlobalObject, JSObject* aGlobal,
+                    JSContext* aCx, bool aIsMainThread);
+
+  AutoJSAPI(const AutoJSAPI&) = delete;
+  AutoJSAPI& operator=(const AutoJSAPI&) = delete;
+};
+
+class AutoIncumbentScript : protected ScriptSettingsStackEntry {
+ public:
+  explicit AutoIncumbentScript(nsIGlobalObject* aGlobalObject);
+  ~AutoIncumbentScript();
+
+ private:
+  JS::AutoHideScriptedCaller mCallerOverride;
+};
+
+class AutoNoJSAPI : protected ScriptSettingsStackEntry,
+                    protected JSAutoNullableRealm {
+ public:
+  AutoNoJSAPI() : AutoNoJSAPI(danger::GetJSContext()) {}
+  ~AutoNoJSAPI();
+
+ private:
+  explicit AutoNoJSAPI(JSContext* aCx);
+
+  JSContext* mCx;
+
+  AutoYieldJSThreadExecution mExecutionYield;
+};
+
+}  
+
+class MOZ_RAII AutoJSContext {
+ public:
+  explicit AutoJSContext();
+  operator JSContext*() const;
+
+ protected:
+  JSContext* mCx;
+  dom::AutoJSAPI mJSAPI;
+};
+
+class MOZ_RAII AutoSafeJSContext : public dom::AutoJSAPI {
+ public:
+  explicit AutoSafeJSContext();
+  operator JSContext*() const { return cx(); }
+
+ private:
+};
+
+class MOZ_RAII AutoSlowOperation {
+ public:
+  explicit AutoSlowOperation();
+  void CheckForInterrupt();
+
+ private:
+  bool mIsMainThread;
+  Maybe<xpc::AutoScriptActivity> mScriptActivity;
+};
+
+class MOZ_RAII AutoDisableJSInterruptCallback {
+ public:
+  explicit AutoDisableJSInterruptCallback(JSContext* aCx)
+      : mCx(aCx), mOld(JS_DisableInterruptCallback(aCx)) {}
+
+  ~AutoDisableJSInterruptCallback() { JS_ResetInterruptCallback(mCx, mOld); }
+
+ private:
+  JSContext* mCx;
+  bool mOld;
+};
+
+class MOZ_RAII AutoAllowLegacyScriptExecution {
+ public:
+  AutoAllowLegacyScriptExecution();
+  ~AutoAllowLegacyScriptExecution();
+
+  static bool IsAllowed();
+
+ private:
+  static int sAutoAllowLegacyScriptExecution;
+};
+
+}  
+
+#endif  // mozilla_dom_ScriptSettings_h

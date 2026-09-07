@@ -1,0 +1,54 @@
+[package]
+name = "iced_aw"
+version = "0.14.1"
+authors = [
+  "Kaiden42 <gitlab@tinysn.com>",
+  "Andrew Wheeler <genusistimelord@gmail.com>",
+]
+edition = "2024"
+description = "Additional widgets for the Iced GUI library"
+license = "MIT"
+homepage = "https://iced.rs"
+repository = "https://github.com/iced-rs/iced_aw"
+keywords = ["gui", "graphics", "interface", "widgets", "iced"]
+categories = ["gui"]
+rust-version = "1.88"
+
+[features]
+default = ["card", "color_picker", "context_menu", "number_input", "selection_list"]
+badge = []
+card = []
+date_picker = []
+color_picker = ["iced_widget/canvas"]
+tab_bar = []
+tabs = []
+time_picker = []
+wrap = []
+number_input = ["num-traits", "typed_input"]
+typed_input = []
+selection_list = []
+menu = []
+quad = []
+spinner = []
+context_menu = []
+slide_bar = []
+drop_down = []
+sidebar = []
+labeled_frame = []
+custom_layout = []
+debug_log = []
+full = []
+
+[dependencies]
+iced_core = { path = "../iced/core" }
+iced_widget = { path = "../iced/widget" }
+
+cfg-if = "1.0"
+iced_fonts_macros = { version = "0.3.0", features = [
+  "advanced_text",
+]}
+num-traits = { version = "0.2.19", optional = true }
+web-time = "1.1.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]

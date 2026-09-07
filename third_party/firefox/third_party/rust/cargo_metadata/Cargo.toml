@@ -1,0 +1,50 @@
+
+[package]
+edition = "2021"
+rust-version = "1.78.0"
+name = "cargo_metadata"
+version = "0.19.2"
+authors = ["Oliver Schneider <git-spam-no-reply9815368754983@oli-obk.de>"]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "structured access to the output of `cargo metadata`"
+license = "MIT"
+repository = "https://github.com/oli-obk/cargo_metadata"
+
+[features]
+builder = ["derive_builder"]
+default = []
+
+[lib]
+name = "cargo_metadata"
+path = "src/lib.rs"
+
+[dependencies.camino]
+version = "1.0.7"
+features = ["serde1"]
+
+[dependencies.cargo-platform]
+version = "0.1.2"
+
+[dependencies.derive_builder]
+version = "0.20"
+optional = true
+
+[dependencies.semver]
+version = "1.0.7"
+features = ["serde"]
+
+[dependencies.serde]
+version = "1.0.136"
+features = ["derive"]
+
+[dependencies.serde_json]
+version = "1.0.118"
+features = ["unbounded_depth"]
+
+[dependencies.thiserror]
+version = "2.0.3"

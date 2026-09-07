@@ -1,0 +1,206 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef mozilla_dom_LocalStorageCache_h
+#define mozilla_dom_LocalStorageCache_h
+
+#include "mozilla/Atomics.h"
+#include "mozilla/Monitor.h"
+#include "nsHashKeys.h"
+#include "nsIPrincipal.h"
+#include "nsString.h"
+#include "nsTHashMap.h"
+
+namespace mozilla::dom {
+
+class LocalStorage;
+class LocalStorageCacheChild;
+class LocalStorageManager;
+class StorageUsage;
+class StorageDBBridge;
+
+class LocalStorageCacheBridge {
+ public:
+  NS_IMETHOD_(MozExternalRefCountType) AddRef(void);
+  NS_IMETHOD_(void) Release(void);
+
+  virtual nsCString Origin() const = 0;
+
+  virtual const nsCString& OriginSuffix() const = 0;
+
+  virtual const nsCString& OriginNoSuffix() const = 0;
+
+  virtual bool Loaded() = 0;
+
+  virtual uint32_t LoadedCount() = 0;
+
+  virtual bool LoadItem(const nsAString& aKey, const nsAString& aValue) = 0;
+
+  virtual void LoadDone(nsresult aRv) = 0;
+
+  virtual void LoadWait() = 0;
+
+ protected:
+  virtual ~LocalStorageCacheBridge() = default;
+
+  ThreadSafeAutoRefCnt mRefCnt;
+  NS_DECL_OWNINGTHREAD
+};
+
+class LocalStorageCache : public LocalStorageCacheBridge {
+ public:
+  void AssertIsOnOwningThread() const { NS_ASSERT_OWNINGTHREAD(LocalStorage); }
+
+  void SetActor(LocalStorageCacheChild* aActor);
+
+  void ClearActor() {
+    AssertIsOnOwningThread();
+
+    mActor = nullptr;
+  }
+
+  NS_IMETHOD_(void) Release(void) override;
+
+  enum MutationSource {
+    ContentMutation,
+    E10sPropagated
+  };
+
+  explicit LocalStorageCache(const nsACString* aOriginNoSuffix);
+
+ protected:
+  virtual ~LocalStorageCache();
+
+ public:
+  void Init(LocalStorageManager* aManager, bool aPersistent,
+            nsIPrincipal* aPrincipal, const nsACString& aQuotaOriginScope);
+
+  int64_t GetOriginQuotaUsage(const LocalStorage* aStorage) const;
+
+  void Preload();
+
+  nsresult GetLength(const LocalStorage* aStorage, uint32_t* aRetval);
+  nsresult GetKey(const LocalStorage* aStorage, uint32_t index,
+                  nsAString& aRetval);
+  nsresult GetItem(const LocalStorage* aStorage, const nsAString& aKey,
+                   nsAString& aRetval);
+  nsresult SetItem(const LocalStorage* aStorage, const nsAString& aKey,
+                   const nsAString& aValue, nsString& aOld,
+                   const MutationSource aSource = ContentMutation);
+  nsresult RemoveItem(const LocalStorage* aStorage, const nsAString& aKey,
+                      nsString& aOld,
+                      const MutationSource aSource = ContentMutation);
+  nsresult Clear(const LocalStorage* aStorage,
+                 const MutationSource aSource = ContentMutation);
+
+  void GetKeys(const LocalStorage* aStorage, nsTArray<nsString>& aKeys);
+
+
+  nsCString Origin() const override;
+  const nsCString& OriginNoSuffix() const override { return mOriginNoSuffix; }
+  const nsCString& OriginSuffix() const override { return mOriginSuffix; }
+  bool Loaded() override { return mLoaded; }
+  uint32_t LoadedCount() override;
+  bool LoadItem(const nsAString& aKey, const nsAString& aValue) override;
+  void LoadDone(nsresult aRv) override;
+  void LoadWait() override;
+
+  class Data {
+   public:
+    Data() : mOriginQuotaUsage(0) {}
+    int64_t mOriginQuotaUsage;
+    nsTHashMap<nsStringHashKey, nsString> mKeys;
+  };
+
+ public:
+  static const uint32_t kDataSetCount = 2;
+
+ private:
+  friend class LocalStorageManager;
+
+  static const uint32_t kUnloadDefault = 1 << 0;
+  static const uint32_t kUnloadSession = 1 << 1;
+  static const uint32_t kUnloadComplete = kUnloadDefault | kUnloadSession;
+
+#ifdef DOM_STORAGE_TESTS
+  static const uint32_t kTestReload = 1 << 15;
+#endif
+
+  void UnloadItems(uint32_t aUnloadFlags);
+
+ private:
+  void WaitForPreload();
+
+  Data& DataSet(const LocalStorage* aStorage);
+
+  void NotifyObservers(const LocalStorage* aStorage, const nsAString& aKey,
+                       const nsAString& aOldValue, const nsAString& aNewValue);
+
+  bool Persist(const LocalStorage* aStorage) const;
+
+  bool ProcessUsageDelta(uint32_t aGetDataSetIndex, const int64_t aDelta,
+                         const MutationSource aSource = ContentMutation);
+  bool ProcessUsageDelta(const LocalStorage* aStorage, const int64_t aDelta,
+                         const MutationSource aSource = ContentMutation);
+
+ private:
+  RefPtr<LocalStorageManager> mManager;
+
+  RefPtr<StorageUsage> mUsage;
+
+  LocalStorageCacheChild* mActor;
+
+  nsCString mOriginNoSuffix;
+
+  nsCString mOriginSuffix;
+
+  nsCString mQuotaOriginScope;
+
+  Data mData[kDataSetCount];
+
+  mozilla::Monitor mMonitor MOZ_UNANNOTATED;
+
+  Atomic<bool, ReleaseAcquire> mLoaded;
+
+  nsresult mLoadResult;
+
+  uint32_t mPrivateBrowsingId;
+
+  bool mInitialized : 1;
+
+  bool mPersistent : 1;
+
+  bool mPreloadTelemetryRecorded : 1;
+};
+
+class StorageUsageBridge {
+ public:
+  NS_INLINE_DECL_THREADSAFE_VIRTUAL_REFCOUNTING(StorageUsageBridge)
+
+  virtual const nsCString& OriginScope() = 0;
+  virtual void LoadUsage(const int64_t aUsage) = 0;
+
+ protected:
+  virtual ~StorageUsageBridge() = default;
+};
+
+class StorageUsage : public StorageUsageBridge {
+ public:
+  explicit StorageUsage(const nsACString& aOriginScope);
+
+  bool CheckAndSetETLD1UsageDelta(
+      uint32_t aDataSetIndex, int64_t aUsageDelta,
+      const LocalStorageCache::MutationSource aSource);
+
+ private:
+  const nsCString& OriginScope() override { return mOriginScope; }
+  void LoadUsage(const int64_t aUsage) override;
+
+  nsCString mOriginScope;
+  int64_t mUsage[LocalStorageCache::kDataSetCount];
+};
+
+}  
+
+#endif  // mozilla_dom_LocalStorageCache_h

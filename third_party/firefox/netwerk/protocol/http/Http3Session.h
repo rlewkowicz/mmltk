@@ -1,0 +1,348 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#ifndef Http3Session_H_
+#define Http3Session_H_
+
+#include "HttpTrafficAnalyzer.h"
+#include "mozilla/Array.h"
+#include "mozilla/WeakPtr.h"
+#include "mozilla/net/NeqoHttp3Conn.h"
+#include "nsAHttpConnection.h"
+#include "nsDeque.h"
+#include "nsISupportsImpl.h"
+#include "nsITimer.h"
+#include "nsIUDPSocket.h"
+#include "nsRefPtrHashtable.h"
+#include "nsTHashMap.h"
+#include "nsWeakReference.h"
+
+
+namespace mozilla::net {
+
+class HttpConnectionUDP;
+class Http3StreamBase;
+class QuicSocketControl;
+class Http3WebTransportSession;
+class Http3WebTransportStream;
+class nsHttpConnection;
+
+#define NS_HTTP3SESSION_IID \
+  {0x8fc82aaf, 0xc4ef, 0x46ed, {0x89, 0x41, 0x93, 0x95, 0x8f, 0xac, 0x4f, 0x21}}
+
+class Http3SessionBase {
+ public:
+  NS_INLINE_DECL_PURE_VIRTUAL_REFCOUNTING
+
+  virtual nsresult TryActivating(const nsACString& aMethod,
+                                 const nsACString& aScheme,
+                                 const nsACString& aAuthorityHeader,
+                                 const nsACString& aPath,
+                                 const nsACString& aHeaders,
+                                 uint64_t* aStreamId,
+                                 Http3StreamBase* aStream) = 0;
+  virtual void CloseSendingSide(uint64_t aStreamId) = 0;
+  virtual void SendHTTPDatagram(uint64_t aStreamId, nsTArray<uint8_t>& aData,
+                                uint64_t aTrackingId) = 0;
+  virtual nsresult SendPriorityUpdateFrame(uint64_t aStreamId,
+                                           uint8_t aPriorityUrgency,
+                                           bool aPriorityIncremental) = 0;
+  virtual void ConnectSlowConsumer(Http3StreamBase* stream) = 0;
+
+  virtual nsresult SendRequestBody(uint64_t aStreamId, const char* buf,
+                                   uint32_t count, uint32_t* countRead) = 0;
+  virtual nsresult ReadResponseData(uint64_t aStreamId, char* aBuf,
+                                    uint32_t aCount, uint32_t* aCountWritten,
+                                    bool* aFin) = 0;
+  virtual void FinishTunnelSetup(nsAHttpTransaction* aTransaction) = 0;
+
+  virtual void CloseStream(Http3StreamBase* aStream, nsresult aResult) {}
+
+  virtual void CloseWebTransportConn() = 0;
+  virtual void StreamHasDataToWrite(Http3StreamBase* aStream) = 0;
+  virtual nsresult CloseWebTransport(uint64_t aSessionId, uint32_t aError,
+                                     const nsACString& aMessage) = 0;
+  virtual void SendDatagram(Http3WebTransportSession* aSession,
+                            nsTArray<uint8_t>& aData, uint64_t aTrackingId) = 0;
+  virtual uint64_t MaxDatagramSize(uint64_t aSessionId) = 0;
+  virtual nsresult TryActivatingWebTransportStream(
+      uint64_t* aStreamId, Http3StreamBase* aStream) = 0;
+  virtual void ResetWebTransportStream(Http3WebTransportStream* aStream,
+                                       uint64_t aErrorCode) = 0;
+  virtual void StreamStopSending(Http3WebTransportStream* aStream,
+                                 uint8_t aErrorCode) = 0;
+  virtual void SetSendOrder(Http3StreamBase* aStream,
+                            Maybe<int64_t> aSendOrder) = 0;
+};
+
+class Http3Session final : public Http3SessionBase,
+                           public nsAHttpTransaction,
+                           public nsAHttpConnection {
+ public:
+  NS_INLINE_DECL_STATIC_IID(NS_HTTP3SESSION_IID)
+
+  NS_DECL_ISUPPORTS_INHERITED
+  NS_DECL_NSAHTTPTRANSACTION
+  NS_DECL_NSAHTTPCONNECTION(mConnection)
+
+  class OnQuicTimeout final : public nsITimerCallback, public nsINamed {
+   public:
+    NS_DECL_THREADSAFE_ISUPPORTS
+    NS_DECL_NSITIMERCALLBACK
+    NS_DECL_NSINAMED
+
+    explicit OnQuicTimeout(HttpConnectionUDP* aConnection);
+
+   private:
+    ~OnQuicTimeout() = default;
+    RefPtr<HttpConnectionUDP> mConnection;
+  };
+
+  Http3Session();
+  nsresult Init(const nsHttpConnectionInfo* aConnInfo, nsINetAddr* selfAddr,
+                nsINetAddr* peerAddr, HttpConnectionUDP* udpConn,
+                uint32_t aProviderFlags, nsIInterfaceRequestor* callbacks,
+                nsIUDPSocket* socket, bool aIsTunnel = false);
+
+  bool IsConnected() const { return mState == CONNECTED; }
+  bool CanSendData() const {
+    return (mState == CONNECTED) || (mState == ZERORTT);
+  }
+  bool IsClosing() const { return (mState == CLOSING || mState == CLOSED); }
+  bool IsClosed() const { return mState == CLOSED; }
+
+  bool AddStream(nsAHttpTransaction* aHttpTransaction, int32_t aPriority,
+                 nsIInterfaceRequestor* aCallbacks);
+
+  void SwapTransaction(nsAHttpTransaction* aOld, nsAHttpTransaction* aNew);
+
+  bool CanReuse();
+
+  nsresult TryActivating(const nsACString& aMethod, const nsACString& aScheme,
+                         const nsACString& aAuthorityHeader,
+                         const nsACString& aPath, const nsACString& aHeaders,
+                         uint64_t* aStreamId,
+                         Http3StreamBase* aStream) override;
+  void CloseSendingSide(uint64_t aStreamId) override;
+  nsresult SendRequestBody(uint64_t aStreamId, const char* buf, uint32_t count,
+                           uint32_t* countRead) override;
+  nsresult ReadResponseHeaders(uint64_t aStreamId,
+                               nsTArray<uint8_t>& aResponseHeaders, bool* aFin);
+  nsresult ReadResponseData(uint64_t aStreamId, char* aBuf, uint32_t aCount,
+                            uint32_t* aCountWritten, bool* aFin) override;
+
+  nsresult CloseWebTransport(uint64_t aSessionId, uint32_t aError,
+                             const nsACString& aMessage) override;
+  nsresult CreateWebTransportStream(uint64_t aSessionId,
+                                    WebTransportStreamType aStreamType,
+                                    uint64_t* aStreamId);
+  void CloseStream(Http3StreamBase* aStream, nsresult aResult) override;
+  void CloseStreamInternal(Http3StreamBase* aStream, nsresult aResult);
+
+  void SetCleanShutdown(bool aCleanShutdown) {
+    mCleanShutdown = aCleanShutdown;
+  }
+
+  bool TestJoinConnection(const nsACString& hostname, int32_t port);
+  bool JoinConnection(const nsACString& hostname, int32_t port);
+
+  void TransactionHasDataToWrite(nsAHttpTransaction* caller) override;
+  void TransactionHasDataToRecv(nsAHttpTransaction* caller) override;
+  [[nodiscard]] nsresult GetTransactionTLSSocketControl(
+      nsITLSSocketControl**) override;
+
+  void Authenticated(int32_t aError, bool aServCertHashesSucceeded = false);
+
+  nsresult ProcessOutputAndEvents(nsIUDPSocket* socket);
+
+  void ReportHttp3Connection();
+
+  int64_t GetBytesWritten() { return mTotalBytesWritten; }
+  int64_t BytesRead() { return mTotalBytesRead; }
+
+  nsresult SendData(nsIUDPSocket* socket);
+  nsresult RecvData(nsIUDPSocket* socket);
+
+  void DoSetEchConfig(const nsACString& aEchConfig);
+
+  nsresult SendPriorityUpdateFrame(uint64_t aStreamId, uint8_t aPriorityUrgency,
+                                   bool aPriorityIncremental) override;
+
+  void ConnectSlowConsumer(Http3StreamBase* stream) override;
+
+  nsresult TryActivatingWebTransportStream(uint64_t* aStreamId,
+                                           Http3StreamBase* aStream) override;
+  void CloseWebTransportStream(Http3WebTransportStream* aStream,
+                               nsresult aResult);
+  void StreamHasDataToWrite(Http3StreamBase* aStream) override;
+  void ResetWebTransportStream(Http3WebTransportStream* aStream,
+                               uint64_t aErrorCode) override;
+  void StreamStopSending(Http3WebTransportStream* aStream,
+                         uint8_t aErrorCode) override;
+
+  void SendDatagram(Http3WebTransportSession* aSession,
+                    nsTArray<uint8_t>& aData, uint64_t aTrackingId) override;
+  void SendHTTPDatagram(uint64_t aStreamId, nsTArray<uint8_t>& aData,
+                        uint64_t aTrackingId) override;
+
+  uint64_t MaxDatagramSize(uint64_t aSessionId) override;
+
+  void SetSendOrder(Http3StreamBase* aStream,
+                    Maybe<int64_t> aSendOrder) override;
+
+  void CloseWebTransportConn() override;
+
+  void FinishTunnelSetup(nsAHttpTransaction* aTransaction) override;
+
+  Http3Stats GetStats();
+
+  already_AddRefed<HttpConnectionUDP> CreateTunnelStream(
+      nsAHttpTransaction* aHttpTransaction, nsIInterfaceRequestor* aCallbacks);
+  already_AddRefed<nsHttpConnection> CreateTunnelStream(
+      nsAHttpTransaction* aHttpTransaction, nsIInterfaceRequestor* aCallbacks,
+      PRIntervalTime aRtt, bool aIsExtendedCONNECT);
+  void SetIsInTunnel() { mIsInTunnel = true; }
+
+  void SetDontExclude() { mDontExclude = true; }
+
+ private:
+  ~Http3Session();
+
+  void CloseInternal(bool aCallNeqoClose);
+  void Shutdown();
+
+  bool RealJoinConnection(const nsACString& hostname, int32_t port,
+                          bool justKidding);
+
+  nsresult ProcessOutput(nsIUDPSocket* socket);
+  nsresult ProcessInput(nsIUDPSocket* socket);
+  nsresult ProcessEvents();
+
+  nsresult ProcessTransactionRead(uint64_t stream_id);
+  nsresult ProcessTransactionRead(Http3StreamBase* stream);
+  nsresult ProcessSlowConsumers();
+
+  void SetupTimer(uint64_t aTimeout);
+
+  enum ResetType {
+    RESET,
+    STOP_SENDING,
+  };
+  void ResetOrStopSendingRecvd(uint64_t aStreamId, uint64_t aError,
+                               ResetType aType);
+
+  void QueueStream(Http3StreamBase* stream);
+  void RemoveStreamFromQueues(Http3StreamBase*);
+  void ProcessPending();
+
+  void CallCertVerification(Maybe<nsCString> aEchPublicName);
+  void SetSecInfo();
+
+  void StreamReadyToWrite(Http3StreamBase* aStream);
+  void MaybeResumeSend();
+
+  void Finish0Rtt(bool aRestart);
+
+  RefPtr<NeqoHttp3Conn> mHttp3Connection;
+  RefPtr<nsAHttpConnection> mConnection;
+  nsTHashMap<nsUint64HashKey, uint64_t> mWebTransportStreamToSessionMap;
+  nsRefPtrHashtable<nsUint64HashKey, Http3StreamBase> mStreamIdHash;
+  nsRefPtrHashtable<nsPtrHashKey<nsAHttpTransaction>, Http3StreamBase>
+      mStreamTransactionHash;
+
+  nsRefPtrDeque<Http3StreamBase> mReadyForWrite;
+
+  nsTArray<RefPtr<Http3StreamBase>> mSlowConsumersReadyForRead;
+  nsRefPtrDeque<Http3StreamBase> mQueuedStreams;
+
+  enum State {
+    INITIALIZING,
+    ZERORTT,
+    CONNECTED,
+    CLOSING,
+    CLOSED
+  } mState{INITIALIZING};
+
+  bool mAuthenticationStarted{false};
+  bool mCleanShutdown{false};
+  bool mGoawayReceived{false};
+  bool mShouldClose{false};
+  bool mIsClosedByNeqo{false};
+  bool mHttp3ConnectionReported = false;
+  nsresult mError{NS_OK};
+  nsresult mSocketError{NS_OK};
+  bool mBeforeConnectedError{false};
+  uint64_t mCurrentBrowserId;
+
+  bool mUseNSPRForIO{true};
+
+  RefPtr<HttpConnectionUDP> mUdpConn;
+
+  nsCOMPtr<nsITimer> mTimer;
+  RefPtr<OnQuicTimeout> mTimerCallback;
+
+  nsTHashMap<nsCStringHashKey, bool> mJoinConnectionCache;
+
+  RefPtr<QuicSocketControl> mSocketControl;
+
+  nsTArray<WeakPtr<Http3StreamBase>> m0RTTStreams;
+  nsTArray<WeakPtr<Http3StreamBase>> mCannotDo0RTTStreams;
+
+  TimeStamp mZeroRttStarted;
+
+  RefPtr<nsHttpTransaction> mFirstHttpTransaction;
+
+  RefPtr<nsHttpConnectionInfo> mConnInfo;
+
+  int64_t mTotalBytesRead = 0;     
+  int64_t mTotalBytesWritten = 0;  
+  PRIntervalTime mLastWriteTime = 0;
+  nsCString mServer;
+
+
+
+  nsCOMPtr<nsINetAddr> mNetAddr;
+
+  enum class ExtendedConnectKind : uint8_t {
+    WebTransport = 0,
+    ConnectUDP,
+  };
+
+  enum ExtendedConnectNegotiation { DISABLED, NEGOTIATING, FAILED, SUCCEEDED };
+
+  struct ExtendedConnectState {
+    ExtendedConnectNegotiation mStatus = DISABLED;
+    nsTArray<WeakPtr<Http3StreamBase>> mWaiters;
+  };
+
+  Array<ExtendedConnectState, 2> mExtConnect{ExtendedConnectState{},
+                                             ExtendedConnectState{}};
+
+  ExtendedConnectState& ExtState(ExtendedConnectKind aKind) {
+    return mExtConnect[static_cast<size_t>(aKind)];
+  }
+
+  bool DeferIfNegotiating(ExtendedConnectKind aKind, Http3StreamBase* aStream);
+  void FinishNegotiation(ExtendedConnectKind aKind, bool aSuccess);
+
+  inline bool HasNoActiveStreams() const {
+    return mStreamTransactionHash.Count() == 0 &&
+           mWebTransportSessions.IsEmpty() && mWebTransportStreams.IsEmpty() &&
+           mTunnelStreams.IsEmpty();
+  }
+
+  nsTArray<RefPtr<Http3StreamBase>> mWebTransportSessions;
+  nsTArray<RefPtr<Http3StreamBase>> mWebTransportStreams;
+  nsTArray<RefPtr<Http3StreamBase>> mTunnelStreams;
+
+  bool mHasWebTransportSession = false;
+  bool mDontExclude = false;
+  bool mHad0RttStream = false;
+  nsIUDPSocket* mSocket;
+  bool mIsInTunnel = false;
+};
+
+}  
+
+#endif  // Http3Session_H_
